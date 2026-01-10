@@ -3,3 +3,5 @@ run/
 *.log
 *.bak
 *.zone
+.agent/
+*.zip

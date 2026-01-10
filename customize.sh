@@ -259,10 +259,6 @@ main() {
     # Extract core files (bin, scripts, conf, tools) - full overwrite
     unzip -o "$ZIPFILE" 'bin/*' 'scripts/*' 'conf/*' 'tools/*' -d "$FLUX_DIR" >&2
     
-    # Extract zashboard dashboard (always overwrite for latest version)
-    rm -rf "$RUN_DIR/zashboard" 2>/dev/null
-    unzip -o "$ZIPFILE" 'run/zashboard/*' -d "$FLUX_DIR" >&2
-    
     # 4. Handle configuration restoration
     ui_print " "
     ui_print "=== Configuration ==="

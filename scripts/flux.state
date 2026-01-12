@@ -1,0 +1,204 @@
+#!/system/bin/sh
+
+# ==============================================================================
+# Flux State Machine (flux.state)
+# Description: Service state management with explicit transitions
+# States: STOPPED -> STARTING -> RUNNING -> STOPPING -> STOPPED
+#                       |                       |
+#                       v                       v
+#                    FAILED <-----------------+
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# [ State Constants ]
+# ------------------------------------------------------------------------------
+
+readonly STATE_STOPPED="STOPPED"
+readonly STATE_STARTING="STARTING"
+readonly STATE_RUNNING="RUNNING"
+readonly STATE_STOPPING="STOPPING"
+readonly STATE_FAILED="FAILED"
+
+# State file location (set by flux.config)
+# STATE_FILE="$RUN_DIR/.state"
+
+# ------------------------------------------------------------------------------
+# [ State Read/Write ]
+# ------------------------------------------------------------------------------
+
+# Get current state (default: STOPPED if no file)
+get_state() {
+    if [ -f "$STATE_FILE" ]; then
+        cat "$STATE_FILE" 2>/dev/null || echo "$STATE_STOPPED"
+    else
+        echo "$STATE_STOPPED"
+    fi
+}
+
+# Set state with logging
+set_state() {
+    local new_state="$1"
+    local old_state
+    old_state=$(get_state)
+    
+    mkdir -p "$(dirname "$STATE_FILE")" 2>/dev/null
+    echo "$new_state" > "$STATE_FILE"
+    
+    log_debug "State transition: $old_state -> $new_state"
+}
+
+# ------------------------------------------------------------------------------
+# [ State Validation ]
+# ------------------------------------------------------------------------------
+
+# Check if transition is valid
+# Returns: 0 if valid, 1 if invalid
+validate_transition() {
+    local current="$1"
+    local target="$2"
+    
+    case "$current:$target" in
+        # Valid start transitions
+        "$STATE_STOPPED:$STATE_STARTING") return 0 ;;
+        "$STATE_FAILED:$STATE_STARTING")  return 0 ;;
+        
+        # Valid running transitions
+        "$STATE_STARTING:$STATE_RUNNING") return 0 ;;
+        "$STATE_STARTING:$STATE_FAILED")  return 0 ;;
+        
+        # Valid stop transitions
+        "$STATE_RUNNING:$STATE_STOPPING") return 0 ;;
+        "$STATE_STOPPING:$STATE_STOPPED") return 0 ;;
+        "$STATE_STOPPING:$STATE_FAILED")  return 0 ;;
+        
+        # Force stop from any state
+        "*:$STATE_STOPPING")              return 0 ;;
+        
+        # Reset from failed
+        "$STATE_FAILED:$STATE_STOPPED")   return 0 ;;
+        
+        # Invalid
+        *)
+            log_warn "Invalid state transition: $current -> $target"
+            return 1
+            ;;
+    esac
+}
+
+# ------------------------------------------------------------------------------
+# [ State Checks ]
+# ------------------------------------------------------------------------------
+
+# Check if service is in running state
+is_running() {
+    [ "$(get_state)" = "$STATE_RUNNING" ]
+}
+
+# Check if service is in transitional state
+is_transitioning() {
+    local state
+    state=$(get_state)
+    [ "$state" = "$STATE_STARTING" ] || [ "$state" = "$STATE_STOPPING" ]
+}
+
+# Check if service is stopped or failed
+is_stopped() {
+    local state
+    state=$(get_state)
+    [ "$state" = "$STATE_STOPPED" ] || [ "$state" = "$STATE_FAILED" ]
+}
+
+# Check if can start (not running or transitioning)
+can_start() {
+    local state
+    state=$(get_state)
+    [ "$state" = "$STATE_STOPPED" ] || [ "$state" = "$STATE_FAILED" ]
+}
+
+# Check if can stop (running)
+can_stop() {
+    [ "$(get_state)" = "$STATE_RUNNING" ]
+}
+
+# Check if can reload (must be running)
+can_reload() {
+    [ "$(get_state)" = "$STATE_RUNNING" ]
+}
+
+# ------------------------------------------------------------------------------
+# [ State Transition Helpers ]
+# ------------------------------------------------------------------------------
+
+# Transition to STARTING state
+transition_starting() {
+    if can_start; then
+        set_state "$STATE_STARTING"
+        return 0
+    else
+        log_warn "Cannot start: current state is $(get_state)"
+        return 1
+    fi
+}
+
+# Transition to RUNNING state
+transition_running() {
+    if [ "$(get_state)" = "$STATE_STARTING" ]; then
+        set_state "$STATE_RUNNING"
+        return 0
+    else
+        log_error "Invalid transition to RUNNING from $(get_state)"
+        return 1
+    fi
+}
+
+# Transition to STOPPING state
+transition_stopping() {
+    local current
+    current=$(get_state)
+    
+    # Allow force stop from any state except already stopped
+    if [ "$current" != "$STATE_STOPPED" ]; then
+        set_state "$STATE_STOPPING"
+        return 0
+    else
+        log_debug "Already stopped"
+        return 0
+    fi
+}
+
+# Transition to STOPPED state
+transition_stopped() {
+    set_state "$STATE_STOPPED"
+    return 0
+}
+
+# Transition to FAILED state
+transition_failed() {
+    set_state "$STATE_FAILED"
+    return 0
+}
+
+# Reset state file (for cleanup)
+reset_state() {
+    rm -f "$STATE_FILE" 2>/dev/null
+    log_debug "State reset"
+}
+
+# ------------------------------------------------------------------------------
+# [ State Info ]
+# ------------------------------------------------------------------------------
+
+# Get human-readable state info
+get_state_info() {
+    local state
+    state=$(get_state)
+    
+    case "$state" in
+        "$STATE_STOPPED")  echo "Service is stopped" ;;
+        "$STATE_STARTING") echo "Service is starting..." ;;
+        "$STATE_RUNNING")  echo "Service is running" ;;
+        "$STATE_STOPPING") echo "Service is stopping..." ;;
+        "$STATE_FAILED")   echo "Service failed" ;;
+        *)                 echo "Unknown state: $state" ;;
+    esac
+}

@@ -1,0 +1,47 @@
+#!/system/bin/sh
+
+# ==============================================================================
+# Flux Module Toggle Listener (flux.mod.inotify)
+# Description: Monitor Magisk disable file for module toggle
+# Pattern: Based on box4magisk box.inotify
+# ==============================================================================
+
+scripts=$(realpath "$0")
+scripts_dir=$(dirname "${scripts}")
+
+. "${scripts_dir}/flux.config"
+. "${scripts_dir}/flux.logger"
+
+# Load user configuration
+load_flux_config
+
+export LOG_COMPONENT="ModInotify"
+
+events=$1
+monitor_dir=$2
+monitor_file=$3
+
+# Ensure run directory exists for logging
+mkdir -p "${RUN_DIR}"
+
+service_control() {
+    # Check for manual mode file (skip auto control if exists)
+    if [ -f "${FLUX_DIR}/manual" ]; then
+        log_debug "Manual mode active, skipping auto control"
+        return 0
+    fi
+    
+    if [ "${monitor_file}" = "disable" ]; then
+        if [ "${events}" = "d" ]; then
+            # disable file deleted = module enabled
+            log_info "Module enabled, starting service"
+            sh "${scripts_dir}/start.sh" start >> "${LOG_FILE}" 2>&1
+        elif [ "${events}" = "n" ]; then
+            # disable file created = module disabled
+            log_info "Module disabled, stopping service"
+            sh "${scripts_dir}/start.sh" stop >> "${LOG_FILE}" 2>&1
+        fi
+    fi
+}
+
+service_control

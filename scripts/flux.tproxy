@@ -1,0 +1,1052 @@
+#!/system/bin/sh
+
+
+# ==============================================================================
+# SCRIPT SETUP & ENVIRONMENT
+# ==============================================================================
+
+SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+. "$SCRIPT_DIR/flux.config"
+. "$SCRIPT_DIR/flux.logger"
+. "$SCRIPT_DIR/flux.validator"
+
+# Set log component for logging utility
+export LOG_COMPONENT="Tproxy"
+
+# ==============================================================================
+# KERNEL & SYSTEM FEATURE DETECTION (Using Cache from flux.validator)
+# ==============================================================================
+
+# Initialize kernel cache on first load
+init_kernel_cache 2>/dev/null
+
+# Check if a kernel feature is enabled (uses cache from flux.validator)
+check_kernel_feature() {
+    check_kernel_feature_cached "$1"
+}
+
+# Verify TPROXY support by checking the kernel module/config
+check_tproxy_support() {
+    if check_kernel_feature "NETFILTER_XT_TARGET_TPROXY"; then
+        log_debug "Kernel TPROXY support confirmed"
+        return 0
+    else
+        log_debug "Kernel TPROXY support not available"
+        return 1
+    fi
+}
+
+
+# ==============================================================================
+# COMMAND WRAPPERS
+# ==============================================================================
+
+# Generic wrapper for iptables/ip6tables with wait lock
+run_ipt_command() {
+    local cmd="$1"
+    shift
+    local args="$*"
+    command $cmd -w 100 $args
+}
+
+iptables()    { run_ipt_command iptables "$@"; }
+ip6tables()   { run_ipt_command ip6tables "$@"; }
+ip_rule()     { command ip rule "$@"; }
+ip6_rule()    { command ip -6 rule "$@"; }
+ip_route()    { command ip route "$@"; }
+ip6_route()   { command ip -6 route "$@"; }
+
+# ==============================================================================
+# UID & PACKAGE RESOLUTION (with caching)
+# ==============================================================================
+
+readonly PACKAGES_LIST="/data/system/packages.list"
+
+# Get modification time of packages.list for cache validation
+get_packages_list_mtime() {
+    if [ -f "$PACKAGES_LIST" ]; then
+        stat -c %Y "$PACKAGES_LIST" 2>/dev/null || stat -f %m "$PACKAGES_LIST" 2>/dev/null || echo "0"
+    else
+        echo "0"
+    fi
+}
+
+# Load UID cache from file, returns 0 if cache is valid, 1 if invalid/missing
+load_uid_cache() {
+    local current_mtime
+    local cached_mtime
+    
+    if [ ! -f "$UID_CACHE_FILE" ]; then
+        log_debug "UID cache file not found"
+        return 1
+    fi
+    
+    current_mtime=$(get_packages_list_mtime)
+    cached_mtime=$(head -n1 "$UID_CACHE_FILE" 2>/dev/null | grep "^#mtime:" | cut -d: -f2)
+    
+    if [ -z "$cached_mtime" ] || [ "$cached_mtime" != "$current_mtime" ]; then
+        log_debug "UID cache expired (mtime: $cached_mtime vs $current_mtime)"
+        rm -f "$UID_CACHE_FILE"
+        return 1
+    fi
+    
+    log_debug "UID cache valid (mtime: $current_mtime)"
+    return 0
+}
+
+# Save UID cache to file
+# Format: first line is "#mtime:TIMESTAMP", rest are "token uid" pairs
+save_uid_cache() {
+    local mtime
+    mtime=$(get_packages_list_mtime)
+    
+    mkdir -p "$(dirname "$UID_CACHE_FILE")"
+    echo "#mtime:$mtime" > "$UID_CACHE_FILE"
+    log_debug "UID cache initialized with mtime: $mtime"
+}
+
+# Add a single entry to UID cache
+add_uid_cache_entry() {
+    local token="$1"
+    local uid="$2"
+    
+    if [ -f "$UID_CACHE_FILE" ]; then
+        echo "$token $uid" >> "$UID_CACHE_FILE"
+    fi
+}
+
+# Lookup a token in UID cache, returns uid or empty string
+lookup_uid_cache() {
+    local token="$1"
+    
+    if [ -f "$UID_CACHE_FILE" ]; then
+        grep "^${token} " "$UID_CACHE_FILE" 2>/dev/null | awk '{print $2}'
+    fi
+}
+
+# Invalidate UID cache (called when packages.list changes)
+invalidate_uid_cache() {
+    if [ -f "$UID_CACHE_FILE" ]; then
+        rm -f "$UID_CACHE_FILE"
+        log_info "UID cache invalidated"
+    fi
+}
+
+# Retrieve UID for a package name from Android system package list
+get_package_uid() {
+    local pkg="$1"
+    local line
+    local uid
+    if [ ! -r "$PACKAGES_LIST" ]; then
+        log_debug "Cannot read $PACKAGES_LIST"
+        return 1
+    fi
+    line=$(grep -m1 "^${pkg}[[:space:]]" "$PACKAGES_LIST" 2> /dev/null || true)
+    if [ -z "$line" ]; then
+        log_debug "Package not found in packages.list: $pkg"
+        return 1
+    fi
+
+    uid=$(echo "$line" | awk '{print $2}' 2> /dev/null || true)
+    case "$uid" in
+        '' | *[!0-9]*)
+            uid=$(echo "$line" | awk '{print $(NF-1)}' 2> /dev/null || true)
+            ;;
+    esac
+    case "$uid" in
+        '' | *[!0-9]*)
+            log_debug "Invalid UID format for package: $pkg"
+            return 1
+            ;;
+        *)
+            echo "$uid"
+            return 0
+            ;;
+    esac
+}
+
+# Resolve multiple packages/tokens (with optional user prefix user:pkg) to UIDs
+# Uses cache when available for improved performance
+find_packages_uid() {
+    local out=""
+    local token
+    local uid_base
+    local final_uid
+    local cached_uid
+    local cache_initialized=0
+    
+    # Check if cache is valid, if not initialize new cache
+    if ! load_uid_cache; then
+        save_uid_cache
+        cache_initialized=1
+    fi
+    
+    # shellcheck disable=SC2048
+    for token in $*; do
+        # Try cache lookup first
+        cached_uid=$(lookup_uid_cache "$token")
+        if [ -n "$cached_uid" ]; then
+            out="$out $cached_uid"
+            log_debug "Cache hit: $token -> $cached_uid" >&2
+            continue
+        fi
+        
+        # Cache miss, resolve from packages.list
+        local user_prefix=0
+        local package="$token"
+        case "$token" in
+            *:*)
+                user_prefix=$(echo "$token" | cut -d: -f1)
+                package=$(echo "$token" | cut -d: -f2-)
+                case "$user_prefix" in
+                    '' | *[!0-9]*)
+                        log_warn "Invalid user prefix in token: $token, using 0" >&2
+                        user_prefix=0
+                        ;;
+                esac
+                ;;
+        esac
+        
+        if uid_base=$(get_package_uid "$package" 2> /dev/null); then
+            final_uid=$((user_prefix * 100000 + uid_base))
+            out="$out $final_uid"
+            # Add to cache
+            add_uid_cache_entry "$token" "$final_uid"
+            log_debug "Resolved and cached: $token -> $final_uid" >&2
+        else
+            log_warn "Failed to resolve UID for package: $package" >&2
+        fi
+    done
+    
+    echo "$out" | awk '{$1=$1;print}'
+}
+
+# ==============================================================================
+# IPTABLES CHAIN MANAGEMENT
+# ==============================================================================
+
+# Check if an iptables chain exists in a specific table
+safe_chain_exists() {
+    local family="$1"
+    local table="$2"
+    local chain="$3"
+    local cmd="iptables"
+
+    if [ "$family" = "6" ]; then
+        cmd="ip6tables"
+    fi
+
+    if $cmd -t "$table" -L "$chain" > /dev/null 2>&1; then
+        return 0
+    fi
+
+    return 1
+}
+
+# Safely create a new chain; flushes it if it already exists
+safe_chain_create() {
+    local family="$1"
+    local table="$2"
+    local chain="$3"
+    local cmd="iptables"
+
+    if [ "$family" = "6" ]; then
+        cmd="ip6tables"
+    fi
+
+    if ! safe_chain_exists "$family" "$table" "$chain"; then
+        $cmd -t "$table" -N "$chain"
+    fi
+
+    $cmd -t "$table" -F "$chain"
+}
+
+# ==============================================================================
+# IPSET & GEO-IP MANAGEMENT
+# ==============================================================================
+
+# Download China IP lists if bypass is enabled and file is outdated
+
+# Initialize ipset with downloaded CIDR rules
+setup_cn_ipset() {
+    [ "$BYPASS_CN_IP" -eq 0 ] && {
+        log_debug "CN IP bypass is disabled, skipping ipset setup"
+        return 0
+    }
+
+    command -v ipset >/dev/null 2>&1 || {
+        log_error "ipset not found. Cannot bypass CN IPs"
+        return 1
+    }
+
+    log_info "Setting up ipset for China mainland IPs"
+
+    ipset destroy cnip 2>/dev/null || true
+    ipset destroy cnip6 2>/dev/null || true
+
+    # Setup IPv4 ipset
+    if [ -f "$CN_IP_FILE" ] && [ -s "$CN_IP_FILE" ]; then
+        local ipv4_count
+        ipv4_count=$(wc -l < "$CN_IP_FILE" 2>/dev/null || echo "0")
+        log_debug "Loading $ipv4_count IPv4 CIDR entries from $CN_IP_FILE"
+
+        local temp_file
+        temp_file=$(mktemp) || {
+            log_error "Failed to create temporary file"
+            return 1
+        }
+        
+        {
+            echo "create cnip hash:net family inet hashsize 8192 maxelem 65536"
+            awk '!/^[[:space:]]*#/ && NF > 0 {printf "add cnip %s\n", $0}' "$CN_IP_FILE"
+        } > "$temp_file"
+
+        if ipset restore -f "$temp_file" 2>/dev/null; then
+            log_info "Successfully loaded $ipv4_count IPv4 CIDR entries"
+        else
+            log_error "Failed to create ipset 'cnip' or load IPv4 CIDR entries"
+            rm -f "$temp_file"
+            return 1
+        fi
+        rm -f "$temp_file"
+    else
+        log_warn "CN IP file not found or empty: $CN_IP_FILE"
+        return 1
+    fi
+
+    log_info "ipset 'cnip' loaded with China mainland IPs"
+
+    # Setup IPv6 ipset if enabled
+    if [ "$PROXY_IPV6" -eq 1 ] && [ -f "$CN_IPV6_FILE" ] && [ -s "$CN_IPV6_FILE" ]; then
+        local ipv6_count
+        ipv6_count=$(wc -l < "$CN_IPV6_FILE" 2>/dev/null || echo "0")
+        log_debug "Loading $ipv6_count IPv6 CIDR entries from $CN_IPV6_FILE"
+
+        local temp_file6
+        temp_file6=$(mktemp) || {
+            log_error "Failed to create temporary file for IPv6"
+            return 0 
+        }
+        
+        {
+            echo "create cnip6 hash:net family inet6 hashsize 8192 maxelem 65536"
+            awk '!/^[[:space:]]*#/ && NF > 0 {printf "add cnip6 %s\n", $0}' "$CN_IPV6_FILE"
+        } > "$temp_file6"
+
+        if ipset restore -f "$temp_file6" 2>/dev/null; then
+            log_info "Successfully loaded $ipv6_count IPv6 CIDR entries"
+        else
+            log_error "Failed to create ipset 'cnip6' or load IPv6 CIDR entries"
+        fi
+        rm -f "$temp_file6"
+
+        log_info "ipset 'cnip6' loaded with China mainland IPv6 IPs"
+    fi
+
+    return 0
+}
+
+# ==============================================================================
+# PROXY LOGIC & RULES
+# ==============================================================================
+
+# Universal function to build proxy chains for TPROXY or REDIRECT
+setup_proxy_chain() {
+    local family="$1"
+    local mode="$2" # tproxy or redirect
+    local suffix=""
+    local mark="$MARK_VALUE"
+    local cmd="iptables"
+
+    if [ "$family" = "6" ]; then
+        suffix="6"
+        mark="$MARK_VALUE6"
+        cmd="ip6tables"
+    fi
+
+    local mode_name="$mode"
+    if [ "$mode" = "tproxy" ]; then
+        mode_name="TPROXY"
+    else
+        mode_name="REDIRECT"
+    fi
+
+    log_info "Setting up $mode_name chains for IPv${family}"
+
+    local chains=""
+    if [ "$family" = "6" ]; then
+        chains="PROXY_PREROUTING6 PROXY_OUTPUT6 BYPASS_IP6 BYPASS_INTERFACE6 PROXY_INTERFACE6 DNS_HIJACK_PRE6 DNS_HIJACK_OUT6 APP_CHAIN6 MAC_CHAIN6"
+    else
+        chains="PROXY_PREROUTING PROXY_OUTPUT BYPASS_IP BYPASS_INTERFACE PROXY_INTERFACE DNS_HIJACK_PRE DNS_HIJACK_OUT APP_CHAIN MAC_CHAIN"
+    fi
+
+    local table="mangle"
+    if [ "$mode" = "redirect" ]; then
+        table="nat"
+    fi
+
+    # Initialize custom chains
+    for c in $chains; do
+        safe_chain_create "$family" "$table" "$c"
+    done
+
+    # Linking Prerouting logic
+    $cmd -t "$table" -A "PROXY_PREROUTING$suffix" -j "BYPASS_IP$suffix"
+    $cmd -t "$table" -A "PROXY_PREROUTING$suffix" -j "PROXY_INTERFACE$suffix"
+    $cmd -t "$table" -A "PROXY_PREROUTING$suffix" -j "MAC_CHAIN$suffix"
+    $cmd -t "$table" -A "PROXY_PREROUTING$suffix" -j "DNS_HIJACK_PRE$suffix"
+
+    # Linking Output logic
+    $cmd -t "$table" -A "PROXY_OUTPUT$suffix" -j "BYPASS_IP$suffix"
+    $cmd -t "$table" -A "PROXY_OUTPUT$suffix" -j "BYPASS_INTERFACE$suffix"
+    $cmd -t "$table" -A "PROXY_OUTPUT$suffix" -j "APP_CHAIN$suffix"
+    $cmd -t "$table" -A "PROXY_OUTPUT$suffix" -j "DNS_HIJACK_OUT$suffix"
+
+    # Bypass Local/Local-Type traffic
+    if check_kernel_feature "NETFILTER_XT_MATCH_ADDRTYPE"; then
+        $cmd -t "$table" -A "BYPASS_IP$suffix" -m addrtype --dst-type LOCAL -p udp ! --dport 53 -j ACCEPT
+        $cmd -t "$table" -A "BYPASS_IP$suffix" -m addrtype --dst-type LOCAL ! -p udp -j ACCEPT
+        log_debug "Added local address type bypass"
+    fi
+
+    # Bypass Reply traffic
+    if check_kernel_feature "NETFILTER_XT_MATCH_CONNTRACK"; then
+        $cmd -t "$table" -A "BYPASS_IP$suffix" -m conntrack --ctdir REPLY -j ACCEPT
+        log_debug "Added reply connection direction bypass"
+    fi
+
+    # Define and bypass Private IP ranges
+    if [ "$family" = "6" ]; then
+        for subnet6 in ::/128 ::1/128 ::ffff:0:0/96 \
+            100::/64 64:ff9b::/96 2001::/32 2001:10::/28 \
+            2001:20::/28 2001:db8::/32 \
+            2002::/16 fe80::/10 ff00::/8; do
+            $cmd -t "$table" -A "BYPASS_IP$suffix" -d "$subnet6" -p udp ! --dport 53 -j ACCEPT
+            $cmd -t "$table" -A "BYPASS_IP$suffix" -d "$subnet6" ! -p udp -j ACCEPT
+        done
+    else
+        for subnet4 in 0.0.0.0/8 10.0.0.0/8 100.0.0.0/8 127.0.0.0/8 \
+            169.254.0.0/16 172.16.0.0/12 192.0.0.0/24 192.0.2.0/24 192.88.99.0/24 \
+            192.168.0.0/16 198.51.100.0/24 203.0.113.0/24 \
+            224.0.0.0/4 240.0.0.0/4 255.255.255.255/32; do
+            $cmd -t "$table" -A "BYPASS_IP$suffix" -d "$subnet4" -p udp ! --dport 53 -j ACCEPT
+            $cmd -t "$table" -A "BYPASS_IP$suffix" -d "$subnet4" ! -p udp -j ACCEPT
+        done
+    fi
+    log_debug "Added bypass rules for private IP ranges"
+
+    # ipset-based CN IP bypass
+    if [ "$BYPASS_CN_IP" -eq 1 ]; then
+        ipset_name="cnip"
+        if [ "$family" = "6" ]; then
+            ipset_name="cnip6"
+        fi
+        if command -v ipset > /dev/null 2>&1 && ipset list "$ipset_name" > /dev/null 2>&1; then
+            $cmd -t "$table" -A "BYPASS_IP$suffix" -m set --match-set "$ipset_name" dst -p udp ! --dport 53 -j ACCEPT
+            $cmd -t "$table" -A "BYPASS_IP$suffix" -m set --match-set "$ipset_name" dst ! -p udp -j ACCEPT
+            log_info "Added ipset-based CN IP bypass rule"
+        else
+            log_warn "ipset '$ipset_name' not available, skipping CN IP bypass"
+        fi
+    fi
+
+    # Interface-specific rules (WiFi, Mobile, Hotspot, USB)
+    log_info "Configuring interface proxy rules"
+    $cmd -t "$table" -A "PROXY_INTERFACE$suffix" -i lo -j RETURN
+    if [ "$PROXY_MOBILE" -eq 1 ]; then
+        $cmd -t "$table" -A "PROXY_INTERFACE$suffix" -i "$MOBILE_INTERFACE" -j RETURN
+        log_debug "Mobile interface $MOBILE_INTERFACE will be proxied"
+    else
+        $cmd -t "$table" -A "PROXY_INTERFACE$suffix" -i "$MOBILE_INTERFACE" -j ACCEPT
+        $cmd -t "$table" -A "BYPASS_INTERFACE$suffix" -o "$MOBILE_INTERFACE" -j ACCEPT
+        log_debug "Mobile interface $MOBILE_INTERFACE will bypass proxy"
+    fi
+
+    if [ "$PROXY_WIFI" -eq 1 ]; then
+        $cmd -t "$table" -A "PROXY_INTERFACE$suffix" -i "$WIFI_INTERFACE" -j RETURN
+        log_debug "WiFi interface $WIFI_INTERFACE will be proxied"
+    else
+        $cmd -t "$table" -A "PROXY_INTERFACE$suffix" -i "$WIFI_INTERFACE" -j ACCEPT
+        $cmd -t "$table" -A "BYPASS_INTERFACE$suffix" -o "$WIFI_INTERFACE" -j ACCEPT
+        log_debug "WiFi interface $WIFI_INTERFACE will bypass proxy"
+    fi
+
+    if [ "$PROXY_HOTSPOT" -eq 1 ]; then
+        if [ "$HOTSPOT_INTERFACE" = "$WIFI_INTERFACE" ]; then
+            local subnet=""
+            if [ "$family" = "6" ]; then
+                subnet="fe80::/10"
+            else
+                subnet="192.168.43.0/24"
+            fi
+            $cmd -t "$table" -A "PROXY_INTERFACE$suffix" -i "$WIFI_INTERFACE" ! -s "$subnet" -j RETURN
+            log_debug "Hotspot interface $WIFI_INTERFACE will be proxied"
+        else
+            $cmd -t "$table" -A "PROXY_INTERFACE$suffix" -i "$HOTSPOT_INTERFACE" -j RETURN
+            log_debug "Hotspot interface $HOTSPOT_INTERFACE will be proxied"
+        fi
+    else
+        $cmd -t "$table" -A "BYPASS_INTERFACE$suffix" -o "$HOTSPOT_INTERFACE" -j ACCEPT
+        log_debug "Hotspot interface $HOTSPOT_INTERFACE will bypass proxy"
+    fi
+
+    if [ "$PROXY_USB" -eq 1 ]; then
+        $cmd -t "$table" -A "PROXY_INTERFACE$suffix" -i "$USB_INTERFACE" -j RETURN
+        log_debug "USB interface $USB_INTERFACE will be proxied"
+    else
+        $cmd -t "$table" -A "PROXY_INTERFACE$suffix" -i "$USB_INTERFACE" -j ACCEPT
+        $cmd -t "$table" -A "BYPASS_INTERFACE$suffix" -o "$USB_INTERFACE" -j ACCEPT
+        log_debug "USB interface $USB_INTERFACE will bypass proxy"
+    fi
+    $cmd -t "$table" -A "PROXY_INTERFACE$suffix" -j ACCEPT
+    log_info "Interface proxy rules configuration completed"
+
+    # MAC filtering for Hotspot
+    if [ "$MAC_FILTER_ENABLE" -eq 1 ] && [ "$PROXY_HOTSPOT" -eq 1 ] && [ -n "$HOTSPOT_INTERFACE" ]; then
+        if check_kernel_feature "NETFILTER_XT_MATCH_MAC"; then
+            log_info "Setting up MAC address filter rules for interface $HOTSPOT_INTERFACE"
+            case "$MAC_PROXY_MODE" in
+                1) # 1 = Blacklist
+                    if [ -n "$BYPASS_MACS_LIST" ]; then
+                        for mac in $BYPASS_MACS_LIST; do
+                            if [ -n "$mac" ]; then
+                                $cmd -t "$table" -A "MAC_CHAIN$suffix" -m mac --mac-source "$mac" -i "$HOTSPOT_INTERFACE" -j ACCEPT
+                                log_debug "Added MAC bypass rule for $mac"
+                            fi
+                        done
+                    else
+                        log_warn "MAC blacklist mode enabled but no bypass MACs configured"
+                    fi
+                    $cmd -t "$table" -A "MAC_CHAIN$suffix" -i "$HOTSPOT_INTERFACE" -j RETURN
+                    ;;
+                2) # 2 = Whitelist
+                    if [ -n "$PROXY_MACS_LIST" ]; then
+                        for mac in $PROXY_MACS_LIST; do
+                            if [ -n "$mac" ]; then
+                                $cmd -t "$table" -A "MAC_CHAIN$suffix" -m mac --mac-source "$mac" -i "$HOTSPOT_INTERFACE" -j RETURN
+                                log_debug "Added MAC proxy rule for $mac"
+                            fi
+                        done
+                    else
+                        log_warn "MAC whitelist mode enabled but no proxy MACs configured"
+                    fi
+                    $cmd -t "$table" -A "MAC_CHAIN$suffix" -i "$HOTSPOT_INTERFACE" -j ACCEPT
+                    ;;
+            esac
+        else
+            log_warn "MAC filtering requires NETFILTER_XT_MATCH_MAC kernel feature which is not available"
+        fi
+    fi
+
+    # Self-traffic loop protection (Core user/mark bypass)
+    if check_kernel_feature "NETFILTER_XT_MATCH_OWNER"; then
+        $cmd -t "$table" -A "APP_CHAIN$suffix" -m owner --uid-owner "$CORE_USER" --gid-owner "$CORE_GROUP" -j ACCEPT
+        log_debug "Added bypass for core user $CORE_USER:$CORE_GROUP"
+    else
+        log_warn "Kernel lacks OWNER match support."
+    fi
+    
+    if check_kernel_feature "NETFILTER_XT_MATCH_MARK" && [ -n "$ROUTING_MARK" ]; then
+        $cmd -t "$table" -A "APP_CHAIN$suffix" -m mark --mark "$ROUTING_MARK" -j ACCEPT
+        log_debug "Added bypass for marked traffic with core mark $ROUTING_MARK"
+    fi
+    
+    if ! check_kernel_feature "NETFILTER_XT_MATCH_OWNER" && { ! check_kernel_feature "NETFILTER_XT_MATCH_MARK" || [ -z "$ROUTING_MARK" ]; }; then
+         log_warn "CRITICAL: No bypass mechanism (Owner/Mark) available! Infinite loop risk."
+    fi
+
+    # Application UID filtering
+    if [ "$APP_PROXY_ENABLE" -eq 1 ]; then
+        if check_kernel_feature "NETFILTER_XT_MATCH_OWNER"; then
+            log_info "Setting up application filter rules in $APP_PROXY_MODE mode"
+            case "$APP_PROXY_MODE" in
+                1) # 1 = Blacklist
+                    if [ -n "$BYPASS_APPS_LIST" ]; then
+                        uids=$(find_packages_uid "$BYPASS_APPS_LIST" || true)
+                        for uid in $uids; do
+                            if [ -n "$uid" ]; then
+                                $cmd -t "$table" -A "APP_CHAIN$suffix" -m owner --uid-owner "$uid" -j ACCEPT
+                                log_debug "Added bypass for UID $uid"
+                            fi
+                        done
+                    else
+                        log_warn "App blacklist mode enabled but no bypass apps configured"
+                    fi
+                    $cmd -t "$table" -A "APP_CHAIN$suffix" -j RETURN
+                    ;;
+                2) # 2 = Whitelist
+                    if [ -n "$PROXY_APPS_LIST" ]; then
+                        uids=$(find_packages_uid "$PROXY_APPS_LIST" || true)
+                        for uid in $uids; do
+                            if [ -n "$uid" ]; then
+                                $cmd -t "$table" -A "APP_CHAIN$suffix" -m owner --uid-owner "$uid" -j RETURN
+                                log_debug "Added proxy for UID $uid"
+                            fi
+                        done
+                    else
+                        log_warn "App whitelist mode enabled but no proxy apps configured"
+                    fi
+                    $cmd -t "$table" -A "APP_CHAIN$suffix" -j ACCEPT
+                    ;;
+            esac
+        else
+            log_warn "Application filtering requires NETFILTER_XT_MATCH_OWNER kernel feature which is not available"
+        fi
+    fi
+
+    # DNS Hijacking configuration
+    if [ "$DNS_HIJACK_ENABLE" -ne 0 ]; then
+        if [ "$mode" = "redirect" ]; then
+            setup_dns_hijack "$family" "redirect"
+        else
+            if [ "$DNS_HIJACK_ENABLE" -eq 2 ]; then
+                setup_dns_hijack "$family" "redirect2"
+            else
+                setup_dns_hijack "$family" "tproxy"
+            fi
+        fi
+    fi
+
+    # Final Proxy Target (TPROXY or REDIRECT)
+    if [ "$mode" = "tproxy" ]; then
+        $cmd -t "$table" -A "PROXY_PREROUTING$suffix" -p tcp -j TPROXY --on-port "$PROXY_TCP_PORT" --tproxy-mark "$mark"
+        $cmd -t "$table" -A "PROXY_PREROUTING$suffix" -p udp -j TPROXY --on-port "$PROXY_UDP_PORT" --tproxy-mark "$mark"
+        $cmd -t "$table" -A "PROXY_OUTPUT$suffix" -j MARK --set-mark "$mark"
+        log_info "TPROXY mode rules added"
+    else
+        $cmd -t "$table" -A "PROXY_PREROUTING$suffix" -j REDIRECT --to-ports "$PROXY_TCP_PORT"
+        $cmd -t "$table" -A "PROXY_OUTPUT$suffix" -j REDIRECT --to-ports "$PROXY_TCP_PORT"
+        log_info "REDIRECT mode rules added"
+    fi
+
+    # Inject Proxy Chains into main chains
+    if [ "$PROXY_UDP" -eq 1 ] || [ "$mode" = "redirect" ]; then
+        $cmd -t "$table" -I PREROUTING -p udp -j "PROXY_PREROUTING$suffix"
+        $cmd -t "$table" -I OUTPUT -p udp -j "PROXY_OUTPUT$suffix"
+        log_debug "Added UDP rules to PREROUTING and OUTPUT chains"
+    fi
+    if [ "$PROXY_TCP" -eq 1 ]; then
+        $cmd -t "$table" -I PREROUTING -p tcp -j "PROXY_PREROUTING$suffix"
+        $cmd -t "$table" -I OUTPUT -p tcp -j "PROXY_OUTPUT$suffix"
+        log_debug "Added TCP rules to PREROUTING and OUTPUT chains"
+    fi
+
+    log_info "$mode_name chains for IPv${family} setup completed"
+}
+
+# ==============================================================================
+# DNS HIJACKING LOGIC
+# ==============================================================================
+
+setup_dns_hijack() {
+    local family="$1"
+    local mode="$2"
+    local suffix=""
+    local mark="$MARK_VALUE"
+    local cmd="iptables"
+
+    if [ "$family" = "6" ]; then
+        suffix="6"
+        mark="$MARK_VALUE6"
+        cmd="ip6tables"
+    fi
+
+    case "$mode" in
+        tproxy)
+            $cmd -t mangle -A "DNS_HIJACK_PRE$suffix" -j RETURN
+            $cmd -t mangle -A "DNS_HIJACK_OUT$suffix" -j RETURN
+            log_debug "DNS hijack enabled using TPROXY mode"
+            ;;
+        redirect)
+            $cmd -t nat -A "DNS_HIJACK_PRE$suffix" -p tcp --dport 53 -j REDIRECT --to-ports "$DNS_PORT"
+            $cmd -t nat -A "DNS_HIJACK_PRE$suffix" -p udp --dport 53 -j REDIRECT --to-ports "$DNS_PORT"
+            $cmd -t nat -A "DNS_HIJACK_OUT$suffix" -p tcp --dport 53 -j REDIRECT --to-ports "$DNS_PORT"
+            $cmd -t nat -A "DNS_HIJACK_OUT$suffix" -p udp --dport 53 -j REDIRECT --to-ports "$DNS_PORT"
+            log_debug "DNS hijack enabled using REDIRECT mode to port $DNS_PORT"
+            ;;
+        redirect2)
+            if [ "$family" = "6" ] && {
+                ! check_kernel_feature "IP6_NF_NAT" || ! check_kernel_feature "IP6_NF_TARGET_REDIRECT"
+            }; then
+                log_warn "IPv6: Kernel does not support IPv6 NAT or REDIRECT, skipping IPv6 DNS hijack"
+                return 0
+            fi
+            safe_chain_create "$family" "nat" "NAT_DNS_HIJACK$suffix"
+            $cmd -t nat -A "NAT_DNS_HIJACK$suffix" -p tcp --dport 53 -j REDIRECT --to-ports "$DNS_PORT"
+            $cmd -t nat -A "NAT_DNS_HIJACK$suffix" -p udp --dport 53 -j REDIRECT --to-ports "$DNS_PORT"
+
+            [ "$PROXY_MOBILE" -eq 1 ] && $cmd -t nat -A PREROUTING -i "$MOBILE_INTERFACE" -j "NAT_DNS_HIJACK$suffix"
+            [ "$PROXY_WIFI" -eq 1 ] && $cmd -t nat -A PREROUTING -i "$WIFI_INTERFACE" -j "NAT_DNS_HIJACK$suffix"
+            [ "$PROXY_USB" -eq 1 ] && $cmd -t nat -A PREROUTING -i "$USB_INTERFACE" -j "NAT_DNS_HIJACK$suffix"
+
+            $cmd -t nat -A OUTPUT -p udp --dport 53 -m owner --uid-owner "$CORE_USER" --gid-owner "$CORE_GROUP" -j ACCEPT
+            $cmd -t nat -A OUTPUT -p tcp --dport 53 -m owner --uid-owner "$CORE_USER" --gid-owner "$CORE_GROUP" -j ACCEPT
+            $cmd -t nat -A OUTPUT -j "NAT_DNS_HIJACK$suffix"
+            log_debug "DNS hijack enabled using REDIRECT mode to port $DNS_PORT"
+            ;;
+    esac
+}
+
+# Wrapper helpers for different modes/families
+setup_tproxy_chain4()   { setup_proxy_chain 4 "tproxy"; }
+setup_redirect_chain4() { log_warn "REDIRECT mode only supports TCP"; setup_proxy_chain 4 "redirect"; }
+setup_tproxy_chain6()   { setup_proxy_chain 6 "tproxy"; }
+setup_redirect_chain6() {
+    if ! check_kernel_feature "IP6_NF_NAT" || ! check_kernel_feature "IP6_NF_TARGET_REDIRECT"; then
+        log_warn "IPv6: Kernel does not support IPv6 NAT or REDIRECT, skipping IPv6 proxy setup"
+        return 0
+    fi
+    log_warn "REDIRECT mode only supports TCP"; setup_proxy_chain 6 "redirect"
+}
+
+# ==============================================================================
+# ROUTING TABLE MANAGEMENT (ip rule / ip route)
+# ==============================================================================
+
+setup_routing4() {
+    log_info "Setting up routing rules for IPv4"
+
+    ip_rule del fwmark "$MARK_VALUE" lookup "$TABLE_ID" 2> /dev/null || true
+    ip_route del local 0.0.0.0/0 dev lo table "$TABLE_ID" 2> /dev/null || true
+
+    if ! ip_rule add fwmark "$MARK_VALUE" table "$TABLE_ID" pref "$TABLE_ID"; then
+        log_error "Failed to add IPv4 routing rule"
+        prop_error "IPv4 rule failed"
+        return 1
+    fi
+
+    if ! ip_route add local 0.0.0.0/0 dev lo table "$TABLE_ID"; then
+        log_error "Failed to add IPv4 route"
+        prop_error "IPv4 route failed"
+        ip_rule del fwmark "$MARK_VALUE" table "$TABLE_ID" pref "$TABLE_ID" 2> /dev/null || true
+        return 1
+    fi
+
+    echo 1 > /proc/sys/net/ipv4/ip_forward
+    log_info "IPv4 routing setup completed"
+}
+
+setup_routing6() {
+    log_info "Setting up routing rules for IPv6"
+
+    ip6_rule del fwmark "$MARK_VALUE6" table "$TABLE_ID" pref "$TABLE_ID" 2> /dev/null || true
+    ip6_route del local ::/0 dev lo table "$TABLE_ID" 2> /dev/null || true
+
+    if ! ip6_rule add fwmark "$MARK_VALUE6" table "$TABLE_ID" pref "$TABLE_ID"; then
+        log_error "Failed to add IPv6 routing rule"
+        prop_error "IPv6 rule failed"
+        return 1
+    fi
+
+    if ! ip6_route add local ::/0 dev lo table "$TABLE_ID"; then
+        log_error "Failed to add IPv6 route"
+        prop_error "IPv6 route failed"
+        ip6_rule del fwmark "$MARK_VALUE6" table "$TABLE_ID" pref "$TABLE_ID" 2> /dev/null || true
+        return 1
+    fi
+
+    echo 1 > /proc/sys/net/ipv6/conf/all/forwarding
+    log_info "IPv6 routing setup completed"
+}
+
+# ==============================================================================
+# CLEANUP OPERATIONS
+# ==============================================================================
+
+cleanup_chain() {
+    local family="$1"
+    local mode="$2"
+    local suffix=""
+    local cmd="iptables"
+
+    if [ "$family" = "6" ]; then
+        suffix="6"
+        cmd="ip6tables"
+    fi
+
+    local mode_name="$mode"
+    if [ "$mode" = "tproxy" ]; then
+        mode_name="TPROXY"
+    else
+        mode_name="REDIRECT"
+    fi
+
+    log_info "Cleaning up $mode_name chains for IPv${family}"
+
+    local table="mangle"
+    if [ "$mode" = "redirect" ]; then
+        table="nat"
+    fi
+
+    # Unlink rules
+    $cmd -t "$table" -D "PROXY_PREROUTING$suffix" -j "BYPASS_IP$suffix" 2> /dev/null || true
+    $cmd -t "$table" -D "PROXY_PREROUTING$suffix" -j "PROXY_INTERFACE$suffix" 2> /dev/null || true
+    $cmd -t "$table" -D "PROXY_PREROUTING$suffix" -j "MAC_CHAIN$suffix" 2> /dev/null || true
+    $cmd -t "$table" -D "PROXY_PREROUTING$suffix" -j "DNS_HIJACK_PRE$suffix" 2> /dev/null || true
+
+    $cmd -t "$table" -D "PROXY_OUTPUT$suffix" -j "BYPASS_IP$suffix" 2> /dev/null || true
+    $cmd -t "$table" -D "PROXY_OUTPUT$suffix" -j "BYPASS_INTERFACE$suffix" 2> /dev/null || true
+    $cmd -t "$table" -D "PROXY_OUTPUT$suffix" -j "APP_CHAIN$suffix" 2> /dev/null || true
+    $cmd -t "$table" -D "PROXY_OUTPUT$suffix" -j "DNS_HIJACK_OUT$suffix" 2> /dev/null || true
+
+    if [ "$PROXY_TCP" -eq 1 ]; then
+        $cmd -t "$table" -D PREROUTING -p tcp -j "PROXY_PREROUTING$suffix" 2> /dev/null || true
+        $cmd -t "$table" -D OUTPUT -p tcp -j "PROXY_OUTPUT$suffix" 2> /dev/null || true
+    fi
+    if [ "$PROXY_UDP" -eq 1 ]; then
+        $cmd -t "$table" -D PREROUTING -p udp -j "PROXY_PREROUTING$suffix" 2> /dev/null || true
+        $cmd -t "$table" -D OUTPUT -p udp -j "PROXY_OUTPUT$suffix" 2> /dev/null || true
+    fi
+
+    # Define chains based on family
+    local chains=""
+    if [ "$family" = "6" ]; then
+        chains="PROXY_PREROUTING6 PROXY_OUTPUT6 BYPASS_IP6 BYPASS_INTERFACE6 PROXY_INTERFACE6 DNS_HIJACK_PRE6 DNS_HIJACK_OUT6 APP_CHAIN6 MAC_CHAIN6"
+    else
+        chains="PROXY_PREROUTING PROXY_OUTPUT BYPASS_IP BYPASS_INTERFACE PROXY_INTERFACE DNS_HIJACK_PRE DNS_HIJACK_OUT APP_CHAIN MAC_CHAIN"
+    fi
+
+    # Destroy chains
+    for c in $chains; do
+        $cmd -t "$table" -F "$c" 2> /dev/null || true
+        $cmd -t "$table" -X "$c" 2> /dev/null || true
+    done
+
+    # Cleanup specific DNS redirection chains
+    if [ "$mode" = "tproxy" ] && [ "$DNS_HIJACK_ENABLE" -eq 2 ]; then
+        $cmd -t nat -D PREROUTING -i "$MOBILE_INTERFACE" -j "NAT_DNS_HIJACK$suffix" 2> /dev/null || true
+        $cmd -t nat -D PREROUTING -i "$WIFI_INTERFACE" -j "NAT_DNS_HIJACK$suffix" 2> /dev/null || true
+        $cmd -t nat -D PREROUTING -i "$USB_INTERFACE" -j "NAT_DNS_HIJACK$suffix" 2> /dev/null || true
+        $cmd -t nat -D OUTPUT -p udp --dport 53 -m owner --uid-owner "$CORE_USER" --gid-owner "$CORE_GROUP" -j ACCEPT 2> /dev/null || true
+        $cmd -t nat -D OUTPUT -p tcp --dport 53 -m owner --uid-owner "$CORE_USER" --gid-owner "$CORE_GROUP" -j ACCEPT 2> /dev/null || true
+        $cmd -t nat -D OUTPUT -j "NAT_DNS_HIJACK$suffix" 2> /dev/null || true
+        $cmd -t nat -F "NAT_DNS_HIJACK$suffix" 2> /dev/null || true
+        $cmd -t nat -X "NAT_DNS_HIJACK$suffix" 2> /dev/null || true
+    fi
+
+    log_info "$mode_name chains for IPv${family} cleanup completed"
+}
+
+cleanup_tproxy_chain4()   { cleanup_chain 4 "tproxy"; }
+cleanup_tproxy_chain6()   { cleanup_chain 6 "tproxy"; }
+cleanup_redirect_chain4() { cleanup_chain 4 "redirect"; }
+cleanup_redirect_chain6() {
+    if ! check_kernel_feature "IP6_NF_NAT" || ! check_kernel_feature "IP6_NF_TARGET_REDIRECT"; then
+        log_warn "IPv6: Kernel does not support IPv6 NAT or REDIRECT, skipping IPv6 cleanup"
+        return 0
+    fi
+    cleanup_chain 6 "redirect"
+}
+
+cleanup_routing4() {
+    log_info "Cleaning up IPv4 routing rules"
+    ip_rule del fwmark "$MARK_VALUE" table "$TABLE_ID" pref "$TABLE_ID" 2> /dev/null || true
+    ip_route del local 0.0.0.0/0 dev lo table "$TABLE_ID" 2> /dev/null || true
+    echo 0 > /proc/sys/net/ipv4/ip_forward 2> /dev/null || true
+    log_info "IPv4 routing cleanup completed"
+}
+
+cleanup_routing6() {
+    log_info "Cleaning up IPv6 routing rules"
+    ip6_rule del fwmark "$MARK_VALUE6" table "$TABLE_ID" pref "$TABLE_ID" 2> /dev/null || true
+    ip6_route del local ::/0 dev lo table "$TABLE_ID" 2> /dev/null || true
+    echo 0 > /proc/sys/net/ipv6/conf/all/forwarding 2> /dev/null || true
+    log_info "IPv6 routing cleanup completed"
+}
+
+cleanup_ipset() {
+    if [ "$BYPASS_CN_IP" -eq 0 ]; then
+        log_debug "CN IP bypass is disabled, skipping ipset cleanup"
+        return 0
+    fi
+    ipset destroy cnip 2> /dev/null || true
+    ipset destroy cnip6 2> /dev/null || true
+    log_info "ipset 'cnip' and 'cnip6' destroyed"
+}
+
+# ==============================================================================
+# MAIN EXECUTION FLOW
+# ==============================================================================
+
+# Determine which proxy mode to use based on kernel support and config
+detect_proxy_mode() {
+    USE_TPROXY=0
+    case "$PROXY_MODE" in
+        0)
+            if check_tproxy_support; then
+                USE_TPROXY=1
+                log_info "Kernel supports TPROXY, using TPROXY mode (auto)"
+            else
+                log_warn "Kernel does not support TPROXY, falling back to REDIRECT mode (auto)"
+            fi
+            ;;
+        1)
+            if check_tproxy_support; then
+                USE_TPROXY=1
+                log_info "Using TPROXY mode (forced by configuration)"
+            else
+                log_error "TPROXY mode forced but kernel does not support TPROXY"
+                prop_error "Kernel: no TPROXY"
+                exit 1
+            fi
+            ;;
+        2)
+            log_info "Using REDIRECT mode (forced by configuration)"
+            ;;
+    esac
+}
+
+start_proxy() {
+    log_info "Starting proxy setup..."
+    if [ "$BYPASS_CN_IP" -eq 1 ]; then
+        if ! check_kernel_feature "IP_SET" || ! check_kernel_feature "NETFILTER_XT_SET"; then
+            log_error "Kernel does not support ipset (CONFIG_IP_SET, CONFIG_NETFILTER_XT_SET). Cannot bypass CN IPs"
+            BYPASS_CN_IP=0
+        else
+            log_debug "CN IP bypass enabled, ipset will be loaded from files"
+            if ! setup_cn_ipset; then
+                log_error "Failed to setup ipset, CN bypass disabled"
+                BYPASS_CN_IP=0
+            fi
+        fi
+    fi
+
+    if [ "$USE_TPROXY" -eq 1 ]; then
+        setup_tproxy_chain4
+        setup_routing4
+        if [ "$PROXY_IPV6" -eq 1 ]; then
+            setup_tproxy_chain6
+            setup_routing6
+        fi
+    else
+        setup_redirect_chain4
+        if [ "$PROXY_IPV6" -eq 1 ]; then
+            setup_redirect_chain6
+        fi
+    fi
+    
+    block_loopback_traffic enable
+    ping_fix enable
+    
+    # Start IP monitor for dynamic anti-loopback
+    start_ip_monitor
+    
+    log_info "Proxy setup completed"
+}
+
+stop_proxy() {
+    log_info "Stopping proxy..."
+    if [ "$USE_TPROXY" -eq 1 ]; then
+        cleanup_tproxy_chain4
+        cleanup_routing4
+        if [ "$PROXY_IPV6" -eq 1 ]; then
+            cleanup_tproxy_chain6
+            cleanup_routing6
+        fi
+    else
+        log_debug "Cleaning up REDIRECT chains"
+        cleanup_redirect_chain4
+        if [ "$PROXY_IPV6" -eq 1 ]; then
+            cleanup_redirect_chain6
+        fi
+    fi
+    
+    cleanup_ipset
+    block_loopback_traffic disable
+    ping_fix disable
+    
+    # Stop IP monitor
+    stop_ip_monitor
+    
+    log_info "Proxy stopped"
+}
+
+block_loopback_traffic() {
+    case "$1" in
+        enable)
+            ip6tables -t filter -A OUTPUT -d ::1 -p tcp -m owner --uid-owner "$CORE_USER" --gid-owner "$CORE_GROUP" -m tcp --dport "$PROXY_TCP_PORT" -j REJECT
+            iptables -t filter -A OUTPUT -d 127.0.0.1 -p tcp -m owner --uid-owner "$CORE_USER" --gid-owner "$CORE_GROUP" -m tcp --dport "$PROXY_TCP_PORT" -j REJECT
+            ;;
+        disable)
+            ip6tables -t filter -D OUTPUT -d ::1 -p tcp -m owner --uid-owner "$CORE_USER" --gid-owner "$CORE_GROUP" -m tcp --dport "$PROXY_TCP_PORT" -j REJECT 2>/dev/null
+            iptables -t filter -D OUTPUT -d 127.0.0.1 -p tcp -m owner --uid-owner "$CORE_USER" --gid-owner "$CORE_GROUP" -m tcp --dport "$PROXY_TCP_PORT" -j REJECT 2>/dev/null
+            ;;
+    esac
+}
+
+# Ping fix: DNAT FakeIP ICMP to loopback so ping works (returns response from 127.0.0.1)
+ping_fix() {
+    # Get FakeIP range from config.json or fallback to settings.ini
+    get_fakeip_range
+    
+    case "$1" in
+        enable)
+            iptables -t nat -A OUTPUT -d "$FAKEIP_RANGE_V4" -p icmp -j DNAT --to-destination 127.0.0.1
+            iptables -t nat -A PREROUTING -d "$FAKEIP_RANGE_V4" -p icmp -j DNAT --to-destination 127.0.0.1
+            if [ "$PROXY_IPV6" = "1" ] && check_kernel_feature "IP6_NF_NAT"; then
+                ip6tables -t nat -A OUTPUT -d "$FAKEIP_RANGE_V6" -p icmp -j DNAT --to-destination ::1
+                ip6tables -t nat -A PREROUTING -d "$FAKEIP_RANGE_V6" -p icmp -j DNAT --to-destination ::1
+            fi
+            log_info "Ping fix enabled for FakeIP range ($FAKEIP_RANGE_V4)"
+            ;;
+        disable)
+            iptables -t nat -D OUTPUT -d "$FAKEIP_RANGE_V4" -p icmp -j DNAT --to-destination 127.0.0.1 2>/dev/null
+            iptables -t nat -D PREROUTING -d "$FAKEIP_RANGE_V4" -p icmp -j DNAT --to-destination 127.0.0.1 2>/dev/null
+            if [ "$PROXY_IPV6" = "1" ]; then
+                ip6tables -t nat -D OUTPUT -d "$FAKEIP_RANGE_V6" -p icmp -j DNAT --to-destination ::1 2>/dev/null
+                ip6tables -t nat -D PREROUTING -d "$FAKEIP_RANGE_V6" -p icmp -j DNAT --to-destination ::1 2>/dev/null
+            fi
+            log_debug "Ping fix disabled"
+            ;;
+    esac
+}
+
+# Start IP address monitor daemon for dynamic anti-loopback
+start_ip_monitor() {
+    local monitor_script="$SCRIPTS_DIR/flux.ip.monitor"
+    
+    if [ -x "$monitor_script" ] || [ -f "$monitor_script" ]; then
+        chmod +x "$monitor_script" 2>/dev/null
+        # Start in background, detached from terminal
+        nohup sh "$monitor_script" start >/dev/null 2>&1 &
+        log_debug "IP monitor daemon started"
+    else
+        log_debug "IP monitor script not found, skipping"
+    fi
+}
+
+# Stop IP address monitor daemon
+stop_ip_monitor() {
+    local monitor_script="$SCRIPTS_DIR/flux.ip.monitor"
+    
+    if [ -x "$monitor_script" ] || [ -f "$monitor_script" ]; then
+        sh "$monitor_script" stop 2>/dev/null
+    fi
+    
+    # Fallback: kill by pattern
+    pkill -f "flux.ip.monitor" 2>/dev/null || true
+    pkill -f "ip monitor address" 2>/dev/null || true
+    log_debug "IP monitor daemon stopped"
+}
+
+main() {
+    load_flux_config
+    detect_proxy_mode
+    
+    local action="${1:-}"
+    
+    case "$action" in
+        start)
+            start_proxy
+            ;;
+        stop)
+            stop_proxy
+            ;;
+        *)
+            echo "Usage: $0 {start|stop}"
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

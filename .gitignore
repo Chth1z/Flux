@@ -1,0 +1,10 @@
+conf/config.json
+run/
+*.log
+*.bak
+*.zone
+*.zip
+rust/
+bin/
+*.txt
+.agent/

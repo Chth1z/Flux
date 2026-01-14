@@ -7,7 +7,10 @@
 
 SKIPUNZIP=1
 
-# --- Installation Environment Check ---
+# ==============================================================================
+# [ Environment Check ]
+# ==============================================================================
+
 if [ "$BOOTMODE" != true ]; then
     ui_print "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     ui_print "! Please install in Magisk/KernelSU/APatch Manager"
@@ -15,8 +18,11 @@ if [ "$BOOTMODE" != true ]; then
     abort "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 fi
 
-# --- Constants & Paths ---
-readonly FLUX_DIR="/data/adb/Flux"
+# ==============================================================================
+# [ Constants & Paths ]
+# ==============================================================================
+
+readonly FLUX_DIR="/data/adb/flux"
 readonly CONF_DIR="$FLUX_DIR/conf"
 readonly BIN_DIR="$FLUX_DIR/bin"
 readonly SCRIPTS_DIR="$FLUX_DIR/scripts"
@@ -24,12 +30,14 @@ readonly RUN_DIR="$FLUX_DIR/run"
 readonly TOOLS_DIR="$FLUX_DIR/tools"
 readonly MODPROP="$MODPATH/module.prop"
 
-# --- UI Helper Functions ---
+# ==============================================================================
+# [ Helper Functions ]
+# ==============================================================================
+
 # Note: ui_print is provided by Magisk/KernelSU/APatch installer
 ui_error() { ui_print "! $1"; }
 ui_success() { ui_print "√ $1"; }
 
-# --- Environment Detection ---
 detect_env() {
     ui_print "- Detecting environment..."
     
@@ -46,12 +54,16 @@ detect_env() {
     fi
 }
 
-# --- Universal Volume Key Detection ---
-# Optimized: uses temp file + grep for reliable detection
+# ==============================================================================
+# [ Universal Volume Key Detection ]
+# ==============================================================================
+
+# Simplified countdown loop with getevent timeout
 choose_action() {
     local title="$1"
-    local default_action="$2" # true = Yes/Keep, false = No/Reset
+    local default_action="$2"  # true = Yes/Keep, false = No/Reset
     local timeout_sec=10
+    local count=0
     
     ui_print " "
     ui_print "● $title"
@@ -59,24 +71,11 @@ choose_action() {
     ui_print "  Vol [-] : No / Reset"
     ui_print "  (Timeout: ${timeout_sec}s)"
 
-    local start_time
-    start_time=$(date +%s)
-    
-    while true; do
-        local now
-        now=$(date +%s)
-        
-        # Capture volume key events to temp file
+    while [ $count -lt $timeout_sec ]; do
+        # Capture 1 event with 1s timeout
         timeout 1 getevent -lc 1 2>&1 | grep KEY_VOLUME > "$TMPDIR/events"
         
-        if [ $((now - start_time)) -gt "$timeout_sec" ]; then
-            if [ "$default_action" = "true" ]; then
-                ui_print "  > Timeout. Default: [Yes/Keep]"
-            else
-                ui_print "  > Timeout. Default: [No/Reset]"
-            fi
-            break
-        elif grep -q KEY_VOLUMEUP "$TMPDIR/events"; then
+        if grep -q KEY_VOLUMEUP "$TMPDIR/events"; then
             ui_print "  > Selected: [Yes/Keep]"
             default_action="true"
             break
@@ -85,17 +84,37 @@ choose_action() {
             default_action="false"
             break
         fi
+        count=$((count + 1))
     done
     
-    # Clear event buffer after detection
+    # Show timeout message if loop completed without selection
+    [ $count -ge $timeout_sec ] && {
+        [ "$default_action" = "true" ] && ui_print "  > Timeout. Default: [Yes/Keep]"
+        [ "$default_action" = "false" ] && ui_print "  > Timeout. Default: [No/Reset]"
+    }
+    
+    # Clear event buffer
     timeout 1 getevent -cl >/dev/null 2>&1
     
-    [ "$default_action" = "true" ] && return 0 || return 1
+    [ "$default_action" = "true" ]
 }
 
-# --- Smart Config Restore (Incremental Update) ---
-# Merges old settings into new config: existing keys are replaced, missing keys are appended
-# Supports multi-line values (package lists with newlines inside quotes)
+# Settings keys to migrate (centralized for easy maintenance)
+# Note: CORE_TIMEOUT, PROXY_TCP_PORT, PROXY_UDP_PORT, DNS_PORT are now read from config.json
+readonly MIGRATE_KEYS="
+SUBSCRIPTION_URL
+LOG_ENABLE LOG_LEVEL LOG_MAX_SIZE
+UPDATE_TIMEOUT RETRY_COUNT UPDATE_INTERVAL
+ROUTING_MARK
+PROXY_MODE DNS_HIJACK_ENABLE
+MOBILE_INTERFACE WIFI_INTERFACE HOTSPOT_INTERFACE USB_INTERFACE
+PROXY_MOBILE PROXY_WIFI PROXY_HOTSPOT PROXY_USB PROXY_TCP PROXY_UDP PROXY_IPV6
+APP_PROXY_ENABLE APP_PROXY_MODE PROXY_APPS_LIST BYPASS_APPS_LIST
+BYPASS_CN_IP CN_IP_URL CN_IPV6_URL
+MAC_FILTER_ENABLE MAC_PROXY_MODE PROXY_MACS_LIST BYPASS_MACS_LIST
+SKIP_CHECK_FEATURE
+"
+
 migrate_settings() {
     local backup_file="$1"
     local target_file="$2"
@@ -104,33 +123,7 @@ migrate_settings() {
     
     ui_print "  > Migrating settings (incremental)..."
     
-    # List of keys to migrate (all user-customizable settings)
-    # Subscription
-    local keys="SUBSCRIPTION_URL"
-    # Logging
-    keys="$keys LOG_ENABLE LOG_LEVEL LOG_MAX_SIZE"
-    # Timeouts
-    keys="$keys CORE_TIMEOUT UPDATE_TIMEOUT RETRY_COUNT UPDATE_INTERVAL"
-    # Routing
-    keys="$keys ROUTING_MARK"
-    # Ports
-    keys="$keys PROXY_TCP_PORT PROXY_UDP_PORT DNS_PORT"
-    # Proxy Mode
-    keys="$keys PROXY_MODE DNS_HIJACK_ENABLE"
-    # Network Interfaces
-    keys="$keys MOBILE_INTERFACE WIFI_INTERFACE HOTSPOT_INTERFACE USB_INTERFACE"
-    # Proxy Scope
-    keys="$keys PROXY_MOBILE PROXY_WIFI PROXY_HOTSPOT PROXY_USB PROXY_TCP PROXY_UDP PROXY_IPV6"
-    # Per-App Proxy
-    keys="$keys APP_PROXY_ENABLE APP_PROXY_MODE PROXY_APPS_LIST BYPASS_APPS_LIST"
-    # CN IP Bypass
-    keys="$keys BYPASS_CN_IP CN_IP_URL CN_IPV6_URL"
-    # MAC Filter
-    keys="$keys MAC_FILTER_ENABLE MAC_PROXY_MODE PROXY_MACS_LIST BYPASS_MACS_LIST"
-    # Advanced
-    keys="$keys SKIP_CHECK_FEATURE"
-    
-    for key in $keys; do
+    for key in $MIGRATE_KEYS; do
         # Use awk to extract value (handles multi-line quoted values)
         local value
         value=$(awk -v key="$key" '
@@ -218,13 +211,13 @@ main() {
             cp -f "$CONF_DIR/settings.ini" "$TMP_BACKUP/settings.ini"
             has_settings=true
         fi
-        # Backup config.json (user choice) - with update_timestamp
+        # Backup config.json (user choice) - with state file
         if [ -f "$CONF_DIR/config.json" ]; then
             cp -f "$CONF_DIR/config.json" "$TMP_BACKUP/config.json"
             has_config=true
-            # Also backup update_timestamp if exists (synced with config.json)
-            if [ -f "$RUN_DIR/.last_update" ]; then
-                cp -f "$RUN_DIR/.last_update" "$TMP_BACKUP/.last_update"
+            # Also backup state file if exists (contains last_update timestamp)
+            if [ -f "$FLUX_DIR/.state" ]; then
+                cp -f "$FLUX_DIR/.state" "$TMP_BACKUP/.state"
                 has_timestamp=true
             fi
         fi
@@ -269,18 +262,18 @@ main() {
         ui_print "- Using default settings.ini"
     fi
     
-    # 4.2 config.json + .last_update - User choice (synced together)
+    # 4.2 config.json + state file - User choice (synced together)
     if [ "$has_config" = "true" ]; then
         if choose_action "Keep [config.json]?" "true"; then
             cp -f "$TMP_BACKUP/config.json" "$CONF_DIR/config.json"
-            # Restore .last_update if it was backed up
+            # Restore state file (contains last_update) if it was backed up
             if [ "$has_timestamp" = "true" ]; then
-                cp -f "$TMP_BACKUP/.last_update" "$RUN_DIR/.last_update"
+                cp -f "$TMP_BACKUP/.state" "$FLUX_DIR/.state"
             fi
             ui_print "  > config.json: restored"
         else
-            # Reset config.json means also delete .last_update
-            rm -f "$RUN_DIR/.last_update" 2>/dev/null
+            # Reset config.json means also reset state file
+            rm -f "$FLUX_DIR/.state" 2>/dev/null
             ui_print "  > config.json: reset to default"
         fi
     fi

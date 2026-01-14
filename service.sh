@@ -1,41 +1,37 @@
 #!/system/bin/sh
 
-
 # ==============================================================================
 # Flux Boot Service (service.sh)
-# Description: Android boot initialization - launches inotify daemons and 
-#              conditionally starts services if module is enabled
-# Entry Points: This + flux.mod.inotify are the ONLY service entry points
+# Description: Android boot initialization and service launcher
 # ==============================================================================
 
-
-# ------------------------------------------------------------------------------
+# ==============================================================================
 # [ Environment Setup ]
-# ------------------------------------------------------------------------------
+# ==============================================================================
 
-# Load system configuration
-. "/data/adb/Flux/scripts/flux.config"
-. "/data/adb/Flux/scripts/flux.logger"
+# Load system configuration (absolute paths for boot safety)
+. "/data/adb/flux/scripts/flux.config"
+. "/data/adb/flux/scripts/flux.logger"
 
-# Load user configuration
-load_flux_config
+# Ensure run directory exists for logging
+[ ! -d "$RUN_DIR" ] && mkdir -p "$RUN_DIR" && chmod 0755 "$RUN_DIR"
 
+load_log_config
 export LOG_COMPONENT="Service"
-
 
 # ==============================================================================
 # [ Boot Detection ]
 # ==============================================================================
 
-# Wait for the Android system to signal boot completion via getprop
+# Wait for the Android system to signal boot completion
 wait_for_boot() {
     local boot_wait_count=0
     local MAX_BOOT_WAIT=60
     
     while [ "$boot_wait_count" -lt "$MAX_BOOT_WAIT" ]; do
-        # Check property to verify if boot process is finished
+        # Check property for finished boot
         if [ "$(getprop sys.boot_completed 2>/dev/null)" = "1" ]; then
-            log_info "System boot completed (waited ${boot_wait_count}s)"
+            log_debug "System boot completed (waited ${boot_wait_count}s)"
             return 0
         fi
         
@@ -47,9 +43,8 @@ wait_for_boot() {
     return 1
 }
 
-
 # ==============================================================================
-# [ Inotify Daemon Launcher ]
+# [ Inotify Managers ]
 # ==============================================================================
 
 # Launch inotifyd watcher for module toggle (disable file)
@@ -64,32 +59,13 @@ start_inotify_module() {
     pkill -f "inotifyd.*flux.mod.inotify" 2>/dev/null || true
     
     # Start inotifyd watching for create(n) and delete(d) events
-    # Specifically monitors file create/delete in the module directory
     inotifyd "$handler" "$watch_dir:nd" &
     
     log_info "Module toggle watcher started (monitoring $watch_dir)"
 }
 
-# Launch inotifyd watcher for packages.list changes (UID cache invalidation)
-start_inotify_packages() {
-    local handler="$SCRIPTS_DIR/flux.pkg.inotify"
-    local watch_dir="/data/system"
-    
-    # Ensure handler is executable
-    [ -f "$handler" ] && chmod +x "$handler" 2>/dev/null
-    
-    # Kill any existing instance
-    pkill -f "inotifyd.*flux.pkg.inotify" 2>/dev/null || true
-    
-    # Start inotifyd watching for write(w), create(c), and move(m) events
-    # Monitors packages.list for app install/uninstall/update
-    inotifyd "$handler" "$watch_dir:wcm" &
-    
-    log_info "Package list watcher started (monitoring $watch_dir)"
-}
-
 # ==============================================================================
-# [ Main Execution Flow ]
+# [ Main Execution ]
 # ==============================================================================
 
 main() {
@@ -99,7 +75,7 @@ main() {
     # Additional delay for system stability
     sleep 5
     
-    # Verify start script exists
+    # Verify start script
     [ ! -f "$START_SCRIPT" ] && {
         log_error "Start script not found: $START_SCRIPT"
         exit 1
@@ -108,18 +84,15 @@ main() {
     # Ensure start script is executable
     [ ! -x "$START_SCRIPT" ] && chmod +x "$START_SCRIPT" 2>/dev/null
     
-    # Launch module toggle watcher first (always active for reactive control)
+    # Launch module toggle watcher (always active for reactive control)
     start_inotify_module
     
-    # Launch packages.list watcher for UID cache invalidation
-    start_inotify_packages
-    
-    # Check if module is disabled (disable file exists)
+    # Check if module is disabled
     if [ -f "$MAGISK_MOD_DIR/disable" ]; then
         log_info "Module is disabled, skipping service start"
         exit 0
     fi
-    
+     
     # Start services
     log_info "Starting Flux services..."
     /system/bin/sh "$START_SCRIPT" start

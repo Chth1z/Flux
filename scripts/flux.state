@@ -2,203 +2,268 @@
 
 # ==============================================================================
 # Flux State Machine (flux.state)
-# Description: Service state management with explicit transitions
-# States: STOPPED -> STARTING -> RUNNING -> STOPPING -> STOPPED
-#                       |                       |
-#                       v                       v
-#                    FAILED <-----------------+
+# Description: Concurrency control and state management
 # ==============================================================================
 
-# ------------------------------------------------------------------------------
-# [ State Constants ]
-# ------------------------------------------------------------------------------
+# ==============================================================================
+# [ State File Operations ]
+# ==============================================================================
 
-readonly STATE_STOPPED="STOPPED"
-readonly STATE_STARTING="STARTING"
-readonly STATE_RUNNING="RUNNING"
-readonly STATE_STOPPING="STOPPING"
-readonly STATE_FAILED="FAILED"
+# Lock directory (mkdir is atomic)
+_STATE_LOCK_DIR=""
 
-# State file location (set by flux.config)
-# STATE_FILE="$RUN_DIR/.state"
-
-# ------------------------------------------------------------------------------
-# [ State Read/Write ]
-# ------------------------------------------------------------------------------
-
-# Get current state (default: STOPPED if no file)
-get_state() {
-    if [ -f "$STATE_FILE" ]; then
-        cat "$STATE_FILE" 2>/dev/null || echo "$STATE_STOPPED"
-    else
-        echo "$STATE_STOPPED"
-    fi
+# Acquire state file lock using mkdir (atomic, portable)
+_state_lock() {
+    _STATE_LOCK_DIR="${STATE_FILE}.lock"
+    local attempts=0
+    local max_attempts=50  # 5 seconds max wait
+    
+    while ! mkdir "$_STATE_LOCK_DIR" 2>/dev/null; do
+        attempts=$((attempts + 1))
+        if [ $attempts -ge $max_attempts ]; then
+            log_warn "State lock timeout, forcing acquisition"
+            rm -rf "$_STATE_LOCK_DIR" 2>/dev/null
+            mkdir "$_STATE_LOCK_DIR" 2>/dev/null || true
+            break
+        fi
+        sleep 0.1 2>/dev/null || sleep 1
+    done
 }
 
-# Set state with logging
-set_state() {
-    local new_state="$1"
-    local old_state
-    old_state=$(get_state)
+# Release state file lock
+_state_unlock() {
+    [ -n "$_STATE_LOCK_DIR" ] && rm -rf "$_STATE_LOCK_DIR" 2>/dev/null
+}
+
+# Read a key from state file
+_state_get() {
+    local key="$1"
+    local value=""
+    
+    if [ -f "$STATE_FILE" ]; then
+        value=$(grep "^${key}=" "$STATE_FILE" 2>/dev/null | tail -1 | cut -d= -f2-)
+    fi
+    
+    echo "$value"
+}
+
+# Set a key in state file (atomic with lock)
+_state_set() {
+    local key="$1"
+    local value="$2"
+    
+    _state_lock
     
     mkdir -p "$(dirname "$STATE_FILE")" 2>/dev/null
-    echo "$new_state" > "$STATE_FILE"
     
-    log_debug "State transition: $old_state -> $new_state"
+    local content="" line found=0 newline="
+"
+    if [ -f "$STATE_FILE" ]; then
+        while IFS= read -r line || [ -n "$line" ]; do
+            case "$line" in
+                "${key}="*) 
+                    content="${content}${key}=${value}${newline}"
+                    found=1
+                    ;;
+                *) content="${content}${line}${newline}" ;;
+            esac
+        done < "$STATE_FILE"
+    fi
+    
+    [ "$found" -eq 0 ] && content="${content}${key}=${value}${newline}"
+    printf '%s' "$content" > "$STATE_FILE"
+    
+    _state_unlock
 }
 
-# ------------------------------------------------------------------------------
-# [ State Validation ]
-# ------------------------------------------------------------------------------
+# ==============================================================================
+# [ State Initialization ]
+# ==============================================================================
 
-# Check if transition is valid
-# Returns: 0 if valid, 1 if invalid
-validate_transition() {
-    local current="$1"
-    local target="$2"
+# Initialize/reset runtime state
+state_init() {
+    mkdir -p "$(dirname "$STATE_FILE")" 2>/dev/null
+    [ ! -f "$STATE_FILE" ] && touch "$STATE_FILE"
     
-    case "$current:$target" in
-        # Valid start transitions
-        "$STATE_STOPPED:$STATE_STARTING") return 0 ;;
-        "$STATE_FAILED:$STATE_STARTING")  return 0 ;;
-        
-        # Valid running transitions
-        "$STATE_STARTING:$STATE_RUNNING") return 0 ;;
-        "$STATE_STARTING:$STATE_FAILED")  return 0 ;;
-        
-        # Valid stop transitions
-        "$STATE_RUNNING:$STATE_STOPPING") return 0 ;;
-        "$STATE_STOPPING:$STATE_STOPPED") return 0 ;;
-        "$STATE_STOPPING:$STATE_FAILED")  return 0 ;;
-        
-        # Force stop from any state
-        "*:$STATE_STOPPING")              return 0 ;;
-        
-        # Reset from failed
-        "$STATE_FAILED:$STATE_STOPPED")   return 0 ;;
-        
-        # Invalid
+    # Only reset runtime state, preserves persistent fields like last_update
+    _state_set "service" "$STATE_STOPPED"
+    _state_set "core" "$STATE_STOPPED"
+    _state_set "tproxy" "$STATE_STOPPED"
+    _state_set "core_ts" "0"
+    _state_set "tproxy_ts" "0"
+    
+    log_debug "State initialized"
+}
+
+# Reset state to stopped (alias)
+state_reset() {
+    state_init
+}
+
+# ==============================================================================
+# [ State Accessors ]
+# ==============================================================================
+
+# Get overall service state
+get_service_state() {
+    local state
+    state=$(_state_get "service")
+    echo "${state:-$STATE_STOPPED}"
+}
+
+# Set overall service state
+set_service_state() {
+    local new_state="$1"
+    local old_state
+    old_state=$(get_service_state)
+    
+    _state_set "service" "$new_state"
+    log_debug "Service state: $old_state -> $new_state"
+}
+
+# Get component state
+get_component_state() {
+    local component="$1"
+    local state
+    state=$(_state_get "$component")
+    echo "${state:-$STATE_STOPPED}"
+}
+
+# Set component state with timestamp
+set_component_state() {
+    local component="$1"
+    local new_state="$2"
+    local old_state
+    local ts
+    
+    old_state=$(get_component_state "$component")
+    ts=$(date +%s)
+    
+    _state_set "$component" "$new_state"
+    _state_set "${component}_ts" "$ts"
+    
+    log_debug "Component $component: $old_state -> $new_state"
+}
+
+# ==============================================================================
+# [ Barrier Synchronization ]
+# ==============================================================================
+
+# Check if a state is terminal (not transitional)
+_is_terminal_state() {
+    local state="$1"
+    case "$state" in
+        $STATE_RUNNING|$STATE_FAILED|$STATE_STOPPED)
+            return 0
+            ;;
         *)
-            log_warn "Invalid state transition: $current -> $target"
             return 1
             ;;
     esac
 }
 
-# ------------------------------------------------------------------------------
+# Wait for all components to reach terminal state
+barrier_wait() {
+    local timeout="${1:-30}"
+    local elapsed=0
+    local interval=1
+    
+    log_debug "Barrier wait: timeout=${timeout}s"
+    
+    while [ $elapsed -lt $timeout ]; do
+        local core_state tproxy_state
+        core_state=$(get_component_state "$COMP_CORE")
+        tproxy_state=$(get_component_state "$COMP_TPROXY")
+        
+        # Check if both reached terminal state
+        if _is_terminal_state "$core_state" && _is_terminal_state "$tproxy_state"; then
+            log_debug "Barrier passed: core=$core_state, tproxy=$tproxy_state"
+            return 0
+        fi
+        
+        sleep $interval
+        elapsed=$((elapsed + interval))
+    done
+    
+    log_warn "Barrier timeout: core=$(get_component_state $COMP_CORE), tproxy=$(get_component_state $COMP_TPROXY)"
+    return 1
+}
+
+# ==============================================================================
+# [ Rollback Logic ]
+# ==============================================================================
+
+# Result Analyzers
+all_components_running() {
+    [ "$(get_component_state $COMP_CORE)" = "$STATE_RUNNING" ] && \
+    [ "$(get_component_state $COMP_TPROXY)" = "$STATE_RUNNING" ]
+}
+
+all_components_stopped() {
+    [ "$(get_component_state $COMP_CORE)" = "$STATE_STOPPED" ] && \
+    [ "$(get_component_state $COMP_TPROXY)" = "$STATE_STOPPED" ]
+}
+
+get_running_components() {
+    local running=""
+    [ "$(get_component_state $COMP_CORE)" = "$STATE_RUNNING" ] && running="$COMP_CORE"
+    [ "$(get_component_state $COMP_TPROXY)" = "$STATE_RUNNING" ] && running="$running $COMP_TPROXY"
+    echo "$running" | xargs
+}
+
+# Rollback a specific component
+rollback_component() {
+    local component="$1"
+    
+    log_info "Rolling back component: $component"
+    set_component_state "$component" "$STATE_ROLLING_BACK"
+    
+    case "$component" in
+        "$COMP_CORE")
+            sh "$SCRIPT_DIR/flux.core" stop >/dev/null 2>&1 || true
+            ;;
+        "$COMP_TPROXY")
+            sh "$TPROXY_SCRIPT" stop >/dev/null 2>&1 || true
+            ;;
+    esac
+    
+    set_component_state "$component" "$STATE_STOPPED"
+    log_debug "Rollback complete: $component"
+}
+
+# Rollback all running components
+rollback_running_components() {
+    local running
+    running=$(get_running_components)
+    
+    if [ -n "$running" ]; then
+        log_info "Rolling back running components: $running"
+        for comp in $running; do
+            rollback_component "$comp"
+        done
+    fi
+}
+
+# ==============================================================================
 # [ State Checks ]
-# ------------------------------------------------------------------------------
+# ==============================================================================
 
-# Check if service is in running state
-is_running() {
-    [ "$(get_state)" = "$STATE_RUNNING" ]
+is_service_running() {
+    [ "$(get_service_state)" = "$STATE_RUNNING" ]
 }
 
-# Check if service is in transitional state
-is_transitioning() {
+is_service_stopped() {
     local state
-    state=$(get_state)
-    [ "$state" = "$STATE_STARTING" ] || [ "$state" = "$STATE_STOPPING" ]
-}
-
-# Check if service is stopped or failed
-is_stopped() {
-    local state
-    state=$(get_state)
+    state=$(get_service_state)
     [ "$state" = "$STATE_STOPPED" ] || [ "$state" = "$STATE_FAILED" ]
 }
 
-# Check if can start (not running or transitioning)
 can_start() {
     local state
-    state=$(get_state)
+    state=$(get_service_state)
     [ "$state" = "$STATE_STOPPED" ] || [ "$state" = "$STATE_FAILED" ]
 }
 
-# Check if can stop (running)
 can_stop() {
-    [ "$(get_state)" = "$STATE_RUNNING" ]
-}
-
-# Check if can reload (must be running)
-can_reload() {
-    [ "$(get_state)" = "$STATE_RUNNING" ]
-}
-
-# ------------------------------------------------------------------------------
-# [ State Transition Helpers ]
-# ------------------------------------------------------------------------------
-
-# Transition to STARTING state
-transition_starting() {
-    if can_start; then
-        set_state "$STATE_STARTING"
-        return 0
-    else
-        log_warn "Cannot start: current state is $(get_state)"
-        return 1
-    fi
-}
-
-# Transition to RUNNING state
-transition_running() {
-    if [ "$(get_state)" = "$STATE_STARTING" ]; then
-        set_state "$STATE_RUNNING"
-        return 0
-    else
-        log_error "Invalid transition to RUNNING from $(get_state)"
-        return 1
-    fi
-}
-
-# Transition to STOPPING state
-transition_stopping() {
-    local current
-    current=$(get_state)
-    
-    # Allow force stop from any state except already stopped
-    if [ "$current" != "$STATE_STOPPED" ]; then
-        set_state "$STATE_STOPPING"
-        return 0
-    else
-        log_debug "Already stopped"
-        return 0
-    fi
-}
-
-# Transition to STOPPED state
-transition_stopped() {
-    set_state "$STATE_STOPPED"
-    return 0
-}
-
-# Transition to FAILED state
-transition_failed() {
-    set_state "$STATE_FAILED"
-    return 0
-}
-
-# Reset state file (for cleanup)
-reset_state() {
-    rm -f "$STATE_FILE" 2>/dev/null
-    log_debug "State reset"
-}
-
-# ------------------------------------------------------------------------------
-# [ State Info ]
-# ------------------------------------------------------------------------------
-
-# Get human-readable state info
-get_state_info() {
-    local state
-    state=$(get_state)
-    
-    case "$state" in
-        "$STATE_STOPPED")  echo "Service is stopped" ;;
-        "$STATE_STARTING") echo "Service is starting..." ;;
-        "$STATE_RUNNING")  echo "Service is running" ;;
-        "$STATE_STOPPING") echo "Service is stopping..." ;;
-        "$STATE_FAILED")   echo "Service failed" ;;
-        *)                 echo "Unknown state: $state" ;;
-    esac
+    [ "$(get_service_state)" = "$STATE_RUNNING" ]
 }

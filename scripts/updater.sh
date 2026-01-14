@@ -1,59 +1,45 @@
 #!/system/bin/sh
 
+# ==============================================================================
+# Flux Subscription Updater (updater.sh)
+# Description: Updates subscription, processes config templates, and updates IP lists
+# ==============================================================================
 
 # ==============================================================================
-# TProxyShell Subscription Updater (updater.sh)
-# Description: Downloads, converts, and generates sing-box configuration
+# [ Environment Setup ]
 # ==============================================================================
-
-# ------------------------------------------------------------------------------
-# [ Load Dependencies ]
-# ------------------------------------------------------------------------------
 
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 . "$SCRIPT_DIR/flux.config"
 . "$SCRIPT_DIR/flux.logger"
+. "$SCRIPT_DIR/flux.state"
 
-# Set log component name
 export LOG_COMPONENT="Update"
-
 
 # ==============================================================================
 # [ Country Mapping ]
 # ==============================================================================
-# Mapping country codes to regex patterns for node filtering
-readonly COUNTRY_REGEX_MAP='
-{
-  "HK": "港|hk|hongkong|🇭🇰",
-  "TW": "台|tw|taiwan|🇹🇼",
-  "JP": "日本|jp|japan|🇯🇵",
-  "SG": "新|sg|singapore|🇸🇬",
-  "US": "美|us|united states|🇺🇸",
-  "KR": "韩|kr|korea|🇰🇷",
-  "UK": "英|uk|united kingdom|🇬🇧",
-  "DE": "德|de|germany|🇩🇪",
-  "FR": "法|fr|france|🇫🇷",
-  "CA": "加|ca|canada|🇨🇦",
-  "AU": "澳|au|australia|🇦🇺",
-  "RU": "俄|ru|russia|🇷🇺",
-  "NL": "荷|nl|netherlands|🇳🇱",
-  "IN": "印|in|india|🇮🇳",
-  "TR": "土|tr|turkey|🇹🇷",
-  "IT": "意|it|italy|🇮🇹",
-  "CH": "瑞|ch|switzerland|🇨🇭",
-  "SE": "瑞典|se|sweden|🇸🇪",
-  "BR": "巴西|br|brazil|🇧🇷",
-  "AR": "阿根廷|ar|argentina|🇦🇷",
-  "VN": "越|vn|vietnam|🇻🇳",
-  "TH": "泰|th|thailand|🇹🇭",
-  "PH": "菲|ph|philippines|🇵🇭",
-  "MY": "马|my|malaysia|🇲🇾",
-  "ID": "印尼|id|indonesia|🇮🇩"
-}'
 
+# Load country mapping from external JSON file for easier maintenance
+readonly COUNTRY_MAP_FILE="$TOOLS_DIR/base/country_map.json"
+
+# Cache for country map (loaded once, reused)
+_COUNTRY_MAP_CACHE=""
+
+# Load country regex map from file with caching
+_load_country_map() {
+    if [ -z "$_COUNTRY_MAP_CACHE" ]; then
+        if [ -f "$COUNTRY_MAP_FILE" ]; then
+            _COUNTRY_MAP_CACHE=$(cat "$COUNTRY_MAP_FILE")
+        else
+            _COUNTRY_MAP_CACHE="{}"
+        fi
+    fi
+    echo "$_COUNTRY_MAP_CACHE"
+}
 
 # ==============================================================================
-# [ JQ Scripts Logic ]
+# [ JQ Scripts ]
 # ==============================================================================
 
 # 1. Build Filter Regex
@@ -83,16 +69,16 @@ readonly JQ_SCRIPT_EXTRACT_NODES='
     end
 '
 
-# 3. Generate Config
+# 3. Generate Config (uses $country_map passed via --argjson)
 readonly JQ_SCRIPT_MERGE_CONFIG='
     ($nodes[0] // []) as $valid_nodes |
     
     (.outbounds // []) |= map(
-        if (.type == "selector") and ($COUNTRY_REGEX_MAP[.tag] != null) then
+        if (.type == "selector") and ($country_map[.tag] != null) then
             .tag as $group_tag |
             .outbounds = (
                 $valid_nodes
-                | map(select(.tag | test($COUNTRY_REGEX_MAP[$group_tag]; "i")))
+                | map(select(.tag | test($country_map[$group_tag]; "i")))
                 | map(.tag)
             )
         elif (.tag == "PROXY" or .tag == "GLOBAL" or .tag == "AUTO") and ((.outbounds | length) == 0) then
@@ -107,10 +93,73 @@ readonly JQ_SCRIPT_MERGE_CONFIG='
 
 
 # ==============================================================================
+# [ Utility Helpers ]
+# ==============================================================================
+
+# Retry a command with configurable attempts
+# Usage: _retry <max_retries> <command...>
+_retry() {
+    local max="$1"; shift
+    local n=0
+    while [ $n -le $max ]; do
+        "$@" && return 0
+        n=$((n + 1))
+        [ $n -le $max ] && { log_warn "Retry $n of $max..."; sleep 1; }
+    done
+    return 1
+}
+
+# Check if file is stale (older than N days)
+# Usage: _is_file_stale <file> [days=7]
+_is_file_stale() {
+    local file="$1" days="${2:-7}"
+    [ ! -f "$file" ] && return 0
+    local now mtime
+    now=$(date +%s)
+    mtime=$(stat -c %Y "$file" 2>/dev/null || echo 0)
+    [ $((now - mtime)) -gt $((days * 86400)) ]
+}
+
+
+# ==============================================================================
 # [ CN IP List Management ]
 # ==============================================================================
 
+# Internal helper: download file with HTTP status validation
+_download_with_validation() {
+    local url="$1"
+    local output="$2"
+    local description="$3"
+    
+    local http_code
+    http_code=$(curl -fsSL --connect-timeout "$UPDATE_TIMEOUT" --retry "$RETRY_COUNT" \
+        -w "%{http_code}" \
+        -o "$output.tmp" \
+        "$url" 2>/dev/null)
+    
+    # Validate HTTP response code (2xx = success)
+    case "$http_code" in
+        2[0-9][0-9])
+            if [ -s "$output.tmp" ]; then
+                mv "$output.tmp" "$output"
+                log_info "$description updated (HTTP $http_code)"
+                return 0
+            else
+                log_warn "$description download empty (HTTP $http_code)"
+                rm -f "$output.tmp"
+                return 1
+            fi
+            ;;
+        *)
+            log_warn "$description download failed (HTTP $http_code)"
+            rm -f "$output.tmp"
+            return 1
+            ;;
+    esac
+}
+
 # Download China IP lists if bypass is enabled and file is outdated
+# Uses parallel downloads for IPv4 and IPv6 when both are needed
 download_cn_ip_list() {
     if [ "$BYPASS_CN_IP" -ne 1 ]; then
         log_debug "CN IP bypass disabled, skipping download"
@@ -118,45 +167,46 @@ download_cn_ip_list() {
     fi
 
     log_info "Updating CN IP list..."
-
-    # Download IPv4 list
-    if [ ! -f "$CN_IP_FILE" ] || [ "$(find "$CN_IP_FILE" -mtime +7 2> /dev/null)" ]; then
-        log_info "Fetching CN IPv4 list..."
-        if curl -fsSL --connect-timeout "$UPDATE_TIMEOUT" --retry "$RETRY_COUNT" \
-            "$CN_IP_URL" \
-            -o "$CN_IP_FILE.tmp" 2>/dev/null; then
-            mv "$CN_IP_FILE.tmp" "$CN_IP_FILE"
-            log_info "CN IPv4 list updated"
-        else
-            log_warn "CN IPv4 download failed"
-            prop_warn "CN IPv4 download failed"
-            rm -f "$CN_IP_FILE.tmp"
-        fi
-    else
-        log_debug "CN IPv4 list is up to date"
-    fi
-
-    # Download IPv6 list if enabled
+    
+    local ipv4_needed=0
+    local ipv6_needed=0
+    
+    # Check if updates are needed (files missing or older than 7 days)
+    _is_file_stale "$CN_IP_FILE" 7 && ipv4_needed=1
+    
     if [ "$PROXY_IPV6" -eq 1 ]; then
-        if [ ! -f "$CN_IPV6_FILE" ] || [ "$(find "$CN_IPV6_FILE" -mtime +7 2> /dev/null)" ]; then
-            log_info "Fetching CN IPv6 list..."
-            if curl -fsSL --connect-timeout "$UPDATE_TIMEOUT" --retry "$RETRY_COUNT" \
-                "$CN_IPV6_URL" \
-                -o "$CN_IPV6_FILE.tmp" 2>/dev/null; then
-                mv "$CN_IPV6_FILE.tmp" "$CN_IPV6_FILE"
-                log_info "CN IPv6 list updated"
-            else
-                log_warn "CN IPv6 download failed"
-                prop_warn "CN IPv6 download failed"
-                rm -f "$CN_IPV6_FILE.tmp"
-            fi
-        else
-            log_debug "CN IPv6 list is up to date"
-        fi
+        _is_file_stale "$CN_IPV6_FILE" 7 && ipv6_needed=1
+    fi
+    
+    # Parallel download if both needed
+    if [ "$ipv4_needed" -eq 1 ] && [ "$ipv6_needed" -eq 1 ]; then
+        log_debug "Fetching CN IPv4 and IPv6 lists in parallel..."
+        
+        _download_with_validation "$CN_IP_URL" "$CN_IP_FILE" "CN IPv4 list" &
+        local pid_v4=$!
+        
+        _download_with_validation "$CN_IPV6_URL" "$CN_IPV6_FILE" "CN IPv6 list" &
+        local pid_v6=$!
+        
+        wait $pid_v4 || prop_warn "CN IPv4 download failed"
+        wait $pid_v6 || prop_warn "CN IPv6 download failed"
+        
+    elif [ "$ipv4_needed" -eq 1 ]; then
+        log_debug "Fetching CN IPv4 list..."
+        _download_with_validation "$CN_IP_URL" "$CN_IP_FILE" "CN IPv4 list" || \
+            prop_warn "CN IPv4 download failed"
+            
+    elif [ "$ipv6_needed" -eq 1 ]; then
+        log_debug "Fetching CN IPv6 list..."
+        _download_with_validation "$CN_IPV6_URL" "$CN_IPV6_FILE" "CN IPv6 list" || \
+            prop_warn "CN IPv6 download failed"
+    else
+        log_debug "CN IP lists are up to date"
     fi
     
     return 0
 }
+
 
 
 # ==============================================================================
@@ -165,11 +215,7 @@ download_cn_ip_list() {
 
 # Remove temporary files
 cleanup_temp_files() {
-    local files="$TMP_SUB_CONVERTED $TMP_NODES_EXTRACTED $GENERATE_FILE"
-    for file in $files; do
-        [ -f "$file" ] && rm -f "$file" 2>/dev/null
-    done
-    
+    rm -f "$TMP_SUB_CONVERTED" "$TMP_NODES_EXTRACTED" "$GENERATE_FILE" 2>/dev/null
     log_debug "Temporary files cleaned up"
 }
 
@@ -200,23 +246,14 @@ validate_environment() {
 }
 
 # Exit with error message and perform cleanup
+# (Uses die() from flux.logger, but adds cleanup)
 fatal() {
-    log_error "$1"
-    prop_warn "$1"
     cleanup_temp_files
-    exit 1
+    die "$1"
 }
 
 # Check if a file exists and is not empty
-validate_file() {
-    local file="$1"
-    local description="$2"
-    
-    [ ! -f "$file" ] && return 1
-    [ ! -s "$file" ] && return 1
-    
-    return 0
-}
+validate_file() { [ -s "$1" ]; }
 
 
 # ==============================================================================
@@ -240,24 +277,7 @@ url=$SUBSCRIPTION_URL
 path=$TMP_SUB_CONVERTED
 EOF
     
-    local attempt=0
-    local success=0
-    
-    while [ $attempt -le $RETRY_COUNT ]; do
-        if [ $attempt -gt 0 ]; then
-            log_warn "Retry attempt $attempt of $RETRY_COUNT..."
-            sleep 1
-        fi
-
-        if ./subconverter -g >/dev/null 2>&1; then
-            success=1
-            break
-        fi
-
-        attempt=$((attempt + 1))
-    done
-    
-    if [ $success -eq 0 ]; then
+    if ! _retry "$RETRY_COUNT" ./subconverter -g >/dev/null 2>&1; then
         rm -f "$GENERATE_FILE"
         fatal "Subscription convert failed"
     fi
@@ -280,7 +300,9 @@ EOF
 
 # Build dynamic filter regex based on available template groups
 build_filter_regex() {
-    ./jq -r --argjson map "$COUNTRY_REGEX_MAP" \
+    local country_map
+    country_map=$(_load_country_map)
+    ./jq -r --argjson map "$country_map" \
         "$JQ_SCRIPT_BUILD_REGEX" \
         "$TEMPLATE_FILE"
 }
@@ -324,8 +346,11 @@ merge_nodes_into_template() {
     
     [ -f "$CONFIG_FILE" ] && cp -f "$CONFIG_FILE" "$CONFIG_BACKUP" 2>/dev/null
     
+    local country_map
+    country_map=$(_load_country_map)
+    
     ./jq --slurpfile nodes "$TMP_NODES_EXTRACTED" \
-         --argjson COUNTRY_REGEX_MAP "$COUNTRY_REGEX_MAP" \
+         --argjson country_map "$country_map" \
          "$JQ_SCRIPT_MERGE_CONFIG" \
          "$TEMPLATE_FILE" > "$CONFIG_FILE"
     
@@ -375,11 +400,12 @@ validate_and_report() {
 
 # Check if enough time has passed since last update
 should_update() {
-    # If no timestamp file exists, should update
-    [ ! -f "$LAST_UPDATE_FILE" ] && return 0
-    
     local last_update current_time elapsed
-    last_update=$(cat "$LAST_UPDATE_FILE" 2>/dev/null || echo 0)
+    
+    # Read last_update from unified state file
+    last_update=$(_state_get "last_update")
+    [ -z "$last_update" ] && return 0  # No timestamp = should update
+    
     current_time=$(date +%s)
     elapsed=$((current_time - last_update))
     
@@ -416,8 +442,8 @@ do_update() {
     # Download CN IP list if enabled in config
     download_cn_ip_list
     
-    # Update timestamp
-    date +%s > "$LAST_UPDATE_FILE"
+    # Update timestamp in unified state file
+    _state_set "last_update" "$(date +%s)"
     
     # Cleanup
     cleanup_temp_files
@@ -442,7 +468,7 @@ main() {
                 log_info "Update interval exceeded, starting update..."
                 do_update
             else
-                log_info "Skipping update (interval not reached)"
+                log_debug "Skipping update (interval not reached)"
             fi
             ;;
         update|*)

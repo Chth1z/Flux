@@ -3,19 +3,22 @@
 # ==============================================================================
 # Flux Module Toggle Listener (flux.mod.inotify)
 # Description: Monitor Magisk disable file for module toggle
-# Pattern: Based on box4magisk box.inotify
 # ==============================================================================
 
-scripts=$(realpath "$0")
-scripts_dir=$(dirname "${scripts}")
+# ==============================================================================
+# [ Environment Setup ]
+# ==============================================================================
 
-. "${scripts_dir}/flux.config"
-. "${scripts_dir}/flux.logger"
+SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+. "$SCRIPT_DIR/flux.config"
+. "$SCRIPT_DIR/flux.logger"
 
-# Load user configuration
-load_flux_config
-
+load_log_config
 export LOG_COMPONENT="ModInotify"
+
+# ==============================================================================
+# [ Event Handlers ]
+# ==============================================================================
 
 events=$1
 monitor_dir=$2
@@ -33,15 +36,16 @@ service_control() {
     
     if [ "${monitor_file}" = "disable" ]; then
         if [ "${events}" = "d" ]; then
-            # disable file deleted = module enabled
+            # disable file deleted -> Module Enabled -> Start Service
             log_info "Module enabled, starting service"
-            sh "${scripts_dir}/start.sh" start >> "${LOG_FILE}" 2>&1
+            sh "${SCRIPT_DIR}/start.sh" start >> "${LOG_FILE}" 2>&1
         elif [ "${events}" = "n" ]; then
-            # disable file created = module disabled
+            # disable file created -> Module Disabled -> Stop Service
             log_info "Module disabled, stopping service"
-            sh "${scripts_dir}/start.sh" stop >> "${LOG_FILE}" 2>&1
+            sh "${SCRIPT_DIR}/start.sh" stop >> "${LOG_FILE}" 2>&1
         fi
     fi
 }
 
+# Run control logic
 service_control

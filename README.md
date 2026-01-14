@@ -11,6 +11,13 @@ A powerful Android transparent proxy module powered by [sing-box](https://sing-b
 - **Subconverter Built-in**: Automatic subscription conversion and node filtering
 - **jq Processor**: JSON manipulation for configuration generation
 
+### Architecture
+- **Parallel Start/Stop**: Core and TProxy start simultaneously with barrier synchronization
+- **State Machine**: Robust state tracking (STOPPED → STARTING → RUNNING → STOPPING)
+- **Atomic Rollback**: If any component fails, all running components are rolled back
+- **Environment Inheritance**: Configuration loaded once, inherited by all child processes
+- **Kernel Feature Caching**: Detected once at startup, exported via environment variables
+
 ### Proxy Modes
 - **TPROXY** (default): Full TCP/UDP support with transparent proxying
 - **REDIRECT**: Fallback mode for kernels without TPROXY support
@@ -30,46 +37,47 @@ Independent proxy switches for each network interface:
 - USB Tethering (`rndis+`)
 
 ### Filtering Mechanisms
-- **Per-App Proxy**: UID-based blacklist/whitelist mode
+- **Per-App Proxy**: UID-based blacklist/whitelist mode with caching
 - **MAC Filter**: MAC address filtering for hotspot clients
 - **Anti-Loopback**: Built-in route marking and user group protection to prevent traffic loops
-- **Dynamic IP Monitor**: Automatically handles temporary IPv6 addresses
+- **Dynamic IP Monitor**: Automatically handles temporary IPv6 addresses with flush+re-add strategy
 
 ### Subscription Management
 - Automatic download, conversion, and configuration generation
-- Node filtering by region (regex-based country matching)
+- Node filtering by region (regex-based country matching via `country_map.json`)
 - Configurable update interval with smart caching
 - Manual force update via `updater.sh`
 
 ### Interaction
 - **[Vol+] / [Vol-]**: Choose whether to preserve configuration during installation
 - **Module Toggle**: Enable/disable via Magisk Manager (reactive inotify-based)
-- **Update Subscription**: Auto-updates on boot if `UPDATE_INTERVAL` has passed; run `updater.sh force` to update manually
+- **Update Subscription**: Auto-updates on boot if `UPDATE_INTERVAL` has passed; run `updater.sh` to update manually
 - **Web Dashboard**: Zashboard UI at `http://127.0.0.1:9090/ui/`
 
 ---
 
 ## Directory Structure
 
-All module files are located at `/data/adb/Flux/`:
+All module files are located at `/data/adb/flux/`:
 
 ```
-/data/adb/Flux/
+/data/adb/flux/
 ├── bin/
 │   └── sing-box              # sing-box core binary
 │
 ├── conf/
 │   ├── config.json           # Generated sing-box configuration
+│   ├── cnip.txt              # China IPv4 CIDR list (optional)
+│   ├── cnip6.txt             # China IPv6 CIDR list (optional)
 │   └── settings.ini          # User configuration file
 │
 ├── run/
-│   ├── zashboard/            # Web dashboard files
-│   ├── sing-box.log          # sing-box core logs
-│   ├── Flux.log              # Module runtime logs (with rotation)
+│   ├── flux.log              # Module runtime logs (with rotation)
 │   ├── sing-box.pid          # sing-box process PID
-│   ├── ip_monitor.pid        # IP monitor daemon PID
 │   ├── cache.db              # sing-box cache database
-│   └── .ip_cache             # IP monitor address cache
+│   ├── cache_ip              # IP monitor address cache
+│   ├── cache_uid             # UID resolution cache
+│   └── cache_kernel          # Kernel feature cache
 │
 ├── scripts/
 │   ├── flux.config           # Centralized path definitions & defaults
@@ -77,27 +85,27 @@ All module files are located at `/data/adb/Flux/`:
 │   ├── flux.ip.monitor       # Dynamic IP address monitor daemon
 │   ├── flux.logger           # Advanced logging & prop management
 │   ├── flux.mod.inotify      # Module toggle listener (inotifyd)
+│   ├── flux.state            # State machine & barrier synchronization
 │   ├── flux.tproxy           # TProxy/Redirect iptables rules
+│   ├── flux.validator        # Configuration & kernel validation
 │   ├── start.sh              # Service orchestrator (parallel start/stop)
 │   └── updater.sh            # Subscription updater & config generator
 │
 ├── tools/
 │   ├── base/
+│   │   ├── country_map.json  # Country regex mapping for node filtering
 │   │   └── singbox.json      # sing-box configuration template
 │   ├── jq                    # jq binary for JSON processing
 │   ├── pref.toml             # Subconverter preferences
 │   └── subconverter          # Subconverter binary
 │
-└── state/
-    ├── .core_ready           # Core startup completion flag
-    ├── .tproxy_ready         # TProxy setup completion flag
-    └── .last_update          # Last subscription update timestamp
+└── .state                    # Unified state file (service/component states)
 ```
 
-### Magisk Module Directory (`/data/adb/modules/Flux/`)
+### Magisk Module Directory (`/data/adb/modules/flux/`)
 
 ```
-/data/adb/modules/Flux/
+/data/adb/modules/flux/
 ├── webroot/
 │   └── index.html            # Redirect to dashboard UI
 ├── service.sh                # Boot service launcher
@@ -109,7 +117,7 @@ All module files are located at `/data/adb/Flux/`:
 
 ## Configuration
 
-Main configuration file: `/data/adb/Flux/conf/settings.ini`
+Main configuration file: `/data/adb/flux/conf/settings.ini`
 
 ### Key Settings
 
@@ -167,7 +175,7 @@ Main configuration file: `/data/adb/Flux/conf/settings.ini`
 3. During installation:
    - Press **[Vol+]** to preserve existing configuration
    - Press **[Vol-]** to use fresh default configuration
-4. Configure your subscription URL in `/data/adb/Flux/conf/settings.ini`
+4. Configure your subscription URL in `/data/adb/flux/conf/settings.ini`
 5. Reboot to start
 
 ---

@@ -2,41 +2,45 @@
 
 # ==============================================================================
 # Flux Unified Validator (flux.validator)
-# Description: Centralized validation for all configuration and resources
-# Usage: Source this file and call validate_all() or individual validators
+# Description: Configuration and environment validation
 # ==============================================================================
 
-# ------------------------------------------------------------------------------
+# ==============================================================================
 # [ Validation Result Tracking ]
-# ------------------------------------------------------------------------------
+# ==============================================================================
 
 VALIDATION_ERRORS=""
 VALIDATION_WARNINGS=""
+VALIDATION_ERROR_COUNT=0
+VALIDATION_WARNING_COUNT=0
+
+# Internal: add message to collection
+_add_message() {
+    local type="$1" msg="$2"
+    case "$type" in
+        error)
+            VALIDATION_ERRORS="${VALIDATION_ERRORS:+${VALIDATION_ERRORS}\n}• ${msg}"
+            VALIDATION_ERROR_COUNT=$((VALIDATION_ERROR_COUNT + 1))
+            ;;
+        warning)
+            VALIDATION_WARNINGS="${VALIDATION_WARNINGS:+${VALIDATION_WARNINGS}\n}• ${msg}"
+            VALIDATION_WARNING_COUNT=$((VALIDATION_WARNING_COUNT + 1))
+            ;;
+    esac
+}
 
 # Add validation error
-add_error() {
-    local msg="$1"
-    if [ -n "$VALIDATION_ERRORS" ]; then
-        VALIDATION_ERRORS="${VALIDATION_ERRORS}\n• ${msg}"
-    else
-        VALIDATION_ERRORS="• ${msg}"
-    fi
-}
+add_error() { _add_message "error" "$1"; }
 
 # Add validation warning
-add_warning() {
-    local msg="$1"
-    if [ -n "$VALIDATION_WARNINGS" ]; then
-        VALIDATION_WARNINGS="${VALIDATION_WARNINGS}\n• ${msg}"
-    else
-        VALIDATION_WARNINGS="• ${msg}"
-    fi
-}
+add_warning() { _add_message "warning" "$1"; }
 
 # Reset validation state
 reset_validation() {
     VALIDATION_ERRORS=""
     VALIDATION_WARNINGS=""
+    VALIDATION_ERROR_COUNT=0
+    VALIDATION_WARNING_COUNT=0
 }
 
 # Check if validation passed
@@ -44,9 +48,9 @@ validation_passed() {
     [ -z "$VALIDATION_ERRORS" ]
 }
 
-# ------------------------------------------------------------------------------
+# ==============================================================================
 # [ Settings Validation ]
-# ------------------------------------------------------------------------------
+# ==============================================================================
 
 # Validate integer in range
 validate_int() {
@@ -72,120 +76,119 @@ validate_int() {
     return 0
 }
 
-# Validate settings.ini values
+# ==============================================================================
+# [ Schema-Driven Validation ]
+# ==============================================================================
+
+# Validation schema: "variable_name:min:max"
+# Each line defines one integer setting to validate
+VALIDATION_SCHEMA="
+LOG_LEVEL:0:4
+LOG_MAX_SIZE:10240:104857600
+UPDATE_TIMEOUT:1:300
+RETRY_COUNT:0:10
+UPDATE_INTERVAL:60:31536000
+PROXY_TCP_PORT:1:65535
+PROXY_UDP_PORT:1:65535
+PROXY_MODE:0:2
+DNS_HIJACK_ENABLE:0:2
+PROXY_MOBILE:0:1
+PROXY_WIFI:0:1
+PROXY_HOTSPOT:0:1
+PROXY_USB:0:1
+PROXY_TCP:0:1
+PROXY_UDP:0:1
+PROXY_IPV6:0:1
+APP_PROXY_ENABLE:0:1
+APP_PROXY_MODE:1:2
+BYPASS_CN_IP:0:1
+MAC_FILTER_ENABLE:0:1
+MAC_PROXY_MODE:1:2
+SKIP_CHECK_FEATURE:0:1
+"
+
+# Validate settings.ini values using schema
 validate_settings() {
     log_debug "Validating settings..."
     local valid=0
     
-    # Logging
-    validate_int "LOG_ENABLE" "$LOG_ENABLE" 0 1 || valid=1
-    validate_int "LOG_LEVEL" "$LOG_LEVEL" 0 3 || valid=1
-    validate_int "LOG_MAX_SIZE" "$LOG_MAX_SIZE" 10240 104857600 || valid=1
-    
-    # Timeouts
-    validate_int "CORE_TIMEOUT" "$CORE_TIMEOUT" 1 60 || valid=1
-    validate_int "UPDATE_TIMEOUT" "$UPDATE_TIMEOUT" 1 300 || valid=1
-    validate_int "RETRY_COUNT" "$RETRY_COUNT" 0 10 || valid=1
-    validate_int "UPDATE_INTERVAL" "$UPDATE_INTERVAL" 60 31536000 || valid=1
-    
-    # Ports
-    validate_int "PROXY_TCP_PORT" "$PROXY_TCP_PORT" 1 65535 || valid=1
-    validate_int "PROXY_UDP_PORT" "$PROXY_UDP_PORT" 1 65535 || valid=1
-    validate_int "DNS_PORT" "$DNS_PORT" 1 65535 || valid=1
-    
-    # Proxy Mode
-    validate_int "PROXY_MODE" "$PROXY_MODE" 0 2 || valid=1
-    validate_int "DNS_HIJACK_ENABLE" "$DNS_HIJACK_ENABLE" 0 2 || valid=1
-    
-    # Proxy Scope
-    validate_int "PROXY_MOBILE" "$PROXY_MOBILE" 0 1 || valid=1
-    validate_int "PROXY_WIFI" "$PROXY_WIFI" 0 1 || valid=1
-    validate_int "PROXY_HOTSPOT" "$PROXY_HOTSPOT" 0 1 || valid=1
-    validate_int "PROXY_USB" "$PROXY_USB" 0 1 || valid=1
-    validate_int "PROXY_TCP" "$PROXY_TCP" 0 1 || valid=1
-    validate_int "PROXY_UDP" "$PROXY_UDP" 0 1 || valid=1
-    validate_int "PROXY_IPV6" "$PROXY_IPV6" 0 1 || valid=1
-    
-    # Per-App Proxy
-    validate_int "APP_PROXY_ENABLE" "$APP_PROXY_ENABLE" 0 1 || valid=1
-    validate_int "APP_PROXY_MODE" "$APP_PROXY_MODE" 1 2 || valid=1
-    
-    # CN IP Bypass
-    validate_int "BYPASS_CN_IP" "$BYPASS_CN_IP" 0 1 || valid=1
-    
-    # MAC Filter
-    validate_int "MAC_FILTER_ENABLE" "$MAC_FILTER_ENABLE" 0 1 || valid=1
-    validate_int "MAC_PROXY_MODE" "$MAC_PROXY_MODE" 1 2 || valid=1
-    
-    # Advanced
-    validate_int "SKIP_CHECK_FEATURE" "$SKIP_CHECK_FEATURE" 0 1 || valid=1
+    local IFS_OLD="$IFS"
+    IFS="
+"
+    for entry in $VALIDATION_SCHEMA; do
+        # Skip empty lines
+        [ -z "$entry" ] && continue
+        
+        IFS=":"
+        set -- $entry
+        local name="$1"
+        local min="$2"
+        local max="$3"
+        IFS="$IFS_OLD"
+        
+        # Skip if incomplete entry
+        [ -z "$name" ] || [ -z "$min" ] || [ -z "$max" ] && continue
+        
+        # Get variable value
+        eval "val=\$$name"
+        
+        validate_int "$name" "$val" "$min" "$max" || valid=1
+    done
+    IFS="$IFS_OLD"
     
     [ $valid -eq 0 ] && log_debug "Settings validation passed"
     return $valid
 }
 
-# ------------------------------------------------------------------------------
+# ==============================================================================
 # [ Resource Validation ]
-# ------------------------------------------------------------------------------
+# ==============================================================================
 
-# Validate required files exist
+# File validation schema: "variable:type:message"
+# type: e=error if missing, w=warning if missing, x=must be executable
+readonly FILE_SCHEMA="
+SING_BOX_BIN:ex:sing-box binary
+CONFIG_FILE:e:config.json
+SETTINGS_FILE:w:settings.ini (using defaults)
+TPROXY_SCRIPT:e:flux.tproxy script
+"
+
+# Validate required files exist (data-driven)
 validate_files() {
     log_debug "Validating required files..."
     local valid=0
     
-    # Core binary
-    if [ ! -f "$SING_BOX_BIN" ]; then
-        add_error "sing-box binary not found"
-        valid=1
-    elif [ ! -x "$SING_BOX_BIN" ]; then
-        add_warning "sing-box not executable, will attempt to fix"
-    fi
-    
-    # Config file
-    if [ ! -f "$CONFIG_FILE" ]; then
-        add_error "config.json not found"
-        valid=1
-    fi
-    
-    # Settings file
-    if [ ! -f "$SETTINGS_FILE" ]; then
-        add_warning "settings.ini not found, using defaults"
-    fi
-    
-    # TProxy script
-    if [ ! -f "$TPROXY_SCRIPT" ]; then
-        add_error "flux.tproxy script not found"
-        valid=1
-    fi
+    local IFS_OLD="$IFS"
+    IFS="
+"
+    for entry in $FILE_SCHEMA; do
+        [ -z "$entry" ] && continue
+        
+        IFS=":"
+        set -- $entry
+        local var="$1" type="$2" desc="$3"
+        IFS="$IFS_OLD"
+        
+        [ -z "$var" ] && continue
+        eval "local path=\$$var"
+        
+        if [ ! -f "$path" ]; then
+            case "$type" in
+                e|ex) add_error "$desc not found"; valid=1 ;;
+                w) add_warning "$desc not found" ;;
+            esac
+        elif [ "$type" = "ex" ] && [ ! -x "$path" ]; then
+            add_warning "$desc not executable, will attempt to fix"
+        fi
+    done
+    IFS="$IFS_OLD"
     
     return $valid
 }
 
-# Validate directories
-validate_directories() {
-    log_debug "Validating directories..."
-    
-    # Ensure run directory exists
-    if [ ! -d "$RUN_DIR" ]; then
-        mkdir -p "$RUN_DIR" 2>/dev/null || {
-            add_error "Cannot create run directory"
-            return 1
-        }
-    fi
-    
-    # Check write permission
-    if ! touch "$RUN_DIR/.test" 2>/dev/null; then
-        add_error "Run directory not writable"
-        return 1
-    fi
-    rm -f "$RUN_DIR/.test"
-    
-    return 0
-}
-
-# ------------------------------------------------------------------------------
+# ==============================================================================
 # [ sing-box Config Validation ]
-# ------------------------------------------------------------------------------
+# ==============================================================================
 
 # Validate sing-box JSON configuration
 validate_singbox_config() {
@@ -214,21 +217,19 @@ validate_singbox_config() {
     return 0
 }
 
-# ------------------------------------------------------------------------------
+# ==============================================================================
 # [ Kernel Feature Validation (with cache) ]
-# ------------------------------------------------------------------------------
+# ==============================================================================
 
 # Initialize kernel capability cache
 init_kernel_cache() {
     # Skip if cache exists and is fresh (created this boot)
     if [ -f "$KERNEL_CACHE_FILE" ]; then
-        local cache_uptime
-        cache_uptime=$(head -n1 "$KERNEL_CACHE_FILE" 2>/dev/null | grep "^#uptime:" | cut -d: -f2)
-        local current_uptime
+        local cache_uptime current_uptime
+        cache_uptime=$(awk -F: '/^#uptime:/{print $2; exit}' "$KERNEL_CACHE_FILE" 2>/dev/null)
         current_uptime=$(cut -d. -f1 /proc/uptime 2>/dev/null || echo "0")
         
         # Cache is valid if created within current boot session
-        # (current uptime > cached uptime means same boot)
         if [ -n "$cache_uptime" ] && [ "$current_uptime" -ge "$cache_uptime" ]; then
             log_debug "Kernel cache valid"
             return 0
@@ -242,23 +243,17 @@ init_kernel_cache() {
     uptime=$(cut -d. -f1 /proc/uptime 2>/dev/null || echo "0")
     echo "#uptime:$uptime" > "$KERNEL_CACHE_FILE"
     
-    # Check and cache kernel features
+    # Check and cache kernel features (single zcat, single grep)
     if [ -f /proc/config.gz ]; then
-        # Extract all CONFIG_ values we care about
-        local features="NETFILTER_XT_TARGET_TPROXY NETFILTER_XT_MATCH_ADDRTYPE"
-        features="$features NETFILTER_XT_MATCH_CONNTRACK NETFILTER_XT_MATCH_OWNER"
-        features="$features NETFILTER_XT_MATCH_MARK NETFILTER_XT_MATCH_MAC"
-        features="$features IP_SET NETFILTER_XT_SET IP6_NF_NAT IP6_NF_TARGET_REDIRECT"
-        
-        for feature in $features; do
-            if zcat /proc/config.gz 2>/dev/null | grep -qE "^CONFIG_${feature}=[ym]$"; then
-                echo "$feature=1" >> "$KERNEL_CACHE_FILE"
-            else
-                echo "$feature=0" >> "$KERNEL_CACHE_FILE"
-            fi
+        # Extract all needed CONFIG_ values in one pass
+        zcat /proc/config.gz 2>/dev/null | grep -E '^CONFIG_(NETFILTER_XT_TARGET_TPROXY|NETFILTER_XT_MATCH_ADDRTYPE|NETFILTER_XT_MATCH_CONNTRACK|NETFILTER_XT_MATCH_OWNER|NETFILTER_XT_MATCH_MARK|NETFILTER_XT_MATCH_MAC|IP_SET|NETFILTER_XT_SET|IP6_NF_NAT|IP6_NF_TARGET_REDIRECT)=[ym]$' | while read -r line; do
+            # CONFIG_FEATURE=y -> FEATURE=1
+            feature="${line#CONFIG_}"
+            feature="${feature%=*}"
+            echo "${feature}=1" >> "$KERNEL_CACHE_FILE"
         done
         
-        log_debug "Kernel cache built with $(wc -l < "$KERNEL_CACHE_FILE") entries"
+        log_debug "Kernel cache built"
     else
         log_debug "Cannot build kernel cache: /proc/config.gz not available"
         return 1
@@ -297,40 +292,78 @@ check_kernel_feature_cached() {
     return 1
 }
 
-# Validate essential kernel features
+# Validate essential kernel features and export for tproxy
 validate_kernel_features() {
     log_debug "Validating kernel features..."
     
     # Initialize cache
     init_kernel_cache
     
-    # Check TPROXY if mode requires it
-    if [ "$PROXY_MODE" = "1" ]; then
-        if ! check_kernel_feature_cached "NETFILTER_XT_TARGET_TPROXY"; then
-            add_error "Kernel lacks TPROXY support (required by PROXY_MODE=1)"
-            return 1
-        fi
+    # Check and export features (passed to tproxy via env)
+    # Using KFEAT_ prefix
+    local tproxy_support=0
+    if check_kernel_feature_cached "NETFILTER_XT_TARGET_TPROXY"; then
+        tproxy_support=1
+    fi
+    export KFEAT_TPROXY="$tproxy_support"
+    
+    local owner_support=0
+    if check_kernel_feature_cached "NETFILTER_XT_MATCH_OWNER"; then
+        owner_support=1
+    fi
+    export KFEAT_OWNER="$owner_support"
+    
+    local mark_support=0
+    if check_kernel_feature_cached "NETFILTER_XT_MATCH_MARK"; then
+        mark_support=1
+    fi
+    export KFEAT_MARK="$mark_support"
+    
+    local ipset_support=0
+    if check_kernel_feature_cached "IP_SET" && check_kernel_feature_cached "NETFILTER_XT_SET"; then
+        ipset_support=1
+    fi
+    export KFEAT_IPSET="$ipset_support"
+    
+    local ipv6_nat_support=0
+    if check_kernel_feature_cached "IP6_NF_NAT" && check_kernel_feature_cached "IP6_NF_TARGET_REDIRECT"; then
+        ipv6_nat_support=1
+    fi
+    export KFEAT_IPV6_NAT="$ipv6_nat_support"
+    
+    # Export additional features needed by tproxy rule building
+    local addrtype_support=0
+    check_kernel_feature_cached "NETFILTER_XT_MATCH_ADDRTYPE" && addrtype_support=1
+    export KFEAT_ADDRTYPE="$addrtype_support"
+    
+    local conntrack_support=0
+    check_kernel_feature_cached "NETFILTER_XT_MATCH_CONNTRACK" && conntrack_support=1
+    export KFEAT_CONNTRACK="$conntrack_support"
+    
+    local mac_support=0
+    check_kernel_feature_cached "NETFILTER_XT_MATCH_MAC" && mac_support=1
+    export KFEAT_MAC="$mac_support"
+
+    # Validate requirements
+    if [ "$PROXY_MODE" = "1" ] && [ "$tproxy_support" -eq 0 ]; then
+        add_error "Kernel lacks TPROXY support (required by PROXY_MODE=1)"
+        return 1
     fi
     
-    # Check OWNER match (required for loop prevention)
-    if ! check_kernel_feature_cached "NETFILTER_XT_MATCH_OWNER"; then
+    if [ "$owner_support" -eq 0 ]; then
         add_warning "Kernel lacks OWNER match, using MARK-based bypass"
     fi
     
-    # Check ipset if CN bypass enabled
-    if [ "$BYPASS_CN_IP" = "1" ]; then
-        if ! check_kernel_feature_cached "IP_SET" || \
-           ! check_kernel_feature_cached "NETFILTER_XT_SET"; then
-            add_warning "Kernel lacks ipset support, CN IP bypass will be disabled"
-        fi
+    if [ "$BYPASS_CN_IP" = "1" ] && [ "$ipset_support" -eq 0 ]; then
+        add_warning "Kernel lacks ipset support, CN IP bypass will be disabled"
     fi
     
     return 0
 }
 
-# ------------------------------------------------------------------------------
+# ==============================================================================
 # [ Main Validation Entry Point ]
-# ------------------------------------------------------------------------------
+# ==============================================================================
 
 # Run all validations
 # Returns: 0 if all passed, 1 if any errors
@@ -338,23 +371,19 @@ validate_all() {
     log_info "Running comprehensive validation..."
     
     reset_validation
-    local has_error=0
+
+    # 1. Validate required files
+    validate_files
     
-    # 1. Validate directories first
-    validate_directories || has_error=1
+    # 2. Validate settings values
+    validate_settings
     
-    # 2. Validate required files
-    validate_files || has_error=1
+    # 3. Validate kernel features (with caching)
+    validate_kernel_features
     
-    # 3. Validate settings values
-    validate_settings || has_error=1
-    
-    # 4. Validate kernel features (with caching)
-    validate_kernel_features || has_error=1
-    
-    # 5. Validate sing-box config (only if files exist)
+    # 4. Validate sing-box config (only if files exist)
     if [ -f "$CONFIG_FILE" ] && [ -f "$SING_BOX_BIN" ]; then
-        validate_singbox_config || has_error=1
+        validate_singbox_config
     fi
     
     # Report results
@@ -368,14 +397,5 @@ validate_all() {
     fi
     
     log_info "Validation passed"
-    return 0
-}
-
-# Quick validation (skip slow checks like sing-box config)
-validate_quick() {
-    reset_validation
-    validate_directories || return 1
-    validate_files || return 1
-    validate_settings || return 1
     return 0
 }

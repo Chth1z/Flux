@@ -1,6 +1,6 @@
-id=Flux
+id=flux
 name=Flux
 version=v0.9.0
-versionCode=20260112
+versionCode=20260115
 author=Chth1z
-description=Seamlessly redirect your network flux.
+description=Seamlessly redirect your network Flux.

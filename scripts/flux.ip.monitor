@@ -2,175 +2,256 @@
 
 # ==============================================================================
 # Flux IP Monitor Daemon (flux.ip.monitor)
-# Description: Monitors IP address changes and dynamically updates anti-loopback
-#              rules to prevent traffic loops with temporary IPv6 addresses
+# Description: Monitors IP address changes dynamically
 # ==============================================================================
 
-scripts=$(realpath "$0")
-scripts_dir=$(dirname "${scripts}")
+# ==============================================================================
+# [ Environment Setup ]
+# ==============================================================================
 
-. "${scripts_dir}/flux.config"
-. "${scripts_dir}/flux.logger"
+SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+. "$SCRIPT_DIR/flux.config"
+. "$SCRIPT_DIR/flux.logger"
 
-# Load user configuration
-load_flux_config
-
+# Config is inherited from flux.tproxy via exported environment variables
 export LOG_COMPONENT="IPMonitor"
 
-# ------------------------------------------------------------------------------
-# [ Rule Management ]
-# ------------------------------------------------------------------------------
+# ==============================================================================
+# [ IPTables Setup ]
+# ==============================================================================
 
-# Add anti-loopback rule for an IP address
-add_bypass_rule() {
-    local ip="$1"
-    local family="$2"  # 4 or 6
-    
-    # Check cache first (faster than iptables -C)
-    # This also prevents duplicate logs from ip monitor attribute update events
-    if grep -qF "$ip" "$IP_CACHE_FILE" 2>/dev/null; then
-        return 0
+# Android 11+ requires -w for iptables lock
+buildVersion=$(getprop ro.build.version.release 2>/dev/null)
+buildVersionMajor=${buildVersion%%.*}
+if [ "${buildVersionMajor:-0}" -ge 11 ]; then
+    IPT="iptables -w 100"
+    IP6T="ip6tables -w 100"
+else
+    IPT="iptables"
+    IP6T="ip6tables"
+fi
+
+# Periodic sync interval (30 minutes)
+readonly SYNC_INTERVAL=1800
+
+# Determine which table to use based on proxy mode
+# TPROXY -> mangle, REDIRECT -> nat
+get_table() {
+    if [ "${PROXY_MODE:-0}" -eq 2 ]; then
+        echo "nat"
+    else
+        echo "mangle"
     fi
-    
-    local cmd="iptables"
-    local chain="BYPASS_IP"
-    
-    if [ "$family" = "6" ]; then
-        cmd="ip6tables"
-        chain="BYPASS_IP6"
-    fi
-    
-    # Add rules
-    $cmd -w 10 -t mangle -A "$chain" -d "$ip" -p udp ! --dport 53 -j ACCEPT 2>/dev/null
-    $cmd -w 10 -t mangle -A "$chain" -d "$ip" ! -p udp -j ACCEPT 2>/dev/null
-    
-    # Add to cache
-    echo "$ip" >> "$IP_CACHE_FILE"
-    
-    log_debug "Added bypass rule for $ip"
 }
 
-# Remove anti-loopback rule for an IP address
-del_bypass_rule() {
-    local ip="$1"
-    local family="$2"
+# ==============================================================================
+# [ Sync Strategy ]
+# ==============================================================================
+
+# Sync all current IP addresses (Flush + Re-add)
+sync_all_addresses() {
+    local table
+    table=$(get_table)
+    local timestamp
+    timestamp=$(date '+%H:%M:%S')
     
-    # Check cache - if not in cache, rule wasn't added by us
-    if ! grep -qF "$ip" "$IP_CACHE_FILE" 2>/dev/null; then
-        return 0
+    log_debug "Syncing all local IP addresses (flush + re-add)..."
+    
+    # Clear cache file
+    : > "$IP_CACHE_FILE"
+    
+    # --- IPv4 ---
+    # Flush LOCAL_IP chain first (if exists)
+    $IPT -t "$table" -F LOCAL_IP 2>/dev/null || {
+        # Chain doesn't exist, create it and insert into BYPASS_IP
+        $IPT -t "$table" -N LOCAL_IP 2>/dev/null
+        $IPT -t "$table" -I BYPASS_IP -j LOCAL_IP 2>/dev/null
+    }
+    
+    # Also handle nat table if using TPROXY with dns redirect
+    if [ "$table" = "mangle" ]; then
+        $IPT -t nat -F LOCAL_IP 2>/dev/null || {
+            $IPT -t nat -N LOCAL_IP 2>/dev/null
+            $IPT -t nat -I PREROUTING -j LOCAL_IP 2>/dev/null
+        }
     fi
     
-    local cmd="iptables"
-    local chain="BYPASS_IP"
+    # Re-add all current IPv4 addresses
+    ip -4 addr show 2>/dev/null | busybox awk '/inet / {print $2}' | while read -r ip_cidr; do
+        # Skip loopback
+        case "$ip_cidr" in
+            127.*) continue ;;
+        esac
+        
+        # Add to mangle table (exclude DNS port 53 to prevent leak)
+        $IPT -t "$table" -A LOCAL_IP -d "$ip_cidr" -p udp ! --dport 53 -j ACCEPT 2>/dev/null
+        $IPT -t "$table" -A LOCAL_IP -d "$ip_cidr" ! -p udp -j ACCEPT 2>/dev/null
+        
+        # Also add to nat table if using TPROXY (for DNS redirect)
+        if [ "$table" = "mangle" ]; then
+            $IPT -t nat -A LOCAL_IP -d "$ip_cidr" -p udp ! --dport 53 -j ACCEPT 2>/dev/null
+            $IPT -t nat -A LOCAL_IP -d "$ip_cidr" ! -p udp -j ACCEPT 2>/dev/null
+        fi
+        
+        # Cache the IP
+        echo "$ip_cidr" >> "$IP_CACHE_FILE"
+        log_debug "Added bypass rule for $ip_cidr"
+    done
     
-    if [ "$family" = "6" ]; then
-        cmd="ip6tables"
-        chain="BYPASS_IP6"
+    # --- IPv6 ---
+    if [ "${PROXY_IPV6:-0}" -eq 1 ]; then
+        # Flush LOCAL_IP6 chain
+        $IP6T -t "$table" -F LOCAL_IP6 2>/dev/null || {
+            $IP6T -t "$table" -N LOCAL_IP6 2>/dev/null
+            $IP6T -t "$table" -I BYPASS_IP6 -j LOCAL_IP6 2>/dev/null
+        }
+        
+        # Re-add all current IPv6 addresses
+        ip -6 addr show 2>/dev/null | busybox awk '/inet6 / {print $2}' | while read -r ip_cidr; do
+            # Skip link-local and loopback (match original net.inotify)
+            case "$ip_cidr" in
+                fe80:*|::1*) continue ;;
+            esac
+            
+            # Exclude DNS port 53 to prevent leak
+            $IP6T -t "$table" -A LOCAL_IP6 -d "$ip_cidr" -p udp ! --dport 53 -j ACCEPT 2>/dev/null
+            $IP6T -t "$table" -A LOCAL_IP6 -d "$ip_cidr" ! -p udp -j ACCEPT 2>/dev/null
+            
+            echo "$ip_cidr" >> "$IP_CACHE_FILE"
+            log_debug "Added bypass rule for $ip_cidr"
+            count=$((count+1))
+        done
     fi
     
-    # Remove rules
-    $cmd -w 10 -t mangle -D "$chain" -d "$ip" -p udp ! --dport 53 -j ACCEPT 2>/dev/null
-    $cmd -w 10 -t mangle -D "$chain" -d "$ip" ! -p udp -j ACCEPT 2>/dev/null
-    
-    # Remove from cache (use temp file for portability)
-    grep -vF "$ip" "$IP_CACHE_FILE" > "$IP_CACHE_FILE.tmp" 2>/dev/null
-    mv -f "$IP_CACHE_FILE.tmp" "$IP_CACHE_FILE" 2>/dev/null
-    
-    log_debug "Removed bypass rule for $ip"
+    log_debug "Synced $count IP addresses to LOCAL_IP chain"
 }
 
-# ------------------------------------------------------------------------------
-# [ Event Parsing ]
-# ------------------------------------------------------------------------------
+# ==============================================================================
+# [ Event Handling ]
+# ==============================================================================
 
-# Parse ip monitor output and handle address events
-# Format examples:
-#   2: wlan0    inet 192.168.1.100/24 brd 192.168.1.255 ...
-#   Deleted 2: wlan0    inet6 2001:db8::1/64 ...
+# Handle individual IP address events from ip monitor
+# Uses incremental updates between full syncs, case matching for performance
 handle_event() {
     local line="$1"
     
     # Skip empty lines
     [ -z "$line" ] && return
     
-    # Determine if it's an add or delete event
+    local table
+    table=$(get_table)
+    
+    # Determine action and family using case (faster than echo|grep)
     local action="add"
-    if echo "$line" | grep -q "^Deleted"; then
-        action="del"
-        line=$(echo "$line" | sed 's/^Deleted //')
-    fi
-    
-    # Extract IP address with CIDR
-    local ip_cidr=""
     local family=""
+    local cmd=""
+    local chain=""
+    local ip_cidr=""
     
-    if echo "$line" | grep -q "inet6"; then
-        # IPv6 address
-        ip_cidr=$(echo "$line" | grep -oE 'inet6 [0-9a-f:]+/[0-9]+' | awk '{print $2}')
-        family="6"
-        
-        # Skip link-local (fe80::) and loopback (::1)
-        echo "$ip_cidr" | grep -qE '^fe80:|^::1/' && return
-        
-    elif echo "$line" | grep -q "inet "; then
-        # IPv4 address
-        ip_cidr=$(echo "$line" | grep -oE 'inet [0-9.]+/[0-9]+' | awk '{print $2}')
-        family="4"
-        
-        # Skip loopback (127.x.x.x)
-        echo "$ip_cidr" | grep -qE '^127\.' && return
-    else
-        # Not an address line
-        return
-    fi
+    case "$line" in
+        Deleted*inet6*) action="del"; family="6"; line="${line#Deleted }" ;;
+        Deleted*inet\ *) action="del"; family="4"; line="${line#Deleted }" ;;
+        *inet6*) family="6" ;;
+        *inet\ *) family="4" ;;
+        *) return ;;  # Not an address line
+    esac
+    
+    # Extract IP address using set (faster than grep|awk)
+    # ip monitor output format: "N: inet[6] IP/PREFIX scope ... INTERFACE"
+    set -- $line
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            inet|inet6) shift; ip_cidr="$1"; break ;;
+        esac
+        shift
+    done
     
     [ -z "$ip_cidr" ] && return
     
+    # Set chain/cmd based on family and apply skip rules
+    if [ "$family" = "6" ]; then
+        cmd="$IP6T"
+        chain="LOCAL_IP6"
+        [ "${PROXY_IPV6:-0}" -eq 0 ] && return
+        case "$ip_cidr" in fe80:*|::1*) return ;; esac  # Skip link-local, loopback
+    else
+        cmd="$IPT"
+        chain="LOCAL_IP"
+        case "$ip_cidr" in 127.*) return ;; esac  # Skip loopback
+    fi
+    
+    local timestamp
+    timestamp=$(date '+%H:%M:%S')
+    
     # Apply rule change
     if [ "$action" = "add" ]; then
-        add_bypass_rule "$ip_cidr" "$family"
+        # Check cache to avoid duplicates
+        if grep -qF "$ip_cidr" "$IP_CACHE_FILE" 2>/dev/null; then
+            return
+        fi
+        
+        # Add rules (exclude DNS port 53 to prevent leak)
+        $cmd -t "$table" -A "$chain" -d "$ip_cidr" -p udp ! --dport 53 -j ACCEPT 2>/dev/null
+        $cmd -t "$table" -A "$chain" -d "$ip_cidr" ! -p udp -j ACCEPT 2>/dev/null
+        
+        # Also add to nat table for IPv4 if using TPROXY
+        if [ "$family" = "4" ] && [ "$table" = "mangle" ]; then
+            $IPT -t nat -A LOCAL_IP -d "$ip_cidr" -p udp ! --dport 53 -j ACCEPT 2>/dev/null
+            $IPT -t nat -A LOCAL_IP -d "$ip_cidr" ! -p udp -j ACCEPT 2>/dev/null
+        fi
+        
+        # Update cache
+        echo "$ip_cidr" >> "$IP_CACHE_FILE"
+        log_debug "Added bypass rule for $ip_cidr"
+        
     else
-        del_bypass_rule "$ip_cidr" "$family"
+        # Check cache - if not in cache, rule wasn't added by us
+        if ! grep -qF "$ip_cidr" "$IP_CACHE_FILE" 2>/dev/null; then
+            return
+        fi
+        
+        # Remove rules (both UDP and non-UDP)
+        $cmd -t "$table" -D "$chain" -d "$ip_cidr" -p udp ! --dport 53 -j ACCEPT 2>/dev/null
+        $cmd -t "$table" -D "$chain" -d "$ip_cidr" ! -p udp -j ACCEPT 2>/dev/null
+        
+        # Also remove from nat table for IPv4
+        if [ "$family" = "4" ] && [ "$table" = "mangle" ]; then
+            $IPT -t nat -D LOCAL_IP -d "$ip_cidr" -p udp ! --dport 53 -j ACCEPT 2>/dev/null
+            $IPT -t nat -D LOCAL_IP -d "$ip_cidr" ! -p udp -j ACCEPT 2>/dev/null
+        fi
+        
+        # Update cache (remove entry)
+        grep -vF "$ip_cidr" "$IP_CACHE_FILE" > "$IP_CACHE_FILE.tmp" 2>/dev/null
+        mv -f "$IP_CACHE_FILE.tmp" "$IP_CACHE_FILE" 2>/dev/null
+        
+        log_debug "Removed bypass rule for $ip_cidr"
     fi
 }
 
-# ------------------------------------------------------------------------------
+# ==============================================================================
 # [ Main Monitor Loop ]
-# ------------------------------------------------------------------------------
+# ==============================================================================
 
-# Sync existing IP addresses at startup
-sync_existing_addresses() {
-    log_debug "Syncing existing IP addresses..."
-    
-    # Get all current IPv4 addresses (skip loopback)
-    ip -4 addr show 2>/dev/null | grep -oE 'inet [0-9.]+/[0-9]+' | awk '{print $2}' | while read -r ip; do
-        echo "$ip" | grep -qE '^127\.' && continue
-        add_bypass_rule "$ip" "4"
-    done
-    
-    # Get all current IPv6 addresses (skip link-local and loopback)
-    ip -6 addr show 2>/dev/null | grep -oE 'inet6 [0-9a-f:]+/[0-9]+' | awk '{print $2}' | while read -r ip; do
-        echo "$ip" | grep -qE '^fe80:|^::1/' && continue
-        add_bypass_rule "$ip" "6"
-    done
-    
-    log_debug "Existing addresses synced"
-}
+SYNC_PID=""
 
 start_monitor() {
     log_info "Starting IP address monitor..."
     
-    # Clear IP cache for fresh start
-    : > "$IP_CACHE_FILE"
-    
-    # Write our PID
-    echo $$ > "$IP_MONITOR_PID_FILE"
-    
     # Trap to clean up on exit
-    trap 'rm -f "$IP_MONITOR_PID_FILE" "$IP_CACHE_FILE"; exit 0' EXIT INT TERM
+    trap 'cleanup_monitor; exit 0' EXIT INT TERM
     
-    # Sync existing addresses before monitoring new events
-    sync_existing_addresses
+    # Initial full sync of all addresses
+    sync_all_addresses
+    
+    # Start periodic sync in background
+    (
+        while true; do
+            sleep "$SYNC_INTERVAL"
+            log_debug "Periodic sync triggered"
+            sync_all_addresses
+        done
+    ) &
+    SYNC_PID=$!
     
     # Run ip monitor and process events
     ip monitor address 2>/dev/null | while read -r line; do
@@ -178,39 +259,61 @@ start_monitor() {
     done
 }
 
-stop_monitor() {
-    if [ -f "$IP_MONITOR_PID_FILE" ]; then
-        local pid
-        pid=$(cat "$IP_MONITOR_PID_FILE" 2>/dev/null)
-        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-            kill "$pid" 2>/dev/null
-            log_debug "IP monitor stopped (PID: $pid)"
-        fi
-        rm -f "$IP_MONITOR_PID_FILE"
-    fi
+cleanup_monitor() {
+    local table
+    table=$(get_table)
     
-    # Also kill by pattern as fallback
-    pkill -f "ip monitor address" 2>/dev/null || true
+    # Kill periodic sync process
+    [ -n "$SYNC_PID" ] && kill "$SYNC_PID" 2>/dev/null
+    
+    # Remove LOCAL_IP chains
+    $IPT -t "$table" -D BYPASS_IP -j LOCAL_IP 2>/dev/null
+    $IPT -t "$table" -F LOCAL_IP 2>/dev/null
+    $IPT -t "$table" -X LOCAL_IP 2>/dev/null
+    
+    # Also cleanup nat table LOCAL_IP (linked to PREROUTING)
+    $IPT -t nat -D PREROUTING -j LOCAL_IP 2>/dev/null
+    $IPT -t nat -F LOCAL_IP 2>/dev/null
+    $IPT -t nat -X LOCAL_IP 2>/dev/null
+    
+    # IPv6 cleanup
+    $IP6T -t "$table" -D BYPASS_IP6 -j LOCAL_IP6 2>/dev/null
+    $IP6T -t "$table" -F LOCAL_IP6 2>/dev/null
+    $IP6T -t "$table" -X LOCAL_IP6 2>/dev/null
     
     # Clean up cache file
-    rm -f "$IP_CACHE_FILE" 2>/dev/null
+    rm -f "$IP_CACHE_FILE" "$IP_CACHE_FILE.tmp" 2>/dev/null
+    
+    log_debug "IP monitor cleanup completed"
 }
 
-# ------------------------------------------------------------------------------
+stop_monitor() {
+    # Kill existing ip monitor processes
+    pkill -f "ip monitor address" 2>/dev/null || true
+    
+    # Clean up
+    cleanup_monitor
+    
+    log_info "IP monitor stopped"
+}
+
+# ==============================================================================
 # [ Entry Point ]
-# ------------------------------------------------------------------------------
+# ==============================================================================
 
 case "${1:-start}" in
     start)
-        # Kill any existing instance first
-        stop_monitor
         start_monitor
         ;;
     stop)
         stop_monitor
         ;;
+    sync)
+        # Manual sync command for testing
+        sync_all_addresses
+        ;;
     *)
-        echo "Usage: $0 {start|stop}"
+        echo "Usage: $0 {start|stop|sync}"
         exit 1
         ;;
 esac

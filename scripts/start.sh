@@ -1,25 +1,39 @@
 #!/system/bin/sh
 
-
 # ==============================================================================
 # Flux Service Manager (start.sh)
-# Description: Orchestrator for Core and TProxy services with state machine
-#              Manages lifecycle with explicit state transitions and rollback
+# Description: Main service orchestrator (start/stop/restart)
 # ==============================================================================
 
-
-# ------------------------------------------------------------------------------
-# [ Load Dependencies ]
-# ------------------------------------------------------------------------------
+# ==============================================================================
+# [ Environment Setup ]
+# ==============================================================================
 
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+
+# Force fresh config load handled by load_flux_config parameter now
 . "$SCRIPT_DIR/flux.config"
 . "$SCRIPT_DIR/flux.logger"
 . "$SCRIPT_DIR/flux.state"
 . "$SCRIPT_DIR/flux.validator"
 
-# Set log component name
 export LOG_COMPONENT="Manager"
+
+# Flux version (read from module.prop or fallback)
+FLUX_VERSION=$(grep "^version=" "$PROP_FILE" 2>/dev/null | cut -d= -f2)
+FLUX_VERSION="${FLUX_VERSION:-v0.9.x}"
+
+# Show startup banner
+show_banner() {
+    cat << 'BANNER'
+    _____ _
+   |  ___| |_   ___  __
+   | |_  | | | | \ \/ /
+   |  _| | | |_| |>  <
+   |_|   |_|\__,_/_/\_\
+BANNER
+    log_info "Flux $FLUX_VERSION starting..."
+}
 
 
 # ==============================================================================
@@ -47,9 +61,28 @@ acquire_lock() {
     done
     
     # Acquire lock
-    echo $$ > "$LOCK_FILE"
-    trap 'release_lock' EXIT INT TERM
+    printf '%s' $$ > "$LOCK_FILE"
+    
+    # Setup signal handlers for graceful shutdown
+    trap '_handle_signal TERM' TERM
+    trap '_handle_signal INT' INT
+    trap 'release_lock' EXIT
+    
     return 0
+}
+
+# Internal signal handler for graceful shutdown
+_handle_signal() {
+    local sig="$1"
+    log_warn "Received SIG$sig, initiating graceful shutdown..."
+    
+    # Perform cleanup
+    stop_services 2>/dev/null || true
+    set_service_state "$STATE_STOPPED"
+    update_prop_status
+    release_lock
+    
+    exit 0
 }
 
 # Release lock
@@ -64,6 +97,11 @@ release_lock() {
 # ==============================================================================
 
 # Initialize runtime environment and rotate logs
+##
+# @brief Initialize runtime environment
+# @description Creates run directory and rotates logs
+# @return 0 on success, 1 on failure
+##
 init_environment() {
     if [ ! -d "$RUN_DIR" ]; then
         mkdir -p "$RUN_DIR" || {
@@ -74,6 +112,9 @@ init_environment() {
         chmod 0755 "$RUN_DIR"
     fi
     
+    load_flux_config
+    export_flux_config
+    
     rotate_log || log_debug "Log rotation skipped"
     
     log_debug "Environment initialized"
@@ -82,97 +123,129 @@ init_environment() {
 
 
 # ==============================================================================
-# [ Rollback Management ]
+# [ Parallel Start with Barrier Synchronization ]
 # ==============================================================================
 
-# Rollback is now handled within each parallel branch
-
-
-# ==============================================================================
-# [ Parallel Start with Branch Rollback ]
-# ==============================================================================
-
+##
+# @brief Start all services in parallel
+# @description Starts core and tproxy subsystems with barrier synchronization
+# @return 0 if both succeeded, 1 if any failed
+##
 start_services() {
     log_info "Starting services in parallel..."
     
-    # Ensure clean slate
+    # Initialize state
+    state_init
+    set_service_state "$STATE_STARTING"
+    
+    # Force cleanup stale processes
     force_cleanup
     
-    local core_result=0
-    local tproxy_result=0
-    local core_pid tproxy_pid
-    
-    # Start Core in background with self-rollback on failure
+    # Start Core in background
     (
-        if sh "$SCRIPT_DIR/flux.core" start; then
-            exit 0
-        else
-            log_error "Core start failed"
-            # Self-rollback: clean up core on failure
-            sh "$SCRIPT_DIR/flux.core" stop >/dev/null 2>&1 || true
-            exit 1
-        fi
+        sh "$SCRIPT_DIR/flux.core" start
+        exit $?
     ) &
-    core_pid=$!
+    local core_pid=$!
     
-    # Start TProxy in background with self-rollback on failure
+    # Start TProxy in background
     (
-        if sh "$TPROXY_SCRIPT" start; then
-            exit 0
-        else
-            log_error "TProxy start failed"
-            # Self-rollback: clean up tproxy on failure
-            sh "$TPROXY_SCRIPT" stop >/dev/null 2>&1 || true
-            exit 1
-        fi
+        sh "$TPROXY_SCRIPT" start
+        exit $?
     ) &
-    tproxy_pid=$!
+    local tproxy_pid=$!
     
-    # Wait for both to complete
-    wait $core_pid
-    core_result=$?
+    log_debug "Parallel start: core_pid=$core_pid, tproxy_pid=$tproxy_pid"
     
-    wait $tproxy_pid
-    tproxy_result=$?
+    # Wait for processes to complete
+    wait $core_pid 2>/dev/null
+    local core_exit=$?
     
-    # Evaluate results and handle cross-rollback
-    if [ $core_result -ne 0 ] && [ $tproxy_result -ne 0 ]; then
+    wait $tproxy_pid 2>/dev/null
+    local tproxy_exit=$?
+    
+    log_debug "Process exit codes: core=$core_exit, tproxy=$tproxy_exit"
+    
+    # Barrier: wait for all components to reach terminal state
+    barrier_wait "$CORE_TIMEOUT"
+    
+    # Analyze results
+    local core_state tproxy_state
+    core_state=$(get_component_state "$COMP_CORE")
+    tproxy_state=$(get_component_state "$COMP_TPROXY")
+    
+    log_debug "Final states: core=$core_state, tproxy=$tproxy_state"
+    
+    # Check for failures and perform rollback
+    if [ "$core_state" = "$STATE_FAILED" ] && [ "$tproxy_state" = "$STATE_FAILED" ]; then
         log_error "All services failed to start"
         prop_error "All failed"
+        set_service_state "$STATE_FAILED"
         return 1
-    elif [ $core_result -ne 0 ]; then
+        
+    elif [ "$core_state" = "$STATE_FAILED" ]; then
         log_error "Core failed, rolling back TProxy"
         prop_error "Core failed"
-        sh "$TPROXY_SCRIPT" stop >/dev/null 2>&1 || true
+        rollback_component "$COMP_TPROXY"
+        set_service_state "$STATE_FAILED"
         return 1
-    elif [ $tproxy_result -ne 0 ]; then
+        
+    elif [ "$tproxy_state" = "$STATE_FAILED" ]; then
         log_error "TProxy failed, rolling back Core"
         prop_error "TProxy failed"
-        sh "$SCRIPT_DIR/flux.core" stop >/dev/null 2>&1 || true
+        rollback_component "$COMP_CORE"
+        set_service_state "$STATE_FAILED"
         return 1
     fi
     
-    log_info "All services started"
-    return 0
+    # Both succeeded
+    if all_components_running; then
+        set_service_state "$STATE_RUNNING"
+        log_info "All services started successfully"
+        return 0
+    fi
+    
+    # Unexpected state
+    log_error "Unexpected final states: core=$core_state, tproxy=$tproxy_state"
+    rollback_running_components
+    set_service_state "$STATE_FAILED"
+    return 1
 }
 
 
 # ==============================================================================
-# [ Sequential Stop ]
+# [ Parallel Stop with Barrier ]
 # ==============================================================================
 
 stop_services() {
-    log_info "Stopping services..."
+    log_info "Stopping services in parallel..."
     
-    # Stop TProxy first (removes iptables rules)
-    log_debug "Stopping TProxy..."
-    sh "$TPROXY_SCRIPT" stop >/dev/null 2>&1 || true
+    set_service_state "$STATE_STOPPING"
     
-    # Stop Core
-    log_debug "Stopping Core..."
-    sh "$SCRIPT_DIR/flux.core" stop >/dev/null 2>&1 || true
+    # Stop TProxy and Core in parallel
+    sh "$TPROXY_SCRIPT" stop >/dev/null 2>&1 &
+    local tproxy_pid=$!
     
-    log_info "All services stopped"
+    sh "$SCRIPT_DIR/flux.core" stop >/dev/null 2>&1 &
+    local core_pid=$!
+    
+    # Wait for both
+    wait $tproxy_pid 2>/dev/null || true
+    wait $core_pid 2>/dev/null || true
+    
+    # Barrier: wait for all STOPPED
+    barrier_wait "$CORE_TIMEOUT"
+    
+    if all_components_stopped; then
+        set_service_state "$STATE_STOPPED"
+        log_info "All services stopped"
+        return 0
+    fi
+    
+    # Force cleanup if barrier failed
+    log_warn "Barrier timeout, forcing cleanup"
+    force_cleanup
+    set_service_state "$STATE_STOPPED"
     return 0
 }
 
@@ -190,12 +263,12 @@ force_cleanup() {
 
 
 # ==============================================================================
-# [ Main Service Operations with State Machine ]
+# [ Main Service Operations ]
 # ==============================================================================
 
 start_service_sequence() {
     local current_state
-    current_state=$(get_state)
+    current_state=$(get_service_state)
     
     # Check if already running
     if [ "$current_state" = "$STATE_RUNNING" ]; then
@@ -206,23 +279,19 @@ start_service_sequence() {
     # Check if transition is allowed
     if ! can_start; then
         log_error "Cannot start from state: $current_state"
+        prop_error "Invalid state: $current_state"
         return 1
     fi
     
-    # Transition to STARTING
-    transition_starting
+    # Show startup banner
+    show_banner
     
     # Initialize environment
-    if ! init_environment; then
-        transition_failed
-        return 1
-    fi
-    
     # Run comprehensive validation
     if ! validate_all; then
         log_error "Validation failed"
         prop_error "Validation failed"
-        transition_failed
+        set_service_state "$STATE_FAILED"
         return 1
     fi
     
@@ -232,14 +301,10 @@ start_service_sequence() {
         sh "$UPDATE_SCRIPT" check || log_debug "Update check completed"
     fi
     
-    # Start services with rollback support
+    # Start services with barrier sync and rollback
     if ! start_services; then
-        transition_failed
         return 1
     fi
-    
-    # Transition to RUNNING
-    transition_running
     
     log_info "Service ready"
     prop_run
@@ -248,7 +313,7 @@ start_service_sequence() {
 
 stop_service_sequence() {
     local current_state
-    current_state=$(get_state)
+    current_state=$(get_service_state)
     
     # Check if already stopped
     if [ "$current_state" = "$STATE_STOPPED" ]; then
@@ -256,61 +321,13 @@ stop_service_sequence() {
         return 0
     fi
     
-    # Transition to STOPPING
-    transition_stopping
-    
     # Stop services
     stop_services
-    
-    # Transition to STOPPED
-    transition_stopped
     
     log_info "Service stopped"
     prop_stop
     return 0
 }
-
-# Hot reload sing-box configuration (no state change, no iptables restart)
-reload_service() {
-    # Check state allows reload
-    if ! can_reload; then
-        log_error "Cannot reload: service not running (state: $(get_state))"
-        return 1
-    fi
-    
-    log_info "Reloading core configuration..."
-    
-    # Validate new config before reload
-    if ! validate_singbox_config; then
-        log_error "New config invalid, reload aborted"
-        return 1
-    fi
-    
-    if sh "$SCRIPT_DIR/flux.core" reload; then
-        log_info "Core config reloaded"
-        return 0
-    else
-        log_error "Reload failed"
-        return 1
-    fi
-}
-
-# Get service status
-status_service() {
-    local state
-    state=$(get_state)
-    
-    echo "State: $state"
-    get_state_info
-    
-    # Additional info if running
-    if [ "$state" = "$STATE_RUNNING" ]; then
-        if [ -f "$PID_FILE" ]; then
-            echo "Core PID: $(cat "$PID_FILE")"
-        fi
-    fi
-}
-
 
 # ==============================================================================
 # [ Entry Point ]
@@ -319,32 +336,15 @@ status_service() {
 main() {
     local action="${1:-}"
     
-    # Validate action first
-    case "$action" in
-        start|stop|reload|status|restart) ;;
-        *)
-            echo "Usage: $0 {start|stop|reload|restart|status}"
-            exit 1
-            ;;
-    esac
-    
-    # Status doesn't need lock
-    if [ "$action" = "status" ]; then
-        load_flux_config
-        status_service
-        exit 0
-    fi
-    
     # Acquire lock to prevent concurrent operations
     if ! acquire_lock; then
         log_error "Another operation is in progress, please wait"
         exit 1
     fi
     
-    # Load configuration
-    load_flux_config
+    init_environment || exit 1
     
-    trap 'update_description; release_lock' EXIT
+    trap 'release_lock' EXIT
     
     local exit_code=0
     
@@ -355,12 +355,13 @@ main() {
         stop)
             stop_service_sequence || exit_code=1
             ;;
-        reload)
-            reload_service || exit_code=1
-            ;;
         restart)
             stop_service_sequence
             start_service_sequence || exit_code=1
+            ;;
+        *)
+            echo "Usage: $0 {start|stop|restart|status}"
+            exit 1
             ;;
     esac
     
@@ -368,3 +369,4 @@ main() {
 }
 
 main "$@"
+

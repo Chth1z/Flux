@@ -1,176 +1,245 @@
 #!/system/bin/sh
 
-
 # ==============================================================================
-# [ Log System & Status Property Management ]
-# ==============================================================================
-#
-# Log Level Guidelines:
-# ┌─────────┬────────────────────────────────────────────────────────────────┐
-# │ Level   │ Usage                                                          │
-# ├─────────┼────────────────────────────────────────────────────────────────┤
-# │ DEBUG   │ Internal state, variable values, flow tracing                  │
-# │         │ Examples: "Resolved UID 10086", "Kernel feature X enabled"     │
-# ├─────────┼────────────────────────────────────────────────────────────────┤
-# │ INFO    │ Normal operations, milestones, successful completions          │
-# │         │ Examples: "Service started", "Config validated", "TProxy ready"│
-# ├─────────┼────────────────────────────────────────────────────────────────┤
-# │ WARN    │ Recoverable issues, fallback behavior, non-fatal problems      │
-# │         │ Service continues but something is suboptimal                  │
-# │         │ Examples: "Update timeout, using cached config"                │
-# │         │ Auto-updates prop to WARNING state (if no ERROR)               │
-# ├─────────┼────────────────────────────────────────────────────────────────┤
-# │ ERROR   │ Fatal issues that prevent normal operation                     │
-# │         │ Service cannot continue or critical feature unavailable        │
-# │         │ Examples: "Core failed to start", "Config validation failed"   │
-# │         │ Auto-updates prop to ERROR state                               │
-# └─────────┴────────────────────────────────────────────────────────────────┘
-
-
-# ==============================================================================
-# [ Status Property Management ]
+# Flux Logging Utility (flux.logger)
+# Description: Standardized logging and error handling
 # ==============================================================================
 
-# Priority: Error(3) > Warning(2) > Running/Stopped(1)
-# Messages are accumulated and displayed as separate lines
-PROP_LEVEL=0
-PROP_TEXT=""
-PROP_MESSAGES=""
+# ==============================================================================
+# [ Configuration ]
+# ==============================================================================
 
-prop_run()   { set_prop "run"   "$1"; }
-prop_stop()  { set_prop "stop"  "$1"; }
-prop_warn()  { add_prop_msg "warn"  "$1"; }
-prop_error() { add_prop_msg "error" "$1"; }
+LOG_COMPONENT="${LOG_COMPONENT:-Flux}"
 
-# Add a message to accumulated list (for warn/error)
-add_prop_msg() {
-    local status="$1"
-    local detail="$2"
-    local current_level=2
-    
-    [ "$status" = "error" ] && current_level=3
-    
-    # Update level if higher priority
-    if [ "$current_level" -gt "$PROP_LEVEL" ]; then
-        PROP_LEVEL="$current_level"
-        PROP_TEXT="$status"
-    fi
-    
-    # Accumulate messages
-    if [ -n "$detail" ]; then
-        if [ -n "$PROP_MESSAGES" ]; then
-            PROP_MESSAGES="${PROP_MESSAGES}\\n• ${detail}"
-        else
-            PROP_MESSAGES="• ${detail}"
-        fi
-    fi
+# Detect interactive mode (terminal attached to stdin)
+_is_interactive() {
+    [ -t 0 ] || [ -t 1 ]
 }
 
-# Set status without accumulation (for run/stop)
-set_prop() {
-    local status="$1"
-    local detail="${2:-}"
-    
-    case "$status" in
-        run|stop)
-            if [ "$PROP_LEVEL" -lt 2 ]; then
-                PROP_LEVEL=1
-                PROP_TEXT="$status"
-                [ -n "$detail" ] && PROP_MESSAGES="$detail"
-            fi
-            ;;
-    esac
-}
-
-# Commit Status to File (Call only once at the end of the script)
-update_description() {
-    # Return immediately if no status has been set
-    [ "$PROP_LEVEL" -eq 0 ] && return 0
-
-    case "$PROP_TEXT" in
-        run)
-            local pid_info=""
-            [ -s "$PID_FILE" ] && pid_info="PID: $(cat "$PID_FILE")"
-            desc_text="🥰 [RUNNING] ${pid_info}"
-            ;;
-        warn)
-            desc_text="🤔 [WARNING]\\n${PROP_MESSAGES:-Degraded}"
-            ;;
-        error)
-            desc_text="🤯 [ERROR]\\n${PROP_MESSAGES:-Failed}"
-            ;;
-        stop)
-            desc_text="😴 [STOPPED]"
-            ;;
-        *)
-            desc_text="😇 [UNKNOWN]"
-            ;;
-    esac
-    
-    if grep -q "\\\\n" "$PROP_FILE"; then
-        sed -i "s|\\\\n.*|\\\\n${desc_text}|" "$PROP_FILE"
-    else
-        sed -i "s|^description=.*|&\\\\n${desc_text}|" "$PROP_FILE"
-    fi
-}
-
-
 # ==============================================================================
-# [ Advanced Logging System ]
+# [ Core Logging ]
 # ==============================================================================
 
-# Log levels mapping
-readonly LOG_LEVEL_DEBUG=0
-readonly LOG_LEVEL_INFO=1
-readonly LOG_LEVEL_WARN=2
-readonly LOG_LEVEL_ERROR=3
-
-# Debug: Internal tracing, variable values, detailed flow info
-log_debug() { log "Debug" "$1"; }
-
-# Info: Normal operations, milestones, successful steps
-log_info()  { log "Info"  "$1"; }
-
-# Warn: Recoverable issues, fallback behavior
-# Note: Use prop_warn("short hint") separately for module status
-log_warn()  { log "Warn"  "$1"; }
-
-# Error: Fatal issues, operation cannot continue
-# Note: Use prop_error("short hint") separately for module status
-log_error() { log "Error" "$1"; }
-
-log() {
+_log() {
     local level="$1"
-    local message="$2"
+    local level_num="$2"
+    local msg="$3"
+    
+    # LOG_LEVEL: 0=OFF, 1=Error, 2=Warn, 3=Info, 4=Debug
+    [ "${LOG_LEVEL:-3}" -lt "$level_num" ] && return 0
+    
     local timestamp
-    local level_score=0
-    local current_log_level="${LOG_LEVEL:-1}"
-    local component="${LOG_COMPONENT:-System}"
-
-    case "$level" in
-        Debug) level_score=0 ;;
-        Info)  level_score=1 ;;
-        Warn)  level_score=2 ;;
-        Error) level_score=3 ;;
-        *)     level_score=1 ;;
-    esac
-
-    [ "$level_score" -lt "$current_log_level" ] && return 0
-
-    timestamp="$(date +"%Y-%m-%d %H:%M:%S")"
+    timestamp=$(date '+%m-%d %H:%M:%S')
+    local log_line
+    log_line=$(printf '[%s] %s [%s] %s' "$timestamp" "$level" "$LOG_COMPONENT" "$msg")
     
-    if [ "${LOG_ENABLE:-1}" -eq 1 ] && [ -n "$LOG_FILE" ]; then
-        if [ ! -d "$RUN_DIR" ]; then
-             mkdir -p "$RUN_DIR" 2>/dev/null
-        fi
-        printf "%s [%s] [%s]: %s\n" "$timestamp" "$component" "$level" "$message" >> "$LOG_FILE" 2>/dev/null
-    fi
+    # Write to log file
+    [ -n "$LOG_FILE" ] && printf '%s\n' "$log_line" >> "$LOG_FILE"
     
-    if [ -t 1 ] || [ "${INTERACTIVE:-0}" -eq 1 ]; then
-        printf "[%s]: %s\n" "$timestamp" "$message"
+    # Also output to terminal if interactive
+    if _is_interactive; then
+        case "$level" in
+            E) printf '\033[31m%s\033[0m\n' "$log_line" >&2 ;; # Red
+            W) printf '\033[33m%s\033[0m\n' "$log_line" >&2 ;; # Yellow
+            I) printf '\033[32m%s\033[0m\n' "$log_line" ;;     # Green
+            D) printf '\033[90m%s\033[0m\n' "$log_line" ;;     # Gray
+
+        esac
     fi
 }
 
+log_debug() { _log "D" 4 "$1"; }
+log_info()  { _log "I" 3 "$1"; }
+log_warn()  { _log "W" 2 "$1"; }
+log_error() { _log "E" 1 "$1"; }
+
+
+# ==============================================================================
+# [ Standardized Error Codes ]
+# ==============================================================================
+
+readonly E_SUCCESS=0
+readonly E_GENERAL=1
+readonly E_TIMEOUT=2
+readonly E_CONFIG=3
+readonly E_NETWORK=4
+readonly E_PERMISSION=5
+readonly E_NOTFOUND=6
+
+
+# ==============================================================================
+# [ Standardized Error Handling ]
+# ==============================================================================
+
+# Exit with error message and optional prop update
+# Usage: die "error message" [exit_code]
+die() {
+    log_error "$1"
+    prop_error "$1"
+    exit "${2:-$E_GENERAL}"
+}
+
+# Execute command, die on failure
+# Usage: try command [args...]
+try() {
+    "$@" || die "Failed: $*"
+}
+
+
+# ==============================================================================
+# [ Retry & Timeout Utilities ]
+# ==============================================================================
+
+# Retry a command with exponential backoff
+# Usage: retry <max_attempts> <initial_delay> command [args...]
+# Example: retry 3 1 curl -f http://example.com
+retry() {
+    local max_attempts="$1"
+    local delay="$2"
+    shift 2
+    
+    local attempt=0
+    local last_exit=0
+    
+    while [ $attempt -lt $max_attempts ]; do
+        if "$@"; then
+            return 0
+        fi
+        last_exit=$?
+        attempt=$((attempt + 1))
+        
+        if [ $attempt -lt $max_attempts ]; then
+            log_debug "Retry $attempt/$max_attempts in ${delay}s: $*"
+            sleep "$delay"
+            delay=$((delay * 2))  # Exponential backoff
+        fi
+    done
+    
+    log_warn "Command failed after $max_attempts attempts: $*"
+    return $last_exit
+}
+
+# Execute command with timeout
+# Usage: with_timeout <seconds> command [args...]
+# Returns: command exit code, or 124 on timeout
+with_timeout() {
+    local timeout="$1"
+    shift
+    
+    # Try timeout command (busybox or coreutils)
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$timeout" "$@"
+    elif command -v busybox >/dev/null 2>&1 && busybox --list 2>/dev/null | grep -q timeout; then
+        busybox timeout "$timeout" "$@"
+    else
+        # Fallback: run without timeout (not ideal but works)
+        log_debug "timeout command not available, running without timeout"
+        "$@"
+    fi
+}
+
+
+# ==============================================================================
+# [ Module Prop Status ]
+# ==============================================================================
+
+_PROP_LAST_ERROR=""
+_PROP_LAST_WARN=""
+_PROP_ORIG_DESC=""
+
+set_prop_error() {
+    _PROP_LAST_ERROR="$1"
+    log_error "$1"
+}
+
+set_prop_warn() {
+    _PROP_LAST_WARN="$1"
+    log_warn "$1"
+}
+
+clear_prop_messages() {
+    _PROP_LAST_ERROR=""
+    _PROP_LAST_WARN=""
+}
+
+_get_state_emoji() {
+    case "$1" in
+        RUNNING)  printf '🥰' ;;
+        STOPPED)  printf '😴' ;;
+        FAILED)   printf '🤯' ;;
+        *)        printf '🤔' ;;
+    esac
+}
+
+update_prop_status() {
+    [ ! -f "$PROP_FILE" ] && return 0
+    
+    # Cache original description on first call
+    if [ -z "$_PROP_ORIG_DESC" ]; then
+        # Extract description value using shell parameter expansion (no sed)
+        local desc_line
+        desc_line=$(grep "^description=" "$PROP_FILE" 2>/dev/null | head -1)
+        _PROP_ORIG_DESC="${desc_line#description=}"
+        # Strip any existing status line (after \n)
+        _PROP_ORIG_DESC="${_PROP_ORIG_DESC%%\\n*}"
+        # If already has emoji prefix, use default
+        case "$_PROP_ORIG_DESC" in
+            *"🥰"*|*"😴"*|*"🤯"*|*"🤔"*)
+                _PROP_ORIG_DESC="Seamlessly redirect your network Flux."
+                ;;
+        esac
+    fi
+    
+    # Read service state from unified state file (key=value format)
+    local state="STOPPED"
+    if [ -f "$STATE_FILE" ]; then
+        state=$(grep "^service=" "$STATE_FILE" 2>/dev/null | tail -1 | cut -d= -f2)
+    fi
+    [ -z "$state" ] && state="STOPPED"
+    
+    # Build status line
+    local emoji
+    emoji=$(_get_state_emoji "$state")
+    local status_line="${emoji} [${state}]"
+    
+    # Add PID if running
+    if [ "$state" = "RUNNING" ] && [ -f "$PID_FILE" ]; then
+        local pid
+        pid=$(cat "$PID_FILE" 2>/dev/null)
+        [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && status_line="${status_line} PID: ${pid}"
+    fi
+    
+    # Add error/warn messages
+    [ -n "$_PROP_LAST_ERROR" ] && status_line="${status_line} | Error: ${_PROP_LAST_ERROR}"
+    [ -z "$_PROP_LAST_ERROR" ] && [ -n "$_PROP_LAST_WARN" ] && status_line="${status_line} | Warn: ${_PROP_LAST_WARN}"
+    
+    # Build full description
+    local full_desc="${_PROP_ORIG_DESC}\\n${status_line}"
+    
+    # Update prop file in-memory (no temp file needed)
+    local content="" line newline="
+"
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            description=*) content="${content}description=${full_desc}${newline}" ;;
+            *) content="${content}${line}${newline}" ;;
+        esac
+    done < "$PROP_FILE"
+    printf '%s' "$content" > "$PROP_FILE" 2>/dev/null
+    
+    log_debug "Prop updated: $status_line"
+}
+
+prop_starting() { clear_prop_messages; update_prop_status; }
+prop_running()  { clear_prop_messages; update_prop_status; }
+prop_stopping() { update_prop_status; }
+prop_stopped()  { update_prop_status; }
+prop_failed()   { update_prop_status; }
+
+prop_error() { set_prop_error "$1"; update_prop_status; }
+prop_warn()  { set_prop_warn "$1"; update_prop_status; }
+prop_run()   { prop_running; }
+prop_stop()  { prop_stopped; }
 
 # ==============================================================================
 # [ Log Rotation ]
@@ -178,16 +247,17 @@ log() {
 
 rotate_log() {
     [ ! -f "$LOG_FILE" ] && return 0
+    [ -z "$RUN_DIR" ] && return 1
     
-    local size
-    size=$(wc -c < "$LOG_FILE" 2>/dev/null || echo 0)
+    local max_size="${LOG_MAX_SIZE:-1048576}"
+    local current_size
+    current_size=$(stat -c%s "$LOG_FILE" 2>/dev/null || stat -f%z "$LOG_FILE" 2>/dev/null || echo 0)
     
-    if [ "$size" -gt "$LOG_MAX_SIZE" ]; then
-        [ -f "${LOG_FILE}.2" ] && mv -f "${LOG_FILE}.2" "${LOG_FILE}.3" 2>/dev/null
-        [ -f "${LOG_FILE}.1" ] && mv -f "${LOG_FILE}.1" "${LOG_FILE}.2" 2>/dev/null
+    if [ "$current_size" -gt "$max_size" ]; then
+        log_info "Rotating log file (size: $current_size > $max_size)"
         mv -f "$LOG_FILE" "${LOG_FILE}.1" 2>/dev/null
-        
-        # Clean old logs (>7 days)
-        find "$RUN_DIR" -name "Flux.log.*" -mtime +7 -delete 2>/dev/null || true
+        find "$RUN_DIR" -name "flux.log.*" -mtime +7 -delete 2>/dev/null || true
     fi
+    return 0
 }
+

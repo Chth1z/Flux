@@ -13,7 +13,6 @@ SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 . "$SCRIPT_DIR/flux.config"
 . "$SCRIPT_DIR/flux.logger"
 . "$SCRIPT_DIR/flux.state"
-. "$SCRIPT_DIR/flux.validator"
 
 export LOG_COMPONENT="Tproxy"
 
@@ -68,15 +67,11 @@ ff00::/8
 # Verify TPROXY support by checking the kernel module/config
 check_tproxy_support() {
     if [ "${KFEAT_TPROXY:-0}" -eq 1 ]; then
-        log_debug "Kernel TPROXY support confirmed (env)"
+        log_debug "TPROXY support confirmed"
         return 0
-    elif check_kernel_feature "NETFILTER_XT_TARGET_TPROXY"; then
-        log_debug "Kernel TPROXY support confirmed (cache)"
-        return 0
-    else
-        log_debug "Kernel TPROXY support not available"
-        return 1
     fi
+    log_debug "TPROXY support not available"
+    return 1
 }
 
 
@@ -119,7 +114,7 @@ load_uid_cache() {
     local cached_mtime
     
     if [ ! -f "$UID_CACHE_FILE" ]; then
-        log_debug "UID cache file not found"
+        log_debug "UID Cache file not found"
         return 1
     fi
     
@@ -127,12 +122,12 @@ load_uid_cache() {
     cached_mtime=$(head -n1 "$UID_CACHE_FILE" 2>/dev/null | grep "^#mtime:" | cut -d: -f2)
     
     if [ -z "$cached_mtime" ] || [ "$cached_mtime" != "$current_mtime" ]; then
-        log_debug "UID cache expired (mtime: $cached_mtime vs $current_mtime)"
+        log_debug "UID Cache expired (mtime: $cached_mtime vs $current_mtime)"
         rm -f "$UID_CACHE_FILE"
         return 1
     fi
     
-    log_debug "UID cache valid (mtime: $current_mtime)"
+    log_debug "UID Cache valid (mtime: $current_mtime)"
     return 0
 }
 
@@ -144,7 +139,7 @@ save_uid_cache() {
     
     mkdir -p "$(dirname "$UID_CACHE_FILE")"
     echo "#mtime:$mtime" > "$UID_CACHE_FILE"
-    log_debug "UID cache initialized with mtime: $mtime"
+    log_debug "UID Cache initialized (mtime: $mtime)"
 }
 
 # Add a single entry to UID cache
@@ -221,7 +216,7 @@ find_packages_uid() {
         cached_uid=$(lookup_uid_cache "$token")
         if [ -n "$cached_uid" ]; then
             out="$out $cached_uid"
-            log_debug "Cache hit: $token -> $cached_uid" >&2
+            log_debug "Resolved (cache): $token -> $cached_uid" >&2
             continue
         fi
         
@@ -246,7 +241,7 @@ find_packages_uid() {
             out="$out $final_uid"
             # Add to cache
             add_uid_cache_entry "$token" "$final_uid"
-            log_debug "Resolved and cached: $token -> $final_uid" >&2
+            log_debug "Resolved (system): $token -> $final_uid" >&2
         else
             log_warn "Failed to resolve UID for package: $package" >&2
         fi
@@ -313,7 +308,7 @@ setup_cn_ipset() {
         return 1
     }
 
-    log_info "Setting up ipset for China mainland IPs"
+    log_info "Setting up CN IP ipset"
 
     ipset destroy cnip 2>/dev/null || true
     ipset destroy cnip6 2>/dev/null || true
@@ -416,7 +411,7 @@ _init_kernel_features() {
     fi
     
     _KFEAT_INITIALIZED=1
-    log_debug "Kernel features loaded: addrtype=$_KFEAT_ADDRTYPE conntrack=$_KFEAT_CONNTRACK owner=$_KFEAT_OWNER mark=$_KFEAT_MARK mac=$_KFEAT_MAC"
+    log_debug "Kernel Cache loaded: addrtype=$_KFEAT_ADDRTYPE conntrack=$_KFEAT_CONNTRACK owner=$_KFEAT_OWNER mark=$_KFEAT_MARK mac=$_KFEAT_MAC"
 }
 
 # Interface config cache
@@ -690,7 +685,7 @@ setup_proxy_chain() {
     local mode_name="$mode"
     [ "$mode" = "tproxy" ] && mode_name="TPROXY" || mode_name="REDIRECT"
     
-    log_debug "Setting up $mode_name chains for IPv${family} (batch mode)"
+    log_debug "Setting up $mode_name chains (IPv${family})"
     
     # Initialize kernel feature cache (once per session)
     _init_kernel_features
@@ -706,7 +701,7 @@ setup_proxy_chain() {
     
     # Apply with iptables-restore
     if $restore_cmd --noflush < "$rules_file" 2>/dev/null; then
-        log_debug "$mode_name chains for IPv${family} setup completed (batch)"
+        log_debug "$mode_name chains setup complete (IPv${family})"
         rm -f "$rules_file"
         
         # Handle DNS hijack redirect2 mode separately (needs nat table modifications)
@@ -1021,7 +1016,7 @@ setup_routing4() {
     fi
 
     echo 1 > /proc/sys/net/ipv4/ip_forward
-    log_info "IPv4 routing setup completed"
+    log_info "Routing setup complete (IPv4)"
 }
 
 setup_routing6() {
@@ -1042,7 +1037,7 @@ setup_routing6() {
     fi
 
     echo 1 > /proc/sys/net/ipv6/conf/all/forwarding
-    log_info "IPv6 routing setup completed"
+    log_info "Routing setup complete (IPv6)"
 }
 
 # ==============================================================================
@@ -1192,10 +1187,10 @@ detect_proxy_mode() {
 
 start_proxy() {
     set_component_state "$COMP_TPROXY" "$STATE_STARTING"
-    log_info "Starting proxy setup..."
+    log_info "Starting setup..."
     if [ "$BYPASS_CN_IP" -eq 1 ]; then
-        if ! check_kernel_feature "IP_SET" || ! check_kernel_feature "NETFILTER_XT_SET"; then
-            log_error "Kernel does not support ipset (CONFIG_IP_SET, CONFIG_NETFILTER_XT_SET). Cannot bypass CN IPs"
+        if [ "${KFEAT_IPSET:-0}" -eq 0 ]; then
+            log_error "Kernel does not support ipset. Cannot bypass CN IPs"
             BYPASS_CN_IP=0
         else
             log_debug "CN IP bypass enabled, ipset will be loaded from files"
@@ -1227,12 +1222,12 @@ start_proxy() {
     start_ip_monitor
     
     set_component_state "$COMP_TPROXY" "$STATE_RUNNING"
-    log_info "Proxy setup completed"
+    log_info "Setup complete"
 }
 
 stop_proxy() {
     set_component_state "$COMP_TPROXY" "$STATE_STOPPING"
-    log_info "Stopping proxy..."
+    log_info "Stopping Tproxy..."
     if [ "$USE_TPROXY" -eq 1 ]; then
         cleanup_tproxy_chain4
         cleanup_routing4
@@ -1256,7 +1251,7 @@ stop_proxy() {
     stop_ip_monitor
     
     set_component_state "$COMP_TPROXY" "$STATE_STOPPED"
-    log_info "Proxy stopped"
+    log_info "Tproxy stopped"
 }
 
 
@@ -1302,7 +1297,7 @@ ping_fix() {
         enable)
             iptables -t nat -A OUTPUT -d "$FAKEIP_RANGE_V4" -p icmp -j DNAT --to-destination 127.0.0.1
             iptables -t nat -A PREROUTING -d "$FAKEIP_RANGE_V4" -p icmp -j DNAT --to-destination 127.0.0.1
-            if [ "$PROXY_IPV6" = "1" ] && check_kernel_feature "IP6_NF_NAT"; then
+            if [ "$PROXY_IPV6" = "1" ] && [ "${KFEAT_IPV6_NAT:-0}" -eq 1 ]; then
                 ip6tables -t nat -A OUTPUT -d "$FAKEIP_RANGE_V6" -p icmp -j DNAT --to-destination ::1
                 ip6tables -t nat -A PREROUTING -d "$FAKEIP_RANGE_V6" -p icmp -j DNAT --to-destination ::1
             fi
@@ -1322,7 +1317,7 @@ ping_fix() {
 
 # Start IP address monitor daemon for dynamic anti-loopback
 start_ip_monitor() {
-    local monitor_script="$SCRIPTS_DIR/flux.ip.monitor"
+    local monitor_script="$MONITOR_SCRIPT"
     
     if [ -x "$monitor_script" ] || [ -f "$monitor_script" ]; then
         chmod +x "$monitor_script" 2>/dev/null
@@ -1336,7 +1331,7 @@ start_ip_monitor() {
 
 # Stop IP address monitor daemon
 stop_ip_monitor() {
-    local monitor_script="$SCRIPTS_DIR/flux.ip.monitor"
+    local monitor_script="$MONITOR_SCRIPT"
     
     if [ -x "$monitor_script" ] || [ -f "$monitor_script" ]; then
         sh "$monitor_script" stop 2>/dev/null

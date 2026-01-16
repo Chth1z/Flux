@@ -30,8 +30,15 @@ _log() {
     
     local timestamp
     timestamp=$(date '+%m-%d %H:%M:%S')
+    
+    # Format component: fixed width 7 chars, left aligned, space padded
+    # Truncate if longer than 7 chars to preserve alignment
+    local comp_fmt
+    comp_fmt=$(printf '%-7.7s' "${LOG_COMPONENT}")
+    
     local log_line
-    log_line=$(printf '[%s] %s [%s] %s' "$timestamp" "$level" "$LOG_COMPONENT" "$msg")
+    # Format: [Time] L [Component] Message
+    log_line=$(printf '[%s] %s [%s] %s' "$timestamp" "$level" "$comp_fmt" "$msg")
     
     # Write to log file
     [ -n "$LOG_FILE" ] && printf '%s\n' "$log_line" >> "$LOG_FILE"
@@ -41,9 +48,8 @@ _log() {
         case "$level" in
             E) printf '\033[31m%s\033[0m\n' "$log_line" >&2 ;; # Red
             W) printf '\033[33m%s\033[0m\n' "$log_line" >&2 ;; # Yellow
-            I) printf '\033[32m%s\033[0m\n' "$log_line" ;;     # Green
-            D) printf '\033[90m%s\033[0m\n' "$log_line" ;;     # Gray
-
+            I) printf '\033[32m%s\033[0m\n' "$log_line" >&2 ;; # Green
+            D) printf '\033[90m%s\033[0m\n' "$log_line" >&2 ;; # Gray
         esac
     fi
 }

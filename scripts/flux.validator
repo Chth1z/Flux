@@ -223,39 +223,54 @@ validate_singbox_config() {
 
 # Initialize kernel capability cache
 init_kernel_cache() {
-    # Skip if cache exists and is fresh (created this boot)
+    # Get current kernel version (changes only when kernel is updated)
+    local current_kernel
+    current_kernel=$(uname -r 2>/dev/null)
+    
+    # Skip if cache exists and kernel version matches
     if [ -f "$KERNEL_CACHE_FILE" ]; then
-        local cache_uptime current_uptime
-        cache_uptime=$(awk -F: '/^#uptime:/{print $2; exit}' "$KERNEL_CACHE_FILE" 2>/dev/null)
-        current_uptime=$(cut -d. -f1 /proc/uptime 2>/dev/null || echo "0")
+        local cached_kernel
+        cached_kernel=$(head -n1 "$KERNEL_CACHE_FILE" 2>/dev/null | grep "^#kernel:" | cut -d: -f2-)
         
-        # Cache is valid if created within current boot session
-        if [ -n "$cache_uptime" ] && [ "$current_uptime" -ge "$cache_uptime" ]; then
-            log_debug "Kernel cache valid"
+        if [ -n "$cached_kernel" ] && [ "$cached_kernel" = "$current_kernel" ]; then
+            log_debug "Kernel Cache valid (kernel version match)"
             return 0
         fi
+        log_debug "Kernel changed: $cached_kernel -> $current_kernel"
     fi
     
-    log_debug "Building kernel capability cache..."
+    log_debug "Building Kernel Capability Cache..."
     
-    # Write header with uptime
-    local uptime
-    uptime=$(cut -d. -f1 /proc/uptime 2>/dev/null || echo "0")
-    echo "#uptime:$uptime" > "$KERNEL_CACHE_FILE"
-    
-    # Check and cache kernel features (single zcat, single grep)
+    # Check and cache kernel features
     if [ -f /proc/config.gz ]; then
-        # Extract all needed CONFIG_ values in one pass
-        zcat /proc/config.gz 2>/dev/null | grep -E '^CONFIG_(NETFILTER_XT_TARGET_TPROXY|NETFILTER_XT_MATCH_ADDRTYPE|NETFILTER_XT_MATCH_CONNTRACK|NETFILTER_XT_MATCH_OWNER|NETFILTER_XT_MATCH_MARK|NETFILTER_XT_MATCH_MAC|IP_SET|NETFILTER_XT_SET|IP6_NF_NAT|IP6_NF_TARGET_REDIRECT)=[ym]$' | while read -r line; do
-            # CONFIG_FEATURE=y -> FEATURE=1
-            feature="${line#CONFIG_}"
-            feature="${feature%=*}"
-            echo "${feature}=1" >> "$KERNEL_CACHE_FILE"
+        # Build content in memory (avoids pipe subshell issue)
+        local content newline="
+"
+        content="#kernel:${current_kernel}${newline}"
+        
+        # Get all kernel config at once
+        local kernel_config
+        kernel_config=$(zcat /proc/config.gz 2>/dev/null)
+        
+        # List of features to check (record ALL, not just supported ones)
+        local features="NETFILTER_XT_TARGET_TPROXY NETFILTER_XT_MATCH_ADDRTYPE NETFILTER_XT_MATCH_CONNTRACK NETFILTER_XT_MATCH_OWNER NETFILTER_XT_MATCH_MARK NETFILTER_XT_MATCH_MAC IP_SET NETFILTER_XT_SET IP6_NF_NAT IP6_NF_TARGET_REDIRECT"
+        
+        local feat val
+        for feat in $features; do
+            # Check if feature is enabled (=y or =m)
+            if echo "$kernel_config" | grep -qE "^CONFIG_${feat}=[ym]$"; then
+                val=1
+            else
+                val=0
+            fi
+            content="${content}${feat}=${val}${newline}"
         done
         
-        log_debug "Kernel cache built"
+        # Write all at once
+        printf '%s' "$content" > "$KERNEL_CACHE_FILE"
+        log_debug "Kernel Cache built"
     else
-        log_debug "Cannot build kernel cache: /proc/config.gz not available"
+        log_debug "Cannot build Kernel Cache: /proc/config.gz not available"
         return 1
     fi
     
@@ -299,64 +314,41 @@ validate_kernel_features() {
     # Initialize cache
     init_kernel_cache
     
-    # Check and export features (passed to tproxy via env)
-    # Using KFEAT_ prefix
-    local tproxy_support=0
-    if check_kernel_feature_cached "NETFILTER_XT_TARGET_TPROXY"; then
-        tproxy_support=1
-    fi
-    export KFEAT_TPROXY="$tproxy_support"
+    # Helper: check feature(s) and export result
+    # Usage: _export_kfeat ENV_NAME FEATURE1 [FEATURE2 ...]
+    _export_kfeat() {
+        local env_name="$1"; shift
+        local result=1
+        for feat in "$@"; do
+            if ! check_kernel_feature_cached "$feat"; then
+                result=0
+                break
+            fi
+        done
+        export "KFEAT_${env_name}=$result"
+        log_debug "KFEAT_${env_name}=$result"
+    }
     
-    local owner_support=0
-    if check_kernel_feature_cached "NETFILTER_XT_MATCH_OWNER"; then
-        owner_support=1
-    fi
-    export KFEAT_OWNER="$owner_support"
-    
-    local mark_support=0
-    if check_kernel_feature_cached "NETFILTER_XT_MATCH_MARK"; then
-        mark_support=1
-    fi
-    export KFEAT_MARK="$mark_support"
-    
-    local ipset_support=0
-    if check_kernel_feature_cached "IP_SET" && check_kernel_feature_cached "NETFILTER_XT_SET"; then
-        ipset_support=1
-    fi
-    export KFEAT_IPSET="$ipset_support"
-    
-    local ipv6_nat_support=0
-    if check_kernel_feature_cached "IP6_NF_NAT" && check_kernel_feature_cached "IP6_NF_TARGET_REDIRECT"; then
-        ipv6_nat_support=1
-    fi
-    export KFEAT_IPV6_NAT="$ipv6_nat_support"
-    
-    # Export additional features needed by tproxy rule building
-    local addrtype_support=0
-    check_kernel_feature_cached "NETFILTER_XT_MATCH_ADDRTYPE" && addrtype_support=1
-    export KFEAT_ADDRTYPE="$addrtype_support"
-    
-    local conntrack_support=0
-    check_kernel_feature_cached "NETFILTER_XT_MATCH_CONNTRACK" && conntrack_support=1
-    export KFEAT_CONNTRACK="$conntrack_support"
-    
-    local mac_support=0
-    check_kernel_feature_cached "NETFILTER_XT_MATCH_MAC" && mac_support=1
-    export KFEAT_MAC="$mac_support"
+    # Export all kernel feature flags
+    _export_kfeat TPROXY    NETFILTER_XT_TARGET_TPROXY
+    _export_kfeat OWNER     NETFILTER_XT_MATCH_OWNER
+    _export_kfeat MARK      NETFILTER_XT_MATCH_MARK
+    _export_kfeat ADDRTYPE  NETFILTER_XT_MATCH_ADDRTYPE
+    _export_kfeat CONNTRACK NETFILTER_XT_MATCH_CONNTRACK
+    _export_kfeat MAC       NETFILTER_XT_MATCH_MAC
+    _export_kfeat IPSET     IP_SET NETFILTER_XT_SET                    # Both required
+    _export_kfeat IPV6_NAT  IP6_NF_NAT IP6_NF_TARGET_REDIRECT          # Both required
 
-    # Validate requirements
-    if [ "$PROXY_MODE" = "1" ] && [ "$tproxy_support" -eq 0 ]; then
+    # Validate critical requirements
+    if [ "$PROXY_MODE" = "1" ] && [ "$KFEAT_TPROXY" -eq 0 ]; then
         add_error "Kernel lacks TPROXY support (required by PROXY_MODE=1)"
         return 1
     fi
     
-    if [ "$owner_support" -eq 0 ]; then
-        add_warning "Kernel lacks OWNER match, using MARK-based bypass"
-    fi
+    [ "$KFEAT_OWNER" -eq 0 ] && add_warning "Kernel lacks OWNER match, using MARK-based bypass"
     
-    if [ "$BYPASS_CN_IP" = "1" ] && [ "$ipset_support" -eq 0 ]; then
+    [ "$BYPASS_CN_IP" = "1" ] && [ "$KFEAT_IPSET" -eq 0 ] && \
         add_warning "Kernel lacks ipset support, CN IP bypass will be disabled"
-    fi
     
     return 0
 }
@@ -368,7 +360,7 @@ validate_kernel_features() {
 # Run all validations
 # Returns: 0 if all passed, 1 if any errors
 validate_all() {
-    log_info "Running comprehensive validation..."
+    log_info "Validating environment..."
     
     reset_validation
 

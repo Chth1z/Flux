@@ -14,7 +14,7 @@ SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 . "$SCRIPT_DIR/flux.logger"
 
 # Config is inherited from flux.tproxy via exported environment variables
-export LOG_COMPONENT="IPMonitor"
+export LOG_COMPONENT="Monitor"
 
 # ==============================================================================
 # [ IPTables Setup ]
@@ -52,13 +52,13 @@ get_table() {
 sync_all_addresses() {
     local table
     table=$(get_table)
-    local timestamp
-    timestamp=$(date '+%H:%M:%S')
     
-    log_debug "Syncing all local IP addresses (flush + re-add)..."
+    log_debug "Syncing IP Cache..."
     
-    # Clear cache file
-    : > "$IP_CACHE_FILE"
+    # Build cache content in memory
+    local cache_content="" newline="
+"
+    local count=0
     
     # --- IPv4 ---
     # Flush LOCAL_IP chain first (if exists)
@@ -76,12 +76,16 @@ sync_all_addresses() {
         }
     fi
     
-    # Re-add all current IPv4 addresses
-    ip -4 addr show 2>/dev/null | busybox awk '/inet / {print $2}' | while read -r ip_cidr; do
+    # Get all IPv4 addresses first (avoid pipe subshell)
+    local ipv4_list
+    ipv4_list=$(ip -4 addr show 2>/dev/null | busybox awk '/inet / {print $2}')
+    
+    # Process IPv4 addresses
+    local ip_cidr
+    while IFS= read -r ip_cidr || [ -n "$ip_cidr" ]; do
+        [ -z "$ip_cidr" ] && continue
         # Skip loopback
-        case "$ip_cidr" in
-            127.*) continue ;;
-        esac
+        case "$ip_cidr" in 127.*) continue ;; esac
         
         # Add to mangle table (exclude DNS port 53 to prevent leak)
         $IPT -t "$table" -A LOCAL_IP -d "$ip_cidr" -p udp ! --dport 53 -j ACCEPT 2>/dev/null
@@ -93,10 +97,13 @@ sync_all_addresses() {
             $IPT -t nat -A LOCAL_IP -d "$ip_cidr" ! -p udp -j ACCEPT 2>/dev/null
         fi
         
-        # Cache the IP
-        echo "$ip_cidr" >> "$IP_CACHE_FILE"
-        log_debug "Added bypass rule for $ip_cidr"
-    done
+        # Build cache content
+        cache_content="${cache_content}${ip_cidr}${newline}"
+        count=$((count + 1))
+        log_debug "Added bypass: $ip_cidr"
+    done <<EOF
+$ipv4_list
+EOF
     
     # --- IPv6 ---
     if [ "${PROXY_IPV6:-0}" -eq 1 ]; then
@@ -106,24 +113,32 @@ sync_all_addresses() {
             $IP6T -t "$table" -I BYPASS_IP6 -j LOCAL_IP6 2>/dev/null
         }
         
-        # Re-add all current IPv6 addresses
-        ip -6 addr show 2>/dev/null | busybox awk '/inet6 / {print $2}' | while read -r ip_cidr; do
-            # Skip link-local and loopback (match original net.inotify)
-            case "$ip_cidr" in
-                fe80:*|::1*) continue ;;
-            esac
+        # Get all IPv6 addresses first
+        local ipv6_list
+        ipv6_list=$(ip -6 addr show 2>/dev/null | busybox awk '/inet6 / {print $2}')
+        
+        # Process IPv6 addresses
+        while IFS= read -r ip_cidr || [ -n "$ip_cidr" ]; do
+            [ -z "$ip_cidr" ] && continue
+            # Skip link-local and loopback
+            case "$ip_cidr" in fe80:*|::1*) continue ;; esac
             
             # Exclude DNS port 53 to prevent leak
             $IP6T -t "$table" -A LOCAL_IP6 -d "$ip_cidr" -p udp ! --dport 53 -j ACCEPT 2>/dev/null
             $IP6T -t "$table" -A LOCAL_IP6 -d "$ip_cidr" ! -p udp -j ACCEPT 2>/dev/null
             
-            echo "$ip_cidr" >> "$IP_CACHE_FILE"
-            log_debug "Added bypass rule for $ip_cidr"
-            count=$((count+1))
-        done
+            cache_content="${cache_content}${ip_cidr}${newline}"
+            count=$((count + 1))
+            log_debug "Added bypass: $ip_cidr"
+        done <<EOF
+$ipv6_list
+EOF
     fi
     
-    log_debug "Synced $count IP addresses to LOCAL_IP chain"
+    # Write cache all at once
+    printf '%s' "$cache_content" > "$IP_CACHE_FILE"
+    
+    log_debug "IP Cache synced: $count IPs"
 }
 
 # ==============================================================================
@@ -202,7 +217,7 @@ handle_event() {
         
         # Update cache
         echo "$ip_cidr" >> "$IP_CACHE_FILE"
-        log_debug "Added bypass rule for $ip_cidr"
+        log_debug "Added bypass: $ip_cidr"
         
     else
         # Check cache - if not in cache, rule wasn't added by us
@@ -220,11 +235,18 @@ handle_event() {
             $IPT -t nat -D LOCAL_IP -d "$ip_cidr" ! -p udp -j ACCEPT 2>/dev/null
         fi
         
-        # Update cache (remove entry)
-        grep -vF "$ip_cidr" "$IP_CACHE_FILE" > "$IP_CACHE_FILE.tmp" 2>/dev/null
-        mv -f "$IP_CACHE_FILE.tmp" "$IP_CACHE_FILE" 2>/dev/null
+        # Update cache (remove entry - in-memory, no temp file)
+        local content="" line newline="
+"
+        while IFS= read -r line || [ -n "$line" ]; do
+            case "$line" in
+                "$ip_cidr") ;;  # Skip this entry
+                *) [ -n "$line" ] && content="${content}${line}${newline}" ;;
+            esac
+        done < "$IP_CACHE_FILE"
+        printf '%s' "$content" > "$IP_CACHE_FILE"
         
-        log_debug "Removed bypass rule for $ip_cidr"
+        log_debug "Removed bypass: $ip_cidr"
     fi
 }
 
@@ -235,7 +257,7 @@ handle_event() {
 SYNC_PID=""
 
 start_monitor() {
-    log_info "Starting IP address monitor..."
+    log_info "Starting IPMonitor..."
     
     # Trap to clean up on exit
     trap 'cleanup_monitor; exit 0' EXIT INT TERM
@@ -284,7 +306,7 @@ cleanup_monitor() {
     # Clean up cache file
     rm -f "$IP_CACHE_FILE" "$IP_CACHE_FILE.tmp" 2>/dev/null
     
-    log_debug "IP monitor cleanup completed"
+    log_debug "Cleanup complete"
 }
 
 stop_monitor() {
@@ -294,26 +316,32 @@ stop_monitor() {
     # Clean up
     cleanup_monitor
     
-    log_info "IP monitor stopped"
+    log_info "IPMonitor stopped"
 }
 
 # ==============================================================================
 # [ Entry Point ]
 # ==============================================================================
 
-case "${1:-start}" in
-    start)
-        start_monitor
-        ;;
-    stop)
-        stop_monitor
-        ;;
-    sync)
-        # Manual sync command for testing
-        sync_all_addresses
-        ;;
-    *)
-        echo "Usage: $0 {start|stop|sync}"
-        exit 1
-        ;;
-esac
+main() {
+    local action="${1:-start}"
+
+    case "$action" in
+        start)
+            start_monitor
+            ;;
+        stop)
+            stop_monitor
+            ;;
+        sync)
+            # Manual sync command for testing
+            sync_all_addresses
+            ;;
+        *)
+            echo "Usage: $0 {start|stop|sync}"
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

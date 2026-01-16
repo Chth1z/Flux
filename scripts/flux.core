@@ -14,7 +14,7 @@ SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 . "$SCRIPT_DIR/flux.logger"
 . "$SCRIPT_DIR/flux.state"
 
-export LOG_COMPONENT="Core"
+export LOG_COMPONENT="Singbox"
 
 # ==============================================================================
 # [ Core Status Check ]
@@ -84,7 +84,7 @@ start_core() {
     
     while [ $start_wait_count -lt "$max_checks" ]; do
         if is_core_running; then
-            log_info "Core started (PID: $pid)"
+            log_info "Singbox started (PID: $pid)"
             set_component_state "$COMP_CORE" "$STATE_RUNNING"
             return 0
         fi
@@ -93,7 +93,7 @@ start_core() {
         start_wait_count=$((start_wait_count + 1))
     done
     
-    log_error "Core start failed (timeout)"
+    log_error "Start failed (timeout)"
     prop_error "Core timeout"
     set_component_state "$COMP_CORE" "$STATE_FAILED"
     _cleanup_core_process
@@ -147,12 +147,12 @@ stop_core() {
     
     rm -f "$PID_FILE" 2>/dev/null
     set_component_state "$COMP_CORE" "$STATE_STOPPED"
-    log_info "Core stopped"
+    log_info "Singbox stopped"
 }
 
 # Emergency rollback - force kill core
 rollback_core() {
-    log_info "Rolling back core..."
+    log_info "Rolling back Singbox..."
     set_component_state "$COMP_CORE" "$STATE_ROLLING_BACK"
     
     if [ -s "$PID_FILE" ]; then
@@ -163,7 +163,7 @@ rollback_core() {
     rm -f "$PID_FILE" 2>/dev/null
     
     set_component_state "$COMP_CORE" "$STATE_STOPPED"
-    log_debug "Core rollback complete"
+    log_debug "Rollback complete"
 }
 
 
@@ -177,7 +177,7 @@ main() {
     case "$action" in
         start)
             is_core_running && { 
-                log_info "Core already running"
+                log_info "Singbox already running"
                 set_component_state "$COMP_CORE" "$STATE_RUNNING"
                 exit 0
             }

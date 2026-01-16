@@ -31,6 +31,7 @@ show_banner() {
    | |_  | | | | \ \/ /
    |  _| | | |_| |>  <
    |_|   |_|\__,_/_/\_\
+    
 BANNER
     log_info "Flux $FLUX_VERSION starting..."
 }
@@ -117,7 +118,10 @@ init_environment() {
     
     rotate_log || log_debug "Log rotation skipped"
     
-    log_debug "Environment initialized"
+    show_banner
+    
+    log_info "Environment initialized"
+    log_debug "Config: TCP=$PROXY_TCP_PORT UDP=$PROXY_UDP_PORT FakeIP=$FAKEIP_RANGE_V4"
     return 0
 }
 
@@ -132,7 +136,7 @@ init_environment() {
 # @return 0 if both succeeded, 1 if any failed
 ##
 start_services() {
-    log_info "Starting services in parallel..."
+    log_info "Starting services..."
     
     # Initialize state
     state_init
@@ -143,7 +147,7 @@ start_services() {
     
     # Start Core in background
     (
-        sh "$SCRIPT_DIR/flux.core" start
+        sh "$CORE_SCRIPT" start
         exit $?
     ) &
     local core_pid=$!
@@ -201,7 +205,7 @@ start_services() {
     # Both succeeded
     if all_components_running; then
         set_service_state "$STATE_RUNNING"
-        log_info "All services started successfully"
+        log_info "Startup complete"
         return 0
     fi
     
@@ -218,7 +222,7 @@ start_services() {
 # ==============================================================================
 
 stop_services() {
-    log_info "Stopping services in parallel..."
+    log_info "Stopping services..."
     
     set_service_state "$STATE_STOPPING"
     
@@ -226,7 +230,7 @@ stop_services() {
     sh "$TPROXY_SCRIPT" stop >/dev/null 2>&1 &
     local tproxy_pid=$!
     
-    sh "$SCRIPT_DIR/flux.core" stop >/dev/null 2>&1 &
+    sh "$CORE_SCRIPT" stop >/dev/null 2>&1 &
     local core_pid=$!
     
     # Wait for both
@@ -238,7 +242,7 @@ stop_services() {
     
     if all_components_stopped; then
         set_service_state "$STATE_STOPPED"
-        log_info "All services stopped"
+        log_info "All stopped"
         return 0
     fi
     
@@ -255,9 +259,9 @@ stop_services() {
 # ==============================================================================
 
 force_cleanup() {
-    log_debug "Force cleanup of stale services..."
+    log_debug "Force cleanup..."
     
-    sh "$SCRIPT_DIR/flux.core" stop >/dev/null 2>&1 || true
+    sh "$CORE_SCRIPT" stop >/dev/null 2>&1 || true
     sh "$TPROXY_SCRIPT" stop >/dev/null 2>&1 || true
 }
 
@@ -270,23 +274,30 @@ start_service_sequence() {
     local current_state
     current_state=$(get_service_state)
     
-    # Check if already running
+    # Check if already running - but verify the process actually exists
     if [ "$current_state" = "$STATE_RUNNING" ]; then
-        log_info "Service already running"
-        return 0
+        # Verify core process is actually alive
+        if [ -f "$PID_FILE" ]; then
+            local pid
+            pid=$(cat "$PID_FILE" 2>/dev/null)
+            if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+                log_info "Service already running (PID: $pid)"
+                return 0
+            fi
+        fi
+        # State says RUNNING but process is dead - reset state
+        log_warn "Stale RUNNING state detected, resetting..."
+        state_init
+        current_state="$STATE_STOPPED"
     fi
     
     # Check if transition is allowed
     if ! can_start; then
-        log_error "Cannot start from state: $current_state"
-        prop_error "Invalid state: $current_state"
-        return 1
+        # State might be STARTING from a crashed startup - force reset
+        log_warn "Forcing state reset from: $current_state"
+        state_init
     fi
     
-    # Show startup banner
-    show_banner
-    
-    # Initialize environment
     # Run comprehensive validation
     if ! validate_all; then
         log_error "Validation failed"
@@ -306,7 +317,7 @@ start_service_sequence() {
         return 1
     fi
     
-    log_info "Service ready"
+    log_info "Ready"
     prop_run
     return 0
 }
@@ -317,7 +328,7 @@ stop_service_sequence() {
     
     # Check if already stopped
     if [ "$current_state" = "$STATE_STOPPED" ]; then
-        log_info "Service already stopped"
+        log_info "Already stopped"
         return 0
     fi
     
@@ -369,4 +380,3 @@ main() {
 }
 
 main "$@"
-

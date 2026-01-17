@@ -10,8 +10,8 @@
 # ==============================================================================
 
 # Load system configuration (absolute paths for boot safety)
-. "/data/adb/flux/scripts/flux.config"
-. "/data/adb/flux/scripts/flux.logger"
+. "/data/adb/flux/scripts/flux.utils"
+. "/data/adb/flux/scripts/flux.data"
 
 # Ensure run directory exists for logging
 [ ! -d "$RUN_DIR" ] && mkdir -p "$RUN_DIR" && chmod 0755 "$RUN_DIR"

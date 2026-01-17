@@ -35,12 +35,12 @@ _init_config_defaults() {
     local line key default current
     for line in \
         "SUBSCRIPTION_URL:" \
-        "CORE_TIMEOUT:5" \
         "UPDATE_TIMEOUT:15" \
         "UPDATE_INTERVAL:86400" \
         "RETRY_COUNT:2" \
         "LOG_LEVEL:3" \
         "LOG_MAX_SIZE:1048576" \
+        "CORE_TIMEOUT:5" \
         "CORE_USER:root" \
         "CORE_GROUP:root" \
         "ROUTING_MARK:" \
@@ -100,23 +100,6 @@ load_flux_config() {
     
     # Load values from config.json (ports, fakeip ranges)
     _load_config_json_values
-}
-
-# Export all config variables for child processes
-# Call this in start.sh after load_flux_config so core/tproxy inherit via environment
-export_flux_config() {
-    export CORE_TIMEOUT UPDATE_TIMEOUT UPDATE_INTERVAL RETRY_COUNT \
-           LOG_LEVEL LOG_MAX_SIZE CORE_USER CORE_GROUP ROUTING_MARK \
-           PROXY_TCP_PORT PROXY_UDP_PORT PROXY_MODE \
-           DNS_HIJACK_ENABLE DNS_PORT \
-           MOBILE_INTERFACE WIFI_INTERFACE HOTSPOT_INTERFACE USB_INTERFACE \
-           PROXY_MOBILE PROXY_WIFI PROXY_HOTSPOT PROXY_USB \
-           PROXY_TCP PROXY_UDP PROXY_IPV6 \
-           MARK_VALUE MARK_VALUE6 TABLE_ID \
-           APP_PROXY_ENABLE APP_PROXY_MODE PROXY_APPS_LIST BYPASS_APPS_LIST \
-           BYPASS_CN_IP CN_IP_FILE CN_IPV6_FILE CN_IP_URL CN_IPV6_URL \
-           MAC_FILTER_ENABLE MAC_PROXY_MODE PROXY_MACS_LIST BYPASS_MACS_LIST \
-           SKIP_CHECK_FEATURE FAKEIP_RANGE_V4 FAKEIP_RANGE_V6
 }
 
 # Internal: Load values from config.json
@@ -231,6 +214,7 @@ LOG_MAX_SIZE:10240:104857600
 UPDATE_TIMEOUT:1:300
 RETRY_COUNT:0:10
 UPDATE_INTERVAL:60:31536000
+CORE_TIMEOUT:1:60
 PROXY_TCP_PORT:1:65535
 PROXY_UDP_PORT:1:65535
 PROXY_MODE:0:2
@@ -364,16 +348,15 @@ validate_singbox_config() {
 # [ Kernel Feature Validation (with cache) ]
 # ==============================================================================
 
-# Initialize kernel capability cache
-init_kernel_cache() {
-    # Get current kernel version (changes only when kernel is updated)
+# Save kernel capability cache (KFEAT_* format for direct source)
+save_kernel_cache() {
     local current_kernel
     current_kernel=$(uname -r 2>/dev/null)
     
     # Skip if cache exists and kernel version matches
     if [ -f "$KERNEL_CACHE_FILE" ]; then
         local cached_kernel
-        cached_kernel=$(head -n1 "$KERNEL_CACHE_FILE" 2>/dev/null | grep "^#kernel:" | cut -d: -f2-)
+        cached_kernel=$(grep "^#kernel:" "$KERNEL_CACHE_FILE" 2>/dev/null | cut -d: -f2-)
         
         if [ -n "$cached_kernel" ] && [ "$cached_kernel" = "$current_kernel" ]; then
             log_debug "Kernel Cache valid (kernel version match)"
@@ -384,39 +367,36 @@ init_kernel_cache() {
     
     log_debug "Building Kernel Capability Cache..."
     
-    # Check and cache kernel features
-    if [ -f /proc/config.gz ]; then
-        # Build content in memory (avoids pipe subshell issue)
-        local content newline="
-"
-        content="#kernel:${current_kernel}${newline}"
-        
-        # Get all kernel config at once
-        local kernel_config
-        kernel_config=$(zcat /proc/config.gz 2>/dev/null)
-        
-        # List of features to check (record ALL, not just supported ones)
-        local features="NETFILTER_XT_TARGET_TPROXY NETFILTER_XT_MATCH_ADDRTYPE NETFILTER_XT_MATCH_CONNTRACK NETFILTER_XT_MATCH_OWNER NETFILTER_XT_MATCH_MARK NETFILTER_XT_MATCH_MAC IP_SET NETFILTER_XT_SET IP6_NF_NAT IP6_NF_TARGET_REDIRECT"
-        
-        local feat val
-        for feat in $features; do
-            # Check if feature is enabled (=y or =m)
-            if echo "$kernel_config" | grep -qE "^CONFIG_${feat}=[ym]$"; then
-                val=1
-            else
-                val=0
-            fi
-            content="${content}${feat}=${val}${newline}"
-        done
-        
-        # Write all at once
-        printf '%s' "$content" > "$KERNEL_CACHE_FILE"
-        log_debug "Kernel Cache built"
-    else
+    if [ ! -f /proc/config.gz ]; then
         log_debug "Cannot build Kernel Cache: /proc/config.gz not available"
         return 1
     fi
     
+    # Get all kernel config at once
+    local kernel_config
+    kernel_config=$(zcat /proc/config.gz 2>/dev/null)
+    
+    # Feature mapping: KERNEL_CONFIG -> KFEAT_NAME
+    local content="# Kernel Feature Cache - Auto Generated
+#kernel:${current_kernel}
+"
+    
+    _check_feat() {
+        if echo "$kernel_config" | grep -qE "^CONFIG_${1}=[ym]$"; then echo 1; else echo 0; fi
+    }
+    
+    content="${content}KFEAT_TPROXY=$(_check_feat NETFILTER_XT_TARGET_TPROXY)
+KFEAT_OWNER=$(_check_feat NETFILTER_XT_MATCH_OWNER)
+KFEAT_MARK=$(_check_feat NETFILTER_XT_MATCH_MARK)
+KFEAT_ADDRTYPE=$(_check_feat NETFILTER_XT_MATCH_ADDRTYPE)
+KFEAT_CONNTRACK=$(_check_feat NETFILTER_XT_MATCH_CONNTRACK)
+KFEAT_MAC=$(_check_feat NETFILTER_XT_MATCH_MAC)
+KFEAT_IPSET=$(_check_feat IP_SET)
+KFEAT_IPV6_NAT=$(_check_feat IP6_NF_NAT)
+"
+    
+    printf '%s' "$content" > "$KERNEL_CACHE_FILE"
+    log_debug "Kernel Cache built"
     return 0
 }
 
@@ -450,51 +430,6 @@ check_kernel_feature_cached() {
     return 1
 }
 
-# Validate essential kernel features and export for tproxy
-validate_kernel_features() {
-    log_debug "Validating kernel features..."
-    
-    # Initialize cache
-    init_kernel_cache
-    
-    # Helper: check feature(s) and export result
-    # Usage: _export_kfeat ENV_NAME FEATURE1 [FEATURE2 ...]
-    _export_kfeat() {
-        local env_name="$1"; shift
-        local result=1
-        for feat in "$@"; do
-            if ! check_kernel_feature_cached "$feat"; then
-                result=0
-                break
-            fi
-        done
-        export "KFEAT_${env_name}=$result"
-        log_debug "KFEAT_${env_name}=$result"
-    }
-    
-    # Export all kernel feature flags
-    _export_kfeat TPROXY    NETFILTER_XT_TARGET_TPROXY
-    _export_kfeat OWNER     NETFILTER_XT_MATCH_OWNER
-    _export_kfeat MARK      NETFILTER_XT_MATCH_MARK
-    _export_kfeat ADDRTYPE  NETFILTER_XT_MATCH_ADDRTYPE
-    _export_kfeat CONNTRACK NETFILTER_XT_MATCH_CONNTRACK
-    _export_kfeat MAC       NETFILTER_XT_MATCH_MAC
-    _export_kfeat IPSET     IP_SET NETFILTER_XT_SET                    # Both required
-    _export_kfeat IPV6_NAT  IP6_NF_NAT IP6_NF_TARGET_REDIRECT          # Both required
-
-    # Validate critical requirements
-    if [ "$PROXY_MODE" = "1" ] && [ "$KFEAT_TPROXY" -eq 0 ]; then
-        add_error "Kernel lacks TPROXY support (required by PROXY_MODE=1)"
-        return 1
-    fi
-    
-    [ "$KFEAT_OWNER" -eq 0 ] && add_warning "Kernel lacks OWNER match, using MARK-based bypass"
-    
-    [ "$BYPASS_CN_IP" = "1" ] && [ "$KFEAT_IPSET" -eq 0 ] && \
-        add_warning "Kernel lacks ipset support, CN IP bypass will be disabled"
-    
-    return 0
-}
 
 # ==============================================================================
 # [ Main Validation Entry Point ]
@@ -513,13 +448,8 @@ validate_all() {
     # 2. Validate settings values
     validate_settings
     
-    # 3. Validate kernel features (with caching)
-    validate_kernel_features
-    
-    # 4. Validate sing-box config (only if files exist)
-    if [ -f "$CONFIG_FILE" ] && [ -f "$SING_BOX_BIN" ]; then
-        validate_singbox_config
-    fi
+    # 3. Validate sing-box config (only if files exist)
+    validate_singbox_config
     
     # Report results
     if [ -n "$VALIDATION_WARNINGS" ]; then
@@ -537,154 +467,57 @@ validate_all() {
 
 
 # ==============================================================================
-# [ UID & Package Resolution (with caching) ]
+# [ UID & Package Resolution ]
 # ==============================================================================
-
-# Get modification time of packages.list for cache validation
-get_packages_list_mtime() {
-    if [ -f "$PACKAGES_LIST" ]; then
-        stat -c %Y "$PACKAGES_LIST" 2>/dev/null || stat -f %m "$PACKAGES_LIST" 2>/dev/null || echo "0"
-    else
-        echo "0"
-    fi
-}
-
-# Load UID cache from file, returns 0 if cache is valid, 1 if invalid/missing
-load_uid_cache() {
-    local current_mtime
-    local cached_mtime
-    
-    if [ ! -f "$UID_CACHE_FILE" ]; then
-        log_debug "UID Cache file not found"
-        return 1
-    fi
-    
-    current_mtime=$(get_packages_list_mtime)
-    cached_mtime=$(head -n1 "$UID_CACHE_FILE" 2>/dev/null | grep "^#mtime:" | cut -d: -f2)
-    
-    if [ -z "$cached_mtime" ] || [ "$cached_mtime" != "$current_mtime" ]; then
-        log_debug "UID Cache expired (mtime: $cached_mtime vs $current_mtime)"
-        rm -f "$UID_CACHE_FILE"
-        return 1
-    fi
-    
-    log_debug "UID Cache valid (mtime: $current_mtime)"
-    return 0
-}
-
-# Save UID cache to file
-# Format: first line is "#mtime:TIMESTAMP", rest are "token uid" pairs
-save_uid_cache() {
-    local mtime
-    mtime=$(get_packages_list_mtime)
-    
-    mkdir -p "$(dirname "$UID_CACHE_FILE")"
-    echo "#mtime:$mtime" > "$UID_CACHE_FILE"
-    log_debug "UID Cache initialized (mtime: $mtime)"
-}
-
-# Add a single entry to UID cache
-add_uid_cache_entry() {
-    local token="$1"
-    local uid="$2"
-    
-    if [ -f "$UID_CACHE_FILE" ]; then
-        echo "$token $uid" >> "$UID_CACHE_FILE"
-    fi
-}
-
-# Lookup a token in UID cache, returns uid or empty string
-lookup_uid_cache() {
-    local token="$1"
-    
-    if [ -f "$UID_CACHE_FILE" ]; then
-        grep "^${token} " "$UID_CACHE_FILE" 2>/dev/null | awk '{print $2}'
-    fi
-}
 
 # Retrieve UID for a package name from Android system package list
 get_package_uid() {
     local pkg="$1"
-    local line
-    local uid
+    local line uid
+    
     if [ ! -r "$PACKAGES_LIST" ]; then
-        log_debug "Cannot read $PACKAGES_LIST"
+        log_warn "packages.list not found or not readable"
         return 1
     fi
-    line=$(grep -m1 "^${pkg}[[:space:]]" "$PACKAGES_LIST" 2> /dev/null || true)
+    
+    line=$(grep "^${pkg} " "$PACKAGES_LIST" 2>/dev/null | head -n1)
     if [ -z "$line" ]; then
-        log_debug "Package not found in packages.list: $pkg"
         return 1
     fi
-
-    uid=$(echo "$line" | awk '{print $2}' 2> /dev/null || true)
+    
+    uid=$(echo "$line" | awk '{print $2}')
     case "$uid" in
-        '' | *[!0-9]*)
-            uid=$(echo "$line" | awk '{print $(NF-1)}' 2> /dev/null || true)
-            ;;
+        ''|*[!0-9]*) return 1 ;;
     esac
-    case "$uid" in
-        '' | *[!0-9]*)
-            log_debug "Invalid UID format for package: $pkg"
-            return 1
-            ;;
-        *)
-            echo "$uid"
-            return 0
-            ;;
-    esac
+    
+    echo "$uid"
 }
 
-# Resolve multiple packages/tokens (with optional user prefix user:pkg) to UIDs
-# Uses cache when available for improved performance
+# Resolve multiple packages to UIDs
+# Supports user prefix format: user:package (e.g., 10:com.example.app)
 find_packages_uid() {
     local out=""
-    local token
-    local uid_base
-    local final_uid
-    local cached_uid
-    local cache_initialized=0
-    
-    # Check if cache is valid, if not initialize new cache
-    if ! load_uid_cache; then
-        save_uid_cache
-        cache_initialized=1
-    fi
+    local token user_prefix package uid_base final_uid
     
     # shellcheck disable=SC2048
     for token in $*; do
-        # Try cache lookup first
-        cached_uid=$(lookup_uid_cache "$token")
-        if [ -n "$cached_uid" ]; then
-            out="$out $cached_uid"
-            log_debug "Resolved (cache): $token -> $cached_uid" >&2
-            continue
-        fi
+        user_prefix=0
+        package="$token"
         
-        # Cache miss, resolve from packages.list
-        local user_prefix=0
-        local package="$token"
+        # Parse user:package format
         case "$token" in
             *:*)
                 user_prefix=$(echo "$token" | cut -d: -f1)
                 package=$(echo "$token" | cut -d: -f2-)
                 case "$user_prefix" in
-                    '' | *[!0-9]*)
-                        log_warn "Invalid user prefix in token: $token, using 0" >&2
-                        user_prefix=0
-                        ;;
+                    ''|*[!0-9]*) user_prefix=0 ;;
                 esac
                 ;;
         esac
         
-        if uid_base=$(get_package_uid "$package" 2> /dev/null); then
+        if uid_base=$(get_package_uid "$package" 2>/dev/null); then
             final_uid=$((user_prefix * 100000 + uid_base))
             out="$out $final_uid"
-            # Add to cache
-            add_uid_cache_entry "$token" "$final_uid"
-            log_debug "Resolved (system): $token -> $final_uid" >&2
-        else
-            log_warn "Failed to resolve UID for package: $package" >&2
         fi
     done
     
@@ -706,98 +539,106 @@ _get_mtime() {
     fi
 }
 
-# Get module version from module.prop
-_get_module_version() {
+# Get module versionCode from module.prop
+_get_version_code() {
     if [ -f "$PROP_FILE" ]; then
-        grep "^version=" "$PROP_FILE" 2>/dev/null | cut -d= -f2
+        grep "^versionCode=" "$PROP_FILE" 2>/dev/null | cut -d= -f2
     else
-        echo "unknown"
+        echo "0"
     fi
 }
 
-# Check if meta cache is valid
+# Check if all caches are valid
 # Returns: 0 if valid, 1 if invalid/missing
-check_meta_cache_valid() {
-    [ ! -f "$CACHE_META_FILE" ] && {
-        log_debug "Meta cache not found"
-        return 1
-    }
+# Detection order: file existence (fast) → versionCode → mtime → kernel (slow)
+is_cache_valid() {
+    # 1. Check cache files exist (fast)
+    [ -f "$CACHE_META_FILE" ] || { log_debug "Meta cache not found"; return 1; }
+    [ -f "$CACHE_CONFIG_FILE" ] || { log_debug "Config cache not found"; return 1; }
+    [ -f "$CACHE_RULES_V4_FILE" ] || { log_debug "Rules cache not found"; return 1; }
+    [ -f "$KERNEL_CACHE_FILE" ] || { log_debug "Kernel cache not found"; return 1; }
     
-    # Parse meta cache
-    local cached_version cached_config_mtime cached_settings_mtime cached_kernel
+    # 2. Parse meta cache
+    local cached_vcode="" cached_settings_mtime="" cached_config_mtime=""
+    local cached_packages_mtime="" cached_kernel=""
     while IFS= read -r line || [ -n "$line" ]; do
         case "$line" in
-            "#version:"*)     cached_version="${line#\#version:}" ;;
-            "#config_mtime:"*) cached_config_mtime="${line#\#config_mtime:}" ;;
-            "#settings_mtime:"*) cached_settings_mtime="${line#\#settings_mtime:}" ;;
-            "#kernel:"*)      cached_kernel="${line#\#kernel:}" ;;
+            "#vcode:"*)           cached_vcode="${line#\#vcode:}" ;;
+            "#settings_mtime:"*)  cached_settings_mtime="${line#\#settings_mtime:}" ;;
+            "#config_mtime:"*)    cached_config_mtime="${line#\#config_mtime:}" ;;
+            "#packages_mtime:"*)  cached_packages_mtime="${line#\#packages_mtime:}" ;;
+            "#kernel:"*)          cached_kernel="${line#\#kernel:}" ;;
         esac
     done < "$CACHE_META_FILE"
     
-    # Check version
-    local current_version
-    current_version=$(_get_module_version)
-    if [ "$cached_version" != "$current_version" ]; then
-        log_debug "Version changed: $cached_version -> $current_version"
+    # 3. Check versionCode (simple comparison)
+    local current_vcode
+    current_vcode=$(_get_version_code)
+    [ "$cached_vcode" != "$current_vcode" ] && {
+        log_debug "versionCode changed: $cached_vcode -> $current_vcode"
         return 1
-    fi
+    }
     
-    # Check config.json mtime
-    local current_config_mtime
-    current_config_mtime=$(_get_mtime "$CONFIG_FILE")
-    if [ "$cached_config_mtime" != "$current_config_mtime" ]; then
-        log_debug "config.json changed: $cached_config_mtime -> $current_config_mtime"
-        return 1
-    fi
-    
-    # Check settings.ini mtime
+    # 4. Check mtime (ordered by modification frequency)
+    # settings.ini - user changes often
     local current_settings_mtime
     current_settings_mtime=$(_get_mtime "$SETTINGS_FILE")
-    if [ "$cached_settings_mtime" != "$current_settings_mtime" ]; then
-        log_debug "settings.ini changed: $cached_settings_mtime -> $current_settings_mtime"
+    [ "$cached_settings_mtime" != "$current_settings_mtime" ] && {
+        log_debug "settings.ini changed"
         return 1
-    fi
+    }
     
-    # Check kernel version
+    # packages.list - app install/uninstall
+    local current_packages_mtime
+    current_packages_mtime=$(_get_mtime "$PACKAGES_LIST")
+    [ "$cached_packages_mtime" != "$current_packages_mtime" ] && {
+        log_debug "packages.list changed"
+        return 1
+    }
+    
+    # config.json - rarely changes
+    local current_config_mtime
+    current_config_mtime=$(_get_mtime "$CONFIG_FILE")
+    [ "$cached_config_mtime" != "$current_config_mtime" ] && {
+        log_debug "config.json changed"
+        return 1
+    }
+    
+    # 5. Check kernel version (slowest - uses external command)
     local current_kernel
     current_kernel=$(uname -r 2>/dev/null)
-    if [ "$cached_kernel" != "$current_kernel" ]; then
+    [ "$cached_kernel" != "$current_kernel" ] && {
         log_debug "Kernel changed: $cached_kernel -> $current_kernel"
         return 1
-    fi
+    }
     
-    # Check if all cache files exist
-    if [ ! -f "$CACHE_CONFIG_FILE" ] || [ ! -f "$KERNEL_CACHE_FILE" ]; then
-        log_debug "Required cache files missing"
-        return 1
-    fi
-    
-    log_debug "Meta cache valid"
+    log_debug "Cache valid"
     return 0
 }
 
-# Update meta cache
-update_meta_cache() {
-    local version config_mtime settings_mtime kernel build_ts
+# Save meta cache
+save_meta_cache() {
+    local vcode settings_mtime config_mtime packages_mtime kernel build_ts
     
-    version=$(_get_module_version)
-    config_mtime=$(_get_mtime "$CONFIG_FILE")
+    vcode=$(_get_version_code)
     settings_mtime=$(_get_mtime "$SETTINGS_FILE")
+    config_mtime=$(_get_mtime "$CONFIG_FILE")
+    packages_mtime=$(_get_mtime "$PACKAGES_LIST")
     kernel=$(uname -r 2>/dev/null)
     build_ts=$(date +%s)
     
     mkdir -p "$(dirname "$CACHE_META_FILE")"
     
     cat > "$CACHE_META_FILE" << EOF
-#version:${version}
-#config_mtime:${config_mtime}
+#vcode:${vcode}
 #settings_mtime:${settings_mtime}
+#config_mtime:${config_mtime}
+#packages_mtime:${packages_mtime}
 #kernel:${kernel}
 #build_ts:${build_ts}
-valid=1
 EOF
     
-    log_debug "Meta cache updated"
+    log_debug "Meta cache saved"
 }
 
 
@@ -809,15 +650,22 @@ EOF
 save_config_cache() {
     mkdir -p "$(dirname "$CACHE_CONFIG_FILE")"
     
+    # Normalize list variables: convert newlines to spaces for shell-safe quoting
+    local _proxy_apps _bypass_apps _proxy_macs _bypass_macs
+    _proxy_apps=$(echo "$PROXY_APPS_LIST" | tr '\n' ' ' | sed 's/  */ /g; s/^ //; s/ $//')
+    _bypass_apps=$(echo "$BYPASS_APPS_LIST" | tr '\n' ' ' | sed 's/  */ /g; s/^ //; s/ $//')
+    _proxy_macs=$(echo "$PROXY_MACS_LIST" | tr '\n' ' ' | sed 's/  */ /g; s/^ //; s/ $//')
+    _bypass_macs=$(echo "$BYPASS_MACS_LIST" | tr '\n' ' ' | sed 's/  */ /g; s/^ //; s/ $//')
+    
     # Export all config variables to cache file
     cat > "$CACHE_CONFIG_FILE" << EOF
 # Flux Config Cache - Auto Generated
-CORE_TIMEOUT=$CORE_TIMEOUT
 UPDATE_TIMEOUT=$UPDATE_TIMEOUT
 UPDATE_INTERVAL=$UPDATE_INTERVAL
 RETRY_COUNT=$RETRY_COUNT
 LOG_LEVEL=$LOG_LEVEL
 LOG_MAX_SIZE=$LOG_MAX_SIZE
+CORE_TIMEOUT=$CORE_TIMEOUT
 CORE_USER=$CORE_USER
 CORE_GROUP=$CORE_GROUP
 ROUTING_MARK=$ROUTING_MARK
@@ -842,8 +690,8 @@ MARK_VALUE6=$MARK_VALUE6
 TABLE_ID=$TABLE_ID
 APP_PROXY_ENABLE=$APP_PROXY_ENABLE
 APP_PROXY_MODE=$APP_PROXY_MODE
-PROXY_APPS_LIST=$PROXY_APPS_LIST
-BYPASS_APPS_LIST=$BYPASS_APPS_LIST
+PROXY_APPS_LIST="$_proxy_apps"
+BYPASS_APPS_LIST="$_bypass_apps"
 BYPASS_CN_IP=$BYPASS_CN_IP
 CN_IP_FILE=$CN_IP_FILE
 CN_IPV6_FILE=$CN_IPV6_FILE
@@ -851,8 +699,8 @@ CN_IP_URL=$CN_IP_URL
 CN_IPV6_URL=$CN_IPV6_URL
 MAC_FILTER_ENABLE=$MAC_FILTER_ENABLE
 MAC_PROXY_MODE=$MAC_PROXY_MODE
-PROXY_MACS_LIST=$PROXY_MACS_LIST
-BYPASS_MACS_LIST=$BYPASS_MACS_LIST
+PROXY_MACS_LIST="$_proxy_macs"
+BYPASS_MACS_LIST="$_bypass_macs"
 SKIP_CHECK_FEATURE=$SKIP_CHECK_FEATURE
 FAKEIP_RANGE_V4=$FAKEIP_RANGE_V4
 FAKEIP_RANGE_V6=$FAKEIP_RANGE_V6
@@ -877,34 +725,20 @@ load_config_cache() {
     return 0
 }
 
-# Load kernel features from cache and export
+# Load kernel features from cache (direct source - no conversion needed)
 load_kernel_cache() {
     if [ ! -f "$KERNEL_CACHE_FILE" ]; then
         log_debug "Kernel cache not found"
         return 1
     fi
     
-    # Export kernel features
-    local line feat val
-    while IFS= read -r line || [ -n "$line" ]; do
-        case "$line" in
-            "#"*) continue ;;
-            *"="*)
-                feat="${line%%=*}"
-                val="${line#*=}"
-                case "$feat" in
-                    NETFILTER_XT_TARGET_TPROXY)    export KFEAT_TPROXY="$val" ;;
-                    NETFILTER_XT_MATCH_OWNER)      export KFEAT_OWNER="$val" ;;
-                    NETFILTER_XT_MATCH_MARK)       export KFEAT_MARK="$val" ;;
-                    NETFILTER_XT_MATCH_ADDRTYPE)   export KFEAT_ADDRTYPE="$val" ;;
-                    NETFILTER_XT_MATCH_CONNTRACK)  export KFEAT_CONNTRACK="$val" ;;
-                    NETFILTER_XT_MATCH_MAC)        export KFEAT_MAC="$val" ;;
-                    IP_SET)                        export KFEAT_IPSET="$val" ;;
-                    IP6_NF_NAT)                    export KFEAT_IPV6_NAT="$val" ;;
-                esac
-                ;;
-        esac
-    done < "$KERNEL_CACHE_FILE"
+    # Direct source - cache already uses KFEAT_* format
+    # shellcheck disable=SC1090
+    . "$KERNEL_CACHE_FILE"
+    
+    # Export for child processes
+    export KFEAT_TPROXY KFEAT_OWNER KFEAT_MARK KFEAT_ADDRTYPE \
+           KFEAT_CONNTRACK KFEAT_MAC KFEAT_IPSET KFEAT_IPV6_NAT
     
     log_debug "Kernel cache loaded"
     return 0
@@ -912,49 +746,29 @@ load_kernel_cache() {
 
 
 # ==============================================================================
-# [ Data Layer Initialization ]
+# [ Cache Builder ]
 # ==============================================================================
 
-# Initialize data layer with cache-first approach
+# Build all caches from source (Cold Boot Logic)
 # Returns: 0 on success, 1 on failure
-init_data_layer() {
-    if check_meta_cache_valid; then
-        # Cache valid: fast path
-        log_info "Cache valid, fast boot..."
-        load_config_cache || {
-            log_warn "Config cache load failed, rebuilding..."
-            _rebuild_all_caches
-            return $?
-        }
-        load_kernel_cache || {
-            log_warn "Kernel cache load failed, rebuilding..."
-            init_kernel_cache
-        }
-    else
-        # Cache invalid: full initialization
-        log_info "Cache invalid, rebuilding..."
-        _rebuild_all_caches || return 1
-    fi
+build_all_caches() {
+    log_info "Building caches..."
     
-    return 0
-}
-
-# Internal: rebuild all caches
-_rebuild_all_caches() {
-    # Load config from source
     load_flux_config
     
-    # Validate
     if ! validate_all; then
-        log_error "Validation failed, cannot rebuild caches"
+        log_error "Validation failed"
+        prop_error "Validation failed"
         return 1
     fi
     
-    # Save caches
+    . "$SCRIPT_DIR/flux.rules"
+    save_kernel_cache
+    load_kernel_cache
     save_config_cache
-    init_kernel_cache
-    update_meta_cache
+    save_rules_cache
+    save_meta_cache
     
-    log_info "Caches rebuilt"
+    log_info "Cache build complete"
     return 0
 }

@@ -245,10 +245,12 @@ validate_environment() {
 }
 
 # Exit with error message and perform cleanup
-# (Uses die() from flux.logger, but adds cleanup)
+# Exit with error message and perform cleanup
 fatal() {
     cleanup_temp_files
-    die "$1"
+    log_error "$1"
+    prop_error "$1"
+    exit 1
 }
 
 # Check if a file exists and is not empty

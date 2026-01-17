@@ -3,6 +3,7 @@
 # ==============================================================================
 # Flux Rules Generator (flux.rules)
 # Description: Generate iptables/ip6tables rules for proxy
+# Note: CORE_USER/CORE_GROUP are loaded from config cache
 # ==============================================================================
 
 # ==============================================================================
@@ -17,27 +18,18 @@ _KFEAT_MARK=0
 _KFEAT_MAC=0
 _KFEAT_INITIALIZED=0
 
-# Initialize kernel feature cache (call once before rule building)
+# Initialize kernel feature cache from exported KFEAT_* variables
 _init_kernel_features() {
     [ "$_KFEAT_INITIALIZED" -eq 1 ] && return 0
     
-    # Use exported features from validator if available (KFEAT_TPROXY is always set)
-    if [ -n "$KFEAT_TPROXY" ]; then
-        _KFEAT_ADDRTYPE=${KFEAT_ADDRTYPE:-0}
-        _KFEAT_CONNTRACK=${KFEAT_CONNTRACK:-0}
-        _KFEAT_OWNER=${KFEAT_OWNER:-0}
-        _KFEAT_MARK=${KFEAT_MARK:-0}
-        _KFEAT_MAC=${KFEAT_MAC:-0}
-    else
-        check_kernel_feature_cached "NETFILTER_XT_MATCH_ADDRTYPE" && _KFEAT_ADDRTYPE=1
-        check_kernel_feature_cached "NETFILTER_XT_MATCH_CONNTRACK" && _KFEAT_CONNTRACK=1
-        check_kernel_feature_cached "NETFILTER_XT_MATCH_OWNER" && _KFEAT_OWNER=1
-        check_kernel_feature_cached "NETFILTER_XT_MATCH_MARK" && _KFEAT_MARK=1
-        check_kernel_feature_cached "NETFILTER_XT_MATCH_MAC" && _KFEAT_MAC=1
-    fi
+    _KFEAT_ADDRTYPE=${KFEAT_ADDRTYPE:-0}
+    _KFEAT_CONNTRACK=${KFEAT_CONNTRACK:-0}
+    _KFEAT_OWNER=${KFEAT_OWNER:-0}
+    _KFEAT_MARK=${KFEAT_MARK:-0}
+    _KFEAT_MAC=${KFEAT_MAC:-0}
     
     _KFEAT_INITIALIZED=1
-    log_debug "Kernel Cache loaded: addrtype=$_KFEAT_ADDRTYPE conntrack=$_KFEAT_CONNTRACK owner=$_KFEAT_OWNER mark=$_KFEAT_MARK mac=$_KFEAT_MAC"
+    log_debug "Kernel features: addrtype=$_KFEAT_ADDRTYPE conntrack=$_KFEAT_CONNTRACK owner=$_KFEAT_OWNER mark=$_KFEAT_MARK mac=$_KFEAT_MAC"
 }
 
 
@@ -160,7 +152,6 @@ _build_app_rules() {
     local rules=""
     
     # Core process bypass (critical for avoiding infinite loop)
-    # Use owner match if available, otherwise fallback to mark match
     if [ "$has_owner" -eq 1 ]; then
         rules="${rules}-A APP_CHAIN${suffix} -m owner --uid-owner $CORE_USER --gid-owner $CORE_GROUP -j ACCEPT\n"
     elif [ "$has_mark" -eq 1 ] && [ -n "$ROUTING_MARK" ]; then
@@ -169,25 +160,20 @@ _build_app_rules() {
     
     # Per-app proxy rules
     if [ "$APP_PROXY_ENABLE" -eq 1 ] && [ "$has_owner" -eq 1 ]; then
+        local uids=""
         case "$APP_PROXY_MODE" in
-            1) # Blacklist
-                if [ -n "$BYPASS_APPS_LIST" ]; then
-                    local uids
-                    uids=$(find_packages_uid "$BYPASS_APPS_LIST" 2>/dev/null || true)
-                    for uid in $uids; do
-                        [ -n "$uid" ] && rules="${rules}-A APP_CHAIN${suffix} -m owner --uid-owner $uid -j ACCEPT\n"
-                    done
-                fi
+            1) # Blacklist: bypass specified apps
+                [ -n "$BYPASS_APPS_LIST" ] && uids=$(find_packages_uid "$BYPASS_APPS_LIST")
+                for uid in $uids; do
+                    [ -n "$uid" ] && rules="${rules}-A APP_CHAIN${suffix} -m owner --uid-owner $uid -j ACCEPT\n"
+                done
                 rules="${rules}-A APP_CHAIN${suffix} -j RETURN\n"
                 ;;
-            2) # Whitelist
-                if [ -n "$PROXY_APPS_LIST" ]; then
-                    local uids
-                    uids=$(find_packages_uid "$PROXY_APPS_LIST" 2>/dev/null || true)
-                    for uid in $uids; do
-                        [ -n "$uid" ] && rules="${rules}-A APP_CHAIN${suffix} -m owner --uid-owner $uid -j RETURN\n"
-                    done
-                fi
+            2) # Whitelist: only proxy specified apps
+                [ -n "$PROXY_APPS_LIST" ] && uids=$(find_packages_uid "$PROXY_APPS_LIST")
+                for uid in $uids; do
+                    [ -n "$uid" ] && rules="${rules}-A APP_CHAIN${suffix} -m owner --uid-owner $uid -j RETURN\n"
+                done
                 rules="${rules}-A APP_CHAIN${suffix} -j ACCEPT\n"
                 ;;
         esac
@@ -343,10 +329,12 @@ generate_rules_ipv6() {
     log_debug "IPv6 rules cached to $CACHE_RULES_V6_FILE"
 }
 
-# Generate rules for both IPv4 and IPv6
-# Usage: generate_all_rules <mode>
-generate_all_rules() {
-    local mode="${1:-tproxy}"
+# Save rules cache for both IPv4 and IPv6
+# Mode is auto-detected from kernel features
+save_rules_cache() {
+    # Auto-detect mode based on kernel TPROXY support
+    local mode="tproxy"
+    [ "${KFEAT_TPROXY:-0}" -eq 0 ] && mode="redirect"
     
     generate_rules_ipv4 "$mode"
     
@@ -354,7 +342,7 @@ generate_all_rules() {
         generate_rules_ipv6 "$mode"
     fi
     
-    log_debug "All rules generated (mode: $mode)"
+    log_debug "Rules cache saved (mode: $mode)"
 }
 
 

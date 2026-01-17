@@ -11,7 +11,6 @@
 
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 . "$SCRIPT_DIR/flux.utils"
-. "$SCRIPT_DIR/flux.data"
 
 # Config is inherited from flux.tproxy via exported environment variables
 export LOG_COMPONENT="Monitor"
@@ -259,6 +258,9 @@ SYNC_PID=""
 start_monitor() {
     log_info "Starting IPMonitor..."
     
+    # Write PID for control
+    echo $$ > "$MONITOR_PID_FILE"
+    
     # Trap to clean up on exit
     trap 'cleanup_monitor; exit 0' EXIT INT TERM
     
@@ -288,6 +290,9 @@ cleanup_monitor() {
     # Kill periodic sync process
     [ -n "$SYNC_PID" ] && kill "$SYNC_PID" 2>/dev/null
     
+    # Remove PID file
+    rm -f "$MONITOR_PID_FILE" 2>/dev/null
+    
     # Remove LOCAL_IP chains
     $IPT -t "$table" -D BYPASS_IP -j LOCAL_IP 2>/dev/null
     $IPT -t "$table" -F LOCAL_IP 2>/dev/null
@@ -310,10 +315,32 @@ cleanup_monitor() {
 }
 
 stop_monitor() {
-    # Kill existing ip monitor processes
-    pkill -f "ip monitor address" 2>/dev/null || true
+    # Check if daemon is running via PID file
+    if [ -f "$MONITOR_PID_FILE" ]; then
+        local pid
+        pid=$(cat "$MONITOR_PID_FILE" 2>/dev/null)
+        
+        # Kill daemon if running (cleanup happens via trap)
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            log_debug "Stopping IPMonitor daemon (PID $pid)..."
+            kill "$pid" 2>/dev/null
+            
+            # Wait for graceful exit (and cleanup)
+            local wait_count=0
+            while kill -0 "$pid" 2>/dev/null && [ $wait_count -lt 20 ]; do
+                sleep 0.1
+                wait_count=$((wait_count + 1))
+            done
+            return 0
+        fi
+    fi
     
-    # Clean up
+    # Fallback: Kill by pattern (if PID file missing or stale)
+    pkill -f "ip monitor address" 2>/dev/null || true
+    pkill -f "flux.ip.monitor start" 2>/dev/null || true
+    
+    # Force cleanup (only if we didn't kill a daemon via PID)
+    log_debug "Force cleaning up monitor state..."
     cleanup_monitor
     
     log_info "IPMonitor stopped"

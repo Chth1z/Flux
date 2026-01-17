@@ -22,6 +22,7 @@ readonly SING_BOX_BIN="$BIN_DIR/sing-box"
 readonly CONFIG_FILE="$CONF_DIR/config.json"
 readonly SETTINGS_FILE="$CONF_DIR/settings.ini"
 readonly PID_FILE="$RUN_DIR/sing-box.pid"
+readonly MONITOR_PID_FILE="$RUN_DIR/ipmonitor.pid"
 readonly LOG_FILE="$RUN_DIR/flux.log"
 # Scripts
 readonly TPROXY_SCRIPT="$SCRIPTS_DIR/flux.tproxy"
@@ -46,7 +47,6 @@ readonly CACHE_CONFIG_FILE="$CACHE_DIR/cache_config"
 readonly CACHE_RULES_V4_FILE="$CACHE_DIR/cache_rules_ipv4"
 readonly CACHE_RULES_V6_FILE="$CACHE_DIR/cache_rules_ipv6"
 readonly IP_CACHE_FILE="$CACHE_DIR/cache_ip"
-readonly UID_CACHE_FILE="$CACHE_DIR/cache_uid"
 readonly KERNEL_CACHE_FILE="$CACHE_DIR/cache_kernel"
 # State Files
 readonly LOCK_FILE="$FLUX_DIR/.flux.lock"
@@ -82,7 +82,6 @@ readonly PRIVATE_SUBNETS_V4_COMPACT="0.0.0.0/8 10.0.0.0/8 100.0.0.0/8 127.0.0.0/
 # Private IPv6 subnets to bypass (compact form for rules)
 readonly PRIVATE_SUBNETS_V6_COMPACT="::/128 ::1/128 ::ffff:0:0/96 100::/64 64:ff9b::/96 2001::/32 2001:10::/28 2001:20::/28 2001:db8::/32 2002::/16 fe80::/10 ff00::/8"
 
-
 # ==============================================================================
 # [ Exports & Env ]
 # ==============================================================================
@@ -91,7 +90,6 @@ export PATH="$BIN_DIR:/data/adb/magisk:/data/adb/ksu/bin:$PATH"
 export FLUX_DIR BIN_DIR CONF_DIR SCRIPTS_DIR RUN_DIR TOOLS_DIR CACHE_DIR
 # Network Configuration
 readonly USER_AGENT="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-
 
 # ==============================================================================
 # [ Logging Module ]
@@ -155,78 +153,6 @@ readonly E_CONFIG=3
 readonly E_NETWORK=4
 readonly E_PERMISSION=5
 readonly E_NOTFOUND=6
-
-
-# ==============================================================================
-# [ Standardized Error Handling ]
-# ==============================================================================
-
-# Exit with error message and optional prop update
-# Usage: die "error message" [exit_code]
-die() {
-    log_error "$1"
-    prop_error "$1"
-    exit "${2:-$E_GENERAL}"
-}
-
-# Execute command, die on failure
-# Usage: try command [args...]
-try() {
-    "$@" || die "Failed: $*"
-}
-
-
-# ==============================================================================
-# [ Retry & Timeout Utilities ]
-# ==============================================================================
-
-# Retry a command with exponential backoff
-# Usage: retry <max_attempts> <initial_delay> command [args...]
-# Example: retry 3 1 curl -f http://example.com
-retry() {
-    local max_attempts="$1"
-    local delay="$2"
-    shift 2
-    
-    local attempt=0
-    local last_exit=0
-    
-    while [ $attempt -lt $max_attempts ]; do
-        if "$@"; then
-            return 0
-        fi
-        last_exit=$?
-        attempt=$((attempt + 1))
-        
-        if [ $attempt -lt $max_attempts ]; then
-            log_debug "Retry $attempt/$max_attempts in ${delay}s: $*"
-            sleep "$delay"
-            delay=$((delay * 2))  # Exponential backoff
-        fi
-    done
-    
-    log_warn "Command failed after $max_attempts attempts: $*"
-    return $last_exit
-}
-
-# Execute command with timeout
-# Usage: with_timeout <seconds> command [args...]
-# Returns: command exit code, or 124 on timeout
-with_timeout() {
-    local timeout="$1"
-    shift
-    
-    # Try timeout command (busybox or coreutils)
-    if command -v timeout >/dev/null 2>&1; then
-        timeout "$timeout" "$@"
-    elif command -v busybox >/dev/null 2>&1 && busybox --list 2>/dev/null | grep -q timeout; then
-        busybox timeout "$timeout" "$@"
-    else
-        # Fallback: run without timeout (not ideal but works)
-        log_debug "timeout command not available, running without timeout"
-        "$@"
-    fi
-}
 
 
 # ==============================================================================
@@ -442,10 +368,6 @@ state_init() {
     log_debug "State initialized"
 }
 
-# Reset state to stopped (alias)
-state_reset() {
-    state_init
-}
 
 # ==============================================================================
 # [ State Accessors ]
@@ -551,13 +473,6 @@ all_components_stopped() {
     [ "$(get_component_state $COMP_TPROXY)" = "$STATE_STOPPED" ]
 }
 
-get_running_components() {
-    local running=""
-    [ "$(get_component_state $COMP_CORE)" = "$STATE_RUNNING" ] && running="$COMP_CORE"
-    [ "$(get_component_state $COMP_TPROXY)" = "$STATE_RUNNING" ] && running="$running $COMP_TPROXY"
-    echo "$running" | xargs
-}
-
 # Rollback a specific component
 rollback_component() {
     local component="$1"
@@ -595,22 +510,8 @@ rollback_running_components() {
 # [ State Checks ]
 # ==============================================================================
 
-is_service_running() {
-    [ "$(get_service_state)" = "$STATE_RUNNING" ]
-}
-
-is_service_stopped() {
-    local state
-    state=$(get_service_state)
-    [ "$state" = "$STATE_STOPPED" ] || [ "$state" = "$STATE_FAILED" ]
-}
-
 can_start() {
     local state
     state=$(get_service_state)
     [ "$state" = "$STATE_STOPPED" ] || [ "$state" = "$STATE_FAILED" ]
-}
-
-can_stop() {
-    [ "$(get_service_state)" = "$STATE_RUNNING" ]
 }

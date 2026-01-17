@@ -11,11 +11,10 @@
 
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 
-# Force fresh config load handled by load_flux_config parameter now
-. "$SCRIPT_DIR/flux.config"
-. "$SCRIPT_DIR/flux.logger"
-. "$SCRIPT_DIR/flux.state"
-. "$SCRIPT_DIR/flux.validator"
+# Load unified modules
+. "$SCRIPT_DIR/flux.utils"
+. "$SCRIPT_DIR/flux.data"
+. "$SCRIPT_DIR/flux.rules"
 
 export LOG_COMPONENT="Manager"
 
@@ -33,7 +32,7 @@ show_banner() {
    |_|   |_|\__,_/_/\_\
     
 BANNER
-    log_info "Flux $FLUX_VERSION starting..."
+    log_info "Flux $FLUX_VERSION"
 }
 
 
@@ -113,15 +112,75 @@ init_environment() {
         chmod 0755 "$RUN_DIR"
     fi
     
-    load_flux_config
-    export_flux_config
-    
     rotate_log || log_debug "Log rotation skipped"
     
     show_banner
     
     log_info "Environment initialized"
-    log_debug "Config: TCP=$PROXY_TCP_PORT UDP=$PROXY_UDP_PORT FakeIP=$FAKEIP_RANGE_V4"
+    return 0
+}
+
+
+# ==============================================================================
+# [ Cache-Driven Initialization ]
+# ==============================================================================
+
+# Initialize with cache-first approach
+# Returns: 0 on success, 1 on failure
+init_with_cache() {
+    if check_meta_cache_valid; then
+        # Cache valid: fast path - skip validation
+        log_info "Cache valid, fast boot..."
+        
+        if ! load_config_cache; then
+            log_warn "Config cache load failed, rebuilding..."
+            return 1
+        fi
+        
+        if ! load_kernel_cache; then
+            log_warn "Kernel cache load failed, rebuilding..."
+            init_kernel_cache
+        fi
+        
+        # Generate rules cache if missing
+        if ! check_rules_cache_valid; then
+            log_debug "Rules cache missing, generating..."
+            local mode="tproxy"
+            [ "${KFEAT_TPROXY:-0}" -eq 0 ] && mode="redirect"
+            generate_all_rules "$mode"
+        fi
+        
+        export_flux_config
+        return 0
+    fi
+    
+    # Cache invalid: full initialization with validation
+    log_info "Cache invalid, rebuilding..."
+    
+    # Load config from source
+    load_flux_config
+    
+    # Run validation
+    if ! validate_all; then
+        log_error "Validation failed"
+        prop_error "Validation failed"
+        return 1
+    fi
+    
+    # Save caches
+    save_config_cache
+    
+    # Generate rules cache
+    local mode="tproxy"
+    [ "${KFEAT_TPROXY:-0}" -eq 0 ] && mode="redirect"
+    generate_all_rules "$mode"
+    
+    # Update meta cache
+    update_meta_cache
+    
+    export_flux_config
+    
+    log_info "Caches rebuilt"
     return 0
 }
 
@@ -298,10 +357,8 @@ start_service_sequence() {
         state_init
     fi
     
-    # Run comprehensive validation
-    if ! validate_all; then
-        log_error "Validation failed"
-        prop_error "Validation failed"
+    # Initialize with cache-first approach
+    if ! init_with_cache; then
         set_service_state "$STATE_FAILED"
         return 1
     fi

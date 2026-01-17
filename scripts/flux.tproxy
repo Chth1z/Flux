@@ -2,7 +2,7 @@
 
 # ==============================================================================
 # Flux TProxy Management (flux.tproxy)
-# Description: iptables rules and routing management
+# Description: iptables rules execution and routing management
 # ==============================================================================
 
 # ==============================================================================
@@ -10,9 +10,9 @@
 # ==============================================================================
 
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
-. "$SCRIPT_DIR/flux.config"
-. "$SCRIPT_DIR/flux.logger"
-. "$SCRIPT_DIR/flux.state"
+. "$SCRIPT_DIR/flux.utils"
+. "$SCRIPT_DIR/flux.data"
+. "$SCRIPT_DIR/flux.rules"
 
 export LOG_COMPONENT="Tproxy"
 
@@ -20,49 +20,10 @@ export LOG_COMPONENT="Tproxy"
 # [ Kernel & System Features ]
 # ==============================================================================
 
-# Check if a kernel feature is enabled (uses cache from flux.validator)
+# Check if a kernel feature is enabled (uses cache from flux.data)
 check_kernel_feature() {
     check_kernel_feature_cached "$1"
 }
-
-# ==============================================================================
-# [ Constants ]
-# ==============================================================================
-
-# Private IPv4 subnets to bypass (RFC 1918, RFC 5737, etc.)
-PRIVATE_SUBNETS_V4="
-0.0.0.0/8
-10.0.0.0/8
-100.64.0.0/10
-127.0.0.0/8
-169.254.0.0/16
-172.16.0.0/12
-192.0.0.0/24
-192.0.2.0/24
-192.88.99.0/24
-192.168.0.0/16
-198.51.100.0/24
-203.0.113.0/24
-224.0.0.0/4
-240.0.0.0/4
-255.255.255.255/32
-"
-
-# Private IPv6 subnets to bypass
-PRIVATE_SUBNETS_V6="
-::/128
-::1/128
-::ffff:0:0/96
-100::/64
-64:ff9b::/96
-2001::/32
-2001:10::/28
-2001:20::/28
-2001:db8::/32
-2002::/16
-fe80::/10
-ff00::/8
-"
 
 # Verify TPROXY support by checking the kernel module/config
 check_tproxy_support() {
@@ -93,162 +54,6 @@ ip6_rule()    { command ip -6 rule "$@"; }
 ip_route()    { command ip route "$@"; }
 ip6_route()   { command ip -6 route "$@"; }
 
-# ==============================================================================
-# UID & PACKAGE RESOLUTION (with caching)
-# ==============================================================================
-
-readonly PACKAGES_LIST="/data/system/packages.list"
-
-# Get modification time of packages.list for cache validation
-get_packages_list_mtime() {
-    if [ -f "$PACKAGES_LIST" ]; then
-        stat -c %Y "$PACKAGES_LIST" 2>/dev/null || stat -f %m "$PACKAGES_LIST" 2>/dev/null || echo "0"
-    else
-        echo "0"
-    fi
-}
-
-# Load UID cache from file, returns 0 if cache is valid, 1 if invalid/missing
-load_uid_cache() {
-    local current_mtime
-    local cached_mtime
-    
-    if [ ! -f "$UID_CACHE_FILE" ]; then
-        log_debug "UID Cache file not found"
-        return 1
-    fi
-    
-    current_mtime=$(get_packages_list_mtime)
-    cached_mtime=$(head -n1 "$UID_CACHE_FILE" 2>/dev/null | grep "^#mtime:" | cut -d: -f2)
-    
-    if [ -z "$cached_mtime" ] || [ "$cached_mtime" != "$current_mtime" ]; then
-        log_debug "UID Cache expired (mtime: $cached_mtime vs $current_mtime)"
-        rm -f "$UID_CACHE_FILE"
-        return 1
-    fi
-    
-    log_debug "UID Cache valid (mtime: $current_mtime)"
-    return 0
-}
-
-# Save UID cache to file
-# Format: first line is "#mtime:TIMESTAMP", rest are "token uid" pairs
-save_uid_cache() {
-    local mtime
-    mtime=$(get_packages_list_mtime)
-    
-    mkdir -p "$(dirname "$UID_CACHE_FILE")"
-    echo "#mtime:$mtime" > "$UID_CACHE_FILE"
-    log_debug "UID Cache initialized (mtime: $mtime)"
-}
-
-# Add a single entry to UID cache
-add_uid_cache_entry() {
-    local token="$1"
-    local uid="$2"
-    
-    if [ -f "$UID_CACHE_FILE" ]; then
-        echo "$token $uid" >> "$UID_CACHE_FILE"
-    fi
-}
-
-# Lookup a token in UID cache, returns uid or empty string
-lookup_uid_cache() {
-    local token="$1"
-    
-    if [ -f "$UID_CACHE_FILE" ]; then
-        grep "^${token} " "$UID_CACHE_FILE" 2>/dev/null | awk '{print $2}'
-    fi
-}
-
-# Retrieve UID for a package name from Android system package list
-get_package_uid() {
-    local pkg="$1"
-    local line
-    local uid
-    if [ ! -r "$PACKAGES_LIST" ]; then
-        log_debug "Cannot read $PACKAGES_LIST"
-        return 1
-    fi
-    line=$(grep -m1 "^${pkg}[[:space:]]" "$PACKAGES_LIST" 2> /dev/null || true)
-    if [ -z "$line" ]; then
-        log_debug "Package not found in packages.list: $pkg"
-        return 1
-    fi
-
-    uid=$(echo "$line" | awk '{print $2}' 2> /dev/null || true)
-    case "$uid" in
-        '' | *[!0-9]*)
-            uid=$(echo "$line" | awk '{print $(NF-1)}' 2> /dev/null || true)
-            ;;
-    esac
-    case "$uid" in
-        '' | *[!0-9]*)
-            log_debug "Invalid UID format for package: $pkg"
-            return 1
-            ;;
-        *)
-            echo "$uid"
-            return 0
-            ;;
-    esac
-}
-
-# Resolve multiple packages/tokens (with optional user prefix user:pkg) to UIDs
-# Uses cache when available for improved performance
-find_packages_uid() {
-    local out=""
-    local token
-    local uid_base
-    local final_uid
-    local cached_uid
-    local cache_initialized=0
-    
-    # Check if cache is valid, if not initialize new cache
-    if ! load_uid_cache; then
-        save_uid_cache
-        cache_initialized=1
-    fi
-    
-    # shellcheck disable=SC2048
-    for token in $*; do
-        # Try cache lookup first
-        cached_uid=$(lookup_uid_cache "$token")
-        if [ -n "$cached_uid" ]; then
-            out="$out $cached_uid"
-            log_debug "Resolved (cache): $token -> $cached_uid" >&2
-            continue
-        fi
-        
-        # Cache miss, resolve from packages.list
-        local user_prefix=0
-        local package="$token"
-        case "$token" in
-            *:*)
-                user_prefix=$(echo "$token" | cut -d: -f1)
-                package=$(echo "$token" | cut -d: -f2-)
-                case "$user_prefix" in
-                    '' | *[!0-9]*)
-                        log_warn "Invalid user prefix in token: $token, using 0" >&2
-                        user_prefix=0
-                        ;;
-                esac
-                ;;
-        esac
-        
-        if uid_base=$(get_package_uid "$package" 2> /dev/null); then
-            final_uid=$((user_prefix * 100000 + uid_base))
-            out="$out $final_uid"
-            # Add to cache
-            add_uid_cache_entry "$token" "$final_uid"
-            log_debug "Resolved (system): $token -> $final_uid" >&2
-        else
-            log_warn "Failed to resolve UID for package: $package" >&2
-        fi
-    done
-    
-    echo "$out" | awk '{$1=$1;print}'
-}
 
 # ==============================================================================
 # IPTABLES CHAIN MANAGEMENT
@@ -290,11 +95,10 @@ safe_chain_create() {
     $cmd -t "$table" -F "$chain"
 }
 
+
 # ==============================================================================
 # IPSET & GEO-IP MANAGEMENT
 # ==============================================================================
-
-# Download China IP lists if bypass is enabled and file is outdated
 
 # Initialize ipset with downloaded CIDR rules
 setup_cn_ipset() {
@@ -375,303 +179,10 @@ setup_cn_ipset() {
     return 0
 }
 
+
 # ==============================================================================
-# PROXY LOGIC & RULES (Optimized with iptables-restore batch mode)
+# PROXY CHAIN SETUP (Uses cached rules from flux.rules)
 # ==============================================================================
-
-# Private IP ranges for bypass
-readonly PRIVATE_SUBNETS_V4="0.0.0.0/8 10.0.0.0/8 100.0.0.0/8 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.0.0.0/24 192.0.2.0/24 192.88.99.0/24 192.168.0.0/16 198.51.100.0/24 203.0.113.0/24 224.0.0.0/4 240.0.0.0/4 255.255.255.255/32"
-readonly PRIVATE_SUBNETS_V6="::/128 ::1/128 ::ffff:0:0/96 100::/64 64:ff9b::/96 2001::/32 2001:10::/28 2001:20::/28 2001:db8::/32 2002::/16 fe80::/10 ff00::/8"
-
-# Global kernel feature cache (initialized once, used throughout)
-_KFEAT_ADDRTYPE=0
-_KFEAT_CONNTRACK=0
-_KFEAT_OWNER=0
-_KFEAT_MARK=0
-_KFEAT_MAC=0
-_KFEAT_INITIALIZED=0
-
-# Initialize kernel feature cache (call once before rule building)
-_init_kernel_features() {
-    [ "$_KFEAT_INITIALIZED" -eq 1 ] && return 0
-    
-    # Use exported features from validator if available (KFEAT_TPROXY is always set)
-    if [ -n "$KFEAT_TPROXY" ]; then
-        _KFEAT_ADDRTYPE=${KFEAT_ADDRTYPE:-0}
-        _KFEAT_CONNTRACK=${KFEAT_CONNTRACK:-0}
-        _KFEAT_OWNER=${KFEAT_OWNER:-0}
-        _KFEAT_MARK=${KFEAT_MARK:-0}
-        _KFEAT_MAC=${KFEAT_MAC:-0}
-    else
-        check_kernel_feature "NETFILTER_XT_MATCH_ADDRTYPE" && _KFEAT_ADDRTYPE=1
-        check_kernel_feature "NETFILTER_XT_MATCH_CONNTRACK" && _KFEAT_CONNTRACK=1
-        check_kernel_feature "NETFILTER_XT_MATCH_OWNER" && _KFEAT_OWNER=1
-        check_kernel_feature "NETFILTER_XT_MATCH_MARK" && _KFEAT_MARK=1
-        check_kernel_feature "NETFILTER_XT_MATCH_MAC" && _KFEAT_MAC=1
-    fi
-    
-    _KFEAT_INITIALIZED=1
-    log_debug "Kernel Cache loaded: addrtype=$_KFEAT_ADDRTYPE conntrack=$_KFEAT_CONNTRACK owner=$_KFEAT_OWNER mark=$_KFEAT_MARK mac=$_KFEAT_MAC"
-}
-
-# Interface config cache
-_IFACE_CONFIG=""
-
-# Get interface config (cached)
-_get_interface_config() {
-    if [ -z "$_IFACE_CONFIG" ]; then
-        _IFACE_CONFIG="mobile|$MOBILE_INTERFACE|$PROXY_MOBILE||
-wifi|$WIFI_INTERFACE|$PROXY_WIFI||
-hotspot|$HOTSPOT_INTERFACE|$PROXY_HOTSPOT|192.168.43.0/24|fe80::/10
-usb|$USB_INTERFACE|$PROXY_USB||"
-    fi
-    printf '%s\n' "$_IFACE_CONFIG"
-}
-
-# Build interface rules (data-driven, eliminates ~60 lines of repetition)
-_build_interface_rules() {
-    local suffix="$1"
-    local table="$2"
-    local family="$3"
-    local rules=""
-    
-    # Always bypass loopback
-    rules="${rules}-A PROXY_INTERFACE${suffix} -i lo -j RETURN\n"
-    
-    local IFS_OLD="$IFS"
-    IFS="
-"
-    for entry in $(_get_interface_config); do
-        IFS="|"
-        set -- $entry
-        local name="$1"
-        local iface="$2"
-        local proxy_enabled="$3"
-        local hotspot_subnet_v4="$4"
-        local hotspot_subnet_v6="$5"
-        IFS="$IFS_OLD"
-        
-        [ -z "$iface" ] && continue
-        
-        if [ "$proxy_enabled" -eq 1 ]; then
-            # Special handling for hotspot with same interface as wifi
-            if [ "$name" = "hotspot" ] && [ "$HOTSPOT_INTERFACE" = "$WIFI_INTERFACE" ]; then
-                local subnet=""
-                [ "$family" = "6" ] && subnet="$hotspot_subnet_v6" || subnet="$hotspot_subnet_v4"
-                [ -n "$subnet" ] && rules="${rules}-A PROXY_INTERFACE${suffix} -i $WIFI_INTERFACE ! -s $subnet -j RETURN\n"
-            else
-                rules="${rules}-A PROXY_INTERFACE${suffix} -i $iface -j RETURN\n"
-            fi
-        else
-            rules="${rules}-A PROXY_INTERFACE${suffix} -i $iface -j ACCEPT\n"
-            rules="${rules}-A BYPASS_INTERFACE${suffix} -o $iface -j ACCEPT\n"
-        fi
-    done
-    IFS="$IFS_OLD"
-    
-    # Final accept for unmatched
-    rules="${rules}-A PROXY_INTERFACE${suffix} -j ACCEPT\n"
-    
-    printf '%b' "$rules"
-}
-
-# Build private IP bypass rules
-_build_bypass_ip_rules() {
-    local suffix="$1"
-    local family="$2"
-    local has_addrtype="$3"
-    local has_conntrack="$4"
-    local rules=""
-    
-    # Local address type bypass
-    if [ "$has_addrtype" -eq 1 ]; then
-        rules="${rules}-A BYPASS_IP${suffix} -m addrtype --dst-type LOCAL -p udp ! --dport 53 -j ACCEPT\n"
-        rules="${rules}-A BYPASS_IP${suffix} -m addrtype --dst-type LOCAL ! -p udp -j ACCEPT\n"
-    fi
-    
-    # Reply connection bypass
-    if [ "$has_conntrack" -eq 1 ]; then
-        rules="${rules}-A BYPASS_IP${suffix} -m conntrack --ctdir REPLY -j ACCEPT\n"
-    fi
-    
-    # Private subnets
-    local subnets=""
-    [ "$family" = "6" ] && subnets="$PRIVATE_SUBNETS_V6" || subnets="$PRIVATE_SUBNETS_V4"
-    
-    for subnet in $subnets; do
-        rules="${rules}-A BYPASS_IP${suffix} -d $subnet -p udp ! --dport 53 -j ACCEPT\n"
-        rules="${rules}-A BYPASS_IP${suffix} -d $subnet ! -p udp -j ACCEPT\n"
-    done
-    
-    # CN IP bypass via ipset
-    if [ "$BYPASS_CN_IP" -eq 1 ]; then
-        local ipset_name="cnip"
-        [ "$family" = "6" ] && ipset_name="cnip6"
-        if command -v ipset > /dev/null 2>&1 && ipset list "$ipset_name" > /dev/null 2>&1; then
-            rules="${rules}-A BYPASS_IP${suffix} -m set --match-set $ipset_name dst -p udp ! --dport 53 -j ACCEPT\n"
-            rules="${rules}-A BYPASS_IP${suffix} -m set --match-set $ipset_name dst ! -p udp -j ACCEPT\n"
-        fi
-    fi
-    
-    printf '%b' "$rules"
-}
-
-# Build APP filtering rules
-_build_app_rules() {
-    local suffix="$1"
-    local has_owner="$2"
-    local has_mark="$3"
-    local rules=""
-    
-    # Core process bypass (critical for avoiding infinite loop)
-    # Use owner match if available, otherwise fallback to mark match
-    if [ "$has_owner" -eq 1 ]; then
-        rules="${rules}-A APP_CHAIN${suffix} -m owner --uid-owner $CORE_USER --gid-owner $CORE_GROUP -j ACCEPT\n"
-    elif [ "$has_mark" -eq 1 ] && [ -n "$ROUTING_MARK" ]; then
-        rules="${rules}-A APP_CHAIN${suffix} -m mark --mark $ROUTING_MARK -j ACCEPT\n"
-    fi
-    
-    # Per-app proxy rules
-    if [ "$APP_PROXY_ENABLE" -eq 1 ] && [ "$has_owner" -eq 1 ]; then
-        case "$APP_PROXY_MODE" in
-            1) # Blacklist
-                if [ -n "$BYPASS_APPS_LIST" ]; then
-                    local uids
-                    uids=$(find_packages_uid "$BYPASS_APPS_LIST" 2>/dev/null || true)
-                    for uid in $uids; do
-                        [ -n "$uid" ] && rules="${rules}-A APP_CHAIN${suffix} -m owner --uid-owner $uid -j ACCEPT\n"
-                    done
-                fi
-                rules="${rules}-A APP_CHAIN${suffix} -j RETURN\n"
-                ;;
-            2) # Whitelist
-                if [ -n "$PROXY_APPS_LIST" ]; then
-                    local uids
-                    uids=$(find_packages_uid "$PROXY_APPS_LIST" 2>/dev/null || true)
-                    for uid in $uids; do
-                        [ -n "$uid" ] && rules="${rules}-A APP_CHAIN${suffix} -m owner --uid-owner $uid -j RETURN\n"
-                    done
-                fi
-                rules="${rules}-A APP_CHAIN${suffix} -j ACCEPT\n"
-                ;;
-        esac
-    fi
-    
-    printf '%b' "$rules"
-}
-
-# Build MAC filtering rules
-_build_mac_rules() {
-    local suffix="$1"
-    local has_mac="$2"
-    local rules=""
-    
-    if [ "$MAC_FILTER_ENABLE" -eq 1 ] && [ "$PROXY_HOTSPOT" -eq 1 ] && [ -n "$HOTSPOT_INTERFACE" ] && [ "$has_mac" -eq 1 ]; then
-        case "$MAC_PROXY_MODE" in
-            1) # Blacklist
-                for mac in $BYPASS_MACS_LIST; do
-                    [ -n "$mac" ] && rules="${rules}-A MAC_CHAIN${suffix} -m mac --mac-source $mac -i $HOTSPOT_INTERFACE -j ACCEPT\n"
-                done
-                rules="${rules}-A MAC_CHAIN${suffix} -i $HOTSPOT_INTERFACE -j RETURN\n"
-                ;;
-            2) # Whitelist
-                for mac in $PROXY_MACS_LIST; do
-                    [ -n "$mac" ] && rules="${rules}-A MAC_CHAIN${suffix} -m mac --mac-source $mac -i $HOTSPOT_INTERFACE -j RETURN\n"
-                done
-                rules="${rules}-A MAC_CHAIN${suffix} -i $HOTSPOT_INTERFACE -j ACCEPT\n"
-                ;;
-        esac
-    fi
-    
-    printf '%b' "$rules"
-}
-
-# Generate complete iptables-restore compatible ruleset
-_build_proxy_rules() {
-    local family="$1"
-    local mode="$2"
-    local suffix=""
-    local mark="$MARK_VALUE"
-    
-    [ "$family" = "6" ] && { suffix="6"; mark="$MARK_VALUE6"; }
-    
-    local table="mangle"
-    [ "$mode" = "redirect" ] && table="nat"
-    
-    # Use cached kernel features (initialized by _init_kernel_features)
-    local has_addrtype=$_KFEAT_ADDRTYPE
-    local has_conntrack=$_KFEAT_CONNTRACK
-    local has_owner=$_KFEAT_OWNER
-    local has_mark=$_KFEAT_MARK
-    local has_mac=$_KFEAT_MAC
-    
-    # Start building rules
-    cat << EOF
-*${table}
-:PROXY_PREROUTING${suffix} - [0:0]
-:PROXY_OUTPUT${suffix} - [0:0]
-:BYPASS_IP${suffix} - [0:0]
-:BYPASS_INTERFACE${suffix} - [0:0]
-:PROXY_INTERFACE${suffix} - [0:0]
-:DNS_HIJACK_PRE${suffix} - [0:0]
-:DNS_HIJACK_OUT${suffix} - [0:0]
-:APP_CHAIN${suffix} - [0:0]
-:MAC_CHAIN${suffix} - [0:0]
-EOF
-    
-    # Chain linking
-    echo "-A PROXY_PREROUTING${suffix} -j BYPASS_IP${suffix}"
-    echo "-A PROXY_PREROUTING${suffix} -j PROXY_INTERFACE${suffix}"
-    echo "-A PROXY_PREROUTING${suffix} -j MAC_CHAIN${suffix}"
-    echo "-A PROXY_PREROUTING${suffix} -j DNS_HIJACK_PRE${suffix}"
-    echo "-A PROXY_OUTPUT${suffix} -j BYPASS_IP${suffix}"
-    echo "-A PROXY_OUTPUT${suffix} -j BYPASS_INTERFACE${suffix}"
-    echo "-A PROXY_OUTPUT${suffix} -j APP_CHAIN${suffix}"
-    echo "-A PROXY_OUTPUT${suffix} -j DNS_HIJACK_OUT${suffix}"
-    
-    # Bypass IP rules
-    _build_bypass_ip_rules "$suffix" "$family" "$has_addrtype" "$has_conntrack"
-    
-    # Interface rules (data-driven)
-    _build_interface_rules "$suffix" "$table" "$family"
-    
-    # MAC filtering
-    _build_mac_rules "$suffix" "$has_mac"
-    
-    # App filtering
-    _build_app_rules "$suffix" "$has_owner" "$has_mark"
-    
-    # DNS hijack (placeholder - actual rules depend on mode)
-    if [ "$DNS_HIJACK_ENABLE" -ne 0 ]; then
-        if [ "$mode" = "tproxy" ] && [ "$DNS_HIJACK_ENABLE" -ne 2 ]; then
-            echo "-A DNS_HIJACK_PRE${suffix} -j RETURN"
-            echo "-A DNS_HIJACK_OUT${suffix} -j RETURN"
-        fi
-    fi
-    
-    # Final proxy target
-    if [ "$mode" = "tproxy" ]; then
-        echo "-A PROXY_PREROUTING${suffix} -p tcp -j TPROXY --on-port $PROXY_TCP_PORT --tproxy-mark $mark"
-        echo "-A PROXY_PREROUTING${suffix} -p udp -j TPROXY --on-port $PROXY_UDP_PORT --tproxy-mark $mark"
-        echo "-A PROXY_OUTPUT${suffix} -j MARK --set-mark $mark"
-    else
-        echo "-A PROXY_PREROUTING${suffix} -j REDIRECT --to-ports $PROXY_TCP_PORT"
-        echo "-A PROXY_OUTPUT${suffix} -j REDIRECT --to-ports $PROXY_TCP_PORT"
-    fi
-    
-    # Inject into main chains
-    # Note: REDIRECT mode only supports TCP, so UDP rules only for TPROXY
-    if [ "$PROXY_UDP" -eq 1 ] && [ "$mode" = "tproxy" ]; then
-        echo "-I PREROUTING -p udp -j PROXY_PREROUTING${suffix}"
-        echo "-I OUTPUT -p udp -j PROXY_OUTPUT${suffix}"
-    fi
-    if [ "$PROXY_TCP" -eq 1 ]; then
-        echo "-I PREROUTING -p tcp -j PROXY_PREROUTING${suffix}"
-        echo "-I OUTPUT -p tcp -j PROXY_OUTPUT${suffix}"
-    fi
-    
-    echo "COMMIT"
-}
 
 # Apply rules using iptables-restore (5-10x faster than individual calls)
 setup_proxy_chain() {
@@ -687,24 +198,36 @@ setup_proxy_chain() {
     
     log_debug "Setting up $mode_name chains (IPv${family})"
     
-    # Initialize kernel feature cache (once per session)
-    _init_kernel_features
-    
-    # Generate rules
+    # Try to load from cache first
     local rules_file
-    rules_file=$(mktemp) || {
-        log_error "Failed to create temp file for rules"
-        return 1
-    }
+    [ "$family" = "6" ] && rules_file="$CACHE_RULES_V6_FILE" || rules_file="$CACHE_RULES_V4_FILE"
     
-    _build_proxy_rules "$family" "$mode" > "$rules_file"
+    if [ -f "$rules_file" ]; then
+        # Apply cached rules
+        if $restore_cmd --noflush < "$rules_file" 2>/dev/null; then
+            log_debug "$mode_name chains setup complete from cache (IPv${family})"
+            
+            # Handle DNS hijack redirect2 mode separately (needs nat table modifications)
+            if [ "$DNS_HIJACK_ENABLE" -eq 2 ] && [ "$mode" = "tproxy" ]; then
+                setup_dns_hijack "$family" "redirect2"
+            fi
+            
+            return 0
+        else
+            log_warn "Cached rules restore failed, regenerating..."
+        fi
+    fi
+    
+    # Generate rules on-the-fly if cache not available
+    _init_kernel_features
+    local rules_content
+    rules_content=$(_build_proxy_rules "$family" "$mode")
     
     # Apply with iptables-restore
-    if $restore_cmd --noflush < "$rules_file" 2>/dev/null; then
+    if echo "$rules_content" | $restore_cmd --noflush 2>/dev/null; then
         log_debug "$mode_name chains setup complete (IPv${family})"
-        rm -f "$rules_file"
         
-        # Handle DNS hijack redirect2 mode separately (needs nat table modifications)
+        # Handle DNS hijack redirect2 mode separately
         if [ "$DNS_HIJACK_ENABLE" -eq 2 ] && [ "$mode" = "tproxy" ]; then
             setup_dns_hijack "$family" "redirect2"
         fi
@@ -712,7 +235,6 @@ setup_proxy_chain() {
         return 0
     else
         log_warn "Batch restore failed, falling back to legacy mode"
-        rm -f "$rules_file"
         _setup_proxy_chain_legacy "$family" "$mode"
     fi
 }
@@ -795,7 +317,7 @@ _setup_proxy_chain_legacy() {
 
     # Private IP ranges bypass
     local subnets=""
-    [ "$family" = "6" ] && subnets="$PRIVATE_SUBNETS_V6" || subnets="$PRIVATE_SUBNETS_V4"
+    [ "$family" = "6" ] && subnets="$PRIVATE_SUBNETS_V6_COMPACT" || subnets="$PRIVATE_SUBNETS_V4_COMPACT"
     for subnet in $subnets; do
         $cmd -t "$table" -A "BYPASS_IP$suffix" -d "$subnet" -p udp ! --dport 53 -j ACCEPT
         $cmd -t "$table" -A "BYPASS_IP$suffix" -d "$subnet" ! -p udp -j ACCEPT
@@ -929,6 +451,7 @@ _setup_proxy_chain_legacy() {
     log_debug "$mode_name chains for IPv${family} setup completed (legacy)"
 }
 
+
 # ==============================================================================
 # DNS HIJACKING LOGIC
 # ==============================================================================
@@ -994,6 +517,7 @@ setup_redirect_chain6() {
     log_warn "REDIRECT mode only supports TCP"; setup_proxy_chain 6 "redirect"
 }
 
+
 # ==============================================================================
 # ROUTING TABLE MANAGEMENT (ip rule / ip route)
 # ==============================================================================
@@ -1039,6 +563,7 @@ setup_routing6() {
     echo 1 > /proc/sys/net/ipv6/conf/all/forwarding
     log_info "Routing setup complete (IPv6)"
 }
+
 
 # ==============================================================================
 # CLEANUP OPERATIONS
@@ -1152,6 +677,7 @@ cleanup_ipset() {
     ipset destroy cnip6 2> /dev/null || true
     log_debug "ipset 'cnip' and 'cnip6' destroyed"
 }
+
 
 # ==============================================================================
 # MAIN EXECUTION FLOW

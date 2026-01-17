@@ -10,8 +10,8 @@
 # ==============================================================================
 
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
-. "$SCRIPT_DIR/flux.config"
-. "$SCRIPT_DIR/flux.logger"
+. "$SCRIPT_DIR/flux.utils"
+. "$SCRIPT_DIR/flux.data"
 
 load_log_config
 export LOG_COMPONENT="Inotify"

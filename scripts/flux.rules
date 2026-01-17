@@ -1,0 +1,391 @@
+#!/system/bin/sh
+
+# ==============================================================================
+# Flux Rules Generator (flux.rules)
+# Description: Generate iptables/ip6tables rules for proxy
+# ==============================================================================
+
+# ==============================================================================
+# [ Kernel Feature Cache ]
+# ==============================================================================
+
+# Global kernel feature cache (initialized once, used throughout)
+_KFEAT_ADDRTYPE=0
+_KFEAT_CONNTRACK=0
+_KFEAT_OWNER=0
+_KFEAT_MARK=0
+_KFEAT_MAC=0
+_KFEAT_INITIALIZED=0
+
+# Initialize kernel feature cache (call once before rule building)
+_init_kernel_features() {
+    [ "$_KFEAT_INITIALIZED" -eq 1 ] && return 0
+    
+    # Use exported features from validator if available (KFEAT_TPROXY is always set)
+    if [ -n "$KFEAT_TPROXY" ]; then
+        _KFEAT_ADDRTYPE=${KFEAT_ADDRTYPE:-0}
+        _KFEAT_CONNTRACK=${KFEAT_CONNTRACK:-0}
+        _KFEAT_OWNER=${KFEAT_OWNER:-0}
+        _KFEAT_MARK=${KFEAT_MARK:-0}
+        _KFEAT_MAC=${KFEAT_MAC:-0}
+    else
+        check_kernel_feature_cached "NETFILTER_XT_MATCH_ADDRTYPE" && _KFEAT_ADDRTYPE=1
+        check_kernel_feature_cached "NETFILTER_XT_MATCH_CONNTRACK" && _KFEAT_CONNTRACK=1
+        check_kernel_feature_cached "NETFILTER_XT_MATCH_OWNER" && _KFEAT_OWNER=1
+        check_kernel_feature_cached "NETFILTER_XT_MATCH_MARK" && _KFEAT_MARK=1
+        check_kernel_feature_cached "NETFILTER_XT_MATCH_MAC" && _KFEAT_MAC=1
+    fi
+    
+    _KFEAT_INITIALIZED=1
+    log_debug "Kernel Cache loaded: addrtype=$_KFEAT_ADDRTYPE conntrack=$_KFEAT_CONNTRACK owner=$_KFEAT_OWNER mark=$_KFEAT_MARK mac=$_KFEAT_MAC"
+}
+
+
+# ==============================================================================
+# [ Interface Configuration ]
+# ==============================================================================
+
+# Interface config cache
+_IFACE_CONFIG=""
+
+# Get interface config (cached)
+_get_interface_config() {
+    if [ -z "$_IFACE_CONFIG" ]; then
+        _IFACE_CONFIG="mobile|$MOBILE_INTERFACE|$PROXY_MOBILE||
+wifi|$WIFI_INTERFACE|$PROXY_WIFI||
+hotspot|$HOTSPOT_INTERFACE|$PROXY_HOTSPOT|192.168.43.0/24|fe80::/10
+usb|$USB_INTERFACE|$PROXY_USB||"
+    fi
+    printf '%s\n' "$_IFACE_CONFIG"
+}
+
+
+# ==============================================================================
+# [ Rule Building Functions ]
+# ==============================================================================
+
+# Build interface rules (data-driven, eliminates ~60 lines of repetition)
+_build_interface_rules() {
+    local suffix="$1"
+    local table="$2"
+    local family="$3"
+    local rules=""
+    
+    # Always bypass loopback
+    rules="${rules}-A PROXY_INTERFACE${suffix} -i lo -j RETURN\n"
+    
+    local IFS_OLD="$IFS"
+    IFS="
+"
+    for entry in $(_get_interface_config); do
+        IFS="|"
+        set -- $entry
+        local name="$1"
+        local iface="$2"
+        local proxy_enabled="$3"
+        local hotspot_subnet_v4="$4"
+        local hotspot_subnet_v6="$5"
+        IFS="$IFS_OLD"
+        
+        [ -z "$iface" ] && continue
+        
+        if [ "$proxy_enabled" -eq 1 ]; then
+            # Special handling for hotspot with same interface as wifi
+            if [ "$name" = "hotspot" ] && [ "$HOTSPOT_INTERFACE" = "$WIFI_INTERFACE" ]; then
+                local subnet=""
+                [ "$family" = "6" ] && subnet="$hotspot_subnet_v6" || subnet="$hotspot_subnet_v4"
+                [ -n "$subnet" ] && rules="${rules}-A PROXY_INTERFACE${suffix} -i $WIFI_INTERFACE ! -s $subnet -j RETURN\n"
+            else
+                rules="${rules}-A PROXY_INTERFACE${suffix} -i $iface -j RETURN\n"
+            fi
+        else
+            rules="${rules}-A PROXY_INTERFACE${suffix} -i $iface -j ACCEPT\n"
+            rules="${rules}-A BYPASS_INTERFACE${suffix} -o $iface -j ACCEPT\n"
+        fi
+    done
+    IFS="$IFS_OLD"
+    
+    # Final accept for unmatched
+    rules="${rules}-A PROXY_INTERFACE${suffix} -j ACCEPT\n"
+    
+    printf '%b' "$rules"
+}
+
+# Build private IP bypass rules
+_build_bypass_ip_rules() {
+    local suffix="$1"
+    local family="$2"
+    local has_addrtype="$3"
+    local has_conntrack="$4"
+    local rules=""
+    
+    # Local address type bypass
+    if [ "$has_addrtype" -eq 1 ]; then
+        rules="${rules}-A BYPASS_IP${suffix} -m addrtype --dst-type LOCAL -p udp ! --dport 53 -j ACCEPT\n"
+        rules="${rules}-A BYPASS_IP${suffix} -m addrtype --dst-type LOCAL ! -p udp -j ACCEPT\n"
+    fi
+    
+    # Reply connection bypass
+    if [ "$has_conntrack" -eq 1 ]; then
+        rules="${rules}-A BYPASS_IP${suffix} -m conntrack --ctdir REPLY -j ACCEPT\n"
+    fi
+    
+    # Private subnets
+    local subnets=""
+    [ "$family" = "6" ] && subnets="$PRIVATE_SUBNETS_V6_COMPACT" || subnets="$PRIVATE_SUBNETS_V4_COMPACT"
+    
+    for subnet in $subnets; do
+        rules="${rules}-A BYPASS_IP${suffix} -d $subnet -p udp ! --dport 53 -j ACCEPT\n"
+        rules="${rules}-A BYPASS_IP${suffix} -d $subnet ! -p udp -j ACCEPT\n"
+    done
+    
+    # CN IP bypass via ipset
+    if [ "$BYPASS_CN_IP" -eq 1 ]; then
+        local ipset_name="cnip"
+        [ "$family" = "6" ] && ipset_name="cnip6"
+        if command -v ipset > /dev/null 2>&1 && ipset list "$ipset_name" > /dev/null 2>&1; then
+            rules="${rules}-A BYPASS_IP${suffix} -m set --match-set $ipset_name dst -p udp ! --dport 53 -j ACCEPT\n"
+            rules="${rules}-A BYPASS_IP${suffix} -m set --match-set $ipset_name dst ! -p udp -j ACCEPT\n"
+        fi
+    fi
+    
+    printf '%b' "$rules"
+}
+
+# Build APP filtering rules
+_build_app_rules() {
+    local suffix="$1"
+    local has_owner="$2"
+    local has_mark="$3"
+    local rules=""
+    
+    # Core process bypass (critical for avoiding infinite loop)
+    # Use owner match if available, otherwise fallback to mark match
+    if [ "$has_owner" -eq 1 ]; then
+        rules="${rules}-A APP_CHAIN${suffix} -m owner --uid-owner $CORE_USER --gid-owner $CORE_GROUP -j ACCEPT\n"
+    elif [ "$has_mark" -eq 1 ] && [ -n "$ROUTING_MARK" ]; then
+        rules="${rules}-A APP_CHAIN${suffix} -m mark --mark $ROUTING_MARK -j ACCEPT\n"
+    fi
+    
+    # Per-app proxy rules
+    if [ "$APP_PROXY_ENABLE" -eq 1 ] && [ "$has_owner" -eq 1 ]; then
+        case "$APP_PROXY_MODE" in
+            1) # Blacklist
+                if [ -n "$BYPASS_APPS_LIST" ]; then
+                    local uids
+                    uids=$(find_packages_uid "$BYPASS_APPS_LIST" 2>/dev/null || true)
+                    for uid in $uids; do
+                        [ -n "$uid" ] && rules="${rules}-A APP_CHAIN${suffix} -m owner --uid-owner $uid -j ACCEPT\n"
+                    done
+                fi
+                rules="${rules}-A APP_CHAIN${suffix} -j RETURN\n"
+                ;;
+            2) # Whitelist
+                if [ -n "$PROXY_APPS_LIST" ]; then
+                    local uids
+                    uids=$(find_packages_uid "$PROXY_APPS_LIST" 2>/dev/null || true)
+                    for uid in $uids; do
+                        [ -n "$uid" ] && rules="${rules}-A APP_CHAIN${suffix} -m owner --uid-owner $uid -j RETURN\n"
+                    done
+                fi
+                rules="${rules}-A APP_CHAIN${suffix} -j ACCEPT\n"
+                ;;
+        esac
+    fi
+    
+    printf '%b' "$rules"
+}
+
+# Build MAC filtering rules
+_build_mac_rules() {
+    local suffix="$1"
+    local has_mac="$2"
+    local rules=""
+    
+    if [ "$MAC_FILTER_ENABLE" -eq 1 ] && [ "$PROXY_HOTSPOT" -eq 1 ] && [ -n "$HOTSPOT_INTERFACE" ] && [ "$has_mac" -eq 1 ]; then
+        case "$MAC_PROXY_MODE" in
+            1) # Blacklist
+                for mac in $BYPASS_MACS_LIST; do
+                    [ -n "$mac" ] && rules="${rules}-A MAC_CHAIN${suffix} -m mac --mac-source $mac -i $HOTSPOT_INTERFACE -j ACCEPT\n"
+                done
+                rules="${rules}-A MAC_CHAIN${suffix} -i $HOTSPOT_INTERFACE -j RETURN\n"
+                ;;
+            2) # Whitelist
+                for mac in $PROXY_MACS_LIST; do
+                    [ -n "$mac" ] && rules="${rules}-A MAC_CHAIN${suffix} -m mac --mac-source $mac -i $HOTSPOT_INTERFACE -j RETURN\n"
+                done
+                rules="${rules}-A MAC_CHAIN${suffix} -i $HOTSPOT_INTERFACE -j ACCEPT\n"
+                ;;
+        esac
+    fi
+    
+    printf '%b' "$rules"
+}
+
+
+# ==============================================================================
+# [ Main Rule Generation ]
+# ==============================================================================
+
+# Generate complete iptables-restore compatible ruleset
+_build_proxy_rules() {
+    local family="$1"
+    local mode="$2"
+    local suffix=""
+    local mark="$MARK_VALUE"
+    
+    [ "$family" = "6" ] && { suffix="6"; mark="$MARK_VALUE6"; }
+    
+    local table="mangle"
+    [ "$mode" = "redirect" ] && table="nat"
+    
+    # Use cached kernel features (initialized by _init_kernel_features)
+    local has_addrtype=$_KFEAT_ADDRTYPE
+    local has_conntrack=$_KFEAT_CONNTRACK
+    local has_owner=$_KFEAT_OWNER
+    local has_mark=$_KFEAT_MARK
+    local has_mac=$_KFEAT_MAC
+    
+    # Start building rules
+    cat <<EOF
+*${table}
+:PROXY_PREROUTING${suffix} - [0:0]
+:PROXY_OUTPUT${suffix} - [0:0]
+:BYPASS_IP${suffix} - [0:0]
+:BYPASS_INTERFACE${suffix} - [0:0]
+:PROXY_INTERFACE${suffix} - [0:0]
+:DNS_HIJACK_PRE${suffix} - [0:0]
+:DNS_HIJACK_OUT${suffix} - [0:0]
+:APP_CHAIN${suffix} - [0:0]
+:MAC_CHAIN${suffix} - [0:0]
+EOF
+    
+    # Chain linking
+    echo "-A PROXY_PREROUTING${suffix} -j BYPASS_IP${suffix}"
+    echo "-A PROXY_PREROUTING${suffix} -j PROXY_INTERFACE${suffix}"
+    echo "-A PROXY_PREROUTING${suffix} -j MAC_CHAIN${suffix}"
+    echo "-A PROXY_PREROUTING${suffix} -j DNS_HIJACK_PRE${suffix}"
+    echo "-A PROXY_OUTPUT${suffix} -j BYPASS_IP${suffix}"
+    echo "-A PROXY_OUTPUT${suffix} -j BYPASS_INTERFACE${suffix}"
+    echo "-A PROXY_OUTPUT${suffix} -j APP_CHAIN${suffix}"
+    echo "-A PROXY_OUTPUT${suffix} -j DNS_HIJACK_OUT${suffix}"
+    
+    # Bypass IP rules
+    _build_bypass_ip_rules "$suffix" "$family" "$has_addrtype" "$has_conntrack"
+    
+    # Interface rules (data-driven)
+    _build_interface_rules "$suffix" "$table" "$family"
+    
+    # MAC filtering
+    _build_mac_rules "$suffix" "$has_mac"
+    
+    # App filtering
+    _build_app_rules "$suffix" "$has_owner" "$has_mark"
+    
+    # DNS hijack (placeholder - actual rules depend on mode)
+    if [ "$DNS_HIJACK_ENABLE" -ne 0 ]; then
+        if [ "$mode" = "tproxy" ] && [ "$DNS_HIJACK_ENABLE" -ne 2 ]; then
+            echo "-A DNS_HIJACK_PRE${suffix} -j RETURN"
+            echo "-A DNS_HIJACK_OUT${suffix} -j RETURN"
+        fi
+    fi
+    
+    # Final proxy target
+    if [ "$mode" = "tproxy" ]; then
+        echo "-A PROXY_PREROUTING${suffix} -p tcp -j TPROXY --on-port $PROXY_TCP_PORT --tproxy-mark $mark"
+        echo "-A PROXY_PREROUTING${suffix} -p udp -j TPROXY --on-port $PROXY_UDP_PORT --tproxy-mark $mark"
+        echo "-A PROXY_OUTPUT${suffix} -j MARK --set-mark $mark"
+    else
+        echo "-A PROXY_PREROUTING${suffix} -j REDIRECT --to-ports $PROXY_TCP_PORT"
+        echo "-A PROXY_OUTPUT${suffix} -j REDIRECT --to-ports $PROXY_TCP_PORT"
+    fi
+    
+    # Inject into main chains
+    # Note: REDIRECT mode only supports TCP, so UDP rules only for TPROXY
+    if [ "$PROXY_UDP" -eq 1 ] && [ "$mode" = "tproxy" ]; then
+        echo "-I PREROUTING -p udp -j PROXY_PREROUTING${suffix}"
+        echo "-I OUTPUT -p udp -j PROXY_OUTPUT${suffix}"
+    fi
+    if [ "$PROXY_TCP" -eq 1 ]; then
+        echo "-I PREROUTING -p tcp -j PROXY_PREROUTING${suffix}"
+        echo "-I OUTPUT -p tcp -j PROXY_OUTPUT${suffix}"
+    fi
+    
+    echo "COMMIT"
+}
+
+
+# ==============================================================================
+# [ Public Interface - Rule Generation ]
+# ==============================================================================
+
+# Generate and cache IPv4 rules
+# Usage: generate_rules_ipv4 <mode>
+# mode: "tproxy" or "redirect"
+generate_rules_ipv4() {
+    local mode="${1:-tproxy}"
+    
+    _init_kernel_features
+    _build_proxy_rules "4" "$mode" > "$CACHE_RULES_V4_FILE"
+    
+    log_debug "IPv4 rules cached to $CACHE_RULES_V4_FILE"
+}
+
+# Generate and cache IPv6 rules
+# Usage: generate_rules_ipv6 <mode>
+# mode: "tproxy" or "redirect"
+generate_rules_ipv6() {
+    local mode="${1:-tproxy}"
+    
+    _init_kernel_features
+    _build_proxy_rules "6" "$mode" > "$CACHE_RULES_V6_FILE"
+    
+    log_debug "IPv6 rules cached to $CACHE_RULES_V6_FILE"
+}
+
+# Generate rules for both IPv4 and IPv6
+# Usage: generate_all_rules <mode>
+generate_all_rules() {
+    local mode="${1:-tproxy}"
+    
+    generate_rules_ipv4 "$mode"
+    
+    if [ "$PROXY_IPV6" -eq 1 ]; then
+        generate_rules_ipv6 "$mode"
+    fi
+    
+    log_debug "All rules generated (mode: $mode)"
+}
+
+
+# ==============================================================================
+# [ Public Interface - Rule Loading ]
+# ==============================================================================
+
+# Load cached IPv4 rules
+# Returns: rules content or empty if cache not found
+load_cached_rules_ipv4() {
+    if [ -f "$CACHE_RULES_V4_FILE" ]; then
+        cat "$CACHE_RULES_V4_FILE"
+    fi
+}
+
+# Load cached IPv6 rules
+# Returns: rules content or empty if cache not found
+load_cached_rules_ipv6() {
+    if [ -f "$CACHE_RULES_V6_FILE" ]; then
+        cat "$CACHE_RULES_V6_FILE"
+    fi
+}
+
+# Check if rules cache exists and is valid
+check_rules_cache_valid() {
+    [ -f "$CACHE_RULES_V4_FILE" ] || return 1
+    
+    # If IPv6 is enabled, check IPv6 cache too
+    if [ "$PROXY_IPV6" -eq 1 ]; then
+        [ -f "$CACHE_RULES_V6_FILE" ] || return 1
+    fi
+    
+    return 0
+}

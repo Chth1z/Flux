@@ -10,9 +10,8 @@
 # ==============================================================================
 
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
-. "$SCRIPT_DIR/flux.config"
-. "$SCRIPT_DIR/flux.logger"
-. "$SCRIPT_DIR/flux.state"
+. "$SCRIPT_DIR/flux.utils"
+. "$SCRIPT_DIR/flux.data"
 
 export LOG_COMPONENT="Update"
 
@@ -20,8 +19,8 @@ export LOG_COMPONENT="Update"
 # [ Country Mapping ]
 # ==============================================================================
 
-# Load country mapping from external JSON file for easier maintenance
-readonly COUNTRY_MAP_FILE="$TOOLS_DIR/base/country_map.json"
+# Load country mapping from external JSON file (path defined in flux.utils)
+# Uses: $COUNTRY_MAP_FILE
 
 # Cache for country map (loaded once, reused)
 _COUNTRY_MAP_CACHE=""

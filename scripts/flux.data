@@ -1,0 +1,960 @@
+#!/system/bin/sh
+
+# ==============================================================================
+# Flux Data Layer (flux.data)
+# Description: Configuration loading, validation, and cache management
+# ==============================================================================
+
+# ==============================================================================
+# [ Lightweight Log Config ]
+# ==============================================================================
+# Load only log-related settings for standalone scripts
+# Use this instead of load_flux_config when only logging is needed
+load_log_config() {
+    [ -f "$SETTINGS_FILE" ] || return 0
+    
+    # Parse only log-related variables from settings
+    local line
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            LOG_LEVEL=*|LOG_MAX_SIZE=*) eval "$line" ;;
+        esac
+    done < "$SETTINGS_FILE"
+    
+    # Apply defaults if not set
+    : "${LOG_LEVEL:=3}"
+    : "${LOG_MAX_SIZE:=1048576}"
+}
+
+
+# ==============================================================================
+# [ Config Loading - Data-Driven Approach ]
+# ==============================================================================
+# Apply defaults using for-loop to avoid subshell (pipe creates subshell)
+_init_config_defaults() {
+    local line key default current
+    for line in \
+        "SUBSCRIPTION_URL:" \
+        "CORE_TIMEOUT:5" \
+        "UPDATE_TIMEOUT:15" \
+        "UPDATE_INTERVAL:86400" \
+        "RETRY_COUNT:2" \
+        "LOG_LEVEL:3" \
+        "LOG_MAX_SIZE:1048576" \
+        "CORE_USER:root" \
+        "CORE_GROUP:root" \
+        "ROUTING_MARK:" \
+        "PROXY_TCP_PORT:1536" \
+        "PROXY_UDP_PORT:1536" \
+        "PROXY_MODE:0" \
+        "DNS_HIJACK_ENABLE:1" \
+        "DNS_PORT:1053" \
+        "MOBILE_INTERFACE:rmnet_data+" \
+        "WIFI_INTERFACE:wlan0" \
+        "HOTSPOT_INTERFACE:wlan2" \
+        "USB_INTERFACE:rndis+" \
+        "PROXY_MOBILE:1" \
+        "PROXY_WIFI:1" \
+        "PROXY_HOTSPOT:0" \
+        "PROXY_USB:0" \
+        "PROXY_TCP:1" \
+        "PROXY_UDP:1" \
+        "PROXY_IPV6:0" \
+        "MARK_VALUE:20" \
+        "MARK_VALUE6:25" \
+        "TABLE_ID:2025" \
+        "APP_PROXY_ENABLE:0" \
+        "APP_PROXY_MODE:1" \
+        "PROXY_APPS_LIST:" \
+        "BYPASS_APPS_LIST:" \
+        "BYPASS_CN_IP:0" \
+        "CN_IP_FILE:/data/adb/flux/conf/cnip.txt" \
+        "CN_IPV6_FILE:/data/adb/flux/conf/cnip6.txt" \
+        "CN_IP_URL:https://raw.githubusercontent.com/PaPerseller/chn-iplist/master/chn_ipv4.txt" \
+        "CN_IPV6_URL:https://ispip.clang.cn/all_cn_ipv6.txt" \
+        "MAC_FILTER_ENABLE:0" \
+        "MAC_PROXY_MODE:1" \
+        "PROXY_MACS_LIST:" \
+        "BYPASS_MACS_LIST:" \
+        "SKIP_CHECK_FEATURE:0" \
+        "FAKEIP_RANGE_V4:198.18.0.0/15" \
+        "FAKEIP_RANGE_V6:fc00::/18"
+    do
+        key="${line%%:*}"
+        default="${line#*:}"
+        eval "current=\"\$$key\""
+        [ -z "$current" ] && eval "$key='$default'"
+    done
+}
+
+load_flux_config() {
+    # Source settings file if exists
+    if [ -f "$SETTINGS_FILE" ]; then
+        set -a
+        . "$SETTINGS_FILE"
+        set +a
+    fi
+    
+    # Apply defaults for any unset variables (uses for-loop to avoid subshell)
+    _init_config_defaults
+    
+    # Load values from config.json (ports, fakeip ranges)
+    _load_config_json_values
+}
+
+# Export all config variables for child processes
+# Call this in start.sh after load_flux_config so core/tproxy inherit via environment
+export_flux_config() {
+    export CORE_TIMEOUT UPDATE_TIMEOUT UPDATE_INTERVAL RETRY_COUNT \
+           LOG_LEVEL LOG_MAX_SIZE CORE_USER CORE_GROUP ROUTING_MARK \
+           PROXY_TCP_PORT PROXY_UDP_PORT PROXY_MODE \
+           DNS_HIJACK_ENABLE DNS_PORT \
+           MOBILE_INTERFACE WIFI_INTERFACE HOTSPOT_INTERFACE USB_INTERFACE \
+           PROXY_MOBILE PROXY_WIFI PROXY_HOTSPOT PROXY_USB \
+           PROXY_TCP PROXY_UDP PROXY_IPV6 \
+           MARK_VALUE MARK_VALUE6 TABLE_ID \
+           APP_PROXY_ENABLE APP_PROXY_MODE PROXY_APPS_LIST BYPASS_APPS_LIST \
+           BYPASS_CN_IP CN_IP_FILE CN_IPV6_FILE CN_IP_URL CN_IPV6_URL \
+           MAC_FILTER_ENABLE MAC_PROXY_MODE PROXY_MACS_LIST BYPASS_MACS_LIST \
+           SKIP_CHECK_FEATURE FAKEIP_RANGE_V4 FAKEIP_RANGE_V6
+}
+
+# Internal: Load values from config.json
+_load_config_json_values() {
+
+    local jq_bin="$TOOLS_DIR/jq"
+    [ ! -x "$jq_bin" ] || [ ! -f "$CONFIG_FILE" ] && return 1
+    
+    # Load proxy ports from inbound configuration
+    local tproxy_port mixed_port
+    tproxy_port=$("$jq_bin" -r '[.inbounds[] | select(.type=="tproxy")] | .[0].listen_port // empty' "$CONFIG_FILE" 2>/dev/null)
+    if [ -n "$tproxy_port" ]; then
+        PROXY_TCP_PORT="$tproxy_port"
+        PROXY_UDP_PORT="$tproxy_port"
+    else
+        mixed_port=$("$jq_bin" -r '[.inbounds[] | select(.type=="mixed")] | .[0].listen_port // empty' "$CONFIG_FILE" 2>/dev/null)
+        [ -n "$mixed_port" ] && PROXY_TCP_PORT="$mixed_port" && PROXY_UDP_PORT="$mixed_port"
+    fi
+    
+    # Load FakeIP ranges (validate CIDR format before assigning)
+    local v4 v6
+    v4=$("$jq_bin" -r '.dns.servers[] | select(.type=="fakeip") | .inet4_range // empty' "$CONFIG_FILE" 2>/dev/null)
+    v6=$("$jq_bin" -r '.dns.servers[] | select(.type=="fakeip") | .inet6_range // empty' "$CONFIG_FILE" 2>/dev/null)
+    
+    # Validate and assign v4 CIDR (format: x.x.x.x/n)
+    case "$v4" in *"/"[0-9]*) FAKEIP_RANGE_V4="$v4" ;; esac
+    # Validate and assign v6 CIDR (format: contains : and /n)
+    case "$v6" in *":"*"/"[0-9]*) FAKEIP_RANGE_V6="$v6" ;; esac
+}
+
+
+# ==============================================================================
+# [ Validation Result Tracking ]
+# ==============================================================================
+
+VALIDATION_ERRORS=""
+VALIDATION_WARNINGS=""
+VALIDATION_ERROR_COUNT=0
+VALIDATION_WARNING_COUNT=0
+
+# Internal: add message to collection
+_add_message() {
+    local type="$1" msg="$2"
+    case "$type" in
+        error)
+            VALIDATION_ERRORS="${VALIDATION_ERRORS:+${VALIDATION_ERRORS}\n}• ${msg}"
+            VALIDATION_ERROR_COUNT=$((VALIDATION_ERROR_COUNT + 1))
+            ;;
+        warning)
+            VALIDATION_WARNINGS="${VALIDATION_WARNINGS:+${VALIDATION_WARNINGS}\n}• ${msg}"
+            VALIDATION_WARNING_COUNT=$((VALIDATION_WARNING_COUNT + 1))
+            ;;
+    esac
+}
+
+# Add validation error
+add_error() { _add_message "error" "$1"; }
+
+# Add validation warning
+add_warning() { _add_message "warning" "$1"; }
+
+# Reset validation state
+reset_validation() {
+    VALIDATION_ERRORS=""
+    VALIDATION_WARNINGS=""
+    VALIDATION_ERROR_COUNT=0
+    VALIDATION_WARNING_COUNT=0
+}
+
+# Check if validation passed
+validation_passed() {
+    [ -z "$VALIDATION_ERRORS" ]
+}
+
+# ==============================================================================
+# [ Settings Validation ]
+# ==============================================================================
+
+# Validate integer in range
+validate_int() {
+    local name="$1"
+    local val="$2"
+    local min="$3"
+    local max="$4"
+    
+    # Check if numeric
+    case "$val" in
+        ''|*[!0-9]*)
+            add_error "$name: not a number ($val)"
+            return 1
+            ;;
+    esac
+    
+    # Check range
+    if [ "$val" -lt "$min" ] || [ "$val" -gt "$max" ]; then
+        add_error "$name: out of range ($val, must be $min-$max)"
+        return 1
+    fi
+    
+    return 0
+}
+
+# ==============================================================================
+# [ Schema-Driven Validation ]
+# ==============================================================================
+
+# Validation schema: "variable_name:min:max"
+# Each line defines one integer setting to validate
+VALIDATION_SCHEMA="
+LOG_LEVEL:0:4
+LOG_MAX_SIZE:10240:104857600
+UPDATE_TIMEOUT:1:300
+RETRY_COUNT:0:10
+UPDATE_INTERVAL:60:31536000
+PROXY_TCP_PORT:1:65535
+PROXY_UDP_PORT:1:65535
+PROXY_MODE:0:2
+DNS_HIJACK_ENABLE:0:2
+PROXY_MOBILE:0:1
+PROXY_WIFI:0:1
+PROXY_HOTSPOT:0:1
+PROXY_USB:0:1
+PROXY_TCP:0:1
+PROXY_UDP:0:1
+PROXY_IPV6:0:1
+APP_PROXY_ENABLE:0:1
+APP_PROXY_MODE:1:2
+BYPASS_CN_IP:0:1
+MAC_FILTER_ENABLE:0:1
+MAC_PROXY_MODE:1:2
+SKIP_CHECK_FEATURE:0:1
+"
+
+# Validate settings.ini values using schema
+validate_settings() {
+    log_debug "Validating settings..."
+    local valid=0
+    
+    local IFS_OLD="$IFS"
+    IFS="
+"
+    for entry in $VALIDATION_SCHEMA; do
+        # Skip empty lines
+        [ -z "$entry" ] && continue
+        
+        IFS=":"
+        set -- $entry
+        local name="$1"
+        local min="$2"
+        local max="$3"
+        IFS="$IFS_OLD"
+        
+        # Skip if incomplete entry
+        [ -z "$name" ] || [ -z "$min" ] || [ -z "$max" ] && continue
+        
+        # Get variable value
+        eval "val=\$$name"
+        
+        validate_int "$name" "$val" "$min" "$max" || valid=1
+    done
+    IFS="$IFS_OLD"
+    
+    [ $valid -eq 0 ] && log_debug "Settings validation passed"
+    return $valid
+}
+
+# ==============================================================================
+# [ Resource Validation ]
+# ==============================================================================
+
+# File validation schema: "variable:type:message"
+# type: e=error if missing, w=warning if missing, x=must be executable
+readonly FILE_SCHEMA="
+SING_BOX_BIN:ex:sing-box binary
+CONFIG_FILE:e:config.json
+SETTINGS_FILE:w:settings.ini (using defaults)
+TPROXY_SCRIPT:e:flux.tproxy script
+"
+
+# Validate required files exist (data-driven)
+validate_files() {
+    log_debug "Validating required files..."
+    local valid=0
+    
+    local IFS_OLD="$IFS"
+    IFS="
+"
+    for entry in $FILE_SCHEMA; do
+        [ -z "$entry" ] && continue
+        
+        IFS=":"
+        set -- $entry
+        local var="$1" type="$2" desc="$3"
+        IFS="$IFS_OLD"
+        
+        [ -z "$var" ] && continue
+        eval "local path=\$$var"
+        
+        if [ ! -f "$path" ]; then
+            case "$type" in
+                e|ex) add_error "$desc not found"; valid=1 ;;
+                w) add_warning "$desc not found" ;;
+            esac
+        elif [ "$type" = "ex" ] && [ ! -x "$path" ]; then
+            add_warning "$desc not executable, will attempt to fix"
+        fi
+    done
+    IFS="$IFS_OLD"
+    
+    return $valid
+}
+
+# ==============================================================================
+# [ sing-box Config Validation ]
+# ==============================================================================
+
+# Validate sing-box JSON configuration
+validate_singbox_config() {
+    log_debug "Validating sing-box configuration..."
+    
+    if [ ! -f "$SING_BOX_BIN" ] || [ ! -x "$SING_BOX_BIN" ]; then
+        # Try to fix permission
+        chmod +x "$SING_BOX_BIN" 2>/dev/null
+    fi
+    
+    if [ ! -x "$SING_BOX_BIN" ]; then
+        add_error "sing-box binary not executable"
+        return 1
+    fi
+    
+    local check_output
+    check_output=$("$SING_BOX_BIN" check -c "$CONFIG_FILE" -D "$RUN_DIR" 2>&1)
+    local check_result=$?
+    
+    if [ $check_result -ne 0 ]; then
+        add_error "sing-box config invalid: $check_output"
+        return 1
+    fi
+    
+    log_debug "sing-box configuration valid"
+    return 0
+}
+
+# ==============================================================================
+# [ Kernel Feature Validation (with cache) ]
+# ==============================================================================
+
+# Initialize kernel capability cache
+init_kernel_cache() {
+    # Get current kernel version (changes only when kernel is updated)
+    local current_kernel
+    current_kernel=$(uname -r 2>/dev/null)
+    
+    # Skip if cache exists and kernel version matches
+    if [ -f "$KERNEL_CACHE_FILE" ]; then
+        local cached_kernel
+        cached_kernel=$(head -n1 "$KERNEL_CACHE_FILE" 2>/dev/null | grep "^#kernel:" | cut -d: -f2-)
+        
+        if [ -n "$cached_kernel" ] && [ "$cached_kernel" = "$current_kernel" ]; then
+            log_debug "Kernel Cache valid (kernel version match)"
+            return 0
+        fi
+        log_debug "Kernel changed: $cached_kernel -> $current_kernel"
+    fi
+    
+    log_debug "Building Kernel Capability Cache..."
+    
+    # Check and cache kernel features
+    if [ -f /proc/config.gz ]; then
+        # Build content in memory (avoids pipe subshell issue)
+        local content newline="
+"
+        content="#kernel:${current_kernel}${newline}"
+        
+        # Get all kernel config at once
+        local kernel_config
+        kernel_config=$(zcat /proc/config.gz 2>/dev/null)
+        
+        # List of features to check (record ALL, not just supported ones)
+        local features="NETFILTER_XT_TARGET_TPROXY NETFILTER_XT_MATCH_ADDRTYPE NETFILTER_XT_MATCH_CONNTRACK NETFILTER_XT_MATCH_OWNER NETFILTER_XT_MATCH_MARK NETFILTER_XT_MATCH_MAC IP_SET NETFILTER_XT_SET IP6_NF_NAT IP6_NF_TARGET_REDIRECT"
+        
+        local feat val
+        for feat in $features; do
+            # Check if feature is enabled (=y or =m)
+            if echo "$kernel_config" | grep -qE "^CONFIG_${feat}=[ym]$"; then
+                val=1
+            else
+                val=0
+            fi
+            content="${content}${feat}=${val}${newline}"
+        done
+        
+        # Write all at once
+        printf '%s' "$content" > "$KERNEL_CACHE_FILE"
+        log_debug "Kernel Cache built"
+    else
+        log_debug "Cannot build Kernel Cache: /proc/config.gz not available"
+        return 1
+    fi
+    
+    return 0
+}
+
+# Check kernel feature using cache
+check_kernel_feature_cached() {
+    local feature="$1"
+    
+    # Skip check if configured
+    if [ "$SKIP_CHECK_FEATURE" = "1" ]; then
+        return 0
+    fi
+    
+    # Try cache first
+    if [ -f "$KERNEL_CACHE_FILE" ]; then
+        local cached
+        cached=$(grep "^${feature}=" "$KERNEL_CACHE_FILE" 2>/dev/null | cut -d= -f2)
+        if [ "$cached" = "1" ]; then
+            return 0
+        elif [ "$cached" = "0" ]; then
+            return 1
+        fi
+    fi
+    
+    # Fallback to direct check
+    if [ -f /proc/config.gz ]; then
+        if zcat /proc/config.gz 2>/dev/null | grep -qE "^CONFIG_${feature}=[ym]$"; then
+            return 0
+        fi
+    fi
+    
+    return 1
+}
+
+# Validate essential kernel features and export for tproxy
+validate_kernel_features() {
+    log_debug "Validating kernel features..."
+    
+    # Initialize cache
+    init_kernel_cache
+    
+    # Helper: check feature(s) and export result
+    # Usage: _export_kfeat ENV_NAME FEATURE1 [FEATURE2 ...]
+    _export_kfeat() {
+        local env_name="$1"; shift
+        local result=1
+        for feat in "$@"; do
+            if ! check_kernel_feature_cached "$feat"; then
+                result=0
+                break
+            fi
+        done
+        export "KFEAT_${env_name}=$result"
+        log_debug "KFEAT_${env_name}=$result"
+    }
+    
+    # Export all kernel feature flags
+    _export_kfeat TPROXY    NETFILTER_XT_TARGET_TPROXY
+    _export_kfeat OWNER     NETFILTER_XT_MATCH_OWNER
+    _export_kfeat MARK      NETFILTER_XT_MATCH_MARK
+    _export_kfeat ADDRTYPE  NETFILTER_XT_MATCH_ADDRTYPE
+    _export_kfeat CONNTRACK NETFILTER_XT_MATCH_CONNTRACK
+    _export_kfeat MAC       NETFILTER_XT_MATCH_MAC
+    _export_kfeat IPSET     IP_SET NETFILTER_XT_SET                    # Both required
+    _export_kfeat IPV6_NAT  IP6_NF_NAT IP6_NF_TARGET_REDIRECT          # Both required
+
+    # Validate critical requirements
+    if [ "$PROXY_MODE" = "1" ] && [ "$KFEAT_TPROXY" -eq 0 ]; then
+        add_error "Kernel lacks TPROXY support (required by PROXY_MODE=1)"
+        return 1
+    fi
+    
+    [ "$KFEAT_OWNER" -eq 0 ] && add_warning "Kernel lacks OWNER match, using MARK-based bypass"
+    
+    [ "$BYPASS_CN_IP" = "1" ] && [ "$KFEAT_IPSET" -eq 0 ] && \
+        add_warning "Kernel lacks ipset support, CN IP bypass will be disabled"
+    
+    return 0
+}
+
+# ==============================================================================
+# [ Main Validation Entry Point ]
+# ==============================================================================
+
+# Run all validations
+# Returns: 0 if all passed, 1 if any errors
+validate_all() {
+    log_info "Validating environment..."
+    
+    reset_validation
+
+    # 1. Validate required files
+    validate_files
+    
+    # 2. Validate settings values
+    validate_settings
+    
+    # 3. Validate kernel features (with caching)
+    validate_kernel_features
+    
+    # 4. Validate sing-box config (only if files exist)
+    if [ -f "$CONFIG_FILE" ] && [ -f "$SING_BOX_BIN" ]; then
+        validate_singbox_config
+    fi
+    
+    # Report results
+    if [ -n "$VALIDATION_WARNINGS" ]; then
+        log_warn "Validation warnings:\n$VALIDATION_WARNINGS"
+    fi
+    
+    if [ -n "$VALIDATION_ERRORS" ]; then
+        log_error "Validation failed:\n$VALIDATION_ERRORS"
+        return 1
+    fi
+    
+    log_info "Validation passed"
+    return 0
+}
+
+
+# ==============================================================================
+# [ UID & Package Resolution (with caching) ]
+# ==============================================================================
+
+# Get modification time of packages.list for cache validation
+get_packages_list_mtime() {
+    if [ -f "$PACKAGES_LIST" ]; then
+        stat -c %Y "$PACKAGES_LIST" 2>/dev/null || stat -f %m "$PACKAGES_LIST" 2>/dev/null || echo "0"
+    else
+        echo "0"
+    fi
+}
+
+# Load UID cache from file, returns 0 if cache is valid, 1 if invalid/missing
+load_uid_cache() {
+    local current_mtime
+    local cached_mtime
+    
+    if [ ! -f "$UID_CACHE_FILE" ]; then
+        log_debug "UID Cache file not found"
+        return 1
+    fi
+    
+    current_mtime=$(get_packages_list_mtime)
+    cached_mtime=$(head -n1 "$UID_CACHE_FILE" 2>/dev/null | grep "^#mtime:" | cut -d: -f2)
+    
+    if [ -z "$cached_mtime" ] || [ "$cached_mtime" != "$current_mtime" ]; then
+        log_debug "UID Cache expired (mtime: $cached_mtime vs $current_mtime)"
+        rm -f "$UID_CACHE_FILE"
+        return 1
+    fi
+    
+    log_debug "UID Cache valid (mtime: $current_mtime)"
+    return 0
+}
+
+# Save UID cache to file
+# Format: first line is "#mtime:TIMESTAMP", rest are "token uid" pairs
+save_uid_cache() {
+    local mtime
+    mtime=$(get_packages_list_mtime)
+    
+    mkdir -p "$(dirname "$UID_CACHE_FILE")"
+    echo "#mtime:$mtime" > "$UID_CACHE_FILE"
+    log_debug "UID Cache initialized (mtime: $mtime)"
+}
+
+# Add a single entry to UID cache
+add_uid_cache_entry() {
+    local token="$1"
+    local uid="$2"
+    
+    if [ -f "$UID_CACHE_FILE" ]; then
+        echo "$token $uid" >> "$UID_CACHE_FILE"
+    fi
+}
+
+# Lookup a token in UID cache, returns uid or empty string
+lookup_uid_cache() {
+    local token="$1"
+    
+    if [ -f "$UID_CACHE_FILE" ]; then
+        grep "^${token} " "$UID_CACHE_FILE" 2>/dev/null | awk '{print $2}'
+    fi
+}
+
+# Retrieve UID for a package name from Android system package list
+get_package_uid() {
+    local pkg="$1"
+    local line
+    local uid
+    if [ ! -r "$PACKAGES_LIST" ]; then
+        log_debug "Cannot read $PACKAGES_LIST"
+        return 1
+    fi
+    line=$(grep -m1 "^${pkg}[[:space:]]" "$PACKAGES_LIST" 2> /dev/null || true)
+    if [ -z "$line" ]; then
+        log_debug "Package not found in packages.list: $pkg"
+        return 1
+    fi
+
+    uid=$(echo "$line" | awk '{print $2}' 2> /dev/null || true)
+    case "$uid" in
+        '' | *[!0-9]*)
+            uid=$(echo "$line" | awk '{print $(NF-1)}' 2> /dev/null || true)
+            ;;
+    esac
+    case "$uid" in
+        '' | *[!0-9]*)
+            log_debug "Invalid UID format for package: $pkg"
+            return 1
+            ;;
+        *)
+            echo "$uid"
+            return 0
+            ;;
+    esac
+}
+
+# Resolve multiple packages/tokens (with optional user prefix user:pkg) to UIDs
+# Uses cache when available for improved performance
+find_packages_uid() {
+    local out=""
+    local token
+    local uid_base
+    local final_uid
+    local cached_uid
+    local cache_initialized=0
+    
+    # Check if cache is valid, if not initialize new cache
+    if ! load_uid_cache; then
+        save_uid_cache
+        cache_initialized=1
+    fi
+    
+    # shellcheck disable=SC2048
+    for token in $*; do
+        # Try cache lookup first
+        cached_uid=$(lookup_uid_cache "$token")
+        if [ -n "$cached_uid" ]; then
+            out="$out $cached_uid"
+            log_debug "Resolved (cache): $token -> $cached_uid" >&2
+            continue
+        fi
+        
+        # Cache miss, resolve from packages.list
+        local user_prefix=0
+        local package="$token"
+        case "$token" in
+            *:*)
+                user_prefix=$(echo "$token" | cut -d: -f1)
+                package=$(echo "$token" | cut -d: -f2-)
+                case "$user_prefix" in
+                    '' | *[!0-9]*)
+                        log_warn "Invalid user prefix in token: $token, using 0" >&2
+                        user_prefix=0
+                        ;;
+                esac
+                ;;
+        esac
+        
+        if uid_base=$(get_package_uid "$package" 2> /dev/null); then
+            final_uid=$((user_prefix * 100000 + uid_base))
+            out="$out $final_uid"
+            # Add to cache
+            add_uid_cache_entry "$token" "$final_uid"
+            log_debug "Resolved (system): $token -> $final_uid" >&2
+        else
+            log_warn "Failed to resolve UID for package: $package" >&2
+        fi
+    done
+    
+    echo "$out" | awk '{$1=$1;print}'
+}
+
+
+# ==============================================================================
+# [ Meta Cache Management ]
+# ==============================================================================
+
+# Get file mtime (cross-platform)
+_get_mtime() {
+    local file="$1"
+    if [ -f "$file" ]; then
+        stat -c %Y "$file" 2>/dev/null || stat -f %m "$file" 2>/dev/null || echo "0"
+    else
+        echo "0"
+    fi
+}
+
+# Get module version from module.prop
+_get_module_version() {
+    if [ -f "$PROP_FILE" ]; then
+        grep "^version=" "$PROP_FILE" 2>/dev/null | cut -d= -f2
+    else
+        echo "unknown"
+    fi
+}
+
+# Check if meta cache is valid
+# Returns: 0 if valid, 1 if invalid/missing
+check_meta_cache_valid() {
+    [ ! -f "$CACHE_META_FILE" ] && {
+        log_debug "Meta cache not found"
+        return 1
+    }
+    
+    # Parse meta cache
+    local cached_version cached_config_mtime cached_settings_mtime cached_kernel
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            "#version:"*)     cached_version="${line#\#version:}" ;;
+            "#config_mtime:"*) cached_config_mtime="${line#\#config_mtime:}" ;;
+            "#settings_mtime:"*) cached_settings_mtime="${line#\#settings_mtime:}" ;;
+            "#kernel:"*)      cached_kernel="${line#\#kernel:}" ;;
+        esac
+    done < "$CACHE_META_FILE"
+    
+    # Check version
+    local current_version
+    current_version=$(_get_module_version)
+    if [ "$cached_version" != "$current_version" ]; then
+        log_debug "Version changed: $cached_version -> $current_version"
+        return 1
+    fi
+    
+    # Check config.json mtime
+    local current_config_mtime
+    current_config_mtime=$(_get_mtime "$CONFIG_FILE")
+    if [ "$cached_config_mtime" != "$current_config_mtime" ]; then
+        log_debug "config.json changed: $cached_config_mtime -> $current_config_mtime"
+        return 1
+    fi
+    
+    # Check settings.ini mtime
+    local current_settings_mtime
+    current_settings_mtime=$(_get_mtime "$SETTINGS_FILE")
+    if [ "$cached_settings_mtime" != "$current_settings_mtime" ]; then
+        log_debug "settings.ini changed: $cached_settings_mtime -> $current_settings_mtime"
+        return 1
+    fi
+    
+    # Check kernel version
+    local current_kernel
+    current_kernel=$(uname -r 2>/dev/null)
+    if [ "$cached_kernel" != "$current_kernel" ]; then
+        log_debug "Kernel changed: $cached_kernel -> $current_kernel"
+        return 1
+    fi
+    
+    # Check if all cache files exist
+    if [ ! -f "$CACHE_CONFIG_FILE" ] || [ ! -f "$KERNEL_CACHE_FILE" ]; then
+        log_debug "Required cache files missing"
+        return 1
+    fi
+    
+    log_debug "Meta cache valid"
+    return 0
+}
+
+# Update meta cache
+update_meta_cache() {
+    local version config_mtime settings_mtime kernel build_ts
+    
+    version=$(_get_module_version)
+    config_mtime=$(_get_mtime "$CONFIG_FILE")
+    settings_mtime=$(_get_mtime "$SETTINGS_FILE")
+    kernel=$(uname -r 2>/dev/null)
+    build_ts=$(date +%s)
+    
+    mkdir -p "$(dirname "$CACHE_META_FILE")"
+    
+    cat > "$CACHE_META_FILE" << EOF
+#version:${version}
+#config_mtime:${config_mtime}
+#settings_mtime:${settings_mtime}
+#kernel:${kernel}
+#build_ts:${build_ts}
+valid=1
+EOF
+    
+    log_debug "Meta cache updated"
+}
+
+
+# ==============================================================================
+# [ Config Cache Management ]
+# ==============================================================================
+
+# Save current config to cache
+save_config_cache() {
+    mkdir -p "$(dirname "$CACHE_CONFIG_FILE")"
+    
+    # Export all config variables to cache file
+    cat > "$CACHE_CONFIG_FILE" << EOF
+# Flux Config Cache - Auto Generated
+CORE_TIMEOUT=$CORE_TIMEOUT
+UPDATE_TIMEOUT=$UPDATE_TIMEOUT
+UPDATE_INTERVAL=$UPDATE_INTERVAL
+RETRY_COUNT=$RETRY_COUNT
+LOG_LEVEL=$LOG_LEVEL
+LOG_MAX_SIZE=$LOG_MAX_SIZE
+CORE_USER=$CORE_USER
+CORE_GROUP=$CORE_GROUP
+ROUTING_MARK=$ROUTING_MARK
+PROXY_TCP_PORT=$PROXY_TCP_PORT
+PROXY_UDP_PORT=$PROXY_UDP_PORT
+PROXY_MODE=$PROXY_MODE
+DNS_HIJACK_ENABLE=$DNS_HIJACK_ENABLE
+DNS_PORT=$DNS_PORT
+MOBILE_INTERFACE=$MOBILE_INTERFACE
+WIFI_INTERFACE=$WIFI_INTERFACE
+HOTSPOT_INTERFACE=$HOTSPOT_INTERFACE
+USB_INTERFACE=$USB_INTERFACE
+PROXY_MOBILE=$PROXY_MOBILE
+PROXY_WIFI=$PROXY_WIFI
+PROXY_HOTSPOT=$PROXY_HOTSPOT
+PROXY_USB=$PROXY_USB
+PROXY_TCP=$PROXY_TCP
+PROXY_UDP=$PROXY_UDP
+PROXY_IPV6=$PROXY_IPV6
+MARK_VALUE=$MARK_VALUE
+MARK_VALUE6=$MARK_VALUE6
+TABLE_ID=$TABLE_ID
+APP_PROXY_ENABLE=$APP_PROXY_ENABLE
+APP_PROXY_MODE=$APP_PROXY_MODE
+PROXY_APPS_LIST=$PROXY_APPS_LIST
+BYPASS_APPS_LIST=$BYPASS_APPS_LIST
+BYPASS_CN_IP=$BYPASS_CN_IP
+CN_IP_FILE=$CN_IP_FILE
+CN_IPV6_FILE=$CN_IPV6_FILE
+CN_IP_URL=$CN_IP_URL
+CN_IPV6_URL=$CN_IPV6_URL
+MAC_FILTER_ENABLE=$MAC_FILTER_ENABLE
+MAC_PROXY_MODE=$MAC_PROXY_MODE
+PROXY_MACS_LIST=$PROXY_MACS_LIST
+BYPASS_MACS_LIST=$BYPASS_MACS_LIST
+SKIP_CHECK_FEATURE=$SKIP_CHECK_FEATURE
+FAKEIP_RANGE_V4=$FAKEIP_RANGE_V4
+FAKEIP_RANGE_V6=$FAKEIP_RANGE_V6
+EOF
+    
+    log_debug "Config cache saved"
+}
+
+# Load config from cache
+load_config_cache() {
+    if [ ! -f "$CACHE_CONFIG_FILE" ]; then
+        log_debug "Config cache not found"
+        return 1
+    fi
+    
+    # Source the cache file
+    set -a
+    . "$CACHE_CONFIG_FILE"
+    set +a
+    
+    log_debug "Config cache loaded"
+    return 0
+}
+
+# Load kernel features from cache and export
+load_kernel_cache() {
+    if [ ! -f "$KERNEL_CACHE_FILE" ]; then
+        log_debug "Kernel cache not found"
+        return 1
+    fi
+    
+    # Export kernel features
+    local line feat val
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            "#"*) continue ;;
+            *"="*)
+                feat="${line%%=*}"
+                val="${line#*=}"
+                case "$feat" in
+                    NETFILTER_XT_TARGET_TPROXY)    export KFEAT_TPROXY="$val" ;;
+                    NETFILTER_XT_MATCH_OWNER)      export KFEAT_OWNER="$val" ;;
+                    NETFILTER_XT_MATCH_MARK)       export KFEAT_MARK="$val" ;;
+                    NETFILTER_XT_MATCH_ADDRTYPE)   export KFEAT_ADDRTYPE="$val" ;;
+                    NETFILTER_XT_MATCH_CONNTRACK)  export KFEAT_CONNTRACK="$val" ;;
+                    NETFILTER_XT_MATCH_MAC)        export KFEAT_MAC="$val" ;;
+                    IP_SET)                        export KFEAT_IPSET="$val" ;;
+                    IP6_NF_NAT)                    export KFEAT_IPV6_NAT="$val" ;;
+                esac
+                ;;
+        esac
+    done < "$KERNEL_CACHE_FILE"
+    
+    log_debug "Kernel cache loaded"
+    return 0
+}
+
+
+# ==============================================================================
+# [ Data Layer Initialization ]
+# ==============================================================================
+
+# Initialize data layer with cache-first approach
+# Returns: 0 on success, 1 on failure
+init_data_layer() {
+    if check_meta_cache_valid; then
+        # Cache valid: fast path
+        log_info "Cache valid, fast boot..."
+        load_config_cache || {
+            log_warn "Config cache load failed, rebuilding..."
+            _rebuild_all_caches
+            return $?
+        }
+        load_kernel_cache || {
+            log_warn "Kernel cache load failed, rebuilding..."
+            init_kernel_cache
+        }
+    else
+        # Cache invalid: full initialization
+        log_info "Cache invalid, rebuilding..."
+        _rebuild_all_caches || return 1
+    fi
+    
+    return 0
+}
+
+# Internal: rebuild all caches
+_rebuild_all_caches() {
+    # Load config from source
+    load_flux_config
+    
+    # Validate
+    if ! validate_all; then
+        log_error "Validation failed, cannot rebuild caches"
+        return 1
+    fi
+    
+    # Save caches
+    save_config_cache
+    init_kernel_cache
+    update_meta_cache
+    
+    log_info "Caches rebuilt"
+    return 0
+}

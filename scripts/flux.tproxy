@@ -2,7 +2,8 @@
 
 # ==============================================================================
 # Flux TProxy Management (flux.tproxy)
-# Description: iptables rules execution and routing management
+# Description: Apply cached iptables rules and manage routing
+# Note: All kernel detection and rule generation is done by flux.rules
 # ==============================================================================
 
 # ==============================================================================
@@ -16,19 +17,40 @@ SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 export LOG_COMPONENT="Tproxy"
 
 # ==============================================================================
-# [ Kernel & System Features ]
+# [ Mode Detection - Read from Cache ]
 # ==============================================================================
 
-# Verify TPROXY support using exported KFEAT_TPROXY from flux.data
+# Check if kernel supports TPROXY
 check_tproxy_support() {
     if [ "${KFEAT_TPROXY:-0}" -eq 1 ]; then
-        log_debug "TPROXY support confirmed"
         return 0
+    else
+        return 1
     fi
-    log_debug "TPROXY support not available"
-    return 1
 }
 
+# Detect proxy mode based on config and kernel support
+# Sets: USE_TPROXY (1=tproxy, 0=redirect)
+detect_proxy_mode() {
+    # Default to TPROXY
+    USE_TPROXY=1
+    
+    # Check 1: Kernel Support
+    if ! check_tproxy_support; then
+        log_warn "Kernel does not support TPROXY, falling back to REDIRECT"
+        USE_TPROXY=0
+    # Check 2: User Config (0=Auto, 1=TProxy, 2=Redirect)
+    elif [ "${PROXY_MODE}" -eq 2 ]; then
+        log_info "TPROXY is disabled by config, using REDIRECT"
+        USE_TPROXY=0
+    fi
+    
+    if [ "$USE_TPROXY" -eq 1 ]; then
+        log_debug "Using TPROXY mode"
+    else
+        log_debug "Using REDIRECT mode"
+    fi
+}
 
 # ==============================================================================
 # COMMAND WRAPPERS
@@ -47,48 +69,6 @@ ip_rule()     { command ip rule "$@"; }
 ip6_rule()    { command ip -6 rule "$@"; }
 ip_route()    { command ip route "$@"; }
 ip6_route()   { command ip -6 route "$@"; }
-
-
-# ==============================================================================
-# IPTABLES CHAIN MANAGEMENT
-# ==============================================================================
-
-# Check if an iptables chain exists in a specific table
-safe_chain_exists() {
-    local family="$1"
-    local table="$2"
-    local chain="$3"
-    local cmd="iptables"
-
-    if [ "$family" = "6" ]; then
-        cmd="ip6tables"
-    fi
-
-    if $cmd -t "$table" -L "$chain" > /dev/null 2>&1; then
-        return 0
-    fi
-
-    return 1
-}
-
-# Safely create a new chain; flushes it if it already exists
-safe_chain_create() {
-    local family="$1"
-    local table="$2"
-    local chain="$3"
-    local cmd="iptables"
-
-    if [ "$family" = "6" ]; then
-        cmd="ip6tables"
-    fi
-
-    if ! safe_chain_exists "$family" "$table" "$chain"; then
-        $cmd -t "$table" -N "$chain"
-    fi
-
-    $cmd -t "$table" -F "$chain"
-}
-
 
 # ==============================================================================
 # IPSET & GEO-IP MANAGEMENT
@@ -204,82 +184,12 @@ setup_proxy_chain() {
     # Apply cached rules
     if $restore_cmd --noflush < "$rules_file" 2>/dev/null; then
         log_debug "$mode_name chains setup complete from cache (IPv${family})"
-        
-        # Handle DNS hijack redirect2 mode separately
-        if [ "$DNS_HIJACK_ENABLE" -eq 2 ] && [ "$mode" = "tproxy" ]; then
-            setup_dns_hijack "$family" "redirect2"
-        fi
-        
+        # Note: DNS hijack redirect2 rules are now loaded via NAT extra cache in ping_fix()
         return 0
     else
         log_error "iptables-restore failed for IPv${family}"
         return 1
     fi
-}
-
-
-
-# ==============================================================================
-# DNS HIJACKING LOGIC
-# ==============================================================================
-
-setup_dns_hijack() {
-    local family="$1"
-    local mode="$2"
-    local suffix=""
-    local mark="$MARK_VALUE"
-    local cmd="iptables"
-
-    if [ "$family" = "6" ]; then
-        suffix="6"
-        mark="$MARK_VALUE6"
-        cmd="ip6tables"
-    fi
-
-    case "$mode" in
-        tproxy)
-            $cmd -t mangle -A "DNS_HIJACK_PRE$suffix" -j RETURN
-            $cmd -t mangle -A "DNS_HIJACK_OUT$suffix" -j RETURN
-            log_debug "DNS hijack enabled using TPROXY mode"
-            ;;
-        redirect)
-            $cmd -t nat -A "DNS_HIJACK_PRE$suffix" -p tcp --dport 53 -j REDIRECT --to-ports "$DNS_PORT"
-            $cmd -t nat -A "DNS_HIJACK_PRE$suffix" -p udp --dport 53 -j REDIRECT --to-ports "$DNS_PORT"
-            $cmd -t nat -A "DNS_HIJACK_OUT$suffix" -p tcp --dport 53 -j REDIRECT --to-ports "$DNS_PORT"
-            $cmd -t nat -A "DNS_HIJACK_OUT$suffix" -p udp --dport 53 -j REDIRECT --to-ports "$DNS_PORT"
-            log_debug "DNS hijack enabled using REDIRECT mode to port $DNS_PORT"
-            ;;
-        redirect2)
-            if [ "$family" = "6" ] && [ "${KFEAT_IPV6_NAT:-0}" -eq 0 ]; then
-                log_warn "IPv6: Kernel does not support IPv6 NAT or REDIRECT, skipping IPv6 DNS hijack"
-                return 0
-            fi
-            safe_chain_create "$family" "nat" "NAT_DNS_HIJACK$suffix"
-            $cmd -t nat -A "NAT_DNS_HIJACK$suffix" -p tcp --dport 53 -j REDIRECT --to-ports "$DNS_PORT"
-            $cmd -t nat -A "NAT_DNS_HIJACK$suffix" -p udp --dport 53 -j REDIRECT --to-ports "$DNS_PORT"
-
-            [ "$PROXY_MOBILE" -eq 1 ] && $cmd -t nat -A PREROUTING -i "$MOBILE_INTERFACE" -j "NAT_DNS_HIJACK$suffix"
-            [ "$PROXY_WIFI" -eq 1 ] && $cmd -t nat -A PREROUTING -i "$WIFI_INTERFACE" -j "NAT_DNS_HIJACK$suffix"
-            [ "$PROXY_USB" -eq 1 ] && $cmd -t nat -A PREROUTING -i "$USB_INTERFACE" -j "NAT_DNS_HIJACK$suffix"
-
-            $cmd -t nat -A OUTPUT -p udp --dport 53 -m owner --uid-owner "$CORE_USER" --gid-owner "$CORE_GROUP" -j ACCEPT
-            $cmd -t nat -A OUTPUT -p tcp --dport 53 -m owner --uid-owner "$CORE_USER" --gid-owner "$CORE_GROUP" -j ACCEPT
-            $cmd -t nat -A OUTPUT -j "NAT_DNS_HIJACK$suffix"
-            log_debug "DNS hijack enabled using REDIRECT mode to port $DNS_PORT"
-            ;;
-    esac
-}
-
-# Wrapper helpers for different modes/families
-setup_tproxy_chain4()   { setup_proxy_chain 4 "tproxy"; }
-setup_redirect_chain4() { log_warn "REDIRECT mode only supports TCP"; setup_proxy_chain 4 "redirect"; }
-setup_tproxy_chain6()   { setup_proxy_chain 6 "tproxy"; }
-setup_redirect_chain6() {
-    if [ "${KFEAT_IPV6_NAT:-0}" -eq 0 ]; then
-        log_warn "IPv6: Kernel does not support IPv6 NAT or REDIRECT, skipping IPv6 proxy setup"
-        return 0
-    fi
-    log_warn "REDIRECT mode only supports TCP"; setup_proxy_chain 6 "redirect"
 }
 
 
@@ -334,89 +244,28 @@ setup_routing6() {
 # CLEANUP OPERATIONS
 # ==============================================================================
 
+# Atomic cleanup using cached iptables-restore rules
+# Requires cleanup rules to be pre-generated by flux.rules
 cleanup_chain() {
     local family="$1"
     local mode="$2"
-    local suffix=""
-    local cmd="iptables"
+    local restore_cmd="iptables-restore"
+    local cleanup_file="${CACHE_DIR}/cache_cleanup_ipv4"
 
     if [ "$family" = "6" ]; then
-        suffix="6"
-        cmd="ip6tables"
+        restore_cmd="ip6tables-restore"
+        cleanup_file="${CACHE_DIR}/cache_cleanup_ipv6"
     fi
 
-    local mode_name="$mode"
-    if [ "$mode" = "tproxy" ]; then
-        mode_name="TPROXY"
-    else
-        mode_name="REDIRECT"
-    fi
+    local mode_name="TPROXY"
+    [ "$mode" = "redirect" ] && mode_name="REDIRECT"
 
     log_debug "Cleaning up $mode_name chains for IPv${family}"
 
-    local table="mangle"
-    if [ "$mode" = "redirect" ]; then
-        table="nat"
-    fi
-
-    # Unlink rules
-    $cmd -t "$table" -D "PROXY_PREROUTING$suffix" -j "BYPASS_IP$suffix" 2> /dev/null || true
-    $cmd -t "$table" -D "PROXY_PREROUTING$suffix" -j "PROXY_INTERFACE$suffix" 2> /dev/null || true
-    $cmd -t "$table" -D "PROXY_PREROUTING$suffix" -j "MAC_CHAIN$suffix" 2> /dev/null || true
-    $cmd -t "$table" -D "PROXY_PREROUTING$suffix" -j "DNS_HIJACK_PRE$suffix" 2> /dev/null || true
-
-    $cmd -t "$table" -D "PROXY_OUTPUT$suffix" -j "BYPASS_IP$suffix" 2> /dev/null || true
-    $cmd -t "$table" -D "PROXY_OUTPUT$suffix" -j "BYPASS_INTERFACE$suffix" 2> /dev/null || true
-    $cmd -t "$table" -D "PROXY_OUTPUT$suffix" -j "APP_CHAIN$suffix" 2> /dev/null || true
-    $cmd -t "$table" -D "PROXY_OUTPUT$suffix" -j "DNS_HIJACK_OUT$suffix" 2> /dev/null || true
-
-    if [ "$PROXY_TCP" -eq 1 ]; then
-        $cmd -t "$table" -D PREROUTING -p tcp -j "PROXY_PREROUTING$suffix" 2> /dev/null || true
-        $cmd -t "$table" -D OUTPUT -p tcp -j "PROXY_OUTPUT$suffix" 2> /dev/null || true
-    fi
-    if [ "$PROXY_UDP" -eq 1 ]; then
-        $cmd -t "$table" -D PREROUTING -p udp -j "PROXY_PREROUTING$suffix" 2> /dev/null || true
-        $cmd -t "$table" -D OUTPUT -p udp -j "PROXY_OUTPUT$suffix" 2> /dev/null || true
-    fi
-
-    # Define chains based on family
-    local chains=""
-    if [ "$family" = "6" ]; then
-        chains="PROXY_PREROUTING6 PROXY_OUTPUT6 BYPASS_IP6 BYPASS_INTERFACE6 PROXY_INTERFACE6 DNS_HIJACK_PRE6 DNS_HIJACK_OUT6 APP_CHAIN6 MAC_CHAIN6"
-    else
-        chains="PROXY_PREROUTING PROXY_OUTPUT BYPASS_IP BYPASS_INTERFACE PROXY_INTERFACE DNS_HIJACK_PRE DNS_HIJACK_OUT APP_CHAIN MAC_CHAIN"
-    fi
-
-    # Destroy chains
-    for c in $chains; do
-        $cmd -t "$table" -F "$c" 2> /dev/null || true
-        $cmd -t "$table" -X "$c" 2> /dev/null || true
-    done
-
-    # Cleanup specific DNS redirection chains
-    if [ "$mode" = "tproxy" ] && [ "$DNS_HIJACK_ENABLE" -eq 2 ]; then
-        $cmd -t nat -D PREROUTING -i "$MOBILE_INTERFACE" -j "NAT_DNS_HIJACK$suffix" 2> /dev/null || true
-        $cmd -t nat -D PREROUTING -i "$WIFI_INTERFACE" -j "NAT_DNS_HIJACK$suffix" 2> /dev/null || true
-        $cmd -t nat -D PREROUTING -i "$USB_INTERFACE" -j "NAT_DNS_HIJACK$suffix" 2> /dev/null || true
-        $cmd -t nat -D OUTPUT -p udp --dport 53 -m owner --uid-owner "$CORE_USER" --gid-owner "$CORE_GROUP" -j ACCEPT 2> /dev/null || true
-        $cmd -t nat -D OUTPUT -p tcp --dport 53 -m owner --uid-owner "$CORE_USER" --gid-owner "$CORE_GROUP" -j ACCEPT 2> /dev/null || true
-        $cmd -t nat -D OUTPUT -j "NAT_DNS_HIJACK$suffix" 2> /dev/null || true
-        $cmd -t nat -F "NAT_DNS_HIJACK$suffix" 2> /dev/null || true
-        $cmd -t nat -X "NAT_DNS_HIJACK$suffix" 2> /dev/null || true
-    fi
-
+    # Apply cached cleanup rules (atomic)
+    [ -s "$cleanup_file" ] && $restore_cmd --noflush < "$cleanup_file" 2>/dev/null || true
+    
     log_debug "$mode_name chains for IPv${family} cleanup completed"
-}
-
-cleanup_tproxy_chain4()   { cleanup_chain 4 "tproxy"; }
-cleanup_tproxy_chain6()   { cleanup_chain 6 "tproxy"; }
-cleanup_redirect_chain4() { cleanup_chain 4 "redirect"; }
-cleanup_redirect_chain6() {
-    if [ "${KFEAT_IPV6_NAT:-0}" -eq 0 ]; then
-        log_warn "IPv6: Kernel does not support IPv6 NAT or REDIRECT, skipping IPv6 cleanup"
-        return 0
-    fi
-    cleanup_chain 6 "redirect"
 }
 
 cleanup_routing4() {
@@ -443,48 +292,26 @@ cleanup_ipset() {
     log_debug "ipset 'cnip' and 'cnip6' destroyed"
 }
 
-
 # ==============================================================================
 # MAIN EXECUTION FLOW
 # ==============================================================================
 
-# Determine which proxy mode to use based on kernel support and config
-detect_proxy_mode() {
-    USE_TPROXY=0
-    case "$PROXY_MODE" in
-        0)
-            if check_tproxy_support; then
-                USE_TPROXY=1
-                log_debug "Kernel supports TPROXY, using TPROXY mode (auto)"
-            else
-                log_warn "Kernel does not support TPROXY, falling back to REDIRECT mode (auto)"
-            fi
-            ;;
-        1)
-            if check_tproxy_support; then
-                USE_TPROXY=1
-                log_debug "Using TPROXY mode (forced by configuration)"
-            else
-                log_error "TPROXY mode forced but kernel does not support TPROXY"
-                prop_error "Kernel: no TPROXY"
-                exit 1
-            fi
-            ;;
-        2)
-            log_debug "Using REDIRECT mode (forced by configuration)"
-            ;;
-    esac
-}
-
 start_proxy() {
     set_component_state "$COMP_TPROXY" "$STATE_STARTING"
     log_info "Starting setup..."
+    
+    # Detect mode based on config/kernel (restored logic)
+    detect_proxy_mode
+    local mode="tproxy"
+    [ "$USE_TPROXY" -eq 0 ] && mode="redirect"
+    
+    # Setup CN IP bypass if enabled (runtime check since ipset is loaded dynamically)
     if [ "$BYPASS_CN_IP" -eq 1 ]; then
         if [ "${KFEAT_IPSET:-0}" -eq 0 ]; then
             log_error "Kernel does not support ipset. Cannot bypass CN IPs"
             BYPASS_CN_IP=0
         else
-            log_debug "CN IP bypass enabled, ipset will be loaded from files"
+            log_debug "CN IP bypass enabled, loading ipset..."
             if ! setup_cn_ipset; then
                 log_error "Failed to setup ipset, CN bypass disabled"
                 BYPASS_CN_IP=0
@@ -492,53 +319,50 @@ start_proxy() {
         fi
     fi
 
-    if [ "$USE_TPROXY" -eq 1 ]; then
-        setup_tproxy_chain4
+    log_debug "Applying rules for $mode mode"
+    
+    # Apply IPv4 rules
+    setup_proxy_chain 4 "$mode"
+    
+    # Setup routing (only needed for TPROXY mode)
+    if [ "$mode" = "tproxy" ]; then
         setup_routing4
-        if [ "$PROXY_IPV6" -eq 1 ]; then
-            setup_tproxy_chain6
-            setup_routing6
-        fi
-    else
-        setup_redirect_chain4
-        if [ "$PROXY_IPV6" -eq 1 ]; then
-            setup_redirect_chain6
-        fi
     fi
     
-    block_loopback_traffic enable
-    ping_fix enable
+    # Apply IPv6 rules if enabled
+    if [ "$PROXY_IPV6" -eq 1 ]; then
+        setup_proxy_chain 6 "$mode"
+        [ "$mode" = "tproxy" ] && setup_routing6
+    fi
     
-    # Start IP monitor for dynamic anti-loopback
     start_ip_monitor
     
     set_component_state "$COMP_TPROXY" "$STATE_RUNNING"
-    log_info "Setup complete"
+    log_info "Setup complete (mode: $mode)"
 }
 
 stop_proxy() {
     set_component_state "$COMP_TPROXY" "$STATE_STOPPING"
     log_info "Stopping Tproxy..."
-    if [ "$USE_TPROXY" -eq 1 ]; then
-        cleanup_tproxy_chain4
-        cleanup_routing4
-        if [ "$PROXY_IPV6" -eq 1 ]; then
-            cleanup_tproxy_chain6
-            cleanup_routing6
-        fi
-    else
-        log_debug "Cleaning up REDIRECT chains"
-        cleanup_redirect_chain4
-        if [ "$PROXY_IPV6" -eq 1 ]; then
-            cleanup_redirect_chain6
-        fi
+    
+    # Re-detect mode to know what to cleanup
+    detect_proxy_mode
+    local mode="tproxy"
+    [ "$USE_TPROXY" -eq 0 ] && mode="redirect"
+    
+    log_debug "Cleanup for $mode mode"
+    
+    # Cleanup IPv4
+    cleanup_chain 4 "$mode"
+    cleanup_routing4
+    
+    # Cleanup IPv6
+    if [ "$PROXY_IPV6" -eq 1 ]; then
+        cleanup_chain 6 "$mode"
+        cleanup_routing6
     fi
     
     cleanup_ipset
-    block_loopback_traffic disable
-    ping_fix disable
-    
-    # Stop IP monitor
     stop_ip_monitor
     
     set_component_state "$COMP_TPROXY" "$STATE_STOPPED"
@@ -551,98 +375,31 @@ rollback_tproxy() {
     log_info "Rolling back tproxy..."
     set_component_state "$COMP_TPROXY" "$STATE_ROLLING_BACK"
     
-    # Force cleanup all chains regardless of mode
-    cleanup_tproxy_chain4
-    cleanup_tproxy_chain6
-    cleanup_redirect_chain4
-    cleanup_redirect_chain6
+    # Force cleanup all chains regardless of mode (try both modes)
+    cleanup_chain 4 "tproxy"
+    cleanup_chain 6 "tproxy"
+    cleanup_chain 4 "redirect"
+    cleanup_chain 6 "redirect"
     cleanup_routing4
     cleanup_routing6
     cleanup_ipset
-    block_loopback_traffic disable
-    ping_fix disable
     stop_ip_monitor
     
     set_component_state "$COMP_TPROXY" "$STATE_STOPPED"
     log_debug "TProxy rollback complete"
 }
 
-block_loopback_traffic() {
-    case "$1" in
-        enable)
-            ip6tables -t filter -A OUTPUT -d ::1 -p tcp -m owner --uid-owner "$CORE_USER" --gid-owner "$CORE_GROUP" -m tcp --dport "$PROXY_TCP_PORT" -j REJECT
-            iptables -t filter -A OUTPUT -d 127.0.0.1 -p tcp -m owner --uid-owner "$CORE_USER" --gid-owner "$CORE_GROUP" -m tcp --dport "$PROXY_TCP_PORT" -j REJECT
-            ;;
-        disable)
-            ip6tables -t filter -D OUTPUT -d ::1 -p tcp -m owner --uid-owner "$CORE_USER" --gid-owner "$CORE_GROUP" -m tcp --dport "$PROXY_TCP_PORT" -j REJECT 2>/dev/null
-            iptables -t filter -D OUTPUT -d 127.0.0.1 -p tcp -m owner --uid-owner "$CORE_USER" --gid-owner "$CORE_GROUP" -m tcp --dport "$PROXY_TCP_PORT" -j REJECT 2>/dev/null
-            ;;
-    esac
-}
-
-# Ping fix: DNAT FakeIP ICMP to loopback so ping works (returns response from 127.0.0.1)
-ping_fix() {
-    # Get FakeIP range - assumes load_flux_config has already run in main()
-    
-    case "$1" in
-        enable)
-            iptables -t nat -A OUTPUT -d "$FAKEIP_RANGE_V4" -p icmp -j DNAT --to-destination 127.0.0.1
-            iptables -t nat -A PREROUTING -d "$FAKEIP_RANGE_V4" -p icmp -j DNAT --to-destination 127.0.0.1
-            if [ "$PROXY_IPV6" = "1" ] && [ "${KFEAT_IPV6_NAT:-0}" -eq 1 ]; then
-                ip6tables -t nat -A OUTPUT -d "$FAKEIP_RANGE_V6" -p icmp -j DNAT --to-destination ::1
-                ip6tables -t nat -A PREROUTING -d "$FAKEIP_RANGE_V6" -p icmp -j DNAT --to-destination ::1
-            fi
-            log_debug "Ping fix enabled for FakeIP range ($FAKEIP_RANGE_V4)"
-            ;;
-        disable)
-            iptables -t nat -D OUTPUT -d "$FAKEIP_RANGE_V4" -p icmp -j DNAT --to-destination 127.0.0.1 2>/dev/null
-            iptables -t nat -D PREROUTING -d "$FAKEIP_RANGE_V4" -p icmp -j DNAT --to-destination 127.0.0.1 2>/dev/null
-            if [ "$PROXY_IPV6" = "1" ]; then
-                ip6tables -t nat -D OUTPUT -d "$FAKEIP_RANGE_V6" -p icmp -j DNAT --to-destination ::1 2>/dev/null
-                ip6tables -t nat -D PREROUTING -d "$FAKEIP_RANGE_V6" -p icmp -j DNAT --to-destination ::1 2>/dev/null
-            fi
-            log_debug "Ping fix disabled"
-            ;;
-    esac
-}
-
 # Start IP address monitor daemon for dynamic anti-loopback
 start_ip_monitor() {
-    local monitor_script="$MONITOR_SCRIPT"
-    
-    if [ -x "$monitor_script" ] || [ -f "$monitor_script" ]; then
-        chmod +x "$monitor_script" 2>/dev/null
-        # Start in background, detached from terminal
-        nohup sh "$monitor_script" start >/dev/null 2>&1 &
-        log_debug "IP monitor daemon started"
-    else
-        log_debug "IP monitor script not found, skipping"
-    fi
+    [ -f "$MONITOR_SCRIPT" ] && nohup sh "$MONITOR_SCRIPT" start >/dev/null 2>&1 &
 }
 
 # Stop IP address monitor daemon
 stop_ip_monitor() {
-    local monitor_script="$MONITOR_SCRIPT"
-    
-    if [ -x "$monitor_script" ] || [ -f "$monitor_script" ]; then
-        sh "$monitor_script" stop 2>/dev/null
-    fi
-    
-    # Fallback: kill by pattern
-    pkill -f "flux.ip.monitor" 2>/dev/null || true
-    pkill -f "ip monitor address" 2>/dev/null || true
-    log_debug "IP monitor daemon stopped"
+    [ -f "$MONITOR_SCRIPT" ] && sh "$MONITOR_SCRIPT" stop 2>/dev/null || true
 }
 
 main() {
-    # Config is inherited from start.sh via environment
-    load_kernel_cache 2>/dev/null || true
-    
-    # Export PROXY_MODE for ipmonitor subprocess
-    export PROXY_MODE
-    
-    detect_proxy_mode
-    
     local action="${1:-}"
     
     case "$action" in

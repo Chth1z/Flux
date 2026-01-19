@@ -87,6 +87,9 @@ main() {
     # Launch module toggle watcher (always active for reactive control)
     start_inotify_module
     
+    # Reset service state on boot (preserves persistent data like last_update)
+    state_init
+    
     # Check if module is disabled
     if [ -f "$MAGISK_MOD_DIR/disable" ]; then
         log_info "Module is disabled, skipping service start"

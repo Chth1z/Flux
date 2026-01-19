@@ -270,9 +270,18 @@ EOF
     
     # DNS hijack (placeholder - actual rules depend on mode)
     if [ "$DNS_HIJACK_ENABLE" -ne 0 ]; then
-        if [ "$mode" = "tproxy" ] && [ "$DNS_HIJACK_ENABLE" -ne 2 ]; then
-            echo "-A DNS_HIJACK_PRE${suffix} -j RETURN"
-            echo "-A DNS_HIJACK_OUT${suffix} -j RETURN"
+        if [ "$mode" = "tproxy" ]; then
+            if [ "$DNS_HIJACK_ENABLE" -eq 2 ]; then
+                # Mode 2 (Redirect): Must ACCEPT in mangle table so packet reaches NAT table
+                echo "-A DNS_HIJACK_PRE${suffix} -p udp --dport 53 -j ACCEPT"
+                echo "-A DNS_HIJACK_PRE${suffix} -p tcp --dport 53 -j ACCEPT"
+                echo "-A DNS_HIJACK_OUT${suffix} -p udp --dport 53 -j ACCEPT"
+                echo "-A DNS_HIJACK_OUT${suffix} -p tcp --dport 53 -j ACCEPT"
+            else
+                # Mode 1 (TPROXY): Just return to let TPROXY catch it
+                echo "-A DNS_HIJACK_PRE${suffix} -j RETURN"
+                echo "-A DNS_HIJACK_OUT${suffix} -j RETURN"
+            fi
         fi
     fi
     
@@ -305,75 +314,297 @@ EOF
 # [ Public Interface - Rule Generation ]
 # ==============================================================================
 
-# Generate and cache IPv4 rules
-# Usage: generate_rules_ipv4 <mode>
-# mode: "tproxy" or "redirect"
-generate_rules_ipv4() {
-    local mode="${1:-tproxy}"
+# Generate all rules for a given family (merged into single cache file)
+# All tables (mangle/nat + filter + nat extra) combined
+_generate_all_rules() {
+    local family="$1"
+    local mode="$2"
     
-    _init_kernel_features
-    _build_proxy_rules "4" "$mode" > "$CACHE_RULES_V4_FILE"
-    
-    log_debug "IPv4 rules cached to $CACHE_RULES_V4_FILE"
+    # Output all setup rules to single file
+    {
+        # 1. Main proxy rules (mangle or nat table)
+        _build_proxy_rules "$family" "$mode"
+        
+        # 2. Filter table rules (loopback block)
+        _build_loopback_block_rules "$family"
+        
+        # 3. NAT extra rules (ping fix + DNS redirect2)
+        _build_nat_extra_rules "$family"
+    }
 }
 
-# Generate and cache IPv6 rules
-# Usage: generate_rules_ipv6 <mode>
-# mode: "tproxy" or "redirect"
-generate_rules_ipv6() {
-    local mode="${1:-tproxy}"
+# Generate all cleanup rules for a given family (merged into single file)
+_generate_all_cleanup_rules() {
+    local family="$1"
+    local mode="$2"
     
-    _init_kernel_features
-    _build_proxy_rules "6" "$mode" > "$CACHE_RULES_V6_FILE"
-    
-    log_debug "IPv6 rules cached to $CACHE_RULES_V6_FILE"
+    # Output all cleanup rules to single file
+    {
+        # 1. Main proxy cleanup (mangle or nat table)
+        _build_cleanup_rules "$family" "$mode"
+        
+        # 2. Filter table cleanup (loopback block)
+        _build_loopback_block_cleanup_rules "$family"
+        
+        # 3. NAT extra cleanup (ping fix + DNS redirect2)
+        _build_nat_extra_cleanup_rules "$family"
+    }
 }
 
-# Save rules cache for both IPv4 and IPv6
+# Save all rules cache - SINGLE ENTRY POINT
 # Mode is auto-detected from kernel features
+# This is the ONLY function that should be called externally
 save_rules_cache() {
-    # Auto-detect mode based on kernel TPROXY support
+    # Initialize kernel features ONCE
+    _init_kernel_features
+    
+    # Auto-detect mode based on kernel TPROXY support and configuration
     local mode="tproxy"
-    [ "${KFEAT_TPROXY:-0}" -eq 0 ] && mode="redirect"
-    
-    generate_rules_ipv4 "$mode"
-    
-    if [ "$PROXY_IPV6" -eq 1 ]; then
-        generate_rules_ipv6 "$mode"
+    # Fallback to redirect if TPROXY not supported OR if PROXY_MODE=2 (REDIRECT forced)
+    if [ "${KFEAT_TPROXY:-0}" -eq 0 ] || [ "${PROXY_MODE:-0}" -eq 2 ]; then
+        mode="redirect"
     fi
     
-    log_debug "Rules cache saved (mode: $mode)"
+    mkdir -p "$(dirname "$CACHE_RULES_V4_FILE")"
+    
+    # Generate IPv4 rules (always)
+    _generate_all_rules "4" "$mode" > "$CACHE_RULES_V4_FILE"
+    _generate_all_cleanup_rules "4" "$mode" > "$CACHE_CLEANUP_V4_FILE"
+    log_debug "IPv4 rules cached"
+    
+    # Generate IPv6 rules (if enabled)
+    if [ "$PROXY_IPV6" -eq 1 ]; then
+        _generate_all_rules "6" "$mode" > "$CACHE_RULES_V6_FILE"
+        _generate_all_cleanup_rules "6" "$mode" > "$CACHE_CLEANUP_V6_FILE"
+        log_debug "IPv6 rules cached"
+    fi
+    
+    log_debug "All rules cache saved (mode: $mode)"
 }
 
 
 # ==============================================================================
-# [ Public Interface - Rule Loading ]
+# [ Filter Table Rules - Loopback Block ]
 # ==============================================================================
 
-# Load cached IPv4 rules
-# Returns: rules content or empty if cache not found
-load_cached_rules_ipv4() {
-    if [ -f "$CACHE_RULES_V4_FILE" ]; then
-        cat "$CACHE_RULES_V4_FILE"
-    fi
+# Build loopback block rules (filter table)
+# Prevents proxy core from connecting to its own proxy port (infinite loop prevention)
+_build_loopback_block_rules() {
+    local family="$1"
+    local loopback_addr="127.0.0.1"
+    
+    [ "$family" = "6" ] && loopback_addr="::1"
+    
+    # Only generate if owner match is available
+    [ "${_KFEAT_OWNER:-0}" -eq 0 ] && return 0
+    
+    cat <<EOF
+*filter
+-A OUTPUT -d ${loopback_addr} -p tcp -m owner --uid-owner ${CORE_USER} --gid-owner ${CORE_GROUP} -m tcp --dport ${PROXY_TCP_PORT} -j REJECT
+COMMIT
+EOF
 }
 
-# Load cached IPv6 rules
-# Returns: rules content or empty if cache not found
-load_cached_rules_ipv6() {
-    if [ -f "$CACHE_RULES_V6_FILE" ]; then
-        cat "$CACHE_RULES_V6_FILE"
-    fi
+# Build loopback block cleanup rules
+_build_loopback_block_cleanup_rules() {
+    local family="$1"
+    local loopback_addr="127.0.0.1"
+    
+    [ "$family" = "6" ] && loopback_addr="::1"
+    
+    [ "${_KFEAT_OWNER:-0}" -eq 0 ] && return 0
+    
+    cat <<EOF
+*filter
+-D OUTPUT -d ${loopback_addr} -p tcp -m owner --uid-owner ${CORE_USER} --gid-owner ${CORE_GROUP} -m tcp --dport ${PROXY_TCP_PORT} -j REJECT
+COMMIT
+EOF
 }
 
-# Check if rules cache exists and is valid
-check_rules_cache_valid() {
-    [ -f "$CACHE_RULES_V4_FILE" ] || return 1
+
+# ==============================================================================
+# [ NAT Extra Rules - Ping Fix + DNS Redirect2 ]
+# ==============================================================================
+
+# Build ping fix rules (NAT table)
+# DNAT FakeIP ICMP to loopback so ping works
+_build_ping_fix_rules() {
+    local family="$1"
+    local fakeip_range="$FAKEIP_RANGE_V4"
+    local loopback_addr="127.0.0.1"
     
-    # If IPv6 is enabled, check IPv6 cache too
-    if [ "$PROXY_IPV6" -eq 1 ]; then
-        [ -f "$CACHE_RULES_V6_FILE" ] || return 1
+    [ "$family" = "6" ] && { 
+        fakeip_range="$FAKEIP_RANGE_V6"
+        loopback_addr="::1"
+        # Skip IPv6 if NAT not supported
+        [ "${KFEAT_IPV6_NAT:-0}" -eq 0 ] && return 0
+    }
+    
+    cat <<EOF
+-A OUTPUT -d ${fakeip_range} -p icmp -j DNAT --to-destination ${loopback_addr}
+-A PREROUTING -d ${fakeip_range} -p icmp -j DNAT --to-destination ${loopback_addr}
+EOF
+}
+
+# Build ping fix cleanup rules
+_build_ping_fix_cleanup_rules() {
+    local family="$1"
+    local fakeip_range="$FAKEIP_RANGE_V4"
+    local loopback_addr="127.0.0.1"
+    
+    [ "$family" = "6" ] && { 
+        fakeip_range="$FAKEIP_RANGE_V6"
+        loopback_addr="::1"
+        [ "${KFEAT_IPV6_NAT:-0}" -eq 0 ] && return 0
+    }
+    
+    cat <<EOF
+-D OUTPUT -d ${fakeip_range} -p icmp -j DNAT --to-destination ${loopback_addr}
+-D PREROUTING -d ${fakeip_range} -p icmp -j DNAT --to-destination ${loopback_addr}
+EOF
+}
+
+# Build DNS redirect2 rules (NAT table)
+# DNS hijacking using NAT REDIRECT (mode 2)
+_build_dns_redirect2_rules() {
+    local family="$1"
+    local suffix=""
+    
+    [ "$family" = "6" ] && { 
+        suffix="6"
+        # Skip IPv6 if NAT not supported
+        [ "${KFEAT_IPV6_NAT:-0}" -eq 0 ] && return 0
+    }
+    
+    # Only generate if DNS_HIJACK_ENABLE is set to 2 (redirect2 mode)
+    [ "${DNS_HIJACK_ENABLE:-0}" -ne 2 ] && return 0
+    
+    cat <<EOF
+:NAT_DNS_HIJACK${suffix} - [0:0]
+-A NAT_DNS_HIJACK${suffix} -p tcp --dport 53 -j REDIRECT --to-ports ${DNS_PORT}
+-A NAT_DNS_HIJACK${suffix} -p udp --dport 53 -j REDIRECT --to-ports ${DNS_PORT}
+EOF
+
+    # Interface hooks
+    [ "$PROXY_MOBILE" -eq 1 ] && echo "-A PREROUTING -i ${MOBILE_INTERFACE} -j NAT_DNS_HIJACK${suffix}"
+    [ "$PROXY_WIFI" -eq 1 ] && echo "-A PREROUTING -i ${WIFI_INTERFACE} -j NAT_DNS_HIJACK${suffix}"
+    [ "$PROXY_USB" -eq 1 ] && echo "-A PREROUTING -i ${USB_INTERFACE} -j NAT_DNS_HIJACK${suffix}"
+    
+    # Output chain bypass for core and hook
+    cat <<EOF
+-A OUTPUT -p udp --dport 53 -m owner --uid-owner ${CORE_USER} --gid-owner ${CORE_GROUP} -j ACCEPT
+-A OUTPUT -p tcp --dport 53 -m owner --uid-owner ${CORE_USER} --gid-owner ${CORE_GROUP} -j ACCEPT
+-A OUTPUT -j NAT_DNS_HIJACK${suffix}
+EOF
+}
+
+# Build combined NAT extra rules (ping fix + DNS redirect2)
+_build_nat_extra_rules() {
+    local family="$1"
+    
+    # Skip IPv6 if NAT not supported to avoid declaring *nat table
+    if [ "$family" = "6" ] && [ "${KFEAT_IPV6_NAT:-0}" -eq 0 ]; then
+        return 0
     fi
     
-    return 0
+    cat <<EOF
+*nat
+EOF
+    _build_ping_fix_rules "$family"
+    _build_dns_redirect2_rules "$family"
+    echo "COMMIT"
 }
+
+# Build NAT extra cleanup rules
+_build_nat_extra_cleanup_rules() {
+    local family="$1"
+    
+    # Skip IPv6 if NAT not supported
+    if [ "$family" = "6" ] && [ "${KFEAT_IPV6_NAT:-0}" -eq 0 ]; then
+        return 0
+    fi
+    
+    cat <<EOF
+*nat
+EOF
+    _build_ping_fix_cleanup_rules "$family"
+    _build_dns_redirect2_cleanup_rules "$family"
+    echo "COMMIT"
+}
+
+# Build DNS redirect2 cleanup rules
+_build_dns_redirect2_cleanup_rules() {
+    local family="$1"
+    local suffix=""
+    
+    [ "$family" = "6" ] && { 
+        suffix="6"
+        [ "${KFEAT_IPV6_NAT:-0}" -eq 0 ] && return 0
+    }
+    
+    [ "${DNS_HIJACK_ENABLE:-0}" -ne 2 ] && return 0
+    
+    # Unhook from main chains
+    [ "$PROXY_MOBILE" -eq 1 ] && echo "-D PREROUTING -i ${MOBILE_INTERFACE} -j NAT_DNS_HIJACK${suffix}"
+    [ "$PROXY_WIFI" -eq 1 ] && echo "-D PREROUTING -i ${WIFI_INTERFACE} -j NAT_DNS_HIJACK${suffix}"
+    [ "$PROXY_USB" -eq 1 ] && echo "-D PREROUTING -i ${USB_INTERFACE} -j NAT_DNS_HIJACK${suffix}"
+    
+    cat <<EOF
+-D OUTPUT -p udp --dport 53 -m owner --uid-owner ${CORE_USER} --gid-owner ${CORE_GROUP} -j ACCEPT
+-D OUTPUT -p tcp --dport 53 -m owner --uid-owner ${CORE_USER} --gid-owner ${CORE_GROUP} -j ACCEPT
+-D OUTPUT -j NAT_DNS_HIJACK${suffix}
+-F NAT_DNS_HIJACK${suffix}
+-X NAT_DNS_HIJACK${suffix}
+EOF
+}
+
+
+# ==============================================================================
+# [ Cleanup Rules Generation ]
+# ==============================================================================
+
+# Chain list constant (shared between setup and cleanup)
+readonly PROXY_CHAINS="PROXY_PREROUTING PROXY_OUTPUT BYPASS_IP BYPASS_INTERFACE PROXY_INTERFACE DNS_HIJACK_PRE DNS_HIJACK_OUT APP_CHAIN MAC_CHAIN"
+
+# Build cleanup rules for iptables-restore (atomic cleanup)
+# This generates explicit -D (unhook) and -F (flush) rules
+_build_cleanup_rules() {
+    local family="$1"
+    local mode="$2"
+    local suffix=""
+    [ "$family" = "6" ] && suffix="6"
+    
+    local table="mangle"
+    [ "$mode" = "redirect" ] && table="nat"
+    
+    cat <<EOF
+*${table}
+# Unhook from main chains (order matters: must be before -X)
+-D PREROUTING -p tcp -j PROXY_PREROUTING${suffix}
+-D PREROUTING -p udp -j PROXY_PREROUTING${suffix}
+-D OUTPUT -p tcp -j PROXY_OUTPUT${suffix}
+-D OUTPUT -p udp -j PROXY_OUTPUT${suffix}
+# Flush all custom chains
+-F PROXY_PREROUTING${suffix}
+-F PROXY_OUTPUT${suffix}
+-F BYPASS_IP${suffix}
+-F BYPASS_INTERFACE${suffix}
+-F PROXY_INTERFACE${suffix}
+-F DNS_HIJACK_PRE${suffix}
+-F DNS_HIJACK_OUT${suffix}
+-F APP_CHAIN${suffix}
+-F MAC_CHAIN${suffix}
+# Delete all custom chains
+-X PROXY_PREROUTING${suffix}
+-X PROXY_OUTPUT${suffix}
+-X BYPASS_IP${suffix}
+-X BYPASS_INTERFACE${suffix}
+-X PROXY_INTERFACE${suffix}
+-X DNS_HIJACK_PRE${suffix}
+-X DNS_HIJACK_OUT${suffix}
+-X APP_CHAIN${suffix}
+-X MAC_CHAIN${suffix}
+COMMIT
+EOF
+}
+

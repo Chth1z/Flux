@@ -395,6 +395,7 @@ KFEAT_IPSET=$(_check_feat IP_SET)
 KFEAT_IPV6_NAT=$(_check_feat IP6_NF_NAT)
 "
     
+    mkdir -p "$(dirname "$KERNEL_CACHE_FILE")"
     printf '%s' "$content" > "$KERNEL_CACHE_FILE"
     log_debug "Kernel Cache built"
     return 0

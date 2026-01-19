@@ -41,12 +41,14 @@ readonly PROP_FILE="$MAGISK_MOD_DIR/module.prop"
 readonly TEMPLATE_FILE="$TOOLS_DIR/base/singbox.json"
 readonly CONFIG_BACKUP="$CONF_DIR/config.json.bak"
 readonly COUNTRY_MAP_FILE="$TOOLS_DIR/base/country_map.json"
-# Cache Files
+# Cache Files (simplified: all rules merged into single files per family)
 readonly CACHE_META_FILE="$CACHE_DIR/cache_meta"
 readonly CACHE_CONFIG_FILE="$CACHE_DIR/cache_config"
 readonly CACHE_RULES_V4_FILE="$CACHE_DIR/cache_rules_ipv4"
 readonly CACHE_RULES_V6_FILE="$CACHE_DIR/cache_rules_ipv6"
-readonly IP_CACHE_FILE="$CACHE_DIR/cache_ip"
+readonly CACHE_CLEANUP_V4_FILE="$CACHE_DIR/cache_cleanup_ipv4"
+readonly CACHE_CLEANUP_V6_FILE="$CACHE_DIR/cache_cleanup_ipv6"
+
 readonly KERNEL_CACHE_FILE="$CACHE_DIR/cache_kernel"
 # State Files
 readonly LOCK_FILE="$FLUX_DIR/.flux.lock"

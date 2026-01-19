@@ -47,6 +47,9 @@ get_table() {
 # [ Sync Strategy ]
 # ==============================================================================
 
+# Global in-memory cache to avoid disk I/O race conditions
+MEM_CACHE=""
+
 # Sync all current IP addresses (Flush + Re-add)
 sync_all_addresses() {
     local table
@@ -134,8 +137,8 @@ $ipv6_list
 EOF
     fi
     
-    # Write cache all at once
-    printf '%s' "$cache_content" > "$IP_CACHE_FILE"
+    # Update memory cache ONLY (No disk write)
+    MEM_CACHE="$cache_content"
     
     log_debug "IP Cache synced: $count IPs"
 }
@@ -194,15 +197,15 @@ handle_event() {
         case "$ip_cidr" in 127.*) return ;; esac  # Skip loopback
     fi
     
-    local timestamp
-    timestamp=$(date '+%H:%M:%S')
+    local newline="
+"
     
     # Apply rule change
     if [ "$action" = "add" ]; then
-        # Check cache to avoid duplicates
-        if grep -qF "$ip_cidr" "$IP_CACHE_FILE" 2>/dev/null; then
-            return
-        fi
+        # Check in-memory cache first to avoid duplicate rules
+        case "$MEM_CACHE" in
+            *"${ip_cidr}${newline}"*) return ;;
+        esac
         
         # Add rules (exclude DNS port 53 to prevent leak)
         $cmd -t "$table" -A "$chain" -d "$ip_cidr" -p udp ! --dport 53 -j ACCEPT 2>/dev/null
@@ -214,15 +217,16 @@ handle_event() {
             $IPT -t nat -A LOCAL_IP -d "$ip_cidr" ! -p udp -j ACCEPT 2>/dev/null
         fi
         
-        # Update cache
-        echo "$ip_cidr" >> "$IP_CACHE_FILE"
+        # Update memory cache
+        MEM_CACHE="${MEM_CACHE}${ip_cidr}${newline}"
         log_debug "Added bypass: $ip_cidr"
         
     else
         # Check cache - if not in cache, rule wasn't added by us
-        if ! grep -qF "$ip_cidr" "$IP_CACHE_FILE" 2>/dev/null; then
-            return
-        fi
+        case "$MEM_CACHE" in
+            *"${ip_cidr}${newline}"*) ;;
+            *) return ;;
+        esac
         
         # Remove rules (both UDP and non-UDP)
         $cmd -t "$table" -D "$chain" -d "$ip_cidr" -p udp ! --dport 53 -j ACCEPT 2>/dev/null
@@ -234,16 +238,20 @@ handle_event() {
             $IPT -t nat -D LOCAL_IP -d "$ip_cidr" ! -p udp -j ACCEPT 2>/dev/null
         fi
         
-        # Update cache (remove entry - in-memory, no temp file)
-        local content="" line newline="
-"
-        while IFS= read -r line || [ -n "$line" ]; do
-            case "$line" in
-                "$ip_cidr") ;;  # Skip this entry
-                *) [ -n "$line" ] && content="${content}${line}${newline}" ;;
-            esac
-        done < "$IP_CACHE_FILE"
-        printf '%s' "$content" > "$IP_CACHE_FILE"
+        # Update memory cache (string manipulation, no file I/O)
+        # Rebuild cache without the deleted IP
+        local new_cache=""
+        local item
+        # Use IFS to iterate lines in MEM_CACHE
+        local IFS_OLD="$IFS"
+        IFS="$newline"
+        for item in $MEM_CACHE; do
+            if [ "$item" != "$ip_cidr" ] && [ -n "$item" ]; then
+                new_cache="${new_cache}${item}${newline}"
+            fi
+        done
+        IFS="$IFS_OLD"
+        MEM_CACHE="$new_cache"
         
         log_debug "Removed bypass: $ip_cidr"
     fi
@@ -252,8 +260,6 @@ handle_event() {
 # ==============================================================================
 # [ Main Monitor Loop ]
 # ==============================================================================
-
-SYNC_PID=""
 
 start_monitor() {
     log_info "Starting IPMonitor..."
@@ -267,17 +273,7 @@ start_monitor() {
     # Initial full sync of all addresses
     sync_all_addresses
     
-    # Start periodic sync in background
-    (
-        while true; do
-            sleep "$SYNC_INTERVAL"
-            log_debug "Periodic sync triggered"
-            sync_all_addresses
-        done
-    ) &
-    SYNC_PID=$!
-    
-    # Run ip monitor and process events
+    # Run ip monitor and process events (real-time, no periodic sync needed)
     ip monitor address 2>/dev/null | while read -r line; do
         handle_event "$line"
     done
@@ -286,9 +282,6 @@ start_monitor() {
 cleanup_monitor() {
     local table
     table=$(get_table)
-    
-    # Kill periodic sync process
-    [ -n "$SYNC_PID" ] && kill "$SYNC_PID" 2>/dev/null
     
     # Remove PID file
     rm -f "$MONITOR_PID_FILE" 2>/dev/null
@@ -308,41 +301,39 @@ cleanup_monitor() {
     $IP6T -t "$table" -F LOCAL_IP6 2>/dev/null
     $IP6T -t "$table" -X LOCAL_IP6 2>/dev/null
     
-    # Clean up cache file
-    rm -f "$IP_CACHE_FILE" "$IP_CACHE_FILE.tmp" 2>/dev/null
+    # Cache is in memory, no file to clean
     
     log_debug "Cleanup complete"
 }
 
 stop_monitor() {
-    # Check if daemon is running via PID file
-    if [ -f "$MONITOR_PID_FILE" ]; then
+    if [ -s "$MONITOR_PID_FILE" ]; then
         local pid
-        pid=$(cat "$MONITOR_PID_FILE" 2>/dev/null)
+        pid=$(cat "$MONITOR_PID_FILE")
         
-        # Kill daemon if running (cleanup happens via trap)
-        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-            log_debug "Stopping IPMonitor daemon (PID $pid)..."
+        if kill -0 "$pid" 2>/dev/null; then
+            log_debug "Stopping PID $pid"
             kill "$pid" 2>/dev/null
             
-            # Wait for graceful exit (and cleanup)
+            # Wait for graceful shutdown (max 1s)
             local wait_count=0
-            while kill -0 "$pid" 2>/dev/null && [ $wait_count -lt 20 ]; do
-                sleep 0.1
+            while kill -0 "$pid" 2>/dev/null && [ $wait_count -lt 2 ]; do
+                sleep 0.5
                 wait_count=$((wait_count + 1))
             done
-            return 0
+            
+            # Force kill if still running
+            if kill -0 "$pid" 2>/dev/null; then
+                log_debug "Force killing $pid"
+                kill -9 "$pid" 2>/dev/null
+            fi
         fi
+    else
+        # Fallback: kill by pattern
+        pkill -9 -f "ip monitor address" 2>/dev/null
     fi
     
-    # Fallback: Kill by pattern (if PID file missing or stale)
-    pkill -f "ip monitor address" 2>/dev/null || true
-    pkill -f "flux.ip.monitor start" 2>/dev/null || true
-    
-    # Force cleanup (only if we didn't kill a daemon via PID)
-    log_debug "Force cleaning up monitor state..."
-    cleanup_monitor
-    
+    rm -f "$MONITOR_PID_FILE" 2>/dev/null
     log_info "IPMonitor stopped"
 }
 

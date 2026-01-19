@@ -245,7 +245,6 @@ validate_environment() {
 }
 
 # Exit with error message and perform cleanup
-# Exit with error message and perform cleanup
 fatal() {
     cleanup_temp_files
     log_error "$1"

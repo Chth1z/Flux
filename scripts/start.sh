@@ -16,7 +16,7 @@ SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 . "$SCRIPT_DIR/flux.data"
 # flux.rules is sourced on-demand (cold boot only)
 
-export LOG_COMPONENT="Manager"
+export LOG_COMPONENT="Service"
 
 # Flux version (read from module.prop or fallback)
 FLUX_VERSION=$(grep "^version=" "$PROP_FILE" 2>/dev/null | cut -d= -f2)
@@ -287,7 +287,8 @@ main() {
     fi
 
     load_config_cache
-
+    load_kernel_cache
+    
     trap 'release_lock' EXIT
     
     local exit_code=0

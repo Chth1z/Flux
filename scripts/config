@@ -1,0 +1,300 @@
+#!/system/bin/sh
+
+# ==============================================================================
+# Flux Configuration Module (config)
+# Description: Configuration loading and validation
+# ==============================================================================
+
+
+# ==============================================================================
+# [ Config Loading - Data-Driven Approach ]
+# ==============================================================================
+
+_init_config_defaults() {
+    local line key default current
+    for line in \
+        "SUBSCRIPTION_URL:" \
+        "UPDATE_TIMEOUT:15" \
+        "UPDATE_INTERVAL:86400" \
+        "RETRY_COUNT:2" \
+        "LOG_LEVEL:3" \
+        "LOG_MAX_SIZE:1048576" \
+        "CORE_TIMEOUT:5" \
+        "CORE_USER:root" \
+        "CORE_GROUP:root" \
+        "ROUTING_MARK:" \
+        "PROXY_TCP_PORT:1536" \
+        "PROXY_UDP_PORT:1536" \
+        "PROXY_MODE:0" \
+        "DNS_HIJACK_ENABLE:1" \
+        "DNS_PORT:1053" \
+        "MOBILE_INTERFACE:rmnet_data+" \
+        "WIFI_INTERFACE:wlan0" \
+        "HOTSPOT_INTERFACE:wlan2" \
+        "USB_INTERFACE:rndis+" \
+        "PROXY_MOBILE:1" \
+        "PROXY_WIFI:1" \
+        "PROXY_HOTSPOT:0" \
+        "PROXY_USB:0" \
+        "PROXY_TCP:1" \
+        "PROXY_UDP:1" \
+        "PROXY_IPV6:0" \
+        "MARK_VALUE:20" \
+        "MARK_VALUE6:25" \
+        "TABLE_ID:2025" \
+        "APP_PROXY_ENABLE:0" \
+        "APP_PROXY_MODE:1" \
+        "PROXY_APPS_LIST:" \
+        "BYPASS_APPS_LIST:" \
+        "MAC_FILTER_ENABLE:0" \
+        "MAC_PROXY_MODE:1" \
+        "PROXY_MACS_LIST:" \
+        "BYPASS_MACS_LIST:" \
+        "SKIP_CHECK_FEATURE:0" \
+        "FAKEIP_RANGE_V4:198.18.0.0/15" \
+        "FAKEIP_RANGE_V6:fc00::/18"
+    do
+        key="${line%%:*}"
+        default="${line#*:}"
+        eval "current=\"\$$key\""
+        [ -z "$current" ] && eval "$key='$default'"
+    done
+}
+
+_load_config_json_values() {
+    local jq_bin="$TOOLS_DIR/jq"
+    [ ! -x "$jq_bin" ] || [ ! -f "$CONFIG_FILE" ] && return 1
+    
+    # robust jq extraction: wrap in [] to handle empty results, use | delimiter
+    local json_output
+    json_output=$("$jq_bin" -r '
+        [
+            ([.inbounds[] | select(.type=="tproxy")] | .[0].listen_port // ""),
+            ([.inbounds[] | select(.type=="mixed")] | .[0].listen_port // ""),
+            ([first(.dns.servers[] | select(.type=="fakeip")) | .inet4_range] | .[0] // ""),
+            ([first(.dns.servers[] | select(.type=="fakeip")) | .inet6_range] | .[0] // "")
+        ] | join("|")
+    ' "$CONFIG_FILE" 2>/dev/null) || return 0
+    
+    local tproxy_port mixed_port v4 v6
+    IFS='|' read -r tproxy_port mixed_port v4 v6 <<< "$json_output"
+    
+    if [ -n "$tproxy_port" ]; then
+        PROXY_TCP_PORT="$tproxy_port"
+        PROXY_UDP_PORT="$tproxy_port"
+    elif [ -n "$mixed_port" ]; then
+        PROXY_TCP_PORT="$mixed_port"
+        PROXY_UDP_PORT="$mixed_port"
+    fi
+    
+    # Assign with validation
+    case "$v4" in *"/"[0-9]*) FAKEIP_RANGE_V4="$v4" ;; esac
+    case "$v6" in *":"*"/"[0-9]*) FAKEIP_RANGE_V6="$v6" ;; esac
+}
+
+
+# ==============================================================================
+# [ Validation Result Tracking ]
+# ==============================================================================
+
+VALIDATION_ERRORS=""
+VALIDATION_WARNINGS=""
+VALIDATION_ERROR_COUNT=0
+VALIDATION_WARNING_COUNT=0
+
+_add_message() {
+    local type="$1" msg="$2"
+    case "$type" in
+        error)
+            VALIDATION_ERRORS="${VALIDATION_ERRORS:+${VALIDATION_ERRORS}\n}• ${msg}"
+            VALIDATION_ERROR_COUNT=$((VALIDATION_ERROR_COUNT + 1))
+            ;;
+        warning)
+            VALIDATION_WARNINGS="${VALIDATION_WARNINGS:+${VALIDATION_WARNINGS}\n}• ${msg}"
+            VALIDATION_WARNING_COUNT=$((VALIDATION_WARNING_COUNT + 1))
+            ;;
+    esac
+}
+
+add_error() { _add_message "error" "$1"; }
+add_warning() { _add_message "warning" "$1"; }
+
+reset_validation() {
+    VALIDATION_ERRORS=""
+    VALIDATION_WARNINGS=""
+    VALIDATION_ERROR_COUNT=0
+    VALIDATION_WARNING_COUNT=0
+}
+
+validation_passed() {
+    [ -z "$VALIDATION_ERRORS" ]
+}
+
+
+# ==============================================================================
+# [ Settings Validation ]
+# ==============================================================================
+
+validate_int() {
+    local name="$1" val="$2" min="$3" max="$4"
+    
+    case "$val" in
+        ''|*[!0-9]*)
+            add_error "$name: not a number ($val)"
+            return 1
+            ;;
+    esac
+    
+    if [ "$val" -lt "$min" ] || [ "$val" -gt "$max" ]; then
+        add_error "$name: out of range ($val, must be $min-$max)"
+        return 1
+    fi
+    
+    return 0
+}
+
+
+# ==============================================================================
+# [ Schema-Driven Validation ]
+# ==============================================================================
+
+VALIDATION_SCHEMA="
+LOG_LEVEL:0:4
+LOG_MAX_SIZE:10240:104857600
+UPDATE_TIMEOUT:1:300
+RETRY_COUNT:0:10
+UPDATE_INTERVAL:60:31536000
+CORE_TIMEOUT:1:60
+PROXY_TCP_PORT:1:65535
+PROXY_UDP_PORT:1:65535
+PROXY_MODE:0:2
+DNS_HIJACK_ENABLE:0:2
+PROXY_MOBILE:0:1
+PROXY_WIFI:0:1
+PROXY_HOTSPOT:0:1
+PROXY_USB:0:1
+PROXY_TCP:0:1
+PROXY_UDP:0:1
+PROXY_IPV6:0:1
+APP_PROXY_ENABLE:0:1
+APP_PROXY_MODE:1:2
+
+MAC_FILTER_ENABLE:0:1
+MAC_PROXY_MODE:1:2
+SKIP_CHECK_FEATURE:0:1
+"
+
+validate_settings() {
+    log_debug "Validating settings..."
+    local valid=0 name min max val
+    
+    printf '%s\n' "$VALIDATION_SCHEMA" | while IFS=: read -r name min max; do
+        [ -z "$name" ] && continue
+        eval "val=\$$name"
+        validate_int "$name" "$val" "$min" "$max" || valid=1
+    done
+    
+    [ $valid -eq 0 ] && log_debug "Settings validation passed"
+    return $valid
+}
+
+
+# ==============================================================================
+# [ Resource Validation ]
+# ==============================================================================
+
+readonly FILE_SCHEMA="
+SING_BOX_BIN:ex:sing-box binary
+CONFIG_FILE:e:config.json
+SETTINGS_FILE:w:settings.ini (using defaults)
+TPROXY_SCRIPT:e:flux.tproxy script
+"
+
+validate_files() {
+    log_debug "Validating required files..."
+    local valid=0 var type desc path
+    
+    printf '%s\n' "$FILE_SCHEMA" | while IFS=: read -r var type desc; do
+        [ -z "$var" ] && continue
+        eval "path=\$$var"
+        
+        if [ ! -f "$path" ]; then
+            case "$type" in
+                e|ex) add_error "$desc not found"; valid=1 ;;
+                w) add_warning "$desc not found" ;;
+            esac
+        elif [ "$type" = "ex" ] && [ ! -x "$path" ]; then
+            add_warning "$desc not executable, will attempt to fix"
+        fi
+    done
+    
+    return $valid
+}
+
+
+# ==============================================================================
+# [ sing-box Config Validation ]
+# ==============================================================================
+
+validate_singbox_config() {
+    log_debug "Validating sing-box configuration..."
+    
+    if [ -f "$SING_BOX_BIN" ] && [ ! -x "$SING_BOX_BIN" ]; then
+        chmod +x "$SING_BOX_BIN" 2>/dev/null
+    fi
+    
+    if [ ! -x "$SING_BOX_BIN" ]; then
+        add_error "sing-box binary not executable"
+        return 1
+    fi
+    
+    local check_output
+    check_output=$("$SING_BOX_BIN" check -c "$CONFIG_FILE" -D "$RUN_DIR" 2>&1)
+    local check_result=$?
+    
+    if [ $check_result -ne 0 ]; then
+        add_error "sing-box config invalid: $check_output"
+        return 1
+    fi
+    
+    log_debug "sing-box configuration valid"
+    return 0
+}
+
+
+# ==============================================================================
+# [ Main Validation Entry Point ]
+# ==============================================================================
+
+validate_all() {
+    log_info "Validating environment..."
+    
+    reset_validation
+
+    validate_files
+    validate_settings
+    validate_singbox_config
+    
+    if [ -n "$VALIDATION_WARNINGS" ]; then
+        log_warn "Validation warnings:\n$VALIDATION_WARNINGS"
+    fi
+    
+    if [ -n "$VALIDATION_ERRORS" ]; then
+        log_error "Validation failed:\n$VALIDATION_ERRORS"
+        return 1
+    fi
+    
+    log_info "Validation passed"
+    return 0
+}
+
+load_flux_config() {
+    if [ -f "$SETTINGS_FILE" ]; then
+        set -a
+        . "$SETTINGS_FILE"
+        set +a
+    fi
+    
+    _init_config_defaults
+    _load_config_json_values
+}

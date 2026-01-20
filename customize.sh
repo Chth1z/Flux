@@ -30,6 +30,13 @@ readonly RUN_DIR="$FLUX_DIR/run"
 readonly TOOLS_DIR="$FLUX_DIR/tools"
 readonly MODPROP="$MODPATH/module.prop"
 
+# Detect service.d path (KSU <10683 uses different path)
+if [ "$KSU" = "true" ] && [ "$KSU_VER_CODE" -lt 10683 ]; then
+    SERVICE_DIR="/data/adb/ksu/service.d"
+else
+    SERVICE_DIR="/data/adb/service.d"
+fi
+
 # ==============================================================================
 # [ Helper Functions ]
 # ==============================================================================
@@ -236,7 +243,11 @@ main() {
     # 2. Extract module files to MODPATH (for Magisk)
     # Note: META-INF is handled automatically by Magisk installer, do not extract manually
     ui_print "- Extracting module files..."
-    unzip -o "$ZIPFILE" 'module.prop' 'service.sh' 'webroot/*' -d "$MODPATH" >&2
+    unzip -o "$ZIPFILE" 'module.prop' 'webroot/*' -d "$MODPATH" >&2
+    
+    # Deploy flux_service.sh to service.d
+    mkdir -p "$SERVICE_DIR"
+    unzip -o "$ZIPFILE" 'flux_service.sh' -d "$SERVICE_DIR" >&2
     
     # 3. Clear and recreate FLUX_DIR structure (ensures clean install)
     ui_print "- Installing Flux core files..."
@@ -303,15 +314,15 @@ main() {
     ui_print "- Setting permissions..."
     set_perm_recursive "$MODPATH" 0 0 0755 0644
     set_perm_recursive "$FLUX_DIR" 0 0 0755 0644
+    set_perm_recursive "$BIN_DIR" 0 0 0755 0700
+    set_perm_recursive "$SCRIPTS_DIR" 0 0 0755 0700
+    set_perm_recursive "$TOOLS_DIR" 0 0 0755 0700
+    set_perm "$SERVICE_DIR/flux_service.sh" 0 0 0700
     
-    # Executables
-    set_perm_recursive "$BIN_DIR" 0 0 0755 0755
-    set_perm_recursive "$SCRIPTS_DIR" 0 0 0755 0755
-    chmod +x "$TOOLS_DIR/jq" 2>/dev/null
-    chmod +x "$TOOLS_DIR/subconverter" 2>/dev/null
-    
-    # RUN_DIR needs write access for runtime files
-    chmod 0755 "$RUN_DIR"
+    # Fallback: fix set_perm_recursive not working on some phones
+    chmod ugo+x "$BIN_DIR"/* 2>/dev/null
+    chmod ugo+x "$SCRIPTS_DIR"/* 2>/dev/null
+    chmod ugo+x "$TOOLS_DIR/jq" "$TOOLS_DIR/subconverter" 2>/dev/null
     
     # 6. Cleanup
     rm -rf "$TMP_BACKUP"

@@ -77,19 +77,17 @@ state_init() {
     _state_lock
     mkdir -p "$(dirname "$STATE_FILE")" 2>/dev/null
     
-    # 1. Read persistent data (Fast one-pass)
+    # Preserve only last_update from previous state
     local last_update=""
     if [ -f "$STATE_FILE" ]; then
         last_update=$(awk '/^last_update=/ {print $0; exit}' "$STATE_FILE" 2>/dev/null)
     fi
     
-    # 2. Write everything in one stream (Single I/O op)
-    {
-        echo "service=$STATE_STOPPED"
-        echo "core=$STATE_STOPPED"
-        echo "tproxy=$STATE_STOPPED"
-        [ -n "$last_update" ] && echo "$last_update"
-    } > "$STATE_FILE"
+    # Write minimal state file (only persistent data)
+    { [ -n "$last_update" ] && echo "$last_update"; } > "$STATE_FILE"
+    
+    # Clear any stale event files (EVENTS_DIR = MAGISK_MOD_DIR)
+    rm -f "$EVENTS_DIR/fail" "$EVENTS_DIR/core_ok" "$EVENTS_DIR/tproxy_ok" "$EVENTS_DIR/cache_ok" 2>/dev/null
     
     _state_unlock
     log_debug "State initialized"
@@ -144,8 +142,16 @@ set_state() {
 }
 
 # Convenience accessors
-get_service_state() { get_state "$COMP_SERVICE"; }
-set_service_state() { set_state "$COMP_SERVICE" "$1"; }
+# Service state is derived from fail file and disable file
+get_service_state() {
+    # Check for fail event file first
+    [ -f "$EVENTS_DIR/fail" ] && { echo "$STATE_FAILED"; return; }
+    # Check disable file (exists = stopped, not exists = running)
+    [ -f "$MAGISK_MOD_DIR/disable" ] && echo "$STATE_STOPPED" || echo "$STATE_RUNNING"
+}
+
+# Legacy compatibility
+set_service_state() { :; }  # No-op, state is derived
 get_component_state() { get_state "$1"; }
 set_component_state() { set_state "$1" "$2"; }
 

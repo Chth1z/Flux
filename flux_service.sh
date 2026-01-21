@@ -36,9 +36,16 @@ wait_for_boot() {
 # ==============================================================================
 
 start_inotify_module() {
-    [ -f "$INOTIFY_SCRIPT" ] && [ ! -x "$INOTIFY_SCRIPT" ] && chmod +x "$INOTIFY_SCRIPT" 2>/dev/null
-    pkill -f "inotifyd.*flux.mod.inotify" 2>/dev/null || true
-    inotifyd "$INOTIFY_SCRIPT" "$MAGISK_MOD_DIR:nd" &
+    [ -f "$DISPATCHER_SCRIPT" ] && [ ! -x "$DISPATCHER_SCRIPT" ] && chmod +x "$DISPATCHER_SCRIPT" 2>/dev/null
+    pkill -f "inotifyd.*dispatcher" 2>/dev/null || true
+    
+    # Single inotifyd monitors MAGISK_MOD_DIR for all events:
+    # n=new(create), d=delete, c=create, w=close_write
+    # Use 'dw' to avoid duplicate events on creation (n + w)
+    nohup inotifyd "$DISPATCHER_SCRIPT" "$MAGISK_MOD_DIR:dw" >/dev/null 2>&1 &
+    
+    # Wait for inotifyd to be ready
+    sleep 1
 }
 
 # Ensure scripts are executable
@@ -62,7 +69,8 @@ main() {
 
     [ -f "$MAGISK_MOD_DIR/disable" ] && exit 0
 
-    run "Start service" /system/bin/sh "$START_SCRIPT" start
+    # Trigger init directly (instead of through inotify)
+    run "Start service" /system/bin/sh "$INIT_SCRIPT"
 }
 
 main

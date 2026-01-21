@@ -30,6 +30,7 @@ readonly SETTINGS_FILE="$CONF_DIR/settings.ini"
 readonly PID_FILE="$RUN_DIR/sing-box.pid"
 readonly MONITOR_PID_FILE="$RUN_DIR/ipmonitor.pid"
 readonly LOG_FILE="$RUN_DIR/flux.log"
+readonly PROP_FILE="$MAGISK_MOD_DIR/module.prop"
 
 # ==============================================================================
 # [ Scripts ]
@@ -43,6 +44,12 @@ readonly CONFIG_SCRIPT="$SCRIPTS_DIR/config"
 readonly MONITOR_SCRIPT="$SCRIPTS_DIR/ipmonitor"
 readonly INOTIFY_SCRIPT="$SCRIPTS_DIR/inotify"
 readonly CACHE_SCRIPT="$SCRIPTS_DIR/cache"
+readonly DISPATCHER_SCRIPT="$SCRIPTS_DIR/dispatcher"
+readonly INIT_SCRIPT="$SCRIPTS_DIR/init"
+readonly IP_HANDLER_SCRIPT="$SCRIPTS_DIR/ip_handler"
+
+# Events directory - same as module dir so single inotifyd can monitor all
+readonly EVENTS_DIR="$MAGISK_MOD_DIR"
 
 # ==============================================================================
 # [ Temporary Files ]
@@ -56,7 +63,6 @@ readonly GENERATE_FILE="$TOOLS_DIR/generate.ini"
 # [ Module Files ]
 # ==============================================================================
 
-readonly PROP_FILE="$MAGISK_MOD_DIR/module.prop"
 readonly TEMPLATE_FILE="$TOOLS_DIR/base/singbox.json"
 readonly CONFIG_BACKUP="$CONF_DIR/config.json.bak"
 readonly COUNTRY_MAP_FILE="$TOOLS_DIR/base/country_map.json"

@@ -185,16 +185,22 @@ _prop_write() {
 
 # Build left part from state (accepts optional state parameter to avoid duplicate file reads)
 # Usage: _prop_build_left [state]
-#   - If state is provided, use it directly (when caller has flux.state loaded)
-#   - If not provided, read from STATE_FILE (standalone fallback)
+#   - If state is provided, use it directly
+#   - If not provided, derive from get_service_state()
 _prop_build_left() {
     local state="${1:-}"
     
-    # Fallback: read from file if state not provided
-    if [ -z "$state" ] && [ -f "$STATE_FILE" ]; then
-        state=$(grep "^service=" "$STATE_FILE" 2>/dev/null | tail -1 | cut -d= -f2)
+    # Fallback: derive state from files if not provided
+    if [ -z "$state" ]; then
+        # Check for fail event file first
+        if [ -f "$EVENTS_DIR/fail" ]; then
+            state="FAILED"
+        elif [ -f "$MAGISK_MOD_DIR/disable" ]; then
+            state="STOPPED"
+        else
+            state="RUNNING"
+        fi
     fi
-    [ -z "$state" ] && state="STOPPED"
     
     local emoji
     emoji=$(_get_state_emoji "$state")

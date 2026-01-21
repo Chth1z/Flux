@@ -1,0 +1,80 @@
+#!/system/bin/sh
+
+# ==============================================================================
+# Flux Initialization Script (init)
+# Description: Initialize environment, run updater, build cache, trigger startup
+# ==============================================================================
+
+SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+. "$SCRIPT_DIR/const"
+. "$SCRIPT_DIR/log"
+. "$SCRIPT_DIR/config"
+
+export LOG_COMPONENT="Init"
+
+# ==============================================================================
+# [ Environment Setup ]
+# ==============================================================================
+
+_init_dirs() {
+    mkdir -p "$RUN_DIR" "$CACHE_DIR"
+    chmod 0755 "$RUN_DIR"
+}
+
+_load_caches() {
+    [ -f "$CACHE_CONFIG_FILE" ] && { set -a; . "$CACHE_CONFIG_FILE"; set +a; }
+    [ -f "$KERNEL_CACHE_FILE" ] && { set -a; . "$KERNEL_CACHE_FILE"; set +a; }
+}
+
+# ==============================================================================
+# [ Update Check (from orchestrator.on_update_check) ]
+# ==============================================================================
+
+_check_update() {
+    [ ! -f "$UPDATE_SCRIPT" ] && return 0
+    log_debug "Checking for subscription updates"
+    sh "$UPDATE_SCRIPT" check || log_debug "Update check completed"
+}
+
+# ==============================================================================
+# [ Cache Check/Build (from orchestrator.on_init_cache) ]
+# ==============================================================================
+
+_init_cache() {
+    if ! sh "$CACHE_SCRIPT" check >/dev/null 2>&1; then
+        run "Build cache" sh "$CACHE_SCRIPT" build || return 1
+    fi
+    return 0
+}
+
+# ==============================================================================
+# [ Main Flow ]
+# ==============================================================================
+
+main() {
+    log_info "Initializing service..."
+    
+    # Setup directories
+    run "Create directories" _init_dirs || { touch "$EVENTS_DIR/fail"; exit 1; }
+    
+    # Rotate logs
+    rotate_log 2>/dev/null
+    
+    # Check for updates (before cache, as config may change)
+    _check_update
+    
+    # Build cache if needed
+    if ! _init_cache; then
+        touch "$EVENTS_DIR/fail"
+        exit 1
+    fi
+    
+    # Load cached config
+    _load_caches
+    
+    # Trigger next phase
+    log_debug "Init complete, triggering component startup"
+    touch "$EVENTS_DIR/cache_ok"
+}
+
+main

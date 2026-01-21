@@ -52,7 +52,8 @@ _init_config_defaults() {
         "BYPASS_MACS_LIST:" \
         "SKIP_CHECK_FEATURE:0" \
         "FAKEIP_RANGE_V4:198.18.0.0/15" \
-        "FAKEIP_RANGE_V6:fc00::/18"
+        "FAKEIP_RANGE_V6:fc00::/18" \
+        "IP_MONITOR_BATCH_INTERVAL:60"
     do
         key="${line%%:*}"
         default="${line#*:}"
@@ -178,10 +179,10 @@ PROXY_UDP:0:1
 PROXY_IPV6:0:1
 APP_PROXY_ENABLE:0:1
 APP_PROXY_MODE:1:2
-
 MAC_FILTER_ENABLE:0:1
 MAC_PROXY_MODE:1:2
 SKIP_CHECK_FEATURE:0:1
+IP_MONITOR_BATCH_INTERVAL:0:300
 "
 
 validate_settings() {

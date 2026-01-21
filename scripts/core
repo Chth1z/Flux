@@ -11,9 +11,12 @@
 
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 
-# Load dependencies (stateless - no flux.state needed)
+# Load dependencies
 . "$SCRIPT_DIR/const"
 . "$SCRIPT_DIR/log"
+
+# Load config cache (needed for SING_BOX_USER, etc.)
+[ -f "$CACHE_CONFIG_FILE" ] && { set -a; . "$CACHE_CONFIG_FILE"; set +a; }
 
 export LOG_COMPONENT="Singbox"
 
@@ -121,8 +124,9 @@ is_core_running() {
 # ==============================================================================
 
 start_core() {
-    run "Launch singbox" _launch_singbox || return 1
-    run "Core startup" _wait_for_ready || return 1
+    run "Launch singbox" _launch_singbox || { touch "$EVENTS_DIR/fail"; return 1; }
+    run "Core startup" _wait_for_ready || { touch "$EVENTS_DIR/fail"; return 1; }
+    touch "$EVENTS_DIR/core_ok"
     return 0
 }
 

@@ -2,7 +2,7 @@
 
 # ==============================================================================
 # Flux IP Monitor Daemon (ipmonitor)
-# Description: Monitors IP address changes dynamically (Optimized V2)
+# Description: Monitors IP address changes dynamically (Batch Processing V3)
 # ==============================================================================
 
 # ==============================================================================
@@ -14,6 +14,9 @@ SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 # Load dependencies
 . "$SCRIPT_DIR/const"
 . "$SCRIPT_DIR/log"
+
+# Load config cache (needed for PROXY_MODE, IP_MONITOR_BATCH_INTERVAL, etc.)
+[ -f "$CACHE_CONFIG_FILE" ] && { set -a; . "$CACHE_CONFIG_FILE"; set +a; }
 
 export LOG_COMPONENT="Monitor"
 
@@ -35,6 +38,9 @@ else
     PRIMARY_TABLE="mangle"
 fi
 
+# Batch processing interval (0 = immediate mode)
+BATCH_INTERVAL="${IP_MONITOR_BATCH_INTERVAL}"
+
 # ==============================================================================
 # [ Helper Functions ]
 # ==============================================================================
@@ -51,47 +57,18 @@ ipt_cmd() {
     fi
 }
 
-# Apply bypass rule (Single Rule Operation)
-# Usage: apply_bypass_rule <add|del> <4|6> <ip_cidr>
-apply_bypass_rule() {
-    local action="$1"
-    local proto="$2"
-    local ip="$3"
-    local flag
-
-    [ "$action" = "add" ] && flag="-A" || flag="-D"
-
-    # 1. Primary Operation (Mangle/Nat/Filter based on PRIMARY_TABLE)
-    # Exclude DNS port 53 to prevent leak
-    if [ "$proto" = "6" ]; then
-        [ "${PROXY_IPV6:-0}" -ne 1 ] && return
-        # Skip link-local and loopback
-        case "$ip" in fe80:*|::1*) return ;; esac
-
-        ipt_cmd 6 -t "$PRIMARY_TABLE" "$flag" LOCAL_IP6 -d "$ip" -p udp ! --dport 53 -j ACCEPT 2>/dev/null
-        ipt_cmd 6 -t "$PRIMARY_TABLE" "$flag" LOCAL_IP6 -d "$ip" ! -p udp -j ACCEPT 2>/dev/null
-    else
-        # Skip loopback
-        case "$ip" in 127.*) return ;; esac
-
-        ipt_cmd 4 -t "$PRIMARY_TABLE" "$flag" LOCAL_IP -d "$ip" -p udp ! --dport 53 -j ACCEPT 2>/dev/null
-        ipt_cmd 4 -t "$PRIMARY_TABLE" "$flag" LOCAL_IP -d "$ip" ! -p udp -j ACCEPT 2>/dev/null
-
-        # 2. Secondary Operation (TPROXY Compat)
-        # If using TPROXY (mangle), we ALSO need to add to NAT table for correct routing of local traffic
-        if [ "$PRIMARY_TABLE" = "mangle" ]; then
-            ipt_cmd 4 -t nat "$flag" LOCAL_IP -d "$ip" -p udp ! --dport 53 -j ACCEPT 2>/dev/null
-            ipt_cmd 4 -t nat "$flag" LOCAL_IP -d "$ip" ! -p udp -j ACCEPT 2>/dev/null
-        fi
-    fi
-}
-
 # ==============================================================================
 # [ Sync Strategy ]
 # ==============================================================================
 
 # Global in-memory cache for event de-duplication
 MEM_CACHE=""
+
+# Pending changes buffer for batch processing
+PENDING_ADD_V4=""
+PENDING_ADD_V6=""
+PENDING_DEL_V4=""
+PENDING_DEL_V6=""
 
 # Initial Sync: Use iptables-restore for O(1) performance
 sync_all_addresses() {
@@ -182,12 +159,147 @@ sync_all_addresses() {
 }
 
 # ==============================================================================
+# [ Batch Processing ]
+# ==============================================================================
+
+# Flush all pending changes using iptables-restore
+flush_pending_changes() {
+    # Skip if no pending changes
+    [ -z "$PENDING_ADD_V4" ] && [ -z "$PENDING_DEL_V4" ] && \
+    [ -z "$PENDING_ADD_V6" ] && [ -z "$PENDING_DEL_V6" ] && return 0
+    
+    local count=0
+    local newline="
+"
+    
+    # --- IPv4 Processing ---
+    if [ -n "$PENDING_ADD_V4" ] || [ -n "$PENDING_DEL_V4" ]; then
+        local restore_v4="*${PRIMARY_TABLE}
+"
+        local restore_v4_nat=""
+        [ "$PRIMARY_TABLE" = "mangle" ] && restore_v4_nat="*nat
+"
+        
+        # Process deletions first
+        local ip IFS_OLD="$IFS"
+        IFS="$newline"
+        for ip in $PENDING_DEL_V4; do
+            [ -z "$ip" ] && continue
+            restore_v4="${restore_v4}-D LOCAL_IP -d ${ip} -p udp ! --dport 53 -j ACCEPT
+-D LOCAL_IP -d ${ip} ! -p udp -j ACCEPT
+"
+            if [ "$PRIMARY_TABLE" = "mangle" ]; then
+                restore_v4_nat="${restore_v4_nat}-D LOCAL_IP -d ${ip} -p udp ! --dport 53 -j ACCEPT
+-D LOCAL_IP -d ${ip} ! -p udp -j ACCEPT
+"
+            fi
+            count=$((count + 1))
+        done
+        
+        # Process additions
+        for ip in $PENDING_ADD_V4; do
+            [ -z "$ip" ] && continue
+            restore_v4="${restore_v4}-A LOCAL_IP -d ${ip} -p udp ! --dport 53 -j ACCEPT
+-A LOCAL_IP -d ${ip} ! -p udp -j ACCEPT
+"
+            if [ "$PRIMARY_TABLE" = "mangle" ]; then
+                restore_v4_nat="${restore_v4_nat}-A LOCAL_IP -d ${ip} -p udp ! --dport 53 -j ACCEPT
+-A LOCAL_IP -d ${ip} ! -p udp -j ACCEPT
+"
+            fi
+            count=$((count + 1))
+        done
+        IFS="$IFS_OLD"
+        
+        # Commit IPv4
+        restore_v4="${restore_v4}COMMIT
+"
+        echo "$restore_v4" | iptables-restore --noflush $IPT_OPTS 2>/dev/null
+        
+        if [ -n "$restore_v4_nat" ]; then
+            restore_v4_nat="${restore_v4_nat}COMMIT
+"
+            echo "$restore_v4_nat" | iptables-restore --noflush $IPT_OPTS 2>/dev/null
+        fi
+    fi
+    
+    # --- IPv6 Processing ---
+    if [ "${PROXY_IPV6:-0}" -eq 1 ] && { [ -n "$PENDING_ADD_V6" ] || [ -n "$PENDING_DEL_V6" ]; }; then
+        local restore_v6="*${PRIMARY_TABLE}
+"
+        local ip IFS_OLD="$IFS"
+        IFS="$newline"
+        
+        # Process deletions
+        for ip in $PENDING_DEL_V6; do
+            [ -z "$ip" ] && continue
+            restore_v6="${restore_v6}-D LOCAL_IP6 -d ${ip} -p udp ! --dport 53 -j ACCEPT
+-D LOCAL_IP6 -d ${ip} ! -p udp -j ACCEPT
+"
+            count=$((count + 1))
+        done
+        
+        # Process additions
+        for ip in $PENDING_ADD_V6; do
+            [ -z "$ip" ] && continue
+            restore_v6="${restore_v6}-A LOCAL_IP6 -d ${ip} -p udp ! --dport 53 -j ACCEPT
+-A LOCAL_IP6 -d ${ip} ! -p udp -j ACCEPT
+"
+            count=$((count + 1))
+        done
+        IFS="$IFS_OLD"
+        
+        restore_v6="${restore_v6}COMMIT
+"
+        echo "$restore_v6" | ip6tables-restore --noflush $IPT_OPTS 2>/dev/null
+    fi
+    
+    # Clear pending buffers
+    PENDING_ADD_V4="" PENDING_DEL_V4=""
+    PENDING_ADD_V6="" PENDING_DEL_V6=""
+    
+    [ $count -gt 0 ] && log_debug "Batch applied $count IP changes"
+}
+
+# Apply bypass rule immediately (for immediate mode)
+# Usage: apply_bypass_rule <add|del> <4|6> <ip_cidr>
+apply_bypass_rule() {
+    local action="$1"
+    local proto="$2"
+    local ip="$3"
+    local flag
+
+    [ "$action" = "add" ] && flag="-A" || flag="-D"
+
+    if [ "$proto" = "6" ]; then
+        [ "${PROXY_IPV6:-0}" -ne 1 ] && return
+        case "$ip" in fe80:*|::1*) return ;; esac
+
+        ipt_cmd 6 -t "$PRIMARY_TABLE" "$flag" LOCAL_IP6 -d "$ip" -p udp ! --dport 53 -j ACCEPT 2>/dev/null
+        ipt_cmd 6 -t "$PRIMARY_TABLE" "$flag" LOCAL_IP6 -d "$ip" ! -p udp -j ACCEPT 2>/dev/null
+    else
+        case "$ip" in 127.*) return ;; esac
+
+        ipt_cmd 4 -t "$PRIMARY_TABLE" "$flag" LOCAL_IP -d "$ip" -p udp ! --dport 53 -j ACCEPT 2>/dev/null
+        ipt_cmd 4 -t "$PRIMARY_TABLE" "$flag" LOCAL_IP -d "$ip" ! -p udp -j ACCEPT 2>/dev/null
+
+        if [ "$PRIMARY_TABLE" = "mangle" ]; then
+            ipt_cmd 4 -t nat "$flag" LOCAL_IP -d "$ip" -p udp ! --dport 53 -j ACCEPT 2>/dev/null
+            ipt_cmd 4 -t nat "$flag" LOCAL_IP -d "$ip" ! -p udp -j ACCEPT 2>/dev/null
+        fi
+    fi
+}
+
+# ==============================================================================
 # [ Event Handling ]
 # ==============================================================================
 
+# Parse and handle IP change event
+# In batch mode: collects to pending buffer
+# In immediate mode: applies directly
 handle_event() {
     local line="$1"
-    [ -z "$line" ] && return
+    [ -z "$line" ] && return 1
     
     local action="add"
     local family=""
@@ -198,7 +310,7 @@ handle_event() {
         Deleted*inet\ *) action="del"; family="4"; line="${line#Deleted }" ;;
         *inet6*) family="6" ;;
         *inet\ *) family="4" ;;
-        *) return ;;
+        *) return 1 ;;
     esac
     
     # Fast extraction
@@ -208,22 +320,28 @@ handle_event() {
             */*) ip_cidr="$token"; break ;;
         esac
     done
-    [ -z "$ip_cidr" ] && return # Valid CIDR required
+    [ -z "$ip_cidr" ] && return 1
+    
+    # Filter out special addresses
+    case "$family" in
+        4) case "$ip_cidr" in 127.*) return 1 ;; esac ;;
+        6) case "$ip_cidr" in fe80:*|::1*) return 1 ;; esac
+           [ "${PROXY_IPV6:-0}" -ne 1 ] && return 1 ;;
+    esac
     
     # Cache Check & Update
     local newline="
 "
     if [ "$action" = "add" ]; then
-        case "$MEM_CACHE" in *"${ip_cidr}${newline}"*) return ;; esac
+        case "$MEM_CACHE" in *"${ip_cidr}${newline}"*) return 1 ;; esac
         MEM_CACHE="${MEM_CACHE}${ip_cidr}${newline}"
         log_debug "IP Add: $ip_cidr"
     else
-        case "$MEM_CACHE" in *"${ip_cidr}${newline}"*) ;; *) return ;; esac
+        case "$MEM_CACHE" in *"${ip_cidr}${newline}"*) ;; *) return 1 ;; esac
         
-        # Remove from cache (String manipulation)
-        local new_cache=""
-        local item
-        local IFS_OLD="$IFS"; IFS="$newline"
+        # Remove from cache
+        local new_cache="" item IFS_OLD="$IFS"
+        IFS="$newline"
         for item in $MEM_CACHE; do
             [ "$item" != "$ip_cidr" ] && [ -n "$item" ] && new_cache="${new_cache}${item}${newline}"
         done
@@ -232,8 +350,25 @@ handle_event() {
         log_debug "IP Del: $ip_cidr"
     fi
     
-    # Apply Rule
-    apply_bypass_rule "$action" "$family" "$ip_cidr"
+    # Batch mode: collect to pending buffer
+    if [ "$BATCH_INTERVAL" -gt 0 ]; then
+        if [ "$action" = "add" ]; then
+            case "$family" in
+                4) PENDING_ADD_V4="${PENDING_ADD_V4}${ip_cidr}${newline}" ;;
+                6) PENDING_ADD_V6="${PENDING_ADD_V6}${ip_cidr}${newline}" ;;
+            esac
+        else
+            case "$family" in
+                4) PENDING_DEL_V4="${PENDING_DEL_V4}${ip_cidr}${newline}" ;;
+                6) PENDING_DEL_V6="${PENDING_DEL_V6}${ip_cidr}${newline}" ;;
+            esac
+        fi
+    else
+        # Immediate mode: apply directly
+        apply_bypass_rule "$action" "$family" "$ip_cidr"
+    fi
+    
+    return 0
 }
 
 
@@ -242,15 +377,30 @@ handle_event() {
 # ==============================================================================
 
 start_monitor() {
-    log_info "Starting IP Monitor..."
+    log_info "Starting IP Monitor (batch=${BATCH_INTERVAL}s)..."
 
-    trap 'cleanup_monitor; exit 0' EXIT INT TERM
+    trap 'flush_pending_changes; cleanup_monitor; exit 0' EXIT INT TERM
     
     run "Syncing local IPs" sync_all_addresses
     
-    ip monitor address 2>/dev/null | while read -r line; do
-        handle_event "$line"
-    done
+    if [ "$BATCH_INTERVAL" -gt 0 ]; then
+        # Batch mode: use read timeout to trigger sync event
+        ip monitor address 2>/dev/null | while true; do
+            if read -t "$BATCH_INTERVAL" -r line; then
+                handle_event "$line"
+            else
+                # Timeout: trigger ip_sync if there are pending changes
+                if [ -n "$PENDING_ADD_V4$PENDING_DEL_V4$PENDING_ADD_V6$PENDING_DEL_V6" ]; then
+                    flush_pending_changes
+                fi
+            fi
+        done
+    else
+        # Immediate mode: process each event directly
+        ip monitor address 2>/dev/null | while read -r line; do
+            handle_event "$line"
+        done
+    fi
 }
 
 cleanup_monitor() {

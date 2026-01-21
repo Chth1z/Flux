@@ -1,0 +1,137 @@
+#!/system/bin/sh
+
+# ==============================================================================
+# Flux Event Dispatcher (dispatcher)
+# Description: Central event handler for inotifyd events
+# ==============================================================================
+
+SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+
+. "$SCRIPT_DIR/const"
+
+# inotifyd argument handling:
+# - Directory monitoring: handler EVENT DIR FILENAME (3 args)
+# - File monitoring: handler EVENT FILEPATH (2 args)
+EVENT_TYPE="$1"
+if [ -n "$3" ]; then
+    # Directory monitoring mode
+    WATCHED_DIR="$2"
+    EVENT_NAME="$3"
+    WATCHED_PATH="$WATCHED_DIR/$EVENT_NAME"
+else
+    # File monitoring mode
+    WATCHED_PATH="$2"
+    EVENT_NAME=$(basename "$WATCHED_PATH")
+fi
+
+# Ignore DELETE events (d) for checking files
+# We only care about Creation (n) or Close-Write (w) for triggers
+# The only exception is 'disable', where deleting it means enabling the module
+if [ "$EVENT_TYPE" = "d" ] && [ "$EVENT_NAME" != "disable" ]; then
+    exit 0
+fi
+
+# IMPORTANT: Only process known event files, ignore everything else (like module.prop)
+case "$EVENT_NAME" in
+    disable|cache_ok|core_ok|tproxy_ok|fail|ip_sync)
+        # Known event file, continue processing
+        ;;
+    *)
+        # Unknown file (module.prop, etc.), exit immediately
+        exit 0
+        ;;
+esac
+
+. "$SCRIPT_DIR/log"
+. "$SCRIPT_DIR/state"
+
+export LOG_COMPONENT="Bus"
+
+log_debug "Event: $EVENT_NAME ($EVENT_TYPE)"
+
+# Cleanup event file immediately (except fail, disable, and sync markers)
+# This prevents duplicate processing, but we must keep sync markers until all are ready
+case "$EVENT_NAME" in
+    fail|disable|core_ok|tproxy_ok) ;;
+    *) rm -f "$WATCHED_PATH" 2>/dev/null ;;
+esac
+
+# ==============================================================================
+# [ Helper Functions ]
+# ==============================================================================
+
+_start_components() {
+    log_info "Starting components..."
+    sh "$CORE_SCRIPT" start &
+    sh "$TPROXY_SCRIPT" start &
+}
+
+_check_all_ready() {
+    # Both core_ok and tproxy_ok must exist
+    [ -f "$EVENTS_DIR/core_ok" ] && [ -f "$EVENTS_DIR/tproxy_ok" ] && {
+            rm -f "$EVENTS_DIR/core_ok" "$EVENTS_DIR/tproxy_ok"
+            log_info "All components ready, starting ipmonitor..."
+            nohup sh "$MONITOR_SCRIPT" start >/dev/null 2>&1 &
+            sync_prop "RUNNING"
+            prop_clear
+            log_info "Service ready"
+    }
+}
+
+_do_stop() {
+    log_info "Stopping services..."
+    sh "$CORE_SCRIPT" stop &
+    sh "$TPROXY_SCRIPT" stop &
+    sh "$MONITOR_SCRIPT" stop &
+    wait
+    rm -f "$EVENTS_DIR/fail" "$EVENTS_DIR/core_ok" "$EVENTS_DIR/tproxy_ok" 2>/dev/null
+    sync_prop "STOPPED"
+    prop_clear
+    log_info "Service stopped"
+}
+
+_do_rollback() {
+    log_warn "Rolling back..."
+    sh "$CORE_SCRIPT" stop 2>/dev/null &
+    sh "$TPROXY_SCRIPT" stop 2>/dev/null &
+    sh "$MONITOR_SCRIPT" stop 2>/dev/null &
+    wait
+    sync_prop "FAILED"
+}
+
+# ==============================================================================
+# [ Event Dispatch ]
+# ==============================================================================
+
+case "$EVENT_NAME" in
+    # === Magisk module toggle ===
+    disable)
+        case "$EVENT_TYPE" in
+            d) sh "$INIT_SCRIPT" & ;;   # Delete = Enable = Start
+            n) _do_stop ;;              # Create = Disable = Stop
+        esac
+        ;;
+    
+    # === Flow markers ===
+    cache_ok)
+        _start_components
+        ;;
+    core_ok)
+        _check_all_ready
+        ;;
+    tproxy_ok)
+        _check_all_ready
+        ;;
+    
+    # === Failure handling ===
+    fail)
+        _do_rollback
+        # Don't remove fail file - used for state detection
+        exit 0
+        ;;
+    
+    # === IP sync ===
+    ip_sync)
+        sh "$IP_HANDLER_SCRIPT" &
+        ;;
+esac

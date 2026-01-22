@@ -1,27 +1,29 @@
 #!/system/bin/sh
 
-# ==============================================================================
-# Flux Initialization Script (init)
-# Description: Initialize environment, run updater, build cache, trigger startup
-# ==============================================================================
+# Flux Initialization Script
+# Environment setup and cache building
+
+
+# Environment Setup
 
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 . "$SCRIPT_DIR/const"
 . "$SCRIPT_DIR/log"
-. "$SCRIPT_DIR/config"
+[ -f "$CACHE_CONFIG_FILE" ] && { set -a; . "$CACHE_CONFIG_FILE"; set +a; }
 
 export LOG_COMPONENT="Init"
 
-# ==============================================================================
-# [ Pre-flight Checks ]
-# ==============================================================================
+# Flux Initialization Script
+# Environment setup and cache building
+
+# Pre-flight Checks
 
 _check_integrity() {
     # Check binaries
     [ ! -f "$SING_BOX_BIN" ] && { log_error "Sing-box binary missing: $SING_BOX_BIN"; return 1; }
     
     # Check scripts
-    for script in "$CORE_SCRIPT" "$TPROXY_SCRIPT" "$MONITOR_SCRIPT" "$CACHE_SCRIPT" "$UPDATE_SCRIPT"; do
+    for script in "$CORE_SCRIPT" "$TPROXY_SCRIPT" "$IP_MONITOR_SCRIPT" "$CACHE_SCRIPT" "$UPDATE_SCRIPT" "$DISPATCHER_SCRIPT" "$IP_HANDLER_SCRIPT" "$RULES_SCRIPT" "$CONFIG_SCRIPT"; do
         [ ! -f "$script" ] && { log_error "Script missing: $script"; return 1; }
     done
     
@@ -39,15 +41,12 @@ _cleanup_failure() {
     # Simulate stop to cleanup any leftover processes/rules
     sh "$CORE_SCRIPT" stop >/dev/null 2>&1
     sh "$TPROXY_SCRIPT" stop >/dev/null 2>&1
-    sh "$MONITOR_SCRIPT" stop >/dev/null 2>&1
+    sh "$IP_MONITOR_SCRIPT" stop >/dev/null 2>&1
     wait
     rm -f "$EVENTS_DIR/fail" "$EVENTS_DIR/core_ok" "$EVENTS_DIR/tproxy_ok" 2>/dev/null
-    log_info "Cleanup completed"
 }
 
-# ==============================================================================
-# [ Environment Setup ]
-# ==============================================================================
+# Directory Initialization
 
 _init_dirs() {
     for dir in "$RUN_DIR" "$CACHE_DIR" "$EVENTS_DIR"; do
@@ -56,34 +55,63 @@ _init_dirs() {
     [ -d "$RUN_DIR" ] && chmod 0755 "$RUN_DIR"
 }
 
-# ==============================================================================
-# [ Update Check (from orchestrator.on_update_check) ]
-# ==============================================================================
+# Subscription Update Trigger
 
 _check_update() {
     log_debug "Checking for subscription updates"
     sh "$UPDATE_SCRIPT" check || log_debug "Update check completed"
 }
 
-# ==============================================================================
-# [ Main Flow ]
-# ==============================================================================
+# Log Maintenance
 
-main() {
-    log_info "Initializing service..."
+# Helper: Rotate single file (Copy-Truncate)
+_rotate_file() {
+    local file="$1"
     
-    run "Check integrity" _check_integrity || { touch "$EVENTS_DIR/fail"; exit 1; }
-    run "Setup directories" _init_dirs || { touch "$EVENTS_DIR/fail"; exit 1; }
-    run "Cleanup failure" _cleanup_failure
-
-    rotate_log 2>/dev/null
+    [ ! -f "$file" ] && return 0
     
-    _check_update
+    local current_size
+    current_size=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null || echo 0)
     
-    run "Ensure Cache" sh "$CACHE_SCRIPT" || { touch "$EVENTS_DIR/fail"; exit 1; }
-
-    log_debug "Init sequence completed"
-    touch "$EVENTS_DIR/init_ok"
+    if [ "$current_size" -gt "$LOG_MAX_SIZE" ]; then
+        log_info "Rotating $(basename "$file") (size: $current_size)"
+        cp -f "$file" "${file}.bak"
+        : > "$file"
+    fi
 }
 
-main
+_rotate_log() {
+    [ -f "$FLUX_LOG" ] && _rotate_file "$FLUX_LOG"
+    [ -f "$SING_BOX_LOG" ] && _rotate_file "$SING_BOX_LOG"
+    
+    return 0
+}
+
+init_env() {
+    _cleanup_failure
+    _init_dirs || { touch "$EVENTS_DIR/fail"; exit 1; }
+    _check_integrity || { touch "$EVENTS_DIR/fail"; exit 1; }
+    _check_update
+    sh "$CACHE_SCRIPT" check || { touch "$EVENTS_DIR/fail"; exit 1; }
+    _rotate_log 2>/dev/null
+}
+
+# Startup Orchestration
+
+main() {
+    local action="${1:-}"
+    
+    case "$action" in
+        init)
+            init_env
+            log_info "Initialization completed"
+            touch "$EVENTS_DIR/init_ok"
+            ;;
+        *)
+            echo "Usage: $0 {init}"
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

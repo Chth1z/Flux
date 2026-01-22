@@ -1,26 +1,17 @@
 #!/system/bin/sh
 
-# ==============================================================================
-# Flux TProxy Management (tproxy)
-# Description: Apply cached iptables rules and manage routing
-# Note: All kernel detection and rule generation is done by rules
-# ==============================================================================
+# Flux TProxy Management
+# Apply cached rules and manage routing tables
 
-# ==============================================================================
-# [ Environment Setup ]
-# ==============================================================================
+# Environment Setup
 
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 . "$SCRIPT_DIR/const"
 . "$SCRIPT_DIR/log"
-[ -f "$CACHE_CONFIG_FILE" ] && { set -a; . "$CACHE_CONFIG_FILE"; set +a; }
-[ -f "$KERNEL_CACHE_FILE" ] && { set -a; . "$KERNEL_CACHE_FILE"; set +a; }
 
-export LOG_COMPONENT="Tproxy"
+export LOG_COMPONENT="Tprx"
 
-# ==============================================================================
-# [ Mode Detection - Read from Cache ]
-# ==============================================================================
+# Proxy Mode Detection
 
 _check_tproxy_support() {
     if [ "${KFEAT_TPROXY:-0}" -eq 1 ]; then
@@ -53,27 +44,20 @@ _detect_proxy_mode() {
     fi
 }
 
-# ==============================================================================
-# COMMAND WRAPPERS
-# ==============================================================================
+# Command Wrappers for locking and families
 
 # Generic wrapper for iptables/ip6tables with wait lock
 _run_ipt_command() {
-    local cmd="$1"
-    shift
+    local cmd="$1"; shift
     command "$cmd" -w 100 "$@"
 }
 
-iptables()    { _run_ipt_command iptables "$@"; }
-ip6tables()   { _run_ipt_command ip6tables "$@"; }
-ip_rule()     { command ip rule "$@"; }
-ip6_rule()    { command ip -6 rule "$@"; }
-ip_route()    { command ip route "$@"; }
-ip6_route()   { command ip -6 route "$@"; }
+_ip_rule()    { command ip rule "$@"; }
+_ip6_rule()   { command ip -6 rule "$@"; }
+_ip_route()   { command ip route "$@"; }
+_ip6_route()  { command ip -6 route "$@"; }
 
-# ==============================================================================
-# PROXY CHAIN SETUP (Uses cached rules from rules)
-# ==============================================================================
+# Proxy Chain Setup (from cached rules)
 
 _setup_proxy_chain() {
     local family="$1"
@@ -97,26 +81,23 @@ _setup_proxy_chain() {
     
     # Apply cached rules
     local err_out
-    err_out=$($restore_cmd --noflush < "$rules_file" 2>&1)
-    if [ $? -eq 0 ]; then
-        return 0
-    else
-        log_error "iptables-restore failed for IPv${family}: $err_out"
+    if ! err_out=$(_run_ipt_command "$restore_cmd" --noflush < "$rules_file" 2>&1); then
+        log_error "$restore_cmd failed (IPv$family)"
+        echo "$err_out" | while read -r line; do log_error "  >> $line"; done
         return 1
     fi
+    return 0
 }
 
-# ==============================================================================
-# ROUTING TABLE MANAGEMENT (ip rule / ip route)
-# ==============================================================================
+# Routing Table Management
 
 _setup_routing4() {
-    ip_rule del fwmark "$MARK_VALUE" lookup "$TABLE_ID" 2> /dev/null || true
-    ip_route del local 0.0.0.0/0 dev lo table "$TABLE_ID" 2> /dev/null || true
+    _ip_rule del fwmark "$MARK_VALUE" lookup "$TABLE_ID" 2> /dev/null || true
+    _ip_route del local 0.0.0.0/0 dev lo table "$TABLE_ID" 2> /dev/null || true
 
-    ip_rule add fwmark "$MARK_VALUE" table "$TABLE_ID" pref "$TABLE_ID" || return 1
-    ip_route add local 0.0.0.0/0 dev lo table "$TABLE_ID" || {
-        ip_rule del fwmark "$MARK_VALUE" table "$TABLE_ID" pref "$TABLE_ID" 2> /dev/null || true
+    _ip_rule add fwmark "$MARK_VALUE" table "$TABLE_ID" pref "$TABLE_ID" || return 1
+    _ip_route add local 0.0.0.0/0 dev lo table "$TABLE_ID" || {
+        _ip_rule del fwmark "$MARK_VALUE" table "$TABLE_ID" pref "$TABLE_ID" 2> /dev/null || true
         return 1
     }
 
@@ -124,21 +105,19 @@ _setup_routing4() {
 }
 
 _setup_routing6() {
-    ip6_rule del fwmark "$MARK_VALUE6" table "$TABLE_ID" pref "$TABLE_ID" 2> /dev/null || true
-    ip6_route del local ::/0 dev lo table "$TABLE_ID" 2> /dev/null || true
+    _ip6_rule del fwmark "$MARK_VALUE6" table "$TABLE_ID" pref "$TABLE_ID" 2> /dev/null || true
+    _ip6_route del local ::/0 dev lo table "$TABLE_ID" 2> /dev/null || true
 
-    ip6_rule add fwmark "$MARK_VALUE6" table "$TABLE_ID" pref "$TABLE_ID" || return 1
-    ip6_route add local ::/0 dev lo table "$TABLE_ID" || {
-        ip6_rule del fwmark "$MARK_VALUE6" table "$TABLE_ID" pref "$TABLE_ID" 2> /dev/null || true
+    _ip6_rule add fwmark "$MARK_VALUE6" table "$TABLE_ID" pref "$TABLE_ID" || return 1
+    _ip6_route add local ::/0 dev lo table "$TABLE_ID" || {
+        _ip6_rule del fwmark "$MARK_VALUE6" table "$TABLE_ID" pref "$TABLE_ID" 2> /dev/null || true
         return 1
     }
 
     echo 1 > /proc/sys/net/ipv6/conf/all/forwarding
 }
 
-# ==============================================================================
-# CLEANUP OPERATIONS
-# ==============================================================================
+# Cleanup and Flush Operations
 
 # Atomic cleanup using cached iptables-restore rules
 # Requires cleanup rules to be pre-generated by rules
@@ -159,28 +138,26 @@ _cleanup_chain() {
     log_debug "Cleaning up $mode_name chains for IPv${family}"
 
     # Apply cached cleanup rules (atomic)
-    [ -s "$cleanup_file" ] && $restore_cmd --noflush < "$cleanup_file" 2>/dev/null || true
+    [ -s "$cleanup_file" ] && _run_ipt_command "$restore_cmd" --noflush < "$cleanup_file" 2>/dev/null || true
     
     log_debug "$mode_name chains for IPv${family} cleanup completed"
 }
 
 _cleanup_routing4() {
-    ip_rule del fwmark "$MARK_VALUE" table "$TABLE_ID" pref "$TABLE_ID" 2> /dev/null || true
-    ip_route del local 0.0.0.0/0 dev lo table "$TABLE_ID" 2> /dev/null || true
+    _ip_rule del fwmark "$MARK_VALUE" table "$TABLE_ID" pref "$TABLE_ID" 2> /dev/null || true
+    _ip_route del local 0.0.0.0/0 dev lo table "$TABLE_ID" 2> /dev/null || true
     echo 0 > /proc/sys/net/ipv4/ip_forward 2> /dev/null || true
     log_debug "IPv4 routing cleanup completed"
 }
 
 _cleanup_routing6() {
-    ip6_rule del fwmark "$MARK_VALUE6" table "$TABLE_ID" pref "$TABLE_ID" 2> /dev/null || true
-    ip6_route del local ::/0 dev lo table "$TABLE_ID" 2> /dev/null || true
+    _ip6_rule del fwmark "$MARK_VALUE6" table "$TABLE_ID" pref "$TABLE_ID" 2> /dev/null || true
+    _ip6_route del local ::/0 dev lo table "$TABLE_ID" 2> /dev/null || true
     echo 0 > /proc/sys/net/ipv6/conf/all/forwarding 2> /dev/null || true
     log_debug "IPv6 routing cleanup completed"
 }
 
-# ==============================================================================
-# MAIN EXECUTION FLOW
-# ==============================================================================
+# Main Execution API
 
 start_proxy() {
     _detect_proxy_mode
@@ -210,22 +187,13 @@ stop_proxy() {
     local mode="tproxy"
     [ "$USE_TPROXY" -eq 0 ] && mode="redirect"
     
-    _cleanup_chain 4 "$mode"
-    _cleanup_routing4
+    run "Flush IPv4 chains" _cleanup_chain 4 "$mode"
+    run "Flush IPv4 routing" _cleanup_routing4
     
     if [ "$PROXY_IPV6" -eq 1 ]; then
-        _cleanup_chain 6 "$mode"
-        _cleanup_routing6
+        run "Flush IPv6 chains" _cleanup_chain 6 "$mode"
+        run "Flush IPv6 routing" _cleanup_routing6
     fi
-}
-
-rollback_tproxy() {
-    _cleanup_chain 4 "tproxy"
-    _cleanup_chain 6 "tproxy"
-    _cleanup_chain 4 "redirect"
-    _cleanup_chain 6 "redirect"
-    _cleanup_routing4
-    _cleanup_routing6
 }
 
 main() {

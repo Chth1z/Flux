@@ -1,13 +1,9 @@
 #!/system/bin/sh
 
-# ==============================================================================
-# Flux Logging Module (log)
-# Description: Logging functions and unified prop status management
-# ==============================================================================
+# Flux Logging Module
+# Unified Magisk Status and File Logging
 
-# ==============================================================================
-# [ Logging ]
-# ==============================================================================
+# Logging Core Functions
 
 LOG_COMPONENT="${LOG_COMPONENT:-Flux}"
 
@@ -27,15 +23,11 @@ _log() {
     local timestamp
     timestamp=$(date '+%m-%d %H:%M:%S')
     
-    # Format component: fixed width 7 chars
-    local comp_fmt
-    comp_fmt=$(printf '%-7.7s' "${LOG_COMPONENT}")
-    
     local log_line
-    log_line=$(printf '[%s] %s [%s] %s' "$timestamp" "$level" "$comp_fmt" "$msg")
+    log_line=$(printf '[%s] %s [%s] %s' "$timestamp" "$level" "${LOG_COMPONENT}" "$msg")
     
     # Write to log file
-    [ -n "$LOG_FILE" ] && printf '%s\n' "$log_line" >> "$LOG_FILE"
+    [ -n "$FLUX_LOG" ] && printf '%s\n' "$log_line" >> "$FLUX_LOG"
     
     # Terminal output with colors
     if _is_interactive; then
@@ -48,40 +40,20 @@ _log() {
     fi
 }
 
-
-# ==============================================================================
-# [ Unified Prop Status ]
-# Format: description\n{left: state} | {right: error/warn}
-# Each update writes directly to file, preserving the other part
-# ==============================================================================
-
-_PROP_ORIG_DESC=""
-
-# Get emoji for state
-_get_state_emoji() {
-    case "$1" in
-        RUNNING)  printf '🥰' ;;
-        STOPPED)  printf '😴' ;;
-        FAILED)   printf '🤯' ;;
-        *)        printf '🤔' ;;
-    esac
-}
+# Unified Prop Status Management
+# Format: original_description\n🥰 [RUNNING] PID: xxx | Error: message
 
 # Initialize original description cache
 _init_prop_orig_desc() {
     [ -n "$_PROP_ORIG_DESC" ] && return 0
     [ ! -f "$PROP_FILE" ] && return 1
     
-    local desc_line
-    desc_line=$(grep "^description=" "$PROP_FILE" 2>/dev/null | head -1)
-    _PROP_ORIG_DESC="${desc_line#description=}"
+    _PROP_ORIG_DESC=$(grep "^description=" "$PROP_FILE" | head -1 | cut -d= -f2-)
     _PROP_ORIG_DESC="${_PROP_ORIG_DESC%%\\n*}"
     
     # Reset if already contains emoji (previous status)
     case "$_PROP_ORIG_DESC" in
-        *"🥰"*|*"😴"*|*"🤯"*|*"🤔"*)
-            _PROP_ORIG_DESC="Seamlessly redirect your network Flux."
-            ;;
+        *"🥰"*|*"😴"*|*"🤯"*|*"🤔"*) _PROP_ORIG_DESC="Seamlessly redirect your network Flux." ;;
     esac
 }
 
@@ -101,10 +73,16 @@ _prop_get_left() {
     echo "${1%% |*}"
 }
 
-# Extract right part (after |)
+# Extract right part by searching for Error/Warn keywords
+# This recovers from accumulated garbage states (e.g. "[FAILED] | [STOPPED] | Error:...")
 _prop_get_right() {
     case "$1" in
-        *" | "*) echo "${1#* | }" ;;
+        *"Error:"*)
+            echo "Error:${1#*Error:}"
+            ;;
+        *"Warn:"*)
+            echo "Warn:${1#*Warn:}"
+            ;;
     esac
 }
 
@@ -121,117 +99,85 @@ _prop_write() {
     
     local full_desc="${_PROP_ORIG_DESC}\\n${status}"
     
-    # Use awk with ENVIRON to avoid escape sequence issues
-    # Use memory buffer to avoid temp file
-    local content
-    content=$(DESC="$full_desc" awk '
+    # Efficient update: Only write if changed
+    local current_line
+    current_line=$(grep "^description=" "$PROP_FILE" | head -1)
+    if [ "$current_line" = "description=${full_desc}" ]; then
+        return 0
+    fi
+
+    # Atomic write strategy
+    local tmp_file="${PROP_FILE}.tmp"
+    if DESC="$full_desc" awk '
         /^description=/ { print "description=" ENVIRON["DESC"]; next }
         { print }
-    ' "$PROP_FILE")
-    
-    printf '%s\n' "$content" > "$PROP_FILE" 2>/dev/null
-    
-    log_debug "Prop: $status"
+    ' "$PROP_FILE" > "$tmp_file"; then
+        mv -f "$tmp_file" "$PROP_FILE"
+        log_debug "Prop updated: $status"
+    else
+        rm -f "$tmp_file"
+        log_error "Failed to update module.prop"
+    fi
 }
 
 # Build left part from state
-# Usage: _prop_build_left [state]
 _prop_build_left() {
-    local state
+    local state="STOPPED"
     
     if [ -f "$EVENTS_DIR/fail" ]; then
         state="FAILED"
-    elif [ -f "$MAGISK_MOD_DIR/disable" ]; then
-        state="STOPPED"
-    elif [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null; then
-        state="RUNNING"
-    else
-        state="STOPPED"
+    elif [ ! -f "$MAGISK_MOD_DIR/disable" ] && [ -f "$PID_FILE" ]; then
+        local pid; pid=$(cat "$PID_FILE" 2>/dev/null)
+        [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && state="RUNNING"
     fi
     
     local emoji
-    emoji=$(_get_state_emoji "$state")
+    case "$state" in
+        RUNNING) emoji='🥰';;
+        STOPPED) emoji='😴';;
+        FAILED)  emoji='🤯';;
+        *)       emoji='🤔';;
+    esac
+
     local left="${emoji} [${state}]"
-    
-    # Add PID if RUNNING
-    if [ "$state" = "RUNNING" ] && [ -f "$PID_FILE" ]; then
-        local pid
-        pid=$(cat "$PID_FILE" 2>/dev/null)
-        [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && left="${left} PID: ${pid}"
-    fi
-    
+    [ "$state" = "RUNNING" ] && left="${left} PID: ${pid}"
     echo "$left"
 }
 
-# ==============================================================================
-# [ Log Rotation ]
-# ==============================================================================
-
-rotate_log() {
-    [ ! -f "$LOG_FILE" ] && return 0
-    
-    local max_size="${LOG_MAX_SIZE:-1048576}"
-    local current_size
-    current_size=$(stat -c%s "$LOG_FILE" 2>/dev/null || stat -f%z "$LOG_FILE" 2>/dev/null || echo 0)
-    
-    if [ "$current_size" -gt "$max_size" ]; then
-        log_info "Rotating log file (size: $current_size > $max_size)"
-        mv -f "$LOG_FILE" "${LOG_FILE}.1" 2>/dev/null
-    fi
-    return 0
+# Helper to read status and return current left part
+_prop_get_current_left() {
+    local current; current=$(_prop_read_status)
+    local left; left=$(_prop_get_left "$current")
+    echo "${left:-$(_prop_build_left)}"
 }
 
-# ==============================================================================
-# [ Public API ]
-# ==============================================================================
+# Public Logging API
 
 # Sync state to prop (update left, preserve right)
-# Usage: sync_prop [state]
 sync_prop() {
-    local current right
-    current=$(_prop_read_status)
-    right=$(_prop_get_right "$current")
-    
-    local left
-    left=$(_prop_build_left)
-    
-    _prop_write "$left" "$right"
+    _prop_write "$(_prop_build_left)" "$(_prop_get_right "$(_prop_read_status)")"
 }
 
 # Set error (update right, preserve left)
 prop_error() {
-    local current left
-    current=$(_prop_read_status)
-    left=$(_prop_get_left "$current")
-    [ -z "$left" ] && left=$(_prop_build_left)
-    
-    _prop_write "$left" "Error: $1"
+    _prop_write "$(_prop_get_current_left)" "Error: $1"
     log_error "$1"
 }
 
 # Set warning (update right, preserve left, don't overwrite error)
 prop_warn() {
-    local current left right
-    current=$(_prop_read_status)
-    left=$(_prop_get_left "$current")
-    right=$(_prop_get_right "$current")
-    [ -z "$left" ] && left=$(_prop_build_left)
+    local current; current=$(_prop_read_status)
+    local right; right=$(_prop_get_right "$current")
     
-    # Don't overwrite existing error
     case "$right" in Error:*) log_warn "$1"; return 0 ;; esac
     
-    _prop_write "$left" "Warn: $1"
+    _prop_write "$(_prop_get_current_left)" "Warn: $1"
     log_warn "$1"
 }
 
 # Clear error/warn (preserve left)
 prop_clear() {
-    local current left
-    current=$(_prop_read_status)
-    left=$(_prop_get_left "$current")
-    [ -z "$left" ] && left=$(_prop_build_left)
-    
-    _prop_write "$left" ""
+    _prop_write "$(_prop_get_current_left)" ""
 }
 
 run() {

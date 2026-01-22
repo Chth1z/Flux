@@ -1,44 +1,121 @@
 #!/system/bin/sh
 
-# ==============================================================================
-# Flux IP Monitor Daemon (ipmonitor)
-# Description: Monitors IP changes and triggers ip_handler via dispatch events
-# Note: Pure monitor, no iptables operations here.
-# ==============================================================================
+# Flux IP Monitor Daemon
+# Detects network changes and triggers synchronization
+
+
+# Environment Setup
 
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 . "$SCRIPT_DIR/const"
 . "$SCRIPT_DIR/log"
-[ -f "$CACHE_CONFIG_FILE" ] && { set -a; . "$CACHE_CONFIG_FILE"; set +a; }
 
-export LOG_COMPONENT="Monitor"
+export LOG_COMPONENT="Moni"
 
-# ==============================================================================
-# [ Main Loop ]
-# ==============================================================================
 
-    _cleanup() {
-        pkill -P $$ 2>/dev/null
-    }
-    trap '_cleanup; exit 0' EXIT INT TERM
+# Helper Functions
+
+# Capture a fingerprint of current global IPs (Interface + IP/CIDR)
+# Filter: global scope only (ignores loopback/link-local/temporary)
+_get_ip_state() {
+    ip -o addr show scope global 2>/dev/null | awk '{print $2, $4}' | sort
+}
+
+
+# Monitor Logic Loop
+
+start_monitor() {
+    # 1. Setup FIFO
+    rm -f "$FIFO_FILE"
+    mkfifo "$FIFO_FILE" || { log_error "Failed to create FIFO"; exit 1; }
+
+    # 2. Start ip monitor background process
+    ip monitor address > "$FIFO_FILE" 2>/dev/null &
+    local monitor_bin_pid=$!
+
+    # 3. Register lifecycle (PID & Cleanup)
+    echo $$ > "$MONITOR_PID_FILE" && \
+    log_info "Starting IP Monitor (PID: $$, BinPID: $monitor_bin_pid, debounce=${DEBOUNCE_INTERVAL}s)"
+
+    trap 'kill "$monitor_bin_pid" 2>/dev/null; rm -f "$FIFO_FILE" "$MONITOR_PID_FILE"; exit 0' EXIT INT TERM
+
+    # 4. Initial State Snapshot
+    local last_state; last_state=$(_get_ip_state)
+    log_debug "Initial IP State: $(echo "$last_state" | tr '\n' ' ')"
     
-echo $$ > "$MONITOR_PID_FILE" && log_info "Starting IP Monitor (PID: $$, debounce=${DEBOUNCE_INTERVAL}s)"
-
-touch "$EVENTS_DIR/ip_sync"
-
-dirty=0
-
-ip monitor address 2>/dev/null | while true; do
-    if read -t "$DEBOUNCE_INTERVAL" -r line; then
-        if [ -n "$line" ]; then
-            dirty=1
+    # 5. Initial Sync Trigger
+    touch "$EVENTS_DIR/ip_sync"
+    
+    # 6. Monitor Loop
+    local dirty=0 current_state
+    
+    while true; do
+        if read -t "$DEBOUNCE_INTERVAL" -r line; then
+            # Activity detected (any output triggers dirty flag)
+            [ -n "$line" ] && dirty=1
+        else
+            # Quiet period (Debounce timeout)
+            if [ "$dirty" -eq 1 ]; then
+                current_state=$(_get_ip_state)
+                if [ "$current_state" != "$last_state" ]; then
+                    log_info "Network change verified"
+                    touch "$EVENTS_DIR/ip_sync"
+                    last_state="$current_state"
+                else
+                    log_debug "Ignored noise (IPs unchanged)"
+                fi
+                dirty=0
+            fi
         fi
+    done < "$FIFO_FILE"
+}
+
+
+_get_monitor_pid() {
+    [ -f "$MONITOR_PID_FILE" ] && cat "$MONITOR_PID_FILE" 2>/dev/null
+}
+
+_is_monitor_running() {
+    local pid="$1"
+    [ -n "$pid" ] && [ -d "/proc/$pid" ]
+}
+
+stop_monitor() {
+    log_info "Stopping IP Monitor..."
+    local pid; pid=$(_get_monitor_pid)
+
+    if _is_monitor_running "$pid"; then
+        kill "$pid" 2>/dev/null
+        local count=0
+        while [ $count -lt 3 ] && _is_monitor_running "$pid"; do
+            sleep 1
+            count=$((count + 1))
+        done
+        _is_monitor_running "$pid" && kill -9 "$pid" 2>/dev/null
     else
-        if [ "$dirty" -eq 1 ]; then
-            log_debug "IPs stabilized, triggering sync"
-            touch "$EVENTS_DIR/ip_sync"
-            dirty=0
-        fi
+        pkill -f "ipmonitor" 2>/dev/null
     fi
-done
+    rm -f "$MONITOR_PID_FILE" "$FIFO_FILE"
+}
+
+# Entry Point
+
+main() {
+    local action="${1:-}"
+    
+    case "$action" in
+        start)
+            start_monitor
+            ;;
+        stop)
+            stop_monitor
+            ;;
+        *)
+            echo "Usage: $0 {start|stop}"
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
 

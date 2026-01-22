@@ -1,75 +1,44 @@
 #!/system/bin/sh
 
-# ==============================================================================
-# Flux Event Dispatcher (dispatcher)
-# Description: Central event handler for inotifyd events
-# ==============================================================================
+# Flux Event Dispatcher
+# Central event handler for inotifyd events
+
+
+# Environment Setup
 
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 . "$SCRIPT_DIR/log"
 . "$SCRIPT_DIR/const"
+[ -f "$CACHE_CONFIG_FILE" ] && { set -a; . "$CACHE_CONFIG_FILE"; set +a; }
+[ -f "$KERNEL_CACHE_FILE" ] && { set -a; . "$KERNEL_CACHE_FILE"; set +a; }
 
-export LOG_COMPONENT="Bus"
-# inotifyd argument handling:
-# - Directory monitoring: handler EVENT DIR FILENAME (3 args)
-# - File monitoring: handler EVENT FILEPATH (2 args)
-EVENT_TYPE="$1"
-if [ -n "$3" ]; then
-    # Directory monitoring mode
-    WATCHED_DIR="$2"
-    EVENT_NAME="$3"
-    WATCHED_PATH="$WATCHED_DIR/$EVENT_NAME"
-else
-    # File monitoring mode
-    WATCHED_PATH="$2"
-    EVENT_NAME=$(basename "$WATCHED_PATH")
-fi
+export LOG_COMPONENT="Disp"
 
-log_debug "Event: $EVENT_NAME ($EVENT_TYPE)"
+# Helper Functions
 
-# ==============================================================================
-# [ Helper Functions ]
-# ==============================================================================
-
-_start_components() {
+start_components() {
     [ -f "$MAGISK_MOD_DIR/disable" ] && { log_warn "Service disabled, ignoring start trigger"; return; }
     log_info "Starting components..."
     sh "$CORE_SCRIPT" start &
     sh "$TPROXY_SCRIPT" start &
 }
 
-_kill_ipmonitor() {
-    if [ -f "$MONITOR_PID_FILE" ]; then
-        local mpid
-        mpid=$(cat "$MONITOR_PID_FILE")
-        if [ -n "$mpid" ]; then
-            kill "$mpid" 2>/dev/null
-        fi
-        rm -f "$MONITOR_PID_FILE"
-    else
-        pkill -f "ipmonitor" 2>/dev/null
-    fi
-}
-
-_check_all_ready() {
+check_all_ready() {
     [ -f "$MAGISK_MOD_DIR/disable" ] && { log_warn "Service disabled, ignoring readiness trigger"; return; }
-    # Both core_ok and tproxy_ok must exist
     [ -f "$EVENTS_DIR/core_ok" ] && [ -f "$EVENTS_DIR/tproxy_ok" ] && {
-            rm -f "$EVENTS_DIR/core_ok" "$EVENTS_DIR/tproxy_ok"
-            log_info "All components ready, starting ipmonitor..."
-            nohup sh "$MONITOR_SCRIPT" start >/dev/null 2>&1 &
-            sync_prop
-            log_info "Service ready"
+        rm -f "$EVENTS_DIR/core_ok" "$EVENTS_DIR/tproxy_ok"
+        log_info "All components ready, starting ipmonitor..."
+        nohup sh "$IP_MONITOR_SCRIPT" start >/dev/null 2>&1 &
+        sync_prop
+        log_info "Flux Service is now READY"
     }
 }
 
-_stop_components() {
+stop_components() {
     log_info "Stopping services..."
     sh "$CORE_SCRIPT" stop &
     sh "$TPROXY_SCRIPT" stop &
-    
-    _kill_ipmonitor
-    
+    sh "$IP_MONITOR_SCRIPT" stop &
     wait
     rm -f "$EVENTS_DIR/core_ok" "$EVENTS_DIR/tproxy_ok" 2>/dev/null
     sync_prop
@@ -77,50 +46,69 @@ _stop_components() {
     log_info "Service stopped"
 }
 
-_rollback_components() {
+rollback_components() {
     log_warn "Rolling back..."
     sh "$CORE_SCRIPT" stop 2>/dev/null &
     sh "$TPROXY_SCRIPT" stop 2>/dev/null &
-    _kill_ipmonitor &
+    sh "$IP_MONITOR_SCRIPT" stop 2>/dev/null &
     wait
     sync_prop
 }
 
-# ==============================================================================
-# [ Event Dispatch ]
-# ==============================================================================
+# Event Dispatch Logic
 
-case "$EVENT_NAME" in
-    # === Magisk module toggle ===
-    disable)
-        case "$EVENT_TYPE" in
-            d) sh "$INIT_SCRIPT" & ;;   # Delete = Enable = Start
-            n) _stop_components ;;      # Create = Disable = Stop
-        esac
-        ;;
-    # === Flow markers ===
-    init_ok)
-        rm -f "$WATCHED_PATH" 2>/dev/null
-        _start_components
-        ;;
-    core_ok)
-        _check_all_ready
-        ;;
-    tproxy_ok)
-        _check_all_ready
-        ;;
-    # === Failure handling ===
-    fail)
-        _rollback_components
-        exit 0
-        ;;
-    # === IP sync ===
-    ip_sync)
-        rm -f "$WATCHED_PATH" 2>/dev/null
-        sh "$IP_HANDLER_SCRIPT" &
-        ;;
-    # === Unknown/Cleanup ===
-    *)
-        rm -f "$WATCHED_PATH" 2>/dev/null
-        ;;
-esac
+main() {
+    # inotifyd argument handling:
+    # - Directory monitoring: handler EVENT DIR FILENAME (3 args)
+    # - File monitoring: handler EVENT FILEPATH (2 args)
+    local event_type="$1"
+    local watched_path
+    local event_name
+    
+    if [ -n "$3" ]; then
+        # Directory monitoring mode
+        local watched_dir="$2"
+        event_name="$3"
+        watched_path="$watched_dir/$event_name"
+    else
+        # File monitoring mode
+        watched_path="$2"
+        event_name=$(basename "$watched_path")
+    fi
+    
+    log_debug "Event: $event_name ($event_type)"
+    
+    case "$event_name" in
+        # === Magisk module toggle ===
+        disable)
+            case "$event_type" in
+                d) sh "$INIT_SCRIPT" init & ;;   # Delete = Enable = Start
+                n) stop_components ;;      # Create = Disable = Stop
+            esac
+            ;;
+        # === Flow markers ===
+        init_ok)
+            rm -f "$watched_path" 2>/dev/null
+            start_components
+            ;;
+        core_ok|tproxy_ok)
+            check_all_ready
+            ;;
+        # === Failure handling ===
+        fail)
+            rollback_components
+            exit 0
+            ;;
+        # === IP sync ===
+        ip_sync)
+            rm -f "$watched_path" 2>/dev/null
+            sh "$IP_HANDLER_SCRIPT" sync &
+            ;;
+        # === Unknown/Cleanup ===
+        *)
+            rm -f "$watched_path" 2>/dev/null
+            ;;
+    esac
+}
+
+main "$@"

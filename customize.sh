@@ -1,15 +1,11 @@
 #!/system/bin/sh
 
-# ==============================================================================
-# FLUX Installer (customize.sh)
-# Description: Advanced Magisk/KernelSU/APatch installer script
-# ==============================================================================
+# Flux Installer
+# Magisk/KernelSU/APatch installation script
 
 SKIPUNZIP=1
 
-# ==============================================================================
-# [ Environment Check ]
-# ==============================================================================
+# Environment Check
 
 if [ "$BOOTMODE" != true ]; then
     ui_print "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -18,9 +14,7 @@ if [ "$BOOTMODE" != true ]; then
     abort "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 fi
 
-# ==============================================================================
-# [ Constants & Paths ]
-# ==============================================================================
+# Constants & Paths
 
 readonly FLUX_DIR="/data/adb/flux"
 readonly CONF_DIR="$FLUX_DIR/conf"
@@ -37,15 +31,13 @@ else
     SERVICE_DIR="/data/adb/service.d"
 fi
 
-# ==============================================================================
-# [ Helper Functions ]
-# ==============================================================================
+# Helper Functions
 
 # Note: ui_print is provided by Magisk/KernelSU/APatch installer
 ui_error() { ui_print "! $1"; }
 ui_success() { ui_print "√ $1"; }
 
-detect_env() {
+_detect_env() {
     ui_print "- Detecting environment..."
     
     if [ "$KSU" = "true" ]; then
@@ -61,12 +53,8 @@ detect_env() {
     fi
 }
 
-# ==============================================================================
-# [ Universal Volume Key Detection ]
-# ==============================================================================
-
 # Simplified countdown loop with getevent timeout
-choose_action() {
+_choose_action() {
     local title="$1"
     local default_action="$2"  # true = Yes/Keep, false = No/Reset
     local timeout_sec=10
@@ -122,7 +110,7 @@ MAC_FILTER_ENABLE MAC_PROXY_MODE PROXY_MACS_LIST BYPASS_MACS_LIST
 SKIP_CHECK_FEATURE
 "
 
-migrate_settings() {
+_migrate_settings() {
     local backup_file="$1"
     local target_file="$2"
     
@@ -198,17 +186,12 @@ migrate_settings() {
 # --- Main Installation Logic ---
 
 main() {
-    detect_env
+    _detect_env
     
     # 1. Backup config files before overwriting
-    local TMP_BACKUP
-    TMP_BACKUP=$(mktemp -d)
+    local TMP_BACKUP; TMP_BACKUP=$(mktemp -d)
     
-    local has_settings=false
-    local has_config=false
-    local has_pref=false
-    local has_singbox=false
-    local has_timestamp=false
+    local has_settings=false has_config=false has_pref=false has_singbox=false
     
     if [ -d "$FLUX_DIR" ]; then
         ui_print "- Backing up configuration files..."
@@ -236,7 +219,6 @@ main() {
     fi
     
     # 2. Extract module files to MODPATH (for Magisk)
-    # Note: META-INF is handled automatically by Magisk installer, do not extract manually
     ui_print "- Extracting module files..."
     unzip -o "$ZIPFILE" 'module.prop' 'webroot/*' -d "$MODPATH" >&2
     
@@ -244,33 +226,27 @@ main() {
     mkdir -p "$SERVICE_DIR"
     unzip -o "$ZIPFILE" 'flux_service.sh' -d "$SERVICE_DIR" >&2
     
-    # 3. Clear and recreate FLUX_DIR structure (ensures clean install)
+    # 3. Clear and recreate FLUX_DIR structure
     ui_print "- Installing Flux core files..."
-    
-    # Remove old directories that will be fully replaced
     rm -rf "$BIN_DIR" "$SCRIPTS_DIR" "$TOOLS_DIR" 2>/dev/null
-    
-    # Create fresh directory structure
     mkdir -p "$FLUX_DIR" "$CONF_DIR" "$BIN_DIR" "$SCRIPTS_DIR" "$TOOLS_DIR" "$RUN_DIR"
-    
-    # Extract core files (bin, scripts, conf, tools) - full overwrite
     unzip -o "$ZIPFILE" 'bin/*' 'scripts/*' 'conf/*' 'tools/*' -d "$FLUX_DIR" >&2
     
     # 4. Handle configuration restoration
     ui_print " "
     ui_print "=== Configuration ==="
     
-    # 4.1 settings.ini - Auto migrate (no user confirmation needed)
+    # 4.1 settings.ini - Auto migrate
     if [ "$has_settings" = "true" ]; then
         ui_print "- Migrating settings.ini..."
-        migrate_settings "$TMP_BACKUP/settings.ini" "$CONF_DIR/settings.ini"
+        _migrate_settings "$TMP_BACKUP/settings.ini" "$CONF_DIR/settings.ini"
     else
         ui_print "- Using default settings.ini"
     fi
     
-    # 4.2 config.json + state file - User choice (synced together)
+    # 4.2 config.json - User choice
     if [ "$has_config" = "true" ]; then
-        if choose_action "Keep [config.json]?" "true"; then
+        if _choose_action "Keep [config.json]?" "true"; then
             cp -f "$TMP_BACKUP/config.json" "$CONF_DIR/config.json"
             ui_print "  > config.json: restored"
         else
@@ -280,7 +256,7 @@ main() {
     
     # 4.3 pref.toml - User choice
     if [ "$has_pref" = "true" ]; then
-        if choose_action "Keep [pref.toml]?" "true"; then
+        if _choose_action "Keep [pref.toml]?" "true"; then
             cp -f "$TMP_BACKUP/pref.toml" "$TOOLS_DIR/pref.toml"
             ui_print "  > pref.toml: restored"
         else
@@ -290,7 +266,7 @@ main() {
     
     # 4.4 singbox.json - User choice
     if [ "$has_singbox" = "true" ]; then
-        if choose_action "Keep [singbox.json]?" "true"; then
+        if _choose_action "Keep [singbox.json]?" "true"; then
             mkdir -p "$TOOLS_DIR/base"
             cp -f "$TMP_BACKUP/singbox.json" "$TOOLS_DIR/base/singbox.json"
             ui_print "  > singbox.json: restored"

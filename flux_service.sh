@@ -11,14 +11,18 @@
 # ==============================================================================
 
 . "/data/adb/flux/scripts/const"
-. "/data/adb/flux/scripts/state"
 . "/data/adb/flux/scripts/log"
+
+_state_init() {
+    rm -f "$EVENTS_DIR/core_ok" "$EVENTS_DIR/tproxy_ok" "$EVENTS_DIR/init_ok" 2>/dev/null
+    log_debug "State initialized"
+}
 
 # ==============================================================================
 # [ Boot Detection ]
 # ==============================================================================
 
-wait_for_boot() {
+_wait_for_boot() {
     local count=0
     local max=60
     
@@ -35,23 +39,15 @@ wait_for_boot() {
 # [ Inotify Module Watcher ]
 # ==============================================================================
 
-start_inotify_module() {
+_start_inotify_module() {
     [ -f "$DISPATCHER_SCRIPT" ] && [ ! -x "$DISPATCHER_SCRIPT" ] && chmod +x "$DISPATCHER_SCRIPT" 2>/dev/null
     pkill -f "inotifyd.*dispatcher" 2>/dev/null || true
     
-    # Single inotifyd monitors MAGISK_MOD_DIR for all events:
-    # n=new(create), d=delete, c=create, w=close_write
-    # Use 'dw' to avoid duplicate events on creation (n + w)
-    nohup inotifyd "$DISPATCHER_SCRIPT" "$MAGISK_MOD_DIR:dw" >/dev/null 2>&1 &
+    mkdir -p "$EVENTS_DIR"
     
-    # Wait for inotifyd to be ready
-    sleep 1
-}
-
-# Ensure scripts are executable
-_ensure_permissions() {
-    [ -f "$START_SCRIPT" ] && [ ! -x "$START_SCRIPT" ] && chmod +x "$START_SCRIPT" 2>/dev/null
-    return 0
+    # Monitor MAGISK_MOD_DIR (disable toggle) ::nd (New, Delete)
+    # Monitor EVENTS_DIR (internal events) ::n (New only)
+    nohup inotifyd "$DISPATCHER_SCRIPT" "$MAGISK_MOD_DIR:nd" "$EVENTS_DIR:n" >/dev/null 2>&1 &
 }
 
 # ==============================================================================
@@ -59,13 +55,15 @@ _ensure_permissions() {
 # ==============================================================================
 
 main() {
-    run "Wait for boot" wait_for_boot || exit 1
+    run "Wait for boot" _wait_for_boot || exit 1
 
     sleep 3
 
-    run "Set permissions" _ensure_permissions
-    run "Start watcher" start_inotify_module
-    run "Init state" state_init
+    run "Start watcher" _start_inotify_module
+
+    sleep 1
+    
+    run "Init state" _state_init
 
     [ -f "$MAGISK_MOD_DIR/disable" ] && exit 0
 

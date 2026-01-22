@@ -11,58 +11,50 @@
 # ==============================================================================
 
 _init_config_defaults() {
-    local line key default current
-    for line in \
-        "SUBSCRIPTION_URL:" \
-        "UPDATE_TIMEOUT:15" \
-        "UPDATE_INTERVAL:86400" \
-        "RETRY_COUNT:2" \
-        "LOG_LEVEL:3" \
-        "LOG_MAX_SIZE:1048576" \
-        "CORE_TIMEOUT:5" \
-        "CORE_USER:root" \
-        "CORE_GROUP:root" \
-        "ROUTING_MARK:" \
-        "PROXY_TCP_PORT:1536" \
-        "PROXY_UDP_PORT:1536" \
-        "PROXY_MODE:0" \
-        "DNS_HIJACK_ENABLE:1" \
-        "DNS_PORT:1053" \
-        "MOBILE_INTERFACE:rmnet_data+" \
-        "WIFI_INTERFACE:wlan0" \
-        "HOTSPOT_INTERFACE:wlan2" \
-        "USB_INTERFACE:rndis+" \
-        "PROXY_MOBILE:1" \
-        "PROXY_WIFI:1" \
-        "PROXY_HOTSPOT:0" \
-        "PROXY_USB:0" \
-        "PROXY_TCP:1" \
-        "PROXY_UDP:1" \
-        "PROXY_IPV6:0" \
-        "MARK_VALUE:20" \
-        "MARK_VALUE6:25" \
-        "TABLE_ID:2025" \
-        "APP_PROXY_ENABLE:0" \
-        "APP_PROXY_MODE:1" \
-        "PROXY_APPS_LIST:" \
-        "BYPASS_APPS_LIST:" \
-        "MAC_FILTER_ENABLE:0" \
-        "MAC_PROXY_MODE:1" \
-        "PROXY_MACS_LIST:" \
-        "BYPASS_MACS_LIST:" \
-        "SKIP_CHECK_FEATURE:0" \
-        "FAKEIP_RANGE_V4:198.18.0.0/15" \
-        "FAKEIP_RANGE_V6:fc00::/18" \
-        "IP_MONITOR_BATCH_INTERVAL:60"
-    do
-        key="${line%%:*}"
-        default="${line#*:}"
-        eval "current=\"\$$key\""
-        [ -z "$current" ] && eval "$key='$default'"
-    done
+    : "${SUBSCRIPTION_URL:=}"
+    : "${UPDATE_TIMEOUT:=15}"
+    : "${UPDATE_INTERVAL:=86400}"
+    : "${RETRY_COUNT:=2}"
+    : "${LOG_LEVEL:=3}"
+    : "${LOG_MAX_SIZE:=1048576}"
+    : "${CORE_TIMEOUT:=5}"
+    : "${CORE_USER:=root}"
+    : "${CORE_GROUP:=root}"
+    : "${ROUTING_MARK:=}"
+    : "${PROXY_TCP_PORT:=1536}"
+    : "${PROXY_UDP_PORT:=1536}"
+    : "${PROXY_MODE:=0}"
+    : "${DNS_HIJACK_ENABLE:=1}"
+    : "${DNS_PORT:=1053}"
+    : "${MOBILE_INTERFACE:=rmnet_data+}"
+    : "${WIFI_INTERFACE:=wlan0}"
+    : "${HOTSPOT_INTERFACE:=wlan2}"
+    : "${USB_INTERFACE:=rndis+}"
+    : "${PROXY_MOBILE:=1}"
+    : "${PROXY_WIFI:=1}"
+    : "${PROXY_HOTSPOT:=0}"
+    : "${PROXY_USB:=0}"
+    : "${PROXY_TCP:=1}"
+    : "${PROXY_UDP:=1}"
+    : "${PROXY_IPV6:=0}"
+    : "${MARK_VALUE:=20}"
+    : "${MARK_VALUE6:=25}"
+    : "${TABLE_ID:=2025}"
+    : "${APP_PROXY_ENABLE:=0}"
+    : "${APP_PROXY_MODE:=1}"
+    : "${PROXY_APPS_LIST:=}"
+    : "${BYPASS_APPS_LIST:=}"
+    : "${MAC_FILTER_ENABLE:=0}"
+    : "${MAC_PROXY_MODE:=1}"
+    : "${PROXY_MACS_LIST:=}"
+    : "${BYPASS_MACS_LIST:=}"
+    : "${SKIP_CHECK_FEATURE:=0}"
+    : "${FAKEIP_RANGE_V4:=198.18.0.0/15}"
+    : "${FAKEIP_RANGE_V6:=fc00::/18}"
+    : "${DEBOUNCE_INTERVAL:=10}"
 }
 
-_load_config_json_values() {
+_extract_json_config() {
     local jq_bin="$TOOLS_DIR/jq"
     [ ! -x "$jq_bin" ] || [ ! -f "$CONFIG_FILE" ] && return 1
     
@@ -127,10 +119,6 @@ reset_validation() {
     VALIDATION_WARNING_COUNT=0
 }
 
-validation_passed() {
-    [ -z "$VALIDATION_ERRORS" ]
-}
-
 
 # ==============================================================================
 # [ Settings Validation ]
@@ -182,7 +170,7 @@ APP_PROXY_MODE:1:2
 MAC_FILTER_ENABLE:0:1
 MAC_PROXY_MODE:1:2
 SKIP_CHECK_FEATURE:0:1
-IP_MONITOR_BATCH_INTERVAL:0:300
+DEBOUNCE_INTERVAL:0:300
 "
 
 validate_settings() {
@@ -269,6 +257,9 @@ validate_singbox_config() {
 
 validate_all() {
     log_info "Validating environment..."
+
+    load_flux_config
+    _extract_json_config
     
     reset_validation
 
@@ -297,5 +288,4 @@ load_flux_config() {
     fi
     
     _init_config_defaults
-    _load_config_json_values
 }

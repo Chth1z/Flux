@@ -5,27 +5,22 @@
 # Description: sing-box process control (start/stop/watch)
 # ==============================================================================
 
+
 # ==============================================================================
 # [ Environment Setup ]
 # ==============================================================================
 
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
-
-# Load dependencies
 . "$SCRIPT_DIR/const"
 . "$SCRIPT_DIR/log"
-
-# Load config cache (needed for SING_BOX_USER, etc.)
 [ -f "$CACHE_CONFIG_FILE" ] && { set -a; . "$CACHE_CONFIG_FILE"; set +a; }
 
 export LOG_COMPONENT="Singbox"
-
 
 # ==============================================================================
 # [ Helper Functions ]
 # ==============================================================================
 
-# Launch sing-box process
 _launch_singbox() {
     # Set resource limits
     ulimit -SHn 1000000 2>/dev/null
@@ -43,7 +38,6 @@ _launch_singbox() {
     echo $! > "$PID_FILE"
 }
 
-# Check port availability using ss (preferred) or netstat
 _check_port() {
     local port="$1"
     if [ -x "/system/bin/ss" ] || command -v ss >/dev/null; then
@@ -53,7 +47,6 @@ _check_port() {
     fi
 }
 
-# Wait for core to be ready (port listening)
 _wait_for_ready() {
     local count=0
     
@@ -66,18 +59,14 @@ _wait_for_ready() {
     return 1
 }
 
-# Get PID from file
 _get_pid() {
     [ -f "$PID_FILE" ] && cat "$PID_FILE" 2>/dev/null
 }
-
-# Check if process is running
 _is_process_running() {
     local pid="$1"
     [ -n "$pid" ] && [ -d "/proc/$pid" ]
 }
 
-# Kill core process
 _kill_core() {
     local pid
     pid=$(_get_pid)
@@ -99,26 +88,6 @@ _kill_core() {
     rm -f "$PID_FILE"
 }
 
-
-# ==============================================================================
-# [ Core Status Check ]
-# ==============================================================================
-
-is_core_running() {
-    local pid
-    pid=$(_get_pid)
-    
-    if ! _is_process_running "$pid"; then
-        return 1
-    fi
-    
-    # Verify port is listening (reuse _check_port helper)
-    _check_port "$PROXY_TCP_PORT" && return 0
-    
-    return 1
-}
-
-
 # ==============================================================================
 # [ Start Core ]
 # ==============================================================================
@@ -130,21 +99,14 @@ start_core() {
     return 0
 }
 
-
 # ==============================================================================
 # [ Stop Core ]
 # ==============================================================================
 
 stop_core() {
-    if ! is_core_running; then
-        log_debug "Core already stopped"
-        return 0
-    fi
-    
     run "Kill process" _kill_core || return 1
     return 0
 }
-
 
 # ==============================================================================
 # [ Entry Point ]
@@ -157,17 +119,8 @@ case "${1:-}" in
     stop)
         stop_core
         ;;
-    status)
-        if is_core_running; then
-            echo "running"
-            exit 0
-        else
-            echo "stopped"
-            exit 1
-        fi
-        ;;
     *)
-        echo "Usage: $0 {start|stop|status}"
+        echo "Usage: $0 {start|stop}"
         exit 1
         ;;
 esac

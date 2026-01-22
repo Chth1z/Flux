@@ -32,7 +32,6 @@ _init_kernel_features() {
     log_debug "Kernel features: addrtype=$_KFEAT_ADDRTYPE conntrack=$_KFEAT_CONNTRACK owner=$_KFEAT_OWNER mark=$_KFEAT_MARK mac=$_KFEAT_MAC"
 }
 
-
 # ==============================================================================
 # [ Interface Configuration ]
 # ==============================================================================
@@ -47,12 +46,10 @@ usb|${USB_INTERFACE}|${PROXY_USB}||
 EOF
 }
 
-
 # ==============================================================================
 # [ Rule Building Functions ]
 # ==============================================================================
 
-# Build interface rules (optimized with variable collection)
 _build_interface_rules() {
     local suffix="$1"
     local table="$2"
@@ -92,7 +89,6 @@ EOF
     echo "-A PROXY_INTERFACE${suffix} -j ACCEPT"
 }
 
-# Build private IP bypass rules (optimized)
 _build_bypass_ip_rules() {
     local suffix="$1"
     local family="$2"
@@ -126,80 +122,75 @@ _build_bypass_ip_rules() {
     printf '%s' "$rules"
 }
 
-# Build APP filtering rules (optimized)
 _build_app_rules() {
     local suffix="$1"
     local has_owner="$2"
     local has_mark="$3"
-    local rules=""
     
     # Core process bypass
     if [ "$has_owner" -eq 1 ]; then
-        rules="-A APP_CHAIN${suffix} -m owner --uid-owner $CORE_USER --gid-owner $CORE_GROUP -j ACCEPT
-"
+        echo "-A APP_CHAIN${suffix} -m owner --uid-owner $CORE_USER --gid-owner $CORE_GROUP -j ACCEPT"
     elif [ "$has_mark" -eq 1 ] && [ -n "$ROUTING_MARK" ]; then
-        rules="-A APP_CHAIN${suffix} -m mark --mark $ROUTING_MARK -j ACCEPT
-"
+        echo "-A APP_CHAIN${suffix} -m mark --mark $ROUTING_MARK -j ACCEPT"
     fi
     
     # Per-app proxy rules
+    log_debug "Building app rules: ENABLE=$APP_PROXY_ENABLE OWNER=$has_owner MODE=$APP_PROXY_MODE"
     if [ "$APP_PROXY_ENABLE" -eq 1 ] && [ "$has_owner" -eq 1 ]; then
         local uids=""
         case "$APP_PROXY_MODE" in
             1) # Blacklist
                 [ -n "$BYPASS_APPS_LIST" ] && uids=$(find_packages_uid "$BYPASS_APPS_LIST")
-                for uid in $uids; do
-                    [ -n "$uid" ] && rules="${rules}-A APP_CHAIN${suffix} -m owner --uid-owner ${uid} -j ACCEPT
-"
-                done
-                rules="${rules}-A APP_CHAIN${suffix} -j RETURN
-"
+                if [ -n "$uids" ]; then
+                    echo "$uids" | awk -v suffix="$suffix" '{
+                        for(i=1; i<=NF; i++) print "-A APP_CHAIN" suffix " -m owner --uid-owner " $i " -j ACCEPT"
+                    }'
+                else 
+                    log_debug "App rules (Blacklist): No UIDs found"
+                fi
+                echo "-A APP_CHAIN${suffix} -j RETURN"
                 ;;
             2) # Whitelist
                 [ -n "$PROXY_APPS_LIST" ] && uids=$(find_packages_uid "$PROXY_APPS_LIST")
-                for uid in $uids; do
-                    [ -n "$uid" ] && rules="${rules}-A APP_CHAIN${suffix} -m owner --uid-owner ${uid} -j RETURN
-"
-                done
-                rules="${rules}-A APP_CHAIN${suffix} -j ACCEPT
-"
+                log_debug "App rules (Whitelist): Found UIDs count=$(echo "$uids" | wc -w)"
+                if [ -n "$uids" ]; then
+                    echo "$uids" | awk -v suffix="$suffix" '{
+                        for(i=1; i<=NF; i++) print "-A APP_CHAIN" suffix " -m owner --uid-owner " $i " -j RETURN"
+                    }'
+                else
+                    log_debug "App rules (Whitelist): No UIDs found from $(echo "$PROXY_APPS_LIST" | wc -w) packages"
+                fi
+                echo "-A APP_CHAIN${suffix} -j ACCEPT"
                 ;;
         esac
     fi
-    
-    printf '%s' "$rules"
 }
 
-# Build MAC filtering rules (optimized)
 _build_mac_rules() {
     local suffix="$1"
     local has_mac="$2"
-    local rules=""
     
     if [ "$MAC_FILTER_ENABLE" -eq 1 ] && [ "$PROXY_HOTSPOT" -eq 1 ] && [ -n "$HOTSPOT_INTERFACE" ] && [ "$has_mac" -eq 1 ]; then
         if [ "$MAC_PROXY_MODE" -eq 1 ]; then
             # Blacklist
-            for mac in $BYPASS_MACS_LIST; do
-                [ -n "$mac" ] && rules="${rules}-A MAC_CHAIN${suffix} -m mac --mac-source ${mac} -i ${HOTSPOT_INTERFACE} -j ACCEPT
-"
-            done
-            rules="${rules}-A MAC_CHAIN${suffix} -i ${HOTSPOT_INTERFACE} -j RETURN
-"
+            if [ -n "$BYPASS_MACS_LIST" ]; then
+                echo "$BYPASS_MACS_LIST" | awk -v suffix="$suffix" -v iface="$HOTSPOT_INTERFACE" '{
+                     for(i=1; i<=NF; i++) print "-A MAC_CHAIN" suffix " -m mac --mac-source " $i " -i " iface " -j ACCEPT"
+                }'
+            fi
+            echo "-A MAC_CHAIN${suffix} -i ${HOTSPOT_INTERFACE} -j RETURN"
         else
             # Whitelist
-            for mac in $PROXY_MACS_LIST; do
-                [ -n "$mac" ] && rules="${rules}-A MAC_CHAIN${suffix} -m mac --mac-source ${mac} -i ${HOTSPOT_INTERFACE} -j RETURN
-"
-            done
-            rules="${rules}-A MAC_CHAIN${suffix} -i ${HOTSPOT_INTERFACE} -j ACCEPT
-"
+            if [ -n "$PROXY_MACS_LIST" ]; then
+                echo "$PROXY_MACS_LIST" | awk -v suffix="$suffix" -v iface="$HOTSPOT_INTERFACE" '{
+                     for(i=1; i<=NF; i++) print "-A MAC_CHAIN" suffix " -m mac --mac-source " $i " -i " iface " -j RETURN"
+                }'
+            fi
+            echo "-A MAC_CHAIN${suffix} -i ${HOTSPOT_INTERFACE} -j ACCEPT"
         fi
     fi
-    
-    printf '%s' "$rules"
 }
 
-# Build DNS hijack rules for mangle table
 _build_dns_hijack_mangle_rules() {
     local suffix="$1"
     local mode="$2"
@@ -224,12 +215,10 @@ EOF
     fi
 }
 
-
 # ==============================================================================
 # [ Main Rule Generation ]
 # ==============================================================================
 
-# Generate complete iptables-restore compatible ruleset
 _build_proxy_rules() {
     local family="$1"
     local mode="$2"
@@ -304,12 +293,10 @@ EOF
     echo "COMMIT"
 }
 
-
 # ==============================================================================
 # [ Public Interface - Rule Generation ]
 # ==============================================================================
 
-# Generate all rules for a given family
 _generate_all_rules() {
     local family="$1"
     local mode="$2"
@@ -465,7 +452,6 @@ _build_nat_extra_cleanup_rules() {
     printf '%s' "${rules}COMMIT
 "
 }
-
 
 # ==============================================================================
 # [ Cleanup Rules ]

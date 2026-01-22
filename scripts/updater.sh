@@ -8,7 +8,6 @@ SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 . "$SCRIPT_DIR/const"
 . "$SCRIPT_DIR/log"
 . "$SCRIPT_DIR/config"
-. "$SCRIPT_DIR/state"
 
 LOG_COMPONENT="Update"
 
@@ -34,19 +33,9 @@ _retry() {
     return 1
 }
 
-_is_file_stale() {
-    local file="$1" days="${2:-7}"
-    [ ! -f "$file" ] && return 0
-    local now mtime
-    now=$(date +%s)
-    mtime=$(stat -c %Y "$file" 2>/dev/null || echo 0)
-    [ $((now - mtime)) -gt $((days * 86400)) ]
-}
-
 _cleanup() {
     rm -f "$TMP_SUB_CONVERTED" "$TMP_NODES_EXTRACTED" "$GENERATE_FILE" 2>/dev/null
 }
-
 
 # ==============================================================================
 # [ Pipeline Steps ]
@@ -110,15 +99,18 @@ _validate_config() {
     [ "$nodes_count" -gt 0 ]
 }
 
-
 # ==============================================================================
 # [ Update Logic ]
 # ==============================================================================
 
 should_update() {
-    local last_update elapsed
-    last_update=$(_state_get "last_update")
-    [ -z "$last_update" ] && return 0
+    [ ! -f "$CONFIG_FILE" ] && return 0
+    
+    local last_update
+    last_update=$(stat -c%Y "$CONFIG_FILE" 2>/dev/null || stat -f%m "$CONFIG_FILE" 2>/dev/null || echo 0)
+    [ "$last_update" -eq 0 ] && return 0
+    
+    local elapsed
     elapsed=$(($(date +%s) - last_update))
     [ "$elapsed" -ge "$UPDATE_INTERVAL" ]
 }
@@ -129,10 +121,7 @@ do_update() {
     run "Filter proxies" _filter_proxies || return 1
     run "Merge config" _merge_config || return 1
     run "Validate config" _validate_config || return 1
-
-    _state_set "last_update" "$(date +%s)"
 }
-
 
 # ==============================================================================
 # [ Entry Point ]

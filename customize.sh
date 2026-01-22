@@ -218,15 +218,10 @@ main() {
             cp -f "$CONF_DIR/settings.ini" "$TMP_BACKUP/settings.ini"
             has_settings=true
         fi
-        # Backup config.json (user choice) - with state file
+        # Backup config.json (user choice)
         if [ -f "$CONF_DIR/config.json" ]; then
             cp -f "$CONF_DIR/config.json" "$TMP_BACKUP/config.json"
             has_config=true
-            # Also backup state file if exists (contains last_update timestamp)
-            if [ -f "$FLUX_DIR/.state" ]; then
-                cp -f "$FLUX_DIR/.state" "$TMP_BACKUP/.state"
-                has_timestamp=true
-            fi
         fi
         # Backup pref.toml (user choice)
         if [ -f "$TOOLS_DIR/pref.toml" ]; then
@@ -277,14 +272,8 @@ main() {
     if [ "$has_config" = "true" ]; then
         if choose_action "Keep [config.json]?" "true"; then
             cp -f "$TMP_BACKUP/config.json" "$CONF_DIR/config.json"
-            # Restore state file (contains last_update) if it was backed up
-            if [ "$has_timestamp" = "true" ]; then
-                cp -f "$TMP_BACKUP/.state" "$FLUX_DIR/.state"
-            fi
             ui_print "  > config.json: restored"
         else
-            # Reset config.json means also reset state file
-            rm -f "$FLUX_DIR/.state" 2>/dev/null
             ui_print "  > config.json: reset to default"
         fi
     fi

@@ -48,54 +48,6 @@ _log() {
     fi
 }
 
-log_debug() { _log "D" 4 "$1"; }
-log_info()  { _log "I" 3 "$1"; }
-log_warn()  { _log "W" 2 "$1"; }
-log_error() { _log "E" 1 "$1"; }
-
-
-# ==============================================================================
-# [ Step Executor ]
-# ==============================================================================
-# Usage: run "Step Name" command [args...]
-# Success: logs "Step Name: OK"
-# Failure: logs error and returns error code
-# Note: prop_error should be called by orchestrator based on exit codes
-
-run() {
-    local name="$1"
-    shift
-    
-    if "$@"; then
-        log_debug "$name: OK"
-        return 0
-    else
-        local rc=$?
-        log_error "$name: FAILED"
-        prop_error "$name: FAILED"
-        return $rc
-    fi
-}
-
-
-# ==============================================================================
-# [ Log Rotation ]
-# ==============================================================================
-
-rotate_log() {
-    [ ! -f "$LOG_FILE" ] && return 0
-    
-    local max_size="${LOG_MAX_SIZE:-1048576}"
-    local current_size
-    current_size=$(stat -c%s "$LOG_FILE" 2>/dev/null || stat -f%z "$LOG_FILE" 2>/dev/null || echo 0)
-    
-    if [ "$current_size" -gt "$max_size" ]; then
-        log_info "Rotating log file (size: $current_size > $max_size)"
-        mv -f "$LOG_FILE" "${LOG_FILE}.1" 2>/dev/null
-    fi
-    return 0
-}
-
 
 # ==============================================================================
 # [ Unified Prop Status ]
@@ -169,37 +121,32 @@ _prop_write() {
     
     local full_desc="${_PROP_ORIG_DESC}\\n${status}"
     
-    # Rewrite file (sed -i may not work on Android)
-    local content="" line newline="
-"
-    while IFS= read -r line || [ -n "$line" ]; do
-        case "$line" in
-            description=*) content="${content}description=${full_desc}${newline}" ;;
-            *) content="${content}${line}${newline}" ;;
-        esac
-    done < "$PROP_FILE"
-    printf '%s' "$content" > "$PROP_FILE" 2>/dev/null
+    # Use awk with ENVIRON to avoid escape sequence issues
+    # Use memory buffer to avoid temp file
+    local content
+    content=$(DESC="$full_desc" awk '
+        /^description=/ { print "description=" ENVIRON["DESC"]; next }
+        { print }
+    ' "$PROP_FILE")
+    
+    printf '%s\n' "$content" > "$PROP_FILE" 2>/dev/null
     
     log_debug "Prop: $status"
 }
 
-# Build left part from state (accepts optional state parameter to avoid duplicate file reads)
+# Build left part from state
 # Usage: _prop_build_left [state]
-#   - If state is provided, use it directly
-#   - If not provided, derive from get_service_state()
 _prop_build_left() {
-    local state="${1:-}"
+    local state
     
-    # Fallback: derive state from files if not provided
-    if [ -z "$state" ]; then
-        # Check for fail event file first
-        if [ -f "$EVENTS_DIR/fail" ]; then
-            state="FAILED"
-        elif [ -f "$MAGISK_MOD_DIR/disable" ]; then
-            state="STOPPED"
-        else
-            state="RUNNING"
-        fi
+    if [ -f "$EVENTS_DIR/fail" ]; then
+        state="FAILED"
+    elif [ -f "$MAGISK_MOD_DIR/disable" ]; then
+        state="STOPPED"
+    elif [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null; then
+        state="RUNNING"
+    else
+        state="STOPPED"
     fi
     
     local emoji
@@ -217,19 +164,36 @@ _prop_build_left() {
 }
 
 # ==============================================================================
+# [ Log Rotation ]
+# ==============================================================================
+
+rotate_log() {
+    [ ! -f "$LOG_FILE" ] && return 0
+    
+    local max_size="${LOG_MAX_SIZE:-1048576}"
+    local current_size
+    current_size=$(stat -c%s "$LOG_FILE" 2>/dev/null || stat -f%z "$LOG_FILE" 2>/dev/null || echo 0)
+    
+    if [ "$current_size" -gt "$max_size" ]; then
+        log_info "Rotating log file (size: $current_size > $max_size)"
+        mv -f "$LOG_FILE" "${LOG_FILE}.1" 2>/dev/null
+    fi
+    return 0
+}
+
+# ==============================================================================
 # [ Public API ]
 # ==============================================================================
 
 # Sync state to prop (update left, preserve right)
-# Usage: sync_prop [state] - pass state to avoid duplicate file reads
+# Usage: sync_prop [state]
 sync_prop() {
-    local state="${1:-}"
     local current right
     current=$(_prop_read_status)
     right=$(_prop_get_right "$current")
     
     local left
-    left=$(_prop_build_left "$state")
+    left=$(_prop_build_left)
     
     _prop_write "$left" "$right"
 }
@@ -270,5 +234,22 @@ prop_clear() {
     _prop_write "$left" ""
 }
 
-# Legacy compatibility
-update_prop_status() { sync_prop; }
+run() {
+    local name="$1"
+    shift
+    
+    if "$@"; then
+        log_info "$name: OK"
+        return 0
+    else
+        local rc=$?
+        log_error "$name: FAILED"
+        prop_error "$name: FAILED"
+        return $rc
+    fi
+}
+
+log_debug() { _log "D" 4 "$1"; }
+log_info()  { _log "I" 3 "$1"; }
+log_warn()  { _log "W" 2 "$1"; }
+log_error() { _log "E" 1 "$1"; }

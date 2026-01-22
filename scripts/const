@@ -5,6 +5,7 @@
 # Description: All path, state, and network constant definitions
 # ==============================================================================
 
+
 # ==============================================================================
 # [ Directory Structure ]
 # ==============================================================================
@@ -14,58 +15,50 @@ readonly BIN_DIR="$FLUX_DIR/bin"
 readonly CONF_DIR="$FLUX_DIR/conf"
 readonly SCRIPTS_DIR="$FLUX_DIR/scripts"
 readonly RUN_DIR="$FLUX_DIR/run"
+readonly EVENTS_DIR="$RUN_DIR/event"
 readonly TOOLS_DIR="$FLUX_DIR/tools"
 readonly CACHE_DIR="$FLUX_DIR/cache"
 readonly MAGISK_MOD_DIR="/data/adb/modules/flux"
 
 # ==============================================================================
-# [ Core Files ]
+# [ Core Binaries & Environment ]
 # ==============================================================================
 
 readonly SING_BOX_BIN="$BIN_DIR/sing-box"
 readonly SUBCONVERTER_BIN="$TOOLS_DIR/subconverter"
 readonly JQ_BIN="$TOOLS_DIR/jq"
+
+PATH="/data/adb/magisk:/data/adb/ksu/bin:/data/adb/ap/bin:$PATH"
+
+# ==============================================================================
+# [ Configuration Files ]
+# ==============================================================================
+
 readonly CONFIG_FILE="$CONF_DIR/config.json"
 readonly SETTINGS_FILE="$CONF_DIR/settings.ini"
+readonly PROP_FILE="$MAGISK_MOD_DIR/module.prop"
+readonly PACKAGES_LIST="/data/system/packages.list"
+
+# ==============================================================================
+# [ Runtime & Log Files ]
+# ==============================================================================
+
 readonly PID_FILE="$RUN_DIR/sing-box.pid"
 readonly MONITOR_PID_FILE="$RUN_DIR/ipmonitor.pid"
 readonly LOG_FILE="$RUN_DIR/flux.log"
-readonly PROP_FILE="$MAGISK_MOD_DIR/module.prop"
 
 # ==============================================================================
-# [ Scripts ]
+# [ Internal Scripts ]
 # ==============================================================================
 
-readonly TPROXY_SCRIPT="$SCRIPTS_DIR/tproxy"
-readonly UPDATE_SCRIPT="$SCRIPTS_DIR/updater.sh"
-readonly START_SCRIPT="$SCRIPTS_DIR/start"
-readonly CORE_SCRIPT="$SCRIPTS_DIR/core"
-readonly CONFIG_SCRIPT="$SCRIPTS_DIR/config"
-readonly MONITOR_SCRIPT="$SCRIPTS_DIR/ipmonitor"
-readonly INOTIFY_SCRIPT="$SCRIPTS_DIR/inotify"
-readonly CACHE_SCRIPT="$SCRIPTS_DIR/cache"
-readonly DISPATCHER_SCRIPT="$SCRIPTS_DIR/dispatcher"
 readonly INIT_SCRIPT="$SCRIPTS_DIR/init"
-readonly IP_HANDLER_SCRIPT="$SCRIPTS_DIR/ip_handler"
-
-# Events directory - same as module dir so single inotifyd can monitor all
-readonly EVENTS_DIR="$MAGISK_MOD_DIR"
-
-# ==============================================================================
-# [ Temporary Files ]
-# ==============================================================================
-
-readonly TMP_SUB_CONVERTED="$RUN_DIR/sub_temp.json"
-readonly TMP_NODES_EXTRACTED="$RUN_DIR/nodes.json"
-readonly GENERATE_FILE="$TOOLS_DIR/generate.ini"
-
-# ==============================================================================
-# [ Module Files ]
-# ==============================================================================
-
-readonly TEMPLATE_FILE="$TOOLS_DIR/base/singbox.json"
-readonly CONFIG_BACKUP="$CONF_DIR/config.json.bak"
-readonly COUNTRY_MAP_FILE="$TOOLS_DIR/base/country_map.json"
+readonly CORE_SCRIPT="$SCRIPTS_DIR/core"
+readonly TPROXY_SCRIPT="$SCRIPTS_DIR/tproxy"
+readonly CACHE_SCRIPT="$SCRIPTS_DIR/cache"
+readonly UPDATE_SCRIPT="$SCRIPTS_DIR/updater.sh"
+readonly MONITOR_SCRIPT="$SCRIPTS_DIR/ipmonitor"
+readonly DISPATCHER_SCRIPT="$SCRIPTS_DIR/dispatcher"
+readonly IP_HANDLER_SCRIPT="$SCRIPTS_DIR/iphandler"
 
 # ==============================================================================
 # [ Cache Files ]
@@ -73,65 +66,41 @@ readonly COUNTRY_MAP_FILE="$TOOLS_DIR/base/country_map.json"
 
 readonly CACHE_META_FILE="$CACHE_DIR/cache_meta"
 readonly CACHE_CONFIG_FILE="$CACHE_DIR/cache_config"
+readonly KERNEL_CACHE_FILE="$CACHE_DIR/cache_kernel"
+
 readonly CACHE_RULES_V4_FILE="$CACHE_DIR/cache_rules_ipv4"
 readonly CACHE_RULES_V6_FILE="$CACHE_DIR/cache_rules_ipv6"
 readonly CACHE_CLEANUP_V4_FILE="$CACHE_DIR/cache_cleanup_ipv4"
 readonly CACHE_CLEANUP_V6_FILE="$CACHE_DIR/cache_cleanup_ipv6"
-readonly KERNEL_CACHE_FILE="$CACHE_DIR/cache_kernel"
 
 # ==============================================================================
-# [ State Files ]
+# [ Tool & Template Resources ]
 # ==============================================================================
 
-readonly STATE_FILE="$FLUX_DIR/.state"
+readonly TEMPLATE_FILE="$TOOLS_DIR/base/singbox.json"
+readonly COUNTRY_MAP_FILE="$TOOLS_DIR/base/country_map.json"
 
 # ==============================================================================
-# [ State Constants - Simplified (3 Result States) ]
+# [ Temporary Artifacts (Updater) ]
 # ==============================================================================
 
-readonly STATE_STOPPED="STOPPED"
-readonly STATE_RUNNING="RUNNING"
-readonly STATE_FAILED="FAILED"
-
-readonly COMP_CORE="core"
-readonly COMP_TPROXY="tproxy"
-readonly COMP_SERVICE="service"
-
-readonly STATE_TRANSITIONS="
-STOPPED->RUNNING
-STOPPED->FAILED
-RUNNING->STOPPED
-RUNNING->FAILED
-FAILED->RUNNING
-FAILED->STOPPED
-"
-
-# ==============================================================================
-# [ System Constants ]
-# ==============================================================================
-
-readonly PACKAGES_LIST="/data/system/packages.list"
-readonly SYNC_INTERVAL=1800
+readonly CONFIG_BACKUP="$CONF_DIR/config.json.bak"
+readonly TMP_SUB_CONVERTED="$RUN_DIR/sub_temp.json"
+readonly TMP_NODES_EXTRACTED="$RUN_DIR/nodes.json"
+readonly GENERATE_FILE="$TOOLS_DIR/generate.ini"
 
 # ==============================================================================
 # [ Network Constants ]
 # ==============================================================================
 
-readonly PRIVATE_SUBNETS_V4_COMPACT="0.0.0.0/8 10.0.0.0/8 100.0.0.0/8 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.0.0.0/24 192.0.2.0/24 192.88.99.0/24 192.168.0.0/16 198.51.100.0/24 203.0.113.0/24 224.0.0.0/4 240.0.0.0/4 255.255.255.255/32"
-readonly PRIVATE_SUBNETS_V6_COMPACT="::/128 ::1/128 ::ffff:0:0/96 100::/64 64:ff9b::/96 2001::/32 2001:10::/28 2001:20::/28 2001:db8::/32 2002::/16 fe80::/10 ff00::/8"
 readonly PROXY_CHAINS="PROXY_PREROUTING PROXY_OUTPUT BYPASS_IP BYPASS_INTERFACE PROXY_INTERFACE DNS_HIJACK_PRE DNS_HIJACK_OUT APP_CHAIN MAC_CHAIN"
 
-readonly USER_AGENT="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+readonly PRIVATE_SUBNETS_V4_COMPACT="0.0.0.0/8 10.0.0.0/8 100.0.0.0/8 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.0.0.0/24 192.0.2.0/24 192.88.99.0/24 192.168.0.0/16 198.51.100.0/24 203.0.113.0/24 224.0.0.0/4 240.0.0.0/4 255.255.255.255/32"
+
+readonly PRIVATE_SUBNETS_V6_COMPACT="::/128 ::1/128 ::ffff:0:0/96 100::/64 64:ff9b::/96 2001::/32 2001:10::/28 2001:20::/28 2001:db8::/32 2002::/16 fe80::/10 ff00::/8"
 
 # ==============================================================================
-# [ Exports ]
-# ==============================================================================
-
-export PATH="$BIN_DIR:/data/adb/magisk:/data/adb/ksu/bin:$PATH"
-export FLUX_DIR BIN_DIR CONF_DIR SCRIPTS_DIR RUN_DIR TOOLS_DIR CACHE_DIR
-
-# ==============================================================================
-# [ JQ Scripts ]
+# [ JQ Logic Scripts ]
 # ==============================================================================
 
 readonly JQ_SCRIPT_BUILD_REGEX='

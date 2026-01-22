@@ -1,0 +1,136 @@
+#!/system/bin/sh
+
+# ==============================================================================
+# Flux IP Handler (ip_handler)
+# Description: Performs full IP synchronization with iptables
+# Triggered by: dispatcher (on ip_sync event)
+# ==============================================================================
+
+SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+. "$SCRIPT_DIR/const"
+. "$SCRIPT_DIR/log"
+[ -f "$CACHE_CONFIG_FILE" ] && { set -a; . "$CACHE_CONFIG_FILE"; set +a; }
+
+export LOG_COMPONENT="Handler"
+
+# ==============================================================================
+# [ Constants ]
+# ==============================================================================
+
+# Android 11+ requires -w for iptables lock
+buildVersion=$(getprop ro.build.version.release 2>/dev/null)
+buildVersionMajor=${buildVersion%%.*}
+
+if [ "${buildVersionMajor:-0}" -ge 11 ]; then
+    IPT_OPTS="-w 100"
+fi
+
+# Determine table based on proxy mode
+if [ "${PROXY_MODE:-0}" -eq 2 ]; then
+    PRIMARY_TABLE="nat"
+else
+    PRIMARY_TABLE="mangle"
+fi
+
+# ==============================================================================
+# [ Helper Functions ]
+# ==============================================================================
+
+_ipt_cmd() {
+    local proto="$1"
+    shift
+    if [ "$proto" = "6" ]; then
+        ip6tables $IPT_OPTS "$@"
+    else
+        iptables $IPT_OPTS "$@"
+    fi
+}
+
+# ==============================================================================
+# [ Sync Logic ]
+# ==============================================================================
+
+sync_all_addresses() {
+    # --- IPv4 Sync ---
+    # Use awk to generate iptables-restore content directly from ip output
+    # This avoids slow shell loops and string concatenation
+    if ! ip -4 addr show 2>/dev/null | awk -v primary="$PRIMARY_TABLE" '
+    BEGIN {
+        count=0
+    }
+    /inet / {
+        ip = $2
+        # Filter 127.* and 0.*
+        if (ip ~ /^127\./ || ip ~ /^0\./) next
+        
+        ips[count++] = ip
+    }
+    END {
+        # Block 1: Primary Table
+        print "*" primary
+        print ":LOCAL_IP - [0:0]"
+        for (i=0; i<count; i++) {
+            print "-A LOCAL_IP -d " ips[i] " -p udp ! --dport 53 -j ACCEPT"
+            print "-A LOCAL_IP -d " ips[i] " ! -p udp -j ACCEPT"
+        }
+        print "COMMIT"
+        
+        # Block 2: NAT Table (only if primary is mangle)
+        if (primary == "mangle") {
+            print "*nat"
+            print ":LOCAL_IP - [0:0]"
+            for (i=0; i<count; i++) {
+                print "-A LOCAL_IP -d " ips[i] " -p udp ! --dport 53 -j ACCEPT"
+                print "-A LOCAL_IP -d " ips[i] " ! -p udp -j ACCEPT"
+            }
+            print "COMMIT"
+        }
+    }
+    ' | iptables-restore --noflush $IPT_OPTS; then
+        log_warn "IPv4 sync failed (iptables-restore error)"
+    fi
+    
+    # Hook chains
+        _ipt_cmd 4 -t "$PRIMARY_TABLE" -C BYPASS_IP -j LOCAL_IP 2>/dev/null || \
+        _ipt_cmd 4 -t "$PRIMARY_TABLE" -I BYPASS_IP -j LOCAL_IP
+
+    if [ "$PRIMARY_TABLE" = "mangle" ]; then
+         _ipt_cmd 4 -t nat -C PREROUTING -j LOCAL_IP 2>/dev/null || \
+            _ipt_cmd 4 -t nat -I PREROUTING -j LOCAL_IP
+    fi
+
+    # --- IPv6 Sync ---
+    if [ "${PROXY_IPV6:-0}" -eq 1 ]; then
+        if ! ip -6 addr show 2>/dev/null | awk -v primary="$PRIMARY_TABLE" '
+        BEGIN {
+            print "*" primary
+            print ":LOCAL_IP6 - [0:0]"
+        }
+        /inet6 / {
+            ip = $2
+            # Filter fe80:: and ::1
+            if (ip ~ /^fe80:/ || ip ~ /^::1/) next
+            print "-A LOCAL_IP6 -d " ip " -p udp ! --dport 53 -j ACCEPT"
+            print "-A LOCAL_IP6 -d " ip " ! -p udp -j ACCEPT"
+        }
+        END { print "COMMIT" }
+        ' | ip6tables-restore --noflush $IPT_OPTS; then
+            log_warn "IPv6 sync failed (ip6tables-restore error)"
+        fi
+        
+        _ipt_cmd 6 -t "$PRIMARY_TABLE" -C BYPASS_IP6 -j LOCAL_IP6 2>/dev/null || \
+            _ipt_cmd 6 -t "$PRIMARY_TABLE" -I BYPASS_IP6 -j LOCAL_IP6
+    fi
+    
+    log_debug "Synced local IPs"
+}
+
+# ==============================================================================
+# [ Main ]
+# ==============================================================================
+
+main() {
+    sync_all_addresses
+}
+
+main

@@ -6,9 +6,10 @@
 # ==============================================================================
 
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
-
+. "$SCRIPT_DIR/log"
 . "$SCRIPT_DIR/const"
 
+export LOG_COMPONENT="Bus"
 # inotifyd argument handling:
 # - Directory monitoring: handler EVENT DIR FILENAME (3 args)
 # - File monitoring: handler EVENT FILEPATH (2 args)
@@ -24,79 +25,65 @@ else
     EVENT_NAME=$(basename "$WATCHED_PATH")
 fi
 
-# Ignore DELETE events (d) for checking files
-# We only care about Creation (n) or Close-Write (w) for triggers
-# The only exception is 'disable', where deleting it means enabling the module
-if [ "$EVENT_TYPE" = "d" ] && [ "$EVENT_NAME" != "disable" ]; then
-    exit 0
-fi
-
-# IMPORTANT: Only process known event files, ignore everything else (like module.prop)
-case "$EVENT_NAME" in
-    disable|cache_ok|core_ok|tproxy_ok|fail|ip_sync)
-        # Known event file, continue processing
-        ;;
-    *)
-        # Unknown file (module.prop, etc.), exit immediately
-        exit 0
-        ;;
-esac
-
-. "$SCRIPT_DIR/log"
-. "$SCRIPT_DIR/state"
-
-export LOG_COMPONENT="Bus"
-
 log_debug "Event: $EVENT_NAME ($EVENT_TYPE)"
-
-# Cleanup event file immediately (except fail, disable, and sync markers)
-# This prevents duplicate processing, but we must keep sync markers until all are ready
-case "$EVENT_NAME" in
-    fail|disable|core_ok|tproxy_ok) ;;
-    *) rm -f "$WATCHED_PATH" 2>/dev/null ;;
-esac
 
 # ==============================================================================
 # [ Helper Functions ]
 # ==============================================================================
 
 _start_components() {
+    [ -f "$MAGISK_MOD_DIR/disable" ] && { log_warn "Service disabled, ignoring start trigger"; return; }
     log_info "Starting components..."
     sh "$CORE_SCRIPT" start &
     sh "$TPROXY_SCRIPT" start &
 }
 
+_kill_ipmonitor() {
+    if [ -f "$MONITOR_PID_FILE" ]; then
+        local mpid
+        mpid=$(cat "$MONITOR_PID_FILE")
+        if [ -n "$mpid" ]; then
+            kill "$mpid" 2>/dev/null
+        fi
+        rm -f "$MONITOR_PID_FILE"
+    else
+        pkill -f "ipmonitor" 2>/dev/null
+    fi
+}
+
 _check_all_ready() {
+    [ -f "$MAGISK_MOD_DIR/disable" ] && { log_warn "Service disabled, ignoring readiness trigger"; return; }
     # Both core_ok and tproxy_ok must exist
     [ -f "$EVENTS_DIR/core_ok" ] && [ -f "$EVENTS_DIR/tproxy_ok" ] && {
             rm -f "$EVENTS_DIR/core_ok" "$EVENTS_DIR/tproxy_ok"
             log_info "All components ready, starting ipmonitor..."
             nohup sh "$MONITOR_SCRIPT" start >/dev/null 2>&1 &
-            sync_prop "RUNNING"
-            prop_clear
+            sync_prop
             log_info "Service ready"
     }
 }
 
-_do_stop() {
+_stop_components() {
     log_info "Stopping services..."
     sh "$CORE_SCRIPT" stop &
     sh "$TPROXY_SCRIPT" stop &
-    sh "$MONITOR_SCRIPT" stop &
+    
+    _kill_ipmonitor
+    
     wait
-    rm -f "$EVENTS_DIR/fail" "$EVENTS_DIR/core_ok" "$EVENTS_DIR/tproxy_ok" 2>/dev/null
-    sync_prop "STOPPED"
+    rm -f "$EVENTS_DIR/core_ok" "$EVENTS_DIR/tproxy_ok" 2>/dev/null
+    sync_prop
     prop_clear
     log_info "Service stopped"
 }
 
-_do_rollback() {
+_rollback_components() {
     log_warn "Rolling back..."
     sh "$CORE_SCRIPT" stop 2>/dev/null &
     sh "$TPROXY_SCRIPT" stop 2>/dev/null &
-    sh "$MONITOR_SCRIPT" stop 2>/dev/null &
+    _kill_ipmonitor &
     wait
-    sync_prop "FAILED"
+    sync_prop
 }
 
 # ==============================================================================
@@ -108,12 +95,12 @@ case "$EVENT_NAME" in
     disable)
         case "$EVENT_TYPE" in
             d) sh "$INIT_SCRIPT" & ;;   # Delete = Enable = Start
-            n) _do_stop ;;              # Create = Disable = Stop
+            n) _stop_components ;;      # Create = Disable = Stop
         esac
         ;;
-    
     # === Flow markers ===
-    cache_ok)
+    init_ok)
+        rm -f "$WATCHED_PATH" 2>/dev/null
         _start_components
         ;;
     core_ok)
@@ -122,16 +109,18 @@ case "$EVENT_NAME" in
     tproxy_ok)
         _check_all_ready
         ;;
-    
     # === Failure handling ===
     fail)
-        _do_rollback
-        # Don't remove fail file - used for state detection
+        _rollback_components
         exit 0
         ;;
-    
     # === IP sync ===
     ip_sync)
+        rm -f "$WATCHED_PATH" 2>/dev/null
         sh "$IP_HANDLER_SCRIPT" &
+        ;;
+    # === Unknown/Cleanup ===
+    *)
+        rm -f "$WATCHED_PATH" 2>/dev/null
         ;;
 esac

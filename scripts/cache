@@ -6,66 +6,61 @@
 # Usage: cache [check|build|load]
 # ==============================================================================
 
+
 # ==============================================================================
 # [ Environment Setup (for standalone execution) ]
 # ==============================================================================
 
-if [ -z "$SCRIPT_DIR" ]; then
-    SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
-    . "$SCRIPT_DIR/const"
-    . "$SCRIPT_DIR/log"
-    . "$SCRIPT_DIR/config"
-    . "$SCRIPT_DIR/rules"
-fi
-
+SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+. "$SCRIPT_DIR/const"
+. "$SCRIPT_DIR/log"
+. "$SCRIPT_DIR/config"
+. "$SCRIPT_DIR/rules"
 
 # ==============================================================================
 # [ UID & Package Resolution ]
 # ==============================================================================
 
-get_package_uid() {
-    local pkg="$1"
-    local uid
-    
-    if [ ! -r "$PACKAGES_LIST" ]; then
-        return 1
-    fi
-    
-    # Use awk for single-pass search and extraction
-    uid=$(awk -v pkg="$pkg" '$1 == pkg {print $2; exit}' "$PACKAGES_LIST" 2>/dev/null)
-    
-    case "$uid" in
-        ''|*[!0-9]*) return 1 ;;
-    esac
-    
-    echo "$uid"
-}
-
 find_packages_uid() {
-    local out=""
-    local token user_prefix package uid_base final_uid
+    local pkgs="$*"
+    [ -z "$pkgs" ] && return 0
     
-    for token in $*; do
-        user_prefix=0
-        package="$token"
-        
-        case "$token" in
-            *:*)
-                user_prefix=$(echo "$token" | cut -d: -f1)
-                package=$(echo "$token" | cut -d: -f2-)
-                case "$user_prefix" in
-                    ''|*[!0-9]*) user_prefix=0 ;;
-                esac
-                ;;
-        esac
-        
-        if uid_base=$(get_package_uid "$package" 2>/dev/null); then
-            final_uid=$((user_prefix * 100000 + uid_base))
-            out="$out $final_uid"
-        fi
-    done
+    # Fast path: Associative array using Awk
+    local uids
+    uids=$(echo "$pkgs" | awk '
+    NR == FNR {
+        for (i = 1; i <= NF; i++) {
+            token = $i;
+            gsub(/\r/, "", token);
+            if (token == "") continue;
+            
+            user = 0;
+            pkg = token;
+            if (index(token, ":") > 0) {
+                split(token, parts, ":");
+                user = parts[1] + 0;
+                pkg = parts[2];
+            }
+            if (targets[pkg] == "") {
+                targets[pkg] = user;
+            } else {
+                targets[pkg] = targets[pkg] " " user;
+            }
+        }
+        next;
+    }
+    {
+        if ($1 in targets) {
+            n = split(targets[$1], users, " ");
+            for (i = 1; i <= n; i++) {
+                uid = $2 + (users[i] * 100000);
+                printf "%d ", uid;
+            }
+        }
+    }
+    ' - "$PACKAGES_LIST")
     
-    echo "$out" | awk '{$1=$1;print}'
+    echo "$uids"
 }
 
 
@@ -122,32 +117,6 @@ KFEAT_IPV6_NAT=$(_check_feat IP6_NF_NAT)
     printf '%s' "$content" > "$KERNEL_CACHE_FILE"
     log_debug "Kernel Cache built"
     return 0
-}
-
-check_kernel_feature_cached() {
-    local feature="$1"
-    
-    if [ "$SKIP_CHECK_FEATURE" = "1" ]; then
-        return 0
-    fi
-    
-    if [ -f "$KERNEL_CACHE_FILE" ]; then
-        local cached
-        cached=$(grep "^${feature}=" "$KERNEL_CACHE_FILE" 2>/dev/null | cut -d= -f2)
-        if [ "$cached" = "1" ]; then
-            return 0
-        elif [ "$cached" = "0" ]; then
-            return 1
-        fi
-    fi
-    
-    if [ -f /proc/config.gz ]; then
-        if zcat /proc/config.gz 2>/dev/null | grep -qE "^CONFIG_${feature}=[ym]$"; then
-            return 0
-        fi
-    fi
-    
-    return 1
 }
 
 
@@ -258,15 +227,19 @@ EOF
 # [ Config Cache Management ]
 # ==============================================================================
 
+_normalize_list() {
+    echo "$1" | awk '{
+        for (i=1; i<=NF; i++) {
+            if (n++ > 0) printf " "
+            printf "%s", $i
+        }
+    }'
+}
+
 save_config_cache() {
     mkdir -p "$(dirname "$CACHE_CONFIG_FILE")"
     
     local _proxy_apps _bypass_apps _proxy_macs _bypass_macs
-    
-    # Helper to normalize lists (remove newlines, extra spaces)
-    _normalize_list() {
-        echo "$1" | awk '{$1=$1;print}' | tr '\n' ' '
-    }
     
     _proxy_apps=$(_normalize_list "$PROXY_APPS_LIST")
     _bypass_apps=$(_normalize_list "$BYPASS_APPS_LIST")
@@ -314,7 +287,7 @@ BYPASS_MACS_LIST="$_bypass_macs"
 SKIP_CHECK_FEATURE=$SKIP_CHECK_FEATURE
 FAKEIP_RANGE_V4=$FAKEIP_RANGE_V4
 FAKEIP_RANGE_V6=$FAKEIP_RANGE_V6
-IP_MONITOR_BATCH_INTERVAL=$IP_MONITOR_BATCH_INTERVAL
+DEBOUNCE_INTERVAL=$DEBOUNCE_INTERVAL
 EOF
     
     log_debug "Config cache saved"
@@ -326,13 +299,12 @@ EOF
 # ==============================================================================
 
 build_all_caches() {
-    run "Load config" load_flux_config || return 1
     run "Validate config" validate_all || return 1
-    run "Build kernel cache" save_kernel_cache || return 1
-    run "Load kernel cache" load_kernel_cache || return 1
-    run "Build config cache" save_config_cache || return 1
-    run "Build rules cache" save_rules_cache || return 1
-    run "Build meta cache" save_meta_cache || return 1
+    save_kernel_cache
+    load_kernel_cache
+    save_config_cache
+    save_rules_cache
+    save_meta_cache
     return 0
 }
 
@@ -349,25 +321,18 @@ load_kernel_cache() {
 # [ Entry Point (Standalone Execution) ]
 # ==============================================================================
 
+ensure_cache() {
+    if is_cache_valid; then
+        log_info "Cache is valid"
+    else
+        log_info "Cache is invalid, building..."    
+        run "Build caches" build_all_caches || return 1
+    fi
+    return 0
+}
+
 main() {
-    case "${1:-}" in
-        check)
-            if is_cache_valid; then
-                echo "valid"
-                return 0
-            else
-                echo "invalid"
-                return 1
-            fi
-            ;;
-        build)
-            build_all_caches
-            ;;
-        *)
-            echo "Usage: $0 {check|build}"
-            return 1
-            ;;
-    esac
+    ensure_cache
 }
 
 main "$@"

@@ -4,6 +4,9 @@
 
 A powerful Android transparent proxy module powered by [sing-box](https://sing-box.sagernet.org/), designed for Magisk / KernelSU / APatch.
 
+> [!IMPORTANT]
+> **Flux v1.0.0 is here!** This version is a complete architectural rewrite focusing on industrial-grade robustness, hardware longevity (flash-wear protection), and event-driven orchestration. See [CHANGELOG.md](CHANGELOG.md) for the full journey from v0.9.0.
+
 ## Features
 
 ### Core Components
@@ -11,17 +14,18 @@ A powerful Android transparent proxy module powered by [sing-box](https://sing-b
 - **Subconverter Built-in**: Automatic subscription conversion and node filtering
 - **jq Processor**: JSON manipulation for configuration generation
 
-### Architecture
-- **Parallel Start/Stop**: Core and TProxy start simultaneously with barrier synchronization
-- **State Machine**: Robust state tracking (STOPPED → STARTING → RUNNING → STOPPING)
-- **Atomic Rollback**: If any component fails, all running components are rolled back
-- **Environment Inheritance**: Configuration loaded once, inherited by all child processes
-- **Kernel Feature Caching**: Detected once at startup, exported via environment variables
+### Architecture & Optimization
+- **Multi-tier Cache System**: Advanced fingerprinting-based caching engine (Kernel/Rules/Config/Meta) minimizes I/O and CPU overhead.
+- **Event-Driven Orchestration**: Uses `inotifyd` and a central `dispatcher` for reactive, high-speed response to state changes.
+- **Flash-Wear Protection**: "Compare-before-write" property management extends NAND longevity by avoiding redundant writes.
+- **Atomic Reliability Layer**: 100% data integrity via temp-and-swap strategy for all critical configuration and module updates.
+- **Robust Config Extraction**: Native-speed JSON parsing for diverse `sing-box` configurations via refined `jq` patterns.
 
 ### Proxy Modes
-- **TPROXY** (default): Full TCP/UDP support with transparent proxying
-- **REDIRECT**: Fallback mode for kernels without TPROXY support
-- **Auto Detection**: Automatically selects the best mode based on kernel capabilities
+- **TPROXY** (default): High-performance transparent proxying with full TCP/UDP support.
+- **REDIRECT**: Reliable fallback for older kernels without TPROXY support.
+- **Auto Detection**: Intelligent mode selection based on cached kernel capabilities.
+- **Robust Config Extraction**: Automatically parses sing-box `config.json` for `mixed`/`tproxy`/`redirect` inbounds and ports.
 
 ### Network Support
 - **Dual-Stack**: Full IPv4 and IPv6 proxy support
@@ -67,39 +71,37 @@ All module files are located at `/data/adb/flux/`:
 │
 ├── conf/
 │   ├── config.json           # Generated sing-box configuration
-│   ├── cnip.txt              # China IPv4 CIDR list (optional)
-│   ├── cnip6.txt             # China IPv6 CIDR list (optional)
 │   └── settings.ini          # User configuration file
 │
-├── run/
+├── run/ (Runtime Only)
 │   ├── flux.log              # Module runtime logs (with rotation)
 │   ├── sing-box.pid          # sing-box process PID
-│   ├── cache.db              # sing-box cache database
-│   ├── cache_ip              # IP monitor address cache
-│   ├── cache_uid             # UID resolution cache
-│   └── cache_kernel          # Kernel feature cache
+│   ├── ipmonitor.pid         # IP monitor process PID
+│   ├── ipmonitor.fifo        # IP monitor named pipe
+│   └── event/                # Internal event signals
 │
 ├── scripts/
-│   ├── flux.config           # Centralized path definitions & defaults
-│   ├── flux.core             # Core lifecycle management (start/stop)
-│   ├── flux.ip.monitor       # Dynamic IP address monitor daemon
-│   ├── flux.logger           # Advanced logging & prop management
-│   ├── flux.mod.inotify      # Module toggle listener (inotifyd)
-│   ├── flux.state            # State machine & barrier synchronization
-│   ├── flux.tproxy           # TProxy/Redirect iptables rules
-│   ├── flux.validator        # Configuration & kernel validation
-│   ├── start.sh              # Service orchestrator (parallel start/stop)
-│   └── updater.sh            # Subscription updater & config generator
+│   ├── cache                 # Cache manager (validation & sig generation)
+│   ├── config                # Config loader & robust JSON extractor
+│   ├── const                 # Central path and constant definitions
+│   ├── core                  # sing-box process control
+│   ├── dispatcher            # Central Event handler (inotifyd)
+│   ├── init                  # Environment & integrity initialization
+│   ├── iphandler             # Interface-local IP synchronization
+│   ├── ipmonitor             # Background network change daemon
+│   ├── log                   # Flash-friendly logging & prop management
+│   ├── rules                 # High-efficiency IPTables rule generator
+│   ├── tproxy                # TProxy/Redirect routing orchestration
+│   └── updater.sh            # Subscription sync & config merger
 │
-├── tools/
-│   ├── base/
-│   │   ├── country_map.json  # Country regex mapping for node filtering
-│   │   └── singbox.json      # sing-box configuration template
-│   ├── jq                    # jq binary for JSON processing
-│   ├── pref.toml             # Subconverter preferences
-│   └── subconverter          # Subconverter binary
-│
-└── .state                    # Unified state file (service/component states)
+└── tools/
+    ├── base/
+    │   ├── country_map.json  # Country regex mapping for node filtering
+    │   └── singbox.json      # sing-box configuration template
+    ├── jq                    # jq binary for JSON processing
+    ├── pref.toml             # Subconverter preferences
+    └── subconverter          # Subconverter binary
+
 ```
 
 ### Magisk Module Directory (`/data/adb/modules/flux/`)
@@ -117,54 +119,61 @@ All module files are located at `/data/adb/flux/`:
 
 ## Configuration
 
-Main configuration file: `/data/adb/flux/conf/settings.ini`
+Main configuration file: `/data/adb/flux/conf/settings.ini`. Changes take effect after service restart.
 
-### Key Settings
-
+### 1. Subscription & Updates
 | Option | Description | Default |
 |--------|-------------|---------|
-| `SUBSCRIPTION_URL` | Subscription URL | (empty) |
-| `PROXY_MODE` | 0=Auto, 1=TProxy, 2=Redirect | `0` |
-| `PROXY_TCP` | Enable TCP proxy | `1` |
-| `PROXY_UDP` | Enable UDP proxy | `1` |
-| `PROXY_IPV6` | Enable IPv6 proxy | `0` |
-| `DNS_HIJACK_ENABLE` | 0=Disable, 1=TProxy, 2=Redirect | `1` |
-| `UPDATE_INTERVAL` | Auto-update interval (seconds) | `86400` |
+| `SUBSCRIPTION_URL` | Subscription link for node conversion | (empty) |
+| `UPDATE_TIMEOUT` | Download timeout in seconds | `15` |
+| `UPDATE_INTERVAL` | Auto-update interval in seconds (86400=24h) | `86400` |
+| `RETRY_COUNT` | Number of retries for failed downloads | `2` |
 
-### Interface Proxy Switches
-
+### 2. Core & Proxy Modes
 | Option | Description | Default |
 |--------|-------------|---------|
-| `PROXY_MOBILE` | Proxy mobile data | `1` |
-| `PROXY_WIFI` | Proxy Wi-Fi | `1` |
-| `PROXY_HOTSPOT` | Proxy hotspot clients | `0` |
-| `PROXY_USB` | Proxy USB tethering | `0` |
+| `PROXY_MODE` | `0`=Auto, `1`=TProxy, `2`=Redirect | `0` |
+| `DNS_HIJACK_ENABLE` | `0`=Off, `1`=TProxy, `2`=Redirect | `1` |
+| `PROXY_TCP` | Enable/Disable TCP Proxying | `1` |
+| `PROXY_UDP` | Enable/Disable UDP Proxying | `1` |
+| `PROXY_IPV6` | Enable/Disable IPv6 Proxying | `0` |
+| `ROUTING_MARK` | Fwmark for routing rules | `2025` |
 
-### Per-App Proxy
+### 3. Interface Control
+Define which interfaces Flux should monitor and intercept.
+| Option | Description | Default IF Name |
+|--------|-------------|-----------------|
+| `MOBILE_INTERFACE` | Mobile data interface pattern | `rmnet_data+` |
+| `WIFI_INTERFACE` | Wi-Fi interface name | `wlan0` |
+| `HOTSPOT_INTERFACE` | Hotspot interface name | `wlan2` |
+| `USB_INTERFACE` | USB tethering interface pattern | `rndis+` |
 
+**Switches (0=Bypass, 1=Proxy):**
+`PROXY_MOBILE`, `PROXY_WIFI`, `PROXY_HOTSPOT`, `PROXY_USB`
+
+### 4. Per-App Filtering
 | Option | Description | Default |
 |--------|-------------|---------|
-| `APP_PROXY_ENABLE` | Enable per-app filtering | `0` |
-| `APP_PROXY_MODE` | 1=Blacklist, 2=Whitelist | `1` |
-| `PROXY_APPS_LIST` | Apps to proxy (whitelist) | (empty) |
-| `BYPASS_APPS_LIST` | Apps to bypass (blacklist) | (empty) |
+| `APP_PROXY_ENABLE` | Enable app-based filtering | `0` |
+| `APP_PROXY_MODE` | `1`=Blacklist (Bypass), `2`=Whitelist (Only) | `1` |
+| `PROXY_APPS_LIST` | Apps to proxy (space/newline separated) | (empty) |
+| `BYPASS_APPS_LIST` | Apps to bypass (space/newline separated) | (empty) |
 
-### China IP Bypass
-
+### 5. MAC Filter (Hotspot Clients)
 | Option | Description | Default |
 |--------|-------------|---------|
-| `BYPASS_CN_IP` | Enable China IP bypass | `0` |
-| `CN_IP_URL` | IPv4 CIDR list URL | GeoIP2-CN |
-| `CN_IPV6_URL` | IPv6 CIDR list URL | ispip.clang.cn |
+| `MAC_FILTER_ENABLE` | Enable MAC filtering for hotspot | `0` |
+| `MAC_PROXY_MODE` | `1`=Blacklist, `2`=Whitelist | `1` |
+| `PROXY_MACS_LIST` | Client MACs to proxy | (empty) |
+| `BYPASS_MACS_LIST` | Client MACs to bypass | (empty) |
 
-### MAC Filter (Hotspot Only)
-
+### 6. Logging & Advanced
 | Option | Description | Default |
 |--------|-------------|---------|
-| `MAC_FILTER_ENABLE` | Enable MAC filtering | `0` |
-| `MAC_PROXY_MODE` | 1=Blacklist, 2=Whitelist | `1` |
-| `PROXY_MACS_LIST` | MACs to proxy | (empty) |
-| `BYPASS_MACS_LIST` | MACs to bypass | (empty) |
+| `LOG_LEVEL` | `0`=OFF, `1`=Error, `2`=Warn, `3`=Info, `4`=Debug | `3` |
+| `LOG_MAX_SIZE` | Log size limit before rotation (bytes) | `1048576` |
+| `DEBOUNCE_INTERVAL` | Network change batch interval (seconds) | `10` |
+| `SKIP_CHECK_FEATURE`| Skip kernel capability detection | `0` |
 
 ---
 
@@ -191,11 +200,10 @@ Main configuration file: `/data/adb/flux/conf/settings.ini`
 ## Credits
 
 - [SagerNet/sing-box](https://github.com/SagerNet/sing-box) - The universal proxy platform
-- [CHIZI-0618/AndroidTProxyShell](https://github.com/CHIZI-0618/AndroidTProxyShell) - Android TProxy shell reference
-- [asdlokj1qpi233/subconverter](https://github.com/asdlokj1qpi233/subconverter) - Subscription format converter
-- [jqlang/jq](https://github.com/jqlang/jq) - Command-line JSON processor
 - [taamarin/box_for_magisk](https://github.com/taamarin/box_for_magisk) - Magisk module patterns and inspiration
 - [CHIZI-0618/box4magisk](https://github.com/CHIZI-0618/box4magisk) - Magisk module reference
+- [asdlokj1qpi233/subconverter](https://github.com/asdlokj1qpi233/subconverter) - Subscription format converter
+- [jqlang/jq](https://github.com/jqlang/jq) - Command-line JSON processor
 
 ---
 

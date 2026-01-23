@@ -11,7 +11,7 @@ _find_packages_uid() {
     [ -z "$pkgs" ] && return 0
     
     # Memoization cache key based on pkgs string hash/length
-    local cache_key="${pkgs//[^a-zA-Z0-9]/_}"
+    local cache_key; cache_key=$(printf '%s' "$pkgs" | tr -d ' ' | tr -c '[:alnum:]' '_')
     local cache_var="_UID_CACHE_${cache_key}"
     eval "local cached_val=\"\$$cache_var\""
     if [ -n "$cached_val" ]; then

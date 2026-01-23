@@ -16,20 +16,19 @@ export LOG_COMPONENT="Moni"
 # Helper Functions
 
 # Capture a fingerprint of current global IPs (Interface + IP/CIDR)
-# Filter: global scope only (ignores loopback/link-local/temporary)
 _get_ip_state() {
-    ip -o addr show scope global 2>/dev/null | awk '{print $2, $4}' | sort
+    # Use -brief for faster parsing and rely on stable interface order to avoid sort
+    ip -brief addr show scope global 2>/dev/null | cut -c 1-60
 }
 
 
 # Monitor Logic Loop
 
 start_monitor() {
-    # 1. Setup FIFO
     mkfifo "$FIFO_FILE" || { log_error "Failed to create FIFO"; return 1; }
 
-    # 2. Start ip monitor background process
-    ip monitor address > "$FIFO_FILE" 2>/dev/null &
+    # Only wake up the loop for global address changes to reduce noise
+    (ip monitor address 2>/dev/null | grep -E "scope global|Deleted" > "$FIFO_FILE") &
     local monitor_bin_pid=$!
 
     #  register lifecycle (PID & Cleanup)
@@ -38,14 +37,12 @@ start_monitor() {
 
     trap 'rm -f "$FIFO_FILE"; kill "$monitor_bin_pid" 2>/dev/null; rm -f "$MONITOR_PID_FILE"; exit 0' EXIT INT TERM
 
-    # 4. Initial State Snapshot
     local last_state; last_state=$(_get_ip_state)
     log_debug "Initial IP State: $(printf '%s ' $last_state)"
     
-    # 5. Initial Sync Trigger
     touch "$EVENTS_DIR/ip_sync"
+    log_info "Ipmonitor started"
     
-    # 6. Monitor Loop
     local dirty=0 current_state
     
     while true; do
@@ -67,6 +64,7 @@ start_monitor() {
             fi
         fi
     done < "$FIFO_FILE"
+    return 0
 }
 
 

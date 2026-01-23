@@ -40,6 +40,7 @@ _cleanup_failure() {
     sh "$IP_MONITOR_SCRIPT" stop &
     wait
     rm -f "$EVENTS_DIR/fail" "$EVENTS_DIR/core_ok" "$EVENTS_DIR/tproxy_ok" 2>/dev/null
+    return 0
 }
 
 # Directory Initialization
@@ -49,6 +50,7 @@ _init_dirs() {
         [ ! -d "$dir" ] && mkdir -p "$dir"
     done
     [ -d "$RUN_DIR" ] && chmod 0755 "$RUN_DIR"
+    return 0
 }
 
 # Subscription Update Trigger

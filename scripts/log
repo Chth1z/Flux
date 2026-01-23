@@ -77,16 +77,17 @@ _prop_read_status() {
     local status; status=$(getprop flux.prop.last)
     if [ -n "$status" ]; then
         printf '%s\n' "$status"
-        return
+        return 0
     fi
 
-    [ ! -f "$PROP_FILE" ] && return
+    [ ! -f "$PROP_FILE" ] && return 1
     local desc
     desc=$(grep "^description=" "$PROP_FILE" 2>/dev/null | head -1)
     desc="${desc#description=}"
     case "$desc" in
         *"\\n"*) printf '%s\n' "${desc#*\\n}" ;;
     esac
+    return 0
 }
 
 # Extract left part (before |)

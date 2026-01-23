@@ -24,7 +24,7 @@ export LOG_COMPONENT="Disp"
 # Helper Functions
 
 start_components() {
-    [ -f "$MAGISK_MOD_DIR/disable" ] && { log_warn "Service disabled, ignoring start trigger"; return; }
+    [ -f "$MAGISK_MOD_DIR/disable" ] && { log_warn "Service disabled, ignoring start trigger"; return 0; }
     sh "$CORE_SCRIPT" start &
     sh "$TPROXY_SCRIPT" start &
     return 0
@@ -35,7 +35,6 @@ check_all_ready() {
     [ -f "$EVENTS_DIR/core_ok" ] && [ -f "$EVENTS_DIR/tproxy_ok" ] && {
         rm -f "$EVENTS_DIR/core_ok" "$EVENTS_DIR/tproxy_ok"
         nohup sh "$IP_MONITOR_SCRIPT" start &
-        log_info "Ipmonitor started"
         sync_prop
         log_info "Flux Service is READY"
     }

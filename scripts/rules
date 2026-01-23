@@ -57,6 +57,7 @@ _find_packages_uid() {
     # Cache result in memory
     eval "${cache_var}=\"\$uids\""
     printf '%s\n' "$uids"
+    return 0
 }
 
 # Stateless kernel feature access - uses KFEAT_* variables from environment/cache

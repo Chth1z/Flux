@@ -113,6 +113,7 @@ sync_all_addresses() {
                 _ipt_cmd 6 -t nat -I PREROUTING -j LOCAL_IP6
         fi
     fi
+    log_debug "Synced local IPs"
     return 0
 }
 
@@ -134,13 +135,8 @@ main() {
     
     case "$action" in
         sync)
-            if sync_all_addresses; then
-                log_debug "Synced local IPs"
-                return 0
-            else
-                log_error "Failed to sync local IPs"
-                return 1
-            fi
+            sync_all_addresses
+            return $?
             ;;
         *)
             printf 'Usage: %s {sync}\n' "$0"

@@ -1,11 +1,15 @@
 # Flux
 
+![Flux Banner](flux_banner.png)
+
+[English](README.md) | [简体中文](README_zh.md)
+
 > Seamlessly redirect your network flux.
 
 A powerful Android transparent proxy module powered by [sing-box](https://sing-box.sagernet.org/), designed for Magisk / KernelSU / APatch.
 
 > [!IMPORTANT]
-> **Flux v1.0.0 is here!** This version is a complete architectural rewrite focusing on industrial-grade robustness, hardware longevity (flash-wear protection), and event-driven orchestration. See [CHANGELOG.md](CHANGELOG.md) for the full journey from v0.9.0.
+> **Flux v1.0.0 is here!** This version is a complete architectural rewrite focusing on industrial-grade performance and event-driven orchestration. See [CHANGELOG.md](CHANGELOG.md) for the full journey from v0.9.0.
 
 ## Features
 
@@ -17,20 +21,18 @@ A powerful Android transparent proxy module powered by [sing-box](https://sing-b
 ### Architecture & Optimization
 - **Multi-tier Cache System**: Advanced fingerprinting-based caching engine (Kernel/Rules/Config/Meta) minimizes I/O and CPU overhead.
 - **Event-Driven Orchestration**: Uses `inotifyd` and a central `dispatcher` for reactive, high-speed response to state changes.
-- **Flash-Wear Protection**: "Compare-before-write" property management extends NAND longevity by avoiding redundant writes.
 - **Atomic Reliability Layer**: 100% data integrity via temp-and-swap strategy for all critical configuration and module updates.
-- **Robust Config Extraction**: Native-speed JSON parsing for diverse `sing-box` configurations via refined `jq` patterns.
+- **Transparent Logic**: Native-speed JSON parsing for diverse `sing-box` configurations via refined `jq` patterns.
 
 ### Proxy Modes
 - **TPROXY** (default): High-performance transparent proxying with full TCP/UDP support.
 - **REDIRECT**: Reliable fallback for older kernels without TPROXY support.
 - **Auto Detection**: Intelligent mode selection based on cached kernel capabilities.
-- **Robust Config Extraction**: Automatically parses sing-box `config.json` for `mixed`/`tproxy`/`redirect` inbounds and ports.
+- **Smart Extraction**: Automatically parses sing-box `config.json` for `mixed`/`tproxy`/`redirect` inbounds and ports.
 
 ### Network Support
 - **Dual-Stack**: Full IPv4 and IPv6 proxy support
 - **DNS Hijacking**: TProxy/Redirect mode DNS interception
-- **China IP Bypass**: IPset-based mainland China IP bypass (optional)
 - **FakeIP ICMP Fix**: Enables ping to work correctly with FakeIP DNS
 
 ### Interface Control
@@ -73,7 +75,7 @@ All module files are located at `/data/adb/flux/`:
 │   ├── config.json           # Generated sing-box configuration
 │   └── settings.ini          # User configuration file
 │
-├── run/ (Runtime Only)
+├── run/
 │   ├── flux.log              # Module runtime logs (with rotation)
 │   ├── sing-box.pid          # sing-box process PID
 │   ├── ipmonitor.pid         # IP monitor process PID

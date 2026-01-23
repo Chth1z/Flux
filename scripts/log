@@ -7,9 +7,9 @@
 
 LOG_COMPONENT="${LOG_COMPONENT:-Flux}"
 
-# Detect interactive mode
-_is_interactive() {
-    [ -t 0 ] || [ -t 1 ]
+# Detect if output should be colored
+_is_terminal() {
+    [ -t 2 ]
 }
 
 _log() {
@@ -24,28 +24,38 @@ _log() {
     timestamp=$(date '+%m-%d %H:%M:%S')
     
     local log_line
-    log_line=$(printf '[%s] %s [%s] %s' "$timestamp" "$level" "${LOG_COMPONENT}" "$msg")
+    log_line=$(printf '[%s] [%s] [%s] %s' "$timestamp" "$level" "${LOG_COMPONENT}" "$msg")
     
-    # Write to log file
-    [ -n "$FLUX_LOG" ] && printf '%s\n' "$log_line" >> "$FLUX_LOG"
-    
-    # Terminal output with colors
-    if _is_interactive; then
+    # Solution A: Output to stderr only. 
+    # File redirection is managed by the entry-point (dispatcher/init).
+    if _is_terminal; then
         case "$level" in
             E) printf '\033[31m%s\033[0m\n' "$log_line" >&2 ;;
             W) printf '\033[33m%s\033[0m\n' "$log_line" >&2 ;;
             I) printf '\033[32m%s\033[0m\n' "$log_line" >&2 ;;
             D) printf '\033[90m%s\033[0m\n' "$log_line" >&2 ;;
+            *) printf '%s\n' "$log_line" >&2 ;;
         esac
+    else
+        printf '%s\n' "$log_line" >&2
     fi
+    return 0
 }
 
 # Unified Prop Status Management
 # Format: original_description\n🥰 [RUNNING] PID: xxx | Error: message
 
-# Initialize original description cache
+# Initialize original description cache (Cross-process via System Properties)
 _init_prop_orig_desc() {
     [ -n "$_PROP_ORIG_DESC" ] && return 0
+    
+    # 1. Try memory cache first (System Property)
+    _PROP_ORIG_DESC=$(getprop flux.prop.orig)
+    if [ -n "$_PROP_ORIG_DESC" ]; then
+        return 0
+    fi
+
+    # 2. Fallback to file reading
     [ ! -f "$PROP_FILE" ] && return 1
     
     _PROP_ORIG_DESC=$(grep "^description=" "$PROP_FILE" | head -1 | cut -d= -f2-)
@@ -55,22 +65,33 @@ _init_prop_orig_desc() {
     case "$_PROP_ORIG_DESC" in
         *"🥰"*|*"😴"*|*"🤯"*|*"🤔"*) _PROP_ORIG_DESC="Seamlessly redirect your network Flux." ;;
     esac
+
+    # 3. Store in memory for other processes
+    setprop flux.prop.orig "$_PROP_ORIG_DESC"
+    return 0
 }
 
 # Read current status line from prop (after \n)
 _prop_read_status() {
+    # Try last successful memory state first
+    local status; status=$(getprop flux.prop.last)
+    if [ -n "$status" ]; then
+        printf '%s\n' "$status"
+        return
+    fi
+
     [ ! -f "$PROP_FILE" ] && return
     local desc
     desc=$(grep "^description=" "$PROP_FILE" 2>/dev/null | head -1)
     desc="${desc#description=}"
     case "$desc" in
-        *"\\n"*) echo "${desc#*\\n}" ;;
+        *"\\n"*) printf '%s\n' "${desc#*\\n}" ;;
     esac
 }
 
 # Extract left part (before |)
 _prop_get_left() {
-    echo "${1%% |*}"
+    printf '%s\n' "${1%% |*}"
 }
 
 # Extract right part by searching for Error/Warn keywords
@@ -78,10 +99,10 @@ _prop_get_left() {
 _prop_get_right() {
     case "$1" in
         *"Error:"*)
-            echo "Error:${1#*Error:}"
+            printf 'Error:%s\n' "${1#*Error:}"
             ;;
         *"Warn:"*)
-            echo "Warn:${1#*Warn:}"
+            printf 'Warn:%s\n' "${1#*Warn:}"
             ;;
     esac
 }
@@ -97,27 +118,29 @@ _prop_write() {
     local status="$left"
     [ -n "$right" ] && status="${left} | ${right}"
     
-    local full_desc="${_PROP_ORIG_DESC}\\n${status}"
-    
-    # Efficient update: Only write if changed
-    local current_line
-    current_line=$(grep "^description=" "$PROP_FILE" | head -1)
-    if [ "$current_line" = "description=${full_desc}" ]; then
+    # State Memoization: Skip I/O if status hasn't changed
+    if [ "$status" = "$(getprop flux.prop.last)" ]; then
         return 0
     fi
 
-    # Atomic write strategy
-    local tmp_file="${PROP_FILE}.tmp"
+    local full_desc="${_PROP_ORIG_DESC}\\n${status}"
+    
+    # Atomic write strategy with secure temporary file
+    local tmp_file; tmp_file=$(mktemp "${PROP_FILE}.XXXXXX")
     if DESC="$full_desc" awk '
         /^description=/ { print "description=" ENVIRON["DESC"]; next }
         { print }
     ' "$PROP_FILE" > "$tmp_file"; then
+        chmod 644 "$tmp_file"
         mv -f "$tmp_file" "$PROP_FILE"
+        setprop flux.prop.last "$status"
         log_debug "Prop updated: $status"
     else
         rm -f "$tmp_file"
         log_error "Failed to update module.prop"
+        return 1
     fi
+    return 0
 }
 
 # Build left part from state
@@ -141,14 +164,14 @@ _prop_build_left() {
 
     local left="${emoji} [${state}]"
     [ "$state" = "RUNNING" ] && left="${left} PID: ${pid}"
-    echo "$left"
+    printf '%s\n' "$left"
 }
 
 # Helper to read status and return current left part
 _prop_get_current_left() {
     local current; current=$(_prop_read_status)
     local left; left=$(_prop_get_left "$current")
-    echo "${left:-$(_prop_build_left)}"
+    printf '%s\n' "${left:-$(_prop_build_left)}"
 }
 
 # Public Logging API
@@ -156,12 +179,14 @@ _prop_get_current_left() {
 # Sync state to prop (update left, preserve right)
 sync_prop() {
     _prop_write "$(_prop_build_left)" "$(_prop_get_right "$(_prop_read_status)")"
+    return 0
 }
 
 # Set error (update right, preserve left)
 prop_error() {
     _prop_write "$(_prop_get_current_left)" "Error: $1"
     log_error "$1"
+    return 0
 }
 
 # Set warning (update right, preserve left, don't overwrite error)
@@ -178,6 +203,7 @@ prop_warn() {
 # Clear error/warn (preserve left)
 prop_clear() {
     _prop_write "$(_prop_get_current_left)" ""
+    return 0
 }
 
 run() {
@@ -193,6 +219,26 @@ run() {
         prop_error "$name: FAILED"
         return $rc
     fi
+}
+
+log_banner() {
+    local msg=" $1 "
+    local width=50
+    local padding=$(( (width - ${#msg}) / 2 ))
+    [ $padding -lt 0 ] && padding=0
+    
+    local line
+    line=$(printf "%${padding}s" "" | tr ' ' '=')
+    local banner="${line}${msg}${line}"
+    [ ${#banner} -lt $width ] && banner="${banner}="
+    
+    # Output to stderr (parents will redirect to file if needed)
+    if _is_terminal; then
+        printf '\n\033[1;36m%s\033[0m\n' "$banner" >&2
+    else
+        printf '\n%s\n' "$banner" >&2
+    fi
+    return 0
 }
 
 log_debug() { _log "D" 4 "$1"; }

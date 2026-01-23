@@ -15,13 +15,11 @@ export LOG_COMPONENT="Core"
 # Helper Functions
 
 _launch_singbox() {
-    # Set resource limits
     ulimit -SHn 1000000 2>/dev/null
     
     local cmd="$SING_BOX_BIN run -c $CONFIG_FILE -D $RUN_DIR"
-    log_debug "Exec: $cmd"
-    
     local run_as="${CORE_USER}:${CORE_GROUP}"
+    local pid
     
     if command -v busybox >/dev/null 2>&1 && [ "$run_as" != "root:root" ]; then
         nohup busybox setuidgid "$run_as" $cmd >> "$FLUX_LOG" 2>&1 &
@@ -29,33 +27,49 @@ _launch_singbox() {
         nohup $cmd >> "$FLUX_LOG" 2>&1 &
     fi
     
-    echo $! > "$PID_FILE"
+    pid=$!
+    
+    if ! printf '%s' "$pid" > "$PID_FILE"; then
+        log_error "Failed to write PID file: $PID_FILE"
+        kill -9 "$pid" 2>/dev/null
+        return 1
+    fi
+    return 0
 }
 
 _check_port() {
     local port="$1"
-    if [ -x "/system/bin/ss" ] || command -v ss >/dev/null; then
-        ss -tlnp 2>/dev/null | grep -q ":${port} "
+    if [ -x "/system/bin/ss" ] || command -v ss >/dev/null 2>&1; then
+        ss -tlnp 2>/dev/null | grep -qE ":${port}([[:space:]]|$)" && return 0
     else
-        netstat -tlnp 2>/dev/null | grep -q ":${port} "
+        netstat -tlnp 2>/dev/null | grep -qE ":${port}([[:space:]]|$)" && return 0
     fi
+    return 1
 }
 
 _wait_for_ready() {
     local count=0
+    local pid
+    pid=$(_get_pid)
     
     while [ $count -lt "$CORE_TIMEOUT" ]; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            log_error "sing-box process died while waiting for readiness"
+            return 1
+        fi
+        
         _check_port "$PROXY_TCP_PORT" && return 0
         log_debug "Waiting for port $PROXY_TCP_PORT ($count/$CORE_TIMEOUT)"
+        
         sleep 1
         count=$((count + 1))
     done
-    
     return 1
 }
 
 _get_pid() {
     [ -f "$PID_FILE" ] && cat "$PID_FILE" 2>/dev/null
+    return 0
 }
 _is_process_running() {
     local pid="$1"
@@ -81,6 +95,7 @@ _kill_core() {
     fi
     
     rm -f "$PID_FILE"
+    return 0
 }
 
 # Public Control API (Start)
@@ -108,9 +123,11 @@ main() {
     case "$action" in
         start)
             start_core
+            return $?
             ;;
         stop)
             stop_core
+            return $?
             ;;
         *)
             echo "Usage: $0 {start|stop}"

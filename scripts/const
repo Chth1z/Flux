@@ -28,7 +28,7 @@ readonly SING_BOX_BIN="$BIN_DIR/sing-box"
 readonly SUBCONVERTER_BIN="$TOOLS_DIR/subconverter"
 readonly JQ_BIN="$TOOLS_DIR/jq"
 
-PATH="/data/adb/magisk:/data/adb/ksu/bin:/data/adb/ap/bin:$PATH"
+readonly PATH="/data/adb/magisk:/data/adb/ksu/bin:/data/adb/ap/bin:$PATH"
 
 # ==============================================================================
 # [ Configuration Files ]

@@ -10,14 +10,8 @@ SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 . "$SCRIPT_DIR/const"
 . "$SCRIPT_DIR/log"
 
-for file in "$CACHE_CONFIG_FILE" "$SETTINGS_FILE"; do
-    if [ -f "$file" ]; then
-        set -a; . "$file"; set +a
-        break
-    fi
-done
-
 LOG_COMPONENT="Updt"
+TMP_CONFIG=""
 
 # JQ Processing Logic
 
@@ -70,13 +64,20 @@ readonly JQ_SCRIPT_ONE_PASS='
 
 # Helper functions
 
+_cleanup() {
+    log_debug "Cleaning up updater artifacts..."
+    [ -n "$TMP_CONFIG" ] && rm -f "$TMP_CONFIG"
+    rm -f "$TMP_SUB_CONVERTED" "$GENERATE_FILE" 2>/dev/null
+    return 0
+}
+
 _retry() {
     local max="$1"; shift
     local n=0
-    while [ $n -le $max ]; do
+    while [ $n -lt $max ]; do
         "$@" && return 0
         n=$((n + 1))
-        [ $n -le $max ] && { log_warn "Retry $n of $max..."; sleep 1; }
+        [ $n -lt $max ] && { log_warn "Retry $n of $max..."; sleep 1; }
     done
     return 1
 }
@@ -84,15 +85,12 @@ _retry() {
 # Update pipeline steps
 
 _init_update() {
-    # Check subscription
     [ -n "$SUBSCRIPTION_URL" ] || { log_error "No subscription"; return 1; }
 
-    # Check tools
     for tool in "$SUBCONVERTER_BIN" "$JQ_BIN" "$TEMPLATE_FILE" "$COUNTRY_MAP_FILE"; do
         [ ! -f "$tool" ] && { log_error "Updater tool missing: $tool"; return 1; }
     done
 
-    # Fix permissions (only if not executable)
     [ -f "$SUBCONVERTER_BIN" ] && [ ! -x "$SUBCONVERTER_BIN" ] && chmod +x "$SUBCONVERTER_BIN"
     [ -f "$JQ_BIN" ] && [ ! -x "$JQ_BIN" ] && chmod +x "$JQ_BIN"
     [ ! -d "$RUN_DIR" ] && mkdir -p "$RUN_DIR"
@@ -112,28 +110,36 @@ EOF
         log_error "Subscription conversion failed or returned empty"
         return 1
     fi
+    return 0
 }
 
 _process_config() {
-    [ -f "$CONFIG_FILE" ] && cp -f "$CONFIG_FILE" "$CONFIG_BACKUP" 2>/dev/null
+    local output="$1"
     
-    "$JQ_BIN" -n \
+    if ! "$JQ_BIN" -n \
         --slurpfile sub "$TMP_SUB_CONVERTED" \
         --slurpfile map "$COUNTRY_MAP_FILE" \
         --slurpfile template "$TEMPLATE_FILE" \
-        '($template[0]) as $template | '"$JQ_SCRIPT_ONE_PASS" > "$CONFIG_FILE"
-    
-    if [ $? -ne 0 ] || [ ! -s "$CONFIG_FILE" ]; then
-        log_error "Config merger failed"
-        [ -f "$CONFIG_BACKUP" ] && mv -f "$CONFIG_BACKUP" "$CONFIG_FILE"
+        '($template[0]) as $template | '"$JQ_SCRIPT_ONE_PASS" > "$output"; then
+        log_error "JQ processing failed"
+        rm -f "$output"
         return 1
     fi
+    
+    if [ ! -s "$output" ]; then
+        log_error "JQ processing returned empty file"
+        rm -f "$output"
+        return 1
+    fi
+    return 0
 }
 
 _validate_config() {
+    local target="$1"
     local nodes_count
-    nodes_count=$("$JQ_BIN" '[.outbounds[] | select(.type != "selector" and .type != "urltest" and .type != "direct" and .type != "block" and .type != "dns")] | length' "$CONFIG_FILE" 2>/dev/null || echo 0)
-    [ "$nodes_count" -gt 0 ]
+    nodes_count=$("$JQ_BIN" '[.outbounds[] | select(.type != "selector" and .type != "urltest" and .type != "direct" and .type != "block" and .type != "dns")] | length' "$target" 2>/dev/null || echo 0)
+    [ "$nodes_count" -gt 0 ] && return 0
+    return 1
 }
 
 # Main Update Orchestration
@@ -143,36 +149,65 @@ should_update() {
     
     local last_update
     last_update=$(stat -c%Y "$CONFIG_FILE" 2>/dev/null || stat -f%m "$CONFIG_FILE" 2>/dev/null || echo 0)
-    [ "$last_update" -eq 0 ] && return 0
+    [ "$last_update" = "0" ] && return 0
     
     local elapsed
     elapsed=$(($(date +%s) - last_update))
-    [ "$elapsed" -ge "$UPDATE_INTERVAL" ]
+    [ "$elapsed" -ge "$UPDATE_INTERVAL" ] && return 0
+    return 1
 }
 
 do_update() {
+    # Secure temporary file
+    TMP_CONFIG=$(mktemp "$RUN_DIR/config.json.XXXXXX")
+    chmod 600 "$TMP_CONFIG"
+    
     run "Initialize update" _init_update || return 1
     run "Convert subscription" _convert_subscription || return 1
-    run "Process config" _process_config || return 1
-    run "Validate config" _validate_config || return 1
+    run "Process config" _process_config "$TMP_CONFIG" || return 1
+    run "Validate config" _validate_config "$TMP_CONFIG" || return 1
+
+    if [ -f "$CONFIG_FILE" ]; then
+        run "Backup current config" cp -pf "$CONFIG_FILE" "$CONFIG_BACKUP"
+    fi
+    run "Deploy new config" mv -f "$TMP_CONFIG" "$CONFIG_FILE"
+    chmod 644 "$CONFIG_FILE"
+    
+    return 0
 }
 
 # Entry point
 
 main() {
-    trap 'rm -f "$TMP_SUB_CONVERTED" "$GENERATE_FILE" 2>/dev/null' EXIT
+    trap _cleanup EXIT INT TERM
 
     local action="${1:-}"
+    local rc=0
     
     case "$action" in
         check)
-            should_update && { log_info "Update interval exceeded"; do_update; } || log_debug "Skipping update"
+            if should_update; then
+                log_info "Update interval exceeded"
+                do_update
+                rc=$?
+            else
+                log_debug "Skipping update"
+            fi
             ;;
         *)
+            for file in "$CACHE_CONFIG_FILE" "$SETTINGS_FILE"; do
+                if [ -f "$file" ]; then
+                    set -a; . "$file"; set +a
+                    break
+                fi
+            done
+
             log_info "Forcing update..."
             do_update
+            rc=$?
             ;;
     esac
+    return $rc
 }
 
 main "$@"

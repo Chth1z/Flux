@@ -14,7 +14,7 @@ export LOG_COMPONENT="Tprx"
 # Proxy Mode Detection
 
 _check_tproxy_support() {
-    if [ "${KFEAT_TPROXY:-0}" -eq 1 ]; then
+    if [ "$KFEAT_TPROXY" = "1" ]; then
         return 0
     else
         return 1
@@ -32,16 +32,17 @@ _detect_proxy_mode() {
         log_warn "Kernel does not support TPROXY, falling back to REDIRECT"
         USE_TPROXY=0
     # Check 2: User Config (0=Auto, 1=TProxy, 2=Redirect)
-    elif [ "${PROXY_MODE}" -eq 2 ]; then
+    elif [ "$PROXY_MODE" = "2" ]; then
         log_info "TPROXY is disabled by config, using REDIRECT"
         USE_TPROXY=0
     fi
     
-    if [ "$USE_TPROXY" -eq 1 ]; then
+    if [ "$USE_TPROXY" = "1" ]; then
         log_debug "Using TPROXY mode"
     else
         log_debug "Using REDIRECT mode"
     fi
+    return 0
 }
 
 # Command Wrappers for locking and families
@@ -101,7 +102,8 @@ _setup_routing4() {
         return 1
     }
 
-    echo 1 > /proc/sys/net/ipv4/ip_forward
+    printf '1\n' > /proc/sys/net/ipv4/ip_forward
+    return 0
 }
 
 _setup_routing6() {
@@ -114,7 +116,8 @@ _setup_routing6() {
         return 1
     }
 
-    echo 1 > /proc/sys/net/ipv6/conf/all/forwarding
+    printf '1\n' > /proc/sys/net/ipv6/conf/all/forwarding
+    return 0
 }
 
 # Cleanup and Flush Operations
@@ -125,11 +128,11 @@ _cleanup_chain() {
     local family="$1"
     local mode="$2"
     local restore_cmd="iptables-restore"
-    local cleanup_file="${CACHE_DIR}/cache_cleanup_ipv4"
+    local cleanup_file="$CACHE_CLEANUP_V4_FILE"
 
     if [ "$family" = "6" ]; then
         restore_cmd="ip6tables-restore"
-        cleanup_file="${CACHE_DIR}/cache_cleanup_ipv6"
+        cleanup_file="$CACHE_CLEANUP_V6_FILE"
     fi
 
     local mode_name="TPROXY"
@@ -141,20 +144,23 @@ _cleanup_chain() {
     [ -s "$cleanup_file" ] && _run_ipt_command "$restore_cmd" --noflush < "$cleanup_file" 2>/dev/null || true
     
     log_debug "$mode_name chains for IPv${family} cleanup completed"
+    return 0
 }
 
-_cleanup_routing4() {
+    _cleanup_routing4() {
     _ip_rule del fwmark "$MARK_VALUE" table "$TABLE_ID" pref "$TABLE_ID" 2> /dev/null || true
     _ip_route del local 0.0.0.0/0 dev lo table "$TABLE_ID" 2> /dev/null || true
-    echo 0 > /proc/sys/net/ipv4/ip_forward 2> /dev/null || true
+    printf '0\n' > /proc/sys/net/ipv4/ip_forward 2> /dev/null || true
     log_debug "IPv4 routing cleanup completed"
+    return 0
 }
 
 _cleanup_routing6() {
     _ip6_rule del fwmark "$MARK_VALUE6" table "$TABLE_ID" pref "$TABLE_ID" 2> /dev/null || true
     _ip6_route del local ::/0 dev lo table "$TABLE_ID" 2> /dev/null || true
-    echo 0 > /proc/sys/net/ipv6/conf/all/forwarding 2> /dev/null || true
+    printf '0\n' > /proc/sys/net/ipv6/conf/all/forwarding 2> /dev/null || true
     log_debug "IPv6 routing cleanup completed"
+    return 0
 }
 
 # Main Execution API
@@ -162,7 +168,7 @@ _cleanup_routing6() {
 start_proxy() {
     _detect_proxy_mode
     local mode="tproxy"
-    [ "$USE_TPROXY" -eq 0 ] && mode="redirect"
+    [ "$USE_TPROXY" = "0" ] && mode="redirect"
 
     run "Apply IPv4 rules" _setup_proxy_chain 4 "$mode" || { touch "$EVENTS_DIR/fail"; return 1; }
     
@@ -170,7 +176,7 @@ start_proxy() {
         run "Setup IPv4 routing" _setup_routing4 || { touch "$EVENTS_DIR/fail"; return 1; }
     fi
     
-    if [ "$PROXY_IPV6" -eq 1 ]; then
+    if [ "$PROXY_IPV6" = "1" ]; then
         run "Apply IPv6 rules" _setup_proxy_chain 6 "$mode" || { touch "$EVENTS_DIR/fail"; return 1; }
         if [ "$mode" = "tproxy" ]; then
             run "Setup IPv6 routing" _setup_routing6 || { touch "$EVENTS_DIR/fail"; return 1; }
@@ -185,15 +191,16 @@ start_proxy() {
 stop_proxy() {
     _detect_proxy_mode
     local mode="tproxy"
-    [ "$USE_TPROXY" -eq 0 ] && mode="redirect"
+    [ "$USE_TPROXY" = "0" ] && mode="redirect"
     
     run "Flush IPv4 chains" _cleanup_chain 4 "$mode"
     run "Flush IPv4 routing" _cleanup_routing4
     
-    if [ "$PROXY_IPV6" -eq 1 ]; then
+    if [ "$PROXY_IPV6" = "1" ]; then
         run "Flush IPv6 chains" _cleanup_chain 6 "$mode"
         run "Flush IPv6 routing" _cleanup_routing6
     fi
+    return 0
 }
 
 main() {
@@ -202,9 +209,11 @@ main() {
     case "$action" in
         start)
             start_proxy
+            return $?
             ;;
         stop)
             stop_proxy
+            return $?
             ;;
         *)
             echo "Usage: $0 {start|stop}"

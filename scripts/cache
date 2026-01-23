@@ -18,7 +18,7 @@ export LOG_COMPONENT="Cach"
 
 _save_rules_cache() {
     local mode="tproxy"
-    if [ "${KFEAT_TPROXY:-0}" -eq 0 ] || [ "${PROXY_MODE:-0}" -eq 2 ]; then
+    if [ "$KFEAT_TPROXY" = "0" ] || [ "$PROXY_MODE" = "2" ]; then
         mode="redirect"
     fi
     
@@ -28,13 +28,14 @@ _save_rules_cache() {
     generate_all_cleanup_rules "4" "$mode" > "$CACHE_CLEANUP_V4_FILE"
     log_debug "IPv4 rules cached"
     
-    if [ "$PROXY_IPV6" -eq 1 ]; then
+    if [ "$PROXY_IPV6" = "1" ]; then
         generate_all_rules "6" "$mode" > "$CACHE_RULES_V6_FILE"
         generate_all_cleanup_rules "6" "$mode" > "$CACHE_CLEANUP_V6_FILE"
         log_debug "IPv6 rules cached"
     fi
     
     log_debug "All rules cache saved (mode: $mode)"
+    return 0
 }
 
 # Kernel Feature Detection Cache
@@ -62,30 +63,31 @@ _save_kernel_cache() {
         return 1
     fi
     
-    local kernel_config
-    kernel_config=$(zcat /proc/config.gz 2>/dev/null)
+    # Consolidate detection into a single awk process
+    local features
+    features=$(zcat /proc/config.gz 2>/dev/null | awk '
+        /CONFIG_NETFILTER_XT_TARGET_TPROXY=[ym]/ { t=1 }
+        /CONFIG_NETFILTER_XT_MATCH_OWNER=[ym]/ { o=1 }
+        /CONFIG_NETFILTER_XT_MATCH_MARK=[ym]/ { m=1 }
+        /CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=[ym]/ { a=1 }
+        /CONFIG_NETFILTER_XT_MATCH_CONNTRACK=[ym]/ { c=1 }
+        /CONFIG_NETFILTER_XT_MATCH_MAC=[ym]/ { ma=1 }
+        /CONFIG_IP6_NF_NAT=[ym]/ { i=1 }
+        END {
+            printf "KFEAT_TPROXY=%d;KFEAT_OWNER=%d;KFEAT_MARK=%d;KFEAT_ADDRTYPE=%d;KFEAT_CONNTRACK=%d;KFEAT_MAC=%d;KFEAT_IPV6_NAT=%d", 
+                   t+0, o+0, m+0, a+0, c+0, ma+0, i+0
+        }
+    ')
+    
+    # Batch export
+    local IFS=';'
+    for feat in $features; do
+        export "$feat"
+    done
     
     local content="# Kernel Feature Cache - Auto Generated
 #kernel:${current_kernel}
-"
-    
-    _check_feat() {
-        case "$kernel_config" in
-            *"CONFIG_${1}=y"*|*"CONFIG_${1}=m"*) echo 1 ;;
-            *) echo 0 ;;
-        esac
-    }
-    
-    # Detect and export
-    export KFEAT_TPROXY=$(_check_feat NETFILTER_XT_TARGET_TPROXY)
-    export KFEAT_OWNER=$(_check_feat NETFILTER_XT_MATCH_OWNER)
-    export KFEAT_MARK=$(_check_feat NETFILTER_XT_MATCH_MARK)
-    export KFEAT_ADDRTYPE=$(_check_feat NETFILTER_XT_MATCH_ADDRTYPE)
-    export KFEAT_CONNTRACK=$(_check_feat NETFILTER_XT_MATCH_CONNTRACK)
-    export KFEAT_MAC=$(_check_feat NETFILTER_XT_MATCH_MAC)
-    export KFEAT_IPV6_NAT=$(_check_feat IP6_NF_NAT)
-    
-    content="${content}KFEAT_TPROXY=${KFEAT_TPROXY}
+KFEAT_TPROXY=${KFEAT_TPROXY}
 KFEAT_OWNER=${KFEAT_OWNER}
 KFEAT_MARK=${KFEAT_MARK}
 KFEAT_ADDRTYPE=${KFEAT_ADDRTYPE}
@@ -106,14 +108,16 @@ KFEAT_IPV6_NAT=${KFEAT_IPV6_NAT}
 _get_mtime() {
     local file="$1"
     if [ -f "$file" ]; then
-        stat -c %Y "$file" 2>/dev/null || stat -f %m "$file" 2>/dev/null || echo "0"
+        stat -c %Y "$file" 2>/dev/null || stat -f %m "$file" 2>/dev/null || printf "0\n"
     else
-        echo "0"
+        printf "0\n"
     fi
+    return 0
 }
 
 _get_version_code() {
     grep "^versionCode=" "$PROP_FILE" | cut -d= -f2-
+    return 0
 }
 
 _get_meta_signature() {
@@ -123,6 +127,7 @@ _get_meta_signature() {
         "$(_get_mtime "$CONFIG_FILE")" \
         "$(_get_mtime "$PACKAGES_LIST")" \
         "$(uname -r 2>/dev/null)"
+    return 0
 }
 
 _is_cache_valid() {
@@ -133,7 +138,11 @@ _is_cache_valid() {
     
     local current_sig cached_sig
     current_sig=$(_get_meta_signature)
-    cached_sig=$(grep "^#" "$CACHE_META_FILE" | grep -v "#build_ts:" | sed 's/^#//')
+    # Single awk process to filter and strip #
+    cached_sig=$(awk '
+        /^#build_ts:/ { next }
+        /^#/ { sub(/^#/, ""); print }
+    ' "$CACHE_META_FILE")
     
     if [ "$current_sig" != "$cached_sig" ]; then
         log_debug "Cache signature mismatch"
@@ -152,11 +161,12 @@ _save_meta_cache() {
     mkdir -p "$(dirname "$CACHE_META_FILE")"
     
     {
-        echo "$sig" | sed 's/^/#/'
-        echo "#build_ts:$(date +%s)"
+        printf '%s\n' "$sig" | sed 's/^/#/'
+        printf '#build_ts:%s\n' "$(date +%s)"
     } > "$CACHE_META_FILE"
     
     log_debug "Meta cache saved"
+    return 0
 }
 
 
@@ -226,6 +236,7 @@ DEBOUNCE_INTERVAL=$DEBOUNCE_INTERVAL
 EOF
     
     log_debug "Config cache saved"
+    return 0
 }
 
 
@@ -258,12 +269,15 @@ main() {
     case "$action" in
         check)
             check_cache
+            return $?
             ;;
         build)
             build_all_caches
+            return $?
             ;;
         *)
             check_cache
+            return $?
             ;;
     esac
 }

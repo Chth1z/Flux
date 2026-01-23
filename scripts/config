@@ -48,6 +48,7 @@ _init_config_defaults() {
     : "${FAKEIP_RANGE_V4:=198.18.0.0/15}"
     : "${FAKEIP_RANGE_V6:=fc00::/18}"
     : "${DEBOUNCE_INTERVAL:=10}"
+    return 0
 }
 
 _extract_json_config() {
@@ -78,6 +79,7 @@ _extract_json_config() {
     # Assign with validation
     case "$v4" in *"/"[0-9]*) FAKEIP_RANGE_V4="$v4" ;; esac
     case "$v6" in *":"*"/"[0-9]*) FAKEIP_RANGE_V6="$v6" ;; esac
+    return 0
 }
 
 # ==============================================================================
@@ -89,15 +91,78 @@ _validate_int() {
     local name="$1" val="$2" min="$3" max="$4"
     case "$val" in
         ''|*[!0-9]*)
-            echo "• $name: not a number ($val)"
-            return 1
-            ;;
+        printf '• %s: not a number (%s)\n' "$name" "${val:-empty}"
+        return 1
+        ;;
     esac
     
     if [ "$val" -lt "$min" ] || [ "$val" -gt "$max" ]; then
-        echo "• $name: out of range ($val, must be $min-$max)"
+        printf '• %s: out of range (%s, must be %s-%s)\n' "$name" "$val" "$min" "$max"
         return 1
     fi
+    return 0
+}
+
+_validate_user_group() {
+    local name="$1" val="$2"
+    [ -z "$val" ] && { printf '• %s: cannot be empty\n' "$name"; return 1; }
+    
+    case "$val" in
+        [0-9]*) return 0 ;;
+    esac
+    
+    case "$val" in
+        *[!a-zA-Z0-9_]*)
+            printf '• %s: invalid format "%s" (must be alphanumeric or numeric ID)\n' "$name" "$val"
+            return 1
+            ;;
+    esac
+    return 0
+}
+
+_validate_url() {
+    local name="$1" val="$2"
+    [ -z "$val" ] && return 0
+
+    case "$val" in
+        http://*|https://*)
+            case "$val" in
+                *[[:space:]\"\'\<\>\;\`\|]*)
+                    printf '• %s: contains illegal characters\n' "$name"
+                    return 1
+                    ;;
+            esac
+            ;;
+        *)
+            printf '• %s: must be a valid http/https URL\n' "$name"
+            return 1
+            ;;
+    esac
+    return 0
+}
+
+_validate_iface() {
+    local name="$1" val="$2"
+
+    case "$val" in
+        ''|*[!a-zA-Z0-9._+]*)
+            printf '• %s: invalid interface name format (%s)\n' "$name" "$val"
+            return 1
+            ;;
+    esac
+
+    case "$val" in
+        *+*)
+            case "$val" in
+                *+) : ;;
+                *)
+                    printf '• %s: invalid wildcard placement in (%s)\n' "$name" "$val"
+                    return 1
+                    ;;
+            esac
+            ;;
+    esac
+    return 0
 }
 
 # ==============================================================================
@@ -105,45 +170,62 @@ _validate_int() {
 # ==============================================================================
 
 VALIDATION_SCHEMA="
-LOG_LEVEL:0:4
-LOG_MAX_SIZE:10240:104857600
-UPDATE_TIMEOUT:1:300
-RETRY_COUNT:0:10
-UPDATE_INTERVAL:60:31536000
-CORE_TIMEOUT:1:60
-PROXY_TCP_PORT:1:65535
-PROXY_UDP_PORT:1:65535
-PROXY_MODE:0:2
-DNS_HIJACK_ENABLE:0:2
-PROXY_MOBILE:0:1
-PROXY_WIFI:0:1
-PROXY_HOTSPOT:0:1
-PROXY_USB:0:1
-PROXY_TCP:0:1
-PROXY_UDP:0:1
-PROXY_IPV6:0:1
-APP_PROXY_ENABLE:0:1
-APP_PROXY_MODE:1:2
-MAC_FILTER_ENABLE:0:1
-MAC_PROXY_MODE:1:2
-SKIP_CHECK_FEATURE:0:1
-DEBOUNCE_INTERVAL:0:300
+LOG_LEVEL:int:0:4
+LOG_MAX_SIZE:int:10240:104857600
+UPDATE_TIMEOUT:int:1:300
+RETRY_COUNT:int:0:10
+UPDATE_INTERVAL:int:60:31536000
+CORE_TIMEOUT:int:1:60
+PROXY_TCP_PORT:int:1:65535
+PROXY_UDP_PORT:int:1:65535
+PROXY_MODE:int:0:2
+DNS_HIJACK_ENABLE:int:0:2
+PROXY_MOBILE:int:0:1
+PROXY_WIFI:int:0:1
+PROXY_HOTSPOT:int:0:1
+PROXY_USB:int:0:1
+PROXY_TCP:int:0:1
+PROXY_UDP:int:0:1
+PROXY_IPV6:int:0:1
+APP_PROXY_ENABLE:int:0:1
+APP_PROXY_MODE:int:1:2
+MAC_FILTER_ENABLE:int:0:1
+MAC_PROXY_MODE:int:1:2
+SKIP_CHECK_FEATURE:int:0:1
+DEBOUNCE_INTERVAL:int:0:300
+CORE_USER:user
+CORE_GROUP:user
+ROUTING_MARK:int:1:65535
+SUBSCRIPTION_URL:url
+MOBILE_INTERFACE:iface
+WIFI_INTERFACE:iface
+HOTSPOT_INTERFACE:iface
+USB_INTERFACE:iface
 "
 
 _validate_settings() {
     log_debug "Validating settings..."
-    local valid=0 name min max val
+    local valid=0 name type p1 p2 val
     
-    # Use process substitution or heredoc to avoid subshell issues with 'valid' variable
-    while IFS=: read -r name min max || [ -n "$name" ]; do
-        [ -z "$name" ] && continue
+    while IFS=: read -r name type p1 p2 || [ -n "$name" ]; do
+        [ -z "$name" ] || [ "${name#\#}" != "$name" ] && continue
+        
+        # Sanitize name to prevent eval injection
+        case "$name" in *[!a-zA-Z0-9_]*) continue ;; esac
+
         eval "val=\$$name"
-        _validate_int "$name" "$val" "$min" "$max" || valid=1
+        
+        case "$type" in
+            int)   _validate_int "$name" "$val" "$p1" "$p2" || valid=1 ;;
+            iface) _validate_iface "$name" "$val" || valid=1 ;;
+            user)  _validate_user_group "$name" "$val" || valid=1 ;;
+            url)   _validate_url "$name" "$val" || valid=1 ;;
+        esac
     done << EOF
 $VALIDATION_SCHEMA
 EOF
     
-    [ $valid -eq 0 ] && log_debug "Settings validation passed"
+    [ "$valid" = "0" ] && log_debug "Settings validation passed"
     return $valid
 }
 
@@ -159,15 +241,15 @@ _validate_singbox_config() {
     fi
     
     if [ ! -x "$SING_BOX_BIN" ]; then
-        echo "• sing-box binary not executable"
+        printf '• sing-box binary not executable\n'
         return 1
     fi
     
     local check_output
     check_output=$("$SING_BOX_BIN" check -c "$CONFIG_FILE" -D "$RUN_DIR" 2>&1)
     
-    if [ $? -ne 0 ]; then
-        echo "• sing-box config invalid: $check_output"
+    if [ $? != "0" ]; then
+        printf '• sing-box config invalid: %s\n' "$check_output"
         return 1
     fi
     
@@ -181,12 +263,17 @@ _validate_singbox_config() {
 
 validate_all() {
     if [ -f "$SETTINGS_FILE" ]; then
-        # Pre-source syntax check
-        if ! sh -n "$SETTINGS_FILE" 2>/dev/null; then
+        # Read once into memory
+        local settings_raw; settings_raw=$(cat "$SETTINGS_FILE")
+        
+        # 1. Syntax check (Process memory)
+        if ! echo "$settings_raw" | sh -n 2>/dev/null; then
             log_error "Syntax error in $SETTINGS_FILE"
             return 1
         fi
-        set -a; . "$SETTINGS_FILE"; set +a
+        
+        # 2. Source from memory
+        eval "$settings_raw"
     fi
     _init_config_defaults
     _extract_json_config

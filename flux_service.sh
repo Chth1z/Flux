@@ -35,11 +35,14 @@ _start_inotify_module() {
     # Monitor MAGISK_MOD_DIR (disable toggle) ::nd (New, Delete)
     # Monitor EVENTS_DIR (internal events) ::n (New only)
     nohup inotifyd "$DISPATCHER_SCRIPT" "$MAGISK_MOD_DIR:nd" "$EVENTS_DIR:n" >/dev/null 2>&1 &
+    return 0
 }
 
 # Execution entry point
 
 main() {
+    [ -n "$FLUX_LOG" ] && [ ! -t 2 ] && exec 2>>"$FLUX_LOG"
+
     run "Wait for boot" _wait_for_boot || exit 1
     sleep 3
 

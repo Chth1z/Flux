@@ -10,9 +10,18 @@ _find_packages_uid() {
     local pkgs="$*"
     [ -z "$pkgs" ] && return 0
     
+    # Memoization cache key based on pkgs string hash/length
+    local cache_key="${pkgs//[^a-zA-Z0-9]/_}"
+    local cache_var="_UID_CACHE_${cache_key}"
+    eval "local cached_val=\"\$$cache_var\""
+    if [ -n "$cached_val" ]; then
+        printf '%s\n' "$cached_val"
+        return 0
+    fi
+    
     # Fast path: Associative array using Awk
     local uids
-    uids=$(echo "$pkgs" | awk '
+    uids=$(printf '%s\n' "$pkgs" | awk '
     NR == FNR {
         for (i = 1; i <= NF; i++) {
             token = $i;
@@ -45,7 +54,9 @@ _find_packages_uid() {
     }
     ' - "$PACKAGES_LIST")
     
-    echo "$uids"
+    # Cache result in memory
+    eval "${cache_var}=\"\$uids\""
+    printf '%s\n' "$uids"
 }
 
 # Stateless kernel feature access - uses KFEAT_* variables from environment/cache
@@ -56,11 +67,12 @@ _find_packages_uid() {
 # Get interface config (cached)
 _get_interface_config() {
     cat <<EOF
-mobile|${MOBILE_INTERFACE}|${PROXY_MOBILE}||
-wifi|${WIFI_INTERFACE}|${PROXY_WIFI}||
-hotspot|${HOTSPOT_INTERFACE}|${PROXY_HOTSPOT}|192.168.43.0/24|fe80::/10
-usb|${USB_INTERFACE}|${PROXY_USB}||
+ mobile|${MOBILE_INTERFACE}|${PROXY_MOBILE}||
+ wifi|${WIFI_INTERFACE}|${PROXY_WIFI}||
+ hotspot|${HOTSPOT_INTERFACE}|${PROXY_HOTSPOT}|192.168.43.0/24|fe80::/10
+ usb|${USB_INTERFACE}|${PROXY_USB}||
 EOF
+    return 0
 }
 
 # Core Rule Building Functions
@@ -69,24 +81,25 @@ _build_interface_rules() {
     local suffix="$1" table="$2" family="$3"
     
     # Always bypass loopback
-    echo "-A PROXY_INTERFACE${suffix} -i lo -j RETURN"
+    printf '%s\n' "-A PROXY_INTERFACE${suffix} -i lo -j RETURN"
     
     _get_interface_config | while IFS="|" read -r name iface proxy_enabled hs_v4 hs_v6; do
         [ -z "$iface" ] && continue
         
-        if [ "$proxy_enabled" -eq 1 ]; then
+        if [ "$proxy_enabled" = "1" ]; then
             local action="-j RETURN"
             if [ "$name" = "hotspot" ] && [ "$HOTSPOT_INTERFACE" = "$WIFI_INTERFACE" ]; then
                 local subnet; [ "$family" = "6" ] && subnet="$hs_v6" || subnet="$hs_v4"
                 [ -n "$subnet" ] && action="! -s $subnet $action"
             fi
-            echo "-A PROXY_INTERFACE${suffix} -i $iface $action"
+            printf '%s\n' "-A PROXY_INTERFACE${suffix} -i $iface $action"
         else
-            echo "-A PROXY_INTERFACE${suffix} -i $iface -j ACCEPT"
-            echo "-A BYPASS_INTERFACE${suffix} -o $iface -j ACCEPT"
+            printf '%s\n' "-A PROXY_INTERFACE${suffix} -i $iface -j ACCEPT"
+            printf '%s\n' "-A BYPASS_INTERFACE${suffix} -o $iface -j ACCEPT"
         fi
     done
-    echo "-A PROXY_INTERFACE${suffix} -j ACCEPT"
+    printf '%s\n' "-A PROXY_INTERFACE${suffix} -j ACCEPT"
+    return 0
 }
 
 _build_bypass_ip_rules() {
@@ -95,14 +108,14 @@ _build_bypass_ip_rules() {
     local rules=""
     
     # Local address type bypass
-    if [ "${KFEAT_ADDRTYPE:-0}" -eq 1 ]; then
+    if [ "$KFEAT_ADDRTYPE" = "1" ]; then
         rules="${rules}-A BYPASS_IP${suffix} -m addrtype --dst-type LOCAL -p udp ! --dport 53 -j ACCEPT
 -A BYPASS_IP${suffix} -m addrtype --dst-type LOCAL ! -p udp -j ACCEPT
 "
     fi
     
     # Reply connection bypass
-    if [ "${KFEAT_CONNTRACK:-0}" -eq 1 ]; then
+    if [ "$KFEAT_CONNTRACK" = "1" ]; then
         rules="${rules}-A BYPASS_IP${suffix} -m conntrack --ctdir REPLY -j ACCEPT
 "
     fi
@@ -118,82 +131,86 @@ _build_bypass_ip_rules() {
     done
     
     printf '%s' "$rules"
+    return 0
 }
 
 _build_app_rules() {
     local suffix="$1"
     
     # Core process bypass
-    if [ "${KFEAT_OWNER:-0}" -eq 1 ]; then
-        echo "-A APP_CHAIN${suffix} -m owner --uid-owner $CORE_USER --gid-owner $CORE_GROUP -j ACCEPT"
-    elif [ "${KFEAT_MARK:-0}" -eq 1 ] && [ -n "$ROUTING_MARK" ]; then
-        echo "-A APP_CHAIN${suffix} -m mark --mark $ROUTING_MARK -j ACCEPT"
+    if [ "$KFEAT_OWNER" = "1" ]; then
+        printf '%s\n' "-A APP_CHAIN${suffix} -m owner --uid-owner $CORE_USER --gid-owner $CORE_GROUP -j ACCEPT"
+    elif [ "$KFEAT_MARK" = "1" ] && [ -n "$ROUTING_MARK" ]; then
+        printf '%s\n' "-A APP_CHAIN${suffix} -m mark --mark $ROUTING_MARK -j ACCEPT"
     fi
     
     # Per-app proxy rules
-    log_debug "Building app rules: ENABLE=$APP_PROXY_ENABLE OWNER=${KFEAT_OWNER:-0} MODE=$APP_PROXY_MODE"
-    if [ "$APP_PROXY_ENABLE" -eq 1 ] && [ "${KFEAT_OWNER:-0}" -eq 1 ]; then
+    log_debug "Building app rules: ENABLE=$APP_PROXY_ENABLE OWNER=$KFEAT_OWNER MODE=$APP_PROXY_MODE"
+    if [ "$APP_PROXY_ENABLE" = "1" ] && [ "$KFEAT_OWNER" = "1" ]; then
         local uids=""
         case "$APP_PROXY_MODE" in
             1) # Blacklist
                 [ -n "$BYPASS_APPS_LIST" ] && uids=$(_find_packages_uid "$BYPASS_APPS_LIST")
                 if [ -n "$uids" ]; then
-                    echo "$uids" | awk -v suffix="$suffix" '{
+                    printf '%s\n' "$uids" | awk -v suffix="$suffix" '{
                         for(i=1; i<=NF; i++) print "-A APP_CHAIN" suffix " -m owner --uid-owner " $i " -j ACCEPT"
                     }'
                 else 
                     log_debug "App rules (Blacklist): No UIDs found"
                 fi
-                echo "-A APP_CHAIN${suffix} -j RETURN"
+                printf '-A APP_CHAIN%s -j RETURN\n' "${suffix}"
                 ;;
             2) # Whitelist
                 [ -n "$PROXY_APPS_LIST" ] && uids=$(_find_packages_uid "$PROXY_APPS_LIST")
-                log_debug "App rules (Whitelist): Found UIDs count=$(echo "$uids" | wc -w)"
+                set -- $uids
+                log_debug "App rules (Whitelist): Found UIDs count=$#"
                 if [ -n "$uids" ]; then
-                    echo "$uids" | awk -v suffix="$suffix" '{
+                    printf '%s\n' "$uids" | awk -v suffix="$suffix" '{
                         for(i=1; i<=NF; i++) print "-A APP_CHAIN" suffix " -m owner --uid-owner " $i " -j RETURN"
                     }'
                 else
-                    log_debug "App rules (Whitelist): No UIDs found from $(echo "$PROXY_APPS_LIST" | wc -w) packages"
+                    log_debug "App rules (Whitelist): No UIDs found from $(printf '%s\n' "$PROXY_APPS_LIST" | wc -w) packages"
                 fi
-                echo "-A APP_CHAIN${suffix} -j ACCEPT"
+                printf '-A APP_CHAIN%s -j ACCEPT\n' "${suffix}"
                 ;;
         esac
     fi
+    return 0
 }
 
 _build_mac_rules() {
     local suffix="$1"
     
-    if [ "$MAC_FILTER_ENABLE" -eq 1 ] && [ "$PROXY_HOTSPOT" -eq 1 ] && [ -n "$HOTSPOT_INTERFACE" ] && [ "${KFEAT_MAC:-0}" -eq 1 ]; then
-        if [ "$MAC_PROXY_MODE" -eq 1 ]; then
+    if [ "$MAC_FILTER_ENABLE" = "1" ] && [ "$PROXY_HOTSPOT" = "1" ] && [ -n "$HOTSPOT_INTERFACE" ] && [ "$KFEAT_MAC" = "1" ]; then
+        if [ "$MAC_PROXY_MODE" = "1" ]; then
             # Blacklist
             if [ -n "$BYPASS_MACS_LIST" ]; then
-                echo "$BYPASS_MACS_LIST" | awk -v suffix="$suffix" -v iface="$HOTSPOT_INTERFACE" '{
+                printf '%s\n' "$BYPASS_MACS_LIST" | awk -v suffix="$suffix" -v iface="$HOTSPOT_INTERFACE" '{
                      for(i=1; i<=NF; i++) print "-A MAC_CHAIN" suffix " -m mac --mac-source " $i " -i " iface " -j ACCEPT"
                 }'
             fi
-            echo "-A MAC_CHAIN${suffix} -i ${HOTSPOT_INTERFACE} -j RETURN"
+            printf '%s\n' "-A MAC_CHAIN${suffix} -i ${HOTSPOT_INTERFACE} -j RETURN"
         else
             # Whitelist
             if [ -n "$PROXY_MACS_LIST" ]; then
-                echo "$PROXY_MACS_LIST" | awk -v suffix="$suffix" -v iface="$HOTSPOT_INTERFACE" '{
+                printf '%s\n' "$PROXY_MACS_LIST" | awk -v suffix="$suffix" -v iface="$HOTSPOT_INTERFACE" '{
                      for(i=1; i<=NF; i++) print "-A MAC_CHAIN" suffix " -m mac --mac-source " $i " -i " iface " -j RETURN"
                 }'
             fi
-            echo "-A MAC_CHAIN${suffix} -i ${HOTSPOT_INTERFACE} -j ACCEPT"
+            printf '%s\n' "-A MAC_CHAIN${suffix} -i ${HOTSPOT_INTERFACE} -j ACCEPT"
         fi
     fi
+    return 0
 }
 
 _build_dns_hijack_mangle_rules() {
     local suffix="$1"
     local mode="$2"
     
-    [ "$DNS_HIJACK_ENABLE" -eq 0 ] && return 0
+    [ "$DNS_HIJACK_ENABLE" = "0" ] && return 0
     [ "$mode" != "tproxy" ] && return 0
     
-    if [ "$DNS_HIJACK_ENABLE" -eq 2 ]; then
+    if [ "$DNS_HIJACK_ENABLE" = "2" ]; then
         # Redirect mode: ACCEPT to let it pass to NAT table
         cat <<EOF
 -A DNS_HIJACK_PRE${suffix} -p udp --dport 53 -j ACCEPT
@@ -224,9 +241,9 @@ _build_proxy_rules() {
     [ "$mode" = "redirect" ] && table="nat"
     
     # --- Header & Chains ---
-    echo "*${table}"
+    printf '%s\n' "*${table}"
     for chain in $PROXY_CHAINS; do
-        echo ":${chain}${suffix} - [0:0]"
+        printf '%s\n' ":${chain}${suffix} - [0:0]"
     done
     
     # --- Link Chains ---
@@ -254,7 +271,7 @@ EOF
 -A PROXY_PREROUTING${suffix} -p udp -j TPROXY --on-port $PROXY_UDP_PORT --tproxy-mark $mark
 -A PROXY_OUTPUT${suffix} -j MARK --set-mark $mark
 EOF
-        [ "$PROXY_UDP" -eq 1 ] && cat <<EOF
+        [ "$PROXY_UDP" = "1" ] && cat <<EOF
 -I PREROUTING -p udp -j PROXY_PREROUTING${suffix}
 -I OUTPUT -p udp -j PROXY_OUTPUT${suffix}
 EOF
@@ -265,14 +282,15 @@ EOF
 EOF
     fi
 
-    if [ "$PROXY_TCP" -eq 1 ]; then
+    if [ "$PROXY_TCP" = "1" ]; then
         cat <<EOF
 -I PREROUTING -p tcp -j PROXY_PREROUTING${suffix}
 -I OUTPUT -p tcp -j PROXY_OUTPUT${suffix}
 EOF
     fi
     
-    echo "COMMIT"
+    printf 'COMMIT\n'
+    return 0
 }
 
 # Filter table loopback blocking
@@ -280,13 +298,13 @@ EOF
 # Loopback block rules (filter table)
 _build_loopback_block() {
     local family="$1" action="${2:--A}"
-    [ "${KFEAT_OWNER:-0}" -eq 0 ] && return 0
+    [ "$KFEAT_OWNER" = "0" ] && return 0
     local addr="127.0.0.1"
     [ "$family" = "6" ] && addr="::1"
     
-    echo "*filter"
-    echo "$action OUTPUT -d ${addr} -p tcp -m owner --uid-owner ${CORE_USER} --gid-owner ${CORE_GROUP} -m tcp --dport ${PROXY_TCP_PORT} -j REJECT"
-    echo "COMMIT"
+    printf '%s\n' "*filter"
+    printf '%s\n' "$action OUTPUT -d ${addr} -p tcp -m owner --uid-owner ${CORE_USER} --gid-owner ${CORE_GROUP} -m tcp --dport ${PROXY_TCP_PORT} -j REJECT"
+    printf '%s\n' "COMMIT"
 }
 
 _build_loopback_block_rules() { _build_loopback_block "$1" "-A"; }
@@ -297,7 +315,7 @@ _build_loopback_block_cleanup_rules() { _build_loopback_block "$1" "-D"; }
 
 _check_nat_support() {
     local family="$1"
-    if [ "$family" = "6" ] && [ "${KFEAT_IPV6_NAT:-0}" -eq 0 ]; then
+    if [ "$family" = "6" ] && [ "$KFEAT_IPV6_NAT" = "0" ]; then
         return 1
     fi
     return 0
@@ -310,32 +328,32 @@ _build_nat_extra() {
     local range="$FAKEIP_RANGE_V4" addr="127.0.0.1" suffix=""
     [ "$family" = "6" ] && { range="$FAKEIP_RANGE_V6"; addr="::1"; suffix="6"; }
     
-    echo "*nat"
-    echo "$action OUTPUT -d ${range} -p icmp -j DNAT --to-destination ${addr}"
-    echo "$action PREROUTING -d ${range} -p icmp -j DNAT --to-destination ${addr}"
+    printf '%s\n' "*nat"
+    printf '%s\n' "$action OUTPUT -d ${range} -p icmp -j DNAT --to-destination ${addr}"
+    printf '%s\n' "$action PREROUTING -d ${range} -p icmp -j DNAT --to-destination ${addr}"
 
     # DNS Hijack (Mode 2)
-    if [ "${DNS_HIJACK_ENABLE:-0}" -eq 2 ]; then
+    if [ "$DNS_HIJACK_ENABLE" = "2" ]; then
         if [ "$action" = "-A" ]; then
-            echo ":NAT_DNS_HIJACK${suffix} - [0:0]"
-            [ "$PROXY_MOBILE" -eq 1 ] && echo "-A PREROUTING -i ${MOBILE_INTERFACE} -j NAT_DNS_HIJACK${suffix}"
-            [ "$PROXY_WIFI" -eq 1 ] && echo "-A PREROUTING -i ${WIFI_INTERFACE} -j NAT_DNS_HIJACK${suffix}"
-            [ "$PROXY_USB" -eq 1 ] && echo "-A PREROUTING -i ${USB_INTERFACE} -j NAT_DNS_HIJACK${suffix}"
-            echo "-A OUTPUT -p udp --dport 53 -m owner --uid-owner ${CORE_USER} --gid-owner ${CORE_GROUP} -j ACCEPT"
-            echo "-A OUTPUT -p tcp --dport 53 -m owner --uid-owner ${CORE_USER} --gid-owner ${CORE_GROUP} -j ACCEPT"
-            echo "-A OUTPUT -j NAT_DNS_HIJACK${suffix}"
+            printf '%s\n' ":NAT_DNS_HIJACK${suffix} - [0:0]"
+            [ "$PROXY_MOBILE" = "1" ] && printf '%s\n' "-A PREROUTING -i ${MOBILE_INTERFACE} -j NAT_DNS_HIJACK${suffix}"
+            [ "$PROXY_WIFI" = "1" ] && printf '%s\n' "-A PREROUTING -i ${WIFI_INTERFACE} -j NAT_DNS_HIJACK${suffix}"
+            [ "$PROXY_USB" = "1" ] && printf '%s\n' "-A PREROUTING -i ${USB_INTERFACE} -j NAT_DNS_HIJACK${suffix}"
+            printf '%s\n' "-A OUTPUT -p udp --dport 53 -m owner --uid-owner ${CORE_USER} --gid-owner ${CORE_GROUP} -j ACCEPT"
+            printf '%s\n' "-A OUTPUT -p tcp --dport 53 -m owner --uid-owner ${CORE_USER} --gid-owner ${CORE_GROUP} -j ACCEPT"
+            printf '%s\n' "-A OUTPUT -j NAT_DNS_HIJACK${suffix}"
         else
-            [ "$PROXY_MOBILE" -eq 1 ] && echo "-D PREROUTING -i ${MOBILE_INTERFACE} -j NAT_DNS_HIJACK${suffix}"
-            [ "$PROXY_WIFI" -eq 1 ] && echo "-D PREROUTING -i ${WIFI_INTERFACE} -j NAT_DNS_HIJACK${suffix}"
-            [ "$PROXY_USB" -eq 1 ] && echo "-D PREROUTING -i ${USB_INTERFACE} -j NAT_DNS_HIJACK${suffix}"
-            echo "-D OUTPUT -p udp --dport 53 -m owner --uid-owner ${CORE_USER} --gid-owner ${CORE_GROUP} -j ACCEPT"
-            echo "-D OUTPUT -p tcp --dport 53 -m owner --uid-owner ${CORE_USER} --gid-owner ${CORE_GROUP} -j ACCEPT"
-            echo "-D OUTPUT -j NAT_DNS_HIJACK${suffix}"
-            echo "-F NAT_DNS_HIJACK${suffix}"
-            echo "-X NAT_DNS_HIJACK${suffix}"
+            [ "$PROXY_MOBILE" = "1" ] && printf '%s\n' "-D PREROUTING -i ${MOBILE_INTERFACE} -j NAT_DNS_HIJACK${suffix}"
+            [ "$PROXY_WIFI" = "1" ] && printf '%s\n' "-D PREROUTING -i ${WIFI_INTERFACE} -j NAT_DNS_HIJACK${suffix}"
+            [ "$PROXY_USB" = "1" ] && printf '%s\n' "-D PREROUTING -i ${USB_INTERFACE} -j NAT_DNS_HIJACK${suffix}"
+            printf '%s\n' "-D OUTPUT -p udp --dport 53 -m owner --uid-owner ${CORE_USER} --gid-owner ${CORE_GROUP} -j ACCEPT"
+            printf '%s\n' "-D OUTPUT -p tcp --dport 53 -m owner --uid-owner ${CORE_USER} --gid-owner ${CORE_GROUP} -j ACCEPT"
+            printf '%s\n' "-D OUTPUT -j NAT_DNS_HIJACK${suffix}"
+            printf '%s\n' "-F NAT_DNS_HIJACK${suffix}"
+            printf '%s\n' "-X NAT_DNS_HIJACK${suffix}"
         fi
     fi
-    echo "COMMIT"
+    printf '%s\n' "COMMIT"
 }
 
 _build_nat_extra_rules() { _build_nat_extra "$1" "-A"; }
@@ -349,16 +367,16 @@ _build_cleanup_rules() {
     local table="mangle"
     [ "$mode" = "redirect" ] && table="nat"
     
-    echo "*${table}"
-    echo "-D PREROUTING -p tcp -j PROXY_PREROUTING${suffix}"
-    echo "-D PREROUTING -p udp -j PROXY_PREROUTING${suffix}"
-    echo "-D OUTPUT -p tcp -j PROXY_OUTPUT${suffix}"
-    echo "-D OUTPUT -p udp -j PROXY_OUTPUT${suffix}"
+    printf '%s\n' "*${table}"
+    printf '%s\n' "-D PREROUTING -p tcp -j PROXY_PREROUTING${suffix}"
+    printf '%s\n' "-D PREROUTING -p udp -j PROXY_PREROUTING${suffix}"
+    printf '%s\n' "-D OUTPUT -p tcp -j PROXY_OUTPUT${suffix}"
+    printf '%s\n' "-D OUTPUT -p udp -j PROXY_OUTPUT${suffix}"
     
     for chain in $PROXY_CHAINS; do
-        echo "-X ${chain}${suffix}"
+        printf '%s\n' "-X ${chain}${suffix}"
     done
-    echo "COMMIT"
+    printf '%s\n' "COMMIT"
 }
 
 # Public Rule Generation API
@@ -370,6 +388,7 @@ generate_all_rules() {
     _build_proxy_rules "$family" "$mode"
     _build_loopback_block_rules "$family"
     _build_nat_extra_rules "$family"
+    return 0
 }
 
 # Generate all cleanup rules for a given family
@@ -380,4 +399,5 @@ generate_all_cleanup_rules() {
     _build_cleanup_rules "$family" "$mode"
     _build_loopback_block_cleanup_rules "$family"
     _build_nat_extra_cleanup_rules "$family"
+    return 0
 }

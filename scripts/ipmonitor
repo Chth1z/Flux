@@ -26,22 +26,21 @@ _get_ip_state() {
 
 start_monitor() {
     # 1. Setup FIFO
-    rm -f "$FIFO_FILE"
-    mkfifo "$FIFO_FILE" || { log_error "Failed to create FIFO"; exit 1; }
+    mkfifo "$FIFO_FILE" || { log_error "Failed to create FIFO"; return 1; }
 
     # 2. Start ip monitor background process
     ip monitor address > "$FIFO_FILE" 2>/dev/null &
     local monitor_bin_pid=$!
 
-    # 3. Register lifecycle (PID & Cleanup)
-    echo $$ > "$MONITOR_PID_FILE" && \
-    log_info "Starting IP Monitor (PID: $$, BinPID: $monitor_bin_pid, debounce=${DEBOUNCE_INTERVAL}s)"
+    #  register lifecycle (PID & Cleanup)
+    printf '%s\n' "$$" > "$MONITOR_PID_FILE" && \
+    log_debug "Starting IP Monitor (PID: $$, BinPID: $monitor_bin_pid, debounce=${DEBOUNCE_INTERVAL}s)"
 
-    trap 'kill "$monitor_bin_pid" 2>/dev/null; rm -f "$FIFO_FILE" "$MONITOR_PID_FILE"; exit 0' EXIT INT TERM
+    trap 'rm -f "$FIFO_FILE"; kill "$monitor_bin_pid" 2>/dev/null; rm -f "$MONITOR_PID_FILE"; exit 0' EXIT INT TERM
 
     # 4. Initial State Snapshot
     local last_state; last_state=$(_get_ip_state)
-    log_debug "Initial IP State: $(echo "$last_state" | tr '\n' ' ')"
+    log_debug "Initial IP State: $(printf '%s ' $last_state)"
     
     # 5. Initial Sync Trigger
     touch "$EVENTS_DIR/ip_sync"
@@ -50,15 +49,15 @@ start_monitor() {
     local dirty=0 current_state
     
     while true; do
-        if read -t "$DEBOUNCE_INTERVAL" -r line; then
+        if read -t "$DEBOUNCE_INTERVAL" -r line 2>/dev/null; then
             # Activity detected (any output triggers dirty flag)
             [ -n "$line" ] && dirty=1
         else
             # Quiet period (Debounce timeout)
-            if [ "$dirty" -eq 1 ]; then
+            if [ "$dirty" = "1" ]; then
                 current_state=$(_get_ip_state)
                 if [ "$current_state" != "$last_state" ]; then
-                    log_info "Network change verified"
+                    log_debug "Network change verified"
                     touch "$EVENTS_DIR/ip_sync"
                     last_state="$current_state"
                 else
@@ -73,6 +72,7 @@ start_monitor() {
 
 _get_monitor_pid() {
     [ -f "$MONITOR_PID_FILE" ] && cat "$MONITOR_PID_FILE" 2>/dev/null
+    return 0
 }
 
 _is_monitor_running() {
@@ -83,6 +83,8 @@ _is_monitor_running() {
 stop_monitor() {
     log_info "Stopping IP Monitor..."
     local pid; pid=$(_get_monitor_pid)
+
+    rm -f "$FIFO_FILE"
 
     if _is_monitor_running "$pid"; then
         kill "$pid" 2>/dev/null
@@ -95,7 +97,9 @@ stop_monitor() {
     else
         pkill -f "ipmonitor" 2>/dev/null
     fi
-    rm -f "$MONITOR_PID_FILE" "$FIFO_FILE"
+
+    rm -f "$MONITOR_PID_FILE"
+    return 0
 }
 
 # Entry Point
@@ -106,9 +110,11 @@ main() {
     case "$action" in
         start)
             start_monitor
+            return $?
             ;;
         stop)
             stop_monitor
+            return $?
             ;;
         *)
             echo "Usage: $0 {start|stop}"

@@ -99,12 +99,8 @@ _prop_get_left() {
 # This recovers from accumulated garbage states (e.g. "[FAILED] | [STOPPED] | Error:...")
 _prop_get_right() {
     case "$1" in
-        *"Error:"*)
-            printf 'Error:%s\n' "${1#*Error:}"
-            ;;
-        *"Warn:"*)
-            printf 'Warn:%s\n' "${1#*Warn:}"
-            ;;
+        *"Error:"*) printf 'Error:%s\n' "${1#*Error:}" ;;
+        *"Warn:"*)  printf 'Warn:%s\n' "${1#*Warn:}" ;;
     esac
 }
 
@@ -113,21 +109,15 @@ _prop_write() {
     [ ! -f "$PROP_FILE" ] && return 0
     _init_prop_orig_desc
     
-    local left="$1"
-    local right="$2"
+    local left="$1" right="$2"
+    local status; [ -n "$right" ] && status="${left} | ${right}" || status="$left"
     
-    local status="$left"
-    [ -n "$right" ] && status="${left} | ${right}"
-    
-    # State Memoization: Skip I/O if status hasn't changed
-    if [ "$status" = "$(getprop flux.prop.last)" ]; then
-        return 0
-    fi
+    # Memoization: Skip I/O if unchanged
+    [ "$status" = "$(getprop flux.prop.last)" ] && return 0
 
     local full_desc="${_PROP_ORIG_DESC}\\n${status}"
-    
-    # Atomic write strategy with secure temporary file
     local tmp_file; tmp_file=$(mktemp "${PROP_FILE}.XXXXXX")
+    
     if DESC="$full_desc" awk '
         /^description=/ { print "description=" ENVIRON["DESC"]; next }
         { print }
@@ -225,15 +215,16 @@ run() {
 log_banner() {
     local msg=" $1 "
     local width=50
-    local padding=$(( (width - ${#msg}) / 2 ))
-    [ $padding -lt 0 ] && padding=0
+    local sym="="
     
-    local line
-    line=$(printf "%${padding}s" "" | tr ' ' '=')
-    local banner="${line}${msg}${line}"
-    [ ${#banner} -lt $width ] && banner="${banner}="
+    local len=${#msg}
+    local side=$(( (width - len) / 2 ))
+    [ $side -lt 0 ] && side=0
     
-    # Output to stderr (parents will redirect to file if needed)
+    local pad; pad=$(printf "%${side}s" "" | tr ' ' "$sym")
+    local banner="${pad}${msg}${pad}"
+    [ ${#banner} -lt $width ] && banner="${banner}${sym}"
+    
     if _is_terminal; then
         printf '\n\033[1;36m%s\033[0m\n' "$banner" >&2
     else

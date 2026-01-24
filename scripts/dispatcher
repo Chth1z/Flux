@@ -45,6 +45,7 @@ stop_components() {
     sh "$CORE_SCRIPT" stop &
     sh "$TPROXY_SCRIPT" stop &
     sh "$IP_MONITOR_SCRIPT" stop &
+    sh "$IP_HANDLER_SCRIPT" cleanup &
     wait
     rm -f "$EVENTS_DIR/core_ok" "$EVENTS_DIR/tproxy_ok" 2>/dev/null
     sync_prop

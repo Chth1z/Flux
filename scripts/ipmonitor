@@ -15,20 +15,22 @@ export LOG_COMPONENT="Moni"
 
 # Helper Functions
 
-# Capture a fingerprint of current global IPs (Interface + IP/CIDR)
+# Capture a fingerprint of current global IPs
 _get_ip_state() {
-    # Use -brief for faster parsing and rely on stable interface order to avoid sort
-    ip -brief addr show scope global 2>/dev/null | cut -c 1-60
+    # Use MD5 of the full brief output to detect any change in any global address
+    ip -brief addr show scope global 2>/dev/null | md5sum | cut -d' ' -f1
 }
-
 
 # Monitor Logic Loop
 
 start_monitor() {
-    mkfifo "$FIFO_FILE" || { log_error "Failed to create FIFO"; return 1; }
+    # Pre-flight cleanup
+    rm -f "$FIFO_FILE" 2>/dev/null
+    mkfifo "$FIFO_FILE" || { log_error "Failed to create FIFO: $FIFO_FILE"; return 1; }
 
     # Only wake up the loop for global address changes to reduce noise
-    (ip monitor address 2>/dev/null | grep -E "scope global|Deleted" > "$FIFO_FILE") &
+    # Use --line-buffered to ensure events are processed immediately
+    (ip monitor address 2>/dev/null | grep --line-buffered -E "scope global|Deleted" > "$FIFO_FILE") &
     local monitor_bin_pid=$!
 
     #  register lifecycle (PID & Cleanup)
@@ -38,8 +40,9 @@ start_monitor() {
     trap 'rm -f "$FIFO_FILE"; kill "$monitor_bin_pid" 2>/dev/null; rm -f "$MONITOR_PID_FILE"; exit 0' EXIT INT TERM
 
     local last_state; last_state=$(_get_ip_state)
-    log_debug "Initial IP State: $(printf '%s ' $last_state)"
+    log_debug "Initial IP State Hash: $last_state"
     
+    # Immediate initial sync trigger
     touch "$EVENTS_DIR/ip_sync"
     log_info "Ipmonitor started"
     
@@ -54,11 +57,11 @@ start_monitor() {
             if [ "$dirty" = "1" ]; then
                 current_state=$(_get_ip_state)
                 if [ "$current_state" != "$last_state" ]; then
-                    log_debug "Network change verified"
+                    log_debug "Network change verified ($last_state -> $current_state)"
                     touch "$EVENTS_DIR/ip_sync"
                     last_state="$current_state"
                 else
-                    log_debug "Ignored noise (IPs unchanged)"
+                    log_debug "Ignored transient network noise"
                 fi
                 dirty=0
             fi
@@ -66,7 +69,6 @@ start_monitor() {
     done < "$FIFO_FILE"
     return 0
 }
-
 
 _get_monitor_pid() {
     [ -f "$MONITOR_PID_FILE" ] && cat "$MONITOR_PID_FILE" 2>/dev/null
@@ -79,11 +81,10 @@ _is_monitor_running() {
 }
 
 stop_monitor() {
-    log_info "Stopping IP Monitor..."
-    local pid; pid=$(_get_monitor_pid)
+    local pid; [ -f "$MONITOR_PID_FILE" ] && pid=$(cat "$MONITOR_PID_FILE" 2>/dev/null)
 
-    rm -f "$FIFO_FILE"
-
+    log_info "Stopping IP Monitor service..."
+    
     if _is_monitor_running "$pid"; then
         kill "$pid" 2>/dev/null
         local count=0
@@ -96,7 +97,8 @@ stop_monitor() {
         pkill -f "ipmonitor" 2>/dev/null
     fi
 
-    rm -f "$MONITOR_PID_FILE"
+    # Final cleanup
+    rm -f "$FIFO_FILE" "$MONITOR_PID_FILE" 2>/dev/null
     return 0
 }
 

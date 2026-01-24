@@ -61,8 +61,7 @@
   "outbounds": [
     {
       "type": "direct",
-      "tag": "DIRECT",
-      "routing_mark": 2025
+      "tag": "DIRECT"
     },
     {
       "type": "selector",

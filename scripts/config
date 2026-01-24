@@ -7,25 +7,37 @@
 # Config Loading - Data-Driven Approach
 
 _init_config_defaults() {
+    # [ General ]
     : "${SUBSCRIPTION_URL:=}"
     : "${UPDATE_TIMEOUT:=15}"
-    : "${UPDATE_INTERVAL:=86400}"
     : "${RETRY_COUNT:=2}"
+    : "${UPDATE_INTERVAL:=86400}"
+
+    # [ Logging ]
     : "${LOG_LEVEL:=3}"
     : "${LOG_MAX_SIZE:=1048576}"
-    : "${CORE_TIMEOUT:=5}"
+
+    # [ Core ]
     : "${CORE_USER:=root}"
     : "${CORE_GROUP:=root}"
-    : "${ROUTING_MARK:=}"
-    : "${PROXY_TCP_PORT:=1536}"
-    : "${PROXY_UDP_PORT:=1536}"
+    : "${CORE_TIMEOUT:=5}"
+
+    # [ Proxy Mode ]
     : "${PROXY_MODE:=0}"
     : "${DNS_HIJACK_ENABLE:=1}"
     : "${DNS_PORT:=1053}"
+    : "${PROXY_TCP_PORT:=1536}"
+    : "${PROXY_UDP_PORT:=1536}"
+    : "${FAKEIP_RANGE_V4:=198.18.0.0/15}"
+    : "${FAKEIP_RANGE_V6:=fc00::/18}"
+
+    # [ Network ]
     : "${MOBILE_INTERFACE:=rmnet_data+}"
     : "${WIFI_INTERFACE:=wlan0}"
     : "${HOTSPOT_INTERFACE:=wlan2}"
     : "${USB_INTERFACE:=rndis+}"
+
+    # [ Proxy Scope ]
     : "${PROXY_MOBILE:=1}"
     : "${PROXY_WIFI:=1}"
     : "${PROXY_HOTSPOT:=0}"
@@ -33,32 +45,40 @@ _init_config_defaults() {
     : "${PROXY_TCP:=1}"
     : "${PROXY_UDP:=1}"
     : "${PROXY_IPV6:=0}"
+
+    # [ Routing ]
+    : "${TABLE_ID:=2025}"
     : "${MARK_VALUE:=20}"
     : "${MARK_VALUE6:=25}"
-    : "${TABLE_ID:=2025}"
-    : "${APP_PROXY_ENABLE:=0}"
-    : "${APP_PROXY_MODE:=1}"
-    : "${PROXY_APPS_LIST:=}"
-    : "${BYPASS_APPS_LIST:=}"
-    : "${MAC_FILTER_ENABLE:=0}"
-    : "${MAC_PROXY_MODE:=1}"
-    : "${PROXY_MACS_LIST:=}"
-    : "${BYPASS_MACS_LIST:=}"
+    : "${ROUTING_MARK:=}"
+
+    # [ App Proxy ]
+    : "${APP_PROXY_MODE:=0}"
+    : "${APP_LIST:=}"
+
+    # [ MAC Filter ]
+    : "${MAC_PROXY_MODE:=0}"
+    : "${MAC_LIST:=}"
+
+    # [ Advanced ]
     : "${SKIP_CHECK_FEATURE:=0}"
-    : "${FAKEIP_RANGE_V4:=198.18.0.0/15}"
-    : "${FAKEIP_RANGE_V6:=fc00::/18}"
     : "${DEBOUNCE_INTERVAL:=10}"
+    : "${EXCLUDE_INTERFACES:=}"
+    : "${ENABLE_CONNTRACK:=1}"
+    : "${CUSTOM_BYPASS_LIST:=}"
+    : "${WAN_INBOUND_BYPASS:=1}"
+    : "${ENABLE_STATEFUL_SKIP:=1}"
+    : "${MSS_CLAMP_ENABLE:=1}"
+    : "${SYSTEM_DNS_PASSTHROUGH:=0}"
+    : "${BLOCK_QUIC:=0}"
     return 0
 }
 
 _extract_json_config() {
     local jq_bin="$TOOLS_DIR/jq"
-    [ ! -x "$jq_bin" ] || [ ! -f "$CONFIG_FILE" ] && return 1
+    [ -x "$jq_bin" ] && [ -f "$CONFIG_FILE" ] || return 0
     
-    # robust jq extraction: 
-    # 1. Search for tproxy, mixed, or redirect inbounds
-    # 2. Extract port from listen_port (int) or listen (string like ":1234")
-    # 3. Join with | for easy parsing
+    # Robust JQ extraction: Port and FakeIP ranges
     local json_output
     json_output=$("$jq_bin" -r '
         [
@@ -76,28 +96,27 @@ _extract_json_config() {
         PROXY_UDP_PORT="$extracted_port"
     fi
     
-    # Assign with validation
+    # Assign with validation (basic syntax check)
     case "$v4" in *"/"[0-9]*) FAKEIP_RANGE_V4="$v4" ;; esac
     case "$v6" in *":"*"/"[0-9]*) FAKEIP_RANGE_V6="$v6" ;; esac
     return 0
 }
 
 # ==============================================================================
-# [ Validation Result Tracking ]
+# [ Type-Specific Validators ]
 # ==============================================================================
 
-# Stateless validation: Functions output error lines beginning with • to stdout
 _validate_int() {
     local name="$1" val="$2" min="$3" max="$4"
     case "$val" in
         ''|*[!0-9]*)
-        printf '• %s: not a number (%s)\n' "$name" "${val:-empty}"
-        return 1
-        ;;
+            printf '  • %s: invalid number "%s"\n' "$name" "$val"
+            return 1
+            ;;
     esac
     
     if [ "$val" -lt "$min" ] || [ "$val" -gt "$max" ]; then
-        printf '• %s: out of range (%s, must be %s-%s)\n' "$name" "$val" "$min" "$max"
+        printf '  • %s: out of range (%s, allowed: %s-%s)\n' "$name" "$val" "$min" "$max"
         return 1
     fi
     return 0
@@ -105,15 +124,12 @@ _validate_int() {
 
 _validate_user_group() {
     local name="$1" val="$2"
-    [ -z "$val" ] && { printf '• %s: cannot be empty\n' "$name"; return 1; }
+    [ -z "$val" ] && { printf '  • %s: cannot be empty\n' "$name"; return 1; }
     
     case "$val" in
         [0-9]*) return 0 ;;
-    esac
-    
-    case "$val" in
         *[!a-zA-Z0-9_]*)
-            printf '• %s: invalid format "%s" (must be alphanumeric or numeric ID)\n' "$name" "$val"
+            printf '  • %s: invalid characters in "%s"\n' "$name" "$val"
             return 1
             ;;
     esac
@@ -128,13 +144,13 @@ _validate_url() {
         http://*|https://*)
             case "$val" in
                 *[[:space:]\"\'\<\>\;\`\|]*)
-                    printf '• %s: contains illegal characters\n' "$name"
+                    printf '  • %s: contains illegal characters\n' "$name"
                     return 1
                     ;;
             esac
             ;;
         *)
-            printf '• %s: must be a valid http/https URL\n' "$name"
+            printf '  • %s: invalid protocol (must be http/https)\n' "$name"
             return 1
             ;;
     esac
@@ -143,23 +159,13 @@ _validate_url() {
 
 _validate_iface() {
     local name="$1" val="$2"
-
     case "$val" in
         ''|*[!a-zA-Z0-9._+]*)
-            printf '• %s: invalid interface name format (%s)\n' "$name" "$val"
+            printf '  • %s: invalid interface name format "%s"\n' "$name" "$val"
             return 1
             ;;
-    esac
-
-    case "$val" in
         *+*)
-            case "$val" in
-                *+) : ;;
-                *)
-                    printf '• %s: invalid wildcard placement in (%s)\n' "$name" "$val"
-                    return 1
-                    ;;
-            esac
+            [ "${val#*+}" = "" ] || { printf '  • %s: wildcard must be at end: "%s"\n' "$name" "$val"; return 1; }
             ;;
     esac
     return 0
@@ -170,16 +176,24 @@ _validate_iface() {
 # ==============================================================================
 
 VALIDATION_SCHEMA="
-LOG_LEVEL:int:0:4
-LOG_MAX_SIZE:int:10240:104857600
+SUBSCRIPTION_URL:url
 UPDATE_TIMEOUT:int:1:300
 RETRY_COUNT:int:0:10
-UPDATE_INTERVAL:int:60:31536000
+UPDATE_INTERVAL:int:0:31536000
+LOG_LEVEL:int:0:4
+LOG_MAX_SIZE:int:10240:104857600
+CORE_USER:user
+CORE_GROUP:user
 CORE_TIMEOUT:int:1:60
-PROXY_TCP_PORT:int:1:65535
-PROXY_UDP_PORT:int:1:65535
 PROXY_MODE:int:0:2
 DNS_HIJACK_ENABLE:int:0:2
+DNS_PORT:int:1:65535
+PROXY_TCP_PORT:int:1:65535
+PROXY_UDP_PORT:int:1:65535
+MOBILE_INTERFACE:iface
+WIFI_INTERFACE:iface
+HOTSPOT_INTERFACE:iface
+USB_INTERFACE:iface
 PROXY_MOBILE:int:0:1
 PROXY_WIFI:int:0:1
 PROXY_HOTSPOT:int:0:1
@@ -187,32 +201,31 @@ PROXY_USB:int:0:1
 PROXY_TCP:int:0:1
 PROXY_UDP:int:0:1
 PROXY_IPV6:int:0:1
-APP_PROXY_ENABLE:int:0:1
-APP_PROXY_MODE:int:1:2
-MAC_FILTER_ENABLE:int:0:1
-MAC_PROXY_MODE:int:1:2
+TABLE_ID:int:1:65535
+MARK_VALUE:int:1:65535
+MARK_VALUE6:int:1:65535
+ROUTING_MARK:int:0:65535
+APP_PROXY_MODE:int:0:2
+MAC_PROXY_MODE:int:0:2
 SKIP_CHECK_FEATURE:int:0:1
 DEBOUNCE_INTERVAL:int:0:300
-CORE_USER:user
-CORE_GROUP:user
-ROUTING_MARK:int:1:65535
-SUBSCRIPTION_URL:url
-MOBILE_INTERFACE:iface
-WIFI_INTERFACE:iface
-HOTSPOT_INTERFACE:iface
-USB_INTERFACE:iface
+ENABLE_CONNTRACK:int:0:1
+WAN_INBOUND_BYPASS:int:0:1
+ENABLE_STATEFUL_SKIP:int:0:1
+MSS_CLAMP_ENABLE:int:0:1
+SYSTEM_DNS_PASSTHROUGH:int:0:1
+BLOCK_QUIC:int:0:1
 "
 
 _validate_settings() {
-    log_debug "Validating settings..."
+    log_debug "Validating runtime settings..."
     local valid=0 name type p1 p2 val
     
     while IFS=: read -r name type p1 p2 || [ -n "$name" ]; do
         [ -z "$name" ] || [ "${name#\#}" != "$name" ] && continue
         
-        # Sanitize name to prevent eval injection
+        # Prevent eval injection
         case "$name" in *[!a-zA-Z0-9_]*) continue ;; esac
-
         eval "val=\$$name"
         
         case "$type" in
@@ -225,8 +238,7 @@ _validate_settings() {
 $VALIDATION_SCHEMA
 EOF
     
-    [ "$valid" = "0" ] && log_debug "Settings validation passed"
-    return $valid
+    return "$valid"
 }
 
 # ==============================================================================
@@ -236,48 +248,42 @@ EOF
 _validate_singbox_config() {
     log_debug "Validating sing-box configuration..."
     
-    if [ -f "$SING_BOX_BIN" ] && [ ! -x "$SING_BOX_BIN" ]; then
-        chmod +x "$SING_BOX_BIN" 2>/dev/null
-    fi
-    
     if [ ! -x "$SING_BOX_BIN" ]; then
-        printf '• sing-box binary not executable\n'
+        [ -f "$SING_BOX_BIN" ] && chmod +x "$SING_BOX_BIN" 2>/dev/null
+        if [ ! -x "$SING_BOX_BIN" ]; then
+            printf '  • sing-box binary not executable or missing\n'
+            return 1
+        fi
+    fi
+    
+    local err_out
+    if ! err_out=$("$SING_BOX_BIN" check -c "$CONFIG_FILE" -D "$RUN_DIR" 2>&1); then
+        printf '  • sing-box config validation failed:\n'
+        echo "$err_out" | while read -r line; do printf '    >> %s\n' "$line"; done
         return 1
     fi
     
-    local check_output
-    check_output=$("$SING_BOX_BIN" check -c "$CONFIG_FILE" -D "$RUN_DIR" 2>&1)
-    
-    if [ $? != "0" ]; then
-        printf '• sing-box config invalid: %s\n' "$check_output"
-        return 1
-    fi
-    
-    log_debug "sing-box configuration valid"
     return 0
 }
 
 # ==============================================================================
-# [ Main Validation Entry Point ]
+# [ Main Entry Point ]
 # ==============================================================================
 
 validate_all() {
+    # 1. Load settings with syntax check
     if [ -f "$SETTINGS_FILE" ]; then
-        # Read once into memory
-        local settings_raw; settings_raw=$(cat "$SETTINGS_FILE")
-        
-        # 1. Syntax check (Process memory)
-        if ! echo "$settings_raw" | sh -n 2>/dev/null; then
+        if ! sh -n "$SETTINGS_FILE" 2>/dev/null; then
             log_error "Syntax error in $SETTINGS_FILE"
             return 1
         fi
-        
-        # 2. Source from memory
-        eval "$settings_raw"
+        . "$SETTINGS_FILE"
     fi
+    
     _init_config_defaults
     _extract_json_config
     
+    # 2. Sequential validation
     local errors
     errors=$(
         _validate_settings
@@ -289,6 +295,6 @@ validate_all() {
         return 1
     fi
     
-    log_info "Validation passed"
+    log_debug "System validation passed"
     return 0
 }

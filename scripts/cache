@@ -22,19 +22,17 @@ _save_rules_cache() {
         mode="redirect"
     fi
     
-    mkdir -p "$(dirname "$CACHE_RULES_V4_FILE")"
+    mkdir -p "$(dirname "$CACHE_RULES_V4_FILE")" 2>/dev/null
     
     generate_all_rules "4" "$mode" > "$CACHE_RULES_V4_FILE"
     generate_all_cleanup_rules "4" "$mode" > "$CACHE_CLEANUP_V4_FILE"
-    log_debug "IPv4 rules cached"
     
     if [ "$PROXY_IPV6" = "1" ]; then
         generate_all_rules "6" "$mode" > "$CACHE_RULES_V6_FILE"
         generate_all_cleanup_rules "6" "$mode" > "$CACHE_CLEANUP_V6_FILE"
-        log_debug "IPv6 rules cached"
     fi
     
-    log_debug "All rules cache saved (mode: $mode)"
+    log_debug "Rules cache saved (mode: $mode)"
     return 0
 }
 
@@ -48,18 +46,17 @@ _save_kernel_cache() {
         local cached_kernel
         cached_kernel=$(grep "^#kernel:" "$KERNEL_CACHE_FILE" 2>/dev/null | cut -d: -f2-)
         
-        if [ -n "$cached_kernel" ] && [ "$cached_kernel" = "$current_kernel" ]; then
+        if [ "$cached_kernel" = "$current_kernel" ]; then
             log_debug "Kernel Cache valid"
             set -a; . "$KERNEL_CACHE_FILE"; set +a
             return 0
         fi
-        log_debug "Kernel changed: $cached_kernel -> $current_kernel"
     fi
     
     log_debug "Building Kernel Capability Cache..."
     
     if [ ! -f /proc/config.gz ]; then
-        log_debug "Cannot build Kernel Cache: /proc/config.gz not available"
+        log_warn "Cannot build Kernel Cache: /proc/config.gz missing"
         return 1
     fi
     
@@ -79,26 +76,17 @@ _save_kernel_cache() {
         }
     ')
     
-    # Batch export
+    # Batch export and prepare file content
+    local content="# Kernel Feature Cache - Auto Generated\n#kernel:${current_kernel}\n"
     local IFS=';'
     for feat in $features; do
         export "$feat"
+        content="${content}${feat}\n"
     done
     
-    local content="# Kernel Feature Cache - Auto Generated
-#kernel:${current_kernel}
-KFEAT_TPROXY=${KFEAT_TPROXY}
-KFEAT_OWNER=${KFEAT_OWNER}
-KFEAT_MARK=${KFEAT_MARK}
-KFEAT_ADDRTYPE=${KFEAT_ADDRTYPE}
-KFEAT_CONNTRACK=${KFEAT_CONNTRACK}
-KFEAT_MAC=${KFEAT_MAC}
-KFEAT_IPV6_NAT=${KFEAT_IPV6_NAT}
-"
-    
-    mkdir -p "$(dirname "$KERNEL_CACHE_FILE")"
-    printf '%s' "$content" > "$KERNEL_CACHE_FILE"
-    log_debug "Kernel Cache built"
+    mkdir -p "$(dirname "$KERNEL_CACHE_FILE")" 2>/dev/null
+    printf '%b' "$content" > "$KERNEL_CACHE_FILE"
+    log_debug "Kernel Cache built successfully"
     return 0
 }
 
@@ -116,8 +104,7 @@ _get_mtime() {
 }
 
 _get_version_code() {
-    grep "^versionCode=" "$PROP_FILE" | cut -d= -f2-
-    return 0
+    grep "^versionCode=" "$PROP_FILE" 2>/dev/null | cut -d= -f2-
 }
 
 _get_meta_signature() {
@@ -131,34 +118,31 @@ _get_meta_signature() {
 }
 
 _is_cache_valid() {
-    [ -f "$CACHE_META_FILE" ] || { log_debug "Meta cache not found"; return 1; }
-    [ -f "$CACHE_CONFIG_FILE" ] || { log_debug "Config cache not found"; return 1; }
-    [ -f "$CACHE_RULES_V4_FILE" ] || { log_debug "Rules cache not found"; return 1; }
-    [ -f "$KERNEL_CACHE_FILE" ] || { log_debug "Kernel cache not found"; return 1; }
+    # Fast check: core files must exist
+    for f in "$CACHE_META_FILE" "$CACHE_CONFIG_FILE" "$KERNEL_CACHE_FILE" "$CACHE_RULES_V4_FILE"; do
+        [ -f "$f" ] || return 1
+    done
     
-    local current_sig cached_sig
+    local current_sig
     current_sig=$(_get_meta_signature)
-    # Single awk process to filter and strip #
+    
+    local cached_sig
     cached_sig=$(awk '
         /^#build_ts:/ { next }
         /^#/ { sub(/^#/, ""); print }
-    ' "$CACHE_META_FILE")
+    ' "$CACHE_META_FILE" 2>/dev/null)
     
-    if [ "$current_sig" != "$cached_sig" ]; then
-        log_debug "Cache signature mismatch"
-        # Optional: Add detailed diff for debugging if needed
-        return 1
-    fi
+    [ "$current_sig" = "$cached_sig" ] && { log_debug "Cache is valid"; return 0; }
     
-    log_debug "Cache valid"
-    return 0
+    log_debug "Cache signature mismatch"
+    return 1
 }
 
 _save_meta_cache() {
     local sig
     sig=$(_get_meta_signature)
     
-    mkdir -p "$(dirname "$CACHE_META_FILE")"
+    mkdir -p "$(dirname "$CACHE_META_FILE")" 2>/dev/null
     
     {
         printf '%s\n' "$sig" | sed 's/^/#/'
@@ -182,35 +166,34 @@ _normalize_list() {
 }
 
 _save_config_cache() {
-    mkdir -p "$(dirname "$CACHE_CONFIG_FILE")"
+    mkdir -p "$(dirname "$CACHE_CONFIG_FILE")" 2>/dev/null
     
-    local _proxy_apps _bypass_apps _proxy_macs _bypass_macs
-    
-    _proxy_apps=$(_normalize_list "$PROXY_APPS_LIST")
-    _bypass_apps=$(_normalize_list "$BYPASS_APPS_LIST")
-    _proxy_macs=$(_normalize_list "$PROXY_MACS_LIST")
-    _bypass_macs=$(_normalize_list "$BYPASS_MACS_LIST")
+    local _app_list _mac_list
+    _app_list=$(_normalize_list "$APP_LIST")
+    _mac_list=$(_normalize_list "$MAC_LIST")
     
     cat > "$CACHE_CONFIG_FILE" << EOF
 # Flux Config Cache - Auto Generated
+SUBSCRIPTION_URL="$SUBSCRIPTION_URL"
 UPDATE_TIMEOUT=$UPDATE_TIMEOUT
-UPDATE_INTERVAL=$UPDATE_INTERVAL
 RETRY_COUNT=$RETRY_COUNT
+UPDATE_INTERVAL=$UPDATE_INTERVAL
 LOG_LEVEL=$LOG_LEVEL
 LOG_MAX_SIZE=$LOG_MAX_SIZE
-CORE_TIMEOUT=$CORE_TIMEOUT
 CORE_USER=$CORE_USER
 CORE_GROUP=$CORE_GROUP
-ROUTING_MARK=$ROUTING_MARK
-PROXY_TCP_PORT=$PROXY_TCP_PORT
-PROXY_UDP_PORT=$PROXY_UDP_PORT
+CORE_TIMEOUT=$CORE_TIMEOUT
 PROXY_MODE=$PROXY_MODE
 DNS_HIJACK_ENABLE=$DNS_HIJACK_ENABLE
 DNS_PORT=$DNS_PORT
-MOBILE_INTERFACE=$MOBILE_INTERFACE
-WIFI_INTERFACE=$WIFI_INTERFACE
-HOTSPOT_INTERFACE=$HOTSPOT_INTERFACE
-USB_INTERFACE=$USB_INTERFACE
+PROXY_TCP_PORT=$PROXY_TCP_PORT
+PROXY_UDP_PORT=$PROXY_UDP_PORT
+FAKEIP_RANGE_V4=$FAKEIP_RANGE_V4
+FAKEIP_RANGE_V6=$FAKEIP_RANGE_V6
+MOBILE_INTERFACE="$MOBILE_INTERFACE"
+WIFI_INTERFACE="$WIFI_INTERFACE"
+HOTSPOT_INTERFACE="$HOTSPOT_INTERFACE"
+USB_INTERFACE="$USB_INTERFACE"
 PROXY_MOBILE=$PROXY_MOBILE
 PROXY_WIFI=$PROXY_WIFI
 PROXY_HOTSPOT=$PROXY_HOTSPOT
@@ -218,20 +201,15 @@ PROXY_USB=$PROXY_USB
 PROXY_TCP=$PROXY_TCP
 PROXY_UDP=$PROXY_UDP
 PROXY_IPV6=$PROXY_IPV6
+TABLE_ID=$TABLE_ID
 MARK_VALUE=$MARK_VALUE
 MARK_VALUE6=$MARK_VALUE6
-TABLE_ID=$TABLE_ID
-APP_PROXY_ENABLE=$APP_PROXY_ENABLE
+ROUTING_MARK="$ROUTING_MARK"
 APP_PROXY_MODE=$APP_PROXY_MODE
-PROXY_APPS_LIST="$_proxy_apps"
-BYPASS_APPS_LIST="$_bypass_apps"
-MAC_FILTER_ENABLE=$MAC_FILTER_ENABLE
+APP_LIST="$_app_list"
 MAC_PROXY_MODE=$MAC_PROXY_MODE
-PROXY_MACS_LIST="$_proxy_macs"
-BYPASS_MACS_LIST="$_bypass_macs"
+MAC_LIST="$_mac_list"
 SKIP_CHECK_FEATURE=$SKIP_CHECK_FEATURE
-FAKEIP_RANGE_V4=$FAKEIP_RANGE_V4
-FAKEIP_RANGE_V6=$FAKEIP_RANGE_V6
 DEBOUNCE_INTERVAL=$DEBOUNCE_INTERVAL
 EOF
     
@@ -243,11 +221,11 @@ EOF
 # Main Cache Builder Logic
 
 build_all_caches() {
-    run "Validate config" validate_all || return 1
-    run "Save kernel cache" _save_kernel_cache || return 1
-    run "Save config cache" _save_config_cache || return 1
-    run "Save rules cache" _save_rules_cache || return 1
-    run "Save meta cache" _save_meta_cache || return 1
+    run "Validate system config" validate_all || return 1
+    run "Save kernel capability" _save_kernel_cache || return 1
+    run "Save normalized config" _save_config_cache || return 1
+    run "Save iptables rules" _save_rules_cache || return 1
+    run "Update meta signature" _save_meta_cache || return 1
     return 0
 }
 
@@ -255,9 +233,9 @@ build_all_caches() {
 
 check_cache() {
     if _is_cache_valid; then
-        log_info "Cache is valid"
+        log_info "All caches are valid, skipping build"
     else
-        log_info "Cache is invalid, building..."    
+        log_info "Cache invalid or missing, rebuilding..."    
         build_all_caches
     fi
     return 0

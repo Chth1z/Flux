@@ -20,99 +20,80 @@ _run_ipt_command() {
     command "$cmd" -w 100 "$@"
 }
 
-iptables()  { _run_ipt_command iptables "$@"; }
-ip6tables() { _run_ipt_command ip6tables "$@"; }
-
 _ipt_cmd() {
-    local proto="$1"; shift
-    [ "$proto" = "6" ] && ip6tables "$@" || iptables "$@"
+    local family="$1"; shift
+    [ "$family" = "6" ] && _run_ipt_command ip6tables "$@" || _run_ipt_command iptables "$@"
 }
 
 # IP Sync Logic
 
-sync_all_addresses() {
-    # --- IPv4 Sync ---
+_sync_family() {
+    local family="$1" targets="$2"
+    local v_suffix="" restore_bin="iptables-restore" proto="inet"
+    
+    [ "$family" = "6" ] && { v_suffix="6"; restore_bin="ip6tables-restore"; proto="inet6"; }
+
     local sync_awk='
-        BEGIN { count=0 }
-        /inet / {
-            split($2, parts, "/")
-            ip = parts[1]
-            if (ip !~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) next
-            if (ip ~ /^127\./ || ip ~ /^0\./) next
-            ips[count++] = ip
+        BEGIN { count=0; n=split(targets, t, " ") }
+        {
+            # Scan entire line for protocol keyword, then capture next field
+            for (i=1; i<NF; i++) {
+                if ($i == proto) {
+                    split($(i+1), p, "/"); val = p[1]
+                    if (val ~ /^(127\.|0\.|fe80:|::1)/ || val == "") continue
+                    ips[count++] = val
+                    break
+                }
+            }
         }
         END {
-            tables_count = split(targets, t, " ")
-            for (j=1; j<=tables_count; j++) {
+            for (j=1; j<=n; j++) {
                 if (t[j] == "") continue
                 print "*" t[j]
-                print ":LOCAL_IP - [0:0]"
+                print ":" chain " - [0:0]"
                 for (i=0; i<count; i++) {
-                    print "-A LOCAL_IP -d " ips[i] " -p udp ! --dport 53 -j ACCEPT"
-                    print "-A LOCAL_IP -d " ips[i] " ! -p udp -j ACCEPT"
+                    print "-A " chain " -d " ips[i] " -p udp --dport 53 -j RETURN"
+                    if (ENVIRON["ENABLE_STATEFUL_SKIP"] == "1") {
+                        print "-A " chain " -d " ips[i] " -j CONNMARK --set-xmark 0x11/0xffffffff"
+                    }
+                    print "-A " chain " -d " ips[i] " -j ACCEPT"
                 }
                 print "COMMIT"
             }
         }'
 
-    local sync_awk_v6='
-        BEGIN { count=0 }
-        /inet6 / {
-            split($2, parts, "/")
-            ip = parts[1]
-            if (ip !~ /^[0-9a-fA-F:]+$/ || index(ip, ":") == 0) next
-            if (ip ~ /^fe80:/ || ip ~ /^::1/) next
-            ips[count++] = ip
-        }
-        END {
-            tables_count = split(targets, t, " ")
-            for (j=1; j<=tables_count; j++) {
-                if (t[j] == "") continue
-                print "*" t[j]
-                print ":LOCAL_IP6 - [0:0]"
-                for (i=0; i<count; i++) {
-                    print "-A LOCAL_IP6 -d " ips[i] " -p udp ! --dport 53 -j ACCEPT"
-                    print "-A LOCAL_IP6 -d " ips[i] " ! -p udp -j ACCEPT"
-                }
-                print "COMMIT"
-            }
-        }'
+    # Streamline IP output via oneline mode for consistent field extraction
+    if ! ip -f "$proto" -o addr show 2>/dev/null | awk \
+        -v proto="$proto" \
+        -v targets="$targets" \
+        -v chain="LOCAL_IP$v_suffix" \
+        "$sync_awk" | _run_ipt_command "$restore_bin" --noflush; then
+        log_warn "IPv$family sync failed"
+        return 1
+    fi
 
-    # --- IPv4 Sync ---
+    # Standardize hook application
+    _ipt_cmd "$family" -t "$PRIMARY_TABLE" -C "BYPASS_IP$v_suffix" -j "LOCAL_IP$v_suffix" 2>/dev/null || \
+    _ipt_cmd "$family" -t "$PRIMARY_TABLE" -I "BYPASS_IP$v_suffix" -j "LOCAL_IP$v_suffix"
+
+    if [ "$PRIMARY_TABLE" = "mangle" ] && { [ "$family" = "4" ] || [ "$KFEAT_IPV6_NAT" = "1" ]; }; then
+        _ipt_cmd "$family" -t nat -C PREROUTING -j "LOCAL_IP$v_suffix" 2>/dev/null || \
+        _ipt_cmd "$family" -t nat -I PREROUTING -j "LOCAL_IP$v_suffix"
+    fi
+    return 0
+}
+
+sync_all_addresses() {
     local v4_targets="$PRIMARY_TABLE"
     [ "$PRIMARY_TABLE" = "mangle" ] && v4_targets="mangle nat"
-    
-    if ! ip -4 addr show 2>/dev/null | awk -v targets="$v4_targets" "$sync_awk" | _run_ipt_command iptables-restore --noflush; then
-        log_warn "IPv4 sync failed"
-    fi
-    
-    # Hook chains
-        _ipt_cmd 4 -t "$PRIMARY_TABLE" -C BYPASS_IP -j LOCAL_IP 2>/dev/null || \
-        _ipt_cmd 4 -t "$PRIMARY_TABLE" -I BYPASS_IP -j LOCAL_IP
+    _sync_family 4 "$v4_targets"
 
-    if [ "$PRIMARY_TABLE" = "mangle" ]; then
-         _ipt_cmd 4 -t nat -C PREROUTING -j LOCAL_IP 2>/dev/null || \
-            _ipt_cmd 4 -t nat -I PREROUTING -j LOCAL_IP
-    fi
-
-    # --- IPv6 Sync ---
     if [ "$PROXY_IPV6" = "1" ]; then
         local v6_targets="$PRIMARY_TABLE"
         [ "$PRIMARY_TABLE" = "mangle" ] && [ "$KFEAT_IPV6_NAT" = "1" ] && v6_targets="mangle nat"
-        
-        if ! ip -6 addr show 2>/dev/null | awk -v targets="$v6_targets" "$sync_awk_v6" | _run_ipt_command ip6tables-restore --noflush; then
-            log_warn "IPv6 sync failed"
-        fi
-        
-        # Hook chains
-        _ipt_cmd 6 -t "$PRIMARY_TABLE" -C BYPASS_IP6 -j LOCAL_IP6 2>/dev/null || \
-            _ipt_cmd 6 -t "$PRIMARY_TABLE" -I BYPASS_IP6 -j LOCAL_IP6
-
-        if [ "$KFEAT_IPV6_NAT" = "1" ]; then
-             _ipt_cmd 6 -t nat -C PREROUTING -j LOCAL_IP6 2>/dev/null || \
-                _ipt_cmd 6 -t nat -I PREROUTING -j LOCAL_IP6
-        fi
+        _sync_family 6 "$v6_targets"
     fi
+
     log_debug "Synced local IPs"
     return 0
 }
@@ -128,6 +109,26 @@ _init_runtime() {
     return 0
 }
 
+_cleanup_family() {
+    local family="$1"
+    local v_suffix="" restore_bin="iptables-restore"
+    [ "$family" = "6" ] && { v_suffix="6"; restore_bin="ip6tables-restore"; }
+
+    # Optimized cleanup via restore to reduce fork/exec overhead
+    # We ignore errors for non-existent chains during cleanup
+    printf '*%s\n-D BYPASS_IP%s -j LOCAL_IP%s\nCOMMIT\n*nat\n-D PREROUTING -j LOCAL_IP%s\nCOMMIT\n*%s\n-F LOCAL_IP%s\n-X LOCAL_IP%s\nCOMMIT\n*nat\n-F LOCAL_IP%s\n-X LOCAL_IP%s\nCOMMIT\n' \
+        "$PRIMARY_TABLE" "$v_suffix" "$v_suffix" "$v_suffix" "$PRIMARY_TABLE" "$v_suffix" "$v_suffix" "$v_suffix" "$v_suffix" \
+        | _run_ipt_command "$restore_bin" --noflush 2>/dev/null
+    return 0
+}
+
+cleanup_all_addresses() {
+    _cleanup_family 4
+    [ "$PROXY_IPV6" = "1" ] && _cleanup_family 6
+    log_debug "Cleaned up local IP chains"
+    return 0
+}
+
 main() {
     _init_runtime
 
@@ -138,11 +139,16 @@ main() {
             sync_all_addresses
             return $?
             ;;
+        cleanup)
+            cleanup_all_addresses
+            return $?
+            ;;
         *)
-            printf 'Usage: %s {sync}\n' "$0"
+            printf 'Usage: %s {sync|cleanup}\n' "$0"
             exit 1
             ;;
     esac
 }
+
 
 main "$@"

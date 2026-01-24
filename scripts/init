@@ -15,18 +15,16 @@ export LOG_COMPONENT="Init"
 # Pre-flight Checks
 
 _check_integrity() {
-    # Check binaries
     [ ! -f "$SING_BOX_BIN" ] && { log_error "Sing-box binary missing: $SING_BOX_BIN"; return 1; }
     
-    # Check scripts
-    for script in "$CORE_SCRIPT" "$TPROXY_SCRIPT" "$IP_MONITOR_SCRIPT" "$CACHE_SCRIPT" "$UPDATE_SCRIPT" "$DISPATCHER_SCRIPT" "$IP_HANDLER_SCRIPT" "$RULES_SCRIPT" "$CONFIG_SCRIPT"; do
-        [ ! -f "$script" ] && { log_error "Script missing: $script"; return 1; }
+    for script in "$CORE_SCRIPT" "$TPROXY_SCRIPT" "$IP_MONITOR_SCRIPT" "$CACHE_SCRIPT" \
+                 "$UPDATE_SCRIPT" "$DISPATCHER_SCRIPT" "$IP_HANDLER_SCRIPT" "$RULES_SCRIPT" "$CONFIG_SCRIPT"; do
+        [ ! -f "$script" ] && { log_error "Script missing: ${script##*/}"; return 1; }
     done
     
-    # Check configs
-    [ ! -f "$SETTINGS_FILE" ] && { log_error "Settings missing: $SETTINGS_FILE"; return 1; }
-    [ ! -f "$CONFIG_FILE" ] && { log_error "Config missing: $CONFIG_FILE"; return 1; }
-    
+    for conf in "$SETTINGS_FILE" "$CONFIG_FILE"; do
+        [ ! -f "$conf" ] && { log_error "Config missing: ${conf##*/}"; return 1; }
+    done
     return 0
 }
 
@@ -38,6 +36,7 @@ _cleanup_failure() {
     sh "$CORE_SCRIPT" stop &
     sh "$TPROXY_SCRIPT" stop &
     sh "$IP_MONITOR_SCRIPT" stop &
+    sh "$IP_HANDLER_SCRIPT" cleanup &
     wait
     rm -f "$EVENTS_DIR/fail" "$EVENTS_DIR/core_ok" "$EVENTS_DIR/tproxy_ok" 2>/dev/null
     return 0
@@ -46,7 +45,7 @@ _cleanup_failure() {
 # Directory Initialization
 
 _init_dirs() {
-    for dir in "$RUN_DIR" "$CACHE_DIR" "$EVENTS_DIR"; do
+    local dir; for dir in "$RUN_DIR" "$CACHE_DIR" "$EVENTS_DIR"; do
         [ ! -d "$dir" ] && mkdir -p "$dir"
     done
     [ -d "$RUN_DIR" ] && chmod 0755 "$RUN_DIR"
@@ -62,25 +61,23 @@ _check_update() {
 
 # Log Maintenance
 
-# Helper: Rotate single file (Copy-Truncate)
 _rotate_file() {
     local file="$1"
-    
     [ ! -f "$file" ] && return 0
     
-    local current_size
-    current_size=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null || echo 0)
+    # Use -L for link follows if needed, but here we expect regular files
+    local sz; sz=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null || echo 0)
     
-    if [ "$current_size" -gt "$LOG_MAX_SIZE" ]; then
-        log_info "Rotating ${file##*/} (size: $current_size)"
-        cp -f "$file" "${file}.bak"
+    if [ "$sz" -gt "$LOG_MAX_SIZE" ]; then
+        log_info "Rotating ${file##*/} (size: $sz)"
+        mv -f "$file" "${file}.bak"
         : > "$file"
     fi
 }
 
 _rotate_log() {
-    [ -f "$FLUX_LOG" ] && _rotate_file "$FLUX_LOG"
-    [ -f "$SING_BOX_LOG" ] && _rotate_file "$SING_BOX_LOG"
+    _rotate_file "$FLUX_LOG"
+    _rotate_file "$SING_BOX_LOG"
     return 0
 }
 

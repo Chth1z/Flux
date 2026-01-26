@@ -92,6 +92,32 @@ _manage_proxy_rules() {
     return 0
 }
 
+# Apply or Cleanup cached PBR (Routing) policies
+_manage_pbr_policies() {
+    local family="$1"
+    local action="$2" # "apply" or "cleanup"
+    
+    local pbr_file
+    if [ "$family" = "6" ]; then
+        [ "$action" = "apply" ] && pbr_file="$CACHE_PBR_V6_FILE" || pbr_file="$CACHE_PBR_CLEANUP_V6_FILE"
+    else
+        [ "$action" = "apply" ] && pbr_file="$CACHE_PBR_V4_FILE" || pbr_file="$CACHE_PBR_CLEANUP_V4_FILE"
+    fi
+
+    [ "$action" = "apply" ] && [ ! -f "$pbr_file" ] && { log_error "PBR cache not found: $pbr_file"; return 1; }
+
+    # Execute PBR commands
+    if [ -s "$pbr_file" ]; then
+        local err_out
+        if ! err_out=$(sh "$pbr_file" 2>&1); then
+            log_error "PBR policy application failed for IPv$family"
+            echo "$err_out" | while read -r line; do log_error "  >> $line"; done
+            return 1
+        fi
+    fi
+    return 0
+}
+
 # Routing Table Management
 
 _manage_routing() {
@@ -121,14 +147,15 @@ _manage_routing() {
         
         if [ "$family" = "4" ]; then
             printf '1\n' > /proc/sys/net/ipv4/ip_forward
+            printf '1\n' > /proc/sys/net/ipv4/conf/all/forwarding
+            printf '1\n' > /proc/sys/net/ipv4/conf/default/forwarding
         else
             printf '1\n' > /proc/sys/net/ipv6/conf/all/forwarding
+            printf '1\n' > /proc/sys/net/ipv6/conf/default/forwarding
         fi
     fi
     return 0
 }
-
-# Main Execution API
 
 # Main Execution API
 
@@ -148,16 +175,23 @@ _manage_all() {
 
     for f in $families; do
         local label="IPv${f}"
+        
+        # 1. IPTables Rules
         run "Manage $label rules ($proxy_action)" _manage_proxy_rules "$f" "$proxy_action" || \
             { [ "$action" = "start" ] && touch "$EVENTS_DIR/fail"; return 1; }
         
+        # 2. PBR Policies (App)
+        run "Manage $label PBR policies ($proxy_action)" _manage_pbr_policies "$f" "$proxy_action" || \
+            { [ "$action" = "start" ] && touch "$EVENTS_DIR/fail"; return 1; }
+        
+        # 3. Routing Tables
         if [ "$mode" = "tproxy" ]; then
             run "Manage $label routing ($route_action)" _manage_routing "$f" "$route_action" || \
                 { [ "$action" = "start" ] && touch "$EVENTS_DIR/fail"; return 1; }
         fi
     done
 
-    [ "$action" = "start" ] && { log_debug "TProxy started (mode: $mode)"; touch "$EVENTS_DIR/tproxy_ok"; }
+    [ "$action" = "start" ] && { log_debug "Hybrid-RCI started (mode: $mode)"; touch "$EVENTS_DIR/tproxy_ok"; }
     return 0
 }
 

@@ -53,6 +53,24 @@ _find_packages_uid() {
     return 0
 }
 
+# Group individual UIDs into ranges for ip rule efficiency
+_find_uid_ranges() {
+    local uids; uids=$(printf '%s\n' "$@" | tr ' ' '\n' | sort -un)
+    [ -z "$uids" ] && return 0
+    echo "$uids" | awk '
+    function print_range() {
+        if (start == "") return
+        if (start == last) printf "%d-%d ", start, start
+        else printf "%d-%d ", start, last
+    }
+    {
+        if (start == "") { start = last = $1; next }
+        if ($1 == last + 1) { last = $1 }
+        else { print_range(); start = last = $1 }
+    }
+    END { print_range() }'
+}
+
 
 # Interface configuration mapping
 
@@ -84,6 +102,18 @@ EOF
 
 # Core Rule Building Functions
 
+_build_exclude_interface_rules() {
+    local suffix="$1"
+    # Create the global exclusion bypass chain
+    for ex in $EXCLUDE_INTERFACES; do
+        if [ -n "$ex" ]; then
+            printf -- '-A EXCLUDE_INTERFACE%s -i %s -j ACCEPT\n' "$suffix" "$ex"
+            printf -- '-A EXCLUDE_INTERFACE%s -o %s -j ACCEPT\n' "$suffix" "$ex"
+        fi
+    done
+    return 0
+}
+
 _build_interface_rules() {
     local suffix="$1"
     
@@ -99,7 +129,7 @@ _build_interface_rules() {
             if ((name == "mobile" || name == "wifi") && WAN_IN_BYPASS == "1") {
                 # WAN interfaces: Bypass TPROXY in Prerouting if enabled. 
                 # This prevents carrier traffic (SMS/VoLTE) from being hijacked.
-                if (ENABLE_STATEFUL_SKIP == "1") {
+                if (ENABLE_CONNTRACK == "1") {
                     printf "-A PROXY_INTERFACE%s -i %s -j CONNMARK --set-xmark 0x11/0xffffffff\n", suffix, iface
                 }
                 printf "-A PROXY_INTERFACE%s -i %s -j ACCEPT\n", suffix, iface
@@ -125,56 +155,101 @@ _build_interface_rules() {
 _build_bypass_ip_rules() {
     local suffix="$1" family="$2"
     
-    # Address type & conntrack optimizations
-    if [ "$KFEAT_ADDRTYPE" = "1" ]; then
-        printf -- '-A BYPASS_IP%s -m addrtype --dst-type LOCAL -p udp --dport 53 -j RETURN\n' "$suffix"
-        printf -- '-A BYPASS_IP%s -m addrtype --dst-type LOCAL -j ACCEPT\n' "$suffix"
-    fi
-    
+    # conntrack optimizations (Note: addrtype removed as it fails on this kernel)
     [ "$KFEAT_CONNTRACK" = "1" ] && [ "$ENABLE_CONNTRACK" = "1" ] && \
         printf -- '-A BYPASS_IP%s -m conntrack --ctdir REPLY -j ACCEPT\n' "$suffix"
     
-    # Private subnets bypass - Efficiently batch generated via Awk
     local subnets; [ "$family" = "6" ] && subnets="$PRIVATE_SUBNETS_V6_COMPACT" || subnets="$PRIVATE_SUBNETS_V4_COMPACT"
-    
-    # Merge with custom bypass list
     subnets="$subnets $CUSTOM_BYPASS_LIST"
     
-    printf '%s\n' $subnets | awk -v chain="BYPASS_IP$suffix" -v skip="$ENABLE_STATEFUL_SKIP" '{
-        if ($1 == "") next
-        printf "-A %s -d %s -p udp --dport 53 -j RETURN\n", chain, $1
-        if (skip == "1") printf "-A %s -d %s -j CONNMARK --set-xmark 0x11/0xffffffff\n", chain, $1
-        printf "-A %s -d %s -j ACCEPT\n", chain, $1
-    }'
+    if [ "$family" = "6" ]; then
+        # IPv6: 16-Zone Jump Tree (O(n/16) optimization based on first hex char)
+        echo "$subnets" | tr ' ' '\n' | awk -v chain="BYPASS_IP6" -v skip="$ENABLE_CONNTRACK" '
+        BEGIN { for(i=0; i<16; i++) zones[i] = 0 }
+        {
+            if ($1 == "") next
+            # Extract first hexadecimal character after any potential compressed ::
+            # For simplicity and effectiveness, we match common global unicast (2xxx, 3xxx) 
+            # and ULA (fc, fd). We use the first nibble.
+            clean_ip = $1; sub(/^::/, "", clean_ip);
+            first_char = tolower(substr(clean_ip, 1, 1));
+            zone = index("0123456789abcdef", first_char) - 1;
+            if (zone < 0 || zone > 15) zone = 0;
+            
+            zone_rules[zone] = zone_rules[zone] "-A BYP_Z" zone "6 -d " $1 " -p udp --dport 53 -j RETURN\n"
+            if (skip == "1") zone_rules[zone] = zone_rules[zone] "-A BYP_Z" zone "6 -d " $1 " -j CONNMARK --set-xmark 0x11/0xffffffff\n"
+            zone_rules[zone] = zone_rules[zone] "-A BYP_Z" zone "6 -d " $1 " -j ACCEPT\n"
+            zones[zone] = 1
+        }
+        END {
+            for(i=0; i<16; i++) if (zones[i]) printf "-A %s -d %x000::/4 -j BYP_Z%d6\n", chain, i, i
+            for(i=0; i<16; i++) if (zones[i]) printf "%s", zone_rules[i]
+        }'
+    else
+        # IPv4: 16-Zone Jump Tree (O(n/16) optimization)
+        echo "$subnets" | tr ' ' '\n' | awk -v chain="BYPASS_IP" -v skip="$ENABLE_CONNTRACK" '
+        BEGIN { for(i=0; i<16; i++) zones[i] = 0 }
+        {
+            if ($1 == "") next
+            split($1, octets, "."); zone = int(octets[1] / 16)
+            if (zone < 0 || zone > 15) zone = 0;
+            
+            zone_rules[zone] = zone_rules[zone] "-A BYP_Z" zone " -d " $1 " -p udp --dport 53 -j RETURN\n"
+            if (skip == "1") zone_rules[zone] = zone_rules[zone] "-A BYP_Z" zone " -d " $1 " -j CONNMARK --set-xmark 0x11/0xffffffff\n"
+            zone_rules[zone] = zone_rules[zone] "-A BYP_Z" zone " -d " $1 " -j ACCEPT\n"
+            zones[zone] = 1
+        }
+        END {
+            for(i=0; i<16; i++) if (zones[i]) printf "-A %s -d %d.0.0.0/4 -j BYP_Z%d\n", chain, i*16, i
+            for(i=0; i<16; i++) if (zones[i]) printf "%s", zone_rules[i]
+        }'
+    fi
     return 0
 }
 
 _build_app_rules() {
     local suffix="$1"
     
-    # Core process bypass
+    # 1. Core process bypass (Kernel feature check)
     if [ "$KFEAT_OWNER" = "1" ]; then
+        printf -- '-A APP_CHAIN%s -m owner --uid-owner %s --gid-owner %s -j CONNMARK --set-xmark 0x11/0xffffffff\n' "$suffix" "$CORE_USER" "$CORE_GROUP"
         printf -- '-A APP_CHAIN%s -m owner --uid-owner %s --gid-owner %s -j ACCEPT\n' "$suffix" "$CORE_USER" "$CORE_GROUP"
     elif [ "$KFEAT_MARK" = "1" ] && [ -n "$ROUTING_MARK" ]; then
+        printf -- '-A APP_CHAIN%s -m mark --mark %s -j CONNMARK --set-xmark 0x11/0xffffffff\n' "$suffix" "$ROUTING_MARK"
         printf -- '-A APP_CHAIN%s -m mark --mark %s -j ACCEPT\n' "$suffix" "$ROUTING_MARK"
     fi
     
-    { [ "$APP_PROXY_MODE" = "0" ] || [ "$KFEAT_OWNER" != "1" ]; } && return 0
+    printf -- '-A APP_CHAIN%s -j RETURN\n' "$suffix"
+    return 0
+}
 
-    local uids; uids=$(_find_packages_uid "$APP_LIST")
-    [ -z "$uids" ] && { printf -- '-A APP_CHAIN%s -j %s\n' "$suffix" "$([ "$APP_PROXY_MODE" = "1" ] && printf "RETURN" || printf "ACCEPT")"; return 0; }
-
-    local action; [ "$APP_PROXY_MODE" = "1" ] && action="ACCEPT" || action="RETURN"
-    local final; [ "$APP_PROXY_MODE" = "1" ] && final="RETURN" || final="ACCEPT"
-
-    printf '%s\n' $uids | awk -v chain="APP_CHAIN$suffix" -v act="$action" '{ printf "-A %s -m owner --uid-owner %s -j %s\n", chain, $1, act }'
+_generate_pbr_rules() {
+    local family="$1" action="$2" # "add" or "del"
+    local table="$TABLE_ID"
+    local mark; [ "$family" = "6" ] && mark="$MARK_VALUE6" || mark="$MARK_VALUE"
     
-    # Advanced: QUIC Blocking (force TCP fallback)
-    if [ "$BLOCK_QUIC" = "1" ]; then
-        printf -- '-A APP_CHAIN%s -p udp --dport 443 -j REJECT --reject-with icmp-port-unreachable\n' "$suffix"
+    # 1. Bypass UIDs (lowest pref)
+    # 2. Proxy UIDs (higher pref)
+    
+    local uids; uids=$(_find_packages_uid "$APP_LIST")
+    local ranges; ranges=$(_find_uid_ranges $uids)
+    
+    local ip_cmd; [ "$family" = "6" ] && ip_cmd="ip -6" || ip_cmd="ip"
+    
+    # Priority: Bypass UIDs (Direct)
+    if [ "$APP_PROXY_MODE" = "2" ]; then
+        # Blacklist mode: APP_LIST are UIDs to REJECT/BYPASS
+        for r in $ranges; do
+            printf '%s rule %s uidrange %s lookup main pref 2000\n' "$ip_cmd" "$action" "$r"
+        done
+        # Default follow main mark? Or proxy all others?
+        # Usually Blacklist means "Only these are bypassed, others remain"
+    else
+        # Whitelist mode: Only APP_LIST are proxied
+        for r in $ranges; do
+            printf '%s rule %s uidrange %s lookup %s pref %s\n' "$ip_cmd" "$action" "$r" "$table" "$table"
+        done
     fi
-
-    printf -- '-A APP_CHAIN%s -j %s\n' "$suffix" "$final"
     return 0
 }
 
@@ -201,12 +276,6 @@ _build_dns_hijack_mangle_rules() {
     local suffix="$1" mode="$2"
     [ "$DNS_HIJACK_ENABLE" = "0" ] || [ "$mode" != "tproxy" ] && return 0
     
-    # Advanced: System DNS Passthrough
-    if [ "$SYSTEM_DNS_PASSTHROUGH" = "1" ] && [ "$KFEAT_OWNER" = "1" ]; then
-        printf -- '-A DNS_HIJACK_PRE%s -m owner --uid-owner 0-999 -j RETURN\n' "$suffix"
-        printf -- '-A DNS_HIJACK_OUT%s -m owner --uid-owner 0-999 -j RETURN\n' "$suffix"
-    fi
-
     if [ "$DNS_HIJACK_ENABLE" = "2" ]; then
         cat <<EOF
 -A DNS_HIJACK_PRE${suffix} -p udp --dport 53 -j ACCEPT
@@ -224,52 +293,76 @@ EOF
 _build_proxy_rules() {
     local family="$1" mode="$2"
     local suffix=""; [ "$family" = "6" ] && suffix="6"
+    
     local mark; [ "$family" = "6" ] && mark="$MARK_VALUE6" || mark="$MARK_VALUE"
+    # Ensure mask is applied for robust matching
+    local full_mark="${mark}/0xffffffff"
     
     local table="mangle"; [ "$mode" = "redirect" ] && table="nat"
     
     printf -- '*%s\n' "$table"
-    for chain in $PROXY_CHAINS; do printf -- ':%s%s - [0:0]\n' "$chain" "$suffix"; done
+    for chain in $PROXY_CHAINS EXCLUDE_INTERFACE; do printf -- ':%s%s - [0:0]\n' "$chain" "$suffix"; done
     
+    # Define Zone sub-chains for Jump Tree
+    for i in $(seq 0 15); do printf -- ':BYP_Z%s%s - [0:0]\n' "$i" "$suffix"; done
+    
+    # --------------------------------------------------------------------------
+    # FAST-PATH: Stateful Acceleration (Top Priority)
+    # --------------------------------------------------------------------------
+    # 1. Bypass Fast-Path: If connection is already marked as bypass (0x11), ACCEPT immediately.
+    printf -- '-A PROXY_PREROUTING%s -m connmark --mark 0x11/0xffffffff -j ACCEPT\n' "$suffix"
+    printf -- '-A PROXY_OUTPUT%s -m connmark --mark 0x11/0xffffffff -j ACCEPT\n' "$suffix"
+
+    # 2. Directional Safety: Global bypass for all REPLY traffic (Prevents TProxy loops)
+    if [ "$KFEAT_CONNTRACK" = "1" ]; then
+        printf -- '-A PROXY_PREROUTING%s -m conntrack --ctdir REPLY -j ACCEPT\n' "$suffix"
+        printf -- '-A PROXY_OUTPUT%s -m conntrack --ctdir REPLY -j ACCEPT\n' "$suffix"
+    fi
+
+    # 3. Proxy Fast-Path: RE-APPLY TPROXY/MARK for ORIGINAL direction marked connections
+    if [ "$mode" = "tproxy" ] && [ "$KFEAT_CONNTRACK" = "1" ] && [ "$KFEAT_MARK" = "1" ]; then
+        printf -- '-A PROXY_PREROUTING%s -p tcp -m conntrack --ctdir ORIGINAL -m connmark --mark %s -j TPROXY --on-port %s --tproxy-mark %s\n' "$suffix" "$full_mark" "$PROXY_TCP_PORT" "$mark"
+        printf -- '-A PROXY_PREROUTING%s -p udp -m conntrack --ctdir ORIGINAL -m connmark --mark %s -j TPROXY --on-port %s --tproxy-mark %s\n' "$suffix" "$full_mark" "$PROXY_UDP_PORT" "$mark"
+        printf -- '-A PROXY_PREROUTING%s -m conntrack --ctdir ORIGINAL -m connmark --mark %s -j ACCEPT\n' "$suffix" "$full_mark"
+        
+        printf -- '-A PROXY_OUTPUT%s -m conntrack --ctdir ORIGINAL -m connmark --mark %s -j MARK --set-mark %s\n' "$suffix" "$full_mark" "$mark"
+        printf -- '-A PROXY_OUTPUT%s -m conntrack --ctdir ORIGINAL -m connmark --mark %s -j ACCEPT\n' "$suffix" "$full_mark"
+    fi
+
+    # --------------------------------------------------------------------------
+    # CLASSIFICATION: Only NEW connections (unmarked) reach here
+    # --------------------------------------------------------------------------
+    _build_exclude_interface_rules "$suffix"
+    _build_bypass_ip_rules "$suffix" "$family"
+
     cat <<EOF
+-A PROXY_PREROUTING${suffix} -j EXCLUDE_INTERFACE${suffix}
 -A PROXY_PREROUTING${suffix} -j BYPASS_IP${suffix}
 -A PROXY_PREROUTING${suffix} -j PROXY_INTERFACE${suffix}
 -A PROXY_PREROUTING${suffix} -j MAC_CHAIN${suffix}
 -A PROXY_PREROUTING${suffix} -j DNS_HIJACK_PRE${suffix}
+
+# OUTPUT chain handles App and local bypasses
+-A PROXY_OUTPUT${suffix} -j EXCLUDE_INTERFACE${suffix}
 -A PROXY_OUTPUT${suffix} -j BYPASS_IP${suffix}
 -A PROXY_OUTPUT${suffix} -j BYPASS_INTERFACE${suffix}
 -A PROXY_OUTPUT${suffix} -j APP_CHAIN${suffix}
 -A PROXY_OUTPUT${suffix} -j DNS_HIJACK_OUT${suffix}
 EOF
     
-    _build_bypass_ip_rules "$suffix" "$family"
     _build_interface_rules "$suffix"
     _build_mac_rules "$suffix"
     _build_app_rules "$suffix"
     _build_dns_hijack_mangle_rules "$suffix" "$mode"
     
     if [ "$mode" = "tproxy" ]; then
-        # Advanced: Stateful Skip Logic (Mark 0x11 = Bypass, Mark 0x14 = Proxy)
-        if [ "$ENABLE_STATEFUL_SKIP" = "1" ] && [ "$KFEAT_CONNTRACK" = "1" ] && [ "$KFEAT_MARK" = "1" ]; then
-            # 0x11 (Bypass): Skip everything and accept
-            printf -- '-A PROXY_PREROUTING%s -m connmark --mark 0x11 -j ACCEPT\n' "$suffix"
-            printf -- '-A PROXY_OUTPUT%s -m connmark --mark 0x11 -j ACCEPT\n' "$suffix"
-
-            # 0x14 (Proxy): Skip sub-chains but apply TPROXY/MARK
-            printf -- '-A PROXY_PREROUTING%s -p tcp -m connmark --mark 0x14 -j TPROXY --on-port %s --tproxy-mark %s\n' "$suffix" "$PROXY_TCP_PORT" "$mark"
-            printf -- '-A PROXY_PREROUTING%s -p udp -m connmark --mark 0x14 -j TPROXY --on-port %s --tproxy-mark %s\n' "$suffix" "$PROXY_UDP_PORT" "$mark"
-            printf -- '-A PROXY_PREROUTING%s -m connmark --mark 0x14 -j ACCEPT\n' "$suffix"
-            
-            printf -- '-A PROXY_OUTPUT%s -m connmark --mark 0x14 -j MARK --set-mark %s\n' "$suffix" "$mark"
-            printf -- '-A PROXY_OUTPUT%s -m connmark --mark 0x14 -j ACCEPT\n' "$suffix"
-        fi
-
         cat <<EOF
--A PROXY_PREROUTING${suffix} -p tcp -j CONNMARK --set-xmark $mark/0xffffffff
+# Classification Fallback (New Connections)
+-A PROXY_PREROUTING${suffix} -p tcp -j CONNMARK --set-xmark $full_mark
 -A PROXY_PREROUTING${suffix} -p tcp -j TPROXY --on-port $PROXY_TCP_PORT --tproxy-mark $mark
--A PROXY_PREROUTING${suffix} -p udp -j CONNMARK --set-xmark $mark/0xffffffff
+-A PROXY_PREROUTING${suffix} -p udp -j CONNMARK --set-xmark $full_mark
 -A PROXY_PREROUTING${suffix} -p udp -j TPROXY --on-port $PROXY_UDP_PORT --tproxy-mark $mark
--A PROXY_OUTPUT${suffix} -j CONNMARK --set-xmark $mark/0xffffffff
+-A PROXY_OUTPUT${suffix} -j CONNMARK --set-xmark $full_mark
 -A PROXY_OUTPUT${suffix} -j MARK --set-mark $mark
 EOF
     else
@@ -311,9 +404,11 @@ _build_nat_extra() {
     local addr; [ "$family" = "6" ] && addr="::1" || addr="127.0.0.1"
     local suffix; [ "$family" = "6" ] && suffix="6" || suffix=""
     
+    local proto; [ "$family" = "6" ] && proto="ipv6-icmp" || proto="icmp"
+    
     printf '*nat\n'
-    printf -- '%s OUTPUT -d %s -p icmp -j DNAT --to-destination %s\n' "$action" "$range" "$addr"
-    printf -- '%s PREROUTING -d %s -p icmp -j DNAT --to-destination %s\n' "$action" "$range" "$addr"
+    printf -- '%s OUTPUT -d %s -p %s -j DNAT --to-destination %s\n' "$action" "$range" "$proto" "$addr"
+    printf -- '%s PREROUTING -d %s -p %s -j DNAT --to-destination %s\n' "$action" "$range" "$proto" "$addr"
 
     if [ "$DNS_HIJACK_ENABLE" = "2" ]; then
         if [ "$action" = "-A" ]; then
@@ -355,8 +450,10 @@ _build_cleanup_rules() {
         printf -- '-D PREROUTING -p udp -j PROXY_PREROUTING%s\n' "$suffix"
         printf -- '-D OUTPUT -p udp -j PROXY_OUTPUT%s\n' "$suffix"
     }
-    for chain in $PROXY_CHAINS; do printf -- '-F %s%s\n' "$chain" "$suffix"; done
-    for chain in $PROXY_CHAINS; do printf -- '-X %s%s\n' "$chain" "$suffix"; done
+    for chain in $PROXY_CHAINS EXCLUDE_INTERFACE; do printf -- '-F %s%s\n' "$chain" "$suffix"; done
+    for chain in $PROXY_CHAINS EXCLUDE_INTERFACE; do printf -- '-X %s%s\n' "$chain" "$suffix"; done
+    
+    for i in $(seq 0 15); do printf -- '-F BYP_Z%s%s\n-X BYP_Z%s%s\n' "$i" "$suffix" "$i" "$suffix"; done
     printf 'COMMIT\n'
     return 0
 }
@@ -371,6 +468,7 @@ generate_all_rules() {
     
     # Advanced: MSS Clamping
     if [ "$MSS_CLAMP_ENABLE" = "1" ]; then
+        local cmd; [ "$f" = "6" ] && cmd="ip6tables" || cmd="iptables"
         printf '*mangle\n'
         printf -- '-A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu\n'
         printf 'COMMIT\n'
@@ -386,9 +484,22 @@ generate_all_cleanup_rules() {
     
     # Advanced: MSS Clamping Cleanup
     if [ "$MSS_CLAMP_ENABLE" = "1" ]; then
+        local cmd; [ "$f" = "6" ] && cmd="ip6tables" || cmd="iptables"
         printf '*mangle\n'
         printf -- '-D POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu\n'
         printf 'COMMIT\n'
     fi
+    return 0
+}
+
+generate_all_pbr_rules() {
+    local f="$1"
+    _generate_pbr_rules "$f" "add"
+    return 0
+}
+
+generate_all_pbr_cleanup_rules() {
+    local f="$1"
+    _generate_pbr_rules "$f" "del"
     return 0
 }

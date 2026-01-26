@@ -1,10 +1,6 @@
 #!/system/bin/sh
 
-# Flux IP Monitor Daemon
-# Detects network changes and triggers synchronization
-
-
-# Environment Setup
+# Flux-SRI (State-driven Routing Injector) Core
 
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 . "$SCRIPT_DIR/const"
@@ -12,116 +8,156 @@ SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 
 export LOG_COMPONENT="Moni"
 
+# Internal SRI Logic
 
-# Helper Functions
-
-# Capture a fingerprint of current global IPs
-_get_ip_state() {
-    # Use MD5 of the full brief output to detect any change in any global address
-    ip -brief addr show scope global 2>/dev/null | md5sum | cut -d' ' -f1
+_capture_state() {
+    local family="$1" proto="inet"; [ "$family" = "6" ] && proto="inet6"
+    ip -f "$proto" -o addr show | awk -v proto="$proto" '
+        {
+            for (i=1; i<NF; i++) {
+                if ($i == proto) {
+                    split($(i+1), p, "/"); val = p[1]
+                    if (val ~ /^(127\.|0\.|fe80:|::1)/ || val == "") continue
+                    print val; break
+                }
+            }
+        }'
 }
 
-# Monitor Logic Loop
+_sri_cleanup() {
+    log_debug "Flux-SRI: Dual-Stack Priority-Sweep (pref 1900)..."
+    # Cleanup IPv4
+    ip rule show | awk -F: '$1 == "1900" { sub(/^[ \t]*/,"",$2); print "ip rule del " $2 }' | sh 2>/dev/null || true
+    # Cleanup IPv6
+    ip -6 rule show | awk -F: '$1 == "1900" { sub(/^[ \t]*/,"",$2); print "ip -6 rule del " $2 }' | sh 2>/dev/null || true
+    rm -f "$SRI_STATE_FILE" 2>/dev/null
+    return 0
+}
+
+_sri_sync_initial() {
+    log_debug "Flux-SRI: Initializing state mirror..."
+    _sri_cleanup
+    local v4_ips; v4_ips=$(_capture_state 4)
+    local v6_ips; [ "$PROXY_IPV6" = "1" ] && v6_ips=$(_capture_state 6)
+    {
+        for ip in $v4_ips; do
+            printf 'ip rule add to %s lookup main pref 1900\n' "$ip"
+            echo "$ip" >> "$SRI_STATE_FILE"
+        done
+        for ip in $v6_ips; do
+            # Use ip -f inet6 for certain dual-stack parity
+            printf 'ip -f inet6 rule add to %s lookup main pref 1900\n' "$ip"
+            echo "$ip" >> "$SRI_STATE_FILE"
+        done
+    } | sh 2>/dev/null || true
+    return 0
+}
 
 start_monitor() {
-    # Pre-flight cleanup
-    rm -f "$FIFO_FILE" 2>/dev/null
-    mkfifo "$FIFO_FILE" || { log_error "Failed to create FIFO: $FIFO_FILE"; return 1; }
-
-    # Only wake up the loop for global address changes to reduce noise
-    # Use --line-buffered to ensure events are processed immediately
-    (ip monitor address 2>/dev/null | grep --line-buffered -E "scope global|Deleted" > "$FIFO_FILE") &
-    local monitor_bin_pid=$!
-
-    #  register lifecycle (PID & Cleanup)
-    printf '%s\n' "$$" > "$MONITOR_PID_FILE" && \
-    log_debug "Starting IP Monitor (PID: $$, BinPID: $monitor_bin_pid, debounce=${DEBOUNCE_INTERVAL}s)"
-
-    trap 'rm -f "$FIFO_FILE"; kill "$monitor_bin_pid" 2>/dev/null; rm -f "$MONITOR_PID_FILE"; exit 0' EXIT INT TERM
-
-    local last_state; last_state=$(_get_ip_state)
-    log_debug "Initial IP State Hash: $last_state"
+    _sri_sync_initial || return 1
     
-    # Immediate initial sync trigger
-    touch "$EVENTS_DIR/ip_sync"
-    log_info "Ipmonitor started"
+    # Setup Sentinel and FIFO
+    echo "$$" > "$MONITOR_PID_FILE"
+    local pipe="$RUN_DIR/flux_sri.pipe"
+    rm -f "$pipe" && mkfifo "$pipe"
+
+    # Unified Child Cleanup
+    _kill_children() { pkill -P "$$" 2>/dev/null; }
     
-    local dirty=0 current_state
-    
-    while true; do
-        if read -t "$DEBOUNCE_INTERVAL" -r line 2>/dev/null; then
-            # Activity detected (any output triggers dirty flag)
-            [ -n "$line" ] && dirty=1
-        else
-            # Quiet period (Debounce timeout)
-            if [ "$dirty" = "1" ]; then
-                current_state=$(_get_ip_state)
-                if [ "$current_state" != "$last_state" ]; then
-                    log_debug "Network change verified ($last_state -> $current_state)"
-                    touch "$EVENTS_DIR/ip_sync"
-                    last_state="$current_state"
-                else
-                    log_debug "Ignored transient network noise"
-                fi
-                dirty=0
-            fi
-        fi
-    done < "$FIFO_FILE"
+    # Traps for clean exit
+    trap '_kill_children; rm -f "$MONITOR_PID_FILE" "$pipe"; exit 0' INT TERM
+    trap 'rm -f "$pipe"' EXIT
+
+    log_info "Flux-SRI started (FIFO + Sentinel Mode)"
+
+    while [ -f "$MONITOR_PID_FILE" ]; do
+        # Data Stream: ip monitor -> FIFO
+        ip -o monitor address 2>/dev/null > "$pipe" &
+        local monitor_pid=$!
+
+        # Processing Engine: FIFO -> AWK -> SH
+        (
+            awk -v state_file="$SRI_STATE_FILE" \
+                -v proxy_ipv6="${PROXY_IPV6:-0}" '
+            function update_state_mirror() {
+                tmp = state_file ".tmp"
+                printf "" > tmp
+                for (i in ips) if (i != "") print i > tmp
+                close(tmp)
+                system("mv " tmp " " state_file " 2>/dev/null")
+            }
+            BEGIN {
+                if (system("[ -f " state_file " ]") == 0) {
+                    while ((getline line < state_file) > 0) { if (line != "") ips[line] = 1 }
+                    close(state_file)
+                }
+                fflush()
+            }
+            {
+                is_del = ($0 ~ /Deleted/); iface = $2
+                proto = ""; ip_idx = 0
+                for (i=1; i<=NF; i++) {
+                    if ($i == "inet") { proto="4"; ip_idx=i+1; break }
+                    if ($i == "inet6" && proxy_ipv6 == "1") { proto="6"; ip_idx=i+1; break }
+                }
+                if (proto == "" || ip_idx == 0 || ip_idx > NF) next
+                split($(ip_idx), p, "/"); ip = p[1]
+                if (ip == "" || ip ~ /^(127\.|0\.|fe80:|::1)/) next
+
+                if (!is_del && !(ip in ips)) {
+                    ips[ip] = 1
+                    printf "ip %srule add to %s lookup main pref 1900\n", (proto=="6"?"-f inet6 ":""), ip
+                    print ip >> state_file
+                } else if (is_del && (ip in ips)) {
+                    delete ips[ip]
+                    printf "ip %srule del to %s lookup main pref 1900\n", (proto=="6"?"-f inet6 ":""), ip
+                    update_state_mirror()
+                }
+                fflush()
+            }
+            ' < "$pipe" | sh 2>&1
+        ) >> "$FLUX_LOG" 2>&1 &
+        local engine_pid=$!
+        
+        wait "$engine_pid"
+        
+        # Stop everything if the monitor dies or we are terminating
+        _kill_children
+        [ -f "$MONITOR_PID_FILE" ] && { log_warn "SRI Engine restart in 3s..."; sleep 3; }
+    done
     return 0
-}
-
-_get_monitor_pid() {
-    [ -f "$MONITOR_PID_FILE" ] && cat "$MONITOR_PID_FILE" 2>/dev/null
-    return 0
-}
-
-_is_monitor_running() {
-    local pid="$1"
-    [ -n "$pid" ] && [ -d "/proc/$pid" ]
 }
 
 stop_monitor() {
-    local pid; [ -f "$MONITOR_PID_FILE" ] && pid=$(cat "$MONITOR_PID_FILE" 2>/dev/null)
-
-    log_info "Stopping IP Monitor service..."
-    
-    if _is_monitor_running "$pid"; then
-        kill "$pid" 2>/dev/null
-        local count=0
-        while [ $count -lt 3 ] && _is_monitor_running "$pid"; do
-            sleep 1
-            count=$((count + 1))
-        done
-        _is_monitor_running "$pid" && kill -9 "$pid" 2>/dev/null
-    else
-        pkill -f "ipmonitor" 2>/dev/null
-    fi
-
-    # Final cleanup
-    rm -f "$FIFO_FILE" "$MONITOR_PID_FILE" 2>/dev/null
+    local pid; pid=$(cat "$MONITOR_PID_FILE" 2>/dev/null)
+    log_info "Stopping Flux-SRI..."
+    [ -n "$pid" ] && { rm -f "$MONITOR_PID_FILE"; kill "$pid" 2>/dev/null; }
+    _sri_cleanup
     return 0
 }
 
-# Entry Point
-
 main() {
     local action="${1:-}"
-    
+
     case "$action" in
+
         start)
             start_monitor
-            return $?
             ;;
         stop)
             stop_monitor
-            return $?
+            ;;
+        sync)
+            _sri_sync_initial
+            ;;
+        cleanup)
+            _sri_cleanup
             ;;
         *)
-            echo "Usage: $0 {start|stop}"
-            exit 1
+            echo "Usage: $0 {start|stop|sync|cleanup}"
+            exit 0
             ;;
     esac
 }
 
 main "$@"
-

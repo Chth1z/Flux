@@ -10,6 +10,12 @@
 
 export LOG_COMPONENT="Flux"
 
+for file in "$CACHE_CONFIG_FILE" "$SETTINGS_FILE"; do
+    if [ -f "$file" ]; then
+        set -a; . "$file"; set +a
+        break
+    fi
+done
 
 # Boot Detection
 

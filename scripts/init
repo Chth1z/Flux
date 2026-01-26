@@ -18,7 +18,7 @@ _check_integrity() {
     [ ! -f "$SING_BOX_BIN" ] && { log_error "Sing-box binary missing: $SING_BOX_BIN"; return 1; }
     
     for script in "$CORE_SCRIPT" "$TPROXY_SCRIPT" "$IP_MONITOR_SCRIPT" "$CACHE_SCRIPT" \
-                 "$UPDATE_SCRIPT" "$DISPATCHER_SCRIPT" "$IP_HANDLER_SCRIPT" "$RULES_SCRIPT" "$CONFIG_SCRIPT"; do
+                 "$UPDATE_SCRIPT" "$DISPATCHER_SCRIPT" "$RULES_SCRIPT" "$CONFIG_SCRIPT"; do
         [ ! -f "$script" ] && { log_error "Script missing: ${script##*/}"; return 1; }
     done
     
@@ -36,7 +36,6 @@ _cleanup_failure() {
     sh "$CORE_SCRIPT" stop &
     sh "$TPROXY_SCRIPT" stop &
     sh "$IP_MONITOR_SCRIPT" stop &
-    sh "$IP_HANDLER_SCRIPT" cleanup &
     wait
     rm -f "$EVENTS_DIR/fail" "$EVENTS_DIR/core_ok" "$EVENTS_DIR/tproxy_ok" 2>/dev/null
     return 0

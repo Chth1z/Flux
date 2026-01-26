@@ -24,15 +24,23 @@ _save_rules_cache() {
     
     mkdir -p "$(dirname "$CACHE_RULES_V4_FILE")" 2>/dev/null
     
+    # 1. IPTables Rules
     generate_all_rules "4" "$mode" > "$CACHE_RULES_V4_FILE"
     generate_all_cleanup_rules "4" "$mode" > "$CACHE_CLEANUP_V4_FILE"
+    
+    # 2. PBR (Routing) Rules
+    generate_all_pbr_rules "4" > "$CACHE_PBR_V4_FILE"
+    generate_all_pbr_cleanup_rules "4" > "$CACHE_PBR_CLEANUP_V4_FILE"
     
     if [ "$PROXY_IPV6" = "1" ]; then
         generate_all_rules "6" "$mode" > "$CACHE_RULES_V6_FILE"
         generate_all_cleanup_rules "6" "$mode" > "$CACHE_CLEANUP_V6_FILE"
+        
+        generate_all_pbr_rules "6" > "$CACHE_PBR_V6_FILE"
+        generate_all_pbr_cleanup_rules "6" > "$CACHE_PBR_CLEANUP_V6_FILE"
     fi
     
-    log_debug "Rules cache saved (mode: $mode)"
+    log_debug "Rules & PBR cache saved (mode: $mode)"
     return 0
 }
 
@@ -55,34 +63,48 @@ _save_kernel_cache() {
     
     log_debug "Building Kernel Capability Cache..."
     
-    if [ ! -f /proc/config.gz ]; then
-        log_warn "Cannot build Kernel Cache: /proc/config.gz missing"
-        return 1
-    fi
-    
-    # Consolidate detection into a single awk process
+    # Detection: try /proc/config.gz first, then fall back to trial/error detection
     local features
-    features=$(zcat /proc/config.gz 2>/dev/null | awk '
-        /CONFIG_NETFILTER_XT_TARGET_TPROXY=[ym]/ { t=1 }
-        /CONFIG_NETFILTER_XT_MATCH_OWNER=[ym]/ { o=1 }
-        /CONFIG_NETFILTER_XT_MATCH_MARK=[ym]/ { m=1 }
-        /CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=[ym]/ { a=1 }
-        /CONFIG_NETFILTER_XT_MATCH_CONNTRACK=[ym]/ { c=1 }
-        /CONFIG_NETFILTER_XT_MATCH_MAC=[ym]/ { ma=1 }
-        /CONFIG_IP6_NF_NAT=[ym]/ { i=1 }
-        END {
-            printf "KFEAT_TPROXY=%d;KFEAT_OWNER=%d;KFEAT_MARK=%d;KFEAT_ADDRTYPE=%d;KFEAT_CONNTRACK=%d;KFEAT_MAC=%d;KFEAT_IPV6_NAT=%d", 
-                   t+0, o+0, m+0, a+0, c+0, ma+0, i+0
-        }
-    ')
+    if [ -f /proc/config.gz ]; then
+        features=$(zcat /proc/config.gz 2>/dev/null | awk '
+            /CONFIG_NETFILTER_XT_TARGET_TPROXY=[ym]/ { t=1 }
+            /CONFIG_NETFILTER_XT_MATCH_OWNER=[ym]/ { o=1 }
+            /CONFIG_NETFILTER_XT_MATCH_MARK=[ym]/ { m=1 }
+            /CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=[ym]/ { a=1 }
+            /CONFIG_NETFILTER_XT_MATCH_CONNTRACK=[ym]/ { c=1 }
+            /CONFIG_NETFILTER_XT_MATCH_MAC=[ym]/ { ma=1 }
+            /CONFIG_IP6_NF_NAT=[ym]/ { i=1 }
+            END {
+                printf "KFEAT_TPROXY=%d;KFEAT_OWNER=%d;KFEAT_MARK=%d;KFEAT_ADDRTYPE=%d;KFEAT_CONNTRACK=%d;KFEAT_MAC=%d;KFEAT_IPV6_NAT=%d", 
+                       t+0, o+0, m+0, a+0, c+0, ma+0, i+0
+            }
+        ')
+    else
+        log_warn "/proc/config.gz missing, falling back to module/trial detection"
+        local t=0 o=0 m=0 a=0 c=0 ma=0 i=0
+        
+        # Simple match detection via /proc/net/ip_tables_matches
+        grep -qw "tproxy" /proc/net/ip_tables_targets 2>/dev/null && t=1
+        grep -qw "owner" /proc/net/ip_tables_matches 2>/dev/null && o=1
+        grep -qw "mark" /proc/net/ip_tables_matches 2>/dev/null && m=1
+        grep -qw "addrtype" /proc/net/ip_tables_matches 2>/dev/null && a=1
+        grep -qw "conntrack" /proc/net/ip_tables_matches 2>/dev/null && c=1
+        
+        # Trial detection for cases where modules aren't listed yet
+        [ "$t" = "0" ] && iptables -t mangle -A OUTPUT -p tcp -j TPROXY --on-port 1536 --tproxy-mark 0x1 2>/dev/null && { t=1; iptables -t mangle -D OUTPUT -p tcp -j TPROXY --on-port 1536 --tproxy-mark 0x1 2>/dev/null; }
+        
+        features="KFEAT_TPROXY=$t;KFEAT_OWNER=$o;KFEAT_MARK=$m;KFEAT_ADDRTYPE=$a;KFEAT_CONNTRACK=$c;KFEAT_MAC=1;KFEAT_IPV6_NAT=1"
+    fi
     
     # Batch export and prepare file content
     local content="# Kernel Feature Cache - Auto Generated\n#kernel:${current_kernel}\n"
-    local IFS=';'
+    local old_ifs="$IFS"
+    IFS=';'
     for feat in $features; do
         export "$feat"
         content="${content}${feat}\n"
     done
+    IFS="$old_ifs"
     
     mkdir -p "$(dirname "$KERNEL_CACHE_FILE")" 2>/dev/null
     printf '%b' "$content" > "$KERNEL_CACHE_FILE"
@@ -96,9 +118,9 @@ _save_kernel_cache() {
 _get_mtime() {
     local file="$1"
     if [ -f "$file" ]; then
-        stat -c %Y "$file" 2>/dev/null || stat -f %m "$file" 2>/dev/null || printf "0\n"
+        (stat -c %Y "$file" 2>/dev/null || stat -f %m "$file" 2>/dev/null || printf "0") | tr -d '\n\r'
     else
-        printf "0\n"
+        printf "0"
     fi
     return 0
 }
@@ -119,8 +141,11 @@ _get_meta_signature() {
 
 _is_cache_valid() {
     # Fast check: core files must exist
-    for f in "$CACHE_META_FILE" "$CACHE_CONFIG_FILE" "$KERNEL_CACHE_FILE" "$CACHE_RULES_V4_FILE"; do
-        [ -f "$f" ] || return 1
+    for f in "$CACHE_META_FILE" "$CACHE_CONFIG_FILE" "$KERNEL_CACHE_FILE" "$CACHE_RULES_V4_FILE" "$CACHE_PBR_V4_FILE"; do
+        if [ ! -f "$f" ]; then
+            log_debug "Cache invalid: missing core file ${f##*/}"
+            return 1
+        fi
     done
     
     local current_sig
@@ -132,9 +157,21 @@ _is_cache_valid() {
         /^#/ { sub(/^#/, ""); print }
     ' "$CACHE_META_FILE" 2>/dev/null)
     
-    [ "$current_sig" = "$cached_sig" ] && { log_debug "Cache is valid"; return 0; }
+    if [ "$current_sig" = "$cached_sig" ]; then
+        log_debug "Cache is valid"
+        return 0
+    fi
     
+    # Debug mismatch
     log_debug "Cache signature mismatch"
+    # Show diff between signatures (ignoring # prefix in cached)
+    (
+        echo "Current signature:"
+        echo "$current_sig"
+        echo "Cached signature:"
+        echo "$cached_sig"
+    ) >&2
+    
     return 1
 }
 
@@ -211,6 +248,12 @@ MAC_PROXY_MODE=$MAC_PROXY_MODE
 MAC_LIST="$_mac_list"
 SKIP_CHECK_FEATURE=$SKIP_CHECK_FEATURE
 DEBOUNCE_INTERVAL=$DEBOUNCE_INTERVAL
+EXCLUDE_INTERFACES="$EXCLUDE_INTERFACES"
+ENABLE_CONNTRACK=$ENABLE_CONNTRACK
+CUSTOM_BYPASS_LIST="$CUSTOM_BYPASS_LIST"
+WAN_INBOUND_BYPASS=$WAN_INBOUND_BYPASS
+ENABLE_STATEFUL_SKIP=$ENABLE_STATEFUL_SKIP
+MSS_CLAMP_ENABLE=$MSS_CLAMP_ENABLE
 EOF
     
     log_debug "Config cache saved"
@@ -236,7 +279,12 @@ check_cache() {
         log_info "All caches are valid, skipping build"
     else
         log_info "Cache invalid or missing, rebuilding..."    
-        build_all_caches
+        if build_all_caches; then
+            return 0
+        else
+            log_error "Cache rebuild failed"
+            return 1
+        fi
     fi
     return 0
 }

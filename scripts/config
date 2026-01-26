@@ -67,10 +67,7 @@ _init_config_defaults() {
     : "${ENABLE_CONNTRACK:=1}"
     : "${CUSTOM_BYPASS_LIST:=}"
     : "${WAN_INBOUND_BYPASS:=1}"
-    : "${ENABLE_STATEFUL_SKIP:=1}"
     : "${MSS_CLAMP_ENABLE:=1}"
-    : "${SYSTEM_DNS_PASSTHROUGH:=0}"
-    : "${BLOCK_QUIC:=0}"
     return 0
 }
 
@@ -211,10 +208,7 @@ SKIP_CHECK_FEATURE:int:0:1
 DEBOUNCE_INTERVAL:int:0:300
 ENABLE_CONNTRACK:int:0:1
 WAN_INBOUND_BYPASS:int:0:1
-ENABLE_STATEFUL_SKIP:int:0:1
 MSS_CLAMP_ENABLE:int:0:1
-SYSTEM_DNS_PASSTHROUGH:int:0:1
-BLOCK_QUIC:int:0:1
 "
 
 _validate_settings() {

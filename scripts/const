@@ -45,7 +45,8 @@ readonly PACKAGES_LIST="/data/system/packages.list"
 
 readonly PID_FILE="$RUN_DIR/sing-box.pid"
 readonly MONITOR_PID_FILE="$RUN_DIR/ipmonitor.pid"
-readonly FIFO_FILE="$RUN_DIR/ipmonitor.fifo"
+readonly FIFO_FILE="$RUN_DIR/ip_monitor.fifo"
+readonly SRI_STATE_FILE="$RUN_DIR/sri_state_ips"
 readonly FLUX_LOG="$RUN_DIR/flux.log"
 readonly SING_BOX_LOG="$RUN_DIR/sing-box.log"
 
@@ -59,7 +60,6 @@ readonly CORE_SCRIPT="$SCRIPTS_DIR/core"
 readonly DISPATCHER_SCRIPT="$SCRIPTS_DIR/dispatcher"
 readonly INIT_SCRIPT="$SCRIPTS_DIR/init"
 readonly IP_MONITOR_SCRIPT="$SCRIPTS_DIR/ipmonitor"
-readonly IP_HANDLER_SCRIPT="$SCRIPTS_DIR/iphandler"
 readonly LOG_SCRIPT="$SCRIPTS_DIR/log"
 readonly RULES_SCRIPT="$SCRIPTS_DIR/rules"
 readonly TPROXY_SCRIPT="$SCRIPTS_DIR/tproxy"
@@ -76,6 +76,10 @@ readonly CACHE_RULES_V4_FILE="$CACHE_DIR/cache_rules_ipv4"
 readonly CACHE_RULES_V6_FILE="$CACHE_DIR/cache_rules_ipv6"
 readonly CACHE_CLEANUP_V4_FILE="$CACHE_DIR/cache_cleanup_ipv4"
 readonly CACHE_CLEANUP_V6_FILE="$CACHE_DIR/cache_cleanup_ipv6"
+readonly CACHE_PBR_V4_FILE="$CACHE_DIR/cache_pbr_ipv4"
+readonly CACHE_PBR_V6_FILE="$CACHE_DIR/cache_pbr_ipv6"
+readonly CACHE_PBR_CLEANUP_V4_FILE="$CACHE_DIR/cache_pbr_cleanup_ipv4"
+readonly CACHE_PBR_CLEANUP_V6_FILE="$CACHE_DIR/cache_pbr_cleanup_ipv6"
 
 # ==============================================================================
 # [ Tool & Template Resources ]
@@ -98,8 +102,10 @@ readonly GENERATE_FILE="$TOOLS_DIR/generate.ini"
 
 readonly PROXY_CHAINS="PROXY_PREROUTING PROXY_OUTPUT BYPASS_IP BYPASS_INTERFACE PROXY_INTERFACE DNS_HIJACK_PRE DNS_HIJACK_OUT APP_CHAIN MAC_CHAIN"
 
-readonly PRIVATE_SUBNETS_V4_COMPACT="0.0.0.0/8 10.0.0.0/8 100.0.0.0/8 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.0.0.0/24 192.0.2.0/24 192.88.99.0/24 192.168.0.0/16 198.51.100.0/24 203.0.113.0/24 224.0.0.0/4 240.0.0.0/4 255.255.255.255/32"
+# Optimized IP Bypasses for Android (Carrier-Safe + RFC 1918/6890/4193)
+# Removed documentation blocks (TEST-NET) and deprecated relay mechanisms (6to4, Teredo)
+readonly PRIVATE_SUBNETS_V4_COMPACT="0.0.0.0/8 10.0.0.0/8 100.0.0.0/8 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.0.0.0/24 192.168.0.0/16 224.0.0.0/4 240.0.0.0/4"
 
-readonly PRIVATE_SUBNETS_V6_COMPACT="::/128 ::1/128 ::ffff:0:0/96 100::/64 64:ff9b::/96 2001::/32 2001:10::/28 2001:20::/28 2001:db8::/32 2002::/16 fe80::/10 ff00::/8"
+readonly PRIVATE_SUBNETS_V6_COMPACT="::/128 ::1/128 ::ffff:0:0/96 100::/64 64:ff9b::/96 fc00::/7 fe80::/10 ff00::/8"
 
 

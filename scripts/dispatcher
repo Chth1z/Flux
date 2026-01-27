@@ -1,10 +1,9 @@
 #!/system/bin/sh
 
-# Flux Event Dispatcher
-# Central event handler for inotifyd events
-
-
-# Environment Setup
+# ==============================================================================
+# [ Flux Event Dispatcher ]
+# Description: Inotify event handler for module toggles and internal state changes.
+# ==============================================================================
 
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 . "$SCRIPT_DIR/const"
@@ -21,30 +20,36 @@ done
 
 export LOG_COMPONENT="Disp"
 
-# Helper Functions
+# ==============================================================================
+# [ Internal Component Control ]
+# ==============================================================================
 
 start_components() {
     [ -f "$MAGISK_MOD_DIR/disable" ] && { log_warn "Service disabled, ignoring start trigger"; return 0; }
-    sh "$CORE_SCRIPT" start &
-    sh "$TPROXY_SCRIPT" start &
+    sh "$CORE_SCRIPT" start < /dev/null &
+    sh "$TPROXY_SCRIPT" start < /dev/null &
     return 0
 }
 
 check_all_ready() {
     [ -f "$MAGISK_MOD_DIR/disable" ] && { log_warn "Service disabled, ignoring readiness trigger"; return; }
-    [ -f "$EVENTS_DIR/core_ok" ] && [ -f "$EVENTS_DIR/tproxy_ok" ] && {
-        rm -f "$EVENTS_DIR/core_ok" "$EVENTS_DIR/tproxy_ok"
-        nohup sh "$IP_MONITOR_SCRIPT" start &
-        sync_prop
-        log_info "Flux Service is READY"
-    }
+    
+    if [ -f "$EVENTS_DIR/core_ok" ] && [ -f "$EVENTS_DIR/tproxy_ok" ]; then
+        if mkdir "$READY_LOCK_DIR" 2>/dev/null; then
+            rm -f "$EVENTS_DIR/core_ok" "$EVENTS_DIR/tproxy_ok"
+            nohup sh "$IP_MONITOR_SCRIPT" start < /dev/null &
+            sync_prop
+            log_info "Flux Service is READY"
+            rmdir "$READY_LOCK_DIR" 2>/dev/null
+        fi
+    fi
     return 0
 }
 
 stop_components() {
-    sh "$CORE_SCRIPT" stop &
-    sh "$TPROXY_SCRIPT" stop &
-    sh "$IP_MONITOR_SCRIPT" stop &
+    sh "$CORE_SCRIPT" stop < /dev/null &
+    sh "$TPROXY_SCRIPT" stop < /dev/null &
+    sh "$IP_MONITOR_SCRIPT" stop < /dev/null &
     wait
     rm -f "$EVENTS_DIR/core_ok" "$EVENTS_DIR/tproxy_ok" 2>/dev/null
     sync_prop
@@ -63,7 +68,9 @@ rollback_components() {
     return 0
 }
 
-# Event Dispatch Logic
+# ==============================================================================
+# [ Event Dispatch Logic ]
+# ==============================================================================
 
 main() {
     [ -n "$FLUX_LOG" ] && [ ! -t 2 ] && exec 2>>"$FLUX_LOG"

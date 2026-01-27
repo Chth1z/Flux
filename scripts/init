@@ -1,10 +1,9 @@
 #!/system/bin/sh
 
-# Flux Initialization Script
-# Environment setup and cache building
-
-
-# Environment Setup
+# ==============================================================================
+# [ Flux Initialization Orchestrator ]
+# Description: Pre-flight integrity checks, environment setup, and log rotation.
+# ==============================================================================
 
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 . "$SCRIPT_DIR/const"
@@ -12,7 +11,9 @@ SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 
 export LOG_COMPONENT="Init"
 
-# Pre-flight Checks
+# ==============================================================================
+# [ Pre-flight Checks ]
+# ==============================================================================
 
 _check_integrity() {
     [ ! -f "$SING_BOX_BIN" ] && { log_error "Sing-box binary missing: $SING_BOX_BIN"; return 1; }
@@ -33,17 +34,22 @@ _cleanup_failure() {
     
     log_warn "Detected previous failure state, cleaning up..."
     # Simulate stop to cleanup any leftover processes/rules
-    sh "$CORE_SCRIPT" stop &
-    sh "$TPROXY_SCRIPT" stop &
-    sh "$IP_MONITOR_SCRIPT" stop &
+    sh "$CORE_SCRIPT" stop < /dev/null &
+    sh "$TPROXY_SCRIPT" stop < /dev/null &
+    sh "$IP_MONITOR_SCRIPT" stop < /dev/null &
     wait
     rm -f "$EVENTS_DIR/fail" "$EVENTS_DIR/core_ok" "$EVENTS_DIR/tproxy_ok" 2>/dev/null
     return 0
 }
 
-# Directory Initialization
+# ==============================================================================
+# [ Directory Initialization ]
+# ==============================================================================
 
 _init_dirs() {
+    # Ensure fresh state for events and locks
+    rmdir "$READY_LOCK_DIR" 2>/dev/null
+    
     local dir; for dir in "$RUN_DIR" "$CACHE_DIR" "$EVENTS_DIR"; do
         [ ! -d "$dir" ] && mkdir -p "$dir"
     done
@@ -51,14 +57,18 @@ _init_dirs() {
     return 0
 }
 
-# Subscription Update Trigger
+# ==============================================================================
+# [ Subscription Update Trigger ]
+# ==============================================================================
 
 _check_update() {
     log_debug "Checking for subscription updates"
     sh "$UPDATE_SCRIPT" check || log_debug "Update check completed"
 }
 
-# Log Maintenance
+# ==============================================================================
+# [ Log Maintenance ]
+# ==============================================================================
 
 _rotate_file() {
     local file="$1"
@@ -69,8 +79,8 @@ _rotate_file() {
     
     if [ "$sz" -gt "$LOG_MAX_SIZE" ]; then
         log_info "Rotating ${file##*/} (size: $sz)"
-        mv -f "$file" "${file}.bak"
-        : > "$file"
+        # Copy + Truncate: Safer for concurrent writers
+        cp -f "$file" "${file}.bak" && : > "$file"
     fi
 }
 
@@ -90,7 +100,9 @@ init_env() {
     return 0
 }
 
-# Startup Orchestration
+# ==============================================================================
+# [ Startup Orchestration ]
+# ==============================================================================
 
 main() {
     local action="${1:-}"

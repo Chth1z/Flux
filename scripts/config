@@ -1,28 +1,33 @@
 #!/system/bin/sh
 
-# Flux Configuration Module
-# Configuration loading and validation
+# ==============================================================================
+# [ Flux Configuration Module ]
+# Description: Schema-driven validation and dynamic JSON config extraction.
+# ==============================================================================
 
 
-# Config Loading - Data-Driven Approach
+# ==============================================================================
+# [ Configuration Management ]
+# ==============================================================================
 
+# Initialize default values for all supported configuration keys
 _init_config_defaults() {
-    # [ General ]
+    # [ General Configuration ]
     : "${SUBSCRIPTION_URL:=}"
     : "${UPDATE_TIMEOUT:=15}"
     : "${RETRY_COUNT:=2}"
     : "${UPDATE_INTERVAL:=86400}"
 
-    # [ Logging ]
+    # [ Logging & Debugging ]
     : "${LOG_LEVEL:=3}"
     : "${LOG_MAX_SIZE:=1048576}"
 
-    # [ Core ]
+    # [ Core Process ]
     : "${CORE_USER:=root}"
     : "${CORE_GROUP:=root}"
     : "${CORE_TIMEOUT:=5}"
 
-    # [ Proxy Mode ]
+    # [ Proxy Engine ]
     : "${PROXY_MODE:=0}"
     : "${DNS_HIJACK_ENABLE:=1}"
     : "${DNS_PORT:=1053}"
@@ -31,13 +36,13 @@ _init_config_defaults() {
     : "${FAKEIP_RANGE_V4:=198.18.0.0/15}"
     : "${FAKEIP_RANGE_V6:=fc00::/18}"
 
-    # [ Network ]
+    # [ Network Interfaces ]
     : "${MOBILE_INTERFACE:=rmnet_data+}"
     : "${WIFI_INTERFACE:=wlan0}"
     : "${HOTSPOT_INTERFACE:=wlan2}"
     : "${USB_INTERFACE:=rndis+}"
 
-    # [ Proxy Scope ]
+    # [ Proxy Granularity ]
     : "${PROXY_MOBILE:=1}"
     : "${PROXY_WIFI:=1}"
     : "${PROXY_HOTSPOT:=0}"
@@ -46,36 +51,32 @@ _init_config_defaults() {
     : "${PROXY_UDP:=1}"
     : "${PROXY_IPV6:=0}"
 
-    # [ Routing ]
+    # [ Network & Routing ]
     : "${TABLE_ID:=2025}"
     : "${MARK_VALUE:=20}"
     : "${MARK_VALUE6:=25}"
     : "${ROUTING_MARK:=}"
 
-    # [ App Proxy ]
+    # [ Application Filtering ]
     : "${APP_PROXY_MODE:=0}"
     : "${APP_LIST:=}"
 
-    # [ MAC Filter ]
-    : "${MAC_PROXY_MODE:=0}"
-    : "${MAC_LIST:=}"
-
-    # [ Advanced ]
+    # [ Performance & Compatibility ]
     : "${SKIP_CHECK_FEATURE:=0}"
+    : "${ENABLE_CONNTRACK:=1}"
+    : "${MSS_CLAMP_ENABLE:=1}"
     : "${DEBOUNCE_INTERVAL:=10}"
     : "${EXCLUDE_INTERFACES:=}"
-    : "${ENABLE_CONNTRACK:=1}"
-    : "${CUSTOM_BYPASS_LIST:=}"
-    : "${WAN_INBOUND_BYPASS:=1}"
-    : "${MSS_CLAMP_ENABLE:=1}"
     return 0
 }
 
+# Dynamically extract runtime ports and ranges from sing-box JSON configuration
+# This ensures that Flux logic automatically aligns with sing-box settings.
 _extract_json_config() {
     local jq_bin="$TOOLS_DIR/jq"
     [ -x "$jq_bin" ] && [ -f "$CONFIG_FILE" ] || return 0
     
-    # Robust JQ extraction: Port and FakeIP ranges
+    # Extract Proxy Port and FakeIP ranges via JQ
     local json_output
     json_output=$("$jq_bin" -r '
         [
@@ -93,7 +94,7 @@ _extract_json_config() {
         PROXY_UDP_PORT="$extracted_port"
     fi
     
-    # Assign with validation (basic syntax check)
+    # Assign extracted ranges with basic syntax validation
     case "$v4" in *"/"[0-9]*) FAKEIP_RANGE_V4="$v4" ;; esac
     case "$v6" in *":"*"/"[0-9]*) FAKEIP_RANGE_V6="$v6" ;; esac
     return 0
@@ -168,10 +169,23 @@ _validate_iface() {
     return 0
 }
 
+_validate_iface_list() {
+    local name="$1" val="$2"
+    [ -z "$val" ] && return 0
+    
+    local iface
+    for iface in $val; do
+        _validate_iface "$name" "$iface" || return 1
+    done
+    return 0
+}
+
 # ==============================================================================
 # [ Schema-Driven Validation ]
 # ==============================================================================
 
+# Declare a data-driven validation schema for all settings
+# Format: KEY:TYPE[:MIN:MAX]
 VALIDATION_SCHEMA="
 SUBSCRIPTION_URL:url
 UPDATE_TIMEOUT:int:1:300
@@ -203,14 +217,14 @@ MARK_VALUE:int:1:65535
 MARK_VALUE6:int:1:65535
 ROUTING_MARK:int:0:65535
 APP_PROXY_MODE:int:0:2
-MAC_PROXY_MODE:int:0:2
 SKIP_CHECK_FEATURE:int:0:1
-DEBOUNCE_INTERVAL:int:0:300
 ENABLE_CONNTRACK:int:0:1
-WAN_INBOUND_BYPASS:int:0:1
 MSS_CLAMP_ENABLE:int:0:1
+DEBOUNCE_INTERVAL:int:0:300
+EXCLUDE_INTERFACES:iflist
 "
 
+# Iterate through the schema and validate each current variable value
 _validate_settings() {
     log_debug "Validating runtime settings..."
     local valid=0 name type p1 p2 val
@@ -218,15 +232,16 @@ _validate_settings() {
     while IFS=: read -r name type p1 p2 || [ -n "$name" ]; do
         [ -z "$name" ] || [ "${name#\#}" != "$name" ] && continue
         
-        # Prevent eval injection
+        # Security: Prevent eval injection via variable names
         case "$name" in *[!a-zA-Z0-9_]*) continue ;; esac
         eval "val=\$$name"
         
         case "$type" in
-            int)   _validate_int "$name" "$val" "$p1" "$p2" || valid=1 ;;
-            iface) _validate_iface "$name" "$val" || valid=1 ;;
-            user)  _validate_user_group "$name" "$val" || valid=1 ;;
-            url)   _validate_url "$name" "$val" || valid=1 ;;
+            int)    _validate_int "$name" "$val" "$p1" "$p2" || valid=1 ;;
+            iface)  _validate_iface "$name" "$val" || valid=1 ;;
+            iflist) _validate_iface_list "$name" "$val" || valid=1 ;;
+            user)   _validate_user_group "$name" "$val" || valid=1 ;;
+            url)    _validate_url "$name" "$val" || valid=1 ;;
         esac
     done << EOF
 $VALIDATION_SCHEMA
@@ -235,10 +250,9 @@ EOF
     return "$valid"
 }
 
-# ==============================================================================
-# [ sing-box Config Validation ]
-# ==============================================================================
+# ------------------------------------------------------------------------------
 
+# Use sing-box binary to verify the core JSON configuration
 _validate_singbox_config() {
     log_debug "Validating sing-box configuration..."
     
@@ -261,11 +275,12 @@ _validate_singbox_config() {
 }
 
 # ==============================================================================
-# [ Main Entry Point ]
+# [ Public Configuration API ]
 # ==============================================================================
 
+# Perform a full system configuration audit
 validate_all() {
-    # 1. Load settings with syntax check
+    # 1. Verify and sourge user settings
     if [ -f "$SETTINGS_FILE" ]; then
         if ! sh -n "$SETTINGS_FILE" 2>/dev/null; then
             log_error "Syntax error in $SETTINGS_FILE"
@@ -274,10 +289,11 @@ validate_all() {
         . "$SETTINGS_FILE"
     fi
     
+    # 2. Populate defaults and extract dynamic config
     _init_config_defaults
     _extract_json_config
     
-    # 2. Sequential validation
+    # 3. Perform schema and binary validation
     local errors
     errors=$(
         _validate_settings

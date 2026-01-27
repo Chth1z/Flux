@@ -1,9 +1,9 @@
 #!/system/bin/sh
 
-# Flux Boot Service
-# Android boot initialization and launcher
-
-# Constants
+# ==============================================================================
+# [ Flux Boot Service ]
+# Description: Android boot initialization, state detection, and dispatcher launcher.
+# ==============================================================================
 
 . "/data/adb/flux/scripts/const"
 . "/data/adb/flux/scripts/log"
@@ -17,7 +17,9 @@ for file in "$CACHE_CONFIG_FILE" "$SETTINGS_FILE"; do
     fi
 done
 
-# Boot Detection
+# ==============================================================================
+# [ Boot Detection ]
+# ==============================================================================
 
 _wait_for_boot() {
     local count=0
@@ -32,7 +34,14 @@ _wait_for_boot() {
     return 1
 }
 
-# Inotify Event Watcher
+# ==============================================================================
+# [ Inotify Event Watcher ]
+# ==============================================================================
+
+# Background event listener powered by inotifyd.
+# Responsibilities:
+# 1. Monitors the Magisk 'disable' toggle for real-time service start/stop.
+# 2. Listens for internal project events (e.g., readiness flags) in the RUN_DIR.
 
 _start_inotify_module() {
     [ -f "$DISPATCHER_SCRIPT" ] && [ ! -x "$DISPATCHER_SCRIPT" ] && chmod +x "$DISPATCHER_SCRIPT" 2>/dev/null
@@ -44,7 +53,9 @@ _start_inotify_module() {
     return 0
 }
 
-# Execution entry point
+# ==============================================================================
+# [ Execution Entry Point ]
+# ==============================================================================
 
 main() {
     [ -n "$FLUX_LOG" ] && [ ! -t 2 ] && exec 2>>"$FLUX_LOG"

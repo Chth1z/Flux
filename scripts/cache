@@ -1,10 +1,9 @@
 #!/system/bin/sh
 
-# Flux Cache Manager
-# Orchestrates validation, generation, and loading of all caches
-
-
-# Environment Setup
+# ==============================================================================
+# [ Flux Cache Manager ]
+# Description: Rules generation, kernel feature detection, and environment fingerprinting.
+# ==============================================================================
 
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 . "$SCRIPT_DIR/const"
@@ -14,7 +13,9 @@ SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 
 export LOG_COMPONENT="Cach"
 
-# Rules Cache Management
+# ==============================================================================
+# [ Rules Cache Management ]
+# ==============================================================================
 
 _save_rules_cache() {
     local mode="tproxy"
@@ -24,28 +25,25 @@ _save_rules_cache() {
     
     mkdir -p "$(dirname "$CACHE_RULES_V4_FILE")" 2>/dev/null
     
-    # 1. IPTables Rules
+    # 1. IPTables Rules (The primary driver)
     generate_all_rules "4" "$mode" > "$CACHE_RULES_V4_FILE"
     generate_all_cleanup_rules "4" "$mode" > "$CACHE_CLEANUP_V4_FILE"
-    
-    # 2. PBR (Routing) Rules
-    generate_all_pbr_rules "4" > "$CACHE_PBR_V4_FILE"
-    generate_all_pbr_cleanup_rules "4" > "$CACHE_PBR_CLEANUP_V4_FILE"
     
     if [ "$PROXY_IPV6" = "1" ]; then
         generate_all_rules "6" "$mode" > "$CACHE_RULES_V6_FILE"
         generate_all_cleanup_rules "6" "$mode" > "$CACHE_CLEANUP_V6_FILE"
-        
-        generate_all_pbr_rules "6" > "$CACHE_PBR_V6_FILE"
-        generate_all_pbr_cleanup_rules "6" > "$CACHE_PBR_CLEANUP_V6_FILE"
     fi
     
-    log_debug "Rules & PBR cache saved (mode: $mode)"
+    log_debug "Iptables Rules cache saved (mode: $mode)"
     return 0
 }
 
-# Kernel Feature Detection Cache
+# ==============================================================================
+# [ Kernel Feature Detection Cache ]
+# ==============================================================================
 
+# Detect and cache available kernel networking features to optimize rule selection.
+# Prioritizes /proc/config.gz if available, falling back to experimental probe logic.
 _save_kernel_cache() {
     local current_kernel
     current_kernel=$(uname -r 2>/dev/null)
@@ -72,16 +70,15 @@ _save_kernel_cache() {
             /CONFIG_NETFILTER_XT_MATCH_MARK=[ym]/ { m=1 }
             /CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=[ym]/ { a=1 }
             /CONFIG_NETFILTER_XT_MATCH_CONNTRACK=[ym]/ { c=1 }
-            /CONFIG_NETFILTER_XT_MATCH_MAC=[ym]/ { ma=1 }
             /CONFIG_IP6_NF_NAT=[ym]/ { i=1 }
             END {
-                printf "KFEAT_TPROXY=%d;KFEAT_OWNER=%d;KFEAT_MARK=%d;KFEAT_ADDRTYPE=%d;KFEAT_CONNTRACK=%d;KFEAT_MAC=%d;KFEAT_IPV6_NAT=%d", 
-                       t+0, o+0, m+0, a+0, c+0, ma+0, i+0
+                printf "KFEAT_TPROXY=%d;KFEAT_OWNER=%d;KFEAT_MARK=%d;KFEAT_ADDRTYPE=%d;KFEAT_CONNTRACK=%d;KFEAT_IPV6_NAT=%d", 
+                       t+0, o+0, m+0, a+0, c+0, i+0
             }
         ')
     else
         log_warn "/proc/config.gz missing, falling back to module/trial detection"
-        local t=0 o=0 m=0 a=0 c=0 ma=0 i=0
+        local t=0 o=0 m=0 a=0 c=0 i=0
         
         # Simple match detection via /proc/net/ip_tables_matches
         grep -qw "tproxy" /proc/net/ip_tables_targets 2>/dev/null && t=1
@@ -93,7 +90,7 @@ _save_kernel_cache() {
         # Trial detection for cases where modules aren't listed yet
         [ "$t" = "0" ] && iptables -t mangle -A OUTPUT -p tcp -j TPROXY --on-port 1536 --tproxy-mark 0x1 2>/dev/null && { t=1; iptables -t mangle -D OUTPUT -p tcp -j TPROXY --on-port 1536 --tproxy-mark 0x1 2>/dev/null; }
         
-        features="KFEAT_TPROXY=$t;KFEAT_OWNER=$o;KFEAT_MARK=$m;KFEAT_ADDRTYPE=$a;KFEAT_CONNTRACK=$c;KFEAT_MAC=1;KFEAT_IPV6_NAT=1"
+        features="KFEAT_TPROXY=$t;KFEAT_OWNER=$o;KFEAT_MARK=$m;KFEAT_ADDRTYPE=$a;KFEAT_CONNTRACK=$c;KFEAT_IPV6_NAT=1"
     fi
     
     # Batch export and prepare file content
@@ -113,7 +110,12 @@ _save_kernel_cache() {
 }
 
 
-# Meta Cache (Environmental Fingerprint)
+# ==============================================================================
+# [ Meta Cache (Environmental Fingerprint) ]
+# ==============================================================================
+
+# Verify if the current environment matches the cached state.
+# Compares a cryptographic-like signature derived from file mtimes and kernel version.
 
 _get_mtime() {
     local file="$1"
@@ -141,7 +143,7 @@ _get_meta_signature() {
 
 _is_cache_valid() {
     # Fast check: core files must exist
-    for f in "$CACHE_META_FILE" "$CACHE_CONFIG_FILE" "$KERNEL_CACHE_FILE" "$CACHE_RULES_V4_FILE" "$CACHE_PBR_V4_FILE"; do
+    for f in "$CACHE_META_FILE" "$CACHE_CONFIG_FILE" "$KERNEL_CACHE_FILE" "$CACHE_RULES_V4_FILE"; do
         if [ ! -f "$f" ]; then
             log_debug "Cache invalid: missing core file ${f##*/}"
             return 1
@@ -175,6 +177,7 @@ _is_cache_valid() {
     return 1
 }
 
+# Save a snapshot of the current environment state for future validation.
 _save_meta_cache() {
     local sig
     sig=$(_get_meta_signature)
@@ -190,8 +193,9 @@ _save_meta_cache() {
     return 0
 }
 
-
-# Config Cache generation
+# ==============================================================================
+# [ Config Cache Generation ]
+# ==============================================================================
 
 _normalize_list() {
     echo "$1" | awk '{
@@ -205,9 +209,8 @@ _normalize_list() {
 _save_config_cache() {
     mkdir -p "$(dirname "$CACHE_CONFIG_FILE")" 2>/dev/null
     
-    local _app_list _mac_list
+    local _app_list
     _app_list=$(_normalize_list "$APP_LIST")
-    _mac_list=$(_normalize_list "$MAC_LIST")
     
     cat > "$CACHE_CONFIG_FILE" << EOF
 # Flux Config Cache - Auto Generated
@@ -244,16 +247,11 @@ MARK_VALUE6=$MARK_VALUE6
 ROUTING_MARK="$ROUTING_MARK"
 APP_PROXY_MODE=$APP_PROXY_MODE
 APP_LIST="$_app_list"
-MAC_PROXY_MODE=$MAC_PROXY_MODE
-MAC_LIST="$_mac_list"
 SKIP_CHECK_FEATURE=$SKIP_CHECK_FEATURE
+ENABLE_CONNTRACK=$ENABLE_CONNTRACK
+MSS_CLAMP_ENABLE=$MSS_CLAMP_ENABLE
 DEBOUNCE_INTERVAL=$DEBOUNCE_INTERVAL
 EXCLUDE_INTERFACES="$EXCLUDE_INTERFACES"
-ENABLE_CONNTRACK=$ENABLE_CONNTRACK
-CUSTOM_BYPASS_LIST="$CUSTOM_BYPASS_LIST"
-WAN_INBOUND_BYPASS=$WAN_INBOUND_BYPASS
-ENABLE_STATEFUL_SKIP=$ENABLE_STATEFUL_SKIP
-MSS_CLAMP_ENABLE=$MSS_CLAMP_ENABLE
 EOF
     
     log_debug "Config cache saved"
@@ -261,8 +259,11 @@ EOF
 }
 
 
-# Main Cache Builder Logic
+# ==============================================================================
+# [ Main Cache Orchestration ]
+# ==============================================================================
 
+# Sequential build of all project caches.
 build_all_caches() {
     run "Validate system config" validate_all || return 1
     run "Save kernel capability" _save_kernel_cache || return 1

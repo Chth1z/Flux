@@ -1,10 +1,9 @@
 #!/system/bin/sh
 
-# Flux Subscription Updater
-# Synchronizes nodes and templates
-
-
-# Environment Setup
+# ==============================================================================
+# [ Flux Subscription Updater ]
+# Description: Synchronizes nodes and templates via one-pass JQ merging logic.
+# ==============================================================================
 
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 . "$SCRIPT_DIR/const"
@@ -13,7 +12,15 @@ SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 LOG_COMPONENT="Updt"
 TMP_CONFIG=""
 
-# JQ Processing Logic
+# ==============================================================================
+# [ JQ Processing Logic ]
+# ==============================================================================
+
+# Highly optimized one-pass JQ script to merge subscription nodes into the template.
+# Technical Details:
+# 1. Extracts valid outbound nodes from subscription (filtering out infrastructure metadata).
+# 2. Assigns consistent labels and IDs for internal routing consistency.
+# 3. Merges the resulting node array into the base sing-box JSON template.
 
 # One-pass JQ script to merge subscription nodes into the template
 # 1. Extracts valid nodes from subscription (excluding infra types like dns/direct)
@@ -68,7 +75,9 @@ readonly JQ_SCRIPT_ONE_PASS='
     .outbounds += $valid_nodes
 '
 
-# Helper functions
+# ==============================================================================
+# [ Internal Helper Functions ]
+# ==============================================================================
 
 _cleanup() {
     log_debug "Cleaning up updater artifacts..."
@@ -88,7 +97,9 @@ _retry() {
     return 1
 }
 
-# Update pipeline steps
+# ==============================================================================
+# [ Update Pipeline Steps ]
+# ==============================================================================
 
 _init_update() {
     [ -n "$SUBSCRIPTION_URL" ] || { log_error "No subscription URL configured"; return 1; }
@@ -112,10 +123,13 @@ _init_update() {
 
 _convert_subscription() {
     # Generate subconverter config dynamically
+    local safe_url
+    safe_url=$(printf '%s' "$SUBSCRIPTION_URL" | tr -d '\n\r ' | sed 's/[;#].*//')
+    
     cat > "$GENERATE_FILE" <<EOF
 [singbox_conversion]
 target=singbox
-url=$SUBSCRIPTION_URL
+url=$safe_url
 path=$TMP_SUB_CONVERTED
 EOF
 
@@ -165,7 +179,9 @@ _validate_config() {
     return 0
 }
 
-# Main Update Orchestration
+# ==============================================================================
+# [ Main Update Orchestration ]
+# ==============================================================================
 
 should_update() {
     [ ! -f "$CONFIG_FILE" ] && return 0
@@ -201,7 +217,9 @@ do_update() {
     return 0
 }
 
-# Entry point
+# ==============================================================================
+# [ Execution Entry Point ]
+# ==============================================================================
 
 main() {
     trap _cleanup EXIT INT TERM

@@ -1,10 +1,9 @@
 #!/system/bin/sh
 
-# Flux Core Management
-# sing-box process control and monitoring
-
-
-# Environment Setup
+# ==============================================================================
+# [ Flux Proxy Core Controller ]
+# Description: Lifecycle management for the sing-box engine (start, stop, wait).
+# ==============================================================================
 
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 . "$SCRIPT_DIR/const"
@@ -12,7 +11,9 @@ SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 
 export LOG_COMPONENT="Core"
 
-# Helper Functions
+# ==============================================================================
+# [ Internal Helper Functions ]
+# ==============================================================================
 
 _launch_singbox() {
     ulimit -SHn 1000000 2>/dev/null
@@ -22,9 +23,9 @@ _launch_singbox() {
     local pid
     
     if command -v busybox >/dev/null 2>&1 && [ "$run_as" != "root:root" ]; then
-        nohup busybox setuidgid "$run_as" $cmd >> "$FLUX_LOG" 2>&1 &
+        nohup busybox setuidgid "$run_as" $cmd >> "$FLUX_LOG" 2>&1 < /dev/null &
     else
-        nohup $cmd >> "$FLUX_LOG" 2>&1 &
+        nohup $cmd >> "$FLUX_LOG" 2>&1 < /dev/null &
     fi
     
     pid=$!
@@ -77,6 +78,8 @@ _is_process_running() {
     [ -n "$pid" ] && [ -d "/proc/$pid" ]
 }
 
+# Gracefully terminate the proxy core process.
+# Attempts SIGTERM first, then escalates to SIGKILL if grace period expires.
 _kill_core() {
     local pid; pid=$(_get_pid)
     [ -z "$pid" ] && return 0
@@ -100,7 +103,9 @@ _kill_core() {
     return 0
 }
 
-# Public Control API (Start)
+# ==============================================================================
+# [ Public Control API ]
+# ==============================================================================
 
 start_core() {
     run "Launch singbox" _launch_singbox || { touch "$EVENTS_DIR/fail"; return 1; }
@@ -117,8 +122,9 @@ stop_core() {
     return 0
 }
 
-# Main entry point
-
+# ==============================================================================
+# [ Main Execution Entry ]
+# ==============================================================================
 main() {
     local action="${1:-}"
     

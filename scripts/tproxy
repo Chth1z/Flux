@@ -1,9 +1,9 @@
 #!/system/bin/sh
 
-# Flux TProxy Management
-# Apply cached rules and manage routing tables
-
-# Environment Setup
+# ==============================================================================
+# [ Flux TProxy & Routing Manager ]
+# Description: Atomic iptables-restore application and PBR routing management.
+# ==============================================================================
 
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 . "$SCRIPT_DIR/const"
@@ -11,41 +11,20 @@ SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 
 export LOG_COMPONENT="Tprx"
 
-# Proxy Mode Detection
+# ==============================================================================
+# [ Mode Detection & Helpers ]
+# ==============================================================================
 
-_check_tproxy_support() {
-    if [ "$KFEAT_TPROXY" = "1" ]; then
-        return 0
-    else
-        return 1
-    fi
-}
 
 # Detect proxy mode based on config and kernel support
-# Sets: USE_TPROXY (1=tproxy, 0=redirect)
-_detect_proxy_mode() {
-    # Default to TPROXY
-    USE_TPROXY=1
-    
-    # Check 1: Kernel Support
-    if ! _check_tproxy_support; then
-        log_warn "Kernel does not support TPROXY, falling back to REDIRECT"
-        USE_TPROXY=0
-    # Check 2: User Config (0=Auto, 1=TProxy, 2=Redirect)
-    elif [ "$PROXY_MODE" = "2" ]; then
-        log_info "TPROXY is disabled by config, using REDIRECT"
-        USE_TPROXY=0
-    fi
-    
-    if [ "$USE_TPROXY" = "1" ]; then
-        log_debug "Using TPROXY mode"
-    else
-        log_debug "Using REDIRECT mode"
-    fi
-    return 0
+_get_proxy_mode() {
+    # 0=Auto (Check kernel), 1=TProxy (Force), 2=Redirect (Force)
+    [ "$KFEAT_TPROXY" = "1" ] && [ "$PROXY_MODE" != "2" ] && echo "tproxy" || echo "redirect"
 }
 
-# Command Wrappers for locking and families
+# ==============================================================================
+# [ Command Wrappers ]
+# ==============================================================================
 
 # Generic wrapper for iptables/ip6tables with wait lock
 _run_ipt_command() {
@@ -58,7 +37,9 @@ _ip6_rule()   { command ip -6 rule "$@"; }
 _ip_route()   { command ip route "$@"; }
 _ip6_route()  { command ip -6 route "$@"; }
 
-# Rule Management (Apply/Cleanup)
+# ==============================================================================
+# [ Rule Management (Apply/Cleanup) ]
+# ==============================================================================
 
 # Apply or Cleanup cached rules atomically
 _manage_proxy_rules() {
@@ -92,34 +73,12 @@ _manage_proxy_rules() {
     return 0
 }
 
-# Apply or Cleanup cached PBR (Routing) policies
-_manage_pbr_policies() {
-    local family="$1"
-    local action="$2" # "apply" or "cleanup"
-    
-    local pbr_file
-    if [ "$family" = "6" ]; then
-        [ "$action" = "apply" ] && pbr_file="$CACHE_PBR_V6_FILE" || pbr_file="$CACHE_PBR_CLEANUP_V6_FILE"
-    else
-        [ "$action" = "apply" ] && pbr_file="$CACHE_PBR_V4_FILE" || pbr_file="$CACHE_PBR_CLEANUP_V4_FILE"
-    fi
+# ==============================================================================
+# [ Routing Table Management ]
+# ==============================================================================
 
-    [ "$action" = "apply" ] && [ ! -f "$pbr_file" ] && { log_error "PBR cache not found: $pbr_file"; return 1; }
-
-    # Execute PBR commands
-    if [ -s "$pbr_file" ]; then
-        local err_out
-        if ! err_out=$(sh "$pbr_file" 2>&1); then
-            log_error "PBR policy application failed for IPv$family"
-            echo "$err_out" | while read -r line; do log_error "  >> $line"; done
-            return 1
-        fi
-    fi
-    return 0
-}
-
-# Routing Table Management
-
+# Highly optimized routing table management for TProxy
+# Uses a deterministic preference (pref == table_id) to avoid conflicts.
 _manage_routing() {
     local family="$1"
     local action="$2" # "setup" or "cleanup"
@@ -134,14 +93,16 @@ _manage_routing() {
         ip_cmd="_ip6"
     fi
 
-    # Always cleanup first to ensure idempotency
-    "${ip_cmd}_rule" del fwmark "$mark" lookup "$TABLE_ID" pref "$TABLE_ID" 2>/dev/null || true
-    "${ip_cmd}_route" del local "$target" dev lo table "$TABLE_ID" 2>/dev/null || true
-
     if [ "$action" = "setup" ]; then
+        # Ensure clean state by attempting deletion first (ignores errors if non-existent)
+        "${ip_cmd}_rule" del fwmark "$mark" table "$TABLE_ID" pref "$TABLE_ID" 2>/dev/null
+        "${ip_cmd}_route" del local "$target" dev lo table "$TABLE_ID" 2>/dev/null
+
+        # Atomically apply new routing
         "${ip_cmd}_rule" add fwmark "$mark" table "$TABLE_ID" pref "$TABLE_ID" || return 1
         "${ip_cmd}_route" add local "$target" dev lo table "$TABLE_ID" || {
-            "${ip_cmd}_rule" del fwmark "$mark" table "$TABLE_ID" pref "$TABLE_ID" 2>/dev/null || true
+            log_error "Failed to setup $family local route"
+            "${ip_cmd}_rule" del fwmark "$mark" table "$TABLE_ID" pref "$TABLE_ID" 2>/dev/null
             return 1
         }
         
@@ -153,45 +114,51 @@ _manage_routing() {
             printf '1\n' > /proc/sys/net/ipv6/conf/all/forwarding
             printf '1\n' > /proc/sys/net/ipv6/conf/default/forwarding
         fi
+    elif [ "$action" = "cleanup" ]; then
+        "${ip_cmd}_rule" del fwmark "$mark" table "$TABLE_ID" pref "$TABLE_ID" 2>/dev/null || true
+        "${ip_cmd}_route" del local "$target" dev lo table "$TABLE_ID" 2>/dev/null || true
     fi
     return 0
 }
 
-# Main Execution API
+# Clear conntrack entries to force state re-evaluation after rule changes.
+_purge_conntrack() {
+    [ "$ENABLE_CONNTRACK" = "1" ] || return 0
+    if command -v conntrack >/dev/null 2>&1; then
+        log_debug "Purging stale conntrack entries..."
+        # Purge by mark values to clear any previous proxy/bypass states
+        conntrack -D -m "$MARK_VALUE" >/dev/null 2>&1 || true
+        [ "$PROXY_IPV6" = "1" ] && conntrack -D -m "$MARK_VALUE6" >/dev/null 2>&1 || true
+        conntrack -D -m 0x11 >/dev/null 2>&1 || true
+    fi
+}
+
+# ==============================================================================
+# [ Main Execution API ]
+# ==============================================================================
 
 _manage_all() {
     local action="$1" # "start" or "stop"
-    local proxy_action="apply"
-    local route_action="setup"
-    [ "$action" = "stop" ] && { proxy_action="cleanup"; route_action="cleanup"; }
+    local mode; mode=$(_get_proxy_mode)
+    local proxy_action="apply"; [ "$action" = "stop" ] && proxy_action="cleanup"
+    local route_action="setup"; [ "$action" = "stop" ] && route_action="cleanup"
 
-    _detect_proxy_mode
-    local mode="tproxy"
-    [ "$USE_TPROXY" = "0" ] && mode="redirect"
+    [ "$action" = "start" ] && _purge_conntrack
 
-    # Process families
-    local families="4"
-    [ "$PROXY_IPV6" = "1" ] && families="4 6"
+    log_debug "Hybrid-RCI $action (mode: $mode)"
 
+    local families="4"; [ "$PROXY_IPV6" = "1" ] && families="4 6"
     for f in $families; do
-        local label="IPv${f}"
-        
-        # 1. IPTables Rules
-        run "Manage $label rules ($proxy_action)" _manage_proxy_rules "$f" "$proxy_action" || \
+        run "Manage IPv$f rules ($proxy_action)" _manage_proxy_rules "$f" "$proxy_action" || \
             { [ "$action" = "start" ] && touch "$EVENTS_DIR/fail"; return 1; }
         
-        # 2. PBR Policies (App)
-        run "Manage $label PBR policies ($proxy_action)" _manage_pbr_policies "$f" "$proxy_action" || \
-            { [ "$action" = "start" ] && touch "$EVENTS_DIR/fail"; return 1; }
-        
-        # 3. Routing Tables
-        if [ "$mode" = "tproxy" ]; then
-            run "Manage $label routing ($route_action)" _manage_routing "$f" "$route_action" || \
+        [ "$mode" = "tproxy" ] && {
+            run "Manage IPv$f routing ($route_action)" _manage_routing "$f" "$route_action" || \
                 { [ "$action" = "start" ] && touch "$EVENTS_DIR/fail"; return 1; }
-        fi
+        }
     done
 
-    [ "$action" = "start" ] && { log_debug "Hybrid-RCI started (mode: $mode)"; touch "$EVENTS_DIR/tproxy_ok"; }
+    [ "$action" = "start" ] && touch "$EVENTS_DIR/tproxy_ok"
     return 0
 }
 

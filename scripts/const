@@ -1,8 +1,8 @@
 #!/system/bin/sh
 
 # ==============================================================================
-# Flux Constants (flux.const)
-# Description: All path, state, and network constant definitions
+# [ Flux Project Constants ]
+# Description: Unified path, state, and network constant definitions.
 # ==============================================================================
 
 
@@ -49,6 +49,7 @@ readonly FIFO_FILE="$RUN_DIR/ip_monitor.fifo"
 readonly SRI_STATE_FILE="$RUN_DIR/sri_state_ips"
 readonly FLUX_LOG="$RUN_DIR/flux.log"
 readonly SING_BOX_LOG="$RUN_DIR/sing-box.log"
+readonly READY_LOCK_DIR="$EVENTS_DIR/.ready.lock"
 
 # ==============================================================================
 # [ Internal Scripts ]
@@ -76,10 +77,6 @@ readonly CACHE_RULES_V4_FILE="$CACHE_DIR/cache_rules_ipv4"
 readonly CACHE_RULES_V6_FILE="$CACHE_DIR/cache_rules_ipv6"
 readonly CACHE_CLEANUP_V4_FILE="$CACHE_DIR/cache_cleanup_ipv4"
 readonly CACHE_CLEANUP_V6_FILE="$CACHE_DIR/cache_cleanup_ipv6"
-readonly CACHE_PBR_V4_FILE="$CACHE_DIR/cache_pbr_ipv4"
-readonly CACHE_PBR_V6_FILE="$CACHE_DIR/cache_pbr_ipv6"
-readonly CACHE_PBR_CLEANUP_V4_FILE="$CACHE_DIR/cache_pbr_cleanup_ipv4"
-readonly CACHE_PBR_CLEANUP_V6_FILE="$CACHE_DIR/cache_pbr_cleanup_ipv6"
 
 # ==============================================================================
 # [ Tool & Template Resources ]
@@ -97,15 +94,15 @@ readonly TMP_SUB_CONVERTED="$RUN_DIR/sub_temp.json"
 readonly GENERATE_FILE="$TOOLS_DIR/generate.ini"
 
 # ==============================================================================
-# [ Network Constants ]
+# [ Network & Routing Constants ]
 # ==============================================================================
 
-readonly PROXY_CHAINS="PROXY_PREROUTING PROXY_OUTPUT BYPASS_IP BYPASS_INTERFACE PROXY_INTERFACE DNS_HIJACK_PRE DNS_HIJACK_OUT APP_CHAIN MAC_CHAIN"
+# Chain names for Proxy and Bypass logic
+readonly PROXY_CHAINS="PROXY_PREROUTING PROXY_OUTPUT BYPASS_IP BYPASS_INTERFACE DNS_HIJACK_PRE DNS_HIJACK_OUT APP_CHAIN"
 
 # Optimized IP Bypasses for Android (Carrier-Safe + RFC 1918/6890/4193)
-# Removed documentation blocks (TEST-NET) and deprecated relay mechanisms (6to4, Teredo)
+# These represent subnets that should ALWAYS bypass the proxy (Local/Private/Multicast)
 readonly PRIVATE_SUBNETS_V4_COMPACT="0.0.0.0/8 10.0.0.0/8 100.0.0.0/8 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.0.0.0/24 192.168.0.0/16 224.0.0.0/4 240.0.0.0/4"
-
 readonly PRIVATE_SUBNETS_V6_COMPACT="::/128 ::1/128 ::ffff:0:0/96 100::/64 64:ff9b::/96 fc00::/7 fe80::/10 ff00::/8"
 
 

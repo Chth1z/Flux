@@ -1,6 +1,9 @@
 #!/system/bin/sh
 
-# Flux-SRI (State-driven Routing Injector) Core
+# ==============================================================================
+# [ Flux IP Monitor (SRI) ]
+# Description: Real-time network address monitoring and Selective Routing Injection.
+# ==============================================================================
 
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 . "$SCRIPT_DIR/const"
@@ -8,7 +11,9 @@ SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 
 export LOG_COMPONENT="Moni"
 
-# Internal SRI Logic
+# ==============================================================================
+# [ Internal SRI Logic ]
+# ==============================================================================
 
 _capture_state() {
     local family="$1" proto="inet"; [ "$family" = "6" ] && proto="inet6"
@@ -116,7 +121,7 @@ start_monitor() {
                 fflush()
             }
             ' < "$pipe" | sh 2>&1
-        ) >> "$FLUX_LOG" 2>&1 &
+        ) >> "$FLUX_LOG" 2>&1 < /dev/null &
         local engine_pid=$!
         
         wait "$engine_pid"

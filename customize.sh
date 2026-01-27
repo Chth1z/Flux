@@ -1,7 +1,9 @@
 #!/system/bin/sh
 
-# Flux Installer
-# Magisk/KernelSU/APatch installation script
+# ==============================================================================
+# [ Flux Module Installer ]
+# Description: Magisk/KernelSU/APatch installation, migration, and env detection.
+# ==============================================================================
 
 SKIPUNZIP=1
 
@@ -14,7 +16,9 @@ if [ "$BOOTMODE" != true ]; then
     abort "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 fi
 
-# Constants & Paths
+# ==============================================================================
+# [ Constants & Paths ]
+# ==============================================================================
 
 readonly FLUX_DIR="/data/adb/flux"
 readonly CONF_DIR="$FLUX_DIR/conf"
@@ -31,7 +35,9 @@ else
     SERVICE_DIR="/data/adb/service.d"
 fi
 
-# Helper Functions
+# ==============================================================================
+# [ Installer UI Helpers ]
+# ==============================================================================
 
 # Note: ui_print is provided by Magisk/KernelSU/APatch installer
 ui_error() { ui_print "! $1"; }
@@ -94,20 +100,24 @@ _choose_action() {
     [ "$default_action" = "true" ]
 }
 
-# Settings keys to migrate (centralized for easy maintenance)
+# ==============================================================================
+# [ Settings Migration Engine ]
+# ==============================================================================
+
+# Incremental settings migration logic to preserve user configuration across updates.
+# Implementation Note: Uses AWK to safely extract values from existing .ini files,
+# supporting multi-line quoted values and ensuring atomic replacement in the new config.
 # Note: CORE_TIMEOUT, PROXY_TCP_PORT, PROXY_UDP_PORT, DNS_PORT are now read from config.json
 readonly MIGRATE_KEYS="
-SUBSCRIPTION_URL
-LOG_ENABLE LOG_LEVEL LOG_MAX_SIZE
-UPDATE_TIMEOUT RETRY_COUNT UPDATE_INTERVAL
-ROUTING_MARK
-PROXY_MODE DNS_HIJACK_ENABLE
+SUBSCRIPTION_URL UPDATE_TIMEOUT RETRY_COUNT UPDATE_INTERVAL
+LOG_LEVEL LOG_MAX_SIZE
+CORE_USER CORE_GROUP CORE_TIMEOUT
+PROXY_MODE DNS_HIJACK_ENABLE DNS_PORT
 MOBILE_INTERFACE WIFI_INTERFACE HOTSPOT_INTERFACE USB_INTERFACE
 PROXY_MOBILE PROXY_WIFI PROXY_HOTSPOT PROXY_USB PROXY_TCP PROXY_UDP PROXY_IPV6
-APP_PROXY_ENABLE APP_PROXY_MODE PROXY_APPS_LIST BYPASS_APPS_LIST
-BYPASS_CN_IP CN_IP_URL CN_IPV6_URL
-MAC_FILTER_ENABLE MAC_PROXY_MODE PROXY_MACS_LIST BYPASS_MACS_LIST
-SKIP_CHECK_FEATURE
+TABLE_ID MARK_VALUE MARK_VALUE6 ROUTING_MARK
+APP_PROXY_MODE APP_LIST
+SKIP_CHECK_FEATURE ENABLE_CONNTRACK MSS_CLAMP_ENABLE DEBOUNCE_INTERVAL EXCLUDE_INTERFACES
 "
 
 _migrate_settings() {
@@ -183,7 +193,9 @@ _migrate_settings() {
     done
 }
 
-# --- Main Installation Logic ---
+# ==============================================================================
+# [ Main Installation Orchestration ]
+# ==============================================================================
 
 main() {
     _detect_env

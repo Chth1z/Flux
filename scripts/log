@@ -1,33 +1,37 @@
 #!/system/bin/sh
 
-# Flux Logging Module
-# Unified Magisk Status and File Logging
-
-# Logging Core Functions
+# ==============================================================================
+# [ Flux Logging System ]
+# Description: Unified logging, terminal coloring, and Magisk status reporting.
+# ==============================================================================
 
 LOG_COMPONENT="${LOG_COMPONENT:-Flux}"
 
-# Detect if output should be colored
+# Detect if the current execution environment supports ANSI color codes
 _is_terminal() {
     [ -t 2 ]
 }
 
+# ==============================================================================
+# [ Log Level Configuration ]
+# ==============================================================================
+# 0: OFF
+# 1: ERROR   - Critical failures requiring immediate attention
+# 2: WARNING - Recoverable issues or unexpected states
+# 3: INFO    - High-level progress markers (Default)
+# 4: DEBUG   - Verbose execution tracing
+# ==============================================================================
+
 _log() {
-    local level="$1"
-    local level_num="$2"
-    local msg="$3"
+    local level="$1"      # Letter code (E, W, I, D)
+    local level_num="$2"  # Numeric level for comparison
+    local msg="$3"        # Log message
     
-    # LOG_LEVEL: 0=OFF, 1=Error, 2=Warn, 3=Info, 4=Debug
     [ "${LOG_LEVEL:-3}" -lt "$level_num" ] && return 0
     
-    local timestamp
-    timestamp=$(date '+%m-%d %H:%M:%S')
+    local timestamp; timestamp=$(date '+%m-%d %H:%M:%S')
+    local log_line; log_line=$(printf '[%s] [%s] [%s] %s' "$timestamp" "$level" "${LOG_COMPONENT}" "$msg")
     
-    local log_line
-    log_line=$(printf '[%s] [%s] [%s] %s' "$timestamp" "$level" "${LOG_COMPONENT}" "$msg")
-    
-    # Solution A: Output to stderr only. 
-    # File redirection is managed by the entry-point (dispatcher/init).
     if _is_terminal; then
         case "$level" in
             E) printf '\033[31m%s\033[0m\n' "$log_line" >&2 ;;
@@ -42,8 +46,13 @@ _log() {
     return 0
 }
 
-# Unified Prop Status Management
+# ==============================================================================
+# [ Magisk User Interface (module.prop) Management ]
+# ==============================================================================
+# Flux updates the Magisk module description in real-time to provide 
+# status feedback to the user via the Magisk/KSU app.
 # Format: original_description\n🥰 [RUNNING] PID: xxx | Error: message
+# ==============================================================================
 
 # Initialize original description cache (Cross-process via System Properties)
 _init_prop_orig_desc() {
@@ -197,6 +206,7 @@ prop_clear() {
     return 0
 }
 
+# Standardized task runner with logging and status reporting
 run() {
     local name="$1"
     shift
@@ -212,6 +222,7 @@ run() {
     fi
 }
 
+# Professional ASCII/ANSI banner for console output highlighting
 log_banner() {
     local msg=" $1 "
     local width=50

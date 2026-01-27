@@ -20,7 +20,7 @@ All notable changes to the Flux project will be documented in this file.
 - **MAC Address Bypass Removal**: Deprecated MAC-based filtering to eliminate kernel overhead and maintain focus on O(1) IP-based routing.
 - **Unified Application Filtering**: Consolidated `PROXY_APPS_LIST` and `BYPASS_APPS_LIST` into a single, highly efficient `APP_LIST` controlled by `APP_PROXY_MODE`.
 
-### ⚙️ ENHANCED PROXY FLOW (THE FUNNEL)
+### ⚙️ ENHANCED PROXY FLOW
 - **Phase 1: Zero-Match Fast Path**: Established/Reply packets exit the kernel logic immediately (90% traffic optimization).
 - **Phase 2: Tiered IP Decision**: New 16-Zone Jump Tree processes large bypass lists with near-constant time complexity.
 - **Phase 3: Reactive Routing**: SRI 2.0 (State-driven Routing Injector) triggers sub-second route synchronization via FIFO pipes upon network state changes.

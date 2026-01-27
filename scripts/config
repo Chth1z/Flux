@@ -65,7 +65,6 @@ _init_config_defaults() {
     : "${SKIP_CHECK_FEATURE:=0}"
     : "${ENABLE_CONNTRACK:=1}"
     : "${MSS_CLAMP_ENABLE:=1}"
-    : "${DEBOUNCE_INTERVAL:=10}"
     : "${EXCLUDE_INTERFACES:=}"
     return 0
 }
@@ -220,7 +219,6 @@ APP_PROXY_MODE:int:0:2
 SKIP_CHECK_FEATURE:int:0:1
 ENABLE_CONNTRACK:int:0:1
 MSS_CLAMP_ENABLE:int:0:1
-DEBOUNCE_INTERVAL:int:0:300
 EXCLUDE_INTERFACES:iflist
 "
 

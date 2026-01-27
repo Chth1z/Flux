@@ -314,7 +314,6 @@ Main configuration file: `/data/adb/flux/conf/settings.ini`. Changes take effect
 | `SKIP_CHECK_FEATURE`| Skip kernel capability detection | `0` |
 | `ENABLE_CONNTRACK`| Use Conntrack to optimize performance | `1` |
 | `MSS_CLAMP_ENABLE`| Enable TCP MSS Clamping | `1` |
-| `DEBOUNCE_INTERVAL` | Network change batch interval (seconds) | `10` |
 | `EXCLUDE_INTERFACES`| List of interfaces to explicitly ignore | (empty) |
 
 ---

@@ -302,7 +302,6 @@
     | `SKIP_CHECK_FEATURE`| 跳过内核能力检测 | `0` |
     | `ENABLE_CONNTRACK`| 启用连接跟踪优化 | `1` |
     | `MSS_CLAMP_ENABLE`| 启用 TCP MSS 钳制 | `1` |
-    | `DEBOUNCE_INTERVAL` | 网络变化批处理抖动时间（秒） | `10` |
     | `EXCLUDE_INTERFACES`| 显式忽略的接口列表 | (空) |
 
     ---

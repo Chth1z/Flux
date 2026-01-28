@@ -4,8 +4,7 @@ run/
 *.bak
 *.zone
 *.zip
-rust/
-bin/
 *.txt
 .agent/
-flux-rust/
+lrqibazk/
+bin/

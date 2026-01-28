@@ -5,6 +5,9 @@
 # Description: Schema-driven validation and dynamic JSON config extraction.
 # ==============================================================================
 
+# Strict error handling
+set -eu
+[ -n "${BASH_VERSION:-}" ] && set -o pipefail
 
 # ==============================================================================
 # [ Configuration Management ]
@@ -14,9 +17,10 @@
 _init_config_defaults() {
     # [ General Configuration ]
     : "${SUBSCRIPTION_URL:=}"
-    : "${UPDATE_TIMEOUT:=15}"
+    : "${UPDATE_TIMEOUT:=5}"
     : "${RETRY_COUNT:=2}"
     : "${UPDATE_INTERVAL:=86400}"
+    : "${PREF_CLEANUP_EMOJI:=1}"
 
     # [ Logging & Debugging ]
     : "${LOG_LEVEL:=3}"
@@ -63,7 +67,6 @@ _init_config_defaults() {
 
     # [ Performance & Compatibility ]
     : "${SKIP_CHECK_FEATURE:=0}"
-    : "${ENABLE_CONNTRACK:=1}"
     : "${MSS_CLAMP_ENABLE:=1}"
     : "${EXCLUDE_INTERFACES:=}"
     return 0
@@ -72,30 +75,34 @@ _init_config_defaults() {
 # Dynamically extract runtime ports and ranges from sing-box JSON configuration
 # This ensures that Flux logic automatically aligns with sing-box settings.
 _extract_json_config() {
-    local jq_bin="$TOOLS_DIR/jq"
-    [ -x "$jq_bin" ] && [ -f "$CONFIG_FILE" ] || return 0
-    
+    local jq_bin="${JQ_BIN}"
+    [ -x "${jq_bin}" ] && [ -f "${CONFIG_FILE}" ] || return 0
+
     # Extract Proxy Port and FakeIP ranges via JQ
     local json_output
-    json_output=$("$jq_bin" -r '
+    json_output=$("${jq_bin}" -r '
         [
             ([.inbounds[]? | select(.type == "tproxy" or .type == "mixed" or .type == "redirect")][0] | .listen_port // (.listen? | sub("^.*:"; "")) // ""),
             ([.dns.servers[]? | select(.type=="fakeip")][0] | .inet4_range // ""),
             ([.dns.servers[]? | select(.type=="fakeip")][0] | .inet6_range // "")
         ] | join("|")
-    ' "$CONFIG_FILE" 2>/dev/null) || return 0
-    
+    ' "${CONFIG_FILE}" 2>/dev/null) || return 0
+
     local extracted_port v4 v6
-    IFS='|' read -r extracted_port v4 v6 <<< "$json_output"
-    
-    if [ -n "$extracted_port" ]; then
-        PROXY_TCP_PORT="$extracted_port"
-        PROXY_UDP_PORT="$extracted_port"
+    IFS='|' read -r extracted_port v4 v6 <<< "${json_output}"
+
+    if [ -n "${extracted_port}" ]; then
+        PROXY_TCP_PORT="${extracted_port}"
+        PROXY_UDP_PORT="${extracted_port}"
     fi
-    
+
     # Assign extracted ranges with basic syntax validation
-    case "$v4" in *"/"[0-9]*) FAKEIP_RANGE_V4="$v4" ;; esac
-    case "$v6" in *":"*"/"[0-9]*) FAKEIP_RANGE_V6="$v6" ;; esac
+    case "${v4}" in
+        */*[0-9]*) FAKEIP_RANGE_V4="${v4}" ;;
+    esac
+    case "${v6}" in
+        *:*/*[0-9]*) FAKEIP_RANGE_V6="${v6}" ;;
+    esac
     return 0
 }
 
@@ -104,14 +111,14 @@ _extract_json_config() {
 # ==============================================================================
 
 _validate_int() {
-    local name="$1" val="$2" min="$3" max="$4"
+    local name="${1}" val="${2}" min="${3}" max="${4}"
     case "$val" in
         ''|*[!0-9]*)
             printf '  • %s: invalid number "%s"\n' "$name" "$val"
             return 1
             ;;
     esac
-    
+
     if [ "$val" -lt "$min" ] || [ "$val" -gt "$max" ]; then
         printf '  • %s: out of range (%s, allowed: %s-%s)\n' "$name" "$val" "$min" "$max"
         return 1
@@ -120,9 +127,9 @@ _validate_int() {
 }
 
 _validate_user_group() {
-    local name="$1" val="$2"
+    local name="${1}" val="${2}"
     [ -z "$val" ] && { printf '  • %s: cannot be empty\n' "$name"; return 1; }
-    
+
     case "$val" in
         [0-9]*) return 0 ;;
         *[!a-zA-Z0-9_]*)
@@ -134,7 +141,7 @@ _validate_user_group() {
 }
 
 _validate_url() {
-    local name="$1" val="$2"
+    local name="${1}" val="${2}"
     [ -z "$val" ] && return 0
 
     case "$val" in
@@ -155,7 +162,7 @@ _validate_url() {
 }
 
 _validate_iface() {
-    local name="$1" val="$2"
+    local name="${1}" val="${2}"
     case "$val" in
         ''|*[!a-zA-Z0-9._+]*)
             printf '  • %s: invalid interface name format "%s"\n' "$name" "$val"
@@ -169,9 +176,9 @@ _validate_iface() {
 }
 
 _validate_iface_list() {
-    local name="$1" val="$2"
+    local name="${1}" val="${2}"
     [ -z "$val" ] && return 0
-    
+
     local iface
     for iface in $val; do
         _validate_iface "$name" "$iface" || return 1
@@ -185,11 +192,12 @@ _validate_iface_list() {
 
 # Declare a data-driven validation schema for all settings
 # Format: KEY:TYPE[:MIN:MAX]
-VALIDATION_SCHEMA="
+readonly VALIDATION_SCHEMA="
 SUBSCRIPTION_URL:url
 UPDATE_TIMEOUT:int:1:300
 RETRY_COUNT:int:0:10
 UPDATE_INTERVAL:int:0:31536000
+PREF_CLEANUP_EMOJI:int:0:1
 LOG_LEVEL:int:0:4
 LOG_MAX_SIZE:int:10240:104857600
 CORE_USER:user
@@ -217,7 +225,6 @@ MARK_VALUE6:int:1:65535
 ROUTING_MARK:int:0:65535
 APP_PROXY_MODE:int:0:2
 SKIP_CHECK_FEATURE:int:0:1
-ENABLE_CONNTRACK:int:0:1
 MSS_CLAMP_ENABLE:int:0:1
 EXCLUDE_INTERFACES:iflist
 "
@@ -226,14 +233,17 @@ EXCLUDE_INTERFACES:iflist
 _validate_settings() {
     log_debug "Validating runtime settings..."
     local valid=0 name type p1 p2 val
-    
+
     while IFS=: read -r name type p1 p2 || [ -n "$name" ]; do
         [ -z "$name" ] || [ "${name#\#}" != "$name" ] && continue
-        
+
         # Security: Prevent eval injection via variable names
         case "$name" in *[!a-zA-Z0-9_]*) continue ;; esac
-        eval "val=\$$name"
-        
+        # Strict mode: If variable is not set, this should error out if we assume it must be set.
+        # However, _init_config_defaults should have set them.
+        # We use explicit ${VAR} without default to catch initialization failures.
+        eval "val=\"\${$name}\""
+
         case "$type" in
             int)    _validate_int "$name" "$val" "$p1" "$p2" || valid=1 ;;
             iface)  _validate_iface "$name" "$val" || valid=1 ;;
@@ -244,7 +254,7 @@ _validate_settings() {
     done << EOF
 $VALIDATION_SCHEMA
 EOF
-    
+
     return "$valid"
 }
 
@@ -253,22 +263,23 @@ EOF
 # Use sing-box binary to verify the core JSON configuration
 _validate_singbox_config() {
     log_debug "Validating sing-box configuration..."
-    
-    if [ ! -x "$SING_BOX_BIN" ]; then
-        [ -f "$SING_BOX_BIN" ] && chmod +x "$SING_BOX_BIN" 2>/dev/null
-        if [ ! -x "$SING_BOX_BIN" ]; then
+
+    local bin="${SING_BOX_BIN}"
+    if [ ! -x "$bin" ]; then
+        [ -f "$bin" ] && chmod +x "$bin" 2>/dev/null
+        if [ ! -x "$bin" ]; then
             printf '  • sing-box binary not executable or missing\n'
             return 1
         fi
     fi
-    
+
     local err_out
-    if ! err_out=$("$SING_BOX_BIN" check -c "$CONFIG_FILE" -D "$RUN_DIR" 2>&1); then
+    if ! err_out=$("$bin" check -c "${CONFIG_FILE}" -D "${RUN_DIR}" 2>&1); then
         printf '  • sing-box config validation failed:\n'
         echo "$err_out" | while read -r line; do printf '    >> %s\n' "$line"; done
         return 1
     fi
-    
+
     return 0
 }
 
@@ -279,30 +290,30 @@ _validate_singbox_config() {
 # Perform a full system configuration audit
 validate_all() {
     # 1. Verify and sourge user settings
-    if [ -f "$SETTINGS_FILE" ]; then
+    if [ -f "${SETTINGS_FILE}" ]; then
         if ! sh -n "$SETTINGS_FILE" 2>/dev/null; then
             log_error "Syntax error in $SETTINGS_FILE"
             return 1
         fi
         . "$SETTINGS_FILE"
     fi
-    
+
     # 2. Populate defaults and extract dynamic config
     _init_config_defaults
     _extract_json_config
-    
+
     # 3. Perform schema and binary validation
     local errors
     errors=$(
         _validate_settings
         _validate_singbox_config
     )
-    
+
     if [ -n "$errors" ]; then
         log_error "Validation failed:\n$errors"
         return 1
     fi
-    
+
     log_debug "System validation passed"
     return 0
 }

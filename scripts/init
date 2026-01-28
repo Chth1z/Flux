@@ -5,40 +5,45 @@
 # Description: Pre-flight integrity checks, environment setup, and log rotation.
 # ==============================================================================
 
-SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
-. "$SCRIPT_DIR/const"
-. "$SCRIPT_DIR/log"
+# Strict error handling
+set -eu
+[ -n "${BASH_VERSION:-}" ] && set -o pipefail
 
-export LOG_COMPONENT="Init"
+readonly SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+. "${SCRIPT_DIR}/const"
+. "${SCRIPT_DIR}/log"
+
+readonly LOG_COMPONENT="Init"
 
 # ==============================================================================
 # [ Pre-flight Checks ]
 # ==============================================================================
 
 _check_integrity() {
-    [ ! -f "$SING_BOX_BIN" ] && { log_error "Sing-box binary missing: $SING_BOX_BIN"; return 1; }
-    
-    for script in "$CORE_SCRIPT" "$TPROXY_SCRIPT" "$IP_MONITOR_SCRIPT" "$CACHE_SCRIPT" \
-                 "$UPDATE_SCRIPT" "$DISPATCHER_SCRIPT" "$RULES_SCRIPT" "$CONFIG_SCRIPT"; do
-        [ ! -f "$script" ] && { log_error "Script missing: ${script##*/}"; return 1; }
+    [ ! -f "${SING_BOX_BIN}" ] && { log_error "Sing-box binary missing: ${SING_BOX_BIN}"; return 1; }
+
+    for script in "${CORE_SCRIPT}" "${TPROXY_SCRIPT}" "${IP_MONITOR_SCRIPT}" "${CACHE_SCRIPT}" \
+                  "${UPDATE_SCRIPT}" "${DISPATCHER_SCRIPT}" "${RULES_SCRIPT}" "${CONFIG_SCRIPT}"
+    do
+        [ ! -f "${script}" ] && { log_error "Script missing: ${script##*/}"; return 1; }
     done
-    
-    for conf in "$SETTINGS_FILE" "$CONFIG_FILE"; do
-        [ ! -f "$conf" ] && { log_error "Config missing: ${conf##*/}"; return 1; }
+
+    for conf in "${SETTINGS_FILE}" "${CONFIG_FILE}"; do
+        [ ! -f "${conf}" ] && { log_error "Config missing: ${conf##*/}"; return 1; }
     done
     return 0
 }
 
 _cleanup_failure() {
-    [ ! -f "$EVENTS_DIR/fail" ] && return 0
-    
+    [ ! -f "${EVENT_FAIL}" ] && return 0
+
     log_warn "Detected previous failure state, cleaning up..."
     # Simulate stop to cleanup any leftover processes/rules
-    sh "$CORE_SCRIPT" stop < /dev/null &
-    sh "$TPROXY_SCRIPT" stop < /dev/null &
-    sh "$IP_MONITOR_SCRIPT" stop < /dev/null &
+    sh "${CORE_SCRIPT}" stop < /dev/null &
+    sh "${TPROXY_SCRIPT}" stop < /dev/null &
+    sh "${IP_MONITOR_SCRIPT}" stop < /dev/null &
     wait
-    rm -f "$EVENTS_DIR/fail" "$EVENTS_DIR/core_ok" "$EVENTS_DIR/tproxy_ok" 2>/dev/null
+    rm -f "${EVENT_FAIL}" "${EVENT_CORE_OK}" "${EVENT_TPROXY_OK}" 2>/dev/null
     return 0
 }
 
@@ -48,12 +53,12 @@ _cleanup_failure() {
 
 _init_dirs() {
     # Ensure fresh state for events and locks
-    rmdir "$READY_LOCK_DIR" 2>/dev/null
-    
-    local dir; for dir in "$RUN_DIR" "$CACHE_DIR" "$EVENTS_DIR"; do
-        [ ! -d "$dir" ] && mkdir -p "$dir"
+    rmdir "${READY_LOCK}" 2>/dev/null
+
+    local dir; for dir in "${RUN_DIR}" "${CACHE_DIR}" "${EVENTS_DIR}"; do
+        [ ! -d "${dir}" ] && mkdir -p "${dir}"
     done
-    [ -d "$RUN_DIR" ] && chmod 0755 "$RUN_DIR"
+    [ -d "${RUN_DIR}" ] && chmod 0755 "${RUN_DIR}"
     return 0
 }
 
@@ -63,7 +68,7 @@ _init_dirs() {
 
 _check_update() {
     log_debug "Checking for subscription updates"
-    sh "$UPDATE_SCRIPT" check || log_debug "Update check completed"
+    sh "${UPDATE_SCRIPT}" check || log_debug "Update check completed"
 }
 
 # ==============================================================================
@@ -71,31 +76,31 @@ _check_update() {
 # ==============================================================================
 
 _rotate_file() {
-    local file="$1"
-    [ ! -f "$file" ] && return 0
-    
+    local file="${1}"
+    [ ! -f "${file}" ] && return 0
+
     # Use -L for link follows if needed, but here we expect regular files
-    local sz; sz=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null || echo 0)
-    
-    if [ "$sz" -gt "$LOG_MAX_SIZE" ]; then
-        log_info "Rotating ${file##*/} (size: $sz)"
+    local sz; sz=$(stat -c%s "${file}" 2>/dev/null || stat -f%z "${file}" 2>/dev/null || echo 0)
+
+    if [ "${sz}" -gt "${LOG_MAX_SIZE}" ]; then
+        log_info "Rotating ${file##*/} (size: ${sz})"
         # Copy + Truncate: Safer for concurrent writers
-        cp -f "$file" "${file}.bak" && : > "$file"
+        cp -f "${file}" "${file}.bak" && : > "${file}"
     fi
 }
 
 _rotate_log() {
-    _rotate_file "$FLUX_LOG"
-    _rotate_file "$SING_BOX_LOG"
+    _rotate_file "${FLUX_LOG}"
+    _rotate_file "${SING_BOX_LOG}"
     return 0
 }
 
 init_env() {
     _cleanup_failure
-    _init_dirs || { touch "$EVENTS_DIR/fail"; return 1; }
-    _check_integrity || { touch "$EVENTS_DIR/fail"; return 1; }
+    _init_dirs || { touch "${EVENT_FAIL}"; return 1; }
+    _check_integrity || { touch "${EVENT_FAIL}"; return 1; }
     _check_update
-    sh "$CACHE_SCRIPT" check || { touch "$EVENTS_DIR/fail"; return 1; }
+    sh "${CACHE_SCRIPT}" check || { touch "${EVENT_FAIL}"; return 1; }
     _rotate_log 2>/dev/null
     return 0
 }
@@ -106,12 +111,12 @@ init_env() {
 
 main() {
     local action="${1:-}"
-    
+
     case "$action" in
         init)
             if init_env; then
                 log_info "Initialization completed"
-                touch "$EVENTS_DIR/init_ok"
+                touch "${EVENT_INIT_OK}"
                 return 0
             else
                 return 1

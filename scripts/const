@@ -11,87 +11,76 @@
 # ==============================================================================
 
 readonly FLUX_DIR="/data/adb/flux"
-readonly BIN_DIR="$FLUX_DIR/bin"
-readonly CONF_DIR="$FLUX_DIR/conf"
-readonly SCRIPTS_DIR="$FLUX_DIR/scripts"
-readonly RUN_DIR="$FLUX_DIR/run"
-readonly EVENTS_DIR="$RUN_DIR/event"
-readonly TOOLS_DIR="$FLUX_DIR/tools"
-readonly CACHE_DIR="$FLUX_DIR/cache"
+readonly BIN_DIR="${FLUX_DIR}/bin"
+readonly CACHE_DIR="${FLUX_DIR}/cache"
+readonly CONF_DIR="${FLUX_DIR}/conf"
+readonly RUN_DIR="${FLUX_DIR}/run"
+readonly EVENTS_DIR="${RUN_DIR}/event"
+readonly SCRIPTS_DIR="${FLUX_DIR}/scripts"
 readonly MAGISK_MOD_DIR="/data/adb/modules/flux"
 
 # ==============================================================================
 # [ Core Binaries & Environment ]
 # ==============================================================================
 
-readonly SING_BOX_BIN="$BIN_DIR/sing-box"
-readonly SUBCONVERTER_BIN="$TOOLS_DIR/subconverter"
-readonly JQ_BIN="$TOOLS_DIR/jq"
+readonly JQ_BIN="${BIN_DIR}/jq"
+readonly SING_BOX_BIN="${BIN_DIR}/sing-box"
 
-readonly PATH="/data/adb/magisk:/data/adb/ksu/bin:/data/adb/ap/bin:$PATH"
+readonly PATH="/data/adb/magisk:/data/adb/ksu/bin:/data/adb/ap/bin:${PATH}"
 
 # ==============================================================================
 # [ Configuration Files ]
 # ==============================================================================
 
-readonly CONFIG_FILE="$CONF_DIR/config.json"
-readonly SETTINGS_FILE="$CONF_DIR/settings.ini"
-readonly PROP_FILE="$MAGISK_MOD_DIR/module.prop"
+readonly CONFIG_FILE="${CONF_DIR}/config.json"
+readonly TEMPLATE_FILE="${CONF_DIR}/template.json"
+readonly SETTINGS_FILE="${CONF_DIR}/settings.ini"
+readonly PROP_FILE="${MAGISK_MOD_DIR}/module.prop"
 readonly PACKAGES_LIST="/data/system/packages.list"
 
 # ==============================================================================
 # [ Runtime & Log Files ]
 # ==============================================================================
 
-readonly PID_FILE="$RUN_DIR/sing-box.pid"
-readonly MONITOR_PID_FILE="$RUN_DIR/ipmonitor.pid"
-readonly FIFO_FILE="$RUN_DIR/ip_monitor.fifo"
-readonly SRI_STATE_FILE="$RUN_DIR/sri_state_ips"
-readonly FLUX_LOG="$RUN_DIR/flux.log"
-readonly SING_BOX_LOG="$RUN_DIR/sing-box.log"
-readonly READY_LOCK_DIR="$EVENTS_DIR/.ready.lock"
+readonly MONITOR_PID_FILE="${RUN_DIR}/ipmonitor.pid"
+readonly FIFO_FILE="${RUN_DIR}/ip_monitor.fifo"
+readonly PID_FILE="${RUN_DIR}/sing-box.pid"
+readonly FLUX_LOG="${RUN_DIR}/flux.log"
+readonly SING_BOX_LOG="${RUN_DIR}/sing-box.log"
+readonly SRI_STATE_FILE="${RUN_DIR}/sri_state_ips"
+
+readonly READY_LOCK="${EVENTS_DIR}/ready_lock"
+readonly EVENT_FAIL="${EVENTS_DIR}/fail"
+readonly EVENT_INIT_OK="${EVENTS_DIR}/init_ok"
+readonly EVENT_CORE_OK="${EVENTS_DIR}/core_ok"
+readonly EVENT_TPROXY_OK="${EVENTS_DIR}/tproxy_ok"
 
 # ==============================================================================
 # [ Internal Scripts ]
 # ==============================================================================
 
-readonly CACHE_SCRIPT="$SCRIPTS_DIR/cache"
-readonly CONFIG_SCRIPT="$SCRIPTS_DIR/config"
-readonly CORE_SCRIPT="$SCRIPTS_DIR/core"
-readonly DISPATCHER_SCRIPT="$SCRIPTS_DIR/dispatcher"
-readonly INIT_SCRIPT="$SCRIPTS_DIR/init"
-readonly IP_MONITOR_SCRIPT="$SCRIPTS_DIR/ipmonitor"
-readonly LOG_SCRIPT="$SCRIPTS_DIR/log"
-readonly RULES_SCRIPT="$SCRIPTS_DIR/rules"
-readonly TPROXY_SCRIPT="$SCRIPTS_DIR/tproxy"
-readonly UPDATE_SCRIPT="$SCRIPTS_DIR/updater.sh"
+readonly CACHE_SCRIPT="${SCRIPTS_DIR}/cache"
+readonly CONFIG_SCRIPT="${SCRIPTS_DIR}/config"
+readonly CORE_SCRIPT="${SCRIPTS_DIR}/core"
+readonly DISPATCHER_SCRIPT="${SCRIPTS_DIR}/dispatcher"
+readonly INIT_SCRIPT="${SCRIPTS_DIR}/init"
+readonly IP_MONITOR_SCRIPT="${SCRIPTS_DIR}/ipmonitor"
+readonly LOG_SCRIPT="${SCRIPTS_DIR}/log"
+readonly RULES_SCRIPT="${SCRIPTS_DIR}/rules"
+readonly TPROXY_SCRIPT="${SCRIPTS_DIR}/tproxy"
+readonly UPDATE_SCRIPT="${SCRIPTS_DIR}/updater.sh"
 
 # ==============================================================================
 # [ Cache Files ]
 # ==============================================================================
 
-readonly CACHE_META_FILE="$CACHE_DIR/cache_meta"
-readonly CACHE_CONFIG_FILE="$CACHE_DIR/cache_config"
-readonly KERNEL_CACHE_FILE="$CACHE_DIR/cache_kernel"
-readonly CACHE_RULES_V4_FILE="$CACHE_DIR/cache_rules_ipv4"
-readonly CACHE_RULES_V6_FILE="$CACHE_DIR/cache_rules_ipv6"
-readonly CACHE_CLEANUP_V4_FILE="$CACHE_DIR/cache_cleanup_ipv4"
-readonly CACHE_CLEANUP_V6_FILE="$CACHE_DIR/cache_cleanup_ipv6"
-
-# ==============================================================================
-# [ Tool & Template Resources ]
-# ==============================================================================
-
-readonly TEMPLATE_FILE="$TOOLS_DIR/base/singbox.json"
-readonly COUNTRY_MAP_FILE="$TOOLS_DIR/base/country_map.json"
-
-# ==============================================================================
-# [ Temporary Artifacts (Updater) ]
-# ==============================================================================
-
-readonly CONFIG_BACKUP="$CONF_DIR/config.json.bak"
-readonly TMP_SUB_CONVERTED="$RUN_DIR/sub_temp.json"
-readonly GENERATE_FILE="$TOOLS_DIR/generate.ini"
+readonly CACHE_META_FILE="${CACHE_DIR}/cache_meta"
+readonly CACHE_CONFIG_FILE="${CACHE_DIR}/cache_config"
+readonly KERNEL_CACHE_FILE="${CACHE_DIR}/cache_kernel"
+readonly CACHE_RULES_V4_FILE="${CACHE_DIR}/cache_rules_ipv4"
+readonly CACHE_RULES_V6_FILE="${CACHE_DIR}/cache_rules_ipv6"
+readonly CACHE_CLEANUP_V4_FILE="${CACHE_DIR}/cache_cleanup_ipv4"
+readonly CACHE_CLEANUP_V6_FILE="${CACHE_DIR}/cache_cleanup_ipv6"
 
 # ==============================================================================
 # [ Network & Routing Constants ]
@@ -104,5 +93,3 @@ readonly PROXY_CHAINS="PROXY_PREROUTING PROXY_OUTPUT BYPASS_IP BYPASS_INTERFACE 
 # These represent subnets that should ALWAYS bypass the proxy (Local/Private/Multicast)
 readonly PRIVATE_SUBNETS_V4_COMPACT="0.0.0.0/8 10.0.0.0/8 100.0.0.0/8 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.0.0.0/24 192.168.0.0/16 224.0.0.0/4 240.0.0.0/4"
 readonly PRIVATE_SUBNETS_V6_COMPACT="::/128 ::1/128 ::ffff:0:0/96 100::/64 64:ff9b::/96 fc00::/7 fe80::/10 ff00::/8"
-
-

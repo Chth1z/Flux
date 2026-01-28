@@ -5,21 +5,28 @@
 # Description: Atomic iptables-restore application and PBR routing management.
 # ==============================================================================
 
-SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
-. "$SCRIPT_DIR/const"
-. "$SCRIPT_DIR/log"
+# Strict error handling
+set -eu
+[ -n "${BASH_VERSION:-}" ] && set -o pipefail
 
-export LOG_COMPONENT="Tprx"
+# ==============================================================================
+# [ Core Initialization ]
+# ==============================================================================
+
+readonly SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+. "${SCRIPT_DIR}/const"
+. "${SCRIPT_DIR}/log"
+
+readonly LOG_COMPONENT="Tprx"
 
 # ==============================================================================
 # [ Mode Detection & Helpers ]
 # ==============================================================================
 
-
 # Detect proxy mode based on config and kernel support
 _get_proxy_mode() {
     # 0=Auto (Check kernel), 1=TProxy (Force), 2=Redirect (Force)
-    [ "$KFEAT_TPROXY" = "1" ] && [ "$PROXY_MODE" != "2" ] && echo "tproxy" || echo "redirect"
+    [ "${KFEAT_TPROXY}" = "1" ] && [ "${PROXY_MODE}" != "2" ] && echo "tproxy" || echo "redirect"
 }
 
 # ==============================================================================
@@ -28,14 +35,11 @@ _get_proxy_mode() {
 
 # Generic wrapper for iptables/ip6tables with wait lock
 _run_ipt_command() {
-    local cmd="$1"; shift
-    command "$cmd" -w 100 "$@"
+    local cmd="${1}"; shift
+    command "${cmd}" -w 100 "$@"
 }
 
-_ip_rule()    { command ip rule "$@"; }
-_ip6_rule()   { command ip -6 rule "$@"; }
-_ip_route()   { command ip route "$@"; }
-_ip6_route()  { command ip -6 route "$@"; }
+
 
 # ==============================================================================
 # [ Rule Management (Apply/Cleanup) ]
@@ -43,30 +47,30 @@ _ip6_route()  { command ip -6 route "$@"; }
 
 # Apply or Cleanup cached rules atomically
 _manage_proxy_rules() {
-    local family="$1"
-    local action="$2" # "apply" or "cleanup"
-    
+    local family="${1}"
+    local action="${2}" # "apply" or "cleanup"
+
     local restore_cmd="iptables-restore"
     local rules_file
-    
-    if [ "$family" = "6" ]; then
+
+    if [ "${family}" = "6" ]; then
         restore_cmd="ip6tables-restore"
-        [ "$action" = "apply" ] && rules_file="$CACHE_RULES_V6_FILE" || rules_file="$CACHE_CLEANUP_V6_FILE"
+        [ "${action}" = "apply" ] && rules_file="${CACHE_RULES_V6_FILE}" || rules_file="${CACHE_CLEANUP_V6_FILE}"
     else
-        [ "$action" = "apply" ] && rules_file="$CACHE_RULES_V4_FILE" || rules_file="$CACHE_CLEANUP_V4_FILE"
+        [ "${action}" = "apply" ] && rules_file="${CACHE_RULES_V4_FILE}" || rules_file="${CACHE_CLEANUP_V4_FILE}"
     fi
 
     if [ "$action" = "apply" ] && [ ! -f "$rules_file" ]; then
-        log_error "Rules cache not found: $rules_file"
+        log_error "Rules cache not found: ${rules_file}"
         return 1
     fi
 
     # Apply cached rules
-    if [ -s "$rules_file" ]; then
+    if [ -s "${rules_file}" ]; then
         local err_out
-        if ! err_out=$(_run_ipt_command "$restore_cmd" --noflush < "$rules_file" 2>&1); then
-            log_error "$restore_cmd ($action) failed for IPv$family"
-            echo "$err_out" | while read -r line; do log_error "  >> $line"; done
+        if ! err_out=$(_run_ipt_command "${restore_cmd}" --noflush < "${rules_file}" 2>&1); then
+            log_error "${restore_cmd} (${action}) failed for IPv${family}"
+            echo "${err_out}" | while read -r line; do log_error "  >> ${line}"; done
             return 1
         fi
     fi
@@ -79,56 +83,79 @@ _manage_proxy_rules() {
 
 # Highly optimized routing table management for TProxy
 # Uses a deterministic preference (pref == table_id) to avoid conflicts.
+# Highly optimized routing table management for TProxy
+# Uses ip -batch for failure-atomic routing table updates.
 _manage_routing() {
-    local family="$1"
-    local action="$2" # "setup" or "cleanup"
-    
-    local mark="$MARK_VALUE"
+    local family="${1}"
+    local action="${2}" # "setup" or "cleanup"
+
+    local mark="${MARK_VALUE}"
     local target="0.0.0.0/0"
-    local ip_cmd="_ip"
-    
-    if [ "$family" = "6" ]; then
-        mark="$MARK_VALUE6"
+    local ip_cmd="ip"
+
+    if [ "${family}" = "6" ]; then
+        mark="${MARK_VALUE6}"
         target="::/0"
-        ip_cmd="_ip6"
+        ip_cmd="ip -6"
     fi
 
-    if [ "$action" = "setup" ]; then
-        # Ensure clean state by attempting deletion first (ignores errors if non-existent)
-        "${ip_cmd}_rule" del fwmark "$mark" table "$TABLE_ID" pref "$TABLE_ID" 2>/dev/null
-        "${ip_cmd}_route" del local "$target" dev lo table "$TABLE_ID" 2>/dev/null
+    local batch_file
+    batch_file="$(mktemp "${RUN_DIR}/flux_route.XXXXXX")" || return 1
 
-        # Atomically apply new routing
-        "${ip_cmd}_rule" add fwmark "$mark" table "$TABLE_ID" pref "$TABLE_ID" || return 1
-        "${ip_cmd}_route" add local "$target" dev lo table "$TABLE_ID" || {
-            log_error "Failed to setup $family local route"
-            "${ip_cmd}_rule" del fwmark "$mark" table "$TABLE_ID" pref "$TABLE_ID" 2>/dev/null
+    if [ "${action}" = "setup" ]; then
+        # 1. Cleanup old (best effort)
+        # Note: -batch continues on error, but we want clean state first.
+        # We manually pre-clean to avoid conflicts, then atomic apply.
+        ${ip_cmd} rule del fwmark "${mark}" table "${TABLE_ID}" pref "${TABLE_ID}" 2>/dev/null || true
+        ${ip_cmd} route del local "${target}" dev lo table "${TABLE_ID}" 2>/dev/null || true
+
+        # 2. Build Atomic Batch
+        cat <<EOF > "${batch_file}"
+rule add fwmark ${mark} table ${TABLE_ID} pref ${TABLE_ID}
+route add local ${target} dev lo table ${TABLE_ID}
+EOF
+
+        # 3. Apply Batch
+        if ! ${ip_cmd} -batch "${batch_file}"; then
+            log_error "Failed to apply IPv${family} routing batch"
+            rm -f "${batch_file}"
+            # Rollback clean
+            ${ip_cmd} rule del fwmark "${mark}" table "${TABLE_ID}" pref "${TABLE_ID}" 2>/dev/null || true
             return 1
-        }
-        
-        if [ "$family" = "4" ]; then
-            printf '1\n' > /proc/sys/net/ipv4/ip_forward
-            printf '1\n' > /proc/sys/net/ipv4/conf/all/forwarding
-            printf '1\n' > /proc/sys/net/ipv4/conf/default/forwarding
-        else
-            printf '1\n' > /proc/sys/net/ipv6/conf/all/forwarding
-            printf '1\n' > /proc/sys/net/ipv6/conf/default/forwarding
         fi
-    elif [ "$action" = "cleanup" ]; then
-        "${ip_cmd}_rule" del fwmark "$mark" table "$TABLE_ID" pref "$TABLE_ID" 2>/dev/null || true
-        "${ip_cmd}_route" del local "$target" dev lo table "$TABLE_ID" 2>/dev/null || true
+
+        # 4. Enable Forwarding
+        if [ "${family}" = "4" ]; then
+            sysctl -w net.ipv4.ip_forward=1 >/dev/null
+            sysctl -w net.ipv4.conf.all.forwarding=1 >/dev/null
+            sysctl -w net.ipv4.conf.default.forwarding=1 >/dev/null
+        else
+            sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null
+            sysctl -w net.ipv6.conf.default.forwarding=1 >/dev/null
+        fi
+
+    elif [ "${action}" = "cleanup" ]; then
+        # Atomic Cleanup Batch
+        cat <<EOF > "${batch_file}"
+rule del fwmark ${mark} table ${TABLE_ID} pref ${TABLE_ID}
+route del local ${target} dev lo table ${TABLE_ID}
+EOF
+        # We allow cleanup to fail (e.g. if already gone)
+        ${ip_cmd} -batch "${batch_file}" 2>/dev/null || true
     fi
+
+    rm -f "${batch_file}"
     return 0
 }
 
 # Clear conntrack entries to force state re-evaluation after rule changes.
 _purge_conntrack() {
-    [ "$ENABLE_CONNTRACK" = "1" ] || return 0
+    [ "${KFEAT_CONNTRACK}" = "1" ] || return 0
     if command -v conntrack >/dev/null 2>&1; then
         log_debug "Purging stale conntrack entries..."
         # Purge by mark values to clear any previous proxy/bypass states
-        conntrack -D -m "$MARK_VALUE" >/dev/null 2>&1 || true
-        [ "$PROXY_IPV6" = "1" ] && conntrack -D -m "$MARK_VALUE6" >/dev/null 2>&1 || true
+        conntrack -D -m "${MARK_VALUE}" >/dev/null 2>&1 || true
+        [ "${PROXY_IPV6}" = "1" ] && conntrack -D -m "${MARK_VALUE6}" >/dev/null 2>&1 || true
         conntrack -D -m 0x11 >/dev/null 2>&1 || true
     fi
 }
@@ -138,27 +165,27 @@ _purge_conntrack() {
 # ==============================================================================
 
 _manage_all() {
-    local action="$1" # "start" or "stop"
+    local action="${1}" # "start" or "stop"
     local mode; mode=$(_get_proxy_mode)
-    local proxy_action="apply"; [ "$action" = "stop" ] && proxy_action="cleanup"
-    local route_action="setup"; [ "$action" = "stop" ] && route_action="cleanup"
+    local proxy_action="apply"; [ "${action}" = "stop" ] && proxy_action="cleanup"
+    local route_action="setup"; [ "${action}" = "stop" ] && route_action="cleanup"
 
-    [ "$action" = "start" ] && _purge_conntrack
+    [ "${action}" = "start" ] && _purge_conntrack
 
-    log_debug "Hybrid-RCI $action (mode: $mode)"
+    log_debug "Hybrid-RCI ${action} (mode: ${mode})"
 
-    local families="4"; [ "$PROXY_IPV6" = "1" ] && families="4 6"
-    for f in $families; do
-        run "Manage IPv$f rules ($proxy_action)" _manage_proxy_rules "$f" "$proxy_action" || \
-            { [ "$action" = "start" ] && touch "$EVENTS_DIR/fail"; return 1; }
-        
-        [ "$mode" = "tproxy" ] && {
-            run "Manage IPv$f routing ($route_action)" _manage_routing "$f" "$route_action" || \
-                { [ "$action" = "start" ] && touch "$EVENTS_DIR/fail"; return 1; }
+    local families="4"; [ "${PROXY_IPV6}" = "1" ] && families="4 6"
+    for f in ${families}; do
+        run "Manage IPv${f} rules (${proxy_action})" _manage_proxy_rules "${f}" "${proxy_action}" || \
+            { [ "${action}" = "start" ] && touch "${EVENT_FAIL}"; return 1; }
+
+        [ "${mode}" = "tproxy" ] && {
+            run "Manage IPv${f} routing (${route_action})" _manage_routing "${f}" "${route_action}" || \
+                { [ "${action}" = "start" ] && touch "${EVENT_FAIL}"; return 1; }
         }
     done
 
-    [ "$action" = "start" ] && touch "$EVENTS_DIR/tproxy_ok"
+    [ "${action}" = "start" ] && touch "${EVENT_TPROXY_OK}"
     return 0
 }
 
@@ -167,15 +194,13 @@ stop_proxy()  { _manage_all "stop"; }
 
 main() {
     local action="${1:-}"
-    
+
     case "$action" in
         start)
             start_proxy
-            return $?
             ;;
         stop)
             stop_proxy
-            return $?
             ;;
         *)
             echo "Usage: $0 {start|stop}"

@@ -62,50 +62,6 @@ Independent proxy switches for each network interface:
 
 ---
 
-## Directory Structure
-
-All module files are located at `/data/adb/flux/`:
-
-```
-/data/adb/flux/
-├── bin/
-│   └── sing-box              # sing-box core binary
-│
-├── conf/
-│   ├── config.json           # Generated sing-box configuration
-│   └── settings.ini          # User configuration file
-│
-├── run/
-│   ├── flux.log              # Module runtime logs (with rotation)
-│   ├── sing-box.pid          # sing-box process PID
-│   ├── ipmonitor.pid         # IP monitor process PID
-│   ├── ipmonitor.fifo        # IP monitor named pipe
-│   └── event/                # Internal event signals
-│
-├── scripts/
-│   ├── cache                 # Cache manager (validation & sig generation)
-│   ├── config                # Config loader & robust JSON extractor
-│   ├── const                 # Central path and constant definitions
-│   ├── core                  # sing-box process control
-│   ├── dispatcher            # Central Event handler (inotifyd)
-│   ├── init                  # Environment & integrity initialization
-│   ├── iphandler             # Interface-local IP synchronization
-│   ├── ipmonitor             # Background network change daemon
-│   ├── log                   # Flash-friendly logging & prop management
-│   ├── rules                 # High-efficiency IPTables rule generator
-│   ├── tproxy                # TProxy/Redirect routing orchestration
-│   └── updater.sh            # Subscription sync & config merger
-│
-└── tools/
-    ├── base/
-    │   ├── country_map.json  # Country regex mapping for node filtering
-    │   └── singbox.json      # sing-box configuration template
-    ├── jq                    # jq binary for JSON processing
-    ├── pref.toml             # Subconverter preferences
-    └── subconverter          # Subconverter binary
-
-```
-
 ## Workflow Visualization
 
 ### 1. Module Lifecycle
@@ -113,14 +69,6 @@ Tracing the flow from Android boot to steady-state monitoring with precision:
 
 ```mermaid
 graph TD
-    %% Style Definitions
-    classDef start fill:#f5f5f5,stroke:#333,stroke-width:2px
-    classDef watcher fill:#e1f5fe,stroke:#01579b,stroke-width:2px
-    classDef init fill:#fff3e0,stroke:#e65100,stroke-width:2px
-    classDef parallel fill:#f3e5f5,stroke:#4a148c,stroke-width:2px
-    classDef ready fill:#e8f5e9,stroke:#2e7d32,stroke-width:3px
-    classDef stop fill:#ffebee,stroke:#c62828,stroke-width:2px
-
     %% Start Sequence
     Boot([Android Boot / service.sh]) --> Wait{Wait for System<br/>/sdcard Ready}
     Wait -->|Ready| LaunchDisp[Start Dispatcher<br/>inotifyd Daemon]
@@ -164,13 +112,6 @@ graph TD
     StopFlow --> StopNodes[Core + TProxy + SRI Stop]
     StopNodes --> Cleanup[Flush Rules & Clear Props]
     Cleanup --> Terminate([Flux Stopped])
-
-    class Boot,Final,Terminate start
-    class LaunchDisp,Watcher,Dispatch watcher
-    class Init,Audit,Env,Cache,Log init
-    class StartComp,Core,SingBox,SBWait,TProxy,Rules,Apply parallel
-    class Readiness,SRI,Monitor,Final ready
-    class StopFlow,StopNodes,Cleanup stop
 ```
 
 ### 2. High-Concurrency Packet Funnel
@@ -178,13 +119,6 @@ Visualizing multi-layer O(1) kernel logic for sub-second precision steering:
 
 ```mermaid
 graph TD
-    %% Style Definitions
-    classDef entry fill:#f5f5f5,stroke:#333,stroke-width:2px
-    classDef fast fill:#fff9c4,stroke:#fbc02d,stroke-width:2px
-    classDef slow fill:#e3f2fd,stroke:#1976d2,stroke-width:2px
-    classDef bypass fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
-    classDef proxy fill:#fce4ec,stroke:#c2185b,stroke-width:2px
-
     %% Entry Points
     In_Pre([External/Hotspot Traffic<br/>PREROUTING]) --> Common
     In_Out([Local App Traffic<br/>OUTPUT]) --> Common
@@ -223,12 +157,42 @@ graph TD
     Hijack --> Sink([sing-box Engine])
     Final --> Sink
     ACCEPT --> End([✓ Exit Kernel])
+```
 
-    class In_Pre,In_Out entry
-    class Fast,Recovery fast
-    class IP_Jump,Iface,App,DNS slow
-    class ACCEPT,Set_Bypass,End bypass
-    class Set_Proxy,Hijack,Final,Sink proxy
+## Directory Structure
+
+All module files are located at `/data/adb/flux/`:
+
+```
+/data/adb/flux/
+├── bin/
+│   ├── jq                    # JSON processor
+│   └── sing-box              # Core proxy engine
+│
+├── conf/
+│   ├── config.json           # Generated sing-box configuration
+│   ├── settings.ini          # User configuration file
+│   └── template.json         # Configuration template
+│
+├── run/
+│   ├── flux.log              # Module runtime logs
+│   ├── sing-box.pid          # Sing-box process PID
+│   ├── ipmonitor.pid         # IP Monitor process PID
+│   ├── ipmonitor.fifo        # IP Monitor pipe
+│   └── event/                # Event signals
+│
+└── scripts/
+    ├── cache                 # Cache manager
+    ├── config                # Config loader
+    ├── const                 # Constants
+    ├── core                  # Process control
+    ├── dispatcher            # Event handler
+    ├── init                  # Initialization
+    ├── ipmonitor             # Network monitor
+    ├── log                   # Logging system
+    ├── rules                 # IPTables generator
+    ├── tproxy                # Routing logic
+    └── updater.sh            # Subscription manager
 ```
 
 ---
@@ -253,9 +217,10 @@ Main configuration file: `/data/adb/flux/conf/settings.ini`. Changes take effect
 | Option | Description | Default |
 |--------|-------------|---------|
 | `SUBSCRIPTION_URL` | Subscription link for node conversion | (empty) |
-| `UPDATE_TIMEOUT` | Download timeout in seconds | `15` |
+| `UPDATE_TIMEOUT` | Download timeout in seconds | `5` |
 | `RETRY_COUNT` | Number of retries for failed downloads | `2` |
 | `UPDATE_INTERVAL` | Auto-update interval in seconds (86400=24h, 0=Disable) | `86400` |
+| `PREF_CLEANUP_EMOJI` | Remove Emoji from node names (0=Keep, 1=Remove) | `1` |
 
 ### 2. Logging & Debugging
 | Option | Description | Default |
@@ -312,7 +277,6 @@ Main configuration file: `/data/adb/flux/conf/settings.ini`. Changes take effect
 | Option | Description | Default |
 |--------|-------------|---------|
 | `SKIP_CHECK_FEATURE`| Skip kernel capability detection | `0` |
-| `ENABLE_CONNTRACK`| Use Conntrack to optimize performance | `1` |
 | `MSS_CLAMP_ENABLE`| Enable TCP MSS Clamping | `1` |
 | `EXCLUDE_INTERFACES`| List of interfaces to explicitly ignore | (empty) |
 

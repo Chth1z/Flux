@@ -5,11 +5,15 @@
 # Description: Lifecycle management for the sing-box engine (start, stop, wait).
 # ==============================================================================
 
-SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
-. "$SCRIPT_DIR/const"
-. "$SCRIPT_DIR/log"
+# Strict error handling
+set -eu
+[ -n "${BASH_VERSION:-}" ] && set -o pipefail
 
-export LOG_COMPONENT="Core"
+readonly SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+. "${SCRIPT_DIR}/const"
+. "${SCRIPT_DIR}/log"
+
+readonly LOG_COMPONENT="Core"
 
 # ==============================================================================
 # [ Internal Helper Functions ]
@@ -17,22 +21,29 @@ export LOG_COMPONENT="Core"
 
 _launch_singbox() {
     ulimit -SHn 1000000 2>/dev/null
-    
-    local cmd="$SING_BOX_BIN run -c $CONFIG_FILE -D $RUN_DIR"
+
+    local cmd="${SING_BOX_BIN} run -c ${CONFIG_FILE} -D ${RUN_DIR}"
     local run_as="${CORE_USER}:${CORE_GROUP}"
     local pid
-    
-    if command -v busybox >/dev/null 2>&1 && [ "$run_as" != "root:root" ]; then
-        nohup busybox setuidgid "$run_as" $cmd >> "$FLUX_LOG" 2>&1 < /dev/null &
+
+    if command -v busybox >/dev/null 2>&1 && [ "${run_as}" != "root:root" ]; then
+        nohup busybox setuidgid "${run_as}" "${cmd}" >> "${FLUX_LOG}" 2>&1 < /dev/null &
     else
-        nohup $cmd >> "$FLUX_LOG" 2>&1 < /dev/null &
+        nohup "${cmd}" >> "${FLUX_LOG}" 2>&1 < /dev/null &
     fi
-    
+
     pid=$!
-    
-    if ! printf '%s' "$pid" > "$PID_FILE"; then
-        log_error "Failed to write PID file: $PID_FILE"
-        kill -9 "$pid" 2>/dev/null
+
+    # Atomic PID write: write to temp -> move
+    # This ensures we never have a partial PID file
+    local tmp_pid; tmp_pid=$(mktemp "${PID_FILE}.XXXXXX")
+    if printf '%s' "${pid}" > "${tmp_pid}"; then
+        mv -f "${tmp_pid}" "${PID_FILE}"
+        return 0
+    else
+        log_error "Failed to write PID file"
+        kill -9 "${pid}" 2>/dev/null
+        rm -f "${tmp_pid}"
         return 1
     fi
     return 0
@@ -42,7 +53,7 @@ _check_port() {
     local port="$1"
     # Unified approach: search for LISTEN on local port
     if command -v ss >/dev/null 2>&1; then
-        ss -Hltn "sport = :$port" 2>/dev/null | grep -q "." && return 0
+        ss -Hltn "sport = :${port}" 2>/dev/null | grep -q "." && return 0
     else
         netstat -ltn 2>/dev/null | grep -qE "[: ]${port}[[:space:]]+.*LISTEN" && return 0
     fi
@@ -52,54 +63,55 @@ _check_port() {
 _wait_for_ready() {
     local count=0
     local pid; pid=$(_get_pid)
-    local max_tries=$((CORE_TIMEOUT * 2))
-    
-    while [ $count -lt "$max_tries" ]; do
-        if ! kill -0 "$pid" 2>/dev/null; then
+
+    while [ "${count}" -lt "${CORE_TIMEOUT}" ]; do
+        if ! kill -0 "${pid}" 2>/dev/null; then
             log_error "sing-box process died while waiting for readiness"
             return 1
         fi
-        
-        _check_port "$PROXY_TCP_PORT" && return 0
-        log_debug "Waiting for port $PROXY_TCP_PORT ($((count / 2))s/$CORE_TIMEOUT s)"
-        
-        sleep 0.5
+
+        _check_port "${PROXY_TCP_PORT}" && return 0
+        log_debug "Waiting for port ${PROXY_TCP_PORT} (${count}/${CORE_TIMEOUT}s)"
+
+        sleep 1
         count=$((count + 1))
     done
     return 1
 }
 
 _get_pid() {
-    [ -f "$PID_FILE" ] && cat "$PID_FILE" 2>/dev/null
+    [ -f "${PID_FILE}" ] && cat "${PID_FILE}" 2>/dev/null
 }
 
 _is_process_running() {
-    local pid="$1"
-    [ -n "$pid" ] && [ -d "/proc/$pid" ]
+    local pid="${1}"
+    [ -n "${pid}" ] && [ -d "/proc/${pid}" ]
 }
 
 # Gracefully terminate the proxy core process.
 # Attempts SIGTERM first, then escalates to SIGKILL if grace period expires.
 _kill_core() {
     local pid; pid=$(_get_pid)
-    [ -z "$pid" ] && return 0
-    
-    if _is_process_running "$pid"; then
-        kill "$pid" 2>/dev/null
-        
+    [ -z "${pid}" ] && return 0
+
+    if _is_process_running "${pid}"; then
+        kill "${pid}" 2>/dev/null
+
         # Wait for graceful shutdown
         local count=0
-        local max_tries=$((CORE_TIMEOUT * 2))
-        while [ $count -lt "$max_tries" ] && _is_process_running "$pid"; do
-            sleep 0.5
+        while [ "${count}" -lt "${CORE_TIMEOUT}" ] && _is_process_running "${pid}"; do
+            sleep 1
             count=$((count + 1))
         done
-        
+
         # Force kill if still running
-        _is_process_running "$pid" && kill -9 "$pid" 2>/dev/null
+        if _is_process_running "${pid}"; then
+            log_warn "Core process hung, force killing..."
+            kill -9 "${pid}" 2>/dev/null
+        fi
     fi
-    
-    rm -f "$PID_FILE"
+
+    rm -f "${PID_FILE}"
     return 0
 }
 
@@ -108,10 +120,10 @@ _kill_core() {
 # ==============================================================================
 
 start_core() {
-    run "Launch singbox" _launch_singbox || { touch "$EVENTS_DIR/fail"; return 1; }
-    run "Core startup" _wait_for_ready || { touch "$EVENTS_DIR/fail"; return 1; }
-    
-    touch "$EVENTS_DIR/core_ok"
+    run "Launch singbox" _launch_singbox || { touch "${EVENT_FAIL}"; return 1; }
+    run "Core startup" _wait_for_ready || { touch "${EVENT_FAIL}"; return 1; }
+
+    touch "${EVENT_CORE_OK}"
     return 0
 }
 
@@ -127,15 +139,13 @@ stop_core() {
 # ==============================================================================
 main() {
     local action="${1:-}"
-    
+
     case "$action" in
         start)
             start_core
-            return $?
             ;;
         stop)
             stop_core
-            return $?
             ;;
         *)
             echo "Usage: $0 {start|stop}"

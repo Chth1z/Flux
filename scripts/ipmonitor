@@ -5,19 +5,23 @@
 # Description: Real-time network address monitoring and Selective Routing Injection.
 # ==============================================================================
 
-SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
-. "$SCRIPT_DIR/const"
-. "$SCRIPT_DIR/log"
+# Strict error handling
+set -eu
+[ -n "${BASH_VERSION:-}" ] && set -o pipefail
 
-export LOG_COMPONENT="Moni"
+readonly SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+. "${SCRIPT_DIR}/const"
+. "${SCRIPT_DIR}/log"
+
+readonly LOG_COMPONENT="Moni"
 
 # ==============================================================================
 # [ Internal SRI Logic ]
 # ==============================================================================
 
 _capture_state() {
-    local family="$1" proto="inet"; [ "$family" = "6" ] && proto="inet6"
-    ip -f "$proto" -o addr show | awk -v proto="$proto" '
+    local family="${1}" proto="inet"; [ "${family}" = "6" ] && proto="inet6"
+    ip -f "${proto}" -o addr show | awk -v proto="${proto}" '
         {
             for (i=1; i<NF; i++) {
                 if ($i == proto) {
@@ -35,24 +39,28 @@ _sri_cleanup() {
     ip rule show | awk -F: '$1 == "1900" { sub(/^[ \t]*/,"",$2); print "ip rule del " $2 }' | sh 2>/dev/null || true
     # Cleanup IPv6
     ip -6 rule show | awk -F: '$1 == "1900" { sub(/^[ \t]*/,"",$2); print "ip -6 rule del " $2 }' | sh 2>/dev/null || true
-    rm -f "$SRI_STATE_FILE" 2>/dev/null
+    rm -f "${SRI_STATE_FILE}" 2>/dev/null
     return 0
 }
 
 _sri_sync_initial() {
     log_debug "Flux-SRI: Initializing state mirror..."
     _sri_cleanup
+
     local v4_ips; v4_ips=$(_capture_state 4)
-    local v6_ips; [ "$PROXY_IPV6" = "1" ] && v6_ips=$(_capture_state 6)
+    local v6_ips; [ "${PROXY_IPV6}" = "1" ] && v6_ips=$(_capture_state 6)
+
+    # Fault-tolerant Sync: Pipe directly to shell
+    # This allows individual rule failures (e.g. "File exists") without stopping the whole batch.
     {
-        for ip in $v4_ips; do
-            printf 'ip rule add to %s lookup main pref 1900\n' "$ip"
-            echo "$ip" >> "$SRI_STATE_FILE"
+        for ip in ${v4_ips}; do
+            printf 'ip rule add to %s lookup main pref 1900\n' "${ip}"
+            echo "${ip}" >> "${SRI_STATE_FILE}"
         done
-        for ip in $v6_ips; do
+        for ip in ${v6_ips}; do
             # Use ip -f inet6 for certain dual-stack parity
-            printf 'ip -f inet6 rule add to %s lookup main pref 1900\n' "$ip"
-            echo "$ip" >> "$SRI_STATE_FILE"
+            printf 'ip -f inet6 rule add to %s lookup main pref 1900\n' "${ip}"
+            echo "${ip}" >> "${SRI_STATE_FILE}"
         done
     } | sh 2>/dev/null || true
     return 0
@@ -60,30 +68,30 @@ _sri_sync_initial() {
 
 start_monitor() {
     _sri_sync_initial || return 1
-    
+
     # Setup Sentinel and FIFO
-    echo "$$" > "$MONITOR_PID_FILE"
-    local pipe="$RUN_DIR/flux_sri.pipe"
-    rm -f "$pipe" && mkfifo "$pipe"
+    echo "$$" > "${MONITOR_PID_FILE}"
+    local pipe="${RUN_DIR}/flux_sri.pipe"
+    rm -f "${pipe}" && mkfifo "${pipe}"
 
     # Unified Child Cleanup
     _kill_children() { pkill -P "$$" 2>/dev/null; }
-    
+
     # Traps for clean exit
-    trap '_kill_children; rm -f "$MONITOR_PID_FILE" "$pipe"; exit 0' INT TERM
-    trap 'rm -f "$pipe"' EXIT
+    trap '_kill_children; rm -f "${MONITOR_PID_FILE}" "${pipe}"; exit 0' INT TERM
+    trap 'rm -f "${pipe}"' EXIT
 
     log_info "Flux-SRI started (FIFO + Sentinel Mode)"
 
-    while [ -f "$MONITOR_PID_FILE" ]; do
+    while [ -f "${MONITOR_PID_FILE}" ]; do
         # Data Stream: ip monitor -> FIFO
-        ip -o monitor address 2>/dev/null > "$pipe" &
+        ip -o monitor address 2>/dev/null > "${pipe}" &
         local monitor_pid=$!
 
         # Processing Engine: FIFO -> AWK -> SH
         (
-            awk -v state_file="$SRI_STATE_FILE" \
-                -v proxy_ipv6="${PROXY_IPV6:-0}" '
+            awk -v state_file="${SRI_STATE_FILE}" \
+                -v proxy_ipv6="${PROXY_IPV6}" '
             function update_state_mirror() {
                 tmp = state_file ".tmp"
                 printf "" > tmp
@@ -120,23 +128,23 @@ start_monitor() {
                 }
                 fflush()
             }
-            ' < "$pipe" | sh 2>&1
-        ) >> "$FLUX_LOG" 2>&1 < /dev/null &
+            ' < "${pipe}" | sh 2>&1
+        ) >> "${FLUX_LOG}" 2>&1 < /dev/null &
         local engine_pid=$!
-        
-        wait "$engine_pid"
-        
+
+        wait "${engine_pid}"
+
         # Stop everything if the monitor dies or we are terminating
         _kill_children
-        [ -f "$MONITOR_PID_FILE" ] && { log_warn "SRI Engine restart in 3s..."; sleep 3; }
+        [ -f "${MONITOR_PID_FILE}" ] && { log_warn "SRI Engine restart in 3s..."; sleep 3; }
     done
     return 0
 }
 
 stop_monitor() {
-    local pid; pid=$(cat "$MONITOR_PID_FILE" 2>/dev/null)
+    local pid; pid=$(cat "${MONITOR_PID_FILE}" 2>/dev/null)
     log_info "Stopping Flux-SRI..."
-    [ -n "$pid" ] && { rm -f "$MONITOR_PID_FILE"; kill "$pid" 2>/dev/null; }
+    [ -n "${pid}" ] && { rm -f "${MONITOR_PID_FILE}"; kill "${pid}" 2>/dev/null; }
     _sri_cleanup
     return 0
 }

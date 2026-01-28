@@ -2,6 +2,21 @@
 
 All notable changes to the Flux project will be documented in this file.
 
+## [v1.3.0] - 2026-01-29
+
+### ⚠️ BREAKING CHANGES
+- **Updater Standardization**: Completely removed `subconverter` dependency. The `updater` script now relies purely on `jq` for robust and lightweight subscription handling.
+- **Directory Structure Clean-up**: Removed the obsolete `tools/` and `scripts/iphandler` directories to streamline the package.
+- **Auto-Detected Conntrack**: Removed `ENABLE_CONNTRACK` setting. It is now automatically enabled if the kernel supports `nf_conntrack`/`xt_conntrack`.
+
+### ✨ NEW FEATURES
+- **Emoji Cleanup Preference**: Introduced `PREF_CLEANUP_EMOJI` in `settings.ini` to optionally remove emojis from node names during subscription updates.
+- **Strict Mode Enforcement**: All scripts now run with `set -u` (nounset) enabled, significantly improving error detection and preventing "silent failure" bugs caused by undefined variables.
+
+### 🛡️ FIXES & OPTIMIZATIONS
+- **Documentation Sync**: Fully aligned `README.md` and `README_zh.md` directory structures and configuration tables.
+- **Fail-Fast Logic**: Helper functions in `scripts/rules` (`_build_loopback_block`, `_build_nat_extra`) now strictly require action arguments to prevent ambiguity.
+
 ## [v1.2.0] - 2026-01-27
 
 ### 🚀 EXTREME PERFORMANCE & ARCHITECTURE

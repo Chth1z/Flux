@@ -6,8 +6,8 @@
 # ==============================================================================
 
 # Strict error handling
-set -eu
-[ -n "${BASH_VERSION:-}" ] && set -o pipefail
+# set -eu (Disabled for compatibility with Magisk/KSU installer environment)
+# [ -n "${BASH_VERSION:-}" ] && set -o pipefail
 
 SKIPUNZIP=1
 
@@ -208,11 +208,12 @@ main() {
 
     # 1. Backup config files before overwriting
     local TMP_BACKUP
-    TMP_BACKUP=$(mktemp -d 2>/dev/null || echo "/dev/tmp/flux_mig_$$")
+    # Use standard Android tmp path if mktemp fails
+    TMP_BACKUP=$(mktemp -d 2>/dev/null || echo "${TMPDIR}/flux_mig_$$")
     mkdir -p "${TMP_BACKUP}"
 
-    # Ensure cleanup on exit
-    trap 'rm -rf "${TMP_BACKUP}"; rm -rf "${FLUX_DIR}/tmp" 2>/dev/null' EXIT INT TERM
+    # Ensure cleanup on exit (Use double quotes to expand TMP_BACKUP immediately)
+    trap "rm -rf \"${TMP_BACKUP}\"; rm -rf \"${FLUX_DIR}/tmp\" 2>/dev/null" EXIT INT TERM
 
     local has_settings=false has_config=false has_template=false
 
@@ -238,14 +239,15 @@ main() {
 
     # 2. Extract module files to MODPATH (for Magisk)
     ui_print "- Extracting module files..."
-    unzip -o "${ZIPFILE}" 'module.prop' 'webroot/*' -d "${MODPATH}" >&2
+    unzip -o "${ZIPFILE}" 'module.prop' 'webroot/*' -d "${MODPATH}" >&2 || abort "! Failed to extract module.prop"
 
     # Deploy flux_service.sh to service.d
-    mkdir -p "${SERVICE_DIR}"
-    unzip -o "${ZIPFILE}" 'flux_service.sh' -d "${SERVICE_DIR}" >&2
+    mkdir -p "${SERVICE_DIR}" || abort "! Failed to create service directory"
+    unzip -o "${ZIPFILE}" 'flux_service.sh' -d "${SERVICE_DIR}" >&2 || abort "! Failed to extract service script"
 
     # 3. Clear and recreate FLUX_DIR structure
-    unzip -o "${ZIPFILE}" 'bin/*' 'scripts/*' 'conf/*' -d "${FLUX_DIR}" >&2
+    rm -rf "${BIN_DIR}" "${SCRIPTS_DIR}" 2>/dev/null
+    unzip -o "${ZIPFILE}" 'bin/*' 'scripts/*' 'conf/*' -d "${FLUX_DIR}" >&2 || abort "! Failed to extract module files"
     # Rename default if template was extracted as singbox.json (for zip compatibility)
     [ -f "${CONF_DIR}/singbox.json" ] && mv -f "${CONF_DIR}/singbox.json" "${CONF_DIR}/template.json"
 

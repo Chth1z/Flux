@@ -336,12 +336,9 @@ main() {
             fi
             ;;
         *)
-            # Environment initialization
-            if [ -z "${SUBSCRIPTION_URL}" ]; then
-                for f in "${CACHE_CONFIG_FILE}" "${SETTINGS_FILE}"; do
-                    [ -f "${f}" ] && { set -a; . "${f}"; set +a; break; }
-                done
-            fi
+            for f in "${CACHE_CONFIG_FILE}" "${SETTINGS_FILE}"; do
+                [ -f "${f}" ] && { set -a; . "${f}"; set +a; break; }
+            done
             log_info "Starting forced update..."
             do_update
             ;;

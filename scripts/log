@@ -10,6 +10,7 @@ set -eu
 [ -n "${BASH_VERSION:-}" ] && set -o pipefail
 
 LOG_COMPONENT="${LOG_COMPONENT:-Name}"
+_PROP_ORIG_DESC=""
 
 # Detect if the current execution environment supports ANSI color codes
 _is_terminal() {
@@ -55,40 +56,33 @@ _log() {
 # ==============================================================================
 # Flux updates the Magisk module description in real-time to provide
 # status feedback to the user via the Magisk/KSU app.
-# Format: original_description\n🥰 [RUNNING] PID: xxx | Error: message
+# Format: original_description\n🥰 [RUNNING] PID: xxx | Warn: message
 # ==============================================================================
+
+# Helper to read the raw description line from module.prop
+_get_prop_desc() {
+    [ ! -f "${PROP_FILE}" ] && return 1
+    local line; line=$(grep "^description=" "${PROP_FILE}" 2>/dev/null | head -1)
+    [ -z "${line}" ] && return 1
+    printf '%s\n' "${line#description=}"
+}
 
 # Initialize original description cache (Cross-process via System Properties)
 _init_prop_orig_desc() {
     [ -n "${_PROP_ORIG_DESC}" ] && return 0
-
     # 1. Try memory cache first (System Property)
     _PROP_ORIG_DESC=$(getprop flux.prop.orig)
     if [ -n "$_PROP_ORIG_DESC" ]; then
         return 0
     fi
-
-    # 2. Fallback to file reading (Shell Native, no forks)
-    [ ! -f "${PROP_FILE}" ] && return 1
-
-    # Efficiently read first matching line without piping
-    while IFS= read -r line; do
-        case "${line}" in
-            description=*)
-                _PROP_ORIG_DESC="${line#description=}"
-                break
-                ;;
-        esac
-    done < "${PROP_FILE}"
-
+    # 2. Fallback to file reading
+    _PROP_ORIG_DESC=$(_get_prop_desc) || return 1
     # Strip potential previous status (newlines)
     _PROP_ORIG_DESC="${_PROP_ORIG_DESC%%\\n*}"
-
     # Reset if already contains emoji (previous status recovery)
     case "$_PROP_ORIG_DESC" in
         *"🥰"*|*"😴"*|*"🤯"*|*"🤔"*) _PROP_ORIG_DESC="Seamlessly redirect your network Flux." ;;
     esac
-
     # 3. Store in memory for other processes
     setprop flux.prop.orig "${_PROP_ORIG_DESC}"
     return 0
@@ -103,19 +97,7 @@ _prop_read_status() {
         return 0
     fi
 
-    [ ! -f "${PROP_FILE}" ] && return 1
-    local desc=""
-
-    # Native read loop
-    while IFS= read -r line; do
-        case "${line}" in
-            description=*)
-                desc="${line#description=}"
-                break
-                ;;
-        esac
-    done < "${PROP_FILE}"
-
+    local desc; desc=$(_get_prop_desc) || return 1
     case "${desc}" in
         *"\\n"*) printf '%s\n' "${desc#*\\n}" ;;
     esac

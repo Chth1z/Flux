@@ -27,9 +27,9 @@ _launch_singbox() {
     local pid
 
     if command -v busybox >/dev/null 2>&1 && [ "${run_as}" != "root:root" ]; then
-        nohup busybox setuidgid "${run_as}" "${cmd}" >> "${FLUX_LOG}" 2>&1 < /dev/null &
+        nohup busybox setuidgid "${run_as}" ${cmd} >> "${FLUX_LOG}" 2>&1 < /dev/null &
     else
-        nohup "${cmd}" >> "${FLUX_LOG}" 2>&1 < /dev/null &
+        nohup ${cmd} >> "${FLUX_LOG}" 2>&1 < /dev/null &
     fi
 
     pid=$!
@@ -71,7 +71,7 @@ _wait_for_ready() {
         fi
 
         _check_port "${PROXY_TCP_PORT}" && return 0
-        log_debug "Waiting for port ${PROXY_TCP_PORT} (${count}/${CORE_TIMEOUT}s)"
+        log_debug "Waiting for port ${PROXY_TCP_PORT} (${count}s/${CORE_TIMEOUT}s)"
 
         sleep 1
         count=$((count + 1))

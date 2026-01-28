@@ -177,11 +177,11 @@ _manage_all() {
     local families="4"; [ "${PROXY_IPV6}" = "1" ] && families="4 6"
     for f in ${families}; do
         run "Manage IPv${f} rules (${proxy_action})" _manage_proxy_rules "${f}" "${proxy_action}" || \
-            { [ "${action}" = "start" ] && touch "${EVENT_FAIL}"; return 1; }
+            { [ "${action}" = "start" ] && { touch "${EVENT_FAIL}"; return 1; } || true; }
 
         [ "${mode}" = "tproxy" ] && {
             run "Manage IPv${f} routing (${route_action})" _manage_routing "${f}" "${route_action}" || \
-                { [ "${action}" = "start" ] && touch "${EVENT_FAIL}"; return 1; }
+                { [ "${action}" = "start" ] && { touch "${EVENT_FAIL}"; return 1; } || true; }
         }
     done
 

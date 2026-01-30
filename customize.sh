@@ -172,7 +172,6 @@ _migrate_settings() {
             # Create temp file for the replacement
             local tmp_file
             tmp_file=$(mktemp)
-
             # Use awk to replace or append the key in target file
             awk -v key="${key}" -v newval="${value}" '
                 BEGIN { found=0; skip=0 }
@@ -217,20 +216,14 @@ main() {
     # Ensure cleanup on exit (Use double quotes to expand TMP_BACKUP immediately)
     trap "rm -rf \"${TMP_BACKUP}\"; rm -rf \"${FLUX_DIR}/tmp\" 2>/dev/null" EXIT INT TERM
 
-    local has_settings=false has_config=false has_template=false
+    local has_settings=false has_template=false
 
     if [ -d "${FLUX_DIR}" ]; then
         ui_print "- Backing up configuration files..."
-
         # Backup settings.ini (will auto-migrate)
         if [ -f "${CONF_DIR}/settings.ini" ]; then
             cp -f "${CONF_DIR}/settings.ini" "${TMP_BACKUP}/settings.ini"
             has_settings=true
-        fi
-        # Backup config.json (user choice)
-        if [ -f "${CONF_DIR}/config.json" ]; then
-            cp -f "${CONF_DIR}/config.json" "${TMP_BACKUP}/config.json"
-            has_config=true
         fi
         # Backup template.json template (user choice)
         if [ -f "${CONF_DIR}/template.json" ]; then
@@ -265,17 +258,7 @@ main() {
         ui_print "- Using default settings.ini"
     fi
 
-    # 4.2 config.json - User choice
-    if [ "${has_config}" = "true" ]; then
-        if _choose_action "Keep [config.json]?" "true"; then
-            cp -f "${TMP_BACKUP}/config.json" "${CONF_DIR}/config.json"
-            ui_print "  > config.json: restored"
-        else
-            ui_print "  > config.json: reset to default"
-        fi
-    fi
-
-    # 4.3 template.json - User choice
+    # 4.2 template.json - User choice
     if [ "${has_template}" = "true" ]; then
         if _choose_action "Keep [template.json]?" "true"; then
             cp -f "${TMP_BACKUP}/template.json" "${CONF_DIR}/template.json"

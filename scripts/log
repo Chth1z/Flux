@@ -82,6 +82,7 @@ _init_prop_orig_desc() {
     # Reset if already contains emoji (previous status recovery)
     case "$_PROP_ORIG_DESC" in
         *"🥰"*|*"😴"*|*"🤯"*|*"🤔"*) _PROP_ORIG_DESC="Seamlessly redirect your network Flux." ;;
+        *"description="*) _PROP_ORIG_DESC="${_PROP_ORIG_DESC#description=}" ;;
     esac
     # 3. Store in memory for other processes
     setprop flux.prop.orig "${_PROP_ORIG_DESC}"
@@ -131,21 +132,23 @@ _prop_write() {
 
     local full_desc="${_PROP_ORIG_DESC}\\n${status}"
     local tmp_file; tmp_file=$(mktemp "${PROP_FILE}.XXXXXX")
+    trap "rm -f '${tmp_file}'" EXIT
 
-    if DESC="${full_desc}" awk '
-        /^description=/ { print "description=" ENVIRON["DESC"]; next }
+    if DESC="${full_desc}" awk -v d="description=" '
+        BEGIN { pattern = "^" d }
+        $0 ~ pattern { print d ENVIRON["DESC"]; next }
         { print }
     ' "${PROP_FILE}" > "${tmp_file}"; then
         chmod 644 "${tmp_file}"
         mv -f "${tmp_file}" "${PROP_FILE}"
         setprop flux.prop.last "${status}"
         log_debug "Prop updated: ${status}"
+        trap - EXIT
+        return 0
     else
-        rm -f "${tmp_file}"
         log_error "Failed to update module.prop"
         return 1
     fi
-    return 0
 }
 
 # Build left part from state
@@ -155,8 +158,8 @@ _prop_build_left() {
 
     if [ -f "${EVENT_FAIL}" ]; then
         state="FAILED"
-    elif [ ! -f "${MAGISK_MOD_DIR}/disable" ] && [ -f "${PID_FILE}" ]; then
-        pid=$(cat "${PID_FILE}" 2>/dev/null)
+    elif [ ! -f "${MAGISK_MOD_DIR}/disable" ] && [ -f "${SING_BOX_PID_FILE}" ]; then
+        pid=$(cat "${SING_BOX_PID_FILE}" 2>/dev/null)
         [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null && state="RUNNING"
     fi
 

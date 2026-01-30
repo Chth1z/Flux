@@ -14,10 +14,12 @@ SKIPUNZIP=1
 # Environment Check
 
 if [ "${BOOTMODE:-false}" != "true" ]; then
-    ui_print "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    ui_print "! Please install in Magisk/KernelSU/APatch Manager"
-    ui_print "! Install from Recovery is NOT supported"
-    abort "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    ui_print "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    ui_print "  ! ERROR: FLUX TERMINATED"
+    ui_print "  ! Please install in Magisk/KSU/APatch"
+    ui_print "  ! Recovery installation is not supported"
+    ui_print "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    abort
 fi
 
 # ==============================================================================
@@ -117,10 +119,10 @@ readonly MIGRATE_KEYS="
 SUBSCRIPTION_URL UPDATE_TIMEOUT RETRY_COUNT UPDATE_INTERVAL PREF_CLEANUP_EMOJI
 LOG_LEVEL LOG_MAX_SIZE
 CORE_USER CORE_GROUP CORE_TIMEOUT
-PROXY_MODE DNS_HIJACK_ENABLE DNS_PORT
 MOBILE_INTERFACE WIFI_INTERFACE HOTSPOT_INTERFACE USB_INTERFACE
-PROXY_MOBILE PROXY_WIFI PROXY_HOTSPOT PROXY_USB PROXY_TCP PROXY_UDP PROXY_IPV6
-TABLE_ID MARK_VALUE MARK_VALUE6 ROUTING_MARK
+HOTSPOT_V4_RANGE HOTSPOT_V6_RANGE
+PROXY_MOBILE PROXY_WIFI PROXY_HOTSPOT PROXY_USB PROXY_IPV6
+TABLE_ID IPV4_MARK IPV6_MARK BYPASS_MARK ROUTING_MARK
 APP_PROXY_MODE APP_LIST
 SKIP_CHECK_FEATURE MSS_CLAMP_ENABLE EXCLUDE_INTERFACES
 "

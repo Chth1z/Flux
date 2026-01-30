@@ -20,16 +20,6 @@ readonly SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 readonly LOG_COMPONENT="Tprx"
 
 # ==============================================================================
-# [ Mode Detection & Helpers ]
-# ==============================================================================
-
-# Detect proxy mode based on config and kernel support
-_get_proxy_mode() {
-    # 0=Auto (Check kernel), 1=TProxy (Force), 2=Redirect (Force)
-    [ "${KFEAT_TPROXY}" = "1" ] && [ "${PROXY_MODE}" != "2" ] && echo "tproxy" || echo "redirect"
-}
-
-# ==============================================================================
 # [ Command Wrappers ]
 # ==============================================================================
 
@@ -39,8 +29,6 @@ _run_ipt_command() {
     command "${cmd}" -w 100 "$@"
 }
 
-
-
 # ==============================================================================
 # [ Rule Management (Apply/Cleanup) ]
 # ==============================================================================
@@ -49,7 +37,6 @@ _run_ipt_command() {
 _manage_proxy_rules() {
     local family="${1}"
     local action="${2}" # "apply" or "cleanup"
-
     local restore_cmd="iptables-restore"
     local rules_file
 
@@ -65,7 +52,6 @@ _manage_proxy_rules() {
         return 1
     fi
 
-    # Apply cached rules
     if [ -s "${rules_file}" ]; then
         local err_out
         if ! err_out=$(_run_ipt_command "${restore_cmd}" --noflush < "${rules_file}" 2>&1); then
@@ -88,13 +74,12 @@ _manage_proxy_rules() {
 _manage_routing() {
     local family="${1}"
     local action="${2}" # "setup" or "cleanup"
-
-    local mark="${MARK_VALUE}"
+    local mark="${IPV4_MARK}"
     local target="0.0.0.0/0"
     local ip_cmd="ip"
 
     if [ "${family}" = "6" ]; then
-        mark="${MARK_VALUE6}"
+        mark="${IPV6_MARK}"
         target="::/0"
         ip_cmd="ip -6"
     fi
@@ -104,17 +89,13 @@ _manage_routing() {
 
     if [ "${action}" = "setup" ]; then
         # 1. Cleanup old (best effort)
-        # Note: -batch continues on error, but we want clean state first.
-        # We manually pre-clean to avoid conflicts, then atomic apply.
         ${ip_cmd} rule del fwmark "${mark}" table "${TABLE_ID}" pref "${TABLE_ID}" 2>/dev/null || true
         ${ip_cmd} route del local "${target}" dev lo table "${TABLE_ID}" 2>/dev/null || true
-
         # 2. Build Atomic Batch
         cat <<EOF > "${batch_file}"
 rule add fwmark ${mark} table ${TABLE_ID} pref ${TABLE_ID}
 route add local ${target} dev lo table ${TABLE_ID}
 EOF
-
         # 3. Apply Batch
         if ! ${ip_cmd} -batch "${batch_file}"; then
             log_error "Failed to apply IPv${family} routing batch"
@@ -123,7 +104,6 @@ EOF
             ${ip_cmd} rule del fwmark "${mark}" table "${TABLE_ID}" pref "${TABLE_ID}" 2>/dev/null || true
             return 1
         fi
-
         # 4. Enable Forwarding
         if [ "${family}" = "4" ]; then
             sysctl -w net.ipv4.ip_forward=1 >/dev/null
@@ -143,7 +123,6 @@ EOF
         # We allow cleanup to fail (e.g. if already gone)
         ${ip_cmd} -batch "${batch_file}" 2>/dev/null || true
     fi
-
     rm -f "${batch_file}"
     return 0
 }
@@ -154,8 +133,8 @@ _purge_conntrack() {
     if command -v conntrack >/dev/null 2>&1; then
         log_debug "Purging stale conntrack entries..."
         # Purge by mark values to clear any previous proxy/bypass states
-        conntrack -D -m "${MARK_VALUE}" >/dev/null 2>&1 || true
-        [ "${PROXY_IPV6}" = "1" ] && conntrack -D -m "${MARK_VALUE6}" >/dev/null 2>&1 || true
+        conntrack -D -m "${IPV4_MARK}" >/dev/null 2>&1 || true
+        [ "${PROXY_IPV6}" = "1" ] && conntrack -D -m "${IPV6_MARK}" >/dev/null 2>&1 || true
         conntrack -D -m 0x11 >/dev/null 2>&1 || true
     fi
 }
@@ -166,23 +145,18 @@ _purge_conntrack() {
 
 _manage_all() {
     local action="${1}" # "start" or "stop"
-    local mode; mode=$(_get_proxy_mode)
     local proxy_action="apply"; [ "${action}" = "stop" ] && proxy_action="cleanup"
     local route_action="setup"; [ "${action}" = "stop" ] && route_action="cleanup"
-
     [ "${action}" = "start" ] && _purge_conntrack
-
-    log_debug "Hybrid-RCI ${action} (mode: ${mode})"
-
+    log_debug "Tproxy ${action}"
     local families="4"; [ "${PROXY_IPV6}" = "1" ] && families="4 6"
+
     for f in ${families}; do
         run "Manage IPv${f} rules (${proxy_action})" _manage_proxy_rules "${f}" "${proxy_action}" || \
             { [ "${action}" = "start" ] && { touch "${EVENT_FAIL}"; return 1; } || true; }
 
-        [ "${mode}" = "tproxy" ] && {
-            run "Manage IPv${f} routing (${route_action})" _manage_routing "${f}" "${route_action}" || \
-                { [ "${action}" = "start" ] && { touch "${EVENT_FAIL}"; return 1; } || true; }
-        }
+        run "Manage IPv${f} routing (${route_action})" _manage_routing "${f}" "${route_action}" || \
+            { [ "${action}" = "start" ] && { touch "${EVENT_FAIL}"; return 1; } || true; }
     done
 
     [ "${action}" = "start" ] && touch "${EVENT_TPROXY_OK}"

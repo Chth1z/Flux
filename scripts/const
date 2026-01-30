@@ -43,8 +43,8 @@ readonly PACKAGES_LIST="/data/system/packages.list"
 # ==============================================================================
 
 readonly MONITOR_PID_FILE="${RUN_DIR}/ipmonitor.pid"
-readonly FIFO_FILE="${RUN_DIR}/ip_monitor.fifo"
-readonly PID_FILE="${RUN_DIR}/sing-box.pid"
+readonly FIFO_FILE="${RUN_DIR}/ipmonitor.fifo"
+readonly SING_BOX_PID_FILE="${RUN_DIR}/sing-box.pid"
 readonly FLUX_LOG="${RUN_DIR}/flux.log"
 readonly SING_BOX_LOG="${RUN_DIR}/sing-box.log"
 readonly SRI_STATE_FILE="${RUN_DIR}/sri_state_ips"
@@ -87,7 +87,7 @@ readonly CACHE_CLEANUP_V6_FILE="${CACHE_DIR}/cache_cleanup_ipv6"
 # ==============================================================================
 
 # Chain names for Proxy and Bypass logic
-readonly PROXY_CHAINS="PROXY_PREROUTING PROXY_OUTPUT BYPASS_IP BYPASS_INTERFACE DNS_HIJACK_PRE DNS_HIJACK_OUT APP_CHAIN"
+readonly PROXY_CHAINS="PROXY_PREROUTING PROXY_OUTPUT BYPASS_IP BYPASS_INTERFACE_PRE BYPASS_INTERFACE_OUT APP_CHAIN ACTION_PROXY_PRE ACTION_PROXY_OUT ACTION_BYPASS"
 
 # Optimized IP Bypasses for Android (Carrier-Safe + RFC 1918/6890/4193)
 # These represent subnets that should ALWAYS bypass the proxy (Local/Private/Multicast)

@@ -26,14 +26,14 @@ readonly LOG_COMPONENT="Cach"
 _atomic_write() {
     local target_file="${1}"; shift
     local tmp_file; tmp_file=$(mktemp "${target_file}.XXXXXX") || return 1
+    trap "rm -f '${tmp_file}'" EXIT
 
-    # Run the generator command and redirect to temp file
     if "$@" > "${tmp_file}"; then
         chmod 644 "${tmp_file}"
         mv -f "${tmp_file}" "${target_file}"
+        trap - EXIT
         return 0
     else
-        rm -f "${tmp_file}"
         log_error "Failed to generate cache: ${target_file##*/}"
         return 1
     fi
@@ -44,23 +44,18 @@ _atomic_write() {
 # ==============================================================================
 
 _save_rules_cache() {
-    local mode="tproxy"
-    if [ "${KFEAT_TPROXY}" = "0" ] || [ "${PROXY_MODE}" = "2" ]; then
-        mode="redirect"
-    fi
-
     mkdir -p "$(dirname "${CACHE_RULES_V4_FILE}")" 2>/dev/null
 
     # 1. IPTables Rules (The primary driver)
-    _atomic_write "${CACHE_RULES_V4_FILE}" generate_all_rules "4" "${mode}" || return 1
-    _atomic_write "${CACHE_CLEANUP_V4_FILE}" generate_all_cleanup_rules "4" "${mode}" || return 1
+    _atomic_write "${CACHE_RULES_V4_FILE}" generate_all_rules "4" || return 1
+    _atomic_write "${CACHE_CLEANUP_V4_FILE}" generate_all_cleanup_rules "4" || return 1
 
     if [ "${PROXY_IPV6}" = "1" ]; then
-        _atomic_write "${CACHE_RULES_V6_FILE}" generate_all_rules "6" "${mode}" || return 1
-        _atomic_write "${CACHE_CLEANUP_V6_FILE}" generate_all_cleanup_rules "6" "${mode}" || return 1
+        _atomic_write "${CACHE_RULES_V6_FILE}" generate_all_rules "6" || return 1
+        _atomic_write "${CACHE_CLEANUP_V6_FILE}" generate_all_cleanup_rules "6" || return 1
     fi
 
-    log_debug "Iptables Rules cache saved (mode: ${mode})"
+    log_debug "Iptables Rules cache saved"
     return 0
 }
 
@@ -73,7 +68,6 @@ _save_rules_cache() {
 _save_kernel_cache() {
     local current_kernel
     current_kernel=$(uname -r 2>/dev/null)
-
     if [ -f "${KERNEL_CACHE_FILE}" ]; then
         local cached_kernel
         cached_kernel=$(grep "^#kernel:" "${KERNEL_CACHE_FILE}" 2>/dev/null | cut -d: -f2-)
@@ -84,9 +78,7 @@ _save_kernel_cache() {
             return 0
         fi
     fi
-
     log_debug "Building Kernel Capability Cache..."
-
     # Detection: try /proc/config.gz first, then fall back to trial/error detection
     local features
     if [ -f /proc/config.gz ]; then
@@ -105,20 +97,16 @@ _save_kernel_cache() {
     else
         log_warn "/proc/config.gz missing, falling back to module/trial detection"
         local t=0 o=0 m=0 a=0 c=0 i=0
-
         # Simple match detection via /proc/net/ip_tables_matches
         grep -qw "tproxy" /proc/net/ip_tables_targets 2>/dev/null && t=1
         grep -qw "owner" /proc/net/ip_tables_matches 2>/dev/null && o=1
         grep -qw "mark" /proc/net/ip_tables_matches 2>/dev/null && m=1
         grep -qw "addrtype" /proc/net/ip_tables_matches 2>/dev/null && a=1
         grep -qw "conntrack" /proc/net/ip_tables_matches 2>/dev/null && c=1
-
         # Trial detection for cases where modules aren't listed yet
         [ "${t}" = "0" ] && iptables -t mangle -A OUTPUT -p tcp -j TPROXY --on-port 1536 --tproxy-mark 0x1 2>/dev/null && { t=1; iptables -t mangle -D OUTPUT -p tcp -j TPROXY --on-port 1536 --tproxy-mark 0x1 2>/dev/null; }
-
         features="KFEAT_TPROXY=$t;KFEAT_OWNER=$o;KFEAT_MARK=$m;KFEAT_ADDRTYPE=$a;KFEAT_CONNTRACK=$c;KFEAT_IPV6_NAT=1"
     fi
-
     # Batch export and prepare file content
     local content="# Kernel Feature Cache - Auto Generated\n#kernel:${current_kernel}\n"
     local old_ifs="${IFS}"
@@ -160,12 +148,14 @@ _get_version_code() {
 }
 
 _get_meta_signature() {
-    printf "vcode:%s\nsettings_mtime:%s\nconfig_mtime:%s\npackages_mtime:%s\nkernel:%s" \
+    [ -n "${_CACHED_META_SIG:-}" ] && { printf '%s\n' "${_CACHED_META_SIG}"; return 0; }
+    _CACHED_META_SIG=$(printf "vcode:%s\nsettings_mtime:%s\nconfig_mtime:%s\npackages_mtime:%s\nkernel:%s" \
         "$(_get_version_code)" \
         "$(_get_mtime "${SETTINGS_FILE}")" \
         "$(_get_mtime "${CONFIG_FILE}")" \
         "$(_get_mtime "${PACKAGES_LIST}")" \
-        "$(uname -r 2>/dev/null)"
+        "$(uname -r 2>/dev/null)")
+    printf '%s\n' "${_CACHED_META_SIG}"
     return 0
 }
 
@@ -177,10 +167,8 @@ _is_cache_valid() {
             return 1
         fi
     done
-
     local current_sig
     current_sig=$(_get_meta_signature)
-
     local cached_sig
     cached_sig=$(awk '
         /^#build_ts:/ { next }
@@ -191,7 +179,6 @@ _is_cache_valid() {
         log_debug "Cache is valid"
         return 0
     fi
-
     # Debug mismatch
     log_debug "Cache signature mismatch"
     return 1
@@ -201,14 +188,11 @@ _is_cache_valid() {
 _save_meta_cache() {
     local sig
     sig=$(_get_meta_signature)
-
     mkdir -p "$(dirname "${CACHE_META_FILE}")" 2>/dev/null
-
     _gen_meta() {
         printf '%s\n' "$sig" | sed 's/^/#/'
         printf '#build_ts:%s\n' "$(date +%s)"
     }
-
     if _atomic_write "${CACHE_META_FILE}" _gen_meta; then
         log_debug "Meta cache saved"
         return 0
@@ -222,20 +206,13 @@ _save_meta_cache() {
 # ==============================================================================
 
 _normalize_list() {
-    echo "${1}" | awk '{
-        for (i=1; i<=NF; i++) {
-            if (n++ > 0) printf " "
-            printf "%s", $i
-        }
-    }'
+    printf '%s' "${1}" | awk '{for(i=1;i<=NF;i++) printf "%s%s", $i, (i==NF?"":" ")}'
 }
 
 _save_config_cache() {
     mkdir -p "$(dirname "${CACHE_CONFIG_FILE}")" 2>/dev/null
-
     local _app_list
     _app_list=$(_normalize_list "${APP_LIST}")
-
     _gen_config() {
         cat << EOF
 # Flux Config Cache - Auto Generated
@@ -249,27 +226,24 @@ LOG_MAX_SIZE=${LOG_MAX_SIZE}
 CORE_USER=${CORE_USER}
 CORE_GROUP=${CORE_GROUP}
 CORE_TIMEOUT=${CORE_TIMEOUT}
-PROXY_MODE=${PROXY_MODE}
-DNS_HIJACK_ENABLE=${DNS_HIJACK_ENABLE}
-DNS_PORT=${DNS_PORT}
-PROXY_TCP_PORT=${PROXY_TCP_PORT}
-PROXY_UDP_PORT=${PROXY_UDP_PORT}
-FAKEIP_RANGE_V4=${FAKEIP_RANGE_V4}
-FAKEIP_RANGE_V6=${FAKEIP_RANGE_V6}
 MOBILE_INTERFACE="${MOBILE_INTERFACE}"
 WIFI_INTERFACE="${WIFI_INTERFACE}"
 HOTSPOT_INTERFACE="${HOTSPOT_INTERFACE}"
 USB_INTERFACE="${USB_INTERFACE}"
+HOTSPOT_V4_RANGE="${HOTSPOT_V4_RANGE}"
+HOTSPOT_V6_RANGE="${HOTSPOT_V6_RANGE}"
+PROXY_PORT=${PROXY_PORT}
+FAKEIP_V4_RANGE=${FAKEIP_V4_RANGE}
+FAKEIP_V6_RANGE=${FAKEIP_V6_RANGE}
 PROXY_MOBILE=${PROXY_MOBILE}
 PROXY_WIFI=${PROXY_WIFI}
 PROXY_HOTSPOT=${PROXY_HOTSPOT}
 PROXY_USB=${PROXY_USB}
-PROXY_TCP=${PROXY_TCP}
-PROXY_UDP=${PROXY_UDP}
 PROXY_IPV6=${PROXY_IPV6}
 TABLE_ID=${TABLE_ID}
-MARK_VALUE=${MARK_VALUE}
-MARK_VALUE6=${MARK_VALUE6}
+IPV4_MARK=${IPV4_MARK}
+IPV6_MARK=${IPV6_MARK}
+BYPASS_MARK=${BYPASS_MARK}
 ROUTING_MARK="${ROUTING_MARK}"
 APP_PROXY_MODE=${APP_PROXY_MODE}
 APP_LIST="${_app_list}"
@@ -278,7 +252,6 @@ MSS_CLAMP_ENABLE=${MSS_CLAMP_ENABLE}
 EXCLUDE_INTERFACES="${EXCLUDE_INTERFACES}"
 EOF
     }
-
     if _atomic_write "${CACHE_CONFIG_FILE}" _gen_config; then
         log_debug "Config cache saved"
         return 0

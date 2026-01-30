@@ -239,6 +239,9 @@ _parse_to_json() {
                 gsub("[$¥](?<n>[0-9.]+)([xX倍率]*)"; "\(.n)x") |
                 gsub("(?<n>[0-9.]+)([xX倍率]+)"; "\(.n)x") |
                 gsub("(^\\s+|\\s+$)"; "") | gsub("\\s{2,}"; " ")
+             else . end) |
+            .tag |= (if . == "" then .type else . end) |
+            .tag |= (if (length > 32) then (.[0:29] + "...")
              else . end)
         )
         ' "${output}" > "${refined}"; then

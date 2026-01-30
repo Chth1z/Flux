@@ -26,9 +26,8 @@
 - **原子可靠层**：所有关键配置和模块更新均采用临时交换（temp-and-swap）策略，确保 100% 数据完整性。
 
 ### 代理模式
-- **TPROXY**（默认）：高性能透明代理，支持完整的 TCP/UDP。
-- **REDIRECT**：针对不支持 TPROXY 的旧内核的可靠回退方案。
-- **Conntrack 联锁优化**：通过 `ENABLE_CONNTRACK_OPT` 开关实现状态化流量快速通行。
+- **TPROXY**（默认）：高性能、协议无关的透明代理 (TCP/UDP)。
+- **智能探测**：自动解析 sing-box `config.json` 获取 `mixed`/`tproxy` 入站端口。
 
 ### 过滤机制
 - **按应用代理**：基于 UID 的黑白名单模式（含缓存）
@@ -135,14 +134,10 @@ graph TD
 
     %% 最终出口
     Set_Bypass --> ACCEPT
-    Set_Proxy --> DNS{Port 53?}
-    Recovery --> DNS
+    Set_Proxy --> Gate{TProxy Gate}
+    Recovery --> Gate
 
-    DNS -->|Yes| Hijack[DNS 劫持<br/>Port 1053]
-    DNS -->|No| Final[注入 Core<br/>Port 1536]
-
-    Hijack --> Sink([sing-box 引擎])
-    Final --> Sink
+    Gate --> Sink([sing-box Engine<br/>Port 1536])
     ACCEPT --> End([✓ 直接通过内核])
 ```
 
@@ -226,9 +221,9 @@ graph TD
 ### 4. 代理引擎
 | 选项 | 描述 | 默认值 |
 |--------|-------------|---------|
-| `PROXY_MODE` | `0`=自动, `1`=TProxy, `2`=Redirect | `0` |
-| `DNS_HIJACK_ENABLE` | `0`=关闭, `1`=TProxy (Mangle), `2`=Redirect (NAT) | `1` |
-| `DNS_PORT` | DNS 本地监听端口 | `1053` |
+| `PROXY_PORT` | 代理监听端口（自动提取）| `1536` |
+| `FAKEIP_RANGE_V4` | FakeIP IPv4 地址范围（自动提取）| `198.18.0.0/15` |
+| `FAKEIP_RANGE_V6` | FakeIP IPv6 地址范围（自动提取）| `fc00::/18` |
 
 ### 5. 网络接口
 | 选项 | 描述 | 默认接口名 |
@@ -243,8 +238,6 @@ graph TD
 |--------|-------------|---------|
 | `PROXY_MOBILE` / `PROXY_WIFI` | 接口代理开关 (0=绕过, 1=代理) | `1` |
 | `PROXY_HOTSPOT` / `PROXY_USB` | 接口代理开关 (0=绕过, 1=代理) | `0` |
-| `PROXY_TCP` | 启用 TCP 代理 | `1` |
-| `PROXY_UDP` | 启用 UDP 代理 | `1` |
 | `PROXY_IPV6` | 启用 IPv6 代理 | `0` |
 
 ### 7. 网络与路由

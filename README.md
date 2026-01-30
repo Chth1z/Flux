@@ -26,10 +26,8 @@ A powerful Android transparent proxy module powered by [sing-box](https://sing-b
 - **Atomic Reliability Layer**: 100% data integrity via temp-and-swap strategy for all critical configuration and module updates.
 
 ### Proxy Modes
-- **TPROXY** (default): High-performance transparent proxying with full TCP/UDP support.
-- **REDIRECT**: Reliable fallback for older kernels without TPROXY support.
-- **Auto Detection**: Intelligent mode selection based on cached kernel capabilities.
-- **Smart Extraction**: Automatically parses sing-box `config.json` for `mixed`/`tproxy`/`redirect` inbounds and ports.
+- **TPROXY** (default): High-performance, protocol-agnostic transparent proxying (TCP/UDP).
+- **Smart Extraction**: Automatically parses sing-box `config.json` for `mixed`/`tproxy` inbounds and ports.
 
 ### Network Support
 - **Dual-Stack**: Full IPv4 and IPv6 proxy support
@@ -148,14 +146,10 @@ graph TD
 
     %% Exit Points
     Set_Bypass --> ACCEPT
-    Set_Proxy --> DNS{Port 53?}
-    Recovery --> DNS
+    Set_Proxy --> Gate{TProxy Gate}
+    Recovery --> Gate
 
-    DNS -->|Yes| Hijack[DNS Hijack<br/>Port 1053]
-    DNS -->|No| Final[Core Injection<br/>Port 1536]
-
-    Hijack --> Sink([sing-box Engine])
-    Final --> Sink
+    Gate --> Sink([sing-box Engine<br/>Port 1536])
     ACCEPT --> End([✓ Exit Kernel])
 ```
 
@@ -238,9 +232,9 @@ Main configuration file: `/data/adb/flux/conf/settings.ini`. Changes take effect
 ### 4. Proxy Engine
 | Option | Description | Default |
 |--------|-------------|---------|
-| `PROXY_MODE` | `0`=Auto, `1`=TProxy, `2`=Redirect | `0` |
-| `DNS_HIJACK_ENABLE` | `0`=Disable, `1`=TProxy (Mangle), `2`=Redirect (NAT) | `1` |
-| `DNS_PORT` | DNS Local listening port | `1053` |
+| `PROXY_PORT` | Proxy listening port (Auto-extracted) | `1536` |
+| `FAKEIP_RANGE_V4` | FakeIP IPv4 address range (Auto-extracted) | `198.18.0.0/15` |
+| `FAKEIP_RANGE_V6` | FakeIP IPv6 address range (Auto-extracted) | `fc00::/18` |
 
 ### 5. Network Interfaces
 | Option | Description | Default IF Name |
@@ -255,8 +249,6 @@ Main configuration file: `/data/adb/flux/conf/settings.ini`. Changes take effect
 |--------|-------------|---------|
 | `PROXY_MOBILE` / `PROXY_WIFI` | Interface proxy switches (0=Bypass, 1=Proxy) | `1` |
 | `PROXY_HOTSPOT` / `PROXY_USB` | Interface proxy switches (0=Bypass, 1=Proxy) | `0` |
-| `PROXY_TCP` | Enable/Disable TCP Proxying | `1` |
-| `PROXY_UDP` | Enable/Disable UDP Proxying | `1` |
 | `PROXY_IPV6` | Enable/Disable IPv6 Proxying | `0` |
 
 ### 7. Network & Routing

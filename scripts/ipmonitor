@@ -49,16 +49,13 @@ _sri_sync_initial() {
 
     local v4_ips; v4_ips=$(_capture_state 4)
     local v6_ips; [ "${PROXY_IPV6}" = "1" ] && v6_ips=$(_capture_state 6)
-
     # Fault-tolerant Sync: Pipe directly to shell
-    # This allows individual rule failures (e.g. "File exists") without stopping the whole batch.
     {
         for ip in ${v4_ips}; do
             printf 'ip rule add to %s lookup main pref 1900\n' "${ip}"
             echo "${ip}" >> "${SRI_STATE_FILE}"
         done
         for ip in ${v6_ips}; do
-            # Use ip -f inet6 for certain dual-stack parity
             printf 'ip -f inet6 rule add to %s lookup main pref 1900\n' "${ip}"
             echo "${ip}" >> "${SRI_STATE_FILE}"
         done
@@ -71,21 +68,20 @@ start_monitor() {
 
     # Setup Sentinel and FIFO
     echo "$$" > "${MONITOR_PID_FILE}"
-    local pipe="${RUN_DIR}/flux_sri.pipe"
-    rm -f "${pipe}" && mkfifo "${pipe}"
+    rm -f "${FIFO_FILE}" && mkfifo "${FIFO_FILE}"
 
     # Unified Child Cleanup
     _kill_children() { pkill -P "$$" 2>/dev/null; }
 
     # Traps for clean exit
-    trap '_kill_children; rm -f "${MONITOR_PID_FILE}" "${pipe}"; exit 0' INT TERM
-    trap 'rm -f "${pipe}"' EXIT
+    trap '_kill_children; rm -f "${MONITOR_PID_FILE}" "${FIFO_FILE}"; exit 0' INT TERM
+    trap 'rm -f "${FIFO_FILE}"' EXIT
 
     log_info "Flux-SRI started (FIFO + Sentinel Mode)"
 
     while [ -f "${MONITOR_PID_FILE}" ]; do
         # Data Stream: ip monitor -> FIFO
-        ip -o monitor address 2>/dev/null > "${pipe}" &
+        ip -o monitor address 2>/dev/null > "${FIFO_FILE}" &
         local monitor_pid=$!
 
         # Processing Engine: FIFO -> AWK -> SH
@@ -128,7 +124,7 @@ start_monitor() {
                 }
                 fflush()
             }
-            ' < "${pipe}" | sh 2>&1
+            ' < "${FIFO_FILE}" | sh 2>&1
         ) >> "${FLUX_LOG}" 2>&1 < /dev/null &
         local engine_pid=$!
 

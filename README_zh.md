@@ -1,29 +1,24 @@
 # Flux
 
-![Flux Banner](flux_banner.png)
-
 [English](README.md) | [简体中文](README_zh.md)
 
 > 无缝重定向您的网络流量。
 
 一个强大的 Android 透明代理模块，由 [sing-box](https://sing-box.sagernet.org/) 驱动，专为 Magisk / KernelSU / APatch 设计。
 
-> [!IMPORTANT]
-> **Flux v1.2.0 已发布！** 此版本是核心引擎的一次重大飞跃，引入了全新的 SRI 2.0 状态路由器与高并发漏斗规则架构。查看 [CHANGELOG.md](CHANGELOG.md) 了解更新细节。
-
 ## 功能特性
 
 ### 核心组件
 - **sing-box 集成**：使用 sing-box 作为核心代理引擎
-- **内置订阅转换**：自动订阅转换和节点过滤
+- **内置订阅转换器**：自动订阅转换和节点过滤
 - **jq 处理器**：用于生成配置的 JSON 处理
 
-### 架构与优化 (v1.2.0+)
-- **SRI 2.0 (State-driven Routing Injector)**：全新的状态实时监控引擎，利用 FIFO 命名管道实现亚秒级 IP 路由注入，屏蔽网络环境剧烈切换带来的短时间“漏血”。
-- **工业级数据包漏斗**：重构 IPTables 逻辑链，采用“三层过滤”模型（物理绕过 -> 状态直连 -> 指数级跳转树），确保数据包在内核中的处理路径最短。
-- **16 分区跳转树 (O(n/16))**：大规模 CIDR/IP 绕过列表现在按子网首段进行 16 分区跳转，在大列表环境下 CPU 消耗降低约 85%。
-- **多层缓存系统**：基于指纹的高级缓存引擎（内核/规则/配置/元数据），最大限度减少 I/O 和 CPU 开销。
-- **原子可靠层**：所有关键配置和模块更新均采用临时交换（temp-and-swap）策略，确保 100% 数据完整性。
+### 架构与优化
+- **SRI (选择性路由注入器)**：统一的 AWK 引擎，整合初始同步与实时监控，通过三层 IP 过滤实现去冗余规则操作
+- **高性能数据包漏斗**：三层过滤（物理绕过 → 状态直连 → 16 分区跳转树）实现最短内核处理路径
+- **16 分区跳转树**：大规模 CIDR/IP 绕过列表按子网前缀分区，CPU 消耗降低约 85%
+- **基于 inotify 的缓存**：实时配置监控，即时缓存失效
+- **原子可靠性**：所有关键操作采用 temp-and-swap 策略，确保 100% 数据完整性
 
 ### 代理模式
 - **TPROXY**（默认）：高性能、协议无关的透明代理 (TCP/UDP)。
@@ -32,7 +27,7 @@
 ### 过滤机制
 - **按应用代理**：基于 UID 的黑白名单模式（含缓存）
 - **防环路**：内置路由标记和用户组保护，防止流量环路
-- **动态 IP 监控**：使用刷新+重新添加（flush+re-add）策略自动处理临时 IPv6 地址
+- **动态 IP 监控**：统一的 AWK 引擎配合内存状态去重，自动处理临时 IPv6 地址
 
 ### 订阅管理
 - 自动下载、转换和配置生成
@@ -48,6 +43,18 @@
 
 ---
 
+## 安装
+
+1. 从 [Releases](https://github.com/Chth1z/Flux/releases) 下载最新的发布 ZIP 压缩包
+2. 通过 Magisk 管理器 / KernelSU / APatch 安装
+3. 安装过程中：
+- 按 **[音量+]** 保留现有配置
+- 按 **[音量-]** 使用全新的默认配置
+4. 在 `/data/adb/flux/conf/settings.ini` 中配置您的订阅链接
+5. 重启以启动
+
+---
+
 ## 工作流程可视化
 
 ### 1. 模块启动与生命周期
@@ -55,49 +62,36 @@
 
 ```mermaid
 graph TD
-    %% 启动链条
-    Boot([Android 启动 / service.sh]) --> Wait{等待系统就绪<br/>/sdcard 挂载}
-    Wait -->|超时或就绪| LaunchDisp[启动 Dispatcher<br/>inotifyd 守护进程]
+    Boot([Android 启动]) --> Wait{系统就绪?}
+    Wait -->|是| Dispatcher[启动 Dispatcher<br/>inotifyd]
     
-    LaunchDisp --> Watcher{{监听 disable 文件}}
+    Dispatcher --> Watch{{监听 disable 文件}}
     
-    Watcher -- "文件被删除" --> Dispatch[scripts/dispatcher]
+    Watch -- "已删除" --> Init
     
-    subgraph "Phase A: 环境与指纹校验 (Init)"
-        Dispatch --> Init[scripts/init]
-        Init --> Audit[1. 完整性审计]
-        Audit --> Env[2. 变量提取 & 订阅更新]
-        Env --> Cache[3. 指纹校验 & 缓存同步]
-        Cache --> Log[4. 日志轮转维护]
+    subgraph InitPhase ["初始化阶段"]
+        Init[scripts/init] --> Check1{更新过期?}
+        Check1 -->|过期| Update[运行 Updater]
+        Check1 -->|有效| Check2
+        Update --> Check2{缓存有效?}
+        Check2 -->|无效| Rebuild[重建缓存]
+        Check2 -->|有效| LogRot[日志轮转]
+        Rebuild --> LogRot
     end
     
-    Log -- "init_ok" --> StartComp[并发组件加载]
+    LogRot --> Launch["启动所有组件"]
     
-    subgraph "Phase B: 核心引擎与规则 (并驱)"
-        StartComp --> Core[scripts/core]
-        StartComp --> TProxy[scripts/tproxy]
-        
-        Core --> SingBox[启动 sing-box]
-        SingBox --> SBWait{端口就绪?}
-        SBWait -- "core_ok" --> Readiness
-        
-        TProxy --> Rules[scripts/rules<br/>生成分流二进制]
-        Rules --> Apply[挂载规则集与策略路由]
-        Apply -- "tproxy_ok" --> Readiness
+    subgraph Components ["并行启动"]
+        Launch --> Core[Core<br/>sing-box]
+        Launch --> TProxy[TProxy<br/>iptables]
+        Launch --> Monitor[IPMonitor<br/>SRI]
     end
     
-    subgraph "Phase C: 反应式监控 (Monitor)"
-        Readiness{双组件就绪?} -- "Yes" --> SRI[启动 Flux-SRI]
-        SRI --> Monitor[异步监听网络/IP 波动]
-    end
+    Core & TProxy --> Ready
+    Ready[全部就绪] --> Final([就绪])
     
-    Monitor --> Final([Flux READY!])
-
-    %% 停止链条
-    Watcher -- "文件被创建" --> StopFlow[执行 Stop 指令]
-    StopFlow --> StopNodes[Core + TProxy + SRI 停止]
-    StopNodes --> Cleanup[清理注入规则 & 清空属性]
-    Cleanup --> Terminate([Flux 已停止])
+    Watch -- "已创建" --> Stop[停止全部]
+    Stop --> Cleanup[清理规则]
 ```
 
 ### 2. 极致性能漏斗：数据包分流决策树
@@ -105,40 +99,51 @@ graph TD
 
 ```mermaid
 graph TD
-    %% 入口
-    In_Pre([外部/热点流量<br/>PREROUTING]) --> Common
-    In_Out([本机应用流量<br/>OUTPUT]) --> Common
+    Pre([PREROUTING<br/>外部流量]) --> Fast
+    Out([OUTPUT<br/>本地应用]) --> Fast
 
-    subgraph Common [统一分流引擎]
-        %% 第一层：⚡ 快速路径
-        Fast{⚡ 状态快速路径<br/>Stateful Fast-Path}
+    subgraph Chain ["Mangle 链"]
+        Fast{⚡ 快速路径}
         
-        Fast -->|REPLY 方向<br/>90% 流量| ACCEPT
-        Fast -->|已标记 0x11| ACCEPT
-        Fast -->|已标记 0x14| Recovery[还原 TProxy / Mark]
+        subgraph Shortcuts ["快速路径出口 (Fast-Path)"]
+            direction LR
+            Recover[还原标记 + TPROXY]
+            Accepted[Accepted]
+        end
 
-        %% 第二层：🐢 慢速判定 (新连接)
-        Fast -- "无标记 / 首包" --> IP_Jump{16 分区跳转树<br/>IP Bypass?}
+        %% 代理路径 (左侧)
+        Fast -->|"connmark = PROXY"| Recover
         
-        IP_Jump -->|命中绕过列表| Set_Bypass[标记 0x11]
+        %% 绕过路径 (右侧)
+        Fast -->|"connmark = BYPASS"| Accepted
+        Fast -->|"ctdir REPLY"| Accepted
+
+        %% 决策路径 (右侧偏下)
+        Fast -- "新连接" --> IPCheck
         
-        IP_Jump -- "公网流量" --> Iface{物理接口检查<br/>Enabled?}
+        IPCheck{IP 绕过列表?<br/>16 分区跳转树}
+        IPCheck -->|公网| IfCheck
+        IPCheck -->|私有/局域网/绕过| SetBypass[标记 BYPASS]
         
-        Iface -->|禁用/排除接口| Set_Bypass
+        IfCheck{接口<br/>已启用?}
+        IfCheck -->|已启用| AppCheck
+        IfCheck -->|已禁用| SetBypass
         
-        Iface -- "代理接口" --> App{UID 应用过滤<br/>Black/White List}
-        
-        App -->|绕过应用| Set_Bypass
-        App -->|全局/命中应用| Set_Proxy[标记 0x14 / Mark 20]
+        AppCheck{应用过滤<br/>UID 匹配?}
+        AppCheck -->|代理应用| SetProxy[标记 PROXY<br/>+ TPROXY]
+        AppCheck -->|绕过应用| SetBypass
     end
 
-    %% 最终出口
-    Set_Bypass --> ACCEPT
-    Set_Proxy --> Gate{TProxy Gate}
-    Recovery --> Gate
-
-    Gate --> Sink([sing-box Engine<br/>Port 1536])
-    ACCEPT --> End([✓ 直接通过内核])
+    Recover --> SingBox
+    SetProxy --> SingBox
+    
+    Accepted --> Bypass
+    SetBypass --> Bypass
+    
+    subgraph Exit ["流量出口"]
+        SingBox([sing-box 引擎])
+        Bypass([内核直连])
+    end
 ```
 
 ---
@@ -162,7 +167,6 @@ graph TD
 │   ├── flux.log              # 模块运行日志
 │   ├── sing-box.pid          # sing-box 进程 PID
 │   ├── ipmonitor.pid         # IP 监控进程 PID
-│   ├── ipmonitor.fifo        # IP 监控命名管道
 │   └── event/                # 内部事件信号
 │
 └── scripts/
@@ -240,12 +244,9 @@ graph TD
 | `PROXY_HOTSPOT` / `PROXY_USB` | 接口代理开关 (0=绕过, 1=代理) | `0` |
 | `PROXY_IPV6` | 启用 IPv6 代理 | `0` |
 
-### 7. 网络与路由
+### 7. 路由标识
 | 选项 | 描述 | 默认值 |
 |--------|-------------|---------|
-| `TABLE_ID` | IPTables 路由表 ID | `2025` |
-| `MARK_VALUE` | IPv4 流量策略标记 | `20` |
-| `MARK_VALUE6` | IPv6 流量策略标记 | `25` |
 | `ROUTING_MARK` | 核心直连标记 (为空则使用 UID 匹配) | (空) |
 
 ### 8. 应用过滤
@@ -257,21 +258,9 @@ graph TD
 ### 9. 性能与兼容性
 | 选项 | 描述 | 默认值 |
 |--------|-------------|---------|
-| `SKIP_CHECK_FEATURE`| 跳过内核能力检测 | `0` |
 | `MSS_CLAMP_ENABLE`| 启用 TCP MSS 钳制 | `1` |
-| `EXCLUDE_INTERFACES`| 显式忽略的接口列表 | (空) |
-
----
-
-## 安装
-
-1. 从 [Releases](https://github.com/Chth1z/Flux/releases) 下载最新的发布 ZIP 压缩包
-2. 通过 Magisk 管理器 / KernelSU / APatch 安装
-3. 安装过程中：
-- 按 **[音量+]** 保留现有配置
-- 按 **[音量-]** 使用全新的默认配置
-4. 在 `/data/adb/flux/conf/settings.ini` 中配置您的订阅链接
-5. 重启以启动
+| `EXCLUDE_INTERFACES`| 显式忽略的接口列表 (OUTPUT) | (空) |
+| `INCLUDE_INTERFACES`| 额外需要代理的接口列表 (PREROUTING) | (空) |
 
 ---
 
@@ -288,7 +277,6 @@ graph TD
 - [SagerNet/sing-box](https://github.com/SagerNet/sing-box) - 通用代理平台
 - [taamarin/box_for_magisk](https://github.com/taamarin/box_for_magisk) - Magisk 模块模式与灵感
 - [CHIZI-0618/box4magisk](https://github.com/CHIZI-0618/box4magisk) - Magisk 模块参考
-- [asdlokj1qpi233/subconverter](https://github.com/asdlokj1qpi233/subconverter) - 订阅格式转换器
 - [jqlang/jq](https://github.com/jqlang/jq) - 命令行 JSON 处理器
 
 ---

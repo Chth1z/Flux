@@ -1,32 +1,27 @@
 # Flux
 
-![Flux Banner](flux_banner.png)
-
 [English](README.md) | [简体中文](README_zh.md)
 
-> Seamlessly redirect your network flux.
+> Seamlessly redirect your network Flux.
 
 A powerful Android transparent proxy module powered by [sing-box](https://sing-box.sagernet.org/), designed for Magisk / KernelSU / APatch.
-
-> [!IMPORTANT]
-> **Flux v1.2.0 is here!** This version is a major architectural leap, introducing the **SRI 2.0** state router and **High-Concurrency Funnel** rule architecture. See [CHANGELOG.md](CHANGELOG.md) for full update details.
 
 ## Features
 
 ### Core Components
 - **sing-box Integration**: Uses sing-box as the core proxy engine
-- **Subconverter Built-in**: Automatic subscription conversion and node filtering
+- **Built-in Subscription Converter**: Automatic subscription conversion and node filtering
 - **jq Processor**: JSON manipulation for configuration generation
 
-### Architecture & Optimization (v1.2.0+)
-- **SRI 2.0 (State-driven Routing Injector)**: A new reactive monitoring engine utilizing FIFO pipes for sub-second IP route injection, preventing "leaks" during rapid network transitions.
-- **Industrial Packet Funnel**: Refactored IPTables logic using a "Triple-Layer Filter" model (Physical Bypass -> Stateful Direct -> Exponential Jump Tree) for the shortest possible in-kernel processing path.
-- **16-Zone Jump Tree (O(n/16))**: Large CIDR/IP bypass lists are now partitioned into 16 zones by subnet prefix, reducing CPU consumption by ~85% in heavy list environments.
-- **Multi-tier Cache System**: Advanced fingerprinting-based caching engine (Kernel/Rules/Config/Meta) minimizes I/O and CPU overhead.
-- **Atomic Reliability Layer**: 100% data integrity via temp-and-swap strategy for all critical configuration and module updates.
+### Architecture & Optimization
+- **SRI (Selective Routing Injector)**: Unified AWK engine combining initial sync and real-time monitoring with three-layer IP filtering for zero-redundancy rule operations
+- **High-Performance Packet Funnel**: Triple-layer filtering (Physical Bypass → Stateful Direct → 16-Zone Jump Tree) for minimal in-kernel processing path
+- **16-Zone Jump Tree**: Large CIDR/IP bypass lists partitioned by subnet prefix, reducing CPU consumption by ~85%
+- **inotify-Based Cache**: Real-time configuration monitoring with instant cache invalidation
+- **Atomic Reliability**: 100% data integrity via temp-and-swap strategy for all critical operations
 
 ### Proxy Modes
-- **TPROXY** (default): High-performance, protocol-agnostic transparent proxying (TCP/UDP).
+- **TPROXY**: High-performance, protocol-agnostic transparent proxying (TCP/UDP).
 - **Smart Extraction**: Automatically parses sing-box `config.json` for `mixed`/`tproxy` inbounds and ports.
 
 ### Network Support
@@ -44,11 +39,11 @@ Independent proxy switches for each network interface:
 ### Filtering Mechanisms
 - **Per-App Proxy**: UID-based blacklist/whitelist mode with caching
 - **Anti-Loopback**: Built-in route marking and user group protection to prevent traffic loops
-- **Dynamic IP Monitor**: Automatically handles temporary IPv6 addresses with flush+re-add strategy
+- **Dynamic IP Monitor**: Unified AWK engine with memory-state deduplication automatically handles temporary IPv6 addresses
 
 ### Subscription Management
 - Automatic download, conversion, and configuration generation
-- Node filtering by region (regex-based country matching via `country_map.json`)
+- Node filtering by region
 - Configurable update interval with smart caching
 - Manual force update via `updater.sh`
 
@@ -60,97 +55,93 @@ Independent proxy switches for each network interface:
 
 ---
 
+## Installation
+
+1. Download the latest release ZIP from [Releases](https://github.com/Chth1z/Flux/releases)
+2. Install via Magisk Manager / KernelSU / APatch
+3. During installation:
+   - Press **[Vol+]** to preserve existing configuration
+   - Press **[Vol-]** to use fresh default configuration
+4. Configure your subscription URL in `/data/adb/flux/conf/settings.ini`
+5. Reboot to start
+
+---
+
 ## Workflow Visualization
 
 ### 1. Module Lifecycle
-Tracing the flow from Android boot to steady-state monitoring with precision:
 
 ```mermaid
 graph TD
-    %% Start Sequence
-    Boot([Android Boot / service.sh]) --> Wait{Wait for System<br/>/sdcard Ready}
-    Wait -->|Ready| LaunchDisp[Start Dispatcher<br/>inotifyd Daemon]
+    Boot([Android Boot]) --> Wait{System Ready?}
+    Wait -->|Yes| Dispatcher[Start Dispatcher<br/>inotifyd]
     
-    LaunchDisp --> Watcher{{Monitor 'disable' file}}
+    Dispatcher --> Watch{{Monitor 'disable' file}}
     
-    Watcher -- "File Deleted" --> Dispatch[scripts/dispatcher]
+    Watch -- "Deleted" --> Init
     
-    subgraph "Phase A: Environment Audit (Init)"
-        Dispatch --> Init[scripts/init]
-        Init --> Audit[1. Integrity Check]
-        Audit --> Env[2. Var Extraction & Sub Update]
-        Env --> Cache[3. Fingerprint & Cache Sync]
-        Cache --> Log[4. Log Rotation]
+    subgraph InitPhase ["Init Phase"]
+        Init[scripts/init] --> Check1{Update Expired?}
+        Check1 -->|Expired| Update[Run Updater]
+        Check1 -->|Valid| Check2
+        Update --> Check2{Cache Valid?}
+        Check2 -->|Invalid| Rebuild[Rebuild Cache]
+        Check2 -->|Valid| LogRot[Log Rotation]
+        Rebuild --> LogRot
     end
     
-    Log -- "init_ok" --> StartComp[Concurrent Loading]
+    LogRot --> Launch["Launch All Components"]
     
-    subgraph "Phase B: Engine & Rules (Parallel)"
-        StartComp --> Core[scripts/core]
-        StartComp --> TProxy[scripts/tproxy]
-        
-        Core --> SingBox[Launch sing-box]
-        SingBox --> SBWait{Port Ready?}
-        SBWait -- "core_ok" --> Readiness
-        
-        TProxy --> Rules[scripts/rules<br/>Generate Binary]
-        Rules --> Apply[Apply Ruleset & Policy Routes]
-        Apply -- "tproxy_ok" --> Readiness
+    subgraph Components ["Parallel Startup"]
+        Launch --> Core[Core<br/>sing-box]
+        Launch --> TProxy[TProxy<br/>iptables]
+        Launch --> Monitor[IPMonitor<br/>SRI]
     end
     
-    subgraph "Phase C: Reactive Monitoring (Monitor)"
-        Readiness{Both Ready?} -- "Yes" --> SRI[Start Flux-SRI]
-        SRI --> Monitor[Async Network Monitoring]
-    end
+    Core & TProxy --> Ready
+    Ready[All Ready] --> Final([READY])
     
-    Monitor --> Final([Flux READY!])
-
-    %% Stop Sequence
-    Watcher -- "File Created" --> StopFlow[Exec Stop Commands]
-    StopFlow --> StopNodes[Core + TProxy + SRI Stop]
-    StopNodes --> Cleanup[Flush Rules & Clear Props]
-    Cleanup --> Terminate([Flux Stopped])
+    Watch -- "Created" --> Stop[Stop All]
+    Stop --> Cleanup[Flush Rules]
 ```
 
 ### 2. High-Concurrency Packet Funnel
-Visualizing multi-layer O(1) kernel logic for sub-second precision steering:
 
 ```mermaid
 graph TD
-    %% Entry Points
-    In_Pre([External/Hotspot Traffic<br/>PREROUTING]) --> Common
-    In_Out([Local App Traffic<br/>OUTPUT]) --> Common
+    Pre([PREROUTING<br/>External Traffic]) --> Chain
+    Out([OUTPUT<br/>Local Apps]) --> Chain
 
-    subgraph Common [Unified Diversion Engine]
-        %% Layer 1: ⚡ Fast-Path
-        Fast{⚡ Stateful Fast-Path}
+    subgraph Chain ["Mangle Chain"]
+        Fast{⚡ Fast-Path}
         
-        Fast -->|REPLY Direction<br/>90% Traffic| ACCEPT
-        Fast -->|Marked 0x11| ACCEPT
-        Fast -->|Marked 0x14| Recovery[Restore TProxy / Mark]
+        Fast -->|"ctdir REPLY"| Accepted
+        Fast -->|"connmark = BYPASS"| Accepted
+        Fast -->|"connmark = PROXY"| Recover[Restore Mark<br/>& TPROXY]
 
-        %% Layer 2: 🐢 Decision Path (New Conn)
-        Fast -- "No Mark / First Packet" --> IP_Jump{16-Zone Jump Tree<br/>IP Bypass?}
+        Fast -- "New Connection" --> IPCheck
         
-        IP_Jump -->|Private/Bypass Hit| Set_Bypass[Mark 0x11]
+        IPCheck{IP Bypass List?<br/>16-Zone Jump Tree}
+        IPCheck -->|Private/LAN/Bypass| SetBypass[Bypass]
+        IPCheck -->|Public| IfCheck
         
-        IP_Jump -- "Public Traffic" --> Iface{Physical Interface<br/>Enabled?}
+        IfCheck{Interface<br/>Enabled?}
+        IfCheck -->|Disabled| SetBypass
+        IfCheck -->|Enabled| AppCheck
         
-        Iface -->|Disabled/Excluded| Set_Bypass
-        
-        Iface -- "Proxy Enabled" --> App{UID App Filtering<br/>Black/White List}
-        
-        App -->|Bypass App| Set_Bypass
-        App -->|Global / Whitelist Hit| Set_Proxy[Mark 0x14 / Mark 20]
+        AppCheck{App Filter<br/>UID Match?}
+        AppCheck -->|Bypass App| SetBypass
+        AppCheck -->|Proxy App| SetProxy[Mark PROXY<br/>& TPROXY]
     end
 
-    %% Exit Points
-    Set_Bypass --> ACCEPT
-    Set_Proxy --> Gate{TProxy Gate}
-    Recovery --> Gate
-
-    Gate --> Sink([sing-box Engine<br/>Port 1536])
-    ACCEPT --> End([✓ Exit Kernel])
+    SetBypass --> Bypass
+    SetProxy --> SingBox
+    Recover --> SingBox
+    
+    subgraph Exit ["Data Exit"]
+        SingBox([sing-box Engine<br/>Port 1536])
+        Bypass([Direct to Kernel<br/>/ Bypass])
+    end
 ```
 
 ## Directory Structure
@@ -172,7 +163,6 @@ All module files are located at `/data/adb/flux/`:
 │   ├── flux.log              # Module runtime logs
 │   ├── sing-box.pid          # Sing-box process PID
 │   ├── ipmonitor.pid         # IP Monitor process PID
-│   ├── ipmonitor.fifo        # IP Monitor pipe
 │   └── event/                # Event signals
 │
 └── scripts/
@@ -251,12 +241,9 @@ Main configuration file: `/data/adb/flux/conf/settings.ini`. Changes take effect
 | `PROXY_HOTSPOT` / `PROXY_USB` | Interface proxy switches (0=Bypass, 1=Proxy) | `0` |
 | `PROXY_IPV6` | Enable/Disable IPv6 Proxying | `0` |
 
-### 7. Network & Routing
+### 7. Routing Mark
 | Option | Description | Default |
 |--------|-------------|---------|
-| `TABLE_ID` | IPTables Table ID | `2025` |
-| `MARK_VALUE` | Fwmark for IPv4 rules | `20` |
-| `MARK_VALUE6` | Fwmark for IPv6 rules | `25` |
 | `ROUTING_MARK` | Core/Bypass Routing Mark (empty=UID match) | (empty) |
 
 ### 8. Application Filtering
@@ -268,21 +255,9 @@ Main configuration file: `/data/adb/flux/conf/settings.ini`. Changes take effect
 ### 9. Performance & Compatibility
 | Option | Description | Default |
 |--------|-------------|---------|
-| `SKIP_CHECK_FEATURE`| Skip kernel capability detection | `0` |
 | `MSS_CLAMP_ENABLE`| Enable TCP MSS Clamping | `1` |
-| `EXCLUDE_INTERFACES`| List of interfaces to explicitly ignore | (empty) |
-
----
-
-## Installation
-
-1. Download the latest release ZIP from [Releases](https://github.com/Chth1z/Flux/releases)
-2. Install via Magisk Manager / KernelSU / APatch
-3. During installation:
-   - Press **[Vol+]** to preserve existing configuration
-   - Press **[Vol-]** to use fresh default configuration
-4. Configure your subscription URL in `/data/adb/flux/conf/settings.ini`
-5. Reboot to start
+| `EXCLUDE_INTERFACES`| List of interfaces to explicitly ignore (OUTPUT) | (empty) |
+| `INCLUDE_INTERFACES`| List of additional interfaces to proxy (PREROUTING) | (empty) |
 
 ---
 
@@ -299,7 +274,6 @@ Main configuration file: `/data/adb/flux/conf/settings.ini`. Changes take effect
 - [SagerNet/sing-box](https://github.com/SagerNet/sing-box) - The universal proxy platform
 - [taamarin/box_for_magisk](https://github.com/taamarin/box_for_magisk) - Magisk module patterns and inspiration
 - [CHIZI-0618/box4magisk](https://github.com/CHIZI-0618/box4magisk) - Magisk module reference
-- [asdlokj1qpi233/subconverter](https://github.com/asdlokj1qpi233/subconverter) - Subscription format converter
 - [jqlang/jq](https://github.com/jqlang/jq) - Command-line JSON processor
 
 ---

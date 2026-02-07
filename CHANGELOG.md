@@ -2,6 +2,51 @@
 
 All notable changes to the Flux project will be documented in this file.
 
+## [v1.3.3] - 2026-02-07
+
+### ⚡ IP MONITOR PERFECTION
+- **Unified AWK Engine**: Rewrote `ipmonitor` with a single-process architecture that combines initial IP sync and real-time monitoring, using three-layer filtering (semantic, memory-state, phase-based) for zero-redundancy rule operations
+
+### 🔧 CONSTANTS CONSOLIDATION
+- **Internal Network Constants**: Moved `TABLE_ID`, `IPV4_MARK`, `IPV6_MARK`, and `BYPASS_MARK` from user-configurable `settings.ini` to `scripts/const` as `readonly` system constants
+- **Simplified Configuration**: Removed obsolete `MARK_VALUE`, `MARK_VALUE6`, and `TABLE_ID` from settings documentation
+
+### 🛠️ CODE REFINEMENT
+- **Merged Log Rotation**: Combined `_rotate_file` and `_rotate_log` into a single streamlined function in `scripts/init`
+
+## [v1.3.2] - 2026-02-06
+
+### ⚡ STARTUP OPTIMIZATION
+- **Parallel IPMonitor**: `ipmonitor` now starts simultaneously with `core` and `tproxy`, reducing startup latency by eliminating unnecessary dependency wait
+- **Simplified Readiness Logic**: Removed `READY_LOCK` mutex as concurrent safety is no longer needed with parallel component startup
+
+### 🔧 CACHE SYSTEM REFACTORING
+- **inotify-Based Invalidation**: Replaced mtime-based fingerprint validation with real-time configuration file monitoring
+  - Configuration changes instantly invalidate cache via `rm meta_cache`
+  - Eliminated ~50 lines of fingerprint calculation logic
+- **Prioritized Config Loading**: All scripts now prefer `cache_config` (when meta exists) over `settings.ini` for faster initialization
+
+### 🛠️ ROBUSTNESS IMPROVEMENTS
+- **Updater Cleanup Fix**: Moved `trap _cleanup` to function entry, ensuring workspace cleanup even on early errors
+
+### 🗂️ CODE ORGANIZATION
+- **Inline Cache Validation**: Moved cache check logic from standalone script call to inline execution in `init`, reducing subprocess overhead
+
+## [v1.3.1] - 2026-01-29
+
+### ⚡ EXTREME PERFORMANCE
+- **Ultimate Streamlined Proxy Chain**: Introduced `:ACTION_PROXY` and `:ACTION_BYPASS` sub-chains to deduplicate mangle rules.
+- **Rule Count Optimization**: Reduced the number of rules in high-frequency chains (APP_CHAIN/BYPASS_IP) by ~50%, leading to faster kernel-space lookup.
+
+### 🚀 PROTOCOL-AGNOSTIC ARCHITECTURE
+- **Agnostic Proxy Chain**: Decoupled transport protocols from the decision logic. Flux now intercepts all traffic by default and dispatches it via a unified `TPROXY_GATE`.
+- **Simplified Configuration**: Removed `PROXY_TCP` and `PROXY_UDP` settings. The system now automatically handles all supported transient traffic.
+- **Unified Entry Points**: Refactored IPTables logic to use single-pass attachment for both `PREROUTING` and `OUTPUT` chains, reducing rule count and kernel overhead.
+
+### 🛡️ REFINE & OPTIMIZE
+- **Unified Proxy Port**: Consolidated `PROXY_TCP_PORT` and `PROXY_UDP_PORT` into a single `PROXY_PORT` for simplified configuration and rule management.
+- **JQ Extraction Refinement**: Updated `jq` logic to exclusively recognize `tproxy` type inbounds, ensuring alignment with the project's focus on transparent proxying.
+
 ## [v1.3.0] - 2026-01-29
 
 ### ⚠️ BREAKING CHANGES

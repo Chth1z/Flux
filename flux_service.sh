@@ -16,12 +16,14 @@ export LOG_COMPONENT="Flux"
 
 # Load configurations (first valid)
 # CACHE_CONFIG_FILE and SETTINGS_FILE are defined in const (which is sourced above), so strict mode is safe.
-for file in "${CACHE_CONFIG_FILE}" "${SETTINGS_FILE}"; do
-    if [ -f "${file}" ]; then
-        set -a; . "${file}"; set +a
-        break
-    fi
-done
+if [ -f "${CACHE_META_FILE}" ] && [ -f "${CACHE_CONFIG_FILE}" ]; then
+    set -a; . "${CACHE_CONFIG_FILE}"; set +a
+elif [ -f "${SETTINGS_FILE}" ]; then
+    set -a; . "${SETTINGS_FILE}"; set +a
+else
+    log_error "No configuration found"
+    exit 1
+fi
 
 # ==============================================================================
 # [ Boot Detection ]
@@ -56,7 +58,8 @@ _start_inotify_module() {
     mkdir -p "${EVENTS_DIR}"
     # Monitor MAGISK_MOD_DIR (disable toggle) ::nd (New, Delete)
     # Monitor EVENTS_DIR (internal events) ::n (New only)
-    nohup inotifyd "${DISPATCHER_SCRIPT}" "${MAGISK_MOD_DIR}:nd" "${EVENTS_DIR}:n" >/dev/null 2>&1 &
+    # Monitor CONF_DIR (config changes) ::w (Write/Modify)
+    nohup inotifyd "${DISPATCHER_SCRIPT}" "${MAGISK_MOD_DIR}:nd" "${EVENTS_DIR}:n" "${CONF_DIR}:wcy" >/dev/null 2>&1 &
     return 0
 }
 

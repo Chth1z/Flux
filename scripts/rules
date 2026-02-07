@@ -10,79 +10,55 @@ set -eu
 [ -n "${BASH_VERSION:-}" ] && set -o pipefail
 
 # ==============================================================================
-# [ UID and Package Resolution Helpers ]
+# [ 1. UID and Package Resolution ]
 # ==============================================================================
 
-# Highly efficient UID resolver using an AWK-based single-pass scan of packages.list
-# Memoization is utilized to avoid redundant parsing for the same package sets.
-_find_packages_uid() {
+# Find and resolve UIDs for specified packages with memoization
+_find_uids() {
     local pkgs="${*}"
     [ -z "${pkgs}" ] && return 0
 
-    # Memoization cache key (sanitize pkgs for variable naming)
-    local cache_key; cache_key=$(printf '%s' "${pkgs}" | tr -c '[:alnum:]' '_')
-    local cache_var="_UID_CACHE_${cache_key}"
-    # Must use :- to safely check if dynamic variable is set (cache hit) or unset (cache miss)
-    # without triggering set -u (nounset) error.
+    # Cache hit check (memoization using dynamic variable)
+    local cache_var; cache_var="_UID_CACHE_$(printf '%s' "${pkgs}" | tr -c '[:alnum:]' '_')"
     eval "local cached_val=\"\${${cache_var}:-}\""
-
     if [ -n "${cached_val}" ]; then
         printf '%s ' "${cached_val}"
         return 0
     fi
 
-    # Efficiently resolve multiple packages to UIDs via Awk
-    local uids
-    uids=$(printf '%s ' "${pkgs}" | awk -v offset="100000" '
+    local uids; uids=$(printf '%s ' "${pkgs}" | awk -v offset="100000" '
     NR == FNR {
         for (i = 1; i <= NF; i++) {
-            pkg = $i; gsub(/\r/, "", pkg);
-            if (pkg == "") continue;
-
-            user = 0;
-            if (index(pkg, ":") > 0) {
-                split(pkg, parts, ":");
-                user = parts[1] + 0;
-                pkg = parts[2];
-            }
-            targets[pkg] = (targets[pkg] == "") ? user : targets[pkg] " " user;
+            pkg = $i; gsub(/\r/, "", pkg); if (pkg == "") continue
+            user = 0
+            if (index(pkg, ":") > 0) { split(pkg, parts, ":"); user = parts[1] + 0; pkg = parts[2] }
+            targets[pkg] = (targets[pkg] == "") ? user : targets[pkg] " " user
         }
-        next;
+        next
     }
     {
         if ($1 in targets) {
-            n = split(targets[$1], users, " ");
-            for (i = 1; i <= n; i++) {
-                printf "%d ", $2 + (users[i] * offset);
-            }
+            n = split(targets[$1], users, " ")
+            for (i = 1; i <= n; i++) printf "%d ", $2 + (users[i] * offset)
         }
-    }
-    ' - "${PACKAGES_LIST}")
+    }' - "${PACKAGES_LIST}")
 
-    if [ -n "${uids}" ]; then
-        eval "${cache_var}=\"${uids}\""
-    fi
+    if [ -n "${uids}" ]; then eval "${cache_var}=\"${uids}\""; fi
     printf '%s ' "${uids}"
     return 0
 }
 
 # ==============================================================================
-# [ Interface & Network Scanning ]
+# [ 2. Interface Config ]
 # ==============================================================================
 
 # Map abstract logical interfaces (mobile, wifi, etc.) to physical device names
-# Returns: name|iface|enabled|hs_v4|hs_v6|excluded
-_get_interface_config() {
-    # format: name|iface|enabled|hs_v4|hs_v6|excluded
+# Returns: name|iface|enabled|hs_v4|hs_v6
+# Fetch and parse network interface configuration
+_get_iface_config() {
     _get_interface_raw | while IFS="|" read -r name iface enabled hs_v4 hs_v6; do
         [ -z "${iface}" ] && continue
-
-        local excluded=0
-        for ex in ${EXCLUDE_INTERFACES}; do
-            if [ "${iface}" = "${ex}" ]; then excluded=1; break; fi
-        done
-
-        printf '%s|%s|%s|%s|%s|%s\n' "${name}" "${iface}" "${enabled}" "${hs_v4}" "${hs_v6}" "${excluded}"
+        printf '%s|%s|%s|%s|%s\n' "${name}" "${iface}" "${enabled}" "${hs_v4}" "${hs_v6}"
     done
     return 0
 }
@@ -98,45 +74,14 @@ EOF
 }
 
 # ==============================================================================
-# [ Rule Building Components ]
+# [ 3. Rule Components ]
 # ==============================================================================
-
-# Build interface-based routing rules (context-aware shortcuts)
-_build_interface_rules() {
-    local suffix="${1}" context="${2}" # context: PRE or OUT
-
-    local chain="BYPASS_INTERFACE_${context}${suffix}"
-    local action="ACTION_PROXY_${context}${suffix}"
-
-    # 1. Base Exclusion Rules
-    printf -- '-A %s -i lo -j RETURN\n' "${chain}"
-
-    # 2. AWK Pipeline: Process all interfaces in one go
-    _get_interface_config | awk -v suffix="${suffix}" \
-        -v chain="${chain}" -v action="${action}" -F "|" '
-    {
-        name=$1; iface=$2; enabled=$3; excluded=$6
-
-        # Directional Shortcuts
-        if (excluded == "1") {
-            printf "-A %s -i %s -j ACTION_BYPASS%s\n", chain, iface, suffix
-            printf "-A %s -o %s -j ACCEPT\n", chain, iface
-        } else if (enabled == "1") {
-            printf "-A %s -i %s -j %s\n", chain, iface, action
-        } else {
-            printf "-A %s -i %s -j ACTION_BYPASS%s\n", chain, iface, suffix
-            printf "-A %s -o %s -j ACCEPT\n", chain, iface
-        }
-    }'
-    return 0
-}
 
 # Build IP-based bypass rules with adaptive jumping
 # Use sub-zones for large sets to keep O(log N), use flat list for small sets.
 _build_bypass_ip_rules() {
     local suffix="${1}" family="${2}"
- 
-    local subnets; [ "${family}" = "6" ] && subnets="${PRIVATE_SUBNETS_V6_COMPACT}" || subnets="${PRIVATE_SUBNETS_V4_COMPACT}"
+    local subnets; [ "${family}" = "6" ] && subnets="${BYPASS_IPv6_LIST}" || subnets="${BYPASS_IPv4_LIST}"
     local chain="BYPASS_IP${suffix}"
 
     # Adaptive decision: only use jump tree for large subnet lists (>= 16)
@@ -148,38 +93,34 @@ _build_bypass_ip_rules() {
         return 0
     fi
 
-    if [ "${family}" = "6" ]; then
-        # IPv6: 16-Zone Jump Tree (Tiered lookup by first nibble)
-        echo "${subnets}" | tr ' ' '\n' | awk -v chain="${chain}" '
-        BEGIN { for(i=0; i<16; i++) zones[i] = 0 }
-        {
-            if ($1 == "") next
+    # IPv4/IPv6 Unified Jump Tree (Adaptive lookup)
+    echo "${subnets}" | tr ' ' '\n' | awk -v chain="${chain}" -v family="${family}" -v suffix="${suffix}" '
+    BEGIN { for(i=0; i<16; i++) zones[i] = 0 }
+    {
+        if ($1 == "") next
+        if (family == "6") {
             clean_ip = $1; sub(/^::/, "", clean_ip);
             first_char = tolower(substr(clean_ip, 1, 1));
             zone = index("0123456789abcdef", first_char) - 1;
             if (zone < 0 || zone > 15) zone = 0;
-            zone_rules[zone] = zone_rules[zone] "-A BYP_Z" zone "6 -d " $1 " -j ACTION_BYPASS6\n"
-            zones[zone] = 1
-        }
-        END {
-            for(i=0; i<16; i++) if (zones[i]) printf "-A %s -d %x000::/4 -j BYP_Z%d6\n", chain, i, i
-            for(i=0; i<16; i++) if (zones[i]) printf "%s", zone_rules[i]
-        }'
-    else
-        echo "${subnets}" | tr ' ' '\n' | awk -v chain="${chain}" '
-        BEGIN { for(i=0; i<16; i++) zones[i] = 0 }
-        {
-            if ($1 == "") next
+            printf "-A BYP_Z%d%s -d %s -j ACTION_BYPASS%s\n", zone, suffix, $1, suffix > "/dev/stdout"
+        } else {
             split($1, octets, "."); zone = int(octets[1] / 16)
             if (zone < 0 || zone > 15) zone = 0;
-            zone_rules[zone] = zone_rules[zone] "-A BYP_Z" zone " -d " $1 " -j ACTION_BYPASS\n"
-            zones[zone] = 1
+            printf "-A BYP_Z%d -d %s -j ACTION_BYPASS\n", zone, $1 > "/dev/stdout"
         }
-        END {
-            for(i=0; i<16; i++) if (zones[i]) printf "-A %s -d %d.0.0.0/4 -j BYP_Z%d\n", chain, i*16, i
-            for(i=0; i<16; i++) if (zones[i]) printf "%s", zone_rules[i]
-        }'
-    fi
+        zones[zone] = 1
+    }
+    END {
+        for(i=0; i<16; i++) {
+            if (!zones[i]) continue
+            if (family == "6") {
+                printf "-A %s -d %x000::/4 -j BYP_Z%d6\n", chain, i, i
+            } else {
+                printf "-A %s -d %d.0.0.0/4 -j BYP_Z%d\n", chain, i*16, i
+            }
+        }
+    }'
     return 0
 }
 
@@ -231,209 +172,252 @@ _build_app_rules() {
         # Blacklist: Proxy everything else
         printf -- '-A APP_CHAIN%s -j %s\n' "${suffix}" "${action_proxy}"
     else
-        # Whitelist: Return to direct for others
-        printf -- '-A APP_CHAIN%s -j RETURN\n' "${suffix}"
+        # Whitelist: ACCEPT (bypass) for apps not in list
+        printf -- '-A APP_CHAIN%s -j ACCEPT\n' "${suffix}"
     fi
-
     return 0
 }
 
-# ==============================================================================
-# [ Main Proxy Rule Orchestrator ]
-# ==============================================================================
-
-# Construct the full Extreme Performance ruleset for a specific IP family
-_build_proxy_rules() {
-    local family="${1}"
-    local suffix=""; [ "${family}" = "6" ] && suffix="6"
-
-    local mark; [ "${family}" = "6" ] && mark="${IPV6_MARK}" || mark="${IPV4_MARK}"
-    local full_mark="${mark}/0xffffffff"
-
-    # Decision Logic ALWAYS resides in Mangle Table for performance and consistency
-    printf -- '*mangle\n'
-    for chain in ${PROXY_CHAINS}; do printf -- ':%s%s - [0:0]\n' "$chain" "$suffix"; done
-
-    # Define Zone sub-chains for Jump Tree only if adaptive logic would use them
-    local subnets; [ "${family}" = "6" ] && subnets="${PRIVATE_SUBNETS_V6_COMPACT}" || subnets="${PRIVATE_SUBNETS_V4_COMPACT}"
-    local count; count=$(echo "${subnets}" | wc -w)
-    if [ "${count}" -ge 16 ]; then
-        for i in $(seq 0 15); do printf -- ':BYP_Z%s%s - [0:0]\n' "$i" "$suffix"; done
-    fi
- 
-    # 0. Define specialized ACTION chains for deduplication
-    if [ "${KFEAT_CONNTRACK}" = "1" ]; then
-        printf -- '-A ACTION_BYPASS%s -j CONNMARK --set-xmark %s/0xffffffff\n' "$suffix" "${BYPASS_MARK}"
-    fi
-    printf -- '-A ACTION_BYPASS%s -j ACCEPT\n' "$suffix"
-
-    # Context-Aware Proxy Actions: Avoid returning to main chain for faster execution
-    # ACTION_PROXY_PRE: Sets marks and directly performs TProxy redirection (Inlined)
-    if [ "${KFEAT_CONNTRACK}" = "1" ]; then
-        printf -- '-A ACTION_PROXY_PRE%s -j CONNMARK --set-xmark %s\n' "$suffix" "$full_mark"
-    fi
-    printf -- '-A ACTION_PROXY_PRE%s -j MARK --set-mark %s\n' "$suffix" "$mark"
-    printf -- '-A ACTION_PROXY_PRE%s -p tcp -j TPROXY --on-port %s --tproxy-mark %s\n' "$suffix" "${PROXY_PORT}" "$mark"
-    printf -- '-A ACTION_PROXY_PRE%s -p udp -j TPROXY --on-port %s --tproxy-mark %s\n' "$suffix" "${PROXY_PORT}" "$mark"
-    printf -- '-A ACTION_PROXY_PRE%s -j ACCEPT\n' "$suffix"
-
-    # ACTION_PROXY_OUT: Sets marks and exits for local routing
-    if [ "${KFEAT_CONNTRACK}" = "1" ]; then
-        printf -- '-A ACTION_PROXY_OUT%s -j CONNMARK --set-xmark %s\n' "$suffix" "$full_mark"
-    fi
-    printf -- '-A ACTION_PROXY_OUT%s -j MARK --set-mark %s\n' "$suffix" "$mark"
-    printf -- '-A ACTION_PROXY_OUT%s -j ACCEPT\n' "$suffix"
- 
-    # 1. Populate sub-chains first
-    _build_bypass_ip_rules "$suffix" "$family"
- 
-    # Cache interface check to avoid redundant pipe/awk calls
-    local active_interfaces; active_interfaces=$(_get_interface_raw | awk -F'|' '$3=="1"{print $2}')
-    if [ -n "${active_interfaces}" ]; then
-        _build_interface_rules "$suffix" "PRE"
-        _build_interface_rules "$suffix" "OUT"
-    fi
-    [ "${APP_PROXY_MODE}" != "0" ] && _build_app_rules "$suffix"
-
-    # 2. FAST-PATH: Stateful & High-Frequency Recovery (Order: REPLY > CONNMARK)
-    if [ "${KFEAT_CONNTRACK}" = "1" ]; then
-        printf -- '-A PROXY_PREROUTING%s -m conntrack --ctdir REPLY -j ACCEPT\n' "$suffix"
-        printf -- '-A PROXY_OUTPUT%s -m conntrack --ctdir REPLY -j ACCEPT\n' "$suffix"
-    fi
-
-    # Fast-Path for Bypass and Proxy (Marked) connections
-    printf -- '-A PROXY_PREROUTING%s -m connmark --mark %s/0xffffffff -j ACCEPT\n' "${suffix}" "${BYPASS_MARK}"
-    printf -- '-A PROXY_OUTPUT%s -m connmark --mark %s/0xffffffff -j ACCEPT\n' "${suffix}" "${BYPASS_MARK}"
-
+_build_action_chain() {
+    local name="${1}" suffix="${2}" mark="${3}" full_mark="${4}" tproxy="${5:-0}"
+    
     if [ "${KFEAT_CONNTRACK}" = "1" ] && [ "${KFEAT_MARK}" = "1" ]; then
-        # Proxy Recover Path: Inline TProxy for existing proxied streams
-        # Note: ctdir ORIGINAL is implicit since REPLY was already handled above
-        printf -- '-A PROXY_PREROUTING%s -m connmark --mark %s -p tcp -j TPROXY --on-port %s --tproxy-mark %s\n' "$suffix" "$full_mark" "${PROXY_PORT}" "$mark"
-        printf -- '-A PROXY_PREROUTING%s -m connmark --mark %s -p udp -j TPROXY --on-port %s --tproxy-mark %s\n' "$suffix" "$full_mark" "${PROXY_PORT}" "$mark"
-        printf -- '-A PROXY_PREROUTING%s -m connmark --mark %s -j ACCEPT\n' "$suffix" "$full_mark"
-
-        printf -- '-A PROXY_OUTPUT%s -m connmark --mark %s -j MARK --set-mark %s\n' "$suffix" "$full_mark" "$mark"
-        printf -- '-A PROXY_OUTPUT%s -m connmark --mark %s -j ACCEPT\n' "$suffix" "$full_mark"
+        printf -- '-A %s -j CONNMARK --set-xmark %s\n' "${name}" "${full_mark}"
+        printf -- '-A %s -j MARK --set-mark %s\n' "${name}" "${mark}"
     fi
 
-    # 3. SLOW-PATH: Decision Tree (IP -> Interface -> App)
-    printf -- '-A PROXY_PREROUTING%s -j BYPASS_IP%s\n' "$suffix" "$suffix"
-    if [ -n "${active_interfaces}" ]; then
-        printf -- '-A PROXY_PREROUTING%s -j BYPASS_INTERFACE_PRE%s\n' "$suffix" "$suffix"
+    if [ "${tproxy}" = "1" ]; then
+        printf -- '-A %s -p tcp -j TPROXY --on-port %s --tproxy-mark %s\n' "${name}" "${PROXY_PORT}" "${mark}"
+        printf -- '-A %s -p udp -j TPROXY --on-port %s --tproxy-mark %s\n' "${name}" "${PROXY_PORT}" "${mark}"
+    fi
+    printf -- '-A %s -j ACCEPT\n' "${name}"
+}
+
+# Build the iptables chain structure (Skeleton) for a specific action
+_build_ipt_chains() {
+    local family="${1}" suffix="${2}" action="${3}"
+    local list="${PROXY_CHAINS}"
+    
+    # Recalculate count internally to ensure accuracy for the current family
+    local subnets; [ "${family}" = "6" ] && subnets="${BYPASS_IPv6_LIST}" || subnets="${BYPASS_IPv4_LIST}"
+    local count; count=$(echo "${subnets}" | wc -w)
+
+    # Add adaptive zones if count exceeds threshold
+    if [ "${count}" -ge 16 ]; then
+        for i in $(seq 0 15); do list="${list} BYP_Z${i}"; done
     fi
 
-    printf -- '-A PROXY_OUTPUT%s -j BYPASS_IP%s\n' "$suffix" "$suffix"
-    if [ -n "${active_interfaces}" ]; then
-        printf -- '-A PROXY_OUTPUT%s -j BYPASS_INTERFACE_OUT%s\n' "$suffix" "$suffix"
-    fi
+    for chain in ${list}; do
+        case "${action}" in
+            create) printf -- ':%s%s - [0:0]\n' "${chain}" "${suffix}" ;;
+            flush)  printf -- '-F %s%s\n' "${chain}" "${suffix}" ;;
+            delete) printf -- '-X %s%s\n' "${chain}" "${suffix}" ;;
+        esac
+    done
+}
 
-    if [ "${APP_PROXY_MODE}" != "0" ]; then
-        printf -- '-A PROXY_OUTPUT%s -j APP_CHAIN%s\n' "$suffix" "$suffix"
-    fi
+_build_fast_path_rules() {
+    local suffix="${1}" mark="${2}" proxy_mark="${3}" bypass_mark="${4}"
+    [ "${KFEAT_CONNTRACK}" = "0" ] && return 0
+    cat <<EOF
+-A PROXY_PREROUTING${suffix} -m conntrack --ctdir REPLY -j ACCEPT
+-A PROXY_OUTPUT${suffix} -m conntrack --ctdir REPLY -j ACCEPT
+EOF
 
-    # 5. FINAL INJECTION: Direct all remaining specific traffic to TProxy Gate (Inlined)
-    # Note: Many packets already exited via ACTION_PROXY_PRE/OUT shortcuts
-    printf -- '-A PROXY_PREROUTING%s -m mark --mark %s -p tcp -j TPROXY --on-port %s --tproxy-mark %s\n' "$suffix" "$mark" "${PROXY_PORT}" "$mark"
-    printf -- '-A PROXY_PREROUTING%s -m mark --mark %s -p udp -j TPROXY --on-port %s --tproxy-mark %s\n' "$suffix" "$mark" "${PROXY_PORT}" "$mark"
-    printf -- '-A PROXY_PREROUTING%s -m mark --mark %s -j ACCEPT\n' "$suffix" "$mark"
-    printf -- '-A PROXY_OUTPUT%s -m mark --mark %s -j ACCEPT\n' "$suffix" "$mark"
-
-    # Attach Flux chains to standard system entry points
-    # Unified Attachment: Intercept all traffic for processing in Flux chains
-    printf -- '-I PREROUTING -j PROXY_PREROUTING%s\n' "$suffix"
-    printf -- '-I OUTPUT -j PROXY_OUTPUT%s\n' "$suffix"
-
-    printf 'COMMIT\n'
+    [ "${KFEAT_MARK}" = "0" ] && return 0
+    cat <<EOF
+-A PROXY_PREROUTING${suffix} -m connmark --mark ${bypass_mark} -j ACCEPT
+-A PROXY_OUTPUT${suffix} -m connmark --mark ${bypass_mark} -j ACCEPT
+-A PROXY_PREROUTING${suffix} -m connmark --mark ${proxy_mark} -p tcp -j TPROXY --on-port ${PROXY_PORT} --tproxy-mark ${mark}
+-A PROXY_PREROUTING${suffix} -m connmark --mark ${proxy_mark} -p udp -j TPROXY --on-port ${PROXY_PORT} --tproxy-mark ${mark}
+-A PROXY_PREROUTING${suffix} -m connmark --mark ${proxy_mark} -j ACCEPT
+-A PROXY_OUTPUT${suffix} -m connmark --mark ${proxy_mark} -j MARK --set-mark ${mark}
+-A PROXY_OUTPUT${suffix} -m connmark --mark ${proxy_mark} -j ACCEPT
+EOF
     return 0
 }
 
-_build_loopback_block() {
+# Build PREROUTING slow-path decision logic
+_build_pre_rules() {
+    local suffix="${1}" chain="${2}" iface_config="${3}"
+    local action="ACTION_PROXY_PRE${suffix}"
+    
+    # 1. IP-based bypass (First priority)
+    printf -- '-A %s -j BYPASS_IP%s\n' "${chain}" "${suffix}"
+
+    # 2. Local Loopback (Internal communication)
+    printf -- '-A %s -i lo -j ACCEPT\n' "${chain}"
+
+    # 3. Interface-based decision
+    echo "${iface_config}" | awk -v chain="${chain}" -v action="${action}" -v include="${INCLUDE_INTERFACES}" -F "|" '
+    BEGIN {
+        split(include, inc, " ")
+        for (i in inc) printf "-A %s -i %s -j %s\n", chain, inc[i], action
+    }
+    {
+        iface=$2; enabled=$3
+        if (enabled == "1") printf "-A %s -i %s -j %s\n", chain, iface, action
+    }'
+
+    # 4. Fallback (Direct connection)
+    printf -- '-A %s -j ACCEPT\n' "${chain}"
+    return 0
+}
+
+# Build OUTPUT slow-path decision logic
+_build_out_rules() {
+    local suffix="${1}" chain="${2}" iface_config="${3}"
+    local action="ACTION_PROXY_OUT${suffix}"
+
+    # 1. IP-based bypass (First priority)
+    printf -- '-A %s -j BYPASS_IP%s\n' "${chain}" "${suffix}"
+
+    # 2. Interface-based bypass (Bypass interfaces & disabled ones)
+    echo "${iface_config}" | awk -v suffix="${suffix}" -v chain="${chain}" -v exclude="${EXCLUDE_INTERFACES}" -F "|" '
+    BEGIN {
+        split(exclude, ex, " ")
+        for (i in ex) printf "-A %s -o %s -j ACTION_BYPASS%s\n", chain, ex[i], suffix
+    }
+    {
+        iface=$2; enabled=$3
+        if (enabled != "1") printf "-A %s -o %s -j ACTION_BYPASS%s\n", chain, iface, suffix
+    }'
+    
+    # 3. Application-based decision tree
+    if [ "${APP_PROXY_MODE}" != "0" ]; then
+        printf -- '-A %s -j APP_CHAIN%s\n' "${chain}" "${suffix}"
+    fi
+
+    # 4. Final Proxy Action (For all traffic that passed the filters)
+    printf -- '-A %s -j %s\n' "${chain}" "${action}"
+    return 0
+}
+
+_build_loopback_rules() {
     local family="${1}" action="${2}"
     [ "${KFEAT_OWNER}" = "0" ] && return 0
     local addr; [ "${family}" = "6" ] && addr="::1" || addr="127.0.0.1"
 
     cat <<EOF
 *filter
-$action OUTPUT -d ${addr} -p tcp -m owner --uid-owner ${CORE_USER} --gid-owner ${CORE_GROUP} -m tcp --dport ${PROXY_PORT} -j REJECT
+${action} OUTPUT -d ${addr} -p tcp -m owner --uid-owner ${CORE_USER} --gid-owner ${CORE_GROUP} -m tcp --dport ${PROXY_PORT} -j REJECT
 COMMIT
 EOF
     return 0
 }
 
-_build_nat_extra() {
+_build_fakeip_rules() {
     local family="${1}" action="${2}"
     { [ "${family}" = "6" ] && [ "${KFEAT_IPV6_NAT}" = "0" ]; } && return 0
 
     local range; [ "${family}" = "6" ] && range="${FAKEIP_V6_RANGE}" || range="${FAKEIP_V4_RANGE}"
     local addr; [ "${family}" = "6" ] && addr="::1" || addr="127.0.0.1"
     local suffix; [ "${family}" = "6" ] && suffix="6" || suffix=""
-
     local proto; [ "${family}" = "6" ] && proto="ipv6-icmp" || proto="icmp"
 
-    printf '*nat\n'
-    printf -- '%s OUTPUT -d %s -p %s -j DNAT --to-destination %s\n' "$action" "$range" "$proto" "$addr"
-    printf -- '%s PREROUTING -d %s -p %s -j DNAT --to-destination %s\n' "$action" "$range" "$proto" "$addr"
+    cat <<EOF
+*nat
+${action} OUTPUT -d ${range} -p ${proto} -j DNAT --to-destination ${addr}
+${action} PREROUTING -d ${range} -p ${proto} -j DNAT --to-destination ${addr}
+COMMIT
+EOF
+    return 0
+}
+
+_build_mss_clamp_rules() {
+    local action="${1}"
+    [ "${MSS_CLAMP_ENABLE}" = "1" ] || return 0
+    cat <<EOF
+*mangle
+${action} POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+COMMIT
+EOF
+    return 0
+}
+
+# ==============================================================================
+# [ 4. Orchestrator ]
+# ==============================================================================
+
+# Orchestrate the complete proxy rule set for a family
+_orchestrate_rules() {
+    local family="${1}"
+    local suffix=""; [ "${family}" = "6" ] && suffix="6"
+    local mark; [ "${family}" = "6" ] && mark="${IPV6_MARK}" || mark="${IPV4_MARK}"
+    local proxy_mark="${mark}/0xffffffff"
+    local bypass_mark="${BYPASS_MARK}/0xffffffff"
+    local iface_config; iface_config=$(_get_iface_config)
+
+    printf -- '*mangle\n'
+
+    _build_ipt_chains "${family}" "${suffix}" "create"
+ 
+    # 0. Define specialized ACTION chains for deduplication
+    if [ "${KFEAT_CONNTRACK}" = "1" ] && [ "${KFEAT_MARK}" = "1" ]; then
+        printf -- '-A ACTION_BYPASS%s -j CONNMARK --set-xmark %s\n' "${suffix}" "${bypass_mark}"
+    fi
+    printf -- '-A ACTION_BYPASS%s -j ACCEPT\n' "${suffix}"
+
+    # Context-Aware Proxy Actions: Avoid returning to main chain for faster execution
+    _build_action_chain "ACTION_PROXY_PRE${suffix}" "${suffix}" "${mark}" "${proxy_mark}" 1
+    _build_action_chain "ACTION_PROXY_OUT${suffix}" "${suffix}" "${mark}" "${proxy_mark}" 0
+ 
+    # 1. Populate sub-chains first
+    _build_bypass_ip_rules "${suffix}" "${family}"
+    [ "${APP_PROXY_MODE}" != "0" ] && _build_app_rules "${suffix}"
+
+    # 2. FAST-PATH: Stateful & High-Frequency Recovery (Order: REPLY > CONNMARK)
+    _build_fast_path_rules "${suffix}" "${mark}" "${proxy_mark}" "${bypass_mark}"
+
+    # 3. SLOW-PATH: Decision Tree
+    _build_pre_rules "${suffix}" "PROXY_PREROUTING${suffix}" "${iface_config}"
+    _build_out_rules "${suffix}" "PROXY_OUTPUT${suffix}" "${iface_config}"
+
+    # Attach Flux chains to standard system entry points
+    printf -- '-I PREROUTING -j PROXY_PREROUTING%s\n' "${suffix}"
+    printf -- '-I OUTPUT -j PROXY_OUTPUT%s\n' "${suffix}"
 
     printf 'COMMIT\n'
     return 0
 }
 
-_build_cleanup_rules() {
+# Orchestrate the cleanup rule set to safely remove all Flux chains
+_orchestrate_cleanup() {
     local family="${1}"
     local suffix=""; [ "${family}" = "6" ] && suffix="6"
 
-    # Clean Mangle
     printf -- '*mangle\n'
-    printf -- '-D PREROUTING -j PROXY_PREROUTING%s\n' "$suffix"
-    printf -- '-D OUTPUT -j PROXY_OUTPUT%s\n' "$suffix"
 
-    for chain in ${PROXY_CHAINS}; do printf -- '-F %s%s\n' "$chain" "$suffix"; done
-    
-    # Adaptive Cleanup: Only flush/delete Zone chains if they exist
-    local subnets; [ "${family}" = "6" ] && subnets="${PRIVATE_SUBNETS_V6_COMPACT}" || subnets="${PRIVATE_SUBNETS_V4_COMPACT}"
-    local count; count=$(echo "${subnets}" | wc -w)
-    if [ "${count}" -ge 16 ]; then
-        for i in $(seq 0 15); do printf -- '-F BYP_Z%s%s\n' "$i" "$suffix"; done
-    fi
-
-    for chain in ${PROXY_CHAINS}; do printf -- '-X %s%s\n' "$chain" "$suffix"; done
-
-    if [ "${count}" -ge 16 ]; then
-        for i in $(seq 0 15); do printf -- '-X BYP_Z%s%s\n' "$i" "$suffix"; done
-    fi
+    printf -- '-D PREROUTING -j PROXY_PREROUTING%s\n' "${suffix}"
+    printf -- '-D OUTPUT -j PROXY_OUTPUT%s\n' "${suffix}"
+ 
+    _build_ipt_chains "${family}" "${suffix}" "flush"
+    _build_ipt_chains "${family}" "${suffix}" "delete"
+ 
     printf 'COMMIT\n'
-
     return 0
 }
 
-# Public APIs
+# ==============================================================================
+# [ 5. Public APIs ]
+# ==============================================================================
 
-generate_all_rules() {
-    local f="${1}"
-    _build_proxy_rules "${f}"
-    _build_loopback_block "${f}" "-A"
-    _build_nat_extra "${f}" "-A"
-
-    # Advanced: MSS Clamping
-    if [ "${MSS_CLAMP_ENABLE}" = "1" ]; then
-        printf '*mangle\n'
-        printf -- '-A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu\n'
-        printf 'COMMIT\n'
-    fi
+# Public API: Generate complete rule stream
+generate_rules() {
+    local family="${1}"
+    _orchestrate_rules "${family}"
+    _build_loopback_rules "${family}" "-A"
+    _build_fakeip_rules "${family}" "-A"
+    _build_mss_clamp_rules "-A"
     return 0
 }
 
-generate_all_cleanup_rules() {
-    local f="${1}"
-    _build_cleanup_rules "${f}"
-    _build_loopback_block "${f}" "-D"
-    _build_nat_extra "${f}" "-D"
-
-    # Advanced: MSS Clamping Cleanup
-    if [ "${MSS_CLAMP_ENABLE}" = "1" ]; then
-        printf '*mangle\n'
-        printf -- '-D POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu\n'
-        printf 'COMMIT\n'
-    fi
+# Public API: Generate cleanup rule stream
+generate_cleanup() {
+    local family="${1}"
+    _orchestrate_cleanup "${family}"
+    _build_loopback_rules "${family}" "-D"
+    _build_fakeip_rules "${family}" "-D"
+    _build_mss_clamp_rules "-D"
     return 0
 }

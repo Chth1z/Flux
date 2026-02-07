@@ -131,7 +131,6 @@ _is_base64() {
         *[!A-Za-z0-9+/=[:space:]]*) return 1 ;;
         *) return 0 ;;
     esac
-    return 0
 }
 
 # ==============================================================================
@@ -304,6 +303,19 @@ _validate_and_deploy() {
 
 do_update() {
     trap _cleanup EXIT INT TERM
+
+    # Load config: prefer cache_config if valid, fallback to settings
+    if [ -f "${CACHE_META_FILE}" ] && [ -f "${CACHE_CONFIG_FILE}" ]; then
+        . "${CACHE_CONFIG_FILE}"
+    elif [ -f "${SETTINGS_FILE}" ]; then
+        . "${SETTINGS_FILE}"
+    else
+        log_error "No configuration found"
+        return 1
+    fi
+
+    log_info "Starting subscription update..."
+
     # Setup safe workspace
     WORK_DIR=$(mktemp -d "${RUN_DIR}/work.XXXXXX") || return 1
     local sub_raw="${WORK_DIR}/sub_raw"
@@ -326,24 +338,15 @@ do_update() {
 }
 
 main() {
-    local action="${1:-}"
+    local action="${1:-update}"
 
     case "${action}" in
-        check)
-            if [ ! -f "${CONFIG_FILE}" ]; then
-                do_update
-            else
-                local last; last=$(stat -c%Y "${CONFIG_FILE}" 2>/dev/null || stat -f%m "${CONFIG_FILE}" 2>/dev/null || echo 0)
-                local now; now=$(date +%s)
-                [ $((now - last)) -ge "${UPDATE_INTERVAL}" ] && do_update || log_debug "Up to date"
-            fi
+        update)
+            do_update
             ;;
         *)
-            for f in "${CACHE_CONFIG_FILE}" "${SETTINGS_FILE}"; do
-                [ -f "${f}" ] && { set -a; . "${f}"; set +a; break; }
-            done
-            log_info "Starting forced update..."
-            do_update
+            echo "Usage: $0 {update}"
+            exit 1
             ;;
     esac
 }

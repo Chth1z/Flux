@@ -26,14 +26,13 @@ readonly LOG_COMPONENT="Cach"
 _atomic_write() {
     local target_file="${1}"; shift
     local tmp_file; tmp_file=$(mktemp "${target_file}.XXXXXX") || return 1
-    trap "rm -f '${tmp_file}'" EXIT
 
-    if "$@" > "${tmp_file}"; then
+    if "$@" > "${tmp_file}" 2>/dev/null; then
         chmod 644 "${tmp_file}"
         mv -f "${tmp_file}" "${target_file}"
-        trap - EXIT
         return 0
     else
+        rm -f "${tmp_file}"
         log_error "Failed to generate cache: ${target_file##*/}"
         return 1
     fi
@@ -44,15 +43,13 @@ _atomic_write() {
 # ==============================================================================
 
 _save_rules_cache() {
-    mkdir -p "$(dirname "${CACHE_RULES_V4_FILE}")" 2>/dev/null
-
     # 1. IPTables Rules (The primary driver)
-    _atomic_write "${CACHE_RULES_V4_FILE}" generate_all_rules "4" || return 1
-    _atomic_write "${CACHE_CLEANUP_V4_FILE}" generate_all_cleanup_rules "4" || return 1
+    _atomic_write "${CACHE_RULES_V4_FILE}" generate_rules "4" || return 1
+    _atomic_write "${CACHE_CLEANUP_V4_FILE}" generate_cleanup "4" || return 1
 
     if [ "${PROXY_IPV6}" = "1" ]; then
-        _atomic_write "${CACHE_RULES_V6_FILE}" generate_all_rules "6" || return 1
-        _atomic_write "${CACHE_CLEANUP_V6_FILE}" generate_all_cleanup_rules "6" || return 1
+        _atomic_write "${CACHE_RULES_V6_FILE}" generate_rules "6" || return 1
+        _atomic_write "${CACHE_CLEANUP_V6_FILE}" generate_cleanup "6" || return 1
     fi
 
     log_debug "Iptables Rules cache saved"
@@ -68,13 +65,13 @@ _save_rules_cache() {
 _save_kernel_cache() {
     local current_kernel
     current_kernel=$(uname -r 2>/dev/null)
-    if [ -f "${KERNEL_CACHE_FILE}" ]; then
+    if [ -f "${CACHE_KERNEL_FILE}" ]; then
         local cached_kernel
-        cached_kernel=$(grep "^#kernel:" "${KERNEL_CACHE_FILE}" 2>/dev/null | cut -d: -f2-)
+        cached_kernel=$(grep "^#kernel:" "${CACHE_KERNEL_FILE}" 2>/dev/null | cut -d: -f2-)
 
         if [ "${cached_kernel}" = "${current_kernel}" ]; then
             log_debug "Kernel Cache valid"
-            set -a; . "${KERNEL_CACHE_FILE}"; set +a
+            set -a; . "${CACHE_KERNEL_FILE}"; set +a
             return 0
         fi
     fi
@@ -117,84 +114,8 @@ _save_kernel_cache() {
     done
     IFS="${old_ifs}"
 
-    mkdir -p "$(dirname "${KERNEL_CACHE_FILE}")" 2>/dev/null
-
-    if _atomic_write "${KERNEL_CACHE_FILE}" printf '%b' "$content"; then
+    if _atomic_write "${CACHE_KERNEL_FILE}" printf '%b' "${content}"; then
         log_debug "Kernel Cache built successfully"
-        return 0
-    else
-        return 1
-    fi
-}
-
-# ==============================================================================
-# [ Meta Cache (Environmental Fingerprint) ]
-# ==============================================================================
-
-# Verify if the current environment matches the cached state.
-# Compares a cryptographic-like signature derived from file mtimes and kernel version.
-_get_mtime() {
-    local file="${1}"
-    if [ -f "${file}" ]; then
-        (stat -c %Y "${file}" 2>/dev/null || stat -f %m "${file}" 2>/dev/null || printf "0") | tr -d '\n\r'
-    else
-        printf "0"
-    fi
-    return 0
-}
-
-_get_version_code() {
-    grep "^versionCode=" "${PROP_FILE}" 2>/dev/null | cut -d= -f2-
-}
-
-_get_meta_signature() {
-    [ -n "${_CACHED_META_SIG:-}" ] && { printf '%s\n' "${_CACHED_META_SIG}"; return 0; }
-    _CACHED_META_SIG=$(printf "vcode:%s\nsettings_mtime:%s\nconfig_mtime:%s\npackages_mtime:%s\nkernel:%s" \
-        "$(_get_version_code)" \
-        "$(_get_mtime "${SETTINGS_FILE}")" \
-        "$(_get_mtime "${CONFIG_FILE}")" \
-        "$(_get_mtime "${PACKAGES_LIST}")" \
-        "$(uname -r 2>/dev/null)")
-    printf '%s\n' "${_CACHED_META_SIG}"
-    return 0
-}
-
-_is_cache_valid() {
-    # Fast check: core files must exist
-    for f in "${CACHE_META_FILE}" "${CACHE_CONFIG_FILE}" "${KERNEL_CACHE_FILE}" "${CACHE_RULES_V4_FILE}"; do
-        if [ ! -f "${f}" ]; then
-            log_debug "Cache invalid: missing core file ${f##*/}"
-            return 1
-        fi
-    done
-    local current_sig
-    current_sig=$(_get_meta_signature)
-    local cached_sig
-    cached_sig=$(awk '
-        /^#build_ts:/ { next }
-        /^#/ { sub(/^#/, ""); print }
-    ' "${CACHE_META_FILE}" 2>/dev/null)
-
-    if [ "${current_sig}" = "${cached_sig}" ]; then
-        log_debug "Cache is valid"
-        return 0
-    fi
-    # Debug mismatch
-    log_debug "Cache signature mismatch"
-    return 1
-}
-
-# Save a snapshot of the current environment state for future validation.
-_save_meta_cache() {
-    local sig
-    sig=$(_get_meta_signature)
-    mkdir -p "$(dirname "${CACHE_META_FILE}")" 2>/dev/null
-    _gen_meta() {
-        printf '%s\n' "$sig" | sed 's/^/#/'
-        printf '#build_ts:%s\n' "$(date +%s)"
-    }
-    if _atomic_write "${CACHE_META_FILE}" _gen_meta; then
-        log_debug "Meta cache saved"
         return 0
     else
         return 1
@@ -210,13 +131,12 @@ _normalize_list() {
 }
 
 _save_config_cache() {
-    mkdir -p "$(dirname "${CACHE_CONFIG_FILE}")" 2>/dev/null
     local _app_list
     _app_list=$(_normalize_list "${APP_LIST}")
     _gen_config() {
         cat << EOF
 # Flux Config Cache - Auto Generated
-SUBSCRIPTION_URL="${SUBSCRIPTION_URL}"
+SUBSCRIPTION_URL=${SUBSCRIPTION_URL}
 UPDATE_TIMEOUT=${UPDATE_TIMEOUT}
 RETRY_COUNT=${RETRY_COUNT}
 UPDATE_INTERVAL=${UPDATE_INTERVAL}
@@ -230,8 +150,6 @@ MOBILE_INTERFACE="${MOBILE_INTERFACE}"
 WIFI_INTERFACE="${WIFI_INTERFACE}"
 HOTSPOT_INTERFACE="${HOTSPOT_INTERFACE}"
 USB_INTERFACE="${USB_INTERFACE}"
-HOTSPOT_V4_RANGE="${HOTSPOT_V4_RANGE}"
-HOTSPOT_V6_RANGE="${HOTSPOT_V6_RANGE}"
 PROXY_PORT=${PROXY_PORT}
 FAKEIP_V4_RANGE=${FAKEIP_V4_RANGE}
 FAKEIP_V6_RANGE=${FAKEIP_V6_RANGE}
@@ -240,16 +158,12 @@ PROXY_WIFI=${PROXY_WIFI}
 PROXY_HOTSPOT=${PROXY_HOTSPOT}
 PROXY_USB=${PROXY_USB}
 PROXY_IPV6=${PROXY_IPV6}
-TABLE_ID=${TABLE_ID}
-IPV4_MARK=${IPV4_MARK}
-IPV6_MARK=${IPV6_MARK}
-BYPASS_MARK=${BYPASS_MARK}
 ROUTING_MARK="${ROUTING_MARK}"
 APP_PROXY_MODE=${APP_PROXY_MODE}
 APP_LIST="${_app_list}"
-SKIP_CHECK_FEATURE=${SKIP_CHECK_FEATURE}
 MSS_CLAMP_ENABLE=${MSS_CLAMP_ENABLE}
 EXCLUDE_INTERFACES="${EXCLUDE_INTERFACES}"
+INCLUDE_INTERFACES="${INCLUDE_INTERFACES}"
 EOF
     }
     if _atomic_write "${CACHE_CONFIG_FILE}" _gen_config; then
@@ -260,6 +174,20 @@ EOF
     fi
 }
 
+# ==============================================================================
+# [ Meta Cache (Validity Marker) ]
+# ==============================================================================
+
+# Create meta marker to indicate cache is valid.
+_save_meta_cache() {
+    if touch "${CACHE_META_FILE}"; then
+        log_debug "Meta marker saved"
+        return 0
+    else
+        log_error "Failed to save meta marker"
+        return 1
+    fi
+}
 
 # ==============================================================================
 # [ Main Cache Orchestration ]
@@ -267,6 +195,7 @@ EOF
 
 # Sequential build of all project caches.
 build_all_caches() {
+    mkdir -p "${CACHE_DIR}" 2>/dev/null
     run "Validate system config" validate_all || return 1
     run "Save kernel capability" _save_kernel_cache || return 1
     run "Save normalized config" _save_config_cache || return 1
@@ -275,35 +204,17 @@ build_all_caches() {
     return 0
 }
 
-# Entry Point (Standalone Execution)
-
-check_cache() {
-    if _is_cache_valid; then
-        log_info "All caches are valid, skipping build"
-    else
-        log_info "Cache invalid or missing, rebuilding..."
-        if build_all_caches; then
-            return 0
-        else
-            log_error "Cache rebuild failed"
-            return 1
-        fi
-    fi
-    return 0
-}
-
+# Entry Point
 main() {
     local action="${1:-}"
 
     case "${action}" in
-        check)
-            check_cache
-            ;;
         build)
             build_all_caches
             ;;
         *)
-            check_cache
+            echo "Usage: $0 build"
+            exit 1
             ;;
     esac
 }

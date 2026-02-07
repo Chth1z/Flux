@@ -45,7 +45,6 @@ _launch_singbox() {
         rm -f "${tmp_pid}"
         return 1
     fi
-    return 0
 }
 
 _check_port() {
@@ -123,8 +122,6 @@ start_core() {
     return 0
 }
 
-# Public Control API (Stop)
-
 stop_core() {
     run "Kill process" _kill_core || return 1
     return 0
@@ -136,7 +133,7 @@ stop_core() {
 main() {
     local action="${1:-}"
 
-    case "$action" in
+    case "${action}" in
         start)
             start_core
             ;;

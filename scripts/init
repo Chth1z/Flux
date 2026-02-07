@@ -52,10 +52,8 @@ _cleanup_failure() {
 # ==============================================================================
 
 _init_dirs() {
-    # Ensure fresh state for events and locks
-    rmdir "${READY_LOCK}" 2>/dev/null
-
-    local dir; for dir in "${RUN_DIR}" "${CACHE_DIR}" "${EVENTS_DIR}"; do
+    local dir
+    for dir in "${RUN_DIR}" "${CACHE_DIR}" "${EVENTS_DIR}"; do
         [ ! -d "${dir}" ] && mkdir -p "${dir}"
     done
     [ -d "${RUN_DIR}" ] && chmod 0755 "${RUN_DIR}"
@@ -63,45 +61,72 @@ _init_dirs() {
 }
 
 # ==============================================================================
-# [ Subscription Update Trigger ]
-# ==============================================================================
-
-_check_update() {
-    log_debug "Checking for subscription updates"
-    sh "${UPDATE_SCRIPT}" check || log_debug "Update check completed"
-}
-
-# ==============================================================================
 # [ Log Maintenance ]
 # ==============================================================================
 
-_rotate_file() {
-    local file="${1}"
-    [ ! -f "${file}" ] && return 0
-
-    # Use -L for link follows if needed, but here we expect regular files
-    local sz; sz=$(stat -c%s "${file}" 2>/dev/null || stat -f%z "${file}" 2>/dev/null || echo 0)
-
-    if [ "${sz}" -gt "${LOG_MAX_SIZE}" ]; then
-        log_info "Rotating ${file##*/} (size: ${sz})"
-        # Copy + Truncate: Safer for concurrent writers
-        cp -f "${file}" "${file}.bak" && : > "${file}"
-    fi
-}
-
 _rotate_log() {
-    _rotate_file "${FLUX_LOG}"
-    _rotate_file "${SING_BOX_LOG}"
+    local log sz
+    for log in "${FLUX_LOG}" "${SING_BOX_LOG}"; do
+        [ ! -f "${log}" ] && continue
+        sz=$(stat -c%s "${log}" 2>/dev/null || stat -f%z "${log}" 2>/dev/null || echo 0)
+        if [ "${sz}" -gt "${LOG_MAX_SIZE}" ]; then
+            log_info "Rotating ${log##*/} (size: ${sz})"
+            cp -f "${log}" "${log}.bak" && : > "${log}"
+        fi
+    done
     return 0
 }
+
+# ==============================================================================
+# [ Cache Validation ]
+# ==============================================================================
+
+_validate_cache() {
+    # Cache validation: check meta marker, rebuild if missing
+    if [ -f "${CACHE_META_FILE}" ]; then
+        log_info "Cache is valid, skipping build"
+    else
+        log_info "Cache invalid or missing, rebuilding..."
+        if ! sh "${CACHE_SCRIPT}" build; then
+            log_error "Cache rebuild failed"
+            touch "${EVENT_FAIL}"
+            return 1
+        fi
+    fi
+    return 0
+}
+
+# ==============================================================================
+# [ Update Check ]
+# ==============================================================================
+
+_check_update() {
+    if [ ! -f "${CONFIG_FILE}" ]; then
+        sh "${UPDATE_SCRIPT}" update
+    else
+        local last; last=$(stat -c%Y "${CONFIG_FILE}" 2>/dev/null || stat -f%m "${CONFIG_FILE}" 2>/dev/null || echo 0)
+        local now; now=$(date +%s)        
+        if [ $((now - last)) -ge "${UPDATE_INTERVAL}" ]; then
+            sh "${UPDATE_SCRIPT}" update
+        else
+            log_debug "Config up to date"
+        fi
+    fi
+    return 0
+}
+
+# ==============================================================================
+# [ Init Environment ]
+# ==============================================================================
 
 init_env() {
     _cleanup_failure
     _init_dirs || { touch "${EVENT_FAIL}"; return 1; }
     _check_integrity || { touch "${EVENT_FAIL}"; return 1; }
-    _check_update
-    sh "${CACHE_SCRIPT}" check || { touch "${EVENT_FAIL}"; return 1; }
+    _check_update || { touch "${EVENT_FAIL}"; return 1; }
+    _validate_cache || { touch "${EVENT_FAIL}"; return 1; }
     _rotate_log 2>/dev/null
+    touch "${EVENT_INIT_OK}"
     return 0
 }
 
@@ -112,19 +137,13 @@ init_env() {
 main() {
     local action="${1:-}"
 
-    case "$action" in
+    case "${action}" in
         init)
-            if init_env; then
-                log_info "Initialization completed"
-                touch "${EVENT_INIT_OK}"
-                return 0
-            else
-                return 1
-            fi
+            init_env
             ;;
         *)
             echo "Usage: $0 {init}"
-            return 1
+            exit 1
             ;;
     esac
 }

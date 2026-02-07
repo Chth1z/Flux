@@ -33,9 +33,6 @@ _init_config_defaults() {
     : "${WIFI_INTERFACE:=wlan0}"
     : "${HOTSPOT_INTERFACE:=wlan2}"
     : "${USB_INTERFACE:=rndis+}"
-    # [ Tethering & Hotspot ]
-    : "${HOTSPOT_V4_RANGE:=192.168.43.0/24}"
-    : "${HOTSPOT_V6_RANGE:=fe80::/10}"
     # [ Proxy Engine ]
     : "${PROXY_PORT:=1536}"
     : "${FAKEIP_V4_RANGE:=198.18.0.0/15}"
@@ -46,19 +43,15 @@ _init_config_defaults() {
     : "${PROXY_HOTSPOT:=1}"
     : "${PROXY_USB:=1}"
     : "${PROXY_IPV6:=0}"
-    # [ Network & Routing ]
-    : "${TABLE_ID:=2025}"
-    : "${IPV4_MARK:=0x14}"
-    : "${IPV6_MARK:=0x19}"
-    : "${BYPASS_MARK:=0x11}"
+    # [ Routing Mark ]
     : "${ROUTING_MARK:=}"
     # [ Application Filtering ]
     : "${APP_PROXY_MODE:=0}"
     : "${APP_LIST:=}"
     # [ Performance & Compatibility ]
-    : "${SKIP_CHECK_FEATURE:=0}"
     : "${MSS_CLAMP_ENABLE:=1}"
     : "${EXCLUDE_INTERFACES:=}"
+    : "${INCLUDE_INTERFACES:=}"
     return 0
 }
 
@@ -79,7 +72,9 @@ _extract_json_config() {
     ' "${CONFIG_FILE}" 2>/dev/null) || return 0
 
     local extracted_port v4 v6
-    IFS='|' read -r extracted_port v4 v6 <<< "${json_output}"
+    IFS='|' read -r extracted_port v4 v6 << EOF
+${json_output}
+EOF
 
     if [ -n "${extracted_port}" ]; then
         PROXY_PORT="${extracted_port}"
@@ -102,52 +97,52 @@ _extract_json_config() {
 _validate_int() {
     local name="${1}" val="${2}" min="${3}" max="${4}"
     # Allow empty values for optional fields (like ROUTING_MARK)
-    [ -z "$val" ] && return 0
-    case "$val" in
+    [ -z "${val}" ] && return 0
+    case "${val}" in
         *[!0-9]*)
-            printf '  • %s: invalid number "%s"\n' "$name" "$val"
+            printf '  • %s: invalid number "%s"\n' "${name}" "${val}"
             return 1
             ;;
     esac
 
-    if [ "$val" -lt "$min" ] || [ "$val" -gt "$max" ]; then
-        printf '  • %s: out of range (%s, allowed: %s-%s)\n' "$name" "$val" "$min" "$max"
+    if [ "${val}" -lt "${min}" ] || [ "${val}" -gt "${max}" ]; then
+        printf '  • %s: out of range (%s, allowed: %s-%s)\n' "${name}" "${val}" "${min}" "${max}"
         return 1
     fi
     return 0
 }
 
-_validate_user_group() {
+_validate_ident() {
     local name="${1}" val="${2}"
-    [ -z "$val" ] && { printf '  • %s: cannot be empty\n' "$name"; return 1; }
-    case "$val" in
+    [ -z "${val}" ] && { printf '  • %s: cannot be empty\n' "${name}"; return 1; }
+    case "${val}" in
         [0-9]*) return 0 ;; # Allows 0x marks and numeric IDs
         *[!a-zA-Z0-9_]*)
-            printf '  • %s: invalid characters in "%s"\n' "$name" "$val"
+            printf '  • %s: invalid characters in "%s"\n' "${name}" "${val}"
             return 1
             ;;
     esac
     return 0
 }
 
-_validate_range() {
+_validate_cidr() {
     local name="${1}" val="${2}"
-    [ -z "$val" ] && return 0
-    case "$val" in
+    [ -z "${val}" ] && return 0
+    case "${val}" in
         *[!-0-9a-fA-F.:/]*)
-            printf '  • %s: invalid characters in range "%s"\n' "$name" "$val"
+            printf '  • %s: invalid characters in CIDR "%s"\n' "${name}" "${val}"
             return 1
             ;;
     esac
     return 0
 }
 
-_validate_pkglist() {
+_validate_pkg_list() {
     local name="${1}" val="${2}"
-    [ -z "$val" ] && return 0
-    case "$val" in
+    [ -z "${val}" ] && return 0
+    case "${val}" in
         *[!-a-zA-Z0-9._[:space:]]*)
-            printf '  • %s: invalid characters in application list\n' "$name"
+            printf '  • %s: invalid characters in package list\n' "${name}"
             return 1
             ;;
     esac
@@ -156,18 +151,18 @@ _validate_pkglist() {
 
 _validate_url() {
     local name="${1}" val="${2}"
-    [ -z "$val" ] && return 0
-    case "$val" in
+    [ -z "${val}" ] && return 0
+    case "${val}" in
         http://*|https://*)
-            case "$val" in
+            case "${val}" in
                 *[[:space:]\"\'\<\>\;\`\|]*)
-                    printf '  • %s: contains illegal characters\n' "$name"
+                    printf '  • %s: contains illegal characters\n' "${name}"
                     return 1
                     ;;
             esac
             ;;
         *)
-            printf '  • %s: invalid protocol (must be http/https)\n' "$name"
+            printf '  • %s: invalid protocol (must be http/https)\n' "${name}"
             return 1
             ;;
     esac
@@ -176,13 +171,13 @@ _validate_url() {
 
 _validate_iface() {
     local name="${1}" val="${2}"
-    case "$val" in
+    case "${val}" in
         ''|*[!a-zA-Z0-9._+]*)
-            printf '  • %s: invalid interface name format "%s"\n' "$name" "$val"
+            printf '  • %s: invalid interface name format "%s"\n' "${name}" "${val}"
             return 1
             ;;
         *+*)
-            [ "${val#*+}" = "" ] || { printf '  • %s: wildcard must be at end: "%s"\n' "$name" "$val"; return 1; }
+            [ "${val#*+}" = "" ] || { printf '  • %s: wildcard must be at end: "%s"\n' "${name}" "${val}"; return 1; }
             ;;
     esac
     return 0
@@ -190,10 +185,10 @@ _validate_iface() {
 
 _validate_iface_list() {
     local name="${1}" val="${2}"
-    [ -z "$val" ] && return 0
+    [ -z "${val}" ] && return 0
     local iface
-    for iface in $val; do
-        _validate_iface "$name" "$iface" || return 1
+    for iface in ${val}; do
+        _validate_iface "${name}" "${iface}" || return 1
     done
     return 0
 }
@@ -212,62 +207,56 @@ UPDATE_INTERVAL:int:0:31536000
 PREF_CLEANUP_EMOJI:int:0:1
 LOG_LEVEL:int:0:4
 LOG_MAX_SIZE:int:10240:104857600
-CORE_USER:user
-CORE_GROUP:user
+CORE_USER:ident
+CORE_GROUP:ident
 CORE_TIMEOUT:int:1:60
 MOBILE_INTERFACE:iface
 WIFI_INTERFACE:iface
 HOTSPOT_INTERFACE:iface
 USB_INTERFACE:iface
-HOTSPOT_V4_RANGE:range
-HOTSPOT_V6_RANGE:range
 PROXY_PORT:int:1:65535
-FAKEIP_V4_RANGE:range
-FAKEIP_V6_RANGE:range
+FAKEIP_V4_RANGE:cidr
+FAKEIP_V6_RANGE:cidr
 PROXY_MOBILE:int:0:1
 PROXY_WIFI:int:0:1
 PROXY_HOTSPOT:int:0:1
 PROXY_USB:int:0:1
 PROXY_IPV6:int:0:1
-TABLE_ID:int:1:65535
-IPV4_MARK:user
-IPV6_MARK:user
-BYPASS_MARK:user
 ROUTING_MARK:int:0:65535
 APP_PROXY_MODE:int:0:2
-APP_LIST:pkglist
-SKIP_CHECK_FEATURE:int:0:1
+APP_LIST:pkg_list
 MSS_CLAMP_ENABLE:int:0:1
-EXCLUDE_INTERFACES:iflist
+EXCLUDE_INTERFACES:iface_list
+INCLUDE_INTERFACES:iface_list
 "
 
 # Iterate through the schema and validate each current variable value
 _validate_settings() {
     log_debug "Validating runtime settings..."
     local valid=0 name type p1 p2 val
-    while IFS=: read -r name type p1 p2 || [ -n "$name" ]; do
-        [ -z "$name" ] || [ "${name#\#}" != "$name" ] && continue
+    while IFS=: read -r name type p1 p2 || [ -n "${name}" ]; do
+        [ -z "${name}" ] || [ "${name#\#}" != "${name}" ] && continue
 
         # Security: Prevent eval injection via variable names
-        case "$name" in *[!a-zA-Z0-9_]*) continue ;; esac
+        case "${name}" in *[!a-zA-Z0-9_]*) continue ;; esac
         # Strict mode: If variable is not set, this should error out if we assume it must be set.
         # However, _init_config_defaults should have set them.
         # We use explicit ${VAR} without default to catch initialization failures.
         eval "val=\"\${$name}\""
 
-        case "$type" in
-            int)     _validate_int "$name" "$val" "$p1" "$p2" || valid=1 ;;
-            iface)   _validate_iface "$name" "$val" || valid=1 ;;
-            iflist)  _validate_iface_list "$name" "$val" || valid=1 ;;
-            user)    _validate_user_group "$name" "$val" || valid=1 ;;
-            url)     _validate_url "$name" "$val" || valid=1 ;;
-            range)   _validate_range "$name" "$val" || valid=1 ;;
-            pkglist) _validate_pkglist "$name" "$val" || valid=1 ;;
+        case "${type}" in
+            int)        _validate_int "${name}" "${val}" "${p1}" "${p2}" || valid=1 ;;
+            ident)      _validate_ident "${name}" "${val}" || valid=1 ;;
+            url)        _validate_url "${name}" "${val}" || valid=1 ;;
+            cidr)       _validate_cidr "${name}" "${val}" || valid=1 ;;
+            iface)      _validate_iface "${name}" "${val}" || valid=1 ;;
+            iface_list) _validate_iface_list "${name}" "${val}" || valid=1 ;;
+            pkg_list)   _validate_pkg_list "${name}" "${val}" || valid=1 ;;
         esac
     done << EOF
-$VALIDATION_SCHEMA
+${VALIDATION_SCHEMA}
 EOF
-    return "$valid"
+    return "${valid}"
 }
 
 # ------------------------------------------------------------------------------
@@ -276,17 +265,17 @@ EOF
 _validate_singbox_config() {
     log_debug "Validating sing-box configuration..."
     local bin="${SING_BOX_BIN}"
-    if [ ! -x "$bin" ]; then
-        [ -f "$bin" ] && chmod +x "$bin" 2>/dev/null
-        if [ ! -x "$bin" ]; then
+    if [ ! -x "${bin}" ]; then
+        [ -f "${bin}" ] && chmod +x "${bin}" 2>/dev/null
+        if [ ! -x "${bin}" ]; then
             printf '  • sing-box binary not executable or missing\n'
             return 1
         fi
     fi
     local err_out
-    if ! err_out=$("$bin" check -c "${CONFIG_FILE}" -D "${RUN_DIR}" 2>&1); then
+    if ! err_out=$("${bin}" check -c "${CONFIG_FILE}" -D "${RUN_DIR}" 2>&1); then
         printf '  • sing-box config validation failed:\n'
-        echo "$err_out" | while read -r line; do printf '    >> %s\n' "$line"; done
+        echo "${err_out}" | while read -r line; do printf '    >> %s\n' "${line}"; done
         return 1
     fi
     return 0
@@ -300,11 +289,11 @@ _validate_singbox_config() {
 validate_all() {
     # 1. Verify and sourge user settings
     if [ -f "${SETTINGS_FILE}" ]; then
-        if ! sh -n "$SETTINGS_FILE" 2>/dev/null; then
-            log_error "Syntax error in $SETTINGS_FILE"
+        if ! sh -n "${SETTINGS_FILE}" 2>/dev/null; then
+            log_error "Syntax error in ${SETTINGS_FILE}"
             return 1
         fi
-        . "$SETTINGS_FILE"
+        . "${SETTINGS_FILE}"
     fi
     # 2. Populate defaults and extract dynamic config
     _init_config_defaults
@@ -315,8 +304,8 @@ validate_all() {
         _validate_settings
         _validate_singbox_config
     )
-    if [ -n "$errors" ]; then
-        log_error "Validation failed:\n$errors"
+    if [ -n "${errors}" ]; then
+        log_error "Validation failed:\n${errors}"
         return 1
     fi
     log_debug "System validation passed"

@@ -11,13 +11,15 @@
 # ==============================================================================
 
 readonly FLUX_DIR="/data/adb/flux"
+readonly MAGISK_MOD_DIR="/data/adb/modules/flux"
+
 readonly BIN_DIR="${FLUX_DIR}/bin"
 readonly CACHE_DIR="${FLUX_DIR}/cache"
 readonly CONF_DIR="${FLUX_DIR}/conf"
 readonly RUN_DIR="${FLUX_DIR}/run"
 readonly EVENTS_DIR="${RUN_DIR}/event"
 readonly SCRIPTS_DIR="${FLUX_DIR}/scripts"
-readonly MAGISK_MOD_DIR="/data/adb/modules/flux"
+
 
 # ==============================================================================
 # [ Core Binaries & Environment ]
@@ -42,14 +44,12 @@ readonly PACKAGES_LIST="/data/system/packages.list"
 # [ Runtime & Log Files ]
 # ==============================================================================
 
-readonly MONITOR_PID_FILE="${RUN_DIR}/ipmonitor.pid"
-readonly FIFO_FILE="${RUN_DIR}/ipmonitor.fifo"
-readonly SING_BOX_PID_FILE="${RUN_DIR}/sing-box.pid"
 readonly FLUX_LOG="${RUN_DIR}/flux.log"
+readonly FIFO_FILE="${RUN_DIR}/ipmonitor.fifo"
+readonly MONITOR_PID_FILE="${RUN_DIR}/ipmonitor.pid"
+readonly SING_BOX_PID_FILE="${RUN_DIR}/sing-box.pid"
 readonly SING_BOX_LOG="${RUN_DIR}/sing-box.log"
-readonly SRI_STATE_FILE="${RUN_DIR}/sri_state_ips"
 
-readonly READY_LOCK="${EVENTS_DIR}/ready_lock"
 readonly EVENT_FAIL="${EVENTS_DIR}/fail"
 readonly EVENT_INIT_OK="${EVENTS_DIR}/init_ok"
 readonly EVENT_CORE_OK="${EVENTS_DIR}/core_ok"
@@ -76,7 +76,7 @@ readonly UPDATE_SCRIPT="${SCRIPTS_DIR}/updater.sh"
 
 readonly CACHE_META_FILE="${CACHE_DIR}/cache_meta"
 readonly CACHE_CONFIG_FILE="${CACHE_DIR}/cache_config"
-readonly KERNEL_CACHE_FILE="${CACHE_DIR}/cache_kernel"
+readonly CACHE_KERNEL_FILE="${CACHE_DIR}/cache_kernel"
 readonly CACHE_RULES_V4_FILE="${CACHE_DIR}/cache_rules_ipv4"
 readonly CACHE_RULES_V6_FILE="${CACHE_DIR}/cache_rules_ipv6"
 readonly CACHE_CLEANUP_V4_FILE="${CACHE_DIR}/cache_cleanup_ipv4"
@@ -87,9 +87,24 @@ readonly CACHE_CLEANUP_V6_FILE="${CACHE_DIR}/cache_cleanup_ipv6"
 # ==============================================================================
 
 # Chain names for Proxy and Bypass logic
-readonly PROXY_CHAINS="PROXY_PREROUTING PROXY_OUTPUT BYPASS_IP BYPASS_INTERFACE_PRE BYPASS_INTERFACE_OUT APP_CHAIN ACTION_PROXY_PRE ACTION_PROXY_OUT ACTION_BYPASS"
+readonly PROXY_CHAINS="PROXY_PREROUTING PROXY_OUTPUT BYPASS_IP APP_CHAIN ACTION_PROXY_PRE ACTION_PROXY_OUT ACTION_BYPASS"
 
-# Optimized IP Bypasses for Android (Carrier-Safe + RFC 1918/6890/4193)
-# These represent subnets that should ALWAYS bypass the proxy (Local/Private/Multicast)
-readonly PRIVATE_SUBNETS_V4_COMPACT="0.0.0.0/8 10.0.0.0/8 100.0.0.0/8 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.0.0.0/24 192.168.0.0/16 224.0.0.0/4 240.0.0.0/4"
-readonly PRIVATE_SUBNETS_V6_COMPACT="::/128 ::1/128 ::ffff:0:0/96 100::/64 64:ff9b::/96 fc00::/7 fe80::/10 ff00::/8"
+# IP Bypasses for Android (Carrier-Safe + RFC 1918/6890/4193)
+readonly BYPASS_IPv4_LIST="0.0.0.0/8 10.0.0.0/8 100.0.0.0/8 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.0.0.0/24 192.0.2.0/24 192.88.99.0/24 192.168.0.0/16 198.51.100.0/24 203.0.113.0/24 224.0.0.0/4 240.0.0.0/4 255.255.255.255/32"
+readonly BYPASS_IPv6_LIST="::/128 ::1/128 ::ffff:0:0/96 100::/64 64:ff9b::/96 2001::/32 2001:10::/28 2001:20::/28 2001:db8::/32 2002::/16 fe80::/10 ff00::/8"
+
+# Hotspot IP Ranges
+readonly HOTSPOT_V4_RANGE="192.168.43.0/24"
+readonly HOTSPOT_V6_RANGE="fe80::/10"
+
+# Routing & PBR Constants
+# These define the topological structure of Flux routing in the Linux stack.
+readonly SRI_RULE_PREF=1900
+readonly TABLE_ID=2025
+
+# Netfilter Marks
+readonly IPV4_MARK=0x14
+readonly IPV6_MARK=0x19
+readonly BYPASS_MARK=0x11
+
+

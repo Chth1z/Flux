@@ -72,7 +72,7 @@ _init_prop_orig_desc() {
     [ -n "${_PROP_ORIG_DESC}" ] && return 0
     # 1. Try memory cache first (System Property)
     _PROP_ORIG_DESC=$(getprop flux.prop.orig)
-    if [ -n "$_PROP_ORIG_DESC" ]; then
+    if [ -n "${_PROP_ORIG_DESC}" ]; then
         return 0
     fi
     # 2. Fallback to file reading
@@ -80,7 +80,7 @@ _init_prop_orig_desc() {
     # Strip potential previous status (newlines)
     _PROP_ORIG_DESC="${_PROP_ORIG_DESC%%\\n*}"
     # Reset if already contains emoji (previous status recovery)
-    case "$_PROP_ORIG_DESC" in
+    case "${_PROP_ORIG_DESC}" in
         *"🥰"*|*"😴"*|*"🤯"*|*"🤔"*) _PROP_ORIG_DESC="Seamlessly redirect your network Flux." ;;
         *"description="*) _PROP_ORIG_DESC="${_PROP_ORIG_DESC#description=}" ;;
     esac
@@ -132,7 +132,6 @@ _prop_write() {
 
     local full_desc="${_PROP_ORIG_DESC}\\n${status}"
     local tmp_file; tmp_file=$(mktemp "${PROP_FILE}.XXXXXX")
-    trap "rm -f '${tmp_file}'" EXIT
 
     if DESC="${full_desc}" awk -v d="description=" '
         BEGIN { pattern = "^" d }
@@ -143,9 +142,9 @@ _prop_write() {
         mv -f "${tmp_file}" "${PROP_FILE}"
         setprop flux.prop.last "${status}"
         log_debug "Prop updated: ${status}"
-        trap - EXIT
         return 0
     else
+        rm -f "${tmp_file}"
         log_error "Failed to update module.prop"
         return 1
     fi
@@ -183,7 +182,9 @@ _prop_get_current_left() {
     printf '%s\n' "${left:-$(_prop_build_left)}"
 }
 
+# ==============================================================================
 # Public Logging API
+# ==============================================================================
 
 # Sync state to prop (update left, preserve right)
 sync_prop() {
@@ -236,7 +237,6 @@ log_banner() {
     local msg=" ${1} "
     local width=50
     local sym="="
-
     local len=${#msg}
     local side=$(( (width - len) / 2 ))
     [ "${side}" -lt 0 ] && side=0

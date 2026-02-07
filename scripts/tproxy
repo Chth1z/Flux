@@ -20,119 +20,32 @@ readonly SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 readonly LOG_COMPONENT="Tprx"
 
 # ==============================================================================
-# [ Command Wrappers ]
+# [ 1. Helpers & Core Wrappers ]
 # ==============================================================================
 
-# Generic wrapper for iptables/ip6tables with wait lock
 _run_ipt_command() {
     local cmd="${1}"; shift
     command "${cmd}" -w 100 "$@"
 }
 
-# ==============================================================================
-# [ Rule Management (Apply/Cleanup) ]
-# ==============================================================================
-
-# Apply or Cleanup cached rules atomically
-_manage_proxy_rules() {
-    local family="${1}"
-    local action="${2}" # "apply" or "cleanup"
-    local restore_cmd="iptables-restore"
-    local rules_file
-
-    if [ "${family}" = "6" ]; then
-        restore_cmd="ip6tables-restore"
-        [ "${action}" = "apply" ] && rules_file="${CACHE_RULES_V6_FILE}" || rules_file="${CACHE_CLEANUP_V6_FILE}"
-    else
-        [ "${action}" = "apply" ] && rules_file="${CACHE_RULES_V4_FILE}" || rules_file="${CACHE_CLEANUP_V4_FILE}"
-    fi
-
-    if [ "$action" = "apply" ] && [ ! -f "$rules_file" ]; then
-        log_error "Rules cache not found: ${rules_file}"
-        return 1
-    fi
-
-    if [ -s "${rules_file}" ]; then
-        local err_out
-        if ! err_out=$(_run_ipt_command "${restore_cmd}" --noflush < "${rules_file}" 2>&1); then
-            log_error "${restore_cmd} (${action}) failed for IPv${family}"
-            echo "${err_out}" | while read -r line; do log_error "  >> ${line}"; done
-            return 1
-        fi
-    fi
-    return 0
+# Atomic routing batch processor (Technical implementation)
+_exec_route_batch() {
+    local op="${1}" mark="${2}" target="${3}" ip_cmd="${4}"
+    local bfile; bfile="$(mktemp "${RUN_DIR}/flux_route.XXXXXX")" || return 1
+    cat <<EOF > "${bfile}"
+rule ${op} fwmark ${mark} table ${TABLE_ID} pref ${TABLE_ID}
+route ${op} local ${target} dev lo table ${TABLE_ID}
+EOF
+    ${ip_cmd} -batch "${bfile}" 2>/dev/null
+    local ret=$?; rm -f "${bfile}"
+    return "${ret}"
 }
 
-# ==============================================================================
-# [ Routing Table Management ]
-# ==============================================================================
-
-# Highly optimized routing table management for TProxy
-# Uses a deterministic preference (pref == table_id) to avoid conflicts.
-# Highly optimized routing table management for TProxy
-# Uses ip -batch for failure-atomic routing table updates.
-_manage_routing() {
-    local family="${1}"
-    local action="${2}" # "setup" or "cleanup"
-    local mark="${IPV4_MARK}"
-    local target="0.0.0.0/0"
-    local ip_cmd="ip"
-
-    if [ "${family}" = "6" ]; then
-        mark="${IPV6_MARK}"
-        target="::/0"
-        ip_cmd="ip -6"
-    fi
-
-    local batch_file
-    batch_file="$(mktemp "${RUN_DIR}/flux_route.XXXXXX")" || return 1
-
-    if [ "${action}" = "setup" ]; then
-        # 1. Cleanup old (best effort)
-        ${ip_cmd} rule del fwmark "${mark}" table "${TABLE_ID}" pref "${TABLE_ID}" 2>/dev/null || true
-        ${ip_cmd} route del local "${target}" dev lo table "${TABLE_ID}" 2>/dev/null || true
-        # 2. Build Atomic Batch
-        cat <<EOF > "${batch_file}"
-rule add fwmark ${mark} table ${TABLE_ID} pref ${TABLE_ID}
-route add local ${target} dev lo table ${TABLE_ID}
-EOF
-        # 3. Apply Batch
-        if ! ${ip_cmd} -batch "${batch_file}"; then
-            log_error "Failed to apply IPv${family} routing batch"
-            rm -f "${batch_file}"
-            # Rollback clean
-            ${ip_cmd} rule del fwmark "${mark}" table "${TABLE_ID}" pref "${TABLE_ID}" 2>/dev/null || true
-            return 1
-        fi
-        # 4. Enable Forwarding
-        if [ "${family}" = "4" ]; then
-            sysctl -w net.ipv4.ip_forward=1 >/dev/null
-            sysctl -w net.ipv4.conf.all.forwarding=1 >/dev/null
-            sysctl -w net.ipv4.conf.default.forwarding=1 >/dev/null
-        else
-            sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null
-            sysctl -w net.ipv6.conf.default.forwarding=1 >/dev/null
-        fi
-
-    elif [ "${action}" = "cleanup" ]; then
-        # Atomic Cleanup Batch
-        cat <<EOF > "${batch_file}"
-rule del fwmark ${mark} table ${TABLE_ID} pref ${TABLE_ID}
-route del local ${target} dev lo table ${TABLE_ID}
-EOF
-        # We allow cleanup to fail (e.g. if already gone)
-        ${ip_cmd} -batch "${batch_file}" 2>/dev/null || true
-    fi
-    rm -f "${batch_file}"
-    return 0
-}
-
-# Clear conntrack entries to force state re-evaluation after rule changes.
+# Clear conntrack entries to force state re-evaluation
 _purge_conntrack() {
     [ "${KFEAT_CONNTRACK}" = "1" ] || return 0
     if command -v conntrack >/dev/null 2>&1; then
         log_debug "Purging stale conntrack entries..."
-        # Purge by mark values to clear any previous proxy/bypass states
         conntrack -D -m "${IPV4_MARK}" >/dev/null 2>&1 || true
         [ "${PROXY_IPV6}" = "1" ] && conntrack -D -m "${IPV6_MARK}" >/dev/null 2>&1 || true
         conntrack -D -m 0x11 >/dev/null 2>&1 || true
@@ -140,36 +53,99 @@ _purge_conntrack() {
 }
 
 # ==============================================================================
-# [ Main Execution API ]
+# [ 2. Atomic Component Logic ]
 # ==============================================================================
 
-_manage_all() {
-    local action="${1}" # "start" or "stop"
-    local proxy_action="apply"; [ "${action}" = "stop" ] && proxy_action="cleanup"
-    local route_action="setup"; [ "${action}" = "stop" ] && route_action="cleanup"
-    [ "${action}" = "start" ] && _purge_conntrack
-    log_debug "Tproxy ${action}"
+# --iptables Logic --
+
+_apply_rules() {
+    local family="${1}"
+    local cmd; [ "${family}" = "6" ] && cmd="ip6tables-restore" || cmd="iptables-restore"
+    local file; [ "${family}" = "6" ] && file="${CACHE_RULES_V6_FILE}" || file="${CACHE_RULES_V4_FILE}"
+
+    if [ ! -s "${file}" ]; then
+        log_error "Rules cache missing or empty: ${file}"
+        return 1
+    fi
+
+    local err; if ! err=$(_run_ipt_command "${cmd}" --noflush < "${file}" 2>&1); then
+        log_error "${cmd} apply failed for IPv${family}"
+        echo "${err}" | while read -r line; do log_error "  >> ${line}"; done
+        return 1
+    fi
+}
+
+_cleanup_rules() {
+    local family="${1}"
+    local cmd; [ "${family}" = "6" ] && cmd="ip6tables-restore" || cmd="iptables-restore"
+    local file; [ "${family}" = "6" ] && file="${CACHE_CLEANUP_V6_FILE}" || file="${CACHE_CLEANUP_V4_FILE}"
+
+    [ -s "${file}" ] || return 0
+    _run_ipt_command "${cmd}" --noflush < "${file}" 2>/dev/null || true
+}
+
+# -- Routing Logic --
+
+_setup_route() {
+    local family="${1}"
+    local mark; [ "${family}" = "6" ] && mark="${IPV6_MARK}" || mark="${IPV4_MARK}"
+    local target; [ "${family}" = "6" ] && target="::/0" || target="0.0.0.0/0"
+    local ip_cmd; [ "${family}" = "6" ] && ip_cmd="ip -6" || ip_cmd="ip"
+
+    if ! _exec_route_batch "add" "${mark}" "${target}" "${ip_cmd}"; then
+        log_error "Failed to apply IPv${family} routing batch"
+        return 1
+    fi
+
+    # Enable Forwarding
+    if [ "${family}" = "6" ]; then
+        sysctl -w net.ipv6.conf.all.forwarding=1 net.ipv6.conf.default.forwarding=1 >/dev/null
+    else
+        sysctl -w net.ipv4.ip_forward=1 net.ipv4.conf.all.forwarding=1 net.ipv4.conf.default.forwarding=1 >/dev/null
+    fi
+}
+
+_cleanup_route() {
+    local family="${1}"
+    local mark; [ "${family}" = "6" ] && mark="${IPV6_MARK}" || mark="${IPV4_MARK}"
+    local target; [ "${family}" = "6" ] && target="::/0" || target="0.0.0.0/0"
+    local ip_cmd; [ "${family}" = "6" ] && ip_cmd="ip -6" || ip_cmd="ip"
+
+    _exec_route_batch "del" "${mark}" "${target}" "${ip_cmd}" || true
+}
+
+# ==============================================================================
+# [ 3. Public APIs (The Orchestrators) ]
+# ==============================================================================
+
+start_proxy() {
+    log_debug "Tproxy starting..."
+    _purge_conntrack
+
     local families="4"; [ "${PROXY_IPV6}" = "1" ] && families="4 6"
-
-    for f in ${families}; do
-        run "Manage IPv${f} rules (${proxy_action})" _manage_proxy_rules "${f}" "${proxy_action}" || \
-            { [ "${action}" = "start" ] && { touch "${EVENT_FAIL}"; return 1; } || true; }
-
-        run "Manage IPv${f} routing (${route_action})" _manage_routing "${f}" "${route_action}" || \
-            { [ "${action}" = "start" ] && { touch "${EVENT_FAIL}"; return 1; } || true; }
+    for family in ${families}; do
+        run "IPv${family} Rules (apply)" _apply_rules "${family}" || { touch "${EVENT_FAIL}"; return 1; }
+        run "IPv${family} Route (setup)" _setup_route "${family}" || { touch "${EVENT_FAIL}"; return 1; }
     done
 
-    [ "${action}" = "start" ] && touch "${EVENT_TPROXY_OK}"
+    touch "${EVENT_TPROXY_OK}"
     return 0
 }
 
-start_proxy() { _manage_all "start"; }
-stop_proxy()  { _manage_all "stop"; }
+stop_proxy() {
+    log_debug "Tproxy stopping..."
+    local families="4"; [ "${PROXY_IPV6}" = "1" ] && families="4 6"
+    for family in ${families}; do
+        run "IPv${family} Rules (cleanup)" _cleanup_rules "${family}"
+        run "IPv${family} Route (cleanup)" _cleanup_route "${family}"
+    done
+    return 0
+}
 
 main() {
     local action="${1:-}"
 
-    case "$action" in
+    case "${action}" in
         start)
             start_proxy
             ;;

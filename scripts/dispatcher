@@ -14,14 +14,16 @@ readonly SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 . "${SCRIPT_DIR}/log"
 
 # Load configurations (first valid)
-for file in "${CACHE_CONFIG_FILE}" "${SETTINGS_FILE}"; do
-    if [ -f "${file}" ]; then
-        set -a; . "${file}"; set +a
-        break
-    fi
-done
+if [ -f "${CACHE_META_FILE}" ] && [ -f "${CACHE_CONFIG_FILE}" ]; then
+    set -a; . "${CACHE_CONFIG_FILE}"; set +a
+elif [ -f "${SETTINGS_FILE}" ]; then
+    set -a; . "${SETTINGS_FILE}"; set +a
+else
+    log_error "No configuration found"
+    exit 1
+fi
 
-[ -f "${KERNEL_CACHE_FILE}" ] && { set -a; . "${KERNEL_CACHE_FILE}"; set +a; }
+[ -f "${CACHE_KERNEL_FILE}" ] && { set -a; . "${CACHE_KERNEL_FILE}"; set +a; }
 
 readonly LOG_COMPONENT="Disp"
 
@@ -33,20 +35,15 @@ start_components() {
     [ -f "${MAGISK_MOD_DIR}/disable" ] && { log_warn "Service disabled, ignoring start trigger"; return 0; }
     sh "${CORE_SCRIPT}" start < /dev/null &
     sh "${TPROXY_SCRIPT}" start < /dev/null &
+    sh "${IP_MONITOR_SCRIPT}" start < /dev/null &
     return 0
 }
 
 check_all_ready() {
-    [ -f "${MAGISK_MOD_DIR}/disable" ] && { log_warn "Service disabled, ignoring readiness trigger"; return; }
-
     if [ -f "${EVENT_CORE_OK}" ] && [ -f "${EVENT_TPROXY_OK}" ]; then
-        if mkdir "${READY_LOCK}" 2>/dev/null; then
-            rm -f "${EVENT_CORE_OK}" "${EVENT_TPROXY_OK}"
-            nohup sh "${IP_MONITOR_SCRIPT}" start < /dev/null &
-            sync_prop
-            log_info "Flux Service is READY"
-            rmdir "$READY_LOCK" 2>/dev/null
-        fi
+        rm -f "${EVENT_CORE_OK}" "${EVENT_TPROXY_OK}"
+        sync_prop
+        log_info "Flux Service is READY"
     fi
     return 0
 }
@@ -84,21 +81,12 @@ main() {
     # - Directory monitoring: handler EVENT DIR FILENAME (3 args)
     # - File monitoring: handler EVENT FILEPATH (2 args)
     local event_type="${1:-}"
-    local watched_path
-    local event_name
+    local watched_path="${2:-}"
+    local event_name="${3:-${watched_path##*/}}"
 
-    if [ -n "${3:-}" ]; then
-        # Directory monitoring mode
-        local watched_dir="${2:-}"
-        event_name="${3}"
-        watched_path="${watched_dir}/${event_name}"
-    else
-        # File monitoring mode
-        watched_path="${2:-}"
-        event_name="${watched_path##*/}"
-    fi
+    [ -n "${3:-}" ] && watched_path="${watched_path}/${event_name}"
 
-    log_debug "Event: ${event_name} (${event_type})"
+    log_debug "Event: ${watched_path} (${event_type})"
 
     case "${event_name}" in
         # === Magisk module toggle ===
@@ -114,7 +102,7 @@ main() {
             ;;
         # === Flow markers ===
         init_ok)
-            rm -f "${watched_path}" 2>/dev/null
+            rm -f "${EVENT_INIT_OK}" 2>/dev/null
             start_components
             ;;
         core_ok|tproxy_ok)
@@ -125,10 +113,10 @@ main() {
             rollback_components
             return 0
             ;;
-        # === IP sync ===
-        ip_sync)
-            rm -f "${watched_path}" 2>/dev/null
-            sh "${IP_MONITOR_SCRIPT}" sync &
+        # === Config file changes → invalidate cache ===
+        settings.ini|config.json)
+            log_info "Config changed: ${event_name}"
+            rm -f "${CACHE_META_FILE}" 2>/dev/null
             ;;
         # === Ignore unknown events ===
         *)

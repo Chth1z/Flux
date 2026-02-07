@@ -49,9 +49,11 @@ start_monitor() {
             exec ip -o monitor address 2>/dev/null
         } | awk -v proxy_ipv6="${PROXY_IPV6}" \
                 -v pref="${SRI_RULE_PREF}" \
-                -v log_file="${FLUX_LOG}" '
-        # Efficient logging: Use date command only when needed
+                -v log_file="${FLUX_LOG}" \
+                -v log_level="${LOG_LEVEL}" '
+        # Log only when level is DEBUG (4)
         function log_debug(tag, ip,    ds, cmd) {
+            if (log_level < 4) return
             cmd = "date +\"[%m-%d %H:%M:%S]\""
             if ((cmd | getline ds) > 0) {
                 printf "%s [D] [Moni] SRI %s %s\n", ds, tag, ip >> log_file
@@ -86,19 +88,21 @@ start_monitor() {
         function is_valid(ip) {
             return (ip != "" && ip !~ /^(127\.|0\.|fe80:|::1)/)
         }
+        function is_temporary(line) {
+            return (line ~ / temporary/)
+        }
         # Phase 1: Initial Sync
         !/---MONITOR_START---/ && !monitor_mode {
+            if (is_temporary($0)) next
             ip = extract_ip($0, "inet")
+            if (!is_valid(ip) && proxy_ipv6 == "1") ip = extract_ip($0, "inet6")
             if (is_valid(ip)) add_rule(ip)
-            if (proxy_ipv6 == "1") {
-                ip = extract_ip($0, "inet6")
-                if (is_valid(ip)) add_rule(ip)
-            }
             next
         }
         # Transition/Phase 2: Monitor
         /---MONITOR_START---/ { monitor_mode = 1; next }
         monitor_mode {
+            if (is_temporary($0)) next
             is_del = ($0 ~ /Deleted/)
             ip = extract_ip($0, "inet")
             if (!is_valid(ip) && proxy_ipv6 == "1") ip = extract_ip($0, "inet6")

@@ -1,0 +1,44 @@
+# addrsyncd.toml
+# Strict schema: unknown fields fail, alias/abbreviation not accepted.
+# Relative paths are resolved against CLI --work-dir (-d).
+
+[log]
+# Exact values only: error | warn | info | debug
+level = "info"
+
+# Log file path: relative to --work-dir, or absolute path.
+file = "addrsyncd.log"
+
+[daemon]
+# Enable IPv6 address tracking and rule sync.
+ipv6 = true
+
+# Debounce window for route-address events (milliseconds, must be > 0).
+debounce_ms = 500
+
+# Hard upper bound of debounce window (milliseconds, must be >= debounce_ms).
+debounce_max_ms = 5000
+
+# Maximum operations in one apply batch (must be > 0).
+batch_max = 128
+
+[rule]
+# Linux rule preference (priority), must be positive.
+pref = 1900
+
+# Linux routing table id, must be positive integer.
+table_id = 254
+
+[filters]
+# Address flags to ignore.
+# Exact values only:
+# temporary | optimistic | deprecated | tentative | dadfailed | stable_privacy | managetempaddr
+ignore_addr_flags = []
+
+# Exact IP list to ignore. No CIDR allowed here.
+# Example: ["10.0.0.9", "2001:db8::9"]
+ignore_ips = []
+
+# CIDR list to ignore (CIDR only, plain IP is invalid).
+# Example: ["10.0.0.0/8", "2001:db8::/32"]
+ignore_cidrs = []

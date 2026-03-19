@@ -1,0 +1,50 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+[*.md]
+trim_trailing_whitespace = false
+
+[*.{json,toml,html,xml,yml,yaml}]
+indent_size = 2
+
+[*.ps1]
+indent_size = 4
+
+[*.sh]
+shell_variant = posix
+switch_case_indent = true
+binary_next_line = false
+space_redirects = false
+keep_padding = false
+function_next_line = false
+
+[scripts/*]
+shell_variant = posix
+switch_case_indent = true
+binary_next_line = false
+space_redirects = false
+keep_padding = false
+function_next_line = false
+
+[conf/settings.ini]
+shell_variant = posix
+switch_case_indent = true
+binary_next_line = false
+space_redirects = false
+keep_padding = false
+function_next_line = false
+
+[META-INF/com/google/android/update-binary]
+shell_variant = posix
+switch_case_indent = true
+binary_next_line = false
+space_redirects = false
+keep_padding = false
+function_next_line = false

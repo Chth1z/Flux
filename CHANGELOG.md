@@ -2,6 +2,34 @@
 
 All notable changes to the Flux project will be documented in this file.
 
+## [v1.4.0] - 2026-02-23
+
+### ⚠️ Correctness & Stability
+- Fixed `UPDATE_INTERVAL=0` behavior: it now correctly disables boot-time auto update.
+- Wired `UPDATE_TIMEOUT` into updater download requests (`curl --connect-timeout/--max-time`).
+- Reordered init checks to allow missing `config.json` before updater/cache rebuild flow.
+- Hardened cache validation: `cache_ok` now also requires required cache files to exist and be non-empty.
+- Added strict parallel task result aggregation via `wait_pids` in init/dispatcher critical paths.
+
+### 🔁 Runtime Lifecycle
+- Refactored `scripts/addrsync` lifecycle to PID-based flow (no internal `status` polling loops).
+- Implemented `addrsyncd stop` first, with `kill -9` fallback and deterministic pid cleanup.
+- Added dispatcher handling for `addrsyncd.toml` change events.
+- Added `init cache` action for cache-only rebuild path used by config hot-reload.
+
+### 🧾 Config & Docs Alignment
+- Removed `BYPASS_IPV4_LIST` / `BYPASS_IPV6_LIST` from `settings.ini` exposure; keep internal constants in `scripts/lib`.
+- Updated installer migration key set to match current public settings.
+- Synced README/README_zh with current addrsync-based architecture and real config keys.
+- Removed stale documentation keys (`RULES_DEBUG_DUMP`, `INCLUDE_INTERFACES`) from README tables.
+
+### 📦 Release Process
+- Added `scripts/check_release.ps1` for lightweight pre-release consistency checks.
+- Updated package workflow to:
+  - run release checks before packaging
+  - include `flux_service.sh` (instead of stale `service.sh`)
+  - enforce required ZIP entries (including `conf/addrsyncd.toml`)
+
 ## [v1.3.3] - 2026-02-07
 
 ### ⚡ IP MONITOR PERFECTION

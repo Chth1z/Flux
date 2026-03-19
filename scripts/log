@@ -2,15 +2,11 @@
 
 # ==============================================================================
 # [ Flux Logging System ]
-# Description: Unified logging, terminal coloring, and Magisk status reporting.
+# Description: Unified terminal logging, coloring, and Magisk status reporting.
 # ==============================================================================
 
-# Strict error handling
-set -eu
-[ -n "${BASH_VERSION:-}" ] && set -o pipefail
-
 LOG_COMPONENT="${LOG_COMPONENT:-Name}"
-_PROP_ORIG_DESC=""
+LOG_LEVEL="${LOG_LEVEL:-3}"
 
 # Detect if the current execution environment supports ANSI color codes
 _is_terminal() {
@@ -27,208 +23,46 @@ _is_terminal() {
 # 4: DEBUG   - Verbose execution tracing
 # ==============================================================================
 
-_log() {
-    local level="${1}"      # Letter code (E, W, I, D)
-    local level_num="${2}"  # Numeric level for comparison
-    local msg="${3}"        # Log message
+_LOG_LAST_SEC=-1
+_LOG_LAST_TIME=""
 
+_get_timestamp() {
+    if [ -n "${EPOCHSECONDS:-}" ]; then
+        echo "${EPOCHSECONDS}"
+    else
+        date +%s
+    fi
+}
+
+_log() {
+    local level="${1}"
+    local level_num="${2}"
+    local msg="${3}"
     [ "${LOG_LEVEL}" -lt "${level_num}" ] && return 0
 
-    local timestamp; timestamp=$(date '+%m-%d %H:%M:%S')
-    local log_line; log_line=$(printf '[%s] [%s] [%s] %s' "${timestamp}" "${level}" "${LOG_COMPONENT}" "${msg}")
+    # Fast timestamping: cache formatted time by unix second in a shell-agnostic way.
+    local now
+    now=$(_get_timestamp)
+    if [ "${now}" -ne "${_LOG_LAST_SEC}" ]; then
+        _LOG_LAST_SEC="${now}"
+        _LOG_LAST_TIME=$(date '+%m-%d %H:%M:%S')
+    fi
+
+    local log_line="[${_LOG_LAST_TIME}] [${level}] [${LOG_COMPONENT}] ${msg}"
 
     if _is_terminal; then
+        # Color lookup: E=31(red), W=33(yellow), I=32(green), D=90(gray)
+        local color
         case "${level}" in
-            E) printf '\033[31m%s\033[0m\n' "${log_line}" >&2 ;;
-            W) printf '\033[33m%s\033[0m\n' "${log_line}" >&2 ;;
-            I) printf '\033[32m%s\033[0m\n' "${log_line}" >&2 ;;
-            D) printf '\033[90m%s\033[0m\n' "${log_line}" >&2 ;;
-            *) printf '%s\n' "${log_line}" >&2 ;;
+        E) color=31 ;;
+        W) color=33 ;;
+        I) color=32 ;;
+        D) color=90 ;;
+        *) color=0 ;;
         esac
+        printf '\033[%sm%s\033[0m\n' "${color}" "${log_line}" >&2
     else
         printf '%s\n' "${log_line}" >&2
-    fi
-    return 0
-}
-
-# ==============================================================================
-# [ Magisk User Interface (module.prop) Management ]
-# ==============================================================================
-# Flux updates the Magisk module description in real-time to provide
-# status feedback to the user via the Magisk/KSU app.
-# Format: original_description\n🥰 [RUNNING] PID: xxx | Warn: message
-# ==============================================================================
-
-# Helper to read the raw description line from module.prop
-_get_prop_desc() {
-    [ ! -f "${PROP_FILE}" ] && return 1
-    local line; line=$(grep "^description=" "${PROP_FILE}" 2>/dev/null | head -1)
-    [ -z "${line}" ] && return 1
-    printf '%s\n' "${line#description=}"
-}
-
-# Initialize original description cache (Cross-process via System Properties)
-_init_prop_orig_desc() {
-    [ -n "${_PROP_ORIG_DESC}" ] && return 0
-    # 1. Try memory cache first (System Property)
-    _PROP_ORIG_DESC=$(getprop flux.prop.orig)
-    if [ -n "${_PROP_ORIG_DESC}" ]; then
-        return 0
-    fi
-    # 2. Fallback to file reading
-    _PROP_ORIG_DESC=$(_get_prop_desc) || return 1
-    # Strip potential previous status (newlines)
-    _PROP_ORIG_DESC="${_PROP_ORIG_DESC%%\\n*}"
-    # Reset if already contains emoji (previous status recovery)
-    case "${_PROP_ORIG_DESC}" in
-        *"🥰"*|*"😴"*|*"🤯"*|*"🤔"*) _PROP_ORIG_DESC="Seamlessly redirect your network Flux." ;;
-        *"description="*) _PROP_ORIG_DESC="${_PROP_ORIG_DESC#description=}" ;;
-    esac
-    # 3. Store in memory for other processes
-    setprop flux.prop.orig "${_PROP_ORIG_DESC}"
-    return 0
-}
-
-# Read current status line from prop (after \n)
-_prop_read_status() {
-    # Try last successful memory state first
-    local status; status=$(getprop flux.prop.last)
-    if [ -n "${status}" ]; then
-        printf '%s\n' "${status}"
-        return 0
-    fi
-
-    local desc; desc=$(_get_prop_desc) || return 1
-    case "${desc}" in
-        *"\\n"*) printf '%s\n' "${desc#*\\n}" ;;
-    esac
-    return 0
-}
-
-# Extract left part (before |)
-_prop_get_left() {
-    printf '%s\n' "${1%% |*}"
-}
-
-# Extract right part by searching for Error/Warn keywords
-# This recovers from accumulated garbage states (e.g. "[FAILED] | [STOPPED] | Error:...")
-_prop_get_right() {
-    case "${1}" in
-        *"Error:"*) printf 'Error:%s\n' "${1#*Error:}" ;;
-        *"Warn:"*)  printf 'Warn:%s\n' "${1#*Warn:}" ;;
-    esac
-}
-
-# Write prop with left and right parts
-_prop_write() {
-    [ ! -f "${PROP_FILE}" ] && return 0
-    _init_prop_orig_desc
-
-    local left="${1}" right="${2}"
-    local status; [ -n "${right}" ] && status="${left} | ${right}" || status="${left}"
-
-    # Memoization: Skip I/O if unchanged
-    [ "${status}" = "$(getprop flux.prop.last)" ] && return 0
-
-    local full_desc="${_PROP_ORIG_DESC}\\n${status}"
-    local tmp_file; tmp_file=$(mktemp "${PROP_FILE}.XXXXXX")
-
-    if DESC="${full_desc}" awk -v d="description=" '
-        BEGIN { pattern = "^" d }
-        $0 ~ pattern { print d ENVIRON["DESC"]; next }
-        { print }
-    ' "${PROP_FILE}" > "${tmp_file}"; then
-        chmod 644 "${tmp_file}"
-        mv -f "${tmp_file}" "${PROP_FILE}"
-        setprop flux.prop.last "${status}"
-        log_debug "Prop updated: ${status}"
-        return 0
-    else
-        rm -f "${tmp_file}"
-        log_error "Failed to update module.prop"
-        return 1
-    fi
-}
-
-# Build left part from state
-_prop_build_left() {
-    local state="STOPPED"
-    local pid=""
-
-    if [ -f "${EVENT_FAIL}" ]; then
-        state="FAILED"
-    elif [ ! -f "${MAGISK_MOD_DIR}/disable" ] && [ -f "${SING_BOX_PID_FILE}" ]; then
-        pid=$(cat "${SING_BOX_PID_FILE}" 2>/dev/null)
-        [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null && state="RUNNING"
-    fi
-
-    local emoji
-    case "${state}" in
-        RUNNING) emoji='🥰';;
-        STOPPED) emoji='😴';;
-        FAILED)  emoji='🤯';;
-        *)       emoji='🤔';;
-    esac
-
-    local left="${emoji} [${state}]"
-    [ "${state}" = "RUNNING" ] && left="${left} PID: ${pid}"
-    printf '%s\n' "${left}"
-}
-
-# Helper to read status and return current left part
-_prop_get_current_left() {
-    local current; current=$(_prop_read_status)
-    local left; left=$(_prop_get_left "${current}")
-    printf '%s\n' "${left:-$(_prop_build_left)}"
-}
-
-# ==============================================================================
-# Public Logging API
-# ==============================================================================
-
-# Sync state to prop (update left, preserve right)
-sync_prop() {
-    _prop_write "$(_prop_build_left)" "$(_prop_get_right "$(_prop_read_status)")"
-    return 0
-}
-
-# Set error (update right, preserve left)
-prop_error() {
-    _prop_write "$(_prop_get_current_left)" "Error: ${1}"
-    log_error "${1}"
-    return 0
-}
-
-# Set warning (update right, preserve left, don't overwrite error)
-prop_warn() {
-    local current; current=$(_prop_read_status)
-    local right; right=$(_prop_get_right "${current}")
-
-    case "${right}" in Error:*) log_warn "${1}"; return 0 ;; esac
-
-    _prop_write "$(_prop_get_current_left)" "Warn: ${1}"
-    log_warn "${1}"
-}
-
-# Clear error/warn (preserve left)
-prop_clear() {
-    _prop_write "$(_prop_get_current_left)" ""
-    return 0
-}
-
-# Standardized task runner with logging and status reporting
-run() {
-    local name="${1}"
-    shift
-
-    if "$@"; then
-        log_info "${name}: OK"
-        return 0
-    else
-        local rc=$?
-        log_error "${name}: FAILED"
-        prop_error "${name}: FAILED"
-        return ${rc}
     fi
 }
 
@@ -238,10 +72,11 @@ log_banner() {
     local width=50
     local sym="="
     local len=${#msg}
-    local side=$(( (width - len) / 2 ))
+    local side=$(((width - len) / 2))
     [ "${side}" -lt 0 ] && side=0
 
-    local pad; pad=$(printf "%${side}s" "" | tr ' ' "${sym}")
+    local pad
+    pad=$(printf "%${side}s" "" | tr ' ' "${sym}")
     local banner="${pad}${msg}${pad}"
     [ "${#banner}" -lt "${width}" ] && banner="${banner}${sym}"
 
@@ -250,10 +85,68 @@ log_banner() {
     else
         printf '\n%s\n' "${banner}" >&2
     fi
-    return 0
 }
 
 log_debug() { _log "D" 4 "${1}"; }
-log_info()  { _log "I" 3 "${1}"; }
-log_warn()  { _log "W" 2 "${1}"; }
+log_info() { _log "I" 3 "${1}"; }
+log_warn() { _log "W" 2 "${1}"; }
 log_error() { _log "E" 1 "${1}"; }
+
+# ==============================================================================
+# [ Magisk User Interface (module.prop) Management ]
+# ==============================================================================
+# Flux updates the Magisk module description in real-time to provide
+# status feedback to the user via the Magisk/KSU app.
+# Format: original_description\n🥰 [RUNNING] PID: xxx
+# ==============================================================================
+
+_L_STAT=""
+sync_prop() {
+    [ ! -f "${PROP_FILE}" ] && return 0
+
+    # 1. Build status (Internal)
+    local state="${1}"
+    local emoji
+    local pid=""
+
+    case "${state}" in
+    RUNNING) emoji='🥰' ;;
+    STOPPED) emoji='😴' ;;
+    FAILED) emoji='🤯' ;;
+    *) emoji='🤔' ;;
+    esac
+    [ "${state}" = "RUNNING" ] && pid=$(cat "${SING_BOX_PID_FILE}" 2>/dev/null)
+
+    local status="${emoji} [${state}]${pid:+ PID: ${pid}}"
+
+    # 2. Skip if no change
+    [ "${status}" = "${_L_STAT}" ] && return 0
+    _L_STAT="${status}"
+
+    # 3. Atomic write: avoid in-place sed escaping pitfalls.
+    local tmp_prop
+    tmp_prop=$(mktemp "${PROP_FILE}.XXXXXX") || return 0
+
+    # Use awk for a single-pass extraction and replacement to minimize process fork overhead.
+    if awk -v stat="${status}" '
+        BEGIN { done=0 }
+        $0 ~ /^description=/ {
+            # Extract base description, strip previous status (\n...), and trim whitespace
+            base = substr($0, index($0, "=") + 1)
+            sub(/\\n.*/, "", base)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", base)
+            if (base == "") base = "Flux Proxy Module"
+
+            print "description=" base "\\n" stat
+            done=1; next
+        }
+        { print }
+        END { if (!done) print "description=Flux Proxy Module\\n" stat }
+    ' "${PROP_FILE}" >"${tmp_prop}"; then
+        mv -f "${tmp_prop}" "${PROP_FILE}" 2>/dev/null || rm -f "${tmp_prop}"
+    else
+        rm -f "${tmp_prop}"
+    fi
+
+    log_debug "Status: ${state}"
+}

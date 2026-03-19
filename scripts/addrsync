@@ -1,0 +1,128 @@
+#!/system/bin/sh
+
+# ==============================================================================
+# [ Flux Address Sync Controller ]
+# Description: Lifecycle management for addrsyncd (start, stop, resync, cleanup).
+# ==============================================================================
+
+set -eu
+[ -n "${BASH_VERSION:-}" ] && set -o pipefail
+
+readonly SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+
+. "${SCRIPT_DIR}/lib"
+. "${SCRIPT_DIR}/log"
+
+readonly LOG_COMPONENT="ASyn"
+
+# ==============================================================================
+# [ Daemon Process Management ]
+# ==============================================================================
+
+_start_daemon() {
+    local pid
+    local daemon_pid
+
+    if pid=$(read_pid_file "${ADDRSYNCD_PID_FILE}" "addrsyncd"); then
+        if [ -n "${pid}" ] && pid_alive "${pid}"; then
+            log_info "addrsyncd already running (pid=${pid})"
+            return 0
+        fi
+    fi
+
+    # Sync with core: use nohup and backgrounding instead of --daemon to avoid log noise.
+    nohup "${ADDRSYNCD_BIN}" -c "${ADDRSYNCD_CONF_FILE}" -d "${RUN_DIR}" run >/dev/null 2>&1 &
+    daemon_pid=$!
+
+    if ! write_pid_file "${ADDRSYNCD_PID_FILE}" "${daemon_pid}"; then
+        kill -9 "${daemon_pid}" 2>/dev/null
+        return 1
+    fi
+
+    if ! wait_pid_state "${daemon_pid}" "${CORE_TIMEOUT}" alive; then
+        log_error "addrsyncd start timeout (pid=${daemon_pid})"
+        return 1
+    fi
+    return 0
+}
+
+_wait_for_ready() {
+    local pid
+    pid=$(read_pid_file "${ADDRSYNCD_PID_FILE}" "addrsyncd") || return 1
+    [ -n "${pid}" ] && pid_alive "${pid}"
+}
+
+_stop_daemon() {
+    local pid
+    if pid=$(get_valid_daemon_pid "${ADDRSYNCD_PID_FILE}" "${ADDRSYNCD_BIN}" "addrsyncd"); then
+        "${ADDRSYNCD_BIN}" -c "${ADDRSYNCD_CONF_FILE}" -d "${RUN_DIR}" stop >/dev/null 2>&1 || true
+
+        if ! wait_pid_state "${pid}" "${CORE_TIMEOUT}" dead; then
+            terminate_pid "${pid}" "${CORE_TIMEOUT}" "addrsyncd" || true
+        fi
+        rm -f "${ADDRSYNCD_PID_FILE}"
+    fi
+    return 0
+}
+
+# ==============================================================================
+# [ Service Control ]
+# ==============================================================================
+
+start_addrsync() {
+    run -v "Start addrsyncd" _start_daemon || return $?
+    run -v "addrsync startup" _wait_for_ready || return $?
+}
+
+stop_addrsync() {
+    run -v "Stop addrsyncd" _stop_daemon || true
+}
+
+resync_addrsync() {
+    "${ADDRSYNCD_BIN}" \
+        -c "${ADDRSYNCD_CONF_FILE}" \
+        -d "${RUN_DIR}" \
+        resync >/dev/null 2>&1
+}
+
+status_addrsync() {
+    "${ADDRSYNCD_BIN}" \
+        -c "${ADDRSYNCD_CONF_FILE}" \
+        -d "${RUN_DIR}" \
+        status 2>&1
+}
+
+cleanup_addrsync() {
+    "${ADDRSYNCD_BIN}" \
+        -c "${ADDRSYNCD_CONF_FILE}" \
+        -d "${RUN_DIR}" \
+        cleanup --mode dump >/dev/null 2>&1
+}
+
+main() {
+    local action="${1:-}"
+
+    case "${action}" in
+    start)
+        start_addrsync
+        ;;
+    stop)
+        stop_addrsync
+        ;;
+    resync)
+        resync_addrsync
+        ;;
+    status)
+        status_addrsync
+        ;;
+    cleanup)
+        cleanup_addrsync
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|resync|status|cleanup}"
+        exit 1
+        ;;
+    esac
+}
+
+main "$@"

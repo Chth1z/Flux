@@ -1,313 +1,368 @@
-#!/system/bin/sh
-
 # ==============================================================================
 # [ Flux Configuration Module ]
-# Description: Schema-driven validation and dynamic JSON config extraction.
+# Description: Schema-driven configuration with unified init/validate/export.
 # ==============================================================================
 
-# Strict error handling
-set -eu
-[ -n "${BASH_VERSION:-}" ] && set -o pipefail
-
 # ==============================================================================
-# [ Configuration Management ]
+# [ Extract runtime ports and ranges ]
 # ==============================================================================
-
-# Initialize default values for all supported configuration keys
-_init_config_defaults() {
-    # [ Updater Configuration ]
-    : "${SUBSCRIPTION_URL:=}"
-    : "${UPDATE_TIMEOUT:=5}"
-    : "${RETRY_COUNT:=2}"
-    : "${UPDATE_INTERVAL:=86400}"
-    : "${PREF_CLEANUP_EMOJI:=1}"
-    # [ Logging & Debugging ]
-    : "${LOG_LEVEL:=3}"
-    : "${LOG_MAX_SIZE:=1048576}"
-    # [ Core Process ]
-    : "${CORE_USER:=root}"
-    : "${CORE_GROUP:=root}"
-    : "${CORE_TIMEOUT:=5}"
-    # [ Network Interfaces ]
-    : "${MOBILE_INTERFACE:=rmnet_data+}"
-    : "${WIFI_INTERFACE:=wlan0}"
-    : "${HOTSPOT_INTERFACE:=wlan2}"
-    : "${USB_INTERFACE:=rndis+}"
-    # [ Proxy Engine ]
-    : "${PROXY_PORT:=1536}"
-    : "${FAKEIP_V4_RANGE:=198.18.0.0/15}"
-    : "${FAKEIP_V6_RANGE:=fc00::/18}"
-    # [ Proxy Granularity ]
-    : "${PROXY_MOBILE:=1}"
-    : "${PROXY_WIFI:=1}"
-    : "${PROXY_HOTSPOT:=1}"
-    : "${PROXY_USB:=1}"
-    : "${PROXY_IPV6:=0}"
-    # [ Routing Mark ]
-    : "${ROUTING_MARK:=}"
-    # [ Application Filtering ]
-    : "${APP_PROXY_MODE:=0}"
-    : "${APP_LIST:=}"
-    # [ Performance & Compatibility ]
-    : "${MSS_CLAMP_ENABLE:=1}"
-    : "${EXCLUDE_INTERFACES:=}"
-    : "${INCLUDE_INTERFACES:=}"
-    return 0
-}
-
-# Dynamically extract runtime ports and ranges from sing-box JSON configuration
-# This ensures that Flux logic automatically aligns with sing-box settings.
 _extract_json_config() {
-    local jq_bin="${JQ_BIN}"
-    [ -x "${jq_bin}" ] && [ -f "${CONFIG_FILE}" ] || return 0
-    # Extract Proxy Port and FakeIP ranges via JQ
-    local json_output
+    [ -x "${JQ_BIN}" ] || {
+        log_error "jq binary missing or not executable"
+        return 1
+    }
+    [ -f "${CONFIG_FILE}" ] || {
+        log_error "config.json missing"
+        return 1
+    }
 
-    json_output=$("${jq_bin}" -r '
+    local json_output
+    json_output=$("${JQ_BIN}" -r '
         [
             ([.inbounds[]? | select(.type == "tproxy")][0] | .listen_port // (.listen? | sub("^.*:"; "")) // ""),
             ([.dns.servers[]? | select(.type=="fakeip")][0] | .inet4_range // ""),
             ([.dns.servers[]? | select(.type=="fakeip")][0] | .inet6_range // "")
         ] | join("|")
-    ' "${CONFIG_FILE}" 2>/dev/null) || return 0
+    ' "${CONFIG_FILE}" 2>/dev/null) || {
+        log_error "Failed to parse config.json"
+        return 1
+    }
 
     local extracted_port v4 v6
-    IFS='|' read -r extracted_port v4 v6 << EOF
+    IFS='|' read -r extracted_port v4 v6 <<EOF
 ${json_output}
 EOF
-
-    if [ -n "${extracted_port}" ]; then
-        PROXY_PORT="${extracted_port}"
-    fi
-    # Assign extracted ranges with basic syntax validation
-    case "${v4}" in
-        */*[0-9]*) FAKEIP_V4_RANGE="${v4}" ;;
-    esac
-
-    case "${v6}" in
-        *:*/*[0-9]*) FAKEIP_V6_RANGE="${v6}" ;;
-    esac
-    return 0
+    [ -n "${extracted_port}" ] && PROXY_PORT="${extracted_port}"
+    [ -n "${v4}" ] && FAKEIP_V4_RANGE="${v4}"
+    [ -n "${v6}" ] && FAKEIP_V6_RANGE="${v6}"
 }
 
 # ==============================================================================
-# [ Type-Specific Validators ]
+# [ Sing-box Binary Validation ]
 # ==============================================================================
-
-_validate_int() {
-    local name="${1}" val="${2}" min="${3}" max="${4}"
-    # Allow empty values for optional fields (like ROUTING_MARK)
-    [ -z "${val}" ] && return 0
-    case "${val}" in
-        *[!0-9]*)
-            printf '  • %s: invalid number "%s"\n' "${name}" "${val}"
-            return 1
-            ;;
-    esac
-
-    if [ "${val}" -lt "${min}" ] || [ "${val}" -gt "${max}" ]; then
-        printf '  • %s: out of range (%s, allowed: %s-%s)\n' "${name}" "${val}" "${min}" "${max}"
+_validate_singbox_config() {
+    local err
+    if ! err=$("${SING_BOX_BIN}" check -c "${CONFIG_FILE}" -D "${RUN_DIR}" 2>&1); then
+        log_error "sing-box config check failed"
+        printf '%s\n' "${err}" | while IFS= read -r line; do
+            log_error "  >> ${line}"
+        done
         return 1
     fi
     return 0
 }
 
-_validate_ident() {
-    local name="${1}" val="${2}"
-    [ -z "${val}" ] && { printf '  • %s: cannot be empty\n' "${name}"; return 1; }
-    case "${val}" in
-        [0-9]*) return 0 ;; # Allows 0x marks and numeric IDs
-        *[!a-zA-Z0-9_]*)
-            printf '  • %s: invalid characters in "%s"\n' "${name}" "${val}"
-            return 1
-            ;;
-    esac
-    return 0
-}
-
-_validate_cidr() {
-    local name="${1}" val="${2}"
-    [ -z "${val}" ] && return 0
-    case "${val}" in
-        *[!-0-9a-fA-F.:/]*)
-            printf '  • %s: invalid characters in CIDR "%s"\n' "${name}" "${val}"
-            return 1
-            ;;
-    esac
-    return 0
-}
-
-_validate_pkg_list() {
-    local name="${1}" val="${2}"
-    [ -z "${val}" ] && return 0
-    case "${val}" in
-        *[!-a-zA-Z0-9._[:space:]]*)
-            printf '  • %s: invalid characters in package list\n' "${name}"
-            return 1
-            ;;
-    esac
-    return 0
-}
-
-_validate_url() {
-    local name="${1}" val="${2}"
-    [ -z "${val}" ] && return 0
-    case "${val}" in
-        http://*|https://*)
-            case "${val}" in
-                *[[:space:]\"\'\<\>\;\`\|]*)
-                    printf '  • %s: contains illegal characters\n' "${name}"
-                    return 1
-                    ;;
-            esac
-            ;;
-        *)
-            printf '  • %s: invalid protocol (must be http/https)\n' "${name}"
-            return 1
-            ;;
-    esac
-    return 0
-}
-
-_validate_iface() {
-    local name="${1}" val="${2}"
-    case "${val}" in
-        ''|*[!a-zA-Z0-9._+]*)
-            printf '  • %s: invalid interface name format "%s"\n' "${name}" "${val}"
-            return 1
-            ;;
-        *+*)
-            [ "${val#*+}" = "" ] || { printf '  • %s: wildcard must be at end: "%s"\n' "${name}" "${val}"; return 1; }
-            ;;
-    esac
-    return 0
-}
-
-_validate_iface_list() {
-    local name="${1}" val="${2}"
-    [ -z "${val}" ] && return 0
-    local iface
-    for iface in ${val}; do
-        _validate_iface "${name}" "${iface}" || return 1
-    done
-    return 0
-}
-
 # ==============================================================================
-# [ Schema-Driven Validation ]
+# [ Schema-Driven Config Processor ]
 # ==============================================================================
-
-# Declare a data-driven validation schema for all settings
-# Format: KEY:TYPE[:MIN:MAX]
-readonly VALIDATION_SCHEMA="
-SUBSCRIPTION_URL:url
-UPDATE_TIMEOUT:int:1:300
-RETRY_COUNT:int:0:10
-UPDATE_INTERVAL:int:0:31536000
-PREF_CLEANUP_EMOJI:int:0:1
-LOG_LEVEL:int:0:4
-LOG_MAX_SIZE:int:10240:104857600
-CORE_USER:ident
-CORE_GROUP:ident
-CORE_TIMEOUT:int:1:60
-MOBILE_INTERFACE:iface
-WIFI_INTERFACE:iface
-HOTSPOT_INTERFACE:iface
-USB_INTERFACE:iface
-PROXY_PORT:int:1:65535
-FAKEIP_V4_RANGE:cidr
-FAKEIP_V6_RANGE:cidr
-PROXY_MOBILE:int:0:1
-PROXY_WIFI:int:0:1
-PROXY_HOTSPOT:int:0:1
-PROXY_USB:int:0:1
-PROXY_IPV6:int:0:1
-ROUTING_MARK:int:0:65535
-APP_PROXY_MODE:int:0:2
-APP_LIST:pkg_list
-MSS_CLAMP_ENABLE:int:0:1
-EXCLUDE_INTERFACES:iface_list
-INCLUDE_INTERFACES:iface_list
+# One-pass settings processor: init defaults, validate, export
+# Returns: 0 on success, 1 on validation error
+readonly SETTINGS_SCHEMA="
+SUBSCRIPTION_URL:url::
+UPDATE_TIMEOUT:int:5:1:300
+RETRY_COUNT:int:2:0:10
+UPDATE_INTERVAL:int:86400:0:31536000
+PREF_CLEANUP_EMOJI:int:1:0:1
+LOG_LEVEL:int:3:0:4
+LOG_MAX_SIZE:int:1048576:10240:104857600
+CORE_USER:ident:root
+CORE_GROUP:ident:root
+CORE_TIMEOUT:int:5:1:60
+MOBILE_INTERFACE:iface:rmnet_data+
+WIFI_INTERFACE:iface:wlan0
+HOTSPOT_INTERFACE:iface:wlan2
+USB_INTERFACE:iface:rndis+
+PROXY_PORT:int:1536:1:65535
+FAKEIP_V4_RANGE:cidr:198.18.0.0/15
+FAKEIP_V6_RANGE:cidr:fc00::/18
+PROXY_MOBILE:int:1:0:1
+PROXY_WIFI:int:1:0:1
+PROXY_HOTSPOT:int:1:0:1
+PROXY_USB:int:1:0:1
+PROXY_IPV6:int:0:0:1
+ROUTING_MARK:int::0:65535
+APP_PROXY_MODE:int:0:0:2
+APP_LIST:pkg_list::
+MSS_CLAMP_ENABLE:int:1:0:1
+EXCLUDE_INTERFACES:iface_list::
+UPDATER_EXCLUDE_REMARKS:regex:(expire|traffic|官网|到期|流量|剩余|套餐|重置|联系|群组|通知|平台|网站|时间|建议|反馈|版本|更新)
+UPDATER_RENAME_RULES:json:[]
+UPDATER_MAX_TAG_LENGTH:int:32:1:128
 "
 
-# Iterate through the schema and validate each current variable value
-_validate_settings() {
-    log_debug "Validating runtime settings..."
-    local valid=0 name type p1 p2 val
-    while IFS=: read -r name type p1 p2 || [ -n "${name}" ]; do
-        [ -z "${name}" ] || [ "${name#\#}" != "${name}" ] && continue
+_process_settings() {
+    local input_file="${SETTINGS_FILE}"
+    [ -f "${input_file}" ] || input_file="/dev/null"
 
-        # Security: Prevent eval injection via variable names
-        case "${name}" in *[!a-zA-Z0-9_]*) continue ;; esac
-        # Strict mode: If variable is not set, this should error out if we assume it must be set.
-        # However, _init_config_defaults should have set them.
-        # We use explicit ${VAR} without default to catch initialization failures.
-        eval "val=\"\${$name}\""
+    # Compile config to shell script
+    if SETTINGS_SCHEMA_VAL="${SETTINGS_SCHEMA}" awk '
+    function trim(s) {
+        sub(/^[[:space:]]+/, "", s)
+        sub(/[[:space:]]+$/, "", s)
+        return s
+    }
 
-        case "${type}" in
-            int)        _validate_int "${name}" "${val}" "${p1}" "${p2}" || valid=1 ;;
-            ident)      _validate_ident "${name}" "${val}" || valid=1 ;;
-            url)        _validate_url "${name}" "${val}" || valid=1 ;;
-            cidr)       _validate_cidr "${name}" "${val}" || valid=1 ;;
-            iface)      _validate_iface "${name}" "${val}" || valid=1 ;;
-            iface_list) _validate_iface_list "${name}" "${val}" || valid=1 ;;
-            pkg_list)   _validate_pkg_list "${name}" "${val}" || valid=1 ;;
-        esac
-    done << EOF
-${VALIDATION_SCHEMA}
-EOF
-    return "${valid}"
-}
+    function validate(type, name, val, p1, p2,    n, i, item, rc) {
+        if (type == "int") {
+            if (val == "") return 0
+            if (val !~ /^-?[0-9]+$/ || length(val) > 18) {
+                print "[WARN] " name ": invalid or over-sized number \047" val "\047" > "/dev/stderr"
+                return 1
+            }
+            if (p1 != "" && p2 != "") {
+                if (val + 0 < p1 + 0 || val + 0 > p2 + 0) {
+                    print "[WARN] " name ": out of range (" val ", allowed: " p1 "-" p2 ")" > "/dev/stderr"
+                    return 1
+                }
+            }
+        } else if (type == "ident") {
+            if (val == "") {
+                print "[WARN] " name ": cannot be empty" > "/dev/stderr"
+                return 1
+            }
+            if (val ~ /^-?[0-9]+$/) return 0
+            if (val !~ /^[a-zA-Z_][a-zA-Z0-9_]*$/) {
+                print "[WARN] " name ": invalid identifier \047" val "\047" > "/dev/stderr"
+                return 1
+            }
+        } else if (type == "url") {
+            if (val == "") return 0
+            if (val !~ /^(http|https):\/\//) {
+                print "[WARN] " name ": must be http/https URL" > "/dev/stderr"
+                return 1
+            }
+            if (val ~ /[\ "\047<> ;`|]/) {
+                print "[WARN] " name ": contains illegal characters" > "/dev/stderr"
+                return 1
+            }
+        } else if (type == "cidr") {
+            if (val == "") return 0
+            if (val ~ /[^0-9a-fA-F.:\/]/) {
+                 print "[WARN] " name ": invalid CIDR \047" val "\047" > "/dev/stderr"
+                 return 1
+            }
+        } else if (type == "iface") {
+            if (val == "") return 0
+            if (val ~ /[^a-zA-Z0-9._+]/) {
+                print "[WARN] " name ": invalid interface \047" val "\047" > "/dev/stderr"
+                return 1
+            }
+            if (val ~ /\+/ && val !~ /\+$/) {
+                 print "[WARN] " name ": wildcard must be at end \047" val "\047" > "/dev/stderr"
+                 return 1
+            }
+        } else if (type == "iface_list") {
+            if (val == "") return 0
+            n = split(val, items, /[[:space:]]+/)
+            for (i = 1; i <= n; i++) {
+                if (validate("iface", name, items[i])) return 1
+            }
+        } else if (type == "pkg_list") {
+            if (val == "") return 0
+            if (val ~ /[^a-zA-Z0-9._[:space:]-]/) {
+                 print "[WARN] " name ": invalid package list" > "/dev/stderr"
+                 return 1
+            }
+        }
+        return 0
+    }
 
-# ------------------------------------------------------------------------------
+    BEGIN {
+        # 1. Parse Schema
+        schema = ENVIRON["SETTINGS_SCHEMA_VAL"]
+        n_schema = split(schema, schema_lines, "\n")
+        for (i = 1; i <= n_schema; i++) {
+            line = trim(schema_lines[i])
+            if (line == "" || line ~ /^#/) continue
+            split(line, parts, ":")
+            key = parts[1]
+            if (key == "") continue
 
-# Use sing-box binary to verify the core JSON configuration
-_validate_singbox_config() {
-    log_debug "Validating sing-box configuration..."
-    local bin="${SING_BOX_BIN}"
-    if [ ! -x "${bin}" ]; then
-        [ -f "${bin}" ] && chmod +x "${bin}" 2>/dev/null
-        if [ ! -x "${bin}" ]; then
-            printf '  • sing-box binary not executable or missing\n'
-            return 1
-        fi
-    fi
-    local err_out
-    if ! err_out=$("${bin}" check -c "${CONFIG_FILE}" -D "${RUN_DIR}" 2>&1); then
-        printf '  • sing-box config validation failed:\n'
-        echo "${err_out}" | while read -r line; do printf '    >> %s\n' "${line}"; done
+            schema_map[key, "type"] = parts[2]
+            schema_map[key, "default"] = parts[3]
+            schema_map[key, "min"] = parts[4]
+            schema_map[key, "max"] = parts[5]
+            schema_keys[++k_count] = key
+        }
+
+        # Initialize parser state
+        in_quotes = 0
+        quote_char = ""
+        key = ""
+        val = ""
+    }
+
+    # 2. Parse Settings File (Stream processing)
+    {
+        line = $0
+        if (!in_quotes) {
+            # Match KEY=VALUE
+            if (line ~ /^[[:space:]]*[A-Z0-9_]+[[:space:]]*=/) {
+                # Save previous key if exists
+                if (key != "") {
+                    config_map[key] = trim(val)
+                }
+
+                # Parse new key
+                split(line, parts, "=")
+                raw_key = parts[1]
+                sub(/^[[:space:]]+/, "", raw_key)
+                sub(/[[:space:]]+$/, "", raw_key)
+                key = raw_key
+
+                # Extract value part
+                # recreate value part (handle multiple = in value)
+                raw_val = line
+                sub(/^[[:space:]]*[A-Z0-9_]+[[:space:]]*=[[:space:]]*/, "", raw_val)
+
+                # Check quoting
+                t = trim(raw_val)
+                first = substr(t, 1, 1)
+
+                if (first == "\"" || first == "\047") {
+                    quote_char = first
+                    t = substr(t, 2)
+                    idx = index(t, quote_char)
+                    if (idx > 0) {
+                        # Single line quoted
+                        val = substr(t, 1, idx - 1)
+                        config_map[key] = val
+                        key = "" # Done with this key
+                        val = ""
+                    } else {
+                        # Start multi-line quote
+                        val = t
+                        in_quotes = 1
+                    }
+                } else {
+                    # Unquoted
+                    sub(/[[:space:]]+#.*$/, "", raw_val)
+                    val = trim(raw_val)
+                    config_map[key] = val
+                    key = "" # Done
+                    val = ""
+                }
+            }
+        } else {
+            # Inside quotes
+            idx = index(line, quote_char)
+            if (idx > 0) {
+                # End quote
+                segment = substr(line, 1, idx - 1)
+                val = val "\n" segment
+                config_map[key] = val
+                key = ""
+                val = ""
+                in_quotes = 0
+                quote_char = ""
+            } else {
+                val = val "\n" line
+            }
+        }
+    }
+
+    END {
+        # Handle last pending key
+        if (key != "") {
+            config_map[key] = trim(val)
+        }
+
+        print "# Flux Config Cache - Auto Generated"
+
+        has_error = 0
+        for (i = 1; i <= k_count; i++) {
+            name = schema_keys[i]
+            type = schema_map[name, "type"]
+            def = schema_map[name, "default"]
+            min = schema_map[name, "min"]
+            max = schema_map[name, "max"]
+
+            val = (name in config_map) ? config_map[name] : ""
+
+            # Apply default
+            if (val == "") val = def
+
+            # Validate
+            if (validate(type, name, val, min, max)) has_error = 1
+
+            # Normalize pkg_list (newlines to spaces)
+            if (type == "pkg_list") {
+                gsub(/\n/, " ", val)
+                gsub(/[[:space:]]+/, " ", val)
+                val = trim(val)
+            }
+
+            # Escape single quotes for shell
+            gsub(/\047/, "\047\\\047\047", val)
+
+            printf "%s=\047%s\047\n", name, val
+        }
+
+        exit has_error
+    }
+    ' "${input_file}"; then
+        return 0
+    else
+        log_error "Config validation failed"
         return 1
     fi
-    return 0
+}
+
+# ==============================================================================
+# [ Kernel Feature Detection ]
+# ==============================================================================
+# Detect kernel features, set variables, and output to stdout
+_detect_kernel() {
+    printf "# Kernel Features\n"
+
+    if [ -f /proc/config.gz ]; then
+        zcat /proc/config.gz 2>/dev/null | awk '
+            BEGIN {
+                # Whitelist of features to detect
+                f["CONFIG_NETFILTER_XT_TARGET_TPROXY"]  = "KFEAT_TPROXY"
+                f["CONFIG_NETFILTER_XT_MATCH_OWNER"]   = "KFEAT_OWNER"
+                f["CONFIG_NETFILTER_XT_MATCH_MARK"]    = "KFEAT_MARK"
+                f["CONFIG_NETFILTER_XT_MATCH_ADDRTYPE"] = "KFEAT_ADDRTYPE"
+                f["CONFIG_NETFILTER_XT_MATCH_CONNTRACK"] = "KFEAT_CONNTRACK"
+                f["CONFIG_IP6_NF_NAT"]                 = "KFEAT_IPV6_NAT"
+            }
+            {
+                split($0, p, "=")
+                if (p[1] in f) {
+                    res[f[p[1]]] = (p[2] ~ /^[ym]$/) ? 1 : 0
+                }
+            }
+            END {
+                for (k in f) {
+                    name = f[k]
+                    printf "%s=%d\n", name, res[name]+0
+                }
+            }
+        '
+    else
+        log_warn "/proc/config.gz missing, falling back to module detection"
+        local t=0 o=0 m=0 a=0 c=0 i=0
+        grep -qw "tproxy" /proc/net/ip_tables_targets 2>/dev/null && t=1
+        grep -qw "owner" /proc/net/ip_tables_matches 2>/dev/null && o=1
+        grep -qw "mark" /proc/net/ip_tables_matches 2>/dev/null && m=1
+        grep -qw "addrtype" /proc/net/ip_tables_matches 2>/dev/null && a=1
+        grep -qw "conntrack" /proc/net/ip_tables_matches 2>/dev/null && c=1
+        grep -qw "nat" /proc/net/ip6_tables_names 2>/dev/null && i=1
+
+        printf 'KFEAT_TPROXY=%d\nKFEAT_OWNER=%d\nKFEAT_MARK=%d\nKFEAT_ADDRTYPE=%d\nKFEAT_CONNTRACK=%d\nKFEAT_IPV6_NAT=%d\n' \
+            "$t" "$o" "$m" "$a" "$c" "$i"
+    fi
 }
 
 # ==============================================================================
 # [ Public Configuration API ]
 # ==============================================================================
-
-# Perform a full system configuration audit
-validate_all() {
-    # 1. Verify and sourge user settings
-    if [ -f "${SETTINGS_FILE}" ]; then
-        if ! sh -n "${SETTINGS_FILE}" 2>/dev/null; then
-            log_error "Syntax error in ${SETTINGS_FILE}"
-            return 1
-        fi
-        . "${SETTINGS_FILE}"
-    fi
-    # 2. Populate defaults and extract dynamic config
-    _init_config_defaults
-    _extract_json_config
-    # 3. Perform schema and binary validation
-    local errors
-    errors=$(
-        _validate_settings
-        _validate_singbox_config
-    )
-    if [ -n "${errors}" ]; then
-        log_error "Validation failed:\n${errors}"
-        return 1
-    fi
-    log_debug "System validation passed"
+# One-stop config: init defaults, validate, export cache to stdout
+# Also validates sing-box config
+build_config() {
+    _validate_singbox_config || return 1
+    _extract_json_config || return 1
+    _process_settings || return 1
+    _detect_kernel || return 1
     return 0
 }

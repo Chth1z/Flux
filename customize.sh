@@ -11,14 +11,16 @@
 
 SKIPUNZIP=1
 
-# Environment Check
+# ==============================================================================
+# [ Environment Check ]
+# ==============================================================================
 
 if [ "${BOOTMODE:-false}" != "true" ]; then
-    ui_print "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    ui_print "========================================"
     ui_print "  ! ERROR: FLUX TERMINATED"
     ui_print "  ! Please install in Magisk/KSU/APatch"
     ui_print "  ! Recovery installation is not supported"
-    ui_print "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    ui_print "========================================"
     abort
 fi
 
@@ -46,7 +48,7 @@ fi
 
 # Note: ui_print is provided by Magisk/KernelSU/APatch installer
 ui_error() { ui_print "! $1"; }
-ui_success() { ui_print "√ $1"; }
+ui_success() { ui_print "[OK] $1"; }
 
 _detect_env() {
     ui_print "- Detecting environment..."
@@ -62,13 +64,16 @@ _detect_env() {
     else
         ui_print "  > Unknown Environment"
     fi
-    return 0
 }
+
+# ==============================================================================
+# [ Volume Key Selection ]
+# ==============================================================================
 
 # Simplified countdown loop with getevent timeout
 _choose_action() {
     local title="${1}"
-    local default_action="${2}"  # true = Yes/Keep, false = No/Reset
+    local default_action="${2}" # true = Yes/Keep, false = No/Reset
     local timeout_sec=10
     local count=0
 
@@ -80,17 +85,21 @@ _choose_action() {
 
     while [ "${count}" -lt "${timeout_sec}" ]; do
         # Capture 1 event with 1s timeout
-        timeout 1 getevent -lc 1 2>&1 | grep KEY_VOLUME > "${TMPDIR}/events" || true
+        local ev
+        ev=$(timeout 1 getevent -lc 1 2>/dev/null | grep KEY_VOLUME || true)
 
-        if grep -q KEY_VOLUMEUP "${TMPDIR}/events" 2>/dev/null; then
+        case "${ev}" in
+        *KEY_VOLUMEUP*)
             ui_print "  > Selected: [Yes/Keep]"
             default_action="true"
             break
-        elif grep -q KEY_VOLUMEDOWN "${TMPDIR}/events" 2>/dev/null; then
+            ;;
+        *KEY_VOLUMEDOWN*)
             ui_print "  > Selected: [No/Reset]"
             default_action="false"
             break
-        fi
+            ;;
+        esac
         count=$((count + 1))
     done
 
@@ -101,7 +110,7 @@ _choose_action() {
     }
 
     # Clear event buffer
-    timeout 1 getevent -cl >/dev/null 2>&1 || true
+    timeout 1 getevent -cl >/dev/null 2>&1
 
     [ "${default_action}" = "true" ]
 }
@@ -115,86 +124,157 @@ _choose_action() {
 # supporting multi-line quoted values and ensuring atomic replacement in the new config.
 # Note: CORE_TIMEOUT, PROXY_TCP_PORT, PROXY_UDP_PORT, DNS_PORT are now read from config.json
 readonly MIGRATE_KEYS="
-SUBSCRIPTION_URL UPDATE_TIMEOUT RETRY_COUNT UPDATE_INTERVAL PREF_CLEANUP_EMOJI
-LOG_LEVEL LOG_MAX_SIZE
-CORE_USER CORE_GROUP CORE_TIMEOUT
-MOBILE_INTERFACE WIFI_INTERFACE HOTSPOT_INTERFACE USB_INTERFACE
-PROXY_MOBILE PROXY_WIFI PROXY_HOTSPOT PROXY_USB PROXY_IPV6
+SUBSCRIPTION_URL
+UPDATE_TIMEOUT
+RETRY_COUNT
+UPDATE_INTERVAL
+PREF_CLEANUP_EMOJI
+LOG_LEVEL
+LOG_MAX_SIZE
+CORE_USER
+CORE_GROUP
+CORE_TIMEOUT
+MOBILE_INTERFACE
+WIFI_INTERFACE
+HOTSPOT_INTERFACE
+USB_INTERFACE
+PROXY_MOBILE
+PROXY_WIFI
+PROXY_HOTSPOT
+PROXY_USB
+PROXY_IPV6
 ROUTING_MARK
-APP_PROXY_MODE APP_LIST
-MSS_CLAMP_ENABLE EXCLUDE_INTERFACES INCLUDE_INTERFACES
+APP_PROXY_MODE
+APP_LIST
+MSS_CLAMP_ENABLE
+EXCLUDE_INTERFACES
+UPDATER_EXCLUDE_REMARKS
+UPDATER_RENAME_RULES
+UPDATER_MAX_TAG_LENGTH
 "
 
 _migrate_settings() {
     local backup_file="${1}"
     local target_file="${2}"
+    local tmp_file
 
     [ ! -f "${backup_file}" ] && return 0
 
     ui_print "  > Migrating settings (incremental)..."
 
-    for key in ${MIGRATE_KEYS}; do
-        # Use awk to extract value (handles multi-line quoted values)
-        local value
-        value=$(awk -v key="${key}" '
-            BEGIN { found=0; in_quotes=0; value="" }
-            $0 ~ "^"key"=" {
-                found=1
-                # Get everything after KEY=
-                sub("^"key"=", "")
-                value = $0
-                # Count quotes to detect multi-line
-                n = gsub(/"/, "\"", value)
-                if (n == 1) {
-                    # Opening quote but no closing - multi-line value
-                    in_quotes=1
-                } else {
-                    # Single line value - print and exit
-                    print value
-                    exit
+    tmp_file=$(mktemp) || return 1
+    awk -v keys="${MIGRATE_KEYS}" '
+        function trim(s) {
+            sub(/^[[:space:]]+/, "", s)
+            sub(/[[:space:]]+$/, "", s)
+            return s
+        }
+        function quote_start(rhs,   t, q, rest) {
+            t = trim(rhs)
+            q = substr(t, 1, 1)
+            if (q != "\"" && q != "'"'"'") return ""
+            rest = substr(t, 2)
+            return (index(rest, q) == 0) ? q : ""
+        }
+        BEGIN {
+            n = split(keys, arr, /[[:space:]]+/)
+            for (i = 1; i <= n; i++) if (arr[i] != "") keep[arr[i]] = 1
+
+            phase = 0
+            in_bq = 0
+            bq_key = ""
+            bq_quote = ""
+            bq_val = ""
+
+            skip_target = 0
+            target_quote = ""
+        }
+        FNR == 1 {
+            phase++
+        }
+        phase == 1 {
+            line = $0
+
+            if (!in_bq) {
+                if (line ~ /^[A-Z0-9_]+[[:space:]]*=/) {
+                    key = line
+                    sub(/[[:space:]]*=.*/, "", key)
+
+                    if (key in keep) {
+                        rhs = line
+                        sub(/^[^=]*=[[:space:]]*/, "", rhs)
+
+                        q = quote_start(rhs)
+                        if (q != "") {
+                            in_bq = 1
+                            bq_key = key
+                            bq_quote = q
+                            bq_val = rhs
+                        } else {
+                            map[key] = rhs
+                        }
+                    }
                 }
+            } else {
+                bq_val = bq_val "\n" line
+                if (index(line, bq_quote) > 0) {
+                    map[bq_key] = bq_val
+                    in_bq = 0
+                    bq_key = ""
+                    bq_quote = ""
+                    bq_val = ""
+                }
+            }
+            next
+        }
+        phase == 2 {
+            line = $0
+
+            if (skip_target) {
+                if (index(line, target_quote) > 0) skip_target = 0
                 next
             }
-            found && in_quotes {
-                value = value "\n" $0
-                # Check for closing quote
-                if (/"/) {
-                    in_quotes=0
-                    print value
-                    exit
+
+            if (line ~ /^[A-Z0-9_]+[[:space:]]*=/) {
+                key = line
+                sub(/[[:space:]]*=.*/, "", key)
+
+                if (key in map) {
+                    print key "=" map[key]
+                    restored[key] = 1
+
+                    rhs = line
+                    sub(/^[^=]*=[[:space:]]*/, "", rhs)
+                    q = quote_start(rhs)
+                    if (q != "") {
+                        skip_target = 1
+                        target_quote = q
+                    }
+                    next
                 }
             }
-        ' "${backup_file}")
 
-        if [ -n "${value}" ]; then
-            # Create temp file for the replacement
-            local tmp_file
-            tmp_file=$(mktemp)
-            # Use awk to replace or append the key in target file
-            awk -v key="${key}" -v newval="${value}" '
-                BEGIN { found=0; skip=0 }
-                $0 ~ "^"key"=" {
-                    found=1
-                    print key"="newval
-                    # Check if value continues on next lines
-                    n = gsub(/"/, "\"", $0)
-                    if (n == 1) skip=1
-                    next
+            print line
+        }
+        END {
+            n = split(keys, arr, /[[:space:]]+/)
+            for (i = 1; i <= n; i++) {
+                key = arr[i]
+                if (key == "") continue
+                if ((key in map) && !(key in restored)) {
+                    print key "=" map[key]
                 }
-                skip {
-                    if (/"/) skip=0
-                    next
-                }
-                { print }
-                END {
-                    if (!found) print key"="newval
-                }
-            ' "${target_file}" > "${tmp_file}"
+            }
+        }
+    ' "${backup_file}" "${target_file}" >"${tmp_file}"
 
-            mv -f "${tmp_file}" "${target_file}"
-            ui_print "     ↳ ${key}: restored"
-        fi
-    done
+    if [ $? -ne 0 ]; then
+        rm -f "${tmp_file}"
+        return 1
+    fi
+
+    mv -f "${tmp_file}" "${target_file}"
+    ui_print "     ↳ settings.ini: restored"
     return 0
 }
 
@@ -206,27 +286,31 @@ main() {
     _detect_env
 
     # 1. Backup config files before overwriting
-    local TMP_BACKUP
-    # Use standard Android tmp path if mktemp fails
-    TMP_BACKUP=$(mktemp -d 2>/dev/null || echo "${TMPDIR}/flux_mig_$$")
-    mkdir -p "${TMP_BACKUP}"
+    local tmp_backup
+    tmp_backup=$(mktemp -d 2>/dev/null) || abort "! Failed to create temporary backup directory"
+    mkdir -p "${tmp_backup}"
 
-    # Ensure cleanup on exit (Use double quotes to expand TMP_BACKUP immediately)
-    trap "rm -rf \"${TMP_BACKUP}\"; rm -rf \"${FLUX_DIR}/tmp\" 2>/dev/null" EXIT INT TERM
+    # Ensure cleanup on exit (Use double quotes to expand tmp_backup immediately)
+    trap "rm -rf \"${tmp_backup}\"; rm -rf \"${FLUX_DIR}/tmp\" 2>/dev/null" EXIT INT TERM
 
-    local has_settings=false has_template=false
+    local has_settings=false has_template=false has_addrsyncd=false
 
     if [ -d "${FLUX_DIR}" ]; then
         ui_print "- Backing up configuration files..."
         # Backup settings.ini (will auto-migrate)
         if [ -f "${CONF_DIR}/settings.ini" ]; then
-            cp -f "${CONF_DIR}/settings.ini" "${TMP_BACKUP}/settings.ini"
+            cp -f "${CONF_DIR}/settings.ini" "${tmp_backup}/settings.ini"
             has_settings=true
         fi
         # Backup template.json template (user choice)
         if [ -f "${CONF_DIR}/template.json" ]; then
-            cp -f "${CONF_DIR}/template.json" "${TMP_BACKUP}/template.json"
+            cp -f "${CONF_DIR}/template.json" "${tmp_backup}/template.json"
             has_template=true
+        fi
+        # Backup addrsyncd.toml (user choice)
+        if [ -f "${CONF_DIR}/addrsyncd.toml" ]; then
+            cp -f "${CONF_DIR}/addrsyncd.toml" "${tmp_backup}/addrsyncd.toml"
+            has_addrsyncd=true
         fi
     fi
 
@@ -240,6 +324,9 @@ main() {
 
     # 3. Clear and recreate FLUX_DIR structure
     rm -rf "${BIN_DIR}" "${SCRIPTS_DIR}" 2>/dev/null
+    # Clear cache to prevent rule inheritance issues on version mismatch
+    rm -rf "${FLUX_DIR}/cache" 2>/dev/null
+
     unzip -o "${ZIPFILE}" 'bin/*' 'scripts/*' 'conf/*' -d "${FLUX_DIR}" >&2 || abort "! Failed to extract module files"
     # Rename default if template was extracted as singbox.json (for zip compatibility)
     [ -f "${CONF_DIR}/singbox.json" ] && mv -f "${CONF_DIR}/singbox.json" "${CONF_DIR}/template.json"
@@ -251,7 +338,7 @@ main() {
     # 4.1 settings.ini - Auto migrate
     if [ "${has_settings}" = "true" ]; then
         ui_print "- Migrating settings.ini..."
-        _migrate_settings "${TMP_BACKUP}/settings.ini" "${CONF_DIR}/settings.ini"
+        _migrate_settings "${tmp_backup}/settings.ini" "${CONF_DIR}/settings.ini"
     else
         ui_print "- Using default settings.ini"
     fi
@@ -259,10 +346,20 @@ main() {
     # 4.2 template.json - User choice
     if [ "${has_template}" = "true" ]; then
         if _choose_action "Keep [template.json]?" "true"; then
-            cp -f "${TMP_BACKUP}/template.json" "${CONF_DIR}/template.json"
+            cp -f "${tmp_backup}/template.json" "${CONF_DIR}/template.json"
             ui_print "  > template.json: restored"
         else
             ui_print "  > template.json: reset to default"
+        fi
+    fi
+
+    # 4.3 addrsyncd.toml - User choice
+    if [ "${has_addrsyncd}" = "true" ]; then
+        if _choose_action "Keep [addrsyncd.toml]?" "true"; then
+            cp -f "${tmp_backup}/addrsyncd.toml" "${CONF_DIR}/addrsyncd.toml"
+            ui_print "  > addrsyncd.toml: restored"
+        else
+            ui_print "  > addrsyncd.toml: reset to default"
         fi
     fi
 
@@ -274,13 +371,12 @@ main() {
     set_perm_recursive "${SCRIPTS_DIR}" 0 0 0755 0700
     set_perm "${SERVICE_DIR}/flux_service.sh" 0 0 0700
 
-    # Fallback: fix set_perm_recursive not working on some phones
-    chmod ugo+x "${BIN_DIR}"/* 2>/dev/null || true
-    chmod ugo+x "${SCRIPTS_DIR}"/* 2>/dev/null || true
+    chmod ugo+x "${BIN_DIR}"/* 2>/dev/null || abort "! Failed to set executable bits for binaries"
+    chmod ugo+x "${SCRIPTS_DIR}"/* 2>/dev/null || abort "! Failed to set executable bits for scripts"
 
     # 6. Cleanup
-    rm -rf "${TMP_BACKUP}"
-    rm -rf "${FLUX_DIR}/tmp" 2>/dev/null || true
+    rm -rf "${tmp_backup}"
+    rm -rf "${FLUX_DIR}/tmp" 2>/dev/null || abort "! Failed to clean temporary files"
 
     ui_success "Installation Complete!"
 }

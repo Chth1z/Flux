@@ -1,0 +1,507 @@
+#!/system/bin/sh
+
+# ==============================================================================
+# [ Flux Core Shared Library ]
+# Description: Shared constants, utilities, and configuration orchestration.
+# ==============================================================================
+
+# ==============================================================================
+# [ Routing & PBR Constants ]
+# ==============================================================================
+# These define the topological structure of Flux routing in the Linux stack.
+readonly TABLE_ID=2025
+
+# Netfilter Marks
+readonly IPV4_MARK=0x14
+readonly IPV6_MARK=0x19
+readonly BYPASS_MARK=0x11
+
+# ==============================================================================
+# [ Timeout Constants ]
+# ==============================================================================
+
+readonly BOOT_TIMEOUT=60   # Max wait for system boot (seconds)
+readonly IPTABLES_WAIT=100 # iptables lock wait timeout (centiseconds)
+readonly RESTART_DEBOUNCE_SEC=10
+
+# ==============================================================================
+# [ Directory Structure ]
+# ==============================================================================
+
+readonly FLUX_DIR="/data/adb/flux"
+readonly MAGISK_MOD_DIR="/data/adb/modules/flux"
+
+readonly BIN_DIR="${FLUX_DIR}/bin"
+readonly CACHE_DIR="${FLUX_DIR}/cache"
+readonly CONF_DIR="${FLUX_DIR}/conf"
+readonly RUN_DIR="${FLUX_DIR}/run"
+readonly SCRIPTS_DIR="${FLUX_DIR}/scripts"
+
+# ==============================================================================
+# [ Core Binaries & Environment ]
+# ==============================================================================
+
+readonly JQ_BIN="${BIN_DIR}/jq"
+readonly SING_BOX_BIN="${BIN_DIR}/sing-box"
+readonly ADDRSYNCD_BIN="${BIN_DIR}/addrsyncd"
+
+readonly PATH="/data/adb/magisk:/data/adb/ksu/bin:/data/adb/ap/bin:${PATH}"
+
+# ==============================================================================
+# [ Configuration Files ]
+# ==============================================================================
+
+readonly CONFIG_FILE="${CONF_DIR}/config.json"
+readonly TEMPLATE_FILE="${CONF_DIR}/template.json"
+readonly SETTINGS_FILE="${CONF_DIR}/settings.ini"
+readonly ADDRSYNCD_CONF_FILE="${CONF_DIR}/addrsyncd.toml"
+readonly PROP_FILE="${MAGISK_MOD_DIR}/module.prop"
+readonly PACKAGES_LIST="/data/system/packages.list"
+
+# ==============================================================================
+# [ Runtime & Log Files ]
+# ==============================================================================
+
+readonly FLUX_LOG="${RUN_DIR}/flux.log"
+readonly SING_BOX_PID_FILE="${RUN_DIR}/sing-box.pid"
+readonly SING_BOX_LOG="${RUN_DIR}/sing-box.log"
+readonly ADDRSYNCD_LOG_FILE="${RUN_DIR}/addrsyncd.log"
+readonly ADDRSYNCD_PID_FILE="${RUN_DIR}/addrsyncd.pid"
+
+# ==============================================================================
+# [ Internal Files ]
+# ==============================================================================
+readonly DISPATCH_LOCK_DIR="${RUN_DIR}/dispatcher.lock"
+readonly RESTART_STAMP_FILE="${RUN_DIR}/restart.stamp"
+readonly BOOT_TRIGGER="${MAGISK_MOD_DIR}/boot_trigger"
+readonly EVENT_CACHE_OK="${CACHE_DIR}/cache_valid"
+
+# ==============================================================================
+# [ Internal Scripts ]
+# ==============================================================================
+
+readonly CONFIG_SCRIPT="${SCRIPTS_DIR}/config"
+readonly CORE_SCRIPT="${SCRIPTS_DIR}/core"
+readonly DISPATCHER_SCRIPT="${SCRIPTS_DIR}/dispatcher"
+readonly INIT_SCRIPT="${SCRIPTS_DIR}/init"
+readonly ADDRSYNC_SCRIPT="${SCRIPTS_DIR}/addrsync"
+readonly LIB_SCRIPT="${SCRIPTS_DIR}/lib"
+readonly LOG_SCRIPT="${SCRIPTS_DIR}/log"
+readonly RULES_SCRIPT="${SCRIPTS_DIR}/rules"
+readonly TPROXY_SCRIPT="${SCRIPTS_DIR}/tproxy"
+readonly UPDATE_SCRIPT="${SCRIPTS_DIR}/updater.sh"
+
+# ==============================================================================
+# [ Cache Files ]
+# ==============================================================================
+
+readonly CACHE_CONFIG_FILE="${CACHE_DIR}/cache_config"
+readonly CACHE_RULES_V4_FILE="${CACHE_DIR}/cache_rules_ipv4"
+readonly CACHE_RULES_V6_FILE="${CACHE_DIR}/cache_rules_ipv6"
+readonly CACHE_CLEANUP_V4_FILE="${CACHE_DIR}/cache_cleanup_ipv4"
+readonly CACHE_CLEANUP_V6_FILE="${CACHE_DIR}/cache_cleanup_ipv6"
+
+# ==============================================================================
+# [ File Utilities ]
+# ==============================================================================
+
+# Get file age in seconds
+# Usage: file_age FILE
+file_age() {
+    local file="${1}"
+    [ ! -f "${file}" ] && echo 0 && return 0
+
+    local mtime
+    mtime=$(stat -c%Y "${file}" 2>/dev/null) || {
+        log_error "stat failed: ${file}"
+        return 1
+    }
+    echo $(($(date +%s) - mtime))
+}
+
+# Get file size in bytes
+# Usage: file_size FILE
+file_size() {
+    local file="${1}"
+    [ ! -f "${file}" ] && echo 0 && return 0
+    stat -c%s "${file}" 2>/dev/null || {
+        log_error "stat failed: ${file}"
+        return 1
+    }
+}
+
+# Atomic write to file to prevent corruption
+# Usage: atomic_write TARGET_FILE command [args...]
+atomic_write() {
+    local target_file="${1}"
+    shift
+
+    local tmp_file
+    tmp_file=$(mktemp "${target_file}.XXXXXX") || return 1
+
+    local rc
+    if "$@" >"${tmp_file}"; then
+        mv -f "${tmp_file}" "${target_file}"
+        return 0
+    else
+        rc=$?
+        rm -f "${tmp_file}"
+        log_error "Write failed: ${target_file##*/}"
+        return "${rc}"
+    fi
+}
+
+# Generic cleanup utility
+# Usage: trap 'cleanup "Message" "$FILE" "$DIR"' EXIT INT TERM
+cleanup() {
+    local rc=$?
+    local msg="${1}"
+    shift
+
+    [ -n "${msg}" ] && log_debug "${msg}"
+    for item in "$@"; do
+        [ -n "${item}" ] && rm -rf "${item}" 2>/dev/null
+    done
+    return "${rc}"
+}
+
+# ==============================================================================
+# [ Network Utilities ]
+# ==============================================================================
+
+# Check if string is a valid integer
+# Usage: is_int STRING
+is_int() {
+    case "${1}" in
+    '' | *[!0-9]*) return 1 ;;
+    esac
+    return 0
+}
+
+# Check if a port is listening
+# Usage: is_port_listening PORT
+is_port_listening() {
+    local port="${1}"
+    command -v ss >/dev/null 2>&1 || {
+        log_error "ss command missing"
+        return 1
+    }
+    ss -Hltn "sport = :${port}" 2>/dev/null | grep -q "."
+}
+
+# ==============================================================================
+# [ Process Utilities ]
+# ==============================================================================
+
+# Read and validate a PID from pid file.
+# Usage: read_pid_file PID_FILE [LABEL]
+read_pid_file() {
+    local pid_file="${1}"
+    local label="${2}"
+    local pid=""
+
+    [ -f "${pid_file}" ] || return 0
+
+    pid=$(cat "${pid_file}" 2>/dev/null) || {
+        log_error "Failed reading ${label} pid file"
+        return 1
+    }
+
+    [ -z "${pid}" ] && return 0
+
+    is_int "${pid}" || {
+        log_error "Invalid ${label} pid: ${pid}"
+        return 1
+    }
+
+    printf '%s\n' "${pid}"
+}
+
+# Check whether a PID is alive.
+# Usage: pid_alive PID
+pid_alive() {
+    local pid="${1}"
+    [ -n "${pid}" ] || return 1
+    [ -d "/proc/${pid}" ] || kill -0 "${pid}" 2>/dev/null
+}
+
+# Verify /proc cmdline contains an expected fragment.
+# Usage: pid_matches_cmd PID EXPECTED_FRAGMENT
+pid_matches_cmd() {
+    local pid="${1}"
+    local expected="${2}"
+
+    [ -n "${expected}" ] || return 0
+    [ -r "/proc/${pid}/cmdline" ] || return 1
+
+    tr '\0' ' ' <"/proc/${pid}/cmdline" 2>/dev/null | grep -Fq -- "${expected}"
+}
+
+# Wait until pid enters a target state.
+# Usage: wait_pid_state PID TIMEOUT_SEC alive|dead
+wait_pid_state() {
+    local pid="${1}"
+    local timeout="${2}"
+    local target="${3}"
+    local count=0
+
+    while [ "${count}" -lt "${timeout}" ]; do
+        if [ "${target}" = "alive" ]; then
+            pid_alive "${pid}" && return 0
+        else
+            pid_alive "${pid}" || return 0
+        fi
+        sleep 1
+        count=$((count + 1))
+    done
+    return 1
+}
+
+# Terminate a process gracefully, then force-kill if needed.
+# Usage: terminate_pid PID TIMEOUT_SEC LABEL
+terminate_pid() {
+    local pid="${1}"
+    local timeout="${2}"
+    local label="${3}"
+
+    pid_alive "${pid}" || return 0
+
+    kill "${pid}" 2>/dev/null || true
+    wait_pid_state "${pid}" "${timeout}" dead && return 0
+
+    log_warn "${label} process hung, force killing..."
+    kill -9 "${pid}" 2>/dev/null || true
+    wait_pid_state "${pid}" 2 dead || true
+
+    pid_alive "${pid}" && return 1
+    return 0
+}
+
+# Persist PID atomically.
+# Usage: write_pid_file PID_FILE PID
+write_pid_file() {
+    local pid_file="${1}"
+    local pid="${2}"
+
+    atomic_write "${pid_file}" printf '%s' "${pid}"
+}
+
+# Get a validated daemon PID matching the given command
+# Usage: get_valid_daemon_pid PID_FILE BINARY_MATCH LABEL
+get_valid_daemon_pid() {
+    local pid_file="${1}"
+    local cmd_match="${2}"
+    local label="${3}"
+    local pid=""
+
+    if pid=$(read_pid_file "${pid_file}" "${label}"); then
+        if [ -n "${pid}" ] && pid_alive "${pid}"; then
+            if pid_matches_cmd "${pid}" "${cmd_match}"; then
+                printf '%s\n' "${pid}"
+                return 0
+            else
+                log_warn "${label} pid mismatch, skipping kill (pid=${pid})"
+            fi
+        fi
+    fi
+    rm -f "${pid_file}"
+    return 1
+}
+
+# ==============================================================================
+# [ String Utilities ]
+# ==============================================================================
+
+# Retry a command with exponential backoff
+# Usage: retry MAX_ATTEMPTS command [args...]
+retry() {
+    local max="${1}"
+    shift
+
+    local n=0
+    local wait=1
+    while [ "${n}" -lt "${max}" ]; do
+        "$@" && return 0
+        n=$((n + 1))
+        [ "${n}" -lt "${max}" ] && {
+            log_warn "Retry ${n}/${max}..."
+            sleep "${wait}"
+            wait=$((wait * 2))
+            [ "${wait}" -gt 16 ] && wait=16
+        }
+    done
+    return 1
+}
+
+# Check if content is base64 encoded
+# Usage: is_base64 FILE
+is_base64() {
+    local file="${1}"
+    local s
+    s=$(head -c 512 "${file}" 2>/dev/null)
+
+    [ -z "${s}" ] && return 1
+    case "${s}" in
+    "https://"* | "http://"* | "ss://"* | "vmess://"* | "vless://"* | "trojan://"* | "hysteria2://"* | "tuic://"* | "{"* | "#"*)
+        return 1
+        ;;
+    *[!A-Za-z0-9+/=[:space:]]*) return 1 ;;
+    *) return 0 ;;
+    esac
+}
+
+# ==============================================================================
+# [ Task Utilities ]
+# ==============================================================================
+
+# Standardized task runner with logging and status reporting
+# Usage: run [OPTIONS] "Name" command [args...]
+# Options:
+#   -v, --verbose  Show OK message on success (default: silent)
+#   -i, --ignore   Do not log error on failure
+run() {
+    local verbose=false
+    local ignore_err=false
+
+    while [ "$#" -gt 0 ]; do
+        case "${1}" in
+        --)
+            shift
+            break
+            ;;
+        -v | --verbose)
+            verbose=true
+            shift
+            ;;
+        -i | --ignore)
+            ignore_err=true
+            shift
+            ;;
+        -[vi]*)
+            local opts="${1#-}"
+            case "${opts}" in
+            *v*) verbose=true ;;
+            esac
+            case "${opts}" in
+            *i*) ignore_err=true ;;
+            esac
+            shift
+            ;;
+        -*)
+            log_error "run: unknown option '${1}'"
+            return 2
+            ;;
+        *)
+            break
+            ;;
+        esac
+    done
+
+    [ "$#" -ge 2 ] || {
+        log_error "run: insufficient arguments"
+        return 2
+    }
+
+    local name="${1}"
+    shift
+
+    if "$@"; then
+        [ "${verbose}" = true ] && log_info "${name}: OK"
+        return 0
+    else
+        local _rc=$?
+        [ "${ignore_err}" = false ] && log_error "${name}: FAILED (rc=${_rc})"
+        return "${_rc}"
+    fi
+}
+
+# Wait for multiple PIDs and return 0 only if ALL succeeded
+# Usage: wait_pids [pids...]
+wait_pids() {
+    local rc=0
+    for pid in "$@"; do
+        wait "${pid}" || rc=$?
+    done
+    return "${rc}"
+}
+
+# Wait for multiple PIDs with timeout and Fail-Fast check
+# Usage: wait_pids_timeout TIMEOUT PID...
+wait_pids_timeout() {
+    local timeout="${1}"
+    shift
+    local pids="$@"
+    local count=0
+
+    while [ "${count}" -lt "${timeout}" ]; do
+        # 1. Check process status
+        local running=0
+        for pid in ${pids}; do
+            if kill -0 "${pid}" 2>/dev/null; then
+                running=1
+                break
+            fi
+        done
+
+        if [ "${running}" -eq 0 ]; then
+            local rc=0
+            for pid in ${pids}; do
+                wait "${pid}" || rc=1
+            done
+            return "${rc}"
+        fi
+
+        sleep 1
+        count=$((count + 1))
+    done
+
+    log_error "Timeout waiting for background tasks"
+    return 1
+}
+
+# ==============================================================================
+# [ Configuration Loading ]
+# ==============================================================================
+
+load_config() {
+    if [ -f "${EVENT_CACHE_OK}" ] && [ -f "${CACHE_CONFIG_FILE}" ]; then
+        set -a
+        . "${CACHE_CONFIG_FILE}"
+        set +a
+        return 0
+    fi
+
+    [ -f "${SETTINGS_FILE}" ] || {
+        log_error "No configuration found"
+        return 1
+    }
+    [ -f "${CONFIG_SCRIPT}" ] || {
+        log_error "Config script missing"
+        return 1
+    }
+
+    # Parse+validate settings via config module instead of sourcing raw shell.
+    . "${CONFIG_SCRIPT}"
+
+    local tmp_cfg
+    local tmp_dir="${RUN_DIR}"
+    [ -d "${tmp_dir}" ] || tmp_dir="${FLUX_DIR}"
+    [ -d "${tmp_dir}" ] || tmp_dir="/data/local/tmp"
+
+    tmp_cfg=$(mktemp "${tmp_dir}/loadcfg.XXXXXX") || {
+        log_error "Failed to create temporary config file"
+        return 1
+    }
+
+    if { _process_settings && _detect_kernel; } >"${tmp_cfg}"; then
+        set -a
+        . "${tmp_cfg}"
+        set +a
+        rm -f "${tmp_cfg}"
+        return 0
+    fi
+
+    rm -f "${tmp_cfg}"
+    log_error "Failed to load validated settings"
+    return 1
+}

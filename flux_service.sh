@@ -4,26 +4,25 @@
 # [ Flux Boot Service ]
 # Description: Android boot initialization, state detection, and dispatcher launcher.
 # ==============================================================================
+# Runtime note:
+#   This script only waits boot, starts inotify watcher, and triggers init once.
+#   Orchestration decisions are delegated to dispatcher via events.
+# ==============================================================================
 
 # Strict error handling
 set -eu
 [ -n "${BASH_VERSION:-}" ] && set -o pipefail
 
-. "/data/adb/flux/scripts/const"
+# ==============================================================================
+# [ Environment & Logging ]
+# ==============================================================================
+
+. "/data/adb/flux/scripts/lib"
 . "/data/adb/flux/scripts/log"
 
-export LOG_COMPONENT="Flux"
+readonly LOG_COMPONENT="Flux"
 
-# Load configurations (first valid)
-# CACHE_CONFIG_FILE and SETTINGS_FILE are defined in const (which is sourced above), so strict mode is safe.
-if [ -f "${CACHE_META_FILE}" ] && [ -f "${CACHE_CONFIG_FILE}" ]; then
-    set -a; . "${CACHE_CONFIG_FILE}"; set +a
-elif [ -f "${SETTINGS_FILE}" ]; then
-    set -a; . "${SETTINGS_FILE}"; set +a
-else
-    log_error "No configuration found"
-    exit 1
-fi
+load_config || exit 1
 
 # ==============================================================================
 # [ Boot Detection ]
@@ -31,14 +30,11 @@ fi
 
 _wait_for_boot() {
     local count=0
-    local max=60
-
-    while [ "${count}" -lt "${max}" ]; do
+    while [ "${count}" -lt "${BOOT_TIMEOUT}" ]; do
         [ "$(getprop sys.boot_completed 2>/dev/null)" = "1" ] && return 0
         sleep 1
         count=$((count + 1))
     done
-
     return 1
 }
 
@@ -49,18 +45,16 @@ _wait_for_boot() {
 # Background event listener powered by inotifyd.
 # Responsibilities:
 # 1. Monitors the Magisk 'disable' toggle for real-time service start/stop.
-# 2. Listens for internal project events (e.g., readiness flags) in the RUN_DIR.
+# 2. Listens for config file changes for hot-reload.
 
 _start_inotify_module() {
-    # DISPATCHER_SCRIPT is defined in const.
-    [ -f "${DISPATCHER_SCRIPT}" ] && [ ! -x "${DISPATCHER_SCRIPT}" ] && chmod +x "${DISPATCHER_SCRIPT}" 2>/dev/null
-    pkill -f "inotifyd.*dispatcher" 2>/dev/null || true
-    mkdir -p "${EVENTS_DIR}"
+    if [ -f "${DISPATCHER_SCRIPT}" ] && [ ! -x "${DISPATCHER_SCRIPT}" ]; then
+        chmod +x "${DISPATCHER_SCRIPT}" || return 1
+    fi
+    pkill -f "inotifyd.*dispatcher" >/dev/null 2>&1 || true
     # Monitor MAGISK_MOD_DIR (disable toggle) ::nd (New, Delete)
-    # Monitor EVENTS_DIR (internal events) ::n (New only)
-    # Monitor CONF_DIR (config changes) ::w (Write/Modify)
-    nohup inotifyd "${DISPATCHER_SCRIPT}" "${MAGISK_MOD_DIR}:nd" "${EVENTS_DIR}:n" "${CONF_DIR}:wcy" >/dev/null 2>&1 &
-    return 0
+    # Monitor CONF_DIR (config changes) ::y (Close-Write)
+    nohup inotifyd "${DISPATCHER_SCRIPT}" "${MAGISK_MOD_DIR}:nd" "${CONF_DIR}:y" >/dev/null 2>&1 &
 }
 
 # ==============================================================================
@@ -68,19 +62,17 @@ _start_inotify_module() {
 # ==============================================================================
 
 main() {
-    # FLUX_LOG is defined in const.
     [ -n "${FLUX_LOG}" ] && [ ! -t 2 ] && exec 2>>"${FLUX_LOG}"
 
+    # Clear stale dispatcher locks from previous dirty shutdown
+    rm -rf "${DISPATCH_LOCK_DIR}" 2>/dev/null || true
+
     run "Wait for boot" _wait_for_boot || exit 1
-    sleep 3
-
-    run "Start watcher" _start_inotify_module
-    sleep 1
-
-    rm -f "${EVENT_CORE_OK}" "${EVENT_TPROXY_OK}" "${EVENT_INIT_OK}" 2>/dev/null
+    run -v "Start watcher" _start_inotify_module || exit 1
 
     [ -f "${MAGISK_MOD_DIR}/disable" ] && exit 0
-    /system/bin/sh "${INIT_SCRIPT}" init
+
+    touch "${BOOT_TRIGGER}"
 }
 
-main
+main "$@"

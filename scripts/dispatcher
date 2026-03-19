@@ -2,128 +2,207 @@
 
 # ==============================================================================
 # [ Flux Event Dispatcher ]
-# Description: Inotify event handler for module toggles and internal state changes.
+# Description: Inotify event handler and the single orchestration entrypoint.
+#
+# Runtime call graph (effective paths only):
+#   boot: flux_service -> init -> (event:init_ok) -> dispatcher -> core/tproxy/addrsync
+#   config write:
+#     settings.ini    -> stop(all) -> init -> (event:init_ok) -> start(all)
+#     config.json     -> init cache -> restart(core)
+#     addrsyncd.toml  -> restart(addrsync)
+#
+# Invariants:
+#   1) dispatcher is the only runtime orchestrator for start/stop/restart/fail transitions.
+#   2) init only prepares runtime prerequisites and emits EVENT_INIT_OK.
+#   3) core/tproxy/addrsync only manage component lifecycle.
+#   4) failures must converge to STOPPED/FAILED without stale ready markers.
 # ==============================================================================
 
-# Strict error handling
 set -eu
 [ -n "${BASH_VERSION:-}" ] && set -o pipefail
 
 readonly SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
-. "${SCRIPT_DIR}/const"
+
+. "${SCRIPT_DIR}/lib"
 . "${SCRIPT_DIR}/log"
-
-# Load configurations (first valid)
-if [ -f "${CACHE_META_FILE}" ] && [ -f "${CACHE_CONFIG_FILE}" ]; then
-    set -a; . "${CACHE_CONFIG_FILE}"; set +a
-elif [ -f "${SETTINGS_FILE}" ]; then
-    set -a; . "${SETTINGS_FILE}"; set +a
-else
-    log_error "No configuration found"
-    exit 1
-fi
-
-[ -f "${CACHE_KERNEL_FILE}" ] && { set -a; . "${CACHE_KERNEL_FILE}"; set +a; }
 
 readonly LOG_COMPONENT="Disp"
 
+load_config || exit 1
+
 # ==============================================================================
-# [ Internal Component Control ]
+# [ Component Control ]
 # ==============================================================================
 
-start_components() {
-    [ -f "${MAGISK_MOD_DIR}/disable" ] && { log_warn "Service disabled, ignoring start trigger"; return 0; }
-    sh "${CORE_SCRIPT}" start < /dev/null &
-    sh "${TPROXY_SCRIPT}" start < /dev/null &
-    sh "${IP_MONITOR_SCRIPT}" start < /dev/null &
+_parallel_run() {
+    local action="${1}"
+    local p1 p2 p3
+
+    sh "${CORE_SCRIPT}" "${action}" </dev/null &
+    p1=$!
+    sh "${TPROXY_SCRIPT}" "${action}" </dev/null &
+    p2=$!
+    sh "${ADDRSYNC_SCRIPT}" "${action}" </dev/null &
+    p3=$!
+
+    # Wait with 10s timeout and Fail-Fast
+    if ! wait_pids_timeout 10 "${p1}" "${p2}" "${p3}"; then
+        log_error "Parallel execution failed or timed out, killing children..."
+        kill -9 "${p1}" "${p2}" "${p3}" 2>/dev/null
+        return 1
+    fi
+}
+
+_restart_debounced() {
+    local token="${1}"
+    local last=""
+
+    [ ! -f "${RESTART_STAMP_FILE}" ] && return 0
+    [ "$(file_age "${RESTART_STAMP_FILE}")" -ge "${RESTART_DEBOUNCE_SEC}" ] && return 0
+
+    IFS= read -r last <"${RESTART_STAMP_FILE}" || true
+    [ "${token}" != "${last}" ]
+}
+
+_write_restart_stamp() {
+    local token="${1}"
+    printf '%s\n' "${token}" >"${RESTART_STAMP_FILE}"
+}
+
+# ==============================================================================
+# [ State Actions ]
+# ==============================================================================
+
+_state_start() {
+    [ -f "${MAGISK_MOD_DIR}/disable" ] && {
+        log_warn "Service disabled, ignoring start trigger"
+        return 0
+    }
+
+    log_banner "STARTING FLUX"
+    rm -f "${BOOT_TRIGGER}"
+
+    if ! sh "${INIT_SCRIPT}" init; then
+        log_error "Init failed"
+        _state_fail
+        return 1
+    fi
+
+    if _parallel_run start; then
+        sync_prop "RUNNING"
+        log_info "Flux Service is READY"
+    else
+        _state_fail
+        return 1
+    fi
+}
+
+_state_stop() {
+    log_banner "STOPPING FLUX"
+    _parallel_run stop || true
+    sync_prop "STOPPED"
+    log_info "Flux Service stopped"
     return 0
 }
 
-check_all_ready() {
-    if [ -f "${EVENT_CORE_OK}" ] && [ -f "${EVENT_TPROXY_OK}" ]; then
-        rm -f "${EVENT_CORE_OK}" "${EVENT_TPROXY_OK}"
-        sync_prop
+_state_restart() {
+    local changed="${1}"
+
+    if ! _restart_debounced "${changed}"; then
+        log_debug "Skip duplicate config event: ${changed}"
+        return 0
+    fi
+
+    _write_restart_stamp "${changed}"
+    rm -f "${EVENT_CACHE_OK}"
+    log_info "Config update: ${changed}, full restart"
+
+    log_banner "RESTARTING FLUX"
+
+    if ! sh "${INIT_SCRIPT}" init; then
+        log_error "Init failed"
+        _state_fail
+        return 1
+    fi
+
+    _parallel_run stop || true
+
+    if _parallel_run start; then
+        sync_prop "RUNNING"
         log_info "Flux Service is READY"
+    else
+        _state_fail
+        return 1
+    fi
+}
+
+_state_fail() {
+    log_warn "Rolling back..."
+    _parallel_run stop || true
+    sync_prop "FAILED"
+    return 0
+}
+
+# ==============================================================================
+# [ Event Dispatch ]
+# ==============================================================================
+
+_dispatch_event() {
+    local event_name="${1}"
+    local event_type="${2}"
+    local key="${event_name}:${event_type}"
+    local action=""
+
+    case "${key}" in
+    boot_trigger:n) action="_state_start" ;;
+    disable:d) action="_state_start" ;;
+    disable:n) action="_state_stop" ;;
+    settings.ini:y | addrsyncd.toml:y | config.json:y) action="_state_restart" ;;
+    esac
+
+    if [ -z "${action}" ]; then
+        log_debug "No handler for: ${key}"
+        return 0
+    fi
+
+    log_debug "Dispatching: ${key} -> ${action}"
+    if ! "${action}" "${event_name}"; then
+        log_error "Handler failed: ${action} (${key})"
+        return 1
     fi
     return 0
 }
 
-stop_components() {
-    sh "${CORE_SCRIPT}" stop < /dev/null &
-    sh "${TPROXY_SCRIPT}" stop < /dev/null &
-    sh "${IP_MONITOR_SCRIPT}" stop < /dev/null &
-    wait
-    rm -f "${EVENT_CORE_OK}" "${EVENT_TPROXY_OK}" 2>/dev/null
-    sync_prop
-    prop_clear
-    log_info "Service stopped"
-    return 0
-}
+_with_dispatch_lock() {
+    [ -d "${RUN_DIR}" ] || mkdir -p "${RUN_DIR}" 2>/dev/null || true
 
-rollback_components() {
-    log_warn "Rolling back..."
-    sh "${CORE_SCRIPT}" stop &
-    sh "${TPROXY_SCRIPT}" stop &
-    sh "${IP_MONITOR_SCRIPT}" stop &
-    wait
-    sync_prop
-    return 0
-}
+    if ! mkdir "${DISPATCH_LOCK_DIR}" 2>/dev/null; then
+        log_debug "Dispatcher busy, skip overlapping event"
+        return 0
+    fi
 
-# ==============================================================================
-# [ Event Dispatch Logic ]
-# ==============================================================================
+    local rc=0
+    trap 'rmdir "${DISPATCH_LOCK_DIR}" 2>/dev/null || true' EXIT INT TERM
+
+    "$@" || rc=$?
+
+    rmdir "${DISPATCH_LOCK_DIR}" 2>/dev/null || true
+    trap - EXIT INT TERM
+
+    return "${rc}"
+}
 
 main() {
-    [ -n "${FLUX_LOG}" ] && [ ! -t 2 ] && exec 2>>"${FLUX_LOG}"
+    [ ! -t 2 ] && [ -n "${FLUX_LOG}" ] && exec 2>>"${FLUX_LOG}"
 
-    # inotifyd argument handling:
-    # - Directory monitoring: handler EVENT DIR FILENAME (3 args)
-    # - File monitoring: handler EVENT FILEPATH (2 args)
     local event_type="${1:-}"
     local watched_path="${2:-}"
     local event_name="${3:-${watched_path##*/}}"
 
     [ -n "${3:-}" ] && watched_path="${watched_path}/${event_name}"
 
-    log_debug "Event: ${watched_path} (${event_type})"
-
-    case "${event_name}" in
-        # === Magisk module toggle ===
-        disable)
-            case "${event_type}" in
-                d)
-                    log_banner "STARTING FLUX"
-                    sh "${INIT_SCRIPT}" init & ;;   # Delete = Enable = Start
-                n)
-                    log_banner "STOPPING FLUX"
-                    stop_components ;;      # Create = Disable = Stop
-            esac
-            ;;
-        # === Flow markers ===
-        init_ok)
-            rm -f "${EVENT_INIT_OK}" 2>/dev/null
-            start_components
-            ;;
-        core_ok|tproxy_ok)
-            check_all_ready
-            ;;
-        # === Failure handling ===
-        fail)
-            rollback_components
-            return 0
-            ;;
-        # === Config file changes → invalidate cache ===
-        settings.ini|config.json)
-            log_info "Config changed: ${event_name}"
-            rm -f "${CACHE_META_FILE}" 2>/dev/null
-            ;;
-        # === Ignore unknown events ===
-        *)
-            return 0
-            ;;
-    esac
-    return 0
+    log_debug "Event: ${watched_path} -> ${event_type}"
+    _with_dispatch_lock _dispatch_event "${event_name}" "${event_type}"
 }
 
 main "$@"

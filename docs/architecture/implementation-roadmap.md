@@ -32,6 +32,8 @@ This roadmap turns the [blueprint](fluxd-blueprint.md) and [technical specificat
 
 ## Phase 1 — Control-plane tracer bullet
 
+Current implementation status: the control-plane tracer bullet now uses one `epoll` reactor for Unix control admission and `signalfd` shutdown, with admission closed before active connection handlers drain. Netlink, timerfd, pidfd, and BPF reactor sources remain assigned to their later phases and are not delivered by this milestone.
+
 ### Deliverables
 
 - `fluxd daemon` boot lifecycle with Unix control socket.

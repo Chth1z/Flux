@@ -8,7 +8,7 @@ struct ThreadAffine(PhantomData<Rc<()>>);
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod implementation {
     use std::mem::MaybeUninit;
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 
     use super::ThreadAffine;
     use crate::PlatformError;
@@ -123,6 +123,10 @@ mod implementation {
                     == u32::try_from(libc::SIGINT).unwrap_or_default()
                     || information.ssi_signo == u32::try_from(libc::SIGTERM).unwrap_or_default());
             }
+        }
+
+        pub(crate) fn readiness_fd(&self) -> BorrowedFd<'_> {
+            self.fd.as_fd()
         }
     }
 

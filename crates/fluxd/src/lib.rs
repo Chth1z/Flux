@@ -18,7 +18,7 @@ pub use protocol::{
     DaemonSnapshot, EventDisposition, EventReport, MAX_CONTROL_PACKET_BYTES, ProtocolHandler,
     RequestPeerId,
 };
-pub use socket::{ControlSocketError, ControlSocketServer, SocketControlClient};
+pub use socket::{ControlConnectionHandler, ControlSocketError, SocketControlClient};
 
 pub trait DaemonClient: ControlClient {
     fn ping(&self) -> Result<(), ControlError>;

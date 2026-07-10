@@ -12,10 +12,12 @@ use flux_core::{
     LegacyDispatcher, LegacyIntent, OperationReport, Reason,
 };
 use flux_platform::{
-    KernelReleaseSource, LegacyScriptPaths, ProcessLegacyDispatcher, ShutdownSignal,
+    DaemonReactor, KernelReleaseSource, LegacyScriptPaths, ProcessLegacyDispatcher, ShutdownSignal,
 };
 
-use crate::{AdministrativeIntentStore, ControlSocketError, ControlSocketServer, IntentStoreError};
+use crate::{
+    AdministrativeIntentStore, ControlConnectionHandler, ControlSocketError, IntentStoreError,
+};
 
 const DEFAULT_ROOT: &str = "/data/adb/flux";
 const DEFAULT_DISABLE_PATH: &str = "/data/adb/modules/flux/disable";
@@ -121,13 +123,18 @@ where
         KernelSupport::Unsupported { .. } => DaemonControl::Unsupported,
     };
 
-    let server = ControlSocketServer::bind(&options.socket_path, kernel_support, control)
-        .map_err(DaemonError::Socket)?;
-    server
-        .serve_until(|| shutdown.received().map_err(ControlSocketError::Platform))
-        .map_err(DaemonError::Socket)?;
-    server.wait_for_idle();
-    Ok(())
+    let handler = ControlConnectionHandler::new(kernel_support, control);
+    let (reactor, _stop) = DaemonReactor::bind(&options.socket_path, shutdown, move |connection| {
+        if let Err(error) = handler.serve(connection) {
+            eprintln!("fluxd: rejected control connection: {error}");
+        }
+    })
+    .map_err(ControlSocketError::Reactor)
+    .map_err(DaemonError::Socket)?;
+    reactor
+        .run()
+        .map_err(ControlSocketError::Reactor)
+        .map_err(DaemonError::Socket)
 }
 
 enum DaemonControl {

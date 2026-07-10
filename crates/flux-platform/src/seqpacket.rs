@@ -70,7 +70,7 @@ impl PeerCredentials {
 mod implementation {
     use std::fs;
     use std::mem::{MaybeUninit, offset_of};
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
     use std::path::{Path, PathBuf};
@@ -88,7 +88,17 @@ mod implementation {
 
     impl SeqpacketListener {
         pub fn bind(path: impl AsRef<Path>) -> Result<Self, PlatformError> {
-            let path = path.as_ref();
+            Self::bind_with_socket_flags(path.as_ref(), 0)
+        }
+
+        pub(crate) fn bind_nonblocking(path: impl AsRef<Path>) -> Result<Self, PlatformError> {
+            Self::bind_with_socket_flags(path.as_ref(), libc::SOCK_NONBLOCK)
+        }
+
+        fn bind_with_socket_flags(
+            path: &Path,
+            additional_flags: i32,
+        ) -> Result<Self, PlatformError> {
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).map_err(|source| PlatformError::SystemCall {
                     operation: "create Unix socket directory",
@@ -96,7 +106,7 @@ mod implementation {
                 })?;
             }
 
-            let fd = create_socket()?;
+            let fd = create_socket_with_flags(additional_flags)?;
             let (address, length) = socket_address(path)?;
             // SAFETY: `address` is initialized for `length` bytes and points to
             // a pathname Unix-domain address for the lifetime of this call.
@@ -141,6 +151,22 @@ mod implementation {
 
         pub fn accept(&self) -> Result<SeqpacketConnection, PlatformError> {
             accept_connection(self.fd.as_raw_fd())
+        }
+
+        pub(crate) fn try_accept(&self) -> Result<Option<SeqpacketConnection>, PlatformError> {
+            match accept_connection(self.fd.as_raw_fd()) {
+                Ok(connection) => Ok(Some(connection)),
+                Err(PlatformError::SystemCall { source, .. })
+                    if source.kind() == std::io::ErrorKind::WouldBlock =>
+                {
+                    Ok(None)
+                }
+                Err(error) => Err(error),
+            }
+        }
+
+        pub(crate) fn readiness_fd(&self) -> BorrowedFd<'_> {
+            self.fd.as_fd()
         }
 
         pub fn accept_timeout(
@@ -401,6 +427,8 @@ mod implementation {
         loop {
             // SAFETY: the listener FD is valid. Null address pointers request
             // no peer pathname, and SOCK_CLOEXEC applies to the returned FD.
+            // SOCK_NONBLOCK is deliberately omitted so a reactor-ready listener
+            // still hands blocking connections to its worker threads.
             let accepted = unsafe {
                 libc::accept4(
                     fd,
@@ -659,6 +687,104 @@ pub use implementation::{SeqpacketConnection, SeqpacketListener};
 #[cfg(test)]
 mod tests {
     use super::Uid;
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    mod nonblocking_listener {
+        use std::os::fd::AsRawFd;
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        use super::super::{SeqpacketConnection, SeqpacketListener};
+        use tempfile::tempdir;
+
+        #[test]
+        fn reports_an_empty_backlog() {
+            let directory = tempdir().expect("temporary directory");
+            let socket_path = directory.path().join("fluxd.sock");
+            let listener = SeqpacketListener::bind_nonblocking(&socket_path)
+                .expect("bind nonblocking listener");
+
+            assert!(
+                listener
+                    .try_accept()
+                    .expect("try accepting client")
+                    .is_none()
+            );
+        }
+
+        #[test]
+        fn exposes_a_borrowed_readiness_descriptor() {
+            let directory = tempdir().expect("temporary directory");
+            let socket_path = directory.path().join("fluxd.sock");
+            let listener = SeqpacketListener::bind_nonblocking(&socket_path)
+                .expect("bind nonblocking listener");
+
+            // SAFETY: the borrowed descriptor remains owned by `listener` for
+            // this call and F_GETFL does not modify memory through a pointer.
+            let status = unsafe { libc::fcntl(listener.readiness_fd().as_raw_fd(), libc::F_GETFL) };
+
+            assert!(
+                status >= 0,
+                "read listener status: {}",
+                std::io::Error::last_os_error()
+            );
+            assert_ne!(status & libc::O_NONBLOCK, 0);
+        }
+
+        #[test]
+        fn accepts_a_queued_peer() {
+            let directory = tempdir().expect("temporary directory");
+            let socket_path = directory.path().join("fluxd.sock");
+            let listener = SeqpacketListener::bind_nonblocking(&socket_path)
+                .expect("bind nonblocking listener");
+            let _client = SeqpacketConnection::connect(&socket_path).expect("queue client");
+
+            assert!(
+                listener
+                    .try_accept()
+                    .expect("try accepting client")
+                    .is_some()
+            );
+        }
+
+        #[test]
+        fn returns_a_blocking_usable_connection() {
+            let directory = tempdir().expect("temporary directory");
+            let socket_path = directory.path().join("fluxd.sock");
+            let listener = SeqpacketListener::bind_nonblocking(&socket_path)
+                .expect("bind nonblocking listener");
+            let client = SeqpacketConnection::connect(&socket_path).expect("queue client");
+            let connection = listener
+                .try_accept()
+                .expect("try accepting client")
+                .expect("queued client must be accepted");
+            let (started_tx, started_rx) = mpsc::sync_channel(1);
+            let (result_tx, result_rx) = mpsc::sync_channel(1);
+            let receiver = thread::spawn(move || {
+                started_tx.send(()).expect("publish receive start");
+                result_tx
+                    .send(connection.recv_packet(64))
+                    .expect("publish receive result");
+            });
+
+            started_rx.recv().expect("receive must start");
+            assert!(matches!(
+                result_rx.recv_timeout(Duration::from_millis(30)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ));
+
+            client.send_packet(b"request").expect("send request");
+            assert_eq!(
+                result_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("blocking receive must complete")
+                    .expect("receive request"),
+                b"request"
+            );
+            receiver.join().expect("receiver thread");
+        }
+    }
 
     #[test]
     fn uid_round_trips_valid_kernel_value() {

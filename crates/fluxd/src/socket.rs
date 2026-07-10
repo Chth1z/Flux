@@ -1,15 +1,12 @@
 use std::error::Error;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::thread;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use flux_core::{
     ControlClient, ControlError, ControlService, KernelSupport, LegacyIntent, OperationReport,
 };
-use flux_platform::{PlatformError, SeqpacketConnection, SeqpacketListener};
+use flux_platform::{PlatformError, ReactorError, SeqpacketConnection};
 
 use crate::protocol::{
     decode_control_response, decode_event_response, decode_ping_response, decode_status_response,
@@ -19,7 +16,6 @@ use crate::{
     DaemonSnapshot, EventReport, MAX_CONTROL_PACKET_BYTES, ProtocolHandler, RequestPeerId,
 };
 
-const MAX_CONCURRENT_CONTROL_CLIENTS: usize = 16;
 static NEXT_CONTROL_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
@@ -91,140 +87,47 @@ impl ControlClient for SocketControlClient {
     }
 }
 
-pub struct ControlSocketServer<C> {
-    listener: SeqpacketListener,
-    handler: Arc<ProtocolHandler<C>>,
-    active_clients: Arc<AtomicUsize>,
+pub struct ControlConnectionHandler<C> {
+    handler: ProtocolHandler<C>,
 }
 
-impl<C> ControlSocketServer<C>
-where
-    C: ControlService + Send + Sync + 'static,
-{
-    pub fn bind(
-        path: impl AsRef<Path>,
-        kernel_support: KernelSupport,
-        control: C,
-    ) -> Result<Self, ControlSocketError> {
-        let path = path.as_ref();
-        let listener = SeqpacketListener::bind(path).map_err(ControlSocketError::Platform)?;
-        Ok(Self {
-            listener,
-            handler: Arc::new(ProtocolHandler::new(kernel_support, control)),
-            active_clients: Arc::new(AtomicUsize::new(0)),
-        })
-    }
-
-    pub fn serve_once(&self) -> Result<(), ControlSocketError> {
-        let connection = self
-            .listener
-            .accept()
-            .map_err(ControlSocketError::Platform)?;
-        self.serve_connection(&connection)
-    }
-
-    pub fn serve_until<F>(&self, mut should_stop: F) -> Result<(), ControlSocketError>
-    where
-        F: FnMut() -> Result<bool, ControlSocketError>,
-    {
-        loop {
-            if should_stop()? {
-                return Ok(());
-            }
-            let Some(connection) = self
-                .listener
-                .accept_timeout(Duration::from_millis(250))
-                .map_err(ControlSocketError::Platform)?
-            else {
-                continue;
-            };
-            self.dispatch_connection(connection);
-        }
-    }
-
-    fn serve_connection(&self, connection: &SeqpacketConnection) -> Result<(), ControlSocketError> {
-        serve_connection(self.handler.as_ref(), connection)
-    }
-
-    fn dispatch_connection(&self, connection: SeqpacketConnection) {
-        if self
-            .active_clients
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-                (active < MAX_CONCURRENT_CONTROL_CLIENTS).then_some(active.saturating_add(1))
-            })
-            .is_err()
-        {
-            eprintln!(
-                "fluxd: rejected control connection: {} concurrent clients are already active",
-                MAX_CONCURRENT_CONTROL_CLIENTS
-            );
-            return;
-        }
-
-        let handler = Arc::clone(&self.handler);
-        let active_clients = Arc::clone(&self.active_clients);
-        let spawn = thread::Builder::new()
-            .name("flux-control-client".to_owned())
-            .spawn(move || {
-                let _guard = ActiveClientGuard(active_clients);
-                if let Err(error) = serve_connection(handler.as_ref(), &connection) {
-                    eprintln!("fluxd: rejected control connection: {error}");
-                }
-            });
-        if let Err(error) = spawn {
-            self.active_clients.fetch_sub(1, Ordering::AcqRel);
-            eprintln!("fluxd: cannot start control client worker: {error}");
-        }
-    }
-
-    pub fn serve_forever(&self) -> Result<(), ControlSocketError> {
-        self.serve_until(|| Ok(false))
-    }
-
-    pub fn wait_for_idle(&self) {
-        while self.active_clients.load(Ordering::Acquire) != 0 {
-            thread::sleep(Duration::from_millis(10));
-        }
-    }
-}
-
-struct ActiveClientGuard(Arc<AtomicUsize>);
-
-impl Drop for ActiveClientGuard {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
-fn serve_connection<C>(
-    handler: &ProtocolHandler<C>,
-    connection: &SeqpacketConnection,
-) -> Result<(), ControlSocketError>
+impl<C> ControlConnectionHandler<C>
 where
     C: ControlService,
 {
-    let credentials = connection
-        .require_same_effective_user()
-        .map_err(ControlSocketError::Platform)?;
-    let request = connection
-        .recv_packet(MAX_CONTROL_PACKET_BYTES)
-        .map_err(ControlSocketError::Platform)?;
-    let peer = RequestPeerId::new(credentials.uid(), credentials.pid());
-    let response = handler.handle_for_peer(&request, peer);
-    connection
-        .send_packet(&response)
-        .map_err(ControlSocketError::Platform)
+    #[must_use]
+    pub fn new(kernel_support: KernelSupport, control: C) -> Self {
+        Self {
+            handler: ProtocolHandler::new(kernel_support, control),
+        }
+    }
+
+    pub fn serve(&self, connection: SeqpacketConnection) -> Result<(), ControlSocketError> {
+        let credentials = connection
+            .require_same_effective_user()
+            .map_err(ControlSocketError::Platform)?;
+        let request = connection
+            .recv_packet(MAX_CONTROL_PACKET_BYTES)
+            .map_err(ControlSocketError::Platform)?;
+        let peer = RequestPeerId::new(credentials.uid(), credentials.pid());
+        let response = self.handler.handle_for_peer(&request, peer);
+        connection
+            .send_packet(&response)
+            .map_err(ControlSocketError::Platform)
+    }
 }
 
 #[derive(Debug)]
 pub enum ControlSocketError {
     Platform(PlatformError),
+    Reactor(ReactorError),
 }
 
 impl fmt::Display for ControlSocketError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Platform(error) => write!(formatter, "control socket: {error}"),
+            Self::Reactor(error) => write!(formatter, "control reactor: {error}"),
         }
     }
 }
@@ -233,6 +136,7 @@ impl Error for ControlSocketError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Platform(error) => Some(error),
+            Self::Reactor(error) => Some(error),
         }
     }
 }

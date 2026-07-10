@@ -4,10 +4,12 @@ use std::error::Error;
 use std::fmt;
 
 mod legacy_dispatcher;
+mod reactor;
 mod seqpacket;
 mod shutdown;
 
 pub use legacy_dispatcher::{LegacyScriptPaths, ProcessLegacyDispatcher};
+pub use reactor::{DaemonReactor, ReactorError, ReactorStopHandle, StopDisposition};
 pub use seqpacket::{PeerCredentials, SeqpacketConnection, SeqpacketListener, Uid};
 pub use shutdown::ShutdownSignal;
 

@@ -1,21 +1,24 @@
 #![cfg(any(target_os = "linux", target_os = "android"))]
 
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use flux_core::{
     ControlClient, ControlError, KernelSupport, LegacyControlBridge, LegacyDispatcher,
     LegacyIntent, Reason,
 };
-use flux_platform::SeqpacketConnection;
-use fluxd::{ControlSocketServer, SocketControlClient};
+use flux_platform::{DaemonReactor, SeqpacketConnection, ShutdownSignal};
+use fluxd::{ControlConnectionHandler, SocketControlClient};
 use tempfile::tempdir;
 
 #[test]
-fn seqpacket_client_and_server_complete_a_control_operation() {
+fn seqpacket_client_and_reactor_complete_a_control_operation() {
     let directory = tempdir().expect("temporary directory");
     let socket_path = directory.path().join("fluxd.sock");
+    let shutdown = ShutdownSignal::install().expect("install shutdown signal source");
     let calls = Arc::new(Mutex::new(Vec::new()));
     let bridge = LegacyControlBridge::start(
         RecordingDispatcher {
@@ -24,33 +27,39 @@ fn seqpacket_client_and_server_complete_a_control_operation() {
         4,
     )
     .expect("start bridge");
-    let server = ControlSocketServer::bind(
-        &socket_path,
+    let handler = ControlConnectionHandler::new(
         KernelSupport::evaluate("5.10.0").expect("kernel release"),
         bridge,
-    )
-    .expect("bind server");
+    );
+    let (reactor, stop) = DaemonReactor::bind(&socket_path, shutdown, move |connection| {
+        handler.serve(connection).expect("serve control connection");
+    })
+    .expect("bind reactor");
 
-    let server_thread = thread::spawn(move || server.serve_once().expect("serve request"));
-    let client = SocketControlClient::new(&socket_path);
     let intent = LegacyIntent::Running {
         reason: Reason::Fluxctl,
     };
+    let client_path = socket_path.clone();
+    let client_thread = thread::spawn(move || {
+        let result = SocketControlClient::new(client_path).submit_and_wait(intent);
+        stop.request_stop().expect("request reactor stop");
+        result.expect("control operation completes")
+    });
 
-    let report = client
-        .submit_and_wait(intent)
-        .expect("control operation completes");
+    reactor.run().expect("run reactor");
+    let report = client_thread.join().expect("client thread");
 
     assert_eq!(report.intent, intent);
     assert_eq!(report.revision, 2);
-    server_thread.join().expect("server thread");
     assert_eq!(calls.lock().expect("calls lock").as_slice(), &[intent]);
+    assert_socket_absent(&socket_path);
 }
 
 #[test]
 fn daemon_keeps_serving_after_a_client_disconnects_before_sending() {
     let directory = tempdir().expect("temporary directory");
     let socket_path = directory.path().join("fluxd.sock");
+    let shutdown = ShutdownSignal::install().expect("install shutdown signal source");
     let bridge = LegacyControlBridge::start(
         RecordingDispatcher {
             calls: Arc::new(Mutex::new(Vec::new())),
@@ -58,33 +67,38 @@ fn daemon_keeps_serving_after_a_client_disconnects_before_sending() {
         4,
     )
     .expect("start bridge");
-    let server = ControlSocketServer::bind(
-        &socket_path,
+    let handler = ControlConnectionHandler::new(
         KernelSupport::evaluate("5.10.0").expect("kernel release"),
         bridge,
-    )
-    .expect("bind server");
-    let stop = Arc::new(AtomicBool::new(false));
-    let server_stop = Arc::clone(&stop);
-    let server_thread = thread::spawn(move || {
-        server
-            .serve_until(|| Ok(server_stop.load(Ordering::Acquire)))
-            .expect("serve until stopped");
+    );
+    let (reactor, stop) = DaemonReactor::bind(&socket_path, shutdown, move |connection| {
+        if let Err(error) = handler.serve(connection) {
+            eprintln!("rejected test connection: {error}");
+        }
+    })
+    .expect("bind reactor");
+    let client_path = socket_path.clone();
+    let client_thread = thread::spawn(move || {
+        let result = {
+            let disconnected =
+                SeqpacketConnection::connect(&client_path).expect("connect first client");
+            drop(disconnected);
+
+            SocketControlClient::new(&client_path).ping()
+        };
+        stop.request_stop().expect("request reactor stop");
+        result.expect("second client receives pong");
     });
 
-    let disconnected = SeqpacketConnection::connect(&socket_path).expect("connect first client");
-    drop(disconnected);
-
-    let client = SocketControlClient::new(&socket_path);
-    client.ping().expect("second client receives pong");
-    stop.store(true, Ordering::Release);
-    server_thread.join().expect("server thread");
+    reactor.run().expect("run reactor");
+    client_thread.join().expect("client thread");
 }
 
 #[test]
 fn ping_remains_responsive_while_a_control_operation_is_in_flight() {
     let directory = tempdir().expect("temporary directory");
     let socket_path = directory.path().join("fluxd.sock");
+    let shutdown = ShutdownSignal::install().expect("install shutdown signal source");
     let (started_tx, started_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
     let bridge = LegacyControlBridge::start(
@@ -95,40 +109,147 @@ fn ping_remains_responsive_while_a_control_operation_is_in_flight() {
         4,
     )
     .expect("start bridge");
-    let server = ControlSocketServer::bind(
-        &socket_path,
+    let handler = ControlConnectionHandler::new(
         KernelSupport::evaluate("5.10.0").expect("kernel release"),
         bridge,
-    )
-    .expect("bind server");
-    let stop = Arc::new(AtomicBool::new(false));
-    let server_stop = Arc::clone(&stop);
-    let server_thread = thread::spawn(move || {
-        server
-            .serve_until(|| Ok(server_stop.load(Ordering::Acquire)))
-            .expect("serve until stopped");
-    });
-
-    let control_path = socket_path.clone();
-    let control = thread::spawn(move || {
-        SocketControlClient::new(control_path)
-            .submit_and_wait(LegacyIntent::Running {
+    );
+    let (reactor, stop) = DaemonReactor::bind(&socket_path, shutdown, move |connection| {
+        handler.serve(connection).expect("serve control connection");
+    })
+    .expect("bind reactor");
+    let client_path = socket_path.clone();
+    let client_thread = thread::spawn(move || {
+        let control_path = client_path.clone();
+        let control = thread::spawn(move || {
+            SocketControlClient::new(control_path).submit_and_wait(LegacyIntent::Running {
                 reason: Reason::Fluxctl,
             })
-            .expect("control completes")
+        });
+        let result = (|| {
+            started_rx.recv().map_err(|error| error.to_string())?;
+            let ping_result = SocketControlClient::new(&client_path)
+                .ping()
+                .map_err(|error| error.to_string());
+            release_tx.send(()).map_err(|error| error.to_string())?;
+            let control_result = control
+                .join()
+                .map_err(|_| "control client panicked".to_owned())?
+                .map_err(|error| error.to_string());
+            ping_result?;
+            control_result?;
+            Ok::<(), String>(())
+        })();
+        stop.request_stop().expect("request reactor stop");
+        result.expect("ping and control complete");
     });
-    started_rx
-        .recv()
-        .expect("dispatcher operation must be in flight");
 
-    SocketControlClient::new(&socket_path)
-        .ping()
-        .expect("ping remains responsive");
+    reactor.run().expect("run reactor");
+    client_thread.join().expect("client coordinator");
+}
 
-    release_tx.send(()).expect("release dispatcher");
-    control.join().expect("control client");
-    stop.store(true, Ordering::Release);
-    server_thread.join().expect("server thread");
+#[test]
+fn stop_requested_before_run_closes_the_listener_without_dispatching_queued_clients() {
+    let directory = tempdir().expect("temporary directory");
+    let socket_path = directory.path().join("fluxd.sock");
+    let shutdown = ShutdownSignal::install().expect("install shutdown signal source");
+    let bridge = LegacyControlBridge::start(
+        RecordingDispatcher {
+            calls: Arc::new(Mutex::new(Vec::new())),
+        },
+        4,
+    )
+    .expect("start bridge");
+    let handler = ControlConnectionHandler::new(
+        KernelSupport::evaluate("5.10.0").expect("kernel release"),
+        bridge,
+    );
+    let served = Arc::new(AtomicBool::new(false));
+    let handler_served = Arc::clone(&served);
+    let (reactor, stop) = DaemonReactor::bind(&socket_path, shutdown, move |connection| {
+        handler_served.store(true, Ordering::Release);
+        handler.serve(connection).expect("serve control connection");
+    })
+    .expect("bind reactor");
+    let queued = SeqpacketConnection::connect(&socket_path).expect("queue client");
+    queued
+        .send_packet(br#"{"protocol_version":1,"request_id":7,"command":{"kind":"ping"}}"#)
+        .expect("send queued request");
+
+    stop.request_stop().expect("request reactor stop");
+    reactor.run().expect("run stopped reactor");
+
+    assert!(!served.load(Ordering::Acquire));
+    assert_socket_absent(&socket_path);
+}
+
+#[test]
+fn stop_closes_control_admission_before_a_running_mutation_drains() {
+    let directory = tempdir().expect("temporary directory");
+    let socket_path = directory.path().join("fluxd.sock");
+    let shutdown = ShutdownSignal::install().expect("install shutdown signal source");
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let bridge = LegacyControlBridge::start(
+        BlockingDispatcher {
+            started_tx,
+            release_rx,
+        },
+        4,
+    )
+    .expect("start bridge");
+    let handler = ControlConnectionHandler::new(
+        KernelSupport::evaluate("5.10.0").expect("kernel release"),
+        bridge,
+    );
+    let (reactor, stop) = DaemonReactor::bind(&socket_path, shutdown, move |connection| {
+        handler.serve(connection).expect("serve control connection");
+    })
+    .expect("bind reactor");
+    let client_path = socket_path.clone();
+    let coordinator = thread::spawn(move || {
+        let control_path = client_path.clone();
+        let control = thread::spawn(move || {
+            SocketControlClient::new(control_path).submit_and_wait(LegacyIntent::Running {
+                reason: Reason::Fluxctl,
+            })
+        });
+        started_rx
+            .recv()
+            .expect("dispatcher operation must be in flight");
+
+        stop.request_stop().expect("request reactor stop");
+        let closed_before_drain = wait_for_socket_absence(&client_path, Duration::from_secs(1));
+        let mutation_still_running = !control.is_finished();
+        release_tx.send(()).expect("release dispatcher");
+        control
+            .join()
+            .expect("control client")
+            .expect("control operation completes");
+
+        assert!(closed_before_drain, "listener must close before drain");
+        assert!(mutation_still_running, "mutation must still be draining");
+    });
+
+    reactor.run().expect("run reactor");
+    coordinator.join().expect("client coordinator");
+}
+
+fn wait_for_socket_absence(path: &Path, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match std::fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
+            Ok(_) | Err(_) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(2));
+            }
+            Ok(_) | Err(_) => return false,
+        }
+    }
+}
+
+fn assert_socket_absent(path: &Path) {
+    let error = std::fs::symlink_metadata(path).expect_err("listener socket must be absent");
+    assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
 }
 
 struct RecordingDispatcher {

@@ -1,0 +1,14 @@
+[package]
+name = "flux-platform"
+description = "Linux and Android adapters for Flux"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+libc.workspace = true
+
+[lints]
+workspace = true

@@ -8,4 +8,5 @@ run/
 .agent/
 lrqibazk/
 bin/
-ebpf/
+/target/
+/ebpf/target/

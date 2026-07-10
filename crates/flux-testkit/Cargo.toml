@@ -1,0 +1,14 @@
+[package]
+name = "flux-testkit"
+description = "Deterministic model adapters and fixtures for Flux"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+flux-platform = { path = "../flux-platform" }
+
+[lints]
+workspace = true

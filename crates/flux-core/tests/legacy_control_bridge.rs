@@ -4,8 +4,8 @@ use std::thread;
 use std::time::Duration;
 
 use flux_core::{
-    AdministrativeState, ControlError, LegacyControlBridge, LegacyDispatcher, LegacyIntent,
-    OperationReport, Reason,
+    AdministrativeState, ConfigurationChangeReport, ControlError, LegacyControlBridge,
+    LegacyDispatcher, LegacyIntent, OperationReport, Reason,
 };
 
 #[test]
@@ -43,8 +43,112 @@ fn running_intent_updates_the_snapshot_after_dispatcher_success() {
     let snapshot = bridge.snapshot();
     assert_eq!(snapshot.revision, 2);
     assert_eq!(snapshot.administrative_state, AdministrativeState::Running);
+    assert!(!snapshot.configuration_dirty);
     assert_eq!(snapshot.in_flight, None);
     assert_eq!(snapshot.last_completed, Some(report));
+}
+
+#[test]
+fn configuration_change_while_stopped_is_deferred_without_calling_the_dispatcher() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let bridge = LegacyControlBridge::start(
+        RecordingDispatcher {
+            calls: Arc::clone(&calls),
+        },
+        8,
+    )
+    .expect("start bridge");
+    bridge
+        .submit(LegacyIntent::Stopped {
+            reason: Reason::Fluxctl,
+        })
+        .expect("accept stop")
+        .wait()
+        .expect("stop succeeds");
+    calls.lock().expect("calls lock").clear();
+
+    let revision = bridge
+        .mark_configuration_dirty()
+        .expect("defer configuration change");
+
+    assert_eq!(revision, 3);
+    assert!(calls.lock().expect("calls lock").is_empty());
+    let snapshot = bridge.snapshot();
+    assert_eq!(snapshot.administrative_state, AdministrativeState::Stopped);
+    assert!(snapshot.configuration_dirty);
+}
+
+#[test]
+fn successful_start_consumes_a_deferred_configuration_change() {
+    let bridge = LegacyControlBridge::start(
+        RecordingDispatcher {
+            calls: Arc::new(Mutex::new(Vec::new())),
+        },
+        8,
+    )
+    .expect("start bridge");
+    bridge
+        .mark_configuration_dirty()
+        .expect("mark configuration dirty");
+
+    bridge
+        .submit(LegacyIntent::Running {
+            reason: Reason::DisableRemoved,
+        })
+        .expect("accept start")
+        .wait()
+        .expect("start succeeds");
+
+    assert!(!bridge.snapshot().configuration_dirty);
+}
+
+#[test]
+fn configuration_change_queued_after_stop_is_deferred_in_writer_order() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let bridge = LegacyControlBridge::start(
+        RecordingDispatcher {
+            calls: Arc::clone(&calls),
+        },
+        8,
+    )
+    .expect("start bridge");
+    let stop = bridge
+        .submit(LegacyIntent::Stopped {
+            reason: Reason::DisableCreated,
+        })
+        .expect("accept stop");
+
+    let report = bridge
+        .configuration_changed(Reason::ConfigChanged)
+        .expect("handle configuration change");
+    stop.wait().expect("stop succeeds");
+
+    assert_eq!(report, ConfigurationChangeReport::Deferred { revision: 3 });
+    assert_eq!(
+        calls.lock().expect("calls lock").as_slice(),
+        &[LegacyIntent::Stopped {
+            reason: Reason::DisableCreated,
+        }]
+    );
+    assert!(bridge.snapshot().configuration_dirty);
+}
+
+#[test]
+fn accepted_administrative_intent_remains_desired_after_dispatcher_failure() {
+    let bridge = LegacyControlBridge::start(FailingDispatcher, 4).expect("start bridge");
+
+    bridge
+        .submit(LegacyIntent::Running {
+            reason: Reason::Boot,
+        })
+        .expect("accept start")
+        .wait()
+        .expect_err("dispatcher fails");
+
+    let snapshot = bridge.snapshot();
+    assert_eq!(snapshot.administrative_state, AdministrativeState::Running);
+    assert_eq!(snapshot.in_flight, None);
+    assert_eq!(snapshot.last_completed, None);
 }
 
 #[test]
@@ -125,6 +229,14 @@ impl LegacyDispatcher for NotifyingDispatcher {
 struct ConcurrencyCheckingDispatcher {
     active: Arc<AtomicUsize>,
     maximum: Arc<AtomicUsize>,
+}
+
+struct FailingDispatcher;
+
+impl LegacyDispatcher for FailingDispatcher {
+    fn execute(&mut self, _intent: &LegacyIntent) -> Result<(), ControlError> {
+        Err(ControlError::dispatcher("injected failure"))
+    }
 }
 
 impl LegacyDispatcher for ConcurrencyCheckingDispatcher {

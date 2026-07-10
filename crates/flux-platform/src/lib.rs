@@ -5,9 +5,11 @@ use std::fmt;
 
 mod legacy_dispatcher;
 mod seqpacket;
+mod shutdown;
 
 pub use legacy_dispatcher::{LegacyScriptPaths, ProcessLegacyDispatcher};
-pub use seqpacket::{SeqpacketConnection, SeqpacketListener};
+pub use seqpacket::{PeerCredentials, SeqpacketConnection, SeqpacketListener};
+pub use shutdown::ShutdownSignal;
 
 pub trait KernelReleaseSource {
     fn kernel_release(&self) -> Result<String, PlatformError>;
@@ -36,6 +38,12 @@ pub enum PlatformError {
         limit: usize,
     },
     PeerClosed,
+    PeerUidMismatch {
+        expected_uid: u32,
+        pid: u32,
+        uid: u32,
+        gid: u32,
+    },
     ShortWrite {
         expected: usize,
         actual: usize,
@@ -61,6 +69,17 @@ impl fmt::Display for PlatformError {
                 write!(formatter, "packet of {actual} bytes exceeds {limit} bytes")
             }
             Self::PeerClosed => formatter.write_str("control peer closed the connection"),
+            Self::PeerUidMismatch {
+                expected_uid,
+                pid,
+                uid,
+                gid,
+            } => {
+                write!(
+                    formatter,
+                    "control peer UID mismatch: expected uid={expected_uid}, pid={pid}, uid={uid}, gid={gid}"
+                )
+            }
             Self::ShortWrite { expected, actual } => {
                 write!(
                     formatter,
@@ -80,6 +99,7 @@ impl Error for PlatformError {
             | Self::InvalidSocketPath(_)
             | Self::PacketTooLarge { .. }
             | Self::PeerClosed
+            | Self::PeerUidMismatch { .. }
             | Self::ShortWrite { .. } => None,
         }
     }

@@ -26,7 +26,7 @@ fn main() {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from("/data/adb/flux/run/fluxd.sock"));
     let client = fluxd::SocketControlClient::new(socket_path);
-    let exit = fluxd::run_cli_with_control(
+    let exit = fluxd::run_cli_with_daemon(
         args,
         &source,
         &client,

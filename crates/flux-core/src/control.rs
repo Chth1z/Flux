@@ -51,9 +51,16 @@ pub struct OperationReport {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConfigurationChangeReport {
+    Reloaded(OperationReport),
+    Deferred { revision: u64 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ControlSnapshot {
     pub revision: u64,
     pub administrative_state: AdministrativeState,
+    pub configuration_dirty: bool,
     pub in_flight: Option<LegacyIntent>,
     pub last_completed: Option<OperationReport>,
 }
@@ -63,6 +70,7 @@ impl Default for ControlSnapshot {
         Self {
             revision: 0,
             administrative_state: AdministrativeState::Unknown,
+            configuration_dirty: false,
             in_flight: None,
             last_completed: None,
         }
@@ -75,6 +83,28 @@ pub trait LegacyDispatcher: Send + 'static {
 
 pub trait ControlClient {
     fn submit_and_wait(&self, intent: LegacyIntent) -> Result<OperationReport, ControlError>;
+
+    #[must_use]
+    fn snapshot(&self) -> Arc<ControlSnapshot> {
+        Arc::new(ControlSnapshot::default())
+    }
+
+    fn mark_configuration_dirty(&self) -> Result<u64, ControlError> {
+        Err(ControlError::BridgeStopped)
+    }
+
+    fn configuration_changed(
+        &self,
+        reason: Reason,
+    ) -> Result<ConfigurationChangeReport, ControlError> {
+        if self.snapshot().administrative_state == AdministrativeState::Running {
+            self.submit_and_wait(LegacyIntent::Reload { reason })
+                .map(ConfigurationChangeReport::Reloaded)
+        } else {
+            self.mark_configuration_dirty()
+                .map(|revision| ConfigurationChangeReport::Deferred { revision })
+        }
+    }
 }
 
 pub struct LegacyControlBridge {
@@ -111,7 +141,7 @@ impl LegacyControlBridge {
         let sender = self.sender.as_ref().ok_or(ControlError::BridgeStopped)?;
         let (completion_tx, completion_rx) = mpsc::channel();
         sender
-            .try_send(WorkerRequest {
+            .try_send(WorkerRequest::Execute {
                 intent,
                 completion_tx,
             })
@@ -122,6 +152,40 @@ impl LegacyControlBridge {
         Ok(OperationHandle {
             completion_rx: Some(completion_rx),
         })
+    }
+
+    pub fn mark_configuration_dirty(&self) -> Result<u64, ControlError> {
+        let sender = self.sender.as_ref().ok_or(ControlError::BridgeStopped)?;
+        let (completion_tx, completion_rx) = mpsc::channel();
+        sender
+            .try_send(WorkerRequest::MarkConfigurationDirty { completion_tx })
+            .map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => ControlError::QueueFull,
+                mpsc::TrySendError::Disconnected(_) => ControlError::BridgeStopped,
+            })?;
+        completion_rx
+            .recv()
+            .map_err(|_| ControlError::BridgeStopped)?
+    }
+
+    pub fn configuration_changed(
+        &self,
+        reason: Reason,
+    ) -> Result<ConfigurationChangeReport, ControlError> {
+        let sender = self.sender.as_ref().ok_or(ControlError::BridgeStopped)?;
+        let (completion_tx, completion_rx) = mpsc::channel();
+        sender
+            .try_send(WorkerRequest::ConfigurationChanged {
+                reason,
+                completion_tx,
+            })
+            .map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => ControlError::QueueFull,
+                mpsc::TrySendError::Disconnected(_) => ControlError::BridgeStopped,
+            })?;
+        completion_rx
+            .recv()
+            .map_err(|_| ControlError::BridgeStopped)?
     }
 
     #[must_use]
@@ -136,6 +200,21 @@ impl LegacyControlBridge {
 impl ControlClient for LegacyControlBridge {
     fn submit_and_wait(&self, intent: LegacyIntent) -> Result<OperationReport, ControlError> {
         self.submit(intent)?.wait()
+    }
+
+    fn snapshot(&self) -> Arc<ControlSnapshot> {
+        LegacyControlBridge::snapshot(self)
+    }
+
+    fn mark_configuration_dirty(&self) -> Result<u64, ControlError> {
+        LegacyControlBridge::mark_configuration_dirty(self)
+    }
+
+    fn configuration_changed(
+        &self,
+        reason: Reason,
+    ) -> Result<ConfigurationChangeReport, ControlError> {
+        LegacyControlBridge::configuration_changed(self, reason)
     }
 }
 
@@ -169,6 +248,7 @@ pub enum ControlError {
     BridgeStopped,
     OperationAlreadyConsumed,
     WorkerStart(String),
+    Persistence(String),
     Dispatcher(String),
 }
 
@@ -176,6 +256,11 @@ impl ControlError {
     #[must_use]
     pub fn dispatcher(message: impl Into<String>) -> Self {
         Self::Dispatcher(message.into())
+    }
+
+    #[must_use]
+    pub fn persistence(message: impl Into<String>) -> Self {
+        Self::Persistence(message.into())
     }
 }
 
@@ -193,6 +278,9 @@ impl fmt::Display for ControlError {
             Self::WorkerStart(message) => {
                 write!(formatter, "cannot start legacy writer: {message}")
             }
+            Self::Persistence(message) => {
+                write!(formatter, "cannot persist control state: {message}")
+            }
             Self::Dispatcher(message) => write!(formatter, "legacy dispatcher failed: {message}"),
         }
     }
@@ -200,9 +288,18 @@ impl fmt::Display for ControlError {
 
 impl Error for ControlError {}
 
-struct WorkerRequest {
-    intent: LegacyIntent,
-    completion_tx: mpsc::Sender<Result<OperationReport, ControlError>>,
+enum WorkerRequest {
+    Execute {
+        intent: LegacyIntent,
+        completion_tx: mpsc::Sender<Result<OperationReport, ControlError>>,
+    },
+    MarkConfigurationDirty {
+        completion_tx: mpsc::Sender<Result<u64, ControlError>>,
+    },
+    ConfigurationChanged {
+        reason: Reason,
+        completion_tx: mpsc::Sender<Result<ConfigurationChangeReport, ControlError>>,
+    },
 }
 
 fn worker_loop<D>(
@@ -213,32 +310,92 @@ fn worker_loop<D>(
     D: LegacyDispatcher,
 {
     while let Ok(request) = receiver.recv() {
-        let started = replace_snapshot(snapshot, |current| ControlSnapshot {
-            revision: current.revision.saturating_add(1),
-            administrative_state: current.administrative_state,
-            in_flight: Some(request.intent),
-            last_completed: current.last_completed,
-        });
+        match request {
+            WorkerRequest::Execute {
+                intent,
+                completion_tx,
+            } => {
+                let _ = completion_tx.send(execute_intent(&mut dispatcher, snapshot, intent));
+            }
+            WorkerRequest::MarkConfigurationDirty { completion_tx } => {
+                let _ = completion_tx.send(Ok(mark_dirty(snapshot)));
+            }
+            WorkerRequest::ConfigurationChanged {
+                reason,
+                completion_tx,
+            } => {
+                let result = if read_snapshot(snapshot).administrative_state
+                    == AdministrativeState::Running
+                {
+                    execute_intent(&mut dispatcher, snapshot, LegacyIntent::Reload { reason })
+                        .map(ConfigurationChangeReport::Reloaded)
+                } else {
+                    Ok(ConfigurationChangeReport::Deferred {
+                        revision: mark_dirty(snapshot),
+                    })
+                };
+                let _ = completion_tx.send(result);
+            }
+        }
+    }
+}
 
-        let result = dispatcher.execute(&request.intent);
-        let completed_revision = started.revision.saturating_add(1);
-        let operation = result.map(|()| OperationReport {
-            intent: request.intent,
-            revision: completed_revision,
-        });
+fn execute_intent<D>(
+    dispatcher: &mut D,
+    snapshot: &RwLock<Arc<ControlSnapshot>>,
+    intent: LegacyIntent,
+) -> Result<OperationReport, ControlError>
+where
+    D: LegacyDispatcher,
+{
+    let started = replace_snapshot(snapshot, |current| ControlSnapshot {
+        revision: current.revision.saturating_add(1),
+        administrative_state: next_administrative_state(current.administrative_state, intent),
+        configuration_dirty: current.configuration_dirty,
+        in_flight: Some(intent),
+        last_completed: current.last_completed,
+    });
 
-        replace_snapshot(snapshot, |current| ControlSnapshot {
-            revision: completed_revision,
-            administrative_state: operation
-                .as_ref()
-                .map_or(current.administrative_state, |report| {
-                    next_administrative_state(current.administrative_state, report.intent)
-                }),
-            in_flight: None,
-            last_completed: operation.as_ref().ok().copied().or(current.last_completed),
-        });
+    let result = dispatcher.execute(&intent);
+    let completed_revision = started.revision.saturating_add(1);
+    let operation = result.map(|()| OperationReport {
+        intent,
+        revision: completed_revision,
+    });
 
-        let _ = request.completion_tx.send(operation);
+    replace_snapshot(snapshot, |current| ControlSnapshot {
+        revision: completed_revision,
+        administrative_state: current.administrative_state,
+        configuration_dirty: operation
+            .as_ref()
+            .map_or(current.configuration_dirty, |report| match report.intent {
+                LegacyIntent::Running { .. } | LegacyIntent::Reload { .. } => false,
+                LegacyIntent::Stopped { .. } | LegacyIntent::ResyncAddresses { .. } => {
+                    current.configuration_dirty
+                }
+            }),
+        in_flight: None,
+        last_completed: operation.as_ref().ok().copied().or(current.last_completed),
+    });
+
+    operation
+}
+
+fn mark_dirty(snapshot: &RwLock<Arc<ControlSnapshot>>) -> u64 {
+    replace_snapshot(snapshot, |current| ControlSnapshot {
+        revision: current.revision.saturating_add(1),
+        administrative_state: current.administrative_state,
+        configuration_dirty: true,
+        in_flight: current.in_flight,
+        last_completed: current.last_completed,
+    })
+    .revision
+}
+
+fn read_snapshot(snapshot: &RwLock<Arc<ControlSnapshot>>) -> Arc<ControlSnapshot> {
+    match snapshot.read() {
+        Ok(snapshot) => Arc::clone(&snapshot),
+        Err(poisoned) => Arc::clone(&poisoned.into_inner()),
     }
 }
 

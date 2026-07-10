@@ -44,4 +44,14 @@ cargo xtask build-android
 
 The task validates `source.properties`, selects the API-suffixed NDK clang linker for the host OS, and builds the `fluxd` release binary. It refuses a different NDK revision instead of silently producing an unqualified artifact.
 
-The build output remains in Cargo's target directory during Phase 0. Magisk release staging is introduced with the Phase 1 bridge so the existing package does not gain a second networking owner prematurely.
+## Magisk module staging
+
+The bridge release is staged only after a successful pinned Android release build:
+
+```text
+cargo xtask stage-module --stage dist/module --runtime-binaries /path/to/runtime-binaries
+```
+
+`--runtime-binaries` must contain the independently sourced `sing-box`, `jq`, and rollback `addrsyncd` Android binaries. The task copies the tracked module tree, installs the newly built `fluxd` at `bin/fluxd`, and refuses a non-empty stage or a stage missing any required runtime file. This keeps third-party provenance explicit and prevents installer changes from landing without a real Android `fluxd` artifact.
+
+Before publishing, populate every blank version/source/hash field in `conf/manifest.json` from the staged artifacts and archive the matching provenance records.

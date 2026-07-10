@@ -5,6 +5,14 @@
   "note": "Release packaging must fill version, source, target, and sha256 for every binary before publishing.",
   "binaries": [
     {
+      "name": "fluxd",
+      "path": "bin/fluxd",
+      "source": "https://github.com/Chth1z/Flux",
+      "version": "0.1.0",
+      "target": "aarch64-linux-android",
+      "sha256": ""
+    },
+    {
       "name": "sing-box",
       "path": "bin/sing-box",
       "source": "",

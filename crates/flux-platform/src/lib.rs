@@ -3,6 +3,10 @@
 use std::error::Error;
 use std::fmt;
 
+mod legacy_dispatcher;
+
+pub use legacy_dispatcher::{LegacyScriptPaths, ProcessLegacyDispatcher};
+
 pub trait KernelReleaseSource {
     fn kernel_release(&self) -> Result<String, PlatformError>;
 }

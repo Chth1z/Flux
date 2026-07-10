@@ -52,6 +52,7 @@ _service_state() {
 status_cmd() {
     _print_kv "config" "$([ "${CONFIG_READY}" = "1" ] && printf ready || printf failed)"
     _print_kv "module" "$(_service_state)"
+    _print_kv "fluxd" "$(_pid_status "${FLUXD_PID_FILE}" "fluxd" "${FLUXD_BIN}")"
     [ "${CONFIG_READY}" = "1" ] && _print_kv "proxy mode" "${PROXY_MODE}"
     _print_kv "sing-box" "$(_pid_status "${SING_BOX_PID_FILE}" "sing-box" "${SING_BOX_BIN}")"
     if [ "${CONFIG_READY}" = "1" ]; then
@@ -167,16 +168,28 @@ logs_cmd() {
     fi
 }
 
+_fluxd_control_cmd() {
+    local action="${1}"
+
+    [ -x "${FLUXD_BIN}" ] || {
+        log_error "fluxd binary missing or not executable: ${FLUXD_BIN}"
+        return 127
+    }
+
+    exec "${FLUXD_BIN}" control "${action}"
+}
+
 main() {
     local action="${1:-status}"
     shift || true
 
     case "${action}" in
-    start | stop)
-        sh "${DISPATCHER_SCRIPT}" "${action}" "$@"
-        ;;
-    restart)
-        sh "${DISPATCHER_SCRIPT}" restart "fluxctl"
+    start | stop | restart | reload | resync)
+        [ "$#" -eq 0 ] || {
+            log_error "${action} does not accept arguments"
+            return 2
+        }
+        _fluxd_control_cmd "${action}"
         ;;
     status)
         status_cmd
@@ -187,14 +200,11 @@ main() {
     rules-preview | preview)
         rules_preview_cmd
         ;;
-    resync)
-        sh "${ADDRSYNC_SCRIPT}" resync
-        ;;
     logs)
         logs_cmd "$@"
         ;;
     *)
-        echo "Usage: $0 {status|start|stop|restart|diagnose|rules-preview|resync|logs [file]}"
+        echo "Usage: $0 {status|start|stop|restart|reload|diagnose|rules-preview|resync|logs [file]}"
         exit 1
         ;;
     esac

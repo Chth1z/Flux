@@ -23,6 +23,16 @@ readonly BYPASS_MARK=0x11
 readonly BOOT_TIMEOUT=60   # Max wait for system boot (seconds)
 readonly IPTABLES_WAIT=100 # iptables lock wait timeout (centiseconds)
 readonly RESTART_DEBOUNCE_SEC=10
+readonly EX_TEMPFAIL=75
+
+# The watchdog stops after repeated rapid failures, but a daemon that remains
+# healthy for this interval resets the failure budget.
+readonly FLUXD_RESTART_LIMIT=5
+readonly FLUXD_RESTART_STABLE_SEC=30
+readonly FLUXD_RESTART_BACKOFF_MAX=16
+readonly FLUXD_SOCKET_READY_TIMEOUT=60
+readonly FLUXD_SHUTDOWN_TIMEOUT=30
+readonly FLUXD_DISPATCH_RECOVERY_TIMEOUT=120
 
 # ==============================================================================
 # [ Directory Structure ]
@@ -44,6 +54,7 @@ readonly SCRIPTS_DIR="${FLUX_DIR}/scripts"
 readonly JQ_BIN="${BIN_DIR}/jq"
 readonly SING_BOX_BIN="${BIN_DIR}/sing-box"
 readonly ADDRSYNCD_BIN="${BIN_DIR}/addrsyncd"
+readonly FLUXD_BIN="${BIN_DIR}/fluxd"
 
 readonly PATH="/data/adb/magisk:/data/adb/ksu/bin:/data/adb/ap/bin:${PATH}"
 
@@ -63,6 +74,13 @@ readonly PACKAGES_LIST="/data/system/packages.list"
 # ==============================================================================
 
 readonly FLUX_LOG="${RUN_DIR}/flux.log"
+readonly FLUXD_LOG_FILE="${RUN_DIR}/fluxd.log"
+readonly FLUXD_PID_FILE="${RUN_DIR}/fluxd.pid"
+readonly FLUXD_SOCKET="${RUN_DIR}/fluxd.sock"
+readonly FLUXD_INTENT_FILE="${RUN_DIR}/administrative-intent.json"
+readonly FLUXD_WATCHDOG_LOCK_DIR="${RUN_DIR}/fluxd-watchdog.lock"
+readonly FLUXD_WATCHDOG_OWNER_FILE="${FLUXD_WATCHDOG_LOCK_DIR}/owner"
+readonly FLUXD_WATCHDOG_REAP_FILE="${RUN_DIR}/fluxd-watchdog.reap"
 readonly SING_BOX_PID_FILE="${RUN_DIR}/sing-box.pid"
 readonly SING_BOX_LOG="${RUN_DIR}/sing-box.log"
 readonly ADDRSYNCD_LOG_FILE="${RUN_DIR}/addrsyncd.log"
@@ -72,8 +90,8 @@ readonly ADDRSYNCD_PID_FILE="${RUN_DIR}/addrsyncd.pid"
 # [ Internal Files ]
 # ==============================================================================
 readonly DISPATCH_LOCK_DIR="${RUN_DIR}/dispatcher.lock"
+readonly DISPATCH_LOCK_OWNER_FILE="${DISPATCH_LOCK_DIR}/owner"
 readonly RESTART_STAMP_FILE="${RUN_DIR}/restart.stamp"
-readonly BOOT_TRIGGER="${MAGISK_MOD_DIR}/boot_trigger"
 readonly EVENT_CACHE_OK="${CACHE_DIR}/cache_valid"
 
 # ==============================================================================
@@ -91,6 +109,7 @@ readonly RULES_SCRIPT="${SCRIPTS_DIR}/rules"
 readonly TPROXY_SCRIPT="${SCRIPTS_DIR}/tproxy"
 readonly UPDATE_SCRIPT="${SCRIPTS_DIR}/updater.sh"
 readonly FLUXCTL_SCRIPT="${SCRIPTS_DIR}/fluxctl"
+readonly FLUX_EVENT_SCRIPT="${SCRIPTS_DIR}/flux-event"
 
 # ==============================================================================
 # [ Cache Files ]
@@ -255,6 +274,38 @@ pid_matches_cmd() {
     [ -r "/proc/${pid}/cmdline" ] || return 1
 
     tr '\0' ' ' <"/proc/${pid}/cmdline" 2>/dev/null | grep -Fq -- "${expected}"
+}
+
+# Read Linux process start ticks (field 22 in /proc/PID/stat).
+# Usage: process_start_ticks PID
+process_start_ticks() {
+    local pid="${1}"
+    local stat_line=""
+    local stat_fields=""
+    local start_ticks=""
+
+    [ -r "/proc/${pid}/stat" ] || return 1
+    IFS= read -r stat_line <"/proc/${pid}/stat" || return 1
+    stat_fields="${stat_line##*) }"
+    [ "${stat_fields}" != "${stat_line}" ] || return 1
+
+    set -- ${stat_fields}
+    [ "$#" -ge 20 ] || return 1
+    start_ticks="${20}"
+    is_int "${start_ticks}" || return 1
+    printf '%s\n' "${start_ticks}"
+}
+
+# Read and validate the current Linux boot identity.
+current_boot_id() {
+    local boot_id=""
+
+    [ -r "/proc/sys/kernel/random/boot_id" ] || return 1
+    IFS= read -r boot_id <"/proc/sys/kernel/random/boot_id" || return 1
+    case "${boot_id}" in
+    '' | *[!0-9A-Fa-f-]*) return 1 ;;
+    esac
+    printf '%s\n' "${boot_id}"
 }
 
 # Wait until pid enters a target state.

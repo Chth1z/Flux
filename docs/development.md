@@ -55,3 +55,20 @@ cargo xtask stage-module --stage dist/module --runtime-binaries /path/to/runtime
 `--runtime-binaries` must contain the independently sourced `sing-box`, `jq`, and rollback `addrsyncd` Android binaries. The task copies the tracked module tree, installs the newly built `fluxd` at `bin/fluxd`, and refuses a non-empty stage or a stage missing any required runtime file. This keeps third-party provenance explicit and prevents installer changes from landing without a real Android `fluxd` artifact.
 
 Before publishing, populate every blank version/source/hash field in `conf/manifest.json` from the staged artifacts and archive the matching provenance records.
+
+## Phase 1 bridge runtime
+
+The packaged module installs `flux_service.sh` as module-local `service.sh`. It launches a bounded watchdog for `fluxd daemon` and an `inotifyd` Adapter that forwards raw facts through `scripts/flux-event`; event-to-intent policy remains in Rust.
+
+Native online commands are:
+
+```text
+fluxd ping
+fluxd status [--json]
+fluxd control start|stop|restart|reload|resync
+fluxd event EVENT_TYPE WATCHED_PATH EVENT_NAME
+```
+
+The socket defaults to `/data/adb/flux/run/fluxd.sock` with mode `0600`. Accepted peers must match the daemon effective UID. Administrative intent is atomically recorded in `/data/adb/flux/run/administrative-intent.json` with the current Linux boot ID, so a daemon restart replays desired running/stopped state before normal control traffic. A recoverable legacy dispatcher failure leaves the daemon queryable; journal, peer, or socket-safety failures remain fatal.
+
+Mutating `fluxctl` commands use this socket exclusively and never fall back to direct script execution. Read-only diagnostics still use the legacy inspection paths during the bridge release. The legacy dispatcher accepts networking mutations only with `FLUXD_BRIDGE=1`, serializes them with an identity-bearing lock, and remains the sole networking writer.

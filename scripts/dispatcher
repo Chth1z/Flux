@@ -1,20 +1,17 @@
 #!/system/bin/sh
 
 # ==============================================================================
-# [ Flux Event Dispatcher ]
-# Description: Inotify event handler and the single orchestration entrypoint.
+# [ Flux Legacy Dispatcher ]
+# Description: Phase 1 networking writer invoked only through fluxd.
 #
-# Runtime call graph (effective paths only):
-#   boot: flux_service -> init -> (event:init_ok) -> dispatcher -> core/tproxy/addrsync
-#   config write:
-#     settings.ini    -> stop(all) -> init -> (event:init_ok) -> start(all)
-#     config.json     -> init cache -> restart(core)
-#     addrsyncd.toml  -> restart(addrsync)
+# Runtime call graph:
+#   service/inotify/fluxctl -> fluxd -> FLUXD_BRIDGE=1 dispatcher
+#   dispatcher -> init/core/tproxy/addrsync legacy writers
 #
 # Invariants:
-#   1) dispatcher is the only runtime orchestrator for start/stop/restart/fail transitions.
-#   2) init only prepares runtime prerequisites and emits EVENT_INIT_OK.
-#   3) core/tproxy/addrsync only manage component lifecycle.
+#   1) fluxd owns administrative intent and serializes every mutation.
+#   2) FLUXD_BRIDGE=1 is required before legacy networking state is changed.
+#   3) init only prepares runtime prerequisites and emits EVENT_INIT_OK.
 #   4) failures must converge to STOPPED/FAILED without stale ready markers.
 # ==============================================================================
 
@@ -33,7 +30,16 @@ readonly SCRIPT_DIR="${_script_path%/*}"
 
 readonly LOG_COMPONENT="Disp"
 
-load_config || exit 1
+_forward_to_fluxd_control() {
+    local action="${1}"
+
+    [ -x "${FLUXD_BIN}" ] || {
+        log_error "fluxd binary missing or not executable: ${FLUXD_BIN}"
+        return 127
+    }
+
+    exec "${FLUXD_BIN}" control "${action}"
+}
 
 # ==============================================================================
 # [ Component Control ]
@@ -108,7 +114,6 @@ _state_start() {
     }
 
     log_banner "STARTING FLUX"
-    rm -f "${BOOT_TRIGGER}"
 
     if ! sh "${INIT_SCRIPT}" init; then
         log_error "Init failed"
@@ -184,7 +189,6 @@ _dispatch_event() {
     local action=""
 
     case "${key}" in
-    boot_trigger:n) action="_state_start" ;;
     disable:d) action="_state_start" ;;
     disable:n) action="_state_stop" ;;
     settings.ini:y | addrsyncd.toml:y | config.json:y) action="_state_restart" ;;
@@ -207,15 +211,34 @@ _with_dispatch_lock() {
     [ -d "${RUN_DIR}" ] || mkdir -p "${RUN_DIR}" 2>/dev/null || true
 
     if ! mkdir "${DISPATCH_LOCK_DIR}" 2>/dev/null; then
-        log_debug "Dispatcher busy, skip overlapping event"
-        return 0
+        log_debug "Dispatcher busy, reject overlapping operation"
+        return "${EX_TEMPFAIL}"
+    fi
+
+    local owner_start=""
+    local owner_boot_id=""
+    owner_start=$(process_start_ticks "$$") || {
+        rmdir "${DISPATCH_LOCK_DIR}" 2>/dev/null || true
+        return 1
+    }
+    owner_boot_id=$(current_boot_id) || {
+        rmdir "${DISPATCH_LOCK_DIR}" 2>/dev/null || true
+        return 1
+    }
+    if ! atomic_write \
+        "${DISPATCH_LOCK_OWNER_FILE}" \
+        printf '%s %s %s\n' "$$" "${owner_start}" "${owner_boot_id}"; then
+        rm -f "${DISPATCH_LOCK_OWNER_FILE}" 2>/dev/null || true
+        rmdir "${DISPATCH_LOCK_DIR}" 2>/dev/null || true
+        return 1
     fi
 
     local rc=0
-    trap 'rmdir "${DISPATCH_LOCK_DIR}" 2>/dev/null || true' EXIT INT TERM
+    trap 'rm -f "${DISPATCH_LOCK_OWNER_FILE}" 2>/dev/null || true; rmdir "${DISPATCH_LOCK_DIR}" 2>/dev/null || true' EXIT INT TERM
 
     "$@" || rc=$?
 
+    rm -f "${DISPATCH_LOCK_OWNER_FILE}" 2>/dev/null || true
     rmdir "${DISPATCH_LOCK_DIR}" 2>/dev/null || true
     trap - EXIT INT TERM
 
@@ -223,11 +246,28 @@ _with_dispatch_lock() {
 }
 
 main() {
-    [ ! -t 2 ] && [ -n "${FLUX_LOG}" ] && exec 2>>"${FLUX_LOG}"
-
     local event_type="${1:-}"
     local watched_path="${2:-}"
     local event_name="${3:-${watched_path##*/}}"
+
+    if [ "${FLUXD_BRIDGE:-0}" != "1" ]; then
+        [ ! -t 2 ] && [ -n "${FLUX_LOG}" ] && exec 2>>"${FLUX_LOG}"
+
+        case "${event_type}" in
+        start | stop | restart | reload | resync)
+            _forward_to_fluxd_control "${event_type}"
+            return $?
+            ;;
+        esac
+
+        [ "$#" -eq 3 ] || {
+            log_error "dispatcher is internal; use fluxd control"
+            return 2
+        }
+        exec "${FLUX_EVENT_SCRIPT}" "$@"
+    fi
+
+    load_config || return 1
 
     case "${event_type}" in
     start)
@@ -243,6 +283,11 @@ main() {
         return $?
         ;;
     esac
+
+    [ "$#" -eq 3 ] || {
+        log_error "Unsupported bridge invocation: ${event_type:-<empty>}"
+        return 2
+    }
 
     [ -n "${3:-}" ] && watched_path="${watched_path}/${event_name}"
 

@@ -35,13 +35,6 @@ readonly SCRIPTS_DIR="${FLUX_DIR}/scripts"
 readonly RUN_DIR="${FLUX_DIR}/run"
 readonly MODPROP="${MODPATH}/module.prop"
 
-# Detect service.d path (KSU <10683 uses different path)
-if [ "${KSU:-false}" = "true" ] && [ "${KSU_VER_CODE:-0}" -lt 10683 ]; then
-    SERVICE_DIR="/data/adb/ksu/service.d"
-else
-    SERVICE_DIR="/data/adb/service.d"
-fi
-
 # ==============================================================================
 # [ Installer UI Helpers ]
 # ==============================================================================
@@ -327,9 +320,14 @@ main() {
     ui_print "- Extracting module files..."
     unzip -o "${ZIPFILE}" 'module.prop' 'webroot/*' -d "${MODPATH}" >&2 || abort "! Failed to extract module.prop"
 
-    # Deploy flux_service.sh to service.d
-    mkdir -p "${SERVICE_DIR}" || abort "! Failed to create service directory"
-    unzip -o "${ZIPFILE}" 'flux_service.sh' -d "${SERVICE_DIR}" >&2 || abort "! Failed to extract service script"
+    # Deploy the boot launcher as the module-local late_start service. Remove
+    # the legacy global service.d copies so only one watchdog can own fluxd.
+    unzip -o "${ZIPFILE}" 'flux_service.sh' -d "${MODPATH}" >&2 || abort "! Failed to extract service script"
+    mv -f "${MODPATH}/flux_service.sh" "${MODPATH}/service.sh" || abort "! Failed to install module service.sh"
+    rm -f \
+        "/data/adb/service.d/flux_service.sh" \
+        "/data/adb/ksu/service.d/flux_service.sh" \
+        2>/dev/null || true
 
     # 3. Clear and recreate FLUX_DIR structure
     rm -rf "${BIN_DIR}" "${SCRIPTS_DIR}" 2>/dev/null
@@ -337,6 +335,7 @@ main() {
     rm -rf "${FLUX_DIR}/cache" 2>/dev/null
 
     unzip -o "${ZIPFILE}" 'bin/*' 'scripts/*' 'conf/*' -d "${FLUX_DIR}" >&2 || abort "! Failed to extract module files"
+    [ -f "${BIN_DIR}/fluxd" ] || abort "! Required binary missing from module ZIP: bin/fluxd"
     # Rename default if template was extracted as singbox.json (for zip compatibility)
     [ -f "${CONF_DIR}/singbox.json" ] && mv -f "${CONF_DIR}/singbox.json" "${CONF_DIR}/template.json"
 
@@ -378,7 +377,7 @@ main() {
     set_perm_recursive "${FLUX_DIR}" 0 0 0755 0644
     set_perm_recursive "${BIN_DIR}" 0 0 0755 0700
     set_perm_recursive "${SCRIPTS_DIR}" 0 0 0755 0700
-    set_perm "${SERVICE_DIR}/flux_service.sh" 0 0 0700
+    set_perm "${MODPATH}/service.sh" 0 0 0700
 
     chmod ugo+x "${BIN_DIR}"/* 2>/dev/null || abort "! Failed to set executable bits for binaries"
     chmod ugo+x "${SCRIPTS_DIR}"/* 2>/dev/null || abort "! Failed to set executable bits for scripts"

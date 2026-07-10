@@ -1,10 +1,35 @@
 use flux_platform::SystemKernelReleaseSource;
 
 fn main() {
+    let args = std::env::args().collect::<Vec<_>>();
     let source = SystemKernelReleaseSource;
-    let exit = fluxd::run_cli(
-        std::env::args(),
+    if args.get(1).is_some_and(|command| command == "daemon") {
+        if args.len() != 2 {
+            eprintln!("fluxd: daemon does not accept positional arguments");
+            std::process::exit(2);
+        }
+        let options = match fluxd::DaemonOptions::from_environment() {
+            Ok(options) => options,
+            Err(error) => {
+                eprintln!("fluxd: {error}");
+                std::process::exit(1);
+            }
+        };
+        if let Err(error) = fluxd::run_daemon(&source, options) {
+            eprintln!("fluxd: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    let socket_path = std::env::var_os("FLUXD_SOCKET")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/data/adb/flux/run/fluxd.sock"));
+    let client = fluxd::SocketControlClient::new(socket_path);
+    let exit = fluxd::run_cli_with_control(
+        args,
         &source,
+        &client,
         &mut std::io::stdout(),
         &mut std::io::stderr(),
     );

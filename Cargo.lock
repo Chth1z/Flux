@@ -59,6 +59,7 @@ dependencies = [
  "flux-testkit",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

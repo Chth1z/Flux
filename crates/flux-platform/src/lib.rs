@@ -4,8 +4,10 @@ use std::error::Error;
 use std::fmt;
 
 mod legacy_dispatcher;
+mod seqpacket;
 
 pub use legacy_dispatcher::{LegacyScriptPaths, ProcessLegacyDispatcher};
+pub use seqpacket::{SeqpacketConnection, SeqpacketListener};
 
 pub trait KernelReleaseSource {
     fn kernel_release(&self) -> Result<String, PlatformError>;
@@ -28,6 +30,16 @@ pub enum PlatformError {
         source: std::io::Error,
     },
     InvalidKernelReleaseEncoding,
+    InvalidSocketPath(String),
+    PacketTooLarge {
+        actual: usize,
+        limit: usize,
+    },
+    PeerClosed,
+    ShortWrite {
+        expected: usize,
+        actual: usize,
+    },
 }
 
 impl fmt::Display for PlatformError {
@@ -42,6 +54,19 @@ impl fmt::Display for PlatformError {
             Self::InvalidKernelReleaseEncoding => {
                 formatter.write_str("kernel release is not valid UTF-8")
             }
+            Self::InvalidSocketPath(message) => {
+                write!(formatter, "invalid Unix socket path: {message}")
+            }
+            Self::PacketTooLarge { actual, limit } => {
+                write!(formatter, "packet of {actual} bytes exceeds {limit} bytes")
+            }
+            Self::PeerClosed => formatter.write_str("control peer closed the connection"),
+            Self::ShortWrite { expected, actual } => {
+                write!(
+                    formatter,
+                    "short packet write: expected {expected} bytes, wrote {actual}"
+                )
+            }
         }
     }
 }
@@ -50,7 +75,12 @@ impl Error for PlatformError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::SystemCall { source, .. } => Some(source),
-            Self::UnsupportedPlatform(_) | Self::InvalidKernelReleaseEncoding => None,
+            Self::UnsupportedPlatform(_)
+            | Self::InvalidKernelReleaseEncoding
+            | Self::InvalidSocketPath(_)
+            | Self::PacketTooLarge { .. }
+            | Self::PeerClosed
+            | Self::ShortWrite { .. } => None,
         }
     }
 }

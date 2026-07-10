@@ -6,6 +6,14 @@ use flux_core::{
 use flux_platform::KernelReleaseSource;
 use serde::Serialize;
 
+mod daemon;
+mod protocol;
+mod socket;
+
+pub use daemon::{DaemonError, DaemonOptions, run_daemon};
+pub use protocol::{MAX_CONTROL_PACKET_BYTES, ProtocolHandler};
+pub use socket::{ControlSocketError, ControlSocketServer, SocketControlClient};
+
 const EXIT_SUCCESS: i32 = 0;
 const EXIT_RUNTIME_ERROR: i32 = 1;
 const EXIT_USAGE: i32 = 2;

@@ -15,6 +15,7 @@ serde_json.workspace = true
 
 [dev-dependencies]
 flux-testkit = { path = "../flux-testkit" }
+tempfile = "3"
 
 [lints]
 workspace = true

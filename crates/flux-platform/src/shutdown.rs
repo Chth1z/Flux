@@ -1,13 +1,34 @@
+use std::marker::PhantomData;
+use std::rc::Rc;
+
+#[derive(Default)]
+// `Rc` makes this zero-sized marker neither Send nor Sync.
+struct ThreadAffine(PhantomData<Rc<()>>);
+
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod implementation {
     use std::mem::MaybeUninit;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
+    use super::ThreadAffine;
     use crate::PlatformError;
 
+    /// A signal-mask guard that must remain on the thread that installed it.
+    ///
+    /// Moving the guard to another thread would restore a thread-local
+    /// `pthread_sigmask` on the wrong thread, so the type is deliberately
+    /// neither [`Send`] nor [`Sync`].
+    ///
+    /// ```compile_fail
+    /// use flux_platform::ShutdownSignal;
+    ///
+    /// let shutdown = ShutdownSignal::install().expect("install shutdown signal source");
+    /// std::thread::spawn(move || drop(shutdown));
+    /// ```
     pub struct ShutdownSignal {
         fd: OwnedFd,
         previous_mask: libc::sigset_t,
+        _thread_affinity: ThreadAffine,
     }
 
     impl ShutdownSignal {
@@ -28,9 +49,9 @@ mod implementation {
             let mask = unsafe { mask.assume_init() };
 
             let mut previous_mask = MaybeUninit::<libc::sigset_t>::zeroed();
-            // SAFETY: both signal-set pointers are valid for this call. The
-            // current thread has not spawned daemon workers yet, so children
-            // will inherit the blocked mask.
+            // SAFETY: both signal-set pointers are valid for this call. Signal
+            // masks are thread-local; `ShutdownSignal` is not `Send`, so its
+            // Drop implementation restores this mask on the installing thread.
             let block_result = unsafe {
                 libc::pthread_sigmask(libc::SIG_BLOCK, &raw const mask, previous_mask.as_mut_ptr())
             };
@@ -58,6 +79,7 @@ mod implementation {
                 // SAFETY: successful signalfd returned a new owned descriptor.
                 fd: unsafe { OwnedFd::from_raw_fd(fd) },
                 previous_mask,
+                _thread_affinity: ThreadAffine::default(),
             })
         }
 
@@ -129,9 +151,12 @@ mod implementation {
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 mod implementation {
+    use super::ThreadAffine;
     use crate::PlatformError;
 
-    pub struct ShutdownSignal;
+    pub struct ShutdownSignal {
+        _thread_affinity: ThreadAffine,
+    }
 
     impl ShutdownSignal {
         pub fn install() -> Result<Self, PlatformError> {
@@ -145,3 +170,36 @@ mod implementation {
 }
 
 pub use implementation::ShutdownSignal;
+
+#[cfg(test)]
+mod tests {
+    use super::ShutdownSignal;
+
+    trait AmbiguousIfSend<Marker> {
+        fn assert_not_send() {}
+    }
+
+    trait AmbiguousIfSync<Marker> {
+        fn assert_not_sync() {}
+    }
+
+    impl<T: ?Sized> AmbiguousIfSend<()> for T {}
+
+    struct ImplementsSend;
+
+    impl<T: ?Sized + Send> AmbiguousIfSend<ImplementsSend> for T {}
+
+    struct ImplementsSync;
+
+    impl<T: ?Sized> AmbiguousIfSync<()> for T {}
+    impl<T: ?Sized + Sync> AmbiguousIfSync<ImplementsSync> for T {}
+
+    #[test]
+    fn shutdown_signal_is_thread_affine() {
+        // Type inference is unique only when ShutdownSignal does not implement
+        // Send; a Send implementation would make both marker impls applicable.
+        let _ = <ShutdownSignal as AmbiguousIfSend<_>>::assert_not_send;
+        // The same ambiguity check independently protects the Sync invariant.
+        let _ = <ShutdownSignal as AmbiguousIfSync<_>>::assert_not_sync;
+    }
+}

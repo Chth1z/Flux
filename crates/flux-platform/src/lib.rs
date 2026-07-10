@@ -8,7 +8,7 @@ mod seqpacket;
 mod shutdown;
 
 pub use legacy_dispatcher::{LegacyScriptPaths, ProcessLegacyDispatcher};
-pub use seqpacket::{PeerCredentials, SeqpacketConnection, SeqpacketListener};
+pub use seqpacket::{PeerCredentials, SeqpacketConnection, SeqpacketListener, Uid};
 pub use shutdown::ShutdownSignal;
 
 pub trait KernelReleaseSource {
@@ -39,9 +39,9 @@ pub enum PlatformError {
     },
     PeerClosed,
     PeerUidMismatch {
-        expected_uid: u32,
+        expected_uid: Uid,
         pid: u32,
-        uid: u32,
+        uid: Uid,
         gid: u32,
     },
     ShortWrite {

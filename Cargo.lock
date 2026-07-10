@@ -57,6 +57,7 @@ dependencies = [
  "flux-core",
  "flux-platform",
  "flux-testkit",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",

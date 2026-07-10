@@ -1,11 +1,32 @@
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
+
 use flux_core::{
-    AdministrativeState, ConfigurationChangeReport, ControlClient, ControlError, ControlSnapshot,
+    AdministrativeState, ConfigurationChangeReport, ControlError, ControlService, ControlSnapshot,
     KernelSupport, KernelVersion, LegacyIntent, OperationReport, Reason,
 };
+use flux_platform::Uid;
 use serde::{Deserialize, Serialize};
 
 const PROTOCOL_VERSION: u16 = 1;
+const RECENT_RESULT_CAPACITY: usize = 128;
+const RECENT_RESULT_FINGERPRINT_BYTES: usize = MAX_CONTROL_PACKET_BYTES;
+const RECENT_RESULT_RESPONSE_BYTES: usize = MAX_CONTROL_PACKET_BYTES;
+const DUPLICATE_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_CONTROL_PACKET_BYTES: usize = 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct RequestPeerId(u64);
+
+impl RequestPeerId {
+    const IN_PROCESS: Self = Self(0);
+
+    #[must_use]
+    pub const fn new(uid: Uid, pid: u32) -> Self {
+        Self((uid.as_raw() as u64) << 32 | pid as u64)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DaemonSnapshot {
@@ -29,17 +50,19 @@ pub struct EventReport {
 pub struct ProtocolHandler<C> {
     kernel_support: KernelSupport,
     control: C,
+    recent_results: Mutex<RecentResults>,
 }
 
 impl<C> ProtocolHandler<C>
 where
-    C: ControlClient,
+    C: ControlService,
 {
     #[must_use]
-    pub const fn new(kernel_support: KernelSupport, control: C) -> Self {
+    pub fn new(kernel_support: KernelSupport, control: C) -> Self {
         Self {
             kernel_support,
             control,
+            recent_results: Mutex::new(RecentResults::default()),
         }
     }
 
@@ -50,6 +73,11 @@ where
 
     #[must_use]
     pub fn handle(&self, packet: &[u8]) -> Vec<u8> {
+        self.handle_for_peer(packet, RequestPeerId::IN_PROCESS)
+    }
+
+    #[must_use]
+    pub fn handle_for_peer(&self, packet: &[u8], peer: RequestPeerId) -> Vec<u8> {
         if packet.len() > MAX_CONTROL_PACKET_BYTES {
             return encode_response(ResponseEnvelope::error(
                 0,
@@ -80,6 +108,56 @@ where
             ));
         }
 
+        if request.command.is_mutating() {
+            let key = RecentRequestKey {
+                peer,
+                request_id: request.request_id,
+            };
+            let decision = match self.recent_results.lock() {
+                Ok(mut recent) => recent.begin(key, packet),
+                Err(poisoned) => poisoned.into_inner().begin(key, packet),
+            };
+            match decision {
+                RecentDecision::Owner(completion) => {
+                    let response = self.dispatch(request);
+                    match self.recent_results.lock() {
+                        Ok(mut recent) => recent.complete(key, &completion, &response),
+                        Err(poisoned) => {
+                            poisoned.into_inner().complete(key, &completion, &response)
+                        }
+                    }
+                    return response;
+                }
+                RecentDecision::Duplicate(completion) => {
+                    return completion.wait().unwrap_or_else(|| {
+                        encode_response(ResponseEnvelope::error(
+                            request.request_id,
+                            "request_in_flight",
+                            "timed out waiting for the original request".to_owned(),
+                        ))
+                    });
+                }
+                RecentDecision::Conflict => {
+                    return encode_response(ResponseEnvelope::error(
+                        request.request_id,
+                        "request_id_conflict",
+                        "request ID was already used for a different mutation".to_owned(),
+                    ));
+                }
+                RecentDecision::Busy => {
+                    return encode_response(ResponseEnvelope::error(
+                        request.request_id,
+                        "recent_result_cache_full",
+                        "too many mutating requests are still in flight".to_owned(),
+                    ));
+                }
+            }
+        }
+
+        self.dispatch(request)
+    }
+
+    fn dispatch(&self, request: RequestEnvelope) -> Vec<u8> {
         match request.command {
             WireCommand::Ping => {
                 encode_response(ResponseEnvelope::ok(request.request_id, ResponseBody::Pong))
@@ -240,6 +318,194 @@ enum WireCommand {
         watched_path: String,
         event_name: String,
     },
+}
+
+impl WireCommand {
+    const fn is_mutating(&self) -> bool {
+        matches!(self, Self::Control { .. } | Self::Event { .. })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct RecentRequestKey {
+    peer: RequestPeerId,
+    request_id: u64,
+}
+
+#[derive(Default)]
+struct RecentResults {
+    entries: HashMap<RecentRequestKey, RecentEntry>,
+    order: VecDeque<RecentRequestKey>,
+    fingerprint_bytes: usize,
+    response_bytes: usize,
+}
+
+impl RecentResults {
+    fn begin(&mut self, key: RecentRequestKey, packet: &[u8]) -> RecentDecision {
+        if let Some(entry) = self.entries.get(&key) {
+            return if entry.fingerprint.as_ref() == packet {
+                RecentDecision::Duplicate(Arc::clone(&entry.completion))
+            } else {
+                RecentDecision::Conflict
+            };
+        }
+
+        self.evict_completed_for(1, packet.len(), 0);
+        if self.entries.len().saturating_add(1) > RECENT_RESULT_CAPACITY
+            || self.fingerprint_bytes.saturating_add(packet.len()) > RECENT_RESULT_FINGERPRINT_BYTES
+        {
+            return RecentDecision::Busy;
+        }
+
+        let completion = Arc::new(RequestCompletion::default());
+        self.fingerprint_bytes = self.fingerprint_bytes.saturating_add(packet.len());
+        self.order.push_back(key);
+        self.entries.insert(
+            key,
+            RecentEntry {
+                fingerprint: packet.to_vec().into_boxed_slice(),
+                completion: Arc::clone(&completion),
+                response_bytes: 0,
+            },
+        );
+        RecentDecision::Owner(completion)
+    }
+
+    fn complete(
+        &mut self,
+        key: RecentRequestKey,
+        completion: &Arc<RequestCompletion>,
+        response: &[u8],
+    ) {
+        self.evict_completed_for(0, 0, response.len());
+        let can_retain = response.len() <= RECENT_RESULT_RESPONSE_BYTES
+            && self.response_bytes.saturating_add(response.len()) <= RECENT_RESULT_RESPONSE_BYTES;
+
+        if can_retain {
+            if let Some(entry) = self.entries.get_mut(&key) {
+                debug_assert!(Arc::ptr_eq(&entry.completion, completion));
+                debug_assert_eq!(entry.response_bytes, 0);
+                entry.response_bytes = response.len();
+                self.response_bytes = self.response_bytes.saturating_add(response.len());
+            } else {
+                completion.finish(response);
+                return;
+            }
+        } else {
+            self.order.retain(|candidate| *candidate != key);
+            self.remove_entry(key);
+        }
+
+        // Publication occurs while the recent-results lock is still held. This
+        // keeps response accounting and completion visibility one atomic cache
+        // transition while waiters use only the completion lock.
+        completion.finish(response);
+        debug_assert!(self.response_bytes <= RECENT_RESULT_RESPONSE_BYTES);
+    }
+
+    fn evict_completed_for(
+        &mut self,
+        incoming_entries: usize,
+        incoming_fingerprint_bytes: usize,
+        incoming_response_bytes: usize,
+    ) {
+        let mut examined = 0;
+        while (self.entries.len().saturating_add(incoming_entries) > RECENT_RESULT_CAPACITY
+            || self
+                .fingerprint_bytes
+                .saturating_add(incoming_fingerprint_bytes)
+                > RECENT_RESULT_FINGERPRINT_BYTES
+            || self.response_bytes.saturating_add(incoming_response_bytes)
+                > RECENT_RESULT_RESPONSE_BYTES)
+            && examined < self.order.len()
+        {
+            let Some(key) = self.order.pop_front() else {
+                break;
+            };
+            let completed = self
+                .entries
+                .get(&key)
+                .is_some_and(|entry| entry.completion.is_finished());
+            if completed {
+                self.remove_entry(key);
+            } else {
+                self.order.push_back(key);
+                examined = examined.saturating_add(1);
+            }
+        }
+    }
+
+    fn remove_entry(&mut self, key: RecentRequestKey) {
+        if let Some(entry) = self.entries.remove(&key) {
+            self.fingerprint_bytes = self
+                .fingerprint_bytes
+                .saturating_sub(entry.fingerprint.len());
+            self.response_bytes = self.response_bytes.saturating_sub(entry.response_bytes);
+        }
+    }
+}
+
+struct RecentEntry {
+    fingerprint: Box<[u8]>,
+    completion: Arc<RequestCompletion>,
+    response_bytes: usize,
+}
+
+enum RecentDecision {
+    Owner(Arc<RequestCompletion>),
+    Duplicate(Arc<RequestCompletion>),
+    Conflict,
+    Busy,
+}
+
+#[derive(Default)]
+struct RequestCompletion {
+    response: Mutex<Option<Arc<[u8]>>>,
+    ready: Condvar,
+}
+
+impl RequestCompletion {
+    fn finish(&self, response: &[u8]) {
+        let mut slot = match self.response.lock() {
+            Ok(slot) => slot,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *slot = Some(Arc::from(response));
+        self.ready.notify_all();
+    }
+
+    fn is_finished(&self) -> bool {
+        match self.response.lock() {
+            Ok(response) => response.is_some(),
+            Err(poisoned) => poisoned.into_inner().is_some(),
+        }
+    }
+
+    fn wait(&self) -> Option<Vec<u8>> {
+        let deadline = Instant::now() + DUPLICATE_WAIT_TIMEOUT;
+        let mut slot = match self.response.lock() {
+            Ok(slot) => slot,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        loop {
+            if let Some(response) = slot.as_ref() {
+                return Some(response.to_vec());
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            let waited = self.ready.wait_timeout(slot, remaining);
+            let (next, timeout) = match waited {
+                Ok(waited) => waited,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            slot = next;
+            if timeout.timed_out() && slot.is_none() {
+                return None;
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
@@ -525,8 +791,37 @@ impl From<WireOperationReport> for OperationReport {
 }
 
 fn encode_response(response: ResponseEnvelope) -> Vec<u8> {
-    let mut encoded = serde_json::to_vec(&response)
-        .unwrap_or_else(|_| br#"{"protocol_version":1,"request_id":0,"result":{"status":"error","code":"internal","message":"response encoding failed"}}"#.to_vec());
+    let request_id = response.request_id;
+    let mut encoded = match serde_json::to_vec(&response) {
+        Ok(encoded) if encoded.len() < MAX_CONTROL_PACKET_BYTES => encoded,
+        Ok(_) => {
+            return encode_fixed_error_response(
+                request_id,
+                "response_too_large",
+                format!("control response exceeds {MAX_CONTROL_PACKET_BYTES} bytes"),
+            );
+        }
+        Err(_) => {
+            return encode_fixed_error_response(
+                request_id,
+                "internal",
+                "response encoding failed".to_owned(),
+            );
+        }
+    };
+    encoded.push(b'\n');
+    encoded
+}
+
+fn encode_fixed_error_response(request_id: u64, code: &'static str, message: String) -> Vec<u8> {
+    let fallback = ResponseEnvelope::error(request_id, code, message);
+    let mut encoded = serde_json::to_vec(&fallback).unwrap_or_else(|_| {
+        format!(
+            "{{\"protocol_version\":{PROTOCOL_VERSION},\"request_id\":{request_id},\"result\":{{\"status\":\"error\",\"code\":\"internal\",\"message\":\"response encoding failed\"}}}}"
+        )
+        .into_bytes()
+    });
+    debug_assert!(encoded.len() < MAX_CONTROL_PACKET_BYTES);
     encoded.push(b'\n');
     encoded
 }

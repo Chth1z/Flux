@@ -1,7 +1,46 @@
+use std::fmt;
+
+/// A validated Linux/Android user identity.
+///
+/// The all-ones `uid_t` value is reserved as the kernel's "no identity"
+/// sentinel and is therefore excluded from this type.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(transparent)]
+pub struct Uid(u32);
+
+impl Uid {
+    pub const ROOT: Self = Self(0);
+
+    #[must_use]
+    pub const fn from_raw(raw: u32) -> Option<Self> {
+        if raw == u32::MAX {
+            None
+        } else {
+            Some(Self(raw))
+        }
+    }
+
+    #[must_use]
+    pub const fn as_raw(self) -> u32 {
+        self.0
+    }
+
+    #[must_use]
+    pub const fn is_root(self) -> bool {
+        self.0 == Self::ROOT.0
+    }
+}
+
+impl fmt::Display for Uid {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PeerCredentials {
     pid: u32,
-    uid: u32,
+    uid: Uid,
     gid: u32,
 }
 
@@ -12,7 +51,7 @@ impl PeerCredentials {
     }
 
     #[must_use]
-    pub const fn uid(self) -> u32 {
+    pub const fn uid(self) -> Uid {
         self.uid
     }
 
@@ -23,7 +62,7 @@ impl PeerCredentials {
 
     #[must_use]
     pub const fn is_root(self) -> bool {
-        self.uid == 0
+        self.uid.is_root()
     }
 }
 
@@ -37,7 +76,7 @@ mod implementation {
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
-    use super::PeerCredentials;
+    use super::{PeerCredentials, Uid};
     use crate::PlatformError;
 
     #[derive(Debug)]
@@ -258,25 +297,37 @@ mod implementation {
                     std::io::Error::from_raw_os_error(libc::EPROTO),
                 )
             })?;
+            let uid = Uid::from_raw(credentials.uid).ok_or_else(|| {
+                system_call_error(
+                    "read Unix seqpacket peer credentials",
+                    std::io::Error::from_raw_os_error(libc::EPROTO),
+                )
+            })?;
             Ok(PeerCredentials {
                 pid,
-                uid: credentials.uid,
+                uid,
                 gid: credentials.gid,
             })
         }
 
         pub fn require_root_peer(&self) -> Result<PeerCredentials, PlatformError> {
-            self.require_peer_uid(0)
+            self.require_peer_uid(Uid::ROOT)
         }
 
         pub fn require_same_effective_user(&self) -> Result<PeerCredentials, PlatformError> {
             // SAFETY: `geteuid` has no pointer arguments or preconditions.
-            self.require_peer_uid(unsafe { libc::geteuid() })
+            let effective_uid = Uid::from_raw(unsafe { libc::geteuid() }).ok_or_else(|| {
+                system_call_error(
+                    "read daemon effective UID",
+                    std::io::Error::from_raw_os_error(libc::EPROTO),
+                )
+            })?;
+            self.require_peer_uid(effective_uid)
         }
 
         pub fn require_peer_uid(
             &self,
-            expected_uid: u32,
+            expected_uid: Uid,
         ) -> Result<PeerCredentials, PlatformError> {
             let credentials = self.peer_credentials()?;
             if credentials.uid() == expected_uid {
@@ -543,7 +594,7 @@ mod implementation {
     use std::path::Path;
     use std::time::Duration;
 
-    use super::PeerCredentials;
+    use super::{PeerCredentials, Uid};
     use crate::PlatformError;
 
     #[derive(Debug)]
@@ -592,7 +643,7 @@ mod implementation {
 
         pub fn require_peer_uid(
             &self,
-            _expected_uid: u32,
+            _expected_uid: Uid,
         ) -> Result<PeerCredentials, PlatformError> {
             Err(PlatformError::UnsupportedPlatform(std::env::consts::OS))
         }
@@ -604,3 +655,21 @@ mod implementation {
 }
 
 pub use implementation::{SeqpacketConnection, SeqpacketListener};
+
+#[cfg(test)]
+mod tests {
+    use super::Uid;
+
+    #[test]
+    fn uid_round_trips_valid_kernel_value() {
+        let uid = Uid::from_raw(10_123).expect("valid UID");
+
+        assert_eq!(uid.as_raw(), 10_123);
+        assert!(!uid.is_root());
+    }
+
+    #[test]
+    fn uid_rejects_kernel_no_identity_sentinel() {
+        assert_eq!(Uid::from_raw(u32::MAX), None);
+    }
+}

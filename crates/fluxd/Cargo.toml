@@ -13,6 +13,9 @@ flux-platform = { path = "../flux-platform" }
 serde.workspace = true
 serde_json.workspace = true
 
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
 flux-testkit = { path = "../flux-testkit" }
 tempfile = "3"

@@ -7,8 +7,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use flux_core::{
-    AdministrativeState, ConfigurationChangeReport, ControlClient, ControlError, ControlSnapshot,
-    KernelSupport, LegacyControlBridge, LegacyDispatcher, LegacyIntent, OperationReport, Reason,
+    AdministrativeState, ConfigurationChangeClient, ConfigurationChangeReport, ControlClient,
+    ControlError, ControlSnapshot, ControlSnapshotSource, KernelSupport, LegacyControlBridge,
+    LegacyDispatcher, LegacyIntent, OperationReport, Reason,
 };
 use flux_platform::{
     KernelReleaseSource, LegacyScriptPaths, ProcessLegacyDispatcher, ShutdownSignal,
@@ -45,7 +46,7 @@ impl DaemonOptions {
             .unwrap_or_else(default_shell);
         let intent_path = env::var_os("FLUXD_INTENT_PATH")
             .map(PathBuf::from)
-            .unwrap_or_else(|| root.join("run/administrative-intent.json"));
+            .unwrap_or_else(|| root.join("state/administrative-intent.json"));
         let boot_id_path = env::var_os("FLUX_BOOT_ID_PATH")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(DEFAULT_BOOT_ID_PATH));
@@ -86,6 +87,12 @@ pub fn run_daemon<S>(kernel_source: &S, options: DaemonOptions) -> Result<(), Da
 where
     S: KernelReleaseSource,
 {
+    // Block process-directed termination before any daemon worker can be
+    // created. Every in-process thread then inherits the mask, leaving
+    // signalfd as the sole shutdown consumer. Legacy children explicitly
+    // restore a clean mask in ProcessLegacyDispatcher before exec.
+    let shutdown = ShutdownSignal::install()
+        .map_err(|error| DaemonError::Socket(ControlSocketError::Platform(error)))?;
     let release = kernel_source
         .kernel_release()
         .map_err(|error| DaemonError::Kernel(error.to_string()))?;
@@ -104,21 +111,11 @@ where
             let dispatcher = PersistingLegacyDispatcher { dispatcher, store };
             let bridge = LegacyControlBridge::start(dispatcher, options.queue_capacity)
                 .map_err(DaemonError::Control)?;
-            let initial_result = bridge
+            bridge
                 .submit(initial_intent)
                 .map_err(DaemonError::Control)?
-                .wait();
-            match initial_result {
-                Ok(_) => {}
-                Err(error @ ControlError::Persistence(_)) => {
-                    return Err(DaemonError::Control(error));
-                }
-                Err(error) => {
-                    eprintln!(
-                        "fluxd: startup reconciliation failed; control socket remains available: {error}"
-                    );
-                }
-            }
+                .wait()
+                .map_err(DaemonError::Control)?;
             DaemonControl::Bridge(bridge)
         }
         KernelSupport::Unsupported { .. } => DaemonControl::Unsupported,
@@ -126,11 +123,6 @@ where
 
     let server = ControlSocketServer::bind(&options.socket_path, kernel_support, control)
         .map_err(DaemonError::Socket)?;
-    // Install the signal mask only after the legacy writer thread has started.
-    // Child scripts inherit that worker's unblocked mask and keep normal
-    // SIGTERM behavior, while the main thread consumes shutdown via signalfd.
-    let shutdown = ShutdownSignal::install()
-        .map_err(|error| DaemonError::Socket(ControlSocketError::Platform(error)))?;
     server
         .serve_until(|| shutdown.received().map_err(ControlSocketError::Platform))
         .map_err(DaemonError::Socket)?;
@@ -150,21 +142,18 @@ impl ControlClient for DaemonControl {
             Self::Unsupported => Err(ControlError::BridgeStopped),
         }
     }
+}
 
+impl ControlSnapshotSource for DaemonControl {
     fn snapshot(&self) -> Arc<ControlSnapshot> {
         match self {
             Self::Bridge(bridge) => bridge.snapshot(),
             Self::Unsupported => Arc::new(ControlSnapshot::default()),
         }
     }
+}
 
-    fn mark_configuration_dirty(&self) -> Result<u64, ControlError> {
-        match self {
-            Self::Bridge(bridge) => bridge.mark_configuration_dirty(),
-            Self::Unsupported => Err(ControlError::BridgeStopped),
-        }
-    }
-
+impl ConfigurationChangeClient for DaemonControl {
     fn configuration_changed(
         &self,
         reason: Reason,
@@ -193,7 +182,11 @@ where
         };
         if let Some(state) = state {
             self.store.persist(state).map_err(|error| {
-                ControlError::persistence(format!("administrative intent: {error}"))
+                ControlError::persistence(
+                    "write administrative intent",
+                    error,
+                    "repair the Flux state directory and restart fluxd",
+                )
             })?;
         }
         self.dispatcher.execute(intent)

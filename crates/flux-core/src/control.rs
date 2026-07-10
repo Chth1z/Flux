@@ -83,28 +83,28 @@ pub trait LegacyDispatcher: Send + 'static {
 
 pub trait ControlClient {
     fn submit_and_wait(&self, intent: LegacyIntent) -> Result<OperationReport, ControlError>;
+}
 
+pub trait ControlSnapshotSource {
     #[must_use]
-    fn snapshot(&self) -> Arc<ControlSnapshot> {
-        Arc::new(ControlSnapshot::default())
-    }
+    fn snapshot(&self) -> Arc<ControlSnapshot>;
+}
 
-    fn mark_configuration_dirty(&self) -> Result<u64, ControlError> {
-        Err(ControlError::BridgeStopped)
-    }
-
+pub trait ConfigurationChangeClient {
     fn configuration_changed(
         &self,
         reason: Reason,
-    ) -> Result<ConfigurationChangeReport, ControlError> {
-        if self.snapshot().administrative_state == AdministrativeState::Running {
-            self.submit_and_wait(LegacyIntent::Reload { reason })
-                .map(ConfigurationChangeReport::Reloaded)
-        } else {
-            self.mark_configuration_dirty()
-                .map(|revision| ConfigurationChangeReport::Deferred { revision })
-        }
-    }
+    ) -> Result<ConfigurationChangeReport, ControlError>;
+}
+
+pub trait ControlService:
+    ControlClient + ControlSnapshotSource + ConfigurationChangeClient
+{
+}
+
+impl<T> ControlService for T where
+    T: ControlClient + ControlSnapshotSource + ConfigurationChangeClient
+{
 }
 
 pub struct LegacyControlBridge {
@@ -139,7 +139,7 @@ impl LegacyControlBridge {
 
     pub fn submit(&self, intent: LegacyIntent) -> Result<OperationHandle, ControlError> {
         let sender = self.sender.as_ref().ok_or(ControlError::BridgeStopped)?;
-        let (completion_tx, completion_rx) = mpsc::channel();
+        let (completion_tx, completion_rx) = mpsc::sync_channel(1);
         sender
             .try_send(WorkerRequest::Execute {
                 intent,
@@ -156,7 +156,7 @@ impl LegacyControlBridge {
 
     pub fn mark_configuration_dirty(&self) -> Result<u64, ControlError> {
         let sender = self.sender.as_ref().ok_or(ControlError::BridgeStopped)?;
-        let (completion_tx, completion_rx) = mpsc::channel();
+        let (completion_tx, completion_rx) = mpsc::sync_channel(1);
         sender
             .try_send(WorkerRequest::MarkConfigurationDirty { completion_tx })
             .map_err(|error| match error {
@@ -173,7 +173,7 @@ impl LegacyControlBridge {
         reason: Reason,
     ) -> Result<ConfigurationChangeReport, ControlError> {
         let sender = self.sender.as_ref().ok_or(ControlError::BridgeStopped)?;
-        let (completion_tx, completion_rx) = mpsc::channel();
+        let (completion_tx, completion_rx) = mpsc::sync_channel(1);
         sender
             .try_send(WorkerRequest::ConfigurationChanged {
                 reason,
@@ -201,15 +201,15 @@ impl ControlClient for LegacyControlBridge {
     fn submit_and_wait(&self, intent: LegacyIntent) -> Result<OperationReport, ControlError> {
         self.submit(intent)?.wait()
     }
+}
 
+impl ControlSnapshotSource for LegacyControlBridge {
     fn snapshot(&self) -> Arc<ControlSnapshot> {
         LegacyControlBridge::snapshot(self)
     }
+}
 
-    fn mark_configuration_dirty(&self) -> Result<u64, ControlError> {
-        LegacyControlBridge::mark_configuration_dirty(self)
-    }
-
+impl ConfigurationChangeClient for LegacyControlBridge {
     fn configuration_changed(
         &self,
         reason: Reason,
@@ -241,14 +241,18 @@ impl OperationHandle {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum ControlError {
     InvalidQueueCapacity,
     QueueFull,
     BridgeStopped,
     OperationAlreadyConsumed,
     WorkerStart(String),
-    Persistence(String),
+    Persistence {
+        operation: &'static str,
+        source: Arc<dyn Error + Send + Sync>,
+        recovery: &'static str,
+    },
     Dispatcher(String),
 }
 
@@ -259,8 +263,15 @@ impl ControlError {
     }
 
     #[must_use]
-    pub fn persistence(message: impl Into<String>) -> Self {
-        Self::Persistence(message.into())
+    pub fn persistence<E>(operation: &'static str, source: E, recovery: &'static str) -> Self
+    where
+        E: Error + Send + Sync + 'static,
+    {
+        Self::Persistence {
+            operation,
+            source: Arc::new(source),
+            recovery,
+        }
     }
 }
 
@@ -278,27 +289,44 @@ impl fmt::Display for ControlError {
             Self::WorkerStart(message) => {
                 write!(formatter, "cannot start legacy writer: {message}")
             }
-            Self::Persistence(message) => {
-                write!(formatter, "cannot persist control state: {message}")
-            }
+            Self::Persistence {
+                operation,
+                source,
+                recovery,
+            } => write!(
+                formatter,
+                "cannot persist control state during {operation}: {source}; recovery: {recovery}"
+            ),
             Self::Dispatcher(message) => write!(formatter, "legacy dispatcher failed: {message}"),
         }
     }
 }
 
-impl Error for ControlError {}
+impl Error for ControlError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Persistence { source, .. } => Some(source.as_ref()),
+            Self::InvalidQueueCapacity
+            | Self::QueueFull
+            | Self::BridgeStopped
+            | Self::OperationAlreadyConsumed
+            | Self::WorkerStart(_)
+            | Self::Dispatcher(_) => None,
+        }
+    }
+}
 
 enum WorkerRequest {
     Execute {
         intent: LegacyIntent,
-        completion_tx: mpsc::Sender<Result<OperationReport, ControlError>>,
+        completion_tx: mpsc::SyncSender<Result<OperationReport, ControlError>>,
     },
     MarkConfigurationDirty {
-        completion_tx: mpsc::Sender<Result<u64, ControlError>>,
+        completion_tx: mpsc::SyncSender<Result<u64, ControlError>>,
     },
     ConfigurationChanged {
         reason: Reason,
-        completion_tx: mpsc::Sender<Result<ConfigurationChangeReport, ControlError>>,
+        completion_tx: mpsc::SyncSender<Result<ConfigurationChangeReport, ControlError>>,
     },
 }
 

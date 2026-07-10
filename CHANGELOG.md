@@ -8,6 +8,7 @@ All notable changes to the Flux project will be documented in this file.
 - Added the `fluxd` Rust daemon, versioned root-only `SOCK_SEQPACKET` control protocol, live status/ping, raw event forwarding, and serialized legacy control.
 - Enforced the Linux 5.10 minimum while keeping unsupported devices queryable without networking mutation.
 - Added boot-ID-scoped administrative-intent recovery, bounded concurrent clients, peer credential checks, graceful signal handling, and stale-socket recovery.
+- Hardened startup admission with bounded request-result deduplication, symlink-safe durable state I/O, and process-wide signalfd delivery while preserving normal child-process signals.
 - Moved boot launch to module-local `service.sh`; mutating `fluxctl` commands no longer bypass the daemon.
 - Added pinned Android build and Magisk staging contracts while retaining `addrsyncd` as the bridge-release rollback binary.
 

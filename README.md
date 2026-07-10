@@ -170,6 +170,9 @@ All module files are located at `/data/adb/flux/`:
 │   ├── settings.ini          # User configuration file
 │   └── template.json         # Configuration template
 │
+├── state/
+│   └── administrative-intent.json # Boot-scoped durable fluxd intent
+│
 ├── run/
 │   ├── flux.log              # Module runtime logs
 │   ├── sing-box.pid          # Sing-box process PID

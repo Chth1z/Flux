@@ -16,6 +16,7 @@ pub use daemon::{DaemonError, DaemonOptions, run_daemon};
 pub use intent_store::{AdministrativeIntentStore, IntentStoreError};
 pub use protocol::{
     DaemonSnapshot, EventDisposition, EventReport, MAX_CONTROL_PACKET_BYTES, ProtocolHandler,
+    RequestPeerId,
 };
 pub use socket::{ControlSocketError, ControlSocketServer, SocketControlClient};
 

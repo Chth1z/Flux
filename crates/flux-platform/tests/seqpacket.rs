@@ -7,7 +7,7 @@ use std::sync::{Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use flux_platform::{PlatformError, SeqpacketConnection, SeqpacketListener};
+use flux_platform::{PlatformError, SeqpacketConnection, SeqpacketListener, Uid};
 use tempfile::tempdir;
 
 const STALE_SOCKET_HELPER_ENV: &str = "FLUX_SEQPACKET_STALE_SOCKET_HELPER";
@@ -265,7 +265,8 @@ fn accepted_connection_reports_kernel_peer_credentials() {
 
     assert_eq!(credentials.pid(), std::process::id());
     // SAFETY: these functions have no pointer arguments or preconditions.
-    assert_eq!(credentials.uid(), unsafe { libc::geteuid() });
+    let effective_uid = Uid::from_raw(unsafe { libc::geteuid() }).expect("valid effective UID");
+    assert_eq!(credentials.uid(), effective_uid);
     // SAFETY: these functions have no pointer arguments or preconditions.
     assert_eq!(credentials.gid(), unsafe { libc::getegid() });
 }
@@ -286,16 +287,17 @@ fn root_peer_validation_uses_kernel_credentials() {
     let _client = SeqpacketConnection::connect(&socket_path).expect("connect client");
     let result = server.join().expect("server thread");
     // SAFETY: `geteuid` has no pointer arguments or preconditions.
-    let effective_uid = unsafe { libc::geteuid() };
-    if effective_uid == 0 {
+    let effective_uid = Uid::from_raw(unsafe { libc::geteuid() }).expect("valid effective UID");
+    if effective_uid.is_root() {
         assert!(result.expect("root peer must be accepted").is_root());
     } else {
         match result.expect_err("non-root peer must be rejected") {
             PlatformError::PeerUidMismatch {
-                expected_uid: 0,
-                uid,
-                ..
-            } => assert_eq!(uid, effective_uid),
+                expected_uid, uid, ..
+            } => {
+                assert_eq!(expected_uid, Uid::ROOT);
+                assert_eq!(uid, effective_uid);
+            }
             other => panic!("unexpected validation error: {other}"),
         }
     }
@@ -320,7 +322,8 @@ fn same_effective_user_validation_accepts_the_local_client() {
         .expect("server thread")
         .expect("same effective user must be accepted");
     // SAFETY: `geteuid` has no pointer arguments or preconditions.
-    assert_eq!(credentials.uid(), unsafe { libc::geteuid() });
+    let effective_uid = Uid::from_raw(unsafe { libc::geteuid() }).expect("valid effective UID");
+    assert_eq!(credentials.uid(), effective_uid);
 }
 
 #[test]

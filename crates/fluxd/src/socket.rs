@@ -6,21 +6,25 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use flux_core::{ControlClient, ControlError, KernelSupport, LegacyIntent, OperationReport};
+use flux_core::{
+    ControlClient, ControlError, ControlService, KernelSupport, LegacyIntent, OperationReport,
+};
 use flux_platform::{PlatformError, SeqpacketConnection, SeqpacketListener};
 
 use crate::protocol::{
     decode_control_response, decode_event_response, decode_ping_response, decode_status_response,
     encode_control_request, encode_event_request, encode_ping_request, encode_status_request,
 };
-use crate::{DaemonSnapshot, EventReport, MAX_CONTROL_PACKET_BYTES, ProtocolHandler};
+use crate::{
+    DaemonSnapshot, EventReport, MAX_CONTROL_PACKET_BYTES, ProtocolHandler, RequestPeerId,
+};
 
 const MAX_CONCURRENT_CONTROL_CLIENTS: usize = 16;
+static NEXT_CONTROL_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
 pub struct SocketControlClient {
     path: PathBuf,
-    next_request_id: AtomicU64,
 }
 
 impl SocketControlClient {
@@ -28,7 +32,6 @@ impl SocketControlClient {
     pub fn new(path: impl AsRef<Path>) -> Self {
         Self {
             path: path.as_ref().to_owned(),
-            next_request_id: AtomicU64::new(1),
         }
     }
 
@@ -59,7 +62,7 @@ impl SocketControlClient {
     }
 
     fn next_request_id(&self) -> u64 {
-        self.next_request_id.fetch_add(1, Ordering::Relaxed)
+        NEXT_CONTROL_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
     }
 
     fn exchange(&self, request: &[u8]) -> Result<Vec<u8>, ControlError> {
@@ -96,7 +99,7 @@ pub struct ControlSocketServer<C> {
 
 impl<C> ControlSocketServer<C>
 where
-    C: ControlClient + Send + Sync + 'static,
+    C: ControlService + Send + Sync + 'static,
 {
     pub fn bind(
         path: impl AsRef<Path>,
@@ -198,15 +201,16 @@ fn serve_connection<C>(
     connection: &SeqpacketConnection,
 ) -> Result<(), ControlSocketError>
 where
-    C: ControlClient,
+    C: ControlService,
 {
-    connection
+    let credentials = connection
         .require_same_effective_user()
         .map_err(ControlSocketError::Platform)?;
     let request = connection
         .recv_packet(MAX_CONTROL_PACKET_BYTES)
         .map_err(ControlSocketError::Platform)?;
-    let response = handler.handle(&request);
+    let peer = RequestPeerId::new(credentials.uid(), credentials.pid());
+    let response = handler.handle_for_peer(&request, peer);
     connection
         .send_packet(&response)
         .map_err(ControlSocketError::Platform)

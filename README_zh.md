@@ -162,6 +162,9 @@ graph TD
 │   ├── settings.ini          # 用户配置文件
 │   └── template.json         # 配置模板
 │
+├── state/
+│   └── administrative-intent.json # 按启动周期持久化的 fluxd 管理意图
+│
 ├── run/
 │   ├── flux.log              # 模块运行日志
 │   ├── sing-box.pid          # sing-box 进程 PID

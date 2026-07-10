@@ -7,6 +7,7 @@
 - [Implementation roadmap](architecture/implementation-roadmap.md) — phased migration and verification gates.
 - [Controller interface comparison](architecture/interface-comparison.md) — three alternative Interfaces and the selected hybrid.
 - [Domain language](../CONTEXT.md) — canonical project terms.
+- [Development and build workflow](development.md) — pinned Rust/Android toolchains and verification commands.
 
 ## Research
 
@@ -32,4 +33,3 @@
 - [ADR-0006: audited mark allocation](adr/0006-allocate-marks-after-android-conflict-analysis.md)
 - [ADR-0007: respect Android VPN policy](adr/0007-respect-android-vpn-policy-by-default.md)
 - [ADR-0008: minimal Controller, internal planner](adr/0008-minimal-controller-with-internal-strategy-planner.md)
-

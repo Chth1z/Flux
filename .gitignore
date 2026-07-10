@@ -9,4 +9,5 @@ run/
 lrqibazk/
 bin/
 /target/
+/dist/
 /ebpf/target/

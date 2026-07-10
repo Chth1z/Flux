@@ -1,0 +1,28 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.93.0
+          components: clippy,rustfmt
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo xtask ci
+      - name: Check legacy addrsyncd compatibility
+        run: |
+          cargo test --manifest-path addrsyncd/Cargo.toml
+          cargo clippy --manifest-path addrsyncd/Cargo.toml --all-targets -- -D warnings
+          cargo check --manifest-path addrsyncd/Cargo.toml --target aarch64-linux-android --all-targets

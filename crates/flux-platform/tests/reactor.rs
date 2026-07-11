@@ -35,10 +35,9 @@ impl SignalHandlerGuard {
         // SAFETY: zeroed storage is valid for receiving the previous action.
         let mut previous = unsafe { std::mem::zeroed::<libc::sigaction>() };
         // SAFETY: both pointers reference initialized/writable sigaction values.
-        assert_eq!(
-            unsafe { libc::sigaction(libc::SIGUSR1, &raw const action, &raw mut previous,) },
-            0
-        );
+        let install_result =
+            unsafe { libc::sigaction(libc::SIGUSR1, &raw const action, &raw mut previous) };
+        assert_eq!(install_result, 0);
         Self { previous }
     }
 }
@@ -444,10 +443,9 @@ fn termination_signal_wakes_the_reactor_through_signalfd() {
     thread::sleep(Duration::from_millis(20));
     // SAFETY: `native_thread` names the live reactor thread, where SIGTERM was
     // blocked before its signalfd was registered with epoll.
-    assert_eq!(
-        unsafe { libc::pthread_kill(running.native_thread as libc::pthread_t, libc::SIGTERM) },
-        0
-    );
+    let kill_result =
+        unsafe { libc::pthread_kill(running.native_thread as libc::pthread_t, libc::SIGTERM) };
+    assert_eq!(kill_result, 0);
     wait_until(Duration::from_secs(1), || running.thread.is_finished());
     running
         .thread
@@ -473,10 +471,9 @@ fn reactor_keeps_waiting_after_epoll_is_interrupted() {
     thread::sleep(Duration::from_millis(20));
     // SAFETY: `native_thread` names the live reactor thread and SIGUSR1 has a
     // process-wide non-restarting handler for the duration of this test.
-    assert_eq!(
-        unsafe { libc::pthread_kill(running.native_thread as libc::pthread_t, libc::SIGUSR1) },
-        0
-    );
+    let kill_result =
+        unsafe { libc::pthread_kill(running.native_thread as libc::pthread_t, libc::SIGUSR1) };
+    assert_eq!(kill_result, 0);
     thread::sleep(Duration::from_millis(10));
     let _client = SeqpacketConnection::connect(&socket_path).expect("connect after signal");
     handled_rx
@@ -640,10 +637,8 @@ fn exercise_partial_bind_failure(socket_path: &Path) {
         rlim_max: 0,
     };
     // SAFETY: `original_limit` is writable storage for one rlimit value.
-    assert_eq!(
-        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut original_limit) },
-        0
-    );
+    let get_limit_result = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut original_limit) };
+    assert_eq!(get_limit_result, 0);
     let constrained_limit = libc::rlimit {
         rlim_cur: maximum_observed_fd.saturating_add(32),
         rlim_max: original_limit.rlim_max,
@@ -651,10 +646,9 @@ fn exercise_partial_bind_failure(socket_path: &Path) {
     assert!(constrained_limit.rlim_cur <= constrained_limit.rlim_max);
     // SAFETY: `constrained_limit` is initialized and only lowers this helper
     // process's soft descriptor limit.
-    assert_eq!(
-        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const constrained_limit) },
-        0
-    );
+    let set_limit_result =
+        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const constrained_limit) };
+    assert_eq!(set_limit_result, 0);
 
     let mut fillers = Vec::new();
     let saturation_error = loop {
@@ -694,10 +688,9 @@ fn signal_is_blocked(signal: libc::c_int) -> bool {
     let mut current = std::mem::MaybeUninit::<libc::sigset_t>::zeroed();
     // SAFETY: a null set pointer queries the calling thread's current mask and
     // `current` is writable storage for the result.
-    assert_eq!(
-        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), current.as_mut_ptr()) },
-        0
-    );
+    let mask_result =
+        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), current.as_mut_ptr()) };
+    assert_eq!(mask_result, 0);
     // SAFETY: pthread_sigmask initialized the complete signal set above.
     let current = unsafe { current.assume_init() };
     // SAFETY: `current` is initialized and `signal` is a valid POSIX signal.

@@ -439,9 +439,8 @@ mod implementation {
             };
             if accepted >= 0 {
                 // SAFETY: a successful `accept4` returns a new owned descriptor.
-                return Ok(SeqpacketConnection {
-                    fd: unsafe { OwnedFd::from_raw_fd(accepted) },
-                });
+                let accepted_fd = unsafe { OwnedFd::from_raw_fd(accepted) };
+                return Ok(SeqpacketConnection { fd: accepted_fd });
             }
             let source = std::io::Error::last_os_error();
             if source.raw_os_error() != Some(libc::EINTR) {

@@ -32,10 +32,9 @@ impl SignalHandlerGuard {
         // SAFETY: zeroed storage is valid for receiving the previous action.
         let mut previous = unsafe { std::mem::zeroed::<libc::sigaction>() };
         // SAFETY: both pointers reference initialized/writable sigaction values.
-        assert_eq!(
-            unsafe { libc::sigaction(libc::SIGUSR1, &raw const action, &raw mut previous,) },
-            0
-        );
+        let install_result =
+            unsafe { libc::sigaction(libc::SIGUSR1, &raw const action, &raw mut previous) };
+        assert_eq!(install_result, 0);
         Self { previous }
     }
 }
@@ -211,10 +210,9 @@ fn accept_timeout_keeps_waiting_after_signal_interruption() {
     thread::sleep(Duration::from_millis(20));
     // SAFETY: `server_thread` names the live server thread and SIGUSR1 has a
     // process-wide non-restarting handler installed for this test.
-    assert_eq!(
-        unsafe { libc::pthread_kill(server_thread as libc::pthread_t, libc::SIGUSR1) },
-        0
-    );
+    let kill_result =
+        unsafe { libc::pthread_kill(server_thread as libc::pthread_t, libc::SIGUSR1) };
+    assert_eq!(kill_result, 0);
 
     let (timed_out, elapsed) = server.join().expect("server thread");
     assert!(timed_out);
@@ -369,10 +367,9 @@ fn recv_packet_retries_after_signal_interruption() {
     thread::sleep(Duration::from_millis(20));
     // SAFETY: `server_thread` names the live server thread and SIGUSR1 has a
     // process-wide non-restarting handler installed for this test.
-    assert_eq!(
-        unsafe { libc::pthread_kill(server_thread as libc::pthread_t, libc::SIGUSR1) },
-        0
-    );
+    let kill_result =
+        unsafe { libc::pthread_kill(server_thread as libc::pthread_t, libc::SIGUSR1) };
+    assert_eq!(kill_result, 0);
     thread::sleep(Duration::from_millis(10));
     client.send_packet(b"request").expect("send after signal");
 
@@ -407,10 +404,9 @@ fn accept_retries_after_signal_interruption() {
     thread::sleep(Duration::from_millis(20));
     // SAFETY: `server_thread` names the live server thread and SIGUSR1 has a
     // process-wide non-restarting handler installed for this test.
-    assert_eq!(
-        unsafe { libc::pthread_kill(server_thread as libc::pthread_t, libc::SIGUSR1) },
-        0
-    );
+    let kill_result =
+        unsafe { libc::pthread_kill(server_thread as libc::pthread_t, libc::SIGUSR1) };
+    assert_eq!(kill_result, 0);
     thread::sleep(Duration::from_millis(10));
     let client = SeqpacketConnection::connect(&socket_path).expect("connect after signal");
     client.send_packet(b"request").expect("send request");
@@ -487,10 +483,9 @@ fn send_packet_retries_after_signal_interruption() {
 
     // SAFETY: `sender_thread` names the live sender thread and SIGUSR1 has a
     // process-wide non-restarting handler installed for this test.
-    assert_eq!(
-        unsafe { libc::pthread_kill(sender_thread as libc::pthread_t, libc::SIGUSR1) },
-        0
-    );
+    let kill_result =
+        unsafe { libc::pthread_kill(sender_thread as libc::pthread_t, libc::SIGUSR1) };
+    assert_eq!(kill_result, 0);
     thread::sleep(Duration::from_millis(10));
     drain_tx.send(()).expect("allow server to drain packets");
 

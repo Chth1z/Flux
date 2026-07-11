@@ -40,9 +40,14 @@ mod implementation {
             }
             // SAFETY: sigemptyset initialized `mask`; each call only mutates
             // that set and accepts the named POSIX signal number.
-            if unsafe { libc::sigaddset(mask.as_mut_ptr(), libc::SIGINT) } != 0
-                || unsafe { libc::sigaddset(mask.as_mut_ptr(), libc::SIGTERM) } != 0
-            {
+            let add_sigint_result = unsafe { libc::sigaddset(mask.as_mut_ptr(), libc::SIGINT) };
+            if add_sigint_result != 0 {
+                return Err(last_error("populate shutdown signal set"));
+            }
+            // SAFETY: sigemptyset initialized `mask`; this call only mutates
+            // that set and accepts the named POSIX signal number.
+            let add_sigterm_result = unsafe { libc::sigaddset(mask.as_mut_ptr(), libc::SIGTERM) };
+            if add_sigterm_result != 0 {
                 return Err(last_error("populate shutdown signal set"));
             }
             // SAFETY: the successful calls above initialized the full sigset_t.

@@ -11,10 +11,8 @@ fn blocked_termination_signal_is_consumed_through_signalfd() {
 
     // SAFETY: pthread_self returns the live current thread and SIGTERM is
     // blocked by ShutdownSignal before it is delivered.
-    assert_eq!(
-        unsafe { libc::pthread_kill(libc::pthread_self(), libc::SIGTERM) },
-        0
-    );
+    let kill_result = unsafe { libc::pthread_kill(libc::pthread_self(), libc::SIGTERM) };
+    assert_eq!(kill_result, 0);
 
     let deadline = Instant::now() + Duration::from_secs(1);
     loop {
@@ -49,10 +47,9 @@ fn signal_is_blocked(signal: libc::c_int) -> bool {
     let mut current = std::mem::MaybeUninit::<libc::sigset_t>::zeroed();
     // SAFETY: a null set pointer queries the calling thread's current mask and
     // `current` is writable storage for the result.
-    assert_eq!(
-        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), current.as_mut_ptr()) },
-        0
-    );
+    let mask_result =
+        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), current.as_mut_ptr()) };
+    assert_eq!(mask_result, 0);
     // SAFETY: pthread_sigmask initialized the complete signal set above.
     let current = unsafe { current.assume_init() };
     // SAFETY: `current` is initialized and `signal` is a valid POSIX signal.

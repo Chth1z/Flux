@@ -16,6 +16,42 @@ pub enum StopDisposition {
 }
 
 #[derive(Debug)]
+pub enum NetworkInventoryDegradation {
+    Initialization(PlatformError),
+    DescriptorFailure { events: u32 },
+    Runtime(PlatformError),
+}
+
+impl fmt::Display for NetworkInventoryDegradation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Initialization(error) => {
+                write!(
+                    formatter,
+                    "initialize network inventory observation: {error}"
+                )
+            }
+            Self::DescriptorFailure { events } => write!(
+                formatter,
+                "network inventory descriptor reported epoll events 0x{events:x}"
+            ),
+            Self::Runtime(error) => {
+                write!(formatter, "drive network inventory observation: {error}")
+            }
+        }
+    }
+}
+
+impl Error for NetworkInventoryDegradation {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Initialization(error) | Self::Runtime(error) => Some(error),
+            Self::DescriptorFailure { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug)]
 pub enum ReactorError {
     Platform(PlatformError),
     WorkerSpawn {
@@ -95,14 +131,24 @@ mod implementation {
     use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
     use std::sync::{Arc, Mutex, MutexGuard};
     use std::thread::{self, JoinHandle};
+    use std::time::Instant;
 
-    use super::{MAX_ACCEPTS_PER_TURN, MAX_WORKERS, ReactorError, StopDisposition};
+    use super::{
+        MAX_ACCEPTS_PER_TURN, MAX_WORKERS, NetworkInventoryDegradation, ReactorError,
+        StopDisposition,
+    };
+    use crate::address_sync::AddressEventPolicy;
+    use crate::network_observer::NetworkInventorySource;
+    use crate::network_observer::driver::{
+        RouteNetworkInventoryDriver, RouteNetworkInventoryWorkBudget,
+    };
     use crate::{PlatformError, SeqpacketConnection, SeqpacketListener, ShutdownSignal};
 
     const LISTENER_TOKEN: u64 = 1;
     const SHUTDOWN_TOKEN: u64 = 2;
     const WAKE_TOKEN: u64 = 3;
-    const EPOLL_EVENT_CAPACITY: usize = 3;
+    const NETWORK_INVENTORY_TOKEN: u64 = 4;
+    const EPOLL_EVENT_CAPACITY: usize = 4;
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum StopPhase {
@@ -272,6 +318,38 @@ mod implementation {
         listener: bool,
         shutdown: bool,
         wake: bool,
+        network_inventory: bool,
+        network_inventory_failure: Option<u32>,
+    }
+
+    struct NetworkInventoryRegistration {
+        driver: RouteNetworkInventoryDriver,
+        on_degradation: Box<dyn FnOnce(NetworkInventoryDegradation) + Send>,
+    }
+
+    impl NetworkInventoryRegistration {
+        fn next_deadline(&self) -> Option<Instant> {
+            self.driver.next_deadline()
+        }
+
+        fn drive_ready(&mut self, now: Instant) -> Result<(), PlatformError> {
+            self.driver
+                .drive_ready(RouteNetworkInventoryWorkBudget::default(), now)
+                .map(|_| ())
+        }
+
+        fn drive_due(&mut self, now: Instant) -> Result<(), PlatformError> {
+            self.driver.drive_due(now).map(|_| ())
+        }
+
+        fn degrade(mut self, degradation: NetworkInventoryDegradation) {
+            self.driver.disable();
+            (self.on_degradation)(degradation);
+        }
+
+        fn disable(mut self) {
+            self.driver.disable();
+        }
     }
 
     pub struct DaemonReactor {
@@ -284,6 +362,7 @@ mod implementation {
         completion_receiver: Receiver<WorkerCompletion>,
         workers: HashMap<u64, JoinHandle<()>>,
         next_worker_id: u64,
+        network_inventory: Option<NetworkInventoryRegistration>,
         // Keep this last: its field drop restores the installing thread's
         // signal mask only after every other daemon-owned value is gone.
         shutdown: ShutdownSignal,
@@ -321,10 +400,48 @@ mod implementation {
                     completion_receiver,
                     workers: HashMap::with_capacity(MAX_WORKERS),
                     next_worker_id: 1,
+                    network_inventory: None,
                     shutdown,
                 },
                 stop,
             ))
+        }
+
+        pub fn bind_with_network_inventory<H, D>(
+            path: impl AsRef<Path>,
+            shutdown: ShutdownSignal,
+            handler: H,
+            on_degradation: D,
+        ) -> Result<(Self, ReactorStopHandle, Option<NetworkInventorySource>), ReactorError>
+        where
+            H: Fn(SeqpacketConnection) + Send + Sync + 'static,
+            D: FnOnce(NetworkInventoryDegradation) + Send + 'static,
+        {
+            let (mut reactor, stop) = Self::bind(path, shutdown, handler)?;
+            let (mut driver, source) = match RouteNetworkInventoryDriver::open(
+                AddressEventPolicy::new(true),
+                Instant::now(),
+            ) {
+                Ok(opened) => opened,
+                Err(error) => {
+                    on_degradation(NetworkInventoryDegradation::Initialization(error));
+                    return Ok((reactor, stop, None));
+                }
+            };
+            if let Err(error) = add_epoll_interest(
+                reactor.epoll.as_raw_fd(),
+                driver.readiness_fd(),
+                NETWORK_INVENTORY_TOKEN,
+            ) {
+                driver.disable();
+                on_degradation(NetworkInventoryDegradation::Initialization(error));
+                return Ok((reactor, stop, None));
+            }
+            reactor.network_inventory = Some(NetworkInventoryRegistration {
+                driver,
+                on_degradation: Box::new(on_degradation),
+            });
+            Ok((reactor, stop, Some(source)))
         }
 
         pub fn run(mut self) -> Result<(), ReactorError> {
@@ -362,12 +479,46 @@ mod implementation {
                 if ready.listener {
                     self.dispatch_ready_connections()?;
                 }
+                if self.wake.is_stopping() {
+                    return Ok(());
+                }
+
+                if let Some(events) = ready.network_inventory_failure {
+                    self.degrade_network_inventory(
+                        NetworkInventoryDegradation::DescriptorFailure { events },
+                    );
+                } else if ready.network_inventory {
+                    let error = self
+                        .network_inventory
+                        .as_mut()
+                        .and_then(|registration| registration.drive_ready(Instant::now()).err());
+                    if let Some(error) = error {
+                        self.degrade_network_inventory(NetworkInventoryDegradation::Runtime(error));
+                    }
+                }
+                if self.wake.is_stopping() {
+                    return Ok(());
+                }
+
+                let error = self
+                    .network_inventory
+                    .as_mut()
+                    .and_then(|registration| registration.drive_due(Instant::now()).err());
+                if let Some(error) = error {
+                    self.degrade_network_inventory(NetworkInventoryDegradation::Runtime(error));
+                }
             }
         }
 
         fn wait_for_ready_descriptors(&self) -> Result<ReadySet, ReactorError> {
             let mut events = [libc::epoll_event { events: 0, u64: 0 }; EPOLL_EVENT_CAPACITY];
             let count = loop {
+                let timeout = epoll_wait_timeout(
+                    Instant::now(),
+                    self.network_inventory
+                        .as_ref()
+                        .and_then(NetworkInventoryRegistration::next_deadline),
+                );
                 // SAFETY: `events` is writable for its full cardinality and the
                 // epoll descriptor remains valid for this blocking call.
                 let count = unsafe {
@@ -375,7 +526,7 @@ mod implementation {
                         self.epoll.as_raw_fd(),
                         events.as_mut_ptr(),
                         i32::try_from(events.len()).expect("event capacity fits c_int"),
-                        -1,
+                        timeout,
                     )
                 };
                 if count >= 0 {
@@ -387,32 +538,7 @@ mod implementation {
                 }
             };
 
-            let mut ready = ReadySet {
-                listener: false,
-                shutdown: false,
-                wake: false,
-            };
-            for event in &events[..count] {
-                let token = event.u64;
-                let flags = event.events;
-                let descriptor = descriptor_name(token)?;
-                if flags & u32::try_from(libc::EPOLLERR | libc::EPOLLHUP).unwrap_or(u32::MAX) != 0 {
-                    return Err(ReactorError::DescriptorFailure {
-                        descriptor,
-                        events: flags,
-                    });
-                }
-                if flags & u32::try_from(libc::EPOLLIN).unwrap_or_default() == 0 {
-                    continue;
-                }
-                match token {
-                    LISTENER_TOKEN => ready.listener = true,
-                    SHUTDOWN_TOKEN => ready.shutdown = true,
-                    WAKE_TOKEN => ready.wake = true,
-                    _ => return Err(ReactorError::UnknownEpollToken(token)),
-                }
-            }
-            Ok(ready)
+            classify_ready_events(&events[..count])
         }
 
         fn consume_shutdown_signals(&self) -> Result<(), ReactorError> {
@@ -546,6 +672,18 @@ mod implementation {
             Ok(())
         }
 
+        fn degrade_network_inventory(&mut self, degradation: NetworkInventoryDegradation) {
+            if let Some(registration) = self.network_inventory.take() {
+                registration.degrade(degradation);
+            }
+        }
+
+        fn disable_network_inventory(&mut self) {
+            if let Some(registration) = self.network_inventory.take() {
+                registration.disable();
+            }
+        }
+
         fn close_listener_and_drain(
             mut self,
             mut terminal_error: Option<ReactorError>,
@@ -556,6 +694,7 @@ mod implementation {
             // no new work can arrive while existing handlers are drained.
             drop(self.listener.take());
             self.listener_registered = false;
+            self.disable_network_inventory();
 
             for (worker_id, worker) in self.workers.drain() {
                 if worker.join().is_err() && terminal_error.is_none() {
@@ -577,12 +716,64 @@ mod implementation {
             self.wake.begin_shutdown();
             drop(self.listener.take());
             self.listener_registered = false;
+            self.disable_network_inventory();
             for (_worker_id, worker) in self.workers.drain() {
                 let _ = worker.join();
             }
             while self.completion_receiver.try_recv().is_ok() {}
             self.wake.mark_exited();
         }
+    }
+
+    fn classify_ready_events(events: &[libc::epoll_event]) -> Result<ReadySet, ReactorError> {
+        let mut ready = ReadySet {
+            listener: false,
+            shutdown: false,
+            wake: false,
+            network_inventory: false,
+            network_inventory_failure: None,
+        };
+        for event in events {
+            let token = event.u64;
+            let flags = event.events;
+            if token == NETWORK_INVENTORY_TOKEN {
+                if flags & u32::try_from(libc::EPOLLERR | libc::EPOLLHUP).unwrap_or(u32::MAX) != 0 {
+                    ready.network_inventory_failure = Some(flags);
+                } else if flags & u32::try_from(libc::EPOLLIN).unwrap_or_default() != 0 {
+                    ready.network_inventory = true;
+                }
+                continue;
+            }
+            let descriptor = descriptor_name(token)?;
+            if flags & u32::try_from(libc::EPOLLERR | libc::EPOLLHUP).unwrap_or(u32::MAX) != 0 {
+                return Err(ReactorError::DescriptorFailure {
+                    descriptor,
+                    events: flags,
+                });
+            }
+            if flags & u32::try_from(libc::EPOLLIN).unwrap_or_default() == 0 {
+                continue;
+            }
+            match token {
+                LISTENER_TOKEN => ready.listener = true,
+                SHUTDOWN_TOKEN => ready.shutdown = true,
+                WAKE_TOKEN => ready.wake = true,
+                _ => return Err(ReactorError::UnknownEpollToken(token)),
+            }
+        }
+        Ok(ready)
+    }
+
+    fn epoll_wait_timeout(now: Instant, deadline: Option<Instant>) -> i32 {
+        let Some(deadline) = deadline else {
+            return -1;
+        };
+        let remaining = deadline.saturating_duration_since(now);
+        if remaining.is_zero() {
+            return 0;
+        }
+        let milliseconds = remaining.as_nanos().div_ceil(1_000_000);
+        i32::try_from(milliseconds).unwrap_or(i32::MAX)
     }
 
     fn create_epoll() -> Result<OwnedFd, PlatformError> {
@@ -663,14 +854,74 @@ mod implementation {
     fn system_call_error(operation: &'static str, source: std::io::Error) -> PlatformError {
         PlatformError::SystemCall { operation, source }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use std::time::Duration;
+
+        use super::*;
+
+        #[test]
+        fn epoll_timeout_tracks_inventory_deadlines_without_oversleeping() {
+            let now = Instant::now();
+
+            assert_eq!(epoll_wait_timeout(now, None), -1);
+            assert_eq!(epoll_wait_timeout(now, Some(now)), 0);
+            assert_eq!(
+                epoll_wait_timeout(now, now.checked_add(Duration::from_nanos(1))),
+                1
+            );
+            assert_eq!(
+                epoll_wait_timeout(now, now.checked_add(Duration::from_nanos(1_000_001))),
+                2
+            );
+            assert_eq!(
+                epoll_wait_timeout(
+                    now,
+                    now.checked_add(Duration::from_millis(i32::MAX as u64 + 1)),
+                ),
+                i32::MAX
+            );
+        }
+
+        #[test]
+        fn route_descriptor_failure_is_degraded_while_core_failures_remain_fatal() {
+            let input = u32::try_from(libc::EPOLLIN).unwrap_or_default();
+            let hangup = u32::try_from(libc::EPOLLHUP).unwrap_or_default();
+            let ready = classify_ready_events(&[
+                libc::epoll_event {
+                    events: input,
+                    u64: LISTENER_TOKEN,
+                },
+                libc::epoll_event {
+                    events: hangup,
+                    u64: NETWORK_INVENTORY_TOKEN,
+                },
+            ])
+            .expect("route hangup is a degraded observation failure");
+
+            assert!(ready.listener);
+            assert_eq!(ready.network_inventory_failure, Some(hangup));
+            assert!(matches!(
+                classify_ready_events(&[libc::epoll_event {
+                    events: hangup,
+                    u64: LISTENER_TOKEN,
+                }]),
+                Err(ReactorError::DescriptorFailure {
+                    descriptor: "reactor listener",
+                    events,
+                }) if events == hangup
+            ));
+        }
+    }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 mod implementation {
     use std::path::Path;
 
-    use super::{ReactorError, StopDisposition};
-    use crate::{PlatformError, SeqpacketConnection, ShutdownSignal};
+    use super::{NetworkInventoryDegradation, ReactorError, StopDisposition};
+    use crate::{NetworkInventorySource, PlatformError, SeqpacketConnection, ShutdownSignal};
 
     pub struct DaemonReactor;
 
@@ -682,6 +933,19 @@ mod implementation {
         ) -> Result<(Self, ReactorStopHandle), ReactorError>
         where
             H: Fn(SeqpacketConnection) + Send + Sync + 'static,
+        {
+            Err(PlatformError::UnsupportedPlatform(std::env::consts::OS).into())
+        }
+
+        pub fn bind_with_network_inventory<H, D>(
+            _path: impl AsRef<Path>,
+            _shutdown: ShutdownSignal,
+            _handler: H,
+            _on_degradation: D,
+        ) -> Result<(Self, ReactorStopHandle, Option<NetworkInventorySource>), ReactorError>
+        where
+            H: Fn(SeqpacketConnection) + Send + Sync + 'static,
+            D: FnOnce(NetworkInventoryDegradation) + Send + 'static,
         {
             Err(PlatformError::UnsupportedPlatform(std::env::consts::OS).into())
         }

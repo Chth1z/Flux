@@ -39,8 +39,8 @@ const RTNLGRP_IPV6_RULE: u32 = 19;
 const AF_NETLINK: u16 = 16;
 const SOCKADDR_NL_LENGTH: u32 = 12;
 const MSG_TRUNC: i32 = 0x20;
-const RECEIVE_BATCH_SLOTS: usize = 8;
-const ROUTE_DATAGRAM_CAPACITY: usize = 64 * 1024;
+pub(crate) const RECEIVE_BATCH_SLOTS: usize = 8;
+pub(crate) const ROUTE_DATAGRAM_CAPACITY: usize = 64 * 1024;
 const ROUTE_SOCKET_RECEIVE_BUFFER_BYTES: i32 = 4 * 1024 * 1024;
 const MAX_EFFECTIVE_ROUTE_SOCKET_RECEIVE_BUFFER_BYTES: i32 = ROUTE_SOCKET_RECEIVE_BUFFER_BYTES * 2;
 
@@ -330,6 +330,7 @@ fn classify_batch(metadata: &[NetlinkDatagramMetadata]) -> BatchIntegrity {
 mod implementation {
     use std::fmt;
     use std::mem;
+    use std::num::NonZeroUsize;
     use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 
     use super::{
@@ -613,7 +614,9 @@ mod implementation {
         pub(crate) fn receive_batch<'a>(
             &self,
             ring: &'a mut NetlinkReceiveRing,
+            max_datagrams: NonZeroUsize,
         ) -> Result<NetlinkReceiveOutcome<'a>, PlatformError> {
+            let max_datagrams = max_datagrams.get().min(RECEIVE_BATCH_SLOTS);
             let received = loop {
                 ring.prepare();
                 // SAFETY: every mmsghdr points to one distinct fixed slab slot
@@ -623,7 +626,7 @@ mod implementation {
                     libc::recvmmsg(
                         self.fd.as_raw_fd(),
                         ring.headers.as_mut_ptr(),
-                        RECEIVE_BATCH_SLOTS as libc::c_uint,
+                        max_datagrams as libc::c_uint,
                         (libc::MSG_DONTWAIT | libc::MSG_TRUNC) as _,
                         std::ptr::null_mut(),
                     )
@@ -905,7 +908,7 @@ mod implementation {
             let mut ring = NetlinkReceiveRing::new();
             loop {
                 match socket
-                    .receive_batch(&mut ring)
+                    .receive_batch(&mut ring, NonZeroUsize::new(RECEIVE_BATCH_SLOTS).unwrap())
                     .expect("receive address dump")
                 {
                     NetlinkReceiveOutcome::WouldBlock => {
@@ -976,6 +979,7 @@ mod implementation {
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 mod implementation {
     use std::marker::PhantomData;
+    use std::num::NonZeroUsize;
 
     use super::{
         AddressDumpRequest, NetlinkDatagram, NetlinkDatagramMetadata, NetlinkReceiveOutcome,
@@ -1037,6 +1041,7 @@ mod implementation {
         pub(crate) fn receive_batch<'a>(
             &self,
             _ring: &'a mut NetlinkReceiveRing,
+            _max_datagrams: NonZeroUsize,
         ) -> Result<NetlinkReceiveOutcome<'a>, PlatformError> {
             Err(PlatformError::UnsupportedPlatform(std::env::consts::OS))
         }

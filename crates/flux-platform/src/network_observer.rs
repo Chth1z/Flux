@@ -13,6 +13,8 @@ use crate::address_sync::{
     AddressDatagram, AddressEventDecodeError, AddressEventKind, InterfaceAddressEvent,
 };
 
+pub(crate) mod driver;
+
 /// A cloneable view of the latest complete network inventory.
 ///
 /// Clones share immutable snapshots. `snapshot` returns `None` before the
@@ -322,6 +324,10 @@ impl NetworkInventoryObserver {
 
     pub(crate) fn note_dump_request_failure(&mut self) -> ObserverDriveOutcome {
         self.invalidate(ObserverFault::DumpRequestFailed)
+    }
+
+    pub(crate) fn disable(&mut self) {
+        self.mark_unsynchronized();
     }
 
     fn publish(

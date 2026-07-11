@@ -138,6 +138,64 @@ fn dropping_an_unrun_reactor_completes_cleanup_and_stop_state() {
 }
 
 #[test]
+fn inventory_enabled_reactor_publishes_without_displacing_control_work() {
+    let directory = tempdir().expect("temporary directory");
+    let socket_path = directory.path().join("fluxd.sock");
+    let (handled_tx, handled_rx) = mpsc::sync_channel(1);
+    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+    let reactor_path = socket_path.clone();
+    let thread = thread::spawn(move || {
+        let shutdown = ShutdownSignal::install().expect("install shutdown signal source");
+        let (reactor, stop, source) = DaemonReactor::bind_with_network_inventory(
+            reactor_path,
+            shutdown,
+            move |connection| {
+                let packet = connection.recv_packet(64).expect("receive request");
+                handled_tx.send(packet).expect("publish handled packet");
+            },
+            drop,
+        )
+        .expect("bind inventory-enabled reactor");
+        ready_tx
+            .send((stop, source))
+            .expect("publish inventory-enabled reactor");
+        reactor.run()
+    });
+    let (stop, source) = ready_rx.recv().expect("reactor setup result");
+    let Some(source) = source else {
+        assert_eq!(
+            stop.request_stop().expect("request degraded reactor stop"),
+            StopDisposition::Requested
+        );
+        thread
+            .join()
+            .expect("reactor thread")
+            .expect("run degraded inventory-enabled reactor");
+        return;
+    };
+
+    let client = SeqpacketConnection::connect(&socket_path).expect("connect reactor");
+    client.send_packet(b"request").expect("send request");
+    assert_eq!(
+        handled_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("control request is handled"),
+        b"request"
+    );
+    wait_until(Duration::from_secs(2), || source.snapshot().is_some());
+
+    assert_eq!(
+        stop.request_stop().expect("request reactor stop"),
+        StopDisposition::Requested
+    );
+    thread
+        .join()
+        .expect("reactor thread")
+        .expect("run inventory-enabled reactor");
+    assert!(source.snapshot().is_none());
+}
+
+#[test]
 fn partial_bind_failure_unlinks_listener_and_restores_signal_mask() {
     if let Some(socket_path) = std::env::var_os(PARTIAL_BIND_HELPER_ENV) {
         exercise_partial_bind_failure(Path::new(&socket_path));
@@ -245,6 +303,71 @@ fn listener_is_unlinked_before_running_workers_are_drained() {
         .join()
         .expect("reactor thread")
         .expect("run reactor");
+}
+
+#[test]
+fn inventory_is_invalidated_before_running_workers_are_drained() {
+    let directory = tempdir().expect("temporary directory");
+    let socket_path = directory.path().join("fluxd.sock");
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let handler_release = Arc::clone(&release);
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+    let reactor_path = socket_path.clone();
+    let thread = thread::spawn(move || {
+        let shutdown = ShutdownSignal::install().expect("install shutdown signal source");
+        let (reactor, stop, source) = DaemonReactor::bind_with_network_inventory(
+            reactor_path,
+            shutdown,
+            move |_connection| {
+                entered_tx.send(()).expect("publish worker entry");
+                let (lock, changed) = &*handler_release;
+                let mut released = lock.lock().expect("worker release lock");
+                while !*released {
+                    released = changed.wait(released).expect("wait for worker release");
+                }
+            },
+            drop,
+        )
+        .expect("bind inventory-enabled reactor");
+        ready_tx
+            .send((stop, source))
+            .expect("publish inventory-enabled reactor");
+        reactor.run()
+    });
+    let (stop, source) = ready_rx.recv().expect("reactor setup result");
+    let Some(source) = source else {
+        assert_eq!(
+            stop.request_stop().expect("request degraded reactor stop"),
+            StopDisposition::Requested
+        );
+        thread
+            .join()
+            .expect("reactor thread")
+            .expect("run degraded inventory-enabled reactor");
+        return;
+    };
+    wait_until(Duration::from_secs(2), || source.snapshot().is_some());
+
+    let _client = SeqpacketConnection::connect(&socket_path).expect("connect reactor");
+    entered_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("worker starts");
+    assert_eq!(
+        stop.request_stop().expect("request reactor stop"),
+        StopDisposition::Requested
+    );
+    wait_until(Duration::from_secs(1), || !socket_path.exists());
+    assert!(source.snapshot().is_none());
+    assert!(!thread.is_finished(), "worker must still be draining");
+
+    let (lock, changed) = &*release;
+    *lock.lock().expect("worker release lock") = true;
+    changed.notify_all();
+    thread
+        .join()
+        .expect("reactor thread")
+        .expect("run inventory-enabled reactor");
 }
 
 #[test]

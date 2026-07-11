@@ -109,7 +109,7 @@ where
     let shutdown = ShutdownSignal::install()
         .map_err(|error| DaemonError::Socket(ControlSocketError::Platform(error)))?;
     let profile = Arc::new(profile_source.collect_capability_profile());
-    let (control, runtime) = match profile.legacy_mutation_gate() {
+    let (control, runtime, network_inventory_enabled) = match profile.legacy_mutation_gate() {
         LegacyMutationGate::Allowed => {
             let boot_identity =
                 profile
@@ -165,11 +165,13 @@ where
                 .map_err(DaemonError::Control)?
                 .wait()
                 .map_err(DaemonError::Control)?;
-            (DaemonControl::Bridge(bridge), runtime)
+            (DaemonControl::Bridge(bridge), runtime, true)
         }
-        LegacyMutationGate::ReadOnly { .. } => {
-            (DaemonControl::ReadOnly, RuntimeSnapshotSource::default())
-        }
+        LegacyMutationGate::ReadOnly { .. } => (
+            DaemonControl::ReadOnly,
+            RuntimeSnapshotSource::default(),
+            false,
+        ),
     };
 
     let handler = ControlConnectionHandler::with_runtime_snapshot_source(
@@ -177,11 +179,24 @@ where
         control,
         runtime,
     );
-    let (reactor, _stop) = DaemonReactor::bind(&options.socket_path, shutdown, move |connection| {
+    let serve_connection = move |connection| {
         if let Err(error) = handler.serve(connection) {
             eprintln!("fluxd: rejected control connection: {error}");
         }
-    })
+    };
+    let (reactor, _stop, _network_inventory) = if network_inventory_enabled {
+        DaemonReactor::bind_with_network_inventory(
+            &options.socket_path,
+            shutdown,
+            serve_connection,
+            |degradation| {
+                eprintln!("fluxd: network inventory observation disabled: {degradation}");
+            },
+        )
+    } else {
+        DaemonReactor::bind(&options.socket_path, shutdown, serve_connection)
+            .map(|(reactor, stop)| (reactor, stop, None))
+    }
     .map_err(ControlSocketError::Reactor)
     .map_err(DaemonError::Socket)?;
     reactor

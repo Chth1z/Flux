@@ -26,7 +26,9 @@ pub use phase_dispatcher::{
     DispatcherPhaseCommand, PhaseDispatcherError, PhaseDispatcherErrorKind, PhaseDispatcherPaths,
     ProcessPhaseDispatcher,
 };
-pub use reactor::{DaemonReactor, ReactorError, ReactorStopHandle, StopDisposition};
+pub use reactor::{
+    DaemonReactor, NetworkInventoryDegradation, ReactorError, ReactorStopHandle, StopDisposition,
+};
 pub use seqpacket::{PeerCredentials, SeqpacketConnection, SeqpacketListener, Uid};
 pub use shutdown::ShutdownSignal;
 pub use sing_box::{

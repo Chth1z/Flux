@@ -1,8 +1,10 @@
 use std::io::Write;
 
 use flux_core::{
-    AdministrativeState, ControlClient, ControlError, ControlSnapshot, KernelSupport, LegacyIntent,
-    MIN_SUPPORTED_KERNEL, OperationReport, Reason,
+    AdministrativeState, ControlClient, ControlError, ControlSnapshot, KernelMutationStatus,
+    KernelSupport, LegacyAddressSynchronization, LegacyArtifactReadiness, LegacyArtifactResolution,
+    LegacyIntent, LegacyMutationGate, LegacyMutationWriter, LegacyRuleBackend,
+    MIN_SUPPORTED_KERNEL, Observation, OperationReport, Reason, SelinuxMode,
 };
 use flux_platform::KernelReleaseSource;
 use serde::Serialize;
@@ -11,6 +13,8 @@ mod daemon;
 mod intent_store;
 mod protocol;
 mod socket;
+
+use protocol::WireCapabilityProfile;
 
 pub use daemon::{DaemonError, DaemonOptions, run_daemon};
 pub use intent_store::{AdministrativeIntentStore, IntentStoreError};
@@ -233,7 +237,7 @@ where
         }
         Err(error) => {
             let _ = writeln!(stderr, "fluxd: {error}");
-            EXIT_RUNTIME_ERROR
+            mutating_error_exit(&error)
         }
     }
 }
@@ -297,8 +301,16 @@ where
         }
         Err(error) => {
             let _ = writeln!(stderr, "fluxd: {error}");
-            EXIT_RUNTIME_ERROR
+            mutating_error_exit(&error)
         }
+    }
+}
+
+fn mutating_error_exit(error: &ControlError) -> i32 {
+    if error.rejection_code() == Some("unsupported_kernel") {
+        EXIT_UNSUPPORTED
+    } else {
+        EXIT_RUNTIME_ERROR
     }
 }
 
@@ -324,19 +336,21 @@ where
             return EXIT_RUNTIME_ERROR;
         }
     };
-    let (daemon_state, version, supported) = match snapshot.kernel_support {
-        KernelSupport::Supported(version) => ("running", version, true),
-        KernelSupport::Unsupported { found, .. } => ("unsupported_kernel", found, false),
+    let capability_profile = &snapshot.capability_profile;
+    let daemon_state = match capability_profile.legacy_mutation_gate() {
+        LegacyMutationGate::Allowed => "running",
+        LegacyMutationGate::ReadOnly {
+            kernel: KernelMutationStatus::Unsupported { .. },
+            ..
+        } => "unsupported_kernel",
+        LegacyMutationGate::ReadOnly { .. } => "read_only_profile",
     };
 
     if json {
         let document = OnlineStatusDocument {
             daemon: daemon_state,
-            kernel: OnlineKernelDocument {
-                version: version.to_string(),
-                minimum: MIN_SUPPORTED_KERNEL.to_string(),
-                supported,
-            },
+            kernel: online_kernel_document(capability_profile),
+            capability_profile: capability_profile.into(),
             control: OnlineControlDocument::from(snapshot.control),
         };
         if serde_json::to_writer(&mut *stdout, &document).is_err() || writeln!(stdout).is_err() {
@@ -345,12 +359,94 @@ where
         return EXIT_SUCCESS;
     }
 
-    let supported_label = if supported { "yes" } else { "no" };
+    let bridge = capability_profile.legacy_bridge();
     let administrative_state = administrative_state_label(snapshot.control.administrative_state);
     if writeln!(stdout, "daemon: {daemon_state}").is_err()
-        || writeln!(stdout, "kernel version: {version}").is_err()
+        || writeln!(
+            stdout,
+            "capability profile schema: {}",
+            capability_profile.schema_version()
+        )
+        .is_err()
+        || writeln!(
+            stdout,
+            "capability profile revision: {}",
+            capability_profile.revision().get()
+        )
+        .is_err()
+        || writeln!(
+            stdout,
+            "kernel release: {}",
+            format_observation(capability_profile.kernel().release(), |release| {
+                release.as_str().to_owned()
+            })
+        )
+        .is_err()
+        || writeln!(
+            stdout,
+            "kernel version: {}",
+            format_observation(capability_profile.kernel().version(), ToString::to_string)
+        )
+        .is_err()
         || writeln!(stdout, "minimum kernel: {MIN_SUPPORTED_KERNEL}").is_err()
-        || writeln!(stdout, "kernel supported: {supported_label}").is_err()
+        || writeln!(
+            stdout,
+            "mutation gate: {}",
+            mutation_gate_label(capability_profile.legacy_mutation_gate())
+        )
+        .is_err()
+        || writeln!(
+            stdout,
+            "boot identity: {}",
+            format_observation(capability_profile.boot_identity(), |identity| {
+                identity.as_str().to_owned()
+            })
+        )
+        .is_err()
+        || writeln!(
+            stdout,
+            "SELinux: {}",
+            format_observation(capability_profile.selinux(), |mode| {
+                selinux_mode_label(*mode).to_owned()
+            })
+        )
+        .is_err()
+        || writeln!(
+            stdout,
+            "legacy mutation writer: {}",
+            legacy_mutation_writer_label(bridge.mutation_writer())
+        )
+        .is_err()
+        || writeln!(
+            stdout,
+            "legacy rule backend: {}",
+            legacy_rule_backend_label(bridge.rule_backend())
+        )
+        .is_err()
+        || writeln!(
+            stdout,
+            "legacy address synchronization: {}",
+            legacy_address_synchronization_label(bridge.address_synchronization())
+        )
+        .is_err()
+        || writeln!(
+            stdout,
+            "legacy shell: {}",
+            format_legacy_artifact(bridge.shell())
+        )
+        .is_err()
+        || writeln!(
+            stdout,
+            "legacy dispatcher: {}",
+            format_legacy_artifact(bridge.dispatcher())
+        )
+        .is_err()
+        || writeln!(
+            stdout,
+            "legacy addrsync: {}",
+            format_legacy_artifact(bridge.addrsync())
+        )
+        .is_err()
         || writeln!(stdout, "administrative state: {administrative_state}").is_err()
         || writeln!(
             stdout,
@@ -482,7 +578,9 @@ struct KernelDocument<'a> {
 #[derive(Serialize)]
 struct OnlineStatusDocument {
     daemon: &'static str,
-    kernel: OnlineKernelDocument,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kernel: Option<OnlineKernelDocument>,
+    capability_profile: WireCapabilityProfile,
     control: OnlineControlDocument,
 }
 
@@ -547,6 +645,96 @@ impl From<OperationReport> for OnlineOperationDocument {
             intent: report.intent.into(),
             revision: report.revision,
         }
+    }
+}
+
+fn online_kernel_document(profile: &flux_core::CapabilityProfile) -> Option<OnlineKernelDocument> {
+    match profile.kernel_support()? {
+        KernelSupport::Supported(version) => Some(OnlineKernelDocument {
+            version: version.to_string(),
+            minimum: MIN_SUPPORTED_KERNEL.to_string(),
+            supported: true,
+        }),
+        KernelSupport::Unsupported { found, minimum } => Some(OnlineKernelDocument {
+            version: found.to_string(),
+            minimum: minimum.to_string(),
+            supported: false,
+        }),
+    }
+}
+
+fn format_observation<T>(observation: &Observation<T>, map: impl FnOnce(&T) -> String) -> String {
+    match observation {
+        Observation::Verified(value) => format!("{} (verified)", map(value)),
+        Observation::Absent => "absent".to_owned(),
+        Observation::Denied => "denied".to_owned(),
+        Observation::Malformed => "malformed".to_owned(),
+        Observation::Unavailable => "unavailable".to_owned(),
+    }
+}
+
+fn format_legacy_artifact(observation: &Observation<LegacyArtifactReadiness>) -> String {
+    match observation {
+        Observation::Verified(artifact) => format!(
+            "{} ({}, verified)",
+            if artifact.is_ready() {
+                "ready"
+            } else {
+                "not ready"
+            },
+            legacy_artifact_resolution_label(artifact.resolution())
+        ),
+        Observation::Absent => "absent".to_owned(),
+        Observation::Denied => "denied".to_owned(),
+        Observation::Malformed => "malformed".to_owned(),
+        Observation::Unavailable => "unavailable".to_owned(),
+    }
+}
+
+const fn mutation_gate_label(gate: LegacyMutationGate) -> &'static str {
+    match gate {
+        LegacyMutationGate::Allowed => "allowed",
+        LegacyMutationGate::ReadOnly {
+            kernel: KernelMutationStatus::Unsupported { .. },
+            ..
+        } => "unsupported_kernel",
+        LegacyMutationGate::ReadOnly { .. } => "read_only_profile",
+    }
+}
+
+const fn selinux_mode_label(mode: SelinuxMode) -> &'static str {
+    match mode {
+        SelinuxMode::Enforcing => "enforcing",
+        SelinuxMode::Permissive => "permissive",
+    }
+}
+
+const fn legacy_mutation_writer_label(writer: LegacyMutationWriter) -> &'static str {
+    match writer {
+        LegacyMutationWriter::Dispatcher => "dispatcher",
+    }
+}
+
+const fn legacy_rule_backend_label(backend: LegacyRuleBackend) -> &'static str {
+    match backend {
+        LegacyRuleBackend::IptablesRestore => "iptables_restore",
+    }
+}
+
+const fn legacy_address_synchronization_label(
+    synchronization: LegacyAddressSynchronization,
+) -> &'static str {
+    match synchronization {
+        LegacyAddressSynchronization::StandaloneAddrsyncdViaScript => {
+            "standalone_addrsyncd_via_script"
+        }
+    }
+}
+
+const fn legacy_artifact_resolution_label(resolution: LegacyArtifactResolution) -> &'static str {
+    match resolution {
+        LegacyArtifactResolution::Direct => "direct",
+        LegacyArtifactResolution::SymbolicLink => "symbolic_link",
     }
 }
 

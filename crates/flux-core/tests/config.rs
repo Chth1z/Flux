@@ -1,7 +1,6 @@
 use std::error::Error;
 use std::fs;
 use std::io;
-use std::path::PathBuf;
 use std::time::Duration;
 
 use flux_core::{ConfigErrorKind, FailurePolicy, FluxConfig};
@@ -252,13 +251,135 @@ fn accepts_the_phase_one_resource_budget_boundaries() {
 
 #[test]
 fn loads_configuration_from_a_file() {
-    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("phase-one-flux.toml");
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("phase-one-flux.toml");
     fs::write(&path, MINIMAL_CONFIG).expect("write config fixture");
 
     let config = FluxConfig::load(&path).expect("load config fixture");
 
     assert_eq!(config.daemon().fail_policy(), FailurePolicy::Open);
     fs::remove_file(path).expect("remove config fixture");
+}
+
+#[test]
+fn loads_configuration_from_a_relative_path() {
+    let directory = tempfile::tempdir_in(".").expect("relative temporary directory");
+    let absolute_path = directory.path().join("phase-one-flux.toml");
+    let current_directory = std::env::current_dir().expect("current directory");
+    let path = absolute_path
+        .strip_prefix(current_directory)
+        .expect("temporary directory is below the current directory");
+    fs::write(&absolute_path, MINIMAL_CONFIG).expect("write relative config fixture");
+
+    let config = FluxConfig::load(path).expect("load relative config fixture");
+
+    assert_eq!(config.daemon().fail_policy(), FailurePolicy::Open);
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[test]
+fn load_rejects_a_symbolic_link_without_following_it() {
+    use std::os::unix::fs::symlink;
+
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let target = directory.path().join("target.toml");
+    let link = directory.path().join("flux.toml");
+    fs::write(&target, MINIMAL_CONFIG).expect("write target configuration");
+    symlink(&target, &link).expect("create configuration symlink");
+
+    let error = FluxConfig::load(&link).expect_err("configuration symlinks must be rejected");
+
+    assert_eq!(error.kind(), ConfigErrorKind::UnsafeFileType);
+    assert_eq!(
+        error
+            .source()
+            .and_then(|source| source.downcast_ref::<io::Error>())
+            .and_then(io::Error::raw_os_error),
+        Some(libc::ELOOP)
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[test]
+fn load_rejects_a_symbolic_link_in_an_ancestor_component() {
+    use std::os::unix::fs::symlink;
+
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let real_parent = directory.path().join("real-parent");
+    let linked_parent = directory.path().join("linked-parent");
+    fs::create_dir(&real_parent).expect("create real configuration parent");
+    fs::write(real_parent.join("flux.toml"), MINIMAL_CONFIG).expect("write target configuration");
+    symlink(&real_parent, &linked_parent).expect("create ancestor symlink");
+
+    let error = FluxConfig::load(linked_parent.join("flux.toml"))
+        .expect_err("ancestor symlinks must be rejected");
+    let raw_os_error = error
+        .source()
+        .and_then(|source| source.downcast_ref::<io::Error>())
+        .and_then(io::Error::raw_os_error);
+
+    assert_eq!(error.kind(), ConfigErrorKind::UnsafeFileType);
+    assert!(
+        matches!(raw_os_error, Some(libc::ELOOP) | Some(libc::ENOTDIR)),
+        "unexpected ancestor-symlink error: {raw_os_error:?}"
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[test]
+fn load_rejects_parent_directory_components() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    fs::create_dir(directory.path().join("child")).expect("create child directory");
+    fs::write(directory.path().join("flux.toml"), MINIMAL_CONFIG)
+        .expect("write target configuration");
+    let path = directory.path().join("child/../flux.toml");
+
+    let error = FluxConfig::load(path).expect_err("parent traversal must be rejected");
+
+    assert_eq!(error.kind(), ConfigErrorKind::UnsafeFileType);
+    assert_eq!(
+        error
+            .source()
+            .and_then(|source| source.downcast_ref::<io::Error>())
+            .map(io::Error::kind),
+        Some(io::ErrorKind::InvalidInput)
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[test]
+fn load_rejects_a_fifo_without_blocking() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let fifo = directory.path().join("flux.toml");
+    let fifo_name = CString::new(fifo.as_os_str().as_bytes()).expect("FIFO path without NUL");
+    // SAFETY: `fifo_name` is a valid NUL-terminated pathname and the mode is
+    // restricted to ordinary permission bits.
+    let result = unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) };
+    assert_eq!(result, 0, "create FIFO: {}", io::Error::last_os_error());
+
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let worker = std::thread::spawn(move || {
+        let _ = sender.send(FluxConfig::load(fifo));
+    });
+    let error = receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("opening a FIFO must not block")
+        .expect_err("a FIFO is not a configuration file");
+    worker.join().expect("configuration loader worker");
+
+    assert_eq!(error.kind(), ConfigErrorKind::UnsafeFileType);
+    assert_eq!(
+        error
+            .source()
+            .and_then(|source| source.downcast_ref::<io::Error>())
+            .map(io::Error::kind),
+        Some(io::ErrorKind::InvalidInput)
+    );
 }
 
 #[test]
@@ -271,7 +392,8 @@ fn parse_errors_preserve_the_toml_source() {
 
 #[test]
 fn load_errors_preserve_the_io_source() {
-    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join(format!(
         "missing-phase-one-flux-{}-{}.toml",
         std::process::id(),
         line!()
@@ -303,7 +425,8 @@ fn rejects_an_oversized_parse_document_before_toml_decoding() {
 
 #[test]
 fn rejects_an_oversized_loaded_document() {
-    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("oversized-phase-one-flux.toml");
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("oversized-phase-one-flux.toml");
     fs::write(&path, vec![b' '; 65_537]).expect("write oversized config fixture");
 
     let result = FluxConfig::load(&path);
@@ -320,7 +443,8 @@ fn rejects_an_oversized_loaded_document() {
 
 #[test]
 fn load_errors_preserve_the_utf8_source() {
-    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("invalid-utf8-phase-one-flux.toml");
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("invalid-utf8-phase-one-flux.toml");
     fs::write(&path, [0xff]).expect("write invalid UTF-8 config fixture");
 
     let result = FluxConfig::load(&path);

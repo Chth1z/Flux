@@ -295,10 +295,16 @@ main() {
     # Ensure cleanup on exit (Use double quotes to expand tmp_backup immediately)
     trap "rm -rf \"${tmp_backup}\"; rm -rf \"${FLUX_DIR}/tmp\" 2>/dev/null" EXIT INT TERM
 
-    local has_settings=false has_template=false has_addrsyncd=false
+    local has_flux_config=false has_settings=false has_template=false has_addrsyncd=false
 
     if [ -d "${FLUX_DIR}" ]; then
         ui_print "- Backing up configuration files..."
+        # flux.toml is authoritative and is always preserved across upgrades.
+        if [ -f "${CONF_DIR}/flux.toml" ]; then
+            cp -f "${CONF_DIR}/flux.toml" "${tmp_backup}/flux.toml" ||
+                abort "! Failed to back up flux.toml"
+            has_flux_config=true
+        fi
         # Backup settings.ini (will auto-migrate)
         if [ -f "${CONF_DIR}/settings.ini" ]; then
             cp -f "${CONF_DIR}/settings.ini" "${tmp_backup}/settings.ini"
@@ -343,7 +349,16 @@ main() {
     ui_print " "
     ui_print "=== Configuration ==="
 
-    # 4.1 settings.ini - Auto migrate
+    # 4.1 flux.toml - Always preserve the authoritative user configuration
+    if [ "${has_flux_config}" = "true" ]; then
+        cp -f "${tmp_backup}/flux.toml" "${CONF_DIR}/flux.toml" ||
+            abort "! Failed to restore flux.toml"
+        ui_print "- Restored existing flux.toml"
+    else
+        ui_print "- Using default flux.toml"
+    fi
+
+    # 4.2 settings.ini - Auto migrate
     if [ "${has_settings}" = "true" ]; then
         ui_print "- Migrating settings.ini..."
         _migrate_settings "${tmp_backup}/settings.ini" "${CONF_DIR}/settings.ini"
@@ -351,7 +366,7 @@ main() {
         ui_print "- Using default settings.ini"
     fi
 
-    # 4.2 template.json - User choice
+    # 4.3 template.json - User choice
     if [ "${has_template}" = "true" ]; then
         if _choose_action "Keep [template.json]?" "true"; then
             cp -f "${tmp_backup}/template.json" "${CONF_DIR}/template.json"
@@ -361,7 +376,7 @@ main() {
         fi
     fi
 
-    # 4.3 addrsyncd.toml - User choice
+    # 4.4 addrsyncd.toml - User choice
     if [ "${has_addrsyncd}" = "true" ]; then
         if _choose_action "Keep [addrsyncd.toml]?" "true"; then
             cp -f "${tmp_backup}/addrsyncd.toml" "${CONF_DIR}/addrsyncd.toml"

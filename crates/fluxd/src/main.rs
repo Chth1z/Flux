@@ -1,4 +1,4 @@
-use flux_platform::SystemKernelReleaseSource;
+use flux_platform::{SystemCapabilityProfileSource, SystemKernelReleaseSource};
 
 fn main() {
     let args = std::env::args().collect::<Vec<_>>();
@@ -15,7 +15,8 @@ fn main() {
                 std::process::exit(1);
             }
         };
-        if let Err(error) = fluxd::run_daemon(&source, options) {
+        let profile_source = SystemCapabilityProfileSource::new(options.capability_profile_paths());
+        if let Err(error) = fluxd::run_daemon(&profile_source, options) {
             eprintln!("fluxd: {error}");
             std::process::exit(1);
         }

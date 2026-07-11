@@ -7,10 +7,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use flux_core::{
-    ControlClient, ControlError, KernelSupport, LegacyControlBridge, LegacyDispatcher,
-    LegacyIntent, Reason,
+    CapabilityProfile, CapabilityProfileRevision, ControlClient, ControlError, LegacyControlBridge,
+    LegacyDispatcher, LegacyIntent, Reason,
 };
 use flux_platform::{DaemonReactor, SeqpacketConnection, ShutdownSignal};
+use flux_testkit::CapabilityProfileFixture;
 use fluxd::{ControlConnectionHandler, SocketControlClient};
 use tempfile::tempdir;
 
@@ -27,10 +28,8 @@ fn seqpacket_client_and_reactor_complete_a_control_operation() {
         4,
     )
     .expect("start bridge");
-    let handler = ControlConnectionHandler::new(
-        KernelSupport::evaluate("5.10.0").expect("kernel release"),
-        bridge,
-    );
+    let handler =
+        ControlConnectionHandler::new(Arc::new(CapabilityProfileFixture::supported()), bridge);
     let (reactor, stop) = DaemonReactor::bind(&socket_path, shutdown, move |connection| {
         handler.serve(connection).expect("serve control connection");
     })
@@ -56,6 +55,49 @@ fn seqpacket_client_and_reactor_complete_a_control_operation() {
 }
 
 #[test]
+fn seqpacket_status_preserves_the_capability_profile_revision() {
+    let directory = tempdir().expect("temporary directory");
+    let socket_path = directory.path().join("fluxd.sock");
+    let shutdown = ShutdownSignal::install().expect("install shutdown signal source");
+    let initial = CapabilityProfileFixture::supported();
+    let revision = CapabilityProfileRevision::new(23).expect("nonzero revision");
+    let profile = CapabilityProfile::new(
+        revision,
+        initial.boot_identity().clone(),
+        initial.kernel().clone(),
+        initial.selinux().clone(),
+        initial.legacy_bridge().clone(),
+    );
+    let expected_profile = profile.clone();
+    let bridge = LegacyControlBridge::start(
+        RecordingDispatcher {
+            calls: Arc::new(Mutex::new(Vec::new())),
+        },
+        4,
+    )
+    .expect("start bridge");
+    let handler = ControlConnectionHandler::new(Arc::new(profile), bridge);
+    let (reactor, stop) = DaemonReactor::bind(&socket_path, shutdown, move |connection| {
+        handler.serve(connection).expect("serve control connection");
+    })
+    .expect("bind reactor");
+    let client_path = socket_path.clone();
+    let client_thread = thread::spawn(move || {
+        let snapshot = SocketControlClient::new(client_path)
+            .status()
+            .expect("status snapshot");
+        stop.request_stop().expect("request reactor stop");
+        snapshot
+    });
+
+    reactor.run().expect("run reactor");
+    let snapshot = client_thread.join().expect("client thread");
+
+    assert_eq!(snapshot.capability_profile, expected_profile);
+    assert_socket_absent(&socket_path);
+}
+
+#[test]
 fn daemon_keeps_serving_after_a_client_disconnects_before_sending() {
     let directory = tempdir().expect("temporary directory");
     let socket_path = directory.path().join("fluxd.sock");
@@ -67,10 +109,8 @@ fn daemon_keeps_serving_after_a_client_disconnects_before_sending() {
         4,
     )
     .expect("start bridge");
-    let handler = ControlConnectionHandler::new(
-        KernelSupport::evaluate("5.10.0").expect("kernel release"),
-        bridge,
-    );
+    let handler =
+        ControlConnectionHandler::new(Arc::new(CapabilityProfileFixture::supported()), bridge);
     let (reactor, stop) = DaemonReactor::bind(&socket_path, shutdown, move |connection| {
         if let Err(error) = handler.serve(connection) {
             eprintln!("rejected test connection: {error}");
@@ -109,10 +149,8 @@ fn ping_remains_responsive_while_a_control_operation_is_in_flight() {
         4,
     )
     .expect("start bridge");
-    let handler = ControlConnectionHandler::new(
-        KernelSupport::evaluate("5.10.0").expect("kernel release"),
-        bridge,
-    );
+    let handler =
+        ControlConnectionHandler::new(Arc::new(CapabilityProfileFixture::supported()), bridge);
     let (reactor, stop) = DaemonReactor::bind(&socket_path, shutdown, move |connection| {
         handler.serve(connection).expect("serve control connection");
     })
@@ -159,10 +197,8 @@ fn stop_requested_before_run_closes_the_listener_without_dispatching_queued_clie
         4,
     )
     .expect("start bridge");
-    let handler = ControlConnectionHandler::new(
-        KernelSupport::evaluate("5.10.0").expect("kernel release"),
-        bridge,
-    );
+    let handler =
+        ControlConnectionHandler::new(Arc::new(CapabilityProfileFixture::supported()), bridge);
     let served = Arc::new(AtomicBool::new(false));
     let handler_served = Arc::clone(&served);
     let (reactor, stop) = DaemonReactor::bind(&socket_path, shutdown, move |connection| {
@@ -172,7 +208,7 @@ fn stop_requested_before_run_closes_the_listener_without_dispatching_queued_clie
     .expect("bind reactor");
     let queued = SeqpacketConnection::connect(&socket_path).expect("queue client");
     queued
-        .send_packet(br#"{"protocol_version":1,"request_id":7,"command":{"kind":"ping"}}"#)
+        .send_packet(br#"{"protocol_version":2,"request_id":7,"command":{"kind":"ping"}}"#)
         .expect("send queued request");
 
     stop.request_stop().expect("request reactor stop");
@@ -197,10 +233,8 @@ fn stop_closes_control_admission_before_a_running_mutation_drains() {
         4,
     )
     .expect("start bridge");
-    let handler = ControlConnectionHandler::new(
-        KernelSupport::evaluate("5.10.0").expect("kernel release"),
-        bridge,
-    );
+    let handler =
+        ControlConnectionHandler::new(Arc::new(CapabilityProfileFixture::supported()), bridge);
     let (reactor, stop) = DaemonReactor::bind(&socket_path, shutdown, move |connection| {
         handler.serve(connection).expect("serve control connection");
     })

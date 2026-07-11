@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
 const SIGTERM: std::ffi::c_int = 15;
+const PACKAGED_CONFIG: &str = include_str!("../../../conf/flux.toml");
 
 unsafe extern "C" {
     fn kill(process: std::ffi::c_int, signal: std::ffi::c_int) -> std::ffi::c_int;
@@ -23,12 +24,16 @@ fn process_directed_sigterm_stops_daemon_cleanly_with_live_legacy_worker() {
     let socket_path = root.join("run/fluxd.sock");
     let dispatcher_record = root.join("run/dispatcher.record");
     let boot_id_path = directory.path().join("boot-id");
+    let selinux_enforce_path = directory.path().join("selinux-enforce");
     let disable_path = directory.path().join("disable");
 
     fs::create_dir_all(root.join("scripts")).expect("create scripts directory");
+    fs::create_dir_all(root.join("conf")).expect("create config directory");
     fs::create_dir_all(root.join("state")).expect("create state directory");
     fs::create_dir_all(root.join("run")).expect("create run directory");
-    fs::write(&boot_id_path, "signal-test-boot\n").expect("write boot ID");
+    fs::write(root.join("conf/flux.toml"), PACKAGED_CONFIG).expect("write configuration");
+    fs::write(&boot_id_path, "33333333-3333-4333-8333-333333333333\n").expect("write boot ID");
+    fs::write(&selinux_enforce_path, "1\n").expect("write SELinux mode");
     write_script(
         &root.join("scripts/dispatcher"),
         &format!(
@@ -43,6 +48,7 @@ fn process_directed_sigterm_stops_daemon_cleanly_with_live_legacy_worker() {
         .env("FLUX_ROOT", &root)
         .env("FLUXD_SOCKET", &socket_path)
         .env("FLUX_BOOT_ID_PATH", &boot_id_path)
+        .env("FLUX_SELINUX_ENFORCE_PATH", &selinux_enforce_path)
         .env("FLUX_DISABLE_PATH", &disable_path)
         .env("FLUX_SHELL", "/bin/sh")
         .stdin(Stdio::null())

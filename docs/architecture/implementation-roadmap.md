@@ -32,7 +32,7 @@ This roadmap turns the [blueprint](fluxd-blueprint.md) and [technical specificat
 
 ## Phase 1 — Control-plane tracer bullet
 
-Current implementation status: the control-plane tracer bullet now uses one `epoll` reactor for Unix control admission and `signalfd` shutdown, with admission closed before active connection handlers drain. Netlink, timerfd, pidfd, and BPF reactor sources remain assigned to their later phases and are not delivered by this milestone.
+Current implementation status: the control-plane tracer bullet now uses one `epoll` reactor for Unix control admission and `signalfd` shutdown, with admission closed before active connection handlers drain. The strict schema-1 `flux.toml` parser is wired into mutation-allowed startup and supplies the bounded legacy-writer queue capacity. One immutable Capability Profile gates that startup and reports kernel release/version, boot identity, SELinux state, and legacy bridge artifacts; below-floor or unverified profiles remain queryable without loading mutation configuration, disable/intent state, or the writer. Netlink, timerfd, pidfd, active advanced probes, and BPF reactor sources remain assigned to their later phases and are not delivered by this milestone.
 
 ### Deliverables
 

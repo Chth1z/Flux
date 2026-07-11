@@ -159,6 +159,7 @@ graph TD
 │
 ├── conf/
 │   ├── config.json           # 生成的 sing-box 配置
+│   ├── flux.toml             # 严格校验的 fluxd 守护进程配置
 │   ├── settings.ini          # 用户配置文件
 │   └── template.json         # 配置模板
 │
@@ -200,7 +201,7 @@ graph TD
 
 ## 配置说明
 
-主配置文件：`/data/adb/flux/conf/settings.ini`。更改在服务重启后生效。
+旧版网络配置仍使用 `/data/adb/flux/conf/settings.ini`。Rust 控制平面使用严格校验的 `/data/adb/flux/conf/flux.toml` 守护进程配置；schema 1 会拒绝未知字段，且 `daemon.fail_policy` 仅接受 `"open"`。目前修改 `flux.toml` 后需要重启守护进程，而 `settings.ini` 仍沿用现有的事件驱动重载流程。
 
 ### 1. 基础订阅配置
 | 选项 | 描述 | 默认值 |

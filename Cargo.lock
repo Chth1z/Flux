@@ -40,7 +40,9 @@ checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 name = "flux-core"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "serde",
+ "tempfile",
  "toml",
 ]
 
@@ -57,6 +59,7 @@ dependencies = [
 name = "flux-testkit"
 version = "0.1.0"
 dependencies = [
+ "flux-core",
  "flux-platform",
 ]
 

@@ -9,6 +9,9 @@ All notable changes to the Flux project will be documented in this file.
 - Enforced the Linux 5.10 minimum while keeping unsupported devices queryable without networking mutation.
 - Added boot-ID-scoped administrative-intent recovery, bounded concurrent clients, peer credential checks, graceful signal handling, and stale-socket recovery.
 - Hardened startup admission with bounded request-result deduplication, symlink-safe durable state I/O, and process-wide signalfd delivery while preserving normal child-process signals.
+- Replaced timed control polling with a bounded `epoll` reactor over the control listener, `signalfd`, and programmatic wakeups.
+- Added the strict schema-1 `flux.toml` daemon configuration with bounded resource budgets and upgrade-safe preservation.
+- Added a boot-scoped read-only Capability Profile for kernel gating, boot identity, SELinux state, and legacy bridge facts; control protocol v2 carries the coherent profile used for mutation decisions.
 - Moved boot launch to module-local `service.sh`; mutating `fluxctl` commands no longer bypass the daemon.
 - Added pinned Android build and Magisk staging contracts while retaining `addrsyncd` as the bridge-release rollback binary.
 

@@ -26,3 +26,18 @@ fn persistence_error_preserves_its_source_and_recovery_guidance() {
         )
     );
 }
+
+#[test]
+fn request_rejection_preserves_its_stable_code() {
+    let error = ControlError::request_rejected(
+        "unsupported_kernel",
+        "kernel 5.4.280 is below minimum 5.10.0",
+    );
+
+    assert_eq!(error.rejection_code(), Some("unsupported_kernel"));
+    assert_eq!(
+        error.to_string(),
+        "control request rejected (unsupported_kernel): kernel 5.4.280 is below minimum 5.10.0"
+    );
+    assert!(error.source().is_none());
+}

@@ -7,12 +7,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use flux_core::{
-    AdministrativeState, ConfigurationChangeClient, ConfigurationChangeReport, ControlClient,
-    ControlError, ControlSnapshot, ControlSnapshotSource, KernelSupport, LegacyControlBridge,
-    LegacyDispatcher, LegacyIntent, OperationReport, Reason,
+    AdministrativeState, CapabilityProfileSource, ConfigError, ConfigurationChangeClient,
+    ConfigurationChangeReport, ControlClient, ControlError, ControlSnapshot, ControlSnapshotSource,
+    FluxConfig, LegacyControlBridge, LegacyDispatcher, LegacyIntent, LegacyMutationGate,
+    OperationReport, Reason,
 };
 use flux_platform::{
-    DaemonReactor, KernelReleaseSource, LegacyScriptPaths, ProcessLegacyDispatcher, ShutdownSignal,
+    CapabilityProfilePaths, DaemonReactor, LegacyScriptPaths, ProcessLegacyDispatcher,
+    ShutdownSignal,
 };
 
 use crate::{
@@ -22,17 +24,19 @@ use crate::{
 const DEFAULT_ROOT: &str = "/data/adb/flux";
 const DEFAULT_DISABLE_PATH: &str = "/data/adb/modules/flux/disable";
 const DEFAULT_BOOT_ID_PATH: &str = "/proc/sys/kernel/random/boot_id";
+const DEFAULT_SELINUX_ENFORCE_PATH: &str = "/sys/fs/selinux/enforce";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DaemonOptions {
     pub socket_path: PathBuf,
+    pub config_path: PathBuf,
     pub shell: PathBuf,
     pub dispatcher_script: PathBuf,
     pub addrsync_script: PathBuf,
     pub intent_path: PathBuf,
     pub boot_id_path: PathBuf,
+    pub selinux_enforce_path: PathBuf,
     pub disable_path: PathBuf,
-    pub queue_capacity: usize,
 }
 
 impl DaemonOptions {
@@ -43,6 +47,9 @@ impl DaemonOptions {
         let socket_path = env::var_os("FLUXD_SOCKET")
             .map(PathBuf::from)
             .unwrap_or_else(|| root.join("run/fluxd.sock"));
+        let config_path = env::var_os("FLUXD_CONFIG_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| root.join("conf/flux.toml"));
         let shell = env::var_os("FLUX_SHELL")
             .map(PathBuf::from)
             .unwrap_or_else(default_shell);
@@ -52,42 +59,41 @@ impl DaemonOptions {
         let boot_id_path = env::var_os("FLUX_BOOT_ID_PATH")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(DEFAULT_BOOT_ID_PATH));
+        let selinux_enforce_path = env::var_os("FLUX_SELINUX_ENFORCE_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_SELINUX_ENFORCE_PATH));
         let disable_path = env::var_os("FLUX_DISABLE_PATH")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(DEFAULT_DISABLE_PATH));
-        let queue_capacity = env::var("FLUXD_QUEUE_CAPACITY")
-            .ok()
-            .map(|value| {
-                value.parse::<usize>().map_err(|_| {
-                    DaemonError::Configuration(format!(
-                        "FLUXD_QUEUE_CAPACITY '{value}' is not a positive integer"
-                    ))
-                })
-            })
-            .transpose()?
-            .unwrap_or(64);
-        if queue_capacity == 0 {
-            return Err(DaemonError::Configuration(
-                "FLUXD_QUEUE_CAPACITY must be greater than zero".to_owned(),
-            ));
-        }
 
         Ok(Self {
             socket_path,
+            config_path,
             shell,
             dispatcher_script: root.join("scripts/dispatcher"),
             addrsync_script: root.join("scripts/addrsync"),
             intent_path,
             boot_id_path,
+            selinux_enforce_path,
             disable_path,
-            queue_capacity,
         })
+    }
+
+    #[must_use]
+    pub fn capability_profile_paths(&self) -> CapabilityProfilePaths {
+        CapabilityProfilePaths::new(
+            &self.boot_id_path,
+            &self.selinux_enforce_path,
+            &self.shell,
+            &self.dispatcher_script,
+            &self.addrsync_script,
+        )
     }
 }
 
-pub fn run_daemon<S>(kernel_source: &S, options: DaemonOptions) -> Result<(), DaemonError>
+pub fn run_daemon<S>(profile_source: &S, options: DaemonOptions) -> Result<(), DaemonError>
 where
-    S: KernelReleaseSource,
+    S: CapabilityProfileSource,
 {
     // Block process-directed termination before any daemon worker can be
     // created. Every in-process thread then inherits the mask, leaving
@@ -95,14 +101,28 @@ where
     // restore a clean mask in ProcessLegacyDispatcher before exec.
     let shutdown = ShutdownSignal::install()
         .map_err(|error| DaemonError::Socket(ControlSocketError::Platform(error)))?;
-    let release = kernel_source
-        .kernel_release()
-        .map_err(|error| DaemonError::Kernel(error.to_string()))?;
-    let kernel_support = KernelSupport::evaluate(&release)
-        .map_err(|error| DaemonError::Kernel(error.to_string()))?;
-    let control = match kernel_support {
-        KernelSupport::Supported(_) => {
-            let store = AdministrativeIntentStore::new(&options.intent_path, &options.boot_id_path);
+    let profile = Arc::new(profile_source.collect_capability_profile());
+    let control = match profile.legacy_mutation_gate() {
+        LegacyMutationGate::Allowed => {
+            let boot_identity =
+                profile
+                    .boot_identity()
+                    .verified()
+                    .cloned()
+                    .ok_or(DaemonError::Invariant(
+                        "legacy mutation gate allowed startup without a verified boot identity",
+                    ))?;
+            // The strict user configuration is authoritative for
+            // mutation-capable runtime settings. Load it before touching
+            // durable intent or starting the legacy networking writer.
+            let config = FluxConfig::load(&options.config_path).map_err(DaemonError::FluxConfig)?;
+            let queue_capacity = usize::try_from(config.daemon().event_queue_capacity().get())
+                .map_err(|_| {
+                    DaemonError::Configuration(
+                        "daemon.event_queue_capacity does not fit this target".to_owned(),
+                    )
+                })?;
+            let store = AdministrativeIntentStore::new(&options.intent_path, boot_identity);
             let initial_intent = initial_intent(&store, &options.disable_path)?;
             let dispatcher = ProcessLegacyDispatcher::new(LegacyScriptPaths {
                 shell: options.shell,
@@ -111,7 +131,7 @@ where
                 addrsync: options.addrsync_script,
             });
             let dispatcher = PersistingLegacyDispatcher { dispatcher, store };
-            let bridge = LegacyControlBridge::start(dispatcher, options.queue_capacity)
+            let bridge = LegacyControlBridge::start(dispatcher, queue_capacity)
                 .map_err(DaemonError::Control)?;
             bridge
                 .submit(initial_intent)
@@ -120,10 +140,10 @@ where
                 .map_err(DaemonError::Control)?;
             DaemonControl::Bridge(bridge)
         }
-        KernelSupport::Unsupported { .. } => DaemonControl::Unsupported,
+        LegacyMutationGate::ReadOnly { .. } => DaemonControl::ReadOnly,
     };
 
-    let handler = ControlConnectionHandler::new(kernel_support, control);
+    let handler = ControlConnectionHandler::new(Arc::clone(&profile), control);
     let (reactor, _stop) = DaemonReactor::bind(&options.socket_path, shutdown, move |connection| {
         if let Err(error) = handler.serve(connection) {
             eprintln!("fluxd: rejected control connection: {error}");
@@ -139,14 +159,14 @@ where
 
 enum DaemonControl {
     Bridge(LegacyControlBridge),
-    Unsupported,
+    ReadOnly,
 }
 
 impl ControlClient for DaemonControl {
     fn submit_and_wait(&self, intent: LegacyIntent) -> Result<OperationReport, ControlError> {
         match self {
             Self::Bridge(bridge) => bridge.submit_and_wait(intent),
-            Self::Unsupported => Err(ControlError::BridgeStopped),
+            Self::ReadOnly => Err(ControlError::BridgeStopped),
         }
     }
 }
@@ -155,7 +175,7 @@ impl ControlSnapshotSource for DaemonControl {
     fn snapshot(&self) -> Arc<ControlSnapshot> {
         match self {
             Self::Bridge(bridge) => bridge.snapshot(),
-            Self::Unsupported => Arc::new(ControlSnapshot::default()),
+            Self::ReadOnly => Arc::new(ControlSnapshot::default()),
         }
     }
 }
@@ -167,7 +187,7 @@ impl ConfigurationChangeClient for DaemonControl {
     ) -> Result<ConfigurationChangeReport, ControlError> {
         match self {
             Self::Bridge(bridge) => bridge.configuration_changed(reason),
-            Self::Unsupported => Err(ControlError::BridgeStopped),
+            Self::ReadOnly => Err(ControlError::BridgeStopped),
         }
     }
 }
@@ -247,7 +267,8 @@ fn initial_intent(
 #[derive(Debug)]
 pub enum DaemonError {
     Configuration(String),
-    Kernel(String),
+    FluxConfig(ConfigError),
+    Invariant(&'static str),
     Intent(IntentStoreError),
     Control(ControlError),
     Socket(ControlSocketError),
@@ -257,7 +278,8 @@ impl fmt::Display for DaemonError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Configuration(message) => write!(formatter, "daemon configuration: {message}"),
-            Self::Kernel(message) => write!(formatter, "kernel capability: {message}"),
+            Self::FluxConfig(error) => write!(formatter, "daemon configuration: {error}"),
+            Self::Invariant(message) => write!(formatter, "daemon invariant: {message}"),
             Self::Intent(error) => write!(formatter, "administrative intent: {error}"),
             Self::Control(error) => write!(formatter, "control bridge: {error}"),
             Self::Socket(error) => error.fmt(formatter),
@@ -268,10 +290,11 @@ impl fmt::Display for DaemonError {
 impl Error for DaemonError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::FluxConfig(error) => Some(error),
             Self::Control(error) => Some(error),
             Self::Intent(error) => Some(error),
             Self::Socket(error) => Some(error),
-            Self::Configuration(_) | Self::Kernel(_) => None,
+            Self::Configuration(_) | Self::Invariant(_) => None,
         }
     }
 }

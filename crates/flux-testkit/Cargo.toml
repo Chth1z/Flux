@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+flux-core = { path = "../flux-core" }
 flux-platform = { path = "../flux-platform" }
 
 [lints]

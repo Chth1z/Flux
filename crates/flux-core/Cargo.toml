@@ -1,6 +1,6 @@
 [package]
 name = "flux-core"
-description = "Domain model and deterministic planning core for Flux"
+description = "Domain models, validated configuration, and control primitives for Flux"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,3 +13,9 @@ workspace = true
 [dependencies]
 serde.workspace = true
 toml.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+libc.workspace = true

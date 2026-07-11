@@ -9,6 +9,18 @@ fn parses_android_vendor_kernel_release() {
 }
 
 #[test]
+fn parses_a_plus_suffixed_kernel_release_by_its_numeric_prefix() {
+    let version = KernelVersion::parse_release("5.10.198+").expect("valid numeric prefix");
+
+    assert_eq!(version, KernelVersion::new(5, 10, 198));
+    assert!(
+        KernelSupport::evaluate("5.10.198+")
+            .expect("valid numeric prefix")
+            .is_supported()
+    );
+}
+
+#[test]
 fn accepts_the_minimum_supported_kernel() {
     let support = KernelSupport::evaluate("5.10.0-gki").expect("release should parse");
 

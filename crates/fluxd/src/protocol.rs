@@ -3,13 +3,18 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use flux_core::{
-    AdministrativeState, ConfigurationChangeReport, ControlError, ControlService, ControlSnapshot,
-    KernelSupport, KernelVersion, LegacyIntent, OperationReport, Reason,
+    AdministrativeState, BootIdentity, BootIdentityMutationStatus,
+    CAPABILITY_PROFILE_SCHEMA_VERSION, CapabilityProfile, ConfigurationChangeReport, ControlError,
+    ControlService, ControlSnapshot, KernelFacts, KernelMutationStatus, KernelRelease,
+    KernelSupport, KernelVersion, LegacyAddressSynchronization, LegacyArtifactReadiness,
+    LegacyArtifactResolution, LegacyBridgeFacts, LegacyIntent, LegacyMutationGate,
+    LegacyMutationWriter, LegacyRuleBackend, MIN_SUPPORTED_KERNEL, Observation, OperationReport,
+    Reason, SelinuxMode,
 };
 use flux_platform::Uid;
 use serde::{Deserialize, Serialize};
 
-const PROTOCOL_VERSION: u16 = 1;
+const PROTOCOL_VERSION: u16 = 2;
 const RECENT_RESULT_CAPACITY: usize = 128;
 const RECENT_RESULT_FINGERPRINT_BYTES: usize = MAX_CONTROL_PACKET_BYTES;
 const RECENT_RESULT_RESPONSE_BYTES: usize = MAX_CONTROL_PACKET_BYTES;
@@ -28,9 +33,9 @@ impl RequestPeerId {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DaemonSnapshot {
-    pub kernel_support: KernelSupport,
+    pub capability_profile: CapabilityProfile,
     pub control: ControlSnapshot,
 }
 
@@ -48,7 +53,7 @@ pub struct EventReport {
 }
 
 pub struct ProtocolHandler<C> {
-    kernel_support: KernelSupport,
+    capability_profile: Arc<CapabilityProfile>,
     control: C,
     recent_results: Mutex<RecentResults>,
 }
@@ -58,9 +63,9 @@ where
     C: ControlService,
 {
     #[must_use]
-    pub fn new(kernel_support: KernelSupport, control: C) -> Self {
+    pub fn new(capability_profile: Arc<CapabilityProfile>, control: C) -> Self {
         Self {
-            kernel_support,
+            capability_profile,
             control,
             recent_results: Mutex::new(RecentResults::default()),
         }
@@ -165,7 +170,8 @@ where
             WireCommand::Status => encode_response(ResponseEnvelope::ok(
                 request.request_id,
                 ResponseBody::Snapshot {
-                    kernel: self.kernel_support.into(),
+                    kernel: self.capability_profile.kernel_support().map(Into::into),
+                    capability_profile: Box::new(self.capability_profile.as_ref().into()),
                     control: self.control.snapshot().as_ref().into(),
                 },
             )),
@@ -181,7 +187,7 @@ where
     }
 
     fn handle_control(&self, request_id: u64, action: WireAction, reason: WireReason) -> Vec<u8> {
-        if let Some(response) = self.unsupported_kernel_response(request_id) {
+        if let Some(response) = self.mutation_gate_response(request_id) {
             return response;
         }
 
@@ -235,7 +241,7 @@ where
     }
 
     fn handle_event_intent(&self, request_id: u64, intent: LegacyIntent) -> Vec<u8> {
-        if let Some(response) = self.unsupported_kernel_response(request_id) {
+        if let Some(response) = self.mutation_gate_response(request_id) {
             return response;
         }
         match self.control.submit_and_wait(intent) {
@@ -255,7 +261,7 @@ where
     }
 
     fn handle_configuration_event(&self, request_id: u64) -> Vec<u8> {
-        if let Some(response) = self.unsupported_kernel_response(request_id) {
+        if let Some(response) = self.mutation_gate_response(request_id) {
             return response;
         }
         match self.control.configuration_changed(Reason::ConfigChanged) {
@@ -285,15 +291,24 @@ where
         }
     }
 
-    fn unsupported_kernel_response(&self, request_id: u64) -> Option<Vec<u8>> {
-        let KernelSupport::Unsupported { found, minimum } = self.kernel_support else {
-            return None;
-        };
-        Some(encode_response(ResponseEnvelope::error(
-            request_id,
-            "unsupported_kernel",
-            format!("kernel {found} is below minimum {minimum}"),
-        )))
+    fn mutation_gate_response(&self, request_id: u64) -> Option<Vec<u8>> {
+        match self.capability_profile.legacy_mutation_gate() {
+            LegacyMutationGate::Allowed => None,
+            LegacyMutationGate::ReadOnly {
+                kernel: KernelMutationStatus::Unsupported { found, minimum },
+                ..
+            } => Some(encode_response(ResponseEnvelope::error(
+                request_id,
+                "unsupported_kernel",
+                format!("kernel {found} is below minimum {minimum}"),
+            ))),
+            LegacyMutationGate::ReadOnly { .. } => Some(encode_response(ResponseEnvelope::error(
+                request_id,
+                "read_only_profile",
+                "capability profile is read-only because kernel or boot identity is unverified"
+                    .to_owned(),
+            ))),
+        }
     }
 }
 
@@ -598,7 +613,9 @@ enum WireResult {
 enum ResponseBody {
     Pong,
     Snapshot {
-        kernel: WireKernelSupport,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        kernel: Option<WireKernelSupport>,
+        capability_profile: Box<WireCapabilityProfile>,
         control: WireControlSnapshot,
     },
     Operation {
@@ -628,7 +645,7 @@ impl From<WireEventDisposition> for EventDisposition {
     }
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 enum WireKernelSupport {
     Supported { version: String },
@@ -649,27 +666,372 @@ impl From<KernelSupport> for WireKernelSupport {
     }
 }
 
-impl TryFrom<WireKernelSupport> for KernelSupport {
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct WireCapabilityProfile {
+    schema_version: u16,
+    revision: u64,
+    boot_identity: WireObservation<String>,
+    kernel: WireKernelFacts,
+    selinux: WireObservation<WireSelinuxMode>,
+    legacy_bridge: WireLegacyBridgeFacts,
+}
+
+impl From<&CapabilityProfile> for WireCapabilityProfile {
+    fn from(profile: &CapabilityProfile) -> Self {
+        Self {
+            schema_version: profile.schema_version(),
+            revision: profile.revision().get(),
+            boot_identity: wire_boot_identity(profile.boot_identity()),
+            kernel: WireKernelFacts {
+                release: wire_kernel_release(profile.kernel().release()),
+                version: wire_kernel_version(profile.kernel().version()),
+                minimum: MIN_SUPPORTED_KERNEL.to_string(),
+                gate: profile.legacy_mutation_gate().into(),
+            },
+            selinux: wire_selinux(profile.selinux()),
+            legacy_bridge: profile.legacy_bridge().into(),
+        }
+    }
+}
+
+impl TryFrom<WireCapabilityProfile> for CapabilityProfile {
     type Error = ControlError;
 
-    fn try_from(support: WireKernelSupport) -> Result<Self, Self::Error> {
-        match support {
-            WireKernelSupport::Supported { version } => KernelVersion::parse_release(&version)
-                .map(Self::Supported)
-                .map_err(|error| {
-                    ControlError::dispatcher(format!("invalid daemon kernel version: {error}"))
-                }),
-            WireKernelSupport::Unsupported { found, minimum } => {
-                let found = KernelVersion::parse_release(&found).map_err(|error| {
-                    ControlError::dispatcher(format!("invalid daemon kernel version: {error}"))
-                })?;
-                let minimum = KernelVersion::parse_release(&minimum).map_err(|error| {
-                    ControlError::dispatcher(format!("invalid daemon minimum kernel: {error}"))
-                })?;
-                Ok(Self::Unsupported { found, minimum })
+    fn try_from(wire: WireCapabilityProfile) -> Result<Self, Self::Error> {
+        if wire.schema_version != CAPABILITY_PROFILE_SCHEMA_VERSION {
+            return Err(invalid_capability_profile(format!(
+                "schema version {} is unsupported; expected {CAPABILITY_PROFILE_SCHEMA_VERSION}",
+                wire.schema_version
+            )));
+        }
+        let revision = flux_core::CapabilityProfileRevision::new(wire.revision)
+            .ok_or_else(|| invalid_capability_profile("revision must be nonzero".to_owned()))?;
+
+        let boot_identity = wire.boot_identity.try_map(|value| {
+            BootIdentity::parse(&value).map_err(|error| {
+                invalid_capability_profile(format!("invalid boot identity: {error}"))
+            })
+        })?;
+        let WireKernelFacts {
+            release,
+            version,
+            minimum,
+            gate,
+        } = wire.kernel;
+        let release = release.try_map(|value| {
+            KernelRelease::new(value).map_err(|error| {
+                invalid_capability_profile(format!("invalid kernel release: {error}"))
+            })
+        })?;
+        let kernel = KernelFacts::from_release(release);
+        if version != wire_kernel_version(kernel.version()) {
+            return Err(invalid_capability_profile(
+                "kernel release and parsed version observations disagree".to_owned(),
+            ));
+        }
+        let minimum = KernelVersion::parse_release(&minimum).map_err(|error| {
+            invalid_capability_profile(format!("invalid minimum kernel version: {error}"))
+        })?;
+        if minimum != MIN_SUPPORTED_KERNEL {
+            return Err(invalid_capability_profile(format!(
+                "minimum kernel {minimum} does not match {MIN_SUPPORTED_KERNEL}"
+            )));
+        }
+
+        let selinux = wire.selinux.try_map(|mode| Ok(mode.into()))?;
+        let legacy_bridge = wire.legacy_bridge.try_into()?;
+        let profile =
+            CapabilityProfile::new(revision, boot_identity, kernel, selinux, legacy_bridge);
+        if gate != profile.legacy_mutation_gate().into() {
+            return Err(invalid_capability_profile(
+                "reported mutation gate disagrees with kernel and boot observations".to_owned(),
+            ));
+        }
+        Ok(profile)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct WireKernelFacts {
+    release: WireObservation<String>,
+    version: WireObservation<String>,
+    minimum: String,
+    gate: WireLegacyMutationGate,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "status", content = "value", rename_all = "snake_case")]
+enum WireObservation<T> {
+    Verified(T),
+    Absent,
+    Denied,
+    Malformed,
+    Unavailable,
+}
+
+impl<T> WireObservation<T> {
+    fn try_map<U, E>(self, map: impl FnOnce(T) -> Result<U, E>) -> Result<Observation<U>, E> {
+        match self {
+            Self::Verified(value) => map(value).map(Observation::Verified),
+            Self::Absent => Ok(Observation::Absent),
+            Self::Denied => Ok(Observation::Denied),
+            Self::Malformed => Ok(Observation::Malformed),
+            Self::Unavailable => Ok(Observation::Unavailable),
+        }
+    }
+}
+
+impl<T> From<Observation<T>> for WireObservation<T> {
+    fn from(observation: Observation<T>) -> Self {
+        match observation {
+            Observation::Verified(value) => Self::Verified(value),
+            Observation::Absent => Self::Absent,
+            Observation::Denied => Self::Denied,
+            Observation::Malformed => Self::Malformed,
+            Observation::Unavailable => Self::Unavailable,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WireSelinuxMode {
+    Enforcing,
+    Permissive,
+}
+
+impl From<WireSelinuxMode> for SelinuxMode {
+    fn from(mode: WireSelinuxMode) -> Self {
+        match mode {
+            WireSelinuxMode::Enforcing => Self::Enforcing,
+            WireSelinuxMode::Permissive => Self::Permissive,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct WireLegacyBridgeFacts {
+    mutation_writer: WireLegacyMutationWriter,
+    rule_backend: WireLegacyRuleBackend,
+    address_synchronization: WireLegacyAddressSynchronization,
+    shell: WireObservation<WireLegacyArtifactReadiness>,
+    dispatcher: WireObservation<WireLegacyArtifactReadiness>,
+    addrsync: WireObservation<WireLegacyArtifactReadiness>,
+}
+
+impl From<&LegacyBridgeFacts> for WireLegacyBridgeFacts {
+    fn from(bridge: &LegacyBridgeFacts) -> Self {
+        Self {
+            mutation_writer: bridge.mutation_writer().into(),
+            rule_backend: bridge.rule_backend().into(),
+            address_synchronization: bridge.address_synchronization().into(),
+            shell: wire_legacy_artifact(bridge.shell()),
+            dispatcher: wire_legacy_artifact(bridge.dispatcher()),
+            addrsync: wire_legacy_artifact(bridge.addrsync()),
+        }
+    }
+}
+
+impl TryFrom<WireLegacyBridgeFacts> for LegacyBridgeFacts {
+    type Error = ControlError;
+
+    fn try_from(bridge: WireLegacyBridgeFacts) -> Result<Self, Self::Error> {
+        let WireLegacyBridgeFacts {
+            mutation_writer: WireLegacyMutationWriter::Dispatcher,
+            rule_backend: WireLegacyRuleBackend::IptablesRestore,
+            address_synchronization: WireLegacyAddressSynchronization::StandaloneAddrsyncdViaScript,
+            shell,
+            dispatcher,
+            addrsync,
+        } = bridge;
+        Ok(Self::new(
+            shell.try_map(|artifact| Ok(artifact.into()))?,
+            dispatcher.try_map(|artifact| Ok(artifact.into()))?,
+            addrsync.try_map(|artifact| Ok(artifact.into()))?,
+        ))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WireLegacyMutationWriter {
+    Dispatcher,
+}
+
+impl From<LegacyMutationWriter> for WireLegacyMutationWriter {
+    fn from(writer: LegacyMutationWriter) -> Self {
+        match writer {
+            LegacyMutationWriter::Dispatcher => Self::Dispatcher,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WireLegacyRuleBackend {
+    IptablesRestore,
+}
+
+impl From<LegacyRuleBackend> for WireLegacyRuleBackend {
+    fn from(backend: LegacyRuleBackend) -> Self {
+        match backend {
+            LegacyRuleBackend::IptablesRestore => Self::IptablesRestore,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WireLegacyAddressSynchronization {
+    StandaloneAddrsyncdViaScript,
+}
+
+impl From<LegacyAddressSynchronization> for WireLegacyAddressSynchronization {
+    fn from(address_synchronization: LegacyAddressSynchronization) -> Self {
+        match address_synchronization {
+            LegacyAddressSynchronization::StandaloneAddrsyncdViaScript => {
+                Self::StandaloneAddrsyncdViaScript
             }
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct WireLegacyArtifactReadiness {
+    resolution: WireLegacyArtifactResolution,
+    ready: bool,
+}
+
+impl From<WireLegacyArtifactReadiness> for LegacyArtifactReadiness {
+    fn from(artifact: WireLegacyArtifactReadiness) -> Self {
+        Self::new(artifact.resolution.into(), artifact.ready)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WireLegacyArtifactResolution {
+    Direct,
+    SymbolicLink,
+}
+
+impl From<LegacyArtifactResolution> for WireLegacyArtifactResolution {
+    fn from(resolution: LegacyArtifactResolution) -> Self {
+        match resolution {
+            LegacyArtifactResolution::Direct => Self::Direct,
+            LegacyArtifactResolution::SymbolicLink => Self::SymbolicLink,
+        }
+    }
+}
+
+impl From<WireLegacyArtifactResolution> for LegacyArtifactResolution {
+    fn from(resolution: WireLegacyArtifactResolution) -> Self {
+        match resolution {
+            WireLegacyArtifactResolution::Direct => Self::Direct,
+            WireLegacyArtifactResolution::SymbolicLink => Self::SymbolicLink,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum WireLegacyMutationGate {
+    Allowed,
+    ReadOnly {
+        kernel: WireKernelMutationStatus,
+        boot_identity: WireBootIdentityMutationStatus,
+    },
+}
+
+impl From<LegacyMutationGate> for WireLegacyMutationGate {
+    fn from(gate: LegacyMutationGate) -> Self {
+        match gate {
+            LegacyMutationGate::Allowed => Self::Allowed,
+            LegacyMutationGate::ReadOnly {
+                kernel,
+                boot_identity,
+            } => Self::ReadOnly {
+                kernel: kernel.into(),
+                boot_identity: boot_identity.into(),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum WireKernelMutationStatus {
+    Eligible,
+    Unsupported { found: String, minimum: String },
+    Unverified,
+}
+
+impl From<KernelMutationStatus> for WireKernelMutationStatus {
+    fn from(status: KernelMutationStatus) -> Self {
+        match status {
+            KernelMutationStatus::Eligible => Self::Eligible,
+            KernelMutationStatus::Unsupported { found, minimum } => Self::Unsupported {
+                found: found.to_string(),
+                minimum: minimum.to_string(),
+            },
+            KernelMutationStatus::Unverified => Self::Unverified,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WireBootIdentityMutationStatus {
+    Verified,
+    Unverified,
+}
+
+impl From<BootIdentityMutationStatus> for WireBootIdentityMutationStatus {
+    fn from(status: BootIdentityMutationStatus) -> Self {
+        match status {
+            BootIdentityMutationStatus::Verified => Self::Verified,
+            BootIdentityMutationStatus::Unverified => Self::Unverified,
+        }
+    }
+}
+
+fn wire_boot_identity(identity: &Observation<BootIdentity>) -> WireObservation<String> {
+    wire_observation(identity, |identity| identity.as_str().to_owned())
+}
+
+fn wire_kernel_release(release: &Observation<KernelRelease>) -> WireObservation<String> {
+    wire_observation(release, |release| release.as_str().to_owned())
+}
+
+fn wire_kernel_version(version: &Observation<KernelVersion>) -> WireObservation<String> {
+    wire_observation(version, ToString::to_string)
+}
+
+fn wire_selinux(mode: &Observation<SelinuxMode>) -> WireObservation<WireSelinuxMode> {
+    wire_observation(mode, |mode| match mode {
+        SelinuxMode::Enforcing => WireSelinuxMode::Enforcing,
+        SelinuxMode::Permissive => WireSelinuxMode::Permissive,
+    })
+}
+
+fn wire_legacy_artifact(
+    artifact: &Observation<LegacyArtifactReadiness>,
+) -> WireObservation<WireLegacyArtifactReadiness> {
+    wire_observation(artifact, |artifact| WireLegacyArtifactReadiness {
+        resolution: artifact.resolution().into(),
+        ready: artifact.is_ready(),
+    })
+}
+
+fn wire_observation<T, U>(
+    observation: &Observation<T>,
+    map: impl FnOnce(&T) -> U,
+) -> WireObservation<U> {
+    observation.map_ref(map).into()
+}
+
+fn invalid_capability_profile(message: String) -> ControlError {
+    ControlError::protocol(format!("invalid daemon capability profile: {message}"))
 }
 
 #[derive(Deserialize, Serialize)]
@@ -915,11 +1277,25 @@ pub(crate) fn decode_status_response(
     let response = decode_response(packet, expected_request_id)?;
     match response.result {
         WireResult::Ok {
-            body: ResponseBody::Snapshot { kernel, control },
-        } => Ok(DaemonSnapshot {
-            kernel_support: kernel.try_into()?,
-            control: control.into(),
-        }),
+            body:
+                ResponseBody::Snapshot {
+                    kernel,
+                    capability_profile,
+                    control,
+                },
+        } => {
+            let capability_profile: CapabilityProfile = (*capability_profile).try_into()?;
+            let expected_kernel = capability_profile.kernel_support().map(Into::into);
+            if kernel != expected_kernel {
+                return Err(invalid_capability_profile(
+                    "legacy kernel field disagrees with capability profile".to_owned(),
+                ));
+            }
+            Ok(DaemonSnapshot {
+                capability_profile,
+                control: control.into(),
+            })
+        }
         WireResult::Ok { .. } => Err(unexpected_response("status")),
         WireResult::Error { code, message } => Err(rejected_response(code, message)),
     }
@@ -948,7 +1324,7 @@ pub(crate) fn decode_event_response(
 
 fn encode_request(request: RequestEnvelope) -> Result<Vec<u8>, ControlError> {
     serde_json::to_vec(&request)
-        .map_err(|error| ControlError::dispatcher(format!("encode control request: {error}")))
+        .map_err(|error| ControlError::protocol(format!("encode control request: {error}")))
 }
 
 fn decode_response(
@@ -956,15 +1332,15 @@ fn decode_response(
     expected_request_id: u64,
 ) -> Result<ResponseEnvelope, ControlError> {
     let response = serde_json::from_slice::<ResponseEnvelope>(packet)
-        .map_err(|error| ControlError::dispatcher(format!("decode control response: {error}")))?;
+        .map_err(|error| ControlError::protocol(format!("decode control response: {error}")))?;
     if response.protocol_version != PROTOCOL_VERSION {
-        return Err(ControlError::dispatcher(format!(
+        return Err(ControlError::protocol(format!(
             "daemon protocol version {} does not match {PROTOCOL_VERSION}",
             response.protocol_version
         )));
     }
     if response.request_id != expected_request_id {
-        return Err(ControlError::dispatcher(format!(
+        return Err(ControlError::protocol(format!(
             "daemon response request ID {} does not match {expected_request_id}",
             response.request_id
         )));
@@ -973,13 +1349,66 @@ fn decode_response(
 }
 
 fn unexpected_response(request_kind: &str) -> ControlError {
-    ControlError::dispatcher(format!(
+    ControlError::protocol(format!(
         "daemon returned an unexpected body for a {request_kind} request"
     ))
 }
 
 fn rejected_response(code: String, message: String) -> ControlError {
-    ControlError::dispatcher(format!(
-        "daemon rejected control request ({code}): {message}"
-    ))
+    ControlError::request_rejected(code, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use flux_core::{CapabilityProfile, CapabilityProfileRevision};
+    use flux_testkit::CapabilityProfileFixture;
+
+    use super::*;
+
+    #[test]
+    fn status_decoder_rejects_an_incoherent_legacy_kernel_field() {
+        let profile = CapabilityProfileFixture::supported();
+        let response = encode_response(ResponseEnvelope::ok(
+            91,
+            ResponseBody::Snapshot {
+                kernel: Some(WireKernelSupport::Supported {
+                    version: "6.6.0".to_owned(),
+                }),
+                capability_profile: Box::new((&profile).into()),
+                control: (&ControlSnapshot::default()).into(),
+            },
+        ));
+
+        let error = decode_status_response(&response, 91).expect_err("incoherent status");
+
+        assert_eq!(
+            error.to_string(),
+            "control protocol: invalid daemon capability profile: legacy kernel field disagrees with capability profile"
+        );
+    }
+
+    #[test]
+    fn status_decoder_preserves_a_nonzero_profile_revision() {
+        let initial = CapabilityProfileFixture::supported();
+        let revision = CapabilityProfileRevision::new(47).expect("nonzero revision");
+        let profile = CapabilityProfile::new(
+            revision,
+            initial.boot_identity().clone(),
+            initial.kernel().clone(),
+            initial.selinux().clone(),
+            initial.legacy_bridge().clone(),
+        );
+        let response = encode_response(ResponseEnvelope::ok(
+            92,
+            ResponseBody::Snapshot {
+                kernel: profile.kernel_support().map(Into::into),
+                capability_profile: Box::new((&profile).into()),
+                control: (&ControlSnapshot::default()).into(),
+            },
+        ));
+
+        let snapshot = decode_status_response(&response, 92).expect("coherent status");
+
+        assert_eq!(snapshot.capability_profile.revision(), revision);
+    }
 }

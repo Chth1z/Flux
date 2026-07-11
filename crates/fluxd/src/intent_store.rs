@@ -1,15 +1,13 @@
 use std::error::Error;
 use std::fmt;
-use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use flux_core::AdministrativeState;
+use flux_core::{AdministrativeState, BootIdentity};
 use serde::{Deserialize, Serialize};
 
 const INTENT_SCHEMA_VERSION: u16 = 1;
-const MAX_BOOT_ID_BYTES: usize = 128;
 // The versioned intent record contains only a boot ID and a two-state enum.
 // A 4 KiB budget leaves ample schema-growth headroom while bounding startup I/O.
 const MAX_INTENT_RECORD_BYTES: usize = 4096;
@@ -18,20 +16,19 @@ static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdministrativeIntentStore {
     record_path: PathBuf,
-    boot_id_path: PathBuf,
+    boot_identity: BootIdentity,
 }
 
 impl AdministrativeIntentStore {
     #[must_use]
-    pub fn new(record_path: impl AsRef<Path>, boot_id_path: impl AsRef<Path>) -> Self {
+    pub fn new(record_path: impl AsRef<Path>, boot_identity: BootIdentity) -> Self {
         Self {
             record_path: record_path.as_ref().to_owned(),
-            boot_id_path: boot_id_path.as_ref().to_owned(),
+            boot_identity,
         }
     }
 
     pub fn load(&self) -> Result<AdministrativeState, IntentStoreError> {
-        let boot_id = self.read_boot_id()?;
         let Some(encoded) = record_io::read(&self.record_path)? else {
             return Ok(AdministrativeState::Unknown);
         };
@@ -40,7 +37,7 @@ impl AdministrativeIntentStore {
         if record.schema_version != INTENT_SCHEMA_VERSION {
             return Err(IntentStoreError::UnsupportedSchema(record.schema_version));
         }
-        if record.boot_id != boot_id {
+        if record.boot_id != self.boot_identity.as_str() {
             return Ok(AdministrativeState::Unknown);
         }
         Ok(record.administrative_state.into())
@@ -48,25 +45,14 @@ impl AdministrativeIntentStore {
 
     pub fn persist(&self, state: AdministrativeState) -> Result<(), IntentStoreError> {
         let state = StoredAdministrativeState::try_from(state)?;
-        let boot_id = self.read_boot_id()?;
         let record = IntentRecord {
             schema_version: INTENT_SCHEMA_VERSION,
-            boot_id,
+            boot_id: self.boot_identity.as_str().to_owned(),
             administrative_state: state,
         };
         let mut encoded = serde_json::to_vec(&record).map_err(IntentStoreError::EncodeRecord)?;
         encoded.push(b'\n');
         record_io::write(&self.record_path, &encoded)
-    }
-
-    fn read_boot_id(&self) -> Result<String, IntentStoreError> {
-        let boot_id = fs::read_to_string(&self.boot_id_path)
-            .map_err(|error| IntentStoreError::io("read boot identity", error))?;
-        let boot_id = boot_id.trim();
-        if boot_id.is_empty() || boot_id.len() > MAX_BOOT_ID_BYTES {
-            return Err(IntentStoreError::InvalidBootIdentity);
-        }
-        Ok(boot_id.to_owned())
     }
 }
 
@@ -111,7 +97,6 @@ pub enum IntentStoreError {
         operation: &'static str,
         source: io::Error,
     },
-    InvalidBootIdentity,
     InvalidRecord(serde_json::Error),
     EncodeRecord(serde_json::Error),
     UnsupportedSchema(u16),
@@ -132,8 +117,7 @@ impl IntentStoreError {
     pub fn raw_os_error(&self) -> Option<i32> {
         match self {
             Self::Io { source, .. } => source.raw_os_error(),
-            Self::InvalidBootIdentity
-            | Self::InvalidRecord(_)
+            Self::InvalidRecord(_)
             | Self::EncodeRecord(_)
             | Self::UnsupportedSchema(_)
             | Self::RecordTooLarge { .. }
@@ -148,7 +132,6 @@ impl fmt::Display for IntentStoreError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io { operation, source } => write!(formatter, "{operation} failed: {source}"),
-            Self::InvalidBootIdentity => formatter.write_str("boot identity is empty or too large"),
             Self::InvalidRecord(error) => write!(formatter, "invalid intent record: {error}"),
             Self::EncodeRecord(error) => write!(formatter, "cannot encode intent record: {error}"),
             Self::UnsupportedSchema(version) => {
@@ -181,8 +164,7 @@ impl Error for IntentStoreError {
         match self {
             Self::Io { source, .. } => Some(source),
             Self::InvalidRecord(error) | Self::EncodeRecord(error) => Some(error),
-            Self::InvalidBootIdentity
-            | Self::UnsupportedSchema(_)
+            Self::UnsupportedSchema(_)
             | Self::RecordTooLarge { .. }
             | Self::NotRegularFile(_)
             | Self::UnknownState

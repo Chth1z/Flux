@@ -1,16 +1,17 @@
 use std::fs;
 
-use flux_core::AdministrativeState;
+use flux_core::{AdministrativeState, BootIdentity};
 use fluxd::AdministrativeIntentStore;
 use tempfile::tempdir;
+
+const BOOT_A: &str = "11111111-1111-4111-8111-111111111111";
+const BOOT_B: &str = "22222222-2222-4222-8222-222222222222";
 
 #[test]
 fn same_boot_administrative_intent_round_trips_through_the_runtime_record() {
     let directory = tempdir().expect("temporary directory");
-    let boot_id_path = directory.path().join("boot_id");
     let record_path = directory.path().join("intent.json");
-    fs::write(&boot_id_path, "boot-a\n").expect("write boot identity");
-    let store = AdministrativeIntentStore::new(&record_path, &boot_id_path);
+    let store = AdministrativeIntentStore::new(&record_path, boot_identity(BOOT_A));
 
     assert_eq!(
         store.load().expect("missing record is valid"),
@@ -23,9 +24,8 @@ fn same_boot_administrative_intent_round_trips_through_the_runtime_record() {
 
     assert_eq!(
         fs::read_to_string(&record_path).expect("runtime record"),
-        concat!(
-            "{\"schema_version\":1,\"boot_id\":\"boot-a\",",
-            "\"administrative_state\":\"running\"}\n"
+        format!(
+            "{{\"schema_version\":1,\"boot_id\":\"{BOOT_A}\",\"administrative_state\":\"running\"}}\n"
         )
     );
     assert_eq!(
@@ -37,18 +37,12 @@ fn same_boot_administrative_intent_round_trips_through_the_runtime_record() {
 #[test]
 fn previous_boot_intent_is_ignored() {
     let directory = tempdir().expect("temporary directory");
-    let boot_id_path = directory.path().join("boot_id");
     let record_path = directory.path().join("intent.json");
-    fs::write(&boot_id_path, "boot-b\n").expect("write current boot identity");
-    fs::write(
-        &record_path,
-        concat!(
-            "{\"schema_version\":1,\"boot_id\":\"boot-a\",",
-            "\"administrative_state\":\"stopped\"}\n"
-        ),
-    )
-    .expect("write previous-boot record");
-    let store = AdministrativeIntentStore::new(&record_path, &boot_id_path);
+    let previous_boot = AdministrativeIntentStore::new(&record_path, boot_identity(BOOT_A));
+    previous_boot
+        .persist(AdministrativeState::Stopped)
+        .expect("persist previous-boot intent");
+    let store = AdministrativeIntentStore::new(&record_path, boot_identity(BOOT_B));
 
     assert_eq!(
         store.load().expect("stale record is valid"),
@@ -59,11 +53,9 @@ fn previous_boot_intent_is_ignored() {
 #[test]
 fn oversized_administrative_intent_record_is_rejected_before_decoding() {
     let directory = tempdir().expect("temporary directory");
-    let boot_id_path = directory.path().join("boot_id");
     let record_path = directory.path().join("intent.json");
-    fs::write(&boot_id_path, "boot-a\n").expect("write boot identity");
     fs::write(&record_path, vec![b'x'; 4097]).expect("write oversized intent record");
-    let store = AdministrativeIntentStore::new(&record_path, &boot_id_path);
+    let store = AdministrativeIntentStore::new(&record_path, boot_identity(BOOT_A));
 
     let error = store
         .load()
@@ -84,13 +76,11 @@ fn fifo_intent_record_is_rejected_without_blocking() {
     use std::time::Duration;
 
     let directory = tempdir().expect("temporary directory");
-    let boot_id_path = directory.path().join("boot_id");
     let record_path = directory.path().join("intent.json");
-    fs::write(&boot_id_path, "boot-a\n").expect("write boot identity");
     let fifo_path = CString::new(record_path.as_os_str().as_bytes()).expect("FIFO path CString");
     // SAFETY: `fifo_path` is NUL-terminated and the mode is a valid permission mask.
     assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
-    let store = AdministrativeIntentStore::new(&record_path, &boot_id_path);
+    let store = AdministrativeIntentStore::new(&record_path, boot_identity(BOOT_A));
     let (result_sender, result_receiver) = mpsc::sync_channel(1);
     let loader = thread::spawn(move || {
         result_sender
@@ -126,9 +116,8 @@ fn fifo_intent_record_is_rejected_without_blocking() {
 #[test]
 fn unknown_state_cannot_replace_a_concrete_administrative_intent() {
     let directory = tempdir().expect("temporary directory");
-    let boot_id_path = directory.path().join("boot_id");
-    fs::write(&boot_id_path, "boot-a\n").expect("write boot identity");
-    let store = AdministrativeIntentStore::new(directory.path().join("intent.json"), &boot_id_path);
+    let store =
+        AdministrativeIntentStore::new(directory.path().join("intent.json"), boot_identity(BOOT_A));
 
     let error = store
         .persist(AdministrativeState::Unknown)
@@ -145,12 +134,11 @@ fn parent_symlink_is_rejected_without_writing_through_it() {
     let directory = tempdir().expect("temporary directory");
     let outside = directory.path().join("outside");
     let linked_parent = directory.path().join("linked-state");
-    let boot_id_path = directory.path().join("boot_id");
     fs::create_dir(&outside).expect("create outside directory");
     symlink(&outside, &linked_parent).expect("create parent symlink");
-    fs::write(&boot_id_path, "boot-a\n").expect("write boot identity");
 
-    let store = AdministrativeIntentStore::new(linked_parent.join("intent.json"), &boot_id_path);
+    let store =
+        AdministrativeIntentStore::new(linked_parent.join("intent.json"), boot_identity(BOOT_A));
     let load_error = store
         .load()
         .expect_err("symlinked parent must also be rejected for reads");
@@ -169,13 +157,11 @@ fn final_symlink_is_rejected_without_reading_or_replacing_its_target() {
     use std::os::unix::fs::symlink;
 
     let directory = tempdir().expect("temporary directory");
-    let boot_id_path = directory.path().join("boot_id");
     let outside_record = directory.path().join("outside.json");
     let record_path = directory.path().join("intent.json");
-    fs::write(&boot_id_path, "boot-a\n").expect("write boot identity");
     fs::write(&outside_record, "do-not-touch\n").expect("write outside sentinel");
     symlink(&outside_record, &record_path).expect("create final symlink");
-    let store = AdministrativeIntentStore::new(&record_path, &boot_id_path);
+    let store = AdministrativeIntentStore::new(&record_path, boot_identity(BOOT_A));
 
     let load_error = store
         .load()
@@ -199,12 +185,19 @@ fn final_symlink_is_rejected_without_reading_or_replacing_its_target() {
 #[test]
 fn io_errors_expose_their_raw_os_error() {
     let directory = tempdir().expect("temporary directory");
-    let store = AdministrativeIntentStore::new(
-        directory.path().join("intent.json"),
-        directory.path().join("missing-boot-id"),
-    );
+    let blocked_parent = directory.path().join("not-a-directory");
+    fs::write(&blocked_parent, "blocks intent path traversal\n")
+        .expect("create non-directory parent");
+    let store =
+        AdministrativeIntentStore::new(blocked_parent.join("intent.json"), boot_identity(BOOT_A));
 
-    let error = store.load().expect_err("missing boot identity must fail");
+    let error = store
+        .persist(AdministrativeState::Running)
+        .expect_err("intent path traversal must fail");
 
     assert!(error.raw_os_error().is_some());
+}
+
+fn boot_identity(value: &str) -> BootIdentity {
+    BootIdentity::parse(value).expect("test boot identity is canonical")
 }

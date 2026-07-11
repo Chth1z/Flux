@@ -167,6 +167,7 @@ All module files are located at `/data/adb/flux/`:
 │
 ├── conf/
 │   ├── config.json           # Generated sing-box configuration
+│   ├── flux.toml             # Strict fluxd daemon configuration
 │   ├── settings.ini          # User configuration file
 │   └── template.json         # Configuration template
 │
@@ -209,7 +210,7 @@ All module files are located at `/data/adb/flux/`:
 
 ## Configuration
 
-Main configuration file: `/data/adb/flux/conf/settings.ini`. Changes take effect after service restart.
+The legacy networking configuration remains `/data/adb/flux/conf/settings.ini`. The Rust control plane uses the strict `/data/adb/flux/conf/flux.toml` daemon configuration; schema 1 rejects unknown fields and accepts only `daemon.fail_policy = "open"`. Changes to `flux.toml` currently require a daemon restart, while `settings.ini` retains its existing event-driven reload path.
 
 ### 1. General Configuration
 | Option | Description | Default |

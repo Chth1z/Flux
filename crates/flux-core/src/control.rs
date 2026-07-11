@@ -253,6 +253,12 @@ pub enum ControlError {
         source: Arc<dyn Error + Send + Sync>,
         recovery: &'static str,
     },
+    RequestRejected {
+        code: String,
+        message: String,
+    },
+    Protocol(String),
+    Transport(String),
     Dispatcher(String),
 }
 
@@ -271,6 +277,40 @@ impl ControlError {
             operation,
             source: Arc::new(source),
             recovery,
+        }
+    }
+
+    #[must_use]
+    pub fn request_rejected(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::RequestRejected {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn protocol(message: impl Into<String>) -> Self {
+        Self::Protocol(message.into())
+    }
+
+    #[must_use]
+    pub fn transport(message: impl Into<String>) -> Self {
+        Self::Transport(message.into())
+    }
+
+    #[must_use]
+    pub fn rejection_code(&self) -> Option<&str> {
+        match self {
+            Self::RequestRejected { code, .. } => Some(code),
+            Self::InvalidQueueCapacity
+            | Self::QueueFull
+            | Self::BridgeStopped
+            | Self::OperationAlreadyConsumed
+            | Self::WorkerStart(_)
+            | Self::Persistence { .. }
+            | Self::Protocol(_)
+            | Self::Transport(_)
+            | Self::Dispatcher(_) => None,
         }
     }
 }
@@ -297,6 +337,11 @@ impl fmt::Display for ControlError {
                 formatter,
                 "cannot persist control state during {operation}: {source}; recovery: {recovery}"
             ),
+            Self::RequestRejected { code, message } => {
+                write!(formatter, "control request rejected ({code}): {message}")
+            }
+            Self::Protocol(message) => write!(formatter, "control protocol: {message}"),
+            Self::Transport(message) => write!(formatter, "control transport: {message}"),
             Self::Dispatcher(message) => write!(formatter, "legacy dispatcher failed: {message}"),
         }
     }
@@ -311,6 +356,9 @@ impl Error for ControlError {
             | Self::BridgeStopped
             | Self::OperationAlreadyConsumed
             | Self::WorkerStart(_)
+            | Self::RequestRejected { .. }
+            | Self::Protocol(_)
+            | Self::Transport(_)
             | Self::Dispatcher(_) => None,
         }
     }

@@ -1,10 +1,11 @@
 use std::error::Error;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use flux_core::{
-    ControlClient, ControlError, ControlService, KernelSupport, LegacyIntent, OperationReport,
+    CapabilityProfile, ControlClient, ControlError, ControlService, LegacyIntent, OperationReport,
 };
 use flux_platform::{PlatformError, ReactorError, SeqpacketConnection};
 
@@ -63,7 +64,7 @@ impl SocketControlClient {
 
     fn exchange(&self, request: &[u8]) -> Result<Vec<u8>, ControlError> {
         if request.len() > MAX_CONTROL_PACKET_BYTES {
-            return Err(ControlError::dispatcher(format!(
+            return Err(ControlError::protocol(format!(
                 "control request exceeds {MAX_CONTROL_PACKET_BYTES} bytes"
             )));
         }
@@ -96,9 +97,9 @@ where
     C: ControlService,
 {
     #[must_use]
-    pub fn new(kernel_support: KernelSupport, control: C) -> Self {
+    pub fn new(capability_profile: Arc<CapabilityProfile>, control: C) -> Self {
         Self {
-            handler: ProtocolHandler::new(kernel_support, control),
+            handler: ProtocolHandler::new(capability_profile, control),
         }
     }
 
@@ -142,5 +143,5 @@ impl Error for ControlSocketError {
 }
 
 fn control_transport_error(error: PlatformError) -> ControlError {
-    ControlError::dispatcher(format!("control socket transport: {error}"))
+    ControlError::transport(error.to_string())
 }

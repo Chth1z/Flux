@@ -44,7 +44,7 @@ Only `fluxd daemon` is long-lived. Sing-Box is its child. A boot shell watchdog 
 
 ## 3. Local control socket and Module routing
 
-The control socket is `/data/adb/flux/run/fluxd.sock`, Unix `SOCK_SEQPACKET`, protocol version 1.
+The control socket is `/data/adb/flux/run/fluxd.sock`, Unix `SOCK_SEQPACKET`, protocol version 2. Version 2 adds the coherent boot-scoped Capability Profile to status responses; version-1 requests are rejected explicitly rather than decoded against the new response shape.
 
 ### 3.1 Request envelope
 

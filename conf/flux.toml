@@ -1,0 +1,7 @@
+schema = 1
+
+[daemon]
+fail_policy = "open"
+reconcile_debounce_ms = 250
+event_queue_capacity = 256
+generation_history = 2

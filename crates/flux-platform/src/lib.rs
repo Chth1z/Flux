@@ -11,6 +11,8 @@ mod capability;
 mod child_process;
 mod legacy_dispatcher;
 mod netlink;
+#[allow(dead_code)]
+mod network_observer;
 mod phase_dispatcher;
 mod reactor;
 mod seqpacket;
@@ -19,6 +21,7 @@ mod sing_box;
 
 pub use capability::{CapabilityProfilePaths, SystemCapabilityProfileSource};
 pub use legacy_dispatcher::{LegacyScriptPaths, ProcessLegacyDispatcher};
+pub use network_observer::NetworkInventorySource;
 pub use phase_dispatcher::{
     DispatcherPhaseCommand, PhaseDispatcherError, PhaseDispatcherErrorKind, PhaseDispatcherPaths,
     ProcessPhaseDispatcher,

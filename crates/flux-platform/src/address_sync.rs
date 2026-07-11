@@ -459,7 +459,7 @@ impl RtnetlinkAddressEventDecoder {
         if !matches!(family, AF_INET | AF_INET6) {
             return Ok(None);
         }
-        let selected_by_policy = body[3] == 0 && (family != AF_INET6 || self.policy.ipv6_enabled);
+        let family_is_enabled = family != AF_INET6 || self.policy.ipv6_enabled;
 
         let attributes = &body[INTERFACE_ADDRESS_MESSAGE_LENGTH..];
         let mut peer_address = None;
@@ -585,12 +585,15 @@ impl RtnetlinkAddressEventDecoder {
                 )
             })?;
 
-        if !selected_by_policy || !is_global_usable(address) || self.policy.ignores_address(address)
+        if !family_is_enabled || !is_global_usable(address) || self.policy.ignores_address(address)
         {
             return Ok(None);
         }
 
-        let kind = if message_type == RTM_DELADDR || self.policy.removes_for_flags(flags) {
+        let kind = if message_type == RTM_DELADDR
+            || body[3] != 0
+            || self.policy.removes_for_flags(flags)
+        {
             AddressEventKind::Remove
         } else {
             AddressEventKind::Add

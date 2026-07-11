@@ -587,6 +587,8 @@ Do not enable `NETLINK_NO_ENOBUFS`; Flux needs loss notification. Reject and ret
 
 Phase 3 first delivers this as a read-only `NetworkInventorySource`. The production Adapter subscribes before starting its initial dump, queues or compensates for events racing that dump, and publishes only a complete canonical snapshot. `MSG_TRUNC`, `ENOBUFS`, `NLMSG_OVERRUN`, malformed/ambiguous messages, interrupted dumps, missing completion, and mixed sequences invalidate all partial state and force another full dump. Only a materially different complete snapshot advances the monotonic `NetworkEpoch`. Netlink readiness is registered with the existing daemon reactor and processed under a bounded per-turn budget; no second epoll owner is permitted.
 
+Implementation checkpoint: the current substrate implements canonical address snapshots, strict address decoding, AF_UNSPEC address dumps, loss/debounce/resynchronization state, and the subscribed route-netlink socket. This is not yet the production Adapter described above: link/route/rule fact codecs, the opaque socket/decoder/observer driver, and single-reactor registration remain required before the Phase 3 observer is complete.
+
 The existing `addrsyncd` batching, acknowledgement classification, debounce maximum, bounded maintenance work, and compensating resync behaviors are ported into this owner rather than called as a subprocess.
 
 ## 12. TUN specification

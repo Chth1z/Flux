@@ -150,6 +150,41 @@ fn flag_transitions_emit_removals_instead_of_leaving_stale_records() {
 }
 
 #[test]
+fn scope_transitions_emit_removals_instead_of_leaving_stale_records() {
+    let mut datagram = address_message_with_scope(
+        RTM_NEWADDR,
+        AF_INET,
+        24,
+        0,
+        253,
+        3,
+        &[(IFA_ADDRESS, &[10, 0, 0, 2])],
+    );
+    datagram.extend(address_message_with_scope(
+        RTM_DELADDR,
+        AF_INET,
+        24,
+        0,
+        254,
+        4,
+        &[(IFA_ADDRESS, &[10, 0, 0, 3])],
+    ));
+
+    let decoded = decoder(true)
+        .decode_datagram(&datagram)
+        .expect("valid scope transition datagram");
+
+    assert_eq!(
+        decoded
+            .events()
+            .iter()
+            .map(|event| event.kind())
+            .collect::<Vec<_>>(),
+        [AddressEventKind::Remove, AddressEventKind::Remove]
+    );
+}
+
+#[test]
 fn address_policy_rejects_out_of_range_and_unsupported_mapped_prefixes() {
     let v4 = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 0));
     assert_eq!(
@@ -712,6 +747,28 @@ fn address_message(
         interface_index,
         attributes,
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn address_message_with_scope(
+    message_type: u16,
+    family: u8,
+    prefix_length: u8,
+    flags: u8,
+    scope: u8,
+    interface_index: u32,
+    attributes: &[(u16, &[u8])],
+) -> Vec<u8> {
+    let mut message = address_message(
+        message_type,
+        family,
+        prefix_length,
+        flags,
+        interface_index,
+        attributes,
+    );
+    message[NETLINK_HEADER_LENGTH + 3] = scope;
+    message
 }
 
 #[allow(clippy::too_many_arguments)]

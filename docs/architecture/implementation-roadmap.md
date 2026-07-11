@@ -93,6 +93,8 @@ Shell phase scripts remain the only networking-state writer. Rust owns Sing-Box 
 
 ## Phase 3 — Absorb `addrsyncd` and policy routing
 
+Current implementation status: the committed foundation has a canonical address inventory and strict private rtnetlink address decoder. This checkpoint adds an AF_UNSPEC address-dump request, a loss-aware address observer state machine, and a subscribed nonblocking route-netlink socket substrate. It is still an incomplete Phase 3 tracer bullet: the opaque driver, existing-reactor integration, and canonical link/route/rule facts remain pending, and no native policy-routing mutation is admitted yet.
+
 ### Deliverables
 
 - Reimplement the required `addrsyncd` netlink behavior behind private `flux-platform` modules; do not expose raw rtnetlink framing as the product Interface. Resolve the standalone subproject's `UNLICENSED` provenance before copying source text into the GPL workspace.

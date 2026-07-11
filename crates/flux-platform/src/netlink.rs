@@ -7,6 +7,11 @@ pub(crate) const NLMSG_DONE: u16 = 3;
 pub(crate) const NLMSG_OVERRUN: u16 = 4;
 pub(crate) const NLM_F_DUMP_INTR: u16 = 0x10;
 
+// Kept private to the platform crate until the inventory observer owns the
+// higher-level resynchronization contract.
+#[allow(dead_code)]
+pub(crate) mod socket;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct NetlinkMessageHeader {
     length: u32,

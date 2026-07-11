@@ -2,10 +2,20 @@ use std::error::Error;
 use std::fmt;
 
 pub(crate) const NETLINK_HEADER_LENGTH: usize = 16;
+pub(crate) const NETLINK_ATTRIBUTE_HEADER_LENGTH: usize = 4;
 pub(crate) const NLMSG_ERROR: u16 = 2;
 pub(crate) const NLMSG_DONE: u16 = 3;
 pub(crate) const NLMSG_OVERRUN: u16 = 4;
 pub(crate) const NLM_F_DUMP_INTR: u16 = 0x10;
+pub(crate) const NLM_F_ACK_TLVS: u16 = 0x200;
+pub(crate) const NLA_F_NESTED: u16 = 1 << 15;
+pub(crate) const NLA_F_NET_BYTEORDER: u16 = 1 << 14;
+pub(crate) const NLA_TYPE_MASK: u16 = !(NLA_F_NESTED | NLA_F_NET_BYTEORDER);
+
+// Link facts are decoded privately until the inventory source coordinates a
+// complete link/address transaction and can publish both classes atomically.
+#[allow(dead_code)]
+pub(crate) mod link;
 
 // Kept private to the platform crate until the inventory observer owns the
 // higher-level resynchronization contract.
@@ -72,6 +82,237 @@ impl<'a> NetlinkMessage<'a> {
     pub(crate) const fn offset(self) -> usize {
         self.offset
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NetlinkAttribute<'a> {
+    raw_type: u16,
+    value: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> NetlinkAttribute<'a> {
+    #[must_use]
+    pub(crate) const fn attribute_type(self) -> u16 {
+        self.raw_type & NLA_TYPE_MASK
+    }
+
+    #[must_use]
+    pub(crate) const fn flags(self) -> u16 {
+        self.raw_type & !NLA_TYPE_MASK
+    }
+
+    #[must_use]
+    pub(crate) const fn value(self) -> &'a [u8] {
+        self.value
+    }
+
+    #[must_use]
+    pub(crate) const fn offset(self) -> usize {
+        self.offset
+    }
+
+    #[must_use]
+    pub(crate) const fn value_offset(self) -> usize {
+        self.offset + NETLINK_ATTRIBUTE_HEADER_LENGTH
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NetlinkAttributeErrorKind {
+    InvalidAttributeLength,
+    MissingAttributePadding,
+    InvalidAttributeFlags,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NetlinkAttributeError {
+    kind: NetlinkAttributeErrorKind,
+    offset: usize,
+}
+
+impl NetlinkAttributeError {
+    const fn new(kind: NetlinkAttributeErrorKind, offset: usize) -> Self {
+        Self { kind, offset }
+    }
+
+    #[must_use]
+    pub(crate) const fn kind(self) -> NetlinkAttributeErrorKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub(crate) const fn offset(self) -> usize {
+        self.offset
+    }
+}
+
+impl fmt::Display for NetlinkAttributeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "invalid netlink attribute at byte {}: {}",
+            self.offset,
+            match self.kind {
+                NetlinkAttributeErrorKind::InvalidAttributeLength => "invalid attribute length",
+                NetlinkAttributeErrorKind::MissingAttributePadding => {
+                    "missing aligned attribute padding"
+                }
+                NetlinkAttributeErrorKind::InvalidAttributeFlags => {
+                    "nested and network-byte-order flags are mutually exclusive"
+                }
+            }
+        )
+    }
+}
+
+impl Error for NetlinkAttributeError {}
+
+#[derive(Clone, Debug)]
+pub(crate) struct NetlinkAttributeIter<'a> {
+    attributes: &'a [u8],
+    base_offset: usize,
+    offset: usize,
+    failed: bool,
+}
+
+impl<'a> NetlinkAttributeIter<'a> {
+    #[must_use]
+    pub(crate) const fn new(attributes: &'a [u8], base_offset: usize) -> Self {
+        Self {
+            attributes,
+            base_offset,
+            offset: 0,
+            failed: false,
+        }
+    }
+}
+
+impl<'a> Iterator for NetlinkAttributeIter<'a> {
+    type Item = Result<NetlinkAttribute<'a>, NetlinkAttributeError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.failed || self.offset == self.attributes.len() {
+            return None;
+        }
+
+        let remaining = &self.attributes[self.offset..];
+        let attribute_offset = self.base_offset + self.offset;
+        if remaining.len() < NETLINK_ATTRIBUTE_HEADER_LENGTH {
+            self.failed = true;
+            return Some(Err(NetlinkAttributeError::new(
+                NetlinkAttributeErrorKind::InvalidAttributeLength,
+                attribute_offset,
+            )));
+        }
+
+        let length = read_u16(remaining) as usize;
+        if length < NETLINK_ATTRIBUTE_HEADER_LENGTH || length > remaining.len() {
+            self.failed = true;
+            return Some(Err(NetlinkAttributeError::new(
+                NetlinkAttributeErrorKind::InvalidAttributeLength,
+                attribute_offset,
+            )));
+        }
+        let aligned_length = align4(length);
+        if aligned_length > remaining.len() {
+            self.failed = true;
+            return Some(Err(NetlinkAttributeError::new(
+                NetlinkAttributeErrorKind::MissingAttributePadding,
+                attribute_offset,
+            )));
+        }
+
+        let raw_type = read_u16(&remaining[2..]);
+        if raw_type & NLA_F_NESTED != 0 && raw_type & NLA_F_NET_BYTEORDER != 0 {
+            self.failed = true;
+            return Some(Err(NetlinkAttributeError::new(
+                NetlinkAttributeErrorKind::InvalidAttributeFlags,
+                attribute_offset,
+            )));
+        }
+
+        let attribute = NetlinkAttribute {
+            raw_type,
+            value: &remaining[NETLINK_ATTRIBUTE_HEADER_LENGTH..length],
+            offset: attribute_offset,
+        };
+        self.offset += aligned_length;
+        Some(Ok(attribute))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NetlinkDoneErrorKind {
+    InvalidPayload,
+    ErrorStatus,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NetlinkDoneError {
+    kind: NetlinkDoneErrorKind,
+    offset: usize,
+}
+
+impl NetlinkDoneError {
+    const fn new(kind: NetlinkDoneErrorKind, offset: usize) -> Self {
+        Self { kind, offset }
+    }
+
+    #[must_use]
+    pub(crate) const fn kind(self) -> NetlinkDoneErrorKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub(crate) const fn offset(self) -> usize {
+        self.offset
+    }
+}
+
+pub(crate) fn validate_done_payload(
+    payload: &[u8],
+    flags: u16,
+    payload_offset: usize,
+) -> Result<(), NetlinkDoneError> {
+    if payload.is_empty() {
+        return Ok(());
+    }
+    if payload.len() < std::mem::size_of::<i32>() {
+        return Err(NetlinkDoneError::new(
+            NetlinkDoneErrorKind::InvalidPayload,
+            payload_offset,
+        ));
+    }
+
+    let status = i32::from_ne_bytes(
+        payload[..4]
+            .try_into()
+            .expect("validated native-endian i32 payload"),
+    );
+    if status != 0 {
+        return Err(NetlinkDoneError::new(
+            NetlinkDoneErrorKind::ErrorStatus,
+            payload_offset,
+        ));
+    }
+
+    let attributes = &payload[4..];
+    if attributes.is_empty() {
+        return Ok(());
+    }
+    if flags & NLM_F_ACK_TLVS == 0 {
+        return Err(NetlinkDoneError::new(
+            NetlinkDoneErrorKind::InvalidPayload,
+            payload_offset + 4,
+        ));
+    }
+    for attribute in NetlinkAttributeIter::new(attributes, payload_offset + 4) {
+        attribute.map_err(|error| {
+            NetlinkDoneError::new(NetlinkDoneErrorKind::InvalidPayload, error.offset())
+        })?;
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

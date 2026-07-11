@@ -52,6 +52,277 @@ impl InterfaceIndex {
     }
 }
 
+/// Maximum interface-name payload stored without the kernel's terminal NUL.
+pub const INTERFACE_NAME_MAX_BYTES: usize = 15;
+/// Maximum raw `IFLA_INFO_KIND` bytes that fit inside its u16-sized `IFLA_LINKINFO` parent.
+pub const INTERFACE_LINK_KIND_MAX_BYTES: usize = 65_523;
+
+#[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct InterfaceName {
+    length: u8,
+    bytes: [u8; INTERFACE_NAME_MAX_BYTES],
+}
+
+impl InterfaceName {
+    #[must_use]
+    pub fn new(value: &[u8]) -> Option<Self> {
+        if value.is_empty() || value.len() > INTERFACE_NAME_MAX_BYTES || value.contains(&0) {
+            return None;
+        }
+
+        let mut bytes = [0; INTERFACE_NAME_MAX_BYTES];
+        bytes[..value.len()].copy_from_slice(value);
+        Some(Self {
+            length: value.len() as u8,
+            bytes,
+        })
+    }
+
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..usize::from(self.length)]
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> Option<&str> {
+        std::str::from_utf8(self.as_bytes()).ok()
+    }
+}
+
+impl fmt::Debug for InterfaceName {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("InterfaceName")
+            .field(&self.as_bytes())
+            .finish()
+    }
+}
+
+#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct InterfaceLinkKind(Box<[u8]>);
+
+impl InterfaceLinkKind {
+    #[must_use]
+    pub fn new(value: &[u8]) -> Option<Self> {
+        if value.is_empty() || value.len() > INTERFACE_LINK_KIND_MAX_BYTES || value.contains(&0) {
+            return None;
+        }
+
+        Some(Self(value.into()))
+    }
+
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> Option<&str> {
+        std::str::from_utf8(self.as_bytes()).ok()
+    }
+}
+
+impl fmt::Debug for InterfaceLinkKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("InterfaceLinkKind")
+            .field(&self.as_bytes())
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(transparent)]
+pub struct InterfaceLinkFlags(u32);
+
+impl InterfaceLinkFlags {
+    pub const UP: Self = Self(1 << 0);
+    pub const BROADCAST: Self = Self(1 << 1);
+    pub const DEBUG: Self = Self(1 << 2);
+    pub const LOOPBACK: Self = Self(1 << 3);
+    pub const POINT_TO_POINT: Self = Self(1 << 4);
+    pub const NO_TRAILERS: Self = Self(1 << 5);
+    pub const RUNNING: Self = Self(1 << 6);
+    pub const NO_ARP: Self = Self(1 << 7);
+    pub const PROMISCUOUS: Self = Self(1 << 8);
+    pub const ALL_MULTICAST: Self = Self(1 << 9);
+    pub const MASTER: Self = Self(1 << 10);
+    pub const SLAVE: Self = Self(1 << 11);
+    pub const MULTICAST: Self = Self(1 << 12);
+    pub const PORT_SELECT: Self = Self(1 << 13);
+    pub const AUTOMEDIA: Self = Self(1 << 14);
+    pub const DYNAMIC: Self = Self(1 << 15);
+    pub const LOWER_UP: Self = Self(1 << 16);
+    pub const DORMANT: Self = Self(1 << 17);
+    pub const ECHO: Self = Self(1 << 18);
+
+    #[must_use]
+    pub const fn from_bits(bits: u32) -> Self {
+        Self(bits)
+    }
+
+    #[must_use]
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
+    #[must_use]
+    pub const fn intersects(self, other: Self) -> bool {
+        self.0 & other.0 != 0
+    }
+}
+
+impl BitOr for InterfaceLinkFlags {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Self(self.0 | rhs.0)
+    }
+}
+
+impl BitOrAssign for InterfaceLinkFlags {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(transparent)]
+pub struct InterfaceHardwareType(u16);
+
+impl InterfaceHardwareType {
+    #[must_use]
+    pub const fn from_raw(value: u16) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u16 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(transparent)]
+pub struct InterfaceOperationalState(u8);
+
+impl InterfaceOperationalState {
+    pub const UNKNOWN: Self = Self(0);
+    pub const NOT_PRESENT: Self = Self(1);
+    pub const DOWN: Self = Self(2);
+    pub const LOWER_LAYER_DOWN: Self = Self(3);
+    pub const TESTING: Self = Self(4);
+    pub const DORMANT: Self = Self(5);
+    pub const UP: Self = Self(6);
+
+    #[must_use]
+    pub const fn from_raw(value: u8) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u8 {
+        self.0
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct InterfaceLinkRecord {
+    interface_index: InterfaceIndex,
+    name: InterfaceName,
+    hardware_type: InterfaceHardwareType,
+    flags: InterfaceLinkFlags,
+    mtu: Option<u32>,
+    operational_state: Option<InterfaceOperationalState>,
+    carrier: Option<bool>,
+    kind: Option<InterfaceLinkKind>,
+}
+
+impl InterfaceLinkRecord {
+    #[must_use]
+    pub fn new(
+        interface_index: InterfaceIndex,
+        name: InterfaceName,
+        hardware_type: InterfaceHardwareType,
+        flags: InterfaceLinkFlags,
+    ) -> Self {
+        Self {
+            interface_index,
+            name,
+            hardware_type,
+            flags,
+            mtu: None,
+            operational_state: None,
+            carrier: None,
+            kind: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_mtu(mut self, mtu: u32) -> Self {
+        self.mtu = Some(mtu);
+        self
+    }
+
+    #[must_use]
+    pub fn with_operational_state(mut self, state: InterfaceOperationalState) -> Self {
+        self.operational_state = Some(state);
+        self
+    }
+
+    #[must_use]
+    pub fn with_carrier(mut self, carrier: bool) -> Self {
+        self.carrier = Some(carrier);
+        self
+    }
+
+    #[must_use]
+    pub fn with_kind(mut self, kind: InterfaceLinkKind) -> Self {
+        self.kind = Some(kind);
+        self
+    }
+
+    #[must_use]
+    pub const fn interface_index(&self) -> InterfaceIndex {
+        self.interface_index
+    }
+
+    #[must_use]
+    pub const fn name(&self) -> &InterfaceName {
+        &self.name
+    }
+
+    #[must_use]
+    pub const fn hardware_type(&self) -> InterfaceHardwareType {
+        self.hardware_type
+    }
+
+    #[must_use]
+    pub const fn flags(&self) -> InterfaceLinkFlags {
+        self.flags
+    }
+
+    #[must_use]
+    pub const fn mtu(&self) -> Option<u32> {
+        self.mtu
+    }
+
+    #[must_use]
+    pub const fn operational_state(&self) -> Option<InterfaceOperationalState> {
+        self.operational_state
+    }
+
+    #[must_use]
+    pub const fn carrier(&self) -> Option<bool> {
+        self.carrier
+    }
+
+    #[must_use]
+    pub fn kind(&self) -> Option<&InterfaceLinkKind> {
+        self.kind.as_ref()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(transparent)]
 pub struct InterfaceAddressFlags(u32);

@@ -1,8 +1,10 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use flux_core::{
-    InterfaceAddressFlags, InterfaceAddressRecord, InterfaceAddressRecordErrorKind, InterfaceIndex,
-    NetworkEpoch, NetworkInventoryError, NetworkInventoryTracker,
+    INTERFACE_LINK_KIND_MAX_BYTES, INTERFACE_NAME_MAX_BYTES, InterfaceAddressFlags,
+    InterfaceAddressRecord, InterfaceAddressRecordErrorKind, InterfaceHardwareType, InterfaceIndex,
+    InterfaceLinkFlags, InterfaceLinkKind, InterfaceLinkRecord, InterfaceName,
+    InterfaceOperationalState, NetworkEpoch, NetworkInventoryError, NetworkInventoryTracker,
 };
 
 #[test]
@@ -35,6 +37,91 @@ fn identifiers_prefixes_and_address_flags_preserve_their_domain_invariants() {
     assert_eq!(flags.bits(), 0x8000_0801);
     assert!(flags.intersects(InterfaceAddressFlags::TEMPORARY));
     assert!(!flags.intersects(InterfaceAddressFlags::DEPRECATED));
+}
+
+#[test]
+fn link_facts_preserve_kernel_identity_without_assuming_utf8_or_known_values() {
+    let maximum_name = [b'n'; INTERFACE_NAME_MAX_BYTES];
+    let maximum_kind = vec![b'k'; INTERFACE_LINK_KIND_MAX_BYTES];
+    let non_utf8_name = InterfaceName::new(&[b'r', b'm', 0xff]).expect("raw interface name");
+    let non_utf8_kind = InterfaceLinkKind::new(&[b'v', 0xfe]).expect("raw link kind");
+
+    assert_eq!(
+        InterfaceName::new(&maximum_name)
+            .expect("maximum interface name")
+            .as_bytes(),
+        maximum_name
+    );
+    assert_eq!(
+        InterfaceLinkKind::new(&maximum_kind)
+            .expect("maximum link kind")
+            .as_bytes(),
+        maximum_kind.as_slice()
+    );
+    assert_eq!(non_utf8_name.as_str(), None);
+    assert_eq!(non_utf8_kind.as_str(), None);
+    for invalid in [
+        &b""[..],
+        &b"bad\0name"[..],
+        &[b'x'; INTERFACE_NAME_MAX_BYTES + 1],
+    ] {
+        assert_eq!(InterfaceName::new(invalid), None);
+    }
+    assert_eq!(
+        InterfaceName::new(b"raw/name: ok")
+            .expect("raw bounded name")
+            .as_bytes(),
+        b"raw/name: ok"
+    );
+    assert_eq!(InterfaceLinkKind::new(b""), None);
+    assert_eq!(InterfaceLinkKind::new(b"bad\0kind"), None);
+    assert_eq!(
+        InterfaceLinkKind::new(&vec![b'x'; INTERFACE_LINK_KIND_MAX_BYTES + 1]),
+        None
+    );
+    let first_vendor_kind = InterfaceLinkKind::new(&[b'x'; 64]).expect("vendor kind");
+    let mut other_vendor_bytes = [b'x'; 64];
+    other_vendor_bytes[63] = b'y';
+    let second_vendor_kind =
+        InterfaceLinkKind::new(&other_vendor_bytes).expect("distinct vendor kind");
+    assert_ne!(first_vendor_kind, second_vendor_kind);
+
+    let interface_index = InterfaceIndex::new(7).expect("nonzero interface index");
+    let mut flags = InterfaceLinkFlags::UP | InterfaceLinkFlags::LOWER_UP;
+    flags |= InterfaceLinkFlags::from_bits(0x8000_0000);
+    let unknown_state = InterfaceOperationalState::from_raw(0xfe);
+    let record = InterfaceLinkRecord::new(
+        interface_index,
+        non_utf8_name,
+        InterfaceHardwareType::from_raw(0xfffe),
+        flags,
+    )
+    .with_mtu(0)
+    .with_operational_state(unknown_state)
+    .with_carrier(false)
+    .with_kind(non_utf8_kind.clone());
+
+    assert_eq!(record.interface_index(), interface_index);
+    assert_eq!(record.name(), &non_utf8_name);
+    assert_eq!(record.hardware_type().raw(), 0xfffe);
+    assert_eq!(record.flags().bits(), 0x8001_0001);
+    assert!(record.flags().intersects(InterfaceLinkFlags::LOWER_UP));
+    assert_eq!(record.mtu(), Some(0));
+    assert_eq!(record.operational_state(), Some(unknown_state));
+    assert_eq!(unknown_state.raw(), 0xfe);
+    assert_eq!(record.carrier(), Some(false));
+    assert_eq!(record.kind(), Some(&non_utf8_kind));
+
+    let minimal = InterfaceLinkRecord::new(
+        interface_index,
+        non_utf8_name,
+        InterfaceHardwareType::from_raw(1),
+        InterfaceLinkFlags::default(),
+    );
+    assert_eq!(minimal.mtu(), None);
+    assert_eq!(minimal.operational_state(), None);
+    assert_eq!(minimal.carrier(), None);
+    assert_eq!(minimal.kind(), None);
 }
 
 #[test]

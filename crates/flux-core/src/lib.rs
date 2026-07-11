@@ -30,7 +30,9 @@ pub use control::{
     LegacyDispatcher, LegacyIntent, OperationHandle, OperationReport, Reason,
 };
 pub use network_inventory::{
-    AddressFlagConflict, InterfaceAddressFlags, InterfaceAddressRecord,
-    InterfaceAddressRecordError, InterfaceAddressRecordErrorKind, InterfaceIndex, NetworkEpoch,
+    AddressFlagConflict, INTERFACE_LINK_KIND_MAX_BYTES, INTERFACE_NAME_MAX_BYTES,
+    InterfaceAddressFlags, InterfaceAddressRecord, InterfaceAddressRecordError,
+    InterfaceAddressRecordErrorKind, InterfaceHardwareType, InterfaceIndex, InterfaceLinkFlags,
+    InterfaceLinkKind, InterfaceLinkRecord, InterfaceName, InterfaceOperationalState, NetworkEpoch,
     NetworkInventory, NetworkInventoryError, NetworkInventoryTracker,
 };

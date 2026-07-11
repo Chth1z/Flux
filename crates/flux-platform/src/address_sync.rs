@@ -7,7 +7,8 @@ use flux_core::{InterfaceAddressFlags, InterfaceAddressRecord, InterfaceIndex};
 
 use crate::netlink::{
     NETLINK_HEADER_LENGTH, NLM_F_DUMP_INTR, NLMSG_DONE, NLMSG_ERROR, NLMSG_OVERRUN,
-    NetlinkFrameError, NetlinkFrameErrorKind, NetlinkMessageHeader, NetlinkMessageIter, align4,
+    NetlinkDoneError, NetlinkDoneErrorKind, NetlinkFrameError, NetlinkFrameErrorKind,
+    NetlinkMessageHeader, NetlinkMessageIter, align4, validate_done_payload,
 };
 
 const INTERFACE_ADDRESS_MESSAGE_LENGTH: usize = 8;
@@ -254,6 +255,20 @@ impl From<NetlinkFrameError> for AddressEventDecodeError {
     }
 }
 
+impl From<NetlinkDoneError> for AddressEventDecodeError {
+    fn from(error: NetlinkDoneError) -> Self {
+        Self::new(
+            match error.kind() {
+                NetlinkDoneErrorKind::InvalidPayload => {
+                    AddressEventDecodeErrorKind::InvalidDonePayload
+                }
+                NetlinkDoneErrorKind::ErrorStatus => AddressEventDecodeErrorKind::DoneErrorStatus,
+            },
+            error.offset(),
+        )
+    }
+}
+
 impl fmt::Display for AddressEventDecodeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -313,7 +328,7 @@ impl fmt::Display for AddressEventDecodeError {
                     "netlink datagram contains a message after NLMSG_DONE"
                 }
                 AddressEventDecodeErrorKind::InvalidDonePayload => {
-                    "NLMSG_DONE payload must be empty or exactly one native-endian i32"
+                    "NLMSG_DONE payload or extended-ack attributes are malformed"
                 }
                 AddressEventDecodeErrorKind::DoneErrorStatus => {
                     "NLMSG_DONE reports a nonzero error status"
@@ -413,8 +428,10 @@ impl RtnetlinkAddressEventDecoder {
                 NLMSG_DONE => {
                     validate_done_payload(
                         message.payload(),
+                        header.flags(),
                         message.offset() + NETLINK_HEADER_LENGTH,
-                    )?;
+                    )
+                    .map_err(AddressEventDecodeError::from)?;
                     if completion.replace(header).is_some() {
                         return Err(AddressEventDecodeError::new(
                             AddressEventDecodeErrorKind::DuplicateDone,
@@ -600,33 +617,6 @@ impl RtnetlinkAddressEventDecoder {
         };
         Ok(Some(InterfaceAddressEvent { kind, record }))
     }
-}
-
-fn validate_done_payload(
-    payload: &[u8],
-    payload_offset: usize,
-) -> Result<(), AddressEventDecodeError> {
-    if payload.is_empty() {
-        return Ok(());
-    }
-    if payload.len() != std::mem::size_of::<i32>() {
-        return Err(AddressEventDecodeError::new(
-            AddressEventDecodeErrorKind::InvalidDonePayload,
-            payload_offset,
-        ));
-    }
-    let status = i32::from_ne_bytes(
-        payload
-            .try_into()
-            .expect("validated native-endian i32 payload"),
-    );
-    if status != 0 {
-        return Err(AddressEventDecodeError::new(
-            AddressEventDecodeErrorKind::DoneErrorStatus,
-            payload_offset,
-        ));
-    }
-    Ok(())
 }
 
 fn normalize_configured_prefix(

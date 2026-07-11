@@ -1,4 +1,5 @@
 use super::*;
+use crate::netlink::NLM_F_ACK_TLVS;
 
 #[test]
 fn address_decoder_constructs_a_validated_core_record() {
@@ -562,6 +563,46 @@ fn zero_status_done_message_is_accepted() {
         .expect("zero status completes the dump");
 
     assert_eq!(decoded.completion().expect("completion").sequence(), 77);
+}
+
+#[test]
+fn done_message_accepts_only_flagged_well_formed_extended_ack_attributes() {
+    let mut payload = 0_i32.to_ne_bytes().to_vec();
+    append_attribute(&mut payload, 1, b"dump warning\0");
+
+    let decoded = decoder(true)
+        .decode_datagram(&netlink_message(
+            NLMSG_DONE,
+            NLM_F_ACK_TLVS,
+            77,
+            0,
+            &payload,
+        ))
+        .expect("valid extended dump acknowledgement");
+    assert_eq!(decoded.completion().expect("completion").sequence(), 77);
+
+    assert_eq!(
+        decoder(true)
+            .decode_datagram(&netlink_message(NLMSG_DONE, 0, 77, 0, &payload))
+            .expect_err("unflagged extended acknowledgement")
+            .kind(),
+        AddressEventDecodeErrorKind::InvalidDonePayload
+    );
+
+    payload.pop();
+    assert_eq!(
+        decoder(true)
+            .decode_datagram(&netlink_message(
+                NLMSG_DONE,
+                NLM_F_ACK_TLVS,
+                77,
+                0,
+                &payload,
+            ))
+            .expect_err("malformed extended acknowledgement")
+            .kind(),
+        AddressEventDecodeErrorKind::InvalidDonePayload
+    );
 }
 
 #[test]

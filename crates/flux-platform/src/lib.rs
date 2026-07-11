@@ -4,16 +4,29 @@ use std::error::Error;
 use std::fmt;
 
 mod capability;
+mod child_process;
 mod legacy_dispatcher;
 mod reactor;
 mod seqpacket;
 mod shutdown;
+mod sing_box;
 
 pub use capability::{CapabilityProfilePaths, SystemCapabilityProfileSource};
 pub use legacy_dispatcher::{LegacyScriptPaths, ProcessLegacyDispatcher};
 pub use reactor::{DaemonReactor, ReactorError, ReactorStopHandle, StopDisposition};
 pub use seqpacket::{PeerCredentials, SeqpacketConnection, SeqpacketListener, Uid};
 pub use shutdown::ShutdownSignal;
+pub use sing_box::{
+    ReadinessEvidence, SingBoxExit, SingBoxLaunchSpec, SingBoxLauncher, SingBoxReadiness,
+};
+
+#[doc(hidden)]
+pub mod internal {
+    pub use crate::sing_box::{
+        PinnedSingBoxLaunch, ProcessDiagnostics, SingBoxChild, SingBoxChildIdentity,
+        SingBoxProcessAdapter, SingBoxProcessError, TerminationOutcome, ValidationReport,
+    };
+}
 
 pub trait KernelReleaseSource {
     fn kernel_release(&self) -> Result<String, PlatformError>;

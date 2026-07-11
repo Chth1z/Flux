@@ -10,6 +10,7 @@ use flux_platform::KernelReleaseSource;
 use serde::Serialize;
 
 mod daemon;
+mod engine_supervisor;
 mod intent_store;
 mod protocol;
 mod socket;
@@ -17,6 +18,13 @@ mod socket;
 use protocol::WireCapabilityProfile;
 
 pub use daemon::{DaemonError, DaemonOptions, run_daemon};
+pub use engine_supervisor::{
+    CaptureBlockedAction, CaptureObservation, DesiredEngine, EngineArtifact, EngineArtifactDigest,
+    EnginePhase, EngineReport, EngineSnapshot, EngineSpec, EngineSpecError, EngineSpecIoOperation,
+    EngineSupervisor, EngineSupervisorError, EngineSupervisorErrorKind, MAX_ENGINE_BINARY_BYTES,
+    MAX_ENGINE_CONFIG_BYTES, MAX_ENGINE_DIAGNOSTIC_BYTES, OwnedEngineIdentity, RestartPolicy,
+    RestartPolicyError, SHA256_DIGEST_BYTES,
+};
 pub use intent_store::{AdministrativeIntentStore, IntentStoreError};
 pub use protocol::{
     DaemonSnapshot, EventDisposition, EventReport, MAX_CONTROL_PACKET_BYTES, ProtocolHandler,

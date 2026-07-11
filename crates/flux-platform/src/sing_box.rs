@@ -1233,6 +1233,11 @@ fn configure_child(
         ChildProcessConfig {
             raise_nofile_limit: true,
             new_process_group,
+            // This contains direct launches. A later BusyBox setuidgid
+            // credential transition can clear PDEATHSIG, so non-root launch
+            // needs the deferred post-credential Rust launcher before it can
+            // claim the same crash-time guarantee.
+            kill_on_parent_death: true,
             inherited_fds,
         },
     )

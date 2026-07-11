@@ -38,7 +38,23 @@ _wait_for_ready() {
 }
 
 _stop_daemon() {
-    "${ADDRSYNCD_BIN}" -c "${ADDRSYNCD_CONF_FILE}" -d "${RUN_DIR}" stop >/dev/null 2>&1 || true
+    if ! "${ADDRSYNCD_BIN}" -c "${ADDRSYNCD_CONF_FILE}" -d "${RUN_DIR}" status >/dev/null 2>&1; then
+        rm -f "${ADDRSYNCD_PID_FILE}" 2>/dev/null || true
+        return 0
+    fi
+
+    "${ADDRSYNCD_BIN}" -c "${ADDRSYNCD_CONF_FILE}" -d "${RUN_DIR}" stop >/dev/null 2>&1 || return 1
+
+    local count=0
+    local timeout="${CORE_TIMEOUT:-5}"
+    while "${ADDRSYNCD_BIN}" -c "${ADDRSYNCD_CONF_FILE}" -d "${RUN_DIR}" status >/dev/null 2>&1; do
+        count=$((count + 1))
+        [ "${count}" -lt "${timeout}" ] || {
+            log_error "addrsyncd remained running after stop"
+            return 1
+        }
+        sleep 1
+    done
     rm -f "${ADDRSYNCD_PID_FILE}" 2>/dev/null || true
     return 0
 }
@@ -53,7 +69,7 @@ start_addrsync() {
 }
 
 stop_addrsync() {
-    run -v "Stop addrsyncd" _stop_daemon || true
+    run -v "Stop addrsyncd" _stop_daemon
 }
 
 resync_addrsync() {

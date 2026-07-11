@@ -16,6 +16,7 @@ impl ProcessSignal {
 pub(crate) struct ChildProcessConfig {
     pub(crate) raise_nofile_limit: bool,
     pub(crate) new_process_group: bool,
+    pub(crate) kill_on_parent_death: bool,
     pub(crate) inherited_fds: Vec<i32>,
 }
 
@@ -43,13 +44,22 @@ mod implementation {
         let empty_mask = unsafe { empty_mask.assume_init() };
         let nofile_limit = preferred_nofile_limit(config.raise_nofile_limit);
         let new_process_group = config.new_process_group;
+        // Capture the creating process before fork. `PR_SET_PDEATHSIG` is not
+        // retroactive, so the child compares this identity after arming the
+        // signal to close the parent-exit-before-prctl race.
+        let expected_parent = config.kill_on_parent_death.then(|| {
+            // SAFETY: getpid has no arguments or failure mode and only reads
+            // the calling process identity.
+            unsafe { libc::getpid() }
+        });
         let inherited_fds = config.inherited_fds;
 
         // SAFETY: the closure runs after fork and before exec. `sigprocmask`,
-        // `setpgid`, `fcntl`, Linux/Bionic's errno accessor, and Linux/Bionic's
-        // `setrlimit` wrapper are allocation-free syscall/TLS operations. The
-        // closure touches only copied or preallocated values and constructs an
-        // `io::Error` from the captured errno integer.
+        // `setpgid`, `fcntl`, `prctl`, `getpid`, `getppid`, `kill`,
+        // Linux/Bionic's errno accessor, and Linux/Bionic's `setrlimit`
+        // wrapper are allocation-free syscall/TLS operations. The closure
+        // touches only copied or preallocated values and constructs an
+        // `io::Error` from a captured errno integer or constant.
         unsafe {
             command.pre_exec(move || {
                 if libc::sigprocmask(
@@ -76,6 +86,19 @@ mod implementation {
                     // Raising the descriptor limit is best effort. Failure is
                     // intentionally ignored so a sandbox cannot prevent exec.
                     let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit);
+                }
+                if let Some(expected_parent) = expected_parent {
+                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                        return Err(last_fork_error());
+                    }
+                    if libc::getppid() != expected_parent {
+                        if libc::kill(libc::getpid(), libc::SIGKILL) != 0 {
+                            return Err(last_fork_error());
+                        }
+                        // SIGKILL cannot return control, but keep the exec
+                        // contract fail-closed if the kernel ever does.
+                        return Err(io::Error::from_raw_os_error(libc::ECHILD));
+                    }
                 }
                 Ok(())
             });
@@ -233,6 +256,7 @@ mod implementation {
         let ChildProcessConfig {
             raise_nofile_limit: _,
             new_process_group: _,
+            kill_on_parent_death: _,
             inherited_fds: _,
         } = config;
         Ok(())

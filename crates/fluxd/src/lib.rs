@@ -10,14 +10,21 @@ use flux_platform::KernelReleaseSource;
 use serde::Serialize;
 
 mod daemon;
+mod engine_manifest;
 mod engine_supervisor;
 mod intent_store;
 mod protocol;
+mod runtime_coordinator;
+mod runtime_status;
 mod socket;
 
 use protocol::WireCapabilityProfile;
 
 pub use daemon::{DaemonError, DaemonOptions, run_daemon};
+pub use engine_manifest::{
+    EngineManifest, EngineManifestError, EngineManifestErrorKind, EngineManifestIoOperation,
+    MAX_ENGINE_MANIFEST_BYTES, MAX_ENGINE_TIMEOUT_MS, PreparedEngineManifest,
+};
 pub use engine_supervisor::{
     CaptureBlockedAction, CaptureObservation, DesiredEngine, EngineArtifact, EngineArtifactDigest,
     EnginePhase, EngineReport, EngineSnapshot, EngineSpec, EngineSpecError, EngineSpecIoOperation,
@@ -29,6 +36,10 @@ pub use intent_store::{AdministrativeIntentStore, IntentStoreError};
 pub use protocol::{
     DaemonSnapshot, EventDisposition, EventReport, MAX_CONTROL_PACKET_BYTES, ProtocolHandler,
     RequestPeerId,
+};
+pub use runtime_status::{
+    RuntimeCaptureState, RuntimeEngineState, RuntimeFailure, RuntimePhase, RuntimeSnapshot,
+    RuntimeSnapshotSource,
 };
 pub use socket::{ControlConnectionHandler, ControlSocketError, SocketControlClient};
 
@@ -360,6 +371,7 @@ where
             kernel: online_kernel_document(capability_profile),
             capability_profile: capability_profile.into(),
             control: OnlineControlDocument::from(snapshot.control),
+            runtime: OnlineRuntimeDocument::from(snapshot.runtime),
         };
         if serde_json::to_writer(&mut *stdout, &document).is_err() || writeln!(stdout).is_err() {
             return EXIT_RUNTIME_ERROR;
@@ -369,6 +381,15 @@ where
 
     let bridge = capability_profile.legacy_bridge();
     let administrative_state = administrative_state_label(snapshot.control.administrative_state);
+    let runtime_generation = snapshot
+        .runtime
+        .generation
+        .map_or_else(|| "none".to_owned(), |generation| generation.to_string());
+    let runtime_error = snapshot
+        .runtime
+        .last_error
+        .as_ref()
+        .map_or_else(|| "none".to_owned(), format_runtime_failure);
     if writeln!(stdout, "daemon: {daemon_state}").is_err()
         || writeln!(
             stdout,
@@ -467,6 +488,27 @@ where
         )
         .is_err()
         || writeln!(stdout, "revision: {}", snapshot.control.revision).is_err()
+        || writeln!(stdout, "runtime revision: {}", snapshot.runtime.revision).is_err()
+        || writeln!(
+            stdout,
+            "runtime phase: {}",
+            runtime_phase_label(snapshot.runtime.phase)
+        )
+        .is_err()
+        || writeln!(
+            stdout,
+            "runtime capture: {}",
+            runtime_capture_label(snapshot.runtime.capture)
+        )
+        .is_err()
+        || writeln!(
+            stdout,
+            "runtime engine: {}",
+            runtime_engine_label(snapshot.runtime.engine)
+        )
+        .is_err()
+        || writeln!(stdout, "runtime generation: {runtime_generation}").is_err()
+        || writeln!(stdout, "runtime last error: {runtime_error}").is_err()
     {
         return EXIT_RUNTIME_ERROR;
     }
@@ -590,6 +632,7 @@ struct OnlineStatusDocument {
     kernel: Option<OnlineKernelDocument>,
     capability_profile: WireCapabilityProfile,
     control: OnlineControlDocument,
+    runtime: OnlineRuntimeDocument,
 }
 
 #[derive(Serialize)]
@@ -616,6 +659,46 @@ impl From<ControlSnapshot> for OnlineControlDocument {
             configuration_dirty: snapshot.configuration_dirty,
             in_flight: snapshot.in_flight.map(Into::into),
             last_completed: snapshot.last_completed.map(Into::into),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct OnlineRuntimeDocument {
+    revision: u64,
+    phase: &'static str,
+    capture: &'static str,
+    engine: &'static str,
+    generation: Option<u64>,
+    last_error: Option<OnlineRuntimeFailureDocument>,
+}
+
+impl From<RuntimeSnapshot> for OnlineRuntimeDocument {
+    fn from(snapshot: RuntimeSnapshot) -> Self {
+        Self {
+            revision: snapshot.revision,
+            phase: runtime_phase_label(snapshot.phase),
+            capture: runtime_capture_label(snapshot.capture),
+            engine: runtime_engine_label(snapshot.engine),
+            generation: snapshot.generation,
+            last_error: snapshot.last_error.map(Into::into),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct OnlineRuntimeFailureDocument {
+    operation: String,
+    message: String,
+    recovery: String,
+}
+
+impl From<RuntimeFailure> for OnlineRuntimeFailureDocument {
+    fn from(failure: RuntimeFailure) -> Self {
+        Self {
+            operation: failure.operation,
+            message: failure.message,
+            recovery: failure.recovery,
         }
     }
 }
@@ -696,6 +779,50 @@ fn format_legacy_artifact(observation: &Observation<LegacyArtifactReadiness>) ->
         Observation::Denied => "denied".to_owned(),
         Observation::Malformed => "malformed".to_owned(),
         Observation::Unavailable => "unavailable".to_owned(),
+    }
+}
+
+fn format_runtime_failure(failure: &RuntimeFailure) -> String {
+    format!(
+        "{}: {}; recovery: {}",
+        failure.operation, failure.message, failure.recovery
+    )
+}
+
+const fn runtime_phase_label(phase: RuntimePhase) -> &'static str {
+    match phase {
+        RuntimePhase::Unknown => "unknown",
+        RuntimePhase::Bootstrapping => "bootstrapping",
+        RuntimePhase::Stopped => "stopped",
+        RuntimePhase::Preparing => "preparing",
+        RuntimePhase::Activating => "activating",
+        RuntimePhase::Verifying => "verifying",
+        RuntimePhase::Running => "running",
+        RuntimePhase::Degraded => "degraded",
+        RuntimePhase::Repairing => "repairing",
+        RuntimePhase::Stopping => "stopping",
+        RuntimePhase::Failed => "failed",
+    }
+}
+
+const fn runtime_capture_label(capture: RuntimeCaptureState) -> &'static str {
+    match capture {
+        RuntimeCaptureState::Unknown => "unknown",
+        RuntimeCaptureState::Detached => "detached",
+        RuntimeCaptureState::Published => "published",
+    }
+}
+
+const fn runtime_engine_label(engine: RuntimeEngineState) -> &'static str {
+    match engine {
+        RuntimeEngineState::Unknown => "unknown",
+        RuntimeEngineState::Stopped => "stopped",
+        RuntimeEngineState::Starting => "starting",
+        RuntimeEngineState::Ready => "ready",
+        RuntimeEngineState::Exited => "exited",
+        RuntimeEngineState::BackingOff => "backing_off",
+        RuntimeEngineState::Stopping => "stopping",
+        RuntimeEngineState::Failed => "failed",
     }
 }
 

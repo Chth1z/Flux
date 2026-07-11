@@ -15,6 +15,7 @@ use crate::protocol::{
 };
 use crate::{
     DaemonSnapshot, EventReport, MAX_CONTROL_PACKET_BYTES, ProtocolHandler, RequestPeerId,
+    RuntimeSnapshotSource,
 };
 
 static NEXT_CONTROL_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
@@ -100,6 +101,21 @@ where
     pub fn new(capability_profile: Arc<CapabilityProfile>, control: C) -> Self {
         Self {
             handler: ProtocolHandler::new(capability_profile, control),
+        }
+    }
+
+    #[must_use]
+    pub fn with_runtime_snapshot_source(
+        capability_profile: Arc<CapabilityProfile>,
+        control: C,
+        runtime: RuntimeSnapshotSource,
+    ) -> Self {
+        Self {
+            handler: ProtocolHandler::with_runtime_snapshot_source(
+                capability_profile,
+                control,
+                runtime,
+            ),
         }
     }
 

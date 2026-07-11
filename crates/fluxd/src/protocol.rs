@@ -14,6 +14,11 @@ use flux_core::{
 use flux_platform::Uid;
 use serde::{Deserialize, Serialize};
 
+use crate::{
+    RuntimeCaptureState, RuntimeEngineState, RuntimeFailure, RuntimePhase, RuntimeSnapshot,
+    RuntimeSnapshotSource,
+};
+
 const PROTOCOL_VERSION: u16 = 2;
 const RECENT_RESULT_CAPACITY: usize = 128;
 const RECENT_RESULT_FINGERPRINT_BYTES: usize = MAX_CONTROL_PACKET_BYTES;
@@ -37,6 +42,7 @@ impl RequestPeerId {
 pub struct DaemonSnapshot {
     pub capability_profile: CapabilityProfile,
     pub control: ControlSnapshot,
+    pub runtime: RuntimeSnapshot,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -55,6 +61,7 @@ pub struct EventReport {
 pub struct ProtocolHandler<C> {
     capability_profile: Arc<CapabilityProfile>,
     control: C,
+    runtime: RuntimeSnapshotSource,
     recent_results: Mutex<RecentResults>,
 }
 
@@ -64,9 +71,23 @@ where
 {
     #[must_use]
     pub fn new(capability_profile: Arc<CapabilityProfile>, control: C) -> Self {
+        Self::with_runtime_snapshot_source(
+            capability_profile,
+            control,
+            RuntimeSnapshotSource::default(),
+        )
+    }
+
+    #[must_use]
+    pub fn with_runtime_snapshot_source(
+        capability_profile: Arc<CapabilityProfile>,
+        control: C,
+        runtime: RuntimeSnapshotSource,
+    ) -> Self {
         Self {
             capability_profile,
             control,
+            runtime,
             recent_results: Mutex::new(RecentResults::default()),
         }
     }
@@ -173,6 +194,7 @@ where
                     kernel: self.capability_profile.kernel_support().map(Into::into),
                     capability_profile: Box::new(self.capability_profile.as_ref().into()),
                     control: self.control.snapshot().as_ref().into(),
+                    runtime: self.runtime.snapshot().as_ref().into(),
                 },
             )),
             WireCommand::Control { action, reason } => {
@@ -617,6 +639,8 @@ enum ResponseBody {
         kernel: Option<WireKernelSupport>,
         capability_profile: Box<WireCapabilityProfile>,
         control: WireControlSnapshot,
+        #[serde(default)]
+        runtime: WireRuntimeSnapshot,
     },
     Operation {
         revision: u64,
@@ -1067,6 +1091,195 @@ impl From<WireControlSnapshot> for ControlSnapshot {
     }
 }
 
+#[derive(Default, Deserialize, Serialize)]
+struct WireRuntimeSnapshot {
+    revision: u64,
+    phase: WireRuntimePhase,
+    capture: WireRuntimeCaptureState,
+    engine: WireRuntimeEngineState,
+    generation: Option<u64>,
+    last_error: Option<WireRuntimeFailure>,
+}
+
+impl From<&RuntimeSnapshot> for WireRuntimeSnapshot {
+    fn from(snapshot: &RuntimeSnapshot) -> Self {
+        Self {
+            revision: snapshot.revision,
+            phase: snapshot.phase.into(),
+            capture: snapshot.capture.into(),
+            engine: snapshot.engine.into(),
+            generation: snapshot.generation,
+            last_error: snapshot.last_error.as_ref().map(Into::into),
+        }
+    }
+}
+
+impl From<WireRuntimeSnapshot> for RuntimeSnapshot {
+    fn from(snapshot: WireRuntimeSnapshot) -> Self {
+        Self {
+            revision: snapshot.revision,
+            phase: snapshot.phase.into(),
+            capture: snapshot.capture.into(),
+            engine: snapshot.engine.into(),
+            generation: snapshot.generation,
+            last_error: snapshot.last_error.map(Into::into),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WireRuntimePhase {
+    #[default]
+    Unknown,
+    Bootstrapping,
+    Stopped,
+    Preparing,
+    Activating,
+    Verifying,
+    Running,
+    Degraded,
+    Repairing,
+    Stopping,
+    Failed,
+}
+
+impl From<RuntimePhase> for WireRuntimePhase {
+    fn from(phase: RuntimePhase) -> Self {
+        match phase {
+            RuntimePhase::Unknown => Self::Unknown,
+            RuntimePhase::Bootstrapping => Self::Bootstrapping,
+            RuntimePhase::Stopped => Self::Stopped,
+            RuntimePhase::Preparing => Self::Preparing,
+            RuntimePhase::Activating => Self::Activating,
+            RuntimePhase::Verifying => Self::Verifying,
+            RuntimePhase::Running => Self::Running,
+            RuntimePhase::Degraded => Self::Degraded,
+            RuntimePhase::Repairing => Self::Repairing,
+            RuntimePhase::Stopping => Self::Stopping,
+            RuntimePhase::Failed => Self::Failed,
+        }
+    }
+}
+
+impl From<WireRuntimePhase> for RuntimePhase {
+    fn from(phase: WireRuntimePhase) -> Self {
+        match phase {
+            WireRuntimePhase::Unknown => Self::Unknown,
+            WireRuntimePhase::Bootstrapping => Self::Bootstrapping,
+            WireRuntimePhase::Stopped => Self::Stopped,
+            WireRuntimePhase::Preparing => Self::Preparing,
+            WireRuntimePhase::Activating => Self::Activating,
+            WireRuntimePhase::Verifying => Self::Verifying,
+            WireRuntimePhase::Running => Self::Running,
+            WireRuntimePhase::Degraded => Self::Degraded,
+            WireRuntimePhase::Repairing => Self::Repairing,
+            WireRuntimePhase::Stopping => Self::Stopping,
+            WireRuntimePhase::Failed => Self::Failed,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WireRuntimeCaptureState {
+    #[default]
+    Unknown,
+    Detached,
+    Published,
+}
+
+impl From<RuntimeCaptureState> for WireRuntimeCaptureState {
+    fn from(capture: RuntimeCaptureState) -> Self {
+        match capture {
+            RuntimeCaptureState::Unknown => Self::Unknown,
+            RuntimeCaptureState::Detached => Self::Detached,
+            RuntimeCaptureState::Published => Self::Published,
+        }
+    }
+}
+
+impl From<WireRuntimeCaptureState> for RuntimeCaptureState {
+    fn from(capture: WireRuntimeCaptureState) -> Self {
+        match capture {
+            WireRuntimeCaptureState::Unknown => Self::Unknown,
+            WireRuntimeCaptureState::Detached => Self::Detached,
+            WireRuntimeCaptureState::Published => Self::Published,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WireRuntimeEngineState {
+    #[default]
+    Unknown,
+    Stopped,
+    Starting,
+    Ready,
+    Exited,
+    BackingOff,
+    Stopping,
+    Failed,
+}
+
+impl From<RuntimeEngineState> for WireRuntimeEngineState {
+    fn from(engine: RuntimeEngineState) -> Self {
+        match engine {
+            RuntimeEngineState::Unknown => Self::Unknown,
+            RuntimeEngineState::Stopped => Self::Stopped,
+            RuntimeEngineState::Starting => Self::Starting,
+            RuntimeEngineState::Ready => Self::Ready,
+            RuntimeEngineState::Exited => Self::Exited,
+            RuntimeEngineState::BackingOff => Self::BackingOff,
+            RuntimeEngineState::Stopping => Self::Stopping,
+            RuntimeEngineState::Failed => Self::Failed,
+        }
+    }
+}
+
+impl From<WireRuntimeEngineState> for RuntimeEngineState {
+    fn from(engine: WireRuntimeEngineState) -> Self {
+        match engine {
+            WireRuntimeEngineState::Unknown => Self::Unknown,
+            WireRuntimeEngineState::Stopped => Self::Stopped,
+            WireRuntimeEngineState::Starting => Self::Starting,
+            WireRuntimeEngineState::Ready => Self::Ready,
+            WireRuntimeEngineState::Exited => Self::Exited,
+            WireRuntimeEngineState::BackingOff => Self::BackingOff,
+            WireRuntimeEngineState::Stopping => Self::Stopping,
+            WireRuntimeEngineState::Failed => Self::Failed,
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+struct WireRuntimeFailure {
+    operation: String,
+    message: String,
+    recovery: String,
+}
+
+impl From<&RuntimeFailure> for WireRuntimeFailure {
+    fn from(failure: &RuntimeFailure) -> Self {
+        Self {
+            operation: failure.operation.clone(),
+            message: failure.message.clone(),
+            recovery: failure.recovery.clone(),
+        }
+    }
+}
+
+impl From<WireRuntimeFailure> for RuntimeFailure {
+    fn from(failure: WireRuntimeFailure) -> Self {
+        Self {
+            operation: failure.operation,
+            message: failure.message,
+            recovery: failure.recovery,
+        }
+    }
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum WireAdministrativeState {
@@ -1282,6 +1495,7 @@ pub(crate) fn decode_status_response(
                     kernel,
                     capability_profile,
                     control,
+                    runtime,
                 },
         } => {
             let capability_profile: CapabilityProfile = (*capability_profile).try_into()?;
@@ -1294,6 +1508,7 @@ pub(crate) fn decode_status_response(
             Ok(DaemonSnapshot {
                 capability_profile,
                 control: control.into(),
+                runtime: runtime.into(),
             })
         }
         WireResult::Ok { .. } => Err(unexpected_response("status")),
@@ -1376,6 +1591,7 @@ mod tests {
                 }),
                 capability_profile: Box::new((&profile).into()),
                 control: (&ControlSnapshot::default()).into(),
+                runtime: WireRuntimeSnapshot::default(),
             },
         ));
 
@@ -1404,11 +1620,42 @@ mod tests {
                 kernel: profile.kernel_support().map(Into::into),
                 capability_profile: Box::new((&profile).into()),
                 control: (&ControlSnapshot::default()).into(),
+                runtime: WireRuntimeSnapshot::default(),
             },
         ));
 
         let snapshot = decode_status_response(&response, 92).expect("coherent status");
 
         assert_eq!(snapshot.capability_profile.revision(), revision);
+    }
+
+    #[test]
+    fn status_decoder_preserves_the_observed_runtime_snapshot() {
+        let profile = CapabilityProfileFixture::supported();
+        let runtime = RuntimeSnapshot {
+            revision: 14,
+            phase: RuntimePhase::Repairing,
+            capture: RuntimeCaptureState::Detached,
+            engine: RuntimeEngineState::BackingOff,
+            generation: Some(48),
+            last_error: Some(RuntimeFailure {
+                operation: "maintain proxy engine".to_owned(),
+                message: "owned child exited unexpectedly".to_owned(),
+                recovery: "retry after bounded backoff".to_owned(),
+            }),
+        };
+        let response = encode_response(ResponseEnvelope::ok(
+            93,
+            ResponseBody::Snapshot {
+                kernel: profile.kernel_support().map(Into::into),
+                capability_profile: Box::new((&profile).into()),
+                control: (&ControlSnapshot::default()).into(),
+                runtime: (&runtime).into(),
+            },
+        ));
+
+        let snapshot = decode_status_response(&response, 93).expect("coherent status");
+
+        assert_eq!(snapshot.runtime, runtime);
     }
 }

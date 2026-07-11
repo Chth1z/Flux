@@ -499,7 +499,9 @@ build_config() {
     set +a
     _apply_proxy_mode_config || return 1
     _extract_json_config || return 1
-    _validate_singbox_config || return 1
+    if [ "${FLUXD_ENGINE_OWNER:-legacy}" != "rust" ]; then
+        _validate_singbox_config || return 1
+    fi
     cat "${tmp_settings}"
     rm -f "${tmp_settings}"
     _detect_kernel || return 1

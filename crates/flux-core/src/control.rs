@@ -2,6 +2,7 @@ use std::error::Error;
 use std::fmt;
 use std::sync::{Arc, RwLock, mpsc};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Reason {
@@ -79,6 +80,14 @@ impl Default for ControlSnapshot {
 
 pub trait LegacyDispatcher: Send + 'static {
     fn execute(&mut self, intent: &LegacyIntent) -> Result<(), ControlError>;
+
+    fn maintenance_interval(&self) -> Option<Duration> {
+        None
+    }
+
+    fn maintain(&mut self) {}
+
+    fn shutdown(&mut self) {}
 }
 
 pub trait ControlClient {
@@ -253,6 +262,11 @@ pub enum ControlError {
         source: Arc<dyn Error + Send + Sync>,
         recovery: &'static str,
     },
+    Runtime {
+        operation: &'static str,
+        source: Arc<dyn Error + Send + Sync>,
+        recovery: &'static str,
+    },
     RequestRejected {
         code: String,
         message: String,
@@ -274,6 +288,18 @@ impl ControlError {
         E: Error + Send + Sync + 'static,
     {
         Self::Persistence {
+            operation,
+            source: Arc::new(source),
+            recovery,
+        }
+    }
+
+    #[must_use]
+    pub fn runtime<E>(operation: &'static str, source: E, recovery: &'static str) -> Self
+    where
+        E: Error + Send + Sync + 'static,
+    {
+        Self::Runtime {
             operation,
             source: Arc::new(source),
             recovery,
@@ -308,6 +334,7 @@ impl ControlError {
             | Self::OperationAlreadyConsumed
             | Self::WorkerStart(_)
             | Self::Persistence { .. }
+            | Self::Runtime { .. }
             | Self::Protocol(_)
             | Self::Transport(_)
             | Self::Dispatcher(_) => None,
@@ -337,6 +364,14 @@ impl fmt::Display for ControlError {
                 formatter,
                 "cannot persist control state during {operation}: {source}; recovery: {recovery}"
             ),
+            Self::Runtime {
+                operation,
+                source,
+                recovery,
+            } => write!(
+                formatter,
+                "runtime reconciliation failed during {operation}: {source}; recovery: {recovery}"
+            ),
             Self::RequestRejected { code, message } => {
                 write!(formatter, "control request rejected ({code}): {message}")
             }
@@ -350,7 +385,9 @@ impl fmt::Display for ControlError {
 impl Error for ControlError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Persistence { source, .. } => Some(source.as_ref()),
+            Self::Persistence { source, .. } | Self::Runtime { source, .. } => {
+                Some(source.as_ref())
+            }
             Self::InvalidQueueCapacity
             | Self::QueueFull
             | Self::BridgeStopped
@@ -385,7 +422,27 @@ fn worker_loop<D>(
 ) where
     D: LegacyDispatcher,
 {
-    while let Ok(request) = receiver.recv() {
+    let maintenance_interval = dispatcher
+        .maintenance_interval()
+        .filter(|interval| !interval.is_zero());
+    loop {
+        let request = match maintenance_interval {
+            Some(interval) => match receiver.recv_timeout(interval) {
+                Ok(request) => Some(request),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    dispatcher.maintain();
+                    None
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            },
+            None => match receiver.recv() {
+                Ok(request) => Some(request),
+                Err(_) => break,
+            },
+        };
+        let Some(request) = request else {
+            continue;
+        };
         match request {
             WorkerRequest::Execute {
                 intent,
@@ -413,7 +470,9 @@ fn worker_loop<D>(
                 let _ = completion_tx.send(result);
             }
         }
+        dispatcher.maintain();
     }
+    dispatcher.shutdown();
 }
 
 fn execute_intent<D>(

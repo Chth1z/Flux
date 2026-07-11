@@ -1,6 +1,7 @@
 #![cfg(any(target_os = "linux", target_os = "android"))]
 
 use std::fs;
+use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
@@ -10,6 +11,8 @@ use std::time::{Duration, Instant};
 
 use tempfile::tempdir;
 
+use fluxd::{RuntimeCaptureState, RuntimeEngineState, RuntimePhase, SocketControlClient};
+
 const SIGTERM: std::ffi::c_int = 15;
 const PACKAGED_CONFIG: &str = include_str!("../../../conf/flux.toml");
 
@@ -18,7 +21,7 @@ unsafe extern "C" {
 }
 
 #[test]
-fn process_directed_sigterm_stops_daemon_cleanly_with_live_legacy_worker() {
+fn process_directed_sigterm_stops_daemon_cleanly_with_live_runtime_writer() {
     let directory = tempdir().expect("temporary directory");
     let root = directory.path().join("flux");
     let socket_path = root.join("run/fluxd.sock");
@@ -26,22 +29,62 @@ fn process_directed_sigterm_stops_daemon_cleanly_with_live_legacy_worker() {
     let boot_id_path = directory.path().join("boot-id");
     let selinux_enforce_path = directory.path().join("selinux-enforce");
     let disable_path = directory.path().join("disable");
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("reserve listener port");
+    let listener_port = listener.local_addr().expect("listener address").port();
+    drop(listener);
 
     fs::create_dir_all(root.join("scripts")).expect("create scripts directory");
+    fs::create_dir_all(root.join("bin")).expect("create binary directory");
     fs::create_dir_all(root.join("conf")).expect("create config directory");
     fs::create_dir_all(root.join("state")).expect("create state directory");
     fs::create_dir_all(root.join("run")).expect("create run directory");
     fs::write(root.join("conf/flux.toml"), PACKAGED_CONFIG).expect("write configuration");
+    fs::write(root.join("conf/config.json"), "{}\n").expect("write engine configuration");
     fs::write(&boot_id_path, "33333333-3333-4333-8333-333333333333\n").expect("write boot ID");
     fs::write(&selinux_enforce_path, "1\n").expect("write SELinux mode");
     write_script(
         &root.join("scripts/dispatcher"),
         &format!(
-            "printf '%s\\n' \"$*\" > '{}'\n",
-            dispatcher_record.display()
+            "set -eu\n\
+             command=${{1:-}}\n\
+             printf '%s\\n' \"$command\" >> '{}'\n\
+             if [ \"$command\" = prepare ]; then\n\
+                 cat > '{}' <<'EOF'\n\
+FLUX_ENGINE_MANIFEST_V1\n\
+generation=1\n\
+binary={}\n\
+config={}\n\
+working_directory={}\n\
+log={}\n\
+launcher=direct\n\
+readiness=listener\n\
+startup_timeout_ms=3000\n\
+stop_timeout_ms=3000\n\
+listener_port={}\n\
+EOF\n\
+             fi\n\
+             exit 0\n",
+            dispatcher_record.display(),
+            root.join("run/engine.manifest").display(),
+            root.join("bin/sing-box").display(),
+            root.join("conf/config.json").display(),
+            root.join("run").display(),
+            root.join("run/sing-box.log").display(),
+            listener_port,
         ),
     );
     write_script(&root.join("scripts/addrsync"), "exit 0\n");
+    write_script(
+        &root.join("bin/sing-box"),
+        &format!(
+            "set -eu\n\
+             case \"${{1:-}}\" in\n\
+                 check) exit 0 ;;\n\
+                 run) exec python3 -c 'import signal, socket; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind((\"127.0.0.1\", {listener_port})); s.listen(); signal.pause()' ;;\n\
+                 *) exit 64 ;;\n\
+             esac\n"
+        ),
+    );
 
     let mut child = Command::new(fluxd_binary())
         .arg("daemon")
@@ -58,6 +101,13 @@ fn process_directed_sigterm_stops_daemon_cleanly_with_live_legacy_worker() {
         .expect("start fluxd daemon");
 
     wait_for_daemon_ready(&mut child, &socket_path, &dispatcher_record);
+    let snapshot = SocketControlClient::new(&socket_path)
+        .status()
+        .expect("read live daemon status");
+    assert_eq!(snapshot.runtime.phase, RuntimePhase::Running);
+    assert_eq!(snapshot.runtime.capture, RuntimeCaptureState::Published);
+    assert_eq!(snapshot.runtime.engine, RuntimeEngineState::Ready);
+    assert_eq!(snapshot.runtime.generation, Some(1));
     // SAFETY: `child.id()` names the live daemon process observed ready above.
     assert_eq!(unsafe { kill(child.id() as std::ffi::c_int, SIGTERM) }, 0);
 
@@ -70,6 +120,19 @@ fn process_directed_sigterm_stops_daemon_cleanly_with_live_legacy_worker() {
         status.success(),
         "daemon must consume SIGTERM through signalfd, not terminate from signal {:?}: {status}",
         status.signal()
+    );
+    let phases = fs::read_to_string(&dispatcher_record).expect("dispatcher phase record");
+    assert_eq!(
+        phases.lines().collect::<Vec<_>>(),
+        [
+            "startup-recover",
+            "prepare",
+            "capture-start",
+            "capture-verify",
+            "state-running",
+            "capture-stop",
+            "state-stopped",
+        ]
     );
 }
 

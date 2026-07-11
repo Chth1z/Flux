@@ -4,7 +4,9 @@ use std::ffi::OsString;
 use std::fs::{self, File};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -16,6 +18,8 @@ use flux_platform::{
     ShutdownSignal, SingBoxExit, SingBoxLaunchSpec, SingBoxLauncher, SingBoxReadiness,
 };
 use tempfile::{TempDir, tempdir};
+
+const PARENT_DEATH_HELPER_ROOT: &str = "FLUX_TEST_SING_BOX_PARENT_DEATH_ROOT";
 
 #[test]
 fn validation_uses_exact_arguments_and_reports_check_failure() {
@@ -117,6 +121,28 @@ fn direct_spawn_retains_child_identity_and_observes_exit() {
             .expect("read child log")
             .contains("run exiting")
     );
+}
+
+#[test]
+fn sing_box_child_is_killed_when_its_supervisor_process_dies() {
+    if let Some(root) = std::env::var_os(PARENT_DEATH_HELPER_ROOT) {
+        run_parent_death_helper(Path::new(&root));
+        return;
+    }
+
+    let directory = tempdir().expect("temporary parent-death directory");
+    let child_pid_path = directory.path().join("sing-box.pid");
+    let mut supervisor = NestedSupervisor::spawn(
+        "sing_box_child_is_killed_when_its_supervisor_process_dies",
+        PARENT_DEATH_HELPER_ROOT,
+        directory.path(),
+        child_pid_path.clone(),
+    );
+    let child_pid = wait_for_recorded_pid(&child_pid_path);
+
+    let status = supervisor.kill_and_wait();
+    assert_eq!(status.signal(), Some(libc::SIGKILL));
+    wait_for_proc_exit(child_pid);
 }
 
 #[test]
@@ -424,6 +450,47 @@ struct Fixture {
     spec: SingBoxLaunchSpec,
 }
 
+struct NestedSupervisor {
+    child: Child,
+    descendant_pid_path: PathBuf,
+}
+
+impl NestedSupervisor {
+    fn spawn(test: &str, environment: &str, root: &Path, descendant_pid_path: PathBuf) -> Self {
+        let child = Command::new(std::env::current_exe().expect("current test executable"))
+            .arg("--exact")
+            .arg(test)
+            .arg("--nocapture")
+            .env(environment, root)
+            .spawn()
+            .expect("spawn isolated Sing-Box supervisor");
+        Self {
+            child,
+            descendant_pid_path,
+        }
+    }
+
+    fn kill_and_wait(&mut self) -> ExitStatus {
+        self.child.kill().expect("kill isolated supervisor");
+        self.child.wait().expect("reap isolated supervisor")
+    }
+}
+
+impl Drop for NestedSupervisor {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if thread::panicking()
+            && let Ok(pid) = fs::read_to_string(&self.descendant_pid_path)
+            && let Ok(pid) = pid.trim().parse::<libc::pid_t>()
+        {
+            // SAFETY: during unwind this PID came from the isolated helper;
+            // SIGKILL prevents a failed containment assertion leaking it.
+            let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+    }
+}
+
 impl Fixture {
     fn new(mode: &str) -> Self {
         let root = tempdir().expect("temporary test directory");
@@ -557,6 +624,39 @@ fn pin_launch(spec: &SingBoxLaunchSpec) -> PinnedSingBoxLaunch {
     .expect("validate pinned launch descriptors")
 }
 
+fn run_parent_death_helper(root: &Path) {
+    let binary = fake_sing_box(root);
+    let working_directory = root.join("supervised work");
+    fs::create_dir(&working_directory).expect("create supervised working directory");
+    let config = root.join("supervised-config");
+    fs::write(&config, "ignore").expect("write supervised config");
+    let spec = SingBoxLaunchSpec {
+        binary,
+        config,
+        working_directory,
+        log: root.join("supervised.log"),
+        launcher: SingBoxLauncher::Direct,
+        readiness: SingBoxReadiness::TunInterface {
+            name: "lo".to_owned(),
+        },
+        startup_timeout: Duration::from_secs(1),
+        stop_timeout: Duration::from_millis(500),
+    };
+    let pinned = pin_launch(&spec);
+    let child = SingBoxProcessAdapter
+        .spawn_pinned(&pinned, &spec)
+        .expect("spawn supervised fake Sing-Box");
+    fs::write(
+        root.join("sing-box.pid"),
+        child.identity().pid().to_string(),
+    )
+    .expect("publish supervised Sing-Box PID");
+
+    loop {
+        thread::park();
+    }
+}
+
 fn assert_exact_invocation(fixture: &Fixture, pinned: &PinnedSingBoxLaunch, mode: &str) {
     let arguments = fs::read_to_string(&fixture.invocation).expect("read invocation record");
     let expected = [
@@ -584,6 +684,27 @@ fn read_recorded_pid(path: &Path) -> u32 {
         .trim()
         .parse::<u32>()
         .expect("valid recorded process ID")
+}
+
+fn wait_for_recorded_pid(path: &Path) -> u32 {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match fs::read_to_string(path) {
+            Ok(pid) => {
+                return pid
+                    .trim()
+                    .parse::<u32>()
+                    .expect("valid supervised process ID");
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("read supervised process ID: {error}"),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "supervised process did not publish its process ID"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn wait_for_exit(adapter: &SingBoxProcessAdapter, child: &mut SingBoxChild) -> SingBoxExit {

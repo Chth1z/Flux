@@ -42,6 +42,8 @@ fluxd cleanup --offline
 
 Only `fluxd daemon` is long-lived. Sing-Box is its child. A boot shell watchdog may restart `fluxd` after a crash or fatal invariant exit, but it contains no policy logic, never invokes a second recovery owner, and does not restart a settled `UnsupportedKernel` daemon. Normal journal recovery runs inside daemon startup before mutating commands are accepted. `fluxd recover --offline` is an explicit salvage command that requires the daemon lease to be absent. The legacy `fluxctl restart` verb is a client alias for `ReloadSources` followed by `Converge(Configured)`; it has no separate protocol or lifecycle meaning.
 
+In the delivered Phase 1 bridge, `RuntimeCoordinator` implements `LegacyDispatcher` and runs on the one bounded `LegacyControlBridge` worker. The worker serializes requests, address resynchronization, idle maintenance, and shutdown. `EngineSupervisor` owns the Sing-Box child; shell phase scripts remain the only rules/routes/address-sync writer. A boot-scoped mode lease rejects legacy `scripts/core` verbs for the duration of a Rust-owned engine run.
+
 ## 3. Local control socket and Module routing
 
 The control socket is `/data/adb/flux/run/fluxd.sock`, Unix `SOCK_SEQPACKET`, protocol version 2. Version 2 adds the coherent boot-scoped Capability Profile to status responses; version-1 requests are rejected explicitly rather than decoded against the new response shape.
@@ -111,6 +113,8 @@ struct ResponseEnvelope {
 Packets larger than 1 MiB are rejected. The daemon verifies peer credentials and socket permissions. Mutating commands require root or the configured administrative group; read-only commands may be granted to the Android shell UID.
 
 Request IDs are retained in a bounded recent-result cache so a retried mutating request is not applied twice.
+
+Phase 1 status returns `control` and `runtime` separately. `ControlSnapshot` describes desired/control progress. `RuntimeSnapshot` is an independently revisioned observed projection containing runtime phase, capture state, engine state, generation, and an optional bounded operation/message/recovery failure. Clients must not infer observed health solely from administrative intent or request completion.
 
 ## 4. Core domain types
 
@@ -684,6 +688,20 @@ Rules:
 - treat port/TUN presence as one readiness signal, not full health;
 - keep engine logs separate but correlated by Generation.
 
+Delivered Phase 1 supervision additionally requires:
+
+- a strict engine manifest no larger than 16 KiB, with no unknown, duplicate, malformed, missing, or mode-inappropriate fields;
+- startup and stop timeout fields in `1..=60000` milliseconds;
+- SHA-256 identities for the exact binary, configuration, and optional BusyBox launcher;
+- descriptor-pinned `sing-box check` and `run`, followed by a rehash of the same descriptors before readiness acceptance;
+- PID plus `/proc` start-tick identity before every signal and child-owned listener/TUN readiness evidence;
+- a direct-child `PR_SET_PDEATHSIG(SIGKILL)` lease with a post-arm parent-identity race check for Sing-Box and phase-shell processes;
+- bounded TERM/KILL/reap, restart windows, exponential backoff, and retained ownership until disappearance is observed.
+
+The Phase 1 transaction orders start as `prepare` → engine admission → generation-bound capture start → structural capture verification → generation-bound `RUNNING`, and stop as capture detach → engine stop/reap → `STOPPED`. Partial capture-start compensation retains generation evidence until both networking writers prove cleanup; terminal publication and engine retirement are forbidden while detachment is uncertain. Reload prepares the candidate while the previous generation remains active, blocks replacement if detach fails, and attempts the previous immutable `EngineSpec` if candidate activation fails. An uncertain reload detach enters capture repair: prove full detachment, retain/reconcile the old engine, then republish and reverify that generation. Publication failure after successful verification retains the runtime, but maintenance performs a fresh generation-bound capture verification before retrying `RUNNING`. The current structural capture check is not a synthetic traffic/loop-prevention proof.
+
+The parent-death lease is deliberately described as direct-child containment, not process-tree containment. Linux does not inherit `PDEATHSIG` across `fork`, and clears it when a later `setuidgid` transition changes effective or filesystem credentials. Direct-launch Sing-Box therefore supports automatic same-boot restart recovery. A crashed `busybox-setuidgid` generation is handled conservatively: startup recovery detaches capture, publishes `FAILED`, preserves the Rust ownership lease and active generation evidence, and refuses automatic daemon restart because stale child death cannot be proven. Phase descendants remain outside the direct-child guarantee. Full crash-time coverage requires a post-credential Rust launcher plus a verified Flux-owned process-cgroup containment design; those are deferred hardening and must be proven on Android before the broader guarantee is claimed.
+
 ## 15. Generation journal
 
 ### 15.1 Record
@@ -816,9 +834,11 @@ enum RuntimeEvent {
 
 If the compiled digest and observed managed-object digest equal the active Generation, reconciliation performs health verification only and returns `NoChange`.
 
+The Phase 1 serialized worker calls `maintain` after each request and after bounded idle timeouts. Maintenance advances pending child reap/backoff without spawning a second child, detaches capture after abnormal exit or uncertain mutation, restarts only after supervisor admission, restores and structurally verifies capture, and freshly re-verifies the matching generation before retrying pending `RUNNING`; `STOPPED` and `FAILED` retries occur only after capture is proven detached. Shutdown uses bounded retries of the same detach-before-stop ordering.
+
 ## 18. Kernel I/O runtime
 
-The mandatory baseline is one custom `epoll` reactor derived from the current `addrsyncd` design. It owns nonblocking route/netfilter netlink sockets, timerfd, signalfd or pidfds, control descriptors, child pipes, and pollable BPF buffers. It owns TUN queue FDs only in a future `FluxOwnedTunFd` plan; in `EngineOwnedTun`, packet I/O stays entirely inside Sing-Box. Handlers drain bounded batches to `EAGAIN` and yield after a work budget.
+The mandatory target baseline is one custom `epoll` reactor derived from the current `addrsyncd` design. Phase 1 currently integrates the control descriptor and shutdown `signalfd`; nonblocking route/netfilter netlink sockets, timerfd, pidfds, child pipes, and pollable BPF buffers remain later work. It owns TUN queue FDs only in a future `FluxOwnedTunFd` plan; in `EngineOwnedTun`, packet I/O stays entirely inside Sing-Box. Handlers drain bounded batches to `EAGAIN` and yield after a work budget.
 
 Higher-level async tasks communicate through bounded channels. `io_uring` is a separate `FluxOwnedTunFd` TUN I/O Adapter selected only when the FD-handoff contract, `io_uring_setup`, required opcode probes, cancellation, a real TUN read/write smoke test, policy permissions, and device benchmarks all succeed.
 
@@ -851,10 +871,12 @@ The packaging task fails if binary source, version, target, hash, license, or re
 
 | Release stage | Runtime behavior |
 |---|---|
-| Bridge | `fluxd` supervises current shell backends and exposes new status/config migration |
+| Bridge | `fluxd` owns Sing-Box through the atomic runtime coordinator; serialized shell phases still own networking writes and expose separate control/runtime status |
 | Legacy parity | `fluxd` owns xtables/PBR/address sync; updater may still use external curl/jq adapters |
 | New backends | nftables, ipset, managed TUN, and eBPF observation available behind capability gates |
 | Default switch | `auto` prefers nftables where conformance passes |
 | Cleanup | standalone `addrsyncd` and runtime policy scripts removed; wrappers retained |
 
 No compatibility stage may have two independent owners mutating the same kernel objects.
+
+Open Phase 1 hardening gates are a stronger functional traffic/loop-prevention probe, ancestor-safe `openat`/`openat2` traversal, bounded rotating Generation-correlated logs, pidfd/timerfd reactor integration, and real-device evidence on Android kernel 5.10.

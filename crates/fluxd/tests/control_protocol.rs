@@ -10,7 +10,10 @@ use flux_core::{
 };
 use flux_platform::Uid;
 use flux_testkit::CapabilityProfileFixture;
-use fluxd::{MAX_CONTROL_PACKET_BYTES, ProtocolHandler, RequestPeerId};
+use fluxd::{
+    MAX_CONTROL_PACKET_BYTES, ProtocolHandler, RequestPeerId, RuntimeCaptureState,
+    RuntimeEngineState, RuntimeFailure, RuntimePhase, RuntimeSnapshot, RuntimeSnapshotSource,
+};
 
 fn uid(raw: u32) -> Uid {
     Uid::from_raw(raw).expect("valid test UID")
@@ -65,7 +68,20 @@ fn version_one_requests_are_explicitly_rejected() {
 
 #[test]
 fn status_returns_one_coherent_capability_profile_and_control_snapshot() {
-    let handler = ProtocolHandler::new(
+    let runtime = RuntimeSnapshotSource::default();
+    runtime.publish(RuntimeSnapshot {
+        revision: 12,
+        phase: RuntimePhase::Repairing,
+        capture: RuntimeCaptureState::Detached,
+        engine: RuntimeEngineState::BackingOff,
+        generation: Some(74),
+        last_error: Some(RuntimeFailure {
+            operation: "maintain proxy engine".to_owned(),
+            message: "owned child exited unexpectedly".to_owned(),
+            recovery: "retry after bounded backoff".to_owned(),
+        }),
+    });
+    let handler = ProtocolHandler::with_runtime_snapshot_source(
         supported_profile(),
         RecordingClient::with_snapshot(ControlSnapshot {
             revision: 73,
@@ -79,6 +95,7 @@ fn status_returns_one_coherent_capability_profile_and_control_snapshot() {
                 revision: 73,
             }),
         }),
+        runtime,
     );
 
     let response =
@@ -111,7 +128,13 @@ fn status_returns_one_coherent_capability_profile_and_control_snapshot() {
             "\"configuration_dirty\":false,",
             "\"in_flight\":null,\"last_completed\":{",
             "\"intent\":{\"action\":\"reload\",\"reason\":\"config_changed\"},",
-            "\"revision\":73}}}}}\n"
+            "\"revision\":73}},",
+            "\"runtime\":{\"revision\":1,\"phase\":\"repairing\",",
+            "\"capture\":\"detached\",",
+            "\"engine\":\"backing_off\",\"generation\":74,",
+            "\"last_error\":{\"operation\":\"maintain proxy engine\",",
+            "\"message\":\"owned child exited unexpectedly\",",
+            "\"recovery\":\"retry after bounded backoff\"}}}}}\n"
         )
     );
 }

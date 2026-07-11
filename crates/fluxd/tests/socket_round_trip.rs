@@ -12,7 +12,10 @@ use flux_core::{
 };
 use flux_platform::{DaemonReactor, SeqpacketConnection, ShutdownSignal};
 use flux_testkit::CapabilityProfileFixture;
-use fluxd::{ControlConnectionHandler, SocketControlClient};
+use fluxd::{
+    ControlConnectionHandler, RuntimeCaptureState, RuntimeEngineState, RuntimeFailure,
+    RuntimePhase, RuntimeSnapshot, RuntimeSnapshotSource, SocketControlClient,
+};
 use tempfile::tempdir;
 
 #[test]
@@ -94,6 +97,57 @@ fn seqpacket_status_preserves_the_capability_profile_revision() {
     let snapshot = client_thread.join().expect("client thread");
 
     assert_eq!(snapshot.capability_profile, expected_profile);
+    assert_socket_absent(&socket_path);
+}
+
+#[test]
+fn seqpacket_status_preserves_the_observed_runtime_snapshot() {
+    let directory = tempdir().expect("temporary directory");
+    let socket_path = directory.path().join("fluxd.sock");
+    let shutdown = ShutdownSignal::install().expect("install shutdown signal source");
+    let runtime_source = RuntimeSnapshotSource::default();
+    runtime_source.publish(RuntimeSnapshot {
+        revision: 33,
+        phase: RuntimePhase::Verifying,
+        capture: RuntimeCaptureState::Published,
+        engine: RuntimeEngineState::Ready,
+        generation: Some(91),
+        last_error: Some(RuntimeFailure {
+            operation: "verify published capture".to_owned(),
+            message: "functional probe timed out".to_owned(),
+            recovery: "detach capture before retiring the proxy engine".to_owned(),
+        }),
+    });
+    let runtime = runtime_source.snapshot().as_ref().clone();
+    let bridge = LegacyControlBridge::start(
+        RecordingDispatcher {
+            calls: Arc::new(Mutex::new(Vec::new())),
+        },
+        4,
+    )
+    .expect("start bridge");
+    let handler = ControlConnectionHandler::with_runtime_snapshot_source(
+        Arc::new(CapabilityProfileFixture::supported()),
+        bridge,
+        runtime_source,
+    );
+    let (reactor, stop) = DaemonReactor::bind(&socket_path, shutdown, move |connection| {
+        handler.serve(connection).expect("serve control connection");
+    })
+    .expect("bind reactor");
+    let client_path = socket_path.clone();
+    let client_thread = thread::spawn(move || {
+        let snapshot = SocketControlClient::new(client_path)
+            .status()
+            .expect("status snapshot");
+        stop.request_stop().expect("request reactor stop");
+        snapshot
+    });
+
+    reactor.run().expect("run reactor");
+    let snapshot = client_thread.join().expect("client thread");
+
+    assert_eq!(snapshot.runtime, runtime);
     assert_socket_absent(&socket_path);
 }
 

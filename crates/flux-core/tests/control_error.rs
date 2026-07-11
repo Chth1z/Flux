@@ -28,6 +28,27 @@ fn persistence_error_preserves_its_source_and_recovery_guidance() {
 }
 
 #[test]
+fn runtime_error_preserves_its_source_and_recovery_guidance() {
+    let error = ControlError::runtime(
+        "publish capture",
+        io::Error::new(io::ErrorKind::PermissionDenied, "iptables lock denied"),
+        "detach capture and retry reconciliation",
+    );
+
+    assert_eq!(
+        error.source().map(ToString::to_string).as_deref(),
+        Some("iptables lock denied")
+    );
+    assert_eq!(
+        error.to_string(),
+        concat!(
+            "runtime reconciliation failed during publish capture: ",
+            "iptables lock denied; recovery: detach capture and retry reconciliation"
+        )
+    );
+}
+
+#[test]
 fn request_rejection_preserves_its_stable_code() {
     let error = ControlError::request_rejected(
         "unsupported_kernel",

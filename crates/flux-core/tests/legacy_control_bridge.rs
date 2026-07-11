@@ -203,8 +203,87 @@ fn concurrent_submissions_never_execute_more_than_one_dispatcher_call() {
     assert_eq!(bridge.snapshot().revision, 16);
 }
 
+#[test]
+fn maintenance_and_shutdown_share_the_serialized_writer() {
+    let (event_tx, event_rx) = mpsc::channel();
+    let dispatcher = MaintenanceDispatcher { event_tx };
+    let bridge = LegacyControlBridge::start(dispatcher, 4).expect("start bridge");
+
+    assert_eq!(
+        event_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("idle maintenance runs"),
+        MaintenanceEvent::Maintained
+    );
+
+    bridge
+        .submit(LegacyIntent::Running {
+            reason: Reason::Fluxctl,
+        })
+        .expect("accept operation")
+        .wait()
+        .expect("dispatcher succeeds");
+    loop {
+        if event_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("observe execute event")
+            == MaintenanceEvent::Executed
+        {
+            break;
+        }
+    }
+    assert_eq!(
+        event_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("maintenance follows request"),
+        MaintenanceEvent::Maintained
+    );
+
+    drop(bridge);
+    loop {
+        if event_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("observe shutdown event")
+            == MaintenanceEvent::Shutdown
+        {
+            break;
+        }
+    }
+}
+
 struct RecordingDispatcher {
     calls: Arc<Mutex<Vec<LegacyIntent>>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MaintenanceEvent {
+    Executed,
+    Maintained,
+    Shutdown,
+}
+
+struct MaintenanceDispatcher {
+    event_tx: mpsc::Sender<MaintenanceEvent>,
+}
+
+impl LegacyDispatcher for MaintenanceDispatcher {
+    fn execute(&mut self, _intent: &LegacyIntent) -> Result<(), ControlError> {
+        self.event_tx
+            .send(MaintenanceEvent::Executed)
+            .map_err(|error| ControlError::dispatcher(error.to_string()))
+    }
+
+    fn maintenance_interval(&self) -> Option<Duration> {
+        Some(Duration::from_millis(5))
+    }
+
+    fn maintain(&mut self) {
+        let _ = self.event_tx.send(MaintenanceEvent::Maintained);
+    }
+
+    fn shutdown(&mut self) {
+        let _ = self.event_tx.send(MaintenanceEvent::Shutdown);
+    }
 }
 
 impl LegacyDispatcher for RecordingDispatcher {

@@ -5,7 +5,10 @@ use flux_core::{
     LegacyIntent, OperationReport,
 };
 use flux_testkit::{CapabilityProfileFixture, StaticKernelReleaseSource};
-use fluxd::{DaemonClient, DaemonSnapshot, EventDisposition, EventReport, run_cli_with_daemon};
+use fluxd::{
+    DaemonClient, DaemonSnapshot, EventDisposition, EventReport, RuntimeCaptureState,
+    RuntimeEngineState, RuntimeFailure, RuntimePhase, RuntimeSnapshot, run_cli_with_daemon,
+};
 
 #[test]
 fn ping_uses_the_daemon_transport() {
@@ -125,7 +128,13 @@ fn json_status_comes_from_the_live_daemon_snapshot() {
             "\"resolution\":\"direct\",\"ready\":true}}}},",
             "\"control\":{\"revision\":18,\"administrative_state\":\"stopped\",",
             "\"configuration_dirty\":true,\"in_flight\":null,",
-            "\"last_completed\":null}}\n"
+            "\"last_completed\":null},",
+            "\"runtime\":{\"revision\":7,\"phase\":\"repairing\",",
+            "\"capture\":\"detached\",",
+            "\"engine\":\"backing_off\",\"generation\":19,",
+            "\"last_error\":{\"operation\":\"maintain proxy engine\",",
+            "\"message\":\"owned child exited unexpectedly\",",
+            "\"recovery\":\"retry after bounded backoff\"}}}\n"
         )
     );
     assert_eq!(
@@ -238,7 +247,14 @@ fn text_status_reports_the_capability_profile_evidence() {
             "legacy addrsync: ready (direct, verified)\n",
             "administrative state: stopped\n",
             "configuration dirty: yes\n",
-            "revision: 18\n"
+            "revision: 18\n",
+            "runtime revision: 7\n",
+            "runtime phase: repairing\n",
+            "runtime capture: detached\n",
+            "runtime engine: backing_off\n",
+            "runtime generation: 19\n",
+            "runtime last error: maintain proxy engine: owned child exited unexpectedly; ",
+            "recovery: retry after bounded backoff\n"
         )
     );
     assert_eq!(source.calls(), 0);
@@ -309,6 +325,7 @@ impl DaemonClient for RecordingDaemonClient {
                 in_flight: None,
                 last_completed: None,
             },
+            runtime: observed_runtime(),
         })
     }
 
@@ -333,5 +350,20 @@ impl DaemonClient for RecordingDaemonClient {
             disposition: EventDisposition::Deferred,
             revision: 19,
         })
+    }
+}
+
+fn observed_runtime() -> RuntimeSnapshot {
+    RuntimeSnapshot {
+        revision: 7,
+        phase: RuntimePhase::Repairing,
+        capture: RuntimeCaptureState::Detached,
+        engine: RuntimeEngineState::BackingOff,
+        generation: Some(19),
+        last_error: Some(RuntimeFailure {
+            operation: "maintain proxy engine".to_owned(),
+            message: "owned child exited unexpectedly".to_owned(),
+            recovery: "retry after bounded backoff".to_owned(),
+        }),
     }
 }

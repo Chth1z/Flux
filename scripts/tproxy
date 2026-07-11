@@ -405,6 +405,52 @@ _route() {
     return 0
 }
 
+_verify_rules_detached() {
+    local family="${1}"
+    local cmd="iptables"
+    local suffix=""
+    [ "${family}" = "6" ] && cmd="ip6tables" && suffix="6"
+
+    "${cmd}" -w "${IPTABLES_WAIT}" -t mangle -S >/dev/null 2>&1 || {
+        log_error "Cannot inspect IPv${family} mangle rules after cleanup"
+        return 1
+    }
+    if "${cmd}" -w "${IPTABLES_WAIT}" -t mangle -C PREROUTING -j "PROXY_PREROUTING${suffix}" >/dev/null 2>&1; then
+        log_error "IPv${family} PREROUTING capture jump remains attached"
+        return 1
+    fi
+    if "${cmd}" -w "${IPTABLES_WAIT}" -t mangle -C OUTPUT -j "PROXY_OUTPUT${suffix}" >/dev/null 2>&1; then
+        log_error "IPv${family} OUTPUT capture jump remains attached"
+        return 1
+    fi
+    return 0
+}
+
+_verify_route_detached() {
+    local family="${1}"
+    local pref="${TABLE_ID}"
+    local table="${TABLE_ID}"
+    local rules=""
+    local routes=""
+
+    if [ "${family}" = "6" ]; then
+        rules=$(ip -6 rule show 2>/dev/null) || return 1
+        routes=$(ip -6 route show table "${table}" 2>/dev/null) || return 1
+    else
+        rules=$(ip rule show 2>/dev/null) || return 1
+        routes=$(ip route show table "${table}" 2>/dev/null) || return 1
+    fi
+    if printf '%s\n' "${rules}" | grep -Eq "^${pref}:.*fwmark .*lookup ${table}([[:space:]]|$)"; then
+        log_error "IPv${family} Flux policy rule remains attached"
+        return 1
+    fi
+    if printf '%s\n' "${routes}" | grep -Eq '^local .* dev lo([[:space:]]|$)'; then
+        log_error "IPv${family} Flux local route remains attached"
+        return 1
+    fi
+    return 0
+}
+
 # ==============================================================================
 # [ Public API ]
 # ==============================================================================
@@ -439,15 +485,23 @@ stop_proxy() {
     fi
 
     local f
+    local rc=0
     for f in ${families}; do
-        _active_feature_enabled "BLOCK_QUIC" && run -v "Clean IPv${f} QUIC" _block_quic cleanup "${f}" || true
-        run -v "Clean IPv${f} Rules" _cleanup_rules "${f}" || true
-        run -v "Clean IPv${f} Route" _route cleanup "${f}" || true
-        _remove_active_cleanup "${f}"
+        if _active_feature_enabled "BLOCK_QUIC"; then
+            run -v "Clean IPv${f} QUIC" _block_quic cleanup "${f}" || rc=1
+        fi
+        run -v "Clean IPv${f} Rules" _cleanup_rules "${f}" || rc=1
+        run -v "Clean IPv${f} Route" _route cleanup "${f}" || rc=1
+        run -v "Verify IPv${f} Rules Detached" _verify_rules_detached "${f}" || rc=1
+        run -v "Verify IPv${f} Route Detached" _verify_route_detached "${f}" || rc=1
+        [ "${rc}" -ne 0 ] || _remove_active_cleanup "${f}"
     done
-    run -v "Restore Compatibility Profiles" _restore_compat_profiles || true
-    rm -f "${ACTIVE_FEATURES_FILE}" 2>/dev/null || true
-    rm -f "${ACTIVE_RUNTIME_FILE}" 2>/dev/null || true
+    run -v "Restore Compatibility Profiles" _restore_compat_profiles || rc=1
+    if [ "${rc}" -eq 0 ]; then
+        rm -f "${ACTIVE_FEATURES_FILE}" 2>/dev/null || true
+        rm -f "${ACTIVE_RUNTIME_FILE}" 2>/dev/null || true
+    fi
+    return "${rc}"
 }
 
 # ==============================================================================

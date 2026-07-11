@@ -6,13 +6,15 @@
 #
 # Runtime call graph:
 #   service/inotify/fluxctl -> fluxd -> FLUXD_BRIDGE=1 dispatcher
-#   dispatcher -> init/core/tproxy/addrsync legacy writers
+#   legacy mode: dispatcher -> init/core/tproxy/addrsync
+#   Rust-owned mode: dispatcher -> init/tproxy/addrsync (never core)
 #
 # Invariants:
 #   1) fluxd owns administrative intent and serializes every mutation.
 #   2) FLUXD_BRIDGE=1 is required before legacy networking state is changed.
 #   3) init only prepares runtime prerequisites and emits EVENT_INIT_OK.
 #   4) failures must converge to STOPPED/FAILED without stale ready markers.
+#   5) boot-scoped legacy and Rust-owned modes cannot be mixed.
 # ==============================================================================
 
 set -eu
@@ -29,6 +31,10 @@ readonly SCRIPT_DIR="${_script_path%/*}"
 . "${SCRIPT_DIR}/log"
 
 readonly LOG_COMPONENT="Disp"
+readonly ENGINE_MANIFEST_MAX_BYTES=16384
+# Keep arithmetic portable across Android shells while leaving ample runtime
+# reload headroom.
+readonly ENGINE_GENERATION_MAX=2147483647
 
 _forward_to_fluxd_control() {
     local action="${1}"
@@ -107,9 +113,892 @@ _write_restart_stamp() {
 # [ State Actions ]
 # ==============================================================================
 
+_clear_stale_boot_runtime_records() {
+    rm -f \
+        "${DISPATCH_MODE_FILE}" \
+        "${CAPTURE_ACTIVE_FILE}" \
+        "${CAPTURE_VERIFIED_FILE}" \
+        "${ENGINE_ACTIVE_GENERATION_FILE}" \
+        "${ENGINE_PREVIOUS_GENERATION_FILE}" \
+        "${ACTIVE_CLEANUP_V4_FILE}" \
+        "${ACTIVE_CLEANUP_V6_FILE}" \
+        "${ACTIVE_FEATURES_FILE}" \
+        "${ACTIVE_RUNTIME_FILE}" \
+        "${ADDRSYNCD_PID_FILE}" 2>/dev/null || true
+}
+
+_read_dispatch_mode_record() {
+    local active=""
+    local active_boot_id=""
+    local extra=""
+
+    [ -f "${DISPATCH_MODE_FILE}" ] && [ ! -L "${DISPATCH_MODE_FILE}" ] || {
+        log_error "Dispatcher mode record is missing or unsafe"
+        return 1
+    }
+    read -r active active_boot_id extra <"${DISPATCH_MODE_FILE}" || return 1
+    [ -n "${active_boot_id}" ] && [ -z "${extra}" ] || {
+        log_error "Dispatcher mode record is malformed"
+        return 1
+    }
+    case "${active}" in
+    legacy | rust-owned) ;;
+    *)
+        log_error "Dispatcher mode record has an unknown owner"
+        return 1
+        ;;
+    esac
+    case "${active_boot_id}" in
+    '' | *[!0-9A-Fa-f-]*)
+        log_error "Dispatcher mode record has an invalid boot identity"
+        return 1
+        ;;
+    esac
+    printf '%s %s\n' "${active}" "${active_boot_id}"
+}
+
+_require_recovery_capture_detached() {
+    local evidence=""
+
+    for evidence in \
+        "${CAPTURE_ACTIVE_FILE}" \
+        "${ACTIVE_CLEANUP_V4_FILE}" \
+        "${ACTIVE_CLEANUP_V6_FILE}" \
+        "${ACTIVE_FEATURES_FILE}" \
+        "${ACTIVE_RUNTIME_FILE}" \
+        "${ADDRSYNCD_PID_FILE}"; do
+        if [ -e "${evidence}" ] || [ -L "${evidence}" ]; then
+            log_error "Capture recovery evidence remains: ${evidence##*/}"
+            return 1
+        fi
+    done
+}
+
+_generation_launcher() {
+    local generation="${1}"
+    local generation_dir=""
+    local launcher=""
+    local launcher_count=0
+    local line=""
+    local manifest=""
+
+    generation_dir=$(_generation_dir "${generation}") || return 1
+    manifest="${generation_dir}/engine.manifest"
+    [ -f "${manifest}" ] && [ ! -L "${manifest}" ] || {
+        log_error "Generation launcher manifest is missing or unsafe: ${generation}"
+        return 1
+    }
+    while IFS= read -r line; do
+        case "${line}" in
+        launcher=*)
+            launcher_count=$((launcher_count + 1))
+            launcher="${line#launcher=}"
+            ;;
+        esac
+    done <"${manifest}"
+    [ "${launcher_count}" -eq 1 ] || {
+        log_error "Generation manifest must identify exactly one launcher"
+        return 1
+    }
+    case "${launcher}" in
+    direct | busybox-setuidgid)
+        printf '%s\n' "${launcher}"
+        ;;
+    *)
+        log_error "Generation manifest has an unsupported launcher"
+        return 1
+        ;;
+    esac
+}
+
+_busybox_quarantine_generation() {
+    local generation=""
+    local inspected_generation=""
+    local launcher=""
+    local prepared_generation=""
+    local primary_generation="${1:-}"
+
+    if [ -e "${ENGINE_MANIFEST_FILE}" ] || [ -L "${ENGINE_MANIFEST_FILE}" ]; then
+        prepared_generation=$(_prepared_manifest_generation) || return 2
+    fi
+    for generation in "${primary_generation}" "${prepared_generation}"; do
+        [ -n "${generation}" ] || continue
+        [ "${generation}" != "${inspected_generation}" ] || continue
+        inspected_generation="${generation}"
+        launcher=$(_generation_launcher "${generation}") || return 2
+        if [ "${launcher}" = "busybox-setuidgid" ]; then
+            printf '%s\n' "${generation}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+_state_startup_recover() {
+    local active=""
+    local active_boot_id=""
+    local boot_id=""
+    local mode_record=""
+    local quarantine_generation=""
+    local recovery_generation=""
+
+    boot_id=$(current_boot_id) || return 1
+    if [ ! -e "${DISPATCH_MODE_FILE}" ] && [ ! -L "${DISPATCH_MODE_FILE}" ]; then
+        # No owner is allowed to leave capture evidence behind. Generation
+        # publication records alone are safe to retire after detachment has
+        # already been proven.
+        _require_recovery_capture_detached || return 1
+        rm -f \
+            "${CAPTURE_VERIFIED_FILE}" \
+            "${ENGINE_ACTIVE_GENERATION_FILE}" \
+            "${ENGINE_PREVIOUS_GENERATION_FILE}" 2>/dev/null || true
+        sync_prop "STOPPED"
+        return 0
+    fi
+
+    mode_record=$(_read_dispatch_mode_record) || return 1
+    set -- ${mode_record}
+    active="${1}"
+    active_boot_id="${2}"
+
+    if [ "${active_boot_id}" != "${boot_id}" ]; then
+        # Kernel objects cannot survive a boot boundary. Retire only the
+        # persistent evidence; never run generation cleanup with a stale boot
+        # identity that could now name unrelated processes or objects.
+        _clear_stale_boot_runtime_records
+        sync_prop "STOPPED"
+        return 0
+    fi
+    if [ "${active}" = "legacy" ]; then
+        log_error "Live legacy ownership blocks Rust startup recovery"
+        return 1
+    fi
+
+    if [ -e "${CAPTURE_ACTIVE_FILE}" ] || [ -L "${CAPTURE_ACTIVE_FILE}" ]; then
+        recovery_generation=$(_read_generation_record "${CAPTURE_ACTIVE_FILE}" "attached capture") || return 1
+        _state_capture_stop || return 1
+    elif _capture_mutation_evidence_present; then
+        recovery_generation=$(_recovery_generation) || return 1
+        _stop_capture_generation "${recovery_generation}" || return 1
+    elif [ -e "${ENGINE_ACTIVE_GENERATION_FILE}" ] || [ -L "${ENGINE_ACTIVE_GENERATION_FILE}" ]; then
+        recovery_generation=$(_read_generation_record "${ENGINE_ACTIVE_GENERATION_FILE}" "published runtime") || return 1
+    fi
+    _require_recovery_capture_detached || return 1
+    if quarantine_generation=$(_busybox_quarantine_generation "${recovery_generation}"); then
+        _write_generation_record "${ENGINE_ACTIVE_GENERATION_FILE}" "${quarantine_generation}" || return 1
+        sync_prop "FAILED" || return 1
+        log_error "BusyBox-launched Sing-Box cannot be proven dead after daemon loss; Rust ownership is quarantined"
+        return 1
+    else
+        [ "$?" -eq 1 ] || return 1
+    fi
+    _state_stopped_rust
+}
+
+_claim_dispatch_mode() {
+    local requested="${1}"
+    local active=""
+    local active_boot_id=""
+    local boot_id=""
+
+    [ -d "${RUN_DIR}" ] || mkdir -p "${RUN_DIR}"
+    boot_id=$(current_boot_id) || return 1
+    if [ -f "${DISPATCH_MODE_FILE}" ]; then
+        read -r active active_boot_id <"${DISPATCH_MODE_FILE}" || return 1
+        if [ "${active_boot_id}" != "${boot_id}" ]; then
+            _clear_stale_boot_runtime_records
+        else
+            if [ "${active}" != "${requested}" ]; then
+                log_error "Dispatcher mode '${active}' cannot run '${requested}' verbs"
+                return 1
+            fi
+            return 0
+        fi
+    fi
+
+    atomic_write "${DISPATCH_MODE_FILE}" printf '%s %s\n' "${requested}" "${boot_id}"
+}
+
+_require_dispatch_mode() {
+    local required="${1}"
+    local active=""
+    local active_boot_id=""
+    local boot_id=""
+
+    [ -f "${DISPATCH_MODE_FILE}" ] || {
+        log_error "Dispatcher mode is not established; run prepare first"
+        return 1
+    }
+    boot_id=$(current_boot_id) || return 1
+    read -r active active_boot_id <"${DISPATCH_MODE_FILE}" || return 1
+    [ "${active_boot_id}" = "${boot_id}" ] || {
+        _clear_stale_boot_runtime_records
+        log_error "Dispatcher mode belongs to a previous boot; run prepare first"
+        return 1
+    }
+    [ "${active}" = "${required}" ] || {
+        log_error "Dispatcher mode '${active}' cannot run '${required}' verbs"
+        return 1
+    }
+}
+
+_load_shared_prepared_config() {
+    if [ -s "${CACHE_CONFIG_FILE}" ]; then
+        set -a
+        . "${CACHE_CONFIG_FILE}"
+        set +a
+        return 0
+    fi
+    load_config
+}
+
+_validate_generation_id() {
+    local generation="${1:-}"
+
+    case "${generation}" in
+    '' | 0 | 0* | *[!0-9]*)
+        log_error "Generation must be a canonical positive decimal integer"
+        return 1
+        ;;
+    esac
+    [ "${#generation}" -le 10 ] && [ "${generation}" -le "${ENGINE_GENERATION_MAX}" ] || {
+        log_error "Generation exceeds the supported range"
+        return 1
+    }
+}
+
+_generation_dir() {
+    local generation="${1}"
+
+    _validate_generation_id "${generation}" || return 1
+    printf '%s/%s\n' "${ENGINE_GENERATIONS_DIR}" "${generation}"
+}
+
+_allocate_generation_id() {
+    local current=0
+    local next=0
+    local path=""
+    local candidate=""
+
+    # _state_prepare is invoked under _with_dispatch_lock, so the sequence and
+    # directory scan form one serialized allocation decision.
+    [ -d "${ENGINE_GENERATIONS_DIR}" ] || mkdir -p "${ENGINE_GENERATIONS_DIR}" || return 1
+    if [ -f "${ENGINE_GENERATION_SEQUENCE_FILE}" ]; then
+        IFS= read -r current <"${ENGINE_GENERATION_SEQUENCE_FILE}" || return 1
+        _validate_generation_id "${current}" || {
+            log_error "Generation sequence is invalid"
+            return 1
+        }
+    fi
+
+    for path in "${ENGINE_GENERATIONS_DIR}"/*; do
+        [ -d "${path}" ] || continue
+        candidate="${path##*/}"
+        case "${candidate}" in
+        '' | 0 | 0* | *[!0-9]*) continue ;;
+        esac
+        [ "${#candidate}" -le 10 ] || continue
+        [ "${candidate}" -le "${ENGINE_GENERATION_MAX}" ] 2>/dev/null || continue
+        [ "${candidate}" -le "${current}" ] || current="${candidate}"
+    done
+
+    [ "${current}" -lt "${ENGINE_GENERATION_MAX}" ] || {
+        log_error "Generation sequence is exhausted"
+        return 1
+    }
+    next=$((current + 1))
+    atomic_write "${ENGINE_GENERATION_SEQUENCE_FILE}" printf '%s\n' "${next}" || return 1
+    printf '%s\n' "${next}"
+}
+
+_write_generation_record() {
+    local target="${1}"
+    local generation="${2}"
+    local boot_id=""
+
+    _validate_generation_id "${generation}" || return 1
+    boot_id=$(current_boot_id) || return 1
+    atomic_write "${target}" printf '%s %s\n' "${generation}" "${boot_id}"
+}
+
+_read_generation_record() {
+    local source="${1}"
+    local label="${2}"
+    local generation=""
+    local record_boot_id=""
+    local extra=""
+    local boot_id=""
+
+    [ -f "${source}" ] && [ ! -L "${source}" ] || {
+        log_error "${label} generation record is missing or unsafe"
+        return 1
+    }
+    read -r generation record_boot_id extra <"${source}" || return 1
+    [ -z "${extra}" ] || {
+        log_error "${label} generation record is malformed"
+        return 1
+    }
+    _validate_generation_id "${generation}" || return 1
+    boot_id=$(current_boot_id) || return 1
+    [ "${record_boot_id}" = "${boot_id}" ] || {
+        log_error "${label} generation belongs to a different boot"
+        return 1
+    }
+    printf '%s\n' "${generation}"
+}
+
+_load_generation_config() {
+    local generation="${1}"
+    local generation_dir=""
+    local recorded_generation=""
+
+    generation_dir=$(_generation_dir "${generation}") || return 1
+    [ -d "${generation_dir}" ] && [ ! -L "${generation_dir}" ] || {
+        log_error "Generation directory is missing or unsafe: ${generation}"
+        return 1
+    }
+    [ -f "${generation_dir}/generation.id" ] && [ ! -L "${generation_dir}/generation.id" ] || {
+        log_error "Generation identity is missing or unsafe: ${generation}"
+        return 1
+    }
+    IFS= read -r recorded_generation <"${generation_dir}/generation.id" || return 1
+    [ "${recorded_generation}" = "${generation}" ] || {
+        log_error "Generation directory identity mismatch"
+        return 1
+    }
+    [ -s "${generation_dir}/cache_config" ] && [ ! -L "${generation_dir}/cache_config" ] || {
+        log_error "Generation environment is missing or unsafe: ${generation}"
+        return 1
+    }
+
+    FLUXD_ENGINE_OWNER=rust
+    FLUX_GENERATION_ID="${generation}"
+    FLUX_GENERATION_DIR="${generation_dir}"
+    export FLUXD_ENGINE_OWNER FLUX_GENERATION_ID FLUX_GENERATION_DIR
+    set -a
+    . "${generation_dir}/cache_config"
+    set +a
+}
+
+_copy_generation_artifact() {
+    local source="${1}"
+    local target="${2}"
+    local label="${3}"
+
+    [ -f "${source}" ] && [ ! -L "${source}" ] || {
+        log_error "${label} is missing or unsafe: ${source}"
+        return 1
+    }
+    cp "${source}" "${target}" || return 1
+    chmod 0444 "${target}" 2>/dev/null || return 1
+}
+
+_snapshot_generation_artifacts() {
+    local generation="${1}"
+    local generation_dir="${2}"
+
+    _copy_generation_artifact "${CONFIG_FILE}" "${generation_dir}/config.json" "Sing-Box configuration" || return 1
+    _copy_generation_artifact "${CACHE_CONFIG_FILE}" "${generation_dir}/cache_config" "generated environment" || return 1
+    _copy_generation_artifact "${CACHE_RULES_V4_FILE}" "${generation_dir}/cache_rules_ipv4" "IPv4 rule cache" || return 1
+    _copy_generation_artifact "${CACHE_CLEANUP_V4_FILE}" "${generation_dir}/cache_cleanup_ipv4" "IPv4 cleanup cache" || return 1
+
+    if [ "${PROXY_IPV6}" = "1" ]; then
+        _copy_generation_artifact "${CACHE_RULES_V6_FILE}" "${generation_dir}/cache_rules_ipv6" "IPv6 rule cache" || return 1
+        _copy_generation_artifact "${CACHE_CLEANUP_V6_FILE}" "${generation_dir}/cache_cleanup_ipv6" "IPv6 cleanup cache" || return 1
+    fi
+    if [ -f "${CACHE_KERNEL_CAPS_FILE}" ] && [ ! -L "${CACHE_KERNEL_CAPS_FILE}" ]; then
+        _copy_generation_artifact "${CACHE_KERNEL_CAPS_FILE}" "${generation_dir}/cache_kernel_caps" "kernel capability cache" || return 1
+    fi
+
+    printf '%s\n' "${generation}" >"${generation_dir}/generation.id" || return 1
+    chmod 0444 "${generation_dir}/generation.id" 2>/dev/null || return 1
+    : >"${generation_dir}/cache_valid" || return 1
+    chmod 0444 "${generation_dir}/cache_valid" 2>/dev/null || return 1
+    : >"${generation_dir}/sing-box.log" || return 1
+    chmod 0600 "${generation_dir}/sing-box.log" 2>/dev/null || return 1
+}
+
+_discard_incomplete_generation() {
+    local generation_dir="${1}"
+    local generation="${generation_dir##*/}"
+    local expected_dir=""
+
+    expected_dir=$(_generation_dir "${generation}") || return 1
+    [ "${generation_dir}" = "${expected_dir}" ] || {
+        log_error "Refusing to discard an unexpected generation path"
+        return 1
+    }
+    chmod 0755 "${generation_dir}" 2>/dev/null || true
+    rm -rf "${generation_dir}" 2>/dev/null || true
+    rm -f "${ENGINE_MANIFEST_FILE}" 2>/dev/null || true
+}
+
+_manifest_safe_value() {
+    local name="${1}"
+    local value="${2}"
+
+    case "${value}" in
+    '' | *[!A-Za-z0-9_./:+-]*)
+        log_error "Unsafe engine manifest value: ${name}"
+        return 1
+        ;;
+    esac
+    return 0
+}
+
+_emit_engine_manifest() {
+    local generation="${1}"
+    local generation_dir="${2}"
+    local generation_config="${generation_dir}/config.json"
+    local generation_log="${generation_dir}/sing-box.log"
+    local startup_timeout_ms=$((CORE_TIMEOUT * 1000))
+    local stop_timeout_ms="${startup_timeout_ms}"
+    local launcher="direct"
+    local busybox_path=""
+    local identity="${CORE_USER}:${CORE_GROUP}"
+
+    if [ "${identity}" != "root:root" ]; then
+        busybox_path=$(command -v busybox 2>/dev/null) || {
+            log_error "Non-root engine launch requires BusyBox setuidgid"
+            return 1
+        }
+        case "${busybox_path}" in
+        /*) ;;
+        *)
+            log_error "BusyBox path must be absolute"
+            return 1
+            ;;
+        esac
+        [ -x "${busybox_path}" ] || {
+            log_error "BusyBox launcher is not executable: ${busybox_path}"
+            return 1
+        }
+        _manifest_safe_value busybox "${busybox_path}" || return 1
+        _manifest_safe_value identity "${identity}" || return 1
+        launcher="busybox-setuidgid"
+    fi
+
+    _validate_generation_id "${generation}" || return 1
+    _manifest_safe_value binary "${SING_BOX_BIN}" || return 1
+    _manifest_safe_value config "${generation_config}" || return 1
+    _manifest_safe_value working_directory "${RUN_DIR}" || return 1
+    _manifest_safe_value log "${generation_log}" || return 1
+    is_int "${startup_timeout_ms}" || return 1
+
+    printf '%s\n' \
+        'FLUX_ENGINE_MANIFEST_V1' \
+        "generation=${generation}" \
+        "binary=${SING_BOX_BIN}" \
+        "config=${generation_config}" \
+        "working_directory=${RUN_DIR}" \
+        "log=${generation_log}" \
+        "launcher=${launcher}"
+    if [ "${launcher}" = "busybox-setuidgid" ]; then
+        printf '%s\n' "busybox=${busybox_path}" "identity=${identity}"
+    fi
+    printf '%s\n' \
+        "readiness=$([ "${PROXY_MODE}" = "tun" ] && printf tun || printf listener)" \
+        "startup_timeout_ms=${startup_timeout_ms}" \
+        "stop_timeout_ms=${stop_timeout_ms}"
+
+    if [ "${PROXY_MODE}" = "tun" ]; then
+        _manifest_safe_value tun_interface "${TUN_INTERFACE}" || return 1
+        printf 'tun_interface=%s\n' "${TUN_INTERFACE}"
+    else
+        is_int "${PROXY_PORT}" || return 1
+        printf 'listener_port=%s\n' "${PROXY_PORT}"
+    fi
+}
+
+_write_engine_manifest() {
+    local generation="${1}"
+    local generation_dir="${2}"
+    local generation_manifest="${generation_dir}/engine.manifest"
+    local manifest_size=""
+
+    atomic_write "${generation_manifest}" _emit_engine_manifest "${generation}" "${generation_dir}" || return 1
+    manifest_size=$(file_size "${generation_manifest}") || return 1
+    if [ "${manifest_size}" -gt "${ENGINE_MANIFEST_MAX_BYTES}" ]; then
+        log_error "Engine manifest exceeds ${ENGINE_MANIFEST_MAX_BYTES} bytes"
+        rm -f "${generation_manifest}"
+        return 1
+    fi
+    chmod 0444 "${generation_manifest}" 2>/dev/null || return 1
+    atomic_write "${ENGINE_MANIFEST_FILE}" cat "${generation_manifest}"
+}
+
+_state_prepare() {
+    local generation=""
+    local generation_dir=""
+
+    rm -f "${ENGINE_MANIFEST_FILE}" 2>/dev/null || true
+    _claim_dispatch_mode rust-owned || return 1
+
+    generation=$(_allocate_generation_id) || return 1
+    generation_dir=$(_generation_dir "${generation}") || return 1
+    mkdir "${generation_dir}" || {
+        log_error "Cannot create generation directory: ${generation}"
+        return 1
+    }
+
+    rm -f "${EVENT_CACHE_OK}" 2>/dev/null || true
+
+    if ! load_config; then
+        _discard_incomplete_generation "${generation_dir}" || true
+        return 1
+    fi
+    if ! FLUXD_ENGINE_OWNER=rust sh "${INIT_SCRIPT}" init; then
+        log_error "Init failed"
+        _discard_incomplete_generation "${generation_dir}" || true
+        return 1
+    fi
+    if ! _load_shared_prepared_config; then
+        _discard_incomplete_generation "${generation_dir}" || true
+        return 1
+    fi
+    if ! _snapshot_generation_artifacts "${generation}" "${generation_dir}"; then
+        _discard_incomplete_generation "${generation_dir}" || true
+        return 1
+    fi
+    if ! _write_engine_manifest "${generation}" "${generation_dir}"; then
+        _discard_incomplete_generation "${generation_dir}" || true
+        return 1
+    fi
+    if ! chmod 0555 "${generation_dir}" 2>/dev/null; then
+        _discard_incomplete_generation "${generation_dir}" || true
+        return 1
+    fi
+    return 0
+}
+
+_capture_start_compensate() {
+    local rc=0
+
+    sh "${TPROXY_SCRIPT}" stop </dev/null || rc=1
+    sh "${ADDRSYNC_SCRIPT}" stop </dev/null || rc=1
+    if [ "${rc}" -eq 0 ]; then
+        rm -f "${CAPTURE_ACTIVE_FILE}" "${CAPTURE_VERIFIED_FILE}" 2>/dev/null || rc=1
+    fi
+    return "${rc}"
+}
+
+_capture_mutation_evidence_present() {
+    local evidence=""
+
+    for evidence in \
+        "${CAPTURE_VERIFIED_FILE}" \
+        "${ACTIVE_CLEANUP_V4_FILE}" \
+        "${ACTIVE_CLEANUP_V6_FILE}" \
+        "${ACTIVE_FEATURES_FILE}" \
+        "${ACTIVE_RUNTIME_FILE}" \
+        "${ADDRSYNCD_PID_FILE}"; do
+        [ -e "${evidence}" ] || [ -L "${evidence}" ] || continue
+        return 0
+    done
+    return 1
+}
+
+_prepared_manifest_generation() {
+    local header=""
+    local line=""
+    local generation=""
+    local generation_count=0
+    local manifest_size=""
+    local generation_dir=""
+
+    [ -f "${ENGINE_MANIFEST_FILE}" ] && [ ! -L "${ENGINE_MANIFEST_FILE}" ] || {
+        log_error "Prepared engine manifest is missing or unsafe during recovery"
+        return 1
+    }
+    manifest_size=$(file_size "${ENGINE_MANIFEST_FILE}") || return 1
+    [ "${manifest_size}" -le "${ENGINE_MANIFEST_MAX_BYTES}" ] || {
+        log_error "Prepared engine manifest exceeds the recovery size limit"
+        return 1
+    }
+    IFS= read -r header <"${ENGINE_MANIFEST_FILE}" || return 1
+    [ "${header}" = "FLUX_ENGINE_MANIFEST_V1" ] || {
+        log_error "Prepared engine manifest has an unsupported header"
+        return 1
+    }
+    while IFS= read -r line; do
+        case "${line}" in
+        generation=*)
+            generation_count=$((generation_count + 1))
+            generation="${line#generation=}"
+            ;;
+        esac
+    done <"${ENGINE_MANIFEST_FILE}"
+    [ "${generation_count}" -eq 1 ] || {
+        log_error "Prepared engine manifest must identify exactly one generation"
+        return 1
+    }
+    _validate_generation_id "${generation}" || return 1
+    generation_dir=$(_generation_dir "${generation}") || return 1
+    [ -f "${generation_dir}/engine.manifest" ] && [ ! -L "${generation_dir}/engine.manifest" ] || {
+        log_error "Prepared recovery generation is missing its immutable manifest"
+        return 1
+    }
+    printf '%s\n' "${generation}"
+}
+
+_recovery_generation() {
+    if [ -e "${CAPTURE_VERIFIED_FILE}" ] || [ -L "${CAPTURE_VERIFIED_FILE}" ]; then
+        _read_generation_record "${CAPTURE_VERIFIED_FILE}" "verified capture"
+        return $?
+    fi
+    _prepared_manifest_generation
+}
+
+_stop_capture_generation() {
+    local generation="${1}"
+    local rc=0
+
+    _load_generation_config "${generation}" || return 1
+    rm -f "${CAPTURE_VERIFIED_FILE}" 2>/dev/null || true
+    sh "${TPROXY_SCRIPT}" stop </dev/null || rc=1
+    sh "${ADDRSYNC_SCRIPT}" stop </dev/null || rc=1
+    return "${rc}"
+}
+
+_state_capture_start() {
+    local generation="${1:-}"
+    local active_generation=""
+
+    _require_dispatch_mode rust-owned || return 1
+    _load_generation_config "${generation}" || return 1
+    if [ -e "${CAPTURE_ACTIVE_FILE}" ]; then
+        active_generation=$(_read_generation_record "${CAPTURE_ACTIVE_FILE}" "attached capture") || return 1
+        if [ "${active_generation}" = "${generation}" ]; then
+            return 0
+        fi
+        log_error "Capture generation ${active_generation} must be detached before selecting ${generation}"
+        return 1
+    fi
+    rm -f "${CAPTURE_VERIFIED_FILE}" 2>/dev/null || true
+    _write_generation_record "${CAPTURE_ACTIVE_FILE}" "${generation}" || return 1
+
+    if ! sh "${ADDRSYNC_SCRIPT}" start </dev/null; then
+        log_error "Address synchronization startup failed"
+        if ! _capture_start_compensate; then
+            log_error "Partial capture cleanup remains pending"
+        fi
+        return 1
+    fi
+    if ! sh "${TPROXY_SCRIPT}" start </dev/null; then
+        log_error "Capture path startup failed"
+        if ! _capture_start_compensate; then
+            log_error "Partial capture cleanup remains pending"
+        fi
+        return 1
+    fi
+    return 0
+}
+
+_state_capture_stop() {
+    local generation=""
+
+    _require_dispatch_mode rust-owned || return 1
+    if [ ! -e "${CAPTURE_ACTIVE_FILE}" ]; then
+        rm -f "${CAPTURE_VERIFIED_FILE}" 2>/dev/null || true
+        return 0
+    fi
+    generation=$(_read_generation_record "${CAPTURE_ACTIVE_FILE}" "attached capture") || return 1
+    _stop_capture_generation "${generation}" || return 1
+    rm -f "${CAPTURE_ACTIVE_FILE}" 2>/dev/null || true
+}
+
+_state_address_resync() {
+    local generation=""
+    local capture_generation=""
+
+    _require_dispatch_mode rust-owned || return 1
+    generation=$(_read_generation_record "${ENGINE_ACTIVE_GENERATION_FILE}" "published runtime") || return 1
+    capture_generation=$(_read_generation_record "${CAPTURE_ACTIVE_FILE}" "attached capture") || return 1
+    [ "${generation}" = "${capture_generation}" ] || {
+        log_error "Published and attached generations do not match"
+        return 1
+    }
+    _load_generation_config "${generation}" || return 1
+    sh "${ADDRSYNC_SCRIPT}" resync </dev/null
+}
+
+_state_capture_verify() {
+    local generation="${1:-}"
+    local active_generation=""
+
+    _require_dispatch_mode rust-owned || return 1
+    _load_generation_config "${generation}" || return 1
+    active_generation=$(_read_generation_record "${CAPTURE_ACTIVE_FILE}" "attached capture") || return 1
+    [ "${active_generation}" = "${generation}" ] || {
+        log_error "Capture verification generation does not match the attached capture"
+        return 1
+    }
+    if ! sh "${ADDRSYNC_SCRIPT}" status </dev/null >/dev/null; then
+        log_error "Address synchronization is not ready"
+        return 1
+    fi
+    [ -s "${ACTIVE_RUNTIME_FILE}" ] || {
+        log_error "Capture runtime evidence is missing"
+        return 1
+    }
+    grep -qxF "PROXY_MODE=${PROXY_MODE}" "${ACTIVE_RUNTIME_FILE}" || {
+        log_error "Capture runtime mode does not match prepared mode"
+        return 1
+    }
+    if [ "${PROXY_MODE}" = "tproxy" ]; then
+        [ -s "${ACTIVE_CLEANUP_V4_FILE}" ] || {
+            log_error "IPv4 capture ownership evidence is missing"
+            return 1
+        }
+        if [ "${PROXY_IPV6}" = "1" ]; then
+            [ -s "${ACTIVE_CLEANUP_V6_FILE}" ] || {
+                log_error "IPv6 capture ownership evidence is missing"
+                return 1
+            }
+        fi
+    fi
+
+    _write_generation_record "${CAPTURE_VERIFIED_FILE}" "${generation}"
+}
+
+_publish_generation_manifest() {
+    local generation="${1}"
+    local generation_dir=""
+    local generation_manifest=""
+
+    generation_dir=$(_generation_dir "${generation}") || return 1
+    generation_manifest="${generation_dir}/engine.manifest"
+    [ -f "${generation_manifest}" ] && [ ! -L "${generation_manifest}" ] || {
+        log_error "Generation manifest is missing or unsafe: ${generation}"
+        return 1
+    }
+    atomic_write "${ENGINE_MANIFEST_FILE}" cat "${generation_manifest}"
+}
+
+_prune_generation_history() {
+    local current_generation="${1}"
+    local previous_generation="${2:-}"
+    local path=""
+    local generation=""
+
+    for path in "${ENGINE_GENERATIONS_DIR}"/*; do
+        [ -d "${path}" ] && [ ! -L "${path}" ] || continue
+        generation="${path##*/}"
+        case "${generation}" in
+        '' | 0 | 0* | *[!0-9]*) continue ;;
+        esac
+        [ "${generation}" = "${current_generation}" ] && continue
+        [ -n "${previous_generation}" ] && [ "${generation}" = "${previous_generation}" ] && continue
+        chmod 0755 "${path}" 2>/dev/null || {
+            log_warn "Could not unlock retired generation ${generation} for pruning"
+            return 1
+        }
+        rm -rf "${path}" 2>/dev/null || {
+            log_warn "Could not prune retired generation ${generation}"
+            return 1
+        }
+    done
+}
+
+_publish_running_generation() {
+    local generation="${1}"
+    local previous_generation="${2:-}"
+    local retained_previous=""
+
+    if [ -n "${previous_generation}" ] && [ "${previous_generation}" != "${generation}" ]; then
+        _write_generation_record "${ENGINE_PREVIOUS_GENERATION_FILE}" "${previous_generation}" || return 1
+        retained_previous="${previous_generation}"
+    elif [ -e "${ENGINE_PREVIOUS_GENERATION_FILE}" ]; then
+        retained_previous=$(_read_generation_record "${ENGINE_PREVIOUS_GENERATION_FILE}" "previous runtime") || return 1
+    fi
+
+    _publish_generation_manifest "${generation}" || return 1
+    _write_generation_record "${ENGINE_ACTIVE_GENERATION_FILE}" "${generation}" || return 1
+    if ! sync_prop "RUNNING"; then
+        if [ -n "${previous_generation}" ]; then
+            _write_generation_record "${ENGINE_ACTIVE_GENERATION_FILE}" "${previous_generation}" || true
+        else
+            rm -f "${ENGINE_ACTIVE_GENERATION_FILE}" 2>/dev/null || true
+        fi
+        return 1
+    fi
+
+    _prune_generation_history "${generation}" "${retained_previous}" || true
+    return 0
+}
+
+_state_running() {
+    local generation="${1:-}"
+    local capture_generation=""
+    local verified_generation=""
+    local previous_generation=""
+
+    _require_dispatch_mode rust-owned || return 1
+    _load_generation_config "${generation}" || return 1
+    capture_generation=$(_read_generation_record "${CAPTURE_ACTIVE_FILE}" "attached capture") || return 1
+    [ "${capture_generation}" = "${generation}" ] || {
+        log_error "Cannot publish RUNNING for a generation other than the attached capture"
+        return 1
+    }
+    verified_generation=$(_read_generation_record "${CAPTURE_VERIFIED_FILE}" "verified capture") || return 1
+    [ "${verified_generation}" = "${generation}" ] || {
+        log_error "Cannot publish RUNNING for a generation other than the verified capture"
+        return 1
+    }
+
+    if [ -e "${ENGINE_ACTIVE_GENERATION_FILE}" ]; then
+        previous_generation=$(_read_generation_record "${ENGINE_ACTIVE_GENERATION_FILE}" "published runtime") || return 1
+    fi
+    _publish_running_generation "${generation}" "${previous_generation}"
+}
+
+_require_detached_capture() {
+    [ ! -e "${CAPTURE_ACTIVE_FILE}" ] || {
+        log_error "Capture must be detached before publishing a terminal state"
+        return 1
+    }
+}
+
+_state_failed() {
+    _require_dispatch_mode rust-owned || return 1
+    _require_detached_capture || return 1
+    rm -f "${CAPTURE_VERIFIED_FILE}" "${ENGINE_ACTIVE_GENERATION_FILE}" 2>/dev/null || true
+    sync_prop "FAILED"
+}
+
+_state_stopped_rust() {
+    if [ -e "${DISPATCH_MODE_FILE}" ] || [ -L "${DISPATCH_MODE_FILE}" ]; then
+        [ -f "${DISPATCH_MODE_FILE}" ] && [ ! -L "${DISPATCH_MODE_FILE}" ] || {
+            log_error "Dispatcher mode record is unsafe"
+            return 1
+        }
+    fi
+    if [ -f "${DISPATCH_MODE_FILE}" ] && ! _require_dispatch_mode rust-owned; then
+        # A stale boot lease is removed by _require_dispatch_mode and is safe
+        # to treat as an already-unowned stopped runtime. A live legacy lease
+        # remains present and must still block Rust-owned publication.
+        [ ! -f "${DISPATCH_MODE_FILE}" ] || return 1
+    fi
+    _require_detached_capture || return 1
+    rm -f \
+        "${CAPTURE_VERIFIED_FILE}" \
+        "${ENGINE_ACTIVE_GENERATION_FILE}" \
+        "${ENGINE_PREVIOUS_GENERATION_FILE}" 2>/dev/null || {
+        log_error "Cannot retire stopped runtime generation records"
+        return 1
+    }
+    rm -f "${DISPATCH_MODE_FILE}" 2>/dev/null || {
+        log_error "Cannot release the Rust-owned dispatcher mode lease"
+        return 1
+    }
+    sync_prop "STOPPED"
+}
+
 _state_start() {
+    _claim_dispatch_mode legacy || return 1
     [ -f "${MAGISK_MOD_DIR}/disable" ] && {
         log_warn "Service disabled, ignoring start trigger"
+        rm -f "${DISPATCH_MODE_FILE}" 2>/dev/null || true
         return 0
     }
 
@@ -131,9 +1020,11 @@ _state_start() {
 }
 
 _state_stop() {
+    _claim_dispatch_mode legacy || return 1
     log_banner "STOPPING FLUX"
     _parallel_run stop || true
     sync_prop "STOPPED"
+    rm -f "${DISPATCH_MODE_FILE}" 2>/dev/null || true
     log_info "Flux Service stopped"
     return 0
 }
@@ -141,6 +1032,8 @@ _state_stop() {
 _state_restart() {
     local changed="${1}"
     local force="${2:-0}"
+
+    _claim_dispatch_mode legacy || return 1
 
     if [ "${force}" != "1" ] && ! _restart_debounced "${changed}"; then
         log_debug "Skip duplicate config event: ${changed}"
@@ -175,6 +1068,7 @@ _state_fail() {
     log_warn "Rolling back..."
     _parallel_run stop || true
     sync_prop "FAILED"
+    rm -f "${DISPATCH_MODE_FILE}" 2>/dev/null || true
     return 0
 }
 
@@ -266,6 +1160,81 @@ main() {
         }
         exec "${FLUX_EVENT_SCRIPT}" "$@"
     fi
+
+    case "${event_type}" in
+    startup-recover)
+        [ "$#" -eq 1 ] || {
+            log_error "startup-recover does not accept arguments"
+            return 2
+        }
+        _with_dispatch_lock _state_startup_recover
+        return $?
+        ;;
+    prepare)
+        [ "$#" -eq 1 ] || {
+            log_error "prepare does not accept arguments"
+            return 2
+        }
+        _with_dispatch_lock _state_prepare
+        return $?
+        ;;
+    capture-start)
+        [ "$#" -eq 2 ] || {
+            log_error "capture-start requires GENERATION"
+            return 2
+        }
+        _with_dispatch_lock _state_capture_start "${2}"
+        return $?
+        ;;
+    capture-stop)
+        [ "$#" -eq 1 ] || {
+            log_error "capture-stop does not accept arguments"
+            return 2
+        }
+        _with_dispatch_lock _state_capture_stop
+        return $?
+        ;;
+    capture-verify)
+        [ "$#" -eq 2 ] || {
+            log_error "capture-verify requires GENERATION"
+            return 2
+        }
+        _with_dispatch_lock _state_capture_verify "${2}"
+        return $?
+        ;;
+    address-resync)
+        [ "$#" -eq 1 ] || {
+            log_error "address-resync does not accept arguments"
+            return 2
+        }
+        _with_dispatch_lock _state_address_resync
+        return $?
+        ;;
+    state-running)
+        [ "$#" -eq 2 ] || {
+            log_error "state-running requires GENERATION"
+            return 2
+        }
+        _with_dispatch_lock _state_running "${2}"
+        return $?
+        ;;
+    state-stopped)
+        [ "$#" -eq 1 ] || {
+            log_error "state-stopped does not accept arguments"
+            return 2
+        }
+        _with_dispatch_lock _state_stopped_rust
+        return $?
+        ;;
+    state-failed)
+        [ "$#" -eq 1 ] || {
+            log_error "state-failed does not accept arguments"
+            return 2
+        }
+        _with_dispatch_lock _state_failed
+        return $?
+        ;;
+    esac
 
     load_config || return 1
 

@@ -92,8 +92,15 @@ readonly ADDRSYNCD_PID_FILE="${RUN_DIR}/addrsyncd.pid"
 # ==============================================================================
 readonly DISPATCH_LOCK_DIR="${RUN_DIR}/dispatcher.lock"
 readonly DISPATCH_LOCK_OWNER_FILE="${DISPATCH_LOCK_DIR}/owner"
+readonly DISPATCH_MODE_FILE="${RUN_DIR}/dispatcher.mode"
+readonly ENGINE_MANIFEST_FILE="${RUN_DIR}/engine.manifest"
+readonly ENGINE_GENERATIONS_DIR="${RUN_DIR}/generations"
+readonly ENGINE_GENERATION_SEQUENCE_FILE="${RUN_DIR}/engine.generation-sequence"
+readonly ENGINE_ACTIVE_GENERATION_FILE="${RUN_DIR}/engine.active"
+readonly ENGINE_PREVIOUS_GENERATION_FILE="${RUN_DIR}/engine.previous"
+readonly CAPTURE_ACTIVE_FILE="${RUN_DIR}/capture.active"
+readonly CAPTURE_VERIFIED_FILE="${RUN_DIR}/capture.verified"
 readonly RESTART_STAMP_FILE="${RUN_DIR}/restart.stamp"
-readonly EVENT_CACHE_OK="${CACHE_DIR}/cache_valid"
 
 # ==============================================================================
 # [ Internal Scripts ]
@@ -116,12 +123,30 @@ readonly FLUX_EVENT_SCRIPT="${SCRIPTS_DIR}/flux-event"
 # [ Cache Files ]
 # ==============================================================================
 
-readonly CACHE_CONFIG_FILE="${CACHE_DIR}/cache_config"
-readonly CACHE_RULES_V4_FILE="${CACHE_DIR}/cache_rules_ipv4"
-readonly CACHE_RULES_V6_FILE="${CACHE_DIR}/cache_rules_ipv6"
-readonly CACHE_CLEANUP_V4_FILE="${CACHE_DIR}/cache_cleanup_ipv4"
-readonly CACHE_CLEANUP_V6_FILE="${CACHE_DIR}/cache_cleanup_ipv6"
-readonly CACHE_KERNEL_CAPS_FILE="${CACHE_DIR}/cache_kernel_caps"
+# Rust-owned capture children inherit the selected immutable generation. Legacy
+# and preparation paths continue to use the shared build cache.
+_runtime_cache_dir="${CACHE_DIR}"
+if [ "${FLUXD_ENGINE_OWNER:-legacy}" = "rust" ] && [ -n "${FLUX_GENERATION_DIR:-}" ]; then
+    _runtime_generation_id="${FLUX_GENERATION_DIR##*/}"
+    case "${_runtime_generation_id}" in
+    '' | 0 | 0* | *[!0-9]*) ;;
+    *)
+        if [ "${FLUX_GENERATION_DIR}" = "${ENGINE_GENERATIONS_DIR}/${_runtime_generation_id}" ]; then
+            _runtime_cache_dir="${FLUX_GENERATION_DIR}"
+        fi
+        ;;
+    esac
+fi
+readonly RUNTIME_CACHE_DIR="${_runtime_cache_dir}"
+unset _runtime_cache_dir _runtime_generation_id
+
+readonly CACHE_CONFIG_FILE="${RUNTIME_CACHE_DIR}/cache_config"
+readonly CACHE_RULES_V4_FILE="${RUNTIME_CACHE_DIR}/cache_rules_ipv4"
+readonly CACHE_RULES_V6_FILE="${RUNTIME_CACHE_DIR}/cache_rules_ipv6"
+readonly CACHE_CLEANUP_V4_FILE="${RUNTIME_CACHE_DIR}/cache_cleanup_ipv4"
+readonly CACHE_CLEANUP_V6_FILE="${RUNTIME_CACHE_DIR}/cache_cleanup_ipv6"
+readonly CACHE_KERNEL_CAPS_FILE="${RUNTIME_CACHE_DIR}/cache_kernel_caps"
+readonly EVENT_CACHE_OK="${RUNTIME_CACHE_DIR}/cache_valid"
 readonly ACTIVE_CLEANUP_V4_FILE="${RUN_DIR}/active_cleanup_ipv4"
 readonly ACTIVE_CLEANUP_V6_FILE="${RUN_DIR}/active_cleanup_ipv6"
 readonly ACTIVE_FEATURES_FILE="${RUN_DIR}/active_features"

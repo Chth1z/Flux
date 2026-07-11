@@ -5,6 +5,7 @@ use std::fmt;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use flux_core::{
     AdministrativeState, CapabilityProfileSource, ConfigError, ConfigurationChangeClient,
@@ -13,18 +14,22 @@ use flux_core::{
     OperationReport, Reason,
 };
 use flux_platform::{
-    CapabilityProfilePaths, DaemonReactor, LegacyScriptPaths, ProcessLegacyDispatcher,
-    ShutdownSignal,
+    CapabilityProfilePaths, DaemonReactor, DispatcherPhaseCommand, PhaseDispatcherPaths,
+    ProcessPhaseDispatcher, ShutdownSignal,
 };
 
+use crate::runtime_coordinator::{ProcessRuntimeWriter, RuntimeCoordinator};
 use crate::{
-    AdministrativeIntentStore, ControlConnectionHandler, ControlSocketError, IntentStoreError,
+    AdministrativeIntentStore, ControlConnectionHandler, ControlSocketError, EngineSupervisor,
+    IntentStoreError, RuntimeSnapshotSource,
 };
 
 const DEFAULT_ROOT: &str = "/data/adb/flux";
 const DEFAULT_DISABLE_PATH: &str = "/data/adb/modules/flux/disable";
 const DEFAULT_BOOT_ID_PATH: &str = "/proc/sys/kernel/random/boot_id";
 const DEFAULT_SELINUX_ENFORCE_PATH: &str = "/sys/fs/selinux/enforce";
+const MIN_ENGINE_MAINTENANCE_INTERVAL: Duration = Duration::from_millis(50);
+const MAX_ENGINE_MAINTENANCE_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DaemonOptions {
@@ -33,6 +38,7 @@ pub struct DaemonOptions {
     pub shell: PathBuf,
     pub dispatcher_script: PathBuf,
     pub addrsync_script: PathBuf,
+    pub engine_manifest_path: PathBuf,
     pub intent_path: PathBuf,
     pub boot_id_path: PathBuf,
     pub selinux_enforce_path: PathBuf,
@@ -72,6 +78,7 @@ impl DaemonOptions {
             shell,
             dispatcher_script: root.join("scripts/dispatcher"),
             addrsync_script: root.join("scripts/addrsync"),
+            engine_manifest_path: root.join("run/engine.manifest"),
             intent_path,
             boot_id_path,
             selinux_enforce_path,
@@ -97,12 +104,12 @@ where
 {
     // Block process-directed termination before any daemon worker can be
     // created. Every in-process thread then inherits the mask, leaving
-    // signalfd as the sole shutdown consumer. Legacy children explicitly
-    // restore a clean mask in ProcessLegacyDispatcher before exec.
+    // signalfd as the sole shutdown consumer. Phase-dispatcher and Proxy
+    // Engine children explicitly restore a clean mask before exec.
     let shutdown = ShutdownSignal::install()
         .map_err(|error| DaemonError::Socket(ControlSocketError::Platform(error)))?;
     let profile = Arc::new(profile_source.collect_capability_profile());
-    let control = match profile.legacy_mutation_gate() {
+    let (control, runtime) = match profile.legacy_mutation_gate() {
         LegacyMutationGate::Allowed => {
             let boot_identity =
                 profile
@@ -112,9 +119,26 @@ where
                     .ok_or(DaemonError::Invariant(
                         "legacy mutation gate allowed startup without a verified boot identity",
                     ))?;
-            // The strict user configuration is authoritative for
-            // mutation-capable runtime settings. Load it before touching
-            // durable intent or starting the legacy networking writer.
+            let phase_paths = PhaseDispatcherPaths {
+                shell: options.shell,
+                shell_args: Vec::<OsString>::new(),
+                dispatcher: options.dispatcher_script,
+            };
+            let mut startup_recovery = ProcessPhaseDispatcher::new(phase_paths.clone());
+            startup_recovery
+                .execute(DispatcherPhaseCommand::StartupRecover)
+                .map_err(|error| {
+                    DaemonError::Control(ControlError::runtime(
+                        "recover stale runtime before daemon admission",
+                        error,
+                        "repair the dispatcher ownership evidence and restart fluxd",
+                    ))
+                })?;
+            // Startup recovery relies only on immutable generation artifacts
+            // and ownership records. It must run before parsing the current
+            // user configuration so a broken edit cannot strand same-boot
+            // capture. Once recovery succeeds, the strict user configuration
+            // becomes authoritative for the new runtime.
             let config = FluxConfig::load(&options.config_path).map_err(DaemonError::FluxConfig)?;
             let queue_capacity = usize::try_from(config.daemon().event_queue_capacity().get())
                 .map_err(|_| {
@@ -124,12 +148,15 @@ where
                 })?;
             let store = AdministrativeIntentStore::new(&options.intent_path, boot_identity);
             let initial_intent = initial_intent(&store, &options.disable_path)?;
-            let dispatcher = ProcessLegacyDispatcher::new(LegacyScriptPaths {
-                shell: options.shell,
-                shell_args: Vec::<OsString>::new(),
-                dispatcher: options.dispatcher_script,
-                addrsync: options.addrsync_script,
-            });
+            let writer = ProcessRuntimeWriter::new(phase_paths, &options.engine_manifest_path);
+            let maintenance_interval =
+                engine_maintenance_interval(config.daemon().reconcile_debounce().get());
+            let dispatcher = RuntimeCoordinator::with_dependencies(
+                writer,
+                EngineSupervisor::new(),
+                maintenance_interval,
+            );
+            let runtime = dispatcher.runtime_snapshot_source();
             let dispatcher = PersistingLegacyDispatcher { dispatcher, store };
             let bridge = LegacyControlBridge::start(dispatcher, queue_capacity)
                 .map_err(DaemonError::Control)?;
@@ -138,12 +165,18 @@ where
                 .map_err(DaemonError::Control)?
                 .wait()
                 .map_err(DaemonError::Control)?;
-            DaemonControl::Bridge(bridge)
+            (DaemonControl::Bridge(bridge), runtime)
         }
-        LegacyMutationGate::ReadOnly { .. } => DaemonControl::ReadOnly,
+        LegacyMutationGate::ReadOnly { .. } => {
+            (DaemonControl::ReadOnly, RuntimeSnapshotSource::default())
+        }
     };
 
-    let handler = ControlConnectionHandler::new(Arc::clone(&profile), control);
+    let handler = ControlConnectionHandler::with_runtime_snapshot_source(
+        Arc::clone(&profile),
+        control,
+        runtime,
+    );
     let (reactor, _stop) = DaemonReactor::bind(&options.socket_path, shutdown, move |connection| {
         if let Err(error) = handler.serve(connection) {
             eprintln!("fluxd: rejected control connection: {error}");
@@ -217,6 +250,18 @@ where
             })?;
         }
         self.dispatcher.execute(intent)
+    }
+
+    fn maintenance_interval(&self) -> Option<Duration> {
+        self.dispatcher.maintenance_interval()
+    }
+
+    fn maintain(&mut self) {
+        self.dispatcher.maintain();
+    }
+
+    fn shutdown(&mut self) {
+        self.dispatcher.shutdown();
     }
 }
 
@@ -304,5 +349,29 @@ fn default_shell() -> PathBuf {
         PathBuf::from("/system/bin/sh")
     } else {
         PathBuf::from("/bin/sh")
+    }
+}
+
+fn engine_maintenance_interval(configured: Duration) -> Duration {
+    configured.clamp(
+        MIN_ENGINE_MAINTENANCE_INTERVAL,
+        MAX_ENGINE_MAINTENANCE_INTERVAL,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn engine_maintenance_interval_is_bounded_independently_of_config_debounce() {
+        assert_eq!(
+            engine_maintenance_interval(Duration::from_millis(1)),
+            MIN_ENGINE_MAINTENANCE_INTERVAL
+        );
+        assert_eq!(
+            engine_maintenance_interval(Duration::from_secs(u64::from(u32::MAX))),
+            MAX_ENGINE_MAINTENANCE_INTERVAL
+        );
     }
 }

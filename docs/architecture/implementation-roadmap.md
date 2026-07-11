@@ -95,8 +95,10 @@ Shell phase scripts remain the only networking-state writer. Rust owns Sing-Box 
 
 ### Deliverables
 
-- Port `addrsyncd` netlink codecs, batched receive/send, extack handling, address filters, debounce maximum, and resync logic into `flux-platform`.
-- Live link/address/route/rule observer.
+- Reimplement the required `addrsyncd` netlink behavior behind private `flux-platform` modules; do not expose raw rtnetlink framing as the product Interface. Resolve the standalone subproject's `UNLICENSED` provenance before copying source text into the GPL workspace.
+- Deliver a read-only, subscribe-before-dump link/address/route/rule observer before any native mutation. It must publish only complete, canonical `NetworkInventory` snapshots with a monotonic `NetworkEpoch` and integrate into the existing single reactor rather than creating a second epoll owner.
+- Preserve batched receive/send, optional extack diagnostics, address filters, bounded per-turn work, quiet debounce, debounce maximum, and compensating resync behavior.
+- Treat `MSG_TRUNC`, `ENOBUFS`, `NLMSG_OVERRUN`, malformed or ambiguous messages, `NLM_F_DUMP_INTR`, missing `NLMSG_DONE`, and sequence inconsistency as mandatory full-resync conditions. Partial dumps never advance the Network Epoch.
 - In-process address-derived Bypass Policy.
 - Rust rtnetlink PBR apply/verify/cleanup.
 - Generation journal and startup recovery for routes/rules.
@@ -108,7 +110,9 @@ Shell phase scripts remain the only networking-state writer. Rust owns Sing-Box 
 
 ### Exit gate
 
-- Lifecycle, event loss, address churn, IPv6 temporary-address, and cleanup tests equal or exceed current `addrsyncd` behavior.
+- Lifecycle, event loss, address churn, IPv6 temporary-address, and cleanup tests meet the stricter loss/recovery contract even where current `addrsyncd` behavior does not.
+- An event arriving during the initial dump is replayed after that dump or forces another complete dump; no event/dump race may publish a stale inventory.
+- Netlink work budgets yield to ready control and shutdown sources in the one daemon reactor.
 - Kill-9 at each journal phase converges without deleting unrelated rules.
 - Real-device CPU/RSS and convergence baseline is captured.
 
@@ -347,12 +351,12 @@ Before a backend may be selected automatically, its documentation must include:
 
 ## Immediate implementation backlog
 
-1. Create the Rust workspace and `xtask` Android build.
-2. Capture the current real-device baseline.
-3. Implement kernel-version parsing and Capability Profile JSON.
-4. Implement the control socket and `status` command.
-5. Add Sing-Box child supervision without changing networking ownership.
-6. Build and persist the exact Sing-Box Engine Capability Profile before compiling any Generation.
-7. Implement legacy config migration in check-only mode.
-8. Extract current rule-generation cases into backend-neutral golden fixtures.
-9. Port the `addrsyncd` netlink codec and event loop behind the new Kernel Plane seam.
+1. Capture the current real-device baseline and replace every placeholder evidence field.
+2. Build and persist the exact versioned Sing-Box Engine Capability Profile before compiling any final Generation.
+3. Reimplement private rtnetlink codecs and a loss-aware, read-only Network Inventory observer behind the Kernel Plane seam.
+4. Register netlink readiness and bounded work in the existing daemon reactor; do not introduce a second epoll owner.
+5. Split passive startup admission from active capability probes and expose an immutable, revisioned Capability Profile snapshot with runtime demotions.
+6. Implement deterministic Desired State normalization, Generation compilation, and boot/profile/engine-bound planning leases.
+7. Implement Android-safe mark and RPDB-priority allocation from the observed inventory; do not promote the legacy low-byte marks or fixed priorities without proof.
+8. Cut over address-derived rules and PBR with a transition lease that disables the shell route writer before the first native mutation.
+9. Implement legacy config migration in check-only mode and extract current rule-generation cases into backend-neutral golden fixtures.

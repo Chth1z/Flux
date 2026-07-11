@@ -3,9 +3,14 @@
 use std::error::Error;
 use std::fmt;
 
+// This hardened parser is intentionally internal until the inventory source
+// owns the higher-level snapshot interface that consumes it.
+#[allow(dead_code)]
+mod address_sync;
 mod capability;
 mod child_process;
 mod legacy_dispatcher;
+mod netlink;
 mod phase_dispatcher;
 mod reactor;
 mod seqpacket;

@@ -9,6 +9,7 @@
 mod capability;
 mod config;
 mod control;
+mod network_inventory;
 
 pub use capability::{
     BootIdentity, BootIdentityMutationStatus, CAPABILITY_PROFILE_SCHEMA_VERSION, CapabilityProfile,
@@ -27,4 +28,9 @@ pub use control::{
     AdministrativeState, ConfigurationChangeClient, ConfigurationChangeReport, ControlClient,
     ControlError, ControlService, ControlSnapshot, ControlSnapshotSource, LegacyControlBridge,
     LegacyDispatcher, LegacyIntent, OperationHandle, OperationReport, Reason,
+};
+pub use network_inventory::{
+    AddressFlagConflict, InterfaceAddressFlags, InterfaceAddressRecord,
+    InterfaceAddressRecordError, InterfaceAddressRecordErrorKind, InterfaceIndex, NetworkEpoch,
+    NetworkInventory, NetworkInventoryError, NetworkInventoryTracker,
 };

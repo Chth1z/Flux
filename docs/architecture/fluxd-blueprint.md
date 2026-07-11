@@ -183,6 +183,8 @@ The prepared and active values are opaque ownership tokens. Their Rust types enf
 
 Production uses Linux/Android adapters. Tests use a deterministic in-memory kernel adapter with failure injection. This is a real seam because at least two adapters exist.
 
+The first Phase 3 slice is deliberately observation-only. A `NetworkInventorySource` publishes immutable, canonical snapshots with a monotonic `NetworkEpoch`; raw rtnetlink messages, dump sequencing, batching, debounce, and loss recovery remain private implementation details. The production Adapter subscribes before its initial dump and shares the daemon's existing reactor. `MSG_TRUNC`, `ENOBUFS`, `NLMSG_OVERRUN`, interrupted or incomplete dumps, parse ambiguity, and sequence inconsistency discard partial state and require a full resync before another snapshot can be published. Native route/rule mutation is not admitted by this slice.
+
 ### 5. Proxy Engine module
 
 Interface:

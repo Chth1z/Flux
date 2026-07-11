@@ -23,6 +23,12 @@ Primary local sources:
 - [`scripts/updater.sh`](../../scripts/updater.sh)
 - [`addrsyncd/src`](../../addrsyncd/src)
 
+### `addrsyncd` migration provenance
+
+The standalone [`addrsyncd/Cargo.toml`](../../addrsyncd/Cargo.toml) currently declares `license = "UNLICENSED"`, while the rewrite workspace is GPL-3.0-only. Until the copyright holder records an explicit compatible grant, source text and non-trivial implementation expression from the standalone crate must not be copied into the workspace.
+
+The Phase 3 rtnetlink decoder foundation is therefore an independent implementation from the Linux UAPI layout and the documented/fixture-level behavior that Flux must preserve. Its module structure, error model, parsing flow, and tests were written anew; the standalone code remains a behavioral reference and rollback artifact. Every later migration slice must keep this distinction or record the permission/provenance that authorizes direct reuse.
+
 ## Current runtime topology
 
 ```mermaid

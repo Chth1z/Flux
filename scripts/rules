@@ -11,7 +11,7 @@
 readonly PROXY_CHAINS="PROXY_PREROUTING PROXY_OUTPUT BYPASS_IP APP_CHAIN ACTION_PROXY_PRE ACTION_PROXY_OUT ACTION_BYPASS BYP_Z0 BYP_Z1 BYP_Z2 BYP_Z3 BYP_Z4 BYP_Z5 BYP_Z6 BYP_Z7 BYP_Z8 BYP_Z9 BYP_Z10 BYP_Z11 BYP_Z12 BYP_Z13 BYP_Z14 BYP_Z15"
 
 # IP Bypasses for Android (Carrier-Safe + RFC 1918/6890/4193)
-readonly BYPASS_IPv4_LIST="0.0.0.0/8 10.0.0.0/8 100.0.0.0/8 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.0.0.0/24 192.0.2.0/24 192.88.99.0/24 192.168.0.0/16 198.51.100.0/24 203.0.113.0/24 224.0.0.0/4 240.0.0.0/4 255.255.255.255/32"
+readonly BYPASS_IPv4_LIST="0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.0.0.0/24 192.0.2.0/24 192.88.99.0/24 192.168.0.0/16 198.51.100.0/24 203.0.113.0/24 224.0.0.0/4 240.0.0.0/4 255.255.255.255/32"
 readonly BYPASS_IPv6_LIST="::/128 ::1/128 ::ffff:0:0/96 100::/64 64:ff9b::/96 2001::/32 2001:10::/28 2001:20::/28 2001:db8::/32 2002::/16 fe80::/10 ff00::/8"
 
 # Hotspot IP Ranges
@@ -101,7 +101,6 @@ _build_app_rules() {
     fi
 
     local pkgs="${APP_LIST}"
-    [ -z "${pkgs}" ] && return 0
 
     local target
     if [ "${mode}" = "1" ]; then
@@ -110,10 +109,10 @@ _build_app_rules() {
         target="${action_proxy}"
     fi
 
-    awk -v app_list="${pkgs}" -v suffix="${suffix}" -v target="${target}" \
-        -v scope="${APP_USER_SCOPE}" -v user_list="${APP_USER_LIST}" '
+    if [ -n "${pkgs}" ]; then
+        awk -v app_list="${pkgs}" -v suffix="${suffix}" -v target="${target}" \
+            -v scope="${APP_USER_SCOPE}" -v user_list="${APP_USER_LIST}" '
     BEGIN {
-        if (app_list == "") exit
         n = split(app_list, arr, /[[:space:]]+/)
         for (i = 1; i <= n; i++) if (arr[i] != "") targets[arr[i]] = 1
 
@@ -138,6 +137,7 @@ _build_app_rules() {
         }
     }
     ' "${PACKAGES_LIST}"
+    fi
 
     if [ "${mode}" = "1" ]; then
         printf -- '-A APP_CHAIN%s -j %s\n' "${suffix}" "${action_proxy}"

@@ -24,7 +24,10 @@ jobs:
       - name: Check Magisk shell bridge syntax
         run: >-
           bash -n customize.sh flux_service.sh scripts/dispatcher
-          scripts/fluxctl scripts/lib scripts/flux-event
+          scripts/fluxctl scripts/lib scripts/flux-event scripts/rules
+          tests/shell/rules_generation.sh
+      - name: Test legacy rule generation semantics
+        run: sh tests/shell/rules_generation.sh
       - name: Check legacy addrsyncd compatibility
         run: |
           cargo test --manifest-path addrsyncd/Cargo.toml

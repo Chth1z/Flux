@@ -169,6 +169,25 @@ For sockets, call `getsockopt(SO_MARK)` before `setsockopt`. For xtables use `--
 
 netd defines a priority lattice beginning with VPN override/output rules, secure VPN and prohibit-non-VPN rules, followed by explicit-network, local/tethering, implicit/default-network, and unreachable rules. It can match UID ranges, fwmark/mask, interfaces, and tables through rtnetlink attributes. [S10], [S29]
 
+The release families relevant to Flux are not one lattice. Android 12/12L and Android 13+ require separate closed grammars, while Android 14+ additionally permits a dynamic physical-local rule at priority `20000`. [S37], [S38], [S39], [S40]
+
+| Role | Android 12/12L | Android 13+ |
+|---|---:|---:|
+| VPN override system/OIF/output-local | `10000` / `11000` / `12000` | same |
+| Secure VPN / prohibit non-VPN | `13000` / `14000` | same |
+| UID explicit / explicit / output-interface | `15000..15999` / `16000..16999` / `17000..17999` | same |
+| Legacy system/network / local / tethering | `18000` / `19000` / `20000` / `21000` | same |
+| UID implicit / implicit / bypassable VPN | `22000..22999` / `23000` / `24000..24999` | same |
+| UID-local / local-route / local-exclusion VPN | absent | `25000` / `26000` / `27000..27999` |
+| VPN fallthrough | `26000` | `28000` |
+| UID default network | `27000..27999` | `29000..29998` |
+| UID default unreachable | `28000..28999` | `30000..30998` |
+| Default network / final unreachable | `29000` / `32000` | `31000` / `32000` |
+
+The netd rule builder is otherwise strict: it creates paired IPv4/IPv6 rules with wildcard source/destination, zero TOS and flags, `RTPROT_UNSPEC`, and only the expected table, fwmark/mask, UID, input-interface, or output-interface attributes. It emits no GOTO, tunnel, suppressor, L3MDEV, IP-protocol, port-range, or flow selector. Priority alone is never role evidence; every modeled field must match the selected source-pinned grammar. [S41]
+
+Two structural consequences affect the current Flux routing program. First, Android 12 leaves no priority after the maximum UID-default-unreachable subpriority and before default-network; Android 13+ leaves only `30999`, while Flux currently requires two distinct priorities. Second, one global proxy rule cannot both run after per-UID local-output policy near `29000`/`31000` and before tethering at `21000`. Empty observed slots are not leases: equal-priority insertions are ordered after existing equal-priority rules, and netd may add a later security rule without colliding at creation time. [S42]
+
 Design requirements:
 
 - Default to `respect_android_vpn = true`. A transparent proxy must not accidentally turn lockdown into bypass.
@@ -513,3 +532,9 @@ Acceptance invariants:
 [S34]: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/include/uapi/linux/rtnetlink.h?id=738ac465e4e900d4a391a27da4e20c090eaa1e75
 [S35]: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/net/netfilter/nf_tables_api.c?id=738ac465e4e900d4a391a27da4e20c090eaa1e75
 [S36]: https://android.googlesource.com/kernel/configs/+/bd79f38685cf939ab836dd8ddd2e01506ccff47a/t/android-5.10/android-base.config
+[S37]: https://android.googlesource.com/platform/system/netd/+/refs/tags/android-12.0.0_r1/server/RouteController.h
+[S38]: https://android.googlesource.com/platform/system/netd/+/refs/tags/android-13.0.0_r1/server/RouteController.h
+[S39]: https://android.googlesource.com/platform/system/netd/+/refs/tags/android-13.0.0_r1/server/UidRanges.h
+[S40]: https://android.googlesource.com/platform/system/netd/+/e11b8688b1f99292ade06f89f957c1f7e76ceae9/server/RouteController.cpp
+[S41]: https://android.googlesource.com/platform/system/netd/+/e11b8688b1f99292ade06f89f957c1f7e76ceae9/server/RouteController.cpp#256
+[S42]: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/net/core/fib_rules.c?id=738ac465e4e900d4a391a27da4e20c090eaa1e75#n812

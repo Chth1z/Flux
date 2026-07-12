@@ -55,12 +55,17 @@ pub enum RpdbRuleClassification {
 }
 
 /// Versioned classifications for one exact ordered rule snapshot.
+///
+/// Platform classifiers may also attach crate-owned static policy bounds for rules that can be
+/// absent from the current dump but remain reserved by the selected versioned grammar.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RpdbRuleAudit {
     snapshot_id: NetworkInventorySnapshotId,
     epoch: NetworkEpoch,
     classifier_revision: RpdbClassifierRevision,
     classifications: Box<[RpdbRuleClassification]>,
+    ipv4_static_window: Option<RpdbPriorityWindow>,
+    ipv6_static_window: Option<RpdbPriorityWindow>,
 }
 
 impl RpdbRuleAudit {
@@ -84,7 +89,32 @@ impl RpdbRuleAudit {
             epoch: inventory.epoch(),
             classifier_revision,
             classifications,
+            ipv4_static_window: None,
+            ipv6_static_window: None,
         })
+    }
+
+    /// Adds classifier-owned static bounds that may not have a currently observed rule.
+    ///
+    /// This is crate-private because the public constructor deliberately models only aligned rule
+    /// classifications. Versioned platform classifiers add static policy ranges through their
+    /// own safe API rather than letting arbitrary callers strengthen or weaken an audit ad hoc.
+    pub(crate) fn with_static_priority_window(
+        mut self,
+        family: NetworkAddressFamily,
+        last_must_precede: RulePriority,
+        first_terminal_barrier: RulePriority,
+    ) -> Self {
+        debug_assert!(last_must_precede < first_terminal_barrier);
+        let window = Some(RpdbPriorityWindow {
+            last_must_precede,
+            first_terminal_barrier,
+        });
+        match family {
+            NetworkAddressFamily::Ipv4 => self.ipv4_static_window = window,
+            NetworkAddressFamily::Ipv6 => self.ipv6_static_window = window,
+        }
+        self
     }
 
     #[must_use]
@@ -105,6 +135,16 @@ impl RpdbRuleAudit {
     #[must_use]
     pub fn classifications(&self) -> &[RpdbRuleClassification] {
         &self.classifications
+    }
+
+    const fn static_priority_window(
+        &self,
+        family: NetworkAddressFamily,
+    ) -> Option<RpdbPriorityWindow> {
+        match family {
+            NetworkAddressFamily::Ipv4 => self.ipv4_static_window,
+            NetworkAddressFamily::Ipv6 => self.ipv6_static_window,
+        }
     }
 }
 
@@ -655,8 +695,9 @@ fn plan_family(
     family: NetworkAddressFamily,
     placement: RpdbFamilyPlacement,
 ) -> Result<RpdbPriorityWindow, RpdbPlacementPlanError> {
-    let mut last_must_precede = None;
-    let mut first_terminal_barrier = None;
+    let static_window = audit.static_priority_window(family);
+    let mut last_must_precede = static_window.map(RpdbPriorityWindow::last_must_precede);
+    let mut first_terminal_barrier = static_window.map(RpdbPriorityWindow::first_terminal_barrier);
 
     for (dump_index, (rule, classification)) in inventory
         .rules()

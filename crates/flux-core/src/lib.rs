@@ -7,6 +7,7 @@
 //! mutation intent explicit at their domain boundaries.
 
 mod address_bypass;
+mod android_rpdb;
 mod capability;
 mod config;
 mod control;
@@ -23,6 +24,12 @@ pub use address_bypass::{
     AddressBypassRoutingSpecErrorKind, AddressBypassRuleBudget, AddressBypassRuleConflict,
     AddressBypassRuleConflictKind, AddressBypassRuleIntent, MAX_ADDRESS_BYPASS_CONFLICTS,
     MAX_ADDRESS_BYPASS_RULES, StaleAddressBypassPlan, plan_address_bypass,
+};
+pub use android_rpdb::{
+    AndroidRpdbClassificationReport, AndroidRpdbPlacementPlanError, AndroidRpdbPolicyProfile,
+    AndroidRpdbPriorityBand, AndroidRpdbPriorityContract, AndroidRpdbProfileIssue,
+    AndroidRpdbRuleRole, AndroidRpdbUnknownReason, AndroidRpdbUnknownRule,
+    MAX_ANDROID_RPDB_UNKNOWN_RULES, classify_android_rpdb, plan_android_rpdb_placement,
 };
 pub use capability::{
     BootIdentity, BootIdentityMutationStatus, CAPABILITY_PROFILE_SCHEMA_VERSION, CapabilityProfile,

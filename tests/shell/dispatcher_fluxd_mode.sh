@@ -328,30 +328,82 @@ EOF
     assert_not_called core
 }
 
-test_prepare_writes_exact_tun_readiness_manifest() {
+test_prepare_rejects_tun_before_init_or_manifest() {
     reset_fixture
     sed -i 's/^PROXY_MODE=.*/PROXY_MODE=tun/' "${FLUX_ROOT}/cache/cache_config"
     sed -i 's/^TUN_INTERFACE=.*/TUN_INTERFACE=flux-tun0/' "${FLUX_ROOT}/cache/cache_config"
+    : >"${CALLS_FILE}"
 
+    if run_bridge prepare; then
+        fail "Rust-owned prepare admitted unsupported TUN mode"
+    fi
+
+    assert_not_called init
+    assert_not_called core
+    [ ! -e "${RUN_ROOT}/engine.manifest" ] ||
+        fail "rejected TUN prepare published an engine manifest"
+    [ ! -d "${GENERATIONS_ROOT}/1" ] ||
+        fail "rejected TUN prepare retained incomplete generation artifacts"
+}
+
+test_prepare_rejects_missing_proxy_mode_without_artifacts() {
+    reset_fixture
+    sed -i '/^PROXY_MODE=/d' "${FLUX_ROOT}/cache/cache_config"
+    : >"${CALLS_FILE}"
+
+    if run_bridge prepare; then
+        fail "Rust-owned prepare admitted a missing proxy mode"
+    fi
+
+    assert_not_called init
+    [ ! -e "${RUN_ROOT}/engine.manifest" ] ||
+        fail "missing-mode prepare published an engine manifest"
+    [ ! -d "${GENERATIONS_ROOT}/1" ] ||
+        fail "missing-mode prepare retained incomplete generation artifacts"
+}
+
+test_prepare_revalidates_proxy_mode_generated_by_init() {
+    reset_fixture
+    write_stub init '
+printf "init:%s\n" "$*" >>/data/adb/flux/run/test-calls
+sed -i "s/^PROXY_MODE=.*/PROXY_MODE=tun/" /data/adb/flux/cache/cache_config
+: >/data/adb/flux/cache/cache_valid
+exit 0'
+
+    if run_bridge prepare; then
+        fail "Rust-owned prepare trusted the pre-init mode after init generated TUN"
+    fi
+
+    grep -qx 'init:init' "${CALLS_FILE}" ||
+        fail "generated-mode test did not exercise init"
+    [ ! -e "${RUN_ROOT}/engine.manifest" ] ||
+        fail "init-generated TUN published an engine manifest"
+    [ ! -d "${GENERATIONS_ROOT}/1" ] ||
+        fail "init-generated TUN retained incomplete generation artifacts"
+}
+
+test_active_tproxy_prepare_rejects_tun_without_disturbance() {
+    reset_fixture
     generation=$(prepare_generation)
-    [ "${generation}" = "1" ] || fail "TUN generation must be 1"
+    run_bridge capture-start "${generation}" || fail "initial capture-start failed"
+    run_bridge capture-verify "${generation}" || fail "initial capture-verify failed"
+    run_bridge state-running "${generation}" || fail "initial state-running failed"
+    cp "${RUN_ROOT}/capture.active" "${RUN_ROOT}/tproxy-capture-active"
+    cp "${RUN_ROOT}/capture.verified" "${RUN_ROOT}/tproxy-capture-verified"
+    cp "${RUN_ROOT}/engine.active" "${RUN_ROOT}/tproxy-engine-active"
+    sed -i 's/^PROXY_MODE=.*/PROXY_MODE=tun/' "${FLUX_ROOT}/cache/cache_config"
 
-    cat >"${RUN_ROOT}/expected-manifest" <<'EOF'
-FLUX_ENGINE_MANIFEST_V1
-generation=1
-binary=/data/adb/flux/bin/sing-box
-config=/data/adb/flux/run/generations/1/config.json
-working_directory=/data/adb/flux/run
-log=/data/adb/flux/run/generations/1/sing-box.log
-launcher=direct
-readiness=tun
-startup_timeout_ms=5000
-stop_timeout_ms=5000
-tun_interface=flux-tun0
-EOF
-    assert_file_equals "${RUN_ROOT}/expected-manifest" "${RUN_ROOT}/engine.manifest"
-    ! grep -q '^listener_port=' "${RUN_ROOT}/engine.manifest" ||
-        fail "TUN manifest must forbid listener_port"
+    if run_bridge prepare; then
+        fail "active TPROXY generation admitted a TUN replacement"
+    fi
+
+    [ ! -e "${RUN_ROOT}/engine.manifest" ] ||
+        fail "rejected TUN replacement retained a candidate manifest"
+    [ ! -d "${GENERATIONS_ROOT}/2" ] ||
+        fail "rejected TUN replacement retained candidate artifacts"
+    assert_file_equals "${RUN_ROOT}/tproxy-capture-active" "${RUN_ROOT}/capture.active"
+    assert_file_equals "${RUN_ROOT}/tproxy-capture-verified" "${RUN_ROOT}/capture.verified"
+    assert_file_equals "${RUN_ROOT}/tproxy-engine-active" "${RUN_ROOT}/engine.active"
 }
 
 test_rust_owned_config_build_skips_unpinned_sing_box_check() {
@@ -923,7 +975,10 @@ test_previous_generation_can_be_selected_after_newer_prepare
 test_generation_mismatch_is_rejected_for_verification_and_publication
 test_running_publication_retains_only_current_and_previous_generations
 test_prepare_writes_exact_busybox_manifest
-test_prepare_writes_exact_tun_readiness_manifest
+test_prepare_rejects_tun_before_init_or_manifest
+test_prepare_rejects_missing_proxy_mode_without_artifacts
+test_prepare_revalidates_proxy_mode_generated_by_init
+test_active_tproxy_prepare_rejects_tun_without_disturbance
 test_rust_owned_config_build_skips_unpinned_sing_box_check
 test_capture_start_owns_only_addrsync_and_tproxy
 test_capture_start_compensates_partial_failure

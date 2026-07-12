@@ -1,6 +1,6 @@
 # Current Flux System Baseline
 
-This note records the rewrite baseline at repository commit `c978b75` (`Add CLI control plane, TUN mode, PBR, multi-user proxy, and perf mode`). It is based on the checked-in implementation rather than the README alone.
+This historical note records the legacy shell baseline at repository commit `c978b75` (`Add CLI control plane, TUN mode, PBR, multi-user proxy, and perf mode`). It is based on that checked-in implementation rather than the README alone. It does not describe current Rust-owned bridge admission: Phase 1 now rejects TUN during `prepare` pending an exact-device single-owner and forced-death route-cleanup canary.
 
 ## Scope and size
 
@@ -92,7 +92,7 @@ The Rust `KernelContract` defines `5.10` and maps missing-syscall errors to an u
 - `RULE_BACKEND` accepts only `iptables_restore`.
 - `BYPASS_SET_BACKEND` accepts `zone`, `ipset`, or `auto`, but rule generation always emits the fixed 16-zone chain structure.
 - `KFEAT_NFT` and `KFEAT_IPSET` are detected but do not select production adapters.
-- TUN mode delegates `auto_route` and `strict_route` to Sing-Box; Flux does not own or reconcile the TUN interface and routes.
+- The legacy TUN mode delegates `auto_route` and `strict_route` to Sing-Box; Flux does not own or reconcile the TUN interface and routes. This remains baseline evidence, not a mode admitted by the Rust-owned Phase 1 bridge.
 - eBPF is explicitly documented as future diagnostic/auxiliary work and has no loader or program lifecycle.
 
 ### 4. Mutation is not atomic across subsystems

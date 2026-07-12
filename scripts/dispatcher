@@ -627,6 +627,20 @@ _write_engine_manifest() {
     atomic_write "${ENGINE_MANIFEST_FILE}" cat "${generation_manifest}"
 }
 
+_require_rust_owned_bridge_proxy_mode() {
+    case "${PROXY_MODE:-}" in
+    tproxy) return 0 ;;
+    tun)
+        log_error "Rust-owned Phase 1 TUN is unsupported until single-owner forced-death route cleanup is proven"
+        return 1
+        ;;
+    *)
+        log_error "Rust-owned Phase 1 received an unsupported proxy mode"
+        return 1
+        ;;
+    esac
+}
+
 _state_prepare() {
     local generation=""
     local generation_dir=""
@@ -647,12 +661,20 @@ _state_prepare() {
         _discard_incomplete_generation "${generation_dir}" || true
         return 1
     fi
+    if ! _require_rust_owned_bridge_proxy_mode; then
+        _discard_incomplete_generation "${generation_dir}" || true
+        return 1
+    fi
     if ! FLUXD_ENGINE_OWNER=rust sh "${INIT_SCRIPT}" init; then
         log_error "Init failed"
         _discard_incomplete_generation "${generation_dir}" || true
         return 1
     fi
     if ! _load_shared_prepared_config; then
+        _discard_incomplete_generation "${generation_dir}" || true
+        return 1
+    fi
+    if ! _require_rust_owned_bridge_proxy_mode; then
         _discard_incomplete_generation "${generation_dir}" || true
         return 1
     fi

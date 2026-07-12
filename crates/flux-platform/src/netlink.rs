@@ -12,13 +12,11 @@ pub(crate) const NLA_F_NESTED: u16 = 1 << 15;
 pub(crate) const NLA_F_NET_BYTEORDER: u16 = 1 << 14;
 pub(crate) const NLA_TYPE_MASK: u16 = !(NLA_F_NESTED | NLA_F_NET_BYTEORDER);
 
-// Link facts are decoded privately until the inventory source coordinates a
-// complete link/address transaction and can publish both classes atomically.
+// Raw link framing stays private behind the combined inventory observer.
 #[allow(dead_code)]
 pub(crate) mod link;
 
-// Kept private to the platform crate until the inventory observer owns the
-// higher-level resynchronization contract.
+// Socket ownership and dump sequencing stay private to the platform Adapter.
 #[allow(dead_code)]
 pub(crate) mod socket;
 

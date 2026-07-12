@@ -1,11 +1,19 @@
 use std::num::NonZeroU32;
 
 const NETLINK_HEADER_LENGTH: usize = 16;
+const NETLINK_ATTRIBUTE_HEADER_LENGTH: usize = 4;
+const INTERFACE_LINK_MESSAGE_LENGTH: usize = 16;
 const INTERFACE_ADDRESS_MESSAGE_LENGTH: usize = 8;
+const EXTENDED_LINK_MASK_ATTRIBUTE_LENGTH: usize = NETLINK_ATTRIBUTE_HEADER_LENGTH + 4;
+const LINK_DUMP_REQUEST_LENGTH: usize =
+    NETLINK_HEADER_LENGTH + INTERFACE_LINK_MESSAGE_LENGTH + EXTENDED_LINK_MASK_ATTRIBUTE_LENGTH;
 const ADDRESS_DUMP_REQUEST_LENGTH: usize = NETLINK_HEADER_LENGTH + INTERFACE_ADDRESS_MESSAGE_LENGTH;
+const RTM_GETLINK: u16 = 18;
 const RTM_GETADDR: u16 = 22;
 const NLM_F_REQUEST: u16 = 0x0001;
 const NLM_F_DUMP: u16 = 0x0300;
+const IFLA_EXT_MASK: u16 = 29;
+const RTEXT_FILTER_SKIP_STATS: u32 = 1 << 3;
 
 #[cfg(target_os = "linux")]
 const RTNLGRP_LINK: u32 = libc::RTNLGRP_LINK;
@@ -40,7 +48,10 @@ const AF_NETLINK: u16 = 16;
 const SOCKADDR_NL_LENGTH: u32 = 12;
 const MSG_TRUNC: i32 = 0x20;
 pub(crate) const RECEIVE_BATCH_SLOTS: usize = 8;
-pub(crate) const ROUTE_DATAGRAM_CAPACITY: usize = 64 * 1024;
+// Operational bound for current Android 5.10 link/address observation. This
+// is not a protocol-wide rtnetlink maximum; larger future/VF-heavy messages
+// remain loss signals through MSG_TRUNC and force a complete resynchronization.
+pub(crate) const ROUTE_DATAGRAM_CAPACITY: usize = 256 * 1024;
 const ROUTE_SOCKET_RECEIVE_BUFFER_BYTES: i32 = 4 * 1024 * 1024;
 const MAX_EFFECTIVE_ROUTE_SOCKET_RECEIVE_BUFFER_BYTES: i32 = ROUTE_SOCKET_RECEIVE_BUFFER_BYTES * 2;
 
@@ -78,6 +89,36 @@ impl NetlinkSequenceAllocator {
 impl Default for NetlinkSequenceAllocator {
     fn default() -> Self {
         Self::new(NonZeroU32::MIN)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct LinkDumpRequest {
+    bytes: [u8; LINK_DUMP_REQUEST_LENGTH],
+    sequence: NonZeroU32,
+}
+
+impl LinkDumpRequest {
+    pub(crate) fn all(sequence: NonZeroU32) -> Self {
+        let mut bytes = [0; LINK_DUMP_REQUEST_LENGTH];
+        bytes[..4].copy_from_slice(&(LINK_DUMP_REQUEST_LENGTH as u32).to_ne_bytes());
+        bytes[4..6].copy_from_slice(&RTM_GETLINK.to_ne_bytes());
+        bytes[6..8].copy_from_slice(&(NLM_F_REQUEST | NLM_F_DUMP).to_ne_bytes());
+        bytes[8..12].copy_from_slice(&sequence.get().to_ne_bytes());
+        let attribute = NETLINK_HEADER_LENGTH + INTERFACE_LINK_MESSAGE_LENGTH;
+        bytes[attribute..attribute + 2]
+            .copy_from_slice(&(EXTENDED_LINK_MASK_ATTRIBUTE_LENGTH as u16).to_ne_bytes());
+        bytes[attribute + 2..attribute + 4].copy_from_slice(&IFLA_EXT_MASK.to_ne_bytes());
+        bytes[attribute + 4..attribute + 8].copy_from_slice(&RTEXT_FILTER_SKIP_STATS.to_ne_bytes());
+        Self { bytes, sequence }
+    }
+
+    pub(crate) const fn as_bytes(&self) -> &[u8; LINK_DUMP_REQUEST_LENGTH] {
+        &self.bytes
+    }
+
+    pub(crate) const fn sequence(&self) -> NonZeroU32 {
+        self.sequence
     }
 }
 
@@ -334,7 +375,7 @@ mod implementation {
     use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 
     use super::{
-        AF_NETLINK, AddressDumpRequest, BatchIntegrity,
+        AF_NETLINK, AddressDumpRequest, BatchIntegrity, LinkDumpRequest,
         MAX_EFFECTIVE_ROUTE_SOCKET_RECEIVE_BUFFER_BYTES, MSG_TRUNC, NetlinkBatchMetadata,
         NetlinkDatagram, NetlinkDatagramMetadata, NetlinkReceiveLoss, NetlinkReceiveOutcome,
         NetlinkSendOutcome, NetlinkSenderAddress, RECEIVE_BATCH_SLOTS, ROUTE_DATAGRAM_CAPACITY,
@@ -569,6 +610,21 @@ mod implementation {
             &self,
             request: &AddressDumpRequest,
         ) -> Result<NetlinkSendOutcome, PlatformError> {
+            self.send_dump(request.as_bytes(), "send route-netlink address dump")
+        }
+
+        pub(crate) fn send_link_dump(
+            &self,
+            request: &LinkDumpRequest,
+        ) -> Result<NetlinkSendOutcome, PlatformError> {
+            self.send_dump(request.as_bytes(), "send route-netlink link dump")
+        }
+
+        fn send_dump(
+            &self,
+            request: &[u8],
+            operation: &'static str,
+        ) -> Result<NetlinkSendOutcome, PlatformError> {
             let destination = RawNetlinkSocketAddress {
                 family: AF_NETLINK,
                 ..RawNetlinkSocketAddress::default()
@@ -580,8 +636,8 @@ mod implementation {
                 let sent = unsafe {
                     libc::sendto(
                         self.fd.as_raw_fd(),
-                        request.as_bytes().as_ptr().cast::<libc::c_void>(),
-                        request.as_bytes().len(),
+                        request.as_ptr().cast::<libc::c_void>(),
+                        request.len(),
                         libc::MSG_DONTWAIT,
                         std::ptr::from_ref(&destination).cast::<libc::sockaddr>(),
                         SOCKADDR_NL_LENGTH,
@@ -595,16 +651,16 @@ mod implementation {
                     if source.kind() == std::io::ErrorKind::WouldBlock {
                         return Ok(NetlinkSendOutcome::WouldBlock);
                     }
-                    return Err(system_call_error("send route-netlink address dump", source));
+                    return Err(system_call_error(operation, source));
                 }
             };
             let actual = usize::try_from(sent).map_err(|_| PlatformError::ShortWrite {
-                expected: request.as_bytes().len(),
+                expected: request.len(),
                 actual: 0,
             })?;
-            if actual != request.as_bytes().len() {
+            if actual != request.len() {
                 return Err(PlatformError::ShortWrite {
-                    expected: request.as_bytes().len(),
+                    expected: request.len(),
                     actual,
                 });
             }
@@ -815,14 +871,23 @@ mod implementation {
         use std::num::NonZeroU32;
         use std::time::{Duration, Instant};
 
+        use super::super::{
+            INTERFACE_LINK_MESSAGE_LENGTH, NETLINK_ATTRIBUTE_HEADER_LENGTH, NETLINK_HEADER_LENGTH,
+            RTNLGRP_LINK, multicast_group_bit,
+        };
         use super::*;
-        use crate::netlink::{NLMSG_DONE, NLMSG_ERROR, NetlinkMessageIter};
+        use crate::netlink::link::RtnetlinkLinkEventDecoder;
+        use crate::netlink::{
+            NLMSG_DONE, NLMSG_ERROR, NetlinkMessageIter, align4, validate_done_payload,
+        };
 
         #[test]
         fn receive_ring_slots_are_fixed_non_overlapping_and_pointer_stable() {
             let mut ring = NetlinkReceiveRing::new();
             let slab_start = ring.slab.as_ptr() as usize;
 
+            assert_eq!(ring.iovecs[0].iov_len, 256 * 1024);
+            assert_eq!(ring.slab.len(), 2 * 1024 * 1024);
             for index in 0..RECEIVE_BATCH_SLOTS {
                 let expected = slab_start + index * ROUTE_DATAGRAM_CAPACITY;
                 assert_eq!(ring.iovecs[index].iov_base as usize, expected);
@@ -845,6 +910,44 @@ mod implementation {
             assert_eq!(ring.headers[0].msg_hdr.msg_flags, 0);
             assert_eq!(ring.headers[0].msg_len, 0);
             assert_eq!(ring.senders[0], RawNetlinkSocketAddress::default());
+        }
+
+        #[test]
+        fn receive_ring_preserves_and_link_decoder_accepts_a_datagram_above_64_kib() {
+            let fixture = oversized_link_datagram_fixture();
+            assert_eq!(fixture.len(), 65_584);
+            assert!(fixture.len() > 64 * 1024);
+            assert!(fixture.len() <= ROUTE_DATAGRAM_CAPACITY);
+
+            let mut ring = NetlinkReceiveRing::new();
+            ring.slab[..fixture.len()].copy_from_slice(&fixture);
+            ring.headers[0].msg_len = u32::try_from(fixture.len()).unwrap();
+            ring.headers[0].msg_hdr.msg_flags = 0;
+            ring.headers[0].msg_hdr.msg_namelen = SOCKADDR_NL_LENGTH;
+            ring.senders[0] = RawNetlinkSocketAddress {
+                family: AF_NETLINK,
+                groups: multicast_group_bit(RTNLGRP_LINK),
+                ..RawNetlinkSocketAddress::default()
+            };
+            ring.update_metadata(1);
+
+            assert_eq!(
+                classify_batch(&ring.metadata[..1]),
+                BatchIntegrity::Complete
+            );
+            let batch = NetlinkDatagramBatch {
+                ring: &ring,
+                count: 1,
+            };
+            let datagram = batch.datagram(0).expect("oversized receive fixture");
+            assert_eq!(datagram.bytes(), fixture);
+            assert_eq!(datagram.metadata().reported_length(), fixture.len());
+
+            let decoded = RtnetlinkLinkEventDecoder::new()
+                .decode_datagram(datagram.bytes())
+                .expect("structurally valid oversized RTM_NEWLINK");
+            let record = decoded.events()[0].record().expect("link upsert");
+            assert_eq!(record.name().as_bytes(), b"oversized0");
         }
 
         #[test]
@@ -880,7 +983,8 @@ mod implementation {
         }
 
         #[test]
-        fn address_dump_round_trip_retains_kernel_sender_until_matching_done() {
+        #[ignore = "requires access to the host route-netlink namespace"]
+        fn sequential_link_then_address_dump_uses_one_socket_and_ring() {
             let socket = match RouteNetlinkSocket::open() {
                 Ok(socket) => socket,
                 Err(PlatformError::SystemCall { source, .. })
@@ -890,61 +994,147 @@ mod implementation {
                 }
                 Err(error) => panic!("open route-netlink socket: {error}"),
             };
-            let sequence = NonZeroU32::new(0x1020_3040).unwrap();
-            let request = AddressDumpRequest::all(sequence);
+            let mut ring = NetlinkReceiveRing::new();
+            let link_sequence = NonZeroU32::new(0x1020_3040).unwrap();
+            let address_sequence = NonZeroU32::new(0x1020_3041).unwrap();
+            let link_request = LinkDumpRequest::all(link_sequence);
+            let address_request = AddressDumpRequest::all(address_sequence);
+            let mut maximum_datagram_length = 0;
+
+            send_dump_and_wait_for_matching_done(
+                &socket,
+                &mut ring,
+                link_sequence,
+                "link dump",
+                &mut maximum_datagram_length,
+                || socket.send_link_dump(&link_request),
+            );
+            send_dump_and_wait_for_matching_done(
+                &socket,
+                &mut ring,
+                address_sequence,
+                "address dump",
+                &mut maximum_datagram_length,
+                || socket.send_address_dump(&address_request),
+            );
+
+            assert!(maximum_datagram_length > 0);
+            assert!(maximum_datagram_length <= ROUTE_DATAGRAM_CAPACITY);
+        }
+
+        fn send_dump_and_wait_for_matching_done(
+            socket: &RouteNetlinkSocket,
+            ring: &mut NetlinkReceiveRing,
+            sequence: NonZeroU32,
+            operation: &'static str,
+            maximum_datagram_length: &mut usize,
+            mut send: impl FnMut() -> Result<NetlinkSendOutcome, PlatformError>,
+        ) {
             let deadline = Instant::now() + Duration::from_secs(2);
             loop {
-                match socket
-                    .send_address_dump(&request)
-                    .expect("send address dump")
-                {
+                match send().unwrap_or_else(|error| panic!("send {operation}: {error}")) {
                     NetlinkSendOutcome::Sent => break,
                     NetlinkSendOutcome::WouldBlock => {
-                        wait_for(&socket, libc::POLLOUT, deadline);
+                        wait_for(socket, libc::POLLOUT, deadline);
                     }
                 }
             }
 
-            let mut ring = NetlinkReceiveRing::new();
             loop {
                 match socket
-                    .receive_batch(&mut ring, NonZeroUsize::new(RECEIVE_BATCH_SLOTS).unwrap())
-                    .expect("receive address dump")
+                    .receive_batch(ring, NonZeroUsize::new(RECEIVE_BATCH_SLOTS).unwrap())
+                    .unwrap_or_else(|error| panic!("receive {operation}: {error}"))
                 {
                     NetlinkReceiveOutcome::WouldBlock => {
-                        wait_for(&socket, libc::POLLIN, deadline);
+                        wait_for(socket, libc::POLLIN, deadline);
                     }
                     NetlinkReceiveOutcome::Loss(loss) => {
-                        panic!("unexpected route-netlink loss during address dump: {loss:?}");
+                        panic!("unexpected route-netlink loss during {operation}: {loss:?}");
                     }
                     NetlinkReceiveOutcome::Datagrams(batch) => {
                         assert!(!batch.is_empty());
                         for index in 0..batch.len() {
                             let datagram = batch.datagram(index).expect("received datagram");
                             assert!(datagram.metadata().sender().is_kernel());
+                            *maximum_datagram_length =
+                                (*maximum_datagram_length).max(datagram.bytes().len());
                             assert_eq!(
                                 datagram.bytes().len(),
                                 datagram.metadata().reported_length()
                             );
+                            let multicast = datagram.metadata().sender().groups() != 0;
                             for message in NetlinkMessageIter::new(datagram.bytes()) {
                                 let message = message.expect("kernel emitted framed netlink data");
-                                if message.header().sequence() != sequence.get() {
-                                    continue;
-                                }
                                 assert_ne!(
                                     message.header().message_type(),
                                     NLMSG_ERROR,
-                                    "kernel rejected exact RTM_GETADDR request"
+                                    "kernel rejected or aborted {operation}"
+                                );
+                                if multicast {
+                                    // Sequence zero is conventional for multicast, but origin is
+                                    // determined by sockaddr_nl groups rather than the header.
+                                    continue;
+                                }
+                                assert_eq!(
+                                    message.header().sequence(),
+                                    sequence.get(),
+                                    "unicast {operation} response used an unexpected sequence"
                                 );
                                 if message.header().message_type() == NLMSG_DONE {
+                                    validate_done_payload(
+                                        message.payload(),
+                                        message.header().flags(),
+                                        message.offset() + NETLINK_HEADER_LENGTH,
+                                    )
+                                    .unwrap_or_else(|error| {
+                                        panic!(
+                                            "kernel returned invalid {operation} DONE: {error:?}"
+                                        )
+                                    });
                                     return;
                                 }
                             }
                         }
                     }
                 }
-                assert!(Instant::now() < deadline, "address dump did not complete");
+                assert!(Instant::now() < deadline, "{operation} did not complete");
             }
+        }
+
+        fn oversized_link_datagram_fixture() -> Vec<u8> {
+            const RTM_NEWLINK: u16 = 16;
+            const IFLA_IFNAME: u16 = 3;
+            const UNKNOWN_LINK_ATTRIBUTE: u16 = 63;
+
+            let mut payload = vec![0_u8; INTERFACE_LINK_MESSAGE_LENGTH];
+            payload[4..8].copy_from_slice(&7_i32.to_ne_bytes());
+            append_fixture_attribute(&mut payload, IFLA_IFNAME, b"oversized0\0");
+
+            let maximum_value_length = usize::from(u16::MAX) - NETLINK_ATTRIBUTE_HEADER_LENGTH;
+            append_fixture_attribute(
+                &mut payload,
+                UNKNOWN_LINK_ATTRIBUTE,
+                &vec![0xa5; maximum_value_length],
+            );
+
+            let length = NETLINK_HEADER_LENGTH + payload.len();
+            let mut message = Vec::with_capacity(align4(length));
+            message.extend_from_slice(&u32::try_from(length).unwrap().to_ne_bytes());
+            message.extend_from_slice(&RTM_NEWLINK.to_ne_bytes());
+            message.extend_from_slice(&0_u16.to_ne_bytes());
+            message.extend_from_slice(&1_u32.to_ne_bytes());
+            message.extend_from_slice(&0_u32.to_ne_bytes());
+            message.extend_from_slice(&payload);
+            message.resize(align4(message.len()), 0);
+            message
+        }
+
+        fn append_fixture_attribute(message: &mut Vec<u8>, attribute_type: u16, value: &[u8]) {
+            let length = NETLINK_ATTRIBUTE_HEADER_LENGTH + value.len();
+            message.extend_from_slice(&u16::try_from(length).unwrap().to_ne_bytes());
+            message.extend_from_slice(&attribute_type.to_ne_bytes());
+            message.extend_from_slice(value);
+            message.resize(align4(message.len()), 0);
         }
 
         fn wait_for(socket: &RouteNetlinkSocket, events: i16, deadline: Instant) {
@@ -982,8 +1172,8 @@ mod implementation {
     use std::num::NonZeroUsize;
 
     use super::{
-        AddressDumpRequest, NetlinkDatagram, NetlinkDatagramMetadata, NetlinkReceiveOutcome,
-        NetlinkSendOutcome, RouteNetlinkSocketEvidence,
+        AddressDumpRequest, LinkDumpRequest, NetlinkDatagram, NetlinkDatagramMetadata,
+        NetlinkReceiveOutcome, NetlinkSendOutcome, RouteNetlinkSocketEvidence,
     };
     use crate::PlatformError;
 
@@ -1034,6 +1224,13 @@ mod implementation {
         pub(crate) fn send_address_dump(
             &self,
             _request: &AddressDumpRequest,
+        ) -> Result<NetlinkSendOutcome, PlatformError> {
+            Err(PlatformError::UnsupportedPlatform(std::env::consts::OS))
+        }
+
+        pub(crate) fn send_link_dump(
+            &self,
+            _request: &LinkDumpRequest,
         ) -> Result<NetlinkSendOutcome, PlatformError> {
             Err(PlatformError::UnsupportedPlatform(std::env::consts::OS))
         }
@@ -1110,6 +1307,48 @@ mod tests {
     }
 
     #[test]
+    fn link_dump_builder_emits_exact_af_unspec_rtm_getlink_request() {
+        let sequence = NonZeroU32::new(0x0102_0304).unwrap();
+        let all = LinkDumpRequest::all(sequence);
+
+        #[cfg(target_endian = "little")]
+        let expected_all = [
+            0x28, 0x00, 0x00, 0x00, // nlmsg_len
+            0x12, 0x00, // RTM_GETLINK
+            0x01, 0x03, // NLM_F_REQUEST | NLM_F_DUMP
+            0x04, 0x03, 0x02, 0x01, // sequence
+            0x00, 0x00, 0x00, 0x00, // kernel-selected port id
+            0x00, 0x00, // AF_UNSPEC + padding
+            0x00, 0x00, // hardware type
+            0x00, 0x00, 0x00, 0x00, // interface index
+            0x00, 0x00, 0x00, 0x00, // link flags
+            0x00, 0x00, 0x00, 0x00, // change mask
+            0x08, 0x00, // attribute length
+            0x1d, 0x00, // IFLA_EXT_MASK
+            0x08, 0x00, 0x00, 0x00, // RTEXT_FILTER_SKIP_STATS
+        ];
+        #[cfg(target_endian = "big")]
+        let expected_all = [
+            0x00, 0x00, 0x00, 0x28, // nlmsg_len
+            0x00, 0x12, // RTM_GETLINK
+            0x03, 0x01, // NLM_F_REQUEST | NLM_F_DUMP
+            0x01, 0x02, 0x03, 0x04, // sequence
+            0x00, 0x00, 0x00, 0x00, // kernel-selected port id
+            0x00, 0x00, // AF_UNSPEC + padding
+            0x00, 0x00, // hardware type
+            0x00, 0x00, 0x00, 0x00, // interface index
+            0x00, 0x00, 0x00, 0x00, // link flags
+            0x00, 0x00, 0x00, 0x00, // change mask
+            0x00, 0x08, // attribute length
+            0x00, 0x1d, // IFLA_EXT_MASK
+            0x00, 0x00, 0x00, 0x08, // RTEXT_FILTER_SKIP_STATS
+        ];
+
+        assert_eq!(all.as_bytes(), &expected_all);
+        assert_eq!(all.sequence(), sequence);
+    }
+
+    #[test]
     fn batch_classification_preserves_flags_and_sender_before_accepting_bytes() {
         let sender = NetlinkSenderAddress::new(SOCKADDR_NL_LENGTH, AF_NETLINK, 7, 0, 0x40);
         let metadata = [
@@ -1136,16 +1375,29 @@ mod tests {
     fn truncated_or_non_kernel_sender_quarantines_the_entire_batch() {
         let kernel = NetlinkSenderAddress::new(SOCKADDR_NL_LENGTH, AF_NETLINK, 0, 0, 0);
         let userspace = NetlinkSenderAddress::new(SOCKADDR_NL_LENGTH, AF_NETLINK, 0, 44, 0);
-        let truncated = [
+        let exact_capacity = [
             NetlinkDatagramMetadata::new(64, 0, kernel),
-            NetlinkDatagramMetadata::new(ROUTE_DATAGRAM_CAPACITY + 1, MSG_TRUNC, kernel),
+            NetlinkDatagramMetadata::new(ROUTE_DATAGRAM_CAPACITY, 0, kernel),
+        ];
+        let oversized = [
+            NetlinkDatagramMetadata::new(64, 0, kernel),
+            NetlinkDatagramMetadata::new(ROUTE_DATAGRAM_CAPACITY + 1, 0, kernel),
+        ];
+        let flagged_at_capacity = [
+            NetlinkDatagramMetadata::new(64, 0, kernel),
+            NetlinkDatagramMetadata::new(ROUTE_DATAGRAM_CAPACITY, MSG_TRUNC, kernel),
         ];
         let foreign = [
             NetlinkDatagramMetadata::new(64, 0, kernel),
             NetlinkDatagramMetadata::new(64, 0, userspace),
         ];
 
-        assert_eq!(classify_batch(&truncated), BatchIntegrity::Truncated);
+        assert_eq!(classify_batch(&exact_capacity), BatchIntegrity::Complete);
+        assert_eq!(classify_batch(&oversized), BatchIntegrity::Truncated);
+        assert_eq!(
+            classify_batch(&flagged_at_capacity),
+            BatchIntegrity::Truncated
+        );
         assert_eq!(classify_batch(&foreign), BatchIntegrity::UnexpectedSender);
     }
 }

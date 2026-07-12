@@ -7,16 +7,16 @@ use std::time::{Duration, Instant};
 use flux_core::NetworkEpoch;
 
 use crate::PlatformError;
-use crate::address_sync::{
-    AddressDatagram, AddressEventDecodeError, AddressEventPolicy, RtnetlinkAddressEventDecoder,
-};
+use crate::address_sync::{AddressEventPolicy, RtnetlinkAddressEventDecoder};
+use crate::netlink::link::RtnetlinkLinkEventDecoder;
 use crate::netlink::socket::{
-    AddressDumpRequest, NetlinkReceiveLoss, NetlinkReceiveOutcome, NetlinkReceiveRing,
-    NetlinkSendOutcome, NetlinkSequenceAllocator, RECEIVE_BATCH_SLOTS, ROUTE_DATAGRAM_CAPACITY,
-    RouteNetlinkSocket, RouteNetlinkSocketEvidence,
+    AddressDumpRequest, LinkDumpRequest, NetlinkReceiveLoss, NetlinkReceiveOutcome,
+    NetlinkReceiveRing, NetlinkSendOutcome, NetlinkSequenceAllocator, RECEIVE_BATCH_SLOTS,
+    ROUTE_DATAGRAM_CAPACITY, RouteNetlinkSocket, RouteNetlinkSocketEvidence,
 };
 
 use super::{
+    InventoryDatagram, InventoryDatagramOrigin, InventoryDecodeError, MAX_RACE_QUEUE_BYTES,
     MAX_RACE_QUEUE_CAPACITY, NetworkInventoryObserver, NetworkInventorySource, ObserverConfig,
     ObserverDriveOutcome, ObserverFault, ObserverLoss, deadline_after,
 };
@@ -26,11 +26,11 @@ const DEFAULT_QUIET_DEBOUNCE: Duration = Duration::from_millis(50);
 const DEFAULT_MAXIMUM_DEBOUNCE: Duration = Duration::from_millis(250);
 const DEFAULT_DUMP_SEND_RETRY: Duration = Duration::from_millis(50);
 const DEFAULT_READY_DATAGRAM_BUDGET: usize = 16;
-const DEFAULT_READY_BYTE_BUDGET: usize = 256 * 1024;
+const DEFAULT_READY_BYTE_BUDGET: usize = 1024 * 1024;
 
 /// A hard per-turn receive budget for the route inventory driver.
 ///
-/// The byte budget must reserve at least one complete 64 KiB netlink
+/// The byte budget must reserve at least one complete 256 KiB netlink
 /// datagram. The driver conservatively limits each `recvmmsg` invocation by
 /// the remaining worst-case slot capacity, so an accepted batch can always be
 /// consumed atomically without exceeding this budget.
@@ -110,11 +110,12 @@ impl RouteNetworkInventoryDriveReport {
 /// Opaque owner of the read-only route-netlink inventory pipeline.
 ///
 /// The socket is opened and subscribed before `open` attempts the initial
-/// `AF_UNSPEC RTM_GETADDR` dump. Raw framing, sequence allocation, receive
-/// storage, decoding, loss recovery, and publication remain private. Any
-/// returned error is permanent for this driver instance: the source is made
-/// stale before the error reaches the caller, allowing the daemon to disable
-/// observation without disturbing its other facilities.
+/// `RTM_GETLINK` dump, followed strictly by one `AF_UNSPEC RTM_GETADDR` dump.
+/// Raw framing, sequence allocation, receive storage, decoding, loss recovery,
+/// and publication remain private. Any returned error is permanent for this
+/// driver instance: the source is made stale before the error reaches the
+/// caller, allowing the daemon to disable observation without disturbing its
+/// other facilities.
 pub(crate) struct RouteNetworkInventoryDriver {
     inner: RouteNetworkInventoryDriverInner<SystemRouteNetworkInventoryTransport>,
 }
@@ -175,6 +176,7 @@ impl RouteNetworkInventoryDriver {
 fn production_observer_config() -> ObserverConfig {
     ObserverConfig::new(
         MAX_RACE_QUEUE_CAPACITY,
+        MAX_RACE_QUEUE_BYTES,
         DEFAULT_DUMP_TIMEOUT,
         DEFAULT_QUIET_DEBOUNCE,
         DEFAULT_MAXIMUM_DEBOUNCE,
@@ -182,10 +184,19 @@ fn production_observer_config() -> ObserverConfig {
     .expect("hard-coded route inventory observer configuration is valid")
 }
 
+fn inventory_datagram_origin(sender_groups: u32) -> InventoryDatagramOrigin {
+    if sender_groups == 0 {
+        InventoryDatagramOrigin::Response
+    } else {
+        InventoryDatagramOrigin::Notification
+    }
+}
+
 struct SystemRouteNetworkInventoryTransport {
     socket: RouteNetlinkSocket,
     ring: NetlinkReceiveRing,
-    decoder: RtnetlinkAddressEventDecoder,
+    link_decoder: RtnetlinkLinkEventDecoder,
+    address_decoder: RtnetlinkAddressEventDecoder,
 }
 
 impl SystemRouteNetworkInventoryTransport {
@@ -197,7 +208,8 @@ impl SystemRouteNetworkInventoryTransport {
         Ok(Self {
             socket,
             ring: NetlinkReceiveRing::new(),
-            decoder: RtnetlinkAddressEventDecoder::new(policy),
+            link_decoder: RtnetlinkLinkEventDecoder::new(),
+            address_decoder: RtnetlinkAddressEventDecoder::new(policy),
         })
     }
 
@@ -212,6 +224,13 @@ impl SystemRouteNetworkInventoryTransport {
 }
 
 impl RouteNetworkInventoryTransport for SystemRouteNetworkInventoryTransport {
+    fn send_link_dump(
+        &mut self,
+        request: &LinkDumpRequest,
+    ) -> Result<NetlinkSendOutcome, PlatformError> {
+        self.socket.send_link_dump(request)
+    }
+
     fn send_address_dump(
         &mut self,
         request: &AddressDumpRequest,
@@ -226,7 +245,8 @@ impl RouteNetworkInventoryTransport for SystemRouteNetworkInventoryTransport {
         let Self {
             socket,
             ring,
-            decoder,
+            link_decoder,
+            address_decoder,
         } = self;
         match socket.receive_batch(ring, max_datagrams)? {
             NetlinkReceiveOutcome::WouldBlock => {
@@ -247,8 +267,15 @@ impl RouteNetworkInventoryTransport for SystemRouteNetworkInventoryTransport {
                     let datagram = batch
                         .datagram(index)
                         .expect("validated receive batch index is present");
-                    bytes = bytes.saturating_add(datagram.bytes().len());
-                    datagrams.push(decoder.decode_datagram(datagram.bytes()));
+                    let wire_bytes = datagram.bytes().len();
+                    bytes = bytes.saturating_add(wire_bytes);
+                    let origin = inventory_datagram_origin(datagram.metadata().sender().groups());
+                    datagrams.push(InventoryDatagram::from_decoded(
+                        link_decoder.decode_datagram(datagram.bytes()),
+                        address_decoder.decode_datagram(datagram.bytes()),
+                        origin,
+                        wire_bytes,
+                    ));
                 }
                 Ok(RouteNetworkInventoryReceiveOutcome::Batch(
                     DecodedRouteNetworkInventoryBatch { datagrams, bytes },
@@ -259,6 +286,11 @@ impl RouteNetworkInventoryTransport for SystemRouteNetworkInventoryTransport {
 }
 
 trait RouteNetworkInventoryTransport {
+    fn send_link_dump(
+        &mut self,
+        request: &LinkDumpRequest,
+    ) -> Result<NetlinkSendOutcome, PlatformError>;
+
     fn send_address_dump(
         &mut self,
         request: &AddressDumpRequest,
@@ -277,14 +309,35 @@ enum RouteNetworkInventoryReceiveOutcome {
 }
 
 struct DecodedRouteNetworkInventoryBatch {
-    datagrams: Vec<Result<AddressDatagram, AddressEventDecodeError>>,
+    datagrams: Vec<Result<InventoryDatagram, InventoryDecodeError>>,
     bytes: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
-struct PendingDumpRequest {
-    request: AddressDumpRequest,
-    retry_at: Instant,
+enum PendingDumpRequest {
+    Link {
+        request: LinkDumpRequest,
+        retry_at: Instant,
+    },
+    Address {
+        request: AddressDumpRequest,
+        retry_at: Instant,
+    },
+}
+
+impl PendingDumpRequest {
+    const fn retry_at(self) -> Instant {
+        match self {
+            Self::Link { retry_at, .. } | Self::Address { retry_at, .. } => retry_at,
+        }
+    }
+
+    fn with_retry_at(self, retry_at: Instant) -> Self {
+        match self {
+            Self::Link { request, .. } => Self::Link { request, retry_at },
+            Self::Address { request, .. } => Self::Address { request, retry_at },
+        }
+    }
 }
 
 struct RouteNetworkInventoryDriverInner<T> {
@@ -326,7 +379,7 @@ impl<T: RouteNetworkInventoryTransport> RouteNetworkInventoryDriverInner<T> {
         }
         earliest_deadline(
             self.observer.next_deadline(),
-            self.pending_dump.map(|pending| pending.retry_at),
+            self.pending_dump.map(PendingDumpRequest::retry_at),
         )
     }
 
@@ -380,8 +433,8 @@ impl<T: RouteNetworkInventoryTransport> RouteNetworkInventoryDriverInner<T> {
                     progress.made_progress = true;
                     let outcome = self.observer.consume_batch(batch.datagrams, now);
                     let resync = self.apply_observer_outcome(outcome, now, &mut progress);
+                    self.try_send_dump(now, &mut progress)?;
                     if resync {
-                        self.try_send_dump(now, &mut progress)?;
                         return Ok(progress.finish(false));
                     }
                 }
@@ -417,6 +470,11 @@ impl<T: RouteNetworkInventoryTransport> RouteNetworkInventoryDriverInner<T> {
                 progress.published_epoch = Some(epoch);
                 false
             }
+            ObserverDriveOutcome::RequestAddressDump => {
+                progress.made_progress = true;
+                self.schedule_address_dump(now);
+                false
+            }
             ObserverDriveOutcome::RequestDump(fault) => {
                 progress.made_progress = true;
                 progress.resync_fault = Some(fault);
@@ -427,11 +485,21 @@ impl<T: RouteNetworkInventoryTransport> RouteNetworkInventoryDriverInner<T> {
     }
 
     fn schedule_resync(&mut self, now: Instant) {
-        if self.disabled || self.pending_dump.is_some() {
+        if self.disabled {
             return;
         }
         let sequence = self.sequences.allocate();
-        self.pending_dump = Some(PendingDumpRequest {
+        self.pending_dump = Some(PendingDumpRequest::Link {
+            request: LinkDumpRequest::all(sequence),
+            retry_at: now,
+        });
+    }
+
+    fn schedule_address_dump(&mut self, now: Instant) {
+        debug_assert!(!self.disabled);
+        debug_assert!(self.pending_dump.is_none());
+        let sequence = self.sequences.allocate();
+        self.pending_dump = Some(PendingDumpRequest::Address {
             request: AddressDumpRequest::all(sequence),
             retry_at: now,
         });
@@ -445,11 +513,17 @@ impl<T: RouteNetworkInventoryTransport> RouteNetworkInventoryDriverInner<T> {
         let Some(pending) = self.pending_dump else {
             return Ok(());
         };
-        if now < pending.retry_at {
+        if now < pending.retry_at() {
             return Ok(());
         }
 
-        let sent = match self.transport.send_address_dump(&pending.request) {
+        let send_result = match pending {
+            PendingDumpRequest::Link { request, .. } => self.transport.send_link_dump(&request),
+            PendingDumpRequest::Address { request, .. } => {
+                self.transport.send_address_dump(&request)
+            }
+        };
+        let sent = match send_result {
             Ok(sent) => sent,
             Err(error) => {
                 let _ = self.observer.note_dump_request_failure();
@@ -461,13 +535,18 @@ impl<T: RouteNetworkInventoryTransport> RouteNetworkInventoryDriverInner<T> {
         match sent {
             NetlinkSendOutcome::Sent => {
                 self.pending_dump = None;
-                self.observer.begin_dump(pending.request.sequence(), now);
+                match pending {
+                    PendingDumpRequest::Link { request, .. } => {
+                        self.observer.begin_link_dump(request.sequence(), now);
+                    }
+                    PendingDumpRequest::Address { request, .. } => {
+                        self.observer.begin_address_dump(request.sequence(), now);
+                    }
+                }
             }
             NetlinkSendOutcome::WouldBlock => {
-                self.pending_dump = Some(PendingDumpRequest {
-                    retry_at: deadline_after(now, self.dump_send_retry),
-                    ..pending
-                });
+                self.pending_dump =
+                    Some(pending.with_retry_at(deadline_after(now, self.dump_send_retry)));
             }
         }
         Ok(())
@@ -561,8 +640,11 @@ mod tests {
     use crate::address_sync::AddressEventPolicy;
 
     const NLMSG_DONE: u16 = 3;
+    const RTM_NEWLINK: u16 = 16;
     const RTM_NEWADDR: u16 = 20;
+    const AF_UNSPEC: u8 = 0;
     const AF_INET: u8 = 2;
+    const IFLA_IFNAME: u16 = 3;
     const IFA_ADDRESS: u16 = 1;
 
     #[test]
@@ -570,26 +652,42 @@ mod tests {
         let budget = RouteNetworkInventoryWorkBudget::default();
 
         assert_eq!(budget.max_datagrams(), 16);
-        assert_eq!(budget.max_bytes(), 256 * 1024);
+        assert_eq!(budget.max_bytes(), 1024 * 1024);
         assert_eq!(
             receive_allowance(budget, &DriveProgress::default())
                 .unwrap()
                 .get(),
             4
         );
-        assert!(RouteNetworkInventoryWorkBudget::new(0, 256 * 1024).is_none());
-        assert!(RouteNetworkInventoryWorkBudget::new(1, 64 * 1024 - 1).is_none());
+        assert!(RouteNetworkInventoryWorkBudget::new(0, 1024 * 1024).is_none());
+        assert!(RouteNetworkInventoryWorkBudget::new(1, ROUTE_DATAGRAM_CAPACITY - 1).is_none());
+    }
+
+    #[test]
+    fn sender_multicast_groups_are_authoritative_for_datagram_origin() {
+        assert_eq!(
+            inventory_datagram_origin(0),
+            InventoryDatagramOrigin::Response
+        );
+        assert_eq!(
+            inventory_datagram_origin(0x40),
+            InventoryDatagramOrigin::Notification
+        );
     }
 
     #[test]
     fn initial_dump_is_sent_once_and_complete_batch_publishes_source() {
         let now = Instant::now();
         let mut fake = FakeTransport::default();
-        fake.receives.push_back(Ok(batch([done(1)])));
+        let link = link(1);
+        let address = address(2);
+        let expected_bytes = link.len() + address.len() + 2 * 16;
+        fake.receives.push_back(Ok(batch([link, done(1)])));
+        fake.receives.push_back(Ok(batch([address, done(2)])));
         let (mut driver, source) = start(fake, now);
 
         assert!(source.snapshot().is_none());
-        assert_eq!(driver.transport.sent_sequences, [1]);
+        assert_eq!(driver.transport.sent_requests, [TestDumpRequest::Link(1)]);
         assert_eq!(driver.transport.send_saw_subscription, [true]);
 
         let report = driver
@@ -600,11 +698,96 @@ mod tests {
             report.disposition(),
             RouteNetworkInventoryDriveDisposition::Progress
         );
-        assert_eq!(report.datagrams(), 1);
-        assert_eq!(report.bytes(), 16);
+        assert_eq!(report.datagrams(), 4);
+        assert_eq!(report.bytes(), expected_bytes);
         assert_eq!(report.published_epoch(), Some(NetworkEpoch::INITIAL));
+        assert_eq!(report.resync_fault(), None);
         assert_eq!(driver.transport.receive_limits[0], 4);
-        assert!(source.snapshot().is_some());
+        assert_eq!(
+            driver.transport.sent_requests,
+            [TestDumpRequest::Link(1), TestDumpRequest::Address(2)]
+        );
+        let snapshot = source.snapshot().expect("combined driver snapshot");
+        assert_eq!(snapshot.links().len(), 1);
+        assert_eq!(snapshot.links()[0].name().as_bytes(), b"wlan0");
+        assert_eq!(snapshot.addresses().len(), 1);
+    }
+
+    #[test]
+    fn address_send_would_block_retries_same_sequence_and_retains_link_facts() {
+        let now = Instant::now();
+        let mut fake = FakeTransport::default();
+        fake.sends.push_back(Ok(NetlinkSendOutcome::Sent));
+        fake.sends.push_back(Ok(NetlinkSendOutcome::WouldBlock));
+        fake.receives.push_back(Ok(batch([link(1), done(1)])));
+        fake.receives
+            .push_back(Ok(RouteNetworkInventoryReceiveOutcome::WouldBlock));
+        let (mut driver, source) = start(fake, now);
+
+        let first = driver
+            .drive_ready(RouteNetworkInventoryWorkBudget::default(), now)
+            .expect("complete link phase and defer address send");
+        let retry_at = now + DEFAULT_DUMP_SEND_RETRY;
+        assert_eq!(first.published_epoch(), None);
+        assert_eq!(first.resync_fault(), None);
+        assert!(source.snapshot().is_none());
+        assert_eq!(driver.next_deadline(), Some(retry_at));
+        assert_eq!(
+            driver.transport.sent_requests,
+            [TestDumpRequest::Link(1), TestDumpRequest::Address(2)]
+        );
+
+        driver.transport.receives.push_back(Ok(batch([done(2)])));
+        driver.drive_due(retry_at).expect("retry address send");
+        assert_eq!(
+            driver.transport.sent_requests,
+            [
+                TestDumpRequest::Link(1),
+                TestDumpRequest::Address(2),
+                TestDumpRequest::Address(2),
+            ]
+        );
+
+        let published = driver
+            .drive_ready(RouteNetworkInventoryWorkBudget::default(), retry_at)
+            .expect("complete address phase");
+        assert_eq!(published.published_epoch(), Some(NetworkEpoch::INITIAL));
+        let snapshot = source.snapshot().expect("retained link facts");
+        assert_eq!(snapshot.links().len(), 1);
+        assert_eq!(snapshot.links()[0].name().as_bytes(), b"wlan0");
+    }
+
+    #[test]
+    fn fault_while_address_send_is_pending_restarts_from_fresh_link_sequence() {
+        let now = Instant::now();
+        let mut fake = FakeTransport::default();
+        fake.sends.push_back(Ok(NetlinkSendOutcome::Sent));
+        fake.sends.push_back(Ok(NetlinkSendOutcome::WouldBlock));
+        fake.receives.push_back(Ok(batch([done(1)])));
+        fake.receives
+            .push_back(Ok(RouteNetworkInventoryReceiveOutcome::Loss(
+                ObserverLoss::Enobufs,
+            )));
+        let (mut driver, source) = start(fake, now);
+
+        let report = driver
+            .drive_ready(RouteNetworkInventoryWorkBudget::default(), now)
+            .expect("loss replaces pending address request");
+
+        assert!(source.snapshot().is_none());
+        assert_eq!(
+            report.resync_fault(),
+            Some(ObserverFault::ReceiveLoss(ObserverLoss::Enobufs))
+        );
+        assert_eq!(
+            driver.transport.sent_requests,
+            [
+                TestDumpRequest::Link(1),
+                TestDumpRequest::Address(2),
+                TestDumpRequest::Link(3),
+            ]
+        );
+        assert_eq!(driver.next_deadline(), Some(now + test_dump_timeout()));
     }
 
     #[test]
@@ -617,6 +800,7 @@ mod tests {
             let now = Instant::now();
             let mut fake = FakeTransport::default();
             fake.receives.push_back(Ok(batch([done(1)])));
+            fake.receives.push_back(Ok(batch([done(2)])));
             fake.receives
                 .push_back(Ok(RouteNetworkInventoryReceiveOutcome::WouldBlock));
             fake.receives
@@ -631,7 +815,14 @@ mod tests {
                 .expect("recover receive loss");
 
             assert!(source.snapshot().is_none());
-            assert_eq!(driver.transport.sent_sequences, [1, 2]);
+            assert_eq!(
+                driver.transport.sent_requests,
+                [
+                    TestDumpRequest::Link(1),
+                    TestDumpRequest::Address(2),
+                    TestDumpRequest::Link(3),
+                ]
+            );
             assert_eq!(
                 report.resync_fault(),
                 Some(ObserverFault::ReceiveLoss(loss))
@@ -651,7 +842,10 @@ mod tests {
             .expect("drive foreign sequence");
 
         assert!(source.snapshot().is_none());
-        assert_eq!(driver.transport.sent_sequences, [1, 2]);
+        assert_eq!(
+            driver.transport.sent_requests,
+            [TestDumpRequest::Link(1), TestDumpRequest::Link(2)]
+        );
         assert_eq!(
             report.resync_fault(),
             Some(ObserverFault::ForeignSequence {
@@ -670,7 +864,7 @@ mod tests {
         let (mut driver, source) = start(fake, now);
         let retry_at = now + DEFAULT_DUMP_SEND_RETRY;
 
-        assert_eq!(driver.transport.sent_sequences, [1]);
+        assert_eq!(driver.transport.sent_requests, [TestDumpRequest::Link(1)]);
         assert_eq!(driver.next_deadline(), Some(retry_at));
         assert_eq!(
             driver
@@ -679,13 +873,16 @@ mod tests {
                 .disposition(),
             RouteNetworkInventoryDriveDisposition::Idle
         );
-        assert_eq!(driver.transport.sent_sequences, [1]);
+        assert_eq!(driver.transport.sent_requests, [TestDumpRequest::Link(1)]);
 
         driver.drive_due(retry_at).expect("retry dump send");
         driver
             .drive_due(retry_at)
             .expect("same instant cannot resend active dump");
-        assert_eq!(driver.transport.sent_sequences, [1, 1]);
+        assert_eq!(
+            driver.transport.sent_requests,
+            [TestDumpRequest::Link(1), TestDumpRequest::Link(1)]
+        );
         assert!(source.snapshot().is_none());
         assert_eq!(driver.next_deadline(), Some(retry_at + test_dump_timeout()));
     }
@@ -695,6 +892,7 @@ mod tests {
         let now = Instant::now();
         let mut fake = FakeTransport::default();
         fake.receives.push_back(Ok(batch([done(1)])));
+        fake.receives.push_back(Ok(batch([done(2)])));
         fake.receives
             .push_back(Ok(RouteNetworkInventoryReceiveOutcome::WouldBlock));
         let large = decoded_batch(
@@ -725,6 +923,7 @@ mod tests {
         let now = Instant::now();
         let mut fake = FakeTransport::default();
         fake.receives.push_back(Ok(batch([done(1)])));
+        fake.receives.push_back(Ok(batch([done(2)])));
         let (mut driver, source) = start(fake, now);
         driver
             .drive_ready(RouteNetworkInventoryWorkBudget::default(), now)
@@ -739,6 +938,7 @@ mod tests {
 
         let mut fake = FakeTransport::default();
         fake.receives.push_back(Ok(batch([done(1)])));
+        fake.receives.push_back(Ok(batch([done(2)])));
         let (mut dropped, dropped_source) = start(fake, now);
         dropped
             .drive_ready(RouteNetworkInventoryWorkBudget::default(), now)
@@ -752,8 +952,9 @@ mod tests {
     fn permanent_transport_error_is_returned_after_source_is_staled() {
         let now = Instant::now();
         let mut fake = FakeTransport::default();
-        fake.receives.push_back(Ok(batch([address(1)])));
         fake.receives.push_back(Ok(batch([done(1)])));
+        fake.receives.push_back(Ok(batch([address(2)])));
+        fake.receives.push_back(Ok(batch([done(2)])));
         fake.receives
             .push_back(Ok(RouteNetworkInventoryReceiveOutcome::WouldBlock));
         fake.receives
@@ -794,6 +995,7 @@ mod tests {
     fn test_observer_config() -> ObserverConfig {
         ObserverConfig::new(
             8,
+            MAX_RACE_QUEUE_BYTES,
             test_dump_timeout(),
             Duration::from_millis(10),
             Duration::from_millis(20),
@@ -805,11 +1007,17 @@ mod tests {
         Duration::from_millis(100)
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum TestDumpRequest {
+        Link(u32),
+        Address(u32),
+    }
+
     struct FakeTransport {
         subscribed: bool,
         sends: VecDeque<Result<NetlinkSendOutcome, PlatformError>>,
         receives: VecDeque<Result<RouteNetworkInventoryReceiveOutcome, PlatformError>>,
-        sent_sequences: Vec<u32>,
+        sent_requests: Vec<TestDumpRequest>,
         send_saw_subscription: Vec<bool>,
         receive_limits: Vec<usize>,
     }
@@ -820,7 +1028,7 @@ mod tests {
                 subscribed: true,
                 sends: VecDeque::new(),
                 receives: VecDeque::new(),
-                sent_sequences: Vec::new(),
+                sent_requests: Vec::new(),
                 send_saw_subscription: Vec::new(),
                 receive_limits: Vec::new(),
             }
@@ -828,11 +1036,24 @@ mod tests {
     }
 
     impl RouteNetworkInventoryTransport for FakeTransport {
+        fn send_link_dump(
+            &mut self,
+            request: &LinkDumpRequest,
+        ) -> Result<NetlinkSendOutcome, PlatformError> {
+            self.sent_requests
+                .push(TestDumpRequest::Link(request.sequence().get()));
+            self.send_saw_subscription.push(self.subscribed);
+            self.sends
+                .pop_front()
+                .unwrap_or(Ok(NetlinkSendOutcome::Sent))
+        }
+
         fn send_address_dump(
             &mut self,
             request: &AddressDumpRequest,
         ) -> Result<NetlinkSendOutcome, PlatformError> {
-            self.sent_sequences.push(request.sequence().get());
+            self.sent_requests
+                .push(TestDumpRequest::Address(request.sequence().get()));
             self.send_saw_subscription.push(self.subscribed);
             self.sends
                 .pop_front()
@@ -859,11 +1080,28 @@ mod tests {
         datagrams: [Vec<u8>; N],
         bytes: usize,
     ) -> RouteNetworkInventoryReceiveOutcome {
-        let decoder = RtnetlinkAddressEventDecoder::new(AddressEventPolicy::new(true));
+        let link_decoder = RtnetlinkLinkEventDecoder::new();
+        let address_decoder = RtnetlinkAddressEventDecoder::new(AddressEventPolicy::new(true));
         RouteNetworkInventoryReceiveOutcome::Batch(DecodedRouteNetworkInventoryBatch {
             datagrams: datagrams
                 .into_iter()
-                .map(|datagram| decoder.decode_datagram(&datagram))
+                .map(|datagram| {
+                    let origin = if datagram
+                        .get(8..12)
+                        .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+                        .is_some_and(|sequence| u32::from_ne_bytes(sequence) == 0)
+                    {
+                        InventoryDatagramOrigin::Notification
+                    } else {
+                        InventoryDatagramOrigin::Response
+                    };
+                    InventoryDatagram::from_decoded(
+                        link_decoder.decode_datagram(&datagram),
+                        address_decoder.decode_datagram(&datagram),
+                        origin,
+                        datagram.len(),
+                    )
+                })
                 .collect(),
             bytes,
         })
@@ -885,6 +1123,24 @@ mod tests {
         payload.extend(IFA_ADDRESS.to_ne_bytes());
         payload.extend(address);
         netlink_message(RTM_NEWADDR, sequence, &payload)
+    }
+
+    fn link(sequence: u32) -> Vec<u8> {
+        let mut payload = vec![AF_UNSPEC, 0];
+        payload.extend(1_u16.to_ne_bytes());
+        payload.extend(7_i32.to_ne_bytes());
+        payload.extend(1_u32.to_ne_bytes());
+        payload.extend(u32::MAX.to_ne_bytes());
+        append_attribute(&mut payload, IFLA_IFNAME, b"wlan0\0");
+        netlink_message(RTM_NEWLINK, sequence, &payload)
+    }
+
+    fn append_attribute(message: &mut Vec<u8>, attribute_type: u16, value: &[u8]) {
+        let length = 4 + value.len();
+        message.extend((length as u16).to_ne_bytes());
+        message.extend(attribute_type.to_ne_bytes());
+        message.extend(value);
+        message.resize((message.len() + 3) & !3, 0);
     }
 
     fn netlink_message(message_type: u16, sequence: u32, payload: &[u8]) -> Vec<u8> {

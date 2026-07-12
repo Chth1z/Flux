@@ -5,21 +5,23 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use flux_core::{
-    InterfaceAddressRecord, InterfaceIndex, NetworkEpoch, NetworkInventory, NetworkInventoryError,
-    NetworkInventoryTracker,
+    InterfaceAddressRecord, InterfaceIndex, InterfaceLinkRecord, NetworkEpoch, NetworkInventory,
+    NetworkInventoryError, NetworkInventoryTracker,
 };
 
 use crate::address_sync::{
     AddressDatagram, AddressEventDecodeError, AddressEventKind, InterfaceAddressEvent,
 };
+use crate::netlink::NetlinkMessageHeader;
+use crate::netlink::link::{InterfaceLinkEvent, LinkDatagram, LinkEventDecodeError};
 
 pub(crate) mod driver;
 
 /// A cloneable view of the latest complete network inventory.
 ///
 /// Clones share immutable snapshots. `snapshot` returns `None` before the
-/// first loss-free dump and whenever loss or an in-progress resynchronization
-/// makes the retained inventory stale.
+/// first loss-free link/address transaction and whenever loss or an in-progress
+/// resynchronization makes the retained inventory stale.
 #[derive(Clone, Debug)]
 pub struct NetworkInventorySource {
     shared: Arc<SharedInventory>,
@@ -37,11 +39,93 @@ struct SharedInventory {
     current: RwLock<Option<Arc<NetworkInventory>>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InventoryDatagramOrigin {
+    Response,
+    Notification,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InventoryDecodeError {
+    Link(LinkEventDecodeError),
+    Address(AddressEventDecodeError),
+    MetadataMismatch,
+    NotificationCompletion,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct InventoryDatagram {
+    origin: InventoryDatagramOrigin,
+    sequence: Option<u32>,
+    completion: Option<NetlinkMessageHeader>,
+    link_events: Vec<InterfaceLinkEvent>,
+    address_events: Vec<InterfaceAddressEvent>,
+    wire_bytes: usize,
+}
+
+impl InventoryDatagram {
+    pub(crate) fn from_decoded(
+        link: Result<LinkDatagram, LinkEventDecodeError>,
+        address: Result<AddressDatagram, AddressEventDecodeError>,
+        origin: InventoryDatagramOrigin,
+        wire_bytes: usize,
+    ) -> Result<Self, InventoryDecodeError> {
+        let link = link.map_err(InventoryDecodeError::Link)?;
+        let address = address.map_err(InventoryDecodeError::Address)?;
+        if link.sequence() != address.sequence() || link.completion() != address.completion() {
+            return Err(InventoryDecodeError::MetadataMismatch);
+        }
+        if origin == InventoryDatagramOrigin::Notification && link.completion().is_some() {
+            return Err(InventoryDecodeError::NotificationCompletion);
+        }
+        Ok(Self {
+            origin,
+            sequence: link.sequence(),
+            completion: link.completion(),
+            link_events: link.events().to_vec(),
+            address_events: address.events().to_vec(),
+            wire_bytes,
+        })
+    }
+
+    #[must_use]
+    pub(crate) const fn origin(&self) -> InventoryDatagramOrigin {
+        self.origin
+    }
+
+    #[must_use]
+    pub(crate) const fn sequence(&self) -> Option<u32> {
+        self.sequence
+    }
+
+    #[must_use]
+    pub(crate) const fn completion(&self) -> Option<NetlinkMessageHeader> {
+        self.completion
+    }
+
+    #[must_use]
+    pub(crate) fn link_events(&self) -> &[InterfaceLinkEvent] {
+        &self.link_events
+    }
+
+    #[must_use]
+    pub(crate) fn address_events(&self) -> &[InterfaceAddressEvent] {
+        &self.address_events
+    }
+
+    #[must_use]
+    pub(crate) const fn wire_bytes(&self) -> usize {
+        self.wire_bytes
+    }
+}
+
 pub(crate) const MAX_RACE_QUEUE_CAPACITY: usize = 4_096;
+pub(crate) const MAX_RACE_QUEUE_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ObserverConfig {
     race_queue_capacity: usize,
+    race_queue_byte_capacity: usize,
     dump_timeout: Duration,
     quiet_debounce: Duration,
     maximum_debounce: Duration,
@@ -50,6 +134,7 @@ pub(crate) struct ObserverConfig {
 impl ObserverConfig {
     pub(crate) fn new(
         race_queue_capacity: usize,
+        race_queue_byte_capacity: usize,
         dump_timeout: Duration,
         quiet_debounce: Duration,
         maximum_debounce: Duration,
@@ -57,6 +142,11 @@ impl ObserverConfig {
         if !(1..=MAX_RACE_QUEUE_CAPACITY).contains(&race_queue_capacity) {
             return Err(ObserverConfigError::InvalidRaceQueueCapacity {
                 actual: race_queue_capacity,
+            });
+        }
+        if !(1..=MAX_RACE_QUEUE_BYTES).contains(&race_queue_byte_capacity) {
+            return Err(ObserverConfigError::InvalidRaceQueueByteCapacity {
+                actual: race_queue_byte_capacity,
             });
         }
         if dump_timeout.is_zero() {
@@ -73,6 +163,7 @@ impl ObserverConfig {
         }
         Ok(Self {
             race_queue_capacity,
+            race_queue_byte_capacity,
             dump_timeout,
             quiet_debounce,
             maximum_debounce,
@@ -83,6 +174,7 @@ impl ObserverConfig {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ObserverConfigError {
     InvalidRaceQueueCapacity { actual: usize },
+    InvalidRaceQueueByteCapacity { actual: usize },
     ZeroDumpTimeout,
     ZeroQuietDebounce,
     ZeroMaximumDebounce,
@@ -92,7 +184,7 @@ pub(crate) enum ObserverConfigError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ObserverFault {
     MissingSequence,
-    Decode(AddressEventDecodeError),
+    Decode(InventoryDecodeError),
     ForeignSequence {
         expected: Option<u32>,
         actual: Option<u32>,
@@ -100,17 +192,24 @@ pub(crate) enum ObserverFault {
     RaceQueueOverflow {
         capacity: usize,
     },
+    RaceQueueByteOverflow {
+        capacity: usize,
+    },
+    ConflictingLinkDumpFact {
+        interface_index: InterfaceIndex,
+    },
     ConflictingDumpFact {
         first: InterfaceAddressRecord,
         first_kind: AddressEventKind,
         second: InterfaceAddressRecord,
         second_kind: AddressEventKind,
     },
+    UnexpectedAddressEventInLinkDump,
+    UnexpectedLinkEventInAddressDump,
     ReceiveLoss(ObserverLoss),
     DumpRequestFailed,
     DumpTimeout,
     DumpMessageAfterCompletion,
-    EventWithoutCompleteSnapshot,
     Inventory(NetworkInventoryError),
 }
 
@@ -118,6 +217,7 @@ pub(crate) enum ObserverFault {
 pub(crate) enum ObserverDriveOutcome {
     Idle,
     Published(NetworkEpoch),
+    RequestAddressDump,
     RequestDump(ObserverFault),
 }
 
@@ -156,27 +256,48 @@ impl NetworkInventoryObserver {
         self.source.clone()
     }
 
-    /// Starts one address inventory transaction.
-    ///
-    /// `expected_sequence` must identify a single `AF_UNSPEC RTM_GETADDR`
-    /// dump. Splitting IPv4 and IPv6 across independently completable dumps
-    /// would permit a half-inventory publication and is intentionally not
-    /// represented by this interface.
-    pub(crate) fn begin_dump(&mut self, expected_sequence: NonZeroU32, now: Instant) {
+    pub(crate) fn begin_link_dump(&mut self, expected_sequence: NonZeroU32, now: Instant) {
         self.mark_unsynchronized();
-        self.dump = Some(DumpState {
+        self.dump = Some(DumpState::Link(LinkDumpState {
             expected_sequence,
             deadline: deadline_after(now, self.config.dump_timeout),
-            facts: BTreeMap::new(),
+            links: BTreeMap::new(),
             seen: BTreeMap::new(),
-            raced_events: VecDeque::with_capacity(self.config.race_queue_capacity),
-        });
+            raced: RacedEvents::default(),
+        }));
+    }
+
+    pub(crate) fn begin_address_dump(&mut self, expected_sequence: NonZeroU32, now: Instant) {
+        let Some(DumpState::AwaitingAddress(waiting)) = self.dump.take() else {
+            panic!("address dump requires a completed link dump");
+        };
+        self.dump = Some(DumpState::Address(AddressDumpState {
+            expected_sequence,
+            deadline: deadline_after(now, self.config.dump_timeout),
+            links: waiting.links,
+            addresses: BTreeMap::new(),
+            seen: BTreeMap::new(),
+            raced: waiting.raced,
+        }));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn begin_dump(&mut self, expected_sequence: NonZeroU32, now: Instant) {
+        self.mark_unsynchronized();
+        self.dump = Some(DumpState::Address(AddressDumpState {
+            expected_sequence,
+            deadline: deadline_after(now, self.config.dump_timeout),
+            links: BTreeMap::new(),
+            addresses: BTreeMap::new(),
+            seen: BTreeMap::new(),
+            raced: RacedEvents::default(),
+        }));
     }
 
     #[cfg(test)]
     pub(crate) fn consume(
         &mut self,
-        datagram: Result<AddressDatagram, AddressEventDecodeError>,
+        datagram: Result<InventoryDatagram, InventoryDecodeError>,
         now: Instant,
     ) -> ObserverDriveOutcome {
         self.consume_batch(std::iter::once(datagram), now)
@@ -184,15 +305,15 @@ impl NetworkInventoryObserver {
 
     /// Ingests one complete socket receive batch as an atomic publication unit.
     ///
-    /// A later fault invalidates every earlier datagram in the batch, and dump
-    /// completion or due debounce work is published only after the entire
-    /// iterator succeeds.
+    /// A later fault invalidates every earlier datagram in the batch. LINK
+    /// completion advances to the ADDRESS request only after the whole batch is
+    /// valid, and ADDRESS completion publishes only after the same check.
     pub(crate) fn consume_batch(
         &mut self,
-        datagrams: impl IntoIterator<Item = Result<AddressDatagram, AddressEventDecodeError>>,
+        datagrams: impl IntoIterator<Item = Result<InventoryDatagram, InventoryDecodeError>>,
         now: Instant,
     ) -> ObserverDriveOutcome {
-        if self.dump.as_ref().is_some_and(|dump| now >= dump.deadline) {
+        if self.dump_deadline().is_some_and(|deadline| now >= deadline) {
             return self.invalidate(ObserverFault::DumpTimeout);
         }
 
@@ -203,63 +324,31 @@ impl NetworkInventoryObserver {
             }
         }
         if dump_completed {
-            return self.complete_dump();
+            return self.complete_dump_phase(now);
         }
         self.poll(now)
     }
 
     fn ingest_datagram(
         &mut self,
-        datagram: Result<AddressDatagram, AddressEventDecodeError>,
+        datagram: Result<InventoryDatagram, InventoryDecodeError>,
         now: Instant,
         dump_completed: &mut bool,
     ) -> Result<(), ObserverFault> {
-        let datagram = match datagram {
-            Ok(datagram) => datagram,
-            Err(error) => return Err(ObserverFault::Decode(error)),
-        };
+        let datagram = datagram.map_err(ObserverFault::Decode)?;
         if datagram.sequence().is_none() {
             return Err(ObserverFault::MissingSequence);
         }
-        let expected = self.dump.as_ref().map(|dump| dump.expected_sequence.get());
-        if datagram.sequence() == Some(0) && expected.is_some() {
-            if datagram.completion().is_some() {
-                return Err(ObserverFault::ForeignSequence {
-                    expected,
-                    actual: datagram.sequence(),
-                });
+        if datagram.origin() == InventoryDatagramOrigin::Notification {
+            if let Some(dump) = self.dump.as_mut() {
+                dump.raced_mut().push(&datagram, self.config)?;
+            } else if self.synchronized {
+                self.stage_live_events(datagram.link_events(), datagram.address_events(), now);
             }
-            let dump = self.dump.as_mut().expect("active dump was observed above");
-            let Some(remaining) = self
-                .config
-                .race_queue_capacity
-                .checked_sub(dump.raced_events.len())
-            else {
-                return Err(ObserverFault::RaceQueueOverflow {
-                    capacity: self.config.race_queue_capacity,
-                });
-            };
-            if datagram.events().len() > remaining {
-                return Err(ObserverFault::RaceQueueOverflow {
-                    capacity: self.config.race_queue_capacity,
-                });
-            }
-            dump.raced_events.extend(datagram.events().iter().copied());
             return Ok(());
         }
-        if expected.is_none() && datagram.sequence() == Some(0) {
-            if datagram.completion().is_some() {
-                return Err(ObserverFault::ForeignSequence {
-                    expected,
-                    actual: datagram.sequence(),
-                });
-            }
-            if !self.synchronized {
-                return Err(ObserverFault::EventWithoutCompleteSnapshot);
-            }
-            self.stage_live_events(datagram.events(), now);
-            return Ok(());
-        }
+
+        let expected = self.dump.as_ref().and_then(DumpState::expected_sequence);
         if datagram.sequence() != expected {
             return Err(ObserverFault::ForeignSequence {
                 expected,
@@ -273,9 +362,27 @@ impl NetworkInventoryObserver {
         let dump = self
             .dump
             .as_mut()
-            .expect("matching sequence requires a dump");
-        for event in datagram.events() {
-            apply_dump_event(&mut dump.facts, &mut dump.seen, *event)?;
+            .expect("matching response sequence requires an active dump");
+        match dump {
+            DumpState::Link(link) => {
+                if !datagram.address_events().is_empty() {
+                    return Err(ObserverFault::UnexpectedAddressEventInLinkDump);
+                }
+                for event in datagram.link_events() {
+                    apply_link_dump_event(&mut link.links, &mut link.seen, event.clone())?;
+                }
+            }
+            DumpState::Address(address) => {
+                if !datagram.link_events().is_empty() {
+                    return Err(ObserverFault::UnexpectedLinkEventInAddressDump);
+                }
+                for event in datagram.address_events() {
+                    apply_address_dump_event(&mut address.addresses, &mut address.seen, *event)?;
+                }
+            }
+            DumpState::AwaitingAddress(_) => {
+                unreachable!("an inter-phase wait has no matching response sequence")
+            }
         }
         if datagram.completion().is_some() {
             *dump_completed = true;
@@ -283,24 +390,41 @@ impl NetworkInventoryObserver {
         Ok(())
     }
 
-    fn complete_dump(&mut self) -> ObserverDriveOutcome {
-        let mut completed = self.dump.take().expect("matching dump is active");
-        for event in completed.raced_events {
-            apply_event(&mut completed.facts, event);
+    fn complete_dump_phase(&mut self, now: Instant) -> ObserverDriveOutcome {
+        match self.dump.take().expect("matching dump is active") {
+            DumpState::Link(link) => {
+                self.dump = Some(DumpState::AwaitingAddress(AddressWaitState {
+                    deadline: deadline_after(now, self.config.dump_timeout),
+                    links: link.links,
+                    raced: link.raced,
+                }));
+                ObserverDriveOutcome::RequestAddressDump
+            }
+            DumpState::Address(mut address) => {
+                for event in address.raced.links {
+                    apply_link_event(&mut address.links, event);
+                }
+                for event in address.raced.addresses {
+                    apply_address_event(&mut address.addresses, event);
+                }
+                self.publish(CompleteFacts {
+                    links: address.links,
+                    addresses: address.addresses,
+                })
+            }
+            DumpState::AwaitingAddress(_) => {
+                unreachable!("an inter-phase wait cannot complete a dump")
+            }
         }
-        let facts = completed.facts;
-        self.publish(facts)
     }
 
     pub(crate) fn next_deadline(&self) -> Option<Instant> {
-        self.dump
-            .as_ref()
-            .map(|dump| dump.deadline)
+        self.dump_deadline()
             .or_else(|| self.pending.as_ref().map(PendingState::next_deadline))
     }
 
     pub(crate) fn poll(&mut self, now: Instant) -> ObserverDriveOutcome {
-        if self.dump.as_ref().is_some_and(|dump| now >= dump.deadline) {
+        if self.dump_deadline().is_some_and(|deadline| now >= deadline) {
             return self.invalidate(ObserverFault::DumpTimeout);
         }
         let Some(pending) = self.pending.as_ref() else {
@@ -330,13 +454,17 @@ impl NetworkInventoryObserver {
         self.mark_unsynchronized();
     }
 
-    fn publish(
-        &mut self,
-        facts: BTreeMap<AddressIdentity, InterfaceAddressRecord>,
-    ) -> ObserverDriveOutcome {
+    fn dump_deadline(&self) -> Option<Instant> {
+        self.dump.as_ref().map(DumpState::deadline)
+    }
+
+    fn publish(&mut self, facts: CompleteFacts) -> ObserverDriveOutcome {
         let previous_epoch = self.tracker.current().map(NetworkInventory::epoch);
         let was_synchronized = self.synchronized;
-        let inventory = match self.tracker.publish_complete(facts.into_values()) {
+        let inventory = match self
+            .tracker
+            .publish_complete(facts.links.into_values(), facts.addresses.into_values())
+        {
             Ok(inventory) => Arc::new(inventory.clone()),
             Err(error) => return self.invalidate(ObserverFault::Inventory(error)),
         };
@@ -350,8 +478,13 @@ impl NetworkInventoryObserver {
         }
     }
 
-    fn stage_live_events(&mut self, events: &[InterfaceAddressEvent], now: Instant) {
-        if events.is_empty() {
+    fn stage_live_events(
+        &mut self,
+        link_events: &[InterfaceLinkEvent],
+        address_events: &[InterfaceAddressEvent],
+        now: Instant,
+    ) {
+        if link_events.is_empty() && address_events.is_empty() {
             return;
         }
 
@@ -363,8 +496,11 @@ impl NetworkInventoryObserver {
         let mut facts = previous_pending
             .map(|pending| pending.facts)
             .unwrap_or_else(|| facts_from_inventory(self.tracker.current()));
-        for event in events {
-            apply_event(&mut facts, *event);
+        for event in link_events {
+            apply_link_event(&mut facts.links, event.clone());
+        }
+        for event in address_events {
+            apply_address_event(&mut facts.addresses, *event);
         }
         if facts_match_inventory(&facts, self.tracker.current()) {
             self.pending = None;
@@ -392,17 +528,113 @@ impl NetworkInventoryObserver {
 }
 
 #[derive(Debug)]
-struct DumpState {
+enum DumpState {
+    Link(LinkDumpState),
+    AwaitingAddress(AddressWaitState),
+    Address(AddressDumpState),
+}
+
+impl DumpState {
+    fn deadline(&self) -> Instant {
+        match self {
+            Self::Link(link) => link.deadline,
+            Self::AwaitingAddress(waiting) => waiting.deadline,
+            Self::Address(address) => address.deadline,
+        }
+    }
+
+    fn expected_sequence(&self) -> Option<u32> {
+        match self {
+            Self::Link(link) => Some(link.expected_sequence.get()),
+            Self::AwaitingAddress(_) => None,
+            Self::Address(address) => Some(address.expected_sequence.get()),
+        }
+    }
+
+    fn raced_mut(&mut self) -> &mut RacedEvents {
+        match self {
+            Self::Link(link) => &mut link.raced,
+            Self::AwaitingAddress(waiting) => &mut waiting.raced,
+            Self::Address(address) => &mut address.raced,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct LinkDumpState {
     expected_sequence: NonZeroU32,
     deadline: Instant,
-    facts: BTreeMap<AddressIdentity, InterfaceAddressRecord>,
+    links: BTreeMap<InterfaceIndex, InterfaceLinkRecord>,
+    seen: BTreeMap<InterfaceIndex, InterfaceLinkEvent>,
+    raced: RacedEvents,
+}
+
+#[derive(Debug)]
+struct AddressWaitState {
+    deadline: Instant,
+    links: BTreeMap<InterfaceIndex, InterfaceLinkRecord>,
+    raced: RacedEvents,
+}
+
+#[derive(Debug)]
+struct AddressDumpState {
+    expected_sequence: NonZeroU32,
+    deadline: Instant,
+    links: BTreeMap<InterfaceIndex, InterfaceLinkRecord>,
+    addresses: BTreeMap<AddressIdentity, InterfaceAddressRecord>,
     seen: BTreeMap<AddressIdentity, InterfaceAddressEvent>,
-    raced_events: VecDeque<InterfaceAddressEvent>,
+    raced: RacedEvents,
+}
+
+#[derive(Debug, Default)]
+struct RacedEvents {
+    links: VecDeque<InterfaceLinkEvent>,
+    addresses: VecDeque<InterfaceAddressEvent>,
+    event_count: usize,
+    wire_bytes: usize,
+}
+
+impl RacedEvents {
+    fn push(
+        &mut self,
+        datagram: &InventoryDatagram,
+        config: ObserverConfig,
+    ) -> Result<(), ObserverFault> {
+        let additional_events = datagram
+            .link_events()
+            .len()
+            .saturating_add(datagram.address_events().len());
+        if additional_events == 0 {
+            return Ok(());
+        }
+        if self.event_count.saturating_add(additional_events) > config.race_queue_capacity {
+            return Err(ObserverFault::RaceQueueOverflow {
+                capacity: config.race_queue_capacity,
+            });
+        }
+        if self.wire_bytes.saturating_add(datagram.wire_bytes()) > config.race_queue_byte_capacity {
+            return Err(ObserverFault::RaceQueueByteOverflow {
+                capacity: config.race_queue_byte_capacity,
+            });
+        }
+        self.links.extend(datagram.link_events().iter().cloned());
+        self.addresses
+            .extend(datagram.address_events().iter().copied());
+        self.event_count += additional_events;
+        self.wire_bytes += datagram.wire_bytes();
+        Ok(())
+    }
+}
+
+#[derive(Debug, Default)]
+struct CompleteFacts {
+    links: BTreeMap<InterfaceIndex, InterfaceLinkRecord>,
+    addresses: BTreeMap<AddressIdentity, InterfaceAddressRecord>,
 }
 
 #[derive(Debug)]
 struct PendingState {
-    facts: BTreeMap<AddressIdentity, InterfaceAddressRecord>,
+    facts: CompleteFacts,
     quiet_deadline: Instant,
     maximum_deadline: Instant,
 }
@@ -430,7 +662,77 @@ impl From<InterfaceAddressRecord> for AddressIdentity {
     }
 }
 
-fn apply_event(
+fn apply_link_event(
+    facts: &mut BTreeMap<InterfaceIndex, InterfaceLinkRecord>,
+    event: InterfaceLinkEvent,
+) {
+    match event {
+        InterfaceLinkEvent::Upsert(update) => {
+            let index = update.interface_index();
+            let merged = merge_link_record(facts.get(&index), &update);
+            facts.insert(index, merged);
+        }
+        InterfaceLinkEvent::Remove(interface_index) => {
+            facts.remove(&interface_index);
+        }
+    }
+}
+
+fn merge_link_record(
+    existing: Option<&InterfaceLinkRecord>,
+    update: &InterfaceLinkRecord,
+) -> InterfaceLinkRecord {
+    let mut merged = InterfaceLinkRecord::new(
+        update.interface_index(),
+        *update.name(),
+        update.hardware_type(),
+        update.flags(),
+    );
+    if let Some(mtu) = update
+        .mtu()
+        .or_else(|| existing.and_then(InterfaceLinkRecord::mtu))
+    {
+        merged = merged.with_mtu(mtu);
+    }
+    if let Some(state) = update
+        .operational_state()
+        .or_else(|| existing.and_then(InterfaceLinkRecord::operational_state))
+    {
+        merged = merged.with_operational_state(state);
+    }
+    if let Some(carrier) = update
+        .carrier()
+        .or_else(|| existing.and_then(InterfaceLinkRecord::carrier))
+    {
+        merged = merged.with_carrier(carrier);
+    }
+    if let Some(kind) = update
+        .kind()
+        .or_else(|| existing.and_then(InterfaceLinkRecord::kind))
+    {
+        merged = merged.with_kind(kind.clone());
+    }
+    merged
+}
+
+fn apply_link_dump_event(
+    facts: &mut BTreeMap<InterfaceIndex, InterfaceLinkRecord>,
+    seen: &mut BTreeMap<InterfaceIndex, InterfaceLinkEvent>,
+    event: InterfaceLinkEvent,
+) -> Result<(), ObserverFault> {
+    let interface_index = event.interface_index();
+    if let Some(first) = seen.get(&interface_index) {
+        if first != &event {
+            return Err(ObserverFault::ConflictingLinkDumpFact { interface_index });
+        }
+        return Ok(());
+    }
+    seen.insert(interface_index, event.clone());
+    apply_link_event(facts, event);
+    Ok(())
+}
+
+fn apply_address_event(
     facts: &mut BTreeMap<AddressIdentity, InterfaceAddressRecord>,
     event: InterfaceAddressEvent,
 ) {
@@ -446,7 +748,7 @@ fn apply_event(
     }
 }
 
-fn apply_dump_event(
+fn apply_address_dump_event(
     facts: &mut BTreeMap<AddressIdentity, InterfaceAddressRecord>,
     seen: &mut BTreeMap<AddressIdentity, InterfaceAddressEvent>,
     event: InterfaceAddressEvent,
@@ -465,7 +767,7 @@ fn apply_dump_event(
         return Ok(());
     }
     seen.insert(identity, event);
-    apply_event(facts, event);
+    apply_address_event(facts, event);
     Ok(())
 }
 
@@ -473,29 +775,30 @@ fn deadline_after(now: Instant, duration: Duration) -> Instant {
     now.checked_add(duration).unwrap_or(now)
 }
 
-fn facts_from_inventory(
-    inventory: Option<&NetworkInventory>,
-) -> BTreeMap<AddressIdentity, InterfaceAddressRecord> {
-    inventory
+fn facts_from_inventory(inventory: Option<&NetworkInventory>) -> CompleteFacts {
+    let links = inventory
+        .into_iter()
+        .flat_map(NetworkInventory::links)
+        .cloned()
+        .map(|record| (record.interface_index(), record))
+        .collect();
+    let addresses = inventory
         .into_iter()
         .flat_map(NetworkInventory::addresses)
         .copied()
         .map(|record| (AddressIdentity::from(record), record))
-        .collect()
+        .collect();
+    CompleteFacts { links, addresses }
 }
 
-fn facts_match_inventory(
-    facts: &BTreeMap<AddressIdentity, InterfaceAddressRecord>,
-    inventory: Option<&NetworkInventory>,
-) -> bool {
+fn facts_match_inventory(facts: &CompleteFacts, inventory: Option<&NetworkInventory>) -> bool {
     let Some(inventory) = inventory else {
         return false;
     };
-    facts.len() == inventory.addresses().len()
-        && facts
-            .values()
-            .copied()
-            .eq(inventory.addresses().iter().copied())
+    facts.links.len() == inventory.links().len()
+        && facts.links.values().eq(inventory.links().iter())
+        && facts.addresses.len() == inventory.addresses().len()
+        && facts.addresses.values().eq(inventory.addresses().iter())
 }
 
 fn read_unpoisoned<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {

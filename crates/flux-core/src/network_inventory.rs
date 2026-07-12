@@ -460,6 +460,7 @@ impl Error for InterfaceAddressRecordError {}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NetworkInventory {
     epoch: NetworkEpoch,
+    links: Box<[InterfaceLinkRecord]>,
     addresses: Box<[InterfaceAddressRecord]>,
 }
 
@@ -470,13 +471,54 @@ impl NetworkInventory {
     }
 
     #[must_use]
+    pub fn links(&self) -> &[InterfaceLinkRecord] {
+        &self.links
+    }
+
+    #[must_use]
     pub fn addresses(&self) -> &[InterfaceAddressRecord] {
         &self.addresses
     }
 
     #[must_use]
     pub fn materially_differs_from(&self, candidate: &Self) -> bool {
-        self.addresses != candidate.addresses
+        self.links != candidate.links || self.addresses != candidate.addresses
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InterfaceLinkConflict {
+    interface_index: InterfaceIndex,
+}
+
+impl InterfaceLinkConflict {
+    #[must_use]
+    pub const fn interface_index(self) -> InterfaceIndex {
+        self.interface_index
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InterfaceNameConflict {
+    name: InterfaceName,
+    first_interface_index: InterfaceIndex,
+    second_interface_index: InterfaceIndex,
+}
+
+impl InterfaceNameConflict {
+    #[must_use]
+    pub const fn name(self) -> InterfaceName {
+        self.name
+    }
+
+    #[must_use]
+    pub const fn first_interface_index(self) -> InterfaceIndex {
+        self.first_interface_index
+    }
+
+    #[must_use]
+    pub const fn second_interface_index(self) -> InterfaceIndex {
+        self.second_interface_index
     }
 }
 
@@ -518,6 +560,8 @@ impl AddressFlagConflict {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NetworkInventoryError {
+    ConflictingLinkFacts(InterfaceLinkConflict),
+    ConflictingInterfaceName(InterfaceNameConflict),
     ConflictingAddressFlags(AddressFlagConflict),
     EpochExhausted,
 }
@@ -525,6 +569,18 @@ pub enum NetworkInventoryError {
 impl fmt::Display for NetworkInventoryError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ConflictingLinkFacts(conflict) => write!(
+                formatter,
+                "interface index {} has conflicting canonical link facts",
+                conflict.interface_index.get()
+            ),
+            Self::ConflictingInterfaceName(conflict) => write!(
+                formatter,
+                "primary interface name {:?} is shared by interface indices {} and {}",
+                conflict.name,
+                conflict.first_interface_index.get(),
+                conflict.second_interface_index.get()
+            ),
             Self::ConflictingAddressFlags(conflict) => write!(
                 formatter,
                 "interface address {} on index {} with prefix length {} has conflicting flags {:#x} and {:#x}",
@@ -559,13 +615,15 @@ impl NetworkInventoryTracker {
 
     pub fn publish_complete(
         &mut self,
+        links: impl IntoIterator<Item = InterfaceLinkRecord>,
         addresses: impl IntoIterator<Item = InterfaceAddressRecord>,
     ) -> Result<&NetworkInventory, NetworkInventoryError> {
+        let links = canonicalize_complete_links(links)?;
         let addresses = canonicalize_complete_addresses(addresses)?;
         if self
             .current
             .as_ref()
-            .is_some_and(|current| current.addresses == addresses)
+            .is_some_and(|current| current.links == links && current.addresses == addresses)
         {
             return Ok(self.current.as_ref().expect("current inventory is present"));
         }
@@ -577,12 +635,66 @@ impl NetworkInventoryTracker {
                 .ok_or(NetworkInventoryError::EpochExhausted)?,
             None => NetworkEpoch::INITIAL,
         };
-        self.current = Some(NetworkInventory { epoch, addresses });
+        self.current = Some(NetworkInventory {
+            epoch,
+            links,
+            addresses,
+        });
         Ok(self
             .current
             .as_ref()
             .expect("published inventory is present"))
     }
+}
+
+fn canonicalize_complete_links(
+    links: impl IntoIterator<Item = InterfaceLinkRecord>,
+) -> Result<Box<[InterfaceLinkRecord]>, NetworkInventoryError> {
+    let mut links: Vec<_> = links.into_iter().collect();
+    links.sort();
+
+    let mut canonical: Vec<InterfaceLinkRecord> = Vec::with_capacity(links.len());
+    for record in links {
+        if let Some(previous) = canonical.last()
+            && previous.interface_index == record.interface_index
+        {
+            if previous != &record {
+                return Err(NetworkInventoryError::ConflictingLinkFacts(
+                    InterfaceLinkConflict {
+                        interface_index: record.interface_index,
+                    },
+                ));
+            }
+            continue;
+        }
+        canonical.push(record);
+    }
+
+    let mut names: Vec<_> = canonical
+        .iter()
+        .map(|record| (record.name, record.interface_index))
+        .collect();
+    names.sort_unstable();
+    for pair in names.windows(2) {
+        let [
+            (first_name, first_interface_index),
+            (second_name, second_interface_index),
+        ] = pair
+        else {
+            unreachable!("a two-element window always contains two names");
+        };
+        if first_name == second_name {
+            return Err(NetworkInventoryError::ConflictingInterfaceName(
+                InterfaceNameConflict {
+                    name: *first_name,
+                    first_interface_index: *first_interface_index,
+                    second_interface_index: *second_interface_index,
+                },
+            ));
+        }
+    }
+
+    Ok(canonical.into_boxed_slice())
 }
 
 fn canonicalize_complete_addresses(

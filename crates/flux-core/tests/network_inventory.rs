@@ -128,24 +128,37 @@ fn link_facts_preserve_kernel_identity_without_assuming_utf8_or_known_values() {
 fn complete_publications_are_order_independent_and_deduplicate_exact_records() {
     let first = address_record(7, IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)), 24, 0);
     let second = address_record(9, IpAddr::V6(Ipv6Addr::LOCALHOST), 128, 0x80);
+    let first_link = link_record(7, b"eth0");
+    let second_link = link_record(9, b"tun0");
     let mut left_tracker = NetworkInventoryTracker::new();
     let mut right_tracker = NetworkInventoryTracker::new();
     let left = left_tracker
-        .publish_complete([second, first, first])
+        .publish_complete(
+            [second_link.clone(), first_link.clone(), first_link.clone()],
+            [second, first, first],
+        )
         .expect("complete inventory");
     let right = right_tracker
-        .publish_complete([first, second])
+        .publish_complete([first_link.clone(), second_link.clone()], [first, second])
         .expect("complete inventory");
 
+    assert_eq!(left.links(), &[first_link.clone(), second_link.clone()]);
+    assert_eq!(right.links(), left.links());
     assert_eq!(left.addresses(), &[first, second]);
     assert_eq!(right.addresses(), &[first, second]);
     assert!(!left.materially_differs_from(right));
 
-    let mut changed_tracker = NetworkInventoryTracker::new();
-    let changed = changed_tracker
-        .publish_complete([first])
-        .expect("complete inventory");
-    assert!(left.materially_differs_from(changed));
+    let mut link_changed_tracker = NetworkInventoryTracker::new();
+    let link_changed = link_changed_tracker
+        .publish_complete([first_link.clone()], [first, second])
+        .expect("link-only candidate");
+    assert!(left.materially_differs_from(link_changed));
+
+    let mut address_changed_tracker = NetworkInventoryTracker::new();
+    let address_changed = address_changed_tracker
+        .publish_complete([first_link, second_link], [first])
+        .expect("address-only candidate");
+    assert!(left.materially_differs_from(address_changed));
 }
 
 #[test]
@@ -153,14 +166,15 @@ fn conflicting_flags_for_one_canonical_address_are_rejected() {
     let address = IpAddr::V6(Ipv6Addr::LOCALHOST);
     let temporary = address_record(9, address, 128, InterfaceAddressFlags::TEMPORARY.bits());
     let deprecated = address_record(9, address, 128, InterfaceAddressFlags::DEPRECATED.bits());
+    let link = link_record(9, b"lo");
     let mut tracker = NetworkInventoryTracker::new();
     let prior_epoch = tracker
-        .publish_complete([temporary])
+        .publish_complete([link.clone()], [temporary])
         .expect("initial complete inventory")
         .epoch();
 
     let error = tracker
-        .publish_complete([deprecated, temporary, temporary])
+        .publish_complete([link], [deprecated, temporary, temporary])
         .expect_err("one canonical address cannot carry conflicting flag records");
     let NetworkInventoryError::ConflictingAddressFlags(conflict) = error else {
         panic!("unexpected inventory error: {error}");
@@ -186,18 +200,23 @@ fn tracker_advances_the_epoch_once_for_one_material_topology_change() {
     let first = address_record(7, IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)), 24, 0);
     let second = address_record(9, IpAddr::V6(Ipv6Addr::LOCALHOST), 128, 0x80);
     let changed_second = address_record(9, IpAddr::V6(Ipv6Addr::LOCALHOST), 128, 0xa0);
+    let first_link = link_record(7, b"eth0");
+    let second_link = link_record(9, b"tun0");
     let mut tracker = NetworkInventoryTracker::new();
 
     let initial_epoch = tracker
-        .publish_complete([first, second])
+        .publish_complete([first_link.clone(), second_link.clone()], [first, second])
         .expect("initial complete snapshot")
         .epoch();
     let equivalent_epoch = tracker
-        .publish_complete([second, first, first])
+        .publish_complete(
+            [second_link.clone(), first_link.clone(), first_link.clone()],
+            [second, first, first],
+        )
         .expect("equivalent complete snapshot")
         .epoch();
     let changed_epoch = tracker
-        .publish_complete([first, changed_second])
+        .publish_complete([first_link, second_link], [first, changed_second])
         .expect("changed complete snapshot")
         .epoch();
 
@@ -208,6 +227,120 @@ fn tracker_advances_the_epoch_once_for_one_material_topology_change() {
         tracker.current().expect("published inventory").epoch(),
         changed_epoch
     );
+}
+
+#[test]
+fn link_only_and_address_only_changes_advance_separate_epochs() {
+    let first_address = address_record(7, IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)), 24, 0);
+    let second_address = address_record(7, IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11)), 24, 0);
+    let first_link = link_record(7, b"eth0");
+    let second_link = link_record(9, b"tun0");
+    let mut tracker = NetworkInventoryTracker::new();
+
+    let initial_epoch = tracker
+        .publish_complete([first_link.clone()], [first_address])
+        .expect("initial combined snapshot")
+        .epoch();
+    let link_epoch = tracker
+        .publish_complete([first_link.clone(), second_link.clone()], [first_address])
+        .expect("link-only change")
+        .epoch();
+    let address_epoch = tracker
+        .publish_complete(
+            [first_link.clone(), second_link.clone()],
+            [first_address, second_address],
+        )
+        .expect("address-only change")
+        .epoch();
+
+    assert_eq!(initial_epoch, NetworkEpoch::INITIAL);
+    assert_eq!(link_epoch, initial_epoch.checked_next().unwrap());
+    assert_eq!(address_epoch, link_epoch.checked_next().unwrap());
+    let current = tracker.current().expect("latest combined snapshot");
+    assert_eq!(current.links(), &[first_link, second_link]);
+    assert_eq!(current.addresses(), &[first_address, second_address]);
+}
+
+#[test]
+fn unchanged_combined_snapshot_retains_the_published_inventory() {
+    let first_address = address_record(7, IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)), 24, 0);
+    let second_address = address_record(9, IpAddr::V6(Ipv6Addr::LOCALHOST), 128, 0x80);
+    let first_link = link_record(7, b"eth0");
+    let second_link = link_record(9, b"tun0");
+    let mut tracker = NetworkInventoryTracker::new();
+
+    let initial = tracker
+        .publish_complete(
+            [first_link.clone(), second_link.clone()],
+            [first_address, second_address],
+        )
+        .expect("initial combined snapshot");
+    let initial_pointer = std::ptr::from_ref(initial);
+    let initial_epoch = initial.epoch();
+    let unchanged = tracker
+        .publish_complete(
+            [second_link, first_link.clone(), first_link.clone()],
+            [second_address, first_address, first_address],
+        )
+        .expect("unchanged combined snapshot");
+
+    assert_eq!(std::ptr::from_ref(unchanged), initial_pointer);
+    assert_eq!(unchanged.epoch(), initial_epoch);
+    assert_eq!(unchanged.links(), &[first_link, link_record(9, b"tun0")]);
+    assert_eq!(unchanged.addresses(), &[first_address, second_address]);
+}
+
+#[test]
+fn conflicting_links_are_rejected() {
+    let first = link_record(7, b"eth0");
+    let conflicting = link_record(7, b"wlan0");
+    let mut tracker = NetworkInventoryTracker::new();
+
+    let error = tracker
+        .publish_complete([first, conflicting], [])
+        .expect_err("one interface index cannot carry conflicting link facts");
+    let NetworkInventoryError::ConflictingLinkFacts(conflict) = error else {
+        panic!("unexpected inventory error: {error}");
+    };
+    assert_eq!(conflict.interface_index().get(), 7);
+    assert!(tracker.current().is_none());
+}
+
+#[test]
+fn one_primary_interface_name_on_different_indices_is_rejected() {
+    let retained_link = link_record(3, b"lo");
+    let duplicate_name = InterfaceName::new(b"eth0").expect("valid interface name");
+    let lower_index = InterfaceIndex::new(7).expect("nonzero interface index");
+    let higher_index = InterfaceIndex::new(9).expect("nonzero interface index");
+    let mut tracker = NetworkInventoryTracker::new();
+    let retained = tracker
+        .publish_complete([retained_link.clone()], [])
+        .expect("initial inventory");
+    let retained_pointer = std::ptr::from_ref(retained);
+    let retained_epoch = retained.epoch();
+
+    let error = tracker
+        .publish_complete(
+            [
+                link_record(higher_index.get(), duplicate_name.as_bytes()),
+                link_record(lower_index.get(), duplicate_name.as_bytes()),
+            ],
+            [],
+        )
+        .expect_err("one primary name cannot identify two interface indices");
+    let NetworkInventoryError::ConflictingInterfaceName(conflict) = error else {
+        panic!("unexpected inventory error: {error}");
+    };
+
+    assert_eq!(conflict.name(), duplicate_name);
+    assert_eq!(conflict.first_interface_index(), lower_index);
+    assert_eq!(conflict.second_interface_index(), higher_index);
+    let current = tracker
+        .current()
+        .expect("prior inventory remains published");
+    assert_eq!(std::ptr::from_ref(current), retained_pointer);
+    assert_eq!(current.epoch(), retained_epoch);
+    assert_eq!(current.links(), &[retained_link]);
 }
 
 fn address_record(
@@ -223,4 +356,13 @@ fn address_record(
         InterfaceAddressFlags::from_bits(flags),
     )
     .expect("valid interface address record")
+}
+
+fn link_record(interface_index: u32, name: &[u8]) -> InterfaceLinkRecord {
+    InterfaceLinkRecord::new(
+        InterfaceIndex::new(interface_index).expect("nonzero interface index"),
+        InterfaceName::new(name).expect("valid interface name"),
+        InterfaceHardwareType::from_raw(1),
+        InterfaceLinkFlags::default(),
+    )
 }

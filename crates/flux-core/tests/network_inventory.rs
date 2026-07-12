@@ -11,6 +11,12 @@ use flux_core::{
 fn identifiers_prefixes_and_address_flags_preserve_their_domain_invariants() {
     assert_eq!(NetworkEpoch::new(0), None);
     assert_eq!(InterfaceIndex::new(0), None);
+    assert_eq!(
+        InterfaceIndex::new(i32::MAX as u32).map(InterfaceIndex::get),
+        Some(i32::MAX as u32)
+    );
+    assert_eq!(InterfaceIndex::new(i32::MAX as u32 + 1), None);
+    assert_eq!(InterfaceIndex::new(u32::MAX), None);
 
     let interface = InterfaceIndex::new(7).expect("nonzero interface index");
     let mut flags = InterfaceAddressFlags::TEMPORARY | InterfaceAddressFlags::STABLE_PRIVACY;

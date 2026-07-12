@@ -16,6 +16,10 @@ pub(crate) const NLA_TYPE_MASK: u16 = !(NLA_F_NESTED | NLA_F_NET_BYTEORDER);
 #[allow(dead_code)]
 pub(crate) mod link;
 
+// Raw route framing stays private to the platform Adapter pending combined-observer integration.
+#[allow(dead_code)]
+pub(crate) mod route;
+
 // Socket ownership and dump sequencing stay private to the platform Adapter.
 #[allow(dead_code)]
 pub(crate) mod socket;

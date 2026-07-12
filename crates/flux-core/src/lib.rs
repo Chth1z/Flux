@@ -10,6 +10,7 @@ mod capability;
 mod config;
 mod control;
 mod network_inventory;
+mod network_route;
 
 pub use capability::{
     BootIdentity, BootIdentityMutationStatus, CAPABILITY_PROFILE_SCHEMA_VERSION, CapabilityProfile,
@@ -36,4 +37,10 @@ pub use network_inventory::{
     InterfaceLinkFlags, InterfaceLinkKind, InterfaceLinkRecord, InterfaceName,
     InterfaceNameConflict, InterfaceOperationalState, NetworkEpoch, NetworkInventory,
     NetworkInventoryError, NetworkInventoryTracker,
+};
+pub use network_route::{
+    NetworkAddressFamily, NetworkRouteRecord, NetworkRouteRecordError, NetworkRouteRecordErrorKind,
+    RouteFlags, RouteGateway, RouteNexthop, RouteNexthopFlags, RoutePath, RoutePreference,
+    RoutePrefix, RoutePrefixError, RoutePrefixErrorKind, RouteProperties, RouteProtocol,
+    RouteScope, RouteTableId, RouteType,
 };

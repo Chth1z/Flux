@@ -38,8 +38,12 @@ impl NetworkEpoch {
 pub struct InterfaceIndex(NonZeroU32);
 
 impl InterfaceIndex {
+    /// Constructs a real Linux interface index from its positive kernel `int` domain.
     #[must_use]
     pub const fn new(value: u32) -> Option<Self> {
+        if value > i32::MAX as u32 {
+            return None;
+        }
         match NonZeroU32::new(value) {
             Some(value) => Some(Self(value)),
             None => None,

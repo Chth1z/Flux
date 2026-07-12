@@ -44,7 +44,7 @@ cargo clippy --manifest-path addrsyncd/Cargo.toml --all-targets -- -D warnings
 cargo check --manifest-path addrsyncd/Cargo.toml --target aarch64-linux-android --all-targets
 ```
 
-Its bridge reconciliation now reads canonical kernel rule dumps and preserves duplicate observations instead of relying only on in-memory ownership tracking. This does not yet make `run --daemon` a convergence handshake: the standalone daemon still reports ready before startup cleanup, apply, and readback verification complete.
+Its bridge reconciliation reads canonical kernel rule dumps and preserves duplicate observations instead of relying only on in-memory ownership tracking. `run --daemon` is now a bounded convergence handshake: readiness follows startup cleanup, reconcile/apply, two clean readbacks, and a final drain of the subscribed route socket to `EAGAIN`. Loss or ambiguous framing forces reconciliation, and parent-side readiness failures terminate and reap the child.
 
 Host execution of `addrsyncd` requires Linux or Android. On Windows, use the Android cross-check and run its host tests in Linux CI.
 

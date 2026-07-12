@@ -6,7 +6,8 @@ use flux_core::{
     AddressBypassRoutingSpecErrorKind, AddressBypassRuleBudget, AddressBypassRuleConflictKind,
     InterfaceAddressFlags, InterfaceAddressRecord, InterfaceIndex, MAX_ADDRESS_BYPASS_CONFLICTS,
     MAX_ADDRESS_BYPASS_RULES, NetworkAddressFamily, NetworkInventory, NetworkInventoryTracker,
-    NetworkRuleRecord, RuleAction, RuleFlags, RuleFwMark, RulePrefix, RulePriority, RuleProperties,
+    NetworkRuleRecord, OpaqueRuleAttribute, RuleAction, RuleAttributeOpacity, RuleFlags,
+    RuleFwMark, RuleOpaqueAttributeFingerprint, RulePrefix, RulePriority, RuleProperties,
     RuleProtocol, RuleTableId, plan_address_bypass,
 };
 
@@ -340,6 +341,14 @@ fn same_destination_field_mismatches_never_become_an_exact_identity_match() {
     .unwrap();
     let additional_selector =
         rule(desired, 254, SYNTHETIC_IPV4_PRIORITY, 99).with_fwmark(RuleFwMark::new(1, 1).unwrap());
+    let opaque_semantics = rule(desired, 254, SYNTHETIC_IPV4_PRIORITY, 99).with_attribute_opacity(
+        RuleAttributeOpacity::new(
+            [OpaqueRuleAttribute::new(25, 0, 4)],
+            0,
+            RuleOpaqueAttributeFingerprint::from_bytes([0x25; 32]),
+        )
+        .expect("bounded opacity evidence"),
+    );
     let inventory = inventory(
         [address(1, desired, 24, 0)],
         [
@@ -347,6 +356,7 @@ fn same_destination_field_mismatches_never_become_an_exact_identity_match() {
             different_protocol,
             different_action,
             additional_selector,
+            opaque_semantics,
         ],
     );
 
@@ -360,7 +370,7 @@ fn same_destination_field_mismatches_never_become_an_exact_identity_match() {
         panic!("expected routing conflicts");
     };
     assert_eq!(omitted_conflicts, 0);
-    assert_eq!(conflicts.len(), 4);
+    assert_eq!(conflicts.len(), 5);
     assert!(conflicts.iter().all(|conflict| {
         conflict.kind() == AddressBypassRuleConflictKind::UnexpectedRuleAtSelectedPriority
     }));

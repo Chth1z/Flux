@@ -1,11 +1,12 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use flux_core::{
-    InterfaceName, NetworkAddressFamily, NetworkRuleRecord, NetworkRuleRecordErrorKind, RuleAction,
-    RuleFlags, RuleFlowId, RuleFwMark, RuleIpProtocol, RulePortRange, RulePortRangeErrorKind,
-    RulePrefix, RulePrefixErrorKind, RulePriority, RuleProperties, RuleProtocol,
-    RuleSuppressInterfaceGroup, RuleSuppressPrefixLength, RuleTableId, RuleTunnelId, RuleUidRange,
-    RuleUidRangeErrorKind,
+    InterfaceName, MAX_OPAQUE_RULE_ATTRIBUTE_DETAILS, NetworkAddressFamily, NetworkRuleRecord,
+    NetworkRuleRecordErrorKind, OpaqueRuleAttribute, RuleAction, RuleAttributeCoverage,
+    RuleAttributeOpacity, RuleFlags, RuleFlowId, RuleFwMark, RuleIpProtocol,
+    RuleOpaqueAttributeFingerprint, RulePortRange, RulePortRangeErrorKind, RulePrefix,
+    RulePrefixErrorKind, RulePriority, RuleProperties, RuleProtocol, RuleSuppressInterfaceGroup,
+    RuleSuppressPrefixLength, RuleTableId, RuleTunnelId, RuleUidRange, RuleUidRangeErrorKind,
 };
 
 #[test]
@@ -158,6 +159,67 @@ fn raw_selector_differences_canonicalize_to_equal_records_without_implying_dedup
     let ordered_multiset = [first, second];
     assert_eq!(ordered_multiset.len(), 2);
     assert_eq!(ordered_multiset[0], ordered_multiset[1]);
+}
+
+#[test]
+fn rule_attribute_coverage_defaults_complete_and_opacity_changes_record_identity() {
+    let complete = ipv4_record();
+    assert_eq!(
+        complete.attribute_coverage(),
+        &RuleAttributeCoverage::Complete
+    );
+    assert!(complete.has_complete_attribute_coverage());
+
+    let details = [
+        OpaqueRuleAttribute::new(25, 0, 4),
+        OpaqueRuleAttribute::new(25, 0x8000, 3),
+    ];
+    let first_fingerprint = RuleOpaqueAttributeFingerprint::from_bytes([0x11; 32]);
+    let opacity = RuleAttributeOpacity::new(details, 2, first_fingerprint)
+        .expect("bounded nonempty opacity evidence");
+    assert_eq!(opacity.retained_details(), &details);
+    assert_eq!(opacity.omitted_details(), 2);
+    assert_eq!(opacity.total_attributes(), 4);
+    assert_eq!(opacity.fingerprint(), first_fingerprint);
+
+    let opaque = complete.clone().with_attribute_opacity(opacity);
+    assert!(!opaque.has_complete_attribute_coverage());
+    assert_ne!(opaque, complete);
+    assert_eq!(
+        opaque
+            .attribute_coverage()
+            .opacity()
+            .expect("opaque coverage")
+            .retained_details(),
+        &details
+    );
+
+    let changed_payload_fingerprint = complete.with_attribute_opacity(
+        RuleAttributeOpacity::new(
+            details,
+            2,
+            RuleOpaqueAttributeFingerprint::from_bytes([0x22; 32]),
+        )
+        .expect("second opacity evidence"),
+    );
+    assert_ne!(opaque, changed_payload_fingerprint);
+
+    assert!(
+        RuleAttributeOpacity::new([], 0, first_fingerprint).is_none(),
+        "opacity must retain at least one diagnostic detail"
+    );
+    assert!(
+        RuleAttributeOpacity::new(
+            std::iter::repeat_n(
+                OpaqueRuleAttribute::new(30, 0, 1),
+                MAX_OPAQUE_RULE_ATTRIBUTE_DETAILS + 1,
+            ),
+            0,
+            first_fingerprint,
+        )
+        .is_none(),
+        "callers cannot exceed the retained-detail bound"
+    );
 }
 
 #[test]

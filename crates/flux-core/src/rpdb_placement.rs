@@ -477,6 +477,10 @@ pub enum RpdbPlacementPlanError {
         family: NetworkAddressFamily,
         dump_index: usize,
     },
+    OpaqueRule {
+        family: NetworkAddressFamily,
+        dump_index: usize,
+    },
     MissingMustPrecedeBoundary {
         family: NetworkAddressFamily,
     },
@@ -533,6 +537,10 @@ impl fmt::Display for RpdbPlacementPlanError {
             Self::UnknownRule { family, dump_index } => write!(
                 formatter,
                 "RPDB rule {dump_index} for {family:?} has no trusted classification"
+            ),
+            Self::OpaqueRule { family, dump_index } => write!(
+                formatter,
+                "RPDB rule {dump_index} for {family:?} contains unmodeled attributes"
             ),
             Self::MissingMustPrecedeBoundary { family } => write!(
                 formatter,
@@ -658,6 +666,9 @@ fn plan_family(
     {
         if rule.destination().family() != family {
             continue;
+        }
+        if !rule.has_complete_attribute_coverage() {
+            return Err(RpdbPlacementPlanError::OpaqueRule { family, dump_index });
         }
 
         match classification {

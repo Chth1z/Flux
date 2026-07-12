@@ -3,11 +3,13 @@ use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use flux_core::{
-    InterfaceName, NetworkAddressFamily, NetworkRuleRecord, NetworkRuleRecordErrorKind, RuleAction,
-    RuleFlags, RuleFlowId, RuleFwMark, RuleIpProtocol, RulePortRange, RulePrefix, RulePriority,
-    RuleProperties, RuleProtocol, RuleSuppressInterfaceGroup, RuleSuppressPrefixLength,
-    RuleTableId, RuleTunnelId, RuleUidRange,
+    InterfaceName, MAX_OPAQUE_RULE_ATTRIBUTE_DETAILS, NetworkAddressFamily, NetworkRuleRecord,
+    NetworkRuleRecordErrorKind, OpaqueRuleAttribute, RuleAction, RuleAttributeOpacity, RuleFlags,
+    RuleFlowId, RuleFwMark, RuleIpProtocol, RuleOpaqueAttributeFingerprint, RulePortRange,
+    RulePrefix, RulePriority, RuleProperties, RuleProtocol, RuleSuppressInterfaceGroup,
+    RuleSuppressPrefixLength, RuleTableId, RuleTunnelId, RuleUidRange,
 };
+use sha2::{Digest, Sha256};
 
 use super::{
     NETLINK_HEADER_LENGTH, NLM_F_DUMP_INTR, NLMSG_DONE, NLMSG_ERROR, NLMSG_OVERRUN,
@@ -19,6 +21,7 @@ use super::{
 const RULE_MESSAGE_LENGTH: usize = 12;
 const UID_RANGE_LENGTH: usize = 8;
 const PORT_RANGE_LENGTH: usize = 4;
+const OPAQUE_ATTRIBUTE_FINGERPRINT_DOMAIN: &[u8] = b"flux-rule-opaque-attributes-v1\0";
 
 const RTM_NEWRULE: u16 = 32;
 const RTM_DELRULE: u16 = 33;
@@ -613,6 +616,9 @@ impl RtnetlinkRuleEventDecoder {
                 .with_flow(flow)
                 .map_err(|error| record_error(error.kind(), body_offset, decoded.goto_target))?;
         }
+        if let Some(opacity) = decoded.opaque_attributes.finish() {
+            record = record.with_attribute_opacity(opacity);
+        }
 
         if family == NetworkAddressFamily::Ipv6 && !self.include_ipv6 {
             return Ok(None);
@@ -653,6 +659,68 @@ struct DecodedRuleAttributes {
     ip_protocol: Option<RuleIpProtocol>,
     source_port_range: Option<RulePortRange>,
     destination_port_range: Option<RulePortRange>,
+    opaque_attributes: OpaqueRuleAttributeAccumulator,
+}
+
+struct OpaqueRuleAttributeAccumulator {
+    retained_details: Vec<OpaqueRuleAttribute>,
+    omitted_details: u32,
+    total_attributes: u32,
+    hasher: Sha256,
+}
+
+impl Default for OpaqueRuleAttributeAccumulator {
+    fn default() -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(OPAQUE_ATTRIBUTE_FINGERPRINT_DOMAIN);
+        Self {
+            retained_details: Vec::with_capacity(MAX_OPAQUE_RULE_ATTRIBUTE_DETAILS),
+            omitted_details: 0,
+            total_attributes: 0,
+            hasher,
+        }
+    }
+}
+
+impl OpaqueRuleAttributeAccumulator {
+    fn record(&mut self, attribute: NetlinkAttribute<'_>) {
+        let payload_length = u16::try_from(attribute.value().len())
+            .expect("a netlink attribute payload is bounded by its u16 length field");
+        let detail = OpaqueRuleAttribute::new(
+            attribute.attribute_type(),
+            attribute.flags(),
+            payload_length,
+        );
+        if self.retained_details.len() < MAX_OPAQUE_RULE_ATTRIBUTE_DETAILS {
+            self.retained_details.push(detail);
+        } else {
+            self.omitted_details = self
+                .omitted_details
+                .checked_add(1)
+                .expect("one netlink message cannot contain u32::MAX attributes");
+        }
+        self.total_attributes = self
+            .total_attributes
+            .checked_add(1)
+            .expect("one netlink message cannot contain u32::MAX attributes");
+
+        let raw_type = attribute.attribute_type() | attribute.flags();
+        self.hasher.update(raw_type.to_le_bytes());
+        self.hasher.update(payload_length.to_le_bytes());
+        self.hasher.update(attribute.value());
+    }
+
+    fn finish(mut self) -> Option<RuleAttributeOpacity> {
+        if self.total_attributes == 0 {
+            return None;
+        }
+        self.hasher.update(self.total_attributes.to_le_bytes());
+        let fingerprint = RuleOpaqueAttributeFingerprint::from_bytes(self.hasher.finalize().into());
+        Some(
+            RuleAttributeOpacity::new(self.retained_details, self.omitted_details, fingerprint)
+                .expect("opaque attribute accumulator maintains the core evidence bounds"),
+        )
+    }
 }
 
 fn decode_rule_attributes(
@@ -905,7 +973,7 @@ fn decode_rule_attributes(
                     RuleEventDecodeErrorKind::InvalidDestinationPortRangeLength,
                 )?);
             }
-            _ => {}
+            _ => decoded.opaque_attributes.record(attribute),
         }
     }
 

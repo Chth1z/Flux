@@ -105,6 +105,7 @@ fn comprehensive_ipv4_rule_is_canonical_and_preserves_selection_facts() {
         (443, 8443)
     );
     assert_eq!(record.flow().unwrap().get(), 42);
+    assert!(record.has_complete_attribute_coverage());
 }
 
 #[test]
@@ -155,6 +156,7 @@ fn ipv6_goto_delete_preserves_raw_tclass_and_masks_prefix_host_bits() {
     assert_eq!(record.properties().action(), RuleAction::GOTO);
     assert_eq!(record.goto_target().unwrap().get(), 200);
     assert!(record.flow().is_none());
+    assert!(record.has_complete_attribute_coverage());
 }
 
 #[test]
@@ -752,7 +754,9 @@ fn flow_is_strict_for_ipv4_and_framing_only_for_ipv6() {
     let decoded = decoder(true)
         .decode_datagram(&ipv6)
         .expect("IPv6 liberal FRA_FLOW policy");
-    assert!(decoded.events()[0].record().flow().is_none());
+    let record = decoded.events()[0].record();
+    assert!(record.flow().is_none());
+    assert!(record.has_complete_attribute_coverage());
 }
 
 #[test]
@@ -887,6 +891,93 @@ fn scalar_widths_flags_duplicates_and_future_attributes_are_strict() {
         ]))
         .expect("well-framed future attributes remain forward compatible");
     assert_eq!(decoded.events().len(), 1);
+    let opacity = decoded.events()[0]
+        .record()
+        .attribute_coverage()
+        .opacity()
+        .expect("future attributes make the rule semantically opaque");
+    assert_eq!(
+        opacity.retained_details(),
+        &[
+            OpaqueRuleAttribute::new(future_type, NLA_F_NESTED, 3),
+            OpaqueRuleAttribute::new(future_type, NLA_F_NET_BYTEORDER, 1),
+        ]
+    );
+    assert_eq!(opacity.omitted_details(), 0);
+    assert_eq!(opacity.total_attributes(), 2);
+    let original_fingerprint = opacity.fingerprint();
+
+    let changed_payload = decoder(true)
+        .decode_datagram(&basic_rule(&[
+            (future_type | NLA_F_NESTED, &[0xde, 0xad, 0xbf]),
+            (future_type | NLA_F_NET_BYTEORDER, &[1]),
+        ]))
+        .expect("changed opaque payload remains observable");
+    assert_ne!(
+        changed_payload.events()[0]
+            .record()
+            .attribute_coverage()
+            .opacity()
+            .unwrap()
+            .fingerprint(),
+        original_fingerprint
+    );
+
+    let reversed = decoder(true)
+        .decode_datagram(&basic_rule(&[
+            (future_type | NLA_F_NET_BYTEORDER, &[1]),
+            (future_type | NLA_F_NESTED, &[0xde, 0xad, 0xbe]),
+        ]))
+        .expect("opaque attribute order remains observable");
+    assert_ne!(
+        reversed.events()[0]
+            .record()
+            .attribute_coverage()
+            .opacity()
+            .unwrap()
+            .fingerprint(),
+        original_fingerprint
+    );
+
+    let many = vec![(future_type, b"x".as_slice()); MAX_OPAQUE_RULE_ATTRIBUTE_DETAILS + 3];
+    let bounded = decoder(true)
+        .decode_datagram(&basic_rule(&many))
+        .expect("many future attributes remain bounded");
+    let bounded_opacity = bounded.events()[0]
+        .record()
+        .attribute_coverage()
+        .opacity()
+        .unwrap();
+    assert_eq!(
+        bounded_opacity.retained_details().len(),
+        MAX_OPAQUE_RULE_ATTRIBUTE_DETAILS
+    );
+    assert_eq!(bounded_opacity.omitted_details(), 3);
+    assert_eq!(
+        bounded_opacity.total_attributes(),
+        u32::try_from(MAX_OPAQUE_RULE_ATTRIBUTE_DETAILS + 3).unwrap()
+    );
+
+    let bounded_fingerprint = bounded_opacity.fingerprint();
+    let mut changed_omitted = many;
+    *changed_omitted.last_mut().expect("opaque attributes") = (future_type, b"y".as_slice());
+    let changed_bounded = decoder(true)
+        .decode_datagram(&basic_rule(&changed_omitted))
+        .expect("an omitted opaque payload remains part of change detection");
+    let changed_bounded_opacity = changed_bounded.events()[0]
+        .record()
+        .attribute_coverage()
+        .opacity()
+        .unwrap();
+    assert_eq!(
+        changed_bounded_opacity.retained_details(),
+        bounded_opacity.retained_details()
+    );
+    assert_eq!(
+        changed_bounded_opacity.omitted_details(),
+        bounded_opacity.omitted_details()
+    );
+    assert_ne!(changed_bounded_opacity.fingerprint(), bounded_fingerprint);
 }
 
 #[test]
@@ -925,6 +1016,33 @@ fn uid_port_and_ip_protocol_values_follow_linux_5_10_domains() {
         ]))
         .expect("zero mask canonicalizes the selector away");
     assert!(inert_mark.events()[0].record().fwmark().is_none());
+}
+
+#[test]
+fn future_port_masks_preserve_known_range_facts_but_make_the_projection_opaque() {
+    // Linux added FRA_SPORT_MASK after the Android 5.10 attribute set modeled here.
+    const FRA_SPORT_MASK_FUTURE: u16 = 28;
+    let source_ports = range_u16(1_024, 2_048);
+    let source_mask = 0xfff0_u16.to_ne_bytes();
+    let decoded = decoder(true)
+        .decode_datagram(&basic_rule(&[
+            (FRA_SPORT_RANGE, &source_ports),
+            (FRA_SPORT_MASK_FUTURE, &source_mask),
+        ]))
+        .expect("future port-mask selector remains observable");
+    let record = decoded.events()[0].record();
+    let range = record
+        .source_port_range()
+        .expect("known source-port range remains decoded");
+    assert_eq!((range.start(), range.end()), (1_024, 2_048));
+    assert_eq!(
+        record
+            .attribute_coverage()
+            .opacity()
+            .expect("unmodeled mask blocks semantic completeness")
+            .retained_details(),
+        &[OpaqueRuleAttribute::new(FRA_SPORT_MASK_FUTURE, 0, 2)]
+    );
 }
 
 #[test]

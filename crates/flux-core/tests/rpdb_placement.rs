@@ -1,11 +1,12 @@
 use flux_core::{
     DeferredRoutingPrerequisite, NetworkAddressFamily, NetworkInventory, NetworkInventoryTracker,
-    NetworkRouteRecord, NetworkRuleRecord, RouteFlags, RoutePath, RoutePrefix, RouteProperties,
-    RouteProtocol, RouteScope, RouteTableId, RouteType, RpdbClassifierRevision,
+    NetworkRouteRecord, NetworkRuleRecord, OpaqueRuleAttribute, RouteFlags, RoutePath, RoutePrefix,
+    RouteProperties, RouteProtocol, RouteScope, RouteTableId, RouteType, RpdbClassifierRevision,
     RpdbFamilyPlacement, RpdbFamilyPlacementError, RpdbPlacementPlanError, RpdbPlacementRequest,
     RpdbPlacementRequestError, RpdbPriorityRole, RpdbRuleAudit, RpdbRuleAuditError,
-    RpdbRuleClassification, RuleAction, RuleFlags, RulePrefix, RulePriority, RuleProperties,
-    RuleProtocol, RuleTableId, plan_rpdb_placement,
+    RpdbRuleClassification, RuleAction, RuleAttributeOpacity, RuleFlags,
+    RuleOpaqueAttributeFingerprint, RulePrefix, RulePriority, RuleProperties, RuleProtocol,
+    RuleTableId, plan_rpdb_placement,
 };
 
 const GUARD_PRIORITY: u32 = 10_000;
@@ -315,6 +316,103 @@ fn unknown_rules_fail_closed_only_for_enabled_families() {
         RpdbPlacementPlanError::UnknownRule {
             family: NetworkAddressFamily::Ipv4,
             dump_index: 1,
+        }
+    );
+}
+
+#[test]
+fn opaque_rules_override_classification_only_for_enabled_families() {
+    let request = ipv4_request();
+    for classification in [
+        RpdbRuleClassification::MustPrecedeFlux,
+        RpdbRuleClassification::TerminalBarrier,
+        RpdbRuleClassification::DoesNotConstrainFlux,
+        RpdbRuleClassification::Unknown,
+    ] {
+        let inventory = inventory(
+            [],
+            [
+                rule(
+                    NetworkAddressFamily::Ipv4,
+                    GUARD_PRIORITY,
+                    254,
+                    RuleAction::TO_TABLE,
+                    None,
+                ),
+                opaque_rule(NetworkAddressFamily::Ipv4, 12_000),
+                rule(
+                    NetworkAddressFamily::Ipv4,
+                    BARRIER_PRIORITY,
+                    254,
+                    RuleAction::TO_TABLE,
+                    None,
+                ),
+            ],
+        );
+        let audit = audit(
+            &inventory,
+            [
+                RpdbRuleClassification::MustPrecedeFlux,
+                classification,
+                RpdbRuleClassification::TerminalBarrier,
+            ],
+        );
+        assert_eq!(
+            plan_rpdb_placement(&inventory, &audit, request)
+                .expect_err("opaque enabled-family rule blocks classifier trust"),
+            RpdbPlacementPlanError::OpaqueRule {
+                family: NetworkAddressFamily::Ipv4,
+                dump_index: 1,
+            }
+        );
+    }
+
+    let disabled_inventory = inventory(
+        [],
+        [
+            rule(
+                NetworkAddressFamily::Ipv4,
+                GUARD_PRIORITY,
+                254,
+                RuleAction::TO_TABLE,
+                None,
+            ),
+            rule(
+                NetworkAddressFamily::Ipv4,
+                BARRIER_PRIORITY,
+                254,
+                RuleAction::TO_TABLE,
+                None,
+            ),
+            opaque_rule(NetworkAddressFamily::Ipv6, 12_000),
+        ],
+    );
+    let disabled_audit = audit(
+        &disabled_inventory,
+        [
+            RpdbRuleClassification::MustPrecedeFlux,
+            RpdbRuleClassification::TerminalBarrier,
+            RpdbRuleClassification::DoesNotConstrainFlux,
+        ],
+    );
+    plan_rpdb_placement(&disabled_inventory, &disabled_audit, request)
+        .expect("opaque disabled-family rules remain outside an IPv4-only lease");
+
+    let dual_request = RpdbPlacementRequest::new(
+        Some(placement(BYPASS_PRIORITY, PROXY_PRIORITY, PRIVATE_TABLE)),
+        Some(placement(
+            BYPASS_PRIORITY,
+            PROXY_PRIORITY,
+            PRIVATE_TABLE + 1,
+        )),
+    )
+    .expect("dual-family request");
+    assert_eq!(
+        plan_rpdb_placement(&disabled_inventory, &disabled_audit, dual_request)
+            .expect_err("enabling the opaque IPv6 family rejects the atomic request"),
+        RpdbPlacementPlanError::OpaqueRule {
+            family: NetworkAddressFamily::Ipv6,
+            dump_index: 2,
         }
     );
 }
@@ -813,6 +911,40 @@ fn leases_reject_stale_snapshots_and_classifier_revisions() {
     );
 }
 
+#[test]
+fn newly_opaque_rule_attributes_stale_an_existing_placement_lease() {
+    let rules = baseline_rules(NetworkAddressFamily::Ipv4);
+    let mut tracker = NetworkInventoryTracker::new();
+    let complete = tracker
+        .publish_complete_with_routing([], [], [], rules.clone())
+        .expect("complete rule inventory")
+        .clone();
+    let audit = audit(
+        &complete,
+        [
+            RpdbRuleClassification::MustPrecedeFlux,
+            RpdbRuleClassification::TerminalBarrier,
+        ],
+    );
+    let lease = plan_rpdb_placement(&complete, &audit, ipv4_request())
+        .expect("complete facts admit placement");
+
+    let opaque_rules = [
+        rules[0].clone(),
+        rules[1].clone().with_attribute_opacity(test_opacity()),
+    ];
+    let opaque = tracker
+        .publish_complete_with_routing([], [], [], opaque_rules)
+        .expect("opaque rule inventory")
+        .clone();
+    let stale = lease
+        .ensure_current(&opaque, audit.classifier_revision())
+        .expect_err("newly opaque semantics invalidate the prior lease");
+    assert_eq!(stale.leased_snapshot_id(), complete.snapshot_id());
+    assert_eq!(stale.current_snapshot_id(), opaque.snapshot_id());
+    assert_ne!(stale.leased_epoch(), stale.current_epoch());
+}
+
 fn revision(value: u64) -> RpdbClassifierRevision {
     RpdbClassifierRevision::new(value).expect("nonzero classifier revision")
 }
@@ -880,6 +1012,19 @@ fn rule(
         goto_target.map(RulePriority::from_raw),
     )
     .expect("valid test rule")
+}
+
+fn opaque_rule(family: NetworkAddressFamily, priority: u32) -> NetworkRuleRecord {
+    rule(family, priority, 254, RuleAction::TO_TABLE, None).with_attribute_opacity(test_opacity())
+}
+
+fn test_opacity() -> RuleAttributeOpacity {
+    RuleAttributeOpacity::new(
+        [OpaqueRuleAttribute::new(25, 0, 4)],
+        0,
+        RuleOpaqueAttributeFingerprint::from_bytes([0x25; 32]),
+    )
+    .expect("bounded test opacity evidence")
 }
 
 fn route(family: NetworkAddressFamily, table: u32) -> NetworkRouteRecord {

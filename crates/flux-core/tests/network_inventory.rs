@@ -5,9 +5,10 @@ use flux_core::{
     InterfaceAddressRecord, InterfaceAddressRecordErrorKind, InterfaceHardwareType, InterfaceIndex,
     InterfaceLinkFlags, InterfaceLinkKind, InterfaceLinkRecord, InterfaceName,
     InterfaceOperationalState, NetworkAddressFamily, NetworkEpoch, NetworkInventoryError,
-    NetworkInventoryTracker, NetworkRouteRecord, NetworkRuleRecord, RouteFlags, RoutePath,
-    RoutePrefix, RouteProperties, RouteProtocol, RouteScope, RouteTableId, RouteType, RuleAction,
-    RuleFlags, RulePrefix, RulePriority, RuleProperties, RuleProtocol, RuleTableId,
+    NetworkInventoryTracker, NetworkRouteRecord, NetworkRuleRecord, OpaqueRuleAttribute,
+    RouteFlags, RoutePath, RoutePrefix, RouteProperties, RouteProtocol, RouteScope, RouteTableId,
+    RouteType, RuleAction, RuleAttributeOpacity, RuleFlags, RuleOpaqueAttributeFingerprint,
+    RulePrefix, RulePriority, RuleProperties, RuleProtocol, RuleTableId,
 };
 
 #[test]
@@ -221,6 +222,63 @@ fn routing_publications_preserve_order_multiplicity_and_epoch_semantics() {
         .expect("legacy complete publication");
     assert!(legacy.routes().is_empty());
     assert!(legacy.rules().is_empty());
+}
+
+#[test]
+fn opaque_rule_fingerprint_changes_advance_inventory_identity() {
+    let complete_rule = rule_record(100, 1_000);
+    let detail = OpaqueRuleAttribute::new(25, 0, 4);
+    let first_opaque = complete_rule.clone().with_attribute_opacity(
+        RuleAttributeOpacity::new(
+            [detail],
+            0,
+            RuleOpaqueAttributeFingerprint::from_bytes([0x11; 32]),
+        )
+        .expect("first opacity evidence"),
+    );
+    let changed_opaque = complete_rule.clone().with_attribute_opacity(
+        RuleAttributeOpacity::new(
+            [detail],
+            0,
+            RuleOpaqueAttributeFingerprint::from_bytes([0x22; 32]),
+        )
+        .expect("changed opacity evidence"),
+    );
+    let mut tracker = NetworkInventoryTracker::new();
+
+    let complete = tracker
+        .publish_complete_with_routing([], [], [], [complete_rule.clone()])
+        .expect("complete rule inventory");
+    let complete_epoch = complete.epoch();
+    let complete_snapshot = complete.snapshot_id();
+
+    let opaque = tracker
+        .publish_complete_with_routing([], [], [], [first_opaque.clone()])
+        .expect("opaque rule inventory");
+    let opaque_epoch = opaque.epoch();
+    let opaque_snapshot = opaque.snapshot_id();
+    assert_eq!(opaque_epoch, complete_epoch.checked_next().unwrap());
+    assert_ne!(opaque_snapshot, complete_snapshot);
+
+    let unchanged = tracker
+        .publish_complete_with_routing([], [], [], [first_opaque])
+        .expect("identical opaque rule inventory");
+    assert_eq!(unchanged.epoch(), opaque_epoch);
+    assert_eq!(unchanged.snapshot_id(), opaque_snapshot);
+
+    let changed = tracker
+        .publish_complete_with_routing([], [], [], [changed_opaque])
+        .expect("payload-fingerprint change");
+    assert_eq!(changed.epoch(), opaque_epoch.checked_next().unwrap());
+    let changed_epoch = changed.epoch();
+
+    let complete_again = tracker
+        .publish_complete_with_routing([], [], [], [complete_rule])
+        .expect("opacity removal");
+    assert_eq!(
+        complete_again.epoch(),
+        changed_epoch.checked_next().unwrap()
+    );
 }
 
 #[test]

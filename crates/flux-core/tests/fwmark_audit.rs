@@ -2,7 +2,8 @@ use flux_core::{
     ANDROID_NET_ID_FWMARK_MASK, DeferredFwmarkPrerequisite, FwmarkCandidate, FwmarkCandidateError,
     FwmarkEvidenceSource, FwmarkEvidenceState, FwmarkPartialAuditOutcome, FwmarkPartialConflict,
     FwmarkRole, MAX_FWMARK_PARTIAL_CONFLICTS, NetworkAddressFamily, NetworkInventory,
-    NetworkInventoryTracker, NetworkRuleRecord, RuleAction, RuleFlags, RuleFwMark, RulePrefix,
+    NetworkInventoryTracker, NetworkRuleRecord, OpaqueRuleAttribute, RuleAction,
+    RuleAttributeOpacity, RuleFlags, RuleFwMark, RuleOpaqueAttributeFingerprint, RulePrefix,
     RulePriority, RuleProperties, RuleProtocol, RuleTableId, audit_fwmark_candidate_partial,
 };
 
@@ -285,6 +286,49 @@ fn disjoint_or_absent_rpdb_selectors_do_not_turn_incomplete_evidence_into_succes
 }
 
 #[test]
+fn opaque_rpdb_attributes_downgrade_source_evidence_without_hiding_known_conflicts() {
+    let opaque_unmarked = with_opacity(unmarked_rule(NetworkAddressFamily::Ipv6, 200));
+    let incomplete_inventory = inventory([opaque_unmarked]);
+    let incomplete = audit_fwmark_candidate_partial(&incomplete_inventory, candidate());
+    assert_eq!(incomplete.outcome(), FwmarkPartialAuditOutcome::Incomplete);
+    assert!(incomplete.conflicts().is_empty());
+    assert_eq!(
+        incomplete
+            .sources()
+            .iter()
+            .find(|status| status.source() == FwmarkEvidenceSource::Rpdb)
+            .expect("RPDB source status")
+            .state(),
+        FwmarkEvidenceState::Opaque
+    );
+
+    let opaque_marked = with_opacity(marked_rule(
+        NetworkAddressFamily::Ipv4,
+        300,
+        PROXY_VALUE,
+        CANDIDATE_MASK,
+        RuleAction::TO_TABLE,
+        RuleFlags::default(),
+    ));
+    let conflicting_inventory = inventory([opaque_marked]);
+    let conflicting = audit_fwmark_candidate_partial(&conflicting_inventory, candidate());
+    assert_eq!(
+        conflicting.outcome(),
+        FwmarkPartialAuditOutcome::Conflicting
+    );
+    assert_eq!(conflicting.conflicts().len(), 1);
+    assert_eq!(
+        conflicting
+            .sources()
+            .iter()
+            .find(|status| status.source() == FwmarkEvidenceSource::Rpdb)
+            .expect("RPDB source status")
+            .state(),
+        FwmarkEvidenceState::Opaque
+    );
+}
+
+#[test]
 fn conflict_evidence_is_bounded_without_changing_the_rejection_decision() {
     let low_field = FwmarkCandidate::new(0x3, 0x1, 0x2).expect("two low-bit roles");
     let rules = (0..64).map(|index| {
@@ -384,6 +428,17 @@ fn marked_rule(
 
 fn unmarked_rule(family: NetworkAddressFamily, priority: u32) -> NetworkRuleRecord {
     unmarked_rule_with_properties(family, priority, RuleAction::TO_TABLE, RuleFlags::default())
+}
+
+fn with_opacity(rule: NetworkRuleRecord) -> NetworkRuleRecord {
+    rule.with_attribute_opacity(
+        RuleAttributeOpacity::new(
+            [OpaqueRuleAttribute::new(25, 0, 4)],
+            0,
+            RuleOpaqueAttributeFingerprint::from_bytes([0x25; 32]),
+        )
+        .expect("bounded test opacity evidence"),
+    )
 }
 
 fn unmarked_rule_with_properties(

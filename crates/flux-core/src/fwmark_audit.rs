@@ -42,6 +42,7 @@ const FWMARK_SOURCE_STATUSES: [FwmarkSourceStatus; 8] = [
         FwmarkEvidenceState::Unavailable,
     ),
 ];
+const RPDB_SOURCE_STATUS_INDEX: usize = 1;
 
 const DEFERRED_FWMARK_PREREQUISITES: [DeferredFwmarkPrerequisite; 11] = [
     DeferredFwmarkPrerequisite::PositiveAllocationAuthority,
@@ -197,6 +198,8 @@ pub enum FwmarkEvidenceSource {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum FwmarkEvidenceState {
     Available,
+    /// The source was observed, but some semantics are not modeled strongly enough for proof.
+    Opaque,
     Unavailable,
 }
 
@@ -272,6 +275,7 @@ pub struct FwmarkPartialAudit {
     epoch: NetworkEpoch,
     candidate: FwmarkCandidate,
     outcome: FwmarkPartialAuditOutcome,
+    sources: [FwmarkSourceStatus; FWMARK_SOURCE_STATUSES.len()],
     conflicts: Box<[FwmarkPartialConflict]>,
     omitted_conflicts: u32,
 }
@@ -303,7 +307,7 @@ impl FwmarkPartialAudit {
     /// Future activation audits may require additional domains; this is not a completeness
     /// manifest that can authorize allocation.
     pub fn sources(&self) -> &[FwmarkSourceStatus] {
-        &FWMARK_SOURCE_STATUSES
+        &self.sources
     }
 
     #[must_use]
@@ -397,6 +401,15 @@ pub fn audit_fwmark_candidate_partial(
 ) -> FwmarkPartialAudit {
     let mut conflicts = Vec::new();
     let mut omitted_conflicts = 0_u32;
+    let mut sources = FWMARK_SOURCE_STATUSES;
+    if inventory
+        .rules()
+        .iter()
+        .any(|rule| !rule.has_complete_attribute_coverage())
+    {
+        sources[RPDB_SOURCE_STATUS_INDEX] =
+            FwmarkSourceStatus::new(FwmarkEvidenceSource::Rpdb, FwmarkEvidenceState::Opaque);
+    }
 
     let android_overlap = candidate.mask() & ANDROID_NET_ID_FWMARK_MASK;
     if android_overlap != 0 {
@@ -440,6 +453,7 @@ pub fn audit_fwmark_candidate_partial(
         epoch: inventory.epoch(),
         candidate,
         outcome,
+        sources,
         conflicts: conflicts.into_boxed_slice(),
         omitted_conflicts,
     }

@@ -90,6 +90,7 @@ version = "0.1.0"
 dependencies = [
  "flux-core",
  "libc",
+ "sha2",
  "tempfile",
 ]
 

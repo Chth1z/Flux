@@ -569,6 +569,146 @@ impl fmt::Display for RulePortRangeError {
 
 impl Error for RulePortRangeError {}
 
+/// Maximum ordered diagnostics retained for one rule's unmodeled attributes.
+///
+/// The aggregate fingerprint still covers every opaque attribute, including details beyond this
+/// bound. The retained descriptors are diagnostics only and never make an opaque rule complete.
+pub const MAX_OPAQUE_RULE_ATTRIBUTE_DETAILS: usize = 8;
+
+/// Bounded metadata for one well-framed but semantically unmodeled rule attribute.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct OpaqueRuleAttribute {
+    attribute_type: u16,
+    flags: u16,
+    payload_length: u16,
+}
+
+impl OpaqueRuleAttribute {
+    #[must_use]
+    pub const fn new(attribute_type: u16, flags: u16, payload_length: u16) -> Self {
+        Self {
+            attribute_type,
+            flags,
+            payload_length,
+        }
+    }
+
+    #[must_use]
+    pub const fn attribute_type(self) -> u16 {
+        self.attribute_type
+    }
+
+    #[must_use]
+    pub const fn flags(self) -> u16 {
+        self.flags
+    }
+
+    #[must_use]
+    pub const fn payload_length(self) -> u16 {
+        self.payload_length
+    }
+}
+
+/// Aggregate change fingerprint for every opaque attribute on one rule.
+///
+/// This value supports conservative inventory change detection. It is not a byte-for-byte kernel
+/// identity, an ownership token, or sufficient evidence for exact deletion.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(transparent)]
+pub struct RuleOpaqueAttributeFingerprint([u8; 32]);
+
+impl RuleOpaqueAttributeFingerprint {
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+/// Bounded evidence that one rule contains attributes whose selection semantics are unmodeled.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct RuleAttributeOpacity {
+    retained_details: Box<[OpaqueRuleAttribute]>,
+    omitted_details: u32,
+    fingerprint: RuleOpaqueAttributeFingerprint,
+}
+
+impl RuleAttributeOpacity {
+    /// Constructs opacity evidence from a bounded, nonempty ordered diagnostic prefix.
+    #[must_use]
+    pub fn new(
+        retained_details: impl IntoIterator<Item = OpaqueRuleAttribute>,
+        omitted_details: u32,
+        fingerprint: RuleOpaqueAttributeFingerprint,
+    ) -> Option<Self> {
+        let retained_details = retained_details.into_iter().collect::<Vec<_>>();
+        let retained_count = u32::try_from(retained_details.len()).ok()?;
+        if retained_details.is_empty()
+            || retained_details.len() > MAX_OPAQUE_RULE_ATTRIBUTE_DETAILS
+            || retained_count.checked_add(omitted_details).is_none()
+        {
+            return None;
+        }
+
+        Some(Self {
+            retained_details: retained_details.into_boxed_slice(),
+            omitted_details,
+            fingerprint,
+        })
+    }
+
+    #[must_use]
+    pub fn retained_details(&self) -> &[OpaqueRuleAttribute] {
+        &self.retained_details
+    }
+
+    #[must_use]
+    pub const fn omitted_details(&self) -> u32 {
+        self.omitted_details
+    }
+
+    #[must_use]
+    pub fn total_attributes(&self) -> u32 {
+        u32::try_from(self.retained_details.len()).expect("opaque rule detail bound fits u32")
+            + self.omitted_details
+    }
+
+    #[must_use]
+    pub const fn fingerprint(&self) -> RuleOpaqueAttributeFingerprint {
+        self.fingerprint
+    }
+}
+
+/// Semantic coverage of the rule attributes represented by a canonical record.
+///
+/// `Complete` means every observed attribute was represented or is explicitly understood to be
+/// inert for this address family. It still does not make the record an exact mutation identity.
+#[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum RuleAttributeCoverage {
+    #[default]
+    Complete,
+    Opaque(RuleAttributeOpacity),
+}
+
+impl RuleAttributeCoverage {
+    #[must_use]
+    pub const fn is_complete(&self) -> bool {
+        matches!(self, Self::Complete)
+    }
+
+    #[must_use]
+    pub const fn opacity(&self) -> Option<&RuleAttributeOpacity> {
+        match self {
+            Self::Complete => None,
+            Self::Opaque(opacity) => Some(opacity),
+        }
+    }
+}
+
 /// Canonical policy-rule selection facts.
 ///
 /// Prefix host bits and firewall-mark bits outside the mask are normalized away. Exact future
@@ -595,6 +735,7 @@ pub struct NetworkRuleRecord {
     source_port_range: Option<RulePortRange>,
     destination_port_range: Option<RulePortRange>,
     flow: Option<RuleFlowId>,
+    attribute_coverage: RuleAttributeCoverage,
 }
 
 impl NetworkRuleRecord {
@@ -653,7 +794,15 @@ impl NetworkRuleRecord {
             source_port_range: None,
             destination_port_range: None,
             flow: None,
+            attribute_coverage: RuleAttributeCoverage::Complete,
         })
+    }
+
+    /// Marks the record as semantically opaque without exposing a way to clear that evidence.
+    #[must_use]
+    pub fn with_attribute_opacity(mut self, opacity: RuleAttributeOpacity) -> Self {
+        self.attribute_coverage = RuleAttributeCoverage::Opaque(opacity);
+        self
     }
 
     #[must_use]
@@ -819,6 +968,16 @@ impl NetworkRuleRecord {
     #[must_use]
     pub const fn flow(&self) -> Option<RuleFlowId> {
         self.flow
+    }
+
+    #[must_use]
+    pub const fn attribute_coverage(&self) -> &RuleAttributeCoverage {
+        &self.attribute_coverage
+    }
+
+    #[must_use]
+    pub const fn has_complete_attribute_coverage(&self) -> bool {
+        self.attribute_coverage.is_complete()
     }
 }
 

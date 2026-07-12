@@ -63,11 +63,13 @@ pub use network_route::{
     RouteScope, RouteTableId, RouteType,
 };
 pub use network_rule::{
-    NetworkRuleRecord, NetworkRuleRecordError, NetworkRuleRecordErrorKind, RuleAction, RuleFlags,
-    RuleFlowId, RuleFwMark, RuleIpProtocol, RulePortRange, RulePortRangeError,
-    RulePortRangeErrorKind, RulePrefix, RulePrefixError, RulePrefixErrorKind, RulePriority,
-    RuleProperties, RuleProtocol, RuleSuppressInterfaceGroup, RuleSuppressPrefixLength,
-    RuleTableId, RuleTunnelId, RuleUidRange, RuleUidRangeError, RuleUidRangeErrorKind,
+    MAX_OPAQUE_RULE_ATTRIBUTE_DETAILS, NetworkRuleRecord, NetworkRuleRecordError,
+    NetworkRuleRecordErrorKind, OpaqueRuleAttribute, RuleAction, RuleAttributeCoverage,
+    RuleAttributeOpacity, RuleFlags, RuleFlowId, RuleFwMark, RuleIpProtocol,
+    RuleOpaqueAttributeFingerprint, RulePortRange, RulePortRangeError, RulePortRangeErrorKind,
+    RulePrefix, RulePrefixError, RulePrefixErrorKind, RulePriority, RuleProperties, RuleProtocol,
+    RuleSuppressInterfaceGroup, RuleSuppressPrefixLength, RuleTableId, RuleTunnelId, RuleUidRange,
+    RuleUidRangeError, RuleUidRangeErrorKind,
 };
 pub use rpdb_placement::{
     DeferredRoutingPrerequisite, RpdbClassifierRevision, RpdbFamilyPlacement,

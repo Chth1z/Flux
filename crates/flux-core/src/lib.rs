@@ -10,6 +10,7 @@ mod address_bypass;
 mod capability;
 mod config;
 mod control;
+mod fwmark_audit;
 mod network_inventory;
 mod network_route;
 mod network_rule;
@@ -40,6 +41,12 @@ pub use control::{
     AdministrativeState, ConfigurationChangeClient, ConfigurationChangeReport, ControlClient,
     ControlError, ControlService, ControlSnapshot, ControlSnapshotSource, LegacyControlBridge,
     LegacyDispatcher, LegacyIntent, OperationHandle, OperationReport, Reason,
+};
+pub use fwmark_audit::{
+    ANDROID_NET_ID_FWMARK_MASK, DeferredFwmarkPrerequisite, FwmarkCandidate, FwmarkCandidateError,
+    FwmarkEvidenceSource, FwmarkEvidenceState, FwmarkPartialAudit, FwmarkPartialAuditOutcome,
+    FwmarkPartialConflict, FwmarkRole, FwmarkSourceStatus, MAX_FWMARK_PARTIAL_CONFLICTS,
+    StaleFwmarkPartialAudit, audit_fwmark_candidate_partial,
 };
 pub use network_inventory::{
     AddressFlagConflict, INTERFACE_LINK_KIND_MAX_BYTES, INTERFACE_NAME_MAX_BYTES,

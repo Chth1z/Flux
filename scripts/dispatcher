@@ -641,6 +641,13 @@ _require_rust_owned_bridge_proxy_mode() {
     esac
 }
 
+_require_rust_owned_bridge_loop_prevention() {
+    [ "${KFEAT_OWNER:-0}" = "1" ] || {
+        log_error "Rust-owned Phase 1 requires xt_owner for its current Proxy Engine loop prevention"
+        return 1
+    }
+}
+
 _state_prepare() {
     local generation=""
     local generation_dir=""
@@ -665,6 +672,10 @@ _state_prepare() {
         _discard_incomplete_generation "${generation_dir}" || true
         return 1
     fi
+    if ! _require_rust_owned_bridge_loop_prevention; then
+        _discard_incomplete_generation "${generation_dir}" || true
+        return 1
+    fi
     if ! FLUXD_ENGINE_OWNER=rust sh "${INIT_SCRIPT}" init; then
         log_error "Init failed"
         _discard_incomplete_generation "${generation_dir}" || true
@@ -675,6 +686,10 @@ _state_prepare() {
         return 1
     fi
     if ! _require_rust_owned_bridge_proxy_mode; then
+        _discard_incomplete_generation "${generation_dir}" || true
+        return 1
+    fi
+    if ! _require_rust_owned_bridge_loop_prevention; then
         _discard_incomplete_generation "${generation_dir}" || true
         return 1
     fi

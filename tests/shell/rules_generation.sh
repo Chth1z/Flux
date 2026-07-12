@@ -54,6 +54,20 @@ if printf '%s\n' "${ipv4_bypass}" | grep -Fq -- '100.0.0.0/8'; then
 fi
 
 APP_LIST=""
+mode_zero=$(_build_app_rules "" 0)
+assert_equals \
+    '-A APP_CHAIN -m owner --uid-owner 1000 --gid-owner 1000 -j ACTION_BYPASS
+-A APP_CHAIN -j RETURN' \
+    "${mode_zero}" \
+    "mode zero must preserve the Proxy Engine owner bypass"
+
+mode_zero_v6=$(_build_app_rules "6" 0)
+assert_equals \
+    '-A APP_CHAIN6 -m owner --uid-owner 1000 --gid-owner 1000 -j ACTION_BYPASS6
+-A APP_CHAIN6 -j RETURN' \
+    "${mode_zero_v6}" \
+    "IPv6 mode zero must preserve the Proxy Engine owner bypass"
+
 allowlist=$(_build_app_rules "" 2)
 assert_equals \
     '-A APP_CHAIN -m owner --uid-owner 1000 --gid-owner 1000 -j ACTION_BYPASS
@@ -74,6 +88,41 @@ assert_equals \
 -A APP_CHAIN6 -j ACCEPT' \
     "${allowlist_v6}" \
     "IPv6 empty allowlist must proxy zero applications"
+
+# shellcheck disable=SC2034
+MOBILE_INTERFACE=""
+# shellcheck disable=SC2034
+WIFI_INTERFACE=""
+# shellcheck disable=SC2034
+HOTSPOT_INTERFACE=""
+# shellcheck disable=SC2034
+USB_INTERFACE=""
+# shellcheck disable=SC2034
+PROXY_MOBILE=1
+# shellcheck disable=SC2034
+PROXY_WIFI=1
+# shellcheck disable=SC2034
+PROXY_HOTSPOT=1
+# shellcheck disable=SC2034
+PROXY_USB=1
+
+mode_zero_output=$(_build_chain_rules \
+    "PROXY_OUTPUT" "ACTION_PROXY_OUT" "-o" "" 0)
+assert_equals \
+    '-A PROXY_OUTPUT -j BYPASS_IP
+-A PROXY_OUTPUT -j APP_CHAIN
+-A PROXY_OUTPUT -j ACTION_PROXY_OUT' \
+    "${mode_zero_output}" \
+    "mode zero OUTPUT must run the engine bypass before proxy action"
+
+mode_zero_output_v6=$(_build_chain_rules \
+    "PROXY_OUTPUT6" "ACTION_PROXY_OUT6" "-o" "" 0)
+assert_equals \
+    '-A PROXY_OUTPUT6 -j BYPASS_IP6
+-A PROXY_OUTPUT6 -j APP_CHAIN6
+-A PROXY_OUTPUT6 -j ACTION_PROXY_OUT6' \
+    "${mode_zero_output_v6}" \
+    "IPv6 mode zero OUTPUT must run the engine bypass before proxy action"
 
 tmp_dir=$(mktemp -d)
 trap 'rm -rf "${tmp_dir}"' EXIT INT TERM

@@ -224,18 +224,17 @@ EOF
     }
 }
 
-# Build chain rules (chain, action, flag, ex_list, is_pre, app)
+# Build chain rules (chain, action, flag, ex_list, is_pre)
 _build_chain_rules() {
     local chain="${1}"
     local action="${2}"
     local flag="${3}"
     local ex_list="${4}"
     local is_pre="${5}"
-    local app="${6}"
 
     # Arguments passed via awk variables for safety
     awk -v chain="${chain}" -v action="${action}" -v flag="${flag}" -v ex_list="${ex_list}" \
-        -v is_pre="${is_pre}" -v app="${app}" \
+        -v is_pre="${is_pre}" \
         -v m_if="${MOBILE_INTERFACE}" -v m_en="${PROXY_MOBILE}" \
         -v w_if="${WIFI_INTERFACE}" -v w_en="${PROXY_WIFI}" \
         -v h_if="${HOTSPOT_INTERFACE}" -v h_en="${PROXY_HOTSPOT}" \
@@ -262,7 +261,7 @@ _build_chain_rules() {
         if (is_pre == "1") {
             printf "-A %s -j ACCEPT\n", chain
         } else {
-            if (app != "0") printf "-A %s -j APP_CHAIN%s\n", chain, suffix
+            printf "-A %s -j APP_CHAIN%s\n", chain, suffix
             printf "-A %s -j %s\n", chain, action
         }
     }'
@@ -377,17 +376,19 @@ _orchestrate() {
         _build_action_chain "ACTION_PROXY_OUT${suffix}" "${mark}" "${proxy_mark}" 0
 
         _build_bypass_ip_rules "${suffix}" "${family}"
-        [ "${app_mode}" != "0" ] && _build_app_rules "${suffix}" "${app_mode}"
+        # APP_CHAIN always carries the engine-owner loop escape. In mode 0 it
+        # returns non-engine traffic so the normal proxy action still runs.
+        _build_app_rules "${suffix}" "${app_mode}"
 
         _build_divert_rules "${suffix}" "${mark}" "${proxy_mark}"
         _build_fast_path_rules "${suffix}" "${mark}" "${proxy_mark}" "${bypass_mark}"
 
         _build_chain_rules \
             "PROXY_PREROUTING${suffix}" "ACTION_PROXY_PRE${suffix}" \
-            "-i" "${EXCLUDE_INTERFACES}" 1 "${app_mode}"
+            "-i" "${EXCLUDE_INTERFACES}" 1
         _build_chain_rules \
             "PROXY_OUTPUT${suffix}" "ACTION_PROXY_OUT${suffix}" \
-            "-o" "${EXCLUDE_INTERFACES}" 0 "${app_mode}"
+            "-o" "${EXCLUDE_INTERFACES}" 0
 
         printf -- '-I PREROUTING -j PROXY_PREROUTING%s\n' "${suffix}"
         printf -- '-I OUTPUT -j PROXY_OUTPUT%s\n' "${suffix}"

@@ -82,6 +82,7 @@ CORE_TIMEOUT=5
 PROXY_MODE=tproxy
 PROXY_PORT=1536
 PROXY_IPV6=0
+KFEAT_OWNER=1
 TUN_INTERFACE=tun0
 EOF
     printf '*mangle\nCOMMIT\n' >"${FLUX_ROOT}/cache/cache_rules_ipv4"
@@ -428,6 +429,52 @@ EOF
     ' || fail "Rust-owned config build invoked shell validation"
 
     assert_not_called sing-box
+}
+
+test_prepare_rejects_missing_xt_owner_before_init_or_generation_publication() {
+    reset_fixture
+    sed -i 's/^KFEAT_OWNER=.*/KFEAT_OWNER=0/' "${FLUX_ROOT}/cache/cache_config"
+    : >"${CALLS_FILE}"
+
+    if run_bridge prepare; then
+        fail "prepare accepted Rust-owned capture without xt_owner loop prevention"
+    fi
+
+    assert_not_called init
+    [ ! -e "${RUN_ROOT}/engine.manifest" ] ||
+        fail "xt_owner rejection published an engine manifest"
+    [ ! -d "${GENERATIONS_ROOT}/1" ] ||
+        fail "xt_owner rejection retained incomplete generation artifacts"
+    [ ! -e "${RUN_ROOT}/capture.active" ] ||
+        fail "xt_owner rejection published capture ownership"
+    assert_not_called core
+    assert_not_called addrsync
+    assert_not_called tproxy
+}
+
+test_prepare_revalidates_xt_owner_generated_by_init() {
+    reset_fixture
+    write_stub init '
+printf "init:%s\n" "$*" >>/data/adb/flux/run/test-calls
+sed -i "s/^KFEAT_OWNER=.*/KFEAT_OWNER=0/" /data/adb/flux/cache/cache_config
+: >/data/adb/flux/cache/cache_valid
+exit 0'
+
+    if run_bridge prepare; then
+        fail "Rust-owned prepare trusted pre-init xt_owner after generated capability mismatch"
+    fi
+
+    grep -qx 'init:init' "${CALLS_FILE}" ||
+        fail "generated xt_owner test did not exercise init"
+    [ ! -e "${RUN_ROOT}/engine.manifest" ] ||
+        fail "init-generated missing xt_owner published an engine manifest"
+    [ ! -d "${GENERATIONS_ROOT}/1" ] ||
+        fail "init-generated missing xt_owner retained incomplete generation artifacts"
+    [ ! -e "${RUN_ROOT}/capture.active" ] ||
+        fail "init-generated missing xt_owner published capture ownership"
+    assert_not_called core
+    assert_not_called addrsync
+    assert_not_called tproxy
 }
 
 test_capture_start_owns_only_addrsync_and_tproxy() {
@@ -980,6 +1027,8 @@ test_prepare_rejects_missing_proxy_mode_without_artifacts
 test_prepare_revalidates_proxy_mode_generated_by_init
 test_active_tproxy_prepare_rejects_tun_without_disturbance
 test_rust_owned_config_build_skips_unpinned_sing_box_check
+test_prepare_rejects_missing_xt_owner_before_init_or_generation_publication
+test_prepare_revalidates_xt_owner_generated_by_init
 test_capture_start_owns_only_addrsync_and_tproxy
 test_capture_start_compensates_partial_failure
 test_capture_start_preserves_retry_evidence_when_compensation_fails

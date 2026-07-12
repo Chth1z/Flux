@@ -855,7 +855,7 @@ Typestate participant Interfaces give Locality to phase-specific cleanup. The nf
 
 Android variation is modeled as strategies and facts, not conditionals spread across capture Adapters. Built-in extensions may include:
 
-- mark/rule-priority allocator for observed netd/vendor state;
+- device-qualified mark-authority verification and traffic-domain-aware RPDB planning; observed netd/vendor state alone never allocates a mark field;
 - VPN coexistence policy for VPN-underlay, VPN-over-Flux, or explicit refusal;
 - tethering/interface-role classifier;
 - CLAT/NAT64 inventory and bypass policy contributor;

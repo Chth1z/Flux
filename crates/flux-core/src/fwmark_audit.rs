@@ -11,7 +11,7 @@ pub const ANDROID_NET_ID_FWMARK_MASK: u32 = 0x0000_ffff;
 /// Maximum detailed conflicts retained in one partial fwmark audit.
 pub const MAX_FWMARK_PARTIAL_CONFLICTS: usize = 64;
 
-const FWMARK_SOURCE_STATUSES: [FwmarkSourceStatus; 8] = [
+const FWMARK_SOURCE_STATUSES: [FwmarkSourceStatus; 9] = [
     FwmarkSourceStatus::new(
         FwmarkEvidenceSource::AndroidNetId,
         FwmarkEvidenceState::Available,
@@ -33,6 +33,7 @@ const FWMARK_SOURCE_STATUSES: [FwmarkSourceStatus; 8] = [
         FwmarkEvidenceSource::TrafficControlAndBpf,
         FwmarkEvidenceState::Unavailable,
     ),
+    FwmarkSourceStatus::new(FwmarkEvidenceSource::Xfrm, FwmarkEvidenceState::Unavailable),
     FwmarkSourceStatus::new(
         FwmarkEvidenceSource::ConnmarkAndSocketTransfers,
         FwmarkEvidenceState::Unavailable,
@@ -190,6 +191,7 @@ pub enum FwmarkEvidenceSource {
     LegacyXtables,
     Nftables,
     TrafficControlAndBpf,
+    Xfrm,
     ConnmarkAndSocketTransfers,
     ExistingFluxOwnership,
 }

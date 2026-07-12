@@ -257,6 +257,13 @@ The legacy networking configuration remains `/data/adb/flux/conf/settings.ini`. 
 | `PROXY_IPV6` | Enable/Disable IPv6 Proxying | `0` |
 
 ### 7. Routing Mark
+
+> [!WARNING]
+> These options describe the legacy shell bridge only. Its `0xff` mask overlaps Android's
+> low-16-bit `netId` field and is not an approved default for the Rust rewrite. The native planner
+> requires an explicit device-qualified mark grant plus a complete live census; neither an empty
+> scan nor an explicit legacy value can bypass that authority.
+
 | Option | Description | Default |
 |--------|-------------|---------|
 | `ROUTING_MARK` | Core/Bypass Routing Mark (empty=UID match) | (empty) |

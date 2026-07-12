@@ -7,6 +7,7 @@
 //! mutation intent explicit at their domain boundaries.
 
 mod address_bypass;
+mod android_mark_authority;
 mod android_rpdb;
 mod android_tproxy_topology;
 mod capability;
@@ -27,6 +28,22 @@ pub use address_bypass::{
     AddressHostSetPlan, AddressHostSetPlanError, AddressHostSetPolicy,
     MAX_ADDRESS_BYPASS_CONFLICTS, MAX_ADDRESS_BYPASS_RULES, StaleAddressBypassPlan,
     StaleAddressHostSetPlan, plan_address_bypass, plan_address_host_set,
+};
+pub use android_mark_authority::{
+    ANDROID_DEVICE_QUALIFIED_CANDIDATE_MASK, ANDROID_MARK_DEVICE_POLICY_ARTIFACT_DIGEST_BYTES,
+    AndroidMarkCandidateEligibilityError, AndroidMarkDeviceGrantKind, AndroidMarkDevicePolicy,
+    AndroidMarkDevicePolicyArtifactDigest, AndroidMarkDevicePolicyArtifactDigestError,
+    AndroidMarkDevicePolicyError, AndroidMarkDevicePolicyIdentity, AndroidMarkDevicePolicyKind,
+    AndroidMarkDevicePolicyName, AndroidMarkDevicePolicyNameError, AndroidMarkDevicePolicyRevision,
+    AndroidMarkPlanningAuthority, AndroidMarkPlanningAuthorizationError, AndroidMarkPositiveGrant,
+    COMPLETE_FWMARK_CENSUS_COVERAGE_RECORDS, CompleteFwmarkCensus, CompleteFwmarkCensusError,
+    CompleteFwmarkCensusObservationId, DeferredAndroidMarkActivationPrerequisite,
+    FwmarkCensusCollectorRevision, FwmarkCensusConflict, FwmarkCensusCoverageRecord,
+    FwmarkCensusCoverageState, FwmarkPlane, FwmarkPlaneSet, FwmarkUseOperation, FwmarkUseRecord,
+    FwmarkUseRecordError, MAX_ANDROID_MARK_DEVICE_POLICY_NAME_BYTES,
+    MAX_COMPLETE_FWMARK_CENSUS_MARK_USES, NetworkNamespaceIdentity,
+    OWNERSHIP_JOURNAL_IDENTITY_BYTES, OwnershipJournalIdentity, OwnershipJournalIdentityError,
+    OwnershipJournalRevision, authorize_android_mark_planning,
 };
 pub use android_rpdb::{
     AndroidRpdbClassificationReport, AndroidRpdbPlacementPlanError, AndroidRpdbPolicyProfile,

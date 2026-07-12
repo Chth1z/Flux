@@ -30,6 +30,6 @@
 - [ADR-0003: kernel floor and active probes](adr/0003-kernel-floor-and-active-capability-probes.md)
 - [ADR-0004: optional eBPF observation/acceleration](adr/0004-ebpf-is-optional-observation-and-acceleration.md)
 - [ADR-0005: nftables with compatible fallbacks](adr/0005-prefer-native-nftables-with-compatible-fallbacks.md)
-- [ADR-0006: audited mark allocation](adr/0006-allocate-marks-after-android-conflict-analysis.md)
+- [ADR-0006: positive device-qualified mark authority](adr/0006-allocate-marks-after-android-conflict-analysis.md)
 - [ADR-0007: respect Android VPN policy](adr/0007-respect-android-vpn-policy-by-default.md)
 - [ADR-0008: minimal Controller, internal planner](adr/0008-minimal-controller-with-internal-strategy-planner.md)

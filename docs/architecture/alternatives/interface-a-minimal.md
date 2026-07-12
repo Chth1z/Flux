@@ -300,9 +300,9 @@ This serial order is intentional. Kernel networking state is shared and ordering
 ### 2.3 Android coexistence invariants
 
 1. Android-owned marks, RPDB rules, routes, netfilter chains/tables, cgroup programs, qdiscs, and VPN state are Observed State, never Managed Objects.
-2. Mark writes are masked merges using a conflict-audited lease.
+2. Mark writes are masked merges only after the current technical specification's device-qualified planning authority and a later activation lease both succeed; observation alone never allocates the complement of seen masks.
 3. The default policy respects Android VPN, always-on VPN, and lockdown routing.
-4. A Backend Plan is rejected or Degraded if safe rule priority, mark lease, hook placement, or ownership cannot be proven.
+4. A Backend Plan is rejected or Degraded if safe rule priority, mark authority, hook placement, or ownership cannot be proven.
 5. netd restart begins a new Network Epoch and invalidates affected observations and leases.
 6. Netlink loss or an inconsistent dump requires a full observation before further activation.
 

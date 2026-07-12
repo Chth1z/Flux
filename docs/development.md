@@ -24,6 +24,15 @@ cargo xtask ci
 
 `cargo xtask ci` runs formatting, host checks/tests, Clippy with warnings denied, and the Android cross-check for the new workspace.
 
+The focused Phase 3 Android mark-authority model can be exercised with:
+
+```text
+cargo test -p flux-core --test android_mark_authority
+```
+
+This is a pure planning checkpoint. A passing host test does not replace production Android
+device-policy verification, complete mark-census collection, or activation canaries.
+
 The compatibility submodule remains separate:
 
 ```text

@@ -161,6 +161,13 @@ enum EbpfPreference { Auto, Off, Observe, Accelerate }
 enum TriState { Auto, On, Off }
 enum AutoToggle { Auto, On, Off }
 
+enum MarkPolicy {
+    Auto,
+    Explicit { mask: u32, proxy_value: u32, bypass_value: u32 },
+}
+
+enum RoutingPolicy { Auto }
+
 struct TunPolicy {
     stack: TunStackPreference,
     interface: InterfaceName,
@@ -252,11 +259,13 @@ backend = "auto"
 ipv6 = "auto"
 
 [capture.marks]
-allocation = "auto"
+allocation = "auto" # auto | explicit
+# mask = "0x..."         # required only for explicit
+# proxy_value = "0x..."  # required only for explicit
+# bypass_value = "0x..." # required only for explicit
 
 [capture.routing]
-table = "auto"
-rule_priority = "auto"
+allocation = "auto"
 
 [android]
 respect_android_vpn = true
@@ -302,7 +311,9 @@ max_download_bytes = 16777216
 max_nodes = 10000
 ```
 
-The legacy values (`0x14`, `0x19`, `0x11` under mask `0xff`, table/priority `2025`) are imported only as compatibility candidates. They are not presumed safe: AOSP netd assigns bits 0–15 of the fwmark to `netId`, so the compiler must remap or reject overlapping legacy marks. New installations use automatic allocation after live mark/rule conflict analysis.
+For marks, `auto` asks the planner to derive a candidate; it does not create authority or promise that a candidate exists. `explicit` requires every commented mark value and supplies only a candidate subject to the same conflict, freshness, ownership, and activation gates as `auto`. It is not an expert override. The legacy mark values (`0x14`, `0x19`, `0x11` under mask `0xff`) are imported only as explicit compatibility candidates. Generic AOSP grants Flux no mark field, so neither a new-installation `auto` request nor an explicit value may become a TPROXY mark plan without a matching device-qualified positive assertion and complete live evidence.
+
+Routing currently admits only `allocation = "auto"`, meaning topology-qualified candidate derivation rather than a promise of success. A singular explicit table/priority schema is deliberately deferred: one atomic Traffic Scope retains per-anchor intervals and may have no common priority across residual-local and tether domains. The legacy table/priority `2025` is therefore a migration diagnostic, not a native routing candidate, until the next Phase 3 slice defines the per-domain realization contract.
 
 ## 6. Capability Profile
 
@@ -482,9 +493,11 @@ Forwarded traffic never evaluates an OUTPUT-only UID predicate. Local and forwar
 - Proxy and bypass values differ under the mask.
 - Values contain no bits outside the mask.
 - Every update preserves bits outside the Flux mask.
-- The Flux mask is disjoint from AOSP netd's `netId` field and any other Android/vendor fields discovered in active rules or device policy.
+- Generic AOSP grants no Flux mark field; a conflict-free scan is not positive authority.
+- Bits 21–30 (`0x7fe0_0000`) are only the syntactic envelope in which a device-qualified policy may name a candidate, not a reservation.
+- The Flux mask is disjoint from every externally observed predicate read, masked write, transfer read, and transfer write on packet, socket, and conntrack marks.
 - The current legacy low-byte mask `0xff` is never accepted merely because it was previously configured.
-- Observed Android/vendor rules are checked for overlapping semantics before activation.
+- Opaque RPDB evidence rejects authority; unobserved or opaque bits are never allocated by complement.
 - Engine outbound sockets receive an unambiguous bypass identity.
 - IPv4 and IPv6 may share the same value only when route rules remain unambiguous.
 
@@ -570,20 +583,20 @@ All route/rule operations use rtnetlink from the daemon.
 
 ### 11.1 TPROXY routing
 
-For each enabled family:
+For each enabled family, a future activation-capable TPROXY plan requires:
 
-- one Flux-owned fwmark rule using the configured value/mask and validated priority;
+- one Flux-owned fwmark rule using an authorized mark candidate and a separately admitted routing candidate;
 - one local default route in the Flux table to loopback;
 - address-derived higher-priority bypass rules for active local interface addresses where required by the selected topology;
 - exact cleanup messages carrying the same attributes used to create objects.
 
-Rule priority is allocated only after parsing the Android RPDB. With `respect_android_vpn = true`, the selected placement must preserve secure/lockdown VPN and per-UID network selection. A fixed legacy priority such as `2025` is not accepted without a proven device-specific policy.
+Routing candidates remain unselected until the complete Android RPDB grammar, requested traffic-domain topology, table occupancy, ownership evidence, and later activation prerequisites admit them. With `respect_android_vpn = true`, placement must preserve secure/lockdown VPN and per-UID network selection. A fixed legacy priority such as `2025` is not accepted as a native candidate, and the final explicit routing schema remains deferred until per-domain realization is designed.
 
 Implementation checkpoint: `flux-core` now has a mutation-free address-bypass planner. It consumes one complete `NetworkInventory` plus an explicit caller-resolved per-family priority, lookup-table, and rule-protocol specification; it does not allocate those values or claim that numeric placement alone preserves Android VPN policy. The planner filters unusable, disabled-family, flag-matched, exact-address, and CIDR-matched facts; normalizes valid IPv4-mapped inputs; rejects mapped prefixes crossing the mapping boundary; deduplicates addresses across interfaces; and emits deterministic `/32` or `/128` destination-host intents under a fixed rule-count budget. The result is bound to both the source `NetworkEpoch` and an opaque process-local snapshot identity so an equal epoch from another observer cannot authorize later work. Selected-priority occupancy is audited against the ordered rule multiset with bounded diagnostics. Even an exact canonical `NetworkRuleRecord` remains an unowned conflict: canonical equality is not journal/raw ownership evidence, so adoption, retirement, native encoding, and cleanup remain deferred.
 
-The versioned RPDB placement checkpoint adds a pure audit around that planner. A classifier must provide exactly one ordered classification for every observed rule and explicit must-precede and terminal boundaries for each enabled family. A rule with semantically opaque attributes rejects placement in an enabled family before any caller classification is trusted; opacity in a disabled family remains outside that family-scoped lease. The audit otherwise admits a candidate only when `last must-precede < address bypass < Flux proxy < first terminal barrier`, both requested priority slots are empty, no GOTO edge intersects the candidate interval, and the proposed Flux-private table has no route or rule occupancy in that family. IPv4 and IPv6 admission is atomic, and the resulting process-local lease is bound to snapshot identity, epoch, and classifier revision; it can project only the address-bypass priorities targeting Linux table 254. This is placement evidence, not an Android VPN-safety or activation proof: selector-overlap analysis, mark allocation, route reachability, boot and namespace binding, durable ownership, exact mutation identity, and contained device canaries remain required before native writes.
+The versioned RPDB placement checkpoint adds a pure audit around that planner. A classifier must provide exactly one ordered classification for every observed rule and explicit must-precede and terminal boundaries for each enabled family. A rule with semantically opaque attributes rejects placement in an enabled family before any caller classification is trusted; opacity in a disabled family remains outside that family-scoped lease. The audit otherwise admits a candidate only when `last must-precede < address bypass < Flux proxy < first terminal barrier`, both requested priority slots are empty, no GOTO edge intersects the candidate interval, and the proposed Flux-private table has no route or rule occupancy in that family. IPv4 and IPv6 admission is atomic, and the resulting process-local lease is bound to snapshot identity, epoch, and classifier revision; it can project only the address-bypass priorities targeting Linux table 254. This is placement evidence, not an Android VPN-safety or activation proof: positive mark authority, route reachability, boot and namespace binding, durable ownership, exact mutation identity, and contained device canaries remain required before native writes.
 
-A third pure checkpoint now performs only the fwmark conflict analysis that current Rust evidence can honestly support. It validates one nonzero common mask with distinct nonzero proxy and bypass values, exposes masked-merge semantics that preserve every outside bit, and reports definite overlap with Android's low 16-bit `netId` field plus every ordered IPv4/IPv6 RPDB fwmark selector. Conflict evidence is bounded without changing the decision, and the report is bound to the exact inventory snapshot and epoch. Its RPDB source status becomes `Opaque` if any rule carries unmodeled attributes; this does not invent a collision, and known selector overlaps remain definite conflicts alongside the incomplete source state. There is intentionally no accepted outcome and no `MarkLease`: a conflict-free or semantically opaque RPDB report remains `Incomplete`, while device-qualified positive allocation authority, complete xtables/nftables and TC/BPF censuses, socket/connmark transfer semantics, other-instance ownership, boot and namespace identity, exact writer behavior, observer continuity, and activation canaries remain unavailable or deferred. Unobserved or opaque bits must never be treated as allocatable by taking the complement of current conflicts.
+A third pure checkpoint performs the partial fwmark conflict analysis that current `NetworkInventory` evidence can support. It validates one nonzero common mask with distinct nonzero proxy and bypass values, exposes masked-merge arithmetic that preserves every outside bit, and reports definite overlap with Android's low 16-bit `netId` field plus every ordered IPv4/IPv6 RPDB fwmark selector. Conflict evidence is bounded without changing the decision, and the report is bound to the exact inventory snapshot and epoch. Its RPDB source status becomes `Opaque` if any rule carries unmodeled attributes; this does not invent a collision, and known selector overlaps remain definite conflicts alongside the incomplete source state. The partial report alone has no accepted outcome and no `MarkLease`: device policy, xtables, nftables, TC/BPF, XFRM, socket/connmark transfers, and existing Flux ownership require stronger evidence. Unobserved or opaque bits must never be treated as allocatable by taking the complement of current conflicts.
 
 The Android RPDB classifier checkpoint is also pure. Callers must explicitly select one exact source-pinned grammar: AOSP Android 12 r1, Android 13 r1, or the repository's pinned March 2025 netd revision. The classifier never guesses from an SDK level or priorities. It matches the complete AOSP rule shape—wildcard prefixes, zero TOS, origin protocol, action, table class, fwmark/mask, loopback/input/output interface, UID presence, flags, and absence of every unrelated selector—then retains one aligned role per ordered rule plus bounded unknown diagnostics. Opaque attributes, unfamiliar priorities, one-field signature drift, unsupported actions or flags, missing initialization sentinels, and nonmonotonic per-family order fail closed. Exact kernel-local and recognized Android roles through UID-default-unreachable become `MustPrecedeFlux`; exact default-network and global unreachable rules become `TerminalBarrier`; the classifier never emits `DoesNotConstrainFlux` without a later traffic-domain proof.
 
@@ -594,6 +607,10 @@ The next pure checkpoint separates realization-neutral address selection from th
 Android TPROXY topology assessment is traffic-domain and observed-anchor aware. Each report is bound to one exact observed `DefaultNetwork` or `Tethering` rule, its classifier revision, and the corresponding present, administratively-up input-link identity. Residual local OUTPUT inherits the anchor's `iif lo` and Android fwmark predicate; tether ingress inherits the exact non-loopback `iif`. Only a trusted input-interface mismatch or incompatible fwmark predicate is selector-disjoint. Unknown/opaque rules and an invalid family profile remain unknown before any disjointness claim, and overlapping same-domain anchors that select distinct tables are rejected as ambiguous. Android 12 therefore has no local-output slot, Android 13+ has only `30999`, and an exact tether domain has the open interval `20000 < priority < 21000`. The existing unqualified address-bypass rule is not a valid tether-domain shape because placing it in that interval could also affect local OUTPUT. These are structural intervals only: the report exposes no selected priority, placement/mark lease, route intent, or mutation identity. Even a one-slot residual window still requires one-rule address handling, positive mark authority, exact Capture Program ordering, per-connection domain identity, Android network-selection handoff, route reachability canaries, boot/namespace binding, observer continuity, durable ownership, exact mutation identity, and an explicit Proxy Engine loop escape.
 
 The multi-domain scope checkpoint keeps that evidence atomic without turning it into a plan. One bounded, nonempty, duplicate-free request binds exactly one routing shape to selected residual-local families and exact tether ingress interfaces. The assessor discovers every recognized anchor matching each requested domain, retains every per-anchor interval, selector, link identity, disposition vector, and structural result in deterministic request/dump order, and rejects a missing domain, mixed inventory/classifier evidence, an unusable or ambiguous anchor, or an exceeded request/report bound without returning a partial scope. Valid negative results remain diagnostic data. The aggregate summary gives definite domain incompatibility or slot exhaustion precedence over incomplete evidence; otherwise any incomplete anchor makes the scope incomplete, and only all residual windows yield an all-candidate structural summary. Freshness re-runs complete domain discovery and every per-anchor assessment against the current inventory and classifier, so anchor additions, removals, reorderings, link reuse, opacity, profile drift, or selector/table drift invalidate the old scope. The scope still selects no common priority, route table, mark, route intent, ownership identity, encoder, or mutation operation.
+
+The positive Android mark-authority checkpoint is also planning-only. Generic AOSP is an explicit zero-grant policy, and bits 21–30 are merely the device-qualified candidate envelope. The device-policy factory records an external trust-boundary assertion rather than verifying the artifact: it binds the exact mark candidate and topology scope, the full `CapabilityProfile` with verified boot identity, network-namespace identity, a named cooperative device policy with a nonzero SHA-256 artifact digest and revision, and the exact nonempty plane set asserted by that policy. A partial assertion is representable for diagnostics but cannot authorize planning; authorization requires the grant to cover packet, socket, and conntrack marks. It then consumes one non-`Clone`, point-in-time census with exactly 27 complete-present/complete-absent coverage records: Android `netId`, RPDB, device policy, legacy xtables, nftables, TC/BPF, XFRM, connmark/socket transfers, and existing Flux ownership across all three planes. The census accepts at most 512 raw mark-use records before canonical sorting and deduplication, and binds the exact inventory snapshot/epoch, full Capability Profile, namespace, policy identity/revision, collector revision, and ownership-journal identity/revision. Any candidate-mask overlap with an external predicate read, masked write, transfer read, or transfer write rejects regardless of values; opaque RPDB evidence also rejects. Known mark conflicts are reported before an otherwise incomplete topology result, while definite topology incompatibility remains a structural rejection.
+
+`AndroidMarkPlanningAuthority` has no public constructor and cannot become a `MarkLease`, priority, table, route intent, encoder, mutation operation, activation lease, or writer. Reauthorization consumes the authority and requires a newly collected census observation. Exact writer semantics, mark-observer continuity, and a mark-preservation canary remain mark-specific activation prerequisites. The topology separately retains exact Capture Program ordering, domain-identity and Android network-selection handoff, route-reachability canaries, observer continuity, durable ownership, exact mutation identity, and Proxy Engine loop escape; the pre-mark host-set shape also retains one-rule address-handling proof. Binding the census to the ownership journal is freshness evidence, not ownership or cleanup authority.
 
 ### 11.2 Network events
 

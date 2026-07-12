@@ -130,6 +130,7 @@ fn conflict_free_rpdb_evidence_remains_explicitly_incomplete() {
                 FwmarkEvidenceSource::TrafficControlAndBpf,
                 FwmarkEvidenceState::Unavailable,
             ),
+            (FwmarkEvidenceSource::Xfrm, FwmarkEvidenceState::Unavailable,),
             (
                 FwmarkEvidenceSource::ConnmarkAndSocketTransfers,
                 FwmarkEvidenceState::Unavailable,

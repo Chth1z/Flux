@@ -6,7 +6,7 @@ Minimum supported kernel required by the project: Linux 5.10
 
 ## Executive findings
 
-1. Android's packet/socket mark is shared platform state, not a free-form tag. AOSP uses bits 0-15 for the Android network ID and additional bits for explicit network selection, VPN protection, permissions, billing, vendor use, and wakeup accounting. Flux must update only a device-audited mask and preserve all other bits. The current Flux values `0x14`, `0x19`, and `0x11` under mask `0xff` overlap Android's network-ID field and are unsafe for the rewrite. [S8], [S9]
+1. Android's packet/socket mark is shared platform state, not a free-form tag. AOSP uses bits 0-15 for the Android network ID and additional bits for explicit network selection, VPN protection, permissions, billing, vendor use, and wakeup accounting. Generic AOSP grants Flux no mark field; even bits 21–30 are only a device-qualified candidate envelope. The current Flux values `0x14`, `0x19`, and `0x11` under mask `0xff` overlap Android's network-ID field and are unsafe for the rewrite. [S8], [S9]
 
 2. Android's routing policy database is part of ConnectivityService/netd's control plane. Current AOSP priorities 10000-32000 encode secure VPN, per-UID, explicit-network, local-network, tethering, default-network, and unreachable behavior. A Flux rule at priority 2025 precedes all of them; once Flux marks a packet, that placement can bypass Android VPN/lockdown decisions. The rewrite needs an explicit policy such as `respect_android_vpn = true`, a runtime rule audit, and a tested placement strategy rather than a fixed global priority. [S10]
 
@@ -133,29 +133,27 @@ netd reads the existing `SO_MARK`, updates selected fields, and writes the merge
 
 There is no public allocator for third-party mark bits. Even AOSP-reserved bits are not a perpetual promise to Magisk modules, and OEM QoS/security code may use additional masks.
 
-### 3.2 Required mark allocator
+### 3.2 Required positive mark authority
 
-The rewrite should model marks as a resource:
+Negative conflict analysis cannot allocate a mark field. Generic AOSP has no public allocator and is modeled as an explicit zero grant. The inclusive bits 21–30 mask (`0x7fe0_0000`) is only a syntactic envelope in which an exact device-qualified policy may name a candidate; it is not a reservation, and taking the complement of observed masks is forbidden.
 
-```text
-MarkLease {
-    mask,
-    proxy_value,
-    bypass_value,
-    purpose,
-    evidence,
-    conflicts[],
-}
-```
+A positive grant is an external trust-boundary assertion, not verification performed by `flux-core`. It binds the exact mask/proxy/bypass candidate, exact atomic TPROXY topology scope, full `CapabilityProfile` with verified boot identity, network-namespace identity, a named cooperative policy with a nonzero SHA-256 artifact digest and policy revision, and the exact nonempty mark-plane set asserted by that policy. A partial plane assertion is representable but insufficient: planning authorization requires packet, socket, and conntrack coverage. Automatic and explicit mark configuration supply candidates only and require the same grant; explicit input is not an override.
 
-Startup allocation must:
+Live authorization consumes one point-in-time, non-cloneable complete census. It requires exactly nine sources across all three planes, or 27 complete-present/complete-absent coverage records:
 
-1. Parse current IPv4/IPv6 rules and their `FRA_FWMARK/FRA_FWMASK` values.
-2. Inspect legacy iptables MARK, CONNMARK, socket, TPROXY, and owner rules.
-3. Inspect nftables rules and sets when nft is present.
-4. Inspect TC filters/actions that read or write marks.
-5. Reject overlap with AOSP's defined fields, known Android connmark flags, vendor rules, or another Flux instance.
-6. Permit an expert override, but expose the overlap in status and logs.
+1. Android `netId`;
+2. RPDB selectors;
+3. device mark policy;
+4. legacy xtables;
+5. nftables;
+6. TC/BPF;
+7. XFRM;
+8. connmark/socket transfers;
+9. existing Flux ownership.
+
+Missing, duplicate, incomplete, opaque, denied, transient, unavailable, inconsistent, or over-budget coverage grants no authority. The census accepts at most 512 raw predicate-read, masked-write, transfer-read, or transfer-write records before canonical sorting and deduplication, and binds the exact inventory snapshot identity/epoch, full capability facts and boot, namespace, policy identity/revision, collector revision, and durable ownership-journal identity/revision. Any candidate-mask overlap with an external use rejects regardless of the compared values. Opaque RPDB evidence rejects even if another census cell claims completeness, and known conflicts are decided before an otherwise incomplete topology report.
+
+The resulting `AndroidMarkPlanningAuthority` is privately constructed, non-`Clone`, and limited to pure planning. It exposes no `MarkLease`, rule priority, route table, route intent, encoder, writer, ownership operation, mutation authority, or activation conversion. Reauthorization consumes it and requires a newly collected census. Exact writer semantics, mark-observer continuity, and a mark-preservation canary remain mark-specific prerequisites; Capture Program ordering, domain/network-selection handoff, route reachability, topology observer continuity, durable ownership, exact mutation identity, engine loop escape, and shape-specific one-rule address handling remain separate topology prerequisites.
 
 All writes use masked merge semantics:
 
@@ -163,7 +161,7 @@ All writes use masked merge semantics:
 new_mark = (old_mark & ~flux_mask) | (flux_value & flux_mask)
 ```
 
-For sockets, call `getsockopt(SO_MARK)` before `setsockopt`. For xtables use `--set-xmark value/mask` and explicit `--nfmask/--ctmask` on CONNMARK operations. Never save, restore, or overwrite all 32 bits.
+This formula is arithmetic, not write authority. A future writer must still call `getsockopt(SO_MARK)` before `setsockopt`; xtables must use `--set-xmark value/mask` and explicit `--nfmask/--ctmask` on CONNMARK operations. Never save, restore, or overwrite all 32 bits.
 
 ### 3.3 Android RPDB and VPN policy
 
@@ -490,7 +488,7 @@ Acceptance invariants:
 ## 12. Recommended architecture decisions for the blueprint
 
 1. Make `fluxd` the single desired-state owner for address sync, RPDB, TUN, netfilter, capability probing, supervision, and status. Shell scripts only enter the Magisk lifecycle and provide emergency glue.
-2. Replace fixed marks and rule priorities with audited leases and a documented Android-VPN policy.
+2. Replace fixed marks with device-qualified positive planning authority and fixed priorities with topology-qualified routing candidates; keep both separate from activation leases and preserve the documented Android-VPN policy.
 3. Keep Android legacy xtables as the compatibility baseline; add nftables as an atomic optional backend, not a simultaneous overlay.
 4. Prefer nft native sets over ipset in the nft backend; retain ipset only as an optional legacy accelerator.
 5. Implement TUN as a first-class backend with engine-owned queues first; adapt engine multiqueue/offloads through its version-qualified profile and reserve direct queue control for a future FD-handoff contract.

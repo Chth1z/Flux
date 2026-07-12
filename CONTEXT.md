@@ -68,6 +68,18 @@ _Avoid_: Auto mode, fallback chain
 A device networking object that Flux can identify as its own, reconstruct from a Generation, and safely remove without disturbing Android-owned state.
 _Avoid_: Flux rule, temporary state
 
+**Planning Authority**:
+Freshness-bound positive evidence that permits a later pure planning step while exposing every remaining prerequisite; it is never an activation lease or mutation capability.
+_Avoid_: Approval, safe-to-apply flag
+
+**Device-qualified Mark Grant**:
+An externally established cooperative device-policy assertion binding one exact mark candidate to its topology, Capability Profile, boot, network namespace, policy artifact, revision, and storage planes.
+_Avoid_: Free bits, expert override
+
+**Mark Census**:
+A bounded, consumed point-in-time assertion covering every required mark source and packet, socket, and conntrack plane, including explicit complete absence.
+_Avoid_: Mark cache, available-bit scan
+
 ## Configuration sources
 
 **Subscription Snapshot**:

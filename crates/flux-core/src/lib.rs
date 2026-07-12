@@ -14,6 +14,7 @@ mod capability;
 mod config;
 mod control;
 mod fwmark_audit;
+mod fwmark_census;
 mod network_inventory;
 mod network_route;
 mod network_rule;
@@ -88,6 +89,10 @@ pub use fwmark_audit::{
     FwmarkEvidenceSource, FwmarkEvidenceState, FwmarkPartialAudit, FwmarkPartialAuditOutcome,
     FwmarkPartialConflict, FwmarkRole, FwmarkSourceStatus, MAX_FWMARK_PARTIAL_CONFLICTS,
     StaleFwmarkPartialAudit, audit_fwmark_candidate_partial,
+};
+pub use fwmark_census::{
+    RpdbFwmarkCensusFragment, RpdbFwmarkCensusFragmentError, StaleRpdbFwmarkCensusFragment,
+    project_rpdb_fwmark_census_fragment,
 };
 pub use network_inventory::{
     AddressFlagConflict, INTERFACE_LINK_KIND_MAX_BYTES, INTERFACE_NAME_MAX_BYTES,

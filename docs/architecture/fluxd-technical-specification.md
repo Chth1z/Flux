@@ -346,6 +346,14 @@ enum CapabilityStatus {
 }
 ```
 
+The target record includes exact device identity, but the delivered `CapabilityProfile` model is
+currently narrower: it binds boot identity, kernel facts, SELinux state, and the legacy bridge, but
+not exact Android product/build/vendor identity or the selected netd/Connectivity artifact. A
+production positive mark-policy loader therefore remains blocked until those facts enter the full
+freshness-bound profile, or an equally strict qualification report is retained and rechecked by
+policy binding and census authorization. Parsing an arbitrary manifest and hashing its own bytes
+must not create a device-qualified grant.
+
 ### 6.2 Version catalog
 
 Every optional feature entry has:
@@ -611,6 +619,19 @@ The multi-domain scope checkpoint keeps that evidence atomic without turning it 
 The positive Android mark-authority checkpoint is also planning-only. Generic AOSP is an explicit zero-grant policy, and bits 21–30 are merely the device-qualified candidate envelope. The device-policy factory records an external trust-boundary assertion rather than verifying the artifact: it binds the exact mark candidate and topology scope, the full `CapabilityProfile` with verified boot identity, network-namespace identity, a named cooperative device policy with a nonzero SHA-256 artifact digest and revision, and the exact nonempty plane set asserted by that policy. A partial assertion is representable for diagnostics but cannot authorize planning; authorization requires the grant to cover packet, socket, and conntrack marks. It then consumes one non-`Clone`, point-in-time census with exactly 27 complete-present/complete-absent coverage records: Android `netId`, RPDB, device policy, legacy xtables, nftables, TC/BPF, XFRM, connmark/socket transfers, and existing Flux ownership across all three planes. The census accepts at most 512 raw mark-use records before canonical sorting and deduplication, and binds the exact inventory snapshot/epoch, full Capability Profile, namespace, policy identity/revision, collector revision, and ownership-journal identity/revision. Any candidate-mask overlap with an external predicate read, masked write, transfer read, or transfer write rejects regardless of values; opaque RPDB evidence also rejects. Known mark conflicts are reported before an otherwise incomplete topology result, while definite topology incompatibility remains a structural rejection.
 
 `AndroidMarkPlanningAuthority` has no public constructor and cannot become a `MarkLease`, priority, table, route intent, encoder, mutation operation, activation lease, or writer. Reauthorization consumes the authority and requires a newly collected census observation. Exact writer semantics, mark-observer continuity, and a mark-preservation canary remain mark-specific activation prerequisites. The topology separately retains exact Capture Program ordering, domain-identity and Android network-selection handoff, route-reachability canaries, observer continuity, durable ownership, exact mutation identity, and Proxy Engine loop escape; the pre-mark host-set shape also retains one-rule address-handling proof. Binding the census to the ownership journal is freshness evidence, not ownership or cleanup authority.
+
+The first concrete census-source checkpoint is now an inventory-bound RPDB fwmark fragment. Linux
+FIB rules predicate on a transient `flowi_mark`: packet-origin paths populate it from `skb->mark`,
+while local-output paths populate it from `sk->sk_mark`. Every modeled `fwmark` selector therefore
+emits an ordered packet-plane and socket-plane `PredicateRead` using the selector mask; RPDB does
+not directly read conntrack marks, so that cell is complete-absent. Exact rule dump order and
+duplicates are retained. Any semantically opaque rule makes both packet and socket coverage
+opaque, but known selectors remain in the fragment. The exact 512-raw-record budget is enforced
+before sorting or deduplication, so 256 selectors fit and selector 257 rejects without truncation.
+The fragment binds the exact inventory snapshot identity and epoch, carries no complete-collector
+revision or policy/ownership bindings, and exposes no conversion to a complete Mark Census,
+Planning Authority, lease, encoder, writer, or mutation operation. The other 24 source-plane cells
+and cross-source point-in-time coordination remain deferred.
 
 ### 11.2 Network events
 

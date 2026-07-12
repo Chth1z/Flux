@@ -1,7 +1,7 @@
 # Android networking and kernel constraints for the Flux rewrite
 
 Status: research note for the Rust `fluxd` architecture  
-Last researched: 2026-07-11  
+Last researched: 2026-07-13\
 Minimum supported kernel required by the project: Linux 5.10
 
 ## Executive findings
@@ -150,6 +150,15 @@ Live authorization consumes one point-in-time, non-cloneable complete census. It
 7. XFRM;
 8. connmark/socket transfers;
 9. existing Flux ownership.
+
+RPDB `fwmark` rules do not read an intrinsically packet-only field. Linux FIB-rule matching compares
+the selector with transient `flowi_mark`; IPv4 and IPv6 packet-origin paths populate that value from
+`skb->mark`, while local socket-output paths populate it from `sk->sk_mark`. The first bounded RPDB
+fragment therefore records each observed selector mask as both a packet-plane and socket-plane
+predicate read. It records the RPDB conntrack cell as complete-absent because FIB rules do not
+directly read ctmark; any ctmark-to-packet influence belongs to the separate transfer evidence
+source. Opaque rule attributes make both flow-origin cells opaque without discarding known
+selectors. [S43], [S44], [S45], [S46], [S47]
 
 Missing, duplicate, incomplete, opaque, denied, transient, unavailable, inconsistent, or over-budget coverage grants no authority. The census accepts at most 512 raw predicate-read, masked-write, transfer-read, or transfer-write records before canonical sorting and deduplication, and binds the exact inventory snapshot identity/epoch, full capability facts and boot, namespace, policy identity/revision, collector revision, and durable ownership-journal identity/revision. Any candidate-mask overlap with an external use rejects regardless of the compared values. Opaque RPDB evidence rejects even if another census cell claims completeness, and known conflicts are decided before an otherwise incomplete topology report.
 
@@ -542,3 +551,8 @@ Acceptance invariants:
 [S40]: https://android.googlesource.com/platform/system/netd/+/e11b8688b1f99292ade06f89f957c1f7e76ceae9/server/RouteController.cpp
 [S41]: https://android.googlesource.com/platform/system/netd/+/e11b8688b1f99292ade06f89f957c1f7e76ceae9/server/RouteController.cpp#256
 [S42]: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/net/core/fib_rules.c?id=738ac465e4e900d4a391a27da4e20c090eaa1e75#n812
+[S43]: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/net/core/fib_rules.c?id=738ac465e4e900d4a391a27da4e20c090eaa1e75#n259
+[S44]: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/include/net/route.h?id=738ac465e4e900d4a391a27da4e20c090eaa1e75#n151
+[S45]: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/net/ipv4/route.c?id=738ac465e4e900d4a391a27da4e20c090eaa1e75#n2218
+[S46]: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/net/ipv6/datagram.c?id=738ac465e4e900d4a391a27da4e20c090eaa1e75#n41
+[S47]: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/net/ipv6/route.c?id=738ac465e4e900d4a391a27da4e20c090eaa1e75#n2434

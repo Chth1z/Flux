@@ -123,6 +123,17 @@ The positive Android mark-authority model is now implemented as the next pure ch
 
 Planning authorization consumes a non-`Clone` census with exactly nine evidence sources—Android `netId`, RPDB, device policy, legacy xtables, nftables, TC/BPF, XFRM, connmark/socket transfers, and existing Flux ownership—across all three planes. Every one of the 27 source-plane cells must be complete-present or complete-absent, at most 512 raw uses are accepted before canonical sorting and deduplication, and the observation binds inventory snapshot/epoch, full capability facts, namespace, policy identity/revision, collector revision, and ownership-journal identity/revision. Any external read/write/transfer overlap rejects regardless of values, opaque RPDB rejects, and known conflicts take precedence over incomplete topology evidence. The result exposes only a consuming, freshness-checked `AndroidMarkPlanningAuthority`; it cannot produce a `MarkLease`, priority, table, route, encoder, mutation, writer, or activation conversion, and reauthorization requires a fresh census.
 
+The first source-scoped mark-evidence checkpoint is now implemented as a pure
+`RpdbFwmarkCensusFragment`. It projects each ordered RPDB fwmark selector into adjacent packet- and
+socket-plane predicate reads because Linux route lookup can seed `flowi_mark` from either
+`skb->mark` or `sk->sk_mark`; RPDB directly reads no conntrack mark. Duplicate rules remain duplicate
+raw pairs, opaque rules keep both flow-origin cells opaque while retaining known uses, and the
+snapshot/epoch binding rejects drift and equal-epoch cross-tracker evidence. The fragment accepts
+at most 512 raw records—256 marked rules—and rejects selector 257 without truncation. It has no
+complete-collector revision, policy or ownership binding, complete-census conversion, Planning
+Authority, lease, writer, or mutation capability. The remaining 24 cells and cross-source
+point-in-time coordination are still pending.
+
 ### Deliverables
 
 - Reimplement the required `addrsyncd` netlink behavior behind private `flux-platform` modules; do not expose raw rtnetlink framing as the product Interface. Resolve the standalone subproject's `UNLICENSED` provenance before copying source text into the GPL workspace.
@@ -130,7 +141,7 @@ Planning authorization consumes a non-`Clone` census with exactly nine evidence 
 - Preserve batched receive/send, optional extack diagnostics, address filters, bounded per-turn work, quiet debounce, debounce maximum, and compensating resync behavior.
 - Treat `MSG_TRUNC`, `ENOBUFS`, `NLMSG_OVERRUN`, malformed or ambiguous messages, `NLM_F_DUMP_INTR`, missing `NLMSG_DONE`, and sequence inconsistency as mandatory full-resync conditions. While a dump is active, serialize resynchronization behind that sequence's terminal response; if terminal evidence cannot be recovered by the drain deadline, leave the source invalid and degrade observation rather than overlap a replacement request. Partial dumps never advance the Network Epoch.
 - In-process address-derived Bypass Policy.
-- Integrate a reviewed device-qualified policy loader and the bounded complete fwmark census collector; generic AOSP must continue to produce zero grant.
+- Continue bounded source-by-source mark-evidence collection, add exact Android device/build/netd qualification before the reviewed policy trust boundary, and then assemble the fresh complete 27-cell fwmark census collector; source fragments cannot authorize planning, and generic AOSP must continue to produce zero grant.
 - Rust rtnetlink PBR apply/verify/cleanup.
 - Generation journal and startup recovery for routes/rules.
 - Remove the standalone `addrsyncd` process from runtime, while keeping its binary available for one bridge release as emergency rollback.

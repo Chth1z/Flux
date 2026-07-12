@@ -28,10 +28,13 @@ The focused Phase 3 Android mark-authority model can be exercised with:
 
 ```text
 cargo test -p flux-core --test android_mark_authority
+cargo test -p flux-core --test rpdb_fwmark_census
 ```
 
-This is a pure planning checkpoint. A passing host test does not replace production Android
-device-policy verification, complete mark-census collection, or activation canaries.
+These are pure evidence/planning checkpoints. The RPDB test covers only one inventory-backed source
+fragment; it does not create a complete Mark Census or Planning Authority. Passing host tests do
+not replace production Android device-policy verification, the remaining source collectors,
+cross-source freshness, or activation canaries.
 
 The compatibility submodule remains separate:
 

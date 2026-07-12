@@ -30,12 +30,16 @@ _Avoid_: Partial success, fallback mode
 The set of device, application, user, interface, address-family, and tethering traffic that Flux is allowed to classify.
 _Avoid_: Match list, app list
 
+**Traffic Domain**:
+A bounded, explicitly anchored and selector-disjoint portion of Traffic Scope, such as residual local OUTPUT for one family or forwarded traffic from one exact tether ingress. Backend planning may differ by domain only after exhaustive coverage and non-overlap are proven.
+_Avoid_: Rule bucket, interface case
+
 **Capture Policy**:
 The ordered decisions that determine whether in-scope traffic is sent to the Proxy Engine or continues directly.
 _Avoid_: Firewall rules, routing script
 
 **Bypass Policy**:
-The portion of Capture Policy that identifies traffic which must remain direct, including loop prevention and device-local connectivity.
+The portion of Capture Policy that identifies traffic which remains direct. It distinguishes mandatory loop/device-local safety exclusions from configurable private, CGNAT, and other special-use direct defaults.
 _Avoid_: Exclusion list, direct rules
 
 **Capture Path**:
@@ -59,6 +63,10 @@ _Avoid_: Kernel flags, device preset
 **Engine Capability Profile**:
 Verified, version-qualified facts about what the exact Proxy Engine binary and configuration dialect permit Flux to stage, supervise, and hand off.
 _Avoid_: Sing-Box version check, engine feature flags
+
+**Kernel Extension Profile**:
+Freshness-bound identity, protocol, semantics, and canary evidence for an already-loaded reviewed OEM/custom-kernel extension. It never authorizes Flux to load or unload a module and never replaces a conventional correctness path.
+_Avoid_: Module detected, kernel plugin available
 
 **Backend Plan**:
 The explainable selection of a Capture Path and supporting mechanisms for one Capability Profile, Engine Capability Profile, and Desired State.

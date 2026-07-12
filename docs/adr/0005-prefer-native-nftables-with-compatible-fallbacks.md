@@ -1,5 +1,6 @@
 ---
-status: proposed
+status: accepted
+decision_date: 2026-07-13
 ---
 
 # Prefer native nftables with xtables and TUN fallbacks

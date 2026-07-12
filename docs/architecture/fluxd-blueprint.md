@@ -1,8 +1,8 @@
 # Fluxd Rewrite Blueprint
 
-Status: proposed architecture  
-Date: 2026-07-11  
-Minimum supported kernel: Linux 5.10
+- Status: accepted, evolving architecture
+- Last updated: 2026-07-13
+- Minimum supported kernel: Linux 5.10
 
 ## Executive decision
 
@@ -23,6 +23,7 @@ eBPF is a first-class optional plane with two stages: observability first, then 
 - [Android network and kernel research](../research/android-network-kernel.md)
 - [Sing-Box and related project research](../research/sing-box-and-projects.md)
 - [Rust, eBPF, and netfilter research](../research/rust-ebpf-netfilter.md)
+- [Expanded eBPF and kernel-extension assessment](../research/ebpf-and-kernel-extensions-2026-07.md)
 
 ## Goals
 
@@ -41,6 +42,7 @@ eBPF is a first-class optional plane with two stages: observability first, then 
 - Reimplementing Sing-Box protocols or embedding its Go runtime into `fluxd`.
 - Making XDP the transparent-proxy mechanism.
 - Treating a kernel version, `/proc/config.gz`, a binary on `PATH`, or a loaded module as proof that a feature is usable.
+- Shipping or automatically loading `.ko`, KPM, or other kernel payloads as a compatibility backend.
 - Taking ownership of Android netd or vendor-created rules and routes.
 - Supporting kernels older than 5.10, even when individual required syscalls appear to work.
 - Shipping an eBPF-only Capture Path before correctness parity and device coverage exist.
@@ -135,20 +137,25 @@ This is the main external Seam used by the daemon and lifecycle tests. The contr
 Interface:
 
 ```rust
-pub fn compile_generation(
+pub fn enumerate_generation_candidates(
     desired: &DesiredState,
     capabilities: &CapabilityProfile,
     engine: &EngineCapabilityProfile,
     inventory: &NetworkInventory,
-    evidence: &PlanningEvidence,
+) -> Result<BoundedCandidateSet, CompileError>;
+
+pub fn compile_generation(
+    candidates: BoundedCandidateSet,
+    evidence: PlanningEvidenceSet,
+    selection: CandidateSelection,
 ) -> Result<GenerationArtifact, CompileError>;
 ```
 
-`PlanningEvidence` borrows externally established, freshness-bound authorities required by the candidate plan. In particular, an Android mark-dependent plan must carry the exact non-`Clone` `AndroidMarkPlanningAuthority`; the compiler does not manufacture it from negative scans or generic AOSP facts. The current authority permits only further pure planning, so an activation-capable Generation still requires the separate writer, observer, canary, topology, ownership, and mutation proofs.
+Candidate enumeration may produce only bounded, non-authorizing syntactic/topology candidates. `PlanningEvidenceSet` is then passed by value and owns a bounded candidate-keyed set of freshness-bound authorities. In particular, an Android mark-dependent plan must carry the exact non-`Clone` `AndroidMarkPlanningAuthority`; the compiler does not manufacture it from negative scans or generic AOSP facts. Explicit selection evaluates only the named candidate and fails on missing/stale evidence. `auto` boundedly visits ranked candidates, retains evidence failures as rejection reasons, and selects the first candidate whose exact evidence remains fresh. Consuming the selected authority leaves a non-authorizing receipt in the artifact, binding the reviewed catalog entry/digest, candidate/topology, inventory epoch/snapshot, complete census observation identity/digest and collector revision, ownership-journal identity/revision, Capability Profile, boot, and namespace. Activation rechecks the receipt and still requires separate writer, observer, canary, topology, ownership, and mutation proofs.
 
-The implementation is pure computation. It hides normalization, policy ordering, mark- and routing-candidate selection, UID expansion, CIDR canonicalization, Sing-Box overlay generation, backend scoring, resource budgeting, and safety validation. It does not collect census evidence, assert device cooperation, allocate by complement, or turn planning evidence into an activation lease.
+The implementation is pure computation. It hides normalization, policy ordering, bounded mark/routing candidate enumeration and scoring, authorized candidate finalization, UID expansion, CIDR canonicalization, Sing-Box overlay generation, resource budgeting, and safety validation. It does not collect census evidence, assert device cooperation, allocate by complement, or turn planning evidence into an activation lease.
 
-The compiler must return the same byte-for-byte `GenerationArtifact` for identical normalized inputs. It must not read files, invoke commands, or mutate the kernel. The Controller assigns a monotonic `GenerationId` and the Generation Store adds timestamps only after compilation; neither is part of the artifact digest.
+The compiler must return the same byte-for-byte candidate set for identical normalized discovery inputs and the same byte-for-byte `GenerationArtifact` for identical candidates/evidence/selection. It must not read files, invoke commands, or mutate the kernel. The Controller assigns a monotonic `GenerationId` and the Generation Store adds timestamps only after compilation; neither is part of the artifact digest.
 
 ### 3. Runtime Reconciler module
 
@@ -331,8 +338,11 @@ Every capability is one of:
 - `Supported`: an active probe succeeded;
 - `Unsupported`: the facility or required operation is absent;
 - `Denied`: it exists but current capabilities or SELinux policy reject it;
+- `Conflicting`: the facility exists, but an Android/foreign owner or semantic collision makes it unsafe to claim;
 - `Broken`: the probe exposed behavior that is present but unusable;
 - `Unknown`: no safe probe was possible.
+
+Transient timeout, busy, interrupted, or environmental failures are attempt-level evidence. They retain errno/extack/verifier context and a bounded retry/backoff decision, but they do not create a durable `Transient` capability class.
 
 Evidence sources are retained separately:
 
@@ -355,7 +365,11 @@ The profile is initialized once per boot and cached using:
 - Flux binary version;
 - SELinux enforcing state;
 - relevant tool hashes and BTF identity;
-- Android build fingerprint.
+- Android product/build/vendor and security-patch identity;
+- kernel build identity and verified-boot state;
+- SELinux policy identity;
+- netd/Connectivity artifact identities;
+- network namespace identity.
 
 Probes use uniquely named temporary resources and mandatory cleanup. A permission error is not treated as feature absence. A selected feature that later returns a structural unsupported error is demoted for the current boot and causes plan recompilation.
 
@@ -370,11 +384,13 @@ The profile is revisioned again whenever tool or BTF identity changes, SELinux/p
 | `capture = tun` | managed Sing-Box TUN | fail with missing-capability report |
 | large bypass sets on nftables | interval sets | compile error if resource budget exceeded |
 | large bypass sets on xtables | generation-specific ipset populated through verified restore/swap, then stable-jump cutover | bounded jump structure |
-| `ebpf = auto` | acceleration if full attach path verifies | observation, then off |
-| `ebpf = observe` | tc/cgroup observation supported by probes | off with Degraded State |
+| `ebpf = auto` | production-qualified positive acceleration with parity and benchmark evidence | observation, then off |
+| `ebpf = observe` | `xt_bpf` observation where xtables is selected, then TUN TC or proven proxy-child telemetry | off with Degraded State |
 | `ebpf = accelerate` | verified acceleration plus a complete conventional correctness path | fail planning with capability evidence; do not disturb the active path |
 
 An explicit backend request does not silently fall back to a different backend. `auto` is the only capture mode that changes mechanisms automatically. Explicit eBPF `accelerate` is strict; `observe` is intentionally best-effort because its absence does not change capture correctness.
+
+Backend selection is compiled per bounded Traffic Domain, not as one global capture/routing tuple. Residual local OUTPUT, exact tether ingress, and a managed TUN may choose different mechanisms only when the compiler proves the requested scope is exhaustive, selector-disjoint, non-overlapping, and compatible in engine/listener, mark, route, address-set, activation, and cleanup ownership. A heterogeneous plan is never inferred merely because its individual facilities probe successfully.
 
 ## Capture Path designs
 
@@ -391,7 +407,7 @@ Design requirements:
 - use stable entry chains and generation-specific rules or atomically replace the entire owned table;
 - preserve reserved mark bits and cache decisions in conntrack marks where safe;
 - distinguish local OUTPUT classification from forwarded/tethered PREROUTING classification;
-- bypass local, multicast, link-local, Proxy Engine, control-plane, and configured direct traffic before capture;
+- apply mandatory loop/control/device-local safety exclusions before capture, then apply separately configured private, CGNAT, special-use, and other direct policy;
 - support counters and drift observation without making counters part of correctness;
 - use an output route hook or equivalent mark path that causes policy rerouting correctly;
 - verify nftables TPROXY, socket, UID, set, counter, and batch behavior individually.
@@ -441,11 +457,10 @@ Ship eBPF as an optional diagnostic plane before it affects packet decisions.
 
 Candidate programs:
 
-- tc ingress/egress observation on a verified Generation-scoped TUN interface first, using a Flux-owned qdisc/filter lease even when Sing-Box owns the interface and queue FDs;
-- cgroup socket/connect observation where Android exposes a stable attach point;
+- `xt_bpf` observation inside Flux-owned xtables chains first: update bounded counters and always return false so the complete classic classifier remains authoritative;
 - tracepoint-based lifecycle signals only when BTF/tracepoint compatibility is verified.
 
-Physical-interface TC is experimental. AOSP netd removes `clsact` qdiscs during NetworkController startup, and Android tethering offload can share physical-interface TC resources. Any physical-NIC attachment therefore requires explicit conflict detection, netd-lifecycle reconciliation, and proof that tethering/offload behavior is not disturbed.
+For the follow-on TC roles introduced only after proxy-positive `xt_bpf` parity, AOSP netd removes `clsact` qdiscs from every extant interface during NetworkController startup. A legacy TUN TC attachment is therefore bound to link identity and Network Epoch and must be reverified after netd lifecycle changes. A verified 6.6+ TCX link is qdisc-less and is not removed by `clsact` cleanup, but still requires link-identity and foreign-program ordering revalidation. Physical/tether-interface TC remains experimental because Android tethering offload can share those resources.
 
 Maps:
 
@@ -462,15 +477,23 @@ Acceleration is allowed only when an equivalent non-eBPF path remains the correc
 
 Candidate behavior:
 
+- use `xt_bpf` first for proxy-positive matches only; every miss, parse ambiguity, `overflowuid`, stale Generation, or map failure continues through the full classic classifier;
+- after positive `xt_bpf` parity, add TC observation on a verified Generation-scoped TUN and optional proxy-child `sockops` telemetry proven available across the full cgroup ancestor chain; these roles remain observation-only even though they arrive in the second sequence stage;
 - cache socket or flow decisions produced by Capture Policy;
-- stamp only Flux-reserved mark bits on verified tc/cgroup paths;
+- stamp only Flux-reserved mark bits on verified TC paths for independently proven Traffic Domains;
 - short-circuit repeated UID/interface/prefix classification in nftables or xtables;
 - own individual attachments with `bpf_link` where supported, use the shared control-map flip for BPF policy-slot publication, and retain an explicitly tested legacy attach adapter otherwise;
 - preserve a generation ID in configuration maps so stale programs fail safe.
 
+This sequence is implementation priority, not runtime coupling. Once the TUN TC or proxy-child
+telemetry role exists, its Backend Plan eligibility depends only on its own domain, attachment,
+probe, and conventional fallback evidence; an nftables/TUN plan does not need `xt_bpf` or xtables.
+
 In the future `FluxOwnedTunFd` plan, add feature-gated `TUNSETSTEERINGEBPF` for flow-stable multiqueue selection. Defer `TUNSETFILTEREBPF`: a program returning zero drops traffic, and the kernel cannot distinguish a logic bug from an intended decision, so it has no automatic fail-open guarantee.
 
-The acceleration bridge on the 5.10 baseline is reserved-mark stamping followed by ordinary nftables/xtables mark matching. TC ingress may accelerate PREROUTING/tethered classification; TC egress occurs after local OUTPUT and cannot accelerate that path. nftables and xtables are never assumed to read Aya maps directly.
+For out-of-chain TC/cgroup programs on the 5.10 baseline, the general BPF-to-netfilter bridge is reserved-mark stamping followed by ordinary nftables/xtables mark matching. `xt_bpf` is a separate direct Boolean match inside a referencing xtables rule. TC ingress may accelerate PREROUTING/tethered classification; TC egress occurs after local OUTPUT and cannot accelerate that path. nftables and xtables are never assumed to read Aya maps directly.
+
+Linux 5.10 TC ingress socket assignment (`bpf_sk_assign`) is a separate exact-domain experiment. It still requires a correct local route, a same-netns compatible transparent listener, and miss behavior that cannot blackhole ordinary forwarding. Making it correctness-bearing would require a separate ADR; it is not part of the automatic acceleration ladder.
 
 For hot updates, old and new program sets share a small control map. New links attach in dormant/pass-through mode with an immutable expected Generation; after every required link and per-generation policy map is ready, one control-map update selects the new BPF active-policy slot. Old programs then observe a mismatch and pass through before they are detached. This selector is internal to the optional eBPF plane and never updates the authoritative `active.json`; global Generation publication still follows mandatory engine/kernel verification. If shared-map or concurrent attachment semantics cannot be proven, acceleration is detached and reattached non-atomically while the conventional correctness path stays active.
 
@@ -487,7 +510,7 @@ For hot updates, old and new program sets share a small control map. New links a
 
 - XDP is not the main Capture Path because it does not cover Android local OUTPUT semantics and lacks the socket, UID, route, and conntrack context required for equivalent policy.
 - Physical-NIC TC/XDP is never enabled automatically in the first production release.
-- Android's root cgroup hooks are never claimed or replaced. Cgroup programs on a Flux-owned child cgroup cover Flux/Sing-Box processes only; arbitrary Android-app coverage requires separate coexistence proof on an Android-owned cgroup and remains experimental.
+- Android's root cgroup hooks are never claimed or replaced. A Flux-owned child cgroup does not imply that the same attach types are available: an attachment at any ancestor can constrain descendants. Flux inventories the full ancestor chain and child, unless it has separately proved the child is directly under root. Only an exact unoccupied or explicitly compatible hook may be used, initially for optional proxy-child telemetry; arbitrary Android-app coverage remains experimental.
 - eBPF must not silently alter Android-owned mark bits.
 - A failed or detached eBPF accelerator must leave the nftables/xtables/TUN path correct.
 
@@ -511,7 +534,7 @@ Material changes increment the Network Epoch and trigger a debounced reconciliat
 
 The current `addrsyncd` behavior becomes an in-process policy that protects all active local interface addresses from proxy-loop policy routing. It uses the same rtnetlink socket ownership, batching, acknowledgement tracking, filtering, cleanup, and resync logic as the rest of the Kernel Plane.
 
-The rewritten rule compiler treats these as generated Bypass Policy, not as an independent daemon concern.
+The rewritten rule compiler treats these as the mandatory safety portion of generated Bypass Policy, not as an independent daemon concern. Configurable private, CGNAT, special-use, and user-direct prefixes are a separate policy layer and must not be conflated with loop/device-local safety.
 
 ### UID and Android users
 
@@ -529,6 +552,7 @@ The rewritten rule compiler treats these as generated Bypass Policy, not as an i
 - Do not reuse the current low-byte mask as a new-install default: AOSP netd uses bits 0–15 for `netId`, so Flux must preserve those and every other Android-owned bit.
 - Generic AOSP grants no mark field. Bits 21–30 are only a device-qualified candidate envelope, never an inferred reservation.
 - Accept a cooperative policy assertion only when it binds the exact candidate/topology, full Capability Profile and verified boot, network namespace, named policy plus nonzero SHA-256 artifact digest/revision, and its exact nonempty mark-plane set. Planning authority additionally requires that set to cover packet, socket, and conntrack marks.
+- Select production policy assertions only from a compile-time reviewed catalog keyed by stable Android product/build/vendor, kernel-build, SELinux-policy, netd/Connectivity, and tool artifact identities. Then freshness-bind the selected assertion to the full Capability Profile, verified boot, boot ID, and observed network namespace. Runtime-only boot/namespace identities are not catalog keys, and a runtime manifest does not become trusted by hashing its own bytes.
 - Require a fresh, consumed 27-cell census over Android `netId`, RPDB, device policy, xtables, nftables, TC/BPF, XFRM, connmark/socket transfers, and existing Flux ownership. Any external overlap or opaque RPDB evidence rejects.
 - Default `respect_android_vpn` to true and place Flux rules only after evaluating netd's secure-VPN, per-UID, explicit-network, tethering, default-network, and unreachable policy lattice.
 - Never implement loop prevention as a global root-UID bypass; identify only the Proxy Engine's owned sockets/process identity.
@@ -818,6 +842,7 @@ The Phase 1 projection already exposes `ControlSnapshot` and `RuntimeSnapshot` a
 11. Config, state, and control inputs are treated as untrusted.
 12. Shell never generates or applies networking policy in the final architecture.
 13. Generic AOSP and conflict-free negative scans never create Android mark authority; only exact device-qualified positive evidence may permit mark planning.
+14. Production `fluxd` never loads or unloads kernel modules and release packages contain no `.ko`, KPM, or opaque kernel payload. An already-loaded exact-device extension is optional read-only observation only; decision-bearing use requires a concrete partner and superseding ADR.
 
 Phase 1 is an explicit bridge exception to invariant 12's final-state wording: shell phase scripts still apply networking state, but the serialized worker is their only caller and the boot-scoped lease excludes `scripts/core` from Rust-owned engine runs.
 

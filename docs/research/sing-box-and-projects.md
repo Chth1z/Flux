@@ -1,6 +1,8 @@
 # Sing-Box and adjacent-project research for the Flux Rust rewrite
 
-Research date: 2026-07-11 (Asia/Singapore)
+- Original research date: 2026-07-11 (Asia/Singapore)
+- Last updated: 2026-07-13
+- Current Flux design baseline: `868729fcce4d076b11e7746d8ec39369f26159f2`
 
 This note studies Sing-Box and adjacent Android transparent-proxy, TUN, userspace-network-stack, and eBPF projects as design inputs for the Flux rewrite. It is intentionally implementation-oriented: it records what the projects actually do, where the relevant code lives, what is safe to reuse conceptually, and what Flux should avoid copying.
 
@@ -372,10 +374,11 @@ Limitations that matter for Flux:
 
 Therefore:
 
-- **5.10 baseline:** eBPF disabled by default; nftables/iptables/TUN provide full functional service;
-- **optional eBPF tier:** enabled only when each required map type, program type, attach point, helper, BTF/CO-RE strategy, memlock behavior, and cgroup/tc operation passes a probe;
-- **5.17+ is an eligibility hint, not proof**;
-- start with observability/classification experiments before transparent redirection;
+- **5.10 correctness baseline:** nftables/iptables/TUN provide full functional service without eBPF;
+- **5.10-probeable `xt_bpf` tier:** first observe inside Flux-owned xtables chains with an always-false matcher, then allow proxy-positive hits while every miss continues through the complete classic classifier;
+- **higher-risk dae-style TC/cgroup tier:** enabled only when each required map type, program type, attach point, helper, BTF/CO-RE strategy, memlock behavior, full cgroup ancestor-chain attachment state, qdisc owner, and packet context passes a probe;
+- **5.17+ is an eligibility hint for dae-style facilities, not proof**, while `xt_bpf` can be attempted on the 5.10 floor;
+- bind legacy TUN TC to Network Epoch because netd can delete `clsact` from every extant interface; a verified TCX link is qdisc-less but retains link/order freshness; treat physical/tether TC as a separate conflict-checked experiment;
 - keep the backend detachable and semantically equivalent to a non-eBPF policy path.
 
 ### Reload pattern to borrow from dae
@@ -506,8 +509,9 @@ Kernel version is recorded for diagnostics and coarse gating, but feature select
 |---|---|---|---|
 | A: baseline | Linux/Android kernel `>= 5.10`; native TUN and/or required xtables operations probe successfully | iptables TPROXY for TCP+UDP where available; REDIRECT for TCP otherwise; native TUN as full-protocol fallback; ipset optional | Must provide functional proxy service without nftables/eBPF |
 | B: nftables | nf_tables netlink transaction, required hooks/expressions/sets/maps, and permissions probe successfully | `inet` table, atomic batches, sets/maps, optional NFQUEUE pre-match | Fall back to Tier A without changing policy semantics |
-| C: advanced eBPF | recommended eligibility `>= 5.17`, then all required tc/cgroup program types, helpers, maps, BTF/CO-RE or fixed-layout strategy, attach points, and permissions pass | early classification/observability; later optional redirect/direct fast path | Detach and revert to Tier B/A at runtime after verified failure |
-| D: newer-helper acceleration | feature-specific probes, potentially much newer than 5.17 | helpers such as redirect-peer or newer map/link semantics | Never required for correctness |
+| C: `xt_bpf` | Android/Linux 5.10 eligibility plus exact maps, pinned socket-filter, iptables revision-1 extension, SELinux, packet-context, canary, and cleanup probes | observation, then proxy-positive matching in Flux-owned xtables chains | Remove the optional match and retain the complete Tier A classifier |
+| D: advanced TC/cgroup eBPF | recommended dae-style eligibility `>= 5.17`, then exact hook/program/helper/map/BTF or no-CO-RE strategy, full ancestor-chain attach flags, qdisc ownership, and permissions pass | TUN observation; later per-domain mark/cache acceleration; device-qualified socket-assignment research | Detach and revert to Tier B/A/C after verified failure |
+| E: newer-helper acceleration | feature-specific probes, including TCX at 6.6+ or netfilter BPF at 6.4+ | improved attachment lifecycle or narrow experiments | Never required for correctness |
 
 Probe examples:
 
@@ -517,7 +521,8 @@ Probe examples:
 - ipset: create/swap/destroy the exact `hash:net` families required;
 - policy routing: add/delete a private rule/table in the reserved Flux range and verify dump results;
 - NFQUEUE: bind a private queue and test queue expression acceptance without capturing production traffic;
-- eBPF: load minimal programs for each type/helper/map and attach/detach to a disposable or controlled hook;
+- `xt_bpf`: create maps, load/pin the exact socket filters, reference them in private IPv4/IPv6 OUTPUT/PREROUTING chains, send canary packets, inspect counters/UID context, delete rules, then unpin;
+- TC/cgroup eBPF: inventory foreign programs and attach flags, load minimal programs for each type/helper/map, and attach/query/detach only at a disposable or controlled hook;
 - offload: negotiate TUN flags/ioctls, then run a packet-format smoke test before enabling batch/GSO paths.
 
 Probe results should be cached per boot and invalidated after kernel/module changes or a failed operation.

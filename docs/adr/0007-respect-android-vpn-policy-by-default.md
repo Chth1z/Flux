@@ -1,5 +1,6 @@
 ---
-status: proposed
+status: accepted
+decision_date: 2026-07-13
 ---
 
 # Respect Android VPN policy by default

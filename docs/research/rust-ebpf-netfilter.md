@@ -1,9 +1,11 @@
 # Rust, eBPF, Netfilter, and TUN Research for `fluxd`
 
-Status: research complete  
-Date: 2026-07-11  
-Repository baseline: `c978b75d879a9d155e46197dd86bf7cd9dc1b519`  
-Minimum supported kernel: Linux 5.10
+- Status: original research complete; amended for the current design
+- Original research date: 2026-07-11
+- Last updated: 2026-07-13
+- Original repository baseline: `c978b75d879a9d155e46197dd86bf7cd9dc1b519`
+- Current design baseline: `868729fcce4d076b11e7746d8ec39369f26159f2`
+- Minimum supported kernel: Linux 5.10
 
 ## Scope
 
@@ -127,9 +129,12 @@ It is not, on its own, equivalent to Android transparent proxying. No single bas
 
 | Hook or facility | 5.10 baseline | Useful scope | Important limitations | Flux recommendation |
 |---|---|---|---|---|
-| TC `sched_cls` ingress/egress | Yes in upstream 5.10 | Packet classification, counters, Flux mark-bit writes, TUN observation | Attachment owns or shares qdisc/filter state; physical Android interfaces may be managed by netd/vendor offload; no inherent app UID | First eBPF hook on a verified Generation-scoped TUN link under a Flux-owned qdisc/filter lease; physical NIC use opt-in after coexistence probe |
-| cgroup skb ingress/egress | Yes | Cgroup-scoped packet policy and accounting | Requires a stable attachable cgroup and compatible Android hierarchy; coverage depends on where tasks live | Optional, never assumed from version |
-| cgroup sock-address programs | Yes | Observe or influence locally originated bind/connect/sendmsg syscalls | Does not cover forwarded/tethered packets and is not a packet-path TPROXY replacement | Experimental per-app/local-origin optimization |
+| xtables `xt_bpf` pinned socket filter | Enabled by AOSP 5.10 base configs; still probe exact device/userspace | Observation and positive proxy matching inside Flux-owned chains | Only covers packets traversing the referencing rule; OUTPUT UID depends on socket association, `overflowuid` is ambiguous, and PREROUTING normally has no app UID | First eBPF integration: observation always returns false, then positive proxy hits with complete classic fallback |
+| TC `sched_cls` ingress/egress | Yes in upstream 5.10 | Packet classification, counters, Flux mark-bit writes, TUN observation | Attachment owns or shares qdisc/filter state; physical Android interfaces may be managed by netd/vendor offload; no inherent app UID | First TC hook after `xt_bpf`: use a verified Generation-scoped TUN link under a Flux-owned qdisc/filter lease; physical NIC use opt-in after coexistence probe |
+| TC ingress socket assignment | `bpf_sk_assign` is present at the floor | Exact-domain transparent listener assignment | Still needs a correct local route, same-netns compatible socket, and safe miss behavior; high conflict risk on tether/physical hooks | Project-roadmap Phase 8 exact-device experiment only |
+| cgroup skb ingress/egress | Yes | Cgroup-scoped packet policy and accounting | A program at any ancestor can constrain descendants; AOSP root defaults normally block the same hook | Optional only after full ancestor-chain plus child program/flag inventory |
+| cgroup sock-address programs | Yes | Observe or influence locally originated bind/connect/sendmsg syscalls | Standard AOSP root attachments normally block descendants; does not cover forwarded/tethered packets | Device-specific lab path, never a general loop-escape mechanism |
+| cgroup `sockops` | Yes | Proxy-child TCP cookie, RTT, retransmit, connection-state, and read-only socket-mark telemetry through validated `ctx->sk->mark` | Attach type must be genuinely available; TCP-only timing is too late to prove initial route selection | Optional child-cgroup canary paired with userspace TCP/UDP mark evidence |
 | `sk_lookup` | Present in 5.10; documented upstream | Select a local TCP listening or unconnected UDP socket during socket lookup | Does not run for established TCP or connected UDP; cannot replace all netfilter routing and forwarding behavior | Experimental local-proxy ingress path only[5] |
 | XDP | Yes | Earliest ingress telemetry, coarse prefilter/drop, explicit redirect experiments | No local OUTPUT, socket UID, conntrack, or normal route context; driver/generic mode differs | Never the primary transparent-proxy path |
 | TUN steering/filter socket BPF | Yes in upstream 5.10 | Select a TUN queue; trim/drop before userspace | Applies only to queue FDs owned by Flux and needs dedicated socket-filter programs | Steering is a future `FluxOwnedTunFd` feature; filtering is deferred because it lacks an automatic fail-open guarantee[7][8] |
@@ -146,9 +151,15 @@ The safe acceleration contract is narrow:
 new_mark = (old_mark & !flux_mask) | (flux_value & flux_mask)
 ```
 
-The program must never assign a whole mark. Android uses marks for network identity and routing decisions, and vendor builds may allocate additional bits. `fluxd` must allocate a non-conflicting mask from observed rules and routes, publish it to eBPF through a configuration map, and reject activation when ownership cannot be established.
+The program must never assign a whole mark. Android uses marks for network identity and routing decisions, and vendor builds may allocate additional bits. Observing a free-looking mask is not allocation authority. `fluxd` may publish mark bits to eBPF only after exact device-qualified positive policy, a fresh complete 27-cell packet/socket/conntrack census, topology and preservation proofs, and a later activation lease; every other case rejects decision-bearing mark writes.
 
-TC programs should initially attach only to verified Generation-scoped TUN netdevices under a Flux-owned qdisc/filter lease, including a Sing-Box-created link whose queue FDs remain engine-owned. Legacy TC attach requires explicit reconciliation of qdisc and filter identities; deletion must remove only Flux filters. On 6.6+ Aya can use TCX when its real attach probe works and can fall back to the legacy TC path otherwise.[14] The selected attach kind, interface index, direction, priority/handle or link ID, program tag, and generation must be recorded.
+TC programs should initially attach only to verified Generation-scoped TUN netdevices, including a Sing-Box-created link whose queue FDs remain engine-owned. AOSP netd can delete `clsact` from every extant interface during startup, so legacy TC uses a Flux-owned qdisc/filter lease bound to Network Epoch and reverified after netd lifecycle changes. On 6.6+ Aya can select qdisc-less TCX, but a failed TCX attach is returned to Flux; after probe failure or runtime demotion Flux explicitly retries the legacy netlink adapter.[14] Netd `clsact` deletion does not itself remove TCX, but link identity and foreign-program ordering still require revalidation. The selected attach kind, interface index, direction, legacy priority/handle or TCX link ID, attach flags, foreign-program inventory, program tag, policy-map digest, and Generation must be recorded.
+
+### TC socket assignment is a narrow BPF-TPROXY experiment
+
+Linux 5.10 supports `bpf_sk_lookup_tcp`/`udp` plus `bpf_sk_assign` at TC ingress. A program can select a compatible transparent TCP listener or unconnected UDP socket, but the packet still must reach a local route. A markless design is conceivable for an exact tether ingress with an input-interface RPDB selector, ordinary/throw routes for direct prefixes, and local routes only for proxy-positive prefixes.
+
+This is not a general mark replacement. If a miss can still enter a proxy-local default, ordinary forwarding is blackholed. The socket must be in the same netns, reuseport sockets are not accepted by the 5.10 TC assignment path, and later redirects can invalidate delivery. CLAT, fragments, conntrack, VPN policy, dynamic networks, and netd/offload conflicts require real-device canaries. Keep this after positive `xt_bpf` acceleration and require a separate ADR before it becomes correctness-bearing.
 
 ### `sk_lookup` is promising but deliberately narrow
 
@@ -204,7 +215,7 @@ Do not create a combinatorial object matrix for every kernel version. Partition 
 | eBPF program language | Rust `no_std` is a first-class workflow | Normally C compiled by Clang, although other ELF producers can be used |
 | CO-RE/skeleton maturity | Supports BTF/relocations and Rust-side APIs; less tied to canonical C skeleton workflow | Strong libbpf CO-RE and generated skeleton model[15] |
 | Feature probing | Source contains program/map/helper probes[13] | libbpf probing APIs are available, with custom integration required |
-| TC lifecycle | Legacy TC plus automatic TCX path/fallback in current source[14] | libbpf/link and netlink facilities; application supplies lifecycle policy |
+| TC lifecycle | Version-selected TCX or legacy TC; TCX failure is returned, so Flux explicitly retries legacy after probe/demotion[14] | libbpf/link and netlink facilities; application supplies lifecycle policy |
 | Netfilter BPF example | Framework support evolves; validate the exact release | Audited tree includes `netfilter_blocklist` example[18] |
 | Android cross-build | No mandatory libelf/zlib/libbpf runtime chain | Cargo features help static/vendored builds, but libbpf and its native build/dependencies remain[16][17] |
 | Recommended role | Default production loader and Rust eBPF programs | Optional lab/tooling backend and newer-kernel netfilter prototype |
@@ -279,15 +290,15 @@ Command presence or `KFEAT_NFT=1` is insufficient. The probe should:
 
 The canary must be constructed so no real packet can match. The cleanup is an RAII/recovery-journal obligation, not a `finally` comment. A crash on the probe must leave a recognizable temporary name that the next boot can remove without touching foreign state.
 
-Classify failures rather than reducing them to false:
+Classify stable availability rather than reducing failures to false:
 
 - **unsupported:** family/expression/revision is absent;
-- **forbidden:** capability or SELinux policy denied the operation;
-- **conflict:** name, hook, or other owner prevents safe installation;
-- **malformed/bug:** kernel rejected Flux's encoding or `nft` rejected generated JSON;
-- **transient:** ENOBUFS, interrupted dump, lock/resource pressure, or racing network state.
+- **denied:** capability or SELinux policy denied the operation;
+- **conflicting:** name, hook, or other owner prevents safe installation;
+- **broken:** kernel rejected Flux's valid encoding, or Flux/`nft` generation violated the specified contract;
+- **unknown:** no safe conclusive probe is possible.
 
-Automatic mode may try the next safe backend after any non-transient failure, but diagnostics must retain the distinction. An explicit `backend = "nftables"` request should fail rather than silently switch mechanisms.
+ENOBUFS, interrupted dump, lock/resource pressure, or racing network state are transient probe-attempt outcomes with bounded retry/backoff evidence. Automatic mode may try the next safe backend after a stable non-supported result or exhausted retry policy, but diagnostics retain both stable state and attempt evidence. An explicit `backend = "nftables"` request fails rather than silently switching mechanisms.
 
 ### Native netfilter BPF is not the nftables replacement
 
@@ -493,12 +504,11 @@ Avoid a bag of booleans. A useful model is:
 
 ```rust
 enum CapabilityStatus {
-    Enabled,
-    Disabled,
-    Degraded,
-    Forbidden,
+    Supported,
     Unsupported,
-    Conflict,
+    Denied,
+    Conflicting,
+    Broken,
     Unknown,
 }
 
@@ -533,8 +543,8 @@ The compiler consumes this evidence plus user policy. It should never call probe
 | kernel BTF | none | open and parse `/sys/kernel/btf/vmlinux`, then relocate/load a CO-RE canary | no-CO-RE object |
 | TC | none | inspect existing qdisc/filters; attach/query/detach a no-op classifier on an owned interface | eBPF TC off |
 | TCX | parsed >=6.6, or backport attempt policy | link create/query/detach | legacy TC |
-| cgroup skb/sock-addr | none | identify intended cgroup, inspect existing programs, attach/query/detach no-op | hook off |
-| `sk_lookup` | 5.10 baseline eligibility | load, attach to controlled cgroup, prove TCP and UDP socket selection in a canary namespace/device test | normal TPROXY/TUN path |
+| cgroup skb/sock-addr | none | identify the intended child and every ancestor, inspect direct programs/flags, then attach/query/detach a no-op only when the chain permits it | hook off |
+| `sk_lookup` | 5.10 baseline eligibility | load, attach through a controlled network-namespace FD, prove TCP and UDP socket selection in a canary namespace/device test | normal TPROXY/TUN path |
 | XDP | per interface | inspect program, attempt non-replacing attach in requested mode, query, detach | XDP off |
 | netfilter BPF | parsed >=6.4, or explicit backport attempt | program/helper load plus real hook attach/query/detach | nftables/xtables |
 | `/dev/net/tun` | none | open, `TUNGETFEATURES`, `TUNSETIFF`, rtnetlink readback, packet round trip, cleanup | TPROXY or unsupported TUN request |
@@ -544,6 +554,8 @@ The compiler consumes this evidence plus user policy. It should never call probe
 | `io_uring` | future `FluxOwnedTunFd` | setup, feature bits, opcode probe, real TUN I/O, cancel/shutdown, benchmark | epoll |
 
 Capability results should be cached only for the current boot. Invalidate a selected capability after a structural runtime failure such as `EOPNOTSUPP`, verifier rejection after policy change, disappeared interface, changed cgroup mount, or backend binary replacement. Recompile the generation using the next safe path.
+
+The stable capability state should be `supported`, `unsupported`, `denied`, `conflicting`, `broken`, or `unknown`. Retryable timeout/busy/interruption evidence belongs to an individual probe attempt with bounded backoff; it should not persist as a seventh `transient` availability class.
 
 ## Privileges, capabilities, and seccomp
 
@@ -591,6 +603,10 @@ Regardless of model:
 - avoid inheritable and ambient capabilities unless a documented child contract needs them;
 - retain a root compatibility mode only with an explicit diagnostic warning.
 
+### Kernel extensions are not the privilege fallback
+
+A `.ko` can implement custom netfilter hooks, ipset/xtables compatibility, or a typed Generic Netlink service, but it bypasses the verifier-governed eBPF safety model and has a kernel-wide failure radius. Android module support does not establish matching KMI/modversions, exported symbols, signature acceptance, SELinux permission, or unload safety. Production Flux should call no module load/unload syscall and package no kernel payload. It may consume an already-loaded reviewed OEM/custom-kernel extension only for exact-profiled read-only observation with independently verified AVB/module-signature/measurement identity; Generic Netlink checks provide origin/correlation, not source-build authentication. Decision-bearing use requires a concrete partner, passive-by-default lease semantics, and a separate ADR. See the [expanded assessment](ebpf-and-kernel-extensions-2026-07.md).
+
 ### Seccomp
 
 Linux seccomp filters are additive: later filters can only further restrict the process. The kernel documentation requires checking the architecture in the filter because syscall numbers differ between architectures, and it describes `PR_SET_NO_NEW_PRIVS` as the unprivileged filter prerequisite.[11]
@@ -602,6 +618,7 @@ Apply seccomp only after backend selection and initialization. Use backend-speci
 - TUN extension: the exact TUN and network-interface ioctls;
 - io_uring extension only when selected;
 - subscription updater, if in-process: narrowly scoped network/file syscalls or a separate worker.
+- production profiles explicitly deny `init_module`, `finit_module`, and `delete_module`.
 
 A bad seccomp policy can boot-loop a networking module. Ship audit/learning fixtures, test every backend combination, install the filter after recovery resources are open, and retain a configuration-controlled safe mode for diagnosis. Seccomp reduces syscall surface; it is not a complete sandbox and does not replace SELinux or filesystem validation.
 
@@ -722,7 +739,7 @@ Use QEMU, virtme-ng, or equivalent reproducible VMs for fast CI. Then run Cuttle
 - verifier rejection with complete bounded log capture;
 - map full/eviction behavior;
 - ring-buffer wrap, overflow, ordering, and lost-event accounting;
-- legacy TC attach/detach and TCX fallback;
+- legacy TC attach/detach and explicit legacy retry after TCX probe failure;
 - existing foreign program detection and non-replacement;
 - interface disappearance/recreation;
 - TUN steering flow stability and queue-count changes;
@@ -783,14 +800,22 @@ The acceptance property is convergence to exactly one of three states: the previ
 ### Phase 4: eBPF observation
 
 - Add Aya loader, no-CO-RE baseline object, capability probes, and verifier diagnostics.
-- Attach counters first to a verified Generation-scoped TUN link under a Flux-owned qdisc/filter lease.
+- Probe exact `xt_bpf` map/program/pin/iptables/packet/cleanup behavior and attach an observation rule that always returns false.
 - Add ring-buffer sampled events with perf-buffer fallback.
 - Test map generation swap and stale-generation fail-safe behavior.
 - Ship physical-interface TC, cgroup, sk_lookup, and XDP only as explicit experiments.
 
 ### Phase 5: eBPF acceleration and newer-kernel paths
 
-- Add masked mark acceleration where decision parity is proven.
+This local sequence is implementation priority. Once implemented, TUN TC observation and child
+telemetry are independently eligible from their own probes and do not require an active `xt_bpf`
+path at runtime.
+
+- Add `xt_bpf` proxy-positive matching first; every miss, parse ambiguity, `overflowuid`, stale Generation, or map failure continues through the complete classic classifier.
+- Attach TC counters next to a verified Generation-scoped TUN link; use Network-Epoch-bound legacy TC or a verified qdisc-less TCX link.
+- Add optional proxy-child `sockops` telemetry only after full ancestor-chain attach-state proof, paired with userspace TCP/UDP mark evidence.
+- Add bounded flow caching and masked TC mark acceleration only where per-domain decision parity is proven.
+- Prototype TC ingress socket assignment only for an exact domain with safe local-route/miss behavior.
 - Under `FluxOwnedTunFd`, add TUN steering eBPF and measure multiqueue stability; keep TUN filtering deferred.
 - Prefer TCX on verified 6.6+ kernels.
 - Prototype netfilter BPF on verified 6.4+ kernels, optionally using libbpf-rs as a reference.
@@ -818,7 +843,7 @@ preferred:  nftables TPROXY + rtnetlink PBR
 fallback:   coherent xtables TPROXY + generation-specific ipsets + stable-jump cutover
 fallback:   coherent xtables TPROXY + bounded jump tree
 alternate:  managed Sing-Box TUN + fluxd-owned route lifecycle
-optional:   Aya eBPF observation, then verified mark/cache acceleration; TUN steering only with future FluxOwnedTunFd
+optional:   `xt_bpf` observation then proxy-positive acceleration; TUN TC observation; later per-domain mark/cache experiments; TUN steering only with future FluxOwnedTunFd
 baseline I/O: epoll
 optional I/O: io_uring only with future FluxOwnedTunFd plus live TUN probe and benchmark
 ```
@@ -840,7 +865,7 @@ This design uses advanced Rust and kernel facilities where they deepen the modul
 11. Linux v5.10 seccomp filter semantics, architecture checks, and `no_new_privs`: [Documentation/userspace-api/seccomp_filter.rst](https://github.com/torvalds/linux/blob/2c85ebc57b3e1817b6ce1a6b703928e113a90442/Documentation/userspace-api/seccomp_filter.rst).
 12. Aya's Rust implementation and no-libbpf/BCC positioning: [Aya README at `2f09011`](https://github.com/aya-rs/aya/blob/2f09011af04527218f744e79ed1e8edc85e1972c/README.md).
 13. Aya runtime program/map/helper probes: [aya/src/sys/feature_probe.rs](https://github.com/aya-rs/aya/blob/2f09011af04527218f744e79ed1e8edc85e1972c/aya/src/sys/feature_probe.rs).
-14. Aya TC attach implementation and TCX fallback: [aya/src/programs/tc.rs](https://github.com/aya-rs/aya/blob/2f09011af04527218f744e79ed1e8edc85e1972c/aya/src/programs/tc.rs).
+14. Aya TC attach implementation and version-based TCX selection (Flux supplies explicit legacy retry): [aya/src/programs/tc.rs](https://github.com/aya-rs/aya/blob/2f09011af04527218f744e79ed1e8edc85e1972c/aya/src/programs/tc.rs).
 15. libbpf CO-RE and application model: [docs/libbpf_overview.rst](https://github.com/libbpf/libbpf/blob/34e3ebf0f062cf81882c51ac95dce720101ca5cc/docs/libbpf_overview.rst).
 16. libbpf build prerequisites and native dependencies: [libbpf README](https://github.com/libbpf/libbpf/blob/34e3ebf0f062cf81882c51ac95dce720101ca5cc/README.md).
 17. libbpf-rs static/vendored feature surface: [libbpf-rs/Cargo.toml](https://github.com/libbpf/libbpf-rs/blob/db7d45732a9309adb4854f371dcd6904fe4ed0c2/libbpf-rs/Cargo.toml).

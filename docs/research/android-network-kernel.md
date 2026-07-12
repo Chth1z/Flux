@@ -1,8 +1,8 @@
 # Android networking and kernel constraints for the Flux rewrite
 
-Status: research note for the Rust `fluxd` architecture  
-Last researched: 2026-07-13\
-Minimum supported kernel required by the project: Linux 5.10
+- Status: research note for the Rust `fluxd` architecture
+- Last researched: 2026-07-13
+- Minimum supported kernel required by the project: Linux 5.10
 
 ## Executive findings
 
@@ -14,7 +14,7 @@ Minimum supported kernel required by the project: Linux 5.10
 
 4. Android's platform `iptables` binary is deliberately built as the **legacy** xtables implementation, and netd invokes `/system/bin/iptables-restore`. An nftables backend therefore creates a separate netfilter control plane; Flux must select exactly one Flux-owned backend at a time and leave Android/netd chains intact. [S11], [S20]
 
-5. Android already owns global eBPF hooks. AOSP attaches cgroup programs to the root cgroup for accounting/firewall behavior, and netd deletes clsact qdiscs from interfaces during its own startup. Flux must not attach to Android's root cgroup or physical-interface clsact/XDP paths in the default profile. TC BPF on an exact Generation-scoped TUN link under a Flux-owned qdisc/filter lease is much safer even when Sing-Box owns the queue FDs; physical-interface TC/XDP and netns-wide `sk_lookup` should remain experimental, conflict-checked features. [S12], [S21], [S32]
+5. Android already owns global eBPF hooks. AOSP attaches cgroup programs to the root cgroup with ordinary attach flags for accounting/firewall behavior, which normally prevents the same hook type in descendants, and netd deletes `clsact` qdiscs from every extant interface during its own startup. Flux must not replace Android programs or assume that a child cgroup makes connect/socket-create hooks available. `xt_bpf` inside a Flux-owned xtables chain is the lowest-conflict first experiment; the project implements proxy-positive `xt_bpf` parity before TUN TC observation, but the latter is independently eligible at runtime from its own Network Epoch/link-order evidence. Physical/tether TC/XDP and netns-wide `sk_lookup` remain experimental. [S12], [S21], [S32], [S48]
 
 6. Magisk's module `service.sh` runs in non-blocking late-start mode; `post-fs-data.sh` is blocking and should be kept free of networking work. Upstream Magisk injects its callbacks under `u:r:magisk:s0` and makes its root domain permissive/unconstrained, but Android capabilities, LSM hooks, device nodes, cgroup ownership, module signatures, and vendor forks can still make individual operations fail. Every privileged feature needs an operation-level probe with the failure classified as absent, policy-denied, or conflicting. [S1], [S2], [S4], [S5]
 
@@ -160,7 +160,7 @@ directly read ctmark; any ctmark-to-packet influence belongs to the separate tra
 source. Opaque rule attributes make both flow-origin cells opaque without discarding known
 selectors. [S43], [S44], [S45], [S46], [S47]
 
-Missing, duplicate, incomplete, opaque, denied, transient, unavailable, inconsistent, or over-budget coverage grants no authority. The census accepts at most 512 raw predicate-read, masked-write, transfer-read, or transfer-write records before canonical sorting and deduplication, and binds the exact inventory snapshot identity/epoch, full capability facts and boot, namespace, policy identity/revision, collector revision, and durable ownership-journal identity/revision. Any candidate-mask overlap with an external use rejects regardless of the compared values. Opaque RPDB evidence rejects even if another census cell claims completeness, and known conflicts are decided before an otherwise incomplete topology report.
+Unsupported, duplicate, incomplete, opaque, denied, unknown, inconsistent, over-budget, or transient-attempt coverage grants no authority. The census accepts at most 512 raw predicate-read, masked-write, transfer-read, or transfer-write records before canonical sorting and deduplication, and binds the exact inventory snapshot identity/epoch, full capability facts and boot, namespace, policy identity/revision, collector revision, and durable ownership-journal identity/revision. Any candidate-mask overlap with an external use rejects regardless of the compared values. Opaque RPDB evidence rejects even if another census cell claims completeness, and known conflicts are decided before an otherwise incomplete topology report.
 
 The resulting `AndroidMarkPlanningAuthority` is privately constructed, non-`Clone`, and limited to pure planning. It exposes no `MarkLease`, rule priority, route table, route intent, encoder, writer, ownership operation, mutation authority, or activation conversion. Reauthorization consumes it and requires a newly collected census. Exact writer semantics, mark-observer continuity, and a mark-preservation canary remain mark-specific prerequisites; Capture Program ordering, domain/network-selection handoff, route reachability, topology observer continuity, durable ownership, exact mutation identity, engine loop escape, and shape-specific one-rule address handling remain separate topology prerequisites.
 
@@ -170,7 +170,7 @@ All writes use masked merge semantics:
 new_mark = (old_mark & ~flux_mask) | (flux_value & flux_mask)
 ```
 
-This formula is arithmetic, not write authority. A future writer must still call `getsockopt(SO_MARK)` before `setsockopt`; xtables must use `--set-xmark value/mask` and explicit `--nfmask/--ctmask` on CONNMARK operations. Never save, restore, or overwrite all 32 bits.
+This formula is arithmetic, not write authority. A userspace socket writer must read `SO_MARK` with `getsockopt` before masked `setsockopt`. A 5.10 cgroup socket-create program can read/write `bpf_sock.mark` directly; a connect4/6 program reads `ctx->sk->mark` and may use `bpf_setsockopt(SO_MARK)`—`bpf_getsockopt(SO_MARK)` is not the read path. xtables must use `--set-xmark value/mask` and explicit `--nfmask/--ctmask` on CONNMARK operations. Never save, restore, or overwrite all 32 bits.
 
 ### 3.3 Android RPDB and VPN policy
 
@@ -286,18 +286,19 @@ Backend order for large bypass collections:
 
 Android's network accounting/firewall design loads programs at boot, pins maps in bpffs, and attaches cgroup programs at the root cgroup. AOSP netd checks kernel/platform versions, attaches ingress/egress, socket-create/release, connect, bind, sendmsg/recvmsg, and sockopt programs according to availability, and treats BPF-loader failure as boot-critical. [S21], [S23], [S32]
 
-AOSP also uses TC BPF for tethering offload. netd's `NetworkController` constructor deletes clsact qdiscs on enumerated interfaces during startup, so a physical-interface TC attachment can disappear when netd restarts. [S12]
+AOSP also uses TC BPF for tethering offload. netd's `NetworkController` constructor deletes `clsact` qdiscs on every enumerated interface during startup, so both physical and TUN legacy-TC attachments can disappear when netd restarts. A verified TCX link is qdisc-less but still requires link-identity and program-order freshness. [S12]
 
 ### 6.2 Safe default BPF scope
 
-The production default may use eBPF only where Flux owns the attachment point:
+The production default may use eBPF only where Flux owns the effective attachment point:
 
-- TC ingress/egress on a verified Generation-scoped TUN interface under a Flux-owned qdisc/filter lease;
+- a pinned `xt_bpf` socket-filter referenced only from a Flux-owned xtables rule, first for observation that always returns false and later for proxy-positive decisions with complete classic fallback;
+- after proxy-positive `xt_bpf` parity, TC ingress/egress observation on a verified Generation-scoped TUN interface under a legacy Flux-owned qdisc/filter lease or verified TCX link;
 - ring-buffer telemetry from a Flux-owned program;
 - maps pinned under a unique Flux bpffs directory only after verifying ownership and mount visibility;
-- optional child-cgroup programs only if Android task-profile/cgroup behavior has been validated on that device.
+- optional proxy-child `sockops` telemetry only if program inventory and attach flags across the full cgroup ancestor chain plus child prove that exact hook available.
 
-Do not replace or attach a second program to Android's root cgroup hooks. AOSP currently uses `BPF_PROG_ATTACH` with default flags for several root hooks, so an additional attachment may fail or replace platform behavior depending on hook/kernel semantics. [S21]
+Do not replace Android cgroup programs. AOSP currently uses `BPF_PROG_ATTACH` with default flags for several root hooks, and an attachment at any ancestor can constrain descendants. A child cgroup is therefore a scope boundary only after the full ancestor chain plus child proves the exact hook unoccupied or explicitly compatible. [S21], [S48]
 
 ### 6.3 Experimental BPF features
 
@@ -307,7 +308,8 @@ Do not replace or attach a second program to Android's root cgroup hooks. AOSP c
 | `BPF_PROG_TYPE_SK_LOOKUP` | Select a local TCP/UDP socket for an L7 proxy over wide address/port ranges | Attaches to the whole netns through `BPF_LINK_CREATE`; global scope and program ordering make it experimental. It does not itself perform policy routing. [S30] |
 | TC clsact BPF | Fast classification, mark merge, counters, possible redirect on Flux TUN | Restrict to Flux TUN by default. Physical interfaces conflict with netd/tethering and require restart reconciliation. |
 | XDP | Very early filtering/telemetry | Driver support is fragmented, it does not cover local output, and it can interfere with vendor offload. Lab-only for this project. |
-| cgroup sock_addr/sockops | Per-proxy-socket policy, upstream selection telemetry | Use only on a proven Flux-owned child cgroup; Android root hooks still inherit/apply. |
+| cgroup sock_addr/sockops | Per-proxy-socket policy, upstream selection telemetry | Use only after full ancestor-chain plus child inventory proves the exact hook compatible. |
+| TC ingress socket assignment | Assign a compatible transparent listener for an exact tether domain | Linux still requires a correct local route and safe miss behavior; physical/tether TC ownership, CLAT, VPN, fragments, and offload make this a lab-only exact-device path. [S49] |
 | CO-RE/BTF | Fewer per-kernel object variants | `CONFIG_DEBUG_INFO_BTF` and readable `/sys/kernel/btf/vmlinux` are not Android 5.10 base requirements. Keep a UAPI-only/no-BTF path. |
 
 Linux's BPF design documentation is explicit that the only reliable way to know whether the verifier accepts a program is to load it. Version and Kconfig checks are prefilters, not activation decisions. [S30]
@@ -323,12 +325,17 @@ Capability probe results need separate classes:
 | Result class | Typical evidence | Meaning |
 |---|---|---|
 | `supported` | minimal real operation succeeds | Safe to consider for activation |
-| `missing` | `ENOPROTOOPT`, `EOPNOTSUPP`, missing device, unknown nft expression | Kernel/config/userspace feature absent |
-| `policy_denied` | `EACCES`/`EPERM` plus capability/AVC evidence | Kernel may support it, execution context does not |
-| `conflict` | existing hook, mark-mask, qdisc, table, or rule ownership collision | Feature exists but is unsafe to claim |
+| `unsupported` | `ENOPROTOOPT`, `EOPNOTSUPP`, missing device, unknown nft expression | Kernel/config/userspace feature absent |
+| `denied` | `EACCES`/`EPERM` plus capability/AVC evidence | Kernel may support it, execution context does not |
+| `conflicting` | existing hook, mark-mask, qdisc, table, or rule ownership collision | Feature exists but is unsafe to claim |
 | `broken` | verifier/kernel error inconsistent with the advertised baseline | Vendor backport/ABI defect; disable and report |
+| `unknown` | no safe conclusive probe is possible | Do not select a decision-bearing role |
 
-Flux must not automatically load kernel modules. GKI moves hardware support into signed vendor modules and maintains a KMI, but module availability, signature policy, load timing, and vendor configuration remain device-specific. [S31]
+Timeout, interruption, busy/resource pressure, and racing state are probe-attempt outcomes with bounded retry/backoff evidence, not a durable `transient` capability class.
+
+Flux must not automatically load or unload kernel modules. Android's 5.10 base configs enable modules, unload, modversions, and strict module RWX, but that does not make a portable `.ko`: GKI KMI is scoped to one Android release/LTS/config/toolchain and exported symbol list; signature protection, SELinux loader domains, read-only AVB/DLKM placement, dependencies, live references, and teardown remain exact-device constraints. A module can panic the kernel, and userspace rollback cannot repair the current boot. [S19], [S31], [S50], [S51], [S52]
+
+Production Flux packages no `.ko`, KPM, or opaque kernel payload and calls no module load/unload syscall. It may consume an already-loaded reviewed OEM/custom-kernel extension only as optional read-only observation through a freshness-bound exact-device profile, independently verified AVB/module-signature/measurement identity, a versioned strictly validated Generic Netlink contract, and an active canary. Sender/sequence/nonce checks provide origin and correlation, not source-build authentication. Decision-bearing use requires a concrete partner and separate ADR. Module presence cannot grant mark ownership or authenticate its own device policy. The detailed assessment is in [`ebpf-and-kernel-extensions-2026-07.md`](ebpf-and-kernel-extensions-2026-07.md).
 
 ## 8. Netlink notifications and synchronization
 
@@ -358,7 +365,7 @@ Each gate should record:
 ```text
 Capability {
     name,
-    state: supported | missing | policy_denied | conflict | broken,
+    state: supported | unsupported | denied | conflicting | broken | unknown,
     kernel_release,
     android_sdk,
     first_api_level,
@@ -380,7 +387,7 @@ Cache only within the current boot and network namespace. Re-probe after OTA/ker
 | nftables base | Not required | `NFT_MSG_GETGEN` plus atomic create/delete of private table | Legacy xtables |
 | nft socket + TPROXY | Not required | Create/delete private base chain and exact expressions | Legacy TPROXY or TUN |
 | ipset required set types | Not required | Protocol handshake and create/destroy private `hash:net` set | nft set or bounded legacy rules |
-| TUN single queue | Required by Android 5.10 base | Open device, `TUNGETFEATURES`, create temporary `IFF_TUN|IFF_NO_PI`, close | TPROXY mode |
+| TUN single queue | Required by Android 5.10 base | Open device, `TUNGETFEATURES`, create temporary `IFF_TUN + IFF_NO_PI`, close | TPROXY mode |
 | TUN multiqueue | Upstream 5.10 supports; not required as a behavior | Create two queues for one temporary device and exchange packets | Single queue |
 | eBPF syscall/map/program | Required baseline configs, policy still matters | Create map, load minimal program, query FD info, close | Userspace/netfilter path |
 | BPF ring buffer | Present upstream 5.10; not an Android contract | Create ringbuf map and run mmap/epoll smoke test | Userspace counters/perf buffer |
@@ -556,3 +563,8 @@ Acceptance invariants:
 [S45]: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/net/ipv4/route.c?id=738ac465e4e900d4a391a27da4e20c090eaa1e75#n2218
 [S46]: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/net/ipv6/datagram.c?id=738ac465e4e900d4a391a27da4e20c090eaa1e75#n41
 [S47]: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/net/ipv6/route.c?id=738ac465e4e900d4a391a27da4e20c090eaa1e75#n2434
+[S48]: https://github.com/torvalds/linux/blob/2c85ebc57b3e1817b6ce1a6b703928e113a90442/kernel/bpf/cgroup.c
+[S49]: https://github.com/torvalds/linux/commit/cf7fbe660f2dbd738ab58aea8e9b0ca6ad232449
+[S50]: https://source.android.com/docs/core/architecture/kernel/stable-kmi
+[S51]: https://source.android.com/docs/core/architecture/kernel/vendor-module-guidelines
+[S52]: https://source.android.com/docs/core/architecture/partitions/vendor-odm-dlkm-partition

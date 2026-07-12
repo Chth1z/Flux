@@ -11,6 +11,18 @@ This roadmap turns the [blueprint](fluxd-blueprint.md) and [technical specificat
 - Do not remove a shell behavior until its Rust replacement has failure-injection and recovery tests.
 - Treat a real Android 5.10 device as the minimum release gate, not merely a compile target.
 
+## Current parallel workstreams (2026-07-13)
+
+The next checkpoint is not a single linear Phase 3 task. Three bounded lanes may proceed in parallel,
+but correctness gates retain strict ordering:
+
+1. **Bridge safety:** correct `100.64.0.0/10` and separate mandatory loop/local exclusions from configurable private/special-use direct defaults; define empty allow/deny semantics; remove dual Flux/Sing-Box TUN routing ownership; make `addrsyncd` readiness mean initial convergence; add functional capture canaries; repair legacy status/migration and package provenance.
+2. **Native Phase 3 correctness:** add exact device/artifact identity; select positive mark policies from a compile-time reviewed stable artifact catalog and then bind them to boot/namespace freshness; complete the remaining 24 census cells and point-in-time coordinator; prove writer semantics, observer continuity, mark preservation, domain/network-selection handoff, and route reachability; only then allocate priorities/tables/marks or mutate the kernel.
+3. **Optional eBPF research:** implement the exact `xt_bpf` probe and observation design without delaying the first two lanes. Positive acceleration waits for the Rust xtables compiler, a complete conventional classifier, parity evidence, and device benchmarks.
+
+TUN dual route ownership is P0: until `EngineOwnedTun` has one proven owner, the bridge selects exactly
+one routing owner or reports TUN unsupported.
+
 ## Phase 0 — Baseline and reproducible toolchain
 
 ### Deliverables
@@ -70,6 +82,10 @@ Shell phase scripts remain the only networking-state writer. Rust owns Sing-Box 
 - A kernel below 5.10 performs no persistent mutation, remains queryable in settled `UnsupportedKernel`, returns the stable unsupported result to mutating clients, and does not enter a watchdog restart loop.
 - Control protocol fuzz tests and permission tests pass.
 - No behavior regression relative to the recorded baseline.
+- The bridge emits RFC 6598 as `100.64.0.0/10`, keeps mandatory loop/device-local exclusions separate from configurable direct defaults, and has golden fixtures for both.
+- Empty application allowlist proxies zero otherwise eligible applications; empty denylist proxies all otherwise eligible applications.
+- TUN has exactly one routing owner. If neither Flux-owned nor Engine-owned routing can be proven, the bridge reports TUN unsupported instead of activating two partial owners.
+- `addrsyncd` readiness requires initial dump/cleanup/apply/readback convergence, and `RUNNING` requires Generation-scoped functional capture and loop-prevention canaries rather than structural files alone.
 
 ## Phase 2 — Configuration and Generation Compiler
 
@@ -79,14 +95,15 @@ Shell phase scripts remain the only networking-state writer. Rust owns Sing-Box 
 - Pure Desired State normalization.
 - Network Inventory model populated from snapshots, initially without live ownership.
 - Backend-neutral Capture Policy compiler.
-- Generation IDs, digests, resource budgets, dry-run plan, and explain output.
+- Two-stage Generation compiler: bounded non-authorizing candidate enumeration/scoring, followed by finalization that takes a bounded candidate-keyed Planning Evidence set by value and consumes the selected authority.
+- Generation IDs, digests, non-authorizing evidence receipts, resource budgets, dry-run candidate set, and explain/rejection output.
 - Sing-Box per-Generation overlay generation and validation.
 - Revisioned device and Sing-Box Engine Capability Profiles, with Generation planning leases invalidated by boot changes, runtime demotions, or engine binary/profile changes.
 - Golden tests proving parity with representative current rules.
 
 ### Exit gate
 
-- Identical normalized inputs produce identical Generation artifacts.
+- Identical normalized discovery inputs produce identical bounded candidate sets; identical candidate/evidence/selection inputs produce identical Generation artifacts and receipts.
 - Property tests cover CIDR normalization, UID expansion, mark preservation, rule ordering, and resource limits.
 - Boot/profile revisions and Sing-Box binary/profile changes invalidate stale planning leases, and persisted Generation records retain enough identity to reject unsafe recovery.
 - Migration round-trips all supported current settings or emits an explicit lossy-mapping error.
@@ -119,7 +136,7 @@ The resulting structural evidence is explicit: Android 12 local OUTPUT remains i
 
 The next pure checkpoint now aggregates those reports atomically for a bounded requested Traffic Scope. A request binds one routing shape to selected IPv4/IPv6 residual-local domains and exact tether ingress interfaces, rejects empty/duplicate/oversized scopes, and requires at least one recognized usable anchor for every requested domain. Every matching anchor is assessed rather than letting a caller cherry-pick one rule; successful assessments are retained in deterministic order, while any unusable or ambiguous match rejects the whole scope without partial output. Definite incompatibility or priority-slot exhaustion dominates an otherwise incomplete aggregate; absent a definite rejection, any incomplete anchor keeps the scope incomplete, and only all residual windows produce the residual multi-domain summary. Freshness repeats complete anchor discovery and assessment against the current inventory/classifier instead of comparing only epoch or revision headers. This remains diagnostic evidence: it neither intersects or sums per-domain windows nor emits a priority, mark, route/table intent, ownership claim, or mutation authority.
 
-The positive Android mark-authority model is now implemented as the next pure checkpoint. Generic AOSP is a zero-grant policy; bits 21–30 are only a syntactic envelope for a device-qualified candidate. A positive policy factory records an externally established cooperative assertion bound to the exact candidate and topology scope, full Capability Profile with verified boot identity, network namespace, named policy plus nonzero SHA-256 artifact digest and revision, and the exact nonempty plane set asserted by that policy. This factory is a trust boundary and does not verify the vendor artifact itself; planning authorization separately requires the assertion to cover packet, socket, and conntrack marks.
+The positive Android mark-authority model is now implemented as the next pure checkpoint. Generic AOSP is a zero-grant policy; bits 21–30 are only a syntactic envelope for a device-qualified candidate. A positive policy factory records an externally established cooperative assertion bound to the exact candidate and topology scope, full Capability Profile with verified boot identity, network namespace, named policy plus nonzero SHA-256 artifact digest and revision, and the exact nonempty plane set asserted by that policy. The delivered factory is a modeling trust boundary, not a production policy loader. Production use first requires exact Android product/build/vendor, kernel-build, verified-boot, SELinux-policy, netd/Connectivity artifact, tool, boot, and namespace identity. A compile-time reviewed catalog is keyed only by stable artifact identities; its selected assertion is then bound to verified boot, boot ID, and the observed namespace. A runtime manifest cannot create authority by hashing itself. Planning authorization separately requires the assertion to cover packet, socket, and conntrack marks.
 
 Planning authorization consumes a non-`Clone` census with exactly nine evidence sources—Android `netId`, RPDB, device policy, legacy xtables, nftables, TC/BPF, XFRM, connmark/socket transfers, and existing Flux ownership—across all three planes. Every one of the 27 source-plane cells must be complete-present or complete-absent, at most 512 raw uses are accepted before canonical sorting and deduplication, and the observation binds inventory snapshot/epoch, full capability facts, namespace, policy identity/revision, collector revision, and ownership-journal identity/revision. Any external read/write/transfer overlap rejects regardless of values, opaque RPDB rejects, and known conflicts take precedence over incomplete topology evidence. The result exposes only a consuming, freshness-checked `AndroidMarkPlanningAuthority`; it cannot produce a `MarkLease`, priority, table, route, encoder, mutation, writer, or activation conversion, and reauthorization requires a fresh census.
 
@@ -141,7 +158,9 @@ point-in-time coordination are still pending.
 - Preserve batched receive/send, optional extack diagnostics, address filters, bounded per-turn work, quiet debounce, debounce maximum, and compensating resync behavior.
 - Treat `MSG_TRUNC`, `ENOBUFS`, `NLMSG_OVERRUN`, malformed or ambiguous messages, `NLM_F_DUMP_INTR`, missing `NLMSG_DONE`, and sequence inconsistency as mandatory full-resync conditions. While a dump is active, serialize resynchronization behind that sequence's terminal response; if terminal evidence cannot be recovered by the drain deadline, leave the source invalid and degrade observation rather than overlap a replacement request. Partial dumps never advance the Network Epoch.
 - In-process address-derived Bypass Policy.
-- Continue bounded source-by-source mark-evidence collection, add exact Android device/build/netd qualification before the reviewed policy trust boundary, and then assemble the fresh complete 27-cell fwmark census collector; source fragments cannot authorize planning, and generic AOSP must continue to produce zero grant.
+- Add exact Android product/build/vendor, kernel-build, verified-boot, SELinux-policy, netd/Connectivity artifact, tool, and namespace identity to the freshness-bound profile.
+- Define a compile-time reviewed positive-policy catalog keyed by stable product/build/kernel/policy/tool artifact identities and an externally reviewed digest/revision; bind the selected assertion to verified boot, boot ID, and observed namespace, and reject arbitrary runtime manifests as authority.
+- Continue bounded source-by-source mark-evidence collection and then assemble the fresh complete 27-cell fwmark census collector; source fragments cannot authorize planning, and generic AOSP must continue to produce zero grant.
 - Rust rtnetlink PBR apply/verify/cleanup.
 - Generation journal and startup recovery for routes/rules.
 - Remove the standalone `addrsyncd` process from runtime, while keeping its binary available for one bridge release as emergency rollback.
@@ -170,6 +189,7 @@ point-in-time coordination are still pending.
 - Bounded-tree fallback compiler.
 - Transaction coordinator spanning Sing-Box, xtables, ipsets, and rtnetlink.
 - Drift detection for Flux-owned chains, sets, routes, and rules.
+- Exact `xt_bpf` capability adapter: map operations, socket-filter load/helpers, bpffs pin/get, revision-1 `--object-pinned`, IPv4/IPv6 OUTPUT/PREROUTING packet canaries, UID-context behavior, rule-reference teardown, and crash cleanup. The conventional xtables compiler remains complete when this adapter is absent.
 
 ### Ownership rule
 
@@ -226,11 +246,9 @@ point-in-time coordination are still pending.
 
 - Aya-based loader spike and documented comparison with libbpf-rs.
 - `no_std` eBPF program workspace and shared map ABI.
-- Generation-scoped-TUN tc probes using a Flux-owned qdisc/filter lease after exact link verification, including when Sing-Box owns the interface and queue FDs; add cgroup probes where feasible.
-- Experimental physical-interface TC probe guarded by netd/qdisc/offload conflict detection.
+- `xt_bpf` observation in Flux-owned xtables chains as the first hook: update bounded counters and always return false.
 - Bounded `RLIMIT_MEMLOCK` calculation/raise plus real map allocation; classify `CAP_BPF`, `CAP_NET_ADMIN`, relevant `CAP_PERFMON`, `CAP_SYS_ADMIN` fallback, and SELinux denial separately.
 - Per-CPU counters, LRU sampled flow map, probed ring-buffer events with perf-event-array fallback, and generation control map.
-- Cgroup programs limited to Flux/Sing-Box child processes unless a separate Android-owned-cgroup coexistence experiment proves safety.
 - Capability and verifier diagnostics.
 - Read-only CLI/web metrics path.
 
@@ -244,12 +262,24 @@ point-in-time coordination are still pending.
 
 ### Deliverables
 
-- Flow/socket decision cache populated from the same compiled Capture Policy.
+The order below is implementation priority, not a runtime dependency. Once implemented, TUN TC and
+proxy-child telemetry are independently selectable for nftables/TUN plans from their own probes and
+conventional fallback; they do not require xtables or an active `xt_bpf` accelerator.
+
+- `xt_bpf` proxy-positive fast path populated from the same compiled Capture Policy; every miss, parse ambiguity, `overflowuid`, stale Generation, or map failure uses the complete classic classifier.
+- Generation-scoped-TUN TC observation after positive `xt_bpf` parity, including when Sing-Box owns the interface and queue FDs. Legacy TC uses a Flux-owned `clsact`/filter lease bound to Network Epoch; verified 6.6+ TCX is qdisc-less but still revalidates link identity and foreign-program ordering.
+- Proxy-child `sockops` telemetry only after full ancestor-chain plus child program inventory proves that exact hook available; pair it with userspace TCP/UDP mark canaries and never use event absence as loop-escape proof.
+- Experimental physical/tether-interface TC probe guarded by netd/qdisc/offload conflict detection.
+- Cgroup programs remain limited to Flux/Sing-Box child processes unless a separate Android-owned-cgroup coexistence experiment proves safety.
+- Flow/socket decision cache only after positive-path parity and bounded resource evidence.
 - Reserved-mark stamping as the explicit 5.10 bridge, with hook ordering documented: TC ingress may accelerate PREROUTING/tethered traffic; local OUTPUT is not claimed through TC egress.
 - nftables/xtables fast path consuming only the verified Flux mark, never reading eBPF maps directly.
 - Per-generation policy maps plus shared control map: attach new programs dormant, flip one BPF active-policy selector, then detach old programs; this does not publish `active.json`, and Flux falls back to detach/attach when the selector contract cannot be proven.
 - Optional TUN queue steering only under the future `FluxOwnedTunFd` contract; TUN filter eBPF remains deferred.
 - Parity oracle comparing accelerated decisions with the non-eBPF compiler for recorded traffic cases.
+- Per-domain backend-plan experiment proving bounded Traffic Domain fragments exhaustive, selector-disjoint, non-overlapping, and compatible in engine/listener, mark, route, address-set, activation, and cleanup ownership.
+- Exact tether-domain TC ingress socket-assignment experiment using `bpf_sk_assign` only with a compatible same-netns transparent listener, a proven local route, and miss behavior that preserves ordinary forwarding. It cannot become correctness-bearing without a separate ADR.
+- Netns `sk_lookup` remains a narrow listener-selection experiment. Add reuseport BPF only after Flux controls the listener FD/group or Sing-Box exposes a verified inherited-listener contract.
 
 ### Exit gate
 
@@ -282,6 +312,7 @@ point-in-time coordination are still pending.
 
 - Capability/group reduction where device policy permits.
 - Optional seccomp profile after syscall capture across every backend.
+- Production seccomp and package verification deny/reject `init_module`, `finit_module`, `delete_module`, `.ko`, KPM, and opaque kernel payloads.
 - State-path symlink/hardlink protections.
 - Dependency audit, SBOM, reproducibility check, and unsafe-code audit.
 - Final default backend selection based on the device evidence set.
@@ -393,13 +424,17 @@ Before a backend may be selected automatically, its documentation must include:
 
 ## Immediate implementation backlog
 
-1. Capture the current real-device baseline and replace every placeholder evidence field.
-2. Build and persist the exact versioned Sing-Box Engine Capability Profile before compiling any final Generation.
-3. Reimplement private rtnetlink codecs and a loss-aware, read-only Network Inventory observer behind the Kernel Plane seam.
-4. Register netlink readiness and bounded work in the existing daemon reactor; do not introduce a second epoll owner.
-5. Split passive startup admission from active capability probes and expose an immutable, revisioned Capability Profile snapshot with runtime demotions.
-6. Implement deterministic Desired State normalization, Generation compilation, and boot/profile/engine-bound planning leases.
-7. Integrate the device-qualified policy trust boundary and fresh 27-cell fwmark census collector, then satisfy exact writer semantics, observer continuity, and mark-preservation canaries; do not turn the completed planning authority into an activation lease.
-8. Redesign the RPDB program around the proven no-two-slot/default-network and tethering/per-UID constraints, satisfy the remaining topology handoff/ownership/canary prerequisites, and only then implement priority/table allocation.
-9. Cut over address-derived rules and PBR with a transition lease that disables the shell route writer before the first native mutation.
-10. Implement legacy config migration in check-only mode and extract current rule-generation cases into backend-neutral golden fixtures.
+1. Fix the bridge's `100.0.0.0/8` error, define mandatory loop/local exclusions separately from configurable private/special-use direct defaults, and add golden fixtures.
+2. Define empty allowlist/denylist semantics and fix the bridge compiler so an empty allowlist proxies no applications.
+3. Remove dual TUN route ownership: select exactly one Flux or Sing-Box owner, or report the bridge mode unsupported.
+4. Make standalone `addrsyncd` readiness require initial dump, cleanup, apply, and verification convergence; strengthen `capture-verify` with Generation-scoped TCP/UDP/DNS and loop canaries.
+5. Repair legacy CLI status, installation migration, and package/source manifest provenance.
+6. Capture the current real-device baseline and replace every placeholder evidence field.
+7. Build and persist the exact versioned Sing-Box Engine Capability Profile before compiling any final Generation.
+8. Extend the Capability Profile with exact Android product/build/vendor, kernel-build, verified-boot, SELinux-policy, netd/Connectivity artifact, tool, and namespace identity.
+9. Define the compile-time reviewed positive mark-policy catalog over stable artifact identities, then bind selections to verified boot, boot ID, and observed namespace; never authorize an arbitrary runtime self-hashed manifest.
+10. Complete the remaining mark-evidence fragments and point-in-time 27-cell coordinator, then satisfy exact writer semantics, observer continuity, and mark-preservation canaries; do not turn planning authority into an activation lease.
+11. Redesign the RPDB program around the proven no-two-slot/default-network and tethering/per-UID constraints, satisfy domain/network-selection handoff, ownership, reachability, and canary prerequisites, and only then implement priority/table allocation.
+12. Cut over address-derived rules and PBR with a transition lease that disables the shell route writer before the first native mutation.
+13. Implement legacy config migration in check-only mode and extract current rule-generation cases into backend-neutral golden fixtures.
+14. Design the Phase 4 `xt_bpf` probe/observation adapter in parallel, without delaying correctness work or selecting acceleration before parity and benchmark gates.

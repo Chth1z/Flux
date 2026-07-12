@@ -1,7 +1,8 @@
 # Fluxd Technical Specification
 
-Status: proposed  
-Companion document: [Fluxd Rewrite Blueprint](fluxd-blueprint.md)
+- Status: accepted living specification
+- Last updated: 2026-07-13
+- Companion document: [Fluxd Rewrite Blueprint](fluxd-blueprint.md)
 
 ## 1. Supported platform contract
 
@@ -204,6 +205,7 @@ struct GenerationArtifact {
     desired_digest: Digest,
     capability_profile_revision: CapabilityProfileRevision,
     engine_profile_revision: EngineCapabilityProfileRevision,
+    planning_evidence: PlanningEvidenceReceipts,
     engine_binary_digest: Digest,
     backend_plan: BackendPlan,
     engine_config: EngineConfigArtifact,
@@ -213,9 +215,37 @@ struct GenerationArtifact {
     resource_budget: ResourceBudget,
     invariants: Vec<GenerationInvariant>,
 }
+
+struct AndroidMarkPlanningReceipt {
+    catalog_entry: ReviewedPolicyCatalogEntryId,
+    policy_digest: Sha256Digest,
+    policy_revision: PolicyRevision,
+    candidate: MarkCandidate,
+    topology: TopologyScopeIdentity,
+    inventory_epoch: NetworkEpoch,
+    inventory_snapshot: NetworkInventoryIdentity,
+    complete_census_observation_id: CompleteFwmarkCensusObservationId,
+    canonical_census_digest: Sha256Digest,
+    census_collector_revision: CensusCollectorRevision,
+    ownership_journal_identity: OwnershipJournalIdentity,
+    ownership_journal_revision: OwnershipJournalRevision,
+    capability_profile_revision: CapabilityProfileRevision,
+    boot_id: BootId,
+    network_namespace: NetworkNamespaceIdentity,
+}
+
+struct PlanningEvidenceReceipts {
+    android_mark: Option<AndroidMarkPlanningReceipt>,
+}
 ```
 
 `GenerationArtifact` is the deterministic, digest-bearing compiler output. Capture, route, and eBPF programs inside it use logical Managed Object keys rather than concrete kernel names. The Controller assigns the `GenerationId` only after successful compilation, and adapters derive bounded concrete names deterministically from that ID during preparation; creation/update timestamps belong to `GenerationRecord`, not the artifact. All numeric kernel identifiers use validated newtypes. Generation IDs use a monotonic local sequence plus an artifact-digest prefix; correctness does not depend on wall-clock uniqueness.
+
+`PlanningEvidenceReceipts` contains no authority or mutation capability. A mark-dependent domain plan
+requires the compiler to consume a fresh `AndroidMarkPlanningAuthority` and retain the resulting
+receipt; a plan containing no mark reads, writes, or transfers records that mark authority was not required. Activation rechecks
+the receipt's exact boot, namespace, inventory, catalog, census, and ownership facts and still needs
+a separate activation lease.
 
 ## 5. Configuration schema
 
@@ -320,6 +350,32 @@ Routing currently admits only `allocation = "auto"`, meaning topology-qualified 
 ### 6.1 Record format
 
 ```rust
+struct DeviceIdentity {
+    android_product: AndroidProductIdentity,
+    android_build: AndroidBuildIdentity,
+    vendor_build: VendorBuildIdentity,
+    security_patch: SecurityPatchLevel,
+    verified_boot: VerifiedBootIdentity,
+    kernel_build: KernelBuildIdentity,
+    selinux_policy: SelinuxPolicyIdentity,
+    netd: ArtifactIdentity,
+    connectivity: ArtifactIdentity,
+    tools: BTreeMap<ToolId, ArtifactIdentity>,
+    network_namespace: NetworkNamespaceIdentity,
+}
+
+struct ReviewedPolicySelector {
+    android_product: AndroidProductIdentity,
+    android_build: AndroidBuildIdentity,
+    vendor_build: VendorBuildIdentity,
+    security_patch: SecurityPatchLevel,
+    kernel_build: KernelBuildIdentity,
+    selinux_policy: SelinuxPolicyIdentity,
+    netd: ArtifactIdentity,
+    connectivity: ArtifactIdentity,
+    tools: BTreeMap<ToolId, ArtifactIdentity>,
+}
+
 struct CapabilityProfile {
     revision: CapabilityProfileRevision,
     boot_id: BootId,
@@ -341,8 +397,15 @@ enum CapabilityStatus {
     Supported,
     Unsupported,
     Denied,
+    Conflicting,
     Broken,
     Unknown,
+}
+
+enum ProbeAttemptOutcome {
+    Success,
+    TransientFailure { retry: RetryPolicy },
+    StableFailure,
 }
 ```
 
@@ -350,9 +413,16 @@ The target record includes exact device identity, but the delivered `CapabilityP
 currently narrower: it binds boot identity, kernel facts, SELinux state, and the legacy bridge, but
 not exact Android product/build/vendor identity or the selected netd/Connectivity artifact. A
 production positive mark-policy loader therefore remains blocked until those facts enter the full
-freshness-bound profile, or an equally strict qualification report is retained and rechecked by
-policy binding and census authorization. Parsing an arbitrary manifest and hashing its own bytes
-must not create a device-qualified grant.
+freshness-bound profile. Production assertions are selected from a compile-time reviewed policy
+catalog keyed by `ReviewedPolicySelector` and an externally reviewed artifact digest/revision. The
+selected assertion is then freshness-bound to the full Capability Profile, verified boot, boot ID,
+and observed network namespace. Runtime-only boot/namespace identities are never literal catalog
+keys. Parsing an arbitrary runtime manifest and hashing its own bytes must not create a
+device-qualified grant.
+
+`CapabilityStatus` records durable availability. Timeout, interruption, temporary resource
+pressure, and other retryable failures are retained as `ProbeAttemptOutcome` evidence with bounded
+backoff; they do not create a durable `Transient` capability state.
 
 ### 6.2 Version catalog
 
@@ -379,11 +449,13 @@ The catalog is evidence and optimization, not final authority. Exact introductio
 | nftables base support | create/delete uniquely named temporary table in one batch |
 | nftables required program | create a non-matching canary in the real hook context using the exact set lookup, counter, masked mark update, socket-transparent match, TCP/UDP TPROXY expressions, and one batch; list/normalize it, then delete and verify absence |
 | xtables TPROXY path | detect legacy versus nft variants, require coherent IPv4/IPv6 restore tools, then apply/verify/clean a private chain with the exact matches and targets |
+| `xt_bpf` | create/update required maps, load and pin the exact socket-filter programs, reference them with the selected iptables revision-1 `--object-pinned` extension in private IPv4/IPv6 OUTPUT/PREROUTING canary chains, send packets, validate UID/context/counters including ambiguous `overflowuid`, remove rules before unpinning, and verify cleanup |
 | ipset | create, populate, swap, and destroy temporary family-specific sets |
 | TUN | open device, create unique non-persistent interface, query flags, close, verify removal |
 | eBPF map types | create each required map type and close it |
 | eBPF program types | load minimal program and capture verifier output |
-| eBPF attach points | attach/detach harmless program at the exact intended hook |
+| eBPF attach points | inventory existing programs and flags, then attach/query/detach a harmless program at the exact intended hook without replacing an unknown owner |
+| Cgroup hierarchy | identify the intended proxy-child cgroup and every ancestor to the root, query every requested attach type and flags, and prove that no ancestor blocks the child hook before attaching |
 | BTF/CO-RE | open BTF and load a relocation-dependent probe program |
 | BPF ring event transport | create, mmap, epoll, submit/consume, and overflow-test ringbuf; otherwise probe perf-event-array fallback |
 | TUN eBPF steering | only for a Flux-owned TUN FD contract: load socket-filter canary, attach with `TUNSETSTEERINGEBPF`, verify queue selection, detach |
@@ -399,17 +471,56 @@ Before Generation compilation, Flux queries and validates the exact Sing-Box bin
 
 Every `CompiledGeneration` records both the device `CapabilityProfileRevision` and the `EngineCapabilityProfileRevision` used by the planner. A boot change, runtime capability demotion, Sing-Box binary replacement, or engine-profile refresh invalidates the planning lease: Flux must recompile or explicitly prove that the active Generation's requirements are still satisfied before repairing or reactivating it.
 
+### 6.5 Preloaded Kernel Extension Profile
+
+Production Flux does not load or unload kernel modules. If a reviewed OEM/custom-kernel extension is
+already active, an optional `KernelExtensionProfile` may describe it without promoting it to a
+general fallback:
+
+```rust
+struct KernelExtensionProfile {
+    revision: KernelExtensionProfileRevision,
+    boot_id: BootId,
+    namespace: NetworkNamespaceIdentity,
+    device: DeviceIdentity,
+    kernel_kmi: KernelKmiIdentity,
+    owner: KernelExtensionOwner,
+    live_identity: KernelExtensionLiveIdentity,
+    source_digest: Sha256Digest,
+    signer: Option<SignerIdentity>,
+    protocol: GenericNetlinkProtocolIdentity,
+    semantics: KernelExtensionSemantics,
+    canary: CapabilityEvidence,
+}
+```
+
+The control handshake resolves the family through Generic Netlink control, validates kernel sender,
+sequence, command, reserved fields, and strict attributes, and exchanges a nonce plus expected
+protocol/boot/namespace for origin and correlation. Echoed identity fields are claims, not
+authentication. Acceptance requires independently observed AVB/module-signature/measurement or
+other reviewed platform evidence matching the catalog, followed by a nonpersistent behavioral
+canary. Until a concrete partner contract and superseding ADR define a passive-by-default,
+Generation-leased, expiring fail-open mechanism, this profile is read-only observation/diagnostic
+evidence and is not referenced by `BackendPlan` or `GenerationArtifact`. Flux never unloads an
+extension it did not load, and production Flux loads none.
+
 ## 7. Backend Plan
 
 ```rust
 struct BackendPlan {
+    domains: Vec<DomainBackendPlan>,
+    tun: Option<TunBackendPlan>,
+    ebpf: EbpfPlan,
+    degraded: Vec<DegradedFeature>,
+    rejected: Vec<RejectedBackend>,
+}
+
+struct DomainBackendPlan {
+    domain: TrafficDomain,
     capture: CaptureBackend,
     address_sets: AddressSetBackend,
     routing: RoutingBackend,
-    tun: Option<TunBackendPlan>,
-    ebpf: EbpfMode,
-    degraded: Vec<DegradedFeature>,
-    rejected: Vec<RejectedBackend>,
+    coverage: DomainCoverageProof,
 }
 
 enum CaptureBackend {
@@ -427,6 +538,7 @@ enum AddressSetBackend {
 
 enum RoutingBackend {
     RtnetlinkMarkedLocal,
+    RtnetlinkInputInterfaceLocal,
     RtnetlinkTun,
 }
 
@@ -434,6 +546,41 @@ enum EbpfMode {
     Off,
     Observe,
     Accelerate,
+}
+
+struct EbpfPlan {
+    requested: EbpfMode,
+    roles: Vec<EbpfRolePlan>,
+}
+
+struct EbpfRolePlan {
+    domains: TrafficDomainSet,
+    mechanism: EbpfMechanism,
+    role: EbpfRole,
+    attachment: AttachmentLeasePlan,
+    fallback: ConventionalFallbackProof,
+}
+
+enum EbpfMechanism {
+    XtBpfMatcher,
+    TunTc,
+    ProxyChildSockOps,
+    PhysicalTcExperimental,
+    TcSocketAssignExperimental,
+    NetnsSkLookupExperimental,
+    ListenerReuseportFuture,
+    NetfilterBpfExperimental,
+    TunSteering,
+}
+
+enum EbpfRole {
+    Observe,
+    ProxyPositive,
+    FlowCache,
+    MaskedMarkAcceleration,
+    SocketAssign,
+    ListenerSelect,
+    QueueSteering,
 }
 
 struct TunBackendPlan {
@@ -466,14 +613,32 @@ enum TunSteeringMode { KernelDefault, Ebpf }
 
 ### 7.1 Selection algorithm
 
+Planning is two-stage. `enumerate_generation_candidates(...)` returns a bounded ranked set of
+non-authorizing syntactic/topology candidates. `compile_generation(candidates, evidence, selection)`
+takes a bounded candidate-keyed `PlanningEvidenceSet` by value so a selected non-`Clone` authority
+is actually consumed; each candidate retains the exact Capability Profile, Engine Capability
+Profile, inventory, and topology identities used during enumeration.
+
+Candidate enumeration:
+
 1. Reject kernel `< 5.10`.
 2. Normalize explicit user preferences.
 3. Derive hard requirements from Traffic Scope: local apps, tethered traffic, IPv6, per-app policy, UDP, DNS, Android VPN semantics, and fail policy.
-4. Evaluate candidate plans against `Supported` device capabilities and the version-qualified Engine Capability Profile only.
-5. Reject candidates that exceed rule/set/map/resource budgets.
-6. Score remaining candidates by requested mode, semantic coverage, atomicity, recovery quality, and tested preference order.
-7. Add eBPF independently; it cannot rescue an otherwise invalid correctness plan.
-8. Return the selected plan and all rejection reasons.
+4. Partition the requested Traffic Scope into a bounded set of explicit domains and require a recognized anchor for each.
+5. Evaluate candidate domain plans against `Supported` device capabilities and the version-qualified Engine Capability Profile only.
+6. Reject combinations that are not exhaustive, selector-disjoint, non-overlapping, or compatible in engine/listener, mark, route, per-domain address-set, activation, and cleanup ownership.
+7. Reject candidates that exceed rule/set/map/resource budgets.
+8. Add independently eligible eBPF roles per domain; they cannot rescue an otherwise invalid correctness plan.
+9. Rank remaining candidates by requested mode, semantic coverage, atomicity, recovery quality, and tested preference order.
+10. Return the bounded ranked candidates and all rejection reasons without consuming authority.
+
+Candidate finalization:
+
+1. For an explicit request, evaluate only the named candidate and fail immediately if its exact evidence is missing or stale.
+2. For `auto`, boundedly visit ranked candidates, rechecking each candidate's Capability Profile, Engine Capability Profile, inventory, topology, boot, and namespace bindings; retain every failure as a rejection reason.
+3. For a candidate containing mark reads, writes, or transfers, remove, freshness-check, and consume its exact `AndroidMarkPlanningAuthority` from the owned evidence set. A candidate with no mark use records that authority was not required.
+4. Select the first `auto` candidate whose exact evidence succeeds, or fail with the complete bounded rejection report when none does.
+5. Emit the immutable Backend Plan, programs, non-authorizing evidence receipt, resource budget, and all retained rejection/explanation data.
 
 The algorithm is pure and has golden tests for representative device profiles.
 
@@ -485,15 +650,26 @@ The backend-neutral Capture Program uses this order:
 
 1. traffic outside Traffic Scope;
 2. Flux control and Proxy Engine loop prevention;
-3. invalid, local-only, multicast, broadcast, and configured Bypass Policy;
-4. established-flow cached bypass/proxy decision when valid;
-5. interface/network role decision;
-6. Android user/UID policy for locally originated traffic;
-7. protocol-specific safety policy;
-8. proxy action;
-9. direct default for unsupported or explicitly bypassed scopes.
+3. mandatory invalid, local/device-owned, multicast, broadcast, and other loop-safety exclusions;
+4. configurable private, CGNAT, special-use, and user-direct Bypass Policy;
+5. established-flow cached bypass/proxy decision when valid;
+6. interface/network role decision;
+7. Android user/UID policy for locally originated traffic;
+8. protocol-specific safety policy;
+9. proxy action;
+10. direct default for unsupported or explicitly bypassed scopes.
 
 Forwarded traffic never evaluates an OUTPUT-only UID predicate. Local and forwarded programs are compiled separately even when a backend later shares chains or sets.
+
+Application selection uses typed set algebra after package/user inventory resolution:
+
+- `all` proxies every otherwise eligible local application;
+- `allowlist(S)` proxies exactly the eligible UIDs in `S`, so `allowlist(∅)` proxies zero applications;
+- `denylist(S)` proxies eligible UIDs not in `S`, so `denylist(∅)` proxies every otherwise eligible application.
+
+The bridge compiler and every native backend must share these semantics. The canonical CGNAT prefix
+is `100.64.0.0/10`; `100.0.0.0/8` is never emitted as an RFC 6598 default. Mandatory loop/device-
+local exclusions are not disabled by an empty configurable bypass set.
 
 ### 8.2 Mark invariants
 
@@ -701,21 +877,33 @@ All map sizes are calculated by the Generation Compiler and checked against the 
 
 ### 13.2 Generation safety
 
+For `xt_bpf`, each Generation owns new maps, programs, pins, and private xtables chains. Observation
+programs always return zero. Positive programs return nonzero only for an unambiguous proxy decision;
+every miss, parse ambiguity, `bpf_get_socket_uid() == overflowuid`, stale Generation, or map failure continues through
+the complete classic classifier. Activation switches the stable xtables jump only after the new
+program reference and packet canary verify; retirement removes referencing rules before unpinning.
+
 Old and new program sets share a small control map. Each program has an immutable expected Generation and reads the BPF active-policy selector plus the selected per-generation policy-map slot. Userspace populates the new maps, attaches every new program in dormant/pass-through mode, and then performs one control-map update selecting the new BPF policy slot. New programs accelerate only on a match; old programs immediately pass through and are detached afterward. This internal selector update does not publish the authoritative `GenerationRecord` or modify `active.json`.
 
 When shared-map reuse or concurrent attachment cannot be proven, Flux detaches/re-attaches acceleration non-atomically while nftables/xtables/TUN remains the complete correctness path.
 
-On the 5.10 correctness stack, the only general BPF-to-netfilter bridge is a masked Flux mark. TC ingress may stamp a verified decision before PREROUTING for forwarded/tethered traffic, and nftables/xtables may match that mark. TC egress occurs after local OUTPUT and is not claimed to accelerate that classification path. No backend assumes it can read Aya maps directly.
+On the 5.10 correctness stack, the general bridge from out-of-chain TC/cgroup programs into netfilter is a masked Flux mark. `xt_bpf` is a separate direct Boolean bridge inside a referencing xtables rule. TC ingress may stamp a verified decision before PREROUTING for forwarded/tethered traffic, and nftables/xtables may match that mark. TC egress occurs after local OUTPUT and is not claimed to accelerate that classification path. No backend assumes it can read Aya maps directly.
+
+TC ingress `bpf_sk_assign` is an exact-domain experiment, not a general bridge. The assigned socket
+must be compatible and in the same namespace, and the packet still requires a correct local route.
+A miss must retain an ordinary forwarding route rather than fall into a proxy-local default. This
+role cannot become correctness-bearing without a separate ADR and domain fallback proof.
 
 Only `FluxOwnedTunFd` may attach a socket-filter steering program through `TUNSETSTEERINGEBPF`. `TUNSETFILTEREBPF` is deferred because a zero return drops traffic and there is no automatic distinction between a program bug and an intended filter decision.
 
 ### 13.3 Attachment
 
 - Prefer `bpf_link` ownership when probed.
-- Legacy tc attachment uses a private qdisc/filter identity and exact cleanup.
-- Default tc attachment is limited to a verified Generation-scoped TUN netdevice, whether its queue FDs are engine-owned or Flux-owned. Flux must own a collision-checked qdisc/filter identity, revalidate link identity after recreation, and remove only that lease. Physical interfaces require an experimental opt-in because AOSP netd can delete `clsact` qdiscs on startup and tethering offload may use the same path.
+- Legacy TC attachment uses a private `clsact`/filter identity and exact cleanup. It is bound to Network Epoch and reverified after netd lifecycle changes because AOSP netd may delete `clsact` from every extant interface.
+- TCX attachment is qdisc-less and owns a BPF link rather than a `clsact` filter. Netd `clsact` deletion does not itself demote TCX, but link identity, foreign TCX program ordering, attach flags, link/program IDs, and offload semantics remain freshness evidence.
+- Default TC attachment is limited to a verified Generation-scoped TUN netdevice, whether its queue FDs are engine-owned or Flux-owned. Physical interfaces additionally require an experimental opt-in because tethering offload may use the same path.
 - Physical-interface experiments observe netd lifecycle, verify attachment after every Network Epoch, and immediately demote on qdisc/filter conflict.
-- Never replace or multi-attach to Android's root cgroup hooks by default. A Flux-owned child cgroup covers Flux/Sing-Box processes only; arbitrary Android-app coverage on an Android-owned cgroup is a separate experimental coexistence plan.
+- Never replace Android's cgroup hooks. Program IDs and attach flags across every ancestor plus the child must prove an exact hook unoccupied or explicitly compatible; an attachment at any ancestor can constrain descendants, and AOSP's root defaults normally prevent the same type below it. The first allowed child role is optional proxy-child `sockops` telemetry, paired with userspace TCP/UDP canaries rather than used as the loop-escape mechanism.
 - Detach or userspace death must leave the correctness Capture Path intact.
 - `BPF_PROG_TYPE_NETFILTER` is eligible only on parsed kernel 6.4+ and a successful real hook probe.
 - TCX is eligible only on parsed kernel 6.6+ and a successful attach/query/detach probe; legacy TC remains the fallback.
@@ -845,6 +1033,7 @@ enum ErrorCode {
     UnsupportedKernel,
     CapabilityUnsupported,
     CapabilityDenied,
+    CapabilityConflict,
     ConfigurationInvalid,
     EngineInvalid,
     EngineUnhealthy,
@@ -932,6 +1121,8 @@ cargo xtask device-test --serial <adb-serial>
 ```
 
 The packaging task fails if binary source, version, target, hash, license, or required device-test evidence is missing.
+It also rejects `.ko`, KPM, or other opaque kernel payloads in a production artifact. Production
+`fluxd` does not call `init_module`, `finit_module`, or `delete_module`.
 
 ## 20. Compatibility and removal schedule
 

@@ -1,5 +1,6 @@
 ---
-status: proposed
+status: accepted
+decision_date: 2026-07-13
 ---
 
 # Enforce kernel 5.10 and select features through active probes

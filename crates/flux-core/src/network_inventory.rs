@@ -4,6 +4,9 @@ use std::net::IpAddr;
 use std::num::{NonZeroU32, NonZeroU64};
 use std::ops::{BitOr, BitOrAssign};
 
+use crate::network_route::NetworkRouteRecord;
+use crate::network_rule::NetworkRuleRecord;
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(transparent)]
 pub struct NetworkEpoch(NonZeroU64);
@@ -466,6 +469,8 @@ pub struct NetworkInventory {
     epoch: NetworkEpoch,
     links: Box<[InterfaceLinkRecord]>,
     addresses: Box<[InterfaceAddressRecord]>,
+    routes: Box<[NetworkRouteRecord]>,
+    rules: Box<[NetworkRuleRecord]>,
 }
 
 impl NetworkInventory {
@@ -484,9 +489,24 @@ impl NetworkInventory {
         &self.addresses
     }
 
+    /// Returns routes in kernel dump order, including exact duplicates.
+    #[must_use]
+    pub fn routes(&self) -> &[NetworkRouteRecord] {
+        &self.routes
+    }
+
+    /// Returns policy rules in kernel dump order, including exact duplicates.
+    #[must_use]
+    pub fn rules(&self) -> &[NetworkRuleRecord] {
+        &self.rules
+    }
+
     #[must_use]
     pub fn materially_differs_from(&self, candidate: &Self) -> bool {
-        self.links != candidate.links || self.addresses != candidate.addresses
+        self.links != candidate.links
+            || self.addresses != candidate.addresses
+            || self.routes != candidate.routes
+            || self.rules != candidate.rules
     }
 }
 
@@ -622,13 +642,30 @@ impl NetworkInventoryTracker {
         links: impl IntoIterator<Item = InterfaceLinkRecord>,
         addresses: impl IntoIterator<Item = InterfaceAddressRecord>,
     ) -> Result<&NetworkInventory, NetworkInventoryError> {
+        self.publish_complete_with_routing(links, addresses, std::iter::empty(), std::iter::empty())
+    }
+
+    /// Atomically publishes one complete link/address/route/rule snapshot.
+    ///
+    /// Link and address facts are canonical sets. Route and rule facts are
+    /// ordered multisets, so their input order and multiplicity are retained.
+    pub fn publish_complete_with_routing(
+        &mut self,
+        links: impl IntoIterator<Item = InterfaceLinkRecord>,
+        addresses: impl IntoIterator<Item = InterfaceAddressRecord>,
+        routes: impl IntoIterator<Item = NetworkRouteRecord>,
+        rules: impl IntoIterator<Item = NetworkRuleRecord>,
+    ) -> Result<&NetworkInventory, NetworkInventoryError> {
         let links = canonicalize_complete_links(links)?;
         let addresses = canonicalize_complete_addresses(addresses)?;
-        if self
-            .current
-            .as_ref()
-            .is_some_and(|current| current.links == links && current.addresses == addresses)
-        {
+        let routes = routes.into_iter().collect::<Vec<_>>().into_boxed_slice();
+        let rules = rules.into_iter().collect::<Vec<_>>().into_boxed_slice();
+        if self.current.as_ref().is_some_and(|current| {
+            current.links == links
+                && current.addresses == addresses
+                && current.routes == routes
+                && current.rules == rules
+        }) {
             return Ok(self.current.as_ref().expect("current inventory is present"));
         }
 
@@ -643,6 +680,8 @@ impl NetworkInventoryTracker {
             epoch,
             links,
             addresses,
+            routes,
+            rules,
         });
         Ok(self
             .current

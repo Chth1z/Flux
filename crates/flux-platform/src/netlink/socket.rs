@@ -54,7 +54,7 @@ const AF_NETLINK: u16 = 16;
 const SOCKADDR_NL_LENGTH: u32 = 12;
 const MSG_TRUNC: i32 = 0x20;
 pub(crate) const RECEIVE_BATCH_SLOTS: usize = 8;
-// Operational bound for current Android 5.10 link/address observation. This
+// Operational bound for current Android 5.10 link/address/route/rule observation. This
 // is not a protocol-wide rtnetlink maximum; larger future/VF-heavy messages
 // remain loss signals through MSG_TRUNC and force a complete resynchronization.
 pub(crate) const ROUTE_DATAGRAM_CAPACITY: usize = 256 * 1024;
@@ -376,7 +376,10 @@ pub(crate) enum NetlinkSendOutcome {
 pub(crate) enum NetlinkReceiveOutcome<'a> {
     WouldBlock,
     Datagrams(NetlinkDatagramBatch<'a>),
-    Loss(NetlinkReceiveLoss),
+    Loss {
+        loss: NetlinkReceiveLoss,
+        terminal_sequences: Box<[u32]>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -440,6 +443,7 @@ mod implementation {
         route_subscription_groups,
     };
     use crate::PlatformError;
+    use crate::netlink::terminal_sequences;
 
     const _: () = assert!(AF_NETLINK == libc::AF_NETLINK as u16);
     const _: () = assert!(MSG_TRUNC == libc::MSG_TRUNC);
@@ -543,6 +547,23 @@ mod implementation {
                     ),
                 );
             }
+        }
+
+        fn recoverable_terminal_sequences(&self, count: usize) -> Box<[u32]> {
+            let mut recovered = Vec::new();
+            for index in 0..count {
+                let metadata = self.metadata[index];
+                if metadata.is_truncated()
+                    || !metadata.sender().is_kernel()
+                    || metadata.sender().groups() != 0
+                {
+                    continue;
+                }
+                let start = index * ROUTE_DATAGRAM_CAPACITY;
+                let end = start + metadata.reported_length();
+                recovered.extend_from_slice(&terminal_sequences(&self.slab[start..end]));
+            }
+            recovered.into_boxed_slice()
         }
     }
 
@@ -767,7 +788,10 @@ mod implementation {
                         return Ok(NetlinkReceiveOutcome::WouldBlock);
                     }
                     if source.raw_os_error() == Some(libc::ENOBUFS) {
-                        return Ok(NetlinkReceiveOutcome::Loss(NetlinkReceiveLoss::Enobufs));
+                        return Ok(NetlinkReceiveOutcome::Loss {
+                            loss: NetlinkReceiveLoss::Enobufs,
+                            terminal_sequences: Box::default(),
+                        });
                     }
                     return Err(system_call_error("receive route-netlink batch", source));
                 }
@@ -790,16 +814,18 @@ mod implementation {
                         count,
                     }))
                 }
-                BatchIntegrity::Truncated => {
-                    Ok(NetlinkReceiveOutcome::Loss(NetlinkReceiveLoss::Truncated(
-                        Box::new(NetlinkBatchMetadata::copy_from(metadata)),
-                    )))
-                }
-                BatchIntegrity::UnexpectedSender => Ok(NetlinkReceiveOutcome::Loss(
-                    NetlinkReceiveLoss::UnexpectedSender(Box::new(
+                BatchIntegrity::Truncated => Ok(NetlinkReceiveOutcome::Loss {
+                    loss: NetlinkReceiveLoss::Truncated(Box::new(NetlinkBatchMetadata::copy_from(
+                        metadata,
+                    ))),
+                    terminal_sequences: ring.recoverable_terminal_sequences(count),
+                }),
+                BatchIntegrity::UnexpectedSender => Ok(NetlinkReceiveOutcome::Loss {
+                    loss: NetlinkReceiveLoss::UnexpectedSender(Box::new(
                         NetlinkBatchMetadata::copy_from(metadata),
                     )),
-                )),
+                    terminal_sequences: ring.recoverable_terminal_sequences(count),
+                }),
             }
         }
     }
@@ -984,6 +1010,35 @@ mod implementation {
         }
 
         #[test]
+        fn lossy_batch_preserves_terminal_sequences_from_intact_kernel_responses() {
+            let sequence = 0x1020_3040_u32;
+            let mut done = Vec::with_capacity(NETLINK_HEADER_LENGTH);
+            done.extend_from_slice(&(NETLINK_HEADER_LENGTH as u32).to_ne_bytes());
+            done.extend_from_slice(&NLMSG_DONE.to_ne_bytes());
+            done.extend_from_slice(&0_u16.to_ne_bytes());
+            done.extend_from_slice(&sequence.to_ne_bytes());
+            done.extend_from_slice(&0_u32.to_ne_bytes());
+
+            let mut ring = NetlinkReceiveRing::new();
+            let second = ROUTE_DATAGRAM_CAPACITY;
+            ring.slab[second..second + done.len()].copy_from_slice(&done);
+            ring.headers[0].msg_len = u32::try_from(ROUTE_DATAGRAM_CAPACITY + 1).unwrap();
+            ring.headers[0].msg_hdr.msg_flags = MSG_TRUNC;
+            ring.headers[1].msg_len = u32::try_from(done.len()).unwrap();
+            for index in 0..2 {
+                ring.headers[index].msg_hdr.msg_namelen = SOCKADDR_NL_LENGTH;
+                ring.senders[index].family = AF_NETLINK;
+            }
+            ring.update_metadata(2);
+
+            assert_eq!(
+                classify_batch(&ring.metadata[..2]),
+                BatchIntegrity::Truncated
+            );
+            assert_eq!(ring.recoverable_terminal_sequences(2).as_ref(), &[sequence]);
+        }
+
+        #[test]
         fn receive_ring_preserves_and_link_decoder_accepts_a_datagram_above_64_kib() {
             let fixture = oversized_link_datagram_fixture();
             assert_eq!(fixture.len(), 65_584);
@@ -1139,7 +1194,7 @@ mod implementation {
                     NetlinkReceiveOutcome::WouldBlock => {
                         wait_for(socket, libc::POLLIN, deadline);
                     }
-                    NetlinkReceiveOutcome::Loss(loss) => {
+                    NetlinkReceiveOutcome::Loss { loss, .. } => {
                         panic!("unexpected route-netlink loss during {operation}: {loss:?}");
                     }
                     NetlinkReceiveOutcome::Datagrams(batch) => {

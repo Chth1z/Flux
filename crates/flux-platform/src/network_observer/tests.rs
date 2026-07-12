@@ -7,12 +7,17 @@ use flux_core::{InterfaceAddressFlags, InterfaceLinkFlags, NetworkEpoch};
 
 use crate::address_sync::{AddressEventPolicy, RtnetlinkAddressEventDecoder};
 use crate::netlink::link::RtnetlinkLinkEventDecoder;
+use crate::netlink::route::RtnetlinkRouteEventDecoder;
+use crate::netlink::rule::RtnetlinkRuleEventDecoder;
+use crate::netlink::terminal_sequences;
 
 const NETLINK_HEADER_LENGTH: usize = 16;
 const RTM_NEWLINK: u16 = 16;
 const RTM_DELLINK: u16 = 17;
 const RTM_NEWADDR: u16 = 20;
 const RTM_DELADDR: u16 = 21;
+const RTM_NEWROUTE: u16 = 24;
+const RTM_NEWRULE: u16 = 32;
 const AF_UNSPEC: u8 = 0;
 const AF_INET: u8 = 2;
 const AF_INET6: u8 = 10;
@@ -24,7 +29,16 @@ const IFLA_CARRIER: u16 = 33;
 const IFLA_INFO_KIND: u16 = 1;
 const NLA_F_NESTED: u16 = 1 << 15;
 const IFA_ADDRESS: u16 = 1;
+const RTA_PRIORITY: u16 = 6;
+const FRA_PRIORITY: u16 = 6;
+const FRA_SUPPRESS_PREFIXLEN: u16 = 14;
+const FRA_TABLE: u16 = 15;
+const FRA_PROTOCOL: u16 = 21;
+const NLMSG_ERROR: u16 = 2;
 const NLMSG_DONE: u16 = 3;
+const RT_TABLE_MAIN: u8 = 254;
+const RTN_UNICAST: u8 = 1;
+const FR_ACT_TO_TBL: u8 = 1;
 
 #[test]
 fn source_is_none_before_first_complete_dump() {
@@ -95,7 +109,7 @@ fn startup_af_unspec_dump_publishes_both_families_only_after_matching_done() {
 }
 
 #[test]
-fn coordinated_link_then_address_dump_publishes_one_combined_epoch() {
+fn coordinated_four_phase_dump_publishes_only_after_rule_done() {
     let mut observer = observer();
     let source = observer.source();
     let now = Instant::now();
@@ -130,6 +144,42 @@ fn coordinated_link_then_address_dump_publishes_one_combined_epoch() {
             decode(netlink_message(NLMSG_DONE, 71, &[])),
             now + Duration::from_millis(5),
         ),
+        ObserverDriveOutcome::RequestRouteDump
+    );
+    assert!(source.snapshot().is_none());
+
+    observer.begin_route_dump(dump_sequence(72), now + Duration::from_millis(6));
+    assert_eq!(
+        observer.consume(
+            decode(route_datagram(72, 200)),
+            now + Duration::from_millis(7),
+        ),
+        ObserverDriveOutcome::Idle
+    );
+    assert!(source.snapshot().is_none());
+    assert_eq!(
+        observer.consume(
+            decode(netlink_message(NLMSG_DONE, 72, &[])),
+            now + Duration::from_millis(8),
+        ),
+        ObserverDriveOutcome::RequestRuleDump
+    );
+    assert!(source.snapshot().is_none());
+
+    observer.begin_rule_dump(dump_sequence(73), now + Duration::from_millis(9));
+    assert_eq!(
+        observer.consume(
+            decode(rule_datagram(73, 100)),
+            now + Duration::from_millis(10),
+        ),
+        ObserverDriveOutcome::Idle
+    );
+    assert!(source.snapshot().is_none());
+    assert_eq!(
+        observer.consume(
+            decode(netlink_message(NLMSG_DONE, 73, &[])),
+            now + Duration::from_millis(11),
+        ),
         ObserverDriveOutcome::Published(NetworkEpoch::INITIAL)
     );
 
@@ -140,10 +190,14 @@ fn coordinated_link_then_address_dump_publishes_one_combined_epoch() {
     assert_eq!(snapshot.links()[0].name().as_bytes(), b"wlan0");
     assert_eq!(snapshot.links()[0].mtu(), Some(1_500));
     assert_eq!(snapshot.addresses().len(), 1);
+    assert_eq!(snapshot.routes().len(), 1);
+    assert_eq!(snapshot.routes()[0].priority(), 200);
+    assert_eq!(snapshot.rules().len(), 1);
+    assert_eq!(snapshot.rules()[0].priority().get(), 100);
 }
 
 #[test]
-fn transaction_races_span_both_phases_and_preserve_partial_link_fields() {
+fn transaction_races_span_all_phases_and_preserve_partial_link_fields() {
     let mut observer = observer();
     let source = observer.source();
     let now = Instant::now();
@@ -181,6 +235,26 @@ fn transaction_races_span_both_phases_and_preserve_partial_link_fields() {
         observer.consume(
             decode(netlink_message(NLMSG_DONE, 73, &[])),
             now + Duration::from_millis(4),
+        ),
+        ObserverDriveOutcome::RequestRouteDump
+    );
+    assert!(source.snapshot().is_none());
+
+    observer.begin_route_dump(dump_sequence(74), now + Duration::from_millis(5));
+    assert_eq!(
+        observer.consume(
+            decode(netlink_message(NLMSG_DONE, 74, &[])),
+            now + Duration::from_millis(6),
+        ),
+        ObserverDriveOutcome::RequestRuleDump
+    );
+    assert!(source.snapshot().is_none());
+
+    observer.begin_rule_dump(dump_sequence(75), now + Duration::from_millis(7));
+    assert_eq!(
+        observer.consume(
+            decode(netlink_message(NLMSG_DONE, 75, &[])),
+            now + Duration::from_millis(8),
         ),
         ObserverDriveOutcome::Published(NetworkEpoch::INITIAL)
     );
@@ -246,38 +320,27 @@ fn transaction_race_byte_budget_is_enforced_independently_of_event_count() {
             decode_notification(notification),
             now + Duration::from_millis(1),
         ),
-        ObserverDriveOutcome::RequestDump(ObserverFault::RaceQueueByteOverflow { capacity })
+        ObserverDriveOutcome::DrainDump(ObserverFault::RaceQueueByteOverflow { capacity })
     );
     assert!(observer.source().snapshot().is_none());
+    assert_eq!(
+        observer.consume(
+            decode(netlink_message(NLMSG_DONE, 75, &[])),
+            now + Duration::from_millis(2),
+        ),
+        ObserverDriveOutcome::RequestDump(ObserverFault::RaceQueueByteOverflow { capacity })
+    );
 }
 
 #[test]
-fn link_removal_does_not_invent_an_address_cascade() {
+fn live_link_and_address_updates_preserve_published_routing_facts() {
     let mut observer = observer();
     let source = observer.source();
     let now = Instant::now();
-    observer.begin_link_dump(dump_sequence(76), now);
-    assert_eq!(
-        observer.consume_batch(
-            [
-                decode(link_datagram(76, 7, b"wlan0", 0x1, Some(1_500))),
-                decode(netlink_message(NLMSG_DONE, 76, &[])),
-            ],
-            now + Duration::from_millis(1),
-        ),
-        ObserverDriveOutcome::RequestAddressDump
-    );
-    observer.begin_address_dump(dump_sequence(77), now + Duration::from_millis(2));
-    assert_eq!(
-        observer.consume_batch(
-            [
-                decode(address_datagram(77, RTM_NEWADDR, 7, [192, 0, 2, 9], 24, 0,)),
-                decode(netlink_message(NLMSG_DONE, 77, &[])),
-            ],
-            now + Duration::from_millis(3),
-        ),
-        ObserverDriveOutcome::Published(NetworkEpoch::INITIAL)
-    );
+    complete_single_routed_dump(&mut observer, 76, now);
+    let initial = source.snapshot().expect("complete routed inventory");
+    let routes = initial.routes().to_vec();
+    let rules = initial.rules().to_vec();
 
     assert_eq!(
         observer.consume(
@@ -294,6 +357,227 @@ fn link_removal_does_not_invent_an_address_cascade() {
     let snapshot = source.snapshot().expect("link removal committed");
     assert!(snapshot.links().is_empty());
     assert_eq!(snapshot.addresses().len(), 1);
+    assert_eq!(snapshot.routes(), routes);
+    assert_eq!(snapshot.rules(), rules);
+
+    assert_eq!(
+        observer.consume(
+            decode_notification(address_datagram(
+                904,
+                RTM_NEWADDR,
+                9,
+                [198, 51, 100, 4],
+                24,
+                0,
+            )),
+            now + Duration::from_millis(40),
+        ),
+        ObserverDriveOutcome::Idle
+    );
+    let third_epoch = next_epoch.checked_next().expect("third epoch");
+    assert_eq!(
+        observer.poll(now + Duration::from_millis(60)),
+        ObserverDriveOutcome::Published(third_epoch)
+    );
+    let snapshot = source.snapshot().expect("address addition committed");
+    assert_eq!(snapshot.addresses().len(), 2);
+    assert_eq!(snapshot.routes(), routes);
+    assert_eq!(snapshot.rules(), rules);
+}
+
+#[test]
+fn route_and_rule_dumps_preserve_order_and_exact_duplicates() {
+    let mut observer = observer();
+    let source = observer.source();
+    let now = Instant::now();
+    observer.begin_link_dump(dump_sequence(100), now);
+    assert_eq!(
+        observer.consume(
+            decode(netlink_message(NLMSG_DONE, 100, &[])),
+            now + Duration::from_millis(1),
+        ),
+        ObserverDriveOutcome::RequestAddressDump
+    );
+    observer.begin_address_dump(dump_sequence(101), now + Duration::from_millis(2));
+    assert_eq!(
+        observer.consume(
+            decode(netlink_message(NLMSG_DONE, 101, &[])),
+            now + Duration::from_millis(3),
+        ),
+        ObserverDriveOutcome::RequestRouteDump
+    );
+
+    observer.begin_route_dump(dump_sequence(102), now + Duration::from_millis(4));
+    for (elapsed_ms, priority) in [(5, 300), (6, 100), (7, 300)] {
+        assert_eq!(
+            observer.consume(
+                decode(route_datagram(102, priority)),
+                now + Duration::from_millis(elapsed_ms),
+            ),
+            ObserverDriveOutcome::Idle
+        );
+    }
+    assert_eq!(
+        observer.consume(
+            decode(netlink_message(NLMSG_DONE, 102, &[])),
+            now + Duration::from_millis(8),
+        ),
+        ObserverDriveOutcome::RequestRuleDump
+    );
+    assert!(source.snapshot().is_none());
+
+    observer.begin_rule_dump(dump_sequence(103), now + Duration::from_millis(9));
+    for (elapsed_ms, priority) in [(10, 30), (11, 10), (12, 30)] {
+        assert_eq!(
+            observer.consume(
+                decode(rule_datagram(103, priority)),
+                now + Duration::from_millis(elapsed_ms),
+            ),
+            ObserverDriveOutcome::Idle
+        );
+    }
+    assert!(source.snapshot().is_none());
+    assert_eq!(
+        observer.consume(
+            decode(netlink_message(NLMSG_DONE, 103, &[])),
+            now + Duration::from_millis(13),
+        ),
+        ObserverDriveOutcome::Published(NetworkEpoch::INITIAL)
+    );
+
+    let snapshot = source.snapshot().expect("ordered routing inventory");
+    assert_eq!(
+        snapshot
+            .routes()
+            .iter()
+            .map(|record| record.priority())
+            .collect::<Vec<_>>(),
+        [300, 100, 300]
+    );
+    assert_eq!(snapshot.routes()[0], snapshot.routes()[2]);
+    assert_eq!(
+        snapshot
+            .rules()
+            .iter()
+            .map(|record| record.priority().get())
+            .collect::<Vec<_>>(),
+        [30, 10, 30]
+    );
+    assert_eq!(snapshot.rules()[0], snapshot.rules()[2]);
+}
+
+#[test]
+fn route_and_rule_notifications_before_their_own_dumps_are_subsumed() {
+    let mut observer = observer();
+    let source = observer.source();
+    let now = Instant::now();
+    observer.begin_link_dump(dump_sequence(110), now);
+    assert_eq!(
+        observer.consume(
+            decode(netlink_message(NLMSG_DONE, 110, &[])),
+            now + Duration::from_millis(1),
+        ),
+        ObserverDriveOutcome::RequestAddressDump
+    );
+
+    observer.begin_address_dump(dump_sequence(111), now + Duration::from_millis(2));
+    assert_eq!(
+        observer.consume(
+            decode_notification(route_datagram(900, 900)),
+            now + Duration::from_millis(3),
+        ),
+        ObserverDriveOutcome::Idle
+    );
+    assert_eq!(
+        observer.consume(
+            decode(netlink_message(NLMSG_DONE, 111, &[])),
+            now + Duration::from_millis(4),
+        ),
+        ObserverDriveOutcome::RequestRouteDump
+    );
+
+    observer.begin_route_dump(dump_sequence(112), now + Duration::from_millis(5));
+    assert_eq!(
+        observer.consume(
+            decode(route_datagram(112, 10)),
+            now + Duration::from_millis(6),
+        ),
+        ObserverDriveOutcome::Idle
+    );
+    assert_eq!(
+        observer.consume(
+            decode_notification(rule_datagram(901, 900)),
+            now + Duration::from_millis(7),
+        ),
+        ObserverDriveOutcome::Idle
+    );
+    assert_eq!(
+        observer.consume(
+            decode(netlink_message(NLMSG_DONE, 112, &[])),
+            now + Duration::from_millis(8),
+        ),
+        ObserverDriveOutcome::RequestRuleDump
+    );
+
+    observer.begin_rule_dump(dump_sequence(113), now + Duration::from_millis(9));
+    assert_eq!(
+        observer.consume(
+            decode(rule_datagram(113, 20)),
+            now + Duration::from_millis(10),
+        ),
+        ObserverDriveOutcome::Idle
+    );
+    assert_eq!(
+        observer.consume(
+            decode(netlink_message(NLMSG_DONE, 113, &[])),
+            now + Duration::from_millis(11),
+        ),
+        ObserverDriveOutcome::Published(NetworkEpoch::INITIAL)
+    );
+
+    let snapshot = source.snapshot().expect("authoritative routing dumps");
+    assert_eq!(snapshot.routes().len(), 1);
+    assert_eq!(snapshot.routes()[0].priority(), 10);
+    assert_eq!(snapshot.rules().len(), 1);
+    assert_eq!(snapshot.rules()[0].priority().get(), 20);
+}
+
+#[test]
+fn notifications_during_active_route_and_rule_dumps_are_drained() {
+    let now = Instant::now();
+    let mut route_observer = observer();
+    begin_empty_route_dump(&mut route_observer, 120, now);
+    assert_eq!(
+        route_observer.consume(
+            decode_notification(route_datagram(902, 77)),
+            now + Duration::from_millis(5),
+        ),
+        ObserverDriveOutcome::DrainDump(ObserverFault::RouteNotificationAfterDumpStarted)
+    );
+    assert_eq!(
+        route_observer.consume(
+            decode(netlink_message(NLMSG_DONE, 122, &[])),
+            now + Duration::from_millis(6),
+        ),
+        ObserverDriveOutcome::RequestDump(ObserverFault::RouteNotificationAfterDumpStarted)
+    );
+
+    let mut rule_observer = observer();
+    begin_empty_rule_dump(&mut rule_observer, 130, now);
+    assert_eq!(
+        rule_observer.consume(
+            decode_notification(rule_datagram(903, 88)),
+            now + Duration::from_millis(7),
+        ),
+        ObserverDriveOutcome::DrainDump(ObserverFault::RuleNotificationAfterDumpStarted)
+    );
+    assert_eq!(
+        rule_observer.consume(
+            decode(netlink_message(NLMSG_DONE, 133, &[])),
+            now + Duration::from_millis(8),
+        ),
+        ObserverDriveOutcome::RequestDump(ObserverFault::RuleNotificationAfterDumpStarted)
+    );
 }
 
 #[test]
@@ -464,9 +748,16 @@ fn conflicting_duplicate_dump_facts_require_a_fresh_dump() {
 
     assert!(matches!(
         outcome,
-        ObserverDriveOutcome::RequestDump(ObserverFault::ConflictingDumpFact { .. })
+        ObserverDriveOutcome::DrainDump(ObserverFault::ConflictingDumpFact { .. })
     ));
     assert!(source.snapshot().is_none());
+    assert!(matches!(
+        observer.consume(
+            decode(netlink_message(NLMSG_DONE, 43, &[])),
+            now + Duration::from_millis(3),
+        ),
+        ObserverDriveOutcome::RequestDump(ObserverFault::ConflictingDumpFact { .. })
+    ));
     assert_eq!(observer.next_deadline(), None);
 }
 
@@ -501,7 +792,7 @@ fn loss_before_next_epoch_discards_pending_events_and_requires_resync() {
     );
 
     assert_eq!(
-        observer.note_loss(ObserverLoss::Enobufs),
+        observer.note_loss(ObserverLoss::Enobufs, &[], now + Duration::from_millis(11),),
         ObserverDriveOutcome::RequestDump(ObserverFault::ReceiveLoss(ObserverLoss::Enobufs))
     );
     assert!(source.snapshot().is_none());
@@ -600,9 +891,16 @@ fn empty_datagram_requests_resync_without_panicking() {
             decode_notification(Vec::new()),
             now + Duration::from_millis(10),
         ),
-        ObserverDriveOutcome::RequestDump(ObserverFault::MissingSequence)
+        ObserverDriveOutcome::DrainDump(ObserverFault::MissingSequence)
     );
     assert!(multicast.source().snapshot().is_none());
+    assert_eq!(
+        multicast.consume(
+            decode(netlink_message(NLMSG_DONE, 78, &[])),
+            now + Duration::from_millis(11),
+        ),
+        ObserverDriveOutcome::RequestDump(ObserverFault::MissingSequence)
+    );
 }
 
 #[test]
@@ -900,7 +1198,7 @@ fn truncation_and_timeout_invalidate_state_until_a_fresh_dump() {
         ObserverDriveOutcome::Idle
     );
     assert_eq!(
-        truncated.note_truncation(),
+        truncated.note_truncation(now + Duration::from_millis(11)),
         ObserverDriveOutcome::RequestDump(ObserverFault::ReceiveLoss(ObserverLoss::Truncated))
     );
     assert!(truncated_source.snapshot().is_none());
@@ -913,10 +1211,17 @@ fn truncation_and_timeout_invalidate_state_until_a_fresh_dump() {
     assert_eq!(timed_out.next_deadline(), Some(deadline));
     assert_eq!(
         timed_out.poll(deadline),
-        ObserverDriveOutcome::RequestDump(ObserverFault::DumpTimeout)
+        ObserverDriveOutcome::DrainDump(ObserverFault::DumpTimeout)
     );
     assert!(timed_out_source.snapshot().is_none());
-    assert_eq!(timed_out.poll(deadline), ObserverDriveOutcome::Idle);
+    assert_eq!(
+        timed_out.consume(
+            decode(netlink_message(NLMSG_DONE, 52, &[])),
+            deadline + Duration::from_millis(1),
+        ),
+        ObserverDriveOutcome::RequestDump(ObserverFault::DumpTimeout)
+    );
+    assert_eq!(timed_out.next_deadline(), None);
 }
 
 #[test]
@@ -931,13 +1236,93 @@ fn foreign_sequence_invalidates_dump_before_completion() {
             decode(netlink_message(NLMSG_DONE, 54, &[])),
             now + Duration::from_millis(1),
         ),
-        ObserverDriveOutcome::RequestDump(ObserverFault::ForeignSequence {
+        ObserverDriveOutcome::DrainDump(ObserverFault::ForeignSequence {
             expected: Some(53),
             actual: Some(54),
         })
     );
     assert!(source.snapshot().is_none());
+    assert_eq!(
+        observer.consume(
+            decode(netlink_message(NLMSG_DONE, 53, &[])),
+            now + Duration::from_millis(2),
+        ),
+        ObserverDriveOutcome::RequestDump(ObserverFault::ForeignSequence {
+            expected: Some(53),
+            actual: Some(54),
+        })
+    );
     assert_eq!(observer.next_deadline(), None);
+}
+
+#[test]
+fn raw_terminal_hints_end_faulted_transactions_when_semantic_decoding_fails() {
+    let now = Instant::now();
+
+    for (sequence, terminal) in [
+        (80, netlink_message(NLMSG_ERROR, 80, &[])),
+        (81, netlink_message(NLMSG_DONE, 81, &[0xff])),
+    ] {
+        let mut observer = observer();
+        observer.begin_link_dump(dump_sequence(sequence), now);
+        assert!(matches!(
+            observer.consume(decode(terminal), now + Duration::from_millis(1)),
+            ObserverDriveOutcome::RequestDump(ObserverFault::Decode(_))
+        ));
+        assert_eq!(observer.next_deadline(), None);
+    }
+
+    let mut draining = observer();
+    draining.begin_link_dump(dump_sequence(82), now);
+    assert!(matches!(
+        draining.consume(
+            decode(netlink_message(NLMSG_DONE, 99, &[])),
+            now + Duration::from_millis(1),
+        ),
+        ObserverDriveOutcome::DrainDump(ObserverFault::ForeignSequence { .. })
+    ));
+    assert!(matches!(
+        draining.consume(
+            decode(netlink_message(NLMSG_ERROR, 82, &[])),
+            now + Duration::from_millis(2),
+        ),
+        ObserverDriveOutcome::RequestDump(ObserverFault::ForeignSequence { .. })
+    ));
+
+    let mut notification = observer();
+    notification.begin_link_dump(dump_sequence(83), now);
+    assert!(matches!(
+        notification.consume(
+            decode_notification(netlink_message(NLMSG_DONE, 83, &[])),
+            now + Duration::from_millis(1),
+        ),
+        ObserverDriveOutcome::DrainDump(ObserverFault::Decode(_))
+    ));
+    assert!(matches!(
+        notification.consume(
+            decode(netlink_message(NLMSG_DONE, 83, &[])),
+            now + Duration::from_millis(2),
+        ),
+        ObserverDriveOutcome::RequestDump(ObserverFault::Decode(_))
+    ));
+
+    let mut wrong_class = observer();
+    wrong_class.begin_link_dump(dump_sequence(84), now);
+    let mut route_then_done = route_datagram(84, 10);
+    route_then_done.extend_from_slice(&netlink_message(NLMSG_DONE, 84, &[]));
+    assert!(matches!(
+        wrong_class.consume(decode(route_then_done), now + Duration::from_millis(1)),
+        ObserverDriveOutcome::RequestDump(ObserverFault::UnexpectedDumpFact { .. })
+    ));
+
+    let mut mixed_terminals = observer();
+    mixed_terminals.begin_link_dump(dump_sequence(85), now);
+    let mut foreign_then_owned = netlink_message(NLMSG_ERROR, 99, &[]);
+    foreign_then_owned.extend_from_slice(&netlink_message(NLMSG_ERROR, 85, &[]));
+    assert!(matches!(
+        mixed_terminals.consume(decode(foreign_then_owned), now + Duration::from_millis(1),),
+        ObserverDriveOutcome::RequestDump(ObserverFault::Decode(_))
+    ));
 }
 
 #[test]
@@ -959,9 +1344,16 @@ fn dump_race_queue_is_bounded() {
             decode(address_datagram(0, RTM_NEWADDR, 7, [192, 0, 2, 10], 24, 0,)),
             now + Duration::from_millis(2),
         ),
-        ObserverDriveOutcome::RequestDump(ObserverFault::RaceQueueOverflow { capacity: 1 })
+        ObserverDriveOutcome::DrainDump(ObserverFault::RaceQueueOverflow { capacity: 1 })
     );
     assert!(source.snapshot().is_none());
+    assert_eq!(
+        observer.consume(
+            decode(netlink_message(NLMSG_DONE, 55, &[])),
+            now + Duration::from_millis(3),
+        ),
+        ObserverDriveOutcome::RequestDump(ObserverFault::RaceQueueOverflow { capacity: 1 })
+    );
     assert_eq!(observer.next_deadline(), None);
 }
 
@@ -994,7 +1386,7 @@ fn late_done_cannot_publish_after_dump_timeout() {
 fn loss_cause_and_dump_send_failure_are_preserved_for_the_driver() {
     let mut observer = observer();
     assert_eq!(
-        observer.note_loss(ObserverLoss::UnexpectedSender),
+        observer.note_loss(ObserverLoss::UnexpectedSender, &[], Instant::now()),
         ObserverDriveOutcome::RequestDump(ObserverFault::ReceiveLoss(
             ObserverLoss::UnexpectedSender
         ))
@@ -1003,7 +1395,14 @@ fn loss_cause_and_dump_send_failure_are_preserved_for_the_driver() {
     let now = Instant::now();
     observer.begin_dump(dump_sequence(57), now);
     assert_eq!(
-        observer.note_dump_request_failure(),
+        observer.note_dump_request_failure(now + Duration::from_millis(1)),
+        ObserverDriveOutcome::DrainDump(ObserverFault::DumpRequestFailed)
+    );
+    assert_eq!(
+        observer.consume(
+            decode(netlink_message(NLMSG_DONE, 57, &[])),
+            now + Duration::from_millis(2),
+        ),
         ObserverDriveOutcome::RequestDump(ObserverFault::DumpRequestFailed)
     );
     assert_eq!(observer.next_deadline(), None);
@@ -1031,6 +1430,122 @@ fn observer_with_limits(
         )
         .expect("valid observer config"),
     )
+}
+
+fn begin_empty_route_dump(
+    observer: &mut NetworkInventoryObserver,
+    first_sequence: u32,
+    now: Instant,
+) {
+    observer.begin_link_dump(dump_sequence(first_sequence), now);
+    assert_eq!(
+        observer.consume(
+            decode(netlink_message(NLMSG_DONE, first_sequence, &[])),
+            now + Duration::from_millis(1),
+        ),
+        ObserverDriveOutcome::RequestAddressDump
+    );
+    observer.begin_address_dump(
+        dump_sequence(first_sequence + 1),
+        now + Duration::from_millis(2),
+    );
+    assert_eq!(
+        observer.consume(
+            decode(netlink_message(NLMSG_DONE, first_sequence + 1, &[])),
+            now + Duration::from_millis(3),
+        ),
+        ObserverDriveOutcome::RequestRouteDump
+    );
+    observer.begin_route_dump(
+        dump_sequence(first_sequence + 2),
+        now + Duration::from_millis(4),
+    );
+}
+
+fn begin_empty_rule_dump(
+    observer: &mut NetworkInventoryObserver,
+    first_sequence: u32,
+    now: Instant,
+) {
+    begin_empty_route_dump(observer, first_sequence, now);
+    assert_eq!(
+        observer.consume(
+            decode(netlink_message(NLMSG_DONE, first_sequence + 2, &[])),
+            now + Duration::from_millis(5),
+        ),
+        ObserverDriveOutcome::RequestRuleDump
+    );
+    observer.begin_rule_dump(
+        dump_sequence(first_sequence + 3),
+        now + Duration::from_millis(6),
+    );
+}
+
+fn complete_single_routed_dump(
+    observer: &mut NetworkInventoryObserver,
+    first_sequence: u32,
+    now: Instant,
+) {
+    observer.begin_link_dump(dump_sequence(first_sequence), now);
+    assert_eq!(
+        observer.consume_batch(
+            [
+                decode(link_datagram(first_sequence, 7, b"wlan0", 0x1, Some(1_500),)),
+                decode(netlink_message(NLMSG_DONE, first_sequence, &[])),
+            ],
+            now + Duration::from_millis(1),
+        ),
+        ObserverDriveOutcome::RequestAddressDump
+    );
+    observer.begin_address_dump(
+        dump_sequence(first_sequence + 1),
+        now + Duration::from_millis(2),
+    );
+    assert_eq!(
+        observer.consume_batch(
+            [
+                decode(address_datagram(
+                    first_sequence + 1,
+                    RTM_NEWADDR,
+                    7,
+                    [192, 0, 2, 9],
+                    24,
+                    0,
+                )),
+                decode(netlink_message(NLMSG_DONE, first_sequence + 1, &[])),
+            ],
+            now + Duration::from_millis(3),
+        ),
+        ObserverDriveOutcome::RequestRouteDump
+    );
+    observer.begin_route_dump(
+        dump_sequence(first_sequence + 2),
+        now + Duration::from_millis(4),
+    );
+    assert_eq!(
+        observer.consume_batch(
+            [
+                decode(route_datagram(first_sequence + 2, 200)),
+                decode(netlink_message(NLMSG_DONE, first_sequence + 2, &[])),
+            ],
+            now + Duration::from_millis(5),
+        ),
+        ObserverDriveOutcome::RequestRuleDump
+    );
+    observer.begin_rule_dump(
+        dump_sequence(first_sequence + 3),
+        now + Duration::from_millis(6),
+    );
+    assert!(matches!(
+        observer.consume_batch(
+            [
+                decode(rule_datagram(first_sequence + 3, 100)),
+                decode(netlink_message(NLMSG_DONE, first_sequence + 3, &[])),
+            ],
+            now + Duration::from_millis(7),
+        ),
+        ObserverDriveOutcome::Published(_)
+    ));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1067,12 +1582,12 @@ fn complete_single_address_dump(
     ));
 }
 
-fn decode(datagram: Vec<u8>) -> Result<InventoryDatagram, InventoryDecodeError> {
+fn decode(datagram: Vec<u8>) -> InventoryDatagramObservation {
     let origin = test_datagram_origin(&datagram);
     decode_with_policy_and_origin(datagram, AddressEventPolicy::new(true), origin)
 }
 
-fn decode_notification(datagram: Vec<u8>) -> Result<InventoryDatagram, InventoryDecodeError> {
+fn decode_notification(datagram: Vec<u8>) -> InventoryDatagramObservation {
     decode_with_policy_and_origin(
         datagram,
         AddressEventPolicy::new(true),
@@ -1087,7 +1602,7 @@ fn dump_sequence(value: u32) -> NonZeroU32 {
 fn decode_with_ignored_flags(
     datagram: Vec<u8>,
     ignored_flags: InterfaceAddressFlags,
-) -> Result<InventoryDatagram, InventoryDecodeError> {
+) -> InventoryDatagramObservation {
     let origin = test_datagram_origin(&datagram);
     decode_with_policy_and_origin(
         datagram,
@@ -1100,12 +1615,15 @@ fn decode_with_policy_and_origin(
     datagram: Vec<u8>,
     policy: AddressEventPolicy,
     origin: InventoryDatagramOrigin,
-) -> Result<InventoryDatagram, InventoryDecodeError> {
-    InventoryDatagram::from_decoded(
+) -> InventoryDatagramObservation {
+    InventoryDatagramObservation::from_decoded(
         RtnetlinkLinkEventDecoder::new().decode_datagram(&datagram),
         RtnetlinkAddressEventDecoder::new(policy).decode_datagram(&datagram),
+        RtnetlinkRouteEventDecoder::new(true).decode_datagram(&datagram),
+        RtnetlinkRuleEventDecoder::new(true).decode_datagram(&datagram),
         origin,
         datagram.len(),
+        terminal_sequences(&datagram),
     )
 }
 
@@ -1168,6 +1686,31 @@ fn link_removal_datagram(sequence: u32, interface_index: u32) -> Vec<u8> {
     payload.extend(0_u32.to_ne_bytes());
     payload.extend(u32::MAX.to_ne_bytes());
     netlink_message(RTM_DELLINK, sequence, &payload)
+}
+
+fn route_datagram(sequence: u32, priority: u32) -> Vec<u8> {
+    let mut payload = vec![AF_INET, 0, 0, 0, RT_TABLE_MAIN, 2, 0, RTN_UNICAST];
+    payload.extend_from_slice(&0_u32.to_ne_bytes());
+    append_attribute(&mut payload, RTA_PRIORITY, &priority.to_ne_bytes());
+    netlink_message(RTM_NEWROUTE, sequence, &payload)
+}
+
+fn rule_datagram(sequence: u32, priority: u32) -> Vec<u8> {
+    let mut payload = vec![AF_INET, 0, 0, 0, RT_TABLE_MAIN, 0, 0, FR_ACT_TO_TBL];
+    payload.extend_from_slice(&0_u32.to_ne_bytes());
+    append_attribute(&mut payload, FRA_PRIORITY, &priority.to_ne_bytes());
+    append_attribute(
+        &mut payload,
+        FRA_TABLE,
+        &u32::from(RT_TABLE_MAIN).to_ne_bytes(),
+    );
+    append_attribute(
+        &mut payload,
+        FRA_SUPPRESS_PREFIXLEN,
+        &u32::MAX.to_ne_bytes(),
+    );
+    append_attribute(&mut payload, FRA_PROTOCOL, &[0]);
+    netlink_message(RTM_NEWRULE, sequence, &payload)
 }
 
 fn address_datagram(

@@ -16,11 +16,11 @@ pub(crate) const NLA_TYPE_MASK: u16 = !(NLA_F_NESTED | NLA_F_NET_BYTEORDER);
 #[allow(dead_code)]
 pub(crate) mod link;
 
-// Raw route framing stays private to the platform Adapter pending combined-observer integration.
+// Raw route framing stays private behind the combined inventory observer.
 #[allow(dead_code)]
 pub(crate) mod route;
 
-// Raw rule framing stays private to the platform Adapter pending combined-observer integration.
+// Raw rule framing stays private behind the combined inventory observer.
 #[allow(dead_code)]
 pub(crate) mod rule;
 
@@ -319,6 +319,19 @@ pub(crate) fn validate_done_payload(
         })?;
     }
     Ok(())
+}
+
+pub(crate) fn terminal_sequences(datagram: &[u8]) -> Box<[u32]> {
+    let mut sequences = Vec::new();
+    for message in NetlinkMessageIter::new(datagram) {
+        let Ok(message) = message else {
+            break;
+        };
+        if matches!(message.header().message_type(), NLMSG_DONE | NLMSG_ERROR) {
+            sequences.push(message.header().sequence());
+        }
+    }
+    sequences.into_boxed_slice()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

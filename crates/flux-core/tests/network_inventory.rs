@@ -4,7 +4,10 @@ use flux_core::{
     INTERFACE_LINK_KIND_MAX_BYTES, INTERFACE_NAME_MAX_BYTES, InterfaceAddressFlags,
     InterfaceAddressRecord, InterfaceAddressRecordErrorKind, InterfaceHardwareType, InterfaceIndex,
     InterfaceLinkFlags, InterfaceLinkKind, InterfaceLinkRecord, InterfaceName,
-    InterfaceOperationalState, NetworkEpoch, NetworkInventoryError, NetworkInventoryTracker,
+    InterfaceOperationalState, NetworkAddressFamily, NetworkEpoch, NetworkInventoryError,
+    NetworkInventoryTracker, NetworkRouteRecord, NetworkRuleRecord, RouteFlags, RoutePath,
+    RoutePrefix, RouteProperties, RouteProtocol, RouteScope, RouteTableId, RouteType, RuleAction,
+    RuleFlags, RulePrefix, RulePriority, RuleProperties, RuleProtocol, RuleTableId,
 };
 
 #[test]
@@ -165,6 +168,81 @@ fn complete_publications_are_order_independent_and_deduplicate_exact_records() {
         .publish_complete([first_link, second_link], [first])
         .expect("address-only candidate");
     assert!(left.materially_differs_from(address_changed));
+}
+
+#[test]
+fn routing_publications_preserve_order_multiplicity_and_epoch_semantics() {
+    let link = link_record(7, b"eth0");
+    let address = address_record(7, IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)), 24, 0);
+    let first_route = route_record(100, 10);
+    let second_route = route_record(200, 20);
+    let first_rule = rule_record(100, 1_000);
+    let second_rule = rule_record(200, 2_000);
+    let routes = [
+        second_route.clone(),
+        first_route.clone(),
+        second_route.clone(),
+    ];
+    let rules = [first_rule.clone(), second_rule.clone(), first_rule.clone()];
+    let mut tracker = NetworkInventoryTracker::new();
+
+    let initial = tracker
+        .publish_complete_with_routing([link.clone()], [address], routes.clone(), rules.clone())
+        .expect("complete routed inventory");
+    let initial_pointer = std::ptr::from_ref(initial);
+    let initial_epoch = initial.epoch();
+    assert_eq!(initial.routes(), &routes);
+    assert_eq!(initial.rules(), &rules);
+
+    let unchanged = tracker
+        .publish_complete_with_routing([link.clone()], [address], routes.clone(), rules.clone())
+        .expect("unchanged routed inventory");
+    assert_eq!(std::ptr::from_ref(unchanged), initial_pointer);
+    assert_eq!(unchanged.epoch(), initial_epoch);
+
+    let reordered = tracker
+        .publish_complete_with_routing(
+            [link],
+            [address],
+            [first_route, second_route.clone(), second_route],
+            rules,
+        )
+        .expect("order-only route change");
+    assert_eq!(reordered.epoch(), initial_epoch.checked_next().unwrap());
+
+    let mut legacy = NetworkInventoryTracker::new();
+    let legacy = legacy
+        .publish_complete([], [])
+        .expect("legacy complete publication");
+    assert!(legacy.routes().is_empty());
+    assert!(legacy.rules().is_empty());
+}
+
+#[test]
+fn rejected_set_facts_leave_the_prior_ordered_routing_snapshot_intact() {
+    let link = link_record(7, b"eth0");
+    let address = address_record(7, IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)), 24, 0);
+    let route = route_record(100, 10);
+    let rule = rule_record(100, 1_000);
+    let mut tracker = NetworkInventoryTracker::new();
+    let epoch = tracker
+        .publish_complete_with_routing([link.clone()], [address], [route.clone()], [rule.clone()])
+        .expect("initial routed inventory")
+        .epoch();
+
+    tracker
+        .publish_complete_with_routing(
+            [link, link_record(7, b"wlan0")],
+            [address],
+            [route_record(200, 20)],
+            [rule_record(200, 2_000)],
+        )
+        .expect_err("conflicting link facts reject the whole candidate");
+
+    let retained = tracker.current().expect("prior inventory remains current");
+    assert_eq!(retained.epoch(), epoch);
+    assert_eq!(retained.routes(), &[route]);
+    assert_eq!(retained.rules(), &[rule]);
 }
 
 #[test]
@@ -371,4 +449,39 @@ fn link_record(interface_index: u32, name: &[u8]) -> InterfaceLinkRecord {
         InterfaceHardwareType::from_raw(1),
         InterfaceLinkFlags::default(),
     )
+}
+
+fn route_record(table: u32, priority: u32) -> NetworkRouteRecord {
+    NetworkRouteRecord::new(
+        RoutePrefix::unspecified(NetworkAddressFamily::Ipv4),
+        RoutePrefix::unspecified(NetworkAddressFamily::Ipv4),
+        RouteProperties::new(
+            0,
+            RouteTableId::from_raw(table),
+            RouteProtocol::from_raw(2),
+            RouteScope::from_raw(0),
+            RouteType::from_raw(1),
+            RouteFlags::default(),
+        ),
+        priority,
+        RoutePath::None,
+    )
+    .expect("valid route record")
+}
+
+fn rule_record(table: u32, priority: u32) -> NetworkRuleRecord {
+    NetworkRuleRecord::new(
+        RulePrefix::unspecified(NetworkAddressFamily::Ipv4),
+        RulePrefix::unspecified(NetworkAddressFamily::Ipv4),
+        RuleProperties::new(
+            0,
+            RuleTableId::from_raw(table),
+            RuleAction::TO_TABLE,
+            RuleProtocol::from_raw(2),
+            RuleFlags::default(),
+        ),
+        RulePriority::from_raw(priority),
+        None,
+    )
+    .expect("valid rule record")
 }

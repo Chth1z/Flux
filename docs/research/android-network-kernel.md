@@ -188,6 +188,10 @@ The netd rule builder is otherwise strict: it creates paired IPv4/IPv6 rules wit
 
 Two structural consequences affect the current Flux routing program. First, Android 12 leaves no priority after the maximum UID-default-unreachable subpriority and before default-network; Android 13+ leaves only `30999`, while Flux currently requires two distinct priorities. Second, one global proxy rule cannot both run after per-UID local-output policy near `29000`/`31000` and before tethering at `21000`. Empty observed slots are not leases: equal-priority insertions are ordered after existing equal-priority rules, and netd may add a later security rule without colliding at creation time. [S42]
 
+The first safe model consequence is to split domains instead of moving one global rule. Residual local OUTPUT is anchored to an exact observed default-network rule and its `iif lo` plus fwmark selector; a tether domain is anchored to an exact priority-`21000` tethering rule and the same present, administratively-up ingress interface. This yields no local slot on Android 12, only `30999` on Android 13+, and `20001..20999` for one exact tether ingress. A table number alone is not a stable network identity, and capture before either anchor still needs explicit per-connection domain identity plus Android network-selection handoff. Multiple overlapping anchors that name different tables are therefore ambiguous rather than evidence for a choice.
+
+Address-derived local hosts can be selected independently of an RPDB realization. Compiling those hosts into a pre-mark Capture Policy bypass would reduce the local structural requirement from two priorities to one, but it is safe only after the selected backend proves that address bypass precedes connmark restoration, every mark write, and proxy action during atomic address churn. Private-table `throw` host routes remain a possible probed fallback, not an assumed design property.
+
 Design requirements:
 
 - Default to `respect_android_vpn = true`. A transparent proxy must not accidentally turn lockdown into bypass.

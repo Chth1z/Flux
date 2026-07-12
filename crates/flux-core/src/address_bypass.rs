@@ -260,22 +260,22 @@ impl fmt::Display for AddressBypassPrefixError {
 impl Error for AddressBypassPrefixError {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AddressBypassPolicy {
-    routing: AddressBypassRoutingSpec,
+pub struct AddressHostSetPolicy {
+    families: AddressHostFamilySelection,
     rule_budget: AddressBypassRuleBudget,
     ignored_flags: InterfaceAddressFlags,
     ignored_addresses: BTreeSet<IpAddr>,
     ignored_prefixes: BTreeSet<AddressBypassPrefix>,
 }
 
-impl AddressBypassPolicy {
+impl AddressHostSetPolicy {
     #[must_use]
     pub const fn new(
-        routing: AddressBypassRoutingSpec,
+        families: AddressHostFamilySelection,
         rule_budget: AddressBypassRuleBudget,
     ) -> Self {
         Self {
-            routing,
+            families,
             rule_budget,
             ignored_flags: InterfaceAddressFlags::from_bits(0),
             ignored_addresses: BTreeSet::new(),
@@ -308,8 +308,8 @@ impl AddressBypassPolicy {
     }
 
     #[must_use]
-    pub const fn routing(&self) -> AddressBypassRoutingSpec {
-        self.routing
+    pub const fn families(&self) -> AddressHostFamilySelection {
+        self.families
     }
 
     #[must_use]
@@ -323,7 +323,7 @@ impl AddressBypassPolicy {
     ) -> Result<Option<IpAddr>, AddressBypassInventoryAddressErrorKind> {
         let address = normalize_inventory_address(record)?;
         if !is_global_usable(address)
-            || self.routing.priority_for(address_family(address)).is_none()
+            || !self.families.includes(address_family(address))
             || record.flags().intersects(self.ignored_flags)
             || self.ignored_addresses.contains(&address)
             || self
@@ -335,6 +335,221 @@ impl AddressBypassPolicy {
         } else {
             Ok(Some(address))
         }
+    }
+}
+
+/// Nonempty address-family selection for one address-derived host set.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum AddressHostFamilySelection {
+    Ipv4,
+    Ipv6,
+    DualStack,
+}
+
+impl AddressHostFamilySelection {
+    const fn from_routing(routing: AddressBypassRoutingSpec) -> Self {
+        match (
+            routing.ipv4_priority().is_some(),
+            routing.ipv6_priority().is_some(),
+        ) {
+            (true, false) => Self::Ipv4,
+            (false, true) => Self::Ipv6,
+            (true, true) => Self::DualStack,
+            (false, false) => unreachable!(),
+        }
+    }
+
+    #[must_use]
+    pub const fn includes(self, family: NetworkAddressFamily) -> bool {
+        matches!(
+            (self, family),
+            (Self::Ipv4 | Self::DualStack, NetworkAddressFamily::Ipv4)
+                | (Self::Ipv6 | Self::DualStack, NetworkAddressFamily::Ipv6)
+        )
+    }
+}
+
+/// Deterministic selected local-interface host addresses for one complete inventory snapshot.
+///
+/// This is realization-neutral evidence. A later Capture Program may consume it as a pre-mark
+/// bypass set, while the compatibility planner below projects the same hosts into RPDB rules. The
+/// plan proves neither backend ordering nor kernel mutation ownership.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AddressHostSetPlan {
+    snapshot_id: NetworkInventorySnapshotId,
+    epoch: NetworkEpoch,
+    families: AddressHostFamilySelection,
+    hosts: Box<[IpAddr]>,
+}
+
+impl AddressHostSetPlan {
+    #[must_use]
+    pub const fn snapshot_id(&self) -> NetworkInventorySnapshotId {
+        self.snapshot_id
+    }
+
+    #[must_use]
+    pub const fn epoch(&self) -> NetworkEpoch {
+        self.epoch
+    }
+
+    #[must_use]
+    pub const fn families(&self) -> AddressHostFamilySelection {
+        self.families
+    }
+
+    #[must_use]
+    pub fn hosts(&self) -> &[IpAddr] {
+        &self.hosts
+    }
+
+    pub fn ensure_current(
+        &self,
+        inventory: &NetworkInventory,
+    ) -> Result<(), StaleAddressHostSetPlan> {
+        if inventory.snapshot_id() == self.snapshot_id {
+            Ok(())
+        } else {
+            Err(StaleAddressHostSetPlan {
+                planned_snapshot_id: self.snapshot_id,
+                current_snapshot_id: inventory.snapshot_id(),
+                planned_epoch: self.epoch,
+                current_epoch: inventory.epoch(),
+            })
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AddressHostSetPlanError {
+    HostBudgetExceeded {
+        budget: AddressBypassRuleBudget,
+        required_at_least: u32,
+    },
+    InvalidInventoryAddress {
+        record: InterfaceAddressRecord,
+        reason: AddressBypassInventoryAddressErrorKind,
+    },
+}
+
+impl fmt::Display for AddressHostSetPlanError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::HostBudgetExceeded {
+                budget,
+                required_at_least,
+            } => write!(
+                formatter,
+                "address host set requires at least {required_at_least} hosts but its budget is {}",
+                budget.get()
+            ),
+            Self::InvalidInventoryAddress { record, reason } => write!(
+                formatter,
+                "interface address {}/{} on index {} is invalid for address host-set planning: {reason:?}",
+                record.address(),
+                record.prefix_length(),
+                record.interface_index().get()
+            ),
+        }
+    }
+}
+
+impl Error for AddressHostSetPlanError {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StaleAddressHostSetPlan {
+    planned_snapshot_id: NetworkInventorySnapshotId,
+    current_snapshot_id: NetworkInventorySnapshotId,
+    planned_epoch: NetworkEpoch,
+    current_epoch: NetworkEpoch,
+}
+
+impl StaleAddressHostSetPlan {
+    #[must_use]
+    pub const fn planned_snapshot_id(self) -> NetworkInventorySnapshotId {
+        self.planned_snapshot_id
+    }
+
+    #[must_use]
+    pub const fn current_snapshot_id(self) -> NetworkInventorySnapshotId {
+        self.current_snapshot_id
+    }
+
+    #[must_use]
+    pub const fn planned_epoch(self) -> NetworkEpoch {
+        self.planned_epoch
+    }
+
+    #[must_use]
+    pub const fn current_epoch(self) -> NetworkEpoch {
+        self.current_epoch
+    }
+}
+
+impl fmt::Display for StaleAddressHostSetPlan {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "address host-set plan snapshot {} at epoch {} is stale relative to snapshot {} at epoch {}",
+            self.planned_snapshot_id.get(),
+            self.planned_epoch.get(),
+            self.current_snapshot_id.get(),
+            self.current_epoch.get()
+        )
+    }
+}
+
+impl Error for StaleAddressHostSetPlan {}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AddressBypassPolicy {
+    routing: AddressBypassRoutingSpec,
+    host_set: AddressHostSetPolicy,
+}
+
+impl AddressBypassPolicy {
+    #[must_use]
+    pub const fn new(
+        routing: AddressBypassRoutingSpec,
+        rule_budget: AddressBypassRuleBudget,
+    ) -> Self {
+        Self {
+            routing,
+            host_set: AddressHostSetPolicy::new(
+                AddressHostFamilySelection::from_routing(routing),
+                rule_budget,
+            ),
+        }
+    }
+
+    #[must_use]
+    pub fn with_ignored_flags(mut self, flags: InterfaceAddressFlags) -> Self {
+        self.host_set = self.host_set.with_ignored_flags(flags);
+        self
+    }
+
+    #[must_use]
+    pub fn with_ignored_addresses(mut self, addresses: impl IntoIterator<Item = IpAddr>) -> Self {
+        self.host_set = self.host_set.with_ignored_addresses(addresses);
+        self
+    }
+
+    pub fn with_ignored_prefixes(
+        mut self,
+        prefixes: impl IntoIterator<Item = (IpAddr, u8)>,
+    ) -> Result<Self, AddressBypassPrefixError> {
+        self.host_set = self.host_set.with_ignored_prefixes(prefixes)?;
+        Ok(self)
+    }
+
+    #[must_use]
+    pub const fn routing(&self) -> AddressBypassRoutingSpec {
+        self.routing
+    }
+
+    #[must_use]
+    pub const fn rule_budget(&self) -> AddressBypassRuleBudget {
+        self.host_set.rule_budget()
     }
 }
 
@@ -585,23 +800,23 @@ impl fmt::Display for StaleAddressBypassPlan {
 
 impl Error for StaleAddressBypassPlan {}
 
-pub fn plan_address_bypass(
+pub fn plan_address_host_set(
     inventory: &NetworkInventory,
-    policy: &AddressBypassPolicy,
-) -> Result<AddressBypassPlan, AddressBypassPlanError> {
-    let mut addresses = BTreeSet::new();
+    policy: &AddressHostSetPolicy,
+) -> Result<AddressHostSetPlan, AddressHostSetPlanError> {
+    let mut hosts = BTreeSet::new();
     let budget = policy.rule_budget();
     for record in inventory.addresses() {
         let selected = policy.selected_address(*record).map_err(|reason| {
-            AddressBypassPlanError::InvalidInventoryAddress {
+            AddressHostSetPlanError::InvalidInventoryAddress {
                 record: *record,
                 reason,
             }
         })?;
         if let Some(address) = selected {
-            addresses.insert(address);
-            if addresses.len() > budget.get() as usize {
-                return Err(AddressBypassPlanError::RuleBudgetExceeded {
+            hosts.insert(address);
+            if hosts.len() > budget.get() as usize {
+                return Err(AddressHostSetPlanError::HostBudgetExceeded {
                     budget,
                     required_at_least: budget.get() + 1,
                 });
@@ -609,8 +824,36 @@ pub fn plan_address_bypass(
         }
     }
 
-    let intents = addresses
-        .into_iter()
+    Ok(AddressHostSetPlan {
+        snapshot_id: inventory.snapshot_id(),
+        epoch: inventory.epoch(),
+        families: policy.families(),
+        hosts: hosts.into_iter().collect::<Vec<_>>().into_boxed_slice(),
+    })
+}
+
+pub fn plan_address_bypass(
+    inventory: &NetworkInventory,
+    policy: &AddressBypassPolicy,
+) -> Result<AddressBypassPlan, AddressBypassPlanError> {
+    let host_set =
+        plan_address_host_set(inventory, &policy.host_set).map_err(|error| match error {
+            AddressHostSetPlanError::HostBudgetExceeded {
+                budget,
+                required_at_least,
+            } => AddressBypassPlanError::RuleBudgetExceeded {
+                budget,
+                required_at_least,
+            },
+            AddressHostSetPlanError::InvalidInventoryAddress { record, reason } => {
+                AddressBypassPlanError::InvalidInventoryAddress { record, reason }
+            }
+        })?;
+
+    let intents = host_set
+        .hosts()
+        .iter()
+        .copied()
         .map(|address| AddressBypassRuleIntent::new(address, policy.routing()))
         .collect::<Vec<_>>();
     let mut expected = BTreeMap::new();

@@ -4,15 +4,94 @@ use flux_core::{
     AddressBypassInventoryAddressErrorKind, AddressBypassPlanError, AddressBypassPolicy,
     AddressBypassPrefix, AddressBypassPrefixErrorKind, AddressBypassRoutingSpec,
     AddressBypassRoutingSpecErrorKind, AddressBypassRuleBudget, AddressBypassRuleConflictKind,
+    AddressHostFamilySelection, AddressHostSetPlanError, AddressHostSetPolicy,
     InterfaceAddressFlags, InterfaceAddressRecord, InterfaceIndex, MAX_ADDRESS_BYPASS_CONFLICTS,
     MAX_ADDRESS_BYPASS_RULES, NetworkAddressFamily, NetworkInventory, NetworkInventoryTracker,
     NetworkRuleRecord, OpaqueRuleAttribute, RuleAction, RuleAttributeOpacity, RuleFlags,
     RuleFwMark, RuleOpaqueAttributeFingerprint, RulePrefix, RulePriority, RuleProperties,
-    RuleProtocol, RuleTableId, plan_address_bypass,
+    RuleProtocol, RuleTableId, plan_address_bypass, plan_address_host_set,
 };
 
 const SYNTHETIC_IPV4_PRIORITY: u32 = 40_001;
 const SYNTHETIC_IPV6_PRIORITY: u32 = 40_002;
+
+#[test]
+fn neutral_host_set_preserves_filtering_ordering_and_snapshot_identity() {
+    let policy = AddressHostSetPolicy::new(
+        AddressHostFamilySelection::DualStack,
+        AddressBypassRuleBudget::new(8).expect("host budget"),
+    )
+    .with_ignored_addresses([IpAddr::V6("::ffff:192.0.2.9".parse().unwrap())])
+    .with_ignored_prefixes([(IpAddr::V6("::ffff:198.51.100.0".parse().unwrap()), 120)])
+    .expect("mapped ignored prefix");
+    let source = inventory(
+        [
+            address(5, IpAddr::V6("2001:db8::2".parse().unwrap()), 64, 0),
+            address(4, IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)), 24, 0),
+            address(3, IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9)), 24, 0),
+            address(2, IpAddr::V4(Ipv4Addr::new(192, 0, 2, 9)), 24, 0),
+            address(1, IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)), 32, 0),
+        ],
+        [],
+    );
+
+    let plan = plan_address_host_set(&source, &policy).expect("neutral address host set");
+    assert_eq!(plan.snapshot_id(), source.snapshot_id());
+    assert_eq!(plan.epoch(), source.epoch());
+    assert_eq!(plan.families(), AddressHostFamilySelection::DualStack);
+    assert_eq!(
+        plan.hosts(),
+        [
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)),
+            IpAddr::V6("2001:db8::2".parse().unwrap()),
+        ]
+    );
+    plan.ensure_current(&source).expect("same snapshot");
+
+    let unrelated = inventory(
+        [address(9, IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)), 24, 0)],
+        [],
+    );
+    let stale = plan
+        .ensure_current(&unrelated)
+        .expect_err("equal epoch from another tracker is stale");
+    assert_eq!(stale.planned_snapshot_id(), source.snapshot_id());
+    assert_eq!(stale.current_snapshot_id(), unrelated.snapshot_id());
+}
+
+#[test]
+fn neutral_host_set_applies_family_and_budget_bounds_without_rpdb_inputs() {
+    let source = inventory(
+        [
+            address(1, IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 24, 0),
+            address(2, IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2)), 24, 0),
+            address(3, IpAddr::V6("2001:db8::1".parse().unwrap()), 64, 0),
+        ],
+        [],
+    );
+    let ipv6 = AddressHostSetPolicy::new(
+        AddressHostFamilySelection::Ipv6,
+        AddressBypassRuleBudget::new(1).expect("one host"),
+    );
+    assert_eq!(
+        plan_address_host_set(&source, &ipv6)
+            .expect("IPv4 hosts are outside the selected family")
+            .hosts(),
+        [IpAddr::V6("2001:db8::1".parse().unwrap())]
+    );
+
+    let ipv4 = AddressHostSetPolicy::new(
+        AddressHostFamilySelection::Ipv4,
+        AddressBypassRuleBudget::new(1).expect("one host"),
+    );
+    assert!(matches!(
+        plan_address_host_set(&source, &ipv4),
+        Err(AddressHostSetPlanError::HostBudgetExceeded {
+            budget,
+            required_at_least: 2,
+        }) if budget.get() == 1
+    ));
+}
 
 #[test]
 fn planner_derives_deterministic_host_rules_and_deduplicates_addresses() {

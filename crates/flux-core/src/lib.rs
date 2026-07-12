@@ -8,6 +8,7 @@
 
 mod address_bypass;
 mod android_rpdb;
+mod android_tproxy_topology;
 mod capability;
 mod config;
 mod control;
@@ -22,14 +23,24 @@ pub use address_bypass::{
     AddressBypassPolicy, AddressBypassPrefix, AddressBypassPrefixError,
     AddressBypassPrefixErrorKind, AddressBypassRoutingSpec, AddressBypassRoutingSpecError,
     AddressBypassRoutingSpecErrorKind, AddressBypassRuleBudget, AddressBypassRuleConflict,
-    AddressBypassRuleConflictKind, AddressBypassRuleIntent, MAX_ADDRESS_BYPASS_CONFLICTS,
-    MAX_ADDRESS_BYPASS_RULES, StaleAddressBypassPlan, plan_address_bypass,
+    AddressBypassRuleConflictKind, AddressBypassRuleIntent, AddressHostFamilySelection,
+    AddressHostSetPlan, AddressHostSetPlanError, AddressHostSetPolicy,
+    MAX_ADDRESS_BYPASS_CONFLICTS, MAX_ADDRESS_BYPASS_RULES, StaleAddressBypassPlan,
+    StaleAddressHostSetPlan, plan_address_bypass, plan_address_host_set,
 };
 pub use android_rpdb::{
     AndroidRpdbClassificationReport, AndroidRpdbPlacementPlanError, AndroidRpdbPolicyProfile,
     AndroidRpdbPriorityBand, AndroidRpdbPriorityContract, AndroidRpdbProfileIssue,
     AndroidRpdbRuleRole, AndroidRpdbUnknownReason, AndroidRpdbUnknownRule,
     MAX_ANDROID_RPDB_UNKNOWN_RULES, classify_android_rpdb, plan_android_rpdb_placement,
+};
+pub use android_tproxy_topology::{
+    AndroidTproxyDomainSelector, AndroidTproxyEvidenceCoverage, AndroidTproxyPriorityInterval,
+    AndroidTproxyRoutingShape, AndroidTproxyRuleDisposition, AndroidTproxySelectionAnchor,
+    AndroidTproxySelectorDisjointReason, AndroidTproxyStructuralFeasibility,
+    AndroidTproxyTopologyError, AndroidTproxyTopologyFeasibilityReport,
+    AndroidTproxyTrafficDomainKind, DeferredAndroidTproxyPrerequisite,
+    StaleAndroidTproxyTopologyReport, assess_android_tproxy_topology,
 };
 pub use capability::{
     BootIdentity, BootIdentityMutationStatus, CAPABILITY_PROFILE_SCHEMA_VERSION, CapabilityProfile,

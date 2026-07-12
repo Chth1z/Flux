@@ -192,6 +192,8 @@ The first safe model consequence is to split domains instead of moving one globa
 
 Address-derived local hosts can be selected independently of an RPDB realization. Compiling those hosts into a pre-mark Capture Policy bypass would reduce the local structural requirement from two priorities to one, but it is safe only after the selected backend proves that address bypass precedes connmark restoration, every mark write, and proxy action during atomic address churn. Private-table `throw` host routes remain a possible probed fallback, not an assumed design property.
 
+Requested domains must also be assessed as one atomic scope rather than as unrelated favorable examples. The current pure model binds one routing shape to a bounded set of residual-local address families and exact tether ingress interfaces, discovers every recognized matching anchor, and retains each anchor's own selector and priority interval. Missing or ambiguous anchors reject the scope; known incompatibility or slot exhaustion remains definite even when another anchor is incomplete. A scope containing only residual candidate windows is still not an allocation: no common priority is inferred across domains, and full freshness reassessment is required after any inventory or classifier change.
+
 Design requirements:
 
 - Default to `respect_android_vpn = true`. A transparent proxy must not accidentally turn lockdown into bypass.

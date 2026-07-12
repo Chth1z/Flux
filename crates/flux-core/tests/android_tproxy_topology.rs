@@ -1,12 +1,16 @@
 use flux_core::{
     AndroidRpdbPolicyProfile, AndroidRpdbRuleRole, AndroidTproxyEvidenceCoverage,
     AndroidTproxyRoutingShape, AndroidTproxyRuleDisposition, AndroidTproxySelectorDisjointReason,
-    AndroidTproxyStructuralFeasibility, AndroidTproxyTopologyError, AndroidTproxyTrafficDomainKind,
+    AndroidTproxyStructuralFeasibility, AndroidTproxyTopologyError,
+    AndroidTproxyTopologyScopeError, AndroidTproxyTopologyScopeRequest,
+    AndroidTproxyTopologyScopeRequestError, AndroidTproxyTopologyScopeStructuralFeasibility,
+    AndroidTproxyTrafficDomainKind, AndroidTproxyTrafficDomainRequest,
     DeferredAndroidTproxyPrerequisite, InterfaceHardwareType, InterfaceIndex, InterfaceLinkFlags,
-    InterfaceLinkRecord, InterfaceName, NetworkAddressFamily, NetworkInventory,
+    InterfaceLinkRecord, InterfaceName, MAX_ANDROID_TPROXY_REQUESTED_DOMAINS,
+    MAX_ANDROID_TPROXY_SCOPE_ANCHORS, NetworkAddressFamily, NetworkInventory,
     NetworkInventoryTracker, NetworkRuleRecord, RuleAction, RuleFlags, RuleFwMark, RulePrefix,
     RulePriority, RuleProperties, RuleProtocol, RuleTableId, RuleUidRange,
-    assess_android_tproxy_topology, classify_android_rpdb,
+    assess_android_tproxy_topology, assess_android_tproxy_topology_scope, classify_android_rpdb,
 };
 
 const NET_ID_MASK: u32 = 0x0000_ffff;
@@ -554,6 +558,366 @@ fn reports_reject_cross_snapshot_inputs_and_stale_future_use() {
     );
     assert_eq!(stale.reported_profile(), profile);
     assert_eq!(stale.current_profile(), wrong_profile);
+}
+
+#[test]
+fn scope_atomically_assesses_dual_stack_local_and_tether_domains() {
+    let profile = AndroidRpdbPolicyProfile::AospAndroid13R1;
+    let fixture = profile_fixture_for_families(
+        profile,
+        [NetworkAddressFamily::Ipv4, NetworkAddressFamily::Ipv6],
+        true,
+    );
+    let inventory = make_inventory(fixture.links, fixture.rules);
+    let classification = classify_android_rpdb(&inventory, profile);
+    let request = AndroidTproxyTopologyScopeRequest::new(
+        AndroidTproxyRoutingShape::PreMarkAddressHostSet,
+        [
+            AndroidTproxyTrafficDomainRequest::tether_ingress(
+                NetworkAddressFamily::Ipv6,
+                interface(b"rndis0"),
+            ),
+            AndroidTproxyTrafficDomainRequest::residual_local_output(NetworkAddressFamily::Ipv4),
+            AndroidTproxyTrafficDomainRequest::tether_ingress(
+                NetworkAddressFamily::Ipv4,
+                interface(b"rndis0"),
+            ),
+            AndroidTproxyTrafficDomainRequest::residual_local_output(NetworkAddressFamily::Ipv6),
+        ],
+    )
+    .expect("valid dual-stack scope");
+
+    assert_eq!(
+        request.domains(),
+        &[
+            AndroidTproxyTrafficDomainRequest::residual_local_output(NetworkAddressFamily::Ipv4,),
+            AndroidTproxyTrafficDomainRequest::residual_local_output(NetworkAddressFamily::Ipv6,),
+            AndroidTproxyTrafficDomainRequest::tether_ingress(
+                NetworkAddressFamily::Ipv4,
+                interface(b"rndis0"),
+            ),
+            AndroidTproxyTrafficDomainRequest::tether_ingress(
+                NetworkAddressFamily::Ipv6,
+                interface(b"rndis0"),
+            ),
+        ]
+    );
+
+    let scope = assess_android_tproxy_topology_scope(&inventory, &classification, &request)
+        .expect("every requested domain has an exact trusted anchor");
+    assert_eq!(scope.snapshot_id(), inventory.snapshot_id());
+    assert_eq!(scope.epoch(), inventory.epoch());
+    assert_eq!(scope.profile(), profile);
+    assert_eq!(scope.request(), &request);
+    assert_eq!(scope.entries().len(), 4);
+    assert_eq!(
+        scope.structural_feasibility(),
+        AndroidTproxyTopologyScopeStructuralFeasibility::AllMatchedAnchorsHaveResidualCandidateWindows {
+            anchor_count: 4,
+        }
+    );
+    for entry in scope.entries() {
+        assert_eq!(entry.domain().family(), entry.report().selector().family());
+        assert_eq!(
+            entry.structural_feasibility(),
+            AndroidTproxyStructuralFeasibility::ResidualCandidateWindow {
+                shape: AndroidTproxyRoutingShape::PreMarkAddressHostSet,
+                required: 1,
+                available: match entry.domain().kind() {
+                    AndroidTproxyTrafficDomainKind::ResidualLocalOutput => 1,
+                    AndroidTproxyTrafficDomainKind::TetherIngress => 999,
+                },
+            }
+        );
+    }
+    assert!(
+        scope
+            .deferred_prerequisites()
+            .contains(&DeferredAndroidTproxyPrerequisite::PositiveMarkAuthority)
+    );
+}
+
+#[test]
+fn scope_preserves_negative_evidence_with_definite_failure_precedence() {
+    let profile = AndroidRpdbPolicyProfile::AospAndroid12R1;
+    let mut fixture = profile_fixture_for_families(
+        profile,
+        [NetworkAddressFamily::Ipv4, NetworkAddressFamily::Ipv6],
+        true,
+    );
+    fixture.rules.push(
+        RuleSpec::netd(20_500, 1_777, RuleAction::TO_TABLE)
+            .family(NetworkAddressFamily::Ipv6)
+            .input(b"other0")
+            .build(),
+    );
+    sort_rules(&mut fixture.rules);
+    let inventory = make_inventory(fixture.links, fixture.rules);
+    let classification = classify_android_rpdb(&inventory, profile);
+    let request = AndroidTproxyTopologyScopeRequest::new(
+        AndroidTproxyRoutingShape::PreMarkAddressHostSet,
+        [
+            AndroidTproxyTrafficDomainRequest::residual_local_output(NetworkAddressFamily::Ipv4),
+            AndroidTproxyTrafficDomainRequest::tether_ingress(
+                NetworkAddressFamily::Ipv6,
+                interface(b"rndis0"),
+            ),
+        ],
+    )
+    .unwrap();
+    let scope = assess_android_tproxy_topology_scope(&inventory, &classification, &request)
+        .expect("negative structural evidence remains report data");
+
+    assert_eq!(
+        scope.entries()[0].structural_feasibility(),
+        AndroidTproxyStructuralFeasibility::InsufficientPrioritySlots {
+            shape: AndroidTproxyRoutingShape::PreMarkAddressHostSet,
+            required: 1,
+            available: 0,
+        }
+    );
+    assert_eq!(
+        scope.entries()[1].structural_feasibility(),
+        AndroidTproxyStructuralFeasibility::IncompleteEvidence {
+            unknown_rule_count: 1,
+        }
+    );
+    assert_eq!(
+        scope.structural_feasibility(),
+        AndroidTproxyTopologyScopeStructuralFeasibility::DefiniteStructuralRejection {
+            rejected_anchor_count: 1,
+        }
+    );
+
+    let dedicated = AndroidTproxyTopologyScopeRequest::new(
+        AndroidTproxyRoutingShape::DedicatedAddressBypassRule,
+        [AndroidTproxyTrafficDomainRequest::tether_ingress(
+            NetworkAddressFamily::Ipv4,
+            interface(b"rndis0"),
+        )],
+    )
+    .unwrap();
+    let dedicated =
+        assess_android_tproxy_topology_scope(&inventory, &classification, &dedicated).unwrap();
+    assert!(matches!(
+        dedicated.entries()[0].structural_feasibility(),
+        AndroidTproxyStructuralFeasibility::IncompatibleTrafficDomain { .. }
+    ));
+}
+
+#[test]
+fn scope_summary_is_incomplete_only_when_no_definite_failure_exists() {
+    let profile = AndroidRpdbPolicyProfile::AospAndroid13R1;
+    let mut fixture = profile_fixture(profile, true);
+    fixture.rules.push(
+        RuleSpec::netd(20_500, 1_777, RuleAction::TO_TABLE)
+            .input(b"other0")
+            .build(),
+    );
+    sort_rules(&mut fixture.rules);
+    let inventory = make_inventory(fixture.links, fixture.rules);
+    let classification = classify_android_rpdb(&inventory, profile);
+    let request = AndroidTproxyTopologyScopeRequest::new(
+        AndroidTproxyRoutingShape::PreMarkAddressHostSet,
+        [AndroidTproxyTrafficDomainRequest::tether_ingress(
+            NetworkAddressFamily::Ipv4,
+            interface(b"rndis0"),
+        )],
+    )
+    .unwrap();
+    let scope = assess_android_tproxy_topology_scope(&inventory, &classification, &request)
+        .expect("incomplete evidence remains a valid diagnostic scope");
+
+    assert_eq!(
+        scope.entries()[0].structural_feasibility(),
+        AndroidTproxyStructuralFeasibility::IncompleteEvidence {
+            unknown_rule_count: 1,
+        }
+    );
+    assert_eq!(
+        scope.structural_feasibility(),
+        AndroidTproxyTopologyScopeStructuralFeasibility::IncompleteEvidence {
+            incomplete_anchor_count: 1,
+        }
+    );
+}
+
+#[test]
+fn known_slot_exhaustion_precedes_unknown_same_domain_rules() {
+    let profile = AndroidRpdbPolicyProfile::AospAndroid12R1;
+    let mut fixture = profile_fixture(profile, false);
+    fixture.rules.push(
+        RuleSpec::netd(20_500, 1_777, RuleAction::TO_TABLE)
+            .input(b"other0")
+            .build(),
+    );
+    sort_rules(&mut fixture.rules);
+    let inventory = make_inventory(fixture.links, fixture.rules);
+    let classification = classify_android_rpdb(&inventory, profile);
+    let anchor = role_index(
+        &inventory,
+        &classification,
+        AndroidRpdbRuleRole::DefaultNetwork,
+        NetworkAddressFamily::Ipv4,
+    );
+    let report = assess_android_tproxy_topology(&inventory, &classification, anchor).unwrap();
+
+    assert_eq!(report.unknown_rule_count(), 1);
+    assert_eq!(
+        report.structural_feasibility(AndroidTproxyRoutingShape::PreMarkAddressHostSet),
+        AndroidTproxyStructuralFeasibility::InsufficientPrioritySlots {
+            shape: AndroidTproxyRoutingShape::PreMarkAddressHostSet,
+            required: 1,
+            available: 0,
+        }
+    );
+}
+
+#[test]
+fn scope_request_is_nonempty_bounded_and_duplicate_free() {
+    assert_eq!(
+        AndroidTproxyTopologyScopeRequest::new(
+            AndroidTproxyRoutingShape::PreMarkAddressHostSet,
+            [],
+        )
+        .unwrap_err(),
+        AndroidTproxyTopologyScopeRequestError::NoRequestedDomains
+    );
+
+    let domain =
+        AndroidTproxyTrafficDomainRequest::residual_local_output(NetworkAddressFamily::Ipv4);
+    assert_eq!(
+        AndroidTproxyTopologyScopeRequest::new(
+            AndroidTproxyRoutingShape::PreMarkAddressHostSet,
+            [domain, domain],
+        )
+        .unwrap_err(),
+        AndroidTproxyTopologyScopeRequestError::DuplicateRequestedDomain { duplicate: domain }
+    );
+
+    assert_eq!(
+        AndroidTproxyTopologyScopeRequest::new(
+            AndroidTproxyRoutingShape::PreMarkAddressHostSet,
+            vec![domain; MAX_ANDROID_TPROXY_REQUESTED_DOMAINS + 1],
+        )
+        .unwrap_err(),
+        AndroidTproxyTopologyScopeRequestError::TooManyRequestedDomains {
+            maximum: MAX_ANDROID_TPROXY_REQUESTED_DOMAINS,
+            required_at_least: MAX_ANDROID_TPROXY_REQUESTED_DOMAINS + 1,
+        }
+    );
+}
+
+#[test]
+fn scope_requires_every_requested_domain_to_have_an_observed_anchor() {
+    let profile = AndroidRpdbPolicyProfile::AospAndroid13R1;
+    let inventory = profile_inventory(profile, false);
+    let classification = classify_android_rpdb(&inventory, profile);
+    let missing_ipv6 =
+        AndroidTproxyTrafficDomainRequest::residual_local_output(NetworkAddressFamily::Ipv6);
+    let request = AndroidTproxyTopologyScopeRequest::new(
+        AndroidTproxyRoutingShape::PreMarkAddressHostSet,
+        [missing_ipv6],
+    )
+    .unwrap();
+    assert_eq!(
+        assess_android_tproxy_topology_scope(&inventory, &classification, &request).unwrap_err(),
+        AndroidTproxyTopologyScopeError::MissingRequestedDomain {
+            domain: missing_ipv6,
+        }
+    );
+}
+
+#[test]
+fn scope_includes_every_matching_anchor_and_enforces_its_report_bound() {
+    let profile = AndroidRpdbPolicyProfile::AospAndroid13R1;
+    let mut fixture = profile_fixture(profile, false);
+    fixture
+        .rules
+        .push(default_network_for(profile, NetworkAddressFamily::Ipv4));
+    fixture.rules.push(
+        RuleSpec::netd(31_000, DEFAULT_NETWORK_TABLE, RuleAction::TO_TABLE)
+            .mark(SYSTEM_PERMISSION, NET_ID_MASK | SYSTEM_PERMISSION)
+            .input(b"lo")
+            .build(),
+    );
+    sort_rules(&mut fixture.rules);
+    let inventory = make_inventory(fixture.links, fixture.rules);
+    let classification = classify_android_rpdb(&inventory, profile);
+    let request = AndroidTproxyTopologyScopeRequest::new(
+        AndroidTproxyRoutingShape::PreMarkAddressHostSet,
+        [AndroidTproxyTrafficDomainRequest::residual_local_output(
+            NetworkAddressFamily::Ipv4,
+        )],
+    )
+    .unwrap();
+    let scope = assess_android_tproxy_topology_scope(&inventory, &classification, &request)
+        .expect("same-table duplicate anchors remain aligned evidence");
+    assert_eq!(scope.entries().len(), 3);
+    assert_ne!(
+        scope.entries()[0].report().anchor().dump_index(),
+        scope.entries()[1].report().anchor().dump_index()
+    );
+    assert!(scope.entries().iter().any(|entry| {
+        entry.report().selector().android_fwmark()
+            == RuleFwMark::new(SYSTEM_PERMISSION, NET_ID_MASK | SYSTEM_PERMISSION)
+    }));
+
+    let mut fixture = profile_fixture(profile, false);
+    for _ in 0..MAX_ANDROID_TPROXY_SCOPE_ANCHORS {
+        fixture
+            .rules
+            .push(default_network_for(profile, NetworkAddressFamily::Ipv4));
+    }
+    sort_rules(&mut fixture.rules);
+    let inventory = make_inventory(fixture.links, fixture.rules);
+    let classification = classify_android_rpdb(&inventory, profile);
+    assert_eq!(
+        assess_android_tproxy_topology_scope(&inventory, &classification, &request).unwrap_err(),
+        AndroidTproxyTopologyScopeError::TooManyMatchedAnchors {
+            maximum: MAX_ANDROID_TPROXY_SCOPE_ANCHORS,
+            required_at_least: MAX_ANDROID_TPROXY_SCOPE_ANCHORS + 1,
+        }
+    );
+}
+
+#[test]
+fn scope_freshness_reassesses_complete_anchor_discovery() {
+    let profile = AndroidRpdbPolicyProfile::AospAndroid13R1;
+    let first = profile_inventory(profile, false);
+    let first_classification = classify_android_rpdb(&first, profile);
+    let request = AndroidTproxyTopologyScopeRequest::new(
+        AndroidTproxyRoutingShape::PreMarkAddressHostSet,
+        [AndroidTproxyTrafficDomainRequest::residual_local_output(
+            NetworkAddressFamily::Ipv4,
+        )],
+    )
+    .unwrap();
+    let scope = assess_android_tproxy_topology_scope(&first, &first_classification, &request)
+        .expect("initial scope");
+    scope
+        .ensure_current(&first, &first_classification)
+        .expect("same complete evidence");
+
+    let mut fixture = profile_fixture(profile, false);
+    fixture
+        .rules
+        .push(default_network_for(profile, NetworkAddressFamily::Ipv4));
+    sort_rules(&mut fixture.rules);
+    let second = make_inventory(fixture.links, fixture.rules);
+    let second_classification = classify_android_rpdb(&second, profile);
+    let stale = scope
+        .ensure_current(&second, &second_classification)
+        .expect_err("new matching anchor changes the complete scope assessment");
+    assert_eq!(stale.reported_snapshot_id(), first.snapshot_id());
+    assert_eq!(stale.current_snapshot_id(), second.snapshot_id());
+
+    assert!(matches!(
+        assess_android_tproxy_topology_scope(&second, &first_classification, &request),
+        Err(AndroidTproxyTopologyScopeError::Topology(
+            AndroidTproxyTopologyError::ClassifierSnapshotMismatch { .. }
+        ))
+    ));
 }
 
 fn profile_inventory(profile: AndroidRpdbPolicyProfile, tether: bool) -> NetworkInventory {

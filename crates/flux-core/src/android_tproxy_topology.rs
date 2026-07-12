@@ -15,6 +15,11 @@ use crate::rpdb_placement::{RpdbClassifierRevision, RpdbRuleClassification};
 const ANDROID_LOCAL_NETWORK_PRIORITY: RulePriority = RulePriority::from_raw(20_000);
 const ANDROID_TETHERING_PRIORITY: RulePriority = RulePriority::from_raw(21_000);
 
+/// Maximum traffic domains accepted by one atomic topology-scope request.
+pub const MAX_ANDROID_TPROXY_REQUESTED_DOMAINS: usize = 64;
+/// Maximum exact anchors retained by one topology-scope report.
+pub const MAX_ANDROID_TPROXY_SCOPE_ANCHORS: usize = 64;
+
 const COMMON_DEFERRED_ANDROID_TPROXY_PREREQUISITES: [DeferredAndroidTproxyPrerequisite; 10] = [
     DeferredAndroidTproxyPrerequisite::PositiveMarkAuthority,
     DeferredAndroidTproxyPrerequisite::ExactCaptureOrdering,
@@ -51,6 +56,88 @@ pub enum AndroidTproxyTrafficDomainKind {
     TetherIngress,
 }
 
+/// One logical traffic-scope domain requested from the Android topology assessor.
+///
+/// Exact selector identity remains in each matched per-anchor report. Residual local OUTPUT is
+/// requested by family, while tether ingress additionally names the exact input interface.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum AndroidTproxyTrafficDomainRequest {
+    ResidualLocalOutput {
+        family: NetworkAddressFamily,
+    },
+    TetherIngress {
+        family: NetworkAddressFamily,
+        input_interface: InterfaceName,
+    },
+}
+
+impl AndroidTproxyTrafficDomainRequest {
+    #[must_use]
+    pub const fn residual_local_output(family: NetworkAddressFamily) -> Self {
+        Self::ResidualLocalOutput { family }
+    }
+
+    #[must_use]
+    pub const fn tether_ingress(
+        family: NetworkAddressFamily,
+        input_interface: InterfaceName,
+    ) -> Self {
+        Self::TetherIngress {
+            family,
+            input_interface,
+        }
+    }
+
+    #[must_use]
+    pub const fn family(self) -> NetworkAddressFamily {
+        match self {
+            Self::ResidualLocalOutput { family } | Self::TetherIngress { family, .. } => family,
+        }
+    }
+
+    #[must_use]
+    pub const fn kind(self) -> AndroidTproxyTrafficDomainKind {
+        match self {
+            Self::ResidualLocalOutput { .. } => AndroidTproxyTrafficDomainKind::ResidualLocalOutput,
+            Self::TetherIngress { .. } => AndroidTproxyTrafficDomainKind::TetherIngress,
+        }
+    }
+
+    #[must_use]
+    pub const fn input_interface(self) -> Option<InterfaceName> {
+        match self {
+            Self::ResidualLocalOutput { .. } => None,
+            Self::TetherIngress {
+                input_interface, ..
+            } => Some(input_interface),
+        }
+    }
+
+    const fn expected_role(self) -> AndroidRpdbRuleRole {
+        match self {
+            Self::ResidualLocalOutput { .. } => AndroidRpdbRuleRole::DefaultNetwork,
+            Self::TetherIngress { .. } => AndroidRpdbRuleRole::Tethering,
+        }
+    }
+}
+
+impl fmt::Display for AndroidTproxyTrafficDomainRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ResidualLocalOutput { family } => {
+                write!(formatter, "{family:?} residual local OUTPUT")
+            }
+            Self::TetherIngress {
+                family,
+                input_interface,
+            } => write!(
+                formatter,
+                "{family:?} tether ingress on {input_interface:?}"
+            ),
+        }
+    }
+}
+
 /// Routing shape whose integer-priority demand is being assessed.
 ///
 /// Neither shape is an activation plan. `PreMarkAddressHostSet` assumes that a later Capture
@@ -70,6 +157,96 @@ impl AndroidTproxyRoutingShape {
         }
     }
 }
+
+/// Atomic routing shape and traffic-domain scope to assess.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AndroidTproxyTopologyScopeRequest {
+    shape: AndroidTproxyRoutingShape,
+    domains: Box<[AndroidTproxyTrafficDomainRequest]>,
+}
+
+impl AndroidTproxyTopologyScopeRequest {
+    pub fn new(
+        shape: AndroidTproxyRoutingShape,
+        requested_domains: impl IntoIterator<Item = AndroidTproxyTrafficDomainRequest>,
+    ) -> Result<Self, AndroidTproxyTopologyScopeRequestError> {
+        let mut domains = Vec::new();
+        for domain in requested_domains {
+            if domains.len() == MAX_ANDROID_TPROXY_REQUESTED_DOMAINS {
+                return Err(
+                    AndroidTproxyTopologyScopeRequestError::TooManyRequestedDomains {
+                        maximum: MAX_ANDROID_TPROXY_REQUESTED_DOMAINS,
+                        required_at_least: MAX_ANDROID_TPROXY_REQUESTED_DOMAINS + 1,
+                    },
+                );
+            }
+            domains.push(domain);
+        }
+        if domains.is_empty() {
+            return Err(AndroidTproxyTopologyScopeRequestError::NoRequestedDomains);
+        }
+        domains.sort_unstable();
+        if let Some(duplicate) = domains
+            .windows(2)
+            .find(|window| window[0] == window[1])
+            .map(|window| window[0])
+        {
+            return Err(
+                AndroidTproxyTopologyScopeRequestError::DuplicateRequestedDomain { duplicate },
+            );
+        }
+
+        Ok(Self {
+            shape,
+            domains: domains.into_boxed_slice(),
+        })
+    }
+
+    #[must_use]
+    pub const fn shape(&self) -> AndroidTproxyRoutingShape {
+        self.shape
+    }
+
+    #[must_use]
+    pub fn domains(&self) -> &[AndroidTproxyTrafficDomainRequest] {
+        &self.domains
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AndroidTproxyTopologyScopeRequestError {
+    NoRequestedDomains,
+    TooManyRequestedDomains {
+        maximum: usize,
+        required_at_least: usize,
+    },
+    DuplicateRequestedDomain {
+        duplicate: AndroidTproxyTrafficDomainRequest,
+    },
+}
+
+impl fmt::Display for AndroidTproxyTopologyScopeRequestError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoRequestedDomains => {
+                formatter.write_str("Android TPROXY topology scope requests no traffic domains")
+            }
+            Self::TooManyRequestedDomains {
+                maximum,
+                required_at_least,
+            } => write!(
+                formatter,
+                "Android TPROXY topology scope requests at least {required_at_least} domains but its limit is {maximum}"
+            ),
+            Self::DuplicateRequestedDomain { duplicate } => write!(
+                formatter,
+                "Android TPROXY topology scope requests {duplicate} more than once"
+            ),
+        }
+    }
+}
+
+impl Error for AndroidTproxyTopologyScopeRequestError {}
 
 /// Exact selector evidence retained for one traffic domain.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -227,6 +404,17 @@ pub enum AndroidTproxyStructuralFeasibility {
     },
 }
 
+/// Atomic structural summary across every exact anchor in one requested scope.
+///
+/// Definite incompatibility or slot exhaustion takes precedence over incomplete evidence. The
+/// residual-window variant still grants no priority, mark, route, ownership, or mutation authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AndroidTproxyTopologyScopeStructuralFeasibility {
+    DefiniteStructuralRejection { rejected_anchor_count: u32 },
+    IncompleteEvidence { incomplete_anchor_count: u32 },
+    AllMatchedAnchorsHaveResidualCandidateWindows { anchor_count: u32 },
+}
+
 /// Preconditions deliberately not proven by this structural report.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum DeferredAndroidTproxyPrerequisite {
@@ -346,26 +534,26 @@ impl AndroidTproxyTopologyFeasibilityReport {
                 domain: self.kind,
             };
         }
+
+        let required = shape.required_priority_slots();
+        let available = self.interval.open_priority_count();
+        if available < required as u32 {
+            return AndroidTproxyStructuralFeasibility::InsufficientPrioritySlots {
+                shape,
+                required,
+                available,
+            };
+        }
         if self.unknown_rule_count != 0 {
             return AndroidTproxyStructuralFeasibility::IncompleteEvidence {
                 unknown_rule_count: self.unknown_rule_count,
             };
         }
 
-        let required = shape.required_priority_slots();
-        let available = self.interval.open_priority_count();
-        if available < required as u32 {
-            AndroidTproxyStructuralFeasibility::InsufficientPrioritySlots {
-                shape,
-                required,
-                available,
-            }
-        } else {
-            AndroidTproxyStructuralFeasibility::ResidualCandidateWindow {
-                shape,
-                required,
-                available,
-            }
+        AndroidTproxyStructuralFeasibility::ResidualCandidateWindow {
+            shape,
+            required,
+            available,
         }
     }
 
@@ -374,14 +562,7 @@ impl AndroidTproxyTopologyFeasibilityReport {
         &self,
         shape: AndroidTproxyRoutingShape,
     ) -> &'static [DeferredAndroidTproxyPrerequisite] {
-        match shape {
-            AndroidTproxyRoutingShape::DedicatedAddressBypassRule => {
-                &COMMON_DEFERRED_ANDROID_TPROXY_PREREQUISITES
-            }
-            AndroidTproxyRoutingShape::PreMarkAddressHostSet => {
-                &PRE_MARK_DEFERRED_ANDROID_TPROXY_PREREQUISITES
-            }
-        }
+        deferred_prerequisites_for_shape(shape)
     }
 
     pub fn ensure_current(
@@ -496,6 +677,243 @@ impl fmt::Display for StaleAndroidTproxyTopologyReport {
 }
 
 impl Error for StaleAndroidTproxyTopologyReport {}
+
+/// One requested traffic domain aligned with one exact observed Android selection anchor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AndroidTproxyTopologyScopeEntry {
+    domain: AndroidTproxyTrafficDomainRequest,
+    report: AndroidTproxyTopologyFeasibilityReport,
+    structural_feasibility: AndroidTproxyStructuralFeasibility,
+}
+
+impl AndroidTproxyTopologyScopeEntry {
+    #[must_use]
+    pub const fn domain(&self) -> AndroidTproxyTrafficDomainRequest {
+        self.domain
+    }
+
+    #[must_use]
+    pub const fn report(&self) -> &AndroidTproxyTopologyFeasibilityReport {
+        &self.report
+    }
+
+    #[must_use]
+    pub const fn structural_feasibility(&self) -> AndroidTproxyStructuralFeasibility {
+        self.structural_feasibility
+    }
+}
+
+/// Snapshot-bound, atomically assessed Android TPROXY topology scope.
+///
+/// The scope is constructed directly from the current inventory and classifier rather than from
+/// caller-asserted per-anchor reports. Every recognized anchor matching every requested domain is
+/// retained under one routing shape. Negative structural evidence remains inspectable; even an
+/// all-residual result is diagnostic-only and exposes no selected priority, table choice, mark,
+/// route intent, lease, ownership, encoding, or mutation identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AndroidTproxyTopologyScopeReport {
+    snapshot_id: NetworkInventorySnapshotId,
+    epoch: NetworkEpoch,
+    classifier_revision: RpdbClassifierRevision,
+    profile: AndroidRpdbPolicyProfile,
+    request: AndroidTproxyTopologyScopeRequest,
+    entries: Box<[AndroidTproxyTopologyScopeEntry]>,
+    structural_feasibility: AndroidTproxyTopologyScopeStructuralFeasibility,
+}
+
+impl AndroidTproxyTopologyScopeReport {
+    #[must_use]
+    pub const fn snapshot_id(&self) -> NetworkInventorySnapshotId {
+        self.snapshot_id
+    }
+
+    #[must_use]
+    pub const fn epoch(&self) -> NetworkEpoch {
+        self.epoch
+    }
+
+    #[must_use]
+    pub const fn classifier_revision(&self) -> RpdbClassifierRevision {
+        self.classifier_revision
+    }
+
+    #[must_use]
+    pub const fn profile(&self) -> AndroidRpdbPolicyProfile {
+        self.profile
+    }
+
+    #[must_use]
+    pub const fn request(&self) -> &AndroidTproxyTopologyScopeRequest {
+        &self.request
+    }
+
+    #[must_use]
+    pub fn entries(&self) -> &[AndroidTproxyTopologyScopeEntry] {
+        &self.entries
+    }
+
+    #[must_use]
+    pub const fn structural_feasibility(&self) -> AndroidTproxyTopologyScopeStructuralFeasibility {
+        self.structural_feasibility
+    }
+
+    #[must_use]
+    pub const fn deferred_prerequisites(&self) -> &'static [DeferredAndroidTproxyPrerequisite] {
+        deferred_prerequisites_for_shape(self.request.shape)
+    }
+
+    pub fn ensure_current(
+        &self,
+        inventory: &NetworkInventory,
+        classification: &AndroidRpdbClassificationReport,
+    ) -> Result<(), StaleAndroidTproxyTopologyScopeReport> {
+        if assess_android_tproxy_topology_scope(inventory, classification, &self.request)
+            .is_ok_and(|current| &current == self)
+        {
+            Ok(())
+        } else {
+            Err(StaleAndroidTproxyTopologyScopeReport {
+                reported_snapshot_id: self.snapshot_id,
+                current_inventory_snapshot_id: inventory.snapshot_id(),
+                current_classification_snapshot_id: classification.audit().snapshot_id(),
+                reported_epoch: self.epoch,
+                current_inventory_epoch: inventory.epoch(),
+                current_classification_epoch: classification.audit().epoch(),
+                reported_profile: self.profile,
+                current_profile: classification.profile(),
+                reported_classifier_revision: self.classifier_revision,
+                current_classifier_revision: classification.audit().classifier_revision(),
+            })
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StaleAndroidTproxyTopologyScopeReport {
+    reported_snapshot_id: NetworkInventorySnapshotId,
+    current_inventory_snapshot_id: NetworkInventorySnapshotId,
+    current_classification_snapshot_id: NetworkInventorySnapshotId,
+    reported_epoch: NetworkEpoch,
+    current_inventory_epoch: NetworkEpoch,
+    current_classification_epoch: NetworkEpoch,
+    reported_profile: AndroidRpdbPolicyProfile,
+    current_profile: AndroidRpdbPolicyProfile,
+    reported_classifier_revision: RpdbClassifierRevision,
+    current_classifier_revision: RpdbClassifierRevision,
+}
+
+impl StaleAndroidTproxyTopologyScopeReport {
+    #[must_use]
+    pub const fn reported_snapshot_id(self) -> NetworkInventorySnapshotId {
+        self.reported_snapshot_id
+    }
+
+    #[must_use]
+    pub const fn current_snapshot_id(self) -> NetworkInventorySnapshotId {
+        self.current_inventory_snapshot_id
+    }
+
+    #[must_use]
+    pub const fn current_classification_snapshot_id(self) -> NetworkInventorySnapshotId {
+        self.current_classification_snapshot_id
+    }
+
+    #[must_use]
+    pub const fn reported_epoch(self) -> NetworkEpoch {
+        self.reported_epoch
+    }
+
+    #[must_use]
+    pub const fn current_epoch(self) -> NetworkEpoch {
+        self.current_inventory_epoch
+    }
+
+    #[must_use]
+    pub const fn current_classification_epoch(self) -> NetworkEpoch {
+        self.current_classification_epoch
+    }
+
+    #[must_use]
+    pub const fn reported_profile(self) -> AndroidRpdbPolicyProfile {
+        self.reported_profile
+    }
+
+    #[must_use]
+    pub const fn current_profile(self) -> AndroidRpdbPolicyProfile {
+        self.current_profile
+    }
+
+    #[must_use]
+    pub const fn reported_classifier_revision(self) -> RpdbClassifierRevision {
+        self.reported_classifier_revision
+    }
+
+    #[must_use]
+    pub const fn current_classifier_revision(self) -> RpdbClassifierRevision {
+        self.current_classifier_revision
+    }
+}
+
+impl fmt::Display for StaleAndroidTproxyTopologyScopeReport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "Android TPROXY topology scope for snapshot {} at epoch {} with profile {:?} and classifier revision {} is stale relative to inventory snapshot {} at epoch {} and classification snapshot {} at epoch {} with profile {:?} and revision {}",
+            self.reported_snapshot_id.get(),
+            self.reported_epoch.get(),
+            self.reported_profile,
+            self.reported_classifier_revision.get(),
+            self.current_inventory_snapshot_id.get(),
+            self.current_inventory_epoch.get(),
+            self.current_classification_snapshot_id.get(),
+            self.current_classification_epoch.get(),
+            self.current_profile,
+            self.current_classifier_revision.get()
+        )
+    }
+}
+
+impl Error for StaleAndroidTproxyTopologyScopeReport {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AndroidTproxyTopologyScopeError {
+    MissingRequestedDomain {
+        domain: AndroidTproxyTrafficDomainRequest,
+    },
+    TooManyMatchedAnchors {
+        maximum: usize,
+        required_at_least: usize,
+    },
+    Topology(AndroidTproxyTopologyError),
+}
+
+impl fmt::Display for AndroidTproxyTopologyScopeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingRequestedDomain { domain } => write!(
+                formatter,
+                "Android TPROXY topology scope found no recognized anchor for {domain}"
+            ),
+            Self::TooManyMatchedAnchors {
+                maximum,
+                required_at_least,
+            } => write!(
+                formatter,
+                "Android TPROXY topology scope matches at least {required_at_least} anchors but its limit is {maximum}"
+            ),
+            Self::Topology(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl Error for AndroidTproxyTopologyScopeError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Topology(error) => Some(error),
+            Self::MissingRequestedDomain { .. } | Self::TooManyMatchedAnchors { .. } => None,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AndroidTproxyTopologyError {
@@ -639,18 +1057,7 @@ pub fn assess_android_tproxy_topology(
     classification: &AndroidRpdbClassificationReport,
     anchor_dump_index: usize,
 ) -> Result<AndroidTproxyTopologyFeasibilityReport, AndroidTproxyTopologyError> {
-    if inventory.epoch() != classification.audit().epoch() {
-        return Err(AndroidTproxyTopologyError::ClassifierEpochMismatch {
-            inventory: inventory.epoch(),
-            classifier: classification.audit().epoch(),
-        });
-    }
-    if inventory.snapshot_id() != classification.audit().snapshot_id() {
-        return Err(AndroidTproxyTopologyError::ClassifierSnapshotMismatch {
-            inventory: inventory.snapshot_id(),
-            classifier: classification.audit().snapshot_id(),
-        });
-    }
+    ensure_classifier_matches_inventory(inventory, classification)?;
 
     let rule = inventory.rules().get(anchor_dump_index).ok_or(
         AndroidTproxyTopologyError::AnchorOutOfBounds {
@@ -796,6 +1203,133 @@ pub fn assess_android_tproxy_topology(
         dispositions: dispositions.into_boxed_slice(),
         unknown_rule_count,
     })
+}
+
+/// Atomically assesses every recognized Android selection anchor matching the requested scope.
+///
+/// Requests are already bounded, sorted, and duplicate-free. Each domain must have at least one
+/// recognized anchor; every match is assessed rather than letting the caller cherry-pick one rule.
+/// Structural negatives remain report data. This function is pure and grants no activation or
+/// mutation authority.
+pub fn assess_android_tproxy_topology_scope(
+    inventory: &NetworkInventory,
+    classification: &AndroidRpdbClassificationReport,
+    request: &AndroidTproxyTopologyScopeRequest,
+) -> Result<AndroidTproxyTopologyScopeReport, AndroidTproxyTopologyScopeError> {
+    ensure_classifier_matches_inventory(inventory, classification)
+        .map_err(AndroidTproxyTopologyScopeError::Topology)?;
+
+    let mut entries = Vec::new();
+    let mut rejected_anchor_count = 0_u32;
+    let mut incomplete_anchor_count = 0_u32;
+    for domain in request.domains() {
+        let mut matched = false;
+        for (dump_index, rule) in inventory.rules().iter().enumerate() {
+            if !requested_domain_matches(*domain, rule, classification.roles()[dump_index]) {
+                continue;
+            }
+            matched = true;
+            if entries.len() == MAX_ANDROID_TPROXY_SCOPE_ANCHORS {
+                return Err(AndroidTproxyTopologyScopeError::TooManyMatchedAnchors {
+                    maximum: MAX_ANDROID_TPROXY_SCOPE_ANCHORS,
+                    required_at_least: MAX_ANDROID_TPROXY_SCOPE_ANCHORS + 1,
+                });
+            }
+            let report = assess_android_tproxy_topology(inventory, classification, dump_index)
+                .map_err(AndroidTproxyTopologyScopeError::Topology)?;
+            let structural_feasibility = report.structural_feasibility(request.shape());
+            match structural_feasibility {
+                AndroidTproxyStructuralFeasibility::IncompatibleTrafficDomain { .. }
+                | AndroidTproxyStructuralFeasibility::InsufficientPrioritySlots { .. } => {
+                    rejected_anchor_count = rejected_anchor_count.saturating_add(1);
+                }
+                AndroidTproxyStructuralFeasibility::IncompleteEvidence { .. } => {
+                    incomplete_anchor_count = incomplete_anchor_count.saturating_add(1);
+                }
+                AndroidTproxyStructuralFeasibility::ResidualCandidateWindow { .. } => {}
+            }
+            entries.push(AndroidTproxyTopologyScopeEntry {
+                domain: *domain,
+                report,
+                structural_feasibility,
+            });
+        }
+        if !matched {
+            return Err(AndroidTproxyTopologyScopeError::MissingRequestedDomain {
+                domain: *domain,
+            });
+        }
+    }
+
+    let anchor_count =
+        u32::try_from(entries.len()).expect("the Android TPROXY scope anchor bound fits in u32");
+    let structural_feasibility = if rejected_anchor_count != 0 {
+        AndroidTproxyTopologyScopeStructuralFeasibility::DefiniteStructuralRejection {
+            rejected_anchor_count,
+        }
+    } else if incomplete_anchor_count != 0 {
+        AndroidTproxyTopologyScopeStructuralFeasibility::IncompleteEvidence {
+            incomplete_anchor_count,
+        }
+    } else {
+        AndroidTproxyTopologyScopeStructuralFeasibility::AllMatchedAnchorsHaveResidualCandidateWindows {
+            anchor_count,
+        }
+    };
+
+    Ok(AndroidTproxyTopologyScopeReport {
+        snapshot_id: inventory.snapshot_id(),
+        epoch: inventory.epoch(),
+        classifier_revision: classification.audit().classifier_revision(),
+        profile: classification.profile(),
+        request: request.clone(),
+        entries: entries.into_boxed_slice(),
+        structural_feasibility,
+    })
+}
+
+const fn deferred_prerequisites_for_shape(
+    shape: AndroidTproxyRoutingShape,
+) -> &'static [DeferredAndroidTproxyPrerequisite] {
+    match shape {
+        AndroidTproxyRoutingShape::DedicatedAddressBypassRule => {
+            &COMMON_DEFERRED_ANDROID_TPROXY_PREREQUISITES
+        }
+        AndroidTproxyRoutingShape::PreMarkAddressHostSet => {
+            &PRE_MARK_DEFERRED_ANDROID_TPROXY_PREREQUISITES
+        }
+    }
+}
+
+fn ensure_classifier_matches_inventory(
+    inventory: &NetworkInventory,
+    classification: &AndroidRpdbClassificationReport,
+) -> Result<(), AndroidTproxyTopologyError> {
+    if inventory.epoch() != classification.audit().epoch() {
+        return Err(AndroidTproxyTopologyError::ClassifierEpochMismatch {
+            inventory: inventory.epoch(),
+            classifier: classification.audit().epoch(),
+        });
+    }
+    if inventory.snapshot_id() != classification.audit().snapshot_id() {
+        return Err(AndroidTproxyTopologyError::ClassifierSnapshotMismatch {
+            inventory: inventory.snapshot_id(),
+            classifier: classification.audit().snapshot_id(),
+        });
+    }
+    Ok(())
+}
+
+fn requested_domain_matches(
+    domain: AndroidTproxyTrafficDomainRequest,
+    rule: &crate::network_rule::NetworkRuleRecord,
+    role: Option<AndroidRpdbRuleRole>,
+) -> bool {
+    role == Some(domain.expected_role())
+        && rule.destination().family() == domain.family()
+        && domain
+            .input_interface()
+            .is_none_or(|input_interface| rule.input_interface() == Some(&input_interface))
 }
 
 fn reject_ambiguous_anchor(

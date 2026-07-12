@@ -39,8 +39,14 @@ pub use android_tproxy_topology::{
     AndroidTproxyRoutingShape, AndroidTproxyRuleDisposition, AndroidTproxySelectionAnchor,
     AndroidTproxySelectorDisjointReason, AndroidTproxyStructuralFeasibility,
     AndroidTproxyTopologyError, AndroidTproxyTopologyFeasibilityReport,
-    AndroidTproxyTrafficDomainKind, DeferredAndroidTproxyPrerequisite,
-    StaleAndroidTproxyTopologyReport, assess_android_tproxy_topology,
+    AndroidTproxyTopologyScopeEntry, AndroidTproxyTopologyScopeError,
+    AndroidTproxyTopologyScopeReport, AndroidTproxyTopologyScopeRequest,
+    AndroidTproxyTopologyScopeRequestError, AndroidTproxyTopologyScopeStructuralFeasibility,
+    AndroidTproxyTrafficDomainKind, AndroidTproxyTrafficDomainRequest,
+    DeferredAndroidTproxyPrerequisite, MAX_ANDROID_TPROXY_REQUESTED_DOMAINS,
+    MAX_ANDROID_TPROXY_SCOPE_ANCHORS, StaleAndroidTproxyTopologyReport,
+    StaleAndroidTproxyTopologyScopeReport, assess_android_tproxy_topology,
+    assess_android_tproxy_topology_scope,
 };
 pub use capability::{
     BootIdentity, BootIdentityMutationStatus, CAPABILITY_PROFILE_SCHEMA_VERSION, CapabilityProfile,

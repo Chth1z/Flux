@@ -522,7 +522,13 @@ test_real_addrsync_stop_propagates_stop_failure() {
 #!/usr/bin/sh
 action="${5:-}"
 case "${action}" in
-    status) [ -f /data/adb/flux/run/fake-addrsync-running ] ;;
+    status)
+        if [ -f /data/adb/flux/run/fake-addrsync-running ]; then
+            printf 'running pid=4242\n'
+        else
+            printf 'stopped\n'
+        fi
+        ;;
     stop)
         [ ! -f /data/adb/flux/run/fail-addrsync-stop ] || exit 71
         rm -f /data/adb/flux/run/fake-addrsync-running
@@ -533,18 +539,93 @@ EOF
     chmod 0755 "${FLUX_ROOT}/bin/addrsyncd"
     : >"${RUN_ROOT}/fake-addrsync-running"
     : >"${RUN_ROOT}/fail-addrsync-stop"
+    : >"${RUN_ROOT}/addrsyncd.pid"
 
     if CORE_TIMEOUT=1 sh /src/scripts/addrsync stop; then
         fail "addrsync stop suppressed the daemon stop failure"
     fi
     [ -f "${RUN_ROOT}/fake-addrsync-running" ] ||
         fail "failed addrsync stop lost running evidence"
+    [ -f "${RUN_ROOT}/addrsyncd.pid" ] ||
+        fail "failed addrsync stop discarded daemon identity evidence"
 
     rm -f "${RUN_ROOT}/fail-addrsync-stop"
     CORE_TIMEOUT=1 sh /src/scripts/addrsync stop ||
         fail "addrsync stop did not recover"
     [ ! -e "${RUN_ROOT}/fake-addrsync-running" ] ||
         fail "successful addrsync stop retained running evidence"
+    [ ! -e "${RUN_ROOT}/addrsyncd.pid" ] ||
+        fail "successful addrsync stop retained daemon identity evidence"
+}
+
+test_real_addrsync_start_requires_exact_running_status() {
+    reset_fixture
+    cat >"${FLUX_ROOT}/bin/addrsyncd" <<'EOF'
+#!/usr/bin/sh
+action="${5:-}"
+case "${action}" in
+    status)
+        if [ -f /data/adb/flux/run/fake-addrsync-running ]; then
+            printf 'running pid=4242\n'
+        else
+            printf 'stopped\n'
+        fi
+        ;;
+    run)
+        printf 'run\n' >>/data/adb/flux/run/addrsyncd-actions
+        [ ! -f /data/adb/flux/run/leave-addrsync-stopped ] || exit 0
+        : >/data/adb/flux/run/fake-addrsync-running
+        ;;
+    *) exit 0 ;;
+esac
+EOF
+    chmod 0755 "${FLUX_ROOT}/bin/addrsyncd"
+
+    sh /src/scripts/addrsync start || fail "addrsync did not start from exact stopped state"
+    grep -qx 'run' "${RUN_ROOT}/addrsyncd-actions" ||
+        fail "addrsync treated exact stopped state as already running"
+    sh /src/scripts/addrsync status >"${RUN_ROOT}/addrsync-status" ||
+        fail "addrsync rejected exact running state"
+    grep -qx 'running pid=4242' "${RUN_ROOT}/addrsync-status" ||
+        fail "addrsync did not preserve the trusted running identity"
+
+    rm -f "${RUN_ROOT}/fake-addrsync-running"
+    : >"${RUN_ROOT}/leave-addrsync-stopped"
+    if sh /src/scripts/addrsync start; then
+        fail "addrsync accepted stopped status as startup readiness"
+    fi
+    [ "$(grep -c '^run$' "${RUN_ROOT}/addrsyncd-actions")" -eq 2 ] ||
+        fail "addrsync did not attempt the stopped daemon startup"
+}
+
+test_real_addrsync_rejects_config_invalid_status_and_preserves_stop_evidence() {
+    reset_fixture
+    cat >"${FLUX_ROOT}/bin/addrsyncd" <<'EOF'
+#!/usr/bin/sh
+action="${5:-}"
+case "${action}" in
+    status) printf 'stopped(config invalid: missing [rule] section)\n' ;;
+    run|stop) printf '%s\n' "${action}" >>/data/adb/flux/run/addrsyncd-actions ;;
+    *) exit 0 ;;
+esac
+EOF
+    chmod 0755 "${FLUX_ROOT}/bin/addrsyncd"
+    : >"${RUN_ROOT}/addrsyncd.pid"
+
+    if sh /src/scripts/addrsync start; then
+        fail "addrsync started with config-invalid status"
+    fi
+    if sh /src/scripts/addrsync status >/dev/null; then
+        fail "addrsync reported config-invalid status as ready"
+    fi
+    if sh /src/scripts/addrsync stop; then
+        fail "addrsync treated config-invalid status as safely stopped"
+    fi
+
+    [ -f "${RUN_ROOT}/addrsyncd.pid" ] ||
+        fail "config-invalid stop discarded daemon identity evidence"
+    [ ! -e "${RUN_ROOT}/addrsyncd-actions" ] ||
+        fail "config-invalid status allowed a daemon mutation"
 }
 
 test_address_resync_uses_only_the_address_writer() {
@@ -850,6 +931,8 @@ test_capture_start_preserves_retry_evidence_when_compensation_fails
 test_capture_stop_is_ordered_and_idempotent
 test_real_tproxy_stop_refuses_to_claim_detach_while_jumps_remain
 test_real_addrsync_stop_propagates_stop_failure
+test_real_addrsync_start_requires_exact_running_status
+test_real_addrsync_rejects_config_invalid_status_and_preserves_stop_evidence
 test_address_resync_uses_only_the_address_writer
 test_running_publication_requires_capture_verification
 test_terminal_state_publication_requires_detached_capture

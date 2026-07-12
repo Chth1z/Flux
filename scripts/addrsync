@@ -24,30 +24,106 @@ readonly LOG_COMPONENT="ASyn"
 # [ Daemon Process Management ]
 # ==============================================================================
 
+_daemon_state() {
+    local status=""
+    local pid=""
+
+    status=$("${ADDRSYNCD_BIN}" -c "${ADDRSYNCD_CONF_FILE}" -d "${RUN_DIR}" status 2>/dev/null) || {
+        log_error "Cannot inspect addrsyncd status"
+        return 1
+    }
+
+    case "${status}" in
+    stopped)
+        printf '%s\n' "stopped"
+        ;;
+    "running pid="*)
+        pid="${status#running pid=}"
+        case "${pid}" in
+        '' | 0 | 0* | *[!0-9]*)
+            log_error "addrsyncd returned an invalid running identity"
+            return 1
+            ;;
+        esac
+        printf 'running:%s\n' "${pid}"
+        ;;
+    *)
+        # In particular, `stopped(config invalid: ...)` is not evidence that
+        # the daemon is safely stopped; the config may prevent process lookup.
+        log_error "addrsyncd returned an untrusted status"
+        return 1
+        ;;
+    esac
+}
+
 _start_daemon() {
-    if "${ADDRSYNCD_BIN}" -c "${ADDRSYNCD_CONF_FILE}" -d "${RUN_DIR}" status >/dev/null 2>&1; then
+    local state=""
+    state=$(_daemon_state) || return 1
+
+    case "${state}" in
+    running:*)
         log_info "addrsyncd already running"
         return 0
-    fi
+        ;;
+    stopped) ;;
+    *)
+        log_error "addrsyncd status parser returned an invalid state"
+        return 1
+        ;;
+    esac
 
     "${ADDRSYNCD_BIN}" -c "${ADDRSYNCD_CONF_FILE}" -d "${RUN_DIR}" run --daemon >/dev/null 2>&1
 }
 
 _wait_for_ready() {
-    "${ADDRSYNCD_BIN}" -c "${ADDRSYNCD_CONF_FILE}" -d "${RUN_DIR}" status >/dev/null 2>&1
+    local state=""
+    state=$(_daemon_state) || return 1
+    case "${state}" in
+    running:*) return 0 ;;
+    stopped)
+        log_error "addrsyncd is stopped after startup"
+        return 1
+        ;;
+    *)
+        log_error "addrsyncd status parser returned an invalid state"
+        return 1
+        ;;
+    esac
 }
 
 _stop_daemon() {
-    if ! "${ADDRSYNCD_BIN}" -c "${ADDRSYNCD_CONF_FILE}" -d "${RUN_DIR}" status >/dev/null 2>&1; then
+    local state=""
+    state=$(_daemon_state) || return 1
+    case "${state}" in
+    stopped)
         rm -f "${ADDRSYNCD_PID_FILE}" 2>/dev/null || true
         return 0
-    fi
+        ;;
+    running:*) ;;
+    *)
+        log_error "addrsyncd status parser returned an invalid state"
+        return 1
+        ;;
+    esac
 
     "${ADDRSYNCD_BIN}" -c "${ADDRSYNCD_CONF_FILE}" -d "${RUN_DIR}" stop >/dev/null 2>&1 || return 1
 
     local count=0
     local timeout="${CORE_TIMEOUT:-5}"
-    while "${ADDRSYNCD_BIN}" -c "${ADDRSYNCD_CONF_FILE}" -d "${RUN_DIR}" status >/dev/null 2>&1; do
+    while :; do
+        state=$(_daemon_state) || return 1
+        case "${state}" in
+        stopped)
+            rm -f "${ADDRSYNCD_PID_FILE}" 2>/dev/null || true
+            return 0
+            ;;
+        running:*) ;;
+        *)
+            log_error "addrsyncd status parser returned an invalid state"
+            return 1
+            ;;
+        esac
+
         count=$((count + 1))
         [ "${count}" -lt "${timeout}" ] || {
             log_error "addrsyncd remained running after stop"
@@ -55,8 +131,6 @@ _stop_daemon() {
         }
         sleep 1
     done
-    rm -f "${ADDRSYNCD_PID_FILE}" 2>/dev/null || true
-    return 0
 }
 
 # ==============================================================================
@@ -80,10 +154,21 @@ resync_addrsync() {
 }
 
 status_addrsync() {
-    "${ADDRSYNCD_BIN}" \
-        -c "${ADDRSYNCD_CONF_FILE}" \
-        -d "${RUN_DIR}" \
-        status 2>&1
+    local state=""
+    state=$(_daemon_state) || return 1
+    case "${state}" in
+    running:*)
+        printf 'running pid=%s\n' "${state#running:}"
+        ;;
+    stopped)
+        printf '%s\n' "stopped"
+        return 1
+        ;;
+    *)
+        log_error "addrsyncd status parser returned an invalid state"
+        return 1
+        ;;
+    esac
 }
 
 cleanup_addrsync() {

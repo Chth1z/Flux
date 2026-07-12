@@ -13,6 +13,7 @@ mod control;
 mod network_inventory;
 mod network_route;
 mod network_rule;
+mod rpdb_placement;
 
 pub use address_bypass::{
     AddressBypassInventoryAddressErrorKind, AddressBypassPlan, AddressBypassPlanError,
@@ -60,4 +61,10 @@ pub use network_rule::{
     RulePortRangeErrorKind, RulePrefix, RulePrefixError, RulePrefixErrorKind, RulePriority,
     RuleProperties, RuleProtocol, RuleSuppressInterfaceGroup, RuleSuppressPrefixLength,
     RuleTableId, RuleTunnelId, RuleUidRange, RuleUidRangeError, RuleUidRangeErrorKind,
+};
+pub use rpdb_placement::{
+    DeferredRoutingPrerequisite, RpdbClassifierRevision, RpdbFamilyPlacement,
+    RpdbFamilyPlacementError, RpdbPlacementLease, RpdbPlacementPlanError, RpdbPlacementRequest,
+    RpdbPlacementRequestError, RpdbPriorityRole, RpdbPriorityWindow, RpdbRuleAudit,
+    RpdbRuleAuditError, RpdbRuleClassification, StaleRpdbPlacementLease, plan_rpdb_placement,
 };

@@ -4,12 +4,18 @@ const NETLINK_HEADER_LENGTH: usize = 16;
 const NETLINK_ATTRIBUTE_HEADER_LENGTH: usize = 4;
 const INTERFACE_LINK_MESSAGE_LENGTH: usize = 16;
 const INTERFACE_ADDRESS_MESSAGE_LENGTH: usize = 8;
+const ROUTE_MESSAGE_LENGTH: usize = 12;
+const RULE_MESSAGE_LENGTH: usize = 12;
 const EXTENDED_LINK_MASK_ATTRIBUTE_LENGTH: usize = NETLINK_ATTRIBUTE_HEADER_LENGTH + 4;
 const LINK_DUMP_REQUEST_LENGTH: usize =
     NETLINK_HEADER_LENGTH + INTERFACE_LINK_MESSAGE_LENGTH + EXTENDED_LINK_MASK_ATTRIBUTE_LENGTH;
 const ADDRESS_DUMP_REQUEST_LENGTH: usize = NETLINK_HEADER_LENGTH + INTERFACE_ADDRESS_MESSAGE_LENGTH;
+const ROUTE_DUMP_REQUEST_LENGTH: usize = NETLINK_HEADER_LENGTH + ROUTE_MESSAGE_LENGTH;
+const RULE_DUMP_REQUEST_LENGTH: usize = NETLINK_HEADER_LENGTH + RULE_MESSAGE_LENGTH;
 const RTM_GETLINK: u16 = 18;
 const RTM_GETADDR: u16 = 22;
+const RTM_GETROUTE: u16 = 26;
+const RTM_GETRULE: u16 = 34;
 const NLM_F_REQUEST: u16 = 0x0001;
 const NLM_F_DUMP: u16 = 0x0300;
 const IFLA_EXT_MASK: u16 = 29;
@@ -139,6 +145,56 @@ impl AddressDumpRequest {
     }
 
     pub(crate) const fn as_bytes(&self) -> &[u8; ADDRESS_DUMP_REQUEST_LENGTH] {
+        &self.bytes
+    }
+
+    pub(crate) const fn sequence(&self) -> NonZeroU32 {
+        self.sequence
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RouteDumpRequest {
+    bytes: [u8; ROUTE_DUMP_REQUEST_LENGTH],
+    sequence: NonZeroU32,
+}
+
+impl RouteDumpRequest {
+    pub(crate) fn all(sequence: NonZeroU32) -> Self {
+        let mut bytes = [0; ROUTE_DUMP_REQUEST_LENGTH];
+        bytes[..4].copy_from_slice(&(ROUTE_DUMP_REQUEST_LENGTH as u32).to_ne_bytes());
+        bytes[4..6].copy_from_slice(&RTM_GETROUTE.to_ne_bytes());
+        bytes[6..8].copy_from_slice(&(NLM_F_REQUEST | NLM_F_DUMP).to_ne_bytes());
+        bytes[8..12].copy_from_slice(&sequence.get().to_ne_bytes());
+        Self { bytes, sequence }
+    }
+
+    pub(crate) const fn as_bytes(&self) -> &[u8; ROUTE_DUMP_REQUEST_LENGTH] {
+        &self.bytes
+    }
+
+    pub(crate) const fn sequence(&self) -> NonZeroU32 {
+        self.sequence
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RuleDumpRequest {
+    bytes: [u8; RULE_DUMP_REQUEST_LENGTH],
+    sequence: NonZeroU32,
+}
+
+impl RuleDumpRequest {
+    pub(crate) fn all(sequence: NonZeroU32) -> Self {
+        let mut bytes = [0; RULE_DUMP_REQUEST_LENGTH];
+        bytes[..4].copy_from_slice(&(RULE_DUMP_REQUEST_LENGTH as u32).to_ne_bytes());
+        bytes[4..6].copy_from_slice(&RTM_GETRULE.to_ne_bytes());
+        bytes[6..8].copy_from_slice(&(NLM_F_REQUEST | NLM_F_DUMP).to_ne_bytes());
+        bytes[8..12].copy_from_slice(&sequence.get().to_ne_bytes());
+        Self { bytes, sequence }
+    }
+
+    pub(crate) const fn as_bytes(&self) -> &[u8; RULE_DUMP_REQUEST_LENGTH] {
         &self.bytes
     }
 
@@ -379,8 +435,9 @@ mod implementation {
         MAX_EFFECTIVE_ROUTE_SOCKET_RECEIVE_BUFFER_BYTES, MSG_TRUNC, NetlinkBatchMetadata,
         NetlinkDatagram, NetlinkDatagramMetadata, NetlinkReceiveLoss, NetlinkReceiveOutcome,
         NetlinkSendOutcome, NetlinkSenderAddress, RECEIVE_BATCH_SLOTS, ROUTE_DATAGRAM_CAPACITY,
-        ROUTE_SOCKET_RECEIVE_BUFFER_BYTES, RouteNetlinkSocketEvidence, SOCKADDR_NL_LENGTH,
-        SocketOptionEvidence, classify_batch, route_subscription_groups,
+        ROUTE_SOCKET_RECEIVE_BUFFER_BYTES, RouteDumpRequest, RouteNetlinkSocketEvidence,
+        RuleDumpRequest, SOCKADDR_NL_LENGTH, SocketOptionEvidence, classify_batch,
+        route_subscription_groups,
     };
     use crate::PlatformError;
 
@@ -618,6 +675,20 @@ mod implementation {
             request: &LinkDumpRequest,
         ) -> Result<NetlinkSendOutcome, PlatformError> {
             self.send_dump(request.as_bytes(), "send route-netlink link dump")
+        }
+
+        pub(crate) fn send_route_dump(
+            &self,
+            request: &RouteDumpRequest,
+        ) -> Result<NetlinkSendOutcome, PlatformError> {
+            self.send_dump(request.as_bytes(), "send route-netlink route dump")
+        }
+
+        pub(crate) fn send_rule_dump(
+            &self,
+            request: &RuleDumpRequest,
+        ) -> Result<NetlinkSendOutcome, PlatformError> {
+            self.send_dump(request.as_bytes(), "send route-netlink rule dump")
         }
 
         fn send_dump(
@@ -984,7 +1055,7 @@ mod implementation {
 
         #[test]
         #[ignore = "requires access to the host route-netlink namespace"]
-        fn sequential_link_then_address_dump_uses_one_socket_and_ring() {
+        fn sequential_link_address_route_and_rule_dumps_use_one_socket_and_ring() {
             let socket = match RouteNetlinkSocket::open() {
                 Ok(socket) => socket,
                 Err(PlatformError::SystemCall { source, .. })
@@ -997,8 +1068,12 @@ mod implementation {
             let mut ring = NetlinkReceiveRing::new();
             let link_sequence = NonZeroU32::new(0x1020_3040).unwrap();
             let address_sequence = NonZeroU32::new(0x1020_3041).unwrap();
+            let route_sequence = NonZeroU32::new(0x1020_3042).unwrap();
+            let rule_sequence = NonZeroU32::new(0x1020_3043).unwrap();
             let link_request = LinkDumpRequest::all(link_sequence);
             let address_request = AddressDumpRequest::all(address_sequence);
+            let route_request = RouteDumpRequest::all(route_sequence);
+            let rule_request = RuleDumpRequest::all(rule_sequence);
             let mut maximum_datagram_length = 0;
 
             send_dump_and_wait_for_matching_done(
@@ -1016,6 +1091,22 @@ mod implementation {
                 "address dump",
                 &mut maximum_datagram_length,
                 || socket.send_address_dump(&address_request),
+            );
+            send_dump_and_wait_for_matching_done(
+                &socket,
+                &mut ring,
+                route_sequence,
+                "route dump",
+                &mut maximum_datagram_length,
+                || socket.send_route_dump(&route_request),
+            );
+            send_dump_and_wait_for_matching_done(
+                &socket,
+                &mut ring,
+                rule_sequence,
+                "rule dump",
+                &mut maximum_datagram_length,
+                || socket.send_rule_dump(&rule_request),
             );
 
             assert!(maximum_datagram_length > 0);
@@ -1173,7 +1264,8 @@ mod implementation {
 
     use super::{
         AddressDumpRequest, LinkDumpRequest, NetlinkDatagram, NetlinkDatagramMetadata,
-        NetlinkReceiveOutcome, NetlinkSendOutcome, RouteNetlinkSocketEvidence,
+        NetlinkReceiveOutcome, NetlinkSendOutcome, RouteDumpRequest, RouteNetlinkSocketEvidence,
+        RuleDumpRequest,
     };
     use crate::PlatformError;
 
@@ -1231,6 +1323,20 @@ mod implementation {
         pub(crate) fn send_link_dump(
             &self,
             _request: &LinkDumpRequest,
+        ) -> Result<NetlinkSendOutcome, PlatformError> {
+            Err(PlatformError::UnsupportedPlatform(std::env::consts::OS))
+        }
+
+        pub(crate) fn send_route_dump(
+            &self,
+            _request: &RouteDumpRequest,
+        ) -> Result<NetlinkSendOutcome, PlatformError> {
+            Err(PlatformError::UnsupportedPlatform(std::env::consts::OS))
+        }
+
+        pub(crate) fn send_rule_dump(
+            &self,
+            _request: &RuleDumpRequest,
         ) -> Result<NetlinkSendOutcome, PlatformError> {
             Err(PlatformError::UnsupportedPlatform(std::env::consts::OS))
         }
@@ -1300,6 +1406,66 @@ mod tests {
             0x00, 0x00, 0x00, 0x00, // kernel-selected port id
             0x00, 0x00, 0x00, 0x00, // AF_UNSPEC + zeroed ifaddrmsg
             0x00, 0x00, 0x00, 0x00,
+        ];
+
+        assert_eq!(all.as_bytes(), &expected_all);
+        assert_eq!(all.sequence(), sequence);
+    }
+
+    #[test]
+    fn route_dump_builder_emits_exact_af_unspec_rtm_getroute_request() {
+        let sequence = NonZeroU32::new(0x0102_0304).unwrap();
+        let all = RouteDumpRequest::all(sequence);
+
+        #[cfg(target_endian = "little")]
+        let expected_all = [
+            0x1c, 0x00, 0x00, 0x00, // nlmsg_len
+            0x1a, 0x00, // RTM_GETROUTE
+            0x01, 0x03, // NLM_F_REQUEST | NLM_F_DUMP
+            0x04, 0x03, 0x02, 0x01, // sequence
+            0x00, 0x00, 0x00, 0x00, // kernel-selected port id
+            0x00, 0x00, 0x00, 0x00, // AF_UNSPEC + zeroed rtmsg
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        #[cfg(target_endian = "big")]
+        let expected_all = [
+            0x00, 0x00, 0x00, 0x1c, // nlmsg_len
+            0x00, 0x1a, // RTM_GETROUTE
+            0x03, 0x01, // NLM_F_REQUEST | NLM_F_DUMP
+            0x01, 0x02, 0x03, 0x04, // sequence
+            0x00, 0x00, 0x00, 0x00, // kernel-selected port id
+            0x00, 0x00, 0x00, 0x00, // AF_UNSPEC + zeroed rtmsg
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+
+        assert_eq!(all.as_bytes(), &expected_all);
+        assert_eq!(all.sequence(), sequence);
+    }
+
+    #[test]
+    fn rule_dump_builder_emits_exact_af_unspec_rtm_getrule_request() {
+        let sequence = NonZeroU32::new(0x0102_0304).unwrap();
+        let all = RuleDumpRequest::all(sequence);
+
+        #[cfg(target_endian = "little")]
+        let expected_all = [
+            0x1c, 0x00, 0x00, 0x00, // nlmsg_len
+            0x22, 0x00, // RTM_GETRULE
+            0x01, 0x03, // NLM_F_REQUEST | NLM_F_DUMP
+            0x04, 0x03, 0x02, 0x01, // sequence
+            0x00, 0x00, 0x00, 0x00, // kernel-selected port id
+            0x00, 0x00, 0x00, 0x00, // AF_UNSPEC + zeroed fib_rule_hdr
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        #[cfg(target_endian = "big")]
+        let expected_all = [
+            0x00, 0x00, 0x00, 0x1c, // nlmsg_len
+            0x00, 0x22, // RTM_GETRULE
+            0x03, 0x01, // NLM_F_REQUEST | NLM_F_DUMP
+            0x01, 0x02, 0x03, 0x04, // sequence
+            0x00, 0x00, 0x00, 0x00, // kernel-selected port id
+            0x00, 0x00, 0x00, 0x00, // AF_UNSPEC + zeroed fib_rule_hdr
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         ];
 
         assert_eq!(all.as_bytes(), &expected_all);

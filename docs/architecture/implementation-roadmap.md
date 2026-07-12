@@ -101,6 +101,8 @@ The rule foundation adds canonical IPv4/IPv6 policy-rule facts and a strict priv
 
 This rule layer also remains outside the runtime inventory and transport. Canonical rules are semantic projections rather than exact deletion identities, and a future snapshot must retain dump order and multiplicity because equal-priority and duplicate rules are valid. Exact `GETROUTE`/`GETRULE` requests, atomic LINK/ADDRESS/ROUTE/RULE publication, kernel rule identity, and native policy-routing mutation remain pending; runtime publication is still LINK/ADDRESS-only.
 
+The transport foundation now adds byte-exact `AF_UNSPEC RTM_GETROUTE` and `RTM_GETRULE` dump requests plus nonblocking send paths on the already subscribed route-netlink socket. Both requests use a zeroed 12-byte family header, unique nonzero sequences, strict `NLM_F_REQUEST | NLM_F_DUMP` framing, and no filter attributes. Endian-specific fixtures and a sequential real-kernel LINK→ADDRESS→ROUTE→RULE smoke verify that all four transactions can share one socket and receive ring without overlapping dumps. The observer and driver do not issue the new requests yet, so atomic publication, route/rule race replay, and runtime inventory expansion remain the next checkpoint.
+
 ### Deliverables
 
 - Reimplement the required `addrsyncd` netlink behavior behind private `flux-platform` modules; do not expose raw rtnetlink framing as the product Interface. Resolve the standalone subproject's `UNLICENSED` provenance before copying source text into the GPL workspace.

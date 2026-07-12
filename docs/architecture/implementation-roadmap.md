@@ -16,7 +16,7 @@ This roadmap turns the [blueprint](fluxd-blueprint.md) and [technical specificat
 The next checkpoint is not a single linear Phase 3 task. Three bounded lanes may proceed in parallel,
 but correctness gates retain strict ordering:
 
-1. **Bridge safety:** the `100.64.0.0/10`, mandatory-exclusion, empty allow/deny, TUN-rejection, and converged-`addrsyncd` readiness checkpoints are complete. Next, add functional capture canaries and repair legacy status/migration and package provenance; retain the TUN rejection until one exact routing owner passes readback and forced-death cleanup canaries.
+1. **Bridge safety:** the `100.64.0.0/10`, mandatory-exclusion, empty allow/deny, TUN-rejection, and converged-`addrsyncd` readiness checkpoints are complete. Next, implement the [Generation-scoped functional capture canary](functional-capture-canary.md) and repair legacy status/migration and package provenance; retain the TUN rejection until one exact routing owner passes readback and forced-death cleanup canaries.
 2. **Native Phase 3 correctness:** add exact device/artifact identity; select positive mark policies from a compile-time reviewed stable artifact catalog and then bind them to boot/namespace freshness; complete the remaining 24 census cells and point-in-time coordinator; prove writer semantics, observer continuity, mark preservation, domain/network-selection handoff, and route reachability; only then allocate priorities/tables/marks or mutate the kernel.
 3. **Optional eBPF research:** implement the exact `xt_bpf` probe and observation design without delaying the first two lanes. Positive acceleration waits for the Rust xtables compiler, a complete conventional classifier, parity evidence, and device benchmarks.
 
@@ -91,7 +91,7 @@ Shell phase scripts remain the only networking-state writer. Rust owns Sing-Box 
 - The bridge emits RFC 6598 as `100.64.0.0/10`, keeps mandatory loop/device-local exclusions separate from configurable direct defaults, and has golden fixtures for both.
 - Empty application allowlist proxies zero otherwise eligible applications; empty denylist proxies all otherwise eligible applications.
 - The Rust-owned Phase 1 bridge reports TUN unsupported. Re-enabling it requires an exact-device single routing owner plus forced-death cleanup/readback evidence; it must never activate the current Sing-Box automation together with Flux's TPROXY-specific PBR.
-- `addrsyncd` readiness requires initial dump/cleanup/apply/readback convergence, and `RUNNING` requires Generation-scoped functional capture and loop-prevention canaries rather than structural files alone.
+- `addrsyncd` readiness requires initial dump/cleanup/apply/readback convergence, and `RUNNING` requires the [Generation-scoped functional capture and loop-prevention canary](functional-capture-canary.md) rather than structural files alone.
 
 ## Phase 2 — Configuration and Generation Compiler
 

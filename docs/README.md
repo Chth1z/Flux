@@ -5,6 +5,7 @@
 - [Fluxd rewrite blueprint](architecture/fluxd-blueprint.md) — recommended architecture and design decisions.
 - [Technical specification](architecture/fluxd-technical-specification.md) — types, protocols, probes, transactions, backend behavior, and packaging contract.
 - [Implementation roadmap](architecture/implementation-roadmap.md) — phased migration and verification gates.
+- [Functional capture canary](architecture/functional-capture-canary.md) — Generation-scoped TCP, UDP, DNS, and loop-escape verification contract.
 - [Controller interface comparison](architecture/interface-comparison.md) — three alternative Interfaces and the selected hybrid.
 - [Domain language](../CONTEXT.md) — canonical project terms.
 - [Development and build workflow](development.md) — pinned Rust/Android toolchains and verification commands.

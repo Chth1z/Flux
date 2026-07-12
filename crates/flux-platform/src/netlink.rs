@@ -20,6 +20,10 @@ pub(crate) mod link;
 #[allow(dead_code)]
 pub(crate) mod route;
 
+// Raw rule framing stays private to the platform Adapter pending combined-observer integration.
+#[allow(dead_code)]
+pub(crate) mod rule;
+
 // Socket ownership and dump sequencing stay private to the platform Adapter.
 #[allow(dead_code)]
 pub(crate) mod socket;

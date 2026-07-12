@@ -11,6 +11,7 @@ mod config;
 mod control;
 mod network_inventory;
 mod network_route;
+mod network_rule;
 
 pub use capability::{
     BootIdentity, BootIdentityMutationStatus, CAPABILITY_PROFILE_SCHEMA_VERSION, CapabilityProfile,
@@ -43,4 +44,11 @@ pub use network_route::{
     RouteFlags, RouteGateway, RouteNexthop, RouteNexthopFlags, RoutePath, RoutePreference,
     RoutePrefix, RoutePrefixError, RoutePrefixErrorKind, RouteProperties, RouteProtocol,
     RouteScope, RouteTableId, RouteType,
+};
+pub use network_rule::{
+    NetworkRuleRecord, NetworkRuleRecordError, NetworkRuleRecordErrorKind, RuleAction, RuleFlags,
+    RuleFlowId, RuleFwMark, RuleIpProtocol, RulePortRange, RulePortRangeError,
+    RulePortRangeErrorKind, RulePrefix, RulePrefixError, RulePrefixErrorKind, RulePriority,
+    RuleProperties, RuleProtocol, RuleSuppressInterfaceGroup, RuleSuppressPrefixLength,
+    RuleTableId, RuleTunnelId, RuleUidRange, RuleUidRangeError, RuleUidRangeErrorKind,
 };

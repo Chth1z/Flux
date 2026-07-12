@@ -25,9 +25,19 @@ jobs:
         run: >-
           bash -n customize.sh flux_service.sh scripts/dispatcher
           scripts/fluxctl scripts/lib scripts/flux-event scripts/rules
-          tests/shell/rules_generation.sh
+          tests/shell/rules_generation.sh tests/shell/run-dispatcher-tests.sh
       - name: Test legacy rule generation semantics
         run: sh tests/shell/rules_generation.sh
+      - name: Ensure bubblewrap is available
+        run: |
+          if ! command -v bwrap >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install --yes --no-install-recommends bubblewrap
+          fi
+      - name: Test Rust-owned dispatcher bridge
+        run: >-
+          sudo env "PATH=${PATH}" FLUX_DISPATCHER_TESTS_REQUIRED=1
+          sh tests/shell/run-dispatcher-tests.sh
       - name: Check legacy addrsyncd compatibility
         run: |
           cargo test --manifest-path addrsyncd/Cargo.toml

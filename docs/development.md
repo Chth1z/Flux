@@ -46,6 +46,14 @@ cargo check --manifest-path addrsyncd/Cargo.toml --target aarch64-linux-android 
 
 Its bridge reconciliation reads canonical kernel rule dumps and preserves duplicate observations instead of relying only on in-memory ownership tracking. `run --daemon` is now a bounded convergence handshake: readiness follows startup cleanup, reconcile/apply, two clean readbacks, and a final drain of the subscribed route socket to `EAGAIN`. Loss or ambiguous framing forces reconciliation, and parent-side readiness failures terminate and reap the child.
 
+The full Rust-owned dispatcher lifecycle suite runs in an isolated Bubblewrap root:
+
+```text
+sh tests/shell/run-dispatcher-tests.sh
+```
+
+Local hosts without Bubblewrap report a skip. CI sets `FLUX_DISPATCHER_TESTS_REQUIRED=1`, making an unavailable or prohibited Bubblewrap environment a failure.
+
 Host execution of `addrsyncd` requires Linux or Android. On Windows, use the Android cross-check and run its host tests in Linux CI.
 
 ## Android release build

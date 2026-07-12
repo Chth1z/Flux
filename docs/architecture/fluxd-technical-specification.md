@@ -579,6 +579,8 @@ For each enabled family:
 
 Rule priority is allocated only after parsing the Android RPDB. With `respect_android_vpn = true`, the selected placement must preserve secure/lockdown VPN and per-UID network selection. A fixed legacy priority such as `2025` is not accepted without a proven device-specific policy.
 
+Implementation checkpoint: `flux-core` now has a mutation-free address-bypass planner. It consumes one complete `NetworkInventory` plus an explicit caller-resolved per-family priority, lookup-table, and rule-protocol specification; it does not allocate those values or claim that numeric placement alone preserves Android VPN policy. The planner filters unusable, disabled-family, flag-matched, exact-address, and CIDR-matched facts; normalizes valid IPv4-mapped inputs; rejects mapped prefixes crossing the mapping boundary; deduplicates addresses across interfaces; and emits deterministic `/32` or `/128` destination-host intents under a fixed rule-count budget. The result is bound to both the source `NetworkEpoch` and an opaque process-local snapshot identity so an equal epoch from another observer cannot authorize later work. Selected-priority occupancy is audited against the ordered rule multiset with bounded diagnostics. Even an exact canonical `NetworkRuleRecord` remains an unowned conflict: canonical equality is not journal/raw ownership evidence, so adoption, retirement, native encoding, and cleanup remain deferred.
+
 ### 11.2 Network events
 
 Subscribe to link, IPv4/IPv6 address, route, and rule groups required by the active plan. Use sequence-aware dump reconciliation after startup, overrun, receive truncation, or suspected event loss.

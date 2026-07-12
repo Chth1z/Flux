@@ -3,9 +3,12 @@ use std::fmt;
 use std::net::IpAddr;
 use std::num::{NonZeroU32, NonZeroU64};
 use std::ops::{BitOr, BitOrAssign};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::network_route::NetworkRouteRecord;
 use crate::network_rule::NetworkRuleRecord;
+
+static NEXT_NETWORK_INVENTORY_SNAPSHOT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(transparent)]
@@ -33,6 +36,21 @@ impl NetworkEpoch {
             Some(value) => Self::new(value),
             None => None,
         }
+    }
+}
+
+/// Opaque process-local identity for one materially distinct inventory snapshot.
+///
+/// Unlike `NetworkEpoch`, this value does not restart at one for each independent tracker. It lets
+/// in-process plans reject an unrelated snapshot that happens to carry the same epoch counter.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(transparent)]
+pub struct NetworkInventorySnapshotId(NonZeroU64);
+
+impl NetworkInventorySnapshotId {
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0.get()
     }
 }
 
@@ -466,6 +484,7 @@ impl Error for InterfaceAddressRecordError {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NetworkInventory {
+    snapshot_id: NetworkInventorySnapshotId,
     epoch: NetworkEpoch,
     links: Box<[InterfaceLinkRecord]>,
     addresses: Box<[InterfaceAddressRecord]>,
@@ -474,6 +493,11 @@ pub struct NetworkInventory {
 }
 
 impl NetworkInventory {
+    #[must_use]
+    pub const fn snapshot_id(&self) -> NetworkInventorySnapshotId {
+        self.snapshot_id
+    }
+
     #[must_use]
     pub const fn epoch(&self) -> NetworkEpoch {
         self.epoch
@@ -588,6 +612,7 @@ pub enum NetworkInventoryError {
     ConflictingInterfaceName(InterfaceNameConflict),
     ConflictingAddressFlags(AddressFlagConflict),
     EpochExhausted,
+    SnapshotIdExhausted,
 }
 
 impl fmt::Display for NetworkInventoryError {
@@ -615,6 +640,9 @@ impl fmt::Display for NetworkInventoryError {
                 conflict.second_flags.bits()
             ),
             Self::EpochExhausted => formatter.write_str("network inventory epoch is exhausted"),
+            Self::SnapshotIdExhausted => {
+                formatter.write_str("network inventory snapshot identity is exhausted")
+            }
         }
     }
 }
@@ -676,7 +704,9 @@ impl NetworkInventoryTracker {
                 .ok_or(NetworkInventoryError::EpochExhausted)?,
             None => NetworkEpoch::INITIAL,
         };
+        let snapshot_id = allocate_snapshot_id()?;
         self.current = Some(NetworkInventory {
+            snapshot_id,
             epoch,
             links,
             addresses,
@@ -688,6 +718,17 @@ impl NetworkInventoryTracker {
             .as_ref()
             .expect("published inventory is present"))
     }
+}
+
+fn allocate_snapshot_id() -> Result<NetworkInventorySnapshotId, NetworkInventoryError> {
+    let value = NEXT_NETWORK_INVENTORY_SNAPSHOT_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .map_err(|_| NetworkInventoryError::SnapshotIdExhausted)?;
+    Ok(NetworkInventorySnapshotId(
+        NonZeroU64::new(value).expect("snapshot identity counter starts nonzero"),
+    ))
 }
 
 fn canonicalize_complete_links(

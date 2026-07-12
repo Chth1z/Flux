@@ -156,6 +156,8 @@ fn complete_publications_are_order_independent_and_deduplicate_exact_records() {
     assert_eq!(left.addresses(), &[first, second]);
     assert_eq!(right.addresses(), &[first, second]);
     assert!(!left.materially_differs_from(right));
+    assert_ne!(left.snapshot_id(), right.snapshot_id());
+    assert_eq!(left.epoch(), right.epoch());
 
     let mut link_changed_tracker = NetworkInventoryTracker::new();
     let link_changed = link_changed_tracker
@@ -190,6 +192,7 @@ fn routing_publications_preserve_order_multiplicity_and_epoch_semantics() {
         .publish_complete_with_routing([link.clone()], [address], routes.clone(), rules.clone())
         .expect("complete routed inventory");
     let initial_pointer = std::ptr::from_ref(initial);
+    let initial_snapshot_id = initial.snapshot_id();
     let initial_epoch = initial.epoch();
     assert_eq!(initial.routes(), &routes);
     assert_eq!(initial.rules(), &rules);
@@ -198,6 +201,7 @@ fn routing_publications_preserve_order_multiplicity_and_epoch_semantics() {
         .publish_complete_with_routing([link.clone()], [address], routes.clone(), rules.clone())
         .expect("unchanged routed inventory");
     assert_eq!(std::ptr::from_ref(unchanged), initial_pointer);
+    assert_eq!(unchanged.snapshot_id(), initial_snapshot_id);
     assert_eq!(unchanged.epoch(), initial_epoch);
 
     let reordered = tracker
@@ -209,6 +213,7 @@ fn routing_publications_preserve_order_multiplicity_and_epoch_semantics() {
         )
         .expect("order-only route change");
     assert_eq!(reordered.epoch(), initial_epoch.checked_next().unwrap());
+    assert_ne!(reordered.snapshot_id(), initial_snapshot_id);
 
     let mut legacy = NetworkInventoryTracker::new();
     let legacy = legacy

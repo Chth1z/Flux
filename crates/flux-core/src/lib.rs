@@ -6,6 +6,7 @@
 //! configuration and control APIs keep validation, bounded state, and
 //! mutation intent explicit at their domain boundaries.
 
+mod address_bypass;
 mod capability;
 mod config;
 mod control;
@@ -13,6 +14,14 @@ mod network_inventory;
 mod network_route;
 mod network_rule;
 
+pub use address_bypass::{
+    AddressBypassInventoryAddressErrorKind, AddressBypassPlan, AddressBypassPlanError,
+    AddressBypassPolicy, AddressBypassPrefix, AddressBypassPrefixError,
+    AddressBypassPrefixErrorKind, AddressBypassRoutingSpec, AddressBypassRoutingSpecError,
+    AddressBypassRoutingSpecErrorKind, AddressBypassRuleBudget, AddressBypassRuleConflict,
+    AddressBypassRuleConflictKind, AddressBypassRuleIntent, MAX_ADDRESS_BYPASS_CONFLICTS,
+    MAX_ADDRESS_BYPASS_RULES, StaleAddressBypassPlan, plan_address_bypass,
+};
 pub use capability::{
     BootIdentity, BootIdentityMutationStatus, CAPABILITY_PROFILE_SCHEMA_VERSION, CapabilityProfile,
     CapabilityProfileRevision, CapabilityProfileSource, KernelFacts, KernelMutationStatus,
@@ -37,7 +46,7 @@ pub use network_inventory::{
     InterfaceAddressRecordErrorKind, InterfaceHardwareType, InterfaceIndex, InterfaceLinkConflict,
     InterfaceLinkFlags, InterfaceLinkKind, InterfaceLinkRecord, InterfaceName,
     InterfaceNameConflict, InterfaceOperationalState, NetworkEpoch, NetworkInventory,
-    NetworkInventoryError, NetworkInventoryTracker,
+    NetworkInventoryError, NetworkInventorySnapshotId, NetworkInventoryTracker,
 };
 pub use network_route::{
     NetworkAddressFamily, NetworkRouteRecord, NetworkRouteRecordError, NetworkRouteRecordErrorKind,

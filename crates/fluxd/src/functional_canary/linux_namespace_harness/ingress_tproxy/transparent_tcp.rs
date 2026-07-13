@@ -138,7 +138,11 @@ pub(super) fn socket_mark(stream: &TcpStream) -> Result<u32, String> {
     get_u32_option(stream.as_raw_fd(), libc::SOL_SOCKET, libc::SO_MARK)
 }
 
-fn socket_owned(domain: i32, socket_type: i32, protocol: i32) -> Result<OwnedFd, String> {
+pub(super) fn socket_owned(
+    domain: i32,
+    socket_type: i32,
+    protocol: i32,
+) -> Result<OwnedFd, String> {
     // SAFETY: `socket` receives only integer constants and returns a new descriptor on success.
     let raw_fd = unsafe { libc::socket(domain, socket_type, protocol) };
     if raw_fd < 0 {
@@ -151,7 +155,7 @@ fn socket_owned(domain: i32, socket_type: i32, protocol: i32) -> Result<OwnedFd,
     Ok(unsafe { OwnedFd::from_raw_fd(raw_fd) })
 }
 
-fn set_i32_option(fd: RawFd, level: i32, name: i32, value: i32) -> Result<(), String> {
+pub(super) fn set_i32_option(fd: RawFd, level: i32, name: i32, value: i32) -> Result<(), String> {
     let length = libc::socklen_t::try_from(size_of::<i32>())
         .map_err(|_| "i32 socket-option length does not fit socklen_t".to_owned())?;
     // SAFETY: `value` is initialized, `length` matches it, and `setsockopt` does not retain the
@@ -168,7 +172,7 @@ fn set_i32_option(fd: RawFd, level: i32, name: i32, value: i32) -> Result<(), St
     }
 }
 
-fn set_u32_option(fd: RawFd, level: i32, name: i32, value: u32) -> Result<(), String> {
+pub(super) fn set_u32_option(fd: RawFd, level: i32, name: i32, value: u32) -> Result<(), String> {
     let length = libc::socklen_t::try_from(size_of::<u32>())
         .map_err(|_| "u32 socket-option length does not fit socklen_t".to_owned())?;
     // SAFETY: `value` is initialized, `length` matches it, and `setsockopt` does not retain the
@@ -185,7 +189,7 @@ fn set_u32_option(fd: RawFd, level: i32, name: i32, value: u32) -> Result<(), St
     }
 }
 
-fn get_i32_option(fd: RawFd, level: i32, name: i32) -> Result<i32, String> {
+pub(super) fn get_i32_option(fd: RawFd, level: i32, name: i32) -> Result<i32, String> {
     let mut value = 0_i32;
     let mut length = libc::socklen_t::try_from(size_of::<i32>())
         .map_err(|_| "i32 socket-option length does not fit socklen_t".to_owned())?;
@@ -215,7 +219,7 @@ fn get_i32_option(fd: RawFd, level: i32, name: i32) -> Result<i32, String> {
     Ok(value)
 }
 
-fn get_u32_option(fd: RawFd, level: i32, name: i32) -> Result<u32, String> {
+pub(super) fn get_u32_option(fd: RawFd, level: i32, name: i32) -> Result<u32, String> {
     let mut value = 0_u32;
     let mut length = libc::socklen_t::try_from(size_of::<u32>())
         .map_err(|_| "u32 socket-option length does not fit socklen_t".to_owned())?;
@@ -245,7 +249,7 @@ fn get_u32_option(fd: RawFd, level: i32, name: i32) -> Result<u32, String> {
     Ok(value)
 }
 
-fn bind_fd(fd: RawFd, address: SocketAddr) -> Result<(), String> {
+pub(super) fn bind_fd(fd: RawFd, address: SocketAddr) -> Result<(), String> {
     let result = match address {
         SocketAddr::V4(address) => {
             let raw = sockaddr_in(address.ip(), address.port());
@@ -279,7 +283,7 @@ fn bind_fd(fd: RawFd, address: SocketAddr) -> Result<(), String> {
     }
 }
 
-fn connect_fd(fd: RawFd, address: SocketAddr, timeout: Duration) -> Result<(), String> {
+pub(super) fn connect_fd(fd: RawFd, address: SocketAddr, timeout: Duration) -> Result<(), String> {
     let result = match address {
         SocketAddr::V4(address) => {
             let raw = sockaddr_in(address.ip(), address.port());

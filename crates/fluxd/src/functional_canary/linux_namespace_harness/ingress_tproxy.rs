@@ -1,7 +1,7 @@
 //! Privileged ingress-only TPROXY checkpoint.
 //!
 //! This test proves that traffic arriving from a dedicated probe namespace traverses an exact
-//! mangle/PREROUTING TPROXY selector, reaches transparent dual-stack TCP listeners with the
+//! mangle/PREROUTING TPROXY selectors, reaches transparent dual-stack TCP/UDP listeners with the
 //! original destination intact, and leaves through sockets carrying a test-owned bypass mark.
 //! It deliberately does not classify local OUTPUT marking as TPROXY traversal and does not
 //! construct production `UnqualifiedCanaryGateEvidence`.
@@ -10,8 +10,15 @@ use super::*;
 use serde_json::Value;
 
 mod transparent_tcp;
+mod transparent_udp;
 
-use transparent_tcp::{TransparentTcpListener, connect_marked, socket_mark};
+use transparent_tcp::{
+    TransparentTcpListener, connect_marked as connect_marked_tcp, socket_mark as tcp_socket_mark,
+};
+use transparent_udp::{
+    TransparentUdpListener, connect_marked as connect_marked_udp,
+    connect_transparent_marked as connect_transparent_marked_udp, socket_mark as udp_socket_mark,
+};
 
 const TEST_NAME: &str = "functional_canary::linux_namespace_harness::privileged_ingress_tproxy_checkpoint_exercises_real_capture_counters_and_cleanup";
 const MODE_PREFLIGHT: &str = "tproxy-preflight";
@@ -28,6 +35,7 @@ const RELAY_ORIGIN_BIT: u32 = 0x0000_0080;
 const RELAY_BYPASS_MARK: u32 = RELAY_ORIGIN_BIT | 0x0000_0002;
 const ROUTE_PROTOCOL: u32 = 99;
 const TCP_CAPTURE_MAXIMUM: u64 = 64;
+const UDP_ECHO_PACKET_COUNT: u64 = 1;
 
 pub(super) fn run() {
     let result = match env::var(MODE_ENV).as_deref() {
@@ -108,17 +116,28 @@ fn run_preflight() -> Result<(), String> {
     require_preexisting_xtables_support()?;
     command("ip", &["link", "set", "dev", "lo", "up"])?;
 
-    let ipv4 = TransparentTcpListener::bind(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 41_090)?;
-    let ipv6 = TransparentTcpListener::bind(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 41_090)?;
-    if ipv4.transparent_readback() != 1
-        || ipv6.transparent_readback() != 1
-        || ipv6.ipv6_only_readback() != Some(1)
+    let ipv4_tcp = TransparentTcpListener::bind(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 41_090)?;
+    let ipv6_tcp = TransparentTcpListener::bind(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 41_090)?;
+    let ipv4_udp =
+        TransparentUdpListener::bind(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 41_090, IO_TIMEOUT)?;
+    let ipv6_udp =
+        TransparentUdpListener::bind(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 41_090, IO_TIMEOUT)?;
+    if ipv4_tcp.transparent_readback() != 1
+        || ipv6_tcp.transparent_readback() != 1
+        || ipv6_tcp.ipv6_only_readback() != Some(1)
+        || ipv4_udp.transparent_readback() != 1
+        || ipv6_udp.transparent_readback() != 1
+        || ipv4_udp.receive_original_destination_readback() != 1
+        || ipv6_udp.receive_original_destination_readback() != 1
+        || ipv6_udp.ipv6_only_readback() != Some(1)
     {
         return Err("transparent listener preflight readback mismatch".to_owned());
     }
 
     preflight_marked_connect(IpAddr::V4(Ipv4Addr::LOCALHOST))?;
     preflight_marked_connect(IpAddr::V6(Ipv6Addr::LOCALHOST))?;
+    preflight_marked_udp_connect(IpAddr::V4(Ipv4Addr::LOCALHOST))?;
+    preflight_marked_udp_connect(IpAddr::V6(Ipv6Addr::LOCALHOST))?;
 
     for (program, chain, on_ip, source, destination) in [
         (
@@ -137,56 +156,36 @@ fn run_preflight() -> Result<(), String> {
         ),
     ] {
         command(program, &["-t", "mangle", "-N", chain])?;
-        command(
-            program,
-            &[
+        for protocol in ["tcp", "udp"] {
+            command(
+                program,
+                &[
+                    "-t",
+                    "mangle",
+                    "-A",
+                    chain,
+                    "-p",
+                    protocol,
+                    "-m",
+                    "comment",
+                    "--comment",
+                    "flux-tproxy-preflight",
+                    "-j",
+                    "TPROXY",
+                    "--on-ip",
+                    on_ip,
+                    "--on-port",
+                    "41090",
+                    "--tproxy-mark",
+                    "0x1/0xf",
+                ],
+            )?;
+            let hook = [
                 "-t",
                 "mangle",
-                "-A",
-                chain,
-                "-p",
-                "tcp",
-                "-m",
-                "comment",
-                "--comment",
-                "flux-tproxy-preflight",
-                "-j",
-                "TPROXY",
-                "--on-ip",
-                on_ip,
-                "--on-port",
-                "41090",
-                "--tproxy-mark",
-                "0x1/0xf",
-            ],
-        )?;
-        let hook = [
-            "-t",
-            "mangle",
-            "-I",
-            "PREROUTING",
-            "1",
-            "-i",
-            "lo",
-            "-s",
-            source,
-            "-d",
-            destination,
-            "-p",
-            "tcp",
-            "--dport",
-            "9",
-            "-j",
-            chain,
-        ];
-        command(program, &hook)?;
-        command(
-            program,
-            &[
-                "-t",
-                "mangle",
-                "-D",
+                "-I",
                 "PREROUTING",
+                "1",
                 "-i",
                 "lo",
                 "-s",
@@ -194,13 +193,35 @@ fn run_preflight() -> Result<(), String> {
                 "-d",
                 destination,
                 "-p",
-                "tcp",
+                protocol,
                 "--dport",
                 "9",
                 "-j",
                 chain,
-            ],
-        )?;
+            ];
+            command(program, &hook)?;
+            command(
+                program,
+                &[
+                    "-t",
+                    "mangle",
+                    "-D",
+                    "PREROUTING",
+                    "-i",
+                    "lo",
+                    "-s",
+                    source,
+                    "-d",
+                    destination,
+                    "-p",
+                    protocol,
+                    "--dport",
+                    "9",
+                    "-j",
+                    chain,
+                ],
+            )?;
+        }
         command(program, &["-t", "mangle", "-F", chain])?;
         command(program, &["-t", "mangle", "-X", chain])?;
     }
@@ -346,8 +367,8 @@ fn preflight_marked_connect(ip: IpAddr) -> Result<(), String> {
         .map_err(|error| format!("read marked-connect preflight listener tuple: {error}"))?;
     let acceptor = thread::spawn(move || listener.accept().map(|_| ()));
     let source = SocketAddr::new(ip, 0);
-    let (stream, mark) = connect_marked(source, destination, RELAY_BYPASS_MARK, IO_TIMEOUT)?;
-    if mark != RELAY_BYPASS_MARK || socket_mark(&stream)? != RELAY_BYPASS_MARK {
+    let (stream, mark) = connect_marked_tcp(source, destination, RELAY_BYPASS_MARK, IO_TIMEOUT)?;
+    if mark != RELAY_BYPASS_MARK || tcp_socket_mark(&stream)? != RELAY_BYPASS_MARK {
         return Err("SO_MARK preflight readback mismatch".to_owned());
     }
     drop(stream);
@@ -355,6 +376,46 @@ fn preflight_marked_connect(ip: IpAddr) -> Result<(), String> {
         .join()
         .map_err(|_| "marked-connect preflight acceptor panicked".to_owned())?
         .map_err(|error| format!("accept marked-connect preflight: {error}"))
+}
+
+fn preflight_marked_udp_connect(ip: IpAddr) -> Result<(), String> {
+    let peer = UdpSocket::bind(SocketAddr::new(ip, 0))
+        .map_err(|error| format!("bind marked UDP preflight peer on {ip}: {error}"))?;
+    peer.set_read_timeout(Some(IO_TIMEOUT))
+        .map_err(|error| format!("set marked UDP preflight peer timeout: {error}"))?;
+    let destination = peer
+        .local_addr()
+        .map_err(|error| format!("read marked UDP preflight peer tuple: {error}"))?;
+    let (socket, mark) = connect_marked_udp(
+        SocketAddr::new(ip, 0),
+        destination,
+        RELAY_BYPASS_MARK,
+        IO_TIMEOUT,
+    )?;
+    if mark != RELAY_BYPASS_MARK || udp_socket_mark(&socket)? != RELAY_BYPASS_MARK {
+        return Err("UDP SO_MARK preflight readback mismatch".to_owned());
+    }
+    let request = b"flux-tproxy-udp-preflight";
+    if socket
+        .send(request)
+        .map_err(|error| format!("send marked UDP preflight datagram: {error}"))?
+        != request.len()
+    {
+        return Err("marked UDP preflight sent a partial datagram".to_owned());
+    }
+    let mut buffer = [0_u8; 64];
+    let (length, remote) = peer
+        .recv_from(&mut buffer)
+        .map_err(|error| format!("receive marked UDP preflight datagram: {error}"))?;
+    if &buffer[..length] != request
+        || remote
+            != socket
+                .local_addr()
+                .map_err(|error| format!("read marked UDP preflight source: {error}"))?
+    {
+        return Err("marked UDP preflight tuple or payload mismatch".to_owned());
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -391,14 +452,18 @@ struct ChainNames {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CounterComments {
-    ipv4_capture: String,
+    ipv4_capture_tcp: String,
+    ipv4_capture_udp: String,
     ipv4_unexpected_ingress: String,
-    ipv4_bypass: String,
+    ipv4_bypass_tcp: String,
+    ipv4_bypass_udp: String,
     ipv4_recapture: String,
     ipv4_unexpected_output: String,
-    ipv6_capture: String,
+    ipv6_capture_tcp: String,
+    ipv6_capture_udp: String,
     ipv6_unexpected_ingress: String,
-    ipv6_bypass: String,
+    ipv6_bypass_tcp: String,
+    ipv6_bypass_udp: String,
     ipv6_recapture: String,
     ipv6_unexpected_output: String,
 }
@@ -409,11 +474,18 @@ struct RelayReadyReport {
     nonce: String,
     network_namespace: String,
     process_identity: ProcessIdentity,
-    ipv4_listener: SocketAddr,
-    ipv6_listener: SocketAddr,
-    ipv4_transparent: i32,
-    ipv6_transparent: i32,
-    ipv6_only: i32,
+    ipv4_tcp_listener: SocketAddr,
+    ipv6_tcp_listener: SocketAddr,
+    ipv4_tcp_transparent: i32,
+    ipv6_tcp_transparent: i32,
+    ipv6_tcp_only: i32,
+    ipv4_udp_listener: SocketAddr,
+    ipv6_udp_listener: SocketAddr,
+    ipv4_udp_transparent: i32,
+    ipv6_udp_transparent: i32,
+    ipv4_udp_receive_original_destination: i32,
+    ipv6_udp_receive_original_destination: i32,
+    ipv6_udp_only: i32,
     relay_mark: u32,
 }
 
@@ -421,11 +493,16 @@ struct RelayReadyReport {
 struct RelayFlowReport {
     id: String,
     family: String,
+    transport: String,
+    semantic: String,
     inbound_remote: SocketAddr,
     original_destination: SocketAddr,
     outbound_local: SocketAddr,
     outbound_remote: SocketAddr,
     observed_socket_mark: u32,
+    response_local: Option<SocketAddr>,
+    response_remote: Option<SocketAddr>,
+    observed_response_socket_mark: Option<u32>,
     request_hex: String,
     response_hex: String,
 }
@@ -441,7 +518,9 @@ struct RelayReport {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct FamilyCounterSnapshot {
     capture_tcp: u64,
+    capture_udp: u64,
     bypass_tcp: u64,
+    bypass_udp: u64,
     recapture_attempt: u64,
     unexpected_ingress: u64,
     unexpected_output: u64,
@@ -540,14 +619,18 @@ fn run_isolated() -> Result<(), String> {
             ipv6_output: format!("FX6{suffix}O"),
         },
         comments: CounterComments {
-            ipv4_capture: format!("f4{suffix}cap"),
+            ipv4_capture_tcp: format!("f4{suffix}ct"),
+            ipv4_capture_udp: format!("f4{suffix}cu"),
             ipv4_unexpected_ingress: format!("f4{suffix}uin"),
-            ipv4_bypass: format!("f4{suffix}byp"),
+            ipv4_bypass_tcp: format!("f4{suffix}bt"),
+            ipv4_bypass_udp: format!("f4{suffix}bu"),
             ipv4_recapture: format!("f4{suffix}rec"),
             ipv4_unexpected_output: format!("f4{suffix}uout"),
-            ipv6_capture: format!("f6{suffix}cap"),
+            ipv6_capture_tcp: format!("f6{suffix}ct"),
+            ipv6_capture_udp: format!("f6{suffix}cu"),
             ipv6_unexpected_ingress: format!("f6{suffix}uin"),
-            ipv6_bypass: format!("f6{suffix}byp"),
+            ipv6_bypass_tcp: format!("f6{suffix}bt"),
+            ipv6_bypass_udp: format!("f6{suffix}bu"),
             ipv6_recapture: format!("f6{suffix}rec"),
             ipv6_unexpected_output: format!("f6{suffix}uout"),
         },
@@ -623,11 +706,19 @@ fn validate_tproxy_journal(resources: &TproxyResources) -> Result<(), String> {
             "before-ipv6-rpdb-route",
             "before-ipv6-rpdb-rule",
             "before-ipv4-ingress-chain-create",
-            "before-ipv4-prerouting-hook",
+            "before-ipv4-tcp-output-hook",
+            "before-ipv4-udp-output-hook",
+            "before-ipv4-tcp-prerouting-hook",
+            "before-ipv4-udp-prerouting-hook",
             "before-ipv6-ingress-chain-create",
-            "before-ipv6-prerouting-hook",
+            "before-ipv6-tcp-output-hook",
+            "before-ipv6-udp-output-hook",
+            "before-ipv6-tcp-prerouting-hook",
+            "before-ipv6-udp-prerouting-hook",
             "before-client-spawn",
             "before-capture-cleanup",
+            "before-relay-cleanup",
+            "before-peer-server-cleanup",
         ],
     )?;
     let mut expected = Vec::new();
@@ -668,6 +759,31 @@ fn validate_tproxy_journal(resources: &TproxyResources) -> Result<(), String> {
             return Err(format!(
                 "journal stage {} does not preserve its exact command and inverse: record={record:?}",
                 mutation.stage
+            ));
+        }
+    }
+    let stage_index = |stage: &str| {
+        records
+            .iter()
+            .position(|record| record.stage == stage)
+            .ok_or_else(|| format!("journal omitted ordered stage {stage}"))
+    };
+    for family in ["ipv4", "ipv6"] {
+        for protocol in ["tcp", "udp"] {
+            let output = stage_index(&format!("before-{family}-{protocol}-output-hook"))?;
+            let prerouting = stage_index(&format!("before-{family}-{protocol}-prerouting-hook"))?;
+            if output >= prerouting {
+                return Err(format!(
+                    "journal installed {family} {protocol} PREROUTING before its OUTPUT guard"
+                ));
+            }
+        }
+    }
+    let capture_cleanup = stage_index("before-capture-cleanup")?;
+    for child_cleanup in ["before-relay-cleanup", "before-peer-server-cleanup"] {
+        if capture_cleanup >= stage_index(child_cleanup)? {
+            return Err(format!(
+                "journal reaped {child_cleanup} before capture cleanup began"
             ));
         }
     }
@@ -1497,15 +1613,21 @@ fn capture_mutations(plan: &RulePlan, ipv6: bool) -> Vec<PlannedMutation> {
             inverse: delete_rule(rule),
         });
     }
-    for (stage, hook) in [
-        (format!("before-{family}-output-hook"), &plan.output_hook),
-        (
-            format!("before-{family}-prerouting-hook"),
-            &plan.prerouting_hook,
-        ),
-    ] {
+    for hook in &plan.output_hooks {
+        let protocol = rule_value_after(hook, &["-p", "--protocol"])
+            .expect("validated OUTPUT hook has an exact protocol");
         mutations.push(PlannedMutation {
-            stage,
+            stage: format!("before-{family}-{protocol}-output-hook"),
+            program: plan.program.clone(),
+            action: hook.clone(),
+            inverse: delete_rule(hook),
+        });
+    }
+    for hook in &plan.prerouting_hooks {
+        let protocol = rule_value_after(hook, &["-p", "--protocol"])
+            .expect("validated PREROUTING hook has an exact protocol");
+        mutations.push(PlannedMutation {
+            stage: format!("before-{family}-{protocol}-prerouting-hook"),
             program: plan.program.clone(),
             action: hook.clone(),
             inverse: delete_rule(hook),
@@ -1553,8 +1675,8 @@ struct RulePlan {
     output_chain: String,
     ingress_rules: Vec<Vec<String>>,
     output_rules: Vec<Vec<String>>,
-    prerouting_hook: Vec<String>,
-    output_hook: Vec<String>,
+    prerouting_hooks: Vec<Vec<String>>,
+    output_hooks: Vec<Vec<String>>,
 }
 
 impl RulePlan {
@@ -1574,24 +1696,30 @@ impl RulePlan {
             &self.output_chain,
             &["ACCEPT", "DROP"],
         )?;
-        validate_hook(
-            "PREROUTING",
-            &self.prerouting_hook,
-            "PREROUTING",
-            &self.ingress_chain,
-        )?;
-        validate_hook("OUTPUT", &self.output_hook, "OUTPUT", &self.output_chain)?;
-        if !self
-            .ingress_rules
-            .iter()
-            .any(|rule| rule_action(rule) == Some("TPROXY"))
-        {
-            return Err("ingress rule plan has no TPROXY action".to_owned());
+        for hook in &self.prerouting_hooks {
+            validate_hook("PREROUTING", hook, "PREROUTING", &self.ingress_chain)?;
         }
+        for hook in &self.output_hooks {
+            validate_hook("OUTPUT", hook, "OUTPUT", &self.output_chain)?;
+        }
+        validate_protocol_coverage(
+            "ingress TPROXY rules",
+            self.ingress_rules
+                .iter()
+                .filter(|rule| rule_action(rule) == Some("TPROXY")),
+        )?;
+        validate_protocol_coverage("PREROUTING hooks", self.prerouting_hooks.iter())?;
+        validate_protocol_coverage(
+            "OUTPUT bypass rules",
+            self.output_rules
+                .iter()
+                .filter(|rule| rule_action(rule) == Some("ACCEPT")),
+        )?;
+        validate_protocol_coverage("OUTPUT hooks", self.output_hooks.iter())?;
         if self
             .output_rules
             .iter()
-            .chain([&self.output_hook])
+            .chain(&self.output_hooks)
             .flatten()
             .any(|argument| argument == "TPROXY" || argument == &self.ingress_chain)
         {
@@ -1599,6 +1727,29 @@ impl RulePlan {
         }
         Ok(())
     }
+}
+
+fn validate_protocol_coverage<'a>(
+    scope: &str,
+    rules: impl Iterator<Item = &'a Vec<String>>,
+) -> Result<(), String> {
+    let mut protocols = BTreeSet::new();
+    let mut count = 0;
+    for rule in rules {
+        count += 1;
+        let protocol = rule_value_after(rule, &["-p", "--protocol"])
+            .ok_or_else(|| format!("{scope} rule has no exact protocol: {rule:?}"))?;
+        if !protocols.insert(protocol.to_owned()) {
+            return Err(format!("{scope} repeats protocol {protocol}: {rule:?}"));
+        }
+    }
+    let expected = BTreeSet::from(["tcp".to_owned(), "udp".to_owned()]);
+    if count != expected.len() || protocols != expected {
+        return Err(format!(
+            "{scope} must cover TCP and UDP exactly once, observed {protocols:?}"
+        ));
+    }
+    Ok(())
 }
 
 fn validate_private_rules(
@@ -1672,9 +1823,11 @@ fn rule_plan(config: &TproxyHarnessConfig, ipv6: bool) -> RulePlan {
         relay_probe_interface,
         relay_peer_interface,
         on_ip,
-        capture_comment,
+        capture_tcp_comment,
+        capture_udp_comment,
         unexpected_ingress_comment,
-        bypass_comment,
+        bypass_tcp_comment,
+        bypass_udp_comment,
         recapture_comment,
         unexpected_output_comment,
     ) = if ipv6 {
@@ -1688,9 +1841,11 @@ fn rule_plan(config: &TproxyHarnessConfig, ipv6: bool) -> RulePlan {
             &config.relay_probe_interface,
             &config.base.daemon_interface,
             "::",
-            &config.comments.ipv6_capture,
+            &config.comments.ipv6_capture_tcp,
+            &config.comments.ipv6_capture_udp,
             &config.comments.ipv6_unexpected_ingress,
-            &config.comments.ipv6_bypass,
+            &config.comments.ipv6_bypass_tcp,
+            &config.comments.ipv6_bypass_udp,
             &config.comments.ipv6_recapture,
             &config.comments.ipv6_unexpected_output,
         )
@@ -1705,27 +1860,29 @@ fn rule_plan(config: &TproxyHarnessConfig, ipv6: bool) -> RulePlan {
             &config.relay_probe_interface,
             &config.base.daemon_interface,
             "0.0.0.0",
-            &config.comments.ipv4_capture,
+            &config.comments.ipv4_capture_tcp,
+            &config.comments.ipv4_capture_udp,
             &config.comments.ipv4_unexpected_ingress,
-            &config.comments.ipv4_bypass,
+            &config.comments.ipv4_bypass_tcp,
+            &config.comments.ipv4_bypass_udp,
             &config.comments.ipv4_recapture,
             &config.comments.ipv4_unexpected_output,
         )
     };
-    let ingress_rules = vec![
+    let tproxy_rule = |protocol: &str, port: u16, comment: &str| {
         strings(&[
             "-t",
             "mangle",
             "-A",
             ingress_chain,
             "-p",
-            "tcp",
+            protocol,
             "--dport",
-            &config.base.tcp_port.to_string(),
+            &port.to_string(),
             "-m",
             "comment",
             "--comment",
-            capture_comment,
+            comment,
             "-j",
             "TPROXY",
             "--on-ip",
@@ -1734,7 +1891,11 @@ fn rule_plan(config: &TproxyHarnessConfig, ipv6: bool) -> RulePlan {
             &config.tproxy_port.to_string(),
             "--tproxy-mark",
             &format!("{PROXY_MARK:#x}/{PROXY_MASK:#x}"),
-        ]),
+        ])
+    };
+    let ingress_rules = vec![
+        tproxy_rule("tcp", config.base.tcp_port, capture_tcp_comment),
+        tproxy_rule("udp", config.base.udp_port, capture_udp_comment),
         strings(&[
             "-t",
             "mangle",
@@ -1748,16 +1909,16 @@ fn rule_plan(config: &TproxyHarnessConfig, ipv6: bool) -> RulePlan {
             "DROP",
         ]),
     ];
-    let output_rules = vec![
+    let bypass_rule = |protocol: &str, port: u16, comment: &str| {
         strings(&[
             "-t",
             "mangle",
             "-A",
             output_chain,
             "-p",
-            "tcp",
+            protocol,
             "--dport",
-            &config.base.tcp_port.to_string(),
+            &port.to_string(),
             "-m",
             "mark",
             "--mark",
@@ -1765,10 +1926,14 @@ fn rule_plan(config: &TproxyHarnessConfig, ipv6: bool) -> RulePlan {
             "-m",
             "comment",
             "--comment",
-            bypass_comment,
+            comment,
             "-j",
             "ACCEPT",
-        ]),
+        ])
+    };
+    let output_rules = vec![
+        bypass_rule("tcp", config.base.tcp_port, bypass_tcp_comment),
+        bypass_rule("udp", config.base.udp_port, bypass_udp_comment),
         strings(&[
             "-t",
             "mangle",
@@ -1798,52 +1963,64 @@ fn rule_plan(config: &TproxyHarnessConfig, ipv6: bool) -> RulePlan {
             "DROP",
         ]),
     ];
-    let prerouting_hook = strings(&[
-        "-t",
-        "mangle",
-        "-I",
-        "PREROUTING",
-        "1",
-        "-i",
-        relay_probe_interface,
-        "-s",
-        &probe_source,
-        "-d",
-        &peer_destination,
-        "-p",
-        "tcp",
-        "--dport",
-        &config.base.tcp_port.to_string(),
-        "-j",
-        ingress_chain,
-    ]);
-    let output_hook = strings(&[
-        "-t",
-        "mangle",
-        "-I",
-        "OUTPUT",
-        "1",
-        "-o",
-        relay_peer_interface,
-        "-s",
-        &relay_source,
-        "-d",
-        &peer_destination,
-        "-p",
-        "tcp",
-        "--dport",
-        &config.base.tcp_port.to_string(),
-        "-j",
-        output_chain,
-    ]);
+    let prerouting_hook = |protocol: &str, port: u16| {
+        strings(&[
+            "-t",
+            "mangle",
+            "-I",
+            "PREROUTING",
+            "1",
+            "-i",
+            relay_probe_interface,
+            "-s",
+            &probe_source,
+            "-d",
+            &peer_destination,
+            "-p",
+            protocol,
+            "--dport",
+            &port.to_string(),
+            "-j",
+            ingress_chain,
+        ])
+    };
+    let output_hook = |protocol: &str, port: u16| {
+        strings(&[
+            "-t",
+            "mangle",
+            "-I",
+            "OUTPUT",
+            "1",
+            "-o",
+            relay_peer_interface,
+            "-s",
+            &relay_source,
+            "-d",
+            &peer_destination,
+            "-p",
+            protocol,
+            "--dport",
+            &port.to_string(),
+            "-j",
+            output_chain,
+        ])
+    };
+    let prerouting_hooks = vec![
+        prerouting_hook("tcp", config.base.tcp_port),
+        prerouting_hook("udp", config.base.udp_port),
+    ];
+    let output_hooks = vec![
+        output_hook("tcp", config.base.tcp_port),
+        output_hook("udp", config.base.udp_port),
+    ];
     RulePlan {
         program: program.to_owned(),
         ingress_chain: ingress_chain.clone(),
         output_chain: output_chain.clone(),
         ingress_rules,
         output_rules,
-        prerouting_hook,
-        output_hook,
+        prerouting_hooks,
+        output_hooks,
     }
 }
 
@@ -1852,7 +2029,8 @@ fn validate_rule_plan_installed(plan: &RulePlan) -> Result<(), String> {
         .ingress_rules
         .iter()
         .chain(&plan.output_rules)
-        .chain([&plan.prerouting_hook, &plan.output_hook])
+        .chain(&plan.output_hooks)
+        .chain(&plan.prerouting_hooks)
     {
         let mut check = rule.clone();
         let operation = check
@@ -1939,19 +2117,33 @@ fn run_holder(role: HolderRole) -> Result<(), String> {
 
 fn run_peer() -> Result<(), String> {
     let config = config_from_environment()?;
-    let mut servers = tcp_echo_specs(&config.base)
+    let mut servers = echo_specs(&config.base)
         .into_iter()
-        .map(|spec| {
-            let listener = TcpListener::bind(spec.peer).map_err(|error| {
-                format!("bind ingress TPROXY peer TCP flow {}: {error}", spec.id)
-            })?;
-            listener.set_nonblocking(true).map_err(|error| {
-                format!(
-                    "make ingress TPROXY peer TCP flow {} nonblocking: {error}",
-                    spec.id
-                )
-            })?;
-            Ok((spec, listener))
+        .map(|spec| match spec.transport {
+            FlowTransport::Tcp => {
+                let listener = TcpListener::bind(spec.peer).map_err(|error| {
+                    format!("bind ingress TPROXY peer TCP flow {}: {error}", spec.id)
+                })?;
+                listener.set_nonblocking(true).map_err(|error| {
+                    format!(
+                        "make ingress TPROXY peer TCP flow {} nonblocking: {error}",
+                        spec.id
+                    )
+                })?;
+                Ok(BoundPeerServer::Tcp { spec, listener })
+            }
+            FlowTransport::Udp => {
+                let socket = UdpSocket::bind(spec.peer).map_err(|error| {
+                    format!("bind ingress TPROXY peer UDP flow {}: {error}", spec.id)
+                })?;
+                socket.set_read_timeout(Some(IO_TIMEOUT)).map_err(|error| {
+                    format!(
+                        "set ingress TPROXY peer UDP timeout for {}: {error}",
+                        spec.id
+                    )
+                })?;
+                Ok(BoundPeerServer::Udp { spec, socket })
+            }
         })
         .collect::<Result<Vec<_>, String>>()?;
     let ready = ReadyReport {
@@ -1966,8 +2158,8 @@ fn run_peer() -> Result<(), String> {
     write_json_synced(&config.base.ready_path, &ready)?;
     let deadline = Instant::now() + PROCESS_TIMEOUT;
     let mut flows = Vec::with_capacity(servers.len());
-    for (spec, listener) in &mut servers {
-        flows.push(serve_peer_tcp(&config.base, spec, listener, deadline)?);
+    for server in &mut servers {
+        flows.push(server.serve(&config.base, deadline)?);
     }
     write_json_synced(
         &config.base.peer_report_path,
@@ -1984,8 +2176,11 @@ fn run_peer() -> Result<(), String> {
 fn run_client() -> Result<(), String> {
     let config = config_from_environment()?;
     let mut flows = Vec::new();
-    for spec in tcp_echo_specs(&config.base) {
-        flows.push(run_client_tcp(&config.base, &spec)?);
+    for spec in echo_specs(&config.base) {
+        flows.push(match spec.transport {
+            FlowTransport::Tcp => run_client_tcp(&config.base, &spec)?,
+            FlowTransport::Udp => run_probe_client_udp(&config, &spec)?,
+        });
     }
     write_json_synced(
         &config.base.client_report_path,
@@ -1998,101 +2193,119 @@ fn run_client() -> Result<(), String> {
     )
 }
 
+fn run_probe_client_udp(
+    config: &TproxyHarnessConfig,
+    spec: &FlowSpec,
+) -> Result<FlowReport, String> {
+    let source_ip = match spec.family {
+        AddressFamily::Ipv4 => IpAddr::V4(config.probe_ipv4),
+        AddressFamily::Ipv6 => IpAddr::V6(config.probe_ipv6),
+    };
+    let socket = UdpSocket::bind(SocketAddr::new(source_ip, 0))
+        .map_err(|error| format!("bind ingress TPROXY client UDP flow {}: {error}", spec.id))?;
+    socket.connect(spec.peer).map_err(|error| {
+        format!(
+            "connect ingress TPROXY client UDP flow {} to {}: {error}",
+            spec.id, spec.peer
+        )
+    })?;
+    socket
+        .set_read_timeout(Some(IO_TIMEOUT))
+        .and_then(|()| socket.set_write_timeout(Some(IO_TIMEOUT)))
+        .map_err(|error| {
+            format!(
+                "set ingress TPROXY client UDP timeouts for {}: {error}",
+                spec.id
+            )
+        })?;
+    let request = spec.request(&config.base)?;
+    let sent = socket
+        .send(&request)
+        .map_err(|error| format!("send ingress TPROXY client UDP flow {}: {error}", spec.id))?;
+    if sent != request.len() {
+        return Err(format!(
+            "ingress TPROXY client UDP flow {} sent {sent} of {} request bytes",
+            spec.id,
+            request.len()
+        ));
+    }
+    let mut buffer = [0_u8; 4096];
+    let length = socket.recv(&mut buffer).map_err(|error| {
+        format!(
+            "receive ingress TPROXY client UDP flow {}: {error}",
+            spec.id
+        )
+    })?;
+    let response = buffer[..length].to_vec();
+    validate_response(spec, &config.base, &request, &response)?;
+    let local = socket
+        .local_addr()
+        .map_err(|error| format!("read ingress TPROXY client UDP local tuple: {error}"))?;
+    let remote = socket
+        .peer_addr()
+        .map_err(|error| format!("read ingress TPROXY client UDP peer tuple: {error}"))?;
+    flow_report(spec, &config.base, local, remote, request, response)
+}
+
 fn run_relay() -> Result<(), String> {
     let config = config_from_environment()?;
-    let ipv4 = TransparentTcpListener::bind(IpAddr::V4(Ipv4Addr::UNSPECIFIED), config.tproxy_port)?;
-    let ipv6 = TransparentTcpListener::bind(IpAddr::V6(Ipv6Addr::UNSPECIFIED), config.tproxy_port)?;
+    let ipv4_tcp =
+        TransparentTcpListener::bind(IpAddr::V4(Ipv4Addr::UNSPECIFIED), config.tproxy_port)?;
+    let ipv6_tcp =
+        TransparentTcpListener::bind(IpAddr::V6(Ipv6Addr::UNSPECIFIED), config.tproxy_port)?;
+    let ipv4_udp = TransparentUdpListener::bind(
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        config.tproxy_port,
+        IO_TIMEOUT,
+    )?;
+    let ipv6_udp = TransparentUdpListener::bind(
+        IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+        config.tproxy_port,
+        IO_TIMEOUT,
+    )?;
     let ready = RelayReadyReport {
         role: "relay".to_owned(),
         nonce: config.base.nonce.clone(),
         network_namespace: network_namespace_identity()?,
         process_identity: capture_process_identity(std::process::id())?,
-        ipv4_listener: ipv4.local_addr()?,
-        ipv6_listener: ipv6.local_addr()?,
-        ipv4_transparent: ipv4.transparent_readback(),
-        ipv6_transparent: ipv6.transparent_readback(),
-        ipv6_only: ipv6
-            .ipv6_only_readback()
-            .ok_or_else(|| "IPv6 transparent listener omitted IPV6_V6ONLY readback".to_owned())?,
+        ipv4_tcp_listener: ipv4_tcp.local_addr()?,
+        ipv6_tcp_listener: ipv6_tcp.local_addr()?,
+        ipv4_tcp_transparent: ipv4_tcp.transparent_readback(),
+        ipv6_tcp_transparent: ipv6_tcp.transparent_readback(),
+        ipv6_tcp_only: ipv6_tcp.ipv6_only_readback().ok_or_else(|| {
+            "IPv6 transparent TCP listener omitted IPV6_V6ONLY readback".to_owned()
+        })?,
+        ipv4_udp_listener: ipv4_udp.local_addr()?,
+        ipv6_udp_listener: ipv6_udp.local_addr()?,
+        ipv4_udp_transparent: ipv4_udp.transparent_readback(),
+        ipv6_udp_transparent: ipv6_udp.transparent_readback(),
+        ipv4_udp_receive_original_destination: ipv4_udp.receive_original_destination_readback(),
+        ipv6_udp_receive_original_destination: ipv6_udp.receive_original_destination_readback(),
+        ipv6_udp_only: ipv6_udp.ipv6_only_readback().ok_or_else(|| {
+            "IPv6 transparent UDP listener omitted IPV6_V6ONLY readback".to_owned()
+        })?,
         relay_mark: RELAY_BYPASS_MARK,
     };
     write_json_synced(&config.relay_ready_path, &ready)?;
 
     let deadline = Instant::now() + PROCESS_TIMEOUT;
     let mut flows = Vec::new();
-    for spec in tcp_echo_specs(&config.base) {
-        let listener = match spec.family {
-            AddressFamily::Ipv4 => ipv4.listener(),
-            AddressFamily::Ipv6 => ipv6.listener(),
-        };
-        let (mut inbound, inbound_remote) = accept_until(listener, deadline, &spec.id)?;
-        inbound
-            .set_read_timeout(Some(IO_TIMEOUT))
-            .and_then(|()| inbound.set_write_timeout(Some(IO_TIMEOUT)))
-            .map_err(|error| format!("set relay inbound timeouts for {}: {error}", spec.id))?;
-        let original_destination = inbound
-            .local_addr()
-            .map_err(|error| format!("read relay original destination for {}: {error}", spec.id))?;
-        if original_destination != spec.peer {
-            return Err(format!(
-                "relay flow {} recovered original destination {original_destination}, expected {}",
-                spec.id, spec.peer
-            ));
-        }
-        let request = read_u32_frame(&mut inbound)?;
-        let expected_request = spec.request(&config.base)?;
-        if request != expected_request {
-            return Err(format!(
-                "relay flow {} received unexpected request: expected={} actual={}",
-                spec.id,
-                hex_encode(&expected_request),
-                hex_encode(&request)
-            ));
-        }
-        let relay_ip = match spec.family {
-            AddressFamily::Ipv4 => IpAddr::V4(config.base.daemon_ipv4),
-            AddressFamily::Ipv6 => IpAddr::V6(config.base.daemon_ipv6),
-        };
-        let (mut outbound, observed_socket_mark) = connect_marked(
-            SocketAddr::new(relay_ip, 0),
-            original_destination,
-            RELAY_BYPASS_MARK,
-            IO_TIMEOUT,
-        )?;
-        let outbound_local = outbound
-            .local_addr()
-            .map_err(|error| format!("read relay outbound local tuple for {}: {error}", spec.id))?;
-        let outbound_remote = outbound
-            .peer_addr()
-            .map_err(|error| format!("read relay outbound peer tuple for {}: {error}", spec.id))?;
-        write_u32_frame(&mut outbound, &request)?;
-        let response = read_u32_frame(&mut outbound)?;
-        let expected_response = spec.response(&config.base, &request)?;
-        if response != expected_response {
-            return Err(format!(
-                "relay flow {} received unexpected upstream response: expected={} actual={}",
-                spec.id,
-                hex_encode(&expected_response),
-                hex_encode(&response)
-            ));
-        }
-        if socket_mark(&outbound)? != RELAY_BYPASS_MARK {
-            return Err(format!(
-                "relay flow {} lost its SO_MARK before response",
-                spec.id
-            ));
-        }
-        write_u32_frame(&mut inbound, &response)?;
-        flows.push(RelayFlowReport {
-            id: spec.id,
-            family: spec.family.label().to_owned(),
-            inbound_remote,
-            original_destination,
-            outbound_local,
-            outbound_remote,
-            observed_socket_mark,
-            request_hex: hex_encode(&request),
-            response_hex: hex_encode(&response),
+    for spec in echo_specs(&config.base) {
+        flows.push(match spec.transport {
+            FlowTransport::Tcp => {
+                let listener = match spec.family {
+                    AddressFamily::Ipv4 => ipv4_tcp.listener(),
+                    AddressFamily::Ipv6 => ipv6_tcp.listener(),
+                };
+                relay_tcp_echo(&config, &spec, listener, deadline)?
+            }
+            FlowTransport::Udp => {
+                let listener = match spec.family {
+                    AddressFamily::Ipv4 => &ipv4_udp,
+                    AddressFamily::Ipv6 => &ipv6_udp,
+                };
+                relay_udp_echo(&config, &spec, listener)?
+            }
         });
     }
     write_json_synced(
@@ -2105,6 +2318,222 @@ fn run_relay() -> Result<(), String> {
         },
     )?;
     wait_for_stop(&config.relay_stop_path, PROCESS_TIMEOUT)
+}
+
+fn relay_tcp_echo(
+    config: &TproxyHarnessConfig,
+    spec: &FlowSpec,
+    listener: &TcpListener,
+    deadline: Instant,
+) -> Result<RelayFlowReport, String> {
+    let (mut inbound, inbound_remote) = accept_until(listener, deadline, &spec.id)?;
+    inbound
+        .set_read_timeout(Some(IO_TIMEOUT))
+        .and_then(|()| inbound.set_write_timeout(Some(IO_TIMEOUT)))
+        .map_err(|error| format!("set relay inbound timeouts for {}: {error}", spec.id))?;
+    let original_destination = inbound
+        .local_addr()
+        .map_err(|error| format!("read relay original destination for {}: {error}", spec.id))?;
+    if original_destination != spec.peer {
+        return Err(format!(
+            "relay flow {} recovered original destination {original_destination}, expected {}",
+            spec.id, spec.peer
+        ));
+    }
+    let request = read_u32_frame(&mut inbound)?;
+    require_expected_request(config, spec, &request)?;
+    let relay_ip = relay_peer_ip(config, spec.family);
+    let (mut outbound, observed_socket_mark) = connect_marked_tcp(
+        SocketAddr::new(relay_ip, 0),
+        original_destination,
+        RELAY_BYPASS_MARK,
+        IO_TIMEOUT,
+    )?;
+    let outbound_local = outbound
+        .local_addr()
+        .map_err(|error| format!("read relay outbound local tuple for {}: {error}", spec.id))?;
+    let outbound_remote = outbound
+        .peer_addr()
+        .map_err(|error| format!("read relay outbound peer tuple for {}: {error}", spec.id))?;
+    write_u32_frame(&mut outbound, &request)?;
+    let response = read_u32_frame(&mut outbound)?;
+    require_expected_response(config, spec, &request, &response)?;
+    if tcp_socket_mark(&outbound)? != RELAY_BYPASS_MARK {
+        return Err(format!(
+            "relay TCP flow {} lost its SO_MARK before response",
+            spec.id
+        ));
+    }
+    write_u32_frame(&mut inbound, &response)?;
+    Ok(RelayFlowReport {
+        id: spec.id.clone(),
+        family: spec.family.label().to_owned(),
+        transport: spec.transport.label().to_owned(),
+        semantic: spec.semantic.label().to_owned(),
+        inbound_remote,
+        original_destination,
+        outbound_local,
+        outbound_remote,
+        observed_socket_mark,
+        response_local: None,
+        response_remote: None,
+        observed_response_socket_mark: None,
+        request_hex: hex_encode(&request),
+        response_hex: hex_encode(&response),
+    })
+}
+
+fn relay_udp_echo(
+    config: &TproxyHarnessConfig,
+    spec: &FlowSpec,
+    listener: &TransparentUdpListener,
+) -> Result<RelayFlowReport, String> {
+    let mut inbound_buffer = [0_u8; 4096];
+    let inbound = listener.receive(&mut inbound_buffer)?;
+    if inbound.original_destination != spec.peer {
+        return Err(format!(
+            "relay UDP flow {} recovered original destination {}, expected {}",
+            spec.id, inbound.original_destination, spec.peer
+        ));
+    }
+    require_expected_request(config, spec, &inbound.payload)?;
+
+    let relay_ip = relay_peer_ip(config, spec.family);
+    let (outbound, observed_socket_mark) = connect_marked_udp(
+        SocketAddr::new(relay_ip, 0),
+        inbound.original_destination,
+        RELAY_BYPASS_MARK,
+        IO_TIMEOUT,
+    )?;
+    let outbound_local = outbound.local_addr().map_err(|error| {
+        format!(
+            "read relay UDP outbound local tuple for {}: {error}",
+            spec.id
+        )
+    })?;
+    let outbound_remote = outbound.peer_addr().map_err(|error| {
+        format!(
+            "read relay UDP outbound peer tuple for {}: {error}",
+            spec.id
+        )
+    })?;
+    let sent = outbound
+        .send(&inbound.payload)
+        .map_err(|error| format!("send relay UDP upstream flow {}: {error}", spec.id))?;
+    if sent != inbound.payload.len() {
+        return Err(format!(
+            "relay UDP flow {} sent {sent} of {} upstream bytes",
+            spec.id,
+            inbound.payload.len()
+        ));
+    }
+    let mut response_buffer = [0_u8; 4096];
+    let response_length = outbound
+        .recv(&mut response_buffer)
+        .map_err(|error| format!("receive relay UDP upstream flow {}: {error}", spec.id))?;
+    let response = response_buffer[..response_length].to_vec();
+    require_expected_response(config, spec, &inbound.payload, &response)?;
+    if udp_socket_mark(&outbound)? != RELAY_BYPASS_MARK {
+        return Err(format!(
+            "relay UDP flow {} lost its upstream SO_MARK before response",
+            spec.id
+        ));
+    }
+
+    let (response_socket, observed_response_socket_mark, transparent) =
+        connect_transparent_marked_udp(
+            inbound.original_destination,
+            inbound.remote,
+            RELAY_BYPASS_MARK,
+            IO_TIMEOUT,
+        )?;
+    if transparent != 1 || udp_socket_mark(&response_socket)? != RELAY_BYPASS_MARK {
+        return Err(format!(
+            "relay UDP flow {} response socket lost transparency or SO_MARK",
+            spec.id
+        ));
+    }
+    let response_local = response_socket.local_addr().map_err(|error| {
+        format!(
+            "read relay UDP response local tuple for {}: {error}",
+            spec.id
+        )
+    })?;
+    let response_remote = response_socket.peer_addr().map_err(|error| {
+        format!(
+            "read relay UDP response peer tuple for {}: {error}",
+            spec.id
+        )
+    })?;
+    let sent = response_socket
+        .send(&response)
+        .map_err(|error| format!("send relay UDP client response for {}: {error}", spec.id))?;
+    if sent != response.len() {
+        return Err(format!(
+            "relay UDP flow {} sent {sent} of {} client-response bytes",
+            spec.id,
+            response.len()
+        ));
+    }
+
+    Ok(RelayFlowReport {
+        id: spec.id.clone(),
+        family: spec.family.label().to_owned(),
+        transport: spec.transport.label().to_owned(),
+        semantic: spec.semantic.label().to_owned(),
+        inbound_remote: inbound.remote,
+        original_destination: inbound.original_destination,
+        outbound_local,
+        outbound_remote,
+        observed_socket_mark,
+        response_local: Some(response_local),
+        response_remote: Some(response_remote),
+        observed_response_socket_mark: Some(observed_response_socket_mark),
+        request_hex: hex_encode(&inbound.payload),
+        response_hex: hex_encode(&response),
+    })
+}
+
+fn relay_peer_ip(config: &TproxyHarnessConfig, family: AddressFamily) -> IpAddr {
+    match family {
+        AddressFamily::Ipv4 => IpAddr::V4(config.base.daemon_ipv4),
+        AddressFamily::Ipv6 => IpAddr::V6(config.base.daemon_ipv6),
+    }
+}
+
+fn require_expected_request(
+    config: &TproxyHarnessConfig,
+    spec: &FlowSpec,
+    request: &[u8],
+) -> Result<(), String> {
+    let expected = spec.request(&config.base)?;
+    if request != expected {
+        return Err(format!(
+            "relay flow {} received unexpected request: expected={} actual={}",
+            spec.id,
+            hex_encode(&expected),
+            hex_encode(request)
+        ));
+    }
+    Ok(())
+}
+
+fn require_expected_response(
+    config: &TproxyHarnessConfig,
+    spec: &FlowSpec,
+    request: &[u8],
+    response: &[u8],
+) -> Result<(), String> {
+    let expected = spec.response(&config.base, request)?;
+    if response != expected {
+        return Err(format!(
+            "relay flow {} received unexpected upstream response: expected={} actual={}",
+            spec.id,
+            hex_encode(&expected),
+            hex_encode(response)
+        ));
+    }
+    Ok(())
 }
 
 fn accept_until(
@@ -2128,10 +2557,10 @@ fn accept_until(
     }
 }
 
-fn tcp_echo_specs(config: &HarnessConfig) -> Vec<FlowSpec> {
+fn echo_specs(config: &HarnessConfig) -> Vec<FlowSpec> {
     flow_specs(config)
         .into_iter()
-        .filter(|spec| spec.transport == FlowTransport::Tcp && spec.semantic == FlowSemantic::Echo)
+        .filter(|spec| spec.semantic == FlowSemantic::Echo)
         .collect()
 }
 
@@ -2197,13 +2626,22 @@ fn validate_reports(
     if relay_ready.role != "relay"
         || relay_ready.nonce != config.base.nonce
         || relay_ready.network_namespace != config.base.daemon_network_namespace
-        || relay_ready.ipv4_listener
+        || relay_ready.ipv4_tcp_listener
             != SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), config.tproxy_port)
-        || relay_ready.ipv6_listener
+        || relay_ready.ipv6_tcp_listener
             != SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), config.tproxy_port)
-        || relay_ready.ipv4_transparent != 1
-        || relay_ready.ipv6_transparent != 1
-        || relay_ready.ipv6_only != 1
+        || relay_ready.ipv4_tcp_transparent != 1
+        || relay_ready.ipv6_tcp_transparent != 1
+        || relay_ready.ipv6_tcp_only != 1
+        || relay_ready.ipv4_udp_listener
+            != SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), config.tproxy_port)
+        || relay_ready.ipv6_udp_listener
+            != SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), config.tproxy_port)
+        || relay_ready.ipv4_udp_transparent != 1
+        || relay_ready.ipv6_udp_transparent != 1
+        || relay_ready.ipv4_udp_receive_original_destination != 1
+        || relay_ready.ipv6_udp_receive_original_destination != 1
+        || relay_ready.ipv6_udp_only != 1
         || relay_ready.relay_mark != RELAY_BYPASS_MARK
     {
         return Err(format!("relay readiness mismatch: {relay_ready:?}"));
@@ -2211,7 +2649,7 @@ fn validate_reports(
     let client_flows = indexed_flows("client", &client.flows)?;
     let peer_flows = indexed_flows("peer", &peer.flows)?;
     let relay_flows = indexed_relay_flows(&relay.flows)?;
-    let specs = tcp_echo_specs(&config.base);
+    let specs = echo_specs(&config.base);
     if client_flows.len() != specs.len()
         || peer_flows.len() != specs.len()
         || relay_flows.len() != specs.len()
@@ -2236,7 +2674,7 @@ fn validate_reports(
             .ok_or_else(|| format!("peer omitted flow {}", spec.id))?;
         for (role, flow) in [("client", client_flow), ("peer", peer_flow)] {
             if flow.family != spec.family.label()
-                || flow.transport != FlowTransport::Tcp.label()
+                || flow.transport != spec.transport.label()
                 || flow.semantic != FlowSemantic::Echo.label()
                 || flow.nonce != config.base.nonce
             {
@@ -2254,9 +2692,23 @@ fn validate_reports(
             AddressFamily::Ipv4 => IpAddr::V4(config.base.daemon_ipv4),
             AddressFamily::Ipv6 => IpAddr::V6(config.base.daemon_ipv6),
         };
+        let response_tuple_valid = match spec.transport {
+            FlowTransport::Tcp => {
+                relay_flow.response_local.is_none()
+                    && relay_flow.response_remote.is_none()
+                    && relay_flow.observed_response_socket_mark.is_none()
+            }
+            FlowTransport::Udp => {
+                relay_flow.response_local == Some(client_flow.remote)
+                    && relay_flow.response_remote == Some(client_flow.local)
+                    && relay_flow.observed_response_socket_mark == Some(RELAY_BYPASS_MARK)
+            }
+        };
         if client_flow.local.ip() != expected_probe_ip
             || client_flow.remote != spec.peer
             || relay_flow.family != spec.family.label()
+            || relay_flow.transport != spec.transport.label()
+            || relay_flow.semantic != spec.semantic.label()
             || relay_flow.inbound_remote != client_flow.local
             || relay_flow.original_destination != client_flow.remote
             || relay_flow.outbound_local.ip() != expected_relay_ip
@@ -2264,6 +2716,7 @@ fn validate_reports(
             || relay_flow.outbound_local != peer_flow.remote
             || peer_flow.local != spec.peer
             || relay_flow.observed_socket_mark != RELAY_BYPASS_MARK
+            || !response_tuple_valid
         {
             return Err(format!(
                 "flow {} tuple/mark cross-check failed: client={client_flow:?} relay={relay_flow:?} peer={peer_flow:?}",
@@ -2306,8 +2759,10 @@ fn read_counters(config: &TproxyHarnessConfig) -> Result<CounterSnapshot, String
     let ipv6 = command_output("ip6tables-save", &["-c", "-t", "mangle"])?;
     Ok(CounterSnapshot {
         ipv4: FamilyCounterSnapshot {
-            capture_tcp: packet_count_for_comment(&ipv4, &config.comments.ipv4_capture)?,
-            bypass_tcp: packet_count_for_comment(&ipv4, &config.comments.ipv4_bypass)?,
+            capture_tcp: packet_count_for_comment(&ipv4, &config.comments.ipv4_capture_tcp)?,
+            capture_udp: packet_count_for_comment(&ipv4, &config.comments.ipv4_capture_udp)?,
+            bypass_tcp: packet_count_for_comment(&ipv4, &config.comments.ipv4_bypass_tcp)?,
+            bypass_udp: packet_count_for_comment(&ipv4, &config.comments.ipv4_bypass_udp)?,
             recapture_attempt: packet_count_for_comment(&ipv4, &config.comments.ipv4_recapture)?,
             unexpected_ingress: packet_count_for_comment(
                 &ipv4,
@@ -2319,8 +2774,10 @@ fn read_counters(config: &TproxyHarnessConfig) -> Result<CounterSnapshot, String
             )?,
         },
         ipv6: FamilyCounterSnapshot {
-            capture_tcp: packet_count_for_comment(&ipv6, &config.comments.ipv6_capture)?,
-            bypass_tcp: packet_count_for_comment(&ipv6, &config.comments.ipv6_bypass)?,
+            capture_tcp: packet_count_for_comment(&ipv6, &config.comments.ipv6_capture_tcp)?,
+            capture_udp: packet_count_for_comment(&ipv6, &config.comments.ipv6_capture_udp)?,
+            bypass_tcp: packet_count_for_comment(&ipv6, &config.comments.ipv6_bypass_tcp)?,
+            bypass_udp: packet_count_for_comment(&ipv6, &config.comments.ipv6_bypass_udp)?,
             recapture_attempt: packet_count_for_comment(&ipv6, &config.comments.ipv6_recapture)?,
             unexpected_ingress: packet_count_for_comment(
                 &ipv6,
@@ -2368,12 +2825,14 @@ fn validate_counter_bounds(snapshot: CounterSnapshot) -> Result<(), String> {
     for (family, counters) in [("IPv4", snapshot.ipv4), ("IPv6", snapshot.ipv6)] {
         if !(1..=TCP_CAPTURE_MAXIMUM).contains(&counters.capture_tcp)
             || !(1..=TCP_CAPTURE_MAXIMUM).contains(&counters.bypass_tcp)
+            || counters.capture_udp != UDP_ECHO_PACKET_COUNT
+            || counters.bypass_udp != UDP_ECHO_PACKET_COUNT
             || counters.recapture_attempt != 0
             || counters.unexpected_ingress != 0
             || counters.unexpected_output != 0
         {
             return Err(format!(
-                "{family} ingress TPROXY counters are outside the TCP checkpoint bounds: {counters:?}"
+                "{family} ingress TPROXY counters are outside the TCP/UDP echo checkpoint bounds: {counters:?}"
             ));
         }
     }
@@ -3010,6 +3469,27 @@ fn strings(arguments: &[&str]) -> Vec<String> {
 mod tests {
     use super::*;
 
+    fn exact_protocol_rule<'a>(
+        rules: &'a [Vec<String>],
+        action: &str,
+        protocol: &str,
+    ) -> &'a [String] {
+        let matches = rules
+            .iter()
+            .filter(|rule| {
+                rule_action(rule) == Some(action)
+                    && rule_value_after(rule, &["-p", "--protocol"]) == Some(protocol)
+            })
+            .collect::<Vec<_>>();
+        let [rule] = matches.as_slice() else {
+            panic!(
+                "expected exactly one {protocol} {action} rule, found {}",
+                matches.len()
+            );
+        };
+        rule
+    }
+
     #[test]
     fn ingress_rule_plan_never_places_tproxy_in_output() {
         let directory = PathBuf::from("/tmp/flux-ingress-rule-plan-test");
@@ -3051,14 +3531,18 @@ mod tests {
                 ipv6_output: "FX6TESTO".to_owned(),
             },
             comments: CounterComments {
-                ipv4_capture: "f4cap".to_owned(),
+                ipv4_capture_tcp: "f4ct".to_owned(),
+                ipv4_capture_udp: "f4cu".to_owned(),
                 ipv4_unexpected_ingress: "f4uin".to_owned(),
-                ipv4_bypass: "f4byp".to_owned(),
+                ipv4_bypass_tcp: "f4bt".to_owned(),
+                ipv4_bypass_udp: "f4bu".to_owned(),
                 ipv4_recapture: "f4rec".to_owned(),
                 ipv4_unexpected_output: "f4uout".to_owned(),
-                ipv6_capture: "f6cap".to_owned(),
+                ipv6_capture_tcp: "f6ct".to_owned(),
+                ipv6_capture_udp: "f6cu".to_owned(),
                 ipv6_unexpected_ingress: "f6uin".to_owned(),
-                ipv6_bypass: "f6byp".to_owned(),
+                ipv6_bypass_tcp: "f6bt".to_owned(),
+                ipv6_bypass_udp: "f6bu".to_owned(),
                 ipv6_recapture: "f6rec".to_owned(),
                 ipv6_unexpected_output: "f6uout".to_owned(),
             },
@@ -3069,7 +3553,22 @@ mod tests {
             peer_server_stop_path: directory.join("peer-server-stop"),
             probe_stop_path: directory.join("probe-stop"),
         };
-        for plan in [rule_plan(&config, false), rule_plan(&config, true)] {
+        assert_eq!(
+            echo_specs(&config.base)
+                .into_iter()
+                .map(|spec| spec.id)
+                .collect::<Vec<_>>(),
+            [
+                "ipv4-tcp".to_owned(),
+                "ipv4-udp".to_owned(),
+                "ipv6-tcp".to_owned(),
+                "ipv6-udp".to_owned(),
+            ]
+        );
+        for (ipv6, plan) in [
+            (false, rule_plan(&config, false)),
+            (true, rule_plan(&config, true)),
+        ] {
             plan.validate_capture_boundary()
                 .expect("real ingress rule plan preserves its capture boundary");
             assert!(
@@ -3085,35 +3584,156 @@ mod tests {
                     .flatten()
                     .any(|argument| argument == "TPROXY")
             );
-            assert_eq!(
-                rule_value_after(&plan.prerouting_hook, &["-I", "--insert"]),
-                Some("PREROUTING")
-            );
-            assert_eq!(
-                rule_action(&plan.prerouting_hook),
-                Some(plan.ingress_chain.as_str())
-            );
-            assert_eq!(
-                rule_value_after(&plan.output_hook, &["-I", "--insert"]),
-                Some("OUTPUT")
-            );
-            assert_eq!(
-                rule_action(&plan.output_hook),
-                Some(plan.output_chain.as_str())
+            assert_eq!(plan.prerouting_hooks.len(), 2);
+            assert_eq!(plan.output_hooks.len(), 2);
+            let (
+                program,
+                probe_source,
+                peer_destination,
+                relay_source,
+                on_ip,
+                capture_tcp_comment,
+                capture_udp_comment,
+                bypass_tcp_comment,
+                bypass_udp_comment,
+            ) = if ipv6 {
+                (
+                    "ip6tables",
+                    "2001:db8:2::2/128".to_owned(),
+                    "2001:db8:1::2/128".to_owned(),
+                    "2001:db8:1::1/128".to_owned(),
+                    "::",
+                    "f6ct",
+                    "f6cu",
+                    "f6bt",
+                    "f6bu",
+                )
+            } else {
+                (
+                    "iptables",
+                    "11.23.43.2/32".to_owned(),
+                    "11.23.42.2/32".to_owned(),
+                    "11.23.42.1/32".to_owned(),
+                    "0.0.0.0",
+                    "f4ct",
+                    "f4cu",
+                    "f4bt",
+                    "f4bu",
+                )
+            };
+            assert_eq!(plan.program, program);
+            for (protocol, port, capture_comment, bypass_comment) in [
+                ("tcp", "41001", capture_tcp_comment, bypass_tcp_comment),
+                ("udp", "41002", capture_udp_comment, bypass_udp_comment),
+            ] {
+                let capture = exact_protocol_rule(&plan.ingress_rules, "TPROXY", protocol);
+                assert_eq!(rule_value_after(capture, &["--dport"]), Some(port));
+                assert_eq!(
+                    rule_value_after(capture, &["--comment"]),
+                    Some(capture_comment)
+                );
+                assert_eq!(rule_value_after(capture, &["--on-ip"]), Some(on_ip));
+                assert_eq!(rule_value_after(capture, &["--on-port"]), Some("41090"));
+                assert_eq!(
+                    rule_value_after(capture, &["--tproxy-mark"]),
+                    Some("0x1/0xf")
+                );
+
+                let prerouting = exact_protocol_rule(
+                    &plan.prerouting_hooks,
+                    plan.ingress_chain.as_str(),
+                    protocol,
+                );
+                assert_eq!(
+                    rule_value_after(prerouting, &["-I", "--insert"]),
+                    Some("PREROUTING")
+                );
+                assert_eq!(rule_value_after(prerouting, &["-i"]), Some("fxdaemon"));
+                assert_eq!(
+                    rule_value_after(prerouting, &["-s"]),
+                    Some(probe_source.as_str())
+                );
+                assert_eq!(
+                    rule_value_after(prerouting, &["-d"]),
+                    Some(peer_destination.as_str())
+                );
+                assert_eq!(rule_value_after(prerouting, &["--dport"]), Some(port));
+
+                let bypass = exact_protocol_rule(&plan.output_rules, "ACCEPT", protocol);
+                assert_eq!(rule_value_after(bypass, &["--dport"]), Some(port));
+                assert_eq!(
+                    rule_value_after(bypass, &["--mark"]),
+                    Some("0x82/0xffffffff")
+                );
+                assert_eq!(
+                    rule_value_after(bypass, &["--comment"]),
+                    Some(bypass_comment)
+                );
+
+                let output =
+                    exact_protocol_rule(&plan.output_hooks, plan.output_chain.as_str(), protocol);
+                assert_eq!(
+                    rule_value_after(output, &["-I", "--insert"]),
+                    Some("OUTPUT")
+                );
+                assert_eq!(rule_value_after(output, &["-o"]), Some("fxrelay"));
+                assert_eq!(
+                    rule_value_after(output, &["-s"]),
+                    Some(relay_source.as_str())
+                );
+                assert_eq!(
+                    rule_value_after(output, &["-d"]),
+                    Some(peer_destination.as_str())
+                );
+                assert_eq!(rule_value_after(output, &["--dport"]), Some(port));
+            }
+
+            let mutations = capture_mutations(&plan, ipv6);
+            let last_output = mutations
+                .iter()
+                .rposition(|mutation| mutation.stage.ends_with("-output-hook"))
+                .expect("output hook mutation");
+            let first_prerouting = mutations
+                .iter()
+                .position(|mutation| mutation.stage.ends_with("-prerouting-hook"))
+                .expect("PREROUTING hook mutation");
+            assert!(last_output < first_prerouting);
+            assert!(
+                mutations[first_prerouting..]
+                    .iter()
+                    .all(|mutation| mutation.stage.ends_with("-prerouting-hook"))
             );
         }
 
         let mut plan = rule_plan(&config, false);
-        let target = plan
-            .output_hook
+        let target = plan.output_hooks[0]
             .iter()
             .position(|argument| argument == "-j")
             .expect("OUTPUT hook jump")
             + 1;
-        plan.output_hook[target] = plan.ingress_chain.clone();
+        plan.output_hooks[0][target] = plan.ingress_chain.clone();
         let error = plan
             .validate_capture_boundary()
             .expect_err("OUTPUT must not jump to the ingress TPROXY chain");
         assert!(error.contains("OUTPUT hook targets FX4TESTI, expected FX4TESTO"));
+    }
+
+    #[test]
+    fn tcp_activity_cannot_mask_missing_udp_counters() {
+        let tcp_only = FamilyCounterSnapshot {
+            capture_tcp: 1,
+            capture_udp: 0,
+            bypass_tcp: 1,
+            bypass_udp: 0,
+            recapture_attempt: 0,
+            unexpected_ingress: 0,
+            unexpected_output: 0,
+        };
+        let error = validate_counter_bounds(CounterSnapshot {
+            ipv4: tcp_only,
+            ipv6: tcp_only,
+        })
+        .expect_err("TCP-only counters must not qualify the UDP checkpoint");
+        assert!(error.contains("TCP/UDP echo checkpoint bounds"));
     }
 }

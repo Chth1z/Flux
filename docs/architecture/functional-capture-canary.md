@@ -130,13 +130,15 @@ The contained topology is split into a boot-scoped facility and Generation-scope
 
 The Linux ingress checkpoint uses a narrower three-namespace topology. A probe namespace sends
 traffic through a second veth into the daemon/relay namespace, where exact interface, source,
-destination, protocol, and port selectors exercise PREROUTING TPROXY. Its delivered first slice
-proxies dual-stack TCP echo through transparent Rust listeners, proves the accepted socket retains
-the original destination, and opens separately marked relay sockets to the existing peer
-namespace. Forwarding remains disabled so a missed selector cannot silently reach the peer. This
+destination, protocol, and port selectors exercise PREROUTING TPROXY. Its delivered ingress slice
+proxies dual-stack TCP and UDP echo through transparent Rust listeners, proves accepted TCP sockets
+and strict UDP original-destination ancillary data retain the intended peer tuple, and opens
+separately marked relay sockets to the existing peer namespace. UDP responses use a separate
+transparent marked socket bound to the recovered destination so the probe observes the original
+source. Forwarding remains disabled so a missed selector cannot silently reach the peer. This
 proves only the ingress traffic domain and test-local relay; it does not instantiate the dedicated
-production probe/engine UIDs or the Sing-Box local-OUTPUT path. UDP echo and DNS over UDP/TCP remain
-the next extension of the same ingress checkpoint.
+production probe/engine UIDs or the Sing-Box local-OUTPUT path. DNS over UDP/TCP remains the next
+extension of the same ingress checkpoint.
 
 The peer route is traffic-scoped, not a boot-long override of an arbitrary global destination.
 The facility requires a dedicated engine UID and installs a device-qualified RPDB rule matching
@@ -195,14 +197,15 @@ generation-specific Sing-Box listener, leave through an engine-owned outbound so
 contained peer, and return before the absolute deadline. Success in one family never substitutes
 for an enabled family that failed.
 
-The delivered Linux ingress slice applies the TCP-echo payload contract to a test-local relay for
-both address families. Its report cross-checks three distinct observations rather than equating
-the client and peer tuples: probe client to original peer destination, accepted transparent socket
-to the recovered original destination, and marked relay outbound socket to peer responder. The
-UDP extension must additionally prove source-preserving responses, and the DNS extension must
-retain the existing transaction/question/answer checks over both transports. None of these harness
-reports can be converted into complete model evidence until the exact supervised-engine identity,
-distinct UIDs, and authoritative socket correlation also exist.
+The delivered Linux ingress slice applies the TCP/UDP echo payload contract to a test-local relay
+for both address families. Its report cross-checks three distinct observations rather than
+equating the client and peer tuples: probe client to original peer destination, transparent relay
+receive state to the recovered original destination, and marked relay outbound socket to peer
+responder. UDP additionally cross-checks the transparent response socket bound to the recovered
+destination and connected to the exact probe tuple, proving source-preserving responses. The DNS
+extension must retain the existing transaction/question/answer checks over both transports. None
+of these harness reports can be converted into complete model evidence until the exact supervised-
+engine identity, distinct UIDs, and authoritative socket correlation also exist.
 
 The local peer validates the received payload and records the engine-side connection/datagram
 tuple. The adapter correlates that tuple with the exact supervised engine identity and validates
@@ -259,11 +262,11 @@ functional pass.
    UDP, and DNS traffic and independently verifies exact topology cleanup. It proves the
    traffic-flow contracts and contained test topology without installing capture.
 3. **In progress:** the third-probe-namespace ingress checkpoint now exercises exact dual-stack
-   TCP-echo PREROUTING TPROXY selectors, transparent-listener original-destination recovery,
-   marked relay egress, per-family route controls, bounded capture/bypass counters, and exact
-   cleanup. Next extend the same checkpoint with UDP echo and DNS over UDP/TCP, including
-   source-preserving UDP responses. The empirical OUTPUT boundary above remains part of its
-   acceptance contract.
+   TCP/UDP-echo PREROUTING TPROXY selectors, accepted-socket and strict ancillary-data original-
+   destination recovery, marked relay egress, source-preserving UDP responses, per-family route
+   controls, independent bounded TCP/UDP capture/bypass counters, and exact cleanup. Next extend
+   the same checkpoint with DNS over UDP/TCP. The empirical OUTPUT boundary above remains part of
+   its acceptance contract.
 4. Add a separate local-OUTPUT qualification slice using distinct nonzero probe/engine UIDs and
    authoritative `/proc` FD plus INET_DIAG correlation (or a separately qualified cgroup-eBPF
    observer). Only that later slice may construct complete evidence and call the model
@@ -293,7 +296,7 @@ preflight. It also removes all harness-internal mode, configuration, token, and 
 variables before invoking Cargo, so caller state cannot bypass the outer preflight. This command
 is deliberately excluded from `cargo xtask ci`.
 
-Invoke the delivered ingress TCP slice with:
+Invoke the delivered ingress TCP/UDP echo slice with:
 
 ```text
 cargo xtask test-functional-canary-linux-tproxy
@@ -303,7 +306,8 @@ FLUX_LINUX_CANARY_REQUIRED=1 cargo xtask test-functional-canary-linux-tproxy
 The command selects only the ignored test
 `functional_canary::linux_namespace_harness::privileged_ingress_tproxy_checkpoint_exercises_real_capture_counters_and_cleanup`
 with exact matching, `--nocapture`, and one test thread. The current implementation covers
-dual-stack TCP echo; UDP echo and DNS over UDP/TCP remain pending under the same command and test.
+dual-stack TCP and UDP echo, including strict UDP original-destination cmsg validation and source-
+preserving replies; DNS over UDP/TCP remains pending under the same command and test.
 The deterministic regression `ingress_rule_plan_never_places_tproxy_in_output` proves that rule
 generation never emits xtables TPROXY in OUTPUT. OUTPUT-mark or route-lookup evidence still cannot
 qualify PREROUTING TPROXY without exact listener/flow evidence.

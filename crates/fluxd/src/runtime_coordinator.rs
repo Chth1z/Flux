@@ -188,10 +188,12 @@ enum RuntimeOwnership {
     DetachPending {
         generation: Box<PreparedGeneration>,
         terminal: PublishedRuntimeState,
+        rollback: Option<Box<PreparedGeneration>>,
     },
     Retiring {
         generation: Box<PreparedGeneration>,
         terminal: PublishedRuntimeState,
+        rollback: Option<Box<PreparedGeneration>>,
     },
 }
 
@@ -301,20 +303,24 @@ where
             RuntimeOwnership::Retiring {
                 generation,
                 terminal,
+                rollback,
             } => {
                 self.ownership = RuntimeOwnership::Retiring {
                     generation,
                     terminal,
+                    rollback,
                 };
                 return Err(retirement_pending_error("reload runtime"));
             }
             RuntimeOwnership::DetachPending {
                 generation,
                 terminal,
+                rollback,
             } => {
                 self.ownership = RuntimeOwnership::DetachPending {
                     generation,
                     terminal,
+                    rollback,
                 };
                 return Err(retirement_pending_error("reload runtime"));
             }
@@ -342,23 +348,31 @@ where
         };
         match self.activate_prepared(candidate) {
             Ok(()) => Ok(()),
-            Err(candidate_failure)
-                if matches!(
-                    &self.ownership,
-                    RuntimeOwnership::Engine {
-                        generation,
-                        capture: CaptureObservation::Published,
-                    } | RuntimeOwnership::DetachPending {
-                        generation,
-                        terminal: _,
-                    } if generation.id == candidate_id
-                ) =>
-            {
-                Err(candidate_failure)
-            }
-            Err(candidate_failure) => match self.activate_prepared(*previous) {
-                Ok(()) => Err(candidate_failure),
-                Err(rollback_failure) => Err(self.settle_failed_rollback(rollback_failure)),
+            Err(candidate_failure) => match &mut self.ownership {
+                RuntimeOwnership::Engine {
+                    generation,
+                    capture: CaptureObservation::Published,
+                } if generation.id == candidate_id => Err(candidate_failure),
+                RuntimeOwnership::DetachPending {
+                    generation,
+                    rollback,
+                    ..
+                } if generation.id == candidate_id => {
+                    *rollback = Some(previous);
+                    Err(candidate_failure)
+                }
+                RuntimeOwnership::Retiring {
+                    generation,
+                    rollback,
+                    ..
+                } if generation.id == candidate_id => {
+                    *rollback = Some(previous);
+                    Err(candidate_failure)
+                }
+                _ => match self.activate_prepared(*previous) {
+                    Ok(()) => Err(candidate_failure),
+                    Err(rollback_failure) => Err(self.settle_failed_rollback(rollback_failure)),
+                },
             },
         }
     }
@@ -451,6 +465,7 @@ where
             self.ownership = RuntimeOwnership::DetachPending {
                 generation: Box::new(generation),
                 terminal: PublishedRuntimeState::Failed,
+                rollback: None,
             };
             return runtime_writer_error(
                 "detach failed capture",
@@ -461,6 +476,7 @@ where
         match self.reconcile_retirement(
             Box::new(generation),
             PublishedRuntimeState::Failed,
+            None,
             "stop engine after failed activation",
             "keep capture detached and retry engine cleanup",
         ) {
@@ -488,10 +504,12 @@ where
             RuntimeOwnership::Retiring {
                 generation,
                 terminal,
+                rollback,
             } => {
                 return match self.reconcile_retirement(
                     generation,
                     terminal,
+                    rollback,
                     "complete proxy engine retirement",
                     "keep capture detached and retry bounded engine cleanup",
                 )? {
@@ -501,10 +519,12 @@ where
             RuntimeOwnership::DetachPending {
                 generation,
                 terminal,
+                rollback,
             } => {
                 return match self.reconcile_pending_detachment(
                     generation,
                     terminal,
+                    rollback,
                     "complete capture detachment",
                     "retain the proxy engine and retry capture detachment",
                 )? {
@@ -771,6 +791,7 @@ where
                 return match self.reconcile_retirement(
                     generation,
                     PublishedRuntimeState::Stopped,
+                    None,
                     "stop proxy engine",
                     "keep capture detached and retry engine reconciliation",
                 )? {
@@ -786,6 +807,7 @@ where
                 return match self.reconcile_pending_detachment(
                     generation,
                     PublishedRuntimeState::Stopped,
+                    None,
                     "detach capture",
                     "retain the proxy engine and retry capture detachment",
                 )? {
@@ -801,6 +823,7 @@ where
                 return match self.reconcile_pending_detachment(
                     generation,
                     PublishedRuntimeState::Stopped,
+                    None,
                     "detach capture",
                     "retain the proxy engine and retry capture detachment",
                 )? {
@@ -827,6 +850,7 @@ where
             self.ownership = RuntimeOwnership::DetachPending {
                 generation,
                 terminal: PublishedRuntimeState::Stopped,
+                rollback: None,
             };
             return Err(runtime_writer_error(
                 "detach capture",
@@ -837,6 +861,7 @@ where
         match self.reconcile_retirement(
             generation,
             PublishedRuntimeState::Stopped,
+            None,
             "stop proxy engine",
             "keep capture detached and retry engine reconciliation",
         )? {
@@ -853,6 +878,7 @@ where
         &mut self,
         generation: Box<PreparedGeneration>,
         terminal: PublishedRuntimeState,
+        rollback: Option<Box<PreparedGeneration>>,
         operation: &'static str,
         recovery: &'static str,
     ) -> Result<RetirementProgress, ControlError> {
@@ -860,12 +886,14 @@ where
             self.ownership = RuntimeOwnership::DetachPending {
                 generation,
                 terminal,
+                rollback,
             };
             return Err(runtime_writer_error(operation, source, recovery));
         }
         self.reconcile_retirement(
             generation,
             terminal,
+            rollback,
             "retire proxy engine after capture detachment",
             "keep capture detached and retry bounded engine cleanup",
         )
@@ -875,6 +903,7 @@ where
         &mut self,
         generation: Box<PreparedGeneration>,
         terminal: PublishedRuntimeState,
+        rollback: Option<Box<PreparedGeneration>>,
         operation: &'static str,
         recovery: &'static str,
     ) -> Result<RetirementProgress, ControlError> {
@@ -888,6 +917,7 @@ where
                 self.ownership = RuntimeOwnership::Retiring {
                     generation,
                     terminal,
+                    rollback,
                 };
                 return Err(ControlError::runtime(operation, source, recovery));
             }
@@ -899,6 +929,7 @@ where
             self.ownership = RuntimeOwnership::Retiring {
                 generation,
                 terminal,
+                rollback,
             };
             self.publish_runtime(
                 RuntimePhase::Stopping,
@@ -908,6 +939,14 @@ where
                 None,
             );
             return Ok(RetirementProgress::Pending(report));
+        }
+
+        if let Some(previous) = rollback {
+            self.ownership = RuntimeOwnership::Stopped;
+            return match self.activate_prepared(*previous) {
+                Ok(()) => Ok(RetirementProgress::Settled),
+                Err(rollback_failure) => Err(self.settle_failed_rollback(rollback_failure)),
+            };
         }
 
         let (phase, publish_operation, publish_recovery) = match terminal {
@@ -925,6 +964,7 @@ where
                 self.ownership = RuntimeOwnership::Retiring {
                     generation,
                     terminal,
+                    rollback: None,
                 };
                 return Err(ControlError::runtime(
                     "retire proxy engine",
@@ -972,9 +1012,11 @@ where
             | RuntimeOwnership::Retiring {
                 generation,
                 terminal: _,
+                rollback: _,
             } => self.reconcile_retirement(
                 generation,
                 PublishedRuntimeState::Failed,
+                None,
                 "settle failed rollback",
                 "keep capture detached and retry bounded engine cleanup",
             ),
@@ -982,6 +1024,7 @@ where
                 self.ownership = RuntimeOwnership::DetachPending {
                     generation,
                     terminal: PublishedRuntimeState::Failed,
+                    rollback: None,
                 };
                 return rollback_failure_error(rollback_failure);
             }
@@ -989,6 +1032,7 @@ where
                 self.ownership = RuntimeOwnership::DetachPending {
                     generation,
                     terminal: PublishedRuntimeState::Failed,
+                    rollback: None,
                 };
                 return rollback_failure_error(rollback_failure);
             }
@@ -2194,7 +2238,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_candidate_compensation_does_not_restart_the_previous_generation() {
+    fn failed_candidate_compensation_waits_for_detachment_before_previous_restart() {
         let active = EngineFixture::new();
         let candidate = EngineFixture::new();
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -2248,7 +2292,90 @@ mod tests {
             [
                 Event::CaptureStopped,
                 Event::EngineStopped(CaptureObservation::Detached),
-                Event::Published(PublishedRuntimeState::Failed),
+                Event::EngineRunning(CaptureObservation::Detached),
+                Event::CaptureStarted,
+                Event::CaptureVerified,
+                Event::Published(PublishedRuntimeState::Running {
+                    generation: generation(1),
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn pending_candidate_retirement_defers_previous_restart_until_settled() {
+        let active = EngineFixture::new();
+        let candidate = EngineFixture::new();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let reports = Arc::new(Mutex::new(VecDeque::new()));
+        let writer = ScriptedWriter {
+            events: Arc::clone(&events),
+            prepared: VecDeque::from([active.spec.clone(), candidate.spec.clone()]),
+            next_generation_id: 1,
+            capture_start_failure: false,
+            capture_stop_failures: 0,
+            verify_failure: false,
+        };
+        let engine = ScriptedEngine {
+            events: Arc::clone(&events),
+            reports: Arc::clone(&reports),
+        };
+        let mut coordinator =
+            RuntimeCoordinator::with_dependencies(writer, engine, Duration::from_millis(100));
+        coordinator
+            .execute(&LegacyIntent::Running {
+                reason: Reason::Boot,
+            })
+            .expect("initial generation converges");
+        coordinator.writer.verify_failure = true;
+        events.lock().expect("events lock").clear();
+        reports.lock().expect("reports lock").extend([
+            EngineReport::Started {
+                revision: 2,
+                owned_resource_readiness: ReadinessEvidence::Listener {
+                    port: NonZeroU16::new(1536).expect("nonzero port"),
+                    table: PathBuf::from("/proc/1/net/tcp"),
+                },
+            },
+            EngineReport::BackingOff {
+                revision: 3,
+                retry_after: Duration::from_secs(1),
+            },
+        ]);
+
+        coordinator
+            .execute(&LegacyIntent::Reload {
+                reason: Reason::Fluxctl,
+            })
+            .expect_err("candidate verification failure is reported");
+
+        assert_eq!(
+            *events.lock().expect("events lock"),
+            [
+                Event::Prepared(Reason::Fluxctl),
+                Event::CaptureStopped,
+                Event::EngineRunning(CaptureObservation::Detached),
+                Event::CaptureStarted,
+                Event::CaptureVerified,
+                Event::CaptureStopped,
+                Event::EngineStopped(CaptureObservation::Detached),
+            ]
+        );
+        coordinator.writer.verify_failure = false;
+        events.lock().expect("events lock").clear();
+
+        coordinator.maintain();
+
+        assert_eq!(
+            *events.lock().expect("events lock"),
+            [
+                Event::EngineStopped(CaptureObservation::Detached),
+                Event::EngineRunning(CaptureObservation::Detached),
+                Event::CaptureStarted,
+                Event::CaptureVerified,
+                Event::Published(PublishedRuntimeState::Running {
+                    generation: generation(1),
+                }),
             ]
         );
     }

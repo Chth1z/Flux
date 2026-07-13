@@ -18,10 +18,11 @@ use sha2::{Digest, Sha256};
 
 use crate::{EngineArtifactDigest, EngineSpec, OwnedEngineIdentity};
 
-pub(crate) const FUNCTIONAL_CANARY_SCHEMA_VERSION: u16 = 1;
+pub(crate) const FUNCTIONAL_CANARY_SCHEMA_VERSION: u16 = 2;
 pub(crate) const FUNCTIONAL_CANARY_NONCE_BYTES: usize = 32;
 pub(crate) const CAPTURE_PROGRAM_DIGEST_BYTES: usize = 32;
 pub(crate) const CANARY_DNS_QUESTION_DIGEST_BYTES: usize = 32;
+pub(crate) const CANARY_INBOUND_PAYLOAD_DIGEST_BYTES: usize = 32;
 pub(crate) const CANARY_DNS_WIRE_NAME_BYTES: usize = 83;
 pub(crate) const MAX_FUNCTIONAL_CANARY_DURATION: Duration = Duration::from_secs(3);
 pub(crate) const MAX_CANARY_FACILITY_OBSERVATION_AGE: Duration = Duration::from_secs(3);
@@ -32,6 +33,7 @@ pub(crate) const CANARY_PEER_SERVER_SLOTS: usize = 3;
 pub(crate) const CANARY_NEGATIVE_CONTROL_SLOTS: usize = 2;
 pub(crate) const CANARY_FACILITY_AUDIT_DIGEST_BYTES: usize = 32;
 pub(crate) const CAPTURE_OWNER_RECORD_DIGEST_BYTES: usize = 32;
+pub(crate) const CANARY_INBOUND_DELIVERY_REPORT_SCHEMA_VERSION: u16 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FunctionalCanaryGateMode {
@@ -47,6 +49,13 @@ pub(crate) enum FunctionalCanaryGateMode {
 pub(crate) enum CanaryAddressFamilies {
     Ipv4Only,
     Ipv4AndIpv6,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CanaryCaptureBackend {
+    Tproxy,
+    Redirect,
+    Dnat,
 }
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
@@ -236,6 +245,7 @@ pub(crate) struct CanaryAttemptObjectIdentities {
     selector: CanaryAttemptObjectIdentity,
     leak_guard: CanaryAttemptObjectIdentity,
     counters: CanaryAttemptObjectIdentity,
+    listener_delivery_report: CanaryAttemptObjectIdentity,
 }
 
 impl CanaryAttemptObjectIdentities {
@@ -246,6 +256,7 @@ impl CanaryAttemptObjectIdentities {
         selector: CanaryAttemptObjectIdentity,
         leak_guard: CanaryAttemptObjectIdentity,
         counters: CanaryAttemptObjectIdentity,
+        listener_delivery_report: CanaryAttemptObjectIdentity,
     ) -> Self {
         Self {
             generation,
@@ -253,6 +264,7 @@ impl CanaryAttemptObjectIdentities {
             selector,
             leak_guard,
             counters,
+            listener_delivery_report,
         }
     }
 
@@ -279,6 +291,11 @@ impl CanaryAttemptObjectIdentities {
     #[must_use]
     pub(crate) const fn counters(self) -> CanaryAttemptObjectIdentity {
         self.counters
+    }
+
+    #[must_use]
+    pub(crate) const fn listener_delivery_report(self) -> CanaryAttemptObjectIdentity {
+        self.listener_delivery_report
     }
 }
 
@@ -1430,6 +1447,7 @@ impl CanaryCounterDeltaBounds {
 pub(crate) struct CanaryAttemptRequest {
     schema_version: u16,
     pre_binding: CanaryAttemptBinding,
+    capture_backend: CanaryCaptureBackend,
     nonce: CanaryNonce,
     deadline: CanaryDeadline,
     families: CanaryAddressFamilies,
@@ -1495,6 +1513,7 @@ impl CanaryAttemptRequest {
         Ok(Self {
             schema_version: FUNCTIONAL_CANARY_SCHEMA_VERSION,
             pre_binding,
+            capture_backend: CanaryCaptureBackend::Tproxy,
             nonce,
             deadline,
             families,
@@ -1516,6 +1535,11 @@ impl CanaryAttemptRequest {
     #[must_use]
     pub(crate) const fn pre_binding(&self) -> &CanaryAttemptBinding {
         &self.pre_binding
+    }
+
+    #[must_use]
+    pub(crate) const fn capture_backend(&self) -> CanaryCaptureBackend {
+        self.capture_backend
     }
 
     #[must_use]
@@ -1592,6 +1616,18 @@ pub(crate) enum CanaryFlowKind {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CanaryFlowProtocol {
+    Tcp,
+    Udp,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CanaryFlowAddressFamily {
+    Ipv4,
+    Ipv6,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub(crate) enum CanaryFlow {
     Ipv4TcpEcho = 0,
@@ -1630,6 +1666,30 @@ impl CanaryFlow {
             Self::Ipv4UdpEcho | Self::Ipv6UdpEcho => CanaryFlowKind::UdpEcho,
             Self::Ipv4DnsUdp | Self::Ipv6DnsUdp => CanaryFlowKind::DnsUdp,
             Self::Ipv4DnsTcp | Self::Ipv6DnsTcp => CanaryFlowKind::DnsTcp,
+        }
+    }
+
+    pub(crate) const fn protocol(self) -> CanaryFlowProtocol {
+        match self.kind() {
+            CanaryFlowKind::TcpEcho | CanaryFlowKind::DnsTcp => CanaryFlowProtocol::Tcp,
+            CanaryFlowKind::UdpEcho | CanaryFlowKind::DnsUdp => CanaryFlowProtocol::Udp,
+        }
+    }
+
+    pub(crate) const fn address_family(self) -> CanaryFlowAddressFamily {
+        if self.is_ipv4() {
+            CanaryFlowAddressFamily::Ipv4
+        } else {
+            CanaryFlowAddressFamily::Ipv6
+        }
+    }
+
+    const fn inbound_listener_slot(self) -> usize {
+        match (self.address_family(), self.protocol()) {
+            (CanaryFlowAddressFamily::Ipv4, CanaryFlowProtocol::Tcp) => 0,
+            (CanaryFlowAddressFamily::Ipv4, CanaryFlowProtocol::Udp) => 1,
+            (CanaryFlowAddressFamily::Ipv6, CanaryFlowProtocol::Tcp) => 2,
+            (CanaryFlowAddressFamily::Ipv6, CanaryFlowProtocol::Udp) => 3,
         }
     }
 
@@ -1862,6 +1922,370 @@ impl UnqualifiedCanaryDnsEvidence {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct CanaryInboundPayloadDigest([u8; CANARY_INBOUND_PAYLOAD_DIGEST_BYTES]);
+
+impl CanaryInboundPayloadDigest {
+    #[must_use]
+    const fn from_bytes(bytes: [u8; CANARY_INBOUND_PAYLOAD_DIGEST_BYTES]) -> Self {
+        Self(bytes)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CanaryInboundPayloadIdentity {
+    Echo {
+        nonce: CanaryNonce,
+        wire_length: NonZeroU16,
+        wire_digest: CanaryInboundPayloadDigest,
+    },
+    Dns {
+        nonce: CanaryNonce,
+        transaction_id: u16,
+        question: CanaryDnsQuestionDigest,
+        wire_length: NonZeroU16,
+        wire_digest: CanaryInboundPayloadDigest,
+        tcp_length_prefix: Option<u16>,
+    },
+}
+
+fn expected_inbound_payload_identity(
+    request: &CanaryAttemptRequest,
+    flow: CanaryFlow,
+) -> CanaryInboundPayloadIdentity {
+    let Some(dns) = request.expected_dns(flow) else {
+        let mut hasher = Sha256::new();
+        hasher.update(request.nonce().as_bytes());
+        let wire_digest = CanaryInboundPayloadDigest::from_bytes(hasher.finalize().into());
+        return CanaryInboundPayloadIdentity::Echo {
+            nonce: request.nonce(),
+            wire_length: NonZeroU16::new(
+                u16::try_from(FUNCTIONAL_CANARY_NONCE_BYTES)
+                    .expect("the fixed nonce length fits u16"),
+            )
+            .expect("the fixed nonce length is nonzero"),
+            wire_digest,
+        };
+    };
+
+    const DNS_HEADER_BYTES: u16 = 12;
+    const DNS_QUESTION_FOOTER_BYTES: u16 = 4;
+    let wire_length = DNS_HEADER_BYTES
+        + u16::try_from(CANARY_DNS_WIRE_NAME_BYTES).expect("DNS wire-name length fits u16")
+        + DNS_QUESTION_FOOTER_BYTES;
+    let mut hasher = Sha256::new();
+    hasher.update(dns.transaction_id.to_be_bytes());
+    hasher.update(0x0100_u16.to_be_bytes());
+    hasher.update(1_u16.to_be_bytes());
+    hasher.update(0_u16.to_be_bytes());
+    hasher.update(0_u16.to_be_bytes());
+    hasher.update(0_u16.to_be_bytes());
+    hasher.update(dns.question.wire_name);
+    hasher.update(dns.question.record_type.to_be_bytes());
+    hasher.update(1_u16.to_be_bytes());
+    let wire_digest = CanaryInboundPayloadDigest::from_bytes(hasher.finalize().into());
+    CanaryInboundPayloadIdentity::Dns {
+        nonce: request.nonce(),
+        transaction_id: dns.transaction_id,
+        question: dns.question_digest,
+        wire_length: NonZeroU16::new(wire_length).expect("DNS query wire length is nonzero"),
+        wire_digest,
+        tcp_length_prefix: (flow.kind() == CanaryFlowKind::DnsTcp).then_some(wire_length),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CanaryListenerSocketObservation {
+    authority: CanarySocketObserverAuthority,
+    sequence: NonZeroU64,
+    lost_events_before: u64,
+    lost_events_after: u64,
+    observed_at: Instant,
+}
+
+impl CanaryListenerSocketObservation {
+    #[cfg(test)]
+    #[must_use]
+    const fn new(
+        authority: CanarySocketObserverAuthority,
+        sequence: NonZeroU64,
+        lost_events_before: u64,
+        lost_events_after: u64,
+        observed_at: Instant,
+    ) -> Self {
+        Self {
+            authority,
+            sequence,
+            lost_events_before,
+            lost_events_after,
+            observed_at,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CanaryInboundDeliveryAuthority {
+    SupervisedEngineReport {
+        engine: OwnedEngineIdentity,
+        report_object: CanaryAttemptObjectIdentity,
+        schema_version: NonZeroU16,
+    },
+    QualifiedCgroupBpf {
+        observer: CanarySocketObserverAuthority,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CanaryInboundDeliveryEvent {
+    authority: CanaryInboundDeliveryAuthority,
+    sequence: NonZeroU64,
+    lost_events_before: u64,
+    lost_events_after: u64,
+    observed_at: Instant,
+}
+
+impl CanaryInboundDeliveryEvent {
+    #[cfg(test)]
+    #[must_use]
+    const fn new(
+        authority: CanaryInboundDeliveryAuthority,
+        sequence: NonZeroU64,
+        lost_events_before: u64,
+        lost_events_after: u64,
+        observed_at: Instant,
+    ) -> Self {
+        Self {
+            authority,
+            sequence,
+            lost_events_before,
+            lost_events_after,
+            observed_at,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CanaryTproxyListenerSocketIdentity {
+    generation: NonZeroU32,
+    engine: OwnedEngineIdentity,
+    listener: CanaryListenerIdentity,
+    daemon_network_namespace: NetworkNamespaceIdentity,
+    capture_program_digest: CaptureProgramDigest,
+    selector: CanaryAttemptObjectIdentity,
+    protocol: CanaryFlowProtocol,
+    address_family: CanaryFlowAddressFamily,
+    listener_fd: CanaryProcFd,
+    listener_inode: NonZeroU64,
+    listener_cookie: CanaryInetDiagCookie,
+    bind: SocketAddr,
+    transparent: bool,
+    ipv6_only: Option<bool>,
+    observation: CanaryListenerSocketObservation,
+}
+
+impl CanaryTproxyListenerSocketIdentity {
+    #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
+    #[must_use]
+    const fn new(
+        generation: NonZeroU32,
+        engine: OwnedEngineIdentity,
+        listener: CanaryListenerIdentity,
+        daemon_network_namespace: NetworkNamespaceIdentity,
+        capture_program_digest: CaptureProgramDigest,
+        selector: CanaryAttemptObjectIdentity,
+        protocol: CanaryFlowProtocol,
+        address_family: CanaryFlowAddressFamily,
+        listener_fd: CanaryProcFd,
+        listener_inode: NonZeroU64,
+        listener_cookie: CanaryInetDiagCookie,
+        bind: SocketAddr,
+        transparent: bool,
+        ipv6_only: Option<bool>,
+        observation: CanaryListenerSocketObservation,
+    ) -> Self {
+        Self {
+            generation,
+            engine,
+            listener,
+            daemon_network_namespace,
+            capture_program_digest,
+            selector,
+            protocol,
+            address_family,
+            listener_fd,
+            listener_inode,
+            listener_cookie,
+            bind,
+            transparent,
+            ipv6_only,
+            observation,
+        }
+    }
+
+    fn same_socket_as(&self, other: &Self) -> bool {
+        self.generation == other.generation
+            && self.engine == other.engine
+            && self.listener == other.listener
+            && self.daemon_network_namespace == other.daemon_network_namespace
+            && self.capture_program_digest == other.capture_program_digest
+            && self.selector == other.selector
+            && self.protocol == other.protocol
+            && self.address_family == other.address_family
+            && self.listener_fd == other.listener_fd
+            && self.listener_inode == other.listener_inode
+            && self.listener_cookie == other.listener_cookie
+            && self.bind == other.bind
+            && self.transparent == other.transparent
+            && self.ipv6_only == other.ipv6_only
+    }
+
+    fn physical_identity_collides_with(&self, other: &Self) -> bool {
+        self.listener_fd == other.listener_fd
+            || self.listener_inode == other.listener_inode
+            || self.listener_cookie == other.listener_cookie
+    }
+
+    fn physical_identity_collides_with_socket(
+        &self,
+        fd: CanaryProcFd,
+        inode: NonZeroU64,
+        cookie: CanaryInetDiagCookie,
+    ) -> bool {
+        self.listener_fd == fd || self.listener_inode == inode || self.listener_cookie == cookie
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CanaryTproxyAcceptedSocketDelivery {
+    flow: CanaryFlow,
+    engine: OwnedEngineIdentity,
+    listener_cookie: CanaryInetDiagCookie,
+    accepted_fd: CanaryProcFd,
+    accepted_inode: NonZeroU64,
+    accepted_cookie: CanaryInetDiagCookie,
+    local: SocketAddr,
+    peer: SocketAddr,
+    event: CanaryInboundDeliveryEvent,
+    payload: CanaryInboundPayloadIdentity,
+}
+
+impl CanaryTproxyAcceptedSocketDelivery {
+    #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
+    #[must_use]
+    const fn new(
+        flow: CanaryFlow,
+        engine: OwnedEngineIdentity,
+        listener_cookie: CanaryInetDiagCookie,
+        accepted_fd: CanaryProcFd,
+        accepted_inode: NonZeroU64,
+        accepted_cookie: CanaryInetDiagCookie,
+        local: SocketAddr,
+        peer: SocketAddr,
+        event: CanaryInboundDeliveryEvent,
+        payload: CanaryInboundPayloadIdentity,
+    ) -> Self {
+        Self {
+            flow,
+            engine,
+            listener_cookie,
+            accepted_fd,
+            accepted_inode,
+            accepted_cookie,
+            local,
+            peer,
+            event,
+            payload,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CanaryOriginalDestinationCmsg {
+    Ipv4 { payload_length: u16 },
+    Ipv6 { payload_length: u16 },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CanaryTproxyUdpRecvmsgDelivery {
+    flow: CanaryFlow,
+    listener_cookie: CanaryInetDiagCookie,
+    client_source: SocketAddr,
+    original_destination: SocketAddr,
+    payload_truncated: bool,
+    control_truncated: bool,
+    original_destination_cmsg_count: u8,
+    original_destination_cmsg: CanaryOriginalDestinationCmsg,
+    event: CanaryInboundDeliveryEvent,
+    payload: CanaryInboundPayloadIdentity,
+}
+
+impl CanaryTproxyUdpRecvmsgDelivery {
+    #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
+    #[must_use]
+    const fn new(
+        flow: CanaryFlow,
+        listener_cookie: CanaryInetDiagCookie,
+        client_source: SocketAddr,
+        original_destination: SocketAddr,
+        payload_truncated: bool,
+        control_truncated: bool,
+        original_destination_cmsg_count: u8,
+        original_destination_cmsg: CanaryOriginalDestinationCmsg,
+        event: CanaryInboundDeliveryEvent,
+        payload: CanaryInboundPayloadIdentity,
+    ) -> Self {
+        Self {
+            flow,
+            listener_cookie,
+            client_source,
+            original_destination,
+            payload_truncated,
+            control_truncated,
+            original_destination_cmsg_count,
+            original_destination_cmsg,
+            event,
+            payload,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum UnqualifiedCanaryInboundListenerDeliveryEvidence {
+    TproxyTcp {
+        listener: CanaryTproxyListenerSocketIdentity,
+        accepted: CanaryTproxyAcceptedSocketDelivery,
+    },
+    TproxyUdp {
+        listener: CanaryTproxyListenerSocketIdentity,
+        datagram: CanaryTproxyUdpRecvmsgDelivery,
+    },
+    Redirect,
+    Dnat,
+}
+
+impl UnqualifiedCanaryInboundListenerDeliveryEvidence {
+    #[must_use]
+    pub(crate) const fn capture_backend(&self) -> CanaryCaptureBackend {
+        match self {
+            Self::TproxyTcp { .. } | Self::TproxyUdp { .. } => CanaryCaptureBackend::Tproxy,
+            Self::Redirect => CanaryCaptureBackend::Redirect,
+            Self::Dnat => CanaryCaptureBackend::Dnat,
+        }
+    }
+
+    #[must_use]
+    const fn delivery_event(&self) -> Option<CanaryInboundDeliveryEvent> {
+        match self {
+            Self::TproxyTcp { accepted, .. } => Some(accepted.event),
+            Self::TproxyUdp { datagram, .. } => Some(datagram.event),
+            Self::Redirect | Self::Dnat => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct UnqualifiedCanaryFlowEvidence {
     flow: CanaryFlow,
@@ -1872,6 +2296,7 @@ pub(crate) struct UnqualifiedCanaryFlowEvidence {
     peer_tuple: CanaryFlowTuple,
     started_at: Instant,
     completed_at: Instant,
+    inbound_listener_delivery: Option<UnqualifiedCanaryInboundListenerDeliveryEvidence>,
     dns: Option<UnqualifiedCanaryDnsEvidence>,
 }
 
@@ -1887,6 +2312,7 @@ impl UnqualifiedCanaryFlowEvidence {
         peer_tuple: CanaryFlowTuple,
         started_at: Instant,
         completed_at: Instant,
+        inbound_listener_delivery: Option<UnqualifiedCanaryInboundListenerDeliveryEvidence>,
         dns: Option<UnqualifiedCanaryDnsEvidence>,
     ) -> Self {
         Self {
@@ -1898,6 +2324,7 @@ impl UnqualifiedCanaryFlowEvidence {
             peer_tuple,
             started_at,
             completed_at,
+            inbound_listener_delivery,
             dns,
         }
     }
@@ -2266,6 +2693,132 @@ pub(crate) enum CanaryEvidenceError {
     FlowTupleMismatch {
         flow: CanaryFlow,
     },
+    MissingInboundListenerDelivery {
+        flow: CanaryFlow,
+    },
+    InboundListenerBackendMismatch {
+        flow: CanaryFlow,
+        expected: CanaryCaptureBackend,
+        observed: CanaryCaptureBackend,
+    },
+    InboundListenerBackendUnsupported {
+        flow: CanaryFlow,
+        backend: CanaryCaptureBackend,
+    },
+    InboundListenerGenerationMismatch {
+        flow: CanaryFlow,
+    },
+    InboundListenerEngineMismatch {
+        flow: CanaryFlow,
+    },
+    InboundListenerIdentityMismatch {
+        flow: CanaryFlow,
+    },
+    InboundListenerObserverMismatch {
+        flow: CanaryFlow,
+    },
+    InboundListenerDeliveryAuthorityMismatch {
+        flow: CanaryFlow,
+    },
+    InboundListenerNetworkNamespaceMismatch {
+        flow: CanaryFlow,
+    },
+    InboundListenerCaptureProgramMismatch {
+        flow: CanaryFlow,
+    },
+    InboundListenerSelectorMismatch {
+        flow: CanaryFlow,
+    },
+    InboundListenerFlowMismatch {
+        expected: CanaryFlow,
+        observed: CanaryFlow,
+    },
+    InboundListenerProtocolMismatch {
+        flow: CanaryFlow,
+    },
+    InboundListenerAddressFamilyMismatch {
+        flow: CanaryFlow,
+    },
+    InboundListenerBindMismatch {
+        flow: CanaryFlow,
+    },
+    InboundListenerTransparentSocketRequired {
+        flow: CanaryFlow,
+    },
+    InboundListenerIpv6OnlyStateInvalid {
+        flow: CanaryFlow,
+    },
+    InboundListenerObservationLoss {
+        flow: CanaryFlow,
+    },
+    InboundListenerObservationLossBaselineChanged {
+        first: CanaryFlow,
+        second: CanaryFlow,
+    },
+    InboundListenerSocketObservationTimingInvalid {
+        flow: CanaryFlow,
+    },
+    InboundListenerTransportEvidenceMismatch {
+        flow: CanaryFlow,
+    },
+    InboundListenerAcceptedEngineMismatch {
+        flow: CanaryFlow,
+    },
+    InboundListenerSocketLinkMismatch {
+        flow: CanaryFlow,
+    },
+    InboundListenerAcceptedSocketIdentityCollision {
+        flow: CanaryFlow,
+    },
+    InboundListenerClientSourceMismatch {
+        flow: CanaryFlow,
+    },
+    InboundListenerOriginalDestinationMismatch {
+        flow: CanaryFlow,
+    },
+    InboundListenerTimingInvalid {
+        flow: CanaryFlow,
+    },
+    InboundListenerEventLoss {
+        flow: CanaryFlow,
+    },
+    InboundListenerEventSequenceReused {
+        first: CanaryFlow,
+        second: CanaryFlow,
+    },
+    InboundListenerEventLossBaselineChanged {
+        first: CanaryFlow,
+        second: CanaryFlow,
+    },
+    InboundListenerDeliveryAuthorityChanged {
+        first: CanaryFlow,
+        second: CanaryFlow,
+    },
+    InboundListenerAcceptedSocketIdentityReused {
+        first: CanaryFlow,
+        second: CanaryFlow,
+    },
+    InboundListenerSocketIdentityReused {
+        first: CanaryFlow,
+        second: CanaryFlow,
+    },
+    InboundListenerAcceptedSocketConflictsWithListener {
+        listener: CanaryFlow,
+        accepted: CanaryFlow,
+    },
+    InboundListenerSocketIdentityChanged {
+        first: CanaryFlow,
+        second: CanaryFlow,
+    },
+    InboundListenerUdpMessageTruncated {
+        flow: CanaryFlow,
+    },
+    InboundListenerUdpOriginalDestinationInvalid {
+        flow: CanaryFlow,
+    },
+    InboundListenerPayloadMismatch {
+        flow: CanaryFlow,
+    },
     DnsEvidenceMissing {
         flow: CanaryFlow,
     },
@@ -2396,6 +2949,19 @@ fn validate_flow_evidence(
     evidence: &UnqualifiedCanaryFlowEvidenceSlots,
     attempt_completed_at: Instant,
 ) -> Result<(), CanaryEvidenceError> {
+    let mut listener_sockets: [Option<(CanaryFlow, &CanaryTproxyListenerSocketIdentity)>; 4] =
+        [None; 4];
+    let mut delivery_sequences: [Option<(CanaryFlow, NonZeroU64)>; FUNCTIONAL_CANARY_FLOW_SLOTS] =
+        [None; FUNCTIONAL_CANARY_FLOW_SLOTS];
+    let mut delivery_loss_baseline: Option<(CanaryFlow, u64)> = None;
+    let mut listener_observation_loss_baseline: Option<(CanaryFlow, u64)> = None;
+    let mut delivery_authority: Option<(CanaryFlow, CanaryInboundDeliveryAuthority)> = None;
+    let mut accepted_socket_identities: [Option<(
+        CanaryFlow,
+        CanaryProcFd,
+        NonZeroU64,
+        CanaryInetDiagCookie,
+    )>; FUNCTIONAL_CANARY_FLOW_SLOTS] = [None; FUNCTIONAL_CANARY_FLOW_SLOTS];
     for expected_flow in CanaryFlow::ALL {
         let slot = &evidence.slots[expected_flow.index()];
         if !request.requires_flow(expected_flow) {
@@ -2451,6 +3017,126 @@ fn validate_flow_evidence(
                 flow: expected_flow,
             });
         }
+        let validated_delivery =
+            validate_inbound_listener_delivery(request, expected_flow, observed)?;
+        let listener_slot = expected_flow.inbound_listener_slot();
+        if let Some((first_flow, first_listener)) = listener_sockets[listener_slot] {
+            if !first_listener.same_socket_as(validated_delivery.listener) {
+                return Err(CanaryEvidenceError::InboundListenerSocketIdentityChanged {
+                    first: first_flow,
+                    second: expected_flow,
+                });
+            }
+        } else {
+            for (first_flow, first_listener) in listener_sockets.iter().flatten().copied() {
+                if first_listener.physical_identity_collides_with(validated_delivery.listener) {
+                    return Err(CanaryEvidenceError::InboundListenerSocketIdentityReused {
+                        first: first_flow,
+                        second: expected_flow,
+                    });
+                }
+            }
+            for (accepted_flow, accepted_fd, accepted_inode, accepted_cookie) in
+                accepted_socket_identities.iter().flatten().copied()
+            {
+                if validated_delivery
+                    .listener
+                    .physical_identity_collides_with_socket(
+                        accepted_fd,
+                        accepted_inode,
+                        accepted_cookie,
+                    )
+                {
+                    return Err(
+                        CanaryEvidenceError::InboundListenerAcceptedSocketConflictsWithListener {
+                            listener: expected_flow,
+                            accepted: accepted_flow,
+                        },
+                    );
+                }
+            }
+            listener_sockets[listener_slot] = Some((expected_flow, validated_delivery.listener));
+        }
+        let listener_loss_baseline = validated_delivery.listener.observation.lost_events_before;
+        if let Some((first_flow, first_loss_baseline)) = listener_observation_loss_baseline {
+            if first_loss_baseline != listener_loss_baseline {
+                return Err(
+                    CanaryEvidenceError::InboundListenerObservationLossBaselineChanged {
+                        first: first_flow,
+                        second: expected_flow,
+                    },
+                );
+            }
+        } else {
+            listener_observation_loss_baseline = Some((expected_flow, listener_loss_baseline));
+        }
+        for (first_flow, first_sequence) in delivery_sequences.iter().flatten().copied() {
+            if first_sequence == validated_delivery.event.sequence {
+                return Err(CanaryEvidenceError::InboundListenerEventSequenceReused {
+                    first: first_flow,
+                    second: expected_flow,
+                });
+            }
+        }
+        delivery_sequences[expected_flow.index()] =
+            Some((expected_flow, validated_delivery.event.sequence));
+        if let Some((first_flow, first_authority)) = delivery_authority {
+            if first_authority != validated_delivery.event.authority {
+                return Err(
+                    CanaryEvidenceError::InboundListenerDeliveryAuthorityChanged {
+                        first: first_flow,
+                        second: expected_flow,
+                    },
+                );
+            }
+        } else {
+            delivery_authority = Some((expected_flow, validated_delivery.event.authority));
+        }
+        if let Some((first_flow, first_loss_baseline)) = delivery_loss_baseline {
+            if first_loss_baseline != validated_delivery.event.lost_events_before {
+                return Err(
+                    CanaryEvidenceError::InboundListenerEventLossBaselineChanged {
+                        first: first_flow,
+                        second: expected_flow,
+                    },
+                );
+            }
+        } else {
+            delivery_loss_baseline =
+                Some((expected_flow, validated_delivery.event.lost_events_before));
+        }
+        if let Some((accepted_fd, accepted_inode, accepted_cookie)) =
+            validated_delivery.accepted_socket
+        {
+            for (listener_flow, listener) in listener_sockets.iter().flatten().copied() {
+                if listener.physical_identity_collides_with_socket(
+                    accepted_fd,
+                    accepted_inode,
+                    accepted_cookie,
+                ) {
+                    return Err(
+                        CanaryEvidenceError::InboundListenerAcceptedSocketConflictsWithListener {
+                            listener: listener_flow,
+                            accepted: expected_flow,
+                        },
+                    );
+                }
+            }
+            for (first_flow, _, first_inode, first_cookie) in
+                accepted_socket_identities.iter().flatten().copied()
+            {
+                if first_inode == accepted_inode || first_cookie == accepted_cookie {
+                    return Err(
+                        CanaryEvidenceError::InboundListenerAcceptedSocketIdentityReused {
+                            first: first_flow,
+                            second: expected_flow,
+                        },
+                    );
+                }
+            }
+            accepted_socket_identities[expected_flow.index()] =
+                Some((expected_flow, accepted_fd, accepted_inode, accepted_cookie));
+        }
         match (expected_flow.is_dns(), observed.dns) {
             (true, Some(dns)) => validate_dns(
                 expected_flow,
@@ -2470,6 +3156,232 @@ fn validate_flow_evidence(
             }
             (false, None) => {}
         }
+    }
+    Ok(())
+}
+
+struct ValidatedInboundListenerDelivery<'a> {
+    listener: &'a CanaryTproxyListenerSocketIdentity,
+    event: CanaryInboundDeliveryEvent,
+    accepted_socket: Option<(CanaryProcFd, NonZeroU64, CanaryInetDiagCookie)>,
+}
+
+fn validate_inbound_listener_delivery<'a>(
+    request: &CanaryAttemptRequest,
+    flow: CanaryFlow,
+    flow_evidence: &'a UnqualifiedCanaryFlowEvidence,
+) -> Result<ValidatedInboundListenerDelivery<'a>, CanaryEvidenceError> {
+    let delivery = flow_evidence
+        .inbound_listener_delivery
+        .as_ref()
+        .ok_or(CanaryEvidenceError::MissingInboundListenerDelivery { flow })?;
+    let expected_backend = request.capture_backend();
+    let observed_backend = delivery.capture_backend();
+    if observed_backend != expected_backend {
+        return Err(CanaryEvidenceError::InboundListenerBackendMismatch {
+            flow,
+            expected: expected_backend,
+            observed: observed_backend,
+        });
+    }
+    if expected_backend != CanaryCaptureBackend::Tproxy {
+        return Err(CanaryEvidenceError::InboundListenerBackendUnsupported {
+            flow,
+            backend: expected_backend,
+        });
+    }
+    let (listener, event, payload, accepted_socket) = match (flow.protocol(), delivery) {
+        (
+            CanaryFlowProtocol::Tcp,
+            UnqualifiedCanaryInboundListenerDeliveryEvidence::TproxyTcp { listener, accepted },
+        ) => {
+            if accepted.flow != flow {
+                return Err(CanaryEvidenceError::InboundListenerFlowMismatch {
+                    expected: flow,
+                    observed: accepted.flow,
+                });
+            }
+            if accepted.engine != request.pre_binding.engine.engine() {
+                return Err(CanaryEvidenceError::InboundListenerAcceptedEngineMismatch { flow });
+            }
+            if accepted.listener_cookie != listener.listener_cookie {
+                return Err(CanaryEvidenceError::InboundListenerSocketLinkMismatch { flow });
+            }
+            if accepted.accepted_fd == listener.listener_fd
+                || accepted.accepted_inode == listener.listener_inode
+                || accepted.accepted_cookie == listener.listener_cookie
+            {
+                return Err(
+                    CanaryEvidenceError::InboundListenerAcceptedSocketIdentityCollision { flow },
+                );
+            }
+            if accepted.peer != flow_evidence.client_tuple.source() {
+                return Err(CanaryEvidenceError::InboundListenerClientSourceMismatch { flow });
+            }
+            if accepted.local != flow_evidence.client_tuple.destination() {
+                return Err(
+                    CanaryEvidenceError::InboundListenerOriginalDestinationMismatch { flow },
+                );
+            }
+            (
+                listener,
+                accepted.event,
+                accepted.payload,
+                Some((
+                    accepted.accepted_fd,
+                    accepted.accepted_inode,
+                    accepted.accepted_cookie,
+                )),
+            )
+        }
+        (
+            CanaryFlowProtocol::Udp,
+            UnqualifiedCanaryInboundListenerDeliveryEvidence::TproxyUdp { listener, datagram },
+        ) => {
+            if datagram.flow != flow {
+                return Err(CanaryEvidenceError::InboundListenerFlowMismatch {
+                    expected: flow,
+                    observed: datagram.flow,
+                });
+            }
+            if datagram.listener_cookie != listener.listener_cookie {
+                return Err(CanaryEvidenceError::InboundListenerSocketLinkMismatch { flow });
+            }
+            if datagram.client_source != flow_evidence.client_tuple.source() {
+                return Err(CanaryEvidenceError::InboundListenerClientSourceMismatch { flow });
+            }
+            if datagram.original_destination != flow_evidence.client_tuple.destination() {
+                return Err(
+                    CanaryEvidenceError::InboundListenerOriginalDestinationMismatch { flow },
+                );
+            }
+            if datagram.payload_truncated || datagram.control_truncated {
+                return Err(CanaryEvidenceError::InboundListenerUdpMessageTruncated { flow });
+            }
+            let cmsg_matches = matches!(
+                (flow.address_family(), &datagram.original_destination_cmsg),
+                (
+                    CanaryFlowAddressFamily::Ipv4,
+                    CanaryOriginalDestinationCmsg::Ipv4 { payload_length: 16 }
+                ) | (
+                    CanaryFlowAddressFamily::Ipv6,
+                    CanaryOriginalDestinationCmsg::Ipv6 { payload_length: 28 }
+                )
+            );
+            if datagram.original_destination_cmsg_count != 1 || !cmsg_matches {
+                return Err(
+                    CanaryEvidenceError::InboundListenerUdpOriginalDestinationInvalid { flow },
+                );
+            }
+            (listener, datagram.event, datagram.payload, None)
+        }
+        _ => {
+            return Err(CanaryEvidenceError::InboundListenerTransportEvidenceMismatch { flow });
+        }
+    };
+    validate_tproxy_listener_socket(request, flow, flow_evidence, listener, event)?;
+    let expected_payload = expected_inbound_payload_identity(request, flow);
+    if payload != expected_payload {
+        return Err(CanaryEvidenceError::InboundListenerPayloadMismatch { flow });
+    }
+    Ok(ValidatedInboundListenerDelivery {
+        listener,
+        event,
+        accepted_socket,
+    })
+}
+
+fn validate_tproxy_listener_socket(
+    request: &CanaryAttemptRequest,
+    flow: CanaryFlow,
+    flow_evidence: &UnqualifiedCanaryFlowEvidence,
+    listener: &CanaryTproxyListenerSocketIdentity,
+    delivery_event: CanaryInboundDeliveryEvent,
+) -> Result<(), CanaryEvidenceError> {
+    let engine = &request.pre_binding.engine;
+    if listener.generation != engine.generation() {
+        return Err(CanaryEvidenceError::InboundListenerGenerationMismatch { flow });
+    }
+    if listener.engine != engine.engine() {
+        return Err(CanaryEvidenceError::InboundListenerEngineMismatch { flow });
+    }
+    if &listener.listener != engine.listener() {
+        return Err(CanaryEvidenceError::InboundListenerIdentityMismatch { flow });
+    }
+    let authority = &request.pre_binding.environment.authority;
+    let expected_observer = authority.socket_observer;
+    if listener.observation.authority != expected_observer {
+        return Err(CanaryEvidenceError::InboundListenerObserverMismatch { flow });
+    }
+    let delivery_authority_valid = match delivery_event.authority {
+        CanaryInboundDeliveryAuthority::SupervisedEngineReport {
+            engine: observed_engine,
+            report_object,
+            schema_version,
+        } => {
+            observed_engine == engine.engine()
+                && report_object
+                    == request
+                        .pre_binding
+                        .environment
+                        .attempt_objects
+                        .listener_delivery_report
+                && schema_version.get() == CANARY_INBOUND_DELIVERY_REPORT_SCHEMA_VERSION
+        }
+        CanaryInboundDeliveryAuthority::QualifiedCgroupBpf { observer } => {
+            observer == expected_observer
+                && matches!(
+                    observer,
+                    CanarySocketObserverAuthority::QualifiedCgroupBpf { .. }
+                )
+        }
+    };
+    if !delivery_authority_valid {
+        return Err(CanaryEvidenceError::InboundListenerDeliveryAuthorityMismatch { flow });
+    }
+    if listener.daemon_network_namespace != authority.network.daemon_network_namespace {
+        return Err(CanaryEvidenceError::InboundListenerNetworkNamespaceMismatch { flow });
+    }
+    if listener.capture_program_digest != authority.capture_program_digest {
+        return Err(CanaryEvidenceError::InboundListenerCaptureProgramMismatch { flow });
+    }
+    if listener.selector != request.pre_binding.environment.attempt_objects.selector {
+        return Err(CanaryEvidenceError::InboundListenerSelectorMismatch { flow });
+    }
+    if listener.protocol != flow.protocol() {
+        return Err(CanaryEvidenceError::InboundListenerProtocolMismatch { flow });
+    }
+    if listener.address_family != flow.address_family() {
+        return Err(CanaryEvidenceError::InboundListenerAddressFamilyMismatch { flow });
+    }
+    if listener.bind.port() != engine.listener().port().get()
+        || !listener.bind.ip().is_unspecified()
+        || listener.bind.is_ipv4() != flow.is_ipv4()
+    {
+        return Err(CanaryEvidenceError::InboundListenerBindMismatch { flow });
+    }
+    if !listener.transparent {
+        return Err(CanaryEvidenceError::InboundListenerTransparentSocketRequired { flow });
+    }
+    match (listener.address_family, listener.ipv6_only) {
+        (CanaryFlowAddressFamily::Ipv4, None) | (CanaryFlowAddressFamily::Ipv6, Some(true)) => {}
+        _ => return Err(CanaryEvidenceError::InboundListenerIpv6OnlyStateInvalid { flow }),
+    }
+    if listener.observation.lost_events_before != listener.observation.lost_events_after {
+        return Err(CanaryEvidenceError::InboundListenerObservationLoss { flow });
+    }
+    if delivery_event.lost_events_before != delivery_event.lost_events_after {
+        return Err(CanaryEvidenceError::InboundListenerEventLoss { flow });
+    }
+    if listener.observation.observed_at < request.deadline().started_at()
+        || listener.observation.observed_at > delivery_event.observed_at
+    {
+        return Err(CanaryEvidenceError::InboundListenerSocketObservationTimingInvalid { flow });
+    }
+    if delivery_event.observed_at < flow_evidence.started_at
+        || delivery_event.observed_at > flow_evidence.completed_at
+    {
+        return Err(CanaryEvidenceError::InboundListenerTimingInvalid { flow });
     }
     Ok(())
 }
@@ -3190,6 +4102,864 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn inbound_listener_delivery_is_required_and_backend_specific() {
+        let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+        let flow = CanaryFlow::Ipv4TcpEcho;
+
+        let mut missing = fixture.successful_evidence();
+        missing.flows.slots[flow.index()]
+            .as_mut()
+            .expect("IPv4 TCP evidence")
+            .inbound_listener_delivery = None;
+        assert_eq!(
+            validate(&fixture, missing).expect_err("listener delivery is mandatory"),
+            CanaryEvidenceError::MissingInboundListenerDelivery { flow }
+        );
+
+        let mut redirected = fixture.successful_evidence();
+        let flow_evidence = redirected.flows.slots[flow.index()]
+            .as_mut()
+            .expect("IPv4 TCP evidence");
+        flow_evidence.inbound_listener_delivery =
+            Some(UnqualifiedCanaryInboundListenerDeliveryEvidence::Redirect);
+        assert_eq!(
+            validate(&fixture, redirected).expect_err("REDIRECT delivery cannot qualify TPROXY"),
+            CanaryEvidenceError::InboundListenerBackendMismatch {
+                flow,
+                expected: CanaryCaptureBackend::Tproxy,
+                observed: CanaryCaptureBackend::Redirect,
+            }
+        );
+
+        let mut dnat = fixture.successful_evidence();
+        let flow_evidence = dnat.flows.slots[flow.index()]
+            .as_mut()
+            .expect("IPv4 TCP evidence");
+        flow_evidence.inbound_listener_delivery =
+            Some(UnqualifiedCanaryInboundListenerDeliveryEvidence::Dnat);
+        assert_eq!(
+            validate(&fixture, dnat).expect_err("DNAT delivery cannot qualify TPROXY"),
+            CanaryEvidenceError::InboundListenerBackendMismatch {
+                flow,
+                expected: CanaryCaptureBackend::Tproxy,
+                observed: CanaryCaptureBackend::Dnat,
+            }
+        );
+    }
+
+    #[test]
+    fn tproxy_listener_delivery_binds_generation_engine_listener_and_flow_shape() {
+        let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+        let flow = CanaryFlow::Ipv4TcpEcho;
+
+        let mut generation = fixture.successful_evidence();
+        tproxy_listener_mut(&mut generation, flow).generation =
+            NonZeroU32::new(18).expect("different generation");
+        assert_eq!(
+            validate(&fixture, generation).expect_err("generation drift cannot pass"),
+            CanaryEvidenceError::InboundListenerGenerationMismatch { flow }
+        );
+
+        let mut engine = fixture.successful_evidence();
+        tproxy_listener_mut(&mut engine, flow).engine = OwnedEngineIdentity::new(
+            NonZeroU32::new(4243).expect("different pid"),
+            NonZeroU64::new(98_766).expect("different start ticks"),
+        );
+        assert_eq!(
+            validate(&fixture, engine).expect_err("another process cannot satisfy delivery"),
+            CanaryEvidenceError::InboundListenerEngineMismatch { flow }
+        );
+
+        let mut listener = fixture.successful_evidence();
+        tproxy_listener_mut(&mut listener, flow).listener.port =
+            NonZeroU16::new(1537).expect("different listener port");
+        assert_eq!(
+            validate(&fixture, listener).expect_err("another listener cannot satisfy delivery"),
+            CanaryEvidenceError::InboundListenerIdentityMismatch { flow }
+        );
+
+        let mut wrong_flow = fixture.successful_evidence();
+        tproxy_tcp_delivery_mut(&mut wrong_flow, flow).flow = CanaryFlow::Ipv4UdpEcho;
+        assert_eq!(
+            validate(&fixture, wrong_flow).expect_err("another flow cannot satisfy delivery"),
+            CanaryEvidenceError::InboundListenerFlowMismatch {
+                expected: flow,
+                observed: CanaryFlow::Ipv4UdpEcho,
+            }
+        );
+
+        let mut protocol = fixture.successful_evidence();
+        tproxy_listener_mut(&mut protocol, flow).protocol = CanaryFlowProtocol::Udp;
+        assert_eq!(
+            validate(&fixture, protocol).expect_err("UDP cannot prove TCP listener delivery"),
+            CanaryEvidenceError::InboundListenerProtocolMismatch { flow }
+        );
+
+        let mut family = fixture.successful_evidence();
+        tproxy_listener_mut(&mut family, flow).address_family = CanaryFlowAddressFamily::Ipv6;
+        assert_eq!(
+            validate(&fixture, family).expect_err("IPv6 cannot prove IPv4 listener delivery"),
+            CanaryEvidenceError::InboundListenerAddressFamilyMismatch { flow }
+        );
+    }
+
+    #[test]
+    fn tproxy_listener_delivery_binds_tuple_timing_and_attempt_payload() {
+        let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+        let flow = CanaryFlow::Ipv4TcpEcho;
+
+        let mut client_source = fixture.successful_evidence();
+        let accepted = tproxy_tcp_delivery_mut(&mut client_source, flow);
+        accepted.peer.set_port(accepted.peer.port() + 1);
+        assert_eq!(
+            validate(&fixture, client_source).expect_err("another client cannot satisfy delivery"),
+            CanaryEvidenceError::InboundListenerClientSourceMismatch { flow }
+        );
+
+        let mut destination = fixture.successful_evidence();
+        let accepted = tproxy_tcp_delivery_mut(&mut destination, flow);
+        accepted.local.set_port(accepted.local.port() + 1);
+        assert_eq!(
+            validate(&fixture, destination)
+                .expect_err("a rewritten destination cannot satisfy TPROXY delivery"),
+            CanaryEvidenceError::InboundListenerOriginalDestinationMismatch { flow }
+        );
+
+        let mut timing = fixture.successful_evidence();
+        let started_at = timing.flows.slots[flow.index()]
+            .as_ref()
+            .expect("IPv4 TCP evidence")
+            .started_at;
+        tproxy_delivery_event_mut(&mut timing, flow).observed_at =
+            started_at - Duration::from_nanos(1);
+        assert_eq!(
+            validate(&fixture, timing).expect_err("out-of-flow delivery cannot pass"),
+            CanaryEvidenceError::InboundListenerTimingInvalid { flow }
+        );
+
+        let mut echo_payload = fixture.successful_evidence();
+        let CanaryInboundPayloadIdentity::Echo { nonce, .. } =
+            tproxy_payload_mut(&mut echo_payload, flow)
+        else {
+            panic!("echo flow carries echo payload identity");
+        };
+        *nonce = CanaryNonce::from_bytes([8; FUNCTIONAL_CANARY_NONCE_BYTES]);
+        assert_eq!(
+            validate(&fixture, echo_payload).expect_err("another echo nonce cannot pass"),
+            CanaryEvidenceError::InboundListenerPayloadMismatch { flow }
+        );
+
+        let dns_flow = CanaryFlow::Ipv4DnsUdp;
+        let mut dns_payload = fixture.successful_evidence();
+        let CanaryInboundPayloadIdentity::Dns { transaction_id, .. } =
+            tproxy_payload_mut(&mut dns_payload, dns_flow)
+        else {
+            panic!("DNS flow carries DNS listener payload identity");
+        };
+        *transaction_id ^= 1;
+        assert_eq!(
+            validate(&fixture, dns_payload)
+                .expect_err("another nonce-derived DNS transaction cannot pass"),
+            CanaryEvidenceError::InboundListenerPayloadMismatch { flow: dns_flow }
+        );
+    }
+
+    #[test]
+    fn tproxy_listener_socket_is_bound_to_authority_attempt_and_socket_state() {
+        let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+        let flow = CanaryFlow::Ipv4TcpEcho;
+
+        let mut observer = fixture.successful_evidence();
+        tproxy_listener_mut(&mut observer, flow)
+            .observation
+            .authority = CanarySocketObserverAuthority::ProcFdInetDiag {
+            collector_identity: CanaryAttemptObjectIdentity::new(
+                [12; CANARY_ATTEMPT_OBJECT_IDENTITY_BYTES],
+            )
+            .expect("observer identity"),
+            collector_revision: NonZeroU64::new(13).expect("observer revision"),
+            netlink_port_id: NonZeroU32::new(15).expect("different port ID"),
+        };
+        assert_eq!(
+            validate(&fixture, observer).expect_err("another socket observer cannot pass"),
+            CanaryEvidenceError::InboundListenerObserverMismatch { flow }
+        );
+
+        let mut network_namespace = fixture.successful_evidence();
+        tproxy_listener_mut(&mut network_namespace, flow).daemon_network_namespace = fixture
+            .request
+            .pre_binding
+            .environment
+            .authority
+            .network
+            .peer_network_namespace;
+        assert_eq!(
+            validate(&fixture, network_namespace)
+                .expect_err("another network namespace cannot pass"),
+            CanaryEvidenceError::InboundListenerNetworkNamespaceMismatch { flow }
+        );
+
+        let mut capture_program = fixture.successful_evidence();
+        tproxy_listener_mut(&mut capture_program, flow).capture_program_digest =
+            CaptureProgramDigest::new([4; CAPTURE_PROGRAM_DIGEST_BYTES])
+                .expect("different capture program");
+        assert_eq!(
+            validate(&fixture, capture_program).expect_err("another capture program cannot pass"),
+            CanaryEvidenceError::InboundListenerCaptureProgramMismatch { flow }
+        );
+
+        let mut selector = fixture.successful_evidence();
+        tproxy_listener_mut(&mut selector, flow).selector =
+            CanaryAttemptObjectIdentity::new([16; CANARY_ATTEMPT_OBJECT_IDENTITY_BYTES])
+                .expect("different selector");
+        assert_eq!(
+            validate(&fixture, selector).expect_err("another attempt selector cannot pass"),
+            CanaryEvidenceError::InboundListenerSelectorMismatch { flow }
+        );
+
+        let mut bind = fixture.successful_evidence();
+        let listener = tproxy_listener_mut(&mut bind, flow);
+        listener.bind.set_port(listener.bind.port() + 1);
+        assert_eq!(
+            validate(&fixture, bind).expect_err("another bind tuple cannot pass"),
+            CanaryEvidenceError::InboundListenerBindMismatch { flow }
+        );
+
+        let mut non_wildcard = fixture.successful_evidence();
+        tproxy_listener_mut(&mut non_wildcard, flow)
+            .bind
+            .set_ip(IpAddr::V4(Ipv4Addr::new(11, 0, 0, 1)));
+        assert_eq!(
+            validate(&fixture, non_wildcard)
+                .expect_err("a non-wildcard listener cannot satisfy this TPROXY contract"),
+            CanaryEvidenceError::InboundListenerBindMismatch { flow }
+        );
+
+        let mut wrong_bind_family = fixture.successful_evidence();
+        tproxy_listener_mut(&mut wrong_bind_family, flow).bind =
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 1536);
+        assert_eq!(
+            validate(&fixture, wrong_bind_family)
+                .expect_err("an IPv6 bind cannot prove an IPv4 listener"),
+            CanaryEvidenceError::InboundListenerBindMismatch { flow }
+        );
+
+        let mut transparent = fixture.successful_evidence();
+        tproxy_listener_mut(&mut transparent, flow).transparent = false;
+        assert_eq!(
+            validate(&fixture, transparent)
+                .expect_err("a conventional listener cannot qualify TPROXY"),
+            CanaryEvidenceError::InboundListenerTransparentSocketRequired { flow }
+        );
+
+        let mut ipv4_v6only = fixture.successful_evidence();
+        tproxy_listener_mut(&mut ipv4_v6only, flow).ipv6_only = Some(true);
+        assert_eq!(
+            validate(&fixture, ipv4_v6only).expect_err("IPv4 has no IPV6_V6ONLY state"),
+            CanaryEvidenceError::InboundListenerIpv6OnlyStateInvalid { flow }
+        );
+
+        let mut observation_loss = fixture.successful_evidence();
+        tproxy_listener_mut(&mut observation_loss, flow)
+            .observation
+            .lost_events_after = 5;
+        assert_eq!(
+            validate(&fixture, observation_loss)
+                .expect_err("an incomplete listener observation cannot pass"),
+            CanaryEvidenceError::InboundListenerObservationLoss { flow }
+        );
+
+        let mut observation_timing = fixture.successful_evidence();
+        let delivery_observed_at =
+            tproxy_delivery_event_mut(&mut observation_timing, flow).observed_at;
+        tproxy_listener_mut(&mut observation_timing, flow)
+            .observation
+            .observed_at = delivery_observed_at + Duration::from_nanos(1);
+        assert_eq!(
+            validate(&fixture, observation_timing)
+                .expect_err("a listener observed after delivery cannot pass"),
+            CanaryEvidenceError::InboundListenerSocketObservationTimingInvalid { flow }
+        );
+
+        let dual = Fixture::new(CanaryAddressFamilies::Ipv4AndIpv6);
+        let ipv6_flow = CanaryFlow::Ipv6TcpEcho;
+        let mut ipv6_v6only = dual.successful_evidence();
+        tproxy_listener_mut(&mut ipv6_v6only, ipv6_flow).ipv6_only = Some(false);
+        assert_eq!(
+            validate(&dual, ipv6_v6only).expect_err("the separate IPv6 listener must be v6-only"),
+            CanaryEvidenceError::InboundListenerIpv6OnlyStateInvalid { flow: ipv6_flow }
+        );
+    }
+
+    #[test]
+    fn transport_specific_tproxy_delivery_rejects_unlinked_or_lossy_socket_events() {
+        let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+        let tcp_flow = CanaryFlow::Ipv4TcpEcho;
+
+        let mut accepted_engine = fixture.successful_evidence();
+        tproxy_tcp_delivery_mut(&mut accepted_engine, tcp_flow).engine = OwnedEngineIdentity::new(
+            NonZeroU32::new(4243).expect("different PID"),
+            NonZeroU64::new(98_766).expect("different start ticks"),
+        );
+        assert_eq!(
+            validate(&fixture, accepted_engine)
+                .expect_err("an accepted socket from another process cannot pass"),
+            CanaryEvidenceError::InboundListenerAcceptedEngineMismatch { flow: tcp_flow }
+        );
+
+        let mut unlinked = fixture.successful_evidence();
+        tproxy_tcp_delivery_mut(&mut unlinked, tcp_flow).listener_cookie =
+            CanaryInetDiagCookie::new(99, 1).expect("different listener cookie");
+        assert_eq!(
+            validate(&fixture, unlinked).expect_err("an unlinked accepted socket cannot pass"),
+            CanaryEvidenceError::InboundListenerSocketLinkMismatch { flow: tcp_flow }
+        );
+
+        let mut collision = fixture.successful_evidence();
+        let listener_inode = tproxy_listener_mut(&mut collision, tcp_flow).listener_inode;
+        tproxy_tcp_delivery_mut(&mut collision, tcp_flow).accepted_inode = listener_inode;
+        assert_eq!(
+            validate(&fixture, collision)
+                .expect_err("the listener cannot masquerade as its accepted child"),
+            CanaryEvidenceError::InboundListenerAcceptedSocketIdentityCollision { flow: tcp_flow }
+        );
+
+        let mut fd_collision = fixture.successful_evidence();
+        let listener_fd = tproxy_listener_mut(&mut fd_collision, tcp_flow).listener_fd;
+        tproxy_tcp_delivery_mut(&mut fd_collision, tcp_flow).accepted_fd = listener_fd;
+        assert_eq!(
+            validate(&fixture, fd_collision)
+                .expect_err("the accepted child cannot reuse the live listener FD"),
+            CanaryEvidenceError::InboundListenerAcceptedSocketIdentityCollision { flow: tcp_flow }
+        );
+
+        let mut cookie_collision = fixture.successful_evidence();
+        let listener_cookie = tproxy_listener_mut(&mut cookie_collision, tcp_flow).listener_cookie;
+        tproxy_tcp_delivery_mut(&mut cookie_collision, tcp_flow).accepted_cookie = listener_cookie;
+        assert_eq!(
+            validate(&fixture, cookie_collision)
+                .expect_err("the accepted child cannot reuse the listener cookie"),
+            CanaryEvidenceError::InboundListenerAcceptedSocketIdentityCollision { flow: tcp_flow }
+        );
+
+        let udp_flow = CanaryFlow::Ipv4UdpEcho;
+        let mut truncated = fixture.successful_evidence();
+        tproxy_udp_delivery_mut(&mut truncated, udp_flow).control_truncated = true;
+        assert_eq!(
+            validate(&fixture, truncated).expect_err("MSG_CTRUNC cannot pass"),
+            CanaryEvidenceError::InboundListenerUdpMessageTruncated { flow: udp_flow }
+        );
+
+        let mut payload_truncated = fixture.successful_evidence();
+        tproxy_udp_delivery_mut(&mut payload_truncated, udp_flow).payload_truncated = true;
+        assert_eq!(
+            validate(&fixture, payload_truncated).expect_err("MSG_TRUNC cannot pass"),
+            CanaryEvidenceError::InboundListenerUdpMessageTruncated { flow: udp_flow }
+        );
+
+        let mut udp_unlinked = fixture.successful_evidence();
+        tproxy_udp_delivery_mut(&mut udp_unlinked, udp_flow).listener_cookie =
+            CanaryInetDiagCookie::new(99, 2).expect("different listener cookie");
+        assert_eq!(
+            validate(&fixture, udp_unlinked)
+                .expect_err("a datagram from another listener cannot pass"),
+            CanaryEvidenceError::InboundListenerSocketLinkMismatch { flow: udp_flow }
+        );
+
+        let mut missing_cmsg = fixture.successful_evidence();
+        tproxy_udp_delivery_mut(&mut missing_cmsg, udp_flow).original_destination_cmsg_count = 0;
+        assert_eq!(
+            validate(&fixture, missing_cmsg)
+                .expect_err("a missing original-destination cmsg cannot pass"),
+            CanaryEvidenceError::InboundListenerUdpOriginalDestinationInvalid { flow: udp_flow }
+        );
+
+        let mut duplicate_cmsg = fixture.successful_evidence();
+        tproxy_udp_delivery_mut(&mut duplicate_cmsg, udp_flow).original_destination_cmsg_count = 2;
+        assert_eq!(
+            validate(&fixture, duplicate_cmsg)
+                .expect_err("duplicate original-destination cmsgs cannot pass"),
+            CanaryEvidenceError::InboundListenerUdpOriginalDestinationInvalid { flow: udp_flow }
+        );
+
+        let mut wrong_cmsg_family = fixture.successful_evidence();
+        tproxy_udp_delivery_mut(&mut wrong_cmsg_family, udp_flow).original_destination_cmsg =
+            CanaryOriginalDestinationCmsg::Ipv6 { payload_length: 28 };
+        assert_eq!(
+            validate(&fixture, wrong_cmsg_family)
+                .expect_err("an IPv6 cmsg cannot prove an IPv4 datagram"),
+            CanaryEvidenceError::InboundListenerUdpOriginalDestinationInvalid { flow: udp_flow }
+        );
+
+        let mut wrong_cmsg_length = fixture.successful_evidence();
+        tproxy_udp_delivery_mut(&mut wrong_cmsg_length, udp_flow).original_destination_cmsg =
+            CanaryOriginalDestinationCmsg::Ipv4 { payload_length: 15 };
+        assert_eq!(
+            validate(&fixture, wrong_cmsg_length)
+                .expect_err("a malformed sockaddr_in cmsg cannot pass"),
+            CanaryEvidenceError::InboundListenerUdpOriginalDestinationInvalid { flow: udp_flow }
+        );
+
+        let dual = Fixture::new(CanaryAddressFamilies::Ipv4AndIpv6);
+        let ipv6_udp = CanaryFlow::Ipv6UdpEcho;
+        let mut wrong_ipv6_cmsg_length = dual.successful_evidence();
+        tproxy_udp_delivery_mut(&mut wrong_ipv6_cmsg_length, ipv6_udp).original_destination_cmsg =
+            CanaryOriginalDestinationCmsg::Ipv6 { payload_length: 27 };
+        assert_eq!(
+            validate(&dual, wrong_ipv6_cmsg_length)
+                .expect_err("a malformed sockaddr_in6 cmsg cannot pass"),
+            CanaryEvidenceError::InboundListenerUdpOriginalDestinationInvalid { flow: ipv6_udp }
+        );
+
+        let mut wrong_transport = fixture.successful_evidence();
+        let udp_delivery = wrong_transport.flows.slots[udp_flow.index()]
+            .as_ref()
+            .expect("IPv4 UDP evidence")
+            .inbound_listener_delivery
+            .as_ref()
+            .expect("UDP listener delivery")
+            .clone();
+        wrong_transport.flows.slots[tcp_flow.index()]
+            .as_mut()
+            .expect("IPv4 TCP evidence")
+            .inbound_listener_delivery = Some(udp_delivery);
+        assert_eq!(
+            validate(&fixture, wrong_transport)
+                .expect_err("UDP recvmsg evidence cannot prove TCP acceptance"),
+            CanaryEvidenceError::InboundListenerTransportEvidenceMismatch { flow: tcp_flow }
+        );
+    }
+
+    #[test]
+    fn inbound_delivery_events_are_unique_stable_and_single_authority() {
+        let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+        let first = CanaryFlow::Ipv4TcpEcho;
+        let second = CanaryFlow::Ipv4UdpEcho;
+
+        let mut independent_sequences = fixture.successful_evidence();
+        tproxy_delivery_event_mut(&mut independent_sequences, first).sequence =
+            NonZeroU64::new(1).expect("independent delivery sequence");
+        validate(&fixture, independent_sequences)
+            .expect("listener-observer and delivery-authority sequence domains are independent");
+
+        let mut shared_listener_sequence = fixture.successful_evidence();
+        let listener_sequence = tproxy_listener_mut(&mut shared_listener_sequence, first)
+            .observation
+            .sequence;
+        tproxy_listener_mut(&mut shared_listener_sequence, second)
+            .observation
+            .sequence = listener_sequence;
+        validate(&fixture, shared_listener_sequence)
+            .expect("one complete listener snapshot may cover multiple sockets and flows");
+
+        let mut reused_sequence = fixture.successful_evidence();
+        let first_sequence = tproxy_delivery_event_mut(&mut reused_sequence, first).sequence;
+        tproxy_delivery_event_mut(&mut reused_sequence, second).sequence = first_sequence;
+        assert_eq!(
+            validate(&fixture, reused_sequence)
+                .expect_err("one delivery event cannot satisfy two flows"),
+            CanaryEvidenceError::InboundListenerEventSequenceReused { first, second }
+        );
+
+        let mut event_loss = fixture.successful_evidence();
+        tproxy_delivery_event_mut(&mut event_loss, first).lost_events_after = 5;
+        assert_eq!(
+            validate(&fixture, event_loss).expect_err("delivery event loss cannot pass"),
+            CanaryEvidenceError::InboundListenerEventLoss { flow: first }
+        );
+
+        let mut baseline = fixture.successful_evidence();
+        let event = tproxy_delivery_event_mut(&mut baseline, second);
+        event.lost_events_before = 5;
+        event.lost_events_after = 5;
+        assert_eq!(
+            validate(&fixture, baseline).expect_err("loss baseline drift cannot pass"),
+            CanaryEvidenceError::InboundListenerEventLossBaselineChanged { first, second }
+        );
+
+        let mut listener_baseline = fixture.successful_evidence();
+        let observation = &mut tproxy_listener_mut(&mut listener_baseline, second).observation;
+        observation.lost_events_before = 5;
+        observation.lost_events_after = 5;
+        assert_eq!(
+            validate(&fixture, listener_baseline)
+                .expect_err("listener-observer loss baseline drift cannot pass"),
+            CanaryEvidenceError::InboundListenerObservationLossBaselineChanged { first, second }
+        );
+
+        let mut listener_fd_reused = fixture.successful_evidence();
+        let first_listener_fd = tproxy_listener_mut(&mut listener_fd_reused, first).listener_fd;
+        tproxy_listener_mut(&mut listener_fd_reused, second).listener_fd = first_listener_fd;
+        assert_eq!(
+            validate(&fixture, listener_fd_reused)
+                .expect_err("TCP and UDP listener roles cannot reuse one FD"),
+            CanaryEvidenceError::InboundListenerSocketIdentityReused { first, second }
+        );
+
+        let mut listener_inode_reused = fixture.successful_evidence();
+        let first_listener_inode =
+            tproxy_listener_mut(&mut listener_inode_reused, first).listener_inode;
+        tproxy_listener_mut(&mut listener_inode_reused, second).listener_inode =
+            first_listener_inode;
+        assert_eq!(
+            validate(&fixture, listener_inode_reused)
+                .expect_err("TCP and UDP listener roles cannot reuse one inode"),
+            CanaryEvidenceError::InboundListenerSocketIdentityReused { first, second }
+        );
+
+        let mut listener_cookie_reused = fixture.successful_evidence();
+        let first_listener_cookie =
+            tproxy_listener_mut(&mut listener_cookie_reused, first).listener_cookie;
+        tproxy_listener_mut(&mut listener_cookie_reused, second).listener_cookie =
+            first_listener_cookie;
+        tproxy_udp_delivery_mut(&mut listener_cookie_reused, second).listener_cookie =
+            first_listener_cookie;
+        assert_eq!(
+            validate(&fixture, listener_cookie_reused)
+                .expect_err("TCP and UDP listener roles cannot reuse one socket cookie"),
+            CanaryEvidenceError::InboundListenerSocketIdentityReused { first, second }
+        );
+
+        let mut accepted_conflicts_with_later_listener = fixture.successful_evidence();
+        let udp_listener_cookie =
+            tproxy_listener_mut(&mut accepted_conflicts_with_later_listener, second)
+                .listener_cookie;
+        tproxy_tcp_delivery_mut(&mut accepted_conflicts_with_later_listener, first)
+            .accepted_cookie = udp_listener_cookie;
+        assert_eq!(
+            validate(&fixture, accepted_conflicts_with_later_listener)
+                .expect_err("an accepted child cannot collide with a later listener role"),
+            CanaryEvidenceError::InboundListenerAcceptedSocketConflictsWithListener {
+                listener: second,
+                accepted: first,
+            }
+        );
+
+        let dns_tcp = CanaryFlow::Ipv4DnsTcp;
+        let mut listener_changed = fixture.successful_evidence();
+        tproxy_listener_mut(&mut listener_changed, dns_tcp).listener_inode =
+            NonZeroU64::new(71_000).expect("different listener inode");
+        assert_eq!(
+            validate(&fixture, listener_changed)
+                .expect_err("one transport cannot switch listener sockets mid-attempt"),
+            CanaryEvidenceError::InboundListenerSocketIdentityChanged {
+                first,
+                second: dns_tcp,
+            }
+        );
+
+        let dns_udp = CanaryFlow::Ipv4DnsUdp;
+        let mut udp_listener_changed = fixture.successful_evidence();
+        tproxy_listener_mut(&mut udp_listener_changed, dns_udp).listener_inode =
+            NonZeroU64::new(71_001).expect("different UDP listener inode");
+        assert_eq!(
+            validate(&fixture, udp_listener_changed)
+                .expect_err("UDP echo and DNS must share one stable listener socket"),
+            CanaryEvidenceError::InboundListenerSocketIdentityChanged {
+                first: second,
+                second: dns_udp,
+            }
+        );
+
+        let mut accepted_conflicts_with_existing_listener = fixture.successful_evidence();
+        let udp_listener_inode =
+            tproxy_listener_mut(&mut accepted_conflicts_with_existing_listener, second)
+                .listener_inode;
+        tproxy_tcp_delivery_mut(&mut accepted_conflicts_with_existing_listener, dns_tcp)
+            .accepted_inode = udp_listener_inode;
+        assert_eq!(
+            validate(&fixture, accepted_conflicts_with_existing_listener)
+                .expect_err("an accepted child cannot collide with an existing listener role"),
+            CanaryEvidenceError::InboundListenerAcceptedSocketConflictsWithListener {
+                listener: second,
+                accepted: dns_tcp,
+            }
+        );
+
+        let mut accepted_reused = fixture.successful_evidence();
+        let first_inode = tproxy_tcp_delivery_mut(&mut accepted_reused, first).accepted_inode;
+        tproxy_tcp_delivery_mut(&mut accepted_reused, dns_tcp).accepted_inode = first_inode;
+        assert_eq!(
+            validate(&fixture, accepted_reused)
+                .expect_err("two TCP flows cannot reuse an accepted socket identity"),
+            CanaryEvidenceError::InboundListenerAcceptedSocketIdentityReused {
+                first,
+                second: dns_tcp,
+            }
+        );
+
+        let mut accepted_cookie_reused = fixture.successful_evidence();
+        let first_cookie =
+            tproxy_tcp_delivery_mut(&mut accepted_cookie_reused, first).accepted_cookie;
+        tproxy_tcp_delivery_mut(&mut accepted_cookie_reused, dns_tcp).accepted_cookie =
+            first_cookie;
+        assert_eq!(
+            validate(&fixture, accepted_cookie_reused)
+                .expect_err("two TCP flows cannot reuse an accepted socket cookie"),
+            CanaryEvidenceError::InboundListenerAcceptedSocketIdentityReused {
+                first,
+                second: dns_tcp,
+            }
+        );
+
+        let mut mixed_fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+        let qualified_observer = qualified_cgroup_bpf_observer();
+        mixed_fixture
+            .request
+            .pre_binding
+            .environment
+            .authority
+            .socket_observer = qualified_observer;
+        let mut qualified = mixed_fixture.successful_evidence();
+        for flow in CanaryFlow::ALL {
+            if mixed_fixture.request.requires_flow(flow) {
+                tproxy_delivery_event_mut(&mut qualified, flow).authority =
+                    CanaryInboundDeliveryAuthority::QualifiedCgroupBpf {
+                        observer: qualified_observer,
+                    };
+            }
+        }
+        validate(&mixed_fixture, qualified)
+            .expect("one exact qualified cgroup-BPF authority may prove every delivery");
+
+        let mut mixed = mixed_fixture.successful_evidence();
+        tproxy_delivery_event_mut(&mut mixed, second).authority =
+            CanaryInboundDeliveryAuthority::QualifiedCgroupBpf {
+                observer: qualified_observer,
+            };
+        assert_eq!(
+            validate(&mixed_fixture, mixed)
+                .expect_err("one attempt cannot mix report and BPF delivery authority"),
+            CanaryEvidenceError::InboundListenerDeliveryAuthorityChanged { first, second }
+        );
+    }
+
+    #[test]
+    fn supervised_delivery_report_and_exact_wire_identity_are_attempt_bound() {
+        let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+        let flow = CanaryFlow::Ipv4TcpEcho;
+
+        let mut exact_lengths = fixture.successful_evidence();
+        let CanaryInboundPayloadIdentity::Echo {
+            wire_length,
+            wire_digest,
+            ..
+        } = *tproxy_payload_mut(&mut exact_lengths, flow)
+        else {
+            panic!("echo flow carries echo payload identity");
+        };
+        assert_eq!(
+            wire_length.get(),
+            u16::try_from(FUNCTIONAL_CANARY_NONCE_BYTES).expect("nonce length fits u16")
+        );
+        let mut echo_hasher = Sha256::new();
+        echo_hasher.update(fixture.request.nonce().as_bytes());
+        assert_eq!(
+            wire_digest,
+            CanaryInboundPayloadDigest::from_bytes(echo_hasher.finalize().into())
+        );
+        let dns_udp = CanaryFlow::Ipv4DnsUdp;
+        let CanaryInboundPayloadIdentity::Dns {
+            wire_length,
+            tcp_length_prefix,
+            ..
+        } = *tproxy_payload_mut(&mut exact_lengths, dns_udp)
+        else {
+            panic!("DNS/UDP flow carries DNS payload identity");
+        };
+        assert_eq!(wire_length.get(), 99);
+        assert_eq!(tcp_length_prefix, None);
+        let dns_tcp = CanaryFlow::Ipv4DnsTcp;
+        let CanaryInboundPayloadIdentity::Dns {
+            wire_length,
+            tcp_length_prefix,
+            ..
+        } = *tproxy_payload_mut(&mut exact_lengths, dns_tcp)
+        else {
+            panic!("DNS/TCP flow carries DNS payload identity");
+        };
+        assert_eq!(wire_length.get(), 99);
+        assert_eq!(tcp_length_prefix, Some(99));
+
+        let mut report_engine = fixture.successful_evidence();
+        let CanaryInboundDeliveryAuthority::SupervisedEngineReport { engine, .. } =
+            &mut tproxy_delivery_event_mut(&mut report_engine, flow).authority
+        else {
+            panic!("fixture uses supervised engine reports");
+        };
+        *engine = OwnedEngineIdentity::new(
+            NonZeroU32::new(4243).expect("different report PID"),
+            NonZeroU64::new(98_766).expect("different report start ticks"),
+        );
+        assert_eq!(
+            validate(&fixture, report_engine)
+                .expect_err("another engine cannot own the delivery report"),
+            CanaryEvidenceError::InboundListenerDeliveryAuthorityMismatch { flow }
+        );
+
+        let mut report_object = fixture.successful_evidence();
+        let CanaryInboundDeliveryAuthority::SupervisedEngineReport {
+            report_object: observed_object,
+            ..
+        } = &mut tproxy_delivery_event_mut(&mut report_object, flow).authority
+        else {
+            panic!("fixture uses supervised engine reports");
+        };
+        *observed_object =
+            CanaryAttemptObjectIdentity::new([16; CANARY_ATTEMPT_OBJECT_IDENTITY_BYTES])
+                .expect("different report object");
+        assert_eq!(
+            validate(&fixture, report_object)
+                .expect_err("another report object cannot satisfy delivery"),
+            CanaryEvidenceError::InboundListenerDeliveryAuthorityMismatch { flow }
+        );
+
+        let mut schema = fixture.successful_evidence();
+        let CanaryInboundDeliveryAuthority::SupervisedEngineReport { schema_version, .. } =
+            &mut tproxy_delivery_event_mut(&mut schema, flow).authority
+        else {
+            panic!("fixture uses supervised engine reports");
+        };
+        *schema_version = NonZeroU16::new(2).expect("different schema");
+        assert_eq!(
+            validate(&fixture, schema).expect_err("another report schema cannot pass"),
+            CanaryEvidenceError::InboundListenerDeliveryAuthorityMismatch { flow }
+        );
+
+        let mut invalid_bpf = fixture.successful_evidence();
+        tproxy_delivery_event_mut(&mut invalid_bpf, flow).authority =
+            CanaryInboundDeliveryAuthority::QualifiedCgroupBpf {
+                observer: qualified_cgroup_bpf_observer(),
+            };
+        assert_eq!(
+            validate(&fixture, invalid_bpf)
+                .expect_err("an unbound BPF observer cannot satisfy delivery"),
+            CanaryEvidenceError::InboundListenerDeliveryAuthorityMismatch { flow }
+        );
+
+        let mut non_bpf_authority = fixture.successful_evidence();
+        let proc_fd_observer = fixture
+            .request
+            .pre_binding
+            .environment
+            .authority
+            .socket_observer;
+        tproxy_delivery_event_mut(&mut non_bpf_authority, flow).authority =
+            CanaryInboundDeliveryAuthority::QualifiedCgroupBpf {
+                observer: proc_fd_observer,
+            };
+        assert_eq!(
+            validate(&fixture, non_bpf_authority)
+                .expect_err("a proc/diag observer cannot masquerade as cgroup-BPF authority"),
+            CanaryEvidenceError::InboundListenerDeliveryAuthorityMismatch { flow }
+        );
+
+        let mut echo_length = fixture.successful_evidence();
+        let CanaryInboundPayloadIdentity::Echo { wire_length, .. } =
+            tproxy_payload_mut(&mut echo_length, flow)
+        else {
+            panic!("echo flow carries echo payload identity");
+        };
+        *wire_length = NonZeroU16::new(31).expect("different echo wire length");
+        assert_eq!(
+            validate(&fixture, echo_length).expect_err("a partial echo payload cannot pass"),
+            CanaryEvidenceError::InboundListenerPayloadMismatch { flow }
+        );
+
+        let mut wire_digest = fixture.successful_evidence();
+        let CanaryInboundPayloadIdentity::Echo {
+            wire_digest: observed_digest,
+            ..
+        } = tproxy_payload_mut(&mut wire_digest, flow)
+        else {
+            panic!("echo flow carries echo payload identity");
+        };
+        observed_digest.0[0] ^= 1;
+        assert_eq!(
+            validate(&fixture, wire_digest).expect_err("another wire payload cannot pass"),
+            CanaryEvidenceError::InboundListenerPayloadMismatch { flow }
+        );
+
+        let mut framing = fixture.successful_evidence();
+        let CanaryInboundPayloadIdentity::Dns {
+            tcp_length_prefix, ..
+        } = tproxy_payload_mut(&mut framing, dns_tcp)
+        else {
+            panic!("DNS/TCP flow carries DNS payload identity");
+        };
+        *tcp_length_prefix = None;
+        assert_eq!(
+            validate(&fixture, framing)
+                .expect_err("DNS/TCP without its two-byte length prefix cannot pass"),
+            CanaryEvidenceError::InboundListenerPayloadMismatch { flow: dns_tcp }
+        );
+
+        let mut dns_udp_length = fixture.successful_evidence();
+        let CanaryInboundPayloadIdentity::Dns { wire_length, .. } =
+            tproxy_payload_mut(&mut dns_udp_length, dns_udp)
+        else {
+            panic!("DNS/UDP flow carries DNS payload identity");
+        };
+        *wire_length = NonZeroU16::new(98).expect("different DNS wire length");
+        assert_eq!(
+            validate(&fixture, dns_udp_length).expect_err("an incomplete DNS datagram cannot pass"),
+            CanaryEvidenceError::InboundListenerPayloadMismatch { flow: dns_udp }
+        );
+
+        let mut dns_udp_digest = fixture.successful_evidence();
+        let CanaryInboundPayloadIdentity::Dns { wire_digest, .. } =
+            tproxy_payload_mut(&mut dns_udp_digest, dns_udp)
+        else {
+            panic!("DNS/UDP flow carries DNS payload identity");
+        };
+        wire_digest.0[0] ^= 1;
+        assert_eq!(
+            validate(&fixture, dns_udp_digest)
+                .expect_err("another canonical DNS datagram cannot pass"),
+            CanaryEvidenceError::InboundListenerPayloadMismatch { flow: dns_udp }
+        );
+
+        let mut dns_nonce = fixture.successful_evidence();
+        let CanaryInboundPayloadIdentity::Dns { nonce, .. } =
+            tproxy_payload_mut(&mut dns_nonce, dns_udp)
+        else {
+            panic!("DNS/UDP flow carries DNS payload identity");
+        };
+        *nonce = CanaryNonce::from_bytes([8; FUNCTIONAL_CANARY_NONCE_BYTES]);
+        assert_eq!(
+            validate(&fixture, dns_nonce)
+                .expect_err("a DNS payload from another attempt cannot pass"),
+            CanaryEvidenceError::InboundListenerPayloadMismatch { flow: dns_udp }
+        );
+
+        let mut dns_question = fixture.successful_evidence();
+        let CanaryInboundPayloadIdentity::Dns { question, .. } =
+            tproxy_payload_mut(&mut dns_question, dns_udp)
+        else {
+            panic!("DNS/UDP flow carries DNS payload identity");
+        };
+        question.0[0] ^= 1;
+        assert_eq!(
+            validate(&fixture, dns_question).expect_err("another DNS question digest cannot pass"),
+            CanaryEvidenceError::InboundListenerPayloadMismatch { flow: dns_udp }
+        );
+
+        let mut wrong_framing = fixture.successful_evidence();
+        let CanaryInboundPayloadIdentity::Dns {
+            tcp_length_prefix, ..
+        } = tproxy_payload_mut(&mut wrong_framing, dns_tcp)
+        else {
+            panic!("DNS/TCP flow carries DNS payload identity");
+        };
+        *tcp_length_prefix = Some(98);
+        assert_eq!(
+            validate(&fixture, wrong_framing)
+                .expect_err("an incorrect DNS/TCP length prefix cannot pass"),
+            CanaryEvidenceError::InboundListenerPayloadMismatch { flow: dns_tcp }
+        );
+    }
+
+    #[test]
     fn flow_nonce_slot_tuple_timing_and_dns_mismatches_are_rejected() {
         let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
 
@@ -3610,6 +5380,102 @@ pub(crate) mod tests {
         )
     }
 
+    fn inbound_listener_delivery_mut(
+        evidence: &mut UnqualifiedCanaryGateEvidence,
+        flow: CanaryFlow,
+    ) -> &mut UnqualifiedCanaryInboundListenerDeliveryEvidence {
+        evidence.flows.slots[flow.index()]
+            .as_mut()
+            .expect("required flow evidence")
+            .inbound_listener_delivery
+            .as_mut()
+            .expect("inbound listener delivery evidence")
+    }
+
+    fn tproxy_listener_mut(
+        evidence: &mut UnqualifiedCanaryGateEvidence,
+        flow: CanaryFlow,
+    ) -> &mut CanaryTproxyListenerSocketIdentity {
+        match inbound_listener_delivery_mut(evidence, flow) {
+            UnqualifiedCanaryInboundListenerDeliveryEvidence::TproxyTcp { listener, .. }
+            | UnqualifiedCanaryInboundListenerDeliveryEvidence::TproxyUdp { listener, .. } => {
+                listener
+            }
+            UnqualifiedCanaryInboundListenerDeliveryEvidence::Redirect
+            | UnqualifiedCanaryInboundListenerDeliveryEvidence::Dnat => {
+                panic!("fixture uses TPROXY delivery evidence")
+            }
+        }
+    }
+
+    fn tproxy_tcp_delivery_mut(
+        evidence: &mut UnqualifiedCanaryGateEvidence,
+        flow: CanaryFlow,
+    ) -> &mut CanaryTproxyAcceptedSocketDelivery {
+        match inbound_listener_delivery_mut(evidence, flow) {
+            UnqualifiedCanaryInboundListenerDeliveryEvidence::TproxyTcp { accepted, .. } => {
+                accepted
+            }
+            _ => panic!("fixture flow uses TPROXY TCP delivery evidence"),
+        }
+    }
+
+    fn tproxy_udp_delivery_mut(
+        evidence: &mut UnqualifiedCanaryGateEvidence,
+        flow: CanaryFlow,
+    ) -> &mut CanaryTproxyUdpRecvmsgDelivery {
+        match inbound_listener_delivery_mut(evidence, flow) {
+            UnqualifiedCanaryInboundListenerDeliveryEvidence::TproxyUdp { datagram, .. } => {
+                datagram
+            }
+            _ => panic!("fixture flow uses TPROXY UDP delivery evidence"),
+        }
+    }
+
+    fn tproxy_delivery_event_mut(
+        evidence: &mut UnqualifiedCanaryGateEvidence,
+        flow: CanaryFlow,
+    ) -> &mut CanaryInboundDeliveryEvent {
+        match inbound_listener_delivery_mut(evidence, flow) {
+            UnqualifiedCanaryInboundListenerDeliveryEvidence::TproxyTcp { accepted, .. } => {
+                &mut accepted.event
+            }
+            UnqualifiedCanaryInboundListenerDeliveryEvidence::TproxyUdp { datagram, .. } => {
+                &mut datagram.event
+            }
+            _ => panic!("fixture uses TPROXY delivery evidence"),
+        }
+    }
+
+    fn tproxy_payload_mut(
+        evidence: &mut UnqualifiedCanaryGateEvidence,
+        flow: CanaryFlow,
+    ) -> &mut CanaryInboundPayloadIdentity {
+        match inbound_listener_delivery_mut(evidence, flow) {
+            UnqualifiedCanaryInboundListenerDeliveryEvidence::TproxyTcp { accepted, .. } => {
+                &mut accepted.payload
+            }
+            UnqualifiedCanaryInboundListenerDeliveryEvidence::TproxyUdp { datagram, .. } => {
+                &mut datagram.payload
+            }
+            _ => panic!("fixture uses TPROXY delivery evidence"),
+        }
+    }
+
+    fn qualified_cgroup_bpf_observer() -> CanarySocketObserverAuthority {
+        CanarySocketObserverAuthority::QualifiedCgroupBpf {
+            program_identity: CanaryAttemptObjectIdentity::new(
+                [17; CANARY_ATTEMPT_OBJECT_IDENTITY_BYTES],
+            )
+            .expect("BPF program identity"),
+            link_id: NonZeroU32::new(18).expect("BPF link ID"),
+            event_map_id: NonZeroU32::new(19).expect("BPF event map ID"),
+            loss_map_id: NonZeroU32::new(20).expect("BPF loss map ID"),
+            cgroup_id: NonZeroU64::new(21).expect("cgroup ID"),
+            event_schema_version: NonZeroU16::new(1).expect("BPF event schema"),
+        }
+    }
+
     const BOOT_ID: &str = "00112233-4455-6677-8899-aabbccddeeff";
 
     pub(crate) struct Fixture {
@@ -3648,50 +5514,85 @@ pub(crate) mod tests {
                         80_000 + u64::try_from(index).expect("slot index fits u64"),
                     )
                     .expect("socket inode");
+                    let observer = self
+                        .request
+                        .pre_binding
+                        .environment
+                        .authority
+                        .socket_observer;
+                    let socket_correlation = match observer {
+                        CanarySocketObserverAuthority::ProcFdInetDiag { .. } => {
+                            CanarySocketCorrelation::ProcFdInetDiag {
+                                observer,
+                                process: self.request.pre_binding.engine.engine(),
+                                proc_fd: CanaryProcFd::new(
+                                    100 + u32::try_from(index).expect("slot index fits u32"),
+                                )
+                                .expect("engine socket fd"),
+                                fd_socket_inode: socket_inode,
+                                diag_socket_inode: socket_inode,
+                                inet_diag_cookie: CanaryInetDiagCookie::new(
+                                    1,
+                                    u32::try_from(index + 1).expect("slot cookie"),
+                                )
+                                .expect("nonzero INET_DIAG cookie"),
+                                observer_sequence: NonZeroU64::new(
+                                    90_000 + u64::try_from(index).expect("slot sequence"),
+                                )
+                                .expect("observer sequence"),
+                                diag_protocol: match flow.protocol() {
+                                    CanaryFlowProtocol::Tcp => CanaryInetDiagProtocol::Tcp,
+                                    CanaryFlowProtocol::Udp => CanaryInetDiagProtocol::Udp,
+                                },
+                                diag_tuple: evidence.peer_tuple,
+                                diag_uid: self.request.pre_binding.environment.rpdb.engine_uid,
+                                diag_socket_mark: 0,
+                                fd_scan_complete: true,
+                                diag_dump_complete: true,
+                                snapshot_started_at: evidence.started_at + Duration::from_millis(1),
+                                dump_started_at: evidence.started_at + Duration::from_millis(2),
+                                dump_completed_at: evidence.started_at + Duration::from_millis(3),
+                                snapshot_completed_at: evidence.started_at
+                                    + Duration::from_millis(4),
+                            }
+                        }
+                        CanarySocketObserverAuthority::QualifiedCgroupBpf { .. } => {
+                            CanarySocketCorrelation::QualifiedCgroupBpf {
+                                observer,
+                                process: self.request.pre_binding.engine.engine(),
+                                socket_cookie: NonZeroU64::new(
+                                    80_000 + u64::try_from(index).expect("slot index fits u64"),
+                                )
+                                .expect("socket cookie"),
+                                attempt_nonce: self.request.nonce(),
+                                event_sequence: NonZeroU64::new(
+                                    90_000 + u64::try_from(index).expect("slot sequence"),
+                                )
+                                .expect("event sequence"),
+                                hook: match (flow.protocol(), flow.is_ipv4()) {
+                                    (CanaryFlowProtocol::Tcp, true) => {
+                                        CanaryBpfSocketHook::ConnectIpv4
+                                    }
+                                    (CanaryFlowProtocol::Tcp, false) => {
+                                        CanaryBpfSocketHook::ConnectIpv6
+                                    }
+                                    (CanaryFlowProtocol::Udp, true) => {
+                                        CanaryBpfSocketHook::SendMessageIpv4
+                                    }
+                                    (CanaryFlowProtocol::Udp, false) => {
+                                        CanaryBpfSocketHook::SendMessageIpv6
+                                    }
+                                },
+                                lost_events_before: 0,
+                                lost_events_after: 0,
+                                observed_at: evidence.started_at + Duration::from_millis(2),
+                            }
+                        }
+                    };
                     UnqualifiedCanaryOutboundEvidence::new(
                         flow,
                         evidence.peer_tuple,
-                        CanarySocketCorrelation::ProcFdInetDiag {
-                            observer: self
-                                .request
-                                .pre_binding
-                                .environment
-                                .authority
-                                .socket_observer,
-                            process: self.request.pre_binding.engine.engine(),
-                            proc_fd: CanaryProcFd::new(
-                                100 + u32::try_from(index).expect("slot index fits u32"),
-                            )
-                            .expect("engine socket fd"),
-                            fd_socket_inode: socket_inode,
-                            diag_socket_inode: socket_inode,
-                            inet_diag_cookie: CanaryInetDiagCookie::new(
-                                1,
-                                u32::try_from(index + 1).expect("slot cookie"),
-                            )
-                            .expect("nonzero INET_DIAG cookie"),
-                            observer_sequence: NonZeroU64::new(
-                                90_000 + u64::try_from(index).expect("slot sequence"),
-                            )
-                            .expect("observer sequence"),
-                            diag_protocol: match flow.kind() {
-                                CanaryFlowKind::TcpEcho | CanaryFlowKind::DnsTcp => {
-                                    CanaryInetDiagProtocol::Tcp
-                                }
-                                CanaryFlowKind::UdpEcho | CanaryFlowKind::DnsUdp => {
-                                    CanaryInetDiagProtocol::Udp
-                                }
-                            },
-                            diag_tuple: evidence.peer_tuple,
-                            diag_uid: self.request.pre_binding.environment.rpdb.engine_uid,
-                            diag_socket_mark: 0,
-                            fd_scan_complete: true,
-                            diag_dump_complete: true,
-                            snapshot_started_at: evidence.started_at + Duration::from_millis(1),
-                            dump_started_at: evidence.started_at + Duration::from_millis(2),
-                            dump_completed_at: evidence.started_at + Duration::from_millis(3),
-                            snapshot_completed_at: evidence.started_at + Duration::from_millis(4),
-                        },
+                        socket_correlation,
                         self.request.pre_binding.environment.rpdb.engine_uid,
                         0,
                     )
@@ -3903,6 +5804,8 @@ pub(crate) mod tests {
                 .expect("guard identity"),
             CanaryAttemptObjectIdentity::new([7; CANARY_ATTEMPT_OBJECT_IDENTITY_BYTES])
                 .expect("counter identity"),
+            CanaryAttemptObjectIdentity::new([15; CANARY_ATTEMPT_OBJECT_IDENTITY_BYTES])
+                .expect("listener delivery report identity"),
         );
         let network = CanaryNetworkObservationBinding::new(
             NetworkNamespaceIdentity::new(1, 101).expect("daemon namespace"),
@@ -4047,6 +5950,111 @@ pub(crate) mod tests {
         });
         let started_at = request.deadline().started_at()
             + Duration::from_millis(10 * u64::try_from(index + 1).expect("slot index"));
+        let payload = expected_inbound_payload_identity(request, flow);
+        let listener_slot = flow.inbound_listener_slot();
+        let listener_slot_u32 = u32::try_from(listener_slot).expect("listener slot fits u32");
+        let listener_slot_u64 = u64::try_from(listener_slot).expect("listener slot fits u64");
+        let flow_index_u32 = u32::try_from(index).expect("flow index fits u32");
+        let flow_index_u64 = u64::try_from(index).expect("flow index fits u64");
+        let listener_cookie =
+            CanaryInetDiagCookie::new(10, listener_slot_u32 + 1).expect("fixture listener cookie");
+        let listener_port = request.pre_binding.engine.listener().port().get();
+        let bind = if flow.is_ipv4() {
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), listener_port)
+        } else {
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), listener_port)
+        };
+        let observer = request.pre_binding.environment.authority.socket_observer;
+        let listener = CanaryTproxyListenerSocketIdentity::new(
+            request.pre_binding.engine.generation(),
+            request.pre_binding.engine.engine(),
+            request.pre_binding.engine.listener().clone(),
+            request
+                .pre_binding
+                .environment
+                .authority
+                .network
+                .daemon_network_namespace,
+            request
+                .pre_binding
+                .environment
+                .authority
+                .capture_program_digest,
+            request.pre_binding.environment.attempt_objects.selector,
+            flow.protocol(),
+            flow.address_family(),
+            CanaryProcFd::new(10 + listener_slot_u32).expect("fixture listener fd"),
+            NonZeroU64::new(70_000 + listener_slot_u64).expect("fixture listener inode"),
+            listener_cookie,
+            bind,
+            true,
+            (!flow.is_ipv4()).then_some(true),
+            CanaryListenerSocketObservation::new(
+                observer,
+                NonZeroU64::new(100 + listener_slot_u64).expect("listener observation sequence"),
+                4,
+                4,
+                request.deadline().started_at() + Duration::from_millis(1),
+            ),
+        );
+        let delivery_event = CanaryInboundDeliveryEvent::new(
+            CanaryInboundDeliveryAuthority::SupervisedEngineReport {
+                engine: request.pre_binding.engine.engine(),
+                report_object: request
+                    .pre_binding
+                    .environment
+                    .attempt_objects
+                    .listener_delivery_report,
+                schema_version: NonZeroU16::new(CANARY_INBOUND_DELIVERY_REPORT_SCHEMA_VERSION)
+                    .expect("listener delivery report schema is nonzero"),
+            },
+            NonZeroU64::new(1_000 + flow_index_u64).expect("delivery event sequence"),
+            4,
+            4,
+            started_at + Duration::from_millis(1),
+        );
+        let inbound_listener_delivery = match flow.protocol() {
+            CanaryFlowProtocol::Tcp => {
+                UnqualifiedCanaryInboundListenerDeliveryEvidence::TproxyTcp {
+                    listener,
+                    accepted: CanaryTproxyAcceptedSocketDelivery::new(
+                        flow,
+                        request.pre_binding.engine.engine(),
+                        listener_cookie,
+                        CanaryProcFd::new(100 + flow_index_u32).expect("accepted socket fd"),
+                        NonZeroU64::new(80_000 + flow_index_u64).expect("accepted socket inode"),
+                        CanaryInetDiagCookie::new(20, flow_index_u32 + 1)
+                            .expect("accepted socket cookie"),
+                        client_tuple.destination(),
+                        client_tuple.source(),
+                        delivery_event,
+                        payload,
+                    ),
+                }
+            }
+            CanaryFlowProtocol::Udp => {
+                let original_destination_cmsg = if flow.is_ipv4() {
+                    CanaryOriginalDestinationCmsg::Ipv4 { payload_length: 16 }
+                } else {
+                    CanaryOriginalDestinationCmsg::Ipv6 { payload_length: 28 }
+                };
+                UnqualifiedCanaryInboundListenerDeliveryEvidence::TproxyUdp {
+                    listener,
+                    datagram: CanaryTproxyUdpRecvmsgDelivery::new(
+                        flow,
+                        listener_cookie,
+                        client_tuple.source(),
+                        client_tuple.destination(),
+                        false,
+                        false,
+                        1,
+                        original_destination_cmsg,
+                        delivery_event,
+                        payload,
+                    ),
+                }
+            }
+        };
         UnqualifiedCanaryFlowEvidence::new(
             flow,
             request.nonce(),
@@ -4056,6 +6064,7 @@ pub(crate) mod tests {
             peer_tuple,
             started_at,
             started_at + Duration::from_millis(5),
+            Some(inbound_listener_delivery),
             dns,
         )
     }

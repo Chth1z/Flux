@@ -1,7 +1,7 @@
 # Generation-Scoped Functional Capture Canary
 
 - Status: accepted implementation contract; production qualification incomplete
-- Last updated: 2026-07-13
+- Last updated: 2026-07-14
 
 This document defines the next Phase 1 bridge tracer bullet. It turns `capture-verify` from a
 structural check into a bounded functional transaction without claiming that the Android
@@ -100,6 +100,48 @@ before the first flow and after the last flow. A mismatch, stale reply, missing 
 or expired deadline invalidates the whole attempt. A verification record names only one
 Generation; it cannot be reused after restart, reload, network-namespace replacement, or engine
 replacement.
+
+### Schema-v2 listener and delivery authority
+
+Functional-canary evidence schema v2 requires authoritative inbound listener-delivery evidence
+for every flow. The request-selected backend remains TPROXY. `REDIRECT` and `DNAT` are typed
+negative evidence only and always fail backend matching; they are not supported fallback request
+backends.
+
+The proof has two independent parts. The static listener observation binds the exact Generation,
+supervised engine PID and start ticks, readiness listener identity, daemon network namespace,
+Capture Program digest, attempt selector, protocol and family, listener FD/inode/INET_DIAG cookie,
+family-correct wildcard bind at the admitted port, transparent-socket state, and IPv6-only state.
+IPv4 carries no `IPV6_V6ONLY` state, while the separate IPv6 listener must be v6-only. The
+observation also names the pre-bound socket-observer authority, its nonzero sequence, unchanged
+loss counter, and monotonic observation time. Distinct `(family, protocol)` listener roles cannot
+reuse an FD, inode, or socket cookie.
+
+The per-flow delivery event uses one authority for the whole attempt: either an exact supervised-
+engine report bound to the attempt-owned report object and report schema v1, or the exact
+separately qualified cgroup-BPF observer. Delivery sequences are nonzero and unique per flow; the
+cumulative delivery-loss and listener-observation-loss baselines remain constant, and no event may
+lose records. Listener-observer and delivery-event sequences are independent numeric domains, so
+only monotonic timestamps establish their causal order.
+
+TCP evidence links a distinct accepted FD/inode/cookie to the parent listener cookie and exact
+supervised engine. Its identity cannot collide with any listener role; its local tuple equals the
+original destination and its peer tuple equals the probe source. Accepted inodes and cookies
+cannot be reused across TCP flows. UDP evidence records
+one `recvmsg` delivery per datagram, the selected listener cookie, exact source and original
+destination, no payload or control truncation, and exactly one family-correct original-destination
+cmsg with a 16-byte `sockaddr_in` or 28-byte `sockaddr_in6`. Echo and DNS share one stable listener
+socket for each `(family, protocol)` pair.
+
+The inbound payload is also exact: echo binds the 32-byte nonce, wire length, and SHA-256; DNS binds
+the canonical query bytes, attempt nonce, transaction ID, question digest, wire length, and
+SHA-256. DNS/TCP additionally binds the two-byte length prefix to the DNS message length; the
+digest covers the DNS message bytes. A copied tuple, readiness port/path, `Tproxy` enum, self-report
+alone, or counters cannot qualify a flow.
+
+The schema-v2 `validate_for` listener/delivery validation is complete. Production evidence
+construction is not: positive listener and delivery constructors remain private and test-only
+until a real observer/report factory and distinct-UID local-OUTPUT executor exist.
 
 ## Contained peer topology
 
@@ -213,10 +255,10 @@ receive state to the recovered original destination, and marked relay outbound s
 responder. UDP additionally cross-checks the transparent response socket bound to the recovered
 destination and connected to the exact probe tuple, proving source-preserving responses. The DNS
 flows retain the existing transaction/question/answer checks over both transports and cross-check
-the parsed client, relay, and peer reports. None of these harness reports can be converted into
-complete model evidence until a distinct-UID local-OUTPUT executor proves backend-specific
-listener delivery, invokes the authoritative collector against the exact supervised engine, and
-constructs the remaining attempt evidence.
+the parsed client, relay, and peer reports. The schema-v2 validator is complete, but these ingress
+reports are not authoritative constructors for it. A distinct-UID local-OUTPUT executor must
+produce the backend-specific listener and delivery records, invoke the outbound collector against
+the exact supervised engine, and construct the remaining attempt evidence.
 
 ### Delivered `/proc` FD plus INET_DIAG correlation prerequisite
 
@@ -232,10 +274,11 @@ ambiguous match, identity drift, missing cookie/inode/FD/mark binding, tuple/UID
 out-of-window observation fails closed; enumeration hints are never promoted into correlation
 evidence.
 
-This collector is deliberately not a canary executor. It does not create the distinct probe and
-engine UIDs, install local-OUTPUT capture, generate traffic, prove listener delivery, or authorize
-the model's complete `validate_for` path. Those transaction-level responsibilities remain in the
-separate local-OUTPUT adapter/executor.
+This collector is deliberately not a canary executor or the complete listener-envelope producer.
+It does not create the distinct probe and engine UIDs, install local-OUTPUT capture, generate
+traffic, prove transparent/v6-only listener socket options, observe TCP accept or UDP ancillary
+delivery, or construct the schema-v2 evidence. Those transaction-level responsibilities remain in
+the separate local-OUTPUT adapter/executor and authoritative observer/report factories.
 
 The local peer validates the received payload and records the engine-side connection/datagram
 tuple. The adapter correlates that tuple with the exact supervised engine identity and validates
@@ -301,14 +344,21 @@ functional pass.
    model correlation bind protocol, exact tuple, UID, mark, FD/inode/cookie identity, complete
    dumps, supervised-process identity, and timing. This is evidence plumbing, not a functional
    pass.
-5. Add a separate local-OUTPUT qualification slice using distinct nonzero probe/engine UIDs,
-   backend-specific listener delivery, the delivered collector (or a separately qualified
-   cgroup-eBPF observer), and the complete model `validate_for` path. REDIRECT/DNAT delivery cannot
-   qualify a TPROXY Generation; an adapter without a qualifying TPROXY listener path reports
-   `unsupported`. This slice must not weaken the model to accommodate the ingress checkpoint.
-6. Add an Android lab adapter that reports explicit `unsupported`, `denied`, `conflicting`,
+5. **Complete model checkpoint:** functional-canary schema v2 requires the exact TPROXY listener,
+   transport-specific TCP accept or UDP `recvmsg` delivery, attempt-bound authority, loss/timing,
+   stable cross-flow socket identity, and exact inbound wire evidence described above. Positive
+   constructors remain private and test-only.
+6. Add a separate local-OUTPUT qualification slice using distinct nonzero probe/engine UIDs, real
+   listener-observer and delivery-report factories, the delivered outbound collector, and the
+   completed schema-v2 `validate_for` path. A separately qualified cgroup-eBPF observer may replace
+   the report only after its own authority and loss contract is proven. REDIRECT/DNAT delivery
+   cannot qualify a TPROXY Generation; an adapter without a qualifying TPROXY listener path reports
+   `unsupported`. Missing `newuidmap`/`newgidmap` or another required distinct-UID mechanism is an
+   explicit optional-mode skip or required-mode failure, never permission to fall back to root/root
+   or the same UID. This slice must not weaken the model to accommodate the ingress checkpoint.
+7. Add an Android lab adapter that reports explicit `unsupported`, `denied`, `conflicting`,
    `broken`, or `unknown` evidence. It remains diagnostic-only until exact-device qualification.
-7. Permit TPROXY `RUNNING` only for reviewed device profiles whose functional canary passes the
+8. Permit TPROXY `RUNNING` only for reviewed device profiles whose functional canary passes the
    real-device matrix and cleanup/crash tests. Other profiles remain unqualified; broaden the
    reviewed set without weakening the probe. TUN remains rejected until its separate
    single-route-owner and forced-death cleanup canaries pass.

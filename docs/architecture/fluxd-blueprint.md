@@ -1,7 +1,7 @@
 # Fluxd Rewrite Blueprint
 
 - Status: accepted, evolving architecture
-- Last updated: 2026-07-13
+- Last updated: 2026-07-14
 - Minimum supported kernel: Linux 5.10
 
 ## Executive decision
@@ -472,6 +472,12 @@ Maps:
 
 The daemon rate-limits and samples user-space events. Normal packet accounting stays in maps and is read in batches.
 
+Functional-canary schema v2 reserves an exact `QualifiedCgroupBpf` delivery authority, but no
+current cgroup program or attachment is qualified for that role. It remains optional and must
+separately prove ancestor-chain compatibility, hook semantics, complete per-flow events, payload
+visibility, loss accounting, and cleanup before it can construct authoritative evidence. Sampled
+ring/perf telemetry and ordinary counters remain non-authoritative.
+
 ### Stage B: acceleration
 
 Acceleration is allowed only when an equivalent non-eBPF path remains the correctness fallback.
@@ -592,10 +598,17 @@ local OUTPUT: in the harness kernel, an OUTPUT mark plus local policy route did 
 PREROUTING, and xtables TPROXY cannot attach to OUTPUT. OUTPUT counters and route lookups are
 therefore negative-control evidence only. The strict Linux/Android `/proc` FD plus INET_DIAG
 collector now binds protocol, exact tuple, UID, mark, FD/inode/cookie, complete dumps, supervised
-process identity, and timing, but it is only a delivered evidence prerequisite. Distinct nonzero
-probe/engine UIDs, backend-specific local-OUTPUT listener delivery, complete model `validate_for`,
+process identity, and timing, but it is only a delivered outbound-evidence prerequisite.
+Functional-canary schema v2 now completes the listener/delivery `validate_for` contract: every
+flow binds the exact Generation, engine, namespace, Capture Program, selector, listener
+FD/inode/cookie and socket state, independent TCP-accept or UDP-`recvmsg` delivery, exact payload,
+stable and globally noncolliding `(family, protocol)` listeners, accepted children distinct from
+every listener, and constant authority/loss baseline. Readiness evidence is
+only an admission input. Positive constructors remain private and test-only, so distinct nonzero
+probe/engine UIDs, a local-OUTPUT executor, real observer/report factories, collector integration,
 and Android qualification remain separate gates. REDIRECT/DNAT cannot qualify TPROXY; an adapter
-must prove delivery to the selected backend's listener or report that backend unsupported.
+must prove delivery to the selected backend's listener or report that backend unsupported. Host
+evidence still cannot authorize production `functional_passed`.
 
 The Phase 1 manifest is a strict UTF-8 line document no larger than 16 KiB. It rejects unknown, duplicate, malformed, missing, and conditional-field violations; startup and stop timeouts are decimal milliseconds in `1..=60000`. A boot-scoped dispatcher mode lease prevents Rust-owned phase verbs—including address resynchronization—from being mixed with legacy `scripts/core` engine ownership.
 

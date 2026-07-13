@@ -1,7 +1,7 @@
 # Fluxd Technical Specification
 
 - Status: accepted living specification
-- Last updated: 2026-07-13
+- Last updated: 2026-07-14
 - Companion document: [Fluxd Rewrite Blueprint](fluxd-blueprint.md)
 
 ## 1. Supported platform contract
@@ -904,6 +904,7 @@ Only `FluxOwnedTunFd` may attach a socket-filter steering program through `TUNSE
 - Default TC attachment is limited to a verified Generation-scoped TUN netdevice, whether its queue FDs are engine-owned or Flux-owned. Physical interfaces additionally require an experimental opt-in because tethering offload may use the same path.
 - Physical-interface experiments observe netd lifecycle, verify attachment after every Network Epoch, and immediately demote on qdisc/filter conflict.
 - Never replace Android's cgroup hooks. Program IDs and attach flags across every ancestor plus the child must prove an exact hook unoccupied or explicitly compatible; an attachment at any ancestor can constrain descendants, and AOSP's root defaults normally prevent the same type below it. The first allowed child role is optional proxy-child `sockops` telemetry, paired with userspace TCP/UDP canaries rather than used as the loop-escape mechanism.
+- The functional-canary `QualifiedCgroupBpf` delivery authority is a reserved schema variant, not a delivered attachment. No program may use it until ancestor-chain compatibility, exact hook semantics, event completeness, payload visibility, cumulative loss accounting, and owned cleanup have a separate qualification record.
 - Detach or userspace death must leave the correctness Capture Path intact.
 - `BPF_PROG_TYPE_NETFILTER` is eligible only on parsed kernel 6.4+ and a successful real hook probe.
 - TCX is eligible only on parsed kernel 6.6+ and a successful attach/query/detach probe; legacy TC remains the fallback.
@@ -915,6 +916,7 @@ Only `FluxOwnedTunFd` may attach a socket-filter steering program through `TUNSE
 - A perf-event-array Adapter is the event fallback; if neither works, sampled events degrade off while map counters remain available.
 - Payloads exclude raw application data and secrets.
 - Verifier logs are bounded and stored only for failed loads or explicit diagnostics.
+- Sampled ring/perf events and aggregate counters are never authoritative functional-canary delivery evidence. A future qualified producer must emit one complete, loss-accounted attempt-bound event per required flow.
 
 ## 14. Sing-Box supervision
 
@@ -952,7 +954,7 @@ Delivered Phase 1 supervision additionally requires:
 - a direct-child `PR_SET_PDEATHSIG(SIGKILL)` lease with a post-arm parent-identity race check for Sing-Box and phase-shell processes;
 - bounded TERM/KILL/reap, restart windows, exponential backoff, and retained ownership until disappearance is observed.
 
-The Phase 1 transaction rejects TUN during `prepare`, before engine admission or networking mutation. It also requires `xt_owner` before initialization and revalidates it from the generated capability cache; the current shell Capture Program sends every local OUTPUT policy through the application chain so the configured engine UID/GID bypass remains active even when application filtering is disabled. `ROUTING_MARK` is not accepted as equivalent authority because the bridge does not prove that the supervised engine applies it to its sockets. For admitted TPROXY state, start is `prepare` → engine admission → Generation-bound capture start → structural capture verification → configured functional gate → Generation-bound `RUNNING`, and stop is capture detach → engine stop/reap → `STOPPED`. The production daemon explicitly selects structural-only compatibility; required-mode tests execute the delivered Stage-1 exact-binding canary transaction, and the first Stage-2 Linux checkpoint now exercises the isolated dual-stack topology and cleanup without installing capture. Partial capture-start compensation retains Generation evidence until both networking writers prove cleanup; terminal publication and engine retirement are forbidden while detachment is uncertain. Reload prepares the candidate while the previous Generation remains active, preserves its pass on prepare-only failure, invalidates it before detachment, blocks replacement if detach fails, and attempts the previous immutable `EngineSpec` if candidate activation fails. An uncertain reload detach enters capture repair: prove full detachment, retain/reconcile the old engine, then republish and freshly verify that Generation. Publication failure, identity loss, repair/restoration, and address resynchronization require a fresh complete gate before retrying `RUNNING`. Candidate evidence never authorizes rollback publication. The current owner bypass is a compatibility loop-escape prerequisite; the socket-correlation collector is delivered, while complete production/Sing-Box-bound ingress evidence, the separate local-OUTPUT executor, and Android device qualification remain open.
+The Phase 1 transaction rejects TUN during `prepare`, before engine admission or networking mutation. It also requires `xt_owner` before initialization and revalidates it from the generated capability cache; the current shell Capture Program sends every local OUTPUT policy through the application chain so the configured engine UID/GID bypass remains active even when application filtering is disabled. `ROUTING_MARK` is not accepted as equivalent authority because the bridge does not prove that the supervised engine applies it to its sockets. For admitted TPROXY state, start is `prepare` → engine admission → Generation-bound capture start → structural capture verification → configured functional gate → Generation-bound `RUNNING`, and stop is capture detach → engine stop/reap → `STOPPED`. The production daemon explicitly selects structural-only compatibility; required-mode tests execute the delivered Stage-1 exact-binding canary transaction, and the first Stage-2 Linux checkpoint now exercises the isolated dual-stack topology and cleanup without installing capture. Partial capture-start compensation retains Generation evidence until both networking writers prove cleanup; terminal publication and engine retirement are forbidden while detachment is uncertain. Reload prepares the candidate while the previous Generation remains active, preserves its pass on prepare-only failure, invalidates it before detachment, blocks replacement if detach fails, and attempts the previous immutable `EngineSpec` if candidate activation fails. An uncertain reload detach enters capture repair: prove full detachment, retain/reconcile the old engine, then republish and freshly verify that Generation. Publication failure, identity loss, repair/restoration, and address resynchronization require a fresh complete gate before retrying `RUNNING`. Candidate evidence never authorizes rollback publication. The current owner bypass is a compatibility loop-escape prerequisite; the socket-correlation collector and schema-v2 listener/delivery validator are delivered, while production observer/report factories, the distinct-UID local-OUTPUT executor, collector integration, and Android device qualification remain open.
 
 The delivered Linux evidence class is explicitly ingress-only. The command
 `cargo xtask test-functional-canary-linux-tproxy` selects the exact ignored test
@@ -979,9 +981,46 @@ connected-UDP dumps. Correlation is accepted only when protocol, exact local/rem
 required mark, numeric FD, matching FD/diag inode, INET_DIAG cookie, exact supervised PID/start-tick
 identity, and recorded dump/snapshot timing all agree; partial, drifting, oversized, late,
 ambiguous, malformed, stale, or interrupted observations fail closed. The collector supplies
-evidence plumbing only. Distinct nonzero
-probe/engine UIDs, backend-specific local-OUTPUT listener delivery, and the model `validate_for`
-call remain required before Linux evidence can represent the complete transaction.
+outbound evidence plumbing only; it does not prove transparent/v6-only listener options, TCP
+accept, or UDP ancillary delivery.
+
+### 14.1 Functional-canary schema-v2 listener delivery
+
+The internal functional-canary evidence model is schema v2. The control protocol remains v3, the
+supervised inbound-delivery report is independently schema v1, and `flux.toml` remains schema v1.
+Request construction selects TPROXY only. `REDIRECT` and `DNAT` values are negative evidence used
+to reject backend substitution, not supported request backends.
+
+Every required flow contains an independently observed static listener identity and a per-flow
+delivery event. The listener binds the exact Generation, supervised PID/start ticks, admitted
+readiness identity, daemon network namespace, Capture Program digest, attempt selector, protocol,
+family, FD, inode, INET_DIAG cookie, family-correct wildcard bind and port, transparent state, and
+IPv6-only semantics. Its exact pre-bound observer authority, sequence, unchanged loss counter, and
+monotonic time are also required. Different `(family, protocol)` roles cannot reuse a listener FD,
+inode, or cookie. A supervised delivery report never replaces this socket observation.
+
+One delivery authority is used for the complete attempt. A supervised report must name the exact
+engine, attempt-owned report-object identity, and report schema v1. The alternative must be the
+exact pre-bound, separately qualified cgroup-BPF observer; it cannot wrap a proc/diag observer or
+be mixed with supervised reports. Delivery sequences are nonzero and unique across flows, delivery
+and listener-observation loss baselines are constant, and every observation is loss-free. Listener
+and delivery sequences are independent numeric domains; only monotonic timestamps order them.
+
+TCP delivery binds the parent-listener cookie, exact engine, distinct accepted FD/inode/cookie,
+original local destination, and probe peer tuple. The accepted identity cannot collide with any
+listener, and accepted inode or cookie reuse across flows is rejected. UDP delivery binds one
+datagram to the listener cookie, source, original destination, no
+payload/control truncation, and exactly one family-correct original-destination cmsg of length 16
+for `sockaddr_in` or 28 for `sockaddr_in6`. Echo and DNS share one stable listener for each
+`(family, protocol)` pair. Echo payload evidence binds the exact 32-byte nonce, length, and SHA-256;
+DNS binds the canonical query, nonce, transaction ID, question digest, length, and SHA-256, with an
+exact two-byte DNS/TCP length prefix.
+
+The schema-v2 `validate_for` path is complete, but authoritative construction is intentionally not
+available in production. Listener/delivery constructors remain private and test-only until a real
+observer/report factory, distinct nonzero probe/engine UIDs, a backend-specific local-OUTPUT
+executor, delivered outbound-collector integration, and Android qualification exist. Host or
+ingress evidence cannot publish production `functional_passed`.
 
 REDIRECT or DNAT to a conventional local listener cannot qualify a TPROXY Generation because it
 does not exercise that backend's transparent listener and destination semantics. The local-OUTPUT
@@ -1171,4 +1210,13 @@ It also rejects `.ko`, KPM, or other opaque kernel payloads in a production arti
 
 No compatibility stage may have two independent owners mutating the same kernel objects.
 
-Open Phase 1 hardening gates are the separate distinct-UID local-OUTPUT/backend-listener/model-validation executor and Android adapter/qualification for the delivered functional traffic/loop-prevention transaction; the strict `/proc` FD plus INET_DIAG collector prerequisite is complete. Ingress evidence cannot discharge the local-OUTPUT gate, and REDIRECT/DNAT cannot qualify TPROXY. Also open are an exact-device TUN single-owner and forced-death route-cleanup canary before removing the current TUN rejection, ancestor-safe `openat`/`openat2` traversal, bounded rotating Generation-correlated logs, pidfd/timerfd reactor integration, and real-device evidence on Android kernel 5.10.
+Open Phase 1 hardening gates are the production schema-v2 evidence producer, distinct-UID
+local-OUTPUT executor, delivered outbound-collector integration, and Android adapter/qualification
+for the functional traffic/loop-prevention transaction. Missing `newuidmap`/`newgidmap` or another
+required distinct-UID mechanism must skip explicitly in optional mode or fail in required mode;
+root/root and same-UID execution never substitute. The schema-v2 validator and strict `/proc` FD
+plus INET_DIAG collector prerequisite are complete. Ingress evidence cannot discharge the
+local-OUTPUT gate, and REDIRECT/DNAT cannot qualify TPROXY. Also open are an exact-device TUN
+single-owner and forced-death route-cleanup canary before removing the current TUN rejection,
+ancestor-safe `openat`/`openat2` traversal, bounded rotating Generation-correlated logs,
+pidfd/timerfd reactor integration, and real-device evidence on Android kernel 5.10.

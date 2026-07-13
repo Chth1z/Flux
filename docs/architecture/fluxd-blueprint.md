@@ -584,10 +584,10 @@ proves the contained dual-stack TCP/UDP/DNS topology. The delivered command
 `cargo xtask test-functional-canary-linux-tproxy` selects the exact ignored test
 `functional_canary::linux_namespace_harness::privileged_ingress_tproxy_checkpoint_exercises_real_capture_counters_and_cleanup`
 and injects traffic from a third probe namespace through PREROUTING into a test-local transparent
-relay. Its current dual-stack TCP/UDP-echo slice proves ingress TPROXY, accepted-socket and strict
-ancillary-data original-destination recovery, marked relay egress, source-preserving UDP replies,
-per-family route controls/counters, and cleanup. DNS over UDP/TCP remains the next extension under
-the same command. This ingress evidence cannot authorize residual
+relay. Its current dual-stack TCP/UDP echo plus DNS-over-UDP/TCP slice proves ingress TPROXY,
+accepted-socket and strict ancillary-data original-destination recovery, marked relay egress,
+source-preserving UDP replies, nonce-bound DNS transaction/question/answer evidence, per-family
+route controls/counters, and cleanup. This ingress evidence cannot authorize residual
 local OUTPUT: in the harness kernel, an OUTPUT mark plus local policy route did not re-enter
 PREROUTING, and xtables TPROXY cannot attach to OUTPUT. OUTPUT counters and route lookups are
 therefore negative-control evidence only. Distinct nonzero probe/engine UIDs, exact local-OUTPUT

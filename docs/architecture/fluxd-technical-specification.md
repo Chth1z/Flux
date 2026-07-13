@@ -957,12 +957,12 @@ The Phase 1 transaction rejects TUN during `prepare`, before engine admission or
 The delivered Linux evidence class is explicitly ingress-only. The command
 `cargo xtask test-functional-canary-linux-tproxy` selects the exact ignored test
 `functional_canary::linux_namespace_harness::privileged_ingress_tproxy_checkpoint_exercises_real_capture_counters_and_cleanup`.
-Its current slice adds a third probe network namespace and sends dual-stack TCP and UDP echo
-through exact PREROUTING TPROXY selectors into a test-local transparent Rust relay. It proves
-accepted-socket and strict ancillary-data original-destination recovery, relay and peer tuples,
-relay socket-mark readback, source-preserving UDP replies, per-family route controls, independent
-bounded TCP/UDP capture/bypass counters, and exact cleanup. DNS over UDP/TCP remains the next
-extension under the same command and exact test. Before invoking
+Its current slice adds a third probe network namespace and sends dual-stack TCP/UDP echo plus
+nonce-bound DNS over UDP/TCP through exact PREROUTING TPROXY selectors into a test-local transparent
+Rust relay. It proves accepted-socket and strict ancillary-data original-destination recovery,
+relay and peer tuples, relay socket-mark readback, source-preserving UDP replies, parsed DNS
+transaction/question/answer evidence, per-family route controls, independent bounded flow
+counters, and exact cleanup. Before invoking
 xtables TPROXY, the harness requires the target, mark/comment matches, family TPROXY support, and
 selected xtables backend support to be visible as already active under `/sys/module`; it refuses
 implicit kernel-module autoload.
@@ -1159,4 +1159,4 @@ It also rejects `.ko`, KPM, or other opaque kernel payloads in a production arti
 
 No compatibility stage may have two independent owners mutating the same kernel objects.
 
-Open Phase 1 hardening gates are the DNS-over-UDP/TCP extension of the delivered third-namespace ingress PREROUTING TPROXY/counter executor, the separate distinct-UID local-OUTPUT plus INET_DIAG/model-validation executor, and Android adapter/qualification for the delivered functional traffic/loop-prevention transaction. Ingress evidence cannot discharge the local-OUTPUT gate. Also open are an exact-device TUN single-owner and forced-death route-cleanup canary before removing the current TUN rejection, ancestor-safe `openat`/`openat2` traversal, bounded rotating Generation-correlated logs, pidfd/timerfd reactor integration, and real-device evidence on Android kernel 5.10.
+Open Phase 1 hardening gates are the separate distinct-UID local-OUTPUT plus INET_DIAG/model-validation executor and Android adapter/qualification for the delivered functional traffic/loop-prevention transaction. Ingress evidence cannot discharge the local-OUTPUT gate. Also open are an exact-device TUN single-owner and forced-death route-cleanup canary before removing the current TUN rejection, ancestor-safe `openat`/`openat2` traversal, bounded rotating Generation-correlated logs, pidfd/timerfd reactor integration, and real-device evidence on Android kernel 5.10.

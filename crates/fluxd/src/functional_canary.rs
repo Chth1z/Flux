@@ -2742,7 +2742,7 @@ fn bounded_prefix(diagnostic: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::fs;
     use std::num::{NonZeroU8, NonZeroU16, NonZeroU32, NonZeroU64};
 
@@ -2814,11 +2814,21 @@ mod tests {
         );
         assert_eq!(
             fixture.request.pre_binding.engine.artifacts.binary,
-            fixture._engine.spec.binary_digest()
+            fixture
+                ._engine
+                .as_ref()
+                .expect("fixture owns its engine")
+                .spec
+                .binary_digest()
         );
         assert_eq!(
             fixture.request.pre_binding.engine.artifacts.config,
-            fixture._engine.spec.config_digest()
+            fixture
+                ._engine
+                .as_ref()
+                .expect("fixture owns its engine")
+                .spec
+                .config_digest()
         );
         assert_eq!(
             fixture.request.pre_binding.engine.listener.port().get(),
@@ -2920,7 +2930,11 @@ mod tests {
         );
 
         let other = request_with_nonce(
-            &fixture._engine.spec,
+            &fixture
+                ._engine
+                .as_ref()
+                .expect("fixture owns its engine")
+                .spec,
             CanaryAddressFamilies::Ipv4Only,
             fixture.request.deadline().started_at() + Duration::from_secs(4),
             CanaryNonce::from_bytes([8; FUNCTIONAL_CANARY_NONCE_BYTES]),
@@ -3077,23 +3091,34 @@ mod tests {
 
     const BOOT_ID: &str = "00112233-4455-6677-8899-aabbccddeeff";
 
-    struct Fixture {
+    pub(crate) struct Fixture {
         request: CanaryAttemptRequest,
-        _engine: EngineFixture,
+        _engine: Option<EngineFixture>,
     }
 
     impl Fixture {
-        fn new(families: CanaryAddressFamilies) -> Self {
+        pub(crate) fn new(families: CanaryAddressFamilies) -> Self {
             let engine = EngineFixture::new();
             let started_at = Instant::now();
             let request = request(&engine.spec, families, started_at);
             Self {
                 request,
-                _engine: engine,
+                _engine: Some(engine),
             }
         }
 
-        fn successful_evidence(&self) -> UnqualifiedCanaryGateEvidence {
+        pub(crate) fn from_request(request: CanaryAttemptRequest) -> Self {
+            Self {
+                request,
+                _engine: None,
+            }
+        }
+
+        pub(crate) const fn request(&self) -> &CanaryAttemptRequest {
+            &self.request
+        }
+
+        pub(crate) fn successful_evidence(&self) -> UnqualifiedCanaryGateEvidence {
             let flows = flow_slots(&self.request);
             let outbound = std::array::from_fn(|index| {
                 let flow = CanaryFlow::ALL[index];
@@ -3180,7 +3205,7 @@ mod tests {
             )
         }
 
-        fn observed_at(&self) -> Instant {
+        pub(crate) fn observed_at(&self) -> Instant {
             self.request.deadline().started_at() + Duration::from_millis(210)
         }
     }
@@ -3198,22 +3223,44 @@ mod tests {
         )
     }
 
-    fn request_with_nonce(
+    pub(crate) fn request_with_nonce(
         spec: &EngineSpec,
         families: CanaryAddressFamilies,
         started_at: Instant,
         nonce: CanaryNonce,
     ) -> CanaryAttemptRequest {
-        let readiness = ReadinessEvidence::Listener {
-            port: NonZeroU16::new(1536).expect("nonzero listener port"),
-            table: PathBuf::from("/proc/4242/net/tcp"),
-        };
-        let generation = NonZeroU32::new(17).expect("nonzero generation");
-        let engine = CanaryEngineBinding::from_identity_parts(
-            generation,
+        request_with_engine_identity(
+            spec,
+            families,
+            started_at,
+            nonce,
+            NonZeroU32::new(17).expect("nonzero generation"),
             NonZeroU32::new(4242).expect("nonzero pid"),
             NonZeroU64::new(98_765).expect("nonzero start ticks"),
             NonZeroU64::new(23).expect("nonzero snapshot revision"),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn request_with_engine_identity(
+        spec: &EngineSpec,
+        families: CanaryAddressFamilies,
+        started_at: Instant,
+        nonce: CanaryNonce,
+        generation: NonZeroU32,
+        pid: NonZeroU32,
+        start_time_ticks: NonZeroU64,
+        engine_snapshot_revision: NonZeroU64,
+    ) -> CanaryAttemptRequest {
+        let readiness = ReadinessEvidence::Listener {
+            port: NonZeroU16::new(1536).expect("nonzero listener port"),
+            table: PathBuf::from(format!("/proc/{}/net/tcp", pid.get())),
+        };
+        let engine = CanaryEngineBinding::from_identity_parts(
+            generation,
+            pid,
+            start_time_ticks,
+            engine_snapshot_revision,
             spec,
             &readiness,
         )

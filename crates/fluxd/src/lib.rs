@@ -12,8 +12,8 @@ use serde::Serialize;
 mod daemon;
 mod engine_manifest;
 mod engine_supervisor;
-// This accepted Stage 1 model is intentionally isolated until the coordinator
-// ordering checkpoint wires the functional canary into runtime activation.
+// The required Stage 1 gate is wired behind an explicit coordinator seam, but
+// production remains structural-only until a platform adapter is qualified.
 #[allow(dead_code)]
 mod functional_canary;
 mod intent_store;

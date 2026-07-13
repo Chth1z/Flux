@@ -18,7 +18,9 @@ use flux_platform::{
     ProcessPhaseDispatcher, ShutdownSignal,
 };
 
-use crate::runtime_coordinator::{ProcessRuntimeWriter, RuntimeCoordinator};
+use crate::runtime_coordinator::{
+    ProcessRuntimeWriter, RuntimeCoordinator, RuntimeFunctionalCanary,
+};
 use crate::{
     AdministrativeIntentStore, ControlConnectionHandler, ControlSocketError, EngineSupervisor,
     IntentStoreError, RuntimeSnapshotSource,
@@ -155,6 +157,7 @@ where
                 writer,
                 EngineSupervisor::new(),
                 maintenance_interval,
+                RuntimeFunctionalCanary::StructuralOnlyCompatibility,
             );
             let runtime = dispatcher.runtime_snapshot_source();
             let dispatcher = PersistingLegacyDispatcher { dispatcher, store };

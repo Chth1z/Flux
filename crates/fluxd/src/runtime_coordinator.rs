@@ -1,16 +1,22 @@
 use std::error::Error;
 use std::fmt;
 use std::io;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroU64};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use flux_core::{ControlError, LegacyDispatcher, LegacyIntent, Reason};
 use flux_platform::{
     DispatcherPhaseCommand, PhaseDispatcherError, PhaseDispatcherPaths, ProcessPhaseDispatcher,
 };
 
+use crate::functional_canary::{
+    CanaryAddressFamilies, CanaryAttemptBinding, CanaryAttemptRequest, CanaryCounterDeltaBounds,
+    CanaryDeadline, CanaryEngineBinding, CanaryEnvironmentBinding, CanaryNonce,
+    FunctionalCanaryDisposition, FunctionalCanaryError, FunctionalCanaryGateMode,
+    UnqualifiedFunctionalCanaryExecutor,
+};
 use crate::{
     CaptureObservation, DesiredEngine, EngineManifest, EngineManifestError, EnginePhase,
     EngineReport, EngineSnapshot, EngineSpec, EngineSupervisor, EngineSupervisorError,
@@ -49,8 +55,72 @@ pub(crate) trait EngineRuntime: Send + 'static {
         capture: CaptureObservation,
     ) -> Result<EngineReport, EngineSupervisorError>;
 
-    fn snapshot(&self) -> Arc<EngineSnapshot> {
-        Arc::new(EngineSnapshot::default())
+    fn snapshot(&self) -> Arc<EngineSnapshot>;
+}
+
+pub(crate) struct UnqualifiedFunctionalCanaryAttemptInputs {
+    environment: CanaryEnvironmentBinding,
+    nonce: CanaryNonce,
+    deadline: CanaryDeadline,
+    families: CanaryAddressFamilies,
+    counter_bounds: CanaryCounterDeltaBounds,
+}
+
+impl UnqualifiedFunctionalCanaryAttemptInputs {
+    // Production remains explicitly structural-only until the Android adapter
+    // is qualified; the required constructor is exercised by the Linux/test seam.
+    #[allow(dead_code)]
+    #[must_use]
+    pub(crate) const fn new(
+        environment: CanaryEnvironmentBinding,
+        nonce: CanaryNonce,
+        deadline: CanaryDeadline,
+        families: CanaryAddressFamilies,
+        counter_bounds: CanaryCounterDeltaBounds,
+    ) -> Self {
+        Self {
+            environment,
+            nonce,
+            deadline,
+            families,
+            counter_bounds,
+        }
+    }
+}
+
+pub(crate) trait UnqualifiedFunctionalCanaryAttemptContext: Send + 'static {
+    fn prepare_attempt(
+        &mut self,
+        generation: NonZeroU32,
+    ) -> Result<UnqualifiedFunctionalCanaryAttemptInputs, FunctionalCanaryError>;
+
+    fn reobserve_environment(
+        &mut self,
+        request: &CanaryAttemptRequest,
+    ) -> Result<CanaryEnvironmentBinding, FunctionalCanaryError>;
+
+    fn monotonic_now(&mut self) -> Instant;
+}
+
+pub(crate) enum RuntimeFunctionalCanary {
+    StructuralOnlyCompatibility,
+    // Kept available for the privileged Linux harness and future qualified
+    // Android adapter; daemon composition deliberately selects the other arm.
+    #[allow(dead_code)]
+    RequiredUnqualified {
+        context: Box<dyn UnqualifiedFunctionalCanaryAttemptContext>,
+        executor: Box<dyn UnqualifiedFunctionalCanaryExecutor>,
+    },
+}
+
+impl RuntimeFunctionalCanary {
+    const fn mode(&self) -> FunctionalCanaryGateMode {
+        match self {
+            Self::StructuralOnlyCompatibility => {
+                FunctionalCanaryGateMode::StructuralOnlyCompatibility
+            }
+            Self::RequiredUnqualified { .. } => FunctionalCanaryGateMode::RequiredUnqualified,
+        }
     }
 }
 
@@ -202,9 +272,15 @@ enum RetirementProgress {
     Pending(EngineReport),
 }
 
+struct QualifiedRunningGeneration {
+    generation: NonZeroU32,
+    disposition: FunctionalCanaryDisposition,
+}
+
 pub(crate) struct RuntimeCoordinator<W, E = EngineSupervisor> {
     writer: W,
     engine: E,
+    functional_canary: RuntimeFunctionalCanary,
     ownership: RuntimeOwnership,
     maintenance_interval: Duration,
     runtime: RuntimeSnapshotSource,
@@ -216,7 +292,12 @@ where
     W: LegacyRuntimeWriter,
     E: EngineRuntime,
 {
-    pub(crate) fn with_dependencies(writer: W, engine: E, maintenance_interval: Duration) -> Self {
+    pub(crate) fn with_dependencies(
+        writer: W,
+        engine: E,
+        maintenance_interval: Duration,
+        functional_canary: RuntimeFunctionalCanary,
+    ) -> Self {
         let runtime = RuntimeSnapshotSource::new(RuntimeSnapshot {
             revision: 0,
             phase: RuntimePhase::Stopped,
@@ -228,11 +309,22 @@ where
         Self {
             writer,
             engine,
+            functional_canary,
             ownership: RuntimeOwnership::Stopped,
             maintenance_interval,
             runtime,
             pending_publication: None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_structural_dependencies(writer: W, engine: E, maintenance_interval: Duration) -> Self {
+        Self::with_dependencies(
+            writer,
+            engine,
+            maintenance_interval,
+            RuntimeFunctionalCanary::StructuralOnlyCompatibility,
+        )
     }
 
     pub(crate) fn runtime_snapshot_source(&self) -> RuntimeSnapshotSource {
@@ -427,22 +519,22 @@ where
             Some(u64::from(generation.id.get())),
             None,
         );
-        if let Err(source) = self.writer.verify_capture(&generation) {
-            let failure = runtime_writer_error(
-                "verify published capture",
-                source,
-                "detach capture before retiring the proxy engine",
-            );
-            return Err(self.compensate_failed_activation(generation, failure));
-        }
+        let qualification = match self.verify_running_gate(
+            &generation,
+            "verify published capture",
+            "detach capture before retiring the proxy engine",
+        ) {
+            Ok(qualification) => qualification,
+            Err(failure) => {
+                return Err(self.compensate_failed_activation(generation, failure));
+            }
+        };
         self.ownership = RuntimeOwnership::Engine {
             generation: Box::new(generation.clone()),
             capture: CaptureObservation::Published,
         };
-        self.publish_legacy_state(
-            PublishedRuntimeState::Running {
-                generation: generation.id,
-            },
+        self.publish_qualified_running(
+            qualification,
             "publish running state",
             "retain the verified data path and retry state publication",
         )?;
@@ -614,17 +706,45 @@ where
             self.pending_publication,
             Some(PublishedRuntimeState::Running { generation }) if generation == generation_id
         );
-        if capture == CaptureObservation::Published
-            && engine_ready
-            && pending_running_retry
-            && let Err(source) = self.writer.verify_capture(&generation)
-        {
-            self.ownership = RuntimeOwnership::CaptureRepairPending { generation };
-            return Err(runtime_writer_error(
+        if capture == CaptureObservation::Published && engine_ready && pending_running_retry {
+            if self.functional_canary.mode() == FunctionalCanaryGateMode::RequiredUnqualified
+                && let Err(source) = self.writer.capture_start(&generation)
+            {
+                self.ownership = RuntimeOwnership::CaptureRepairPending { generation };
+                return Err(runtime_writer_error(
+                    "reassert capture before functional running retry",
+                    source,
+                    "detach and restore the active generation before retrying publication",
+                ));
+            }
+            let qualification = match self.verify_running_gate(
+                &generation,
                 "reverify capture before running publication",
-                source,
                 "detach and restore the active generation before retrying publication",
-            ));
+            ) {
+                Ok(qualification) => qualification,
+                Err(error) => {
+                    self.ownership = RuntimeOwnership::CaptureRepairPending { generation };
+                    return Err(error);
+                }
+            };
+            self.ownership = RuntimeOwnership::Engine {
+                generation,
+                capture,
+            };
+            self.publish_qualified_running(
+                qualification,
+                "retry running state publication",
+                "retain the verified data path and retry publication",
+            )?;
+            self.publish_runtime(
+                RuntimePhase::Running,
+                RuntimeCaptureState::Published,
+                RuntimeEngineState::Ready,
+                Some(u64::from(generation_id.get())),
+                None,
+            );
+            return Ok(());
         }
         self.ownership = RuntimeOwnership::Engine {
             generation,
@@ -735,23 +855,23 @@ where
             Some(u64::from(generation.id.get())),
             None,
         );
-        if let Err(source) = self.writer.verify_capture(&generation) {
-            let failure = runtime_writer_error(
-                "verify restored capture",
-                source,
-                "detach capture before retiring the restarted engine",
-            );
-            return Err(self.compensate_failed_activation(*generation, failure));
-        }
+        let qualification = match self.verify_running_gate(
+            &generation,
+            "verify restored capture",
+            "detach capture before retiring the restarted engine",
+        ) {
+            Ok(qualification) => qualification,
+            Err(failure) => {
+                return Err(self.compensate_failed_activation(*generation, failure));
+            }
+        };
         let generation_id = generation.id;
         self.ownership = RuntimeOwnership::Engine {
             generation,
             capture: CaptureObservation::Published,
         };
-        self.publish_legacy_state(
-            PublishedRuntimeState::Running {
-                generation: generation_id,
-            },
+        self.publish_qualified_running(
+            qualification,
             "republish running state",
             "retain the verified path and retry state publication",
         )?;
@@ -1070,6 +1190,203 @@ where
         }
     }
 
+    fn verify_running_gate(
+        &mut self,
+        generation: &PreparedGeneration,
+        structural_operation: &'static str,
+        structural_recovery: &'static str,
+    ) -> Result<QualifiedRunningGeneration, ControlError> {
+        self.writer.verify_capture(generation).map_err(|source| {
+            runtime_writer_error(structural_operation, source, structural_recovery)
+        })?;
+
+        if self.functional_canary.mode() == FunctionalCanaryGateMode::StructuralOnlyCompatibility {
+            return Ok(QualifiedRunningGeneration {
+                generation: generation.id,
+                disposition: FunctionalCanaryDisposition::StructuralOnlyCompatibility,
+            });
+        }
+
+        let pre_engine = self.reconcile_canary_engine(
+            generation,
+            "observe proxy engine before functional canary",
+            "detach capture before repairing the proxy engine and canary environment",
+        )?;
+        let attempt = match &mut self.functional_canary {
+            RuntimeFunctionalCanary::RequiredUnqualified { context, .. } => {
+                context.prepare_attempt(generation.id).map_err(|source| {
+                    functional_canary_error(
+                        "prepare functional canary attempt",
+                        source,
+                        "detach capture before repairing canary attempt inputs",
+                    )
+                })?
+            }
+            RuntimeFunctionalCanary::StructuralOnlyCompatibility => {
+                unreachable!("functional canary mode was checked before attempt preparation")
+            }
+        };
+        let pre_binding = CanaryAttemptBinding::new(pre_engine, attempt.environment);
+        let request = CanaryAttemptRequest::new(
+            pre_binding,
+            attempt.nonce,
+            attempt.deadline,
+            attempt.families,
+            attempt.counter_bounds,
+        )
+        .map_err(|source| {
+            functional_canary_error(
+                "construct functional canary attempt",
+                source,
+                "detach capture before repairing canary attempt construction",
+            )
+        })?;
+        let execution = match &mut self.functional_canary {
+            RuntimeFunctionalCanary::RequiredUnqualified { executor, .. } => {
+                executor.execute(&request)
+            }
+            RuntimeFunctionalCanary::StructuralOnlyCompatibility => {
+                unreachable!("functional canary mode was checked before execution")
+            }
+        };
+        let post_engine = self.reconcile_canary_engine(
+            generation,
+            "observe proxy engine after functional canary",
+            "detach capture before repairing the proxy engine and canary environment",
+        )?;
+        let (post_environment, observed_at) = match &mut self.functional_canary {
+            RuntimeFunctionalCanary::RequiredUnqualified { context, .. } => {
+                let environment = context.reobserve_environment(&request).map_err(|source| {
+                    functional_canary_error(
+                        "reobserve functional canary environment",
+                        source,
+                        "detach capture before repairing the canary environment",
+                    )
+                })?;
+                (environment, context.monotonic_now())
+            }
+            RuntimeFunctionalCanary::StructuralOnlyCompatibility => {
+                unreachable!("functional canary mode was checked before post-attempt observation")
+            }
+        };
+        let post_binding = CanaryAttemptBinding::new(post_engine, post_environment);
+        if request.pre_binding() != &post_binding {
+            return Err(ControlError::runtime(
+                "validate functional canary post-attempt identity",
+                io::Error::other(
+                    "functional canary engine or environment identity changed during the attempt",
+                ),
+                "detach capture before starting a fresh functional canary attempt",
+            ));
+        }
+        let evidence = execution.map_err(|source| {
+            functional_canary_error(
+                "execute functional capture canary",
+                source,
+                "detach capture before repairing the proxy engine and canary environment",
+            )
+        })?;
+        let validated = evidence
+            .validate_for(&request, &post_binding, observed_at)
+            .map_err(|source| {
+                functional_canary_error(
+                    "validate functional capture canary",
+                    source,
+                    "detach capture before starting a fresh functional canary attempt",
+                )
+            })?;
+        Ok(QualifiedRunningGeneration {
+            generation: generation.id,
+            disposition: FunctionalCanaryDisposition::AttemptPassedUnqualified(Box::new(validated)),
+        })
+    }
+
+    fn reconcile_canary_engine(
+        &mut self,
+        generation: &PreparedGeneration,
+        operation: &'static str,
+        recovery: &'static str,
+    ) -> Result<CanaryEngineBinding, ControlError> {
+        let report = self
+            .engine
+            .reconcile(
+                DesiredEngine::Running(&generation.spec),
+                CaptureObservation::Published,
+            )
+            .map_err(|source| ControlError::runtime(operation, source, recovery))?;
+        if !matches!(
+            report,
+            EngineReport::Started { .. } | EngineReport::NoChange { .. }
+        ) {
+            return Err(ControlError::runtime(
+                operation,
+                io::Error::other(format!(
+                    "proxy engine did not remain ready for the functional canary: {report:?}"
+                )),
+                recovery,
+            ));
+        }
+        let snapshot = self.engine.snapshot();
+        if snapshot.phase() != EnginePhase::Ready {
+            return Err(ControlError::runtime(
+                operation,
+                io::Error::other(format!(
+                    "proxy engine is not ready for a functional canary: {:?}",
+                    snapshot.phase()
+                )),
+                recovery,
+            ));
+        }
+        let identity = snapshot.owned_identity().ok_or_else(|| {
+            ControlError::runtime(
+                operation,
+                io::Error::other("ready proxy engine has no owned identity"),
+                recovery,
+            )
+        })?;
+        let revision = NonZeroU64::new(snapshot.revision()).ok_or_else(|| {
+            ControlError::runtime(
+                operation,
+                io::Error::other("ready proxy engine snapshot has zero revision"),
+                recovery,
+            )
+        })?;
+        let readiness = snapshot.owned_resource_readiness().ok_or_else(|| {
+            ControlError::runtime(
+                operation,
+                io::Error::other("ready proxy engine has no owned-resource readiness evidence"),
+                recovery,
+            )
+        })?;
+        CanaryEngineBinding::new(
+            generation.id,
+            identity,
+            revision,
+            &generation.spec,
+            readiness,
+        )
+        .map_err(|source| ControlError::runtime(operation, source, recovery))
+    }
+
+    fn publish_qualified_running(
+        &mut self,
+        qualification: QualifiedRunningGeneration,
+        operation: &'static str,
+        recovery: &'static str,
+    ) -> Result<(), ControlError> {
+        match qualification.disposition {
+            FunctionalCanaryDisposition::StructuralOnlyCompatibility
+            | FunctionalCanaryDisposition::AttemptPassedUnqualified(_) => {}
+        }
+        self.publish_legacy_state(
+            PublishedRuntimeState::Running {
+                generation: qualification.generation,
+            },
+            operation,
+            recovery,
+        )
+    }
+
     fn publish_legacy_state(
         &mut self,
         state: PublishedRuntimeState,
@@ -1361,21 +1678,41 @@ where
     ControlError::runtime(operation, source, recovery)
 }
 
+fn functional_canary_error<E>(
+    operation: &'static str,
+    source: E,
+    recovery: &'static str,
+) -> ControlError
+where
+    E: Error + Send + Sync + 'static,
+{
+    ControlError::runtime(operation, source, recovery)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
     use std::fs;
     use std::io;
-    use std::num::NonZeroU16;
+    use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use flux_core::{LegacyDispatcher, LegacyIntent, Reason};
     use flux_platform::{ReadinessEvidence, SingBoxLaunchSpec, SingBoxLauncher, SingBoxReadiness};
 
     use super::*;
-    use crate::{EngineReport, RestartPolicy};
+    use crate::functional_canary::tests::{
+        Fixture as FunctionalCanaryFixture,
+        request_with_engine_identity as functional_request_with_engine_identity,
+        request_with_nonce as functional_request_with_nonce,
+    };
+    use crate::functional_canary::{
+        CanaryAddressFamilies, CanaryCleanupStatus, CanaryErrorKind, CanaryNonce,
+        FUNCTIONAL_CANARY_NONCE_BYTES, UnqualifiedCanaryGateEvidence,
+    };
+    use crate::{EngineReport, OwnedEngineIdentity, RestartPolicy};
 
     #[test]
     fn start_orders_prepare_engine_capture_verify_and_publication() {
@@ -1393,8 +1730,11 @@ mod tests {
             events: Arc::clone(&events),
             reports: Arc::new(Mutex::new(VecDeque::new())),
         };
-        let mut coordinator =
-            RuntimeCoordinator::with_dependencies(writer, engine, Duration::from_millis(100));
+        let mut coordinator = RuntimeCoordinator::with_structural_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+        );
 
         coordinator
             .execute(&LegacyIntent::Running {
@@ -1432,8 +1772,11 @@ mod tests {
             events,
             reports: Arc::new(Mutex::new(VecDeque::new())),
         };
-        let mut coordinator =
-            RuntimeCoordinator::with_dependencies(writer, engine, Duration::from_millis(100));
+        let mut coordinator = RuntimeCoordinator::with_structural_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+        );
         let runtime = coordinator.runtime_snapshot_source();
 
         coordinator
@@ -1449,6 +1792,609 @@ mod tests {
         assert_eq!(snapshot.engine, RuntimeEngineState::Ready);
         assert_eq!(snapshot.generation, Some(1));
         assert_eq!(snapshot.last_error, None);
+    }
+
+    #[test]
+    fn required_canary_start_orders_complete_gate_before_running_publication() {
+        let fixture = EngineFixture::new();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let started_at = Instant::now();
+        let request = functional_request_with_nonce(
+            &fixture.spec,
+            CanaryAddressFamilies::Ipv4Only,
+            started_at,
+            CanaryNonce::from_bytes([21; FUNCTIONAL_CANARY_NONCE_BYTES]),
+        );
+        let canary_script = Arc::new(Mutex::new(ScriptedCanary::new([
+            ScriptedCanaryAttempt::passing(request),
+        ])));
+        let writer = ScriptedWriter {
+            events: Arc::clone(&events),
+            prepared: VecDeque::from([fixture.spec.clone()]),
+            next_generation_id: 17,
+            capture_start_failure: false,
+            capture_stop_failures: 0,
+            verify_failure: false,
+        };
+        let engine = RequiredScriptedEngine::new(
+            Arc::clone(&events),
+            [ready_canary_snapshot(98_765), ready_canary_snapshot(98_765)],
+        );
+        let mut coordinator = RuntimeCoordinator::with_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+            scripted_required_canary(Arc::clone(&canary_script), Arc::clone(&events)),
+        );
+        let runtime = coordinator.runtime_snapshot_source();
+
+        coordinator
+            .execute(&LegacyIntent::Running {
+                reason: Reason::Boot,
+            })
+            .expect("required functional canary converges");
+
+        assert_eq!(
+            *events.lock().expect("events lock"),
+            [
+                Event::Prepared(Reason::Boot),
+                Event::EngineRunning(CaptureObservation::Detached),
+                Event::CaptureStarted,
+                Event::CaptureVerified,
+                Event::EngineRunning(CaptureObservation::Published),
+                Event::CanaryPrepared(generation(17)),
+                Event::CanaryExecuted(generation(17)),
+                Event::EngineRunning(CaptureObservation::Published),
+                Event::CanaryReobserved(generation(17)),
+                Event::Published(PublishedRuntimeState::Running {
+                    generation: generation(17),
+                }),
+            ]
+        );
+        assert_eq!(canary_script.lock().expect("canary script").executions, 1);
+        assert_eq!(runtime.snapshot().phase, RuntimePhase::Running);
+    }
+
+    #[test]
+    fn stale_post_canary_engine_identity_compensates_capture_first() {
+        let fixture = EngineFixture::new();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let request = functional_request_with_nonce(
+            &fixture.spec,
+            CanaryAddressFamilies::Ipv4Only,
+            Instant::now(),
+            CanaryNonce::from_bytes([22; FUNCTIONAL_CANARY_NONCE_BYTES]),
+        );
+        let canary_script = Arc::new(Mutex::new(ScriptedCanary::new([
+            ScriptedCanaryAttempt::passing(request),
+        ])));
+        let writer = ScriptedWriter {
+            events: Arc::clone(&events),
+            prepared: VecDeque::from([fixture.spec.clone()]),
+            next_generation_id: 17,
+            capture_start_failure: false,
+            capture_stop_failures: 0,
+            verify_failure: false,
+        };
+        let engine = RequiredScriptedEngine::new(
+            Arc::clone(&events),
+            [ready_canary_snapshot(98_765), ready_canary_snapshot(98_766)],
+        );
+        let mut coordinator = RuntimeCoordinator::with_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+            scripted_required_canary(canary_script, Arc::clone(&events)),
+        );
+
+        coordinator
+            .execute(&LegacyIntent::Running {
+                reason: Reason::Boot,
+            })
+            .expect_err("stale post-attempt engine identity prevents running");
+
+        assert_eq!(
+            *events.lock().expect("events lock"),
+            [
+                Event::Prepared(Reason::Boot),
+                Event::EngineRunning(CaptureObservation::Detached),
+                Event::CaptureStarted,
+                Event::CaptureVerified,
+                Event::EngineRunning(CaptureObservation::Published),
+                Event::CanaryPrepared(generation(17)),
+                Event::CanaryExecuted(generation(17)),
+                Event::EngineRunning(CaptureObservation::Published),
+                Event::CanaryReobserved(generation(17)),
+                Event::CaptureStopped,
+                Event::EngineStopped(CaptureObservation::Detached),
+                Event::Published(PublishedRuntimeState::Failed),
+            ]
+        );
+    }
+
+    #[test]
+    fn uncertain_canary_cleanup_post_observes_then_compensates_capture_first() {
+        let fixture = EngineFixture::new();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let request = functional_request_with_nonce(
+            &fixture.spec,
+            CanaryAddressFamilies::Ipv4Only,
+            Instant::now(),
+            CanaryNonce::from_bytes([23; FUNCTIONAL_CANARY_NONCE_BYTES]),
+        );
+        let canary_script = Arc::new(Mutex::new(ScriptedCanary::new([
+            ScriptedCanaryAttempt::failing(
+                request,
+                CanaryErrorKind::CleanupUncertain,
+                CanaryCleanupStatus::Uncertain,
+            ),
+        ])));
+        let writer = ScriptedWriter {
+            events: Arc::clone(&events),
+            prepared: VecDeque::from([fixture.spec.clone()]),
+            next_generation_id: 17,
+            capture_start_failure: false,
+            capture_stop_failures: 0,
+            verify_failure: false,
+        };
+        let engine = RequiredScriptedEngine::new(
+            Arc::clone(&events),
+            [ready_canary_snapshot(98_765), ready_canary_snapshot(98_765)],
+        );
+        let mut coordinator = RuntimeCoordinator::with_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+            scripted_required_canary(canary_script, Arc::clone(&events)),
+        );
+
+        coordinator
+            .execute(&LegacyIntent::Running {
+                reason: Reason::Boot,
+            })
+            .expect_err("uncertain canary cleanup prevents running");
+
+        assert_eq!(
+            *events.lock().expect("events lock"),
+            [
+                Event::Prepared(Reason::Boot),
+                Event::EngineRunning(CaptureObservation::Detached),
+                Event::CaptureStarted,
+                Event::CaptureVerified,
+                Event::EngineRunning(CaptureObservation::Published),
+                Event::CanaryPrepared(generation(17)),
+                Event::CanaryExecuted(generation(17)),
+                Event::EngineRunning(CaptureObservation::Published),
+                Event::CanaryReobserved(generation(17)),
+                Event::CaptureStopped,
+                Event::EngineStopped(CaptureObservation::Detached),
+                Event::Published(PublishedRuntimeState::Failed),
+            ]
+        );
+    }
+
+    #[test]
+    fn running_publication_retry_reasserts_capture_and_runs_fresh_canary() {
+        let fixture = EngineFixture::new();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let started_at = Instant::now();
+        let first = functional_request_with_nonce(
+            &fixture.spec,
+            CanaryAddressFamilies::Ipv4Only,
+            started_at,
+            CanaryNonce::from_bytes([24; FUNCTIONAL_CANARY_NONCE_BYTES]),
+        );
+        let second = functional_request_with_nonce(
+            &fixture.spec,
+            CanaryAddressFamilies::Ipv4Only,
+            started_at,
+            CanaryNonce::from_bytes([25; FUNCTIONAL_CANARY_NONCE_BYTES]),
+        );
+        let canary_script = Arc::new(Mutex::new(ScriptedCanary::new([
+            ScriptedCanaryAttempt::passing(first),
+            ScriptedCanaryAttempt::passing(second),
+        ])));
+        let writer = PublicationFailingWriter {
+            inner: ScriptedWriter {
+                events: Arc::clone(&events),
+                prepared: VecDeque::from([fixture.spec.clone()]),
+                next_generation_id: 17,
+                capture_start_failure: false,
+                capture_stop_failures: 0,
+                verify_failure: false,
+            },
+            fail_on_call: 1,
+            calls: 0,
+        };
+        let engine = RequiredScriptedEngine::new(
+            Arc::clone(&events),
+            std::iter::repeat_with(|| ready_canary_snapshot(98_765)).take(8),
+        );
+        let mut coordinator = RuntimeCoordinator::with_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+            scripted_required_canary(Arc::clone(&canary_script), Arc::clone(&events)),
+        );
+        coordinator
+            .execute(&LegacyIntent::Running {
+                reason: Reason::Boot,
+            })
+            .expect_err("initial running publication fails");
+        events.lock().expect("events lock").clear();
+
+        coordinator.maintain();
+
+        assert_eq!(
+            *events.lock().expect("events lock"),
+            [
+                Event::EngineRunning(CaptureObservation::Published),
+                Event::CaptureStarted,
+                Event::CaptureVerified,
+                Event::EngineRunning(CaptureObservation::Published),
+                Event::CanaryPrepared(generation(17)),
+                Event::CanaryExecuted(generation(17)),
+                Event::EngineRunning(CaptureObservation::Published),
+                Event::CanaryReobserved(generation(17)),
+                Event::Published(PublishedRuntimeState::Running {
+                    generation: generation(17),
+                }),
+            ]
+        );
+        let script = canary_script.lock().expect("canary script");
+        assert_eq!(script.requests.len(), 2);
+        assert_ne!(script.requests[0].nonce(), script.requests[1].nonce());
+    }
+
+    #[test]
+    fn failed_functional_canary_during_running_retry_enters_capture_repair() {
+        let fixture = EngineFixture::new();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let started_at = Instant::now();
+        let attempts = [
+            ScriptedCanaryAttempt::passing(functional_request_with_nonce(
+                &fixture.spec,
+                CanaryAddressFamilies::Ipv4Only,
+                started_at,
+                CanaryNonce::from_bytes([26; FUNCTIONAL_CANARY_NONCE_BYTES]),
+            )),
+            ScriptedCanaryAttempt::failing(
+                functional_request_with_nonce(
+                    &fixture.spec,
+                    CanaryAddressFamilies::Ipv4Only,
+                    started_at,
+                    CanaryNonce::from_bytes([27; FUNCTIONAL_CANARY_NONCE_BYTES]),
+                ),
+                CanaryErrorKind::ResponseMismatch,
+                CanaryCleanupStatus::VerifiedAbsent,
+            ),
+            ScriptedCanaryAttempt::passing(functional_request_with_nonce(
+                &fixture.spec,
+                CanaryAddressFamilies::Ipv4Only,
+                started_at,
+                CanaryNonce::from_bytes([28; FUNCTIONAL_CANARY_NONCE_BYTES]),
+            )),
+        ];
+        let canary_script = Arc::new(Mutex::new(ScriptedCanary::new(attempts)));
+        let writer = PublicationFailingWriter {
+            inner: ScriptedWriter {
+                events: Arc::clone(&events),
+                prepared: VecDeque::from([fixture.spec.clone()]),
+                next_generation_id: 17,
+                capture_start_failure: false,
+                capture_stop_failures: 0,
+                verify_failure: false,
+            },
+            fail_on_call: 1,
+            calls: 0,
+        };
+        let engine = RequiredScriptedEngine::new(
+            Arc::clone(&events),
+            std::iter::repeat_with(|| ready_canary_snapshot(98_765)).take(12),
+        );
+        let mut coordinator = RuntimeCoordinator::with_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+            scripted_required_canary(Arc::clone(&canary_script), Arc::clone(&events)),
+        );
+        coordinator
+            .execute(&LegacyIntent::Running {
+                reason: Reason::Boot,
+            })
+            .expect_err("initial running publication fails");
+        events.lock().expect("events lock").clear();
+
+        coordinator.maintain();
+        let failed_retry_events = events.lock().expect("events lock").clone();
+        assert_eq!(
+            failed_retry_events,
+            [
+                Event::EngineRunning(CaptureObservation::Published),
+                Event::CaptureStarted,
+                Event::CaptureVerified,
+                Event::EngineRunning(CaptureObservation::Published),
+                Event::CanaryPrepared(generation(17)),
+                Event::CanaryExecuted(generation(17)),
+                Event::EngineRunning(CaptureObservation::Published),
+                Event::CanaryReobserved(generation(17)),
+            ]
+        );
+        events.lock().expect("events lock").clear();
+
+        coordinator.maintain();
+
+        assert_eq!(
+            *events.lock().expect("events lock"),
+            [
+                Event::CaptureStopped,
+                Event::EngineRunning(CaptureObservation::Detached),
+                Event::CaptureStarted,
+                Event::CaptureVerified,
+                Event::EngineRunning(CaptureObservation::Published),
+                Event::CanaryPrepared(generation(17)),
+                Event::CanaryExecuted(generation(17)),
+                Event::EngineRunning(CaptureObservation::Published),
+                Event::CanaryReobserved(generation(17)),
+                Event::Published(PublishedRuntimeState::Running {
+                    generation: generation(17),
+                }),
+            ]
+        );
+        let script = canary_script.lock().expect("canary script");
+        assert_eq!(script.requests.len(), 3);
+        assert_ne!(script.requests[1].nonce(), script.requests[2].nonce());
+    }
+
+    #[test]
+    fn restart_restoration_runs_fresh_canary_for_new_engine_identity() {
+        let fixture = EngineFixture::new();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let started_at = Instant::now();
+        let first = functional_request_with_engine_identity(
+            &fixture.spec,
+            CanaryAddressFamilies::Ipv4Only,
+            started_at,
+            CanaryNonce::from_bytes([29; FUNCTIONAL_CANARY_NONCE_BYTES]),
+            generation(17),
+            NonZeroU32::new(4242).expect("PID"),
+            NonZeroU64::new(98_765).expect("start ticks"),
+            NonZeroU64::new(23).expect("revision"),
+        );
+        let second = functional_request_with_engine_identity(
+            &fixture.spec,
+            CanaryAddressFamilies::Ipv4Only,
+            started_at,
+            CanaryNonce::from_bytes([30; FUNCTIONAL_CANARY_NONCE_BYTES]),
+            generation(17),
+            NonZeroU32::new(4343).expect("PID"),
+            NonZeroU64::new(99_999).expect("start ticks"),
+            NonZeroU64::new(24).expect("revision"),
+        );
+        let canary_script = Arc::new(Mutex::new(ScriptedCanary::new([
+            ScriptedCanaryAttempt::passing(first),
+            ScriptedCanaryAttempt::passing(second),
+        ])));
+        let writer = ScriptedWriter {
+            events: Arc::clone(&events),
+            prepared: VecDeque::from([fixture.spec.clone()]),
+            next_generation_id: 17,
+            capture_start_failure: false,
+            capture_stop_failures: 0,
+            verify_failure: false,
+        };
+        let engine = RequiredScriptedEngine::new(
+            Arc::clone(&events),
+            [
+                ready_canary_snapshot_for(4242, 98_765, 23),
+                ready_canary_snapshot_for(4242, 98_765, 23),
+                ready_canary_snapshot_for(4343, 99_999, 24),
+                ready_canary_snapshot_for(4343, 99_999, 24),
+            ],
+        );
+        let mut coordinator = RuntimeCoordinator::with_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+            scripted_required_canary(Arc::clone(&canary_script), Arc::clone(&events)),
+        );
+        coordinator
+            .execute(&LegacyIntent::Running {
+                reason: Reason::Boot,
+            })
+            .expect("initial generation converges");
+        events.lock().expect("events lock").clear();
+        coordinator.engine.reports.extend([
+            EngineReport::AwaitingCaptureRemoval { revision: 25 },
+            EngineReport::Started {
+                revision: 26,
+                owned_resource_readiness: ReadinessEvidence::Listener {
+                    port: NonZeroU16::new(1536).expect("port"),
+                    table: PathBuf::from("/proc/4343/net/tcp"),
+                },
+            },
+        ]);
+
+        coordinator.maintain();
+
+        assert_eq!(
+            *events.lock().expect("events lock"),
+            [
+                Event::EngineRunning(CaptureObservation::Published),
+                Event::CaptureStopped,
+                Event::EngineRunning(CaptureObservation::Detached),
+                Event::CaptureStarted,
+                Event::CaptureVerified,
+                Event::EngineRunning(CaptureObservation::Published),
+                Event::CanaryPrepared(generation(17)),
+                Event::CanaryExecuted(generation(17)),
+                Event::EngineRunning(CaptureObservation::Published),
+                Event::CanaryReobserved(generation(17)),
+                Event::Published(PublishedRuntimeState::Running {
+                    generation: generation(17),
+                }),
+            ]
+        );
+        let script = canary_script.lock().expect("canary script");
+        assert_eq!(script.requests.len(), 2);
+        assert_eq!(
+            script.requests[1].pre_binding().engine().engine().pid(),
+            4343
+        );
+        assert_ne!(script.requests[0].nonce(), script.requests[1].nonce());
+    }
+
+    #[test]
+    fn candidate_canary_evidence_never_authorizes_rollback_publication() {
+        let active = EngineFixture::new();
+        let candidate = EngineFixture::new();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let started_at = Instant::now();
+        let attempts = [
+            ScriptedCanaryAttempt::passing(functional_request_with_engine_identity(
+                &active.spec,
+                CanaryAddressFamilies::Ipv4Only,
+                started_at,
+                CanaryNonce::from_bytes([31; FUNCTIONAL_CANARY_NONCE_BYTES]),
+                generation(17),
+                NonZeroU32::new(4242).expect("PID"),
+                NonZeroU64::new(98_765).expect("start ticks"),
+                NonZeroU64::new(23).expect("revision"),
+            )),
+            ScriptedCanaryAttempt::passing(functional_request_with_engine_identity(
+                &candidate.spec,
+                CanaryAddressFamilies::Ipv4Only,
+                started_at,
+                CanaryNonce::from_bytes([32; FUNCTIONAL_CANARY_NONCE_BYTES]),
+                generation(18),
+                NonZeroU32::new(5252).expect("PID"),
+                NonZeroU64::new(111_111).expect("start ticks"),
+                NonZeroU64::new(31).expect("revision"),
+            )),
+            ScriptedCanaryAttempt::passing(functional_request_with_engine_identity(
+                &active.spec,
+                CanaryAddressFamilies::Ipv4Only,
+                started_at,
+                CanaryNonce::from_bytes([33; FUNCTIONAL_CANARY_NONCE_BYTES]),
+                generation(17),
+                NonZeroU32::new(6262).expect("PID"),
+                NonZeroU64::new(222_222).expect("start ticks"),
+                NonZeroU64::new(41).expect("revision"),
+            )),
+        ];
+        let canary_script = Arc::new(Mutex::new(ScriptedCanary::new(attempts)));
+        let writer = ScriptedWriter {
+            events: Arc::clone(&events),
+            prepared: VecDeque::from([active.spec.clone(), candidate.spec.clone()]),
+            next_generation_id: 17,
+            capture_start_failure: false,
+            capture_stop_failures: 0,
+            verify_failure: false,
+        };
+        let engine = RequiredScriptedEngine::new(
+            Arc::clone(&events),
+            [
+                ready_canary_snapshot_for(4242, 98_765, 23),
+                ready_canary_snapshot_for(4242, 98_765, 23),
+                ready_canary_snapshot_for(4242, 98_765, 23),
+                ready_canary_snapshot_for(5252, 111_111, 31),
+                ready_canary_snapshot_for(5252, 111_112, 31),
+                ready_canary_snapshot_for(5252, 111_112, 31),
+                ready_canary_snapshot_for(6262, 222_222, 41),
+                ready_canary_snapshot_for(6262, 222_222, 41),
+            ],
+        );
+        let mut coordinator = RuntimeCoordinator::with_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+            scripted_required_canary(Arc::clone(&canary_script), Arc::clone(&events)),
+        );
+        coordinator
+            .execute(&LegacyIntent::Running {
+                reason: Reason::Boot,
+            })
+            .expect("active generation converges");
+        events.lock().expect("events lock").clear();
+        coordinator.engine.reports.extend([
+            EngineReport::Started {
+                revision: 30,
+                owned_resource_readiness: ReadinessEvidence::Listener {
+                    port: NonZeroU16::new(1536).expect("port"),
+                    table: PathBuf::from("/proc/5252/net/tcp"),
+                },
+            },
+            EngineReport::NoChange { revision: 31 },
+            EngineReport::NoChange { revision: 31 },
+            EngineReport::BackingOff {
+                revision: 32,
+                retry_after: Duration::from_millis(1),
+            },
+            EngineReport::Stopped { revision: 33 },
+        ]);
+
+        coordinator
+            .execute(&LegacyIntent::Reload {
+                reason: Reason::Fluxctl,
+            })
+            .expect_err("candidate post-attempt identity changed");
+
+        let reload_events = events.lock().expect("events lock").clone();
+        assert!(!reload_events.iter().any(|event| matches!(
+            event,
+            Event::Published(PublishedRuntimeState::Running { generation })
+                if *generation == crate::runtime_coordinator::tests::generation(18)
+        )));
+        assert_eq!(
+            reload_events,
+            [
+                Event::Prepared(Reason::Fluxctl),
+                Event::CaptureStopped,
+                Event::EngineRunning(CaptureObservation::Detached),
+                Event::CaptureStarted,
+                Event::CaptureVerified,
+                Event::EngineRunning(CaptureObservation::Published),
+                Event::CanaryPrepared(generation(18)),
+                Event::CanaryExecuted(generation(18)),
+                Event::EngineRunning(CaptureObservation::Published),
+                Event::CanaryReobserved(generation(18)),
+                Event::CaptureStopped,
+                Event::EngineStopped(CaptureObservation::Detached),
+            ]
+        );
+        events.lock().expect("events lock").clear();
+
+        coordinator.maintain();
+
+        assert_eq!(
+            *events.lock().expect("events lock"),
+            [
+                Event::EngineStopped(CaptureObservation::Detached),
+                Event::EngineRunning(CaptureObservation::Detached),
+                Event::CaptureStarted,
+                Event::CaptureVerified,
+                Event::EngineRunning(CaptureObservation::Published),
+                Event::CanaryPrepared(generation(17)),
+                Event::CanaryExecuted(generation(17)),
+                Event::EngineRunning(CaptureObservation::Published),
+                Event::CanaryReobserved(generation(17)),
+                Event::Published(PublishedRuntimeState::Running {
+                    generation: generation(17),
+                }),
+            ]
+        );
+        let script = canary_script.lock().expect("canary script");
+        let observed_generations: Vec<_> = script
+            .requests
+            .iter()
+            .map(|request| request.pre_binding().engine().generation())
+            .collect();
+        assert_eq!(
+            observed_generations,
+            [generation(17), generation(18), generation(17)]
+        );
+        assert_ne!(script.requests[0].nonce(), script.requests[2].nonce());
+        assert_ne!(script.requests[1].nonce(), script.requests[2].nonce());
     }
 
     #[test]
@@ -1471,8 +2417,11 @@ mod tests {
             events: Arc::clone(&events),
             reports: Arc::new(Mutex::new(VecDeque::new())),
         };
-        let mut coordinator =
-            RuntimeCoordinator::with_dependencies(writer, engine, Duration::from_millis(100));
+        let mut coordinator = RuntimeCoordinator::with_structural_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+        );
         let runtime = coordinator.runtime_snapshot_source();
 
         coordinator
@@ -1523,8 +2472,11 @@ mod tests {
             events: Arc::clone(&events),
             reports: Arc::new(Mutex::new(VecDeque::new())),
         };
-        let mut coordinator =
-            RuntimeCoordinator::with_dependencies(writer, engine, Duration::from_millis(100));
+        let mut coordinator = RuntimeCoordinator::with_structural_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+        );
         coordinator
             .execute(&LegacyIntent::Running {
                 reason: Reason::Boot,
@@ -1582,8 +2534,11 @@ mod tests {
             events: Arc::clone(&events),
             reports: Arc::clone(&reports),
         };
-        let mut coordinator =
-            RuntimeCoordinator::with_dependencies(writer, engine, Duration::from_millis(100));
+        let mut coordinator = RuntimeCoordinator::with_structural_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+        );
         coordinator
             .execute(&LegacyIntent::Running {
                 reason: Reason::Boot,
@@ -1631,8 +2586,11 @@ mod tests {
             events: Arc::clone(&events),
             reports: Arc::new(Mutex::new(VecDeque::new())),
         };
-        let mut coordinator =
-            RuntimeCoordinator::with_dependencies(writer, engine, Duration::from_millis(100));
+        let mut coordinator = RuntimeCoordinator::with_structural_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+        );
         let runtime = coordinator.runtime_snapshot_source();
         coordinator
             .execute(&LegacyIntent::Running {
@@ -1682,8 +2640,11 @@ mod tests {
             events: Arc::clone(&events),
             reports: Arc::new(Mutex::new(VecDeque::new())),
         };
-        let mut coordinator =
-            RuntimeCoordinator::with_dependencies(writer, engine, Duration::from_millis(100));
+        let mut coordinator = RuntimeCoordinator::with_structural_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+        );
         coordinator
             .execute(&LegacyIntent::Running {
                 reason: Reason::Boot,
@@ -1723,8 +2684,11 @@ mod tests {
             events: Arc::clone(&events),
             reports: Arc::new(Mutex::new(VecDeque::new())),
         };
-        let mut coordinator =
-            RuntimeCoordinator::with_dependencies(writer, engine, Duration::from_millis(100));
+        let mut coordinator = RuntimeCoordinator::with_structural_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+        );
         coordinator
             .execute(&LegacyIntent::Running {
                 reason: Reason::Boot,
@@ -1767,8 +2731,11 @@ mod tests {
             events: Arc::clone(&events),
             reports: Arc::clone(&reports),
         };
-        let mut coordinator =
-            RuntimeCoordinator::with_dependencies(writer, engine, Duration::from_millis(1));
+        let mut coordinator = RuntimeCoordinator::with_structural_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(1),
+        );
         coordinator
             .execute(&LegacyIntent::Running {
                 reason: Reason::Boot,
@@ -1817,8 +2784,11 @@ mod tests {
             events: Arc::clone(&events),
             reports: Arc::new(Mutex::new(VecDeque::new())),
         };
-        let mut coordinator =
-            RuntimeCoordinator::with_dependencies(writer, engine, Duration::from_millis(100));
+        let mut coordinator = RuntimeCoordinator::with_structural_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+        );
 
         coordinator
             .execute(&LegacyIntent::ResyncAddresses {
@@ -1845,8 +2815,11 @@ mod tests {
             events: Arc::clone(&events),
             reports: Arc::new(Mutex::new(VecDeque::new())),
         };
-        let mut coordinator =
-            RuntimeCoordinator::with_dependencies(writer, engine, Duration::from_millis(100));
+        let mut coordinator = RuntimeCoordinator::with_structural_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+        );
         coordinator
             .execute(&LegacyIntent::Running {
                 reason: Reason::Boot,
@@ -1883,8 +2856,11 @@ mod tests {
             events: Arc::clone(&events),
             reports: Arc::clone(&reports),
         };
-        let mut coordinator =
-            RuntimeCoordinator::with_dependencies(writer, engine, Duration::from_millis(1));
+        let mut coordinator = RuntimeCoordinator::with_structural_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(1),
+        );
         coordinator
             .execute(&LegacyIntent::Running {
                 reason: Reason::Boot,
@@ -1928,8 +2904,11 @@ mod tests {
             events: Arc::clone(&events),
             reports: Arc::new(Mutex::new(VecDeque::new())),
         };
-        let mut coordinator =
-            RuntimeCoordinator::with_dependencies(writer, engine, Duration::from_millis(100));
+        let mut coordinator = RuntimeCoordinator::with_structural_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+        );
 
         coordinator
             .execute(&LegacyIntent::Running {
@@ -1967,8 +2946,11 @@ mod tests {
             events: Arc::clone(&events),
             reports: Arc::new(Mutex::new(VecDeque::new())),
         };
-        let mut coordinator =
-            RuntimeCoordinator::with_dependencies(writer, engine, Duration::from_millis(100));
+        let mut coordinator = RuntimeCoordinator::with_structural_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+        );
 
         coordinator
             .execute(&LegacyIntent::Running {
@@ -2005,8 +2987,11 @@ mod tests {
             events: Arc::clone(&events),
             reports: Arc::new(Mutex::new(VecDeque::new())),
         };
-        let mut coordinator =
-            RuntimeCoordinator::with_dependencies(writer, engine, Duration::from_millis(100));
+        let mut coordinator = RuntimeCoordinator::with_structural_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+        );
 
         coordinator
             .execute(&LegacyIntent::Running {
@@ -2044,8 +3029,11 @@ mod tests {
             events: Arc::clone(&events),
             reports: Arc::new(Mutex::new(VecDeque::new())),
         };
-        let mut coordinator =
-            RuntimeCoordinator::with_dependencies(writer, engine, Duration::from_millis(100));
+        let mut coordinator = RuntimeCoordinator::with_structural_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+        );
         coordinator
             .execute(&LegacyIntent::Running {
                 reason: Reason::Boot,
@@ -2092,8 +3080,11 @@ mod tests {
             events: Arc::clone(&events),
             reports: Arc::clone(&reports),
         };
-        let mut coordinator =
-            RuntimeCoordinator::with_dependencies(writer, engine, Duration::from_millis(100));
+        let mut coordinator = RuntimeCoordinator::with_structural_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+        );
         coordinator
             .execute(&LegacyIntent::Running {
                 reason: Reason::Boot,
@@ -2151,8 +3142,11 @@ mod tests {
             events: Arc::clone(&events),
             reports: Arc::clone(&reports),
         };
-        let mut coordinator =
-            RuntimeCoordinator::with_dependencies(writer, engine, Duration::from_millis(100));
+        let mut coordinator = RuntimeCoordinator::with_structural_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+        );
         let runtime = coordinator.runtime_snapshot_source();
         coordinator
             .execute(&LegacyIntent::Running {
@@ -2205,8 +3199,11 @@ mod tests {
             events: Arc::clone(&events),
             reports: Arc::new(Mutex::new(VecDeque::new())),
         };
-        let mut coordinator =
-            RuntimeCoordinator::with_dependencies(writer, engine, Duration::from_millis(100));
+        let mut coordinator = RuntimeCoordinator::with_structural_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+        );
         coordinator
             .execute(&LegacyIntent::Running {
                 reason: Reason::Boot,
@@ -2258,8 +3255,11 @@ mod tests {
             events: Arc::clone(&events),
             reports: Arc::new(Mutex::new(VecDeque::new())),
         };
-        let mut coordinator =
-            RuntimeCoordinator::with_dependencies(writer, engine, Duration::from_millis(100));
+        let mut coordinator = RuntimeCoordinator::with_structural_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+        );
         coordinator
             .execute(&LegacyIntent::Running {
                 reason: Reason::Boot,
@@ -2320,8 +3320,11 @@ mod tests {
             events: Arc::clone(&events),
             reports: Arc::clone(&reports),
         };
-        let mut coordinator =
-            RuntimeCoordinator::with_dependencies(writer, engine, Duration::from_millis(100));
+        let mut coordinator = RuntimeCoordinator::with_structural_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+        );
         coordinator
             .execute(&LegacyIntent::Running {
                 reason: Reason::Boot,
@@ -2397,8 +3400,11 @@ mod tests {
             events: Arc::clone(&events),
             reports: Arc::clone(&reports),
         };
-        let mut coordinator =
-            RuntimeCoordinator::with_dependencies(writer, engine, Duration::from_millis(100));
+        let mut coordinator = RuntimeCoordinator::with_structural_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+        );
         coordinator
             .execute(&LegacyIntent::Running {
                 reason: Reason::Boot,
@@ -2433,6 +3439,9 @@ mod tests {
         CaptureStarted,
         CaptureStopped,
         CaptureVerified,
+        CanaryPrepared(NonZeroU32),
+        CanaryExecuted(NonZeroU32),
+        CanaryReobserved(NonZeroU32),
         AddressesResynchronized,
         Published(PublishedRuntimeState),
     }
@@ -2655,6 +3664,294 @@ mod tests {
                 }
             }
         }
+
+        fn snapshot(&self) -> Arc<EngineSnapshot> {
+            Arc::new(EngineSnapshot::default())
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum ScriptedCanaryOutcome {
+        Pass,
+        Fail {
+            kind: CanaryErrorKind,
+            cleanup: CanaryCleanupStatus,
+        },
+    }
+
+    struct ScriptedCanaryAttempt {
+        request: CanaryAttemptRequest,
+        outcome: ScriptedCanaryOutcome,
+    }
+
+    impl ScriptedCanaryAttempt {
+        fn passing(request: CanaryAttemptRequest) -> Self {
+            Self {
+                request,
+                outcome: ScriptedCanaryOutcome::Pass,
+            }
+        }
+
+        fn failing(
+            request: CanaryAttemptRequest,
+            kind: CanaryErrorKind,
+            cleanup: CanaryCleanupStatus,
+        ) -> Self {
+            Self {
+                request,
+                outcome: ScriptedCanaryOutcome::Fail { kind, cleanup },
+            }
+        }
+    }
+
+    struct ActiveCanaryAttempt {
+        request: CanaryAttemptRequest,
+        outcome: ScriptedCanaryOutcome,
+    }
+
+    struct ScriptedCanary {
+        attempts: VecDeque<ScriptedCanaryAttempt>,
+        active: Option<ActiveCanaryAttempt>,
+        requests: Vec<CanaryAttemptRequest>,
+        executions: usize,
+    }
+
+    impl ScriptedCanary {
+        fn new(attempts: impl IntoIterator<Item = ScriptedCanaryAttempt>) -> Self {
+            Self {
+                attempts: attempts.into_iter().collect(),
+                active: None,
+                requests: Vec::new(),
+                executions: 0,
+            }
+        }
+    }
+
+    struct ScriptedCanaryContext {
+        script: Arc<Mutex<ScriptedCanary>>,
+        events: Arc<Mutex<Vec<Event>>>,
+    }
+
+    impl UnqualifiedFunctionalCanaryAttemptContext for ScriptedCanaryContext {
+        fn prepare_attempt(
+            &mut self,
+            generation: NonZeroU32,
+        ) -> Result<UnqualifiedFunctionalCanaryAttemptInputs, FunctionalCanaryError> {
+            let mut script = self.script.lock().expect("canary script");
+            let attempt = script.attempts.pop_front().ok_or_else(|| {
+                FunctionalCanaryError::new(
+                    CanaryErrorKind::AdapterFailure,
+                    CanaryCleanupStatus::NotRequired,
+                    "no scripted functional canary attempt remains",
+                )
+            })?;
+            if attempt.request.pre_binding().engine().generation() != generation {
+                return Err(FunctionalCanaryError::new(
+                    CanaryErrorKind::IdentityChanged,
+                    CanaryCleanupStatus::NotRequired,
+                    "scripted canary generation does not match the active generation",
+                ));
+            }
+            self.events
+                .lock()
+                .expect("events lock")
+                .push(Event::CanaryPrepared(generation));
+            let inputs = UnqualifiedFunctionalCanaryAttemptInputs::new(
+                attempt.request.pre_binding().environment().clone(),
+                attempt.request.nonce(),
+                attempt.request.deadline(),
+                attempt.request.families(),
+                attempt.request.counter_bounds(),
+            );
+            script.active = Some(ActiveCanaryAttempt {
+                request: attempt.request,
+                outcome: attempt.outcome,
+            });
+            Ok(inputs)
+        }
+
+        fn reobserve_environment(
+            &mut self,
+            request: &CanaryAttemptRequest,
+        ) -> Result<CanaryEnvironmentBinding, FunctionalCanaryError> {
+            let script = self.script.lock().expect("canary script");
+            let active = script.active.as_ref().ok_or_else(|| {
+                FunctionalCanaryError::new(
+                    CanaryErrorKind::AdapterFailure,
+                    CanaryCleanupStatus::NotRequired,
+                    "functional canary has no active scripted attempt",
+                )
+            })?;
+            if &active.request != request {
+                return Err(FunctionalCanaryError::new(
+                    CanaryErrorKind::IdentityChanged,
+                    CanaryCleanupStatus::NotRequired,
+                    "post-attempt observation received a different request",
+                ));
+            }
+            let generation = request.pre_binding().engine().generation();
+            self.events
+                .lock()
+                .expect("events lock")
+                .push(Event::CanaryReobserved(generation));
+            Ok(request.pre_binding().environment().clone())
+        }
+
+        fn monotonic_now(&mut self) -> Instant {
+            let mut script = self.script.lock().expect("canary script");
+            let active = script
+                .active
+                .take()
+                .expect("post-attempt clock requires an active canary");
+            FunctionalCanaryFixture::from_request(active.request).observed_at()
+        }
+    }
+
+    struct ScriptedCanaryExecutor {
+        script: Arc<Mutex<ScriptedCanary>>,
+        events: Arc<Mutex<Vec<Event>>>,
+    }
+
+    impl UnqualifiedFunctionalCanaryExecutor for ScriptedCanaryExecutor {
+        fn execute(
+            &mut self,
+            request: &CanaryAttemptRequest,
+        ) -> Result<UnqualifiedCanaryGateEvidence, FunctionalCanaryError> {
+            let mut script = self.script.lock().expect("canary script");
+            let active = script.active.as_ref().ok_or_else(|| {
+                FunctionalCanaryError::new(
+                    CanaryErrorKind::AdapterFailure,
+                    CanaryCleanupStatus::NotRequired,
+                    "functional canary executor has no active attempt",
+                )
+            })?;
+            if &active.request != request {
+                return Err(FunctionalCanaryError::new(
+                    CanaryErrorKind::IdentityChanged,
+                    CanaryCleanupStatus::NotRequired,
+                    "functional canary executor received a different request",
+                ));
+            }
+            let outcome = active.outcome;
+            let generation = request.pre_binding().engine().generation();
+            script.requests.push(request.clone());
+            script.executions += 1;
+            self.events
+                .lock()
+                .expect("events lock")
+                .push(Event::CanaryExecuted(generation));
+            match outcome {
+                ScriptedCanaryOutcome::Pass => Ok(FunctionalCanaryFixture::from_request(
+                    request.clone(),
+                )
+                .successful_evidence()),
+                ScriptedCanaryOutcome::Fail { kind, cleanup } => Err(FunctionalCanaryError::new(
+                    kind,
+                    cleanup,
+                    "injected functional canary failure",
+                )),
+            }
+        }
+    }
+
+    fn scripted_required_canary(
+        script: Arc<Mutex<ScriptedCanary>>,
+        events: Arc<Mutex<Vec<Event>>>,
+    ) -> RuntimeFunctionalCanary {
+        RuntimeFunctionalCanary::RequiredUnqualified {
+            context: Box::new(ScriptedCanaryContext {
+                script: Arc::clone(&script),
+                events: Arc::clone(&events),
+            }),
+            executor: Box::new(ScriptedCanaryExecutor { script, events }),
+        }
+    }
+
+    struct RequiredScriptedEngine {
+        events: Arc<Mutex<Vec<Event>>>,
+        reports: VecDeque<EngineReport>,
+        snapshots: Arc<Mutex<VecDeque<Arc<EngineSnapshot>>>>,
+        current_snapshot: Arc<Mutex<Arc<EngineSnapshot>>>,
+    }
+
+    impl RequiredScriptedEngine {
+        fn new(
+            events: Arc<Mutex<Vec<Event>>>,
+            snapshots: impl IntoIterator<Item = Arc<EngineSnapshot>>,
+        ) -> Self {
+            Self {
+                events,
+                reports: VecDeque::new(),
+                snapshots: Arc::new(Mutex::new(snapshots.into_iter().collect())),
+                current_snapshot: Arc::new(Mutex::new(Arc::new(EngineSnapshot::default()))),
+            }
+        }
+    }
+
+    impl EngineRuntime for RequiredScriptedEngine {
+        fn reconcile(
+            &mut self,
+            desired: DesiredEngine<'_>,
+            capture: CaptureObservation,
+        ) -> Result<EngineReport, EngineSupervisorError> {
+            match desired {
+                DesiredEngine::Running(_) => {
+                    self.events
+                        .lock()
+                        .expect("events lock")
+                        .push(Event::EngineRunning(capture));
+                    Ok(self.reports.pop_front().unwrap_or(EngineReport::Started {
+                        revision: 1,
+                        owned_resource_readiness: ReadinessEvidence::Listener {
+                            port: NonZeroU16::new(1536).expect("nonzero port"),
+                            table: PathBuf::from("/proc/4242/net/tcp"),
+                        },
+                    }))
+                }
+                DesiredEngine::Stopped => {
+                    self.events
+                        .lock()
+                        .expect("events lock")
+                        .push(Event::EngineStopped(capture));
+                    Ok(self
+                        .reports
+                        .pop_front()
+                        .unwrap_or(EngineReport::Stopped { revision: 1 }))
+                }
+            }
+        }
+
+        fn snapshot(&self) -> Arc<EngineSnapshot> {
+            if let Some(snapshot) = self.snapshots.lock().expect("snapshots lock").pop_front() {
+                *self.current_snapshot.lock().expect("current snapshot lock") =
+                    Arc::clone(&snapshot);
+                snapshot
+            } else {
+                Arc::clone(&self.current_snapshot.lock().expect("current snapshot lock"))
+            }
+        }
+    }
+
+    fn ready_canary_snapshot(start_time_ticks: u64) -> Arc<EngineSnapshot> {
+        ready_canary_snapshot_for(4242, start_time_ticks, 23)
+    }
+
+    fn ready_canary_snapshot_for(
+        pid: u32,
+        start_time_ticks: u64,
+        revision: u64,
+    ) -> Arc<EngineSnapshot> {
+        Arc::new(EngineSnapshot::ready_for_test(
+            NonZeroU64::new(revision).expect("nonzero engine revision"),
+            OwnedEngineIdentity::new(
+                NonZeroU32::new(pid).expect("nonzero engine PID"),
+                NonZeroU64::new(start_time_ticks).expect("nonzero engine start ticks"),
+            ),
+            ReadinessEvidence::Listener {
+                port: NonZeroU16::new(1536).expect("nonzero listener port"),
+                table: PathBuf::from(format!("/proc/{pid}/net/tcp")),
+            },
+        ))
     }
 
     struct EngineFixture {

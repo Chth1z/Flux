@@ -396,6 +396,24 @@ impl EngineSnapshot {
     pub fn last_diagnostic(&self) -> Option<&str> {
         self.last_diagnostic.as_deref()
     }
+
+    #[cfg(test)]
+    pub(crate) fn ready_for_test(
+        revision: NonZeroU64,
+        owned_identity: OwnedEngineIdentity,
+        readiness: ReadinessEvidence,
+    ) -> Self {
+        Self {
+            revision: revision.get(),
+            phase: EnginePhase::Ready,
+            owned_identity: Some(owned_identity),
+            restart_attempts: 0,
+            retry_delay: None,
+            last_exit: None,
+            readiness: Some(readiness),
+            last_diagnostic: None,
+        }
+    }
 }
 
 impl Default for EngineSnapshot {

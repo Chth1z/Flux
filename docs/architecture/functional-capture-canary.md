@@ -42,6 +42,14 @@ OUTPUT mark counter, a local-route lookup, or zero peer packets as proof that lo
 TPROXY. Those observations are route/loop negative controls only. Production local-OUTPUT
 qualification requires its own device-supported capture mechanism and listener evidence.
 
+REDIRECT and DNAT are not substitutes for that proof. They can deliver a rewritten local flow to
+a conventional listener, but that does not exercise the selected TPROXY backend, its transparent
+listener, or its original-destination semantics. A local-OUTPUT adapter may qualify only the
+backend-specific listener path that it actually exercises. For a TPROXY Generation it must prove
+delivery to that Generation's TPROXY listener with the expected tuple semantics; if the device has
+no supported way to do so, the adapter reports `unsupported` instead of silently qualifying a
+REDIRECT/DNAT path.
+
 ## Runtime status contract
 
 Protocol version 3 carries a required verification field inside the independently revisioned
@@ -206,8 +214,28 @@ responder. UDP additionally cross-checks the transparent response socket bound t
 destination and connected to the exact probe tuple, proving source-preserving responses. The DNS
 flows retain the existing transaction/question/answer checks over both transports and cross-check
 the parsed client, relay, and peer reports. None of these harness reports can be converted into
-complete model evidence until the exact supervised-engine identity, distinct UIDs, and
-authoritative socket correlation also exist.
+complete model evidence until a distinct-UID local-OUTPUT executor proves backend-specific
+listener delivery, invokes the authoritative collector against the exact supervised engine, and
+constructs the remaining attempt evidence.
+
+### Delivered `/proc` FD plus INET_DIAG correlation prerequisite
+
+The Linux/Android collector for the primary non-eBPF correlation path is delivered. For the exact
+supervised PID and `/proc` start-tick identity, it requires identical bounded pre/post socket-FD
+inventories and completes the IPv4/IPv6 TCP and connected-UDP INET_DIAG dumps under one caller-
+supplied exclusive monotonic deadline. A successful evidence join binds the transport protocol,
+exact local and remote tuple, socket UID, required mark, numeric FD, matching `/proc` and INET_DIAG
+socket inode, INET_DIAG cookie, collector identity/sequence, process identity, and the recorded
+dump/snapshot timing interval inside the corresponding flow window. An incomplete scan or dump,
+FD drift, deadline expiry, resource-bound breach, dump interruption, malformed or duplicate/
+ambiguous match, identity drift, missing cookie/inode/FD/mark binding, tuple/UID/mark mismatch, or
+out-of-window observation fails closed; enumeration hints are never promoted into correlation
+evidence.
+
+This collector is deliberately not a canary executor. It does not create the distinct probe and
+engine UIDs, install local-OUTPUT capture, generate traffic, prove listener delivery, or authorize
+the model's complete `validate_for` path. Those transaction-level responsibilities remain in the
+separate local-OUTPUT adapter/executor.
 
 The local peer validates the received payload and records the engine-side connection/datagram
 tuple. The adapter correlates that tuple with the exact supervised engine identity and validates
@@ -269,13 +297,18 @@ functional pass.
    responses, parsed DNS transaction/question/answer evidence, per-family route controls,
    independent bounded flow counters, and exact cleanup. The empirical OUTPUT boundary above
    remains part of its acceptance contract.
-4. Add a separate local-OUTPUT qualification slice using distinct nonzero probe/engine UIDs and
-   authoritative `/proc` FD plus INET_DIAG correlation (or a separately qualified cgroup-eBPF
-   observer). Only that later slice may construct complete evidence and call the model
-   `validate_for` path. It must not weaken the model to accommodate the ingress checkpoint.
-5. Add an Android lab adapter that reports explicit `unsupported`, `denied`, `conflicting`,
+4. **Complete prerequisite:** the strict Linux/Android `/proc` FD plus INET_DIAG collector and
+   model correlation bind protocol, exact tuple, UID, mark, FD/inode/cookie identity, complete
+   dumps, supervised-process identity, and timing. This is evidence plumbing, not a functional
+   pass.
+5. Add a separate local-OUTPUT qualification slice using distinct nonzero probe/engine UIDs,
+   backend-specific listener delivery, the delivered collector (or a separately qualified
+   cgroup-eBPF observer), and the complete model `validate_for` path. REDIRECT/DNAT delivery cannot
+   qualify a TPROXY Generation; an adapter without a qualifying TPROXY listener path reports
+   `unsupported`. This slice must not weaken the model to accommodate the ingress checkpoint.
+6. Add an Android lab adapter that reports explicit `unsupported`, `denied`, `conflicting`,
    `broken`, or `unknown` evidence. It remains diagnostic-only until exact-device qualification.
-6. Permit TPROXY `RUNNING` only for reviewed device profiles whose functional canary passes the
+7. Permit TPROXY `RUNNING` only for reviewed device profiles whose functional canary passes the
    real-device matrix and cleanup/crash tests. Other profiles remain unqualified; broaden the
    reviewed set without weakening the probe. TUN remains rejected until its separate
    single-route-owner and forced-death cleanup canaries pass.
@@ -324,8 +357,8 @@ than triggering implicit module autoload.
 
 Until the separate local-OUTPUT slice and real-device qualification are evidenced, Flux must
 describe Phase 1 capture verification as structural and the functional exit gate as incomplete.
-Host ingress tests, Linux namespaces, route lookups, or successful counters do not constitute
-production Android evidence.
+The delivered collector, host ingress tests, Linux namespaces, route lookups, or successful
+counters do not authorize production `functional_passed` and do not constitute Android evidence.
 
 ## Open Android qualification work
 

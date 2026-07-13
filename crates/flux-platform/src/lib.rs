@@ -18,6 +18,7 @@ mod reactor;
 mod seqpacket;
 mod shutdown;
 mod sing_box;
+pub mod socket_diagnostics;
 
 pub use capability::{CapabilityProfilePaths, SystemCapabilityProfileSource};
 pub use legacy_dispatcher::{LegacyScriptPaths, ProcessLegacyDispatcher};

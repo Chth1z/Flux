@@ -590,9 +590,12 @@ source-preserving UDP replies, nonce-bound DNS transaction/question/answer evide
 route controls/counters, and cleanup. This ingress evidence cannot authorize residual
 local OUTPUT: in the harness kernel, an OUTPUT mark plus local policy route did not re-enter
 PREROUTING, and xtables TPROXY cannot attach to OUTPUT. OUTPUT counters and route lookups are
-therefore negative-control evidence only. Distinct nonzero probe/engine UIDs, exact local-OUTPUT
-listener delivery, INET_DIAG or separately qualified cgroup-eBPF socket correlation, complete
-model `validate_for`, and Android qualification remain separate gates.
+therefore negative-control evidence only. The strict Linux/Android `/proc` FD plus INET_DIAG
+collector now binds protocol, exact tuple, UID, mark, FD/inode/cookie, complete dumps, supervised
+process identity, and timing, but it is only a delivered evidence prerequisite. Distinct nonzero
+probe/engine UIDs, backend-specific local-OUTPUT listener delivery, complete model `validate_for`,
+and Android qualification remain separate gates. REDIRECT/DNAT cannot qualify TPROXY; an adapter
+must prove delivery to the selected backend's listener or report that backend unsupported.
 
 The Phase 1 manifest is a strict UTF-8 line document no larger than 16 KiB. It rejects unknown, duplicate, malformed, missing, and conditional-field violations; startup and stop timeouts are decimal milliseconds in `1..=60000`. A boot-scoped dispatcher mode lease prevents Rust-owned phase verbs—including address resynchronization—from being mixed with legacy `scripts/core` engine ownership.
 

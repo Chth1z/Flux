@@ -11,6 +11,9 @@ use flux_core::{
     OwnershipJournalRevision, RouteTableId, RulePriority,
 };
 use flux_platform::ReadinessEvidence;
+use flux_platform::socket_diagnostics::{
+    CorrelatedProcessSocket, InetSocketProtocol, ProcessSocketDiagnostics, SocketCorrelationError,
+};
 use sha2::{Digest, Sha256};
 
 use crate::{EngineArtifactDigest, EngineSpec, OwnedEngineIdentity};
@@ -426,6 +429,31 @@ impl CanaryInetDiagCookie {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CanaryProcFd(u32);
+
+impl CanaryProcFd {
+    #[must_use]
+    pub(crate) const fn new(raw: u32) -> Option<Self> {
+        if raw <= i32::MAX as u32 {
+            Some(Self(raw))
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CanaryInetDiagProtocol {
+    Tcp,
+    Udp,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CanaryBpfSocketHook {
     ConnectIpv4,
     ConnectIpv6,
@@ -438,14 +466,21 @@ pub(crate) enum CanarySocketCorrelation {
     ProcFdInetDiag {
         observer: CanarySocketObserverAuthority,
         process: OwnedEngineIdentity,
-        proc_fd: NonZeroU32,
+        proc_fd: CanaryProcFd,
         fd_socket_inode: NonZeroU64,
         diag_socket_inode: NonZeroU64,
         inet_diag_cookie: CanaryInetDiagCookie,
         observer_sequence: NonZeroU64,
+        diag_protocol: CanaryInetDiagProtocol,
+        diag_tuple: CanaryFlowTuple,
+        diag_uid: NonZeroU32,
+        diag_socket_mark: u32,
         fd_scan_complete: bool,
         diag_dump_complete: bool,
-        observed_at: Instant,
+        snapshot_started_at: Instant,
+        snapshot_completed_at: Instant,
+        dump_started_at: Instant,
+        dump_completed_at: Instant,
     },
     QualifiedCgroupBpf {
         observer: CanarySocketObserverAuthority,
@@ -460,12 +495,115 @@ pub(crate) enum CanarySocketCorrelation {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CanarySocketCorrelationBuildError {
+    WrongObserverAuthority,
+    ObserverPortMismatch,
+    ProcessIdentityMismatch,
+    SnapshotCorrelationRejected(SocketCorrelationError),
+    SnapshotCorrelationMismatch,
+    InvalidProcFd,
+    ZeroDiagnosticInode,
+    InvalidInetDiagCookie,
+    ZeroDiagnosticUid,
+    MissingDiagnosticMark,
+    MissingDiagnosticDump,
+    AmbiguousDiagnosticDump,
+}
+
 impl CanarySocketCorrelation {
-    const fn observed_at(self) -> Instant {
-        match self {
-            Self::ProcFdInetDiag { observed_at, .. }
-            | Self::QualifiedCgroupBpf { observed_at, .. } => observed_at,
+    /// Build one correlation exclusively from an exact collector snapshot join.
+    ///
+    /// The local-OUTPUT executor will call this adapter after selecting the
+    /// expected FD, protocol, and tuple through `ProcessSocketDiagnostics::correlate`.
+    #[allow(dead_code)]
+    pub(crate) fn from_proc_fd_inet_diag_snapshot(
+        observer: CanarySocketObserverAuthority,
+        process: OwnedEngineIdentity,
+        snapshot: &ProcessSocketDiagnostics,
+        correlated: CorrelatedProcessSocket,
+    ) -> Result<Self, CanarySocketCorrelationBuildError> {
+        let CanarySocketObserverAuthority::ProcFdInetDiag {
+            netlink_port_id, ..
+        } = observer
+        else {
+            return Err(CanarySocketCorrelationBuildError::WrongObserverAuthority);
+        };
+        if netlink_port_id != snapshot.netlink_port_id() {
+            return Err(CanarySocketCorrelationBuildError::ObserverPortMismatch);
         }
+        let observed_process = snapshot.process();
+        if observed_process.pid().get() != process.pid()
+            || observed_process.start_time_ticks().get() != process.start_time_ticks()
+        {
+            return Err(CanarySocketCorrelationBuildError::ProcessIdentityMismatch);
+        }
+
+        let process_fd = correlated.process_fd();
+        let diagnostic = correlated.diagnostic();
+        let selected = snapshot
+            .correlate(
+                process_fd.fd(),
+                diagnostic.protocol(),
+                diagnostic.local_address(),
+                diagnostic.remote_address(),
+            )
+            .map_err(CanarySocketCorrelationBuildError::SnapshotCorrelationRejected)?;
+        if selected != correlated {
+            return Err(CanarySocketCorrelationBuildError::SnapshotCorrelationMismatch);
+        }
+
+        let proc_fd = CanaryProcFd::new(process_fd.fd())
+            .ok_or(CanarySocketCorrelationBuildError::InvalidProcFd)?;
+        let diag_socket_inode = NonZeroU64::new(diagnostic.inode())
+            .ok_or(CanarySocketCorrelationBuildError::ZeroDiagnosticInode)?;
+        let cookie_words = diagnostic.cookie().words();
+        let inet_diag_cookie = CanaryInetDiagCookie::new(cookie_words[0], cookie_words[1])
+            .ok_or(CanarySocketCorrelationBuildError::InvalidInetDiagCookie)?;
+        let diag_uid = NonZeroU32::new(diagnostic.uid())
+            .ok_or(CanarySocketCorrelationBuildError::ZeroDiagnosticUid)?;
+        let diag_socket_mark = diagnostic
+            .mark()
+            .ok_or(CanarySocketCorrelationBuildError::MissingDiagnosticMark)?;
+
+        let mut dumps = snapshot.dumps().iter().copied().filter(|dump| {
+            dump.sequence() == diagnostic.dump_sequence()
+                && dump.address_family() == diagnostic.address_family()
+                && dump.protocol() == diagnostic.protocol()
+        });
+        let dump = dumps
+            .next()
+            .ok_or(CanarySocketCorrelationBuildError::MissingDiagnosticDump)?;
+        if dumps.next().is_some() {
+            return Err(CanarySocketCorrelationBuildError::AmbiguousDiagnosticDump);
+        }
+
+        Ok(Self::ProcFdInetDiag {
+            observer,
+            process,
+            proc_fd,
+            fd_socket_inode: process_fd.inode(),
+            diag_socket_inode,
+            inet_diag_cookie,
+            observer_sequence: NonZeroU64::new(u64::from(diagnostic.dump_sequence().get()))
+                .expect("a nonzero u32 remains nonzero as u64"),
+            diag_protocol: match diagnostic.protocol() {
+                InetSocketProtocol::Tcp => CanaryInetDiagProtocol::Tcp,
+                InetSocketProtocol::Udp => CanaryInetDiagProtocol::Udp,
+            },
+            diag_tuple: CanaryFlowTuple::new(
+                diagnostic.local_address(),
+                diagnostic.remote_address(),
+            ),
+            diag_uid,
+            diag_socket_mark,
+            fd_scan_complete: snapshot.fd_scan_complete(),
+            diag_dump_complete: snapshot.diag_dumps_complete(),
+            snapshot_started_at: snapshot.started_at(),
+            snapshot_completed_at: snapshot.completed_at(),
+            dump_started_at: dump.started_at(),
+            dump_completed_at: dump.completed_at(),
+        })
     }
 
     const fn process(self) -> OwnedEngineIdentity {
@@ -2177,6 +2315,18 @@ pub(crate) enum CanaryEvidenceError {
     OutboundSocketCorrelationIdentityMismatch {
         flow: CanaryFlow,
     },
+    OutboundSocketCorrelationProtocolMismatch {
+        flow: CanaryFlow,
+    },
+    OutboundSocketCorrelationTupleMismatch {
+        flow: CanaryFlow,
+    },
+    OutboundSocketCorrelationUidMismatch {
+        flow: CanaryFlow,
+    },
+    OutboundSocketCorrelationMarkMismatch {
+        flow: CanaryFlow,
+    },
     OutboundSocketCorrelationTimingInvalid {
         flow: CanaryFlow,
     },
@@ -2465,10 +2615,6 @@ fn validate_socket_correlation(
     if correlation.process() != request.pre_binding.engine.engine() {
         return Err(CanaryEvidenceError::OutboundEngineMismatch { flow });
     }
-    let observed_at = correlation.observed_at();
-    if observed_at < flow_evidence.started_at || observed_at > flow_evidence.completed_at {
-        return Err(CanaryEvidenceError::OutboundSocketCorrelationTimingInvalid { flow });
-    }
     let expected_observer = request.pre_binding.environment.authority.socket_observer;
     if correlation.observer() != expected_observer {
         return Err(CanaryEvidenceError::OutboundSocketObserverMismatch { flow });
@@ -2479,11 +2625,27 @@ fn validate_socket_correlation(
             CanarySocketCorrelation::ProcFdInetDiag {
                 fd_socket_inode,
                 diag_socket_inode,
+                diag_protocol,
+                diag_tuple,
+                diag_uid,
+                diag_socket_mark,
                 fd_scan_complete,
                 diag_dump_complete,
+                snapshot_started_at,
+                snapshot_completed_at,
+                dump_started_at,
+                dump_completed_at,
                 ..
             },
         ) => {
+            if snapshot_started_at >= dump_started_at
+                || dump_started_at >= dump_completed_at
+                || dump_completed_at >= snapshot_completed_at
+                || snapshot_started_at < flow_evidence.started_at
+                || snapshot_completed_at > flow_evidence.completed_at
+            {
+                return Err(CanaryEvidenceError::OutboundSocketCorrelationTimingInvalid { flow });
+            }
             if !fd_scan_complete || !diag_dump_complete {
                 return Err(CanaryEvidenceError::OutboundSocketCorrelationLoss { flow });
             }
@@ -2491,6 +2653,24 @@ fn validate_socket_correlation(
                 return Err(
                     CanaryEvidenceError::OutboundSocketCorrelationIdentityMismatch { flow },
                 );
+            }
+            let expected_protocol = match flow.kind() {
+                CanaryFlowKind::TcpEcho | CanaryFlowKind::DnsTcp => CanaryInetDiagProtocol::Tcp,
+                CanaryFlowKind::UdpEcho | CanaryFlowKind::DnsUdp => CanaryInetDiagProtocol::Udp,
+            };
+            if diag_protocol != expected_protocol {
+                return Err(
+                    CanaryEvidenceError::OutboundSocketCorrelationProtocolMismatch { flow },
+                );
+            }
+            if diag_tuple != outbound.tuple {
+                return Err(CanaryEvidenceError::OutboundSocketCorrelationTupleMismatch { flow });
+            }
+            if diag_uid != outbound.observed_uid {
+                return Err(CanaryEvidenceError::OutboundSocketCorrelationUidMismatch { flow });
+            }
+            if diag_socket_mark != outbound.observed_socket_mark {
+                return Err(CanaryEvidenceError::OutboundSocketCorrelationMarkMismatch { flow });
             }
         }
         (
@@ -2500,9 +2680,13 @@ fn validate_socket_correlation(
                 hook,
                 lost_events_before,
                 lost_events_after,
+                observed_at,
                 ..
             },
         ) => {
+            if observed_at < flow_evidence.started_at || observed_at > flow_evidence.completed_at {
+                return Err(CanaryEvidenceError::OutboundSocketCorrelationTimingInvalid { flow });
+            }
             if attempt_nonce != request.nonce() {
                 return Err(CanaryEvidenceError::OutboundSocketCorrelationNonceMismatch { flow });
             }
@@ -3066,15 +3250,23 @@ pub(crate) mod tests {
     fn structured_loop_evidence_requires_clear_marks_and_negative_route_isolation() {
         let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
         let mut marked = fixture.successful_evidence();
-        marked.loop_escape.outbound.slots[0]
-            .as_mut()
-            .expect("outbound evidence")
-            .observed_socket_mark = fixture
+        let proxy_mark = fixture
             .request
             .pre_binding
             .environment
             .rpdb
             .proxy_mark_value;
+        let outbound = marked.loop_escape.outbound.slots[0]
+            .as_mut()
+            .expect("outbound evidence");
+        outbound.observed_socket_mark = proxy_mark;
+        let CanarySocketCorrelation::ProcFdInetDiag {
+            diag_socket_mark, ..
+        } = &mut outbound.socket_correlation
+        else {
+            panic!("fixture uses proc/INET_DIAG correlation");
+        };
+        *diag_socket_mark = proxy_mark;
         assert_eq!(
             validate(&fixture, marked).expect_err("masked outbound socket cannot pass"),
             CanaryEvidenceError::OutboundProxyMarkNotClear {
@@ -3128,6 +3320,219 @@ pub(crate) mod tests {
                 flow: CanaryFlow::Ipv4TcpEcho,
             }
         );
+    }
+
+    #[test]
+    fn proc_fd_inet_diag_correlation_requires_the_exact_outbound_socket() {
+        let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+
+        let mut unrelated_tuple = fixture.successful_evidence();
+        let flow = unrelated_tuple.flows.slots[CanaryFlow::Ipv4TcpEcho.index()]
+            .as_ref()
+            .expect("IPv4 TCP flow evidence");
+        let outbound = unrelated_tuple.loop_escape.outbound.slots[CanaryFlow::Ipv4TcpEcho.index()]
+            .as_mut()
+            .expect("IPv4 TCP outbound evidence");
+        let CanarySocketCorrelation::ProcFdInetDiag { diag_tuple, .. } =
+            &mut outbound.socket_correlation
+        else {
+            panic!("fixture uses proc/INET_DIAG correlation");
+        };
+        *diag_tuple = flow.client_tuple;
+        assert_eq!(
+            validate(&fixture, unrelated_tuple)
+                .expect_err("an unrelated INET_DIAG tuple cannot prove socket ownership"),
+            CanaryEvidenceError::OutboundSocketCorrelationTupleMismatch {
+                flow: CanaryFlow::Ipv4TcpEcho,
+            }
+        );
+
+        let mut wrong_protocol = fixture.successful_evidence();
+        let outbound = wrong_protocol.loop_escape.outbound.slots[CanaryFlow::Ipv4TcpEcho.index()]
+            .as_mut()
+            .expect("IPv4 TCP outbound evidence");
+        let CanarySocketCorrelation::ProcFdInetDiag { diag_protocol, .. } =
+            &mut outbound.socket_correlation
+        else {
+            panic!("fixture uses proc/INET_DIAG correlation");
+        };
+        *diag_protocol = CanaryInetDiagProtocol::Udp;
+        assert_eq!(
+            validate(&fixture, wrong_protocol)
+                .expect_err("a UDP INET_DIAG row cannot prove a TCP socket"),
+            CanaryEvidenceError::OutboundSocketCorrelationProtocolMismatch {
+                flow: CanaryFlow::Ipv4TcpEcho,
+            }
+        );
+
+        let mut wrong_uid = fixture.successful_evidence();
+        let outbound = wrong_uid.loop_escape.outbound.slots[CanaryFlow::Ipv4TcpEcho.index()]
+            .as_mut()
+            .expect("IPv4 TCP outbound evidence");
+        let CanarySocketCorrelation::ProcFdInetDiag { diag_uid, .. } =
+            &mut outbound.socket_correlation
+        else {
+            panic!("fixture uses proc/INET_DIAG correlation");
+        };
+        *diag_uid = NonZeroU32::new(20_003).expect("unrelated UID");
+        assert_eq!(
+            validate(&fixture, wrong_uid)
+                .expect_err("an unrelated INET_DIAG UID cannot prove socket ownership"),
+            CanaryEvidenceError::OutboundSocketCorrelationUidMismatch {
+                flow: CanaryFlow::Ipv4TcpEcho,
+            }
+        );
+
+        let mut wrong_mark = fixture.successful_evidence();
+        let outbound = wrong_mark.loop_escape.outbound.slots[CanaryFlow::Ipv4TcpEcho.index()]
+            .as_mut()
+            .expect("IPv4 TCP outbound evidence");
+        let CanarySocketCorrelation::ProcFdInetDiag {
+            diag_socket_mark, ..
+        } = &mut outbound.socket_correlation
+        else {
+            panic!("fixture uses proc/INET_DIAG correlation");
+        };
+        *diag_socket_mark = 1;
+        assert_eq!(
+            validate(&fixture, wrong_mark)
+                .expect_err("a mismatched INET_DIAG mark cannot prove socket ownership"),
+            CanaryEvidenceError::OutboundSocketCorrelationMarkMismatch {
+                flow: CanaryFlow::Ipv4TcpEcho,
+            }
+        );
+    }
+
+    #[test]
+    fn proc_fd_inet_diag_identity_types_reject_invalid_values() {
+        assert_eq!(
+            CanaryProcFd::new(0).map(CanaryProcFd::get),
+            Some(0),
+            "fd zero remains a valid Linux file descriptor"
+        );
+        assert_eq!(
+            CanaryProcFd::new(i32::MAX as u32).map(CanaryProcFd::get),
+            Some(i32::MAX as u32)
+        );
+        assert_eq!(CanaryProcFd::new(i32::MAX as u32 + 1), None);
+        assert_eq!(
+            CanaryInetDiagCookie::new(u32::MAX, u32::MAX),
+            None,
+            "INET_DIAG_NOCOOKIE is request syntax, not observed identity"
+        );
+        assert!(
+            CanaryInetDiagCookie::new(0, 0).is_some(),
+            "the ABI does not reserve the zero cookie"
+        );
+        assert_eq!(NonZeroU64::new(0), None);
+    }
+
+    #[test]
+    fn proc_fd_inet_diag_intervals_are_strict_and_inside_the_flow_window() {
+        let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+
+        let mut reversed_dump = fixture.successful_evidence();
+        let outbound = reversed_dump.loop_escape.outbound.slots[CanaryFlow::Ipv4TcpEcho.index()]
+            .as_mut()
+            .expect("IPv4 TCP outbound evidence");
+        let CanarySocketCorrelation::ProcFdInetDiag {
+            dump_started_at,
+            dump_completed_at,
+            ..
+        } = &mut outbound.socket_correlation
+        else {
+            panic!("fixture uses proc/INET_DIAG correlation");
+        };
+        std::mem::swap(dump_started_at, dump_completed_at);
+        assert_eq!(
+            validate(&fixture, reversed_dump)
+                .expect_err("a reversed diagnostic dump interval cannot pass"),
+            CanaryEvidenceError::OutboundSocketCorrelationTimingInvalid {
+                flow: CanaryFlow::Ipv4TcpEcho,
+            }
+        );
+
+        let mut starts_before_flow = fixture.successful_evidence();
+        let flow_started_at = starts_before_flow.flows.slots[CanaryFlow::Ipv4TcpEcho.index()]
+            .as_ref()
+            .expect("IPv4 TCP flow evidence")
+            .started_at;
+        let outbound = starts_before_flow.loop_escape.outbound.slots
+            [CanaryFlow::Ipv4TcpEcho.index()]
+        .as_mut()
+        .expect("IPv4 TCP outbound evidence");
+        let CanarySocketCorrelation::ProcFdInetDiag {
+            snapshot_started_at,
+            ..
+        } = &mut outbound.socket_correlation
+        else {
+            panic!("fixture uses proc/INET_DIAG correlation");
+        };
+        *snapshot_started_at = flow_started_at - Duration::from_nanos(1);
+        assert_eq!(
+            validate(&fixture, starts_before_flow)
+                .expect_err("a snapshot beginning before its flow cannot pass"),
+            CanaryEvidenceError::OutboundSocketCorrelationTimingInvalid {
+                flow: CanaryFlow::Ipv4TcpEcho,
+            }
+        );
+
+        let mut completes_after_flow = fixture.successful_evidence();
+        let flow_completed_at = completes_after_flow.flows.slots[CanaryFlow::Ipv4TcpEcho.index()]
+            .as_ref()
+            .expect("IPv4 TCP flow evidence")
+            .completed_at;
+        let outbound = completes_after_flow.loop_escape.outbound.slots
+            [CanaryFlow::Ipv4TcpEcho.index()]
+        .as_mut()
+        .expect("IPv4 TCP outbound evidence");
+        let CanarySocketCorrelation::ProcFdInetDiag {
+            snapshot_completed_at,
+            ..
+        } = &mut outbound.socket_correlation
+        else {
+            panic!("fixture uses proc/INET_DIAG correlation");
+        };
+        *snapshot_completed_at = flow_completed_at + Duration::from_nanos(1);
+        assert_eq!(
+            validate(&fixture, completes_after_flow)
+                .expect_err("a snapshot completing after its flow cannot pass"),
+            CanaryEvidenceError::OutboundSocketCorrelationTimingInvalid {
+                flow: CanaryFlow::Ipv4TcpEcho,
+            }
+        );
+    }
+
+    #[test]
+    fn one_complete_inet_diag_dump_may_correlate_multiple_sockets() {
+        let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+        let mut evidence = fixture.successful_evidence();
+        let shared_sequence = match evidence.loop_escape.outbound.slots
+            [CanaryFlow::Ipv4TcpEcho.index()]
+        .as_ref()
+        .expect("IPv4 TCP outbound evidence")
+        .socket_correlation
+        {
+            CanarySocketCorrelation::ProcFdInetDiag {
+                observer_sequence, ..
+            } => observer_sequence,
+            CanarySocketCorrelation::QualifiedCgroupBpf { .. } => {
+                panic!("fixture uses proc/INET_DIAG correlation")
+            }
+        };
+        let outbound = evidence.loop_escape.outbound.slots[CanaryFlow::Ipv4UdpEcho.index()]
+            .as_mut()
+            .expect("IPv4 UDP outbound evidence");
+        let CanarySocketCorrelation::ProcFdInetDiag {
+            observer_sequence, ..
+        } = &mut outbound.socket_correlation
+        else {
+            panic!("fixture uses proc/INET_DIAG correlation");
+        };
+        *observer_sequence = shared_sequence;
+
+        validate(&fixture, evidence)
+            .expect("one complete dump sequence may contain multiple exact socket rows");
     }
 
     #[test]
@@ -3254,7 +3659,7 @@ pub(crate) mod tests {
                                 .authority
                                 .socket_observer,
                             process: self.request.pre_binding.engine.engine(),
-                            proc_fd: NonZeroU32::new(
+                            proc_fd: CanaryProcFd::new(
                                 100 + u32::try_from(index).expect("slot index fits u32"),
                             )
                             .expect("engine socket fd"),
@@ -3269,9 +3674,23 @@ pub(crate) mod tests {
                                 90_000 + u64::try_from(index).expect("slot sequence"),
                             )
                             .expect("observer sequence"),
+                            diag_protocol: match flow.kind() {
+                                CanaryFlowKind::TcpEcho | CanaryFlowKind::DnsTcp => {
+                                    CanaryInetDiagProtocol::Tcp
+                                }
+                                CanaryFlowKind::UdpEcho | CanaryFlowKind::DnsUdp => {
+                                    CanaryInetDiagProtocol::Udp
+                                }
+                            },
+                            diag_tuple: evidence.peer_tuple,
+                            diag_uid: self.request.pre_binding.environment.rpdb.engine_uid,
+                            diag_socket_mark: 0,
                             fd_scan_complete: true,
                             diag_dump_complete: true,
-                            observed_at: evidence.started_at + Duration::from_millis(1),
+                            snapshot_started_at: evidence.started_at + Duration::from_millis(1),
+                            dump_started_at: evidence.started_at + Duration::from_millis(2),
+                            dump_completed_at: evidence.started_at + Duration::from_millis(3),
+                            snapshot_completed_at: evidence.started_at + Duration::from_millis(4),
                         },
                         self.request.pre_binding.environment.rpdb.engine_uid,
                         0,

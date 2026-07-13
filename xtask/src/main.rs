@@ -9,6 +9,7 @@ const ANDROID_API_LEVEL: &str = "31";
 const ANDROID_NDK_REVISION: &str = "27.3.13750724";
 const LINUX_CANARY_REQUIRED_ENV: &str = "FLUX_LINUX_CANARY_REQUIRED";
 const LINUX_CANARY_TEST: &str = "functional_canary::linux_namespace_harness::privileged_dual_stack_canary_exercises_real_topology_and_cleanup";
+const LINUX_TPROXY_CANARY_TEST: &str = "functional_canary::linux_namespace_harness::privileged_ingress_tproxy_checkpoint_exercises_real_capture_counters_and_cleanup";
 const LINUX_CANARY_INTERNAL_ENVS: [&str; 5] = [
     "FLUX_LINUX_CANARY_HARNESS_MODE",
     "FLUX_LINUX_CANARY_HARNESS_CONFIG",
@@ -73,6 +74,10 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
             require_no_arguments(&arguments)?;
             test_functional_canary_linux()
         }
+        "test-functional-canary-linux-tproxy" => {
+            require_no_arguments(&arguments)?;
+            test_functional_canary_linux_tproxy()
+        }
         "stage-module" => stage_module(parse_stage_module_options(&arguments)?),
         "ci" => {
             require_no_arguments(&arguments)?;
@@ -99,6 +104,14 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
 }
 
 fn test_functional_canary_linux() -> Result<(), String> {
+    test_linux_canary(LINUX_CANARY_TEST)
+}
+
+fn test_functional_canary_linux_tproxy() -> Result<(), String> {
+    test_linux_canary(LINUX_TPROXY_CANARY_TEST)
+}
+
+fn test_linux_canary(test_name: &str) -> Result<(), String> {
     let required = linux_canary_required()?;
     if env::consts::OS != "linux" {
         return linux_canary_skip_or_fail(
@@ -112,13 +125,13 @@ fn test_functional_canary_linux() -> Result<(), String> {
         "-p",
         "fluxd",
         "--lib",
-        LINUX_CANARY_TEST,
+        test_name,
         "--",
         "--ignored",
         "--exact",
         "--list",
     ])?;
-    if !linux_canary_test_is_listed(&listed) {
+    if !linux_canary_test_is_listed(&listed, test_name) {
         return linux_canary_skip_or_fail(
             required,
             "the privileged Linux functional-canary harness is not implemented in this checkout",
@@ -130,7 +143,7 @@ fn test_functional_canary_linux() -> Result<(), String> {
         "-p",
         "fluxd",
         "--lib",
-        LINUX_CANARY_TEST,
+        test_name,
         "--",
         "--ignored",
         "--exact",
@@ -157,8 +170,8 @@ fn parse_linux_canary_required(value: Option<&str>) -> Result<bool, String> {
     }
 }
 
-fn linux_canary_test_is_listed(listing: &str) -> bool {
-    let expected = format!("{LINUX_CANARY_TEST}: test");
+fn linux_canary_test_is_listed(listing: &str, test_name: &str) -> bool {
+    let expected = format!("{test_name}: test");
     listing.lines().any(|line| line.trim() == expected)
 }
 
@@ -496,6 +509,7 @@ fn print_help() {
            check-android  Type-check fluxd for aarch64-linux-android\n\
            build-android  Build release fluxd with NDK {ANDROID_NDK_REVISION}, API {ANDROID_API_LEVEL}\n\
            test-functional-canary-linux  Run the opt-in ignored privileged Linux canary checkpoint\n\
+           test-functional-canary-linux-tproxy  Run the ingress-only Linux TPROXY checkpoint\n\
            stage-module   Build and stage a Magisk tree; requires --stage DIR --runtime-binaries DIR\n\
            ci             Run all checks that do not require an NDK linker"
     );
@@ -516,10 +530,17 @@ mod tests {
     #[test]
     fn linux_canary_listing_requires_the_exact_ignored_test_name() {
         let exact = format!("{LINUX_CANARY_TEST}: test\n");
-        assert!(linux_canary_test_is_listed(&exact));
+        assert!(linux_canary_test_is_listed(&exact, LINUX_CANARY_TEST));
         assert!(!linux_canary_test_is_listed(
-            "functional_canary::linux_namespace_harness::other: test\n"
+            "functional_canary::linux_namespace_harness::other: test\n",
+            LINUX_CANARY_TEST,
         ));
+        let tproxy = format!("{LINUX_TPROXY_CANARY_TEST}: test\n");
+        assert!(linux_canary_test_is_listed(
+            &tproxy,
+            LINUX_TPROXY_CANARY_TEST
+        ));
+        assert!(!linux_canary_test_is_listed(&tproxy, LINUX_CANARY_TEST));
     }
 
     #[test]

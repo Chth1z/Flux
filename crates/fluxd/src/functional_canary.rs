@@ -2745,6 +2745,80 @@ fn bounded_prefix(diagnostic: &str) -> String {
 mod linux_namespace_harness;
 
 #[cfg(test)]
+mod linux_tproxy_checkpoint_boundary {
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(super) enum LinuxTproxyCheckpointHook {
+        Output,
+        Prerouting,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(super) enum LinuxTproxyCheckpointAction {
+        SetMark,
+        Tproxy,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(super) struct LinuxTproxyCheckpointRulePlan {
+        rules: [(LinuxTproxyCheckpointHook, LinuxTproxyCheckpointAction); 2],
+    }
+
+    impl LinuxTproxyCheckpointRulePlan {
+        pub(super) fn new(
+            rules: [(LinuxTproxyCheckpointHook, LinuxTproxyCheckpointAction); 2],
+        ) -> Option<Self> {
+            if rules.iter().any(|(hook, action)| {
+                matches!(action, LinuxTproxyCheckpointAction::Tproxy)
+                    && !matches!(hook, LinuxTproxyCheckpointHook::Prerouting)
+            }) {
+                return None;
+            }
+            Some(Self { rules })
+        }
+
+        fn has_prerouting_tproxy(self) -> bool {
+            self.rules.contains(&(
+                LinuxTproxyCheckpointHook::Prerouting,
+                LinuxTproxyCheckpointAction::Tproxy,
+            ))
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(super) struct LinuxTproxyCheckpointEvidence {
+        output_mark_packets: u64,
+        prerouting_tproxy_packets: u64,
+        listener_observations: u64,
+    }
+
+    impl LinuxTproxyCheckpointEvidence {
+        pub(super) const fn new(
+            output_mark_packets: u64,
+            prerouting_tproxy_packets: u64,
+            listener_observations: u64,
+        ) -> Self {
+            Self {
+                output_mark_packets,
+                prerouting_tproxy_packets,
+                listener_observations,
+            }
+        }
+
+        pub(super) const fn output_mark_packets(self) -> u64 {
+            self.output_mark_packets
+        }
+
+        pub(super) fn qualifies_ingress_tproxy(self, plan: LinuxTproxyCheckpointRulePlan) -> bool {
+            // OUTPUT marking is diagnostic evidence only. It cannot substitute for observing
+            // both the PREROUTING TPROXY action and the transparent listener.
+            plan.has_prerouting_tproxy()
+                && self.prerouting_tproxy_packets > 0
+                && self.listener_observations > 0
+        }
+    }
+}
+
+#[cfg(test)]
 pub(crate) mod tests {
     use std::fs;
     use std::num::{NonZeroU8, NonZeroU16, NonZeroU32, NonZeroU64};
@@ -2752,8 +2826,47 @@ pub(crate) mod tests {
     use flux_core::{NetworkInventoryTracker, OWNERSHIP_JOURNAL_IDENTITY_BYTES};
     use flux_platform::{SingBoxLaunchSpec, SingBoxLauncher, SingBoxReadiness};
 
+    use super::linux_tproxy_checkpoint_boundary::{
+        LinuxTproxyCheckpointAction, LinuxTproxyCheckpointEvidence, LinuxTproxyCheckpointHook,
+        LinuxTproxyCheckpointRulePlan,
+    };
     use super::*;
     use crate::RestartPolicy;
+
+    #[test]
+    fn linux_tproxy_checkpoint_rejects_output_mark_only_evidence() {
+        assert!(
+            LinuxTproxyCheckpointRulePlan::new([
+                (
+                    LinuxTproxyCheckpointHook::Output,
+                    LinuxTproxyCheckpointAction::Tproxy,
+                ),
+                (
+                    LinuxTproxyCheckpointHook::Prerouting,
+                    LinuxTproxyCheckpointAction::Tproxy,
+                ),
+            ])
+            .is_none()
+        );
+
+        let plan = LinuxTproxyCheckpointRulePlan::new([
+            (
+                LinuxTproxyCheckpointHook::Output,
+                LinuxTproxyCheckpointAction::SetMark,
+            ),
+            (
+                LinuxTproxyCheckpointHook::Prerouting,
+                LinuxTproxyCheckpointAction::Tproxy,
+            ),
+        ])
+        .expect("TPROXY is confined to PREROUTING");
+        let output_mark_only = LinuxTproxyCheckpointEvidence::new(8, 0, 0);
+        assert_eq!(output_mark_only.output_mark_packets(), 8);
+        assert!(!output_mark_only.qualifies_ingress_tproxy(plan));
+        assert!(!LinuxTproxyCheckpointEvidence::new(8, 8, 0).qualifies_ingress_tproxy(plan));
+        assert!(!LinuxTproxyCheckpointEvidence::new(8, 0, 8).qualifies_ingress_tproxy(plan));
+        assert!(LinuxTproxyCheckpointEvidence::new(0, 8, 8).qualifies_ingress_tproxy(plan));
+    }
 
     #[test]
     fn deadline_is_absolute_nonzero_capped_and_exclusive() {

@@ -42,9 +42,11 @@ const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_DIAGNOSTIC_BYTES: usize = 8 * 1024;
 const MAX_HELPER_FILE_BYTES: u64 = 64 * 1024;
 const MAX_JSON_BYTES: usize = 48 * 1024;
-const MAX_JOURNAL_BYTES: u64 = 48 * 1024;
-const MAX_JOURNAL_RECORDS: usize = 32;
+const MAX_JOURNAL_BYTES: u64 = 192 * 1024;
+const MAX_JOURNAL_RECORDS: usize = 96;
 static JSON_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+mod ingress_tproxy;
 
 #[test]
 #[ignore = "requires Linux user/mount/network namespace authority"]
@@ -61,6 +63,12 @@ fn privileged_dual_stack_canary_exercises_real_topology_and_cleanup() {
     if let Err(error) = result {
         panic!("Linux functional-canary topology checkpoint failed: {error}");
     }
+}
+
+#[test]
+#[ignore = "requires Linux user/mount/network namespace and TPROXY authority"]
+fn privileged_ingress_tproxy_checkpoint_exercises_real_capture_counters_and_cleanup() {
+    ingress_tproxy::run();
 }
 
 fn run_outer() -> Result<(), String> {
@@ -906,7 +914,7 @@ fn run_peer() -> Result<(), String> {
     let deadline = Instant::now() + PROCESS_TIMEOUT;
     let mut flows = Vec::with_capacity(servers.len());
     for server in &mut servers {
-        flows.push(server.serve(deadline)?);
+        flows.push(server.serve(&config, deadline)?);
     }
     let report = ProcessReport {
         role: "peer".to_owned(),
@@ -1067,10 +1075,10 @@ enum BoundPeerServer {
 }
 
 impl BoundPeerServer {
-    fn serve(&mut self, deadline: Instant) -> Result<FlowReport, String> {
+    fn serve(&mut self, config: &HarnessConfig, deadline: Instant) -> Result<FlowReport, String> {
         match self {
-            Self::Tcp { spec, listener } => serve_peer_tcp(spec, listener, deadline),
-            Self::Udp { spec, socket } => serve_peer_udp(spec, socket, deadline),
+            Self::Tcp { spec, listener } => serve_peer_tcp(config, spec, listener, deadline),
+            Self::Udp { spec, socket } => serve_peer_udp(config, spec, socket, deadline),
         }
     }
 }
@@ -1102,6 +1110,7 @@ fn bind_peer_servers(config: &HarnessConfig) -> Result<Vec<BoundPeerServer>, Str
 }
 
 fn serve_peer_tcp(
+    config: &HarnessConfig,
     spec: &FlowSpec,
     listener: &TcpListener,
     deadline: Instant,
@@ -1125,13 +1134,12 @@ fn serve_peer_tcp(
         .set_read_timeout(Some(IO_TIMEOUT))
         .and_then(|()| stream.set_write_timeout(Some(IO_TIMEOUT)))
         .map_err(|error| format!("set peer TCP timeouts for {}: {error}", spec.id))?;
-    let config = config_from_environment()?;
     let request = if spec.semantic == FlowSemantic::Dns {
         read_u16_frame(&mut stream)?
     } else {
         read_u32_frame(&mut stream)?
     };
-    let expected = spec.request(&config)?;
+    let expected = spec.request(config)?;
     if request != expected {
         return Err(format!(
             "peer TCP flow {} received unexpected request: expected={} actual={}",
@@ -1140,7 +1148,7 @@ fn serve_peer_tcp(
             hex_encode(&request)
         ));
     }
-    let response = spec.response(&config, &request)?;
+    let response = spec.response(config, &request)?;
     if spec.semantic == FlowSemantic::Dns {
         write_u16_frame(&mut stream, &response)?;
     } else {
@@ -1149,21 +1157,21 @@ fn serve_peer_tcp(
     let local = stream
         .local_addr()
         .map_err(|error| format!("read peer TCP local tuple for {}: {error}", spec.id))?;
-    flow_report(spec, &config, local, remote, request, response)
+    flow_report(spec, config, local, remote, request, response)
 }
 
 fn serve_peer_udp(
+    config: &HarnessConfig,
     spec: &FlowSpec,
     socket: &UdpSocket,
     _deadline: Instant,
 ) -> Result<FlowReport, String> {
-    let config = config_from_environment()?;
     let mut buffer = [0_u8; 4096];
     let (length, remote) = socket
         .recv_from(&mut buffer)
         .map_err(|error| format!("receive peer UDP flow {}: {error}", spec.id))?;
     let request = buffer[..length].to_vec();
-    let expected = spec.request(&config)?;
+    let expected = spec.request(config)?;
     if request != expected {
         return Err(format!(
             "peer UDP flow {} received unexpected request: expected={} actual={}",
@@ -1172,7 +1180,7 @@ fn serve_peer_udp(
             hex_encode(&request)
         ));
     }
-    let response = spec.response(&config, &request)?;
+    let response = spec.response(config, &request)?;
     let sent = socket
         .send_to(&response, remote)
         .map_err(|error| format!("send peer UDP flow {} response: {error}", spec.id))?;
@@ -1186,7 +1194,7 @@ fn serve_peer_udp(
     let local = socket
         .local_addr()
         .map_err(|error| format!("read peer UDP local tuple for {}: {error}", spec.id))?;
-    flow_report(spec, &config, local, remote, request, response)
+    flow_report(spec, config, local, remote, request, response)
 }
 
 fn run_client_flow(config: &HarnessConfig, spec: &FlowSpec) -> Result<FlowReport, String> {
@@ -2425,6 +2433,12 @@ fn reports_missing_interface(stderr: &[u8], interface: &str) -> bool {
 }
 
 fn ensure_isolated_authority() -> Result<(), String> {
+    ensure_isolated_authority_with_boundary(
+        "topology-only; distinct engine/probe UID authority, TPROXY, loop escape, counters, and model validation remain pending",
+    )
+}
+
+fn ensure_isolated_authority_with_boundary(boundary: &str) -> Result<(), String> {
     let reentry_token = env::var(REENTRY_TOKEN_ENV).map_err(|_| {
         format!("{MODE_ISOLATED} mode requires a parent-issued {REENTRY_TOKEN_ENV}")
     })?;
@@ -2479,8 +2493,8 @@ fn ensure_isolated_authority() -> Result<(), String> {
         ));
     }
     eprintln!(
-        "QUALIFICATION BOUNDARY: topology-only user namespace UID map {}; distinct engine/probe UID authority, TPROXY, loop escape, counters, and model validation remain pending",
-        uid_map.trim().replace('\n', "; ")
+        "QUALIFICATION BOUNDARY: {boundary}; user namespace UID map {}",
+        uid_map.trim().replace('\n', "; "),
     );
     Ok(())
 }

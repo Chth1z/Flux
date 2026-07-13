@@ -16,9 +16,9 @@ This roadmap turns the [blueprint](fluxd-blueprint.md) and [technical specificat
 The next checkpoint is not a single linear Phase 3 task. Three bounded lanes may proceed in parallel,
 but correctness gates retain strict ordering:
 
-1. **Bridge safety:** the `100.64.0.0/10`, mandatory-exclusion, empty allow/deny, TUN-rejection, and converged-`addrsyncd` readiness checkpoints are complete. The Stage-1 [Generation-scoped functional capture canary](functional-capture-canary.md) model, coordinator ordering, lifecycle tests, and protocol-v3 verification status are complete; production still explicitly selects structural-only compatibility. The first privileged Linux namespace checkpoint now proves the isolated dual-stack TCP/UDP/DNS topology and exact cleanup. Next, complete its TPROXY, distinct-UID loop-escape, counter, INET_DIAG, and model-validation executor work while repairing legacy status/migration and package provenance. Retain the TUN rejection until one exact routing owner passes readback and forced-death cleanup canaries.
+1. **Bridge safety:** the `100.64.0.0/10`, mandatory-exclusion, empty allow/deny, TUN-rejection, and converged-`addrsyncd` readiness checkpoints are complete. The Stage-1 [Generation-scoped functional capture canary](functional-capture-canary.md) model, coordinator ordering, lifecycle tests, and protocol-v3 verification status are complete; production still explicitly selects structural-only compatibility. The first privileged Linux namespace checkpoint proves the isolated dual-stack TCP/UDP/DNS topology and exact cleanup. The delivered third-probe-namespace slice now proves real dual-stack TCP-echo PREROUTING TPROXY, transparent-listener original-destination recovery, marked relay egress, per-family route controls/counters, and cleanup. Next extend that same ingress checkpoint with UDP echo and DNS over UDP/TCP. Ingress evidence cannot authorize the current local-OUTPUT production domain: distinct nonzero probe/engine UIDs, exact local-OUTPUT listener evidence, INET_DIAG socket correlation, and complete model `validate_for` remain later gates while legacy status/migration and package provenance are repaired. Retain the TUN rejection until one exact routing owner passes readback and forced-death cleanup canaries.
 2. **Native Phase 3 correctness:** add exact device/artifact identity; select positive mark policies from a compile-time reviewed stable artifact catalog and then bind them to boot/namespace freshness; complete the remaining 24 census cells and point-in-time coordinator; prove writer semantics, observer continuity, mark preservation, domain/network-selection handoff, and route reachability; only then allocate priorities/tables/marks or mutate the kernel.
-3. **Optional eBPF research:** implement the exact `xt_bpf` probe and observation design without delaying the first two lanes. Positive acceleration waits for the Rust xtables compiler, a complete conventional classifier, parity evidence, and device benchmarks.
+3. **Optional eBPF implementation/probe:** implement the exact near-term `xt_bpf` capability probe without delaying the first two lanes, land compiler integration in Phase 4, and retain broader observation work for Phase 7. Positive acceleration waits for the Rust xtables compiler, a complete conventional classifier, parity evidence, and device benchmarks.
 
 TUN dual route ownership is P0: until `EngineOwnedTun` has one proven owner, the bridge selects exactly
 one routing owner or reports TUN unsupported.
@@ -64,7 +64,7 @@ After the Capability Profile admits mutation, startup invokes bounded `startup-r
 
 Direct Sing-Box and phase-shell children arm `PR_SET_PDEATHSIG(SIGKILL)` with a parent-race check. This contains direct children on daemon death, not whole process trees: phase descendants do not inherit it and BusyBox credential changes may clear it, which is why BusyBox generations require quarantine rather than automatic restart.
 
-Still deferred are the remaining privileged namespace executor layers and Android adapter/qualification for the delivered functional-canary transaction, an exact-device TUN single-owner and forced-death route-cleanup canary, ancestor-safe `openat`/`openat2` traversal, long-term Generation-log retention/rotation, pidfd/timerfd integration into the reactor, post-credential/process-cgroup containment, and real Android 5.10 release-gate evidence. Netlink and BPF reactor sources remain assigned to later phases.
+Still deferred are the UDP/DNS extension of the delivered ingress PREROUTING TPROXY namespace checkpoint, the separate distinct-UID local-OUTPUT/INET_DIAG/model executor, and Android adapter/qualification for the delivered functional-canary transaction. The local-OUTPUT split is mandatory: an empirical Linux harness showed that OUTPUT marking plus a local policy route did not re-enter PREROUTING, and xtables TPROXY cannot attach to OUTPUT. Also deferred are an exact-device TUN single-owner and forced-death route-cleanup canary, ancestor-safe `openat`/`openat2` traversal, long-term Generation-log retention/rotation, pidfd/timerfd integration into the reactor, post-credential/process-cgroup containment, and real Android 5.10 release-gate evidence. Netlink and BPF reactor sources remain assigned to later phases.
 
 ### Deliverables
 
@@ -364,7 +364,9 @@ Run privileged network-namespace tests on at least:
 
 Scenarios:
 
-- nftables and xtables TPROXY TCP/UDP;
+- nftables and xtables PREROUTING TPROXY TCP/UDP from an exact ingress namespace;
+- separate local-OUTPUT capture, listener-delivery, and loop-escape qualification without
+  inferring success from OUTPUT mark counters or route lookups;
 - ipset swap and rollback;
 - IPv4/IPv6 marked policy routing;
 - TUN interface lifecycle;
@@ -431,14 +433,15 @@ Before a backend may be selected automatically, its documentation must include:
 ## Immediate implementation backlog
 
 1. Keep the Rust-owned bridge TUN rejection until an exact Flux or Sing-Box owner passes route readback and forced-death cleanup canaries; then replace the rejection with that single proven owner.
-2. Complete the privileged Linux namespace executor for the delivered Generation-scoped TCP/UDP/DNS and loop-canary transaction, then implement the explicit Android adapter and qualification matrix.
-3. Repair legacy CLI status, installation migration, and package/source manifest provenance.
-4. Capture the current real-device baseline and replace every placeholder evidence field.
-5. Build and persist the exact versioned Sing-Box Engine Capability Profile before compiling any final Generation.
-6. Extend the Capability Profile with exact Android product/build/vendor, kernel-build, verified-boot, SELinux-policy, netd/Connectivity artifact, tool, and namespace identity.
-7. Define the compile-time reviewed positive mark-policy catalog over stable artifact identities, then bind selections to verified boot, boot ID, and observed namespace; never authorize an arbitrary runtime self-hashed manifest.
-8. Complete the remaining mark-evidence fragments and point-in-time 27-cell coordinator, then satisfy exact writer semantics, observer continuity, and mark-preservation canaries; do not turn planning authority into an activation lease.
-9. Redesign the RPDB program around the proven no-two-slot/default-network and tethering/per-UID constraints, satisfy domain/network-selection handoff, ownership, reachability, and canary prerequisites, and only then implement priority/table allocation.
-10. Cut over address-derived rules and PBR with a transition lease that disables the shell route writer before the first native mutation.
-11. Implement legacy config migration in check-only mode and extract current rule-generation cases into backend-neutral golden fixtures.
-12. Design the Phase 4 `xt_bpf` probe/observation adapter in parallel, without delaying correctness work or selecting acceleration before parity and benchmark gates.
+2. Extend the delivered `cargo xtask test-functional-canary-linux-tproxy` checkpoint, which selects only `functional_canary::linux_namespace_harness::privileged_ingress_tproxy_checkpoint_exercises_real_capture_counters_and_cleanup`, from its current dual-stack TCP-echo slice to UDP echo and DNS over UDP/TCP. Preserve exact original-destination/source behavior, per-family route controls, bounded counters, cleanup, and the regression that forbids TPROXY in OUTPUT.
+3. Complete a separate local-OUTPUT executor with distinct nonzero probe/engine UIDs, exact listener delivery, `/proc` FD plus INET_DIAG correlation (or separately qualified cgroup-eBPF evidence), and the full model `validate_for` path; only then implement the explicit Android adapter and qualification matrix.
+4. Repair legacy CLI status, installation migration, and package/source manifest provenance.
+5. Capture the current real-device baseline and replace every placeholder evidence field.
+6. Build and persist the exact versioned Sing-Box Engine Capability Profile before compiling any final Generation.
+7. Extend the Capability Profile with exact Android product/build/vendor, kernel-build, verified-boot, SELinux-policy, netd/Connectivity artifact, tool, and namespace identity.
+8. Define the compile-time reviewed positive mark-policy catalog over stable artifact identities, then bind selections to verified boot, boot ID, and observed namespace; never authorize an arbitrary runtime self-hashed manifest.
+9. Complete the remaining mark-evidence fragments and point-in-time 27-cell coordinator, then satisfy exact writer semantics, observer continuity, and mark-preservation canaries; do not turn planning authority into an activation lease.
+10. Redesign the RPDB program around the proven no-two-slot/default-network and tethering/per-UID constraints, satisfy domain/network-selection handoff, ownership, reachability, and canary prerequisites, and only then implement priority/table allocation.
+11. Cut over address-derived rules and PBR with a transition lease that disables the shell route writer before the first native mutation.
+12. Implement legacy config migration in check-only mode and extract current rule-generation cases into backend-neutral golden fixtures.
+13. Implement the `xt_bpf` capability probe in parallel, wire its compiler adapter in Phase 4, and keep broader eBPF observation in Phase 7 without delaying correctness work or selecting acceleration before parity and benchmark gates.

@@ -74,11 +74,37 @@ all harness-internal mode, configuration, token, and outer-namespace variables f
 children so inherited caller state cannot bypass the outer preflight or select an internal
 re-entry mode.
 
-Stage 2 is still in progress. The first checkpoint exercises real dual-stack TCP, UDP, and DNS
-traffic in an isolated Linux topology and independently checks exact cleanup. It does not yet
-exercise the Flux TPROXY path, distinct engine/probe UID loop escape, counter bounds, INET_DIAG
-socket identity, or the complete model `validate_for` path, and therefore is not functional or
-Android qualification.
+The delivered checkpoint exercises real dual-stack TCP, UDP, and DNS traffic in an isolated Linux
+topology and independently checks exact cleanup. It does not install capture and therefore is not
+functional or Android qualification.
+
+The delivered ingress checkpoint uses a third probe namespace to exercise real PREROUTING TPROXY
+through a test-local transparent Rust relay:
+
+```text
+cargo xtask test-functional-canary-linux-tproxy
+FLUX_LINUX_CANARY_REQUIRED=1 cargo xtask test-functional-canary-linux-tproxy
+```
+
+The command selects the exact ignored test
+`functional_canary::linux_namespace_harness::privileged_ingress_tproxy_checkpoint_exercises_real_capture_counters_and_cleanup`,
+again with exact matching, `--nocapture`, and one test thread. Its current dual-stack TCP-echo
+slice proves ingress PREROUTING TPROXY, accepted-socket original-destination recovery, marked relay
+egress, per-family route controls, bounded capture/bypass counters, and cleanup. UDP echo and DNS
+over UDP/TCP remain the next extension under the same command and exact test. The deterministic
+regression `ingress_rule_plan_never_places_tproxy_in_output` preserves the hook boundary.
+
+This split records an observed kernel boundary. In the privileged harness environment, marking a
+locally generated OUTPUT packet and selecting a local policy route did not make that packet
+traverse PREROUTING or reach the TPROXY listener; xtables TPROXY also cannot attach to OUTPUT.
+OUTPUT mark counters and route lookups are therefore negative controls, not capture success.
+Distinct nonzero engine/probe UIDs, exact local-OUTPUT listener evidence, `/proc` FD plus INET_DIAG
+socket correlation (or separately qualified cgroup-eBPF evidence), and the complete model
+`validate_for` path remain later checkpoints. Neither Linux command is part of `cargo xtask ci`,
+and neither may invoke `sudo`, `modprobe`, or load a `.ko`. The TPROXY preflight runs before rule
+mutation and refuses to continue unless the target, mark/comment matches, family TPROXY support,
+and selected xtables backend support are already active under `/sys/module`, preventing implicit
+module autoload from being mistaken for an available checkpoint.
 
 Host execution of `addrsyncd` requires Linux or Android. On Windows, use the Android cross-check and run its host tests in Linux CI.
 
@@ -170,4 +196,4 @@ Every phase process has a nonzero execution deadline capped at 60 seconds. The R
 
 On daemon startup, the Capability Profile first decides whether mutation is admissible. An admitted runtime runs the bounded `startup-recover` phase before strict `flux.toml` loading, so a broken current configuration cannot strand same-boot capture; recovery must also succeed before administrative intent is read, persisted, or executed and before the control socket is admitted. Below-floor or unverified profiles stay on the non-mutating read-only path and never invoke recovery. Recovery is serialized by the dispatcher lock. With no lease and no capture evidence it idempotently publishes `STOPPED`. A same-boot Rust lease removes the exact active generation, or uses the immutable prepared generation for markerless partial activation, then stops TPROXY before address synchronization and proves capture evidence absent. For a direct engine launch, `PDEATHSIG` supplies the child-death proof, so recovery publishes `STOPPED`, clears active/previous/verification records, and releases the lease. For `busybox-setuidgid`, child death cannot be proven after daemon loss: recovery publishes `FAILED` only after detachment, preserves the Rust lease and active engine generation, and blocks automatic daemon restart for explicit repair. Cleanup failure likewise preserves evidence and ownership. Same-boot legacy ownership is rejected without mutation; prior-boot evidence is retired without treating kernel objects as surviving the reboot.
 
-Phase 1 `capture-verify` proves shell-owned structural evidence; the always-on owner bypass prevents the default self-capture omission but is not itself a synthetic end-to-end traffic or exact-process loop-prevention proof. The Stage-1 typed canary model, coordinator ordering, failure injection, and status contract are delivered, along with the first Stage-2 isolated topology checkpoint. Deferred are the remaining privileged namespace executor layers, Android adapter and device qualification, ancestor-safe directory traversal with `openat`/`openat2`, long-term retention/rotation policy for Generation logs, a pidfd/timerfd reactor, full process-tree containment, and real-device release evidence on the minimum Android 5.10 kernel.
+Phase 1 `capture-verify` proves shell-owned structural evidence; the always-on owner bypass prevents the default self-capture omission but is not itself a synthetic end-to-end traffic or exact-process loop-prevention proof. The Stage-1 typed canary model, coordinator ordering, failure injection, and status contract are delivered, along with the first Stage-2 isolated topology checkpoint and the dual-stack TCP slice of the third-namespace ingress PREROUTING TPROXY checkpoint. Deferred are that checkpoint's UDP/DNS extension, the separate distinct-UID local-OUTPUT plus INET_DIAG/model-validation executor, Android adapter and device qualification, ancestor-safe directory traversal with `openat`/`openat2`, long-term retention/rotation policy for Generation logs, a pidfd/timerfd reactor, full process-tree containment, and real-device release evidence on the minimum Android 5.10 kernel. Ingress evidence cannot discharge the local-OUTPUT gate.

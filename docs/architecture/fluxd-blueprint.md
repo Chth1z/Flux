@@ -406,7 +406,8 @@ Design requirements:
 - use family-aware address sets with interval semantics;
 - use stable entry chains and generation-specific rules or atomically replace the entire owned table;
 - preserve reserved mark bits and cache decisions in conntrack marks where safe;
-- distinguish local OUTPUT classification from forwarded/tethered PREROUTING classification;
+- distinguish local OUTPUT classification from forwarded/tethered PREROUTING classification, and
+  never promote ingress listener/counter evidence into local-OUTPUT evidence;
 - apply mandatory loop/control/device-local safety exclusions before capture, then apply separately configured private, CGNAT, special-use, and other direct policy;
 - support counters and drift observation without making counters part of correctness;
 - use an output route hook or equivalent mark path that causes policy rerouting correctly;
@@ -577,6 +578,20 @@ The rewritten rule compiler treats these as the mandatory safety portion of gene
 - On unexpected exit, immediately begin fail-open repair unless the user explicitly selected fail-closed behavior.
 
 The delivered Phase 1 Supervisor separates and composes two proofs. Descriptor-pinned validation of the exact binary, configuration, and optional launcher plus child-owned listener/TUN evidence is the pre-capture admission proof. The runtime handoff then publishes capture and checks shell-owned structural evidence before invoking its explicit functional-canary gate. Required-mode coordinator paths run fresh pre/post engine reconciliation, exact environment binding, attempt execution, evidence validation, and cleanup checks before every initial, retry, restart-restoration, or rollback `RUNNING` publication. Capture-start records generation ownership before mutation and retains it when compensation cannot prove cleanup. Candidate evidence never authorizes rollback publication. The production daemon deliberately selects structural-only compatibility because the Android adapter and exact-process loop-escape proof remain unqualified; the required executor currently exists for tests and later privileged harnesses. Any activation/verification failure must prove detach before retiring the candidate, and reload attempts the recorded previous `EngineSpec`.
+
+The privileged Linux harness also separates evidence by traffic domain. Its first checkpoint
+proves the contained dual-stack TCP/UDP/DNS topology. The delivered command
+`cargo xtask test-functional-canary-linux-tproxy` selects the exact ignored test
+`functional_canary::linux_namespace_harness::privileged_ingress_tproxy_checkpoint_exercises_real_capture_counters_and_cleanup`
+and injects traffic from a third probe namespace through PREROUTING into a test-local transparent
+relay. Its current dual-stack TCP-echo slice proves ingress TPROXY, original-destination recovery,
+marked relay egress, per-family route controls/counters, and cleanup. UDP echo and DNS over UDP/TCP
+remain the next extension under the same command. This ingress evidence cannot authorize residual
+local OUTPUT: in the harness kernel, an OUTPUT mark plus local policy route did not re-enter
+PREROUTING, and xtables TPROXY cannot attach to OUTPUT. OUTPUT counters and route lookups are
+therefore negative-control evidence only. Distinct nonzero probe/engine UIDs, exact local-OUTPUT
+listener delivery, INET_DIAG or separately qualified cgroup-eBPF socket correlation, complete
+model `validate_for`, and Android qualification remain separate gates.
 
 The Phase 1 manifest is a strict UTF-8 line document no larger than 16 KiB. It rejects unknown, duplicate, malformed, missing, and conditional-field violations; startup and stop timeouts are decimal milliseconds in `1..=60000`. A boot-scoped dispatcher mode lease prevents Rust-owned phase verbs—including address resynchronization—from being mixed with legacy `scripts/core` engine ownership.
 

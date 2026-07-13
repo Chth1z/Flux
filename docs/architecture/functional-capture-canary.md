@@ -26,6 +26,22 @@ verification layers succeed for the same Generation. The production compatibilit
 continues to publish operational `RUNNING` after structural verification while reporting
 `structural_only` rather than claiming functional authorization.
 
+### Ingress evidence is not local-OUTPUT evidence
+
+The Linux namespace program must classify capture evidence by hook and traffic domain. A packet
+injected from a separate probe namespace can enter the daemon namespace through an exact ingress
+interface and exercise PREROUTING TPROXY. That is useful evidence for transparent listeners,
+original-destination recovery, policy routing, relay behavior, counters, and cleanup, but it does
+not exercise the Android local-application OUTPUT path.
+
+This distinction is based on an observed kernel boundary, not only on documentation. In the
+privileged Linux harness environment, marking a locally generated OUTPUT packet and selecting a
+local policy route did not cause that packet to traverse PREROUTING or reach the TPROXY listener;
+the xtables TPROXY target also rejects attachment to OUTPUT. Flux therefore never treats an
+OUTPUT mark counter, a local-route lookup, or zero peer packets as proof that local OUTPUT reached
+TPROXY. Those observations are route/loop negative controls only. Production local-OUTPUT
+qualification requires its own device-supported capture mechanism and listener evidence.
+
 ## Runtime status contract
 
 Protocol version 3 carries a required verification field inside the independently revisioned
@@ -112,6 +128,16 @@ The contained topology is split into a boot-scoped facility and Generation-scope
    accepts only the attempt's addresses, ports, and nonce-derived query name, applies strict byte
    and request limits, and exits at the attempt deadline.
 
+The Linux ingress checkpoint uses a narrower three-namespace topology. A probe namespace sends
+traffic through a second veth into the daemon/relay namespace, where exact interface, source,
+destination, protocol, and port selectors exercise PREROUTING TPROXY. Its delivered first slice
+proxies dual-stack TCP echo through transparent Rust listeners, proves the accepted socket retains
+the original destination, and opens separately marked relay sockets to the existing peer
+namespace. Forwarding remains disabled so a missed selector cannot silently reach the peer. This
+proves only the ingress traffic domain and test-local relay; it does not instantiate the dedicated
+production probe/engine UIDs or the Sing-Box local-OUTPUT path. UDP echo and DNS over UDP/TCP remain
+the next extension of the same ingress checkpoint.
+
 The peer route is traffic-scoped, not a boot-long override of an arbitrary global destination.
 The facility requires a dedicated engine UID and installs a device-qualified RPDB rule matching
 that UID, exact canary destination, protocol, and responder port before selecting the private
@@ -169,6 +195,15 @@ generation-specific Sing-Box listener, leave through an engine-owned outbound so
 contained peer, and return before the absolute deadline. Success in one family never substitutes
 for an enabled family that failed.
 
+The delivered Linux ingress slice applies the TCP-echo payload contract to a test-local relay for
+both address families. Its report cross-checks three distinct observations rather than equating
+the client and peer tuples: probe client to original peer destination, accepted transparent socket
+to the recovered original destination, and marked relay outbound socket to peer responder. The
+UDP extension must additionally prove source-preserving responses, and the DNS extension must
+retain the existing transaction/question/answer checks over both transports. None of these harness
+reports can be converted into complete model evidence until the exact supervised-engine identity,
+distinct UIDs, and authoritative socket correlation also exist.
+
 The local peer validates the received payload and records the engine-side connection/datagram
 tuple. The adapter correlates that tuple with the exact supervised engine identity and validates
 the configured loop-escape mechanism where the platform exposes authoritative socket/route
@@ -220,19 +255,27 @@ functional pass.
    failure injection, deadline, stale-identity, cleanup, retry, restart, resynchronization, and
    rollback tests. Existing structural verification remains a separate prerequisite, and protocol
    version 3 exposes the orthogonal verification result without enabling the production gate.
-2. **In progress:** the first privileged Linux namespace checkpoint exercises real dual-stack TCP,
-   UDP, and DNS traffic and independently verifies exact topology cleanup. TPROXY traversal,
-   distinct engine/probe UID loop escape, counter bounds, INET_DIAG identity, and the complete
-   model `validate_for` path remain pending. Even after those pieces land, this stage proves the
-   transaction and test topology rather than Android compatibility.
-3. Add an Android lab adapter that reports explicit `unsupported`, `denied`, `conflicting`,
+2. **Complete:** the first privileged Linux namespace checkpoint exercises real dual-stack TCP,
+   UDP, and DNS traffic and independently verifies exact topology cleanup. It proves the
+   traffic-flow contracts and contained test topology without installing capture.
+3. **In progress:** the third-probe-namespace ingress checkpoint now exercises exact dual-stack
+   TCP-echo PREROUTING TPROXY selectors, transparent-listener original-destination recovery,
+   marked relay egress, per-family route controls, bounded capture/bypass counters, and exact
+   cleanup. Next extend the same checkpoint with UDP echo and DNS over UDP/TCP, including
+   source-preserving UDP responses. The empirical OUTPUT boundary above remains part of its
+   acceptance contract.
+4. Add a separate local-OUTPUT qualification slice using distinct nonzero probe/engine UIDs and
+   authoritative `/proc` FD plus INET_DIAG correlation (or a separately qualified cgroup-eBPF
+   observer). Only that later slice may construct complete evidence and call the model
+   `validate_for` path. It must not weaken the model to accommodate the ingress checkpoint.
+5. Add an Android lab adapter that reports explicit `unsupported`, `denied`, `conflicting`,
    `broken`, or `unknown` evidence. It remains diagnostic-only until exact-device qualification.
-4. Permit TPROXY `RUNNING` only for reviewed device profiles whose functional canary passes the
+6. Permit TPROXY `RUNNING` only for reviewed device profiles whose functional canary passes the
    real-device matrix and cleanup/crash tests. Other profiles remain unqualified; broaden the
    reviewed set without weakening the probe. TUN remains rejected until its separate
    single-route-owner and forced-death cleanup canaries pass.
 
-Invoke the Stage-2 checkpoint separately from ordinary CI:
+Invoke the delivered topology checkpoint separately from ordinary CI:
 
 ```text
 cargo xtask test-functional-canary-linux
@@ -250,9 +293,32 @@ preflight. It also removes all harness-internal mode, configuration, token, and 
 variables before invoking Cargo, so caller state cannot bypass the outer preflight. This command
 is deliberately excluded from `cargo xtask ci`.
 
-Until stage 4 is evidenced, Flux must describe Phase 1 capture verification as structural and the
-functional exit gate as incomplete. Host tests, Linux namespaces, or successful counters do not
-constitute production Android evidence.
+Invoke the delivered ingress TCP slice with:
+
+```text
+cargo xtask test-functional-canary-linux-tproxy
+FLUX_LINUX_CANARY_REQUIRED=1 cargo xtask test-functional-canary-linux-tproxy
+```
+
+The command selects only the ignored test
+`functional_canary::linux_namespace_harness::privileged_ingress_tproxy_checkpoint_exercises_real_capture_counters_and_cleanup`
+with exact matching, `--nocapture`, and one test thread. The current implementation covers
+dual-stack TCP echo; UDP echo and DNS over UDP/TCP remain pending under the same command and test.
+The deterministic regression `ingress_rule_plan_never_places_tproxy_in_output` proves that rule
+generation never emits xtables TPROXY in OUTPUT. OUTPUT-mark or route-lookup evidence still cannot
+qualify PREROUTING TPROXY without exact listener/flow evidence.
+
+The ingress checkpoint remains outside `cargo xtask ci` and uses the same optional/required
+preflight policy as the delivered topology checkpoint. It must not invoke `sudo`, `modprobe`, load
+a `.ko`, or convert unavailable kernel support into a passing capture result. Before any rule
+mutation, preflight requires the xtables TPROXY, mark, comment, family TPROXY, and selected backend
+support to be visible as already active under `/sys/module`; otherwise it skips or fails rather
+than triggering implicit module autoload.
+
+Until the separate local-OUTPUT slice and real-device qualification are evidenced, Flux must
+describe Phase 1 capture verification as structural and the functional exit gate as incomplete.
+Host ingress tests, Linux namespaces, route lookups, or successful counters do not constitute
+production Android evidence.
 
 ## Open Android qualification work
 

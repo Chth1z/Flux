@@ -7,7 +7,8 @@ use flux_core::{
 use flux_testkit::{CapabilityProfileFixture, StaticKernelReleaseSource};
 use fluxd::{
     DaemonClient, DaemonSnapshot, EventDisposition, EventReport, RuntimeCaptureState,
-    RuntimeEngineState, RuntimeFailure, RuntimePhase, RuntimeSnapshot, run_cli_with_daemon,
+    RuntimeEngineState, RuntimeFailure, RuntimePhase, RuntimeSnapshot, RuntimeVerificationState,
+    run_cli_with_daemon,
 };
 
 #[test]
@@ -131,7 +132,8 @@ fn json_status_comes_from_the_live_daemon_snapshot() {
             "\"last_completed\":null},",
             "\"runtime\":{\"revision\":7,\"phase\":\"repairing\",",
             "\"capture\":\"detached\",",
-            "\"engine\":\"backing_off\",\"generation\":19,",
+            "\"engine\":\"backing_off\",",
+            "\"verification\":\"functional_failed\",\"generation\":19,",
             "\"last_error\":{\"operation\":\"maintain proxy engine\",",
             "\"message\":\"owned child exited unexpectedly\",",
             "\"recovery\":\"retry after bounded backoff\"}}}\n"
@@ -252,6 +254,7 @@ fn text_status_reports_the_capability_profile_evidence() {
             "runtime phase: repairing\n",
             "runtime capture: detached\n",
             "runtime engine: backing_off\n",
+            "runtime verification: functional_failed\n",
             "runtime generation: 19\n",
             "runtime last error: maintain proxy engine: owned child exited unexpectedly; ",
             "recovery: retry after bounded backoff\n"
@@ -359,6 +362,7 @@ fn observed_runtime() -> RuntimeSnapshot {
         phase: RuntimePhase::Repairing,
         capture: RuntimeCaptureState::Detached,
         engine: RuntimeEngineState::BackingOff,
+        verification: RuntimeVerificationState::FunctionalFailed,
         generation: Some(19),
         last_error: Some(RuntimeFailure {
             operation: "maintain proxy engine".to_owned(),

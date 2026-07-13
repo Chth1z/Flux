@@ -14,7 +14,8 @@ use flux_platform::{DaemonReactor, SeqpacketConnection, ShutdownSignal};
 use flux_testkit::CapabilityProfileFixture;
 use fluxd::{
     ControlConnectionHandler, RuntimeCaptureState, RuntimeEngineState, RuntimeFailure,
-    RuntimePhase, RuntimeSnapshot, RuntimeSnapshotSource, SocketControlClient,
+    RuntimePhase, RuntimeSnapshot, RuntimeSnapshotSource, RuntimeVerificationState,
+    SocketControlClient,
 };
 use tempfile::tempdir;
 
@@ -111,6 +112,7 @@ fn seqpacket_status_preserves_the_observed_runtime_snapshot() {
         phase: RuntimePhase::Verifying,
         capture: RuntimeCaptureState::Published,
         engine: RuntimeEngineState::Ready,
+        verification: RuntimeVerificationState::FunctionalPending,
         generation: Some(91),
         last_error: Some(RuntimeFailure {
             operation: "verify published capture".to_owned(),
@@ -262,7 +264,7 @@ fn stop_requested_before_run_closes_the_listener_without_dispatching_queued_clie
     .expect("bind reactor");
     let queued = SeqpacketConnection::connect(&socket_path).expect("queue client");
     queued
-        .send_packet(br#"{"protocol_version":2,"request_id":7,"command":{"kind":"ping"}}"#)
+        .send_packet(br#"{"protocol_version":3,"request_id":7,"command":{"kind":"ping"}}"#)
         .expect("send queued request");
 
     stop.request_stop().expect("request reactor stop");

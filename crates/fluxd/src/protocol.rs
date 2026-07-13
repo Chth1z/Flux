@@ -16,10 +16,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     RuntimeCaptureState, RuntimeEngineState, RuntimeFailure, RuntimePhase, RuntimeSnapshot,
-    RuntimeSnapshotSource,
+    RuntimeSnapshotSource, RuntimeVerificationState,
 };
 
-const PROTOCOL_VERSION: u16 = 2;
+const PROTOCOL_VERSION: u16 = 3;
 const RECENT_RESULT_CAPACITY: usize = 128;
 const RECENT_RESULT_FINGERPRINT_BYTES: usize = MAX_CONTROL_PACKET_BYTES;
 const RECENT_RESULT_RESPONSE_BYTES: usize = MAX_CONTROL_PACKET_BYTES;
@@ -639,7 +639,6 @@ enum ResponseBody {
         kernel: Option<WireKernelSupport>,
         capability_profile: Box<WireCapabilityProfile>,
         control: WireControlSnapshot,
-        #[serde(default)]
         runtime: WireRuntimeSnapshot,
     },
     Operation {
@@ -1097,6 +1096,7 @@ struct WireRuntimeSnapshot {
     phase: WireRuntimePhase,
     capture: WireRuntimeCaptureState,
     engine: WireRuntimeEngineState,
+    verification: WireRuntimeVerificationState,
     generation: Option<u64>,
     last_error: Option<WireRuntimeFailure>,
 }
@@ -1108,6 +1108,7 @@ impl From<&RuntimeSnapshot> for WireRuntimeSnapshot {
             phase: snapshot.phase.into(),
             capture: snapshot.capture.into(),
             engine: snapshot.engine.into(),
+            verification: snapshot.verification.into(),
             generation: snapshot.generation,
             last_error: snapshot.last_error.as_ref().map(Into::into),
         }
@@ -1121,6 +1122,7 @@ impl From<WireRuntimeSnapshot> for RuntimeSnapshot {
             phase: snapshot.phase.into(),
             capture: snapshot.capture.into(),
             engine: snapshot.engine.into(),
+            verification: snapshot.verification.into(),
             generation: snapshot.generation,
             last_error: snapshot.last_error.map(Into::into),
         }
@@ -1249,6 +1251,38 @@ impl From<WireRuntimeEngineState> for RuntimeEngineState {
             WireRuntimeEngineState::BackingOff => Self::BackingOff,
             WireRuntimeEngineState::Stopping => Self::Stopping,
             WireRuntimeEngineState::Failed => Self::Failed,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WireRuntimeVerificationState {
+    #[default]
+    StructuralOnly,
+    FunctionalPending,
+    FunctionalPassed,
+    FunctionalFailed,
+}
+
+impl From<RuntimeVerificationState> for WireRuntimeVerificationState {
+    fn from(verification: RuntimeVerificationState) -> Self {
+        match verification {
+            RuntimeVerificationState::StructuralOnly => Self::StructuralOnly,
+            RuntimeVerificationState::FunctionalPending => Self::FunctionalPending,
+            RuntimeVerificationState::FunctionalPassed => Self::FunctionalPassed,
+            RuntimeVerificationState::FunctionalFailed => Self::FunctionalFailed,
+        }
+    }
+}
+
+impl From<WireRuntimeVerificationState> for RuntimeVerificationState {
+    fn from(verification: WireRuntimeVerificationState) -> Self {
+        match verification {
+            WireRuntimeVerificationState::StructuralOnly => Self::StructuralOnly,
+            WireRuntimeVerificationState::FunctionalPending => Self::FunctionalPending,
+            WireRuntimeVerificationState::FunctionalPassed => Self::FunctionalPassed,
+            WireRuntimeVerificationState::FunctionalFailed => Self::FunctionalFailed,
         }
     }
 }
@@ -1637,6 +1671,7 @@ mod tests {
             phase: RuntimePhase::Repairing,
             capture: RuntimeCaptureState::Detached,
             engine: RuntimeEngineState::BackingOff,
+            verification: RuntimeVerificationState::FunctionalFailed,
             generation: Some(48),
             last_error: Some(RuntimeFailure {
                 operation: "maintain proxy engine".to_owned(),
@@ -1657,5 +1692,63 @@ mod tests {
         let snapshot = decode_status_response(&response, 93).expect("coherent status");
 
         assert_eq!(snapshot.runtime, runtime);
+    }
+
+    #[test]
+    fn version_three_status_requires_runtime_verification() {
+        let profile = CapabilityProfileFixture::supported();
+        let response = encode_response(ResponseEnvelope::ok(
+            94,
+            ResponseBody::Snapshot {
+                kernel: profile.kernel_support().map(Into::into),
+                capability_profile: Box::new((&profile).into()),
+                control: (&ControlSnapshot::default()).into(),
+                runtime: WireRuntimeSnapshot::default(),
+            },
+        ));
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&response).expect("encoded response document");
+        document["result"]["body"]["runtime"]
+            .as_object_mut()
+            .expect("runtime object")
+            .remove("verification");
+        let response = serde_json::to_vec(&document).expect("response without verification");
+
+        let error = decode_status_response(&response, 94)
+            .expect_err("version-three runtime verification is required");
+
+        assert!(
+            error.to_string().contains("missing field `verification`"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn status_decoder_preserves_every_runtime_verification_state() {
+        let profile = CapabilityProfileFixture::supported();
+        for verification in [
+            RuntimeVerificationState::StructuralOnly,
+            RuntimeVerificationState::FunctionalPending,
+            RuntimeVerificationState::FunctionalPassed,
+            RuntimeVerificationState::FunctionalFailed,
+        ] {
+            let runtime = RuntimeSnapshot {
+                verification,
+                ..RuntimeSnapshot::unknown()
+            };
+            let response = encode_response(ResponseEnvelope::ok(
+                95,
+                ResponseBody::Snapshot {
+                    kernel: profile.kernel_support().map(Into::into),
+                    capability_profile: Box::new((&profile).into()),
+                    control: (&ControlSnapshot::default()).into(),
+                    runtime: (&runtime).into(),
+                },
+            ));
+
+            let snapshot = decode_status_response(&response, 95).expect("coherent status");
+
+            assert_eq!(snapshot.runtime.verification, verification);
+        }
     }
 }

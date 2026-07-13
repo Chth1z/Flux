@@ -12,6 +12,8 @@ All notable changes to the Flux project will be documented in this file.
 - Replaced timed control polling with a bounded `epoll` reactor over the control listener, `signalfd`, and programmatic wakeups.
 - Added the strict schema-1 `flux.toml` daemon configuration with bounded resource budgets and upgrade-safe preservation.
 - Added a boot-scoped read-only Capability Profile for kernel gating, boot identity, SELinux state, and legacy bridge facts; control protocol v2 carries the coherent profile used for mutation decisions.
+- Added the Stage-1 generation-scoped functional capture-canary model and coordinator gates for activation, publication retry, restart restoration, resynchronization, and rollback, with exact pre/post identity and bounded evidence validation. Production remains explicitly structural-only and Android-unqualified pending the privileged and device harnesses.
+- Bumped the local control contract to protocol v3 with a required orthogonal runtime verification state (`structural_only`, `functional_pending`, `functional_passed`, or `functional_failed`); version-1 and version-2 requests are rejected explicitly.
 - Moved boot launch to module-local `service.sh`; mutating `fluxctl` commands no longer bypass the daemon.
 - Added pinned Android build and Magisk staging contracts while retaining `addrsyncd` as the bridge-release rollback binary.
 

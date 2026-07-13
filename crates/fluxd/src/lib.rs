@@ -43,7 +43,7 @@ pub use protocol::{
 };
 pub use runtime_status::{
     RuntimeCaptureState, RuntimeEngineState, RuntimeFailure, RuntimePhase, RuntimeSnapshot,
-    RuntimeSnapshotSource,
+    RuntimeSnapshotSource, RuntimeVerificationState,
 };
 pub use socket::{ControlConnectionHandler, ControlSocketError, SocketControlClient};
 
@@ -511,6 +511,12 @@ where
             runtime_engine_label(snapshot.runtime.engine)
         )
         .is_err()
+        || writeln!(
+            stdout,
+            "runtime verification: {}",
+            runtime_verification_label(snapshot.runtime.verification)
+        )
+        .is_err()
         || writeln!(stdout, "runtime generation: {runtime_generation}").is_err()
         || writeln!(stdout, "runtime last error: {runtime_error}").is_err()
     {
@@ -673,6 +679,7 @@ struct OnlineRuntimeDocument {
     phase: &'static str,
     capture: &'static str,
     engine: &'static str,
+    verification: &'static str,
     generation: Option<u64>,
     last_error: Option<OnlineRuntimeFailureDocument>,
 }
@@ -684,6 +691,7 @@ impl From<RuntimeSnapshot> for OnlineRuntimeDocument {
             phase: runtime_phase_label(snapshot.phase),
             capture: runtime_capture_label(snapshot.capture),
             engine: runtime_engine_label(snapshot.engine),
+            verification: runtime_verification_label(snapshot.verification),
             generation: snapshot.generation,
             last_error: snapshot.last_error.map(Into::into),
         }
@@ -827,6 +835,15 @@ const fn runtime_engine_label(engine: RuntimeEngineState) -> &'static str {
         RuntimeEngineState::BackingOff => "backing_off",
         RuntimeEngineState::Stopping => "stopping",
         RuntimeEngineState::Failed => "failed",
+    }
+}
+
+const fn runtime_verification_label(verification: RuntimeVerificationState) -> &'static str {
+    match verification {
+        RuntimeVerificationState::StructuralOnly => "structural_only",
+        RuntimeVerificationState::FunctionalPending => "functional_pending",
+        RuntimeVerificationState::FunctionalPassed => "functional_passed",
+        RuntimeVerificationState::FunctionalFailed => "functional_failed",
     }
 }
 

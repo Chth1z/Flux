@@ -258,9 +258,9 @@ stateDiagram-v2
     Failed --> Preparing: explicit retry or state change
 ```
 
-`Running` means Observed State matches all required parts of Desired State. `Degraded` is valid only when the compiler marked the missing behavior optional and the report names the omitted capability.
+In the final architecture, `Running` means Observed State matches all required parts of Desired State. The Phase 1 projection uses `Running` as the operational engine/capture phase and reports verification orthogonally, so callers must require the appropriate verification state when functional authorization matters. `Degraded` is valid only when the compiler marked the missing behavior optional and the report names the omitted capability.
 
-During Phase 1, status exposes two deliberately separate immutable views. `ControlSnapshot` reports desired/control progress (administrative state, in-flight intent, dirty configuration, and last completion). The independently revisioned `RuntimeSnapshot` reports observed runtime phase, capture state, engine state, generation, and a bounded last error. A successful control response therefore does not substitute for runtime observation.
+During Phase 1, status exposes two deliberately separate immutable views. `ControlSnapshot` reports desired/control progress (administrative state, in-flight intent, dirty configuration, and last completion). The independently revisioned `RuntimeSnapshot` reports observed runtime phase, capture state, engine state, orthogonal verification state, generation, and a bounded last error. Protocol version 3 requires verification as `structural_only`, `functional_pending`, `functional_passed`, or `functional_failed`; a verification-only transition advances the runtime revision. `RUNNING` remains an operational phase and does not by itself claim functional or Android qualification. A successful control response therefore does not substitute for runtime observation.
 
 ## Generation transaction protocol
 
@@ -321,7 +321,7 @@ After the new Generation verifies, remove only Managed Objects belonging to the 
 - Fail-closed is an explicit user policy and must never be silently selected.
 - On daemon restart, the journal is replayed against Observed State; it is never assumed that the last recorded phase completed.
 
-In the Phase 1 implementation, failure to detach capture is not treated as fail-open success. Stop or activation-failure cleanup remains in `DetachPending`, retaining the child and generation marker while blocking start/reload until detach is proven before engine retirement or `STOPPED`/`FAILED` publication. Failed or uncertain reload detach keeps the old engine in `CaptureRepairPending`; the candidate is not launched, and maintenance proves detach before republishing and re-verifying old-generation capture. A failed `RUNNING` publication is retried only after fresh engine observation and a fresh generation-bound structural capture verification. Verification uncertainty enters the same capture-repair path; an observed exit takes repair precedence over publication.
+In the Phase 1 implementation, failure to detach capture is not treated as fail-open success. Stop or activation-failure cleanup remains in `DetachPending`, retaining the child and Generation marker while blocking start/reload until detach is proven before engine retirement or `STOPPED`/`FAILED` publication. Failed or uncertain reload detach keeps the old engine in `CaptureRepairPending`; the candidate is not launched, and maintenance proves detach before republishing and freshly verifying old-Generation capture. A failed `RUNNING` publication is retried only after fresh engine observation, capture reassertion, structural verification, and the complete configured functional gate. Engine identity loss, repair/restoration, or address resynchronization invalidates a required-mode pass and schedules the same fresh gate. Verification uncertainty enters the capture-repair path; an observed exit takes repair precedence over publication.
 
 ## Kernel version and capability adaptation
 
@@ -576,7 +576,7 @@ The rewritten rule compiler treats these as the mandatory safety portion of gene
 - Use a dedicated UID/GID when device policy permits, while retaining a root compatibility mode.
 - On unexpected exit, immediately begin fail-open repair unless the user explicitly selected fail-closed behavior.
 
-The delivered Phase 1 Supervisor separates two proofs that the completed Controller will compose. Descriptor-pinned validation of the exact binary, configuration, and optional launcher plus child-owned listener/TUN evidence is the pre-capture admission proof. The runtime handoff then publishes capture and checks shell-owned structural evidence before `RUNNING`. Capture-start records generation ownership before mutation and retains it when compensation cannot prove cleanup. That structural check is not yet a synthetic functional traffic or loop-prevention proof; the stronger probe remains a required follow-up. Any activation/verification failure must prove detach before retiring the candidate, and reload attempts the recorded previous `EngineSpec`.
+The delivered Phase 1 Supervisor separates and composes two proofs. Descriptor-pinned validation of the exact binary, configuration, and optional launcher plus child-owned listener/TUN evidence is the pre-capture admission proof. The runtime handoff then publishes capture and checks shell-owned structural evidence before invoking its explicit functional-canary gate. Required-mode coordinator paths run fresh pre/post engine reconciliation, exact environment binding, attempt execution, evidence validation, and cleanup checks before every initial, retry, restart-restoration, or rollback `RUNNING` publication. Capture-start records generation ownership before mutation and retains it when compensation cannot prove cleanup. Candidate evidence never authorizes rollback publication. The production daemon deliberately selects structural-only compatibility because the Android adapter and exact-process loop-escape proof remain unqualified; the required executor currently exists for tests and later privileged harnesses. Any activation/verification failure must prove detach before retiring the candidate, and reload attempts the recorded previous `EngineSpec`.
 
 The Phase 1 manifest is a strict UTF-8 line document no larger than 16 KiB. It rejects unknown, duplicate, malformed, missing, and conditional-field violations; startup and stop timeouts are decimal milliseconds in `1..=60000`. A boot-scoped dispatcher mode lease prevents Rust-owned phase verbs—including address resynchronization—from being mixed with legacy `scripts/core` engine ownership.
 
@@ -813,7 +813,7 @@ Expose a structured snapshot containing:
 - eBPF verifier/attach state and counters;
 - last successful reconciliation and last failure.
 
-The Phase 1 projection already exposes `ControlSnapshot` and `RuntimeSnapshot` as separate protocol fields, and each prepared generation has its own runtime log. Long-term bounded rotation/retention policy and retained redacted diagnostic bundles are not yet delivered; current supervisor diagnostics are bounded and raw tails are excluded from public snapshots.
+The Phase 1 projection exposes `ControlSnapshot` and `RuntimeSnapshot` as separate protocol fields, including the required version-3 runtime verification state, and each prepared Generation has its own runtime log. Long-term bounded rotation/retention policy and retained redacted diagnostic bundles are not yet delivered; current supervisor diagnostics are bounded and raw tails are excluded from public snapshots.
 
 ## Additional proposed features
 

@@ -13,6 +13,7 @@ use flux_testkit::CapabilityProfileFixture;
 use fluxd::{
     MAX_CONTROL_PACKET_BYTES, ProtocolHandler, RequestPeerId, RuntimeCaptureState,
     RuntimeEngineState, RuntimeFailure, RuntimePhase, RuntimeSnapshot, RuntimeSnapshotSource,
+    RuntimeVerificationState,
 };
 
 fn uid(raw: u32) -> Uid {
@@ -38,30 +39,30 @@ fn ping_has_a_stable_versioned_json_contract() {
     let handler = ProtocolHandler::new(supported_profile(), RecordingClient::default());
 
     let response =
-        handler.handle(br#"{"protocol_version":2,"request_id":7,"command":{"kind":"ping"}}"#);
+        handler.handle(br#"{"protocol_version":3,"request_id":7,"command":{"kind":"ping"}}"#);
 
     assert_eq!(
         String::from_utf8(response).expect("UTF-8 response"),
         concat!(
-            "{\"protocol_version\":2,\"request_id\":7,",
+            "{\"protocol_version\":3,\"request_id\":7,",
             "\"result\":{\"status\":\"ok\",\"body\":{\"kind\":\"pong\"}}}\n"
         )
     );
 }
 
 #[test]
-fn version_one_requests_are_explicitly_rejected() {
+fn version_two_requests_are_explicitly_rejected() {
     let handler = ProtocolHandler::new(supported_profile(), RecordingClient::default());
 
     let response =
-        handler.handle(br#"{"protocol_version":1,"request_id":6,"command":{"kind":"ping"}}"#);
+        handler.handle(br#"{"protocol_version":2,"request_id":6,"command":{"kind":"ping"}}"#);
 
     assert_eq!(
         String::from_utf8(response).expect("UTF-8 response"),
         concat!(
-            "{\"protocol_version\":2,\"request_id\":6,",
+            "{\"protocol_version\":3,\"request_id\":6,",
             "\"result\":{\"status\":\"error\",\"code\":\"unsupported_protocol\",",
-            "\"message\":\"protocol version 1 is unsupported; expected 2\"}}\n"
+            "\"message\":\"protocol version 2 is unsupported; expected 3\"}}\n"
         )
     );
 }
@@ -74,6 +75,7 @@ fn status_returns_one_coherent_capability_profile_and_control_snapshot() {
         phase: RuntimePhase::Repairing,
         capture: RuntimeCaptureState::Detached,
         engine: RuntimeEngineState::BackingOff,
+        verification: RuntimeVerificationState::FunctionalFailed,
         generation: Some(74),
         last_error: Some(RuntimeFailure {
             operation: "maintain proxy engine".to_owned(),
@@ -99,12 +101,12 @@ fn status_returns_one_coherent_capability_profile_and_control_snapshot() {
     );
 
     let response =
-        handler.handle(br#"{"protocol_version":2,"request_id":8,"command":{"kind":"status"}}"#);
+        handler.handle(br#"{"protocol_version":3,"request_id":8,"command":{"kind":"status"}}"#);
 
     assert_eq!(
         String::from_utf8(response).expect("UTF-8 response"),
         concat!(
-            "{\"protocol_version\":2,\"request_id\":8,",
+            "{\"protocol_version\":3,\"request_id\":8,",
             "\"result\":{\"status\":\"ok\",\"body\":{\"kind\":\"snapshot\",",
             "\"kernel\":{\"status\":\"supported\",\"version\":\"5.10.198\"},",
             "\"capability_profile\":{\"schema_version\":1,\"revision\":1,",
@@ -131,7 +133,8 @@ fn status_returns_one_coherent_capability_profile_and_control_snapshot() {
             "\"revision\":73}},",
             "\"runtime\":{\"revision\":1,\"phase\":\"repairing\",",
             "\"capture\":\"detached\",",
-            "\"engine\":\"backing_off\",\"generation\":74,",
+            "\"engine\":\"backing_off\",",
+            "\"verification\":\"functional_failed\",\"generation\":74,",
             "\"last_error\":{\"operation\":\"maintain proxy engine\",",
             "\"message\":\"owned child exited unexpectedly\",",
             "\"recovery\":\"retry after bounded backoff\"}}}}}\n"
@@ -150,13 +153,13 @@ fn config_event_while_stopped_is_deferred_without_invoking_the_writer() {
     );
 
     let response = handler.handle(
-        br#"{"protocol_version":2,"request_id":10,"command":{"kind":"event","event_type":"y","watched_path":"/data/adb/flux/conf","event_name":"settings.ini"}}"#,
+        br#"{"protocol_version":3,"request_id":10,"command":{"kind":"event","event_type":"y","watched_path":"/data/adb/flux/conf","event_name":"settings.ini"}}"#,
     );
 
     assert_eq!(
         String::from_utf8(response).expect("UTF-8 response"),
         concat!(
-            "{\"protocol_version\":2,\"request_id\":10,",
+            "{\"protocol_version\":3,\"request_id\":10,",
             "\"result\":{\"status\":\"ok\",\"body\":{",
             "\"kind\":\"event\",\"disposition\":\"deferred\",\"revision\":1}}}\n"
         )
@@ -170,13 +173,13 @@ fn disable_removal_event_maps_to_a_running_intent() {
     let handler = ProtocolHandler::new(supported_profile(), RecordingClient::default());
 
     let response = handler.handle(
-        br#"{"protocol_version":2,"request_id":12,"command":{"kind":"event","event_type":"d","watched_path":"/data/adb/modules/flux","event_name":"disable"}}"#,
+        br#"{"protocol_version":3,"request_id":12,"command":{"kind":"event","event_type":"d","watched_path":"/data/adb/modules/flux","event_name":"disable"}}"#,
     );
 
     assert_eq!(
         String::from_utf8(response).expect("UTF-8 response"),
         concat!(
-            "{\"protocol_version\":2,\"request_id\":12,",
+            "{\"protocol_version\":3,\"request_id\":12,",
             "\"result\":{\"status\":\"ok\",\"body\":{",
             "\"kind\":\"event\",\"disposition\":\"applied\",\"revision\":73}}}\n"
         )
@@ -194,13 +197,13 @@ fn unrelated_inotify_fact_is_acknowledged_without_mutation() {
     let handler = ProtocolHandler::new(supported_profile(), RecordingClient::default());
 
     let response = handler.handle(
-        br#"{"protocol_version":2,"request_id":14,"command":{"kind":"event","event_type":"y","watched_path":"/data/adb/flux/conf","event_name":"notes.txt"}}"#,
+        br#"{"protocol_version":3,"request_id":14,"command":{"kind":"event","event_type":"y","watched_path":"/data/adb/flux/conf","event_name":"notes.txt"}}"#,
     );
 
     assert_eq!(
         String::from_utf8(response).expect("UTF-8 response"),
         concat!(
-            "{\"protocol_version\":2,\"request_id\":14,",
+            "{\"protocol_version\":3,\"request_id\":14,",
             "\"result\":{\"status\":\"ok\",\"body\":{",
             "\"kind\":\"event\",\"disposition\":\"ignored\",\"revision\":0}}}\n"
         )
@@ -212,7 +215,7 @@ fn unrelated_inotify_fact_is_acknowledged_without_mutation() {
 fn retried_mutation_with_the_same_peer_and_request_id_is_applied_once() {
     let handler = ProtocolHandler::new(supported_profile(), RecordingClient::default());
     let peer = RequestPeerId::new(uid(1000), 42);
-    let packet = br#"{"protocol_version":2,"request_id":21,"command":{"kind":"control","action":"start","reason":"fluxctl"}}"#;
+    let packet = br#"{"protocol_version":3,"request_id":21,"command":{"kind":"control","action":"start","reason":"fluxctl"}}"#;
 
     let first = handler.handle_for_peer(packet, peer);
     let retry = handler.handle_for_peer(packet, peer);
@@ -233,7 +236,7 @@ fn concurrent_retry_waits_for_the_original_mutation_result() {
         BlockingClient::new(),
     ));
     let peer = RequestPeerId::new(uid(1000), 43);
-    let packet = br#"{"protocol_version":2,"request_id":23,"command":{"kind":"control","action":"start","reason":"fluxctl"}}"#;
+    let packet = br#"{"protocol_version":3,"request_id":23,"command":{"kind":"control","action":"start","reason":"fluxctl"}}"#;
 
     let original_handler = Arc::clone(&handler);
     let original = thread::spawn(move || original_handler.handle_for_peer(packet, peer));
@@ -271,8 +274,8 @@ fn concurrent_retry_waits_for_the_original_mutation_result() {
 fn semantically_equal_mutation_with_different_packet_bytes_conflicts() {
     let handler = ProtocolHandler::new(supported_profile(), RecordingClient::default());
     let peer = RequestPeerId::new(uid(1000), 44);
-    let compact = br#"{"protocol_version":2,"request_id":24,"command":{"kind":"control","action":"start","reason":"fluxctl"}}"#;
-    let spaced = br#"{ "protocol_version": 2, "request_id": 24, "command": { "kind": "control", "action": "start", "reason": "fluxctl" } }"#;
+    let compact = br#"{"protocol_version":3,"request_id":24,"command":{"kind":"control","action":"start","reason":"fluxctl"}}"#;
+    let spaced = br#"{ "protocol_version": 3, "request_id": 24, "command": { "kind": "control", "action": "start", "reason": "fluxctl" } }"#;
 
     let _ = handler.handle_for_peer(compact, peer);
     let response = handler.handle_for_peer(spaced, peer);
@@ -280,7 +283,7 @@ fn semantically_equal_mutation_with_different_packet_bytes_conflicts() {
     assert_eq!(
         String::from_utf8(response).expect("UTF-8 response"),
         concat!(
-            "{\"protocol_version\":2,\"request_id\":24,",
+            "{\"protocol_version\":3,\"request_id\":24,",
             "\"result\":{\"status\":\"error\",\"code\":\"request_id_conflict\",",
             "\"message\":\"request ID was already used for a different mutation\"}}\n"
         )
@@ -291,7 +294,7 @@ fn semantically_equal_mutation_with_different_packet_bytes_conflicts() {
 #[test]
 fn request_ids_are_scoped_to_the_authenticated_peer() {
     let handler = ProtocolHandler::new(supported_profile(), RecordingClient::default());
-    let packet = br#"{"protocol_version":2,"request_id":25,"command":{"kind":"control","action":"start","reason":"fluxctl"}}"#;
+    let packet = br#"{"protocol_version":3,"request_id":25,"command":{"kind":"control","action":"start","reason":"fluxctl"}}"#;
 
     let _ = handler.handle_for_peer(packet, RequestPeerId::new(uid(1000), 45));
     let _ = handler.handle_for_peer(packet, RequestPeerId::new(uid(1000), 46));
@@ -306,7 +309,7 @@ fn oversized_mutation_result_is_replaced_by_a_bounded_protocol_error() {
         ErrorClient::new(MAX_CONTROL_PACKET_BYTES),
     );
     let peer = RequestPeerId::new(uid(1000), 47);
-    let packet = br#"{"protocol_version":2,"request_id":26,"command":{"kind":"control","action":"start","reason":"fluxctl"}}"#;
+    let packet = br#"{"protocol_version":3,"request_id":26,"command":{"kind":"control","action":"start","reason":"fluxctl"}}"#;
 
     let response = handler.handle_for_peer(packet, peer);
     let retry = handler.handle_for_peer(packet, peer);
@@ -315,7 +318,7 @@ fn oversized_mutation_result_is_replaced_by_a_bounded_protocol_error() {
     assert_eq!(
         String::from_utf8(response.clone()).expect("UTF-8 response"),
         concat!(
-            "{\"protocol_version\":2,\"request_id\":26,",
+            "{\"protocol_version\":3,\"request_id\":26,",
             "\"result\":{\"status\":\"error\",\"code\":\"response_too_large\",",
             "\"message\":\"control response exceeds 1048576 bytes\"}}\n"
         )
@@ -331,8 +334,8 @@ fn completed_result_cache_evicts_entries_to_bound_retained_response_bytes() {
         ErrorClient::new(MAX_CONTROL_PACKET_BYTES / 2 + 1024),
     );
     let peer = RequestPeerId::new(uid(1000), 48);
-    let first_packet = br#"{"protocol_version":2,"request_id":27,"command":{"kind":"control","action":"start","reason":"fluxctl"}}"#;
-    let second_packet = br#"{"protocol_version":2,"request_id":28,"command":{"kind":"control","action":"stop","reason":"fluxctl"}}"#;
+    let first_packet = br#"{"protocol_version":3,"request_id":27,"command":{"kind":"control","action":"start","reason":"fluxctl"}}"#;
+    let second_packet = br#"{"protocol_version":3,"request_id":28,"command":{"kind":"control","action":"stop","reason":"fluxctl"}}"#;
 
     let first_response = handler.handle_for_peer(first_packet, peer);
     let second_response = handler.handle_for_peer(second_packet, peer);
@@ -358,7 +361,7 @@ fn concurrent_large_results_never_overrun_the_completed_response_budget() {
             let handler = Arc::clone(&handler);
             thread::spawn(move || {
                 let packet = format!(
-                    "{{\"protocol_version\":2,\"request_id\":{},\"command\":{{\"kind\":\"control\",\"action\":\"start\",\"reason\":\"fluxctl\"}}}}",
+                    "{{\"protocol_version\":3,\"request_id\":{},\"command\":{{\"kind\":\"control\",\"action\":\"start\",\"reason\":\"fluxctl\"}}}}",
                     100 + index
                 );
                 handler.handle_for_peer(packet.as_bytes(), peer)
@@ -384,7 +387,7 @@ fn concurrent_large_results_never_overrun_the_completed_response_budget() {
 
     for index in 0..CONCURRENT_RESULTS {
         let packet = format!(
-            "{{\"protocol_version\":2,\"request_id\":{},\"command\":{{\"kind\":\"control\",\"action\":\"start\",\"reason\":\"fluxctl\"}}}}",
+            "{{\"protocol_version\":3,\"request_id\":{},\"command\":{{\"kind\":\"control\",\"action\":\"start\",\"reason\":\"fluxctl\"}}}}",
             100 + index
         );
         let response = handler.handle_for_peer(packet.as_bytes(), peer);
@@ -398,8 +401,8 @@ fn concurrent_large_results_never_overrun_the_completed_response_budget() {
 fn reused_request_id_with_different_payload_is_rejected() {
     let handler = ProtocolHandler::new(supported_profile(), RecordingClient::default());
     let peer = RequestPeerId::new(uid(1000), 42);
-    let start = br#"{"protocol_version":2,"request_id":22,"command":{"kind":"control","action":"start","reason":"fluxctl"}}"#;
-    let stop = br#"{"protocol_version":2,"request_id":22,"command":{"kind":"control","action":"stop","reason":"fluxctl"}}"#;
+    let start = br#"{"protocol_version":3,"request_id":22,"command":{"kind":"control","action":"start","reason":"fluxctl"}}"#;
+    let stop = br#"{"protocol_version":3,"request_id":22,"command":{"kind":"control","action":"stop","reason":"fluxctl"}}"#;
 
     let _ = handler.handle_for_peer(start, peer);
     let response = handler.handle_for_peer(stop, peer);
@@ -407,7 +410,7 @@ fn reused_request_id_with_different_payload_is_rejected() {
     assert_eq!(
         String::from_utf8(response).expect("UTF-8 response"),
         concat!(
-            "{\"protocol_version\":2,\"request_id\":22,",
+            "{\"protocol_version\":3,\"request_id\":22,",
             "\"result\":{\"status\":\"error\",\"code\":\"request_id_conflict\",",
             "\"message\":\"request ID was already used for a different mutation\"}}\n"
         )
@@ -421,13 +424,13 @@ fn control_request_maps_wire_intent_and_returns_the_operation_revision() {
     let handler = ProtocolHandler::new(supported_profile(), client);
 
     let response = handler.handle(
-        br#"{"protocol_version":2,"request_id":9,"command":{"kind":"control","action":"reload","reason":"config_changed"}}"#,
+        br#"{"protocol_version":3,"request_id":9,"command":{"kind":"control","action":"reload","reason":"config_changed"}}"#,
     );
 
     assert_eq!(
         String::from_utf8(response).expect("UTF-8 response"),
         concat!(
-            "{\"protocol_version\":2,\"request_id\":9,",
+            "{\"protocol_version\":3,\"request_id\":9,",
             "\"result\":{\"status\":\"ok\",\"body\":{",
             "\"kind\":\"operation\",\"revision\":73}}}\n"
         )
@@ -448,13 +451,13 @@ fn unsupported_kernel_rejects_mutation_without_calling_the_writer() {
     );
 
     let response = handler.handle(
-        br#"{"protocol_version":2,"request_id":11,"command":{"kind":"control","action":"start","reason":"boot"}}"#,
+        br#"{"protocol_version":3,"request_id":11,"command":{"kind":"control","action":"start","reason":"boot"}}"#,
     );
 
     assert_eq!(
         String::from_utf8(response).expect("UTF-8 response"),
         concat!(
-            "{\"protocol_version\":2,\"request_id\":11,",
+            "{\"protocol_version\":3,\"request_id\":11,",
             "\"result\":{\"status\":\"error\",\"code\":\"unsupported_kernel\",",
             "\"message\":\"kernel 5.4.280 is below minimum 5.10.0\"}}\n"
         )
@@ -471,13 +474,13 @@ fn unverified_kernel_or_boot_rejects_mutation_without_calling_the_writer() {
         let handler = ProtocolHandler::new(Arc::new(profile), RecordingClient::default());
 
         let response = handler.handle(
-            br#"{"protocol_version":2,"request_id":13,"command":{"kind":"control","action":"start","reason":"boot"}}"#,
+            br#"{"protocol_version":3,"request_id":13,"command":{"kind":"control","action":"start","reason":"boot"}}"#,
         );
 
         assert_eq!(
             String::from_utf8(response).expect("UTF-8 response"),
             concat!(
-                "{\"protocol_version\":2,\"request_id\":13,",
+                "{\"protocol_version\":3,\"request_id\":13,",
                 "\"result\":{\"status\":\"error\",\"code\":\"read_only_profile\",",
                 "\"message\":\"capability profile is read-only because kernel or boot identity is unverified\"}}\n"
             )
@@ -494,13 +497,13 @@ fn read_only_profile_rejects_configuration_events_before_control_service_state_c
     );
 
     let response = handler.handle(
-        br#"{"protocol_version":2,"request_id":15,"command":{"kind":"event","event_type":"y","watched_path":"/data/adb/flux/conf","event_name":"settings.ini"}}"#,
+        br#"{"protocol_version":3,"request_id":15,"command":{"kind":"event","event_type":"y","watched_path":"/data/adb/flux/conf","event_name":"settings.ini"}}"#,
     );
 
     assert_eq!(
         String::from_utf8(response).expect("UTF-8 response"),
         concat!(
-            "{\"protocol_version\":2,\"request_id\":15,",
+            "{\"protocol_version\":3,\"request_id\":15,",
             "\"result\":{\"status\":\"error\",\"code\":\"read_only_profile\",",
             "\"message\":\"capability profile is read-only because kernel or boot identity is unverified\"}}\n"
         )
@@ -522,7 +525,7 @@ fn oversized_packet_is_rejected_before_json_parsing() {
     assert_eq!(
         String::from_utf8(response).expect("UTF-8 response"),
         concat!(
-            "{\"protocol_version\":2,\"request_id\":0,",
+            "{\"protocol_version\":3,\"request_id\":0,",
             "\"result\":{\"status\":\"error\",\"code\":\"packet_too_large\",",
             "\"message\":\"control packet exceeds 1048576 bytes\"}}\n"
         )

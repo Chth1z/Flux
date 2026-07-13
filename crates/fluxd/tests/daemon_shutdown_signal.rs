@@ -11,7 +11,10 @@ use std::time::{Duration, Instant};
 
 use tempfile::tempdir;
 
-use fluxd::{RuntimeCaptureState, RuntimeEngineState, RuntimePhase, SocketControlClient};
+use fluxd::{
+    RuntimeCaptureState, RuntimeEngineState, RuntimePhase, RuntimeVerificationState,
+    SocketControlClient,
+};
 
 const SIGTERM: std::ffi::c_int = 15;
 const PACKAGED_CONFIG: &str = include_str!("../../../conf/flux.toml");
@@ -107,6 +110,10 @@ EOF\n\
     assert_eq!(snapshot.runtime.phase, RuntimePhase::Running);
     assert_eq!(snapshot.runtime.capture, RuntimeCaptureState::Published);
     assert_eq!(snapshot.runtime.engine, RuntimeEngineState::Ready);
+    assert_eq!(
+        snapshot.runtime.verification,
+        RuntimeVerificationState::StructuralOnly
+    );
     assert_eq!(snapshot.runtime.generation, Some(1));
     // SAFETY: `child.id()` names the live daemon process observed ready above.
     assert_eq!(unsafe { kill(child.id() as std::ffi::c_int, SIGTERM) }, 0);

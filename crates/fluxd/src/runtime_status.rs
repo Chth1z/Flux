@@ -34,6 +34,19 @@ pub enum RuntimeEngineState {
     Failed,
 }
 
+/// The strongest capture verification currently associated with the observed runtime.
+///
+/// `StructuralOnly` is the conservative baseline: it means no functional pass currently
+/// authorizes publication for this observation. It does not by itself claim that structural
+/// verification has completed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeVerificationState {
+    StructuralOnly,
+    FunctionalPending,
+    FunctionalPassed,
+    FunctionalFailed,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeFailure {
     pub operation: String,
@@ -47,6 +60,7 @@ pub struct RuntimeSnapshot {
     pub phase: RuntimePhase,
     pub capture: RuntimeCaptureState,
     pub engine: RuntimeEngineState,
+    pub verification: RuntimeVerificationState,
     pub generation: Option<u64>,
     pub last_error: Option<RuntimeFailure>,
 }
@@ -59,6 +73,7 @@ impl RuntimeSnapshot {
             phase: RuntimePhase::Unknown,
             capture: RuntimeCaptureState::Unknown,
             engine: RuntimeEngineState::Unknown,
+            verification: RuntimeVerificationState::StructuralOnly,
             generation: None,
             last_error: None,
         }
@@ -132,6 +147,7 @@ mod tests {
             phase: RuntimePhase::Running,
             capture: RuntimeCaptureState::Published,
             engine: RuntimeEngineState::Ready,
+            verification: RuntimeVerificationState::StructuralOnly,
             generation: Some(7),
             last_error: None,
         };
@@ -175,6 +191,7 @@ mod tests {
             phase: RuntimePhase::Stopped,
             capture: RuntimeCaptureState::Detached,
             engine: RuntimeEngineState::Stopped,
+            verification: RuntimeVerificationState::StructuralOnly,
             generation: None,
             last_error: None,
         };
@@ -183,5 +200,35 @@ mod tests {
         source.publish(stopped);
 
         assert_eq!(source.snapshot().revision, 1);
+    }
+
+    #[test]
+    fn verification_only_change_advances_the_runtime_revision() {
+        let source = RuntimeSnapshotSource::new(RuntimeSnapshot {
+            revision: 0,
+            phase: RuntimePhase::Verifying,
+            capture: RuntimeCaptureState::Published,
+            engine: RuntimeEngineState::Ready,
+            verification: RuntimeVerificationState::FunctionalPending,
+            generation: Some(7),
+            last_error: None,
+        });
+
+        source.publish(RuntimeSnapshot {
+            revision: 0,
+            phase: RuntimePhase::Verifying,
+            capture: RuntimeCaptureState::Published,
+            engine: RuntimeEngineState::Ready,
+            verification: RuntimeVerificationState::FunctionalPassed,
+            generation: Some(7),
+            last_error: None,
+        });
+
+        let snapshot = source.snapshot();
+        assert_eq!(snapshot.revision, 1);
+        assert_eq!(
+            snapshot.verification,
+            RuntimeVerificationState::FunctionalPassed
+        );
     }
 }

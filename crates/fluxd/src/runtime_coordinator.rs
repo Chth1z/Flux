@@ -21,7 +21,7 @@ use crate::{
     CaptureObservation, DesiredEngine, EngineManifest, EngineManifestError, EnginePhase,
     EngineReport, EngineSnapshot, EngineSpec, EngineSupervisor, EngineSupervisorError,
     RuntimeCaptureState, RuntimeEngineState, RuntimeFailure, RuntimePhase, RuntimeSnapshot,
-    RuntimeSnapshotSource,
+    RuntimeSnapshotSource, RuntimeVerificationState,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -277,6 +277,19 @@ struct QualifiedRunningGeneration {
     disposition: FunctionalCanaryDisposition,
 }
 
+impl QualifiedRunningGeneration {
+    const fn verification(&self) -> RuntimeVerificationState {
+        match &self.disposition {
+            FunctionalCanaryDisposition::StructuralOnlyCompatibility => {
+                RuntimeVerificationState::StructuralOnly
+            }
+            FunctionalCanaryDisposition::AttemptPassedUnqualified(_) => {
+                RuntimeVerificationState::FunctionalPassed
+            }
+        }
+    }
+}
+
 pub(crate) struct RuntimeCoordinator<W, E = EngineSupervisor> {
     writer: W,
     engine: E,
@@ -303,6 +316,7 @@ where
             phase: RuntimePhase::Stopped,
             capture: RuntimeCaptureState::Detached,
             engine: RuntimeEngineState::Stopped,
+            verification: RuntimeVerificationState::StructuralOnly,
             generation: None,
             last_error: None,
         });
@@ -385,6 +399,7 @@ where
             )
         })?;
         let candidate_id = candidate.id;
+        self.mark_functional_gate_pending();
         let ownership = std::mem::replace(&mut self.ownership, RuntimeOwnership::Stopped);
         let (previous, capture) = match ownership {
             RuntimeOwnership::Engine {
@@ -470,10 +485,11 @@ where
     }
 
     fn activate_prepared(&mut self, generation: PreparedGeneration) -> Result<(), ControlError> {
-        self.publish_runtime(
+        self.publish_runtime_with_verification(
             RuntimePhase::Activating,
             RuntimeCaptureState::Detached,
             RuntimeEngineState::Starting,
+            self.pending_verification(),
             Some(u64::from(generation.id.get())),
             None,
         );
@@ -512,10 +528,11 @@ where
             );
             return Err(self.compensate_failed_activation(generation, failure));
         }
-        self.publish_runtime(
+        self.publish_runtime_with_verification(
             RuntimePhase::Verifying,
             RuntimeCaptureState::Published,
             RuntimeEngineState::Ready,
+            self.pending_verification(),
             Some(u64::from(generation.id.get())),
             None,
         );
@@ -526,6 +543,7 @@ where
         ) {
             Ok(qualification) => qualification,
             Err(failure) => {
+                self.mark_functional_gate_failed();
                 return Err(self.compensate_failed_activation(generation, failure));
             }
         };
@@ -533,15 +551,17 @@ where
             generation: Box::new(generation.clone()),
             capture: CaptureObservation::Published,
         };
+        let verification = qualification.verification();
         self.publish_qualified_running(
             qualification,
             "publish running state",
             "retain the verified data path and retry state publication",
         )?;
-        self.publish_runtime(
+        self.publish_runtime_with_verification(
             RuntimePhase::Running,
             RuntimeCaptureState::Published,
             RuntimeEngineState::Ready,
+            verification,
             Some(u64::from(generation.id.get())),
             None,
         );
@@ -637,6 +657,7 @@ where
                     generation,
                     capture,
                 };
+                self.mark_functional_gate_pending();
                 return Err(ControlError::runtime(
                     "maintain proxy engine",
                     source,
@@ -645,7 +666,19 @@ where
             }
         };
 
+        if !matches!(report, EngineReport::NoChange { .. }) {
+            self.mark_functional_gate_pending();
+        }
+
         if matches!(report, EngineReport::AwaitingCaptureRemoval { .. }) {
+            self.publish_runtime_with_verification(
+                RuntimePhase::Repairing,
+                runtime_capture_state(capture),
+                RuntimeEngineState::Exited,
+                self.pending_verification(),
+                Some(u64::from(generation.id.get())),
+                None,
+            );
             if capture == CaptureObservation::Published
                 && let Err(source) = self.writer.capture_stop()
             {
@@ -702,11 +735,25 @@ where
             report,
             EngineReport::Started { .. } | EngineReport::NoChange { .. }
         );
-        let pending_running_retry = matches!(
+        let pending_running_publication = matches!(
             self.pending_publication,
             Some(PublishedRuntimeState::Running { generation }) if generation == generation_id
         );
-        if capture == CaptureObservation::Published && engine_ready && pending_running_retry {
+        let functional_requalification_pending = self.functional_canary.mode()
+            == FunctionalCanaryGateMode::RequiredUnqualified
+            && self.current_verification() == RuntimeVerificationState::FunctionalPending;
+        if capture == CaptureObservation::Published
+            && engine_ready
+            && (pending_running_publication || functional_requalification_pending)
+        {
+            self.publish_runtime_with_verification(
+                RuntimePhase::Verifying,
+                RuntimeCaptureState::Published,
+                RuntimeEngineState::Ready,
+                self.pending_verification(),
+                Some(u64::from(generation_id.get())),
+                None,
+            );
             if self.functional_canary.mode() == FunctionalCanaryGateMode::RequiredUnqualified
                 && let Err(source) = self.writer.capture_start(&generation)
             {
@@ -724,6 +771,7 @@ where
             ) {
                 Ok(qualification) => qualification,
                 Err(error) => {
+                    self.mark_functional_gate_failed();
                     self.ownership = RuntimeOwnership::CaptureRepairPending { generation };
                     return Err(error);
                 }
@@ -732,15 +780,17 @@ where
                 generation,
                 capture,
             };
+            let verification = qualification.verification();
             self.publish_qualified_running(
                 qualification,
                 "retry running state publication",
                 "retain the verified data path and retry publication",
             )?;
-            self.publish_runtime(
+            self.publish_runtime_with_verification(
                 RuntimePhase::Running,
                 RuntimeCaptureState::Published,
                 RuntimeEngineState::Ready,
+                verification,
                 Some(u64::from(generation_id.get())),
                 None,
             );
@@ -771,6 +821,7 @@ where
         &mut self,
         generation: Box<PreparedGeneration>,
     ) -> Result<(), ControlError> {
+        self.mark_functional_gate_pending();
         if let Err(source) = self.writer.capture_stop() {
             self.ownership = RuntimeOwnership::CaptureRepairPending { generation };
             return Err(runtime_writer_error(
@@ -837,6 +888,7 @@ where
             };
             return Ok(());
         }
+        self.mark_functional_gate_pending();
         if let Err(source) = self.writer.capture_start(&generation) {
             self.ownership = RuntimeOwnership::Engine {
                 generation,
@@ -848,10 +900,11 @@ where
                 "keep capture detached and retry publication",
             ));
         }
-        self.publish_runtime(
+        self.publish_runtime_with_verification(
             RuntimePhase::Verifying,
             RuntimeCaptureState::Published,
             RuntimeEngineState::Ready,
+            self.pending_verification(),
             Some(u64::from(generation.id.get())),
             None,
         );
@@ -862,6 +915,7 @@ where
         ) {
             Ok(qualification) => qualification,
             Err(failure) => {
+                self.mark_functional_gate_failed();
                 return Err(self.compensate_failed_activation(*generation, failure));
             }
         };
@@ -870,15 +924,17 @@ where
             generation,
             capture: CaptureObservation::Published,
         };
+        let verification = qualification.verification();
         self.publish_qualified_running(
             qualification,
             "republish running state",
             "retain the verified path and retry state publication",
         )?;
-        self.publish_runtime(
+        self.publish_runtime_with_verification(
             RuntimePhase::Running,
             RuntimeCaptureState::Published,
             RuntimeEngineState::Ready,
+            verification,
             Some(u64::from(generation_id.get())),
             None,
         );
@@ -886,6 +942,7 @@ where
     }
 
     fn stop(&mut self) -> Result<(), ControlError> {
+        self.reset_verification();
         let ownership = std::mem::replace(&mut self.ownership, RuntimeOwnership::Stopped);
         let (generation, capture) = match ownership {
             RuntimeOwnership::Stopped => {
@@ -894,10 +951,11 @@ where
                     "publish stopped state",
                     "retry runtime reconciliation",
                 )?;
-                self.publish_runtime(
+                self.publish_runtime_with_verification(
                     RuntimePhase::Stopped,
                     RuntimeCaptureState::Detached,
                     RuntimeEngineState::Stopped,
+                    RuntimeVerificationState::StructuralOnly,
                     None,
                     None,
                 );
@@ -957,10 +1015,11 @@ where
             }
         };
 
-        self.publish_runtime(
+        self.publish_runtime_with_verification(
             RuntimePhase::Stopping,
             runtime_capture_state(capture),
             RuntimeEngineState::Stopping,
+            RuntimeVerificationState::StructuralOnly,
             Some(u64::from(generation.id.get())),
             None,
         );
@@ -1095,10 +1154,17 @@ where
         };
         self.ownership = RuntimeOwnership::Stopped;
         self.publish_legacy_state(terminal, publish_operation, publish_recovery)?;
-        self.publish_runtime(
+        let verification = match terminal {
+            PublishedRuntimeState::Stopped => RuntimeVerificationState::StructuralOnly,
+            PublishedRuntimeState::Failed | PublishedRuntimeState::Running { .. } => {
+                self.current_verification()
+            }
+        };
+        self.publish_runtime_with_verification(
             phase,
             RuntimeCaptureState::Detached,
             RuntimeEngineState::Stopped,
+            verification,
             None,
             None,
         );
@@ -1461,10 +1527,17 @@ where
             }
         };
         self.publish_legacy_state(state, operation, recovery)?;
-        self.publish_runtime(
+        let verification = match state {
+            PublishedRuntimeState::Stopped => RuntimeVerificationState::StructuralOnly,
+            PublishedRuntimeState::Failed | PublishedRuntimeState::Running { .. } => {
+                self.current_verification()
+            }
+        };
+        self.publish_runtime_with_verification(
             phase,
             RuntimeCaptureState::Detached,
             RuntimeEngineState::Stopped,
+            verification,
             None,
             None,
         );
@@ -1475,6 +1548,102 @@ where
         runtime_engine_state(self.engine.snapshot().phase())
     }
 
+    fn resync_active_addresses(&mut self) -> Result<(), ControlError> {
+        if self.functional_canary.mode() == FunctionalCanaryGateMode::StructuralOnlyCompatibility {
+            return self.writer.resync_addresses().map_err(|source| {
+                runtime_writer_error(
+                    "resynchronize addresses",
+                    source,
+                    "retry after repairing the legacy address writer",
+                )
+            });
+        }
+
+        self.mark_functional_gate_pending();
+        let ownership = std::mem::replace(&mut self.ownership, RuntimeOwnership::Stopped);
+        let (generation, capture) = match ownership {
+            RuntimeOwnership::Engine {
+                generation,
+                capture,
+            } => (generation, capture),
+            other => {
+                self.ownership = other;
+                return Ok(());
+            }
+        };
+        self.pending_publication = Some(PublishedRuntimeState::Running {
+            generation: generation.id,
+        });
+        match self.writer.resync_addresses() {
+            Ok(()) => {
+                self.ownership = RuntimeOwnership::Engine {
+                    generation,
+                    capture,
+                };
+                Ok(())
+            }
+            Err(source) => {
+                self.ownership = RuntimeOwnership::CaptureRepairPending { generation };
+                Err(runtime_writer_error(
+                    "resynchronize addresses",
+                    source,
+                    "detach and restore capture before requalifying the active generation",
+                ))
+            }
+        }
+    }
+
+    fn current_verification(&self) -> RuntimeVerificationState {
+        self.runtime.snapshot().verification
+    }
+
+    const fn pending_verification(&self) -> RuntimeVerificationState {
+        match self.functional_canary.mode() {
+            FunctionalCanaryGateMode::StructuralOnlyCompatibility => {
+                RuntimeVerificationState::StructuralOnly
+            }
+            FunctionalCanaryGateMode::RequiredUnqualified => {
+                RuntimeVerificationState::FunctionalPending
+            }
+        }
+    }
+
+    const fn normalize_verification(
+        &self,
+        verification: RuntimeVerificationState,
+    ) -> RuntimeVerificationState {
+        match self.functional_canary.mode() {
+            FunctionalCanaryGateMode::StructuralOnlyCompatibility => {
+                RuntimeVerificationState::StructuralOnly
+            }
+            FunctionalCanaryGateMode::RequiredUnqualified => verification,
+        }
+    }
+
+    fn mark_functional_gate_failed(&self) {
+        if self.functional_canary.mode() != FunctionalCanaryGateMode::RequiredUnqualified {
+            return;
+        }
+        let mut snapshot = self.runtime.snapshot().as_ref().clone();
+        snapshot.verification = RuntimeVerificationState::FunctionalFailed;
+        self.runtime.publish(snapshot);
+    }
+
+    fn mark_functional_gate_pending(&self) {
+        if self.functional_canary.mode() != FunctionalCanaryGateMode::RequiredUnqualified {
+            return;
+        }
+        let mut snapshot = self.runtime.snapshot().as_ref().clone();
+        snapshot.verification = RuntimeVerificationState::FunctionalPending;
+        self.runtime.publish(snapshot);
+    }
+
+    fn reset_verification(&self) {
+        let mut snapshot = self.runtime.snapshot().as_ref().clone();
+        snapshot.verification = RuntimeVerificationState::StructuralOnly;
+        self.runtime.publish(snapshot);
+    }
+
     fn publish_runtime(
         &self,
         phase: RuntimePhase,
@@ -1483,11 +1652,31 @@ where
         generation: Option<u64>,
         last_error: Option<RuntimeFailure>,
     ) {
+        self.publish_runtime_with_verification(
+            phase,
+            capture,
+            engine,
+            self.current_verification(),
+            generation,
+            last_error,
+        );
+    }
+
+    fn publish_runtime_with_verification(
+        &self,
+        phase: RuntimePhase,
+        capture: RuntimeCaptureState,
+        engine: RuntimeEngineState,
+        verification: RuntimeVerificationState,
+        generation: Option<u64>,
+        last_error: Option<RuntimeFailure>,
+    ) {
         self.runtime.publish(RuntimeSnapshot {
             revision: 0,
             phase,
             capture,
             engine,
+            verification: self.normalize_verification(verification),
             generation,
             last_error,
         });
@@ -1525,15 +1714,7 @@ where
             {
                 Ok(())
             }
-            LegacyIntent::ResyncAddresses { .. } => {
-                self.writer.resync_addresses().map_err(|source| {
-                    runtime_writer_error(
-                        "resynchronize addresses",
-                        source,
-                        "retry after repairing the legacy address writer",
-                    )
-                })
-            }
+            LegacyIntent::ResyncAddresses { .. } => self.resync_active_addresses(),
         };
         if let Err(error) = &result {
             self.publish_runtime_error(error);
@@ -1790,6 +1971,10 @@ mod tests {
         assert_eq!(snapshot.phase, RuntimePhase::Running);
         assert_eq!(snapshot.capture, RuntimeCaptureState::Published);
         assert_eq!(snapshot.engine, RuntimeEngineState::Ready);
+        assert_eq!(
+            snapshot.verification,
+            RuntimeVerificationState::StructuralOnly
+        );
         assert_eq!(snapshot.generation, Some(1));
         assert_eq!(snapshot.last_error, None);
     }
@@ -1852,7 +2037,304 @@ mod tests {
             ]
         );
         assert_eq!(canary_script.lock().expect("canary script").executions, 1);
-        assert_eq!(runtime.snapshot().phase, RuntimePhase::Running);
+        let snapshot = runtime.snapshot();
+        assert_eq!(snapshot.phase, RuntimePhase::Running);
+        assert_eq!(
+            snapshot.verification,
+            RuntimeVerificationState::FunctionalPassed
+        );
+    }
+
+    #[test]
+    fn required_reload_prepare_failure_preserves_the_active_functional_pass() {
+        let fixture = EngineFixture::new();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let request = functional_request_with_nonce(
+            &fixture.spec,
+            CanaryAddressFamilies::Ipv4Only,
+            Instant::now(),
+            CanaryNonce::from_bytes([41; FUNCTIONAL_CANARY_NONCE_BYTES]),
+        );
+        let canary_script = Arc::new(Mutex::new(ScriptedCanary::new([
+            ScriptedCanaryAttempt::passing(request),
+        ])));
+        let writer = ScriptedWriter {
+            events: Arc::clone(&events),
+            prepared: VecDeque::from([fixture.spec.clone()]),
+            next_generation_id: 17,
+            capture_start_failure: false,
+            capture_stop_failures: 0,
+            verify_failure: false,
+        };
+        let engine = RequiredScriptedEngine::new(
+            Arc::clone(&events),
+            [ready_canary_snapshot(98_765), ready_canary_snapshot(98_765)],
+        );
+        let mut coordinator = RuntimeCoordinator::with_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+            scripted_required_canary(canary_script, events),
+        );
+        let runtime = coordinator.runtime_snapshot_source();
+        coordinator
+            .execute(&LegacyIntent::Running {
+                reason: Reason::Boot,
+            })
+            .expect("active generation converges");
+
+        coordinator
+            .execute(&LegacyIntent::Reload {
+                reason: Reason::Fluxctl,
+            })
+            .expect_err("candidate preparation fails before active binding changes");
+
+        let snapshot = runtime.snapshot();
+        assert_eq!(snapshot.generation, Some(17));
+        assert_eq!(
+            snapshot.verification,
+            RuntimeVerificationState::FunctionalPassed
+        );
+    }
+
+    #[test]
+    fn required_reload_detachment_failure_invalidates_the_active_functional_pass() {
+        let active = EngineFixture::new();
+        let candidate = EngineFixture::new();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let request = functional_request_with_nonce(
+            &active.spec,
+            CanaryAddressFamilies::Ipv4Only,
+            Instant::now(),
+            CanaryNonce::from_bytes([42; FUNCTIONAL_CANARY_NONCE_BYTES]),
+        );
+        let canary_script = Arc::new(Mutex::new(ScriptedCanary::new([
+            ScriptedCanaryAttempt::passing(request),
+        ])));
+        let writer = ScriptedWriter {
+            events: Arc::clone(&events),
+            prepared: VecDeque::from([active.spec.clone(), candidate.spec.clone()]),
+            next_generation_id: 17,
+            capture_start_failure: false,
+            capture_stop_failures: 1,
+            verify_failure: false,
+        };
+        let engine = RequiredScriptedEngine::new(
+            Arc::clone(&events),
+            [ready_canary_snapshot(98_765), ready_canary_snapshot(98_765)],
+        );
+        let mut coordinator = RuntimeCoordinator::with_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+            scripted_required_canary(canary_script, events),
+        );
+        let runtime = coordinator.runtime_snapshot_source();
+        coordinator
+            .execute(&LegacyIntent::Running {
+                reason: Reason::Boot,
+            })
+            .expect("active generation converges");
+
+        coordinator
+            .execute(&LegacyIntent::Reload {
+                reason: Reason::Fluxctl,
+            })
+            .expect_err("uncertain capture detachment blocks replacement");
+
+        let snapshot = runtime.snapshot();
+        assert_eq!(snapshot.generation, Some(17));
+        assert_eq!(
+            snapshot.verification,
+            RuntimeVerificationState::FunctionalPending
+        );
+    }
+
+    #[test]
+    fn required_reconcile_error_requalifies_after_a_later_ready_observation() {
+        let fixture = EngineFixture::new();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let started_at = Instant::now();
+        let canary_script = Arc::new(Mutex::new(ScriptedCanary::new([
+            ScriptedCanaryAttempt::passing(functional_request_with_nonce(
+                &fixture.spec,
+                CanaryAddressFamilies::Ipv4Only,
+                started_at,
+                CanaryNonce::from_bytes([43; FUNCTIONAL_CANARY_NONCE_BYTES]),
+            )),
+            ScriptedCanaryAttempt::passing(functional_request_with_nonce(
+                &fixture.spec,
+                CanaryAddressFamilies::Ipv4Only,
+                started_at,
+                CanaryNonce::from_bytes([44; FUNCTIONAL_CANARY_NONCE_BYTES]),
+            )),
+        ])));
+        let writer = ScriptedWriter {
+            events: Arc::clone(&events),
+            prepared: VecDeque::from([fixture.spec.clone()]),
+            next_generation_id: 17,
+            capture_start_failure: false,
+            capture_stop_failures: 0,
+            verify_failure: false,
+        };
+        let engine = RequiredScriptedEngine::new(
+            Arc::clone(&events),
+            std::iter::repeat_with(|| ready_canary_snapshot(98_765)).take(5),
+        );
+        let mut coordinator = RuntimeCoordinator::with_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+            scripted_required_canary(Arc::clone(&canary_script), events),
+        );
+        let runtime = coordinator.runtime_snapshot_source();
+        coordinator
+            .execute(&LegacyIntent::Running {
+                reason: Reason::Boot,
+            })
+            .expect("initial generation converges");
+        coordinator.engine.fail_next_running = true;
+
+        coordinator.maintain();
+
+        assert_eq!(
+            runtime.snapshot().verification,
+            RuntimeVerificationState::FunctionalPending
+        );
+        coordinator
+            .engine
+            .reports
+            .push_back(EngineReport::NoChange { revision: 24 });
+
+        coordinator.maintain();
+
+        assert_eq!(canary_script.lock().expect("canary script").executions, 2);
+        assert_eq!(
+            runtime.snapshot().verification,
+            RuntimeVerificationState::FunctionalPassed
+        );
+    }
+
+    #[test]
+    fn required_started_report_runs_a_fresh_canary_before_restoring_passed_status() {
+        let fixture = EngineFixture::new();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let started_at = Instant::now();
+        let canary_script = Arc::new(Mutex::new(ScriptedCanary::new([
+            ScriptedCanaryAttempt::passing(functional_request_with_nonce(
+                &fixture.spec,
+                CanaryAddressFamilies::Ipv4Only,
+                started_at,
+                CanaryNonce::from_bytes([45; FUNCTIONAL_CANARY_NONCE_BYTES]),
+            )),
+            ScriptedCanaryAttempt::passing(functional_request_with_nonce(
+                &fixture.spec,
+                CanaryAddressFamilies::Ipv4Only,
+                started_at,
+                CanaryNonce::from_bytes([46; FUNCTIONAL_CANARY_NONCE_BYTES]),
+            )),
+        ])));
+        let writer = ScriptedWriter {
+            events: Arc::clone(&events),
+            prepared: VecDeque::from([fixture.spec.clone()]),
+            next_generation_id: 17,
+            capture_start_failure: false,
+            capture_stop_failures: 0,
+            verify_failure: false,
+        };
+        let engine = RequiredScriptedEngine::new(
+            Arc::clone(&events),
+            std::iter::repeat_with(|| ready_canary_snapshot(98_765)).take(4),
+        );
+        let mut coordinator = RuntimeCoordinator::with_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+            scripted_required_canary(Arc::clone(&canary_script), events),
+        );
+        let runtime = coordinator.runtime_snapshot_source();
+        coordinator
+            .execute(&LegacyIntent::Running {
+                reason: Reason::Boot,
+            })
+            .expect("initial generation converges");
+        coordinator.engine.reports.push_back(EngineReport::Started {
+            revision: 24,
+            owned_resource_readiness: ReadinessEvidence::Listener {
+                port: NonZeroU16::new(1536).expect("port"),
+                table: PathBuf::from("/proc/4242/net/tcp"),
+            },
+        });
+
+        coordinator.maintain();
+
+        assert_eq!(canary_script.lock().expect("canary script").executions, 2);
+        assert_eq!(
+            runtime.snapshot().verification,
+            RuntimeVerificationState::FunctionalPassed
+        );
+    }
+
+    #[test]
+    fn required_address_resync_schedules_a_fresh_running_gate() {
+        let fixture = EngineFixture::new();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let started_at = Instant::now();
+        let canary_script = Arc::new(Mutex::new(ScriptedCanary::new([
+            ScriptedCanaryAttempt::passing(functional_request_with_nonce(
+                &fixture.spec,
+                CanaryAddressFamilies::Ipv4Only,
+                started_at,
+                CanaryNonce::from_bytes([47; FUNCTIONAL_CANARY_NONCE_BYTES]),
+            )),
+            ScriptedCanaryAttempt::passing(functional_request_with_nonce(
+                &fixture.spec,
+                CanaryAddressFamilies::Ipv4Only,
+                started_at,
+                CanaryNonce::from_bytes([48; FUNCTIONAL_CANARY_NONCE_BYTES]),
+            )),
+        ])));
+        let writer = ScriptedWriter {
+            events: Arc::clone(&events),
+            prepared: VecDeque::from([fixture.spec.clone()]),
+            next_generation_id: 17,
+            capture_start_failure: false,
+            capture_stop_failures: 0,
+            verify_failure: false,
+        };
+        let engine = RequiredScriptedEngine::new(
+            Arc::clone(&events),
+            std::iter::repeat_with(|| ready_canary_snapshot(98_765)).take(4),
+        );
+        let mut coordinator = RuntimeCoordinator::with_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+            scripted_required_canary(Arc::clone(&canary_script), events),
+        );
+        let runtime = coordinator.runtime_snapshot_source();
+        coordinator
+            .execute(&LegacyIntent::Running {
+                reason: Reason::Boot,
+            })
+            .expect("initial generation converges");
+
+        coordinator
+            .execute(&LegacyIntent::ResyncAddresses {
+                reason: Reason::Fluxctl,
+            })
+            .expect("address resync completes");
+
+        assert_eq!(
+            runtime.snapshot().verification,
+            RuntimeVerificationState::FunctionalPending
+        );
+        coordinator.maintain();
+        assert_eq!(canary_script.lock().expect("canary script").executions, 2);
+        assert_eq!(
+            runtime.snapshot().verification,
+            RuntimeVerificationState::FunctionalPassed
+        );
     }
 
     #[test]
@@ -1886,6 +2368,7 @@ mod tests {
             Duration::from_millis(100),
             scripted_required_canary(canary_script, Arc::clone(&events)),
         );
+        let runtime = coordinator.runtime_snapshot_source();
 
         coordinator
             .execute(&LegacyIntent::Running {
@@ -1909,6 +2392,10 @@ mod tests {
                 Event::EngineStopped(CaptureObservation::Detached),
                 Event::Published(PublishedRuntimeState::Failed),
             ]
+        );
+        assert_eq!(
+            runtime.snapshot().verification,
+            RuntimeVerificationState::FunctionalFailed
         );
     }
 
@@ -1947,6 +2434,7 @@ mod tests {
             Duration::from_millis(100),
             scripted_required_canary(canary_script, Arc::clone(&events)),
         );
+        let runtime = coordinator.runtime_snapshot_source();
 
         coordinator
             .execute(&LegacyIntent::Running {
@@ -1970,6 +2458,10 @@ mod tests {
                 Event::EngineStopped(CaptureObservation::Detached),
                 Event::Published(PublishedRuntimeState::Failed),
             ]
+        );
+        assert_eq!(
+            runtime.snapshot().verification,
+            RuntimeVerificationState::FunctionalFailed
         );
     }
 
@@ -2016,11 +2508,16 @@ mod tests {
             Duration::from_millis(100),
             scripted_required_canary(Arc::clone(&canary_script), Arc::clone(&events)),
         );
+        let runtime = coordinator.runtime_snapshot_source();
         coordinator
             .execute(&LegacyIntent::Running {
                 reason: Reason::Boot,
             })
             .expect_err("initial running publication fails");
+        assert_eq!(
+            runtime.snapshot().verification,
+            RuntimeVerificationState::FunctionalPending
+        );
         events.lock().expect("events lock").clear();
 
         coordinator.maintain();
@@ -2044,6 +2541,10 @@ mod tests {
         let script = canary_script.lock().expect("canary script");
         assert_eq!(script.requests.len(), 2);
         assert_ne!(script.requests[0].nonce(), script.requests[1].nonce());
+        assert_eq!(
+            runtime.snapshot().verification,
+            RuntimeVerificationState::FunctionalPassed
+        );
     }
 
     #[test]
@@ -2098,11 +2599,16 @@ mod tests {
             Duration::from_millis(100),
             scripted_required_canary(Arc::clone(&canary_script), Arc::clone(&events)),
         );
+        let runtime = coordinator.runtime_snapshot_source();
         coordinator
             .execute(&LegacyIntent::Running {
                 reason: Reason::Boot,
             })
             .expect_err("initial running publication fails");
+        assert_eq!(
+            runtime.snapshot().verification,
+            RuntimeVerificationState::FunctionalPending
+        );
         events.lock().expect("events lock").clear();
 
         coordinator.maintain();
@@ -2119,6 +2625,10 @@ mod tests {
                 Event::EngineRunning(CaptureObservation::Published),
                 Event::CanaryReobserved(generation(17)),
             ]
+        );
+        assert_eq!(
+            runtime.snapshot().verification,
+            RuntimeVerificationState::FunctionalFailed
         );
         events.lock().expect("events lock").clear();
 
@@ -2144,6 +2654,10 @@ mod tests {
         let script = canary_script.lock().expect("canary script");
         assert_eq!(script.requests.len(), 3);
         assert_ne!(script.requests[1].nonce(), script.requests[2].nonce());
+        assert_eq!(
+            runtime.snapshot().verification,
+            RuntimeVerificationState::FunctionalPassed
+        );
     }
 
     #[test]
@@ -2198,6 +2712,7 @@ mod tests {
             Duration::from_millis(100),
             scripted_required_canary(Arc::clone(&canary_script), Arc::clone(&events)),
         );
+        let runtime = coordinator.runtime_snapshot_source();
         coordinator
             .execute(&LegacyIntent::Running {
                 reason: Reason::Boot,
@@ -2242,6 +2757,10 @@ mod tests {
             4343
         );
         assert_ne!(script.requests[0].nonce(), script.requests[1].nonce());
+        assert_eq!(
+            runtime.snapshot().verification,
+            RuntimeVerificationState::FunctionalPassed
+        );
     }
 
     #[test]
@@ -2310,6 +2829,7 @@ mod tests {
             Duration::from_millis(100),
             scripted_required_canary(Arc::clone(&canary_script), Arc::clone(&events)),
         );
+        let runtime = coordinator.runtime_snapshot_source();
         coordinator
             .execute(&LegacyIntent::Running {
                 reason: Reason::Boot,
@@ -2395,6 +2915,10 @@ mod tests {
         );
         assert_ne!(script.requests[0].nonce(), script.requests[2].nonce());
         assert_ne!(script.requests[1].nonce(), script.requests[2].nonce());
+        assert_eq!(
+            runtime.snapshot().verification,
+            RuntimeVerificationState::FunctionalPassed
+        );
     }
 
     #[test]
@@ -3870,6 +4394,7 @@ mod tests {
     struct RequiredScriptedEngine {
         events: Arc<Mutex<Vec<Event>>>,
         reports: VecDeque<EngineReport>,
+        fail_next_running: bool,
         snapshots: Arc<Mutex<VecDeque<Arc<EngineSnapshot>>>>,
         current_snapshot: Arc<Mutex<Arc<EngineSnapshot>>>,
     }
@@ -3882,6 +4407,7 @@ mod tests {
             Self {
                 events,
                 reports: VecDeque::new(),
+                fail_next_running: false,
                 snapshots: Arc::new(Mutex::new(snapshots.into_iter().collect())),
                 current_snapshot: Arc::new(Mutex::new(Arc::new(EngineSnapshot::default()))),
             }
@@ -3900,6 +4426,12 @@ mod tests {
                         .lock()
                         .expect("events lock")
                         .push(Event::EngineRunning(capture));
+                    if std::mem::take(&mut self.fail_next_running) {
+                        return Err(EngineSupervisorError::InvariantViolation {
+                            diagnostic: "injected required-engine reconciliation failure"
+                                .to_owned(),
+                        });
+                    }
                     Ok(self.reports.pop_front().unwrap_or(EngineReport::Started {
                         revision: 1,
                         owned_resource_readiness: ReadinessEvidence::Listener {

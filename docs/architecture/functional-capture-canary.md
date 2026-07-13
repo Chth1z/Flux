@@ -21,7 +21,37 @@ send real TCP, UDP, and DNS traffic through the active Generation and receive no
 attempt-local responses. Listener presence, file presence, a successful command, or netfilter/BPF
 counters alone never satisfy the functional gate. Counters may support the evidence record.
 
-`RUNNING` may be published only when both verification layers succeed for the same Generation.
+When the required functional gate is selected, `RUNNING` may be published only when both
+verification layers succeed for the same Generation. The production compatibility composition
+continues to publish operational `RUNNING` after structural verification while reporting
+`structural_only` rather than claiming functional authorization.
+
+## Runtime status contract
+
+Protocol version 3 carries a required verification field inside the independently revisioned
+`RuntimeSnapshot`. It is deliberately orthogonal to operational phase:
+
+- `structural_only` is the conservative baseline: no functional pass authorizes the current
+  observation. It does not assert that structural verification has already completed.
+- `functional_pending` means the current binding requires a fresh complete gate before it can
+  regain functional authorization.
+- `functional_passed` means the required gate and the subsequent `RUNNING` publication both
+  succeeded for the exact current Generation, engine, and environment binding.
+- `functional_failed` means the complete required gate failed, including a structural
+  prerequisite, attempt execution, evidence/identity validation, or cleanup proof.
+
+A passed attempt is not published as `functional_passed` before `state-running` succeeds. Failed
+publication returns to `functional_pending`, because the retry requires a fresh attempt. Engine or
+environment identity loss, restart, repair, uncertain reload detachment, and active address
+resynchronization also invalidate a pass. Address resynchronization schedules a fresh running gate;
+failure enters capture repair because the Network Epoch may have changed partially. Rollback runs a
+new attempt for the restored Generation and never inherits candidate evidence. Administrative stop
+resets to `structural_only`, meaning no functional authorization remains for an inactive runtime.
+
+`RuntimePhase::Running` remains an operational statement and never implies functional
+qualification. Likewise, `functional_passed` records an exact attempt-level result; until the
+stage-4 Android matrix is evidenced, it is not a production-device qualification claim. The
+production Phase 1 composition explicitly selects structural-only compatibility.
 
 ## Attempt identity and evidence
 
@@ -186,9 +216,10 @@ functional pass.
 
 ## Staged delivery and qualification
 
-1. Add typed attempt/evidence types, an injectable canary executor, coordinator ordering, failure
-   injection, deadline, stale-identity, and cleanup tests. Existing structural verification remains
-   a separate prerequisite.
+1. **Complete:** typed attempt/evidence types, an injectable canary executor, coordinator ordering,
+   failure injection, deadline, stale-identity, cleanup, retry, restart, resynchronization, and
+   rollback tests. Existing structural verification remains a separate prerequisite, and protocol
+   version 3 exposes the orthogonal verification result without enabling the production gate.
 2. Implement a privileged Linux network-namespace integration harness with real TCP, UDP, DNS,
    loop-escape, IPv4, and IPv6 flows. This proves the transaction and test topology, not Android
    compatibility.

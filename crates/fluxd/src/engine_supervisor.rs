@@ -3,7 +3,7 @@ use std::error::Error;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroU64};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -322,6 +322,14 @@ pub struct OwnedEngineIdentity {
 }
 
 impl OwnedEngineIdentity {
+    #[must_use]
+    pub(crate) const fn new(pid: NonZeroU32, start_time_ticks: NonZeroU64) -> Self {
+        Self {
+            pid: pid.get(),
+            start_time_ticks: start_time_ticks.get(),
+        }
+    }
+
     #[must_use]
     pub const fn pid(self) -> u32 {
         self.pid

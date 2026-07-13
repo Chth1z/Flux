@@ -1018,9 +1018,11 @@ exact two-byte DNS/TCP length prefix.
 
 The schema-v2 `validate_for` path is complete, but authoritative construction is intentionally not
 available in production. Listener/delivery constructors remain private and test-only until a real
-observer/report factory, distinct nonzero probe/engine UIDs, a backend-specific local-OUTPUT
-executor, delivered outbound-collector integration, and Android qualification exist. Host or
-ingress evidence cannot publish production `functional_passed`.
+observer/report factory, a backend-specific local-OUTPUT executor, delivered outbound-collector
+integration, and Android qualification exist. The separate Linux credential preflight now proves
+exact singleton controller/probe/engine UID and GID maps, delegated nonzero role identities, empty
+groups, zero role capabilities, `NoNewPrivs`, and exact map/namespace readback. It sends no traffic,
+uses file-backed subordinate-ID discovery, and cannot publish `functional_passed`.
 
 REDIRECT or DNAT to a conventional local listener cannot qualify a TPROXY Generation because it
 does not exercise that backend's transparent listener and destination semantics. The local-OUTPUT
@@ -1210,12 +1212,12 @@ It also rejects `.ko`, KPM, or other opaque kernel payloads in a production arti
 
 No compatibility stage may have two independent owners mutating the same kernel objects.
 
-Open Phase 1 hardening gates are the production schema-v2 evidence producer, distinct-UID
-local-OUTPUT executor, delivered outbound-collector integration, and Android adapter/qualification
-for the functional traffic/loop-prevention transaction. Missing `newuidmap`/`newgidmap` or another
-required distinct-UID mechanism must skip explicitly in optional mode or fail in required mode;
-root/root and same-UID execution never substitute. The schema-v2 validator and strict `/proc` FD
-plus INET_DIAG collector prerequisite are complete. Ingress evidence cannot discharge the
+Open Phase 1 hardening gates are the production schema-v2 evidence producer, local-OUTPUT executor,
+delivered outbound-collector integration, and Android adapter/qualification for the functional
+traffic/loop-prevention transaction. The exact Linux distinct-credential preflight, schema-v2
+validator, and strict `/proc` FD plus INET_DIAG collector prerequisite are complete. The preflight
+explicitly skips or fails unavailable helpers/maps/group authority and rejects root/root or
+same-UID substitution, but it is not traffic qualification. Ingress evidence cannot discharge the
 local-OUTPUT gate, and REDIRECT/DNAT cannot qualify TPROXY. Also open are an exact-device TUN
 single-owner and forced-death route-cleanup canary before removing the current TUN rejection,
 ancestor-safe `openat`/`openat2` traversal, bounded rotating Generation-correlated logs,

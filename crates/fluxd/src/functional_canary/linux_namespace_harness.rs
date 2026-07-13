@@ -46,6 +46,7 @@ const MAX_JOURNAL_BYTES: u64 = 192 * 1024;
 const MAX_JOURNAL_RECORDS: usize = 96;
 static JSON_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+mod distinct_uid;
 mod ingress_tproxy;
 
 #[test]
@@ -69,6 +70,12 @@ fn privileged_dual_stack_canary_exercises_real_topology_and_cleanup() {
 #[ignore = "requires Linux user/mount/network namespace and TPROXY authority"]
 fn privileged_ingress_tproxy_checkpoint_exercises_real_capture_counters_and_cleanup() {
     ingress_tproxy::run();
+}
+
+#[test]
+#[ignore = "requires Linux user-namespace authority for distinct subordinate credentials"]
+fn privileged_local_output_distinct_uid_capability_preflight() {
+    distinct_uid::run();
 }
 
 fn run_outer() -> Result<(), String> {

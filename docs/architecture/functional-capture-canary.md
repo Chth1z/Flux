@@ -348,20 +348,34 @@ functional pass.
    transport-specific TCP accept or UDP `recvmsg` delivery, attempt-bound authority, loss/timing,
    stable cross-flow socket identity, and exact inbound wire evidence described above. Positive
    constructors remain private and test-only.
-6. Add a separate local-OUTPUT qualification slice using distinct nonzero probe/engine UIDs, real
+6. **Complete credential preflight:** the opt-in Linux checkpoint creates a disposable namespace
+   with exact singleton controller/probe/engine UID and GID maps, delegated nonzero role IDs,
+   empty supplementary groups, exact namespace/map readback, zero role capabilities, and
+   `NoNewPrivs`. Optional mode skips unavailable outer prerequisites and required mode fails; exact
+   validation failures fail in both modes. It sends no traffic and is not capture qualification.
+7. Add a separate local-OUTPUT qualification slice using the delivered credential preflight, real
    listener-observer and delivery-report factories, the delivered outbound collector, and the
    completed schema-v2 `validate_for` path. A separately qualified cgroup-eBPF observer may replace
    the report only after its own authority and loss contract is proven. REDIRECT/DNAT delivery
    cannot qualify a TPROXY Generation; an adapter without a qualifying TPROXY listener path reports
-   `unsupported`. Missing `newuidmap`/`newgidmap` or another required distinct-UID mechanism is an
-   explicit optional-mode skip or required-mode failure, never permission to fall back to root/root
-   or the same UID. This slice must not weaken the model to accommodate the ingress checkpoint.
-7. Add an Android lab adapter that reports explicit `unsupported`, `denied`, `conflicting`,
+   `unsupported`. This slice must not weaken the model to accommodate the ingress checkpoint.
+8. Add an Android lab adapter that reports explicit `unsupported`, `denied`, `conflicting`,
    `broken`, or `unknown` evidence. It remains diagnostic-only until exact-device qualification.
-8. Permit TPROXY `RUNNING` only for reviewed device profiles whose functional canary passes the
+9. Permit TPROXY `RUNNING` only for reviewed device profiles whose functional canary passes the
    real-device matrix and cleanup/crash tests. Other profiles remain unqualified; broaden the
    reviewed set without weakening the probe. TUN remains rejected until its separate
    single-route-owner and forced-death cleanup canaries pass.
+
+Invoke the credential-only checkpoint separately from ordinary CI:
+
+```text
+cargo xtask test-functional-canary-linux-output-preflight
+FLUX_LINUX_CANARY_REQUIRED=1 cargo xtask test-functional-canary-linux-output-preflight
+```
+
+It never invokes `sudo`, loads modules, installs capture, or sends traffic. File-backed subordinate-
+ID discovery may conservatively skip NSS-only configurations; Android requires a separate true-
+root, collision-qualified UID/GID adapter.
 
 Invoke the delivered topology checkpoint separately from ordinary CI:
 

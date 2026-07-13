@@ -10,12 +10,23 @@ const ANDROID_NDK_REVISION: &str = "27.3.13750724";
 const LINUX_CANARY_REQUIRED_ENV: &str = "FLUX_LINUX_CANARY_REQUIRED";
 const LINUX_CANARY_TEST: &str = "functional_canary::linux_namespace_harness::privileged_dual_stack_canary_exercises_real_topology_and_cleanup";
 const LINUX_TPROXY_CANARY_TEST: &str = "functional_canary::linux_namespace_harness::privileged_ingress_tproxy_checkpoint_exercises_real_capture_counters_and_cleanup";
-const LINUX_CANARY_INTERNAL_ENVS: [&str; 5] = [
+const LINUX_OUTPUT_UID_PREFLIGHT_TEST: &str = "functional_canary::linux_namespace_harness::privileged_local_output_distinct_uid_capability_preflight";
+const LINUX_CANARY_INTERNAL_ENVS: [&str; 15] = [
     "FLUX_LINUX_CANARY_HARNESS_MODE",
     "FLUX_LINUX_CANARY_HARNESS_CONFIG",
     "FLUX_LINUX_CANARY_REENTRY_TOKEN",
     "FLUX_LINUX_CANARY_OUTER_NETNS",
     "FLUX_LINUX_CANARY_OUTER_USERNS",
+    "FLUX_LINUX_CANARY_OUTER_MOUNTNS",
+    "FLUX_LINUX_CANARY_EXPECTED_UID_MAP",
+    "FLUX_LINUX_CANARY_EXPECTED_GID_MAP",
+    "FLUX_LINUX_CANARY_MAPPING_MECHANISM",
+    "FLUX_LINUX_CANARY_ROLE_UID",
+    "FLUX_LINUX_CANARY_ROLE_GID",
+    "FLUX_LINUX_CANARY_OUTER_SUPPLEMENTARY_GROUPS",
+    "FLUX_LINUX_CANARY_INNER_NETNS",
+    "FLUX_LINUX_CANARY_INNER_USERNS",
+    "FLUX_LINUX_CANARY_INNER_MOUNTNS",
 ];
 
 fn main() {
@@ -78,6 +89,10 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
             require_no_arguments(&arguments)?;
             test_functional_canary_linux_tproxy()
         }
+        "test-functional-canary-linux-output-preflight" => {
+            require_no_arguments(&arguments)?;
+            test_functional_canary_linux_output_preflight()
+        }
         "stage-module" => stage_module(parse_stage_module_options(&arguments)?),
         "ci" => {
             require_no_arguments(&arguments)?;
@@ -109,6 +124,10 @@ fn test_functional_canary_linux() -> Result<(), String> {
 
 fn test_functional_canary_linux_tproxy() -> Result<(), String> {
     test_linux_canary(LINUX_TPROXY_CANARY_TEST)
+}
+
+fn test_functional_canary_linux_output_preflight() -> Result<(), String> {
+    test_linux_canary(LINUX_OUTPUT_UID_PREFLIGHT_TEST)
 }
 
 fn test_linux_canary(test_name: &str) -> Result<(), String> {
@@ -510,6 +529,7 @@ fn print_help() {
            build-android  Build release fluxd with NDK {ANDROID_NDK_REVISION}, API {ANDROID_API_LEVEL}\n\
            test-functional-canary-linux  Run the opt-in ignored privileged Linux canary checkpoint\n\
            test-functional-canary-linux-tproxy  Run the ingress-only Linux TPROXY checkpoint\n\
+           test-functional-canary-linux-output-preflight  Preflight distinct local-OUTPUT credentials (no traffic)\n\
            stage-module   Build and stage a Magisk tree; requires --stage DIR --runtime-binaries DIR\n\
            ci             Run all checks that do not require an NDK linker"
     );
@@ -541,6 +561,15 @@ mod tests {
             LINUX_TPROXY_CANARY_TEST
         ));
         assert!(!linux_canary_test_is_listed(&tproxy, LINUX_CANARY_TEST));
+        let output_preflight = format!("{LINUX_OUTPUT_UID_PREFLIGHT_TEST}: test\n");
+        assert!(linux_canary_test_is_listed(
+            &output_preflight,
+            LINUX_OUTPUT_UID_PREFLIGHT_TEST
+        ));
+        assert!(!linux_canary_test_is_listed(
+            &output_preflight,
+            LINUX_TPROXY_CANARY_TEST
+        ));
     }
 
     #[test]

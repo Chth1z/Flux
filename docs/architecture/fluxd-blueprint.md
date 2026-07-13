@@ -604,9 +604,11 @@ flow binds the exact Generation, engine, namespace, Capture Program, selector, l
 FD/inode/cookie and socket state, independent TCP-accept or UDP-`recvmsg` delivery, exact payload,
 stable and globally noncolliding `(family, protocol)` listeners, accepted children distinct from
 every listener, and constant authority/loss baseline. Readiness evidence is
-only an admission input. Positive constructors remain private and test-only, so distinct nonzero
-probe/engine UIDs, a local-OUTPUT executor, real observer/report factories, collector integration,
-and Android qualification remain separate gates. REDIRECT/DNAT cannot qualify TPROXY; an adapter
+only an admission input. The separate Linux credential preflight now proves exact nonzero
+probe/engine UID+GID roles, empty groups, zero role capabilities, and exact map/namespace readback
+without installing capture or sending traffic. Positive constructors remain private and test-only,
+so a local-OUTPUT executor, real observer/report factories, collector integration, and Android
+qualification remain separate gates. REDIRECT/DNAT cannot qualify TPROXY; an adapter
 must prove delivery to the selected backend's listener or report that backend unsupported. Host
 evidence still cannot authorize production `functional_passed`.
 

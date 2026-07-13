@@ -112,11 +112,30 @@ executor, production observer/report factories, and outbound-collector integrati
 checkpoints. REDIRECT/DNAT cannot qualify TPROXY; the local-OUTPUT adapter must prove delivery to
 the selected backend's listener or report unsupported.
 
-The future executor preflight must require distinct nonzero probe and engine UIDs. If
-`newuidmap`/`newgidmap` or another required credential mechanism is unavailable, optional mode
-skips explicitly and required mode fails; root/root or same-UID execution is never accepted as a
-weaker substitute. Neither Linux command is part of `cargo xtask ci`, and neither may invoke
-`sudo`, `modprobe`, load a `.ko`, or trigger implicit module autoload. The TPROXY preflight runs
+The delivered credential-only local-OUTPUT preflight is also opt-in:
+
+```text
+cargo xtask test-functional-canary-linux-output-preflight
+FLUX_LINUX_CANARY_REQUIRED=1 cargo xtask test-functional-canary-linux-output-preflight
+```
+
+It selects the exact ignored test
+`functional_canary::linux_namespace_harness::privileged_local_output_distinct_uid_capability_preflight`.
+Before any traffic or rule mutation, the checkpoint creates a disposable user/mount/network
+namespace with exactly three singleton UID and GID mappings: controller `0`, probe `20001`, and
+engine `20002`. The two role identities must come from distinct delegated subordinate IDs. It
+uses trusted mapping helpers under a scrubbed `PATH`, clears and verifies supplementary groups,
+reads back the exact maps and namespaces, and executes both nonzero roles with matching real,
+effective, saved, and filesystem credentials, zero inheritable/permitted/effective/ambient
+capabilities, and `NoNewPrivs=1`.
+
+Unavailable helpers, subordinate ranges, parent mappings, or group policy explicitly skip in
+optional mode and fail in required mode. Exact-map, namespace, or credential drift after the
+availability probe fails in both modes. Root/root, same-UID, broad-map, overflow-ID, inherited-
+group, and confined mapped-root fallbacks are rejected. This proves credential capability only;
+it does not install local-OUTPUT capture, run Sing-Box, construct schema-v2 evidence, or qualify
+Android. None of the three Linux commands is part of `cargo xtask ci`, and none may invoke `sudo`,
+`modprobe`, load a `.ko`, or trigger implicit module autoload. The ingress TPROXY preflight runs
 before rule mutation and refuses to continue unless the target, mark/comment matches, family
 TPROXY support, and selected xtables backend support are already active under `/sys/module`.
 

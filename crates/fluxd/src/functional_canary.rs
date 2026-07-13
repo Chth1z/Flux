@@ -3,6 +3,7 @@ use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::num::{NonZeroU8, NonZeroU16, NonZeroU32, NonZeroU64};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use flux_core::{
@@ -13,6 +14,7 @@ use flux_core::{
 use flux_platform::ReadinessEvidence;
 use flux_platform::socket_diagnostics::{
     CorrelatedProcessSocket, InetSocketProtocol, ProcessSocketDiagnostics, SocketCorrelationError,
+    SocketDiagnosticsError, SystemSocketDiagnosticsSession, SystemSocketDiagnosticsSource,
 };
 use sha2::{Digest, Sha256};
 
@@ -426,6 +428,176 @@ pub(crate) enum CanarySocketObserverAuthority {
         cgroup_id: NonZeroU64,
         event_schema_version: NonZeroU16,
     },
+}
+
+/// Pure request-side binding for one live observer opening.
+///
+/// The private process-local opening identity prevents a later socket that
+/// receives the same recycled netlink port number from matching the original
+/// attempt resource.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CanarySocketObserverBinding {
+    authority: CanarySocketObserverAuthority,
+    opening_id: CanarySocketObserverOpeningId,
+}
+
+impl CanarySocketObserverBinding {
+    #[cfg(test)]
+    pub(crate) const fn scripted(
+        authority: CanarySocketObserverAuthority,
+        opening_id: NonZeroU64,
+    ) -> Self {
+        Self {
+            authority,
+            opening_id: CanarySocketObserverOpeningId(opening_id),
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn authority(self) -> CanarySocketObserverAuthority {
+        self.authority
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CanarySocketObserverOpeningId(NonZeroU64);
+
+static NEXT_CANARY_SOCKET_OBSERVER_OPENING_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug)]
+pub(crate) enum CanaryAttemptSocketObserverOpenError {
+    SocketDiagnostics(SocketDiagnosticsError),
+    OpeningIdentityExhausted,
+}
+
+impl fmt::Display for CanaryAttemptSocketObserverOpenError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SocketDiagnostics(error) => error.fmt(formatter),
+            Self::OpeningIdentityExhausted => {
+                formatter.write_str("functional-canary socket-observer opening identity exhausted")
+            }
+        }
+    }
+}
+
+impl Error for CanaryAttemptSocketObserverOpenError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::SocketDiagnostics(error) => Some(error),
+            Self::OpeningIdentityExhausted => None,
+        }
+    }
+}
+
+impl From<SocketDiagnosticsError> for CanaryAttemptSocketObserverOpenError {
+    fn from(error: SocketDiagnosticsError) -> Self {
+        Self::SocketDiagnostics(error)
+    }
+}
+
+/// Attempt-owned transport for the socket observer named by the request.
+///
+/// Production construction derives the authority port and a private opening
+/// identity from the exact live prebound session. The value is neither
+/// cloneable nor separable from that session, so a copied or recycled port ID
+/// cannot substitute for the observer handed from preparation to execution.
+pub(crate) struct CanaryAttemptSocketObserverSession {
+    binding: CanarySocketObserverBinding,
+    deadline: CanaryDeadline,
+    transport: CanaryAttemptSocketObserverTransport,
+}
+
+const _: fn() = || {
+    fn assert_send_static<T: Send + 'static>() {}
+    assert_send_static::<CanaryAttemptSocketObserverSession>();
+};
+
+enum CanaryAttemptSocketObserverTransport {
+    ProcFdInetDiag(SystemSocketDiagnosticsSession),
+    #[cfg(test)]
+    Scripted,
+}
+
+impl CanaryAttemptSocketObserverSession {
+    /// Open the real observer in the caller's current network namespace under
+    /// the attempt's immutable deadline and derive its request authority.
+    #[allow(dead_code)]
+    pub(crate) fn open_proc_fd_inet_diag(
+        collector_identity: CanaryAttemptObjectIdentity,
+        collector_revision: NonZeroU64,
+        deadline: CanaryDeadline,
+    ) -> Result<Self, CanaryAttemptSocketObserverOpenError> {
+        let session = SystemSocketDiagnosticsSource.open_until(deadline.expires_at())?;
+        let opening_id = next_socket_observer_opening_id()?;
+        Ok(Self {
+            binding: CanarySocketObserverBinding {
+                authority: CanarySocketObserverAuthority::ProcFdInetDiag {
+                    collector_identity,
+                    collector_revision,
+                    netlink_port_id: session.netlink_port_id(),
+                },
+                opening_id,
+            },
+            deadline,
+            transport: CanaryAttemptSocketObserverTransport::ProcFdInetDiag(session),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn scripted(
+        binding: CanarySocketObserverBinding,
+        deadline: CanaryDeadline,
+    ) -> Self {
+        Self {
+            binding,
+            deadline,
+            transport: CanaryAttemptSocketObserverTransport::Scripted,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn authority(&self) -> CanarySocketObserverAuthority {
+        self.binding.authority()
+    }
+
+    #[must_use]
+    pub(crate) const fn binding(&self) -> CanarySocketObserverBinding {
+        self.binding
+    }
+
+    #[must_use]
+    pub(crate) const fn deadline(&self) -> CanaryDeadline {
+        self.deadline
+    }
+
+    /// Recover the exact platform session after request-authority validation.
+    #[allow(dead_code)]
+    pub(crate) fn into_proc_fd_inet_diag(
+        self,
+    ) -> Result<SystemSocketDiagnosticsSession, FunctionalCanaryError> {
+        match self.transport {
+            CanaryAttemptSocketObserverTransport::ProcFdInetDiag(session) => Ok(session),
+            #[cfg(test)]
+            CanaryAttemptSocketObserverTransport::Scripted => Err(FunctionalCanaryError::new(
+                CanaryErrorKind::InvalidEvidence,
+                CanaryCleanupStatus::NotRequired,
+                "the attempt-owned socket observer is not a prebound /proc FD plus INET_DIAG session",
+            )),
+        }
+    }
+}
+
+fn next_socket_observer_opening_id()
+-> Result<CanarySocketObserverOpeningId, CanaryAttemptSocketObserverOpenError> {
+    let raw = NEXT_CANARY_SOCKET_OBSERVER_OPENING_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .map_err(|_| CanaryAttemptSocketObserverOpenError::OpeningIdentityExhausted)?;
+    Ok(CanarySocketObserverOpeningId(
+        NonZeroU64::new(raw).expect("socket-observer opening IDs start at one"),
+    ))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1232,6 +1404,7 @@ pub(crate) struct CanaryEnvironmentAuthorityBinding {
     capture_program_digest: CaptureProgramDigest,
     ownership: CanaryOwnershipBinding,
     socket_observer: CanarySocketObserverAuthority,
+    socket_observer_opening: CanarySocketObserverOpeningId,
 }
 
 impl CanaryEnvironmentAuthorityBinding {
@@ -1242,7 +1415,7 @@ impl CanaryEnvironmentAuthorityBinding {
         network: CanaryNetworkObservationBinding,
         capture_program_digest: CaptureProgramDigest,
         ownership: CanaryOwnershipBinding,
-        socket_observer: CanarySocketObserverAuthority,
+        socket_observer: CanarySocketObserverBinding,
     ) -> Self {
         Self {
             boot_identity,
@@ -1250,13 +1423,22 @@ impl CanaryEnvironmentAuthorityBinding {
             network,
             capture_program_digest,
             ownership,
-            socket_observer,
+            socket_observer: socket_observer.authority,
+            socket_observer_opening: socket_observer.opening_id,
         }
     }
 
     #[must_use]
     pub(crate) const fn socket_observer(&self) -> CanarySocketObserverAuthority {
         self.socket_observer
+    }
+
+    #[must_use]
+    pub(crate) const fn socket_observer_binding(&self) -> CanarySocketObserverBinding {
+        CanarySocketObserverBinding {
+            authority: self.socket_observer,
+            opening_id: self.socket_observer_opening,
+        }
     }
 
     #[must_use]
@@ -3822,10 +4004,63 @@ impl fmt::Display for FunctionalCanaryError {
 
 impl Error for FunctionalCanaryError {}
 
+pub(crate) struct UnqualifiedFunctionalCanaryExecution<'a> {
+    request: &'a CanaryAttemptRequest,
+    socket_observer: CanaryAttemptSocketObserverSession,
+}
+
+impl<'a> UnqualifiedFunctionalCanaryExecution<'a> {
+    pub(crate) fn new(
+        request: &'a CanaryAttemptRequest,
+        socket_observer: CanaryAttemptSocketObserverSession,
+    ) -> Result<Self, FunctionalCanaryError> {
+        if request
+            .pre_binding()
+            .environment()
+            .authority()
+            .socket_observer_binding()
+            != socket_observer.binding()
+        {
+            return Err(FunctionalCanaryError::new(
+                CanaryErrorKind::IdentityChanged,
+                CanaryCleanupStatus::NotRequired,
+                "attempt-owned socket observer does not match the immutable request authority",
+            ));
+        }
+        if request.deadline() != socket_observer.deadline() {
+            return Err(FunctionalCanaryError::new(
+                CanaryErrorKind::IdentityChanged,
+                CanaryCleanupStatus::NotRequired,
+                "attempt-owned socket observer deadline does not match the immutable request deadline",
+            ));
+        }
+        Ok(Self {
+            request,
+            socket_observer,
+        })
+    }
+
+    #[must_use]
+    pub(crate) const fn request(&self) -> &'a CanaryAttemptRequest {
+        self.request
+    }
+
+    #[must_use]
+    pub(crate) const fn socket_observer_authority(&self) -> CanarySocketObserverAuthority {
+        self.socket_observer.authority()
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (&'a CanaryAttemptRequest, CanaryAttemptSocketObserverSession) {
+        (self.request, self.socket_observer)
+    }
+}
+
 pub(crate) trait UnqualifiedFunctionalCanaryExecutor: Send + 'static {
     fn execute(
         &mut self,
-        request: &CanaryAttemptRequest,
+        execution: UnqualifiedFunctionalCanaryExecution<'_>,
     ) -> Result<UnqualifiedCanaryGateEvidence, FunctionalCanaryError>;
 }
 
@@ -5837,14 +6072,17 @@ pub(crate) mod tests {
             network,
             CaptureProgramDigest::new([3; CAPTURE_PROGRAM_DIGEST_BYTES]).expect("capture digest"),
             ownership,
-            CanarySocketObserverAuthority::ProcFdInetDiag {
-                collector_identity: CanaryAttemptObjectIdentity::new(
-                    [12; CANARY_ATTEMPT_OBJECT_IDENTITY_BYTES],
-                )
-                .expect("socket observer identity"),
-                collector_revision: NonZeroU64::new(13).expect("collector revision"),
-                netlink_port_id: NonZeroU32::new(14).expect("netlink port ID"),
-            },
+            CanarySocketObserverBinding::scripted(
+                CanarySocketObserverAuthority::ProcFdInetDiag {
+                    collector_identity: CanaryAttemptObjectIdentity::new(
+                        [12; CANARY_ATTEMPT_OBJECT_IDENTITY_BYTES],
+                    )
+                    .expect("socket observer identity"),
+                    collector_revision: NonZeroU64::new(13).expect("collector revision"),
+                    netlink_port_id: NonZeroU32::new(14).expect("netlink port ID"),
+                },
+                NonZeroU64::new(15).expect("socket observer opening ID"),
+            ),
         );
         CanaryEnvironmentBinding::new(
             authority,

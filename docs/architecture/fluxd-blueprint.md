@@ -602,8 +602,11 @@ collector now binds protocol, exact tuple, UID, mark, FD/inode/cookie, complete 
 process identity, and timing. Its prebound session API now exposes the real kernel netlink port ID
 before collection, preserves one owned FD with monotonic sequences across snapshots, consumes and
 retires the handle on every error, prevents deadline extension, and retains the temporary-session
-compatibility wrapper. It is still only a delivered outbound-evidence prerequisite: the future
-attempt context must bind the port ID and transfer that exact session to the executor.
+compatibility wrapper. The typed canary handoff now opens that session under the attempt deadline,
+derives the copied request authority plus a private per-opening identity from the live handle,
+makes request construction use the session's exact deadline, checks both at the context-output and
+execution boundaries, and moves the same non-cloneable resource into prepared local-OUTPUT
+execution. A copied port ID or reopened replacement socket cannot reproduce that binding.
 Functional-canary schema v2 now completes the listener/delivery `validate_for` contract: every
 flow binds the exact Generation, engine, namespace, Capture Program, selector, listener
 FD/inode/cookie and socket state, independent TCP-accept or UDP-`recvmsg` delivery, exact payload,
@@ -618,7 +621,8 @@ zero-state xtables driver reports `Unsupported` with cleanup `NotRequired` befor
 OUTPUT marking does not reach PREROUTING TPROXY; the prepared/raw type is uninhabited, so no
 positive evidence can be emitted. Required mode treats that result as a failed gate and never
 reaches `RUNNING`. Real local-OUTPUT capture receipts, observer/report factories, prebound collector
-session handoff, capability-qualified execution, and Android qualification remain separate gates.
+use by a real attempt context, capability-qualified execution, and Android qualification remain
+separate gates.
 REDIRECT/DNAT, ingress promotion, counters, route lookups, and veth-bounce substitutions cannot
 qualify TPROXY. Host evidence still cannot authorize production `functional_passed`.
 

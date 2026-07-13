@@ -11,12 +11,16 @@
 //! schema-v2 gate evidence remains behind the private evidence-factory trait so
 //! an adapter cannot substitute REDIRECT, DNAT, ingress traffic, counters, or a
 //! route lookup for authoritative local-OUTPUT TPROXY listener delivery.
+//! Attempt preparation also carries the exact non-cloneable socket-observer
+//! session separately from the pure request. Read-only availability sees only
+//! the request; a prepared driver receives the bound session once by value.
 
 use std::convert::Infallible;
 
 use super::{
-    CanaryAttemptRequest, CanaryAvailability, CanaryCaptureBackend, CanaryCleanupStatus,
-    CanaryErrorKind, FunctionalCanaryError, UnqualifiedCanaryGateEvidence,
+    CanaryAttemptRequest, CanaryAttemptSocketObserverSession, CanaryAvailability,
+    CanaryCaptureBackend, CanaryCleanupStatus, CanaryErrorKind, FunctionalCanaryError,
+    UnqualifiedCanaryGateEvidence, UnqualifiedFunctionalCanaryExecution,
     UnqualifiedFunctionalCanaryExecutor, bounded_prefix,
 };
 
@@ -97,6 +101,7 @@ trait PreparedTproxyLocalOutputAttempt {
     fn execute_tproxy_local_output(
         self,
         request: &CanaryAttemptRequest,
+        socket_observer: CanaryAttemptSocketObserverSession,
     ) -> Result<RawTproxyLocalOutputArtifacts<Self::RawObservations>, FunctionalCanaryError>;
 }
 
@@ -132,16 +137,18 @@ where
 {
     fn execute(
         &mut self,
-        request: &CanaryAttemptRequest,
+        execution: UnqualifiedFunctionalCanaryExecution<'_>,
     ) -> Result<UnqualifiedCanaryGateEvidence, FunctionalCanaryError> {
+        let request = execution.request();
         require_tproxy_request(request)?;
 
         let prepared = self
             .driver
             .prepare_tproxy_local_output(request)
             .map_err(TproxyLocalOutputUnavailable::into_functional_error)?;
+        let (request, socket_observer) = execution.into_parts();
         let raw = prepared
-            .execute_tproxy_local_output(request)
+            .execute_tproxy_local_output(request, socket_observer)
             .map_err(normalize_post_preparation_failure)?;
         self.evidence_factory
             .promote(request, raw)
@@ -217,6 +224,7 @@ impl PreparedTproxyLocalOutputAttempt for Infallible {
     fn execute_tproxy_local_output(
         self,
         _request: &CanaryAttemptRequest,
+        _socket_observer: CanaryAttemptSocketObserverSession,
     ) -> Result<RawTproxyLocalOutputArtifacts<Self::RawObservations>, FunctionalCanaryError> {
         match self {}
     }
@@ -241,12 +249,17 @@ impl TproxyLocalOutputEvidenceFactory<Infallible> for TproxyCanaryEvidenceFactor
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU64;
     use std::sync::Arc;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    use std::sync::atomic::AtomicBool;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     use super::super::tests::Fixture;
+    use super::super::{CanarySocketObserverAuthority, CanarySocketObserverBinding};
     use super::*;
-    use crate::functional_canary::CanaryAddressFamilies;
+    use crate::functional_canary::{CanaryAddressFamilies, CanaryDeadline};
 
     #[test]
     fn xtables_reports_unsupported_before_mutation() {
@@ -254,7 +267,7 @@ mod tests {
         let mut executor = xtables_tproxy_local_output_executor();
 
         let error = executor
-            .execute(fixture.request())
+            .execute(execution(fixture.request()))
             .expect_err("xtables has no qualifying local-OUTPUT TPROXY mechanism");
 
         assert_eq!(
@@ -279,7 +292,7 @@ mod tests {
             let mut executor = TproxyLocalOutputExecutor::new(driver, TproxyCanaryEvidenceFactory);
 
             let error = executor
-                .execute(&request)
+                .execute(execution(&request))
                 .expect_err("substitute request backends cannot enter the driver");
 
             assert_eq!(error.kind(), CanaryErrorKind::InvalidEvidence);
@@ -304,7 +317,7 @@ mod tests {
             );
 
             let error = executor
-                .execute(fixture.request())
+                .execute(execution(fixture.request()))
                 .expect_err("pre-mutation unavailability cannot execute an attempt");
 
             assert_eq!(error.kind(), CanaryErrorKind::Availability(availability));
@@ -339,7 +352,7 @@ mod tests {
         );
 
         let error = executor
-            .execute(fixture.request())
+            .execute(execution(fixture.request()))
             .expect_err("NotRequired is invalid after a prepared attempt exists");
 
         assert_eq!(error.kind(), CanaryErrorKind::CleanupUncertain);
@@ -354,7 +367,7 @@ mod tests {
             NeverCalledEvidenceFactory,
         );
         let error = contradictory
-            .execute(fixture.request())
+            .execute(execution(fixture.request()))
             .expect_err("cleanup-uncertain kind cannot claim verified absence");
         assert_eq!(error.kind(), CanaryErrorKind::CleanupUncertain);
         assert_eq!(error.cleanup(), CanaryCleanupStatus::Uncertain);
@@ -380,7 +393,7 @@ mod tests {
             );
 
             let error = executor
-                .execute(fixture.request())
+                .execute(execution(fixture.request()))
                 .expect_err("prepared attempt injects a failure");
 
             assert_eq!(error.kind(), kind);
@@ -456,6 +469,7 @@ mod tests {
         fn execute_tproxy_local_output(
             self,
             _request: &CanaryAttemptRequest,
+            _socket_observer: CanaryAttemptSocketObserverSession,
         ) -> Result<RawTproxyLocalOutputArtifacts<Self::RawObservations>, FunctionalCanaryError>
         {
             Err(FunctionalCanaryError::new(
@@ -475,6 +489,194 @@ mod tests {
             _raw: RawTproxyLocalOutputArtifacts<()>,
         ) -> Result<UnqualifiedCanaryGateEvidence, FunctionalCanaryError> {
             panic!("the factory must not run after driver failure")
+        }
+    }
+
+    fn execution(request: &CanaryAttemptRequest) -> UnqualifiedFunctionalCanaryExecution<'_> {
+        let socket_observer = CanaryAttemptSocketObserverSession::scripted(
+            request
+                .pre_binding()
+                .environment()
+                .authority()
+                .socket_observer_binding(),
+            request.deadline(),
+        );
+        UnqualifiedFunctionalCanaryExecution::new(request, socket_observer)
+            .expect("scripted observer matches request authority")
+    }
+
+    #[test]
+    fn copied_numeric_authority_cannot_replace_the_owned_attempt_session() {
+        let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+        let request = fixture.request();
+        let authority = request
+            .pre_binding()
+            .environment()
+            .authority()
+            .socket_observer();
+        let observer = CanaryAttemptSocketObserverSession::scripted(
+            CanarySocketObserverBinding::scripted(
+                authority,
+                NonZeroU64::new(999).expect("replacement opening ID"),
+            ),
+            request.deadline(),
+        );
+
+        let error = match UnqualifiedFunctionalCanaryExecution::new(request, observer) {
+            Ok(_) => panic!("copied numeric authority cannot replace the original opening"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), CanaryErrorKind::IdentityChanged);
+        assert_eq!(error.cleanup(), CanaryCleanupStatus::NotRequired);
+    }
+
+    #[test]
+    fn observer_opening_deadline_must_equal_the_request_deadline() {
+        let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+        let request = fixture.request();
+        let different_deadline =
+            CanaryDeadline::new(request.deadline().started_at(), Duration::from_millis(1))
+                .expect("shorter scripted deadline");
+        let observer = CanaryAttemptSocketObserverSession::scripted(
+            request
+                .pre_binding()
+                .environment()
+                .authority()
+                .socket_observer_binding(),
+            different_deadline,
+        );
+
+        let error = match UnqualifiedFunctionalCanaryExecution::new(request, observer) {
+            Ok(_) => panic!("observer and request deadlines cannot diverge"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), CanaryErrorKind::IdentityChanged);
+        assert_eq!(error.cleanup(), CanaryCleanupStatus::NotRequired);
+        assert!(error.diagnostic().contains("deadline"));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn exact_prebound_observer_session_reaches_the_driver_by_value() {
+        let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+        let mut request = fixture.request().clone();
+        let (collector_identity, collector_revision) = match request
+            .pre_binding()
+            .environment()
+            .authority()
+            .socket_observer()
+        {
+            CanarySocketObserverAuthority::ProcFdInetDiag {
+                collector_identity,
+                collector_revision,
+                ..
+            } => (collector_identity, collector_revision),
+            CanarySocketObserverAuthority::QualifiedCgroupBpf { .. } => {
+                panic!("fixture uses the INET_DIAG observer")
+            }
+        };
+        let observer = CanaryAttemptSocketObserverSession::open_proc_fd_inet_diag(
+            collector_identity,
+            collector_revision,
+            request.deadline(),
+        )
+        .expect("open prebound observer");
+        let binding = observer.binding();
+        let authority = observer.authority();
+        request.pre_binding.environment.authority.socket_observer = authority;
+        request
+            .pre_binding
+            .environment
+            .authority
+            .socket_observer_opening = binding.opening_id;
+        let reached_driver = Arc::new(AtomicBool::new(false));
+        let driver = PreboundObserverPreparedDriver {
+            binding,
+            reached_driver: Arc::clone(&reached_driver),
+        };
+        let mut executor = TproxyLocalOutputExecutor::new(driver, NeverCalledEvidenceFactory);
+
+        let error = executor
+            .execute(
+                UnqualifiedFunctionalCanaryExecution::new(&request, observer)
+                    .expect("prebound observer matches request authority"),
+            )
+            .expect_err("test prepared attempt injects a verified-clean failure");
+
+        assert_eq!(error.kind(), CanaryErrorKind::ResponseMismatch);
+        assert_eq!(error.cleanup(), CanaryCleanupStatus::VerifiedAbsent);
+        assert!(reached_driver.load(Ordering::SeqCst));
+    }
+
+    struct PreboundObserverPreparedDriver {
+        binding: CanarySocketObserverBinding,
+        reached_driver: Arc<AtomicBool>,
+    }
+
+    impl TproxyLocalOutputDriver for PreboundObserverPreparedDriver {
+        type Prepared = PreboundObserverPreparedFailure;
+
+        fn prepare_tproxy_local_output(
+            &self,
+            request: &CanaryAttemptRequest,
+        ) -> Result<Self::Prepared, TproxyLocalOutputUnavailable> {
+            assert_eq!(
+                request
+                    .pre_binding()
+                    .environment()
+                    .authority()
+                    .socket_observer_binding(),
+                self.binding
+            );
+            Ok(PreboundObserverPreparedFailure {
+                binding: self.binding,
+                reached_driver: Arc::clone(&self.reached_driver),
+            })
+        }
+    }
+
+    struct PreboundObserverPreparedFailure {
+        binding: CanarySocketObserverBinding,
+        reached_driver: Arc<AtomicBool>,
+    }
+
+    impl PreparedTproxyLocalOutputAttempt for PreboundObserverPreparedFailure {
+        type RawObservations = ();
+
+        fn execute_tproxy_local_output(
+            self,
+            request: &CanaryAttemptRequest,
+            socket_observer: CanaryAttemptSocketObserverSession,
+        ) -> Result<RawTproxyLocalOutputArtifacts<Self::RawObservations>, FunctionalCanaryError>
+        {
+            assert_eq!(
+                request
+                    .pre_binding()
+                    .environment()
+                    .authority()
+                    .socket_observer_binding(),
+                self.binding
+            );
+            assert_eq!(socket_observer.binding(), self.binding);
+            let session = socket_observer
+                .into_proc_fd_inet_diag()
+                .expect("driver received the real prebound session");
+            let CanarySocketObserverAuthority::ProcFdInetDiag {
+                netlink_port_id, ..
+            } = self.binding.authority()
+            else {
+                panic!("test authority is INET_DIAG")
+            };
+            assert_eq!(session.netlink_port_id(), netlink_port_id);
+            drop(session);
+            self.reached_driver.store(true, Ordering::SeqCst);
+            Err(FunctionalCanaryError::new(
+                CanaryErrorKind::ResponseMismatch,
+                CanaryCleanupStatus::VerifiedAbsent,
+                "synthetic prepared attempt consumed the exact observer session",
+            ))
         }
     }
 }

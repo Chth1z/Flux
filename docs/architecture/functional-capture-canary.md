@@ -320,12 +320,20 @@ must prove that the TCP and UDP INET_DIAG handlers are built in or already activ
 and report unsupported otherwise. A dump request is not an admissible availability probe because a
 kernel may satisfy it through implicit `request_module` autoload, which production Flux prohibits.
 
-The platform session closes the socket-port temporal gap but does not by itself bind a canary
-attempt. A positive local-OUTPUT context must open the session in the exact daemon network namespace
-before building `CanaryEnvironmentAuthorityBinding`, copy its real port ID into the request, and
-hand the exact owned session to the executor for collection. Reopening another socket after copying
-the port ID is invalid. That attempt-owned handoff, collector object identity/revision binding, and
-real positive producer remain deferred.
+The canary layer now closes the next ownership gap with a non-cloneable attempt transport. Its
+production constructor opens the platform session under the immutable canary deadline and derives
+the request authority plus a private per-opening identity from that exact handle. Attempt inputs
+derive the request deadline from the transport. Checked context-output and execution envelopes
+reject numeric-authority reuse, replacement sessions, or deadline drift; the coordinator keeps the pure request for post-observation while moving
+the session once into the executor, and only a successfully prepared local-OUTPUT attempt receives
+it by value. Request construction, availability, or later failure drops the session. A copied port
+ID cannot be paired with a reopened replacement socket even if the kernel reuses the port number,
+and a live regression proves the bound port is unchanged at prepared execution.
+
+This type-safe handoff is still not a real producer. A production `prepare_attempt` context must
+invoke it in the exact daemon network namespace, supply the real collector object identity/revision,
+perform no-autoload capability admission, and use the session for the actual per-flow observations.
+The current daemon has no production required-mode context.
 
 This collector is deliberately not a canary executor or the complete listener-envelope producer.
 It does not create the distinct probe and engine UIDs, install local-OUTPUT capture, generate
@@ -415,16 +423,21 @@ functional pass.
    owned session before request construction, expose its real port ID, reuse the same FD with
    monotonic nonzero sequences, retire the handle on any error, prevent deadline extension, and
    preserve the temporary-session compatibility API. This remains observation plumbing.
-9. Add a separate positive local-OUTPUT qualification slice using the delivered credential
-   preflight, real listener-observer and delivery-report factories, an attempt-owned handoff of the
-   delivered prebound collector session, and the completed schema-v2 `validate_for` path. A
+9. **Complete typed attempt handoff:** a non-cloneable canary transport derives request authority,
+   a private per-opening identity, and the immutable deadline from the exact prebound session;
+   checked input/execution envelopes reject copied/reopened mismatches or deadline drift, and the
+   coordinator moves the handle once into prepared local-OUTPUT execution. Production still
+   has no real required-mode context or positive driver.
+10. Add a separate positive local-OUTPUT qualification slice using the delivered credential
+   preflight and handoff, a real attempt context, listener-observer and delivery-report factories,
+   actual collector-session observations, and the completed schema-v2 `validate_for` path. A
    separately qualified cgroup-eBPF observer may replace
    the report only after its own authority and loss contract is proven. REDIRECT/DNAT delivery
    cannot qualify a TPROXY Generation; an adapter without a qualifying TPROXY listener path reports
    `unsupported`. This slice must not weaken the model to accommodate the ingress checkpoint.
-10. Add an Android lab adapter that reports explicit `unsupported`, `denied`, `conflicting`,
+11. Add an Android lab adapter that reports explicit `unsupported`, `denied`, `conflicting`,
    `broken`, or `unknown` evidence. It remains diagnostic-only until exact-device qualification.
-11. Permit TPROXY `RUNNING` only for reviewed device profiles whose functional canary passes the
+12. Permit TPROXY `RUNNING` only for reviewed device profiles whose functional canary passes the
    real-device matrix and cleanup/crash tests. Other profiles remain unqualified; broaden the
    reviewed set without weakening the probe. TUN remains rejected until its separate
    single-route-owner and forced-death cleanup canaries pass.

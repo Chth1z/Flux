@@ -12,9 +12,10 @@ use flux_platform::{
 };
 
 use crate::functional_canary::{
-    CanaryAddressFamilies, CanaryAttemptBinding, CanaryAttemptRequest, CanaryCounterDeltaBounds,
-    CanaryDeadline, CanaryEngineBinding, CanaryEnvironmentBinding, CanaryNonce,
-    FunctionalCanaryDisposition, FunctionalCanaryError, FunctionalCanaryGateMode,
+    CanaryAddressFamilies, CanaryAttemptBinding, CanaryAttemptRequest,
+    CanaryAttemptSocketObserverSession, CanaryCounterDeltaBounds, CanaryDeadline,
+    CanaryEngineBinding, CanaryEnvironmentBinding, CanaryNonce, FunctionalCanaryDisposition,
+    FunctionalCanaryError, FunctionalCanaryGateMode, UnqualifiedFunctionalCanaryExecution,
     UnqualifiedFunctionalCanaryExecutor,
 };
 use crate::{
@@ -60,6 +61,7 @@ pub(crate) trait EngineRuntime: Send + 'static {
 
 pub(crate) struct UnqualifiedFunctionalCanaryAttemptInputs {
     environment: CanaryEnvironmentBinding,
+    socket_observer: CanaryAttemptSocketObserverSession,
     nonce: CanaryNonce,
     deadline: CanaryDeadline,
     families: CanaryAddressFamilies,
@@ -70,21 +72,29 @@ impl UnqualifiedFunctionalCanaryAttemptInputs {
     // Production remains explicitly structural-only until the Android adapter
     // is qualified; the required constructor is exercised by the Linux/test seam.
     #[allow(dead_code)]
-    #[must_use]
-    pub(crate) const fn new(
+    pub(crate) fn new(
         environment: CanaryEnvironmentBinding,
+        socket_observer: CanaryAttemptSocketObserverSession,
         nonce: CanaryNonce,
-        deadline: CanaryDeadline,
         families: CanaryAddressFamilies,
         counter_bounds: CanaryCounterDeltaBounds,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, FunctionalCanaryError> {
+        if environment.authority().socket_observer_binding() != socket_observer.binding() {
+            return Err(FunctionalCanaryError::new(
+                crate::functional_canary::CanaryErrorKind::IdentityChanged,
+                crate::functional_canary::CanaryCleanupStatus::NotRequired,
+                "prepared socket observer does not match the canary environment authority",
+            ));
+        }
+        let deadline = socket_observer.deadline();
+        Ok(Self {
             environment,
+            socket_observer,
             nonce,
             deadline,
             families,
             counter_bounds,
-        }
+        })
     }
 }
 
@@ -1292,24 +1302,35 @@ where
                 unreachable!("functional canary mode was checked before attempt preparation")
             }
         };
-        let pre_binding = CanaryAttemptBinding::new(pre_engine, attempt.environment);
-        let request = CanaryAttemptRequest::new(
-            pre_binding,
-            attempt.nonce,
-            attempt.deadline,
-            attempt.families,
-            attempt.counter_bounds,
-        )
-        .map_err(|source| {
-            functional_canary_error(
-                "construct functional canary attempt",
-                source,
-                "detach capture before repairing canary attempt construction",
-            )
-        })?;
+        let UnqualifiedFunctionalCanaryAttemptInputs {
+            environment,
+            socket_observer,
+            nonce,
+            deadline,
+            families,
+            counter_bounds,
+        } = attempt;
+        let pre_binding = CanaryAttemptBinding::new(pre_engine, environment);
+        let request =
+            CanaryAttemptRequest::new(pre_binding, nonce, deadline, families, counter_bounds)
+                .map_err(|source| {
+                    functional_canary_error(
+                        "construct functional canary attempt",
+                        source,
+                        "detach capture before repairing canary attempt construction",
+                    )
+                })?;
+        let execution_input = UnqualifiedFunctionalCanaryExecution::new(&request, socket_observer)
+            .map_err(|source| {
+                functional_canary_error(
+                    "bind functional canary attempt-owned observer",
+                    source,
+                    "detach capture before preparing a fresh canary observer",
+                )
+            })?;
         let execution = match &mut self.functional_canary {
             RuntimeFunctionalCanary::RequiredUnqualified { executor, .. } => {
-                executor.execute(&request)
+                executor.execute(execution_input)
             }
             RuntimeFunctionalCanary::StructuralOnlyCompatibility => {
                 unreachable!("functional canary mode was checked before execution")
@@ -1892,7 +1913,7 @@ mod tests {
     };
     use crate::functional_canary::{
         CanaryAddressFamilies, CanaryCleanupStatus, CanaryErrorKind, CanaryNonce,
-        FUNCTIONAL_CANARY_NONCE_BYTES, UnqualifiedCanaryGateEvidence,
+        CanarySocketObserverBinding, FUNCTIONAL_CANARY_NONCE_BYTES, UnqualifiedCanaryGateEvidence,
     };
     use crate::{EngineReport, OwnedEngineIdentity, RestartPolicy};
 
@@ -2532,6 +2553,39 @@ mod tests {
             runtime.snapshot().verification,
             RuntimeVerificationState::FunctionalFailed
         );
+    }
+
+    #[test]
+    fn attempt_inputs_reject_an_observer_not_bound_to_the_environment() {
+        let fixture = EngineFixture::new();
+        let request = functional_request_with_nonce(
+            &fixture.spec,
+            CanaryAddressFamilies::Ipv4Only,
+            Instant::now(),
+            CanaryNonce::from_bytes([50; FUNCTIONAL_CANARY_NONCE_BYTES]),
+        );
+        let environment = request.pre_binding().environment().clone();
+        let authority = environment.authority().socket_observer();
+
+        let error = match UnqualifiedFunctionalCanaryAttemptInputs::new(
+            environment,
+            CanaryAttemptSocketObserverSession::scripted(
+                CanarySocketObserverBinding::scripted(
+                    authority,
+                    NonZeroU64::new(999).expect("scripted opening ID"),
+                ),
+                request.deadline(),
+            ),
+            request.nonce(),
+            request.families(),
+            request.counter_bounds(),
+        ) {
+            Ok(_) => panic!("mismatched prepared observer cannot become attempt inputs"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), CanaryErrorKind::IdentityChanged);
+        assert_eq!(error.cleanup(), CanaryCleanupStatus::NotRequired);
     }
 
     #[test]
@@ -4349,13 +4403,18 @@ mod tests {
                 .lock()
                 .expect("events lock")
                 .push(Event::CanaryPrepared(generation));
-            let inputs = UnqualifiedFunctionalCanaryAttemptInputs::new(
-                attempt.request.pre_binding().environment().clone(),
-                attempt.request.nonce(),
+            let environment = attempt.request.pre_binding().environment().clone();
+            let socket_observer = CanaryAttemptSocketObserverSession::scripted(
+                environment.authority().socket_observer_binding(),
                 attempt.request.deadline(),
+            );
+            let inputs = UnqualifiedFunctionalCanaryAttemptInputs::new(
+                environment,
+                socket_observer,
+                attempt.request.nonce(),
                 attempt.request.families(),
                 attempt.request.counter_bounds(),
-            );
+            )?;
             script.active = Some(ActiveCanaryAttempt {
                 request: attempt.request,
                 outcome: attempt.outcome,
@@ -4408,8 +4467,22 @@ mod tests {
     impl UnqualifiedFunctionalCanaryExecutor for ScriptedCanaryExecutor {
         fn execute(
             &mut self,
-            request: &CanaryAttemptRequest,
+            execution: UnqualifiedFunctionalCanaryExecution<'_>,
         ) -> Result<UnqualifiedCanaryGateEvidence, FunctionalCanaryError> {
+            let request = execution.request();
+            if execution.socket_observer_authority()
+                != request
+                    .pre_binding()
+                    .environment()
+                    .authority()
+                    .socket_observer()
+            {
+                return Err(FunctionalCanaryError::new(
+                    CanaryErrorKind::IdentityChanged,
+                    CanaryCleanupStatus::NotRequired,
+                    "scripted executor received the wrong attempt-owned socket observer",
+                ));
+            }
             let mut script = self.script.lock().expect("canary script");
             let active = script.active.as_ref().ok_or_else(|| {
                 FunctionalCanaryError::new(

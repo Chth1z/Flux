@@ -167,10 +167,10 @@ the seam cannot produce a positive host result.
 
 Before a positive factory can inhabit that path, it must bind an explicit local-OUTPUT capture
 receipt rather than trusting a `Tproxy` label, observe the exact probe and engine UID+GID/process
-credentials, prove report-object cleanup and cleanup timing, and bind the real pre-opened socket-
-diagnostics authority. Those are later checkpoints. "Fail-closed" here means weak evidence cannot
-qualify the gate; it does not override the separate user-selected fail-open versus fail-closed
-connectivity compensation policy.
+credentials, construct the delivered exact report-object and temporal cleanup evidence, and bind
+the real pre-opened socket-diagnostics authority. Those producer-side steps remain later
+checkpoints. "Fail-closed" here means weak evidence cannot qualify the gate; it does not override
+the separate user-selected fail-open versus fail-closed connectivity compensation policy.
 
 ## Contained peer topology
 
@@ -357,10 +357,31 @@ Every mutation has an ownership token and an inverse operation recorded before e
 cleanup is capture-safe:
 
 1. quiesce, terminate, and reap the probe client while selectors and leak guards remain active;
-2. remove the canary selector and attempt-only guards/counters and verify them absent;
+2. remove the canary selector and attempt-only guards/counters; retire the attempt-owned listener-
+   delivery report for supervised-report authority, or verify it was never created for qualified
+   cgroup-BPF authority; then verify every exact reserved object absent;
 3. stop and reap the peer servers;
 4. retire the attempt record while retaining the unchanged boot facility for fresh
    verification after restart or publication retry.
+
+The unqualified gate record carries daemon-observed monotonic timestamps rather than cleanup
+booleans. Client and peer retirement evidence records PID/start-time identity plus ordered
+quiesce, terminate, and reap observations. The validator rejects collisions among those roles and
+with the supervised engine; the future real attempt context must additionally bind each claimed
+identity to its attempt-owned process handle before the factory can promote positive evidence.
+Object-retirement evidence binds each pairwise-distinct selector, leak-guard, counter, and
+listener-delivery-report identity plus retirement and subsequent absence readback. The attempt
+record binds the exact Generation and nonce plus retirement and absence observations. Validation
+requires the final flow and delivery to precede client quiescence, final counter readback to
+precede counter retirement, client reaping to precede every object retirement, every object
+absence readback to precede peer stopping, peer reaping to precede attempt-record retirement, and
+final record absence to precede observation of the unchanged retained facility. Every timestamp is
+no later than gate completion and strictly before the immutable request deadline. These `Instant`
+values are local coordinator observations; they are not accepted as serialized timestamps supplied
+by child processes. A qualified cgroup-BPF delivery authority selects the explicit verified-never-
+created report-object disposition rather than inventing a retirement event; a positive producer
+still needs the observer's separately proven lifecycle authority before it can construct that
+claim.
 
 Clean daemon shutdown and startup/offline recovery remove the facility's RPDB rules and private
 table routes, then its addresses, veth pair, and peer namespace, and finally verify every exact
@@ -428,16 +449,28 @@ functional pass.
    checked input/execution envelopes reject copied/reopened mismatches or deadline drift, and the
    coordinator moves the handle once into prepared local-OUTPUT execution. Production still
    has no real required-mode context or positive driver.
-10. Add a separate positive local-OUTPUT qualification slice using the delivered credential
+10. **Complete temporal cleanup model:** typed process retirement, exact pairwise-distinct attempt-
+   object retirement and absence (including the listener-delivery report), attempt-record
+   retirement, retained-facility observation, and gate/deadline chronology now replace boolean
+   cleanup claims. Counter readback and the final authoritative delivery event must precede
+   retirement of their evidence objects. Qualified cgroup-BPF delivery instead requires the exact
+   report object to be verified never created and absent after the final event. This is validation
+   plumbing; production still has no positive evidence producer or attempt-process ownership
+   binding.
+11. Add an explicit local-OUTPUT capture-receipt contract for the selected TPROXY path. The
+   receipt remains unavailable until a backend can prove the real local-OUTPUT traffic domain; it
+   must not be inferred from REDIRECT/DNAT, ingress traffic, counters, route lookups, or a backend
+   enum.
+12. Add a separate positive local-OUTPUT qualification slice using the delivered credential
    preflight and handoff, a real attempt context, listener-observer and delivery-report factories,
    actual collector-session observations, and the completed schema-v2 `validate_for` path. A
    separately qualified cgroup-eBPF observer may replace
    the report only after its own authority and loss contract is proven. REDIRECT/DNAT delivery
    cannot qualify a TPROXY Generation; an adapter without a qualifying TPROXY listener path reports
    `unsupported`. This slice must not weaken the model to accommodate the ingress checkpoint.
-11. Add an Android lab adapter that reports explicit `unsupported`, `denied`, `conflicting`,
+13. Add an Android lab adapter that reports explicit `unsupported`, `denied`, `conflicting`,
    `broken`, or `unknown` evidence. It remains diagnostic-only until exact-device qualification.
-12. Permit TPROXY `RUNNING` only for reviewed device profiles whose functional canary passes the
+14. Permit TPROXY `RUNNING` only for reviewed device profiles whose functional canary passes the
    real-device matrix and cleanup/crash tests. Other profiles remain unqualified; broaden the
    reviewed set without weakening the probe. TUN remains rejected until its separate
    single-route-owner and forced-death cleanup canaries pass.

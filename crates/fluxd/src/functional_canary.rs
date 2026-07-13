@@ -186,6 +186,7 @@ pub(crate) enum CanaryBindingError {
     CaptureOwnerGenerationMismatch,
     CaptureOwnerBootMismatch,
     AllZeroAttemptObjectIdentity,
+    AttemptObjectIdentityCollision,
     AttemptObjectGenerationMismatch,
     AttemptObjectNonceMismatch,
     InvalidCounterBounds,
@@ -251,23 +252,28 @@ pub(crate) struct CanaryAttemptObjectIdentities {
 }
 
 impl CanaryAttemptObjectIdentities {
-    #[must_use]
-    pub(crate) const fn new(
+    pub(crate) fn new(
         generation: NonZeroU32,
         nonce: CanaryNonce,
         selector: CanaryAttemptObjectIdentity,
         leak_guard: CanaryAttemptObjectIdentity,
         counters: CanaryAttemptObjectIdentity,
         listener_delivery_report: CanaryAttemptObjectIdentity,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, CanaryBindingError> {
+        let identities = [selector, leak_guard, counters, listener_delivery_report];
+        for (index, identity) in identities.iter().enumerate() {
+            if identities[index + 1..].contains(identity) {
+                return Err(CanaryBindingError::AttemptObjectIdentityCollision);
+            }
+        }
+        Ok(Self {
             generation,
             nonce,
             selector,
             leak_guard,
             counters,
             listener_delivery_report,
-        }
+        })
     }
 
     #[must_use]
@@ -2658,21 +2664,125 @@ impl CanaryProcessIdentity {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CanaryProcessRetirementEvidence {
+    process: CanaryProcessIdentity,
+    quiesced_at: Instant,
+    terminated_at: Instant,
+    reaped_at: Instant,
+}
+
+impl CanaryProcessRetirementEvidence {
+    #[must_use]
+    pub(crate) const fn new(
+        process: CanaryProcessIdentity,
+        quiesced_at: Instant,
+        terminated_at: Instant,
+        reaped_at: Instant,
+    ) -> Self {
+        Self {
+            process,
+            quiesced_at,
+            terminated_at,
+            reaped_at,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CanaryAttemptObjectRetirementEvidence {
+    object: CanaryAttemptObjectIdentity,
+    retired_at: Instant,
+    absent_observed_at: Instant,
+}
+
+impl CanaryAttemptObjectRetirementEvidence {
+    #[must_use]
+    pub(crate) const fn new(
+        object: CanaryAttemptObjectIdentity,
+        retired_at: Instant,
+        absent_observed_at: Instant,
+    ) -> Self {
+        Self {
+            object,
+            retired_at,
+            absent_observed_at,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CanaryListenerDeliveryReportCleanupEvidence {
+    Retired(CanaryAttemptObjectRetirementEvidence),
+    VerifiedNeverCreated {
+        object: CanaryAttemptObjectIdentity,
+        absent_observed_at: Instant,
+    },
+}
+
+impl CanaryListenerDeliveryReportCleanupEvidence {
+    #[must_use]
+    pub(crate) const fn retired(evidence: CanaryAttemptObjectRetirementEvidence) -> Self {
+        Self::Retired(evidence)
+    }
+
+    #[must_use]
+    pub(crate) const fn verified_never_created(
+        object: CanaryAttemptObjectIdentity,
+        absent_observed_at: Instant,
+    ) -> Self {
+        Self::VerifiedNeverCreated {
+            object,
+            absent_observed_at,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CanaryAttemptRecordRetirementEvidence {
+    generation: NonZeroU32,
+    nonce: CanaryNonce,
+    retired_at: Instant,
+    absent_observed_at: Instant,
+}
+
+impl CanaryAttemptRecordRetirementEvidence {
+    #[must_use]
+    pub(crate) const fn new(
+        generation: NonZeroU32,
+        nonce: CanaryNonce,
+        retired_at: Instant,
+        absent_observed_at: Instant,
+    ) -> Self {
+        Self {
+            generation,
+            nonce,
+            retired_at,
+            absent_observed_at,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CanaryCleanupObjectRole {
+    Selector,
+    LeakGuard,
+    Counters,
+    ListenerDeliveryReport,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct UnqualifiedCanaryCleanupEvidence {
     nonce: CanaryNonce,
-    objects: CanaryAttemptObjectIdentities,
-    client: CanaryProcessIdentity,
-    client_quiesced: bool,
-    client_terminated: bool,
-    client_reaped: bool,
-    peer_servers: [CanaryProcessIdentity; CANARY_PEER_SERVER_SLOTS],
-    peer_servers_stopped: [bool; CANARY_PEER_SERVER_SLOTS],
-    peer_servers_reaped: [bool; CANARY_PEER_SERVER_SLOTS],
-    selector_absent: bool,
-    leak_guard_absent: bool,
-    counters_absent: bool,
+    client: CanaryProcessRetirementEvidence,
+    peer_servers: [CanaryProcessRetirementEvidence; CANARY_PEER_SERVER_SLOTS],
+    selector_retirement: CanaryAttemptObjectRetirementEvidence,
+    leak_guard_retirement: CanaryAttemptObjectRetirementEvidence,
+    counters_retirement: CanaryAttemptObjectRetirementEvidence,
+    listener_delivery_report: CanaryListenerDeliveryReportCleanupEvidence,
+    attempt_record: CanaryAttemptRecordRetirementEvidence,
     retained_facility: CanaryFacilityIdentity,
+    retained_facility_observed_at: Instant,
 }
 
 impl UnqualifiedCanaryCleanupEvidence {
@@ -2680,33 +2790,27 @@ impl UnqualifiedCanaryCleanupEvidence {
     #[must_use]
     pub(crate) const fn new(
         nonce: CanaryNonce,
-        objects: CanaryAttemptObjectIdentities,
-        client: CanaryProcessIdentity,
-        client_quiesced: bool,
-        client_terminated: bool,
-        client_reaped: bool,
-        peer_servers: [CanaryProcessIdentity; CANARY_PEER_SERVER_SLOTS],
-        peer_servers_stopped: [bool; CANARY_PEER_SERVER_SLOTS],
-        peer_servers_reaped: [bool; CANARY_PEER_SERVER_SLOTS],
-        selector_absent: bool,
-        leak_guard_absent: bool,
-        counters_absent: bool,
+        client: CanaryProcessRetirementEvidence,
+        peer_servers: [CanaryProcessRetirementEvidence; CANARY_PEER_SERVER_SLOTS],
+        selector_retirement: CanaryAttemptObjectRetirementEvidence,
+        leak_guard_retirement: CanaryAttemptObjectRetirementEvidence,
+        counters_retirement: CanaryAttemptObjectRetirementEvidence,
+        listener_delivery_report: CanaryListenerDeliveryReportCleanupEvidence,
+        attempt_record: CanaryAttemptRecordRetirementEvidence,
         retained_facility: CanaryFacilityIdentity,
+        retained_facility_observed_at: Instant,
     ) -> Self {
         Self {
             nonce,
-            objects,
             client,
-            client_quiesced,
-            client_terminated,
-            client_reaped,
             peer_servers,
-            peer_servers_stopped,
-            peer_servers_reaped,
-            selector_absent,
-            leak_guard_absent,
-            counters_absent,
+            selector_retirement,
+            leak_guard_retirement,
+            counters_retirement,
+            listener_delivery_report,
+            attempt_record,
             retained_facility,
+            retained_facility_observed_at,
         }
     }
 }
@@ -2827,7 +2931,13 @@ impl UnqualifiedCanaryGateEvidence {
         validate_flow_evidence(expected, &self.flows, self.completed_at)?;
         validate_loop_evidence(expected, &self.flows, &self.loop_escape)?;
         validate_counter_evidence(expected, &self.flows, self.completed_at, self.counters)?;
-        validate_cleanup_evidence(expected, &self.cleanup)?;
+        validate_cleanup_evidence(
+            expected,
+            &self.flows,
+            self.counters,
+            self.completed_at,
+            &self.cleanup,
+        )?;
         Ok(ValidatedUnqualifiedCanaryGateEvidence(self))
     }
 }
@@ -3098,21 +3208,38 @@ pub(crate) enum CanaryEvidenceError {
         observed: u64,
     },
     CleanupNonceMismatch,
-    CleanupObjectMismatch,
-    CleanupClientNotQuiesced,
-    CleanupClientNotTerminated,
-    CleanupClientNotReaped,
-    CleanupPeerServerNotStopped {
+    CleanupObjectMismatch {
+        object: CanaryCleanupObjectRole,
+    },
+    CleanupObjectRetirementTimingInvalid {
+        object: CanaryCleanupObjectRole,
+    },
+    CleanupClientRetirementTimingInvalid,
+    CleanupClientQuiescedBeforeFlowCompletion,
+    CleanupPeerServerRetirementTimingInvalid {
         slot: usize,
     },
-    CleanupPeerServerNotReaped {
+    CleanupObjectRetiredBeforeClientReap {
+        object: CanaryCleanupObjectRole,
+    },
+    CleanupObjectAbsenceObservedBeforeClientReap {
+        object: CanaryCleanupObjectRole,
+    },
+    CleanupCountersRetiredBeforeFinalObservation,
+    CleanupListenerDeliveryReportRetiredBeforeFinalDelivery,
+    CleanupListenerDeliveryReportNeverCreatedObservedBeforeFinalDelivery,
+    CleanupListenerDeliveryReportDispositionMismatch,
+    CleanupPeerServerQuiescedBeforeObjectAbsence {
         slot: usize,
     },
     CleanupProcessIdentityCollision,
-    CleanupSelectorPresent,
-    CleanupLeakGuardPresent,
-    CleanupCountersPresent,
+    CleanupAttemptRecordMismatch,
+    CleanupAttemptRecordTimingInvalid,
+    CleanupAttemptRecordRetiredBeforePeerReap,
     CleanupFacilityChanged,
+    CleanupFacilityObservedBeforeSettlement,
+    CleanupTimingAfterGateCompletion,
+    CleanupTimingAtOrAfterDeadline,
 }
 
 impl fmt::Display for CanaryEvidenceError {
@@ -3883,51 +4010,244 @@ fn validate_counter_evidence(
 
 fn validate_cleanup_evidence(
     request: &CanaryAttemptRequest,
+    flows: &UnqualifiedCanaryFlowEvidenceSlots,
+    counters: UnqualifiedCanaryCounterEvidence,
+    attempt_completed_at: Instant,
     cleanup: &UnqualifiedCanaryCleanupEvidence,
 ) -> Result<(), CanaryEvidenceError> {
     let environment = &request.pre_binding.environment;
     if cleanup.nonce != request.nonce() {
         return Err(CanaryEvidenceError::CleanupNonceMismatch);
     }
-    if cleanup.objects != environment.attempt_objects {
-        return Err(CanaryEvidenceError::CleanupObjectMismatch);
+
+    let deadline = request.deadline();
+    let client = cleanup.client;
+    if !retirement_timing_is_ordered(client) {
+        return Err(CanaryEvidenceError::CleanupClientRetirementTimingInvalid);
     }
-    if !cleanup.client_quiesced {
-        return Err(CanaryEvidenceError::CleanupClientNotQuiesced);
+    validate_cleanup_timestamp(client.quiesced_at, attempt_completed_at, deadline)?;
+    validate_cleanup_timestamp(client.terminated_at, attempt_completed_at, deadline)?;
+    validate_cleanup_timestamp(client.reaped_at, attempt_completed_at, deadline)?;
+
+    let mut last_flow_completed_at = deadline.started_at();
+    let mut last_delivery_observed_at = deadline.started_at();
+    let mut delivery_authority = None;
+    for flow in flows.slots.iter().flatten() {
+        last_flow_completed_at = std::cmp::max(last_flow_completed_at, flow.completed_at);
+        let delivery = flow
+            .inbound_listener_delivery
+            .as_ref()
+            .and_then(UnqualifiedCanaryInboundListenerDeliveryEvidence::delivery_event)
+            .ok_or(CanaryEvidenceError::MissingInboundListenerDelivery { flow: flow.flow })?;
+        last_delivery_observed_at = std::cmp::max(last_delivery_observed_at, delivery.observed_at);
+        delivery_authority.get_or_insert(delivery.authority);
     }
-    if !cleanup.client_terminated {
-        return Err(CanaryEvidenceError::CleanupClientNotTerminated);
+    if client.quiesced_at < last_flow_completed_at {
+        return Err(CanaryEvidenceError::CleanupClientQuiescedBeforeFlowCompletion);
     }
-    if !cleanup.client_reaped {
-        return Err(CanaryEvidenceError::CleanupClientNotReaped);
+
+    let engine = request.pre_binding.engine.engine();
+    let matches_engine = |process: CanaryProcessIdentity| {
+        process.pid.get() == engine.pid()
+            && process.start_time_ticks.get() == engine.start_time_ticks()
+    };
+    if matches_engine(client.process) {
+        return Err(CanaryEvidenceError::CleanupProcessIdentityCollision);
     }
-    if cleanup.peer_servers.contains(&cleanup.client) {
+    if cleanup
+        .peer_servers
+        .iter()
+        .any(|peer| peer.process == client.process || matches_engine(peer.process))
+    {
         return Err(CanaryEvidenceError::CleanupProcessIdentityCollision);
     }
     for first in 0..CANARY_PEER_SERVER_SLOTS {
-        if !cleanup.peer_servers_stopped[first] {
-            return Err(CanaryEvidenceError::CleanupPeerServerNotStopped { slot: first });
+        let peer = cleanup.peer_servers[first];
+        if !retirement_timing_is_ordered(peer) {
+            return Err(
+                CanaryEvidenceError::CleanupPeerServerRetirementTimingInvalid { slot: first },
+            );
         }
-        if !cleanup.peer_servers_reaped[first] {
-            return Err(CanaryEvidenceError::CleanupPeerServerNotReaped { slot: first });
-        }
+        validate_cleanup_timestamp(peer.quiesced_at, attempt_completed_at, deadline)?;
+        validate_cleanup_timestamp(peer.terminated_at, attempt_completed_at, deadline)?;
+        validate_cleanup_timestamp(peer.reaped_at, attempt_completed_at, deadline)?;
         for second in first + 1..CANARY_PEER_SERVER_SLOTS {
-            if cleanup.peer_servers[first] == cleanup.peer_servers[second] {
+            if peer.process == cleanup.peer_servers[second].process {
                 return Err(CanaryEvidenceError::CleanupProcessIdentityCollision);
             }
         }
     }
-    if !cleanup.selector_absent {
-        return Err(CanaryEvidenceError::CleanupSelectorPresent);
+
+    let expected_objects = environment.attempt_objects;
+    let object_retirements = [
+        (
+            CanaryCleanupObjectRole::Selector,
+            cleanup.selector_retirement,
+            expected_objects.selector(),
+        ),
+        (
+            CanaryCleanupObjectRole::LeakGuard,
+            cleanup.leak_guard_retirement,
+            expected_objects.leak_guard(),
+        ),
+        (
+            CanaryCleanupObjectRole::Counters,
+            cleanup.counters_retirement,
+            expected_objects.counters(),
+        ),
+    ];
+    let mut last_object_absence_observed_at = client.reaped_at;
+    for (object, retirement, expected_identity) in object_retirements {
+        if retirement.object != expected_identity {
+            return Err(CanaryEvidenceError::CleanupObjectMismatch { object });
+        }
+        if retirement.retired_at > retirement.absent_observed_at {
+            return Err(CanaryEvidenceError::CleanupObjectRetirementTimingInvalid { object });
+        }
+        validate_cleanup_timestamp(retirement.retired_at, attempt_completed_at, deadline)?;
+        validate_cleanup_timestamp(
+            retirement.absent_observed_at,
+            attempt_completed_at,
+            deadline,
+        )?;
+        match object {
+            CanaryCleanupObjectRole::Counters
+                if retirement.retired_at < counters.after_observed_at =>
+            {
+                return Err(CanaryEvidenceError::CleanupCountersRetiredBeforeFinalObservation);
+            }
+            _ => {}
+        }
+        if retirement.retired_at < client.reaped_at {
+            return Err(CanaryEvidenceError::CleanupObjectRetiredBeforeClientReap { object });
+        }
+        last_object_absence_observed_at = std::cmp::max(
+            last_object_absence_observed_at,
+            retirement.absent_observed_at,
+        );
     }
-    if !cleanup.leak_guard_absent {
-        return Err(CanaryEvidenceError::CleanupLeakGuardPresent);
+
+    let delivery_authority =
+        delivery_authority.ok_or(CanaryEvidenceError::MissingInboundListenerDelivery {
+            flow: CanaryFlow::Ipv4TcpEcho,
+        })?;
+    match (delivery_authority, cleanup.listener_delivery_report) {
+        (
+            CanaryInboundDeliveryAuthority::SupervisedEngineReport { .. },
+            CanaryListenerDeliveryReportCleanupEvidence::Retired(retirement),
+        ) => {
+            let object = CanaryCleanupObjectRole::ListenerDeliveryReport;
+            if retirement.object != expected_objects.listener_delivery_report() {
+                return Err(CanaryEvidenceError::CleanupObjectMismatch { object });
+            }
+            if retirement.retired_at > retirement.absent_observed_at {
+                return Err(CanaryEvidenceError::CleanupObjectRetirementTimingInvalid { object });
+            }
+            validate_cleanup_timestamp(retirement.retired_at, attempt_completed_at, deadline)?;
+            validate_cleanup_timestamp(
+                retirement.absent_observed_at,
+                attempt_completed_at,
+                deadline,
+            )?;
+            if retirement.retired_at < last_delivery_observed_at {
+                return Err(
+                    CanaryEvidenceError::CleanupListenerDeliveryReportRetiredBeforeFinalDelivery,
+                );
+            }
+            if retirement.retired_at < client.reaped_at {
+                return Err(CanaryEvidenceError::CleanupObjectRetiredBeforeClientReap { object });
+            }
+            last_object_absence_observed_at = std::cmp::max(
+                last_object_absence_observed_at,
+                retirement.absent_observed_at,
+            );
+        }
+        (
+            CanaryInboundDeliveryAuthority::QualifiedCgroupBpf { .. },
+            CanaryListenerDeliveryReportCleanupEvidence::VerifiedNeverCreated {
+                object,
+                absent_observed_at,
+            },
+        ) => {
+            let role = CanaryCleanupObjectRole::ListenerDeliveryReport;
+            if object != expected_objects.listener_delivery_report() {
+                return Err(CanaryEvidenceError::CleanupObjectMismatch { object: role });
+            }
+            validate_cleanup_timestamp(absent_observed_at, attempt_completed_at, deadline)?;
+            if absent_observed_at < last_delivery_observed_at {
+                return Err(
+                    CanaryEvidenceError::CleanupListenerDeliveryReportNeverCreatedObservedBeforeFinalDelivery,
+                );
+            }
+            if absent_observed_at < client.reaped_at {
+                return Err(
+                    CanaryEvidenceError::CleanupObjectAbsenceObservedBeforeClientReap {
+                        object: role,
+                    },
+                );
+            }
+            last_object_absence_observed_at =
+                std::cmp::max(last_object_absence_observed_at, absent_observed_at);
+        }
+        _ => return Err(CanaryEvidenceError::CleanupListenerDeliveryReportDispositionMismatch),
     }
-    if !cleanup.counters_absent {
-        return Err(CanaryEvidenceError::CleanupCountersPresent);
+
+    let mut cleanup_settled_at = last_object_absence_observed_at;
+    for (slot, peer) in cleanup.peer_servers.iter().copied().enumerate() {
+        if peer.quiesced_at < last_object_absence_observed_at {
+            return Err(CanaryEvidenceError::CleanupPeerServerQuiescedBeforeObjectAbsence { slot });
+        }
+        cleanup_settled_at = std::cmp::max(cleanup_settled_at, peer.reaped_at);
     }
+
+    let attempt_record = cleanup.attempt_record;
+    if attempt_record.generation != request.pre_binding.engine.generation()
+        || attempt_record.nonce != request.nonce()
+    {
+        return Err(CanaryEvidenceError::CleanupAttemptRecordMismatch);
+    }
+    if attempt_record.retired_at > attempt_record.absent_observed_at {
+        return Err(CanaryEvidenceError::CleanupAttemptRecordTimingInvalid);
+    }
+    validate_cleanup_timestamp(attempt_record.retired_at, attempt_completed_at, deadline)?;
+    validate_cleanup_timestamp(
+        attempt_record.absent_observed_at,
+        attempt_completed_at,
+        deadline,
+    )?;
+    if attempt_record.retired_at < cleanup_settled_at {
+        return Err(CanaryEvidenceError::CleanupAttemptRecordRetiredBeforePeerReap);
+    }
+    cleanup_settled_at = attempt_record.absent_observed_at;
+
     if cleanup.retained_facility != environment.facility {
         return Err(CanaryEvidenceError::CleanupFacilityChanged);
+    }
+    validate_cleanup_timestamp(
+        cleanup.retained_facility_observed_at,
+        attempt_completed_at,
+        deadline,
+    )?;
+    if cleanup.retained_facility_observed_at < cleanup_settled_at {
+        return Err(CanaryEvidenceError::CleanupFacilityObservedBeforeSettlement);
+    }
+    Ok(())
+}
+
+fn retirement_timing_is_ordered(evidence: CanaryProcessRetirementEvidence) -> bool {
+    evidence.quiesced_at <= evidence.terminated_at && evidence.terminated_at <= evidence.reaped_at
+}
+
+fn validate_cleanup_timestamp(
+    observed_at: Instant,
+    attempt_completed_at: Instant,
+    deadline: CanaryDeadline,
+) -> Result<(), CanaryEvidenceError> {
+    if observed_at >= deadline.expires_at() {
+        return Err(CanaryEvidenceError::CleanupTimingAtOrAfterDeadline);
+    }
+    if observed_at > attempt_completed_at {
+        return Err(CanaryEvidenceError::CleanupTimingAfterGateCompletion);
     }
     Ok(())
 }
@@ -4956,6 +5276,37 @@ pub(crate) mod tests {
                     };
             }
         }
+        assert_eq!(
+            validate(&mixed_fixture, qualified.clone())
+                .expect_err("BPF authority cannot fabricate report-object retirement"),
+            CanaryEvidenceError::CleanupListenerDeliveryReportDispositionMismatch
+        );
+        qualified.cleanup.listener_delivery_report =
+            CanaryListenerDeliveryReportCleanupEvidence::verified_never_created(
+                mixed_fixture
+                    .request
+                    .pre_binding
+                    .environment
+                    .attempt_objects
+                    .listener_delivery_report(),
+                mixed_fixture.request.deadline().started_at() + Duration::from_millis(123),
+            );
+        let mut premature_never_created_readback = qualified.clone();
+        let CanaryListenerDeliveryReportCleanupEvidence::VerifiedNeverCreated {
+            absent_observed_at,
+            ..
+        } = &mut premature_never_created_readback
+            .cleanup
+            .listener_delivery_report
+        else {
+            panic!("qualified BPF fixture verifies the report object was never created");
+        };
+        *absent_observed_at = mixed_fixture.request.deadline().started_at();
+        assert_eq!(
+            validate(&mixed_fixture, premature_never_created_readback)
+                .expect_err("BPF report-object absence must follow the final delivery"),
+            CanaryEvidenceError::CleanupListenerDeliveryReportNeverCreatedObservedBeforeFinalDelivery
+        );
         validate(&mixed_fixture, qualified)
             .expect("one exact qualified cgroup-BPF authority may prove every delivery");
 
@@ -5543,7 +5894,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn completion_at_deadline_and_uncertain_cleanup_are_rejected() {
+    fn completion_at_deadline_and_invalid_cleanup_are_rejected() {
         let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
         let mut late = fixture.successful_evidence();
         late.completed_at = fixture.request.deadline().expires_at();
@@ -5553,10 +5904,11 @@ pub(crate) mod tests {
         );
 
         let mut uncertain = fixture.successful_evidence();
-        uncertain.cleanup.client_reaped = false;
+        uncertain.cleanup.client.reaped_at =
+            uncertain.cleanup.client.quiesced_at - Duration::from_nanos(1);
         assert_eq!(
             validate(&fixture, uncertain).expect_err("cleanup uncertainty cannot pass"),
-            CanaryEvidenceError::CleanupClientNotReaped
+            CanaryEvidenceError::CleanupClientRetirementTimingInvalid
         );
 
         let mut recursion = fixture.successful_evidence();
@@ -5564,6 +5916,223 @@ pub(crate) mod tests {
         assert_eq!(
             validate(&fixture, recursion).expect_err("recapture delta cannot pass"),
             CanaryEvidenceError::RecaptureCounterDeltaOutOfRange { observed: 1 }
+        );
+    }
+
+    #[test]
+    fn cleanup_evidence_binds_exact_objects_and_documented_chronology() {
+        let fixture = Fixture::new(CanaryAddressFamilies::Ipv4AndIpv6);
+
+        let mut before_flow_completion = fixture.successful_evidence();
+        let last_flow_completed_at = before_flow_completion
+            .flows
+            .slots
+            .iter()
+            .flatten()
+            .map(|flow| flow.completed_at)
+            .max()
+            .expect("dual-stack fixture has required flows");
+        before_flow_completion.cleanup.client.quiesced_at =
+            last_flow_completed_at - Duration::from_nanos(1);
+        assert_eq!(
+            validate(&fixture, before_flow_completion)
+                .expect_err("the client must remain live through the final flow"),
+            CanaryEvidenceError::CleanupClientQuiescedBeforeFlowCompletion
+        );
+
+        let mut wrong_report_object = fixture.successful_evidence();
+        supervised_report_retirement_mut(&mut wrong_report_object).object = fixture
+            .request
+            .pre_binding
+            .environment
+            .attempt_objects
+            .selector();
+        assert_eq!(
+            validate(&fixture, wrong_report_object)
+                .expect_err("a copied selector identity cannot retire the report object"),
+            CanaryEvidenceError::CleanupObjectMismatch {
+                object: CanaryCleanupObjectRole::ListenerDeliveryReport,
+            }
+        );
+
+        let mut supervised_report_claimed_never_created = fixture.successful_evidence();
+        supervised_report_claimed_never_created
+            .cleanup
+            .listener_delivery_report =
+            CanaryListenerDeliveryReportCleanupEvidence::verified_never_created(
+                fixture
+                    .request
+                    .pre_binding
+                    .environment
+                    .attempt_objects
+                    .listener_delivery_report(),
+                fixture.request.deadline().started_at() + Duration::from_millis(123),
+            );
+        assert_eq!(
+            validate(&fixture, supervised_report_claimed_never_created)
+                .expect_err("a supervised report must carry retirement evidence"),
+            CanaryEvidenceError::CleanupListenerDeliveryReportDispositionMismatch
+        );
+
+        let mut absence_before_retirement = fixture.successful_evidence();
+        absence_before_retirement
+            .cleanup
+            .selector_retirement
+            .retired_at = absence_before_retirement
+            .cleanup
+            .selector_retirement
+            .absent_observed_at
+            + Duration::from_nanos(1);
+        assert_eq!(
+            validate(&fixture, absence_before_retirement)
+                .expect_err("absence readback cannot precede object retirement"),
+            CanaryEvidenceError::CleanupObjectRetirementTimingInvalid {
+                object: CanaryCleanupObjectRole::Selector,
+            }
+        );
+
+        let mut report_removed_before_delivery = fixture.successful_evidence();
+        let final_delivery_observed_at = report_removed_before_delivery
+            .flows
+            .slots
+            .iter()
+            .flatten()
+            .filter_map(|flow| {
+                flow.inbound_listener_delivery
+                    .as_ref()
+                    .and_then(UnqualifiedCanaryInboundListenerDeliveryEvidence::delivery_event)
+                    .map(|event| event.observed_at)
+            })
+            .max()
+            .expect("dual-stack fixture has authoritative delivery events");
+        supervised_report_retirement_mut(&mut report_removed_before_delivery).retired_at =
+            final_delivery_observed_at - Duration::from_nanos(1);
+        assert_eq!(
+            validate(&fixture, report_removed_before_delivery)
+                .expect_err("the report object must survive the final delivery event"),
+            CanaryEvidenceError::CleanupListenerDeliveryReportRetiredBeforeFinalDelivery
+        );
+
+        let mut counters_removed_before_readback = fixture.successful_evidence();
+        counters_removed_before_readback
+            .cleanup
+            .counters_retirement
+            .retired_at =
+            counters_removed_before_readback.counters.after_observed_at - Duration::from_nanos(1);
+        assert_eq!(
+            validate(&fixture, counters_removed_before_readback)
+                .expect_err("counter removal cannot precede final readback"),
+            CanaryEvidenceError::CleanupCountersRetiredBeforeFinalObservation
+        );
+
+        let mut object_removed_before_client_reap = fixture.successful_evidence();
+        object_removed_before_client_reap
+            .cleanup
+            .selector_retirement
+            .retired_at =
+            object_removed_before_client_reap.cleanup.client.reaped_at - Duration::from_nanos(1);
+        assert_eq!(
+            validate(&fixture, object_removed_before_client_reap)
+                .expect_err("attempt objects remain until the client is reaped"),
+            CanaryEvidenceError::CleanupObjectRetiredBeforeClientReap {
+                object: CanaryCleanupObjectRole::Selector,
+            }
+        );
+
+        let mut peer_stopped_before_object_removal = fixture.successful_evidence();
+        let report_absent_observed_at =
+            supervised_report_retirement_mut(&mut peer_stopped_before_object_removal)
+                .absent_observed_at;
+        peer_stopped_before_object_removal.cleanup.peer_servers[0].quiesced_at =
+            report_absent_observed_at - Duration::from_nanos(1);
+        assert_eq!(
+            validate(&fixture, peer_stopped_before_object_removal)
+                .expect_err("peer servers remain live until attempt objects are absent"),
+            CanaryEvidenceError::CleanupPeerServerQuiescedBeforeObjectAbsence { slot: 0 }
+        );
+
+        let mut engine_process_reused = fixture.successful_evidence();
+        let engine = fixture.request.pre_binding.engine.engine();
+        engine_process_reused.cleanup.client.process = CanaryProcessIdentity::new(
+            NonZeroU32::new(engine.pid()).expect("engine PID is nonzero"),
+            NonZeroU64::new(engine.start_time_ticks()).expect("engine start ticks are nonzero"),
+        );
+        assert_eq!(
+            validate(&fixture, engine_process_reused)
+                .expect_err("cleanup roles cannot reuse the supervised engine identity"),
+            CanaryEvidenceError::CleanupProcessIdentityCollision
+        );
+
+        let mut wrong_attempt_record = fixture.successful_evidence();
+        wrong_attempt_record.cleanup.attempt_record.nonce =
+            CanaryNonce::from_bytes([9; FUNCTIONAL_CANARY_NONCE_BYTES]);
+        assert_eq!(
+            validate(&fixture, wrong_attempt_record)
+                .expect_err("cleanup must retire the exact attempt record"),
+            CanaryEvidenceError::CleanupAttemptRecordMismatch
+        );
+
+        let mut attempt_record_retired_before_peer_reap = fixture.successful_evidence();
+        attempt_record_retired_before_peer_reap
+            .cleanup
+            .attempt_record
+            .retired_at = attempt_record_retired_before_peer_reap.cleanup.peer_servers
+            [CANARY_PEER_SERVER_SLOTS - 1]
+            .reaped_at
+            - Duration::from_nanos(1);
+        assert_eq!(
+            validate(&fixture, attempt_record_retired_before_peer_reap)
+                .expect_err("the attempt record outlives all peer servers"),
+            CanaryEvidenceError::CleanupAttemptRecordRetiredBeforePeerReap
+        );
+
+        let mut facility_observed_before_settlement = fixture.successful_evidence();
+        facility_observed_before_settlement
+            .cleanup
+            .retained_facility_observed_at =
+            facility_observed_before_settlement.cleanup.peer_servers[CANARY_PEER_SERVER_SLOTS - 1]
+                .reaped_at
+                - Duration::from_nanos(1);
+        assert_eq!(
+            validate(&fixture, facility_observed_before_settlement)
+                .expect_err("facility readback must follow complete attempt cleanup"),
+            CanaryEvidenceError::CleanupFacilityObservedBeforeSettlement
+        );
+
+        let mut cleanup_after_gate = fixture.successful_evidence();
+        cleanup_after_gate.cleanup.retained_facility_observed_at =
+            cleanup_after_gate.completed_at + Duration::from_nanos(1);
+        assert_eq!(
+            validate(&fixture, cleanup_after_gate)
+                .expect_err("cleanup evidence cannot postdate gate completion"),
+            CanaryEvidenceError::CleanupTimingAfterGateCompletion
+        );
+
+        let mut cleanup_at_deadline = fixture.successful_evidence();
+        cleanup_at_deadline.cleanup.retained_facility_observed_at =
+            fixture.request.deadline().expires_at();
+        assert_eq!(
+            validate(&fixture, cleanup_at_deadline).expect_err("the cleanup deadline is exclusive"),
+            CanaryEvidenceError::CleanupTimingAtOrAfterDeadline
+        );
+    }
+
+    #[test]
+    fn attempt_object_roles_must_have_distinct_identities() {
+        let identity = CanaryAttemptObjectIdentity::new([1; CANARY_ATTEMPT_OBJECT_IDENTITY_BYTES])
+            .expect("nonzero attempt object identity");
+        assert_eq!(
+            CanaryAttemptObjectIdentities::new(
+                NonZeroU32::new(1).expect("generation"),
+                CanaryNonce::from_bytes([2; FUNCTIONAL_CANARY_NONCE_BYTES]),
+                identity,
+                identity,
+                CanaryAttemptObjectIdentity::new([3; CANARY_ATTEMPT_OBJECT_IDENTITY_BYTES])
+                    .expect("counter identity"),
+                CanaryAttemptObjectIdentity::new([4; CANARY_ATTEMPT_OBJECT_IDENTITY_BYTES])
+                    .expect("report identity"),
+            ),
+            Err(CanaryBindingError::AttemptObjectIdentityCollision)
         );
     }
 
@@ -5696,6 +6265,17 @@ pub(crate) mod tests {
                 &mut datagram.payload
             }
             _ => panic!("fixture uses TPROXY delivery evidence"),
+        }
+    }
+
+    fn supervised_report_retirement_mut(
+        evidence: &mut UnqualifiedCanaryGateEvidence,
+    ) -> &mut CanaryAttemptObjectRetirementEvidence {
+        match &mut evidence.cleanup.listener_delivery_report {
+            CanaryListenerDeliveryReportCleanupEvidence::Retired(retirement) => retirement,
+            CanaryListenerDeliveryReportCleanupEvidence::VerifiedNeverCreated { .. } => {
+                panic!("fixture uses supervised delivery-report cleanup")
+            }
         }
     }
 
@@ -6043,7 +6623,8 @@ pub(crate) mod tests {
                 .expect("counter identity"),
             CanaryAttemptObjectIdentity::new([15; CANARY_ATTEMPT_OBJECT_IDENTITY_BYTES])
                 .expect("listener delivery report identity"),
-        );
+        )
+        .expect("distinct attempt object identities");
         let network = CanaryNetworkObservationBinding::new(
             NetworkNamespaceIdentity::new(1, 101).expect("daemon namespace"),
             NetworkNamespaceIdentity::new(1, 102).expect("peer namespace"),
@@ -6102,24 +6683,69 @@ pub(crate) mod tests {
                 NonZeroU64::new(ticks).expect("nonzero canary process start ticks"),
             )
         };
+        let started_at = request.deadline().started_at();
         UnqualifiedCanaryCleanupEvidence::new(
             request.nonce(),
-            request.pre_binding.environment.attempt_objects,
-            process(60_001, 70_001),
-            true,
-            true,
-            true,
+            CanaryProcessRetirementEvidence::new(
+                process(60_001, 70_001),
+                started_at + Duration::from_millis(110),
+                started_at + Duration::from_millis(111),
+                started_at + Duration::from_millis(112),
+            ),
             [
-                process(60_002, 70_002),
-                process(60_003, 70_003),
-                process(60_004, 70_004),
+                CanaryProcessRetirementEvidence::new(
+                    process(60_002, 70_002),
+                    started_at + Duration::from_millis(130),
+                    started_at + Duration::from_millis(131),
+                    started_at + Duration::from_millis(132),
+                ),
+                CanaryProcessRetirementEvidence::new(
+                    process(60_003, 70_003),
+                    started_at + Duration::from_millis(133),
+                    started_at + Duration::from_millis(134),
+                    started_at + Duration::from_millis(135),
+                ),
+                CanaryProcessRetirementEvidence::new(
+                    process(60_004, 70_004),
+                    started_at + Duration::from_millis(136),
+                    started_at + Duration::from_millis(137),
+                    started_at + Duration::from_millis(138),
+                ),
             ],
-            [true; CANARY_PEER_SERVER_SLOTS],
-            [true; CANARY_PEER_SERVER_SLOTS],
-            true,
-            true,
-            true,
+            CanaryAttemptObjectRetirementEvidence::new(
+                request.pre_binding.environment.attempt_objects.selector(),
+                started_at + Duration::from_millis(116),
+                started_at + Duration::from_millis(120),
+            ),
+            CanaryAttemptObjectRetirementEvidence::new(
+                request.pre_binding.environment.attempt_objects.leak_guard(),
+                started_at + Duration::from_millis(117),
+                started_at + Duration::from_millis(121),
+            ),
+            CanaryAttemptObjectRetirementEvidence::new(
+                request.pre_binding.environment.attempt_objects.counters(),
+                started_at + Duration::from_millis(118),
+                started_at + Duration::from_millis(122),
+            ),
+            CanaryListenerDeliveryReportCleanupEvidence::retired(
+                CanaryAttemptObjectRetirementEvidence::new(
+                    request
+                        .pre_binding
+                        .environment
+                        .attempt_objects
+                        .listener_delivery_report(),
+                    started_at + Duration::from_millis(119),
+                    started_at + Duration::from_millis(123),
+                ),
+            ),
+            CanaryAttemptRecordRetirementEvidence::new(
+                request.pre_binding.engine.generation(),
+                request.nonce(),
+                started_at + Duration::from_millis(140),
+                started_at + Duration::from_millis(141),
+            ),
             request.pre_binding.environment.facility,
+            started_at + Duration::from_millis(150),
         )
     }
 

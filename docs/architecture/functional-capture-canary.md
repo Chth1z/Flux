@@ -220,15 +220,35 @@ functional pass.
    failure injection, deadline, stale-identity, cleanup, retry, restart, resynchronization, and
    rollback tests. Existing structural verification remains a separate prerequisite, and protocol
    version 3 exposes the orthogonal verification result without enabling the production gate.
-2. Implement a privileged Linux network-namespace integration harness with real TCP, UDP, DNS,
-   loop-escape, IPv4, and IPv6 flows. This proves the transaction and test topology, not Android
-   compatibility.
+2. **In progress:** the first privileged Linux namespace checkpoint exercises real dual-stack TCP,
+   UDP, and DNS traffic and independently verifies exact topology cleanup. TPROXY traversal,
+   distinct engine/probe UID loop escape, counter bounds, INET_DIAG identity, and the complete
+   model `validate_for` path remain pending. Even after those pieces land, this stage proves the
+   transaction and test topology rather than Android compatibility.
 3. Add an Android lab adapter that reports explicit `unsupported`, `denied`, `conflicting`,
    `broken`, or `unknown` evidence. It remains diagnostic-only until exact-device qualification.
 4. Permit TPROXY `RUNNING` only for reviewed device profiles whose functional canary passes the
    real-device matrix and cleanup/crash tests. Other profiles remain unqualified; broaden the
    reviewed set without weakening the probe. TUN remains rejected until its separate
    single-route-owner and forced-death cleanup canaries pass.
+
+Invoke the Stage-2 checkpoint separately from ordinary CI:
+
+```text
+cargo xtask test-functional-canary-linux
+FLUX_LINUX_CANARY_REQUIRED=1 cargo xtask test-functional-canary-linux
+```
+
+The task selects the exact ignored test
+`functional_canary::linux_namespace_harness::privileged_dual_stack_canary_exercises_real_topology_and_cleanup`
+and runs it with one test thread. `FLUX_LINUX_CANARY_REQUIRED` accepts only `0` or `1`: optional
+mode reports unavailable or denied outer preflight prerequisites as an explicit skip, while
+required mode fails. Once isolated mutation begins, later setup or capability errors fail in both
+modes so cleanup uncertainty cannot be mistaken for an unavailable host. The task does not invoke
+`sudo`; the Rust harness owns authoritative isolation and capability
+preflight. It also removes all harness-internal mode, configuration, token, and outer-namespace
+variables before invoking Cargo, so caller state cannot bypass the outer preflight. This command
+is deliberately excluded from `cargo xtask ci`.
 
 Until stage 4 is evidenced, Flux must describe Phase 1 capture verification as structural and the
 functional exit gate as incomplete. Host tests, Linux namespaces, or successful counters do not

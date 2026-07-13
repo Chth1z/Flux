@@ -2741,6 +2741,9 @@ fn bounded_prefix(diagnostic: &str) -> String {
     diagnostic[..end].to_owned()
 }
 
+#[cfg(all(test, target_os = "linux"))]
+mod linux_namespace_harness;
+
 #[cfg(test)]
 pub(crate) mod tests {
     use std::fs;

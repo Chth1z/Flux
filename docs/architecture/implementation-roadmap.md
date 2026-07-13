@@ -16,7 +16,7 @@ This roadmap turns the [blueprint](fluxd-blueprint.md) and [technical specificat
 The next checkpoint is not a single linear Phase 3 task. Three bounded lanes may proceed in parallel,
 but correctness gates retain strict ordering:
 
-1. **Bridge safety:** the `100.64.0.0/10`, mandatory-exclusion, empty allow/deny, TUN-rejection, and converged-`addrsyncd` readiness checkpoints are complete. The Stage-1 [Generation-scoped functional capture canary](functional-capture-canary.md) model, coordinator ordering, lifecycle tests, and protocol-v3 verification status are complete; production still explicitly selects structural-only compatibility. Next, build the privileged Linux namespace harness and repair legacy status/migration and package provenance. Retain the TUN rejection until one exact routing owner passes readback and forced-death cleanup canaries.
+1. **Bridge safety:** the `100.64.0.0/10`, mandatory-exclusion, empty allow/deny, TUN-rejection, and converged-`addrsyncd` readiness checkpoints are complete. The Stage-1 [Generation-scoped functional capture canary](functional-capture-canary.md) model, coordinator ordering, lifecycle tests, and protocol-v3 verification status are complete; production still explicitly selects structural-only compatibility. The first privileged Linux namespace checkpoint now proves the isolated dual-stack TCP/UDP/DNS topology and exact cleanup. Next, complete its TPROXY, distinct-UID loop-escape, counter, INET_DIAG, and model-validation executor work while repairing legacy status/migration and package provenance. Retain the TUN rejection until one exact routing owner passes readback and forced-death cleanup canaries.
 2. **Native Phase 3 correctness:** add exact device/artifact identity; select positive mark policies from a compile-time reviewed stable artifact catalog and then bind them to boot/namespace freshness; complete the remaining 24 census cells and point-in-time coordinator; prove writer semantics, observer continuity, mark preservation, domain/network-selection handoff, and route reachability; only then allocate priorities/tables/marks or mutate the kernel.
 3. **Optional eBPF research:** implement the exact `xt_bpf` probe and observation design without delaying the first two lanes. Positive acceleration waits for the Rust xtables compiler, a complete conventional classifier, parity evidence, and device benchmarks.
 
@@ -64,7 +64,7 @@ After the Capability Profile admits mutation, startup invokes bounded `startup-r
 
 Direct Sing-Box and phase-shell children arm `PR_SET_PDEATHSIG(SIGKILL)` with a parent-race check. This contains direct children on daemon death, not whole process trees: phase descendants do not inherit it and BusyBox credential changes may clear it, which is why BusyBox generations require quarantine rather than automatic restart.
 
-Still deferred are the privileged namespace executor and Android adapter/qualification for the delivered functional-canary transaction, an exact-device TUN single-owner and forced-death route-cleanup canary, ancestor-safe `openat`/`openat2` traversal, long-term Generation-log retention/rotation, pidfd/timerfd integration into the reactor, post-credential/process-cgroup containment, and real Android 5.10 release-gate evidence. Netlink and BPF reactor sources remain assigned to later phases.
+Still deferred are the remaining privileged namespace executor layers and Android adapter/qualification for the delivered functional-canary transaction, an exact-device TUN single-owner and forced-death route-cleanup canary, ancestor-safe `openat`/`openat2` traversal, long-term Generation-log retention/rotation, pidfd/timerfd integration into the reactor, post-credential/process-cgroup containment, and real Android 5.10 release-gate evidence. Netlink and BPF reactor sources remain assigned to later phases.
 
 ### Deliverables
 
@@ -431,7 +431,7 @@ Before a backend may be selected automatically, its documentation must include:
 ## Immediate implementation backlog
 
 1. Keep the Rust-owned bridge TUN rejection until an exact Flux or Sing-Box owner passes route readback and forced-death cleanup canaries; then replace the rejection with that single proven owner.
-2. Build the privileged Linux namespace executor for the delivered Generation-scoped TCP/UDP/DNS and loop-canary transaction, then implement the explicit Android adapter and qualification matrix.
+2. Complete the privileged Linux namespace executor for the delivered Generation-scoped TCP/UDP/DNS and loop-canary transaction, then implement the explicit Android adapter and qualification matrix.
 3. Repair legacy CLI status, installation migration, and package/source manifest provenance.
 4. Capture the current real-device baseline and replace every placeholder evidence field.
 5. Build and persist the exact versioned Sing-Box Engine Capability Profile before compiling any final Generation.

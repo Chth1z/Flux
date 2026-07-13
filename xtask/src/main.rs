@@ -7,6 +7,15 @@ use std::process::{Command, ExitStatus};
 const ANDROID_TARGET: &str = "aarch64-linux-android";
 const ANDROID_API_LEVEL: &str = "31";
 const ANDROID_NDK_REVISION: &str = "27.3.13750724";
+const LINUX_CANARY_REQUIRED_ENV: &str = "FLUX_LINUX_CANARY_REQUIRED";
+const LINUX_CANARY_TEST: &str = "functional_canary::linux_namespace_harness::privileged_dual_stack_canary_exercises_real_topology_and_cleanup";
+const LINUX_CANARY_INTERNAL_ENVS: [&str; 5] = [
+    "FLUX_LINUX_CANARY_HARNESS_MODE",
+    "FLUX_LINUX_CANARY_HARNESS_CONFIG",
+    "FLUX_LINUX_CANARY_REENTRY_TOKEN",
+    "FLUX_LINUX_CANARY_OUTER_NETNS",
+    "FLUX_LINUX_CANARY_OUTER_USERNS",
+];
 
 fn main() {
     if let Err(error) = run(env::args_os().skip(1)) {
@@ -60,6 +69,10 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
             require_no_arguments(&arguments)?;
             build_android()
         }
+        "test-functional-canary-linux" => {
+            require_no_arguments(&arguments)?;
+            test_functional_canary_linux()
+        }
         "stage-module" => stage_module(parse_stage_module_options(&arguments)?),
         "ci" => {
             require_no_arguments(&arguments)?;
@@ -82,6 +95,79 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
         unknown => Err(format!(
             "unknown command '{unknown}'; run `cargo xtask help`"
         )),
+    }
+}
+
+fn test_functional_canary_linux() -> Result<(), String> {
+    let required = linux_canary_required()?;
+    if env::consts::OS != "linux" {
+        return linux_canary_skip_or_fail(
+            required,
+            "the functional canary harness requires a Linux host",
+        );
+    }
+
+    let listed = cargo_stdout([
+        "test",
+        "-p",
+        "fluxd",
+        "--lib",
+        LINUX_CANARY_TEST,
+        "--",
+        "--ignored",
+        "--exact",
+        "--list",
+    ])?;
+    if !linux_canary_test_is_listed(&listed) {
+        return linux_canary_skip_or_fail(
+            required,
+            "the privileged Linux functional-canary harness is not implemented in this checkout",
+        );
+    }
+
+    cargo_scrubbed([
+        "test",
+        "-p",
+        "fluxd",
+        "--lib",
+        LINUX_CANARY_TEST,
+        "--",
+        "--ignored",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1",
+    ])
+}
+
+fn linux_canary_required() -> Result<bool, String> {
+    match env::var(LINUX_CANARY_REQUIRED_ENV) {
+        Ok(value) => parse_linux_canary_required(Some(&value)),
+        Err(env::VarError::NotPresent) => parse_linux_canary_required(None),
+        Err(env::VarError::NotUnicode(_)) => Err(format!(
+            "{LINUX_CANARY_REQUIRED_ENV} must contain valid UTF-8"
+        )),
+    }
+}
+
+fn parse_linux_canary_required(value: Option<&str>) -> Result<bool, String> {
+    match value {
+        None | Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(_) => Err(format!("{LINUX_CANARY_REQUIRED_ENV} must be 0 or 1")),
+    }
+}
+
+fn linux_canary_test_is_listed(listing: &str) -> bool {
+    let expected = format!("{LINUX_CANARY_TEST}: test");
+    listing.lines().any(|line| line.trim() == expected)
+}
+
+fn linux_canary_skip_or_fail(required: bool, reason: &str) -> Result<(), String> {
+    if required {
+        Err(reason.to_owned())
+    } else {
+        eprintln!("SKIP: {reason}");
+        Ok(())
     }
 }
 
@@ -353,6 +439,43 @@ fn cargo<const N: usize>(args: [&str; N], envs: &[(&str, &std::ffi::OsStr)]) -> 
     require_success(&rendered, status)
 }
 
+fn cargo_stdout<const N: usize>(args: [&str; N]) -> Result<String, String> {
+    let rendered = format!("cargo {}", args.join(" "));
+    let mut command = Command::new("cargo");
+    command.args(args);
+    scrub_linux_canary_internal_environment(&mut command);
+    let output = command
+        .output()
+        .map_err(|error| format!("failed to execute `{rendered}`: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "`{rendered}` exited with {}: {}",
+            output.status,
+            stderr.trim()
+        ));
+    }
+    String::from_utf8(output.stdout)
+        .map_err(|error| format!("`{rendered}` produced non-UTF-8 test-list output: {error}"))
+}
+
+fn cargo_scrubbed<const N: usize>(args: [&str; N]) -> Result<(), String> {
+    let rendered = format!("cargo {}", args.join(" "));
+    let mut command = Command::new("cargo");
+    command.args(args);
+    scrub_linux_canary_internal_environment(&mut command);
+    let status = command
+        .status()
+        .map_err(|error| format!("failed to execute `{rendered}`: {error}"))?;
+    require_success(&rendered, status)
+}
+
+fn scrub_linux_canary_internal_environment(command: &mut Command) {
+    for variable in LINUX_CANARY_INTERNAL_ENVS {
+        command.env_remove(variable);
+    }
+}
+
 fn require_success(command: &str, status: ExitStatus) -> Result<(), String> {
     if status.success() {
         Ok(())
@@ -372,7 +495,46 @@ fn print_help() {
            clippy         Run Clippy with warnings denied\n\
            check-android  Type-check fluxd for aarch64-linux-android\n\
            build-android  Build release fluxd with NDK {ANDROID_NDK_REVISION}, API {ANDROID_API_LEVEL}\n\
+           test-functional-canary-linux  Run the opt-in ignored privileged Linux canary checkpoint\n\
            stage-module   Build and stage a Magisk tree; requires --stage DIR --runtime-binaries DIR\n\
            ci             Run all checks that do not require an NDK linker"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn linux_canary_required_contract_accepts_only_zero_one_or_unset() {
+        assert_eq!(parse_linux_canary_required(None), Ok(false));
+        assert_eq!(parse_linux_canary_required(Some("0")), Ok(false));
+        assert_eq!(parse_linux_canary_required(Some("1")), Ok(true));
+        assert!(parse_linux_canary_required(Some("true")).is_err());
+    }
+
+    #[test]
+    fn linux_canary_listing_requires_the_exact_ignored_test_name() {
+        let exact = format!("{LINUX_CANARY_TEST}: test\n");
+        assert!(linux_canary_test_is_listed(&exact));
+        assert!(!linux_canary_test_is_listed(
+            "functional_canary::linux_namespace_harness::other: test\n"
+        ));
+    }
+
+    #[test]
+    fn linux_canary_invocation_scrubs_internal_reentry_environment() {
+        let mut command = Command::new("cargo");
+        for variable in LINUX_CANARY_INTERNAL_ENVS {
+            command.env(variable, "hostile-parent-value");
+        }
+
+        scrub_linux_canary_internal_environment(&mut command);
+
+        for variable in LINUX_CANARY_INTERNAL_ENVS {
+            assert!(command.get_envs().any(|(name, value)| {
+                name == std::ffi::OsStr::new(variable) && value.is_none()
+            }));
+        }
+    }
 }

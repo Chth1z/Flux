@@ -54,6 +54,32 @@ sh tests/shell/run-dispatcher-tests.sh
 
 Local hosts without Bubblewrap report a skip. CI sets `FLUX_DISPATCHER_TESTS_REQUIRED=1`, making an unavailable or prohibited Bubblewrap environment a failure.
 
+The privileged Linux functional-canary harness is an independent opt-in checkpoint and is not part
+of `cargo xtask ci`:
+
+```text
+cargo xtask test-functional-canary-linux
+FLUX_LINUX_CANARY_REQUIRED=1 cargo xtask test-functional-canary-linux
+```
+
+The command selects only the ignored test
+`functional_canary::linux_namespace_harness::privileged_dual_stack_canary_exercises_real_topology_and_cleanup`
+with exact matching, `--nocapture`, and one test thread. With
+`FLUX_LINUX_CANARY_REQUIRED` unset or `0`, an unsupported host, an unavailable checkpoint, or an
+outer preflight prerequisite denial before mutation is an explicit skip. Setting it to `1` makes
+every such condition a failure; other values are rejected. Failures after isolated mutation begins
+remain failures in either mode. The task never invokes `sudo`, and the ignored
+Rust test owns the authoritative isolation, capability, and cleanup preflight. The task removes
+all harness-internal mode, configuration, token, and outer-namespace variables from its Cargo
+children so inherited caller state cannot bypass the outer preflight or select an internal
+re-entry mode.
+
+Stage 2 is still in progress. The first checkpoint exercises real dual-stack TCP, UDP, and DNS
+traffic in an isolated Linux topology and independently checks exact cleanup. It does not yet
+exercise the Flux TPROXY path, distinct engine/probe UID loop escape, counter bounds, INET_DIAG
+socket identity, or the complete model `validate_for` path, and therefore is not functional or
+Android qualification.
+
 Host execution of `addrsyncd` requires Linux or Android. On Windows, use the Android cross-check and run its host tests in Linux CI.
 
 ## Android release build
@@ -144,4 +170,4 @@ Every phase process has a nonzero execution deadline capped at 60 seconds. The R
 
 On daemon startup, the Capability Profile first decides whether mutation is admissible. An admitted runtime runs the bounded `startup-recover` phase before strict `flux.toml` loading, so a broken current configuration cannot strand same-boot capture; recovery must also succeed before administrative intent is read, persisted, or executed and before the control socket is admitted. Below-floor or unverified profiles stay on the non-mutating read-only path and never invoke recovery. Recovery is serialized by the dispatcher lock. With no lease and no capture evidence it idempotently publishes `STOPPED`. A same-boot Rust lease removes the exact active generation, or uses the immutable prepared generation for markerless partial activation, then stops TPROXY before address synchronization and proves capture evidence absent. For a direct engine launch, `PDEATHSIG` supplies the child-death proof, so recovery publishes `STOPPED`, clears active/previous/verification records, and releases the lease. For `busybox-setuidgid`, child death cannot be proven after daemon loss: recovery publishes `FAILED` only after detachment, preserves the Rust lease and active engine generation, and blocks automatic daemon restart for explicit repair. Cleanup failure likewise preserves evidence and ownership. Same-boot legacy ownership is rejected without mutation; prior-boot evidence is retired without treating kernel objects as surviving the reboot.
 
-Phase 1 `capture-verify` proves shell-owned structural evidence; the always-on owner bypass prevents the default self-capture omission but is not itself a synthetic end-to-end traffic or exact-process loop-prevention proof. The Stage-1 typed canary model, coordinator ordering, failure injection, and status contract are delivered. Deferred are the privileged namespace executor, Android adapter and device qualification, ancestor-safe directory traversal with `openat`/`openat2`, long-term retention/rotation policy for Generation logs, a pidfd/timerfd reactor, full process-tree containment, and real-device release evidence on the minimum Android 5.10 kernel.
+Phase 1 `capture-verify` proves shell-owned structural evidence; the always-on owner bypass prevents the default self-capture omission but is not itself a synthetic end-to-end traffic or exact-process loop-prevention proof. The Stage-1 typed canary model, coordinator ordering, failure injection, and status contract are delivered, along with the first Stage-2 isolated topology checkpoint. Deferred are the remaining privileged namespace executor layers, Android adapter and device qualification, ancestor-safe directory traversal with `openat`/`openat2`, long-term retention/rotation policy for Generation logs, a pidfd/timerfd reactor, full process-tree containment, and real-device release evidence on the minimum Android 5.10 kernel.

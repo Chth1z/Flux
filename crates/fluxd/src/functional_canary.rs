@@ -2865,9 +2865,10 @@ impl UnqualifiedCanaryCounterEvidence {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) struct UnqualifiedCanaryGateEvidence {
     request: CanaryAttemptRequest,
+    local_output_capture_receipt: local_output::TproxyLocalOutputCaptureReceipt,
     completed_at: Instant,
     flows: UnqualifiedCanaryFlowEvidenceSlots,
     unexpected_flow_count: u8,
@@ -2877,9 +2878,11 @@ pub(crate) struct UnqualifiedCanaryGateEvidence {
 }
 
 impl UnqualifiedCanaryGateEvidence {
+    #[allow(clippy::too_many_arguments)]
     #[must_use]
-    pub(crate) const fn new(
+    pub(in crate::functional_canary) const fn new(
         request: CanaryAttemptRequest,
+        local_output_capture_receipt: local_output::TproxyLocalOutputCaptureReceipt,
         completed_at: Instant,
         flows: UnqualifiedCanaryFlowEvidenceSlots,
         unexpected_flow_count: u8,
@@ -2889,6 +2892,7 @@ impl UnqualifiedCanaryGateEvidence {
     ) -> Self {
         Self {
             request,
+            local_output_capture_receipt,
             completed_at,
             flows,
             unexpected_flow_count,
@@ -2929,6 +2933,14 @@ impl UnqualifiedCanaryGateEvidence {
             });
         }
         validate_flow_evidence(expected, &self.flows, self.completed_at)?;
+        self.local_output_capture_receipt
+            .validate_for(
+                expected,
+                &self.flows,
+                self.completed_at,
+                self.cleanup.client.quiesced_at,
+            )
+            .map_err(|_| CanaryEvidenceError::LocalOutputCaptureReceiptInvalid)?;
         validate_loop_evidence(expected, &self.flows, &self.loop_escape)?;
         validate_counter_evidence(expected, &self.flows, self.completed_at, self.counters)?;
         validate_cleanup_evidence(
@@ -3126,6 +3138,7 @@ pub(crate) enum CanaryEvidenceError {
     UnexpectedFlows {
         count: u8,
     },
+    LocalOutputCaptureReceiptInvalid,
     MissingOutboundLoopEvidence {
         flow: CanaryFlow,
     },
@@ -4659,6 +4672,22 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn gate_rejects_a_local_output_capture_receipt_from_another_attempt() {
+        let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+        let other = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+        let other_flows = flow_slots(&other.request);
+        let mut evidence = fixture.successful_evidence();
+        evidence.local_output_capture_receipt =
+            local_output::TproxyLocalOutputCaptureReceipt::scripted(&other.request, &other_flows);
+
+        assert_eq!(
+            validate(&fixture, evidence)
+                .expect_err("a capture receipt cannot be replayed across attempts"),
+            CanaryEvidenceError::LocalOutputCaptureReceiptInvalid
+        );
+    }
+
+    #[test]
     fn inbound_listener_delivery_is_required_and_backend_specific() {
         let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
         let flow = CanaryFlow::Ipv4TcpEcho;
@@ -5096,6 +5125,11 @@ pub(crate) mod tests {
         let mut independent_sequences = fixture.successful_evidence();
         tproxy_delivery_event_mut(&mut independent_sequences, first).sequence =
             NonZeroU64::new(1).expect("independent delivery sequence");
+        independent_sequences.local_output_capture_receipt =
+            local_output::TproxyLocalOutputCaptureReceipt::scripted(
+                &fixture.request,
+                &independent_sequences.flows,
+            );
         validate(&fixture, independent_sequences)
             .expect("listener-observer and delivery-authority sequence domains are independent");
 
@@ -5267,20 +5301,29 @@ pub(crate) mod tests {
             .environment
             .authority
             .socket_observer = qualified_observer;
-        let mut qualified = mixed_fixture.successful_evidence();
-        for flow in CanaryFlow::ALL {
-            if mixed_fixture.request.requires_flow(flow) {
-                tproxy_delivery_event_mut(&mut qualified, flow).authority =
-                    CanaryInboundDeliveryAuthority::QualifiedCgroupBpf {
-                        observer: qualified_observer,
-                    };
+        let qualified_evidence = || {
+            let mut evidence = mixed_fixture.successful_evidence();
+            for flow in CanaryFlow::ALL {
+                if mixed_fixture.request.requires_flow(flow) {
+                    tproxy_delivery_event_mut(&mut evidence, flow).authority =
+                        CanaryInboundDeliveryAuthority::QualifiedCgroupBpf {
+                            observer: qualified_observer,
+                        };
+                }
             }
-        }
+            evidence.local_output_capture_receipt =
+                local_output::TproxyLocalOutputCaptureReceipt::scripted(
+                    &mixed_fixture.request,
+                    &evidence.flows,
+                );
+            evidence
+        };
         assert_eq!(
-            validate(&mixed_fixture, qualified.clone())
+            validate(&mixed_fixture, qualified_evidence())
                 .expect_err("BPF authority cannot fabricate report-object retirement"),
             CanaryEvidenceError::CleanupListenerDeliveryReportDispositionMismatch
         );
+        let mut qualified = qualified_evidence();
         qualified.cleanup.listener_delivery_report =
             CanaryListenerDeliveryReportCleanupEvidence::verified_never_created(
                 mixed_fixture
@@ -5291,7 +5334,19 @@ pub(crate) mod tests {
                     .listener_delivery_report(),
                 mixed_fixture.request.deadline().started_at() + Duration::from_millis(123),
             );
-        let mut premature_never_created_readback = qualified.clone();
+        let mut premature_never_created_readback = qualified_evidence();
+        premature_never_created_readback
+            .cleanup
+            .listener_delivery_report =
+            CanaryListenerDeliveryReportCleanupEvidence::verified_never_created(
+                mixed_fixture
+                    .request
+                    .pre_binding
+                    .environment
+                    .attempt_objects
+                    .listener_delivery_report(),
+                mixed_fixture.request.deadline().started_at() + Duration::from_millis(123),
+            );
         let CanaryListenerDeliveryReportCleanupEvidence::VerifiedNeverCreated {
             absent_observed_at,
             ..
@@ -5937,7 +5992,7 @@ pub(crate) mod tests {
         assert_eq!(
             validate(&fixture, before_flow_completion)
                 .expect_err("the client must remain live through the final flow"),
-            CanaryEvidenceError::CleanupClientQuiescedBeforeFlowCompletion
+            CanaryEvidenceError::LocalOutputCaptureReceiptInvalid
         );
 
         let mut wrong_report_object = fixture.successful_evidence();
@@ -6447,8 +6502,11 @@ pub(crate) mod tests {
             );
             let counters = counter_evidence(&self.request);
             let cleanup = cleanup_evidence(&self.request);
+            let local_output_capture_receipt =
+                local_output::TproxyLocalOutputCaptureReceipt::scripted(&self.request, &flows);
             UnqualifiedCanaryGateEvidence::new(
                 self.request.clone(),
+                local_output_capture_receipt,
                 self.request.deadline().started_at() + Duration::from_millis(200),
                 flows,
                 0,

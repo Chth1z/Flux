@@ -954,7 +954,7 @@ Delivered Phase 1 supervision additionally requires:
 - a direct-child `PR_SET_PDEATHSIG(SIGKILL)` lease with a post-arm parent-identity race check for Sing-Box and phase-shell processes;
 - bounded TERM/KILL/reap, restart windows, exponential backoff, and retained ownership until disappearance is observed.
 
-The Phase 1 transaction rejects TUN during `prepare`, before engine admission or networking mutation. It also requires `xt_owner` before initialization and revalidates it from the generated capability cache; the current shell Capture Program sends every local OUTPUT policy through the application chain so the configured engine UID/GID bypass remains active even when application filtering is disabled. `ROUTING_MARK` is not accepted as equivalent authority because the bridge does not prove that the supervised engine applies it to its sockets. For admitted TPROXY state, start is `prepare` → engine admission → Generation-bound capture start → structural capture verification → configured functional gate → Generation-bound `RUNNING`, and stop is capture detach → engine stop/reap → `STOPPED`. The production daemon explicitly selects structural-only compatibility; required-mode tests execute the delivered Stage-1 exact-binding canary transaction, and the first Stage-2 Linux checkpoint now exercises the isolated dual-stack topology and cleanup without installing capture. Partial capture-start compensation retains Generation evidence until both networking writers prove cleanup; terminal publication and engine retirement are forbidden while detachment is uncertain. Reload prepares the candidate while the previous Generation remains active, preserves its pass on prepare-only failure, invalidates it before detachment, blocks replacement if detach fails, and attempts the previous immutable `EngineSpec` if candidate activation fails. An uncertain reload detach enters capture repair: prove full detachment, retain/reconcile the old engine, then republish and freshly verify that Generation. Publication failure, identity loss, repair/restoration, and address resynchronization require a fresh complete gate before retrying `RUNNING`. Candidate evidence never authorizes rollback publication. The current owner bypass is a compatibility loop-escape prerequisite; the socket-correlation collector, its prebound session and typed attempt-owned handoff transports, schema-v2 listener/delivery validator, temporal cleanup/retirement validator, and fail-closed TPROXY-only local-OUTPUT executor seam are delivered, while the explicit local-OUTPUT capture receipt, positive traffic producer, real attempt context and process-ownership binding, production observer/report factories, and Android device qualification remain open.
+The Phase 1 transaction rejects TUN during `prepare`, before engine admission or networking mutation. It also requires `xt_owner` before initialization and revalidates it from the generated capability cache; the current shell Capture Program sends every local OUTPUT policy through the application chain so the configured engine UID/GID bypass remains active even when application filtering is disabled. `ROUTING_MARK` is not accepted as equivalent authority because the bridge does not prove that the supervised engine applies it to its sockets. For admitted TPROXY state, start is `prepare` → engine admission → Generation-bound capture start → structural capture verification → configured functional gate → Generation-bound `RUNNING`, and stop is capture detach → engine stop/reap → `STOPPED`. The production daemon explicitly selects structural-only compatibility; required-mode tests execute the delivered Stage-1 exact-binding canary transaction, and the first Stage-2 Linux checkpoint now exercises the isolated dual-stack topology and cleanup without installing capture. Partial capture-start compensation retains Generation evidence until both networking writers prove cleanup; terminal publication and engine retirement are forbidden while detachment is uncertain. Reload prepares the candidate while the previous Generation remains active, preserves its pass on prepare-only failure, invalidates it before detachment, blocks replacement if detach fails, and attempts the previous immutable `EngineSpec` if candidate activation fails. An uncertain reload detach enters capture repair: prove full detachment, retain/reconcile the old engine, then republish and freshly verify that Generation. Publication failure, identity loss, repair/restoration, and address resynchronization require a fresh complete gate before retrying `RUNNING`. Candidate evidence never authorizes rollback publication. The current owner bypass is a compatibility loop-escape prerequisite; the socket-correlation collector, its prebound session and typed attempt-owned handoff transports, schema-v2 listener/delivery validator, temporal cleanup/retirement validator, fail-closed TPROXY-only local-OUTPUT executor seam, and explicit per-flow capture-receipt/verifier contract are delivered. The production receipt authority remains uninhabited; the positive traffic producer, real attempt context and process-handle/credential binding, production listener/report parser and factories, actual collector integration, and Android device qualification remain open.
 
 The delivered Linux evidence class is explicitly ingress-only. The command
 `cargo xtask test-functional-canary-linux-tproxy` selects the exact ignored test
@@ -1066,11 +1066,17 @@ for `sockaddr_in` or 28 for `sockaddr_in6`. Echo and DNS share one stable listen
 DNS binds the canonical query, nonce, transaction ID, question digest, length, and SHA-256, with an
 exact two-byte DNS/TCP length prefix.
 
-The schema-v2 `validate_for` path is complete, but authoritative construction is intentionally not
-available in production. Listener/delivery constructors remain private and test-only until a real
-observer/report factory proves an explicit local-OUTPUT capture receipt. A production-compiled
-executor/driver/factory seam exists, but the current xtables driver's prepared/raw type and factory
-input are uninhabited, so it cannot produce evidence. The separate Linux credential preflight now
+The schema-v2 `validate_for` path and the explicit local-OUTPUT capture-receipt contract are
+complete, but authoritative construction is intentionally not available in production. The
+non-cloneable receipt stores the exact request plus one fixed-slot event per required flow and
+validates the request-bound probe UID, nonce, tuple, payload, listener cookie, exact delivery event,
+unique sequence, unchanged loss baseline, and attempt/client/deadline chronology. Drivers return
+unverified capture proof and raw observations; a separate sealed verifier must mint receipt-bound
+artifacts before the evidence factory can run. The resulting gate record owns the receipt by value,
+and `validate_for` rechecks it against the exact retained flows and cleanup client lifetime. The
+production verifier authority and current xtables prepared/raw path remain uninhabited, and
+listener/delivery constructors remain private and test-only. The separate Linux credential
+preflight now
 proves exact singleton controller/probe/engine UID and GID maps, delegated nonzero role identities,
 empty groups, zero role capabilities, `NoNewPrivs`, and exact map/namespace readback. It sends no
 traffic, uses file-backed subordinate-ID discovery, and cannot publish `functional_passed`.
@@ -1091,8 +1097,14 @@ preparation is a read-only availability phase and returns only `Unsupported`, `D
 `VerifiedAbsent` or `Uncertain`. A post-preparation `NotRequired` or inconsistent uncertain result
 is promoted to `CleanupUncertain` with cleanup `Uncertain`.
 
-Drivers return raw observations and cannot directly return schema-v2 gate evidence. The private
-evidence factory is the only promotion boundary. The current xtables driver is zero-state, owns no
+Drivers return unverified capture proof plus raw observations and cannot directly return either a
+capture receipt or schema-v2 gate evidence. The sealed receipt verifier is the only boundary that
+may mint receipt-bound artifacts; the private evidence factory is the only later promotion
+boundary. Receipt validation binds the complete immutable request so Generation, boot, namespace,
+Network Epoch/snapshot, Capture Program, ownership, engine/listener, selector, nonce, and deadline
+cannot be replayed independently. Every required family/transport slot must then correlate its
+request UID, tuple, payload, listener cookie, and exact schema-v2 delivery event under unique
+loss-free sequence and monotonic-time bounds. The current xtables driver is zero-state, owns no
 networking writer, and always returns `Unsupported` before mutation because its local OUTPUT path
 only sets a mark while TPROXY exists in PREROUTING. It never emits TPROXY in OUTPUT and never falls
 back to REDIRECT/DNAT, promotes ingress PREROUTING evidence, infers success from counters or route
@@ -1106,13 +1118,15 @@ distinct selector/guard/counter retirement, authority-sensitive report-object re
 verified-never-created disposition, exact absence readback, final counter/report lifetime,
 attempt-record retirement, retained-facility observation, and complete gate/deadline chronology.
 Its process identities remain unqualified claims until the real attempt context binds them to
-attempt-owned process handles. A positive factory remains prohibited until
-it proves the local-OUTPUT traffic domain and capture receipt, exact probe and engine
-UID+GID/process credentials, those attempt-process ownership bindings, and real use of the
-delivered prebound socket-diagnostics handoff and collector identity/revision.
+attempt-owned process handles. A positive factory remains prohibited until one concrete verifier
+authority proves the local-OUTPUT traffic domain, exact probe and engine UID/GID/PID/start-tick/
+handle credentials are bound, a real listener observer and supervised report parser/factory exist,
+and the delivered prebound socket-diagnostics handoff performs actual collection under its exact
+collector identity/revision.
 Qualified cgroup-BPF remains an alternative only after its independent attachment, identity, loss,
 report-object never-created/absence disposition, and lifecycle contract are proven. Production
-daemon composition remains `StructuralOnlyCompatibility`.
+daemon composition remains `StructuralOnlyCompatibility`. Ordinary BPF counters or sampled events
+cannot mint a capture receipt, and production Flux neither loads nor unloads `.ko` modules.
 
 The parent-death lease is deliberately described as direct-child containment, not process-tree containment. Linux does not inherit `PDEATHSIG` across `fork`, and clears it when a later `setuidgid` transition changes effective or filesystem credentials. Direct-launch Sing-Box therefore supports automatic same-boot restart recovery. A crashed `busybox-setuidgid` generation is handled conservatively: startup recovery detaches capture, publishes `FAILED`, preserves the Rust ownership lease and active generation evidence, and refuses automatic daemon restart because stale child death cannot be proven. Phase descendants remain outside the direct-child guarantee. Full crash-time coverage requires a post-credential Rust launcher plus a verified Flux-owned process-cgroup containment design; those are deferred hardening and must be proven on Android before the broader guarantee is claimed.
 
@@ -1296,10 +1310,11 @@ It also rejects `.ko`, KPM, or other opaque kernel payloads in a production arti
 
 No compatibility stage may have two independent owners mutating the same kernel objects.
 
-Open Phase 1 hardening gates are the production schema-v2 evidence producer, local-OUTPUT executor,
-delivered outbound-collector integration, and Android adapter/qualification for the functional
-traffic/loop-prevention transaction. The exact Linux distinct-credential preflight, schema-v2
-validator, and strict `/proc` FD plus INET_DIAG collector prerequisite are complete. The preflight
+Open Phase 1 hardening gates are the production schema-v2 evidence producer, concrete local-OUTPUT
+receipt authority/executor, actual prebound INET_DIAG collector integration, and Android adapter/
+qualification for the functional traffic/loop-prevention transaction. The exact Linux distinct-
+credential preflight, schema-v2 validator, strict `/proc` FD plus INET_DIAG collector prerequisite,
+and per-flow capture-receipt/verifier contract are complete. The preflight
 explicitly skips or fails unavailable helpers/maps/group authority and rejects root/root or
 same-UID substitution, but it is not traffic qualification. Ingress evidence cannot discharge the
 local-OUTPUT gate, and REDIRECT/DNAT cannot qualify TPROXY. Also open are an exact-device TUN

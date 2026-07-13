@@ -615,14 +615,20 @@ every listener, and constant authority/loss baseline. Readiness evidence is
 only an admission input. The separate Linux credential preflight now proves exact nonzero
 probe/engine UID+GID roles, empty groups, zero role capabilities, and exact map/namespace readback
 without installing capture or sending traffic. Positive constructors remain private and test-only,
-while a production-compiled TPROXY-only executor/driver/factory seam now separates read-only
-availability, prepared execution, raw observation, and private evidence promotion. Its current
-zero-state xtables driver reports `Unsupported` with cleanup `NotRequired` before mutation because
-OUTPUT marking does not reach PREROUTING TPROXY; the prepared/raw type is uninhabited, so no
+while a production-compiled TPROXY-only executor/driver/verifier/factory seam now separates
+read-only availability, prepared execution, unverified capture proof, receipt-bound artifacts, and
+private evidence promotion. The completed non-cloneable per-flow receipt contract binds the exact
+request, probe UID, nonce, tuple, payload, listener cookie, authoritative delivery event, sequence/
+loss state, and chronology. The gate evidence owns that receipt and revalidates it with the retained
+flows and client cleanup lifetime. Its sealed production verifier authority remains uninhabited.
+The current zero-state xtables driver reports `Unsupported` with cleanup `NotRequired` before
+mutation because OUTPUT marking does not reach PREROUTING TPROXY; the prepared/raw type is
+uninhabited, so no
 positive evidence can be emitted. Required mode treats that result as a failed gate and never
-reaches `RUNNING`. Real local-OUTPUT capture receipts, observer/report factories, prebound collector
-use by a real attempt context, capability-qualified execution, and Android qualification remain
-separate gates.
+reaches `RUNNING`. Attempt-owned UID/GID/PID/start-tick/handle binding, observer/report parsing and
+factories, actual prebound collector use, a real traffic producer, capability-qualified execution,
+and Android qualification remain separate gates. A separately qualified cgroup-BPF authority is
+optional, and no production path loads or unloads a `.ko`.
 REDIRECT/DNAT, ingress promotion, counters, route lookups, and veth-bounce substitutions cannot
 qualify TPROXY. Host evidence still cannot authorize production `functional_passed`.
 

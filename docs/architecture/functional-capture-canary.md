@@ -139,11 +139,25 @@ SHA-256. DNS/TCP additionally binds the two-byte length prefix to the DNS messag
 digest covers the DNS message bytes. A copied tuple, readiness port/path, `Tproxy` enum, self-report
 alone, or counters cannot qualify a flow.
 
-The schema-v2 `validate_for` listener/delivery validation is complete. Production evidence
-construction is not: positive listener and delivery constructors remain private and test-only
-until a real observer/report factory can prove the local-OUTPUT traffic domain and exact capture
-receipt. A production-compiled executor/driver/factory boundary now exists, but its current
-xtables raw-artifact type is uninhabited and therefore cannot construct positive evidence.
+The schema-v2 `validate_for` listener/delivery validation is complete. The separate local-OUTPUT
+TPROXY capture-receipt contract is also complete at the model boundary. One non-cloneable receipt
+stores the exact immutable request and one fixed-slot event for every required flow. Each event
+binds the flow, nonce, request-bound probe UID, client tuple, exact inbound payload identity,
+transparent-listener cookie, the same authoritative delivery event retained by schema-v2 evidence,
+a unique nonzero sequence, and a daemon-observed monotonic time. Validation rejects missing or
+unexpected family slots, request/backend drift, tuple/payload/listener/delivery mismatch, sequence
+reuse, event loss, and observations outside the flow, attempt, client-lifetime, or immutable-deadline
+envelope.
+
+Receipt issuance is a separate authority boundary. A driver may return only unverified capture
+proof plus raw observations; a module-private verifier must first mint receipt-bound artifacts, and
+the evidence factory accepts only that verified form. The resulting unqualified gate record owns
+the receipt by value, and its final `validate_for` path revalidates the receipt against the retained
+flow evidence and cleanup client lifetime before loop, counter, and cleanup validation can pass.
+The production verifier authority remains deliberately uninhabited, while tests use a scripted
+authority to exercise the complete contract. Positive listener and delivery constructors therefore
+remain private and test-only, and the current xtables prepared/raw path remains uninhabited and
+cannot construct positive evidence.
 
 ### Fail-closed local-OUTPUT executor seam
 
@@ -157,20 +171,26 @@ mutation may have occurred. Failures after that point must carry cleanup `Verifi
 `Uncertain`; a missing or inconsistent proof is promoted to `CleanupUncertain` with cleanup
 `Uncertain`.
 
-The driver returns raw observations only. A module-private evidence factory is the sole promotion
-path into schema-v2 gate evidence. The current zero-state xtables driver has no prepared value: it
-reports `Availability(Unsupported)` before acquiring a networking writer or mutating state because
-the installed program can only mark OUTPUT and apply TPROXY in PREROUTING. It never attempts
-TPROXY in OUTPUT and never substitutes REDIRECT, DNAT, ingress PREROUTING traffic, a veth bounce,
-counters, or route-lookup inference. Its raw type and the current factory input are uninhabited, so
-the seam cannot produce a positive host result.
+The driver returns unverified capture proof plus raw observations only. The receipt verifier is the
+sole path from those values to receipt-bound artifacts, and the module-private evidence factory is
+the sole promotion path from those artifacts into schema-v2 gate evidence. The current zero-state
+xtables driver has no prepared value: it reports `Availability(Unsupported)` before acquiring a networking
+writer or mutating state because the installed program can only mark OUTPUT and apply TPROXY in
+PREROUTING. It never attempts TPROXY in OUTPUT and never substitutes REDIRECT, DNAT, ingress
+PREROUTING traffic, a veth bounce, counters, or route-lookup inference. Its raw type, concrete
+receipt authority, and current factory input are uninhabited, so the seam cannot produce a positive
+host result.
 
-Before a positive factory can inhabit that path, it must bind an explicit local-OUTPUT capture
-receipt rather than trusting a `Tproxy` label, observe the exact probe and engine UID+GID/process
-credentials, construct the delivered exact report-object and temporal cleanup evidence, and bind
-the real pre-opened socket-diagnostics authority. Those producer-side steps remain later
-checkpoints. "Fail-closed" here means weak evidence cannot qualify the gate; it does not override
-the separate user-selected fail-open versus fail-closed connectivity compensation policy.
+The next positive producer must replace the sealed receipt authority with one reviewed,
+mechanism-specific local-OUTPUT verifier; bind exact attempt-owned probe and engine UID, GID, PID,
+`/proc` start ticks, and process handles; construct the delivered report-object and temporal cleanup
+evidence; and use the real pre-opened socket-diagnostics authority for actual observations. A
+separately qualified cgroup-BPF observer may later replace supervised delivery reports only after
+its own attachment, identity, complete-event, loss, and lifecycle contract is proven; ordinary BPF
+counters or sampled events cannot mint the receipt. No production receipt path may depend on Flux
+loading or unloading a `.ko`, and production module autoload remains prohibited. "Fail-closed" here
+means weak evidence cannot qualify the gate; it does not override the separate user-selected
+fail-open versus fail-closed connectivity compensation policy.
 
 ## Contained peer topology
 
@@ -457,13 +477,19 @@ functional pass.
    report object to be verified never created and absent after the final event. This is validation
    plumbing; production still has no positive evidence producer or attempt-process ownership
    binding.
-11. Add an explicit local-OUTPUT capture-receipt contract for the selected TPROXY path. The
-   receipt remains unavailable until a backend can prove the real local-OUTPUT traffic domain; it
-   must not be inferred from REDIRECT/DNAT, ingress traffic, counters, route lookups, or a backend
-   enum.
+11. **Complete capture-receipt contract:** the selected TPROXY request now has a non-cloneable,
+   per-flow local-OUTPUT receipt model that binds the complete request, request probe UID, nonce,
+   tuple, payload, listener cookie, exact delivery event, unique sequence, loss baseline, and
+   attempt/client/deadline chronology. Drivers return unverified proof; only the separate sealed
+   verifier may mint receipt-bound artifacts for the evidence factory. The gate record then owns
+   the receipt and revalidates it with its exact flows and client cleanup lifetime. The production
+   authority is still uninhabited, so REDIRECT/DNAT, ingress traffic, counters, route lookups, a
+   backend enum, or the current xtables path cannot produce a positive receipt.
 12. Add a separate positive local-OUTPUT qualification slice using the delivered credential
-   preflight and handoff, a real attempt context, listener-observer and delivery-report factories,
-   actual collector-session observations, and the completed schema-v2 `validate_for` path. A
+   preflight and handoff, a real attempt context with attempt-owned UID/GID/PID/start-tick/handle
+   binding, a listener observer plus delivery-report schema-v1 parser/factory, actual prebound
+   collector-session observations, a real traffic producer, and the completed schema-v2
+   `validate_for` path. A
    separately qualified cgroup-eBPF observer may replace
    the report only after its own authority and loss contract is proven. REDIRECT/DNAT delivery
    cannot qualify a TPROXY Generation; an adapter without a qualifying TPROXY listener path reports

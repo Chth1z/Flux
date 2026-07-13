@@ -9,9 +9,9 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use super::implementation::{
-    DumpDecoder, DumpSpec, RawNetlinkSocketAddress, encode_dump_request, parse_fd_name,
-    parse_proc_stat, parse_socket_symlink_target, require_stable_socket_fds,
-    validate_kernel_sender,
+    DumpDecoder, DumpSequenceState, DumpSpec, RawNetlinkSocketAddress, bounded_session_deadline,
+    encode_dump_request, parse_fd_name, parse_proc_stat, parse_socket_symlink_target,
+    require_stable_socket_fds, validate_kernel_sender,
 };
 use super::*;
 
@@ -409,6 +409,65 @@ fn collection_deadline_is_exclusive_and_checked_before_procfs_access() {
 }
 
 #[test]
+fn session_open_deadline_is_exclusive() {
+    let error = match SystemSocketDiagnosticsSource.open_until(Instant::now()) {
+        Ok(_) => panic!("an expired deadline cannot open a diagnostic session"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), SocketDiagnosticsErrorKind::DeadlineExpired);
+}
+
+#[test]
+fn session_sequences_are_monotonic_nonzero_and_never_wrap() {
+    let mut ordinary = DumpSequenceState::starting_at(NonZeroU32::new(1).unwrap());
+    assert_eq!(
+        ordinary.reserve_snapshot().unwrap().map(NonZeroU32::get),
+        [1, 2, 3, 4]
+    );
+    assert_eq!(
+        ordinary.reserve_snapshot().unwrap().map(NonZeroU32::get),
+        [5, 6, 7, 8]
+    );
+
+    let mut final_complete = DumpSequenceState::starting_at(NonZeroU32::new(u32::MAX - 3).unwrap());
+    assert_eq!(
+        final_complete
+            .reserve_snapshot()
+            .unwrap()
+            .map(NonZeroU32::get),
+        [u32::MAX - 3, u32::MAX - 2, u32::MAX - 1, u32::MAX]
+    );
+    assert_eq!(
+        final_complete.reserve_snapshot().unwrap_err().kind(),
+        SocketDiagnosticsErrorKind::CollectionLimitExceeded
+    );
+
+    let mut insufficient = DumpSequenceState::starting_at(NonZeroU32::new(u32::MAX - 2).unwrap());
+    assert_eq!(
+        insufficient.reserve_snapshot().unwrap_err().kind(),
+        SocketDiagnosticsErrorKind::CollectionLimitExceeded
+    );
+    assert_eq!(
+        insufficient.reserve_snapshot().unwrap_err().kind(),
+        SocketDiagnosticsErrorKind::CollectionLimitExceeded
+    );
+}
+
+#[test]
+fn later_collection_deadline_cannot_extend_the_session_ceiling() {
+    let opened = Instant::now();
+    let hard = opened + Duration::from_secs(3);
+    assert_eq!(
+        bounded_session_deadline(hard, opened + Duration::from_secs(2)),
+        opened + Duration::from_secs(2)
+    );
+    assert_eq!(
+        bounded_session_deadline(hard, opened + Duration::from_secs(4)),
+        hard
+    );
+}
+
+#[test]
 fn live_same_process_tcp_and_connected_udp_are_exactly_correlated() {
     const CHILD_MODE: &str = "FLUX_SOCKET_DIAGNOSTICS_LIVE_CHILD";
     const CHILD_TOKEN: &str = "socket-diag-live-v1";
@@ -448,13 +507,38 @@ fn live_same_process_tcp_and_connected_udp_are_exactly_correlated() {
     udp_right.connect(udp_left.local_addr().unwrap()).unwrap();
 
     let identity = parse_proc_stat(&fs::read("/proc/self/stat").unwrap()).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let snapshot = SystemSocketDiagnosticsSource
-        .collect_until(identity, deadline)
+    let fd_count_before_expiring_session = proc_fd_count();
+    let mut expiring_session = SystemSocketDiagnosticsSource
+        .open_until(Instant::now() + Duration::from_secs(5))
         .unwrap();
+    assert_eq!(proc_fd_count(), fd_count_before_expiring_session + 1);
+    expiring_session.set_deadline_for_test(Instant::now());
+    let error = match expiring_session
+        .collect_process_until(identity, Instant::now() + Duration::from_secs(5))
+    {
+        Ok(_) => panic!("a later collection deadline extended the expired session ceiling"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), SocketDiagnosticsErrorKind::DeadlineExpired);
+    assert_eq!(proc_fd_count(), fd_count_before_expiring_session);
+
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let fd_count_before_session = proc_fd_count();
+    let session = SystemSocketDiagnosticsSource.open_until(deadline).unwrap();
+    assert_eq!(proc_fd_count(), fd_count_before_session + 1);
+    let after_open_lower_bound = Instant::now();
+    let prebound_port_id = session.netlink_port_id();
+    let other_session = SystemSocketDiagnosticsSource.open_until(deadline).unwrap();
+    assert_eq!(proc_fd_count(), fd_count_before_session + 2);
+    assert_ne!(other_session.netlink_port_id(), prebound_port_id);
+    drop(other_session);
+    assert_eq!(proc_fd_count(), fd_count_before_session + 1);
+    let (session, snapshot) = session.collect_process_until(identity, deadline).unwrap();
     // SAFETY: `geteuid` has no pointer arguments or preconditions.
     let effective_uid = unsafe { libc::geteuid() };
     assert_eq!(snapshot.process(), identity);
+    assert_eq!(snapshot.netlink_port_id(), prebound_port_id);
+    assert!(snapshot.started_at() >= after_open_lower_bound);
     assert!(snapshot.fd_scan_complete());
     assert!(snapshot.diag_dumps_complete());
     assert_eq!(snapshot.dumps().len(), 4);
@@ -465,6 +549,27 @@ fn live_same_process_tcp_and_connected_udp_are_exactly_correlated() {
             && dump.started_at() <= dump.completed_at()
             && dump.completed_at() <= snapshot.completed_at()
     }));
+    assert_eq!(
+        snapshot
+            .dumps()
+            .iter()
+            .map(|dump| dump.sequence().get())
+            .collect::<Vec<_>>(),
+        [1, 2, 3, 4]
+    );
+    assert_eq!(
+        snapshot
+            .dumps()
+            .iter()
+            .map(|dump| (dump.address_family(), dump.protocol()))
+            .collect::<Vec<_>>(),
+        [
+            (InetSocketAddressFamily::Ipv4, InetSocketProtocol::Tcp),
+            (InetSocketAddressFamily::Ipv4, InetSocketProtocol::Udp),
+            (InetSocketAddressFamily::Ipv6, InetSocketProtocol::Tcp),
+            (InetSocketAddressFamily::Ipv6, InetSocketProtocol::Udp),
+        ]
+    );
 
     let tcp = snapshot
         .correlate(
@@ -488,7 +593,38 @@ fn live_same_process_tcp_and_connected_udp_are_exactly_correlated() {
     assert_eq!(udp.diagnostic().state(), 1);
     assert_eq!(udp.diagnostic().uid(), effective_uid);
 
+    let (session, second) = session.collect_process_until(identity, deadline).unwrap();
+    assert_eq!(second.netlink_port_id(), prebound_port_id);
+    assert_eq!(
+        second
+            .dumps()
+            .iter()
+            .map(|dump| dump.sequence().get())
+            .collect::<Vec<_>>(),
+        [5, 6, 7, 8]
+    );
+
+    let temporary = SystemSocketDiagnosticsSource
+        .collect_until(identity, deadline)
+        .unwrap();
+    assert_ne!(temporary.netlink_port_id(), prebound_port_id);
+    assert_eq!(
+        temporary
+            .dumps()
+            .iter()
+            .map(|dump| dump.sequence().get())
+            .collect::<Vec<_>>(),
+        [1, 2, 3, 4]
+    );
+    assert_eq!(proc_fd_count(), fd_count_before_session + 1);
+    drop(session);
+    assert_eq!(proc_fd_count(), fd_count_before_session);
+
     drop((tcp_server, tcp_client, tcp_listener, udp_left, udp_right));
+}
+
+fn proc_fd_count() -> usize {
+    fs::read_dir("/proc/self/fd").unwrap().count()
 }
 
 fn decoder(spec: DumpSpec) -> DumpDecoder {

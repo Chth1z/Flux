@@ -304,6 +304,29 @@ ambiguous match, identity drift, missing cookie/inode/FD/mark binding, tuple/UID
 out-of-window observation fails closed; enumeration hints are never promoted into correlation
 evidence.
 
+The collector now also exposes a uniquely owned, non-cloneable prebound session. Calling
+`SystemSocketDiagnosticsSource::open_until` binds NETLINK_SOCK_DIAG under the caller's exclusive
+deadline and exposes the kernel-assigned nonzero port ID before any process snapshot. Every later
+`collect_process_until` consumes that session, uses the same FD, and returns the clean session with
+the snapshot only on success. This linear ownership serializes transactions and makes every error
+retire the socket, so late unread datagrams cannot satisfy a later transaction. Nonzero sequences
+remain monotonic across successful snapshots. A deadline supplied later may shorten but cannot
+extend the opening deadline, and sequence exhaustion fails rather than wrapping. The existing
+`collect_until` entry point remains a compatibility wrapper that opens one temporary session
+internally.
+
+Opening the session does not issue a protocol dump. The future capability-qualified attempt path
+must prove that the TCP and UDP INET_DIAG handlers are built in or already active before collection
+and report unsupported otherwise. A dump request is not an admissible availability probe because a
+kernel may satisfy it through implicit `request_module` autoload, which production Flux prohibits.
+
+The platform session closes the socket-port temporal gap but does not by itself bind a canary
+attempt. A positive local-OUTPUT context must open the session in the exact daemon network namespace
+before building `CanaryEnvironmentAuthorityBinding`, copy its real port ID into the request, and
+hand the exact owned session to the executor for collection. Reopening another socket after copying
+the port ID is invalid. That attempt-owned handoff, collector object identity/revision binding, and
+real positive producer remain deferred.
+
 This collector is deliberately not a canary executor or the complete listener-envelope producer.
 It does not create the distinct probe and engine UIDs, install local-OUTPUT capture, generate
 traffic, prove transparent/v6-only listener socket options, observe TCP accept or UDP ancillary
@@ -388,15 +411,20 @@ functional pass.
    xtables driver reports `unsupported` with cleanup `NotRequired` before mutation and has no
    positive raw value. Required-mode coordinator regression proves this result cannot reach
    `RUNNING`; production composition remains structural-only.
-8. Add a separate positive local-OUTPUT qualification slice using the delivered credential preflight, real
-   listener-observer and delivery-report factories, prebound integration of the delivered outbound
-   collector, and the completed schema-v2 `validate_for` path. A separately qualified cgroup-eBPF observer may replace
+8. **Complete prebound transport:** the Linux/Android socket-diagnostics source can bind a uniquely
+   owned session before request construction, expose its real port ID, reuse the same FD with
+   monotonic nonzero sequences, retire the handle on any error, prevent deadline extension, and
+   preserve the temporary-session compatibility API. This remains observation plumbing.
+9. Add a separate positive local-OUTPUT qualification slice using the delivered credential
+   preflight, real listener-observer and delivery-report factories, an attempt-owned handoff of the
+   delivered prebound collector session, and the completed schema-v2 `validate_for` path. A
+   separately qualified cgroup-eBPF observer may replace
    the report only after its own authority and loss contract is proven. REDIRECT/DNAT delivery
    cannot qualify a TPROXY Generation; an adapter without a qualifying TPROXY listener path reports
    `unsupported`. This slice must not weaken the model to accommodate the ingress checkpoint.
-9. Add an Android lab adapter that reports explicit `unsupported`, `denied`, `conflicting`,
+10. Add an Android lab adapter that reports explicit `unsupported`, `denied`, `conflicting`,
    `broken`, or `unknown` evidence. It remains diagnostic-only until exact-device qualification.
-10. Permit TPROXY `RUNNING` only for reviewed device profiles whose functional canary passes the
+11. Permit TPROXY `RUNNING` only for reviewed device profiles whose functional canary passes the
    real-device matrix and cleanup/crash tests. Other profiles remain unqualified; broaden the
    reviewed set without weakening the probe. TUN remains rejected until its separate
    single-route-owner and forced-death cleanup canaries pass.

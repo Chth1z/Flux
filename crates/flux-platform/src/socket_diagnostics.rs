@@ -437,9 +437,7 @@ impl fmt::Display for SocketDiagnosticsError {
                     "socket diagnostics are unsupported on {platform}"
                 )
             }
-            Self::DeadlineExpired => {
-                formatter.write_str("socket-diagnostic collection deadline expired")
-            }
+            Self::DeadlineExpired => formatter.write_str("socket-diagnostic deadline expired"),
             Self::Io {
                 operation,
                 path,
@@ -504,34 +502,106 @@ impl Error for SocketDiagnosticsError {
     }
 }
 
-/// Stateless system collector for process socket ownership evidence.
+/// System entry point for process socket ownership evidence.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SystemSocketDiagnosticsSource;
 
 impl SystemSocketDiagnosticsSource {
+    /// Open and bind a reusable diagnostic session before an exclusive deadline.
+    ///
+    /// The returned session exposes its kernel-assigned netlink port ID before
+    /// any process collection, allowing callers to bind that real observer
+    /// authority into an immutable canary request.
+    pub fn open_until(
+        self,
+        deadline: Instant,
+    ) -> Result<SystemSocketDiagnosticsSession, SocketDiagnosticsError> {
+        open_until(deadline)
+    }
+
     /// Collect a complete identity-bound snapshot before an exclusive deadline.
+    ///
+    /// This convenience method opens a temporary prebound session internally.
     pub fn collect_until(
         self,
         expected: SocketDiagnosticsProcessIdentity,
         deadline: Instant,
     ) -> Result<ProcessSocketDiagnostics, SocketDiagnosticsError> {
-        collect_until(expected, deadline)
+        let session = self.open_until(deadline)?;
+        let (_, snapshot) = session.collect_process_until(expected, deadline)?;
+        Ok(snapshot)
     }
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn collect_until(
-    expected: SocketDiagnosticsProcessIdentity,
-    deadline: Instant,
-) -> Result<ProcessSocketDiagnostics, SocketDiagnosticsError> {
-    implementation::collect_until(expected, deadline)
+pub struct SystemSocketDiagnosticsSession {
+    inner: implementation::SystemSocketDiagnosticsSession,
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
-fn collect_until(
-    _expected: SocketDiagnosticsProcessIdentity,
+pub struct SystemSocketDiagnosticsSession {
+    _unsupported: std::convert::Infallible,
+}
+
+impl SystemSocketDiagnosticsSession {
+    /// Kernel-assigned port ID of the already-bound NETLINK_SOCK_DIAG socket.
+    ///
+    /// The number is network-namespace-scoped and may be reused after close;
+    /// authority therefore requires retaining this exact live session.
+    #[must_use]
+    pub fn netlink_port_id(&self) -> NonZeroU32 {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            self.inner.netlink_port_id()
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            match self._unsupported {}
+        }
+    }
+
+    #[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+    fn set_deadline_for_test(&mut self, deadline: Instant) {
+        self.inner.set_deadline_for_test(deadline);
+    }
+
+    /// Collect one complete process snapshot through this prebound session.
+    ///
+    /// Ownership serializes transactions and preserves monotonically
+    /// increasing, nonzero netlink sequences. Success returns the same clean
+    /// session for another collection; every error consumes and drops it, so
+    /// unread late datagrams can never satisfy a later transaction. The
+    /// supplied deadline may shorten but can never extend the exclusive
+    /// deadline fixed when the session opened.
+    pub fn collect_process_until(
+        self,
+        expected: SocketDiagnosticsProcessIdentity,
+        deadline: Instant,
+    ) -> Result<(Self, ProcessSocketDiagnostics), SocketDiagnosticsError> {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            let (inner, snapshot) = self.inner.collect_process_until(expected, deadline)?;
+            Ok((Self { inner }, snapshot))
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            let _ = (expected, deadline);
+            match self._unsupported {}
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn open_until(deadline: Instant) -> Result<SystemSocketDiagnosticsSession, SocketDiagnosticsError> {
+    Ok(SystemSocketDiagnosticsSession {
+        inner: implementation::SystemSocketDiagnosticsSession::open_until(deadline)?,
+    })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn open_until(
     _deadline: Instant,
-) -> Result<ProcessSocketDiagnostics, SocketDiagnosticsError> {
+) -> Result<SystemSocketDiagnosticsSession, SocketDiagnosticsError> {
     Err(SocketDiagnosticsError::UnsupportedPlatform(
         std::env::consts::OS,
     ))

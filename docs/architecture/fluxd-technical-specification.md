@@ -954,7 +954,7 @@ Delivered Phase 1 supervision additionally requires:
 - a direct-child `PR_SET_PDEATHSIG(SIGKILL)` lease with a post-arm parent-identity race check for Sing-Box and phase-shell processes;
 - bounded TERM/KILL/reap, restart windows, exponential backoff, and retained ownership until disappearance is observed.
 
-The Phase 1 transaction rejects TUN during `prepare`, before engine admission or networking mutation. It also requires `xt_owner` before initialization and revalidates it from the generated capability cache; the current shell Capture Program sends every local OUTPUT policy through the application chain so the configured engine UID/GID bypass remains active even when application filtering is disabled. `ROUTING_MARK` is not accepted as equivalent authority because the bridge does not prove that the supervised engine applies it to its sockets. For admitted TPROXY state, start is `prepare` → engine admission → Generation-bound capture start → structural capture verification → configured functional gate → Generation-bound `RUNNING`, and stop is capture detach → engine stop/reap → `STOPPED`. The production daemon explicitly selects structural-only compatibility; required-mode tests execute the delivered Stage-1 exact-binding canary transaction, and the first Stage-2 Linux checkpoint now exercises the isolated dual-stack topology and cleanup without installing capture. Partial capture-start compensation retains Generation evidence until both networking writers prove cleanup; terminal publication and engine retirement are forbidden while detachment is uncertain. Reload prepares the candidate while the previous Generation remains active, preserves its pass on prepare-only failure, invalidates it before detachment, blocks replacement if detach fails, and attempts the previous immutable `EngineSpec` if candidate activation fails. An uncertain reload detach enters capture repair: prove full detachment, retain/reconcile the old engine, then republish and freshly verify that Generation. Publication failure, identity loss, repair/restoration, and address resynchronization require a fresh complete gate before retrying `RUNNING`. Candidate evidence never authorizes rollback publication. The current owner bypass is a compatibility loop-escape prerequisite; the socket-correlation collector, schema-v2 listener/delivery validator, and fail-closed TPROXY-only local-OUTPUT executor seam are delivered, while the positive traffic producer, production observer/report factories, prebound collector integration, and Android device qualification remain open.
+The Phase 1 transaction rejects TUN during `prepare`, before engine admission or networking mutation. It also requires `xt_owner` before initialization and revalidates it from the generated capability cache; the current shell Capture Program sends every local OUTPUT policy through the application chain so the configured engine UID/GID bypass remains active even when application filtering is disabled. `ROUTING_MARK` is not accepted as equivalent authority because the bridge does not prove that the supervised engine applies it to its sockets. For admitted TPROXY state, start is `prepare` → engine admission → Generation-bound capture start → structural capture verification → configured functional gate → Generation-bound `RUNNING`, and stop is capture detach → engine stop/reap → `STOPPED`. The production daemon explicitly selects structural-only compatibility; required-mode tests execute the delivered Stage-1 exact-binding canary transaction, and the first Stage-2 Linux checkpoint now exercises the isolated dual-stack topology and cleanup without installing capture. Partial capture-start compensation retains Generation evidence until both networking writers prove cleanup; terminal publication and engine retirement are forbidden while detachment is uncertain. Reload prepares the candidate while the previous Generation remains active, preserves its pass on prepare-only failure, invalidates it before detachment, blocks replacement if detach fails, and attempts the previous immutable `EngineSpec` if candidate activation fails. An uncertain reload detach enters capture repair: prove full detachment, retain/reconcile the old engine, then republish and freshly verify that Generation. Publication failure, identity loss, repair/restoration, and address resynchronization require a fresh complete gate before retrying `RUNNING`. Candidate evidence never authorizes rollback publication. The current owner bypass is a compatibility loop-escape prerequisite; the socket-correlation collector, its prebound session transport, schema-v2 listener/delivery validator, and fail-closed TPROXY-only local-OUTPUT executor seam are delivered, while the positive traffic producer, production observer/report factories, attempt-owned session handoff, and Android device qualification remain open.
 
 The delivered Linux evidence class is explicitly ingress-only. The command
 `cargo xtask test-functional-canary-linux-tproxy` selects the exact ignored test
@@ -984,7 +984,43 @@ ambiguous, malformed, stale, or interrupted observations fail closed. The collec
 outbound evidence plumbing only; it does not prove transparent/v6-only listener options, TCP
 accept, or UDP ancillary delivery.
 
-### 14.1 Functional-canary schema-v2 listener delivery
+### 14.1 Prebound socket-diagnostics sessions
+
+The platform collector exposes this stateful authority surface on Linux and Android:
+
+```rust
+let session = SystemSocketDiagnosticsSource.open_until(attempt_deadline)?;
+let port_id = session.netlink_port_id();
+let (session, snapshot) = session.collect_process_until(engine_identity, attempt_deadline)?;
+```
+
+The session uniquely owns one nonblocking, close-on-exec NETLINK_SOCK_DIAG FD and is not cloneable.
+`netlink_port_id()` returns the kernel-assigned nonzero local port before any process collection.
+All snapshots use that same FD. Collection consumes the session and returns it only with a complete
+snapshot, so safe code cannot overlap transactions or reuse a handle after any error. Every four-
+dump snapshot reserves a new monotonic nonzero sequence range, and exhaustion fails instead of
+wrapping. The opening deadline is the absolute upper bound for the session; later calls may shorten
+it but cannot extend it. Dropping either an unused session or any error path closes the observer.
+
+`SystemSocketDiagnosticsSource::collect_until` remains a compatibility wrapper that opens one
+temporary session and performs one collection. Successful stateful and compatibility snapshots
+retain the same complete PID/start-tick, stable pre/post FD inventory, four dump, bounds, tuple,
+cookie, mark, and timing guarantees.
+
+Binding the NETLINK_SOCK_DIAG socket does not itself request a protocol handler. Before the first
+production dump, the future capability-qualified attempt integration must prove that the required
+TCP and UDP INET_DIAG handlers are built in or already active and otherwise report unsupported. It
+must not use a dump request as an availability probe because kernels may invoke `request_module`
+for a missing modular handler; production Flux never relies on that implicit autoload path.
+
+This platform type is necessary but not sufficient for canary authority. `prepare_attempt` must
+open it in the exact daemon network namespace before `CanaryEnvironmentAuthorityBinding` and
+`CanaryAttemptRequest` are built, bind the returned port ID, and transfer the same owned session to
+the later executor. Copying the port ID and reopening another socket is invalid. That attempt-owned
+handoff and the higher-level collector identity/revision binding remain part of the positive
+local-OUTPUT producer checkpoint.
+
+### 14.2 Functional-canary schema-v2 listener delivery
 
 The internal functional-canary evidence model is schema v2. The control protocol remains v3, the
 supervised inbound-delivery report is independently schema v1, and `flux.toml` remains schema v1.
@@ -1031,7 +1067,7 @@ adapter must prove delivery to the selected Generation's backend-specific listen
 report the backend unsupported. Neither the collector nor any host-only adapter result may publish
 production `functional_passed`; Android qualification remains a separate real-device gate.
 
-### 14.2 Local-OUTPUT executor admission
+### 14.3 Local-OUTPUT executor admission
 
 `CanaryAttemptRequest` remains TPROXY-only. The local-OUTPUT executor rejects a REDIRECT or DNAT
 request as `InvalidEvidence` with cleanup `NotRequired` before consulting a driver. Driver
@@ -1053,7 +1089,8 @@ publishes `RUNNING`.
 This is fail-closed evidence admission only. It does not change the separate default fail-open
 connectivity compensation policy. A positive factory remains prohibited until the model binds the
 local-OUTPUT traffic domain and capture receipt, exact probe and engine UID+GID/process credentials,
-report-object cleanup and observation timing, and the real pre-opened socket-diagnostics authority.
+report-object cleanup and observation timing, and an attempt-owned handoff of the delivered prebound
+socket-diagnostics session and its real authority.
 Qualified cgroup-BPF remains an alternative only after its independent attachment, identity, loss,
 and lifecycle contract is proven. Production daemon composition remains
 `StructuralOnlyCompatibility`.

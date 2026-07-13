@@ -38,6 +38,7 @@ const MAX_SOCKET_DIAG_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_SOCKET_DIAG_SNAPSHOT_ROWS: usize = 262_144;
 const MAX_PROCESS_FD_ENTRIES: usize = 262_144;
 const MAX_PROCESS_SOCKET_FDS: usize = 262_144;
+const SOCKET_DIAG_DUMP_COUNT: usize = 4;
 const SOCKADDR_NL_LENGTH: libc::socklen_t = 12;
 
 const _: () = assert!(SOCKADDR_NL_LENGTH as usize == mem::size_of::<libc::sockaddr_nl>());
@@ -90,6 +91,8 @@ impl DumpSpec {
     }
 }
 
+const _: () = assert!(DumpSpec::ALL.len() == SOCKET_DIAG_DUMP_COUNT);
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[repr(C)]
 pub(super) struct RawNetlinkSocketAddress {
@@ -104,65 +107,139 @@ const _: () =
 const _: () =
     assert!(mem::align_of::<RawNetlinkSocketAddress>() == mem::align_of::<libc::sockaddr_nl>());
 
-pub(super) fn collect_until(
-    expected: SocketDiagnosticsProcessIdentity,
+pub(super) struct SystemSocketDiagnosticsSession {
+    socket: SocketDiagSocket,
+    sequences: DumpSequenceState,
     deadline: Instant,
-) -> Result<ProcessSocketDiagnostics, SocketDiagnosticsError> {
-    let started_at = deadline_checkpoint(deadline)?;
-    verify_process_identity(expected, deadline)?;
-    let socket = SocketDiagSocket::open(deadline)?;
-    let socket_fds = scan_socket_fds(expected.pid(), deadline)?;
-    let mut sockets = Vec::new();
-    let mut dumps = Vec::with_capacity(DumpSpec::ALL.len());
-    let mut snapshot_bytes = 0_usize;
+}
 
-    for (index, spec) in DumpSpec::ALL.into_iter().enumerate() {
-        let sequence = NonZeroU32::new(
-            u32::try_from(index + 1).expect("four socket diagnostic transactions fit u32"),
-        )
-        .expect("diagnostic sequence starts at one");
-        let mut decoded = socket.dump(spec, sequence, deadline)?;
-        snapshot_bytes = snapshot_bytes
-            .checked_add(decoded.received_bytes)
-            .filter(|bytes| *bytes <= MAX_SOCKET_DIAG_SNAPSHOT_BYTES)
-            .ok_or_else(|| {
-                protocol_error(
-                    "collect socket-diagnostic snapshot",
-                    "snapshot byte bound exceeded",
-                    None,
-                )
-            })?;
-        if sockets.len().saturating_add(decoded.sockets.len()) > MAX_SOCKET_DIAG_SNAPSHOT_ROWS {
-            return Err(protocol_error(
-                "collect socket-diagnostic snapshot",
-                "snapshot socket-row bound exceeded",
-                None,
-            ));
-        }
-        sockets.append(&mut decoded.sockets);
-        dumps.push(InetSocketDump {
-            sequence,
-            address_family: spec.address_family,
-            protocol: spec.protocol,
-            started_at: decoded.started_at,
-            completed_at: decoded.completed_at,
-        });
+impl SystemSocketDiagnosticsSession {
+    pub(super) fn open_until(deadline: Instant) -> Result<Self, SocketDiagnosticsError> {
+        Ok(Self {
+            socket: SocketDiagSocket::open(deadline)?,
+            sequences: DumpSequenceState::new(),
+            deadline,
+        })
     }
 
-    verify_process_identity(expected, deadline)?;
-    let final_socket_fds = scan_socket_fds(expected.pid(), deadline)?;
-    verify_process_identity(expected, deadline)?;
-    require_stable_socket_fds(expected, &socket_fds, &final_socket_fds)?;
-    let completed_at = deadline_checkpoint(deadline)?;
-    Ok(ProcessSocketDiagnostics {
-        process: expected,
-        netlink_port_id: socket.port_id,
-        started_at,
-        completed_at,
-        socket_fds: socket_fds.into_boxed_slice(),
-        dumps: dumps.into_boxed_slice(),
-        sockets: sockets.into_boxed_slice(),
-    })
+    pub(super) const fn netlink_port_id(&self) -> NonZeroU32 {
+        self.socket.port_id
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_deadline_for_test(&mut self, deadline: Instant) {
+        self.deadline = deadline;
+    }
+
+    pub(super) fn collect_process_until(
+        mut self,
+        expected: SocketDiagnosticsProcessIdentity,
+        deadline: Instant,
+    ) -> Result<(Self, ProcessSocketDiagnostics), SocketDiagnosticsError> {
+        let deadline = bounded_session_deadline(self.deadline, deadline);
+        let started_at = deadline_checkpoint(deadline)?;
+        verify_process_identity(expected, deadline)?;
+        let socket_fds = scan_socket_fds(expected.pid(), deadline)?;
+        let sequences = self.sequences.reserve_snapshot()?;
+        let mut sockets = Vec::new();
+        let mut dumps = Vec::with_capacity(SOCKET_DIAG_DUMP_COUNT);
+        let mut snapshot_bytes = 0_usize;
+
+        for (spec, sequence) in DumpSpec::ALL.into_iter().zip(sequences) {
+            let mut decoded = self.socket.dump(spec, sequence, deadline)?;
+            snapshot_bytes = snapshot_bytes
+                .checked_add(decoded.received_bytes)
+                .filter(|bytes| *bytes <= MAX_SOCKET_DIAG_SNAPSHOT_BYTES)
+                .ok_or_else(|| {
+                    protocol_error(
+                        "collect socket-diagnostic snapshot",
+                        "snapshot byte bound exceeded",
+                        None,
+                    )
+                })?;
+            if sockets.len().saturating_add(decoded.sockets.len()) > MAX_SOCKET_DIAG_SNAPSHOT_ROWS {
+                return Err(protocol_error(
+                    "collect socket-diagnostic snapshot",
+                    "snapshot socket-row bound exceeded",
+                    None,
+                ));
+            }
+            sockets.append(&mut decoded.sockets);
+            dumps.push(InetSocketDump {
+                sequence,
+                address_family: spec.address_family,
+                protocol: spec.protocol,
+                started_at: decoded.started_at,
+                completed_at: decoded.completed_at,
+            });
+        }
+
+        verify_process_identity(expected, deadline)?;
+        let final_socket_fds = scan_socket_fds(expected.pid(), deadline)?;
+        verify_process_identity(expected, deadline)?;
+        require_stable_socket_fds(expected, &socket_fds, &final_socket_fds)?;
+        let completed_at = deadline_checkpoint(deadline)?;
+        let snapshot = ProcessSocketDiagnostics {
+            process: expected,
+            netlink_port_id: self.socket.port_id,
+            started_at,
+            completed_at,
+            socket_fds: socket_fds.into_boxed_slice(),
+            dumps: dumps.into_boxed_slice(),
+            sockets: sockets.into_boxed_slice(),
+        };
+        Ok((self, snapshot))
+    }
+}
+
+pub(super) fn bounded_session_deadline(hard: Instant, requested: Instant) -> Instant {
+    std::cmp::min(hard, requested)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct DumpSequenceState {
+    next: Option<NonZeroU32>,
+}
+
+impl DumpSequenceState {
+    const fn new() -> Self {
+        Self {
+            next: NonZeroU32::new(1),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) const fn starting_at(next: NonZeroU32) -> Self {
+        Self { next: Some(next) }
+    }
+
+    pub(super) fn reserve_snapshot(
+        &mut self,
+    ) -> Result<[NonZeroU32; SOCKET_DIAG_DUMP_COUNT], SocketDiagnosticsError> {
+        let Some(first) = self.next else {
+            return Err(sequence_limit_error());
+        };
+        let first = first.get();
+        let Some(last) = first.checked_add(
+            u32::try_from(SOCKET_DIAG_DUMP_COUNT - 1)
+                .expect("socket diagnostic dump count fits u32"),
+        ) else {
+            self.next = None;
+            return Err(sequence_limit_error());
+        };
+        self.next = last.checked_add(1).and_then(NonZeroU32::new);
+        Ok(std::array::from_fn(|index| {
+            let offset = u32::try_from(index).expect("dump sequence index fits u32");
+            NonZeroU32::new(first + offset).expect("reserved sequence is nonzero")
+        }))
+    }
+}
+
+fn sequence_limit_error() -> SocketDiagnosticsError {
+    SocketDiagnosticsError::CollectionLimitExceeded {
+        operation: "reserve socket-diagnostic session sequences",
+        limit: u32::MAX as usize,
+    }
 }
 
 fn verify_process_identity(

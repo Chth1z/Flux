@@ -101,8 +101,13 @@ traverse PREROUTING or reach the TPROXY listener; xtables TPROXY also cannot att
 OUTPUT mark counters and route lookups are therefore negative controls, not capture success.
 The strict Linux/Android `/proc` FD plus INET_DIAG collector is delivered and rejects evidence
 unless protocol, exact tuple, UID, mark, FD/inode/cookie, complete dumps, supervised-process
-identity, and timing all agree. Functional-canary schema v2 now rejects missing, REDIRECT, DNAT,
-weak, mismatched, lossy, stale, or transport-incomplete listener delivery evidence. Fixtures bind
+identity, and timing all agree. Its prebound session API exposes the real nonzero netlink port ID
+before collection and reuses the same owned socket with monotonic sequences. Collection consumes
+the session and returns it only on success; every error retires the handle, sequence exhaustion
+cannot wrap, and later calls cannot extend the opening deadline. The original `collect_until` API
+still opens a temporary session internally. Functional-canary schema v2 now rejects missing,
+REDIRECT, DNAT, weak, mismatched, lossy, stale, or transport-incomplete listener delivery evidence.
+Fixtures bind
 the exact Generation/engine/namespace/Capture Program/selector and listener FD/inode/cookie/socket
 state; TCP accept or UDP `recvmsg` delivery; one attempt authority and loss baseline; stable
 and globally noncolliding per-family/protocol listener identities; accepted children distinct from
@@ -114,9 +119,24 @@ cleanup after preparation, and permits only its private factory to promote raw o
 current zero-state xtables driver returns `Unsupported` before mutation because OUTPUT marking does
 not reach PREROUTING TPROXY; its prepared/raw type is uninhabited, so it sends no traffic and cannot
 construct positive evidence. Production observer/report factories, a local-OUTPUT capture receipt,
-prebound outbound-collector integration, and capability-qualified execution remain later
-checkpoints. Ingress, REDIRECT/DNAT, counters, route lookups, or a veth bounce cannot qualify
+attempt-owned handoff of the prebound collector session, and capability-qualified execution remain
+later checkpoints. Ingress, REDIRECT/DNAT, counters, route lookups, or a veth bounce cannot qualify
 TPROXY.
+
+Run the socket-diagnostics session and live-correlation regressions with:
+
+```text
+cargo test -p flux-platform socket_diagnostics
+```
+
+These tests prove pre-collection port visibility, distinct simultaneous session ports, same-handle
+sequence continuity, deadline capping, sequence exhaustion, the temporary-session wrapper, and the
+existing exact TCP/connected-UDP correlation. They observe procfs and NETLINK_SOCK_DIAG only; they
+do not send canary traffic, alter rules/routes/sysctls, or explicitly load/unload modules. A host
+kernel may nevertheless service the first TCP/UDP diagnostic request through `request_module` when
+its INET_DIAG handlers are modular, so run the live regression only where those handlers are already
+active or host autoload policy is acceptable. Production integration must preflight built-in or
+already-active handlers and report unsupported instead of using a dump request as that probe.
 
 Run the deterministic seam and coordinator regressions with:
 
@@ -246,4 +266,4 @@ Every phase process has a nonzero execution deadline capped at 60 seconds. The R
 
 On daemon startup, the Capability Profile first decides whether mutation is admissible. An admitted runtime runs the bounded `startup-recover` phase before strict `flux.toml` loading, so a broken current configuration cannot strand same-boot capture; recovery must also succeed before administrative intent is read, persisted, or executed and before the control socket is admitted. Below-floor or unverified profiles stay on the non-mutating read-only path and never invoke recovery. Recovery is serialized by the dispatcher lock. With no lease and no capture evidence it idempotently publishes `STOPPED`. A same-boot Rust lease removes the exact active generation, or uses the immutable prepared generation for markerless partial activation, then stops TPROXY before address synchronization and proves capture evidence absent. For a direct engine launch, `PDEATHSIG` supplies the child-death proof, so recovery publishes `STOPPED`, clears active/previous/verification records, and releases the lease. For `busybox-setuidgid`, child death cannot be proven after daemon loss: recovery publishes `FAILED` only after detachment, preserves the Rust lease and active engine generation, and blocks automatic daemon restart for explicit repair. Cleanup failure likewise preserves evidence and ownership. Same-boot legacy ownership is rejected without mutation; prior-boot evidence is retired without treating kernel objects as surviving the reboot.
 
-Phase 1 `capture-verify` proves shell-owned structural evidence; the always-on owner bypass prevents the default self-capture omission but is not itself a synthetic end-to-end traffic or exact-process loop-prevention proof. The Stage-1 typed canary model, coordinator ordering, failure injection, status contract, authoritative schema-v2 listener/delivery validator, and fail-closed TPROXY-only local-OUTPUT executor seam are delivered, along with the first Stage-2 isolated topology checkpoint, the complete dual-stack TCP/UDP echo plus DNS-over-UDP/TCP third-namespace ingress PREROUTING TPROXY checkpoint, and the strict Linux/Android `/proc` FD plus INET_DIAG outbound-collector prerequisite. Deferred are the positive local-OUTPUT traffic producer and backend-listener/report factories using the completed validator, prebound collector sessions, Android adapter and device qualification, ancestor-safe directory traversal with `openat`/`openat2`, long-term retention/rotation policy for Generation logs, a pidfd/timerfd reactor, full process-tree containment, and real-device release evidence on the minimum Android 5.10 kernel. Ingress or collector evidence cannot discharge the local-OUTPUT gate, REDIRECT/DNAT cannot qualify TPROXY, and production must remain `structural_only` rather than publish `functional_passed` from host evidence.
+Phase 1 `capture-verify` proves shell-owned structural evidence; the always-on owner bypass prevents the default self-capture omission but is not itself a synthetic end-to-end traffic or exact-process loop-prevention proof. The Stage-1 typed canary model, coordinator ordering, failure injection, status contract, authoritative schema-v2 listener/delivery validator, fail-closed TPROXY-only local-OUTPUT executor seam, and prebound socket-diagnostics session transport are delivered, along with the first Stage-2 isolated topology checkpoint, the complete dual-stack TCP/UDP echo plus DNS-over-UDP/TCP third-namespace ingress PREROUTING TPROXY checkpoint, and the strict Linux/Android `/proc` FD plus INET_DIAG outbound-collector prerequisite. Deferred are the positive local-OUTPUT traffic producer and backend-listener/report factories using the completed validator, attempt-owned session handoff, Android adapter and device qualification, ancestor-safe directory traversal with `openat`/`openat2`, long-term retention/rotation policy for Generation logs, a pidfd/timerfd reactor, full process-tree containment, and real-device release evidence on the minimum Android 5.10 kernel. Ingress or collector evidence cannot discharge the local-OUTPUT gate, REDIRECT/DNAT cannot qualify TPROXY, and production must remain `structural_only` rather than publish `functional_passed` from host evidence.

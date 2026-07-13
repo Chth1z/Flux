@@ -599,7 +599,11 @@ local OUTPUT: in the harness kernel, an OUTPUT mark plus local policy route did 
 PREROUTING, and xtables TPROXY cannot attach to OUTPUT. OUTPUT counters and route lookups are
 therefore negative-control evidence only. The strict Linux/Android `/proc` FD plus INET_DIAG
 collector now binds protocol, exact tuple, UID, mark, FD/inode/cookie, complete dumps, supervised
-process identity, and timing, but it is only a delivered outbound-evidence prerequisite.
+process identity, and timing. Its prebound session API now exposes the real kernel netlink port ID
+before collection, preserves one owned FD with monotonic sequences across snapshots, consumes and
+retires the handle on every error, prevents deadline extension, and retains the temporary-session
+compatibility wrapper. It is still only a delivered outbound-evidence prerequisite: the future
+attempt context must bind the port ID and transfer that exact session to the executor.
 Functional-canary schema v2 now completes the listener/delivery `validate_for` contract: every
 flow binds the exact Generation, engine, namespace, Capture Program, selector, listener
 FD/inode/cookie and socket state, independent TCP-accept or UDP-`recvmsg` delivery, exact payload,
@@ -614,7 +618,7 @@ zero-state xtables driver reports `Unsupported` with cleanup `NotRequired` befor
 OUTPUT marking does not reach PREROUTING TPROXY; the prepared/raw type is uninhabited, so no
 positive evidence can be emitted. Required mode treats that result as a failed gate and never
 reaches `RUNNING`. Real local-OUTPUT capture receipts, observer/report factories, prebound collector
-integration, capability-qualified execution, and Android qualification remain separate gates.
+session handoff, capability-qualified execution, and Android qualification remain separate gates.
 REDIRECT/DNAT, ingress promotion, counters, route lookups, and veth-bounce substitutions cannot
 qualify TPROXY. Host evidence still cannot authorize production `functional_passed`.
 

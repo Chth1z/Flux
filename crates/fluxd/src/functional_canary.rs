@@ -3837,6 +3837,8 @@ fn bounded_prefix(diagnostic: &str) -> String {
     diagnostic[..end].to_owned()
 }
 
+pub(crate) mod local_output;
+
 #[cfg(all(test, target_os = "linux"))]
 mod linux_namespace_harness;
 

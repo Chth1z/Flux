@@ -16,7 +16,7 @@ This roadmap turns the [blueprint](fluxd-blueprint.md) and [technical specificat
 The next checkpoint is not a single linear Phase 3 task. Three bounded lanes may proceed in parallel,
 but correctness gates retain strict ordering:
 
-1. **Bridge safety:** the `100.64.0.0/10`, mandatory-exclusion, empty allow/deny, TUN-rejection, and converged-`addrsyncd` readiness checkpoints are complete. The Stage-1 [Generation-scoped functional capture canary](functional-capture-canary.md) model, coordinator ordering, lifecycle tests, protocol-v3 verification status, and authoritative schema-v2 listener/delivery validator are complete; production still explicitly selects structural-only compatibility. The first privileged Linux namespace checkpoint proves the isolated dual-stack TCP/UDP/DNS topology and exact cleanup. The delivered third-probe-namespace checkpoint now proves real dual-stack TCP/UDP echo plus DNS-over-UDP/TCP PREROUTING TPROXY, accepted-socket and strict ancillary-data original-destination recovery, marked relay egress, source-preserving UDP replies, nonce-bound DNS evidence, per-family route controls/counters, and cleanup. The strict Linux/Android `/proc` FD plus INET_DIAG outbound-collector prerequisite is also complete, binding protocol, exact tuple, UID, mark, FD/inode/cookie, complete dumps, process identity, and timing. The separate credential-only preflight now proves exact nonzero probe/engine UID+GID roles, empty groups, zero role capabilities, and fail-closed optional/required behavior without traffic. Ingress, collector, and credential evidence still cannot authorize the current local-OUTPUT production domain: the next bridge-safety checkpoint is a fail-closed TPROXY-only executor and real listener-observer/report factory that construct schema-v2 evidence and invoke the completed `validate_for` path. REDIRECT/DNAT cannot qualify a TPROXY plan; the adapter must prove its selected backend or report unsupported. Retain the TUN rejection until one exact routing owner passes readback and forced-death cleanup canaries.
+1. **Bridge safety:** the `100.64.0.0/10`, mandatory-exclusion, empty allow/deny, TUN-rejection, and converged-`addrsyncd` readiness checkpoints are complete. The Stage-1 [Generation-scoped functional capture canary](functional-capture-canary.md) model, coordinator ordering, lifecycle tests, protocol-v3 verification status, and authoritative schema-v2 listener/delivery validator are complete; production still explicitly selects structural-only compatibility. The first privileged Linux namespace checkpoint proves the isolated dual-stack TCP/UDP/DNS topology and exact cleanup. The delivered third-probe-namespace checkpoint now proves real dual-stack TCP/UDP echo plus DNS-over-UDP/TCP PREROUTING TPROXY, accepted-socket and strict ancillary-data original-destination recovery, marked relay egress, source-preserving UDP replies, nonce-bound DNS evidence, per-family route controls/counters, and cleanup. The strict Linux/Android `/proc` FD plus INET_DIAG outbound-collector prerequisite is also complete, binding protocol, exact tuple, UID, mark, FD/inode/cookie, complete dumps, process identity, and timing. The credential-only preflight proves exact nonzero probe/engine UID+GID roles, empty groups, zero role capabilities, and explicit optional-skip/required-failure semantics without traffic. The fail-closed TPROXY-only local-OUTPUT executor seam is now complete; current xtables support reports unsupported before mutation and has no positive raw type. Ingress, collector, credential, and seam evidence still cannot authorize the current local-OUTPUT production domain: the next bridge-safety checkpoints are prebound socket-observation sessions and a real listener-observer/report factory with an explicit local-OUTPUT capture receipt, exact runtime credentials, and cleanup authority before schema-v2 construction. REDIRECT/DNAT cannot qualify a TPROXY plan; the adapter must prove its selected backend or report unsupported. Retain the TUN rejection until one exact routing owner passes readback and forced-death cleanup canaries.
 2. **Native Phase 3 correctness:** add exact device/artifact identity; select positive mark policies from a compile-time reviewed stable artifact catalog and then bind them to boot/namespace freshness; complete the remaining 24 census cells and point-in-time coordinator; prove writer semantics, observer continuity, mark preservation, domain/network-selection handoff, and route reachability; only then allocate priorities/tables/marks or mutate the kernel.
 3. **Optional eBPF implementation/probe:** implement the exact near-term `xt_bpf` capability probe without delaying the first two lanes, land compiler integration in Phase 4, and retain broader observation work for Phase 7. Positive acceleration waits for the Rust xtables compiler, a complete conventional classifier, parity evidence, and device benchmarks.
 
@@ -64,14 +64,17 @@ After the Capability Profile admits mutation, startup invokes bounded `startup-r
 
 Direct Sing-Box and phase-shell children arm `PR_SET_PDEATHSIG(SIGKILL)` with a parent-race check. This contains direct children on daemon death, not whole process trees: phase descendants do not inherit it and BusyBox credential changes may clear it, which is why BusyBox generations require quarantine rather than automatic restart.
 
-The exact Linux distinct-UID/GID credential preflight is delivered but sends no traffic. Still
-deferred are the separate local-OUTPUT executor, real schema-v2 listener-
-observer/report factories, outbound-collector integration, and Android adapter/qualification. The
-validator itself is complete and rejects weak, substituted, lossy, stale, or transport-incomplete
-delivery evidence. The local-OUTPUT split is mandatory: an empirical Linux harness showed that
-OUTPUT marking plus a local policy route did not re-enter PREROUTING, and xtables TPROXY cannot
-attach to OUTPUT. REDIRECT/DNAT delivery cannot qualify that TPROXY backend, so an adapter must
-prove backend-specific listener delivery or report unsupported. The delivered preflight makes
+The exact Linux distinct-UID/GID credential preflight is delivered but sends no traffic. The
+TPROXY-only local-OUTPUT executor boundary is also delivered: read-only typed availability is
+separate from prepared execution, drivers return raw observations, and only a module-private
+factory may promote them. The current zero-state xtables driver reports `Unsupported` with cleanup
+`NotRequired` before mutation because OUTPUT marking does not re-enter PREROUTING TPROXY; its
+prepared/raw type is uninhabited, so it adds no positive traffic or evidence path. Still deferred
+are a real local-OUTPUT capture receipt, schema-v2 listener-observer/report factories, prebound
+outbound-collector integration, capability-qualified engine/probe execution, and Android
+adapter/qualification. The validator itself is complete and rejects weak, substituted, lossy,
+stale, or transport-incomplete delivery evidence. REDIRECT/DNAT, ingress promotion, counters,
+route lookups, and veth-bounce substitutions cannot qualify that TPROXY backend. The delivered preflight makes
 missing helpers, subordinate IDs, parent maps, and group authority an explicit optional-mode skip
 or required-mode failure, never a root/root or same-UID fallback. Also deferred are an exact-device TUN single-
 owner and forced-death route-cleanup canary, ancestor-safe `openat`/`openat2` traversal, long-term
@@ -446,13 +449,16 @@ Before a backend may be selected automatically, its documentation must include:
 ## Immediate implementation backlog
 
 1. Keep the Rust-owned bridge TUN rejection until an exact Flux or Sing-Box owner passes route readback and forced-death cleanup canaries; then replace the rejection with that single proven owner.
-2. Build the separate local-OUTPUT producer/executor on the delivered exact credential preflight, a
-   TPROXY-only selected request backend, real listener-socket observation and delivery-report
-   factories, the exact attempt-owned supervised report schema/object identity or a separately
-   qualified cgroup-eBPF authority, the delivered strict `/proc` FD plus INET_DIAG outbound
-   collector, and the completed schema-v2 `validate_for` path. REDIRECT/DNAT cannot qualify TPROXY;
-   report unsupported when the selected backend's listener path cannot be proven. Only then
-   implement the explicit Android adapter and qualification matrix.
+2. Continue the positive local-OUTPUT producer on the delivered fail-closed TPROXY-only seam and
+   exact credential preflight. Add an explicit local-OUTPUT capture receipt, exact probe and engine
+   UID+GID/process observations, real listener-socket and delivery-report factories, report-object
+   cleanup proof, the exact attempt-owned supervised report schema/object identity or a separately
+   qualified cgroup-eBPF authority, and a prebound strict `/proc` FD plus INET_DIAG outbound
+   collector whose real port ID is in the request authority. Then execute traffic through the
+   completed schema-v2 `validate_for` path. REDIRECT/DNAT, ingress traffic, counters, route lookups,
+   and veth-bounce paths cannot qualify TPROXY; report unsupported when the selected backend's
+   listener path cannot be proven. Only then implement the explicit Android adapter and
+   qualification matrix.
 3. Repair legacy CLI status, installation migration, and package/source manifest provenance.
 4. Capture the current real-device baseline and replace every placeholder evidence field.
 5. Build and persist the exact versioned Sing-Box Engine Capability Profile before compiling any final Generation.

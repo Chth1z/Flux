@@ -107,10 +107,27 @@ the exact Generation/engine/namespace/Capture Program/selector and listener FD/i
 state; TCP accept or UDP `recvmsg` delivery; one attempt authority and loss baseline; stable
 and globally noncolliding per-family/protocol listener identities; accepted children distinct from
 every listener; and exact inbound wire length/SHA-256 including DNS/TCP framing. Positive
-constructors remain private and test-only. The distinct-UID local-OUTPUT
-executor, production observer/report factories, and outbound-collector integration remain later
-checkpoints. REDIRECT/DNAT cannot qualify TPROXY; the local-OUTPUT adapter must prove delivery to
-the selected backend's listener or report unsupported.
+constructors remain private and test-only. A production-compiled TPROXY-only local-OUTPUT
+executor/driver/factory seam is now delivered. It rejects REDIRECT/DNAT requests before driver
+preparation, maps typed pre-mutation availability to cleanup `NotRequired`, requires authoritative
+cleanup after preparation, and permits only its private factory to promote raw observations. The
+current zero-state xtables driver returns `Unsupported` before mutation because OUTPUT marking does
+not reach PREROUTING TPROXY; its prepared/raw type is uninhabited, so it sends no traffic and cannot
+construct positive evidence. Production observer/report factories, a local-OUTPUT capture receipt,
+prebound outbound-collector integration, and capability-qualified execution remain later
+checkpoints. Ingress, REDIRECT/DNAT, counters, route lookups, or a veth bounce cannot qualify
+TPROXY.
+
+Run the deterministic seam and coordinator regressions with:
+
+```text
+cargo test -p fluxd functional_canary::local_output
+cargo test -p fluxd xtables_local_output_executor_never_reaches_running
+```
+
+These tests are unprivileged. They perform no traffic or kernel mutation and do not add a positive
+host executor. "Fail-closed" here describes evidence admission only; it does not alter the
+separate user-selected connectivity failure policy.
 
 The delivered credential-only local-OUTPUT preflight is also opt-in:
 
@@ -229,4 +246,4 @@ Every phase process has a nonzero execution deadline capped at 60 seconds. The R
 
 On daemon startup, the Capability Profile first decides whether mutation is admissible. An admitted runtime runs the bounded `startup-recover` phase before strict `flux.toml` loading, so a broken current configuration cannot strand same-boot capture; recovery must also succeed before administrative intent is read, persisted, or executed and before the control socket is admitted. Below-floor or unverified profiles stay on the non-mutating read-only path and never invoke recovery. Recovery is serialized by the dispatcher lock. With no lease and no capture evidence it idempotently publishes `STOPPED`. A same-boot Rust lease removes the exact active generation, or uses the immutable prepared generation for markerless partial activation, then stops TPROXY before address synchronization and proves capture evidence absent. For a direct engine launch, `PDEATHSIG` supplies the child-death proof, so recovery publishes `STOPPED`, clears active/previous/verification records, and releases the lease. For `busybox-setuidgid`, child death cannot be proven after daemon loss: recovery publishes `FAILED` only after detachment, preserves the Rust lease and active engine generation, and blocks automatic daemon restart for explicit repair. Cleanup failure likewise preserves evidence and ownership. Same-boot legacy ownership is rejected without mutation; prior-boot evidence is retired without treating kernel objects as surviving the reboot.
 
-Phase 1 `capture-verify` proves shell-owned structural evidence; the always-on owner bypass prevents the default self-capture omission but is not itself a synthetic end-to-end traffic or exact-process loop-prevention proof. The Stage-1 typed canary model, coordinator ordering, failure injection, status contract, and authoritative schema-v2 listener/delivery validator are delivered, along with the first Stage-2 isolated topology checkpoint, the complete dual-stack TCP/UDP echo plus DNS-over-UDP/TCP third-namespace ingress PREROUTING TPROXY checkpoint, and the strict Linux/Android `/proc` FD plus INET_DIAG outbound-collector prerequisite. Deferred are the distinct-UID local-OUTPUT executor and backend-listener evidence producers using the completed validator, Android adapter and device qualification, ancestor-safe directory traversal with `openat`/`openat2`, long-term retention/rotation policy for Generation logs, a pidfd/timerfd reactor, full process-tree containment, and real-device release evidence on the minimum Android 5.10 kernel. Ingress or collector evidence cannot discharge the local-OUTPUT gate, REDIRECT/DNAT cannot qualify TPROXY, and production must remain `structural_only` rather than publish `functional_passed` from host evidence.
+Phase 1 `capture-verify` proves shell-owned structural evidence; the always-on owner bypass prevents the default self-capture omission but is not itself a synthetic end-to-end traffic or exact-process loop-prevention proof. The Stage-1 typed canary model, coordinator ordering, failure injection, status contract, authoritative schema-v2 listener/delivery validator, and fail-closed TPROXY-only local-OUTPUT executor seam are delivered, along with the first Stage-2 isolated topology checkpoint, the complete dual-stack TCP/UDP echo plus DNS-over-UDP/TCP third-namespace ingress PREROUTING TPROXY checkpoint, and the strict Linux/Android `/proc` FD plus INET_DIAG outbound-collector prerequisite. Deferred are the positive local-OUTPUT traffic producer and backend-listener/report factories using the completed validator, prebound collector sessions, Android adapter and device qualification, ancestor-safe directory traversal with `openat`/`openat2`, long-term retention/rotation policy for Generation logs, a pidfd/timerfd reactor, full process-tree containment, and real-device release evidence on the minimum Android 5.10 kernel. Ingress or collector evidence cannot discharge the local-OUTPUT gate, REDIRECT/DNAT cannot qualify TPROXY, and production must remain `structural_only` rather than publish `functional_passed` from host evidence.

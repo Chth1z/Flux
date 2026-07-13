@@ -1884,6 +1884,7 @@ mod tests {
     use flux_platform::{ReadinessEvidence, SingBoxLaunchSpec, SingBoxLauncher, SingBoxReadiness};
 
     use super::*;
+    use crate::functional_canary::local_output::xtables_tproxy_local_output_executor;
     use crate::functional_canary::tests::{
         Fixture as FunctionalCanaryFixture,
         request_with_engine_identity as functional_request_with_engine_identity,
@@ -2452,6 +2453,74 @@ mod tests {
                 Event::EngineRunning(CaptureObservation::Published),
                 Event::CanaryPrepared(generation(17)),
                 Event::CanaryExecuted(generation(17)),
+                Event::EngineRunning(CaptureObservation::Published),
+                Event::CanaryReobserved(generation(17)),
+                Event::CaptureStopped,
+                Event::EngineStopped(CaptureObservation::Detached),
+                Event::Published(PublishedRuntimeState::Failed),
+            ]
+        );
+        assert_eq!(
+            runtime.snapshot().verification,
+            RuntimeVerificationState::FunctionalFailed
+        );
+    }
+
+    #[test]
+    fn xtables_local_output_executor_never_reaches_running() {
+        let fixture = EngineFixture::new();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let request = functional_request_with_nonce(
+            &fixture.spec,
+            CanaryAddressFamilies::Ipv4Only,
+            Instant::now(),
+            CanaryNonce::from_bytes([49; FUNCTIONAL_CANARY_NONCE_BYTES]),
+        );
+        let canary_script = Arc::new(Mutex::new(ScriptedCanary::new([
+            ScriptedCanaryAttempt::passing(request),
+        ])));
+        let writer = ScriptedWriter {
+            events: Arc::clone(&events),
+            prepared: VecDeque::from([fixture.spec.clone()]),
+            next_generation_id: 17,
+            capture_start_failure: false,
+            capture_stop_failures: 0,
+            verify_failure: false,
+        };
+        let engine = RequiredScriptedEngine::new(
+            Arc::clone(&events),
+            [ready_canary_snapshot(98_765), ready_canary_snapshot(98_765)],
+        );
+        let functional_canary = RuntimeFunctionalCanary::RequiredUnqualified {
+            context: Box::new(ScriptedCanaryContext {
+                script: Arc::clone(&canary_script),
+                events: Arc::clone(&events),
+            }),
+            executor: xtables_tproxy_local_output_executor(),
+        };
+        let mut coordinator = RuntimeCoordinator::with_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+            functional_canary,
+        );
+        let runtime = coordinator.runtime_snapshot_source();
+
+        coordinator
+            .execute(&LegacyIntent::Running {
+                reason: Reason::Boot,
+            })
+            .expect_err("unsupported local-OUTPUT TPROXY prevents running");
+
+        assert_eq!(
+            *events.lock().expect("events lock"),
+            [
+                Event::Prepared(Reason::Boot),
+                Event::EngineRunning(CaptureObservation::Detached),
+                Event::CaptureStarted,
+                Event::CaptureVerified,
+                Event::EngineRunning(CaptureObservation::Published),
+                Event::CanaryPrepared(generation(17)),
                 Event::EngineRunning(CaptureObservation::Published),
                 Event::CanaryReobserved(generation(17)),
                 Event::CaptureStopped,

@@ -319,6 +319,7 @@ After the new Generation verifies, remove only Managed Objects belonging to the 
 - Failure during attachment triggers backend-specific compensation and re-observation.
 - If exact rollback cannot be proven, the default policy is fail-open: detach Flux capture first, retain diagnostics, and report `Failed`.
 - Fail-closed is an explicit user policy and must never be silently selected.
+- Functional-canary "fail-closed" evidence admission is orthogonal to that connectivity policy: weak or unavailable evidence cannot authorize the gate, but it does not silently select fail-closed traffic handling.
 - On daemon restart, the journal is replayed against Observed State; it is never assumed that the last recorded phase completed.
 
 In the Phase 1 implementation, failure to detach capture is not treated as fail-open success. Stop or activation-failure cleanup remains in `DetachPending`, retaining the child and Generation marker while blocking start/reload until detach is proven before engine retirement or `STOPPED`/`FAILED` publication. Failed or uncertain reload detach keeps the old engine in `CaptureRepairPending`; the candidate is not launched, and maintenance proves detach before republishing and freshly verifying old-Generation capture. A failed `RUNNING` publication is retried only after fresh engine observation, capture reassertion, structural verification, and the complete configured functional gate. Engine identity loss, repair/restoration, or address resynchronization invalidates a required-mode pass and schedules the same fresh gate. Verification uncertainty enters the capture-repair path; an observed exit takes repair precedence over publication.
@@ -607,10 +608,15 @@ every listener, and constant authority/loss baseline. Readiness evidence is
 only an admission input. The separate Linux credential preflight now proves exact nonzero
 probe/engine UID+GID roles, empty groups, zero role capabilities, and exact map/namespace readback
 without installing capture or sending traffic. Positive constructors remain private and test-only,
-so a local-OUTPUT executor, real observer/report factories, collector integration, and Android
-qualification remain separate gates. REDIRECT/DNAT cannot qualify TPROXY; an adapter
-must prove delivery to the selected backend's listener or report that backend unsupported. Host
-evidence still cannot authorize production `functional_passed`.
+while a production-compiled TPROXY-only executor/driver/factory seam now separates read-only
+availability, prepared execution, raw observation, and private evidence promotion. Its current
+zero-state xtables driver reports `Unsupported` with cleanup `NotRequired` before mutation because
+OUTPUT marking does not reach PREROUTING TPROXY; the prepared/raw type is uninhabited, so no
+positive evidence can be emitted. Required mode treats that result as a failed gate and never
+reaches `RUNNING`. Real local-OUTPUT capture receipts, observer/report factories, prebound collector
+integration, capability-qualified execution, and Android qualification remain separate gates.
+REDIRECT/DNAT, ingress promotion, counters, route lookups, and veth-bounce substitutions cannot
+qualify TPROXY. Host evidence still cannot authorize production `functional_passed`.
 
 The Phase 1 manifest is a strict UTF-8 line document no larger than 16 KiB. It rejects unknown, duplicate, malformed, missing, and conditional-field violations; startup and stop timeouts are decimal milliseconds in `1..=60000`. A boot-scoped dispatcher mode lease prevents Rust-owned phase verbs—including address resynchronization—from being mixed with legacy `scripts/core` engine ownership.
 

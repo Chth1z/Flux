@@ -141,7 +141,36 @@ alone, or counters cannot qualify a flow.
 
 The schema-v2 `validate_for` listener/delivery validation is complete. Production evidence
 construction is not: positive listener and delivery constructors remain private and test-only
-until a real observer/report factory and distinct-UID local-OUTPUT executor exist.
+until a real observer/report factory can prove the local-OUTPUT traffic domain and exact capture
+receipt. A production-compiled executor/driver/factory boundary now exists, but its current
+xtables raw-artifact type is uninhabited and therefore cannot construct positive evidence.
+
+### Fail-closed local-OUTPUT executor seam
+
+The delivered local-OUTPUT seam is an evidence-admission boundary, not a positive capture
+implementation. Request construction remains hardwired to TPROXY. The executor rejects a
+REDIRECT or DNAT request as `InvalidEvidence` with cleanup `NotRequired` before driver preparation.
+Driver preparation is read-only and can report only the typed availability classes
+`unsupported`, `denied`, `conflicting`, `broken`, or `unknown`; each maps to
+`Availability(...)` with cleanup `NotRequired`. A prepared value marks the boundary after which
+mutation may have occurred. Failures after that point must carry cleanup `VerifiedAbsent` or
+`Uncertain`; a missing or inconsistent proof is promoted to `CleanupUncertain` with cleanup
+`Uncertain`.
+
+The driver returns raw observations only. A module-private evidence factory is the sole promotion
+path into schema-v2 gate evidence. The current zero-state xtables driver has no prepared value: it
+reports `Availability(Unsupported)` before acquiring a networking writer or mutating state because
+the installed program can only mark OUTPUT and apply TPROXY in PREROUTING. It never attempts
+TPROXY in OUTPUT and never substitutes REDIRECT, DNAT, ingress PREROUTING traffic, a veth bounce,
+counters, or route-lookup inference. Its raw type and the current factory input are uninhabited, so
+the seam cannot produce a positive host result.
+
+Before a positive factory can inhabit that path, it must bind an explicit local-OUTPUT capture
+receipt rather than trusting a `Tproxy` label, observe the exact probe and engine UID+GID/process
+credentials, prove report-object cleanup and cleanup timing, and bind the real pre-opened socket-
+diagnostics authority. Those are later checkpoints. "Fail-closed" here means weak evidence cannot
+qualify the gate; it does not override the separate user-selected fail-open versus fail-closed
+connectivity compensation policy.
 
 ## Contained peer topology
 
@@ -256,9 +285,10 @@ responder. UDP additionally cross-checks the transparent response socket bound t
 destination and connected to the exact probe tuple, proving source-preserving responses. The DNS
 flows retain the existing transaction/question/answer checks over both transports and cross-check
 the parsed client, relay, and peer reports. The schema-v2 validator is complete, but these ingress
-reports are not authoritative constructors for it. A distinct-UID local-OUTPUT executor must
-produce the backend-specific listener and delivery records, invoke the outbound collector against
-the exact supervised engine, and construct the remaining attempt evidence.
+reports are not authoritative constructors for it. A positive distinct-UID local-OUTPUT producer
+behind the delivered executor seam must produce the backend-specific listener and delivery records,
+invoke the outbound collector against the exact supervised engine, and construct the remaining
+attempt evidence.
 
 ### Delivered `/proc` FD plus INET_DIAG correlation prerequisite
 
@@ -353,15 +383,20 @@ functional pass.
    empty supplementary groups, exact namespace/map readback, zero role capabilities, and
    `NoNewPrivs`. Optional mode skips unavailable outer prerequisites and required mode fails; exact
    validation failures fail in both modes. It sends no traffic and is not capture qualification.
-7. Add a separate local-OUTPUT qualification slice using the delivered credential preflight, real
-   listener-observer and delivery-report factories, the delivered outbound collector, and the
-   completed schema-v2 `validate_for` path. A separately qualified cgroup-eBPF observer may replace
+7. **Complete fail-closed seam:** the TPROXY-only executor separates read-only availability,
+   prepared execution, raw observations, and module-private evidence promotion. The current
+   xtables driver reports `unsupported` with cleanup `NotRequired` before mutation and has no
+   positive raw value. Required-mode coordinator regression proves this result cannot reach
+   `RUNNING`; production composition remains structural-only.
+8. Add a separate positive local-OUTPUT qualification slice using the delivered credential preflight, real
+   listener-observer and delivery-report factories, prebound integration of the delivered outbound
+   collector, and the completed schema-v2 `validate_for` path. A separately qualified cgroup-eBPF observer may replace
    the report only after its own authority and loss contract is proven. REDIRECT/DNAT delivery
    cannot qualify a TPROXY Generation; an adapter without a qualifying TPROXY listener path reports
    `unsupported`. This slice must not weaken the model to accommodate the ingress checkpoint.
-8. Add an Android lab adapter that reports explicit `unsupported`, `denied`, `conflicting`,
+9. Add an Android lab adapter that reports explicit `unsupported`, `denied`, `conflicting`,
    `broken`, or `unknown` evidence. It remains diagnostic-only until exact-device qualification.
-9. Permit TPROXY `RUNNING` only for reviewed device profiles whose functional canary passes the
+10. Permit TPROXY `RUNNING` only for reviewed device profiles whose functional canary passes the
    real-device matrix and cleanup/crash tests. Other profiles remain unqualified; broaden the
    reviewed set without weakening the probe. TUN remains rejected until its separate
    single-route-owner and forced-death cleanup canaries pass.
@@ -419,7 +454,7 @@ mutation, preflight requires the xtables TPROXY, mark, comment, family TPROXY, a
 support to be visible as already active under `/sys/module`; otherwise it skips or fails rather
 than triggering implicit module autoload.
 
-Until the separate local-OUTPUT slice and real-device qualification are evidenced, Flux must
+Until the positive local-OUTPUT producer and real-device qualification are evidenced, Flux must
 describe Phase 1 capture verification as structural and the functional exit gate as incomplete.
 The delivered collector, host ingress tests, Linux namespaces, route lookups, or successful
 counters do not authorize production `functional_passed` and do not constitute Android evidence.

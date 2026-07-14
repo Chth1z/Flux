@@ -1,0 +1,99 @@
+*mangle
+:PROXY_PREROUTING6 - [0:0]
+:PROXY_OUTPUT6 - [0:0]
+:BYPASS_IP6 - [0:0]
+:APP_CHAIN6 - [0:0]
+:ACTION_PROXY_PRE6 - [0:0]
+:ACTION_PROXY_OUT6 - [0:0]
+:ACTION_BYPASS6 - [0:0]
+:BYP_Z06 - [0:0]
+:BYP_Z16 - [0:0]
+:BYP_Z26 - [0:0]
+:BYP_Z36 - [0:0]
+:BYP_Z46 - [0:0]
+:BYP_Z56 - [0:0]
+:BYP_Z66 - [0:0]
+:BYP_Z76 - [0:0]
+:BYP_Z86 - [0:0]
+:BYP_Z96 - [0:0]
+:BYP_Z106 - [0:0]
+:BYP_Z116 - [0:0]
+:BYP_Z126 - [0:0]
+:BYP_Z136 - [0:0]
+:BYP_Z146 - [0:0]
+:BYP_Z156 - [0:0]
+:DIVERT6 - [0:0]
+-A ACTION_BYPASS6 -j CONNMARK --set-xmark 0x11/0xff
+-A ACTION_BYPASS6 -j ACCEPT
+-A ACTION_PROXY_PRE6 -j CONNMARK --set-xmark 0x19/0xff
+-A ACTION_PROXY_PRE6 -j MARK --set-xmark 0x19/0xff
+-A ACTION_PROXY_PRE6 -p tcp -j TPROXY --on-port 1536 --tproxy-mark 0x19/0xff
+-A ACTION_PROXY_PRE6 -p udp -j TPROXY --on-port 1536 --tproxy-mark 0x19/0xff
+-A ACTION_PROXY_PRE6 -j ACCEPT
+-A ACTION_PROXY_OUT6 -j CONNMARK --set-xmark 0x19/0xff
+-A ACTION_PROXY_OUT6 -j MARK --set-xmark 0x19/0xff
+-A ACTION_PROXY_OUT6 -j ACCEPT
+-A BYP_Z06 -d ::/128 -j ACTION_BYPASS6
+-A BYP_Z06 -d ::1/128 -j ACTION_BYPASS6
+-A BYP_Z06 -d ::ffff:0:0/96 -j ACTION_BYPASS6
+-A BYP_Z16 -d 100::/64 -j ACTION_BYPASS6
+-A BYP_Z66 -d 64:ff9b::/96 -j ACTION_BYPASS6
+-A BYP_Z26 -d 2001::/32 -j ACTION_BYPASS6
+-A BYP_Z26 -d 2001:10::/28 -j ACTION_BYPASS6
+-A BYP_Z26 -d 2001:20::/28 -j ACTION_BYPASS6
+-A BYP_Z26 -d 2001:db8::/32 -j ACTION_BYPASS6
+-A BYP_Z26 -d 2002::/16 -j ACTION_BYPASS6
+-A BYP_Z156 -d fe80::/10 -j ACTION_BYPASS6
+-A BYP_Z156 -d ff00::/8 -j ACTION_BYPASS6
+-A BYPASS_IP6 -d 0000::/4 -j BYP_Z06
+-A BYPASS_IP6 -d 1000::/4 -j BYP_Z16
+-A BYPASS_IP6 -d 2000::/4 -j BYP_Z26
+-A BYPASS_IP6 -d 6000::/4 -j BYP_Z66
+-A BYPASS_IP6 -d f000::/4 -j BYP_Z156
+-A APP_CHAIN6 -m owner --uid-owner 1000 --gid-owner 1000 -j ACTION_BYPASS6
+-A APP_CHAIN6 -m owner --uid-owner 210124 -j ACTION_PROXY_OUT6
+-A APP_CHAIN6 -m owner --uid-owner 1010124 -j ACTION_PROXY_OUT6
+-A APP_CHAIN6 -m owner --uid-owner 210123 -j ACTION_PROXY_OUT6
+-A APP_CHAIN6 -m owner --uid-owner 1010123 -j ACTION_PROXY_OUT6
+-A APP_CHAIN6 -j ACCEPT
+-A DIVERT6 -j MARK --set-xmark 0x19/0xff
+-A DIVERT6 -j ACCEPT
+-A PROXY_PREROUTING6 -p tcp -m socket --transparent -j DIVERT6
+-A PROXY_PREROUTING6 -m conntrack --ctdir REPLY -j ACCEPT
+-A PROXY_OUTPUT6 -m conntrack --ctdir REPLY -j ACCEPT
+-A PROXY_PREROUTING6 -m connmark --mark 0x11/0xff -j ACCEPT
+-A PROXY_OUTPUT6 -m connmark --mark 0x11/0xff -j ACCEPT
+-A PROXY_PREROUTING6 -m connmark --mark 0x19/0xff -p tcp -j TPROXY --on-port 1536 --tproxy-mark 0x19/0xff
+-A PROXY_PREROUTING6 -m connmark --mark 0x19/0xff -p udp -j TPROXY --on-port 1536 --tproxy-mark 0x19/0xff
+-A PROXY_PREROUTING6 -m connmark --mark 0x19/0xff -j ACCEPT
+-A PROXY_OUTPUT6 -m connmark --mark 0x19/0xff -j MARK --set-xmark 0x19/0xff
+-A PROXY_OUTPUT6 -m connmark --mark 0x19/0xff -j ACCEPT
+-A PROXY_PREROUTING6 -j BYPASS_IP6
+-A PROXY_PREROUTING6 -i lo -j ACCEPT
+-A PROXY_PREROUTING6 -i wlan+ -j ACCEPT
+-A PROXY_PREROUTING6 -i rmnet+ -j ACCEPT
+-A PROXY_PREROUTING6 -i wlan+ -j ACCEPT
+-A PROXY_PREROUTING6 -i rmnet_data+ -j ACTION_PROXY_PRE6
+-A PROXY_PREROUTING6 -i wlan2 -j ACTION_PROXY_PRE6
+-A PROXY_PREROUTING6 -j ACCEPT
+-A PROXY_OUTPUT6 -j BYPASS_IP6
+-A PROXY_OUTPUT6 -o wlan+ -j ACTION_BYPASS6
+-A PROXY_OUTPUT6 -o rmnet+ -j ACTION_BYPASS6
+-A PROXY_OUTPUT6 -o wlan+ -j ACTION_BYPASS6
+-A PROXY_OUTPUT6 -o wlan0 -j ACTION_BYPASS6
+-A PROXY_OUTPUT6 -o rndis+ -j ACTION_BYPASS6
+-A PROXY_OUTPUT6 -j APP_CHAIN6
+-A PROXY_OUTPUT6 -j ACTION_PROXY_OUT6
+-I PREROUTING -j PROXY_PREROUTING6
+-I OUTPUT -j PROXY_OUTPUT6
+COMMIT
+*filter
+-A OUTPUT -d ::1 -p tcp -m owner --uid-owner 1000 --gid-owner 1000 -m tcp --dport 1536 -j REJECT
+COMMIT
+*nat
+-A OUTPUT -d fc00::/18 -p ipv6-icmp -j DNAT --to-destination ::1
+-A PREROUTING -d fc00::/18 -p ipv6-icmp -j DNAT --to-destination ::1
+COMMIT
+*mangle
+-A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+COMMIT

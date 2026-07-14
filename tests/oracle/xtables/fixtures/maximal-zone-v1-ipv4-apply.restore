@@ -1,0 +1,104 @@
+*mangle
+:PROXY_PREROUTING - [0:0]
+:PROXY_OUTPUT - [0:0]
+:BYPASS_IP - [0:0]
+:APP_CHAIN - [0:0]
+:ACTION_PROXY_PRE - [0:0]
+:ACTION_PROXY_OUT - [0:0]
+:ACTION_BYPASS - [0:0]
+:BYP_Z0 - [0:0]
+:BYP_Z1 - [0:0]
+:BYP_Z2 - [0:0]
+:BYP_Z3 - [0:0]
+:BYP_Z4 - [0:0]
+:BYP_Z5 - [0:0]
+:BYP_Z6 - [0:0]
+:BYP_Z7 - [0:0]
+:BYP_Z8 - [0:0]
+:BYP_Z9 - [0:0]
+:BYP_Z10 - [0:0]
+:BYP_Z11 - [0:0]
+:BYP_Z12 - [0:0]
+:BYP_Z13 - [0:0]
+:BYP_Z14 - [0:0]
+:BYP_Z15 - [0:0]
+:DIVERT - [0:0]
+-A ACTION_BYPASS -j CONNMARK --set-xmark 0x11/0xff
+-A ACTION_BYPASS -j ACCEPT
+-A ACTION_PROXY_PRE -j CONNMARK --set-xmark 0x14/0xff
+-A ACTION_PROXY_PRE -j MARK --set-xmark 0x14/0xff
+-A ACTION_PROXY_PRE -p tcp -j TPROXY --on-port 1536 --tproxy-mark 0x14/0xff
+-A ACTION_PROXY_PRE -p udp -j TPROXY --on-port 1536 --tproxy-mark 0x14/0xff
+-A ACTION_PROXY_PRE -j ACCEPT
+-A ACTION_PROXY_OUT -j CONNMARK --set-xmark 0x14/0xff
+-A ACTION_PROXY_OUT -j MARK --set-xmark 0x14/0xff
+-A ACTION_PROXY_OUT -j ACCEPT
+-A BYP_Z0 -d 0.0.0.0/8 -j ACTION_BYPASS
+-A BYP_Z0 -d 10.0.0.0/8 -j ACTION_BYPASS
+-A BYP_Z6 -d 100.64.0.0/10 -j ACTION_BYPASS
+-A BYP_Z7 -d 127.0.0.0/8 -j ACTION_BYPASS
+-A BYP_Z10 -d 169.254.0.0/16 -j ACTION_BYPASS
+-A BYP_Z10 -d 172.16.0.0/12 -j ACTION_BYPASS
+-A BYP_Z12 -d 192.0.0.0/24 -j ACTION_BYPASS
+-A BYP_Z12 -d 192.0.2.0/24 -j ACTION_BYPASS
+-A BYP_Z12 -d 192.88.99.0/24 -j ACTION_BYPASS
+-A BYP_Z12 -d 192.168.0.0/16 -j ACTION_BYPASS
+-A BYP_Z12 -d 198.51.100.0/24 -j ACTION_BYPASS
+-A BYP_Z12 -d 203.0.113.0/24 -j ACTION_BYPASS
+-A BYP_Z14 -d 224.0.0.0/4 -j ACTION_BYPASS
+-A BYP_Z15 -d 240.0.0.0/4 -j ACTION_BYPASS
+-A BYP_Z15 -d 255.255.255.255/32 -j ACTION_BYPASS
+-A BYPASS_IP -d 0.0.0.0/4 -j BYP_Z0
+-A BYPASS_IP -d 96.0.0.0/4 -j BYP_Z6
+-A BYPASS_IP -d 112.0.0.0/4 -j BYP_Z7
+-A BYPASS_IP -d 160.0.0.0/4 -j BYP_Z10
+-A BYPASS_IP -d 192.0.0.0/4 -j BYP_Z12
+-A BYPASS_IP -d 224.0.0.0/4 -j BYP_Z14
+-A BYPASS_IP -d 240.0.0.0/4 -j BYP_Z15
+-A APP_CHAIN -m owner --uid-owner 1000 --gid-owner 1000 -j ACTION_BYPASS
+-A APP_CHAIN -m owner --uid-owner 210124 -j ACTION_PROXY_OUT
+-A APP_CHAIN -m owner --uid-owner 1010124 -j ACTION_PROXY_OUT
+-A APP_CHAIN -m owner --uid-owner 210123 -j ACTION_PROXY_OUT
+-A APP_CHAIN -m owner --uid-owner 1010123 -j ACTION_PROXY_OUT
+-A APP_CHAIN -j ACCEPT
+-A DIVERT -j MARK --set-xmark 0x14/0xff
+-A DIVERT -j ACCEPT
+-A PROXY_PREROUTING -p tcp -m socket --transparent -j DIVERT
+-A PROXY_PREROUTING -m conntrack --ctdir REPLY -j ACCEPT
+-A PROXY_OUTPUT -m conntrack --ctdir REPLY -j ACCEPT
+-A PROXY_PREROUTING -m connmark --mark 0x11/0xff -j ACCEPT
+-A PROXY_OUTPUT -m connmark --mark 0x11/0xff -j ACCEPT
+-A PROXY_PREROUTING -m connmark --mark 0x14/0xff -p tcp -j TPROXY --on-port 1536 --tproxy-mark 0x14/0xff
+-A PROXY_PREROUTING -m connmark --mark 0x14/0xff -p udp -j TPROXY --on-port 1536 --tproxy-mark 0x14/0xff
+-A PROXY_PREROUTING -m connmark --mark 0x14/0xff -j ACCEPT
+-A PROXY_OUTPUT -m connmark --mark 0x14/0xff -j MARK --set-xmark 0x14/0xff
+-A PROXY_OUTPUT -m connmark --mark 0x14/0xff -j ACCEPT
+-A PROXY_PREROUTING -j BYPASS_IP
+-A PROXY_PREROUTING -i lo -j ACCEPT
+-A PROXY_PREROUTING -i wlan+ -j ACCEPT
+-A PROXY_PREROUTING -i rmnet+ -j ACCEPT
+-A PROXY_PREROUTING -i wlan+ -j ACCEPT
+-A PROXY_PREROUTING -i rmnet_data+ -j ACTION_PROXY_PRE
+-A PROXY_PREROUTING -i wlan2 -j ACTION_PROXY_PRE
+-A PROXY_PREROUTING -j ACCEPT
+-A PROXY_OUTPUT -j BYPASS_IP
+-A PROXY_OUTPUT -o wlan+ -j ACTION_BYPASS
+-A PROXY_OUTPUT -o rmnet+ -j ACTION_BYPASS
+-A PROXY_OUTPUT -o wlan+ -j ACTION_BYPASS
+-A PROXY_OUTPUT -o wlan0 -j ACTION_BYPASS
+-A PROXY_OUTPUT -o rndis+ -j ACTION_BYPASS
+-A PROXY_OUTPUT -j APP_CHAIN
+-A PROXY_OUTPUT -j ACTION_PROXY_OUT
+-I PREROUTING -j PROXY_PREROUTING
+-I OUTPUT -j PROXY_OUTPUT
+COMMIT
+*filter
+-A OUTPUT -d 127.0.0.1 -p tcp -m owner --uid-owner 1000 --gid-owner 1000 -m tcp --dport 1536 -j REJECT
+COMMIT
+*nat
+-A OUTPUT -d 198.18.0.0/15 -p icmp -j DNAT --to-destination 127.0.0.1
+-A PREROUTING -d 198.18.0.0/15 -p icmp -j DNAT --to-destination 127.0.0.1
+COMMIT
+*mangle
+-A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+COMMIT

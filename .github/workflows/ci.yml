@@ -55,3 +55,20 @@ jobs:
           cargo test --manifest-path addrsyncd/Cargo.toml
           cargo clippy --manifest-path addrsyncd/Cargo.toml --all-targets -- -D warnings
           cargo check --manifest-path addrsyncd/Cargo.toml --target aarch64-linux-android --all-targets
+
+  xtables-oracle:
+    name: Pinned xtables shell oracle
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.93.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Pull exact BusyBox linux/amd64 oracle image
+        run: >-
+          docker pull --platform=linux/amd64
+          docker.io/library/busybox@sha256:dfb66b2b3e6981fefa54fd2cd4faf662c35b4a4baeff48295a9409ddf3224c48
+      - name: Verify pinned xtables restore fixtures
+        run: cargo xtask xtables-oracle --check

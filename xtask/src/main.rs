@@ -8,6 +8,8 @@ use std::process::{Command, ExitStatus};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+mod xtables_oracle;
+
 const ANDROID_TARGET: &str = "aarch64-linux-android";
 const ANDROID_API_LEVEL: &str = "31";
 const ANDROID_NDK_REVISION: &str = "27.3.13750724";
@@ -145,6 +147,10 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
         "test-functional-canary-linux-output-preflight" => {
             require_no_arguments(&arguments)?;
             test_functional_canary_linux_output_preflight()
+        }
+        "xtables-oracle" => {
+            let mode = xtables_oracle::parse_options(&arguments)?;
+            xtables_oracle::run(mode)
         }
         "stage-module" => stage_module(parse_stage_module_options(&arguments)?),
         "verify-package" => verify_package(parse_verify_package_options(&arguments)?),
@@ -2187,6 +2193,7 @@ fn print_help() {
            test-functional-canary-linux  Run the opt-in ignored privileged Linux canary checkpoint\n\
            test-functional-canary-linux-tproxy  Run the ingress-only Linux TPROXY checkpoint\n\
            test-functional-canary-linux-output-preflight  Preflight distinct local-OUTPUT credentials (no traffic)\n\
+           xtables-oracle Verify or explicitly update pinned shell-generated restore fixtures; requires --check or --update\n\
            stage-module   Build and stage a Magisk tree; requires --stage DIR --runtime-binaries DIR\n\
            verify-package Verify a populated release stage; requires --stage DIR\n\
            ci             Run all checks that do not require an NDK linker"

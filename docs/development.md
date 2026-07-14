@@ -139,8 +139,9 @@ request's explicit probe/engine UID+GID and credential-map domain, exact engine 
 client/peer PID/start-tick/handle observations, restricted credentials, role namespaces, exact
 cleanup retirements, and chronology before the evidence factory can run. The Linux/Android
 `ProcessHandle` substrate opens only from retained children, verifies stable process-wide
-credentials through pidfd/procfs correlation, and distinguishes exit from confirmed parent reap;
-the no-traffic credential preflight exercises that ordering. The first integration subcheckpoint
+credentials plus user/mount/network namespace and UID/GID-map domains through pidfd/procfs
+correlation, and distinguishes exit from confirmed parent reap; the no-traffic credential
+preflight exercises that ordering. The first integration subcheckpoint
 is now delivered: `SingBoxChild::open_process_handle` opens exclusively from the retained live
 `std::process::Child`, rechecks the recorded PID/start ticks against the resulting pidfd/procfs
 identity, and does not transfer signaling, waiting, or reaping authority. `EngineSupervisor`
@@ -155,24 +156,32 @@ adapter-owned TERM/reap, retained-handle exit observation after reap, request/au
 a real Supervisor-to-pidfd lifecycle, successful required-mode opening, and the required xtables
 path preserving `Unsupported` without opening an authority or reaching `RUNNING`.
 
-The next engine-observation subcheckpoint is also delivered. `ProcessHandle::initial_observation`
-returns the exact identity and credentials captured during child-origin pidfd opening. The process
-verifier consumes `EngineChildAuthority`, preserves that initial observation at the daemon-owned
-opening time, reobserves the same retained pidfd after capture verification, timestamps completion
+The exact engine-observation-pair subcheckpoint is also delivered.
+`ProcessHandle::initial_observation` returns the exact identity, credentials, and process domain
+captured during child-origin pidfd opening. The process verifier consumes `EngineChildAuthority`,
+preserves that initial observation at the daemon-owned opening time, reobserves the same retained
+pidfd after capture verification, timestamps completion
 only after the full scan, and receives a non-cloneable raw pair bound to the exact request engine,
-snapshot revision, private opening identity, stable credentials, and exclusive deadline. The pair
-keeps the handle private and exposes no signal, wait, or reap operation. Exit or deadline failure
-at this post-preparation stage is cleanup-uncertain and cannot call the evidence factory. A real
-child regression proves the pair reaches only the process verifier while the parent still owns
-termination and reap; a second regression proves exit between observations fails closed.
+snapshot revision, private opening identity, stable complete process observation, and exclusive
+deadline. The pair keeps the handle private and exposes no signal, wait, or reap operation. Exit
+or deadline failure at this post-preparation stage is cleanup-uncertain and cannot call the evidence
+factory. A real child regression proves the pair reaches only the process verifier while the parent
+still owns termination and reap; a second regression proves exit between observations fails closed.
+
+The engine credential-policy/domain subcheckpoint is now delivered as well. Each platform
+observation opens user/mount/network namespace descriptors for every task and performs a bounded
+two-pass UID/GID-map read; the census rejects heterogeneous or changing task credentials,
+namespaces, maps, malformed canonical extents, oversized content, and excess entries. The process
+verifier requires both engine observations to match the immutable request's exact four-slot UID/GID
+policy, empty supplementary groups, zero capabilities, `NoNewPrivs`, exact user/mount/map domain,
+and daemon network namespace. Mismatch is cleanup-uncertain, the evidence factory is not called,
+and the adapter retains termination/reap ownership.
 
 Both production receipt authorities therefore remain uninhabited, and the current zero-state
 xtables driver still returns `Unsupported` before mutation because OUTPUT marking does not reach
 PREROUTING TPROXY. The combined integration checkpoint remains incomplete and is split into the
-following remaining reviews: authoritative engine user/mount/network namespace plus UID/GID-map
-observation; validation that all four UID/GID slots match the request, supplementary groups and
-capabilities are empty, and `NoNewPrivs` is set; final verifier-side completion chronology and
-prepared-driver client/peer ownership and retirement; an independent listener observer that proves
+following remaining reviews: final verifier-side completion chronology and prepared-driver
+client/peer ownership and retirement; an independent listener observer that proves
 UDP listener state, FD/inode/cookie, transparency, and IPv6-only state; a bounded versioned
 supervised-report parser and immutable engine capability contract; and actual prebound collector
 observations, cleanup binding, and schema-v2 factory execution with test-only fixtures. Readiness
@@ -365,4 +374,4 @@ Every phase process has a nonzero execution deadline capped at 60 seconds. The R
 
 On daemon startup, the Capability Profile first decides whether mutation is admissible. An admitted runtime runs the bounded `startup-recover` phase before strict `flux.toml` loading, so a broken current configuration cannot strand same-boot capture; recovery must also succeed before administrative intent is read, persisted, or executed and before the control socket is admitted. Below-floor or unverified profiles stay on the non-mutating read-only path and never invoke recovery. Recovery is serialized by the dispatcher lock. With no lease and no capture evidence it idempotently publishes `STOPPED`. A same-boot Rust lease removes the exact active generation, or uses the immutable prepared generation for markerless partial activation, then stops TPROXY before address synchronization and proves capture evidence absent. For a direct engine launch, `PDEATHSIG` supplies the child-death proof, so recovery publishes `STOPPED`, clears active/previous/verification records, and releases the lease. For `busybox-setuidgid`, child death cannot be proven after daemon loss: recovery publishes `FAILED` only after detachment, preserves the Rust lease and active engine generation, and blocks automatic daemon restart for explicit repair. Cleanup failure likewise preserves evidence and ownership. Same-boot legacy ownership is rejected without mutation; prior-boot evidence is retired without treating kernel objects as surviving the reboot.
 
-Phase 1 `capture-verify` proves shell-owned structural evidence; the always-on owner bypass prevents the default self-capture omission but is not itself a synthetic end-to-end traffic or exact-process loop-prevention proof. The Stage-1 typed canary model, coordinator ordering, failure injection, status contract, authoritative schema-v2 listener/delivery validator, temporal cleanup/retirement validator, fail-closed TPROXY-only local-OUTPUT executor seam, explicit per-flow capture-receipt/verifier contract, process-ownership receipt contract, child-origin pidfd substrate, exact retained-engine before/after observation pair, prebound socket-diagnostics session transport, and type-safe attempt-owned observer handoff are delivered, along with the first Stage-2 isolated topology checkpoint, the complete dual-stack TCP/UDP echo plus DNS-over-UDP/TCP third-namespace ingress PREROUTING TPROXY checkpoint, and the strict Linux/Android `/proc` FD plus INET_DIAG outbound-collector prerequisite. The exact retained engine-child authority now travels from `SingBoxChild` through matching `EngineSupervisor` ownership and the serialized coordinator into the process-verifier boundary while preserving adapter-owned signal/wait/reap authority. Deferred are the positive traffic producer; engine credential-policy and namespace/map-domain validation, verifier-side completion chronology, and prepared-driver client/peer child ownership; backend listener observation and delivery-report parsing/factories; actual prebound collector observations; Android adapter and device qualification; ancestor-safe directory traversal with `openat`/`openat2`; long-term retention/rotation policy for Generation logs; pidfd/timerfd reactor integration; full process-tree containment; and real-device release evidence on the minimum Android 5.10 kernel. Both production receipt authorities remain uninhabited, current xtables remains `Unsupported`, optional eBPF requires separate qualification, and no explicit `.ko` load/unload operation was added. The legacy structural bridge has not yet proven that every xtables/kernel dependency is already active without implicit module requests, so it cannot satisfy the future no-autoload qualification. Ingress or collector evidence cannot discharge the local-OUTPUT gate, REDIRECT/DNAT cannot qualify TPROXY, and production must remain `structural_only` rather than publish `functional_passed` from host evidence.
+Phase 1 `capture-verify` proves shell-owned structural evidence; the always-on owner bypass prevents the default self-capture omission but is not itself a synthetic end-to-end traffic or exact-process loop-prevention proof. The Stage-1 typed canary model, coordinator ordering, failure injection, status contract, authoritative schema-v2 listener/delivery validator, temporal cleanup/retirement validator, fail-closed TPROXY-only local-OUTPUT executor seam, explicit per-flow capture-receipt/verifier contract, process-ownership receipt contract, child-origin pidfd substrate, exact retained-engine before/after observation pair, authoritative engine credential-policy/domain validation, prebound socket-diagnostics session transport, and type-safe attempt-owned observer handoff are delivered, along with the first Stage-2 isolated topology checkpoint, the complete dual-stack TCP/UDP echo plus DNS-over-UDP/TCP third-namespace ingress PREROUTING TPROXY checkpoint, and the strict Linux/Android `/proc` FD plus INET_DIAG outbound-collector prerequisite. The exact retained engine-child authority now travels from `SingBoxChild` through matching `EngineSupervisor` ownership and the serialized coordinator into the process-verifier boundary while preserving adapter-owned signal/wait/reap authority. Deferred are the positive traffic producer; verifier-side completion chronology and prepared-driver client/peer child ownership; backend listener observation and delivery-report parsing/factories; actual prebound collector observations; Android adapter and device qualification; ancestor-safe directory traversal with `openat`/`openat2`; long-term retention/rotation policy for Generation logs; pidfd/timerfd reactor integration; full process-tree containment; and real-device release evidence on the minimum Android 5.10 kernel. Both production receipt authorities remain uninhabited, current xtables remains `Unsupported`, optional eBPF requires separate qualification, and no explicit `.ko` load/unload operation was added. The legacy structural bridge has not yet proven that every xtables/kernel dependency is already active without implicit module requests, so it cannot satisfy the future no-autoload qualification. Ingress or collector evidence cannot discharge the local-OUTPUT gate, REDIRECT/DNAT cannot qualify TPROXY, and production must remain `structural_only` rather than publish `functional_passed` from host evidence.

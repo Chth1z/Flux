@@ -24,11 +24,12 @@ use std::convert::Infallible;
 #[cfg(test)]
 use crate::engine_supervisor::OwnedEngineIdentity;
 use crate::engine_supervisor::{EngineChildAuthority, EngineChildObservationPair};
+use flux_platform::ProcessObservation;
 
 use super::{
-    CanaryAttemptRequest, CanaryAttemptSocketObserverSession, CanaryAvailability,
-    CanaryCaptureBackend, CanaryCleanupStatus, CanaryErrorKind, FunctionalCanaryError,
-    UnqualifiedCanaryGateEvidence, UnqualifiedFunctionalCanaryExecution,
+    CANARY_CREDENTIAL_MAP_DIGEST_BYTES, CanaryAttemptRequest, CanaryAttemptSocketObserverSession,
+    CanaryAvailability, CanaryCaptureBackend, CanaryCleanupStatus, CanaryErrorKind,
+    FunctionalCanaryError, UnqualifiedCanaryGateEvidence, UnqualifiedFunctionalCanaryExecution,
     UnqualifiedFunctionalCanaryExecutor, bounded_prefix,
 };
 
@@ -1652,6 +1653,17 @@ struct EngineObservationBoundTproxyLocalOutputArtifacts<P, R> {
     observations: R,
 }
 
+/// Sealed engine-policy stage. Construction proves the raw same-handle pair
+/// satisfies the immutable request's credential and namespace/map domain, but
+/// still grants no authority over client/peer children and cannot mint the
+/// final all-role process receipt.
+struct EnginePolicyBoundTproxyLocalOutputArtifacts<P, R> {
+    capture_receipt: TproxyLocalOutputCaptureReceipt,
+    engine_observations: EngineChildObservationPair,
+    process_proof: P,
+    observations: R,
+}
+
 struct ReceiptBoundTproxyLocalOutputArtifacts<R> {
     capture_receipt: TproxyLocalOutputCaptureReceipt,
     process_ownership_receipt: TproxyLocalOutputProcessOwnershipReceipt,
@@ -1760,15 +1772,13 @@ fn bind_engine_child_observations<P, R>(
     let before = engine_observations.before();
     let after = engine_observations.after();
     let before_identity = before.process().identity();
-    let after_identity = after.process().identity();
     let deadline = request.deadline();
     if engine_observations.identity() != expected.engine()
         || engine_observations.engine_snapshot_revision() != expected.engine_snapshot_revision()
         || engine_observations.opening_id().get() == 0
         || before_identity.pid().get() != expected.engine().pid()
         || before_identity.start_time_ticks().get() != expected.engine().start_time_ticks()
-        || after_identity != before_identity
-        || before.process().credentials() != after.process().credentials()
+        || after.process() != before.process()
         || before.observed_at() < deadline.started_at()
         || before.observed_at() >= deadline.expires_at()
         || after.observed_at() < before.observed_at()
@@ -1777,7 +1787,7 @@ fn bind_engine_child_observations<P, R>(
         return Err(FunctionalCanaryError::new(
             CanaryErrorKind::CleanupUncertain,
             CanaryCleanupStatus::Uncertain,
-            "authoritative engine observation pair does not match the immutable request, stable credentials, or deadline chronology",
+            "authoritative engine observation pair does not match the immutable request, stable credentials/process domain, or deadline chronology",
         ));
     }
     Ok(EngineObservationBoundTproxyLocalOutputArtifacts {
@@ -1785,6 +1795,145 @@ fn bind_engine_child_observations<P, R>(
         engine_observations,
         process_proof: capture_bound.process_proof,
         observations: capture_bound.observations,
+    })
+}
+
+trait EngineProcessPolicyObservationView {
+    fn uids(&self) -> [u32; 4];
+    fn gids(&self) -> [u32; 4];
+    fn supplementary_groups(&self) -> &[u32];
+    fn capability_inheritable(&self) -> u64;
+    fn capability_permitted(&self) -> u64;
+    fn capability_effective(&self) -> u64;
+    fn capability_ambient(&self) -> u64;
+    fn no_new_privileges(&self) -> bool;
+    fn user_namespace(&self) -> (u64, u64);
+    fn mount_namespace(&self) -> (u64, u64);
+    fn network_namespace(&self) -> (u64, u64);
+    fn uid_map_digest(&self) -> [u8; CANARY_CREDENTIAL_MAP_DIGEST_BYTES];
+    fn gid_map_digest(&self) -> [u8; CANARY_CREDENTIAL_MAP_DIGEST_BYTES];
+}
+
+impl EngineProcessPolicyObservationView for ProcessObservation {
+    fn uids(&self) -> [u32; 4] {
+        *self.credentials().uids()
+    }
+
+    fn gids(&self) -> [u32; 4] {
+        *self.credentials().gids()
+    }
+
+    fn supplementary_groups(&self) -> &[u32] {
+        self.credentials().supplementary_groups()
+    }
+
+    fn capability_inheritable(&self) -> u64 {
+        self.credentials().capability_inheritable()
+    }
+
+    fn capability_permitted(&self) -> u64 {
+        self.credentials().capability_permitted()
+    }
+
+    fn capability_effective(&self) -> u64 {
+        self.credentials().capability_effective()
+    }
+
+    fn capability_ambient(&self) -> u64 {
+        self.credentials().capability_ambient()
+    }
+
+    fn no_new_privileges(&self) -> bool {
+        self.credentials().no_new_privileges()
+    }
+
+    fn user_namespace(&self) -> (u64, u64) {
+        let identity = self.domain().user_namespace();
+        (identity.device(), identity.inode().get())
+    }
+
+    fn mount_namespace(&self) -> (u64, u64) {
+        let identity = self.domain().mount_namespace();
+        (identity.device(), identity.inode().get())
+    }
+
+    fn network_namespace(&self) -> (u64, u64) {
+        let identity = self.domain().network_namespace();
+        (identity.device(), identity.inode().get())
+    }
+
+    fn uid_map_digest(&self) -> [u8; CANARY_CREDENTIAL_MAP_DIGEST_BYTES] {
+        *self.domain().uid_map_digest().as_bytes()
+    }
+
+    fn gid_map_digest(&self) -> [u8; CANARY_CREDENTIAL_MAP_DIGEST_BYTES] {
+        *self.domain().gid_map_digest().as_bytes()
+    }
+}
+
+fn engine_process_observation_satisfies_request<O>(
+    request: &CanaryAttemptRequest,
+    observed: &O,
+) -> bool
+where
+    O: EngineProcessPolicyObservationView + ?Sized,
+{
+    let environment = request.pre_binding().environment();
+    let expected_credentials = environment.engine_credentials();
+    let expected_domain = environment.credential_domain();
+    let expected_network = environment.authority().network().daemon_network_namespace();
+    let expected_user = expected_domain.user_namespace();
+    let expected_mount = expected_domain.mount_namespace();
+    observed.uids() == [expected_credentials.uid().get(); 4]
+        && observed.gids() == [expected_credentials.gid().get(); 4]
+        && observed.supplementary_groups().is_empty()
+        && observed.capability_inheritable() == 0
+        && observed.capability_permitted() == 0
+        && observed.capability_effective() == 0
+        && observed.capability_ambient() == 0
+        && observed.no_new_privileges()
+        && observed.user_namespace() == (expected_user.device(), expected_user.inode().get())
+        && observed.mount_namespace() == (expected_mount.device(), expected_mount.inode().get())
+        && observed.network_namespace() == (expected_network.device(), expected_network.inode())
+        && observed.uid_map_digest() == expected_domain.uid_map_digest().as_bytes()
+        && observed.gid_map_digest() == expected_domain.gid_map_digest().as_bytes()
+}
+
+fn validate_engine_process_policy_pair<B, A>(
+    request: &CanaryAttemptRequest,
+    before: &B,
+    after: &A,
+) -> Result<(), FunctionalCanaryError>
+where
+    B: EngineProcessPolicyObservationView + ?Sized,
+    A: EngineProcessPolicyObservationView + ?Sized,
+{
+    if !engine_process_observation_satisfies_request(request, before)
+        || !engine_process_observation_satisfies_request(request, after)
+    {
+        return Err(FunctionalCanaryError::new(
+            CanaryErrorKind::CleanupUncertain,
+            CanaryCleanupStatus::Uncertain,
+            "authoritative engine observations do not satisfy the immutable request credential policy and namespace/map domain",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_engine_child_policy<P, R>(
+    request: &CanaryAttemptRequest,
+    engine_bound: EngineObservationBoundTproxyLocalOutputArtifacts<P, R>,
+) -> Result<EnginePolicyBoundTproxyLocalOutputArtifacts<P, R>, FunctionalCanaryError> {
+    validate_engine_process_policy_pair(
+        request,
+        engine_bound.engine_observations.before().process(),
+        engine_bound.engine_observations.after().process(),
+    )?;
+    Ok(EnginePolicyBoundTproxyLocalOutputArtifacts {
+        capture_receipt: engine_bound.capture_receipt,
+        engine_observations: engine_bound.engine_observations,
+        process_proof: engine_bound.process_proof,
+        observations: engine_bound.observations,
     })
 }
 
@@ -1883,12 +2032,13 @@ impl TproxyLocalOutputProcessOwnershipVerifier<Infallible, Infallible>
         engine_child: EngineChildAuthority,
         capture_bound: CaptureReceiptBoundTproxyLocalOutputArtifacts<Infallible, Infallible>,
     ) -> Result<ReceiptBoundTproxyLocalOutputArtifacts<Infallible>, FunctionalCanaryError> {
-        let EngineObservationBoundTproxyLocalOutputArtifacts {
+        let engine_bound = bind_engine_child_observations(request, engine_child, capture_bound)?;
+        let EnginePolicyBoundTproxyLocalOutputArtifacts {
             capture_receipt: _,
             engine_observations: _,
             process_proof,
             observations: _,
-        } = bind_engine_child_observations(request, engine_child, capture_bound)?;
+        } = validate_engine_child_policy(request, engine_bound)?;
         match process_proof {}
     }
 }
@@ -1930,6 +2080,211 @@ mod tests {
     };
     #[cfg(target_os = "linux")]
     use flux_platform::ProcessHandle;
+
+    #[derive(Clone)]
+    struct ScriptedEngineProcessPolicyObservation {
+        uids: [u32; 4],
+        gids: [u32; 4],
+        supplementary_groups: Vec<u32>,
+        capability_inheritable: u64,
+        capability_permitted: u64,
+        capability_effective: u64,
+        capability_ambient: u64,
+        no_new_privileges: bool,
+        user_namespace: (u64, u64),
+        mount_namespace: (u64, u64),
+        network_namespace: (u64, u64),
+        uid_map_digest: [u8; CANARY_CREDENTIAL_MAP_DIGEST_BYTES],
+        gid_map_digest: [u8; CANARY_CREDENTIAL_MAP_DIGEST_BYTES],
+    }
+
+    impl ScriptedEngineProcessPolicyObservation {
+        fn exact(request: &CanaryAttemptRequest) -> Self {
+            let environment = request.pre_binding().environment();
+            let credentials = environment.engine_credentials();
+            let domain = environment.credential_domain();
+            let user = domain.user_namespace();
+            let mount = domain.mount_namespace();
+            let network = environment.authority().network().daemon_network_namespace();
+            Self {
+                uids: [credentials.uid().get(); 4],
+                gids: [credentials.gid().get(); 4],
+                supplementary_groups: Vec::new(),
+                capability_inheritable: 0,
+                capability_permitted: 0,
+                capability_effective: 0,
+                capability_ambient: 0,
+                no_new_privileges: true,
+                user_namespace: (user.device(), user.inode().get()),
+                mount_namespace: (mount.device(), mount.inode().get()),
+                network_namespace: (network.device(), network.inode()),
+                uid_map_digest: domain.uid_map_digest().as_bytes(),
+                gid_map_digest: domain.gid_map_digest().as_bytes(),
+            }
+        }
+    }
+
+    impl EngineProcessPolicyObservationView for ScriptedEngineProcessPolicyObservation {
+        fn uids(&self) -> [u32; 4] {
+            self.uids
+        }
+
+        fn gids(&self) -> [u32; 4] {
+            self.gids
+        }
+
+        fn supplementary_groups(&self) -> &[u32] {
+            &self.supplementary_groups
+        }
+
+        fn capability_inheritable(&self) -> u64 {
+            self.capability_inheritable
+        }
+
+        fn capability_permitted(&self) -> u64 {
+            self.capability_permitted
+        }
+
+        fn capability_effective(&self) -> u64 {
+            self.capability_effective
+        }
+
+        fn capability_ambient(&self) -> u64 {
+            self.capability_ambient
+        }
+
+        fn no_new_privileges(&self) -> bool {
+            self.no_new_privileges
+        }
+
+        fn user_namespace(&self) -> (u64, u64) {
+            self.user_namespace
+        }
+
+        fn mount_namespace(&self) -> (u64, u64) {
+            self.mount_namespace
+        }
+
+        fn network_namespace(&self) -> (u64, u64) {
+            self.network_namespace
+        }
+
+        fn uid_map_digest(&self) -> [u8; CANARY_CREDENTIAL_MAP_DIGEST_BYTES] {
+            self.uid_map_digest
+        }
+
+        fn gid_map_digest(&self) -> [u8; CANARY_CREDENTIAL_MAP_DIGEST_BYTES] {
+            self.gid_map_digest
+        }
+    }
+
+    fn assert_engine_policy_rejected<F>(request: &CanaryAttemptRequest, mutate: F)
+    where
+        F: FnOnce(&mut ScriptedEngineProcessPolicyObservation),
+    {
+        let mut observed = ScriptedEngineProcessPolicyObservation::exact(request);
+        mutate(&mut observed);
+        assert!(!engine_process_observation_satisfies_request(
+            request, &observed
+        ));
+    }
+
+    #[test]
+    fn engine_policy_requires_exact_credentials_and_observed_domain() {
+        let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+        let request = fixture.request();
+        let exact = ScriptedEngineProcessPolicyObservation::exact(request);
+        let exact_after = exact.clone();
+        validate_engine_process_policy_pair(request, &exact, &exact_after)
+            .expect("an exact scripted pair reaches the sealed policy-bound transition");
+
+        for slot in 0..4 {
+            assert_engine_policy_rejected(request, |observed| observed.uids[slot] ^= 1);
+            assert_engine_policy_rejected(request, |observed| observed.gids[slot] ^= 1);
+        }
+        assert_engine_policy_rejected(request, |observed| observed.supplementary_groups.push(1));
+        assert_engine_policy_rejected(request, |observed| observed.capability_inheritable = 1);
+        assert_engine_policy_rejected(request, |observed| observed.capability_permitted = 1);
+        assert_engine_policy_rejected(request, |observed| observed.capability_effective = 1);
+        assert_engine_policy_rejected(request, |observed| observed.capability_ambient = 1);
+        assert_engine_policy_rejected(request, |observed| observed.no_new_privileges = false);
+        assert_engine_policy_rejected(request, |observed| observed.user_namespace.0 ^= 1);
+        assert_engine_policy_rejected(request, |observed| observed.user_namespace.1 ^= 1);
+        assert_engine_policy_rejected(request, |observed| observed.mount_namespace.0 ^= 1);
+        assert_engine_policy_rejected(request, |observed| observed.mount_namespace.1 ^= 1);
+        assert_engine_policy_rejected(request, |observed| observed.network_namespace.0 ^= 1);
+        assert_engine_policy_rejected(request, |observed| observed.network_namespace.1 ^= 1);
+        assert_engine_policy_rejected(request, |observed| observed.uid_map_digest[0] ^= 1);
+        assert_engine_policy_rejected(request, |observed| observed.gid_map_digest[0] ^= 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn real_process_observation_policy_view_projects_every_authoritative_field() {
+        let mut child = EngineObservationTestChild::sleeping();
+        let handle = ProcessHandle::open_child(&child.0).expect("open exact test-child handle");
+        let observed = handle.initial_observation();
+        let credentials = observed.credentials();
+        let domain = observed.domain();
+
+        assert_eq!(observed.uids(), *credentials.uids());
+        assert_eq!(observed.gids(), *credentials.gids());
+        assert_eq!(
+            observed.supplementary_groups(),
+            credentials.supplementary_groups()
+        );
+        assert_eq!(
+            observed.capability_inheritable(),
+            credentials.capability_inheritable()
+        );
+        assert_eq!(
+            observed.capability_permitted(),
+            credentials.capability_permitted()
+        );
+        assert_eq!(
+            observed.capability_effective(),
+            credentials.capability_effective()
+        );
+        assert_eq!(
+            observed.capability_ambient(),
+            credentials.capability_ambient()
+        );
+        assert_eq!(
+            observed.no_new_privileges(),
+            credentials.no_new_privileges()
+        );
+        assert_eq!(
+            observed.user_namespace(),
+            (
+                domain.user_namespace().device(),
+                domain.user_namespace().inode().get()
+            )
+        );
+        assert_eq!(
+            observed.mount_namespace(),
+            (
+                domain.mount_namespace().device(),
+                domain.mount_namespace().inode().get()
+            )
+        );
+        assert_eq!(
+            observed.network_namespace(),
+            (
+                domain.network_namespace().device(),
+                domain.network_namespace().inode().get()
+            )
+        );
+        assert_eq!(
+            observed.uid_map_digest(),
+            *domain.uid_map_digest().as_bytes()
+        );
+        assert_eq!(
+            observed.gid_map_digest(),
+            *domain.gid_map_digest().as_bytes()
+        );
+
+        child.terminate_and_reap();
+    }
 
     #[test]
     fn xtables_reports_unsupported_before_mutation() {
@@ -2250,15 +2605,7 @@ mod tests {
     fn exact_engine_observation_pair_reaches_only_the_process_verifier() {
         let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
         let mut request = fixture.request().clone();
-        let mut child = EngineObservationTestChild::sleeping();
-        let handle = ProcessHandle::open_child(&child.0).expect("open exact test-child handle");
-        let process_identity = handle.identity();
-        let revision = request.pre_binding().engine().engine_snapshot_revision();
-        let authority = EngineChildAuthority::from_process_handle_for_test(handle, revision)
-            .expect("bind test child authority");
-        let opening_id = authority.opening_id();
-        request.pre_binding.engine.engine =
-            OwnedEngineIdentity::new(process_identity.pid(), process_identity.start_time_ticks());
+        let (mut child, authority, opening_id) = real_engine_authority_for(&mut request);
         let seed = Fixture::from_request(request.clone()).successful_evidence();
         let capture_verifier_calls = Arc::new(AtomicUsize::new(0));
         let process_verifier_calls = Arc::new(AtomicUsize::new(0));
@@ -2316,18 +2663,70 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn engine_policy_mismatch_is_cleanup_uncertain_and_never_reaches_the_factory() {
+        let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+        let mut request = fixture.request().clone();
+        let (mut child, authority, _opening_id) = real_engine_authority_for(&mut request);
+        let seed = Fixture::from_request(request.clone()).successful_evidence();
+        let capture_verifier_calls = Arc::new(AtomicUsize::new(0));
+        let process_verifier_calls = Arc::new(AtomicUsize::new(0));
+        let factory_calls = Arc::new(AtomicUsize::new(0));
+        let mut executor = TproxyLocalOutputExecutor::new(
+            ScriptedProofDriver::new(&request, &seed),
+            ScriptedCaptureVerifier {
+                calls: Arc::clone(&capture_verifier_calls),
+            },
+            PolicyValidatingEngineObservationVerifier {
+                calls: Arc::clone(&process_verifier_calls),
+            },
+            RecordingEvidenceFactory {
+                capture_verifier_calls: Arc::clone(&capture_verifier_calls),
+                process_verifier_calls: Arc::clone(&process_verifier_calls),
+                calls: Arc::clone(&factory_calls),
+                panic_on_call: true,
+            },
+        );
+        let socket_observer = CanaryAttemptSocketObserverSession::scripted(
+            request
+                .pre_binding()
+                .environment()
+                .authority()
+                .socket_observer_binding(),
+            request.deadline(),
+        );
+        let execution = UnqualifiedFunctionalCanaryExecution::new(
+            &request,
+            socket_observer,
+            Box::new(move || Ok(authority)),
+        )
+        .expect("bind real engine authority to the exact request identity");
+
+        let error = executor
+            .execute(execution)
+            .expect_err("host child credentials and domain cannot satisfy the scripted request");
+
+        assert_eq!(error.kind(), CanaryErrorKind::CleanupUncertain);
+        assert_eq!(error.cleanup(), CanaryCleanupStatus::Uncertain);
+        assert!(error.diagnostic().contains("credential policy"));
+        assert_eq!(capture_verifier_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(process_verifier_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(factory_calls.load(Ordering::SeqCst), 0);
+        assert!(
+            child
+                .0
+                .try_wait()
+                .expect("policy validation does not reap the child")
+                .is_none()
+        );
+        child.terminate_and_reap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn engine_exit_during_final_observation_fails_with_uncertain_cleanup() {
         let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
         let mut request = fixture.request().clone();
-        let mut child = EngineObservationTestChild::sleeping();
-        let handle = ProcessHandle::open_child(&child.0).expect("open exact test-child handle");
-        let process_identity = handle.identity();
-        let revision = request.pre_binding().engine().engine_snapshot_revision();
-        let authority = EngineChildAuthority::from_process_handle_for_test(handle, revision)
-            .expect("bind test child authority");
-        let opening_id = authority.opening_id();
-        request.pre_binding.engine.engine =
-            OwnedEngineIdentity::new(process_identity.pid(), process_identity.start_time_ticks());
+        let (mut child, authority, opening_id) = real_engine_authority_for(&mut request);
         let seed = Fixture::from_request(request.clone()).successful_evidence();
         child.terminate_and_reap();
         let capture_verifier_calls = Arc::new(AtomicUsize::new(0));
@@ -2572,6 +2971,11 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    struct PolicyValidatingEngineObservationVerifier {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[cfg(target_os = "linux")]
     struct EngineObservationTestChild(std::process::Child);
 
     #[cfg(target_os = "linux")]
@@ -2598,6 +3002,22 @@ mod tests {
         fn drop(&mut self) {
             self.terminate_and_reap();
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn real_engine_authority_for(
+        request: &mut CanaryAttemptRequest,
+    ) -> (EngineObservationTestChild, EngineChildAuthority, NonZeroU64) {
+        let child = EngineObservationTestChild::sleeping();
+        let handle = ProcessHandle::open_child(&child.0).expect("open exact test-child handle");
+        let process_identity = handle.identity();
+        let revision = request.pre_binding().engine().engine_snapshot_revision();
+        let authority = EngineChildAuthority::from_process_handle_for_test(handle, revision)
+            .expect("bind test child authority");
+        let opening_id = authority.opening_id();
+        request.pre_binding.engine.engine =
+            OwnedEngineIdentity::new(process_identity.pid(), process_identity.start_time_ticks());
+        (child, authority, opening_id)
     }
 
     #[cfg(target_os = "linux")]
@@ -2632,16 +3052,8 @@ mod tests {
                 request.pre_binding().engine().engine_snapshot_revision()
             );
             assert_eq!(
-                engine_bound
-                    .engine_observations
-                    .before()
-                    .process()
-                    .credentials(),
-                engine_bound
-                    .engine_observations
-                    .after()
-                    .process()
-                    .credentials()
+                engine_bound.engine_observations.before().process(),
+                engine_bound.engine_observations.after().process()
             );
             assert_eq!(&engine_bound.process_proof.request, request);
             assert_eq!(
@@ -2661,6 +3073,34 @@ mod tests {
                 CanaryErrorKind::ResponseMismatch,
                 CanaryCleanupStatus::VerifiedAbsent,
                 "recorded exact raw engine observations without minting a process receipt",
+            ))
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl TproxyLocalOutputProcessOwnershipVerifier<ScriptedProcessProof, ScriptedRawObservations>
+        for PolicyValidatingEngineObservationVerifier
+    {
+        fn verify_process_ownership(
+            &mut self,
+            request: &CanaryAttemptRequest,
+            engine_child: EngineChildAuthority,
+            capture_bound: CaptureReceiptBoundTproxyLocalOutputArtifacts<
+                ScriptedProcessProof,
+                ScriptedRawObservations,
+            >,
+        ) -> Result<
+            ReceiptBoundTproxyLocalOutputArtifacts<ScriptedRawObservations>,
+            FunctionalCanaryError,
+        > {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let engine_bound =
+                bind_engine_child_observations(request, engine_child, capture_bound)?;
+            let _policy_bound = validate_engine_child_policy(request, engine_bound)?;
+            Err(FunctionalCanaryError::new(
+                CanaryErrorKind::ResponseMismatch,
+                CanaryCleanupStatus::VerifiedAbsent,
+                "engine policy validation remained receipt-uninhabited",
             ))
         }
     }

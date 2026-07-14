@@ -358,7 +358,7 @@ pub(crate) struct EngineChildAuthority {
 static NEXT_ENGINE_CHILD_AUTHORITY_OPENING_ID: AtomicU64 = AtomicU64::new(1);
 
 enum EngineChildAuthorityTransport {
-    Production(ProcessHandle),
+    Production(Box<ProcessHandle>),
     #[cfg(test)]
     Scripted,
 }
@@ -374,7 +374,7 @@ impl EngineChildAuthority {
             engine_snapshot_revision,
             opening_id: next_engine_child_authority_opening_id()?,
             opened_at: Instant::now(),
-            transport: EngineChildAuthorityTransport::Production(handle),
+            transport: EngineChildAuthorityTransport::Production(Box::new(handle)),
         })
     }
 
@@ -514,7 +514,7 @@ impl EngineChildAuthority {
                 process: after,
                 observed_at: observed_after_at,
             },
-            _handle: handle,
+            _handle: *handle,
         })
     }
 }

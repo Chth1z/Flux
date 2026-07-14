@@ -29,8 +29,9 @@ pub use phase_dispatcher::{
     ProcessPhaseDispatcher,
 };
 pub use process::{
-    ProcessCredentials, ProcessHandle, ProcessHandleError, ProcessHandleErrorKind, ProcessIdentity,
-    ProcessObservation,
+    PROCESS_CREDENTIAL_MAP_DIGEST_BYTES, ProcessCredentialMapDigest, ProcessCredentialMapKind,
+    ProcessCredentials, ProcessDomainObservation, ProcessHandle, ProcessHandleError,
+    ProcessHandleErrorKind, ProcessIdentity, ProcessNamespaceIdentity, ProcessObservation,
 };
 pub use reactor::{
     DaemonReactor, NetworkInventoryDegradation, ReactorError, ReactorStopHandle, StopDisposition,

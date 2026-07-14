@@ -175,9 +175,13 @@ identity and validation rejects engine-handle drift or reuse across live roles.
 The Linux/Android platform substrate for that future verifier is also delivered. A non-cloneable
 `ProcessHandle` opens only from a retained live `Child`, correlates a pidfd with its procfs PID and
 start ticks, proves the child remains waitable by this parent, and performs two stable bounded
-censuses of every `/proc/<pid>/task/*/status` entry so all threads have identical credentials. A
-pidfd reporting exit is not accepted as reap evidence: the owner must still confirm `Child::wait`,
-and the distinct-UID/GID preflight now exercises that ordering with live probe and engine children.
+censuses of every `/proc/<pid>/task/*/status` entry and opened user/mount/network namespace
+descriptor so all threads have identical credentials and process domains. It also reads the
+process UID/GID maps in both passes, strictly parses at most 340 canonical non-overlapping extents
+within 16 KiB, and records domain-separated SHA-256 digests without copying request expectations.
+A pidfd reporting exit is not accepted as reap evidence: the owner must still confirm
+`Child::wait`, and the distinct-UID/GID preflight now exercises that ordering with live probe and
+engine children.
 The retained-engine authority handoff is now delivered. `SingBoxChild::open_process_handle` opens
 the authority only from its retained live child, rechecks the recorded PID/start ticks, and leaves
 signal/wait/reap ownership with the adapter. `EngineSupervisor` then requires matching ready,
@@ -187,17 +191,23 @@ exact request engine, snapshot revision, and deadline. The local-OUTPUT
 executor invokes that opener only after read-only backend availability succeeds and before the
 prepared-attempt boundary, so the current xtables `Unsupported` result performs no pidfd/procfs
 scan. A successful opening carries a private nonzero opening identity and daemon-owned observation
-time, then moves into the process-verifier boundary after capture verification. This is still
-observation and model plumbing. The next independently reviewed slice now consumes that authority
-inside the process-verifier boundary, preserves the initial child-origin identity and credential
-scan, reobserves the same retained pidfd after capture verification, and returns a non-cloneable
-raw pair bound to the exact engine identity, snapshot revision, opening identity, and exclusive
-attempt deadline. The final observation is timestamped only after the complete procfs scan, the
-pair retains the handle privately without exposing signal/wait/reap operations, and an exit or
-deadline failure after preparation becomes cleanup-uncertain. Production receipt authority remains
-uninhabited: the raw pair does not yet observe the user/mount/network namespace and UID/GID-map
-domain, retain and retire real client/peer `Child` values, or establish the final verifier-side
-attempt-completion timestamp required by receipt chronology.
+time, then moves into the process-verifier boundary after capture verification. The first reviewed
+verifier slice consumes that authority, preserves the complete child-origin observation,
+reobserves the same retained pidfd after capture verification, and returns a non-cloneable raw pair
+bound to the exact engine identity, snapshot revision, opening identity, and exclusive attempt
+deadline. The final observation is timestamped only after the complete procfs scan, the pair
+retains the handle privately without exposing signal/wait/reap operations, and an exit or deadline
+failure after preparation becomes cleanup-uncertain.
+
+The completed engine-policy/domain slice then validates both complete observations against the
+immutable request. All four real/effective/saved/filesystem UID and GID slots must equal the exact
+request engine UID/GID values; supplementary groups and every capability set must be empty;
+`NoNewPrivs` must be set; and the observed user, mount, daemon network namespace, UID-map digest,
+and GID-map digest must match exactly. Before/after stability compares the complete authoritative
+platform observation, including its domain, and any mismatch remains cleanup-uncertain without
+calling the evidence factory. Production process-receipt authority remains uninhabited: the
+verifier does not yet retain and retire real client/peer `Child` values or establish the final
+verifier-side attempt-completion timestamp required by receipt chronology.
 
 ### Fail-closed local-OUTPUT executor seam
 
@@ -223,12 +233,11 @@ PREROUTING traffic, a veth bounce, counters, or route-lookup inference. Its raw 
 capture/process receipt authorities, and current factory input are uninhabited, so the seam cannot
 produce a positive host result.
 
-The remaining integration subcheckpoints must validate the delivered raw engine observation pair
-against the request credential policy and authoritative namespace/map domain, bind client/peer
-authority to driver-retained children, establish final verifier completion chronology, construct
-the delivered report-object and temporal cleanup evidence, and use the real pre-opened
-socket-diagnostics authority for actual observations. A later positive producer must also replace
-both sealed receipt authorities with reviewed concrete verifiers. A
+The remaining integration subcheckpoints must bind client/peer authority to driver-retained
+children, establish final verifier completion chronology, construct the delivered report-object
+and temporal cleanup evidence, and use the real pre-opened socket-diagnostics authority for actual
+observations. A later positive producer must also replace both sealed receipt authorities with
+reviewed concrete verifiers. A
 separately qualified cgroup-BPF observer may later replace supervised delivery reports only after
 its own attachment, identity, complete-event, loss, and lifecycle contract is proven; ordinary BPF
 counters or sampled events cannot mint the receipt. No qualified production receipt path may
@@ -539,11 +548,11 @@ functional pass.
    before/after and client/peer PID/start-tick/handle observations, complete restricted credentials,
    role network namespaces, exact cleanup retirements, distinct handle openings, and flow/cleanup/
    deadline chronology. The Linux/Android pidfd substrate opens only from retained children,
-   validates stable process-wide thread credentials, distinguishes exit from parent reap, and is
-   exercised by the no-traffic credential preflight. Production receipt authority remains
-   uninhabited. The engine-child authority handoff and raw same-pidfd before/after pair below are
-   delivered, but credential-policy/domain validation, final verifier completion chronology, and
-   real driver child integration remain open.
+   validates stable process-wide thread credentials and process domains, distinguishes exit from
+   parent reap, and is exercised by the no-traffic credential preflight. Production receipt
+   authority remains uninhabited. The engine-child authority handoff and raw same-pidfd before/after
+   pair below are delivered together with exact engine credential-policy/domain validation, but
+   final verifier completion chronology and real driver child integration remain open.
 13. **Incomplete local-OUTPUT integration-plumbing checkpoint:** deliver this work as separately
    reviewed subcheckpoints so no plumbing-only step is mistaken for capture qualification:
    - **13a complete — retained engine-child authority handoff:**
@@ -568,11 +577,17 @@ functional pass.
      deadline, or pair-contract failure after preparation is cleanup-uncertain. Tests exercise the
      real Supervisor-to-pidfd lifecycle, distinct openings, successful verifier-only handoff, and
      exit between observations. This slice does not mint a process receipt.
-   - **13b-2a pending — engine credential-policy and process-domain validation:** extend the raw
-     engine observation with authoritative user/mount/network namespace identities and UID/GID-map
-     digests, then require all four UID/GID slots to match the request engine credentials, empty
-     supplementary groups, zero inheritable/permitted/effective/ambient capabilities, and
-     `NoNewPrivs`. No expected domain may be copied into an observed field.
+   - **13b-2a complete — engine credential-policy and process-domain validation:** every
+     `ProcessObservation` now carries authoritative user/mount/network namespace identities from
+     opened descriptors plus canonical UID/GID-map digests. The bounded two-pass task census
+     requires stable homogeneous credentials and namespaces across every thread and stable maps;
+     map parsing rejects malformed, zero-length, overflowing, overlapping, oversized, or
+     over-entry-limit input before domain-separated hashing. The process verifier validates both
+     engine observations against the request's exact four-slot UID/GID policy, empty supplementary
+     groups, zero inheritable/permitted/effective/ambient capabilities, `NoNewPrivs`, exact
+     user/mount/map domain, and daemon network namespace. No expected domain is copied into an
+     observed field, policy mismatch is cleanup-uncertain, and the production process-receipt
+     authority remains uninhabited.
    - **13b-2b pending — driver-child ownership and final receipt chronology:** retain driver-owned
      client/peer `Child` values through exact termination and parent reap, bind their corresponding
      process handles and domain observations, and assign final attempt completion only after every

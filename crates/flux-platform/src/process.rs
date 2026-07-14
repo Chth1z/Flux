@@ -5,16 +5,19 @@
 //! require the process-wide `SIGCHLD` disposition to preserve waitable
 //! children, verify that the pidfd still names a child of this process, and
 //! correlate every observation through `/proc/self/fdinfo/<pidfd>` before and
-//! after reading the process's procfs identity and credentials. The caller must
-//! not use an out-of-band `waitpid`/`waitid` reaper for the child while opening
-//! the handle. The handle deliberately exposes no signaling or reap API: pidfd
-//! readability proves exit, not parent-side reaping.
+//! after reading the process's procfs identity, credentials, namespaces, and
+//! credential maps. The caller must not use an out-of-band `waitpid`/`waitid`
+//! reaper for the child while opening the handle. The handle deliberately
+//! exposes no signaling or reap API: pidfd readability proves exit, not
+//! parent-side reaping.
 
 use std::error::Error;
 use std::fmt;
 use std::num::{NonZeroU32, NonZeroU64};
 use std::path::PathBuf;
 use std::process::Child;
+
+pub const PROCESS_CREDENTIAL_MAP_DIGEST_BYTES: usize = 32;
 
 /// Stable PID plus Linux procfs start-time identity for one process instance.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -104,11 +107,87 @@ impl ProcessCredentials {
     }
 }
 
+/// Stable kernel object identity for one process namespace.
+///
+/// Linux and Android observations use the complete namespace descriptor
+/// `st_dev`/`st_ino` pair rather than a textual procfs symlink rendering.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ProcessNamespaceIdentity {
+    device: u64,
+    inode: NonZeroU64,
+}
+
+impl ProcessNamespaceIdentity {
+    #[must_use]
+    pub const fn new(device: u64, inode: NonZeroU64) -> Self {
+        Self { device, inode }
+    }
+
+    #[must_use]
+    pub const fn device(self) -> u64 {
+        self.device
+    }
+
+    #[must_use]
+    pub const fn inode(self) -> NonZeroU64 {
+        self.inode
+    }
+}
+
+/// Versioned SHA-256 identity for one canonical Linux UID or GID map.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ProcessCredentialMapDigest([u8; PROCESS_CREDENTIAL_MAP_DIGEST_BYTES]);
+
+impl ProcessCredentialMapDigest {
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; PROCESS_CREDENTIAL_MAP_DIGEST_BYTES] {
+        &self.0
+    }
+}
+
+/// Stable process-wide namespace and credential-map domain.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProcessDomainObservation {
+    user_namespace: ProcessNamespaceIdentity,
+    mount_namespace: ProcessNamespaceIdentity,
+    network_namespace: ProcessNamespaceIdentity,
+    uid_map_digest: ProcessCredentialMapDigest,
+    gid_map_digest: ProcessCredentialMapDigest,
+}
+
+impl ProcessDomainObservation {
+    #[must_use]
+    pub const fn user_namespace(self) -> ProcessNamespaceIdentity {
+        self.user_namespace
+    }
+
+    #[must_use]
+    pub const fn mount_namespace(self) -> ProcessNamespaceIdentity {
+        self.mount_namespace
+    }
+
+    #[must_use]
+    pub const fn network_namespace(self) -> ProcessNamespaceIdentity {
+        self.network_namespace
+    }
+
+    #[must_use]
+    pub const fn uid_map_digest(self) -> ProcessCredentialMapDigest {
+        self.uid_map_digest
+    }
+
+    #[must_use]
+    pub const fn gid_map_digest(self) -> ProcessCredentialMapDigest {
+        self.gid_map_digest
+    }
+}
+
 /// One complete point-in-time observation through a retained process handle.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProcessObservation {
     identity: ProcessIdentity,
     credentials: ProcessCredentials,
+    domain: ProcessDomainObservation,
 }
 
 impl ProcessObservation {
@@ -120,6 +199,26 @@ impl ProcessObservation {
     #[must_use]
     pub const fn credentials(&self) -> &ProcessCredentials {
         &self.credentials
+    }
+
+    #[must_use]
+    pub const fn domain(&self) -> ProcessDomainObservation {
+        self.domain
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProcessCredentialMapKind {
+    Uid,
+    Gid,
+}
+
+impl ProcessCredentialMapKind {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Uid => "UID",
+            Self::Gid => "GID",
+        }
     }
 }
 
@@ -176,6 +275,18 @@ pub enum ProcessHandleError {
         pid: NonZeroU32,
         thread: NonZeroU32,
     },
+    ProcessThreadNamespacesChanged {
+        pid: NonZeroU32,
+        thread: NonZeroU32,
+    },
+    ProcessThreadNamespaceMismatch {
+        pid: NonZeroU32,
+        thread: NonZeroU32,
+    },
+    ProcessCredentialMapChanged {
+        pid: NonZeroU32,
+        map: ProcessCredentialMapKind,
+    },
     ChildReapContractUnavailable,
     ChildOwnershipLost {
         pid: NonZeroU32,
@@ -183,6 +294,9 @@ pub enum ProcessHandleError {
     ProcfsPidNamespaceMismatch {
         caller_pid: NonZeroU32,
         procfs_pid: NonZeroU32,
+    },
+    ProcessDomainUnsupported {
+        path: PathBuf,
     },
     MalformedProcStat {
         path: PathBuf,
@@ -196,12 +310,22 @@ pub enum ProcessHandleError {
     MalformedProcessTaskEntry {
         path: PathBuf,
     },
+    MalformedProcessNamespace {
+        path: PathBuf,
+    },
+    MalformedProcessIdMap {
+        path: PathBuf,
+    },
     ProcFileLimitExceeded {
         path: PathBuf,
         limit: usize,
     },
     ProcessThreadLimitExceeded {
         pid: NonZeroU32,
+        limit: usize,
+    },
+    ProcessIdMapEntryLimitExceeded {
+        path: PathBuf,
         limit: usize,
     },
     SystemCall {
@@ -215,9 +339,9 @@ impl ProcessHandleError {
     #[must_use]
     pub const fn kind(&self) -> ProcessHandleErrorKind {
         match self {
-            Self::UnsupportedPlatform(_) | Self::PidFdUnsupported { .. } => {
-                ProcessHandleErrorKind::Unsupported
-            }
+            Self::UnsupportedPlatform(_)
+            | Self::PidFdUnsupported { .. }
+            | Self::ProcessDomainUnsupported { .. } => ProcessHandleErrorKind::Unsupported,
             Self::Exited { .. } => ProcessHandleErrorKind::Exited,
             Self::InvalidChildPid { .. }
             | Self::PidFdIdentityMismatch { .. }
@@ -228,6 +352,9 @@ impl ProcessHandleError {
             | Self::ProcessThreadSetChanged { .. }
             | Self::ProcessThreadCredentialsChanged { .. }
             | Self::ProcessThreadCredentialMismatch { .. }
+            | Self::ProcessThreadNamespacesChanged { .. }
+            | Self::ProcessThreadNamespaceMismatch { .. }
+            | Self::ProcessCredentialMapChanged { .. }
             | Self::ChildReapContractUnavailable
             | Self::ChildOwnershipLost { .. }
             | Self::ProcfsPidNamespaceMismatch { .. } => ProcessHandleErrorKind::IdentityChanged,
@@ -235,8 +362,11 @@ impl ProcessHandleError {
             | Self::MalformedProcStatus { .. }
             | Self::MalformedPidFdInfo { .. }
             | Self::MalformedProcessTaskEntry { .. }
+            | Self::MalformedProcessNamespace { .. }
+            | Self::MalformedProcessIdMap { .. }
             | Self::ProcFileLimitExceeded { .. }
-            | Self::ProcessThreadLimitExceeded { .. } => ProcessHandleErrorKind::Parse,
+            | Self::ProcessThreadLimitExceeded { .. }
+            | Self::ProcessIdMapEntryLimitExceeded { .. } => ProcessHandleErrorKind::Parse,
             Self::SystemCall { .. } => ProcessHandleErrorKind::SystemCall,
         }
     }
@@ -290,6 +420,19 @@ impl fmt::Display for ProcessHandleError {
                 formatter,
                 "process {pid} thread {thread} credentials differ from the process leader"
             ),
+            Self::ProcessThreadNamespacesChanged { pid, thread } => write!(
+                formatter,
+                "process {pid} thread {thread} namespaces changed during observation"
+            ),
+            Self::ProcessThreadNamespaceMismatch { pid, thread } => write!(
+                formatter,
+                "process {pid} thread {thread} namespaces differ from the process leader"
+            ),
+            Self::ProcessCredentialMapChanged { pid, map } => write!(
+                formatter,
+                "process {pid} {} map changed during observation",
+                map.label()
+            ),
             Self::ChildReapContractUnavailable => formatter.write_str(
                 "process-wide SIGCHLD disposition does not preserve exact waitable children",
             ),
@@ -304,6 +447,11 @@ impl fmt::Display for ProcessHandleError {
                 formatter,
                 "procfs PID namespace mismatch: caller sees PID {caller_pid}, /proc/self/stat reports {procfs_pid}"
             ),
+            Self::ProcessDomainUnsupported { path } => write!(
+                formatter,
+                "required process-domain procfs entry {} is unavailable",
+                path.display()
+            ),
             Self::MalformedProcStat { path } => {
                 write!(formatter, "malformed proc stat {}", path.display())
             }
@@ -316,6 +464,12 @@ impl fmt::Display for ProcessHandleError {
             Self::MalformedProcessTaskEntry { path } => {
                 write!(formatter, "malformed process task entry {}", path.display())
             }
+            Self::MalformedProcessNamespace { path } => {
+                write!(formatter, "malformed process namespace {}", path.display())
+            }
+            Self::MalformedProcessIdMap { path } => {
+                write!(formatter, "malformed process ID map {}", path.display())
+            }
             Self::ProcFileLimitExceeded { path, limit } => write!(
                 formatter,
                 "proc file {} exceeds the hard limit of {limit} bytes",
@@ -324,6 +478,11 @@ impl fmt::Display for ProcessHandleError {
             Self::ProcessThreadLimitExceeded { pid, limit } => write!(
                 formatter,
                 "process {pid} exceeds the hard limit of {limit} observed threads"
+            ),
+            Self::ProcessIdMapEntryLimitExceeded { path, limit } => write!(
+                formatter,
+                "process ID map {} exceeds the hard limit of {limit} entries",
+                path.display()
             ),
             Self::SystemCall {
                 operation,
@@ -355,15 +514,22 @@ impl Error for ProcessHandleError {
             | Self::ProcessThreadSetChanged { .. }
             | Self::ProcessThreadCredentialsChanged { .. }
             | Self::ProcessThreadCredentialMismatch { .. }
+            | Self::ProcessThreadNamespacesChanged { .. }
+            | Self::ProcessThreadNamespaceMismatch { .. }
+            | Self::ProcessCredentialMapChanged { .. }
             | Self::ChildReapContractUnavailable
             | Self::ChildOwnershipLost { .. }
             | Self::ProcfsPidNamespaceMismatch { .. }
+            | Self::ProcessDomainUnsupported { .. }
             | Self::MalformedProcStat { .. }
             | Self::MalformedProcStatus { .. }
             | Self::MalformedPidFdInfo { .. }
             | Self::MalformedProcessTaskEntry { .. }
+            | Self::MalformedProcessNamespace { .. }
+            | Self::MalformedProcessIdMap { .. }
             | Self::ProcFileLimitExceeded { .. }
-            | Self::ProcessThreadLimitExceeded { .. } => None,
+            | Self::ProcessThreadLimitExceeded { .. }
+            | Self::ProcessIdMapEntryLimitExceeded { .. } => None,
         }
     }
 }
@@ -372,6 +538,7 @@ impl Error for ProcessHandleError {
 pub struct ProcessHandle {
     identity: ProcessIdentity,
     credentials: ProcessCredentials,
+    domain: ProcessDomainObservation,
     transport: ProcessHandleTransport,
 }
 
@@ -392,7 +559,7 @@ const _: fn() = || {
 
 impl ProcessHandle {
     /// Open a pidfd for the exact process represented by `child` and capture its
-    /// initial procfs identity and credentials.
+    /// initial procfs identity, credentials, and process domain.
     ///
     /// The process-wide `SIGCHLD` disposition must be the default without
     /// `SA_NOCLDWAIT`, and no external reaper may wait on this child while the
@@ -412,8 +579,13 @@ impl ProcessHandle {
         &self.credentials
     }
 
-    /// Return the exact identity and credentials captured while this child-
-    /// origin handle was opened.
+    #[must_use]
+    pub const fn domain(&self) -> ProcessDomainObservation {
+        self.domain
+    }
+
+    /// Return the exact identity, credentials, and process domain captured
+    /// while this child-origin handle was opened.
     ///
     /// The returned value is an owned observation so callers can retain it
     /// alongside a later [`Self::reobserve`] result without cloning or
@@ -423,14 +595,16 @@ impl ProcessHandle {
         ProcessObservation {
             identity: self.identity,
             credentials: self.credentials.clone(),
+            domain: self.domain,
         }
     }
 
     /// Reobserve the same live pidfd-bound process.
     ///
     /// Exit is reported as [`ProcessHandleErrorKind::Exited`]. Success proves
-    /// only a live exact identity plus a point-in-time credential observation;
-    /// it does not prove that a later exit was reaped by the parent.
+    /// only a live exact identity plus point-in-time credential and process-
+    /// domain observations; it does not prove that a later exit was reaped by
+    /// the parent.
     pub fn reobserve(&self) -> Result<ProcessObservation, ProcessHandleError> {
         implementation::reobserve(self)
     }
@@ -442,6 +616,7 @@ impl fmt::Debug for ProcessHandle {
             .debug_struct("ProcessHandle")
             .field("identity", &self.identity)
             .field("credentials", &self.credentials)
+            .field("domain", &self.domain)
             .finish_non_exhaustive()
     }
 }
@@ -453,12 +628,16 @@ mod implementation {
     use std::mem::MaybeUninit;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
     use std::path::{Path, PathBuf};
     use std::process::Child;
 
+    use sha2::{Digest, Sha256};
+
     use super::{
-        ProcessCredentials, ProcessHandle, ProcessHandleError, ProcessHandleTransport,
-        ProcessIdentity, ProcessObservation,
+        ProcessCredentialMapDigest, ProcessCredentialMapKind, ProcessCredentials,
+        ProcessDomainObservation, ProcessHandle, ProcessHandleError, ProcessHandleTransport,
+        ProcessIdentity, ProcessNamespaceIdentity, ProcessObservation,
     };
     use std::num::{NonZeroU32, NonZeroU64};
 
@@ -467,8 +646,45 @@ mod implementation {
     // decimal `Groups:` representation fits below this bound with the rest of
     // one task status file.
     const PROC_STATUS_LIMIT: usize = 1024 * 1024;
+    const PROC_ID_MAP_LIMIT: usize = 16 * 1024;
     const PIDFD_INFO_LIMIT: usize = 16 * 1024;
     const MAX_PROCESS_THREADS: usize = 1024;
+    const MAX_PROCESS_ID_MAP_ENTRIES: usize = 340;
+    const UID_MAP_DIGEST_DOMAIN: &[u8] = b"flux.process.uid-map.v1\0";
+    const GID_MAP_DIGEST_DOMAIN: &[u8] = b"flux.process.gid-map.v1\0";
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(super) struct ProcessTaskNamespaces {
+        pub(super) user: ProcessNamespaceIdentity,
+        pub(super) mount: ProcessNamespaceIdentity,
+        pub(super) network: ProcessNamespaceIdentity,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub(super) struct ProcessTaskObservation {
+        pub(super) credentials: ProcessCredentials,
+        pub(super) namespaces: ProcessTaskNamespaces,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(super) struct ProcessCredentialMapObservation {
+        pub(super) uid: ProcessCredentialMapDigest,
+        pub(super) gid: ProcessCredentialMapDigest,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    pub(super) struct ProcessObservationCensusPass<'a> {
+        pub(super) task_ids: &'a [NonZeroU32],
+        pub(super) task_observations: &'a [(NonZeroU32, ProcessTaskObservation)],
+        pub(super) credential_maps: ProcessCredentialMapObservation,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct ProcessIdMapEntry {
+        inside: u32,
+        outside: u32,
+        length: u32,
+    }
 
     pub(super) fn open_child(child: &Child) -> Result<ProcessHandle, ProcessHandleError> {
         require_waitable_child_disposition()?;
@@ -486,6 +702,7 @@ mod implementation {
         Ok(ProcessHandle {
             identity: observation.identity,
             credentials: observation.credentials,
+            domain: observation.domain,
             transport: ProcessHandleTransport { pidfd },
         })
     }
@@ -571,7 +788,7 @@ mod implementation {
             ));
         }
 
-        let credentials = observe_process_credentials(pidfd, expected_pid)?;
+        let (credentials, domain) = observe_process_state(pidfd, expected_pid)?;
 
         require_pidfd_pid(pidfd, expected_pid)?;
         require_waitable_child(pidfd, expected_pid)?;
@@ -580,6 +797,7 @@ mod implementation {
         Ok(ProcessObservation {
             identity,
             credentials,
+            domain,
         })
     }
 
@@ -594,70 +812,116 @@ mod implementation {
         }
     }
 
-    fn observe_process_credentials(
+    fn observe_process_state(
         pidfd: &OwnedFd,
         pid: NonZeroU32,
-    ) -> Result<ProcessCredentials, ProcessHandleError> {
+    ) -> Result<(ProcessCredentials, ProcessDomainObservation), ProcessHandleError> {
         let first_ids = scan_process_task_ids(pidfd, pid)?;
-        let first = read_process_task_credentials(pidfd, pid, &first_ids)?;
+        let first = read_process_task_observations(pidfd, pid, &first_ids)?;
+        let first_maps = read_process_credential_maps(pidfd, pid)?;
         let middle_ids = scan_process_task_ids(pidfd, pid)?;
-        let second = read_process_task_credentials(pidfd, pid, &middle_ids)?;
+        let second = read_process_task_observations(pidfd, pid, &middle_ids)?;
+        let second_maps = read_process_credential_maps(pidfd, pid)?;
         let final_ids = scan_process_task_ids(pidfd, pid)?;
-        validate_process_credential_census(
+        validate_process_observation_census(
             pid,
-            &first_ids,
-            &first,
-            &middle_ids,
-            &second,
+            ProcessObservationCensusPass {
+                task_ids: &first_ids,
+                task_observations: &first,
+                credential_maps: first_maps,
+            },
+            ProcessObservationCensusPass {
+                task_ids: &middle_ids,
+                task_observations: &second,
+                credential_maps: second_maps,
+            },
             &final_ids,
         )
     }
 
-    pub(super) fn validate_process_credential_census(
+    pub(super) fn validate_process_observation_census(
         pid: NonZeroU32,
-        first_ids: &[NonZeroU32],
-        first: &[(NonZeroU32, ProcessCredentials)],
-        second_ids: &[NonZeroU32],
-        second: &[(NonZeroU32, ProcessCredentials)],
+        first: ProcessObservationCensusPass<'_>,
+        second: ProcessObservationCensusPass<'_>,
         final_ids: &[NonZeroU32],
-    ) -> Result<ProcessCredentials, ProcessHandleError> {
-        let first_aligned = first.len() == first_ids.len()
+    ) -> Result<(ProcessCredentials, ProcessDomainObservation), ProcessHandleError> {
+        let first_aligned = first.task_observations.len() == first.task_ids.len()
             && first
+                .task_observations
                 .iter()
-                .zip(first_ids)
+                .zip(first.task_ids)
                 .all(|((observed, _), expected)| observed == expected);
-        let second_aligned = second.len() == second_ids.len()
+        let second_aligned = second.task_observations.len() == second.task_ids.len()
             && second
+                .task_observations
                 .iter()
-                .zip(second_ids)
+                .zip(second.task_ids)
                 .all(|((observed, _), expected)| observed == expected);
-        if first_ids != second_ids || second_ids != final_ids || !first_aligned || !second_aligned {
+        if first.task_ids != second.task_ids
+            || second.task_ids != final_ids
+            || !first_aligned
+            || !second_aligned
+        {
             return Err(ProcessHandleError::ProcessThreadSetChanged { pid });
         }
-        for ((first_thread, first_credentials), (second_thread, second_credentials)) in
-            first.iter().zip(second)
+        for ((first_thread, first_observation), (second_thread, second_observation)) in
+            first.task_observations.iter().zip(second.task_observations)
         {
             debug_assert_eq!(first_thread, second_thread);
-            if first_credentials != second_credentials {
+            if first_observation.credentials != second_observation.credentials {
                 return Err(ProcessHandleError::ProcessThreadCredentialsChanged {
+                    pid,
+                    thread: *first_thread,
+                });
+            }
+            if first_observation.namespaces != second_observation.namespaces {
+                return Err(ProcessHandleError::ProcessThreadNamespacesChanged {
                     pid,
                     thread: *first_thread,
                 });
             }
         }
         let leader = second
+            .task_observations
             .iter()
-            .find_map(|(thread, credentials)| (*thread == pid).then_some(credentials))
+            .find_map(|(thread, observation)| (*thread == pid).then_some(observation))
             .ok_or(ProcessHandleError::MissingProcessLeaderTask { pid })?;
-        for (thread, credentials) in second {
-            if credentials != leader {
+        for (thread, observation) in second.task_observations {
+            if observation.credentials != leader.credentials {
                 return Err(ProcessHandleError::ProcessThreadCredentialMismatch {
                     pid,
                     thread: *thread,
                 });
             }
+            if observation.namespaces != leader.namespaces {
+                return Err(ProcessHandleError::ProcessThreadNamespaceMismatch {
+                    pid,
+                    thread: *thread,
+                });
+            }
         }
-        Ok(leader.clone())
+        if first.credential_maps.uid != second.credential_maps.uid {
+            return Err(ProcessHandleError::ProcessCredentialMapChanged {
+                pid,
+                map: ProcessCredentialMapKind::Uid,
+            });
+        }
+        if first.credential_maps.gid != second.credential_maps.gid {
+            return Err(ProcessHandleError::ProcessCredentialMapChanged {
+                pid,
+                map: ProcessCredentialMapKind::Gid,
+            });
+        }
+        Ok((
+            leader.credentials.clone(),
+            ProcessDomainObservation {
+                user_namespace: leader.namespaces.user,
+                mount_namespace: leader.namespaces.mount,
+                network_namespace: leader.namespaces.network,
+                uid_map_digest: second.credential_maps.uid,
+                gid_map_digest: second.credential_maps.gid,
+            },
+        ))
     }
 
     fn scan_process_task_ids(
@@ -706,11 +970,11 @@ mod implementation {
         Ok(threads)
     }
 
-    fn read_process_task_credentials(
+    fn read_process_task_observations(
         pidfd: &OwnedFd,
         pid: NonZeroU32,
         threads: &[NonZeroU32],
-    ) -> Result<Vec<(NonZeroU32, ProcessCredentials)>, ProcessHandleError> {
+    ) -> Result<Vec<(NonZeroU32, ProcessTaskObservation)>, ProcessHandleError> {
         let mut observations = Vec::with_capacity(threads.len());
         for thread in threads {
             let path = PathBuf::from(format!("/proc/{pid}/task/{thread}/status"));
@@ -731,9 +995,222 @@ mod implementation {
                     observed: status_pid,
                 });
             }
-            observations.push((*thread, credentials));
+            let namespaces = ProcessTaskNamespaces {
+                user: read_process_task_namespace(pidfd, pid, threads, *thread, "user")?,
+                mount: read_process_task_namespace(pidfd, pid, threads, *thread, "mnt")?,
+                network: read_process_task_namespace(pidfd, pid, threads, *thread, "net")?,
+            };
+            observations.push((
+                *thread,
+                ProcessTaskObservation {
+                    credentials,
+                    namespaces,
+                },
+            ));
         }
         Ok(observations)
+    }
+
+    fn read_process_task_namespace(
+        pidfd: &OwnedFd,
+        pid: NonZeroU32,
+        threads: &[NonZeroU32],
+        thread: NonZeroU32,
+        namespace: &str,
+    ) -> Result<ProcessNamespaceIdentity, ProcessHandleError> {
+        let path = PathBuf::from(format!("/proc/{pid}/task/{thread}/ns/{namespace}"));
+        let file = File::open(&path)
+            .map_err(|source| process_domain_system_error("open process namespace", &path, source))
+            .map_err(|error| prefer_task_change_or_exit(pidfd, pid, threads, error))?;
+        let metadata = file
+            .metadata()
+            .map_err(|source| {
+                process_domain_system_error("inspect process namespace", &path, source)
+            })
+            .map_err(|error| prefer_task_change_or_exit(pidfd, pid, threads, error))?;
+        let inode = NonZeroU64::new(metadata.ino())
+            .ok_or_else(|| ProcessHandleError::MalformedProcessNamespace { path: path.clone() })
+            .map_err(|error| prefer_task_change_or_exit(pidfd, pid, threads, error))?;
+        Ok(ProcessNamespaceIdentity::new(metadata.dev(), inode))
+    }
+
+    fn read_process_credential_maps(
+        pidfd: &OwnedFd,
+        pid: NonZeroU32,
+    ) -> Result<ProcessCredentialMapObservation, ProcessHandleError> {
+        Ok(ProcessCredentialMapObservation {
+            uid: read_process_credential_map(pidfd, pid, ProcessCredentialMapKind::Uid)?,
+            gid: read_process_credential_map(pidfd, pid, ProcessCredentialMapKind::Gid)?,
+        })
+    }
+
+    fn read_process_credential_map(
+        pidfd: &OwnedFd,
+        pid: NonZeroU32,
+        kind: ProcessCredentialMapKind,
+    ) -> Result<ProcessCredentialMapDigest, ProcessHandleError> {
+        let leaf = match kind {
+            ProcessCredentialMapKind::Uid => "uid_map",
+            ProcessCredentialMapKind::Gid => "gid_map",
+        };
+        let path = proc_process_path(pid, leaf);
+        let contents = read_bounded(&path, PROC_ID_MAP_LIMIT, "read process credential map")
+            .map_err(|error| process_domain_read_error(&path, error))
+            .map_err(|error| prefer_exit(pidfd, pid, error))?;
+        digest_process_id_map(&contents, &path, kind)
+            .map_err(|error| prefer_exit(pidfd, pid, error))
+    }
+
+    fn process_domain_read_error(path: &Path, error: ProcessHandleError) -> ProcessHandleError {
+        match error {
+            ProcessHandleError::SystemCall { source, .. }
+                if source.kind() == io::ErrorKind::NotFound =>
+            {
+                ProcessHandleError::ProcessDomainUnsupported {
+                    path: path.to_path_buf(),
+                }
+            }
+            error => error,
+        }
+    }
+
+    fn process_domain_system_error(
+        operation: &'static str,
+        path: &Path,
+        source: io::Error,
+    ) -> ProcessHandleError {
+        if source.kind() == io::ErrorKind::NotFound {
+            ProcessHandleError::ProcessDomainUnsupported {
+                path: path.to_path_buf(),
+            }
+        } else {
+            ProcessHandleError::SystemCall {
+                operation,
+                path: Some(path.to_path_buf()),
+                source,
+            }
+        }
+    }
+
+    pub(super) fn digest_process_id_map(
+        contents: &[u8],
+        path: &Path,
+        kind: ProcessCredentialMapKind,
+    ) -> Result<ProcessCredentialMapDigest, ProcessHandleError> {
+        let entries = parse_process_id_map(contents, path)?;
+        let mut hasher = Sha256::new();
+        hasher.update(match kind {
+            ProcessCredentialMapKind::Uid => UID_MAP_DIGEST_DOMAIN,
+            ProcessCredentialMapKind::Gid => GID_MAP_DIGEST_DOMAIN,
+        });
+        hasher.update(
+            u32::try_from(entries.len())
+                .expect("the process ID-map entry limit fits u32")
+                .to_le_bytes(),
+        );
+        for entry in entries {
+            hasher.update(entry.inside.to_le_bytes());
+            hasher.update(entry.outside.to_le_bytes());
+            hasher.update(entry.length.to_le_bytes());
+        }
+        Ok(ProcessCredentialMapDigest(hasher.finalize().into()))
+    }
+
+    fn parse_process_id_map(
+        contents: &[u8],
+        path: &Path,
+    ) -> Result<Vec<ProcessIdMapEntry>, ProcessHandleError> {
+        let mut entries = Vec::new();
+        for line in contents.split(|byte| *byte == b'\n') {
+            let line = trim_ascii(line);
+            if line.is_empty() {
+                continue;
+            }
+            if entries.len() == MAX_PROCESS_ID_MAP_ENTRIES {
+                return Err(ProcessHandleError::ProcessIdMapEntryLimitExceeded {
+                    path: path.to_path_buf(),
+                    limit: MAX_PROCESS_ID_MAP_ENTRIES,
+                });
+            }
+            let fields = line
+                .split(|byte| byte.is_ascii_whitespace())
+                .filter(|field| !field.is_empty())
+                .collect::<Vec<_>>();
+            let [inside, outside, length] = fields.as_slice() else {
+                return Err(ProcessHandleError::MalformedProcessIdMap {
+                    path: path.to_path_buf(),
+                });
+            };
+            let inside = parse_canonical_u32(inside).ok_or_else(|| {
+                ProcessHandleError::MalformedProcessIdMap {
+                    path: path.to_path_buf(),
+                }
+            })?;
+            let outside = parse_canonical_u32(outside).ok_or_else(|| {
+                ProcessHandleError::MalformedProcessIdMap {
+                    path: path.to_path_buf(),
+                }
+            })?;
+            let length = parse_canonical_u32(length)
+                .filter(|length| *length != 0)
+                .ok_or_else(|| ProcessHandleError::MalformedProcessIdMap {
+                    path: path.to_path_buf(),
+                })?;
+            let maximum = u64::from(u32::MAX);
+            if u64::from(inside) + u64::from(length) > maximum
+                || u64::from(outside) + u64::from(length) > maximum
+            {
+                return Err(ProcessHandleError::MalformedProcessIdMap {
+                    path: path.to_path_buf(),
+                });
+            }
+            entries.push(ProcessIdMapEntry {
+                inside,
+                outside,
+                length,
+            });
+        }
+        if entries.is_empty() {
+            return Err(ProcessHandleError::MalformedProcessIdMap {
+                path: path.to_path_buf(),
+            });
+        }
+
+        let mut inside_order = entries.clone();
+        inside_order.sort_unstable_by_key(|entry| entry.inside);
+        if inside_order.windows(2).any(|window| {
+            ranges_overlap(
+                window[0].inside,
+                window[0].length,
+                window[1].inside,
+                window[1].length,
+            )
+        }) {
+            return Err(ProcessHandleError::MalformedProcessIdMap {
+                path: path.to_path_buf(),
+            });
+        }
+        let mut outside_order = entries.clone();
+        outside_order.sort_unstable_by_key(|entry| entry.outside);
+        if outside_order.windows(2).any(|window| {
+            ranges_overlap(
+                window[0].outside,
+                window[0].length,
+                window[1].outside,
+                window[1].length,
+            )
+        }) {
+            return Err(ProcessHandleError::MalformedProcessIdMap {
+                path: path.to_path_buf(),
+            });
+        }
+        entries.sort_unstable_by_key(|entry| (entry.inside, entry.outside, entry.length));
+        Ok(entries)
+    }
+
+    fn ranges_overlap(first: u32, first_length: u32, second: u32, second_length: u32) -> bool {
+        u64::from(first) < u64::from(second) + u64::from(second_length)
+            && u64::from(second) < u64::from(first) + u64::from(first_length)
     }
 
     fn prefer_task_change_or_exit(

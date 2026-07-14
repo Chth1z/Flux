@@ -441,6 +441,11 @@ impl CanaryCredentialMapDigest {
         }
         Err(CanaryBindingError::AllZeroCredentialMapDigest)
     }
+
+    #[must_use]
+    pub(crate) const fn as_bytes(self) -> [u8; CANARY_CREDENTIAL_MAP_DIGEST_BYTES] {
+        self.0
+    }
 }
 
 /// Identity of the user/mount-namespace and ID-map domain in which process
@@ -469,6 +474,26 @@ impl CanaryCredentialDomainBinding {
             uid_map_digest,
             gid_map_digest,
         })
+    }
+
+    #[must_use]
+    pub(crate) const fn user_namespace(self) -> CanaryFileIdentity {
+        self.user_namespace
+    }
+
+    #[must_use]
+    pub(crate) const fn mount_namespace(self) -> CanaryFileIdentity {
+        self.mount_namespace
+    }
+
+    #[must_use]
+    pub(crate) const fn uid_map_digest(self) -> CanaryCredentialMapDigest {
+        self.uid_map_digest
+    }
+
+    #[must_use]
+    pub(crate) const fn gid_map_digest(self) -> CanaryCredentialMapDigest {
+        self.gid_map_digest
     }
 }
 

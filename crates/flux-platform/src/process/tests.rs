@@ -1,14 +1,20 @@
 use std::io::{BufRead, BufReader, Write};
 use std::num::{NonZeroU32, NonZeroU64};
+use std::os::unix::fs::MetadataExt;
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
 use super::implementation::{
-    parse_pidfd_info, parse_proc_stat, parse_proc_status, require_waitable_child,
-    validate_process_credential_census,
+    ProcessCredentialMapObservation, ProcessObservationCensusPass, ProcessTaskNamespaces,
+    ProcessTaskObservation, digest_process_id_map, parse_pidfd_info, parse_proc_stat,
+    parse_proc_status, require_waitable_child, validate_process_observation_census,
 };
-use super::{ProcessHandle, ProcessHandleError, ProcessHandleErrorKind, ProcessIdentity};
+use super::{
+    ProcessCredentialMapKind, ProcessHandle, ProcessHandleError, ProcessHandleErrorKind,
+    ProcessIdentity, ProcessNamespaceIdentity,
+};
 
 const THREAD_HELPER_MODE: &str = "FLUX_PROCESS_HANDLE_THREAD_HELPER";
 const THREAD_HELPER_TEST: &str = "process::tests::process_handle_thread_helper";
@@ -90,6 +96,43 @@ impl Drop for ChildGuard {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+fn task_namespaces(seed: u64) -> ProcessTaskNamespaces {
+    ProcessTaskNamespaces {
+        user: ProcessNamespaceIdentity::new(4, NonZeroU64::new(seed).unwrap()),
+        mount: ProcessNamespaceIdentity::new(4, NonZeroU64::new(seed + 1).unwrap()),
+        network: ProcessNamespaceIdentity::new(4, NonZeroU64::new(seed + 2).unwrap()),
+    }
+}
+
+fn credential_maps(uid: &[u8], gid: &[u8]) -> ProcessCredentialMapObservation {
+    ProcessCredentialMapObservation {
+        uid: digest_process_id_map(
+            uid,
+            Path::new("/test/uid_map"),
+            ProcessCredentialMapKind::Uid,
+        )
+        .expect("digest test UID map"),
+        gid: digest_process_id_map(
+            gid,
+            Path::new("/test/gid_map"),
+            ProcessCredentialMapKind::Gid,
+        )
+        .expect("digest test GID map"),
+    }
+}
+
+fn observation_pass<'a>(
+    task_ids: &'a [NonZeroU32],
+    task_observations: &'a [(NonZeroU32, ProcessTaskObservation)],
+    credential_maps: ProcessCredentialMapObservation,
+) -> ProcessObservationCensusPass<'a> {
+    ProcessObservationCensusPass {
+        task_ids,
+        task_observations,
+        credential_maps,
     }
 }
 
@@ -189,15 +232,45 @@ fn credential_census_validation_rejects_changed_or_heterogeneous_tasks() {
     )
     .expect("parse worker credentials");
     let task_ids = [leader_id, worker_id];
-    let homogeneous = [(leader_id, leader.clone()), (worker_id, leader.clone())];
-    let heterogeneous = [(leader_id, leader), (worker_id, restricted_worker)];
+    let namespaces = task_namespaces(100);
+    let homogeneous = [
+        (
+            leader_id,
+            ProcessTaskObservation {
+                credentials: leader.clone(),
+                namespaces,
+            },
+        ),
+        (
+            worker_id,
+            ProcessTaskObservation {
+                credentials: leader.clone(),
+                namespaces,
+            },
+        ),
+    ];
+    let heterogeneous = [
+        (
+            leader_id,
+            ProcessTaskObservation {
+                credentials: leader,
+                namespaces,
+            },
+        ),
+        (
+            worker_id,
+            ProcessTaskObservation {
+                credentials: restricted_worker,
+                namespaces,
+            },
+        ),
+    ];
+    let maps = credential_maps(b"0 1000 1\n", b"0 2000 1\n");
 
-    let error = validate_process_credential_census(
+    let error = validate_process_observation_census(
         leader_id,
-        &task_ids,
-        &heterogeneous,
-        &task_ids,
-        &heterogeneous,
+        observation_pass(&task_ids, &heterogeneous, maps),
+        observation_pass(&task_ids, &heterogeneous, maps),
         &task_ids,
     )
     .expect_err("a stable worker/leader credential mismatch must be rejected");
@@ -209,12 +282,10 @@ fn credential_census_validation_rejects_changed_or_heterogeneous_tasks() {
         } if pid == leader_id && thread == worker_id
     ));
 
-    let error = validate_process_credential_census(
+    let error = validate_process_observation_census(
         leader_id,
-        &task_ids,
-        &homogeneous,
-        &task_ids,
-        &heterogeneous,
+        observation_pass(&task_ids, &homogeneous, maps),
+        observation_pass(&task_ids, &heterogeneous, maps),
         &task_ids,
     )
     .expect_err("credentials changing between scans must be rejected");
@@ -224,6 +295,183 @@ fn credential_census_validation_rejects_changed_or_heterogeneous_tasks() {
             pid,
             thread
         } if pid == leader_id && thread == worker_id
+    ));
+}
+
+#[test]
+fn namespace_and_map_census_rejects_drift_or_heterogeneous_tasks() {
+    let leader_id = NonZeroU32::new(4242).unwrap();
+    let worker_id = NonZeroU32::new(4243).unwrap();
+    let (_, _, credentials) = parse_proc_status(
+        b"Tgid:\t4242\nPid:\t4242\nUid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\nGroups:\t\nCapInh:\t0\nCapPrm:\t0\nCapEff:\t0\nCapAmb:\t0\nNoNewPrivs:\t1\n",
+    )
+    .expect("parse stable credentials");
+    let task_ids = [leader_id, worker_id];
+    let namespaces = task_namespaces(200);
+    let alternate_namespaces = task_namespaces(300);
+    let homogeneous = [
+        (
+            leader_id,
+            ProcessTaskObservation {
+                credentials: credentials.clone(),
+                namespaces,
+            },
+        ),
+        (
+            worker_id,
+            ProcessTaskObservation {
+                credentials: credentials.clone(),
+                namespaces,
+            },
+        ),
+    ];
+    let heterogeneous = [
+        (
+            leader_id,
+            ProcessTaskObservation {
+                credentials: credentials.clone(),
+                namespaces,
+            },
+        ),
+        (
+            worker_id,
+            ProcessTaskObservation {
+                credentials,
+                namespaces: alternate_namespaces,
+            },
+        ),
+    ];
+    let maps = credential_maps(b"0 1000 1\n", b"0 2000 1\n");
+
+    let error = validate_process_observation_census(
+        leader_id,
+        observation_pass(&task_ids, &homogeneous, maps),
+        observation_pass(&task_ids, &heterogeneous, maps),
+        &task_ids,
+    )
+    .expect_err("a namespace transition between scans must be rejected");
+    assert!(matches!(
+        error,
+        ProcessHandleError::ProcessThreadNamespacesChanged { pid, thread }
+            if pid == leader_id && thread == worker_id
+    ));
+
+    let error = validate_process_observation_census(
+        leader_id,
+        observation_pass(&task_ids, &heterogeneous, maps),
+        observation_pass(&task_ids, &heterogeneous, maps),
+        &task_ids,
+    )
+    .expect_err("a stable worker/leader namespace mismatch must be rejected");
+    assert!(matches!(
+        error,
+        ProcessHandleError::ProcessThreadNamespaceMismatch { pid, thread }
+            if pid == leader_id && thread == worker_id
+    ));
+
+    let changed_uid_maps = credential_maps(b"0 1001 1\n", b"0 2000 1\n");
+    let error = validate_process_observation_census(
+        leader_id,
+        observation_pass(&task_ids, &homogeneous, maps),
+        observation_pass(&task_ids, &homogeneous, changed_uid_maps),
+        &task_ids,
+    )
+    .expect_err("a UID map transition between scans must be rejected");
+    assert!(matches!(
+        error,
+        ProcessHandleError::ProcessCredentialMapChanged {
+            pid,
+            map: ProcessCredentialMapKind::Uid
+        } if pid == leader_id
+    ));
+}
+
+#[test]
+fn process_id_map_digest_is_canonical_domain_separated_and_exact() {
+    let canonical = b"0 1000 1\n1 2000 2\n";
+    let reordered = b"\n  1   2000  2\n0\t1000\t1\n";
+    let uid = digest_process_id_map(
+        canonical,
+        Path::new("/test/uid_map"),
+        ProcessCredentialMapKind::Uid,
+    )
+    .expect("digest canonical UID map");
+    let equivalent = digest_process_id_map(
+        reordered,
+        Path::new("/test/uid_map"),
+        ProcessCredentialMapKind::Uid,
+    )
+    .expect("digest reordered UID map");
+    assert_eq!(uid, equivalent);
+    assert_eq!(
+        uid.as_bytes(),
+        &[
+            0xcf, 0x3b, 0x52, 0xaf, 0x5e, 0x3e, 0x42, 0x6c, 0x6f, 0x38, 0xa4, 0x6d, 0x45, 0xe0,
+            0xb8, 0x59, 0x40, 0x0f, 0x6b, 0xfb, 0xd7, 0x3f, 0x53, 0xb5, 0x1e, 0x7b, 0x2b, 0xb5,
+            0x00, 0xbc, 0x97, 0xbd,
+        ]
+    );
+
+    let gid = digest_process_id_map(
+        canonical,
+        Path::new("/test/gid_map"),
+        ProcessCredentialMapKind::Gid,
+    )
+    .expect("digest canonical GID map");
+    assert_ne!(uid, gid, "UID and GID map domains must be distinct");
+
+    let split = digest_process_id_map(
+        b"0 1000 1\n1 1001 1\n",
+        Path::new("/test/uid_map"),
+        ProcessCredentialMapKind::Uid,
+    )
+    .expect("digest split UID map");
+    let merged = digest_process_id_map(
+        b"0 1000 2\n",
+        Path::new("/test/uid_map"),
+        ProcessCredentialMapKind::Uid,
+    )
+    .expect("digest merged UID map");
+    assert_ne!(split, merged, "exact extent shape remains digest-bound");
+}
+
+#[test]
+fn process_id_map_parser_rejects_malformed_overlapping_and_oversized_maps() {
+    let invalid = [
+        b"".as_slice(),
+        b"0 1000 1 extra\n".as_slice(),
+        b"00 1000 1\n".as_slice(),
+        b"0 1000 0\n".as_slice(),
+        b"4294967294 0 2\n".as_slice(),
+        b"0 4294967294 2\n".as_slice(),
+        b"0 1000 2\n1 2000 1\n".as_slice(),
+        b"0 1000 1\n2 1000 1\n".as_slice(),
+    ];
+    for contents in invalid {
+        let error = digest_process_id_map(
+            contents,
+            Path::new("/test/uid_map"),
+            ProcessCredentialMapKind::Uid,
+        )
+        .expect_err("malformed ID maps must be rejected");
+        assert!(matches!(
+            error,
+            ProcessHandleError::MalformedProcessIdMap { .. }
+        ));
+    }
+
+    let oversized = (0..=340)
+        .map(|index| format!("{} {} 1\n", index * 2, 1000 + index * 2))
+        .collect::<String>();
+    let error = digest_process_id_map(
+        oversized.as_bytes(),
+        Path::new("/test/uid_map"),
+        ProcessCredentialMapKind::Uid,
+    )
+    .expect_err("more than 340 ID-map entries must be rejected");
+    assert!(matches!(
+        error,
+        ProcessHandleError::ProcessIdMapEntryLimitExceeded { limit: 340, .. }
     ));
 }
 
@@ -250,10 +498,42 @@ fn child_origin_handle_reobserves_the_same_live_identity_and_credentials() {
     let initial = handle.initial_observation();
     assert_eq!(initial.identity(), handle.identity());
     assert_eq!(initial.credentials(), handle.credentials());
+    assert_eq!(initial.domain(), handle.domain());
+
+    let pid = initial.identity().pid();
+    let domain = initial.domain();
+    for (leaf, observed) in [
+        ("user", domain.user_namespace()),
+        ("mnt", domain.mount_namespace()),
+        ("net", domain.network_namespace()),
+    ] {
+        let path = format!("/proc/{pid}/ns/{leaf}");
+        let file = std::fs::File::open(&path).expect("open live child namespace");
+        let metadata = file.metadata().expect("inspect live child namespace");
+        assert_eq!(observed.device(), metadata.dev());
+        assert_eq!(observed.inode().get(), metadata.ino());
+    }
+    let uid_map_path = format!("/proc/{pid}/uid_map");
+    let gid_map_path = format!("/proc/{pid}/gid_map");
+    let expected_uid_map = digest_process_id_map(
+        &std::fs::read(&uid_map_path).expect("read live child UID map"),
+        Path::new(&uid_map_path),
+        ProcessCredentialMapKind::Uid,
+    )
+    .expect("digest live child UID map");
+    let expected_gid_map = digest_process_id_map(
+        &std::fs::read(&gid_map_path).expect("read live child GID map"),
+        Path::new(&gid_map_path),
+        ProcessCredentialMapKind::Gid,
+    )
+    .expect("digest live child GID map");
+    assert_eq!(domain.uid_map_digest(), expected_uid_map);
+    assert_eq!(domain.gid_map_digest(), expected_gid_map);
 
     let observation = handle.reobserve().expect("reobserve live child");
     assert_eq!(observation.identity(), initial.identity());
     assert_eq!(observation.credentials(), initial.credentials());
+    assert_eq!(observation.domain(), initial.domain());
 }
 
 #[test]

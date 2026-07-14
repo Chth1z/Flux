@@ -50,13 +50,16 @@ verifier can pass.
    request; and execution opens it after availability but before preparation without giving the
    driver pidfd or signal/wait/reap authority. The process verifier now preserves the child-origin
    initial observation and reobserves the same retained pidfd after capture verification, producing
-   a non-cloneable raw pair bound to identity, revision, opening ID, stable credentials, and the
-   exclusive deadline. Still pending are engine credential-policy validation, authoritative
-   user/mount/network namespace and UID/GID-map observation, verifier completion chronology,
-   driver-owned client/peer child retirement, independent listener observation, a versioned report
-   capability/parser, actual prebound collector observations, cleanup binding, and schema-v2
-   construction with test-only fixtures. All remain fail-closed while production returns
-   `Unsupported`.
+   a non-cloneable raw pair bound to identity, revision, opening ID, stable complete process
+   observations, and the exclusive deadline. The platform now obtains authoritative
+   user/mount/network namespace identities for every thread, reads bounded canonical UID/GID maps
+   twice, and rejects thread/domain/map drift. The process verifier validates both observations
+   against the request's exact four-slot UID/GID policy, empty groups, zero capabilities,
+   `NoNewPrivs`, credential-map domain, and daemon network namespace. Still pending are verifier
+   completion chronology, driver-owned client/peer child retirement, independent listener
+   observation, a versioned report capability/parser, actual prebound collector observations,
+   cleanup binding, and schema-v2 construction with test-only fixtures. All remain fail-closed
+   while production returns `Unsupported`.
 
    Before any positive traffic producer or receipt authority may be inhabited, one concrete
    local-OUTPUT capture mechanism must preserve TPROXY listener semantics on the target device and
@@ -66,11 +69,10 @@ verifier can pass.
    future experiment; production never loads a `.ko`. REDIRECT/DNAT cannot qualify a TPROXY plan,
    and TUN remains rejected until one exact routing owner passes readback and forced-death cleanup
    canaries.
-   The immediate next subcheckpoints are 13b-2a engine credential-policy and namespace/map-domain
-   validation, then 13b-2b driver-owned client/peer retirement plus final verifier completion
-   chronology. Listener/report and collector/factory work follow as separate reviews. Cgroup-BPF
-   is not assigned to Phase 8 until a separate TCP/UDP-complete
-   authority design and exit gate exist.
+   The immediate next subcheckpoint is 13b-2b driver-owned client/peer retirement plus final
+   verifier completion chronology. Listener/report and collector/factory work follow as separate
+   reviews. Cgroup-BPF is not assigned to Phase 8 until a separate TCP/UDP-complete authority design
+   and exit gate exist.
 2. **Native Phase 3 correctness:** add exact device/artifact identity; select positive mark policies from a compile-time reviewed stable artifact catalog and then bind them to boot/namespace freshness; complete the remaining 24 census cells and point-in-time coordinator; prove writer semantics, observer continuity, mark preservation, domain/network-selection handoff, and route reachability; only then allocate priorities/tables/marks or mutate the kernel.
 3. **Optional eBPF implementation/probe:** implement only isolated, opt-in `xt_bpf` probe mechanics in a disposable test namespace without persistent pins, production daemon integration, Capability Profile publication, implicit module autoload, or writes to live Flux chains. The device-qualified adapter and first production-state integration land in Phase 4 after `fluxd` becomes the sole xtables writer; broader observation remains Phase 7. Positive acceleration waits for the Rust xtables compiler, a complete conventional classifier, parity evidence, and device benchmarks.
 
@@ -135,9 +137,11 @@ handoff is delivered: `SingBoxChild` opens an exact child-origin `ProcessHandle`
 requires matching ready ownership, and the coordinator/execution path moves that authority once
 into the process verifier without transferring signal/wait/reap authority. The verifier now
 preserves the initial child-origin observation and reobserves the same retained pidfd after capture
-verification. Still deferred are engine credential-policy and namespace/map-domain validation,
-final verifier completion chronology, prepared-driver client/peer child ownership, schema-v2
-listener-observer/report parsing and factories, production context use of the delivered
+verification. The raw observation now includes authoritative stable user/mount/network namespace
+identities and canonical UID/GID-map digests, and the verifier requires the exact request engine
+credential/domain policy for both scans. Still deferred are final verifier completion chronology,
+prepared-driver client/peer child ownership, schema-v2 listener-observer/report parsing and
+factories, production context use of the delivered
 attempt-owned outbound-collector handoff, actual collector observations, capability-qualified
 engine/probe execution, a real traffic producer, and Android adapter/qualification. The validator
 itself is complete and rejects weak,
@@ -545,10 +549,12 @@ Before a backend may be selected automatically, its documentation must include:
      private opening identity, stable credentials, and exclusive deadline; the handle remains
      observation-only and exit/deadline failure is cleanup-uncertain. Production still cannot mint
      a process receipt.
-   - **2b-2a pending — engine credential-policy and process-domain validation:** observe the exact
-     user/mount/network namespaces and UID/GID maps instead of copying request values, and validate
-     all four UID/GID slots against the request engine credentials together with empty
-     supplementary groups, zero capabilities, and `NoNewPrivs`.
+   - **2b-2a complete — engine credential-policy and process-domain validation:** observe opened
+     user/mount/network namespace descriptors for every task and bounded canonical UID/GID maps
+     instead of copying request values; reject thread, namespace, or map drift across the two-pass
+     census; and validate both engine observations against all four request UID/GID slots, empty
+     supplementary groups, zero capabilities, `NoNewPrivs`, the exact credential-map domain, and
+     daemon network namespace. The production process-receipt authority remains uninhabited.
    - **2b-2b pending — driver-child ownership and final receipt chronology:** retain client/peer
      children through exact termination and parent reap, bind their exact handle/domain evidence,
      and record final attempt completion only after all verifier observations before minting any

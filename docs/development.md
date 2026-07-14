@@ -88,6 +88,28 @@ path continues to execute all bridge capture, policy-routing, and address-synchr
 After the focused test, run `cargo xtask ci`; renderer differential tests and real-device cutover
 qualification belong to later checkpoints.
 
+### Frozen xtables restore syntax workflow
+
+The first xtables support slice is a pure parser/canonical codec for observation artifacts, not a
+Capture renderer. Run its focused integration test with:
+
+```text
+cargo test -p flux-platform --test xtables_restore
+```
+
+The suite uses current-shaped synthetic documents to pin strict LF/single-space printable-ASCII
+framing, repeated tables, declaration and command order, duplicates, IPv4/IPv6 context,
+apply/cleanup opcode separation, per-transaction
+delete-before-flush-before-delete-chain cleanup phases, exact
+bounds, canonical round-trip bytes, and digest identity. It performs no filesystem reads, shell or
+restore invocation, kernel access, or mutation.
+
+Passing this test does not establish that `scripts/rules` generated the bytes, that the kernel
+accepts them, that cleanup is complete, or that a Rust Capture renderer has parity. Raw oracle
+fixtures must be generated later in a hermetic, digest-pinned shell/AWK environment and compared in
+a separate job; normal `cargo xtask ci` only parses checked-in or synthetic bytes and never invokes
+live networking tools.
+
 The privileged Linux functional-canary harness is an independent opt-in checkpoint and is not part
 of `cargo xtask ci`:
 

@@ -306,6 +306,16 @@ point-in-time coordination are still pending.
 
 ## Phase 4 — Rust xtables and ipset parity
 
+The first supporting checkpoint is intentionally below a Capture renderer. `flux-platform` can
+parse and canonically re-encode the frozen restore syntax as an ordered, bounded observation
+artifact: repeated `mangle`/`filter`/`nat` transactions, chain declarations, `-A`/`-I` apply
+commands, `-D`/`-F`/`-X` cleanup commands, duplicates, family context, cleanup phase ordering,
+resource usage, and an exact byte digest are retained. Cleanup phase ordering is enforced within
+each restore transaction. The parser performs no shell execution,
+filesystem discovery, restore invocation, kernel access, Generation conversion, ownership, or
+activation. Its current-shaped synthetic tests are grammar tests, not shell-generated fixture,
+renderer, byte-parity, kernel-acceptance, cleanup-completeness, or device-parity evidence.
+
 ### Deliverables
 
 - Rust compiler for xtables restore programs.

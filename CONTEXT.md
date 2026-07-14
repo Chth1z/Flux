@@ -43,8 +43,24 @@ A deterministic backend-neutral compilation of Capture Policy into separate orde
 _Avoid_: Restore file, active rules
 
 **Shadow Capture Artifact**:
-An observation-only Phase 2 Capture Program used to explain and compare compatibility semantics before a native renderer or activation path exists. It has no Generation ID, Planning Authority, writer token, ownership lease, prepared/active conversion, or functional-canary authority.
+An observation-only Phase 2 Capture Program used to explain and compare compatibility semantics before canonical Capture Program lowering or an activation path exists. It is distinct from the delivered legacy source-shape renderer and has no Generation ID, Planning Authority, writer token, ownership lease, prepared/active conversion, or functional-canary authority.
 _Avoid_: Dry-run Generation, staged rules
+
+**Legacy Rules Plan**:
+A validated, source-shape-preserving Rust representation of the admitted `scripts/rules` compatibility inputs. It can deterministically emit the same bounded apply/cleanup restore bytes for bridge preparation, including legacy ordering and duplicates, but it is not a lowering of `ShadowCaptureArtifact`, a Generation Capture Program, or mutation authority.
+_Avoid_: Native Capture Program, active backend
+
+**Rule Cache Producer**:
+The mutually exclusive compiler identity recorded with shared bridge caches. Rust-owned preparation records `rust` and invokes only `fluxd render-legacy-rules`; explicit legacy ownership records `shell` and alone sources `scripts/rules`. A failed Rust render never silently falls back to the shell producer.
+_Avoid_: Preferred renderer, automatic fallback
+
+**Package Inventory Snapshot**:
+A bounded immutable byte snapshot produced by `fluxd snapshot-legacy-packages` from one no-follow, regular, descriptor-stable Android package source when application UID resolution is required. All renders in one preparation consume the same snapshot; inactive application selection uses an empty snapshot without reading package state.
+_Avoid_: Live packages.list view, package cache
+
+**Restore Executor**:
+The component that submits prepared restore bytes to the kernel. During the current bridge, `scripts/tproxy` remains the sole restore executor and networking writer even when Rust produced the cache bytes.
+_Avoid_: Rule compiler, cache producer
 
 **Bypass Policy**:
 The portion of Capture Policy that identifies traffic which remains direct. It distinguishes mandatory loop/device-local safety exclusions from configurable private, CGNAT, and other special-use direct defaults.
@@ -59,7 +75,7 @@ The data-plane program that accepts captured traffic and executes proxy, DNS, an
 _Avoid_: Core, daemon
 
 **Compatibility Oracle**:
-The frozen, still-executed shell networking implementation and its pinned semantic fixtures used to review Rust replacement behavior during the bridge releases. It remains the sole networking writer until ownership transfers through a component-specific cutover gate; it is not the final architecture.
+The frozen shell networking behavior and pinned fixtures used to review Rust replacement behavior during bridge releases. `scripts/rules` is executed only under explicit legacy ownership as the rollback producer; under Rust ownership it is retained but not sourced. The shell restore path remains the sole networking writer until ownership transfers through a component-specific cutover gate; the oracle is not the final architecture.
 _Avoid_: Second backend, permanent shell path
 
 ## Device model

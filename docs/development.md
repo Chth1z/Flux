@@ -1,6 +1,6 @@
 # Flux Rewrite Development
 
-The Rust rewrite uses a root Cargo workspace while the legacy `addrsyncd` submodule remains independently locked and buildable during the bridge releases. The executed shell networking path is frozen as the compatibility oracle and remains the sole writer until each Rust component passes its cutover gate.
+The Rust rewrite uses a root Cargo workspace while the legacy `addrsyncd` submodule remains independently locked and buildable during the bridge releases. The shell restore path remains the sole networking writer until each Rust component passes its cutover gate. Rust-owned preparation now compiles the legacy restore caches, while the frozen shell generator remains an explicit legacy-owner rollback oracle rather than a silent fallback.
 
 ## Toolchain contract
 
@@ -78,39 +78,80 @@ Treat a difference as a review item, not permission to update both sides mechani
 change is admitted only for a concrete correctness, security, release-contract, or rollback fix,
 and the frozen fixture records why it changed. A shadow change may improve typed normalization or
 explanation, but passing the fixture is semantic characterization only: the checkpoint has no
-restore renderer, byte/device parity claim, Generation ID, Planning Authority, writer token,
+conversion into the independent legacy source-shape renderer, byte/device parity claim,
+Generation ID, Planning Authority, writer token,
 ownership lease, prepared/active conversion, Runtime Coordinator path, or functional-canary
 authority.
 
 Do not use the shadow work to attach or pin eBPF, touch live Flux chains, enable TUN, request kernel
 modules implicitly, load `.ko`/KPM payloads, or perform native networking mutation. The shell phase
 path continues to execute all bridge capture, policy-routing, and address-synchronization writes.
-After the focused test, run `cargo xtask ci`; renderer differential tests and real-device cutover
-qualification belong to later checkpoints.
+The delivered `LegacyRulesPlan` is a separate source-shape compatibility compiler; it does not
+promote the shadow artifact or discharge canonical Capture Program lowering.
 
-### Frozen xtables syntax and oracle workflow
+### Rust legacy-rule renderer and frozen oracle workflow
 
-The completed xtables support slice is a pure parser/canonical codec for observation artifacts, not
-a Capture renderer. Run the synthetic grammar/bounds suite and the checked-in oracle-fixture suite:
+Run the parser, source-shape renderer, strict bridge-input adapter, and checked-in oracle suites:
 
 ```text
 cargo test -p flux-platform --test xtables_restore
 cargo test -p flux-platform --test xtables_restore_oracle
+cargo test -p flux-platform --test xtables_legacy_render
+cargo test -p fluxd --test legacy_rules_cli
+sh tests/shell/run-dispatcher-tests.sh
 ```
 
-The first suite uses current-shaped synthetic documents to pin strict LF/single-space printable-ASCII
+The parser suite uses current-shaped synthetic documents to pin strict LF/single-space printable-ASCII
 framing, repeated tables, declaration and command order, duplicates, IPv4/IPv6 context,
 apply/cleanup opcode separation, per-transaction
 delete-before-flush-before-delete-chain cleanup phases, exact
 bounds, canonical round-trip bytes, and digest identity. It performs no filesystem reads, shell or
-restore invocation, kernel access, or mutation. The second suite parses the four checked-in
+restore invocation, kernel access, or mutation. The oracle parser suite parses the four checked-in
 IPv4/IPv6 apply/cleanup oracle fixtures and proves exact canonical byte round-trip plus the expected
 syntax-artifact accounting and digest.
 
-These tests establish syntax byte compatibility only. They do not establish that an independent
-Rust Capture renderer implements the same packet-policy semantics, that the kernel accepts the
-programs, that apply/cleanup is invertible, or that an Android device has packet-path parity. The
-bounded raw cache-artifact regeneration workflow is separate and explicit:
+`xtables_legacy_render` independently emits those four fixtures from a validated
+`LegacyRulesPlan` and covers the admitted application modes, ordered UIDs and duplicate interfaces,
+feature gates, mark/mask inputs, FakeIP/MSS branches, family admission, and cleanup symmetry. This
+is deliberate legacy source-shape parity, including compatibility ordering that the canonical
+shadow policy normalizes away. It is not a lowering of `ShadowCaptureArtifact`.
+
+`legacy_rules_cli` covers the strict preparation adapter used by
+`fluxd render-legacy-rules --packages-list PATH --family 4|6 --action apply|cleanup`. The adapter
+reads only its allowlisted exported cache environment and bounded package snapshot, resolves the
+ordered Android multi-user UIDs, rejects unsupported TUN, non-`iptables_restore`, non-zone,
+missing-`xt_owner`, and missing-TPROXY profiles, and writes canonical restore bytes to stdout. It
+does not invoke restore tools or mutate networking state.
+
+The same suite covers `fluxd snapshot-legacy-packages --source PATH`. This helper opens the source
+without following symlinks, requires a bounded regular file, verifies the opened descriptor remains
+stable across the read, and streams the snapshot to stdout for `atomic_write`; shell never directly
+copies a live `packages.list` into the preparation cache.
+
+Rust-owned preparation has a mutually exclusive cache-producer contract:
+
+1. `scripts/init` compiles and exports `cache_config`.
+2. When application selection needs package resolution, it invokes
+   `fluxd snapshot-legacy-packages --source "${PACKAGES_LIST}"` through `atomic_write` to publish one
+   descriptor-validated, at-most-4-MiB read-only `cache_packages`; otherwise it publishes an empty
+   snapshot without reading Android package state.
+3. The same immutable snapshot and exported `IPV4_MARK`/`IPV6_MARK`/`BYPASS_MARK` shell PBR inputs
+   feed every parallel family/action Rust render.
+4. Successful Rust preparation records `rust` in `cache_valid` and copies `cache_packages` plus the
+   restore caches into the immutable Generation.
+5. Explicit legacy ownership alone sources `scripts/rules`, removes the package snapshot, records
+   `shell`, and remains the rollback producer. Rust render failure aborts candidate preparation and
+   preserves the active Generation; it never falls back silently to shell generation.
+
+In both modes, `scripts/tproxy` remains the sole restore executor and kernel writer. These host
+tests do not establish kernel acceptance, exact live readback, Android/Magisk packet-path parity, or
+native writer ownership. The bounded raw cache-artifact regeneration workflow remains separate and
+explicit:
+
+The dispatcher suite also proves that explicit legacy restart prepares and validates fresh
+settings, the replacement Sing-Box configuration, and replacement caches before stopping the
+active runtime. A failed replacement render restores the prior cache authority, leaves that runtime
+running, and still permits an explicit stop.
 
 ```text
 cargo xtask xtables-oracle --check
@@ -137,8 +178,9 @@ normal `cargo xtask ci`.
 These files characterize only that bounded cache-input profile. They do not run configuration or
 kernel capability detection and do not cover QUIC, policy-based routing, or forced cleanup; the
 cleanup pair records the shell generator's ordinary `-D` form. They prove neither kernel
-acceptance nor Android/Magisk-device parity, and they create no Capture renderer, Generation,
-writer/ownership authority, prepared/active conversion, coordinator path, or activation claim.
+acceptance nor Android/Magisk-device parity. Raw fixtures alone create no renderer, Generation,
+writer/ownership authority, prepared/active conversion, coordinator path, or activation claim;
+their role in the separate Rust differential suite does not widen that authority.
 
 The privileged Linux functional-canary harness is an independent opt-in checkpoint and is not part
 of `cargo xtask ci`:

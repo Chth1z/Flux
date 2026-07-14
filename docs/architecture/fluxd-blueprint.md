@@ -19,8 +19,10 @@ eBPF is a first-class optional plane with two stages: observability first, then 
 
 Migration is component-by-component rather than a big-bang shell deletion. During bridge releases,
 the serialized shell networking path is frozen as the executable compatibility oracle and remains
-the sole writer. Rust may compile and compare observation-only shadow artifacts before it owns a
-backend, but an ownership transition occurs only after renderer, parity, readback, recovery,
+the sole writer. Rust-owned preparation now compiles the legacy restore caches through a validated
+source-shape renderer while explicit legacy ownership retains the frozen shell generator; this
+non-mutating compiler split does not promote a shadow artifact or transfer writer ownership. A
+kernel ownership transition occurs only after renderer, parity, readback, recovery,
 rollback, and real-device gates pass for that component. See [ADR-0010](../adr/0010-freeze-shell-networking-as-a-shadow-compiler-oracle.md).
 
 ## Research basis
@@ -441,11 +443,21 @@ The compiler emits backend-neutral Capture Policy first, then an nftables progra
 
 This path preserves broad Android compatibility.
 
-Until Phase 4 transfers ownership, the existing shell implementation remains the frozen executed
-oracle for this path. The Phase 2 shadow compiler may characterize its ordered semantics, but it
-does not render or invoke restore commands and does not claim byte or device parity. The Rust
-renderer is admitted later as a separate checkpoint; the shell writer is disabled before its first
-native mutation so both implementations are never active writers.
+The first non-mutating Phase 4 compiler cutover is delivered. Rust-owned preparation exclusively
+invokes `fluxd render-legacy-rules`; explicit legacy ownership exclusively sources `scripts/rules`
+as the frozen rollback oracle. The cache records its `rust` or `shell` producer and never silently
+falls back between them. `scripts/tproxy` remains the sole restore executor and kernel writer.
+
+The delivered `LegacyRulesPlan` preserves validated legacy source shape; it is not a lowering of the
+Phase 2 shadow Capture Program and does not claim target semantic or device parity. A later native
+transition disables the shell writer before its first restore mutation so both implementations are
+never active writers.
+
+When application UID resolution is needed, preparation uses
+`fluxd snapshot-legacy-packages --source PATH`, not a shell copy, to obtain one no-follow, bounded,
+regular, descriptor-stable snapshot for every family/action render. Explicit legacy restart also
+prepares fresh settings, replacement Sing-Box configuration, and replacement caches before stopping
+the active runtime.
 
 Design requirements:
 
@@ -930,7 +942,7 @@ The Phase 1 projection exposes `ControlSnapshot` and `RuntimeSnapshot` as separa
 16. Compatibility components transfer to Rust atomically and individually; shell remains the sole
     writer for a component until its transition lease disables that path.
 
-Phase 1 is an explicit bridge exception to invariant 12's final-state wording: shell phase scripts still apply networking state, but the serialized worker is their only caller and the boot-scoped lease excludes `scripts/core` from Rust-owned engine runs. Their networking behavior is frozen under ADR-0010 except for correctness, security, release-contract, and rollback fixes.
+Phase 1 is an explicit bridge exception to invariant 12's final-state wording: shell phase scripts still apply networking state, but the serialized worker is their only caller and the boot-scoped lease excludes `scripts/core` from Rust-owned engine runs. Rust-owned preparation compiles rule caches; explicit legacy ownership alone executes the frozen shell generator; `scripts/tproxy` applies either prepared cache. Their networking behavior is frozen under ADR-0010 except for correctness, security, release-contract, and rollback fixes.
 
 ## Completion criteria for the rewrite
 

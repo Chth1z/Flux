@@ -13,7 +13,12 @@ Flux 是面向 Magisk、KernelSU 与 APatch 的 Android 透明代理模块。它
 当前分支仍是 Phase 1 过渡桥接版本，并非已经完成的原生 Rust 重写：
 
 - `fluxd` 负责管理意图、串行生命周期、Generation 恢复以及 Sing-Box 子进程。
-- shell 适配器仍是 iptables、策略路由和地址派生规则的唯一写入者。
+- Rust 所有权下的准备阶段只调用 `fluxd render-legacy-rules`，生成保留的 source-shape restore
+  缓存，并将其生产者记录为 `rust`；它不会静默回退到 shell 生成器。
+- 只有显式旧所有权路径会 source `scripts/rules`，并将缓存生产者记录为 `shell`；该路径是互斥的
+  回滚路径，其他情况下 `scripts/rules` 仅作为冻结 oracle 保留。
+- `scripts/tproxy` 仍是唯一 restore 执行器和 xtables 内核写入者。在后续所有权切换前，策略路由与
+  地址派生规则也仍由 shell 适配器修改。
 - 当前桥接仅接受 `PROXY_MODE="tproxy"`。TUN 字段为未来单一所有者方案保留，在激活前会被拒绝。
 - 生产路径的抓取验证仍是结构验证。更严格的本地 OUTPUT 功能 canary 已分阶段实现，但尚未构成
   Android 发布资格证据。
@@ -70,17 +75,41 @@ flowchart TD
     Coordinator --> Engine["EngineSupervisor"]
     Engine --> SingBox["sing-box 子进程"]
     Coordinator --> Bridge["LegacyDispatcher 适配器"]
-    Bridge --> Rules["init / rules / tproxy / addrsync"]
-    Rules --> Kernel["iptables + RPDB + 独立 addrsyncd"]
+    Bridge --> Init["scripts/init 准备阶段"]
+    Init -->|"仅 Rust 所有权"| Renderer["fluxd render-legacy-rules"]
+    Init -->|"仅显式旧所有权"| Oracle["scripts/rules 冻结 oracle / 回滚"]
+    Renderer --> Cache["restore 缓存；生产者 = rust"]
+    Oracle --> CacheLegacy["restore 缓存；生产者 = shell"]
+    Cache --> Tproxy["scripts/tproxy 唯一 restore 执行器"]
+    CacheLegacy --> Tproxy
+    Tproxy --> Kernel["xtables 内核状态"]
+    Bridge --> AddrSync["scripts/addrsync + 独立 addrsyncd"]
+    AddrSync --> KernelPolicy["RPDB + 地址派生规则"]
 ```
 
 Rust 所有权路径中不存在并行 IPMonitor 所有者。事件事实先进入 `fluxd`，所有会修改系统状态的桥接阶段
 都在同一个串行 worker 中执行。
 
+显式旧路径重启会先验证最新 settings，重新生成并检查替换用 Sing-Box 配置，并准备好全部替换 restore
+缓存，然后才停止当前运行实例。替换准备失败时，正在运行的旧实例保持不变。
+
 ## 数据包策略桥接
 
-保留的兼容路径会生成固定的有界 zone iptables 分类器。已有连接标记走快速路径；新流量依次经过
-强制/本地绕过、接口策略和应用策略，最后选择直接放行或交给 Sing-Box 的 TPROXY 监听器。
+保留的兼容路径会生成固定的有界 zone iptables 分类器。在 Rust 所有权准备阶段，`scripts/init` 只会
+调用 `fluxd render-legacy-rules` 生成 apply/cleanup restore 文档，并在缓存生产者标记中记录 `rust`。
+只有需要解析应用 UID 时，`scripts/init` 才会调用
+`fluxd snapshot-legacy-packages --source PATH`；该命令以禁止跟随符号链接的方式打开来源，验证有界的
+普通稳定描述符，并流式生成一份不可变快照，保证每次渲染观察同一输入。否则会发布空快照而不读取
+Android 软件包清单。渲染失败会使准备阶段失败，不会切换写入者或回退到 shell。
+
+只有显式旧所有权路径会 source `scripts/rules`；它将生产者记录为 `shell`，并作为互斥回滚路径存在。
+其他情况下该脚本仅作为冻结的字节级 oracle 保留。两条路径都只发布 restore 缓存，真正执行缓存且
+获准修改 xtables 状态的组件仍只有 `scripts/tproxy`。
+
+当前 Rust 实现是旧兼容/source-shape 渲染器。它复现保留的 shell 契约，包括差分一致性所需的顺序与
+重复形式；它不是后端无关 Capture Program 的规范 lowering，也不授予原生写入权限。已有连接标记走
+快速路径；新流量依次经过强制/本地绕过、接口策略和应用策略，最后选择直接放行或交给 Sing-Box 的
+TPROXY 监听器。
 
 `BYPASS_SET_BACKEND="zone"` 是唯一已实现的后端。在独立适配器、能力探测和一致性测试完成前，
 `ipset` 与 `auto` 会被明确拒绝。
@@ -106,7 +135,10 @@ Rust 所有权路径中不存在并行 IPMonitor 所有者。事件事实先进�
 │   ├── template.json
 │   ├── config.json           # 生成的 Sing-Box 配置
 │   └── manifest.json         # 发布 provenance 契约
-├── cache/                    # 生成的共享桥接产物
+├── cache/
+│   ├── cache_rules_* / cache_cleanup_*  # Rust 或 shell 生成的 restore 文档
+│   ├── cache_packages       # Rust 软件包快照；shell 路径中不存在，无需解析时为空
+│   └── cache_valid          # 缓存生产者标记：rust 或 shell
 ├── state/
 │   └── administrative-intent.json
 ├── run/
@@ -120,7 +152,9 @@ Rust 所有权路径中不存在并行 IPMonitor 所有者。事件事实先进�
     ├── flux-event            # 原始 inotify 事实适配器
     ├── dispatcher            # 串行 shell 阶段适配器
     ├── init / config / updater.sh
-    ├── rules / tproxy / addrsync
+    ├── rules                # 冻结 source-shape oracle 与显式旧路径回滚生成器
+    ├── tproxy               # 唯一 restore 执行器与 xtables 内核写入者
+    ├── addrsync
     └── lib / log / core      # 公共与仅回滚使用的辅助脚本
 ```
 
@@ -215,6 +249,10 @@ watchdog 拥有 `fluxd`。
 `cargo xtask verify-package` 验证完整模块布局、AArch64 ELF、带不可变 revision 的来源与哈希、和 SBOM
 交叉绑定的已识别 SPDX/`LicenseRef`、带哈希的设备证据、固定工具链构建元数据、完整包校验和，并确认
 不存在 `.ko`/`.kpm` 载荷后，才满足当前发布验证边界。
+
+已交付的渲染器只是 xtables 第一个非修改型切换：Rust 负责准备兼容字节，shell 仍负责 restore 执行、
+readback、回滚与内核修改。规范 Capture Program lowering 和原生所有权仍是相互独立、需要门槛验证的
+后续工作。nftables、TUN、eBPF 与 `.ko`/KPM 模块路径继续推迟，本桥接不会激活这些能力。
 
 ## 免责声明
 

@@ -46,7 +46,7 @@ use legacy read-only paths.
 
 Only `fluxd daemon` is long-lived. Sing-Box is its child. A boot shell watchdog may restart `fluxd` after a crash or fatal invariant exit, but it contains no policy logic, never invokes a second recovery owner, and does not restart a settled `UnsupportedKernel` daemon. Normal journal recovery runs inside daemon startup before mutating commands are accepted. `fluxd recover --offline` is an explicit salvage command that requires the daemon lease to be absent. The legacy `fluxctl restart` verb is a client alias for `ReloadSources` followed by `Converge(Configured)`; it has no separate protocol or lifecycle meaning.
 
-In the delivered Phase 1 bridge, `RuntimeCoordinator` implements `LegacyDispatcher` and runs on the one bounded `LegacyControlBridge` worker. The worker serializes requests, address resynchronization, idle maintenance, and shutdown. `EngineSupervisor` owns the Sing-Box child; shell phase scripts remain the only rules/routes/address-sync writer. A boot-scoped mode lease rejects legacy `scripts/core` verbs for the duration of a Rust-owned engine run. This bridge currently admits only TPROXY: `prepare` rejects `PROXY_MODE=tun` before initialization and manifest publication because the shell Flux PBR is TPROXY-specific and exact Sing-Box route cleanup after forced death has no device-qualified proof.
+In the delivered Phase 1 bridge, `RuntimeCoordinator` implements `LegacyDispatcher` and runs on the one bounded `LegacyControlBridge` worker. The worker serializes requests, address resynchronization, idle maintenance, and shutdown. `EngineSupervisor` owns the Sing-Box child. Rust-owned preparation compiles the legacy restore caches, but shell phase scripts remain the only rules/routes/address-sync writer and `scripts/tproxy` remains the sole restore executor. A boot-scoped mode lease rejects legacy `scripts/core` verbs for the duration of a Rust-owned engine run. This bridge currently admits only TPROXY: `prepare` rejects `PROXY_MODE=tun` before initialization and manifest publication because the shell Flux PBR is TPROXY-specific and exact Sing-Box route cleanup after forced death has no device-qualified proof.
 
 ## 3. Local control socket and Module routing
 
@@ -695,6 +695,11 @@ byte-for-byte reproducible. The initial shell-derived fixtures characterize poli
 there is no xtables/nftables renderer, restore-byte parity, live-kernel readback, device-parity
 claim, or conversion to Generation/prepared/active state in this checkpoint.
 
+The separate Phase 4 `LegacyRulesPlan` does not widen this shadow boundary. It preserves and
+validates the legacy generator's source shape so bridge preparation can reproduce compatibility
+restore bytes. It is neither constructed from nor convertible from `ShadowCaptureArtifact` and is
+not canonical Capture Program lowering.
+
 The shadow IR follows the target order in section 8.1: compatibility engine loop prevention is
 before destination/interface policy, and forwarded loopback safety is before configurable bypass.
 The shipped shell reaches `BYPASS_IP` and some interface rules before `APP_CHAIN` owner matching,
@@ -800,14 +805,16 @@ Extended acknowledgements are captured and mapped to the specific generated oper
 
 ## 10. xtables and ipset specification
 
-Until the first Phase 4 cutover, the shell `rules` generator remains the frozen executed
-compatibility oracle. After renderer differential parity, Rust-generated artifacts may replace it
-while the existing shell restore executor remains the sole xtables/ipset writer. A later transition
-lease disables that shell writer before the first native restore mutation. The renderer must pass
-canonical restore and differential gates; native ownership additionally requires failure/recovery,
-exact readback, rollback, and real-device gates.
+The first non-mutating Phase 4 cutover is delivered. Rust-owned preparation exclusively invokes
+`fluxd render-legacy-rules`, records `rust` as the cache producer, and never sources `scripts/rules`.
+Explicit legacy ownership exclusively sources the frozen generator, records `shell`, and remains a
+deliberate rollback producer. Render failure does not silently change producers and cannot replace
+the active Generation. In either mode, `scripts/tproxy` remains the sole xtables restore executor
+and kernel writer. A later transition lease disables that shell writer before the first native
+restore mutation; native ownership still requires failure/recovery, exact readback, rollback, and
+real-device gates.
 
-The completed `flux-platform` xtables checkpoint is only a frozen-syntax observer. A pure parser
+The completed `flux-platform` syntax checkpoint remains a frozen-syntax observer. A pure parser
 accepts an explicit IPv4/IPv6 plus apply/cleanup context and a bounded canonical byte slice; it
 retains ordered and repeated `mangle`/`filter`/`nat` transactions, declarations, commands, opaque
 validated tokens, duplicate lines, cleanup phase order, resource usage, and a domain-separated
@@ -836,24 +843,70 @@ The oracle inputs are cache inputs only: `scripts/rules`, its semantic shell reg
 bounded generator, a reviewed environment cache, and a package-list cache. The profile performs
 no normal configuration or kernel-capability detection, does not cover QUIC, PBR, or forced
 cleanup, and proves neither restore/kernel acceptance nor Android/Magisk parity. Its cleanup
-fixtures characterize the ordinary generated `-D` form. These fixtures do not constitute a
+fixtures characterize the ordinary generated `-D` form. Raw fixtures alone do not constitute a
 Capture renderer, Generation, ownership/writer lease, prepared/active conversion, coordinator
-entry point, activation authority, or shell-to-Rust cutover evidence.
+entry point, or activation authority. Their use by the independent legacy-renderer differential
+suite does not turn that source-shape renderer into canonical Capture Program lowering.
 
-### 10.1 Invocation
+### 10.1 Delivered legacy source-shape renderer
 
-Rust spawns the discovered `iptables-restore`/`ip6tables-restore` binaries directly, passes `--noflush` and a bounded wait option, writes generated content to stdin, and captures stderr with a size limit.
+`LegacyRulesPlan` is a validated compatibility input model. It preserves byte-significant ordering,
+duplicates, application modes and ordered resolved UIDs, mobile/Wi-Fi/hotspot/USB roles, owner
+matches, bound bypass/proxy mark values and mask, conntrack/mark/socket fast paths, TCP/UDP DIVERT gates,
+IPv6 NAT, FakeIP, MSS, family admission, chain naming, and cleanup symmetry. Interface patterns,
+owner tokens, ports, masks, FakeIP families, resource counts, and production prerequisites fail
+closed. The proxy marks are not independently allocated: preparation exports the same
+`IPV4_MARK`/`IPV6_MARK`/`BYPASS_MARK` contract consumed by the shell PBR executor.
+
+The renderer is pure: it performs no filesystem, process, restore, or kernel I/O and returns the
+bounded canonical syntax artifact. Its exact pinned-profile and branch-matrix tests prove legacy
+source-shape parity only. Cached-flow ordering, direct-action side effects, protocol eligibility,
+and other target semantic differences still require a separate canonical Capture Program lowering.
+
+### 10.2 Delivered bridge cache-generation adapter
+
+The compatibility-only command is:
+
+```text
+fluxd render-legacy-rules --packages-list PATH --family 4|6 --action apply|cleanup
+fluxd snapshot-legacy-packages --source PATH
+```
+
+The renderer reads a strict allowlist of exported generated-cache values, resolves Android package/user IDs
+from one bounded regular package snapshot when application policy needs them, constructs the
+validated plan, and writes canonical bytes to stdout. TUN, non-`iptables_restore`, non-zone,
+missing-owner, missing-TPROXY, disabled-family, malformed, oversized, or ambiguous inputs are
+rejected explicitly.
+
+The snapshot helper opens its source without following symlinks, requires a bounded regular file,
+checks descriptor identity/stability across the read, and streams bytes to stdout for atomic cache
+publication. Shell does not copy a live package database directly.
+
+Rust-owned `scripts/init` snapshots `packages.list` only when application resolution is active and
+nonempty; otherwise it publishes an empty snapshot without reading Android package state. The
+snapshot is bounded, non-symlink, read-only, shared by every parallel family/action render, and
+copied with the prepared Generation. Successful cache publication records producer `rust`.
+Explicit legacy ownership instead sources `scripts/rules`, removes the package snapshot, and
+records `shell`. Candidate failure leaves the prior active Generation unchanged.
+
+Explicit legacy restart similarly prepares and validates fresh settings, the replacement Sing-Box
+configuration, and every replacement cache before stopping the active runtime. Preparation failure
+restores the prior cache authority, leaves that runtime untouched, and keeps stop/cleanup available.
+
+### 10.3 Native restore invocation
+
+The future native adapter will spawn the discovered `iptables-restore`/`ip6tables-restore` binaries directly, pass `--noflush` and a bounded wait option, write generated content to stdin, and capture stderr with a size limit.
 
 Before selection, Flux detects whether each tool belongs to iptables-legacy, iptables-nft, a wrapper, or a vendor implementation. IPv4/IPv6 command and restore tools must form one coherent implementation and pass the exact canary. One Generation never mixes legacy and nft variants or manages the same policy through both.
 
-### 10.2 Generation shape
+### 10.4 Generation shape
 
 - Stable entry chains are attached once.
 - Generation chains contain the actual policy and reference only generation-specific sets.
 - Activation updates stable jumps in one restore transaction per family/table.
 - Cleanup removes exact generation chains only after no stable jump references them.
 
-### 10.3 ipset
+### 10.5 ipset
 
 - Separate IPv4 and IPv6 `hash:net` sets.
 - Create generation-specific target sets and populate an unreferenced temporary set.
@@ -862,7 +915,7 @@ Before selection, Flux detects whether each tool belongs to iptables-legacy, ipt
 - Destroy retired generation sets only after their generation chains are unreferenced and removed.
 - If create/add/swap semantics are not all verified, do not select ipset.
 
-### 10.4 Bounded-tree fallback
+### 10.6 Bounded-tree fallback
 
 Retain the current prefix-zone concept as a compatibility compiler, with hard depth and chain-count budgets. Canonicalized user CIDRs are permitted, but compiler estimates must reject pathological expansions.
 
@@ -1059,7 +1112,7 @@ Delivered Phase 1 supervision additionally requires:
 - a direct-child `PR_SET_PDEATHSIG(SIGKILL)` lease with a post-arm parent-identity race check for Sing-Box and phase-shell processes;
 - bounded TERM/KILL/reap, restart windows, exponential backoff, and retained ownership until disappearance is observed.
 
-The Phase 1 transaction rejects TUN during `prepare`, before engine admission or networking mutation. It also requires `xt_owner` before initialization and revalidates it from the generated capability cache; the current shell Capture Program sends every local OUTPUT policy through the application chain so the configured engine UID/GID bypass remains active even when application filtering is disabled. `ROUTING_MARK` is not accepted as equivalent authority because the bridge does not prove that the supervised engine applies it to its sockets. For admitted TPROXY state, start is `prepare` → engine admission → Generation-bound capture start → structural capture verification → configured functional gate → Generation-bound `RUNNING`, and stop is capture detach → engine stop/reap → `STOPPED`. The production daemon explicitly selects structural-only compatibility; required-mode tests execute the delivered Stage-1 exact-binding canary transaction, and the first Stage-2 Linux checkpoint now exercises the isolated dual-stack topology and cleanup without installing capture. Partial capture-start compensation retains Generation evidence until both networking writers prove cleanup; terminal publication and engine retirement are forbidden while detachment is uncertain. Reload prepares the candidate while the previous Generation remains active, preserves its pass on prepare-only failure, invalidates it before detachment, blocks replacement if detach fails, and attempts the previous immutable `EngineSpec` if candidate activation fails. An uncertain reload detach enters capture repair: prove full detachment, retain/reconcile the old engine, then republish and freshly verify that Generation. Publication failure, identity loss, repair/restoration, and address resynchronization require a fresh complete gate before retrying `RUNNING`. Candidate evidence never authorizes rollback publication. The current owner bypass is a compatibility loop-escape prerequisite; the socket-correlation collector, its prebound session and typed attempt-owned handoff transports, schema-v2 listener/delivery validator, temporal cleanup/retirement validator, fail-closed TPROXY-only local-OUTPUT executor seam, per-flow capture receipt, and process-ownership receipt contracts are delivered. The Linux/Android child-origin pidfd substrate and no-traffic live credential preflight are also delivered. Both production receipt authorities remain uninhabited; the positive traffic producer, real `EngineSupervisor`/`SingBoxChild` and prepared-driver child integration, production listener/report parser and factories, actual collector integration, and Android device qualification remain open.
+The Phase 1 transaction rejects TUN during `prepare`, before engine admission or networking mutation. It also requires `xt_owner` before initialization and revalidates it from the generated capability cache; the Rust-rendered legacy compatibility program sends every local OUTPUT policy through the application chain so the configured engine UID/GID bypass remains active even when application filtering is disabled. `ROUTING_MARK` is not accepted as equivalent authority because the bridge does not prove that the supervised engine applies it to its sockets. For admitted TPROXY state, start is `prepare` → engine admission → Generation-bound capture start → structural capture verification → configured functional gate → Generation-bound `RUNNING`, and stop is capture detach → engine stop/reap → `STOPPED`. The production daemon explicitly selects structural-only compatibility; required-mode tests execute the delivered Stage-1 exact-binding canary transaction, and the first Stage-2 Linux checkpoint now exercises the isolated dual-stack topology and cleanup without installing capture. Partial capture-start compensation retains Generation evidence until both networking writers prove cleanup; terminal publication and engine retirement are forbidden while detachment is uncertain. Reload prepares the candidate while the previous Generation remains active, preserves its pass on prepare-only failure, invalidates it before detachment, blocks replacement if detach fails, and attempts the previous immutable `EngineSpec` if candidate activation fails. An uncertain reload detach enters capture repair: prove full detachment, retain/reconcile the old engine, then republish and freshly verify that Generation. Publication failure, identity loss, repair/restoration, and address resynchronization require a fresh complete gate before retrying `RUNNING`. Candidate evidence never authorizes rollback publication. The current owner bypass is a compatibility loop-escape prerequisite; the socket-correlation collector, its prebound session and typed attempt-owned handoff transports, schema-v2 listener/delivery validator, temporal cleanup/retirement validator, fail-closed TPROXY-only local-OUTPUT executor seam, per-flow capture receipt, and process-ownership receipt contracts are delivered. The Linux/Android child-origin pidfd substrate and no-traffic live credential preflight are also delivered. Both production receipt authorities remain uninhabited; the positive traffic producer, real `EngineSupervisor`/`SingBoxChild` and prepared-driver child integration, production listener/report parser and factories, actual collector integration, and Android device qualification remain open.
 
 The delivered Linux evidence class is explicitly ingress-only. The command
 `cargo xtask test-functional-canary-linux-tproxy` selects the exact ignored test
@@ -1458,6 +1511,7 @@ cannot be classified by the current extension checks. Production `fluxd` does no
 |---|---|
 | Bridge | `fluxd` owns Sing-Box through the atomic runtime coordinator; serialized shell phases still own networking writes and expose separate control/runtime status |
 | Shadow compiler | Rust emits deterministic observation-only Capture Programs for frozen-oracle comparison; shell remains the sole executed networking writer and no shadow artifact enters a Generation or activation path |
+| Rust generation bridge | Rust-owned preparation compiles legacy restore caches and records producer `rust`; explicit legacy ownership records `shell`; `scripts/tproxy` remains the sole restore executor/writer |
 | Legacy parity | `fluxd` owns xtables/PBR/address sync; updater may still use external curl/jq adapters |
 | New backends | nftables, ipset, managed TUN, and eBPF observation available behind capability gates |
 | Default switch | `auto` prefers nftables where conformance passes |

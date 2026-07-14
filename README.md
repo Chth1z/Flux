@@ -14,7 +14,14 @@ The current branch is a Phase-1 bridge, not the completed native rewrite:
 
 - `fluxd` owns administrative intent, serialized lifecycle, Generation recovery, and the Sing-Box
   child process.
-- Shell adapters remain the sole writers of iptables policy routing and address-derived rules.
+- Rust-owned preparation exclusively invokes `fluxd render-legacy-rules` to compile the retained
+  source-shape restore caches and records `rust` as their producer. It never silently falls back to
+  the shell generator.
+- Explicit legacy ownership exclusively sources `scripts/rules`, records `shell` as the cache
+  producer, and remains a mutually exclusive rollback path. `scripts/rules` is otherwise retained
+  as the frozen oracle.
+- `scripts/tproxy` remains the sole restore executor and xtables kernel writer. Shell adapters also
+  retain policy-routing and address-derived rule mutation until their later ownership cutovers.
 - The shipped bridge accepts only `PROXY_MODE="tproxy"`. TUN fields are reserved for a future
   single-owner implementation and are rejected before activation.
 - Production capture verification is still structural. The stricter functional local-OUTPUT
@@ -74,18 +81,48 @@ flowchart TD
     Coordinator --> Engine["EngineSupervisor"]
     Engine --> SingBox["sing-box child"]
     Coordinator --> Bridge["LegacyDispatcher adapter"]
-    Bridge --> Rules["init / rules / tproxy / addrsync"]
-    Rules --> Kernel["iptables + RPDB + standalone addrsyncd"]
+    Bridge --> Init["scripts/init preparation"]
+    Init -->|"Rust-owned only"| Renderer["fluxd render-legacy-rules"]
+    Init -->|"explicit legacy owner only"| Oracle["scripts/rules frozen oracle / rollback"]
+    Renderer --> Cache["restore caches; producer = rust"]
+    Oracle --> CacheLegacy["restore caches; producer = shell"]
+    Cache --> Tproxy["scripts/tproxy sole restore executor"]
+    CacheLegacy --> Tproxy
+    Tproxy --> Kernel["xtables kernel state"]
+    Bridge --> AddrSync["scripts/addrsync + standalone addrsyncd"]
+    AddrSync --> KernelPolicy["RPDB + address-derived rules"]
 ```
 
 There is no parallel IPMonitor owner in the Rust-owned bridge. Event facts enter `fluxd`, and all
 mutating bridge phases run through one serialized worker.
 
+An explicit legacy restart validates fresh settings, rebuilds and checks the replacement Sing-Box
+configuration, and prepares every replacement restore cache before stopping the active runtime. A
+replacement preparation failure leaves the running legacy instance untouched.
+
 ## Packet-policy bridge
 
-The retained compatibility path compiles a fixed bounded-zone iptables classifier. Existing
-connection marks take the fast path; new flows pass through mandatory/local bypasses, interface
-policy, and application policy before either direct acceptance or TPROXY delivery to Sing-Box.
+The retained compatibility path compiles a fixed bounded-zone iptables classifier. During
+Rust-owned preparation, `scripts/init` exclusively calls `fluxd render-legacy-rules` for the apply
+and cleanup restore documents and records `rust` in the cache producer marker. When application UID
+resolution is needed, `scripts/init` invokes
+`fluxd snapshot-legacy-packages --source PATH`; the command opens without following symlinks,
+validates a bounded regular stable descriptor, and streams one immutable snapshot so every render
+observes the same input. Otherwise preparation publishes an empty snapshot without reading the
+Android package inventory. A render failure
+fails preparation without switching writers or falling back to shell.
+
+Explicit legacy ownership is the only path that sources `scripts/rules`; it records `shell` as the
+producer and exists as a mutually exclusive rollback path. The script is otherwise retained as a
+frozen byte-level oracle. Both paths publish restore caches, while `scripts/tproxy` remains their
+sole executor and the only component authorized to mutate xtables state.
+
+The Rust implementation is a legacy compatibility/source-shape renderer. It reproduces the retained
+shell contract, including ordering and duplicate forms needed for differential parity; it is not the
+canonical lowering of the backend-neutral Capture Program and grants no native writer authority.
+Existing connection marks take the fast path; new flows pass through mandatory/local bypasses,
+interface policy, and application policy before either direct acceptance or TPROXY delivery to
+Sing-Box.
 
 `BYPASS_SET_BACKEND="zone"` is the only implemented backend. `ipset` and `auto` are intentionally
 rejected until distinct adapters, capability probes, and parity tests exist.
@@ -112,7 +149,10 @@ Runtime files live under `/data/adb/flux/`:
 │   ├── template.json
 │   ├── config.json           # Generated Sing-Box configuration
 │   └── manifest.json         # Release provenance contract
-├── cache/                    # Generated shared bridge artifacts
+├── cache/
+│   ├── cache_rules_* / cache_cleanup_*  # Rust- or shell-produced restore documents
+│   ├── cache_packages       # Rust package snapshot; absent for shell, empty when resolution is inactive
+│   └── cache_valid          # Cache producer marker: rust or shell
 ├── state/
 │   └── administrative-intent.json
 ├── run/
@@ -126,7 +166,9 @@ Runtime files live under `/data/adb/flux/`:
     ├── flux-event            # Raw inotify fact adapter
     ├── dispatcher            # Serialized shell phase adapter
     ├── init / config / updater.sh
-    ├── rules / tproxy / addrsync
+    ├── rules                # Frozen source-shape oracle and explicit legacy rollback generator
+    ├── tproxy               # Sole restore executor and xtables kernel writer
+    ├── addrsync
     └── lib / log / core      # Shared and rollback-only helpers
 ```
 
@@ -225,6 +267,11 @@ until `cargo xtask verify-package` validates the complete module layout, AArch64
 immutable-revision provenance and hashes, recognized SPDX/`LicenseRef` records cross-bound to the
 SBOM, hashed device evidence, pinned build metadata, complete package checksums, and confirms that
 no `.ko`/`.kpm` payload is present.
+
+The delivered renderer is only the first non-mutating xtables cutover: Rust prepares compatibility
+bytes, while shell still owns restore execution, readback, rollback, and kernel mutation. Canonical
+Capture Program lowering and native ownership remain separate gated work. nftables, TUN, eBPF, and
+`.ko`/KPM module paths remain deferred and are not activated by this bridge.
 
 ## Disclaimer
 

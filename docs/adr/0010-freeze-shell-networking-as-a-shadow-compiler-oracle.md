@@ -1,6 +1,7 @@
 ---
 status: accepted
 decision_date: 2026-07-14
+last_reviewed: 2026-07-15
 ---
 
 # Freeze shell networking as the oracle for a non-authorizing Rust shadow compiler
@@ -53,3 +54,29 @@ The consequence is a longer overlap in source code but a shorter period of seman
 the old path stays executable and frozen while the new path first becomes explainable, testable,
 and deterministic, then takes ownership one component at a time without a big-bang rewrite or a
 dual-writer interval.
+
+## 2026-07-15 implementation status
+
+The first rule-generation cutover is non-mutating and complies with this decision. Rust-owned
+preparation now exclusively invokes `fluxd render-legacy-rules`, records `rust` as the cache
+producer, and never sources `scripts/rules`. Explicit legacy ownership exclusively sources the
+frozen generator, records `shell`, and remains the intentional rollback path. Producer selection is
+fail-closed: a Rust render failure aborts candidate preparation and preserves the active Generation;
+it does not silently fall back to shell generation.
+
+The delivered `LegacyRulesPlan` validates and preserves the compatibility source shape. It is not a
+lowering of `ShadowCaptureArtifact`, does not resolve canonical Capture Program ordering, and has no
+writer or activation conversion. Its fixed proxy/bypass marks are supplied from the same exported
+inputs consumed by the shell PBR path. When application UID resolution is needed,
+`fluxd snapshot-legacy-packages --source PATH` obtains the bounded read-only snapshot through a
+no-follow, regular, descriptor-stable read; shell does not copy the live package database directly.
+The snapshot is retained with the prepared Generation.
+
+Explicit legacy restart prepares and validates fresh settings, the replacement Sing-Box
+configuration, and replacement caches before stopping the active runtime. A failed replacement
+preparation preserves that runtime.
+
+`scripts/tproxy` remains the sole restore executor and kernel writer. Native restore execution,
+exact readback, rollback qualification, the transition lease, canonical Capture Program lowering,
+real-device evidence, nftables, TUN, production eBPF, implicit module requests, and `.ko`/KPM paths
+remain outside this cutover.

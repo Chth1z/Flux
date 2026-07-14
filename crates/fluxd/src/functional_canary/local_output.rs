@@ -7,11 +7,12 @@
 //! below has no prepared-attempt value and reports `Unsupported` before it can
 //! acquire a networking writer or mutate capture state.
 //!
-//! Future device-specific drivers return an unverified capture proof alongside
-//! raw observations. A separate verifier must bind those two values to the
-//! immutable request before promotion into schema-v2 gate evidence, so a
-//! driver cannot self-label REDIRECT, DNAT, ingress traffic, counters, or a
-//! route lookup as authoritative local-OUTPUT TPROXY delivery.
+//! Future device-specific drivers return unverified capture proof, process
+//! proof, and raw observations. Separate sealed verifiers must bind both proof
+//! domains to the immutable request before promotion into schema-v2 gate
+//! evidence, so a driver cannot self-label REDIRECT, DNAT, ingress traffic,
+//! counters, a route lookup, or copied process identities as authoritative
+//! local-OUTPUT TPROXY evidence.
 //! Attempt preparation also carries the exact non-cloneable socket-observer
 //! session separately from the pure request. Read-only availability sees only
 //! the request; a prepared driver receives the bound session once by value.
@@ -40,21 +41,24 @@ pub(crate) fn xtables_tproxy_local_output_executor() -> Box<dyn UnqualifiedFunct
     Box::new(TproxyLocalOutputExecutor::new(
         XtablesTproxyLocalOutputDriver,
         TproxyCanaryCaptureVerifier,
+        TproxyCanaryProcessOwnershipVerifier,
         TproxyCanaryEvidenceFactory,
     ))
 }
 
-struct TproxyLocalOutputExecutor<D, V, F> {
+struct TproxyLocalOutputExecutor<D, C, P, F> {
     driver: D,
-    verifier: V,
+    capture_verifier: C,
+    process_verifier: P,
     evidence_factory: F,
 }
 
-impl<D, V, F> TproxyLocalOutputExecutor<D, V, F> {
-    const fn new(driver: D, verifier: V, evidence_factory: F) -> Self {
+impl<D, C, P, F> TproxyLocalOutputExecutor<D, C, P, F> {
+    const fn new(driver: D, capture_verifier: C, process_verifier: P, evidence_factory: F) -> Self {
         Self {
             driver,
-            verifier,
+            capture_verifier,
+            process_verifier,
             evidence_factory,
         }
     }
@@ -99,27 +103,41 @@ impl TproxyLocalOutputUnavailable {
 
 trait PreparedTproxyLocalOutputAttempt {
     type CaptureProof;
+    type ProcessProof;
     type RawObservations;
 
-    /// Execute the attempt and return only an unverified capture proof plus raw
-    /// observations. The driver cannot mint a capture receipt or gate evidence.
+    /// Execute the attempt and return only unverified capture/process proof
+    /// plus raw observations. The driver cannot mint either receipt or gate
+    /// evidence.
     fn execute_tproxy_local_output(
         self,
         request: &CanaryAttemptRequest,
         socket_observer: CanaryAttemptSocketObserverSession,
-    ) -> Result<
-        UnverifiedTproxyLocalOutputArtifacts<Self::CaptureProof, Self::RawObservations>,
-        FunctionalCanaryError,
+    ) -> UnverifiedTproxyLocalOutputResult<
+        Self::CaptureProof,
+        Self::ProcessProof,
+        Self::RawObservations,
     >;
 }
 
-trait TproxyLocalOutputCaptureVerifier<P, R>: Send + 'static {
+type UnverifiedTproxyLocalOutputResult<C, P, R> =
+    Result<UnverifiedTproxyLocalOutputArtifacts<C, P, R>, FunctionalCanaryError>;
+
+trait TproxyLocalOutputCaptureVerifier<C, P, R>: Send + 'static {
     /// Correlate the mechanism-specific proof with the exact raw observation
     /// batch and immutable request, then mint the single-use capture receipt.
     fn verify(
         &mut self,
         request: &CanaryAttemptRequest,
-        raw: UnverifiedTproxyLocalOutputArtifacts<P, R>,
+        raw: UnverifiedTproxyLocalOutputArtifacts<C, P, R>,
+    ) -> Result<CaptureReceiptBoundTproxyLocalOutputArtifacts<P, R>, FunctionalCanaryError>;
+}
+
+trait TproxyLocalOutputProcessOwnershipVerifier<P, R>: Send + 'static {
+    fn verify_process_ownership(
+        &mut self,
+        request: &CanaryAttemptRequest,
+        capture_bound: CaptureReceiptBoundTproxyLocalOutputArtifacts<P, R>,
     ) -> Result<ReceiptBoundTproxyLocalOutputArtifacts<R>, FunctionalCanaryError>;
 }
 
@@ -513,7 +531,7 @@ mod capture_receipt {
             );
             assert_expected_request_rejected(
                 |request| {
-                    request.pre_binding.environment.probe_uid =
+                    request.pre_binding.environment.credentials.probe.uid =
                         NonZeroU32::new(65_530).expect("nonzero probe UID")
                 },
                 TproxyLocalOutputCaptureReceiptError::RequestMismatch,
@@ -756,26 +774,876 @@ mod capture_receipt {
 
 pub(super) use capture_receipt::TproxyLocalOutputCaptureReceipt;
 
+mod process_ownership_receipt {
+    #[cfg(not(test))]
+    use std::convert::Infallible;
+    use std::num::{NonZeroU32, NonZeroU64};
+    use std::time::Instant;
+
+    use super::super::{
+        CANARY_PEER_SERVER_SLOTS, CanaryAttemptRequest, CanaryCredentialDomainBinding, CanaryFlow,
+        CanaryProcessCredentialIdentity, CanaryProcessIdentity, CanaryProcessRetirementEvidence,
+        UnqualifiedCanaryCleanupEvidence, UnqualifiedCanaryFlowEvidenceSlots,
+    };
+    use flux_core::NetworkNamespaceIdentity;
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct TproxyLocalOutputProcessOwnershipAuthority {
+        #[cfg(not(test))]
+        _never: Infallible,
+        #[cfg(test)]
+        _scripted: (),
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct TproxyLocalOutputProcessCredentialObservation {
+        uids: [u32; 4],
+        gids: [u32; 4],
+        supplementary_group_count: u32,
+        cap_inheritable: u64,
+        cap_permitted: u64,
+        cap_effective: u64,
+        cap_ambient: u64,
+        no_new_privileges: bool,
+        credential_domain: CanaryCredentialDomainBinding,
+        network_namespace: NetworkNamespaceIdentity,
+        observed_at: Instant,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct TproxyLocalOutputOwnedProcessObservation {
+        identity: CanaryProcessIdentity,
+        // Receipt-local correlation token issued from the verifier's owned
+        // handle. Its numeric value is intentionally alpha-renamable: the
+        // sealed authority binds the handle to `identity`, while validation
+        // requires the two engine observations to reuse one token and every
+        // simultaneously retained role to use a distinct token.
+        handle_id: NonZeroU64,
+        credentials: TproxyLocalOutputProcessCredentialObservation,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct TproxyLocalOutputOwnedProcessRetirement {
+        observation: TproxyLocalOutputOwnedProcessObservation,
+        retirement: CanaryProcessRetirementEvidence,
+    }
+
+    /// Single-use proof that every process identity retained by gate evidence
+    /// was derived from the exact attempt-owned handle for that role.
+    #[derive(Debug, Eq, PartialEq)]
+    pub(in super::super) struct TproxyLocalOutputProcessOwnershipReceipt {
+        _authority: TproxyLocalOutputProcessOwnershipAuthority,
+        request: CanaryAttemptRequest,
+        engine_before: TproxyLocalOutputOwnedProcessObservation,
+        engine_after: TproxyLocalOutputOwnedProcessObservation,
+        client: TproxyLocalOutputOwnedProcessRetirement,
+        peer_servers: [TproxyLocalOutputOwnedProcessRetirement; CANARY_PEER_SERVER_SLOTS],
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(in super::super) enum ProcessRole {
+        Engine,
+        Client,
+        PeerServer { slot: usize },
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(in super::super) enum TproxyLocalOutputProcessOwnershipReceiptError {
+        RequestMismatch,
+        MissingRequiredFlow,
+        EngineIdentityMismatch,
+        EngineHandleMismatch,
+        EngineCredentialsInvalid,
+        EngineTimingInvalid,
+        ClientIdentityMismatch,
+        ClientCredentialsInvalid,
+        ClientRetirementMismatch,
+        ClientTimingInvalid,
+        PeerIdentityMismatch {
+            slot: usize,
+        },
+        PeerCredentialsInvalid {
+            slot: usize,
+        },
+        PeerRetirementMismatch {
+            slot: usize,
+        },
+        PeerTimingInvalid {
+            slot: usize,
+        },
+        HandleReused {
+            first: ProcessRole,
+            second: ProcessRole,
+        },
+    }
+
+    impl TproxyLocalOutputProcessOwnershipReceipt {
+        pub(in super::super) fn validate_for(
+            &self,
+            expected: &CanaryAttemptRequest,
+            flows: &UnqualifiedCanaryFlowEvidenceSlots,
+            cleanup: &UnqualifiedCanaryCleanupEvidence,
+            attempt_completed_at: Instant,
+        ) -> Result<(), TproxyLocalOutputProcessOwnershipReceiptError> {
+            if &self.request != expected {
+                return Err(TproxyLocalOutputProcessOwnershipReceiptError::RequestMismatch);
+            }
+            let (earliest_flow_started_at, latest_flow_completed_at) =
+                flow_interval(expected, flows)?;
+            let environment = expected.pre_binding().environment();
+            let network = environment.authority().network();
+            let credential_domain = environment.credential_domain();
+            let deadline = expected.deadline();
+            let engine = expected.pre_binding().engine().engine();
+            let engine_identity = CanaryProcessIdentity::new(
+                NonZeroU32::new(engine.pid())
+                    .ok_or(TproxyLocalOutputProcessOwnershipReceiptError::EngineIdentityMismatch)?,
+                NonZeroU64::new(engine.start_time_ticks())
+                    .ok_or(TproxyLocalOutputProcessOwnershipReceiptError::EngineIdentityMismatch)?,
+            );
+            if self.engine_before.identity != engine_identity
+                || self.engine_after.identity != engine_identity
+            {
+                return Err(TproxyLocalOutputProcessOwnershipReceiptError::EngineIdentityMismatch);
+            }
+            if self.engine_before.handle_id != self.engine_after.handle_id {
+                return Err(TproxyLocalOutputProcessOwnershipReceiptError::EngineHandleMismatch);
+            }
+            validate_credentials(
+                &self.engine_before.credentials,
+                Some(environment.engine_credentials()),
+                credential_domain,
+                network.daemon_network_namespace(),
+            )
+            .and_then(|()| {
+                validate_credentials(
+                    &self.engine_after.credentials,
+                    Some(environment.engine_credentials()),
+                    credential_domain,
+                    network.daemon_network_namespace(),
+                )
+            })
+            .map_err(|()| {
+                TproxyLocalOutputProcessOwnershipReceiptError::EngineCredentialsInvalid
+            })?;
+            if self.engine_before.credentials.observed_at < deadline.started_at()
+                || self.engine_before.credentials.observed_at > earliest_flow_started_at
+                || self.engine_after.credentials.observed_at < latest_flow_completed_at
+                || self.engine_after.credentials.observed_at
+                    < self.engine_before.credentials.observed_at
+                || self.engine_after.credentials.observed_at > attempt_completed_at
+                || self.engine_after.credentials.observed_at >= deadline.expires_at()
+            {
+                return Err(TproxyLocalOutputProcessOwnershipReceiptError::EngineTimingInvalid);
+            }
+
+            if self.client.observation.identity != cleanup.client.process {
+                return Err(TproxyLocalOutputProcessOwnershipReceiptError::ClientIdentityMismatch);
+            }
+            if self.client.retirement != cleanup.client {
+                return Err(
+                    TproxyLocalOutputProcessOwnershipReceiptError::ClientRetirementMismatch,
+                );
+            }
+            validate_credentials(
+                &self.client.observation.credentials,
+                Some(environment.probe_credentials()),
+                credential_domain,
+                network.daemon_network_namespace(),
+            )
+            .map_err(|()| {
+                TproxyLocalOutputProcessOwnershipReceiptError::ClientCredentialsInvalid
+            })?;
+            if self.client.observation.credentials.observed_at < deadline.started_at()
+                || self.client.observation.credentials.observed_at > earliest_flow_started_at
+                || self.client.observation.credentials.observed_at
+                    > self.client.retirement.quiesced_at
+            {
+                return Err(TproxyLocalOutputProcessOwnershipReceiptError::ClientTimingInvalid);
+            }
+
+            let mut handles: [Option<(ProcessRole, NonZeroU64)>; CANARY_PEER_SERVER_SLOTS + 2] =
+                [None; CANARY_PEER_SERVER_SLOTS + 2];
+            insert_handle(
+                &mut handles,
+                0,
+                ProcessRole::Engine,
+                self.engine_before.handle_id,
+            )?;
+            insert_handle(
+                &mut handles,
+                1,
+                ProcessRole::Client,
+                self.client.observation.handle_id,
+            )?;
+            for (slot, peer) in self.peer_servers.iter().enumerate() {
+                if peer.observation.identity != cleanup.peer_servers[slot].process {
+                    return Err(
+                        TproxyLocalOutputProcessOwnershipReceiptError::PeerIdentityMismatch {
+                            slot,
+                        },
+                    );
+                }
+                if peer.retirement != cleanup.peer_servers[slot] {
+                    return Err(
+                        TproxyLocalOutputProcessOwnershipReceiptError::PeerRetirementMismatch {
+                            slot,
+                        },
+                    );
+                }
+                validate_credentials(
+                    &peer.observation.credentials,
+                    None,
+                    credential_domain,
+                    network.peer_network_namespace(),
+                )
+                .map_err(|()| {
+                    TproxyLocalOutputProcessOwnershipReceiptError::PeerCredentialsInvalid { slot }
+                })?;
+                if peer.observation.credentials.observed_at < deadline.started_at()
+                    || peer.observation.credentials.observed_at > earliest_flow_started_at
+                    || peer.observation.credentials.observed_at > peer.retirement.quiesced_at
+                {
+                    return Err(
+                        TproxyLocalOutputProcessOwnershipReceiptError::PeerTimingInvalid { slot },
+                    );
+                }
+                insert_handle(
+                    &mut handles,
+                    slot + 2,
+                    ProcessRole::PeerServer { slot },
+                    peer.observation.handle_id,
+                )?;
+            }
+            Ok(())
+        }
+
+        #[cfg(test)]
+        pub(in super::super) fn scripted(
+            request: &CanaryAttemptRequest,
+            flows: &UnqualifiedCanaryFlowEvidenceSlots,
+            cleanup: &UnqualifiedCanaryCleanupEvidence,
+            attempt_completed_at: Instant,
+        ) -> Self {
+            let (earliest_flow_started_at, latest_flow_completed_at) =
+                flow_interval(request, flows).expect("scripted evidence has required flows");
+            let environment = request.pre_binding().environment();
+            let network = environment.authority().network();
+            let credential_domain = environment.credential_domain();
+            let engine = request.pre_binding().engine().engine();
+            let engine_identity = CanaryProcessIdentity::new(
+                NonZeroU32::new(engine.pid()).expect("scripted engine PID is nonzero"),
+                NonZeroU64::new(engine.start_time_ticks())
+                    .expect("scripted engine start ticks are nonzero"),
+            );
+            let engine_before = process_observation(
+                engine_identity,
+                1,
+                environment.engine_credentials(),
+                credential_domain,
+                network.daemon_network_namespace(),
+                earliest_flow_started_at,
+            );
+            let engine_after = process_observation(
+                engine_identity,
+                1,
+                environment.engine_credentials(),
+                credential_domain,
+                network.daemon_network_namespace(),
+                std::cmp::min(latest_flow_completed_at, attempt_completed_at),
+            );
+            let client = TproxyLocalOutputOwnedProcessRetirement {
+                observation: process_observation(
+                    cleanup.client.process,
+                    2,
+                    environment.probe_credentials(),
+                    credential_domain,
+                    network.daemon_network_namespace(),
+                    earliest_flow_started_at,
+                ),
+                retirement: cleanup.client,
+            };
+            let peer_servers = std::array::from_fn(|slot| {
+                let raw = u32::try_from(30_001 + slot).expect("peer credential fits u32");
+                TproxyLocalOutputOwnedProcessRetirement {
+                    observation: process_observation(
+                        cleanup.peer_servers[slot].process,
+                        u64::try_from(slot + 3).expect("peer handle ID fits u64"),
+                        CanaryProcessCredentialIdentity::new(
+                            NonZeroU32::new(raw).expect("peer UID is nonzero"),
+                            NonZeroU32::new(raw).expect("peer GID is nonzero"),
+                        ),
+                        credential_domain,
+                        network.peer_network_namespace(),
+                        earliest_flow_started_at,
+                    ),
+                    retirement: cleanup.peer_servers[slot],
+                }
+            });
+            Self {
+                _authority: TproxyLocalOutputProcessOwnershipAuthority { _scripted: () },
+                request: request.clone(),
+                engine_before,
+                engine_after,
+                client,
+                peer_servers,
+            }
+        }
+    }
+
+    fn flow_interval(
+        request: &CanaryAttemptRequest,
+        flows: &UnqualifiedCanaryFlowEvidenceSlots,
+    ) -> Result<(Instant, Instant), TproxyLocalOutputProcessOwnershipReceiptError> {
+        let mut earliest = None;
+        let mut latest = None;
+        for flow in CanaryFlow::ALL {
+            if !request.requires_flow(flow) {
+                continue;
+            }
+            let evidence = flows.slots[flow.index()]
+                .as_ref()
+                .ok_or(TproxyLocalOutputProcessOwnershipReceiptError::MissingRequiredFlow)?;
+            earliest = Some(earliest.map_or(evidence.started_at, |current| {
+                std::cmp::min(current, evidence.started_at)
+            }));
+            latest = Some(latest.map_or(evidence.completed_at, |current| {
+                std::cmp::max(current, evidence.completed_at)
+            }));
+        }
+        Ok((
+            earliest.ok_or(TproxyLocalOutputProcessOwnershipReceiptError::MissingRequiredFlow)?,
+            latest.ok_or(TproxyLocalOutputProcessOwnershipReceiptError::MissingRequiredFlow)?,
+        ))
+    }
+
+    fn validate_credentials(
+        observed: &TproxyLocalOutputProcessCredentialObservation,
+        expected: Option<CanaryProcessCredentialIdentity>,
+        credential_domain: CanaryCredentialDomainBinding,
+        network_namespace: NetworkNamespaceIdentity,
+    ) -> Result<(), ()> {
+        let uid = NonZeroU32::new(observed.uids[0]).ok_or(())?;
+        let gid = NonZeroU32::new(observed.gids[0]).ok_or(())?;
+        if observed.uids != [uid.get(); 4]
+            || observed.gids != [gid.get(); 4]
+            || observed.supplementary_group_count != 0
+            || observed.cap_inheritable != 0
+            || observed.cap_permitted != 0
+            || observed.cap_effective != 0
+            || observed.cap_ambient != 0
+            || !observed.no_new_privileges
+            || observed.credential_domain != credential_domain
+            || observed.network_namespace != network_namespace
+        {
+            return Err(());
+        }
+        if expected.is_some_and(|expected| expected.uid() != uid || expected.gid() != gid) {
+            return Err(());
+        }
+        Ok(())
+    }
+
+    fn insert_handle(
+        handles: &mut [Option<(ProcessRole, NonZeroU64)>; CANARY_PEER_SERVER_SLOTS + 2],
+        index: usize,
+        role: ProcessRole,
+        handle_id: NonZeroU64,
+    ) -> Result<(), TproxyLocalOutputProcessOwnershipReceiptError> {
+        for previous in handles.iter().flatten() {
+            if previous.1 == handle_id {
+                return Err(
+                    TproxyLocalOutputProcessOwnershipReceiptError::HandleReused {
+                        first: previous.0,
+                        second: role,
+                    },
+                );
+            }
+        }
+        handles[index] = Some((role, handle_id));
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn process_observation(
+        identity: CanaryProcessIdentity,
+        handle_id: u64,
+        credentials: CanaryProcessCredentialIdentity,
+        credential_domain: CanaryCredentialDomainBinding,
+        network_namespace: NetworkNamespaceIdentity,
+        observed_at: Instant,
+    ) -> TproxyLocalOutputOwnedProcessObservation {
+        TproxyLocalOutputOwnedProcessObservation {
+            identity,
+            handle_id: NonZeroU64::new(handle_id).expect("scripted handle ID is nonzero"),
+            credentials: TproxyLocalOutputProcessCredentialObservation {
+                uids: [credentials.uid().get(); 4],
+                gids: [credentials.gid().get(); 4],
+                supplementary_group_count: 0,
+                cap_inheritable: 0,
+                cap_permitted: 0,
+                cap_effective: 0,
+                cap_ambient: 0,
+                no_new_privileges: true,
+                credential_domain,
+                network_namespace,
+                observed_at,
+            },
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::num::{NonZeroU32, NonZeroU64};
+        use std::time::Duration;
+
+        use flux_core::NetworkNamespaceIdentity;
+
+        use super::super::super::tests::Fixture;
+        use super::super::super::{
+            CANARY_CREDENTIAL_MAP_DIGEST_BYTES, CanaryAddressFamilies, CanaryAttemptRequest,
+            CanaryCredentialDomainBinding, CanaryCredentialMapDigest, CanaryFileIdentity,
+            CanaryNonce, CanaryProcessIdentity, FUNCTIONAL_CANARY_NONCE_BYTES,
+            UnqualifiedCanaryGateEvidence,
+        };
+        use super::*;
+
+        fn validate(
+            evidence: &UnqualifiedCanaryGateEvidence,
+            expected: &CanaryAttemptRequest,
+        ) -> Result<(), TproxyLocalOutputProcessOwnershipReceiptError> {
+            evidence
+                .local_output_process_ownership_receipt
+                .validate_for(
+                    expected,
+                    &evidence.flows,
+                    &evidence.cleanup,
+                    evidence.completed_at,
+                )
+        }
+
+        fn assert_receipt_rejected(
+            mutate: impl FnOnce(&mut TproxyLocalOutputProcessOwnershipReceipt),
+            expected_error: TproxyLocalOutputProcessOwnershipReceiptError,
+        ) {
+            let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+            let mut evidence = fixture.successful_evidence();
+            mutate(&mut evidence.local_output_process_ownership_receipt);
+
+            assert_eq!(validate(&evidence, fixture.request()), Err(expected_error));
+        }
+
+        fn assert_engine_credentials_rejected(
+            mutate: impl FnOnce(&mut TproxyLocalOutputProcessCredentialObservation),
+        ) {
+            assert_receipt_rejected(
+                |receipt| mutate(&mut receipt.engine_before.credentials),
+                TproxyLocalOutputProcessOwnershipReceiptError::EngineCredentialsInvalid,
+            );
+        }
+
+        fn assert_engine_after_credentials_rejected(
+            mutate: impl FnOnce(&mut TproxyLocalOutputProcessCredentialObservation),
+        ) {
+            assert_receipt_rejected(
+                |receipt| mutate(&mut receipt.engine_after.credentials),
+                TproxyLocalOutputProcessOwnershipReceiptError::EngineCredentialsInvalid,
+            );
+        }
+
+        fn alternate_credential_domain() -> CanaryCredentialDomainBinding {
+            CanaryCredentialDomainBinding::new(
+                CanaryFileIdentity::new(
+                    90,
+                    NonZeroU64::new(91).expect("alternate user namespace inode"),
+                ),
+                CanaryFileIdentity::new(
+                    90,
+                    NonZeroU64::new(92).expect("alternate mount namespace inode"),
+                ),
+                CanaryCredentialMapDigest::new([21; CANARY_CREDENTIAL_MAP_DIGEST_BYTES])
+                    .expect("alternate UID map digest"),
+                CanaryCredentialMapDigest::new([22; CANARY_CREDENTIAL_MAP_DIGEST_BYTES])
+                    .expect("alternate GID map digest"),
+            )
+            .expect("alternate credential domain")
+        }
+
+        fn alternate_process(identity: CanaryProcessIdentity) -> CanaryProcessIdentity {
+            CanaryProcessIdentity::new(
+                NonZeroU32::new(identity.pid().get() + 100).expect("alternate PID"),
+                NonZeroU64::new(identity.start_time_ticks().get() + 100)
+                    .expect("alternate start ticks"),
+            )
+        }
+
+        #[test]
+        fn scripted_receipt_accepts_exact_ipv4_and_dual_stack_evidence() {
+            for families in [
+                CanaryAddressFamilies::Ipv4Only,
+                CanaryAddressFamilies::Ipv4AndIpv6,
+            ] {
+                let fixture = Fixture::new(families);
+                let evidence = fixture.successful_evidence();
+
+                assert_eq!(validate(&evidence, fixture.request()), Ok(()));
+            }
+        }
+
+        #[test]
+        fn receipt_rejects_request_and_credential_scope_replay() {
+            let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+            let evidence = fixture.successful_evidence();
+            let mut different_attempt = fixture.request().clone();
+            different_attempt.nonce = CanaryNonce::from_bytes([8; FUNCTIONAL_CANARY_NONCE_BYTES]);
+            assert_eq!(
+                validate(&evidence, &different_attempt),
+                Err(TproxyLocalOutputProcessOwnershipReceiptError::RequestMismatch)
+            );
+
+            let mut probe_gid_replay = fixture.successful_evidence();
+            let mut expected = fixture.request().clone();
+            expected.pre_binding.environment.credentials.probe.gid =
+                NonZeroU32::new(65_530).expect("alternate probe GID");
+            probe_gid_replay
+                .local_output_process_ownership_receipt
+                .request = expected.clone();
+            assert_eq!(
+                validate(&probe_gid_replay, &expected),
+                Err(TproxyLocalOutputProcessOwnershipReceiptError::ClientCredentialsInvalid)
+            );
+
+            let mut engine_gid_replay = fixture.successful_evidence();
+            let mut expected = fixture.request().clone();
+            expected.pre_binding.environment.credentials.engine.gid =
+                NonZeroU32::new(65_529).expect("alternate engine GID");
+            engine_gid_replay
+                .local_output_process_ownership_receipt
+                .request = expected.clone();
+            assert_eq!(
+                validate(&engine_gid_replay, &expected),
+                Err(TproxyLocalOutputProcessOwnershipReceiptError::EngineCredentialsInvalid)
+            );
+
+            let mut domain_replay = fixture.successful_evidence();
+            let mut expected = fixture.request().clone();
+            expected.pre_binding.environment.credentials.domain = alternate_credential_domain();
+            domain_replay.local_output_process_ownership_receipt.request = expected.clone();
+            assert_eq!(
+                validate(&domain_replay, &expected),
+                Err(TproxyLocalOutputProcessOwnershipReceiptError::EngineCredentialsInvalid)
+            );
+        }
+
+        #[test]
+        fn receipt_rejects_engine_identity_and_handle_drift() {
+            assert_receipt_rejected(
+                |receipt| {
+                    receipt.engine_before.identity =
+                        alternate_process(receipt.engine_before.identity)
+                },
+                TproxyLocalOutputProcessOwnershipReceiptError::EngineIdentityMismatch,
+            );
+            assert_receipt_rejected(
+                |receipt| {
+                    receipt.engine_after.identity = alternate_process(receipt.engine_after.identity)
+                },
+                TproxyLocalOutputProcessOwnershipReceiptError::EngineIdentityMismatch,
+            );
+            assert_receipt_rejected(
+                |receipt| {
+                    receipt.engine_after.handle_id =
+                        NonZeroU64::new(99).expect("different engine handle")
+                },
+                TproxyLocalOutputProcessOwnershipReceiptError::EngineHandleMismatch,
+            );
+        }
+
+        #[test]
+        fn receipt_rejects_client_and_peer_identity_or_retirement_drift() {
+            assert_receipt_rejected(
+                |receipt| {
+                    receipt.client.observation.identity =
+                        alternate_process(receipt.client.observation.identity)
+                },
+                TproxyLocalOutputProcessOwnershipReceiptError::ClientIdentityMismatch,
+            );
+            assert_receipt_rejected(
+                |receipt| receipt.client.retirement.reaped_at += Duration::from_nanos(1),
+                TproxyLocalOutputProcessOwnershipReceiptError::ClientRetirementMismatch,
+            );
+            assert_receipt_rejected(
+                |receipt| {
+                    receipt.peer_servers[1].observation.identity =
+                        alternate_process(receipt.peer_servers[1].observation.identity)
+                },
+                TproxyLocalOutputProcessOwnershipReceiptError::PeerIdentityMismatch { slot: 1 },
+            );
+            assert_receipt_rejected(
+                |receipt| {
+                    receipt.peer_servers[2].retirement.terminated_at += Duration::from_nanos(1)
+                },
+                TproxyLocalOutputProcessOwnershipReceiptError::PeerRetirementMismatch { slot: 2 },
+            );
+        }
+
+        #[test]
+        fn receipt_rejects_credential_quad_group_capability_and_nnp_drift() {
+            assert_engine_credentials_rejected(|credentials| credentials.uids[1] += 1);
+            assert_engine_credentials_rejected(|credentials| credentials.gids[3] += 1);
+            assert_engine_credentials_rejected(|credentials| {
+                credentials.supplementary_group_count = 1
+            });
+            assert_engine_credentials_rejected(|credentials| credentials.cap_inheritable = 1);
+            assert_engine_credentials_rejected(|credentials| credentials.cap_permitted = 1);
+            assert_engine_credentials_rejected(|credentials| credentials.cap_effective = 1);
+            assert_engine_credentials_rejected(|credentials| credentials.cap_ambient = 1);
+            assert_engine_credentials_rejected(|credentials| credentials.no_new_privileges = false);
+            assert_engine_after_credentials_rejected(|credentials| credentials.uids[2] += 1);
+
+            assert_receipt_rejected(
+                |receipt| receipt.client.observation.credentials.uids = [65_520; 4],
+                TproxyLocalOutputProcessOwnershipReceiptError::ClientCredentialsInvalid,
+            );
+            assert_receipt_rejected(
+                |receipt| receipt.client.observation.credentials.gids = [65_521; 4],
+                TproxyLocalOutputProcessOwnershipReceiptError::ClientCredentialsInvalid,
+            );
+            assert_receipt_rejected(
+                |receipt| receipt.peer_servers[0].observation.credentials.gids[1] += 1,
+                TproxyLocalOutputProcessOwnershipReceiptError::PeerCredentialsInvalid { slot: 0 },
+            );
+
+            let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+            let mut arbitrary_restricted_peer = fixture.successful_evidence();
+            let credentials = &mut arbitrary_restricted_peer
+                .local_output_process_ownership_receipt
+                .peer_servers[1]
+                .observation
+                .credentials;
+            credentials.uids = [65_510; 4];
+            credentials.gids = [65_511; 4];
+            assert_eq!(
+                validate(&arbitrary_restricted_peer, fixture.request()),
+                Ok(()),
+                "peer credentials are restricted and namespace-bound but are not probe/engine roles",
+            );
+        }
+
+        #[test]
+        fn receipt_rejects_wrong_namespace_and_credential_map_domains() {
+            let wrong_network_namespace =
+                NetworkNamespaceIdentity::new(90, 93).expect("alternate network namespace");
+            assert_engine_credentials_rejected(|credentials| {
+                credentials.network_namespace = wrong_network_namespace
+            });
+            assert_receipt_rejected(
+                |receipt| {
+                    receipt.client.observation.credentials.credential_domain =
+                        alternate_credential_domain()
+                },
+                TproxyLocalOutputProcessOwnershipReceiptError::ClientCredentialsInvalid,
+            );
+            assert_receipt_rejected(
+                |receipt| {
+                    receipt.peer_servers[0]
+                        .observation
+                        .credentials
+                        .network_namespace = receipt.engine_before.credentials.network_namespace
+                },
+                TproxyLocalOutputProcessOwnershipReceiptError::PeerCredentialsInvalid { slot: 0 },
+            );
+            assert_engine_credentials_rejected(|credentials| {
+                credentials.credential_domain.user_namespace = CanaryFileIdentity::new(
+                    90,
+                    NonZeroU64::new(94).expect("different user namespace inode"),
+                )
+            });
+            assert_engine_credentials_rejected(|credentials| {
+                credentials.credential_domain.mount_namespace = CanaryFileIdentity::new(
+                    90,
+                    NonZeroU64::new(95).expect("different mount namespace inode"),
+                )
+            });
+            assert_engine_credentials_rejected(|credentials| {
+                credentials.credential_domain.uid_map_digest =
+                    CanaryCredentialMapDigest::new([23; CANARY_CREDENTIAL_MAP_DIGEST_BYTES])
+                        .expect("different UID map digest")
+            });
+            assert_engine_credentials_rejected(|credentials| {
+                credentials.credential_domain.gid_map_digest =
+                    CanaryCredentialMapDigest::new([24; CANARY_CREDENTIAL_MAP_DIGEST_BYTES])
+                        .expect("different GID map digest")
+            });
+        }
+
+        #[test]
+        fn receipt_rejects_reused_handles_and_swapped_role_observations() {
+            assert_receipt_rejected(
+                |receipt| receipt.client.observation.handle_id = receipt.engine_before.handle_id,
+                TproxyLocalOutputProcessOwnershipReceiptError::HandleReused {
+                    first: ProcessRole::Engine,
+                    second: ProcessRole::Client,
+                },
+            );
+            assert_receipt_rejected(
+                |receipt| {
+                    receipt.peer_servers[2].observation.handle_id =
+                        receipt.peer_servers[0].observation.handle_id
+                },
+                TproxyLocalOutputProcessOwnershipReceiptError::HandleReused {
+                    first: ProcessRole::PeerServer { slot: 0 },
+                    second: ProcessRole::PeerServer { slot: 2 },
+                },
+            );
+            assert_receipt_rejected(
+                |receipt| {
+                    std::mem::swap(
+                        &mut receipt.client.observation,
+                        &mut receipt.peer_servers[0].observation,
+                    )
+                },
+                TproxyLocalOutputProcessOwnershipReceiptError::ClientIdentityMismatch,
+            );
+            assert_receipt_rejected(
+                |receipt| receipt.peer_servers.swap(0, 1),
+                TproxyLocalOutputProcessOwnershipReceiptError::PeerIdentityMismatch { slot: 0 },
+            );
+        }
+
+        #[test]
+        fn distinct_handle_ids_are_receipt_local_alpha_renamable_tokens() {
+            let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+            let mut evidence = fixture.successful_evidence();
+            let receipt = &mut evidence.local_output_process_ownership_receipt;
+            std::mem::swap(
+                &mut receipt.client.observation.handle_id,
+                &mut receipt.peer_servers[0].observation.handle_id,
+            );
+
+            assert_eq!(validate(&evidence, fixture.request()), Ok(()));
+        }
+
+        #[test]
+        fn receipt_rejects_missing_flows_and_invalid_observation_timing() {
+            let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+            let mut missing = fixture.successful_evidence();
+            missing.flows.slots[CanaryFlow::Ipv4TcpEcho.index()] = None;
+            assert_eq!(
+                validate(&missing, fixture.request()),
+                Err(TproxyLocalOutputProcessOwnershipReceiptError::MissingRequiredFlow)
+            );
+
+            assert_receipt_rejected(
+                |receipt| {
+                    receipt.engine_before.credentials.observed_at =
+                        receipt.request.deadline().started_at() - Duration::from_nanos(1)
+                },
+                TproxyLocalOutputProcessOwnershipReceiptError::EngineTimingInvalid,
+            );
+            assert_receipt_rejected(
+                |receipt| {
+                    receipt.engine_before.credentials.observed_at =
+                        receipt.engine_after.credentials.observed_at
+                },
+                TproxyLocalOutputProcessOwnershipReceiptError::EngineTimingInvalid,
+            );
+            assert_receipt_rejected(
+                |receipt| {
+                    receipt.engine_after.credentials.observed_at =
+                        receipt.request.deadline().expires_at()
+                },
+                TproxyLocalOutputProcessOwnershipReceiptError::EngineTimingInvalid,
+            );
+            assert_receipt_rejected(
+                |receipt| {
+                    receipt.engine_after.credentials.observed_at =
+                        receipt.engine_before.credentials.observed_at
+                },
+                TproxyLocalOutputProcessOwnershipReceiptError::EngineTimingInvalid,
+            );
+            assert_receipt_rejected(
+                |receipt| {
+                    receipt.engine_after.credentials.observed_at =
+                        receipt.request.deadline().expires_at() - Duration::from_nanos(1)
+                },
+                TproxyLocalOutputProcessOwnershipReceiptError::EngineTimingInvalid,
+            );
+            assert_receipt_rejected(
+                |receipt| {
+                    receipt.client.observation.credentials.observed_at =
+                        receipt.request.deadline().started_at() - Duration::from_nanos(1)
+                },
+                TproxyLocalOutputProcessOwnershipReceiptError::ClientTimingInvalid,
+            );
+            assert_receipt_rejected(
+                |receipt| {
+                    receipt.client.observation.credentials.observed_at =
+                        receipt.engine_after.credentials.observed_at
+                },
+                TproxyLocalOutputProcessOwnershipReceiptError::ClientTimingInvalid,
+            );
+            assert_receipt_rejected(
+                |receipt| {
+                    receipt.client.observation.credentials.observed_at =
+                        receipt.client.retirement.quiesced_at + Duration::from_nanos(1)
+                },
+                TproxyLocalOutputProcessOwnershipReceiptError::ClientTimingInvalid,
+            );
+            assert_receipt_rejected(
+                |receipt| {
+                    receipt.peer_servers[1].observation.credentials.observed_at =
+                        receipt.peer_servers[1].retirement.quiesced_at + Duration::from_nanos(1)
+                },
+                TproxyLocalOutputProcessOwnershipReceiptError::PeerTimingInvalid { slot: 1 },
+            );
+            assert_receipt_rejected(
+                |receipt| {
+                    receipt.peer_servers[2].observation.credentials.observed_at =
+                        receipt.request.deadline().started_at() - Duration::from_nanos(1)
+                },
+                TproxyLocalOutputProcessOwnershipReceiptError::PeerTimingInvalid { slot: 2 },
+            );
+        }
+    }
+}
+
+pub(super) use process_ownership_receipt::TproxyLocalOutputProcessOwnershipReceipt;
+
 const _: fn() = || {
     fn assert_send_static<T: Send + 'static>() {}
     assert_send_static::<TproxyLocalOutputCaptureReceipt>();
+    assert_send_static::<TproxyLocalOutputProcessOwnershipReceipt>();
 };
 
-struct UnverifiedTproxyLocalOutputArtifacts<P, R> {
-    capture_proof: P,
+struct UnverifiedTproxyLocalOutputArtifacts<C, P, R> {
+    capture_proof: C,
+    process_proof: P,
+    observations: R,
+}
+
+struct CaptureReceiptBoundTproxyLocalOutputArtifacts<P, R> {
+    capture_receipt: TproxyLocalOutputCaptureReceipt,
+    process_proof: P,
     observations: R,
 }
 
 struct ReceiptBoundTproxyLocalOutputArtifacts<R> {
     capture_receipt: TproxyLocalOutputCaptureReceipt,
+    process_ownership_receipt: TproxyLocalOutputProcessOwnershipReceipt,
     observations: R,
 }
 
-impl<D, V, F> UnqualifiedFunctionalCanaryExecutor for TproxyLocalOutputExecutor<D, V, F>
+impl<D, C, P, F> UnqualifiedFunctionalCanaryExecutor for TproxyLocalOutputExecutor<D, C, P, F>
 where
     D: TproxyLocalOutputDriver,
-    V: TproxyLocalOutputCaptureVerifier<
+    C: TproxyLocalOutputCaptureVerifier<
             <<D as TproxyLocalOutputDriver>::Prepared as PreparedTproxyLocalOutputAttempt>::CaptureProof,
+            <<D as TproxyLocalOutputDriver>::Prepared as PreparedTproxyLocalOutputAttempt>::ProcessProof,
+            <<D as TproxyLocalOutputDriver>::Prepared as PreparedTproxyLocalOutputAttempt>::RawObservations,
+        >,
+    P: TproxyLocalOutputProcessOwnershipVerifier<
+            <<D as TproxyLocalOutputDriver>::Prepared as PreparedTproxyLocalOutputAttempt>::ProcessProof,
             <<D as TproxyLocalOutputDriver>::Prepared as PreparedTproxyLocalOutputAttempt>::RawObservations,
         >,
     F: TproxyLocalOutputEvidenceFactory<
@@ -797,9 +1665,13 @@ where
         let raw = prepared
             .execute_tproxy_local_output(request, socket_observer)
             .map_err(normalize_post_preparation_failure)?;
-        let verified = self
-            .verifier
+        let capture_bound = self
+            .capture_verifier
             .verify(request, raw)
+            .map_err(normalize_post_preparation_failure)?;
+        let verified = self
+            .process_verifier
+            .verify_process_ownership(request, capture_bound)
             .map_err(normalize_post_preparation_failure)?;
         self.evidence_factory
             .promote(request, verified)
@@ -871,6 +1743,7 @@ impl TproxyLocalOutputDriver for XtablesTproxyLocalOutputDriver {
 
 impl PreparedTproxyLocalOutputAttempt for Infallible {
     type CaptureProof = Infallible;
+    type ProcessProof = Infallible;
     type RawObservations = Infallible;
 
     fn execute_tproxy_local_output(
@@ -878,7 +1751,11 @@ impl PreparedTproxyLocalOutputAttempt for Infallible {
         _request: &CanaryAttemptRequest,
         _socket_observer: CanaryAttemptSocketObserverSession,
     ) -> Result<
-        UnverifiedTproxyLocalOutputArtifacts<Self::CaptureProof, Self::RawObservations>,
+        UnverifiedTproxyLocalOutputArtifacts<
+            Self::CaptureProof,
+            Self::ProcessProof,
+            Self::RawObservations,
+        >,
         FunctionalCanaryError,
     > {
         match self {}
@@ -891,13 +1768,33 @@ impl PreparedTproxyLocalOutputAttempt for Infallible {
 #[derive(Clone, Copy, Debug, Default)]
 struct TproxyCanaryCaptureVerifier;
 
-impl TproxyLocalOutputCaptureVerifier<Infallible, Infallible> for TproxyCanaryCaptureVerifier {
+impl TproxyLocalOutputCaptureVerifier<Infallible, Infallible, Infallible>
+    for TproxyCanaryCaptureVerifier
+{
     fn verify(
         &mut self,
         _request: &CanaryAttemptRequest,
-        raw: UnverifiedTproxyLocalOutputArtifacts<Infallible, Infallible>,
-    ) -> Result<ReceiptBoundTproxyLocalOutputArtifacts<Infallible>, FunctionalCanaryError> {
+        raw: UnverifiedTproxyLocalOutputArtifacts<Infallible, Infallible, Infallible>,
+    ) -> Result<
+        CaptureReceiptBoundTproxyLocalOutputArtifacts<Infallible, Infallible>,
+        FunctionalCanaryError,
+    > {
         match raw.capture_proof {}
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct TproxyCanaryProcessOwnershipVerifier;
+
+impl TproxyLocalOutputProcessOwnershipVerifier<Infallible, Infallible>
+    for TproxyCanaryProcessOwnershipVerifier
+{
+    fn verify_process_ownership(
+        &mut self,
+        _request: &CanaryAttemptRequest,
+        capture_bound: CaptureReceiptBoundTproxyLocalOutputArtifacts<Infallible, Infallible>,
+    ) -> Result<ReceiptBoundTproxyLocalOutputArtifacts<Infallible>, FunctionalCanaryError> {
+        match capture_bound.process_proof {}
     }
 }
 
@@ -931,7 +1828,8 @@ mod tests {
     use super::super::{CanarySocketObserverAuthority, CanarySocketObserverBinding};
     use super::*;
     use crate::functional_canary::{
-        CanaryAddressFamilies, CanaryDeadline, UnqualifiedCanaryFlowEvidenceSlots,
+        CanaryAddressFamilies, CanaryDeadline, UnqualifiedCanaryCleanupEvidence,
+        UnqualifiedCanaryFlowEvidenceSlots,
     };
 
     #[test]
@@ -965,6 +1863,7 @@ mod tests {
             let mut executor = TproxyLocalOutputExecutor::new(
                 driver,
                 TproxyCanaryCaptureVerifier,
+                TproxyCanaryProcessOwnershipVerifier,
                 TproxyCanaryEvidenceFactory,
             );
 
@@ -991,6 +1890,7 @@ mod tests {
             let mut executor = TproxyLocalOutputExecutor::new(
                 UnavailableDriver { availability },
                 TproxyCanaryCaptureVerifier,
+                TproxyCanaryProcessOwnershipVerifier,
                 TproxyCanaryEvidenceFactory,
             );
 
@@ -1027,6 +1927,7 @@ mod tests {
                 cleanup: CanaryCleanupStatus::NotRequired,
             },
             NeverCalledCaptureVerifier,
+            NeverCalledProcessOwnershipVerifier,
             NeverCalledEvidenceFactory,
         );
 
@@ -1044,6 +1945,7 @@ mod tests {
                 cleanup: CanaryCleanupStatus::VerifiedAbsent,
             },
             NeverCalledCaptureVerifier,
+            NeverCalledProcessOwnershipVerifier,
             NeverCalledEvidenceFactory,
         );
         let error = contradictory
@@ -1070,6 +1972,7 @@ mod tests {
             let mut executor = TproxyLocalOutputExecutor::new(
                 PreparedFailureDriver { kind, cleanup },
                 NeverCalledCaptureVerifier,
+                NeverCalledProcessOwnershipVerifier,
                 NeverCalledEvidenceFactory,
             );
 
@@ -1087,18 +1990,24 @@ mod tests {
     fn capture_verifier_binds_driver_proof_before_factory_promotion() {
         let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
         let seed = fixture.successful_evidence();
-        let verifier_calls = Arc::new(AtomicUsize::new(0));
+        let capture_verifier_calls = Arc::new(AtomicUsize::new(0));
+        let process_verifier_calls = Arc::new(AtomicUsize::new(0));
         let factory_calls = Arc::new(AtomicUsize::new(0));
         let driver = ScriptedProofDriver::new(fixture.request(), &seed);
-        let verifier = ScriptedCaptureVerifier {
-            calls: Arc::clone(&verifier_calls),
+        let capture_verifier = ScriptedCaptureVerifier {
+            calls: Arc::clone(&capture_verifier_calls),
+        };
+        let process_verifier = ScriptedProcessOwnershipVerifier {
+            calls: Arc::clone(&process_verifier_calls),
         };
         let factory = RecordingEvidenceFactory {
-            verifier_calls: Arc::clone(&verifier_calls),
+            capture_verifier_calls: Arc::clone(&capture_verifier_calls),
+            process_verifier_calls: Arc::clone(&process_verifier_calls),
             calls: Arc::clone(&factory_calls),
             panic_on_call: false,
         };
-        let mut executor = TproxyLocalOutputExecutor::new(driver, verifier, factory);
+        let mut executor =
+            TproxyLocalOutputExecutor::new(driver, capture_verifier, process_verifier, factory);
 
         let error = executor
             .execute(execution(fixture.request()))
@@ -1106,12 +2015,13 @@ mod tests {
 
         assert_eq!(error.kind(), CanaryErrorKind::ResponseMismatch);
         assert_eq!(error.cleanup(), CanaryCleanupStatus::VerifiedAbsent);
-        assert_eq!(verifier_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(capture_verifier_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(process_verifier_calls.load(Ordering::SeqCst), 1);
         assert_eq!(factory_calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
-    fn verifier_failure_is_post_preparation_and_never_calls_factory() {
+    fn capture_verifier_failure_is_post_preparation_and_never_calls_later_stages() {
         let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
         let seed = fixture.successful_evidence();
         let mut driver = ScriptedProofDriver::new(fixture.request(), &seed);
@@ -1124,17 +2034,23 @@ mod tests {
             .as_mut()
             .expect("IPv4 TCP observation")
             .client_tuple = alternate_tuple;
-        let verifier_calls = Arc::new(AtomicUsize::new(0));
+        let capture_verifier_calls = Arc::new(AtomicUsize::new(0));
+        let process_verifier_calls = Arc::new(AtomicUsize::new(0));
         let factory_calls = Arc::new(AtomicUsize::new(0));
-        let verifier = ScriptedCaptureVerifier {
-            calls: Arc::clone(&verifier_calls),
+        let capture_verifier = ScriptedCaptureVerifier {
+            calls: Arc::clone(&capture_verifier_calls),
+        };
+        let process_verifier = ScriptedProcessOwnershipVerifier {
+            calls: Arc::clone(&process_verifier_calls),
         };
         let factory = RecordingEvidenceFactory {
-            verifier_calls: Arc::clone(&verifier_calls),
+            capture_verifier_calls: Arc::clone(&capture_verifier_calls),
+            process_verifier_calls: Arc::clone(&process_verifier_calls),
             calls: Arc::clone(&factory_calls),
             panic_on_call: true,
         };
-        let mut executor = TproxyLocalOutputExecutor::new(driver, verifier, factory);
+        let mut executor =
+            TproxyLocalOutputExecutor::new(driver, capture_verifier, process_verifier, factory);
 
         let error = executor
             .execute(execution(fixture.request()))
@@ -1143,7 +2059,44 @@ mod tests {
         assert_eq!(error.kind(), CanaryErrorKind::CleanupUncertain);
         assert_eq!(error.cleanup(), CanaryCleanupStatus::Uncertain);
         assert!(error.diagnostic().contains("capture proof"));
-        assert_eq!(verifier_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(capture_verifier_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(process_verifier_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(factory_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn process_verifier_failure_is_post_preparation_and_never_calls_factory() {
+        let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+        let seed = fixture.successful_evidence();
+        let mut driver = ScriptedProofDriver::new(fixture.request(), &seed);
+        driver.prepared.process_proof.cleanup.client.reaped_at += Duration::from_nanos(1);
+        let capture_verifier_calls = Arc::new(AtomicUsize::new(0));
+        let process_verifier_calls = Arc::new(AtomicUsize::new(0));
+        let factory_calls = Arc::new(AtomicUsize::new(0));
+        let capture_verifier = ScriptedCaptureVerifier {
+            calls: Arc::clone(&capture_verifier_calls),
+        };
+        let process_verifier = ScriptedProcessOwnershipVerifier {
+            calls: Arc::clone(&process_verifier_calls),
+        };
+        let factory = RecordingEvidenceFactory {
+            capture_verifier_calls: Arc::clone(&capture_verifier_calls),
+            process_verifier_calls: Arc::clone(&process_verifier_calls),
+            calls: Arc::clone(&factory_calls),
+            panic_on_call: true,
+        };
+        let mut executor =
+            TproxyLocalOutputExecutor::new(driver, capture_verifier, process_verifier, factory);
+
+        let error = executor
+            .execute(execution(fixture.request()))
+            .expect_err("a process proof cannot bless a different cleanup observation batch");
+
+        assert_eq!(error.kind(), CanaryErrorKind::CleanupUncertain);
+        assert_eq!(error.cleanup(), CanaryCleanupStatus::Uncertain);
+        assert!(error.diagnostic().contains("process proof"));
+        assert_eq!(capture_verifier_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(process_verifier_calls.load(Ordering::SeqCst), 1);
         assert_eq!(factory_calls.load(Ordering::SeqCst), 0);
     }
 
@@ -1154,15 +2107,23 @@ mod tests {
     }
 
     #[derive(Clone)]
+    struct ScriptedProcessProof {
+        request: CanaryAttemptRequest,
+        cleanup: UnqualifiedCanaryCleanupEvidence,
+    }
+
+    #[derive(Clone)]
     struct ScriptedRawObservations {
         flows: UnqualifiedCanaryFlowEvidenceSlots,
+        cleanup: UnqualifiedCanaryCleanupEvidence,
         completed_at: Instant,
         client_quiesced_at: Instant,
     }
 
     #[derive(Clone)]
     struct ScriptedPreparedAttempt {
-        proof: ScriptedCaptureProof,
+        capture_proof: ScriptedCaptureProof,
+        process_proof: ScriptedProcessProof,
         observations: ScriptedRawObservations,
     }
 
@@ -1174,12 +2135,17 @@ mod tests {
         fn new(request: &CanaryAttemptRequest, evidence: &UnqualifiedCanaryGateEvidence) -> Self {
             Self {
                 prepared: ScriptedPreparedAttempt {
-                    proof: ScriptedCaptureProof {
+                    capture_proof: ScriptedCaptureProof {
                         request: request.clone(),
                         flows: evidence.flows.clone(),
                     },
+                    process_proof: ScriptedProcessProof {
+                        request: request.clone(),
+                        cleanup: evidence.cleanup.clone(),
+                    },
                     observations: ScriptedRawObservations {
                         flows: evidence.flows.clone(),
+                        cleanup: evidence.cleanup.clone(),
                         completed_at: evidence.completed_at,
                         client_quiesced_at: evidence.cleanup.client.quiesced_at,
                     },
@@ -1195,13 +2161,14 @@ mod tests {
             &self,
             request: &CanaryAttemptRequest,
         ) -> Result<Self::Prepared, TproxyLocalOutputUnavailable> {
-            assert_eq!(&self.prepared.proof.request, request);
+            assert_eq!(&self.prepared.capture_proof.request, request);
             Ok(self.prepared.clone())
         }
     }
 
     impl PreparedTproxyLocalOutputAttempt for ScriptedPreparedAttempt {
         type CaptureProof = ScriptedCaptureProof;
+        type ProcessProof = ScriptedProcessProof;
         type RawObservations = ScriptedRawObservations;
 
         fn execute_tproxy_local_output(
@@ -1209,11 +2176,16 @@ mod tests {
             _request: &CanaryAttemptRequest,
             _socket_observer: CanaryAttemptSocketObserverSession,
         ) -> Result<
-            UnverifiedTproxyLocalOutputArtifacts<Self::CaptureProof, Self::RawObservations>,
+            UnverifiedTproxyLocalOutputArtifacts<
+                Self::CaptureProof,
+                Self::ProcessProof,
+                Self::RawObservations,
+            >,
             FunctionalCanaryError,
         > {
             Ok(UnverifiedTproxyLocalOutputArtifacts {
-                capture_proof: self.proof,
+                capture_proof: self.capture_proof,
+                process_proof: self.process_proof,
                 observations: self.observations,
             })
         }
@@ -1223,18 +2195,26 @@ mod tests {
         calls: Arc<AtomicUsize>,
     }
 
-    impl TproxyLocalOutputCaptureVerifier<ScriptedCaptureProof, ScriptedRawObservations>
-        for ScriptedCaptureVerifier
+    impl
+        TproxyLocalOutputCaptureVerifier<
+            ScriptedCaptureProof,
+            ScriptedProcessProof,
+            ScriptedRawObservations,
+        > for ScriptedCaptureVerifier
     {
         fn verify(
             &mut self,
             request: &CanaryAttemptRequest,
             raw: UnverifiedTproxyLocalOutputArtifacts<
                 ScriptedCaptureProof,
+                ScriptedProcessProof,
                 ScriptedRawObservations,
             >,
         ) -> Result<
-            ReceiptBoundTproxyLocalOutputArtifacts<ScriptedRawObservations>,
+            CaptureReceiptBoundTproxyLocalOutputArtifacts<
+                ScriptedProcessProof,
+                ScriptedRawObservations,
+            >,
             FunctionalCanaryError,
         > {
             self.calls.fetch_add(1, Ordering::SeqCst);
@@ -1249,15 +2229,59 @@ mod tests {
             }
             let capture_receipt =
                 TproxyLocalOutputCaptureReceipt::scripted(request, &raw.capture_proof.flows);
-            Ok(ReceiptBoundTproxyLocalOutputArtifacts {
+            Ok(CaptureReceiptBoundTproxyLocalOutputArtifacts {
                 capture_receipt,
+                process_proof: raw.process_proof,
                 observations: raw.observations,
             })
         }
     }
 
+    struct ScriptedProcessOwnershipVerifier {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl TproxyLocalOutputProcessOwnershipVerifier<ScriptedProcessProof, ScriptedRawObservations>
+        for ScriptedProcessOwnershipVerifier
+    {
+        fn verify_process_ownership(
+            &mut self,
+            request: &CanaryAttemptRequest,
+            capture_bound: CaptureReceiptBoundTproxyLocalOutputArtifacts<
+                ScriptedProcessProof,
+                ScriptedRawObservations,
+            >,
+        ) -> Result<
+            ReceiptBoundTproxyLocalOutputArtifacts<ScriptedRawObservations>,
+            FunctionalCanaryError,
+        > {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if &capture_bound.process_proof.request != request
+                || capture_bound.process_proof.cleanup != capture_bound.observations.cleanup
+            {
+                return Err(FunctionalCanaryError::new(
+                    CanaryErrorKind::InvalidEvidence,
+                    CanaryCleanupStatus::NotRequired,
+                    "synthetic process proof does not match the raw cleanup observation batch",
+                ));
+            }
+            let process_ownership_receipt = TproxyLocalOutputProcessOwnershipReceipt::scripted(
+                request,
+                &capture_bound.observations.flows,
+                &capture_bound.process_proof.cleanup,
+                capture_bound.observations.completed_at,
+            );
+            Ok(ReceiptBoundTproxyLocalOutputArtifacts {
+                capture_receipt: capture_bound.capture_receipt,
+                process_ownership_receipt,
+                observations: capture_bound.observations,
+            })
+        }
+    }
+
     struct RecordingEvidenceFactory {
-        verifier_calls: Arc<AtomicUsize>,
+        capture_verifier_calls: Arc<AtomicUsize>,
+        process_verifier_calls: Arc<AtomicUsize>,
         calls: Arc<AtomicUsize>,
         panic_on_call: bool,
     }
@@ -1271,7 +2295,8 @@ mod tests {
             if self.panic_on_call {
                 panic!("the evidence factory must not run after verifier failure");
             }
-            assert_eq!(self.verifier_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(self.capture_verifier_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(self.process_verifier_calls.load(Ordering::SeqCst), 1);
             self.calls.fetch_add(1, Ordering::SeqCst);
             assert_eq!(
                 verified.capture_receipt.validate_for(
@@ -1282,10 +2307,19 @@ mod tests {
                 ),
                 Ok(())
             );
+            assert_eq!(
+                verified.process_ownership_receipt.validate_for(
+                    request,
+                    &verified.observations.flows,
+                    &verified.observations.cleanup,
+                    verified.observations.completed_at,
+                ),
+                Ok(())
+            );
             Err(FunctionalCanaryError::new(
                 CanaryErrorKind::ResponseMismatch,
                 CanaryCleanupStatus::VerifiedAbsent,
-                "recording factory observed the verifier-issued capture receipt",
+                "recording factory observed both verifier-issued receipts",
             ))
         }
     }
@@ -1353,6 +2387,7 @@ mod tests {
 
     impl PreparedTproxyLocalOutputAttempt for PreparedFailure {
         type CaptureProof = ();
+        type ProcessProof = ();
         type RawObservations = ();
 
         fn execute_tproxy_local_output(
@@ -1360,7 +2395,11 @@ mod tests {
             _request: &CanaryAttemptRequest,
             _socket_observer: CanaryAttemptSocketObserverSession,
         ) -> Result<
-            UnverifiedTproxyLocalOutputArtifacts<Self::CaptureProof, Self::RawObservations>,
+            UnverifiedTproxyLocalOutputArtifacts<
+                Self::CaptureProof,
+                Self::ProcessProof,
+                Self::RawObservations,
+            >,
             FunctionalCanaryError,
         > {
             Err(FunctionalCanaryError::new(
@@ -1373,13 +2412,26 @@ mod tests {
 
     struct NeverCalledCaptureVerifier;
 
-    impl TproxyLocalOutputCaptureVerifier<(), ()> for NeverCalledCaptureVerifier {
+    impl TproxyLocalOutputCaptureVerifier<(), (), ()> for NeverCalledCaptureVerifier {
         fn verify(
             &mut self,
             _request: &CanaryAttemptRequest,
-            _raw: UnverifiedTproxyLocalOutputArtifacts<(), ()>,
-        ) -> Result<ReceiptBoundTproxyLocalOutputArtifacts<()>, FunctionalCanaryError> {
+            _raw: UnverifiedTproxyLocalOutputArtifacts<(), (), ()>,
+        ) -> Result<CaptureReceiptBoundTproxyLocalOutputArtifacts<(), ()>, FunctionalCanaryError>
+        {
             panic!("the verifier must not run after driver failure")
+        }
+    }
+
+    struct NeverCalledProcessOwnershipVerifier;
+
+    impl TproxyLocalOutputProcessOwnershipVerifier<(), ()> for NeverCalledProcessOwnershipVerifier {
+        fn verify_process_ownership(
+            &mut self,
+            _request: &CanaryAttemptRequest,
+            _capture_bound: CaptureReceiptBoundTproxyLocalOutputArtifacts<(), ()>,
+        ) -> Result<ReceiptBoundTproxyLocalOutputArtifacts<()>, FunctionalCanaryError> {
+            panic!("the process verifier must not run after an earlier failure")
         }
     }
 
@@ -1502,6 +2554,7 @@ mod tests {
         let mut executor = TproxyLocalOutputExecutor::new(
             driver,
             NeverCalledCaptureVerifier,
+            NeverCalledProcessOwnershipVerifier,
             NeverCalledEvidenceFactory,
         );
 
@@ -1551,6 +2604,7 @@ mod tests {
 
     impl PreparedTproxyLocalOutputAttempt for PreboundObserverPreparedFailure {
         type CaptureProof = ();
+        type ProcessProof = ();
         type RawObservations = ();
 
         fn execute_tproxy_local_output(
@@ -1558,7 +2612,11 @@ mod tests {
             request: &CanaryAttemptRequest,
             socket_observer: CanaryAttemptSocketObserverSession,
         ) -> Result<
-            UnverifiedTproxyLocalOutputArtifacts<Self::CaptureProof, Self::RawObservations>,
+            UnverifiedTproxyLocalOutputArtifacts<
+                Self::CaptureProof,
+                Self::ProcessProof,
+                Self::RawObservations,
+            >,
             FunctionalCanaryError,
         > {
             assert_eq!(

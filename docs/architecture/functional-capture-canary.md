@@ -159,6 +159,29 @@ authority to exercise the complete contract. Positive listener and delivery cons
 remain private and test-only, and the current xtables prepared/raw path remains uninhabited and
 cannot construct positive evidence.
 
+The process-ownership receipt is now a second, separately sealed authority boundary after capture
+verification. The immutable request carries explicit probe and engine UID plus GID and an exact
+user-namespace, mount-namespace, UID-map, and GID-map domain. One non-cloneable receipt binds the
+supervised engine's exact PID/start ticks and one retained handle across observations before and
+after the required flows; it also binds the client and all peer PID/start-tick identities to
+distinct attempt-owned handle openings and the exact cleanup retirement records. Every credential
+observation requires stable real/effective/saved/filesystem UID and GID values, empty supplementary
+groups, zero inheritable/permitted/effective/ambient capabilities, `NoNewPrivs`, the exact
+credential-map domain, the role-correct network namespace, and flow/cleanup/deadline chronology.
+Handle-opening IDs are receipt-local opaque correlation tokens: their numeric values are
+alpha-renamable, while the sealed verifier authority proves which owned handle produced each
+identity and validation rejects engine-handle drift or reuse across live roles.
+
+The Linux/Android platform substrate for that future verifier is also delivered. A non-cloneable
+`ProcessHandle` opens only from a retained live `Child`, correlates a pidfd with its procfs PID and
+start ticks, proves the child remains waitable by this parent, and performs two stable bounded
+censuses of every `/proc/<pid>/task/*/status` entry so all threads have identical credentials. A
+pidfd reporting exit is not accepted as reap evidence: the owner must still confirm `Child::wait`,
+and the distinct-UID/GID preflight now exercises that ordering with live probe and engine children.
+This is observation and model plumbing. Production receipt authority remains uninhabited, and the
+real engine handle must still originate from `EngineSupervisor`'s retained `SingBoxChild`; a real
+prepared driver must likewise retain and retire its client and peer `Child` values.
+
 ### Fail-closed local-OUTPUT executor seam
 
 The delivered local-OUTPUT seam is an evidence-admission boundary, not a positive capture
@@ -171,24 +194,29 @@ mutation may have occurred. Failures after that point must carry cleanup `Verifi
 `Uncertain`; a missing or inconsistent proof is promoted to `CleanupUncertain` with cleanup
 `Uncertain`.
 
-The driver returns unverified capture proof plus raw observations only. The receipt verifier is the
-sole path from those values to receipt-bound artifacts, and the module-private evidence factory is
-the sole promotion path from those artifacts into schema-v2 gate evidence. The current zero-state
+The driver returns unverified capture proof, process proof, and raw observations only. The capture
+receipt verifier first binds capture proof while carrying the process proof forward; the separate
+process-ownership verifier must then mint a process receipt before the module-private evidence
+factory can promote artifacts into schema-v2 gate evidence. A failure at either verifier remains a
+post-preparation failure and cannot call a later stage. The current zero-state
 xtables driver has no prepared value: it reports `Availability(Unsupported)` before acquiring a networking
 writer or mutating state because the installed program can only mark OUTPUT and apply TPROXY in
 PREROUTING. It never attempts TPROXY in OUTPUT and never substitutes REDIRECT, DNAT, ingress
 PREROUTING traffic, a veth bounce, counters, or route-lookup inference. Its raw type, concrete
-receipt authority, and current factory input are uninhabited, so the seam cannot produce a positive
-host result.
+capture/process receipt authorities, and current factory input are uninhabited, so the seam cannot
+produce a positive host result.
 
-The next positive producer must replace the sealed receipt authority with one reviewed,
-mechanism-specific local-OUTPUT verifier; bind exact attempt-owned probe and engine UID, GID, PID,
-`/proc` start ticks, and process handles; construct the delivered report-object and temporal cleanup
-evidence; and use the real pre-opened socket-diagnostics authority for actual observations. A
+The next positive producer must replace both sealed receipt authorities with reviewed concrete
+verifiers; integrate the engine authority with `EngineSupervisor`'s retained `SingBoxChild` and the
+client/peer authority with driver-retained children; construct the delivered report-object and
+temporal cleanup evidence; and use the real pre-opened socket-diagnostics authority for actual
+observations. A
 separately qualified cgroup-BPF observer may later replace supervised delivery reports only after
 its own attachment, identity, complete-event, loss, and lifecycle contract is proven; ordinary BPF
-counters or sampled events cannot mint the receipt. No production receipt path may depend on Flux
-loading or unloading a `.ko`, and production module autoload remains prohibited. "Fail-closed" here
+counters or sampled events cannot mint the receipt. No qualified production receipt path may
+depend on explicit `.ko` loading or implicit module autoload. The current legacy structural bridge
+does not yet prove that stronger no-autoload prerequisite and therefore cannot qualify the receipt.
+"Fail-closed" here
 means weak evidence cannot qualify the gate; it does not override the separate user-selected
 fail-open versus fail-closed connectivity compensation policy.
 
@@ -387,8 +415,11 @@ cleanup is capture-safe:
 The unqualified gate record carries daemon-observed monotonic timestamps rather than cleanup
 booleans. Client and peer retirement evidence records PID/start-time identity plus ordered
 quiesce, terminate, and reap observations. The validator rejects collisions among those roles and
-with the supervised engine; the future real attempt context must additionally bind each claimed
-identity to its attempt-owned process handle before the factory can promote positive evidence.
+with the supervised engine. The process-ownership receipt now requires every claimed identity and
+exact retirement record to come through a distinct attempt-owned handle opening before the factory
+can promote evidence, and revalidates that receipt only after ordinary cleanup validation. Its
+production authority is intentionally uninhabited until the real attempt context supplies retained
+children and the supervisor supplies its retained engine child.
 Object-retirement evidence binds each pairwise-distinct selector, leak-guard, counter, and
 listener-delivery-report identity plus retirement and subsequent absence readback. The attempt
 record binds the exact Generation and nonce plus retirement and absence observations. Validation
@@ -475,8 +506,8 @@ functional pass.
    cleanup claims. Counter readback and the final authoritative delivery event must precede
    retirement of their evidence objects. Qualified cgroup-BPF delivery instead requires the exact
    report object to be verified never created and absent after the final event. This is validation
-   plumbing; production still has no positive evidence producer or attempt-process ownership
-   binding.
+   plumbing; production still has no positive evidence producer or real runtime process-receipt
+   authority.
 11. **Complete capture-receipt contract:** the selected TPROXY request now has a non-cloneable,
    per-flow local-OUTPUT receipt model that binds the complete request, request probe UID, nonce,
    tuple, payload, listener cookie, exact delivery event, unique sequence, loss baseline, and
@@ -485,18 +516,27 @@ functional pass.
    the receipt and revalidates it with its exact flows and client cleanup lifetime. The production
    authority is still uninhabited, so REDIRECT/DNAT, ingress traffic, counters, route lookups, a
    backend enum, or the current xtables path cannot produce a positive receipt.
-12. Add a separate positive local-OUTPUT qualification slice using the delivered credential
-   preflight and handoff, a real attempt context with attempt-owned UID/GID/PID/start-tick/handle
-   binding, a listener observer plus delivery-report schema-v1 parser/factory, actual prebound
+12. **Complete process-ownership contract:** explicit probe/engine UID+GID and credential-map
+   domains now enter the immutable request. A second non-cloneable receipt binds exact engine
+   before/after and client/peer PID/start-tick/handle observations, complete restricted credentials,
+   role network namespaces, exact cleanup retirements, distinct handle openings, and flow/cleanup/
+   deadline chronology. The Linux/Android pidfd substrate opens only from retained children,
+   validates stable process-wide thread credentials, distinguishes exit from parent reap, and is
+   exercised by the no-traffic credential preflight. Production receipt authority remains
+   uninhabited: `EngineSupervisor`/`SingBoxChild` and real driver child integration are still open.
+13. Add a separate positive local-OUTPUT qualification slice using the delivered credential,
+   handle, receipt, and handoff plumbing; integrate a real attempt context with the retained
+   `SingBoxChild` plus driver-owned client/peer children; add a listener observer plus
+   delivery-report schema-v1 parser/factory, actual prebound
    collector-session observations, a real traffic producer, and the completed schema-v2
    `validate_for` path. A
    separately qualified cgroup-eBPF observer may replace
    the report only after its own authority and loss contract is proven. REDIRECT/DNAT delivery
    cannot qualify a TPROXY Generation; an adapter without a qualifying TPROXY listener path reports
    `unsupported`. This slice must not weaken the model to accommodate the ingress checkpoint.
-13. Add an Android lab adapter that reports explicit `unsupported`, `denied`, `conflicting`,
+14. Add an Android lab adapter that reports explicit `unsupported`, `denied`, `conflicting`,
    `broken`, or `unknown` evidence. It remains diagnostic-only until exact-device qualification.
-14. Permit TPROXY `RUNNING` only for reviewed device profiles whose functional canary passes the
+15. Permit TPROXY `RUNNING` only for reviewed device profiles whose functional canary passes the
    real-device matrix and cleanup/crash tests. Other profiles remain unqualified; broaden the
    reviewed set without weakening the probe. TUN remains rejected until its separate
    single-route-owner and forced-death cleanup canaries pass.

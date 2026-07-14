@@ -35,6 +35,7 @@ pub(crate) const CANARY_PEER_SERVER_SLOTS: usize = 3;
 pub(crate) const CANARY_NEGATIVE_CONTROL_SLOTS: usize = 2;
 pub(crate) const CANARY_FACILITY_AUDIT_DIGEST_BYTES: usize = 32;
 pub(crate) const CAPTURE_OWNER_RECORD_DIGEST_BYTES: usize = 32;
+pub(crate) const CANARY_CREDENTIAL_MAP_DIGEST_BYTES: usize = 32;
 pub(crate) const CANARY_INBOUND_DELIVERY_REPORT_SCHEMA_VERSION: u16 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -176,6 +177,10 @@ pub(crate) enum CanaryBindingError {
     ProxyMarkEmpty,
     ProxyMarkBitsOutsideMask,
     ProbeUidMatchesEngineUid,
+    ProbeGidMatchesEngineGid,
+    EngineCredentialUidMismatch,
+    AllZeroCredentialMapDigest,
+    CredentialNamespaceCollision,
     MissingIpv6Facility,
     SameProtocolResponderPortCollision,
     FacilityAdmissionInventoryMismatch,
@@ -416,6 +421,103 @@ impl CanaryFileIdentity {
     #[must_use]
     pub(crate) const fn inode(self) -> NonZeroU64 {
         self.inode
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct CanaryCredentialMapDigest([u8; CANARY_CREDENTIAL_MAP_DIGEST_BYTES]);
+
+impl CanaryCredentialMapDigest {
+    pub(crate) const fn new(
+        bytes: [u8; CANARY_CREDENTIAL_MAP_DIGEST_BYTES],
+    ) -> Result<Self, CanaryBindingError> {
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] != 0 {
+                return Ok(Self(bytes));
+            }
+            index += 1;
+        }
+        Err(CanaryBindingError::AllZeroCredentialMapDigest)
+    }
+}
+
+/// Identity of the user/mount-namespace and ID-map domain in which process
+/// credentials are interpreted for one immutable attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CanaryCredentialDomainBinding {
+    user_namespace: CanaryFileIdentity,
+    mount_namespace: CanaryFileIdentity,
+    uid_map_digest: CanaryCredentialMapDigest,
+    gid_map_digest: CanaryCredentialMapDigest,
+}
+
+impl CanaryCredentialDomainBinding {
+    pub(crate) fn new(
+        user_namespace: CanaryFileIdentity,
+        mount_namespace: CanaryFileIdentity,
+        uid_map_digest: CanaryCredentialMapDigest,
+        gid_map_digest: CanaryCredentialMapDigest,
+    ) -> Result<Self, CanaryBindingError> {
+        if user_namespace == mount_namespace {
+            return Err(CanaryBindingError::CredentialNamespaceCollision);
+        }
+        Ok(Self {
+            user_namespace,
+            mount_namespace,
+            uid_map_digest,
+            gid_map_digest,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CanaryProcessCredentialIdentity {
+    uid: NonZeroU32,
+    gid: NonZeroU32,
+}
+
+impl CanaryProcessCredentialIdentity {
+    #[must_use]
+    pub(crate) const fn new(uid: NonZeroU32, gid: NonZeroU32) -> Self {
+        Self { uid, gid }
+    }
+
+    #[must_use]
+    pub(crate) const fn uid(self) -> NonZeroU32 {
+        self.uid
+    }
+
+    #[must_use]
+    pub(crate) const fn gid(self) -> NonZeroU32 {
+        self.gid
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CanaryAttemptCredentialBinding {
+    probe: CanaryProcessCredentialIdentity,
+    engine: CanaryProcessCredentialIdentity,
+    domain: CanaryCredentialDomainBinding,
+}
+
+impl CanaryAttemptCredentialBinding {
+    pub(crate) fn new(
+        probe: CanaryProcessCredentialIdentity,
+        engine: CanaryProcessCredentialIdentity,
+        domain: CanaryCredentialDomainBinding,
+    ) -> Result<Self, CanaryBindingError> {
+        if probe.uid() == engine.uid() {
+            return Err(CanaryBindingError::ProbeUidMatchesEngineUid);
+        }
+        if probe.gid() == engine.gid() {
+            return Err(CanaryBindingError::ProbeGidMatchesEngineGid);
+        }
+        Ok(Self {
+            probe,
+            engine,
+            domain,
+        })
     }
 }
 
@@ -1476,7 +1578,7 @@ impl CanaryEnvironmentAuthorityBinding {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CanaryEnvironmentBinding {
     authority: CanaryEnvironmentAuthorityBinding,
-    probe_uid: NonZeroU32,
+    credentials: CanaryAttemptCredentialBinding,
     facility: CanaryFacilityIdentity,
     facility_admission: CanaryFacilityAdmissionToken,
     rpdb: CanaryRpdbIdentity,
@@ -1486,14 +1588,14 @@ pub(crate) struct CanaryEnvironmentBinding {
 impl CanaryEnvironmentBinding {
     pub(crate) fn new(
         authority: CanaryEnvironmentAuthorityBinding,
-        probe_uid: NonZeroU32,
+        credentials: CanaryAttemptCredentialBinding,
         facility: CanaryFacilityIdentity,
         facility_admission: CanaryFacilityAdmissionToken,
         rpdb: CanaryRpdbIdentity,
         attempt_objects: CanaryAttemptObjectIdentities,
     ) -> Result<Self, CanaryBindingError> {
-        if probe_uid.get() == rpdb.engine_uid.get() {
-            return Err(CanaryBindingError::ProbeUidMatchesEngineUid);
+        if credentials.engine.uid() != rpdb.engine_uid {
+            return Err(CanaryBindingError::EngineCredentialUidMismatch);
         }
         if facility_admission.observation.network_epoch != authority.network.network_epoch
             || facility_admission.observation.inventory_snapshot_id
@@ -1506,7 +1608,7 @@ impl CanaryEnvironmentBinding {
         }
         Ok(Self {
             authority,
-            probe_uid,
+            credentials,
             facility,
             facility_admission,
             rpdb,
@@ -1521,7 +1623,22 @@ impl CanaryEnvironmentBinding {
 
     #[must_use]
     pub(crate) const fn probe_uid(&self) -> NonZeroU32 {
-        self.probe_uid
+        self.credentials.probe.uid()
+    }
+
+    #[must_use]
+    pub(crate) const fn probe_credentials(&self) -> CanaryProcessCredentialIdentity {
+        self.credentials.probe
+    }
+
+    #[must_use]
+    pub(crate) const fn engine_credentials(&self) -> CanaryProcessCredentialIdentity {
+        self.credentials.engine
+    }
+
+    #[must_use]
+    pub(crate) const fn credential_domain(&self) -> CanaryCredentialDomainBinding {
+        self.credentials.domain
     }
 
     #[must_use]
@@ -2662,6 +2779,16 @@ impl CanaryProcessIdentity {
             start_time_ticks,
         }
     }
+
+    #[must_use]
+    pub(crate) const fn pid(self) -> NonZeroU32 {
+        self.pid
+    }
+
+    #[must_use]
+    pub(crate) const fn start_time_ticks(self) -> NonZeroU64 {
+        self.start_time_ticks
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2869,6 +2996,7 @@ impl UnqualifiedCanaryCounterEvidence {
 pub(crate) struct UnqualifiedCanaryGateEvidence {
     request: CanaryAttemptRequest,
     local_output_capture_receipt: local_output::TproxyLocalOutputCaptureReceipt,
+    local_output_process_ownership_receipt: local_output::TproxyLocalOutputProcessOwnershipReceipt,
     completed_at: Instant,
     flows: UnqualifiedCanaryFlowEvidenceSlots,
     unexpected_flow_count: u8,
@@ -2883,6 +3011,8 @@ impl UnqualifiedCanaryGateEvidence {
     pub(in crate::functional_canary) const fn new(
         request: CanaryAttemptRequest,
         local_output_capture_receipt: local_output::TproxyLocalOutputCaptureReceipt,
+        local_output_process_ownership_receipt:
+            local_output::TproxyLocalOutputProcessOwnershipReceipt,
         completed_at: Instant,
         flows: UnqualifiedCanaryFlowEvidenceSlots,
         unexpected_flow_count: u8,
@@ -2893,6 +3023,7 @@ impl UnqualifiedCanaryGateEvidence {
         Self {
             request,
             local_output_capture_receipt,
+            local_output_process_ownership_receipt,
             completed_at,
             flows,
             unexpected_flow_count,
@@ -2950,6 +3081,9 @@ impl UnqualifiedCanaryGateEvidence {
             self.completed_at,
             &self.cleanup,
         )?;
+        self.local_output_process_ownership_receipt
+            .validate_for(expected, &self.flows, &self.cleanup, self.completed_at)
+            .map_err(|_| CanaryEvidenceError::LocalOutputProcessOwnershipReceiptInvalid)?;
         Ok(ValidatedUnqualifiedCanaryGateEvidence(self))
     }
 }
@@ -3139,6 +3273,7 @@ pub(crate) enum CanaryEvidenceError {
         count: u8,
     },
     LocalOutputCaptureReceiptInvalid,
+    LocalOutputProcessOwnershipReceiptInvalid,
     MissingOutboundLoopEvidence {
         flow: CanaryFlow,
     },
@@ -4560,7 +4695,56 @@ pub(crate) mod tests {
             CaptureProgramDigest::new([0; CAPTURE_PROGRAM_DIGEST_BYTES]),
             Err(CanaryBindingError::AllZeroCaptureProgramDigest)
         );
+        assert_eq!(
+            CanaryCredentialMapDigest::new([0; CANARY_CREDENTIAL_MAP_DIGEST_BYTES]),
+            Err(CanaryBindingError::AllZeroCredentialMapDigest)
+        );
+        let namespace = CanaryFileIdentity::new(60, NonZeroU64::new(70).expect("namespace inode"));
+        assert_eq!(
+            CanaryCredentialDomainBinding::new(
+                namespace,
+                namespace,
+                CanaryCredentialMapDigest::new([1; CANARY_CREDENTIAL_MAP_DIGEST_BYTES])
+                    .expect("UID map digest"),
+                CanaryCredentialMapDigest::new([2; CANARY_CREDENTIAL_MAP_DIGEST_BYTES])
+                    .expect("GID map digest"),
+            ),
+            Err(CanaryBindingError::CredentialNamespaceCollision)
+        );
         let fixture = Fixture::new(CanaryAddressFamilies::Ipv4AndIpv6);
+        let environment = &fixture.request.pre_binding.environment;
+        let probe = environment.probe_credentials();
+        let engine = environment.engine_credentials();
+        assert_eq!(
+            CanaryAttemptCredentialBinding::new(
+                CanaryProcessCredentialIdentity::new(engine.uid(), probe.gid()),
+                engine,
+                environment.credential_domain(),
+            ),
+            Err(CanaryBindingError::ProbeUidMatchesEngineUid)
+        );
+        assert_eq!(
+            CanaryAttemptCredentialBinding::new(
+                CanaryProcessCredentialIdentity::new(probe.uid(), engine.gid()),
+                engine,
+                environment.credential_domain(),
+            ),
+            Err(CanaryBindingError::ProbeGidMatchesEngineGid)
+        );
+        let mut mismatched_credentials = environment.credentials;
+        mismatched_credentials.engine.uid =
+            NonZeroU32::new(65_500).expect("mismatched engine credential UID");
+        assert_eq!(
+            CanaryEnvironmentBinding::new(
+                environment.authority.clone(),
+                mismatched_credentials,
+                environment.facility,
+                environment.facility_admission,
+                environment.rpdb,
+                environment.attempt_objects,
+            ),
+            Err(CanaryBindingError::EngineCredentialUidMismatch)
+        );
         assert_eq!(
             fixture
                 .request
@@ -4572,7 +4756,7 @@ pub(crate) mod tests {
             BOOT_ID
         );
         assert_eq!(
-            fixture.request.pre_binding.environment.probe_uid.get(),
+            fixture.request.pre_binding.environment.probe_uid().get(),
             20_002
         );
         assert_eq!(fixture.request.pre_binding.engine.engine().pid(), 4242);
@@ -4684,6 +4868,22 @@ pub(crate) mod tests {
             validate(&fixture, evidence)
                 .expect_err("a capture receipt cannot be replayed across attempts"),
             CanaryEvidenceError::LocalOutputCaptureReceiptInvalid
+        );
+    }
+
+    #[test]
+    fn gate_rejects_a_process_ownership_receipt_from_another_attempt() {
+        let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+        let other = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+        let mut evidence = fixture.successful_evidence();
+        let other_evidence = other.successful_evidence();
+        evidence.local_output_process_ownership_receipt =
+            other_evidence.local_output_process_ownership_receipt;
+
+        assert_eq!(
+            validate(&fixture, evidence)
+                .expect_err("a process receipt cannot be replayed across attempts"),
+            CanaryEvidenceError::LocalOutputProcessOwnershipReceiptInvalid
         );
     }
 
@@ -6502,12 +6702,21 @@ pub(crate) mod tests {
             );
             let counters = counter_evidence(&self.request);
             let cleanup = cleanup_evidence(&self.request);
+            let completed_at = self.request.deadline().started_at() + Duration::from_millis(200);
             let local_output_capture_receipt =
                 local_output::TproxyLocalOutputCaptureReceipt::scripted(&self.request, &flows);
+            let local_output_process_ownership_receipt =
+                local_output::TproxyLocalOutputProcessOwnershipReceipt::scripted(
+                    &self.request,
+                    &flows,
+                    &cleanup,
+                    completed_at,
+                );
             UnqualifiedCanaryGateEvidence::new(
                 self.request.clone(),
                 local_output_capture_receipt,
-                self.request.deadline().started_at() + Duration::from_millis(200),
+                local_output_process_ownership_receipt,
+                completed_at,
                 flows,
                 0,
                 loop_escape,
@@ -6725,7 +6934,29 @@ pub(crate) mod tests {
         );
         CanaryEnvironmentBinding::new(
             authority,
-            NonZeroU32::new(20_002).expect("probe UID"),
+            CanaryAttemptCredentialBinding::new(
+                CanaryProcessCredentialIdentity::new(
+                    NonZeroU32::new(20_002).expect("probe UID"),
+                    NonZeroU32::new(20_002).expect("probe GID"),
+                ),
+                CanaryProcessCredentialIdentity::new(
+                    rpdb.engine_uid,
+                    NonZeroU32::new(20_001).expect("engine GID"),
+                ),
+                CanaryCredentialDomainBinding::new(
+                    CanaryFileIdentity::new(60, NonZeroU64::new(61).expect("user namespace inode")),
+                    CanaryFileIdentity::new(
+                        60,
+                        NonZeroU64::new(62).expect("mount namespace inode"),
+                    ),
+                    CanaryCredentialMapDigest::new([16; CANARY_CREDENTIAL_MAP_DIGEST_BYTES])
+                        .expect("UID map digest"),
+                    CanaryCredentialMapDigest::new([17; CANARY_CREDENTIAL_MAP_DIGEST_BYTES])
+                        .expect("GID map digest"),
+                )
+                .expect("distinct credential namespace identities"),
+            )
+            .expect("distinct role credentials"),
             facility,
             admission,
             rpdb,

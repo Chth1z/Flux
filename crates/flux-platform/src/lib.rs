@@ -14,6 +14,7 @@ mod netlink;
 #[allow(dead_code)]
 mod network_observer;
 mod phase_dispatcher;
+mod process;
 mod reactor;
 mod seqpacket;
 mod shutdown;
@@ -26,6 +27,10 @@ pub use network_observer::NetworkInventorySource;
 pub use phase_dispatcher::{
     DispatcherPhaseCommand, PhaseDispatcherError, PhaseDispatcherErrorKind, PhaseDispatcherPaths,
     ProcessPhaseDispatcher,
+};
+pub use process::{
+    ProcessCredentials, ProcessHandle, ProcessHandleError, ProcessHandleErrorKind, ProcessIdentity,
+    ProcessObservation,
 };
 pub use reactor::{
     DaemonReactor, NetworkInventoryDegradation, ReactorError, ReactorStopHandle, StopDisposition,

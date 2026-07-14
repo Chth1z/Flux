@@ -2,15 +2,19 @@
 //!
 //! This checkpoint creates no capture rules and sends no traffic. It proves only that a
 //! disposable user/mount/network namespace can map an owner identity plus two distinct nonzero
-//! probe/engine identities and can actually execute children under those exact credentials.
+//! probe/engine identities, can execute children under those exact credentials, and can retain
+//! exact child-origin process handles through live reobservation and parent-confirmed reap.
 
 use super::*;
+use flux_platform::{ProcessHandle, ProcessHandleError, ProcessHandleErrorKind};
 use std::fmt;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
 const TEST_NAME: &str = "functional_canary::linux_namespace_harness::privileged_local_output_distinct_uid_capability_preflight";
 const MODE_PREFLIGHT: &str = "distinct-uid-preflight";
 const MODE_ROLE: &str = "distinct-uid-role";
+const MODE_PROCESS_HANDLE_PROBE: &str = "distinct-uid-process-handle-probe";
 const OUTER_MOUNTNS_ENV: &str = "FLUX_LINUX_CANARY_OUTER_MOUNTNS";
 const EXPECTED_UID_MAP_ENV: &str = "FLUX_LINUX_CANARY_EXPECTED_UID_MAP";
 const EXPECTED_GID_MAP_ENV: &str = "FLUX_LINUX_CANARY_EXPECTED_GID_MAP";
@@ -32,6 +36,7 @@ pub(super) fn run() {
         Err(env::VarError::NotPresent) => run_outer(),
         Ok(MODE_PREFLIGHT) => run_preflight(),
         Ok(MODE_ROLE) => run_role(),
+        Ok(MODE_PROCESS_HANDLE_PROBE) => run_process_handle_probe_child(),
         Ok(other) => Err(format!("unsupported {MODE_ENV} value {other:?}")),
         Err(env::VarError::NotUnicode(_)) => Err(format!("{MODE_ENV} must contain valid UTF-8")),
     };
@@ -218,7 +223,211 @@ fn run_outer() -> Result<(), String> {
             .to_string(),
         );
     }
+    match run_process_handle_availability_probe() {
+        Ok(()) => {}
+        Err(ProcessHandleProbeFailure::Unavailable(reason)) => {
+            return skip_or_fail(required, reason);
+        }
+        Err(ProcessHandleProbeFailure::Hard(reason)) => return Err(reason),
+    }
     run_outer_reentry(&plan)
+}
+
+#[derive(Debug)]
+enum ProcessHandleProbeFailure {
+    Unavailable(String),
+    Hard(String),
+}
+
+fn run_process_handle_availability_probe() -> Result<(), ProcessHandleProbeFailure> {
+    let executable = env::current_exe().map_err(|error| {
+        ProcessHandleProbeFailure::Hard(format!("resolve process-handle probe executable: {error}"))
+    })?;
+    let handshake_directory = tempfile::tempdir().map_err(|error| {
+        ProcessHandleProbeFailure::Hard(format!(
+            "create process-handle probe handshake directory: {error}"
+        ))
+    })?;
+    let ready_path = handshake_directory.path().join("ready");
+    let release_path = handshake_directory.path().join("release");
+    let mut command = Command::new(executable);
+    command
+        .args([
+            "--ignored",
+            "--exact",
+            TEST_NAME,
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(MODE_ENV, MODE_PROCESS_HANDLE_PROBE)
+        .env(CONFIG_ENV, handshake_directory.path());
+    let description = format_command(&command);
+    command.process_group(0);
+    arm_parent_death_signal(&mut command).map_err(ProcessHandleProbeFailure::Hard)?;
+    let mut stdout_file = tempfile::tempfile().map_err(|error| {
+        ProcessHandleProbeFailure::Hard(format!("create stdout capture for {description}: {error}"))
+    })?;
+    let mut stderr_file = tempfile::tempfile().map_err(|error| {
+        ProcessHandleProbeFailure::Hard(format!("create stderr capture for {description}: {error}"))
+    })?;
+    let stdout_sink = stdout_file.try_clone().map_err(|error| {
+        ProcessHandleProbeFailure::Hard(format!("clone stdout capture for {description}: {error}"))
+    })?;
+    let stderr_sink = stderr_file.try_clone().map_err(|error| {
+        ProcessHandleProbeFailure::Hard(format!("clone stderr capture for {description}: {error}"))
+    })?;
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout_sink))
+        .stderr(Stdio::from(stderr_sink))
+        .spawn()
+        .map_err(|error| {
+            ProcessHandleProbeFailure::Hard(format!("spawn {description}: {error}"))
+        })?;
+
+    let execution = (|| {
+        let expected_ready = format!("ready:process-handle-probe:{}\n", child.id());
+        wait_for_role_signal(
+            &ready_path,
+            &expected_ready,
+            &mut child,
+            COMMAND_TIMEOUT,
+            "process-handle probe readiness",
+        )
+        .map_err(ProcessHandleProbeFailure::Hard)?;
+        let handle =
+            ProcessHandle::open_child(&child).map_err(classify_process_handle_open_error)?;
+        let initial_identity = handle.identity();
+        let reobserved = handle.reobserve().map_err(|error| {
+            ProcessHandleProbeFailure::Hard(format!(
+                "reobserve live process-handle probe child: {error}"
+            ))
+        })?;
+        if reobserved.identity() != initial_identity
+            || reobserved.credentials() != handle.credentials()
+        {
+            return Err(ProcessHandleProbeFailure::Hard(format!(
+                "process-handle probe drifted while live: opened={handle:?} reobserved={reobserved:?}"
+            )));
+        }
+        write_role_signal(&release_path, "release:process-handle-probe\n")
+            .map_err(ProcessHandleProbeFailure::Hard)?;
+        // The pidfd is observation authority only. Parent-owned Child polling
+        // performs and proves the reap before the exited pidfd is consulted.
+        let status = wait_child(&mut child, COMMAND_TIMEOUT).map_err(|error| {
+            ProcessHandleProbeFailure::Hard(format!("reap process-handle probe child: {error}"))
+        })?;
+        let exit_error = handle.reobserve().expect_err(
+            "a reaped process-handle probe child must report exit through its retained pidfd",
+        );
+        if exit_error.kind() != ProcessHandleErrorKind::Exited {
+            return Err(ProcessHandleProbeFailure::Hard(format!(
+                "process-handle probe did not report exit after parent reap: {exit_error}"
+            )));
+        }
+        if !status.success() {
+            return Err(ProcessHandleProbeFailure::Hard(format!(
+                "process-handle probe child exited with {status}"
+            )));
+        }
+        Ok(())
+    })();
+
+    if let Err(error) = execution {
+        let kill_error = kill_live_child_group(&mut child).err();
+        let reap_error = wait_child(&mut child, COMMAND_TIMEOUT).err();
+        let stdout = read_command_capture(&mut stdout_file, &description, "stdout").unwrap_or_else(
+            |capture_error| format!("capture failed: {capture_error}").into_bytes(),
+        );
+        let stderr = read_command_capture(&mut stderr_file, &description, "stderr").unwrap_or_else(
+            |capture_error| format!("capture failed: {capture_error}").into_bytes(),
+        );
+        if kill_error.is_some() || reap_error.is_some() {
+            return Err(ProcessHandleProbeFailure::Hard(format!(
+                "process-handle availability probe failed with {error:?}; cleanup failed: kill_error={kill_error:?} reap_error={reap_error:?}; stdout={} stderr={}",
+                bounded_diagnostic(&stdout),
+                bounded_diagnostic(&stderr)
+            )));
+        }
+        return match error {
+            ProcessHandleProbeFailure::Unavailable(reason) => {
+                Err(ProcessHandleProbeFailure::Unavailable(format!(
+                    "{reason}; probe child was killed and reaped; stdout={} stderr={}",
+                    bounded_diagnostic(&stdout),
+                    bounded_diagnostic(&stderr)
+                )))
+            }
+            ProcessHandleProbeFailure::Hard(reason) => {
+                Err(ProcessHandleProbeFailure::Hard(format!(
+                    "{reason}; stdout={} stderr={}",
+                    bounded_diagnostic(&stdout),
+                    bounded_diagnostic(&stderr)
+                )))
+            }
+        };
+    }
+    Ok(())
+}
+
+fn classify_process_handle_open_error(error: ProcessHandleError) -> ProcessHandleProbeFailure {
+    match error {
+        ProcessHandleError::UnsupportedPlatform(platform) => {
+            ProcessHandleProbeFailure::Unavailable(
+                PreflightUnavailable::new(
+                    UnavailableKind::Unsupported,
+                    format!("process handles are unsupported on {platform}"),
+                )
+                .to_string(),
+            )
+        }
+        ProcessHandleError::PidFdUnsupported { source } => ProcessHandleProbeFailure::Unavailable(
+            PreflightUnavailable::new(
+                UnavailableKind::Unsupported,
+                format!("pidfd_open is unavailable: {source}"),
+            )
+            .to_string(),
+        ),
+        ProcessHandleError::SystemCall {
+            operation,
+            path,
+            source,
+        } if source.kind() == std::io::ErrorKind::PermissionDenied
+            || matches!(
+                source.raw_os_error(),
+                Some(libc::EACCES) | Some(libc::EPERM)
+            ) =>
+        {
+            ProcessHandleProbeFailure::Unavailable(
+                PreflightUnavailable::new(
+                    UnavailableKind::Denied,
+                    format!(
+                        "process-handle acquisition was denied during {operation}{}: {source}",
+                        path.as_ref()
+                            .map_or_else(String::new, |path| format!(" {}", path.display()))
+                    ),
+                )
+                .to_string(),
+            )
+        }
+        error => ProcessHandleProbeFailure::Hard(format!(
+            "process-handle availability probe produced invalid evidence: {error}"
+        )),
+    }
+}
+
+fn run_process_handle_probe_child() -> Result<(), String> {
+    let handshake_directory = required_path_environment(CONFIG_ENV)?;
+    let ready_path = handshake_directory.join("ready");
+    let release_path = handshake_directory.join("release");
+    write_role_signal(
+        &ready_path,
+        &format!("ready:process-handle-probe:{}\n", std::process::id()),
+    )?;
+    wait_for_role_release(
+        &release_path,
+        "release:process-handle-probe\n",
+        PROCESS_TIMEOUT,
+    )
 }
 
 fn build_credential_plan() -> Result<CredentialPlan, PreflightUnavailable> {
@@ -410,7 +619,7 @@ fn run_preflight() -> Result<(), String> {
         run_role_child(role, credential)?;
     }
     eprintln!(
-        "PREFLIGHT PASS: {mechanism} produced exact nonzero probe UID/GID {PROBE_UID}/{PROBE_GID} and engine UID/GID {ENGINE_UID}/{ENGINE_GID}; credential capability only, no local-OUTPUT traffic qualification"
+        "PREFLIGHT PASS: {mechanism} produced exact nonzero probe UID/GID {PROBE_UID}/{PROBE_GID} and engine UID/GID {ENGINE_UID}/{ENGINE_GID}, with exact parent-owned PID/start-tick/process-handle reobservation and parent-confirmed reap; credential/process-handle capability only, no local-OUTPUT traffic qualification"
     );
     Ok(())
 }
@@ -467,6 +676,21 @@ fn validate_mapped_controller() -> Result<String, String> {
 fn run_role_child(role: &str, credential: Credential) -> Result<(), String> {
     let executable =
         env::current_exe().map_err(|error| format!("resolve test executable: {error}"))?;
+    let handshake_directory = tempfile::tempdir()
+        .map_err(|error| format!("create {role} role handshake directory: {error}"))?;
+    let ready_path = handshake_directory.path().join("ready");
+    let release_path = handshake_directory.path().join("release");
+    let mut release_file = create_role_handshake_files(
+        handshake_directory.path(),
+        &ready_path,
+        &release_path,
+        credential,
+    )?;
+    fs::set_permissions(
+        handshake_directory.path(),
+        fs::Permissions::from_mode(0o711),
+    )
+    .map_err(|error| format!("make {role} role handshake directory accessible: {error}"))?;
     let mut command = Command::new(executable);
     command
         .args([
@@ -479,14 +703,128 @@ fn run_role_child(role: &str, credential: Credential) -> Result<(), String> {
         .env(MODE_ENV, MODE_ROLE)
         .env(ROLE_UID_ENV, credential.uid.to_string())
         .env(ROLE_GID_ENV, credential.gid.to_string())
+        .env(CONFIG_ENV, handshake_directory.path())
         .env(INNER_NETNS_ENV, network_namespace_identity()?)
         .env(INNER_USERNS_ENV, user_namespace_identity()?)
         .env(INNER_MOUNTNS_ENV, mount_namespace_identity()?)
         .uid(credential.uid)
         .gid(credential.gid);
-    checked_command(command, COMMAND_TIMEOUT)
-        .map(|_| ())
-        .map_err(|error| format!("execute {role} credential role: {error}"))
+    let description = format_command(&command);
+    command.process_group(0);
+    arm_parent_death_signal(&mut command)?;
+    let mut stdout_file = tempfile::tempfile()
+        .map_err(|error| format!("create stdout capture for {description}: {error}"))?;
+    let mut stderr_file = tempfile::tempfile()
+        .map_err(|error| format!("create stderr capture for {description}: {error}"))?;
+    let stdout_sink = stdout_file
+        .try_clone()
+        .map_err(|error| format!("clone stdout capture for {description}: {error}"))?;
+    let stderr_sink = stderr_file
+        .try_clone()
+        .map_err(|error| format!("clone stderr capture for {description}: {error}"))?;
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout_sink))
+        .stderr(Stdio::from(stderr_sink))
+        .spawn()
+        .map_err(|error| format!("spawn {description}: {error}"))?;
+
+    let execution = (|| {
+        let expected_ready = format!(
+            "ready:{role}:{}:{}:{}\n",
+            child.id(),
+            credential.uid,
+            credential.gid
+        );
+        wait_for_role_signal(
+            &ready_path,
+            &expected_ready,
+            &mut child,
+            COMMAND_TIMEOUT,
+            &format!("{role} readiness"),
+        )?;
+
+        let handle = ProcessHandle::open_child(&child)
+            .map_err(|error| format!("open exact {role} role process handle: {error}"))?;
+        let proc_identity = capture_process_identity(child.id())?;
+        let handle_identity = handle.identity();
+        if handle_identity.pid().get() != child.id()
+            || handle_identity.pid().get() != proc_identity.pid
+            || handle_identity.start_time_ticks().get() != proc_identity.start_ticks
+        {
+            return Err(format!(
+                "{role} role process-handle identity mismatch: child_pid={} proc_identity={proc_identity:?} handle_identity={handle_identity:?}",
+                child.id()
+            ));
+        }
+        validate_handle_credentials(role, credential, handle.credentials())?;
+        let reobserved = handle
+            .reobserve()
+            .map_err(|error| format!("reobserve live {role} role process handle: {error}"))?;
+        if reobserved.identity() != handle_identity
+            || reobserved.credentials() != handle.credentials()
+        {
+            return Err(format!(
+                "{role} role process handle drifted while the child waited: opened={handle:?} reobserved={reobserved:?}"
+            ));
+        }
+        validate_handle_credentials(role, credential, reobserved.credentials())?;
+
+        publish_role_signal(
+            &mut release_file,
+            &release_path,
+            &format!("release:{role}\n"),
+        )?;
+        // The retained Child, not pidfd readability, is the reaping authority.
+        let status = wait_child(&mut child, COMMAND_TIMEOUT)?;
+        let exit_error = handle
+            .reobserve()
+            .expect_err("a reaped role child must report exit through its retained pidfd");
+        if exit_error.kind() != ProcessHandleErrorKind::Exited {
+            return Err(format!(
+                "{role} role process handle did not report exit after parent reap: {exit_error}"
+            ));
+        }
+        if !status.success() {
+            return Err(format!("{role} role child exited with {status}"));
+        }
+        Ok(())
+    })();
+
+    if let Err(error) = execution {
+        let kill_error = kill_live_child_group(&mut child).err();
+        let reap_error = wait_child(&mut child, COMMAND_TIMEOUT).err();
+        let stdout = read_command_capture(&mut stdout_file, &description, "stdout")?;
+        let stderr = read_command_capture(&mut stderr_file, &description, "stderr")?;
+        return Err(format!(
+            "execute {role} credential role: {error}; kill_error={kill_error:?}; reap_error={reap_error:?}; stdout={} stderr={}",
+            bounded_diagnostic(&stdout),
+            bounded_diagnostic(&stderr)
+        ));
+    }
+    Ok(())
+}
+
+fn validate_handle_credentials(
+    role: &str,
+    expected: Credential,
+    observed: &flux_platform::ProcessCredentials,
+) -> Result<(), String> {
+    if observed.uids() != &[expected.uid; 4]
+        || observed.gids() != &[expected.gid; 4]
+        || !observed.supplementary_groups().is_empty()
+        || observed.capability_inheritable() != 0
+        || observed.capability_permitted() != 0
+        || observed.capability_effective() != 0
+        || observed.capability_ambient() != 0
+        || !observed.no_new_privileges()
+    {
+        return Err(format!(
+            "{role} role process-handle credential mismatch: expected_uid={} expected_gid={} observed={observed:?}",
+            expected.uid, expected.gid
+        ));
+    }
+    Ok(())
 }
 
 fn run_role() -> Result<(), String> {
@@ -557,7 +895,191 @@ fn run_role() -> Result<(), String> {
             "credential transition {uid}/{gid} is not covered by the exact expected maps"
         ));
     }
+    let (role, expected_credential) = match credential {
+        PROBE_CREDENTIAL => ("probe", PROBE_CREDENTIAL),
+        ENGINE_CREDENTIAL => ("engine", ENGINE_CREDENTIAL),
+        _ => unreachable!("the fixed credential-role check above rejected unknown identities"),
+    };
+    if credential != expected_credential {
+        return Err(format!(
+            "credential role {role:?} expected {}/{}, observed {uid}/{gid}",
+            expected_credential.uid, expected_credential.gid
+        ));
+    }
+    let handshake_directory = required_path_environment(CONFIG_ENV)?;
+    let ready_path = handshake_directory.join("ready");
+    let release_path = handshake_directory.join("release");
+    write_existing_role_signal(
+        &ready_path,
+        &format!("ready:{role}:{}:{uid}:{gid}\n", std::process::id()),
+    )?;
+    wait_for_role_release(&release_path, &format!("release:{role}\n"), PROCESS_TIMEOUT)?;
     Ok(())
+}
+
+fn required_path_environment(variable: &str) -> Result<PathBuf, String> {
+    env::var_os(variable)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| format!("{variable} is required"))
+}
+
+fn write_role_signal(path: &Path, contents: &str) -> Result<(), String> {
+    let pending = path.with_extension("pending");
+    fs::write(&pending, contents)
+        .map_err(|error| format!("write role handshake {}: {error}", pending.display()))?;
+    fs::rename(&pending, path)
+        .map_err(|error| format!("publish role handshake {}: {error}", path.display()))
+}
+
+fn create_role_handshake_files(
+    directory: &Path,
+    ready_path: &Path,
+    release_path: &Path,
+    credential: Credential,
+) -> Result<File, String> {
+    let ready_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(ready_path)
+        .map_err(|error| format!("create role ready file {}: {error}", ready_path.display()))?;
+    // SAFETY: the descriptor is owned by `ready_file`; the exact nonzero role
+    // UID/GID are mapped in this disposable user namespace; fchown changes only
+    // this newly created regular file and does not follow a path.
+    if unsafe { libc::fchown(ready_file.as_raw_fd(), credential.uid, credential.gid) } != 0 {
+        return Err(format!(
+            "assign role ready file {} to {}/{}: {}",
+            ready_path.display(),
+            credential.uid,
+            credential.gid,
+            std::io::Error::last_os_error()
+        ));
+    }
+    drop(ready_file);
+
+    let release_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o644)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(release_path)
+        .map_err(|error| {
+            format!(
+                "create parent-owned role release file {}: {error}",
+                release_path.display()
+            )
+        })?;
+    let metadata = fs::symlink_metadata(directory)
+        .map_err(|error| format!("inspect role handshake directory: {error}"))?;
+    if !metadata.file_type().is_dir() {
+        return Err(format!(
+            "role handshake path {} is not a directory",
+            directory.display()
+        ));
+    }
+    Ok(release_file)
+}
+
+fn write_existing_role_signal(path: &Path, contents: &str) -> Result<(), String> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| format!("open existing role handshake {}: {error}", path.display()))?;
+    file.write_all(contents.as_bytes())
+        .map_err(|error| format!("write role handshake {}: {error}", path.display()))?;
+    file.sync_data()
+        .map_err(|error| format!("sync role handshake {}: {error}", path.display()))
+}
+
+fn publish_role_signal(file: &mut File, path: &Path, contents: &str) -> Result<(), String> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| format!("seek role handshake {}: {error}", path.display()))?;
+    file.set_len(0)
+        .map_err(|error| format!("truncate role handshake {}: {error}", path.display()))?;
+    file.write_all(contents.as_bytes())
+        .map_err(|error| format!("write role handshake {}: {error}", path.display()))?;
+    file.sync_data()
+        .map_err(|error| format!("sync role handshake {}: {error}", path.display()))
+}
+
+fn wait_for_role_signal(
+    path: &Path,
+    expected: &str,
+    child: &mut Child,
+    timeout: Duration,
+    description: &str,
+) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match fs::read_to_string(path) {
+            Ok(observed) if observed == expected => return Ok(()),
+            Ok(observed) if expected.starts_with(&observed) => {}
+            Ok(observed) => {
+                return Err(format!(
+                    "{description} signal mismatch at {}: expected={expected:?} observed={observed:?}",
+                    path.display()
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "read {description} signal {}: {error}",
+                    path.display()
+                ));
+            }
+        }
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("poll child {} for {description}: {error}", child.id()))?
+        {
+            return Err(format!(
+                "child {} exited with {status} before {description}",
+                child.id()
+            ));
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "child {} did not publish {description} within {timeout:?}",
+                child.id()
+            ));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn wait_for_role_release(path: &Path, expected: &str, timeout: Duration) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match fs::read_to_string(path) {
+            Ok(observed) if observed == expected => return Ok(()),
+            Ok(observed) if expected.starts_with(&observed) => {}
+            Ok(observed) => {
+                return Err(format!(
+                    "role release signal mismatch at {}: expected={expected:?} observed={observed:?}",
+                    path.display()
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "read role release signal {}: {error}",
+                    path.display()
+                ));
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "role release signal {} was not published within {timeout:?}",
+                path.display()
+            ));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn validate_reentry_boundary() -> Result<(), String> {
@@ -1317,6 +1839,64 @@ mod tests {
     }
 
     #[test]
+    fn role_handshake_precreates_nofollow_files_without_a_world_writable_directory() {
+        let directory = tempfile::tempdir().expect("role handshake directory");
+        let ready_path = directory.path().join("ready");
+        let release_path = directory.path().join("release");
+        // SAFETY: geteuid has no arguments or failure mode and only reads the
+        // current process identity for this unprivileged regression.
+        let uid = unsafe { libc::geteuid() };
+        // SAFETY: getegid has no arguments or failure mode and only reads the
+        // current process identity for this unprivileged regression.
+        let gid = unsafe { libc::getegid() };
+        let credential = Credential { uid, gid };
+        let mut release =
+            create_role_handshake_files(directory.path(), &ready_path, &release_path, credential)
+                .expect("precreate secure role handshake files");
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o711))
+            .expect("restrict role handshake directory");
+
+        assert_eq!(
+            fs::symlink_metadata(directory.path())
+                .expect("handshake metadata")
+                .mode()
+                & 0o777,
+            0o711
+        );
+        let ready_metadata = fs::symlink_metadata(&ready_path).expect("ready metadata");
+        assert!(ready_metadata.file_type().is_file());
+        assert_eq!(ready_metadata.uid(), credential.uid);
+        assert_eq!(ready_metadata.gid(), credential.gid);
+        assert_eq!(ready_metadata.mode() & 0o777, 0o600);
+        let release_metadata = fs::symlink_metadata(&release_path).expect("release metadata");
+        assert!(release_metadata.file_type().is_file());
+        assert_eq!(release_metadata.mode() & 0o777, 0o644);
+
+        write_existing_role_signal(&ready_path, "ready:test\n")
+            .expect("write through the precreated ready file");
+        assert_eq!(
+            fs::read_to_string(&ready_path).expect("read ready signal"),
+            "ready:test\n"
+        );
+        publish_role_signal(&mut release, &release_path, "release:test\n")
+            .expect("write through retained parent release descriptor");
+        assert_eq!(
+            fs::read_to_string(&release_path).expect("read release signal"),
+            "release:test\n"
+        );
+
+        let target = directory.path().join("target");
+        fs::write(&target, "unchanged").expect("write symlink target");
+        let symlink = directory.path().join("symlink");
+        std::os::unix::fs::symlink(&target, &symlink).expect("create test symlink");
+        assert!(write_existing_role_signal(&symlink, "clobber").is_err());
+        assert_eq!(
+            fs::read_to_string(target).expect("read unchanged symlink target"),
+            "unchanged"
+        );
+    }
+
+    #[test]
     fn subordinate_mapping_arguments_never_request_root_roles_or_traffic_tools() {
         let plan = CredentialPlan::new(
             MappingMechanism::SubordinateHelpers,
@@ -1361,5 +1941,43 @@ mod tests {
             skip_or_fail(true, "missing newuidmap".to_owned()),
             Err("missing newuidmap".to_owned())
         );
+    }
+
+    #[test]
+    fn process_handle_probe_softens_only_unsupported_or_permission_denied_opening() {
+        for error in [
+            ProcessHandleError::UnsupportedPlatform("test"),
+            ProcessHandleError::PidFdUnsupported {
+                source: std::io::Error::from_raw_os_error(libc::ENOSYS),
+            },
+            ProcessHandleError::SystemCall {
+                operation: "open child pidfd",
+                path: None,
+                source: std::io::Error::from_raw_os_error(libc::EPERM),
+            },
+        ] {
+            assert!(matches!(
+                classify_process_handle_open_error(error),
+                ProcessHandleProbeFailure::Unavailable(_)
+            ));
+        }
+
+        let exited = ProcessHandleError::Exited {
+            pid: std::num::NonZeroU32::new(1).expect("nonzero test PID"),
+        };
+        assert!(matches!(
+            classify_process_handle_open_error(exited),
+            ProcessHandleProbeFailure::Hard(_)
+        ));
+        assert!(matches!(
+            classify_process_handle_open_error(ProcessHandleError::MalformedProcStat {
+                path: PathBuf::from("/proc/1/stat"),
+            }),
+            ProcessHandleProbeFailure::Hard(_)
+        ));
+        assert!(matches!(
+            classify_process_handle_open_error(ProcessHandleError::ChildReapContractUnavailable),
+            ProcessHandleProbeFailure::Hard(_)
+        ));
     }
 }

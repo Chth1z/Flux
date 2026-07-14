@@ -17,6 +17,12 @@ The primary Capture Path is selected at runtime:
 
 eBPF is a first-class optional plane with two stages: observability first, then verified acceleration. It does not replace nftables/xtables/TUN as the correctness path in the initial rewrite.
 
+Migration is component-by-component rather than a big-bang shell deletion. During bridge releases,
+the serialized shell networking path is frozen as the executable compatibility oracle and remains
+the sole writer. Rust may compile and compare observation-only shadow artifacts before it owns a
+backend, but an ownership transition occurs only after renderer, parity, readback, recovery,
+rollback, and real-device gates pass for that component. See [ADR-0010](../adr/0010-freeze-shell-networking-as-a-shadow-compiler-oracle.md).
+
 ## Research basis
 
 - [Current system baseline](../research/current-system-baseline.md)
@@ -156,6 +162,21 @@ Candidate enumeration may produce only bounded, non-authorizing syntactic/topolo
 The implementation is pure computation. It hides normalization, policy ordering, bounded mark/routing candidate enumeration and scoring, authorized candidate finalization, UID expansion, CIDR canonicalization, Sing-Box overlay generation, resource budgeting, and safety validation. It does not collect census evidence, assert device cooperation, allocate by complement, or turn planning evidence into an activation lease.
 
 The compiler must return the same byte-for-byte candidate set for identical normalized discovery inputs and the same byte-for-byte `GenerationArtifact` for identical candidates/evidence/selection. It must not read files, invoke commands, or mutate the kernel. The Controller assigns a monotonic `GenerationId` and the Generation Store adds timestamps only after compilation; neither is part of the artifact digest.
+
+The current Phase 2 tracer bullet stops below both interfaces above. A pure shadow compiler accepts
+already typed and resolved compatibility inputs and emits deterministic, backend-neutral,
+separately ordered local-OUTPUT and forwarded-ingress programs. It keeps a canonical mandatory
+safety baseline distinct from configurable bypasses, retains optional inventory-host
+snapshot/epoch provenance without claiming final freshness, enforces fixed resource budgets, and
+reports a semantic version/digest plus explicit compatibility assumptions and deferred prerequisites. Its
+product is for review and frozen-oracle fixture comparison only; it is not exposed as a public
+packet-decision service.
+
+The shadow artifact is not a `GenerationArtifact` or `CompiledGeneration`. It has no Generation ID,
+Planning Authority or receipt, writer/ownership token, backend renderer, kernel object names,
+prepared/active conversion, Runtime Reconciler entry point, or functional-canary authority. The
+bridge shell remains the sole executed networking writer, and no shadow output is accepted by the
+Phase 1 `RuntimeCoordinator`.
 
 ### 3. Runtime Reconciler module
 
@@ -419,6 +440,12 @@ The compiler emits backend-neutral Capture Policy first, then an nftables progra
 ### xtables compatibility path
 
 This path preserves broad Android compatibility.
+
+Until Phase 4 transfers ownership, the existing shell implementation remains the frozen executed
+oracle for this path. The Phase 2 shadow compiler may characterize its ordered semantics, but it
+does not render or invoke restore commands and does not claim byte or device parity. The Rust
+renderer is admitted later as a separate checkpoint; the shell writer is disabled before its first
+native mutation so both implementations are never active writers.
 
 Design requirements:
 
@@ -897,14 +924,22 @@ The Phase 1 projection exposes `ControlSnapshot` and `RuntimeSnapshot` as separa
 12. Shell never generates or applies networking policy in the final architecture.
 13. Generic AOSP and conflict-free negative scans never create Android mark authority; only exact device-qualified positive evidence may permit mark planning.
 14. Production `fluxd` never loads or unloads kernel modules and release packages contain no `.ko`, KPM, or opaque kernel payload. An already-loaded exact-device extension is optional read-only observation only; decision-bearing use requires a concrete partner and superseding ADR.
+15. A shadow Capture artifact is non-authorizing: it cannot acquire a Generation ID, planning or
+    writer authority, activation conversion, Runtime Reconciler entry point, or functional-canary
+    status merely because its compilation or fixture comparison succeeded.
+16. Compatibility components transfer to Rust atomically and individually; shell remains the sole
+    writer for a component until its transition lease disables that path.
 
-Phase 1 is an explicit bridge exception to invariant 12's final-state wording: shell phase scripts still apply networking state, but the serialized worker is their only caller and the boot-scoped lease excludes `scripts/core` from Rust-owned engine runs.
+Phase 1 is an explicit bridge exception to invariant 12's final-state wording: shell phase scripts still apply networking state, but the serialized worker is their only caller and the boot-scoped lease excludes `scripts/core` from Rust-owned engine runs. Their networking behavior is frozen under ADR-0010 except for correctness, security, release-contract, and rollback fixes.
 
 ## Completion criteria for the rewrite
 
 - `fluxd` is the only long-lived Flux process besides Sing-Box.
 - `addrsyncd` functionality is in-process and its standalone binary is removed from packaging.
 - Runtime routing/rule/config/updater shell scripts are no longer required.
+- Every removed networking script has first passed its component-specific renderer/parity,
+  failure/recovery, exact ownership/readback, rollback, single-writer cutover, and Android gates;
+  minimal installer, launcher/watchdog, disable, uninstall, and compatibility wrappers may remain.
 - nftables, xtables+ipset, xtables+jump, and TUN plans have deterministic compiler tests and real-kernel integration tests.
 - eBPF observation ships with verifier and attach diagnostics; acceleration ships only after parity tests.
 - Unsupported and degraded device states are explainable through CLI JSON.

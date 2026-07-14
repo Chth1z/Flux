@@ -26,6 +26,20 @@ verification layers succeed for the same Generation. The production compatibilit
 continues to publish operational `RUNNING` after structural verification while reporting
 `structural_only` rather than claiming functional authorization.
 
+### Shadow Capture Programs are not canary authority
+
+The Phase 2 shadow compiler is outside this verification transaction. Its deterministic semantic
+digest is domain-separated from the Generation-bound Capture Program digest in an attempt, and a
+shadow artifact has no Generation ID, capture-owner record, Backend Plan, writer token,
+prepared/active state, listener identity, or Runtime Coordinator entry point. A model decision or
+successful frozen-oracle fixture comparison therefore cannot satisfy structural verification,
+construct an attempt, authorize traffic, or publish any functional status. The shell bridge
+remains the sole executed networking writer while this observation-only compiler is developed.
+
+Renderer parity, live readback, and component ownership transfer are later gates. The shadow lane
+also adds no eBPF attach/pin path, TUN activation, implicit module request, or `.ko`/KPM loading that
+could provide an alternate evidence source.
+
 ### Ingress evidence is not local-OUTPUT evidence
 
 The Linux namespace program must classify capture evidence by hook and traffic domain. A packet

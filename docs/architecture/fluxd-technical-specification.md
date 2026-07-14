@@ -250,6 +250,21 @@ receipt; a plan containing no mark reads, writes, or transfers records that mark
 the receipt's exact boot, namespace, inventory, catalog, census, and ownership facts and still needs
 a separate activation lease.
 
+### 4.5 Shadow Capture Artifact
+
+The bounded Phase 2 tracer bullet emits a different artifact class before Generation compilation
+is available. A shadow Capture artifact contains only a semantic version, deterministic digest,
+bounded resource accounting, explicit compatibility assumptions/deferred prerequisites, and
+separate ordered local-OUTPUT and forwarded-ingress programs over already typed and resolved
+inputs. It performs no discovery or I/O.
+
+This artifact is observation-only and is never implicitly promoted to the type in section 4.4. It
+has no Generation ID, Capability/Engine Profile planning lease, Planning Authority or receipt,
+Backend Plan, route/mark program, Managed Object key or kernel name, writer/ownership token,
+prepared/active conversion, journal record, or Runtime Coordinator/Reconciler entry point. Its
+digest is domain-separated from a Generation Capture Program digest and cannot satisfy a
+functional-canary request. No production API treats it as a packet-decision service.
+
 ## 5. Configuration schema
 
 The authoritative user file is `conf/flux.toml`.
@@ -647,6 +662,53 @@ The algorithm is pure and has golden tests for representative device profiles.
 
 ## 8. Policy compilation
 
+### Phase 2 shadow boundary
+
+The first implementation checkpoint is a pure, non-authorizing compatibility compiler. The
+compiler itself owns a versioned canonical mandatory safety baseline; callers may supply bounded
+configurable direct prefixes but cannot delete, replace, or reclassify mandatory entries. It
+canonicalizes and deduplicates resolved UIDs, exact/prefix interface selectors, family-matching
+prefixes, and optional inventory-derived host bypasses before compiling two distinct programs. If
+no host-set plan is supplied, the report explicitly defers inventory-host observation rather than
+claiming complete device-owned-address safety. A partially covering plan reports every selected
+family that remains unobserved, and provenance retains the plan's exact family selection:
+
+- local OUTPUT, where compatibility engine credentials, output-interface policy, and resolved
+  application UID policy are meaningful; and
+- forwarded ingress, where input-interface/tether scope is meaningful and OUTPUT-only UID policy
+  is absent.
+
+The checkpoint orders family/domain scope, compatibility loop prevention, mandatory destination
+safety, inventory-derived address hosts, configurable destination bypass, interface/domain
+selection, local application selection, protocol eligibility, and the proxy/direct result. It
+retains the host-set snapshot/epoch as provenance but defers its Generation-finalization freshness
+check. It records the compatibility UID/GID loop bypass as an assumption rather than claiming exact
+engine-socket authority. Forwarded programs likewise record the legacy exact `lo` name as an
+assumption; native activation still requires observed loopback link identity. Unsupported protocol
+handling is explicit. Established-flow caching,
+transparent-socket acceleration, FakeIP ICMP, QUIC policy, MSS clamping, mark/routing actions,
+backend object naming, and activation remain deferred.
+
+Compilation has fixed prefix, UID, and interface-selector ceilings and fails rather than truncating.
+Canonical ordering and a domain-separated semantic digest make identical normalized inputs
+byte-for-byte reproducible. The initial shell-derived fixtures characterize policy decisions only;
+there is no xtables/nftables renderer, restore-byte parity, live-kernel readback, device-parity
+claim, or conversion to Generation/prepared/active state in this checkpoint.
+
+The shadow IR follows the target order in section 8.1: compatibility engine loop prevention is
+before destination/interface policy, and forwarded loopback safety is before configurable bypass.
+The shipped shell reaches `BYPASS_IP` and some interface rules before `APP_CHAIN` owner matching,
+and emits its combined bypass chain before the loopback rule. Those overlap cases normally share a
+direct disposition but differ in explanation precedence. This is an intentional documented
+target-versus-oracle distinction, not a renderer-parity claim; the later differential checkpoint
+must review it explicitly rather than silently copying either order.
+
+Shadow list predicates are set predicates: members are ORed, while `LocalUidNotIn` and
+`InterfaceDoesNotMatch` negate the complete set. Interface selectors are backend-neutral bytes,
+not proof that an xtables token is renderable. The later renderer must validate quoting/encoding,
+trailing-`+` ambiguity, and IFNAMSIZ expansion before emitting restore syntax, preserve whole-set
+negation, and apply its separate rendered-rule budget.
+
 ### 8.1 Normalized decision order
 
 The backend-neutral Capture Program uses this order:
@@ -737,6 +799,12 @@ Use `NFNL_MSG_BATCH_BEGIN` and `NFNL_MSG_BATCH_END`. Prefer complete replacement
 Extended acknowledgements are captured and mapped to the specific generated operation.
 
 ## 10. xtables and ipset specification
+
+Until the Phase 4 ownership transition, the current shell `rules`/`tproxy` path is the frozen
+executed compatibility oracle and sole xtables/ipset writer. Phase 2 may compare semantic shadow
+fixtures without invoking restore tools. A later Rust renderer must pass canonical restore,
+differential, failure/recovery, exact ownership/readback, rollback, and real-device gates; the
+transition lease disables the shell writer before the first native mutation.
 
 ### 10.1 Invocation
 
@@ -1355,12 +1423,15 @@ cannot be classified by the current extension checks. Production `fluxd` does no
 | Release stage | Runtime behavior |
 |---|---|
 | Bridge | `fluxd` owns Sing-Box through the atomic runtime coordinator; serialized shell phases still own networking writes and expose separate control/runtime status |
+| Shadow compiler | Rust emits deterministic observation-only Capture Programs for frozen-oracle comparison; shell remains the sole executed networking writer and no shadow artifact enters a Generation or activation path |
 | Legacy parity | `fluxd` owns xtables/PBR/address sync; updater may still use external curl/jq adapters |
 | New backends | nftables, ipset, managed TUN, and eBPF observation available behind capability gates |
 | Default switch | `auto` prefers nftables where conformance passes |
 | Cleanup | standalone `addrsyncd` and runtime policy scripts removed; wrappers retained |
 
 No compatibility stage may have two independent owners mutating the same kernel objects.
+The shadow-compiler stage also authorizes no eBPF attachment/pinning, live-chain integration, TUN
+activation, implicit module request, `.ko`/KPM loading, or native netfilter/routing mutation.
 
 Open Phase 1 hardening gates are the production schema-v2 evidence producer, concrete local-OUTPUT
 capture/process receipt authorities and executor, actual prebound INET_DIAG collector integration,

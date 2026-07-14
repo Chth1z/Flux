@@ -1,6 +1,6 @@
 # Flux Rewrite Development
 
-The Rust rewrite uses a root Cargo workspace while the legacy `addrsyncd` submodule remains independently locked and buildable during the bridge releases.
+The Rust rewrite uses a root Cargo workspace while the legacy `addrsyncd` submodule remains independently locked and buildable during the bridge releases. The executed shell networking path is frozen as the compatibility oracle and remains the sole writer until each Rust component passes its cutover gate.
 
 ## Toolchain contract
 
@@ -57,6 +57,36 @@ sh tests/shell/run-dispatcher-tests.sh
 ```
 
 The first two suites are host-only and cover installer migration/configuration admissibility and legacy rule-generation semantics. The remaining three wrappers run in isolated Bubblewrap roots: installer rollback after post-extraction failure, authoritative `fluxctl` delegation, and the complete Rust-owned dispatcher lifecycle. Local hosts without Bubblewrap report an isolated-suite skip. CI makes unavailable or prohibited Bubblewrap environments failures.
+
+### Phase 2 shadow Capture Program workflow
+
+The first Capture Policy checkpoint is pure `flux-core` work. Run its focused integration test with:
+
+```text
+cargo test -p flux-core --test capture_program
+```
+
+The test corpus pins the ordered local-OUTPUT and forwarded-ingress semantics, canonical mandatory
+safety baseline, separately configurable bypasses, resolved application modes and multi-user UIDs,
+exact/prefix interfaces, family/domain isolation, optional inventory-host provenance,
+compatibility engine UID/GID bypass, protocol eligibility, deterministic digest/resource
+accounting, and explicit deferred prerequisites. The
+oracle-derived fixture is rooted in `tests/shell/rules_generation.sh`; run that shell suite
+separately because the Rust test must not execute scripts or inspect live state.
+
+Treat a difference as a review item, not permission to update both sides mechanically. A shell
+change is admitted only for a concrete correctness, security, release-contract, or rollback fix,
+and the frozen fixture records why it changed. A shadow change may improve typed normalization or
+explanation, but passing the fixture is semantic characterization only: the checkpoint has no
+restore renderer, byte/device parity claim, Generation ID, Planning Authority, writer token,
+ownership lease, prepared/active conversion, Runtime Coordinator path, or functional-canary
+authority.
+
+Do not use the shadow work to attach or pin eBPF, touch live Flux chains, enable TUN, request kernel
+modules implicitly, load `.ko`/KPM payloads, or perform native networking mutation. The shell phase
+path continues to execute all bridge capture, policy-routing, and address-synchronization writes.
+After the focused test, run `cargo xtask ci`; renderer differential tests and real-device cutover
+qualification belong to later checkpoints.
 
 The privileged Linux functional-canary harness is an independent opt-in checkpoint and is not part
 of `cargo xtask ci`:

@@ -5,6 +5,7 @@ All notable changes to the Flux project will be documented in this file.
 ## [Unreleased]
 
 ### Bridge contract audit corrections
+- Added the bounded Phase-2 shadow Capture Program checkpoint and ADR-0010 migration boundary. Pure Rust compilation now targets deterministic, separately ordered local-OUTPUT/forwarded-ingress policy with a canonical mandatory safety baseline, optional inventory-host provenance, bounded resource accounting, semantic digest, and explicit assumptions/deferred prerequisites, while the frozen shell path remains the sole executed networking writer and compatibility oracle. Shadow artifacts have no Generation ID, Planning Authority, writer token, renderer, prepared/active conversion, Runtime Coordinator or functional-canary path, parity claim, eBPF attach/pin, TUN activation, implicit module request, or `.ko`/KPM loading; each legacy component requires an independently qualified single-writer cutover before retirement.
 - Made `fluxctl status [--json]` delegate to authoritative live `fluxd` state instead of inferring the Rust-owned Sing-Box lifecycle from the legacy PID file.
 - Completed installer migration for proxy mode, reserved TUN values, and Android multi-user scope; every backup/restore is checked, post-extraction failure restores the retained user configuration, and upgrade preservation is documented per file.
 - Restricted the shipped Phase-1 configuration to `PROXY_MODE=tproxy` and `BYPASS_SET_BACKEND=zone`; unsupported future choices now fail during configuration validation instead of being reported as active.

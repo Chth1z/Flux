@@ -9,11 +9,14 @@ This roadmap turns the [blueprint](fluxd-blueprint.md) and [technical specificat
 - Prefer vertical slices that can run on a device over broad unfinished abstractions.
 - Keep backend selection explicit until each `auto` preference has conformance evidence.
 - Do not remove a shell behavior until its Rust replacement has failure-injection and recovery tests.
+- Freeze the executed shell networking path as a compatibility oracle that receives only
+  correctness, security, release-contract, and rollback fixes; transfer one component at a time
+  and never admit a second writer during comparison.
 - Treat a real Android 5.10 device as the minimum release gate, not merely a compile target.
 
 ## Current parallel workstreams (2026-07-14)
 
-The next checkpoint is not a single linear Phase 3 task. Three bounded lanes may proceed in parallel,
+The next checkpoint is not a single linear Phase 3 task. Four bounded lanes may proceed in parallel,
 but correctness gates retain strict ordering:
 
 The 2026-07-14 code/documentation deviation audit adds one mandatory bridge-contract correction
@@ -73,8 +76,16 @@ verifier can pass.
    verifier completion chronology. Listener/report and collector/factory work follow as separate
    reviews. Cgroup-BPF is not assigned to Phase 8 until a separate TCP/UDP-complete authority design
    and exit gate exist.
-2. **Native Phase 3 correctness:** add exact device/artifact identity; select positive mark policies from a compile-time reviewed stable artifact catalog and then bind them to boot/namespace freshness; complete the remaining 24 census cells and point-in-time coordinator; prove writer semantics, observer continuity, mark preservation, domain/network-selection handoff, and route reachability; only then allocate priorities/tables/marks or mutate the kernel.
-3. **Optional eBPF implementation/probe:** implement only isolated, opt-in `xt_bpf` probe mechanics in a disposable test namespace without persistent pins, production daemon integration, Capability Profile publication, implicit module autoload, or writes to live Flux chains. The device-qualified adapter and first production-state integration land in Phase 4 after `fluxd` becomes the sole xtables writer; broader observation remains Phase 7. Positive acceleration waits for the Rust xtables compiler, a complete conventional classifier, parity evidence, and device benchmarks.
+2. **Phase 2 shadow policy:** compile the frozen compatibility semantics into a pure,
+   deterministic, backend-neutral shadow Capture Program with separate local-OUTPUT and
+   forwarded-ingress programs, a canonical mandatory safety baseline, optional snapshot-bound host
+   bypass provenance, bounded inputs/output, a stable semantic digest, and explicit
+   assumptions/deferred prerequisites. This lane performs no
+   I/O and produces no Generation ID, Planning Authority, writer token, renderer, prepared/active
+   value, Runtime Coordinator entry point, or functional-canary authority. Frozen shell fixtures
+   are characterization inputs, not a parity or activation claim.
+3. **Native Phase 3 correctness:** add exact device/artifact identity; select positive mark policies from a compile-time reviewed stable artifact catalog and then bind them to boot/namespace freshness; complete the remaining 24 census cells and point-in-time coordinator; prove writer semantics, observer continuity, mark preservation, domain/network-selection handoff, and route reachability; only then allocate priorities/tables/marks or mutate the kernel.
+4. **Optional eBPF implementation/probe:** implement only isolated, opt-in `xt_bpf` probe mechanics in a disposable test namespace without persistent pins, production daemon integration, Capability Profile publication, implicit module autoload, or writes to live Flux chains. The device-qualified adapter and first production-state integration land in Phase 4 after `fluxd` becomes the sole xtables writer; broader observation remains Phase 7. Positive acceleration waits for the Rust xtables compiler, a complete conventional classifier, parity evidence, and device benchmarks.
 
 TUN dual route ownership is P0: until `EngineOwnedTun` has one proven owner, the bridge selects exactly
 one routing owner or reports TUN unsupported.
@@ -185,17 +196,37 @@ Shell phase scripts remain the only networking-state writer. Rust owns Sing-Box 
 
 ## Phase 2 — Configuration and Generation Compiler
 
+The first Phase 2 checkpoint is deliberately narrower than a Generation compiler. It compiles
+typed compatibility inputs into an ordered shadow Capture Program, with distinct local and
+forwarded programs, canonical mandatory/configurable bypass layers, optional inventory-derived
+host bypass provenance, deterministic application and interface selectors, compile-time budgets,
+semantic version/digest, and an explanation of every compatibility assumption and deferred
+prerequisite. It is pure and observation-only. There is no
+backend restore renderer, package-to-UID discovery, kernel or filesystem access, Generation ID,
+planning or mutation authority, writer/ownership token, prepared/active conversion, coordinator
+execution path, or eBPF/TUN/module action. The shell path remains the sole executed networking
+writer and the frozen semantic oracle.
+
+This checkpoint does not discharge the Phase 2 exit gate. Oracle-derived fixtures first pin
+semantics such as RFC 6598, mandatory bypasses, empty allow/deny behavior, multi-user UIDs,
+interface matching, family/domain separation, and compatibility engine UID/GID loop bypass. A
+later bounded renderer checkpoint must compare canonical IPv4/IPv6 restore artifacts and then pass
+failure/recovery plus real-device gates before claiming xtables parity or ownership.
+
 ### Deliverables
 
 - Complete versioned config model and legacy migration command.
 - Pure Desired State normalization.
 - Network Inventory model populated from snapshots, initially without live ownership.
-- Backend-neutral Capture Policy compiler.
+- Backend-neutral Capture Policy compiler producing separate ordered local-OUTPUT and
+  forwarded-ingress programs, a canonical mandatory safety baseline, resource accounting, and a
+  stable semantic digest.
 - Two-stage Generation compiler: bounded non-authorizing candidate enumeration/scoring, followed by finalization that takes a bounded candidate-keyed Planning Evidence set by value and consumes the selected authority.
 - Generation IDs, digests, non-authorizing evidence receipts, resource budgets, dry-run candidate set, and explain/rejection output.
 - Sing-Box per-Generation overlay generation and validation.
 - Revisioned device and Sing-Box Engine Capability Profiles, with Generation planning leases invalidated by boot changes, runtime demotions, or engine binary/profile changes.
-- Golden tests proving parity with representative current rules.
+- Frozen oracle-derived semantic fixtures, followed later by renderer-level golden tests proving
+  parity with representative current rules.
 
 ### Exit gate
 
@@ -293,7 +324,10 @@ point-in-time coordination are still pending.
 
 ### Ownership rule
 
-`fluxd` becomes the only writer of Flux xtables/ipset state. `scripts/rules` and `scripts/tproxy` become unused compatibility artifacts.
+`scripts/rules` and `scripts/tproxy` remain frozen, executed compatibility-oracle components until
+the Phase 4 transition lease disables their writer path. Only then does `fluxd` become the sole
+writer of Flux xtables/ipset state and the scripts become non-executed compatibility artifacts.
+There is no shadow/native dual-writer interval.
 
 ### Exit gate
 
@@ -429,7 +463,10 @@ conventional fallback; they do not require xtables or an active `xt_bpf` acceler
 ### Pure and model tests
 
 - Config parsing and migration fixtures.
-- Capture Policy normalization and ordering.
+- Shadow Capture Policy normalization, local/forwarded ordering, canonical mandatory baseline,
+  semantic digest determinism, resource bounds, and explicit non-authorizing/deferred reports.
+- Frozen shell-oracle semantic fixtures; these characterize decisions before a renderer exists and
+  do not by themselves claim restore or device parity.
 - Backend-plan selection over generated Capability Profiles.
 - Mark-authority, routing-candidate, and collision rejection.
 - CIDR/IP set canonicalization.
@@ -530,7 +567,15 @@ Before a backend may be selected automatically, its documentation must include:
    Sing-Box owner passes route readback and forced-death cleanup canaries; then replace the
    rejection with that single proven owner. Keep `BYPASS_SET_BACKEND=zone` as the only admitted
    bridge value until the ipset/auto adapters have distinct capability and parity evidence.
-2. Continue the incomplete local-OUTPUT integration-plumbing checkpoint only after the audited
+2. Complete the bounded Phase 2 shadow Capture Program checkpoint. Keep compilation pure and
+   deterministic; emit separate ordered local/forwarded programs, the canonical mandatory safety
+   baseline, optional inventory-host provenance, bounded resource accounting, semantic digest,
+   compatibility assumptions, and deferred prerequisites. Extract semantic fixtures from the
+   frozen shell oracle, but add no restore
+   renderer, Generation ID, Planning Authority, writer token, prepared/active conversion,
+   Runtime Coordinator path, eBPF attach/pin, TUN activation, implicit module request, or `.ko`/KPM
+   loading. Treat any later renderer/parity/cutover as its own reviewed checkpoint.
+3. Continue the incomplete local-OUTPUT integration-plumbing checkpoint only after the audited
    bridge-contract correction checkpoint passes full CI. Build on the delivered fail-closed
    TPROXY-only seam, exact credential preflight, and completed capture plus process-ownership
    receipt contracts, and submit each subcheckpoint separately:
@@ -576,23 +621,23 @@ Before a backend may be selected automatically, its documentation must include:
    from logs, APIs, counters, or successful proxy traffic. REDIRECT/DNAT, ingress traffic, counters,
    route lookups, and veth-bounce paths cannot qualify TPROXY. Only after the selected backend's
    listener path is proven may the explicit Android adapter and qualification matrix proceed.
-3. Populate the release manifest with exact immutable source revisions, versions, targets, hashes,
+4. Populate the release manifest with exact immutable source revisions, versions, targets, hashes,
    licenses, device-test evidence, SBOM, checksums, and build metadata, then make the strict
    `verify-package` boundary pass. Resolve the standalone `addrsyncd` license before publication;
    do not treat development staging or unsigned self-authored evidence as a release artifact. The
    later `package-magisk` boundary must verify signed/reproducible third-party provenance and
    trusted device/CI attestations.
-4. Capture the current real-device baseline and replace every placeholder evidence field.
-5. Build and persist the exact versioned Sing-Box Engine Capability Profile before compiling any final Generation, including whether an authoritative supervised delivery-report producer exists and its exact versioned transport/framing, schema, loss/sequence, and lifecycle contract.
-6. Extend the Capability Profile with exact Android product/build/vendor, kernel-build, verified-boot, SELinux-policy, netd/Connectivity artifact, tool, and namespace identity.
-7. Define the compile-time reviewed positive mark-policy catalog over stable artifact identities, then bind selections to verified boot, boot ID, and observed namespace; never authorize an arbitrary runtime self-hashed manifest.
-8. Complete the remaining mark-evidence fragments and point-in-time 27-cell coordinator, then satisfy exact writer semantics, observer continuity, and mark-preservation canaries; do not turn planning authority into an activation lease.
-9. Redesign the RPDB program around the proven no-two-slot/default-network and tethering/per-UID constraints, satisfy domain/network-selection handoff, ownership, reachability, and canary prerequisites, and only then implement priority/table allocation.
-10. Cut over address-derived rules and PBR with a transition lease that disables the shell route writer before the first native mutation.
-11. Implement the future Rust `fluxd migrate --check-only` compatibility importer from legacy
+5. Capture the current real-device baseline and replace every placeholder evidence field.
+6. Build and persist the exact versioned Sing-Box Engine Capability Profile before compiling any final Generation, including whether an authoritative supervised delivery-report producer exists and its exact versioned transport/framing, schema, loss/sequence, and lifecycle contract.
+7. Extend the Capability Profile with exact Android product/build/vendor, kernel-build, verified-boot, SELinux-policy, netd/Connectivity artifact, tool, and namespace identity.
+8. Define the compile-time reviewed positive mark-policy catalog over stable artifact identities, then bind selections to verified boot, boot ID, and observed namespace; never authorize an arbitrary runtime self-hashed manifest.
+9. Complete the remaining mark-evidence fragments and point-in-time 27-cell coordinator, then satisfy exact writer semantics, observer continuity, and mark-preservation canaries; do not turn planning authority into an activation lease.
+10. Redesign the RPDB program around the proven no-two-slot/default-network and tethering/per-UID constraints, satisfy domain/network-selection handoff, ownership, reachability, and canary prerequisites, and only then implement priority/table allocation.
+11. Cut over address-derived rules and PBR with a transition lease that disables the shell route writer before the first native mutation.
+12. Implement the future Rust `fluxd migrate --check-only` compatibility importer from legacy
     `settings.ini`/`addrsyncd.toml`, distinct from the completed shell installer migration, and
     extract current rule-generation cases into backend-neutral golden fixtures.
-12. Implement only isolated `xt_bpf` probe mechanics in parallel. Do not attach from the production
+13. Implement only isolated `xt_bpf` probe mechanics in parallel. Do not attach from the production
     daemon, publish device capability, retain pins, trigger implicit module loading, or modify live Flux chains while shell
     remains the bridge writer. Wire the device-qualified compiler adapter in Phase 4, and keep
     broader eBPF observation in Phase 7 without delaying correctness work or selecting acceleration

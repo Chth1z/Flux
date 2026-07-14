@@ -38,3 +38,4 @@
 - [ADR-0007: respect Android VPN policy](adr/0007-respect-android-vpn-policy-by-default.md)
 - [ADR-0008: minimal Controller, internal planner](adr/0008-minimal-controller-with-internal-strategy-planner.md)
 - [ADR-0009: do not make Flux a kernel-module loader](adr/0009-do-not-make-flux-a-kernel-module-loader.md)
+- [ADR-0010: freeze shell networking as a shadow-compiler oracle](adr/0010-freeze-shell-networking-as-a-shadow-compiler-oracle.md)

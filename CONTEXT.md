@@ -38,6 +38,14 @@ _Avoid_: Rule bucket, interface case
 The ordered decisions that determine whether in-scope traffic is sent to the Proxy Engine or continues directly.
 _Avoid_: Firewall rules, routing script
 
+**Capture Program**:
+A deterministic backend-neutral compilation of Capture Policy into separate ordered local-OUTPUT and forwarded-ingress programs, with a canonical mandatory safety baseline, optional inventory-host provenance, bounded resources, and a semantic digest. A Capture Program describes decisions; a backend renderer and an authorized Generation are still required before it can become device state.
+_Avoid_: Restore file, active rules
+
+**Shadow Capture Artifact**:
+An observation-only Phase 2 Capture Program used to explain and compare compatibility semantics before a native renderer or activation path exists. It has no Generation ID, Planning Authority, writer token, ownership lease, prepared/active conversion, or functional-canary authority.
+_Avoid_: Dry-run Generation, staged rules
+
 **Bypass Policy**:
 The portion of Capture Policy that identifies traffic which remains direct. It distinguishes mandatory loop/device-local safety exclusions from configurable private, CGNAT, and other special-use direct defaults.
 _Avoid_: Exclusion list, direct rules
@@ -49,6 +57,10 @@ _Avoid_: Proxy mode, rule backend
 **Proxy Engine**:
 The data-plane program that accepts captured traffic and executes proxy, DNS, and outbound-routing behavior.
 _Avoid_: Core, daemon
+
+**Compatibility Oracle**:
+The frozen, still-executed shell networking implementation and its pinned semantic fixtures used to review Rust replacement behavior during the bridge releases. It remains the sole networking writer until ownership transfers through a component-specific cutover gate; it is not the final architecture.
+_Avoid_: Second backend, permanent shell path
 
 ## Device model
 

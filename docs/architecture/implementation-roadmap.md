@@ -213,6 +213,21 @@ interface matching, family/domain separation, and compatibility engine UID/GID l
 later bounded renderer checkpoint must compare canonical IPv4/IPv6 restore artifacts and then pass
 failure/recovery plus real-device gates before claiming xtables parity or ownership.
 
+The bounded oracle checkpoint now pins the shell/AWK byte output without widening that authority. A
+separate `cargo xtask xtables-oracle --check` verifies four raw IPv4/IPv6 apply/cleanup fixtures;
+the explicit `--update` mode is the reviewed regeneration path. The environment is bound to the
+BusyBox `linux/amd64` OCI manifest
+`sha256:dfb66b2b3e6981fefa54fd2cd4faf662c35b4a4baeff48295a9409ddf3224c48` and `/bin/busybox`
+SHA-256 `c984eacc3b736fe1eeefe201f21b241932ef4c3c03fbb6869a4f156f32dd9716`. Its networkless
+container has a read-only image root and receives only the exact bounded input snapshot over
+stdin; it never mounts the host workspace, invokes restore tools, or accesses live networking.
+Normal `cargo xtask ci` excludes it; a separate CI job explicitly pulls the exact image digest and
+then runs `--check` with pulling disabled inside the runner.
+
+This profile does not run configuration/kernel detection and does not cover QUIC, PBR, or forced
+cleanup. The fixtures are not kernel-acceptance or Android/Magisk-parity evidence and add no
+renderer, Generation, ownership, writer, prepared/active, coordinator, or activation path.
+
 ### Deliverables
 
 - Complete versioned config model and legacy migration command.
@@ -315,6 +330,17 @@ each restore transaction. The parser performs no shell execution,
 filesystem discovery, restore invocation, kernel access, Generation conversion, ownership, or
 activation. Its current-shaped synthetic tests are grammar tests, not shell-generated fixture,
 renderer, byte-parity, kernel-acceptance, cleanup-completeness, or device-parity evidence.
+
+The bounded shell-oracle companion records exactly four raw cache artifacts: IPv4/IPv6 apply and
+IPv4/IPv6 cleanup. `cargo xtask xtables-oracle --check` regenerates them in the pinned BusyBox
+`linux/amd64` environment and rejects byte or manifest drift; only an explicit reviewed
+`--update` rewrites them. The container has no network, privilege, host-workspace mount, live
+networking access, or restore execution; only the exact bounded input snapshot is streamed into
+private tmpfs. Its inputs are the frozen rule generator, semantic shell test, oracle driver,
+reviewed environment cache, and package-list cache—not device configuration or kernel discovery.
+Consequently the checkpoint excludes QUIC, PBR, forced-cleanup behavior,
+kernel acceptance, Android/Magisk parity, and every renderer/Generation/ownership/activation
+claim. It is a separate CI job and is intentionally absent from normal `cargo xtask ci`.
 
 ### Deliverables
 

@@ -105,10 +105,42 @@ bounds, canonical round-trip bytes, and digest identity. It performs no filesyst
 restore invocation, kernel access, or mutation.
 
 Passing this test does not establish that `scripts/rules` generated the bytes, that the kernel
-accepts them, that cleanup is complete, or that a Rust Capture renderer has parity. Raw oracle
-fixtures must be generated later in a hermetic, digest-pinned shell/AWK environment and compared in
-a separate job; normal `cargo xtask ci` only parses checked-in or synthetic bytes and never invokes
-live networking tools.
+accepts them, that cleanup is complete, or that a Rust Capture renderer has parity. The bounded raw
+cache-artifact oracle is a separate, explicit workflow:
+
+```text
+docker pull --platform=linux/amd64 docker.io/library/busybox@sha256:dfb66b2b3e6981fefa54fd2cd4faf662c35b4a4baeff48295a9409ddf3224c48
+cargo xtask xtables-oracle --check
+# After reviewing an intentional oracle-input change:
+cargo xtask xtables-oracle --update
+```
+
+Both modes require a Linux Docker host with that exact image already present. The runner uses
+`--pull=never`; its manifest additionally binds the reviewed
+`busybox:1.37.0-uclibc` source index, `linux/amd64` layer, BusyBox version banner, and exact
+`/bin/busybox` SHA-256
+`c984eacc3b736fe1eeefe201f21b241932ef4c3c03fbb6869a4f156f32dd9716`. Generation runs as an
+unprivileged user with all capabilities dropped, a read-only image root, `no-new-privileges`, and
+no container network. The runner reads the five bounded inputs once, hashes and archives those
+exact bytes, and streams only that snapshot into private tmpfs; it never mounts the host workspace.
+The dedicated GitHub Actions job performs the one explicit registry pull before `--check`;
+generation itself does not access the network, inspect or mutate live networking state, or invoke
+`iptables-restore`/`ip6tables-restore`.
+
+The `maximal-zone-v1` profile emits exactly four raw files:
+`maximal-zone-v1-ipv4-apply.restore`, `maximal-zone-v1-ipv4-cleanup.restore`,
+`maximal-zone-v1-ipv6-apply.restore`, and `maximal-zone-v1-ipv6-cleanup.restore`. It is driven only
+by the checked-in `scripts/rules`, semantic shell test, generator, environment cache, and
+package-list cache recorded in the manifest. `--check` rejects input, environment, fixture-byte,
+hash, size, line-count, or inventory drift. `--update` is the deliberate review path for rewriting
+the four fixtures and their input/fixture metadata; it cannot alter or bless the compile-time
+approved OCI, layer, binary, or version pins. Neither mode is part of normal `cargo xtask ci`.
+
+These files characterize only that bounded cache-input profile. They do not run configuration or
+kernel capability detection and do not cover QUIC, policy-based routing, or forced cleanup; the
+cleanup pair records the shell generator's ordinary `-D` form. They prove neither kernel
+acceptance nor Android/Magisk-device parity, and they create no Capture renderer, Generation,
+writer/ownership authority, prepared/active conversion, coordinator path, or activation claim.
 
 The privileged Linux functional-canary harness is an independent opt-in checkpoint and is not part
 of `cargo xtask ci`:

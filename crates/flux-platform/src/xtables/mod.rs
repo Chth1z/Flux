@@ -1,4 +1,9 @@
+mod render;
 mod restore;
+
+pub use render::{
+    LegacyRulesPlan, LegacyRulesRenderError, LegacyRulesRenderRequest, render_legacy_rules_restore,
+};
 
 pub use restore::{
     MAX_XTABLES_RESTORE_BYTES, MAX_XTABLES_RESTORE_CHAIN_BYTES, MAX_XTABLES_RESTORE_COMMANDS,

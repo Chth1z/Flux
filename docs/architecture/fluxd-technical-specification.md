@@ -34,12 +34,15 @@ fluxd plan [--json] [--dry-run]
 fluxd subscription update
 fluxd diagnose [--bundle PATH]
 fluxd repair
-fluxd migrate [--check|--write]
+fluxd migrate --check-only
 fluxd recover --offline
 fluxd cleanup --offline
 ```
 
-`fluxctl` is a symlink or a small shell wrapper that executes the same binary.
+The target-state `fluxctl` is a symlink or a small shell wrapper that executes the same binary. In
+the delivered Phase 1 bridge, the shell wrapper delegates authoritative status and every mutating
+control to `fluxd`, while `diagnose`, rule preview, logs, and other compatibility observations still
+use legacy read-only paths.
 
 Only `fluxd daemon` is long-lived. Sing-Box is its child. A boot shell watchdog may restart `fluxd` after a crash or fatal invariant exit, but it contains no policy logic, never invokes a second recovery owner, and does not restart a settled `UnsupportedKernel` daemon. Normal journal recovery runs inside daemon startup before mutating commands are accepted. `fluxd recover --offline` is an explicit salvage command that requires the daemon lease to be absent. The legacy `fluxctl restart` verb is a client alias for `ReloadSources` followed by `Converge(Configured)`; it has no separate protocol or lifecycle meaning.
 
@@ -449,7 +452,7 @@ The catalog is evidence and optimization, not final authority. Exact introductio
 | nftables base support | create/delete uniquely named temporary table in one batch |
 | nftables required program | create a non-matching canary in the real hook context using the exact set lookup, counter, masked mark update, socket-transparent match, TCP/UDP TPROXY expressions, and one batch; list/normalize it, then delete and verify absence |
 | xtables TPROXY path | detect legacy versus nft variants, require coherent IPv4/IPv6 restore tools, then apply/verify/clean a private chain with the exact matches and targets |
-| `xt_bpf` | create/update required maps, load and pin the exact socket-filter programs, reference them with the selected iptables revision-1 `--object-pinned` extension in private IPv4/IPv6 OUTPUT/PREROUTING canary chains, send packets, validate UID/context/counters including ambiguous `overflowuid`, remove rules before unpinning, and verify cleanup |
+| `xt_bpf` | first prove the match is built in or already active without triggering `request_module`; then create/update required maps, load and pin the exact socket-filter programs, reference them with the selected iptables revision-1 `--object-pinned` extension in private IPv4/IPv6 OUTPUT/PREROUTING canary chains, send packets, validate UID/context/counters including ambiguous `overflowuid`, remove rules before unpinning, and verify cleanup |
 | ipset | create, populate, swap, and destroy temporary family-specific sets |
 | TUN | open device, create unique non-persistent interface, query flags, close, verify removal |
 | eBPF map types | create each required map type and close it |
@@ -467,7 +470,7 @@ Probe objects carry an RAII cleanup guard. A process crash may still leave kerne
 
 ### 6.4 Engine Capability Profile
 
-Before Generation compilation, Flux queries and validates the exact Sing-Box binary and builds an `EngineCapabilityProfile` containing an immutable revision, binary digest, parsed version/build identity, supported configuration dialect, TPROXY listener staging, TUN route-automation control, `system`/`mixed`/`gvisor` stacks, mark/interface controls, DNS fields, reload behavior, and any documented FD-handoff contract. The planner rejects plans whose engine requirements are not proven even when the kernel path is available.
+Before Generation compilation, Flux queries and validates the exact Sing-Box binary and builds an `EngineCapabilityProfile` containing an immutable revision, binary digest, parsed version/build identity, supported configuration dialect, TPROXY listener staging, TUN route-automation control, `system`/`mixed`/`gvisor` stacks, mark/interface controls, DNS fields, reload behavior, any documented FD-handoff contract, and any authoritative supervised delivery-report producer. A report capability is positive only when it binds the exact producer process, transport and framing, schema revision, sequence/loss behavior, attempt-owned object lifecycle, and shutdown/cleanup semantics to that immutable engine artifact; ordinary logs, management APIs, or observed proxy success are not assumed to satisfy it. The planner rejects plans whose engine requirements are not proven even when the kernel path is available.
 
 Every `CompiledGeneration` records both the device `CapabilityProfileRevision` and the `EngineCapabilityProfileRevision` used by the planner. A boot change, runtime capability demotion, Sing-Box binary replacement, or engine-profile refresh invalidates the planning lease: Flux must recompile or explicitly prove that the active Generation's requirements are still satisfied before repairing or reactivating it.
 
@@ -1037,7 +1040,9 @@ through the actual socket observations. No production required-mode context exis
 ### 14.2 Functional-canary schema-v2 listener delivery
 
 The internal functional-canary evidence model is schema v2. The control protocol remains v3, the
-supervised inbound-delivery report is independently schema v1, and `flux.toml` remains schema v1.
+supervised inbound-delivery report validation format is independently schema v1, and `flux.toml`
+remains schema v1. The schema defines evidence admission; it does not establish that the selected
+engine artifact actually exposes an authoritative report producer.
 Request construction selects TPROXY only. `REDIRECT` and `DNAT` values are negative evidence used
 to reject backend substitution, not supported request backends.
 
@@ -1133,9 +1138,12 @@ Its process identities and retirements now require the process-ownership receipt
 boundary, but production cannot mint that receipt until `EngineSupervisor` exposes authority from
 its retained `SingBoxChild` and a real prepared driver retains, waits, and retires its client/peer
 children. A positive factory also remains prohibited until one concrete capture verifier authority
-proves the local-OUTPUT traffic domain, a real listener observer and supervised report
-parser/factory exist, and the delivered prebound socket-diagnostics handoff performs actual
-collection under its exact collector identity/revision.
+proves the local-OUTPUT traffic domain, the immutable `EngineCapabilityProfile` declares the exact
+supervised report producer contract, a real listener observer and report parser/factory exist, and
+the delivered prebound socket-diagnostics handoff performs actual collection under its exact
+collector identity/revision. Until both the capture mechanism and report producer are qualified,
+the integration-plumbing slice must return `Unsupported` even if every handle, parser, and cleanup
+test passes.
 Qualified cgroup-BPF remains an alternative only after its independent attachment, identity, loss,
 report-object never-created/absence disposition, and lifecycle contract are proven. Production
 daemon composition remains `StructuralOnlyCompatibility`. Ordinary BPF counters or sampled events
@@ -1296,20 +1304,51 @@ Higher-level async tasks communicate through bounded channels. `io_uring` is a s
 
 ### 19.2 `xtask`
 
-Required commands:
+The current bridge implements a deliberately split boundary:
 
 ```text
 cargo xtask build-android
+cargo xtask stage-module --stage <dir> --runtime-binaries <dir>
+cargo xtask verify-package --stage <dir>
+```
+
+`stage-module` creates a development tree and does not claim release compliance. `verify-package`
+is a strict release-candidate consistency boundary. It requires a clean root worktree and clean
+`addrsyncd` submodule, binds their manifest revisions to the exact Git HEADs, byte-compares the
+reviewed source-owned module inventory, and rejects every package file outside the exact four
+binaries, reviewed module files, declared evidence, and release metadata. Required binaries must
+be ELF64 little-endian AArch64 with a bounded file-backed executable entry, congruent load segments,
+and either no interpreter or an Android linker path. Manifest sources require a well-formed HTTPS
+host/path, immutable revision, version, target, artifact hash, and a recognized SPDX identifier or
+explicitly reviewed `LicenseRef`. Schema-1 device evidence is hashed and bound to the exact source
+revision plus operational-payload digest, Android build fingerprint, kernel 5.10+ release, boot ID,
+verified-boot state, enforcing SELinux, capture time, and the exact required passed test-ID set.
+That set is `module_boot`, `status`, `enable_disable`, `restart`, `abnormal_sing_box_exit`,
+`dual_stack_tcp_udp_dns`, and `cleanup`.
+SPDX-2.3 package/`documentDescribes` inventories, IDs, and single SHA-256 records must exactly match
+the manifest. Pinned Rust/NDK/target build metadata and complete recursive package checksums are
+also required. Symbolic links, special files, unsafe paths, hidden or ordinary `.ko`/`.kpm` names,
+and unreviewed Magisk root payloads fail.
+
+This command does not authenticate self-authored third-party provenance or unsigned device JSON.
+A pass is necessary but not sufficient for publication until the later `package-magisk` task
+verifies signed/reproducible third-party provenance and trusted device/CI attestations. The
+checked-in manifest intentionally retains blank third-party release fields, so an unqualified
+development stage must fail this command.
+
+The target release toolchain still requires the remaining commands below as later Phase 0/4/7
+deliverables:
+
+```text
 cargo xtask build-ebpf
 cargo xtask test-linux
 cargo xtask package-magisk
-cargo xtask verify-package
 cargo xtask device-test --serial <adb-serial>
 ```
 
-The packaging task fails if binary source, version, target, hash, license, or required device-test evidence is missing.
-It also rejects `.ko`, KPM, or other opaque kernel payloads in a production artifact. Production
-`fluxd` does not call `init_module`, `finit_module`, or `delete_module`.
+The final packaging task must additionally reject KPM or any other opaque kernel payload form that
+cannot be classified by the current extension checks. Production `fluxd` does not call
+`init_module`, `finit_module`, or `delete_module`.
 
 ## 20. Compatibility and removal schedule
 

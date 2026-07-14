@@ -35,6 +35,39 @@ readonly SCRIPTS_DIR="${FLUX_DIR}/scripts"
 readonly RUN_DIR="${FLUX_DIR}/run"
 readonly MODPROP="${MODPATH}/module.prop"
 
+INSTALL_BACKUP_DIR=""
+INSTALL_RESTORE_CONFIG_ON_EXIT=0
+
+_restore_install_backup() {
+    local backup_dir="${1}"
+    local target_conf_dir="${2}"
+    local file=""
+    local failed=0
+
+    [ -d "${backup_dir}" ] || return 0
+    mkdir -p "${target_conf_dir}" 2>/dev/null || return 1
+    for file in flux.toml settings.ini template.json addrsyncd.toml; do
+        [ -f "${backup_dir}/${file}" ] || continue
+        cp -f "${backup_dir}/${file}" "${target_conf_dir}/${file}" || failed=1
+    done
+    [ "${failed}" -eq 0 ]
+}
+
+_installer_cleanup() {
+    if [ "${INSTALL_RESTORE_CONFIG_ON_EXIT}" = "1" ]; then
+        if _restore_install_backup "${INSTALL_BACKUP_DIR}" "${CONF_DIR}"; then
+            ui_print "! Installation failed; restored the previous configuration"
+        else
+            ui_print "! Installation failed and previous configuration restore was incomplete"
+            ui_print "! Backup retained at: ${INSTALL_BACKUP_DIR}"
+            rm -rf "${FLUX_DIR}/tmp" 2>/dev/null || true
+            return 0
+        fi
+    fi
+    [ -z "${INSTALL_BACKUP_DIR}" ] || rm -rf "${INSTALL_BACKUP_DIR}"
+    rm -rf "${FLUX_DIR}/tmp" 2>/dev/null || true
+}
+
 # ==============================================================================
 # [ Installer UI Helpers ]
 # ==============================================================================
@@ -115,7 +148,8 @@ _choose_action() {
 # Incremental settings migration logic to preserve user configuration across updates.
 # Implementation Note: Uses AWK to safely extract values from existing .ini files,
 # supporting multi-line quoted values and ensuring atomic replacement in the new config.
-# Note: CORE_TIMEOUT, PROXY_TCP_PORT, PROXY_UDP_PORT, DNS_PORT are now read from config.json
+# PROXY_PORT and FakeIP ranges are derived from config.json and intentionally
+# retain the packaged defaults until the regenerated runtime config is read.
 readonly MIGRATE_KEYS="
 SUBSCRIPTION_URL
 UPDATE_TIMEOUT
@@ -136,9 +170,16 @@ PROXY_WIFI
 PROXY_HOTSPOT
 PROXY_USB
 PROXY_IPV6
+PROXY_MODE
+TUN_INTERFACE
+TUN_INET4_ADDRESS
+TUN_INET6_ADDRESS
+TUN_MTU
 ROUTING_MARK
 APP_PROXY_MODE
 APP_LIST
+APP_USER_SCOPE
+APP_USER_LIST
 MSS_CLAMP_ENABLE
 BLOCK_QUIC
 MARK_MASK
@@ -164,7 +205,7 @@ _migrate_settings() {
 
     ui_print "  > Migrating settings (incremental)..."
 
-    tmp_file=$(mktemp) || return 1
+    tmp_file=$(mktemp "${target_file}.tmp.XXXXXX") || return 1
     awk -v keys="${MIGRATE_KEYS}" '
         function trim(s) {
             sub(/^[[:space:]]+/, "", s)
@@ -182,7 +223,6 @@ _migrate_settings() {
             n = split(keys, arr, /[[:space:]]+/)
             for (i = 1; i <= n; i++) if (arr[i] != "") keep[arr[i]] = 1
 
-            phase = 0
             in_bq = 0
             bq_key = ""
             bq_quote = ""
@@ -191,10 +231,7 @@ _migrate_settings() {
             skip_target = 0
             target_quote = ""
         }
-        FNR == 1 {
-            phase++
-        }
-        phase == 1 {
+        FILENAME == ARGV[1] {
             line = $0
 
             if (!in_bq) {
@@ -229,7 +266,7 @@ _migrate_settings() {
             }
             next
         }
-        phase == 2 {
+        FILENAME == ARGV[2] {
             line = $0
 
             if (skip_target) {
@@ -275,7 +312,10 @@ _migrate_settings() {
         return 1
     fi
 
-    mv -f "${tmp_file}" "${target_file}"
+    mv -f "${tmp_file}" "${target_file}" || {
+        rm -f "${tmp_file}"
+        return 1
+    }
     ui_print "     ↳ settings.ini: restored"
     return 0
 }
@@ -291,9 +331,10 @@ main() {
     local tmp_backup
     tmp_backup=$(mktemp -d 2>/dev/null) || abort "! Failed to create temporary backup directory"
     mkdir -p "${tmp_backup}"
+    INSTALL_BACKUP_DIR="${tmp_backup}"
 
-    # Ensure cleanup on exit (Use double quotes to expand tmp_backup immediately)
-    trap "rm -rf \"${tmp_backup}\"; rm -rf \"${FLUX_DIR}/tmp\" 2>/dev/null" EXIT INT TERM
+    trap '_install_rc=$?; trap - EXIT; _installer_cleanup; exit "${_install_rc}"' EXIT
+    trap 'exit 130' INT TERM
 
     local has_flux_config=false has_settings=false has_template=false has_addrsyncd=false
 
@@ -307,17 +348,20 @@ main() {
         fi
         # Backup settings.ini (will auto-migrate)
         if [ -f "${CONF_DIR}/settings.ini" ]; then
-            cp -f "${CONF_DIR}/settings.ini" "${tmp_backup}/settings.ini"
+            cp -f "${CONF_DIR}/settings.ini" "${tmp_backup}/settings.ini" ||
+                abort "! Failed to back up settings.ini"
             has_settings=true
         fi
         # Backup template.json template (user choice)
         if [ -f "${CONF_DIR}/template.json" ]; then
-            cp -f "${CONF_DIR}/template.json" "${tmp_backup}/template.json"
+            cp -f "${CONF_DIR}/template.json" "${tmp_backup}/template.json" ||
+                abort "! Failed to back up template.json"
             has_template=true
         fi
         # Backup addrsyncd.toml (user choice)
         if [ -f "${CONF_DIR}/addrsyncd.toml" ]; then
-            cp -f "${CONF_DIR}/addrsyncd.toml" "${tmp_backup}/addrsyncd.toml"
+            cp -f "${CONF_DIR}/addrsyncd.toml" "${tmp_backup}/addrsyncd.toml" ||
+                abort "! Failed to back up addrsyncd.toml"
             has_addrsyncd=true
         fi
     fi
@@ -340,6 +384,7 @@ main() {
     # Clear cache to prevent rule inheritance issues on version mismatch
     rm -rf "${FLUX_DIR}/cache" 2>/dev/null
 
+    INSTALL_RESTORE_CONFIG_ON_EXIT=1
     unzip -o "${ZIPFILE}" 'bin/*' 'scripts/*' 'conf/*' -d "${FLUX_DIR}" >&2 || abort "! Failed to extract module files"
     [ -f "${BIN_DIR}/fluxd" ] || abort "! Required binary missing from module ZIP: bin/fluxd"
     # Rename default if template was extracted as singbox.json (for zip compatibility)
@@ -361,7 +406,8 @@ main() {
     # 4.2 settings.ini - Auto migrate
     if [ "${has_settings}" = "true" ]; then
         ui_print "- Migrating settings.ini..."
-        _migrate_settings "${tmp_backup}/settings.ini" "${CONF_DIR}/settings.ini"
+        _migrate_settings "${tmp_backup}/settings.ini" "${CONF_DIR}/settings.ini" ||
+            abort "! Failed to migrate settings.ini"
     else
         ui_print "- Using default settings.ini"
     fi
@@ -369,7 +415,8 @@ main() {
     # 4.3 template.json - User choice
     if [ "${has_template}" = "true" ]; then
         if _choose_action "Keep [template.json]?" "true"; then
-            cp -f "${tmp_backup}/template.json" "${CONF_DIR}/template.json"
+            cp -f "${tmp_backup}/template.json" "${CONF_DIR}/template.json" ||
+                abort "! Failed to restore template.json"
             ui_print "  > template.json: restored"
         else
             ui_print "  > template.json: reset to default"
@@ -379,7 +426,8 @@ main() {
     # 4.4 addrsyncd.toml - User choice
     if [ "${has_addrsyncd}" = "true" ]; then
         if _choose_action "Keep [addrsyncd.toml]?" "true"; then
-            cp -f "${tmp_backup}/addrsyncd.toml" "${CONF_DIR}/addrsyncd.toml"
+            cp -f "${tmp_backup}/addrsyncd.toml" "${CONF_DIR}/addrsyncd.toml" ||
+                abort "! Failed to restore addrsyncd.toml"
             ui_print "  > addrsyncd.toml: restored"
         else
             ui_print "  > addrsyncd.toml: reset to default"
@@ -398,7 +446,9 @@ main() {
     chmod ugo+x "${SCRIPTS_DIR}"/* 2>/dev/null || abort "! Failed to set executable bits for scripts"
 
     # 6. Cleanup
+    INSTALL_RESTORE_CONFIG_ON_EXIT=0
     rm -rf "${tmp_backup}"
+    INSTALL_BACKUP_DIR=""
     rm -rf "${FLUX_DIR}/tmp" 2>/dev/null || abort "! Failed to clean temporary files"
 
     ui_success "Installation Complete!"

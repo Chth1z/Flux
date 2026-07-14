@@ -2,6 +2,17 @@
 
 All notable changes to the Flux project will be documented in this file.
 
+## [Unreleased]
+
+### Bridge contract audit corrections
+- Made `fluxctl status [--json]` delegate to authoritative live `fluxd` state instead of inferring the Rust-owned Sing-Box lifecycle from the legacy PID file.
+- Completed installer migration for proxy mode, reserved TUN values, and Android multi-user scope; every backup/restore is checked, post-extraction failure restores the retained user configuration, and upgrade preservation is documented per file.
+- Restricted the shipped Phase-1 configuration to `PROXY_MODE=tproxy` and `BYPASS_SET_BACKEND=zone`; unsupported future choices now fail during configuration validation instead of being reported as active.
+- Corrected the English and Chinese lifecycle, installed-layout, setting-name/default, and TPROXY-listener documentation.
+- Split development module staging from strict release-candidate verification. `cargo xtask verify-package --stage <dir>` now binds clean root/submodule HEADs, exact source/package/binary inventories, reviewed licenses, file-backed AArch64 executable entries and Android interpreters, exact SPDX membership/checksums, payload/device/test-bound evidence, pinned build metadata, and recursive checksums; it rejects unreviewed Magisk root files, symlinks, and hidden or ordinary `.ko`/`.kpm` payloads. Signed third-party and device attestations remain a later publication gate.
+- Removed the misleading one-shot `addrsyncd cleanup --mode tracked` surface; tracked cleanup remains owned by a live daemon during `stop`, while manual stale-rule cleanup uses the kernel dump.
+- Re-gated the next local-OUTPUT canary as fail-closed integration plumbing until a concrete TPROXY capture mechanism and authoritative engine report producer are device-qualified; confined near-term `xt_bpf` work to isolated no-autoload test probes until Rust owns xtables state.
+
 ## [v1.5.0-alpha.1] - 2026-07-11
 
 ### Rust control-plane bridge

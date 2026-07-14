@@ -42,7 +42,7 @@ eBPF is a first-class optional plane with two stages: observability first, then 
 - Reimplementing Sing-Box protocols or embedding its Go runtime into `fluxd`.
 - Making XDP the transparent-proxy mechanism.
 - Treating a kernel version, `/proc/config.gz`, a binary on `PATH`, or a loaded module as proof that a feature is usable.
-- Shipping or automatically loading `.ko`, KPM, or other kernel payloads as a compatibility backend.
+- Shipping or automatically loading `.ko`, KPM, or other opaque kernel-module payloads as a compatibility backend.
 - Taking ownership of Android netd or vendor-created rules and routes.
 - Supporting kernels older than 5.10, even when individual required syscalls appear to work.
 - Shipping an eBPF-only Capture Path before correctness parity and device coverage exist.
@@ -818,7 +818,7 @@ Online socket/client commands:
 - `subscription update`
 - `diagnose [--bundle]`
 - `repair`
-- `migrate [--check|--write]`
+- `migrate --check-only` (initial compatibility importer; mutating migration remains deferred)
 
 Offline multicall commands, which are not routed over the live daemon socket:
 

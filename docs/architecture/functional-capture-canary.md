@@ -524,16 +524,21 @@ functional pass.
    validates stable process-wide thread credentials, distinguishes exit from parent reap, and is
    exercised by the no-traffic credential preflight. Production receipt authority remains
    uninhabited: `EngineSupervisor`/`SingBoxChild` and real driver child integration are still open.
-13. Add a separate positive local-OUTPUT qualification slice using the delivered credential,
+13. Add a separate local-OUTPUT integration-plumbing slice using the delivered credential,
    handle, receipt, and handoff plumbing; integrate a real attempt context with the retained
    `SingBoxChild` plus driver-owned client/peer children; add a listener observer plus
-   delivery-report schema-v1 parser/factory, actual prebound
-   collector-session observations, a real traffic producer, and the completed schema-v2
-   `validate_for` path. A
+   delivery-report schema-v1 parser interface, actual prebound collector-session observations, and
+   the completed schema-v2 `validate_for` path with test-only fixtures. Production must continue to
+   report `unsupported` and cannot mint either receipt until one concrete device-supported
+   local-OUTPUT capture mechanism preserves TPROXY listener semantics and the immutable
+   `EngineCapabilityProfile` declares an authoritative report producer with exact source,
+   transport/framing, schema, sequence/loss, and object-lifecycle semantics. Stock engine logs or
+   APIs are not evidence unless that capability contract explicitly qualifies them. A
    separately qualified cgroup-eBPF observer may replace
    the report only after its own authority and loss contract is proven. REDIRECT/DNAT delivery
    cannot qualify a TPROXY Generation; an adapter without a qualifying TPROXY listener path reports
-   `unsupported`. This slice must not weaken the model to accommodate the ingress checkpoint.
+   `unsupported`. This slice must not weaken the model to accommodate the ingress checkpoint or be
+   renamed positive merely because its process and observer plumbing is complete.
 14. Add an Android lab adapter that reports explicit `unsupported`, `denied`, `conflicting`,
    `broken`, or `unknown` evidence. It remains diagnostic-only until exact-device qualification.
 15. Permit TPROXY `RUNNING` only for reviewed device profiles whose functional canary passes the

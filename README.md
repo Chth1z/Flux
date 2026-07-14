@@ -4,324 +4,240 @@
 
 > Seamlessly redirect your network Flux.
 
-A powerful Android transparent proxy module powered by [sing-box](https://sing-box.sagernet.org/), designed for Magisk / KernelSU / APatch.
+Flux is an Android transparent-proxy module for Magisk, KernelSU, and APatch. It uses
+[sing-box](https://sing-box.sagernet.org/) as an external proxy engine and is being migrated to a
+single Rust controller, `fluxd`.
 
-## Features
+## Current release contract
 
-### Core Components
-- **sing-box Integration**: Uses sing-box as the core proxy engine
-- **Built-in Subscription Converter**: Automatic subscription conversion and node filtering
-- **jq Processor**: JSON manipulation for configuration generation
+The current branch is a Phase-1 bridge, not the completed native rewrite:
 
-### Architecture & Optimization
-- **SRI (Selective Routing Injector)**: Unified AWK engine combining initial sync and real-time monitoring with three-layer IP filtering for zero-redundancy rule operations
-- **High-Performance Packet Funnel**: Triple-layer filtering (Physical Bypass → Stateful Direct → Bounded Goto Skeleton) for a predictable in-kernel processing path
-- **Bounded Goto Skeleton**: Large CIDR/IP bypass lists use canonicalized custom CIDRs, a fixed-level goto tree, and hard chain budgets to keep pure-iptables fallback stable
-- **inotify-Based Cache**: Real-time configuration monitoring with instant cache invalidation
-- **Atomic Reliability**: 100% data integrity via temp-and-swap strategy for all critical operations
+- `fluxd` owns administrative intent, serialized lifecycle, Generation recovery, and the Sing-Box
+  child process.
+- Shell adapters remain the sole writers of iptables policy routing and address-derived rules.
+- The shipped bridge accepts only `PROXY_MODE="tproxy"`. TUN fields are reserved for a future
+  single-owner implementation and are rejected before activation.
+- Production capture verification is still structural. The stricter functional local-OUTPUT
+  canary exists as staged development work but is not yet an Android release qualification.
+- Kernels below 5.10 remain queryable in a non-mutating read-only state.
+- eBPF is optional future observation/acceleration work. Flux packages no `.ko`, KPM, or opaque
+  kernel-module payload and invokes no explicit module-loading API. The legacy shell bridge has not
+  yet proved that every xtables dependency is already active without implicit kernel autoload.
 
-### Proxy Modes
-- **TPROXY**: High-performance, protocol-agnostic transparent proxying (TCP/UDP).
-- **Smart Extraction**: Automatically parses sing-box `config.json` for `mixed`/`tproxy` inbounds and ports.
+The detailed design and current gates are documented under [`docs/`](docs/README.md).
 
-### Network Support
-- **Dual-Stack**: Full IPv4 and IPv6 proxy support
-- **DNS Hijacking**: TProxy/Redirect mode DNS interception
-- **FakeIP ICMP Fix**: Enables ping to work correctly with FakeIP DNS
+## Capabilities
 
-### Interface Control
-Independent proxy switches for each network interface:
-- Mobile Data (`rmnet_data+`)
-- Wi-Fi (`wlan0`)
-- Hotspot (`wlan2`)
-- USB Tethering (`rndis+`)
+- Dual-stack TCP/UDP TPROXY compatibility path.
+- Interface controls for mobile data, Wi-Fi, hotspot, and USB tethering.
+- UID-based application allow/deny policy with Android user/profile scope.
+- Dynamic address-rule reconciliation through the standalone bridge `addrsyncd`.
+- Generation-scoped configuration snapshots, bounded rollback, and startup recovery.
+- Subscription download, filtering, template merge, and Sing-Box validation.
+- CLI control through the private `fluxd` Unix socket.
+- Zashboard redirect at `http://127.0.0.1:9090/ui/` when the configured Sing-Box API is available.
 
-### Filtering Mechanisms
-- **Per-App Proxy**: UID-based blacklist/whitelist mode with caching
-- **Anti-Loopback**: Built-in route marking and user group protection to prevent traffic loops
-- **Dynamic IP Monitor**: Unified AWK engine with memory-state deduplication automatically handles temporary IPv6 addresses
+## Installation and upgrades
 
-### Subscription Management
-- Automatic download, conversion, and configuration generation
-- Node filtering by region
-- Configurable update interval with smart caching
-- Manual force update via `updater.sh`
+1. Download a release ZIP from [Releases](https://github.com/Chth1z/Flux/releases).
+2. Install it through Magisk Manager, KernelSU, or APatch.
+3. Configure `/data/adb/flux/conf/settings.ini` and, when needed, the strict daemon configuration
+   `/data/adb/flux/conf/flux.toml`.
+4. Reboot.
 
-### Interaction
-- **[Vol+] / [Vol-]**: Choose whether to preserve configuration during installation
-- **Module Toggle**: Enable/disable via Magisk Manager (reactive inotify-based)
-- **Update Subscription**: Auto-updates on boot if `UPDATE_INTERVAL` has passed; run `updater.sh` to update manually
-- **Web Dashboard**: Zashboard UI at `http://127.0.0.1:9090/ui/`
+Upgrade preservation is per file:
 
----
+- `flux.toml` is always preserved because it is the authoritative Rust-controller configuration.
+- `settings.ini` is always migrated into the newly packaged schema.
+- `template.json` and `addrsyncd.toml` each receive their own Vol+/Vol− keep/reset prompt.
+- The generated bridge cache is cleared. Existing `run/`, `state/`, and generated `config.json`
+  records are retained so startup recovery can reconcile them; later update/reload policy decides
+  when the Sing-Box configuration is regenerated.
 
-## Installation
+TUN and multi-user values are preserved during migration even when a current bridge cannot activate
+the selected future mode. A failed post-extraction migration/restore aborts installation and the
+installer attempts to restore the retained pre-upgrade configuration before deleting its backup.
 
-1. Download the latest release ZIP from [Releases](https://github.com/Chth1z/Flux/releases)
-2. Install via Magisk Manager / KernelSU / APatch
-3. During installation:
-   - Press **[Vol+]** to preserve existing configuration
-   - Press **[Vol-]** to use fresh default configuration
-4. Configure your subscription URL in `/data/adb/flux/conf/settings.ini`
-5. Reboot to start
-
----
-
-## Workflow Visualization
-
-### 1. Module Lifecycle
+## Runtime lifecycle
 
 ```mermaid
-graph TD
-    Boot([Android Boot]) --> Wait{System Ready?}
-    Wait -->|Yes| Dispatcher[Start Dispatcher<br/>inotifyd]
-
-    Dispatcher --> Watch{{Monitor 'disable' file}}
-
-    Watch -- "Deleted" --> Init
-
-    subgraph InitPhase ["Init Phase"]
-        Init[scripts/init] --> Check1{Update Expired?}
-        Check1 -->|Expired| Update[Run Updater]
-        Check1 -->|Valid| Check2
-        Update --> Check2{Cache Valid?}
-        Check2 -->|Invalid| Rebuild[Rebuild Cache]
-        Check2 -->|Valid| LogRot[Log Rotation]
-        Rebuild --> LogRot
-    end
-
-    LogRot --> Launch["Launch All Components"]
-
-    subgraph Components ["Parallel Startup"]
-        Launch --> Core[Core<br/>sing-box]
-        Launch --> TProxy[TProxy<br/>iptables]
-        Launch --> Monitor[IPMonitor<br/>SRI]
-    end
-
-    Core & TProxy --> Ready
-    Ready[All Ready] --> Final([READY])
-
-    Watch -- "Created" --> Stop[Stop All]
-    Stop --> Cleanup[Flush Rules]
+flowchart TD
+    Boot["Android late-start"] --> Service["module-local service.sh"]
+    Service --> Watchdog["bounded fluxd watchdog"]
+    Watchdog --> Fluxd["fluxd daemon"]
+    Service --> Inotify["inotifyd fact watcher"]
+    Inotify --> Event["flux-event"]
+    Event --> Fluxd
+    CLI["fluxctl / fluxd CLI"] --> Socket["private Unix control socket"]
+    Socket --> Fluxd
+    Fluxd --> Coordinator["serialized RuntimeCoordinator"]
+    Coordinator --> Engine["EngineSupervisor"]
+    Engine --> SingBox["sing-box child"]
+    Coordinator --> Bridge["LegacyDispatcher adapter"]
+    Bridge --> Rules["init / rules / tproxy / addrsync"]
+    Rules --> Kernel["iptables + RPDB + standalone addrsyncd"]
 ```
 
-### 2. High-Concurrency Packet Funnel
+There is no parallel IPMonitor owner in the Rust-owned bridge. Event facts enter `fluxd`, and all
+mutating bridge phases run through one serialized worker.
 
-```mermaid
-graph TD
-    Pre([PREROUTING<br/>External Traffic]) --> Fast
-    Out([OUTPUT<br/>Local Apps]) --> Fast
+## Packet-policy bridge
 
-    subgraph Chain ["Mangle Chain"]
-        Fast{⚡ Fast-Path}
+The retained compatibility path compiles a fixed bounded-zone iptables classifier. Existing
+connection marks take the fast path; new flows pass through mandatory/local bypasses, interface
+policy, and application policy before either direct acceptance or TPROXY delivery to Sing-Box.
 
-        subgraph Shortcuts ["Fast-Path Exits"]
-            direction LR
-            Recover[Restore Mark & TPROXY]
-            Accepted[Accepted]
-        end
+`BYPASS_SET_BACKEND="zone"` is the only implemented backend. `ipset` and `auto` are intentionally
+rejected until distinct adapters, capability probes, and parity tests exist.
 
-        %% Proxy Path (Left)
-        Fast -->|"connmark = PROXY"| Recover
+The legacy bridge still uses fixed table/priority `2025` and low-byte marks. These values overlap
+Android mark policy and are not approved for the future native backend; see the warning under
+Routing marks below.
 
-        %% Bypass Path (Right)
-        Fast -->|"connmark = BYPASS"| Accepted
+## Installed layout
 
-        %% Decision Path (Right/Bottom)
-        Fast -- "New Connection" --> IPCheck
+Runtime files live under `/data/adb/flux/`:
 
-        IPCheck{IP Bypass List?<br/>Bounded Goto Skeleton}
-        IPCheck -->|Public| IfCheck
-        IPCheck -->|Private/LAN/Bypass| SetBypass[Bypass]
-
-        IfCheck{Interface<br/>Enabled?}
-        IfCheck -->|Enabled| AppCheck
-        IfCheck -->|Disabled| SetBypass
-
-        AppCheck{App Filter<br/>UID Match?}
-        AppCheck -->|Proxy App| SetProxy[Mark PROXY<br/>& TPROXY]
-        AppCheck -->|Bypass App| SetBypass
-    end
-
-    Recover --> SingBox
-    SetProxy --> SingBox
-
-    Accepted --> Bypass
-    SetBypass --> Bypass
-
-    subgraph Exit ["Data Exit"]
-        SingBox([sing-box Engine])
-        Bypass([Direct to Kernel])
-    end
-```
-
-## Directory Structure
-
-All module files are located at `/data/adb/flux/`:
-
-```
+```text
 /data/adb/flux/
 ├── bin/
-│   ├── jq                    # JSON processor
-│   └── sing-box              # Core proxy engine
-│
+│   ├── fluxd                 # Rust controller and CLI
+│   ├── addrsyncd             # Bridge address-rule reconciler / rollback binary
+│   ├── jq                    # JSON adapter used by the bridge
+│   └── sing-box              # External proxy engine
 ├── conf/
-│   ├── config.json           # Generated sing-box configuration
-│   ├── flux.toml             # Strict fluxd daemon configuration
-│   ├── settings.ini          # User configuration file
-│   └── template.json         # Configuration template
-│
+│   ├── flux.toml             # Strict fluxd schema
+│   ├── settings.ini          # Legacy networking/subscription settings
+│   ├── addrsyncd.toml
+│   ├── template.json
+│   ├── config.json           # Generated Sing-Box configuration
+│   └── manifest.json         # Release provenance contract
+├── cache/                    # Generated shared bridge artifacts
 ├── state/
-│   └── administrative-intent.json # Boot-scoped durable fluxd intent
-│
+│   └── administrative-intent.json
 ├── run/
-│   ├── flux.log              # Module runtime logs
-│   ├── sing-box.pid          # Sing-box process PID
-│   ├── ipmonitor.pid         # IP Monitor process PID
-│   └── event/                # Event signals
-│
+│   ├── fluxd.sock
+│   ├── fluxd.pid
+│   ├── fluxd.log
+│   ├── generations/          # Immutable prepared Generation snapshots
+│   └── capture.* / engine.*  # Generation ownership and recovery records
 └── scripts/
-    ├── cache                 # Cache manager
-    ├── config                # Config loader
-    ├── const                 # Constants
-    ├── core                  # Process control
-    ├── dispatcher            # Event handler
-    ├── init                  # Initialization
-    ├── ipmonitor             # Network monitor
-    ├── log                   # Logging system
-    ├── rules                 # IPTables generator
-    ├── tproxy                # Routing logic
-    └── updater.sh            # Subscription manager
+    ├── fluxctl               # Compatibility CLI wrapper
+    ├── flux-event            # Raw inotify fact adapter
+    ├── dispatcher            # Serialized shell phase adapter
+    ├── init / config / updater.sh
+    ├── rules / tproxy / addrsync
+    └── lib / log / core      # Shared and rollback-only helpers
 ```
 
----
-### Magisk Module Directory (`/data/adb/modules/flux/`)
-
-```
-/data/adb/modules/flux/
-├── webroot/
-│   └── index.html            # Redirect to dashboard UI
-├── service.sh                # Boot service launcher
-├── module.prop               # Module metadata
-└── disable                   # (Created when module is disabled)
-```
-
----
+The module manager directory `/data/adb/modules/flux/` contains `service.sh`, `module.prop`, the
+dashboard redirect, and the manager-owned `disable` marker. The installer removes obsolete global
+`/data/adb/*/service.d/flux_service.sh` launchers so only the module-local watchdog owns `fluxd`.
 
 ## Configuration
 
-The legacy networking configuration remains `/data/adb/flux/conf/settings.ini`. The Rust control plane uses the strict `/data/adb/flux/conf/flux.toml` daemon configuration; schema 1 rejects unknown fields and accepts only `daemon.fail_policy = "open"`. Changes to `flux.toml` currently require a daemon restart, while `settings.ini` retains its existing event-driven reload path.
+`flux.toml` configures the Rust daemon. Its schema is strict: unknown or missing fields fail, and
+changes currently require a daemon restart. `settings.ini` configures the retained networking and
+subscription bridge.
 
-### 1. General Configuration
+### Subscription and logging
+
 | Option | Description | Default |
-|--------|-------------|---------|
-| `SUBSCRIPTION_URL` | Subscription link for node conversion | (empty) |
+|---|---|---|
+| `SUBSCRIPTION_URL` | Subscription URL | empty |
 | `UPDATE_TIMEOUT` | Download timeout in seconds | `5` |
-| `RETRY_COUNT` | Number of retries for failed downloads | `2` |
-| `UPDATE_INTERVAL` | Auto-update interval in seconds (86400=24h, 0=Disable) | `86400` |
-| `PREF_CLEANUP_EMOJI` | Remove Emoji from node names (0=Keep, 1=Remove) | `1` |
+| `RETRY_COUNT` | Download retry count | `2` |
+| `UPDATE_INTERVAL` | Refresh interval; `0` disables automatic refresh | `86400` |
+| `PREF_CLEANUP_EMOJI` | Remove emoji from node names | `1` |
+| `LOG_LEVEL` | `0` off through `4` debug | `3` |
+| `LOG_MAX_SIZE` | Log rotation threshold in bytes | `1048576` |
 
-### 2. Logging & Debugging
+### Proxy engine
+
 | Option | Description | Default |
-|--------|-------------|---------|
-| `LOG_LEVEL` | `0`=OFF, `1`=Error, `2`=Warn, `3`=Info, `4`=Debug | `3` |
-| `LOG_MAX_SIZE` | Log size limit before rotation (bytes) | `1048576` |
+|---|---|---|
+| `CORE_USER` / `CORE_GROUP` | Sing-Box execution identity | `root` / `root` |
+| `CORE_TIMEOUT` | Engine startup timeout in seconds | `5` |
+| `PROXY_PORT` | TPROXY listener port; extracted only from a `tproxy` inbound | `1536` |
+| `FAKEIP_V4_RANGE` | FakeIP IPv4 range | `198.18.0.0/15` |
+| `FAKEIP_V6_RANGE` | FakeIP IPv6 range | `fc00::/18` |
+| `PROXY_MODE` | Shipped bridge mode; only `tproxy` is accepted | `tproxy` |
+| `TUN_INTERFACE`, `TUN_INET4_ADDRESS`, `TUN_INET6_ADDRESS`, `TUN_MTU` | Reserved and migrated, but unsupported in Phase 1 | packaged values |
 
-### 3. Core Process
+A `mixed` inbound is not a transparent TPROXY listener and is therefore not used for automatic
+port extraction.
+
+### Interfaces and application scope
+
 | Option | Description | Default |
-|--------|-------------|---------|
-| `CORE_USER` | Execution user for sing-box | `root` |
-| `CORE_GROUP` | Execution group for sing-box | `root` |
-| `CORE_TIMEOUT` | Core startup timeout in seconds | `5` |
-
-### 4. Proxy Engine
-| Option | Description | Default |
-|--------|-------------|---------|
-| `PROXY_PORT` | Proxy listening port (Auto-extracted) | `1536` |
-| `FAKEIP_RANGE_V4` | FakeIP IPv4 address range (Auto-extracted) | `198.18.0.0/15` |
-| `FAKEIP_RANGE_V6` | FakeIP IPv6 address range (Auto-extracted) | `fc00::/18` |
-
-### 5. Network Interfaces
-| Option | Description | Default IF Name |
-|--------|-------------|-----------------|
-| `MOBILE_INTERFACE` | Mobile data interface pattern | `rmnet_data+` |
-| `WIFI_INTERFACE` | Wi-Fi interface name | `wlan0` |
-| `HOTSPOT_INTERFACE` | Hotspot interface name | `wlan2` |
+|---|---|---|
+| `MOBILE_INTERFACE` | Mobile interface pattern | `rmnet_data+` |
+| `WIFI_INTERFACE` | Wi-Fi interface | `wlan0` |
+| `HOTSPOT_INTERFACE` | Hotspot interface | `wlan2` |
 | `USB_INTERFACE` | USB tethering interface pattern | `rndis+` |
+| `PROXY_MOBILE`, `PROXY_WIFI`, `PROXY_HOTSPOT`, `PROXY_USB` | Per-interface proxy switches | `1` |
+| `PROXY_IPV6` | Enable IPv6 proxy rules | `0` |
+| `APP_PROXY_MODE` | `0` disabled, `1` denylist/bypass listed apps, `2` allowlist/proxy listed apps | `0` |
+| `APP_LIST` | Package-name list | empty |
+| `APP_USER_SCOPE` | `owner`, `all`, or `list` | `owner` |
+| `APP_USER_LIST` | Android user IDs used by `list` scope | `0` |
 
-### 6. Proxy Granularity
-| Option | Description | Default |
-|--------|-------------|---------|
-| `PROXY_MOBILE` / `PROXY_WIFI` | Interface proxy switches (0=Bypass, 1=Proxy) | `1` |
-| `PROXY_HOTSPOT` / `PROXY_USB` | Interface proxy switches (0=Bypass, 1=Proxy) | `0` |
-| `PROXY_IPV6` | Enable/Disable IPv6 Proxying | `0` |
-
-### 7. Routing Mark
+### Routing marks and compatibility
 
 > [!WARNING]
-> These options describe the legacy shell bridge only. Its `0xff` mask overlaps Android's
-> low-16-bit `netId` field and is not an approved default for the Rust rewrite. The native planner
-> requires an explicit device-qualified mark grant plus a complete live census; neither an empty
-> scan nor an explicit legacy value can bypass that authority.
+> The values in this table describe the legacy shell bridge. Its `0xff` mask overlaps Android's
+> low-16-bit `netId` field and is not an approved default for the native Rust planner. Native
+> mutation requires a device-qualified mark grant and a complete live conflict census.
 
 | Option | Description | Default |
-|--------|-------------|---------|
-| `ROUTING_MARK` | Core/Bypass Routing Mark (empty=UID match) | (empty) |
+|---|---|---|
+| `ROUTING_MARK` | Optional engine bypass mark; empty uses owner matching | empty |
+| `MARK_MASK` | Legacy connmark mask | `0xff` |
+| `RULE_BACKEND` | Implemented rules adapter | `iptables_restore` |
+| `BYPASS_SET_BACKEND` | Implemented bypass classifier | `zone` |
+| `MSS_CLAMP_ENABLE` | TCP MSS clamp | `1` |
+| `BLOCK_QUIC` | Block UDP/443 | `0` |
 
-### 8. Application Filtering
-| Option | Description | Default |
-|--------|-------------|---------|
-| `APP_PROXY_MODE` | `0`=Disable, `1`=Blacklist, `2`=Whitelist | `0` |
-| `APP_LIST` | Package names (space/newline separated) | (empty) |
+Additional compatibility fields are documented in [`conf/settings.ini`](conf/settings.ini).
 
-### 9. Performance & Compatibility
-| Option | Description | Default |
-|--------|-------------|---------|
-| `MSS_CLAMP_ENABLE`| Enable TCP MSS Clamping | `1` |
-| `BLOCK_QUIC` | Block UDP/443 QUIC globally | `0` |
-| `MARK_MASK` | Connmark mask used by Flux marks | `0xff` |
-| `RULE_BACKEND` | Rule backend (`iptables_restore` only for production) | `iptables_restore` |
-| `BYPASS_SET_BACKEND` | Bypass set backend (`zone`, `ipset`, `auto`) | `zone` |
-| `PERFORMANCE_MODE` | Enable optional socket/conntrack fast path when supported | `0` |
-| `PRIVATE_DNS_GUARD` | Reserved compatibility profile, disabled by default | `0` |
-| `IPV6_FORCE_DISABLE` | Reserved compatibility profile, disabled by default | `0` |
-| `VENDOR_FIX_PROFILE` | Reserved vendor profile (`none`, `oneplus`) | `none` |
-| `HOTSPOT_FIX` | Reserved hotspot compatibility profile | `0` |
-| `EXCLUDE_INTERFACES`| List of interfaces to explicitly ignore (OUTPUT) | (empty) |
-
-### CLI Control
-
-Flux provides a CLI-only control plane:
+## CLI
 
 ```bash
-/data/adb/flux/scripts/fluxctl status
+/data/adb/flux/scripts/fluxctl status [--json]
 /data/adb/flux/scripts/fluxctl start
 /data/adb/flux/scripts/fluxctl stop
 /data/adb/flux/scripts/fluxctl restart
+/data/adb/flux/scripts/fluxctl reload
+/data/adb/flux/scripts/fluxctl resync
 /data/adb/flux/scripts/fluxctl diagnose
 /data/adb/flux/scripts/fluxctl rules-preview
-/data/adb/flux/scripts/fluxctl resync
-/data/adb/flux/scripts/fluxctl logs
+/data/adb/flux/scripts/fluxctl logs [file]
 ```
 
----
+`status` is authoritative `fluxd` status, including the Rust-owned Sing-Box runtime state. Mutating
+commands use only the private control socket and never fall back to direct shell mutation.
+
+## Development status
+
+Build, test, privileged canary, Android cross-build, staging, and release-verification instructions
+are in [`docs/development.md`](docs/development.md). A staged development tree is not release-ready
+until `cargo xtask verify-package` validates the complete module layout, AArch64 ELF artifacts,
+immutable-revision provenance and hashes, recognized SPDX/`LicenseRef` records cross-bound to the
+SBOM, hashed device evidence, pinned build metadata, complete package checksums, and confirms that
+no `.ko`/`.kpm` payload is present.
 
 ## Disclaimer
 
-- This project is for educational and research purposes only. Do not use for illegal purposes.
-- Modifying system network settings may cause instability or conflicts. Use at your own risk.
-- The developer is not responsible for any data loss or device damage caused by using this module.
-
----
+- This project is for educational and research use. Do not use it for illegal purposes.
+- Transparent proxy and policy-routing changes can conflict with Android VPN/netd policy.
+- Keep a rollback path and test on a supported device before relying on the module.
 
 ## Credits
 
-- [SagerNet/sing-box](https://github.com/SagerNet/sing-box) - The universal proxy platform
-- [taamarin/box_for_magisk](https://github.com/taamarin/box_for_magisk) - Magisk module patterns and inspiration
-- [CHIZI-0618/box4magisk](https://github.com/CHIZI-0618/box4magisk) - Magisk module reference
-- [jqlang/jq](https://github.com/jqlang/jq) - Command-line JSON processor
-
----
+- [SagerNet/sing-box](https://github.com/SagerNet/sing-box)
+- [taamarin/box_for_magisk](https://github.com/taamarin/box_for_magisk)
+- [CHIZI-0618/box4magisk](https://github.com/CHIZI-0618/box4magisk)
+- [jqlang/jq](https://github.com/jqlang/jq)
 
 ## License
 

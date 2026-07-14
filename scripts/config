@@ -127,7 +127,9 @@ PROXY_WIFI:int:1:0:1
 PROXY_HOTSPOT:int:1:0:1
 PROXY_USB:int:1:0:1
 PROXY_IPV6:int:0:0:1
-PROXY_MODE:enum:tproxy:tproxy,tun
+# TUN helper code and fields are retained for the future EngineOwnedTun plan,
+# but the normal Phase 1 configuration admits only the proven TPROXY path.
+PROXY_MODE:enum:tproxy:tproxy
 TUN_INTERFACE:iface:tun0
 TUN_INET4_ADDRESS:cidr:172.19.0.1/30
 TUN_INET6_ADDRESS:cidr:fdfe:dcba:9876::1/126
@@ -141,7 +143,9 @@ MSS_CLAMP_ENABLE:int:1:0:1
 BLOCK_QUIC:int:0:0:1
 MARK_MASK:mark:0xff
 RULE_BACKEND:enum:iptables_restore:iptables_restore
-BYPASS_SET_BACKEND:enum:zone:zone,ipset,auto
+# ipset/auto remain future adapter names; accepting them before an adapter
+# exists would silently report a backend that rule generation never selected.
+BYPASS_SET_BACKEND:enum:zone:zone
 PERFORMANCE_MODE:int:0:0:1
 PRIVATE_DNS_GUARD:int:0:0:1
 IPV6_FORCE_DISABLE:int:0:0:1

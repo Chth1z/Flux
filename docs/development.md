@@ -46,13 +46,17 @@ cargo check --manifest-path addrsyncd/Cargo.toml --target aarch64-linux-android 
 
 Its bridge reconciliation reads canonical kernel rule dumps and preserves duplicate observations instead of relying only on in-memory ownership tracking. `run --daemon` is now a bounded convergence handshake: readiness follows startup cleanup, reconcile/apply, two clean readbacks, and a final drain of the subscribed route socket to `EAGAIN`. Loss or ambiguous framing forces reconciliation, and parent-side readiness failures terminate and reap the child.
 
-The full Rust-owned dispatcher lifecycle suite runs in an isolated Bubblewrap root:
+The bridge shell regression suites are:
 
 ```text
+sh tests/shell/config_installer_contract.sh
+sh tests/shell/rules_generation.sh
+sh tests/shell/run-installer-tests.sh
+sh tests/shell/run-fluxctl-tests.sh
 sh tests/shell/run-dispatcher-tests.sh
 ```
 
-Local hosts without Bubblewrap report a skip. CI sets `FLUX_DISPATCHER_TESTS_REQUIRED=1`, making an unavailable or prohibited Bubblewrap environment a failure.
+The first two suites are host-only and cover installer migration/configuration admissibility and legacy rule-generation semantics. The remaining three wrappers run in isolated Bubblewrap roots: installer rollback after post-extraction failure, authoritative `fluxctl` delegation, and the complete Rust-owned dispatcher lifecycle. Local hosts without Bubblewrap report an isolated-suite skip. CI makes unavailable or prohibited Bubblewrap environments failures.
 
 The privileged Linux functional-canary harness is an independent opt-in checkpoint and is not part
 of `cargo xtask ci`:
@@ -141,9 +145,12 @@ uninhabited, and the current zero-state xtables driver still returns `Unsupporte
 because OUTPUT marking does not reach PREROUTING TPROXY. Real `EngineSupervisor`/`SingBoxChild` and
 prepared-driver child integration, production listener observation and delivery-report parsing/
 factories, actual prebound collector use, a traffic producer, and capability-qualified Android
-execution remain later checkpoints. A separately qualified cgroup-BPF authority remains optional;
-ordinary BPF counters cannot qualify TPROXY, and this checkpoint adds no explicit `.ko` load/unload
-operation. Ingress,
+execution remain later checkpoints. The immediate next slice integrates supervised userspace
+report/parser, child-handle, listener-observer, collector, and cleanup plumbing but must still
+return `Unsupported`: no device-qualified local-OUTPUT TPROXY capture mechanism or authoritative
+engine report producer has been admitted. A separately qualified cgroup-BPF authority remains an
+unassigned future experiment; ordinary BPF counters cannot qualify TPROXY, and this checkpoint adds no explicit
+`.ko` load/unload operation. Ingress,
 REDIRECT/DNAT, counters, route lookups, or a veth bounce cannot qualify TPROXY.
 
 Run the socket-diagnostics session and live-correlation regressions with:
@@ -223,9 +230,35 @@ The bridge release is staged only after a successful pinned Android release buil
 cargo xtask stage-module --stage dist/module --runtime-binaries /path/to/runtime-binaries
 ```
 
-`--runtime-binaries` must contain the independently sourced `sing-box`, `jq`, and rollback `addrsyncd` Android binaries. The task copies the tracked module tree, installs the newly built `fluxd` at `bin/fluxd`, and refuses a non-empty stage or a stage missing any required runtime file. This keeps third-party provenance explicit and prevents installer changes from landing without a real Android `fluxd` artifact.
+`--runtime-binaries` must contain the independently sourced `sing-box`, `jq`, and rollback `addrsyncd` Android binaries. The task copies the tracked module tree, installs the newly built `fluxd` at `bin/fluxd`, and refuses a non-empty stage or a stage missing any required runtime file. This is a development staging boundary only; it prevents installer changes from landing without a real Android `fluxd` artifact but does not certify third-party provenance.
 
-Before publishing, populate every blank version/source/hash field in `conf/manifest.json` from the staged artifacts and archive the matching provenance records.
+Before publishing, populate every blank source/source-revision/version/hash/license field in
+`conf/manifest.json`, add hashed schema-1 passed device-test evidence bound to the exact source
+revision, operational payload, Android build fingerprint, kernel, boot ID, verified-boot/SELinux
+state, and the exact passed test set (`module_boot`, `status`, `enable_disable`, `restart`,
+`abnormal_sing_box_exit`, `dual_stack_tcp_udp_dns`, and `cleanup`), and generate a populated SPDX
+document, exact pinned-toolchain build metadata, and a
+complete recursive `checksums.sha256` inventory. Then run:
+
+```text
+cargo xtask verify-package --stage dist/module
+```
+
+The verifier requires clean root/submodule Git state and binds `fluxd`/`addrsyncd` revisions to
+their exact HEADs. It enforces the complete allowed file inventory; byte-compares reviewed module
+scripts, configuration, and defaults; requires exactly four manifest binaries; validates bounded
+file-backed AArch64 executable entries and Android interpreter paths; rehashes every artifact and
+payload-bound device record; cross-binds exact SPDX package/source/license/hash records; verifies
+pinned build metadata and complete checksums; and rejects unreviewed Magisk root files, unsafe
+paths, symbolic links, `.ko`/`.kpm` payloads, placeholder/unreviewed licenses or evidence, and any
+profile other than `full`. The checked-in manifest is intentionally not release-complete; a
+normal development stage must fail until release metadata and device evidence are supplied. The
+standalone `addrsyncd` crate remains `UNLICENSED`, so its release license field cannot be populated
+until the copyright holder records a compatible grant.
+
+The current verifier establishes internal consistency, not external trust in an unsigned evidence
+file or self-declared third-party build. Publication remains blocked until `package-magisk` verifies
+signed or reproducible third-party provenance and trusted device/CI attestations.
 
 ## Phase 1 bridge runtime
 

@@ -2,49 +2,54 @@
   "schema_version": 1,
   "project": "Flux",
   "generated_by": "manual",
-  "note": "Release packaging must fill version, source, target, and sha256 for every binary before publishing.",
+  "note": "Development placeholder only. Release verification requires a clean root/submodule revision, exact HTTPS provenance/version/target/hash/license fields, payload-bound device evidence with exact device and test identities, SPDX, complete checksums, and pinned build metadata. Publication additionally requires trusted provenance and device attestations.",
   "binaries": [
     {
       "name": "fluxd",
       "path": "bin/fluxd",
       "source": "https://github.com/Chth1z/Flux",
+      "source_revision": "",
       "version": "0.1.0",
       "target": "aarch64-linux-android",
-      "sha256": ""
+      "sha256": "",
+      "license": "GPL-3.0-only"
     },
     {
       "name": "sing-box",
       "path": "bin/sing-box",
       "source": "",
+      "source_revision": "",
       "version": "",
-      "target": "android",
-      "sha256": ""
+      "target": "aarch64-linux-android",
+      "sha256": "",
+      "license": ""
     },
     {
       "name": "jq",
       "path": "bin/jq",
       "source": "",
+      "source_revision": "",
       "version": "",
-      "target": "android",
-      "sha256": ""
+      "target": "aarch64-linux-android",
+      "sha256": "",
+      "license": ""
     },
     {
       "name": "addrsyncd",
       "path": "bin/addrsyncd",
-      "source": "D:/Github/addrsyncd",
-      "version": "",
-      "target": "android",
-      "sha256": ""
+      "source": "https://github.com/Chth1z/Flux/tree/codex/fluxd-rust-rewrite/addrsyncd",
+      "source_revision": "",
+      "version": "0.1.0",
+      "target": "aarch64-linux-android",
+      "sha256": "",
+      "license": ""
     }
   ],
+  "device_test_evidence": [],
   "default_package_profiles": [
     {
       "name": "full",
       "description": "Contains all required binaries."
-    },
-    {
-      "name": "lite",
-      "description": "Contains scripts and config; user supplies core binaries."
     }
   ]
 }

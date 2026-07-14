@@ -21,7 +21,20 @@ readonly SCRIPT_DIR="${_script_path%/*}"
 readonly LOG_COMPONENT="Ctl"
 
 CONFIG_READY=0
-load_config >/dev/null 2>&1 && CONFIG_READY=1 || true
+CONFIG_ATTEMPTED=0
+
+_ensure_config() {
+    if [ "${CONFIG_ATTEMPTED}" = "1" ]; then
+        return 0
+    fi
+    CONFIG_ATTEMPTED=1
+    if load_config >/dev/null 2>&1; then
+        CONFIG_READY=1
+    else
+        CONFIG_READY=0
+    fi
+    return 0
+}
 
 _print_kv() {
     printf '%-22s %s\n' "${1}:" "${2}"
@@ -49,12 +62,11 @@ _service_state() {
     printf '%s\n' "${state}"
 }
 
-status_cmd() {
+legacy_status_cmd() {
     _print_kv "config" "$([ "${CONFIG_READY}" = "1" ] && printf ready || printf failed)"
     _print_kv "module" "$(_service_state)"
     _print_kv "fluxd" "$(_pid_status "${FLUXD_PID_FILE}" "fluxd" "${FLUXD_BIN}")"
     [ "${CONFIG_READY}" = "1" ] && _print_kv "proxy mode" "${PROXY_MODE}"
-    _print_kv "sing-box" "$(_pid_status "${SING_BOX_PID_FILE}" "sing-box" "${SING_BOX_BIN}")"
     if [ "${CONFIG_READY}" = "1" ]; then
         if [ "${PROXY_MODE}" = "tun" ]; then
             [ -d "/sys/class/net/${TUN_INTERFACE}" ] && _print_kv "tun interface" "up (${TUN_INTERFACE})" || _print_kv "tun interface" "missing (${TUN_INTERFACE})"
@@ -87,7 +99,9 @@ _print_file_section() {
 }
 
 diagnose_cmd() {
-    status_cmd
+    _ensure_config
+    printf '[legacy/offline observations]\n'
+    legacy_status_cmd
 
     _print_file_section "kernel capabilities" "${CACHE_KERNEL_CAPS_FILE}"
     _print_file_section "active runtime" "${ACTIVE_RUNTIME_FILE}"
@@ -125,6 +139,7 @@ _line_count() {
 }
 
 rules_preview_cmd() {
+    _ensure_config
     [ "${CONFIG_READY}" = "1" ] || {
         log_error "Config is not ready"
         return 1
@@ -179,6 +194,15 @@ _fluxd_control_cmd() {
     exec "${FLUXD_BIN}" control "${action}"
 }
 
+_fluxd_status_cmd() {
+    [ -x "${FLUXD_BIN}" ] || {
+        log_error "fluxd binary missing or not executable: ${FLUXD_BIN}"
+        return 127
+    }
+
+    exec "${FLUXD_BIN}" status "$@"
+}
+
 main() {
     local action="${1:-status}"
     shift || true
@@ -192,7 +216,7 @@ main() {
         _fluxd_control_cmd "${action}"
         ;;
     status)
-        status_cmd
+        _fluxd_status_cmd "$@"
         ;;
     diagnose)
         diagnose_cmd

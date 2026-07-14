@@ -1,0 +1,36 @@
+# Frozen semantic oracle copied from scripts/rules BYPASS_IPv4_LIST and
+# BYPASS_IPv6_LIST, plus the owner/application examples in
+# tests/shell/rules_generation.sh. This records source semantics only; it is
+# not an iptables renderer fixture and makes no renderer-parity claim.
+shell_bypass_ipv4=0.0.0.0/8
+shell_bypass_ipv4=10.0.0.0/8
+shell_bypass_ipv4=100.64.0.0/10
+shell_bypass_ipv4=127.0.0.0/8
+shell_bypass_ipv4=169.254.0.0/16
+shell_bypass_ipv4=172.16.0.0/12
+shell_bypass_ipv4=192.0.0.0/24
+shell_bypass_ipv4=192.0.2.0/24
+shell_bypass_ipv4=192.88.99.0/24
+shell_bypass_ipv4=192.168.0.0/16
+shell_bypass_ipv4=198.51.100.0/24
+shell_bypass_ipv4=203.0.113.0/24
+shell_bypass_ipv4=224.0.0.0/4
+shell_bypass_ipv4=240.0.0.0/4
+shell_bypass_ipv4=255.255.255.255/32
+shell_bypass_ipv6=::/128
+shell_bypass_ipv6=::1/128
+shell_bypass_ipv6=::ffff:0:0/96
+shell_bypass_ipv6=100::/64
+shell_bypass_ipv6=64:ff9b::/96
+shell_bypass_ipv6=2001::/32
+shell_bypass_ipv6=2001:10::/28
+shell_bypass_ipv6=2001:20::/28
+shell_bypass_ipv6=2001:db8::/32
+shell_bypass_ipv6=2002::/16
+shell_bypass_ipv6=fe80::/10
+shell_bypass_ipv6=ff00::/8
+forbidden_regression_ipv4=100.0.0.0/8
+engine_uid=1000
+engine_gid=1000
+resolved_uid=10123
+resolved_uid=110123

@@ -11,6 +11,7 @@ mod android_mark_authority;
 mod android_rpdb;
 mod android_tproxy_topology;
 mod capability;
+mod capture_program;
 mod config;
 mod control;
 mod fwmark_audit;
@@ -74,6 +75,23 @@ pub use capability::{
     LegacyMutationWriter, LegacyRuleBackend, MAX_BOOT_IDENTITY_BYTES, MAX_KERNEL_RELEASE_BYTES,
     MIN_SUPPORTED_KERNEL, Observation, ObservationKind, ParseBootIdentityError,
     ParseBootIdentityErrorKind, ParseKernelVersionError, SelinuxMode,
+};
+pub use capture_program::{
+    CaptureApplicationMode, CaptureApplicationPolicy, CaptureApplicationPolicyError,
+    CaptureBypassPolicy, CaptureBypassPolicyError, CaptureClause, CaptureClauseDecision,
+    CaptureDecisionStage, CaptureDomainProgram, CaptureGroupId, CaptureInterfaceDirection,
+    CaptureInterfacePolicy, CaptureInterfacePolicyError, CaptureInterfaceSelector,
+    CaptureInterfaceSelectorKind, CaptureIpPrefix, CaptureIpPrefixError, CapturePredicate,
+    CaptureProgramBudget, CaptureProgramBudgetError, CaptureProgramDigest,
+    CaptureProgramResourceKind, CaptureProgramResourceUsage, CaptureProtocolSet,
+    CaptureProtocolSetError, CaptureTrafficDomain, CaptureTrafficScope, CaptureTrafficScopeError,
+    CaptureTransportProtocol, CaptureUserId, CompatibilityEngineCredentials,
+    MAX_CAPTURE_HOST_ADDRESSES_PER_FAMILY, MAX_CAPTURE_INTERFACE_SELECTORS,
+    MAX_CAPTURE_POLICY_PREFIX_INPUTS, MAX_CAPTURE_POLICY_PREFIXES_PER_FAMILY,
+    MAX_CAPTURE_POLICY_UIDS, SHADOW_CAPTURE_PROGRAM_SCHEMA_VERSION, ShadowAddressHostSetProvenance,
+    ShadowCaptureArtifact, ShadowCaptureCompileError, ShadowCaptureProgramRequest,
+    ShadowCompatibilityAssumption, ShadowCompilationReport, ShadowDeferredPrerequisite,
+    compile_shadow_capture_program,
 };
 pub use config::{
     ConfigError, ConfigErrorKind, DaemonConfig, EventQueueCapacity, FailurePolicy, FluxConfig,

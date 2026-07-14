@@ -2,7 +2,10 @@ mod render;
 mod restore;
 
 pub use render::{
-    LegacyRulesPlan, LegacyRulesRenderError, LegacyRulesRenderRequest, render_legacy_rules_restore,
+    LegacyApplicationMode, LegacyApplicationPolicy, LegacyInterfacePattern, LegacyInterfacePolicy,
+    LegacyInterfaceRole, LegacyKernelFeatures, LegacyOwnerMatch, LegacyOwnerToken, LegacyRulesPlan,
+    LegacyRulesPlanError, LegacyRulesRenderError, LegacyRulesRenderRequest,
+    render_legacy_rules_restore,
 };
 
 pub use restore::{

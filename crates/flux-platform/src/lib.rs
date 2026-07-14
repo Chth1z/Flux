@@ -43,9 +43,11 @@ pub use sing_box::{
     ReadinessEvidence, SingBoxExit, SingBoxLaunchSpec, SingBoxLauncher, SingBoxReadiness,
 };
 pub use xtables::{
-    LegacyRulesPlan, LegacyRulesRenderError, LegacyRulesRenderRequest, MAX_XTABLES_RESTORE_BYTES,
-    MAX_XTABLES_RESTORE_CHAIN_BYTES, MAX_XTABLES_RESTORE_COMMANDS, MAX_XTABLES_RESTORE_LINE_BYTES,
-    MAX_XTABLES_RESTORE_LINES, MAX_XTABLES_RESTORE_TOKEN_BYTES,
+    LegacyApplicationMode, LegacyApplicationPolicy, LegacyInterfacePattern, LegacyInterfacePolicy,
+    LegacyInterfaceRole, LegacyKernelFeatures, LegacyOwnerMatch, LegacyOwnerToken, LegacyRulesPlan,
+    LegacyRulesPlanError, LegacyRulesRenderError, LegacyRulesRenderRequest,
+    MAX_XTABLES_RESTORE_BYTES, MAX_XTABLES_RESTORE_CHAIN_BYTES, MAX_XTABLES_RESTORE_COMMANDS,
+    MAX_XTABLES_RESTORE_LINE_BYTES, MAX_XTABLES_RESTORE_LINES, MAX_XTABLES_RESTORE_TOKEN_BYTES,
     MAX_XTABLES_RESTORE_TOKENS_PER_COMMAND, MAX_XTABLES_RESTORE_TRANSACTIONS,
     XTABLES_RESTORE_DIGEST_BYTES, XTABLES_RESTORE_SCHEMA_VERSION, XtablesChainDeclaration,
     XtablesRestoreAction, XtablesRestoreArtifact, XtablesRestoreCommand, XtablesRestoreCommandKind,

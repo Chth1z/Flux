@@ -9,8 +9,10 @@ use flux_core::{
     ShadowCaptureProgramRequest, compile_shadow_capture_program,
 };
 use flux_platform::{
-    LegacyRulesPlan, LegacyRulesRenderRequest, XtablesRestoreAction, XtablesRestoreContext,
-    XtablesRestoreFamily, render_legacy_rules_restore,
+    LegacyApplicationMode, LegacyApplicationPolicy, LegacyInterfacePattern, LegacyInterfacePolicy,
+    LegacyInterfaceRole, LegacyKernelFeatures, LegacyOwnerMatch, LegacyOwnerToken, LegacyRulesPlan,
+    LegacyRulesPlanError, LegacyRulesRenderError, LegacyRulesRenderRequest, XtablesRestoreAction,
+    XtablesRestoreContext, XtablesRestoreFamily, render_legacy_rules_restore,
 };
 
 struct FixtureCase {
@@ -215,6 +217,186 @@ fn shadow_normalization_cannot_be_used_to_reconstruct_the_legacy_source_shape() 
     )));
 }
 
+#[test]
+fn general_renderer_covers_minimal_application_and_feature_branches() {
+    let plan = general_plan(
+        LegacyApplicationMode::All,
+        [],
+        LegacyKernelFeatures::new(true, false, false, false, false, true, true),
+        false,
+        false,
+        false,
+        None,
+    );
+    let apply = render_text(
+        &plan,
+        XtablesRestoreAction::Apply,
+        XtablesRestoreFamily::Ipv4,
+    );
+    assert!(
+        apply
+            .contains("-A APP_CHAIN -m owner --uid-owner root --gid-owner root -j ACTION_BYPASS\n")
+    );
+    assert!(apply.contains("-A APP_CHAIN -j RETURN\n"));
+    assert!(!apply.contains("CONNMARK"));
+    assert!(!apply.contains("--set-xmark"));
+    assert!(!apply.contains(":DIVERT"));
+    assert!(!apply.contains("TCPMSS"));
+
+    let cleanup = render_text(
+        &plan,
+        XtablesRestoreAction::Cleanup,
+        XtablesRestoreFamily::Ipv4,
+    );
+    assert!(!cleanup.contains("DIVERT"));
+    assert!(!cleanup.contains("POSTROUTING"));
+    assert_eq!(
+        render_legacy_rules_restore(LegacyRulesRenderRequest::new(
+            XtablesRestoreContext::new(XtablesRestoreAction::Apply, XtablesRestoreFamily::Ipv6,),
+            &plan,
+        )),
+        Err(LegacyRulesRenderError::FamilyDisabled)
+    );
+}
+
+#[test]
+fn general_renderer_preserves_denylist_and_no_owner_fallback_semantics() {
+    let denylist = general_plan(
+        LegacyApplicationMode::Denylist,
+        [10_123, 110_123],
+        LegacyKernelFeatures::new(true, true, true, false, false, true, true),
+        false,
+        false,
+        true,
+        None,
+    );
+    let denylist = render_text(
+        &denylist,
+        XtablesRestoreAction::Apply,
+        XtablesRestoreFamily::Ipv4,
+    );
+    assert!(denylist.contains("-A APP_CHAIN -m owner --uid-owner 10123 -j ACTION_BYPASS\n"));
+    assert!(denylist.contains("-A APP_CHAIN -m owner --uid-owner 110123 -j ACTION_BYPASS\n"));
+    assert!(denylist.contains("-A APP_CHAIN -j ACTION_PROXY_OUT\n"));
+
+    let no_owner = general_plan(
+        LegacyApplicationMode::Allowlist,
+        [10_123],
+        LegacyKernelFeatures::new(false, true, false, false, false, true, true),
+        false,
+        false,
+        true,
+        Some(77),
+    );
+    assert!(!no_owner.production_eligible());
+    let no_owner = render_text(
+        &no_owner,
+        XtablesRestoreAction::Apply,
+        XtablesRestoreFamily::Ipv4,
+    );
+    assert!(no_owner.contains("-A APP_CHAIN -m mark --mark 77 -j ACTION_BYPASS\n"));
+    assert!(no_owner.contains("-A APP_CHAIN -j RETURN\n"));
+    assert!(!no_owner.contains("--uid-owner 10123"));
+    assert!(!no_owner.contains("*filter\n"));
+}
+
+#[test]
+fn general_renderer_covers_udp_divert_and_ipv6_nat_gate() {
+    let plan = general_plan(
+        LegacyApplicationMode::Allowlist,
+        [10_123],
+        LegacyKernelFeatures::new(true, true, true, true, true, false, true),
+        true,
+        true,
+        true,
+        None,
+    );
+    let ipv6 = render_text(
+        &plan,
+        XtablesRestoreAction::Apply,
+        XtablesRestoreFamily::Ipv6,
+    );
+    assert!(ipv6.contains(":DIVERT6 - [0:0]\n"));
+    assert!(ipv6.contains("-A PROXY_PREROUTING6 -p udp -m socket --transparent -j DIVERT6\n"));
+    assert!(!ipv6.contains("*nat\n"));
+    assert!(ipv6.contains("TCPMSS --clamp-mss-to-pmtu\n"));
+}
+
+#[test]
+fn general_renderer_rejects_invalid_source_tokens_and_ranges() {
+    assert_eq!(
+        LegacyOwnerToken::new("-1"),
+        Err(LegacyRulesPlanError::InvalidOwnerToken)
+    );
+    assert_eq!(
+        LegacyInterfacePattern::new("+"),
+        Err(LegacyRulesPlanError::InvalidInterfacePattern)
+    );
+    assert_eq!(
+        LegacyInterfacePattern::new("wlan++"),
+        Err(LegacyRulesPlanError::InvalidInterfacePattern)
+    );
+
+    let owner = LegacyOwnerMatch::new(
+        LegacyOwnerToken::new("root").unwrap(),
+        LegacyOwnerToken::new("root").unwrap(),
+    );
+    let applications = LegacyApplicationPolicy::new(LegacyApplicationMode::All, []).unwrap();
+    let interfaces = empty_interfaces();
+    let features = LegacyKernelFeatures::new(true, true, true, false, false, true, true);
+    assert_eq!(
+        LegacyRulesPlan::new(
+            0,
+            0xff,
+            None,
+            owner.clone(),
+            applications.clone(),
+            interfaces.clone(),
+            features,
+            false,
+            false,
+            false,
+            "198.18.0.0/15",
+            "fc00::/18",
+        ),
+        Err(LegacyRulesPlanError::InvalidProxyPort)
+    );
+    assert_eq!(
+        LegacyRulesPlan::new(
+            1536,
+            0,
+            None,
+            owner.clone(),
+            applications.clone(),
+            interfaces.clone(),
+            features,
+            false,
+            false,
+            false,
+            "198.18.0.0/15",
+            "fc00::/18",
+        ),
+        Err(LegacyRulesPlanError::InvalidMarkMask)
+    );
+    assert_eq!(
+        LegacyRulesPlan::new(
+            1536,
+            0xff,
+            None,
+            owner,
+            applications,
+            interfaces,
+            features,
+            false,
+            false,
+            false,
+            "fc00::/18",
+            "fc00::/18",
+        ),
+        Err(LegacyRulesPlanError::InvalidFakeIp)
+    );
+}
+
 fn exact_interface(name: &str) -> CaptureInterfaceSelector {
     CaptureInterfaceSelector::exact(InterfaceName::new(name.as_bytes()).unwrap())
 }
@@ -230,4 +412,62 @@ fn prefix(value: &str) -> CaptureIpPrefix {
         length.parse::<u8>().unwrap(),
     )
     .unwrap()
+}
+
+fn general_plan<const N: usize>(
+    mode: LegacyApplicationMode,
+    uids: [u32; N],
+    features: LegacyKernelFeatures,
+    performance_mode: bool,
+    mss_clamp: bool,
+    ipv6_enabled: bool,
+    routing_mark: Option<u32>,
+) -> LegacyRulesPlan {
+    LegacyRulesPlan::new(
+        1536,
+        0xff,
+        routing_mark,
+        LegacyOwnerMatch::new(
+            LegacyOwnerToken::new("root").unwrap(),
+            LegacyOwnerToken::new("root").unwrap(),
+        ),
+        LegacyApplicationPolicy::new(mode, uids).unwrap(),
+        LegacyInterfacePolicy::new(
+            [pattern("wlan+")],
+            LegacyInterfaceRole::new(Some(pattern("rmnet_data+")), true),
+            LegacyInterfaceRole::new(Some(pattern("wlan0")), false),
+            LegacyInterfaceRole::new(Some(pattern("wlan2")), true),
+            LegacyInterfaceRole::new(Some(pattern("rndis+")), false),
+        )
+        .unwrap(),
+        features,
+        performance_mode,
+        mss_clamp,
+        ipv6_enabled,
+        "198.18.0.0/15",
+        "fc00::/18",
+    )
+    .unwrap()
+}
+
+fn empty_interfaces() -> LegacyInterfacePolicy {
+    let empty = LegacyInterfaceRole::new(None, false);
+    LegacyInterfacePolicy::new([], empty.clone(), empty.clone(), empty.clone(), empty).unwrap()
+}
+
+fn pattern(value: &str) -> LegacyInterfacePattern {
+    LegacyInterfacePattern::new(value).unwrap()
+}
+
+fn render_text(
+    plan: &LegacyRulesPlan,
+    action: XtablesRestoreAction,
+    family: XtablesRestoreFamily,
+) -> String {
+    let artifact = render_legacy_rules_restore(LegacyRulesRenderRequest::new(
+        XtablesRestoreContext::new(action, family),
+        plan,
+    ))
+    .unwrap();
+    String::from_utf8(artifact.render_canonical().into_vec()).unwrap()
 }

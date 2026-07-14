@@ -17,8 +17,8 @@ use flux_platform::internal::{
     TerminationOutcome,
 };
 use flux_platform::{
-    ProcessHandle, ProcessHandleError, ProcessHandleErrorKind, ReadinessEvidence, SingBoxExit,
-    SingBoxLaunchSpec, SingBoxLauncher,
+    ProcessHandle, ProcessHandleError, ProcessHandleErrorKind, ProcessObservation,
+    ReadinessEvidence, SingBoxExit, SingBoxLaunchSpec, SingBoxLauncher,
 };
 use sha2::{Digest, Sha256};
 
@@ -379,6 +379,14 @@ impl EngineChildAuthority {
     }
 
     #[cfg(test)]
+    pub(crate) fn from_process_handle_for_test(
+        handle: ProcessHandle,
+        engine_snapshot_revision: NonZeroU64,
+    ) -> Result<Self, EngineChildAuthorityError> {
+        Self::from_process_handle(handle, engine_snapshot_revision)
+    }
+
+    #[cfg(test)]
     pub(crate) fn scripted(
         identity: OwnedEngineIdentity,
         engine_snapshot_revision: NonZeroU64,
@@ -414,14 +422,269 @@ impl EngineChildAuthority {
         self.opened_at
     }
 
-    /// The process verifier will use this exact handle for its before/after
-    /// observations once a production receipt authority is qualified.
-    #[allow(dead_code)]
-    pub(crate) fn process_handle(&self) -> Option<&ProcessHandle> {
-        match &self.transport {
-            EngineChildAuthorityTransport::Production(handle) => Some(handle),
+    /// Consume this authority to preserve its child-origin initial observation
+    /// and reobserve the same retained handle exactly once.
+    ///
+    /// The exclusive deadline is checked both before and after the full
+    /// reobservation. The returned pair retains the handle privately, exposes
+    /// no signaling/waiting/reaping operations, and cannot be cloned.
+    pub(crate) fn observe_after_until(
+        self,
+        exclusive_deadline: Instant,
+    ) -> Result<EngineChildObservationPair, EngineChildObservationError> {
+        self.observe_after_until_with_clock(exclusive_deadline, Instant::now)
+    }
+
+    fn observe_after_until_with_clock<F>(
+        self,
+        exclusive_deadline: Instant,
+        mut monotonic_now: F,
+    ) -> Result<EngineChildObservationPair, EngineChildObservationError>
+    where
+        F: FnMut() -> Instant,
+    {
+        let Self {
+            identity,
+            engine_snapshot_revision,
+            opening_id,
+            opened_at,
+            transport,
+        } = self;
+        #[cfg(not(test))]
+        let EngineChildAuthorityTransport::Production(handle) = transport;
+        #[cfg(test)]
+        let handle = match transport {
+            EngineChildAuthorityTransport::Production(handle) => handle,
+            EngineChildAuthorityTransport::Scripted => {
+                return Err(EngineChildObservationError::ScriptedAuthority);
+            }
+        };
+        let reobserve_started_at = monotonic_now();
+        if opened_at >= exclusive_deadline || reobserve_started_at >= exclusive_deadline {
+            return Err(EngineChildObservationError::DeadlineExpired {
+                phase: EngineChildObservationPhase::BeforeReobserve,
+                exclusive_deadline,
+                observed_at: reobserve_started_at,
+            });
+        }
+
+        let before = handle.initial_observation();
+        let before_identity = OwnedEngineIdentity::new(
+            before.identity().pid(),
+            before.identity().start_time_ticks(),
+        );
+        if before_identity != identity {
+            return Err(EngineChildObservationError::IdentityMismatch {
+                phase: EngineChildObservationPhase::Initial,
+                expected: identity,
+                observed: before_identity,
+            });
+        }
+
+        let after = handle.reobserve();
+        let observed_after_at = monotonic_now();
+        if observed_after_at >= exclusive_deadline {
+            return Err(EngineChildObservationError::DeadlineExpired {
+                phase: EngineChildObservationPhase::AfterReobserve,
+                exclusive_deadline,
+                observed_at: observed_after_at,
+            });
+        }
+        let after =
+            after.map_err(|source| EngineChildObservationError::ProcessHandle { source })?;
+        let after_identity =
+            OwnedEngineIdentity::new(after.identity().pid(), after.identity().start_time_ticks());
+        if after_identity != identity {
+            return Err(EngineChildObservationError::IdentityMismatch {
+                phase: EngineChildObservationPhase::AfterReobserve,
+                expected: identity,
+                observed: after_identity,
+            });
+        }
+
+        Ok(EngineChildObservationPair {
+            identity,
+            engine_snapshot_revision,
+            opening_id,
+            before: EngineChildProcessObservation {
+                process: before,
+                observed_at: opened_at,
+            },
+            after: EngineChildProcessObservation {
+                process: after,
+                observed_at: observed_after_at,
+            },
+            _handle: handle,
+        })
+    }
+}
+
+/// One daemon-timestamped point-in-time observation from an exact retained
+/// engine-child handle.
+pub(crate) struct EngineChildProcessObservation {
+    process: ProcessObservation,
+    observed_at: Instant,
+}
+
+impl EngineChildProcessObservation {
+    #[must_use]
+    pub(crate) const fn process(&self) -> &ProcessObservation {
+        &self.process
+    }
+
+    #[must_use]
+    pub(crate) const fn observed_at(&self) -> Instant {
+        self.observed_at
+    }
+}
+
+/// Non-cloneable proof that one engine-child authority supplied both the
+/// initial and final observations through the same retained process handle.
+pub(crate) struct EngineChildObservationPair {
+    identity: OwnedEngineIdentity,
+    engine_snapshot_revision: NonZeroU64,
+    opening_id: NonZeroU64,
+    before: EngineChildProcessObservation,
+    after: EngineChildProcessObservation,
+    _handle: ProcessHandle,
+}
+
+impl EngineChildObservationPair {
+    #[must_use]
+    pub(crate) const fn identity(&self) -> OwnedEngineIdentity {
+        self.identity
+    }
+
+    #[must_use]
+    pub(crate) const fn engine_snapshot_revision(&self) -> NonZeroU64 {
+        self.engine_snapshot_revision
+    }
+
+    #[must_use]
+    pub(crate) const fn opening_id(&self) -> NonZeroU64 {
+        self.opening_id
+    }
+
+    #[must_use]
+    pub(crate) const fn before(&self) -> &EngineChildProcessObservation {
+        &self.before
+    }
+
+    #[must_use]
+    pub(crate) const fn after(&self) -> &EngineChildProcessObservation {
+        &self.after
+    }
+}
+
+impl fmt::Debug for EngineChildObservationPair {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EngineChildObservationPair")
+            .field("identity", &self.identity)
+            .field("engine_snapshot_revision", &self.engine_snapshot_revision)
+            .field("opening_id", &self.opening_id)
+            .field("before", &self.before.process)
+            .field("before_observed_at", &self.before.observed_at)
+            .field("after", &self.after.process)
+            .field("after_observed_at", &self.after.observed_at)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EngineChildObservationPhase {
+    Initial,
+    BeforeReobserve,
+    AfterReobserve,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EngineChildObservationErrorKind {
+    DeadlineExpired,
+    IdentityChanged,
+    ProcessHandle(ProcessHandleErrorKind),
+    #[cfg(test)]
+    ScriptedAuthority,
+}
+
+#[derive(Debug)]
+pub(crate) enum EngineChildObservationError {
+    DeadlineExpired {
+        phase: EngineChildObservationPhase,
+        exclusive_deadline: Instant,
+        observed_at: Instant,
+    },
+    IdentityMismatch {
+        phase: EngineChildObservationPhase,
+        expected: OwnedEngineIdentity,
+        observed: OwnedEngineIdentity,
+    },
+    ProcessHandle {
+        source: ProcessHandleError,
+    },
+    #[cfg(test)]
+    ScriptedAuthority,
+}
+
+impl EngineChildObservationError {
+    #[must_use]
+    pub(crate) const fn kind(&self) -> EngineChildObservationErrorKind {
+        match self {
+            Self::DeadlineExpired { .. } => EngineChildObservationErrorKind::DeadlineExpired,
+            Self::IdentityMismatch { .. } => EngineChildObservationErrorKind::IdentityChanged,
+            Self::ProcessHandle { source } => {
+                EngineChildObservationErrorKind::ProcessHandle(source.kind())
+            }
             #[cfg(test)]
-            EngineChildAuthorityTransport::Scripted => None,
+            Self::ScriptedAuthority => EngineChildObservationErrorKind::ScriptedAuthority,
+        }
+    }
+}
+
+impl fmt::Display for EngineChildObservationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DeadlineExpired {
+                phase,
+                exclusive_deadline,
+                observed_at,
+            } => write!(
+                formatter,
+                "engine child observation deadline expired during {phase:?}: deadline {exclusive_deadline:?}, observed at {observed_at:?}",
+            ),
+            Self::IdentityMismatch {
+                phase,
+                expected,
+                observed,
+            } => write!(
+                formatter,
+                "engine child identity changed during {phase:?}: expected PID {} start ticks {}, observed PID {} start ticks {}",
+                expected.pid(),
+                expected.start_time_ticks(),
+                observed.pid(),
+                observed.start_time_ticks(),
+            ),
+            Self::ProcessHandle { source } => {
+                write!(
+                    formatter,
+                    "cannot reobserve exact engine child authority: {source}"
+                )
+            }
+            #[cfg(test)]
+            Self::ScriptedAuthority => formatter.write_str(
+                "scripted engine child authority has no child-origin process observation",
+            ),
+        }
+    }
+}
+
+impl Error for EngineChildObservationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::ProcessHandle { source } => Some(source),
+            Self::DeadlineExpired { .. } | Self::IdentityMismatch { .. } => None,
+            #[cfg(test)]
+            Self::ScriptedAuthority => None,
         }
     }
 }
@@ -456,6 +719,7 @@ impl fmt::Debug for EngineChildAuthority {
 const _: fn() = || {
     fn assert_send_static<T: Send + 'static>() {}
     assert_send_static::<EngineChildAuthority>();
+    assert_send_static::<EngineChildObservationPair>();
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2554,29 +2818,74 @@ mod tests {
         let authority = supervisor
             .open_child_authority(identity, revision, &spec)
             .expect("open production child authority");
-        let process_handle = authority
-            .process_handle()
-            .expect("production authority retains a process handle");
+        let opening_id = authority.opening_id();
+        let opened_at = authority.opened_at();
+        let observations = authority
+            .observe_after_until(Instant::now() + Duration::from_secs(1))
+            .expect("observe the same live supervised child before and after");
+        assert_eq!(observations.identity(), identity);
+        assert_eq!(observations.engine_snapshot_revision(), revision);
+        assert_eq!(observations.opening_id(), opening_id);
         assert_eq!(
-            process_handle
-                .reobserve()
-                .expect("reobserve live supervised child")
-                .identity(),
-            process_handle.identity()
+            observations.before().process().identity(),
+            observations.after().process().identity()
         );
+        assert_eq!(
+            observations.before().process().credentials(),
+            observations.after().process().credentials()
+        );
+        assert_eq!(observations.before().observed_at(), opened_at);
+        assert!(observations.after().observed_at() >= opened_at);
+
+        let late_observer = supervisor
+            .open_child_authority(identity, revision, &spec)
+            .expect("open an exact authority for post-scan deadline rejection");
+        let late_deadline = late_observer.opened_at() + Duration::from_secs(1);
+        let mut observation_times = [late_observer.opened_at(), late_deadline].into_iter();
+        assert_eq!(
+            late_observer
+                .observe_after_until_with_clock(late_deadline, || {
+                    observation_times
+                        .next()
+                        .expect("two observation clock reads")
+                })
+                .expect_err("completion at the exclusive deadline is rejected")
+                .kind(),
+            EngineChildObservationErrorKind::DeadlineExpired
+        );
+
+        let expired_observer = supervisor
+            .open_child_authority(identity, revision, &spec)
+            .expect("open an exact authority for deadline rejection");
+        assert_eq!(
+            expired_observer
+                .observe_after_until(Instant::now())
+                .expect_err("the observation deadline is exclusive")
+                .kind(),
+            EngineChildObservationErrorKind::DeadlineExpired
+        );
+
+        let exit_observer = supervisor
+            .open_child_authority(identity, revision, &spec)
+            .expect("open an exit observer while the child is live");
+        assert_ne!(exit_observer.opening_id(), opening_id);
 
         assert!(matches!(
             supervisor
                 .reconcile(DesiredEngine::Stopped, CaptureObservation::Detached)
-                .expect("supervisor retains stop and reap ownership"),
+                .expect("observation authority does not interfere with stop/reap"),
             EngineReport::Stopped { .. }
         ));
         assert_eq!(
-            process_handle
-                .reobserve()
+            exit_observer
+                .observe_after_until(Instant::now() + Duration::from_secs(1))
                 .expect_err("retained pidfd observes the reaped child exit")
                 .kind(),
-            ProcessHandleErrorKind::Exited
+            EngineChildObservationErrorKind::ProcessHandle(ProcessHandleErrorKind::Exited)
+        );
+        assert_eq!(
+            observations.after().process().identity(),
+            observations.before().process().identity()
         );
     }
 

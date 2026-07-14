@@ -21,9 +21,9 @@
 
 use std::convert::Infallible;
 
-use crate::engine_supervisor::EngineChildAuthority;
 #[cfg(test)]
 use crate::engine_supervisor::OwnedEngineIdentity;
+use crate::engine_supervisor::{EngineChildAuthority, EngineChildObservationPair};
 
 use super::{
     CanaryAttemptRequest, CanaryAttemptSocketObserverSession, CanaryAvailability,
@@ -1642,6 +1642,16 @@ struct CaptureReceiptBoundTproxyLocalOutputArtifacts<P, R> {
     observations: R,
 }
 
+/// Sealed raw engine observation stage. The pair is authoritative for one
+/// exact child-origin handle, but it is deliberately insufficient to mint the
+/// final all-role process-ownership receipt.
+struct EngineObservationBoundTproxyLocalOutputArtifacts<P, R> {
+    capture_receipt: TproxyLocalOutputCaptureReceipt,
+    engine_observations: EngineChildObservationPair,
+    process_proof: P,
+    observations: R,
+}
+
 struct ReceiptBoundTproxyLocalOutputArtifacts<R> {
     capture_receipt: TproxyLocalOutputCaptureReceipt,
     process_ownership_receipt: TproxyLocalOutputProcessOwnershipReceipt,
@@ -1726,6 +1736,56 @@ fn normalize_post_preparation_failure(error: FunctionalCanaryError) -> Functiona
             &error,
         ),
     }
+}
+
+fn bind_engine_child_observations<P, R>(
+    request: &CanaryAttemptRequest,
+    engine_child: EngineChildAuthority,
+    capture_bound: CaptureReceiptBoundTproxyLocalOutputArtifacts<P, R>,
+) -> Result<EngineObservationBoundTproxyLocalOutputArtifacts<P, R>, FunctionalCanaryError> {
+    let engine_observations = engine_child
+        .observe_after_until(request.deadline().expires_at())
+        .map_err(|source| {
+            let diagnostic = format!(
+                "authoritative engine reobservation failed after local-OUTPUT preparation ({:?}): {source}",
+                source.kind(),
+            );
+            FunctionalCanaryError::new(
+                CanaryErrorKind::CleanupUncertain,
+                CanaryCleanupStatus::Uncertain,
+                &diagnostic,
+            )
+        })?;
+    let expected = request.pre_binding().engine();
+    let before = engine_observations.before();
+    let after = engine_observations.after();
+    let before_identity = before.process().identity();
+    let after_identity = after.process().identity();
+    let deadline = request.deadline();
+    if engine_observations.identity() != expected.engine()
+        || engine_observations.engine_snapshot_revision() != expected.engine_snapshot_revision()
+        || engine_observations.opening_id().get() == 0
+        || before_identity.pid().get() != expected.engine().pid()
+        || before_identity.start_time_ticks().get() != expected.engine().start_time_ticks()
+        || after_identity != before_identity
+        || before.process().credentials() != after.process().credentials()
+        || before.observed_at() < deadline.started_at()
+        || before.observed_at() >= deadline.expires_at()
+        || after.observed_at() < before.observed_at()
+        || after.observed_at() >= deadline.expires_at()
+    {
+        return Err(FunctionalCanaryError::new(
+            CanaryErrorKind::CleanupUncertain,
+            CanaryCleanupStatus::Uncertain,
+            "authoritative engine observation pair does not match the immutable request, stable credentials, or deadline chronology",
+        ));
+    }
+    Ok(EngineObservationBoundTproxyLocalOutputArtifacts {
+        capture_receipt: capture_bound.capture_receipt,
+        engine_observations,
+        process_proof: capture_bound.process_proof,
+        observations: capture_bound.observations,
+    })
 }
 
 fn contract_failure(
@@ -1819,11 +1879,17 @@ impl TproxyLocalOutputProcessOwnershipVerifier<Infallible, Infallible>
 {
     fn verify_process_ownership(
         &mut self,
-        _request: &CanaryAttemptRequest,
-        _engine_child: EngineChildAuthority,
+        request: &CanaryAttemptRequest,
+        engine_child: EngineChildAuthority,
         capture_bound: CaptureReceiptBoundTproxyLocalOutputArtifacts<Infallible, Infallible>,
     ) -> Result<ReceiptBoundTproxyLocalOutputArtifacts<Infallible>, FunctionalCanaryError> {
-        match capture_bound.process_proof {}
+        let EngineObservationBoundTproxyLocalOutputArtifacts {
+            capture_receipt: _,
+            engine_observations: _,
+            process_proof,
+            observations: _,
+        } = bind_engine_child_observations(request, engine_child, capture_bound)?;
+        match process_proof {}
     }
 }
 
@@ -1847,6 +1913,8 @@ impl TproxyLocalOutputEvidenceFactory<Infallible> for TproxyCanaryEvidenceFactor
 #[cfg(test)]
 mod tests {
     use std::num::{NonZeroU32, NonZeroU64};
+    #[cfg(target_os = "linux")]
+    use std::process::Command;
     use std::sync::Arc;
     #[cfg(any(target_os = "linux", target_os = "android"))]
     use std::sync::atomic::AtomicBool;
@@ -1860,6 +1928,8 @@ mod tests {
         CanaryAddressFamilies, CanaryDeadline, UnqualifiedCanaryCleanupEvidence,
         UnqualifiedCanaryFlowEvidenceSlots,
     };
+    #[cfg(target_os = "linux")]
+    use flux_platform::ProcessHandle;
 
     #[test]
     fn xtables_reports_unsupported_before_mutation() {
@@ -2175,6 +2245,137 @@ mod tests {
         assert_eq!(factory_calls.load(Ordering::SeqCst), 0);
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exact_engine_observation_pair_reaches_only_the_process_verifier() {
+        let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+        let mut request = fixture.request().clone();
+        let mut child = EngineObservationTestChild::sleeping();
+        let handle = ProcessHandle::open_child(&child.0).expect("open exact test-child handle");
+        let process_identity = handle.identity();
+        let revision = request.pre_binding().engine().engine_snapshot_revision();
+        let authority = EngineChildAuthority::from_process_handle_for_test(handle, revision)
+            .expect("bind test child authority");
+        let opening_id = authority.opening_id();
+        request.pre_binding.engine.engine =
+            OwnedEngineIdentity::new(process_identity.pid(), process_identity.start_time_ticks());
+        let seed = Fixture::from_request(request.clone()).successful_evidence();
+        let capture_verifier_calls = Arc::new(AtomicUsize::new(0));
+        let process_verifier_calls = Arc::new(AtomicUsize::new(0));
+        let factory_calls = Arc::new(AtomicUsize::new(0));
+        let mut executor = TproxyLocalOutputExecutor::new(
+            ScriptedProofDriver::new(&request, &seed),
+            ScriptedCaptureVerifier {
+                calls: Arc::clone(&capture_verifier_calls),
+            },
+            RecordingRawEngineObservationVerifier {
+                calls: Arc::clone(&process_verifier_calls),
+                expected_opening_id: opening_id,
+            },
+            RecordingEvidenceFactory {
+                capture_verifier_calls: Arc::clone(&capture_verifier_calls),
+                process_verifier_calls: Arc::clone(&process_verifier_calls),
+                calls: Arc::clone(&factory_calls),
+                panic_on_call: true,
+            },
+        );
+        let socket_observer = CanaryAttemptSocketObserverSession::scripted(
+            request
+                .pre_binding()
+                .environment()
+                .authority()
+                .socket_observer_binding(),
+            request.deadline(),
+        );
+        let execution = UnqualifiedFunctionalCanaryExecution::new(
+            &request,
+            socket_observer,
+            Box::new(move || Ok(authority)),
+        )
+        .expect("bind real engine authority to the exact request");
+
+        let error = executor.execute(execution).expect_err(
+            "raw engine observation checkpoint deliberately stops before receipt minting",
+        );
+
+        assert_eq!(error.kind(), CanaryErrorKind::ResponseMismatch);
+        assert_eq!(error.cleanup(), CanaryCleanupStatus::VerifiedAbsent);
+        assert!(error.diagnostic().contains("without minting"));
+        assert_eq!(capture_verifier_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(process_verifier_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(factory_calls.load(Ordering::SeqCst), 0);
+        assert!(
+            child
+                .0
+                .try_wait()
+                .expect("process verifier does not reap the child")
+                .is_none()
+        );
+        child.terminate_and_reap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn engine_exit_during_final_observation_fails_with_uncertain_cleanup() {
+        let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+        let mut request = fixture.request().clone();
+        let mut child = EngineObservationTestChild::sleeping();
+        let handle = ProcessHandle::open_child(&child.0).expect("open exact test-child handle");
+        let process_identity = handle.identity();
+        let revision = request.pre_binding().engine().engine_snapshot_revision();
+        let authority = EngineChildAuthority::from_process_handle_for_test(handle, revision)
+            .expect("bind test child authority");
+        let opening_id = authority.opening_id();
+        request.pre_binding.engine.engine =
+            OwnedEngineIdentity::new(process_identity.pid(), process_identity.start_time_ticks());
+        let seed = Fixture::from_request(request.clone()).successful_evidence();
+        child.terminate_and_reap();
+        let capture_verifier_calls = Arc::new(AtomicUsize::new(0));
+        let process_verifier_calls = Arc::new(AtomicUsize::new(0));
+        let factory_calls = Arc::new(AtomicUsize::new(0));
+        let mut executor = TproxyLocalOutputExecutor::new(
+            ScriptedProofDriver::new(&request, &seed),
+            ScriptedCaptureVerifier {
+                calls: Arc::clone(&capture_verifier_calls),
+            },
+            RecordingRawEngineObservationVerifier {
+                calls: Arc::clone(&process_verifier_calls),
+                expected_opening_id: opening_id,
+            },
+            RecordingEvidenceFactory {
+                capture_verifier_calls: Arc::clone(&capture_verifier_calls),
+                process_verifier_calls: Arc::clone(&process_verifier_calls),
+                calls: Arc::clone(&factory_calls),
+                panic_on_call: true,
+            },
+        );
+        let socket_observer = CanaryAttemptSocketObserverSession::scripted(
+            request
+                .pre_binding()
+                .environment()
+                .authority()
+                .socket_observer_binding(),
+            request.deadline(),
+        );
+        let execution = UnqualifiedFunctionalCanaryExecution::new(
+            &request,
+            socket_observer,
+            Box::new(move || Ok(authority)),
+        )
+        .expect("bind exited engine authority to the exact request");
+
+        let error = executor
+            .execute(execution)
+            .expect_err("exited engine cannot produce a final observation pair");
+
+        assert_eq!(error.kind(), CanaryErrorKind::CleanupUncertain);
+        assert_eq!(error.cleanup(), CanaryCleanupStatus::Uncertain);
+        assert!(error.diagnostic().contains("reobserve"));
+        assert_eq!(capture_verifier_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(process_verifier_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(factory_calls.load(Ordering::SeqCst), 0);
+    }
+
     #[derive(Clone)]
     struct ScriptedCaptureProof {
         request: CanaryAttemptRequest,
@@ -2361,6 +2562,106 @@ mod tests {
                 process_ownership_receipt,
                 observations: capture_bound.observations,
             })
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    struct RecordingRawEngineObservationVerifier {
+        calls: Arc<AtomicUsize>,
+        expected_opening_id: NonZeroU64,
+    }
+
+    #[cfg(target_os = "linux")]
+    struct EngineObservationTestChild(std::process::Child);
+
+    #[cfg(target_os = "linux")]
+    impl EngineObservationTestChild {
+        fn sleeping() -> Self {
+            Self(
+                Command::new("sleep")
+                    .arg("30")
+                    .spawn()
+                    .expect("spawn engine observation test child"),
+            )
+        }
+
+        fn terminate_and_reap(&mut self) {
+            if self.0.try_wait().expect("inspect test child").is_none() {
+                self.0.kill().expect("terminate test child");
+                self.0.wait().expect("reap test child");
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for EngineObservationTestChild {
+        fn drop(&mut self) {
+            self.terminate_and_reap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl TproxyLocalOutputProcessOwnershipVerifier<ScriptedProcessProof, ScriptedRawObservations>
+        for RecordingRawEngineObservationVerifier
+    {
+        fn verify_process_ownership(
+            &mut self,
+            request: &CanaryAttemptRequest,
+            engine_child: EngineChildAuthority,
+            capture_bound: CaptureReceiptBoundTproxyLocalOutputArtifacts<
+                ScriptedProcessProof,
+                ScriptedRawObservations,
+            >,
+        ) -> Result<
+            ReceiptBoundTproxyLocalOutputArtifacts<ScriptedRawObservations>,
+            FunctionalCanaryError,
+        > {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let engine_bound =
+                bind_engine_child_observations(request, engine_child, capture_bound)?;
+            assert_eq!(
+                engine_bound.engine_observations.opening_id(),
+                self.expected_opening_id
+            );
+            assert_eq!(
+                engine_bound.engine_observations.identity(),
+                request.pre_binding().engine().engine()
+            );
+            assert_eq!(
+                engine_bound.engine_observations.engine_snapshot_revision(),
+                request.pre_binding().engine().engine_snapshot_revision()
+            );
+            assert_eq!(
+                engine_bound
+                    .engine_observations
+                    .before()
+                    .process()
+                    .credentials(),
+                engine_bound
+                    .engine_observations
+                    .after()
+                    .process()
+                    .credentials()
+            );
+            assert_eq!(&engine_bound.process_proof.request, request);
+            assert_eq!(
+                engine_bound.process_proof.cleanup,
+                engine_bound.observations.cleanup
+            );
+            assert_eq!(
+                engine_bound.capture_receipt.validate_for(
+                    request,
+                    &engine_bound.observations.flows,
+                    engine_bound.observations.completed_at,
+                    engine_bound.observations.client_quiesced_at,
+                ),
+                Ok(())
+            );
+            Err(FunctionalCanaryError::new(
+                CanaryErrorKind::ResponseMismatch,
+                CanaryCleanupStatus::VerifiedAbsent,
+                "recorded exact raw engine observations without minting a process receipt",
+            ))
         }
     }
 

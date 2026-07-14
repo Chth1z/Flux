@@ -412,6 +412,20 @@ impl ProcessHandle {
         &self.credentials
     }
 
+    /// Return the exact identity and credentials captured while this child-
+    /// origin handle was opened.
+    ///
+    /// The returned value is an owned observation so callers can retain it
+    /// alongside a later [`Self::reobserve`] result without cloning or
+    /// reconstructing process authority from a PID.
+    #[must_use]
+    pub fn initial_observation(&self) -> ProcessObservation {
+        ProcessObservation {
+            identity: self.identity,
+            credentials: self.credentials.clone(),
+        }
+    }
+
     /// Reobserve the same live pidfd-bound process.
     ///
     /// Exit is reported as [`ProcessHandleErrorKind::Exited`]. Success proves

@@ -188,9 +188,16 @@ executor invokes that opener only after read-only backend availability succeeds 
 prepared-attempt boundary, so the current xtables `Unsupported` result performs no pidfd/procfs
 scan. A successful opening carries a private nonzero opening identity and daemon-owned observation
 time, then moves into the process-verifier boundary after capture verification. This is still
-observation and model plumbing. Production receipt authority remains uninhabited because the
-placeholder verifier does not yet perform authoritative before/after observations or retain and
-retire real client/peer `Child` values.
+observation and model plumbing. The next independently reviewed slice now consumes that authority
+inside the process-verifier boundary, preserves the initial child-origin identity and credential
+scan, reobserves the same retained pidfd after capture verification, and returns a non-cloneable
+raw pair bound to the exact engine identity, snapshot revision, opening identity, and exclusive
+attempt deadline. The final observation is timestamped only after the complete procfs scan, the
+pair retains the handle privately without exposing signal/wait/reap operations, and an exit or
+deadline failure after preparation becomes cleanup-uncertain. Production receipt authority remains
+uninhabited: the raw pair does not yet observe the user/mount/network namespace and UID/GID-map
+domain, retain and retire real client/peer `Child` values, or establish the final verifier-side
+attempt-completion timestamp required by receipt chronology.
 
 ### Fail-closed local-OUTPUT executor seam
 
@@ -216,9 +223,10 @@ PREROUTING traffic, a veth bounce, counters, or route-lookup inference. Its raw 
 capture/process receipt authorities, and current factory input are uninhabited, so the seam cannot
 produce a positive host result.
 
-The remaining integration subcheckpoints must use the delivered engine authority for real
-before/after observations, bind client/peer authority to driver-retained children, construct the
-delivered report-object and temporal cleanup evidence, and use the real pre-opened
+The remaining integration subcheckpoints must validate the delivered raw engine observation pair
+against the request credential policy and authoritative namespace/map domain, bind client/peer
+authority to driver-retained children, establish final verifier completion chronology, construct
+the delivered report-object and temporal cleanup evidence, and use the real pre-opened
 socket-diagnostics authority for actual observations. A later positive producer must also replace
 both sealed receipt authorities with reviewed concrete verifiers. A
 separately qualified cgroup-BPF observer may later replace supervised delivery reports only after
@@ -533,8 +541,9 @@ functional pass.
    deadline chronology. The Linux/Android pidfd substrate opens only from retained children,
    validates stable process-wide thread credentials, distinguishes exit from parent reap, and is
    exercised by the no-traffic credential preflight. Production receipt authority remains
-   uninhabited. The engine-child authority handoff below is delivered, but authoritative
-   before/after process observation and real driver child integration remain open.
+   uninhabited. The engine-child authority handoff and raw same-pidfd before/after pair below are
+   delivered, but credential-policy/domain validation, final verifier completion chronology, and
+   real driver child integration remain open.
 13. **Incomplete local-OUTPUT integration-plumbing checkpoint:** deliver this work as separately
    reviewed subcheckpoints so no plumbing-only step is mistaken for capture qualification:
    - **13a complete — retained engine-child authority handoff:**
@@ -551,11 +560,24 @@ functional pass.
      request/revision/deadline mismatch rejection, a real Supervisor-to-pidfd lifecycle, successful
      required-mode opening, and the xtables path preserving `Unsupported` without opening an
      authority or reaching `RUNNING`.
-   - **13b pending — authoritative process observation and driver-child ownership:** use the exact
-     engine authority for before/after observations in a reviewed process verifier, and retain
-     driver-owned client/peer `Child` values through exact termination and parent reap. No
-     component may reconstruct authority from a PID or mint the process receipt from copied
-     identities.
+   - **13b-1 complete — exact engine observation pair:** the process verifier consumes the exact
+     engine authority, preserves its child-origin initial observation, and reobserves the same
+     retained pidfd after capture verification. One non-cloneable raw pair binds both observations
+     to the engine identity, snapshot revision, private opening identity, stable credentials, and
+     exclusive request deadline while retaining no signal/wait/reap capability. Exit, identity,
+     deadline, or pair-contract failure after preparation is cleanup-uncertain. Tests exercise the
+     real Supervisor-to-pidfd lifecycle, distinct openings, successful verifier-only handoff, and
+     exit between observations. This slice does not mint a process receipt.
+   - **13b-2a pending — engine credential-policy and process-domain validation:** extend the raw
+     engine observation with authoritative user/mount/network namespace identities and UID/GID-map
+     digests, then require all four UID/GID slots to match the request engine credentials, empty
+     supplementary groups, zero inheritable/permitted/effective/ambient capabilities, and
+     `NoNewPrivs`. No expected domain may be copied into an observed field.
+   - **13b-2b pending — driver-child ownership and final receipt chronology:** retain driver-owned
+     client/peer `Child` values through exact termination and parent reap, bind their corresponding
+     process handles and domain observations, and assign final attempt completion only after every
+     verifier observation before minting the process receipt. No component may reconstruct
+     authority from a PID or mint the receipt from copied identities.
    - **13c pending — listener observation:** add an independently authoritative listener observer
      for every required family/protocol role, including UDP listener state, FD/inode/cookie,
      wildcard binding, transparency, and IPv6-only state. The existing outbound connected-socket

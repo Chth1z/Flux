@@ -247,9 +247,13 @@ fn child_origin_handle_reobserves_the_same_live_identity_and_credentials() {
     let handle = ProcessHandle::open_child(&child.child).expect("open exact child handle");
     assert_eq!(handle.identity().pid().get(), child.child.id());
 
+    let initial = handle.initial_observation();
+    assert_eq!(initial.identity(), handle.identity());
+    assert_eq!(initial.credentials(), handle.credentials());
+
     let observation = handle.reobserve().expect("reobserve live child");
-    assert_eq!(observation.identity(), handle.identity());
-    assert_eq!(observation.credentials(), handle.credentials());
+    assert_eq!(observation.identity(), initial.identity());
+    assert_eq!(observation.credentials(), initial.credentials());
 }
 
 #[test]

@@ -15,7 +15,8 @@ use flux_platform::internal::{
     TerminationOutcome,
 };
 use flux_platform::{
-    ShutdownSignal, SingBoxExit, SingBoxLaunchSpec, SingBoxLauncher, SingBoxReadiness,
+    ProcessHandleErrorKind, ShutdownSignal, SingBoxExit, SingBoxLaunchSpec, SingBoxLauncher,
+    SingBoxReadiness,
 };
 use tempfile::{TempDir, tempdir};
 
@@ -121,6 +122,48 @@ fn direct_spawn_retains_child_identity_and_observes_exit() {
             .expect("read child log")
             .contains("run exiting")
     );
+}
+
+#[test]
+fn retained_sing_box_child_opens_exact_process_handle_without_transferring_reap() {
+    let fixture = Fixture::new("term");
+    let adapter = SingBoxProcessAdapter;
+    let pinned = pin_launch(&fixture.spec);
+    let mut child = adapter
+        .spawn_pinned(&pinned, &fixture.spec)
+        .expect("spawn long-lived fake Sing-Box");
+    wait_for_log(&fixture.spec.log, "term ready");
+
+    let handle = child
+        .open_process_handle()
+        .expect("open exact retained child handle");
+    assert_eq!(handle.identity().pid().get(), child.identity().pid());
+    assert_eq!(
+        handle.identity().start_time_ticks().get(),
+        child.identity().start_time_ticks()
+    );
+    let observation = handle
+        .reobserve()
+        .expect("reobserve the same live Sing-Box child");
+    assert_eq!(observation.identity(), handle.identity());
+    assert_eq!(observation.credentials(), handle.credentials());
+
+    assert_eq!(
+        adapter
+            .terminate(&mut child, fixture.spec.stop_timeout)
+            .expect("the adapter retains termination and reap authority"),
+        TerminationOutcome::Terminated {
+            exit: SingBoxExit::Code(0)
+        }
+    );
+    let error = child
+        .open_process_handle()
+        .expect_err("a reaped Sing-Box child cannot issue a fresh process handle");
+    assert_eq!(error.kind(), ProcessHandleErrorKind::Exited);
+    let error = handle
+        .reobserve()
+        .expect_err("a reaped Sing-Box child cannot remain live through its pidfd");
+    assert_eq!(error.kind(), ProcessHandleErrorKind::Exited);
 }
 
 #[test]

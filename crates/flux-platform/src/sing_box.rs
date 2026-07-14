@@ -3,7 +3,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
-use std::num::NonZeroU16;
+use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
@@ -12,6 +12,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::child_process::{self, ChildProcessConfig, ProcessSignal};
+use crate::process::{ProcessHandle, ProcessHandleError, ProcessIdentity};
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use std::collections::HashSet;
@@ -139,6 +140,37 @@ impl SingBoxChild {
     #[must_use]
     pub const fn identity(&self) -> &SingBoxChildIdentity {
         &self.identity
+    }
+
+    /// Open an exact child-origin process handle without transferring the
+    /// supervisor's signaling or reap authority.
+    ///
+    /// The retained [`Child`] is the only accepted origin. The resulting
+    /// pidfd/procfs identity is rechecked against the identity recorded when
+    /// Sing-Box was spawned, so a copied PID or changed start time cannot be
+    /// promoted into child authority.
+    pub fn open_process_handle(&self) -> Result<ProcessHandle, ProcessHandleError> {
+        let pid =
+            NonZeroU32::new(self.identity.pid).ok_or(ProcessHandleError::InvalidChildPid {
+                pid: self.identity.pid,
+            })?;
+        let child = self
+            .child
+            .as_ref()
+            .ok_or(ProcessHandleError::Exited { pid })?;
+        let handle = ProcessHandle::open_child(child)?;
+        let start_time_ticks =
+            NonZeroU64::new(self.identity.start_time_ticks).ok_or_else(|| {
+                ProcessHandleError::MalformedProcStat {
+                    path: PathBuf::from(format!("/proc/{pid}/stat")),
+                }
+            })?;
+        let expected = ProcessIdentity::new(pid, start_time_ticks);
+        let observed = handle.identity();
+        if observed != expected {
+            return Err(ProcessHandleError::ProcessIdentityMismatch { expected, observed });
+        }
+        Ok(handle)
     }
 }
 
@@ -1600,8 +1632,8 @@ fn defer_reap(mut child: Child, pid: u32) {
 mod tests {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     use super::{
-        ReadinessEvidence, SingBoxChild, SingBoxProcessAdapter, SingBoxProcessError,
-        listener_evidence, proc_net_contains_port, read_child_identity,
+        ProcessHandleError, ReadinessEvidence, SingBoxChild, SingBoxProcessAdapter,
+        SingBoxProcessError, listener_evidence, proc_net_contains_port, read_child_identity,
     };
     use super::{bounded_lossy_tail, retain_tail, valid_identity};
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -1663,6 +1695,57 @@ mod tests {
             error,
             SingBoxProcessError::Signal { source, .. }
                 if source.kind() == std::io::ErrorKind::PermissionDenied
+        ));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn process_handle_rejects_a_changed_recorded_child_identity() {
+        let directory = tempfile::tempdir().expect("create process-handle identity fixture");
+        let process = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exec sleep 5")
+            .spawn()
+            .expect("spawn process-handle identity fixture");
+        let actual_identity = read_child_identity(process.id()).expect("read child identity");
+        let mut changed_identity = actual_identity;
+        changed_identity.start_time_ticks = if actual_identity.start_time_ticks == u64::MAX {
+            actual_identity.start_time_ticks - 1
+        } else {
+            actual_identity.start_time_ticks + 1
+        };
+        let log_path = directory.path().join("sing-box.log");
+        let mut child = SingBoxChild {
+            child: Some(process),
+            identity: changed_identity,
+            reaped_exit: None,
+            log: File::create(&log_path).expect("create child log"),
+            log_path,
+        };
+
+        let error = child
+            .open_process_handle()
+            .expect_err("changed recorded identity must not become child authority");
+        let ProcessHandleError::ProcessIdentityMismatch { expected, observed } = error else {
+            panic!("unexpected process-handle error: {error:?}");
+        };
+        assert_eq!(expected.pid().get(), changed_identity.pid);
+        assert_eq!(
+            expected.start_time_ticks().get(),
+            changed_identity.start_time_ticks
+        );
+        assert_eq!(observed.pid().get(), actual_identity.pid);
+        assert_eq!(
+            observed.start_time_ticks().get(),
+            actual_identity.start_time_ticks
+        );
+
+        child.identity = actual_identity;
+        assert!(matches!(
+            SingBoxProcessAdapter
+                .terminate(&mut child, Duration::from_millis(500))
+                .expect("restore exact identity and reap child"),
+            super::TerminationOutcome::Terminated { .. }
         ));
     }
 

@@ -6,6 +6,7 @@ use std::io;
 use std::num::{NonZeroU32, NonZeroU64};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -15,7 +16,10 @@ use flux_platform::internal::{
     PinnedSingBoxLaunch, SingBoxChild, SingBoxProcessAdapter, SingBoxProcessError,
     TerminationOutcome,
 };
-use flux_platform::{ReadinessEvidence, SingBoxExit, SingBoxLaunchSpec, SingBoxLauncher};
+use flux_platform::{
+    ProcessHandle, ProcessHandleError, ProcessHandleErrorKind, ReadinessEvidence, SingBoxExit,
+    SingBoxLaunchSpec, SingBoxLauncher,
+};
 use sha2::{Digest, Sha256};
 
 pub const MAX_ENGINE_DIAGNOSTIC_BYTES: usize = 4 * 1024;
@@ -339,6 +343,207 @@ impl OwnedEngineIdentity {
     pub const fn start_time_ticks(self) -> u64 {
         self.start_time_ticks
     }
+}
+
+/// Non-cloneable observation authority opened from the Supervisor's retained
+/// child. It carries no signaling, waiting, or reaping capability.
+pub(crate) struct EngineChildAuthority {
+    identity: OwnedEngineIdentity,
+    engine_snapshot_revision: NonZeroU64,
+    opening_id: NonZeroU64,
+    opened_at: Instant,
+    transport: EngineChildAuthorityTransport,
+}
+
+static NEXT_ENGINE_CHILD_AUTHORITY_OPENING_ID: AtomicU64 = AtomicU64::new(1);
+
+enum EngineChildAuthorityTransport {
+    Production(ProcessHandle),
+    #[cfg(test)]
+    Scripted,
+}
+
+impl EngineChildAuthority {
+    fn from_process_handle(
+        handle: ProcessHandle,
+        engine_snapshot_revision: NonZeroU64,
+    ) -> Result<Self, EngineChildAuthorityError> {
+        let identity = handle.identity();
+        Ok(Self {
+            identity: OwnedEngineIdentity::new(identity.pid(), identity.start_time_ticks()),
+            engine_snapshot_revision,
+            opening_id: next_engine_child_authority_opening_id()?,
+            opened_at: Instant::now(),
+            transport: EngineChildAuthorityTransport::Production(handle),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scripted(
+        identity: OwnedEngineIdentity,
+        engine_snapshot_revision: NonZeroU64,
+        opened_at: Instant,
+    ) -> Self {
+        Self {
+            identity,
+            engine_snapshot_revision,
+            opening_id: next_engine_child_authority_opening_id()
+                .expect("scripted engine authority opening IDs are not exhausted"),
+            opened_at,
+            transport: EngineChildAuthorityTransport::Scripted,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn identity(&self) -> OwnedEngineIdentity {
+        self.identity
+    }
+
+    #[must_use]
+    pub(crate) const fn engine_snapshot_revision(&self) -> NonZeroU64 {
+        self.engine_snapshot_revision
+    }
+
+    #[must_use]
+    pub(crate) const fn opening_id(&self) -> NonZeroU64 {
+        self.opening_id
+    }
+
+    #[must_use]
+    pub(crate) const fn opened_at(&self) -> Instant {
+        self.opened_at
+    }
+
+    /// The process verifier will use this exact handle for its before/after
+    /// observations once a production receipt authority is qualified.
+    #[allow(dead_code)]
+    pub(crate) fn process_handle(&self) -> Option<&ProcessHandle> {
+        match &self.transport {
+            EngineChildAuthorityTransport::Production(handle) => Some(handle),
+            #[cfg(test)]
+            EngineChildAuthorityTransport::Scripted => None,
+        }
+    }
+}
+
+impl fmt::Debug for EngineChildAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let transport = match &self.transport {
+            EngineChildAuthorityTransport::Production(handle) => {
+                debug_assert_eq!(
+                    OwnedEngineIdentity::new(
+                        handle.identity().pid(),
+                        handle.identity().start_time_ticks(),
+                    ),
+                    self.identity
+                );
+                "pidfd"
+            }
+            #[cfg(test)]
+            EngineChildAuthorityTransport::Scripted => "scripted",
+        };
+        formatter
+            .debug_struct("EngineChildAuthority")
+            .field("identity", &self.identity)
+            .field("engine_snapshot_revision", &self.engine_snapshot_revision)
+            .field("opening_id", &self.opening_id)
+            .field("opened_at", &self.opened_at)
+            .field("transport", &transport)
+            .finish_non_exhaustive()
+    }
+}
+
+const _: fn() = || {
+    fn assert_send_static<T: Send + 'static>() {}
+    assert_send_static::<EngineChildAuthority>();
+};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EngineChildAuthorityErrorKind {
+    StateChanged,
+    ProcessHandle(ProcessHandleErrorKind),
+    OpeningIdentityExhausted,
+}
+
+#[derive(Debug)]
+pub(crate) enum EngineChildAuthorityError {
+    StateChanged {
+        diagnostic: &'static str,
+    },
+    IdentityMismatch {
+        expected: OwnedEngineIdentity,
+        observed: OwnedEngineIdentity,
+    },
+    ProcessHandle {
+        source: ProcessHandleError,
+    },
+    OpeningIdentityExhausted,
+}
+
+impl EngineChildAuthorityError {
+    #[must_use]
+    pub(crate) const fn kind(&self) -> EngineChildAuthorityErrorKind {
+        match self {
+            Self::StateChanged { .. } | Self::IdentityMismatch { .. } => {
+                EngineChildAuthorityErrorKind::StateChanged
+            }
+            Self::ProcessHandle { source } => {
+                EngineChildAuthorityErrorKind::ProcessHandle(source.kind())
+            }
+            Self::OpeningIdentityExhausted => {
+                EngineChildAuthorityErrorKind::OpeningIdentityExhausted
+            }
+        }
+    }
+
+    pub(crate) const fn state_changed(diagnostic: &'static str) -> Self {
+        Self::StateChanged { diagnostic }
+    }
+}
+
+impl fmt::Display for EngineChildAuthorityError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::StateChanged { diagnostic } => formatter.write_str(diagnostic),
+            Self::IdentityMismatch { expected, observed } => write!(
+                formatter,
+                "engine child authority identity mismatch: expected PID {} start ticks {}, observed PID {} start ticks {}",
+                expected.pid(),
+                expected.start_time_ticks(),
+                observed.pid(),
+                observed.start_time_ticks(),
+            ),
+            Self::ProcessHandle { source } => {
+                write!(
+                    formatter,
+                    "cannot open exact engine child authority: {source}"
+                )
+            }
+            Self::OpeningIdentityExhausted => {
+                formatter.write_str("engine child authority opening identity space is exhausted")
+            }
+        }
+    }
+}
+
+impl Error for EngineChildAuthorityError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::ProcessHandle { source } => Some(source),
+            Self::StateChanged { .. }
+            | Self::IdentityMismatch { .. }
+            | Self::OpeningIdentityExhausted => None,
+        }
+    }
+}
+
+fn next_engine_child_authority_opening_id() -> Result<NonZeroU64, EngineChildAuthorityError> {
+    let raw = NEXT_ENGINE_CHILD_AUTHORITY_OPENING_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .map_err(|_| EngineChildAuthorityError::OpeningIdentityExhausted)?;
+    NonZeroU64::new(raw).ok_or(EngineChildAuthorityError::OpeningIdentityExhausted)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -776,6 +981,68 @@ impl EngineSupervisor {
     #[must_use]
     pub fn snapshot(&self) -> Arc<EngineSnapshot> {
         Arc::clone(&self.snapshot)
+    }
+
+    /// Open a non-cloneable observation authority only from the exact live,
+    /// ready child already retained by this Supervisor.
+    pub(crate) fn open_child_authority(
+        &self,
+        expected: OwnedEngineIdentity,
+        expected_snapshot_revision: NonZeroU64,
+        expected_spec: &EngineSpec,
+    ) -> Result<EngineChildAuthority, EngineChildAuthorityError> {
+        if self.snapshot.phase != EnginePhase::Ready {
+            return Err(EngineChildAuthorityError::state_changed(
+                "engine is not ready while opening its child authority",
+            ));
+        }
+        if self.active_spec.as_ref() != Some(expected_spec) {
+            return Err(EngineChildAuthorityError::state_changed(
+                "ready engine active launch specification changed before authority opening",
+            ));
+        }
+        if self.snapshot.revision != expected_snapshot_revision.get() {
+            return Err(EngineChildAuthorityError::state_changed(
+                "ready engine snapshot revision changed before authority opening",
+            ));
+        }
+        if self.readiness.is_none() || self.snapshot.readiness != self.readiness {
+            return Err(EngineChildAuthorityError::state_changed(
+                "ready engine child authority lacks matching readiness evidence",
+            ));
+        }
+        let owned = self.owned_identity.ok_or_else(|| {
+            EngineChildAuthorityError::state_changed("ready engine has no retained owned identity")
+        })?;
+        if self.snapshot.owned_identity != Some(owned) {
+            return Err(EngineChildAuthorityError::state_changed(
+                "ready engine snapshot identity differs from retained ownership",
+            ));
+        }
+        if owned != expected {
+            return Err(EngineChildAuthorityError::IdentityMismatch {
+                expected,
+                observed: owned,
+            });
+        }
+        let child = self.child.as_ref().ok_or_else(|| {
+            EngineChildAuthorityError::state_changed("ready engine has no retained child process")
+        })?;
+        let child_identity = child.identity();
+        if child_identity != owned {
+            return Err(EngineChildAuthorityError::IdentityMismatch {
+                expected: owned,
+                observed: child_identity,
+            });
+        }
+        let authority = child.open_authority(expected_snapshot_revision)?;
+        if authority.identity() != owned {
+            return Err(EngineChildAuthorityError::IdentityMismatch {
+                expected: owned,
+                observed: authority.identity(),
+            });
+        }
+        Ok(authority)
     }
 
     fn with_dependencies(host: Box<dyn EngineHost>, clock: Box<dyn Clock>) -> Self {
@@ -1517,6 +1784,26 @@ impl HostChild {
             Self::Scripted(child) => child.identity,
         }
     }
+
+    fn open_authority(
+        &self,
+        engine_snapshot_revision: NonZeroU64,
+    ) -> Result<EngineChildAuthority, EngineChildAuthorityError> {
+        match self {
+            Self::Production(child) => child
+                .open_process_handle()
+                .map_err(|source| EngineChildAuthorityError::ProcessHandle { source })
+                .and_then(|handle| {
+                    EngineChildAuthority::from_process_handle(handle, engine_snapshot_revision)
+                }),
+            #[cfg(test)]
+            Self::Scripted(child) => Ok(EngineChildAuthority::scripted(
+                child.identity,
+                engine_snapshot_revision,
+                Instant::now(),
+            )),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2154,6 +2441,8 @@ mod tests {
     use std::fs;
     use std::num::NonZeroU16;
     use std::ops::Deref;
+    #[cfg(target_os = "linux")]
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -2182,6 +2471,179 @@ mod tests {
             Some(ReadinessEvidence::Listener { port, .. }) if port.get() == 1536
         ));
         assert_eq!(snapshot.restart_attempts(), 0);
+    }
+
+    #[test]
+    fn ready_supervisor_opens_exact_non_mutating_child_authority() {
+        let (mut supervisor, _host, _clock) = test_supervisor();
+        let spec = test_spec(1536, restart_policy(3));
+        supervisor
+            .reconcile(DesiredEngine::Running(&spec), CaptureObservation::Detached)
+            .expect("start succeeds");
+        let before = supervisor.snapshot();
+        let expected = before.owned_identity().expect("ready identity");
+        let revision = NonZeroU64::new(before.revision()).expect("ready revision is nonzero");
+
+        let authority = supervisor
+            .open_child_authority(expected, revision, &spec)
+            .expect("ready exact child authority opens");
+
+        assert_eq!(authority.identity(), expected);
+        assert_eq!(authority.engine_snapshot_revision(), revision);
+        assert_ne!(authority.opening_id().get(), 0);
+        assert_eq!(supervisor.snapshot(), before);
+        assert!(matches!(
+            supervisor
+                .reconcile(DesiredEngine::Stopped, CaptureObservation::Detached)
+                .expect("authority does not interfere with stop/reap"),
+            EngineReport::Stopped { .. }
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn production_supervisor_authority_observes_exit_without_taking_reap_ownership() {
+        let directory = tempfile::tempdir().expect("create production authority fixture");
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("reserve fake listener port");
+        let port = listener.local_addr().expect("listener address").port();
+        drop(listener);
+        let binary = directory.path().join("sing-box");
+        fs::write(
+            &binary,
+            format!(
+                "#!/bin/sh\ncase \"$1\" in\ncheck) exit 0 ;;\nrun) exec /usr/bin/python3 -c 'import signal,socket; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind((\"127.0.0.1\",{port})); s.listen(); signal.pause()' ;;\nesac\nexit 64\n"
+            ),
+        )
+        .expect("write fake Sing-Box");
+        let mut permissions = fs::metadata(&binary)
+            .expect("fake Sing-Box metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&binary, permissions).expect("make fake Sing-Box executable");
+        let config = directory.path().join("config.json");
+        fs::write(&config, b"{}").expect("write fake configuration");
+        let spec = EngineSpec::new(
+            SingBoxLaunchSpec {
+                binary,
+                config,
+                working_directory: directory.path().to_path_buf(),
+                log: directory.path().join("sing-box.log"),
+                launcher: SingBoxLauncher::Direct,
+                readiness: SingBoxReadiness::Listener {
+                    port: NonZeroU16::new(port).expect("reserved listener port is nonzero"),
+                },
+                startup_timeout: Duration::from_secs(1),
+                stop_timeout: Duration::from_millis(500),
+            },
+            restart_policy(3),
+        )
+        .expect("inspect production authority fixture");
+        let mut supervisor = EngineSupervisor::new();
+        let report = supervisor
+            .reconcile(DesiredEngine::Running(&spec), CaptureObservation::Detached)
+            .expect("production supervisor reaches ready");
+        assert!(
+            matches!(report, EngineReport::Started { .. }),
+            "production supervisor did not start: {report:?}; snapshot: {:?}",
+            supervisor.snapshot()
+        );
+        let snapshot = supervisor.snapshot();
+        let identity = snapshot.owned_identity().expect("ready identity");
+        let revision = NonZeroU64::new(snapshot.revision()).expect("ready revision is nonzero");
+        let authority = supervisor
+            .open_child_authority(identity, revision, &spec)
+            .expect("open production child authority");
+        let process_handle = authority
+            .process_handle()
+            .expect("production authority retains a process handle");
+        assert_eq!(
+            process_handle
+                .reobserve()
+                .expect("reobserve live supervised child")
+                .identity(),
+            process_handle.identity()
+        );
+
+        assert!(matches!(
+            supervisor
+                .reconcile(DesiredEngine::Stopped, CaptureObservation::Detached)
+                .expect("supervisor retains stop and reap ownership"),
+            EngineReport::Stopped { .. }
+        ));
+        assert_eq!(
+            process_handle
+                .reobserve()
+                .expect_err("retained pidfd observes the reaped child exit")
+                .kind(),
+            ProcessHandleErrorKind::Exited
+        );
+    }
+
+    #[test]
+    fn child_authority_rejects_stopped_or_mismatched_engine_identity() {
+        let (mut supervisor, _host, _clock) = test_supervisor();
+        let spec = test_spec(1536, restart_policy(3));
+        let stopped_identity = OwnedEngineIdentity {
+            pid: 1000,
+            start_time_ticks: 10_000,
+        };
+        let stopped_error = supervisor
+            .open_child_authority(
+                stopped_identity,
+                NonZeroU64::new(1).expect("nonzero expected revision"),
+                &spec,
+            )
+            .expect_err("stopped supervisor has no child authority");
+        assert_eq!(
+            stopped_error.kind(),
+            EngineChildAuthorityErrorKind::StateChanged
+        );
+
+        supervisor
+            .reconcile(DesiredEngine::Running(&spec), CaptureObservation::Detached)
+            .expect("start succeeds");
+        let owned = supervisor
+            .snapshot()
+            .owned_identity()
+            .expect("ready identity");
+        let revision =
+            NonZeroU64::new(supervisor.snapshot().revision()).expect("ready revision is nonzero");
+        let stale_revision = NonZeroU64::new(revision.get() + 1).expect("next revision is nonzero");
+        assert_eq!(
+            supervisor
+                .open_child_authority(owned, stale_revision, &spec)
+                .expect_err("stale snapshot revision cannot open authority")
+                .kind(),
+            EngineChildAuthorityErrorKind::StateChanged
+        );
+        let replacement_spec = test_spec(1537, restart_policy(3));
+        assert_eq!(
+            supervisor
+                .open_child_authority(owned, revision, &replacement_spec)
+                .expect_err("different launch specification cannot open authority")
+                .kind(),
+            EngineChildAuthorityErrorKind::StateChanged
+        );
+        let mismatched = OwnedEngineIdentity {
+            pid: owned.pid().saturating_add(1),
+            start_time_ticks: owned.start_time_ticks(),
+        };
+
+        let mismatch_error = supervisor
+            .open_child_authority(mismatched, revision, &spec)
+            .expect_err("copied mismatched identity cannot open authority");
+        assert_eq!(
+            mismatch_error.kind(),
+            EngineChildAuthorityErrorKind::StateChanged
+        );
+        assert!(matches!(
+            mismatch_error,
+            EngineChildAuthorityError::IdentityMismatch {
+                expected,
+                observed,
+            } if expected == mismatched && observed == owned
+        ));
     }
 
     #[test]

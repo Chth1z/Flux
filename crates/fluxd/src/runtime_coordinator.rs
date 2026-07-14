@@ -11,6 +11,9 @@ use flux_platform::{
     DispatcherPhaseCommand, PhaseDispatcherError, PhaseDispatcherPaths, ProcessPhaseDispatcher,
 };
 
+use crate::engine_supervisor::{
+    EngineChildAuthority, EngineChildAuthorityError, EngineChildAuthorityErrorKind,
+};
 use crate::functional_canary::{
     CanaryAddressFamilies, CanaryAttemptBinding, CanaryAttemptRequest,
     CanaryAttemptSocketObserverSession, CanaryCounterDeltaBounds, CanaryDeadline,
@@ -57,6 +60,13 @@ pub(crate) trait EngineRuntime: Send + 'static {
     ) -> Result<EngineReport, EngineSupervisorError>;
 
     fn snapshot(&self) -> Arc<EngineSnapshot>;
+
+    fn open_canary_child_authority(
+        &self,
+        expected: crate::OwnedEngineIdentity,
+        expected_snapshot_revision: NonZeroU64,
+        expected_spec: &EngineSpec,
+    ) -> Result<EngineChildAuthority, EngineChildAuthorityError>;
 }
 
 pub(crate) struct UnqualifiedFunctionalCanaryAttemptInputs {
@@ -253,6 +263,20 @@ impl EngineRuntime for EngineSupervisor {
 
     fn snapshot(&self) -> Arc<EngineSnapshot> {
         EngineSupervisor::snapshot(self)
+    }
+
+    fn open_canary_child_authority(
+        &self,
+        expected: crate::OwnedEngineIdentity,
+        expected_snapshot_revision: NonZeroU64,
+        expected_spec: &EngineSpec,
+    ) -> Result<EngineChildAuthority, EngineChildAuthorityError> {
+        EngineSupervisor::open_child_authority(
+            self,
+            expected,
+            expected_snapshot_revision,
+            expected_spec,
+        )
     }
 }
 
@@ -1320,14 +1344,28 @@ where
                         "detach capture before repairing canary attempt construction",
                     )
                 })?;
-        let execution_input = UnqualifiedFunctionalCanaryExecution::new(&request, socket_observer)
-            .map_err(|source| {
-                functional_canary_error(
-                    "bind functional canary attempt-owned observer",
-                    source,
-                    "detach capture before preparing a fresh canary observer",
+        let expected_engine = request.pre_binding().engine().engine();
+        let expected_snapshot_revision = request.pre_binding().engine().engine_snapshot_revision();
+        let engine = &self.engine;
+        let expected_spec = &generation.spec;
+        let open_engine_child = Box::new(move || {
+            engine
+                .open_canary_child_authority(
+                    expected_engine,
+                    expected_snapshot_revision,
+                    expected_spec,
                 )
-            })?;
+                .map_err(engine_child_authority_error)
+        });
+        let execution_input =
+            UnqualifiedFunctionalCanaryExecution::new(&request, socket_observer, open_engine_child)
+                .map_err(|source| {
+                    functional_canary_error(
+                        "bind functional canary attempt-owned authorities",
+                        source,
+                        "detach capture before preparing fresh canary authorities",
+                    )
+                })?;
         let execution = match &mut self.functional_canary {
             RuntimeFunctionalCanary::RequiredUnqualified { executor, .. } => {
                 executor.execute(execution_input)
@@ -1340,22 +1378,25 @@ where
             generation,
             "observe proxy engine after functional canary",
             "detach capture before repairing the proxy engine and canary environment",
-        )?;
+        );
         let (post_environment, observed_at) = match &mut self.functional_canary {
             RuntimeFunctionalCanary::RequiredUnqualified { context, .. } => {
-                let environment = context.reobserve_environment(&request).map_err(|source| {
-                    functional_canary_error(
-                        "reobserve functional canary environment",
-                        source,
-                        "detach capture before repairing the canary environment",
-                    )
-                })?;
-                (environment, context.monotonic_now())
+                let environment = context.reobserve_environment(&request);
+                let observed_at = context.monotonic_now();
+                (environment, observed_at)
             }
             RuntimeFunctionalCanary::StructuralOnlyCompatibility => {
                 unreachable!("functional canary mode was checked before post-attempt observation")
             }
         };
+        let post_engine = post_engine?;
+        let post_environment = post_environment.map_err(|source| {
+            functional_canary_error(
+                "reobserve functional canary environment",
+                source,
+                "detach capture before repairing the canary environment",
+            )
+        })?;
         let post_binding = CanaryAttemptBinding::new(post_engine, post_environment);
         if request.pre_binding() != &post_binding {
             return Err(ControlError::runtime(
@@ -1869,6 +1910,51 @@ fn rollback_failure_error(rollback_failure: ControlError) -> ControlError {
     )
 }
 
+fn engine_child_authority_error(source: EngineChildAuthorityError) -> FunctionalCanaryError {
+    let permission_denied = matches!(
+        &source,
+        EngineChildAuthorityError::ProcessHandle {
+            source: flux_platform::ProcessHandleError::SystemCall { source, .. },
+        } if source.kind() == io::ErrorKind::PermissionDenied
+    );
+    let kind = if permission_denied {
+        crate::functional_canary::CanaryErrorKind::Availability(
+            crate::functional_canary::CanaryAvailability::Denied,
+        )
+    } else {
+        match source.kind() {
+            EngineChildAuthorityErrorKind::StateChanged => {
+                crate::functional_canary::CanaryErrorKind::IdentityChanged
+            }
+            EngineChildAuthorityErrorKind::ProcessHandle(
+                flux_platform::ProcessHandleErrorKind::Unsupported,
+            ) => crate::functional_canary::CanaryErrorKind::Availability(
+                crate::functional_canary::CanaryAvailability::Unsupported,
+            ),
+            EngineChildAuthorityErrorKind::ProcessHandle(
+                flux_platform::ProcessHandleErrorKind::Exited
+                | flux_platform::ProcessHandleErrorKind::IdentityChanged,
+            ) => crate::functional_canary::CanaryErrorKind::IdentityChanged,
+            EngineChildAuthorityErrorKind::ProcessHandle(
+                flux_platform::ProcessHandleErrorKind::Parse,
+            ) => crate::functional_canary::CanaryErrorKind::Availability(
+                crate::functional_canary::CanaryAvailability::Broken,
+            ),
+            EngineChildAuthorityErrorKind::ProcessHandle(
+                flux_platform::ProcessHandleErrorKind::SystemCall,
+            ) => crate::functional_canary::CanaryErrorKind::AdapterFailure,
+            EngineChildAuthorityErrorKind::OpeningIdentityExhausted => {
+                crate::functional_canary::CanaryErrorKind::AdapterFailure
+            }
+        }
+    };
+    FunctionalCanaryError::new(
+        kind,
+        crate::functional_canary::CanaryCleanupStatus::NotRequired,
+        &source.to_string(),
+    )
+}
+
 fn runtime_writer_error<E>(
     operation: &'static str,
     source: E,
@@ -2027,6 +2113,7 @@ mod tests {
             Arc::clone(&events),
             [ready_canary_snapshot(98_765), ready_canary_snapshot(98_765)],
         );
+        let authority_openings = engine.authority_openings();
         let mut coordinator = RuntimeCoordinator::with_dependencies(
             writer,
             engine,
@@ -2059,6 +2146,13 @@ mod tests {
             ]
         );
         assert_eq!(canary_script.lock().expect("canary script").executions, 1);
+        assert_eq!(
+            *authority_openings.lock().expect("authority openings lock"),
+            [OwnedEngineIdentity::new(
+                NonZeroU32::new(4242).expect("nonzero engine PID"),
+                NonZeroU64::new(98_765).expect("nonzero engine start ticks"),
+            )]
+        );
         let snapshot = runtime.snapshot();
         assert_eq!(snapshot.phase, RuntimePhase::Running);
         assert_eq!(
@@ -2512,6 +2606,7 @@ mod tests {
             Arc::clone(&events),
             [ready_canary_snapshot(98_765), ready_canary_snapshot(98_765)],
         );
+        let authority_openings = engine.authority_openings();
         let functional_canary = RuntimeFunctionalCanary::RequiredUnqualified {
             context: Box::new(ScriptedCanaryContext {
                 script: Arc::clone(&canary_script),
@@ -2553,6 +2648,89 @@ mod tests {
             runtime.snapshot().verification,
             RuntimeVerificationState::FunctionalFailed
         );
+        assert_eq!(
+            *authority_openings.lock().expect("authority openings lock"),
+            []
+        );
+    }
+
+    #[test]
+    fn failed_engine_authority_opening_still_post_observes_and_retires_the_attempt() {
+        let fixture = EngineFixture::new();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let request = functional_request_with_nonce(
+            &fixture.spec,
+            CanaryAddressFamilies::Ipv4Only,
+            Instant::now(),
+            CanaryNonce::from_bytes([51; FUNCTIONAL_CANARY_NONCE_BYTES]),
+        );
+        let canary_script = Arc::new(Mutex::new(ScriptedCanary::new([
+            ScriptedCanaryAttempt::passing(request),
+        ])));
+        let writer = ScriptedWriter {
+            events: Arc::clone(&events),
+            prepared: VecDeque::from([fixture.spec.clone()]),
+            next_generation_id: 17,
+            capture_start_failure: false,
+            capture_stop_failures: 0,
+            verify_failure: false,
+        };
+        let mut engine = RequiredScriptedEngine::new(
+            Arc::clone(&events),
+            [ready_canary_snapshot(98_765), ready_canary_snapshot(98_765)],
+        );
+        let authority_openings = engine.authority_openings();
+        engine.fail_next_authority_opening(io::ErrorKind::PermissionDenied);
+        engine.fail_running_on_call = Some(3);
+        let mut coordinator = RuntimeCoordinator::with_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+            scripted_required_canary(Arc::clone(&canary_script), Arc::clone(&events)),
+        );
+        let runtime = coordinator.runtime_snapshot_source();
+
+        coordinator
+            .execute(&LegacyIntent::Running {
+                reason: Reason::Boot,
+            })
+            .expect_err("denied engine authority prevents running");
+
+        assert_eq!(
+            *events.lock().expect("events lock"),
+            [
+                Event::Prepared(Reason::Boot),
+                Event::EngineRunning(CaptureObservation::Detached),
+                Event::CaptureStarted,
+                Event::CaptureVerified,
+                Event::EngineRunning(CaptureObservation::Published),
+                Event::CanaryPrepared(generation(17)),
+                Event::EngineRunning(CaptureObservation::Published),
+                Event::CanaryReobserved(generation(17)),
+                Event::CaptureStopped,
+                Event::EngineStopped(CaptureObservation::Detached),
+                Event::Published(PublishedRuntimeState::Failed),
+            ]
+        );
+        assert_eq!(
+            runtime.snapshot().verification,
+            RuntimeVerificationState::FunctionalFailed
+        );
+        assert_eq!(canary_script.lock().expect("canary script").executions, 0);
+        assert!(
+            canary_script
+                .lock()
+                .expect("canary script")
+                .active
+                .is_none(),
+            "post-attempt finalization must retire the active attempt even when post-engine observation fails"
+        );
+        assert!(
+            authority_openings
+                .lock()
+                .expect("authority openings lock")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2586,6 +2764,59 @@ mod tests {
 
         assert_eq!(error.kind(), CanaryErrorKind::IdentityChanged);
         assert_eq!(error.cleanup(), CanaryCleanupStatus::NotRequired);
+    }
+
+    #[test]
+    fn engine_child_authority_errors_preserve_canary_availability_classes() {
+        let mapped = |source| engine_child_authority_error(source);
+        let denied = mapped(EngineChildAuthorityError::ProcessHandle {
+            source: flux_platform::ProcessHandleError::SystemCall {
+                operation: "test denied process observation",
+                path: None,
+                source: io::Error::from(io::ErrorKind::PermissionDenied),
+            },
+        });
+        assert_eq!(
+            denied.kind(),
+            CanaryErrorKind::Availability(crate::functional_canary::CanaryAvailability::Denied)
+        );
+
+        let unsupported = mapped(EngineChildAuthorityError::ProcessHandle {
+            source: flux_platform::ProcessHandleError::UnsupportedPlatform("test"),
+        });
+        assert_eq!(
+            unsupported.kind(),
+            CanaryErrorKind::Availability(
+                crate::functional_canary::CanaryAvailability::Unsupported
+            )
+        );
+
+        let exited = mapped(EngineChildAuthorityError::ProcessHandle {
+            source: flux_platform::ProcessHandleError::Exited {
+                pid: NonZeroU32::new(4242).expect("nonzero PID"),
+            },
+        });
+        assert_eq!(exited.kind(), CanaryErrorKind::IdentityChanged);
+
+        let malformed = mapped(EngineChildAuthorityError::ProcessHandle {
+            source: flux_platform::ProcessHandleError::MalformedProcStat {
+                path: PathBuf::from("/proc/4242/stat"),
+            },
+        });
+        assert_eq!(
+            malformed.kind(),
+            CanaryErrorKind::Availability(crate::functional_canary::CanaryAvailability::Broken)
+        );
+
+        let system = mapped(EngineChildAuthorityError::ProcessHandle {
+            source: flux_platform::ProcessHandleError::SystemCall {
+                operation: "test process observation",
+                path: None,
+                source: io::Error::other("injected non-permission failure"),
+            },
+        });
+        assert_eq!(system.kind(), CanaryErrorKind::AdapterFailure);
+        assert_eq!(system.cleanup(), CanaryCleanupStatus::NotRequired);
     }
 
     #[test]
@@ -4315,6 +4546,17 @@ mod tests {
         fn snapshot(&self) -> Arc<EngineSnapshot> {
             Arc::new(EngineSnapshot::default())
         }
+
+        fn open_canary_child_authority(
+            &self,
+            _expected: OwnedEngineIdentity,
+            _expected_snapshot_revision: NonZeroU64,
+            _expected_spec: &EngineSpec,
+        ) -> Result<EngineChildAuthority, EngineChildAuthorityError> {
+            Err(EngineChildAuthorityError::state_changed(
+                "structural-only scripted engine has no canary child authority",
+            ))
+        }
     }
 
     #[derive(Clone, Copy)]
@@ -4483,6 +4725,12 @@ mod tests {
                     "scripted executor received the wrong attempt-owned socket observer",
                 ));
             }
+            let (request, _socket_observer, engine_child) = execution.into_parts()?;
+            debug_assert_eq!(
+                engine_child.identity(),
+                request.pre_binding().engine().engine()
+            );
+            debug_assert_ne!(engine_child.opening_id().get(), 0);
             let mut script = self.script.lock().expect("canary script");
             let active = script.active.as_ref().ok_or_else(|| {
                 FunctionalCanaryError::new(
@@ -4537,8 +4785,12 @@ mod tests {
         events: Arc<Mutex<Vec<Event>>>,
         reports: VecDeque<EngineReport>,
         fail_next_running: bool,
+        fail_running_on_call: Option<usize>,
+        running_calls: usize,
         snapshots: Arc<Mutex<VecDeque<Arc<EngineSnapshot>>>>,
         current_snapshot: Arc<Mutex<Arc<EngineSnapshot>>>,
+        authority_openings: Arc<Mutex<Vec<OwnedEngineIdentity>>>,
+        authority_failure: Arc<Mutex<Option<io::ErrorKind>>>,
     }
 
     impl RequiredScriptedEngine {
@@ -4550,9 +4802,24 @@ mod tests {
                 events,
                 reports: VecDeque::new(),
                 fail_next_running: false,
+                fail_running_on_call: None,
+                running_calls: 0,
                 snapshots: Arc::new(Mutex::new(snapshots.into_iter().collect())),
                 current_snapshot: Arc::new(Mutex::new(Arc::new(EngineSnapshot::default()))),
+                authority_openings: Arc::new(Mutex::new(Vec::new())),
+                authority_failure: Arc::new(Mutex::new(None)),
             }
+        }
+
+        fn authority_openings(&self) -> Arc<Mutex<Vec<OwnedEngineIdentity>>> {
+            Arc::clone(&self.authority_openings)
+        }
+
+        fn fail_next_authority_opening(&self, kind: io::ErrorKind) {
+            *self
+                .authority_failure
+                .lock()
+                .expect("authority failure lock") = Some(kind);
         }
     }
 
@@ -4564,6 +4831,7 @@ mod tests {
         ) -> Result<EngineReport, EngineSupervisorError> {
             match desired {
                 DesiredEngine::Running(_) => {
+                    self.running_calls += 1;
                     self.events
                         .lock()
                         .expect("events lock")
@@ -4571,6 +4839,12 @@ mod tests {
                     if std::mem::take(&mut self.fail_next_running) {
                         return Err(EngineSupervisorError::InvariantViolation {
                             diagnostic: "injected required-engine reconciliation failure"
+                                .to_owned(),
+                        });
+                    }
+                    if self.fail_running_on_call == Some(self.running_calls) {
+                        return Err(EngineSupervisorError::InvariantViolation {
+                            diagnostic: "injected scheduled required-engine reconciliation failure"
                                 .to_owned(),
                         });
                     }
@@ -4603,6 +4877,46 @@ mod tests {
             } else {
                 Arc::clone(&self.current_snapshot.lock().expect("current snapshot lock"))
             }
+        }
+
+        fn open_canary_child_authority(
+            &self,
+            expected: OwnedEngineIdentity,
+            expected_snapshot_revision: NonZeroU64,
+            _expected_spec: &EngineSpec,
+        ) -> Result<EngineChildAuthority, EngineChildAuthorityError> {
+            if let Some(kind) = self
+                .authority_failure
+                .lock()
+                .expect("authority failure lock")
+                .take()
+            {
+                return Err(EngineChildAuthorityError::ProcessHandle {
+                    source: flux_platform::ProcessHandleError::SystemCall {
+                        operation: "open scripted engine child authority",
+                        path: None,
+                        source: io::Error::from(kind),
+                    },
+                });
+            }
+            let snapshot = self.current_snapshot.lock().expect("current snapshot lock");
+            if snapshot.phase() != EnginePhase::Ready
+                || snapshot.owned_identity() != Some(expected)
+                || snapshot.revision() != expected_snapshot_revision.get()
+            {
+                return Err(EngineChildAuthorityError::state_changed(
+                    "scripted engine snapshot changed before authority opening",
+                ));
+            }
+            self.authority_openings
+                .lock()
+                .expect("authority openings lock")
+                .push(expected);
+            Ok(EngineChildAuthority::scripted(
+                expected,
+                expected_snapshot_revision,
+                Instant::now(),
+            ))
         }
     }
 

@@ -18,6 +18,7 @@ use flux_platform::socket_diagnostics::{
 };
 use sha2::{Digest, Sha256};
 
+use crate::engine_supervisor::EngineChildAuthority;
 use crate::{EngineArtifactDigest, EngineSpec, OwnedEngineIdentity};
 
 pub(crate) const FUNCTIONAL_CANARY_SCHEMA_VERSION: u16 = 2;
@@ -4475,12 +4476,17 @@ impl Error for FunctionalCanaryError {}
 pub(crate) struct UnqualifiedFunctionalCanaryExecution<'a> {
     request: &'a CanaryAttemptRequest,
     socket_observer: CanaryAttemptSocketObserverSession,
+    open_engine_child:
+        Box<dyn FnOnce() -> Result<EngineChildAuthority, FunctionalCanaryError> + 'a>,
 }
 
 impl<'a> UnqualifiedFunctionalCanaryExecution<'a> {
     pub(crate) fn new(
         request: &'a CanaryAttemptRequest,
         socket_observer: CanaryAttemptSocketObserverSession,
+        open_engine_child: Box<
+            dyn FnOnce() -> Result<EngineChildAuthority, FunctionalCanaryError> + 'a,
+        >,
     ) -> Result<Self, FunctionalCanaryError> {
         if request
             .pre_binding()
@@ -4505,6 +4511,7 @@ impl<'a> UnqualifiedFunctionalCanaryExecution<'a> {
         Ok(Self {
             request,
             socket_observer,
+            open_engine_child,
         })
     }
 
@@ -4520,8 +4527,42 @@ impl<'a> UnqualifiedFunctionalCanaryExecution<'a> {
 
     pub(crate) fn into_parts(
         self,
-    ) -> (&'a CanaryAttemptRequest, CanaryAttemptSocketObserverSession) {
-        (self.request, self.socket_observer)
+    ) -> Result<
+        (
+            &'a CanaryAttemptRequest,
+            CanaryAttemptSocketObserverSession,
+            EngineChildAuthority,
+        ),
+        FunctionalCanaryError,
+    > {
+        let engine_child = (self.open_engine_child)()?;
+        debug_assert_ne!(engine_child.opening_id().get(), 0);
+        let expected_engine = self.request.pre_binding().engine();
+        if expected_engine.engine() != engine_child.identity() {
+            return Err(FunctionalCanaryError::new(
+                CanaryErrorKind::IdentityChanged,
+                CanaryCleanupStatus::NotRequired,
+                "attempt-owned engine child authority does not match the immutable request identity",
+            ));
+        }
+        if expected_engine.engine_snapshot_revision() != engine_child.engine_snapshot_revision() {
+            return Err(FunctionalCanaryError::new(
+                CanaryErrorKind::IdentityChanged,
+                CanaryCleanupStatus::NotRequired,
+                "attempt-owned engine child authority does not match the immutable engine snapshot revision",
+            ));
+        }
+        let deadline = self.request.deadline();
+        if engine_child.opened_at() < deadline.started_at()
+            || engine_child.opened_at() >= deadline.expires_at()
+        {
+            return Err(FunctionalCanaryError::new(
+                CanaryErrorKind::IdentityChanged,
+                CanaryCleanupStatus::NotRequired,
+                "attempt-owned engine child authority was not opened within the immutable request deadline",
+            ));
+        }
+        Ok((self.request, self.socket_observer, engine_child))
     }
 }
 

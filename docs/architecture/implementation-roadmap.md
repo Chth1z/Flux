@@ -26,10 +26,11 @@ not authorize native mutation, TUN, eBPF acceleration, or kernel-module loading.
 license, hash, SBOM/build metadata, and real-device evidence must still be populated before the new
 verifier can pass.
 
-1. **Bridge safety:** the `100.64.0.0/10`, mandatory-exclusion, empty allow/deny, TUN-rejection, and converged-`addrsyncd` readiness checkpoints are complete. The Stage-1 [Generation-scoped functional capture canary](functional-capture-canary.md) model, coordinator ordering, lifecycle tests, protocol-v3 verification status, and authoritative schema-v2 listener/delivery validator are complete; production still explicitly selects structural-only compatibility. The first privileged Linux namespace checkpoint proves the isolated dual-stack TCP/UDP/DNS topology and exact cleanup. The delivered third-probe-namespace checkpoint now proves real dual-stack TCP/UDP echo plus DNS-over-UDP/TCP PREROUTING TPROXY, accepted-socket and strict ancillary-data original-destination recovery, marked relay egress, source-preserving UDP replies, nonce-bound DNS evidence, per-family route controls/counters, and cleanup. The strict Linux/Android `/proc` FD plus INET_DIAG outbound-collector prerequisite, its prebound stateful session, and the typed attempt-context-to-executor handoff are complete, binding protocol, exact tuple, UID, mark, FD/inode/cookie, complete dumps, process identity, timing, the real pre-collection netlink port ID, a private per-opening identity, monotonic sequences, error-consuming ownership, exact deadline continuity, and single-move delivery into prepared execution. Cleanup validation now also binds typed process retirement, pairwise-distinct exact selector/guard/counter retirement/absence, authority-sensitive listener-report cleanup, attempt-record retirement, counter/report lifetime, retained-facility observation, and the complete gate/deadline chronology. The credential preflight now retains live probe/engine children, opens child-origin pidfds, verifies stable process-wide UID/GID/group/capability/`NoNewPrivs` state plus namespace/map identity, reobserves before release, confirms parent `wait`, and only then treats pidfd exit as corroboration; it still sends no traffic. The fail-closed TPROXY-only local-OUTPUT executor seam, explicit per-flow capture receipt, and second process-ownership receipt are complete model boundaries: the evidence factory cannot run until sealed verifiers bind the complete request, capture/delivery observations, exact engine before/after and client/peer PID/start-tick/handle observations, restricted credentials, role namespaces, cleanup retirements, and chronology. Both production receipt authorities remain uninhabited, and current xtables support still reports unsupported before mutation. Ingress, collector, credential, handoff, cleanup-model, receipt-model, and seam evidence therefore cannot authorize the current local-OUTPUT production domain. After the audited bridge-contract correction checkpoint, the next bridge-safety checkpoint is integration plumbing only: connect `EngineSupervisor`/`SingBoxChild` and prepared-driver child handles, listener observation, a versioned report-parser interface, the prebound collector, and exact cleanup while the driver still returns `Unsupported`. Before any positive traffic producer or receipt authority may be inhabited, one concrete local-OUTPUT capture mechanism must preserve the selected TPROXY listener semantics on the target device, and the exact supervised report producer must be declared by the immutable `EngineCapabilityProfile`, including its source, transport/framing, loss/sequence behavior, object lifetime, and schema. Stock Sing-Box logs or APIs are not assumed to satisfy that contract. A separately qualified cgroup-BPF authority remains an unassigned future experiment; production never loads a `.ko`. REDIRECT/DNAT cannot qualify a TPROXY plan; the adapter must prove its selected backend or report unsupported. Retain the TUN rejection until one exact routing owner passes readback and forced-death cleanup canaries.
-   The next checkpoint exercises the supervised userspace report/parser plumbing without claiming a
-   positive report producer or capture mechanism. Cgroup-BPF is not assigned to Phase 8 until a
-   separate TCP/UDP-complete authority design and exit gate exist.
+1. **Bridge safety:** the `100.64.0.0/10`, mandatory-exclusion, empty allow/deny, TUN-rejection, and converged-`addrsyncd` readiness checkpoints are complete. The Stage-1 [Generation-scoped functional capture canary](functional-capture-canary.md) model, coordinator ordering, lifecycle tests, protocol-v3 verification status, and authoritative schema-v2 listener/delivery validator are complete; production still explicitly selects structural-only compatibility. The first privileged Linux namespace checkpoint proves the isolated dual-stack TCP/UDP/DNS topology and exact cleanup. The delivered third-probe-namespace checkpoint now proves real dual-stack TCP/UDP echo plus DNS-over-UDP/TCP PREROUTING TPROXY, accepted-socket and strict ancillary-data original-destination recovery, marked relay egress, source-preserving UDP replies, nonce-bound DNS evidence, per-family route controls/counters, and cleanup. The strict Linux/Android `/proc` FD plus INET_DIAG outbound-collector prerequisite, its prebound stateful session, and the typed attempt-context-to-executor handoff are complete, binding protocol, exact tuple, UID, mark, FD/inode/cookie, complete dumps, process identity, timing, the real pre-collection netlink port ID, a private per-opening identity, monotonic sequences, error-consuming ownership, exact deadline continuity, and single-move delivery into prepared execution. Cleanup validation now also binds typed process retirement, pairwise-distinct exact selector/guard/counter retirement/absence, authority-sensitive listener-report cleanup, attempt-record retirement, counter/report lifetime, retained-facility observation, and the complete gate/deadline chronology. The credential preflight now retains live probe/engine children, opens child-origin pidfds, verifies stable process-wide UID/GID/group/capability/`NoNewPrivs` state plus namespace/map identity, reobserves before release, confirms parent `wait`, and only then treats pidfd exit as corroboration; it still sends no traffic. The fail-closed TPROXY-only local-OUTPUT executor seam, explicit per-flow capture receipt, and second process-ownership receipt are complete model boundaries: the evidence factory cannot run until sealed verifiers bind the complete request, capture/delivery observations, exact engine before/after and client/peer PID/start-tick/handle observations, restricted credentials, role namespaces, cleanup retirements, and chronology. Both production receipt authorities remain uninhabited, and current xtables support still reports unsupported before mutation. Ingress, collector, credential, handoff, cleanup-model, receipt-model, and seam evidence therefore cannot authorize the current local-OUTPUT production domain. After the audited bridge-contract correction checkpoint, integration plumbing is split into bounded review points. The first engine-child handoff is complete: the retained `SingBoxChild` opens an exact child-origin `ProcessHandle`; `EngineSupervisor` accepts it only from matching ready ownership, active specification, and snapshot revision; the coordinator binds a single-use opener to the immutable request identity/revision/deadline; and execution invokes it only after read-only backend availability succeeds and before prepared-attempt construction, then moves the authority once into the process-verifier boundary without giving the driver signal/wait/reap or pidfd authority. The current xtables `Unsupported` path therefore opens no authority. Still pending are real engine before/after observations, prepared-driver client/peer child ownership and retirement, independent listener observation, a versioned report capability/parser, actual prebound collector observations, cleanup binding, and schema-v2 construction with test-only fixtures. All of those steps remain fail-closed while the production driver returns `Unsupported`. Before any positive traffic producer or receipt authority may be inhabited, one concrete local-OUTPUT capture mechanism must preserve the selected TPROXY listener semantics on the target device, and the exact supervised report producer must be declared by the immutable `EngineCapabilityProfile`, including its source, transport/framing, loss/sequence behavior, object lifetime, and schema. Stock Sing-Box logs or APIs are not assumed to satisfy that contract. A separately qualified cgroup-BPF authority remains an unassigned future experiment; production never loads a `.ko`. REDIRECT/DNAT cannot qualify a TPROXY plan; the adapter must prove its selected backend or report unsupported. Retain the TUN rejection until one exact routing owner passes readback and forced-death cleanup canaries.
+   The immediate next subcheckpoint is authoritative engine before/after observation plus
+   driver-owned client/peer retirement; listener/report and collector/factory work follow as
+   separate reviews. Cgroup-BPF is not assigned to Phase 8 until a separate TCP/UDP-complete
+   authority design and exit gate exist.
 2. **Native Phase 3 correctness:** add exact device/artifact identity; select positive mark policies from a compile-time reviewed stable artifact catalog and then bind them to boot/namespace freshness; complete the remaining 24 census cells and point-in-time coordinator; prove writer semantics, observer continuity, mark preservation, domain/network-selection handoff, and route reachability; only then allocate priorities/tables/marks or mutate the kernel.
 3. **Optional eBPF implementation/probe:** implement only isolated, opt-in `xt_bpf` probe mechanics in a disposable test namespace without persistent pins, production daemon integration, Capability Profile publication, implicit module autoload, or writes to live Flux chains. The device-qualified adapter and first production-state integration land in Phase 4 after `fluxd` becomes the sole xtables writer; broader observation remains Phase 7. Positive acceleration waits for the Rust xtables compiler, a complete conventional classifier, parity evidence, and device benchmarks.
 
@@ -89,9 +90,11 @@ mint the two non-cloneable receipts, and only fully receipt-bound artifacts reac
 evidence factory. The current zero-state xtables
 driver reports `Unsupported` with cleanup `NotRequired` before mutation because OUTPUT marking does
 not re-enter PREROUTING TPROXY; its prepared/raw type and the production receipt authority are
-uninhabited, so it adds no positive traffic or evidence path. Still deferred are real
-`EngineSupervisor`/`SingBoxChild` plus prepared-driver child-handle integration, schema-v2
-listener-observer/report parsing and factories,
+uninhabited, so it adds no positive traffic or evidence path. The retained engine-child authority
+handoff is delivered: `SingBoxChild` opens an exact child-origin `ProcessHandle`, `EngineSupervisor`
+requires matching ready ownership, and the coordinator/execution path moves that authority once
+into the process verifier without transferring signal/wait/reap authority. Still deferred are real
+engine before/after observations, prepared-driver client/peer child ownership, schema-v2 listener-observer/report parsing and factories,
 production context use of the delivered attempt-owned outbound-collector handoff, actual collector
 observations, capability-qualified engine/probe execution, a real traffic producer, and Android
 adapter/qualification. The validator itself is complete and rejects weak,
@@ -480,28 +483,39 @@ Before a backend may be selected automatically, its documentation must include:
    Sing-Box owner passes route readback and forced-death cleanup canaries; then replace the
    rejection with that single proven owner. Keep `BYPASS_SET_BACKEND=zone` as the only admitted
    bridge value until the ipset/auto adapters have distinct capability and parity evidence.
-2. Continue the local-OUTPUT integration-plumbing slice only after the audited bridge-contract
-   correction checkpoint passes full CI. Build on the delivered fail-closed TPROXY-only seam,
-   exact credential/child-handle preflight, and completed capture plus process-ownership receipt
-   contracts. Integrate the engine handle with `EngineSupervisor`'s retained `SingBoxChild`, retain
-   the prepared driver's client/peer children through exact retirement, and add real listener-socket
-   observation plus a delivery-report parser interface and the exact attempt-owned supervised
-   userspace report schema/object identity. Feed test-only report fixtures into the delivered typed cleanup
-   chronology and exact report-object retirement/absence contract. Bind every
-   cleanup process identity to the already modeled attempt-owned process-handle receipt, and use the
-   typed handoff from the real attempt context to carry the prebound strict `/proc` FD plus
-   INET_DIAG session whose port
-   is already in the request,
-   perform the actual collector observations, and then execute traffic through the completed
-   schema-v2 `validate_for` path while production continues to return `Unsupported`. Before a real
-   producer may inhabit either receipt authority, document and device-qualify one local-OUTPUT
-   capture mechanism that preserves TPROXY semantics, and bind an exact report producer contract
-   to the immutable `EngineCapabilityProfile`; an unavailable producer is not inferred from logs,
-   APIs, counters, or successful proxy traffic. REDIRECT/DNAT, ingress traffic,
-   counters, route lookups,
-   and veth-bounce paths cannot qualify TPROXY; report unsupported when the selected backend's
-   listener path cannot be proven. Only then implement the explicit Android adapter and
-   qualification matrix.
+2. Continue the incomplete local-OUTPUT integration-plumbing checkpoint only after the audited
+   bridge-contract correction checkpoint passes full CI. Build on the delivered fail-closed
+   TPROXY-only seam, exact credential preflight, and completed capture plus process-ownership
+   receipt contracts, and submit each subcheckpoint separately:
+   - **2a complete — retained engine-child authority handoff:**
+     `SingBoxChild::open_process_handle` opens only from the retained live child, checks exact
+     recorded PID/start ticks against the pidfd/procfs identity, and leaves signal/wait/reap
+     authority with the adapter. `EngineSupervisor` requires matching ready/active/readiness/
+     snapshot/child identity and exact snapshot revision, while the serialized coordinator binds a
+     single-use opener to the immutable request identity/revision/deadline. Execution invokes it
+     only after read-only backend availability succeeds and before prepared-attempt construction,
+     then moves the result once into the process verifier after capture verification. The driver never receives the pidfd authority, and current
+     xtables `Unsupported` opens no authority.
+   - **2b pending — authoritative process observation and driver-child ownership:** use that exact
+     authority for real engine before/after observations and retain client/peer children through
+     exact termination and parent reap before minting any process receipt.
+   - **2c pending — listener observer:** independently prove every required listener FD/inode/cookie,
+     wildcard bind, UDP listener state, transparency, and IPv6-only state; readiness port evidence
+     and the current outbound connected-socket collector are insufficient substitutes.
+   - **2d pending — supervised report capability/parser:** define a bounded schema-v1 parser and
+     test-only report frames, then bind the exact producer source, transport/framing, sequence/loss,
+     object lifetime, and cleanup semantics to the immutable `EngineCapabilityProfile`.
+   - **2e pending — collector/factory/cleanup integration:** use the exact prebound `/proc` FD plus
+     INET_DIAG session for actual observations, bind every cleanup identity and report object to its
+     owned resource, and drive test-only fixtures through schema-v2 `validate_for`.
+
+   The combined checkpoint remains incomplete and production continues to return `Unsupported`.
+   Before a real producer may inhabit either receipt authority, document and device-qualify one
+   local-OUTPUT capture mechanism that preserves TPROXY semantics and bind an exact report producer
+   contract to the immutable `EngineCapabilityProfile`; an unavailable producer is not inferred
+   from logs, APIs, counters, or successful proxy traffic. REDIRECT/DNAT, ingress traffic, counters,
+   route lookups, and veth-bounce paths cannot qualify TPROXY. Only after the selected backend's
+   listener path is proven may the explicit Android adapter and qualification matrix proceed.
 3. Populate the release manifest with exact immutable source revisions, versions, targets, hashes,
    licenses, device-test evidence, SBOM, checksums, and build metadata, then make the strict
    `verify-package` boundary pass. Resolve the standalone `addrsyncd` license before publication;

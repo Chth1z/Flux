@@ -178,9 +178,19 @@ start ticks, proves the child remains waitable by this parent, and performs two 
 censuses of every `/proc/<pid>/task/*/status` entry so all threads have identical credentials. A
 pidfd reporting exit is not accepted as reap evidence: the owner must still confirm `Child::wait`,
 and the distinct-UID/GID preflight now exercises that ordering with live probe and engine children.
-This is observation and model plumbing. Production receipt authority remains uninhabited, and the
-real engine handle must still originate from `EngineSupervisor`'s retained `SingBoxChild`; a real
-prepared driver must likewise retain and retire its client and peer `Child` values.
+The retained-engine authority handoff is now delivered. `SingBoxChild::open_process_handle` opens
+the authority only from its retained live child, rechecks the recorded PID/start ticks, and leaves
+signal/wait/reap ownership with the adapter. `EngineSupervisor` then requires matching ready,
+active-spec, readiness, snapshot, owned-identity, and retained-child state before opening a
+non-cloneable `EngineChildAuthority`. The serialized coordinator binds a single-use opener to the
+exact request engine, snapshot revision, and deadline. The local-OUTPUT
+executor invokes that opener only after read-only backend availability succeeds and before the
+prepared-attempt boundary, so the current xtables `Unsupported` result performs no pidfd/procfs
+scan. A successful opening carries a private nonzero opening identity and daemon-owned observation
+time, then moves into the process-verifier boundary after capture verification. This is still
+observation and model plumbing. Production receipt authority remains uninhabited because the
+placeholder verifier does not yet perform authoritative before/after observations or retain and
+retire real client/peer `Child` values.
 
 ### Fail-closed local-OUTPUT executor seam
 
@@ -206,11 +216,11 @@ PREROUTING traffic, a veth bounce, counters, or route-lookup inference. Its raw 
 capture/process receipt authorities, and current factory input are uninhabited, so the seam cannot
 produce a positive host result.
 
-The next positive producer must replace both sealed receipt authorities with reviewed concrete
-verifiers; integrate the engine authority with `EngineSupervisor`'s retained `SingBoxChild` and the
-client/peer authority with driver-retained children; construct the delivered report-object and
-temporal cleanup evidence; and use the real pre-opened socket-diagnostics authority for actual
-observations. A
+The remaining integration subcheckpoints must use the delivered engine authority for real
+before/after observations, bind client/peer authority to driver-retained children, construct the
+delivered report-object and temporal cleanup evidence, and use the real pre-opened
+socket-diagnostics authority for actual observations. A later positive producer must also replace
+both sealed receipt authorities with reviewed concrete verifiers. A
 separately qualified cgroup-BPF observer may later replace supervised delivery reports only after
 its own attachment, identity, complete-event, loss, and lifecycle contract is proven; ordinary BPF
 counters or sampled events cannot mint the receipt. No qualified production receipt path may
@@ -523,22 +533,50 @@ functional pass.
    deadline chronology. The Linux/Android pidfd substrate opens only from retained children,
    validates stable process-wide thread credentials, distinguishes exit from parent reap, and is
    exercised by the no-traffic credential preflight. Production receipt authority remains
-   uninhabited: `EngineSupervisor`/`SingBoxChild` and real driver child integration are still open.
-13. Add a separate local-OUTPUT integration-plumbing slice using the delivered credential,
-   handle, receipt, and handoff plumbing; integrate a real attempt context with the retained
-   `SingBoxChild` plus driver-owned client/peer children; add a listener observer plus
-   delivery-report schema-v1 parser interface, actual prebound collector-session observations, and
-   the completed schema-v2 `validate_for` path with test-only fixtures. Production must continue to
-   report `unsupported` and cannot mint either receipt until one concrete device-supported
-   local-OUTPUT capture mechanism preserves TPROXY listener semantics and the immutable
-   `EngineCapabilityProfile` declares an authoritative report producer with exact source,
-   transport/framing, schema, sequence/loss, and object-lifecycle semantics. Stock engine logs or
-   APIs are not evidence unless that capability contract explicitly qualifies them. A
-   separately qualified cgroup-eBPF observer may replace
-   the report only after its own authority and loss contract is proven. REDIRECT/DNAT delivery
-   cannot qualify a TPROXY Generation; an adapter without a qualifying TPROXY listener path reports
-   `unsupported`. This slice must not weaken the model to accommodate the ingress checkpoint or be
-   renamed positive merely because its process and observer plumbing is complete.
+   uninhabited. The engine-child authority handoff below is delivered, but authoritative
+   before/after process observation and real driver child integration remain open.
+13. **Incomplete local-OUTPUT integration-plumbing checkpoint:** deliver this work as separately
+   reviewed subcheckpoints so no plumbing-only step is mistaken for capture qualification:
+   - **13a complete — retained engine-child authority handoff:**
+     `SingBoxChild::open_process_handle` opens a non-cloneable `ProcessHandle` only from the
+     retained live `std::process::Child`, then rechecks the pidfd/procfs PID and start-time ticks
+     against the identity recorded at spawn. The handle grants observation only; signaling,
+     waiting, and reaping remain with the Sing-Box adapter. `EngineSupervisor` opens the exact
+     authority only from matching ready ownership, active specification, and snapshot revision.
+     The coordinator binds a single-use opener to the immutable request, and execution invokes it
+     only after read-only backend availability succeeds and before prepared-attempt construction,
+     then moves the authority once into the process verifier after capture verification; the driver
+     never receives the pidfd authority. Tests cover recorded-identity substitution,
+     live reobservation, adapter-owned TERM/reap, retained-handle exit observation after reap,
+     request/revision/deadline mismatch rejection, a real Supervisor-to-pidfd lifecycle, successful
+     required-mode opening, and the xtables path preserving `Unsupported` without opening an
+     authority or reaching `RUNNING`.
+   - **13b pending — authoritative process observation and driver-child ownership:** use the exact
+     engine authority for before/after observations in a reviewed process verifier, and retain
+     driver-owned client/peer `Child` values through exact termination and parent reap. No
+     component may reconstruct authority from a PID or mint the process receipt from copied
+     identities.
+   - **13c pending — listener observation:** add an independently authoritative listener observer
+     for every required family/protocol role, including UDP listener state, FD/inode/cookie,
+     wildcard binding, transparency, and IPv6-only state. The existing outbound connected-socket
+     collector and readiness port observation do not by themselves prove this contract.
+   - **13d pending — supervised report contract and parser:** define a bounded, versioned
+     delivery-report schema-v1 parser interface plus test-only frames, and bind source,
+     transport/framing, sequence/loss behavior, report-object lifetime, and shutdown semantics to
+     the immutable `EngineCapabilityProfile`. Stock logs or management APIs are not evidence.
+   - **13e pending — collector, cleanup, and evidence-factory integration:** perform actual
+     observations with the exact prebound collector session, bind every cleanup identity and
+     report object to its owned resource, and exercise the completed schema-v2 `validate_for` path
+     with test-only fixtures.
+
+   The combined checkpoint remains incomplete. Production must continue to report `unsupported`
+   and cannot mint either receipt until one concrete device-supported local-OUTPUT capture
+   mechanism preserves TPROXY listener semantics and the immutable `EngineCapabilityProfile`
+   declares an authoritative report producer. A separately qualified cgroup-eBPF observer may
+   replace the report only after its own authority and loss contract is proven. REDIRECT/DNAT
+   delivery cannot qualify a TPROXY Generation; an adapter without a qualifying TPROXY listener
+   path reports `unsupported`. None of these subcheckpoints may weaken the model to accommodate the
+   ingress checkpoint or be renamed positive merely because its plumbing is complete.
 14. Add an Android lab adapter that reports explicit `unsupported`, `denied`, `conflicting`,
    `broken`, or `unknown` evidence. It remains diagnostic-only until exact-device qualification.
 15. Permit TPROXY `RUNNING` only for reviewed device profiles whose functional canary passes the

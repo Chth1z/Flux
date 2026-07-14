@@ -14,14 +14,16 @@ This roadmap turns the [blueprint](fluxd-blueprint.md) and [technical specificat
   and never admit a second writer during comparison.
 - Treat a real Android 5.10 device as the minimum release gate, not merely a compile target.
 
-## Current parallel workstreams (2026-07-14)
+## Current staged priority (2026-07-15)
 
-The next checkpoint is not a single linear Phase 3 task. Four bounded lanes may proceed in parallel,
-but correctness gates retain strict ordering:
+The 2026-07-15 direction review closes the shadow/compiler/parser/oracle proof-infrastructure
+stage and selects one main delivery lane: the Phase 4 Rust xtables renderer and its first vertical
+cutover. Other evidence work may proceed in parallel, but it must not displace that lane or create
+another open-ended non-authorizing checkpoint. Correctness gates retain strict ordering:
 
-The 2026-07-14 code/documentation deviation audit adds one mandatory bridge-contract correction
-checkpoint before further positive canary integration. The reported live-worktree compile failure
-was stale at the audited HEAD, but the remaining findings were valid. This checkpoint makes `fluxctl status`
+The mandatory bridge-contract correction from the 2026-07-14 code/documentation deviation audit is
+complete. The reported live-worktree compile failure was stale at the audited HEAD, but the
+remaining findings were valid. The completed checkpoint makes `fluxctl status`
 delegate to authoritative daemon state, rejects the meaningless one-shot `addrsyncd` tracked cleanup,
 completes settings migration, exposes only the shipped TPROXY/zone choices, replaces obsolete public
 lifecycle documentation, and separates development staging from strict release verification. It does
@@ -72,20 +74,30 @@ verifier can pass.
    future experiment; production never loads a `.ko`. REDIRECT/DNAT cannot qualify a TPROXY plan,
    and TUN remains rejected until one exact routing owner passes readback and forced-death cleanup
    canaries.
-   The immediate next subcheckpoint is 13b-2b driver-owned client/peer retirement plus final
-   verifier completion chronology. Listener/report and collector/factory work follow as separate
-   reviews. Cgroup-BPF is not assigned to Phase 8 until a separate TCP/UDP-complete authority design
-   and exit gate exist.
-2. **Phase 2 shadow policy:** compile the frozen compatibility semantics into a pure,
-   deterministic, backend-neutral shadow Capture Program with separate local-OUTPUT and
-   forwarded-ingress programs, a canonical mandatory safety baseline, optional snapshot-bound host
-   bypass provenance, bounded inputs/output, a stable semantic digest, and explicit
-   assumptions/deferred prerequisites. This lane performs no
-   I/O and produces no Generation ID, Planning Authority, writer token, renderer, prepared/active
-   value, Runtime Coordinator entry point, or functional-canary authority. Frozen shell fixtures
-   are characterization inputs, not a parity or activation claim.
-3. **Native Phase 3 correctness:** add exact device/artifact identity; select positive mark policies from a compile-time reviewed stable artifact catalog and then bind them to boot/namespace freshness; complete the remaining 24 census cells and point-in-time coordinator; prove writer semantics, observer continuity, mark preservation, domain/network-selection handoff, and route reachability; only then allocate priorities/tables/marks or mutate the kernel.
-4. **Optional eBPF implementation/probe:** implement only isolated, opt-in `xt_bpf` probe mechanics in a disposable test namespace without persistent pins, production daemon integration, Capability Profile publication, implicit module autoload, or writes to live Flux chains. The device-qualified adapter and first production-state integration land in Phase 4 after `fluxd` becomes the sole xtables writer; broader observation remains Phase 7. Positive acceleration waits for the Rust xtables compiler, a complete conventional classifier, parity evidence, and device benchmarks.
+   The remaining 13b-2b driver-child retirement, listener/report, and collector/factory work are
+   deferred activation prerequisites, not the immediate implementation priority. Resume them when
+   an executed backend is ready to inhabit the receipt authorities. Cgroup-BPF remains unassigned
+   until a separate TCP/UDP-complete authority design and exit gate exist.
+2. **Phase 2 shadow policy — complete and frozen:** the deterministic, backend-neutral shadow
+   Capture Program, semantic fixtures, bounded restore parser, pinned raw shell oracle, and
+   checked-in oracle-fixture parser round-trip are delivered. They remain non-authorizing
+   characterization inputs: no shadow artifact enters a Generation or activation path, and this
+   lane receives only corrections needed to preserve its frozen contract.
+3. **Immediate Phase 4 vertical slice:** review the semantic mapping from Capture Program decisions
+   to canonical xtables ordering; implement the bounded Rust renderer; compare its IPv4/IPv6
+   apply/cleanup output against the pinned fixtures; then feed Rust-generated artifacts to the
+   existing shell restore executor. After failure-injection, rollback, readback, and real-device
+   parity gates pass, remove `scripts/rules` from the runtime path. Native restore execution and the
+   final transition lease are a following stage; there is no dual-writer interval.
+4. **Native Phase 3 correctness evidence:** continue exact device/artifact identity, positive mark
+   policy catalog, remaining census cells, point-in-time coordination, observer continuity, mark
+   preservation, domain/network-selection handoff, and route reachability as bounded supporting
+   work. Do not let it delay the renderer slice or confer mutation authority prematurely.
+5. **Optional eBPF probe — deferred:** isolated, opt-in `xt_bpf` mechanics may run only in a
+   disposable test namespace without persistent pins, production daemon integration, Capability
+   Profile publication, implicit module autoload, or writes to live Flux chains. Production-state
+   integration waits until `fluxd` is the sole xtables writer; positive acceleration also requires a
+   complete conventional classifier, parity evidence, and device benchmarks.
 
 TUN dual route ownership is P0: until `EngineOwnedTun` has one proven owner, the bridge selects exactly
 one routing owner or reports TUN unsupported.
@@ -196,7 +208,8 @@ Shell phase scripts remain the only networking-state writer. Rust owns Sing-Box 
 
 ## Phase 2 — Configuration and Generation Compiler
 
-The first Phase 2 checkpoint is deliberately narrower than a Generation compiler. It compiles
+The first Phase 2 checkpoint is complete and frozen. It is deliberately narrower than a Generation
+compiler and compiles
 typed compatibility inputs into an ordered shadow Capture Program, with distinct local and
 forwarded programs, canonical mandatory/configurable bypass layers, optional inventory-derived
 host bypass provenance, deterministic application and interface selectors, compile-time budgets,
@@ -207,22 +220,20 @@ planning or mutation authority, writer/ownership token, prepared/active conversi
 execution path, or eBPF/TUN/module action. The shell path remains the sole executed networking
 writer and the frozen semantic oracle.
 
-This checkpoint does not discharge the Phase 2 exit gate. Oracle-derived fixtures first pin
+This completed checkpoint does not discharge the Phase 2 exit gate. Oracle-derived fixtures pin
 semantics such as RFC 6598, mandatory bypasses, empty allow/deny behavior, multi-user UIDs,
 interface matching, family/domain separation, and compatibility engine UID/GID loop bypass. A
 later bounded renderer checkpoint must compare canonical IPv4/IPv6 restore artifacts and then pass
 failure/recovery plus real-device gates before claiming xtables parity or ownership.
 
-The bounded oracle checkpoint now pins the shell/AWK byte output without widening that authority. A
-separate `cargo xtask xtables-oracle --check` verifies four raw IPv4/IPv6 apply/cleanup fixtures;
-the explicit `--update` mode is the reviewed regeneration path. The environment is bound to the
-BusyBox `linux/amd64` OCI manifest
-`sha256:dfb66b2b3e6981fefa54fd2cd4faf662c35b4a4baeff48295a9409ddf3224c48` and `/bin/busybox`
-SHA-256 `c984eacc3b736fe1eeefe201f21b241932ef4c3c03fbb6869a4f156f32dd9716`. Its networkless
-container has a read-only image root and receives only the exact bounded input snapshot over
-stdin; it never mounts the host workspace, invokes restore tools, or accesses live networking.
-Normal `cargo xtask ci` excludes it; a separate CI job explicitly pulls the exact image digest and
-then runs `--check` with pulling disabled inside the runner.
+The bounded raw oracle checkpoint is also complete and frozen. The canonical environment, input,
+and fixture pin contract lives in `tests/oracle/xtables/manifest.json`; do not duplicate or update
+its hashes in narrative documentation. `cargo xtask xtables-oracle --check` verifies the four raw
+IPv4/IPv6 apply/cleanup fixtures, while explicit `--update` is the reviewed regeneration path.
+Separately, `cargo test -p flux-platform --test xtables_restore_oracle` proves that the checked-in
+bytes parse and canonically round-trip through the syntax artifact. Neither command invokes restore
+tools or live networking, and neither establishes renderer semantics, kernel acceptance, or device
+parity. See `docs/development.md` for the operational workflow.
 
 This profile does not run configuration/kernel detection and does not cover QUIC, PBR, or forced
 cleanup. The fixtures are not kernel-acceptance or Android/Magisk-parity evidence and add no
@@ -321,31 +332,44 @@ point-in-time coordination are still pending.
 
 ## Phase 4 — Rust xtables and ipset parity
 
-The first supporting checkpoint is intentionally below a Capture renderer. `flux-platform` can
+The first supporting checkpoint is complete and frozen below a Capture renderer. `flux-platform` can
 parse and canonically re-encode the frozen restore syntax as an ordered, bounded observation
 artifact: repeated `mangle`/`filter`/`nat` transactions, chain declarations, `-A`/`-I` apply
 commands, `-D`/`-F`/`-X` cleanup commands, duplicates, family context, cleanup phase ordering,
 resource usage, and an exact byte digest are retained. Cleanup phase ordering is enforced within
 each restore transaction. The parser performs no shell execution,
 filesystem discovery, restore invocation, kernel access, Generation conversion, ownership, or
-activation. Its current-shaped synthetic tests are grammar tests, not shell-generated fixture,
-renderer, byte-parity, kernel-acceptance, cleanup-completeness, or device-parity evidence.
+activation. Its current-shaped synthetic tests establish grammar and bounds. The separate
+`xtables_restore_oracle` integration test parses all four checked-in shell-oracle fixtures and
+canonically reproduces their exact bytes and syntax-artifact digests.
 
-The bounded shell-oracle companion records exactly four raw cache artifacts: IPv4/IPv6 apply and
-IPv4/IPv6 cleanup. `cargo xtask xtables-oracle --check` regenerates them in the pinned BusyBox
-`linux/amd64` environment and rejects byte or manifest drift; only an explicit reviewed
-`--update` rewrites them. The container has no network, privilege, host-workspace mount, live
-networking access, or restore execution; only the exact bounded input snapshot is streamed into
-private tmpfs. Its inputs are the frozen rule generator, semantic shell test, oracle driver,
-reviewed environment cache, and package-list cache—not device configuration or kernel discovery.
-Consequently the checkpoint excludes QUIC, PBR, forced-cleanup behavior,
-kernel acceptance, Android/Magisk parity, and every renderer/Generation/ownership/activation
-claim. It is a separate CI job and is intentionally absent from normal `cargo xtask ci`.
+Keep the three evidence levels distinct:
 
-### Deliverables
+1. **Syntax byte round-trip — complete:** the parser accepts a bounded restore document and emits
+   the same canonical bytes; the pinned-fixture test demonstrates this for the four oracle files.
+2. **Semantic renderer parity — next:** a Rust Capture renderer must independently lower reviewed
+   Capture Program semantics and differentially compare the resulting apply/cleanup programs with
+   the frozen shell oracle. Parsing oracle bytes is not this proof.
+3. **Kernel/device parity — later:** restore acceptance, apply/cleanup invertibility, exact readback,
+   rollback, Android/Magisk behavior, and packet-path canaries require isolated and real-device
+   execution after renderer parity.
 
-- Rust compiler for xtables restore programs.
-- Direct child-process adapter for `iptables-restore`/`ip6tables-restore`.
+The canonical oracle pin and fixture inventory live in `tests/oracle/xtables/manifest.json`; the
+operational commands live in `docs/development.md`. The bounded profile excludes QUIC, PBR,
+forced-cleanup behavior, kernel acceptance, Android/Magisk parity, and every
+renderer/Generation/ownership/activation claim. Oracle regeneration remains a separate CI job and
+is intentionally absent from normal `cargo xtask ci`.
+
+### Current vertical-slice deliverables
+
+- Reviewed mapping for ordering, marks/CONNMARK, DIVERT, FakeIP ICMP, QUIC, MSS, interface and UID
+  predicates, chain naming, ownership, and cleanup invertibility.
+- Bounded canonical Rust compiler for xtables restore programs, with explicit rejection of
+  unsupported or deferred semantics and differential tests against the pinned fixtures.
+- Bridge integration that supplies Rust-generated apply/cleanup artifacts to the existing shell
+  restore executor while the shell remains the sole executed networking writer.
+- Following-stage direct child-process adapter for `iptables-restore`/`ip6tables-restore`, exact
+  readback, rollback, and transition lease.
 - Coherent iptables-legacy versus iptables-nft detection and exact canaries; one Generation may use only one matched IPv4/IPv6 implementation family.
 - Stable dispatch chains plus generation chains.
 - ipset capability probes, generation-specific sets, inactive population/optional temporary swap, stable-jump cutover, verification, and cleanup without changing set contents under the old Generation.
@@ -360,10 +384,21 @@ claim. It is a separate CI job and is intentionally absent from normal `cargo xt
 
 ### Ownership rule
 
-`scripts/rules` and `scripts/tproxy` remain frozen, executed compatibility-oracle components until
-the Phase 4 transition lease disables their writer path. Only then does `fluxd` become the sole
-writer of Flux xtables/ipset state and the scripts become non-executed compatibility artifacts.
-There is no shadow/native dual-writer interval.
+`scripts/rules` remains the frozen executed generator until renderer differential parity passes.
+The first cutover removes it from the runtime path while the existing shell executor applies the
+Rust-generated artifacts and remains the sole networking writer. A later transition lease disables
+that shell writer before native restore execution begins; only then does `fluxd` become the sole
+writer of Flux xtables/ipset state. `scripts/tproxy` responsibilities move only through their own
+reviewed ownership gates. There is no shadow/native dual-writer interval.
+
+### Current-stage exit gate
+
+- Rust independently renders the admitted IPv4/IPv6 apply/cleanup semantics and passes reviewed
+  differential tests against the bounded pinned profile.
+- The bridge uses Rust-generated production restore artifacts without executing `scripts/rules`.
+- Shell execution remains the only writer, and rollback to the frozen oracle remains available.
+- Failure injection and device evidence cover the admitted slice; unsupported semantics fail
+  explicitly instead of silently falling back to a second generator.
 
 ### Exit gate
 
@@ -597,22 +632,23 @@ Before a backend may be selected automatically, its documentation must include:
 - security considerations;
 - diagnostic examples.
 
-## Immediate implementation backlog
+## Prioritized implementation backlog
 
-1. Keep the Rust-owned bridge and public configuration TUN rejection until an exact Flux or
-   Sing-Box owner passes route readback and forced-death cleanup canaries; then replace the
-   rejection with that single proven owner. Keep `BYPASS_SET_BACKEND=zone` as the only admitted
-   bridge value until the ipset/auto adapters have distinct capability and parity evidence.
-2. Complete the bounded Phase 2 shadow Capture Program checkpoint. Keep compilation pure and
-   deterministic; emit separate ordered local/forwarded programs, the canonical mandatory safety
-   baseline, optional inventory-host provenance, bounded resource accounting, semantic digest,
-   compatibility assumptions, and deferred prerequisites. Extract semantic fixtures from the
-   frozen shell oracle, but add no restore
-   renderer, Generation ID, Planning Authority, writer token, prepared/active conversion,
-   Runtime Coordinator path, eBPF attach/pin, TUN activation, implicit module request, or `.ko`/KPM
-   loading. Treat any later renderer/parity/cutover as its own reviewed checkpoint.
-3. Continue the incomplete local-OUTPUT integration-plumbing checkpoint only after the audited
-   bridge-contract correction checkpoint passes full CI. Build on the delivered fail-closed
+1. Execute the bounded Phase 4 xtables vertical slice: review the semantic lowering map, implement
+   the canonical Rust renderer, differentially compare IPv4/IPv6 apply/cleanup output with the
+   pinned profile, and feed admitted Rust artifacts to the existing shell restore executor. Exit
+   only when `scripts/rules` is no longer executed in the runtime path and rollback/device evidence
+   covers the admitted slice.
+2. In the following stage, add native restore execution, exact readback, rollback, and the
+   transition lease. Disable the shell writer before the first native mutation; then retire the
+   applicable `scripts/tproxy` responsibilities one ownership seam at a time.
+3. Keep the Rust-owned bridge and public configuration TUN rejection until an exact Flux or
+   Sing-Box owner passes route readback and forced-death cleanup canaries. Keep
+   `BYPASS_SET_BACKEND=zone` as the only admitted bridge value until other adapters have distinct
+   capability and parity evidence. Keep nftables, TUN, production eBPF, `.ko`, and KPM outside the
+   immediate renderer lane.
+4. Defer the incomplete local-OUTPUT integration-plumbing checkpoint until an executed backend is
+   ready to inhabit its receipt authorities. Build on the delivered fail-closed
    TPROXY-only seam, exact credential preflight, and completed capture plus process-ownership
    receipt contracts, and submit each subcheckpoint separately:
    - **2a complete — retained engine-child authority handoff:**
@@ -657,23 +693,23 @@ Before a backend may be selected automatically, its documentation must include:
    from logs, APIs, counters, or successful proxy traffic. REDIRECT/DNAT, ingress traffic, counters,
    route lookups, and veth-bounce paths cannot qualify TPROXY. Only after the selected backend's
    listener path is proven may the explicit Android adapter and qualification matrix proceed.
-4. Populate the release manifest with exact immutable source revisions, versions, targets, hashes,
+5. Populate the release manifest with exact immutable source revisions, versions, targets, hashes,
    licenses, device-test evidence, SBOM, checksums, and build metadata, then make the strict
    `verify-package` boundary pass. Resolve the standalone `addrsyncd` license before publication;
    do not treat development staging or unsigned self-authored evidence as a release artifact. The
    later `package-magisk` boundary must verify signed/reproducible third-party provenance and
    trusted device/CI attestations.
-5. Capture the current real-device baseline and replace every placeholder evidence field.
-6. Build and persist the exact versioned Sing-Box Engine Capability Profile before compiling any final Generation, including whether an authoritative supervised delivery-report producer exists and its exact versioned transport/framing, schema, loss/sequence, and lifecycle contract.
-7. Extend the Capability Profile with exact Android product/build/vendor, kernel-build, verified-boot, SELinux-policy, netd/Connectivity artifact, tool, and namespace identity.
-8. Define the compile-time reviewed positive mark-policy catalog over stable artifact identities, then bind selections to verified boot, boot ID, and observed namespace; never authorize an arbitrary runtime self-hashed manifest.
-9. Complete the remaining mark-evidence fragments and point-in-time 27-cell coordinator, then satisfy exact writer semantics, observer continuity, and mark-preservation canaries; do not turn planning authority into an activation lease.
-10. Redesign the RPDB program around the proven no-two-slot/default-network and tethering/per-UID constraints, satisfy domain/network-selection handoff, ownership, reachability, and canary prerequisites, and only then implement priority/table allocation.
-11. Cut over address-derived rules and PBR with a transition lease that disables the shell route writer before the first native mutation.
-12. Implement the future Rust `fluxd migrate --check-only` compatibility importer from legacy
+6. Capture the current real-device baseline and replace every placeholder evidence field.
+7. Build and persist the exact versioned Sing-Box Engine Capability Profile before compiling any final Generation, including whether an authoritative supervised delivery-report producer exists and its exact versioned transport/framing, schema, loss/sequence, and lifecycle contract.
+8. Extend the Capability Profile with exact Android product/build/vendor, kernel-build, verified-boot, SELinux-policy, netd/Connectivity artifact, tool, and namespace identity.
+9. Define the compile-time reviewed positive mark-policy catalog over stable artifact identities, then bind selections to verified boot, boot ID, and observed namespace; never authorize an arbitrary runtime self-hashed manifest.
+10. Complete the remaining mark-evidence fragments and point-in-time 27-cell coordinator, then satisfy exact writer semantics, observer continuity, and mark-preservation canaries; do not turn planning authority into an activation lease.
+11. Redesign the RPDB program around the proven no-two-slot/default-network and tethering/per-UID constraints, satisfy domain/network-selection handoff, ownership, reachability, and canary prerequisites, and only then implement priority/table allocation.
+12. Cut over address-derived rules and PBR with a transition lease that disables the shell route writer before the first native mutation.
+13. Implement the future Rust `fluxd migrate --check-only` compatibility importer from legacy
     `settings.ini`/`addrsyncd.toml`, distinct from the completed shell installer migration, and
     extract current rule-generation cases into backend-neutral golden fixtures.
-13. Implement only isolated `xt_bpf` probe mechanics in parallel. Do not attach from the production
+14. Implement only isolated `xt_bpf` probe mechanics in parallel. Do not attach from the production
     daemon, publish device capability, retain pins, trigger implicit module loading, or modify live Flux chains while shell
     remains the bridge writer. Wire the device-qualified compiler adapter in Phase 4, and keep
     broader eBPF observation in Phase 7 without delaying correctness work or selecting acceleration

@@ -25,7 +25,7 @@
     },
     {
       "path": "tests/oracle/xtables/maximal-zone-v1.env",
-      "sha256": "97790ca00874230d37e6f5264113f22b32aabd2704e339cc4e0c31b2e21f1e5e"
+      "sha256": "f1783aba402e0cc23c8f5f71dbdf4148f881cb9626688981b62fd116d5f05534"
     },
     {
       "path": "tests/oracle/xtables/packages.list",

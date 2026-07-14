@@ -58,9 +58,9 @@ sh tests/shell/run-dispatcher-tests.sh
 
 The first two suites are host-only and cover installer migration/configuration admissibility and legacy rule-generation semantics. The remaining three wrappers run in isolated Bubblewrap roots: installer rollback after post-extraction failure, authoritative `fluxctl` delegation, and the complete Rust-owned dispatcher lifecycle. Local hosts without Bubblewrap report an isolated-suite skip. CI makes unavailable or prohibited Bubblewrap environments failures.
 
-### Phase 2 shadow Capture Program workflow
+### Completed Phase 2 shadow Capture Program workflow
 
-The first Capture Policy checkpoint is pure `flux-core` work. Run its focused integration test with:
+The frozen Capture Policy checkpoint is pure `flux-core` work. Run its focused integration test with:
 
 ```text
 cargo test -p flux-core --test capture_program
@@ -88,53 +88,51 @@ path continues to execute all bridge capture, policy-routing, and address-synchr
 After the focused test, run `cargo xtask ci`; renderer differential tests and real-device cutover
 qualification belong to later checkpoints.
 
-### Frozen xtables restore syntax workflow
+### Frozen xtables syntax and oracle workflow
 
-The first xtables support slice is a pure parser/canonical codec for observation artifacts, not a
-Capture renderer. Run its focused integration test with:
+The completed xtables support slice is a pure parser/canonical codec for observation artifacts, not
+a Capture renderer. Run the synthetic grammar/bounds suite and the checked-in oracle-fixture suite:
 
 ```text
 cargo test -p flux-platform --test xtables_restore
+cargo test -p flux-platform --test xtables_restore_oracle
 ```
 
-The suite uses current-shaped synthetic documents to pin strict LF/single-space printable-ASCII
+The first suite uses current-shaped synthetic documents to pin strict LF/single-space printable-ASCII
 framing, repeated tables, declaration and command order, duplicates, IPv4/IPv6 context,
 apply/cleanup opcode separation, per-transaction
 delete-before-flush-before-delete-chain cleanup phases, exact
 bounds, canonical round-trip bytes, and digest identity. It performs no filesystem reads, shell or
-restore invocation, kernel access, or mutation.
+restore invocation, kernel access, or mutation. The second suite parses the four checked-in
+IPv4/IPv6 apply/cleanup oracle fixtures and proves exact canonical byte round-trip plus the expected
+syntax-artifact accounting and digest.
 
-Passing this test does not establish that `scripts/rules` generated the bytes, that the kernel
-accepts them, that cleanup is complete, or that a Rust Capture renderer has parity. The bounded raw
-cache-artifact oracle is a separate, explicit workflow:
+These tests establish syntax byte compatibility only. They do not establish that an independent
+Rust Capture renderer implements the same packet-policy semantics, that the kernel accepts the
+programs, that apply/cleanup is invertible, or that an Android device has packet-path parity. The
+bounded raw cache-artifact regeneration workflow is separate and explicit:
 
 ```text
-docker pull --platform=linux/amd64 docker.io/library/busybox@sha256:dfb66b2b3e6981fefa54fd2cd4faf662c35b4a4baeff48295a9409ddf3224c48
 cargo xtask xtables-oracle --check
 # After reviewing an intentional oracle-input change:
 cargo xtask xtables-oracle --update
 ```
 
-Both modes require a Linux Docker host with that exact image already present. The runner uses
-`--pull=never`; its manifest additionally binds the reviewed
-`busybox:1.37.0-uclibc` source index, `linux/amd64` layer, BusyBox version banner, and exact
-`/bin/busybox` SHA-256
-`c984eacc3b736fe1eeefe201f21b241932ef4c3c03fbb6869a4f156f32dd9716`. Generation runs as an
-unprivileged user with all capabilities dropped, a read-only image root, `no-new-privileges`, and
-no container network. The runner reads the five bounded inputs once, hashes and archives those
-exact bytes, and streams only that snapshot into private tmpfs; it never mounts the host workspace.
-The dedicated GitHub Actions job performs the one explicit registry pull before `--check`;
-generation itself does not access the network, inspect or mutate live networking state, or invoke
-`iptables-restore`/`ip6tables-restore`.
+`tests/oracle/xtables/manifest.json` is the sole canonical inventory for the platform image,
+environment identity, inputs, fixture hashes, sizes, and line counts. Do not copy those values into
+another document. Both modes require a Linux Docker host with the manifest's platform image already
+present because the runner uses `--pull=never`. Generation runs unprivileged, with capabilities
+dropped, a read-only image root, `no-new-privileges`, and no container network; it never mounts the
+host workspace or invokes `iptables-restore`/`ip6tables-restore`. The dedicated CI job performs the
+explicit image pull before `--check`.
 
 The `maximal-zone-v1` profile emits exactly four raw files:
 `maximal-zone-v1-ipv4-apply.restore`, `maximal-zone-v1-ipv4-cleanup.restore`,
 `maximal-zone-v1-ipv6-apply.restore`, and `maximal-zone-v1-ipv6-cleanup.restore`. It is driven only
 by the checked-in `scripts/rules`, semantic shell test, generator, environment cache, and
-package-list cache recorded in the manifest. `--check` rejects input, environment, fixture-byte,
-hash, size, line-count, or inventory drift. `--update` is the deliberate review path for rewriting
-the four fixtures and their input/fixture metadata; it cannot alter or bless the compile-time
-approved OCI, layer, binary, or version pins. Neither mode is part of normal `cargo xtask ci`.
+package-list cache recorded in the manifest. `--check` rejects contract or fixture drift; `--update`
+is the deliberate review path for an intentional oracle-input change. Neither mode is part of
+normal `cargo xtask ci`.
 
 These files characterize only that bounded cache-input profile. They do not run configuration or
 kernel capability detection and do not cover QUIC, policy-based routing, or forced cleanup; the

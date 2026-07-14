@@ -771,9 +771,13 @@ Inject:
 
 The acceptance property is convergence to exactly one of three states: the previous known-good generation, the target generation, or a clean documented fail-open state. Partial capture with no healthy proxy engine is not acceptable.
 
-## Implementation sequence derived from the research
+## Local research-stage sequence
 
-### Phase 1: common contracts and retained baseline
+The labels below are local ordering for this research note, not Flux product phases. The
+authoritative product phase numbers and activation gates remain in
+`docs/architecture/implementation-roadmap.md`.
+
+### Research stage 1: common contracts and retained baseline
 
 - Move `addrsyncd` reactor/rtnetlink code in-process.
 - Define typed marks, masks, table/priority IDs, interface identities, generation IDs, and capability evidence.
@@ -781,7 +785,7 @@ The acceptance property is convergence to exactly one of three states: the previ
 - Preserve xtables restore and bounded-tree behavior behind an adapter.
 - Establish a crash-recovery journal and single kernel writer.
 
-### Phase 2: ipset and nftables
+### Research stage 2: ipset and nftables
 
 - Add exact ipset protocol/type/swap probing and the generation-swap adapter.
 - Add the nft JSON/process adapter with a bundled or fingerprinted binary.
@@ -789,7 +793,7 @@ The acceptance property is convergence to exactly one of three states: the previ
 - Differentially test capture policy across all rule backends.
 - Begin the narrow native nft netlink codec only after the process backend is an oracle.
 
-### Phase 3: managed TUN
+### Research stage 3: managed TUN
 
 - Ship `EngineOwnedTun`; implement direct TUN UAPI for contained probes and the future FD-handoff plan.
 - Move TUN routes/rules and device observation under the generation transaction.
@@ -797,7 +801,7 @@ The acceptance property is convergence to exactly one of three states: the previ
 - Add conservative direct multiqueue/offload probes for the future `FluxOwnedTunFd` plan.
 - Keep epoll as the shipping I/O path.
 
-### Phase 4: eBPF observation
+### Research stage 4: eBPF observation
 
 - Add Aya loader, no-CO-RE baseline object, capability probes, and verifier diagnostics.
 - Probe exact `xt_bpf` map/program/pin/iptables/packet/cleanup behavior and attach an observation rule that always returns false.
@@ -805,9 +809,9 @@ The acceptance property is convergence to exactly one of three states: the previ
 - Test map generation swap and stale-generation fail-safe behavior.
 - Ship physical-interface TC, cgroup, sk_lookup, and XDP only as explicit experiments.
 
-### Phase 5: eBPF acceleration and newer-kernel paths
+### Research stage 5: eBPF acceleration and newer-kernel paths
 
-This local sequence is implementation priority. Once implemented, TUN TC observation and child
+This local research sequence records mechanism priority only. Once implemented, TUN TC observation and child
 telemetry are independently eligible from their own probes and do not require an active `xt_bpf`
 path at runtime.
 

@@ -2,6 +2,29 @@ use flux_platform::{SystemCapabilityProfileSource, SystemKernelReleaseSource};
 
 fn main() {
     let args = std::env::args().collect::<Vec<_>>();
+    if args
+        .get(1)
+        .is_some_and(|command| command == "render-legacy-rules")
+    {
+        let exit = fluxd::run_legacy_rules_cli(
+            &args,
+            &fluxd::ProcessLegacyRulesEnvironment,
+            &mut std::io::stdout(),
+            &mut std::io::stderr(),
+        );
+        std::process::exit(exit);
+    }
+    if args
+        .get(1)
+        .is_some_and(|command| command == "snapshot-legacy-packages")
+    {
+        let exit = fluxd::run_legacy_package_snapshot_cli(
+            &args,
+            &mut std::io::stdout(),
+            &mut std::io::stderr(),
+        );
+        std::process::exit(exit);
+    }
     let source = SystemKernelReleaseSource;
     if args.get(1).is_some_and(|command| command == "daemon") {
         if args.len() != 2 {

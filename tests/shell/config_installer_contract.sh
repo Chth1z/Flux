@@ -156,6 +156,8 @@ cat >"${supported}" <<'EOF'
 PROXY_MODE="tproxy"
 BYPASS_SET_BACKEND="zone"
 TUN_INTERFACE="reserved_tun0"
+EXCLUDE_INTERFACES="wlan+
+rmnet+"
 EOF
 SETTINGS_FILE="${supported}"
 _process_settings >"${tmp_dir}/supported.out" 2>"${tmp_dir}/supported.err" ||
@@ -163,6 +165,7 @@ _process_settings >"${tmp_dir}/supported.out" 2>"${tmp_dir}/supported.err" ||
 assert_line "PROXY_MODE='tproxy'" "${tmp_dir}/supported.out"
 assert_line "BYPASS_SET_BACKEND='zone'" "${tmp_dir}/supported.out"
 assert_line "TUN_INTERFACE='reserved_tun0'" "${tmp_dir}/supported.out"
+assert_line "EXCLUDE_INTERFACES='wlan+ rmnet+'" "${tmp_dir}/supported.out"
 
 rejected_tun="${tmp_dir}/rejected-tun.ini"
 printf '%s\n' 'PROXY_MODE="tun"' >"${rejected_tun}"

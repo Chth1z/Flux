@@ -377,7 +377,7 @@ _process_settings() {
             if (validate(type, name, val, min, max)) has_error = 1
 
             # Normalize whitespace-separated list values.
-            if (type == "pkg_list" || type == "user_list") {
+            if (type == "pkg_list" || type == "user_list" || type == "iface_list") {
                 gsub(/\n/, " ", val)
                 gsub(/[[:space:]]+/, " ", val)
                 val = trim(val)

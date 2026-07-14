@@ -3,9 +3,9 @@ mod restore;
 
 pub use render::{
     LegacyApplicationMode, LegacyApplicationPolicy, LegacyInterfacePattern, LegacyInterfacePolicy,
-    LegacyInterfaceRole, LegacyKernelFeatures, LegacyOwnerMatch, LegacyOwnerToken, LegacyRulesPlan,
-    LegacyRulesPlanError, LegacyRulesRenderError, LegacyRulesRenderRequest,
-    render_legacy_rules_restore,
+    LegacyInterfaceRole, LegacyKernelFeatures, LegacyMarkValues, LegacyOwnerMatch,
+    LegacyOwnerToken, LegacyRulesPlan, LegacyRulesPlanError, LegacyRulesRenderError,
+    LegacyRulesRenderRequest, MAX_LEGACY_APPLICATION_UIDS, render_legacy_rules_restore,
 };
 
 pub use restore::{

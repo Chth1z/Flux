@@ -71,11 +71,11 @@ const IPV6_DISPATCH_RULES: &[(u8, &str)] = &[
 
 const MAX_OWNER_TOKEN_BYTES: usize = 255;
 const MAX_INTERFACE_PATTERN_BYTES: usize = 15;
-const MAX_APPLICATION_UIDS: usize = 20_000;
+pub const MAX_LEGACY_APPLICATION_UIDS: usize = 20_000;
 const MAX_EXCLUDED_INTERFACES: usize = 128;
-const IPV4_PROXY_MARK: u32 = 0x14;
-const IPV6_PROXY_MARK: u32 = 0x19;
-const BYPASS_MARK: u32 = 0x11;
+const DEFAULT_IPV4_PROXY_MARK: u32 = 0x14;
+const DEFAULT_IPV6_PROXY_MARK: u32 = 0x19;
+const DEFAULT_BYPASS_MARK: u32 = 0x11;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LegacyOwnerToken(Box<str>);
@@ -105,6 +105,33 @@ impl LegacyOwnerToken {
 pub struct LegacyOwnerMatch {
     uid: LegacyOwnerToken,
     gid: LegacyOwnerToken,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LegacyMarkValues {
+    ipv4_proxy: u32,
+    ipv6_proxy: u32,
+    bypass: u32,
+}
+
+impl LegacyMarkValues {
+    #[must_use]
+    pub const fn new(ipv4_proxy: u32, ipv6_proxy: u32, bypass: u32) -> Self {
+        Self {
+            ipv4_proxy,
+            ipv6_proxy,
+            bypass,
+        }
+    }
+
+    #[must_use]
+    pub const fn legacy_defaults() -> Self {
+        Self::new(
+            DEFAULT_IPV4_PROXY_MARK,
+            DEFAULT_IPV6_PROXY_MARK,
+            DEFAULT_BYPASS_MARK,
+        )
+    }
 }
 
 impl LegacyOwnerMatch {
@@ -158,7 +185,7 @@ impl LegacyApplicationPolicy {
         ordered_uids: impl IntoIterator<Item = u32>,
     ) -> Result<Self, LegacyRulesPlanError> {
         let ordered_uids = ordered_uids.into_iter().collect::<Vec<_>>();
-        if ordered_uids.len() > MAX_APPLICATION_UIDS {
+        if ordered_uids.len() > MAX_LEGACY_APPLICATION_UIDS {
             return Err(LegacyRulesPlanError::TooManyApplicationUids);
         }
         Ok(Self {
@@ -249,6 +276,7 @@ impl LegacyKernelFeatures {
 pub struct LegacyRulesPlan {
     proxy_port: u16,
     mark_mask: u32,
+    marks: LegacyMarkValues,
     routing_mark: Option<u32>,
     owner: LegacyOwnerMatch,
     applications: LegacyApplicationPolicy,
@@ -266,6 +294,7 @@ impl LegacyRulesPlan {
     pub fn new(
         proxy_port: u16,
         mark_mask: u32,
+        marks: LegacyMarkValues,
         routing_mark: Option<u32>,
         owner: LegacyOwnerMatch,
         applications: LegacyApplicationPolicy,
@@ -280,7 +309,7 @@ impl LegacyRulesPlan {
         if proxy_port == 0 {
             return Err(LegacyRulesPlanError::InvalidProxyPort);
         }
-        if mark_mask == 0 {
+        if !legacy_mark_mask_is_valid(mark_mask, marks) {
             return Err(LegacyRulesPlanError::InvalidMarkMask);
         }
         validate_fake_ip(fake_ip_v4, XtablesRestoreFamily::Ipv4)?;
@@ -288,6 +317,7 @@ impl LegacyRulesPlan {
         Ok(Self {
             proxy_port,
             mark_mask,
+            marks,
             routing_mark,
             owner,
             applications,
@@ -309,6 +339,7 @@ impl LegacyRulesPlan {
         Self::new(
             1536,
             0xff,
+            LegacyMarkValues::legacy_defaults(),
             None,
             LegacyOwnerMatch::new(
                 LegacyOwnerToken::new("1000").expect("valid fixture UID"),
@@ -364,7 +395,9 @@ impl fmt::Display for LegacyRulesPlanError {
         formatter.write_str(match self {
             Self::InvalidFakeIp => "legacy rules FakeIP range is invalid or has the wrong family",
             Self::InvalidInterfacePattern => "legacy rules interface pattern is invalid",
-            Self::InvalidMarkMask => "legacy rules mark mask must be nonzero",
+            Self::InvalidMarkMask => {
+                "legacy rules mark mask must contain and distinguish every fixed legacy mark"
+            }
             Self::InvalidOwnerToken => "legacy rules owner token is invalid",
             Self::InvalidProxyPort => "legacy rules proxy port must be nonzero",
             Self::TooManyApplicationUids => "legacy rules application UID list exceeds its limit",
@@ -481,7 +514,7 @@ impl<'a> FamilyProfile<'a> {
             XtablesRestoreFamily::Ipv4 => Self {
                 plan,
                 suffix: "",
-                proxy_mark: IPV4_PROXY_MARK,
+                proxy_mark: plan.marks.ipv4_proxy,
                 loopback: "127.0.0.1",
                 fake_ip_range: &plan.fake_ip_v4,
                 fake_ip_protocol: "icmp",
@@ -491,7 +524,7 @@ impl<'a> FamilyProfile<'a> {
             XtablesRestoreFamily::Ipv6 => Self {
                 plan,
                 suffix: "6",
-                proxy_mark: IPV6_PROXY_MARK,
+                proxy_mark: plan.marks.ipv6_proxy,
                 loopback: "::1",
                 fake_ip_range: &plan.fake_ip_v6,
                 fake_ip_protocol: "ipv6-icmp",
@@ -524,6 +557,13 @@ fn validate_fake_ip(value: &str, family: XtablesRestoreFamily) -> Result<(), Leg
     }
 }
 
+const fn legacy_mark_mask_is_valid(mask: u32, marks: LegacyMarkValues) -> bool {
+    let mark_bits = marks.ipv4_proxy | marks.ipv6_proxy | marks.bypass;
+    mask & mark_bits == mark_bits
+        && (marks.ipv4_proxy ^ marks.bypass) & mask != 0
+        && (marks.ipv6_proxy ^ marks.bypass) & mask != 0
+}
+
 fn render_mangle(action: XtablesRestoreAction, family: FamilyProfile<'_>, output: &mut String) {
     output.push_str("*mangle\n");
     match action {
@@ -548,7 +588,7 @@ fn render_apply_mangle(family: FamilyProfile<'_>, output: &mut String) {
         writeln!(
             output,
             "-A ACTION_BYPASS{} -j CONNMARK --set-xmark 0x{:x}/0x{:x}",
-            family.suffix, BYPASS_MARK, family.plan.mark_mask
+            family.suffix, family.plan.marks.bypass, family.plan.mark_mask
         )
         .expect("writing to String");
     }
@@ -724,7 +764,7 @@ fn render_fast_path(family: FamilyProfile<'_>, output: &mut String) {
         writeln!(
             output,
             "-A {chain}{} -m connmark --mark 0x{:x}/0x{:x} -j ACCEPT",
-            family.suffix, BYPASS_MARK, family.plan.mark_mask
+            family.suffix, family.plan.marks.bypass, family.plan.mark_mask
         )
         .expect("writing to String");
     }

@@ -24,6 +24,14 @@ readonly SCRIPT_DIR="${_script_path%/*}"
 
 readonly LOG_COMPONENT="Init"
 
+_rule_renderer_source() {
+    if [ "${FLUXD_ENGINE_OWNER:-legacy}" = "rust" ]; then
+        printf '%s\n' rust
+    else
+        printf '%s\n' shell
+    fi
+}
+
 # ==============================================================================
 # [ Pre-flight Checks ]
 # ==============================================================================
@@ -31,7 +39,10 @@ readonly LOG_COMPONENT="Init"
 _check_integrity() {
     local bin
 
-    for bin in "${SING_BOX_BIN}" "${ADDRSYNCD_BIN}" "${JQ_BIN}"; do
+    for bin in "${SING_BOX_BIN}" "${ADDRSYNCD_BIN}" "${JQ_BIN}" "${FLUXD_BIN}"; do
+        if [ "${bin}" = "${FLUXD_BIN}" ] && [ "${FLUXD_ENGINE_OWNER:-legacy}" != "rust" ]; then
+            continue
+        fi
         [ ! -f "${bin}" ] && {
             log_error "Binary missing: ${bin##*/}"
             return 1
@@ -43,7 +54,10 @@ _check_integrity() {
         }
     done
 
-    for script in "${CORE_SCRIPT}" "${TPROXY_SCRIPT}" "${ADDRSYNC_SCRIPT}" "${UPDATE_SCRIPT}" "${FLUXCTL_SCRIPT}"; do
+    for script in "${CORE_SCRIPT}" "${TPROXY_SCRIPT}" "${ADDRSYNC_SCRIPT}" "${UPDATE_SCRIPT}" "${FLUXCTL_SCRIPT}" "${RULES_SCRIPT}"; do
+        if [ "${script}" = "${RULES_SCRIPT}" ] && [ "${FLUXD_ENGINE_OWNER:-legacy}" = "rust" ]; then
+            continue
+        fi
         [ ! -f "${script}" ] && {
             log_error "Script missing: ${script##*/}"
             return 1
@@ -98,14 +112,23 @@ _rotate_log() {
 
 # Cache validation: rebuild if missing or invalid
 _validate_cache() {
-    if [ -f "${EVENT_CACHE_OK}" ]; then
+    local renderer_source=""
+    local cached_source=""
+    renderer_source=$(_rule_renderer_source) || return 1
+
+    if [ -f "${EVENT_CACHE_OK}" ] && [ ! -L "${EVENT_CACHE_OK}" ]; then
+        IFS= read -r cached_source <"${EVENT_CACHE_OK}" || true
         if [ -s "${CACHE_CONFIG_FILE}" ] &&
+            [ "${cached_source}" = "${renderer_source}" ] &&
             [ -s "${CACHE_RULES_V4_FILE}" ] &&
             [ -s "${CACHE_CLEANUP_V4_FILE}" ]; then
-            if [ "${PROXY_IPV6}" != "1" ] || {
+            if { [ "${renderer_source}" != "rust" ] || {
+                [ -f "${CACHE_PACKAGES_FILE}" ] &&
+                    [ ! -L "${CACHE_PACKAGES_FILE}" ]
+            }; } && { [ "${PROXY_IPV6}" != "1" ] || {
                 [ -s "${CACHE_RULES_V6_FILE}" ] &&
                     [ -s "${CACHE_CLEANUP_V6_FILE}" ]
-            }; then
+            }; }; then
                 log_info "Cache is valid"
                 return 0
             fi
@@ -115,8 +138,7 @@ _validate_cache() {
     fi
 
     . "${SCRIPT_DIR}/config"
-    . "${SCRIPT_DIR}/rules"
-    # Config must run first (rules depend on it)
+    # Config must run first because the Rust renderer consumes its exported values.
     atomic_write "${CACHE_CONFIG_FILE}" build_config || return 1
 
     # Load generated config cache for deterministic rule generation (e.g. PROXY_IPV6).
@@ -126,25 +148,62 @@ _validate_cache() {
 
     awk '/^KFEAT_/ { print }' "${CACHE_CONFIG_FILE}" >"${CACHE_KERNEL_CAPS_FILE}" 2>/dev/null || true
 
-    # Parallel rule generation for performance
     local pids=""
 
-    atomic_write "${CACHE_RULES_V4_FILE}" generate -A "4" &
-    pids="${pids} $!"
-    atomic_write "${CACHE_CLEANUP_V4_FILE}" generate -D "4" &
-    pids="${pids} $!"
-    [ "${PROXY_IPV6}" = "1" ] && {
-        atomic_write "${CACHE_RULES_V6_FILE}" generate -A "6" &
+    if [ "${renderer_source}" = "rust" ]; then
+        # Snapshot packages.list once so every Rust render in this preparation
+        # observes the same descriptor-validated, bounded application inventory.
+        # No inventory is needed when application selection is inactive or has
+        # no members.
+        if [ "${APP_PROXY_MODE}" != "0" ] && [ -n "${APP_LIST}" ]; then
+            atomic_write "${CACHE_PACKAGES_FILE}" "${FLUXD_BIN}" snapshot-legacy-packages \
+                --source "${PACKAGES_LIST}" || return 1
+        else
+            atomic_write "${CACHE_PACKAGES_FILE}" printf '' || return 1
+        fi
+        chmod 0444 "${CACHE_PACKAGES_FILE}" 2>/dev/null || return 1
+
+        # The restore compiler and shell PBR executor consume one mark contract.
+        export IPV4_MARK IPV6_MARK BYPASS_MARK
+
+        # Parallel rule generation for performance.
+        atomic_write "${CACHE_RULES_V4_FILE}" "${FLUXD_BIN}" render-legacy-rules \
+            --packages-list "${CACHE_PACKAGES_FILE}" --family 4 --action apply &
         pids="${pids} $!"
-        atomic_write "${CACHE_CLEANUP_V6_FILE}" generate -D "6" &
+        atomic_write "${CACHE_CLEANUP_V4_FILE}" "${FLUXD_BIN}" render-legacy-rules \
+            --packages-list "${CACHE_PACKAGES_FILE}" --family 4 --action cleanup &
         pids="${pids} $!"
-    }
+        [ "${PROXY_IPV6}" = "1" ] && {
+            atomic_write "${CACHE_RULES_V6_FILE}" "${FLUXD_BIN}" render-legacy-rules \
+                --packages-list "${CACHE_PACKAGES_FILE}" --family 6 --action apply &
+            pids="${pids} $!"
+            atomic_write "${CACHE_CLEANUP_V6_FILE}" "${FLUXD_BIN}" render-legacy-rules \
+                --packages-list "${CACHE_PACKAGES_FILE}" --family 6 --action cleanup &
+            pids="${pids} $!"
+        }
+    else
+        # Explicit legacy ownership retains the frozen shell generator as the
+        # mutually exclusive rollback path. Rust-owned preparation never falls
+        # back silently when rendering fails.
+        . "${SCRIPT_DIR}/rules"
+        rm -f "${CACHE_PACKAGES_FILE}" 2>/dev/null || true
+        atomic_write "${CACHE_RULES_V4_FILE}" generate -A "4" &
+        pids="${pids} $!"
+        atomic_write "${CACHE_CLEANUP_V4_FILE}" generate -D "4" &
+        pids="${pids} $!"
+        [ "${PROXY_IPV6}" = "1" ] && {
+            atomic_write "${CACHE_RULES_V6_FILE}" generate -A "6" &
+            pids="${pids} $!"
+            atomic_write "${CACHE_CLEANUP_V6_FILE}" generate -D "6" &
+            pids="${pids} $!"
+        }
+    fi
 
     # shellcheck disable=SC2086
     wait_pids ${pids} || return 1
 
     log_debug "Cache build success"
-    touch "${EVENT_CACHE_OK}"
+    atomic_write "${EVENT_CACHE_OK}" printf '%s\n' "${renderer_source}"
 }
 
 # ==============================================================================
@@ -192,6 +251,9 @@ _init_env() {
     local pid_log=$!
 
     run "Check update" _check_update || return $?
+    if [ "${FLUXD_ENGINE_OWNER:-legacy}" != "rust" ]; then
+        run "Check Sing-Box config" "${SING_BOX_BIN}" check -c "${CONFIG_FILE}" -D "${RUN_DIR}" || return $?
+    fi
     run "Validate cache" _validate_cache || return $?
 
     wait "${pid_log}"

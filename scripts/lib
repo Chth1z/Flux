@@ -141,6 +141,7 @@ readonly RUNTIME_CACHE_DIR="${_runtime_cache_dir}"
 unset _runtime_cache_dir _runtime_generation_id
 
 readonly CACHE_CONFIG_FILE="${RUNTIME_CACHE_DIR}/cache_config"
+readonly CACHE_PACKAGES_FILE="${RUNTIME_CACHE_DIR}/cache_packages"
 readonly CACHE_RULES_V4_FILE="${RUNTIME_CACHE_DIR}/cache_rules_ipv4"
 readonly CACHE_RULES_V6_FILE="${RUNTIME_CACHE_DIR}/cache_rules_ipv6"
 readonly CACHE_CLEANUP_V4_FILE="${RUNTIME_CACHE_DIR}/cache_cleanup_ipv4"

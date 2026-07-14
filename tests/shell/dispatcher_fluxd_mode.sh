@@ -87,7 +87,8 @@ TUN_INTERFACE=tun0
 EOF
     printf '*mangle\nCOMMIT\n' >"${FLUX_ROOT}/cache/cache_rules_ipv4"
     printf '*mangle\nCOMMIT\n' >"${FLUX_ROOT}/cache/cache_cleanup_ipv4"
-    : >"${FLUX_ROOT}/cache/cache_valid"
+    : >"${FLUX_ROOT}/cache/cache_packages"
+    printf 'rust\n' >"${FLUX_ROOT}/cache/cache_valid"
     write_stub config '
 _process_settings() {
     cat /data/adb/flux/cache/cache_config
@@ -124,7 +125,51 @@ if [ "${1:-}" = start ]; then
 elif [ "${1:-}" = stop ]; then
     rm -f /data/adb/flux/run/active_runtime /data/adb/flux/run/active_cleanup_ipv4
 fi
-exit 0'
+    exit 0'
+}
+
+install_real_init_fixture() {
+    printf 'UPDATE_INTERVAL=0\n' >>"${FLUX_ROOT}/cache/cache_config"
+    cp /src/scripts/init "${FLUX_ROOT}/scripts/init"
+    chmod 0755 "${FLUX_ROOT}/scripts/init"
+    cat >"${FLUX_ROOT}/scripts/config" <<'EOF'
+_process_settings() {
+    cat /data/adb/flux/cache/cache_config
+}
+
+_detect_kernel() {
+    return 0
+}
+
+build_config() {
+    cat <<'CONFIG'
+LOG_LEVEL='0'
+LOG_MAX_SIZE='1048576'
+UPDATE_INTERVAL='0'
+CORE_USER='root'
+CORE_GROUP='root'
+CORE_TIMEOUT='5'
+PROXY_MODE='tproxy'
+PROXY_PORT='1536'
+PROXY_IPV6='0'
+APP_PROXY_MODE='2'
+APP_LIST='com.example.alpha'
+KFEAT_OWNER=1
+CONFIG
+}
+EOF
+    write_stub updater.sh 'exit 0'
+    write_stub fluxctl 'exit 0'
+    for binary in jq addrsyncd; do
+        printf '#!/usr/bin/sh\nexit 0\n' >"${FLUX_ROOT}/bin/${binary}"
+        chmod 0755 "${FLUX_ROOT}/bin/${binary}"
+    done
+    : >"${FLUX_ROOT}/conf/addrsyncd.toml"
+    printf '{}\n' >"${FLUX_ROOT}/conf/template.json"
+    mkdir -p /data/system
+    cat >/data/system/packages.list <<'EOF'
+com.example.alpha 10124 0 /data/user/0/com.example.alpha default 3003,3002 0 1
+EOF
 }
 
 run_bridge() {
@@ -154,6 +199,7 @@ EOF
     assert_file_equals "${RUN_ROOT}/engine.manifest" "${GENERATIONS_ROOT}/1/engine.manifest"
     assert_file_equals "${FLUX_ROOT}/conf/config.json" "${GENERATIONS_ROOT}/1/config.json"
     assert_file_equals "${FLUX_ROOT}/cache/cache_config" "${GENERATIONS_ROOT}/1/cache_config"
+    assert_file_equals "${FLUX_ROOT}/cache/cache_packages" "${GENERATIONS_ROOT}/1/cache_packages"
     [ "$(stat -c '%a' "${GENERATIONS_ROOT}/1")" = "555" ] ||
         fail "completed generation directory is mutable"
     [ "$(stat -c '%a' "${GENERATIONS_ROOT}/1/config.json")" = "444" ] ||
@@ -162,6 +208,157 @@ EOF
         fail "generation environment snapshot is mutable"
     grep -qx 'init:init' "${CALLS_FILE}" || fail "prepare must run init/config generation"
     assert_not_called core
+}
+
+test_real_init_uses_rust_renderer_and_snapshots_one_package_inventory() {
+    reset_fixture
+    install_real_init_fixture
+    cat >"${FLUX_ROOT}/bin/sing-box" <<'EOF'
+#!/usr/bin/sh
+printf 'sing-box:%s\n' "$*" >>/data/adb/flux/run/test-calls
+exit 77
+EOF
+    chmod 0755 "${FLUX_ROOT}/bin/sing-box"
+    cat >"${FLUX_ROOT}/scripts/rules" <<'EOF'
+return 99
+EOF
+cat >"${FLUX_ROOT}/bin/fluxd" <<'EOF'
+#!/usr/bin/sh
+set -eu
+if [ "${1:-}" = snapshot-legacy-packages ]; then
+    printf 'rust-snapshot:%s\n' "$*" >>/data/adb/flux/run/test-calls
+    cat "${3}"
+    exit 0
+fi
+printf 'rust-render:%s\n' "$*" >>/data/adb/flux/run/test-calls
+printf '*mangle\nCOMMIT\n'
+EOF
+    chmod 0755 "${FLUX_ROOT}/bin/fluxd"
+
+    generation=$(prepare_generation)
+
+    grep -qx 'rust-render:render-legacy-rules --packages-list /data/adb/flux/cache/cache_packages --family 4 --action apply' "${CALLS_FILE}" ||
+        fail "real init did not invoke the Rust IPv4 apply renderer"
+    grep -qx 'rust-render:render-legacy-rules --packages-list /data/adb/flux/cache/cache_packages --family 4 --action cleanup' "${CALLS_FILE}" ||
+        fail "real init did not invoke the Rust IPv4 cleanup renderer"
+    grep -qx 'rust-snapshot:snapshot-legacy-packages --source /data/system/packages.list' "${CALLS_FILE}" ||
+        fail "real init did not invoke the bounded Rust package snapshot helper"
+    assert_not_called sing-box
+    [ "$(grep -c '^rust-render:' "${CALLS_FILE}")" -eq 2 ] ||
+        fail "real init invoked an unexpected renderer count"
+    assert_file_equals /data/system/packages.list "${GENERATIONS_ROOT}/${generation}/cache_packages"
+    grep -qx '\*mangle' "${GENERATIONS_ROOT}/${generation}/cache_rules_ipv4" ||
+        fail "generation did not retain Rust-rendered apply bytes"
+    grep -qx '\*mangle' "${GENERATIONS_ROOT}/${generation}/cache_cleanup_ipv4" ||
+        fail "generation did not retain Rust-rendered cleanup bytes"
+    assert_not_called core
+}
+
+test_real_init_keeps_explicit_shell_renderer_rollback_for_legacy_owner() {
+    reset_fixture
+    install_real_init_fixture
+    rm -f "${FLUX_ROOT}/bin/fluxd"
+    cat >"${FLUX_ROOT}/scripts/rules" <<'EOF'
+generate() {
+    printf 'shell-render:%s\n' "$*" >>/data/adb/flux/run/test-calls
+    printf '*mangle\nCOMMIT\n'
+}
+EOF
+
+    run_bridge start || fail "explicit legacy start did not retain the shell renderer"
+
+    grep -qx 'shell-render:-A 4' "${CALLS_FILE}" || fail "legacy apply did not use scripts/rules"
+    grep -qx 'shell-render:-D 4' "${CALLS_FILE}" || fail "legacy cleanup did not use scripts/rules"
+    [ "$(cat "${FLUX_ROOT}/cache/cache_valid")" = shell ] ||
+        fail "legacy cache did not record its shell producer"
+    [ ! -e "${FLUX_ROOT}/cache/cache_packages" ] ||
+        fail "legacy renderer retained a misleading Rust package snapshot"
+}
+
+test_legacy_restart_prepares_before_stopping_the_active_runtime() {
+    reset_fixture
+    install_real_init_fixture
+    rm -f "${FLUX_ROOT}/bin/fluxd"
+    cat >"${FLUX_ROOT}/scripts/rules" <<'EOF'
+generate() {
+    [ ! -e /data/adb/flux/run/fail-shell-render ] || exit 74
+    printf '*mangle\nCOMMIT\n'
+}
+EOF
+
+    run_bridge start || fail "legacy start before restart preflight test failed"
+    cp "${RUN_ROOT}/dispatcher.mode" "${RUN_ROOT}/legacy-mode-before-render-failure"
+    cp /data/adb/modules/flux/module.prop "${RUN_ROOT}/legacy-prop-before-render-failure"
+    : >"${CALLS_FILE}"
+    : >"${RUN_ROOT}/fail-shell-render"
+
+    if run_bridge restart; then
+        fail "legacy restart accepted a failed replacement render"
+    fi
+
+    ! grep -Eq '^(core|tproxy|addrsync):stop$' "${CALLS_FILE}" ||
+        fail "legacy restart stopped the active runtime before replacement preparation"
+    assert_file_equals "${RUN_ROOT}/legacy-mode-before-render-failure" "${RUN_ROOT}/dispatcher.mode"
+    assert_file_equals "${RUN_ROOT}/legacy-prop-before-render-failure" /data/adb/modules/flux/module.prop
+    grep -q '\[RUNNING\]' /data/adb/modules/flux/module.prop ||
+        fail "failed legacy replacement preparation changed RUNNING state"
+    [ "$(cat "${FLUX_ROOT}/cache/cache_valid")" = shell ] ||
+        fail "failed legacy replacement preparation did not restore cache authority"
+
+    rm -f "${RUN_ROOT}/fail-shell-render"
+    run_bridge stop || fail "legacy stop failed after replacement preparation was rejected"
+    grep -q '\[STOPPED\]' /data/adb/modules/flux/module.prop ||
+        fail "legacy stop did not remain available after replacement preparation failure"
+}
+
+test_failed_rust_render_preserves_the_active_generation() {
+    reset_fixture
+    install_real_init_fixture
+    cat >"${FLUX_ROOT}/scripts/rules" <<'EOF'
+return 99
+EOF
+    cat >"${FLUX_ROOT}/bin/fluxd" <<'EOF'
+#!/usr/bin/sh
+if [ "${1:-}" = snapshot-legacy-packages ]; then
+    cat "${3}"
+    exit 0
+fi
+printf '*mangle\nCOMMIT\n'
+EOF
+    chmod 0755 "${FLUX_ROOT}/bin/fluxd"
+
+    active_generation=$(prepare_generation)
+    run_bridge capture-start "${active_generation}" || fail "initial capture-start failed"
+    run_bridge capture-verify "${active_generation}" || fail "initial capture-verify failed"
+    run_bridge state-running "${active_generation}" || fail "initial state-running failed"
+    cp "${RUN_ROOT}/capture.active" "${RUN_ROOT}/active-before-render-failure"
+    cp "${RUN_ROOT}/capture.verified" "${RUN_ROOT}/verified-before-render-failure"
+    cp "${RUN_ROOT}/engine.active" "${RUN_ROOT}/engine-before-render-failure"
+
+    cat >"${FLUX_ROOT}/bin/fluxd" <<'EOF'
+#!/usr/bin/sh
+set -eu
+if [ "${1:-}" = snapshot-legacy-packages ]; then
+    cat "${3}"
+    exit 0
+fi
+case "$*" in
+*'--family 4 --action cleanup'*) exit 73 ;;
+esac
+printf '*mangle\nCOMMIT\n'
+EOF
+    chmod 0755 "${FLUX_ROOT}/bin/fluxd"
+
+    if run_bridge prepare; then
+        fail "prepare accepted a partial Rust render"
+    fi
+
+    [ ! -e "${RUN_ROOT}/engine.manifest" ] || fail "failed render published a candidate manifest"
+    [ ! -d "${GENERATIONS_ROOT}/2" ] || fail "failed render retained a candidate generation"
+    [ ! -e "${FLUX_ROOT}/cache/cache_valid" ] || fail "failed render published cache validity"
+    assert_file_equals "${RUN_ROOT}/active-before-render-failure" "${RUN_ROOT}/capture.active"
+    assert_file_equals "${RUN_ROOT}/verified-before-render-failure" "${RUN_ROOT}/capture.verified"
+    assert_file_equals "${RUN_ROOT}/engine-before-render-failure" "${RUN_ROOT}/engine.active"
 }
 
 test_prepare_removes_stale_manifest_on_failure() {
@@ -1016,6 +1213,10 @@ test_legacy_and_rust_owned_verbs_cannot_mix() {
 }
 
 test_prepare_writes_exact_direct_manifest_without_core
+test_real_init_uses_rust_renderer_and_snapshots_one_package_inventory
+test_real_init_keeps_explicit_shell_renderer_rollback_for_legacy_owner
+test_legacy_restart_prepares_before_stopping_the_active_runtime
+test_failed_rust_render_preserves_the_active_generation
 test_prepare_removes_stale_manifest_on_failure
 test_prepare_creates_distinct_immutable_generation_artifacts
 test_previous_generation_can_be_selected_after_newer_prepare

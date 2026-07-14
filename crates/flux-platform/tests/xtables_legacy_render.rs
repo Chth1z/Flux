@@ -10,9 +10,10 @@ use flux_core::{
 };
 use flux_platform::{
     LegacyApplicationMode, LegacyApplicationPolicy, LegacyInterfacePattern, LegacyInterfacePolicy,
-    LegacyInterfaceRole, LegacyKernelFeatures, LegacyOwnerMatch, LegacyOwnerToken, LegacyRulesPlan,
-    LegacyRulesPlanError, LegacyRulesRenderError, LegacyRulesRenderRequest, XtablesRestoreAction,
-    XtablesRestoreContext, XtablesRestoreFamily, render_legacy_rules_restore,
+    LegacyInterfaceRole, LegacyKernelFeatures, LegacyMarkValues, LegacyOwnerMatch,
+    LegacyOwnerToken, LegacyRulesPlan, LegacyRulesPlanError, LegacyRulesRenderError,
+    LegacyRulesRenderRequest, XtablesRestoreAction, XtablesRestoreContext, XtablesRestoreFamily,
+    render_legacy_rules_restore,
 };
 
 struct FixtureCase {
@@ -348,6 +349,7 @@ fn general_renderer_rejects_invalid_source_tokens_and_ranges() {
         LegacyRulesPlan::new(
             0,
             0xff,
+            LegacyMarkValues::legacy_defaults(),
             None,
             owner.clone(),
             applications.clone(),
@@ -365,6 +367,7 @@ fn general_renderer_rejects_invalid_source_tokens_and_ranges() {
         LegacyRulesPlan::new(
             1536,
             0,
+            LegacyMarkValues::legacy_defaults(),
             None,
             owner.clone(),
             applications.clone(),
@@ -382,6 +385,7 @@ fn general_renderer_rejects_invalid_source_tokens_and_ranges() {
         LegacyRulesPlan::new(
             1536,
             0xff,
+            LegacyMarkValues::legacy_defaults(),
             None,
             owner,
             applications,
@@ -395,6 +399,38 @@ fn general_renderer_rejects_invalid_source_tokens_and_ranges() {
         ),
         Err(LegacyRulesPlanError::InvalidFakeIp)
     );
+}
+
+#[test]
+fn mark_values_must_fit_the_mask_and_remain_distinct_from_bypass() {
+    for (mask, marks) in [
+        (0, LegacyMarkValues::legacy_defaults()),
+        (1, LegacyMarkValues::legacy_defaults()),
+        (0xff, LegacyMarkValues::new(0x14, 0x19, 0x14)),
+        (0xff, LegacyMarkValues::new(0x114, 0x19, 0x11)),
+    ] {
+        assert_eq!(
+            plan_with_marks(mask, marks),
+            Err(LegacyRulesPlanError::InvalidMarkMask),
+            "mask={mask:#x} marks={marks:?}"
+        );
+    }
+
+    let marks = LegacyMarkValues::new(0x24, 0x29, 0x21);
+    let plan = plan_with_marks(0xff, marks).unwrap();
+    let ipv4 = render_text(
+        &plan,
+        XtablesRestoreAction::Apply,
+        XtablesRestoreFamily::Ipv4,
+    );
+    assert!(ipv4.contains("--set-xmark 0x21/0xff"));
+    assert!(ipv4.contains("--tproxy-mark 0x24/0xff"));
+    let ipv6 = render_text(
+        &plan,
+        XtablesRestoreAction::Apply,
+        XtablesRestoreFamily::Ipv6,
+    );
+    assert!(ipv6.contains("--tproxy-mark 0x29/0xff"));
 }
 
 fn exact_interface(name: &str) -> CaptureInterfaceSelector {
@@ -426,6 +462,7 @@ fn general_plan<const N: usize>(
     LegacyRulesPlan::new(
         1536,
         0xff,
+        LegacyMarkValues::legacy_defaults(),
         routing_mark,
         LegacyOwnerMatch::new(
             LegacyOwnerToken::new("root").unwrap(),
@@ -448,6 +485,30 @@ fn general_plan<const N: usize>(
         "fc00::/18",
     )
     .unwrap()
+}
+
+fn plan_with_marks(
+    mask: u32,
+    marks: LegacyMarkValues,
+) -> Result<LegacyRulesPlan, LegacyRulesPlanError> {
+    LegacyRulesPlan::new(
+        1536,
+        mask,
+        marks,
+        None,
+        LegacyOwnerMatch::new(
+            LegacyOwnerToken::new("root").unwrap(),
+            LegacyOwnerToken::new("root").unwrap(),
+        ),
+        LegacyApplicationPolicy::new(LegacyApplicationMode::All, []).unwrap(),
+        empty_interfaces(),
+        LegacyKernelFeatures::new(true, true, true, false, false, true, true),
+        false,
+        false,
+        true,
+        "198.18.0.0/15",
+        "fc00::/18",
+    )
 }
 
 fn empty_interfaces() -> LegacyInterfacePolicy {

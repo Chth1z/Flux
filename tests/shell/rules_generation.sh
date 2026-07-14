@@ -54,6 +54,21 @@ if printf '%s\n' "${ipv4_bypass}" | grep -Fq -- '100.0.0.0/8'; then
     fail "IPv4 bypass rules retained the overbroad 100.0.0.0/8 prefix"
 fi
 
+ipv6_bypass=$(_build_bypass_ip_rules "6" 6)
+printf '%s\n' "${ipv6_bypass}" |
+    grep -Fqx -- '-A BYP_Z06 -d ::1/128 -j ACTION_BYPASS6' ||
+    fail "IPv6 loopback bypass was not placed in the high-nibble-zero zone"
+printf '%s\n' "${ipv6_bypass}" |
+    grep -Fqx -- '-A BYP_Z06 -d ::ffff:0:0/96 -j ACTION_BYPASS6' ||
+    fail "IPv4-mapped IPv6 bypass was not placed in the high-nibble-zero zone"
+printf '%s\n' "${ipv6_bypass}" |
+    grep -Fqx -- '-A BYPASS_IP6 -d 0000::/4 -j BYP_Z06' ||
+    fail "IPv6 high-nibble-zero dispatcher rule is missing"
+if printf '%s\n' "${ipv6_bypass}" |
+    grep -Eq -- '^-A BYP_Z(16|156) -d ::(1|ffff:0:0)/'; then
+    fail "compressed IPv6 bypass remained in an unreachable nonzero zone"
+fi
+
 APP_LIST=""
 mode_zero=$(_build_app_rules "" 0)
 assert_equals \

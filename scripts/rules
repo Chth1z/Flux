@@ -53,8 +53,8 @@ _build_bypass_ip_rules() {
 
             if (family == "6") {
                 clean_ip = tolower(net)
-                sub(/^[:]+/, "", clean_ip)
-                if (clean_ip == "") {
+                sub(/\/.*/, "", clean_ip)
+                if (substr(clean_ip, 1, 1) == ":") {
                     zone = 0
                 } else {
                     zone = index("0123456789abcdef", substr(clean_ip, 1, 1)) - 1

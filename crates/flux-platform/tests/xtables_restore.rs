@@ -508,6 +508,21 @@ fn declarations_commands_and_opaque_tokens_reject_noncanonical_shapes() {
         XtablesRestoreParseErrorKind::InvalidAddress,
         Some(2),
     );
+    for input in [
+        b"*mangle\n-A OUTPUT -d 192.0.2.0/+24 -j ACCEPT\nCOMMIT\n".as_slice(),
+        b"*mangle\n-A OUTPUT -d 2001:db8::/+64 -j ACCEPT\nCOMMIT\n".as_slice(),
+    ] {
+        assert_error(
+            input,
+            if input.contains(&b':') {
+                context(XtablesRestoreAction::Apply, XtablesRestoreFamily::Ipv6)
+            } else {
+                apply_v4
+            },
+            XtablesRestoreParseErrorKind::InvalidAddress,
+            Some(2),
+        );
+    }
 }
 
 #[test]

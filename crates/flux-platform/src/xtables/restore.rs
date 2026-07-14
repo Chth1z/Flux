@@ -989,6 +989,9 @@ fn validate_address_family(
             XtablesRestoreFamily::Ipv4 => 32,
             XtablesRestoreFamily::Ipv6 => 128,
         };
+        if prefix.is_empty() || !prefix.as_bytes().iter().all(u8::is_ascii_digit) {
+            return Err(invalid_address(line_number));
+        }
         let parsed = prefix
             .parse::<u8>()
             .map_err(|_| invalid_address(line_number))?;

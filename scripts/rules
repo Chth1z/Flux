@@ -130,9 +130,10 @@ _build_app_rules() {
         pkg=$1; uid=$2
         if (pkg in targets) {
             app_id = uid % 100000
-            for (user_id in users) {
+            for (user_id = 0; user_id <= 999; user_id++) {
+                if (!(user_id in users)) continue
                 derived_uid = user_id * 100000 + app_id
-                printf "-A APP_CHAIN%s -m owner --uid-owner %s -j %s\n", suffix, derived_uid, target
+                printf "-A APP_CHAIN%s -m owner --uid-owner %d -j %s\n", suffix, derived_uid, target
             }
         }
     }
@@ -246,9 +247,9 @@ _build_chain_rules() {
         printf "-A %s -j BYPASS_IP%s\n", chain, suffix
         if (is_pre == "1") printf "-A %s -i lo -j ACCEPT\n", chain
 
-        split(ex_list, ex_arr, " ")
+        n_ex = split(ex_list, ex_arr, /[[:space:]]+/)
         ex_tgt = (is_pre == "1") ? "ACCEPT" : bypass
-        for (i in ex_arr) if (ex_arr[i]) printf "-A %s %s %s -j %s\n", chain, flag, ex_arr[i], ex_tgt
+        for (i = 1; i <= n_ex; i++) if (ex_arr[i]) printf "-A %s %s %s -j %s\n", chain, flag, ex_arr[i], ex_tgt
 
         n = split(m_if" "w_if" "h_if" "u_if, ifs, " ")
         split(m_en" "w_en" "h_en" "u_en, ens, " ")

@@ -1,4 +1,5 @@
 #!/usr/bin/sh
+# shellcheck disable=SC2030,SC2031
 
 set -eu
 
@@ -138,5 +139,66 @@ assert_equals \
 -A APP_CHAIN -j ACCEPT' \
     "${populated_allowlist}" \
     "populated allowlist changed rule semantics"
+
+# Associative-array iteration differs across awk implementations. User IDs are
+# semantic sets, so the oracle emits them in canonical numeric order.
+# shellcheck disable=SC2034
+APP_USER_SCOPE=list
+# shellcheck disable=SC2034
+APP_USER_LIST="10 2 10"
+multi_user_allowlist=$(_build_app_rules "" 2)
+assert_equals \
+    '-A APP_CHAIN -m owner --uid-owner 1000 --gid-owner 1000 -j ACTION_BYPASS
+-A APP_CHAIN -m owner --uid-owner 210123 -j ACTION_PROXY_OUT
+-A APP_CHAIN -m owner --uid-owner 1010123 -j ACTION_PROXY_OUT
+-A APP_CHAIN -j ACCEPT' \
+    "${multi_user_allowlist}" \
+    "multi-user rules must use canonical numeric user order"
+
+# Excluded interfaces retain configured order; indexed iteration avoids
+# implementation-defined associative-array order.
+# shellcheck disable=SC2034
+MOBILE_INTERFACE=""
+# shellcheck disable=SC2034
+WIFI_INTERFACE=""
+# shellcheck disable=SC2034
+HOTSPOT_INTERFACE=""
+# shellcheck disable=SC2034
+USB_INTERFACE=""
+ordered_exclusions=$(_build_chain_rules \
+    "PROXY_PREROUTING" "ACTION_PROXY_PRE" "-i" "wlan+ rmnet+ wlan+" 1)
+assert_equals \
+    '-A PROXY_PREROUTING -j BYPASS_IP
+-A PROXY_PREROUTING -i lo -j ACCEPT
+-A PROXY_PREROUTING -i wlan+ -j ACCEPT
+-A PROXY_PREROUTING -i rmnet+ -j ACCEPT
+-A PROXY_PREROUTING -i wlan+ -j ACCEPT
+-A PROXY_PREROUTING -j ACCEPT' \
+    "${ordered_exclusions}" \
+    "excluded interfaces must retain configured order"
+
+if command -v gawk >/dev/null 2>&1 && command -v mawk >/dev/null 2>&1; then
+    gawk_dir="${tmp_dir}/gawk"
+    mawk_dir="${tmp_dir}/mawk"
+    mkdir -p "${gawk_dir}" "${mawk_dir}"
+    ln -s "$(command -v gawk)" "${gawk_dir}/awk"
+    ln -s "$(command -v mawk)" "${mawk_dir}/awk"
+
+    gawk_multi_user=$(PATH="${gawk_dir}:${PATH}"; export PATH; _build_app_rules "" 2)
+    mawk_multi_user=$(PATH="${mawk_dir}:${PATH}"; export PATH; _build_app_rules "" 2)
+    assert_equals \
+        "${gawk_multi_user}" \
+        "${mawk_multi_user}" \
+        "multi-user rule bytes differ between gawk and mawk"
+
+    gawk_exclusions=$(PATH="${gawk_dir}:${PATH}"; export PATH; _build_chain_rules \
+        "PROXY_PREROUTING" "ACTION_PROXY_PRE" "-i" "wlan+ rmnet+ wlan+" 1)
+    mawk_exclusions=$(PATH="${mawk_dir}:${PATH}"; export PATH; _build_chain_rules \
+        "PROXY_PREROUTING" "ACTION_PROXY_PRE" "-i" "wlan+ rmnet+ wlan+" 1)
+    assert_equals \
+        "${gawk_exclusions}" \
+        "${mawk_exclusions}" \
+        "excluded-interface rule bytes differ between gawk and mawk"
+fi
 
 printf 'rules generation shell tests: PASS\n'

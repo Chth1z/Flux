@@ -1,11 +1,11 @@
-//! Privileged Linux topology checkpoint for the functional capture canary.
+//! Privileged disposable-namespace checkpoints for the functional capture canary.
 //!
-//! Qualification boundary: this test deliberately does not install a TPROXY selector, exercise
-//! the RPDB negative control, correlate sockets to the supervised engine, collect capture/bypass/
-//! recapture counters, or construct/validate `UnqualifiedCanaryGateEvidence`. It proves only the
-//! journaled contained topology, real dual-stack TCP/UDP/DNS transactions, independent client and
-//! peer observations, and exact cleanup/readback. Those missing checks remain mandatory before
-//! this facility can authorize `RUNNING` or qualify any Android profile.
+//! The topology and ingress checkpoints remain Linux-only. The local-OUTPUT TPROXY checkpoint also
+//! runs through a development-only rooted Android lane. The topology checkpoint deliberately does
+//! not install a TPROXY selector, exercise the RPDB negative control, correlate sockets to the
+//! supervised engine, collect capture/bypass/recapture counters, or construct/validate
+//! `UnqualifiedCanaryGateEvidence`. None of these checkpoints can authorize `RUNNING` or qualify a
+//! production Android profile.
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -32,6 +32,11 @@ const CONFIG_ENV: &str = "FLUX_LINUX_CANARY_HARNESS_CONFIG";
 const REENTRY_TOKEN_ENV: &str = "FLUX_LINUX_CANARY_REENTRY_TOKEN";
 const OUTER_NETNS_ENV: &str = "FLUX_LINUX_CANARY_OUTER_NETNS";
 const OUTER_USERNS_ENV: &str = "FLUX_LINUX_CANARY_OUTER_USERNS";
+const OUTER_MOUNTNS_ENV: &str = "FLUX_LINUX_CANARY_OUTER_MOUNTNS";
+#[cfg(target_os = "android")]
+const OUTER_PID_ENV: &str = "FLUX_LINUX_CANARY_OUTER_PID";
+const REENTRY_AUTHORITY_ENV: &str = "FLUX_LINUX_CANARY_REENTRY_AUTHORITY";
+const ANDROID_REAL_ROOT_AUTHORITY: &str = "android-real-root";
 const MODE_ISOLATED: &str = "isolated";
 const MODE_HOLDER: &str = "holder";
 const MODE_PEER: &str = "peer";
@@ -46,7 +51,9 @@ const MAX_JOURNAL_BYTES: u64 = 192 * 1024;
 const MAX_JOURNAL_RECORDS: usize = 96;
 static JSON_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(target_os = "linux")]
 mod distinct_uid;
+#[cfg(target_os = "linux")]
 mod ingress_tproxy;
 mod local_output_tproxy;
 #[path = "linux_namespace_harness/ingress_tproxy/transparent_tcp.rs"]
@@ -55,6 +62,7 @@ mod transparent_tcp;
 mod transparent_udp;
 
 #[test]
+#[cfg(target_os = "linux")]
 #[ignore = "requires Linux user/mount/network namespace authority"]
 fn privileged_dual_stack_canary_exercises_real_topology_and_cleanup() {
     let result = match env::var(MODE_ENV).as_deref() {
@@ -72,18 +80,20 @@ fn privileged_dual_stack_canary_exercises_real_topology_and_cleanup() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 #[ignore = "requires Linux user/mount/network namespace and TPROXY authority"]
 fn privileged_ingress_tproxy_checkpoint_exercises_real_capture_counters_and_cleanup() {
     ingress_tproxy::run();
 }
 
 #[test]
-#[ignore = "requires Linux user/mount/network namespace and local-OUTPUT TPROXY authority"]
+#[ignore = "requires isolated mount/network namespace and local-OUTPUT TPROXY authority"]
 fn privileged_local_output_tproxy_checkpoint_exercises_loopback_reinjection_and_cleanup() {
     local_output_tproxy::run();
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 #[ignore = "requires Linux user-namespace authority for distinct subordinate credentials"]
 fn privileged_local_output_distinct_uid_capability_preflight() {
     distinct_uid::run();
@@ -2456,15 +2466,18 @@ fn ensure_isolated_authority() -> Result<(), String> {
     )
 }
 
+#[cfg(target_os = "linux")]
+fn ensure_local_output_isolated_authority_with_boundary(boundary: &str) -> Result<(), String> {
+    ensure_isolated_authority_with_boundary(boundary)
+}
+
+#[cfg(target_os = "android")]
+fn ensure_local_output_isolated_authority_with_boundary(boundary: &str) -> Result<(), String> {
+    ensure_android_real_root_authority_with_boundary(boundary)
+}
+
 fn ensure_isolated_authority_with_boundary(boundary: &str) -> Result<(), String> {
-    let reentry_token = env::var(REENTRY_TOKEN_ENV).map_err(|_| {
-        format!("{MODE_ISOLATED} mode requires a parent-issued {REENTRY_TOKEN_ENV}")
-    })?;
-    if reentry_token.len() != 32 || !reentry_token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(format!(
-            "{REENTRY_TOKEN_ENV} is not a 128-bit hexadecimal token"
-        ));
-    }
+    require_parent_reentry_token()?;
     let outer_netns = env::var(OUTER_NETNS_ENV)
         .map_err(|_| format!("{MODE_ISOLATED} mode requires {OUTER_NETNS_ENV}"))?;
     let outer_userns = env::var(OUTER_USERNS_ENV)
@@ -2517,6 +2530,156 @@ fn ensure_isolated_authority_with_boundary(boundary: &str) -> Result<(), String>
     Ok(())
 }
 
+fn require_parent_reentry_token() -> Result<(), String> {
+    let reentry_token = env::var(REENTRY_TOKEN_ENV).map_err(|_| {
+        format!("{MODE_ISOLATED} mode requires a parent-issued {REENTRY_TOKEN_ENV}")
+    })?;
+    if reentry_token.len() != 32 || !reentry_token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!(
+            "{REENTRY_TOKEN_ENV} is not a 128-bit hexadecimal token"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "android")]
+fn ensure_android_real_root_authority_with_boundary(boundary: &str) -> Result<(), String> {
+    require_parent_reentry_token()?;
+    let authority = env::var(REENTRY_AUTHORITY_ENV)
+        .map_err(|_| format!("isolated Android mode requires {REENTRY_AUTHORITY_ENV}"))?;
+    let outer_pid = env::var(OUTER_PID_ENV)
+        .map_err(|_| format!("isolated Android mode requires {OUTER_PID_ENV}"))?
+        .parse::<u32>()
+        .map_err(|error| format!("parse {OUTER_PID_ENV}: {error}"))?;
+    let parent_pid = process_parent_pid()?;
+    let issued_outer_netns = env::var(OUTER_NETNS_ENV)
+        .map_err(|_| format!("isolated Android mode requires {OUTER_NETNS_ENV}"))?;
+    let issued_outer_mountns = env::var(OUTER_MOUNTNS_ENV)
+        .map_err(|_| format!("isolated Android mode requires {OUTER_MOUNTNS_ENV}"))?;
+    let live_outer_netns = process_namespace_identity(outer_pid, "net")?;
+    let live_outer_mountns = process_namespace_identity(outer_pid, "mnt")?;
+    let current_netns = network_namespace_identity()?;
+    let current_mountns = mount_namespace_identity()?;
+    let outer_uid = effective_uid_for_process(outer_pid)?;
+    let current_uid = effective_uid_for_process(std::process::id())?;
+    validate_android_real_root_boundary(AndroidRealRootBoundary {
+        authority: &authority,
+        outer_pid,
+        parent_pid,
+        outer_uid,
+        current_uid,
+        issued_outer_netns: &issued_outer_netns,
+        live_outer_netns: &live_outer_netns,
+        current_netns: &current_netns,
+        issued_outer_mountns: &issued_outer_mountns,
+        live_outer_mountns: &live_outer_mountns,
+        current_mountns: &current_mountns,
+    })?;
+    eprintln!(
+        "QUALIFICATION BOUNDARY: {boundary}; Android real-root parent pid {outer_pid}; outer net={live_outer_netns} current net={current_netns}; outer mount={live_outer_mountns} current mount={current_mountns}"
+    );
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AndroidRealRootBoundary<'a> {
+    authority: &'a str,
+    outer_pid: u32,
+    parent_pid: u32,
+    outer_uid: u32,
+    current_uid: u32,
+    issued_outer_netns: &'a str,
+    live_outer_netns: &'a str,
+    current_netns: &'a str,
+    issued_outer_mountns: &'a str,
+    live_outer_mountns: &'a str,
+    current_mountns: &'a str,
+}
+
+fn validate_android_real_root_boundary(
+    boundary: AndroidRealRootBoundary<'_>,
+) -> Result<(), String> {
+    if boundary.authority != ANDROID_REAL_ROOT_AUTHORITY {
+        return Err(format!(
+            "{REENTRY_AUTHORITY_ENV} must be {ANDROID_REAL_ROOT_AUTHORITY:?}, found {:?}",
+            boundary.authority
+        ));
+    }
+    if boundary.outer_pid <= 1 || boundary.parent_pid != boundary.outer_pid {
+        return Err(format!(
+            "isolated Android helper is not the direct child of its issued live parent: issued={} observed_ppid={}",
+            boundary.outer_pid, boundary.parent_pid
+        ));
+    }
+    if boundary.outer_uid != 0 || boundary.current_uid != 0 {
+        return Err(format!(
+            "Android initial-root checkpoint requires outer and inner effective UID 0: outer={} inner={}",
+            boundary.outer_uid, boundary.current_uid
+        ));
+    }
+    if boundary.issued_outer_netns != boundary.live_outer_netns
+        || boundary.issued_outer_mountns != boundary.live_outer_mountns
+    {
+        return Err(format!(
+            "issued Android parent namespace identities do not match the live parent: issued_net={} live_net={} issued_mount={} live_mount={}",
+            boundary.issued_outer_netns,
+            boundary.live_outer_netns,
+            boundary.issued_outer_mountns,
+            boundary.live_outer_mountns
+        ));
+    }
+    if boundary.current_netns == boundary.live_outer_netns
+        || boundary.current_mountns == boundary.live_outer_mountns
+    {
+        return Err(format!(
+            "isolated Android reentry did not change both namespaces: outer_net={} current_net={} outer_mount={} current_mount={}",
+            boundary.live_outer_netns,
+            boundary.current_netns,
+            boundary.live_outer_mountns,
+            boundary.current_mountns
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "android")]
+fn require_effective_root(label: &str) -> Result<(), String> {
+    let effective_uid = effective_uid_for_process(std::process::id())?;
+    if effective_uid == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "{label} requires effective UID 0, found {effective_uid}"
+        ))
+    }
+}
+
+#[cfg(target_os = "android")]
+fn effective_uid_for_process(pid: u32) -> Result<u32, String> {
+    let path = format!("/proc/{pid}/status");
+    let status = fs::read_to_string(&path).map_err(|error| format!("read {path}: {error}"))?;
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))
+        .and_then(|line| line.split_whitespace().nth(1))
+        .ok_or_else(|| format!("parse effective UID from {path}"))?
+        .parse::<u32>()
+        .map_err(|error| format!("parse effective UID from {path}: {error}"))
+}
+
+#[cfg(target_os = "android")]
+fn process_parent_pid() -> Result<u32, String> {
+    let status = fs::read_to_string("/proc/self/status")
+        .map_err(|error| format!("read /proc/self/status: {error}"))?;
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("PPid:"))
+        .and_then(|line| line.split_whitespace().next())
+        .ok_or_else(|| "parse parent PID from /proc/self/status".to_owned())?
+        .parse::<u32>()
+        .map_err(|error| format!("parse parent PID from /proc/self/status: {error}"))
+}
+
 fn config_from_environment() -> Result<HarnessConfig, String> {
     let path = env::var_os(CONFIG_ENV).ok_or_else(|| format!("{CONFIG_ENV} is required"))?;
     read_json(Path::new(&path))
@@ -2534,6 +2697,20 @@ fn network_namespace_identity() -> Result<String, String> {
     fs::read_link("/proc/self/ns/net")
         .map(|path| path.to_string_lossy().into_owned())
         .map_err(|error| format!("read network namespace identity: {error}"))
+}
+
+fn mount_namespace_identity() -> Result<String, String> {
+    fs::read_link("/proc/self/ns/mnt")
+        .map(|path| path.to_string_lossy().into_owned())
+        .map_err(|error| format!("read mount namespace identity: {error}"))
+}
+
+#[cfg(target_os = "android")]
+fn process_namespace_identity(pid: u32, namespace: &str) -> Result<String, String> {
+    let path = format!("/proc/{pid}/ns/{namespace}");
+    fs::read_link(&path)
+        .map(|identity| identity.to_string_lossy().into_owned())
+        .map_err(|error| format!("read namespace identity {path}: {error}"))
 }
 
 fn user_namespace_identity() -> Result<String, String> {
@@ -3024,4 +3201,71 @@ fn hex_encode(bytes: &[u8]) -> String {
         encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
     encoded
+}
+
+#[cfg(test)]
+mod android_real_root_boundary_tests {
+    use super::*;
+
+    fn valid_boundary() -> AndroidRealRootBoundary<'static> {
+        AndroidRealRootBoundary {
+            authority: ANDROID_REAL_ROOT_AUTHORITY,
+            outer_pid: 42,
+            parent_pid: 42,
+            outer_uid: 0,
+            current_uid: 0,
+            issued_outer_netns: "net:[1]",
+            live_outer_netns: "net:[1]",
+            current_netns: "net:[2]",
+            issued_outer_mountns: "mnt:[3]",
+            live_outer_mountns: "mnt:[3]",
+            current_mountns: "mnt:[4]",
+        }
+    }
+
+    #[test]
+    fn android_real_root_boundary_accepts_exact_parent_and_changed_namespaces() {
+        validate_android_real_root_boundary(valid_boundary()).expect("valid Android boundary");
+    }
+
+    #[test]
+    fn android_real_root_boundary_rejects_forged_or_weak_evidence() {
+        let cases = [
+            AndroidRealRootBoundary {
+                authority: "mapped-user-root",
+                ..valid_boundary()
+            },
+            AndroidRealRootBoundary {
+                parent_pid: 41,
+                ..valid_boundary()
+            },
+            AndroidRealRootBoundary {
+                outer_uid: 1000,
+                ..valid_boundary()
+            },
+            AndroidRealRootBoundary {
+                current_uid: 1000,
+                ..valid_boundary()
+            },
+            AndroidRealRootBoundary {
+                live_outer_netns: "net:[9]",
+                ..valid_boundary()
+            },
+            AndroidRealRootBoundary {
+                live_outer_mountns: "mnt:[9]",
+                ..valid_boundary()
+            },
+            AndroidRealRootBoundary {
+                current_netns: "net:[1]",
+                ..valid_boundary()
+            },
+            AndroidRealRootBoundary {
+                current_mountns: "mnt:[3]",
+                ..valid_boundary()
+            },
+        ];
+        for boundary in cases {
+            assert!(validate_android_real_root_boundary(boundary).is_err());
+        }
+    }
 }

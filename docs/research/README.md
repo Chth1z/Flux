@@ -27,7 +27,9 @@ Research was performed against pinned primary-source checkouts and official docu
 16. Production Flux must not load or unload `.ko`/KPM payloads. An already-loaded OEM/custom-kernel extension may be consumed only as optional exact-device read-only observation through independently verified platform/module identity plus a versioned, strictly validated interface; decision-bearing use requires a concrete partner and separate ADR.
 17. Linux 5.10 permits a conventional local-OUTPUT transaction through mangle/OUTPUT mark-driven
     rerouting, an RPDB local route through loopback, and mark-qualified loopback PREROUTING TPROXY.
-    MARK alone remains insufficient, Android qualification is still open, TC `bpf_sk_assign()` is a
+    The exact checkpoint now passes on one rooted x86_64 WSA Android 13 development profile while
+    preserving Android-owned mark bits and cleanup boundaries. MARK alone remains insufficient,
+    Android 5.10/ARM64 production and release qualification remain open, TC `bpf_sk_assign()` is a
     separate experimental candidate requiring its own ADR, and production `.ko` loading remains
     prohibited.
 
@@ -65,7 +67,8 @@ Reconciles the peer-project findings with Linux/AOSP primary sources. It defines
 
 Traces local OUTPUT through Linux 5.10 routing and loopback receive processing, compares conventional
 TPROXY, `sk_lookup`, cgroup rewriting, TC `bpf_sk_assign()`, and LKM options, and defines the exact
-dual-stack TCP/UDP qualification and cleanup evidence required before production or Android use.
+dual-stack TCP/UDP qualification and cleanup evidence. It also records the successful rooted
+x86_64 WSA mechanism run and the remaining Android 5.10/ARM64 production gates.
 
 ## Cloned source families
 

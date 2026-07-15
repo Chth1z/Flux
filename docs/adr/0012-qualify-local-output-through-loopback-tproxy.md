@@ -1,6 +1,7 @@
 ---
 status: accepted
 decision_date: 2026-07-15
+last_reviewed: 2026-07-16
 ---
 
 # Qualify local OUTPUT through loopback-reinjected PREROUTING TPROXY
@@ -34,7 +35,36 @@ and a PREROUTING selector tied to a veth/tether interface cannot see loopback re
 The current schema-v1 lowerer and production functional-canary driver remain fail-closed. They do
 not model, own, or authorize the complete mark, RPDB rule, local route, loopback PREROUTING rule,
 listener, escape, activation, and cleanup transaction. A disposable privileged Linux checkpoint is
-supporting evidence only; it cannot construct production gate evidence or authorize Android.
+supporting evidence only; it cannot construct production gate evidence or qualify any production
+Android device profile.
+
+A second development-only lane now cross-builds that exact ignored Rust checkpoint for
+`x86_64-linux-android` and runs it on one explicit rooted ADB serial:
+
+```text
+cargo xtask test-functional-canary-android-x86_64-output-tproxy --serial SERIAL
+```
+
+On 2026-07-15 it passed on WSA 2407.40000.4.0, Android 13 / SDK 33, with Magisk 30.6,
+SELinux enforcing, legacy iptables 1.8.7, and kernel
+`5.15.104-windows-subsystem-for-android-20230927+`. The Android branch uses real UID 0 plus an
+exact live-parent PID and changed mount/network namespace proof because that kernel exposes no user
+namespace procfs. It also demonstrates that Android may replace a pre-connect socket mark with its
+own network-selection value; the checkpoint therefore uses the disposable masked field
+`0x00600000`, merges proxy `0x00200000` or bypass `0x00400000`, and proves every outside Android bit
+is preserved. This is test-only mechanism evidence, not a production mark allocation.
+
+The WSA lane also records bounded userspace differences: its old `ip` omits JSON for route/rule
+commands and cannot encode a rule-protocol attribute, built-in xtables facilities require
+`/proc/config.gz` evidence instead of `/sys/module`, per-namespace built-in table initialization may
+add only `mangle` to the otherwise preserved registration baseline (the observed WSA baseline was
+empty), an intentional UDP drop may return `EPERM`, and fresh-loopback initialization has a
+namespace-local inactive-qdisc normalization before the namespace is retired. The runner forces
+required mode, selects the exact test, uses a private
+`/data/local/tmp` directory, binds fingerprint plus boot ID across the build and cleanup boundaries,
+bounds every host command with kill/reap handling, and independently proves removal. This is useful
+Android mechanism evidence, but it is not Android 5.10/ARM64, distinct-UID, Generation,
+supervised-engine, VPN/netd-coexistence, crash-recovery, or release qualification.
 
 Qualification requires all of the following under one boot, network namespace, mark allocation,
 and attempt identity:

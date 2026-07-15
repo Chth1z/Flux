@@ -4608,7 +4608,7 @@ fn bounded_prefix(diagnostic: &str) -> String {
 
 pub(crate) mod local_output;
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
 mod linux_namespace_harness;
 
 #[cfg(test)]

@@ -12,6 +12,7 @@ module, or package-verifier result is a release candidate.
 
 - Rust `1.93.0` with `rustfmt` and Clippy.
 - Primary target: `aarch64-linux-android`.
+- Development checkpoint target: `x86_64-linux-android` (test-only; never packaged).
 - Android API level: 31.
 - Release-link NDK: revision `27.3.13750724` (NDK r27d).
 
@@ -295,11 +296,55 @@ accept and UDP original-destination delivery, boundary and response-bypass count
 zero egress leakage, stable module/registration inventories, and exact xtables/RPDB/route/link
 baseline restoration.
 
-This checkpoint is mechanism-only host evidence in one test process and network namespace. It does
+This invocation is mechanism-only host evidence in one test process and network namespace. It does
 not combine the separate distinct-UID preflight, use a Generation or production receipt authority,
-consume a supervised Proxy Engine report, or qualify Android. Optional mode may skip only a denied
-or unavailable outer/preflight prerequisite before the isolated transaction begins; any later
+consume a supervised Proxy Engine report, or qualify a production Android profile. Optional mode
+may skip only a denied or unavailable outer/preflight prerequisite before the isolated transaction begins; any later
 mutation, traffic, evidence, or cleanup failure remains a test failure.
+
+The same exact ignored test has a non-shipping x86_64 Android lane for rooted WSA or another
+explicit compatible development serial:
+
+```text
+ANDROID_NDK_HOME=/path/to/android-ndk-r27d \
+  cargo xtask test-functional-canary-android-x86_64-output-tproxy \
+  --serial SERIAL
+```
+
+The command requires Linux/WSL, the pinned NDK 27.3.13750724, API 31 linker, installed
+`x86_64-linux-android` Rust target, one explicit ADB serial advertising x86_64, SDK 31 or later, and
+`su` UID 0. It parses Cargo JSON to select exactly one library-test ELF, creates a unique private
+directory below `/data/local/tmp`, fixes ownership/mode after `adb push`, sanitizes Android `PATH`,
+sets a private `TMPDIR`, clears every harness re-entry variable, forces
+`FLUX_LINUX_CANARY_REQUIRED=1`, and requires the exact normalized libtest listing before execution.
+Every Cargo, ADB, and WSL path command has a host deadline with bounded output plus kill/reap on
+timeout or setup failure. The runner records kernel architecture/release, build fingerprint, and
+boot ID, requires the exact same profile after the cross-build and around cleanup, and removes plus
+independently proves absence of the remote directory. It remains outside `cargo xtask ci`, module
+staging, package verification, release manifests, and AArch64 artifacts.
+`--adb PROGRAM` is optional; the runner uses `$ADB` when set and otherwise `adb`. A Linux `adb`
+client may address WSA directly after connecting the explicit serial. To use a Windows
+platform-tools client from WSL:
+
+```text
+ANDROID_NDK_HOME=/path/to/android-ndk-r27d \
+  cargo xtask test-functional-canary-android-x86_64-output-tproxy \
+  --serial SERIAL --adb /mnt/c/path/to/platform-tools/adb.exe
+```
+
+For an `.exe` client, the runner converts the local WSL artifact path with `wslpath -w` before
+`adb push`.
+
+The 2026-07-15 WSA run passed on Android 13 / SDK 33, Magisk 30.6, SELinux enforcing, legacy
+iptables 1.8.7, and kernel `5.15.104-windows-subsystem-for-android-20230927+`. The Android harness
+uses real-root live-parent plus changed mount/network namespace proof, preserves Android-owned
+socket-mark bits through a test-only `0x00600000` role field, accepts the legacy `ip` text fallback
+and missing rule-protocol syntax, proves built-in facilities without autoload, admits only addition
+of `mangle` to an otherwise preserved registration baseline when built-in per-namespace table
+initialization occurs (the observed WSA baseline was empty), handles synchronous `EPERM` for
+intentional UDP drops, and normalizes only the inactive fresh-loopback qdisc before namespace
+retirement. This is Android mechanism evidence, not Android 5.10/ARM64, distinct-UID, Generation,
+supervised-engine, VPN/netd-coexistence, crash-recovery, or release qualification.
 
 This split records a traffic-domain boundary, not a kernel-wide impossibility result. The ingress
 checkpoint selects a veth interface and does not exercise a locally generated packet rerouted
@@ -586,4 +631,4 @@ Every phase process has a nonzero execution deadline capped at 60 seconds. The R
 
 On daemon startup, the Capability Profile first decides whether mutation is admissible. An admitted runtime runs the bounded `startup-recover` phase before strict `flux.toml` loading, so a broken current configuration cannot strand same-boot capture; recovery must also succeed before administrative intent is read, persisted, or executed and before the control socket is admitted. Below-floor or unverified profiles stay on the non-mutating read-only path and never invoke recovery. Recovery is serialized by the dispatcher lock. With no lease and no capture evidence it idempotently publishes `STOPPED`. A same-boot Rust lease removes the exact active generation, or uses the immutable prepared generation for markerless partial activation, then stops TPROXY before address synchronization and proves capture evidence absent. For a direct engine launch, `PDEATHSIG` supplies the child-death proof, so recovery publishes `STOPPED`, clears active/previous/verification records, and releases the lease. For `busybox-setuidgid`, child death cannot be proven after daemon loss: recovery publishes `FAILED` only after detachment, preserves the Rust lease and active engine generation, and blocks automatic daemon restart for explicit repair. Cleanup failure likewise preserves evidence and ownership. Same-boot legacy ownership is rejected without mutation; prior-boot evidence is retired without treating kernel objects as surviving the reboot.
 
-Phase 1 `capture-verify` proves shell-owned structural evidence; the always-on owner bypass prevents the default self-capture omission but is not itself a synthetic end-to-end traffic or exact-process loop-prevention proof. The Stage-1 typed canary model, coordinator ordering, failure injection, status contract, authoritative schema-v2 listener/delivery validator, temporal cleanup/retirement validator, fail-closed TPROXY-only local-OUTPUT executor seam, explicit per-flow capture-receipt/verifier contract, process-ownership receipt contract, child-origin pidfd substrate, exact retained-engine before/after observation pair, authoritative engine credential-policy/domain validation, prebound socket-diagnostics session transport, and type-safe attempt-owned observer handoff are delivered, along with the first Stage-2 isolated topology checkpoint, the complete dual-stack TCP/UDP echo plus DNS-over-UDP/TCP third-namespace ingress PREROUTING TPROXY checkpoint, and the strict Linux/Android `/proc` FD plus INET_DIAG outbound-collector prerequisite. The exact retained engine-child authority now travels from `SingBoxChild` through matching `EngineSupervisor` ownership and the serialized coordinator into the process-verifier boundary while preserving adapter-owned signal/wait/reap authority. Deferred are the positive traffic producer; verifier-side completion chronology and prepared-driver client/peer child ownership; backend listener observation and delivery-report parsing/factories; actual prebound collector observations; Android adapter and device qualification; ancestor-safe directory traversal with `openat`/`openat2`; long-term retention/rotation policy for Generation logs; pidfd/timerfd reactor integration; full process-tree containment; and real-device release evidence on the minimum Android 5.10 kernel. Both production receipt authorities remain uninhabited, current xtables remains `Unsupported`, optional eBPF requires separate qualification, and no explicit `.ko` load/unload operation was added. The legacy structural bridge has not yet proven that every xtables/kernel dependency is already active without implicit module requests, so it cannot satisfy the future no-autoload qualification. Ingress or collector evidence cannot discharge the local-OUTPUT gate, REDIRECT/DNAT cannot qualify TPROXY, and production must remain `structural_only` rather than publish `functional_passed` from host evidence.
+Phase 1 `capture-verify` proves shell-owned structural evidence; the always-on owner bypass prevents the default self-capture omission but is not itself a synthetic end-to-end traffic or exact-process loop-prevention proof. The Stage-1 typed canary model, coordinator ordering, failure injection, status contract, authoritative schema-v2 listener/delivery validator, temporal cleanup/retirement validator, fail-closed TPROXY-only local-OUTPUT executor seam, explicit per-flow capture-receipt/verifier contract, process-ownership receipt contract, child-origin pidfd substrate, exact retained-engine before/after observation pair, authoritative engine credential-policy/domain validation, prebound socket-diagnostics session transport, and type-safe attempt-owned observer handoff are delivered, along with the first Stage-2 isolated topology checkpoint, the complete dual-stack TCP/UDP echo plus DNS-over-UDP/TCP third-namespace ingress PREROUTING TPROXY checkpoint, the development-only rooted WSA local-OUTPUT TPROXY checkpoint, and the strict Linux/Android `/proc` FD plus INET_DIAG outbound-collector prerequisite. The exact retained engine-child authority now travels from `SingBoxChild` through matching `EngineSupervisor` ownership and the serialized coordinator into the process-verifier boundary while preserving adapter-owned signal/wait/reap authority. Deferred are the production positive traffic producer; verifier-side completion chronology and prepared-driver client/peer child ownership; backend listener observation and delivery-report parsing/factories; actual prebound collector observations; a production Android adapter and reviewed device qualification; ancestor-safe directory traversal with `openat`/`openat2`; long-term retention/rotation policy for Generation logs; pidfd/timerfd reactor integration; full process-tree containment; and real-device release evidence on the minimum Android 5.10 kernel. Both production receipt authorities remain uninhabited, current xtables remains `Unsupported`, optional eBPF requires separate qualification, and no explicit `.ko` load/unload operation was added. The legacy structural bridge has not yet proven that every xtables/kernel dependency is already active without implicit module requests, so it cannot satisfy the future no-autoload qualification. Ingress, collector, host, or WSA mechanism evidence cannot discharge the production local-OUTPUT gate, REDIRECT/DNAT cannot qualify TPROXY, and production must remain `structural_only` rather than publish `functional_passed` from development evidence.

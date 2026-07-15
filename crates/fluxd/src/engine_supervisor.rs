@@ -379,6 +379,7 @@ impl EngineChildAuthority {
     }
 
     #[cfg(test)]
+    #[cfg_attr(target_os = "android", allow(dead_code))]
     pub(crate) fn from_process_handle_for_test(
         handle: ProcessHandle,
         engine_snapshot_revision: NonZeroU64,

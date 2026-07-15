@@ -1,10 +1,10 @@
 //! Disposable local-OUTPUT-to-loopback TPROXY checkpoint.
 //!
-//! This ignored Linux test proves one conventional mechanism only: exact local OUTPUT selectors
-//! set a masked mark, the RPDB selects a test-owned local route through loopback, and loopback
-//! PREROUTING applies TPROXY to exact transparent TCP and UDP listeners without rewriting the
-//! original destination. It is test evidence, not production composition, Android qualification,
-//! or Capture Program activation authority.
+//! This ignored Linux-or-Android development test proves one conventional mechanism only: exact
+//! local OUTPUT selectors set a masked mark, the RPDB selects a test-owned local route through
+//! loopback, and loopback PREROUTING applies TPROXY to exact transparent TCP and UDP listeners
+//! without rewriting the original destination. It is test evidence, not production composition,
+//! Android release qualification, or Capture Program activation authority.
 
 use super::transparent_tcp::{
     TransparentTcpListener, connect_marked as connect_marked_tcp,
@@ -12,7 +12,8 @@ use super::transparent_tcp::{
 };
 use super::transparent_udp::{
     TransparentUdpListener, connect_marked as connect_marked_udp,
-    connect_transparent_marked as connect_transparent_marked_udp, socket_mark as udp_socket_mark,
+    connect_transparent_marked as connect_transparent_marked_udp,
+    set_socket_mark as set_udp_socket_mark, socket_mark as udp_socket_mark,
 };
 use super::*;
 
@@ -23,9 +24,11 @@ const TEST_NAME: &str = "functional_canary::linux_namespace_harness::privileged_
 const MODE_PREFLIGHT: &str = "local-output-tproxy-preflight";
 const MODE_ISOLATED: &str = "local-output-tproxy-isolated";
 
-const PROXY_MASK: u32 = 0x0000_000f;
-const PROXY_MARK: u32 = 0x0000_0001;
-const BYPASS_MARK: u32 = 0x0000_0082;
+// Disposable test-only field inside the currently modeled Android device-policy candidate range.
+// This does not allocate or authorize a production mark lease.
+const PROXY_MASK: u32 = 0x0060_0000;
+const PROXY_MARK: u32 = 0x0020_0000;
+const BYPASS_MARK: u32 = 0x0040_0000;
 const ROUTE_PROTOCOL: u32 = 99;
 const TCP_PORT: u16 = 41_201;
 const UDP_PORT: u16 = 41_202;
@@ -43,14 +46,14 @@ pub(super) fn run() {
         Err(env::VarError::NotUnicode(_)) => Err(format!("{MODE_ENV} must contain valid UTF-8")),
     };
     if let Err(error) = result {
-        panic!("Linux local-OUTPUT TPROXY checkpoint failed: {error}");
+        panic!("isolated local-OUTPUT TPROXY checkpoint failed: {error}");
     }
 }
 
 fn run_outer() -> Result<(), String> {
     let required = required_mode()?;
     for (program, arguments) in [
-        ("unshare", &["--version"][..]),
+        ("unshare", unshare_probe_arguments()),
         ("ip", &["-Version"][..]),
         ("iptables", &["--version"][..]),
         ("ip6tables", &["--version"][..]),
@@ -81,10 +84,10 @@ fn run_outer_reentry(mode: &str, timeout: Duration) -> Result<(), String> {
         env::current_exe().map_err(|error| format!("resolve test executable: {error}"))?;
     let reentry_token = random_nonce()?;
     let outer_netns = network_namespace_identity()?;
-    let outer_userns = user_namespace_identity()?;
+    let outer_mountns = mount_namespace_identity()?;
     let mut command = Command::new("unshare");
     command
-        .args(["--user", "--map-root-user", "--mount", "--net", "--"])
+        .args(local_output_unshare_arguments())
         .arg(executable)
         .args([
             "--ignored",
@@ -96,13 +99,60 @@ fn run_outer_reentry(mode: &str, timeout: Duration) -> Result<(), String> {
         .env(MODE_ENV, mode)
         .env(REENTRY_TOKEN_ENV, reentry_token)
         .env(OUTER_NETNS_ENV, outer_netns)
-        .env(OUTER_USERNS_ENV, outer_userns);
+        .env(OUTER_MOUNTNS_ENV, outer_mountns);
+    #[cfg(target_os = "linux")]
+    command.env(OUTER_USERNS_ENV, user_namespace_identity()?);
+    #[cfg(target_os = "android")]
+    {
+        require_effective_root("outer Android local-OUTPUT checkpoint")?;
+        command
+            .env(OUTER_PID_ENV, std::process::id().to_string())
+            .env(REENTRY_AUTHORITY_ENV, ANDROID_REAL_ROOT_AUTHORITY)
+            .env_remove(OUTER_USERNS_ENV);
+    }
     checked_command(command, timeout).map(|_| ())
 }
 
+#[cfg(target_os = "linux")]
+fn unshare_probe_arguments() -> &'static [&'static str] {
+    &["--version"]
+}
+
+#[cfg(target_os = "android")]
+fn unshare_probe_arguments() -> &'static [&'static str] {
+    &["--help"]
+}
+
+#[cfg(target_os = "linux")]
+fn local_output_unshare_arguments() -> &'static [&'static str] {
+    local_output_unshare_arguments_for(LocalOutputReentryAuthority::MappedUserRoot)
+}
+
+#[cfg(target_os = "android")]
+fn local_output_unshare_arguments() -> &'static [&'static str] {
+    local_output_unshare_arguments_for(LocalOutputReentryAuthority::AndroidRealRoot)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LocalOutputReentryAuthority {
+    MappedUserRoot,
+    AndroidRealRoot,
+}
+
+fn local_output_unshare_arguments_for(
+    authority: LocalOutputReentryAuthority,
+) -> &'static [&'static str] {
+    match authority {
+        LocalOutputReentryAuthority::MappedUserRoot => {
+            &["--user", "--map-root-user", "--mount", "--net", "--"]
+        }
+        LocalOutputReentryAuthority::AndroidRealRoot => &["--mount", "--net", "--"],
+    }
+}
+
 fn run_preflight() -> Result<(), String> {
-    ensure_isolated_authority_with_boundary(
-        "disposable conventional local-OUTPUT TPROXY capability preflight only; no production or Android qualification",
+    ensure_local_output_isolated_authority_with_boundary(
+        "disposable conventional local-OUTPUT TPROXY capability preflight only; no production or Android release qualification",
     )?;
     let modules = ModuleInventory::capture()?;
     command("ip", &["link", "set", "dev", "lo", "up"])?;
@@ -168,7 +218,7 @@ fn run_preflight() -> Result<(), String> {
             "-j",
             "MARK",
             "--set-xmark",
-            "0x1/0xf",
+            "0x200000/0x600000",
         ];
         command(program, &mark_rule)?;
         let output_hook = [
@@ -204,7 +254,7 @@ fn run_preflight() -> Result<(), String> {
             "--on-port",
             "41290",
             "--tproxy-mark",
-            "0x1/0xf",
+            "0x200000/0x600000",
         ];
         command(program, &tproxy_rule)?;
         let prerouting_hook = [
@@ -339,9 +389,8 @@ fn preflight_rpdb(ipv6: bool, table: u32, priority: u32, destination: &str) -> R
         format!("{PROXY_MARK:#x}/{PROXY_MASK:#x}"),
         "lookup".to_owned(),
         table.to_string(),
-        "protocol".to_owned(),
-        ROUTE_PROTOCOL.to_string(),
     ]);
+    append_rule_protocol(&mut rule);
     command_owned("ip", &rule)?;
     let observed_route = route_lookup(
         if ipv6 {
@@ -353,9 +402,9 @@ fn preflight_rpdb(ipv6: bool, table: u32, priority: u32, destination: &str) -> R
         if ipv6 { "::1" } else { "127.0.0.1" },
         PROXY_MARK,
     )?;
-    if observed_route.get("type").and_then(Value::as_str) != Some("local")
-        || observed_route.get("dev").and_then(Value::as_str) != Some("lo")
-        || observed_route.get("table").and_then(value_as_u32) != Some(table)
+    if observed_route.route_type.as_deref() != Some("local")
+        || observed_route.device.as_deref() != Some("lo")
+        || observed_route.table != Some(table)
     {
         return Err(format!(
             "preflight RPDB lookup did not select local table {table}: {observed_route:?}"
@@ -376,8 +425,17 @@ fn preflight_marked_tcp(ip: IpAddr) -> Result<(), String> {
     let acceptor = thread::spawn(move || listener.accept().map(|_| ()));
     let (stream, mark) =
         connect_marked_tcp(SocketAddr::new(ip, 0), destination, BYPASS_MARK, IO_TIMEOUT)?;
-    if mark != BYPASS_MARK || tcp_socket_mark(&stream)? != BYPASS_MARK {
-        return Err("marked TCP preflight SO_MARK readback mismatch".to_owned());
+    let connected_mark = tcp_socket_mark(&stream)?;
+    let expected_mark = merge_mark_role(connected_mark, BYPASS_MARK);
+    let applied_mark = set_tcp_socket_mark(&stream, expected_mark)?;
+    if mark != BYPASS_MARK
+        || applied_mark != expected_mark
+        || mark_role(applied_mark) != BYPASS_MARK
+        || mark_outside_role(applied_mark) != mark_outside_role(connected_mark)
+    {
+        return Err(format!(
+            "marked TCP preflight SO_MARK merge mismatch: before-connect={mark:#x} after-connect={connected_mark:#x} applied={applied_mark:#x} expected={expected_mark:#x}"
+        ));
     }
     drop(stream);
     acceptor
@@ -396,8 +454,17 @@ fn preflight_marked_udp(ip: IpAddr) -> Result<(), String> {
         .map_err(|error| format!("read local-OUTPUT marked UDP preflight address: {error}"))?;
     let (socket, mark) =
         connect_marked_udp(SocketAddr::new(ip, 0), destination, BYPASS_MARK, IO_TIMEOUT)?;
-    if mark != BYPASS_MARK || udp_socket_mark(&socket)? != BYPASS_MARK {
-        return Err("marked UDP preflight SO_MARK readback mismatch".to_owned());
+    let connected_mark = udp_socket_mark(&socket)?;
+    let expected_mark = merge_mark_role(connected_mark, BYPASS_MARK);
+    let applied_mark = set_udp_socket_mark(&socket, expected_mark)?;
+    if mark != BYPASS_MARK
+        || applied_mark != expected_mark
+        || mark_role(applied_mark) != BYPASS_MARK
+        || mark_outside_role(applied_mark) != mark_outside_role(connected_mark)
+    {
+        return Err(format!(
+            "marked UDP preflight SO_MARK merge mismatch: before-connect={mark:#x} after-connect={connected_mark:#x} applied={applied_mark:#x} expected={expected_mark:#x}"
+        ));
     }
     socket
         .send(b"flux-local-output-preflight")
@@ -412,10 +479,35 @@ fn preflight_marked_udp(ip: IpAddr) -> Result<(), String> {
     Ok(())
 }
 
+const fn merge_mark_role(existing: u32, role: u32) -> u32 {
+    (existing & !PROXY_MASK) | role
+}
+
+const fn mark_role(mark: u32) -> u32 {
+    mark & PROXY_MASK
+}
+
+const fn mark_outside_role(mark: u32) -> u32 {
+    mark & !PROXY_MASK
+}
+
+fn append_rule_protocol(arguments: &mut Vec<String>) {
+    arguments.extend(
+        rule_protocol_arguments_for(cfg!(target_os = "linux"))
+            .iter()
+            .map(|argument| (*argument).to_owned()),
+    );
+}
+
+fn rule_protocol_arguments_for(supported: bool) -> &'static [&'static str] {
+    if supported { &["protocol", "99"] } else { &[] }
+}
+
 #[derive(Debug, Clone)]
 struct ModuleInventory {
     module_presence: BTreeMap<String, bool>,
     registrations: BTreeMap<PathBuf, Option<Vec<u8>>>,
+    kernel_config: Option<Vec<u8>>,
 }
 
 impl ModuleInventory {
@@ -493,9 +585,11 @@ impl ModuleInventory {
             Ok((path, contents))
         })
         .collect::<Result<BTreeMap<_, _>, String>>()?;
+        let kernel_config = read_active_kernel_config()?;
         let inventory = Self {
             module_presence,
             registrations,
+            kernel_config,
         };
         inventory.require_support(nft_frontend)?;
         Ok(inventory)
@@ -528,26 +622,74 @@ impl ModuleInventory {
                     ));
                 }
             };
-            if observed != *expected {
+            if observed != *expected
+                && !self.expected_table_initialization(
+                    path,
+                    expected.as_deref(),
+                    observed.as_deref(),
+                )
+            {
                 return Err(format!(
                     "xtables registration inventory changed during local-OUTPUT TPROXY checkpoint: {}",
                     path.display()
                 ));
             }
         }
+        let observed_kernel_config = read_active_kernel_config()?;
+        if observed_kernel_config != self.kernel_config {
+            return Err(
+                "kernel configuration evidence changed during local-OUTPUT TPROXY checkpoint"
+                    .to_owned(),
+            );
+        }
         Ok(())
     }
 
+    fn expected_table_initialization(
+        &self,
+        path: &Path,
+        expected: Option<&[u8]>,
+        observed: Option<&[u8]>,
+    ) -> bool {
+        let Some(expected) = expected else {
+            return false;
+        };
+        let Some(observed) = observed else {
+            return false;
+        };
+        let config_option = match path.to_str() {
+            Some("/proc/net/ip_tables_names") => "CONFIG_IP_NF_MANGLE",
+            Some("/proc/net/ip6_tables_names") => "CONFIG_IP6_NF_MANGLE",
+            _ => return false,
+        };
+        if !self
+            .kernel_config
+            .as_deref()
+            .is_some_and(|config| kernel_config_has_builtin(config, config_option))
+        {
+            return false;
+        }
+        let expected = registration_tokens(expected);
+        let mut allowed = expected.clone();
+        allowed.insert("mangle".to_owned());
+        registration_tokens(observed) == allowed
+    }
+
     fn require_support(&self, nft_frontend: bool) -> Result<(), String> {
-        self.require_component("veth link type", &[&["veth"]], &[])?;
+        self.require_component_with_builtin("veth link type", &[&["veth"]], &[], &["CONFIG_VETH"])?;
         if nft_frontend {
-            self.require_component(
+            self.require_component_with_builtin(
                 "nftables selector and counter expressions",
                 &[&["nf_tables", "nft_compat", "nft_counter"]],
                 &[],
+                &[
+                    "CONFIG_NF_TABLES",
+                    "CONFIG_NFT_COMPAT",
+                    "CONFIG_NFT_COUNTER",
+                ],
             )?;
         }
-        self.require_component(
+        self.require_component_with_builtin(
             "IPv4 mangle table",
             if nft_frontend {
                 &[&["nf_tables", "nft_compat"]]
@@ -555,8 +697,13 @@ impl ModuleInventory {
                 &[&["ip_tables", "iptable_mangle"]]
             },
             &[("/proc/net/ip_tables_names", "mangle")],
+            if nft_frontend {
+                &["CONFIG_NF_TABLES", "CONFIG_NFT_COMPAT"]
+            } else {
+                &["CONFIG_IP_NF_MANGLE"]
+            },
         )?;
-        self.require_component(
+        self.require_component_with_builtin(
             "IPv6 mangle table",
             if nft_frontend {
                 &[&["nf_tables", "nft_compat"]]
@@ -564,8 +711,13 @@ impl ModuleInventory {
                 &[&["ip6_tables", "ip6table_mangle"]]
             },
             &[("/proc/net/ip6_tables_names", "mangle")],
+            if nft_frontend {
+                &["CONFIG_NF_TABLES", "CONFIG_NFT_COMPAT"]
+            } else {
+                &["CONFIG_IP6_NF_MANGLE"]
+            },
         )?;
-        self.require_component(
+        self.require_component_with_builtin(
             "IPv4 TPROXY target",
             if nft_frontend {
                 &[&["nf_tables", "nft_compat", "nft_tproxy", "nf_tproxy_ipv4"]]
@@ -573,8 +725,13 @@ impl ModuleInventory {
                 &[&["xt_TPROXY", "nf_tproxy_ipv4"]]
             },
             &[("/proc/net/ip_tables_targets", "TPROXY")],
+            if nft_frontend {
+                &["CONFIG_NFT_TPROXY", "CONFIG_NF_TPROXY_IPV4"]
+            } else {
+                &["CONFIG_NETFILTER_XT_TARGET_TPROXY", "CONFIG_NF_TPROXY_IPV4"]
+            },
         )?;
-        self.require_component(
+        self.require_component_with_builtin(
             "IPv6 TPROXY target",
             if nft_frontend {
                 &[&["nf_tables", "nft_compat", "nft_tproxy", "nf_tproxy_ipv6"]]
@@ -582,8 +739,13 @@ impl ModuleInventory {
                 &[&["xt_TPROXY", "nf_tproxy_ipv6"]]
             },
             &[("/proc/net/ip6_tables_targets", "TPROXY")],
+            if nft_frontend {
+                &["CONFIG_NFT_TPROXY", "CONFIG_NF_TPROXY_IPV6"]
+            } else {
+                &["CONFIG_NETFILTER_XT_TARGET_TPROXY", "CONFIG_NF_TPROXY_IPV6"]
+            },
         )?;
-        self.require_component(
+        self.require_component_with_builtin(
             "IPv4 MARK target",
             if nft_frontend {
                 &[&["nf_tables", "nft_compat"], &["xt_mark"]]
@@ -591,8 +753,13 @@ impl ModuleInventory {
                 &[&["xt_mark"]]
             },
             &[("/proc/net/ip_tables_targets", "MARK")],
+            if nft_frontend {
+                &["CONFIG_NF_TABLES", "CONFIG_NFT_COMPAT"]
+            } else {
+                &["CONFIG_NETFILTER_XT_TARGET_MARK"]
+            },
         )?;
-        self.require_component(
+        self.require_component_with_builtin(
             "IPv6 MARK target",
             if nft_frontend {
                 &[&["nf_tables", "nft_compat"], &["xt_mark"]]
@@ -600,8 +767,13 @@ impl ModuleInventory {
                 &[&["xt_mark"]]
             },
             &[("/proc/net/ip6_tables_targets", "MARK")],
+            if nft_frontend {
+                &["CONFIG_NF_TABLES", "CONFIG_NFT_COMPAT"]
+            } else {
+                &["CONFIG_NETFILTER_XT_TARGET_MARK"]
+            },
         )?;
-        self.require_component(
+        self.require_component_with_builtin(
             "IPv4 comment match",
             if nft_frontend {
                 &[&["nf_tables", "nft_compat"], &["xt_comment"]]
@@ -609,8 +781,13 @@ impl ModuleInventory {
                 &[&["xt_comment"]]
             },
             &[("/proc/net/ip_tables_matches", "comment")],
+            if nft_frontend {
+                &["CONFIG_NF_TABLES", "CONFIG_NFT_COMPAT"]
+            } else {
+                &["CONFIG_NETFILTER_XT_MATCH_COMMENT"]
+            },
         )?;
-        self.require_component(
+        self.require_component_with_builtin(
             "IPv6 comment match",
             if nft_frontend {
                 &[&["nf_tables", "nft_compat"], &["xt_comment"]]
@@ -618,12 +795,17 @@ impl ModuleInventory {
                 &[&["xt_comment"]]
             },
             &[("/proc/net/ip6_tables_matches", "comment")],
+            if nft_frontend {
+                &["CONFIG_NF_TABLES", "CONFIG_NFT_COMPAT"]
+            } else {
+                &["CONFIG_NETFILTER_XT_MATCH_COMMENT"]
+            },
         )?;
         for (family, path) in [
             ("IPv4", "/proc/net/ip_tables_matches"),
             ("IPv6", "/proc/net/ip6_tables_matches"),
         ] {
-            self.require_component(
+            self.require_component_with_builtin(
                 &format!("{family} TCP match"),
                 if nft_frontend {
                     &[&["nf_tables", "nft_compat"]]
@@ -631,8 +813,13 @@ impl ModuleInventory {
                     &[&["xt_tcpudp"]]
                 },
                 &[(path, "tcp")],
+                if nft_frontend {
+                    &["CONFIG_NF_TABLES", "CONFIG_NFT_COMPAT"]
+                } else {
+                    &["CONFIG_NETFILTER_XTABLES"]
+                },
             )?;
-            self.require_component(
+            self.require_component_with_builtin(
                 &format!("{family} UDP match"),
                 if nft_frontend {
                     &[&["nf_tables", "nft_compat"]]
@@ -640,6 +827,11 @@ impl ModuleInventory {
                     &[&["xt_tcpudp"]]
                 },
                 &[(path, "udp")],
+                if nft_frontend {
+                    &["CONFIG_NF_TABLES", "CONFIG_NFT_COMPAT"]
+                } else {
+                    &["CONFIG_NETFILTER_XTABLES"]
+                },
             )?;
         }
         Ok(())
@@ -651,6 +843,16 @@ impl ModuleInventory {
         module_sets: &[&[&str]],
         registrations: &[(&str, &str)],
     ) -> Result<(), String> {
+        self.require_component_with_builtin(label, module_sets, registrations, &[])
+    }
+
+    fn require_component_with_builtin(
+        &self,
+        label: &str,
+        module_sets: &[&[&str]],
+        registrations: &[(&str, &str)],
+        built_in_options: &[&str],
+    ) -> Result<(), String> {
         let module_proof = module_sets.iter().any(|set| {
             set.iter()
                 .all(|module| self.module_presence.get(*module).copied().unwrap_or(false))
@@ -661,20 +863,79 @@ impl ModuleInventory {
                 .and_then(Option::as_deref)
                 .is_some_and(|contents| registration_has_token(contents, token))
         });
-        if module_proof || registration_proof {
+        let built_in_proof = !built_in_options.is_empty()
+            && self.kernel_config.as_deref().is_some_and(|config| {
+                built_in_options
+                    .iter()
+                    .all(|option| kernel_config_has_builtin(config, option))
+            });
+        if module_proof || registration_proof || built_in_proof {
             Ok(())
         } else {
             Err(format!(
-                "local-OUTPUT TPROXY checkpoint refuses mutation because {label} is neither already active in /sys/module nor already registered in procfs; implicit module autoload is forbidden"
+                "local-OUTPUT TPROXY checkpoint refuses mutation because {label} is neither already active in /sys/module, already registered in procfs, nor proven built-in by /proc/config.gz; implicit module autoload is forbidden"
             ))
         }
     }
+}
+
+fn read_active_kernel_config() -> Result<Option<Vec<u8>>, String> {
+    if !Path::new("/proc/config.gz").is_file() {
+        return Ok(None);
+    }
+    let mut command = Command::new("sh");
+    command.args([
+        "-c",
+        concat!(
+            "zcat /proc/config.gz | grep -E '^(",
+            "CONFIG_VETH|",
+            "CONFIG_NETFILTER_XTABLES|",
+            "CONFIG_NETFILTER_XT_TARGET_TPROXY|",
+            "CONFIG_NF_TPROXY_IPV4|",
+            "CONFIG_NF_TPROXY_IPV6|",
+            "CONFIG_NETFILTER_XT_TARGET_MARK|",
+            "CONFIG_NETFILTER_XT_MATCH_COMMENT|",
+            "CONFIG_IP_NF_MANGLE|",
+            "CONFIG_IP6_NF_MANGLE|",
+            "CONFIG_NF_TABLES|",
+            "CONFIG_NFT_COMPAT|",
+            "CONFIG_NFT_COUNTER|",
+            "CONFIG_NFT_TPROXY",
+            ")=y$'",
+        ),
+    ]);
+    let output = run_command(&mut command, COMMAND_TIMEOUT)?;
+    if !output.status.success() || !output.stderr.is_empty() {
+        return Err(format!(
+            "read built-in kernel configuration evidence: status={} stdout={} stderr={}",
+            output.status,
+            bounded_diagnostic(&output.stdout),
+            bounded_diagnostic(&output.stderr)
+        ));
+    }
+    Ok(Some(output.stdout))
+}
+
+fn kernel_config_has_builtin(config: &[u8], option: &str) -> bool {
+    let expected = format!("{option}=y");
+    String::from_utf8_lossy(config)
+        .lines()
+        .any(|line| line.trim() == expected)
 }
 
 fn registration_has_token(contents: &[u8], token: &str) -> bool {
     String::from_utf8_lossy(contents)
         .lines()
         .any(|line| line.trim() == token)
+}
+
+fn registration_tokens(contents: &[u8]) -> BTreeSet<String> {
+    String::from_utf8_lossy(contents)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -866,8 +1127,8 @@ struct LocalOutputResources {
 }
 
 fn run_isolated() -> Result<(), String> {
-    ensure_isolated_authority_with_boundary(
-        "conventional local OUTPUT mark, RPDB local route, loopback PREROUTING TPROXY, and exact cleanup evidence only; no Android or production qualification",
+    ensure_local_output_isolated_authority_with_boundary(
+        "conventional local OUTPUT mark, RPDB local route, loopback PREROUTING TPROXY, and cleanup evidence only; no Android release or production qualification",
     )?;
     let modules = ModuleInventory::capture()?;
     let directory = tempfile::tempdir()
@@ -948,25 +1209,21 @@ fn require_names_absent(baseline: &Baselines, config: &LocalOutputConfig) -> Res
             config.ipv6_route_table,
         ),
     ] {
-        let rules = json_array(dump, label)?;
+        let rules = parse_rpdb_baseline(dump, label)?;
         for rule in &rules {
-            if let Some((value, mask)) = rpdb_fwmark_selector(rule)?
+            if let Some((value, mask)) = rule.fwmark
                 && mask & PROXY_MASK != 0
             {
                 return Err(format!(
-                    "foreign {label} fwmark selector overlaps the local-OUTPUT test mask: value={value:#x} mask={mask:#x} rule={rule}"
+                    "foreign {label} fwmark selector overlaps the local-OUTPUT test mask: value={value:#x} mask={mask:#x} rule={}",
+                    rule.raw
                 ));
             }
         }
-        if rules.iter().any(|rule| {
-            rule.get("priority")
-                .and_then(value_as_u32)
-                .is_some_and(|value| value == priority)
-                || rule
-                    .get("table")
-                    .and_then(value_as_u32)
-                    .is_some_and(|value| value == table)
-        }) {
+        if rules
+            .iter()
+            .any(|rule| rule.priority == Some(priority) || rule.table == Some(table))
+        {
             return Err(format!(
                 "nonce-derived local-OUTPUT priority {priority} or table {table} is already referenced in {label}"
             ));
@@ -976,7 +1233,7 @@ fn require_names_absent(baseline: &Baselines, config: &LocalOutputConfig) -> Res
         ("IPv4 private route table", &baseline.ipv4_private_table),
         ("IPv6 private route table", &baseline.ipv6_private_table),
     ] {
-        if !json_array(dump, label)?.is_empty() {
+        if !route_table_dump_is_empty(dump, label)? {
             return Err(format!("nonce-derived {label} is not empty"));
         }
     }
@@ -993,6 +1250,83 @@ fn require_names_absent(baseline: &Baselines, config: &LocalOutputConfig) -> Res
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct RpdbBaselineRule {
+    priority: Option<u32>,
+    table: Option<u32>,
+    fwmark: Option<(u32, u32)>,
+    raw: String,
+}
+
+fn parse_rpdb_baseline(output: &[u8], label: &str) -> Result<Vec<RpdbBaselineRule>, String> {
+    let text = std::str::from_utf8(output)
+        .map_err(|error| format!("decode {label} baseline as UTF-8: {error}"))?;
+    if text.trim_start().starts_with('[') {
+        return json_array(output, label)?
+            .into_iter()
+            .map(|rule| {
+                Ok(RpdbBaselineRule {
+                    priority: rule.get("priority").and_then(value_as_u32),
+                    table: rule.get("table").and_then(value_as_u32),
+                    fwmark: rpdb_fwmark_selector(&rule)?,
+                    raw: rule.to_string(),
+                })
+            })
+            .collect();
+    }
+
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            let priority = fields
+                .first()
+                .and_then(|field| field.strip_suffix(':'))
+                .and_then(parse_u32_token);
+            let table = value_after_text_field(&fields, "lookup").and_then(parse_u32_token);
+            let fwmark = match value_after_text_field(&fields, "fwmark") {
+                Some(encoded) => Some(parse_fwmark_selector_text(encoded)?),
+                None => None,
+            };
+            Ok(RpdbBaselineRule {
+                priority,
+                table,
+                fwmark,
+                raw: line.to_owned(),
+            })
+        })
+        .collect()
+}
+
+fn parse_fwmark_selector_text(encoded: &str) -> Result<(u32, u32), String> {
+    let (value, mask) = encoded.split_once('/').unwrap_or((encoded, "0xffffffff"));
+    Ok((
+        parse_u32_token(value)
+            .ok_or_else(|| format!("RPDB fwmark value is not a bounded integer: {encoded:?}"))?,
+        parse_u32_token(mask)
+            .ok_or_else(|| format!("RPDB fwmark mask is not a bounded integer: {encoded:?}"))?,
+    ))
+}
+
+fn value_after_text_field<'a>(fields: &'a [&str], field: &str) -> Option<&'a str> {
+    fields
+        .iter()
+        .position(|candidate| *candidate == field)
+        .and_then(|index| fields.get(index.saturating_add(1)).copied())
+}
+
+fn route_table_dump_is_empty(output: &[u8], label: &str) -> Result<bool, String> {
+    let text =
+        std::str::from_utf8(output).map_err(|error| format!("decode {label} as UTF-8: {error}"))?;
+    if text.trim().is_empty() {
+        return Ok(true);
+    }
+    if text.trim_start().starts_with('[') {
+        return json_array(output, label).map(|routes| routes.is_empty());
+    }
+    Ok(false)
 }
 
 fn require_clean_mangle_baseline(label: &str, text: &str) -> Result<(), String> {
@@ -1301,9 +1635,8 @@ fn rpdb_mutations(config: &LocalOutputConfig) -> Vec<PlannedMutation> {
             format!("{PROXY_MARK:#x}/{PROXY_MASK:#x}"),
             "lookup".to_owned(),
             table.to_string(),
-            "protocol".to_owned(),
-            ROUTE_PROTOCOL.to_string(),
         ]);
+        append_rule_protocol(&mut rule);
         let mut delete_rule = rule.clone();
         delete_rule[usize::from(family == AddressFamily::Ipv6) + 1] = "delete".to_owned();
         mutations.push(mutation(
@@ -1462,7 +1795,7 @@ impl RulePlan {
         }
         for hook in &self.response_output_hooks {
             if rule_value_after(hook, &["--mark"])
-                != Some(format!("{BYPASS_MARK:#x}/0xffffffff").as_str())
+                != Some(format!("{BYPASS_MARK:#x}/{PROXY_MASK:#x}").as_str())
             {
                 return Err(format!(
                     "{} response hook omits the exact bypass mark: {hook:?}",
@@ -1527,7 +1860,7 @@ fn rule_plan(config: &LocalOutputConfig, family: AddressFamily) -> RulePlan {
             "-m",
             "mark",
             "--mark",
-            &format!("{BYPASS_MARK:#x}/0xffffffff"),
+            &format!("{BYPASS_MARK:#x}/{PROXY_MASK:#x}"),
             "-m",
             "comment",
             "--comment",
@@ -1708,7 +2041,7 @@ fn rule_plan(config: &LocalOutputConfig, family: AddressFamily) -> RulePlan {
             "-m",
             "mark",
             "--mark",
-            &format!("{BYPASS_MARK:#x}/0xffffffff"),
+            &format!("{BYPASS_MARK:#x}/{PROXY_MASK:#x}"),
             "-m",
             "comment",
             "--comment",
@@ -1762,7 +2095,7 @@ fn rule_plan(config: &LocalOutputConfig, family: AddressFamily) -> RulePlan {
             "-m",
             "mark",
             "--mark",
-            &format!("{BYPASS_MARK:#x}/0xffffffff"),
+            &format!("{BYPASS_MARK:#x}/{PROXY_MASK:#x}"),
             "-j",
             output_chain,
         ])
@@ -2281,7 +2614,9 @@ fn serve_tcp(
     let original_destination = stream
         .local_addr()
         .map_err(|error| format!("read transparent TCP original destination: {error}"))?;
-    let response_mark = set_tcp_socket_mark(&stream, BYPASS_MARK)?;
+    let inherited_mark = tcp_socket_mark(&stream)?;
+    let expected_response_mark = merge_mark_role(inherited_mark, BYPASS_MARK);
+    let response_mark = set_tcp_socket_mark(&stream, expected_response_mark)?;
     let request = read_u32_frame(&mut stream)?;
     let response = response_payload(&request);
     write_u32_frame(&mut stream, &response)?;
@@ -2291,8 +2626,14 @@ fn serve_tcp(
     let response_remote = stream
         .peer_addr()
         .map_err(|error| format!("read transparent TCP response remote tuple: {error}"))?;
-    if tcp_socket_mark(&stream)? != BYPASS_MARK {
-        return Err("transparent TCP response socket lost its bypass mark".to_owned());
+    let observed_response_mark = tcp_socket_mark(&stream)?;
+    if observed_response_mark != expected_response_mark
+        || mark_role(observed_response_mark) != BYPASS_MARK
+        || mark_outside_role(observed_response_mark) != mark_outside_role(inherited_mark)
+    {
+        return Err(format!(
+            "transparent TCP response socket lost its masked bypass role: inherited={inherited_mark:#x} expected={expected_response_mark:#x} observed={observed_response_mark:#x}"
+        ));
     }
     let expected = SocketAddr::new(config.destination(family), TCP_PORT);
     if original_destination != expected || response_local != expected {
@@ -2330,17 +2671,24 @@ fn serve_udp(
         ));
     }
     let response = response_payload(&datagram.payload);
-    let (response_socket, response_mark, transparent) = connect_transparent_marked_udp(
+    let (response_socket, preconnect_mark, transparent) = connect_transparent_marked_udp(
         datagram.original_destination,
         datagram.remote,
         BYPASS_MARK,
         IO_TIMEOUT,
     )?;
-    if response_mark != BYPASS_MARK
+    let connected_mark = udp_socket_mark(&response_socket)?;
+    let expected_response_mark = merge_mark_role(connected_mark, BYPASS_MARK);
+    let response_mark = set_udp_socket_mark(&response_socket, expected_response_mark)?;
+    if preconnect_mark != BYPASS_MARK
         || transparent != 1
-        || udp_socket_mark(&response_socket)? != BYPASS_MARK
+        || response_mark != expected_response_mark
+        || mark_role(response_mark) != BYPASS_MARK
+        || mark_outside_role(response_mark) != mark_outside_role(connected_mark)
     {
-        return Err("transparent UDP response socket readback mismatch".to_owned());
+        return Err(format!(
+            "transparent UDP response socket masked-mark mismatch: before-connect={preconnect_mark:#x} after-connect={connected_mark:#x} applied={response_mark:#x} expected={expected_response_mark:#x} transparent={transparent}"
+        ));
     }
     let sent = response_socket
         .send(&response)
@@ -2428,8 +2776,11 @@ fn run_tcp_client(
     let source = SocketAddr::new(config.source(family), 0);
     let destination = SocketAddr::new(config.destination(family), TCP_PORT);
     let (mut stream, observed_mark) = connect_marked_tcp(source, destination, 0, IO_TIMEOUT)?;
-    if observed_mark != 0 || tcp_socket_mark(&stream)? != 0 {
-        return Err("positive TCP client was not initially unmarked".to_owned());
+    let connected_mark = tcp_socket_mark(&stream)?;
+    if observed_mark != 0 || mark_role(connected_mark) != 0 {
+        return Err(format!(
+            "positive TCP client entered the test-owned mark field before capture: before-connect={observed_mark:#x} after-connect={connected_mark:#x} mask={PROXY_MASK:#x}"
+        ));
     }
     let request = request_payload(config, family, FlowTransport::Tcp);
     write_u32_frame(&mut stream, &request)?;
@@ -2448,7 +2799,7 @@ fn run_tcp_client(
         transport: FlowTransport::Tcp,
         local,
         remote,
-        socket_mark: observed_mark,
+        socket_mark: connected_mark,
         request,
         response,
     })
@@ -2461,8 +2812,11 @@ fn run_udp_client(
     let source = SocketAddr::new(config.source(family), 0);
     let destination = SocketAddr::new(config.destination(family), UDP_PORT);
     let (socket, observed_mark) = connect_marked_udp(source, destination, 0, IO_TIMEOUT)?;
-    if observed_mark != 0 || udp_socket_mark(&socket)? != 0 {
-        return Err("positive UDP client was not initially unmarked".to_owned());
+    let connected_mark = udp_socket_mark(&socket)?;
+    if observed_mark != 0 || mark_role(connected_mark) != 0 {
+        return Err(format!(
+            "positive UDP client entered the test-owned mark field before capture: before-connect={observed_mark:#x} after-connect={connected_mark:#x} mask={PROXY_MASK:#x}"
+        ));
     }
     let request = request_payload(config, family, FlowTransport::Udp);
     let sent = socket
@@ -2493,7 +2847,7 @@ fn run_udp_client(
         transport: FlowTransport::Udp,
         local,
         remote,
-        socket_mark: observed_mark,
+        socket_mark: connected_mark,
         request,
         response,
     })
@@ -2549,7 +2903,7 @@ fn validate_flow_observations(
                 },
                 TPROXY_PORT,
             );
-            if client.socket_mark != 0
+            if mark_role(client.socket_mark) != 0
                 || client.local.ip() != config.source(family)
                 || client.remote != destination
                 || listener.listener != wildcard
@@ -2557,7 +2911,7 @@ fn validate_flow_observations(
                 || listener.original_destination != destination
                 || listener.response_local != destination
                 || listener.response_remote != client.local
-                || listener.response_mark != BYPASS_MARK
+                || mark_role(listener.response_mark) != BYPASS_MARK
                 || listener.request != client.request
                 || listener.response != client.response
                 || client.response != response_payload(&client.request)
@@ -2578,94 +2932,75 @@ fn run_negative_controls(config: &LocalOutputConfig) -> Result<(), String> {
         let source = SocketAddr::new(config.source(family), 0);
         let destination = SocketAddr::new(config.destination(family), NEGATIVE_PORT);
         let (socket, observed_mark) = connect_marked_udp(source, destination, 0, NEGATIVE_TIMEOUT)?;
-        if observed_mark != 0 || udp_socket_mark(&socket)? != 0 {
+        let connected_mark = udp_socket_mark(&socket)?;
+        if observed_mark != 0 || mark_role(connected_mark) != 0 {
             return Err(format!(
-                "{} unmatched negative-control socket was not unmarked",
-                family.label()
+                "{} unmatched negative-control socket entered the test-owned mark field: before-connect={observed_mark:#x} after-connect={connected_mark:#x}",
+                family.label(),
             ));
         }
         let request = format!("flux-local-output-negative:{}", config.nonce).into_bytes();
-        let sent = socket.send(&request).map_err(|error| {
-            format!(
-                "send {} unmatched negative-control datagram: {error}",
-                family.label()
-            )
-        })?;
-        if sent != request.len() {
-            return Err(format!(
-                "{} unmatched negative-control datagram was partial",
-                family.label()
-            ));
-        }
-        let mut buffer = [0_u8; 64];
-        match socket.recv(&mut buffer) {
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) => {}
-            Err(error) => {
-                return Err(format!(
-                    "{} unmatched negative-control receive failed unexpectedly: {error}",
-                    family.label()
-                ));
-            }
-            Ok(length) => {
-                return Err(format!(
-                    "{} unmatched negative control received {length} bytes",
-                    family.label()
-                ));
-            }
-        }
+        send_udp_expected_drop(
+            &socket,
+            &request,
+            &format!("{} unmatched negative control", family.label()),
+        )?;
 
         let bypass_destination = SocketAddr::new(config.destination(family), UDP_PORT);
-        let (bypass_socket, bypass_mark) = connect_marked_udp(
+        let (bypass_socket, preconnect_bypass_mark) = connect_marked_udp(
             SocketAddr::new(config.source(family), 0),
             bypass_destination,
             BYPASS_MARK,
             NEGATIVE_TIMEOUT,
         )?;
-        if bypass_mark != BYPASS_MARK || udp_socket_mark(&bypass_socket)? != BYPASS_MARK {
+        let connected_bypass_mark = udp_socket_mark(&bypass_socket)?;
+        let expected_bypass_mark = merge_mark_role(connected_bypass_mark, BYPASS_MARK);
+        let bypass_mark = set_udp_socket_mark(&bypass_socket, expected_bypass_mark)?;
+        if preconnect_bypass_mark != BYPASS_MARK
+            || bypass_mark != expected_bypass_mark
+            || mark_role(bypass_mark) != BYPASS_MARK
+            || mark_outside_role(bypass_mark) != mark_outside_role(connected_bypass_mark)
+        {
             return Err(format!(
-                "{} forward-tuple bypass negative-control socket lost its mark",
-                family.label()
+                "{} forward-tuple bypass negative-control socket lost its masked role: before-connect={preconnect_bypass_mark:#x} after-connect={connected_bypass_mark:#x} applied={bypass_mark:#x}",
+                family.label(),
             ));
         }
         let bypass_request =
             format!("flux-local-output-forward-bypass:{}", config.nonce).into_bytes();
-        let sent = bypass_socket.send(&bypass_request).map_err(|error| {
-            format!(
-                "send {} forward-tuple bypass negative control: {error}",
-                family.label()
-            )
-        })?;
-        if sent != bypass_request.len() {
-            return Err(format!(
-                "{} forward-tuple bypass negative control was partial",
-                family.label()
-            ));
-        }
-        match bypass_socket.recv(&mut buffer) {
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) => {}
-            Err(error) => {
-                return Err(format!(
-                    "{} forward-tuple bypass negative-control receive failed unexpectedly: {error}",
-                    family.label()
-                ));
-            }
-            Ok(length) => {
-                return Err(format!(
-                    "{} forward-tuple bypass negative control received {length} bytes",
-                    family.label()
-                ));
-            }
-        }
+        send_udp_expected_drop(
+            &bypass_socket,
+            &bypass_request,
+            &format!("{} forward-tuple bypass negative control", family.label()),
+        )?;
     }
     Ok(())
+}
+
+fn send_udp_expected_drop(socket: &UdpSocket, payload: &[u8], label: &str) -> Result<(), String> {
+    match socket.send(payload) {
+        Ok(sent) if sent == payload.len() => {
+            let mut buffer = [0_u8; 64];
+            match socket.recv(&mut buffer) {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    Ok(())
+                }
+                Err(error) => Err(format!("{label} receive failed unexpectedly: {error}")),
+                Ok(length) => Err(format!("{label} received {length} bytes")),
+            }
+        }
+        Ok(sent) => Err(format!(
+            "{label} datagram was partial: sent={sent} expected={}",
+            payload.len()
+        )),
+        Err(error) if error.raw_os_error() == Some(libc::EPERM) => Ok(()),
+        Err(error) => Err(format!("send {label} datagram: {error}")),
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -2808,9 +3143,9 @@ fn validate_route_controls(config: &LocalOutputConfig) -> Result<(), String> {
         let destination = config.destination(family).to_string();
         let source = config.source(family).to_string();
         let local = route_lookup(family, &destination, &source, PROXY_MARK)?;
-        if local.get("type").and_then(Value::as_str) != Some("local")
-            || local.get("dev").and_then(Value::as_str) != Some("lo")
-            || local.get("table").and_then(value_as_u32) != Some(table)
+        if local.route_type.as_deref() != Some("local")
+            || local.device.as_deref() != Some("lo")
+            || local.table != Some(table)
         {
             return Err(format!(
                 "{} proxy-mark route lookup did not select local table {table} through lo: {local:?}",
@@ -2819,8 +3154,8 @@ fn validate_route_controls(config: &LocalOutputConfig) -> Result<(), String> {
         }
 
         let direct = route_lookup(family, &destination, &source, 0)?;
-        if direct.get("type").and_then(Value::as_str) == Some("local")
-            || direct.get("dev").and_then(Value::as_str) != Some(config.egress_interface.as_str())
+        if direct.route_type.as_deref() == Some("local")
+            || direct.device.as_deref() != Some(config.egress_interface.as_str())
         {
             return Err(format!(
                 "{} unmarked route lookup did not select test egress {}: {direct:?}",
@@ -2830,8 +3165,8 @@ fn validate_route_controls(config: &LocalOutputConfig) -> Result<(), String> {
         }
 
         let bypass = route_lookup(family, &destination, &source, BYPASS_MARK)?;
-        if bypass.get("type").and_then(Value::as_str) == Some("local")
-            || bypass.get("dev").and_then(Value::as_str) != Some(config.egress_interface.as_str())
+        if bypass.route_type.as_deref() == Some("local")
+            || bypass.device.as_deref() != Some(config.egress_interface.as_str())
         {
             return Err(format!(
                 "{} bypass mark accidentally selects the proxy local route: {bypass:?}",
@@ -2847,7 +3182,7 @@ fn route_lookup(
     destination: &str,
     source: &str,
     mark: u32,
-) -> Result<serde_json::Map<String, Value>, String> {
+) -> Result<RouteLookupObservation, String> {
     let mut arguments = Vec::new();
     if family == AddressFamily::Ipv6 {
         arguments.push("-6".to_owned());
@@ -2864,7 +3199,41 @@ fn route_lookup(
         "uid".to_owned(),
         "0".to_owned(),
     ]);
-    first_json_object(&command_output_owned("ip", &arguments)?, "ip route get")
+    parse_route_lookup(&command_output_owned("ip", &arguments)?, "ip route get")
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct RouteLookupObservation {
+    route_type: Option<String>,
+    device: Option<String>,
+    table: Option<u32>,
+}
+
+fn parse_route_lookup(output: &[u8], label: &str) -> Result<RouteLookupObservation, String> {
+    let text =
+        std::str::from_utf8(output).map_err(|error| format!("decode {label} as UTF-8: {error}"))?;
+    if text.trim_start().starts_with('[') {
+        let route = first_json_object(output, label)?;
+        return Ok(RouteLookupObservation {
+            route_type: route.get("type").and_then(Value::as_str).map(str::to_owned),
+            device: route.get("dev").and_then(Value::as_str).map(str::to_owned),
+            table: route.get("table").and_then(value_as_u32),
+        });
+    }
+    let fields = text.split_whitespace().collect::<Vec<_>>();
+    if fields.is_empty() {
+        return Err(format!("{label} produced an empty route lookup"));
+    }
+    let route_type = matches!(
+        fields[0],
+        "local" | "broadcast" | "unreachable" | "blackhole" | "prohibit" | "throw"
+    )
+    .then(|| fields[0].to_owned());
+    Ok(RouteLookupObservation {
+        route_type,
+        device: value_after_text_field(&fields, "dev").map(str::to_owned),
+        table: value_after_text_field(&fields, "table").and_then(parse_u32_token),
+    })
 }
 
 fn first_json_object(output: &[u8], label: &str) -> Result<serde_json::Map<String, Value>, String> {
@@ -2954,6 +3323,11 @@ fn cleanup_isolated(resources: &mut LocalOutputResources) -> Result<(), String> 
         attempt_inverse(mutation, &mut failures);
     }
 
+    #[cfg(target_os = "android")]
+    if let Err(error) = normalize_android_loopback_after_cleanup() {
+        failures.push(error);
+    }
+
     validate_baselines(resources, &mut failures);
     if let Err(error) = resources.modules.verify() {
         failures.push(error);
@@ -2967,6 +3341,12 @@ fn cleanup_isolated(resources: &mut LocalOutputResources) -> Result<(), String> 
     } else {
         Err(failures.join("; "))
     }
+}
+
+#[cfg(target_os = "android")]
+fn normalize_android_loopback_after_cleanup() -> Result<(), String> {
+    command("ip", &["address", "flush", "dev", "lo"])?;
+    command("ip", &["-6", "address", "flush", "dev", "lo"])
 }
 
 fn attempt_inverse(mutation: &PlannedMutation, failures: &mut Vec<String>) -> bool {
@@ -3071,14 +3451,62 @@ fn validate_baselines(resources: &LocalOutputResources, failures: &mut Vec<Strin
     ];
     for (label, expected, result) in observed {
         match result {
-            Ok(actual) if actual == expected => {}
-            Ok(actual) => failures.push(format!(
-                "{label} baseline was not restored: expected={} observed={}",
-                bounded_diagnostic(expected),
-                bounded_diagnostic(&actual)
-            )),
+            Ok(actual) => match (
+                canonical_cleanup_baseline(label, expected),
+                canonical_cleanup_baseline(label, &actual),
+            ) {
+                (Ok(expected_canonical), Ok(actual_canonical))
+                    if actual_canonical == expected_canonical => {}
+                (Ok(_), Ok(_)) => failures.push(format!(
+                    "{label} baseline was not restored: expected={} observed={}",
+                    bounded_diagnostic(expected),
+                    bounded_diagnostic(&actual)
+                )),
+                (Err(error), _) | (_, Err(error)) => failures.push(error),
+            },
             Err(error) => failures.push(format!("read {label} cleanup baseline: {error}")),
         }
+    }
+}
+
+fn canonical_cleanup_baseline(label: &str, baseline: &[u8]) -> Result<Vec<u8>, String> {
+    #[cfg(target_os = "android")]
+    if matches!(label, "link inventory" | "address inventory") {
+        let mut value: Value = serde_json::from_slice(baseline)
+            .map_err(|error| format!("decode {label} for cleanup canonicalization: {error}"))?;
+        let entries = value
+            .as_array_mut()
+            .ok_or_else(|| format!("{label} cleanup inventory is not an array"))?;
+        for entry in entries {
+            let Some(object) = entry.as_object_mut() else {
+                return Err(format!("{label} cleanup inventory contains a non-object"));
+            };
+            canonicalize_android_inactive_loopback_qdisc(object);
+        }
+        return serde_json::to_vec(&value)
+            .map_err(|error| format!("encode canonical {label}: {error}"));
+    }
+    let _ = label;
+    Ok(baseline.to_vec())
+}
+
+#[cfg(any(target_os = "android", test))]
+fn canonicalize_android_inactive_loopback_qdisc(object: &mut serde_json::Map<String, Value>) {
+    let is_inactive_loopback = object.get("ifname").and_then(Value::as_str) == Some("lo")
+        && object
+            .get("flags")
+            .and_then(Value::as_array)
+            .is_some_and(|flags| {
+                !flags
+                    .iter()
+                    .any(|flag| flag.as_str().is_some_and(|flag| flag == "UP"))
+            });
+    let is_expected_inactive_qdisc = object
+        .get("qdisc")
+        .and_then(Value::as_str)
+        .is_some_and(|qdisc| matches!(qdisc, "noop" | "noqueue"));
+    if is_inactive_loopback && is_expected_inactive_qdisc {
+        object.insert("qdisc".to_owned(), Value::String("inactive".to_owned()));
     }
 }
 
@@ -3213,6 +3641,18 @@ mod tests {
     }
 
     #[test]
+    fn launcher_arguments_keep_linux_mapping_separate_from_android_real_root() {
+        assert_eq!(
+            local_output_unshare_arguments_for(LocalOutputReentryAuthority::MappedUserRoot),
+            &["--user", "--map-root-user", "--mount", "--net", "--"]
+        );
+        assert_eq!(
+            local_output_unshare_arguments_for(LocalOutputReentryAuthority::AndroidRealRoot),
+            &["--mount", "--net", "--"]
+        );
+    }
+
+    #[test]
     fn local_output_plan_prepares_loopback_tproxy_before_output_activation() {
         let config = test_config();
         for family in [AddressFamily::Ipv4, AddressFamily::Ipv6] {
@@ -3273,12 +3713,96 @@ mod tests {
     }
 
     #[test]
-    fn route_parser_requires_one_object() {
-        let route = first_json_object(br#"[{"type":"local","dev":"lo","table":28001}]"#, "route")
-            .expect("one route");
-        assert_eq!(route.get("dev").and_then(Value::as_str), Some("lo"));
-        assert!(first_json_object(b"[]", "route").is_err());
+    fn kernel_config_proof_accepts_only_built_in_options() {
+        let config = b"CONFIG_VETH=y\nCONFIG_NETFILTER=m\n# CONFIG_UNUSED is not set\n";
+        assert!(kernel_config_has_builtin(config, "CONFIG_VETH"));
+        assert!(!kernel_config_has_builtin(config, "CONFIG_NETFILTER"));
+        assert!(!kernel_config_has_builtin(config, "CONFIG_UNUSED"));
+
+        let inventory = ModuleInventory {
+            module_presence: BTreeMap::new(),
+            registrations: BTreeMap::new(),
+            kernel_config: Some(b"CONFIG_IP_NF_MANGLE=y\n".to_vec()),
+        };
+        assert!(inventory.expected_table_initialization(
+            Path::new("/proc/net/ip_tables_names"),
+            Some(b""),
+            Some(b"mangle\n"),
+        ));
+        assert!(!inventory.expected_table_initialization(
+            Path::new("/proc/net/ip_tables_names"),
+            Some(b""),
+            Some(b"filter\nmangle\n"),
+        ));
+    }
+
+    #[test]
+    fn masked_role_merge_preserves_android_owned_mark_bits() {
+        let android_mark = 0x000c_0065;
+        let merged = merge_mark_role(android_mark, BYPASS_MARK);
+        assert_eq!(mark_role(merged), BYPASS_MARK);
+        assert_eq!(mark_outside_role(merged), android_mark);
+        assert_eq!(merged, 0x004c_0065);
+    }
+
+    #[test]
+    fn android_rule_builder_omits_unsupported_rule_protocol_attribute() {
+        assert_eq!(rule_protocol_arguments_for(false), &[] as &[&str]);
+        assert_eq!(rule_protocol_arguments_for(true), &["protocol", "99"]);
+    }
+
+    #[test]
+    fn route_parser_accepts_modern_json_and_legacy_text() {
+        let json = parse_route_lookup(br#"[{"type":"local","dev":"lo","table":28001}]"#, "route")
+            .expect("JSON route");
+        let text = parse_route_lookup(
+            b"local 198.51.100.1 dev lo table 28001 src 192.0.2.1 uid 0\n",
+            "route",
+        )
+        .expect("text route");
+        assert_eq!(json, text);
+        assert!(parse_route_lookup(b"", "route").is_err());
         assert!(first_json_object(b"[{},{}]", "route").is_err());
+    }
+
+    #[test]
+    fn android_inactive_loopback_qdisc_normalization_is_exact() {
+        let canonicalized = |qdisc: Option<&str>, active: bool| {
+            let mut object = serde_json::Map::from_iter([
+                ("ifname".to_owned(), Value::String("lo".to_owned())),
+                (
+                    "flags".to_owned(),
+                    Value::Array(if active {
+                        vec![Value::String("UP".to_owned())]
+                    } else {
+                        Vec::new()
+                    }),
+                ),
+            ]);
+            if let Some(qdisc) = qdisc {
+                object.insert("qdisc".to_owned(), Value::String(qdisc.to_owned()));
+            }
+            canonicalize_android_inactive_loopback_qdisc(&mut object);
+            object
+                .get("qdisc")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        };
+
+        assert_eq!(
+            canonicalized(Some("noop"), false).as_deref(),
+            Some("inactive")
+        );
+        assert_eq!(
+            canonicalized(Some("noqueue"), false).as_deref(),
+            Some("inactive")
+        );
+        assert_eq!(
+            canonicalized(Some("netem"), false).as_deref(),
+            Some("netem")
+        );
+        assert_eq!(canonicalized(None, false), None);
+        assert_eq!(canonicalized(Some("noop"), true).as_deref(), Some("noop"));
     }
 
     #[test]
@@ -3295,8 +3819,9 @@ mod tests {
             )
             .is_err()
         );
-        let overlapping: Value =
-            serde_json::from_str(r#"{"fwmark":"0x1/0xf"}"#).expect("test rule");
+        let overlapping = serde_json::json!({
+            "fwmark": format!("{PROXY_MARK:#x}/{PROXY_MASK:#x}")
+        });
         let disjoint: Value =
             serde_json::from_str(r#"{"fwmark":128,"fwmask":128}"#).expect("test rule");
         let (_, overlap_mask) = rpdb_fwmark_selector(&overlapping)
@@ -3307,5 +3832,15 @@ mod tests {
             .expect("fwmark selector");
         assert_ne!(overlap_mask & PROXY_MASK, 0);
         assert_eq!(disjoint_mask & PROXY_MASK, 0);
+
+        let legacy = parse_rpdb_baseline(
+            b"14991:\tfrom all fwmark 0x200000/0x600000 lookup 29991\n",
+            "legacy RPDB",
+        )
+        .expect("legacy text RPDB");
+        assert_eq!(legacy.len(), 1);
+        assert_eq!(legacy[0].priority, Some(14_991));
+        assert_eq!(legacy[0].table, Some(29_991));
+        assert_eq!(legacy[0].fwmark, Some((PROXY_MARK, PROXY_MASK)));
     }
 }

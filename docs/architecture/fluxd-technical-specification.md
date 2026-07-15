@@ -1,7 +1,7 @@
 # Fluxd Technical Specification
 
 - Status: accepted living specification
-- Last updated: 2026-07-15
+- Last updated: 2026-07-16
 - Companion document: [Fluxd Rewrite Blueprint](fluxd-blueprint.md)
 
 This specification describes both the target architecture and temporary development checkpoints.
@@ -17,6 +17,7 @@ contains no legacy runtime networking component or compatibility wrapper.
 | Kernel | `>= 5.10`; older versions settle the daemon into read-only `UnsupportedKernel` before mutation |
 | Primary architecture | `aarch64-linux-android` |
 | Secondary CI architecture | `x86_64-unknown-linux-gnu` for host/integration tests |
+| Development Android test architecture | `x86_64-linux-android`; checkpoint-only, never packaged or release-qualified |
 | Rust | Edition 2024, pinned stable toolchain |
 | Android linking | NDK-built PIE using bionic; no assumption of glibc or a fully static libc |
 | Privilege | root at startup; capability minimization is conditional on device policy |
@@ -1213,7 +1214,7 @@ Delivered Phase 1 supervision additionally requires:
 - a direct-child `PR_SET_PDEATHSIG(SIGKILL)` lease with a post-arm parent-identity race check for Sing-Box and phase-shell processes;
 - bounded TERM/KILL/reap, restart windows, exponential backoff, and retained ownership until disappearance is observed.
 
-The Phase 1 transaction rejects TUN during `prepare`, before engine admission or networking mutation. It also requires `xt_owner` before initialization and revalidates it from the generated capability cache; the Rust-rendered legacy compatibility program sends every local OUTPUT policy through the application chain so the configured engine UID/GID bypass remains active even when application filtering is disabled. `ROUTING_MARK` is not accepted as equivalent authority because the bridge does not prove that the supervised engine applies it to its sockets. For admitted TPROXY state, start is `prepare` → engine admission → Generation-bound capture start → structural capture verification → configured functional gate → Generation-bound `RUNNING`, and stop is capture detach → engine stop/reap → `STOPPED`. The current pre-release bridge explicitly selects structural-only compatibility; required-mode tests execute the delivered Stage-1 exact-binding canary transaction, and the first Stage-2 Linux checkpoint now exercises the isolated dual-stack topology and cleanup without installing capture. Partial capture-start compensation retains Generation evidence until both networking writers prove cleanup; terminal publication and engine retirement are forbidden while detachment is uncertain. Reload prepares the candidate while the previous Generation remains active, preserves its pass on prepare-only failure, invalidates it before detachment, blocks replacement if detach fails, and attempts the previous immutable `EngineSpec` if candidate activation fails. An uncertain reload detach enters capture repair: prove full detachment, retain/reconcile the old engine, then republish and freshly verify that Generation. Publication failure, identity loss, repair/restoration, and address resynchronization require a fresh complete gate before retrying `RUNNING`. Candidate evidence never authorizes rollback publication. The current owner bypass is a compatibility loop-escape prerequisite; the socket-correlation collector, its prebound session and typed attempt-owned handoff transports, schema-v2 listener/delivery validator, temporal cleanup/retirement validator, fail-closed TPROXY-only local-OUTPUT executor seam, per-flow capture receipt, and process-ownership receipt contracts are delivered. The Linux/Android child-origin pidfd substrate and no-traffic live credential preflight are also delivered. Both production receipt authorities remain uninhabited; the positive traffic producer, real `EngineSupervisor`/`SingBoxChild` and prepared-driver child integration, production listener/report parser and factories, actual collector integration, and Android device qualification remain open.
+The Phase 1 transaction rejects TUN during `prepare`, before engine admission or networking mutation. It also requires `xt_owner` before initialization and revalidates it from the generated capability cache; the Rust-rendered legacy compatibility program sends every local OUTPUT policy through the application chain so the configured engine UID/GID bypass remains active even when application filtering is disabled. `ROUTING_MARK` is not accepted as equivalent authority because the bridge does not prove that the supervised engine applies it to its sockets. For admitted TPROXY state, start is `prepare` → engine admission → Generation-bound capture start → structural capture verification → configured functional gate → Generation-bound `RUNNING`, and stop is capture detach → engine stop/reap → `STOPPED`. The current pre-release bridge explicitly selects structural-only compatibility; required-mode tests execute the delivered Stage-1 exact-binding canary transaction, and the first Stage-2 Linux checkpoint now exercises the isolated dual-stack topology and cleanup without installing capture. Partial capture-start compensation retains Generation evidence until both networking writers prove cleanup; terminal publication and engine retirement are forbidden while detachment is uncertain. Reload prepares the candidate while the previous Generation remains active, preserves its pass on prepare-only failure, invalidates it before detachment, blocks replacement if detach fails, and attempts the previous immutable `EngineSpec` if candidate activation fails. An uncertain reload detach enters capture repair: prove full detachment, retain/reconcile the old engine, then republish and freshly verify that Generation. Publication failure, identity loss, repair/restoration, and address resynchronization require a fresh complete gate before retrying `RUNNING`. Candidate evidence never authorizes rollback publication. The current owner bypass is a compatibility loop-escape prerequisite; the socket-correlation collector, its prebound session and typed attempt-owned handoff transports, schema-v2 listener/delivery validator, temporal cleanup/retirement validator, fail-closed TPROXY-only local-OUTPUT executor seam, per-flow capture receipt, and process-ownership receipt contracts are delivered. The Linux/Android child-origin pidfd substrate and no-traffic live credential preflight are also delivered. Both production receipt authorities remain uninhabited; the production traffic producer, real `EngineSupervisor`/`SingBoxChild` and prepared-driver child integration, production listener/report parser and factories, actual collector integration, and reviewed Android release-device qualification remain open. The rooted x86_64 WSA mechanism checkpoint is development-only and does not inhabit any of those authorities.
 
 The delivered Linux evidence class is explicitly ingress-only. The command
 `cargo xtask test-functional-canary-linux-tproxy` selects the exact ignored test
@@ -1250,7 +1251,26 @@ The disposable host checkpoint proves IPv4/IPv6 TCP accept and UDP original-dest
 positive hook/delivery counters, bypass-mark replies, safe misses, zero peer leakage, no implicit
 module autoload, and baseline restoration. It is mechanism-only evidence in one test process and
 namespace; it does not combine the distinct-UID checkpoint, mint Generation/canary authority,
-consume a production Proxy Engine report, or qualify Android.
+consume a production Proxy Engine report, or qualify a production Android profile.
+
+`cargo xtask test-functional-canary-android-x86_64-output-tproxy --serial SERIAL [--adb PROGRAM]`
+cross-builds that exact ignored test with the pinned NDK and runs it under UID 0 on one explicit
+x86_64 Android serial. The runner validates ADB readiness, ABI, kernel architecture, SDK floor, and
+UID 0; records the kernel release, build fingerprint, and boot identity; revalidates the same device
+after the cross-build; derives exactly one test ELF from Cargo JSON; uses a root-owned private
+`/data/local/tmp` directory and `TMPDIR`; sanitizes `PATH`; clears re-entry state; forces required
+mode; lists the exact test; applies bounded host and device deadlines; and removes plus independently
+proves absence of the remote directory. It is excluded from ordinary CI, staging, manifests,
+packaging, and release outputs.
+
+The 2026-07-15 WSA Android 13 / SDK 33 run passed the complete dual-stack transaction. Its Android
+authority path binds UID 0 to the exact live parent and changed mount/network namespaces; the test
+uses a disposable `0x00600000` role field and masked merge to preserve Android-owned socket-mark
+bits. Bounded adapters handle WSA's built-in/no-`/sys/module` proof, legacy route/rule text,
+unsupported rule-protocol syntax, synchronous `EPERM` negative drops, and inactive fresh-loopback
+qdisc normalization. This is profile-specific mechanism and cleanup evidence, not production
+Generation/driver/report/receipt authority, Android 5.10/ARM64, distinct UID, VPN/netd coexistence,
+crash recovery, or release qualification.
 
 The strict Linux/Android `/proc` FD plus INET_DIAG collector is now delivered. One caller-supplied
 exclusive deadline bounds identical pre/post socket-FD inventories plus complete IPv4/IPv6 TCP and
@@ -1587,6 +1607,7 @@ The current bridge implements a deliberately split boundary:
 cargo xtask build-android
 cargo xtask stage-module --stage <dir> --runtime-binaries <dir>
 cargo xtask verify-package --stage <dir>
+cargo xtask test-functional-canary-android-x86_64-output-tproxy --serial <serial> [--adb <program>]
 ```
 
 `stage-module` creates a development tree and does not claim release compliance. The current
@@ -1603,6 +1624,11 @@ revision plus operational-payload digest, Android build fingerprint, kernel 5.10
 verified-boot state, enforcing SELinux, capture time, and the exact required passed test-ID set.
 That set is `module_boot`, `status`, `enable_disable`, `restart`, `abnormal_sing_box_exit`,
 `dual_stack_tcp_udp_dns`, and `cleanup`.
+
+The x86_64 Android checkpoint command is a separate non-shipping test lane. It produces only a
+debug library-test ELF below Cargo `target/`, pushes it to a disposable device directory, and
+removes it after the exact test. It never enters `stage-module`, `verify-package`, release build
+metadata, required device-test attestations, or the AArch64 package inventory.
 SPDX-2.3 package/`documentDescribes` inventories, IDs, and single SHA-256 records must exactly match
 the manifest. Pinned Rust/NDK/target build metadata and complete recursive package checksums are
 also required. Symbolic links, special files, unsafe paths, hidden or ordinary `.ko`/`.kpm` names,
@@ -1640,6 +1666,7 @@ cannot be classified by the current extension checks. Production `fluxd` does no
 | Shadow compiler | Rust emits deterministic observation-only Capture Programs; no shadow artifact enters a Generation or activation path | No |
 | Rust generation bridge | Rust prepares and attests legacy-shaped restore caches; `scripts/tproxy` remains the restore executor/writer | No |
 | Canonical forwarded-ingress lowering | Rust lowers extension-free schema-v1 forwarded policy into generation-namespaced but unattached prepare/retire chains; local OUTPUT and five extensions are rejected, and nothing executes | No |
+| x86_64 Android mechanism checkpoint | The exact ignored local-OUTPUT TPROXY transaction passes on one rooted WSA development profile with remote cleanup; production lowering, receipts, driver, and release matrix remain open | No |
 | Native xtables cutover | Rust owns canonical lowering, restore, exact readback, rollback, and the transition lease; replaced shell rule/restore duties are deleted after qualification | No, until all intended runtime duties are Rust-owned |
 | PBR/address-sync cutover | Rust owns routing and address-derived rules; standalone `addrsyncd` and shell route writers are removed | No |
 | Remaining runtime cutover | Rust owns configuration, subscription, diagnostics, recovery, and offline cleanup; legacy runtime scripts, `jq`/AWK/curl adapters, and wrappers are removed | No |
@@ -1657,11 +1684,11 @@ Capture Path satisfies the advertised scope and no legacy runtime dependency rem
 
 Open Phase 1 hardening gates are the production schema-v2 evidence producer, concrete local-OUTPUT
 capture/process receipt authorities and executor, actual prebound INET_DIAG collector integration,
-and Android adapter/
-qualification for the functional traffic/loop-prevention transaction. The exact Linux distinct-
-credential preflight, schema-v2 validator, strict `/proc` FD plus INET_DIAG collector prerequisite,
-per-flow capture-receipt/verifier contract, process-ownership receipt model, and child-origin pidfd
-substrate are complete. The preflight
+and production Android adapter qualification for the functional traffic/loop-prevention
+transaction. The development-only WSA mechanism lane is complete but does not reduce the
+5.10/ARM64 release matrix. The exact Linux distinct-credential preflight, schema-v2 validator,
+strict `/proc` FD plus INET_DIAG collector prerequisite, per-flow capture-receipt/verifier contract,
+process-ownership receipt model, and child-origin pidfd substrate are complete. The preflight
 explicitly skips or fails unavailable helpers/maps/group authority and rejects root/root or
 same-UID substitution, but it is not traffic qualification. Ingress evidence cannot discharge the
 local-OUTPUT gate, and REDIRECT/DNAT cannot qualify TPROXY. Also open are an exact-device TUN

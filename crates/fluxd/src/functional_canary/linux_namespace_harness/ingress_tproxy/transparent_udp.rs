@@ -252,6 +252,17 @@ pub(super) fn socket_mark(socket: &UdpSocket) -> Result<u32, String> {
     get_u32_option(socket.as_raw_fd(), libc::SOL_SOCKET, libc::SO_MARK)
 }
 
+pub(super) fn set_socket_mark(socket: &UdpSocket, mark: u32) -> Result<u32, String> {
+    set_u32_option(socket.as_raw_fd(), libc::SOL_SOCKET, libc::SO_MARK, mark)?;
+    let observed = socket_mark(socket)?;
+    if observed != mark {
+        return Err(format!(
+            "UDP socket read back SO_MARK={observed:#x}, expected {mark:#x}"
+        ));
+    }
+    Ok(observed)
+}
+
 fn connect_configured(
     source: SocketAddr,
     destination: SocketAddr,

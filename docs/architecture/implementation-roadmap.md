@@ -29,9 +29,10 @@ substrate, not a product or release lane. The extension-free schema-v1 forwarded
 Program lowering is now delivered as deterministic, generation-namespaced but unattached xtables
 prepare/retire artifacts. Local OUTPUT is rejected because MARK-only OUTPUT rules omit the RPDB
 local route, mark-qualified loopback PREROUTING TPROXY companion, listener, escape, and cleanup
-transaction. The immediate delivery lane is to qualify the ADR-0012 local-OUTPUT candidate and only
-the runtime-required adjunct semantics, then consume the admitted artifacts in stable hook
-activation, native restore/readback/rollback, and the xtables
+transaction. The ADR-0012 mechanism now passes the disposable Linux checkpoint and one
+development-only rooted x86_64 WSA profile. The immediate delivery lane is to represent that
+complete transaction plus only the runtime-required adjunct semantics in canonical lowering, then
+consume the admitted artifacts in stable hook activation, native restore/readback/rollback, and the xtables
 transition lease; after that, absorb PBR/address synchronization and the remaining runtime shell
 responsibilities. Other evidence work may proceed in parallel, but it must not displace that
 ownership/removal lane or create another open-ended non-authorizing checkpoint. Correctness gates
@@ -117,8 +118,9 @@ verifier can pass, and a verifier pass cannot override ADR-0011's runtime-comple
    receipt enters the immutable Generation before `engine.manifest`; rejection preserves the active
    Generation. Do not expand this temporary bridge into a release-qualification project. Reuse it
    for targeted cutover fault injection while moving next from the delivered unattached
-   forwarded-ingress lowering to qualification of the ADR-0012 local-OUTPUT candidate, runtime-
-   required adjuncts, native restore/readback/rollback, and real-device qualification of the
+   forwarded-ingress lowering to canonical representation and production integration of the
+   mechanism-qualified ADR-0012 local-OUTPUT candidate, runtime-required adjuncts, native
+   restore/readback/rollback, and reviewed real-device qualification of the
    Rust-owned path. There is no
    dual-writer interval and no public bridge release.
 4. **Native Phase 3 correctness evidence:** continue exact device/artifact identity, positive mark
@@ -199,7 +201,8 @@ credential/domain policy for both scans. Still deferred are final verifier compl
 prepared-driver client/peer child ownership, schema-v2 listener-observer/report parsing and
 factories, production context use of the delivered
 attempt-owned outbound-collector handoff, actual collector observations, capability-qualified
-engine/probe execution, a real traffic producer, and Android adapter/qualification. The validator
+engine/probe execution, a production traffic producer, and production Android
+adapter/qualification. The validator
 itself is complete and rejects weak,
 substituted, lossy,
 stale, or transport-incomplete delivery evidence. REDIRECT/DNAT, ingress promotion, counters,
@@ -447,17 +450,26 @@ intentionally absent from normal `cargo xtask ci`.
   eligibility is explicit; forwarded traffic receives TPROXY; interface tokens, command/byte expansion,
   generation-scoped names, prepare/retire artifacts, resource accounting, and artifact identities
   fail closed.
-- **Open semantic and lifecycle checkpoint:** a real local-OUTPUT TPROXY realization, established-flow
-  caching, transparent-socket DIVERT, FakeIP ICMP, QUIC rejection, MSS clamping, stable hook
-  attachment, native ownership, and proven cleanup invertibility. Local OUTPUT remains an explicit
-  lowering error until the mechanism proves listener delivery.
-- **Delivered mechanism-only host checkpoint:** ADR-0012 selects masked mangle/OUTPUT marking,
+- **Open production semantic and lifecycle checkpoint:** canonical local-OUTPUT TPROXY realization,
+  established-flow caching, transparent-socket DIVERT, FakeIP ICMP, QUIC rejection, MSS clamping,
+  stable hook attachment, native ownership, and production cleanup invertibility. Local OUTPUT
+  remains an explicit lowering error until the complete transaction enters the canonical compiler
+  and production qualification path.
+- **Delivered Linux and rooted-WSA mechanism checkpoints:** ADR-0012 selects masked mangle/OUTPUT
+  marking,
   output-route recomputation, an RPDB local route through loopback, and mark-qualified loopback
   PREROUTING TPROXY as the first conventional candidate. The ignored disposable-namespace test and
   xtask entry exercise dual-stack TCP/UDP original-destination delivery, response bypass, counters,
-  safe misses, no-autoload refusal, ordered activation/retirement, and exact baseline cleanup. It
-  remains outside canonical lowering and production authority and does not combine distinct UID,
-  Generation/receipt evidence, a production report producer, or Android qualification.
+  safe misses, no-autoload refusal, and ordered activation/retirement. Linux proves exact baseline
+  restoration; the rooted WSA lane proves exact owned-object retirement plus semantic baseline
+  restoration with only the admitted inactive-loopback `noop`/`noqueue` equivalence and the exact
+  addition of `mangle` to an otherwise preserved registration baseline caused by built-in per-
+  namespace table initialization; WSA's observed baseline was empty. The Android runner passes on
+  WSA Android 13 / SDK 33, preserves Android-owned mark bits, tolerates only bounded legacy-iproute2
+  differences, and proves remote cleanup before the disposable namespace is retired. Both lanes
+  remain outside canonical lowering and production authority and do not combine distinct UID,
+  Generation/receipt evidence, a production report producer, Android 5.10/ARM64, or release
+  qualification.
 - Following-stage direct child-process adapter for `iptables-restore`/`ip6tables-restore`, exact
   readback, rollback, and transition lease.
 - Coherent iptables-legacy versus iptables-nft detection and exact canaries; one Generation may use only one matched IPv4/IPv6 implementation family.
@@ -697,6 +709,9 @@ Scenarios:
 
 ### Android device matrix
 
+The rooted x86_64 WSA checkpoint is development mechanism evidence and does not count toward this
+minimum release set.
+
 Minimum release set:
 
 | Dimension | Required coverage |
@@ -757,10 +772,11 @@ Before a backend may be selected automatically, its documentation must include:
    release qualification. Stale receipts are rebuilt, not reused; preview and Generation builds
    remain serialized.
 2. **Complete the remaining canonical xtables runtime semantics around the delivered forwarded
-   lowerer.** Qualify the ADR-0012 local-OUTPUT candidate on the disposable Linux checkpoint and
-   reviewed Android profiles, then extend canonical lowering with its complete mark, route,
+   lowerer.** Use the now-passing disposable Linux and rooted-WSA ADR-0012 mechanism checkpoints to
+   extend canonical lowering with the complete mark, route,
    loopback TPROXY, listener, escape, activation, and cleanup transaction. MARK-only OUTPUT is
-   insufficient. Add typed established-flow cache, transparent-socket DIVERT, FakeIP ICMP, QUIC
+   insufficient. Qualify the production transaction separately on reviewed Android 5.10/ARM64
+   profiles. Add typed established-flow cache, transparent-socket DIVERT, FakeIP ICMP, QUIC
    reject, and MSS-clamp
    policy only where the supported runtime requires them, then close stable attachment and
    cleanup-invertibility contracts. The source-shape renderer remains an oracle and is not promoted

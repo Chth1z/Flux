@@ -72,6 +72,58 @@ Cgroup connect/sendmsg address rewriting does not meet the transparent-listener 
 changes the destination presented to the socket operation. An LKM can force additional paths on a
 custom kernel, but it is not a portable or recoverable Android fallback.
 
+## WSA x86_64 Android development checkpoint
+
+The selected conventional transaction has now passed the exact ignored Rust traffic checkpoint on
+one rooted WSA development profile through:
+
+```text
+cargo xtask test-functional-canary-android-x86_64-output-tproxy --serial 127.0.0.1:58526
+```
+
+Observed profile on 2026-07-15:
+
+- WSA 2407.40000.4.0, Android 13 / SDK 33, x86_64 kernel
+  `5.15.104-windows-subsystem-for-android-20230927+`;
+- Magisk 30.6 root in `u:r:magisk:s0`, with SELinux enforcing;
+- legacy IPv4/IPv6 iptables 1.8.7, TPROXY/MARK/socket matching, policy routing, network and mount
+  namespaces, veth, `/dev/tun`, and built-in eBPF syscall/cgroup/TC support;
+- no user-namespace procfs, BTF, nft TPROXY/socket configuration, `bpftool`, nft, or ipset userspace.
+
+The successful run proves IPv4/IPv6 TCP and UDP local OUTPUT classification, route recomputation,
+RPDB local routing through loopback, mark-qualified PREROUTING TPROXY, exact transparent listeners
+and original destinations, response bypass, positive/negative counters, safe misses, and owned
+state cleanup in disposable namespaces. The cross-test ELF uses Android's `/system/bin/linker64`
+and only `libdl.so` plus `libc.so`; the runner lists and executes one exact test under Magisk root,
+uses a private `TMPDIR` below `/data/local/tmp`, binds the fingerprint and boot ID across the
+build/execution/cleanup boundaries, bounds every host command, and proves the remote directory
+absent afterward.
+
+The run also exposed Android semantics that a host-only checkpoint could not:
+
+- Android changed a pre-connect `SO_MARK=0x00400000` to its network-selection mark `0x000c0065`.
+  The checkpoint now uses a test-only `0x00600000` field, re-merges proxy/bypass roles after
+  connect when necessary, and verifies that every bit outside that mask is preserved. This field
+  lies inside the modeled device-policy candidate envelope but has no production allocation
+  authority.
+- WSA's legacy `ip` accepts route protocol tags but not `ip rule ... protocol`, and its `-j` option
+  falls back to text for route/rule output. The Android test path therefore omits only the
+  unsupported rule attribute and parses bounded JSON-or-text evidence while retaining raw cleanup
+  baselines.
+- Built-in xtables/veth support is absent from `/sys/module`; exact `CONFIG_*=y` evidence and
+  already registered targets/matches prevent a behavioral probe from causing implicit autoload.
+  Verification admits only addition of `mangle` to an otherwise preserved registration baseline
+  when built-in per-namespace table initialization occurs; WSA's observed baseline was empty.
+- The intentional UDP egress drop may surface synchronously as `EPERM`, and activating a fresh
+  loopback device changes its inactive qdisc representation from `noop` to `noqueue`. The test
+  still requires the expected counters, flushes namespace-local loopback addresses, canonicalizes
+  only that inactive qdisc representation, and then retires the whole disposable namespace.
+
+This result is Android mechanism evidence, not release evidence. It does not cover the Android
+5.10/ARM64 floor, distinct probe/engine UIDs, a supervised Proxy Engine or Generation, authoritative
+listener/report receipts, live netd/VPN/CLAT/tethering coexistence, network transitions, or forced
+daemon/engine death.
+
 ## Comparison
 
 | Mechanism | Present in upstream 5.10 | Can preserve the on-packet destination | What it still needs | Decision |
@@ -385,30 +437,35 @@ For every candidate device, Flux must actively prove:
 10. cgroup ancestor programs/flags or TC qdisc/filter/link ownership and foreign ordering;
 11. bounded failure injection, observer loss handling, readback, and exact inverse cleanup.
 
-No Android device execution evidence was collected for this note.
+No physical Android 5.10/ARM64 release-device evidence was collected for this note. The rooted WSA
+execution above is development-only x86_64 mechanism evidence.
 
-## 8. Recommended implementation checkpoint
+## 8. Implemented development checkpoint and remaining qualification
 
-Before native writer activation, implement one disposable Linux namespace canary for the complete
-conventional path rather than another mark-only model:
+The disposable Rust namespace canary now implements the complete mechanism slice rather than
+another mark-only model:
 
-1. Create Generation-scoped IPv4 and IPv6 TCP listeners and unconnected UDP sockets with
+1. Create attempt-scoped IPv4 and IPv6 TCP listeners and unconnected UDP sockets with
    transparent mode and original-destination reception enabled.
-2. Create a distinct-UID local client and an independently observed proxy process.
-3. Install exact OUTPUT selectors in xtables mangle, using a test-only non-conflicting masked mark.
-4. Install exact RPDB rules and local default routes through loopback.
-5. Install separate loopback-reachable PRE_ROUTING TPROXY selectors; do not reuse tether-interface
+2. Install exact OUTPUT selectors in xtables mangle, using a test-only masked mark that preserves
+   Android-owned outside bits.
+3. Install exact RPDB rules and local default routes through loopback.
+4. Install separate loopback-reachable PRE_ROUTING TPROXY selectors; do not reuse tether-interface
    selectors.
-6. Record independent counters at OUTPUT, early loopback PREROUTING, TPROXY, listener delivery, and
+5. Record independent counters at OUTPUT, early loopback PREROUTING, TPROXY, listener delivery, and
    bypass/escape points.
-7. Prove TCP accepted local tuples and UDP original-destination control messages for both families,
+6. Prove TCP accepted local tuples and UDP original-destination control messages for both families,
    plus reply traffic and no peer-server leakage.
-8. Remove every object by exact identity and prove absence.
+7. Remove every owned object by exact identity, prove semantic baseline restoration, and retire the
+   disposable namespace.
 
-Only after that can the design decide whether the earlier negative harness result was caused by
-rule placement, route-chain behavior, interface selection, socket binding, or environment policy.
-The test result must remain Linux-harness evidence until repeated on reviewed Android device
-profiles.
+That slice passes on host-capable Linux and the rooted x86_64 WSA profile described above. It closes
+the mechanism question and confirms that the earlier negative observation was arrangement-specific.
+Still open before native writer activation are distinct probe/engine UIDs and owned child
+lifetimes, a real Generation and supervised Proxy Engine, production capture/process receipts and
+reports, live collector integration, exact mark/priority/table leases, reviewed Android 5.10/ARM64
+devices, netd/VPN/CLAT/tethering/network-transition coexistence, and failure injection at every
+transaction step. The WSA result must not be promoted into those authorities.
 
 If conventional TPROXY genuinely fails on a device while TC BPF is authorized, run a second,
 separate loopback-TC `bpf_sk_assign()` canary. Do not combine the two mechanisms in one proof.

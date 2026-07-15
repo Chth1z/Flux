@@ -1,7 +1,7 @@
 # Fluxd Rewrite Blueprint
 
 - Status: accepted, evolving architecture
-- Last updated: 2026-07-15
+- Last updated: 2026-07-16
 - Minimum supported kernel: Linux 5.10
 
 ## Executive decision
@@ -660,7 +660,7 @@ The rewritten rule compiler treats these as the mandatory safety portion of gene
 - Use a dedicated UID/GID when device policy permits, while retaining a root compatibility mode.
 - On unexpected exit, immediately begin fail-open repair unless the user explicitly selected fail-closed behavior.
 
-The delivered Phase 1 Supervisor separates and composes two proofs. Descriptor-pinned validation of the exact binary, configuration, and optional launcher plus child-owned listener/TUN evidence is the pre-capture admission proof. The runtime handoff then publishes capture and checks shell-owned structural evidence before invoking its explicit functional-canary gate. Required-mode coordinator paths run fresh pre/post engine reconciliation, exact environment binding, attempt execution, evidence validation, and cleanup checks before every initial, retry, restart-restoration, or rollback `RUNNING` publication. Capture-start records generation ownership before mutation and retains it when compensation cannot prove cleanup. Candidate evidence never authorizes rollback publication. The current pre-release bridge deliberately selects structural-only compatibility because the Android adapter and exact-process loop-escape proof remain unqualified; the required executor currently exists for tests and later privileged harnesses. Any activation/verification failure must prove detach before retiring the candidate, and reload attempts the recorded previous `EngineSpec`.
+The delivered Phase 1 Supervisor separates and composes two proofs. Descriptor-pinned validation of the exact binary, configuration, and optional launcher plus child-owned listener/TUN evidence is the pre-capture admission proof. The runtime handoff then publishes capture and checks shell-owned structural evidence before invoking its explicit functional-canary gate. Required-mode coordinator paths run fresh pre/post engine reconciliation, exact environment binding, attempt execution, evidence validation, and cleanup checks before every initial, retry, restart-restoration, or rollback `RUNNING` publication. Capture-start records generation ownership before mutation and retains it when compensation cannot prove cleanup. Candidate evidence never authorizes rollback publication. The current pre-release bridge deliberately selects structural-only compatibility because the production Android adapter and exact-process loop-escape proof remain unqualified; the required executor currently exists for tests, including the development-only rooted WSA harness, but has no production positive driver. Any activation/verification failure must prove detach before retiring the candidate, and reload attempts the recorded previous `EngineSpec`.
 
 The privileged Linux harness also separates evidence by traffic domain. Its first checkpoint
 proves the contained dual-stack TCP/UDP/DNS topology. The delivered command
@@ -681,9 +681,17 @@ mark-qualified `-i lo` PREROUTING TPROXY before OUTPUT activation, and OUTPUT de
 proof before listener/route teardown. The opt-in
 `cargo xtask test-functional-canary-linux-output-tproxy` checkpoint exercises dual-stack TCP/UDP
 delivery, original destination, counters, response bypass, safe misses, no-autoload refusal, and
-exact baseline cleanup in a disposable Linux namespace. It remains mechanism-only host evidence:
-the distinct-UID preflight, Generation authority, production reports/receipts, and Android
-qualification are separate gates. The strict Linux/Android `/proc` FD plus INET_DIAG
+exact baseline cleanup in a disposable Linux namespace. The same exact ignored test now has a
+development-only rooted x86_64 Android runner:
+`cargo xtask test-functional-canary-android-x86_64-output-tproxy --serial SERIAL [--adb PROGRAM]`.
+It cross-builds with the pinned NDK, forces required mode, selects one explicit rooted x86_64
+device, binds its fingerprint and boot ID across build/execution/cleanup, bounds every host command,
+runs from a private `/data/local/tmp` directory, and proves removal. The 2026-07-15 run passed on WSA
+Android 13 / SDK 33 with kernel 5.15.104, preserving Android-owned socket-mark bits through a
+test-only masked field while exercising the same dual-stack transaction. These are mechanism
+checkpoints only: the distinct-UID preflight, Generation authority, production reports/receipts,
+production Android adapter, Android 5.10/ARM64 matrix, netd/VPN coexistence, forced-death recovery,
+and release qualification remain separate gates. The strict Linux/Android `/proc` FD plus INET_DIAG
 collector now binds protocol, exact tuple, UID, mark, FD/inode/cookie, complete dumps, supervised
 process identity, and timing. Its prebound session API now exposes the real kernel netlink port ID
 before collection, preserves one owned FD with monotonic sequences across snapshots, consumes and
@@ -713,7 +721,7 @@ prepared/raw type is uninhabited, so no
 positive evidence can be emitted. Required mode treats that result as a failed gate and never
 reaches `RUNNING`. Attempt-owned UID/GID/PID/start-tick/handle binding, observer/report parsing and
 factories, actual prebound collector use, a real traffic producer, capability-qualified execution,
-and Android qualification remain separate gates. A separately qualified cgroup-BPF authority is
+and production Android qualification remain separate gates. A separately qualified cgroup-BPF authority is
 optional, and no production path loads or unloads a `.ko`.
 REDIRECT/DNAT, ingress promotion, counters, route lookups, and veth-bounce substitutions cannot
 qualify TPROXY. Host evidence still cannot authorize production `functional_passed`.

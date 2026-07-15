@@ -1,10 +1,10 @@
 # Generation-Scoped Functional Capture Canary
 
 - Status: supporting pre-release qualification contract; activation work deferred
-- Last updated: 2026-07-15
+- Last updated: 2026-07-16
 
 This document defines a supporting qualification contract for an executed Rust-owned Capture Path.
-The model and host evidence are retained, but further activation plumbing is deferred until a real
+The model and development mechanism evidence are retained, but further activation plumbing is deferred until a real
 backend can inhabit its receipt authorities. It is not the next delivery lane, and none of its
 bridge/shadow/model checkpoints is releasable. A final advertised Capture Path must eventually pass
 the applicable Android transaction before the Rust-only release gate can close.
@@ -43,11 +43,12 @@ writer until the native component cutover.
 Legacy source-shape renderer parity and the unattached extension-free schema-v1
 forwarded-ingress lowerer are complete. Local OUTPUT remains explicitly rejected because MARK-only
 OUTPUT omits the authorized RPDB local route, mark-qualified loopback PREROUTING TPROXY companion,
-exact transparent-listener delivery, loop escape, activation, and cleanup transaction. A valid local
-mechanism, established-flow caching, transparent-socket DIVERT, FakeIP ICMP, QUIC rejection, MSS
-clamping, native restore, live readback, rollback, and component ownership transfer remain later
-gates. The shadow/lowering lane also adds no eBPF attach/pin path, TUN activation, implicit module
-request, or `.ko`/KPM loading that could provide an alternate evidence source.
+exact transparent-listener delivery, loop escape, activation, and cleanup transaction. The
+disposable Linux and rooted-WSA mechanism checkpoints are complete, but production realization,
+established-flow caching, transparent-socket DIVERT, FakeIP ICMP, QUIC rejection, MSS clamping,
+native restore, live readback, rollback, and component ownership transfer remain later gates. The
+shadow/lowering lane also adds no eBPF attach/pin path, TUN activation, implicit module request, or
+`.ko`/KPM loading that could provide an alternate evidence source.
 
 ### Ingress evidence is not local-OUTPUT evidence
 
@@ -75,9 +76,10 @@ local OUTPUT classifier last. Retirement detaches and proves absence of OUTPUT f
 the listener and removes PREROUTING, routes, rules, and private objects by exact inverse identity.
 The checkpoint must prove dual-stack TCP accept and UDP original-destination delivery, positive
 boundary counters, bypass-mark response escape, safe misses, no peer leakage, no implicit module
-autoload, and exact baseline restoration.
+autoload, exact owned-state removal, and baseline restoration with only explicitly admitted
+namespace-local equivalence.
 
-The opt-in mechanism-only host checkpoint is:
+The first opt-in mechanism-only host checkpoint is:
 
 ```text
 cargo xtask test-functional-canary-linux-output-tproxy
@@ -89,6 +91,30 @@ It selects
 This test does not combine the separate distinct-UID preflight, bind a Generation or production
 receipt authority, consume a supervised Proxy Engine report, or qualify an Android profile. A host
 pass therefore remains supporting mechanism evidence and cannot publish `functional_passed`.
+
+The same exact ignored test also has a non-shipping rooted x86_64 Android runner:
+
+```text
+ANDROID_NDK_HOME=/path/to/android-ndk-r27d \
+  cargo xtask test-functional-canary-android-x86_64-output-tproxy \
+  --serial SERIAL [--adb PROGRAM]
+```
+
+The runner requires one explicit ADB serial, x86_64/SDK-31-or-later Android, UID 0, the pinned NDK,
+and the installed Rust target. It cross-builds from Cargo JSON, binds the exact build fingerprint and
+boot ID before remote mutation and around cleanup, bounds every host command with kill/reap handling,
+forces required mode, sanitizes the Android helper path, uses a private `/data/local/tmp` `TMPDIR`,
+lists and runs only the exact test, and proves remote cleanup. On 2026-07-15 it passed on WSA Android
+13 / SDK 33 with Magisk root, SELinux enforcing, legacy iptables 1.8.7, and kernel
+`5.15.104-windows-subsystem-for-android-20230927+`.
+
+That pass adds Android mechanism evidence for the selected transaction. It proves real-root
+mount/network isolation, dual-stack TCP/UDP listener delivery, Android-owned socket-mark-bit
+preservation through a test-only masked field, legacy iproute2 compatibility, no-autoload built-in
+evidence, negative controls, and cleanup. It still does not combine distinct UIDs, a Generation,
+production capture/process receipts, a supervised Proxy Engine report, Android 5.10/ARM64,
+netd/VPN/network-transition coexistence, forced-death recovery, or release qualification, so it
+cannot publish production `functional_passed`.
 
 REDIRECT and DNAT are not substitutes for that proof. They can deliver a rewritten local flow to
 a conventional listener, but that does not exercise the selected TPROXY backend, its transparent
@@ -548,6 +574,13 @@ functional pass.
    responses, parsed DNS transaction/question/answer evidence, per-family route controls,
    independent bounded flow counters, and exact cleanup. The empirical OUTPUT boundary above
    remains part of its acceptance contract.
+
+   **Complete development-only local-OUTPUT mechanism lane:** the exact ignored ADR-0012
+   checkpoint passes in the disposable Linux harness and through the rooted x86_64 Android runner
+   on WSA Android 13 / SDK 33. It proves the two-hook dual-stack TCP/UDP mechanism, masked Android
+   mark preservation, original destinations, bypass, negative controls, and cleanup. The production
+   Android adapter, distinct role credentials, Generation/receipt/report integration, reviewed
+   Android 5.10/ARM64 devices, coexistence matrix, and failure injection remain incomplete.
 4. **Complete prerequisite:** the strict Linux/Android `/proc` FD plus INET_DIAG collector and
    model correlation bind protocol, exact tuple, UID, mark, FD/inode/cookie identity, complete
    dumps, supervised-process identity, and timing. This is evidence plumbing, not a functional
@@ -723,12 +756,16 @@ mutation, preflight requires the xtables TPROXY, mark, comment, family TPROXY, a
 support to be visible as already active under `/sys/module`; otherwise it skips or fails rather
 than triggering implicit module autoload.
 
-Until the positive local-OUTPUT producer and real-device qualification are evidenced, Flux must
-describe Phase 1 capture verification as structural and the functional exit gate as incomplete.
-The delivered collector, host ingress tests, Linux namespaces, route lookups, or successful
-counters do not authorize production `functional_passed` and do not constitute Android evidence.
+Until the production local-OUTPUT producer and reviewed release-device qualification are evidenced,
+Flux must describe Phase 1 capture verification as structural and the functional exit gate as
+incomplete.
+The delivered collector, host ingress tests, Linux namespaces, route lookups, successful counters,
+or WSA mechanism pass do not authorize production `functional_passed`.
 
 ## Open Android qualification work
+
+The rooted WSA pass above closes only the first Android mechanism checkpoint. It is not the
+production endpoint or the minimum Android 5.10/ARM64 release profile.
 
 The production endpoint remains deliberately unresolved. Exact devices must establish whether
 SELinux and the installed root environment permit safe network-namespace, veth, host-route,

@@ -8,6 +8,7 @@ use std::process::{Command, ExitStatus};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+mod android_canary;
 mod xtables_oracle;
 
 const ANDROID_TARGET: &str = "aarch64-linux-android";
@@ -67,13 +68,15 @@ const LINUX_CANARY_TEST: &str = "functional_canary::linux_namespace_harness::pri
 const LINUX_TPROXY_CANARY_TEST: &str = "functional_canary::linux_namespace_harness::privileged_ingress_tproxy_checkpoint_exercises_real_capture_counters_and_cleanup";
 const LINUX_OUTPUT_TPROXY_CANARY_TEST: &str = "functional_canary::linux_namespace_harness::privileged_local_output_tproxy_checkpoint_exercises_loopback_reinjection_and_cleanup";
 const LINUX_OUTPUT_UID_PREFLIGHT_TEST: &str = "functional_canary::linux_namespace_harness::privileged_local_output_distinct_uid_capability_preflight";
-const LINUX_CANARY_INTERNAL_ENVS: [&str; 15] = [
+const LINUX_CANARY_INTERNAL_ENVS: [&str; 17] = [
     "FLUX_LINUX_CANARY_HARNESS_MODE",
     "FLUX_LINUX_CANARY_HARNESS_CONFIG",
     "FLUX_LINUX_CANARY_REENTRY_TOKEN",
     "FLUX_LINUX_CANARY_OUTER_NETNS",
     "FLUX_LINUX_CANARY_OUTER_USERNS",
     "FLUX_LINUX_CANARY_OUTER_MOUNTNS",
+    "FLUX_LINUX_CANARY_OUTER_PID",
+    "FLUX_LINUX_CANARY_REENTRY_AUTHORITY",
     "FLUX_LINUX_CANARY_EXPECTED_UID_MAP",
     "FLUX_LINUX_CANARY_EXPECTED_GID_MAP",
     "FLUX_LINUX_CANARY_MAPPING_MECHANISM",
@@ -152,6 +155,9 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
         "test-functional-canary-linux-output-preflight" => {
             require_no_arguments(&arguments)?;
             test_functional_canary_linux_output_preflight()
+        }
+        "test-functional-canary-android-x86_64-output-tproxy" => {
+            android_canary::run(android_canary::parse_options(&arguments)?)
         }
         "xtables-oracle" => {
             let mode = xtables_oracle::parse_options(&arguments)?;
@@ -504,7 +510,7 @@ fn build_android() -> Result<(), String> {
         })?;
 
     verify_ndk_revision(&ndk_root)?;
-    let linker = android_linker(&ndk_root)?;
+    let linker = android_linker(&ndk_root, ANDROID_TARGET, "aarch64-linux-android")?;
     let linker_env = linker.into_os_string();
     cargo(
         [
@@ -2099,7 +2105,7 @@ fn verify_ndk_revision(ndk_root: &Path) -> Result<(), String> {
     }
 }
 
-fn android_linker(ndk_root: &Path) -> Result<PathBuf, String> {
+fn android_linker(ndk_root: &Path, target: &str, clang_target: &str) -> Result<PathBuf, String> {
     let host = match env::consts::OS {
         "windows" => "windows-x86_64",
         "linux" => "linux-x86_64",
@@ -2110,7 +2116,7 @@ fn android_linker(ndk_root: &Path) -> Result<PathBuf, String> {
         .join("toolchains/llvm/prebuilt")
         .join(host)
         .join("bin");
-    let base = format!("aarch64-linux-android{ANDROID_API_LEVEL}-clang");
+    let base = format!("{clang_target}{ANDROID_API_LEVEL}-clang");
     let candidates = if env::consts::OS == "windows" {
         vec![
             bin.join(format!("{base}.cmd")),
@@ -2124,7 +2130,7 @@ fn android_linker(ndk_root: &Path) -> Result<PathBuf, String> {
         .find(|candidate| candidate.is_file())
         .ok_or_else(|| {
             format!(
-                "NDK linker for {ANDROID_TARGET} API {ANDROID_API_LEVEL} was not found under {}",
+                "NDK linker for {target} API {ANDROID_API_LEVEL} was not found under {}",
                 bin.display()
             )
         })
@@ -2203,6 +2209,7 @@ fn print_help() {
            test-functional-canary-linux-tproxy  Run the ingress-only Linux TPROXY checkpoint\n\
            test-functional-canary-linux-output-tproxy  Run the local-OUTPUT loopback TPROXY checkpoint\n\
            test-functional-canary-linux-output-preflight  Preflight distinct local-OUTPUT credentials (no traffic)\n\
+           test-functional-canary-android-x86_64-output-tproxy  Cross-build and run the exact checkpoint on one explicit rooted x86_64 Android serial\n\
            xtables-oracle Verify or explicitly update pinned shell-generated restore fixtures; requires --check or --update\n\
            stage-module   Build and stage a Magisk tree; requires --stage DIR --runtime-binaries DIR\n\
            verify-package Verify a populated release stage; requires --stage DIR\n\

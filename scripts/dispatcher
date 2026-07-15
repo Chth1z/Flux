@@ -507,6 +507,7 @@ _snapshot_generation_artifacts() {
         _copy_generation_artifact "${CACHE_RULES_V6_FILE}" "${generation_dir}/cache_rules_ipv6" "IPv6 rule cache" || return 1
         _copy_generation_artifact "${CACHE_CLEANUP_V6_FILE}" "${generation_dir}/cache_cleanup_ipv6" "IPv6 cleanup cache" || return 1
     fi
+    _copy_generation_artifact "${CACHE_RULES_MANIFEST_FILE}" "${generation_dir}/legacy-rules.manifest" "legacy rules artifact manifest" || return 1
     if [ -f "${CACHE_KERNEL_CAPS_FILE}" ] && [ ! -L "${CACHE_KERNEL_CAPS_FILE}" ]; then
         _copy_generation_artifact "${CACHE_KERNEL_CAPS_FILE}" "${generation_dir}/cache_kernel_caps" "kernel capability cache" || return 1
     fi
@@ -663,7 +664,11 @@ _state_prepare() {
         return 1
     }
 
-    rm -f "${EVENT_CACHE_OK}" 2>/dev/null || true
+    if ! rm -f "${EVENT_CACHE_OK}" 2>/dev/null; then
+        log_error "Cannot invalidate the shared cache before Generation preparation"
+        _discard_incomplete_generation "${generation_dir}" || true
+        return 1
+    fi
 
     if ! load_config; then
         _discard_incomplete_generation "${generation_dir}" || true
@@ -677,7 +682,10 @@ _state_prepare() {
         _discard_incomplete_generation "${generation_dir}" || true
         return 1
     fi
-    if ! FLUXD_ENGINE_OWNER=rust sh "${INIT_SCRIPT}" init; then
+    if ! FLUX_CACHE_BUILD_SERIALIZED=1 \
+        FLUXD_ENGINE_OWNER=rust \
+        FLUX_GENERATION_ID="${generation}" \
+        sh "${INIT_SCRIPT}" init; then
         log_error "Init failed"
         _discard_incomplete_generation "${generation_dir}" || true
         return 1
@@ -707,6 +715,10 @@ _state_prepare() {
         return 1
     fi
     return 0
+}
+
+_state_cache_preview() {
+    FLUX_CACHE_BUILD_SERIALIZED=1 FLUXD_ENGINE_OWNER=rust sh "${INIT_SCRIPT}" cache
 }
 
 _capture_start_compensate() {
@@ -1048,7 +1060,7 @@ _state_start() {
         return 1
     fi
 
-    if ! sh "${INIT_SCRIPT}" init; then
+    if ! FLUX_CACHE_BUILD_SERIALIZED=1 sh "${INIT_SCRIPT}" init; then
         log_error "Init failed"
         _state_fail
         return 1
@@ -1085,6 +1097,7 @@ _backup_legacy_preparation_cache() {
         "${CACHE_RULES_V6_FILE}" \
         "${CACHE_CLEANUP_V4_FILE}" \
         "${CACHE_CLEANUP_V6_FILE}" \
+        "${CACHE_RULES_MANIFEST_FILE}" \
         "${CACHE_KERNEL_CAPS_FILE}" \
         "${EVENT_CACHE_OK}"; do
         if [ -e "${source}" ] || [ -L "${source}" ]; then
@@ -1114,6 +1127,7 @@ _restore_legacy_preparation_cache() {
         "${CACHE_RULES_V6_FILE}" \
         "${CACHE_CLEANUP_V4_FILE}" \
         "${CACHE_CLEANUP_V6_FILE}" \
+        "${CACHE_RULES_MANIFEST_FILE}" \
         "${CACHE_KERNEL_CAPS_FILE}" \
         "${EVENT_CACHE_OK}"; do
         backup="${backup_dir}/${target##*/}"
@@ -1157,7 +1171,7 @@ _state_restart() {
         rm -rf "${cache_backup}" 2>/dev/null || true
         return 1
     fi
-    if ! FLUXD_ENGINE_OWNER=legacy sh "${INIT_SCRIPT}" init; then
+    if ! FLUX_CACHE_BUILD_SERIALIZED=1 FLUXD_ENGINE_OWNER=legacy sh "${INIT_SCRIPT}" init; then
         log_error "Replacement preparation failed; preserving the active legacy runtime"
         _restore_legacy_preparation_cache "${cache_backup}" || {
             log_error "Cannot restore the active legacy cache from ${cache_backup}"
@@ -1295,6 +1309,14 @@ main() {
             return 2
         }
         _with_dispatch_lock _state_prepare
+        return $?
+        ;;
+    cache-preview)
+        [ "$#" -eq 1 ] || {
+            log_error "cache-preview does not accept arguments"
+            return 2
+        }
+        _with_dispatch_lock _state_cache_preview
         return $?
         ;;
     capture-start)

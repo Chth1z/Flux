@@ -3,9 +3,11 @@ use std::fmt;
 use std::fmt::Write as _;
 use std::net::IpAddr;
 
+use sha2::{Digest, Sha256};
+
 use super::{
     XtablesRestoreAction, XtablesRestoreArtifact, XtablesRestoreContext, XtablesRestoreFamily,
-    XtablesRestoreParseError, parse_xtables_restore,
+    XtablesRestoreParseError, XtablesRestoreResourceUsage, parse_xtables_restore,
 };
 
 const BASE_CHAINS: &[&str] = &[
@@ -76,6 +78,99 @@ const MAX_EXCLUDED_INTERFACES: usize = 128;
 const DEFAULT_IPV4_PROXY_MARK: u32 = 0x14;
 const DEFAULT_IPV6_PROXY_MARK: u32 = 0x19;
 const DEFAULT_BYPASS_MARK: u32 = 0x11;
+
+/// Bump when any plan, pair, set, or resource-total digest encoding changes.
+pub const LEGACY_RULES_IDENTITY_SCHEMA_VERSION: u16 = 1;
+pub const LEGACY_RULES_DIGEST_BYTES: usize = 32;
+
+const LEGACY_RULES_PLAN_DIGEST_DOMAIN: &[u8] = b"Flux legacy rules plan identity\0schema-v1\0";
+const LEGACY_RULES_PAIR_DIGEST_DOMAIN: &[u8] =
+    b"Flux legacy rules artifact pair identity\0schema-v1\0";
+const LEGACY_RULES_SET_DIGEST_DOMAIN: &[u8] =
+    b"Flux legacy rules artifact set identity\0schema-v1\0";
+
+macro_rules! legacy_rules_digest {
+    ($name:ident) => {
+        #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+        #[repr(transparent)]
+        pub struct $name([u8; LEGACY_RULES_DIGEST_BYTES]);
+
+        impl $name {
+            #[must_use]
+            pub const fn as_bytes(&self) -> &[u8; LEGACY_RULES_DIGEST_BYTES] {
+                &self.0
+            }
+        }
+    };
+}
+
+legacy_rules_digest!(LegacyRulesPlanDigest);
+legacy_rules_digest!(LegacyRulesPairDigest);
+legacy_rules_digest!(LegacyRulesSetDigest);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LegacyRulesResourceTotals {
+    input_bytes: usize,
+    lines: usize,
+    transactions: usize,
+    chain_declarations: usize,
+    commands: usize,
+    tokens: usize,
+}
+
+impl LegacyRulesResourceTotals {
+    #[must_use]
+    pub const fn input_bytes(self) -> usize {
+        self.input_bytes
+    }
+
+    #[must_use]
+    pub const fn lines(self) -> usize {
+        self.lines
+    }
+
+    #[must_use]
+    pub const fn transactions(self) -> usize {
+        self.transactions
+    }
+
+    #[must_use]
+    pub const fn chain_declarations(self) -> usize {
+        self.chain_declarations
+    }
+
+    #[must_use]
+    pub const fn commands(self) -> usize {
+        self.commands
+    }
+
+    #[must_use]
+    pub const fn tokens(self) -> usize {
+        self.tokens
+    }
+
+    const fn from_restore(usage: XtablesRestoreResourceUsage) -> Self {
+        Self {
+            input_bytes: usage.input_bytes(),
+            lines: usage.lines(),
+            transactions: usage.transactions(),
+            chain_declarations: usage.chain_declarations(),
+            commands: usage.commands(),
+            tokens: usage.tokens(),
+        }
+    }
+
+    const fn add(self, other: Self) -> Self {
+        Self {
+            input_bytes: self.input_bytes + other.input_bytes,
+            lines: self.lines + other.lines,
+            transactions: self.transactions + other.transactions,
+            chain_declarations: self.chain_declarations + other.chain_declarations,
+            commands: self.commands + other.commands,
+            tokens: self.tokens + other.tokens,
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LegacyOwnerToken(Box<str>);
@@ -377,6 +472,155 @@ impl LegacyRulesPlan {
     pub const fn production_eligible(&self) -> bool {
         self.features.owner && self.features.tproxy
     }
+
+    /// Stable identity of every byte-significant source-shape input consumed by the renderer.
+    ///
+    /// The digest is observation-only. It carries no Generation identity, writer ownership, or
+    /// permission to execute the resulting restore artifacts.
+    #[must_use]
+    pub fn digest(&self) -> LegacyRulesPlanDigest {
+        let mut hasher = identity_hasher(LEGACY_RULES_PLAN_DIGEST_DOMAIN);
+        hash_u16(&mut hasher, self.proxy_port);
+        hash_u32(&mut hasher, self.mark_mask);
+        hash_u32(&mut hasher, self.marks.ipv4_proxy);
+        hash_u32(&mut hasher, self.marks.ipv6_proxy);
+        hash_u32(&mut hasher, self.marks.bypass);
+        hash_optional_u32(&mut hasher, self.routing_mark);
+        hash_text(&mut hasher, self.owner.uid.as_str());
+        hash_text(&mut hasher, self.owner.gid.as_str());
+        hash_u8(&mut hasher, application_mode_tag(self.applications.mode));
+        hash_len(&mut hasher, self.applications.ordered_uids.len());
+        for uid in &self.applications.ordered_uids {
+            hash_u32(&mut hasher, *uid);
+        }
+        hash_len(&mut hasher, self.interfaces.excluded.len());
+        for pattern in &self.interfaces.excluded {
+            hash_text(&mut hasher, pattern.as_str());
+        }
+        hash_len(&mut hasher, self.interfaces.roles.len());
+        for role in &self.interfaces.roles {
+            hash_optional_text(
+                &mut hasher,
+                role.pattern.as_ref().map(LegacyInterfacePattern::as_str),
+            );
+            hash_bool(&mut hasher, role.proxy);
+        }
+        for enabled in [
+            self.features.owner,
+            self.features.mark,
+            self.features.conntrack,
+            self.features.socket_tcp,
+            self.features.socket_udp,
+            self.features.ipv6_nat,
+            self.features.tproxy,
+            self.performance_mode,
+            self.mss_clamp,
+            self.ipv6_enabled,
+        ] {
+            hash_bool(&mut hasher, enabled);
+        }
+        hash_text(&mut hasher, &self.fake_ip_v4);
+        hash_text(&mut hasher, &self.fake_ip_v6);
+        LegacyRulesPlanDigest(hasher.finalize().into())
+    }
+}
+
+/// Renderer-owned apply/cleanup identity for one address family.
+///
+/// Construction is intentionally private to [`render_legacy_rules_pair`], so independently parsed
+/// artifacts cannot be relabeled as a renderer-produced pair.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LegacyRulesArtifactPair {
+    schema_version: u16,
+    family: XtablesRestoreFamily,
+    plan_digest: LegacyRulesPlanDigest,
+    apply: XtablesRestoreArtifact,
+    cleanup: XtablesRestoreArtifact,
+    resource_totals: LegacyRulesResourceTotals,
+    digest: LegacyRulesPairDigest,
+}
+
+impl LegacyRulesArtifactPair {
+    #[must_use]
+    pub const fn schema_version(&self) -> u16 {
+        self.schema_version
+    }
+
+    #[must_use]
+    pub const fn family(&self) -> XtablesRestoreFamily {
+        self.family
+    }
+
+    #[must_use]
+    pub const fn plan_digest(&self) -> LegacyRulesPlanDigest {
+        self.plan_digest
+    }
+
+    #[must_use]
+    pub const fn apply(&self) -> &XtablesRestoreArtifact {
+        &self.apply
+    }
+
+    #[must_use]
+    pub const fn cleanup(&self) -> &XtablesRestoreArtifact {
+        &self.cleanup
+    }
+
+    #[must_use]
+    pub const fn resource_totals(&self) -> LegacyRulesResourceTotals {
+        self.resource_totals
+    }
+
+    #[must_use]
+    pub const fn digest(&self) -> LegacyRulesPairDigest {
+        self.digest
+    }
+}
+
+/// Renderer-owned identity for the complete enabled legacy restore artifact set.
+///
+/// IPv4 is mandatory. IPv6 is present exactly when the immutable source plan enables it. This
+/// type is still non-authorizing and has no filesystem, process, or kernel execution surface.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LegacyRulesArtifactSet {
+    schema_version: u16,
+    plan_digest: LegacyRulesPlanDigest,
+    ipv4: LegacyRulesArtifactPair,
+    ipv6: Option<LegacyRulesArtifactPair>,
+    resource_totals: LegacyRulesResourceTotals,
+    digest: LegacyRulesSetDigest,
+}
+
+impl LegacyRulesArtifactSet {
+    #[must_use]
+    pub const fn schema_version(&self) -> u16 {
+        self.schema_version
+    }
+
+    #[must_use]
+    pub const fn plan_digest(&self) -> LegacyRulesPlanDigest {
+        self.plan_digest
+    }
+
+    #[must_use]
+    pub const fn ipv4(&self) -> &LegacyRulesArtifactPair {
+        &self.ipv4
+    }
+
+    #[must_use]
+    pub const fn ipv6(&self) -> Option<&LegacyRulesArtifactPair> {
+        self.ipv6.as_ref()
+    }
+
+    #[must_use]
+    pub const fn resource_totals(&self) -> LegacyRulesResourceTotals {
+        self.resource_totals
+    }
+
+    #[must_use]
+    pub const fn digest(&self) -> LegacyRulesSetDigest {
+        self.digest
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -480,6 +724,202 @@ pub fn render_legacy_rules_restore(
     render_plan(request.context, request.plan, &mut output);
     parse_xtables_restore(output.as_bytes(), request.context)
         .map_err(LegacyRulesRenderError::InvalidRenderedArtifact)
+}
+
+/// Render and bind the apply/cleanup artifacts for one family from one immutable plan.
+///
+/// The renderer-produced identity can only originate here; there is deliberately no constructor from
+/// arbitrary parsed artifacts.
+pub fn render_legacy_rules_pair(
+    plan: &LegacyRulesPlan,
+    family: XtablesRestoreFamily,
+) -> Result<LegacyRulesArtifactPair, LegacyRulesRenderError> {
+    let apply = render_legacy_rules_restore(LegacyRulesRenderRequest::new(
+        XtablesRestoreContext::new(XtablesRestoreAction::Apply, family),
+        plan,
+    ))?;
+    let cleanup = render_legacy_rules_restore(LegacyRulesRenderRequest::new(
+        XtablesRestoreContext::new(XtablesRestoreAction::Cleanup, family),
+        plan,
+    ))?;
+    let plan_digest = plan.digest();
+    let resource_totals = LegacyRulesResourceTotals::from_restore(apply.usage())
+        .add(LegacyRulesResourceTotals::from_restore(cleanup.usage()));
+    let digest = legacy_rules_pair_digest(plan_digest, family, &apply, &cleanup, resource_totals);
+    Ok(LegacyRulesArtifactPair {
+        schema_version: LEGACY_RULES_IDENTITY_SCHEMA_VERSION,
+        family,
+        plan_digest,
+        apply,
+        cleanup,
+        resource_totals,
+        digest,
+    })
+}
+
+/// Render and bind the complete enabled legacy artifact set from one immutable plan.
+pub fn render_legacy_rules_set(
+    plan: &LegacyRulesPlan,
+) -> Result<LegacyRulesArtifactSet, LegacyRulesRenderError> {
+    let plan_digest = plan.digest();
+    let ipv4 = render_legacy_rules_pair(plan, XtablesRestoreFamily::Ipv4)?;
+    let ipv6 = if plan.ipv6_enabled {
+        Some(render_legacy_rules_pair(plan, XtablesRestoreFamily::Ipv6)?)
+    } else {
+        None
+    };
+    let resource_totals = ipv6.as_ref().map_or_else(
+        || ipv4.resource_totals(),
+        |ipv6| ipv4.resource_totals().add(ipv6.resource_totals()),
+    );
+    let digest = legacy_rules_set_digest(plan_digest, &ipv4, ipv6.as_ref(), resource_totals);
+    Ok(LegacyRulesArtifactSet {
+        schema_version: LEGACY_RULES_IDENTITY_SCHEMA_VERSION,
+        plan_digest,
+        ipv4,
+        ipv6,
+        resource_totals,
+        digest,
+    })
+}
+
+fn legacy_rules_pair_digest(
+    plan_digest: LegacyRulesPlanDigest,
+    family: XtablesRestoreFamily,
+    apply: &XtablesRestoreArtifact,
+    cleanup: &XtablesRestoreArtifact,
+    resource_totals: LegacyRulesResourceTotals,
+) -> LegacyRulesPairDigest {
+    let mut hasher = identity_hasher(LEGACY_RULES_PAIR_DIGEST_DOMAIN);
+    hasher.update(plan_digest.as_bytes());
+    hash_u8(&mut hasher, family_tag(family));
+    hash_restore_artifact(&mut hasher, apply);
+    hash_restore_artifact(&mut hasher, cleanup);
+    hash_resource_totals(&mut hasher, resource_totals);
+    LegacyRulesPairDigest(hasher.finalize().into())
+}
+
+fn legacy_rules_set_digest(
+    plan_digest: LegacyRulesPlanDigest,
+    ipv4: &LegacyRulesArtifactPair,
+    ipv6: Option<&LegacyRulesArtifactPair>,
+    resource_totals: LegacyRulesResourceTotals,
+) -> LegacyRulesSetDigest {
+    let mut hasher = identity_hasher(LEGACY_RULES_SET_DIGEST_DOMAIN);
+    hasher.update(plan_digest.as_bytes());
+    hash_pair_receipt(&mut hasher, ipv4);
+    hash_bool(&mut hasher, ipv6.is_some());
+    if let Some(ipv6) = ipv6 {
+        hash_pair_receipt(&mut hasher, ipv6);
+    }
+    hash_resource_totals(&mut hasher, resource_totals);
+    LegacyRulesSetDigest(hasher.finalize().into())
+}
+
+fn identity_hasher(domain: &[u8]) -> Sha256 {
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    hash_u16(&mut hasher, LEGACY_RULES_IDENTITY_SCHEMA_VERSION);
+    hasher
+}
+
+fn hash_pair_receipt(hasher: &mut Sha256, pair: &LegacyRulesArtifactPair) {
+    hash_u16(hasher, pair.schema_version);
+    hash_u8(hasher, family_tag(pair.family));
+    hasher.update(pair.plan_digest.as_bytes());
+    hasher.update(pair.digest.as_bytes());
+    hash_resource_totals(hasher, pair.resource_totals);
+}
+
+fn hash_restore_artifact(hasher: &mut Sha256, artifact: &XtablesRestoreArtifact) {
+    hash_u16(hasher, artifact.schema_version());
+    hash_u8(hasher, action_tag(artifact.context().action()));
+    hash_u8(hasher, family_tag(artifact.context().family()));
+    hasher.update(artifact.digest().as_bytes());
+    hash_restore_usage(hasher, artifact.usage());
+}
+
+fn hash_restore_usage(hasher: &mut Sha256, usage: XtablesRestoreResourceUsage) {
+    hash_u64(hasher, usage.input_bytes() as u64);
+    hash_u64(hasher, usage.lines() as u64);
+    hash_u64(hasher, usage.transactions() as u64);
+    hash_u64(hasher, usage.chain_declarations() as u64);
+    hash_u64(hasher, usage.commands() as u64);
+    hash_u64(hasher, usage.tokens() as u64);
+}
+
+fn hash_resource_totals(hasher: &mut Sha256, totals: LegacyRulesResourceTotals) {
+    hash_u64(hasher, totals.input_bytes as u64);
+    hash_u64(hasher, totals.lines as u64);
+    hash_u64(hasher, totals.transactions as u64);
+    hash_u64(hasher, totals.chain_declarations as u64);
+    hash_u64(hasher, totals.commands as u64);
+    hash_u64(hasher, totals.tokens as u64);
+}
+
+fn hash_optional_u32(hasher: &mut Sha256, value: Option<u32>) {
+    hash_bool(hasher, value.is_some());
+    if let Some(value) = value {
+        hash_u32(hasher, value);
+    }
+}
+
+fn hash_optional_text(hasher: &mut Sha256, value: Option<&str>) {
+    hash_bool(hasher, value.is_some());
+    if let Some(value) = value {
+        hash_text(hasher, value);
+    }
+}
+
+fn hash_text(hasher: &mut Sha256, value: &str) {
+    hash_len(hasher, value.len());
+    hasher.update(value.as_bytes());
+}
+
+fn hash_len(hasher: &mut Sha256, value: usize) {
+    hash_u64(hasher, value as u64);
+}
+
+fn hash_bool(hasher: &mut Sha256, value: bool) {
+    hash_u8(hasher, u8::from(value));
+}
+
+fn hash_u8(hasher: &mut Sha256, value: u8) {
+    hasher.update([value]);
+}
+
+fn hash_u16(hasher: &mut Sha256, value: u16) {
+    hasher.update(value.to_be_bytes());
+}
+
+fn hash_u32(hasher: &mut Sha256, value: u32) {
+    hasher.update(value.to_be_bytes());
+}
+
+fn hash_u64(hasher: &mut Sha256, value: u64) {
+    hasher.update(value.to_be_bytes());
+}
+
+const fn application_mode_tag(mode: LegacyApplicationMode) -> u8 {
+    match mode {
+        LegacyApplicationMode::All => 1,
+        LegacyApplicationMode::Denylist => 2,
+        LegacyApplicationMode::Allowlist => 3,
+    }
+}
+
+const fn action_tag(action: XtablesRestoreAction) -> u8 {
+    match action {
+        XtablesRestoreAction::Apply => 1,
+        XtablesRestoreAction::Cleanup => 2,
+    }
+}
+
+const fn family_tag(family: XtablesRestoreFamily) -> u8 {
+    match family {
+        XtablesRestoreFamily::Ipv4 => 4,
+        XtablesRestoreFamily::Ipv6 => 6,
+    }
 }
 
 fn render_plan(context: XtablesRestoreContext, plan: &LegacyRulesPlan, output: &mut String) {

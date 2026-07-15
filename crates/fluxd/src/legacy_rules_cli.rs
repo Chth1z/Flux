@@ -2,14 +2,19 @@ use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
 use flux_platform::{
     LegacyApplicationMode, LegacyApplicationPolicy, LegacyInterfacePattern, LegacyInterfacePolicy,
     LegacyInterfaceRole, LegacyKernelFeatures, LegacyMarkValues, LegacyOwnerMatch,
-    LegacyOwnerToken, LegacyRulesPlan, LegacyRulesRenderRequest, MAX_LEGACY_APPLICATION_UIDS,
-    XtablesRestoreAction, XtablesRestoreContext, XtablesRestoreFamily, render_legacy_rules_restore,
+    LegacyOwnerToken, LegacyRulesArtifactSet, LegacyRulesPlan, LegacyRulesRenderRequest,
+    MAX_LEGACY_APPLICATION_UIDS, MAX_XTABLES_RESTORE_BYTES, XtablesRestoreAction,
+    XtablesRestoreContext, XtablesRestoreFamily, render_legacy_rules_restore,
+    render_legacy_rules_set,
 };
+
+use crate::legacy_rules_manifest::LegacyRulesSetManifest;
 
 const EXIT_SUCCESS: i32 = 0;
 const EXIT_RUNTIME_ERROR: i32 = 1;
@@ -17,12 +22,13 @@ const EXIT_USAGE: i32 = 2;
 const EXIT_UNSUPPORTED: i32 = 3;
 
 const MAX_ENV_VALUE_BYTES: usize = 64 * 1024;
-const MAX_PACKAGE_LIST_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_PACKAGE_LIST_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PACKAGE_LIST_LINES: usize = 200_000;
 const MAX_PACKAGE_LIST_LINE_BYTES: usize = 4096;
 const MAX_PACKAGE_NAME_BYTES: usize = 255;
 const ANDROID_UID_STRIDE: u32 = 100_000;
 const MAX_ANDROID_USER_ID: u16 = 999;
+const MAX_LEGACY_GENERATION: u32 = i32::MAX as u32;
 
 pub trait LegacyRulesEnvironment {
     fn value(&self, name: &'static str) -> Option<OsString>;
@@ -101,6 +107,42 @@ where
     }
 }
 
+pub fn run_legacy_rules_attestation_cli<I, T, O, E>(
+    args: I,
+    environment: &impl LegacyRulesEnvironment,
+    stdout: &mut O,
+    stderr: &mut E,
+) -> i32
+where
+    I: IntoIterator<Item = T>,
+    T: AsRef<str>,
+    O: Write,
+    E: Write,
+{
+    match attest_from_inputs(args, environment) {
+        Ok(bytes) => match stdout.write_all(&bytes) {
+            Ok(()) => EXIT_SUCCESS,
+            Err(error) => {
+                let _ = writeln!(stderr, "fluxd: cannot write legacy rules manifest: {error}");
+                EXIT_RUNTIME_ERROR
+            }
+        },
+        Err(LegacyRulesCliError::Usage(message)) => {
+            let _ = writeln!(stderr, "fluxd: {message}");
+            let _ = writeln!(stderr, "{}", attestation_usage());
+            EXIT_USAGE
+        }
+        Err(LegacyRulesCliError::Unsupported(message)) => {
+            let _ = writeln!(stderr, "fluxd: {message}");
+            EXIT_UNSUPPORTED
+        }
+        Err(LegacyRulesCliError::Input(message)) => {
+            let _ = writeln!(stderr, "fluxd: {message}");
+            EXIT_RUNTIME_ERROR
+        }
+    }
+}
+
 fn render_from_inputs<I, T>(
     args: I,
     environment: &impl LegacyRulesEnvironment,
@@ -134,12 +176,47 @@ where
     read_packages_list_bytes(&path.source)
 }
 
+fn attest_from_inputs<I, T>(
+    args: I,
+    environment: &impl LegacyRulesEnvironment,
+) -> Result<Box<[u8]>, LegacyRulesCliError>
+where
+    I: IntoIterator<Item = T>,
+    T: AsRef<str>,
+{
+    let request = AttestationRequest::parse(args)?;
+    let values = EnvironmentValues::read(environment)?;
+    values.require_supported_bridge()?;
+    request.require_family_shape(values.ipv6_enabled)?;
+    let ordered_uids =
+        values.resolve_application_uids(&request.packages_list, XtablesRestoreAction::Apply)?;
+    let plan = values.build_plan(ordered_uids)?;
+    if !plan.production_eligible() {
+        return Err(LegacyRulesCliError::Unsupported(
+            "legacy renderer requires active xt_owner and TPROXY support".to_owned(),
+        ));
+    }
+    let artifacts = render_legacy_rules_set(&plan)
+        .map_err(|error| LegacyRulesCliError::Input(error.to_string()))?;
+    request.require_exact_artifacts(&artifacts)?;
+    let manifest = LegacyRulesSetManifest::from_artifact_set(request.generation, &artifacts)
+        .map_err(|error| LegacyRulesCliError::Input(error.to_string()))?;
+    manifest
+        .verify(request.generation, &artifacts)
+        .map_err(|error| LegacyRulesCliError::Input(error.to_string()))?;
+    Ok(manifest.render_canonical())
+}
+
 const fn usage() -> &'static str {
     "Usage: fluxd render-legacy-rules --packages-list PATH --family 4|6 --action apply|cleanup"
 }
 
 const fn snapshot_usage() -> &'static str {
     "Usage: fluxd snapshot-legacy-packages --source PATH"
+}
+
+const fn attestation_usage() -> &'static str {
+    "Usage: fluxd attest-legacy-rules-set --generation ID --packages-list PATH --ipv4-apply PATH --ipv4-cleanup PATH [--ipv6-apply PATH --ipv6-cleanup PATH]"
 }
 
 struct SnapshotRequest {
@@ -196,6 +273,164 @@ impl SnapshotRequest {
             source: PathBuf::from(source.as_ref()),
         })
     }
+}
+
+struct AttestationRequest {
+    generation: NonZeroU32,
+    packages_list: PathBuf,
+    ipv4_apply: PathBuf,
+    ipv4_cleanup: PathBuf,
+    ipv6_apply: Option<PathBuf>,
+    ipv6_cleanup: Option<PathBuf>,
+}
+
+impl AttestationRequest {
+    fn parse<I, T>(args: I) -> Result<Self, LegacyRulesCliError>
+    where
+        I: IntoIterator<Item = T>,
+        T: AsRef<str>,
+    {
+        let mut args = args.into_iter();
+        let _program = args.next();
+        let Some(command) = args.next() else {
+            return Err(LegacyRulesCliError::Usage(
+                "attest-legacy-rules-set command is missing".to_owned(),
+            ));
+        };
+        if command.as_ref() != "attest-legacy-rules-set" {
+            return Err(LegacyRulesCliError::Usage(format!(
+                "expected attest-legacy-rules-set, found '{}'",
+                command.as_ref()
+            )));
+        }
+
+        let mut fields = HashMap::<&str, String>::new();
+        while let Some(flag) = args.next() {
+            let flag = match flag.as_ref() {
+                "--generation" => "--generation",
+                "--packages-list" => "--packages-list",
+                "--ipv4-apply" => "--ipv4-apply",
+                "--ipv4-cleanup" => "--ipv4-cleanup",
+                "--ipv6-apply" => "--ipv6-apply",
+                "--ipv6-cleanup" => "--ipv6-cleanup",
+                unknown => {
+                    return Err(LegacyRulesCliError::Usage(format!(
+                        "unknown attest-legacy-rules-set option '{unknown}'"
+                    )));
+                }
+            };
+            let Some(value) = args.next() else {
+                return Err(LegacyRulesCliError::Usage(format!(
+                    "{flag} requires a value"
+                )));
+            };
+            if fields.insert(flag, value.as_ref().to_owned()).is_some() {
+                return Err(LegacyRulesCliError::Usage(format!(
+                    "{flag} was specified more than once"
+                )));
+            }
+        }
+
+        let generation_text = required_flag(&fields, "--generation")?;
+        let generation = parse_cli_generation(generation_text)?;
+        let packages_list = required_path(&fields, "--packages-list")?;
+        let ipv4_apply = required_path(&fields, "--ipv4-apply")?;
+        let ipv4_cleanup = required_path(&fields, "--ipv4-cleanup")?;
+        let ipv6_apply = optional_path(&fields, "--ipv6-apply")?;
+        let ipv6_cleanup = optional_path(&fields, "--ipv6-cleanup")?;
+
+        Ok(Self {
+            generation,
+            packages_list,
+            ipv4_apply,
+            ipv4_cleanup,
+            ipv6_apply,
+            ipv6_cleanup,
+        })
+    }
+
+    fn require_family_shape(&self, ipv6_enabled: bool) -> Result<(), LegacyRulesCliError> {
+        match (
+            ipv6_enabled,
+            self.ipv6_apply.is_some(),
+            self.ipv6_cleanup.is_some(),
+        ) {
+            (true, true, true) | (false, false, false) => Ok(()),
+            (true, _, _) => Err(LegacyRulesCliError::Usage(
+                "PROXY_IPV6=1 requires both --ipv6-apply and --ipv6-cleanup".to_owned(),
+            )),
+            (false, _, _) => Err(LegacyRulesCliError::Usage(
+                "PROXY_IPV6=0 forbids --ipv6-apply and --ipv6-cleanup".to_owned(),
+            )),
+        }
+    }
+
+    fn require_exact_artifacts(
+        &self,
+        artifacts: &LegacyRulesArtifactSet,
+    ) -> Result<(), LegacyRulesCliError> {
+        require_exact_artifact(&self.ipv4_apply, "IPv4 apply", artifacts.ipv4().apply())?;
+        require_exact_artifact(
+            &self.ipv4_cleanup,
+            "IPv4 cleanup",
+            artifacts.ipv4().cleanup(),
+        )?;
+        match (
+            self.ipv6_apply.as_deref(),
+            self.ipv6_cleanup.as_deref(),
+            artifacts.ipv6(),
+        ) {
+            (Some(apply), Some(cleanup), Some(ipv6)) => {
+                require_exact_artifact(apply, "IPv6 apply", ipv6.apply())?;
+                require_exact_artifact(cleanup, "IPv6 cleanup", ipv6.cleanup())
+            }
+            (None, None, None) => Ok(()),
+            _ => Err(LegacyRulesCliError::Input(
+                "legacy rules artifact family shape does not match the prepared plan".to_owned(),
+            )),
+        }
+    }
+}
+
+fn parse_cli_generation(value: &str) -> Result<NonZeroU32, LegacyRulesCliError> {
+    value
+        .parse::<u32>()
+        .ok()
+        .filter(|generation| {
+            (1..=MAX_LEGACY_GENERATION).contains(generation)
+                && generation.to_string() == value
+                && value.bytes().all(|byte| byte.is_ascii_digit())
+        })
+        .and_then(NonZeroU32::new)
+        .ok_or_else(|| {
+            LegacyRulesCliError::Usage(
+                "--generation must be a canonical integer in 1..=2147483647".to_owned(),
+            )
+        })
+}
+
+fn required_path(
+    fields: &HashMap<&str, String>,
+    name: &'static str,
+) -> Result<PathBuf, LegacyRulesCliError> {
+    let value = required_flag(fields, name)?;
+    if value.is_empty() {
+        Err(LegacyRulesCliError::Usage(format!(
+            "{name} must not be empty"
+        )))
+    } else {
+        Ok(PathBuf::from(value))
+    }
+}
+
+fn optional_path(
+    fields: &HashMap<&str, String>,
+    name: &'static str,
+) -> Result<Option<PathBuf>, LegacyRulesCliError> {
+    fields
+        .get(name)
+        .map(|_| required_path(fields, name))
+        .transpose()
 }
 
 struct CliRequest {
@@ -714,39 +949,71 @@ fn read_packages_list(path: &Path) -> Result<String, LegacyRulesCliError> {
 }
 
 fn read_packages_list_bytes(path: &Path) -> Result<Box<[u8]>, LegacyRulesCliError> {
+    let bytes = read_bounded_stable_bytes(path, "packages list", MAX_PACKAGE_LIST_BYTES)?;
+    std::str::from_utf8(&bytes).map_err(|_| {
+        LegacyRulesCliError::Input(format!(
+            "packages list '{}' is not valid UTF-8",
+            path.display()
+        ))
+    })?;
+    Ok(bytes)
+}
+
+fn require_exact_artifact(
+    path: &Path,
+    label: &'static str,
+    expected: &flux_platform::XtablesRestoreArtifact,
+) -> Result<(), LegacyRulesCliError> {
+    let purpose = format!("{label} restore artifact");
+    let actual = read_bounded_stable_bytes(path, &purpose, MAX_XTABLES_RESTORE_BYTES)?;
+    if actual.as_ref() == expected.render_canonical().as_ref() {
+        Ok(())
+    } else {
+        Err(LegacyRulesCliError::Input(format!(
+            "{purpose} '{}' does not exactly match canonical Rust output",
+            path.display()
+        )))
+    }
+}
+
+fn read_bounded_stable_bytes(
+    path: &Path,
+    purpose: &str,
+    max_bytes: usize,
+) -> Result<Box<[u8]>, LegacyRulesCliError> {
     let before = fs::symlink_metadata(path).map_err(|error| {
         LegacyRulesCliError::Input(format!(
-            "cannot inspect packages list '{}': {error}",
+            "cannot inspect {purpose} '{}': {error}",
             path.display()
         ))
     })?;
     if before.file_type().is_symlink() || !before.is_file() {
         return Err(LegacyRulesCliError::Input(format!(
-            "packages list '{}' must be a regular non-symlink file",
+            "{purpose} '{}' must be a regular non-symlink file",
             path.display()
         )));
     }
-    if before.len() > MAX_PACKAGE_LIST_BYTES {
+    if before.len() > max_bytes as u64 {
         return Err(LegacyRulesCliError::Input(format!(
-            "packages list '{}' exceeds {MAX_PACKAGE_LIST_BYTES} bytes",
+            "{purpose} '{}' exceeds {max_bytes} bytes",
             path.display()
         )));
     }
-    let file = open_packages_list(path).map_err(|error| {
+    let file = open_bounded_input(path).map_err(|error| {
         LegacyRulesCliError::Input(format!(
-            "cannot open packages list '{}': {error}",
+            "cannot open {purpose} '{}': {error}",
             path.display()
         ))
     })?;
     let opened = file.metadata().map_err(|error| {
         LegacyRulesCliError::Input(format!(
-            "cannot inspect opened packages list '{}': {error}",
+            "cannot inspect opened {purpose} '{}': {error}",
             path.display()
         ))
     })?;
-    if !opened.is_file() || opened.len() > MAX_PACKAGE_LIST_BYTES {
+    if !opened.is_file() || opened.len() > max_bytes as u64 {
         return Err(LegacyRulesCliError::Input(format!(
-            "opened packages list '{}' is not an admitted regular file",
+            "opened {purpose} '{}' is not an admitted regular file",
             path.display()
         )));
     }
@@ -755,50 +1022,44 @@ fn read_packages_list_bytes(path: &Path) -> Result<Box<[u8]>, LegacyRulesCliErro
         use std::os::unix::fs::MetadataExt as _;
         if before.dev() != opened.dev() || before.ino() != opened.ino() {
             return Err(LegacyRulesCliError::Input(format!(
-                "packages list '{}' changed while it was opened",
+                "{purpose} '{}' changed while it was opened",
                 path.display()
             )));
         }
     }
     let mut bytes = Vec::with_capacity(opened.len() as usize);
     (&file)
-        .take(MAX_PACKAGE_LIST_BYTES + 1)
+        .take(max_bytes as u64 + 1)
         .read_to_end(&mut bytes)
         .map_err(|error| {
             LegacyRulesCliError::Input(format!(
-                "cannot read packages list '{}': {error}",
+                "cannot read {purpose} '{}': {error}",
                 path.display()
             ))
         })?;
-    if bytes.len() as u64 > MAX_PACKAGE_LIST_BYTES {
+    if bytes.len() > max_bytes {
         return Err(LegacyRulesCliError::Input(format!(
-            "packages list '{}' grew beyond {MAX_PACKAGE_LIST_BYTES} bytes",
+            "{purpose} '{}' grew beyond {max_bytes} bytes",
             path.display()
         )));
     }
     let after = file.metadata().map_err(|error| {
         LegacyRulesCliError::Input(format!(
-            "cannot re-inspect packages list '{}': {error}",
+            "cannot re-inspect {purpose} '{}': {error}",
             path.display()
         ))
     })?;
-    if !package_metadata_is_stable(&opened, &after) {
+    if !input_metadata_is_stable(&opened, &after) {
         return Err(LegacyRulesCliError::Input(format!(
-            "packages list '{}' changed while it was read",
+            "{purpose} '{}' changed while it was read",
             path.display()
         )));
     }
-    std::str::from_utf8(&bytes).map_err(|_| {
-        LegacyRulesCliError::Input(format!(
-            "packages list '{}' is not valid UTF-8",
-            path.display()
-        ))
-    })?;
     Ok(bytes.into_boxed_slice())
 }
 
 #[cfg(unix)]
-fn package_metadata_is_stable(before: &fs::Metadata, after: &fs::Metadata) -> bool {
+fn input_metadata_is_stable(before: &fs::Metadata, after: &fs::Metadata) -> bool {
     use std::os::unix::fs::MetadataExt as _;
     before.dev() == after.dev()
         && before.ino() == after.ino()
@@ -810,11 +1071,11 @@ fn package_metadata_is_stable(before: &fs::Metadata, after: &fs::Metadata) -> bo
 }
 
 #[cfg(not(unix))]
-fn package_metadata_is_stable(before: &fs::Metadata, after: &fs::Metadata) -> bool {
+fn input_metadata_is_stable(before: &fs::Metadata, after: &fs::Metadata) -> bool {
     before.len() == after.len() && before.modified().ok() == after.modified().ok()
 }
 
-fn open_packages_list(path: &Path) -> std::io::Result<File> {
+fn open_bounded_input(path: &Path) -> std::io::Result<File> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(any(target_os = "linux", target_os = "android"))]

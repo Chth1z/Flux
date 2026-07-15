@@ -105,6 +105,9 @@ _detect_kernel() {
     write_stub init '
 printf "init:%s\n" "$*" >>/data/adb/flux/run/test-calls
 [ ! -f /data/adb/flux/run/fail-init ] || exit 41
+if [ "${FLUXD_ENGINE_OWNER:-legacy}" = rust ]; then
+    printf "FLUX_LEGACY_RULES_SET_MANIFEST_V1\ngeneration=%s\nfamilies=ipv4\n" "${FLUX_GENERATION_ID:?missing generation}" >/data/adb/flux/cache/cache_rules_manifest
+fi
 : >/data/adb/flux/cache/cache_valid
 exit 0'
     write_stub core '
@@ -200,6 +203,8 @@ EOF
     assert_file_equals "${FLUX_ROOT}/conf/config.json" "${GENERATIONS_ROOT}/1/config.json"
     assert_file_equals "${FLUX_ROOT}/cache/cache_config" "${GENERATIONS_ROOT}/1/cache_config"
     assert_file_equals "${FLUX_ROOT}/cache/cache_packages" "${GENERATIONS_ROOT}/1/cache_packages"
+    grep -qx 'generation=1' "${GENERATIONS_ROOT}/1/legacy-rules.manifest" ||
+        fail "Generation did not retain its bound legacy rules manifest"
     [ "$(stat -c '%a' "${GENERATIONS_ROOT}/1")" = "555" ] ||
         fail "completed generation directory is mutable"
     [ "$(stat -c '%a' "${GENERATIONS_ROOT}/1/config.json")" = "444" ] ||
@@ -230,6 +235,11 @@ if [ "${1:-}" = snapshot-legacy-packages ]; then
     cat "${3}"
     exit 0
 fi
+if [ "${1:-}" = attest-legacy-rules-set ]; then
+    printf 'rust-attest:%s\n' "$*" >>/data/adb/flux/run/test-calls
+    printf 'FLUX_LEGACY_RULES_SET_MANIFEST_V1\ngeneration=%s\nfamilies=ipv4\n' "${3}"
+    exit 0
+fi
 printf 'rust-render:%s\n' "$*" >>/data/adb/flux/run/test-calls
 printf '*mangle\nCOMMIT\n'
 EOF
@@ -243,6 +253,8 @@ EOF
         fail "real init did not invoke the Rust IPv4 cleanup renderer"
     grep -qx 'rust-snapshot:snapshot-legacy-packages --source /data/system/packages.list' "${CALLS_FILE}" ||
         fail "real init did not invoke the bounded Rust package snapshot helper"
+    grep -qx "rust-attest:attest-legacy-rules-set --generation ${generation} --packages-list /data/adb/flux/cache/cache_packages --ipv4-apply /data/adb/flux/cache/cache_rules_ipv4 --ipv4-cleanup /data/adb/flux/cache/cache_cleanup_ipv4" "${CALLS_FILE}" ||
+        fail "real init did not attest the complete staged IPv4 rule set"
     assert_not_called sing-box
     [ "$(grep -c '^rust-render:' "${CALLS_FILE}")" -eq 2 ] ||
         fail "real init invoked an unexpected renderer count"
@@ -251,7 +263,192 @@ EOF
         fail "generation did not retain Rust-rendered apply bytes"
     grep -qx '\*mangle' "${GENERATIONS_ROOT}/${generation}/cache_cleanup_ipv4" ||
         fail "generation did not retain Rust-rendered cleanup bytes"
+    grep -qx "generation=${generation}" "${GENERATIONS_ROOT}/${generation}/legacy-rules.manifest" ||
+        fail "generation did not retain its Rust artifact receipt"
     assert_not_called core
+}
+
+test_real_init_attests_and_snapshots_one_dual_family_rule_set() {
+    reset_fixture
+    install_real_init_fixture
+    sed -i "s/PROXY_IPV6='0'/PROXY_IPV6='1'/" "${FLUX_ROOT}/scripts/config"
+    cat >"${FLUX_ROOT}/scripts/rules" <<'EOF'
+return 99
+EOF
+    cat >"${FLUX_ROOT}/bin/fluxd" <<'EOF'
+#!/usr/bin/sh
+set -eu
+case "${1:-}" in
+snapshot-legacy-packages)
+    cat "${3}"
+    ;;
+render-legacy-rules)
+    printf 'rust-render:%s\n' "$*" >>/data/adb/flux/run/test-calls
+    printf '*mangle\nCOMMIT\n'
+    ;;
+attest-legacy-rules-set)
+    printf 'rust-attest:%s\n' "$*" >>/data/adb/flux/run/test-calls
+    printf 'FLUX_LEGACY_RULES_SET_MANIFEST_V1\ngeneration=%s\nfamilies=ipv4,ipv6\n' "${3}"
+    ;;
+*) exit 2 ;;
+esac
+EOF
+    chmod 0755 "${FLUX_ROOT}/bin/fluxd"
+
+    generation=$(prepare_generation)
+
+    [ "$(grep -c '^rust-render:' "${CALLS_FILE}")" -eq 4 ] ||
+        fail "dual-family preparation did not render exactly four artifacts"
+    grep -qx "rust-attest:attest-legacy-rules-set --generation ${generation} --packages-list /data/adb/flux/cache/cache_packages --ipv4-apply /data/adb/flux/cache/cache_rules_ipv4 --ipv4-cleanup /data/adb/flux/cache/cache_cleanup_ipv4 --ipv6-apply /data/adb/flux/cache/cache_rules_ipv6 --ipv6-cleanup /data/adb/flux/cache/cache_cleanup_ipv6" "${CALLS_FILE}" ||
+        fail "real init did not attest the complete staged dual-family rule set"
+    [ -s "${GENERATIONS_ROOT}/${generation}/cache_rules_ipv6" ] ||
+        fail "dual-family generation did not retain IPv6 apply bytes"
+    [ -s "${GENERATIONS_ROOT}/${generation}/cache_cleanup_ipv6" ] ||
+        fail "dual-family generation did not retain IPv6 cleanup bytes"
+    grep -qx 'families=ipv4,ipv6' "${GENERATIONS_ROOT}/${generation}/legacy-rules.manifest" ||
+        fail "dual-family generation did not retain its family-bound receipt"
+    assert_not_called core
+}
+
+test_real_init_rebuilds_before_reusing_a_stale_generation_receipt() {
+    reset_fixture
+    install_real_init_fixture
+    sed -i '/^build_config() {/a\    [ ! -e /data/adb/flux/cache/cache_rules_manifest ] || exit 88' "${FLUX_ROOT}/scripts/config"
+    cat >"${FLUX_ROOT}/scripts/rules" <<'EOF'
+return 99
+EOF
+    cat >"${FLUX_ROOT}/bin/fluxd" <<'EOF'
+#!/usr/bin/sh
+set -eu
+case "${1:-}" in
+snapshot-legacy-packages)
+    cat "${3}"
+    ;;
+render-legacy-rules)
+    printf '*mangle\nCOMMIT\n'
+    ;;
+attest-legacy-rules-set)
+    printf 'rust-attest:%s\n' "$*" >>/data/adb/flux/run/test-calls
+    printf 'FLUX_LEGACY_RULES_SET_MANIFEST_V1\ngeneration=%s\nfamilies=ipv4\n' "${3}"
+    ;;
+*) exit 2 ;;
+esac
+EOF
+    chmod 0755 "${FLUX_ROOT}/bin/fluxd"
+    printf 'FLUX_LEGACY_RULES_SET_MANIFEST_V1\ngeneration=1\nfamilies=ipv4\n' >"${FLUX_ROOT}/cache/cache_rules_manifest"
+    printf 'rust\n' >"${FLUX_ROOT}/cache/cache_valid"
+
+    FLUX_CACHE_BUILD_SERIALIZED=1 FLUXD_ENGINE_OWNER=rust FLUX_GENERATION_ID=2 sh -c '
+        set -a
+        . /data/adb/flux/cache/cache_config
+        set +a
+        sh /data/adb/flux/scripts/init init
+    ' ||
+        fail "real init did not rebuild a cache with a stale Generation receipt"
+
+    grep -qx 'rust-attest:attest-legacy-rules-set --generation 2 --packages-list /data/adb/flux/cache/cache_packages --ipv4-apply /data/adb/flux/cache/cache_rules_ipv4 --ipv4-cleanup /data/adb/flux/cache/cache_cleanup_ipv4' "${CALLS_FILE}" ||
+        fail "real init reused the stale receipt instead of re-attesting Generation 2"
+    grep -qx 'generation=2' "${FLUX_ROOT}/cache/cache_rules_manifest" ||
+        fail "real init did not replace the stale receipt"
+}
+
+test_serialized_cache_preview_bootstraps_without_a_generation_receipt() {
+    reset_fixture
+    install_real_init_fixture
+    cat >"${FLUX_ROOT}/scripts/rules" <<'EOF'
+return 99
+EOF
+    cat >"${FLUX_ROOT}/bin/fluxd" <<'EOF'
+#!/usr/bin/sh
+set -eu
+case "${1:-}" in
+snapshot-legacy-packages)
+    cat "${3}"
+    ;;
+render-legacy-rules)
+    printf 'preview-render:%s\n' "$*" >>/data/adb/flux/run/test-calls
+    printf '*mangle\nCOMMIT\n'
+    ;;
+attest-legacy-rules-set)
+    printf 'preview-attest:%s\n' "$*" >>/data/adb/flux/run/test-calls
+    exit 97
+    ;;
+*) exit 2 ;;
+esac
+EOF
+    chmod 0755 "${FLUX_ROOT}/bin/fluxd"
+    printf 'stale-receipt\n' >"${FLUX_ROOT}/cache/cache_rules_manifest"
+
+    if FLUXD_ENGINE_OWNER=rust sh "${FLUX_ROOT}/scripts/init" cache; then
+        fail "direct cache preview bypassed dispatcher serialization"
+    fi
+    run_bridge cache-preview ||
+        fail "serialized cache preview did not bootstrap without exported config"
+
+    [ "$(grep -c '^preview-render:' "${CALLS_FILE}")" -eq 2 ] ||
+        fail "direct cache preview did not render the IPv4 pair"
+    ! grep -q '^preview-attest:' "${CALLS_FILE}" ||
+        fail "non-Generation cache preview invoked the attester"
+    [ ! -e "${FLUX_ROOT}/cache/cache_rules_manifest" ] ||
+        fail "non-Generation cache preview retained a misleading receipt"
+    [ "$(cat "${FLUX_ROOT}/cache/cache_valid")" = rust ] ||
+        fail "direct cache preview did not publish its Rust cache producer"
+}
+
+test_cache_preview_cannot_overlap_generation_attestation() {
+    reset_fixture
+    install_real_init_fixture
+    cat >"${FLUX_ROOT}/scripts/rules" <<'EOF'
+return 99
+EOF
+    cat >"${FLUX_ROOT}/bin/fluxd" <<'EOF'
+#!/usr/bin/sh
+set -eu
+case "${1:-}" in
+snapshot-legacy-packages)
+    cat "${3}"
+    ;;
+render-legacy-rules)
+    printf '*mangle\nCOMMIT\n'
+    ;;
+attest-legacy-rules-set)
+    : >/data/adb/flux/run/attestation-started
+    while [ ! -e /data/adb/flux/run/release-attestation ]; do
+        sleep 0.01
+    done
+    printf 'FLUX_LEGACY_RULES_SET_MANIFEST_V1\ngeneration=%s\nfamilies=ipv4\n' "${3}"
+    ;;
+*) exit 2 ;;
+esac
+EOF
+    chmod 0755 "${FLUX_ROOT}/bin/fluxd"
+
+    run_bridge prepare &
+    prepare_pid=$!
+    attempts=0
+    while [ ! -e "${RUN_ROOT}/attestation-started" ] && [ "${attempts}" -lt 500 ]; do
+        sleep 0.01
+        attempts=$((attempts + 1))
+    done
+    [ -e "${RUN_ROOT}/attestation-started" ] || {
+        : >"${RUN_ROOT}/release-attestation"
+        wait "${prepare_pid}" 2>/dev/null || true
+        fail "Generation preparation did not reach attestation"
+    }
+
+    preview_rc=0
+    run_bridge cache-preview || preview_rc=$?
+    [ "${preview_rc}" -eq 75 ] || {
+        : >"${RUN_ROOT}/release-attestation"
+        wait "${prepare_pid}" 2>/dev/null || true
+        fail "cache preview overlapped Generation attestation (rc=${preview_rc})"
+    }
+
+    : >"${RUN_ROOT}/release-attestation"
+    wait "${prepare_pid}" || fail "serialized Generation preparation failed"
+    generation=$(manifest_value generation)
+    grep -qx "generation=${generation}" "${GENERATIONS_ROOT}/${generation}/legacy-rules.manifest" ||
+        fail "serialized Generation did not retain its attested receipt"
 }
 
 test_real_init_keeps_explicit_shell_renderer_rollback_for_legacy_owner() {
@@ -323,6 +520,10 @@ if [ "${1:-}" = snapshot-legacy-packages ]; then
     cat "${3}"
     exit 0
 fi
+if [ "${1:-}" = attest-legacy-rules-set ]; then
+    printf 'FLUX_LEGACY_RULES_SET_MANIFEST_V1\ngeneration=%s\nfamilies=ipv4\n' "${3}"
+    exit 0
+fi
 printf '*mangle\nCOMMIT\n'
 EOF
     chmod 0755 "${FLUX_ROOT}/bin/fluxd"
@@ -342,6 +543,10 @@ if [ "${1:-}" = snapshot-legacy-packages ]; then
     cat "${3}"
     exit 0
 fi
+if [ "${1:-}" = attest-legacy-rules-set ]; then
+    printf 'FLUX_LEGACY_RULES_SET_MANIFEST_V1\ngeneration=%s\nfamilies=ipv4\n' "${3}"
+    exit 0
+fi
 case "$*" in
 *'--family 4 --action cleanup'*) exit 73 ;;
 esac
@@ -359,6 +564,64 @@ EOF
     assert_file_equals "${RUN_ROOT}/active-before-render-failure" "${RUN_ROOT}/capture.active"
     assert_file_equals "${RUN_ROOT}/verified-before-render-failure" "${RUN_ROOT}/capture.verified"
     assert_file_equals "${RUN_ROOT}/engine-before-render-failure" "${RUN_ROOT}/engine.active"
+}
+
+test_failed_rust_attestation_preserves_the_active_generation() {
+    reset_fixture
+    install_real_init_fixture
+    cat >"${FLUX_ROOT}/scripts/rules" <<'EOF'
+return 99
+EOF
+    cat >"${FLUX_ROOT}/bin/fluxd" <<'EOF'
+#!/usr/bin/sh
+set -eu
+case "${1:-}" in
+snapshot-legacy-packages)
+    cat "${3}"
+    ;;
+render-legacy-rules)
+    case "$*" in
+    *'--family 4 --action cleanup'*)
+        if [ -f /data/adb/flux/run/tamper-next-rule-set ]; then
+            printf '*mangle\n:TAMPERED - [0:0]\nCOMMIT\n'
+            exit 0
+        fi
+        ;;
+    esac
+    printf '*mangle\nCOMMIT\n'
+    ;;
+attest-legacy-rules-set)
+    if grep -q TAMPERED /data/adb/flux/cache/cache_cleanup_ipv4; then
+        printf 'FLUX_LEGACY_RULES_SET_MANIFEST_V1\ngeneration=999\nfamilies=ipv4\n'
+        exit 0
+    fi
+    printf 'FLUX_LEGACY_RULES_SET_MANIFEST_V1\ngeneration=%s\nfamilies=ipv4\n' "${3}"
+    ;;
+*) exit 2 ;;
+esac
+EOF
+    chmod 0755 "${FLUX_ROOT}/bin/fluxd"
+
+    active_generation=$(prepare_generation)
+    run_bridge capture-start "${active_generation}" || fail "initial capture-start failed"
+    run_bridge capture-verify "${active_generation}" || fail "initial capture-verify failed"
+    run_bridge state-running "${active_generation}" || fail "initial state-running failed"
+    cp "${RUN_ROOT}/capture.active" "${RUN_ROOT}/active-before-attestation-failure"
+    cp "${RUN_ROOT}/capture.verified" "${RUN_ROOT}/verified-before-attestation-failure"
+    cp "${RUN_ROOT}/engine.active" "${RUN_ROOT}/engine-before-attestation-failure"
+    : >"${RUN_ROOT}/tamper-next-rule-set"
+
+    if run_bridge prepare; then
+        fail "prepare accepted an attestation receipt for the wrong Generation"
+    fi
+
+    [ ! -e "${RUN_ROOT}/engine.manifest" ] || fail "failed attestation published a candidate manifest"
+    [ ! -d "${GENERATIONS_ROOT}/2" ] || fail "failed attestation retained a candidate generation"
+    [ ! -e "${FLUX_ROOT}/cache/cache_rules_manifest" ] || fail "failed attestation retained a stale shared receipt"
+    [ ! -e "${FLUX_ROOT}/cache/cache_valid" ] || fail "failed attestation published cache validity"
+    assert_file_equals "${RUN_ROOT}/active-before-attestation-failure" "${RUN_ROOT}/capture.active"
+    assert_file_equals "${RUN_ROOT}/verified-before-attestation-failure" "${RUN_ROOT}/capture.verified"
+    assert_file_equals "${RUN_ROOT}/engine-before-attestation-failure" "${RUN_ROOT}/engine.active"
 }
 
 test_prepare_removes_stale_manifest_on_failure() {
@@ -414,6 +677,8 @@ test_prepare_creates_distinct_immutable_generation_artifacts() {
         fail "second generation did not snapshot its environment"
     grep -q 'GENERATION_TWO' "${GENERATIONS_ROOT}/${second_generation}/cache_rules_ipv4" ||
         fail "second generation did not snapshot its rules"
+    grep -qx "generation=${second_generation}" "${GENERATIONS_ROOT}/${second_generation}/legacy-rules.manifest" ||
+        fail "second generation reused a receipt bound to the first Generation"
     [ "$(manifest_value config)" = "${GENERATIONS_ROOT}/${second_generation}/config.json" ] ||
         fail "top-level manifest does not select the latest generation"
     assert_not_called core
@@ -1214,9 +1479,14 @@ test_legacy_and_rust_owned_verbs_cannot_mix() {
 
 test_prepare_writes_exact_direct_manifest_without_core
 test_real_init_uses_rust_renderer_and_snapshots_one_package_inventory
+test_real_init_attests_and_snapshots_one_dual_family_rule_set
+test_real_init_rebuilds_before_reusing_a_stale_generation_receipt
+test_serialized_cache_preview_bootstraps_without_a_generation_receipt
+test_cache_preview_cannot_overlap_generation_attestation
 test_real_init_keeps_explicit_shell_renderer_rollback_for_legacy_owner
 test_legacy_restart_prepares_before_stopping_the_active_runtime
 test_failed_rust_render_preserves_the_active_generation
+test_failed_rust_attestation_preserves_the_active_generation
 test_prepare_removes_stale_manifest_on_failure
 test_prepare_creates_distinct_immutable_generation_artifacts
 test_previous_generation_can_be_selected_after_newer_prepare

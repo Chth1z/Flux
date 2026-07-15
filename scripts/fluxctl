@@ -145,7 +145,7 @@ rules_preview_cmd() {
         return 1
     }
 
-    FLUXD_ENGINE_OWNER=rust sh "${INIT_SCRIPT}" cache >/dev/null
+    FLUXD_BRIDGE=1 sh "${DISPATCHER_SCRIPT}" cache-preview >/dev/null
 
     printf '[rules]\n'
     _print_kv "backend" "${RULE_BACKEND}"

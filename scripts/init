@@ -23,6 +23,7 @@ readonly SCRIPT_DIR="${_script_path%/*}"
 . "${SCRIPT_DIR}/log"
 
 readonly LOG_COMPONENT="Init"
+readonly LEGACY_RULES_MANIFEST_MAX_BYTES=16384
 
 _rule_renderer_source() {
     if [ "${FLUXD_ENGINE_OWNER:-legacy}" = "rust" ]; then
@@ -110,10 +111,61 @@ _rotate_log() {
 # [ Cache Validation ]
 # ==============================================================================
 
+_validate_rules_manifest() {
+    local expected_generation="${1}"
+    local expected_families="${2}"
+    local header=""
+    local line=""
+    local generation=""
+    local generation_count=0
+    local families=""
+    local families_count=0
+    local manifest_size=""
+
+    [ -s "${CACHE_RULES_MANIFEST_FILE}" ] && [ ! -L "${CACHE_RULES_MANIFEST_FILE}" ] || {
+        log_error "Legacy rules manifest is missing, empty, or unsafe"
+        return 1
+    }
+    manifest_size=$(file_size "${CACHE_RULES_MANIFEST_FILE}") || return 1
+    [ "${manifest_size}" -le "${LEGACY_RULES_MANIFEST_MAX_BYTES}" ] || {
+        log_error "Legacy rules manifest exceeds ${LEGACY_RULES_MANIFEST_MAX_BYTES} bytes"
+        return 1
+    }
+    IFS= read -r header <"${CACHE_RULES_MANIFEST_FILE}" || return 1
+    [ "${header}" = "FLUX_LEGACY_RULES_SET_MANIFEST_V1" ] || {
+        log_error "Legacy rules manifest has an unsupported header"
+        return 1
+    }
+    while IFS= read -r line; do
+        case "${line}" in
+        generation=*)
+            generation_count=$((generation_count + 1))
+            generation="${line#generation=}"
+            ;;
+        families=*)
+            families_count=$((families_count + 1))
+            families="${line#families=}"
+            ;;
+        esac
+    done <"${CACHE_RULES_MANIFEST_FILE}"
+    [ "${generation_count}" -eq 1 ] && [ "${generation}" = "${expected_generation}" ] || {
+        log_error "Legacy rules manifest does not bind the allocated Generation"
+        return 1
+    }
+    [ "${families_count}" -eq 1 ] && [ "${families}" = "${expected_families}" ] || {
+        log_error "Legacy rules manifest does not bind the enabled family set"
+        return 1
+    }
+}
+
 # Cache validation: rebuild if missing or invalid
 _validate_cache() {
+    local generation="${1:-}"
+    local cached_ipv6="${PROXY_IPV6:-0}"
+    local expected_families="ipv4"
     local renderer_source=""
     local cached_source=""
+    [ "${cached_ipv6}" = "1" ] && expected_families="ipv4,ipv6"
     renderer_source=$(_rule_renderer_source) || return 1
 
     if [ -f "${EVENT_CACHE_OK}" ] && [ ! -L "${EVENT_CACHE_OK}" ]; then
@@ -124,18 +176,34 @@ _validate_cache() {
             [ -s "${CACHE_CLEANUP_V4_FILE}" ]; then
             if { [ "${renderer_source}" != "rust" ] || {
                 [ -f "${CACHE_PACKAGES_FILE}" ] &&
-                    [ ! -L "${CACHE_PACKAGES_FILE}" ]
-            }; } && { [ "${PROXY_IPV6}" != "1" ] || {
+                    [ ! -L "${CACHE_PACKAGES_FILE}" ] &&
+                    { [ -z "${generation}" ] || {
+                        [ -s "${CACHE_RULES_MANIFEST_FILE}" ] &&
+                            [ ! -L "${CACHE_RULES_MANIFEST_FILE}" ]
+                    }; }
+            }; } && { [ "${cached_ipv6}" != "1" ] || {
                 [ -s "${CACHE_RULES_V6_FILE}" ] &&
                     [ -s "${CACHE_CLEANUP_V6_FILE}" ]
             }; }; then
-                log_info "Cache is valid"
-                return 0
+                if [ "${renderer_source}" = "rust" ] && [ -n "${generation}" ]; then
+                    if _validate_rules_manifest "${generation}" "${expected_families}"; then
+                        log_info "Cache is valid"
+                        return 0
+                    fi
+                else
+                    log_info "Cache is valid"
+                    return 0
+                fi
             fi
         fi
         log_warn "Cache marker present but cache files are incomplete, rebuilding..."
         rm -f "${EVENT_CACHE_OK}"
     fi
+
+    # Invalidate the old receipt before rebuilding shared cache artifacts.
+    # Dispatcher serialization prevents Generation and preview builds from
+    # overlapping, so new artifacts cannot be paired with a stale receipt.
+    rm -f "${CACHE_RULES_MANIFEST_FILE}" 2>/dev/null || return 1
 
     . "${SCRIPT_DIR}/config"
     # Config must run first because the Rust renderer consumes its exported values.
@@ -145,6 +213,8 @@ _validate_cache() {
     set -a
     . "${CACHE_CONFIG_FILE}"
     set +a
+    expected_families="ipv4"
+    [ "${PROXY_IPV6}" = "1" ] && expected_families="ipv4,ipv6"
 
     awk '/^KFEAT_/ { print }' "${CACHE_CONFIG_FILE}" >"${CACHE_KERNEL_CAPS_FILE}" 2>/dev/null || true
 
@@ -202,6 +272,32 @@ _validate_cache() {
     # shellcheck disable=SC2086
     wait_pids ${pids} || return 1
 
+    if [ "${renderer_source}" = "rust" ] && [ -n "${generation}" ]; then
+        if [ "${PROXY_IPV6}" = "1" ]; then
+            atomic_write "${CACHE_RULES_MANIFEST_FILE}" "${FLUXD_BIN}" attest-legacy-rules-set \
+                --generation "${generation}" \
+                --packages-list "${CACHE_PACKAGES_FILE}" \
+                --ipv4-apply "${CACHE_RULES_V4_FILE}" \
+                --ipv4-cleanup "${CACHE_CLEANUP_V4_FILE}" \
+                --ipv6-apply "${CACHE_RULES_V6_FILE}" \
+                --ipv6-cleanup "${CACHE_CLEANUP_V6_FILE}" || return 1
+        else
+            atomic_write "${CACHE_RULES_MANIFEST_FILE}" "${FLUXD_BIN}" attest-legacy-rules-set \
+                --generation "${generation}" \
+                --packages-list "${CACHE_PACKAGES_FILE}" \
+                --ipv4-apply "${CACHE_RULES_V4_FILE}" \
+                --ipv4-cleanup "${CACHE_CLEANUP_V4_FILE}" || return 1
+        fi
+        if ! _validate_rules_manifest "${generation}" "${expected_families}"; then
+            rm -f "${CACHE_RULES_MANIFEST_FILE}" 2>/dev/null || true
+            return 1
+        fi
+        if ! chmod 0444 "${CACHE_RULES_MANIFEST_FILE}" 2>/dev/null; then
+            rm -f "${CACHE_RULES_MANIFEST_FILE}" 2>/dev/null || true
+            return 1
+        fi
+    fi
+
     log_debug "Cache build success"
     atomic_write "${EVENT_CACHE_OK}" printf '%s\n' "${renderer_source}"
 }
@@ -254,7 +350,11 @@ _init_env() {
     if [ "${FLUXD_ENGINE_OWNER:-legacy}" != "rust" ]; then
         run "Check Sing-Box config" "${SING_BOX_BIN}" check -c "${CONFIG_FILE}" -D "${RUN_DIR}" || return $?
     fi
-    run "Validate cache" _validate_cache || return $?
+    if [ "${FLUXD_ENGINE_OWNER:-legacy}" = "rust" ] && [ -z "${FLUX_GENERATION_ID:-}" ]; then
+        log_error "Rust-owned preparation requires an allocated Generation ID"
+        return 1
+    fi
+    run "Validate cache" _validate_cache "${FLUX_GENERATION_ID:-}" || return $?
 
     wait "${pid_log}"
     return 0
@@ -263,6 +363,8 @@ _init_env() {
 _rebuild_cache_only() {
     run "Init dirs" _init_dirs || return $?
     rm -f "${EVENT_CACHE_OK}"
+    # Preview caches are intentionally not Generation candidates and therefore
+    # do not carry a Generation-bound artifact receipt.
     run "Validate cache" _validate_cache || return $?
     run "Rotate log" _rotate_log
     return 0
@@ -274,6 +376,11 @@ _rebuild_cache_only() {
 
 main() {
     local action="${1:-}"
+
+    [ "${FLUX_CACHE_BUILD_SERIALIZED:-0}" = "1" ] || {
+        log_error "Cache preparation must run through the serialized dispatcher"
+        return "${EX_TEMPFAIL}"
+    }
 
     case "${action}" in
     init)

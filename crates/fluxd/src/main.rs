@@ -25,6 +25,18 @@ fn main() {
         );
         std::process::exit(exit);
     }
+    if args
+        .get(1)
+        .is_some_and(|command| command == "attest-legacy-rules-set")
+    {
+        let exit = fluxd::run_legacy_rules_attestation_cli(
+            &args,
+            &fluxd::ProcessLegacyRulesEnvironment,
+            &mut std::io::stdout(),
+            &mut std::io::stderr(),
+        );
+        std::process::exit(exit);
+    }
     let source = SystemKernelReleaseSource;
     if args.get(1).is_some_and(|command| command == "daemon") {
         if args.len() != 2 {

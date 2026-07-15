@@ -2,10 +2,13 @@ mod render;
 mod restore;
 
 pub use render::{
-    LegacyApplicationMode, LegacyApplicationPolicy, LegacyInterfacePattern, LegacyInterfacePolicy,
-    LegacyInterfaceRole, LegacyKernelFeatures, LegacyMarkValues, LegacyOwnerMatch,
-    LegacyOwnerToken, LegacyRulesPlan, LegacyRulesPlanError, LegacyRulesRenderError,
-    LegacyRulesRenderRequest, MAX_LEGACY_APPLICATION_UIDS, render_legacy_rules_restore,
+    LEGACY_RULES_DIGEST_BYTES, LEGACY_RULES_IDENTITY_SCHEMA_VERSION, LegacyApplicationMode,
+    LegacyApplicationPolicy, LegacyInterfacePattern, LegacyInterfacePolicy, LegacyInterfaceRole,
+    LegacyKernelFeatures, LegacyMarkValues, LegacyOwnerMatch, LegacyOwnerToken,
+    LegacyRulesArtifactPair, LegacyRulesArtifactSet, LegacyRulesPairDigest, LegacyRulesPlan,
+    LegacyRulesPlanDigest, LegacyRulesPlanError, LegacyRulesRenderError, LegacyRulesRenderRequest,
+    LegacyRulesResourceTotals, LegacyRulesSetDigest, MAX_LEGACY_APPLICATION_UIDS,
+    render_legacy_rules_pair, render_legacy_rules_restore, render_legacy_rules_set,
 };
 
 pub use restore::{

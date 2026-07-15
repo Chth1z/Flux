@@ -18,6 +18,7 @@ mod engine_supervisor;
 mod functional_canary;
 mod intent_store;
 mod legacy_rules_cli;
+mod legacy_rules_manifest;
 mod protocol;
 mod runtime_coordinator;
 mod runtime_status;
@@ -40,7 +41,13 @@ pub use engine_supervisor::{
 pub use intent_store::{AdministrativeIntentStore, IntentStoreError};
 pub use legacy_rules_cli::{
     LegacyRulesEnvironment, ProcessLegacyRulesEnvironment, run_legacy_package_snapshot_cli,
-    run_legacy_rules_cli,
+    run_legacy_rules_attestation_cli, run_legacy_rules_cli,
+};
+pub use legacy_rules_manifest::{
+    LEGACY_RULES_SET_MANIFEST_SCHEMA_VERSION, LegacyRulesArtifactManifest, LegacyRulesFamilyShape,
+    LegacyRulesManifestDigest, LegacyRulesManifestResourceTotals, LegacyRulesPairManifest,
+    LegacyRulesSetManifest, LegacyRulesSetManifestError, LegacyRulesSetManifestErrorKind,
+    MAX_LEGACY_RULES_SET_MANIFEST_BYTES,
 };
 pub use protocol::{
     DaemonSnapshot, EventDisposition, EventReport, MAX_CONTROL_PACKET_BYTES, ProtocolHandler,
@@ -617,7 +624,7 @@ where
 fn write_help(output: &mut impl Write) -> i32 {
     let result = writeln!(
         output,
-        "Usage: fluxd <COMMAND>\n\nCommands:\n  status [--json]\n  control <start|stop|restart|reload|resync>\n  ping\n  event <EVENT_TYPE> <WATCHED_PATH> <EVENT_NAME>\n  render-legacy-rules --packages-list PATH --family 4|6 --action apply|cleanup\n  snapshot-legacy-packages --source PATH\n  help\n  version"
+        "Usage: fluxd <COMMAND>\n\nCommands:\n  status [--json]\n  control <start|stop|restart|reload|resync>\n  ping\n  event <EVENT_TYPE> <WATCHED_PATH> <EVENT_NAME>\n  render-legacy-rules --packages-list PATH --family 4|6 --action apply|cleanup\n  snapshot-legacy-packages --source PATH\n  attest-legacy-rules-set --generation ID --packages-list PATH --ipv4-apply PATH --ipv4-cleanup PATH [--ipv6-apply PATH --ipv6-cleanup PATH]\n  help\n  version"
     );
     if result.is_ok() {
         EXIT_SUCCESS

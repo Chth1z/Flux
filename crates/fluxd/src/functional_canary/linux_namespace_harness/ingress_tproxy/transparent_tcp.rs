@@ -88,6 +88,22 @@ impl TransparentTcpListener {
     pub(super) const fn ipv6_only_readback(&self) -> Option<i32> {
         self.ipv6_only
     }
+
+    pub(super) fn set_mark(&self, mark: u32) -> Result<u32, String> {
+        set_u32_option(
+            self.listener.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_MARK,
+            mark,
+        )?;
+        let observed = get_u32_option(self.listener.as_raw_fd(), libc::SOL_SOCKET, libc::SO_MARK)?;
+        if observed != mark {
+            return Err(format!(
+                "transparent TCP listener read back SO_MARK={observed:#x}, expected {mark:#x}"
+            ));
+        }
+        Ok(observed)
+    }
 }
 
 pub(super) fn connect_marked(
@@ -136,6 +152,17 @@ pub(super) fn connect_marked(
 
 pub(super) fn socket_mark(stream: &TcpStream) -> Result<u32, String> {
     get_u32_option(stream.as_raw_fd(), libc::SOL_SOCKET, libc::SO_MARK)
+}
+
+pub(super) fn set_socket_mark(stream: &TcpStream, mark: u32) -> Result<u32, String> {
+    set_u32_option(stream.as_raw_fd(), libc::SOL_SOCKET, libc::SO_MARK, mark)?;
+    let observed = socket_mark(stream)?;
+    if observed != mark {
+        return Err(format!(
+            "TCP socket read back SO_MARK={observed:#x}, expected {mark:#x}"
+        ));
+    }
+    Ok(observed)
 }
 
 pub(super) fn socket_owned(

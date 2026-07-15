@@ -42,7 +42,8 @@ writer until the native component cutover.
 
 Legacy source-shape renderer parity and the unattached extension-free schema-v1
 forwarded-ingress lowerer are complete. Local OUTPUT remains explicitly rejected because MARK-only
-OUTPUT does not prove PREROUTING traversal or delivery to the TPROXY listener. A valid local
+OUTPUT omits the authorized RPDB local route, mark-qualified loopback PREROUTING TPROXY companion,
+exact transparent-listener delivery, loop escape, activation, and cleanup transaction. A valid local
 mechanism, established-flow caching, transparent-socket DIVERT, FakeIP ICMP, QUIC rejection, MSS
 clamping, native restore, live readback, rollback, and component ownership transfer remain later
 gates. The shadow/lowering lane also adds no eBPF attach/pin path, TUN activation, implicit module
@@ -56,13 +57,38 @@ interface and exercise PREROUTING TPROXY. That is useful evidence for transparen
 original-destination recovery, policy routing, relay behavior, counters, and cleanup, but it does
 not exercise the Android local-application OUTPUT path.
 
-This distinction is based on an observed kernel boundary, not only on documentation. In the
-privileged Linux harness environment, marking a locally generated OUTPUT packet and selecting a
-local policy route did not cause that packet to traverse PREROUTING or reach the TPROXY listener;
-the xtables TPROXY target also rejects attachment to OUTPUT. Flux therefore never treats an
-OUTPUT mark counter, a local-route lookup, or zero peer packets as proof that local OUTPUT reached
-TPROXY. Those observations are route/loop negative controls only. Production local-OUTPUT
-qualification requires its own device-supported capture mechanism and listener evidence.
+The hook distinction remains real, but the earlier negative interpretation was too broad. Linux
+5.10 recomputes the OUTPUT route after a relevant mark change, an RPDB-selected local route can
+transmit through loopback, and loopback receive processing invokes PREROUTING. The checked-in
+ingress harness does not exercise that path: its selector is tied to the veth ingress interface.
+In the frozen shell source shape, an optional connmark-qualified TPROXY fast path precedes the
+generic loopback bypass. That historical variant does not define or qualify the selected mandatory
+packet-mark contract. Flux therefore never treats an OUTPUT mark counter,
+a route lookup, or zero peer packets as proof of capture, but it may qualify the complete
+OUTPUT-mark → local-route → loopback-PREROUTING-TPROXY transaction through a dedicated canary.
+Production qualification still requires exact listener evidence and reviewed Android profiles.
+
+ADR-0012 selects the first conventional qualification candidate as one ordered transaction:
+prepare the exact transparent TCP/UDP listeners, install the reviewed RPDB local routes and private
+rules, attach mark-qualified loopback PREROUTING TPROXY, prove the prepared state, and attach the
+local OUTPUT classifier last. Retirement detaches and proves absence of OUTPUT first, then releases
+the listener and removes PREROUTING, routes, rules, and private objects by exact inverse identity.
+The checkpoint must prove dual-stack TCP accept and UDP original-destination delivery, positive
+boundary counters, bypass-mark response escape, safe misses, no peer leakage, no implicit module
+autoload, and exact baseline restoration.
+
+The opt-in mechanism-only host checkpoint is:
+
+```text
+cargo xtask test-functional-canary-linux-output-tproxy
+FLUX_LINUX_CANARY_REQUIRED=1 cargo xtask test-functional-canary-linux-output-tproxy
+```
+
+It selects
+`functional_canary::linux_namespace_harness::privileged_local_output_tproxy_checkpoint_exercises_loopback_reinjection_and_cleanup`.
+This test does not combine the separate distinct-UID preflight, bind a Generation or production
+receipt authority, consume a supervised Proxy Engine report, or qualify an Android profile. A host
+pass therefore remains supporting mechanism evidence and cannot publish `functional_passed`.
 
 REDIRECT and DNAT are not substitutes for that proof. They can deliver a rewritten local flow to
 a conventional listener, but that does not exercise the selected TPROXY backend, its transparent

@@ -65,6 +65,7 @@ const REQUIRED_DEVICE_TESTS: [&str; 7] = [
 const LINUX_CANARY_REQUIRED_ENV: &str = "FLUX_LINUX_CANARY_REQUIRED";
 const LINUX_CANARY_TEST: &str = "functional_canary::linux_namespace_harness::privileged_dual_stack_canary_exercises_real_topology_and_cleanup";
 const LINUX_TPROXY_CANARY_TEST: &str = "functional_canary::linux_namespace_harness::privileged_ingress_tproxy_checkpoint_exercises_real_capture_counters_and_cleanup";
+const LINUX_OUTPUT_TPROXY_CANARY_TEST: &str = "functional_canary::linux_namespace_harness::privileged_local_output_tproxy_checkpoint_exercises_loopback_reinjection_and_cleanup";
 const LINUX_OUTPUT_UID_PREFLIGHT_TEST: &str = "functional_canary::linux_namespace_harness::privileged_local_output_distinct_uid_capability_preflight";
 const LINUX_CANARY_INTERNAL_ENVS: [&str; 15] = [
     "FLUX_LINUX_CANARY_HARNESS_MODE",
@@ -144,6 +145,10 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
             require_no_arguments(&arguments)?;
             test_functional_canary_linux_tproxy()
         }
+        "test-functional-canary-linux-output-tproxy" => {
+            require_no_arguments(&arguments)?;
+            test_functional_canary_linux_output_tproxy()
+        }
         "test-functional-canary-linux-output-preflight" => {
             require_no_arguments(&arguments)?;
             test_functional_canary_linux_output_preflight()
@@ -184,6 +189,10 @@ fn test_functional_canary_linux() -> Result<(), String> {
 
 fn test_functional_canary_linux_tproxy() -> Result<(), String> {
     test_linux_canary(LINUX_TPROXY_CANARY_TEST)
+}
+
+fn test_functional_canary_linux_output_tproxy() -> Result<(), String> {
+    test_linux_canary(LINUX_OUTPUT_TPROXY_CANARY_TEST)
 }
 
 fn test_functional_canary_linux_output_preflight() -> Result<(), String> {
@@ -2192,6 +2201,7 @@ fn print_help() {
            build-android  Build release fluxd with NDK {ANDROID_NDK_REVISION}, API {ANDROID_API_LEVEL}\n\
            test-functional-canary-linux  Run the opt-in ignored privileged Linux canary checkpoint\n\
            test-functional-canary-linux-tproxy  Run the ingress-only Linux TPROXY checkpoint\n\
+           test-functional-canary-linux-output-tproxy  Run the local-OUTPUT loopback TPROXY checkpoint\n\
            test-functional-canary-linux-output-preflight  Preflight distinct local-OUTPUT credentials (no traffic)\n\
            xtables-oracle Verify or explicitly update pinned shell-generated restore fixtures; requires --check or --update\n\
            stage-module   Build and stage a Magisk tree; requires --stage DIR --runtime-binaries DIR\n\
@@ -2328,6 +2338,15 @@ mod tests {
             LINUX_TPROXY_CANARY_TEST
         ));
         assert!(!linux_canary_test_is_listed(&tproxy, LINUX_CANARY_TEST));
+        let output_tproxy = format!("{LINUX_OUTPUT_TPROXY_CANARY_TEST}: test\n");
+        assert!(linux_canary_test_is_listed(
+            &output_tproxy,
+            LINUX_OUTPUT_TPROXY_CANARY_TEST
+        ));
+        assert!(!linux_canary_test_is_listed(
+            &output_tproxy,
+            LINUX_TPROXY_CANARY_TEST
+        ));
         let output_preflight = format!("{LINUX_OUTPUT_UID_PREFLIGHT_TEST}: test\n");
         assert!(linux_canary_test_is_listed(
             &output_preflight,

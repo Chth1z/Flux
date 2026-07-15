@@ -39,6 +39,7 @@
 - [Current implementation follow-up (2026-07, Chinese)](research/current-system-follow-up-2026-07.zh-CN.md)
 - [Peer kernel/proxy projects and `xt_bpf` (2026-07, Chinese)](research/peer-kernel-projects-2026-07.zh-CN.md)
 - [Expanded eBPF and kernel-extension assessment (2026-07)](research/ebpf-and-kernel-extensions-2026-07.md)
+- [Local-origin transparent-capture mechanisms on Linux 5.10 (2026-07)](research/local-output-capture-mechanisms-2026-07.md)
 
 ## Architecture alternatives
 
@@ -59,3 +60,4 @@
 - [ADR-0009: do not make Flux a kernel-module loader](adr/0009-do-not-make-flux-a-kernel-module-loader.md)
 - [ADR-0010: freeze shell networking as a shadow-compiler oracle](adr/0010-freeze-shell-networking-as-a-shadow-compiler-oracle.md)
 - [ADR-0011: keep the rewrite pre-release until the runtime is fully Rust-owned](adr/0011-pre-release-rust-only-release-gate.md)
+- [ADR-0012: qualify local OUTPUT through loopback-reinjected PREROUTING TPROXY](adr/0012-qualify-local-output-through-loopback-tproxy.md)

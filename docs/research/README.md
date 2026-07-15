@@ -25,6 +25,11 @@ Research was performed against pinned primary-source checkouts and official docu
 14. LKM injection is not a general compatibility tier. Re:Kernel and IPSET_LKM demonstrate useful boot-quarantine and kernel-lifecycle ideas, but also expose KMI, rollback, authorization, provenance, and boot-loop costs that a broadly distributed proxy module should avoid.
 15. eBPF roles must be planned per Traffic Domain and attachment owner. A low-conflict `xt_bpf` matcher for Flux-owned xtables, TUN TC observation, proxy-child `sockops` telemetry, and experimental tether TC socket assignment have different coverage and failure contracts and must not be hidden behind one global Boolean or mode.
 16. Production Flux must not load or unload `.ko`/KPM payloads. An already-loaded OEM/custom-kernel extension may be consumed only as optional exact-device read-only observation through independently verified platform/module identity plus a versioned, strictly validated interface; decision-bearing use requires a concrete partner and separate ADR.
+17. Linux 5.10 permits a conventional local-OUTPUT transaction through mangle/OUTPUT mark-driven
+    rerouting, an RPDB local route through loopback, and mark-qualified loopback PREROUTING TPROXY.
+    MARK alone remains insufficient, Android qualification is still open, TC `bpf_sk_assign()` is a
+    separate experimental candidate requiring its own ADR, and production `.ko` loading remains
+    prohibited.
 
 ## Notes
 
@@ -55,6 +60,12 @@ Pins current dae, Re:Kernel/ReKernel-X, NetProxy-Magisk, Box for Root, AndroidTP
 ### [Expanded eBPF and kernel-extension assessment (2026-07)](ebpf-and-kernel-extensions-2026-07.md)
 
 Reconciles the peer-project findings with Linux/AOSP primary sources. It defines the per-domain eBPF mechanism ladder, corrects child-cgroup and `clsact` lifecycle assumptions, evaluates TC socket assignment and newer hooks, and records why Flux must not make `.ko` loading a production fallback.
+
+### [Local-origin transparent-capture mechanisms on Linux 5.10 (2026-07)](local-output-capture-mechanisms-2026-07.md)
+
+Traces local OUTPUT through Linux 5.10 routing and loopback receive processing, compares conventional
+TPROXY, `sk_lookup`, cgroup rewriting, TC `bpf_sk_assign()`, and LKM options, and defines the exact
+dual-stack TCP/UDP qualification and cleanup evidence required before production or Android use.
 
 ## Cloned source families
 

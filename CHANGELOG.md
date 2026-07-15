@@ -11,6 +11,20 @@ All notable changes to the Flux project will be documented in this file.
   further rewrite alpha/beta/release-candidate/public release may ship until `fluxd` owns the
   intended runtime and legacy runtime components are absent from the package.
 
+### Local-OUTPUT TPROXY qualification
+- Corrected the earlier kernel-wide interpretation of the local-OUTPUT experiment. Linux 5.10 can
+  recompute a marked OUTPUT route, select an RPDB local route through loopback, and re-enter
+  PREROUTING. ADR-0012 selects that two-hook transaction as the first conventional qualification
+  candidate while keeping canonical lowering and the production driver fail-closed until the full
+  mark, route, listener, escape, ownership, and cleanup contract is implemented and Android-
+  qualified.
+- Added `cargo xtask test-functional-canary-linux-output-tproxy`, an opt-in, mechanism-only
+  disposable-namespace checkpoint for IPv4/IPv6 TCP and UDP mark-driven loopback reinjection,
+  transparent-listener original-destination delivery, response loop escape, counters, negative
+  controls, no-autoload refusal, and exact inverse cleanup. It does not combine the distinct-UID
+  preflight, construct Generation/canary authority, run a production report producer, or qualify
+  Android.
+
 ### Canonical xtables lowering
 - Added a pure, non-authorizing schema-v1 canonical lowerer for forwarded-ingress Capture Programs.
   It validates the sealed family/clause shape, exact loopback safety, address families, input-
@@ -19,9 +33,10 @@ All notable changes to the Flux project will be documented in this file.
   emits protocol-qualified TCP/UDP TPROXY rules into deterministic generation-namespaced but
   unattached prepare/retire mangle chains. Domain-separated lowering, family-pair, and artifact-set
   identities bind the source-program and restore-syntax digests, entry names, and resource
-  accounting. Local OUTPUT is rejected because
-  MARK-only OUTPUT does not prove PREROUTING traversal or TPROXY-listener delivery. Established-flow
-  caching, transparent-socket DIVERT, FakeIP ICMP, QUIC rejection, and MSS clamping are also explicit
+  accounting. Local OUTPUT is rejected because MARK-only OUTPUT lacks the reviewed RPDB local
+  route, mark-qualified loopback PREROUTING TPROXY companion, and listener-delivery transaction.
+  Established-flow caching, transparent-socket DIVERT, FakeIP ICMP, QUIC rejection, and MSS
+  clamping are also explicit
   unsupported extensions. The artifacts do not attach built-in hooks, invoke restore, inspect live
   state, prove cleanup invertibility, perform readback/rollback, or grant mark, writer, ownership,
   prepared/active, coordinator, or activation authority.

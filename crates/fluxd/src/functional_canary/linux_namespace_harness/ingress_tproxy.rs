@@ -10,13 +10,10 @@
 use super::*;
 use serde_json::Value;
 
-mod transparent_tcp;
-mod transparent_udp;
-
-use transparent_tcp::{
+use super::transparent_tcp::{
     TransparentTcpListener, connect_marked as connect_marked_tcp, socket_mark as tcp_socket_mark,
 };
-use transparent_udp::{
+use super::transparent_udp::{
     TransparentUdpListener, connect_marked as connect_marked_udp,
     connect_transparent_marked as connect_transparent_marked_udp, socket_mark as udp_socket_mark,
 };

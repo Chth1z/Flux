@@ -48,6 +48,11 @@ static JSON_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 mod distinct_uid;
 mod ingress_tproxy;
+mod local_output_tproxy;
+#[path = "linux_namespace_harness/ingress_tproxy/transparent_tcp.rs"]
+mod transparent_tcp;
+#[path = "linux_namespace_harness/ingress_tproxy/transparent_udp.rs"]
+mod transparent_udp;
 
 #[test]
 #[ignore = "requires Linux user/mount/network namespace authority"]
@@ -70,6 +75,12 @@ fn privileged_dual_stack_canary_exercises_real_topology_and_cleanup() {
 #[ignore = "requires Linux user/mount/network namespace and TPROXY authority"]
 fn privileged_ingress_tproxy_checkpoint_exercises_real_capture_counters_and_cleanup() {
     ingress_tproxy::run();
+}
+
+#[test]
+#[ignore = "requires Linux user/mount/network namespace and local-OUTPUT TPROXY authority"]
+fn privileged_local_output_tproxy_checkpoint_exercises_loopback_reinjection_and_cleanup() {
+    local_output_tproxy::run();
 }
 
 #[test]

@@ -187,7 +187,8 @@ Planning Authority or receipt, writer/ownership token, embedded backend renderer
 names, prepared/active conversion, Runtime Reconciler entry point, or functional-canary authority.
 The separate Phase 4 lowerer may consume a forwarded-ingress-only artifact with a non-authorizing
 namespace and mark candidate, but does not mutate or promote the source value. It rejects local
-OUTPUT because MARK-only OUTPUT does not prove TPROXY delivery. The bridge shell remains the sole
+OUTPUT because MARK-only OUTPUT lacks the reviewed RPDB local route, mark-qualified loopback
+PREROUTING TPROXY companion, and listener-delivery transaction. The bridge shell remains the sole
 executed networking writer, and no shadow or lowered output is accepted by the Phase 1
 `RuntimeCoordinator`.
 
@@ -472,9 +473,9 @@ preserves ordered direct decisions as uncached returns, expands terminal whole-s
 negation as positive proxy membership, and emits protocol-qualified TCP/UDP TPROXY rules into
 generation-namespaced but unattached mangle chains. Family prepare/retire artifacts, entry metadata,
 resource accounting, and domain-separated identities are deterministic. Local OUTPUT is rejected:
-an OUTPUT MARK-only chain does not establish PREROUTING traversal or delivery to the selected TPROXY
-listener. Established-flow caching, transparent-socket DIVERT, FakeIP ICMP, QUIC rejection, and MSS
-clamping are also explicit unsupported extensions.
+an OUTPUT MARK-only chain lacks the reviewed RPDB local route, mark-qualified loopback PREROUTING
+TPROXY companion, and listener-delivery transaction. Established-flow caching, transparent-socket
+DIVERT, FakeIP ICMP, QUIC rejection, and MSS clamping are also explicit unsupported extensions.
 
 This canonical artifact has no stable hook attachment, restore invocation, live readback, rollback,
 cleanup-invertibility proof, mark lease, writer/ownership token, prepared/active conversion, or
@@ -669,10 +670,20 @@ and injects traffic from a third probe namespace through PREROUTING into a test-
 relay. Its current dual-stack TCP/UDP echo plus DNS-over-UDP/TCP slice proves ingress TPROXY,
 accepted-socket and strict ancillary-data original-destination recovery, marked relay egress,
 source-preserving UDP replies, nonce-bound DNS transaction/question/answer evidence, per-family
-route controls/counters, and cleanup. This ingress evidence cannot authorize residual
-local OUTPUT: in the harness kernel, an OUTPUT mark plus local policy route did not re-enter
-PREROUTING, and xtables TPROXY cannot attach to OUTPUT. OUTPUT counters and route lookups are
-therefore negative-control evidence only. The strict Linux/Android `/proc` FD plus INET_DIAG
+route controls/counters, and cleanup. This ingress evidence cannot authorize residual local OUTPUT.
+Linux 5.10 source shows that a mark-triggered OUTPUT reroute can select a local route through
+loopback and re-enter PREROUTING, but the checked-in ingress harness selects the veth interface and
+does not exercise that transaction; xtables TPROXY also cannot attach directly to OUTPUT. OUTPUT
+counters and route lookups therefore remain supporting or negative-control evidence only until a
+dedicated canary proves the complete mark, route, loopback TPROXY, listener, escape, and cleanup
+path. ADR-0012 selects that candidate and requires listener plus RPDB/local-route preparation,
+mark-qualified `-i lo` PREROUTING TPROXY before OUTPUT activation, and OUTPUT detachment plus absence
+proof before listener/route teardown. The opt-in
+`cargo xtask test-functional-canary-linux-output-tproxy` checkpoint exercises dual-stack TCP/UDP
+delivery, original destination, counters, response bypass, safe misses, no-autoload refusal, and
+exact baseline cleanup in a disposable Linux namespace. It remains mechanism-only host evidence:
+the distinct-UID preflight, Generation authority, production reports/receipts, and Android
+qualification are separate gates. The strict Linux/Android `/proc` FD plus INET_DIAG
 collector now binds protocol, exact tuple, UID, mark, FD/inode/cookie, complete dumps, supervised
 process identity, and timing. Its prebound session API now exposes the real kernel netlink port ID
 before collection, preserves one owned FD with monotonic sequences across snapshots, consumes and
@@ -697,8 +708,8 @@ request, probe UID, nonce, tuple, payload, listener cookie, authoritative delive
 loss state, and chronology. The gate evidence owns that receipt and revalidates it with the retained
 flows and client cleanup lifetime. Its sealed production verifier authority remains uninhabited.
 The current zero-state xtables driver reports `Unsupported` with cleanup `NotRequired` before
-mutation because OUTPUT marking does not reach PREROUTING TPROXY; the prepared/raw type is
-uninhabited, so no
+mutation because it does not implement or authorize that complete local-OUTPUT transaction; the
+prepared/raw type is uninhabited, so no
 positive evidence can be emitted. Required mode treats that result as a failed gate and never
 reaches `RUNNING`. Attempt-owned UID/GID/PID/start-tick/handle binding, observer/report parsing and
 factories, actual prebound collector use, a real traffic producer, capability-qualified execution,

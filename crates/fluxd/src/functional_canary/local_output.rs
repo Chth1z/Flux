@@ -1,11 +1,11 @@
 //! Fail-closed local-OUTPUT functional-canary executor boundary.
 //!
 //! The selected request backend is always TPROXY. The current xtables capture
-//! program can mark local OUTPUT, but its TPROXY action exists only in
-//! PREROUTING, and the privileged harness proved that local policy routing does
-//! not make those packets re-enter PREROUTING. Consequently the xtables driver
-//! below has no prepared-attempt value and reports `Unsupported` before it can
-//! acquire a networking writer or mutate capture state.
+//! program can mark local OUTPUT, but it does not implement or authorize the
+//! complete route-recomputed local path through loopback into a mark-qualified
+//! PREROUTING TPROXY rule and the exact transparent listener. Consequently the
+//! xtables driver below has no prepared-attempt value and reports `Unsupported`
+//! before it can acquire a networking writer or mutate capture state.
 //!
 //! Future device-specific drivers return unverified capture proof, process
 //! proof, and raw observations. Separate sealed verifiers must bind both proof
@@ -33,7 +33,7 @@ use super::{
     UnqualifiedFunctionalCanaryExecutor, bounded_prefix,
 };
 
-const XTABLES_LOCAL_OUTPUT_UNSUPPORTED: &str = "the xtables capture program marks local OUTPUT but applies TPROXY only in PREROUTING; local routing does not re-enter that hook, and REDIRECT, DNAT, ingress traffic, counters, and route lookups are prohibited substitutes";
+const XTABLES_LOCAL_OUTPUT_UNSUPPORTED: &str = "the current xtables driver has no authorized complete local-OUTPUT transaction: MARK-only OUTPUT lacks the reviewed RPDB local route, loopback-reachable mark-qualified PREROUTING TPROXY rule, exact transparent-listener delivery, loop escape, and cleanup proof; REDIRECT, DNAT, unrelated ingress traffic, counters, and route lookups are prohibited substitutes";
 const NON_TPROXY_REQUEST: &str =
     "the local-OUTPUT functional-canary executor accepts only the request-selected TPROXY backend";
 
@@ -1947,8 +1947,9 @@ fn contract_failure(
     FunctionalCanaryError::new(kind, cleanup, &diagnostic)
 }
 
-/// The legacy xtables program has no device-supported local-OUTPUT TPROXY
-/// mechanism. This zero-state driver intentionally owns no mutation handle.
+/// The current xtables driver has not implemented or device-qualified the
+/// complete local-OUTPUT TPROXY transaction. This zero-state driver
+/// intentionally owns no mutation handle.
 #[derive(Clone, Copy, Debug, Default)]
 struct XtablesTproxyLocalOutputDriver;
 
@@ -2300,7 +2301,8 @@ mod tests {
             CanaryErrorKind::Availability(CanaryAvailability::Unsupported)
         );
         assert_eq!(error.cleanup(), CanaryCleanupStatus::NotRequired);
-        assert!(error.diagnostic().contains("TPROXY only in PREROUTING"));
+        assert!(error.diagnostic().contains("no authorized complete"));
+        assert!(error.diagnostic().contains("loopback-reachable"));
         assert!(error.diagnostic().contains("prohibited substitutes"));
     }
 

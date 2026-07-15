@@ -33,9 +33,11 @@ from the compatibility oracle are review inputs for later differential work.
 
 A shadow artifact is deliberately non-authorizing. It has no Generation ID, Planning Authority,
 writer token, ownership lease, prepared/active conversion, Runtime Coordinator entry point, or
-kernel object names. It is not rendered to xtables, nftables, routes, TUN configuration, or eBPF,
-and its digest is not a Generation Capture Program digest accepted by activation or the functional
-canary. This checkpoint claims neither byte-for-byte restore parity nor device semantic parity.
+kernel object names. It does not itself authorize or execute xtables, nftables, routes, TUN
+configuration, or eBPF, and its digest is not a Generation Capture Program digest accepted by
+activation or the functional canary. A separate pure lowerer may consume a supported shadow shape
+without promoting the source artifact. This checkpoint claims neither byte-for-byte restore parity
+nor device semantic parity.
 
 Each compatibility component is retired only after its Rust replacement passes all applicable
 gates: canonical rendering and differential fixtures, backend and real-device behavior, failure
@@ -84,6 +86,18 @@ configuration, and replacement caches before stopping the active runtime. A fail
 preparation preserves that runtime.
 
 `scripts/tproxy` remains the sole restore executor and kernel writer. Native restore execution,
-exact readback, rollback qualification, the transition lease, canonical Capture Program lowering,
+exact readback, rollback qualification, the transition lease, complete local-OUTPUT lowering,
 real-device evidence, nftables, TUN, production eBPF, implicit module requests, and `.ko`/KPM paths
 remain outside this cutover.
+
+The extension-free schema-v1 forwarded-ingress lowerer is now delivered separately from
+`LegacyRulesPlan`. It consumes a supported shadow artifact and emits deterministic, unattached
+generation-namespaced prepare/retire syntax without acquiring writer or activation authority.
+
+Local-OUTPUT research also identified a contract boundary rather than a categorical oracle defect.
+The frozen shell source shape places its generic loopback bypass after an optional connmark-
+qualified fast path; that historical variant may encode a related local-output path, but it does not
+define or qualify the mandatory packet-mark-qualified loopback PREROUTING companion selected by
+ADR-0012. The shell remains useful evidence for source behavior and rollback during development,
+but byte parity with that behavior cannot veto a qualified target-semantic change. The native
+compiler must follow ADR-0012 and retire any superseded shell behavior at the component cutover.

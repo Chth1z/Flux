@@ -113,10 +113,10 @@ uncached `RETURN`; selected forwarded traffic receives protocol-qualified TPROXY
 
 The resulting prepare/retire documents declare, fill, flush, and delete only unattached
 generation-namespaced implementation chains. The suite verifies that neither artifact modifies a
-built-in hook. Local OUTPUT is an explicit error because a MARK-only OUTPUT chain does not prove
-PREROUTING traversal or delivery to the selected TPROXY listener. Established-flow caching,
-transparent-socket DIVERT, FakeIP ICMP, QUIC rejection, and MSS clamping are also explicit schema-v1
-errors.
+built-in hook. Local OUTPUT is an explicit error because a MARK-only OUTPUT chain lacks the reviewed
+RPDB local route, mark-qualified loopback PREROUTING TPROXY companion, and listener-delivery
+transaction. Established-flow caching, transparent-socket DIVERT, FakeIP ICMP, QUIC rejection, and
+MSS clamping are also explicit schema-v1 errors.
 
 Passing this suite proves pure syntax lowering only. It does not invoke `iptables-restore` or
 `ip6tables-restore`, inspect kernel state, prove cleanup invertibility, allocate an Android mark,
@@ -278,10 +278,34 @@ DNS transaction/question/answer evidence, per-family route controls, independent
 counters, and cleanup. The deterministic
 regression `ingress_rule_plan_never_places_tproxy_in_output` preserves the hook boundary.
 
-This split records an observed kernel boundary. In the privileged harness environment, marking a
-locally generated OUTPUT packet and selecting a local policy route did not make that packet
-traverse PREROUTING or reach the TPROXY listener; xtables TPROXY also cannot attach to OUTPUT.
-OUTPUT mark counters and route lookups are therefore negative controls, not capture success.
+The selected conventional local-OUTPUT mechanism has a separate opt-in checkpoint:
+
+```text
+cargo xtask test-functional-canary-linux-output-tproxy
+FLUX_LINUX_CANARY_REQUIRED=1 cargo xtask test-functional-canary-linux-output-tproxy
+```
+
+The command selects the exact ignored test
+`functional_canary::linux_namespace_harness::privileged_local_output_tproxy_checkpoint_exercises_loopback_reinjection_and_cleanup`.
+Following ADR-0012, it prepares transparent TCP/UDP listeners, reviewed disposable RPDB local
+routes, private chains, and mark-qualified loopback PREROUTING TPROXY before attaching the local
+OUTPUT classifiers last. Cleanup detaches and proves absence of OUTPUT first, retains the listener
+through that boundary, and then replays exact inverses. The test requires positive IPv4/IPv6 TCP
+accept and UDP original-destination delivery, boundary and response-bypass counters, safe misses,
+zero egress leakage, stable module/registration inventories, and exact xtables/RPDB/route/link
+baseline restoration.
+
+This checkpoint is mechanism-only host evidence in one test process and network namespace. It does
+not combine the separate distinct-UID preflight, use a Generation or production receipt authority,
+consume a supervised Proxy Engine report, or qualify Android. Optional mode may skip only a denied
+or unavailable outer/preflight prerequisite before the isolated transaction begins; any later
+mutation, traffic, evidence, or cleanup failure remains a test failure.
+
+This split records a traffic-domain boundary, not a kernel-wide impossibility result. The ingress
+checkpoint selects a veth interface and does not exercise a locally generated packet rerouted
+through loopback. Linux 5.10 source permits that loop to re-enter PREROUTING, while xtables TPROXY
+still cannot attach directly to OUTPUT. OUTPUT mark counters and route lookups therefore remain
+supporting or negative-control evidence, not capture success by themselves.
 The strict Linux/Android `/proc` FD plus INET_DIAG collector is delivered and rejects evidence
 unless protocol, exact tuple, UID, mark, FD/inode/cookie, complete dumps, supervised-process
 identity, and timing all agree. Its prebound session API exposes the real nonzero netlink port ID
@@ -357,9 +381,10 @@ and daemon network namespace. Mismatch is cleanup-uncertain, the evidence factor
 and the adapter retains termination/reap ownership.
 
 Both production receipt authorities therefore remain uninhabited, and the current zero-state
-xtables driver still returns `Unsupported` before mutation because OUTPUT marking does not reach
-PREROUTING TPROXY. The combined integration checkpoint remains incomplete and is split into the
-following remaining reviews: final verifier-side completion chronology and prepared-driver
+xtables driver still returns `Unsupported` before mutation because it does not implement or
+authorize the complete OUTPUT mark, RPDB local route, mark-qualified loopback PREROUTING TPROXY,
+listener, escape, and cleanup transaction. The combined integration checkpoint remains incomplete
+and is split into the following remaining reviews: final verifier-side completion chronology and prepared-driver
 client/peer ownership and retirement; an independent listener observer that proves
 UDP listener state, FD/inode/cookie, transparency, and IPv6-only state; a bounded versioned
 supervised-report parser and immutable engine capability contract; and actual prebound collector
@@ -432,7 +457,7 @@ optional mode and fail in required mode. Exact-map, namespace, or credential dri
 availability probe fails in both modes. Root/root, same-UID, broad-map, overflow-ID, inherited-
 group, and confined mapped-root fallbacks are rejected. This proves credential capability only;
 it does not install local-OUTPUT capture, run Sing-Box, construct schema-v2 evidence, or qualify
-Android. None of the three Linux commands is part of `cargo xtask ci`, and none may invoke `sudo`,
+Android. None of the four Linux commands is part of `cargo xtask ci`, and none may invoke `sudo`,
 `modprobe`, load a `.ko`, or trigger implicit module autoload. The ingress TPROXY preflight runs
 before rule mutation and refuses to continue unless the target, mark/comment matches, family
 TPROXY support, and selected xtables backend support are already active under `/sys/module`.

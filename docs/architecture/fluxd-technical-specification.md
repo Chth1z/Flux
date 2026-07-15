@@ -985,13 +985,14 @@ deterministic and domain-separated. They bind the source-program and restore-syn
 names, and resource accounting. Resource accounting records source clauses, expanded match rules,
 implementation chains, prepare/retire commands, and maximum jump depth.
 
-Schema v1 rejects local OUTPUT because a MARK-only OUTPUT chain does not re-enter PREROUTING or prove
-delivery to the selected TPROXY listener. It also rejects established-flow caching,
+Schema v1 rejects local OUTPUT because a MARK-only OUTPUT chain omits the authorized RPDB local
+route, mark-qualified loopback PREROUTING TPROXY companion, exact listener delivery, loop escape,
+activation, and cleanup transaction. It also rejects established-flow caching,
 transparent-socket DIVERT, FakeIP ICMP, QUIC rejection, and MSS clamping. The artifacts do not attach
 to `PREROUTING` or `OUTPUT`, invoke restore, inspect live state, prove cleanup invertibility, perform
 readback or rollback, acquire ownership, enter the journal/coordinator, or construct prepared/active
-state. The next cutover must first qualify a real local-OUTPUT mechanism, then add any required typed
-extensions and the stable-hook/native-writer transaction.
+state. The next cutover must first represent and qualify the complete ADR-0012 local-OUTPUT
+transaction, then add any required typed extensions and the stable-hook/native-writer transaction.
 
 ### 10.4 Native restore invocation
 
@@ -1227,12 +1228,30 @@ xtables TPROXY, the harness requires the target, mark/comment matches, family TP
 selected xtables backend support to be visible as already active under `/sys/module`; it refuses
 implicit kernel-module autoload.
 
-That checkpoint does not qualify local OUTPUT. Empirically, in the harness kernel, an OUTPUT mark
-followed by a local policy route did not cause the packet to traverse PREROUTING or reach the
-TPROXY listener, and xtables rejects TPROXY in OUTPUT. An OUTPUT mark counter, proxy-table route
-lookup, or zero peer observation is therefore a negative route/loop control, never positive
-capture evidence. The deterministic regression
+That checkpoint does not qualify local OUTPUT. Its exact PREROUTING selectors are tied to the veth
+ingress domain, while Linux 5.10 source permits a mark-triggered OUTPUT reroute to select an
+`RTN_LOCAL` route through loopback and re-enter PREROUTING. Xtables still rejects TPROXY directly in
+OUTPUT. An OUTPUT mark counter, proxy-table route lookup, or zero peer observation is therefore
+never positive capture evidence; a separate checkpoint must prove the complete loopback-reinjected
+listener path. The deterministic regression
 `ingress_rule_plan_never_places_tproxy_in_output` preserves the rule-placement boundary.
+
+ADR-0012 selects the conventional local candidate as one ordered transaction. Preparation binds
+the exact transparent TCP/UDP listeners, reviewed masked mark, RPDB rules, local default routes
+through loopback, private chains, mark-qualified `-i lo` PREROUTING TPROXY hooks, and zero-state
+readback before OUTPUT becomes reachable. OUTPUT attachment is the activation boundary. Retirement
+removes and proves absence of every OUTPUT attachment first, keeps the listener available until
+that proof completes, and only then retires PREROUTING, listener, routes, rules, and private objects
+by exact inverse identity.
+
+`cargo xtask test-functional-canary-linux-output-tproxy` selects the exact ignored test
+`functional_canary::linux_namespace_harness::privileged_local_output_tproxy_checkpoint_exercises_loopback_reinjection_and_cleanup`.
+The disposable host checkpoint proves IPv4/IPv6 TCP accept and UDP original-destination delivery,
+positive hook/delivery counters, bypass-mark replies, safe misses, zero peer leakage, no implicit
+module autoload, and baseline restoration. It is mechanism-only evidence in one test process and
+namespace; it does not combine the distinct-UID checkpoint, mint Generation/canary authority,
+consume a production Proxy Engine report, or qualify Android.
+
 The strict Linux/Android `/proc` FD plus INET_DIAG collector is now delivered. One caller-supplied
 exclusive deadline bounds identical pre/post socket-FD inventories plus complete IPv4/IPv6 TCP and
 connected-UDP dumps. Correlation is accepted only when protocol, exact local/remote tuple, UID,
@@ -1378,8 +1397,9 @@ Network Epoch/snapshot, Capture Program, ownership, engine/listener, selector, n
 cannot be replayed independently. Every required family/transport slot must then correlate its
 request UID, tuple, payload, listener cookie, and exact schema-v2 delivery event under unique
 loss-free sequence and monotonic-time bounds. The current xtables driver is zero-state, owns no
-networking writer, and always returns `Unsupported` before mutation because its local OUTPUT path
-only sets a mark while TPROXY exists in PREROUTING. It never emits TPROXY in OUTPUT and never falls
+networking writer, and always returns `Unsupported` before mutation because it does not implement
+or authorize the complete OUTPUT mark, RPDB local route, mark-qualified loopback PREROUTING TPROXY,
+listener, escape, and cleanup transaction. It never emits TPROXY in OUTPUT and never falls
 back to REDIRECT/DNAT, promotes ingress PREROUTING evidence, infers success from counters or route
 lookups, or uses a veth bounce. The required-mode coordinator treats this unsupported result as a
 failed functional gate, post-observes the attempt binding, compensates capture first, and never

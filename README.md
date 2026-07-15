@@ -8,9 +8,15 @@ Flux is an Android transparent-proxy module for Magisk, KernelSU, and APatch. It
 [sing-box](https://sing-box.sagernet.org/) as an external proxy engine and is being migrated to a
 single Rust controller, `fluxd`.
 
-## Current release contract
+## Pre-release rewrite contract
 
-The current branch is a Phase-1 bridge, not the completed native rewrite:
+The current Rust rewrite branch is development-only and is not a releasable module. There will be
+no public bridge, alpha, beta, or release-candidate build from this line until the intended runtime
+is fully Rust-owned and the legacy runtime components have been removed. Intermediate commits may
+break obsolete internal schemas and compatibility surfaces when that accelerates a cleaner Rust
+design.
+
+The current development checkpoint is a Phase-1 bridge:
 
 - `fluxd` owns administrative intent, serialized lifecycle, Generation recovery, and the Sing-Box
   child process.
@@ -22,9 +28,9 @@ The current branch is a Phase-1 bridge, not the completed native rewrite:
   as the frozen oracle.
 - `scripts/tproxy` remains the sole restore executor and xtables kernel writer. Shell adapters also
   retain policy-routing and address-derived rule mutation until their later ownership cutovers.
-- The shipped bridge accepts only `PROXY_MODE="tproxy"`. TUN fields are reserved for a future
+- The development bridge accepts only `PROXY_MODE="tproxy"`. TUN fields are reserved for a future
   single-owner implementation and are rejected before activation.
-- Production capture verification is still structural. The stricter functional local-OUTPUT
+- Current pre-release bridge capture verification is still structural. The stricter functional local-OUTPUT
   canary exists as staged development work but is not yet an Android release qualification.
 - Kernels below 5.10 remain queryable in a non-mutating read-only state.
 - eBPF is optional future observation/acceleration work. Flux packages no `.ko`, KPM, or opaque
@@ -32,6 +38,12 @@ The current branch is a Phase-1 bridge, not the completed native rewrite:
   yet proved that every xtables dependency is already active without implicit kernel autoload.
 
 The detailed design and current gates are documented under [`docs/`](docs/README.md).
+
+Temporary shell components remain only because they are still the sole proven writer/oracle for
+specific networking state. They are not a compatibility promise: each is removed as soon as its
+Rust replacement passes the required readback, rollback, recovery, single-writer, and Android
+cutover gates. The final package may retain only platform-required installation/boot/disable/uninstall glue;
+that glue will contain no networking policy or cleanup implementation.
 
 ## Capabilities
 
@@ -44,13 +56,16 @@ The detailed design and current gates are documented under [`docs/`](docs/README
 - CLI control through the private `fluxd` Unix socket.
 - Zashboard redirect at `http://127.0.0.1:9090/ui/` when the configured Sing-Box API is available.
 
-## Installation and upgrades
+## Existing published builds
 
-1. Download a release ZIP from [Releases](https://github.com/Chth1z/Flux/releases).
-2. Install it through Magisk Manager, KernelSU, or APatch.
-3. Configure `/data/adb/flux/conf/settings.ini` and, when needed, the strict daemon configuration
-   `/data/adb/flux/conf/flux.toml`.
-4. Reboot.
+The [Releases](https://github.com/Chth1z/Flux/releases) page may contain legacy or incomplete
+hybrid/pre-policy artifacts. Those artifacts are not releases of the completed Rust rewrite.
+Development staging from this branch is for controlled testing only and must not be presented as an
+installable rewrite release. No further rewrite alpha, beta, release candidate, or public release is
+permitted until the full-Rust release gate passes.
+
+The current installer migration behavior below documents the temporary development bridge and may
+change incompatibly before release:
 
 Upgrade preservation is per file:
 
@@ -203,7 +218,7 @@ subscription bridge.
 | `PROXY_PORT` | TPROXY listener port; extracted only from a `tproxy` inbound | `1536` |
 | `FAKEIP_V4_RANGE` | FakeIP IPv4 range | `198.18.0.0/15` |
 | `FAKEIP_V6_RANGE` | FakeIP IPv6 range | `fc00::/18` |
-| `PROXY_MODE` | Shipped bridge mode; only `tproxy` is accepted | `tproxy` |
+| `PROXY_MODE` | Current development bridge mode; only `tproxy` is accepted | `tproxy` |
 | `TUN_INTERFACE`, `TUN_INET4_ADDRESS`, `TUN_INET6_ADDRESS`, `TUN_MTU` | Reserved and migrated, but unsupported in Phase 1 | packaged values |
 
 A `mixed` inbound is not a transparent TPROXY listener and is therefore not used for automatic
@@ -261,12 +276,13 @@ commands use only the private control socket and never fall back to direct shell
 
 ## Development status
 
-Build, test, privileged canary, Android cross-build, staging, and release-verification instructions
-are in [`docs/development.md`](docs/development.md). A staged development tree is not release-ready
-until `cargo xtask verify-package` validates the complete module layout, AArch64 ELF artifacts,
-immutable-revision provenance and hashes, recognized SPDX/`LicenseRef` records cross-bound to the
-SBOM, hashed device evidence, pinned build metadata, complete package checksums, and confirms that
-no `.ko`/`.kpm` payload is present.
+Build, test, privileged canary, Android cross-build, staging, and package-consistency instructions
+are in [`docs/development.md`](docs/development.md). The current `cargo xtask verify-package` checks
+the temporary hybrid stage and cannot make it releasable. Before publication, its inventory must be
+changed to the Rust-only runtime and reject standalone `addrsyncd`, `jq`, legacy runtime scripts,
+and compatibility wrappers, in addition to enforcing AArch64 ELF, immutable provenance/hashes,
+SBOM/license binding, trusted device evidence, pinned build metadata, checksums, and the no-kernel-
+payload policy.
 
 The delivered renderer is only the first non-mutating xtables cutover: Rust prepares compatibility
 bytes, while shell still owns restore execution, readback, rollback, and kernel mutation. Canonical

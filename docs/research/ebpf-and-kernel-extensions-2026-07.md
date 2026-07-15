@@ -6,6 +6,11 @@
 
 This note reconciles the existing [Android/kernel](android-network-kernel.md), [Rust/eBPF](rust-ebpf-netfilter.md), and [peer-project](peer-kernel-projects-2026-07.zh-CN.md) research with additional Linux and AOSP source review. It changes the ordering and granularity of the plan; it does not replace the conventional xtables, nftables, TUN, or rtnetlink correctness paths.
 
+> **Non-normative priority notice:** the implementation order in this research snapshot is
+> superseded by ADR-0011 and the current roadmap. Optional eBPF and preloaded-extension work remains
+> valid design input, but it must not delay canonical lowering, native ownership, or legacy-runtime
+> removal and cannot create an intermediate release.
+
 ## Executive conclusions
 
 1. `xt_bpf` should be Flux's first eBPF integration. It runs a pinned socket-filter program inside a Flux-owned xtables rule, avoids claiming a qdisc or Android root cgroup, and is present in AOSP's 5.10 base configuration. Availability still requires a complete program/map/pin/userspace-extension/packet-context/cleanup probe. [B1] [B2] [B3]

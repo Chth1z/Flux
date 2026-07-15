@@ -2,6 +2,11 @@
 
 Research was performed against pinned primary-source checkouts and official documentation. Upstream repositories were cloned into the operating-system temporary directory and were not vendored into Flux.
 
+> **Planning status:** these notes preserve research evidence and historical recommendations; they
+> are not the execution plan. ADR-0011 and the current implementation roadmap supersede any advice
+> to preserve bridge compatibility, publish an intermediate hybrid, or prioritize optional eBPF/
+> kernel work ahead of the Rust ownership/removal lane.
+
 ## Cross-cutting conclusions
 
 1. The current runtime is a migration hybrid: Rust `fluxd` now owns administrative intent, serialized lifecycle, Proxy Engine supervision, Generation recovery, and failure compensation, while shell remains the sole networking writer and standalone `addrsyncd` still owns address-derived rules.

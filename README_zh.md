@@ -8,9 +8,13 @@ Flux 是面向 Magisk、KernelSU 与 APatch 的 Android 透明代理模块。它
 [sing-box](https://sing-box.sagernet.org/) 作为独立代理引擎，并正在迁移到由单一 Rust
 控制器 `fluxd` 统一编排的架构。
 
-## 当前发布契约
+## 预发布重写契约
 
-当前分支仍是 Phase 1 过渡桥接版本，并非已经完成的原生 Rust 重写：
+当前 Rust 重写分支仅用于开发，不是可发布模块。在目标运行时完全由 Rust 接管、旧运行时组件全部移除
+之前，本分支不会发布公开 bridge、alpha、beta 或 release candidate。只要有助于更快形成干净的 Rust
+设计，中间提交可以破坏已经过时的内部 schema 与兼容接口。
+
+当前开发检查点仍是 Phase 1 过渡桥接：
 
 - `fluxd` 负责管理意图、串行生命周期、Generation 恢复以及 Sing-Box 子进程。
 - Rust 所有权下的准备阶段只调用 `fluxd render-legacy-rules`，生成保留的 source-shape restore
@@ -19,8 +23,8 @@ Flux 是面向 Magisk、KernelSU 与 APatch 的 Android 透明代理模块。它
   回滚路径，其他情况下 `scripts/rules` 仅作为冻结 oracle 保留。
 - `scripts/tproxy` 仍是唯一 restore 执行器和 xtables 内核写入者。在后续所有权切换前，策略路由与
   地址派生规则也仍由 shell 适配器修改。
-- 当前桥接仅接受 `PROXY_MODE="tproxy"`。TUN 字段为未来单一所有者方案保留，在激活前会被拒绝。
-- 生产路径的抓取验证仍是结构验证。更严格的本地 OUTPUT 功能 canary 已分阶段实现，但尚未构成
+- 当前开发桥接仅接受 `PROXY_MODE="tproxy"`。TUN 字段为未来单一所有者方案保留，在激活前会被拒绝。
+- 当前预发布桥接的抓取验证仍是结构验证。更严格的本地 OUTPUT 功能 canary 已分阶段实现，但尚未构成
   Android 发布资格证据。
 - 低于 5.10 的内核保持可查询、不可变更的只读状态。
 - eBPF 仅是未来可选的观测/加速能力。Flux 不打包 `.ko`、KPM 或不透明内核模块载荷，也不调用
@@ -28,6 +32,11 @@ Flux 是面向 Magisk、KernelSU 与 APatch 的 Android 透明代理模块。它
   自动加载。
 
 详细设计和当前门槛见 [`docs/`](docs/README.md)。
+
+临时 shell 组件继续存在，只因为它们仍是某些网络状态唯一已经证明可用的写入者或 oracle；这不是兼容
+承诺。每个 Rust 替代组件一旦通过 readback、rollback、recovery、单写入者和 Android 切换门槛，对应
+旧运行时组件就应立即删除。最终包只允许保留平台必需的安装、启动、禁用与卸载胶水，而且这些胶水不得包含
+网络策略或清理实现。
 
 ## 当前能力
 
@@ -40,13 +49,14 @@ Flux 是面向 Magisk、KernelSU 与 APatch 的 Android 透明代理模块。它
 - 通过 `fluxd` 私有 Unix socket 提供命令行控制。
 - 配置的 Sing-Box API 可用时，可通过 `http://127.0.0.1:9090/ui/` 进入 Zashboard。
 
-## 安装与升级
+## 已发布的旧版本
 
-1. 从 [Releases](https://github.com/Chth1z/Flux/releases) 下载发布 ZIP。
-2. 使用 Magisk Manager、KernelSU 或 APatch 安装。
-3. 配置 `/data/adb/flux/conf/settings.ini`；需要时同时配置严格校验的
-   `/data/adb/flux/conf/flux.toml`。
-4. 重启设备。
+[Releases](https://github.com/Chth1z/Flux/releases) 页面可能仍包含旧版或不完整的
+hybrid/旧政策产物；这些产物都不是“完整 Rust 重写”的发布版。当前分支的 development staging 只用于
+受控测试，不得作为可安装的重写版本对外发布。在完整 Rust 发布门槛通过之前，不再发布新的 rewrite
+alpha、beta、release candidate 或正式版本。
+
+下方迁移行为仅记录当前临时开发桥接，在正式发布前允许不兼容地调整：
 
 升级时按文件分别处理：
 
@@ -244,11 +254,11 @@ watchdog 拥有 `fluxd`。
 
 ## 开发状态
 
-构建、测试、特权 canary、Android 交叉编译、模块暂存和发布验证说明见
-[`docs/development.md`](docs/development.md)。开发暂存目录不等于可发布产物；只有在
-`cargo xtask verify-package` 验证完整模块布局、AArch64 ELF、带不可变 revision 的来源与哈希、和 SBOM
-交叉绑定的已识别 SPDX/`LicenseRef`、带哈希的设备证据、固定工具链构建元数据、完整包校验和，并确认
-不存在 `.ko`/`.kpm` 载荷后，才满足当前发布验证边界。
+构建、测试、特权 canary、Android 交叉编译、模块暂存和包一致性验证说明见
+[`docs/development.md`](docs/development.md)。开发暂存目录不等于可发布产物；当前
+`cargo xtask verify-package` 只检查临时 hybrid 包的一致性，即使通过也不能绕过 ADR-0011。发布前必须先
+把验证清单切换为纯 Rust 运行时，拒绝 standalone `addrsyncd`、`jq`、旧运行时脚本与兼容包装器，再完成
+不可变来源/哈希、SBOM、设备证据、固定工具链、完整校验和、可复现 provenance 与可信 attestation。
 
 已交付的渲染器只是 xtables 第一个非修改型切换：Rust 负责准备兼容字节，shell 仍负责 restore 执行、
 readback、回滚与内核修改。规范 Capture Program lowering 和原生所有权仍是相互独立、需要门槛验证的

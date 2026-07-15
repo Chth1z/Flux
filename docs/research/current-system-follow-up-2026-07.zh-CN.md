@@ -4,6 +4,10 @@
 
 > **历史快照说明：** 正文描述的是提交 `4360d79` 的实现，不应当作当前 HEAD 的实时状态。下方“快照后的进展”记录截至 `868729f` 的后续变化；仍未解决的问题继续保留为设计和回归依据。
 
+> **规划已更新：** 本文“建议的近期顺序”保留为历史研究结论，不再代表当前执行顺序。现行计划以
+> ADR-0011 与 `implementation-roadmap.md` 为准：先完成 Rust 所有权切换并删除被替代的旧运行时；
+> eBPF、`.ko` 和额外 canary 基础设施不得挤占主线，也不存在可发布的中间 bridge 版本。
+
 ## 快照后的进展（截至 `868729f`）
 
 在本快照之后，Network Inventory 已经进入纯规划层，而不再只是未消费的只读库存。分支已经加入：版本化 Android RPDB 分类、按 Traffic Domain 聚合的拓扑可行性报告、正向设备策略约束的 mark planning authority，以及第一块 snapshot-bound RPDB fwmark census fragment。

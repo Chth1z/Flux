@@ -4,6 +4,11 @@
 - Last updated: 2026-07-15
 - Companion document: [Fluxd Rewrite Blueprint](fluxd-blueprint.md)
 
+This specification describes both the target architecture and temporary development checkpoints.
+ADR-0011 controls publication: bridge, shadow, parity, and migration states are not releasable, and
+obsolete internal contracts may break when that accelerates the full Rust cutover. A final package
+contains no legacy runtime networking component or compatibility wrapper.
+
 ## 1. Supported platform contract
 
 | Item | Contract |
@@ -34,15 +39,17 @@ fluxd plan [--json] [--dry-run]
 fluxd subscription update
 fluxd diagnose [--bundle PATH]
 fluxd repair
-fluxd migrate --check-only
 fluxd recover --offline
 fluxd cleanup --offline
+# optional, only if it does not delay cutover:
+fluxd migrate --check-only
 ```
 
-The target-state `fluxctl` is a symlink or a small shell wrapper that executes the same binary. In
-the delivered Phase 1 bridge, the shell wrapper delegates authoritative status and every mutating
-control to `fluxd`, while `diagnose`, rule preview, logs, and other compatibility observations still
-use legacy read-only paths.
+The target-state `fluxctl` is a symlink/hardlink or direct multicall entry into the same Rust binary;
+it is not a policy-bearing shell compatibility wrapper. In the delivered pre-release Phase 1
+bridge, the temporary shell wrapper delegates authoritative status and every mutating control to
+`fluxd`, while `diagnose`, rule preview, logs, and other compatibility observations still use
+legacy read-only paths. That wrapper and those paths are removed as their Rust call sites land.
 
 Only `fluxd daemon` is long-lived. Sing-Box is its child. A boot shell watchdog may restart `fluxd` after a crash or fatal invariant exit, but it contains no policy logic, never invokes a second recovery owner, and does not restart a settled `UnsupportedKernel` daemon. Normal journal recovery runs inside daemon startup before mutating commands are accepted. `fluxd recover --offline` is an explicit salvage command that requires the daemon lease to be absent. The legacy `fluxctl restart` verb is a client alias for `ReloadSources` followed by `Converge(Configured)`; it has no separate protocol or lifecycle meaning.
 
@@ -96,11 +103,12 @@ enum MaintenanceCommand {
     UpdateSubscription,
     Diagnose { include_sensitive_metadata: bool },
     Repair,
+    // Optional build/API surface for already published legacy settings only.
     Migrate { write: bool },
 }
 ```
 
-The socket router is not the Controller Module. `ControllerWireCommand` maps to the selected `submit` Interface; `InspectCommand` maps to `snapshot`/`watch`; maintenance commands are dispatched to separate capability, planning, subscription, diagnostics, migration, or recovery Modules with their own authorization and failure contracts.
+The socket router is not the Controller Module. `ControllerWireCommand` maps to the selected `submit` Interface; `InspectCommand` maps to `snapshot`/`watch`; maintenance commands are dispatched to separate capability, planning, subscription, diagnostics, optional migration, or recovery Modules with their own authorization and failure contracts. The migration variant is omitted from the first release if implementing it would delay the Rust-only cutover.
 
 Separate Modules do not imply separate kernel writers. Capability probes, online repair, and every other operation that may create, attach, replace, or delete a kernel object are submitted through the same kernel-mutation scheduler and Generation fence as reconciliation. Offline `recover` and `cleanup` require the exclusive daemon lease and refuse to run while a live daemon owns it. Read-only planning/diagnostics and file-only migration may execute outside the kernel writer but use their own bounded state/configuration locks.
 
@@ -118,7 +126,7 @@ Packets larger than 1 MiB are rejected. The daemon verifies peer credentials and
 
 Request IDs are retained in a bounded recent-result cache so a retried mutating request is not applied twice.
 
-Phase 1 status returns `control` and `runtime` separately. `ControlSnapshot` describes desired/control progress. `RuntimeSnapshot` is an independently revisioned observed projection containing runtime phase, capture state, engine state, verification state, generation, and an optional bounded operation/message/recovery failure. Verification is required on the version-3 wire shape and is one of `structural_only`, `functional_pending`, `functional_passed`, or `functional_failed`. `structural_only` is the conservative no-functional-authorization baseline rather than proof that structural verification has completed. A functional pass is bound to the exact current Generation, engine, environment, and successful `RUNNING` publication; publication failure, identity loss, address resynchronization, restart, repair, or rollback invalidates it until a fresh gate succeeds. Clients must not infer observed health solely from administrative intent, request completion, runtime phase, or verification state in isolation. The production Phase 1 composition remains structural-only and Android-unqualified.
+Phase 1 status returns `control` and `runtime` separately. `ControlSnapshot` describes desired/control progress. `RuntimeSnapshot` is an independently revisioned observed projection containing runtime phase, capture state, engine state, verification state, generation, and an optional bounded operation/message/recovery failure. Verification is required on the version-3 wire shape and is one of `structural_only`, `functional_pending`, `functional_passed`, or `functional_failed`. `structural_only` is the conservative no-functional-authorization baseline rather than proof that structural verification has completed. A functional pass is bound to the exact current Generation, engine, environment, and successful `RUNNING` publication; publication failure, identity loss, address resynchronization, restart, repair, or rollback invalidates it until a fresh gate succeeds. Clients must not infer observed health solely from administrative intent, request completion, runtime phase, or verification state in isolation. The current pre-release Phase 1 composition remains structural-only and Android-unqualified.
 
 ## 4. Core domain types
 
@@ -863,6 +871,16 @@ bounded canonical syntax artifact. Its exact pinned-profile and branch-matrix te
 source-shape parity only. Cached-flow ordering, direct-action side effects, protocol eligibility,
 and other target semantic differences still require a separate canonical Capture Program lowering.
 
+Renderer-owned identity is schema-versioned and domain-separated. `LegacyRulesPlanDigest` binds
+every byte-significant compatibility input, including ordered and duplicate UID/interface facts,
+marks, owner tokens, family/feature gates, and FakeIP/MSS inputs. A
+`LegacyRulesArtifactPair` can be constructed only by rendering the mandatory apply and cleanup
+contexts for one family from one immutable plan. `LegacyRulesArtifactSet` always contains IPv4 and
+contains IPv6 exactly when that plan enables it. Pair and set digests bind the plan identity,
+context-qualified syntax-artifact digests, parser schema, and aggregate input-byte/line/
+transaction/declaration/command/token totals. These identities are neither signatures nor
+freshness, readback, rollback, writer, activation, or kernel-acceptance authority.
+
 ### 10.2 Delivered bridge cache-generation adapter
 
 The compatibility-only command is:
@@ -870,6 +888,9 @@ The compatibility-only command is:
 ```text
 fluxd render-legacy-rules --packages-list PATH --family 4|6 --action apply|cleanup
 fluxd snapshot-legacy-packages --source PATH
+fluxd attest-legacy-rules-set --generation ID --packages-list PATH \
+  --ipv4-apply PATH --ipv4-cleanup PATH \
+  [--ipv6-apply PATH --ipv6-cleanup PATH]
 ```
 
 The renderer reads a strict allowlist of exported generated-cache values, resolves Android package/user IDs
@@ -888,6 +909,32 @@ snapshot is bounded, non-symlink, read-only, shared by every parallel family/act
 copied with the prepared Generation. Successful cache publication records producer `rust`.
 Explicit legacy ownership instead sources `scripts/rules`, removes the package snapshot, and
 records `shell`. Candidate failure leaves the prior active Generation unchanged.
+
+After all enabled family/action renders succeed, `attest-legacy-rules-set` rereads the same strict
+allowlisted environment, resolves the plan from the bounded package snapshot, renders one complete
+renderer-owned set, and safely reads each supplied artifact without following the final symlink.
+Regular-file, size, descriptor identity, metadata stability, family presence, and exact byte
+equality are mandatory. Generation is canonical decimal `1..=2147483647`; IPv6 paths are required
+exactly when `PROXY_IPV6=1`. Success emits one canonical LF-terminated
+`FLUX_LEGACY_RULES_SET_MANIFEST_V1` document containing the Generation, family shape,
+plan/pair/set/artifact digests, and per-artifact/pair/set resource totals. Fixed field positions
+carry the IPv4/IPv6 plus apply/cleanup contexts; paths and timestamps are excluded.
+
+Shell removes any prior receipt before the first shared-cache rebuild mutation. It validates a
+bounded response envelope: nonempty size-limited content, the expected header, exactly one expected
+Generation, and the enabled-family shape. Trusted Rust owns canonical schema production and strict
+parsing/identity verification; shell does not claim to parse every manifest field. Stale receipts
+are invalidated and rebuilt/re-attested, never reused directly. An unresolved mismatch or failed
+attestation prevents `cache_valid` publication. The dispatcher copies the exact receipt into the
+candidate Generation as `legacy-rules.manifest` before `engine.manifest` and directory immutability.
+A non-Generation `fluxctl rules-preview` rebuild is serialized under the same dispatcher lock,
+deliberately emits no receipt, and cannot authorize later publication. The manifest exposes no restore execution API,
+writer/ownership token, live readback, rollback proof, prepared-capture conversion, or functional
+verification claim; `scripts/tproxy` remains the sole restore executor and kernel writer.
+
+These compatibility-only renderer, snapshot, and attestation commands are removed or made private
+with the bridge when native canonical lowering and restore ownership pass their cutover gate. They
+are not public release APIs.
 
 Explicit legacy restart similarly prepares and validates fresh settings, the replacement Sing-Box
 configuration, and every replacement cache before stopping the active runtime. Preparation failure
@@ -1112,7 +1159,7 @@ Delivered Phase 1 supervision additionally requires:
 - a direct-child `PR_SET_PDEATHSIG(SIGKILL)` lease with a post-arm parent-identity race check for Sing-Box and phase-shell processes;
 - bounded TERM/KILL/reap, restart windows, exponential backoff, and retained ownership until disappearance is observed.
 
-The Phase 1 transaction rejects TUN during `prepare`, before engine admission or networking mutation. It also requires `xt_owner` before initialization and revalidates it from the generated capability cache; the Rust-rendered legacy compatibility program sends every local OUTPUT policy through the application chain so the configured engine UID/GID bypass remains active even when application filtering is disabled. `ROUTING_MARK` is not accepted as equivalent authority because the bridge does not prove that the supervised engine applies it to its sockets. For admitted TPROXY state, start is `prepare` → engine admission → Generation-bound capture start → structural capture verification → configured functional gate → Generation-bound `RUNNING`, and stop is capture detach → engine stop/reap → `STOPPED`. The production daemon explicitly selects structural-only compatibility; required-mode tests execute the delivered Stage-1 exact-binding canary transaction, and the first Stage-2 Linux checkpoint now exercises the isolated dual-stack topology and cleanup without installing capture. Partial capture-start compensation retains Generation evidence until both networking writers prove cleanup; terminal publication and engine retirement are forbidden while detachment is uncertain. Reload prepares the candidate while the previous Generation remains active, preserves its pass on prepare-only failure, invalidates it before detachment, blocks replacement if detach fails, and attempts the previous immutable `EngineSpec` if candidate activation fails. An uncertain reload detach enters capture repair: prove full detachment, retain/reconcile the old engine, then republish and freshly verify that Generation. Publication failure, identity loss, repair/restoration, and address resynchronization require a fresh complete gate before retrying `RUNNING`. Candidate evidence never authorizes rollback publication. The current owner bypass is a compatibility loop-escape prerequisite; the socket-correlation collector, its prebound session and typed attempt-owned handoff transports, schema-v2 listener/delivery validator, temporal cleanup/retirement validator, fail-closed TPROXY-only local-OUTPUT executor seam, per-flow capture receipt, and process-ownership receipt contracts are delivered. The Linux/Android child-origin pidfd substrate and no-traffic live credential preflight are also delivered. Both production receipt authorities remain uninhabited; the positive traffic producer, real `EngineSupervisor`/`SingBoxChild` and prepared-driver child integration, production listener/report parser and factories, actual collector integration, and Android device qualification remain open.
+The Phase 1 transaction rejects TUN during `prepare`, before engine admission or networking mutation. It also requires `xt_owner` before initialization and revalidates it from the generated capability cache; the Rust-rendered legacy compatibility program sends every local OUTPUT policy through the application chain so the configured engine UID/GID bypass remains active even when application filtering is disabled. `ROUTING_MARK` is not accepted as equivalent authority because the bridge does not prove that the supervised engine applies it to its sockets. For admitted TPROXY state, start is `prepare` → engine admission → Generation-bound capture start → structural capture verification → configured functional gate → Generation-bound `RUNNING`, and stop is capture detach → engine stop/reap → `STOPPED`. The current pre-release bridge explicitly selects structural-only compatibility; required-mode tests execute the delivered Stage-1 exact-binding canary transaction, and the first Stage-2 Linux checkpoint now exercises the isolated dual-stack topology and cleanup without installing capture. Partial capture-start compensation retains Generation evidence until both networking writers prove cleanup; terminal publication and engine retirement are forbidden while detachment is uncertain. Reload prepares the candidate while the previous Generation remains active, preserves its pass on prepare-only failure, invalidates it before detachment, blocks replacement if detach fails, and attempts the previous immutable `EngineSpec` if candidate activation fails. An uncertain reload detach enters capture repair: prove full detachment, retain/reconcile the old engine, then republish and freshly verify that Generation. Publication failure, identity loss, repair/restoration, and address resynchronization require a fresh complete gate before retrying `RUNNING`. Candidate evidence never authorizes rollback publication. The current owner bypass is a compatibility loop-escape prerequisite; the socket-correlation collector, its prebound session and typed attempt-owned handoff transports, schema-v2 listener/delivery validator, temporal cleanup/retirement validator, fail-closed TPROXY-only local-OUTPUT executor seam, per-flow capture receipt, and process-ownership receipt contracts are delivered. The Linux/Android child-origin pidfd substrate and no-traffic live credential preflight are also delivered. Both production receipt authorities remain uninhabited; the positive traffic producer, real `EngineSupervisor`/`SingBoxChild` and prepared-driver child integration, production listener/report parser and factories, actual collector integration, and Android device qualification remain open.
 
 The delivered Linux evidence class is explicitly ingress-only. The command
 `cargo xtask test-functional-canary-linux-tproxy` selects the exact ignored test
@@ -1160,10 +1207,11 @@ dump snapshot reserves a new monotonic nonzero sequence range, and exhaustion fa
 wrapping. The opening deadline is the absolute upper bound for the session; later calls may shorten
 it but cannot extend it. Dropping either an unused session or any error path closes the observer.
 
-`SystemSocketDiagnosticsSource::collect_until` remains a compatibility wrapper that opens one
-temporary session and performs one collection. Successful stateful and compatibility snapshots
-retain the same complete PID/start-tick, stable pre/post FD inventory, four dump, bounds, tuple,
-cookie, mark, and timing guarantees.
+`SystemSocketDiagnosticsSource::collect_until` is a temporary in-tree migration wrapper that opens
+one session and performs one collection. It carries no compatibility promise and is removed after
+all call sites use the stateful API. While present, both paths retain the same complete
+PID/start-tick, stable pre/post FD inventory, four dump, bounds, tuple, cookie, mark, and timing
+guarantees.
 
 Binding the NETLINK_SOCK_DIAG socket does not itself request a protocol handler. Before the first
 production dump, the future capability-qualified attempt integration must prove that the required
@@ -1452,7 +1500,8 @@ Higher-level async tasks communicate through bounded channels. `io_uring` is a s
 ### 19.1 Build outputs
 
 - `fluxd` for `aarch64-linux-android`;
-- eBPF object(s) embedded in `fluxd` or packaged with verified hashes;
+- optional eBPF object(s), only when a qualified advertised plane is selected, embedded in `fluxd`
+  or packaged with verified hashes;
 - Sing-Box binary supplied by the release pipeline;
 - generated `manifest.json`, SBOM, checksums, and build metadata;
 - Magisk-compatible ZIP.
@@ -1467,9 +1516,10 @@ cargo xtask stage-module --stage <dir> --runtime-binaries <dir>
 cargo xtask verify-package --stage <dir>
 ```
 
-`stage-module` creates a development tree and does not claim release compliance. `verify-package`
-is a strict release-candidate consistency boundary. It requires a clean root worktree and clean
-`addrsyncd` submodule, binds their manifest revisions to the exact Git HEADs, byte-compares the
+`stage-module` creates a development tree and does not claim release compliance. The current
+`verify-package` is a strict consistency boundary for that temporary hybrid inventory, not a
+release-candidate authorization. It requires a clean root worktree and clean `addrsyncd` submodule,
+binds their manifest revisions to the exact Git HEADs, byte-compares the
 reviewed source-owned module inventory, and rejects every package file outside the exact four
 binaries, reviewed module files, declared evidence, and release metadata. Required binaries must
 be ELF64 little-endian AArch64 with a bounded file-backed executable entry, congruent load segments,
@@ -1486,40 +1536,50 @@ also required. Symbolic links, special files, unsafe paths, hidden or ordinary `
 and unreviewed Magisk root payloads fail.
 
 This command does not authenticate self-authored third-party provenance or unsigned device JSON.
-A pass is necessary but not sufficient for publication until the later `package-magisk` task
-verifies signed/reproducible third-party provenance and trusted device/CI attestations. The
-checked-in manifest intentionally retains blank third-party release fields, so an unqualified
-development stage must fail this command.
+It also verifies a package shape that deliberately still contains temporary bridge components.
+Before any rewrite release, the inventory and verifier must be updated to the Rust-only runtime;
+standalone `addrsyncd`, `jq`, legacy scripts, and compatibility wrappers must then be rejected rather
+than required. Even a pass of the updated verifier is necessary but not sufficient for publication:
+ADR-0011's runtime-completion gate and the later `package-magisk` signed/reproducible provenance plus
+trusted device/CI attestation gate must also pass. The checked-in manifest intentionally retains
+blank third-party fields, so an unqualified development stage must fail this command.
 
-The target release toolchain still requires the remaining commands below as later Phase 0/4/7
-deliverables:
+The target release toolchain still requires real-kernel tests, final packaging, and device tests as
+later deliverables. `build-ebpf` is required only when an eBPF plane is advertised:
 
 ```text
-cargo xtask build-ebpf
 cargo xtask test-linux
 cargo xtask package-magisk
 cargo xtask device-test --serial <adb-serial>
+# only for an advertised eBPF plane:
+cargo xtask build-ebpf
 ```
 
 The final packaging task must additionally reject KPM or any other opaque kernel payload form that
 cannot be classified by the current extension checks. Production `fluxd` does not call
 `init_module`, `finit_module`, or `delete_module`.
 
-## 20. Compatibility and removal schedule
+## 20. Pre-release development and removal schedule
 
-| Release stage | Runtime behavior |
-|---|---|
-| Bridge | `fluxd` owns Sing-Box through the atomic runtime coordinator; serialized shell phases still own networking writes and expose separate control/runtime status |
-| Shadow compiler | Rust emits deterministic observation-only Capture Programs for frozen-oracle comparison; shell remains the sole executed networking writer and no shadow artifact enters a Generation or activation path |
-| Rust generation bridge | Rust-owned preparation compiles legacy restore caches and records producer `rust`; explicit legacy ownership records `shell`; `scripts/tproxy` remains the sole restore executor/writer |
-| Legacy parity | `fluxd` owns xtables/PBR/address sync; updater may still use external curl/jq adapters |
-| New backends | nftables, ipset, managed TUN, and eBPF observation available behind capability gates |
-| Default switch | `auto` prefers nftables where conformance passes |
-| Cleanup | standalone `addrsyncd` and runtime policy scripts removed; wrappers retained |
+| Development checkpoint | Runtime behavior | Releasable? |
+|---|---|---|
+| Bridge | `fluxd` owns Sing-Box through the atomic runtime coordinator; serialized shell phases still own networking writes | No |
+| Shadow compiler | Rust emits deterministic observation-only Capture Programs; no shadow artifact enters a Generation or activation path | No |
+| Rust generation bridge | Rust prepares and attests legacy-shaped restore caches; `scripts/tproxy` remains the restore executor/writer | No |
+| Native xtables cutover | Rust owns canonical lowering, restore, exact readback, rollback, and the transition lease; replaced shell rule/restore duties are deleted after qualification | No, until all intended runtime duties are Rust-owned |
+| PBR/address-sync cutover | Rust owns routing and address-derived rules; standalone `addrsyncd` and shell route writers are removed | No |
+| Remaining runtime cutover | Rust owns configuration, subscription, diagnostics, recovery, and offline cleanup; legacy runtime scripts, `jq`/AWK/curl adapters, and wrappers are removed | No |
+| Rust-only qualification | Only platform-required install/boot/disable/uninstall glue remains outside Rust; supported runtime scope passes Android, recovery, performance, security, provenance, and packaging gates | Yes, after ADR-0011 and every final gate pass |
 
-No compatibility stage may have two independent owners mutating the same kernel objects.
-The shadow-compiler stage also authorizes no eBPF attachment/pinning, live-chain integration, TUN
-activation, implicit module request, `.ko`/KPM loading, or native netfilter/routing mutation.
+None of the bridge, shadow, parity, or partial-cutover checkpoints may be named or published as an
+alpha, beta, release candidate, or release. No development checkpoint may have two independent
+owners mutating the same kernel objects. The shadow-compiler stage also authorizes no eBPF
+attachment/pinning, live-chain integration, TUN activation, implicit module request, `.ko`/KPM
+loading, or native netfilter/routing mutation.
+
+The Rust-only gate does not require every optional future backend to ship. A release may explicitly
+leave nftables, managed TUN, or eBPF unavailable if at least one fully Rust-owned conventional
+Capture Path satisfies the advertised scope and no legacy runtime dependency remains.
 
 Open Phase 1 hardening gates are the production schema-v2 evidence producer, concrete local-OUTPUT
 capture/process receipt authorities and executor, actual prebound INET_DIAG collector integration,

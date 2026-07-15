@@ -13,12 +13,13 @@ rollback, and Android evidence would discard the only executable semantic baseli
 partially native path beside it would be worse: two writers could independently mutate the same
 networking objects.
 
-During the bridge releases, the networking portions of `scripts/init`, `scripts/config`,
+During pre-release development, the networking portions of `scripts/init`, `scripts/config`,
 `scripts/rules`, `scripts/tproxy`, and `scripts/addrsync` are therefore frozen as a compatibility
-oracle. They receive only correctness, security, release-contract, and rollback fixes. The
+oracle. They receive only correctness, security, cutover-contract, and rollback fixes. The
 serialized shell phase path remains the sole executed networking writer until a component-specific
 cutover gate transfers ownership to Rust. This is a migration constraint, not an endorsement of
-shell as the final architecture.
+shell as the final architecture or a releasable bridge. ADR-0011 prohibits publishing any of these
+mixed-runtime checkpoints.
 
 Phase 2 may proceed without mutation by compiling a deterministic backend-neutral shadow Capture
 Program in pure Rust. The shadow compiler normalizes typed UID/GID, application, interface,
@@ -41,9 +42,9 @@ gates: canonical rendering and differential fixtures, backend and real-device be
 and recovery injection, exact live readback and Managed Object ownership, rollback, and an atomic
 single-writer transition. Phase 4 transfers xtables/ipset ownership; Phase 3 separately transfers
 address-derived rule and policy-routing ownership. Until a transfer is complete, Rust may observe
-and compile but must not execute that component's networking mutations. Minimal Magisk
-installation, launcher/watchdog, disable, uninstall, and compatibility-wrapper glue may remain
-after runtime policy scripts are retired.
+and compile but must not execute that component's networking mutations. The final package may
+retain only platform-required Magisk installation, launch, disable, and uninstall glue; it retains
+no legacy compatibility wrapper or shell networking policy/cleanup implementation.
 
 This decision does not authorize eBPF attachment, persistent pins, live-chain integration, TUN
 activation, implicit module autoload, `.ko`/KPM packaging or loading, or consumption of a kernel
@@ -53,7 +54,8 @@ ownership, conformance, and ADR gates.
 The consequence is a longer overlap in source code but a shorter period of semantic uncertainty:
 the old path stays executable and frozen while the new path first becomes explainable, testable,
 and deterministic, then takes ownership one component at a time without a big-bang rewrite or a
-dual-writer interval.
+dual-writer interval. Source overlap is temporary development scaffolding: once a component passes
+its cutover gate, its replaced runtime code is removed rather than maintained for compatibility.
 
 ## 2026-07-15 implementation status
 
@@ -71,6 +73,11 @@ inputs consumed by the shell PBR path. When application UID resolution is needed
 `fluxd snapshot-legacy-packages --source PATH` obtains the bounded read-only snapshot through a
 no-follow, regular, descriptor-stable read; shell does not copy the live package database directly.
 The snapshot is retained with the prepared Generation.
+
+Renderer-owned plan, family-pair, and enabled-family-set digests now bind the source-shape output.
+Rust-owned preparation uses `fluxd attest-legacy-rules-set` to compare every staged artifact with
+one rebuilt plan and retain a strict Generation-bound receipt before `engine.manifest` publication.
+This is non-mutating exact-file verification only and does not advance the single-writer cutover.
 
 Explicit legacy restart prepares and validates fresh settings, the replacement Sing-Box
 configuration, and replacement caches before stopping the active runtime. A failed replacement

@@ -2,6 +2,10 @@
 
 研究日期：2026-07-12（Asia/Singapore），Flux 进度基线于 2026-07-13 刷新。本轮将上游仓库浅克隆到操作系统临时目录，只读取源码，不向 Flux vendoring 任何第三方代码。结论固定到下表 commit，避免默认分支继续变化后失去可复查性。
 
+> **非规范性说明：** 本文的 P0-P3 顺序是当时的研究建议。当前执行顺序由 ADR-0011 和实现路线图
+> 决定：完整 Rust 所有权与旧运行时删除优先；`xt_bpf`、TC/XDP、LKM/`.ko` 仍是隔离、可选、不得
+> 延迟切换主线的工作。
+
 ## 结论先行
 
 1. 用户所说的 `re-kernel` 最合理指向 [`Sakion-Team/Re-Kernel`](https://github.com/Sakion-Team/Re-Kernel)。它是为 Android 冻结/“墓碑”工具提供 Binder、Signal、Network 事件和 socket 清理能力的 LKM/eBPF 项目，**不是透明代理数据面**。

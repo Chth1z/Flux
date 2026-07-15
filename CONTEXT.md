@@ -2,6 +2,21 @@
 
 Flux manages transparent proxy behavior on a rooted Android device while preserving the device's direct-connect behavior outside the configured traffic scope.
 
+## Release model
+
+**Pre-release Rewrite**:
+The current development line may break obsolete internal bridge formats and adapters. Bridge,
+shadow, parity, and migration checkpoints are not releases. Publication begins only after the
+intended runtime is fully Rust-owned, superseded runtime components are absent from the package,
+and the final qualification/provenance gates pass.
+_Avoid_: Bridge release, compatibility release
+
+**Rust-only Release Gate**:
+The release boundary requiring `fluxd` to own every intended runtime responsibility, with only
+platform-required installation, boot, disable, and uninstall glue outside Rust and no shell
+networking policy or cleanup implementation.
+_Avoid_: Packaging pass, staged module
+
 ## State and lifecycle
 
 **Desired State**:
@@ -50,6 +65,10 @@ _Avoid_: Dry-run Generation, staged rules
 A validated, source-shape-preserving Rust representation of the admitted `scripts/rules` compatibility inputs. It can deterministically emit the same bounded apply/cleanup restore bytes for bridge preparation, including legacy ordering and duplicates, but it is not a lowering of `ShadowCaptureArtifact`, a Generation Capture Program, or mutation authority.
 _Avoid_: Native Capture Program, active backend
 
+**Legacy Rules Artifact Receipt**:
+A strict Generation-bound preparation manifest emitted only after one rebuilt `LegacyRulesPlan` exactly matches every staged apply/cleanup artifact for the enabled family set. It binds renderer-owned plan, pair, set, artifact digest, context, and resource identities, but is not a signature, freshness proof, live readback, rollback proof, writer token, activation lease, or kernel acceptance evidence.
+_Avoid_: Qualified Generation, restore verification
+
 **Rule Cache Producer**:
 The mutually exclusive compiler identity recorded with shared bridge caches. Rust-owned preparation records `rust` and invokes only `fluxd render-legacy-rules`; explicit legacy ownership records `shell` and alone sources `scripts/rules`. A failed Rust render never silently falls back to the shell producer.
 _Avoid_: Preferred renderer, automatic fallback
@@ -75,7 +94,11 @@ The data-plane program that accepts captured traffic and executes proxy, DNS, an
 _Avoid_: Core, daemon
 
 **Compatibility Oracle**:
-The frozen shell networking behavior and pinned fixtures used to review Rust replacement behavior during bridge releases. `scripts/rules` is executed only under explicit legacy ownership as the rollback producer; under Rust ownership it is retained but not sourced. The shell restore path remains the sole networking writer until ownership transfers through a component-specific cutover gate; the oracle is not the final architecture.
+The frozen shell networking behavior and pinned fixtures used to review Rust replacement behavior
+during pre-release development. `scripts/rules` is executed only under explicit legacy ownership as
+the rollback producer; under Rust ownership it is retained but not sourced. The shell restore path
+remains the sole networking writer until ownership transfers through a component-specific cutover
+gate, then the replaced component is removed promptly. The oracle is never a release architecture.
 _Avoid_: Second backend, permanent shell path
 
 ## Device model

@@ -2,6 +2,10 @@
 
 This historical note records the legacy shell baseline at repository commit `c978b75` (`Add CLI control plane, TUN mode, PBR, multi-user proxy, and perf mode`). It is based on that checked-in implementation rather than the README alone. It does not describe current Rust-owned bridge admission: Phase 1 now rejects TUN during `prepare` pending an exact-device single-owner and forced-death route-cleanup canary.
 
+> **Superseded planning note:** compatibility obligations and migration sequencing below describe
+> the historical baseline. ADR-0011 now permits breaking pre-release internal state and requires
+> prompt removal of each replaced runtime component; the current roadmap is authoritative.
+
 ## Scope and size
 
 - Runtime shell under `scripts/`: 3,508 lines across 11 files.

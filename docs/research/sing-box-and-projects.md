@@ -6,6 +6,11 @@
 
 This note studies Sing-Box and adjacent Android transparent-proxy, TUN, userspace-network-stack, and eBPF projects as design inputs for the Flux rewrite. It is intentionally implementation-oriented: it records what the projects actually do, where the relevant code lives, what is safe to reuse conceptually, and what Flux should avoid copying.
 
+> **Non-normative priority notice:** lifecycle and ownership findings remain design evidence, but
+> compatibility/migration sequencing in this historical note is superseded by ADR-0011 and the
+> current roadmap. The release package may keep platform bootstrap glue only; emergency networking
+> cleanup is a Rust offline command, not shell compatibility behavior.
+
 The study used upstream documentation and source repositories cloned into the operating-system temporary directory. Nothing from those repositories was vendored into Flux. The current stable Sing-Box release at the time of research was `v1.13.14`; the upstream default branch was `testing`, already carrying 1.14-era work. Stable behavior and forward-looking behavior are separated below.
 
 ## Executive conclusions
@@ -439,7 +444,8 @@ Flux rewrite implications:
 
 - Magisk installer customization that cannot be expressed by the standard installer;
 - module-local boot entrypoint;
-- emergency stop/cleanup fallback that invokes `fluxd` or removes only Flux-namespaced objects;
+- disable/uninstall glue that may invoke `fluxd cleanup --offline` but never implements networking
+  policy or removes kernel objects itself;
 - ABI selection/copy at install time if needed.
 
 ## 10. Proposed control and lifecycle contract

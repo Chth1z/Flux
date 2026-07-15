@@ -1,7 +1,7 @@
 # Fluxd Rewrite Blueprint
 
 - Status: accepted, evolving architecture
-- Last updated: 2026-07-14
+- Last updated: 2026-07-15
 - Minimum supported kernel: Linux 5.10
 
 ## Executive decision
@@ -17,13 +17,16 @@ The primary Capture Path is selected at runtime:
 
 eBPF is a first-class optional plane with two stages: observability first, then verified acceleration. It does not replace nftables/xtables/TUN as the correctness path in the initial rewrite.
 
-Migration is component-by-component rather than a big-bang shell deletion. During bridge releases,
-the serialized shell networking path is frozen as the executable compatibility oracle and remains
-the sole writer. Rust-owned preparation now compiles the legacy restore caches through a validated
-source-shape renderer while explicit legacy ownership retains the frozen shell generator; this
-non-mutating compiler split does not promote a shadow artifact or transfer writer ownership. A
-kernel ownership transition occurs only after renderer, parity, readback, recovery,
-rollback, and real-device gates pass for that component. See [ADR-0010](../adr/0010-freeze-shell-networking-as-a-shadow-compiler-oracle.md).
+Migration is component-by-component rather than an unsafe dual-writer switch. During pre-release
+development, the serialized shell networking path is frozen as the executable compatibility oracle
+and remains the sole writer for each not-yet-cut-over component. Rust-owned preparation now
+compiles the legacy restore caches through a validated source-shape renderer while explicit legacy
+ownership retains the frozen shell generator; this non-mutating compiler split does not promote a
+shadow artifact or transfer writer ownership. A kernel ownership transition occurs only after
+renderer, parity, readback, recovery, rollback, and real-device gates pass for that component; the
+replaced runtime code is then removed promptly. No bridge, shadow, parity, or partial-cutover state
+is releasable. See [ADR-0010](../adr/0010-freeze-shell-networking-as-a-shadow-compiler-oracle.md)
+and [ADR-0011](../adr/0011-pre-release-rust-only-release-gate.md).
 
 ## Research basis
 
@@ -38,7 +41,9 @@ rollback, and real-device gates pass for that component. See [ADR-0010](../adr/0
 - Replace the runtime shell control plane and `addrsyncd` process with one Rust daemon.
 - Make every runtime change idempotent, explainable, recoverable, and attributable to one Generation.
 - Support kernel 5.10 and newer with adaptive feature selection driven by both version metadata and active probes.
-- Add native nftables, real ipset selection, a managed TUN path, and advanced optional eBPF behavior.
+- Provide a fully Rust-owned conventional Capture Path for the first release. Add native nftables,
+  real ipset selection, managed TUN, and optional eBPF behavior only as separately qualified
+  advertised backends; they are not all first-release prerequisites.
 - Preserve transparent TCP and UDP proxying, dual stack, tethering, per-app policy, DNS handling, FakeIP behavior, and loop prevention.
 - Respect Android VPN, lockdown, explicit-network, and default-network semantics by default.
 - Preserve Magisk, KernelSU, and APatch packaging with minimal shell glue.
@@ -254,7 +259,10 @@ pub async fn refresh_subscription(
 ) -> Result<SubscriptionSnapshot>;
 ```
 
-It owns bounded download, decoding, parsing, normalization, filtering, naming, template merge, validation, and atomic snapshot publication. Fetch transport is an internal seam so an external `curl` adapter can be retained during migration and replaced by a Rust TLS adapter later.
+It owns bounded download, decoding, parsing, normalization, filtering, naming, template merge,
+validation, and atomic snapshot publication. Fetch transport is an internal seam. A temporary
+external `curl` adapter may exist only during pre-release migration; the Rust-only release uses a
+Rust transport and ships no curl compatibility dependency.
 
 ## Runtime state model
 
@@ -453,6 +461,14 @@ Phase 2 shadow Capture Program and does not claim target semantic or device pari
 transition disables the shell writer before its first restore mutation so both implementations are
 never active writers.
 
+The bridge now binds that source-shape output before Generation publication. Domain-separated plan,
+mandatory family apply/cleanup pair, and enabled-family set identities are renderer-owned.
+`fluxd attest-legacy-rules-set` rebuilds the plan, safely compares every staged restore file with
+the canonical renderer set, and emits a strict Generation/family/digest/resource receipt. Shell
+publishes it only after all renders succeed and snapshots it into the immutable Generation before
+the engine manifest. This is exact-file preparation evidence, not a signature, live readback,
+rollback proof, writer lease, kernel acceptance result, or Capture Program semantic qualification.
+
 When application UID resolution is needed, preparation uses
 `fluxd snapshot-legacy-packages --source PATH`, not a shell copy, to obtain one no-follow, bounded,
 regular, descriptor-stable snapshot for every family/action render. Explicit legacy restart also
@@ -623,7 +639,7 @@ The rewritten rule compiler treats these as the mandatory safety portion of gene
 - Use a dedicated UID/GID when device policy permits, while retaining a root compatibility mode.
 - On unexpected exit, immediately begin fail-open repair unless the user explicitly selected fail-closed behavior.
 
-The delivered Phase 1 Supervisor separates and composes two proofs. Descriptor-pinned validation of the exact binary, configuration, and optional launcher plus child-owned listener/TUN evidence is the pre-capture admission proof. The runtime handoff then publishes capture and checks shell-owned structural evidence before invoking its explicit functional-canary gate. Required-mode coordinator paths run fresh pre/post engine reconciliation, exact environment binding, attempt execution, evidence validation, and cleanup checks before every initial, retry, restart-restoration, or rollback `RUNNING` publication. Capture-start records generation ownership before mutation and retains it when compensation cannot prove cleanup. Candidate evidence never authorizes rollback publication. The production daemon deliberately selects structural-only compatibility because the Android adapter and exact-process loop-escape proof remain unqualified; the required executor currently exists for tests and later privileged harnesses. Any activation/verification failure must prove detach before retiring the candidate, and reload attempts the recorded previous `EngineSpec`.
+The delivered Phase 1 Supervisor separates and composes two proofs. Descriptor-pinned validation of the exact binary, configuration, and optional launcher plus child-owned listener/TUN evidence is the pre-capture admission proof. The runtime handoff then publishes capture and checks shell-owned structural evidence before invoking its explicit functional-canary gate. Required-mode coordinator paths run fresh pre/post engine reconciliation, exact environment binding, attempt execution, evidence validation, and cleanup checks before every initial, retry, restart-restoration, or rollback `RUNNING` publication. Capture-start records generation ownership before mutation and retains it when compensation cannot prove cleanup. Candidate evidence never authorizes rollback publication. The current pre-release bridge deliberately selects structural-only compatibility because the Android adapter and exact-process loop-escape proof remain unqualified; the required executor currently exists for tests and later privileged harnesses. Any activation/verification failure must prove detach before retiring the candidate, and reload attempts the recorded previous `EngineSpec`.
 
 The privileged Linux harness also separates evidence by traffic domain. Its first checkpoint
 proves the contained dual-stack TCP/UDP/DNS topology. The delivered command
@@ -641,7 +657,7 @@ collector now binds protocol, exact tuple, UID, mark, FD/inode/cookie, complete 
 process identity, and timing. Its prebound session API now exposes the real kernel netlink port ID
 before collection, preserves one owned FD with monotonic sequences across snapshots, consumes and
 retires the handle on every error, prevents deadline extension, and retains the temporary-session
-compatibility wrapper. The typed canary handoff now opens that session under the attempt deadline,
+migration wrapper until stateful call sites replace it. The typed canary handoff now opens that session under the attempt deadline,
 derives the copied request authority plus a private per-opening identity from the live handle,
 makes request construction use the session's exact deadline, checks both at the context-output and
 execution boundaries, and moves the same non-cloneable resource into prepared local-OUTPUT
@@ -790,7 +806,11 @@ Routing remains `auto`-only until the Phase 3 routing slice defines a per-domain
 
 ### Migration
 
-`fluxd migrate` reads `settings.ini` and `addrsyncd.toml` without evaluating shell, produces a candidate `flux.toml`, reports lossy mappings, validates it, and writes it atomically only with explicit installer or CLI approval. Original files are retained as backups for at least one release series.
+An optional `fluxd migrate` command may read already published legacy `settings.ini` and
+`addrsyncd.toml` without evaluating shell, produce a candidate `flux.toml`, report lossy mappings,
+validate it, and write it atomically only with explicit installer or CLI approval. It must not delay
+the cutover or preserve a legacy runtime dependency. Pre-release internal state may instead be
+invalidated deliberately, and no backup-retention promise applies to development-only schemas.
 
 ## DNS and asset ownership
 
@@ -833,7 +853,7 @@ Requirements:
     sing-box.log
     diagnostics/
   scripts/
-    fluxctl
+    platform-required install/boot/disable/uninstall glue only
 ```
 
 `run` contains disposable runtime artifacts. `state` contains crash-recovery records and must use durable atomic writes. Secret-bearing files use `0600`; the control socket uses peer credentials and a narrowly permitted group.
@@ -849,7 +869,7 @@ Online socket/client commands:
 - `status [--json]`
 - `start`, `stop`
 - `reload`
-- `fluxctl restart` as a legacy client alias for reload plus convergence
+- `fluxctl restart` as a Rust multicall client alias for reload plus convergence
 - `reconcile`
 - `capabilities`
 - `backend explain`
@@ -857,14 +877,17 @@ Online socket/client commands:
 - `subscription update`
 - `diagnose [--bundle]`
 - `repair`
-- `migrate --check-only` (initial compatibility importer; mutating migration remains deferred)
+- optional `migrate --check-only` for already published legacy settings
 
 Offline multicall commands, which are not routed over the live daemon socket:
 
 - `recover --offline`
 - `cleanup --offline`
 
-The same binary implements `fluxd daemon`, explicit offline salvage/cleanup, and CLI client behavior. Normal boot recovery is owned by daemon startup, not by a second wrapper command. A small `fluxctl` wrapper or symlink preserves the existing command name.
+The same binary implements `fluxd daemon`, explicit offline salvage/cleanup, and CLI client behavior.
+Normal boot recovery is owned by daemon startup, not by a second wrapper command. The final
+`fluxctl` name resolves directly to the Rust multicall binary through a symlink/hardlink or equivalent
+platform entry; no shell compatibility wrapper remains.
 
 All online work that can mutate kernel state—including active capability probes and repair—enters the same serialized mutation scheduler and Generation fence. Offline salvage/cleanup requires the daemon lease to be absent; separate maintenance Modules do not bypass the single-writer invariant.
 
@@ -942,7 +965,7 @@ The Phase 1 projection exposes `ControlSnapshot` and `RuntimeSnapshot` as separa
 16. Compatibility components transfer to Rust atomically and individually; shell remains the sole
     writer for a component until its transition lease disables that path.
 
-Phase 1 is an explicit bridge exception to invariant 12's final-state wording: shell phase scripts still apply networking state, but the serialized worker is their only caller and the boot-scoped lease excludes `scripts/core` from Rust-owned engine runs. Rust-owned preparation compiles rule caches; explicit legacy ownership alone executes the frozen shell generator; `scripts/tproxy` applies either prepared cache. Their networking behavior is frozen under ADR-0010 except for correctness, security, release-contract, and rollback fixes.
+Phase 1 is a pre-release bridge exception to invariant 12's final-state wording: shell phase scripts still apply networking state, but the serialized worker is their only caller and the boot-scoped lease excludes `scripts/core` from Rust-owned engine runs. Rust-owned preparation compiles rule caches; explicit legacy ownership alone executes the frozen shell generator; `scripts/tproxy` applies either prepared cache. Their networking behavior is frozen under ADR-0010 except for correctness, security, cutover-contract, and rollback fixes. ADR-0011 forbids publishing this exception.
 
 ## Completion criteria for the rewrite
 
@@ -951,10 +974,15 @@ Phase 1 is an explicit bridge exception to invariant 12's final-state wording: s
 - Runtime routing/rule/config/updater shell scripts are no longer required.
 - Every removed networking script has first passed its component-specific renderer/parity,
   failure/recovery, exact ownership/readback, rollback, single-writer cutover, and Android gates;
-  minimal installer, launcher/watchdog, disable, uninstall, and compatibility wrappers may remain.
-- nftables, xtables+ipset, xtables+jump, and TUN plans have deterministic compiler tests and real-kernel integration tests.
-- eBPF observation ships with verifier and attach diagnostics; acceleration ships only after parity tests.
+  only platform-required installer, launcher/watchdog, disable, and uninstall glue may remain, and
+  it contains no networking policy or cleanup behavior.
+- Every advertised backend has deterministic compiler tests and real-kernel integration tests; an
+  explicitly unsupported optional backend is not a first-release prerequisite.
+- eBPF is not a release prerequisite. If an observation role ships, it has verifier and attach/
+  cleanup diagnostics; acceleration ships only after conventional-path parity and benchmarks.
 - Unsupported and degraded device states are explainable through CLI JSON.
 - Crash injection at every transaction step converges to the previous Generation, the target Generation, or clean fail-open state.
 - Android conformance passes on the documented device/kernel matrix, including a 5.10 baseline.
 - A real-device performance baseline replaces the current placeholder and is enforced for releases.
+- No bridge, shadow, parity, or partial-cutover checkpoint is published. Release begins only after
+  the complete intended runtime satisfies ADR-0011's Rust-only gate.

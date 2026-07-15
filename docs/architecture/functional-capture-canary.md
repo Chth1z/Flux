@@ -1,11 +1,13 @@
 # Generation-Scoped Functional Capture Canary
 
-- Status: accepted implementation contract; production qualification incomplete
-- Last updated: 2026-07-14
+- Status: supporting pre-release qualification contract; activation work deferred
+- Last updated: 2026-07-15
 
-This document defines the next Phase 1 bridge tracer bullet. It turns `capture-verify` from a
-structural check into a bounded functional transaction without claiming that the Android
-production adapter is already qualified.
+This document defines a supporting qualification contract for an executed Rust-owned Capture Path.
+The model and host evidence are retained, but further activation plumbing is deferred until a real
+backend can inhabit its receipt authorities. It is not the next delivery lane, and none of its
+bridge/shadow/model checkpoints is releasable. A final advertised Capture Path must eventually pass
+the applicable Android transaction before the Rust-only release gate can close.
 
 ## Verification boundary
 
@@ -22,9 +24,10 @@ attempt-local responses. Listener presence, file presence, a successful command,
 counters alone never satisfy the functional gate. Counters may support the evidence record.
 
 When the required functional gate is selected, `RUNNING` may be published only when both
-verification layers succeed for the same Generation. The production compatibility composition
-continues to publish operational `RUNNING` after structural verification while reporting
-`structural_only` rather than claiming functional authorization.
+verification layers succeed for the same Generation. The current pre-release compatibility
+composition continues to publish operational `RUNNING` after structural verification while
+reporting `structural_only` rather than claiming functional authorization; that development bridge
+cannot become a release on this basis.
 
 ### Shadow Capture Programs are not canary authority
 
@@ -33,12 +36,14 @@ digest is domain-separated from the Generation-bound Capture Program digest in a
 shadow artifact has no Generation ID, capture-owner record, Backend Plan, writer token,
 prepared/active state, listener identity, or Runtime Coordinator entry point. A model decision or
 successful frozen-oracle fixture comparison therefore cannot satisfy structural verification,
-construct an attempt, authorize traffic, or publish any functional status. The shell bridge
-remains the sole executed networking writer while this observation-only compiler is developed.
+construct an attempt, authorize traffic, or publish any functional status. The observation-only
+shadow compiler is complete and frozen; the shell bridge remains the sole executed networking
+writer until the native component cutover.
 
-Renderer parity, live readback, and component ownership transfer are later gates. The shadow lane
-also adds no eBPF attach/pin path, TUN activation, implicit module request, or `.ko`/KPM loading that
-could provide an alternate evidence source.
+Legacy source-shape renderer parity is complete, but canonical Capture Program lowering, native
+restore, live readback, rollback, and component ownership transfer remain later gates. The shadow
+lane also adds no eBPF attach/pin path, TUN activation, implicit module request, or `.ko`/KPM loading
+that could provide an alternate evidence source.
 
 ### Ingress evidence is not local-OUTPUT evidence
 
@@ -88,8 +93,8 @@ resets to `structural_only`, meaning no functional authorization remains for an 
 
 `RuntimePhase::Running` remains an operational statement and never implies functional
 qualification. Likewise, `functional_passed` records an exact attempt-level result; until the
-stage-4 Android matrix is evidenced, it is not a production-device qualification claim. The
-production Phase 1 composition explicitly selects structural-only compatibility.
+stage-4 Android matrix is evidenced, it is not a production-device qualification claim. The current
+pre-release Phase 1 composition explicitly selects structural-only compatibility.
 
 ## Attempt identity and evidence
 
@@ -401,8 +406,8 @@ the snapshot only on success. This linear ownership serializes transactions and 
 retire the socket, so late unread datagrams cannot satisfy a later transaction. Nonzero sequences
 remain monotonic across successful snapshots. A deadline supplied later may shorten but cannot
 extend the opening deadline, and sequence exhaustion fails rather than wrapping. The existing
-`collect_until` entry point remains a compatibility wrapper that opens one temporary session
-internally.
+`collect_until` entry point is a temporary in-tree migration wrapper that opens one session
+internally and is deleted after stateful call-site migration.
 
 Opening the session does not issue a protocol dump. The future capability-qualified attempt path
 must prove that the TCP and UDP INET_DIAG handlers are built in or already active before collection
@@ -531,11 +536,12 @@ functional pass.
    prepared execution, raw observations, and module-private evidence promotion. The current
    xtables driver reports `unsupported` with cleanup `NotRequired` before mutation and has no
    positive raw value. Required-mode coordinator regression proves this result cannot reach
-   `RUNNING`; production composition remains structural-only.
+   `RUNNING`; the current pre-release composition remains structural-only.
 8. **Complete prebound transport:** the Linux/Android socket-diagnostics source can bind a uniquely
    owned session before request construction, expose its real port ID, reuse the same FD with
    monotonic nonzero sequences, retire the handle on any error, prevent deadline extension, and
-   preserve the temporary-session compatibility API. This remains observation plumbing.
+   preserve the temporary-session migration API. That wrapper is removed after stateful call-site
+   migration; this remains observation plumbing.
 9. **Complete typed attempt handoff:** a non-cloneable canary transport derives request authority,
    a private per-opening identity, and the immutable deadline from the exact prebound session;
    checked input/execution envelopes reject copied/reopened mismatches or deadline drift, and the

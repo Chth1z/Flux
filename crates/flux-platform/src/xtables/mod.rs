@@ -1,5 +1,17 @@
+mod lowering;
 mod render;
 mod restore;
+
+pub use lowering::{
+    MAX_XTABLES_CAPTURE_COMMANDS_PER_ARTIFACT, XTABLES_CAPTURE_DIGEST_BYTES,
+    XTABLES_CAPTURE_LOWERING_SCHEMA_VERSION, XtablesCaptureArtifactPair,
+    XtablesCaptureArtifactPairDigest, XtablesCaptureArtifactSet, XtablesCaptureArtifactSetDigest,
+    XtablesCaptureEntryPoint, XtablesCaptureExtension, XtablesCaptureExtensions,
+    XtablesCaptureLoweringBudget, XtablesCaptureLoweringDigest, XtablesCaptureLoweringError,
+    XtablesCaptureLoweringRequest, XtablesCaptureNamespace, XtablesCapturePredicateKind,
+    XtablesCaptureResourceUsage, XtablesInterfaceRenderErrorKind, XtablesTproxyTarget,
+    lower_xtables_capture,
+};
 
 pub use render::{
     LEGACY_RULES_DIGEST_BYTES, LEGACY_RULES_IDENTITY_SCHEMA_VERSION, LegacyApplicationMode,

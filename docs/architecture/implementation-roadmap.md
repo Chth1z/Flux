@@ -25,11 +25,16 @@ This roadmap turns the [blueprint](fluxd-blueprint.md) and [technical specificat
 
 The 2026-07-15 direction review closes the shadow/compiler/parser/oracle proof-infrastructure and
 host bridge-attestation stage. The attested shell bridge is now a frozen development safety/oracle
-substrate, not a product or release lane. The main delivery lane is canonical Capture Program
-lowering followed immediately by native restore/readback/rollback and the xtables transition lease;
-then absorb PBR/address synchronization and the remaining runtime shell responsibilities. Other
-evidence work may proceed in parallel, but it must not displace that ownership/removal lane or
-create another open-ended non-authorizing checkpoint. Correctness gates retain strict ordering:
+substrate, not a product or release lane. The extension-free schema-v1 forwarded-ingress Capture
+Program lowering is now delivered as deterministic, generation-namespaced but unattached xtables
+prepare/retire artifacts. Local OUTPUT is rejected because MARK-only OUTPUT rules do not prove
+re-entry through PREROUTING or delivery to the TPROXY listener. The immediate delivery lane is to
+resolve that local-OUTPUT mechanism and only the runtime-required adjunct semantics, then consume
+the admitted artifacts in stable hook activation, native restore/readback/rollback, and the xtables
+transition lease; after that, absorb PBR/address synchronization and the remaining runtime shell
+responsibilities. Other evidence work may proceed in parallel, but it must not displace that
+ownership/removal lane or create another open-ended non-authorizing checkpoint. Correctness gates
+retain strict ordering:
 
 Phase numbers below preserve architectural workstreams and implementation history. They are not the
 execution order; this current-priority section and the prioritized backlog are authoritative.
@@ -96,7 +101,10 @@ verifier can pass, and a verifier pass cannot override ADR-0011's runtime-comple
    Capture Program, semantic fixtures, bounded restore parser, pinned raw shell oracle, and
    checked-in oracle-fixture parser round-trip are delivered. They remain non-authorizing
    characterization inputs: no shadow artifact enters a Generation or activation path, and this
-   lane receives only corrections needed to preserve its frozen contract.
+   lane receives only corrections needed to preserve its frozen contract. The separate Phase 4
+   lowerer may consume a forwarded-ingress-only artifact with a caller-supplied non-authorizing
+   namespace and mark candidate; that does not promote or mutate the Phase 2 artifact. Artifacts
+   containing local OUTPUT are rejected at this boundary.
 3. **Phase 4 bridge substrate — host-complete and frozen; native ownership is next:**
    the validated legacy source-shape renderer independently reproduces the pinned IPv4/IPv6
    apply/cleanup fixtures, and Rust-owned preparation exclusively invokes
@@ -107,9 +115,10 @@ verifier can pass, and a verifier pass cannot override ADR-0011's runtime-comple
    Generation-bound receipt only after every staged artifact exactly matches one rebuilt plan. The
    receipt enters the immutable Generation before `engine.manifest`; rejection preserves the active
    Generation. Do not expand this temporary bridge into a release-qualification project. Reuse it
-   for targeted cutover fault injection while moving next to canonical Capture Program lowering,
-   native restore/readback/rollback, and real-device qualification of the Rust-owned path. There is
-   no dual-writer interval and no public bridge release.
+   for targeted cutover fault injection while moving next from the delivered unattached
+   forwarded-ingress lowering to a valid local-OUTPUT mechanism, runtime-required adjuncts, native
+   restore/readback/rollback, and real-device qualification of the Rust-owned path. There is no
+   dual-writer interval and no public bridge release.
 4. **Native Phase 3 correctness evidence:** continue exact device/artifact identity, positive mark
    policy catalog, remaining census cells, point-in-time coordination, observer continuity, mark
    preservation, domain/network-selection handoff, and route reachability as bounded supporting
@@ -236,22 +245,31 @@ typed compatibility inputs into an ordered shadow Capture Program, with distinct
 forwarded programs, canonical mandatory/configurable bypass layers, optional inventory-derived
 host bypass provenance, deterministic application and interface selectors, compile-time budgets,
 semantic version/digest, and an explanation of every compatibility assumption and deferred
-prerequisite. It is pure and observation-only. There is no
-backend restore renderer, package-to-UID discovery, kernel or filesystem access, Generation ID,
-planning or mutation authority, writer/ownership token, prepared/active conversion, coordinator
-execution path, or eBPF/TUN/module action. The shell path remains the sole executed networking
-writer and the frozen semantic oracle.
+prerequisite. It is pure and observation-only. The artifact itself contains no backend restore
+renderer, package-to-UID discovery, kernel or filesystem access, Generation ID, planning or
+mutation authority, writer/ownership token, prepared/active conversion, coordinator execution path,
+or eBPF/TUN/module action. The shell path remains the sole executed networking writer and the frozen
+semantic oracle.
 
 The independent Phase 4 `LegacyRulesPlan` does not change this boundary. It preserves the admitted
 shell generator's source shape for bridge cache production; it neither consumes nor promotes a
 `ShadowCaptureArtifact` and carries no Generation or mutation authority.
 
-This completed checkpoint does not discharge the canonical target-semantic or ownership gate.
+The separate Phase 4 schema-v1 lowerer now consumes a forwarded-ingress-only
+`ShadowCaptureArtifact` together with a non-authorizing generation namespace, structurally valid
+TPROXY target, explicit extension state, and command budget. It derives unattached implementation
+chains and paired prepare/retire syntax artifacts without adding authority to the source artifact or
+entering a runtime execution path. A local-OUTPUT program is rejected rather than misrepresented by
+MARK-only rules that cannot prove TPROXY delivery.
+
+This completed checkpoint does not discharge the complete runtime-semantic or ownership gate.
 Oracle-derived fixtures pin semantics such as RFC 6598, mandatory bypasses, empty allow/deny
 behavior, multi-user UIDs, interface matching, family/domain separation, and compatibility engine
 UID/GID loop bypass. The independent source-shape renderer now reproduces and attests the frozen
-IPv4/IPv6 restore artifacts. Canonical Capture Program lowering, native restore/readback/rollback,
-failure/recovery, and real-device gates remain before xtables ownership.
+IPv4/IPv6 restore artifacts. The extension-free schema-v1 forwarded-ingress classifier is now
+lowered into unattached xtables artifacts; a valid local-OUTPUT mechanism, established-flow caching,
+transparent-socket DIVERT, FakeIP ICMP, QUIC rejection, MSS clamping, native
+restore/readback/rollback, failure/recovery, and real-device gates remain before xtables ownership.
 
 The bounded raw oracle checkpoint is also complete and frozen. The canonical environment, input,
 and fixture pin contract lives in `tests/oracle/xtables/manifest.json`; do not duplicate or update
@@ -280,7 +298,7 @@ renderer, Generation, ownership, writer, prepared/active, coordinator, or activa
 - Sing-Box per-Generation overlay generation and validation.
 - Revisioned device and Sing-Box Engine Capability Profiles, with Generation planning leases invalidated by boot changes, runtime demotions, or engine binary/profile changes.
 - Frozen oracle-derived semantic fixtures plus the completed independent source-shape renderer
-  golden tests; canonical target lowering remains separate.
+  golden tests and the separate extension-free schema-v1 forwarded-ingress xtables lowering tests.
 
 ### Exit gate
 
@@ -384,8 +402,15 @@ Keep the four evidence levels distinct:
    family apply/cleanup pair, and enabled-family set digests bind this renderer-owned identity and
    resource accounting. The Generation-bound receipt verifies exact staged bytes against that set;
    it is still level-2 source-shape evidence, not Capture Program lowering.
-3. **Canonical Capture Program semantic parity — open:** a future renderer must lower the reviewed
-   backend-neutral decisions and resolve the known target-versus-legacy ordering/action differences.
+3. **Canonical Capture Program forwarded-ingress base lowering — complete, non-authorizing:** the
+   schema-v1 lowerer consumes a reviewed forwarded-ingress-only artifact, preserves canonical family
+   and clause order, expands whole-set interface negation as positive proxy membership, emits only
+   protocol-qualified TPROXY actions, and gives every direct decision an uncached `RETURN`. It
+   returns generation-namespaced but unattached family prepare/retire artifacts, entry-chain
+   metadata, bounded resource usage, and domain-separated identities. Local OUTPUT is rejected:
+   MARK-only OUTPUT does not establish PREROUTING traversal or TPROXY-listener delivery. Complete
+   runtime semantic parity remains open for that local mechanism plus established-flow caching,
+   transparent-socket DIVERT, FakeIP ICMP, QUIC rejection, and MSS clamping.
 4. **Kernel/device parity — later:** restore acceptance, apply/cleanup invertibility, exact readback,
    rollback, Android/Magisk behavior, and packet-path canaries require isolated and real-device
    execution after renderer parity.
@@ -412,9 +437,16 @@ intentionally absent from normal `cargo xtask ci`.
   digests and bounded resource totals. Shell invalidates old receipts before rebuilding shared cache artifacts,
   publishes `cache_rules_manifest` only after all renders pass, and copies it into the immutable
   Generation as `legacy-rules.manifest` before publishing `engine.manifest`.
-- **Open semantic checkpoint:** reviewed canonical mapping for ordering, cached decisions,
-  direct-versus-cached-bypass actions, protocol eligibility, DIVERT, FakeIP ICMP, QUIC, MSS,
-  interface/UID predicates, naming, ownership, and cleanup invertibility.
+- **Delivered:** extension-free schema-v1 canonical lowering for the forwarded-ingress clause shapes
+  emitted by the frozen shadow compiler. Direct predicates become ordered uncached returns;
+  negative forwarded-interface set predicates become positive proxy membership; TCP/UDP
+  eligibility is explicit; forwarded traffic receives TPROXY; interface tokens, command/byte expansion,
+  generation-scoped names, prepare/retire artifacts, resource accounting, and artifact identities
+  fail closed.
+- **Open semantic and lifecycle checkpoint:** a real local-OUTPUT TPROXY realization, established-flow
+  caching, transparent-socket DIVERT, FakeIP ICMP, QUIC rejection, MSS clamping, stable hook
+  attachment, native ownership, and proven cleanup invertibility. Local OUTPUT remains an explicit
+  lowering error until the mechanism proves listener delivery.
 - Following-stage direct child-process adapter for `iptables-restore`/`ip6tables-restore`, exact
   readback, rollback, and transition lease.
 - Coherent iptables-legacy versus iptables-nft detection and exact canaries; one Generation may use only one matched IPv4/IPv6 implementation family.
@@ -457,6 +489,13 @@ shadow/native dual-writer interval.
   publication. Stale receipts are invalidated and rebuilt/re-attested rather than reused; an
   unresolved mismatch, failed attestation, partial family, unsafe file, or wrong Generation rejects
   candidate publication and preserves the active Generation.
+- **Complete in host implementation:** the extension-free schema-v1 forwarded-ingress classifier
+  lowers to deterministic generation-namespaced IPv4/IPv6 prepare/retire artifacts without
+  attaching a built-in hook, executing restore, or granting mark, writer, ownership, or activation
+  authority.
+- **Open runtime semantics:** local OUTPUT is rejected until an exact TPROXY delivery mechanism
+  exists. Caching, DIVERT, FakeIP ICMP, QUIC rejection, and MSS clamping must also be represented by
+  typed policy before any runtime profile depending on them can use this lowerer.
 - **Open cutover evidence:** use the bridge only for targeted failure/rollback comparison while
   collecting readback and Android evidence against the native Rust-owned transition. Do not turn
   this temporary substrate into a release-packaging lane.
@@ -705,10 +744,13 @@ Before a backend may be selected automatically, its documentation must include:
    fixes, keep it as a bounded oracle/rollback substrate, and add no new compatibility features or
    release qualification. Stale receipts are rebuilt, not reused; preview and Generation builds
    remain serialized.
-2. **Complete canonical Capture Program lowering.** Resolve cached-flow ordering, loop-prevention
-   precedence, direct-action side effects, protocol eligibility, interface/application semantics,
-   cleanup invertibility, and resource budgets. The source-shape renderer remains an oracle and is
-   not promoted into the native compiler.
+2. **Complete the remaining canonical xtables runtime semantics around the delivered forwarded
+   lowerer.** First select and prove a local-OUTPUT mechanism that reaches the generation-specific
+   TPROXY listener with the required destination semantics; MARK-only OUTPUT is insufficient. Add
+   typed established-flow cache, transparent-socket DIVERT, FakeIP ICMP, QUIC reject, and MSS-clamp
+   policy only where the supported runtime requires them, then close stable attachment and
+   cleanup-invertibility contracts. The source-shape renderer remains an oracle and is not promoted
+   into the native compiler.
 3. **Cut over the xtables writer as one vertical Rust slice.** Implement native restore invocation,
    exact live readback, rollback, crash recovery, ownership naming, and the transition lease. Bind
    the already delivered engine/process/canary evidence to the executed backend, qualify the slice

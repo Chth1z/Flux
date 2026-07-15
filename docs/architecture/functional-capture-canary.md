@@ -40,10 +40,13 @@ construct an attempt, authorize traffic, or publish any functional status. The o
 shadow compiler is complete and frozen; the shell bridge remains the sole executed networking
 writer until the native component cutover.
 
-Legacy source-shape renderer parity is complete, but canonical Capture Program lowering, native
-restore, live readback, rollback, and component ownership transfer remain later gates. The shadow
-lane also adds no eBPF attach/pin path, TUN activation, implicit module request, or `.ko`/KPM loading
-that could provide an alternate evidence source.
+Legacy source-shape renderer parity and the unattached extension-free schema-v1
+forwarded-ingress lowerer are complete. Local OUTPUT remains explicitly rejected because MARK-only
+OUTPUT does not prove PREROUTING traversal or delivery to the TPROXY listener. A valid local
+mechanism, established-flow caching, transparent-socket DIVERT, FakeIP ICMP, QUIC rejection, MSS
+clamping, native restore, live readback, rollback, and component ownership transfer remain later
+gates. The shadow/lowering lane also adds no eBPF attach/pin path, TUN activation, implicit module
+request, or `.ko`/KPM loading that could provide an alternate evidence source.
 
 ### Ingress evidence is not local-OUTPUT evidence
 

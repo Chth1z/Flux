@@ -132,12 +132,21 @@ producer and exists as a mutually exclusive rollback path. The script is otherwi
 frozen byte-level oracle. Both paths publish restore caches, while `scripts/tproxy` remains their
 sole executor and the only component authorized to mutate xtables state.
 
-The Rust implementation is a legacy compatibility/source-shape renderer. It reproduces the retained
-shell contract, including ordering and duplicate forms needed for differential parity; it is not the
-canonical lowering of the backend-neutral Capture Program and grants no native writer authority.
-Existing connection marks take the fast path; new flows pass through mandatory/local bypasses,
-interface policy, and application policy before either direct acceptance or TPROXY delivery to
-Sing-Box.
+The Rust implementation used by the executed bridge is a legacy compatibility/source-shape
+renderer. It reproduces the retained shell contract, including ordering and duplicate forms needed
+for differential parity; it is not the canonical lowering of the backend-neutral Capture Program
+and grants no native writer authority. Existing connection marks take the fast path; new flows pass
+through mandatory/local bypasses, interface policy, and application policy before either direct
+acceptance or TPROXY delivery to Sing-Box.
+
+Separately, `flux-platform` now contains an extension-free schema-v1 canonical lowerer for
+forwarded-ingress Capture Programs. It emits deterministic generation-namespaced but unattached
+prepare/retire mangle chains with ordered uncached direct returns and protocol-qualified TCP/UDP
+TPROXY rules. Local OUTPUT is rejected because MARK-only OUTPUT does not prove PREROUTING traversal
+or delivery to the TPROXY listener. Established-flow caching, transparent-socket DIVERT, FakeIP
+ICMP, QUIC rejection, and MSS clamping are also rejected. These artifacts are not used by the bridge
+and grant no authority to execute restore, perform readback or rollback, write or own kernel state,
+or activate capture.
 
 `BYPASS_SET_BACKEND="zone"` is the only implemented backend. `ipset` and `auto` are intentionally
 rejected until distinct adapters, capability probes, and parity tests exist.
@@ -284,10 +293,12 @@ and compatibility wrappers, in addition to enforcing AArch64 ELF, immutable prov
 SBOM/license binding, trusted device evidence, pinned build metadata, checksums, and the no-kernel-
 payload policy.
 
-The delivered renderer is only the first non-mutating xtables cutover: Rust prepares compatibility
-bytes, while shell still owns restore execution, readback, rollback, and kernel mutation. Canonical
-Capture Program lowering and native ownership remain separate gated work. nftables, TUN, eBPF, and
-`.ko`/KPM module paths remain deferred and are not activated by this bridge.
+The delivered bridge renderer is only the first non-mutating xtables cutover: Rust prepares
+compatibility bytes, while shell still owns restore execution, readback, rollback, and kernel
+mutation. A separate non-executed schema-v1 forwarded-ingress canonical lowerer is also delivered,
+but local OUTPUT, its five rejected extensions, stable hook attachment, and native ownership remain
+separate gated work. nftables, TUN, eBPF, and `.ko`/KPM module paths remain deferred and are not
+activated by either compiler.
 
 ## Disclaimer
 

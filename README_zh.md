@@ -116,10 +116,18 @@ Android 软件包清单。渲染失败会使准备阶段失败，不会切换写
 其他情况下该脚本仅作为冻结的字节级 oracle 保留。两条路径都只发布 restore 缓存，真正执行缓存且
 获准修改 xtables 状态的组件仍只有 `scripts/tproxy`。
 
-当前 Rust 实现是旧兼容/source-shape 渲染器。它复现保留的 shell 契约，包括差分一致性所需的顺序与
-重复形式；它不是后端无关 Capture Program 的规范 lowering，也不授予原生写入权限。已有连接标记走
-快速路径；新流量依次经过强制/本地绕过、接口策略和应用策略，最后选择直接放行或交给 Sing-Box 的
-TPROXY 监听器。
+当前由实际桥接使用的 Rust 实现是旧兼容/source-shape 渲染器。它复现保留的 shell 契约，包括差分
+一致性所需的顺序与重复形式；它不是后端无关 Capture Program 的规范 lowering，也不授予原生写入
+权限。已有连接标记走快速路径；新流量依次经过强制/本地绕过、接口策略和应用策略，最后选择直接
+放行或交给 Sing-Box 的 TPROXY 监听器。
+
+此外，`flux-platform` 已实现一个不含扩展的 schema-v1 规范 lowerer，但目前仅接受转发入口
+（forwarded ingress）Capture Program。它生成确定性的、按 generation 命名但尚未挂接的 mangle
+prepare/retire 链；直接决策使用无缓存 `RETURN`，被选择的 TCP/UDP 流量使用带协议限定的 TPROXY。
+本地 OUTPUT 会被明确拒绝，因为仅在 OUTPUT 设置 MARK 并不能证明数据包会重新进入 PREROUTING 或
+到达 TPROXY 监听器。已建立流缓存、透明 socket DIVERT、FakeIP ICMP、QUIC 拒绝和 MSS 钳制同样会被
+拒绝。这些产物不供当前桥接执行，也不授予执行 restore、进行 readback 或回滚、写入或拥有内核状态、
+以及激活透明代理的权限。
 
 `BYPASS_SET_BACKEND="zone"` 是唯一已实现的后端。在独立适配器、能力探测和一致性测试完成前，
 `ipset` 与 `auto` 会被明确拒绝。
@@ -260,9 +268,10 @@ watchdog 拥有 `fluxd`。
 把验证清单切换为纯 Rust 运行时，拒绝 standalone `addrsyncd`、`jq`、旧运行时脚本与兼容包装器，再完成
 不可变来源/哈希、SBOM、设备证据、固定工具链、完整校验和、可复现 provenance 与可信 attestation。
 
-已交付的渲染器只是 xtables 第一个非修改型切换：Rust 负责准备兼容字节，shell 仍负责 restore 执行、
-readback、回滚与内核修改。规范 Capture Program lowering 和原生所有权仍是相互独立、需要门槛验证的
-后续工作。nftables、TUN、eBPF 与 `.ko`/KPM 模块路径继续推迟，本桥接不会激活这些能力。
+已交付的桥接渲染器只是 xtables 第一个非修改型切换：Rust 负责准备兼容字节，shell 仍负责 restore
+执行、readback、回滚与内核修改。另一个不执行的 schema-v1 转发入口规范 lowerer 也已交付，但本地
+OUTPUT、五项被拒绝的扩展、稳定 hook 挂接和原生所有权仍是相互独立、需要门槛验证的后续工作。
+nftables、TUN、eBPF 与 `.ko`/KPM 模块路径继续推迟，两个编译器都不会激活这些能力。
 
 ## 免责声明
 

@@ -273,6 +273,12 @@ prepared/active conversion, journal record, or Runtime Coordinator/Reconciler en
 digest is domain-separated from a Generation Capture Program digest and cannot satisfy a
 functional-canary request. No production API treats it as a packet-decision service.
 
+The separate Phase 4 xtables lowerer may consume a forwarded-ingress-only shadow artifact together
+with a caller-supplied non-authorizing namespace, structurally valid TPROXY target, explicit
+extension state, and command budget. That operation does not add authority or runtime state to the
+source artifact. Local-OUTPUT programs are rejected because an OUTPUT MARK action alone does not
+prove PREROUTING traversal or delivery to the TPROXY listener.
+
 ## 5. Configuration schema
 
 The authoritative user file is `conf/flux.toml`.
@@ -700,13 +706,20 @@ backend object naming, and activation remain deferred.
 Compilation has fixed prefix, UID, and interface-selector ceilings and fails rather than truncating.
 Canonical ordering and a domain-separated semantic digest make identical normalized inputs
 byte-for-byte reproducible. The initial shell-derived fixtures characterize policy decisions only;
-there is no xtables/nftables renderer, restore-byte parity, live-kernel readback, device-parity
-claim, or conversion to Generation/prepared/active state in this checkpoint.
+the frozen Phase 2 checkpoint itself contains no xtables/nftables renderer, restore-byte parity,
+live-kernel readback, device-parity claim, or conversion to Generation/prepared/active state. A
+separate Phase 4 lowerer now consumes only the forwarded-ingress schema-v1 shape and remains outside
+every activation path.
 
 The separate Phase 4 `LegacyRulesPlan` does not widen this shadow boundary. It preserves and
 validates the legacy generator's source shape so bridge preparation can reproduce compatibility
 restore bytes. It is neither constructed from nor convertible from `ShadowCaptureArtifact` and is
 not canonical Capture Program lowering.
+
+The canonical Phase 4 lowerer is independent of `LegacyRulesPlan`. It emits generation-namespaced
+but unattached mangle implementation chains for forwarded ingress only. It rejects local OUTPUT,
+established-flow caching, transparent-socket DIVERT, FakeIP ICMP, QUIC rejection, and MSS clamping,
+and it provides no restore execution, ownership, or activation conversion.
 
 The shadow IR follows the target order in section 8.1: compatibility engine loop prevention is
 before destination/interface policy, and forwarded loopback safety is before configurable bypass.
@@ -718,9 +731,11 @@ must review it explicitly rather than silently copying either order.
 
 Shadow list predicates are set predicates: members are ORed, while `LocalUidNotIn` and
 `InterfaceDoesNotMatch` negate the complete set. Interface selectors are backend-neutral bytes,
-not proof that an xtables token is renderable. The later renderer must validate quoting/encoding,
-trailing-`+` ambiguity, and IFNAMSIZ expansion before emitting restore syntax, preserve whole-set
-negation, and apply its separate rendered-rule budget.
+not proof that an xtables token is renderable. The schema-v1 forwarded-ingress lowerer validates
+token bytes, leading-dash and trailing-`+` ambiguity, and IFNAMSIZ expansion before emitting restore
+syntax. It preserves whole-set `InterfaceDoesNotMatch` semantics by expanding only positive proxy
+membership and applies a separate command budget. Local UID predicates remain outside this delivered
+slice because local OUTPUT is rejected.
 
 ### 8.1 Normalized decision order
 
@@ -869,7 +884,9 @@ closed. The proxy marks are not independently allocated: preparation exports the
 The renderer is pure: it performs no filesystem, process, restore, or kernel I/O and returns the
 bounded canonical syntax artifact. Its exact pinned-profile and branch-matrix tests prove legacy
 source-shape parity only. Cached-flow ordering, direct-action side effects, protocol eligibility,
-and other target semantic differences still require a separate canonical Capture Program lowering.
+and other target semantic differences are not inherited by the separate canonical lowerer. The
+delivered canonical slice handles only extension-free forwarded ingress; local OUTPUT and the five
+typed extensions remain open.
 
 Renderer-owned identity is schema-versioned and domain-separated. `LegacyRulesPlanDigest` binds
 every byte-significant compatibility input, including ordered and duplicate UID/interface facts,
@@ -933,27 +950,63 @@ writer/ownership token, live readback, rollback proof, prepared-capture conversi
 verification claim; `scripts/tproxy` remains the sole restore executor and kernel writer.
 
 These compatibility-only renderer, snapshot, and attestation commands are removed or made private
-with the bridge when native canonical lowering and restore ownership pass their cutover gate. They
-are not public release APIs.
+with the bridge when the remaining canonical semantics and native restore ownership pass their
+cutover gate. They are not public release APIs.
 
 Explicit legacy restart similarly prepares and validates fresh settings, the replacement Sing-Box
 configuration, and every replacement cache before stopping the active runtime. Preparation failure
 restores the prior cache authority, leaves that runtime untouched, and keeps stop/cleanup available.
 
-### 10.3 Native restore invocation
+### 10.3 Delivered canonical schema-v1 forwarded-ingress lowering
+
+`lower_xtables_capture` consumes a schema-v1 `ShadowCaptureArtifact` only when every selected domain
+is forwarded ingress. Its request also carries an `XtablesCaptureNamespace`, an
+`XtablesTproxyTarget`, an explicit `XtablesCaptureExtensions` value, and a caller-selected command
+budget bounded by the immutable restore grammar. `XtablesCaptureNamespace` uses a nonzero numeric
+generation label only to derive deterministic generation-scoped implementation-chain names; it is
+not a Generation, ownership token, writer lease, or activation authority. The target contains a
+nonzero listener port plus an `FwmarkCandidate`; supplying that candidate proves neither Android
+allocation authority nor a mark lease.
+
+The lowerer validates canonical family/domain ordering, unique domain keys, the exact sealed
+forwarded schema-v1 clause shape, mandatory exact-`lo` safety, address-family consistency, input-
+interface direction, xtables token encoding and wildcard bounds, and checked command/byte expansion.
+Ordered direct predicates become uncached `RETURN` rules. The terminal whole-set
+`InterfaceDoesNotMatch` predicate is preserved by emitting positive proxy membership only for the
+selected input interfaces. TCP and UDP eligibility becomes protocol-qualified TPROXY rules using the
+request port and masked proxy mark; every other protocol falls through direct.
+
+For each selected family, the result contains one forwarded entry point and paired canonical
+prepare/retire restore artifacts. Names use `FLX{4|6}F{generation:010}`. Prepare declares and fills
+only the unattached implementation chain; retire flushes and deletes that same unattached chain. The
+restore parser reserves this namespace, requires a nonzero ten-digit `u32` generation, and rejects
+malformed or cross-family names. The lowering, family-pair, and artifact-set identities are
+deterministic and domain-separated. They bind the source-program and restore-syntax digests, entry
+names, and resource accounting. Resource accounting records source clauses, expanded match rules,
+implementation chains, prepare/retire commands, and maximum jump depth.
+
+Schema v1 rejects local OUTPUT because a MARK-only OUTPUT chain does not re-enter PREROUTING or prove
+delivery to the selected TPROXY listener. It also rejects established-flow caching,
+transparent-socket DIVERT, FakeIP ICMP, QUIC rejection, and MSS clamping. The artifacts do not attach
+to `PREROUTING` or `OUTPUT`, invoke restore, inspect live state, prove cleanup invertibility, perform
+readback or rollback, acquire ownership, enter the journal/coordinator, or construct prepared/active
+state. The next cutover must first qualify a real local-OUTPUT mechanism, then add any required typed
+extensions and the stable-hook/native-writer transaction.
+
+### 10.4 Native restore invocation
 
 The future native adapter will spawn the discovered `iptables-restore`/`ip6tables-restore` binaries directly, pass `--noflush` and a bounded wait option, write generated content to stdin, and capture stderr with a size limit.
 
 Before selection, Flux detects whether each tool belongs to iptables-legacy, iptables-nft, a wrapper, or a vendor implementation. IPv4/IPv6 command and restore tools must form one coherent implementation and pass the exact canary. One Generation never mixes legacy and nft variants or manages the same policy through both.
 
-### 10.4 Generation shape
+### 10.5 Generation shape
 
 - Stable entry chains are attached once.
 - Generation chains contain the actual policy and reference only generation-specific sets.
 - Activation updates stable jumps in one restore transaction per family/table.
 - Cleanup removes exact generation chains only after no stable jump references them.
 
-### 10.5 ipset
+### 10.6 ipset
 
 - Separate IPv4 and IPv6 `hash:net` sets.
 - Create generation-specific target sets and populate an unreferenced temporary set.
@@ -962,7 +1015,7 @@ Before selection, Flux detects whether each tool belongs to iptables-legacy, ipt
 - Destroy retired generation sets only after their generation chains are unreferenced and removed.
 - If create/add/swap semantics are not all verified, do not select ipset.
 
-### 10.6 Bounded-tree fallback
+### 10.7 Bounded-tree fallback
 
 Retain the current prefix-zone concept as a compatibility compiler, with hard depth and chain-count budgets. Canonicalized user CIDRs are permitted, but compiler estimates must reject pathological expansions.
 
@@ -1566,6 +1619,7 @@ cannot be classified by the current extension checks. Production `fluxd` does no
 | Bridge | `fluxd` owns Sing-Box through the atomic runtime coordinator; serialized shell phases still own networking writes | No |
 | Shadow compiler | Rust emits deterministic observation-only Capture Programs; no shadow artifact enters a Generation or activation path | No |
 | Rust generation bridge | Rust prepares and attests legacy-shaped restore caches; `scripts/tproxy` remains the restore executor/writer | No |
+| Canonical forwarded-ingress lowering | Rust lowers extension-free schema-v1 forwarded policy into generation-namespaced but unattached prepare/retire chains; local OUTPUT and five extensions are rejected, and nothing executes | No |
 | Native xtables cutover | Rust owns canonical lowering, restore, exact readback, rollback, and the transition lease; replaced shell rule/restore duties are deleted after qualification | No, until all intended runtime duties are Rust-owned |
 | PBR/address-sync cutover | Rust owns routing and address-derived rules; standalone `addrsyncd` and shell route writers are removed | No |
 | Remaining runtime cutover | Rust owns configuration, subscription, diagnostics, recovery, and offline cleanup; legacy runtime scripts, `jq`/AWK/curl adapters, and wrappers are removed | No |

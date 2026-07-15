@@ -1033,12 +1033,17 @@ fn has_reserved_flux_chain_prefix(chain: &str) -> bool {
         "ACTION_BYPASS",
         "DIVERT",
         "BYP_Z",
+        "FLX",
     ]
     .into_iter()
     .any(|prefix| chain.starts_with(prefix))
 }
 
 fn flux_chain_family(chain: &str) -> Option<XtablesRestoreFamily> {
+    if let Some(family) = capture_generation_chain_family(chain) {
+        return Some(family);
+    }
+
     const BASES: [&str; 8] = [
         "PROXY_PREROUTING",
         "PROXY_OUTPUT",
@@ -1068,6 +1073,27 @@ fn flux_chain_family(chain: &str) -> Option<XtablesRestoreFamily> {
         }
     }
     None
+}
+
+fn capture_generation_chain_family(chain: &str) -> Option<XtablesRestoreFamily> {
+    let (family, generation) = if let Some(generation) = chain.strip_prefix("FLX4F") {
+        (XtablesRestoreFamily::Ipv4, generation)
+    } else if let Some(generation) = chain.strip_prefix("FLX6F") {
+        (XtablesRestoreFamily::Ipv6, generation)
+    } else {
+        return None;
+    };
+    if generation.len() != 10
+        || !generation.as_bytes().iter().all(u8::is_ascii_digit)
+        || generation
+            .parse::<u32>()
+            .ok()
+            .filter(|value| *value != 0)
+            .is_none()
+    {
+        return None;
+    }
+    Some(family)
 }
 
 const fn family_mismatch(

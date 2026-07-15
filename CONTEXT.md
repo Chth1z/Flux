@@ -58,8 +58,12 @@ A deterministic backend-neutral compilation of Capture Policy into separate orde
 _Avoid_: Restore file, active rules
 
 **Shadow Capture Artifact**:
-An observation-only Phase 2 Capture Program used to explain and compare compatibility semantics before canonical Capture Program lowering or an activation path exists. It is distinct from the delivered legacy source-shape renderer and has no Generation ID, Planning Authority, writer token, ownership lease, prepared/active conversion, or functional-canary authority.
+An observation-only Phase 2 Capture Program used to explain and compare compatibility semantics. A separate Phase 4 lowerer may consume a forwarded-ingress-only artifact, but does not mutate or promote it. The shadow artifact remains distinct from both the canonical xtables artifact and the legacy source-shape renderer and has no Generation ID, Planning Authority, writer token, ownership lease, prepared/active conversion, or functional-canary authority.
 _Avoid_: Dry-run Generation, staged rules
+
+**Xtables Capture Artifact Set**:
+A deterministic, non-authorizing Phase 4 lowering of an extension-free schema-v1 forwarded-ingress Capture Program into family-scoped, generation-namespaced but unattached prepare/retire mangle chains and entry-point metadata. It rejects local OUTPUT, established-flow caching, transparent-socket DIVERT, FakeIP ICMP, QUIC rejection, and MSS clamping, and carries no restore execution, readback, rollback, writer, ownership, prepared/active, coordinator, or activation authority.
+_Avoid_: Active rules, native cutover, local-OUTPUT backend
 
 **Legacy Rules Plan**:
 A validated, source-shape-preserving Rust representation of the admitted `scripts/rules` compatibility inputs. It can deterministically emit the same bounded apply/cleanup restore bytes for bridge preparation, including legacy ordering and duplicates, but it is not a lowering of `ShadowCaptureArtifact`, a Generation Capture Program, or mutation authority.

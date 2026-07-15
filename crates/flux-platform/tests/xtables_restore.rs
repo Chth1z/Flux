@@ -199,6 +199,54 @@ fn ipv6_family_accepts_compressed_zone_names_and_rejects_ipv4_context() {
 }
 
 #[test]
+fn canonical_capture_chain_names_are_family_scoped_and_sealed() {
+    let ipv4 = b"*mangle\n:FLX4F0000000001 - [0:0]\nCOMMIT\n";
+    let ipv6 = b"*mangle\n:FLX6F4294967295 - [0:0]\nCOMMIT\n";
+
+    for (input, family) in [
+        (ipv4.as_slice(), XtablesRestoreFamily::Ipv4),
+        (ipv6.as_slice(), XtablesRestoreFamily::Ipv6),
+    ] {
+        let artifact = parse_xtables_restore(input, context(XtablesRestoreAction::Apply, family))
+            .expect("canonical Capture chain name");
+        assert_eq!(artifact.render_canonical().as_ref(), input);
+    }
+
+    assert_error(
+        ipv4,
+        context(XtablesRestoreAction::Apply, XtablesRestoreFamily::Ipv6),
+        XtablesRestoreParseErrorKind::FamilyMismatch {
+            expected: XtablesRestoreFamily::Ipv6,
+        },
+        Some(2),
+    );
+    assert_error(
+        ipv6,
+        context(XtablesRestoreAction::Apply, XtablesRestoreFamily::Ipv4),
+        XtablesRestoreParseErrorKind::FamilyMismatch {
+            expected: XtablesRestoreFamily::Ipv4,
+        },
+        Some(2),
+    );
+
+    for chain in [
+        "FLX4F0000000000",
+        "FLX4F000000001",
+        "FLX4F4294967296",
+        "FLX6F000000000A",
+        "FLX5F0000000001",
+    ] {
+        let input = format!("*mangle\n:{chain} - [0:0]\nCOMMIT\n");
+        assert_error(
+            input.as_bytes(),
+            context(XtablesRestoreAction::Apply, XtablesRestoreFamily::Ipv4),
+            XtablesRestoreParseErrorKind::InvalidChainName,
+            Some(2),
+        );
+    }
+}
+
+#[test]
 fn cleanup_round_trip_preserves_delete_flush_delete_chain_phase_order() {
     let artifact = parse_xtables_restore(
         IPV4_CLEANUP,

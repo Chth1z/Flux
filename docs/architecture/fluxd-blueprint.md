@@ -21,12 +21,15 @@ Migration is component-by-component rather than an unsafe dual-writer switch. Du
 development, the serialized shell networking path is frozen as the executable compatibility oracle
 and remains the sole writer for each not-yet-cut-over component. Rust-owned preparation now
 compiles the legacy restore caches through a validated source-shape renderer while explicit legacy
-ownership retains the frozen shell generator; this non-mutating compiler split does not promote a
-shadow artifact or transfer writer ownership. A kernel ownership transition occurs only after
-renderer, parity, readback, recovery, rollback, and real-device gates pass for that component; the
-replaced runtime code is then removed promptly. No bridge, shadow, parity, or partial-cutover state
-is releasable. See [ADR-0010](../adr/0010-freeze-shell-networking-as-a-shadow-compiler-oracle.md)
-and [ADR-0011](../adr/0011-pre-release-rust-only-release-gate.md).
+ownership retains the frozen shell generator. Separately, an extension-free schema-v1 canonical
+lowerer now emits generation-namespaced but unattached forwarded-ingress prepare/retire chains and
+rejects local OUTPUT plus its five unmodeled extensions. Neither non-mutating compiler split promotes
+a shadow artifact or transfers writer ownership. A kernel ownership transition occurs only after a
+real local-OUTPUT mechanism, required adjunct semantics, renderer parity, readback, recovery,
+rollback, and real-device gates pass for that component; the replaced runtime code is then removed
+promptly. No bridge, shadow, parity, or partial-cutover state is releasable. See
+[ADR-0010](../adr/0010-freeze-shell-networking-as-a-shadow-compiler-oracle.md) and
+[ADR-0011](../adr/0011-pre-release-rust-only-release-gate.md).
 
 ## Research basis
 
@@ -180,10 +183,13 @@ product is for review and frozen-oracle fixture comparison only; it is not expos
 packet-decision service.
 
 The shadow artifact is not a `GenerationArtifact` or `CompiledGeneration`. It has no Generation ID,
-Planning Authority or receipt, writer/ownership token, backend renderer, kernel object names,
-prepared/active conversion, Runtime Reconciler entry point, or functional-canary authority. The
-bridge shell remains the sole executed networking writer, and no shadow output is accepted by the
-Phase 1 `RuntimeCoordinator`.
+Planning Authority or receipt, writer/ownership token, embedded backend renderer, kernel object
+names, prepared/active conversion, Runtime Reconciler entry point, or functional-canary authority.
+The separate Phase 4 lowerer may consume a forwarded-ingress-only artifact with a non-authorizing
+namespace and mark candidate, but does not mutate or promote the source value. It rejects local
+OUTPUT because MARK-only OUTPUT does not prove TPROXY delivery. The bridge shell remains the sole
+executed networking writer, and no shadow or lowered output is accepted by the Phase 1
+`RuntimeCoordinator`.
 
 ### 3. Runtime Reconciler module
 
@@ -460,6 +466,20 @@ The delivered `LegacyRulesPlan` preserves validated legacy source shape; it is n
 Phase 2 shadow Capture Program and does not claim target semantic or device parity. A later native
 transition disables the shell writer before its first restore mutation so both implementations are
 never active writers.
+
+The separate canonical schema-v1 lowerer consumes only forwarded-ingress shadow programs. It
+preserves ordered direct decisions as uncached returns, expands terminal whole-set interface
+negation as positive proxy membership, and emits protocol-qualified TCP/UDP TPROXY rules into
+generation-namespaced but unattached mangle chains. Family prepare/retire artifacts, entry metadata,
+resource accounting, and domain-separated identities are deterministic. Local OUTPUT is rejected:
+an OUTPUT MARK-only chain does not establish PREROUTING traversal or delivery to the selected TPROXY
+listener. Established-flow caching, transparent-socket DIVERT, FakeIP ICMP, QUIC rejection, and MSS
+clamping are also explicit unsupported extensions.
+
+This canonical artifact has no stable hook attachment, restore invocation, live readback, rollback,
+cleanup-invertibility proof, mark lease, writer/ownership token, prepared/active conversion, or
+Runtime Reconciler entry point. A native transition still requires one qualified local-OUTPUT
+mechanism, any required typed extensions, and the single-writer cutover gates below.
 
 The bridge now binds that source-shape output before Generation publication. Domain-separated plan,
 mandatory family apply/cleanup pair, and enabled-family set identities are renderer-owned.

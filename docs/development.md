@@ -93,7 +93,36 @@ Do not use the shadow work to attach or pin eBPF, touch live Flux chains, enable
 modules implicitly, load `.ko`/KPM payloads, or perform native networking mutation. The shell phase
 path continues to execute all bridge capture, policy-routing, and address-synchronization writes.
 The delivered `LegacyRulesPlan` is a separate source-shape compatibility compiler; it does not
-promote the shadow artifact or discharge canonical Capture Program lowering.
+promote the shadow artifact or implement the canonical lowering described below.
+
+### Canonical schema-v1 forwarded-ingress xtables lowering workflow
+
+Run the focused pure-lowering suite with:
+
+```text
+cargo test -p flux-platform --test xtables_capture_lowering
+```
+
+This suite consumes forwarded-ingress-only schema-v1 `ShadowCaptureArtifact` values and proves
+deterministic IPv4/IPv6 family artifacts, canonical mandatory/host/loopback/configured direct-rule
+order, positive expansion of the terminal whole-set interface selector,
+TCP-only/UDP-only/TCP+UDP TPROXY eligibility, exact interface token and IFNAMSIZ rejection, checked
+command and immutable restore-byte budgets, family-sealed generation-namespaced chain identity, a
+fixed canonical restore fixture, and fixed/differential digest behavior. Direct decisions emit
+uncached `RETURN`; selected forwarded traffic receives protocol-qualified TPROXY rules.
+
+The resulting prepare/retire documents declare, fill, flush, and delete only unattached
+generation-namespaced implementation chains. The suite verifies that neither artifact modifies a
+built-in hook. Local OUTPUT is an explicit error because a MARK-only OUTPUT chain does not prove
+PREROUTING traversal or delivery to the selected TPROXY listener. Established-flow caching,
+transparent-socket DIVERT, FakeIP ICMP, QUIC rejection, and MSS clamping are also explicit schema-v1
+errors.
+
+Passing this suite proves pure syntax lowering only. It does not invoke `iptables-restore` or
+`ip6tables-restore`, inspect kernel state, prove cleanup invertibility, allocate an Android mark,
+perform readback or rollback, obtain writer/ownership authority, enter the coordinator, or qualify
+Android packet delivery. Do not feed these artifacts to `scripts/tproxy`; the development bridge
+continues to use the independent `LegacyRulesPlan` artifacts below.
 
 ### Rust legacy-rule renderer and frozen oracle workflow
 

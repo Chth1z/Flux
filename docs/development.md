@@ -96,34 +96,59 @@ path continues to execute all bridge capture, policy-routing, and address-synchr
 The delivered `LegacyRulesPlan` is a separate source-shape compatibility compiler; it does not
 promote the shadow artifact or implement the canonical lowering described below.
 
-### Canonical schema-v1 forwarded-ingress xtables lowering workflow
+### Canonical xtables lowering workflow
 
-Run the focused pure-lowering suite with:
+Run the focused pure-lowering and sealed restore-namespace suites with:
 
 ```text
 cargo test -p flux-platform --test xtables_capture_lowering
+cargo test -p flux-platform --test xtables_restore
 ```
 
-This suite consumes forwarded-ingress-only schema-v1 `ShadowCaptureArtifact` values and proves
-deterministic IPv4/IPv6 family artifacts, canonical mandatory/host/loopback/configured direct-rule
-order, positive expansion of the terminal whole-set interface selector,
+The lowering suite consumes extension-free `ShadowCaptureArtifact` values. Forwarded-ingress-only input
+retains schema v1 and pins its exact restore bytes and lowering, family-pair, and artifact-set
+digests. It proves deterministic IPv4/IPv6 family artifacts, canonical mandatory/host/loopback/
+configured direct-rule order, positive expansion of the terminal whole-set interface selector,
 TCP-only/UDP-only/TCP+UDP TPROXY eligibility, exact interface token and IFNAMSIZ rejection, checked
-command and immutable restore-byte budgets, family-sealed generation-namespaced chain identity, a
-fixed canonical restore fixture, and fixed/differential digest behavior. Direct decisions emit
-uncached `RETURN`; selected forwarded traffic receives protocol-qualified TPROXY rules.
+command and immutable restore-byte budgets, and family-sealed `FLX{4|6}F{generation}` identity.
+Direct decisions emit uncached `RETURN`; selected forwarded traffic receives protocol-qualified
+TPROXY rules.
 
-The resulting prepare/retire documents declare, fill, flush, and delete only unattached
-generation-namespaced implementation chains. The suite verifies that neither artifact modifies a
-built-in hook. Local OUTPUT is an explicit error because a MARK-only OUTPUT chain lacks the reviewed
-RPDB local route, mark-qualified loopback PREROUTING TPROXY companion, and listener-delivery
-transaction. Established-flow caching, transparent-socket DIVERT, FakeIP ICMP, QUIC rejection, and
-MSS clamping are also explicit schema-v1 errors.
+Any artifact containing local OUTPUT selects schema v2. The suite proves ordered engine-credential,
+destination, output-interface, and application direct decisions; positive UID proxy membership for
+allowlists; protocol-qualified masked `MARK --set-xmark` in private
+`FLX{4|6}O{generation}` classifier chains; and exact-port TCP/UDP TPROXY in private
+`FLX{4|6}P{generation}` loopback companions. Mixed programs retain distinct `O`, `P`, and `F` roles.
+Proxying local programs require an exact caller-selected, descriptive routing target for every
+enabled family; supplying it creates no allocation or mutation authority. Zero priority, reserved
+tables, unspecified route protocol, and explicitly unspecified rule protocol fail before rendering.
+All-direct local programs require no companion, listener, or routing target and reject an unexpected
+one. Combined classifier/companion command and byte expansion is budgeted before artifact
+construction.
 
-Passing this suite proves pure syntax lowering only. It does not invoke `iptables-restore` or
-`ip6tables-restore`, inspect kernel state, prove cleanup invertibility, allocate an Android mark,
-perform readback or rollback, obtain writer/ownership authority, enter the coordinator, or qualify
-Android packet delivery. Do not feed these artifacts to `scripts/tproxy`; the development bridge
-continues to use the independent `LegacyRulesPlan` artifacts below.
+Schema-v2 entry-point metadata describes the future stable-hook contract without mutating it: the
+OUTPUT classifier selects the unassigned `0/mask` role, the loopback PREROUTING companion selects
+`lo` plus `proxy/mask`, and forwarded ingress retains its separate PREROUTING role. Typed local
+requirements bind the wildcard-family transparent listener and exact port/protocols, the
+compatibility engine UID/GID predicate plus independently required bypass socket mark, and the RPDB
+priority/table, route protocol, optional rule
+protocol, proxy mark/mask, and exact family `/0` `RTN_LOCAL` host-scope route through loopback.
+Descriptive lifecycle metadata prepares all private chains, listener, routing, and escape before
+attaching `P`, then `F`, then `O`; retirement detaches `O`, then `F`, then `P` before removing the
+supporting objects and private chains.
+
+The resulting prepare/retire documents still declare, fill, flush, and delete only unattached
+generation-namespaced implementation chains. The tests verify that neither artifact modifies a
+built-in hook and that the restore grammar accepts only family-matching, nonzero-generation `F`,
+`O`, and `P` names. Established-flow caching, transparent-socket DIVERT, FakeIP ICMP, QUIC rejection,
+and MSS clamping remain explicit unsupported-extension errors in both lowering schemas.
+
+Passing this suite proves pure canonical representation only. It does not invoke
+`iptables-restore` or `ip6tables-restore`, attach a stable hook, create a listener or route, inspect
+kernel state, prove cleanup invertibility, allocate an Android mark, perform readback or rollback,
+obtain writer/ownership authority, enter the coordinator, or qualify Android packet delivery. The
+production xtables driver remains `Unsupported`. Do not feed these artifacts to `scripts/tproxy`;
+the development bridge continues to use the independent `LegacyRulesPlan` artifacts below.
 
 ### Rust legacy-rule renderer and frozen oracle workflow
 
@@ -426,9 +451,10 @@ and daemon network namespace. Mismatch is cleanup-uncertain, the evidence factor
 and the adapter retains termination/reap ownership.
 
 Both production receipt authorities therefore remain uninhabited, and the current zero-state
-xtables driver still returns `Unsupported` before mutation because it does not implement or
-authorize the complete OUTPUT mark, RPDB local route, mark-qualified loopback PREROUTING TPROXY,
-listener, escape, and cleanup transaction. The combined integration checkpoint remains incomplete
+xtables driver still returns `Unsupported` before mutation because no runtime adapter consumes the
+pure schema-v2 `O`/`P` representation to authorize, provision, attach, verify, read back, or retire
+the complete OUTPUT mark, RPDB local route, mark-qualified loopback PREROUTING TPROXY, listener,
+escape, and cleanup transaction. The combined integration checkpoint remains incomplete
 and is split into the following remaining reviews: final verifier-side completion chronology and prepared-driver
 client/peer ownership and retirement; an independent listener observer that proves
 UDP listener state, FD/inode/cookie, transparency, and IPv6-only state; a bounded versioned

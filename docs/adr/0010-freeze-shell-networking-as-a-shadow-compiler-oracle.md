@@ -1,7 +1,7 @@
 ---
 status: accepted
 decision_date: 2026-07-14
-last_reviewed: 2026-07-15
+last_reviewed: 2026-07-16
 ---
 
 # Freeze shell networking as the oracle for a non-authorizing Rust shadow compiler
@@ -86,13 +86,20 @@ configuration, and replacement caches before stopping the active runtime. A fail
 preparation preserves that runtime.
 
 `scripts/tproxy` remains the sole restore executor and kernel writer. Native restore execution,
-exact readback, rollback qualification, the transition lease, complete local-OUTPUT lowering,
-real-device evidence, nftables, TUN, production eBPF, implicit module requests, and `.ko`/KPM paths
-remain outside this cutover.
+exact readback, rollback qualification, the transition lease, stable-hook mutation, runtime
+local-OUTPUT authority, real-device release evidence, nftables, TUN, production eBPF, implicit
+module requests, and `.ko`/KPM paths remain outside this cutover.
 
-The extension-free schema-v1 forwarded-ingress lowerer is now delivered separately from
-`LegacyRulesPlan`. It consumes a supported shadow artifact and emits deterministic, unattached
-generation-namespaced prepare/retire syntax without acquiring writer or activation authority.
+The extension-free canonical lowerer is delivered separately from `LegacyRulesPlan`. Forwarded-
+ingress-only input preserves the exact schema-v1 bytes and digests in generation-namespaced `F`
+chains. Any input containing local OUTPUT selects schema v2: `O` chains classify eligible traffic
+with masked `MARK`, `P` chains describe the mark-qualified loopback PREROUTING TPROXY companion, and
+mixed programs may also carry `F` chains. Typed metadata binds stable-hook roles/selectors, the
+transparent listener, engine loop escape, per-family RPDB/local-route identity, lifecycle order,
+digests, and resource budgets. The prepare/retire documents still operate only on unattached private
+chains; the metadata cannot execute, attach, provision, or authorize anything. Established-flow
+caching, transparent-socket DIVERT, FakeIP ICMP, QUIC rejection, and MSS clamping remain rejected,
+and the production xtables driver remains `Unsupported`.
 
 Local-OUTPUT research also identified a contract boundary rather than a categorical oracle defect.
 The frozen shell source shape places its generic loopback bypass after an optional connmark-

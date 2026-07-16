@@ -8,16 +8,19 @@ use flux_core::{
     CaptureInterfacePolicy, CaptureInterfaceSelector, CaptureIpPrefix, CaptureProtocolSet,
     CaptureTrafficDomain, CaptureTrafficScope, CaptureUserId, CompatibilityEngineCredentials,
     FwmarkCandidate, InterfaceAddressFlags, InterfaceAddressRecord, InterfaceIndex, InterfaceName,
-    NetworkAddressFamily, NetworkInventoryTracker, ShadowCaptureArtifact,
-    ShadowCaptureProgramRequest, ShadowCompilationReport, compile_shadow_capture_program,
-    plan_address_host_set,
+    NetworkAddressFamily, NetworkInventoryTracker, RouteProtocol, RouteTableId, RuleFwMark,
+    RulePriority, RuleProtocol, ShadowCaptureArtifact, ShadowCaptureProgramRequest,
+    ShadowCompilationReport, compile_shadow_capture_program, plan_address_host_set,
 };
 use flux_platform::{
-    MAX_XTABLES_RESTORE_BYTES, XtablesCaptureArtifactSet, XtablesCaptureExtension,
-    XtablesCaptureExtensions, XtablesCaptureLoweringBudget, XtablesCaptureLoweringError,
-    XtablesCaptureLoweringRequest, XtablesCaptureNamespace, XtablesInterfaceRenderErrorKind,
-    XtablesRestoreAction, XtablesRestoreContext, XtablesRestoreFamily, XtablesTproxyTarget,
-    lower_xtables_capture,
+    MAX_XTABLES_RESTORE_BYTES, XtablesCaptureArtifactSet, XtablesCaptureEntryPointRole,
+    XtablesCaptureEntrySelector, XtablesCaptureExtension, XtablesCaptureExtensions,
+    XtablesCaptureHook, XtablesCaptureLoweringBudget, XtablesCaptureLoweringError,
+    XtablesCaptureLoweringRequest, XtablesCaptureNamespace, XtablesCaptureTransactionStep,
+    XtablesInterfaceRenderErrorKind, XtablesLocalOutputRoutingSpec,
+    XtablesLocalOutputRoutingSpecError, XtablesLocalOutputRoutingTarget,
+    XtablesLocalOutputRoutingTargetError, XtablesRestoreAction, XtablesRestoreContext,
+    XtablesRestoreFamily, XtablesTproxyTarget, lower_xtables_capture,
 };
 
 const DEFAULT_GENERATION: u32 = 42;
@@ -25,6 +28,10 @@ const DEFAULT_PROXY_PORT: u16 = 1536;
 const DEFAULT_MARK_MASK: u32 = 0x0060_0000;
 const DEFAULT_PROXY_MARK: u32 = 0x0020_0000;
 const DEFAULT_BYPASS_MARK: u32 = 0x0040_0000;
+const DEFAULT_ROUTE_PRIORITY: u32 = 30_999;
+const DEFAULT_ROUTE_TABLE: u32 = 20_253;
+const DEFAULT_ROUTE_PROTOCOL: u8 = 4;
+const DEFAULT_RULE_PROTOCOL: u8 = 99;
 
 #[test]
 fn dual_stack_forwarded_lowering_is_deterministic_and_unattached() {
@@ -96,6 +103,7 @@ fn forwarded_schema_v1_fixture_pins_exact_bytes_and_identities() {
     );
     let lowered = lower(&report, 1, default_target()).unwrap();
     let pair = lowered.ipv4().unwrap();
+    assert_eq!(lowered.schema_version(), 1);
 
     assert_eq!(
         restore_text(pair.prepare()),
@@ -212,7 +220,40 @@ fn protocol_subsets_emit_only_the_selected_forwarded_proxy_rules() {
 }
 
 #[test]
-fn local_output_and_dual_domain_programs_reject_at_the_first_local_program() {
+fn local_protocol_subsets_align_classifier_companion_and_listener() {
+    for (protocols, selected, omitted) in [
+        (CaptureProtocolSet::TCP, "tcp", "udp"),
+        (CaptureProtocolSet::UDP, "udp", "tcp"),
+    ] {
+        let report = compile_program(
+            scope(AddressHostFamilySelection::Ipv4, true, false),
+            interfaces(&[], &[], &[]),
+            protocols,
+            &[],
+        );
+        let lowered = lower_with_routing(
+            &report,
+            24,
+            default_target(),
+            local_routing_spec(Some(default_routing_target()), None),
+        )
+        .unwrap();
+        let pair = lowered.ipv4().unwrap();
+        let prepare = restore_text(pair.prepare());
+        assert!(prepare.contains(&format!(
+            "-A FLX4O0000000024 -p {selected} -j MARK --set-xmark"
+        )));
+        assert!(prepare.contains(&format!("-A FLX4P0000000024 -p {selected} -j TPROXY")));
+        assert!(!prepare.contains(&format!(" -p {omitted} ")));
+        assert_eq!(
+            pair.local_output().unwrap().listener().protocols(),
+            protocols
+        );
+    }
+}
+
+#[test]
+fn proxying_local_output_requires_exact_family_routing() {
     let local_only = compile_program(
         scope(AddressHostFamilySelection::Ipv4, true, false),
         interfaces(&[], &[], &[]),
@@ -221,25 +262,460 @@ fn local_output_and_dual_domain_programs_reject_at_the_first_local_program() {
     );
     assert_eq!(
         lower(&local_only, DEFAULT_GENERATION, default_target()),
-        Err(XtablesCaptureLoweringError::UnsupportedTrafficDomain {
+        Err(XtablesCaptureLoweringError::MissingLocalOutputRouting {
             family: NetworkAddressFamily::Ipv4,
-            domain: CaptureTrafficDomain::LocalOutput,
         })
     );
 
-    let dual_domain = compile_program(
+    let ipv6_only = local_routing_spec(None, Some(default_routing_target()));
+    assert_eq!(
+        lower_with_routing(&local_only, DEFAULT_GENERATION, default_target(), ipv6_only,),
+        Err(XtablesCaptureLoweringError::MissingLocalOutputRouting {
+            family: NetworkAddressFamily::Ipv4,
+        })
+    );
+}
+
+#[test]
+fn ipv4_local_output_schema_v2_pins_complete_non_authorizing_transaction() {
+    let report = compile_program(
+        scope(AddressHostFamilySelection::Ipv4, true, false),
+        interfaces(&[], &[], &[]),
+        CaptureProtocolSet::TCP_AND_UDP,
+        &[],
+    );
+    let lowered = lower_with_routing(
+        &report,
+        1,
+        default_target(),
+        local_routing_spec(Some(default_routing_target()), None),
+    )
+    .unwrap();
+    assert_eq!(lowered.schema_version(), 2);
+    let pair = lowered.ipv4().unwrap();
+    assert_eq!(
+        pair.entries()
+            .iter()
+            .map(|entry| (entry.role(), entry.hook(), entry.selector(), entry.chain()))
+            .collect::<Vec<_>>(),
+        [
+            (
+                XtablesCaptureEntryPointRole::LocalOutputClassifier,
+                XtablesCaptureHook::Output,
+                XtablesCaptureEntrySelector::Mark(RuleFwMark::new(0, DEFAULT_MARK_MASK).unwrap(),),
+                "FLX4O0000000001",
+            ),
+            (
+                XtablesCaptureEntryPointRole::LocalOutputLoopbackTproxy,
+                XtablesCaptureHook::Prerouting,
+                XtablesCaptureEntrySelector::InputInterfaceAndMark {
+                    interface: interface_bytes(b"lo"),
+                    mark: RuleFwMark::new(DEFAULT_PROXY_MARK, DEFAULT_MARK_MASK).unwrap(),
+                },
+                "FLX4P0000000001",
+            ),
+        ]
+    );
+    assert_eq!(
+        restore_text(pair.prepare()),
+        concat!(
+            "*mangle\n",
+            ":FLX4O0000000001 - [0:0]\n",
+            ":FLX4P0000000001 - [0:0]\n",
+            "-A FLX4O0000000001 -m owner --uid-owner 1000 --gid-owner 1000 -j RETURN\n",
+            "-A FLX4O0000000001 -d 0.0.0.0/8 -j RETURN\n",
+            "-A FLX4O0000000001 -d 127.0.0.0/8 -j RETURN\n",
+            "-A FLX4O0000000001 -d 169.254.0.0/16 -j RETURN\n",
+            "-A FLX4O0000000001 -d 224.0.0.0/4 -j RETURN\n",
+            "-A FLX4O0000000001 -d 240.0.0.0/4 -j RETURN\n",
+            "-A FLX4O0000000001 -p tcp -j MARK --set-xmark 0x200000/0x600000\n",
+            "-A FLX4O0000000001 -p udp -j MARK --set-xmark 0x200000/0x600000\n",
+            "-A FLX4O0000000001 -j RETURN\n",
+            "-A FLX4P0000000001 -p tcp -j TPROXY --on-port 1536 ",
+            "--tproxy-mark 0x200000/0x600000\n",
+            "-A FLX4P0000000001 -p udp -j TPROXY --on-port 1536 ",
+            "--tproxy-mark 0x200000/0x600000\n",
+            "-A FLX4P0000000001 -j RETURN\n",
+            "COMMIT\n",
+        )
+    );
+    assert_eq!(
+        restore_text(pair.retire()),
+        concat!(
+            "*mangle\n",
+            "-F FLX4O0000000001\n",
+            "-F FLX4P0000000001\n",
+            "-X FLX4O0000000001\n",
+            "-X FLX4P0000000001\n",
+            "COMMIT\n",
+        )
+    );
+    for artifact in [restore_text(pair.prepare()), restore_text(pair.retire())] {
+        assert!(!modifies_builtin_hook(&artifact));
+        assert!(!artifact.contains("CONNMARK"));
+    }
+
+    let requirements = pair.local_output().unwrap();
+    let routing = requirements.routing();
+    assert_eq!(routing.priority().get(), DEFAULT_ROUTE_PRIORITY);
+    assert_eq!(routing.table().get(), DEFAULT_ROUTE_TABLE);
+    assert_eq!(routing.route_protocol().raw(), DEFAULT_ROUTE_PROTOCOL);
+    assert_eq!(
+        routing.rule_protocol().unwrap().raw(),
+        DEFAULT_RULE_PROTOCOL
+    );
+    assert_eq!(
+        routing.route_destination(),
+        "0.0.0.0".parse::<IpAddr>().unwrap()
+    );
+    assert_eq!(routing.route_prefix_length(), 0);
+    assert_eq!(routing.route_scope().raw(), 254);
+    assert_eq!(routing.route_type().raw(), 2);
+    assert_eq!(
+        routing.mark(),
+        RuleFwMark::new(DEFAULT_PROXY_MARK, DEFAULT_MARK_MASK).unwrap()
+    );
+    assert_eq!(routing.loopback_interface(), interface_bytes(b"lo"));
+    let listener = requirements.listener();
+    assert_eq!(
+        listener.bind_address(),
+        "0.0.0.0".parse::<IpAddr>().unwrap()
+    );
+    assert_eq!(listener.port().get(), DEFAULT_PROXY_PORT);
+    assert_eq!(listener.protocols(), CaptureProtocolSet::TCP_AND_UDP);
+    assert!(listener.requires_transparent_socket());
+    assert!(listener.requires_original_destination());
+    let escape = requirements.loop_escape();
+    assert_eq!(escape.compatibility_credentials().uid(), uid(1000));
+    assert_eq!(escape.compatibility_credentials().gid(), gid(1000));
+    assert_eq!(
+        escape.socket_mark(),
+        RuleFwMark::new(DEFAULT_BYPASS_MARK, DEFAULT_MARK_MASK).unwrap()
+    );
+
+    let order = pair.transaction_order().unwrap();
+    assert_eq!(
+        order.prepare(),
+        [
+            XtablesCaptureTransactionStep::PrepareEntryPoint(
+                XtablesCaptureEntryPointRole::LocalOutputClassifier,
+            ),
+            XtablesCaptureTransactionStep::PrepareEntryPoint(
+                XtablesCaptureEntryPointRole::LocalOutputLoopbackTproxy,
+            ),
+            XtablesCaptureTransactionStep::PrepareTransparentListener,
+            XtablesCaptureTransactionStep::PreparePolicyRouting,
+            XtablesCaptureTransactionStep::PrepareLoopEscape,
+            XtablesCaptureTransactionStep::AttachEntryPoint(
+                XtablesCaptureEntryPointRole::LocalOutputLoopbackTproxy,
+            ),
+            XtablesCaptureTransactionStep::AttachEntryPoint(
+                XtablesCaptureEntryPointRole::LocalOutputClassifier,
+            ),
+        ]
+    );
+    assert_eq!(
+        order.retire(),
+        [
+            XtablesCaptureTransactionStep::DetachEntryPoint(
+                XtablesCaptureEntryPointRole::LocalOutputClassifier,
+            ),
+            XtablesCaptureTransactionStep::DetachEntryPoint(
+                XtablesCaptureEntryPointRole::LocalOutputLoopbackTproxy,
+            ),
+            XtablesCaptureTransactionStep::RetireLoopEscape,
+            XtablesCaptureTransactionStep::RetirePolicyRouting,
+            XtablesCaptureTransactionStep::RetireTransparentListener,
+            XtablesCaptureTransactionStep::RetireEntryPoint(
+                XtablesCaptureEntryPointRole::LocalOutputLoopbackTproxy,
+            ),
+            XtablesCaptureTransactionStep::RetireEntryPoint(
+                XtablesCaptureEntryPointRole::LocalOutputClassifier,
+            ),
+        ]
+    );
+    assert_eq!(pair.usage().implementation_chains(), 2);
+    assert_eq!(pair.usage().entry_points(), 2);
+    assert_eq!(pair.usage().listener_requirements(), 2);
+    assert_eq!(pair.usage().routing_objects(), 2);
+    assert_eq!(
+        pair.usage().transaction_steps(),
+        order.prepare().len() + order.retire().len()
+    );
+    assert_eq!(
+        digest_hex(lowered.source_program_digest().as_bytes()),
+        "fdee3e01e9f90c898a2147e3d288303b2a3593e24dfce878224c59fab8e8bc8d"
+    );
+    assert_eq!(
+        digest_hex(lowered.lowering_digest().as_bytes()),
+        "8e42d457f70c95d009bcd3a323c5fe3e6d2622f86f8f1254ef3aa2e5d9509768"
+    );
+    assert_eq!(
+        digest_hex(pair.digest().as_bytes()),
+        "b2922a640bf4cabc86855dea020c1fd5a5b74c388c70811c07c43c7784d230aa"
+    );
+    assert_eq!(
+        digest_hex(lowered.digest().as_bytes()),
+        "feff999fcdc65186261dfbc1e3956c5fd9f59320a18b214a07ddcce8d0702d7e"
+    );
+}
+
+#[test]
+fn dual_stack_mixed_programs_use_distinct_local_and_forwarded_roles() {
+    let report = compile_program(
         scope(AddressHostFamilySelection::DualStack, true, true),
         interfaces(&[], &[exact("wlan0")], &[]),
         CaptureProtocolSet::TCP_AND_UDP,
         &[],
     );
+    let lowered = lower_with_routing(
+        &report,
+        17,
+        default_target(),
+        local_routing_spec(
+            Some(default_routing_target()),
+            Some(routing_target(
+                DEFAULT_ROUTE_PRIORITY + 1,
+                DEFAULT_ROUTE_TABLE + 1,
+                DEFAULT_ROUTE_PROTOCOL,
+                Some(DEFAULT_RULE_PROTOCOL),
+            )),
+        ),
+    )
+    .unwrap();
+    assert_eq!(lowered.schema_version(), 2);
+
+    for (family, digit) in [
+        (XtablesRestoreFamily::Ipv4, '4'),
+        (XtablesRestoreFamily::Ipv6, '6'),
+    ] {
+        let pair = lowered.pair(family).unwrap();
+        assert_eq!(
+            pair.entries()
+                .iter()
+                .map(|entry| (entry.role(), entry.chain().to_owned()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    XtablesCaptureEntryPointRole::LocalOutputClassifier,
+                    format!("FLX{digit}O0000000017"),
+                ),
+                (
+                    XtablesCaptureEntryPointRole::LocalOutputLoopbackTproxy,
+                    format!("FLX{digit}P0000000017"),
+                ),
+                (
+                    XtablesCaptureEntryPointRole::ForwardedIngress,
+                    format!("FLX{digit}F0000000017"),
+                ),
+            ]
+        );
+        let order = pair.transaction_order().unwrap();
+        let attach = order
+            .prepare()
+            .iter()
+            .copied()
+            .filter(|step| matches!(step, XtablesCaptureTransactionStep::AttachEntryPoint(_)))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            attach,
+            [
+                XtablesCaptureTransactionStep::AttachEntryPoint(
+                    XtablesCaptureEntryPointRole::LocalOutputLoopbackTproxy,
+                ),
+                XtablesCaptureTransactionStep::AttachEntryPoint(
+                    XtablesCaptureEntryPointRole::ForwardedIngress,
+                ),
+                XtablesCaptureTransactionStep::AttachEntryPoint(
+                    XtablesCaptureEntryPointRole::LocalOutputClassifier,
+                ),
+            ]
+        );
+        let prepare = restore_text(pair.prepare());
+        assert!(prepare.contains(" -j MARK --set-xmark "));
+        assert!(prepare.contains(" -j TPROXY --on-port "));
+        assert!(!modifies_builtin_hook(&prepare));
+        assert_eq!(pair.usage().implementation_chains(), 3);
+    }
+}
+
+#[test]
+fn local_uid_set_algebra_is_preserved_during_mark_lowering() {
+    let allowlist = compile_program_with_application(
+        scope(AddressHostFamilySelection::Ipv4, true, false),
+        interfaces(&[], &[], &[]),
+        CaptureApplicationPolicy::new(CaptureApplicationMode::Allowlist, [uid(1001), uid(1002)])
+            .unwrap(),
+        CaptureProtocolSet::TCP,
+        &[],
+    );
+    let allowlist = lower_with_routing(
+        &allowlist,
+        21,
+        default_target(),
+        local_routing_spec(Some(default_routing_target()), None),
+    )
+    .unwrap();
+    let allowlist = restore_text(allowlist.ipv4().unwrap().prepare());
+    for selected in [1001, 1002] {
+        assert!(allowlist.contains(&format!(
+            "-A FLX4O0000000021 -m owner --uid-owner {selected} -p tcp -j MARK --set-xmark 0x200000/0x600000\n"
+        )));
+    }
+    assert!(!allowlist.contains(" ! "));
+    assert!(!allowlist.contains("-A FLX4O0000000021 -p tcp -j MARK"));
+    assert!(!allowlist.contains(" -p udp "));
+
+    let denylist = compile_program_with_application(
+        scope(AddressHostFamilySelection::Ipv4, true, false),
+        interfaces(&[], &[], &[]),
+        CaptureApplicationPolicy::new(CaptureApplicationMode::Denylist, [uid(1001), uid(1002)])
+            .unwrap(),
+        CaptureProtocolSet::UDP,
+        &[],
+    );
+    let denylist = lower_with_routing(
+        &denylist,
+        22,
+        default_target(),
+        local_routing_spec(Some(default_routing_target()), None),
+    )
+    .unwrap();
+    let denylist = restore_text(denylist.ipv4().unwrap().prepare());
+    let first_uid = denylist.find("--uid-owner 1001 -j RETURN").unwrap();
+    let second_uid = denylist.find("--uid-owner 1002 -j RETURN").unwrap();
+    let proxy = denylist
+        .find("-A FLX4O0000000022 -p udp -j MARK --set-xmark")
+        .unwrap();
+    assert!(first_uid < second_uid && second_uid < proxy);
+    assert!(!denylist.contains(" -p tcp "));
+}
+
+#[test]
+fn local_direct_rules_preserve_owner_destination_interface_uid_and_proxy_order() {
+    let report = compile_program_with_application_and_host(
+        scope(AddressHostFamilySelection::Ipv4, true, false),
+        interfaces(
+            &[exact("tun0")],
+            &[],
+            &[prefix_interface("wlan"), exact("rmnet0")],
+        ),
+        CaptureApplicationPolicy::new(CaptureApplicationMode::Denylist, [uid(1001)]).unwrap(),
+        CaptureProtocolSet::TCP,
+        &["100.64.0.0/10"],
+        Some(host_plan("203.0.113.7")),
+    );
+    let lowered = lower_with_routing(
+        &report,
+        23,
+        default_target(),
+        local_routing_spec(Some(default_routing_target()), None),
+    )
+    .unwrap();
+    let prepare = restore_text(lowered.ipv4().unwrap().prepare());
+
+    let owner = prepare.find("--uid-owner 1000 --gid-owner 1000").unwrap();
+    let mandatory = prepare.find("-d 0.0.0.0/8 -j RETURN").unwrap();
+    let host = prepare.find("-d 203.0.113.7 -j RETURN").unwrap();
+    let configured = prepare.find("-d 100.64.0.0/10 -j RETURN").unwrap();
+    let excluded = prepare.find("-o tun0 -j RETURN").unwrap();
+    let local_prefix = prepare.find("-o wlan+ -j RETURN").unwrap();
+    let local_exact = prepare.find("-o rmnet0 -j RETURN").unwrap();
+    let denied_uid = prepare.find("--uid-owner 1001 -j RETURN").unwrap();
+    let proxy = prepare.find("-p tcp -j MARK --set-xmark").unwrap();
+    assert!(
+        owner < mandatory
+            && mandatory < host
+            && host < configured
+            && configured < excluded
+            && excluded < local_prefix
+            && local_prefix < local_exact
+            && local_exact < denied_uid
+            && denied_uid < proxy
+    );
+}
+
+#[test]
+fn all_direct_local_output_needs_no_companion_or_routing() {
+    let report = compile_program_with_application(
+        scope(AddressHostFamilySelection::Ipv4, true, false),
+        interfaces(&[], &[], &[]),
+        CaptureApplicationPolicy::new(CaptureApplicationMode::Allowlist, []).unwrap(),
+        CaptureProtocolSet::TCP_AND_UDP,
+        &[],
+    );
+    let lowered = lower(&report, 25, default_target()).unwrap();
+    assert_eq!(lowered.schema_version(), 2);
+    let pair = lowered.ipv4().unwrap();
+    assert_eq!(pair.entries().len(), 1);
     assert_eq!(
-        lower(&dual_domain, DEFAULT_GENERATION, default_target()),
-        Err(XtablesCaptureLoweringError::UnsupportedTrafficDomain {
+        pair.entries()[0].role(),
+        XtablesCaptureEntryPointRole::LocalOutputClassifier
+    );
+    assert_eq!(pair.local_output(), None);
+    assert_eq!(pair.usage().routing_objects(), 0);
+    assert_eq!(pair.usage().listener_requirements(), 0);
+    let prepare = restore_text(pair.prepare());
+    assert!(!prepare.contains(" -j MARK "));
+    assert!(!prepare.contains("TPROXY"));
+    assert!(!prepare.contains("FLX4P"));
+
+    assert_eq!(
+        lower_with_routing(
+            &report,
+            25,
+            default_target(),
+            local_routing_spec(Some(default_routing_target()), None),
+        ),
+        Err(XtablesCaptureLoweringError::UnexpectedLocalOutputRouting {
             family: NetworkAddressFamily::Ipv4,
-            domain: CaptureTrafficDomain::LocalOutput,
-        }),
-        "canonical program order exposes IPv4 LocalOutput before any forwarded or IPv6 program"
+        })
+    );
+}
+
+#[test]
+fn local_routing_target_rejects_non_actionable_identities() {
+    assert_eq!(
+        XtablesLocalOutputRoutingSpec::new(None, None),
+        Err(XtablesLocalOutputRoutingSpecError::NoEnabledFamilies)
+    );
+    assert_eq!(
+        XtablesLocalOutputRoutingTarget::new(
+            RulePriority::from_raw(0),
+            RouteTableId::from_raw(DEFAULT_ROUTE_TABLE),
+            RouteProtocol::from_raw(DEFAULT_ROUTE_PROTOCOL),
+            Some(RuleProtocol::from_raw(DEFAULT_RULE_PROTOCOL)),
+        ),
+        Err(XtablesLocalOutputRoutingTargetError::ZeroPriority)
+    );
+    assert_eq!(
+        XtablesLocalOutputRoutingTarget::new(
+            RulePriority::from_raw(DEFAULT_ROUTE_PRIORITY),
+            RouteTableId::from_raw(254),
+            RouteProtocol::from_raw(DEFAULT_ROUTE_PROTOCOL),
+            Some(RuleProtocol::from_raw(DEFAULT_RULE_PROTOCOL)),
+        ),
+        Err(XtablesLocalOutputRoutingTargetError::ReservedTable {
+            table: RouteTableId::from_raw(254),
+        })
+    );
+    assert_eq!(
+        XtablesLocalOutputRoutingTarget::new(
+            RulePriority::from_raw(DEFAULT_ROUTE_PRIORITY),
+            RouteTableId::from_raw(DEFAULT_ROUTE_TABLE),
+            RouteProtocol::from_raw(0),
+            Some(RuleProtocol::from_raw(DEFAULT_RULE_PROTOCOL)),
+        ),
+        Err(XtablesLocalOutputRoutingTargetError::UnspecifiedRouteProtocol)
+    );
+    assert_eq!(
+        XtablesLocalOutputRoutingTarget::new(
+            RulePriority::from_raw(DEFAULT_ROUTE_PRIORITY),
+            RouteTableId::from_raw(DEFAULT_ROUTE_TABLE),
+            RouteProtocol::from_raw(DEFAULT_ROUTE_PROTOCOL),
+            Some(RuleProtocol::from_raw(0)),
+        ),
+        Err(XtablesLocalOutputRoutingTargetError::UnspecifiedRuleProtocol)
     );
 }
 
@@ -381,6 +857,45 @@ fn forwarded_expansion_honors_the_exact_command_budget() {
 }
 
 #[test]
+fn local_output_preflights_the_combined_classifier_and_companion_budget() {
+    let report = compile_program_with_application(
+        scope(AddressHostFamilySelection::Ipv4, true, false),
+        interfaces(&[], &[], &[]),
+        CaptureApplicationPolicy::new(
+            CaptureApplicationMode::Allowlist,
+            [uid(1001), uid(1002), uid(1003)],
+        )
+        .unwrap(),
+        CaptureProtocolSet::TCP_AND_UDP,
+        &[],
+    );
+    let routing = local_routing_spec(Some(default_routing_target()), None);
+    let baseline = lower_with_routing(&report, 31, default_target(), routing).unwrap();
+    let required = baseline.ipv4().unwrap().usage().prepare_commands();
+    let exact = lower_xtables_capture(
+        lowering_request(report.artifact(), 31, default_target())
+            .with_local_output_routing(routing)
+            .with_budget(XtablesCaptureLoweringBudget::new(required).unwrap()),
+    )
+    .unwrap();
+    assert_eq!(exact, baseline);
+
+    assert_eq!(
+        lower_xtables_capture(
+            lowering_request(report.artifact(), 31, default_target())
+                .with_local_output_routing(routing)
+                .with_budget(XtablesCaptureLoweringBudget::new(required - 1).unwrap()),
+        ),
+        Err(XtablesCaptureLoweringError::CommandBudgetExceeded {
+            family: XtablesRestoreFamily::Ipv4,
+            action: XtablesRestoreAction::Apply,
+            maximum: required - 1,
+            required,
+        })
+    );
+}
+
+#[test]
 fn forwarded_expansion_preflights_the_immutable_restore_byte_limit() {
     let configured = (1_u128..=16_377).map(|offset| {
         CaptureIpPrefix::new(
@@ -411,6 +926,49 @@ fn forwarded_expansion_preflights_the_immutable_restore_byte_limit() {
             required,
         }) if required > MAX_XTABLES_RESTORE_BYTES
     ));
+}
+
+#[test]
+fn local_output_expansion_preflights_the_immutable_restore_byte_limit() {
+    let configured = (1_u128..=14_050).map(|offset| {
+        CaptureIpPrefix::new(
+            IpAddr::V6(Ipv6Addr::from(
+                0x2001_0db8_1111_2222_3333_4444_5555_0000_u128 + offset,
+            )),
+            128,
+        )
+        .unwrap()
+    });
+    let report = compile_shadow_capture_program(ShadowCaptureProgramRequest::new(
+        scope(AddressHostFamilySelection::Ipv6, true, false),
+        CompatibilityEngineCredentials::new(uid(1000), gid(1000)),
+        CaptureBypassPolicy::new(configured).unwrap(),
+        None,
+        interfaces(&[], &[], &[]),
+        CaptureApplicationPolicy::new(CaptureApplicationMode::All, []).unwrap(),
+        CaptureProtocolSet::TCP,
+    ))
+    .unwrap();
+
+    let result = lower_with_routing(
+        &report,
+        DEFAULT_GENERATION,
+        default_target(),
+        local_routing_spec(None, Some(default_routing_target())),
+    );
+    match result {
+        Err(XtablesCaptureLoweringError::ArtifactByteLimitExceeded {
+            family: XtablesRestoreFamily::Ipv6,
+            action: XtablesRestoreAction::Apply,
+            maximum: MAX_XTABLES_RESTORE_BYTES,
+            required,
+        }) => assert!(required > MAX_XTABLES_RESTORE_BYTES),
+        Ok(artifact) => panic!(
+            "local byte-limit fixture unexpectedly lowered {} bytes",
+            artifact.ipv6().unwrap().prepare().usage().input_bytes()
+        ),
+        Err(error) => panic!("unexpected local byte-limit error: {error}"),
+    }
 }
 
 #[test]
@@ -477,6 +1035,68 @@ fn forwarded_artifact_identity_binds_program_namespace_port_and_marks_but_not_bu
     assert_ne!(baseline.digest(), next_program.digest());
 }
 
+#[test]
+fn local_schema_v2_identity_binds_routing_and_derived_transaction_requirements() {
+    let report = compile_program(
+        scope(AddressHostFamilySelection::Ipv4, true, false),
+        interfaces(&[], &[], &[]),
+        CaptureProtocolSet::TCP_AND_UDP,
+        &[],
+    );
+    let baseline_routing = local_routing_spec(Some(default_routing_target()), None);
+    let baseline = lower_with_routing(&report, 41, default_target(), baseline_routing).unwrap();
+    let required = baseline.ipv4().unwrap().usage().prepare_commands();
+    let bounded = lower_xtables_capture(
+        lowering_request(report.artifact(), 41, default_target())
+            .with_local_output_routing(baseline_routing)
+            .with_budget(XtablesCaptureLoweringBudget::new(required).unwrap()),
+    )
+    .unwrap();
+    assert_eq!(baseline, bounded);
+
+    for changed in [
+        routing_target(
+            DEFAULT_ROUTE_PRIORITY + 1,
+            DEFAULT_ROUTE_TABLE,
+            DEFAULT_ROUTE_PROTOCOL,
+            Some(DEFAULT_RULE_PROTOCOL),
+        ),
+        routing_target(
+            DEFAULT_ROUTE_PRIORITY,
+            DEFAULT_ROUTE_TABLE + 1,
+            DEFAULT_ROUTE_PROTOCOL,
+            Some(DEFAULT_RULE_PROTOCOL),
+        ),
+        routing_target(
+            DEFAULT_ROUTE_PRIORITY,
+            DEFAULT_ROUTE_TABLE,
+            DEFAULT_ROUTE_PROTOCOL + 1,
+            Some(DEFAULT_RULE_PROTOCOL),
+        ),
+        routing_target(
+            DEFAULT_ROUTE_PRIORITY,
+            DEFAULT_ROUTE_TABLE,
+            DEFAULT_ROUTE_PROTOCOL,
+            None,
+        ),
+    ] {
+        let changed = lower_with_routing(
+            &report,
+            41,
+            default_target(),
+            local_routing_spec(Some(changed), None),
+        )
+        .unwrap();
+        assert_ne!(baseline.lowering_digest(), changed.lowering_digest());
+        assert_ne!(baseline.digest(), changed.digest());
+        assert_eq!(
+            restore_text(baseline.ipv4().unwrap().prepare()),
+            restore_text(changed.ipv4().unwrap().prepare()),
+            "routing identity is descriptive and does not alter private chain bytes"
+        );
+    }
+}
+
 fn compile_program(
     scope: CaptureTrafficScope,
     interfaces: CaptureInterfacePolicy,
@@ -493,13 +1113,48 @@ fn compile_program_with_host(
     bypasses: &[&str],
     host_bypass: Option<AddressHostSetPlan>,
 ) -> ShadowCompilationReport {
+    compile_program_with_application_and_host(
+        scope,
+        interfaces,
+        CaptureApplicationPolicy::new(CaptureApplicationMode::All, []).unwrap(),
+        protocols,
+        bypasses,
+        host_bypass,
+    )
+}
+
+fn compile_program_with_application(
+    scope: CaptureTrafficScope,
+    interfaces: CaptureInterfacePolicy,
+    applications: CaptureApplicationPolicy,
+    protocols: CaptureProtocolSet,
+    bypasses: &[&str],
+) -> ShadowCompilationReport {
+    compile_program_with_application_and_host(
+        scope,
+        interfaces,
+        applications,
+        protocols,
+        bypasses,
+        None,
+    )
+}
+
+fn compile_program_with_application_and_host(
+    scope: CaptureTrafficScope,
+    interfaces: CaptureInterfacePolicy,
+    applications: CaptureApplicationPolicy,
+    protocols: CaptureProtocolSet,
+    bypasses: &[&str],
+    host_bypass: Option<AddressHostSetPlan>,
+) -> ShadowCompilationReport {
     compile_shadow_capture_program(ShadowCaptureProgramRequest::new(
         scope,
         CompatibilityEngineCredentials::new(uid(1000), gid(1000)),
         CaptureBypassPolicy::new(bypasses.iter().copied().map(capture_prefix)).unwrap(),
         host_bypass,
         interfaces,
-        CaptureApplicationPolicy::new(CaptureApplicationMode::All, []).unwrap(),
+        applications,
         protocols,
     ))
     .unwrap()
@@ -542,6 +1197,17 @@ fn lower(
     lower_xtables_capture(lowering_request(report.artifact(), generation, target))
 }
 
+fn lower_with_routing(
+    report: &ShadowCompilationReport,
+    generation: u32,
+    target: XtablesTproxyTarget,
+    routing: XtablesLocalOutputRoutingSpec,
+) -> Result<XtablesCaptureArtifactSet, XtablesCaptureLoweringError> {
+    lower_xtables_capture(
+        lowering_request(report.artifact(), generation, target).with_local_output_routing(routing),
+    )
+}
+
 fn lowering_request(
     artifact: &ShadowCaptureArtifact,
     generation: u32,
@@ -564,6 +1230,37 @@ fn target(proxy_port: u16, mark: FwmarkCandidate) -> XtablesTproxyTarget {
 
 fn default_mark() -> FwmarkCandidate {
     FwmarkCandidate::new(DEFAULT_MARK_MASK, DEFAULT_PROXY_MARK, DEFAULT_BYPASS_MARK).unwrap()
+}
+
+fn local_routing_spec(
+    ipv4: Option<XtablesLocalOutputRoutingTarget>,
+    ipv6: Option<XtablesLocalOutputRoutingTarget>,
+) -> XtablesLocalOutputRoutingSpec {
+    XtablesLocalOutputRoutingSpec::new(ipv4, ipv6).unwrap()
+}
+
+fn default_routing_target() -> XtablesLocalOutputRoutingTarget {
+    routing_target(
+        DEFAULT_ROUTE_PRIORITY,
+        DEFAULT_ROUTE_TABLE,
+        DEFAULT_ROUTE_PROTOCOL,
+        Some(DEFAULT_RULE_PROTOCOL),
+    )
+}
+
+fn routing_target(
+    priority: u32,
+    table: u32,
+    route_protocol: u8,
+    rule_protocol: Option<u8>,
+) -> XtablesLocalOutputRoutingTarget {
+    XtablesLocalOutputRoutingTarget::new(
+        RulePriority::from_raw(priority),
+        RouteTableId::from_raw(table),
+        RouteProtocol::from_raw(route_protocol),
+        rule_protocol.map(RuleProtocol::from_raw),
+    )
+    .unwrap()
 }
 
 fn scope(

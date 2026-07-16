@@ -2,6 +2,8 @@
 
 - Status: design research for the Rust `fluxd` rewrite; not runtime qualification
 - Research date: 2026-07-15 (Asia/Singapore)
+- Compiler checkpoint: pure schema-v2 canonical representation delivered 2026-07-16; production
+  xtables driver remains `Unsupported`
 - Upstream baseline: Linux `v5.10`, commit `2c85ebc57b3e1817b6ce1a6b703928e113a90442`
 - Android evidence: Android S/T 5.10 base configuration at `kernel/configs`
   commit `bd79f38685cf939ab836dd8ddd2e01506ccff47a`, plus the
@@ -37,8 +39,8 @@ expression on devices where nftables is actively qualified. Android S/T's 5.10 b
 however, requires the legacy xtables ingredients and does not require nftables, so xtables is the
 first Android-5.10 base-config-eligible conventional candidate. [A1] [A2]
 
-This conclusion corrects one over-broad design assumption while preserving the current lowerer's
-fail-closed behavior:
+This conclusion corrects one over-broad design assumption. The canonical compiler now represents
+the selected topology while preserving a fail-closed runtime boundary:
 
 - A bare OUTPUT `MARK` rule is not a Capture Program and does not prove listener delivery.
 - The Linux 5.10 source nevertheless shows that a mark change in xtables `mangle/OUTPUT` causes an
@@ -52,9 +54,19 @@ fail-closed behavior:
   optional connmark-qualified TPROXY fast path precedes the generic loopback bypass. That historical
   variant may encode a related path, but it does not define or qualify the selected mandatory
   packet-mark contract. Neither artifact qualifies or disproves the complete candidate.
-- The existing schema-v1 lowerer is still correct to reject local OUTPUT because it emits neither
-  the OUTPUT mark/reroute half nor a loopback-reachable PREROUTING TPROXY half as one authorized,
-  reversible program.
+- Forwarded-ingress-only lowering retains the frozen schema-v1 restore bytes and digests. Any
+  artifact containing local OUTPUT selects schema v2: a private `O` classifier emits ordered direct
+  returns and protocol-qualified masked `MARK`, while a private `P` companion emits exact-port
+  TCP/UDP TPROXY. Mixed programs may also retain their private `F` forwarded chains.
+- Schema-v2 metadata describes the complete dependency contract: OUTPUT selects the unassigned
+  `0/mask` role; loopback PREROUTING selects `lo` plus `proxy/mask`; typed requirements bind the
+  transparent listener, engine loop escape, RPDB/local-route identity, and prepare/attach/detach/
+  retire order. All of those identities and resource totals are digest-bound.
+- The rendered restore documents still create and remove only unattached private chains. They do
+  not modify built-in hooks, provision listeners or routes, execute restore, read back state, or
+  authorize ownership. The production xtables driver therefore remains `Unsupported`, and
+  established-flow caching, transparent-socket DIVERT, FakeIP ICMP, QUIC rejection, and MSS
+  clamping remain rejected.
 
 If conventional TPROXY is absent or unusable but BPF and traffic-control ownership are proven, the
 bounded experimental fallback to investigate is the same OUTPUT mark plus local-route loop, with a
@@ -440,7 +452,15 @@ For every candidate device, Flux must actively prove:
 No physical Android 5.10/ARM64 release-device evidence was collected for this note. The rooted WSA
 execution above is development-only x86_64 mechanism evidence.
 
-## 8. Implemented development checkpoint and remaining qualification
+## 8. Implemented compiler and mechanism checkpoints, and remaining qualification
+
+The pure schema-v2 lowering checkpoint encodes the complete local-OUTPUT transaction selected by
+this research without turning it into device state. Its `O`/`P` entry roles, typed listener,
+loop-escape and routing requirements, descriptive lifecycle ordering, domain-separated identities,
+and combined resource budgets are deterministic inputs for the later production adapter. The
+forwarded-only path deliberately remains schema v1 with its exact existing bytes and digests. No
+built-in hook mutation, runtime ownership, route/listener provisioning, readback, rollback, or
+Android authority follows from either schema.
 
 The disposable Rust namespace canary now implements the complete mechanism slice rather than
 another mark-only model:
@@ -461,11 +481,12 @@ another mark-only model:
 
 That slice passes on host-capable Linux and the rooted x86_64 WSA profile described above. It closes
 the mechanism question and confirms that the earlier negative observation was arrangement-specific.
-Still open before native writer activation are distinct probe/engine UIDs and owned child
-lifetimes, a real Generation and supervised Proxy Engine, production capture/process receipts and
-reports, live collector integration, exact mark/priority/table leases, reviewed Android 5.10/ARM64
-devices, netd/VPN/CLAT/tethering/network-transition coexistence, and failure injection at every
-transaction step. The WSA result must not be promoted into those authorities.
+It does not authorize the canonical artifacts or inhabit the production driver. Still open before
+native writer activation are distinct probe/engine UIDs and owned child lifetimes, a real Generation
+and supervised Proxy Engine, production capture/process receipts and reports, live collector
+integration, exact mark/priority/table leases, stable-hook attachment and readback, reviewed Android
+5.10/ARM64 devices, netd/VPN/CLAT/tethering/network-transition coexistence, and failure injection at
+every transaction step. The WSA result must not be promoted into those authorities.
 
 If conventional TPROXY genuinely fails on a device while TC BPF is authorized, run a second,
 separate loopback-TC `bpf_sk_assign()` canary. Do not combine the two mechanisms in one proof.

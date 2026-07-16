@@ -21,22 +21,25 @@ This roadmap turns the [blueprint](fluxd-blueprint.md) and [technical specificat
   the completed Rust runtime after legacy runtime writers, helpers, and compatibility wrappers are
   absent from the package; see ADR-0011.
 
-## Current staged priority (2026-07-15)
+## Current staged priority (2026-07-16)
 
 The 2026-07-15 direction review closes the shadow/compiler/parser/oracle proof-infrastructure and
 host bridge-attestation stage. The attested shell bridge is now a frozen development safety/oracle
-substrate, not a product or release lane. The extension-free schema-v1 forwarded-ingress Capture
-Program lowering is now delivered as deterministic, generation-namespaced but unattached xtables
-prepare/retire artifacts. Local OUTPUT is rejected because MARK-only OUTPUT rules omit the RPDB
-local route, mark-qualified loopback PREROUTING TPROXY companion, listener, escape, and cleanup
-transaction. The ADR-0012 mechanism now passes the disposable Linux checkpoint and one
-development-only rooted x86_64 WSA profile. The immediate delivery lane is to represent that
-complete transaction plus only the runtime-required adjunct semantics in canonical lowering, then
-consume the admitted artifacts in stable hook activation, native restore/readback/rollback, and the xtables
-transition lease; after that, absorb PBR/address synchronization and the remaining runtime shell
-responsibilities. Other evidence work may proceed in parallel, but it must not displace that
-ownership/removal lane or create another open-ended non-authorizing checkpoint. Correctness gates
-retain strict ordering:
+substrate, not a product or release lane. Canonical xtables lowering now preserves exact schema-v1
+forwarded-only bytes and identities while any local-OUTPUT input selects pure schema v2. The new
+schema represents `FLX{4|6}O{generation:010}` MARK-only OUTPUT classifiers,
+`FLX{4|6}P{generation:010}` mark-qualified loopback PREROUTING TPROXY companions, optional
+unchanged `FLX{4|6}F{generation:010}` forwarded chains, typed routing/listener/escape requirements,
+and descriptive prepare/attach/detach/retire ordering. It does not attach hooks or mutate the
+kernel. The ADR-0012 mechanism also passes the disposable Linux
+checkpoint and one development-only rooted x86_64 WSA profile. The immediate delivery lane is now
+to consume these admitted artifacts in stable-hook activation, native restore plus transaction-
+scoped rtnetlink preparation, exact readback/rollback, and the xtables transition lease; after that,
+absorb the remaining PBR/address synchronization and runtime shell responsibilities. Other evidence
+work may proceed in parallel, but it must not displace that ownership/removal lane or create another
+open-ended non-authorizing checkpoint.
+
+Correctness gates retain strict ordering:
 
 Phase numbers below preserve architectural workstreams and implementation history. They are not the
 execution order; this current-priority section and the prioritized backlog are authoritative.
@@ -104,9 +107,9 @@ verifier can pass, and a verifier pass cannot override ADR-0011's runtime-comple
    checked-in oracle-fixture parser round-trip are delivered. They remain non-authorizing
    characterization inputs: no shadow artifact enters a Generation or activation path, and this
    lane receives only corrections needed to preserve its frozen contract. The separate Phase 4
-   lowerer may consume a forwarded-ingress-only artifact with a caller-supplied non-authorizing
-   namespace and mark candidate; that does not promote or mutate the Phase 2 artifact. Artifacts
-   containing local OUTPUT are rejected at this boundary.
+   lowerer may consume an artifact with a caller-supplied non-authorizing namespace, mark candidate,
+   and optional descriptive local-routing targets; forwarded-only results remain schema v1 and
+   local-OUTPUT results select schema v2. Neither form promotes or mutates the Phase 2 artifact.
 3. **Phase 4 bridge substrate — host-complete and frozen; native ownership is next:**
    the validated legacy source-shape renderer independently reproduces the pinned IPv4/IPv6
    apply/cleanup fixtures, and Rust-owned preparation exclusively invokes
@@ -117,16 +120,16 @@ verifier can pass, and a verifier pass cannot override ADR-0011's runtime-comple
    Generation-bound receipt only after every staged artifact exactly matches one rebuilt plan. The
    receipt enters the immutable Generation before `engine.manifest`; rejection preserves the active
    Generation. Do not expand this temporary bridge into a release-qualification project. Reuse it
-   for targeted cutover fault injection while moving next from the delivered unattached
-   forwarded-ingress lowering to canonical representation and production integration of the
-   mechanism-qualified ADR-0012 local-OUTPUT candidate, runtime-required adjuncts, native
-   restore/readback/rollback, and reviewed real-device qualification of the
-   Rust-owned path. There is no
+   for targeted cutover fault injection while moving next from the delivered unattached schema-v1/
+   schema-v2 canonical lowering to stable-hook and native-writer integration of the mechanism-
+   qualified ADR-0012 local-OUTPUT candidate, runtime-required adjuncts, native restore/readback/
+   rollback, and reviewed real-device qualification of the Rust-owned path. There is no
    dual-writer interval and no public bridge release.
 4. **Native Phase 3 correctness evidence:** continue exact device/artifact identity, positive mark
    policy catalog, remaining census cells, point-in-time coordination, observer continuity, mark
    preservation, domain/network-selection handoff, and route reachability as bounded supporting
-   work. Do not let it delay the renderer slice or confer mutation authority prematurely.
+   work. Do not let it delay the stable-hook/native-writer slice or confer mutation authority
+   prematurely.
 5. **Optional eBPF probe — deferred:** isolated, opt-in `xt_bpf` mechanics may run only in a
    disposable test namespace without persistent pins, production daemon integration, Capability
    Profile publication, implicit module autoload, or writes to live Flux chains. Production-state
@@ -261,21 +264,23 @@ The independent Phase 4 `LegacyRulesPlan` does not change this boundary. It pres
 shell generator's source shape for bridge cache production; it neither consumes nor promotes a
 `ShadowCaptureArtifact` and carries no Generation or mutation authority.
 
-The separate Phase 4 schema-v1 lowerer now consumes a forwarded-ingress-only
-`ShadowCaptureArtifact` together with a non-authorizing generation namespace, structurally valid
-TPROXY target, explicit extension state, and command budget. It derives unattached implementation
-chains and paired prepare/retire syntax artifacts without adding authority to the source artifact or
-entering a runtime execution path. A local-OUTPUT program is rejected rather than misrepresented by
-MARK-only rules that cannot prove TPROXY delivery.
+The separate Phase 4 lowerer now consumes a `ShadowCaptureArtifact` together with a non-authorizing
+generation namespace, structurally valid TPROXY target, optional descriptive local-routing targets,
+explicit extension state, and command budget. Forwarded-only input preserves exact schema v1.
+Local-OUTPUT input selects schema v2 and derives the separate MARK-only OUTPUT classifier,
+mark-qualified loopback PREROUTING TPROXY companion, typed prerequisite identities, and lifecycle
+order. Both forms remain unattached prepare/retire syntax artifacts and add no authority or runtime
+execution path.
 
 This completed checkpoint does not discharge the complete runtime-semantic or ownership gate.
 Oracle-derived fixtures pin semantics such as RFC 6598, mandatory bypasses, empty allow/deny
 behavior, multi-user UIDs, interface matching, family/domain separation, and compatibility engine
 UID/GID loop bypass. The independent source-shape renderer now reproduces and attests the frozen
-IPv4/IPv6 restore artifacts. The extension-free schema-v1 forwarded-ingress classifier is now
-lowered into unattached xtables artifacts; qualification and lowering of the ADR-0012 local-OUTPUT
-candidate, established-flow caching, transparent-socket DIVERT, FakeIP ICMP, QUIC rejection, MSS clamping, native
-restore/readback/rollback, failure/recovery, and real-device gates remain before xtables ownership.
+IPv4/IPv6 restore artifacts. Extension-free schema-v1 forwarded and schema-v2 local-OUTPUT programs
+now lower into unattached xtables artifacts. Stable-hook/native-writer consumption of the ADR-0012
+transaction, established-flow caching, transparent-socket DIVERT, FakeIP ICMP, QUIC rejection, MSS
+clamping, restore/readback/rollback, failure/recovery, and real-device gates remain before xtables
+ownership.
 
 The bounded raw oracle checkpoint is also complete and frozen. The canonical environment, input,
 and fixture pin contract lives in `tests/oracle/xtables/manifest.json`; do not duplicate or update
@@ -304,7 +309,7 @@ renderer, Generation, ownership, writer, prepared/active, coordinator, or activa
 - Sing-Box per-Generation overlay generation and validation.
 - Revisioned device and Sing-Box Engine Capability Profiles, with Generation planning leases invalidated by boot changes, runtime demotions, or engine binary/profile changes.
 - Frozen oracle-derived semantic fixtures plus the completed independent source-shape renderer
-  golden tests and the separate extension-free schema-v1 forwarded-ingress xtables lowering tests.
+  golden tests and the separate extension-free schema-v1/v2 canonical xtables lowering tests.
 
 ### Exit gate
 
@@ -408,16 +413,16 @@ Keep the four evidence levels distinct:
    family apply/cleanup pair, and enabled-family set digests bind this renderer-owned identity and
    resource accounting. The Generation-bound receipt verifies exact staged bytes against that set;
    it is still level-2 source-shape evidence, not Capture Program lowering.
-3. **Canonical Capture Program forwarded-ingress base lowering — complete, non-authorizing:** the
-   schema-v1 lowerer consumes a reviewed forwarded-ingress-only artifact, preserves canonical family
-   and clause order, expands whole-set interface negation as positive proxy membership, emits only
-   protocol-qualified TPROXY actions, and gives every direct decision an uncached `RETURN`. It
-   returns generation-namespaced but unattached family prepare/retire artifacts, entry-chain
-   metadata, bounded resource usage, and domain-separated identities. Local OUTPUT is rejected:
-   MARK-only OUTPUT lacks the reviewed RPDB local route, mark-qualified loopback PREROUTING TPROXY
-   companion, and listener-delivery transaction. Complete
-   runtime semantic parity remains open for that local mechanism plus established-flow caching,
-   transparent-socket DIVERT, FakeIP ICMP, QUIC rejection, and MSS clamping.
+3. **Canonical Capture Program base lowering — complete, non-authorizing:** forwarded-only input
+   preserves the exact schema-v1 family/clause order, restore bytes, `F` names, accounting, and
+   digests. Any local-OUTPUT input selects schema v2, with a MARK-only private `O` classifier,
+   proxying families adding a private `P` loopback TPROXY companion, and mixed families retaining
+   the unchanged `F` role. Typed entry selectors, per-family routing identity, transparent listener,
+   compatibility loop escape, and lifecycle metadata record `P` then optional `F` then `O` for
+   attachment and the inverse hook order for detachment. Prepare/retire restore artifacts still
+   only create/fill and flush/delete private chains; nothing attaches, executes, or authorizes mutation.
+   Complete runtime ownership remains open, as do established-flow caching, transparent-socket
+   DIVERT, FakeIP ICMP, QUIC rejection, and MSS clamping.
 4. **Kernel/device parity — later:** restore acceptance, apply/cleanup invertibility, exact readback,
    rollback, Android/Magisk behavior, and packet-path canaries require isolated and real-device
    execution after renderer parity.
@@ -444,17 +449,17 @@ intentionally absent from normal `cargo xtask ci`.
   digests and bounded resource totals. Shell invalidates old receipts before rebuilding shared cache artifacts,
   publishes `cache_rules_manifest` only after all renders pass, and copies it into the immutable
   Generation as `legacy-rules.manifest` before publishing `engine.manifest`.
-- **Delivered:** extension-free schema-v1 canonical lowering for the forwarded-ingress clause shapes
-  emitted by the frozen shadow compiler. Direct predicates become ordered uncached returns;
-  negative forwarded-interface set predicates become positive proxy membership; TCP/UDP
-  eligibility is explicit; forwarded traffic receives TPROXY; interface tokens, command/byte expansion,
-  generation-scoped names, prepare/retire artifacts, resource accounting, and artifact identities
-  fail closed.
-- **Open production semantic and lifecycle checkpoint:** canonical local-OUTPUT TPROXY realization,
-  established-flow caching, transparent-socket DIVERT, FakeIP ICMP, QUIC rejection, MSS clamping,
-  stable hook attachment, native ownership, and production cleanup invertibility. Local OUTPUT
-  remains an explicit lowering error until the complete transaction enters the canonical compiler
-  and production qualification path.
+- **Delivered:** extension-free canonical lowering for the clause shapes emitted by the frozen
+  shadow compiler. Forwarded-only input preserves exact schema-v1 restore bytes and identities.
+  Local-OUTPUT input selects schema v2, emits private `O` MARK classifiers and proxying `P`
+  loopback TPROXY companions, retains optional `F` forwarded chains, and records typed routing,
+  listener, loop-escape, entry-selector, lifecycle, identity, and resource metadata. The artifacts
+  remain unattached and non-authorizing.
+- **Open production semantic and lifecycle checkpoint:** stable-hook attachment, native restore and
+  rtnetlink ownership, exact readback/rollback, cleanup invertibility, production driver/receipt
+  authorities, and Android release-device qualification. Established-flow caching, transparent-
+  socket DIVERT, FakeIP ICMP, QUIC rejection, and MSS clamping remain typed unsupported extensions
+  and should be implemented only where the supported runtime actually requires them.
 - **Delivered Linux and rooted-WSA mechanism checkpoints:** ADR-0012 selects masked mangle/OUTPUT
   marking,
   output-route recomputation, an RPDB local route through loopback, and mark-qualified loopback
@@ -467,7 +472,7 @@ intentionally absent from normal `cargo xtask ci`.
   namespace table initialization; WSA's observed baseline was empty. The Android runner passes on
   WSA Android 13 / SDK 33, preserves Android-owned mark bits, tolerates only bounded legacy-iproute2
   differences, and proves remote cleanup before the disposable namespace is retired. Both lanes
-  remain outside canonical lowering and production authority and do not combine distinct UID,
+  remain outside production authority and do not combine distinct UID,
   Generation/receipt evidence, a production report producer, Android 5.10/ARM64, or release
   qualification.
 - Following-stage direct child-process adapter for `iptables-restore`/`ip6tables-restore`, exact
@@ -512,14 +517,15 @@ shadow/native dual-writer interval.
   publication. Stale receipts are invalidated and rebuilt/re-attested rather than reused; an
   unresolved mismatch, failed attestation, partial family, unsafe file, or wrong Generation rejects
   candidate publication and preserves the active Generation.
-- **Complete in host implementation:** the extension-free schema-v1 forwarded-ingress classifier
-  lowers to deterministic generation-namespaced IPv4/IPv6 prepare/retire artifacts without
-  attaching a built-in hook, executing restore, or granting mark, writer, ownership, or activation
-  authority.
-- **Open runtime semantics:** local OUTPUT is rejected until the complete ADR-0012 TPROXY
-  transaction is represented and qualified. Caching, DIVERT, FakeIP ICMP, QUIC rejection, and MSS
-  clamping must also be represented by typed policy before any runtime profile depending on them can
-  use this lowerer.
+- **Complete in host implementation:** forwarded-only input retains exact schema-v1 identities, and
+  local-OUTPUT input lowers through pure schema v2 to deterministic generation-namespaced IPv4/IPv6
+  `O`/`P`/optional-`F` prepare/retire artifacts plus typed routing/listener/escape and lifecycle
+  metadata. No built-in hook is attached, no restore/routing operation executes, and no mark,
+  writer, ownership, or activation authority is granted.
+- **Open runtime semantics:** consume the delivered schema-v2 representation in one exact ADR-0012
+  stable-hook, restore/rtnetlink, readback, rollback, cleanup, and transition-lease transaction.
+  Caching, DIVERT, FakeIP ICMP, QUIC rejection, and MSS clamping remain unsupported until a supported
+  runtime profile both requires and qualifies their typed semantics.
 - **Open cutover evidence:** use the bridge only for targeted failure/rollback comparison while
   collecting readback and Android evidence against the native Rust-owned transition. Do not turn
   this temporary substrate into a release-packaging lane.
@@ -666,6 +672,9 @@ conventional fallback; they do not require xtables or an active `xt_bpf` acceler
 - Config parsing and migration fixtures.
 - Shadow Capture Policy normalization, local/forwarded ordering, canonical mandatory baseline,
   semantic digest determinism, resource bounds, and explicit non-authorizing/deferred reports.
+- Canonical xtables lowering: frozen schema-v1 forwarded identities; schema-v2 `O`/`P`/`F`
+  namespace, UID set algebra, masked MARK/TPROXY rendering, exact routing/listener/escape metadata,
+  lifecycle order, combined budgets, and explicit non-authorizing boundaries.
 - Frozen shell-oracle semantic fixtures; these characterize decisions before a renderer exists and
   do not by themselves claim restore or device parity.
 - Backend-plan selection over generated Capability Profiles.
@@ -771,22 +780,21 @@ Before a backend may be selected automatically, its documentation must include:
    fixes, keep it as a bounded oracle/rollback substrate, and add no new compatibility features or
    release qualification. Stale receipts are rebuilt, not reused; preview and Generation builds
    remain serialized.
-2. **Complete the remaining canonical xtables runtime semantics around the delivered forwarded
-   lowerer.** Use the now-passing disposable Linux and rooted-WSA ADR-0012 mechanism checkpoints to
-   extend canonical lowering with the complete mark, route,
-   loopback TPROXY, listener, escape, activation, and cleanup transaction. MARK-only OUTPUT is
-   insufficient. Qualify the production transaction separately on reviewed Android 5.10/ARM64
-   profiles. Add typed established-flow cache, transparent-socket DIVERT, FakeIP ICMP, QUIC
-   reject, and MSS-clamp
-   policy only where the supported runtime requires them, then close stable attachment and
-   cleanup-invertibility contracts. The source-shape renderer remains an oracle and is not promoted
-   into the native compiler.
-3. **Cut over the xtables writer as one vertical Rust slice.** Implement native restore invocation,
-   exact live readback, rollback, crash recovery, ownership naming, and the transition lease. Bind
-   the already delivered engine/process/canary evidence to the executed backend, qualify the slice
-   on Android, disable shell mutation before the first Rust write, then delete the replaced
-   `scripts/rules` and `scripts/tproxy` runtime duties. No dual writer and no compatibility release.
-4. **Cut over PBR and address synchronization.** Complete the exact device/artifact Capability
+2. **Execute the delivered canonical xtables transaction as one bounded native slice.** Consume the
+   schema-v2 `O`/`P`/optional-`F` entries and typed routing/listener/escape dependencies without
+   changing their pure identities. Implement stable entry chains, direct-child restore invocation,
+   rtnetlink preparation, exact live readback, rollback, crash recovery, cleanup invertibility,
+   ownership naming, and the transition lease. The production driver remains `Unsupported` until
+   this complete transaction exists; MARK-only OUTPUT or a partially consumed metadata set is not
+   an intermediate success. The source-shape renderer remains an oracle and is not promoted into
+   the native compiler.
+3. **Qualify and cut over the xtables writer.** Bind the already delivered engine/process/canary
+   evidence to the executed backend, qualify the complete transaction on reviewed Android 5.10/
+   ARM64 profiles, disable shell mutation before the first Rust write, and delete the replaced
+   `scripts/rules` and `scripts/tproxy` runtime duties. Add established-flow cache, transparent-
+   socket DIVERT, FakeIP ICMP, QUIC rejection, or MSS clamping only when the advertised runtime
+   requires and separately qualifies that extension. No dual writer and no compatibility release.
+4. **Cut over remaining PBR and address synchronization.** Complete the exact device/artifact Capability
    Profile, positive mark-policy catalog, point-in-time 27-cell census, RPDB/domain placement, route
    reachability, observer continuity, and rollback. Move address-derived rules into the `fluxd`
    reactor, disable the shell route writer, then remove standalone `addrsyncd` and

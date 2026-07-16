@@ -139,14 +139,19 @@ and grants no native writer authority. Existing connection marks take the fast p
 through mandatory/local bypasses, interface policy, and application policy before either direct
 acceptance or TPROXY delivery to Sing-Box.
 
-Separately, `flux-platform` now contains an extension-free schema-v1 canonical lowerer for
-forwarded-ingress Capture Programs. It emits deterministic generation-namespaced but unattached
-prepare/retire mangle chains with ordered uncached direct returns and protocol-qualified TCP/UDP
-TPROXY rules. Local OUTPUT is rejected because MARK-only OUTPUT does not prove PREROUTING traversal
-or delivery to the TPROXY listener. Established-flow caching, transparent-socket DIVERT, FakeIP
-ICMP, QUIC rejection, and MSS clamping are also rejected. These artifacts are not used by the bridge
-and grant no authority to execute restore, perform readback or rollback, write or own kernel state,
-or activate capture.
+Separately, `flux-platform` now contains an extension-free canonical Capture Program lowerer.
+Forwarded-ingress-only input preserves the exact schema-v1 bytes and digests in private `F` chains.
+Any input containing local OUTPUT selects schema v2: private `O` chains classify eligible TCP/UDP by
+setting the masked proxy mark, private `P` chains describe the mark-qualified loopback PREROUTING
+TPROXY companion, and mixed programs may also contain `F` chains. Typed metadata binds the stable-
+hook selectors, transparent listener, loop escape, per-family RPDB/local-route identities, lifecycle
+order, digests, and resource budgets. The prepare/retire documents still create and remove only
+unattached implementation chains; they do not modify built-in hooks. Established-flow caching,
+transparent-socket DIVERT, FakeIP ICMP, QUIC rejection, and MSS clamping remain rejected.
+
+These canonical artifacts are not used by the bridge. The production xtables driver remains
+`Unsupported`, and the lowerer grants no authority to execute restore, attach hooks, provision a
+listener or route, perform readback or rollback, write or own kernel state, or activate capture.
 
 `BYPASS_SET_BACKEND="zone"` is the only implemented backend. `ipset` and `auto` are intentionally
 rejected until distinct adapters, capability probes, and parity tests exist.
@@ -295,10 +300,11 @@ payload policy.
 
 The delivered bridge renderer is only the first non-mutating xtables cutover: Rust prepares
 compatibility bytes, while shell still owns restore execution, readback, rollback, and kernel
-mutation. A separate non-executed schema-v1 forwarded-ingress canonical lowerer is also delivered,
-but local OUTPUT, its five rejected extensions, stable hook attachment, and native ownership remain
-separate gated work. nftables, TUN, eBPF, and `.ko`/KPM module paths remain deferred and are not
-activated by either compiler.
+mutation. The separate canonical lowerer now represents forwarded ingress and the complete
+schema-v2 local-OUTPUT `O`/`P` transaction, while preserving frozen schema-v1 forwarded-only
+identities. Stable-hook mutation, listener/routing provisioning, live ownership, production driver
+support, and the five rejected extensions remain separate gated work. nftables, TUN, eBPF, and
+`.ko`/KPM module paths remain deferred and are not activated by either compiler.
 
 ## Disclaimer
 

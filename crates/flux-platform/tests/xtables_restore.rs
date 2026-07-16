@@ -200,41 +200,46 @@ fn ipv6_family_accepts_compressed_zone_names_and_rejects_ipv4_context() {
 
 #[test]
 fn canonical_capture_chain_names_are_family_scoped_and_sealed() {
-    let ipv4 = b"*mangle\n:FLX4F0000000001 - [0:0]\nCOMMIT\n";
-    let ipv6 = b"*mangle\n:FLX6F4294967295 - [0:0]\nCOMMIT\n";
-
-    for (input, family) in [
-        (ipv4.as_slice(), XtablesRestoreFamily::Ipv4),
-        (ipv6.as_slice(), XtablesRestoreFamily::Ipv6),
+    for (family_digit, family, other_family) in [
+        ('4', XtablesRestoreFamily::Ipv4, XtablesRestoreFamily::Ipv6),
+        ('6', XtablesRestoreFamily::Ipv6, XtablesRestoreFamily::Ipv4),
     ] {
-        let artifact = parse_xtables_restore(input, context(XtablesRestoreAction::Apply, family))
+        for role in ['F', 'O', 'P'] {
+            let chain = format!("FLX{family_digit}{role}0000000001");
+            let input = format!("*mangle\n:{chain} - [0:0]\nCOMMIT\n");
+            let artifact = parse_xtables_restore(
+                input.as_bytes(),
+                context(XtablesRestoreAction::Apply, family),
+            )
             .expect("canonical Capture chain name");
-        assert_eq!(artifact.render_canonical().as_ref(), input);
+            assert_eq!(artifact.render_canonical().as_ref(), input.as_bytes());
+            assert_error(
+                input.as_bytes(),
+                context(XtablesRestoreAction::Apply, other_family),
+                XtablesRestoreParseErrorKind::FamilyMismatch {
+                    expected: other_family,
+                },
+                Some(2),
+            );
+        }
     }
 
-    assert_error(
-        ipv4,
+    let maximum = b"*mangle\n:FLX6P4294967295 - [0:0]\nCOMMIT\n";
+    parse_xtables_restore(
+        maximum,
         context(XtablesRestoreAction::Apply, XtablesRestoreFamily::Ipv6),
-        XtablesRestoreParseErrorKind::FamilyMismatch {
-            expected: XtablesRestoreFamily::Ipv6,
-        },
-        Some(2),
-    );
-    assert_error(
-        ipv6,
-        context(XtablesRestoreAction::Apply, XtablesRestoreFamily::Ipv4),
-        XtablesRestoreParseErrorKind::FamilyMismatch {
-            expected: XtablesRestoreFamily::Ipv4,
-        },
-        Some(2),
-    );
+    )
+    .expect("maximum nonzero u32 Capture generation");
 
     for chain in [
         "FLX4F0000000000",
+        "FLX4O0000000000",
+        "FLX4P0000000000",
         "FLX4F000000001",
         "FLX4F4294967296",
         "FLX6F000000000A",
         "FLX5F0000000001",
+        "FLX4X0000000001",
     ] {
         let input = format!("*mangle\n:{chain} - [0:0]\nCOMMIT\n");
         assert_error(

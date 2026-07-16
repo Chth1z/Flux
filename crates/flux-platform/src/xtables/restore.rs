@@ -1076,13 +1076,17 @@ fn flux_chain_family(chain: &str) -> Option<XtablesRestoreFamily> {
 }
 
 fn capture_generation_chain_family(chain: &str) -> Option<XtablesRestoreFamily> {
-    let (family, generation) = if let Some(generation) = chain.strip_prefix("FLX4F") {
-        (XtablesRestoreFamily::Ipv4, generation)
-    } else if let Some(generation) = chain.strip_prefix("FLX6F") {
-        (XtablesRestoreFamily::Ipv6, generation)
-    } else {
+    let suffix = chain.strip_prefix("FLX")?;
+    let bytes = suffix.as_bytes();
+    if bytes.len() != 12 || !matches!(bytes[1], b'F' | b'O' | b'P') {
         return None;
+    }
+    let family = match bytes[0] {
+        b'4' => XtablesRestoreFamily::Ipv4,
+        b'6' => XtablesRestoreFamily::Ipv6,
+        _ => return None,
     };
+    let generation = &suffix[2..];
     if generation.len() != 10
         || !generation.as_bytes().iter().all(u8::is_ascii_digit)
         || generation

@@ -32,11 +32,31 @@ PRE_ROUTING. The earlier negative development observation is therefore arrangeme
 kernel-wide impossibility result. The checked-in ingress harness does not exercise local OUTPUT,
 and a PREROUTING selector tied to a veth/tether interface cannot see loopback reinjection.
 
-The current schema-v1 lowerer and production functional-canary driver remain fail-closed. They do
-not model, own, or authorize the complete mark, RPDB rule, local route, loopback PREROUTING rule,
-listener, escape, activation, and cleanup transaction. A disposable privileged Linux checkpoint is
-supporting evidence only; it cannot construct production gate evidence or qualify any production
-Android device profile.
+Canonical xtables lowering now represents this dependency shape without authorizing it. Forwarded-
+only input preserves the exact schema-v1 bytes, `FLX{4|6}F{generation:010}` names, accounting, and
+digests. Any local-OUTPUT input selects schema v2. Its `FLX{4|6}O{generation:010}` private chain is
+a MARK-only classifier reached by typed `OUTPUT` selector `mark 0/mask`; when proxy traffic exists,
+`FLX{4|6}P{generation:010}` is a separate TCP/UDP TPROXY chain reached by typed `PREROUTING`
+selector `-i lo` plus `mark proxy/mask`. A mixed family keeps the unchanged `F` forwarded role.
+The private restore artifacts declare/fill and flush/delete those chains only; they never mutate a
+built-in hook.
+
+Schema v2 also records the exact caller-selected per-family RPDB priority, route table, route
+protocol, optional rule protocol, proxy mark/mask, and loopback identity; the unspecified-address
+transparent listener family, port, and protocol set; and the compatibility engine credentials plus
+bypass mark/mask required for loop escape. These are typed descriptive requirements, not Android-
+safe allocation, readiness, lease, or ownership evidence. The lifecycle metadata prepares private
+`O`, `P`, and optional `F` objects plus listener, routing, and escape, then orders attachment as `P`,
+optional `F`, and `O` last. Retirement orders detachment as `O`, optional `F`, and `P`, followed by
+escape, routing, listener, and private-object retirement.
+
+The production functional-canary driver remains fail-closed and returns `Unsupported` before
+mutation. Canonical lowering still supplies no stable-hook activation, restore/rtnetlink writer,
+live readback, rollback, cleanup proof, transition lease, production receipt authority, or Android
+release qualification. A disposable privileged Linux checkpoint is supporting evidence only; it
+cannot construct production gate evidence or qualify any production Android device profile.
+Established-flow caching, transparent-socket DIVERT, FakeIP ICMP, QUIC rejection, and MSS clamping
+remain independently unsupported extensions and are not part of this first canonical transaction.
 
 A second development-only lane now cross-builds that exact ignored Rust checkpoint for
 `x86_64-linux-android` and runs it on one explicit rooted ADB serial:

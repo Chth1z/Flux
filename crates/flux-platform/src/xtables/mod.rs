@@ -6,11 +6,16 @@ pub use lowering::{
     MAX_XTABLES_CAPTURE_COMMANDS_PER_ARTIFACT, XTABLES_CAPTURE_DIGEST_BYTES,
     XTABLES_CAPTURE_LOWERING_SCHEMA_VERSION, XtablesCaptureArtifactPair,
     XtablesCaptureArtifactPairDigest, XtablesCaptureArtifactSet, XtablesCaptureArtifactSetDigest,
-    XtablesCaptureEntryPoint, XtablesCaptureExtension, XtablesCaptureExtensions,
+    XtablesCaptureEntryPoint, XtablesCaptureEntryPointRole, XtablesCaptureEntrySelector,
+    XtablesCaptureExtension, XtablesCaptureExtensions, XtablesCaptureHook,
     XtablesCaptureLoweringBudget, XtablesCaptureLoweringDigest, XtablesCaptureLoweringError,
     XtablesCaptureLoweringRequest, XtablesCaptureNamespace, XtablesCapturePredicateKind,
-    XtablesCaptureResourceUsage, XtablesInterfaceRenderErrorKind, XtablesTproxyTarget,
-    lower_xtables_capture,
+    XtablesCaptureResourceUsage, XtablesCaptureTransactionOrder, XtablesCaptureTransactionStep,
+    XtablesInterfaceRenderErrorKind, XtablesLocalOutputRoutingRequirement,
+    XtablesLocalOutputRoutingSpec, XtablesLocalOutputRoutingSpecError,
+    XtablesLocalOutputRoutingTarget, XtablesLocalOutputRoutingTargetError,
+    XtablesLocalOutputTransactionRequirements, XtablesLoopEscapeRequirement, XtablesTproxyTarget,
+    XtablesTransparentListenerRequirement, lower_xtables_capture,
 };
 
 pub use render::{

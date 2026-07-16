@@ -40,15 +40,19 @@ construct an attempt, authorize traffic, or publish any functional status. The o
 shadow compiler is complete and frozen; the shell bridge remains the sole executed networking
 writer until the native component cutover.
 
-Legacy source-shape renderer parity and the unattached extension-free schema-v1
-forwarded-ingress lowerer are complete. Local OUTPUT remains explicitly rejected because MARK-only
-OUTPUT omits the authorized RPDB local route, mark-qualified loopback PREROUTING TPROXY companion,
-exact transparent-listener delivery, loop escape, activation, and cleanup transaction. The
-disposable Linux and rooted-WSA mechanism checkpoints are complete, but production realization,
-established-flow caching, transparent-socket DIVERT, FakeIP ICMP, QUIC rejection, MSS clamping,
-native restore, live readback, rollback, and component ownership transfer remain later gates. The
-shadow/lowering lane also adds no eBPF attach/pin path, TUN activation, implicit module request, or
-`.ko`/KPM loading that could provide an alternate evidence source.
+Legacy source-shape renderer parity and canonical xtables lowering are complete as non-authorizing
+artifacts. Forwarded-only input preserves exact schema-v1 bytes and identities. Any local-OUTPUT
+input selects schema v2: `FLX{4|6}O{generation:010}` is the MARK-only OUTPUT classifier,
+`FLX{4|6}P{generation:010}` is the mark-qualified loopback PREROUTING TPROXY companion when proxy
+traffic exists, and an optional `FLX{4|6}F{generation:010}` retains the forwarded role. Typed entry,
+routing, transparent-listener, compatibility loop-escape, lifecycle, identity, and resource
+metadata describe the full ADR-0012 dependency shape, but no built-in hook is attached and no
+route, listener, or writer authority is acquired. The disposable Linux and rooted-WSA mechanism
+checkpoints are complete, but production realization, established-flow caching, transparent-socket
+DIVERT, FakeIP ICMP, QUIC
+rejection, MSS clamping, native restore, live readback, rollback, and component ownership transfer
+remain later gates. The shadow/lowering lane also adds no eBPF attach/pin path, TUN activation,
+implicit module request, or `.ko`/KPM loading that could provide an alternate evidence source.
 
 ### Ingress evidence is not local-OUTPUT evidence
 
@@ -69,11 +73,12 @@ a route lookup, or zero peer packets as proof of capture, but it may qualify the
 OUTPUT-mark → local-route → loopback-PREROUTING-TPROXY transaction through a dedicated canary.
 Production qualification still requires exact listener evidence and reviewed Android profiles.
 
-ADR-0012 selects the first conventional qualification candidate as one ordered transaction:
-prepare the exact transparent TCP/UDP listeners, install the reviewed RPDB local routes and private
-rules, attach mark-qualified loopback PREROUTING TPROXY, prove the prepared state, and attach the
-local OUTPUT classifier last. Retirement detaches and proves absence of OUTPUT first, then releases
-the listener and removes PREROUTING, routes, rules, and private objects by exact inverse identity.
+ADR-0012 selects the first conventional qualification candidate as one ordered transaction. The
+schema-v2 description prepares private `O`, `P`, and optional `F` objects plus the exact transparent
+TCP/UDP listener, reviewed RPDB/local route, and loop escape; it then orders attachment as `P`,
+optional `F`, and `O` last. Retirement orders detachment as `O`, optional `F`, and `P`, then releases
+escape, routing, listener, and private objects by exact inverse identity. A production executor must
+perform and prove that order; the lowering metadata itself does not.
 The checkpoint must prove dual-stack TCP accept and UDP original-destination delivery, positive
 boundary counters, bypass-mark response escape, safe misses, no peer leakage, no implicit module
 autoload, exact owned-state removal, and baseline restoration with only explicitly admitted
@@ -299,13 +304,15 @@ The driver returns unverified capture proof, process proof, and raw observations
 receipt verifier first binds capture proof while carrying the process proof forward; the separate
 process-ownership verifier must then mint a process receipt before the module-private evidence
 factory can promote artifacts into schema-v2 gate evidence. A failure at either verifier remains a
-post-preparation failure and cannot call a later stage. The current zero-state
-xtables driver has no prepared value: it reports `Availability(Unsupported)` before acquiring a networking
-writer or mutating state because the installed program can only mark OUTPUT and apply TPROXY in
-PREROUTING. It never attempts TPROXY in OUTPUT and never substitutes REDIRECT, DNAT, ingress
-PREROUTING traffic, a veth bounce, counters, or route-lookup inference. Its raw type, concrete
-capture/process receipt authorities, and current factory input are uninhabited, so the seam cannot
-produce a positive host result.
+post-preparation failure and cannot call a later stage. The current zero-state xtables driver has no
+prepared value: it reports `Availability(Unsupported)` before acquiring a networking writer or
+mutating state. Canonical xtables-lowering schema v2 now describes the separate OUTPUT MARK and
+loopback PREROUTING TPROXY chains, exact prerequisites, and lifecycle order, but the driver does not
+consume that description into stable hooks, restore/rtnetlink mutation, live readback, rollback,
+cleanup proof, or ownership. It never attempts TPROXY in OUTPUT and never substitutes REDIRECT,
+DNAT, ingress PREROUTING traffic, a veth bounce, counters, or route-lookup inference. Its raw type,
+concrete capture/process receipt authorities, and current factory input are uninhabited, so the seam
+cannot produce a positive host result.
 
 The remaining integration subcheckpoints must bind client/peer authority to driver-retained
 children, establish final verifier completion chronology, construct the delivered report-object
@@ -581,6 +588,13 @@ functional pass.
    mark preservation, original destinations, bypass, negative controls, and cleanup. The production
    Android adapter, distinct role credentials, Generation/receipt/report integration, reviewed
    Android 5.10/ARM64 devices, coexistence matrix, and failure injection remain incomplete.
+
+   **Complete non-authorizing canonical representation:** forwarded-only lowering preserves exact
+   schema-v1 identity, while local-OUTPUT input selects schema v2 with private `O` and `P` chains,
+   optional `F`, typed routing/listener/escape requirements, and descriptive attach/retire order.
+   This closes the representation gap only. The production executor remains `Unsupported`, and no
+   stable hook, route, listener, receipt, or cleanup authority follows from the artifact.
+
 4. **Complete prerequisite:** the strict Linux/Android `/proc` FD plus INET_DIAG collector and
    model correlation bind protocol, exact tuple, UID, mark, FD/inode/cookie identity, complete
    dumps, supervised-process identity, and timing. This is evidence plumbing, not a functional

@@ -1,14 +1,16 @@
 use std::error::Error;
 use std::fmt;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::num::{NonZeroU16, NonZeroU32};
 
 use flux_core::{
     CaptureClause, CaptureClauseDecision, CaptureDecisionStage, CaptureDomainProgram,
     CaptureInterfaceDirection, CaptureInterfaceSelector, CaptureInterfaceSelectorKind,
     CapturePredicate, CaptureProgramDigest, CaptureProtocolSet, CaptureTrafficDomain,
-    CaptureTransportProtocol, FwmarkCandidate, NetworkAddressFamily,
-    SHADOW_CAPTURE_PROGRAM_SCHEMA_VERSION, ShadowCaptureArtifact,
+    CaptureTransportProtocol, CaptureUserId, CompatibilityEngineCredentials, FwmarkCandidate,
+    FwmarkRole, InterfaceName, NetworkAddressFamily, RouteProtocol, RouteScope, RouteTableId,
+    RouteType, RuleFwMark, RulePriority, RuleProtocol, SHADOW_CAPTURE_PROGRAM_SCHEMA_VERSION,
+    ShadowCaptureArtifact,
 };
 use sha2::{Digest, Sha256};
 
@@ -18,17 +20,26 @@ use super::{
     parse_xtables_restore,
 };
 
-/// Schema for deterministic Capture Program to xtables classification lowering.
-pub const XTABLES_CAPTURE_LOWERING_SCHEMA_VERSION: u16 = 1;
+/// Current schema for deterministic Capture Program to xtables transaction lowering.
+pub const XTABLES_CAPTURE_LOWERING_SCHEMA_VERSION: u16 = 2;
 pub const XTABLES_CAPTURE_DIGEST_BYTES: usize = 32;
 pub const MAX_XTABLES_CAPTURE_COMMANDS_PER_ARTIFACT: usize = MAX_XTABLES_RESTORE_COMMANDS;
 
-const LOWERING_DIGEST_DOMAIN: &[u8] =
+const XTABLES_CAPTURE_LOWERING_SCHEMA_VERSION_V1: u16 = 1;
+const LOWERING_DIGEST_DOMAIN_V1: &[u8] =
     b"Flux canonical xtables Capture Program lowering\0schema-v1\0";
-const PAIR_DIGEST_DOMAIN: &[u8] =
+const PAIR_DIGEST_DOMAIN_V1: &[u8] =
     b"Flux canonical xtables Capture Program artifact pair\0schema-v1\0";
-const SET_DIGEST_DOMAIN: &[u8] =
+const SET_DIGEST_DOMAIN_V1: &[u8] =
     b"Flux canonical xtables Capture Program artifact set\0schema-v1\0";
+const LOWERING_DIGEST_DOMAIN_V2: &[u8] =
+    b"Flux canonical xtables Capture Program lowering\0schema-v2\0";
+const PAIR_DIGEST_DOMAIN_V2: &[u8] =
+    b"Flux canonical xtables Capture Program artifact pair\0schema-v2\0";
+const SET_DIGEST_DOMAIN_V2: &[u8] =
+    b"Flux canonical xtables Capture Program artifact set\0schema-v2\0";
+const LINUX_ROUTE_SCOPE_HOST: u8 = 254;
+const LINUX_ROUTE_TYPE_LOCAL: u8 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum XtablesCaptureExtension {
@@ -41,7 +52,7 @@ pub enum XtablesCaptureExtension {
 
 /// Explicit extension selection at the lowering boundary.
 ///
-/// Schema v1 admits only the all-disabled value. Keeping the omitted semantics typed prevents a
+/// Current schemas admit only the all-disabled value. Keeping the omitted semantics typed prevents a
 /// caller from silently assuming that legacy cache, DIVERT, FakeIP, QUIC, or MSS behavior was
 /// included in the canonical classification artifact.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -166,6 +177,144 @@ impl XtablesTproxyTarget {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum XtablesLocalOutputRoutingTargetError {
+    ZeroPriority,
+    ReservedTable { table: RouteTableId },
+    UnspecifiedRouteProtocol,
+    UnspecifiedRuleProtocol,
+}
+
+impl fmt::Display for XtablesLocalOutputRoutingTargetError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ZeroPriority => formatter.write_str("local-OUTPUT RPDB priority is zero"),
+            Self::ReservedTable { table } => write!(
+                formatter,
+                "routing table {} is reserved and cannot identify a Flux local-OUTPUT route",
+                table.get()
+            ),
+            Self::UnspecifiedRouteProtocol => {
+                formatter.write_str("local-OUTPUT route protocol is unspecified")
+            }
+            Self::UnspecifiedRuleProtocol => {
+                formatter.write_str("local-OUTPUT rule protocol is explicitly unspecified")
+            }
+        }
+    }
+}
+
+impl Error for XtablesLocalOutputRoutingTargetError {}
+
+/// Descriptive policy-routing target selected by a caller for one local-OUTPUT family.
+///
+/// This value does not prove Android-safe placement, route ownership, or mutation authority.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct XtablesLocalOutputRoutingTarget {
+    priority: RulePriority,
+    table: RouteTableId,
+    route_protocol: RouteProtocol,
+    rule_protocol: Option<RuleProtocol>,
+}
+
+impl XtablesLocalOutputRoutingTarget {
+    pub const fn new(
+        priority: RulePriority,
+        table: RouteTableId,
+        route_protocol: RouteProtocol,
+        rule_protocol: Option<RuleProtocol>,
+    ) -> Result<Self, XtablesLocalOutputRoutingTargetError> {
+        if priority.get() == 0 {
+            return Err(XtablesLocalOutputRoutingTargetError::ZeroPriority);
+        }
+        if matches!(table.get(), 0 | 253 | 254 | 255) {
+            return Err(XtablesLocalOutputRoutingTargetError::ReservedTable { table });
+        }
+        if route_protocol.raw() == 0 {
+            return Err(XtablesLocalOutputRoutingTargetError::UnspecifiedRouteProtocol);
+        }
+        if matches!(rule_protocol, Some(protocol) if protocol.raw() == 0) {
+            return Err(XtablesLocalOutputRoutingTargetError::UnspecifiedRuleProtocol);
+        }
+        Ok(Self {
+            priority,
+            table,
+            route_protocol,
+            rule_protocol,
+        })
+    }
+
+    #[must_use]
+    pub const fn priority(self) -> RulePriority {
+        self.priority
+    }
+
+    #[must_use]
+    pub const fn table(self) -> RouteTableId {
+        self.table
+    }
+
+    #[must_use]
+    pub const fn route_protocol(self) -> RouteProtocol {
+        self.route_protocol
+    }
+
+    #[must_use]
+    pub const fn rule_protocol(self) -> Option<RuleProtocol> {
+        self.rule_protocol
+    }
+}
+
+/// Per-family routing identities required before a proxying local-OUTPUT program may lower.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct XtablesLocalOutputRoutingSpec {
+    ipv4_routing: Option<XtablesLocalOutputRoutingTarget>,
+    ipv6_routing: Option<XtablesLocalOutputRoutingTarget>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum XtablesLocalOutputRoutingSpecError {
+    NoEnabledFamilies,
+}
+
+impl fmt::Display for XtablesLocalOutputRoutingSpecError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoEnabledFamilies => {
+                formatter.write_str("local-OUTPUT routing selects no address family")
+            }
+        }
+    }
+}
+
+impl Error for XtablesLocalOutputRoutingSpecError {}
+
+impl XtablesLocalOutputRoutingSpec {
+    pub const fn new(
+        ipv4_routing: Option<XtablesLocalOutputRoutingTarget>,
+        ipv6_routing: Option<XtablesLocalOutputRoutingTarget>,
+    ) -> Result<Self, XtablesLocalOutputRoutingSpecError> {
+        if ipv4_routing.is_none() && ipv6_routing.is_none() {
+            return Err(XtablesLocalOutputRoutingSpecError::NoEnabledFamilies);
+        }
+        Ok(Self {
+            ipv4_routing,
+            ipv6_routing,
+        })
+    }
+
+    #[must_use]
+    pub const fn routing_for(
+        self,
+        family: NetworkAddressFamily,
+    ) -> Option<XtablesLocalOutputRoutingTarget> {
+        match family {
+            NetworkAddressFamily::Ipv4 => self.ipv4_routing,
+            NetworkAddressFamily::Ipv6 => self.ipv6_routing,
+        }
+    }
+}
+
 /// Caller-selected command ceiling, bounded by the immutable restore grammar maximum.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(transparent)]
@@ -200,6 +349,7 @@ pub struct XtablesCaptureLoweringRequest<'a> {
     program: &'a ShadowCaptureArtifact,
     namespace: XtablesCaptureNamespace,
     target: XtablesTproxyTarget,
+    local_output_routing: Option<XtablesLocalOutputRoutingSpec>,
     extensions: XtablesCaptureExtensions,
     budget: XtablesCaptureLoweringBudget,
 }
@@ -215,9 +365,19 @@ impl<'a> XtablesCaptureLoweringRequest<'a> {
             program,
             namespace,
             target,
+            local_output_routing: None,
             extensions: XtablesCaptureExtensions::new(false, false, false, false, false),
             budget: XtablesCaptureLoweringBudget(MAX_XTABLES_CAPTURE_COMMANDS_PER_ARTIFACT),
         }
+    }
+
+    #[must_use]
+    pub const fn with_local_output_routing(
+        mut self,
+        routing: XtablesLocalOutputRoutingSpec,
+    ) -> Self {
+        self.local_output_routing = Some(routing);
+        self
     }
 
     #[must_use]
@@ -269,13 +429,45 @@ impl XtablesCaptureArtifactSetDigest {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum XtablesCaptureEntryPointRole {
+    LocalOutputClassifier,
+    LocalOutputLoopbackTproxy,
+    ForwardedIngress,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum XtablesCaptureHook {
+    Prerouting,
+    Output,
+}
+
+/// Exact stable-hook selector needed to reach one generation-specific implementation chain.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum XtablesCaptureEntrySelector {
+    Any,
+    Mark(RuleFwMark),
+    InputInterfaceAndMark {
+        interface: InterfaceName,
+        mark: RuleFwMark,
+    },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct XtablesCaptureEntryPoint {
+    role: XtablesCaptureEntryPointRole,
     domain: CaptureTrafficDomain,
     chain: Box<str>,
+    hook: XtablesCaptureHook,
+    selector: XtablesCaptureEntrySelector,
 }
 
 impl XtablesCaptureEntryPoint {
+    #[must_use]
+    pub const fn role(&self) -> XtablesCaptureEntryPointRole {
+        self.role
+    }
+
     #[must_use]
     pub const fn domain(&self) -> CaptureTrafficDomain {
         self.domain
@@ -285,6 +477,211 @@ impl XtablesCaptureEntryPoint {
     pub const fn chain(&self) -> &str {
         &self.chain
     }
+
+    #[must_use]
+    pub const fn hook(&self) -> XtablesCaptureHook {
+        self.hook
+    }
+
+    #[must_use]
+    pub const fn selector(&self) -> XtablesCaptureEntrySelector {
+        self.selector
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum XtablesCaptureTransactionStep {
+    PrepareEntryPoint(XtablesCaptureEntryPointRole),
+    PrepareTransparentListener,
+    PreparePolicyRouting,
+    PrepareLoopEscape,
+    AttachEntryPoint(XtablesCaptureEntryPointRole),
+    DetachEntryPoint(XtablesCaptureEntryPointRole),
+    RetireLoopEscape,
+    RetirePolicyRouting,
+    RetireTransparentListener,
+    RetireEntryPoint(XtablesCaptureEntryPointRole),
+}
+
+/// Descriptive dependency order only; no step can execute or grant hook ownership.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct XtablesCaptureTransactionOrder {
+    prepare: Box<[XtablesCaptureTransactionStep]>,
+    retire: Box<[XtablesCaptureTransactionStep]>,
+}
+
+impl XtablesCaptureTransactionOrder {
+    #[must_use]
+    pub const fn prepare(&self) -> &[XtablesCaptureTransactionStep] {
+        &self.prepare
+    }
+
+    #[must_use]
+    pub const fn retire(&self) -> &[XtablesCaptureTransactionStep] {
+        &self.retire
+    }
+}
+
+/// Exact transparent listener shape required by a local-OUTPUT transaction.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct XtablesTransparentListenerRequirement {
+    family: XtablesRestoreFamily,
+    bind_address: IpAddr,
+    port: NonZeroU16,
+    protocols: CaptureProtocolSet,
+}
+
+impl XtablesTransparentListenerRequirement {
+    #[must_use]
+    pub const fn family(self) -> XtablesRestoreFamily {
+        self.family
+    }
+
+    #[must_use]
+    pub const fn bind_address(self) -> IpAddr {
+        self.bind_address
+    }
+
+    #[must_use]
+    pub const fn port(self) -> NonZeroU16 {
+        self.port
+    }
+
+    #[must_use]
+    pub const fn protocols(self) -> CaptureProtocolSet {
+        self.protocols
+    }
+
+    #[must_use]
+    pub const fn requires_transparent_socket(self) -> bool {
+        true
+    }
+
+    #[must_use]
+    pub const fn requires_original_destination(self) -> bool {
+        true
+    }
+}
+
+/// Bypass socket-mark selector that must remain valid through OUTPUT retirement.
+///
+/// The copied compatibility credentials remain a policy predicate and diagnostic only. This type
+/// does not bind a supervised process identity, retained handle, mark authority, or escape lease.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct XtablesLoopEscapeRequirement {
+    compatibility_credentials: CompatibilityEngineCredentials,
+    socket_mark: RuleFwMark,
+}
+
+impl XtablesLoopEscapeRequirement {
+    #[must_use]
+    pub const fn compatibility_credentials(self) -> CompatibilityEngineCredentials {
+        self.compatibility_credentials
+    }
+
+    #[must_use]
+    pub const fn socket_mark(self) -> RuleFwMark {
+        self.socket_mark
+    }
+}
+
+/// Exact fwmark-rule and local-default-route identity for one family.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct XtablesLocalOutputRoutingRequirement {
+    family: XtablesRestoreFamily,
+    target: XtablesLocalOutputRoutingTarget,
+    route_destination: IpAddr,
+    route_prefix_length: u8,
+    route_scope: RouteScope,
+    route_type: RouteType,
+    mark: RuleFwMark,
+    loopback_interface: InterfaceName,
+}
+
+impl XtablesLocalOutputRoutingRequirement {
+    #[must_use]
+    pub const fn family(self) -> XtablesRestoreFamily {
+        self.family
+    }
+
+    #[must_use]
+    pub const fn target(self) -> XtablesLocalOutputRoutingTarget {
+        self.target
+    }
+
+    #[must_use]
+    pub const fn priority(self) -> RulePriority {
+        self.target.priority()
+    }
+
+    #[must_use]
+    pub const fn table(self) -> RouteTableId {
+        self.target.table()
+    }
+
+    #[must_use]
+    pub const fn route_protocol(self) -> RouteProtocol {
+        self.target.route_protocol()
+    }
+
+    #[must_use]
+    pub const fn rule_protocol(self) -> Option<RuleProtocol> {
+        self.target.rule_protocol()
+    }
+
+    #[must_use]
+    pub const fn route_destination(self) -> IpAddr {
+        self.route_destination
+    }
+
+    #[must_use]
+    pub const fn route_prefix_length(self) -> u8 {
+        self.route_prefix_length
+    }
+
+    #[must_use]
+    pub const fn route_scope(self) -> RouteScope {
+        self.route_scope
+    }
+
+    #[must_use]
+    pub const fn route_type(self) -> RouteType {
+        self.route_type
+    }
+
+    #[must_use]
+    pub const fn mark(self) -> RuleFwMark {
+        self.mark
+    }
+
+    #[must_use]
+    pub const fn loopback_interface(self) -> InterfaceName {
+        self.loopback_interface
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct XtablesLocalOutputTransactionRequirements {
+    routing: XtablesLocalOutputRoutingRequirement,
+    listener: XtablesTransparentListenerRequirement,
+    loop_escape: XtablesLoopEscapeRequirement,
+}
+
+impl XtablesLocalOutputTransactionRequirements {
+    #[must_use]
+    pub const fn routing(self) -> XtablesLocalOutputRoutingRequirement {
+        self.routing
+    }
+
+    #[must_use]
+    pub const fn listener(self) -> XtablesTransparentListenerRequirement {
+        self.listener
+    }
+
+    #[must_use]
+    pub const fn loop_escape(self) -> XtablesLoopEscapeRequirement {
+        self.loop_escape
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -293,6 +690,10 @@ pub struct XtablesCaptureResourceUsage {
     source_clauses: usize,
     expanded_match_rules: usize,
     implementation_chains: usize,
+    entry_points: usize,
+    listener_requirements: usize,
+    routing_objects: usize,
+    transaction_steps: usize,
     prepare_commands: usize,
     retire_commands: usize,
     maximum_jump_depth: usize,
@@ -320,6 +721,26 @@ impl XtablesCaptureResourceUsage {
     }
 
     #[must_use]
+    pub const fn entry_points(self) -> usize {
+        self.entry_points
+    }
+
+    #[must_use]
+    pub const fn listener_requirements(self) -> usize {
+        self.listener_requirements
+    }
+
+    #[must_use]
+    pub const fn routing_objects(self) -> usize {
+        self.routing_objects
+    }
+
+    #[must_use]
+    pub const fn transaction_steps(self) -> usize {
+        self.transaction_steps
+    }
+
+    #[must_use]
     pub const fn prepare_commands(self) -> usize {
         self.prepare_commands
     }
@@ -340,6 +761,10 @@ impl XtablesCaptureResourceUsage {
             source_clauses: self.source_clauses + other.source_clauses,
             expanded_match_rules: self.expanded_match_rules + other.expanded_match_rules,
             implementation_chains: self.implementation_chains + other.implementation_chains,
+            entry_points: self.entry_points + other.entry_points,
+            listener_requirements: self.listener_requirements + other.listener_requirements,
+            routing_objects: self.routing_objects + other.routing_objects,
+            transaction_steps: self.transaction_steps + other.transaction_steps,
             prepare_commands: self.prepare_commands + other.prepare_commands,
             retire_commands: self.retire_commands + other.retire_commands,
             maximum_jump_depth: self.maximum_jump_depth.max(other.maximum_jump_depth),
@@ -351,6 +776,8 @@ impl XtablesCaptureResourceUsage {
 pub struct XtablesCaptureArtifactPair {
     family: XtablesRestoreFamily,
     entries: Box<[XtablesCaptureEntryPoint]>,
+    local_output: Option<XtablesLocalOutputTransactionRequirements>,
+    transaction_order: Option<XtablesCaptureTransactionOrder>,
     prepare: XtablesRestoreArtifact,
     retire: XtablesRestoreArtifact,
     usage: XtablesCaptureResourceUsage,
@@ -366,6 +793,16 @@ impl XtablesCaptureArtifactPair {
     #[must_use]
     pub const fn entries(&self) -> &[XtablesCaptureEntryPoint] {
         &self.entries
+    }
+
+    #[must_use]
+    pub const fn local_output(&self) -> Option<XtablesLocalOutputTransactionRequirements> {
+        self.local_output
+    }
+
+    #[must_use]
+    pub const fn transaction_order(&self) -> Option<&XtablesCaptureTransactionOrder> {
+        self.transaction_order.as_ref()
     }
 
     #[must_use]
@@ -391,6 +828,7 @@ impl XtablesCaptureArtifactPair {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct XtablesCaptureArtifactSet {
+    schema_version: u16,
     source_program_schema_version: u16,
     source_program_digest: CaptureProgramDigest,
     namespace: XtablesCaptureNamespace,
@@ -406,7 +844,7 @@ pub struct XtablesCaptureArtifactSet {
 impl XtablesCaptureArtifactSet {
     #[must_use]
     pub const fn schema_version(&self) -> u16 {
-        XTABLES_CAPTURE_LOWERING_SCHEMA_VERSION
+        self.schema_version
     }
 
     #[must_use]
@@ -508,6 +946,12 @@ pub enum XtablesCaptureLoweringError {
         family: NetworkAddressFamily,
         domain: CaptureTrafficDomain,
     },
+    MissingLocalOutputRouting {
+        family: NetworkAddressFamily,
+    },
+    UnexpectedLocalOutputRouting {
+        family: NetworkAddressFamily,
+    },
     InvalidProgramShape {
         family: NetworkAddressFamily,
         domain: CaptureTrafficDomain,
@@ -571,11 +1015,19 @@ impl fmt::Display for XtablesCaptureLoweringError {
             }
             Self::UnsupportedExtension { extension } => write!(
                 formatter,
-                "xtables Capture Program lowering does not model {extension:?} in schema v1"
+                "xtables Capture Program lowering does not model {extension:?}"
             ),
             Self::UnsupportedTrafficDomain { family, domain } => write!(
                 formatter,
-                "xtables Capture Program lowering cannot realize the {family:?}/{domain:?} domain with the qualified schema-v1 TPROXY mechanism"
+                "xtables Capture Program lowering cannot realize the {family:?}/{domain:?} domain"
+            ),
+            Self::MissingLocalOutputRouting { family } => write!(
+                formatter,
+                "proxying local OUTPUT for {family:?} lacks its policy-routing target"
+            ),
+            Self::UnexpectedLocalOutputRouting { family } => write!(
+                formatter,
+                "{family:?} local-OUTPUT routing was supplied without a proxy-capable local program"
             ),
             Self::InvalidProgramShape {
                 family,
@@ -589,7 +1041,7 @@ impl fmt::Display for XtablesCaptureLoweringError {
             ),
             Self::MissingForwardedLoopbackSafety { family } => write!(
                 formatter,
-                "forwarded {family:?} Capture Program lacks its schema-v1 loopback safety clause"
+                "forwarded {family:?} Capture Program lacks its canonical loopback safety clause"
             ),
             Self::FamilyMismatch { family, domain } => write!(
                 formatter,
@@ -652,6 +1104,8 @@ impl Error for XtablesCaptureLoweringError {
             | Self::NonCanonicalProgramOrder
             | Self::UnsupportedExtension { .. }
             | Self::UnsupportedTrafficDomain { .. }
+            | Self::MissingLocalOutputRouting { .. }
+            | Self::UnexpectedLocalOutputRouting { .. }
             | Self::InvalidProgramShape { .. }
             | Self::MissingForwardedLoopbackSafety { .. }
             | Self::FamilyMismatch { .. }
@@ -663,10 +1117,11 @@ impl Error for XtablesCaptureLoweringError {
     }
 }
 
-/// Lower forwarded-ingress schema-v1 Capture Programs into unattached generation-specific mangle
-/// chains. Local OUTPUT is rejected because the currently qualified xtables TPROXY mechanism
-/// cannot realize that domain. The result is deterministic and non-authorizing; it cannot execute
-/// restore or activate the generated entry chains.
+/// Lower Capture Programs into deterministic, non-authorizing xtables transaction artifacts.
+///
+/// Forwarded-only input preserves the exact schema-v1 contract. Any local-OUTPUT program selects
+/// schema v2 and describes the complete ADR-0012 prerequisites and lifecycle ordering without
+/// executing restore, mutating stable hooks, or granting routing/listener ownership.
 pub fn lower_xtables_capture(
     request: XtablesCaptureLoweringRequest<'_>,
 ) -> Result<XtablesCaptureArtifactSet, XtablesCaptureLoweringError> {
@@ -684,28 +1139,29 @@ pub fn lower_xtables_capture(
         return Err(XtablesCaptureLoweringError::EmptyProgram);
     }
     validate_program_keys(programs)?;
-    if let Some(program) = programs
+    let schema_version = if programs
         .iter()
-        .find(|program| program.domain() == CaptureTrafficDomain::LocalOutput)
+        .any(|program| program.domain() == CaptureTrafficDomain::LocalOutput)
     {
-        return Err(XtablesCaptureLoweringError::UnsupportedTrafficDomain {
-            family: program.family(),
-            domain: program.domain(),
-        });
-    }
+        XTABLES_CAPTURE_LOWERING_SCHEMA_VERSION
+    } else {
+        XTABLES_CAPTURE_LOWERING_SCHEMA_VERSION_V1
+    };
 
-    let lowering_digest = digest_lowering(request);
+    let lowering_digest = digest_lowering(schema_version, request);
     let ipv4 = lower_family(
         programs,
         NetworkAddressFamily::Ipv4,
         request,
         lowering_digest,
+        schema_version,
     )?;
     let ipv6 = lower_family(
         programs,
         NetworkAddressFamily::Ipv6,
         request,
         lowering_digest,
+        schema_version,
     )?;
     let usage = ipv4
         .as_ref()
@@ -716,9 +1172,16 @@ pub fn lower_xtables_capture(
                 .map(XtablesCaptureArtifactPair::usage)
                 .unwrap_or_default(),
         );
-    let digest = digest_set(lowering_digest, ipv4.as_ref(), ipv6.as_ref(), usage);
+    let digest = digest_set(
+        schema_version,
+        lowering_digest,
+        ipv4.as_ref(),
+        ipv6.as_ref(),
+        usage,
+    );
 
     Ok(XtablesCaptureArtifactSet {
+        schema_version,
         source_program_schema_version: request.program.schema_version(),
         source_program_digest: request.program.digest(),
         namespace: request.namespace,
@@ -760,6 +1223,7 @@ fn program_key(family: NetworkAddressFamily, domain: CaptureTrafficDomain) -> (u
 
 struct ProgramAnalysis<'a> {
     program: &'a CaptureDomainProgram,
+    engine_credentials: Option<CompatibilityEngineCredentials>,
     direct_clause_count: usize,
     proxy_scope: Option<ProxyScope<'a>>,
     protocols: Option<CaptureProtocolSet>,
@@ -771,6 +1235,7 @@ struct ProgramAnalysis<'a> {
 enum ProxyScope<'a> {
     All,
     InputInterfaces(&'a [CaptureInterfaceSelector]),
+    OutputUids(&'a [CaptureUserId]),
 }
 
 struct RenderedChain {
@@ -783,12 +1248,20 @@ fn lower_family(
     family: NetworkAddressFamily,
     request: XtablesCaptureLoweringRequest<'_>,
     lowering_digest: XtablesCaptureLoweringDigest,
+    schema_version: u16,
 ) -> Result<Option<XtablesCaptureArtifactPair>, XtablesCaptureLoweringError> {
     let selected = programs
         .iter()
         .filter(|program| program.family() == family)
         .collect::<Vec<_>>();
     if selected.is_empty() {
+        if request
+            .local_output_routing
+            .and_then(|routing| routing.routing_for(family))
+            .is_some()
+        {
+            return Err(XtablesCaptureLoweringError::UnexpectedLocalOutputRouting { family });
+        }
         return Ok(None);
     }
 
@@ -797,11 +1270,47 @@ fn lower_family(
         .copied()
         .map(analyze_program)
         .collect::<Result<Vec<_>, _>>()?;
-    let implementation_chains = analyses.len();
+    let local_analysis = analyses
+        .iter()
+        .find(|analysis| analysis.program.domain() == CaptureTrafficDomain::LocalOutput);
+    let local_proxy_protocols = local_analysis.and_then(|analysis| analysis.protocols);
+    let supplied_routing = request
+        .local_output_routing
+        .and_then(|routing| routing.routing_for(family));
+    let routing_target = match (local_proxy_protocols, supplied_routing) {
+        (Some(_), Some(routing)) => Some(routing),
+        (Some(_), None) => {
+            return Err(XtablesCaptureLoweringError::MissingLocalOutputRouting { family });
+        }
+        (None, Some(_)) => {
+            return Err(XtablesCaptureLoweringError::UnexpectedLocalOutputRouting { family });
+        }
+        (None, None) => None,
+    };
+
+    let implementation_chains = analyses
+        .iter()
+        .map(|analysis| {
+            1 + usize::from(
+                analysis.program.domain() == CaptureTrafficDomain::LocalOutput
+                    && analysis.protocols.is_some(),
+            )
+        })
+        .sum::<usize>();
     let prepare_commands = analyses
         .iter()
         .map(|analysis| {
-            analysis.direct_rules + analysis.proxy_rules + usize::from(analysis.final_return)
+            let program_commands =
+                analysis.direct_rules + analysis.proxy_rules + usize::from(analysis.final_return);
+            let companion_commands =
+                if analysis.program.domain() == CaptureTrafficDomain::LocalOutput {
+                    analysis
+                        .protocols
+                        .map_or(0, |protocols| protocol_count(protocols) + 1)
+                } else {
+                    0
+                };
+            program_commands + companion_commands
         })
         .sum::<usize>();
     let retire_commands = implementation_chains * 2;
@@ -818,16 +1327,57 @@ fn lower_family(
         retire_commands,
     )?;
 
-    let mut entries = Vec::with_capacity(analyses.len());
+    let mut entries = Vec::with_capacity(implementation_chains);
     let mut chains = Vec::with_capacity(implementation_chains);
     for analysis in &analyses {
-        let chain = capture_chain_name(family, request.namespace.generation());
-        let rules = render_program(analysis, &chain, request.target)?;
-        entries.push(XtablesCaptureEntryPoint {
-            domain: analysis.program.domain(),
-            chain: chain.clone(),
-        });
-        chains.push(RenderedChain { name: chain, rules });
+        match analysis.program.domain() {
+            CaptureTrafficDomain::LocalOutput => {
+                let role = XtablesCaptureEntryPointRole::LocalOutputClassifier;
+                let chain = capture_chain_name(family, role, request.namespace.generation());
+                let rules = render_program(analysis, &chain, request.target)?;
+                entries.push(XtablesCaptureEntryPoint {
+                    role,
+                    domain: CaptureTrafficDomain::LocalOutput,
+                    chain: chain.clone(),
+                    hook: XtablesCaptureHook::Output,
+                    selector: XtablesCaptureEntrySelector::Mark(
+                        RuleFwMark::new(0, request.target.mark().mask())
+                            .expect("a nonzero Flux mask yields an unassigned selector"),
+                    ),
+                });
+                chains.push(RenderedChain { name: chain, rules });
+
+                if let Some(protocols) = analysis.protocols {
+                    let role = XtablesCaptureEntryPointRole::LocalOutputLoopbackTproxy;
+                    let chain = capture_chain_name(family, role, request.namespace.generation());
+                    let rules = render_loopback_companion(&chain, protocols, request.target);
+                    entries.push(XtablesCaptureEntryPoint {
+                        role,
+                        domain: CaptureTrafficDomain::LocalOutput,
+                        chain: chain.clone(),
+                        hook: XtablesCaptureHook::Prerouting,
+                        selector: XtablesCaptureEntrySelector::InputInterfaceAndMark {
+                            interface: loopback_interface(),
+                            mark: request.target.mark().selector(FwmarkRole::Proxy),
+                        },
+                    });
+                    chains.push(RenderedChain { name: chain, rules });
+                }
+            }
+            CaptureTrafficDomain::ForwardedIngress => {
+                let role = XtablesCaptureEntryPointRole::ForwardedIngress;
+                let chain = capture_chain_name(family, role, request.namespace.generation());
+                let rules = render_program(analysis, &chain, request.target)?;
+                entries.push(XtablesCaptureEntryPoint {
+                    role,
+                    domain: CaptureTrafficDomain::ForwardedIngress,
+                    chain: chain.clone(),
+                    hook: XtablesCaptureHook::Prerouting,
+                    selector: XtablesCaptureEntrySelector::Any,
+                });
+                chains.push(RenderedChain { name: chain, rules });
+            }
+        }
     }
 
     debug_assert_eq!(
@@ -860,6 +1410,25 @@ fn lower_family(
     debug_assert_eq!(prepare.usage().commands(), prepare_commands);
     debug_assert_eq!(retire.usage().commands(), retire_commands);
 
+    let local_output = match (local_analysis, local_proxy_protocols, routing_target) {
+        (Some(analysis), Some(protocols), Some(routing)) => Some(build_local_output_requirements(
+            family,
+            analysis
+                .engine_credentials
+                .expect("validated local proxy program has engine credentials"),
+            protocols,
+            routing,
+            request.target,
+        )),
+        (Some(_), None, None) | (None, None, None) => None,
+        _ => unreachable!("local routing validation keeps proxy requirements coherent"),
+    };
+    let transaction_order = if schema_version == XTABLES_CAPTURE_LOWERING_SCHEMA_VERSION {
+        Some(build_transaction_order(&entries, local_output.is_some()))
+    } else {
+        None
+    };
+
     let usage = XtablesCaptureResourceUsage {
         domain_programs: analyses.len(),
         source_clauses: analyses
@@ -868,25 +1437,47 @@ fn lower_family(
             .sum(),
         expanded_match_rules: analyses
             .iter()
-            .map(|analysis| analysis.direct_rules + analysis.proxy_rules)
+            .map(|analysis| {
+                analysis.direct_rules
+                    + analysis.proxy_rules
+                    + if analysis.program.domain() == CaptureTrafficDomain::LocalOutput {
+                        analysis.protocols.map_or(0, protocol_count)
+                    } else {
+                        0
+                    }
+            })
             .sum(),
         implementation_chains,
+        entry_points: entries.len(),
+        listener_requirements: local_output
+            .map(|requirements| protocol_count(requirements.listener().protocols()))
+            .unwrap_or(0),
+        routing_objects: usize::from(local_output.is_some()) * 2,
+        transaction_steps: transaction_order
+            .as_ref()
+            .map(|order| order.prepare().len() + order.retire().len())
+            .unwrap_or(0),
         prepare_commands,
         retire_commands,
         maximum_jump_depth: 1,
     };
     let entries = entries.into_boxed_slice();
-    let digest = digest_pair(
-        lowering_digest,
-        restore_family,
-        &entries,
-        &prepare,
-        &retire,
+    let digest = digest_pair(PairDigestInput {
+        schema_version,
+        lowering: lowering_digest,
+        family: restore_family,
+        entries: &entries,
+        local_output,
+        transaction_order: transaction_order.as_ref(),
+        prepare: &prepare,
+        retire: &retire,
         usage,
-    );
+    });
     Ok(Some(XtablesCaptureArtifactPair {
         family: restore_family,
         entries,
+        local_output,
+        transaction_order,
         prepare,
         retire,
         usage,
@@ -914,12 +1505,18 @@ fn analyze_program(
         return Err(invalid_clause(program, clause));
     }
 
-    match program.domain() {
+    let engine_credentials = match program.domain() {
         CaptureTrafficDomain::LocalOutput => {
-            return Err(XtablesCaptureLoweringError::UnsupportedTrafficDomain {
-                family: program.family(),
-                domain: program.domain(),
-            });
+            let first = &clauses[0];
+            if first.stage() != CaptureDecisionStage::LoopPrevention
+                || first.decision() != CaptureClauseDecision::Direct
+            {
+                return Err(invalid_clause(program, first));
+            }
+            match first.predicate() {
+                CapturePredicate::EngineCredentials(credentials) => Some(*credentials),
+                _ => return Err(invalid_clause(program, first)),
+            }
         }
         CaptureTrafficDomain::ForwardedIngress => {
             let has_loopback = clauses.iter().any(|clause| {
@@ -940,8 +1537,9 @@ fn analyze_program(
                     },
                 );
             }
+            None
         }
-    }
+    };
 
     let mut direct_clause_count = clauses.len();
     let mut proxy_scope = None;
@@ -981,6 +1579,15 @@ fn analyze_program(
                     }
                     direct_clause_count -= 1;
                     proxy_scope = Some(ProxyScope::InputInterfaces(selectors));
+                }
+                CapturePredicate::LocalUidNotIn(uids)
+                    if program.domain() == CaptureTrafficDomain::LocalOutput
+                        && candidate.stage() == CaptureDecisionStage::ApplicationPolicy
+                        && candidate.decision() == CaptureClauseDecision::Direct
+                        && !uids.is_empty() =>
+                {
+                    direct_clause_count -= 1;
+                    proxy_scope = Some(ProxyScope::OutputUids(uids));
                 }
                 _ => {}
             }
@@ -1035,12 +1642,16 @@ fn analyze_program(
         (Some(ProxyScope::InputInterfaces(selectors)), Some(protocols)) => {
             selectors.len() * protocol_count(protocols)
         }
+        (Some(ProxyScope::OutputUids(uids)), Some(protocols)) => {
+            uids.len() * protocol_count(protocols)
+        }
         (None, None) => 0,
         _ => unreachable!("proxy scope and protocol eligibility are discovered together"),
     };
 
     Ok(ProgramAnalysis {
         program,
+        engine_credentials,
         direct_clause_count,
         proxy_scope,
         protocols,
@@ -1059,8 +1670,22 @@ fn validate_direct_clause(
     }
     match clause.predicate() {
         CapturePredicate::Any
-            if program.domain() == CaptureTrafficDomain::ForwardedIngress
-                && clause.stage() == CaptureDecisionStage::InterfaceRole =>
+            if matches!(
+                (program.domain(), clause.stage()),
+                (
+                    CaptureTrafficDomain::ForwardedIngress,
+                    CaptureDecisionStage::InterfaceRole
+                ) | (
+                    CaptureTrafficDomain::LocalOutput,
+                    CaptureDecisionStage::ApplicationPolicy
+                )
+            ) =>
+        {
+            Ok(1)
+        }
+        CapturePredicate::EngineCredentials(_)
+            if program.domain() == CaptureTrafficDomain::LocalOutput
+                && clause.stage() == CaptureDecisionStage::LoopPrevention =>
         {
             Ok(1)
         }
@@ -1097,11 +1722,15 @@ fn validate_direct_clause(
             selectors,
         } if !selectors.is_empty() => {
             validate_interface_direction(program, *direction)?;
-            let admitted_stage = program.domain() == CaptureTrafficDomain::ForwardedIngress
-                && matches!(
+            let admitted_stage = match program.domain() {
+                CaptureTrafficDomain::LocalOutput => {
+                    clause.stage() == CaptureDecisionStage::InterfaceRole
+                }
+                CaptureTrafficDomain::ForwardedIngress => matches!(
                     clause.stage(),
                     CaptureDecisionStage::MandatorySafety | CaptureDecisionStage::InterfaceRole
-                );
+                ),
+            };
             if !admitted_stage {
                 return Err(invalid_clause(program, clause));
             }
@@ -1109,6 +1738,13 @@ fn validate_direct_clause(
                 validate_interface_selector(program, selector)?;
             }
             Ok(selectors.len())
+        }
+        CapturePredicate::LocalUidIn(uids)
+            if program.domain() == CaptureTrafficDomain::LocalOutput
+                && clause.stage() == CaptureDecisionStage::ApplicationPolicy
+                && !uids.is_empty() =>
+        {
+            Ok(uids.len())
         }
         CapturePredicate::InterfaceDoesNotMatch { .. }
         | CapturePredicate::LocalUidNotIn(_)
@@ -1127,12 +1763,7 @@ fn validate_interface_direction(
     direction: CaptureInterfaceDirection,
 ) -> Result<(), XtablesCaptureLoweringError> {
     let expected = match program.domain() {
-        CaptureTrafficDomain::LocalOutput => {
-            return Err(XtablesCaptureLoweringError::UnsupportedTrafficDomain {
-                family: program.family(),
-                domain: program.domain(),
-            });
-        }
+        CaptureTrafficDomain::LocalOutput => CaptureInterfaceDirection::Output,
         CaptureTrafficDomain::ForwardedIngress => CaptureInterfaceDirection::Input,
     };
     if direction == expected {
@@ -1217,7 +1848,11 @@ fn render_direct_clause(
 ) -> Result<(), XtablesCaptureLoweringError> {
     match clause.predicate() {
         CapturePredicate::Any => rules.push(format!("-A {chain} -j RETURN")),
-        CapturePredicate::EngineCredentials(_) => return Err(invalid_clause(program, clause)),
+        CapturePredicate::EngineCredentials(credentials) => rules.push(format!(
+            "-A {chain} -m owner --uid-owner {} --gid-owner {} -j RETURN",
+            credentials.uid().get(),
+            credentials.gid().get()
+        )),
         CapturePredicate::DestinationPrefixes(prefixes) => {
             for prefix in prefixes {
                 rules.push(format!("-A {chain} -d {prefix} -j RETURN"));
@@ -1240,7 +1875,14 @@ fn render_direct_clause(
                 ));
             }
         }
-        CapturePredicate::LocalUidIn(_) => return Err(invalid_clause(program, clause)),
+        CapturePredicate::LocalUidIn(uids) => {
+            for uid in uids {
+                rules.push(format!(
+                    "-A {chain} -m owner --uid-owner {} -j RETURN",
+                    uid.get()
+                ));
+            }
+        }
         CapturePredicate::InterfaceDoesNotMatch { .. }
         | CapturePredicate::LocalUidNotIn(_)
         | CapturePredicate::ProtocolNotIn(_) => return Err(invalid_clause(program, clause)),
@@ -1273,6 +1915,15 @@ fn render_proxy_rules(
                 }
             }
         }
+        ProxyScope::OutputUids(uids) => {
+            for uid in uids.iter().copied() {
+                let uid = uid.get().to_string();
+                let owner = ["-m", "owner", "--uid-owner", uid.as_str()];
+                for protocol in enabled_protocols(protocols) {
+                    rules.push(render_proxy_rule(program, chain, &owner, protocol, target)?);
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -1293,10 +1944,11 @@ fn render_proxy_rule(
     rule.push_str(protocol_token(protocol));
     match program.domain() {
         CaptureTrafficDomain::LocalOutput => {
-            return Err(XtablesCaptureLoweringError::UnsupportedTrafficDomain {
-                family: program.family(),
-                domain: program.domain(),
-            });
+            rule.push_str(" -j MARK --set-xmark ");
+            rule.push_str(&mark_token(
+                target.mark().proxy_value(),
+                target.mark().mask(),
+            ));
         }
         CaptureTrafficDomain::ForwardedIngress => {
             rule.push_str(" -j TPROXY --on-port ");
@@ -1309,6 +1961,115 @@ fn render_proxy_rule(
         }
     }
     Ok(rule)
+}
+
+fn render_loopback_companion(
+    chain: &str,
+    protocols: CaptureProtocolSet,
+    target: XtablesTproxyTarget,
+) -> Vec<String> {
+    let mut rules = Vec::with_capacity(protocol_count(protocols) + 1);
+    for protocol in enabled_protocols(protocols) {
+        rules.push(format!(
+            "-A {chain} -p {} -j TPROXY --on-port {} --tproxy-mark {}",
+            protocol_token(protocol),
+            target.proxy_port().get(),
+            mark_token(target.mark().proxy_value(), target.mark().mask())
+        ));
+    }
+    rules.push(format!("-A {chain} -j RETURN"));
+    rules
+}
+
+fn build_local_output_requirements(
+    family: NetworkAddressFamily,
+    engine_credentials: CompatibilityEngineCredentials,
+    protocols: CaptureProtocolSet,
+    routing: XtablesLocalOutputRoutingTarget,
+    target: XtablesTproxyTarget,
+) -> XtablesLocalOutputTransactionRequirements {
+    let restore_family = restore_family(family);
+    let bind_address = match family {
+        NetworkAddressFamily::Ipv4 => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        NetworkAddressFamily::Ipv6 => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+    };
+    XtablesLocalOutputTransactionRequirements {
+        routing: XtablesLocalOutputRoutingRequirement {
+            family: restore_family,
+            target: routing,
+            route_destination: bind_address,
+            route_prefix_length: 0,
+            route_scope: RouteScope::from_raw(LINUX_ROUTE_SCOPE_HOST),
+            route_type: RouteType::from_raw(LINUX_ROUTE_TYPE_LOCAL),
+            mark: target.mark().selector(FwmarkRole::Proxy),
+            loopback_interface: loopback_interface(),
+        },
+        listener: XtablesTransparentListenerRequirement {
+            family: restore_family,
+            bind_address,
+            port: target.proxy_port(),
+            protocols,
+        },
+        loop_escape: XtablesLoopEscapeRequirement {
+            compatibility_credentials: engine_credentials,
+            socket_mark: target.mark().selector(FwmarkRole::Bypass),
+        },
+    }
+}
+
+fn build_transaction_order(
+    entries: &[XtablesCaptureEntryPoint],
+    has_local_requirements: bool,
+) -> XtablesCaptureTransactionOrder {
+    let mut prepare = entries
+        .iter()
+        .map(|entry| XtablesCaptureTransactionStep::PrepareEntryPoint(entry.role()))
+        .collect::<Vec<_>>();
+    if has_local_requirements {
+        prepare.extend([
+            XtablesCaptureTransactionStep::PrepareTransparentListener,
+            XtablesCaptureTransactionStep::PreparePolicyRouting,
+            XtablesCaptureTransactionStep::PrepareLoopEscape,
+        ]);
+    }
+    for role in [
+        XtablesCaptureEntryPointRole::LocalOutputLoopbackTproxy,
+        XtablesCaptureEntryPointRole::ForwardedIngress,
+        XtablesCaptureEntryPointRole::LocalOutputClassifier,
+    ] {
+        if entries.iter().any(|entry| entry.role() == role) {
+            prepare.push(XtablesCaptureTransactionStep::AttachEntryPoint(role));
+        }
+    }
+
+    let mut retire = Vec::new();
+    for role in [
+        XtablesCaptureEntryPointRole::LocalOutputClassifier,
+        XtablesCaptureEntryPointRole::ForwardedIngress,
+        XtablesCaptureEntryPointRole::LocalOutputLoopbackTproxy,
+    ] {
+        if entries.iter().any(|entry| entry.role() == role) {
+            retire.push(XtablesCaptureTransactionStep::DetachEntryPoint(role));
+        }
+    }
+    if has_local_requirements {
+        retire.extend([
+            XtablesCaptureTransactionStep::RetireLoopEscape,
+            XtablesCaptureTransactionStep::RetirePolicyRouting,
+            XtablesCaptureTransactionStep::RetireTransparentListener,
+        ]);
+    }
+    retire.extend(
+        entries
+            .iter()
+            .rev()
+            .map(|entry| XtablesCaptureTransactionStep::RetireEntryPoint(entry.role())),
+    );
+
+    XtablesCaptureTransactionOrder {
+        prepare: prepare.into_boxed_slice(),
+        retire: retire.into_boxed_slice(),
+    }
 }
 
 fn render_interface_selector(
@@ -1462,14 +2223,32 @@ fn ensure_byte_limit(
     }
 }
 
-fn capture_chain_name(family: NetworkAddressFamily, generation: NonZeroU32) -> Box<str> {
-    format!("FLX{}F{:010}", family_tag(family), generation.get()).into_boxed_str()
+fn capture_chain_name(
+    family: NetworkAddressFamily,
+    role: XtablesCaptureEntryPointRole,
+    generation: NonZeroU32,
+) -> Box<str> {
+    let role = match role {
+        XtablesCaptureEntryPointRole::LocalOutputClassifier => 'O',
+        XtablesCaptureEntryPointRole::LocalOutputLoopbackTproxy => 'P',
+        XtablesCaptureEntryPointRole::ForwardedIngress => 'F',
+    };
+    format!("FLX{}{role}{:010}", family_tag(family), generation.get()).into_boxed_str()
 }
 
-fn digest_lowering(request: XtablesCaptureLoweringRequest<'_>) -> XtablesCaptureLoweringDigest {
+fn digest_lowering(
+    schema_version: u16,
+    request: XtablesCaptureLoweringRequest<'_>,
+) -> XtablesCaptureLoweringDigest {
     let mut digest = Sha256::new();
-    digest.update(LOWERING_DIGEST_DOMAIN);
-    digest.update(XTABLES_CAPTURE_LOWERING_SCHEMA_VERSION.to_be_bytes());
+    digest.update(
+        if schema_version == XTABLES_CAPTURE_LOWERING_SCHEMA_VERSION_V1 {
+            LOWERING_DIGEST_DOMAIN_V1
+        } else {
+            LOWERING_DIGEST_DOMAIN_V2
+        },
+    );
+    digest.update(schema_version.to_be_bytes());
     digest.update(request.program.schema_version().to_be_bytes());
     digest.update(request.program.digest().as_bytes());
     digest.update(request.namespace.generation().get().to_be_bytes());
@@ -1478,43 +2257,72 @@ fn digest_lowering(request: XtablesCaptureLoweringRequest<'_>) -> XtablesCapture
     digest.update(request.target.mark().proxy_value().to_be_bytes());
     digest.update(request.target.mark().bypass_value().to_be_bytes());
     digest.update([request.extensions.bits()]);
+    if schema_version == XTABLES_CAPTURE_LOWERING_SCHEMA_VERSION {
+        digest_routing_spec(&mut digest, request.local_output_routing);
+    }
     XtablesCaptureLoweringDigest(digest.finalize().into())
 }
 
-fn digest_pair(
+struct PairDigestInput<'a> {
+    schema_version: u16,
     lowering: XtablesCaptureLoweringDigest,
     family: XtablesRestoreFamily,
-    entries: &[XtablesCaptureEntryPoint],
-    prepare: &XtablesRestoreArtifact,
-    retire: &XtablesRestoreArtifact,
+    entries: &'a [XtablesCaptureEntryPoint],
+    local_output: Option<XtablesLocalOutputTransactionRequirements>,
+    transaction_order: Option<&'a XtablesCaptureTransactionOrder>,
+    prepare: &'a XtablesRestoreArtifact,
+    retire: &'a XtablesRestoreArtifact,
     usage: XtablesCaptureResourceUsage,
-) -> XtablesCaptureArtifactPairDigest {
+}
+
+fn digest_pair(input: PairDigestInput<'_>) -> XtablesCaptureArtifactPairDigest {
     let mut digest = Sha256::new();
-    digest.update(PAIR_DIGEST_DOMAIN);
-    digest.update(XTABLES_CAPTURE_LOWERING_SCHEMA_VERSION.to_be_bytes());
-    digest.update(lowering.as_bytes());
-    digest.update([restore_family_tag(family)]);
-    digest.update(length_bytes(entries.len()));
-    for entry in entries {
+    digest.update(
+        if input.schema_version == XTABLES_CAPTURE_LOWERING_SCHEMA_VERSION_V1 {
+            PAIR_DIGEST_DOMAIN_V1
+        } else {
+            PAIR_DIGEST_DOMAIN_V2
+        },
+    );
+    digest.update(input.schema_version.to_be_bytes());
+    digest.update(input.lowering.as_bytes());
+    digest.update([restore_family_tag(input.family)]);
+    digest.update(length_bytes(input.entries.len()));
+    for entry in input.entries {
         digest.update([domain_tag(entry.domain)]);
         digest.update(length_bytes(entry.chain.len()));
         digest.update(entry.chain.as_bytes());
+        if input.schema_version == XTABLES_CAPTURE_LOWERING_SCHEMA_VERSION {
+            digest.update([entry_role_tag(entry.role), hook_tag(entry.hook)]);
+            digest_entry_selector(&mut digest, entry.selector);
+        }
     }
-    digest_restore_artifact(&mut digest, prepare);
-    digest_restore_artifact(&mut digest, retire);
-    digest_usage(&mut digest, usage);
+    if input.schema_version == XTABLES_CAPTURE_LOWERING_SCHEMA_VERSION {
+        digest_local_output_requirements(&mut digest, input.local_output);
+        digest_transaction_order(&mut digest, input.transaction_order);
+    }
+    digest_restore_artifact(&mut digest, input.prepare);
+    digest_restore_artifact(&mut digest, input.retire);
+    digest_usage(&mut digest, input.usage, input.schema_version);
     XtablesCaptureArtifactPairDigest(digest.finalize().into())
 }
 
 fn digest_set(
+    schema_version: u16,
     lowering: XtablesCaptureLoweringDigest,
     ipv4: Option<&XtablesCaptureArtifactPair>,
     ipv6: Option<&XtablesCaptureArtifactPair>,
     usage: XtablesCaptureResourceUsage,
 ) -> XtablesCaptureArtifactSetDigest {
     let mut digest = Sha256::new();
-    digest.update(SET_DIGEST_DOMAIN);
-    digest.update(XTABLES_CAPTURE_LOWERING_SCHEMA_VERSION.to_be_bytes());
+    digest.update(
+        if schema_version == XTABLES_CAPTURE_LOWERING_SCHEMA_VERSION_V1 {
+            SET_DIGEST_DOMAIN_V1
+        } else {
+            SET_DIGEST_DOMAIN_V2
+        },
+    );
+    digest.update(schema_version.to_be_bytes());
     digest.update(lowering.as_bytes());
     for pair in [ipv4, ipv6] {
         match pair {
@@ -1525,8 +2333,139 @@ fn digest_set(
             None => digest.update([0]),
         }
     }
-    digest_usage(&mut digest, usage);
+    digest_usage(&mut digest, usage, schema_version);
     XtablesCaptureArtifactSetDigest(digest.finalize().into())
+}
+
+fn digest_routing_spec(digest: &mut Sha256, routing: Option<XtablesLocalOutputRoutingSpec>) {
+    match routing {
+        Some(routing) => {
+            digest.update([1]);
+            for family in [NetworkAddressFamily::Ipv4, NetworkAddressFamily::Ipv6] {
+                match routing.routing_for(family) {
+                    Some(target) => {
+                        digest.update([1, family_tag(family)]);
+                        digest_routing_target(digest, target);
+                    }
+                    None => digest.update([0, family_tag(family)]),
+                }
+            }
+        }
+        None => digest.update([0]),
+    }
+}
+
+fn digest_routing_target(digest: &mut Sha256, target: XtablesLocalOutputRoutingTarget) {
+    digest.update(target.priority().get().to_be_bytes());
+    digest.update(target.table().get().to_be_bytes());
+    digest.update([target.route_protocol().raw()]);
+    match target.rule_protocol() {
+        Some(protocol) => digest.update([1, protocol.raw()]),
+        None => digest.update([0]),
+    }
+}
+
+fn digest_entry_selector(digest: &mut Sha256, selector: XtablesCaptureEntrySelector) {
+    match selector {
+        XtablesCaptureEntrySelector::Any => digest.update([0]),
+        XtablesCaptureEntrySelector::Mark(mark) => {
+            digest.update([1]);
+            digest_rule_fwmark(digest, mark);
+        }
+        XtablesCaptureEntrySelector::InputInterfaceAndMark { interface, mark } => {
+            digest.update([2]);
+            digest.update(length_bytes(interface.as_bytes().len()));
+            digest.update(interface.as_bytes());
+            digest_rule_fwmark(digest, mark);
+        }
+    }
+}
+
+fn digest_local_output_requirements(
+    digest: &mut Sha256,
+    requirements: Option<XtablesLocalOutputTransactionRequirements>,
+) {
+    let Some(requirements) = requirements else {
+        digest.update([0]);
+        return;
+    };
+    digest.update([1]);
+    let routing = requirements.routing();
+    digest.update([restore_family_tag(routing.family())]);
+    digest_routing_target(digest, routing.target());
+    digest_ip_addr(digest, routing.route_destination());
+    digest.update([routing.route_prefix_length()]);
+    digest.update([routing.route_scope().raw()]);
+    digest.update([routing.route_type().raw()]);
+    digest_rule_fwmark(digest, routing.mark());
+    digest.update(length_bytes(routing.loopback_interface().as_bytes().len()));
+    digest.update(routing.loopback_interface().as_bytes());
+
+    let listener = requirements.listener();
+    digest.update([restore_family_tag(listener.family())]);
+    digest_ip_addr(digest, listener.bind_address());
+    digest.update(listener.port().get().to_be_bytes());
+    digest.update([protocol_bits(listener.protocols())]);
+
+    let escape = requirements.loop_escape();
+    digest.update(escape.compatibility_credentials().uid().get().to_be_bytes());
+    digest.update(escape.compatibility_credentials().gid().get().to_be_bytes());
+    digest_rule_fwmark(digest, escape.socket_mark());
+}
+
+fn digest_rule_fwmark(digest: &mut Sha256, mark: RuleFwMark) {
+    digest.update(mark.value().to_be_bytes());
+    digest.update(mark.mask().to_be_bytes());
+}
+
+fn digest_transaction_order(digest: &mut Sha256, order: Option<&XtablesCaptureTransactionOrder>) {
+    let Some(order) = order else {
+        digest.update([0]);
+        return;
+    };
+    digest.update([1]);
+    for steps in [order.prepare(), order.retire()] {
+        digest.update(length_bytes(steps.len()));
+        for step in steps {
+            digest_transaction_step(digest, *step);
+        }
+    }
+}
+
+fn digest_transaction_step(digest: &mut Sha256, step: XtablesCaptureTransactionStep) {
+    match step {
+        XtablesCaptureTransactionStep::PrepareEntryPoint(role) => {
+            digest.update([1, entry_role_tag(role)])
+        }
+        XtablesCaptureTransactionStep::PrepareTransparentListener => digest.update([2]),
+        XtablesCaptureTransactionStep::PreparePolicyRouting => digest.update([3]),
+        XtablesCaptureTransactionStep::PrepareLoopEscape => digest.update([4]),
+        XtablesCaptureTransactionStep::AttachEntryPoint(role) => {
+            digest.update([5, entry_role_tag(role)])
+        }
+        XtablesCaptureTransactionStep::DetachEntryPoint(role) => {
+            digest.update([6, entry_role_tag(role)])
+        }
+        XtablesCaptureTransactionStep::RetireLoopEscape => digest.update([7]),
+        XtablesCaptureTransactionStep::RetirePolicyRouting => digest.update([8]),
+        XtablesCaptureTransactionStep::RetireTransparentListener => digest.update([9]),
+        XtablesCaptureTransactionStep::RetireEntryPoint(role) => {
+            digest.update([10, entry_role_tag(role)])
+        }
+    }
+}
+
+fn digest_ip_addr(digest: &mut Sha256, address: IpAddr) {
+    match address {
+        IpAddr::V4(address) => {
+            digest.update([4]);
+            digest.update(address.octets());
+        }
+        IpAddr::V6(address) => {
+            digest.update([6]);
+            digest.update(address.octets());
+        }
+    }
 }
 
 fn digest_restore_artifact(digest: &mut Sha256, artifact: &XtablesRestoreArtifact) {
@@ -1550,8 +2489,8 @@ fn digest_restore_artifact(digest: &mut Sha256, artifact: &XtablesRestoreArtifac
     }
 }
 
-fn digest_usage(digest: &mut Sha256, usage: XtablesCaptureResourceUsage) {
-    for value in [
+fn digest_usage(digest: &mut Sha256, usage: XtablesCaptureResourceUsage, schema_version: u16) {
+    let v1_values = [
         usage.domain_programs,
         usage.source_clauses,
         usage.expanded_match_rules,
@@ -1559,8 +2498,19 @@ fn digest_usage(digest: &mut Sha256, usage: XtablesCaptureResourceUsage) {
         usage.prepare_commands,
         usage.retire_commands,
         usage.maximum_jump_depth,
-    ] {
+    ];
+    for value in v1_values {
         digest.update(length_bytes(value));
+    }
+    if schema_version == XTABLES_CAPTURE_LOWERING_SCHEMA_VERSION {
+        for value in [
+            usage.entry_points,
+            usage.listener_requirements,
+            usage.routing_objects,
+            usage.transaction_steps,
+        ] {
+            digest.update(length_bytes(value));
+        }
     }
 }
 
@@ -1623,7 +2573,12 @@ fn predicate_kind(predicate: &CapturePredicate) -> XtablesCapturePredicateKind {
 }
 
 fn is_exact_loopback(selector: &CaptureInterfaceSelector) -> bool {
-    selector.kind() == CaptureInterfaceSelectorKind::Exact && selector.name().as_bytes() == b"lo"
+    selector.kind() == CaptureInterfaceSelectorKind::Exact
+        && selector.name() == loopback_interface()
+}
+
+fn loopback_interface() -> InterfaceName {
+    InterfaceName::new(b"lo").expect("the Linux loopback interface name is valid")
 }
 
 const fn address_family(address: IpAddr) -> NetworkAddressFamily {
@@ -1652,6 +2607,26 @@ const fn restore_family_tag(family: XtablesRestoreFamily) -> u8 {
         XtablesRestoreFamily::Ipv4 => 4,
         XtablesRestoreFamily::Ipv6 => 6,
     }
+}
+
+const fn entry_role_tag(role: XtablesCaptureEntryPointRole) -> u8 {
+    match role {
+        XtablesCaptureEntryPointRole::LocalOutputClassifier => 1,
+        XtablesCaptureEntryPointRole::LocalOutputLoopbackTproxy => 2,
+        XtablesCaptureEntryPointRole::ForwardedIngress => 3,
+    }
+}
+
+const fn hook_tag(hook: XtablesCaptureHook) -> u8 {
+    match hook {
+        XtablesCaptureHook::Prerouting => 1,
+        XtablesCaptureHook::Output => 2,
+    }
+}
+
+const fn protocol_bits(protocols: CaptureProtocolSet) -> u8 {
+    (protocols.contains(CaptureTransportProtocol::Tcp) as u8)
+        | ((protocols.contains(CaptureTransportProtocol::Udp) as u8) << 1)
 }
 
 const fn domain_tag(domain: CaptureTrafficDomain) -> u8 {

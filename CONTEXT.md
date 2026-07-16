@@ -58,12 +58,12 @@ A deterministic backend-neutral compilation of Capture Policy into separate orde
 _Avoid_: Restore file, active rules
 
 **Shadow Capture Artifact**:
-An observation-only Phase 2 Capture Program used to explain and compare compatibility semantics. A separate Phase 4 lowerer may consume a forwarded-ingress-only artifact, but does not mutate or promote it. The shadow artifact remains distinct from both the canonical xtables artifact and the legacy source-shape renderer and has no Generation ID, Planning Authority, writer token, ownership lease, prepared/active conversion, or functional-canary authority.
+An observation-only Phase 2 Capture Program used to explain and compare compatibility semantics. A separate Phase 4 lowerer may consume a supported artifact, but does not mutate or promote it. Forwarded-ingress-only lowering preserves the frozen schema-v1 contract; any artifact containing local OUTPUT selects schema v2. The shadow artifact remains distinct from both the canonical xtables artifact and the legacy source-shape renderer and has no Generation ID, Planning Authority, writer token, ownership lease, prepared/active conversion, or functional-canary authority.
 _Avoid_: Dry-run Generation, staged rules
 
 **Xtables Capture Artifact Set**:
-A deterministic, non-authorizing Phase 4 lowering of an extension-free schema-v1 forwarded-ingress Capture Program into family-scoped, generation-namespaced but unattached prepare/retire mangle chains and entry-point metadata. It rejects local OUTPUT, established-flow caching, transparent-socket DIVERT, FakeIP ICMP, QUIC rejection, and MSS clamping, and carries no restore execution, readback, rollback, writer, ownership, prepared/active, coordinator, or activation authority.
-_Avoid_: Active rules, native cutover, local-OUTPUT backend
+A deterministic, non-authorizing Phase 4 lowering of an extension-free Capture Program. Forwarded-ingress-only input retains the exact schema-v1 bytes and digests in private `F` chains. Input containing local OUTPUT selects schema v2 and adds private `O` classifier and, when proxying, mark-qualified loopback `P` TPROXY chains plus typed stable-hook selectors, listener, loop-escape, policy-routing, lifecycle-order, identity, and resource metadata. Prepare/retire syntax never mutates a built-in hook; the metadata is descriptive only. Established-flow caching, transparent-socket DIVERT, FakeIP ICMP, QUIC rejection, and MSS clamping remain rejected, and the artifact carries no restore execution, readback, rollback, writer, ownership, prepared/active, coordinator, or activation authority.
+_Avoid_: Active rules, native cutover, production local-OUTPUT driver
 
 **Legacy Rules Plan**:
 A validated, source-shape-preserving Rust representation of the admitted `scripts/rules` compatibility inputs. It can deterministically emit the same bounded apply/cleanup restore bytes for bridge preparation, including legacy ordering and duplicates, but it is not a lowering of `ShadowCaptureArtifact`, a Generation Capture Program, or mutation authority.

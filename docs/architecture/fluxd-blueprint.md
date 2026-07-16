@@ -21,13 +21,14 @@ Migration is component-by-component rather than an unsafe dual-writer switch. Du
 development, the serialized shell networking path is frozen as the executable compatibility oracle
 and remains the sole writer for each not-yet-cut-over component. Rust-owned preparation now
 compiles the legacy restore caches through a validated source-shape renderer while explicit legacy
-ownership retains the frozen shell generator. Separately, an extension-free schema-v1 canonical
-lowerer now emits generation-namespaced but unattached forwarded-ingress prepare/retire chains and
-rejects local OUTPUT plus its five unmodeled extensions. Neither non-mutating compiler split promotes
-a shadow artifact or transfers writer ownership. A kernel ownership transition occurs only after a
-real local-OUTPUT mechanism, required adjunct semantics, renderer parity, readback, recovery,
-rollback, and real-device gates pass for that component; the replaced runtime code is then removed
-promptly. No bridge, shadow, parity, or partial-cutover state is releasable. See
+ownership retains the frozen shell generator. Separately, canonical lowering preserves exact
+schema-v1 forwarded identities and represents local OUTPUT through pure schema-v2 `O`/`P`
+transaction artifacts while all five optional extensions remain unsupported. Neither non-mutating
+compiler split promotes a shadow artifact or transfers writer ownership. A kernel ownership
+transition occurs only after stable-hook/native-writer integration, required adjunct semantics,
+renderer parity, readback, recovery, rollback, and real-device gates pass for that component; the
+replaced runtime code is then removed promptly. No bridge, shadow, parity, or partial-cutover state
+is releasable. See
 [ADR-0010](../adr/0010-freeze-shell-networking-as-a-shadow-compiler-oracle.md) and
 [ADR-0011](../adr/0011-pre-release-rust-only-release-gate.md).
 
@@ -185,11 +186,12 @@ packet-decision service.
 The shadow artifact is not a `GenerationArtifact` or `CompiledGeneration`. It has no Generation ID,
 Planning Authority or receipt, writer/ownership token, embedded backend renderer, kernel object
 names, prepared/active conversion, Runtime Reconciler entry point, or functional-canary authority.
-The separate Phase 4 lowerer may consume a forwarded-ingress-only artifact with a non-authorizing
-namespace and mark candidate, but does not mutate or promote the source value. It rejects local
-OUTPUT because MARK-only OUTPUT lacks the reviewed RPDB local route, mark-qualified loopback
-PREROUTING TPROXY companion, and listener-delivery transaction. The bridge shell remains the sole
-executed networking writer, and no shadow or lowered output is accepted by the Phase 1
+The separate Phase 4 lowerer may consume the artifact with a non-authorizing namespace, mark
+candidate, and optional descriptive per-family routing targets, but does not mutate or promote the
+source value. Forwarded-only input retains exact schema v1; local-OUTPUT input selects schema v2
+and represents the separate OUTPUT classifier, loopback PREROUTING companion, typed listener/
+routing/escape requirements, and dependency order. The bridge shell remains the sole executed
+networking writer, and no shadow or lowered output is accepted by the Phase 1
 `RuntimeCoordinator`.
 
 ### 3. Runtime Reconciler module
@@ -468,19 +470,30 @@ Phase 2 shadow Capture Program and does not claim target semantic or device pari
 transition disables the shell writer before its first restore mutation so both implementations are
 never active writers.
 
-The separate canonical schema-v1 lowerer consumes only forwarded-ingress shadow programs. It
-preserves ordered direct decisions as uncached returns, expands terminal whole-set interface
-negation as positive proxy membership, and emits protocol-qualified TCP/UDP TPROXY rules into
-generation-namespaced but unattached mangle chains. Family prepare/retire artifacts, entry metadata,
-resource accounting, and domain-separated identities are deterministic. Local OUTPUT is rejected:
-an OUTPUT MARK-only chain lacks the reviewed RPDB local route, mark-qualified loopback PREROUTING
-TPROXY companion, and listener-delivery transaction. Established-flow caching, transparent-socket
-DIVERT, FakeIP ICMP, QUIC rejection, and MSS clamping are also explicit unsupported extensions.
+The separate canonical lowerer now has two deliberately distinct contracts. Forwarded-only input
+retains exact schema-v1 bytes, `FLX{4|6}F{generation:010}` names, resource accounting, and digests.
+Any input containing local OUTPUT selects schema v2. It adds a MARK-only OUTPUT classifier in
+`FLX{4|6}O{generation:010}` and, when proxy traffic exists, a TCP/UDP TPROXY companion in
+`FLX{4|6}P{generation:010}`. The `O` entry metadata selects `mark 0/mask`; the `P` entry selects
+`-i lo` plus `mark proxy/mask`; and the forwarded `F` role retains selector `Any` on PREROUTING.
+The private chains remain unattached and never place TPROXY directly in OUTPUT.
 
-This canonical artifact has no stable hook attachment, restore invocation, live readback, rollback,
-cleanup-invertibility proof, mark lease, writer/ownership token, prepared/active conversion, or
-Runtime Reconciler entry point. A native transition still requires one qualified local-OUTPUT
-mechanism, any required typed extensions, and the single-writer cutover gates below.
+Schema v2 also records typed per-family RPDB/local-route identity, exact transparent-listener
+family/address/port/protocol requirements, compatibility engine credentials plus bypass-mark loop
+escape, and descriptive transaction ordering. The dependency order prepares private chains,
+listener, routing, and escape before attaching `P`, optional `F`, and `O` last; retirement detaches
+`O`, optional `F`, and `P` before releasing escape, routing, listener, and private objects. This
+metadata does not allocate or mutate any of those objects. Positive UID membership preserves local
+allowlist set algebra; ordered direct returns preserve denylist and safety decisions.
+
+Both schemas have no stable-hook mutation, restore invocation, routing writer, live readback,
+rollback, cleanup-invertibility proof, mark/route/listener lease, writer/ownership token,
+prepared/active conversion, receipt authority, or Runtime Reconciler entry point. The production
+xtables driver therefore remains `Unsupported`. Established-flow caching, transparent-socket
+DIVERT, FakeIP ICMP, QUIC rejection, and MSS clamping remain explicit unsupported extensions. A
+native transition still requires stable-hook activation, exact restore/readback/rollback, the
+single-writer transition lease, production evidence authorities, and reviewed Android release
+qualification.
 
 The bridge now binds that source-shape output before Generation publication. Domain-separated plan,
 mandatory family apply/cleanup pair, and enabled-family set identities are renderer-owned.

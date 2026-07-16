@@ -1270,6 +1270,7 @@ fn configure_child(
             // needs the deferred post-credential Rust launcher before it can
             // claim the same crash-time guarantee.
             kill_on_parent_death: true,
+            close_unlisted_fds: false,
             inherited_fds,
         },
     )

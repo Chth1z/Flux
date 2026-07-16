@@ -17,6 +17,7 @@ pub(crate) struct ChildProcessConfig {
     pub(crate) raise_nofile_limit: bool,
     pub(crate) new_process_group: bool,
     pub(crate) kill_on_parent_death: bool,
+    pub(crate) close_unlisted_fds: bool,
     pub(crate) inherited_fds: Vec<i32>,
 }
 
@@ -44,6 +45,7 @@ mod implementation {
         let empty_mask = unsafe { empty_mask.assume_init() };
         let nofile_limit = preferred_nofile_limit(config.raise_nofile_limit);
         let new_process_group = config.new_process_group;
+        let close_unlisted_fds = config.close_unlisted_fds;
         // Capture the creating process before fork. `PR_SET_PDEATHSIG` is not
         // retroactive, so the child compares this identity after arming the
         // signal to close the parent-exit-before-prctl race.
@@ -55,7 +57,7 @@ mod implementation {
         let inherited_fds = config.inherited_fds;
 
         // SAFETY: the closure runs after fork and before exec. `sigprocmask`,
-        // `setpgid`, `fcntl`, `prctl`, `getpid`, `getppid`, `kill`,
+        // `setpgid`, `close_range`, `fcntl`, `prctl`, `getpid`, `getppid`, `kill`,
         // Linux/Bionic's errno accessor, and Linux/Bionic's `setrlimit`
         // wrapper are allocation-free syscall/TLS operations. The closure
         // touches only copied or preallocated values and constructs an
@@ -72,6 +74,9 @@ mod implementation {
                 }
                 if new_process_group && libc::setpgid(0, 0) != 0 {
                     return Err(last_fork_error());
+                }
+                if close_unlisted_fds {
+                    mark_unlisted_descriptors_close_on_exec()?;
                 }
                 for descriptor in &inherited_fds {
                     let flags = libc::fcntl(*descriptor, libc::F_GETFD);
@@ -227,6 +232,20 @@ mod implementation {
         io::Error::from_raw_os_error(fork_errno())
     }
 
+    fn mark_unlisted_descriptors_close_on_exec() -> Result<(), io::Error> {
+        const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
+        // SAFETY: close_range receives an inclusive integer descriptor range
+        // and the CLOEXEC-only flag. Descriptors are not closed in the child;
+        // the explicitly admitted inheritance list is cleared afterward.
+        let result =
+            unsafe { libc::syscall(libc::SYS_close_range, 3_u32, u32::MAX, CLOSE_RANGE_CLOEXEC) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(last_fork_error())
+        }
+    }
+
     #[cfg(target_os = "linux")]
     fn fork_errno() -> i32 {
         // SAFETY: immediately after the failed libc call, glibc/musl exposes
@@ -257,6 +276,7 @@ mod implementation {
             raise_nofile_limit: _,
             new_process_group: _,
             kill_on_parent_death: _,
+            close_unlisted_fds: _,
             inherited_fds: _,
         } = config;
         Ok(())

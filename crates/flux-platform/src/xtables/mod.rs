@@ -1,4 +1,6 @@
 mod lowering;
+#[allow(dead_code)]
+mod native;
 mod render;
 mod restore;
 

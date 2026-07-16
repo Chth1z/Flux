@@ -153,6 +153,15 @@ These canonical artifacts are not used by the bridge. The production xtables dri
 `Unsupported`, and the lowerer grants no authority to execute restore, attach hooks, provision a
 listener or route, perform readback or rollback, write or own kernel state, or activate capture.
 
+The next native lane now has one internal process primitive: `flux-platform` can open exact
+absolute `iptables-restore`/`ip6tables-restore` paths while rejecting a final-component symlink,
+descriptor-pin and digest them, require matching reported legacy or nf_tables restore flavors, and invoke the selected child
+directly with `-w`, `--noflush`, exact canonical stdin, bounded diagnostics, timeout, parent-death,
+unrelated-descriptor closure, and process-group cleanup. It remains crate-private and is deliberately unwired from the bridge, coordinator, and production
+driver. It has no stable-hook, routing, readback, rollback, journal, transition-lease, or activation
+authority, and a successful child exit is not kernel-state proof. Every error after a restore child
+spawns is conservatively tagged as potentially mutated state for mandatory future readback.
+
 `BYPASS_SET_BACKEND="zone"` is the only implemented backend. `ipset` and `auto` are intentionally
 rejected until distinct adapters, capability probes, and parity tests exist.
 
@@ -302,8 +311,9 @@ The delivered bridge renderer is only the first non-mutating xtables cutover: Ru
 compatibility bytes, while shell still owns restore execution, readback, rollback, and kernel
 mutation. The separate canonical lowerer now represents forwarded ingress and the complete
 schema-v2 local-OUTPUT `O`/`P` transaction, while preserving frozen schema-v1 forwarded-only
-identities. Stable-hook mutation, listener/routing provisioning, live ownership, production driver
-support, and the five rejected extensions remain separate gated work. nftables, TUN, eBPF, and
+identities. A crate-private descriptor-pinned direct-child restore primitive is now delivered, but
+stable-hook mutation, listener/routing provisioning, exact readback/rollback, transition leasing,
+live ownership, production driver support, and the five rejected extensions remain separate gated work. nftables, TUN, eBPF, and
 `.ko`/KPM module paths remain deferred and are not activated by either compiler.
 
 ## Disclaimer

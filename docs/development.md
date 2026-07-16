@@ -150,6 +150,34 @@ obtain writer/ownership authority, enter the coordinator, or qualify Android pac
 production xtables driver remains `Unsupported`. Do not feed these artifacts to `scripts/tproxy`;
 the development bridge continues to use the independent `LegacyRulesPlan` artifacts below.
 
+### Native restore-process primitive
+
+Run the focused process Adapter suite with:
+
+```text
+cargo test -p flux-platform xtables::native::tests
+```
+
+This suite uses temporary executable fixtures rather than kernel mutation. It proves that the
+crate-private Adapter opens exact absolute restore paths while rejecting a final-component symlink,
+descriptor-pins and SHA-256-identifies the selected bytes, probes bounded `--version` output, rejects mismatched reported
+legacy and nf_tables IPv4/IPv6 flavors, and revalidates in-place identity before and after execution. Restore
+uses a direct child with cleared environment, exact `-w N --noflush` argv, canonical artifact stdin,
+bounded stdout/stderr, a nonzero deadline, unrelated-descriptor closure, direct-child parent-death
+containment, and process-group kill/reap so a successful parent cannot strand a descendant holding
+the capture pipes. Nonblocking cancellation prevents a blocked stdin writer from extending the
+deadline when cleanup fails; unresolved children move to a deferred reaper. Every restore error
+after successful spawn reports `MayHaveMutated`, so the future owner must re-read live state before
+compensation. Probe errors remain `NotStarted`.
+
+This is a crate-private implementation dependency of the future native xtables owner, not a public
+restore CLI or an independently usable writer. The test does not attach stable hooks, allocate a
+mark, provision or inspect rtnetlink state, serialize against `scripts/tproxy`, perform live
+readback, prove rollback or cleanup invertibility, write a journal, acquire a transition lease,
+enter `RuntimeCoordinator`, or change the functional-canary driver's `Unsupported` result. Tool
+discovery, command/save/readback coherence, xtables-lock error classification, and the complete
+schema-v2 transaction remain open.
+
 ### Rust legacy-rule renderer and frozen oracle workflow
 
 Run the parser, source-shape renderer, strict bridge-input adapter, and checked-in oracle suites:

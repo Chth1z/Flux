@@ -1035,7 +1035,27 @@ receipt authorities, and reviewed Android release qualification remain the next 
 
 ### 10.4 Native restore invocation
 
-The future native adapter will spawn the discovered `iptables-restore`/`ip6tables-restore` binaries directly, pass `--noflush` and a bounded wait option, write generated content to stdin, and capture stderr with a size limit.
+The first internal process primitive now opens caller-selected absolute
+`iptables-restore`/`ip6tables-restore` paths while rejecting a final-component symlink, pins their
+descriptors and domain-separated byte digests, probes bounded `--version` output, and requires the selected family
+pair to report matching legacy or nf_tables restore flavors. This hint does not classify wrappers,
+vendor implementations, command/save coherence, or Backend Plan eligibility. Before and after each invocation it
+revalidates the pinned bytes. It spawns the pinned descriptor directly, clears the inherited
+environment, passes fixed `-w N --noflush` arguments, writes the canonical restore artifact to
+stdin, bounds stdout and stderr, applies a nonzero deadline plus direct-child parent-death
+containment, marks unrelated parent descriptors close-on-exec, and kills/reaps the process group so
+descendants cannot retain its pipes. Its stdin writer is nonblocking and cancellation-aware;
+cleanup failure returns a typed error and transfers unresolved reaping out of the deadline path.
+Every failure after a restore child successfully spawns carries `MayHaveMutated`, requiring the
+future owner to re-read live state before compensation. Probe and pre-spawn failures are
+`NotStarted`.
+
+This primitive remains crate-private and is not a
+restore authority. It is not wired to the Runtime Reconciler or functional-canary driver and has no
+stable-hook, rtnetlink, live readback, rollback, journal, transition lease, prepared/active, or
+ownership conversion. A zero exit is process evidence only. System discovery, coherent
+command/restore/save identity, exact lock-timeout classification, live readback, and the complete
+native transaction remain open.
 
 Before selection, Flux detects whether each tool belongs to iptables-legacy, iptables-nft, a wrapper, or a vendor implementation. IPv4/IPv6 command and restore tools must form one coherent implementation and pass the exact canary. One Generation never mixes legacy and nft variants or manages the same policy through both.
 

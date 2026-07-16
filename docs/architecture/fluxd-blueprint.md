@@ -519,6 +519,14 @@ Design requirements:
 - snapshot and verify restore output, then re-read the owned chains;
 - serialize access around the xtables lock and expose lock timeout distinctly from syntax or feature errors.
 
+The first bullet now has an unwired internal implementation checkpoint: exact restore paths reject
+a final-component symlink and are descriptor-pinned and byte-digested, matching reported legacy/nf_tables family flavors are
+boundedly probed, and direct children receive fixed argv plus canonical stdin with bounded
+diagnostics, timeout, unrelated-descriptor closure, parent-death, and process-group cleanup. All
+post-spawn restore failures conservatively report possible mutation. This is only the process Adapter
+behind the future deep native-owner Module. Stable hooks, command/save discovery, live readback,
+rtnetlink, journaling, rollback, transition leasing, and production composition remain open.
+
 ### Managed TUN path
 
 Sing-Box remains responsible for packet-stack processing. The shipping plan is `EngineOwnedTun`: Sing-Box owns the TUN queue FDs and packet I/O, while Flux owns capture policy and route lifecycle. A future `FluxOwnedTunFd` plan is eligible only when the exact Sing-Box version exposes a documented, tested FD-handoff contract.

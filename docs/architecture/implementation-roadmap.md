@@ -455,6 +455,14 @@ intentionally absent from normal `cargo xtask ci`.
   loopback TPROXY companions, retains optional `F` forwarded chains, and records typed routing,
   listener, loop-escape, entry-selector, lifecycle, identity, and resource metadata. The artifacts
   remain unattached and non-authorizing.
+- **Delivered internal process primitive:** exact absolute IPv4 and optional IPv6 restore paths are
+  opened with final-component symlink rejection, descriptor-pinned, byte-digested, boundedly
+  version-probed, and required to report
+  matching legacy or nf_tables restore flavors. The selected child receives only fixed
+  `-w N --noflush` argv and exact canonical stdin under bounded output, timeout, parent-death, and
+  process-group cleanup, with unrelated parent descriptors made close-on-exec. The primitive is not
+  wired to runtime ownership and child success is not live readback or mutation authority. Every
+  restore error after spawn is conservatively classified as potentially mutated state.
 - **Open production semantic and lifecycle checkpoint:** stable-hook attachment, native restore and
   rtnetlink ownership, exact readback/rollback, cleanup invertibility, production driver/receipt
   authorities, and Android release-device qualification. Established-flow caching, transparent-
@@ -475,8 +483,8 @@ intentionally absent from normal `cargo xtask ci`.
   remain outside production authority and do not combine distinct UID,
   Generation/receipt evidence, a production report producer, Android 5.10/ARM64, or release
   qualification.
-- Following-stage direct child-process adapter for `iptables-restore`/`ip6tables-restore`, exact
-  readback, rollback, and transition lease.
+- Complete the native process profile with command/save discovery, exact readback, stable-hook
+  rendering, xtables-lock classification, rollback, and the transition lease.
 - Coherent iptables-legacy versus iptables-nft detection and exact canaries; one Generation may use only one matched IPv4/IPv6 implementation family.
 - Stable dispatch chains plus generation chains.
 - ipset capability probes, generation-specific sets, inactive population/optional temporary swap, stable-jump cutover, verification, and cleanup without changing set contents under the old Generation.

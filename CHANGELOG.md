@@ -52,6 +52,24 @@ All notable changes to the Flux project will be documented in this file.
   perform readback/rollback, or grant mark, writer, ownership, prepared/active, coordinator, or
   activation authority. The production xtables driver remains `Unsupported`.
 
+### Native xtables process groundwork
+- Added the first internal native restore-process Adapter. It opens caller-selected absolute
+  `iptables-restore` and optional `ip6tables-restore` tools with final-component symlink rejection and descriptor pinning,
+  records a domain-separated byte digest, probes bounded version output, rejects mismatched reported
+  legacy and nf_tables family flavors, and revalidates the pinned bytes before and after execution.
+- Restore children are invoked directly without a shell or inherited environment, receive only
+  `-w N --noflush` plus the exact canonical artifact on stdin, and have bounded stdout/stderr,
+  timeout, direct-child parent-death, unrelated-descriptor closure, process-group kill/reap, and
+  descendant-pipe cleanup. Every restore failure after spawn reports `MayHaveMutated`; cleanup
+  failure returns promptly with a deferred reaper rather than blocking past the operation deadline.
+  Crate-private tests cover exact IPv4/IPv6 argv and stdin, unsafe paths, missing families, nonzero exit,
+  oversized diagnostics, timeout, descendant cleanup, path replacement, and in-place mutation.
+  This primitive remains crate-private and is not wired
+  to the bridge, Runtime Reconciler, or functional-canary driver. It adds no stable-hook,
+  rtnetlink, readback, rollback, journal, transition lease, writer, or activation authority;
+  `scripts/tproxy` remains the sole current restore executor and the production driver remains
+  `Unsupported`.
+
 ### Bridge contract audit corrections
 - Added Generation-bound attestation for Rust-generated legacy restore artifacts. Domain-separated
   plan, mandatory family apply/cleanup pair, and enabled-family set identities bind the exact

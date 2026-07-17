@@ -178,24 +178,65 @@ cleanup_addrsync() {
         cleanup --mode dump >/dev/null 2>&1
 }
 
+_release_networking_writer() {
+    release_shell_xtables_writer_lock
+}
+
+_claim_networking_writer() {
+    if [ -n "${FLUX_XTABLES_WRITER_OWNER_PID:-}" ] ||
+        [ -n "${FLUX_XTABLES_WRITER_OWNER_START_TICKS:-}" ] ||
+        [ -n "${FLUX_XTABLES_WRITER_OWNER_BOOT_ID:-}" ]; then
+        if ! inherit_shell_xtables_writer_lock; then
+            log_error "Inherited networking writer ownership is invalid"
+            return 1
+        fi
+    else
+        if ! claim_shell_xtables_writer_lock; then
+            log_error "Another networking ownership transition is in progress"
+            return 1
+        fi
+    fi
+
+    trap '_release_networking_writer' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
+    if [ -e "${NATIVE_XTABLES_LEASE_FILE}" ] || [ -L "${NATIVE_XTABLES_LEASE_FILE}" ]; then
+        log_error "Native networking ownership is active; refusing addrsync mutation"
+        _release_networking_writer || true
+        return 1
+    fi
+}
+
+_run_mutating_action() {
+    local action="${1}"
+    local rc=0
+
+    _claim_networking_writer || return 1
+    case "${action}" in
+    start) start_addrsync || rc=$? ;;
+    stop) stop_addrsync || rc=$? ;;
+    resync) resync_addrsync || rc=$? ;;
+    cleanup) cleanup_addrsync || rc=$? ;;
+    *) rc=2 ;;
+    esac
+    _release_networking_writer || rc=1
+    trap - EXIT INT TERM
+    return "${rc}"
+}
+
 main() {
     local action="${1:-}"
 
     case "${action}" in
-    start)
-        start_addrsync
-        ;;
-    stop)
-        stop_addrsync
-        ;;
-    resync)
-        resync_addrsync
+    start | stop | resync | cleanup)
+        # The shared child identity covers this mutating controller command.
+        # The intentionally long-lived standalone daemon remains outside this
+        # phase lifetime until its separate cutover backlog item is completed.
+        _run_mutating_action "${action}"
         ;;
     status)
         status_addrsync
-        ;;
-    cleanup)
-        cleanup_addrsync
         ;;
     *)
         echo "Usage: $0 {start|stop|resync|status|cleanup}"

@@ -675,6 +675,7 @@ impl<'a> LegacyRulesRenderRequest<'a> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LegacyRulesRenderError {
     FamilyDisabled,
+    UnsupportedAction(XtablesRestoreAction),
     InvalidRenderedArtifact(XtablesRestoreParseError),
 }
 
@@ -682,7 +683,7 @@ impl LegacyRulesRenderError {
     #[must_use]
     pub const fn parse_error(&self) -> Option<&XtablesRestoreParseError> {
         match self {
-            Self::FamilyDisabled => None,
+            Self::FamilyDisabled | Self::UnsupportedAction(_) => None,
             Self::InvalidRenderedArtifact(source) => Some(source),
         }
     }
@@ -692,6 +693,12 @@ impl fmt::Display for LegacyRulesRenderError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::FamilyDisabled => formatter.write_str("legacy IPv6 restore family is disabled"),
+            Self::UnsupportedAction(action) => {
+                write!(
+                    formatter,
+                    "legacy rules renderer does not support {action:?}"
+                )
+            }
             Self::InvalidRenderedArtifact(source) => write!(
                 formatter,
                 "rendered legacy xtables source shape was not canonical: {source}"
@@ -703,7 +710,7 @@ impl fmt::Display for LegacyRulesRenderError {
 impl Error for LegacyRulesRenderError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::FamilyDisabled => None,
+            Self::FamilyDisabled | Self::UnsupportedAction(_) => None,
             Self::InvalidRenderedArtifact(source) => Some(source),
         }
     }
@@ -719,6 +726,11 @@ pub fn render_legacy_rules_restore(
 ) -> Result<XtablesRestoreArtifact, LegacyRulesRenderError> {
     if request.context.family() == XtablesRestoreFamily::Ipv6 && !request.plan.ipv6_enabled {
         return Err(LegacyRulesRenderError::FamilyDisabled);
+    }
+    if request.context.action() == XtablesRestoreAction::Replace {
+        return Err(LegacyRulesRenderError::UnsupportedAction(
+            XtablesRestoreAction::Replace,
+        ));
     }
     let mut output = String::new();
     render_plan(request.context, request.plan, &mut output);
@@ -912,6 +924,7 @@ const fn action_tag(action: XtablesRestoreAction) -> u8 {
     match action {
         XtablesRestoreAction::Apply => 1,
         XtablesRestoreAction::Cleanup => 2,
+        XtablesRestoreAction::Replace => 3,
     }
 }
 
@@ -1008,6 +1021,9 @@ fn render_mangle(action: XtablesRestoreAction, family: FamilyProfile<'_>, output
     output.push_str("*mangle\n");
     match action {
         XtablesRestoreAction::Apply => render_apply_mangle(family, output),
+        XtablesRestoreAction::Replace => {
+            unreachable!("legacy rules renderer rejects replace action before rendering")
+        }
         XtablesRestoreAction::Cleanup => render_cleanup_mangle(family, output),
     }
     output.push_str("COMMIT\n");
@@ -1393,9 +1409,12 @@ fn render_mss_clamp(action: XtablesRestoreAction, output: &mut String) {
     output.push_str("COMMIT\n");
 }
 
-const fn action_token(action: XtablesRestoreAction) -> &'static str {
+fn action_token(action: XtablesRestoreAction) -> &'static str {
     match action {
         XtablesRestoreAction::Apply => "-A",
+        XtablesRestoreAction::Replace => {
+            unreachable!("legacy rules renderer rejects replace action before rendering")
+        }
         XtablesRestoreAction::Cleanup => "-D",
     }
 }

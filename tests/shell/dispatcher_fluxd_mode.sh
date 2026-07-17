@@ -40,6 +40,133 @@ manifest_value() {
     sed -n "s/^${name}=//p" "${manifest}"
 }
 
+process_start_ticks_for_test() {
+    sh -c '. /src/scripts/lib; process_start_ticks "$1"' sh "${1}"
+}
+
+write_shell_xtables_writer_owner() {
+    local parent_pid="${1}"
+    local parent_start_ticks="${2}"
+    local child_pid="${3}"
+    local child_start_ticks="${4}"
+    local boot_id="${5}"
+
+    mkdir -p "${RUN_ROOT}/xtables-writer.lock"
+    printf 'flux-shell-xtables-writer-owner-v2 %s %s %s %s %s\n' \
+        "${parent_pid}" "${parent_start_ticks}" \
+        "${child_pid}" "${child_start_ticks}" "${boot_id}" \
+        >"${RUN_ROOT}/xtables-writer.lock/shell-owner"
+}
+
+assert_shell_xtables_writer_parent_only() {
+    local parent_pid="${1}"
+    local parent_start_ticks="${2}"
+    local boot_id="${3}"
+
+    grep -qx \
+        "flux-shell-xtables-writer-owner-v2 ${parent_pid} ${parent_start_ticks} 0 0 ${boot_id}" \
+        "${RUN_ROOT}/xtables-writer.lock/shell-owner" ||
+        fail "shell writer record did not retain only its live parent"
+}
+
+wait_for_test_file() {
+    local path="${1}"
+    local label="${2}"
+    local attempts=0
+
+    while [ ! -e "${path}" ] && [ "${attempts}" -lt 500 ]; do
+        sleep 0.01
+        attempts=$((attempts + 1))
+    done
+    [ -e "${path}" ] || fail "timed out waiting for ${label}"
+}
+
+wait_for_test_pid_dead() {
+    local pid="${1}"
+    local label="${2}"
+    local attempts=0
+
+    while [ -e "/proc/${pid}" ] && [ "${attempts}" -lt 500 ]; do
+        sleep 0.01
+        attempts=$((attempts + 1))
+    done
+    [ ! -e "/proc/${pid}" ] || fail "timed out waiting for ${label} to exit"
+}
+
+start_shell_xtables_writer_pair() {
+    cat >"${RUN_ROOT}/writer-child.sh" <<'EOF'
+#!/usr/bin/sh
+set -eu
+. /src/scripts/lib
+
+inherit_shell_xtables_writer_lock || {
+    : >/data/adb/flux/run/writer-child-inherit-failed
+    exit 81
+}
+printf '%s\n' "$$" >/data/adb/flux/run/writer-child-pid
+: >/data/adb/flux/run/writer-child-ready
+while [ ! -e /data/adb/flux/run/writer-child-release ]; do
+    sleep 0.01
+done
+release_shell_xtables_writer_lock || exit 82
+: >/data/adb/flux/run/writer-child-released
+EOF
+    cat >"${RUN_ROOT}/writer-parent.sh" <<'EOF'
+#!/usr/bin/sh
+set -eu
+. /src/scripts/lib
+
+claim_shell_xtables_writer_lock || exit 83
+printf '%s\n' "$$" >/data/adb/flux/run/writer-parent-pid
+: >/data/adb/flux/run/writer-parent-ready
+FLUX_XTABLES_WRITER_OWNER_PID="${XTABLES_WRITER_OWNER_PID}" \
+    FLUX_XTABLES_WRITER_OWNER_START_TICKS="${XTABLES_WRITER_OWNER_START_TICKS}" \
+    FLUX_XTABLES_WRITER_OWNER_BOOT_ID="${XTABLES_WRITER_OWNER_BOOT_ID}" \
+    sh /data/adb/flux/run/writer-child.sh &
+child_pid=$!
+wait "${child_pid}" || true
+: >/data/adb/flux/run/writer-child-finished
+while [ ! -e /data/adb/flux/run/writer-parent-release ]; do
+    sleep 0.01
+done
+release_shell_xtables_writer_lock || exit 84
+: >/data/adb/flux/run/writer-parent-released
+EOF
+    chmod 0755 "${RUN_ROOT}/writer-child.sh" "${RUN_ROOT}/writer-parent.sh"
+
+    sh "${RUN_ROOT}/writer-parent.sh" &
+    WRITER_PARENT_PID=$!
+    wait_for_test_file "${RUN_ROOT}/writer-parent-ready" "writer parent claim"
+    wait_for_test_file "${RUN_ROOT}/writer-child-ready" "writer child inheritance"
+    WRITER_CHILD_PID=$(cat "${RUN_ROOT}/writer-child-pid")
+    [ "$(cat "${RUN_ROOT}/writer-parent-pid")" = "${WRITER_PARENT_PID}" ] ||
+        fail "writer parent pid evidence did not match the launched process"
+}
+
+assert_direct_tproxy_writer_blocked() {
+    local output="${1}"
+    local label="${2}"
+
+    if sh /src/scripts/tproxy invalid >"${output}" 2>&1; then
+        fail "${label} unexpectedly crossed the shell writer lock"
+    fi
+    grep -q 'Another xtables ownership transition is in progress' "${output}" ||
+        fail "${label} was not classified as a live shell writer"
+}
+
+assert_direct_tproxy_writer_recovered() {
+    local output="${1}"
+    local label="${2}"
+
+    if sh /src/scripts/tproxy invalid >"${output}" 2>&1; then
+        fail "invalid tproxy action unexpectedly succeeded after ${label}"
+    fi
+    grep -q '^Usage:' "${output}" ||
+        fail "direct tproxy did not recover ${label}"
+    [ ! -e "${RUN_ROOT}/xtables-writer.lock" ] ||
+        fail "direct tproxy retained the recovered ${label}"
+}
+
 prepare_generation() {
     run_bridge prepare || fail "prepare verb failed"
     manifest_value generation
@@ -114,11 +241,28 @@ exit 0'
 printf "core:%s\n" "$*" >>/data/adb/flux/run/test-calls
 exit 0'
     write_stub addrsync '
+. /data/adb/flux/scripts/lib
+if [ -n "${FLUX_XTABLES_WRITER_OWNER_PID:-}" ] ||
+    [ -n "${FLUX_XTABLES_WRITER_OWNER_START_TICKS:-}" ] ||
+    [ -n "${FLUX_XTABLES_WRITER_OWNER_BOOT_ID:-}" ]; then
+    inherit_shell_xtables_writer_lock || exit 90
+    trap '\''release_shell_xtables_writer_lock'\'' EXIT
+    trap '\''exit 130'\'' INT
+    trap '\''exit 143'\'' TERM
+fi
 printf "addrsync:%s\n" "$*" >>/data/adb/flux/run/test-calls
 printf "addrsync:%s:generation=%s:port=%s\n" "$*" "${FLUX_GENERATION_ID:-none}" "${PROXY_PORT:-none}" >>/data/adb/flux/run/test-env-calls
 exit 0'
     write_stub tproxy '
 . /data/adb/flux/scripts/lib
+if [ -n "${FLUX_XTABLES_WRITER_OWNER_PID:-}" ] ||
+    [ -n "${FLUX_XTABLES_WRITER_OWNER_START_TICKS:-}" ] ||
+    [ -n "${FLUX_XTABLES_WRITER_OWNER_BOOT_ID:-}" ]; then
+    inherit_shell_xtables_writer_lock || exit 90
+    trap '\''release_shell_xtables_writer_lock'\'' EXIT
+    trap '\''exit 130'\'' INT
+    trap '\''exit 143'\'' TERM
+fi
 printf "tproxy:%s\n" "$*" >>/data/adb/flux/run/test-calls
 printf "tproxy:%s:generation=%s:port=%s:cache=%s\n" "$*" "${FLUX_GENERATION_ID:-none}" "${PROXY_PORT:-none}" "${CACHE_RULES_V4_FILE:-none}" >>/data/adb/flux/run/test-env-calls
 [ "${1:-}" != start ] || [ ! -f /data/adb/flux/run/fail-tproxy-start ] || exit 42
@@ -1040,6 +1184,721 @@ EOF
     assert_not_called core
 }
 
+test_native_xtables_lease_blocks_dispatcher_shell_writers() {
+    reset_fixture
+    generation=$(prepare_generation)
+    printf 'stale-or-live-native-owner\n' >"${RUN_ROOT}/native_xtables.lease"
+    : >"${CALLS_FILE}"
+
+    if run_bridge capture-start "${generation}"; then
+        fail "capture-start ran while the native xtables lease existed"
+    fi
+
+    assert_not_called tproxy
+    assert_not_called addrsync
+    [ ! -e "${RUN_ROOT}/capture.active" ] ||
+        fail "rejected shell capture-start published capture ownership"
+}
+
+test_native_xtables_lease_blocks_legacy_start_before_network_mutation() {
+    reset_fixture
+    printf 'stale-or-live-native-owner\n' >"${RUN_ROOT}/native_xtables.lease"
+    : >"${CALLS_FILE}"
+
+    if run_bridge start; then
+        fail "legacy start ran while the native xtables lease existed"
+    fi
+
+    assert_not_called tproxy
+    assert_not_called addrsync
+    assert_not_called core
+}
+
+test_native_xtables_lease_blocks_ambient_internal_writer_state() {
+    reset_fixture
+    owner_start=$(process_start_ticks_for_test "$$")
+    owner_boot=$(cat /proc/sys/kernel/random/boot_id)
+    printf 'stale-or-live-native-owner\n' >"${RUN_ROOT}/native_xtables.lease"
+    : >"${CALLS_FILE}"
+
+    if XTABLES_WRITER_LOCK_OWNED=1 \
+        XTABLES_WRITER_OWNER_PID="$$" \
+        XTABLES_WRITER_OWNER_START_TICKS="${owner_start}" \
+        XTABLES_WRITER_OWNER_BOOT_ID="${owner_boot}" \
+        XTABLES_WRITER_PARENT_PID="$$" \
+        XTABLES_WRITER_PARENT_START_TICKS="${owner_start}" \
+        XTABLES_WRITER_PARENT_BOOT_ID="${owner_boot}" \
+        XTABLES_WRITER_CHILD_PID=2147483647 \
+        XTABLES_WRITER_CHILD_START_TICKS=1 \
+        FLUXD_BRIDGE=1 sh "${DISPATCHER}" start; then
+        fail "ambient internal writer state bypassed the native lease"
+    fi
+
+    assert_not_called tproxy
+    assert_not_called addrsync
+    assert_not_called core
+}
+
+test_native_xtables_lease_blocks_legacy_stop_before_network_mutation() {
+    reset_fixture
+    run_bridge start || fail "legacy start before lease-blocked stop failed"
+    printf 'stale-or-live-native-owner\n' >"${RUN_ROOT}/native_xtables.lease"
+    : >"${CALLS_FILE}"
+
+    if run_bridge stop; then
+        fail "legacy stop ran while the native xtables lease existed"
+    fi
+
+    assert_not_called tproxy
+    assert_not_called addrsync
+    assert_not_called core
+}
+
+test_native_xtables_lease_blocks_legacy_restart_before_network_mutation() {
+    reset_fixture
+    run_bridge start || fail "legacy start before lease-blocked restart failed"
+    printf 'stale-or-live-native-owner\n' >"${RUN_ROOT}/native_xtables.lease"
+    : >"${CALLS_FILE}"
+
+    if run_bridge restart; then
+        fail "legacy restart ran while the native xtables lease existed"
+    fi
+
+    assert_not_called tproxy
+    assert_not_called addrsync
+    assert_not_called core
+}
+
+test_native_xtables_lease_blocks_legacy_failure_cleanup_mutation() {
+    reset_fixture
+    printf 'stale-or-live-native-owner\n' >"${RUN_ROOT}/native_xtables.lease"
+    : >"${RUN_ROOT}/fail-init"
+    : >"${CALLS_FILE}"
+
+    if run_bridge start; then
+        fail "legacy start unexpectedly survived its failed initialization"
+    fi
+
+    assert_not_called tproxy
+    assert_not_called addrsync
+    assert_not_called core
+}
+
+test_native_xtables_lease_blocks_direct_tproxy_mutation() {
+    reset_fixture
+    printf 'stale-or-live-native-owner\n' >"${RUN_ROOT}/native_xtables.lease"
+
+    if sh /src/scripts/tproxy start; then
+        fail "direct tproxy start ran while the native xtables lease existed"
+    fi
+    if sh /src/scripts/tproxy stop; then
+        fail "direct tproxy stop ran while the native xtables lease existed"
+    fi
+
+    [ ! -e "${RUN_ROOT}/xtables-writer.lock" ] ||
+        fail "rejected direct tproxy retained the transition lock"
+}
+
+test_native_xtables_lease_blocks_direct_addrsync_mutation_but_not_status() {
+    reset_fixture
+    cat >"${FLUX_ROOT}/bin/addrsyncd" <<'EOF'
+#!/usr/bin/sh
+action="${5:-}"
+printf '%s\n' "${action}" >>/data/adb/flux/run/addrsyncd-actions
+case "${action}" in
+status) printf 'running pid=4242\n' ;;
+*) exit 0 ;;
+esac
+EOF
+    chmod 0755 "${FLUX_ROOT}/bin/addrsyncd"
+    printf 'stale-or-live-native-owner\n' >"${RUN_ROOT}/native_xtables.lease"
+
+    for action in start stop resync cleanup; do
+        if sh /src/scripts/addrsync "${action}"; then
+            fail "direct addrsync ${action} ran while the native xtables lease existed"
+        fi
+        [ ! -e "${RUN_ROOT}/addrsyncd-actions" ] ||
+            fail "lease-blocked addrsync ${action} invoked addrsyncd"
+        [ ! -e "${RUN_ROOT}/xtables-writer.lock" ] ||
+            fail "lease-blocked addrsync ${action} retained the transition lock"
+    done
+
+    sh /src/scripts/addrsync status >"${RUN_ROOT}/addrsync-status" ||
+        fail "read-only addrsync status was blocked by the native lease"
+    grep -qx 'running pid=4242' "${RUN_ROOT}/addrsync-status" ||
+        fail "read-only addrsync status did not report the daemon result"
+    printf 'status\n' >"${RUN_ROOT}/expected-addrsyncd-actions"
+    assert_file_equals \
+        "${RUN_ROOT}/expected-addrsyncd-actions" \
+        "${RUN_ROOT}/addrsyncd-actions"
+    [ -f "${RUN_ROOT}/native_xtables.lease" ] ||
+        fail "rejected direct addrsync mutation removed the native lease"
+    [ ! -e "${RUN_ROOT}/xtables-writer.lock" ] ||
+        fail "read-only addrsync status created a writer lock"
+}
+
+test_xtables_transition_lock_blocks_shell_writers() {
+    reset_fixture
+    generation=$(prepare_generation)
+    mkdir "${RUN_ROOT}/xtables-writer.lock"
+    : >"${CALLS_FILE}"
+
+    if run_bridge capture-start "${generation}"; then
+        fail "capture-start ran while the xtables transition lock was held"
+    fi
+    if sh /src/scripts/tproxy start; then
+        fail "direct tproxy ran while the xtables transition lock was held"
+    fi
+
+    assert_not_called tproxy
+    assert_not_called addrsync
+    [ -d "${RUN_ROOT}/xtables-writer.lock" ] ||
+        fail "rejected shell writers removed a transition lock they did not own"
+}
+
+test_spoofed_inherited_xtables_writer_metadata_is_rejected() {
+    reset_fixture
+    sleep 30 &
+    owner_pid=$!
+    owner_start=$(process_start_ticks_for_test "${owner_pid}")
+    owner_boot=$(cat /proc/sys/kernel/random/boot_id)
+    write_shell_xtables_writer_owner \
+        "${owner_pid}" "${owner_start}" 0 0 "${owner_boot}"
+
+    if FLUX_XTABLES_WRITER_OWNER_PID="${owner_pid}" \
+        FLUX_XTABLES_WRITER_OWNER_START_TICKS="${owner_start}" \
+        FLUX_XTABLES_WRITER_OWNER_BOOT_ID="${owner_boot}" \
+        sh /src/scripts/tproxy invalid >"${RUN_ROOT}/spoof-error" 2>&1; then
+        kill "${owner_pid}" 2>/dev/null || true
+        wait "${owner_pid}" 2>/dev/null || true
+        fail "spoofed inherited writer metadata reached tproxy"
+    fi
+    kill "${owner_pid}" 2>/dev/null || true
+    wait "${owner_pid}" 2>/dev/null || true
+
+    grep -q 'Inherited xtables writer ownership is invalid' "${RUN_ROOT}/spoof-error" ||
+        fail "spoofed inherited writer metadata was not rejected at the ownership boundary"
+    [ -f "${RUN_ROOT}/xtables-writer.lock/shell-owner" ] ||
+        fail "spoofed child removed the live owner record"
+}
+
+test_valid_parent_bound_xtables_writer_metadata_reaches_tproxy() {
+    reset_fixture
+    owner_start=$(process_start_ticks_for_test "$$")
+    owner_boot=$(cat /proc/sys/kernel/random/boot_id)
+    write_shell_xtables_writer_owner "$$" "${owner_start}" 0 0 "${owner_boot}"
+
+    if FLUX_XTABLES_WRITER_OWNER_PID="$$" \
+        FLUX_XTABLES_WRITER_OWNER_START_TICKS="${owner_start}" \
+        FLUX_XTABLES_WRITER_OWNER_BOOT_ID="${owner_boot}" \
+        sh /src/scripts/tproxy invalid >"${RUN_ROOT}/valid-owner-output" 2>&1; then
+        fail "invalid tproxy action unexpectedly succeeded"
+    fi
+
+    grep -q '^Usage:' "${RUN_ROOT}/valid-owner-output" ||
+        fail "valid parent-bound writer metadata did not reach the tproxy action boundary"
+    assert_shell_xtables_writer_parent_only "$$" "${owner_start}" "${owner_boot}"
+}
+
+test_dead_stale_child_for_same_live_parent_can_be_replaced() {
+    reset_fixture
+    owner_start=$(process_start_ticks_for_test "$$")
+    owner_boot=$(cat /proc/sys/kernel/random/boot_id)
+    write_shell_xtables_writer_owner \
+        "$$" "${owner_start}" 2147483647 1 "${owner_boot}"
+
+    if FLUX_XTABLES_WRITER_OWNER_PID="$$" \
+        FLUX_XTABLES_WRITER_OWNER_START_TICKS="${owner_start}" \
+        FLUX_XTABLES_WRITER_OWNER_BOOT_ID="${owner_boot}" \
+        sh /src/scripts/tproxy invalid >"${RUN_ROOT}/stale-child-output" 2>&1; then
+        fail "invalid tproxy action unexpectedly succeeded"
+    fi
+    grep -q '^Usage:' "${RUN_ROOT}/stale-child-output" ||
+        fail "same-parent tproxy did not replace a dead stale child"
+    assert_shell_xtables_writer_parent_only "$$" "${owner_start}" "${owner_boot}"
+}
+
+test_live_child_record_cannot_be_replaced() {
+    reset_fixture
+    sleep 30 &
+    child_pid=$!
+    owner_start=$(process_start_ticks_for_test "$$")
+    child_start=$(process_start_ticks_for_test "${child_pid}")
+    owner_boot=$(cat /proc/sys/kernel/random/boot_id)
+    write_shell_xtables_writer_owner \
+        "$$" "${owner_start}" "${child_pid}" "${child_start}" "${owner_boot}"
+
+    if FLUX_XTABLES_WRITER_OWNER_PID="$$" \
+        FLUX_XTABLES_WRITER_OWNER_START_TICKS="${owner_start}" \
+        FLUX_XTABLES_WRITER_OWNER_BOOT_ID="${owner_boot}" \
+        sh /src/scripts/tproxy invalid >"${RUN_ROOT}/live-child-output" 2>&1; then
+        kill "${child_pid}" 2>/dev/null || true
+        wait "${child_pid}" 2>/dev/null || true
+        fail "live child writer record was replaced"
+    fi
+    kill "${child_pid}" 2>/dev/null || true
+    wait "${child_pid}" 2>/dev/null || true
+
+    grep -q 'Inherited xtables writer ownership is invalid' \
+        "${RUN_ROOT}/live-child-output" ||
+        fail "live child writer record was not rejected at inheritance"
+    grep -qx \
+        "flux-shell-xtables-writer-owner-v2 $$ ${owner_start} ${child_pid} ${child_start} ${owner_boot}" \
+        "${RUN_ROOT}/xtables-writer.lock/shell-owner" ||
+        fail "rejected child replacement changed the live owner record"
+}
+
+test_nonparticipant_cannot_forge_parent_release_state() {
+    reset_fixture
+    sleep 30 &
+    owner_pid=$!
+    owner_start=$(process_start_ticks_for_test "${owner_pid}")
+    owner_boot=$(cat /proc/sys/kernel/random/boot_id)
+    write_shell_xtables_writer_owner \
+        "${owner_pid}" "${owner_start}" 0 0 "${owner_boot}"
+    cp "${RUN_ROOT}/xtables-writer.lock/shell-owner" \
+        "${RUN_ROOT}/forged-parent-release-before"
+
+    if sh -c '
+. /src/scripts/lib
+XTABLES_WRITER_LOCK_OWNED=1
+XTABLES_WRITER_OWNER_PID="$1"
+XTABLES_WRITER_OWNER_START_TICKS="$2"
+XTABLES_WRITER_OWNER_BOOT_ID="$3"
+XTABLES_WRITER_PARENT_PID="$1"
+XTABLES_WRITER_PARENT_START_TICKS="$2"
+XTABLES_WRITER_PARENT_BOOT_ID="$3"
+release_shell_xtables_writer_lock
+' sh "${owner_pid}" "${owner_start}" "${owner_boot}"; then
+        kill "${owner_pid}" 2>/dev/null || true
+        wait "${owner_pid}" 2>/dev/null || true
+        fail "nonparticipant forged a parent writer release"
+    fi
+
+    assert_file_equals \
+        "${RUN_ROOT}/forged-parent-release-before" \
+        "${RUN_ROOT}/xtables-writer.lock/shell-owner"
+    kill "${owner_pid}" 2>/dev/null || true
+    wait "${owner_pid}" 2>/dev/null || true
+}
+
+test_nonparticipant_cannot_forge_child_release_state() {
+    reset_fixture
+    sleep 30 &
+    owner_pid=$!
+    sleep 30 &
+    child_pid=$!
+    owner_start=$(process_start_ticks_for_test "${owner_pid}")
+    child_start=$(process_start_ticks_for_test "${child_pid}")
+    owner_boot=$(cat /proc/sys/kernel/random/boot_id)
+    write_shell_xtables_writer_owner \
+        "${owner_pid}" "${owner_start}" \
+        "${child_pid}" "${child_start}" "${owner_boot}"
+    cp "${RUN_ROOT}/xtables-writer.lock/shell-owner" \
+        "${RUN_ROOT}/forged-child-release-before"
+
+    if sh -c '
+. /src/scripts/lib
+XTABLES_WRITER_LOCK_OWNED=2
+XTABLES_WRITER_OWNER_PID="$1"
+XTABLES_WRITER_OWNER_START_TICKS="$2"
+XTABLES_WRITER_OWNER_BOOT_ID="$5"
+XTABLES_WRITER_PARENT_PID="$1"
+XTABLES_WRITER_PARENT_START_TICKS="$2"
+XTABLES_WRITER_PARENT_BOOT_ID="$5"
+XTABLES_WRITER_CHILD_PID="$3"
+XTABLES_WRITER_CHILD_START_TICKS="$4"
+release_shell_xtables_writer_lock
+' sh "${owner_pid}" "${owner_start}" "${child_pid}" "${child_start}" "${owner_boot}"; then
+        kill "${owner_pid}" "${child_pid}" 2>/dev/null || true
+        wait "${owner_pid}" 2>/dev/null || true
+        wait "${child_pid}" 2>/dev/null || true
+        fail "nonparticipant forged a child writer release"
+    fi
+
+    assert_file_equals \
+        "${RUN_ROOT}/forged-child-release-before" \
+        "${RUN_ROOT}/xtables-writer.lock/shell-owner"
+    kill "${owner_pid}" "${child_pid}" 2>/dev/null || true
+    wait "${owner_pid}" 2>/dev/null || true
+    wait "${child_pid}" 2>/dev/null || true
+}
+
+test_sigkilled_child_keeps_live_parent_busy_until_parent_release() {
+    reset_fixture
+    start_shell_xtables_writer_pair
+
+    kill -9 "${WRITER_CHILD_PID}" 2>/dev/null || true
+    wait_for_test_file "${RUN_ROOT}/writer-child-finished" "parent child reap"
+    assert_direct_tproxy_writer_blocked \
+        "${RUN_ROOT}/killed-child-competitor" "live parent after child SIGKILL"
+
+    : >"${RUN_ROOT}/writer-parent-release"
+    wait "${WRITER_PARENT_PID}" || fail "live parent could not reclaim its dead child"
+    wait_for_test_file "${RUN_ROOT}/writer-parent-released" "parent writer release"
+    assert_direct_tproxy_writer_recovered \
+        "${RUN_ROOT}/parent-release-competitor" "the parent-released writer lock"
+}
+
+test_sigkilled_parent_keeps_live_child_busy_until_child_release() {
+    reset_fixture
+    start_shell_xtables_writer_pair
+
+    kill -9 "${WRITER_PARENT_PID}" 2>/dev/null || true
+    wait "${WRITER_PARENT_PID}" 2>/dev/null || true
+    assert_direct_tproxy_writer_blocked \
+        "${RUN_ROOT}/killed-parent-competitor" "live child after parent SIGKILL"
+
+    : >"${RUN_ROOT}/writer-child-release"
+    wait_for_test_file "${RUN_ROOT}/writer-child-released" "orphaned child release"
+    assert_direct_tproxy_writer_recovered \
+        "${RUN_ROOT}/child-release-competitor" "the orphaned child-released writer lock"
+}
+
+test_sigkilled_dispatcher_keeps_live_addrsync_phase_fenced() {
+    reset_fixture
+    generation=$(prepare_generation)
+    run_bridge capture-start "${generation}" ||
+        fail "capture-start before addrsync phase crash test failed"
+    run_bridge capture-verify "${generation}" ||
+        fail "capture-verify before addrsync phase crash test failed"
+    run_bridge state-running "${generation}" ||
+        fail "state-running before addrsync phase crash test failed"
+    write_stub addrsync '
+. /data/adb/flux/scripts/lib
+inherited=0
+if [ -n "${FLUX_XTABLES_WRITER_OWNER_PID:-}" ] ||
+    [ -n "${FLUX_XTABLES_WRITER_OWNER_START_TICKS:-}" ] ||
+    [ -n "${FLUX_XTABLES_WRITER_OWNER_BOOT_ID:-}" ]; then
+    inherit_shell_xtables_writer_lock || exit 90
+    inherited=1
+    trap '\''release_shell_xtables_writer_lock'\'' EXIT
+    trap '\''exit 130'\'' INT
+    trap '\''exit 143'\'' TERM
+fi
+printf "%s\n" "$$" >/data/adb/flux/run/addrsync-phase-pid
+: >/data/adb/flux/run/addrsync-phase-ready
+while [ ! -e /data/adb/flux/run/addrsync-phase-release ]; do
+    sleep 0.01
+done
+if [ "${inherited}" -eq 1 ]; then
+    release_shell_xtables_writer_lock || exit 91
+    trap - EXIT INT TERM
+fi
+: >/data/adb/flux/run/addrsync-phase-released
+exit 0'
+
+    FLUXD_BRIDGE=1 sh "${DISPATCHER}" address-resync &
+    dispatcher_pid=$!
+    wait_for_test_file "${RUN_ROOT}/addrsync-phase-ready" "live addrsync phase child"
+    kill -9 "${dispatcher_pid}" 2>/dev/null || true
+    wait "${dispatcher_pid}" 2>/dev/null || true
+
+    assert_direct_tproxy_writer_blocked \
+        "${RUN_ROOT}/live-addrsync-phase-competitor" \
+        "live addrsync phase after dispatcher SIGKILL"
+
+    : >"${RUN_ROOT}/addrsync-phase-release"
+    wait_for_test_file "${RUN_ROOT}/addrsync-phase-released" "addrsync phase release"
+    assert_direct_tproxy_writer_recovered \
+        "${RUN_ROOT}/released-addrsync-phase-competitor" \
+        "the released addrsync phase writer lock"
+}
+
+test_both_dead_shell_xtables_writer_participants_are_recovered() {
+    reset_fixture
+    start_shell_xtables_writer_pair
+
+    kill -9 "${WRITER_PARENT_PID}" 2>/dev/null || true
+    kill -9 "${WRITER_CHILD_PID}" 2>/dev/null || true
+    wait "${WRITER_PARENT_PID}" 2>/dev/null || true
+    wait_for_test_pid_dead "${WRITER_CHILD_PID}" "killed writer child"
+    assert_direct_tproxy_writer_recovered \
+        "${RUN_ROOT}/both-dead-competitor" "both dead writer participants"
+}
+
+test_dead_shell_xtables_writer_lock_is_recovered_before_direct_claim() {
+    reset_fixture
+    owner_boot=$(cat /proc/sys/kernel/random/boot_id)
+    write_shell_xtables_writer_owner \
+        2147483646 1 2147483647 1 "${owner_boot}"
+
+    if sh /src/scripts/tproxy invalid >"${RUN_ROOT}/dead-owner-error" 2>&1; then
+        fail "invalid tproxy action unexpectedly succeeded"
+    fi
+
+    grep -q '^Usage:' "${RUN_ROOT}/dead-owner-error" ||
+        fail "direct tproxy did not progress past stale-lock recovery"
+    [ ! -e "${RUN_ROOT}/xtables-writer.lock" ] ||
+        fail "direct tproxy retained a dead shell writer lock"
+}
+
+test_pid_reused_shell_xtables_writer_participants_are_recovered() {
+    reset_fixture
+    sleep 30 &
+    child_pid=$!
+    owner_boot=$(cat /proc/sys/kernel/random/boot_id)
+    write_shell_xtables_writer_owner "$$" 1 "${child_pid}" 1 "${owner_boot}"
+
+    assert_direct_tproxy_writer_recovered \
+        "${RUN_ROOT}/pid-reused-error" "PID-reused writer participants"
+    kill "${child_pid}" 2>/dev/null || true
+    wait "${child_pid}" 2>/dev/null || true
+}
+
+test_previous_boot_shell_xtables_writer_lock_is_recovered() {
+    reset_fixture
+    sleep 30 &
+    child_pid=$!
+    write_shell_xtables_writer_owner \
+        "$$" "$(process_start_ticks_for_test "$$")" \
+        "${child_pid}" "$(process_start_ticks_for_test "${child_pid}")" \
+        aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa
+
+    if sh /src/scripts/tproxy invalid >"${RUN_ROOT}/previous-boot-error" 2>&1; then
+        fail "invalid tproxy action unexpectedly succeeded"
+    fi
+
+    grep -q '^Usage:' "${RUN_ROOT}/previous-boot-error" ||
+        fail "direct tproxy did not recover the previous-boot shell lock"
+    [ ! -e "${RUN_ROOT}/xtables-writer.lock" ] ||
+        fail "previous-boot shell writer lock was not retired"
+    kill "${child_pid}" 2>/dev/null || true
+    wait "${child_pid}" 2>/dev/null || true
+}
+
+test_malformed_shell_xtables_writer_record_fails_closed() {
+    reset_fixture
+    mkdir "${RUN_ROOT}/xtables-writer.lock"
+    printf '%s\n' '123 456 invalid-v1-record' \
+        >"${RUN_ROOT}/xtables-writer.lock/shell-owner"
+
+    assert_direct_tproxy_writer_blocked \
+        "${RUN_ROOT}/malformed-owner-error" "malformed shell writer record"
+    grep -qx '123 456 invalid-v1-record' \
+        "${RUN_ROOT}/xtables-writer.lock/shell-owner" ||
+        fail "failed-closed malformed record was modified"
+}
+
+test_unverifiable_live_participant_state_fails_closed() {
+    reset_fixture
+    sleep 30 &
+    child_pid=$!
+    child_start=$(process_start_ticks_for_test "${child_pid}")
+    owner_boot=$(cat /proc/sys/kernel/random/boot_id)
+    write_shell_xtables_writer_owner \
+        2147483646 1 "${child_pid}" "${child_start}" "${owner_boot}"
+
+    if sh -c '
+. /src/scripts/lib
+process_start_ticks() { return 1; }
+claim_shell_xtables_writer_lock
+'; then
+        kill "${child_pid}" 2>/dev/null || true
+        wait "${child_pid}" 2>/dev/null || true
+        fail "unverifiable live participant was guessed stale"
+    fi
+
+    grep -qx \
+        "flux-shell-xtables-writer-owner-v2 2147483646 1 ${child_pid} ${child_start} ${owner_boot}" \
+        "${RUN_ROOT}/xtables-writer.lock/shell-owner" ||
+        fail "unverifiable participant record was modified"
+    kill "${child_pid}" 2>/dev/null || true
+    wait "${child_pid}" 2>/dev/null || true
+}
+
+test_native_xtables_writer_marker_always_blocks_shell_recovery() {
+    reset_fixture
+    write_shell_xtables_writer_owner 2147483646 1 2147483647 1 \
+        "$(cat /proc/sys/kernel/random/boot_id)"
+    printf 'native marker\n' >"${RUN_ROOT}/xtables-writer.lock/native-owner"
+
+    if sh /src/scripts/tproxy invalid; then
+        fail "shell writer crossed a native writer marker"
+    fi
+
+    [ -f "${RUN_ROOT}/xtables-writer.lock/native-owner" ] ||
+        fail "shell recovery removed the native writer marker"
+    [ -f "${RUN_ROOT}/xtables-writer.lock/shell-owner" ] ||
+        fail "shell recovery modified a mixed-owner lock"
+}
+
+test_terminated_addrsync_exits_before_readiness_recheck() {
+    reset_fixture
+    cat >"${FLUX_ROOT}/bin/addrsyncd" <<'EOF'
+#!/usr/bin/sh
+action="${5:-}"
+case "${action}" in
+status)
+    if [ -e /data/adb/flux/run/addrsync-initial-status ]; then
+        : >/data/adb/flux/run/addrsync-post-signal-status
+        printf 'running pid=4242\n'
+    else
+        : >/data/adb/flux/run/addrsync-initial-status
+        printf 'stopped\n'
+    fi
+    ;;
+run)
+    : >/data/adb/flux/run/addrsync-signal-command-started
+    while [ ! -e /data/adb/flux/run/addrsync-signal-command-release ]; do
+        sleep 0.01
+    done
+    ;;
+*) exit 0 ;;
+esac
+EOF
+    chmod 0755 "${FLUX_ROOT}/bin/addrsyncd"
+    cat >"${RUN_ROOT}/addrsync-signal-runner.sh" <<'EOF'
+#!/usr/bin/sh
+printf '%s\n' "$$" >/data/adb/flux/run/addrsync-signal-pid
+exec sh /src/scripts/addrsync start
+EOF
+    chmod 0755 "${RUN_ROOT}/addrsync-signal-runner.sh"
+
+    (
+        wait_for_test_file "${RUN_ROOT}/addrsync-signal-pid" "addrsync signal pid"
+        wait_for_test_file \
+            "${RUN_ROOT}/addrsync-signal-command-started" "blocked addrsync startup"
+        if ! kill -TERM "$(cat "${RUN_ROOT}/addrsync-signal-pid")"; then
+            : >"${RUN_ROOT}/addrsync-signal-command-release"
+            exit 1
+        fi
+        : >"${RUN_ROOT}/addrsync-signal-command-release"
+    ) &
+    signal_helper=$!
+    addrsync_rc=0
+    sh "${RUN_ROOT}/addrsync-signal-runner.sh" || addrsync_rc=$?
+    wait "${signal_helper}" || fail "addrsync signal helper failed"
+
+    [ "${addrsync_rc}" -eq 143 ] ||
+        fail "terminated addrsync returned ${addrsync_rc}, expected 143"
+    [ ! -e "${RUN_ROOT}/addrsync-post-signal-status" ] ||
+        fail "terminated addrsync performed a post-signal readiness check"
+    [ ! -e "${RUN_ROOT}/xtables-writer.lock" ] ||
+        fail "terminated direct addrsync retained its writer lock"
+}
+
+test_terminated_tproxy_exits_before_post_signal_mutation() {
+    reset_fixture
+    printf 'cleanup\n' >"${RUN_ROOT}/active_cleanup_ipv6"
+    cat >"/data/adb/magisk/iptables-restore" <<'EOF'
+#!/usr/bin/sh
+: >/data/adb/flux/run/tproxy-signal-command-started
+while [ ! -e /data/adb/flux/run/tproxy-signal-command-release ]; do
+    sleep 0.01
+done
+exit 0
+EOF
+    cat >"/data/adb/magisk/ip" <<'EOF'
+#!/usr/bin/sh
+case "$*" in
+    *"rule del"* | *"route del"*) exit 1 ;;
+    *"rule add"* | *"route replace"*)
+        : >/data/adb/flux/run/tproxy-post-signal-mutation
+        exit 0
+        ;;
+    *) exit 1 ;;
+esac
+EOF
+    chmod 0755 /data/adb/magisk/iptables-restore /data/adb/magisk/ip
+    cat >"${RUN_ROOT}/tproxy-signal-runner.sh" <<'EOF'
+#!/usr/bin/sh
+printf '%s\n' "$$" >/data/adb/flux/run/tproxy-signal-pid
+export PROXY_IPV6=0
+export RULE_BACKEND=restore
+export BYPASS_SET_BACKEND=none
+export PROXY_MODE=tproxy
+export MARK_MASK=0xff
+export PERFORMANCE_MODE=0
+export BLOCK_QUIC=0
+export PRIVATE_DNS_GUARD=0
+export IPV6_FORCE_DISABLE=0
+export VENDOR_FIX_PROFILE=none
+export HOTSPOT_FIX=0
+export PROXY_PORT=1536
+export CORE_USER=root
+export CORE_GROUP=root
+export FAKEIP_V4_RANGE=198.18.0.0/15
+export FAKEIP_V6_RANGE=fc00::/18
+exec sh /src/scripts/tproxy start
+EOF
+    chmod 0755 "${RUN_ROOT}/tproxy-signal-runner.sh"
+
+    (
+        wait_for_test_file "${RUN_ROOT}/tproxy-signal-pid" "tproxy signal pid"
+        wait_for_test_file \
+            "${RUN_ROOT}/tproxy-signal-command-started" "blocked tproxy mutation"
+        kill -TERM "$(cat "${RUN_ROOT}/tproxy-signal-pid")"
+        : >"${RUN_ROOT}/tproxy-signal-command-release"
+    ) &
+    signal_helper=$!
+    tproxy_rc=0
+    sh "${RUN_ROOT}/tproxy-signal-runner.sh" || tproxy_rc=$?
+    wait "${signal_helper}" || fail "tproxy signal helper failed"
+
+    [ "${tproxy_rc}" -eq 143 ] ||
+        fail "terminated tproxy returned ${tproxy_rc}, expected 143"
+    [ ! -e "${RUN_ROOT}/tproxy-post-signal-mutation" ] ||
+        fail "terminated tproxy executed a post-signal mutation"
+    [ ! -e "${RUN_ROOT}/xtables-writer.lock" ] ||
+        fail "terminated direct tproxy retained its writer lock"
+}
+
+test_interrupted_dispatcher_exits_before_post_signal_tproxy() {
+    reset_fixture
+    write_stub addrsync '
+. /data/adb/flux/scripts/lib
+inherit_shell_xtables_writer_lock || exit 90
+trap '\''release_shell_xtables_writer_lock'\'' EXIT
+printf "addrsync:%s\n" "$*" >>/data/adb/flux/run/test-calls
+release_shell_xtables_writer_lock || exit 91
+trap - EXIT
+: >/data/adb/flux/run/dispatcher-addrsync-finished
+exit 0'
+    write_stub core '
+while [ ! -e /data/adb/flux/run/dispatcher-addrsync-finished ]; do
+    sleep 0.01
+done
+: >/data/adb/flux/run/dispatcher-signal-command-started
+while [ ! -e /data/adb/flux/run/dispatcher-signal-command-release ]; do
+    sleep 0.01
+done
+exit 0'
+    write_stub tproxy '
+: >/data/adb/flux/run/dispatcher-post-signal-mutation
+printf "tproxy:%s\n" "$*" >>/data/adb/flux/run/test-calls
+exit 0'
+    cat >"${RUN_ROOT}/dispatcher-signal-runner.sh" <<'EOF'
+#!/usr/bin/sh
+printf '%s\n' "$$" >/data/adb/flux/run/dispatcher-signal-pid
+FLUXD_BRIDGE=1 exec sh /data/adb/flux/scripts/dispatcher start
+EOF
+    chmod 0755 "${RUN_ROOT}/dispatcher-signal-runner.sh"
+    : >"${CALLS_FILE}"
+
+    (
+        wait_for_test_file "${RUN_ROOT}/dispatcher-signal-pid" "dispatcher signal pid"
+        wait_for_test_file \
+            "${RUN_ROOT}/dispatcher-signal-command-started" "blocked dispatcher child"
+        kill -INT "$(cat "${RUN_ROOT}/dispatcher-signal-pid")"
+        : >"${RUN_ROOT}/dispatcher-signal-command-release"
+    ) &
+    signal_helper=$!
+    dispatcher_rc=0
+    sh "${RUN_ROOT}/dispatcher-signal-runner.sh" || dispatcher_rc=$?
+    wait "${signal_helper}" || fail "dispatcher signal helper failed"
+
+    [ "${dispatcher_rc}" -eq 130 ] ||
+        fail "interrupted dispatcher returned ${dispatcher_rc}, expected 130"
+    [ ! -e "${RUN_ROOT}/dispatcher-post-signal-mutation" ] ||
+        fail "interrupted dispatcher invoked tproxy after its signal"
+    assert_not_called tproxy
+    [ ! -e "${RUN_ROOT}/xtables-writer.lock" ] ||
+        fail "interrupted dispatcher retained its writer lock"
+    [ ! -e "${RUN_ROOT}/dispatcher.lock" ] ||
+        fail "interrupted dispatcher retained its dispatch lock"
+}
+
 test_real_tproxy_stop_refuses_to_claim_detach_while_jumps_remain() {
     reset_fixture
     cat >"/data/adb/magisk/iptables" <<'EOF'
@@ -1504,6 +2363,34 @@ test_capture_start_owns_only_addrsync_and_tproxy
 test_capture_start_compensates_partial_failure
 test_capture_start_preserves_retry_evidence_when_compensation_fails
 test_capture_stop_is_ordered_and_idempotent
+test_native_xtables_lease_blocks_dispatcher_shell_writers
+test_native_xtables_lease_blocks_legacy_start_before_network_mutation
+test_native_xtables_lease_blocks_ambient_internal_writer_state
+test_native_xtables_lease_blocks_legacy_stop_before_network_mutation
+test_native_xtables_lease_blocks_legacy_restart_before_network_mutation
+test_native_xtables_lease_blocks_legacy_failure_cleanup_mutation
+test_native_xtables_lease_blocks_direct_tproxy_mutation
+test_native_xtables_lease_blocks_direct_addrsync_mutation_but_not_status
+test_xtables_transition_lock_blocks_shell_writers
+test_spoofed_inherited_xtables_writer_metadata_is_rejected
+test_valid_parent_bound_xtables_writer_metadata_reaches_tproxy
+test_dead_stale_child_for_same_live_parent_can_be_replaced
+test_live_child_record_cannot_be_replaced
+test_nonparticipant_cannot_forge_parent_release_state
+test_nonparticipant_cannot_forge_child_release_state
+test_sigkilled_child_keeps_live_parent_busy_until_parent_release
+test_sigkilled_parent_keeps_live_child_busy_until_child_release
+test_sigkilled_dispatcher_keeps_live_addrsync_phase_fenced
+test_both_dead_shell_xtables_writer_participants_are_recovered
+test_dead_shell_xtables_writer_lock_is_recovered_before_direct_claim
+test_pid_reused_shell_xtables_writer_participants_are_recovered
+test_previous_boot_shell_xtables_writer_lock_is_recovered
+test_malformed_shell_xtables_writer_record_fails_closed
+test_unverifiable_live_participant_state_fails_closed
+test_native_xtables_writer_marker_always_blocks_shell_recovery
+test_terminated_addrsync_exits_before_readiness_recheck
+test_terminated_tproxy_exits_before_post_signal_mutation
+test_interrupted_dispatcher_exits_before_post_signal_tproxy
 test_real_tproxy_stop_refuses_to_claim_detach_while_jumps_remain
 test_real_addrsync_stop_propagates_stop_failure
 test_real_addrsync_start_requires_exact_running_status

@@ -9,7 +9,7 @@ Research was performed against pinned primary-source checkouts and official docu
 
 ## Cross-cutting conclusions
 
-1. The current runtime is a migration hybrid: Rust `fluxd` now owns administrative intent, serialized lifecycle, Proxy Engine supervision, Generation recovery, and failure compensation, while shell remains the sole networking writer and standalone `addrsyncd` still owns address-derived rules.
+1. The current runtime is a migration hybrid: Rust `fluxd` now owns administrative intent, serialized lifecycle, Proxy Engine supervision, Generation recovery, and failure compensation, while shell remains the sole production bridge networking writer and standalone `addrsyncd` still owns address-derived rules.
 2. The current `0xff` mark mask overlaps AOSP netd's `netId` field, and priority `2025` runs ahead of Android's normal VPN/default-network policy lattice. The rewrite needs audited mark and priority leases plus `respect_android_vpn = true` by default.
 3. Linux 5.10 is a support floor, not a feature manifest. Android's 5.10 baseline requires useful legacy xtables, TUN, and BPF ingredients, but not nftables, ipset, BTF, every BPF hook, or permission to use them.
 4. Capability selection must use a contained create/use/observe/delete probe. Durable availability is classified as supported, unsupported, denied, conflicting, broken, or unknown; transient failures remain attempt evidence with bounded retry/backoff rather than becoming a durable capability class.

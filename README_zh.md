@@ -113,21 +113,44 @@ Rust 所有权路径中不存在并行 IPMonitor 所有者。事件事实先进�
 Android 软件包清单。渲染失败会使准备阶段失败，不会切换写入者或回退到 shell。
 
 只有显式旧所有权路径会 source `scripts/rules`；它将生产者记录为 `shell`，并作为互斥回滚路径存在。
-其他情况下该脚本仅作为冻结的字节级 oracle 保留。两条路径都只发布 restore 缓存，真正执行缓存且
-获准修改 xtables 状态的组件仍只有 `scripts/tproxy`。
+其他情况下该脚本仅作为冻结的字节级 oracle 保留。两条路径都只发布 restore 缓存；在生产桥接路径中，
+真正执行缓存和写入网络状态的组件仍只有 `scripts/tproxy`。
 
 当前由实际桥接使用的 Rust 实现是旧兼容/source-shape 渲染器。它复现保留的 shell 契约，包括差分
 一致性所需的顺序与重复形式；它不是后端无关 Capture Program 的规范 lowering，也不授予原生写入
 权限。已有连接标记走快速路径；新流量依次经过强制/本地绕过、接口策略和应用策略，最后选择直接
 放行或交给 Sing-Box 的 TPROXY 监听器。
 
-此外，`flux-platform` 已实现一个不含扩展的 schema-v1 规范 lowerer，但目前仅接受转发入口
-（forwarded ingress）Capture Program。它生成确定性的、按 generation 命名但尚未挂接的 mangle
-prepare/retire 链；直接决策使用无缓存 `RETURN`，被选择的 TCP/UDP 流量使用带协议限定的 TPROXY。
-本地 OUTPUT 会被明确拒绝，因为仅在 OUTPUT 设置 MARK 并不能证明数据包会重新进入 PREROUTING 或
-到达 TPROXY 监听器。已建立流缓存、透明 socket DIVERT、FakeIP ICMP、QUIC 拒绝和 MSS 钳制同样会被
-拒绝。这些产物不供当前桥接执行，也不授予执行 restore、进行 readback 或回滚、写入或拥有内核状态、
-以及激活透明代理的权限。
+此外，`flux-platform` 已实现不含扩展的规范 lowerer。仅含转发入口的 Capture Program 保留 schema v1；
+包含本地 OUTPUT 的输入使用 schema v2，由私有 `O` 链设置掩码 mark，私有 `P` 链描述经 loopback
+重新进入 PREROUTING 的 TPROXY 配套路径，混合程序还可包含 `F` 链。规范产物本身不授予写入权限。
+
+私有 `NativeXtablesOwner` 只暴露 `converge(target)` 与 `recover()`，并在目标经过独立准入后负责稳定的
+`FLX{4|6}SP` PREROUTING / `FLX{4|6}SO` OUTPUT 根链、固定描述符的 command/restore/save、精确 xtables
+与策略路由 readback、回滚、持久 journal 恢复、清理及 shell 可见的迁移租约。持久 owner payload
+schema 2 将目标及可选上一 Generation 绑定到产物摘要、工具集摘要，以及完整 IPv4/IPv6 策略路由审计
+摘要；后者包含精确的 loopback 名称/索引身份。每次路由观察或修改前都会双向验证实时的名称到索引和
+索引到名称映射；只有 IPv4/IPv6 两套 xtables 与两族路由审计均精确或为空时，才能发布 `Active` 或
+`CleanAbsent`，因此未启用族中的残留也会阻止状态推进。
+
+共享 writer fence 使用 shell-owner-v2 记录：父进程 PID/`/proc` 启动 tick、可选子进程 PID/启动 tick，
+以及同一个 boot ID。任一参与者仍存活都会保持 busy。父进程绑定的 `addrsync` 或 `tproxy` 修改阶段会串行
+使用唯一子进程槽位；子阶段在父进程死亡后仍会继续阻止竞争写入，且不会替换父进程身份。存活父进程可以
+回收已死亡的子进程。只有父子均死亡、PID 已复用或记录属于上一 boot 时，才可在精确复核后退休。裸 lock、
+格式错误、native/shell 混合 owner 或无法验证的记录都会保持 fail-closed。
+
+当前 boot 的 terminal journal 也不能仅凭磁盘记录直接视为 `CleanAbsent`。恢复会保留 native guard、共享
+writer fence 和可能仍存在的 lease，重新证明全局 IPv4/IPv6 xtables 与策略路由均为空，然后才删除 terminal
+lease/journal 产物并释放 fence。上一 boot 中精确的 revision-1 `Activating`、已写 journal 但尚未写 lease 的
+边界，在 native-owner scope 与 journal 一致且实时空状态证明通过时可以恢复；同一 boot 或 scope 不匹配的
+missing-lease 状态继续 fail-closed。所有旧模式 start、stop、restart 与失败清理阶段事务，都会在
+`addrsync` 或 `tproxy` 修改前先取得同一个 writer fence。长期运行的 standalone `addrsyncd` 仍属于旧运行时
+所有权，必须在生产组件切换时删除。真实 Adapter 已通过确定性测试和一次 rooted WSA Android 13 x86_64
+的 apply/recover/stop 机制测试。
+
+生产目标准入仍故意保持为空，因此生产 xtables driver 继续返回 `Unsupported`，`scripts/tproxy` 仍是
+生产桥接写入者。WSA 结果只证明机制；Android 5.10/ARM64、mark/RPDB 权威、功能 receipt、daemon 切换
+和被替代 shell 职责的删除仍未完成。
 
 `BYPASS_SET_BACKEND="zone"` 是唯一已实现的后端。在独立适配器、能力探测和一致性测试完成前，
 `ipset` 与 `auto` 会被明确拒绝。
@@ -269,9 +292,11 @@ watchdog 拥有 `fluxd`。
 不可变来源/哈希、SBOM、设备证据、固定工具链、完整校验和、可复现 provenance 与可信 attestation。
 
 已交付的桥接渲染器只是 xtables 第一个非修改型切换：Rust 负责准备兼容字节，shell 仍负责 restore
-执行、readback、回滚与内核修改。另一个不执行的 schema-v1 转发入口规范 lowerer 也已交付，但本地
-OUTPUT、五项被拒绝的扩展、稳定 hook 挂接和原生所有权仍是相互独立、需要门槛验证的后续工作。
-nftables、TUN、eBPF 与 `.ko`/KPM 模块路径继续推迟，两个编译器都不会激活这些能力。
+执行、readback、回滚与内核修改。独立的规范 lowerer 已保留 schema-v1 转发入口身份，并描述完整的
+schema-v2 本地 OUTPUT `O`/`P` 事务。crate-private 原生 owner 也已为独立准入的目标提供稳定 hook 修改、
+精确的事务内策略路由、双族 readback/残留审计、回滚、恢复、清理和迁移租约。尚未完成的是生产目标准入、
+listener/engine/canary 权威、Android 5.10/ARM64 评审资格以及 shell writer 切换，因此生产 driver 仍返回
+`Unsupported`。nftables 与 TUN 继续推迟；eBPF 仍为可选能力，生产路径不会加载 `.ko`/KPM 模块。
 
 ## 免责声明
 

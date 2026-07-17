@@ -62,12 +62,48 @@ An observation-only Phase 2 Capture Program used to explain and compare compatib
 _Avoid_: Dry-run Generation, staged rules
 
 **Xtables Capture Artifact Set**:
-A deterministic, non-authorizing Phase 4 lowering of an extension-free Capture Program. Forwarded-ingress-only input retains the exact schema-v1 bytes and digests in private `F` chains. Input containing local OUTPUT selects schema v2 and adds private `O` classifier and, when proxying, mark-qualified loopback `P` TPROXY chains plus typed stable-hook selectors, listener, loop-escape, policy-routing, lifecycle-order, identity, and resource metadata. Prepare/retire syntax never mutates a built-in hook; the metadata is descriptive only. Established-flow caching, transparent-socket DIVERT, FakeIP ICMP, QUIC rejection, and MSS clamping remain rejected, and the artifact carries no restore execution, readback, rollback, writer, ownership, prepared/active, coordinator, or activation authority.
+A deterministic, non-authorizing Phase 4 lowering of an extension-free Capture Program. Forwarded-ingress-only input retains the exact schema-v1 bytes and digests in private `F` chains. Input containing local OUTPUT selects schema v2 and adds private `O` classifier and, when proxying, mark-qualified loopback `P` TPROXY chains plus typed stable-hook selectors, listener, loop-escape, lifecycle-order, identity, and resource metadata. Its policy-routing identity requires nonzero route and rule protocols, an explicit nonzero route metric, IPv4 HOST scope, and IPv6 UNIVERSE scope. Prepare/retire syntax never mutates a built-in hook; the metadata is descriptive only. Established-flow caching, transparent-socket DIVERT, FakeIP ICMP, QUIC rejection, and MSS clamping remain rejected, and the artifact carries no restore execution, readback, rollback, writer, ownership, prepared/active, coordinator, or activation authority.
 _Avoid_: Active rules, native cutover, production local-OUTPUT driver
 
 **Native Restore Process Adapter**:
-An internal Phase 4 platform primitive that opens exact absolute restore-tool paths while rejecting a final-component symlink, pins their descriptors and byte digests, requires matching reported legacy or nf_tables IPv4/IPv6 restore flavors, and submits one canonical restore artifact through direct argv plus bounded stdin, output, deadline, unrelated-descriptor closure, process-group cleanup, and parent-death containment. It remains crate-private and supplies no stable hooks, rtnetlink state, live readback, rollback, journal, transition lease, writer ownership, or activation authority. A zero child exit is process evidence only; every restore failure after spawn is explicitly `MayHaveMutated` and requires live re-observation by the future owner.
-_Avoid_: Native xtables writer, prepared capture, restore acceptance proof
+An internal Phase 4 platform primitive used only by the native owner. It admits one coherent trusted
+IPv4/optional-IPv6 command/restore/save multicall set before version execution, pins descriptor and
+byte identity, dispatches the exact logical applet through `argv[0]`, and runs bounded direct-child
+restore or complete save operations. A zero child exit is process evidence only; every restore
+failure after spawn is explicitly `MayHaveMutated` and requires fresh owner readback.
+_Avoid_: Public restore CLI, production activation authority
+
+**Native Xtables Owner**:
+A private deep Module exposing only `converge(target)` and `recover()`. It owns stable
+`FLX{4|6}SP` PREROUTING and `FLX{4|6}SO` OUTPUT roots, generation chains, exact save projection,
+journaled policy-routing netlink, rollback, crash recovery, cleanup, and the component transition
+lease. Its exact routing identity requires nonzero route and rule protocols, an explicit nonzero
+route metric, IPv4 HOST scope, and IPv6 UNIVERSE scope. Durable owner-payload schema 2 also binds a
+domain-separated digest of the complete IPv4/IPv6 route/rule audit and exact loopback name/index
+identity. The owner validates that live identity in both name-to-index and index-to-name directions
+before every policy observation or mutation and audits both xtables families plus both routing
+identities before publishing `Active` or `CleanAbsent`. Internally consistent previous-boot durable
+state is retired only under the writer fence after fresh dual-family absence. A current terminal journal retains that
+fence, the native guard, and any surviving lease until fresh global absence retires the terminal
+artifacts. The exact previous-boot revision-1 `Activating` journal-before-lease boundary is recoverable
+when its native-owner scope is coherent; same-boot or mismatched missing-lease state remains blocking.
+Its real Adapter passes deterministic and rooted disposable-WSA mechanism tests, but positive
+production target admission remains uninhabited until the Android 5.10/ARM64 cutover authorities are
+bound; WSA is not release authority.
+_Avoid_: Raw prepare/activate API, production writer today
+
+**Xtables Writer Fence**:
+The shared `xtables-writer.lock/` single-writer boundary used by the private native owner and the
+production shell bridge. A native claim carries a durable scope marker. A canonical shell-owner-v2
+claim carries parent plus optional child PID/`/proc` start-tick identities and one boot ID. Either
+live participant remains busy. One parent-bound mutating `scripts/addrsync` or `scripts/tproxy` phase
+command at a time adds and clears only the child slot; the parent identity is never replaced, a
+surviving phase child remains blocking after parent death, and a live parent may reclaim a dead
+child. Both-dead, PID-reused, or previous-boot ownership may retire only after exact revalidation.
+Bare, mixed, malformed, or otherwise unverifiable state is deliberately not guessed stale. Legacy
+start, stop, restart, and failure cleanup claim this fence before `addrsync` or `tproxy` mutation.
+The long-lived standalone `addrsyncd` daemon remains legacy runtime ownership until its cutover.
+_Avoid_: Advisory mkdir only, best-effort stale-lock deletion
 
 **Legacy Rules Plan**:
 A validated, source-shape-preserving Rust representation of the admitted `scripts/rules` compatibility inputs. It can deterministically emit the same bounded apply/cleanup restore bytes for bridge preparation, including legacy ordering and duplicates, but it is not a lowering of `ShadowCaptureArtifact`, a Generation Capture Program, or mutation authority.
@@ -86,7 +122,7 @@ A bounded immutable byte snapshot produced by `fluxd snapshot-legacy-packages` f
 _Avoid_: Live packages.list view, package cache
 
 **Restore Executor**:
-The component that submits prepared restore bytes to the kernel. During the current bridge, `scripts/tproxy` remains the sole restore executor and networking writer even when Rust produced the cache bytes. The unwired Native Restore Process Adapter does not change current writer ownership.
+The component that submits prepared restore bytes to the kernel. During the current bridge, `scripts/tproxy` remains the sole production restore executor and networking writer even when Rust produced the cache bytes. The Native Restore Process Adapter is wired only inside the private `NativeXtablesOwner`; because positive production target admission remains uninhabited, it does not change current production writer ownership.
 _Avoid_: Rule compiler, cache producer
 
 **Bypass Policy**:
@@ -105,8 +141,9 @@ _Avoid_: Core, daemon
 The frozen shell networking behavior and pinned fixtures used to review Rust replacement behavior
 during pre-release development. `scripts/rules` is executed only under explicit legacy ownership as
 the rollback producer; under Rust ownership it is retained but not sourced. The shell restore path
-remains the sole networking writer until ownership transfers through a component-specific cutover
-gate, then the replaced component is removed promptly. The oracle is never a release architecture.
+remains the sole production networking writer until ownership transfers through a component-
+specific cutover gate, then the replaced component is removed promptly. The oracle is never a
+release architecture.
 _Avoid_: Second backend, permanent shell path
 
 ## Device model

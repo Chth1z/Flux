@@ -1,8 +1,15 @@
 mod lowering;
 #[allow(dead_code)]
 mod native;
+#[allow(dead_code)]
+mod owner;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[allow(dead_code)]
+mod owner_durable;
 mod render;
 mod restore;
+#[allow(dead_code)]
+mod save;
 
 pub use lowering::{
     MAX_XTABLES_CAPTURE_COMMANDS_PER_ARTIFACT, XTABLES_CAPTURE_DIGEST_BYTES,

@@ -130,7 +130,7 @@ fails preparation without switching writers or falling back to shell.
 Explicit legacy ownership is the only path that sources `scripts/rules`; it records `shell` as the
 producer and exists as a mutually exclusive rollback path. The script is otherwise retained as a
 frozen byte-level oracle. Both paths publish restore caches, while `scripts/tproxy` remains their
-sole executor and the only component authorized to mutate xtables state.
+sole production bridge executor and networking writer.
 
 The Rust implementation used by the executed bridge is a legacy compatibility/source-shape
 renderer. It reproduces the retained shell contract, including ordering and duplicate forms needed
@@ -149,18 +149,41 @@ order, digests, and resource budgets. The prepare/retire documents still create 
 unattached implementation chains; they do not modify built-in hooks. Established-flow caching,
 transparent-socket DIVERT, FakeIP ICMP, QUIC rejection, and MSS clamping remain rejected.
 
-These canonical artifacts are not used by the bridge. The production xtables driver remains
-`Unsupported`, and the lowerer grants no authority to execute restore, attach hooks, provision a
-listener or route, perform readback or rollback, write or own kernel state, or activate capture.
+These canonical artifacts are not used by the bridge, and the lowerer itself grants no mutation or
+activation authority. A private `NativeXtablesOwner` now consumes only independently admitted
+targets behind `converge(target)` and `recover()`. It owns stable `FLX{4|6}SP` PREROUTING and
+`FLX{4|6}SO` OUTPUT roots, coherent descriptor-pinned command/restore/save execution, exact xtables
+and policy-routing readback, rollback, durable journal recovery, cleanup, and a shell-visible
+transition lease. Durable payload schema 2 binds the target and optional previous Generation to the
+artifact and tool digests plus a complete IPv4/IPv6 policy-routing audit digest containing the exact
+loopback name/index identity. The owner validates that live interface binding in both directions and
+audits both xtables families and both routing identities before publishing `Active` or `CleanAbsent`,
+so opposite-family residue cannot be hidden by a single-family target.
 
-The next native lane now has one internal process primitive: `flux-platform` can open exact
-absolute `iptables-restore`/`ip6tables-restore` paths while rejecting a final-component symlink,
-descriptor-pin and digest them, require matching reported legacy or nf_tables restore flavors, and invoke the selected child
-directly with `-w`, `--noflush`, exact canonical stdin, bounded diagnostics, timeout, parent-death,
-unrelated-descriptor closure, and process-group cleanup. It remains crate-private and is deliberately unwired from the bridge, coordinator, and production
-driver. It has no stable-hook, routing, readback, rollback, journal, transition-lease, or activation
-authority, and a successful child exit is not kernel-state proof. Every error after a restore child
-spawns is conservatively tagged as potentially mutated state for mandatory future readback.
+The shared writer fence authenticates shell ownership with PID, `/proc` start ticks, and boot ID.
+The canonical v2 record retains the parent PID/start identity and an optional child PID/start
+identity under the same boot ID. Either live participant keeps the fence busy. Each parent-bound
+mutating `addrsync` or `tproxy` phase invocation uses the single child slot, so those writers are
+serialized and a surviving phase child remains blocking if the parent dies. It does not replace the
+parent, and a live parent can reclaim a dead child. Both-dead, PID-reused, and previous-boot records
+are retired only after exact revalidation. Bare, malformed, mixed-owner, or otherwise unverifiable
+locks remain deliberately fail-closed.
+
+A current terminal journal is likewise not accepted as `CleanAbsent` from disk alone. Recovery keeps
+the native guard, shared writer fence, and optional surviving lease until fresh global IPv4/IPv6
+xtables and policy-routing absence passes, then removes the terminal artifacts. The exact
+previous-boot revision-1 `Activating` pre-lease boundary is recoverable when its native-owner scope is
+coherent; same-boot or mismatched missing-lease state remains blocking. Every legacy start, stop,
+restart, and failure-cleanup phase transaction claims this fence before `addrsync` or `tproxy`
+mutation. The retained standalone `addrsyncd` daemon is still legacy runtime ownership and must be
+removed by the production component cutover.
+The real Adapter passed deterministic tests and a rooted disposable WSA Android 13 x86_64
+apply/recover/stop run.
+
+Production target admission remains deliberately uninhabited, so the production xtables driver is
+still `Unsupported` and `scripts/tproxy` remains the production bridge writer. The WSA result is
+mechanism evidence only; Android 5.10/ARM64 qualification, mark/RPDB authority, functional receipts,
+daemon cutover, and deletion of replaced shell duties remain open.
 
 `BYPASS_SET_BACKEND="zone"` is the only implemented backend. `ipset` and `auto` are intentionally
 rejected until distinct adapters, capability probes, and parity tests exist.
@@ -311,10 +334,12 @@ The delivered bridge renderer is only the first non-mutating xtables cutover: Ru
 compatibility bytes, while shell still owns restore execution, readback, rollback, and kernel
 mutation. The separate canonical lowerer now represents forwarded ingress and the complete
 schema-v2 local-OUTPUT `O`/`P` transaction, while preserving frozen schema-v1 forwarded-only
-identities. A crate-private descriptor-pinned direct-child restore primitive is now delivered, but
-stable-hook mutation, listener/routing provisioning, exact readback/rollback, transition leasing,
-live ownership, production driver support, and the five rejected extensions remain separate gated work. nftables, TUN, eBPF, and
-`.ko`/KPM module paths remain deferred and are not activated by either compiler.
+identities. The crate-private native owner now supplies stable-hook mutation, exact transaction-local
+policy routing, dual-family readback/residue auditing, rollback, recovery, cleanup, and transition
+leasing for independently admitted targets. Production target admission, listener/engine/canary
+authority, reviewed Android 5.10/ARM64 qualification, and the shell-writer cutover remain gated, so
+the production driver is still `Unsupported`. nftables and TUN remain deferred; eBPF is optional and
+no production path loads `.ko`/KPM modules.
 
 ## Disclaimer
 

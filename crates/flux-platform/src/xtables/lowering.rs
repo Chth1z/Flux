@@ -38,6 +38,7 @@ const PAIR_DIGEST_DOMAIN_V2: &[u8] =
     b"Flux canonical xtables Capture Program artifact pair\0schema-v2\0";
 const SET_DIGEST_DOMAIN_V2: &[u8] =
     b"Flux canonical xtables Capture Program artifact set\0schema-v2\0";
+const LINUX_ROUTE_SCOPE_UNIVERSE: u8 = 0;
 const LINUX_ROUTE_SCOPE_HOST: u8 = 254;
 const LINUX_ROUTE_TYPE_LOCAL: u8 = 2;
 
@@ -198,7 +199,7 @@ impl fmt::Display for XtablesLocalOutputRoutingTargetError {
                 formatter.write_str("local-OUTPUT route protocol is unspecified")
             }
             Self::UnspecifiedRuleProtocol => {
-                formatter.write_str("local-OUTPUT rule protocol is explicitly unspecified")
+                formatter.write_str("local-OUTPUT rule protocol is unspecified")
             }
         }
     }
@@ -213,32 +214,35 @@ impl Error for XtablesLocalOutputRoutingTargetError {}
 pub struct XtablesLocalOutputRoutingTarget {
     priority: RulePriority,
     table: RouteTableId,
+    route_metric: NonZeroU32,
     route_protocol: RouteProtocol,
-    rule_protocol: Option<RuleProtocol>,
+    rule_protocol: RuleProtocol,
 }
 
 impl XtablesLocalOutputRoutingTarget {
     pub const fn new(
         priority: RulePriority,
         table: RouteTableId,
+        route_metric: NonZeroU32,
         route_protocol: RouteProtocol,
-        rule_protocol: Option<RuleProtocol>,
+        rule_protocol: RuleProtocol,
     ) -> Result<Self, XtablesLocalOutputRoutingTargetError> {
         if priority.get() == 0 {
             return Err(XtablesLocalOutputRoutingTargetError::ZeroPriority);
         }
-        if matches!(table.get(), 0 | 253 | 254 | 255) {
+        if matches!(table.get(), 0 | 252 | 253 | 254 | 255) {
             return Err(XtablesLocalOutputRoutingTargetError::ReservedTable { table });
         }
         if route_protocol.raw() == 0 {
             return Err(XtablesLocalOutputRoutingTargetError::UnspecifiedRouteProtocol);
         }
-        if matches!(rule_protocol, Some(protocol) if protocol.raw() == 0) {
+        if rule_protocol.raw() == 0 {
             return Err(XtablesLocalOutputRoutingTargetError::UnspecifiedRuleProtocol);
         }
         Ok(Self {
             priority,
             table,
+            route_metric,
             route_protocol,
             rule_protocol,
         })
@@ -255,12 +259,17 @@ impl XtablesLocalOutputRoutingTarget {
     }
 
     #[must_use]
+    pub const fn route_metric(self) -> NonZeroU32 {
+        self.route_metric
+    }
+
+    #[must_use]
     pub const fn route_protocol(self) -> RouteProtocol {
         self.route_protocol
     }
 
     #[must_use]
-    pub const fn rule_protocol(self) -> Option<RuleProtocol> {
+    pub const fn rule_protocol(self) -> RuleProtocol {
         self.rule_protocol
     }
 }
@@ -620,12 +629,17 @@ impl XtablesLocalOutputRoutingRequirement {
     }
 
     #[must_use]
+    pub const fn route_metric(self) -> NonZeroU32 {
+        self.target.route_metric()
+    }
+
+    #[must_use]
     pub const fn route_protocol(self) -> RouteProtocol {
         self.target.route_protocol()
     }
 
     #[must_use]
-    pub const fn rule_protocol(self) -> Option<RuleProtocol> {
+    pub const fn rule_protocol(self) -> RuleProtocol {
         self.target.rule_protocol()
     }
 
@@ -1993,13 +2007,17 @@ fn build_local_output_requirements(
         NetworkAddressFamily::Ipv4 => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
         NetworkAddressFamily::Ipv6 => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
     };
+    let route_scope = match family {
+        NetworkAddressFamily::Ipv4 => RouteScope::from_raw(LINUX_ROUTE_SCOPE_HOST),
+        NetworkAddressFamily::Ipv6 => RouteScope::from_raw(LINUX_ROUTE_SCOPE_UNIVERSE),
+    };
     XtablesLocalOutputTransactionRequirements {
         routing: XtablesLocalOutputRoutingRequirement {
             family: restore_family,
             target: routing,
             route_destination: bind_address,
             route_prefix_length: 0,
-            route_scope: RouteScope::from_raw(LINUX_ROUTE_SCOPE_HOST),
+            route_scope,
             route_type: RouteType::from_raw(LINUX_ROUTE_TYPE_LOCAL),
             mark: target.mark().selector(FwmarkRole::Proxy),
             loopback_interface: loopback_interface(),
@@ -2358,11 +2376,9 @@ fn digest_routing_spec(digest: &mut Sha256, routing: Option<XtablesLocalOutputRo
 fn digest_routing_target(digest: &mut Sha256, target: XtablesLocalOutputRoutingTarget) {
     digest.update(target.priority().get().to_be_bytes());
     digest.update(target.table().get().to_be_bytes());
+    digest.update(target.route_metric().get().to_be_bytes());
     digest.update([target.route_protocol().raw()]);
-    match target.rule_protocol() {
-        Some(protocol) => digest.update([1, protocol.raw()]),
-        None => digest.update([0]),
-    }
+    digest.update([target.rule_protocol().raw()]);
 }
 
 fn digest_entry_selector(digest: &mut Sha256, selector: XtablesCaptureEntrySelector) {
@@ -2473,6 +2489,7 @@ fn digest_restore_artifact(digest: &mut Sha256, artifact: &XtablesRestoreArtifac
     digest.update([match artifact.context().action() {
         XtablesRestoreAction::Apply => 1,
         XtablesRestoreAction::Cleanup => 2,
+        XtablesRestoreAction::Replace => 3,
     }]);
     digest.update([restore_family_tag(artifact.context().family())]);
     digest.update(artifact.digest().as_bytes());

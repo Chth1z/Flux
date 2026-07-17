@@ -1,4 +1,5 @@
 use std::error::Error;
+use std::ffi::CString;
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -11,13 +12,17 @@ use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
-use super::{XtablesRestoreArtifact, XtablesRestoreFamily};
+use super::{MAX_XTABLES_RESTORE_BYTES, XtablesRestoreArtifact, XtablesRestoreFamily};
 use crate::child_process::{self, ChildProcessConfig, ProcessSignal};
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 #[cfg(any(target_os = "linux", target_os = "android"))]
-use std::os::unix::fs::{FileExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::ffi::OsStrExt;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use std::os::unix::process::CommandExt as _;
 
 const MAX_WAIT_SECONDS: u16 = 60;
 const MAX_PROCESS_TIMEOUT: Duration = Duration::from_secs(60);
@@ -25,7 +30,109 @@ const MAX_CAPTURE_BYTES: usize = 16 * 1024;
 const MAX_TOOL_BYTES: u64 = 64 * 1024 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const CLEANUP_GRACE: Duration = Duration::from_millis(250);
-const TOOL_DIGEST_DOMAIN: &[u8] = b"Flux pinned xtables restore tool\0sha256-v1\0";
+const TOOL_DIGEST_DOMAIN: &[u8] = b"Flux pinned xtables executable\0sha256-v2\0";
+const TOOL_SET_DIGEST_DOMAIN: &[u8] = b"Flux coherent pinned xtables tool set\0sha256-v2\0";
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) enum XtablesToolRole {
+    Command,
+    Restore,
+    Save,
+}
+
+impl XtablesToolRole {
+    #[must_use]
+    pub(crate) const fn applet(self, family: XtablesRestoreFamily) -> &'static str {
+        match (family, self) {
+            (XtablesRestoreFamily::Ipv4, Self::Command) => "iptables",
+            (XtablesRestoreFamily::Ipv4, Self::Restore) => "iptables-restore",
+            (XtablesRestoreFamily::Ipv4, Self::Save) => "iptables-save",
+            (XtablesRestoreFamily::Ipv6, Self::Command) => "ip6tables",
+            (XtablesRestoreFamily::Ipv6, Self::Restore) => "ip6tables-restore",
+            (XtablesRestoreFamily::Ipv6, Self::Save) => "ip6tables-save",
+        }
+    }
+
+    const fn tag(self) -> u8 {
+        match self {
+            Self::Command => 1,
+            Self::Restore => 2,
+            Self::Save => 3,
+        }
+    }
+}
+
+impl fmt::Display for XtablesToolRole {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Command => "command",
+            Self::Restore => "restore",
+            Self::Save => "save",
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct XtablesToolFamilyPaths {
+    command: PathBuf,
+    restore: PathBuf,
+    save: PathBuf,
+}
+
+impl XtablesToolFamilyPaths {
+    #[must_use]
+    pub(crate) fn new(
+        command: impl Into<PathBuf>,
+        restore: impl Into<PathBuf>,
+        save: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            command: command.into(),
+            restore: restore.into(),
+            save: save.into(),
+        }
+    }
+
+    fn standard(root: &Path, family: XtablesRestoreFamily) -> Self {
+        Self::new(
+            root.join(XtablesToolRole::Command.applet(family)),
+            root.join(XtablesToolRole::Restore.applet(family)),
+            root.join(XtablesToolRole::Save.applet(family)),
+        )
+    }
+
+    #[must_use]
+    pub(crate) fn path(&self, role: XtablesToolRole) -> &Path {
+        match role {
+            XtablesToolRole::Command => &self.command,
+            XtablesToolRole::Restore => &self.restore,
+            XtablesToolRole::Save => &self.save,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct XtablesToolSetPaths {
+    ipv4: XtablesToolFamilyPaths,
+    ipv6: Option<XtablesToolFamilyPaths>,
+}
+
+impl XtablesToolSetPaths {
+    #[must_use]
+    pub(crate) fn new(ipv4: XtablesToolFamilyPaths, ipv6: Option<XtablesToolFamilyPaths>) -> Self {
+        Self { ipv4, ipv6 }
+    }
+
+    #[must_use]
+    pub(crate) fn ipv4(&self) -> &XtablesToolFamilyPaths {
+        &self.ipv4
+    }
+
+    #[must_use]
+    pub(crate) fn ipv6(&self) -> Option<&XtablesToolFamilyPaths> {
+        self.ipv6.as_ref()
+    }
+}
 
 /// Exact executable paths selected for the native restore-process primitive.
 ///
@@ -114,11 +221,45 @@ impl XtablesRestoreToolDigest {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct XtablesToolFileIdentity {
+    device: u64,
+    inode: u64,
+    length: u64,
+    mode: u32,
+    owner_user: u32,
+    owner_group: u32,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+}
+
+impl XtablesToolFileIdentity {
+    #[must_use]
+    pub(crate) const fn device(self) -> u64 {
+        self.device
+    }
+
+    #[must_use]
+    pub(crate) const fn inode(self) -> u64 {
+        self.inode
+    }
+
+    #[must_use]
+    pub(crate) const fn length(self) -> u64 {
+        self.length
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct XtablesRestoreToolIdentity {
     path: PathBuf,
+    family: XtablesRestoreFamily,
+    role: XtablesToolRole,
+    applet: Box<str>,
+    file: XtablesToolFileIdentity,
     digest: XtablesRestoreToolDigest,
     reported_flavor: XtablesRestoreReportedFlavor,
+    release: Box<str>,
     version: Box<str>,
 }
 
@@ -126,6 +267,26 @@ impl XtablesRestoreToolIdentity {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    #[must_use]
+    pub(crate) const fn family(&self) -> XtablesRestoreFamily {
+        self.family
+    }
+
+    #[must_use]
+    pub(crate) const fn role(&self) -> XtablesToolRole {
+        self.role
+    }
+
+    #[must_use]
+    pub const fn applet(&self) -> &str {
+        &self.applet
+    }
+
+    #[must_use]
+    pub(crate) const fn file_identity(&self) -> XtablesToolFileIdentity {
+        self.file
     }
 
     #[must_use]
@@ -139,8 +300,79 @@ impl XtablesRestoreToolIdentity {
     }
 
     #[must_use]
+    pub(crate) const fn release(&self) -> &str {
+        &self.release
+    }
+
+    #[must_use]
     pub const fn version(&self) -> &str {
         &self.version
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(transparent)]
+pub(crate) struct XtablesToolSetDigest([u8; 32]);
+
+impl XtablesToolSetDigest {
+    #[must_use]
+    pub(crate) const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct XtablesToolFamilyIdentity {
+    command: XtablesRestoreToolIdentity,
+    restore: XtablesRestoreToolIdentity,
+    save: XtablesRestoreToolIdentity,
+}
+
+impl XtablesToolFamilyIdentity {
+    #[must_use]
+    pub(crate) const fn tool(&self, role: XtablesToolRole) -> &XtablesRestoreToolIdentity {
+        match role {
+            XtablesToolRole::Command => &self.command,
+            XtablesToolRole::Restore => &self.restore,
+            XtablesToolRole::Save => &self.save,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct XtablesToolSetIdentity {
+    digest: XtablesToolSetDigest,
+    reported_flavor: XtablesRestoreReportedFlavor,
+    release: Box<str>,
+    ipv4: XtablesToolFamilyIdentity,
+    ipv6: Option<XtablesToolFamilyIdentity>,
+}
+
+impl XtablesToolSetIdentity {
+    #[must_use]
+    pub(crate) const fn digest(&self) -> XtablesToolSetDigest {
+        self.digest
+    }
+
+    #[must_use]
+    pub(crate) const fn reported_flavor(&self) -> XtablesRestoreReportedFlavor {
+        self.reported_flavor
+    }
+
+    #[must_use]
+    pub(crate) const fn release(&self) -> &str {
+        &self.release
+    }
+
+    #[must_use]
+    pub(crate) const fn family(
+        &self,
+        family: XtablesRestoreFamily,
+    ) -> Option<&XtablesToolFamilyIdentity> {
+        match family {
+            XtablesRestoreFamily::Ipv4 => Some(&self.ipv4),
+            XtablesRestoreFamily::Ipv6 => self.ipv6.as_ref(),
+        }
     }
 }
 
@@ -178,17 +410,51 @@ impl XtablesRestoreProcessOutput {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct XtablesSaveProcessOutput {
+    family: XtablesRestoreFamily,
+    tool_identity: XtablesRestoreToolIdentity,
+    stdout: Box<[u8]>,
+    stderr: Box<str>,
+}
+
+impl XtablesSaveProcessOutput {
+    #[must_use]
+    pub(crate) const fn family(&self) -> XtablesRestoreFamily {
+        self.family
+    }
+
+    #[must_use]
+    pub(crate) const fn tool_identity(&self) -> &XtablesRestoreToolIdentity {
+        &self.tool_identity
+    }
+
+    #[must_use]
+    pub(crate) const fn stdout(&self) -> &[u8] {
+        &self.stdout
+    }
+
+    #[must_use]
+    pub(crate) const fn stderr(&self) -> &str {
+        &self.stderr
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum XtablesRestoreProcessOperation {
-    Probe,
+    Probe(XtablesToolRole),
     Restore,
+    Save,
 }
 
 impl fmt::Display for XtablesRestoreProcessOperation {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
-            Self::Probe => "probe",
+            Self::Probe(XtablesToolRole::Command) => "command probe",
+            Self::Probe(XtablesToolRole::Restore) => "restore probe",
+            Self::Probe(XtablesToolRole::Save) => "save probe",
             Self::Restore => "restore",
+            Self::Save => "save",
         })
     }
 }
@@ -218,6 +484,7 @@ pub(crate) enum XtablesRestoreProcessErrorKind {
     ToolOpen,
     ToolIdentity,
     ToolFlavor,
+    ToolCoherence,
     MissingFamily,
     ChildSetup,
     Spawn,
@@ -278,6 +545,11 @@ pub(crate) enum XtablesRestoreProcessError {
     ToolFlavorMismatch {
         ipv4: XtablesRestoreReportedFlavor,
         ipv6: XtablesRestoreReportedFlavor,
+    },
+    ToolSetCoherence {
+        family: XtablesRestoreFamily,
+        role: XtablesToolRole,
+        reason: Box<str>,
     },
     MissingFamily {
         family: XtablesRestoreFamily,
@@ -363,6 +635,7 @@ impl XtablesRestoreProcessError {
             Self::ToolFlavor { .. } | Self::ToolFlavorMismatch { .. } => {
                 XtablesRestoreProcessErrorKind::ToolFlavor
             }
+            Self::ToolSetCoherence { .. } => XtablesRestoreProcessErrorKind::ToolCoherence,
             Self::MissingFamily { .. } => XtablesRestoreProcessErrorKind::MissingFamily,
             Self::ChildSetup { .. } => XtablesRestoreProcessErrorKind::ChildSetup,
             Self::Spawn { .. } => XtablesRestoreProcessErrorKind::Spawn,
@@ -403,6 +676,7 @@ impl XtablesRestoreProcessError {
             | Self::ToolIdentity { .. }
             | Self::ToolFlavor { .. }
             | Self::ToolFlavorMismatch { .. }
+            | Self::ToolSetCoherence { .. }
             | Self::MissingFamily { .. }
             | Self::ChildSetup { .. }
             | Self::Spawn { .. }
@@ -481,6 +755,14 @@ impl fmt::Display for XtablesRestoreProcessError {
             Self::ToolFlavorMismatch { ipv4, ipv6 } => write!(
                 formatter,
                 "IPv4 and IPv6 restore tools use different implementations: {ipv4:?} versus {ipv6:?}"
+            ),
+            Self::ToolSetCoherence {
+                family,
+                role,
+                reason,
+            } => write!(
+                formatter,
+                "incoherent {family:?} xtables {role} tool set: {reason}"
             ),
             Self::MissingFamily { family } => {
                 write!(
@@ -602,6 +884,7 @@ impl Error for XtablesRestoreProcessError {
             | Self::ToolIdentityChanged { .. }
             | Self::ToolFlavor { .. }
             | Self::ToolFlavorMismatch { .. }
+            | Self::ToolSetCoherence { .. }
             | Self::MissingFamily { .. }
             | Self::StreamWorkerPanicked { .. }
             | Self::NonZeroExit { .. }
@@ -618,8 +901,8 @@ impl Error for XtablesRestoreProcessError {
 /// transition-lease, or production-driver integration. A successful child
 /// exit is not sufficient native transaction evidence.
 pub(crate) struct XtablesRestoreProcessAdapter {
-    ipv4: PinnedRestoreTool,
-    ipv6: Option<PinnedRestoreTool>,
+    ipv4: PinnedXtablesTool,
+    ipv6: Option<PinnedXtablesTool>,
     reported_flavor: XtablesRestoreReportedFlavor,
     config: XtablesRestoreProcessConfig,
 }
@@ -630,11 +913,27 @@ impl XtablesRestoreProcessAdapter {
         config: XtablesRestoreProcessConfig,
     ) -> Result<Self, XtablesRestoreProcessError> {
         ensure_supported()?;
-        let ipv4 = PinnedRestoreTool::open(XtablesRestoreFamily::Ipv4, paths.ipv4, config.timeout)?;
-        let ipv6 = paths
+        let mut ipv4 = PinnedXtablesTool::open_exact_unprobed(
+            XtablesRestoreFamily::Ipv4,
+            XtablesToolRole::Restore,
+            paths.ipv4,
+        )?;
+        let mut ipv6 = paths
             .ipv6
-            .map(|path| PinnedRestoreTool::open(XtablesRestoreFamily::Ipv6, path, config.timeout))
+            .map(|path| {
+                PinnedXtablesTool::open_exact_unprobed(
+                    XtablesRestoreFamily::Ipv6,
+                    XtablesToolRole::Restore,
+                    path,
+                )
+            })
             .transpose()?;
+        // Open, validate, and descriptor-pin the complete selected mapping
+        // before any candidate executable is allowed to run its version probe.
+        ipv4.probe(config.timeout)?;
+        if let Some(ipv6) = &mut ipv6 {
+            ipv6.probe(config.timeout)?;
+        }
         if let Some(ipv6) = &ipv6
             && ipv4.identity.reported_flavor != ipv6.identity.reported_flavor
         {
@@ -680,8 +979,9 @@ impl XtablesRestoreProcessAdapter {
         let output = run_pinned_process(
             tool,
             XtablesRestoreProcessOperation::Restore,
-            &["-w", &wait, "--noflush"],
-            input,
+            &["-w", &wait, "--noflush", "--modprobe=/dev/null"],
+            ProcessStdin::Bytes(input),
+            CapturePolicy::Tail(MAX_CAPTURE_BYTES),
             config.timeout,
         )?;
         // Descriptor pinning prevents path replacement, while the paired
@@ -692,12 +992,12 @@ impl XtablesRestoreProcessAdapter {
         Ok(XtablesRestoreProcessOutput {
             family,
             tool_identity: tool.identity.clone(),
-            stdout: output.stdout,
-            stderr: output.stderr,
+            stdout: bounded_lossy_tail(&output.stdout.bytes).into_boxed_str(),
+            stderr: bounded_lossy_tail(&output.stderr.bytes).into_boxed_str(),
         })
     }
 
-    fn tool(&self, family: XtablesRestoreFamily) -> Option<&PinnedRestoreTool> {
+    fn tool(&self, family: XtablesRestoreFamily) -> Option<&PinnedXtablesTool> {
         match family {
             XtablesRestoreFamily::Ipv4 => Some(&self.ipv4),
             XtablesRestoreFamily::Ipv6 => self.ipv6.as_ref(),
@@ -705,80 +1005,105 @@ impl XtablesRestoreProcessAdapter {
     }
 }
 
-struct PinnedRestoreTool {
+#[derive(Debug)]
+struct PinnedXtablesTool {
     family: XtablesRestoreFamily,
+    role: XtablesToolRole,
     file: File,
     script: bool,
     identity: XtablesRestoreToolIdentity,
 }
 
-impl PinnedRestoreTool {
-    fn open(
+impl PinnedXtablesTool {
+    fn open_exact_unprobed(
         family: XtablesRestoreFamily,
+        role: XtablesToolRole,
         path: PathBuf,
-        timeout: Duration,
     ) -> Result<Self, XtablesRestoreProcessError> {
         validate_tool_path(family, &path)?;
-        let file = open_tool_file(family, &path)?;
+        let file = open_tool_file_exact(family, &path)?;
+        Self::from_opened_unprobed(family, role, path, file)
+    }
+
+    fn from_opened_unprobed(
+        family: XtablesRestoreFamily,
+        role: XtablesToolRole,
+        path: PathBuf,
+        file: File,
+    ) -> Result<Self, XtablesRestoreProcessError> {
         validate_tool_file(family, &path, &file)?;
         let digest = digest_tool_file(family, &path, &file)?;
+        let file_identity = tool_file_identity(family, &path, &file)?;
         let script = descriptor_is_script(family, &path, &file)?;
-        let provisional = Self {
+        Ok(Self {
             family,
+            role,
             file,
             script,
             identity: XtablesRestoreToolIdentity {
                 path: path.clone(),
+                family,
+                role,
+                applet: role.applet(family).into(),
+                file: file_identity,
                 digest,
                 reported_flavor: XtablesRestoreReportedFlavor::Legacy,
+                release: Box::from("unprobed"),
                 version: Box::from("unprobed"),
             },
-        };
+        })
+    }
+
+    fn probe(&mut self, timeout: Duration) -> Result<(), XtablesRestoreProcessError> {
         let output = run_pinned_process(
-            &provisional,
-            XtablesRestoreProcessOperation::Probe,
+            self,
+            XtablesRestoreProcessOperation::Probe(self.role),
             &["--version"],
-            Box::new([]),
+            ProcessStdin::Null,
+            CapturePolicy::Tail(MAX_CAPTURE_BYTES),
             timeout,
         )?;
-        let version = joined_version_output(&output.stdout, &output.stderr);
-        let reported_flavor = classify_reported_flavor(family, &version)?;
-        let observed = digest_tool_file(family, &path, &provisional.file)?;
-        if observed != digest {
+        let stdout = bounded_lossy_tail(&output.stdout.bytes);
+        let stderr = bounded_lossy_tail(&output.stderr.bytes);
+        let version = joined_version_output(&stdout, &stderr);
+        let (reported_flavor, release) = parse_tool_version(self.family, self.role, &version)?;
+        let observed = digest_tool_file(self.family, &self.identity.path, &self.file)?;
+        let observed_file = tool_file_identity(self.family, &self.identity.path, &self.file)?;
+        if observed != self.identity.digest || observed_file != self.identity.file {
             return Err(XtablesRestoreProcessError::ToolIdentityChanged {
-                family,
-                path,
+                family: self.family,
+                path: self.identity.path.clone(),
                 mutation: XtablesRestoreMutationDisposition::NotStarted,
             });
         }
-        Ok(Self {
-            identity: XtablesRestoreToolIdentity {
-                path,
-                digest,
-                reported_flavor,
-                version,
-            },
-            ..provisional
-        })
+        self.identity.reported_flavor = reported_flavor;
+        self.identity.release = release;
+        self.identity.version = version;
+        Ok(())
     }
 
     fn verify_identity(
         &self,
         mutation: XtablesRestoreMutationDisposition,
     ) -> Result<(), XtablesRestoreProcessError> {
-        let observed =
-            digest_tool_file(self.family, &self.identity.path, &self.file).map_err(|source| {
-                if mutation == XtablesRestoreMutationDisposition::MayHaveMutated {
-                    XtablesRestoreProcessError::PostExecutionToolIdentity {
-                        family: self.family,
-                        path: self.identity.path.clone(),
-                        source: Box::new(source),
-                    }
-                } else {
-                    source
+        let observe = || {
+            Ok((
+                digest_tool_file(self.family, &self.identity.path, &self.file)?,
+                tool_file_identity(self.family, &self.identity.path, &self.file)?,
+            ))
+        };
+        let (observed, observed_file) = observe().map_err(|source| {
+            if mutation == XtablesRestoreMutationDisposition::MayHaveMutated {
+                XtablesRestoreProcessError::PostExecutionToolIdentity {
+                    family: self.family,
+                    path: self.identity.path.clone(),
+                    source: Box::new(source),
                 }
-            })?;
-        if observed == self.identity.digest {
+            } else {
+                source
+            }
+        })?;
+        if observed == self.identity.digest && observed_file == self.identity.file {
             Ok(())
         } else {
             Err(XtablesRestoreProcessError::ToolIdentityChanged {
@@ -790,14 +1115,454 @@ impl PinnedRestoreTool {
     }
 }
 
+#[derive(Debug)]
+struct PinnedXtablesFamily {
+    command: PinnedXtablesTool,
+    restore: PinnedXtablesTool,
+    save: PinnedXtablesTool,
+}
+
+impl PinnedXtablesFamily {
+    fn open_exact_unprobed(
+        family: XtablesRestoreFamily,
+        paths: XtablesToolFamilyPaths,
+    ) -> Result<Self, XtablesRestoreProcessError> {
+        Ok(Self {
+            command: PinnedXtablesTool::open_exact_unprobed(
+                family,
+                XtablesToolRole::Command,
+                paths.command,
+            )?,
+            restore: PinnedXtablesTool::open_exact_unprobed(
+                family,
+                XtablesToolRole::Restore,
+                paths.restore,
+            )?,
+            save: PinnedXtablesTool::open_exact_unprobed(
+                family,
+                XtablesToolRole::Save,
+                paths.save,
+            )?,
+        })
+    }
+
+    fn discover_standard_unprobed(
+        root: &File,
+        root_path: &Path,
+        family: XtablesRestoreFamily,
+    ) -> Result<Self, XtablesRestoreProcessError> {
+        Ok(Self {
+            command: open_discovered_tool(root, root_path, family, XtablesToolRole::Command)?,
+            restore: open_discovered_tool(root, root_path, family, XtablesToolRole::Restore)?,
+            save: open_discovered_tool(root, root_path, family, XtablesToolRole::Save)?,
+        })
+    }
+
+    fn probe_all(&mut self, timeout: Duration) -> Result<(), XtablesRestoreProcessError> {
+        self.command.probe(timeout)?;
+        self.restore.probe(timeout)?;
+        self.save.probe(timeout)
+    }
+
+    const fn tool(&self, role: XtablesToolRole) -> &PinnedXtablesTool {
+        match role {
+            XtablesToolRole::Command => &self.command,
+            XtablesToolRole::Restore => &self.restore,
+            XtablesToolRole::Save => &self.save,
+        }
+    }
+
+    fn identity(&self) -> XtablesToolFamilyIdentity {
+        XtablesToolFamilyIdentity {
+            command: self.command.identity.clone(),
+            restore: self.restore.identity.clone(),
+            save: self.save.identity.clone(),
+        }
+    }
+
+    fn verify_all(
+        &self,
+        mutation: XtablesRestoreMutationDisposition,
+    ) -> Result<(), XtablesRestoreProcessError> {
+        self.command.verify_identity(mutation)?;
+        self.restore.verify_identity(mutation)?;
+        self.save.verify_identity(mutation)
+    }
+}
+
+/// Coherent descriptor-pinned command/restore/save process Adapter.
+///
+/// The Adapter exposes only typed restore and save operations. It never accepts
+/// caller-supplied argument vectors, and successful process execution remains
+/// implementation evidence rather than native transaction authority.
+#[derive(Debug)]
+pub(crate) struct XtablesToolSetProcessAdapter {
+    ipv4: PinnedXtablesFamily,
+    ipv6: Option<PinnedXtablesFamily>,
+    identity: XtablesToolSetIdentity,
+    config: XtablesRestoreProcessConfig,
+}
+
+impl XtablesToolSetProcessAdapter {
+    pub(crate) fn open_exact(
+        paths: XtablesToolSetPaths,
+        config: XtablesRestoreProcessConfig,
+    ) -> Result<Self, XtablesRestoreProcessError> {
+        Self::open_exact_with_coherence(paths, config, true)
+    }
+
+    fn open_exact_with_coherence(
+        paths: XtablesToolSetPaths,
+        config: XtablesRestoreProcessConfig,
+        require_common_digest: bool,
+    ) -> Result<Self, XtablesRestoreProcessError> {
+        ensure_supported()?;
+        let ipv4 =
+            PinnedXtablesFamily::open_exact_unprobed(XtablesRestoreFamily::Ipv4, paths.ipv4)?;
+        let ipv6 = paths
+            .ipv6
+            .map(|paths| {
+                PinnedXtablesFamily::open_exact_unprobed(XtablesRestoreFamily::Ipv6, paths)
+            })
+            .transpose()?;
+        Self::from_families(ipv4, ipv6, config, require_common_digest)
+    }
+
+    pub(crate) fn discover_standard(
+        root: impl AsRef<Path>,
+        include_ipv6: bool,
+        config: XtablesRestoreProcessConfig,
+    ) -> Result<Self, XtablesRestoreProcessError> {
+        Self::discover_standard_with_coherence(root.as_ref(), include_ipv6, config, true)
+    }
+
+    fn discover_standard_with_coherence(
+        root_path: &Path,
+        include_ipv6: bool,
+        config: XtablesRestoreProcessConfig,
+        require_common_digest: bool,
+    ) -> Result<Self, XtablesRestoreProcessError> {
+        ensure_supported()?;
+        validate_discovery_root(root_path)?;
+        let root = open_discovery_root(root_path)?;
+        let ipv4 = PinnedXtablesFamily::discover_standard_unprobed(
+            &root,
+            root_path,
+            XtablesRestoreFamily::Ipv4,
+        )?;
+        let ipv6 = include_ipv6
+            .then(|| {
+                PinnedXtablesFamily::discover_standard_unprobed(
+                    &root,
+                    root_path,
+                    XtablesRestoreFamily::Ipv6,
+                )
+            })
+            .transpose()?;
+        Self::from_families(ipv4, ipv6, config, require_common_digest)
+    }
+
+    #[cfg(test)]
+    fn open_exact_for_tests(
+        paths: XtablesToolSetPaths,
+        config: XtablesRestoreProcessConfig,
+    ) -> Result<Self, XtablesRestoreProcessError> {
+        Self::open_exact_with_coherence(paths, config, false)
+    }
+
+    #[cfg(test)]
+    fn discover_standard_for_tests(
+        root: impl AsRef<Path>,
+        include_ipv6: bool,
+        config: XtablesRestoreProcessConfig,
+    ) -> Result<Self, XtablesRestoreProcessError> {
+        Self::discover_standard_with_coherence(root.as_ref(), include_ipv6, config, false)
+    }
+
+    fn from_families(
+        mut ipv4: PinnedXtablesFamily,
+        mut ipv6: Option<PinnedXtablesFamily>,
+        config: XtablesRestoreProcessConfig,
+        require_common_digest: bool,
+    ) -> Result<Self, XtablesRestoreProcessError> {
+        validate_tool_set_mapping_coherence(&ipv4, ipv6.as_ref(), require_common_digest)?;
+        // Mapping and trust admission happens before the first `--version`
+        // execution. A mismapped candidate therefore cannot execute merely to
+        // tell Flux that the set is incoherent.
+        ipv4.probe_all(config.timeout)?;
+        if let Some(ipv6) = &mut ipv6 {
+            ipv6.probe_all(config.timeout)?;
+        }
+        validate_tool_set_version_coherence(&ipv4, ipv6.as_ref())?;
+        let ipv4_identity = ipv4.identity();
+        let ipv6_identity = ipv6.as_ref().map(PinnedXtablesFamily::identity);
+        let reported_flavor = ipv4.command.identity.reported_flavor;
+        let release = ipv4.command.identity.release.clone();
+        let digest = digest_tool_set(&ipv4_identity, ipv6_identity.as_ref());
+        Ok(Self {
+            ipv4,
+            ipv6,
+            identity: XtablesToolSetIdentity {
+                digest,
+                reported_flavor,
+                release,
+                ipv4: ipv4_identity,
+                ipv6: ipv6_identity,
+            },
+            config,
+        })
+    }
+
+    #[must_use]
+    pub(crate) const fn identity(&self) -> &XtablesToolSetIdentity {
+        &self.identity
+    }
+
+    pub(crate) fn restore(
+        &mut self,
+        artifact: &XtablesRestoreArtifact,
+    ) -> Result<XtablesRestoreProcessOutput, XtablesRestoreProcessError> {
+        let family = artifact.context().family();
+        let config = self.config;
+        self.verify_all(XtablesRestoreMutationDisposition::NotStarted)?;
+        let tool = self
+            .family(family)
+            .ok_or(XtablesRestoreProcessError::MissingFamily { family })?
+            .tool(XtablesToolRole::Restore);
+        let wait = config.wait_seconds.to_string();
+        // This disables the userspace modprobe helper only. It is not evidence
+        // that the kernel avoided request_module(), so the caller must not
+        // treat process success as no-autoload or production mutation authority.
+        let output = run_pinned_process(
+            tool,
+            XtablesRestoreProcessOperation::Restore,
+            &["-w", &wait, "--noflush", "--modprobe=/dev/null"],
+            ProcessStdin::Bytes(artifact.render_canonical()),
+            CapturePolicy::Tail(MAX_CAPTURE_BYTES),
+            config.timeout,
+        )?;
+        self.verify_all(XtablesRestoreMutationDisposition::MayHaveMutated)?;
+        Ok(XtablesRestoreProcessOutput {
+            family,
+            tool_identity: tool.identity.clone(),
+            stdout: bounded_lossy_tail(&output.stdout.bytes).into_boxed_str(),
+            stderr: bounded_lossy_tail(&output.stderr.bytes).into_boxed_str(),
+        })
+    }
+
+    pub(crate) fn save(
+        &mut self,
+        family: XtablesRestoreFamily,
+    ) -> Result<XtablesSaveProcessOutput, XtablesRestoreProcessError> {
+        let config = self.config;
+        self.verify_all(XtablesRestoreMutationDisposition::NotStarted)?;
+        let tool = self
+            .family(family)
+            .ok_or(XtablesRestoreProcessError::MissingFamily { family })?
+            .tool(XtablesToolRole::Save);
+        let output = run_pinned_process(
+            tool,
+            XtablesRestoreProcessOperation::Save,
+            &[],
+            ProcessStdin::Null,
+            CapturePolicy::Complete(MAX_XTABLES_RESTORE_BYTES),
+            config.timeout,
+        )?;
+        self.verify_all(XtablesRestoreMutationDisposition::NotStarted)?;
+        Ok(XtablesSaveProcessOutput {
+            family,
+            tool_identity: tool.identity.clone(),
+            stdout: output.stdout.bytes.into_boxed_slice(),
+            stderr: bounded_lossy_tail(&output.stderr.bytes).into_boxed_str(),
+        })
+    }
+
+    fn family(&self, family: XtablesRestoreFamily) -> Option<&PinnedXtablesFamily> {
+        match family {
+            XtablesRestoreFamily::Ipv4 => Some(&self.ipv4),
+            XtablesRestoreFamily::Ipv6 => self.ipv6.as_ref(),
+        }
+    }
+
+    fn verify_all(
+        &self,
+        mutation: XtablesRestoreMutationDisposition,
+    ) -> Result<(), XtablesRestoreProcessError> {
+        self.ipv4.verify_all(mutation)?;
+        if let Some(ipv6) = &self.ipv6 {
+            ipv6.verify_all(mutation)?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_tool_set_mapping_coherence(
+    ipv4: &PinnedXtablesFamily,
+    ipv6: Option<&PinnedXtablesFamily>,
+    require_common_digest: bool,
+) -> Result<(), XtablesRestoreProcessError> {
+    if !require_common_digest {
+        return Ok(());
+    }
+    let reference = &ipv4.command.identity;
+    for family_tools in std::iter::once(ipv4).chain(ipv6) {
+        for role in [
+            XtablesToolRole::Command,
+            XtablesToolRole::Restore,
+            XtablesToolRole::Save,
+        ] {
+            let identity = &family_tools.tool(role).identity;
+            if identity.digest != reference.digest {
+                return Err(tool_set_coherence_error(
+                    identity,
+                    "executable digest differs from the admitted multicall profile".to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_tool_set_version_coherence(
+    ipv4: &PinnedXtablesFamily,
+    ipv6: Option<&PinnedXtablesFamily>,
+) -> Result<(), XtablesRestoreProcessError> {
+    let reference = &ipv4.command.identity;
+    for family_tools in std::iter::once(ipv4).chain(ipv6) {
+        for role in [
+            XtablesToolRole::Command,
+            XtablesToolRole::Restore,
+            XtablesToolRole::Save,
+        ] {
+            let identity = &family_tools.tool(role).identity;
+            if identity.reported_flavor != reference.reported_flavor {
+                return Err(tool_set_coherence_error(
+                    identity,
+                    format!(
+                        "reported {:?}, expected {:?}",
+                        identity.reported_flavor, reference.reported_flavor
+                    ),
+                ));
+            }
+            if identity.release != reference.release {
+                return Err(tool_set_coherence_error(
+                    identity,
+                    format!(
+                        "reported release {}, expected {}",
+                        identity.release, reference.release
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn tool_set_coherence_error(
+    identity: &XtablesRestoreToolIdentity,
+    reason: String,
+) -> XtablesRestoreProcessError {
+    XtablesRestoreProcessError::ToolSetCoherence {
+        family: identity.family,
+        role: identity.role,
+        reason: reason.into_boxed_str(),
+    }
+}
+
+fn digest_tool_set(
+    ipv4: &XtablesToolFamilyIdentity,
+    ipv6: Option<&XtablesToolFamilyIdentity>,
+) -> XtablesToolSetDigest {
+    let mut digest = Sha256::new();
+    digest.update(TOOL_SET_DIGEST_DOMAIN);
+    hash_tool_family(&mut digest, XtablesRestoreFamily::Ipv4, ipv4);
+    if let Some(ipv6) = ipv6 {
+        digest.update([1]);
+        hash_tool_family(&mut digest, XtablesRestoreFamily::Ipv6, ipv6);
+    } else {
+        digest.update([0]);
+    }
+    XtablesToolSetDigest(digest.finalize().into())
+}
+
+fn hash_tool_family(
+    digest: &mut Sha256,
+    family: XtablesRestoreFamily,
+    identity: &XtablesToolFamilyIdentity,
+) {
+    digest.update([match family {
+        XtablesRestoreFamily::Ipv4 => 4,
+        XtablesRestoreFamily::Ipv6 => 6,
+    }]);
+    for role in [
+        XtablesToolRole::Command,
+        XtablesToolRole::Restore,
+        XtablesToolRole::Save,
+    ] {
+        let tool = identity.tool(role);
+        digest.update([role.tag()]);
+        hash_sized_bytes(digest, tool.applet.as_bytes());
+        hash_sized_bytes(digest, path_bytes(&tool.path).as_ref());
+        digest.update(tool.file.device.to_le_bytes());
+        digest.update(tool.file.inode.to_le_bytes());
+        digest.update(tool.file.length.to_le_bytes());
+        digest.update(tool.file.mode.to_le_bytes());
+        digest.update(tool.file.owner_user.to_le_bytes());
+        digest.update(tool.file.owner_group.to_le_bytes());
+        digest.update(tool.file.modified_seconds.to_le_bytes());
+        digest.update(tool.file.modified_nanoseconds.to_le_bytes());
+        digest.update(tool.digest.as_bytes());
+        digest.update([match tool.reported_flavor {
+            XtablesRestoreReportedFlavor::Legacy => 1,
+            XtablesRestoreReportedFlavor::NfTables => 2,
+        }]);
+        hash_sized_bytes(digest, tool.release.as_bytes());
+        hash_sized_bytes(digest, tool.version.as_bytes());
+    }
+}
+
+fn hash_sized_bytes(digest: &mut Sha256, bytes: &[u8]) {
+    digest.update((bytes.len() as u64).to_le_bytes());
+    digest.update(bytes);
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn path_bytes(path: &Path) -> std::borrow::Cow<'_, [u8]> {
+    std::borrow::Cow::Borrowed(path.as_os_str().as_bytes())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn path_bytes(path: &Path) -> std::borrow::Cow<'_, [u8]> {
+    std::borrow::Cow::Owned(path.to_string_lossy().into_owned().into_bytes())
+}
+
 struct ProcessOutput {
-    stdout: Box<str>,
-    stderr: Box<str>,
+    stdout: CapturedBytes,
+    stderr: CapturedBytes,
 }
 
 struct CapturedBytes {
-    tail: Vec<u8>,
+    bytes: Vec<u8>,
     total: usize,
+}
+
+enum ProcessStdin {
+    Null,
+    Bytes(Box<[u8]>),
+}
+
+#[derive(Clone, Copy)]
+enum CapturePolicy {
+    Tail(usize),
+    Complete(usize),
+}
+
+impl CapturePolicy {
+    const fn limit(self) -> usize {
+        match self {
+            Self::Tail(limit) | Self::Complete(limit) => limit,
+        }
+    }
 }
 
 enum ChildCompletion {
@@ -811,15 +1576,16 @@ enum ChildCompletion {
 }
 
 fn run_pinned_process(
-    tool: &PinnedRestoreTool,
+    tool: &PinnedXtablesTool,
     operation: XtablesRestoreProcessOperation,
     arguments: &[&str],
-    input: Box<[u8]>,
+    input: ProcessStdin,
+    stdout_policy: CapturePolicy,
     timeout: Duration,
 ) -> Result<ProcessOutput, XtablesRestoreProcessError> {
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
-        let _ = (tool, operation, arguments, input, timeout);
+        let _ = (tool, operation, arguments, input, stdout_policy, timeout);
         return Err(XtablesRestoreProcessError::UnsupportedPlatform(
             std::env::consts::OS,
         ));
@@ -835,11 +1601,17 @@ fn run_pinned_process(
         })?;
         let program = descriptor_path(&tool.file);
         let mut command = Command::new(&program);
+        let piped_stdin = matches!(&input, ProcessStdin::Bytes(_));
         command
+            .arg0(tool.identity.applet())
             .args(arguments)
             .env_clear()
             .current_dir("/")
-            .stdin(Stdio::piped())
+            .stdin(if piped_stdin {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         child_process::configure_child_process(
@@ -871,22 +1643,23 @@ fn run_pinned_process(
                 source,
             })?;
         let pid = child.id();
-        let stdin = child.stdin.take().expect("piped stdin is present");
+        let stdin = child.stdin.take();
         let stdout = child.stdout.take().expect("piped stdout is present");
         let stderr = child.stderr.take().expect("piped stderr is present");
-        if let Err(source) = child_process::set_nonblocking(stdin.as_raw_fd()) {
-            let error = XtablesRestoreProcessError::Stream {
-                operation,
-                family: tool.family,
-                stream: XtablesRestoreProcessStream::Stdin,
-                source,
-            };
+        if let Some(stdin) = &stdin
+            && let Err(source) = child_process::set_nonblocking(stdin.as_raw_fd())
+        {
             return Err(setup_failure_error(
                 child,
                 pid,
                 operation,
                 tool.family,
-                error,
+                XtablesRestoreProcessError::Stream {
+                    operation,
+                    family: tool.family,
+                    stream: XtablesRestoreProcessStream::Stdin,
+                    source,
+                },
             ));
         }
         if let Err(source) = child_process::set_nonblocking(stdout.as_raw_fd()) {
@@ -923,19 +1696,26 @@ fn run_pinned_process(
         let stop = Arc::new(AtomicBool::new(false));
         let stdout_total = Arc::new(AtomicUsize::new(0));
         let stderr_total = Arc::new(AtomicUsize::new(0));
-        let stdin_worker =
-            match spawn_stdin_worker(operation, tool.family, stdin, input, Arc::clone(&stop)) {
-                Ok(worker) => worker,
-                Err(error) => {
-                    return Err(setup_failure_error(
-                        child,
-                        pid,
-                        operation,
-                        tool.family,
-                        error,
-                    ));
+        let stdin_worker = match (stdin, input) {
+            (Some(stdin), ProcessStdin::Bytes(bytes)) => {
+                match spawn_stdin_worker(operation, tool.family, stdin, bytes, Arc::clone(&stop)) {
+                    Ok(worker) => Some(worker),
+                    Err(error) => {
+                        return Err(setup_failure_error(
+                            child,
+                            pid,
+                            operation,
+                            tool.family,
+                            error,
+                        ));
+                    }
                 }
-            };
+            }
+            (None, ProcessStdin::Null) => None,
+            (Some(_), ProcessStdin::Null) | (None, ProcessStdin::Bytes(_)) => {
+                unreachable!("configured child stdin and typed input must agree")
+            }
+        };
         let stdout_worker = match spawn_capture_worker(
             operation,
             tool.family,
@@ -943,12 +1723,15 @@ fn run_pinned_process(
             stdout,
             Arc::clone(&stop),
             Arc::clone(&stdout_total),
+            stdout_policy,
         ) {
             Ok(worker) => worker,
             Err(error) => {
                 stop.store(true, Ordering::Release);
                 let cleanup = cleanup_process_group(&mut child, pid);
-                let _ = join_stdin_worker(stdin_worker, operation, tool.family);
+                if let Some(stdin_worker) = stdin_worker {
+                    let _ = join_stdin_worker(stdin_worker, operation, tool.family);
+                }
                 if let Err(source) = cleanup {
                     defer_reap(child);
                     return Err(XtablesRestoreProcessError::Cleanup {
@@ -968,12 +1751,15 @@ fn run_pinned_process(
             stderr,
             Arc::clone(&stop),
             Arc::clone(&stderr_total),
+            CapturePolicy::Tail(MAX_CAPTURE_BYTES),
         ) {
             Ok(worker) => worker,
             Err(error) => {
                 stop.store(true, Ordering::Release);
                 let cleanup = cleanup_process_group(&mut child, pid);
-                let _ = join_stdin_worker(stdin_worker, operation, tool.family);
+                if let Some(stdin_worker) = stdin_worker {
+                    let _ = join_stdin_worker(stdin_worker, operation, tool.family);
+                }
                 let _ = join_capture_worker(
                     stdout_worker,
                     operation,
@@ -992,9 +1778,10 @@ fn run_pinned_process(
                 return Err(error);
             }
         };
+        let stdout_limit = stdout_policy.limit();
         let completion = loop {
             let stdout_seen = stdout_total.load(Ordering::Acquire);
-            if stdout_seen > MAX_CAPTURE_BYTES {
+            if stdout_seen > stdout_limit {
                 break ChildCompletion::OutputLimit {
                     stream: XtablesRestoreProcessStream::Stdout,
                     actual: stdout_seen,
@@ -1017,7 +1804,9 @@ fn run_pinned_process(
 
         let cleanup = cleanup_process_group(&mut child, pid);
         stop.store(true, Ordering::Release);
-        let stdin_result = join_stdin_worker(stdin_worker, operation, tool.family);
+        let stdin_result = stdin_worker
+            .map(|worker| join_stdin_worker(worker, operation, tool.family))
+            .transpose();
         let stdout_result = join_capture_worker(
             stdout_worker,
             operation,
@@ -1042,17 +1831,17 @@ fn run_pinned_process(
         }
         let stdout = stdout_result?;
         let stderr = stderr_result?;
-        let stdout_text = bounded_lossy_tail(&stdout.tail).into_boxed_str();
-        let stderr_text = bounded_lossy_tail(&stderr.tail).into_boxed_str();
+        let stdout_text = bounded_lossy_tail(&stdout.bytes).into_boxed_str();
+        let stderr_text = bounded_lossy_tail(&stderr.bytes).into_boxed_str();
         let stdout_actual = stdout.total.max(stdout_total.load(Ordering::Acquire));
         let stderr_actual = stderr.total.max(stderr_total.load(Ordering::Acquire));
 
-        if stdout_actual > MAX_CAPTURE_BYTES {
+        if stdout_actual > stdout_limit {
             return Err(XtablesRestoreProcessError::OutputLimit {
                 operation,
                 family: tool.family,
                 stream: XtablesRestoreProcessStream::Stdout,
-                maximum: MAX_CAPTURE_BYTES,
+                maximum: stdout_limit,
                 actual: stdout_actual,
                 stdout: stdout_text,
                 stderr: stderr_text,
@@ -1085,11 +1874,18 @@ fn run_pinned_process(
                 stderr: stderr_text,
             }),
             ChildCompletion::OutputLimit { stream, actual } => {
+                let maximum = match stream {
+                    XtablesRestoreProcessStream::Stdout => stdout_limit,
+                    XtablesRestoreProcessStream::Stderr => MAX_CAPTURE_BYTES,
+                    XtablesRestoreProcessStream::Stdin => {
+                        unreachable!("stdin is never an output-limit stream")
+                    }
+                };
                 Err(XtablesRestoreProcessError::OutputLimit {
                     operation,
                     family: tool.family,
                     stream,
-                    maximum: MAX_CAPTURE_BYTES,
+                    maximum,
                     actual,
                     stdout: stdout_text,
                     stderr: stderr_text,
@@ -1106,10 +1902,7 @@ fn run_pinned_process(
             }
             ChildCompletion::Exited(_) => {
                 stdin_result?;
-                Ok(ProcessOutput {
-                    stdout: stdout_text,
-                    stderr: stderr_text,
-                })
+                Ok(ProcessOutput { stdout, stderr })
             }
         }
     }
@@ -1165,6 +1958,7 @@ fn spawn_capture_worker<R>(
     mut reader: R,
     stop: Arc<AtomicBool>,
     total: Arc<AtomicUsize>,
+    policy: CapturePolicy,
 ) -> Result<thread::JoinHandle<io::Result<CapturedBytes>>, XtablesRestoreProcessError>
 where
     R: Read + Send + 'static,
@@ -1172,27 +1966,35 @@ where
     thread::Builder::new()
         .name(format!("flux-xtables-{family:?}-{stream}"))
         .spawn(move || {
-            let mut tail = Vec::with_capacity(MAX_CAPTURE_BYTES);
+            let mut bytes = Vec::with_capacity(policy.limit().min(16 * 1024));
             let mut observed = 0_usize;
             let mut buffer = [0_u8; 4096];
             loop {
                 match reader.read(&mut buffer) {
                     Ok(0) => {
                         return Ok(CapturedBytes {
-                            tail,
+                            bytes,
                             total: observed,
                         });
                     }
                     Ok(read) => {
                         observed = observed.saturating_add(read);
                         total.store(observed, Ordering::Release);
-                        retain_tail(&mut tail, &buffer[..read]);
+                        match policy {
+                            CapturePolicy::Tail(limit) => {
+                                retain_tail(&mut bytes, &buffer[..read], limit);
+                            }
+                            CapturePolicy::Complete(limit) => {
+                                let remaining = limit.saturating_sub(bytes.len());
+                                bytes.extend_from_slice(&buffer[..read.min(remaining)]);
+                            }
+                        }
                     }
                     Err(source) if source.kind() == io::ErrorKind::Interrupted => {}
                     Err(source) if source.kind() == io::ErrorKind::WouldBlock => {
                         if stop.load(Ordering::Acquire) {
                             return Ok(CapturedBytes {
-                                tail,
+                                bytes,
                                 total: observed,
                             });
                         }
@@ -1251,16 +2053,13 @@ fn join_capture_worker(
         })
 }
 
-fn retain_tail(tail: &mut Vec<u8>, bytes: &[u8]) {
-    if bytes.len() >= MAX_CAPTURE_BYTES {
+fn retain_tail(tail: &mut Vec<u8>, bytes: &[u8], limit: usize) {
+    if bytes.len() >= limit {
         tail.clear();
-        tail.extend_from_slice(&bytes[bytes.len() - MAX_CAPTURE_BYTES..]);
+        tail.extend_from_slice(&bytes[bytes.len() - limit..]);
         return;
     }
-    let overflow = tail
-        .len()
-        .saturating_add(bytes.len())
-        .saturating_sub(MAX_CAPTURE_BYTES);
+    let overflow = tail.len().saturating_add(bytes.len()).saturating_sub(limit);
     if overflow != 0 {
         tail.drain(..overflow);
     }
@@ -1290,20 +2089,40 @@ fn joined_version_output(stdout: &str, stderr: &str) -> Box<str> {
     }
 }
 
-fn classify_reported_flavor(
+fn parse_tool_version(
     family: XtablesRestoreFamily,
+    role: XtablesToolRole,
     version: &str,
-) -> Result<XtablesRestoreReportedFlavor, XtablesRestoreProcessError> {
-    let legacy = version.contains("(legacy)");
-    let nft = version.contains("(nf_tables)");
-    match (legacy, nft) {
-        (true, false) => Ok(XtablesRestoreReportedFlavor::Legacy),
-        (false, true) => Ok(XtablesRestoreReportedFlavor::NfTables),
-        _ => Err(XtablesRestoreProcessError::ToolFlavor {
+) -> Result<(XtablesRestoreReportedFlavor, Box<str>), XtablesRestoreProcessError> {
+    let prefix = format!("{} v", role.applet(family));
+    let Some(remainder) = version.strip_prefix(&prefix) else {
+        return Err(XtablesRestoreProcessError::ToolFlavor {
             family,
             version: version.into(),
-        }),
+        });
+    };
+    let (release, reported_flavor) = if let Some(release) = remainder.strip_suffix(" (legacy)") {
+        (release, XtablesRestoreReportedFlavor::Legacy)
+    } else if let Some(release) = remainder.strip_suffix(" (nf_tables)") {
+        (release, XtablesRestoreReportedFlavor::NfTables)
+    } else {
+        return Err(XtablesRestoreProcessError::ToolFlavor {
+            family,
+            version: version.into(),
+        });
+    };
+    if release.is_empty()
+        || release.len() > 128
+        || !release
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'+' | b'-'))
+    {
+        return Err(XtablesRestoreProcessError::ToolFlavor {
+            family,
+            version: version.into(),
+        });
     }
+    Ok((reported_flavor, release.into()))
 }
 
 fn validate_tool_path(
@@ -1322,7 +2141,7 @@ fn validate_tool_path(
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn open_tool_file(
+fn open_tool_file_exact(
     family: XtablesRestoreFamily,
     path: &Path,
 ) -> Result<File, XtablesRestoreProcessError> {
@@ -1338,11 +2157,88 @@ fn open_tool_file(
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
-fn open_tool_file(
+fn open_tool_file_exact(
     family: XtablesRestoreFamily,
     path: &Path,
 ) -> Result<File, XtablesRestoreProcessError> {
     let _ = (family, path);
+    Err(XtablesRestoreProcessError::UnsupportedPlatform(
+        std::env::consts::OS,
+    ))
+}
+
+fn validate_discovery_root(root: &Path) -> Result<(), XtablesRestoreProcessError> {
+    if root.is_absolute() {
+        Ok(())
+    } else {
+        Err(XtablesRestoreProcessError::InvalidPath {
+            family: XtablesRestoreFamily::Ipv4,
+            path: root.to_path_buf(),
+            reason: Box::from("system xtables discovery root must be absolute"),
+        })
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn open_discovery_root(root: &Path) -> Result<File, XtablesRestoreProcessError> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(root)
+        .map_err(|source| XtablesRestoreProcessError::ToolOpen {
+            family: XtablesRestoreFamily::Ipv4,
+            path: root.to_path_buf(),
+            source,
+        })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn open_discovery_root(root: &Path) -> Result<File, XtablesRestoreProcessError> {
+    let _ = root;
+    Err(XtablesRestoreProcessError::UnsupportedPlatform(
+        std::env::consts::OS,
+    ))
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn open_discovered_tool(
+    root: &File,
+    root_path: &Path,
+    family: XtablesRestoreFamily,
+    role: XtablesToolRole,
+) -> Result<PinnedXtablesTool, XtablesRestoreProcessError> {
+    let applet = role.applet(family);
+    let name = CString::new(applet).expect("fixed xtables applet names contain no NUL");
+    let logical_path = root_path.join(applet);
+    // SAFETY: `root` owns a live directory descriptor, `name` is a fixed
+    // NUL-terminated single component, and successful openat returns a new
+    // descriptor whose ownership is transferred exactly once into `File`.
+    let descriptor = unsafe {
+        libc::openat(
+            root.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK,
+        )
+    };
+    if descriptor < 0 {
+        return Err(XtablesRestoreProcessError::ToolOpen {
+            family,
+            path: logical_path,
+            source: io::Error::last_os_error(),
+        });
+    }
+    // SAFETY: `descriptor` was returned by openat and has not been transferred.
+    let file = unsafe { File::from_raw_fd(descriptor) };
+    PinnedXtablesTool::from_opened_unprobed(family, role, logical_path, file)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn open_discovered_tool(
+    _root: &File,
+    _root_path: &Path,
+    _family: XtablesRestoreFamily,
+    _role: XtablesToolRole,
+) -> Result<PinnedXtablesTool, XtablesRestoreProcessError> {
     Err(XtablesRestoreProcessError::UnsupportedPlatform(
         std::env::consts::OS,
     ))
@@ -1375,7 +2271,58 @@ fn validate_tool_file(
         });
     }
     validate_executable_mode(family, path, &metadata)?;
+    validate_trusted_tool_owner(family, path, &metadata)?;
     validate_descriptor(family, path, file)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn tool_file_identity(
+    family: XtablesRestoreFamily,
+    path: &Path,
+    file: &File,
+) -> Result<XtablesToolFileIdentity, XtablesRestoreProcessError> {
+    let metadata = file
+        .metadata()
+        .map_err(|source| XtablesRestoreProcessError::ToolIdentity {
+            family,
+            path: path.to_path_buf(),
+            source,
+        })?;
+    Ok(XtablesToolFileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        length: metadata.len(),
+        mode: metadata.mode(),
+        owner_user: metadata.uid(),
+        owner_group: metadata.gid(),
+        modified_seconds: metadata.mtime(),
+        modified_nanoseconds: metadata.mtime_nsec(),
+    })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn tool_file_identity(
+    family: XtablesRestoreFamily,
+    path: &Path,
+    file: &File,
+) -> Result<XtablesToolFileIdentity, XtablesRestoreProcessError> {
+    let metadata = file
+        .metadata()
+        .map_err(|source| XtablesRestoreProcessError::ToolIdentity {
+            family,
+            path: path.to_path_buf(),
+            source,
+        })?;
+    Ok(XtablesToolFileIdentity {
+        device: 0,
+        inode: 0,
+        length: metadata.len(),
+        mode: 0,
+        owner_user: 0,
+        owner_group: 0,
+        modified_seconds: 0,
+        modified_nanoseconds: 0,
+    })
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -1393,6 +2340,50 @@ fn validate_executable_mode(
             reason: Box::from("tool is not executable"),
         })
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn validate_trusted_tool_owner(
+    family: XtablesRestoreFamily,
+    path: &Path,
+    metadata: &std::fs::Metadata,
+) -> Result<(), XtablesRestoreProcessError> {
+    let mode = metadata.mode();
+    if mode & 0o022 != 0 {
+        return Err(XtablesRestoreProcessError::InvalidPath {
+            family,
+            path: path.to_path_buf(),
+            reason: Box::from("tool must not be writable by group or other users"),
+        });
+    }
+    // A production root daemon admits only root-owned system tools. Non-root
+    // development and hermetic tests may admit files owned by their own euid;
+    // root-owned distribution tools remain usable for non-root host probes.
+    // SAFETY: geteuid has no arguments, no failure mode, and reads only the
+    // calling process credential.
+    let effective_user = unsafe { libc::geteuid() };
+    if metadata.uid() == 0 || metadata.uid() == effective_user {
+        Ok(())
+    } else {
+        Err(XtablesRestoreProcessError::InvalidPath {
+            family,
+            path: path.to_path_buf(),
+            reason: format!(
+                "tool owner {} is neither root nor the effective user {effective_user}",
+                metadata.uid()
+            )
+            .into_boxed_str(),
+        })
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn validate_trusted_tool_owner(
+    _family: XtablesRestoreFamily,
+    _path: &Path,
+    _metadata: &std::fs::Metadata,
+) -> Result<(), XtablesRestoreProcessError> {
+    Ok(())
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]

@@ -508,21 +508,59 @@ stop_proxy() {
 # [ Entry Point ]
 # ==============================================================================
 
+_release_xtables_writer_lock() {
+    release_shell_xtables_writer_lock
+}
+
+_claim_shell_xtables_writer() {
+    _xtables_writer_inherited=0
+    if [ -n "${FLUX_XTABLES_WRITER_OWNER_PID:-}" ] ||
+        [ -n "${FLUX_XTABLES_WRITER_OWNER_START_TICKS:-}" ] ||
+        [ -n "${FLUX_XTABLES_WRITER_OWNER_BOOT_ID:-}" ]; then
+        if ! inherit_shell_xtables_writer_lock; then
+            log_error "Inherited xtables writer ownership is invalid"
+            return 1
+        fi
+        _xtables_writer_inherited=1
+    else
+        if ! claim_shell_xtables_writer_lock; then
+            log_error "Another xtables ownership transition is in progress"
+            return 1
+        fi
+    fi
+    trap '_release_xtables_writer_lock' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
+    if [ -e "${NATIVE_XTABLES_LEASE_FILE}" ] || [ -L "${NATIVE_XTABLES_LEASE_FILE}" ]; then
+        log_error "Native xtables ownership is active; refusing the shell networking writer"
+        _release_xtables_writer_lock || true
+        return 1
+    fi
+}
+
 main() {
     local action="${1:-}"
+    local rc=0
+
+    _claim_shell_xtables_writer || return 1
 
     case "${action}" in
     start)
-        start_proxy
+        start_proxy || rc=$?
         ;;
     stop)
-        stop_proxy
+        stop_proxy || rc=$?
         ;;
     *)
         echo "Usage: $0 {start|stop}"
-        exit 1
+        rc=1
         ;;
     esac
+
+    _release_xtables_writer_lock || rc=1
+    trap - EXIT INT TERM
+    return "${rc}"
 }
 
 main "$@"

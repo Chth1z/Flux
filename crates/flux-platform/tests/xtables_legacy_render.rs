@@ -261,6 +261,20 @@ fn general_renderer_covers_minimal_application_and_feature_branches() {
 }
 
 #[test]
+fn legacy_renderer_rejects_native_replace_context() {
+    let plan = LegacyRulesPlan::maximal_zone_v1();
+    assert_eq!(
+        render_legacy_rules_restore(LegacyRulesRenderRequest::new(
+            XtablesRestoreContext::new(XtablesRestoreAction::Replace, XtablesRestoreFamily::Ipv4,),
+            &plan,
+        )),
+        Err(LegacyRulesRenderError::UnsupportedAction(
+            XtablesRestoreAction::Replace,
+        ))
+    );
+}
+
+#[test]
 fn general_renderer_preserves_denylist_and_no_owner_fallback_semantics() {
     let denylist = general_plan(
         LegacyApplicationMode::Denylist,

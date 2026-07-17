@@ -1,7 +1,7 @@
 # Generation-Scoped Functional Capture Canary
 
 - Status: supporting pre-release qualification contract; activation work deferred
-- Last updated: 2026-07-16
+- Last updated: 2026-07-17
 
 This document defines a supporting qualification contract for an executed Rust-owned Capture Path.
 The model and development mechanism evidence are retained, but further activation plumbing is deferred until a real
@@ -37,22 +37,43 @@ shadow artifact has no Generation ID, capture-owner record, Backend Plan, writer
 prepared/active state, listener identity, or Runtime Coordinator entry point. A model decision or
 successful frozen-oracle fixture comparison therefore cannot satisfy structural verification,
 construct an attempt, authorize traffic, or publish any functional status. The observation-only
-shadow compiler is complete and frozen; the shell bridge remains the sole executed networking
-writer until the native component cutover.
+shadow compiler is complete and frozen; `scripts/tproxy` remains the sole production restore writer
+until backlog item 3 qualifies and transfers the native component lease.
 
 Legacy source-shape renderer parity and canonical xtables lowering are complete as non-authorizing
 artifacts. Forwarded-only input preserves exact schema-v1 bytes and identities. Any local-OUTPUT
 input selects schema v2: `FLX{4|6}O{generation:010}` is the MARK-only OUTPUT classifier,
 `FLX{4|6}P{generation:010}` is the mark-qualified loopback PREROUTING TPROXY companion when proxy
 traffic exists, and an optional `FLX{4|6}F{generation:010}` retains the forwarded role. Typed entry,
-routing, transparent-listener, compatibility loop-escape, lifecycle, identity, and resource
-metadata describe the full ADR-0012 dependency shape, but no built-in hook is attached and no
-route, listener, or writer authority is acquired. The disposable Linux and rooted-WSA mechanism
-checkpoints are complete, but production realization, established-flow caching, transparent-socket
-DIVERT, FakeIP ICMP, QUIC
-rejection, MSS clamping, native restore, live readback, rollback, and component ownership transfer
-remain later gates. The shadow/lowering lane also adds no eBPF attach/pin path, TUN activation,
-implicit module request, or `.ko`/KPM loading that could provide an alternate evidence source.
+transparent-listener, compatibility loop-escape, lifecycle, identity, and resource metadata describe
+the full ADR-0012 dependency shape. The exact routing identity requires nonzero route and rule
+protocols, an explicit nonzero route metric, IPv4 HOST scope, and IPv6 UNIVERSE scope. The lowering
+itself attaches no built-in hook and acquires no route, listener, or writer authority.
+
+The crate-private `NativeXtablesOwner` and its real process/netlink `Adapter` now consume that
+artifact and provide stable-hook mutation, restore/save, journaled routing, exact readback,
+rollback, crash recovery, and cleanup in deterministic tests and the rooted disposable-WSA
+mechanism checkpoint. Its schema-2 durable identity digests the complete IPv4/IPv6 routing audit and
+loopback name/index; live validation runs in both directions, and complete two-family xtables/routing
+residue checks precede `Active` or `CleanAbsent`. Current terminal journals retain the native guard,
+shared writer fence, and optional lease through fresh global dual-family absence before terminal
+artifacts retire. The coherent previous-boot revision-1 `Activating` pre-lease boundary is
+recoverable; same-boot or mismatched missing-lease state stays fail-closed.
+
+Shell-owner v2 retains parent plus optional child PID/start identities and boot ID. Either live
+participant blocks; one serialized parent-bound mutating `addrsync` or `tproxy` phase child changes
+only its slot and remains blocking after parent death; a live parent can reclaim a dead child; and
+only both-dead, PID-reused, or previous-boot records retire after revalidation. Bare, malformed,
+mixed, and unverifiable locks stay fail-closed. Legacy start/stop/restart/failure cleanup holds the
+same fence before `addrsync` or `tproxy` mutation. The standalone daemon remains a later cutover
+duty. Positive production target
+admission remains deliberately uninhabited, and WSA is not release authority. Backlog item 3 must
+still bind the engine/canary and ownership
+authorities, qualify reviewed Android 5.10/ARM64 profiles, transfer the lease, and delete the
+replaced shell duties. Established-flow caching, transparent-socket DIVERT, FakeIP ICMP, QUIC
+rejection, and MSS clamping remain later gates. Neither lane adds an eBPF attach/pin path, TUN
+activation, implicit module request, or `.ko`/KPM loading that could provide an alternate evidence
+source.
 
 ### Ingress evidence is not local-OUTPUT evidence
 
@@ -75,7 +96,9 @@ Production qualification still requires exact listener evidence and reviewed And
 
 ADR-0012 selects the first conventional qualification candidate as one ordered transaction. The
 schema-v2 description prepares private `O`, `P`, and optional `F` objects plus the exact transparent
-TCP/UDP listener, reviewed RPDB/local route, and loop escape; it then orders attachment as `P`,
+TCP/UDP listener, loop escape, and RPDB/local-route identity with nonzero route and rule protocols,
+an explicit nonzero route metric, IPv4 HOST scope, and IPv6 UNIVERSE scope; it then orders
+attachment as `P`,
 optional `F`, and `O` last. Retirement orders detachment as `O`, optional `F`, and `P`, then releases
 escape, routing, listener, and private objects by exact inverse identity. A production executor must
 perform and prove that order; the lowering metadata itself does not.
@@ -304,15 +327,24 @@ The driver returns unverified capture proof, process proof, and raw observations
 receipt verifier first binds capture proof while carrying the process proof forward; the separate
 process-ownership verifier must then mint a process receipt before the module-private evidence
 factory can promote artifacts into schema-v2 gate evidence. A failure at either verifier remains a
-post-preparation failure and cannot call a later stage. The current zero-state xtables driver has no
-prepared value: it reports `Availability(Unsupported)` before acquiring a networking writer or
-mutating state. Canonical xtables-lowering schema v2 now describes the separate OUTPUT MARK and
-loopback PREROUTING TPROXY chains, exact prerequisites, and lifecycle order, but the driver does not
-consume that description into stable hooks, restore/rtnetlink mutation, live readback, rollback,
-cleanup proof, or ownership. It never attempts TPROXY in OUTPUT and never substitutes REDIRECT,
-DNAT, ingress PREROUTING traffic, a veth bounce, counters, or route-lookup inference. Its raw type,
-concrete capture/process receipt authorities, and current factory input are uninhabited, so the seam
-cannot produce a positive host result.
+post-preparation failure and cannot call a later stage. The production xtables driver has no
+admitted prepared value: it reports `Availability(Unsupported)` before constructing a native target,
+acquiring the production writer lease, or mutating state because positive target admission is
+deliberately uninhabited. This is an admission fence, not an absent transaction engine. The private
+`NativeXtablesOwner` and real process/netlink `Adapter` consume canonical schema-v2 lowering into
+stable hooks, restore/save, journaled routing, exact readback, rollback, recovery, and cleanup under
+deterministic and rooted disposable-WSA mechanism tests. The exact routing identity requires
+nonzero route and rule protocols, an explicit nonzero route metric, IPv4 HOST scope, and IPv6
+UNIVERSE scope. Its payload schema 2 additionally binds the complete dual-family route/rule audit and
+loopback name/index, and publication requires both xtables families plus both routing identities to
+be exact or absent.
+
+That private mechanism never attempts TPROXY in OUTPUT and never substitutes REDIRECT, DNAT,
+ingress PREROUTING traffic, a veth bounce, counters, or route-lookup inference. WSA does not supply
+release authority, and the concrete production capture/process receipt authorities and factory
+input remain uninhabited, so this seam cannot produce a positive production result. `scripts/tproxy`
+remains the sole production restore writer until backlog item 3 qualifies Android 5.10/ARM64 and
+transfers the component lease.
 
 The remaining integration subcheckpoints must bind client/peer authority to driver-retained
 children, establish final verifier completion chronology, construct the delivered report-object
@@ -338,8 +370,9 @@ The contained topology is split into a boot-scoped facility and Generation-scope
 1. Before any Generation is planned or an active Generation exists, the one serialized networking
    writer creates a uniquely named, journaled peer network namespace and veth pair. In the Phase 1
    bridge this is a dedicated shell writer phase ordered by Rust; `fluxd` does not issue a second
-   set of network mutations. The future native writer creates the same facility before collecting
-   the final Network Inventory. Reload reuses the existing verified facility and never creates or
+   set of network mutations. Backlog item 3 must bind the delivered native owner into production
+   composition and create the same facility before collecting the final Network Inventory. Reload
+   reuses the existing verified facility and never creates or
    replaces it while the prior Generation is active.
 2. The daemon side stays in the engine's network namespace; the peer side is reserved for bounded
    canary servers. The facility's link identities, IPv4 and enabled IPv6 point-to-point addresses,
@@ -592,8 +625,9 @@ functional pass.
    **Complete non-authorizing canonical representation:** forwarded-only lowering preserves exact
    schema-v1 identity, while local-OUTPUT input selects schema v2 with private `O` and `P` chains,
    optional `F`, typed routing/listener/escape requirements, and descriptive attach/retire order.
-   This closes the representation gap only. The production executor remains `Unsupported`, and no
-   stable hook, route, listener, receipt, or cleanup authority follows from the artifact.
+   This closes the representation gap only. The production driver remains `Unsupported`; the
+   separately delivered private owner supplies transaction mechanics only for admitted targets, and
+   no stable hook, route, listener, receipt, or cleanup authority follows from the artifact itself.
 
 4. **Complete prerequisite:** the strict Linux/Android `/proc` FD plus INET_DIAG collector and
    model correlation bind protocol, exact tuple, UID, mark, FD/inode/cookie identity, complete

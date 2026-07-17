@@ -30,6 +30,7 @@ const DEFAULT_PROXY_MARK: u32 = 0x0020_0000;
 const DEFAULT_BYPASS_MARK: u32 = 0x0040_0000;
 const DEFAULT_ROUTE_PRIORITY: u32 = 30_999;
 const DEFAULT_ROUTE_TABLE: u32 = 20_253;
+const DEFAULT_ROUTE_METRIC: u32 = 1_024;
 const DEFAULT_ROUTE_PROTOCOL: u8 = 4;
 const DEFAULT_RULE_PROTOCOL: u8 = 99;
 
@@ -359,11 +360,9 @@ fn ipv4_local_output_schema_v2_pins_complete_non_authorizing_transaction() {
     let routing = requirements.routing();
     assert_eq!(routing.priority().get(), DEFAULT_ROUTE_PRIORITY);
     assert_eq!(routing.table().get(), DEFAULT_ROUTE_TABLE);
+    assert_eq!(routing.route_metric().get(), DEFAULT_ROUTE_METRIC);
     assert_eq!(routing.route_protocol().raw(), DEFAULT_ROUTE_PROTOCOL);
-    assert_eq!(
-        routing.rule_protocol().unwrap().raw(),
-        DEFAULT_RULE_PROTOCOL
-    );
+    assert_eq!(routing.rule_protocol().raw(), DEFAULT_RULE_PROTOCOL);
     assert_eq!(
         routing.route_destination(),
         "0.0.0.0".parse::<IpAddr>().unwrap()
@@ -448,16 +447,38 @@ fn ipv4_local_output_schema_v2_pins_complete_non_authorizing_transaction() {
     );
     assert_eq!(
         digest_hex(lowered.lowering_digest().as_bytes()),
-        "8e42d457f70c95d009bcd3a323c5fe3e6d2622f86f8f1254ef3aa2e5d9509768"
+        "15364f79d458d77bf60b017942e7ea0e19cbe844a19d5ce8dc74641723bd7f43"
     );
     assert_eq!(
         digest_hex(pair.digest().as_bytes()),
-        "b2922a640bf4cabc86855dea020c1fd5a5b74c388c70811c07c43c7784d230aa"
+        "bc334397bffd2dee2e951cf99acb8845dfe8741a1e5d13c5f55fe2d39aed506f"
     );
     assert_eq!(
         digest_hex(lowered.digest().as_bytes()),
-        "feff999fcdc65186261dfbc1e3956c5fd9f59320a18b214a07ddcce8d0702d7e"
+        "50133a64041de6034832691f31f2efed3027f45155fbc44a935147906b746f31"
     );
+}
+
+#[test]
+fn ipv6_local_output_uses_kernel_canonical_scope_and_explicit_metric() {
+    let report = compile_program(
+        scope(AddressHostFamilySelection::Ipv6, true, false),
+        interfaces(&[], &[], &[]),
+        CaptureProtocolSet::TCP_AND_UDP,
+        &[],
+    );
+    let lowered = lower_with_routing(
+        &report,
+        2,
+        default_target(),
+        local_routing_spec(None, Some(default_routing_target())),
+    )
+    .unwrap();
+    let routing = lowered.ipv6().unwrap().local_output().unwrap().routing();
+
+    assert_eq!(routing.route_scope().raw(), 0);
+    assert_eq!(routing.route_metric().get(), DEFAULT_ROUTE_METRIC);
+    assert_eq!(routing.rule_protocol().raw(), DEFAULT_RULE_PROTOCOL);
 }
 
 #[test]
@@ -477,8 +498,9 @@ fn dual_stack_mixed_programs_use_distinct_local_and_forwarded_roles() {
             Some(routing_target(
                 DEFAULT_ROUTE_PRIORITY + 1,
                 DEFAULT_ROUTE_TABLE + 1,
+                DEFAULT_ROUTE_METRIC,
                 DEFAULT_ROUTE_PROTOCOL,
-                Some(DEFAULT_RULE_PROTOCOL),
+                DEFAULT_RULE_PROTOCOL,
             )),
         ),
     )
@@ -683,28 +705,33 @@ fn local_routing_target_rejects_non_actionable_identities() {
         XtablesLocalOutputRoutingTarget::new(
             RulePriority::from_raw(0),
             RouteTableId::from_raw(DEFAULT_ROUTE_TABLE),
+            NonZeroU32::new(DEFAULT_ROUTE_METRIC).unwrap(),
             RouteProtocol::from_raw(DEFAULT_ROUTE_PROTOCOL),
-            Some(RuleProtocol::from_raw(DEFAULT_RULE_PROTOCOL)),
+            RuleProtocol::from_raw(DEFAULT_RULE_PROTOCOL),
         ),
         Err(XtablesLocalOutputRoutingTargetError::ZeroPriority)
     );
-    assert_eq!(
-        XtablesLocalOutputRoutingTarget::new(
-            RulePriority::from_raw(DEFAULT_ROUTE_PRIORITY),
-            RouteTableId::from_raw(254),
-            RouteProtocol::from_raw(DEFAULT_ROUTE_PROTOCOL),
-            Some(RuleProtocol::from_raw(DEFAULT_RULE_PROTOCOL)),
-        ),
-        Err(XtablesLocalOutputRoutingTargetError::ReservedTable {
-            table: RouteTableId::from_raw(254),
-        })
-    );
+    for table in [0, 252, 253, 254, 255] {
+        assert_eq!(
+            XtablesLocalOutputRoutingTarget::new(
+                RulePriority::from_raw(DEFAULT_ROUTE_PRIORITY),
+                RouteTableId::from_raw(table),
+                NonZeroU32::new(DEFAULT_ROUTE_METRIC).unwrap(),
+                RouteProtocol::from_raw(DEFAULT_ROUTE_PROTOCOL),
+                RuleProtocol::from_raw(DEFAULT_RULE_PROTOCOL),
+            ),
+            Err(XtablesLocalOutputRoutingTargetError::ReservedTable {
+                table: RouteTableId::from_raw(table),
+            })
+        );
+    }
     assert_eq!(
         XtablesLocalOutputRoutingTarget::new(
             RulePriority::from_raw(DEFAULT_ROUTE_PRIORITY),
             RouteTableId::from_raw(DEFAULT_ROUTE_TABLE),
+            NonZeroU32::new(DEFAULT_ROUTE_METRIC).unwrap(),
             RouteProtocol::from_raw(0),
-            Some(RuleProtocol::from_raw(DEFAULT_RULE_PROTOCOL)),
+            RuleProtocol::from_raw(DEFAULT_RULE_PROTOCOL),
         ),
         Err(XtablesLocalOutputRoutingTargetError::UnspecifiedRouteProtocol)
     );
@@ -712,8 +739,9 @@ fn local_routing_target_rejects_non_actionable_identities() {
         XtablesLocalOutputRoutingTarget::new(
             RulePriority::from_raw(DEFAULT_ROUTE_PRIORITY),
             RouteTableId::from_raw(DEFAULT_ROUTE_TABLE),
+            NonZeroU32::new(DEFAULT_ROUTE_METRIC).unwrap(),
             RouteProtocol::from_raw(DEFAULT_ROUTE_PROTOCOL),
-            Some(RuleProtocol::from_raw(0)),
+            RuleProtocol::from_raw(0),
         ),
         Err(XtablesLocalOutputRoutingTargetError::UnspecifiedRuleProtocol)
     );
@@ -1058,26 +1086,37 @@ fn local_schema_v2_identity_binds_routing_and_derived_transaction_requirements()
         routing_target(
             DEFAULT_ROUTE_PRIORITY + 1,
             DEFAULT_ROUTE_TABLE,
+            DEFAULT_ROUTE_METRIC,
             DEFAULT_ROUTE_PROTOCOL,
-            Some(DEFAULT_RULE_PROTOCOL),
+            DEFAULT_RULE_PROTOCOL,
         ),
         routing_target(
             DEFAULT_ROUTE_PRIORITY,
             DEFAULT_ROUTE_TABLE + 1,
+            DEFAULT_ROUTE_METRIC,
             DEFAULT_ROUTE_PROTOCOL,
-            Some(DEFAULT_RULE_PROTOCOL),
+            DEFAULT_RULE_PROTOCOL,
         ),
         routing_target(
             DEFAULT_ROUTE_PRIORITY,
             DEFAULT_ROUTE_TABLE,
+            DEFAULT_ROUTE_METRIC + 1,
+            DEFAULT_ROUTE_PROTOCOL,
+            DEFAULT_RULE_PROTOCOL,
+        ),
+        routing_target(
+            DEFAULT_ROUTE_PRIORITY,
+            DEFAULT_ROUTE_TABLE,
+            DEFAULT_ROUTE_METRIC,
             DEFAULT_ROUTE_PROTOCOL + 1,
-            Some(DEFAULT_RULE_PROTOCOL),
+            DEFAULT_RULE_PROTOCOL,
         ),
         routing_target(
             DEFAULT_ROUTE_PRIORITY,
             DEFAULT_ROUTE_TABLE,
+            DEFAULT_ROUTE_METRIC,
             DEFAULT_ROUTE_PROTOCOL,
-            None,
+            DEFAULT_RULE_PROTOCOL + 1,
         ),
     ] {
         let changed = lower_with_routing(
@@ -1243,22 +1282,25 @@ fn default_routing_target() -> XtablesLocalOutputRoutingTarget {
     routing_target(
         DEFAULT_ROUTE_PRIORITY,
         DEFAULT_ROUTE_TABLE,
+        DEFAULT_ROUTE_METRIC,
         DEFAULT_ROUTE_PROTOCOL,
-        Some(DEFAULT_RULE_PROTOCOL),
+        DEFAULT_RULE_PROTOCOL,
     )
 }
 
 fn routing_target(
     priority: u32,
     table: u32,
+    route_metric: u32,
     route_protocol: u8,
-    rule_protocol: Option<u8>,
+    rule_protocol: u8,
 ) -> XtablesLocalOutputRoutingTarget {
     XtablesLocalOutputRoutingTarget::new(
         RulePriority::from_raw(priority),
         RouteTableId::from_raw(table),
+        NonZeroU32::new(route_metric).unwrap(),
         RouteProtocol::from_raw(route_protocol),
-        rule_protocol.map(RuleProtocol::from_raw),
+        RuleProtocol::from_raw(rule_protocol),
     )
     .unwrap()
 }

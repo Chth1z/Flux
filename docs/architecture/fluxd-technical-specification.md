@@ -1,7 +1,7 @@
 # Fluxd Technical Specification
 
 - Status: accepted living specification
-- Last updated: 2026-07-16
+- Last updated: 2026-07-17
 - Companion document: [Fluxd Rewrite Blueprint](fluxd-blueprint.md)
 
 This specification describes both the target architecture and temporary development checkpoints.
@@ -54,7 +54,7 @@ legacy read-only paths. That wrapper and those paths are removed as their Rust c
 
 Only `fluxd daemon` is long-lived. Sing-Box is its child. A boot shell watchdog may restart `fluxd` after a crash or fatal invariant exit, but it contains no policy logic, never invokes a second recovery owner, and does not restart a settled `UnsupportedKernel` daemon. Normal journal recovery runs inside daemon startup before mutating commands are accepted. `fluxd recover --offline` is an explicit salvage command that requires the daemon lease to be absent. The legacy `fluxctl restart` verb is a client alias for `ReloadSources` followed by `Converge(Configured)`; it has no separate protocol or lifecycle meaning.
 
-In the delivered Phase 1 bridge, `RuntimeCoordinator` implements `LegacyDispatcher` and runs on the one bounded `LegacyControlBridge` worker. The worker serializes requests, address resynchronization, idle maintenance, and shutdown. `EngineSupervisor` owns the Sing-Box child. Rust-owned preparation compiles the legacy restore caches, but shell phase scripts remain the only rules/routes/address-sync writer and `scripts/tproxy` remains the sole restore executor. A boot-scoped mode lease rejects legacy `scripts/core` verbs for the duration of a Rust-owned engine run. This bridge currently admits only TPROXY: `prepare` rejects `PROXY_MODE=tun` before initialization and manifest publication because the shell Flux PBR is TPROXY-specific and exact Sing-Box route cleanup after forced death has no device-qualified proof.
+In the delivered Phase 1 bridge, `RuntimeCoordinator` implements `LegacyDispatcher` and runs on the one bounded `LegacyControlBridge` worker. The worker serializes requests, address resynchronization, idle maintenance, and shutdown. `EngineSupervisor` owns the Sing-Box child. Rust-owned preparation compiles the legacy restore caches, but shell phase scripts remain the only production rules/routes/address-sync writer and `scripts/tproxy` remains the sole production restore executor. A boot-scoped mode lease rejects legacy `scripts/core` verbs for the duration of a Rust-owned engine run. This bridge currently admits only TPROXY: `prepare` rejects `PROXY_MODE=tun` before initialization and manifest publication because the shell Flux PBR is TPROXY-specific and exact Sing-Box route cleanup after forced death has no device-qualified proof.
 
 ## 3. Local control socket and Module routing
 
@@ -840,9 +840,10 @@ The first non-mutating Phase 4 cutover is delivered. Rust-owned preparation excl
 Explicit legacy ownership exclusively sources the frozen generator, records `shell`, and remains a
 deliberate rollback producer. Render failure does not silently change producers and cannot replace
 the active Generation. In either mode, `scripts/tproxy` remains the sole xtables restore executor
-and kernel writer. A later transition lease disables that shell writer before the first native
-restore mutation; native ownership still requires failure/recovery, exact readback, rollback, and
-real-device gates.
+and kernel writer in production composition. The delivered private owner enforces the transition
+lease, failure/recovery, exact readback, and rollback in deterministic and disposable WSA tests, but
+positive production target admission is uninhabited. The item-3 cutover must bind real-device
+authorities and disable the shell writer before the first production native mutation.
 
 The completed `flux-platform` syntax checkpoint remains a frozen-syntax observer. A pure parser
 accepts an explicit IPv4/IPv6 plus apply/cleanup context and a bounded canonical byte slice; it
@@ -954,7 +955,7 @@ candidate Generation as `legacy-rules.manifest` before `engine.manifest` and dir
 A non-Generation `fluxctl rules-preview` rebuild is serialized under the same dispatcher lock,
 deliberately emits no receipt, and cannot authorize later publication. The manifest exposes no restore execution API,
 writer/ownership token, live readback, rollback proof, prepared-capture conversion, or functional
-verification claim; `scripts/tproxy` remains the sole restore executor and kernel writer.
+verification claim; `scripts/tproxy` remains the sole production restore executor and kernel writer.
 
 These compatibility-only renderer, snapshot, and attestation commands are removed or made private
 with the bridge when the remaining canonical semantics and native restore ownership pass their
@@ -1003,10 +1004,11 @@ entry metadata, not commands embedded in the private chains. Prepare restore art
 declare and fill those private chains; retire artifacts only flush and delete them.
 
 For every proxying local family, schema v2 requires one exact typed routing target before lowering:
-nonzero RPDB priority, non-reserved table, nonzero route protocol, optional nonzero rule protocol,
-the selected proxy mark/mask, and loopback interface identity. It also records an unspecified-
-address transparent listener requirement for the exact family, port, and TCP/UDP set, plus a loop-
-escape requirement binding the compatibility engine credentials and required bypass mark/mask.
+nonzero RPDB priority, non-reserved table, nonzero route and rule protocols, an explicit nonzero
+route metric, IPv4 HOST or IPv6 UNIVERSE route scope, the selected proxy mark/mask, and loopback
+interface identity. It also records an unspecified-address transparent listener requirement for the
+exact family, port, and TCP/UDP set, plus a loop-escape requirement binding the compatibility engine
+credentials and required bypass mark/mask.
 These values describe the objects and exact inverse identity a later transaction must own; they do
 not allocate them, prove listener readiness, or authorize Android mutation. An all-direct local
 program remains schema v2 but has only the `O` chain and needs no `P`, routing, listener, or typed
@@ -1030,34 +1032,130 @@ Both schemas reject established-flow caching, transparent-socket DIVERT, FakeIP 
 rejection, and MSS clamping. Neither artifact attaches `PREROUTING` or `OUTPUT`, invokes restore,
 inspects live state, proves cleanup invertibility, performs readback or rollback, acquires
 ownership, enters the journal/coordinator, or constructs prepared/active state. Native stable-hook
-activation, restore execution, exact readback/rollback, transition leases, production driver and
-receipt authorities, and reviewed Android release qualification remain the next cutover gates.
+activation now consumes these artifacts only inside the separate private owner described below;
+the artifacts themselves remain non-authorizing. Production receipt authorities, daemon
+composition, shell-duty deletion, and reviewed Android release qualification remain open.
 
-### 10.4 Native restore invocation
+### 10.4 Delivered native xtables transaction owner
 
-The first internal process primitive now opens caller-selected absolute
-`iptables-restore`/`ip6tables-restore` paths while rejecting a final-component symlink, pins their
-descriptors and domain-separated byte digests, probes bounded `--version` output, and requires the selected family
-pair to report matching legacy or nf_tables restore flavors. This hint does not classify wrappers,
-vendor implementations, command/save coherence, or Backend Plan eligibility. Before and after each invocation it
-revalidates the pinned bytes. It spawns the pinned descriptor directly, clears the inherited
-environment, passes fixed `-w N --noflush` arguments, writes the canonical restore artifact to
-stdin, bounds stdout and stderr, applies a nonzero deadline plus direct-child parent-death
-containment, marks unrelated parent descriptors close-on-exec, and kills/reaps the process group so
-descendants cannot retain its pipes. Its stdin writer is nonblocking and cancellation-aware;
-cleanup failure returns a typed error and transfers unresolved reaping out of the deadline path.
-Every failure after a restore child successfully spawns carries `MayHaveMutated`, requiring the
-future owner to re-read live state before compensation. Probe and pre-spawn failures are
-`NotStarted`.
+`NativeXtablesOwner` is crate-private and exposes only `converge(target)` and `recover()`. It owns
+the private prepare/activate/verify/retire typestate, deterministic compensation, exact startup
+recovery, and all writer serialization. Positive production construction remains impossible: the
+only admitted target factory is test-only, and the production driver stays `Unsupported` until the
+Android mark/RPDB, engine, canary, and release-device authorities are bound to this exact execution.
 
-This primitive remains crate-private and is not a
-restore authority. It is not wired to the Runtime Reconciler or functional-canary driver and has no
-stable-hook, rtnetlink, live readback, rollback, journal, transition lease, prepared/active, or
-ownership conversion. A zero exit is process evidence only. System discovery, coherent
-command/restore/save identity, exact lock-timeout classification, live readback, and the complete
-native transaction remain open.
+Each enabled family uses generation-independent stable roots:
 
-Before selection, Flux detects whether each tool belongs to iptables-legacy, iptables-nft, a wrapper, or a vendor implementation. IPv4/IPv6 command and restore tools must form one coherent implementation and pass the exact canary. One Generation never mixes legacy and nft variants or manages the same policy through both.
+- `FLX{4|6}SP`, reached by the first exact `mangle/PREROUTING` jump;
+- `FLX{4|6}SO`, reached by the first exact `mangle/OUTPUT` jump and treated as the activation
+  boundary.
+
+Private `P`, optional `F`, and `O` chains are prepared before either root is attached. Initial
+activation installs PREROUTING before OUTPUT. Replacement prepares the new private chains, flushes
+and repopulates the stable roots in one restore commit per family, compensates partial dual-stack
+success back to the previous Generation, and retires old private chains only after they are no
+longer referenced. Stop and recovery detach and prove OUTPUT absence first, delete the exact rule
+before the exact route, detach PREROUTING and the stable roots, and finally retire private chains.
+
+The coherent process Adapter pins command, restore, and save descriptors for IPv4 and optional
+IPv6. It opens, hashes, validates trusted ownership/mode, and proves the complete role/family
+mapping before any candidate executes `--version`; all roles must share the admitted multicall
+digest, release, and legacy/nf_tables flavor. Role-specific descriptor execution supplies the
+logical applet as `argv[0]`. Restore uses fixed `-w N --noflush --modprobe=/dev/null`, canonical
+stdin, bounded output, deadlines, parent-death containment, and process-group cleanup. Save uses no
+`-t`, `-w`, or stdin and captures one complete bounded document. `/dev/null` blocks only the
+userspace modprobe helper and is not production no-autoload authority.
+
+Exact save projection selects one mangle table, rejects Flux state in other tables, preserves rule
+order, duplicates, and absolute built-in-hook ordinals, canonicalizes chain emission order and
+counters, and treats known legacy state as conflict. Exactly zero-byte full-save output in a fresh
+legacy namespace is normalized to clean absence. Kernel-emitted default TPROXY `--on-ip 0.0.0.0`
+or `::` is normalized away; a nondefault address remains a conflict. Expected Prepared, Active, and
+OUTPUT-detached projections are derived independently from typed artifacts. Before `Active` or
+`CleanAbsent` can be published, the owner reads both IPv4 and IPv6 save projections, including an
+otherwise disabled family, so opposite-family native or legacy residue is a conflict rather than an
+implicit absence.
+
+Policy routing uses a fresh groups-zero `NETLINK_ROUTE` session for each journaled mutation or
+readback. The session enables `NETLINK_EXT_ACK` and `NETLINK_CAP_ACK`, binds and verifies its exact
+port ID, enforces sender/sequence/deadline and aggregate dump bounds, creates route before rule,
+deletes rule before route, and poisons a session after an ambiguous ACK. Exact readback includes the
+nonzero route and rule protocols, explicit nonzero route metric, IPv4 HOST versus IPv6 UNIVERSE
+route scope,
+Linux-5.10 IPv6 medium `RTA_PREF`, and duplicate/conflict counts.
+The recovery environment supplies one exact audit identity for each of IPv4 and IPv6. The target may
+own either or both, but every active/absence decision observes the complete audit and requires each
+non-target identity to be absent. Before every route/rule observation or mutation, the real Adapter
+proves the admitted loopback binding in both directions: `if_nametoindex(name)` must equal the bound
+index and `if_indextoname(index)` must return the same name. Rename, replacement, or index reuse
+therefore fails before policy state can authorize a transition.
+
+Before the first write, the owner publishes activating intent and a component-scoped lease bound to
+boot, network namespace, and ownership-journal identity. `native_xtables.lease` blocks shell
+mutation; `xtables-writer.lock` serializes publication; and a descriptor-held advisory guard
+prevents duplicate native recovery. Journal revisions name target/previous Generation and artifact
+plus tool digests. Owner-payload schema 2 adds a domain-separated routing digest over the complete
+IPv4/IPv6 audit: loopback name and index, route destination/table/protocol/scope/type/metric/output
+interface, and rule priority/table/mark/mask/protocol. Replacement atomically rebinds the Generation
+journal without releasing the component lease. Clean absence is durably published before lease
+deletion.
+
+Disk-terminal state does not itself authorize `CleanAbsent`. A current terminal journal is returned
+with a recovery fence that retains the native advisory guard, shared writer marker, and an optional
+lease: the lease may still exist after a crash at terminal-journal durability, or already be absent
+after a crash later in release. The owner parses and resolves the terminal payload, freshly proves
+global IPv4 and IPv6 xtables absence plus both policy-routing audit identities absent, and only then
+finishes the fence by removing any lease, the terminal journal, and the shared writer marker. A
+failed or incomplete live audit leaves those artifacts blocking competitors.
+
+Previous-boot retirement admits one additional exact pre-lease crash shape. When the inherited
+native-owner marker has the same recorded scope as a revision-1 `Activating` journal, interruption at
+`JournalDurable` or `JournalBeforeLease` may leave the journal and native writer marker without a
+lease. That coherent previous-boot boundary is fenced, subjected to the same global dual-family
+absence proof, durably terminalized, and retired. A same-boot nonterminal journal without its lease,
+a previous-boot missing-lease journal at any other revision or phase, or a mismatched native-marker/
+journal scope remains fail-closed. Complete previous-boot journal/lease pairs and terminal release
+boundaries retain their guarded absence-first retirement.
+
+The shared writer directory has exactly one authenticated owner marker at a time. A native marker
+contains the durable lease scope. Shell-owner v2 is the canonical six-field record: schema magic,
+parent PID/start ticks, optional child PID/start ticks (`0 0` when absent), and boot ID. Either live
+participant makes the record busy. Parent-bound mutating `addrsync` and `tproxy` phase commands are
+serialized because the record has one child slot. Inheritance revalidates the live parent and
+unchanged record, refuses a live or unverifiable existing child, and writes only the new child slot;
+the parent identity remains present. Release re-authenticates the current parent or child PID, start
+ticks, boot ID, ownership mode, and unchanged record before modifying it. While the parent is live,
+child release clears only that slot. A live parent may reclaim or replace a dead child, and a live
+orphaned child continues to block until its authenticated release. Only a record whose participants
+are both dead or PID-reused, or whose boot is previous, may be retired after exact record and
+directory revalidation. Bare, mixed, malformed, or otherwise unverifiable locks remain fail-closed.
+
+The production bridge uses the same fence for every legacy networking phase transaction. Dispatcher
+entry discards ambient internal `XTABLES_WRITER_*` state and initializes private nesting to zero.
+Nested steps reuse the held parent claim only after rechecking native-lease absence and the exact
+parent record. Start, stop, restart, and failure cleanup claim it before any `addrsync` or `tproxy`
+mutation, and each mutating child authenticates into the single child slot. `INT` and `TERM` exit as
+130 and 143 through authenticated `EXIT` cleanup, so control cannot resume into later mutation. A
+native lease therefore rejects the phase transaction before a networking component is invoked. This
+does not transfer ownership of the intentionally long-lived standalone `addrsyncd` daemon, which
+remains a backlog item-3 cutover responsibility.
+
+Deterministic tests cover zero-to-active, idempotence, replacement, stop, every route/rule/restore
+write boundary, dual-stack partial success, rollback failure, monotonic crash recovery, and lease
+retention. They also cover opposite-family xtables/routing residue, stale loopback bindings,
+current terminal recovery with and without a surviving lease, the previous-boot revision-1
+`JournalDurable`/`JournalBeforeLease` boundary, rejected same-boot and mismatched missing-lease
+states, and the complete shell-owner-v2 matrix: either participant live, dead-child reclamation,
+orphaned live child, both dead, PID reuse, previous boot, spoofing, and bare/malformed/mixed
+fail-closed cases. Shell regressions also cover ambient-state rejection, forged parent/child release,
+signal-exit cleanup, direct `addrsync` native-lease refusal, and a surviving mutating `addrsync` phase
+child that remains blocking after dispatcher death. Legacy start/stop/restart/failure tests prove the
+native lease blocks before any networking component mutation.
+
+The same real process/netlink Adapter passed apply, active-journal recovery, stop, exact readback,
+and cleanup in a rooted disposable WSA Android 13 x86_64 namespace. This is mechanism evidence only,
+not Android 5.10/ARM64 or production cutover authority. Production remains `Unsupported`; eBPF is an
+optional separately qualified plane, and production loads no `.ko`/KPM payload.
 
 ### 10.5 Generation shape
 
@@ -1274,6 +1372,14 @@ Delivered Phase 1 supervision additionally requires:
 
 The Phase 1 transaction rejects TUN during `prepare`, before engine admission or networking mutation. It also requires `xt_owner` before initialization and revalidates it from the generated capability cache; the Rust-rendered legacy compatibility program sends every local OUTPUT policy through the application chain so the configured engine UID/GID bypass remains active even when application filtering is disabled. `ROUTING_MARK` is not accepted as equivalent authority because the bridge does not prove that the supervised engine applies it to its sockets. For admitted TPROXY state, start is `prepare` → engine admission → Generation-bound capture start → structural capture verification → configured functional gate → Generation-bound `RUNNING`, and stop is capture detach → engine stop/reap → `STOPPED`. The current pre-release bridge explicitly selects structural-only compatibility; required-mode tests execute the delivered Stage-1 exact-binding canary transaction, and the first Stage-2 Linux checkpoint now exercises the isolated dual-stack topology and cleanup without installing capture. Partial capture-start compensation retains Generation evidence until both networking writers prove cleanup; terminal publication and engine retirement are forbidden while detachment is uncertain. Reload prepares the candidate while the previous Generation remains active, preserves its pass on prepare-only failure, invalidates it before detachment, blocks replacement if detach fails, and attempts the previous immutable `EngineSpec` if candidate activation fails. An uncertain reload detach enters capture repair: prove full detachment, retain/reconcile the old engine, then republish and freshly verify that Generation. Publication failure, identity loss, repair/restoration, and address resynchronization require a fresh complete gate before retrying `RUNNING`. Candidate evidence never authorizes rollback publication. The current owner bypass is a compatibility loop-escape prerequisite; the socket-correlation collector, its prebound session and typed attempt-owned handoff transports, schema-v2 listener/delivery validator, temporal cleanup/retirement validator, fail-closed TPROXY-only local-OUTPUT executor seam, per-flow capture receipt, and process-ownership receipt contracts are delivered. The Linux/Android child-origin pidfd substrate and no-traffic live credential preflight are also delivered. Both production receipt authorities remain uninhabited; the production traffic producer, real `EngineSupervisor`/`SingBoxChild` and prepared-driver child integration, production listener/report parser and factories, actual collector integration, and reviewed Android release-device qualification remain open. The rooted x86_64 WSA mechanism checkpoint is development-only and does not inhabit any of those authorities.
 
+The retained legacy mode now uses the native-compatible shared writer fence as one outer phase-
+transaction boundary. Start, stop, restart, and failure cleanup acquire it before launching a
+mutating `addrsync` or `tproxy` phase child. Because shell-owner v2 has one child slot, those phase
+writers are serialized; nested stop/start/rollback helpers reuse the outer parent claim. A surviving
+phase child remains busy if the dispatcher dies, and an existing native lease aborts the transaction
+before networking mutation. The long-lived standalone daemon is still legacy runtime state rather
+than an authority transferred by this fence.
+
 The delivered Linux evidence class is explicitly ingress-only. The command
 `cargo xtask test-functional-canary-linux-tproxy` selects the exact ignored test
 `functional_canary::linux_namespace_harness::privileged_ingress_tproxy_checkpoint_exercises_real_capture_counters_and_cleanup`.
@@ -1474,19 +1580,29 @@ validation binds the complete immutable request so Generation, boot, namespace,
 Network Epoch/snapshot, Capture Program, ownership, engine/listener, selector, nonce, and deadline
 cannot be replayed independently. Every required family/transport slot must then correlate its
 request UID, tuple, payload, listener cookie, and exact schema-v2 delivery event under unique
-loss-free sequence and monotonic-time bounds. The current xtables driver is zero-state, owns no
-networking writer, and always returns `Unsupported` before mutation because it does not implement
-or authorize the complete OUTPUT mark, RPDB local route, mark-qualified loopback PREROUTING TPROXY,
-listener, escape, and cleanup transaction. It never emits TPROXY in OUTPUT and never falls
-back to REDIRECT/DNAT, promotes ingress PREROUTING evidence, infers success from counters or route
-lookups, or uses a veth bounce. The required-mode coordinator treats this unsupported result as a
-failed functional gate, post-observes the attempt binding, compensates capture first, and never
-publishes `RUNNING`.
+loss-free sequence and monotonic-time bounds. The production xtables driver still returns
+`Unsupported` before it can construct a native target, acquire the component transition lease, or
+mutate state because positive production target admission is deliberately uninhabited. That
+admission fence, rather than a missing transaction mechanism, keeps the daemon and canary fail
+closed. Behind it, the crate-private `NativeXtablesOwner` and its real process/netlink `Adapter`
+consume schema-v2 artifacts and own stable-hook mutation, coherent restore/save, journaled policy
+routing, exact readback, rollback, crash recovery, and cleanup. Their routing identity requires
+nonzero route and rule protocols, an explicit nonzero route metric, IPv4 HOST scope, and IPv6
+UNIVERSE scope.
+Deterministic failure injection and the rooted disposable-WSA execution checkpoint are mechanism
+evidence only and are not release authority.
 
-The pure canonical xtables-lowering schema-v2 artifact does not change that driver result. It
-describes the two private chains, prerequisite identities, and dependency order, but supplies no
-prepared driver, stable-hook attachment, restore/rtnetlink writer, readback, rollback, cleanup
-proof, or receipt authority.
+The selected transaction shape remains OUTPUT MARK, RPDB local route, and mark-qualified loopback
+PREROUTING TPROXY. It never emits TPROXY in OUTPUT, falls back to REDIRECT/DNAT, promotes ingress
+PREROUTING evidence, infers success from counters or route lookups, or uses a veth bounce. The
+required-mode coordinator treats the still-unsupported production admission result as a failed
+functional gate, post-observes the attempt binding, compensates capture first, and never publishes
+`RUNNING`. `scripts/tproxy` remains the sole production restore writer until backlog item 3 binds
+the engine/canary and ownership authorities, qualifies reviewed Android 5.10/ARM64 profiles, and
+transfers the lease before the first native production write. The pure canonical lowerer remains
+non-authorizing by itself, while the private owner supplies transaction mechanics without supplying
+production prepared-target admission, receipt authority, daemon composition, or Android release
+qualification.
 
 This is fail-closed evidence admission only. It does not change the separate default fail-open
 connectivity compensation policy. The model now requires typed client/peer retirement, pairwise-
@@ -1553,6 +1669,42 @@ enum GenerationPhase {
 `active.json` is updated only after mandatory engine and kernel verification. `Prepared` and `Activating` records may exist without becoming authoritative.
 
 The journal records intent and ownership; recovery always confirms kernel reality before acting.
+
+Backend sub-owners may use a smaller bounded record, but they preserve the same protocol. The
+delivered native xtables owner stores:
+
+- a component lease scope bound to boot identity, network-namespace device/inode, component name,
+  and ownership-journal identity;
+- the current Generation in the journal binding, atomically rebindable under the unchanged
+  component lease during replacement;
+- monotonic revision, phase, and next mutation boundary;
+- owner-payload schema 2 with exact target and optional previous Generation plus canonical
+  artifact-set, coherent tool-set, and complete dual-family policy-routing audit digests; the routing
+  digest includes the loopback name/index and every exact route/rule identity field; and
+- resolvable immutable identities rather than restore programs in the bounded payload.
+
+Its files are `native_xtables.journal`, `native_xtables.lease`, the transient
+`xtables-writer.lock/` directory with a durable native-owner scope marker, and a private advisory
+guard file. Activating intent and the lease are durable before the first restore or rtnetlink
+request. Every later write is preceded by the next journal boundary. A terminal clean-absence
+record is durable before lease deletion, and recovery explicitly handles a crash between lease
+deletion and transient-lock removal. A live advisory guard cannot be adopted by another recovery;
+current terminal recovery retains the guard, shared writer marker, and optional surviving lease
+until the terminal payload resolves and fresh global IPv4/IPv6 xtables plus policy absence succeeds. Only
+then are any lease, terminal journal, and writer marker retired.
+
+Previous-boot recovery accepts complete coherent pairs and terminal boundaries plus the exact
+revision-1 `Activating` `JournalDurable`/`JournalBeforeLease` native-lock boundary whose writer scope
+matches the journal. It rejects same-boot nonterminal missing-lease state, any other previous-boot
+missing-lease phase/revision, and mismatched scopes. Shell ownership uses the canonical v2 parent plus
+optional child PID/start identities and boot ID. Either live participant blocks; the parent-bound
+mutating phase child changes only its child slot while the parent lives and remains blocking after
+parent death; `addrsync` and `tproxy` phase commands are serialized while the schema has one slot.
+Only both-dead, PID-reused, or previous-boot records retire after stable revalidation. Bare,
+malformed, mixed, and unverifiable locks remain blocking. Startup otherwise resolves the exact immutable target(s), validates loopback
+name/index bidirectionally, and observes both xtables families plus both policy-routing audit
+identities afresh before preserving one exact Active Generation or publishing clean absence.
+Uncertainty retains both the journal and component lease.
 
 ### 15.3 DNS, fake-IP, and asset state
 
@@ -1727,10 +1879,11 @@ cannot be classified by the current extension checks. Production `fluxd` does no
 |---|---|---|
 | Bridge | `fluxd` owns Sing-Box through the atomic runtime coordinator; serialized shell phases still own networking writes | No |
 | Shadow compiler | Rust emits deterministic observation-only Capture Programs; no shadow artifact enters a Generation or activation path | No |
-| Rust generation bridge | Rust prepares and attests legacy-shaped restore caches; `scripts/tproxy` remains the restore executor/writer | No |
+| Rust generation bridge | Rust prepares and attests legacy-shaped restore caches; `scripts/tproxy` remains the production restore executor/writer | No |
 | Canonical xtables lowering | Rust preserves exact schema-v1 forwarded identities and lowers local OUTPUT with pure schema-v2 `O`/`P` transaction metadata, typed routing/listener/escape requirements, and descriptive lifecycle order; five extensions remain rejected and nothing executes | No |
 | x86_64 Android mechanism checkpoint | The exact ignored local-OUTPUT TPROXY transaction passes on one rooted WSA development profile with remote cleanup; production execution, receipts, driver, and release matrix remain open | No |
-| Native xtables cutover | Rust owns canonical lowering, restore, exact readback, rollback, and the transition lease; replaced shell rule/restore duties are deleted after qualification | No, until all intended runtime duties are Rust-owned |
+| Private native xtables owner | Rust owns stable hooks, restore/save, schema-2 dual-family routing identity, bidirectional loopback validation, complete IPv4/IPv6 residue audits, authenticated shell/native fencing, rollback, recovery, cleanup, and the transition lease behind test-only target admission; the production shell writer remains | No |
+| Native xtables production cutover | Reviewed Android authorities and functional receipts admit the private owner, the lease transfers before the first Rust write, and replaced shell rule/restore duties are deleted | No, until all intended runtime duties are Rust-owned |
 | PBR/address-sync cutover | Rust owns routing and address-derived rules; standalone `addrsyncd` and shell route writers are removed | No |
 | Remaining runtime cutover | Rust owns configuration, subscription, diagnostics, recovery, and offline cleanup; legacy runtime scripts, `jq`/AWK/curl adapters, and wrappers are removed | No |
 | Rust-only qualification | Only platform-required install/boot/disable/uninstall glue remains outside Rust; supported runtime scope passes Android, recovery, performance, security, provenance, and packaging gates | Yes, after ADR-0011 and every final gate pass |

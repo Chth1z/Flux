@@ -1,7 +1,7 @@
 ---
 status: accepted
 decision_date: 2026-07-15
-last_reviewed: 2026-07-16
+last_reviewed: 2026-07-17
 ---
 
 # Qualify local OUTPUT through loopback-reinjected PREROUTING TPROXY
@@ -41,20 +41,23 @@ selector `-i lo` plus `mark proxy/mask`. A mixed family keeps the unchanged `F` 
 The private restore artifacts declare/fill and flush/delete those chains only; they never mutate a
 built-in hook.
 
-Schema v2 also records the exact caller-selected per-family RPDB priority, route table, route
-protocol, optional rule protocol, proxy mark/mask, and loopback identity; the unspecified-address
-transparent listener family, port, and protocol set; and the compatibility engine credentials plus
-bypass mark/mask required for loop escape. These are typed descriptive requirements, not Android-
-safe allocation, readiness, lease, or ownership evidence. The lifecycle metadata prepares private
+Schema v2 also records the exact caller-selected per-family RPDB priority, route table, explicit
+nonzero route metric, nonzero route and rule protocols, proxy mark/mask, and loopback identity. Its
+local `/0` route is `RTN_LOCAL` with IPv4 `HOST` scope or IPv6 `UNIVERSE` scope. It also records the
+unspecified-address transparent listener family, port, and protocol set and the compatibility engine
+credentials plus bypass mark/mask required for loop escape. These are typed descriptive
+requirements, not Android-safe allocation, readiness, lease, or ownership evidence. The lifecycle metadata prepares private
 `O`, `P`, and optional `F` objects plus listener, routing, and escape, then orders attachment as `P`,
 optional `F`, and `O` last. Retirement orders detachment as `O`, optional `F`, and `P`, followed by
 escape, routing, listener, and private-object retirement.
 
 The production functional-canary driver remains fail-closed and returns `Unsupported` before
-mutation. Canonical lowering still supplies no stable-hook activation, restore/rtnetlink writer,
-live readback, rollback, cleanup proof, transition lease, production receipt authority, or Android
-release qualification. A disposable privileged Linux checkpoint is supporting evidence only; it
-cannot construct production gate evidence or qualify any production Android device profile.
+mutation. The delivered private owner now supplies stable-hook activation, restore/rtnetlink
+mutation, exact readback, rollback, cleanup proof, crash recovery, and the transition lease for an
+independently admitted target. Canonical lowering alone still supplies none of those authorities,
+and production composition supplies neither target admission nor receipt and Android release
+qualification. A disposable privileged Linux checkpoint is supporting evidence only; it cannot
+construct production gate evidence or qualify any production Android device profile.
 Established-flow caching, transparent-socket DIVERT, FakeIP ICMP, QUIC rejection, and MSS clamping
 remain independently unsupported extensions and are not part of this first canonical transaction.
 
@@ -83,8 +86,10 @@ namespace-local inactive-qdisc normalization before the namespace is retired. Th
 required mode, selects the exact test, uses a private
 `/data/local/tmp` directory, binds fingerprint plus boot ID across the build and cleanup boundaries,
 bounds every host command with kill/reap handling, and independently proves removal. This is useful
-Android mechanism evidence, but it is not Android 5.10/ARM64, distinct-UID, Generation,
-supervised-engine, VPN/netd-coexistence, crash-recovery, or release qualification.
+Android mechanism evidence, but that earlier traffic-canary run is not Android 5.10/ARM64,
+distinct-UID, Generation, supervised-engine, VPN/netd-coexistence, owner crash recovery, or release
+qualification. The later native-owner run recorded below separately exercises active-journal
+recovery without adding traffic or production authority.
 
 Qualification requires all of the following under one boot, network namespace, mark allocation,
 and attempt identity:
@@ -118,3 +123,45 @@ production `.ko`/KPM packaging, loading, or unloading.
 
 The primary-source analysis and mechanism comparison are recorded in
 [`local-output-capture-mechanisms-2026-07.md`](../research/local-output-capture-mechanisms-2026-07.md).
+
+## 2026-07-17 native transaction status
+
+The conventional mechanism is now consumed by a complete private native transaction owner. It
+prepares the generation-specific `P`/optional-`F`/`O` chains, installs stable
+`FLX{4|6}SP` PREROUTING roots before `FLX{4|6}SO` OUTPUT activation, creates the exact local route
+before the fwmark rule, performs full save plus rtnetlink readback, and reverses the transaction as
+OUTPUT detach, rule delete, route delete, remaining-root detach, then private-chain retirement.
+Replacement keeps the built-in jumps stable and atomically rebinds the durable Generation journal
+without releasing the component lease.
+
+Owner-payload schema 2 binds the target and optional previous Generation to artifact/tool digests and
+a domain-separated digest of the complete IPv4/IPv6 routing audit, including the exact loopback
+name/index identity. The real Adapter proves that live identity in both directions before every
+route/rule observation or mutation. Both xtables families and both routing audit identities are read
+before `Active` or `CleanAbsent`; any opposite-family residue blocks publication rather than being
+ignored because a family is absent from the target.
+
+Current terminal-journal recovery retains the native guard, shared writer fence, and optional lease
+through a fresh global IPv4/IPv6 xtables plus policy absence proof, then retires the terminal
+artifacts. The exact previous-boot revision-1 `Activating` `JournalDurable`/`JournalBeforeLease`
+boundary is also recoverable when its native-owner scope matches the journal; same-boot or mismatched
+missing-lease state remains fail-closed.
+
+Shell-owner v2 retains parent plus optional child PID/start identities and boot ID. Either live
+participant blocks. One serialized parent-bound mutating `addrsync` or `tproxy` phase child changes
+only the child slot and remains blocking after parent death; a live parent may reclaim a dead child.
+Both-dead, PID-reused, and previous-boot records retire only after exact revalidation. Ambient state
+is discarded, release is authenticated, signals exit through cleanup, and bare, malformed, mixed,
+and unverifiable locks remain fail-closed. Legacy start, stop, restart, and failure cleanup hold the
+same fence before `addrsync` or `tproxy` mutation; the standalone daemon remains a later cutover duty.
+
+The same real process/netlink Adapter passed apply, active-journal recovery, stop, and exact absence
+in a rooted disposable WSA Android 13 x86_64 namespace. That run also established two bounded legacy
+readback normalizations: a zero-byte full save in a never-initialized namespace means exact empty
+state, and kernel-emitted default TPROXY `--on-ip 0.0.0.0`/`::` is equivalent to the canonical
+omission. Nonempty missing-mangle output and nondefault `--on-ip` remain conflicts.
+
+Production remains `Unsupported`: this mechanism test does not supply Android 5.10/ARM64 mark
+authority, RPDB/VPN/netd coexistence, distinct engine identity, functional receipts, or release
+qualification, and it does not authorize shell-duty removal before the item-3 cutover gate. eBPF
+remains an optional separately qualified mechanism, and production loads no `.ko`/KPM payload.

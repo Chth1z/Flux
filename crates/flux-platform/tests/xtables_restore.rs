@@ -252,6 +252,90 @@ fn canonical_capture_chain_names_are_family_scoped_and_sealed() {
 }
 
 #[test]
+fn canonical_stable_capture_roots_are_family_scoped_and_sealed() {
+    for (family_digit, family, other_family) in [
+        ('4', XtablesRestoreFamily::Ipv4, XtablesRestoreFamily::Ipv6),
+        ('6', XtablesRestoreFamily::Ipv6, XtablesRestoreFamily::Ipv4),
+    ] {
+        for hook in ['P', 'O'] {
+            let chain = format!("FLX{family_digit}S{hook}");
+            let input = format!("*mangle\n:{chain} - [0:0]\nCOMMIT\n");
+            let artifact = parse_xtables_restore(
+                input.as_bytes(),
+                context(XtablesRestoreAction::Apply, family),
+            )
+            .expect("canonical stable Capture root");
+            assert_eq!(artifact.render_canonical().as_ref(), input.as_bytes());
+            assert_error(
+                input.as_bytes(),
+                context(XtablesRestoreAction::Apply, other_family),
+                XtablesRestoreParseErrorKind::FamilyMismatch {
+                    expected: other_family,
+                },
+                Some(2),
+            );
+        }
+    }
+
+    for chain in [
+        "FLX4SF",
+        "FLX4S",
+        "FLX4SP0",
+        "FLX4SX",
+        "FLX5SP",
+        "FLX6SOUTPUT",
+    ] {
+        let input = format!("*mangle\n:{chain} - [0:0]\nCOMMIT\n");
+        assert_error(
+            input.as_bytes(),
+            context(XtablesRestoreAction::Apply, XtablesRestoreFamily::Ipv4),
+            XtablesRestoreParseErrorKind::InvalidChainName,
+            Some(2),
+        );
+    }
+}
+
+#[test]
+fn replace_action_requires_flush_then_complete_append_population() {
+    let input = br#"*mangle
+-F FLX4SP
+-F FLX4SO
+-A FLX4SP -i lo -m mark --mark 0x200000/0x600000 -j FLX4P0000000001
+-A FLX4SO -m mark --mark 0x0/0x600000 -j FLX4O0000000001
+COMMIT
+"#;
+    let artifact = parse_xtables_restore(
+        input,
+        context(XtablesRestoreAction::Replace, XtablesRestoreFamily::Ipv4),
+    )
+    .expect("canonical stable-root replacement");
+    assert_eq!(artifact.render_canonical().as_ref(), input);
+
+    assert_error(
+        b"*mangle\n-A FLX4SP -j FLX4P0000000001\nCOMMIT\n",
+        context(XtablesRestoreAction::Replace, XtablesRestoreFamily::Ipv4),
+        XtablesRestoreParseErrorKind::ReplaceOrdering {
+            command: XtablesRestoreCommandKind::Append,
+        },
+        Some(2),
+    );
+    assert_error(
+        b"*mangle\n-F FLX4SP\n-A FLX4SP -j FLX4P0000000001\n-F FLX4SO\nCOMMIT\n",
+        context(XtablesRestoreAction::Replace, XtablesRestoreFamily::Ipv4),
+        XtablesRestoreParseErrorKind::ReplaceOrdering {
+            command: XtablesRestoreCommandKind::Flush,
+        },
+        Some(4),
+    );
+    assert_error(
+        b"*mangle\n:FLX4SP - [0:0]\nCOMMIT\n",
+        context(XtablesRestoreAction::Replace, XtablesRestoreFamily::Ipv4),
+        XtablesRestoreParseErrorKind::ChainDeclarationNotAllowed,
+        Some(2),
+    );
+}
+
+#[test]
 fn cleanup_round_trip_preserves_delete_flush_delete_chain_phase_order() {
     let artifact = parse_xtables_restore(
         IPV4_CLEANUP,

@@ -1,0 +1,2530 @@
+use std::error::Error;
+use std::ffi::{CString, OsStr};
+use std::fmt;
+use std::fs::File;
+use std::io::{self, Read, Write};
+use std::mem::MaybeUninit;
+use std::num::NonZeroU64;
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+use flux_core::{
+    BootIdentity, NetworkNamespaceIdentity, OWNERSHIP_JOURNAL_IDENTITY_BYTES,
+    OwnershipJournalIdentity, OwnershipJournalRevision,
+};
+use sha2::{Digest, Sha256};
+
+pub(crate) const NATIVE_XTABLES_JOURNAL_FILE_NAME: &str = "native_xtables.journal";
+pub(crate) const NATIVE_XTABLES_LEASE_FILE_NAME: &str = "native_xtables.lease";
+pub(crate) const XTABLES_WRITER_LOCK_DIRECTORY_NAME: &str = "xtables-writer.lock";
+const NATIVE_XTABLES_OWNER_GUARD_FILE_NAME: &str = ".native_xtables.owner.lock";
+const NATIVE_XTABLES_WRITER_OWNER_FILE_NAME: &str = "native-owner";
+const SHELL_XTABLES_WRITER_OWNER_FILE_NAME: &str = "shell-owner";
+pub(crate) const MAX_NATIVE_XTABLES_OWNER_PAYLOAD_BYTES: usize = 4096;
+pub(crate) const MAX_NATIVE_XTABLES_DURABLE_RECORD_BYTES: usize = 16 * 1024;
+
+const JOURNAL_MAGIC: &str = "flux-native-xtables-journal-v1";
+const LEASE_MAGIC: &str = "flux-native-xtables-lease-v1";
+const WRITER_OWNER_MAGIC: &str = "flux-native-xtables-writer-owner-v1";
+const SHELL_WRITER_OWNER_MAGIC: &str = "flux-shell-xtables-writer-owner-v2";
+const COMPONENT_NAME: &str = "native_xtables";
+const CHECKSUM_BYTES: usize = 32;
+const MAX_TEMP_CREATE_ATTEMPTS: usize = 16;
+const NATIVE_OWNER_GUARD_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(1);
+const NATIVE_OWNER_GUARD_RETRY_INTERVAL: Duration = Duration::from_millis(2);
+static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(transparent)]
+pub(crate) struct NativeXtablesGeneration(NonZeroU64);
+
+impl NativeXtablesGeneration {
+    #[must_use]
+    pub(crate) const fn new(value: u64) -> Option<Self> {
+        match NonZeroU64::new(value) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NativeXtablesJournalBinding {
+    boot_identity: BootIdentity,
+    network_namespace: NetworkNamespaceIdentity,
+    generation: NativeXtablesGeneration,
+    journal_identity: OwnershipJournalIdentity,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NativeXtablesLeaseScope {
+    boot_identity: BootIdentity,
+    network_namespace: NetworkNamespaceIdentity,
+    journal_identity: OwnershipJournalIdentity,
+}
+
+impl NativeXtablesLeaseScope {
+    #[must_use]
+    pub(crate) const fn new(
+        boot_identity: BootIdentity,
+        network_namespace: NetworkNamespaceIdentity,
+        journal_identity: OwnershipJournalIdentity,
+    ) -> Self {
+        Self {
+            boot_identity,
+            network_namespace,
+            journal_identity,
+        }
+    }
+
+    #[must_use]
+    fn from_journal(binding: &NativeXtablesJournalBinding) -> Self {
+        Self {
+            boot_identity: binding.boot_identity.clone(),
+            network_namespace: binding.network_namespace,
+            journal_identity: binding.journal_identity,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn boot_identity(&self) -> &BootIdentity {
+        &self.boot_identity
+    }
+
+    #[must_use]
+    pub(crate) const fn network_namespace(&self) -> NetworkNamespaceIdentity {
+        self.network_namespace
+    }
+
+    #[must_use]
+    pub(crate) const fn journal_identity(&self) -> OwnershipJournalIdentity {
+        self.journal_identity
+    }
+}
+
+impl NativeXtablesJournalBinding {
+    #[must_use]
+    pub(crate) const fn new(
+        boot_identity: BootIdentity,
+        network_namespace: NetworkNamespaceIdentity,
+        generation: NativeXtablesGeneration,
+        journal_identity: OwnershipJournalIdentity,
+    ) -> Self {
+        Self {
+            boot_identity,
+            network_namespace,
+            generation,
+            journal_identity,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn boot_identity(&self) -> &BootIdentity {
+        &self.boot_identity
+    }
+
+    #[must_use]
+    pub(crate) const fn network_namespace(&self) -> NetworkNamespaceIdentity {
+        self.network_namespace
+    }
+
+    #[must_use]
+    pub(crate) const fn generation(&self) -> NativeXtablesGeneration {
+        self.generation
+    }
+
+    #[must_use]
+    pub(crate) const fn journal_identity(&self) -> OwnershipJournalIdentity {
+        self.journal_identity
+    }
+
+    #[must_use]
+    pub(crate) fn lease_scope(&self) -> NativeXtablesLeaseScope {
+        NativeXtablesLeaseScope::from_journal(self)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NativeXtablesJournalPhase {
+    Activating,
+    Active,
+    Retiring,
+    Uncertain,
+    CleanAbsent,
+}
+
+impl NativeXtablesJournalPhase {
+    const fn token(self) -> &'static str {
+        match self {
+            Self::Activating => "activating",
+            Self::Active => "active",
+            Self::Retiring => "retiring",
+            Self::Uncertain => "uncertain",
+            Self::CleanAbsent => "clean_absent",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "activating" => Some(Self::Activating),
+            "active" => Some(Self::Active),
+            "retiring" => Some(Self::Retiring),
+            "uncertain" => Some(Self::Uncertain),
+            "clean_absent" => Some(Self::CleanAbsent),
+            _ => None,
+        }
+    }
+
+    const fn is_terminal(self) -> bool {
+        matches!(self, Self::CleanAbsent)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NativeXtablesOwnerPayload(Box<[u8]>);
+
+impl NativeXtablesOwnerPayload {
+    pub(crate) fn new(bytes: impl Into<Box<[u8]>>) -> Result<Self, NativeXtablesDurableError> {
+        let bytes = bytes.into();
+        if bytes.len() > MAX_NATIVE_XTABLES_OWNER_PAYLOAD_BYTES {
+            return Err(NativeXtablesDurableError::PayloadTooLarge {
+                actual: bytes.len(),
+                limit: MAX_NATIVE_XTABLES_OWNER_PAYLOAD_BYTES,
+            });
+        }
+        Ok(Self(bytes))
+    }
+
+    #[must_use]
+    pub(crate) const fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NativeXtablesJournalRecord {
+    binding: NativeXtablesJournalBinding,
+    revision: OwnershipJournalRevision,
+    phase: NativeXtablesJournalPhase,
+    owner_payload: NativeXtablesOwnerPayload,
+}
+
+impl NativeXtablesJournalRecord {
+    #[must_use]
+    pub(crate) const fn new(
+        binding: NativeXtablesJournalBinding,
+        revision: OwnershipJournalRevision,
+        phase: NativeXtablesJournalPhase,
+        owner_payload: NativeXtablesOwnerPayload,
+    ) -> Self {
+        Self {
+            binding,
+            revision,
+            phase,
+            owner_payload,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn binding(&self) -> &NativeXtablesJournalBinding {
+        &self.binding
+    }
+
+    #[must_use]
+    pub(crate) const fn revision(&self) -> OwnershipJournalRevision {
+        self.revision
+    }
+
+    #[must_use]
+    pub(crate) const fn phase(&self) -> NativeXtablesJournalPhase {
+        self.phase
+    }
+
+    #[must_use]
+    pub(crate) const fn owner_payload(&self) -> &NativeXtablesOwnerPayload {
+        &self.owner_payload
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct NativeXtablesDurableStore {
+    root: PathBuf,
+    #[cfg(test)]
+    test_control: TestControl,
+}
+
+impl NativeXtablesDurableStore {
+    #[must_use]
+    pub(crate) fn new(root: impl AsRef<Path>) -> Self {
+        Self {
+            root: root.as_ref().to_owned(),
+            #[cfg(test)]
+            test_control: TestControl::default(),
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn journal_path(&self) -> PathBuf {
+        self.root.join(NATIVE_XTABLES_JOURNAL_FILE_NAME)
+    }
+
+    #[must_use]
+    pub(crate) fn lease_path(&self) -> PathBuf {
+        self.root.join(NATIVE_XTABLES_LEASE_FILE_NAME)
+    }
+
+    #[must_use]
+    pub(crate) fn writer_lock_path(&self) -> PathBuf {
+        self.root.join(XTABLES_WRITER_LOCK_DIRECTORY_NAME)
+    }
+
+    /// Publishes the activating journal and then the shell-visible lease before returning any
+    /// mutation authority. A returned error after lock acquisition deliberately leaves the lock
+    /// directory in place when publication may have been interrupted.
+    pub(crate) fn acquire(
+        &self,
+        initial: NativeXtablesJournalRecord,
+    ) -> Result<NativeXtablesTransitionLease, NativeXtablesDurableError> {
+        if initial.phase != NativeXtablesJournalPhase::Activating {
+            return Err(NativeXtablesDurableError::InvalidInitialPhase(
+                initial.phase,
+            ));
+        }
+        let root = open_root(&self.root, true)?.ok_or_else(|| {
+            NativeXtablesDurableError::io(
+                "create native xtables durable root",
+                io::Error::from_raw_os_error(libc::ENOENT),
+            )
+        })?;
+        let lease_scope = initial.binding.lease_scope();
+        let native_guard = match acquire_native_owner_guard(&root) {
+            Ok(guard) => guard,
+            Err(NativeXtablesDurableError::NativeOwnerBusy) => {
+                return if read_lease(&root)?.is_some() {
+                    Err(NativeXtablesDurableError::LeaseConflict)
+                } else {
+                    Err(NativeXtablesDurableError::NativeOwnerBusy)
+                };
+            }
+            Err(error) => return Err(error),
+        };
+        let writer_lock = create_writer_lock(&root, &lease_scope, self)?;
+
+        let existing_lease = read_lease(&root)?;
+        if existing_lease.is_some() {
+            remove_writer_lock(&root, writer_lock, self)?;
+            return Err(NativeXtablesDurableError::LeaseConflict);
+        }
+        if let Some(existing) = read_journal(&root)?
+            && !existing.phase.is_terminal()
+        {
+            return Err(NativeXtablesDurableError::UnresolvedJournal);
+        }
+
+        let encoded_journal = encode_journal(&initial);
+        atomic_write(
+            &root,
+            NATIVE_XTABLES_JOURNAL_FILE_NAME,
+            &encoded_journal,
+            DurableEvent::JournalTempDurable,
+            DurableEvent::JournalDurable,
+            self,
+        )?;
+        checkpoint(self, DurableEvent::JournalBeforeLease)?;
+        let encoded_lease = encode_lease(&lease_scope);
+        atomic_write(
+            &root,
+            NATIVE_XTABLES_LEASE_FILE_NAME,
+            &encoded_lease,
+            DurableEvent::LeaseTempDurable,
+            DurableEvent::LeaseDurable,
+            self,
+        )?;
+        remove_writer_lock(&root, writer_lock, self)?;
+        Ok(NativeXtablesTransitionLease {
+            store: self.clone(),
+            binding: initial.binding,
+            lease_scope,
+            _native_guard: native_guard,
+        })
+    }
+
+    /// Reconstructs an exact lease for startup recovery. A pre-existing publication lock is
+    /// adopted only when a complete matching journal+lease pair proves that the durable lease
+    /// already blocks the shell writer. Partial publication stays blocked.
+    pub(crate) fn recover(
+        &self,
+        expected: &NativeXtablesJournalBinding,
+    ) -> Result<NativeXtablesRecovery, NativeXtablesDurableError> {
+        let Some(root) = open_root(&self.root, false)? else {
+            return Ok(NativeXtablesRecovery::Empty);
+        };
+        let native_guard = acquire_native_owner_guard(&root)?;
+        let lease_scope = expected.lease_scope();
+        let (writer_lock, inherited_lock) =
+            recover_or_create_writer_lock(&root, &lease_scope, self)?;
+
+        let journal = read_journal(&root)?;
+        let lease = read_lease(&root)?;
+        match (journal, lease) {
+            (None, None) if inherited_lock => {
+                Err(NativeXtablesDurableError::InterruptedPublication)
+            }
+            (None, None) => {
+                remove_writer_lock(&root, writer_lock, self)?;
+                Ok(NativeXtablesRecovery::Empty)
+            }
+            (Some(journal), None) => {
+                require_binding(expected, &journal.binding, DurableArtifact::Journal)?;
+                if journal.phase.is_terminal() {
+                    Ok(NativeXtablesRecovery::CleanAbsent {
+                        record: journal.clone(),
+                        fence: Box::new(NativeXtablesRecoveryFence {
+                            store: self.clone(),
+                            writer_lock,
+                            retirement: Some(PreviousBootRetirement {
+                                journal,
+                                lease: None,
+                            }),
+                            _native_guard: native_guard,
+                        }),
+                    })
+                } else if inherited_lock {
+                    Err(NativeXtablesDurableError::InterruptedPublication)
+                } else {
+                    Err(NativeXtablesDurableError::MissingLease)
+                }
+            }
+            (None, Some(lease)) => {
+                let result = require_lease_scope(&lease_scope, &lease)
+                    .and(Err(NativeXtablesDurableError::MissingJournal));
+                if !inherited_lock {
+                    remove_writer_lock(&root, writer_lock, self)?;
+                }
+                result
+            }
+            (Some(journal), Some(lease)) => {
+                let validation =
+                    require_binding(expected, &journal.binding, DurableArtifact::Journal)
+                        .and_then(|()| require_lease_scope(&lease_scope, &lease))
+                        .and_then(|()| require_lease_scope(&journal.binding.lease_scope(), &lease));
+                if let Err(error) = validation {
+                    if !inherited_lock {
+                        remove_writer_lock(&root, writer_lock, self)?;
+                    }
+                    return Err(error);
+                }
+                if journal.phase.is_terminal() {
+                    Ok(NativeXtablesRecovery::CleanAbsent {
+                        record: journal.clone(),
+                        fence: Box::new(NativeXtablesRecoveryFence {
+                            store: self.clone(),
+                            writer_lock,
+                            retirement: Some(PreviousBootRetirement {
+                                journal,
+                                lease: Some(lease),
+                            }),
+                            _native_guard: native_guard,
+                        }),
+                    })
+                } else {
+                    remove_writer_lock(&root, writer_lock, self)?;
+                    Ok(NativeXtablesRecovery::Leased(
+                        NativeXtablesTransitionLease {
+                            store: self.clone(),
+                            binding: expected.clone(),
+                            lease_scope,
+                            _native_guard: native_guard,
+                        },
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Serializes startup inspection even when no journal is present.
+    ///
+    /// `Vacant` is returned only while both the native advisory guard and the shared writer lock
+    /// remain held. The caller must freshly prove xtables and policy-routing absence and then call
+    /// [`NativeXtablesRecoveryFence::finish_clean`]. Dropping the fence without finishing retains
+    /// the writer lock so failed or incomplete live-state inspection remains fail-closed.
+    pub(crate) fn inspect_for_recovery(
+        &self,
+        current_scope: &NativeXtablesLeaseScope,
+    ) -> Result<NativeXtablesRecoveryInspection, NativeXtablesDurableError> {
+        let root = open_root(&self.root, true)?.ok_or_else(|| {
+            NativeXtablesDurableError::io(
+                "create native xtables durable root for recovery inspection",
+                io::Error::from_raw_os_error(libc::ENOENT),
+            )
+        })?;
+        let native_guard = acquire_native_owner_guard(&root)?;
+        let (writer_lock, inherited_lock) =
+            recover_or_create_writer_lock(&root, current_scope, self)?;
+        let journal = read_journal(&root)?;
+        let lease = read_lease(&root)?;
+
+        match (journal, lease) {
+            (None, None) => Ok(NativeXtablesRecoveryInspection::Vacant(
+                NativeXtablesRecoveryFence {
+                    store: self.clone(),
+                    writer_lock,
+                    retirement: None,
+                    _native_guard: native_guard,
+                },
+            )),
+            (None, Some(_)) => Err(NativeXtablesDurableError::MissingJournal),
+            (Some(journal), lease) => {
+                let recorded_scope = journal.binding.lease_scope();
+                if journal.binding.boot_identity == current_scope.boot_identity {
+                    require_lease_scope(current_scope, &recorded_scope)?;
+                    match &lease {
+                        Some(lease) => require_lease_scope(&recorded_scope, lease)?,
+                        None if !journal.phase.is_terminal() => {
+                            return Err(NativeXtablesDurableError::MissingLease);
+                        }
+                        None => {}
+                    }
+                    if journal.phase.is_terminal() {
+                        return Ok(NativeXtablesRecoveryInspection::CurrentTerminal {
+                            record: journal.clone(),
+                            fence: NativeXtablesRecoveryFence {
+                                store: self.clone(),
+                                writer_lock,
+                                retirement: Some(PreviousBootRetirement { journal, lease }),
+                                _native_guard: native_guard,
+                            },
+                        });
+                    }
+                    remove_writer_lock(&root, writer_lock, self)?;
+                    Ok(NativeXtablesRecoveryInspection::CurrentJournal(journal))
+                } else {
+                    let inherited_recorded_lock = inherited_lock
+                        && writer_lock.scope.boot_identity != current_scope.boot_identity;
+                    if inherited_recorded_lock {
+                        require_lease_scope(&recorded_scope, &writer_lock.scope)?;
+                    }
+                    match &lease {
+                        Some(lease) => require_lease_scope(&recorded_scope, lease)?,
+                        None if !(journal.phase.is_terminal()
+                            || inherited_recorded_lock
+                                && journal.phase == NativeXtablesJournalPhase::Activating
+                                && journal.revision == OwnershipJournalRevision::INITIAL) =>
+                        {
+                            return Err(NativeXtablesDurableError::MissingLease);
+                        }
+                        None => {}
+                    }
+                    Ok(NativeXtablesRecoveryInspection::Vacant(
+                        NativeXtablesRecoveryFence {
+                            store: self.clone(),
+                            writer_lock,
+                            retirement: Some(PreviousBootRetirement { journal, lease }),
+                            _native_guard: native_guard,
+                        },
+                    ))
+                }
+            }
+        }
+    }
+
+    pub(crate) fn load_journal(
+        &self,
+    ) -> Result<Option<NativeXtablesJournalRecord>, NativeXtablesDurableError> {
+        let Some(root) = open_root(&self.root, false)? else {
+            return Ok(None);
+        };
+        read_journal(&root)
+    }
+
+    pub(crate) fn load_lease(
+        &self,
+    ) -> Result<Option<NativeXtablesLeaseScope>, NativeXtablesDurableError> {
+        let Some(root) = open_root(&self.root, false)? else {
+            return Ok(None);
+        };
+        read_lease(&root)
+    }
+
+    pub(crate) fn writer_lock_exists(&self) -> Result<bool, NativeXtablesDurableError> {
+        let Some(root) = open_root(&self.root, false)? else {
+            return Ok(false);
+        };
+        writer_lock_exists(&root)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_failpoint(&self, event: Option<DurableEvent>) {
+        self.test_control.set_failpoint(event);
+    }
+
+    #[cfg(test)]
+    fn pause_at(&self, event: DurableEvent) {
+        self.test_control.pause_at(event);
+    }
+
+    #[cfg(test)]
+    fn wait_until_paused(&self, event: DurableEvent) {
+        self.test_control.wait_until_paused(event);
+    }
+
+    #[cfg(test)]
+    fn release_pause(&self) {
+        self.test_control.release_pause();
+    }
+
+    #[cfg(test)]
+    fn take_events(&self) -> Vec<DurableEvent> {
+        self.test_control.take_events()
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum NativeXtablesRecovery {
+    Empty,
+    Leased(NativeXtablesTransitionLease),
+    CleanAbsent {
+        record: NativeXtablesJournalRecord,
+        fence: Box<NativeXtablesRecoveryFence>,
+    },
+}
+
+#[derive(Debug)]
+pub(crate) enum NativeXtablesRecoveryInspection {
+    /// No durable owner artifacts remain, but live kernel absence still needs proof under `fence`.
+    Vacant(NativeXtablesRecoveryFence),
+    /// A current terminal journal still needs fresh global absence proof under `fence` before its
+    /// durable artifacts and the shared writer boundary may be retired.
+    CurrentTerminal {
+        record: NativeXtablesJournalRecord,
+        fence: NativeXtablesRecoveryFence,
+    },
+    /// A current durable journal exists and the caller must continue through exact journal recovery.
+    CurrentJournal(NativeXtablesJournalRecord),
+}
+
+#[derive(Debug)]
+pub(crate) struct NativeXtablesRecoveryFence {
+    store: NativeXtablesDurableStore,
+    writer_lock: NativeWriterLock,
+    retirement: Option<PreviousBootRetirement>,
+    _native_guard: NativeOwnerGuard,
+}
+
+#[derive(Debug)]
+struct PreviousBootRetirement {
+    journal: NativeXtablesJournalRecord,
+    lease: Option<NativeXtablesLeaseScope>,
+}
+
+impl NativeXtablesRecoveryFence {
+    /// Completes a read-only clean-absence proof by durably releasing the shared writer fence.
+    pub(crate) fn finish_clean(self) -> Result<(), NativeXtablesDurableError> {
+        let root = open_existing_root(&self.store.root)?;
+        if let Some(retirement) = self.retirement {
+            let terminal = if retirement.journal.phase.is_terminal() {
+                retirement.journal
+            } else {
+                let revision = retirement
+                    .journal
+                    .revision
+                    .get()
+                    .checked_add(1)
+                    .and_then(OwnershipJournalRevision::new)
+                    .ok_or(NativeXtablesDurableError::RevisionExhausted)?;
+                let terminal = NativeXtablesJournalRecord::new(
+                    retirement.journal.binding,
+                    revision,
+                    NativeXtablesJournalPhase::CleanAbsent,
+                    retirement.journal.owner_payload,
+                );
+                atomic_write(
+                    &root,
+                    NATIVE_XTABLES_JOURNAL_FILE_NAME,
+                    &encode_journal(&terminal),
+                    DurableEvent::JournalTempDurable,
+                    DurableEvent::TerminalJournalDurable,
+                    &self.store,
+                )?;
+                terminal
+            };
+            if let Some(lease) = retirement.lease {
+                remove_lease(&root, &lease, &self.store)?;
+            }
+            remove_journal(&root, &terminal, &self.store)?;
+        }
+        remove_writer_lock(&root, self.writer_lock, &self.store)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct NativeXtablesTransitionLease {
+    store: NativeXtablesDurableStore,
+    binding: NativeXtablesJournalBinding,
+    lease_scope: NativeXtablesLeaseScope,
+    _native_guard: NativeOwnerGuard,
+}
+
+impl NativeXtablesTransitionLease {
+    #[must_use]
+    pub(crate) const fn binding(&self) -> &NativeXtablesJournalBinding {
+        &self.binding
+    }
+
+    /// Atomically advances a nonterminal journal record while holding and revalidating the exact
+    /// durable lease. Terminal publication must use `complete` so lease-release ordering cannot be
+    /// bypassed.
+    pub(crate) fn update(
+        &mut self,
+        next: NativeXtablesJournalRecord,
+    ) -> Result<(), NativeXtablesDurableError> {
+        if next.phase.is_terminal() {
+            return Err(NativeXtablesDurableError::TerminalUpdateRequiresCompletion);
+        }
+        let root = open_existing_root(&self.store.root)?;
+        let writer_lock = create_writer_lock(&root, &self.lease_scope, &self.store)?;
+        let result = validate_update(&root, &self.binding, &self.lease_scope, &next);
+        if let Err(error) = result {
+            remove_writer_lock(&root, writer_lock, &self.store)?;
+            return Err(error);
+        }
+        let encoded = encode_journal(&next);
+        atomic_write(
+            &root,
+            NATIVE_XTABLES_JOURNAL_FILE_NAME,
+            &encoded,
+            DurableEvent::JournalTempDurable,
+            DurableEvent::JournalDurable,
+            &self.store,
+        )?;
+        remove_writer_lock(&root, writer_lock, &self.store)
+    }
+
+    /// Atomically replaces the exact Generation-bound journal while retaining the component-scoped
+    /// lease and the process-held native-owner guard. A crash therefore exposes either the old
+    /// canonical journal or the replacement canonical journal, never a mixed lease binding.
+    pub(crate) fn rebind(
+        &mut self,
+        replacement: NativeXtablesJournalRecord,
+    ) -> Result<(), NativeXtablesDurableError> {
+        validate_replacement_shape(&self.binding, &self.lease_scope, &replacement)?;
+        let root = open_existing_root(&self.store.root)?;
+        let writer_lock = create_writer_lock(&root, &self.lease_scope, &self.store)?;
+        let result = validate_rebind(&root, &self.binding, &self.lease_scope, &replacement);
+        if let Err(error) = result {
+            remove_writer_lock(&root, writer_lock, &self.store)?;
+            return Err(error);
+        }
+        let encoded = encode_journal(&replacement);
+        atomic_write(
+            &root,
+            NATIVE_XTABLES_JOURNAL_FILE_NAME,
+            &encoded,
+            DurableEvent::JournalTempDurable,
+            DurableEvent::JournalDurable,
+            &self.store,
+        )?;
+        self.binding = replacement.binding;
+        remove_writer_lock(&root, writer_lock, &self.store)
+    }
+
+    /// Durably publishes clean absence before deleting the shell-visible lease. The transient
+    /// writer lock remains after any interrupted boundary, keeping shell mutation blocked.
+    pub(crate) fn complete(
+        self,
+        terminal: NativeXtablesJournalRecord,
+    ) -> Result<NativeXtablesJournalRecord, NativeXtablesDurableError> {
+        if !terminal.phase.is_terminal() {
+            return Err(NativeXtablesDurableError::NonTerminalCompletion(
+                terminal.phase,
+            ));
+        }
+        let root = open_existing_root(&self.store.root)?;
+        let writer_lock = create_writer_lock(&root, &self.lease_scope, &self.store)?;
+        let result = validate_update(&root, &self.binding, &self.lease_scope, &terminal);
+        if let Err(error) = result {
+            remove_writer_lock(&root, writer_lock, &self.store)?;
+            return Err(error);
+        }
+        let encoded = encode_journal(&terminal);
+        atomic_write(
+            &root,
+            NATIVE_XTABLES_JOURNAL_FILE_NAME,
+            &encoded,
+            DurableEvent::JournalTempDurable,
+            DurableEvent::TerminalJournalDurable,
+            &self.store,
+        )?;
+        remove_lease(&root, &self.lease_scope, &self.store)?;
+        remove_writer_lock(&root, writer_lock, &self.store)?;
+        Ok(terminal)
+    }
+}
+
+fn validate_update(
+    root: &File,
+    expected: &NativeXtablesJournalBinding,
+    expected_scope: &NativeXtablesLeaseScope,
+    next: &NativeXtablesJournalRecord,
+) -> Result<(), NativeXtablesDurableError> {
+    let lease = read_lease(root)?.ok_or(NativeXtablesDurableError::MissingLease)?;
+    require_lease_scope(expected_scope, &lease)?;
+    require_binding(expected, &next.binding, DurableArtifact::Journal)?;
+    let current = read_journal(root)?.ok_or(NativeXtablesDurableError::MissingJournal)?;
+    require_binding(expected, &current.binding, DurableArtifact::Journal)?;
+    let expected_revision = current
+        .revision
+        .get()
+        .checked_add(1)
+        .and_then(OwnershipJournalRevision::new)
+        .ok_or(NativeXtablesDurableError::RevisionExhausted)?;
+    if next.revision != expected_revision {
+        return Err(NativeXtablesDurableError::RevisionConflict {
+            expected: expected_revision,
+            actual: next.revision,
+        });
+    }
+    Ok(())
+}
+
+fn validate_replacement_shape(
+    current: &NativeXtablesJournalBinding,
+    lease_scope: &NativeXtablesLeaseScope,
+    replacement: &NativeXtablesJournalRecord,
+) -> Result<(), NativeXtablesDurableError> {
+    if replacement.phase.is_terminal() {
+        return Err(NativeXtablesDurableError::TerminalUpdateRequiresCompletion);
+    }
+    require_lease_scope(lease_scope, &replacement.binding.lease_scope())?;
+    if replacement.binding.generation == current.generation {
+        return Err(NativeXtablesDurableError::InvalidRebindIdentity);
+    }
+    Ok(())
+}
+
+fn validate_rebind(
+    root: &File,
+    current_binding: &NativeXtablesJournalBinding,
+    lease_scope: &NativeXtablesLeaseScope,
+    replacement: &NativeXtablesJournalRecord,
+) -> Result<(), NativeXtablesDurableError> {
+    let lease = read_lease(root)?.ok_or(NativeXtablesDurableError::MissingLease)?;
+    require_lease_scope(lease_scope, &lease)?;
+    let current = read_journal(root)?.ok_or(NativeXtablesDurableError::MissingJournal)?;
+    require_binding(current_binding, &current.binding, DurableArtifact::Journal)?;
+    validate_replacement_shape(current_binding, lease_scope, replacement)?;
+    let expected_revision = current
+        .revision
+        .get()
+        .checked_add(1)
+        .and_then(OwnershipJournalRevision::new)
+        .ok_or(NativeXtablesDurableError::RevisionExhausted)?;
+    if replacement.revision != expected_revision {
+        return Err(NativeXtablesDurableError::RevisionConflict {
+            expected: expected_revision,
+            actual: replacement.revision,
+        });
+    }
+    Ok(())
+}
+
+fn require_binding(
+    expected: &NativeXtablesJournalBinding,
+    actual: &NativeXtablesJournalBinding,
+    artifact: DurableArtifact,
+) -> Result<(), NativeXtablesDurableError> {
+    if expected == actual {
+        Ok(())
+    } else {
+        Err(NativeXtablesDurableError::BindingMismatch { artifact })
+    }
+}
+
+fn require_lease_scope(
+    expected: &NativeXtablesLeaseScope,
+    actual: &NativeXtablesLeaseScope,
+) -> Result<(), NativeXtablesDurableError> {
+    if expected == actual {
+        Ok(())
+    } else {
+        Err(NativeXtablesDurableError::BindingMismatch {
+            artifact: DurableArtifact::Lease,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DurableArtifact {
+    Journal,
+    Lease,
+    WriterOwner,
+    ShellWriterOwner,
+}
+
+impl fmt::Display for DurableArtifact {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Journal => formatter.write_str("journal"),
+            Self::Lease => formatter.write_str("lease"),
+            Self::WriterOwner => formatter.write_str("writer owner"),
+            Self::ShellWriterOwner => formatter.write_str("shell writer owner"),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum NativeXtablesDurableError {
+    Io {
+        operation: &'static str,
+        source: io::Error,
+    },
+    UnsafePath(PathBuf),
+    Symlink(PathBuf),
+    UnexpectedFileType(PathBuf),
+    RecordTooLarge {
+        artifact: DurableArtifact,
+        actual: usize,
+        limit: usize,
+    },
+    PayloadTooLarge {
+        actual: usize,
+        limit: usize,
+    },
+    InvalidRecord {
+        artifact: DurableArtifact,
+        reason: &'static str,
+    },
+    NativeOwnerBusy,
+    ShellWriterBusy,
+    LeaseConflict,
+    UnresolvedJournal,
+    InterruptedPublication,
+    MissingJournal,
+    MissingLease,
+    BindingMismatch {
+        artifact: DurableArtifact,
+    },
+    RevisionConflict {
+        expected: OwnershipJournalRevision,
+        actual: OwnershipJournalRevision,
+    },
+    RevisionExhausted,
+    InvalidInitialPhase(NativeXtablesJournalPhase),
+    InvalidRebindIdentity,
+    TerminalUpdateRequiresCompletion,
+    NonTerminalCompletion(NativeXtablesJournalPhase),
+    InterruptedAt(DurableEvent),
+}
+
+impl NativeXtablesDurableError {
+    fn io(operation: &'static str, source: io::Error) -> Self {
+        Self::Io { operation, source }
+    }
+}
+
+impl fmt::Display for NativeXtablesDurableError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io { operation, source } => write!(formatter, "{operation} failed: {source}"),
+            Self::UnsafePath(path) => {
+                write!(
+                    formatter,
+                    "unsafe native xtables durable path {}",
+                    path.display()
+                )
+            }
+            Self::Symlink(path) => write!(
+                formatter,
+                "refusing symbolic-link native xtables durable path {}",
+                path.display()
+            ),
+            Self::UnexpectedFileType(path) => write!(
+                formatter,
+                "native xtables durable path {} has an unexpected file type",
+                path.display()
+            ),
+            Self::RecordTooLarge {
+                artifact,
+                actual,
+                limit,
+            } => write!(
+                formatter,
+                "native xtables {artifact} is {actual} bytes, exceeding {limit}-byte limit"
+            ),
+            Self::PayloadTooLarge { actual, limit } => write!(
+                formatter,
+                "native xtables owner payload is {actual} bytes, exceeding {limit}-byte limit"
+            ),
+            Self::InvalidRecord { artifact, reason } => {
+                write!(formatter, "invalid native xtables {artifact}: {reason}")
+            }
+            Self::NativeOwnerBusy => formatter
+                .write_str("another live native xtables owner holds the process-liveness guard"),
+            Self::ShellWriterBusy => formatter
+                .write_str("another live shell xtables writer holds the shared writer lock"),
+            Self::LeaseConflict => formatter.write_str("native xtables lease already exists"),
+            Self::UnresolvedJournal => {
+                formatter.write_str("nonterminal native xtables journal exists without a lease")
+            }
+            Self::InterruptedPublication => formatter.write_str(
+                "native xtables writer lock records an interrupted or concurrent publication",
+            ),
+            Self::MissingJournal => {
+                formatter.write_str("native xtables lease exists without its journal")
+            }
+            Self::MissingLease => {
+                formatter.write_str("nonterminal native xtables journal has no matching lease")
+            }
+            Self::BindingMismatch { artifact } => write!(
+                formatter,
+                "native xtables {artifact} scope or exact journal binding is stale"
+            ),
+            Self::RevisionConflict { expected, actual } => write!(
+                formatter,
+                "native xtables journal revision must advance to {}, not {}",
+                expected.get(),
+                actual.get()
+            ),
+            Self::RevisionExhausted => {
+                formatter.write_str("native xtables journal revision is exhausted")
+            }
+            Self::InvalidInitialPhase(phase) => write!(
+                formatter,
+                "native xtables acquisition requires activating phase, found {}",
+                phase.token()
+            ),
+            Self::InvalidRebindIdentity => formatter
+                .write_str("native xtables Generation rebind requires a distinct Generation"),
+            Self::TerminalUpdateRequiresCompletion => formatter.write_str(
+                "terminal native xtables journal publication must release through completion",
+            ),
+            Self::NonTerminalCompletion(phase) => write!(
+                formatter,
+                "native xtables completion requires clean_absent phase, found {}",
+                phase.token()
+            ),
+            Self::InterruptedAt(event) => {
+                write!(formatter, "injected interruption at {event:?}")
+            }
+        }
+    }
+}
+
+impl Error for NativeXtablesDurableError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Io { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+
+fn encode_journal(record: &NativeXtablesJournalRecord) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(512 + record.owner_payload.as_bytes().len() * 2);
+    push_line(&mut encoded, JOURNAL_MAGIC);
+    push_line(&mut encoded, &format!("component={COMPONENT_NAME}"));
+    encode_binding_lines(&mut encoded, &record.binding);
+    push_line(&mut encoded, &format!("revision={}", record.revision.get()));
+    push_line(&mut encoded, &format!("phase={}", record.phase.token()));
+    push_line(
+        &mut encoded,
+        &format!("payload_bytes={}", record.owner_payload.as_bytes().len()),
+    );
+    push_line(
+        &mut encoded,
+        &format!(
+            "payload_hex={}",
+            encode_hex(record.owner_payload.as_bytes())
+        ),
+    );
+    append_checksum(&mut encoded);
+    encoded
+}
+
+fn encode_lease(scope: &NativeXtablesLeaseScope) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(384);
+    push_line(&mut encoded, LEASE_MAGIC);
+    push_line(&mut encoded, &format!("component={COMPONENT_NAME}"));
+    encode_scope_lines(&mut encoded, scope);
+    append_checksum(&mut encoded);
+    encoded
+}
+
+fn encode_binding_lines(encoded: &mut Vec<u8>, binding: &NativeXtablesJournalBinding) {
+    push_line(encoded, &format!("boot={}", binding.boot_identity.as_str()));
+    push_line(
+        encoded,
+        &format!("netns_device={}", binding.network_namespace.device()),
+    );
+    push_line(
+        encoded,
+        &format!("netns_inode={}", binding.network_namespace.inode()),
+    );
+    push_line(encoded, &format!("generation={}", binding.generation.get()));
+    push_line(
+        encoded,
+        &format!(
+            "journal={}",
+            encode_hex(binding.journal_identity.as_bytes())
+        ),
+    );
+}
+
+fn encode_scope_lines(encoded: &mut Vec<u8>, scope: &NativeXtablesLeaseScope) {
+    push_line(encoded, &format!("boot={}", scope.boot_identity.as_str()));
+    push_line(
+        encoded,
+        &format!("netns_device={}", scope.network_namespace.device()),
+    );
+    push_line(
+        encoded,
+        &format!("netns_inode={}", scope.network_namespace.inode()),
+    );
+    push_line(
+        encoded,
+        &format!("owner={}", encode_hex(scope.journal_identity.as_bytes())),
+    );
+}
+
+fn encode_writer_owner(scope: &NativeXtablesLeaseScope) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(256);
+    push_line(&mut encoded, WRITER_OWNER_MAGIC);
+    push_line(&mut encoded, &format!("component={COMPONENT_NAME}"));
+    encode_scope_lines(&mut encoded, scope);
+    append_checksum(&mut encoded);
+    encoded
+}
+
+fn append_checksum(encoded: &mut Vec<u8>) {
+    let checksum = Sha256::digest(&*encoded);
+    push_line(encoded, &format!("sha256={}", encode_hex(&checksum)));
+}
+
+fn push_line(encoded: &mut Vec<u8>, line: &str) {
+    encoded.extend_from_slice(line.as_bytes());
+    encoded.push(b'\n');
+}
+
+fn parse_journal(encoded: &[u8]) -> Result<NativeXtablesJournalRecord, NativeXtablesDurableError> {
+    ensure_record_bound(encoded, DurableArtifact::Journal)?;
+    let lines = canonical_lines(encoded, DurableArtifact::Journal, 12)?;
+    if lines[0] != JOURNAL_MAGIC || lines[1] != format!("component={COMPONENT_NAME}") {
+        return Err(invalid_record(
+            DurableArtifact::Journal,
+            "wrong schema or component",
+        ));
+    }
+    validate_checksum(encoded, &lines, DurableArtifact::Journal)?;
+    let binding = parse_binding(&lines[2..7], DurableArtifact::Journal)?;
+    let revision = parse_nonzero_u64(field(lines[7], "revision", DurableArtifact::Journal)?)
+        .and_then(OwnershipJournalRevision::new)
+        .ok_or_else(|| invalid_record(DurableArtifact::Journal, "invalid revision"))?;
+    let phase =
+        NativeXtablesJournalPhase::parse(field(lines[8], "phase", DurableArtifact::Journal)?)
+            .ok_or_else(|| invalid_record(DurableArtifact::Journal, "invalid phase"))?;
+    let payload_len =
+        parse_canonical_usize(field(lines[9], "payload_bytes", DurableArtifact::Journal)?)
+            .ok_or_else(|| invalid_record(DurableArtifact::Journal, "invalid payload length"))?;
+    if payload_len > MAX_NATIVE_XTABLES_OWNER_PAYLOAD_BYTES {
+        return Err(NativeXtablesDurableError::PayloadTooLarge {
+            actual: payload_len,
+            limit: MAX_NATIVE_XTABLES_OWNER_PAYLOAD_BYTES,
+        });
+    }
+    let payload = decode_hex(field(lines[10], "payload_hex", DurableArtifact::Journal)?)
+        .ok_or_else(|| invalid_record(DurableArtifact::Journal, "invalid payload encoding"))?;
+    if payload.len() != payload_len {
+        return Err(invalid_record(
+            DurableArtifact::Journal,
+            "payload length does not match encoding",
+        ));
+    }
+    let record = NativeXtablesJournalRecord::new(
+        binding,
+        revision,
+        phase,
+        NativeXtablesOwnerPayload::new(payload)?,
+    );
+    if encode_journal(&record) != encoded {
+        return Err(invalid_record(
+            DurableArtifact::Journal,
+            "record is not canonical",
+        ));
+    }
+    Ok(record)
+}
+
+fn parse_lease(encoded: &[u8]) -> Result<NativeXtablesLeaseScope, NativeXtablesDurableError> {
+    ensure_record_bound(encoded, DurableArtifact::Lease)?;
+    let lines = canonical_lines(encoded, DurableArtifact::Lease, 7)?;
+    if lines[0] != LEASE_MAGIC || lines[1] != format!("component={COMPONENT_NAME}") {
+        return Err(invalid_record(
+            DurableArtifact::Lease,
+            "wrong schema or component",
+        ));
+    }
+    validate_checksum(encoded, &lines, DurableArtifact::Lease)?;
+    let scope = parse_scope(&lines[2..6], DurableArtifact::Lease)?;
+    if encode_lease(&scope) != encoded {
+        return Err(invalid_record(
+            DurableArtifact::Lease,
+            "record is not canonical",
+        ));
+    }
+    Ok(scope)
+}
+
+fn parse_writer_owner(
+    encoded: &[u8],
+) -> Result<NativeXtablesLeaseScope, NativeXtablesDurableError> {
+    ensure_record_bound(encoded, DurableArtifact::WriterOwner)?;
+    let lines = canonical_lines(encoded, DurableArtifact::WriterOwner, 7)?;
+    if lines[0] != WRITER_OWNER_MAGIC || lines[1] != format!("component={COMPONENT_NAME}") {
+        return Err(invalid_record(
+            DurableArtifact::WriterOwner,
+            "wrong schema or component",
+        ));
+    }
+    validate_checksum(encoded, &lines, DurableArtifact::WriterOwner)?;
+    let scope = parse_scope(&lines[2..6], DurableArtifact::WriterOwner)?;
+    if encode_writer_owner(&scope) != encoded {
+        return Err(invalid_record(
+            DurableArtifact::WriterOwner,
+            "record is not canonical",
+        ));
+    }
+    Ok(scope)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ShellWriterParticipant {
+    pid: u32,
+    start_ticks: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ShellWriterOwner {
+    parent: ShellWriterParticipant,
+    child: Option<ShellWriterParticipant>,
+    boot_identity: BootIdentity,
+}
+
+fn parse_shell_writer_owner(encoded: &[u8]) -> Result<ShellWriterOwner, NativeXtablesDurableError> {
+    ensure_record_bound(encoded, DurableArtifact::ShellWriterOwner)?;
+    let text = std::str::from_utf8(encoded)
+        .map_err(|_| invalid_record(DurableArtifact::ShellWriterOwner, "record is not UTF-8"))?;
+    if !text.ends_with('\n') || text.contains('\r') {
+        return Err(invalid_record(
+            DurableArtifact::ShellWriterOwner,
+            "record is truncated or has noncanonical lines",
+        ));
+    }
+    let fields = text[..text.len() - 1].split(' ').collect::<Vec<_>>();
+    if fields.len() != 6 || fields.iter().any(|field| field.is_empty()) {
+        return Err(invalid_record(
+            DurableArtifact::ShellWriterOwner,
+            "wrong field count",
+        ));
+    }
+    if fields[0] != SHELL_WRITER_OWNER_MAGIC {
+        return Err(invalid_record(
+            DurableArtifact::ShellWriterOwner,
+            "wrong schema",
+        ));
+    }
+    let parent_pid = fields[1]
+        .parse::<u32>()
+        .ok()
+        .filter(|pid| *pid != 0 && pid.to_string() == fields[1])
+        .ok_or_else(|| invalid_record(DurableArtifact::ShellWriterOwner, "invalid parent pid"))?;
+    let parent_start_ticks = (fields[2].len() <= 19)
+        .then(|| parse_nonzero_u64(fields[2]))
+        .flatten()
+        .ok_or_else(|| {
+            invalid_record(
+                DurableArtifact::ShellWriterOwner,
+                "invalid parent process start ticks",
+            )
+        })?;
+    let child_pid = fields[3]
+        .parse::<u32>()
+        .ok()
+        .filter(|pid| pid.to_string() == fields[3])
+        .ok_or_else(|| invalid_record(DurableArtifact::ShellWriterOwner, "invalid child pid"))?;
+    let child_start_ticks = (fields[4].len() <= 19)
+        .then(|| fields[4].parse::<u64>().ok())
+        .flatten()
+        .filter(|ticks| ticks.to_string() == fields[4])
+        .ok_or_else(|| {
+            invalid_record(
+                DurableArtifact::ShellWriterOwner,
+                "invalid child process start ticks",
+            )
+        })?;
+    let child = match (child_pid, child_start_ticks) {
+        (0, 0) => None,
+        (0, _) | (_, 0) => {
+            return Err(invalid_record(
+                DurableArtifact::ShellWriterOwner,
+                "child pid and start ticks must both be present or absent",
+            ));
+        }
+        (pid, start_ticks) => Some(ShellWriterParticipant { pid, start_ticks }),
+    };
+    let boot_identity = BootIdentity::parse(fields[5])
+        .map_err(|_| invalid_record(DurableArtifact::ShellWriterOwner, "invalid boot identity"))?;
+    if boot_identity.as_str() != fields[5] {
+        return Err(invalid_record(
+            DurableArtifact::ShellWriterOwner,
+            "boot identity is not canonical lowercase",
+        ));
+    }
+    Ok(ShellWriterOwner {
+        parent: ShellWriterParticipant {
+            pid: parent_pid,
+            start_ticks: parent_start_ticks,
+        },
+        child,
+        boot_identity,
+    })
+}
+
+fn parse_binding(
+    lines: &[&str],
+    artifact: DurableArtifact,
+) -> Result<NativeXtablesJournalBinding, NativeXtablesDurableError> {
+    if lines.len() != 5 {
+        return Err(invalid_record(artifact, "wrong binding field count"));
+    }
+    let boot_text = field(lines[0], "boot", artifact)?;
+    let boot_identity = BootIdentity::parse(boot_text)
+        .map_err(|_| invalid_record(artifact, "invalid boot identity"))?;
+    let device = parse_canonical_u64(field(lines[1], "netns_device", artifact)?)
+        .ok_or_else(|| invalid_record(artifact, "invalid namespace device"))?;
+    let inode = parse_nonzero_u64(field(lines[2], "netns_inode", artifact)?)
+        .ok_or_else(|| invalid_record(artifact, "invalid namespace inode"))?;
+    let network_namespace = NetworkNamespaceIdentity::new(device, inode)
+        .ok_or_else(|| invalid_record(artifact, "invalid namespace identity"))?;
+    let generation = parse_nonzero_u64(field(lines[3], "generation", artifact)?)
+        .and_then(NativeXtablesGeneration::new)
+        .ok_or_else(|| invalid_record(artifact, "invalid generation"))?;
+    let identity_bytes =
+        decode_fixed_hex::<OWNERSHIP_JOURNAL_IDENTITY_BYTES>(field(lines[4], "journal", artifact)?)
+            .ok_or_else(|| invalid_record(artifact, "invalid journal identity"))?;
+    let journal_identity = OwnershipJournalIdentity::new(identity_bytes)
+        .map_err(|_| invalid_record(artifact, "zero journal identity"))?;
+    Ok(NativeXtablesJournalBinding::new(
+        boot_identity,
+        network_namespace,
+        generation,
+        journal_identity,
+    ))
+}
+
+fn parse_scope(
+    lines: &[&str],
+    artifact: DurableArtifact,
+) -> Result<NativeXtablesLeaseScope, NativeXtablesDurableError> {
+    if lines.len() != 4 {
+        return Err(invalid_record(artifact, "wrong scope field count"));
+    }
+    let boot_text = field(lines[0], "boot", artifact)?;
+    let boot_identity = BootIdentity::parse(boot_text)
+        .map_err(|_| invalid_record(artifact, "invalid boot identity"))?;
+    let device = parse_canonical_u64(field(lines[1], "netns_device", artifact)?)
+        .ok_or_else(|| invalid_record(artifact, "invalid namespace device"))?;
+    let inode = parse_nonzero_u64(field(lines[2], "netns_inode", artifact)?)
+        .ok_or_else(|| invalid_record(artifact, "invalid namespace inode"))?;
+    let network_namespace = NetworkNamespaceIdentity::new(device, inode)
+        .ok_or_else(|| invalid_record(artifact, "invalid namespace identity"))?;
+    let identity_bytes =
+        decode_fixed_hex::<OWNERSHIP_JOURNAL_IDENTITY_BYTES>(field(lines[3], "owner", artifact)?)
+            .ok_or_else(|| invalid_record(artifact, "invalid owner identity"))?;
+    let journal_identity = OwnershipJournalIdentity::new(identity_bytes)
+        .map_err(|_| invalid_record(artifact, "zero owner identity"))?;
+    Ok(NativeXtablesLeaseScope {
+        boot_identity,
+        network_namespace,
+        journal_identity,
+    })
+}
+
+fn canonical_lines(
+    encoded: &[u8],
+    artifact: DurableArtifact,
+    expected: usize,
+) -> Result<Vec<&str>, NativeXtablesDurableError> {
+    let text = std::str::from_utf8(encoded)
+        .map_err(|_| invalid_record(artifact, "record is not UTF-8"))?;
+    if !text.ends_with('\n') || text.contains('\r') {
+        return Err(invalid_record(
+            artifact,
+            "record is truncated or has noncanonical lines",
+        ));
+    }
+    let lines = text[..text.len() - 1].split('\n').collect::<Vec<_>>();
+    if lines.len() != expected || lines.iter().any(|line| line.is_empty()) {
+        return Err(invalid_record(artifact, "wrong line count"));
+    }
+    Ok(lines)
+}
+
+fn validate_checksum(
+    encoded: &[u8],
+    lines: &[&str],
+    artifact: DurableArtifact,
+) -> Result<(), NativeXtablesDurableError> {
+    let checksum_line = lines
+        .last()
+        .ok_or_else(|| invalid_record(artifact, "missing checksum"))?;
+    let expected = decode_fixed_hex::<CHECKSUM_BYTES>(field(checksum_line, "sha256", artifact)?)
+        .ok_or_else(|| invalid_record(artifact, "invalid checksum encoding"))?;
+    let prefix_len = encoded
+        .len()
+        .checked_sub(checksum_line.len() + 1)
+        .ok_or_else(|| invalid_record(artifact, "invalid checksum boundary"))?;
+    let actual: [u8; CHECKSUM_BYTES] = Sha256::digest(&encoded[..prefix_len]).into();
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(invalid_record(artifact, "checksum mismatch"))
+    }
+}
+
+fn field<'a>(
+    line: &'a str,
+    name: &str,
+    artifact: DurableArtifact,
+) -> Result<&'a str, NativeXtablesDurableError> {
+    line.strip_prefix(name)
+        .and_then(|value| value.strip_prefix('='))
+        .ok_or_else(|| invalid_record(artifact, "unexpected field"))
+}
+
+fn parse_nonzero_u64(value: &str) -> Option<u64> {
+    parse_canonical_u64(value).filter(|value| *value != 0)
+}
+
+fn parse_canonical_u64(value: &str) -> Option<u64> {
+    if value.is_empty()
+        || (value.len() > 1 && value.starts_with('0'))
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    value.parse().ok()
+}
+
+fn parse_canonical_usize(value: &str) -> Option<usize> {
+    parse_canonical_u64(value).and_then(|value| usize::try_from(value).ok())
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
+fn decode_hex(value: &str) -> Option<Box<[u8]>> {
+    if !value.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut decoded = Vec::with_capacity(value.len() / 2);
+    for pair in value.as_bytes().chunks_exact(2) {
+        decoded.push((decode_nibble(pair[0])? << 4) | decode_nibble(pair[1])?);
+    }
+    Some(decoded.into_boxed_slice())
+}
+
+fn decode_fixed_hex<const N: usize>(value: &str) -> Option<[u8; N]> {
+    if value.len() != N * 2 {
+        return None;
+    }
+    let mut decoded = [0_u8; N];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        decoded[index] = (decode_nibble(pair[0])? << 4) | decode_nibble(pair[1])?;
+    }
+    Some(decoded)
+}
+
+const fn decode_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
+}
+
+fn ensure_record_bound(
+    encoded: &[u8],
+    artifact: DurableArtifact,
+) -> Result<(), NativeXtablesDurableError> {
+    if encoded.len() > MAX_NATIVE_XTABLES_DURABLE_RECORD_BYTES {
+        Err(NativeXtablesDurableError::RecordTooLarge {
+            artifact,
+            actual: encoded.len(),
+            limit: MAX_NATIVE_XTABLES_DURABLE_RECORD_BYTES,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn invalid_record(artifact: DurableArtifact, reason: &'static str) -> NativeXtablesDurableError {
+    NativeXtablesDurableError::InvalidRecord { artifact, reason }
+}
+
+fn open_existing_root(path: &Path) -> Result<File, NativeXtablesDurableError> {
+    open_root(path, false)?.ok_or_else(|| {
+        NativeXtablesDurableError::io(
+            "open native xtables durable root",
+            io::Error::from_raw_os_error(libc::ENOENT),
+        )
+    })
+}
+
+fn open_root(path: &Path, create: bool) -> Result<Option<File>, NativeXtablesDurableError> {
+    if path.as_os_str().is_empty() {
+        return Err(NativeXtablesDurableError::UnsafePath(path.to_owned()));
+    }
+    let mut directory = File::open(if path.is_absolute() { "/" } else { "." })
+        .map_err(|source| NativeXtablesDurableError::io("open durable path anchor", source))?;
+    let mut traversed = if path.is_absolute() {
+        PathBuf::from("/")
+    } else {
+        PathBuf::from(".")
+    };
+    for component in path.components() {
+        let Component::Normal(name) = component else {
+            match component {
+                Component::RootDir | Component::CurDir => continue,
+                Component::ParentDir | Component::Prefix(_) => {
+                    return Err(NativeXtablesDurableError::UnsafePath(path.to_owned()));
+                }
+                Component::Normal(_) => unreachable!(),
+            }
+        };
+        traversed.push(name);
+        let name = c_string(name, &traversed)?;
+        let descriptor = match open_at(
+            directory.as_raw_fd(),
+            &name,
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+            None,
+        ) {
+            Ok(descriptor) => descriptor,
+            Err(source) if source.raw_os_error() == Some(libc::ENOENT) && !create => {
+                return Ok(None);
+            }
+            Err(source) if source.raw_os_error() == Some(libc::ENOENT) => {
+                make_directory_at(directory.as_raw_fd(), &name, 0o700)?;
+                directory.sync_all().map_err(|source| {
+                    NativeXtablesDurableError::io("sync durable parent directory", source)
+                })?;
+                open_at(
+                    directory.as_raw_fd(),
+                    &name,
+                    libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+                    None,
+                )
+                .map_err(|source| classify_path_error(&directory, &name, &traversed, source))?
+            }
+            Err(source) => {
+                return Err(classify_path_error(&directory, &name, &traversed, source));
+            }
+        };
+        // SAFETY: `openat` returned a new owned descriptor.
+        directory = unsafe { File::from_raw_fd(descriptor) };
+    }
+    Ok(Some(directory))
+}
+
+fn classify_path_error(
+    directory: &File,
+    name: &CString,
+    path: &Path,
+    source: io::Error,
+) -> NativeXtablesDurableError {
+    if matches!(
+        source.raw_os_error(),
+        Some(code) if code == libc::ELOOP || code == libc::ENOTDIR
+    ) {
+        match entry_kind(directory.as_raw_fd(), name) {
+            Ok(Some(EntryKind::Symlink)) => {
+                return NativeXtablesDurableError::Symlink(path.to_owned());
+            }
+            Ok(Some(_)) => {
+                return NativeXtablesDurableError::UnexpectedFileType(path.to_owned());
+            }
+            Ok(None) | Err(_) => {}
+        }
+    }
+    NativeXtablesDurableError::io("open native xtables durable path", source)
+}
+
+fn read_journal(
+    root: &File,
+) -> Result<Option<NativeXtablesJournalRecord>, NativeXtablesDurableError> {
+    read_record(
+        root,
+        NATIVE_XTABLES_JOURNAL_FILE_NAME,
+        DurableArtifact::Journal,
+    )?
+    .map(|encoded| parse_journal(&encoded))
+    .transpose()
+}
+
+fn read_lease(root: &File) -> Result<Option<NativeXtablesLeaseScope>, NativeXtablesDurableError> {
+    read_record(root, NATIVE_XTABLES_LEASE_FILE_NAME, DurableArtifact::Lease)?
+        .map(|encoded| parse_lease(&encoded))
+        .transpose()
+}
+
+fn read_record(
+    root: &File,
+    name: &str,
+    artifact: DurableArtifact,
+) -> Result<Option<Vec<u8>>, NativeXtablesDurableError> {
+    let name = static_c_string(name);
+    let path = durable_child_path(root, name.as_c_str());
+    match entry_kind(root.as_raw_fd(), &name).map_err(|source| {
+        NativeXtablesDurableError::io("inspect native xtables durable record", source)
+    })? {
+        None => return Ok(None),
+        Some(EntryKind::Symlink) => return Err(NativeXtablesDurableError::Symlink(path)),
+        Some(EntryKind::Regular) => {}
+        Some(EntryKind::Directory | EntryKind::Other) => {
+            return Err(NativeXtablesDurableError::UnexpectedFileType(path));
+        }
+    }
+    let descriptor = open_at(
+        root.as_raw_fd(),
+        &name,
+        libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOFOLLOW,
+        None,
+    )
+    .map_err(|source| {
+        NativeXtablesDurableError::io("open native xtables durable record", source)
+    })?;
+    // SAFETY: `openat` returned a new owned descriptor.
+    let file = unsafe { File::from_raw_fd(descriptor) };
+    require_regular_file(&file, &path)?;
+    let metadata = file.metadata().map_err(|source| {
+        NativeXtablesDurableError::io("inspect native xtables durable record", source)
+    })?;
+    let actual = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
+    if actual > MAX_NATIVE_XTABLES_DURABLE_RECORD_BYTES {
+        return Err(NativeXtablesDurableError::RecordTooLarge {
+            artifact,
+            actual,
+            limit: MAX_NATIVE_XTABLES_DURABLE_RECORD_BYTES,
+        });
+    }
+    let mut encoded = Vec::with_capacity(actual.min(512));
+    file.take((MAX_NATIVE_XTABLES_DURABLE_RECORD_BYTES + 1) as u64)
+        .read_to_end(&mut encoded)
+        .map_err(|source| {
+            NativeXtablesDurableError::io("read native xtables durable record", source)
+        })?;
+    ensure_record_bound(&encoded, artifact)?;
+    Ok(Some(encoded))
+}
+
+fn atomic_write(
+    root: &File,
+    target_name: &str,
+    encoded: &[u8],
+    temp_event: DurableEvent,
+    published_event: DurableEvent,
+    store: &NativeXtablesDurableStore,
+) -> Result<(), NativeXtablesDurableError> {
+    ensure_record_bound(
+        encoded,
+        if target_name == NATIVE_XTABLES_LEASE_FILE_NAME {
+            DurableArtifact::Lease
+        } else {
+            DurableArtifact::Journal
+        },
+    )?;
+    let target = static_c_string(target_name);
+    reject_nonregular_target(root, &target)?;
+    let (temporary, mut file) = create_temporary(root, target_name)?;
+    let result = (|| {
+        file.write_all(encoded).map_err(|source| {
+            NativeXtablesDurableError::io("write native xtables durable record", source)
+        })?;
+        file.flush().map_err(|source| {
+            NativeXtablesDurableError::io("flush native xtables durable record", source)
+        })?;
+        file.sync_all().map_err(|source| {
+            NativeXtablesDurableError::io("sync native xtables durable record", source)
+        })?;
+        checkpoint(store, temp_event)?;
+        reject_nonregular_target(root, &target)?;
+        rename_at(root.as_raw_fd(), &temporary, &target)?;
+        root.sync_all().map_err(|source| {
+            NativeXtablesDurableError::io("sync native xtables durable directory", source)
+        })?;
+        checkpoint(store, published_event)
+    })();
+    if result.is_err() && !matches!(result, Err(NativeXtablesDurableError::InterruptedAt(_))) {
+        let _ = unlink_at(root.as_raw_fd(), &temporary, 0);
+    }
+    result
+}
+
+fn create_temporary(
+    root: &File,
+    target_name: &str,
+) -> Result<(CString, File), NativeXtablesDurableError> {
+    for _ in 0..MAX_TEMP_CREATE_ATTEMPTS {
+        let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let name = CString::new(format!(".{target_name}.{}.{}.tmp", std::process::id(), id))
+            .expect("generated durable temporary name contains no NUL");
+        match open_at(
+            root.as_raw_fd(),
+            &name,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            Some(0o600),
+        ) {
+            Ok(descriptor) => {
+                // SAFETY: `openat` returned a new owned descriptor.
+                let file = unsafe { File::from_raw_fd(descriptor) };
+                return Ok((name, file));
+            }
+            Err(source) if source.raw_os_error() == Some(libc::EEXIST) => continue,
+            Err(source) => {
+                return Err(NativeXtablesDurableError::io(
+                    "create native xtables durable temporary",
+                    source,
+                ));
+            }
+        }
+    }
+    Err(NativeXtablesDurableError::io(
+        "create native xtables durable temporary",
+        io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "temporary-name budget exhausted",
+        ),
+    ))
+}
+
+fn reject_nonregular_target(root: &File, name: &CString) -> Result<(), NativeXtablesDurableError> {
+    let path = durable_child_path(root, name.as_c_str());
+    match entry_kind(root.as_raw_fd(), name).map_err(|source| {
+        NativeXtablesDurableError::io("inspect native xtables durable target", source)
+    })? {
+        None | Some(EntryKind::Regular) => Ok(()),
+        Some(EntryKind::Symlink) => Err(NativeXtablesDurableError::Symlink(path)),
+        Some(EntryKind::Directory | EntryKind::Other) => {
+            Err(NativeXtablesDurableError::UnexpectedFileType(path))
+        }
+    }
+}
+
+#[derive(Debug)]
+struct NativeOwnerGuard {
+    _file: File,
+}
+
+#[derive(Debug)]
+struct NativeWriterLock {
+    directory: File,
+    scope: NativeXtablesLeaseScope,
+}
+
+fn acquire_native_owner_guard(root: &File) -> Result<NativeOwnerGuard, NativeXtablesDurableError> {
+    let name = static_c_string(NATIVE_XTABLES_OWNER_GUARD_FILE_NAME);
+    let path = durable_child_path(root, name.as_c_str());
+    let (descriptor, created) = loop {
+        match entry_kind(root.as_raw_fd(), &name).map_err(|source| {
+            NativeXtablesDurableError::io("inspect native xtables owner guard", source)
+        })? {
+            Some(EntryKind::Symlink) => return Err(NativeXtablesDurableError::Symlink(path)),
+            Some(EntryKind::Directory | EntryKind::Other) => {
+                return Err(NativeXtablesDurableError::UnexpectedFileType(path));
+            }
+            Some(EntryKind::Regular) => {
+                let descriptor = open_at(
+                    root.as_raw_fd(),
+                    &name,
+                    libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                    None,
+                )
+                .map_err(|source| {
+                    NativeXtablesDurableError::io("open native xtables owner guard", source)
+                })?;
+                break (descriptor, false);
+            }
+            None => match open_at(
+                root.as_raw_fd(),
+                &name,
+                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                Some(0o600),
+            ) {
+                Ok(descriptor) => break (descriptor, true),
+                Err(source) if source.raw_os_error() == Some(libc::EEXIST) => continue,
+                Err(source) => {
+                    return Err(NativeXtablesDurableError::io(
+                        "create native xtables owner guard",
+                        source,
+                    ));
+                }
+            },
+        }
+    };
+    // SAFETY: `openat` returned a new owned descriptor.
+    let file = unsafe { File::from_raw_fd(descriptor) };
+    require_regular_file(&file, &path)?;
+    let deadline = Instant::now() + NATIVE_OWNER_GUARD_ACQUIRE_TIMEOUT;
+    loop {
+        match try_lock_exclusive(&file) {
+            Ok(()) => break,
+            Err(NativeXtablesDurableError::NativeOwnerBusy) if Instant::now() < deadline => {
+                // `flock` follows an open file description across `fork`. An unrelated child
+                // spawned by another thread can therefore retain a just-released guard for the
+                // short pre-exec window even though the descriptor is CLOEXEC. Bounded retry
+                // absorbs only that transient; a live owner still returns Busy at the deadline.
+                std::thread::sleep(NATIVE_OWNER_GUARD_RETRY_INTERVAL);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    if created {
+        file.sync_all().map_err(|source| {
+            NativeXtablesDurableError::io("sync native xtables owner guard", source)
+        })?;
+        root.sync_all().map_err(|source| {
+            NativeXtablesDurableError::io("sync native xtables owner-guard directory", source)
+        })?;
+    }
+    Ok(NativeOwnerGuard { _file: file })
+}
+
+fn try_lock_exclusive(file: &File) -> Result<(), NativeXtablesDurableError> {
+    // SAFETY: `file` owns a valid descriptor for the duration of this call.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(());
+    }
+    let source = io::Error::last_os_error();
+    if matches!(source.raw_os_error(), Some(code) if code == libc::EAGAIN || code == libc::EWOULDBLOCK)
+    {
+        Err(NativeXtablesDurableError::NativeOwnerBusy)
+    } else {
+        Err(NativeXtablesDurableError::io(
+            "lock native xtables owner guard",
+            source,
+        ))
+    }
+}
+
+fn create_writer_lock(
+    root: &File,
+    scope: &NativeXtablesLeaseScope,
+    store: &NativeXtablesDurableStore,
+) -> Result<NativeWriterLock, NativeXtablesDurableError> {
+    let name = static_c_string(XTABLES_WRITER_LOCK_DIRECTORY_NAME);
+    match make_directory_at(root.as_raw_fd(), &name, 0o700) {
+        Ok(()) => {}
+        Err(NativeXtablesDurableError::Io { source, .. })
+            if source.raw_os_error() == Some(libc::EEXIST) =>
+        {
+            return match entry_kind(root.as_raw_fd(), &name).map_err(|source| {
+                NativeXtablesDurableError::io("inspect native xtables writer lock", source)
+            })? {
+                Some(EntryKind::Directory) => {
+                    Err(NativeXtablesDurableError::InterruptedPublication)
+                }
+                Some(EntryKind::Symlink) => Err(NativeXtablesDurableError::Symlink(
+                    durable_child_path(root, name.as_c_str()),
+                )),
+                Some(EntryKind::Regular | EntryKind::Other) | None => {
+                    Err(NativeXtablesDurableError::UnexpectedFileType(
+                        durable_child_path(root, name.as_c_str()),
+                    ))
+                }
+            };
+        }
+        Err(error) => return Err(error),
+    }
+    root.sync_all().map_err(|source| {
+        NativeXtablesDurableError::io("sync native xtables writer-lock parent", source)
+    })?;
+    let directory = open_writer_lock_directory(root)?;
+    let owner_name = static_c_string(NATIVE_XTABLES_WRITER_OWNER_FILE_NAME);
+    let descriptor = open_at(
+        directory.as_raw_fd(),
+        &owner_name,
+        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        Some(0o600),
+    )
+    .map_err(|source| {
+        NativeXtablesDurableError::io("create native xtables writer owner", source)
+    })?;
+    // SAFETY: `openat` returned a new owned descriptor.
+    let mut owner_file = unsafe { File::from_raw_fd(descriptor) };
+    owner_file
+        .write_all(&encode_writer_owner(scope))
+        .map_err(|source| {
+            NativeXtablesDurableError::io("write native xtables writer owner", source)
+        })?;
+    owner_file.sync_all().map_err(|source| {
+        NativeXtablesDurableError::io("sync native xtables writer owner", source)
+    })?;
+    directory.sync_all().map_err(|source| {
+        NativeXtablesDurableError::io("sync native xtables writer-lock directory", source)
+    })?;
+    checkpoint(store, DurableEvent::WriterLockDurable)?;
+    Ok(NativeWriterLock {
+        directory,
+        scope: scope.clone(),
+    })
+}
+
+fn recover_or_create_writer_lock(
+    root: &File,
+    expected: &NativeXtablesLeaseScope,
+    store: &NativeXtablesDurableStore,
+) -> Result<(NativeWriterLock, bool), NativeXtablesDurableError> {
+    if !writer_lock_exists(root)? {
+        return create_writer_lock(root, expected, store).map(|lock| (lock, false));
+    }
+    let directory = open_writer_lock_directory(root)?;
+    let native_owner = read_record(
+        &directory,
+        NATIVE_XTABLES_WRITER_OWNER_FILE_NAME,
+        DurableArtifact::WriterOwner,
+    )?;
+    let shell_owner = read_record(
+        &directory,
+        SHELL_XTABLES_WRITER_OWNER_FILE_NAME,
+        DurableArtifact::ShellWriterOwner,
+    )?;
+    match (native_owner, shell_owner) {
+        (Some(encoded), None) => {
+            let scope = parse_writer_owner(&encoded)?;
+            if scope.boot_identity == expected.boot_identity {
+                require_lease_scope(expected, &scope)?;
+            }
+            Ok((NativeWriterLock { directory, scope }, true))
+        }
+        (None, Some(encoded)) => {
+            let owner = parse_shell_writer_owner(&encoded)?;
+            if shell_writer_is_live(&owner, expected.boot_identity())? {
+                return Err(NativeXtablesDurableError::ShellWriterBusy);
+            }
+            remove_shell_writer_lock(root, directory, &owner, store)?;
+            create_writer_lock(root, expected, store).map(|lock| (lock, false))
+        }
+        (None, None) | (Some(_), Some(_)) => Err(NativeXtablesDurableError::InterruptedPublication),
+    }
+}
+
+fn shell_writer_is_live(
+    owner: &ShellWriterOwner,
+    current_boot: &BootIdentity,
+) -> Result<bool, NativeXtablesDurableError> {
+    if &owner.boot_identity != current_boot {
+        return Ok(false);
+    }
+    if shell_writer_participant_is_live(&owner.parent)? {
+        return Ok(true);
+    }
+    owner
+        .child
+        .as_ref()
+        .map_or(Ok(false), shell_writer_participant_is_live)
+}
+
+fn shell_writer_participant_is_live(
+    participant: &ShellWriterParticipant,
+) -> Result<bool, NativeXtablesDurableError> {
+    Ok(read_process_start_ticks(participant.pid)? == Some(participant.start_ticks))
+}
+
+fn read_process_start_ticks(pid: u32) -> Result<Option<u64>, NativeXtablesDurableError> {
+    let path = PathBuf::from(format!("/proc/{pid}/stat"));
+    let stat = match std::fs::read_to_string(&path) {
+        Ok(stat) => stat,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(NativeXtablesDurableError::io(
+                "inspect shell xtables writer process identity",
+                source,
+            ));
+        }
+    };
+    let (_, tail) = stat.rsplit_once(") ").ok_or_else(|| {
+        NativeXtablesDurableError::io(
+            "parse shell xtables writer process identity",
+            io::Error::new(io::ErrorKind::InvalidData, "malformed /proc process stat"),
+        )
+    })?;
+    let start_ticks = tail
+        .split_whitespace()
+        .nth(19)
+        .and_then(parse_nonzero_u64)
+        .ok_or_else(|| {
+            NativeXtablesDurableError::io(
+                "parse shell xtables writer process identity",
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid /proc process start ticks",
+                ),
+            )
+        })?;
+    Ok(Some(start_ticks))
+}
+
+fn open_writer_lock_directory(root: &File) -> Result<File, NativeXtablesDurableError> {
+    let name = static_c_string(XTABLES_WRITER_LOCK_DIRECTORY_NAME);
+    let path = durable_child_path(root, name.as_c_str());
+    let descriptor = open_at(
+        root.as_raw_fd(),
+        &name,
+        libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+        None,
+    )
+    .map_err(|source| classify_path_error(root, &name, &path, source))?;
+    // SAFETY: `openat` returned a new owned descriptor.
+    Ok(unsafe { File::from_raw_fd(descriptor) })
+}
+
+fn remove_writer_lock(
+    root: &File,
+    writer_lock: NativeWriterLock,
+    store: &NativeXtablesDurableStore,
+) -> Result<(), NativeXtablesDurableError> {
+    let name = static_c_string(XTABLES_WRITER_LOCK_DIRECTORY_NAME);
+    match entry_kind(root.as_raw_fd(), &name).map_err(|source| {
+        NativeXtablesDurableError::io("inspect native xtables writer lock", source)
+    })? {
+        Some(EntryKind::Directory) => {}
+        Some(EntryKind::Symlink) => {
+            return Err(NativeXtablesDurableError::Symlink(durable_child_path(
+                root,
+                name.as_c_str(),
+            )));
+        }
+        Some(EntryKind::Regular | EntryKind::Other) => {
+            return Err(NativeXtablesDurableError::UnexpectedFileType(
+                durable_child_path(root, name.as_c_str()),
+            ));
+        }
+        None => return Err(NativeXtablesDurableError::InterruptedPublication),
+    }
+    let encoded = read_record(
+        &writer_lock.directory,
+        NATIVE_XTABLES_WRITER_OWNER_FILE_NAME,
+        DurableArtifact::WriterOwner,
+    )?
+    .ok_or(NativeXtablesDurableError::InterruptedPublication)?;
+    let actual_scope = parse_writer_owner(&encoded)?;
+    require_lease_scope(&writer_lock.scope, &actual_scope)?;
+    require_same_entry(root, &name, &writer_lock.directory)?;
+
+    let tombstone = unique_writer_lock_tombstone(root)?;
+    rename_at(root.as_raw_fd(), &name, &tombstone)?;
+    root.sync_all().map_err(|source| {
+        NativeXtablesDurableError::io("sync native xtables writer-lock removal", source)
+    })?;
+    let owner_name = static_c_string(NATIVE_XTABLES_WRITER_OWNER_FILE_NAME);
+    unlink_at(writer_lock.directory.as_raw_fd(), &owner_name, 0).map_err(|source| {
+        NativeXtablesDurableError::io("remove native xtables writer owner", source)
+    })?;
+    writer_lock.directory.sync_all().map_err(|source| {
+        NativeXtablesDurableError::io("sync native xtables writer-owner removal", source)
+    })?;
+    unlink_at(root.as_raw_fd(), &tombstone, libc::AT_REMOVEDIR).map_err(|source| {
+        NativeXtablesDurableError::io("remove native xtables writer-lock tombstone", source)
+    })?;
+    root.sync_all().map_err(|source| {
+        NativeXtablesDurableError::io("sync native xtables writer-lock tombstone removal", source)
+    })?;
+    checkpoint(store, DurableEvent::WriterLockReleased)
+}
+
+fn remove_shell_writer_lock(
+    root: &File,
+    directory: File,
+    expected: &ShellWriterOwner,
+    store: &NativeXtablesDurableStore,
+) -> Result<(), NativeXtablesDurableError> {
+    if read_record(
+        &directory,
+        NATIVE_XTABLES_WRITER_OWNER_FILE_NAME,
+        DurableArtifact::WriterOwner,
+    )?
+    .is_some()
+    {
+        return Err(NativeXtablesDurableError::InterruptedPublication);
+    }
+    let encoded = read_record(
+        &directory,
+        SHELL_XTABLES_WRITER_OWNER_FILE_NAME,
+        DurableArtifact::ShellWriterOwner,
+    )?
+    .ok_or(NativeXtablesDurableError::InterruptedPublication)?;
+    if &parse_shell_writer_owner(&encoded)? != expected {
+        return Err(NativeXtablesDurableError::InterruptedPublication);
+    }
+    require_exact_shell_writer_directory(&directory)?;
+    let lock_name = static_c_string(XTABLES_WRITER_LOCK_DIRECTORY_NAME);
+    require_same_entry(root, &lock_name, &directory)?;
+
+    let tombstone = unique_writer_lock_tombstone(root)?;
+    rename_at(root.as_raw_fd(), &lock_name, &tombstone)?;
+    root.sync_all().map_err(|source| {
+        NativeXtablesDurableError::io("sync stale shell writer-lock retirement", source)
+    })?;
+    let owner_name = static_c_string(SHELL_XTABLES_WRITER_OWNER_FILE_NAME);
+    unlink_at(directory.as_raw_fd(), &owner_name, 0).map_err(|source| {
+        NativeXtablesDurableError::io("remove stale shell writer owner", source)
+    })?;
+    directory.sync_all().map_err(|source| {
+        NativeXtablesDurableError::io("sync stale shell writer-owner removal", source)
+    })?;
+    unlink_at(root.as_raw_fd(), &tombstone, libc::AT_REMOVEDIR).map_err(|source| {
+        NativeXtablesDurableError::io("remove stale shell writer-lock tombstone", source)
+    })?;
+    root.sync_all().map_err(|source| {
+        NativeXtablesDurableError::io("sync stale shell writer-lock removal", source)
+    })?;
+    checkpoint(store, DurableEvent::WriterLockReleased)
+}
+
+fn require_exact_shell_writer_directory(directory: &File) -> Result<(), NativeXtablesDurableError> {
+    let path = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
+    let entries = std::fs::read_dir(path).map_err(|source| {
+        NativeXtablesDurableError::io("inspect shell xtables writer-lock directory", source)
+    })?;
+    let mut owner_seen = false;
+    for entry in entries {
+        let entry = entry.map_err(|source| {
+            NativeXtablesDurableError::io("inspect shell xtables writer-lock entry", source)
+        })?;
+        if entry.file_name().as_bytes() == SHELL_XTABLES_WRITER_OWNER_FILE_NAME.as_bytes()
+            && !owner_seen
+        {
+            owner_seen = true;
+        } else {
+            return Err(NativeXtablesDurableError::InterruptedPublication);
+        }
+    }
+    if owner_seen {
+        Ok(())
+    } else {
+        Err(NativeXtablesDurableError::InterruptedPublication)
+    }
+}
+
+fn unique_writer_lock_tombstone(root: &File) -> Result<CString, NativeXtablesDurableError> {
+    for _ in 0..MAX_TEMP_CREATE_ATTEMPTS {
+        let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let name = CString::new(format!(
+            ".{XTABLES_WRITER_LOCK_DIRECTORY_NAME}.{}.{}.released",
+            std::process::id(),
+            id
+        ))
+        .expect("generated writer-lock tombstone contains no NUL");
+        if entry_kind(root.as_raw_fd(), &name)
+            .map_err(|source| {
+                NativeXtablesDurableError::io("inspect writer-lock tombstone", source)
+            })?
+            .is_none()
+        {
+            return Ok(name);
+        }
+    }
+    Err(NativeXtablesDurableError::io(
+        "allocate native xtables writer-lock tombstone",
+        io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "writer-lock tombstone-name budget exhausted",
+        ),
+    ))
+}
+
+fn require_same_entry(
+    root: &File,
+    name: &CString,
+    opened: &File,
+) -> Result<(), NativeXtablesDurableError> {
+    let opened = opened.metadata().map_err(|source| {
+        NativeXtablesDurableError::io("inspect opened native xtables writer lock", source)
+    })?;
+    let mut stat = MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `name` is NUL-terminated, `root` is an open directory, and `stat` is writable.
+    if unsafe {
+        libc::fstatat(
+            root.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(NativeXtablesDurableError::io(
+            "revalidate native xtables writer lock",
+            io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: successful `fstatat` initialized `stat`.
+    let stat = unsafe { stat.assume_init() };
+    use std::os::unix::fs::MetadataExt;
+    if opened.dev() == stat.st_dev && opened.ino() == stat.st_ino {
+        Ok(())
+    } else {
+        Err(NativeXtablesDurableError::InterruptedPublication)
+    }
+}
+
+fn writer_lock_exists(root: &File) -> Result<bool, NativeXtablesDurableError> {
+    let name = static_c_string(XTABLES_WRITER_LOCK_DIRECTORY_NAME);
+    match entry_kind(root.as_raw_fd(), &name).map_err(|source| {
+        NativeXtablesDurableError::io("inspect native xtables writer lock", source)
+    })? {
+        None => Ok(false),
+        Some(EntryKind::Directory) => Ok(true),
+        Some(EntryKind::Symlink) => Err(NativeXtablesDurableError::Symlink(durable_child_path(
+            root,
+            name.as_c_str(),
+        ))),
+        Some(EntryKind::Regular | EntryKind::Other) => {
+            Err(NativeXtablesDurableError::UnexpectedFileType(
+                durable_child_path(root, name.as_c_str()),
+            ))
+        }
+    }
+}
+
+fn remove_lease(
+    root: &File,
+    expected: &NativeXtablesLeaseScope,
+    store: &NativeXtablesDurableStore,
+) -> Result<(), NativeXtablesDurableError> {
+    let lease = read_lease(root)?.ok_or(NativeXtablesDurableError::MissingLease)?;
+    require_lease_scope(expected, &lease)?;
+    let name = static_c_string(NATIVE_XTABLES_LEASE_FILE_NAME);
+    unlink_at(root.as_raw_fd(), &name, 0)
+        .map_err(|source| NativeXtablesDurableError::io("remove native xtables lease", source))?;
+    root.sync_all().map_err(|source| {
+        NativeXtablesDurableError::io("sync native xtables lease removal", source)
+    })?;
+    checkpoint(store, DurableEvent::LeaseRemovedDurable)
+}
+
+fn remove_journal(
+    root: &File,
+    expected: &NativeXtablesJournalRecord,
+    store: &NativeXtablesDurableStore,
+) -> Result<(), NativeXtablesDurableError> {
+    let journal = read_journal(root)?.ok_or(NativeXtablesDurableError::MissingJournal)?;
+    if &journal != expected {
+        return Err(NativeXtablesDurableError::BindingMismatch {
+            artifact: DurableArtifact::Journal,
+        });
+    }
+    let name = static_c_string(NATIVE_XTABLES_JOURNAL_FILE_NAME);
+    unlink_at(root.as_raw_fd(), &name, 0)
+        .map_err(|source| NativeXtablesDurableError::io("remove native xtables journal", source))?;
+    root.sync_all().map_err(|source| {
+        NativeXtablesDurableError::io("sync native xtables journal removal", source)
+    })?;
+    checkpoint(store, DurableEvent::JournalRemovedDurable)
+}
+
+fn require_regular_file(file: &File, path: &Path) -> Result<(), NativeXtablesDurableError> {
+    let metadata = file.metadata().map_err(|source| {
+        NativeXtablesDurableError::io("inspect native xtables durable record", source)
+    })?;
+    if metadata.is_file() {
+        Ok(())
+    } else {
+        Err(NativeXtablesDurableError::UnexpectedFileType(
+            path.to_owned(),
+        ))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EntryKind {
+    Regular,
+    Directory,
+    Symlink,
+    Other,
+}
+
+fn entry_kind(directory: RawFd, name: &CString) -> io::Result<Option<EntryKind>> {
+    let mut stat = MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `name` is NUL-terminated, `directory` is an open directory descriptor, and `stat`
+    // points to enough writable storage for `fstatat`.
+    let result = unsafe {
+        libc::fstatat(
+            directory,
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result == 0 {
+        // SAFETY: successful `fstatat` initialized the complete structure.
+        let stat = unsafe { stat.assume_init() };
+        let kind = match stat.st_mode & libc::S_IFMT {
+            libc::S_IFREG => EntryKind::Regular,
+            libc::S_IFDIR => EntryKind::Directory,
+            libc::S_IFLNK => EntryKind::Symlink,
+            _ => EntryKind::Other,
+        };
+        Ok(Some(kind))
+    } else {
+        let source = io::Error::last_os_error();
+        if source.raw_os_error() == Some(libc::ENOENT) {
+            Ok(None)
+        } else {
+            Err(source)
+        }
+    }
+}
+
+fn open_at(
+    directory: RawFd,
+    name: &CString,
+    flags: libc::c_int,
+    mode: Option<libc::mode_t>,
+) -> io::Result<RawFd> {
+    // SAFETY: `name` is NUL-terminated, `directory` is open, and `mode` is supplied exactly for
+    // calls that include `O_CREAT`.
+    let descriptor = unsafe {
+        match mode {
+            Some(mode) => libc::openat(directory, name.as_ptr(), flags, mode),
+            None => libc::openat(directory, name.as_ptr(), flags),
+        }
+    };
+    if descriptor >= 0 {
+        Ok(descriptor)
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn make_directory_at(
+    directory: RawFd,
+    name: &CString,
+    mode: libc::mode_t,
+) -> Result<(), NativeXtablesDurableError> {
+    // SAFETY: `name` is NUL-terminated and `directory` is an open directory descriptor.
+    if unsafe { libc::mkdirat(directory, name.as_ptr(), mode) } == 0 {
+        Ok(())
+    } else {
+        Err(NativeXtablesDurableError::io(
+            "create native xtables durable directory",
+            io::Error::last_os_error(),
+        ))
+    }
+}
+
+fn rename_at(
+    directory: RawFd,
+    source: &CString,
+    target: &CString,
+) -> Result<(), NativeXtablesDurableError> {
+    // SAFETY: both names are NUL-terminated and relative to the same open directory descriptor.
+    if unsafe { libc::renameat(directory, source.as_ptr(), directory, target.as_ptr()) } == 0 {
+        Ok(())
+    } else {
+        Err(NativeXtablesDurableError::io(
+            "publish native xtables durable record",
+            io::Error::last_os_error(),
+        ))
+    }
+}
+
+fn unlink_at(directory: RawFd, name: &CString, flags: libc::c_int) -> io::Result<()> {
+    // SAFETY: `name` is NUL-terminated and `directory` is an open directory descriptor.
+    if unsafe { libc::unlinkat(directory, name.as_ptr(), flags) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn c_string(name: &OsStr, path: &Path) -> Result<CString, NativeXtablesDurableError> {
+    CString::new(name.as_bytes())
+        .map_err(|_| NativeXtablesDurableError::UnsafePath(path.to_owned()))
+}
+
+fn static_c_string(name: &str) -> CString {
+    CString::new(name).expect("static durable entry name contains no NUL")
+}
+
+fn durable_child_path(_root: &File, name: &std::ffi::CStr) -> PathBuf {
+    PathBuf::from(String::from_utf8_lossy(name.to_bytes()).into_owned())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DurableEvent {
+    WriterLockDurable,
+    JournalTempDurable,
+    JournalDurable,
+    JournalBeforeLease,
+    LeaseTempDurable,
+    LeaseDurable,
+    TerminalJournalDurable,
+    LeaseRemovedDurable,
+    JournalRemovedDurable,
+    WriterLockReleased,
+}
+
+#[cfg(test)]
+fn checkpoint(
+    store: &NativeXtablesDurableStore,
+    event: DurableEvent,
+) -> Result<(), NativeXtablesDurableError> {
+    store.test_control.checkpoint(event)
+}
+
+#[cfg(not(test))]
+fn checkpoint(
+    store: &NativeXtablesDurableStore,
+    event: DurableEvent,
+) -> Result<(), NativeXtablesDurableError> {
+    let _ = (store, event);
+    Ok(())
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Default)]
+struct TestControl {
+    inner: std::sync::Arc<TestControlInner>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct TestControlInner {
+    state: std::sync::Mutex<TestState>,
+    changed: std::sync::Condvar,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct TestState {
+    failpoint: Option<DurableEvent>,
+    pausepoint: Option<DurableEvent>,
+    paused: Option<DurableEvent>,
+    pause_released: bool,
+    events: Vec<DurableEvent>,
+}
+
+#[cfg(test)]
+impl TestControl {
+    fn checkpoint(&self, event: DurableEvent) -> Result<(), NativeXtablesDurableError> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("test durability control poisoned");
+        state.events.push(event);
+        if state.pausepoint == Some(event) {
+            state.paused = Some(event);
+            self.inner.changed.notify_all();
+            while !state.pause_released {
+                state = self
+                    .inner
+                    .changed
+                    .wait(state)
+                    .expect("test durability control poisoned while paused");
+            }
+            state.pausepoint = None;
+            state.paused = None;
+            state.pause_released = false;
+        }
+        if state.failpoint == Some(event) {
+            state.failpoint = None;
+            Err(NativeXtablesDurableError::InterruptedAt(event))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn set_failpoint(&self, event: Option<DurableEvent>) {
+        self.inner
+            .state
+            .lock()
+            .expect("test durability control poisoned")
+            .failpoint = event;
+    }
+
+    fn pause_at(&self, event: DurableEvent) {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("test durability control poisoned");
+        state.pausepoint = Some(event);
+        state.paused = None;
+        state.pause_released = false;
+    }
+
+    fn wait_until_paused(&self, event: DurableEvent) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("test durability control poisoned");
+        while state.paused != Some(event) {
+            let remaining = deadline
+                .checked_duration_since(std::time::Instant::now())
+                .expect("timed out waiting for durability pausepoint");
+            let (next, timeout) = self
+                .inner
+                .changed
+                .wait_timeout(state, remaining)
+                .expect("test durability control poisoned while waiting");
+            state = next;
+            assert!(
+                !timeout.timed_out() || state.paused == Some(event),
+                "timed out waiting for durability pausepoint {event:?}"
+            );
+        }
+    }
+
+    fn release_pause(&self) {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("test durability control poisoned");
+        state.pause_released = true;
+        self.inner.changed.notify_all();
+    }
+
+    fn take_events(&self) -> Vec<DurableEvent> {
+        std::mem::take(
+            &mut self
+                .inner
+                .state
+                .lock()
+                .expect("test durability control poisoned")
+                .events,
+        )
+    }
+}
+
+#[cfg(test)]
+#[path = "owner_durable_tests.rs"]
+mod tests;

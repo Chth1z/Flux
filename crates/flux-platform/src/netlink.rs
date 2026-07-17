@@ -16,6 +16,14 @@ pub(crate) const NLA_TYPE_MASK: u16 = !(NLA_F_NESTED | NLA_F_NET_BYTEORDER);
 #[allow(dead_code)]
 pub(crate) mod link;
 
+// Exact policy-routing mutation and readback stay private behind the native owner.
+#[allow(dead_code)]
+pub(crate) mod policy_routing;
+
+// The groups-zero mutation socket remains private to the native owner.
+#[allow(dead_code)]
+pub(crate) mod policy_routing_session;
+
 // Raw route framing stays private behind the combined inventory observer.
 #[allow(dead_code)]
 pub(crate) mod route;

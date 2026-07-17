@@ -51,46 +51,79 @@ _forward_to_fluxd_control() {
 # [ Component Control ]
 # ==============================================================================
 
-_parallel_run() {
+_parallel_run_locked() {
     local action="${1}"
     local p_core p_tproxy p_addrsync rc
 
     if [ "${action}" = "start" ]; then
         sh "${CORE_SCRIPT}" start </dev/null &
         p_core=$!
-        sh "${ADDRSYNC_SCRIPT}" start </dev/null &
+        FLUX_XTABLES_WRITER_OWNER_PID="${XTABLES_WRITER_OWNER_PID}" \
+            FLUX_XTABLES_WRITER_OWNER_START_TICKS="${XTABLES_WRITER_OWNER_START_TICKS}" \
+            FLUX_XTABLES_WRITER_OWNER_BOOT_ID="${XTABLES_WRITER_OWNER_BOOT_ID}" \
+            sh "${ADDRSYNC_SCRIPT}" start </dev/null &
         p_addrsync=$!
 
         if ! wait "${p_core}"; then
             log_error "Core startup failed"
             kill -9 "${p_addrsync}" 2>/dev/null || true
             wait "${p_addrsync}" 2>/dev/null || true
-            sh "${ADDRSYNC_SCRIPT}" stop </dev/null || true
+            FLUX_XTABLES_WRITER_OWNER_PID="${XTABLES_WRITER_OWNER_PID}" \
+                FLUX_XTABLES_WRITER_OWNER_START_TICKS="${XTABLES_WRITER_OWNER_START_TICKS}" \
+                FLUX_XTABLES_WRITER_OWNER_BOOT_ID="${XTABLES_WRITER_OWNER_BOOT_ID}" \
+                sh "${ADDRSYNC_SCRIPT}" stop </dev/null || true
+            return 1
+        fi
+        if ! wait "${p_addrsync}"; then
+            log_error "Address synchronization startup failed"
             return 1
         fi
 
-        sh "${TPROXY_SCRIPT}" start </dev/null &
+        FLUX_XTABLES_WRITER_OWNER_PID="${XTABLES_WRITER_OWNER_PID}" \
+            FLUX_XTABLES_WRITER_OWNER_START_TICKS="${XTABLES_WRITER_OWNER_START_TICKS}" \
+            FLUX_XTABLES_WRITER_OWNER_BOOT_ID="${XTABLES_WRITER_OWNER_BOOT_ID}" \
+            sh "${TPROXY_SCRIPT}" start </dev/null &
         p_tproxy=$!
 
-        rc=0
-        wait "${p_tproxy}" || rc=1
-        wait "${p_addrsync}" || rc=1
-        return "${rc}"
-    fi
-
-    sh "${TPROXY_SCRIPT}" "${action}" </dev/null &
-    p_tproxy=$!
-    sh "${ADDRSYNC_SCRIPT}" "${action}" </dev/null &
-    p_addrsync=$!
-    sh "${CORE_SCRIPT}" "${action}" </dev/null &
-    p_core=$!
-
-    # Wait with 10s timeout and Fail-Fast
-    if ! wait_pids_timeout 10 "${p_tproxy}" "${p_addrsync}" "${p_core}"; then
-        log_error "Parallel execution failed or timed out, killing children..."
-        kill -9 "${p_tproxy}" "${p_addrsync}" "${p_core}" 2>/dev/null
+        if wait "${p_tproxy}"; then
+            return 0
+        fi
         return 1
     fi
+
+    rc=0
+    sh "${CORE_SCRIPT}" "${action}" </dev/null &
+    p_core=$!
+    FLUX_XTABLES_WRITER_OWNER_PID="${XTABLES_WRITER_OWNER_PID}" \
+        FLUX_XTABLES_WRITER_OWNER_START_TICKS="${XTABLES_WRITER_OWNER_START_TICKS}" \
+        FLUX_XTABLES_WRITER_OWNER_BOOT_ID="${XTABLES_WRITER_OWNER_BOOT_ID}" \
+        sh "${TPROXY_SCRIPT}" "${action}" </dev/null &
+    p_tproxy=$!
+
+    if ! wait_pids_timeout 10 "${p_tproxy}" "${p_core}"; then
+        log_error "Core/TProxy phase failed or timed out, killing children..."
+        kill -9 "${p_tproxy}" "${p_core}" 2>/dev/null || true
+        wait "${p_tproxy}" 2>/dev/null || true
+        wait "${p_core}" 2>/dev/null || true
+        rc=1
+    fi
+
+    FLUX_XTABLES_WRITER_OWNER_PID="${XTABLES_WRITER_OWNER_PID}" \
+        FLUX_XTABLES_WRITER_OWNER_START_TICKS="${XTABLES_WRITER_OWNER_START_TICKS}" \
+        FLUX_XTABLES_WRITER_OWNER_BOOT_ID="${XTABLES_WRITER_OWNER_BOOT_ID}" \
+        sh "${ADDRSYNC_SCRIPT}" "${action}" </dev/null &
+    p_addrsync=$!
+    if ! wait_pids_timeout 10 "${p_addrsync}"; then
+        log_error "Address synchronization phase failed or timed out, killing child..."
+        kill -9 "${p_addrsync}" 2>/dev/null || true
+        wait "${p_addrsync}" 2>/dev/null || true
+        rc=1
+    fi
+    return "${rc}"
+}
+
+_parallel_run() {
+    _with_shell_networking_writer _parallel_run_locked "$@"
 }
 
 _restart_debounced() {
@@ -340,6 +373,53 @@ _require_dispatch_mode() {
         log_error "Dispatcher mode '${active}' cannot run '${required}' verbs"
         return 1
     }
+}
+
+_require_shell_networking_writer_unleased() {
+    if [ -e "${NATIVE_XTABLES_LEASE_FILE}" ] || [ -L "${NATIVE_XTABLES_LEASE_FILE}" ]; then
+        log_error "Native xtables ownership is active; refusing the shell networking writer"
+        return 1
+    fi
+}
+
+_claim_shell_networking_writer() {
+    if ! claim_shell_xtables_writer_lock; then
+        log_error "Another xtables ownership transition is in progress"
+        return 1
+    fi
+    if ! _require_shell_networking_writer_unleased; then
+        release_shell_xtables_writer_lock || true
+        return 1
+    fi
+}
+
+_release_shell_networking_writer() {
+    release_shell_xtables_writer_lock
+}
+
+_with_shell_networking_writer() {
+    local claimed_here=0
+    local rc=0
+
+    case "${_DISPATCHER_SHELL_WRITER_DEPTH:-}" in
+    '' | *[!0-9]*) return 1 ;;
+    esac
+    if [ "${_DISPATCHER_SHELL_WRITER_DEPTH}" -eq 0 ]; then
+        _claim_shell_networking_writer || return 1
+        claimed_here=1
+    else
+        [ "${_DISPATCHER_SHELL_WRITER_DEPTH}" -lt 16 ] || return 1
+        _require_shell_networking_writer_unleased || return 1
+        revalidate_shell_xtables_writer_parent_lock || return 1
+    fi
+
+    _DISPATCHER_SHELL_WRITER_DEPTH=$((_DISPATCHER_SHELL_WRITER_DEPTH + 1))
+    "$@" || rc=$?
+    _DISPATCHER_SHELL_WRITER_DEPTH=$((_DISPATCHER_SHELL_WRITER_DEPTH - 1))
+    if [ "${claimed_here}" -eq 1 ]; then
+        _release_shell_networking_writer || rc=1
+    fi
+    return "${rc}"
 }
 
 _load_shared_prepared_config() {
@@ -724,8 +804,14 @@ _state_cache_preview() {
 _capture_start_compensate() {
     local rc=0
 
-    sh "${TPROXY_SCRIPT}" stop </dev/null || rc=1
-    sh "${ADDRSYNC_SCRIPT}" stop </dev/null || rc=1
+    FLUX_XTABLES_WRITER_OWNER_PID="${XTABLES_WRITER_OWNER_PID}" \
+        FLUX_XTABLES_WRITER_OWNER_START_TICKS="${XTABLES_WRITER_OWNER_START_TICKS}" \
+        FLUX_XTABLES_WRITER_OWNER_BOOT_ID="${XTABLES_WRITER_OWNER_BOOT_ID}" \
+        sh "${TPROXY_SCRIPT}" stop </dev/null || rc=1
+    FLUX_XTABLES_WRITER_OWNER_PID="${XTABLES_WRITER_OWNER_PID}" \
+        FLUX_XTABLES_WRITER_OWNER_START_TICKS="${XTABLES_WRITER_OWNER_START_TICKS}" \
+        FLUX_XTABLES_WRITER_OWNER_BOOT_ID="${XTABLES_WRITER_OWNER_BOOT_ID}" \
+        sh "${ADDRSYNC_SCRIPT}" stop </dev/null || rc=1
     if [ "${rc}" -eq 0 ]; then
         rm -f "${CAPTURE_ACTIVE_FILE}" "${CAPTURE_VERIFIED_FILE}" 2>/dev/null || rc=1
     fi
@@ -799,18 +885,33 @@ _recovery_generation() {
     _prepared_manifest_generation
 }
 
-_stop_capture_generation() {
+_stop_capture_generation_locked() {
     local generation="${1}"
     local rc=0
 
     _load_generation_config "${generation}" || return 1
     rm -f "${CAPTURE_VERIFIED_FILE}" 2>/dev/null || true
-    sh "${TPROXY_SCRIPT}" stop </dev/null || rc=1
-    sh "${ADDRSYNC_SCRIPT}" stop </dev/null || rc=1
+    FLUX_XTABLES_WRITER_OWNER_PID="${XTABLES_WRITER_OWNER_PID}" \
+        FLUX_XTABLES_WRITER_OWNER_START_TICKS="${XTABLES_WRITER_OWNER_START_TICKS}" \
+        FLUX_XTABLES_WRITER_OWNER_BOOT_ID="${XTABLES_WRITER_OWNER_BOOT_ID}" \
+        sh "${TPROXY_SCRIPT}" stop </dev/null || rc=1
+    FLUX_XTABLES_WRITER_OWNER_PID="${XTABLES_WRITER_OWNER_PID}" \
+        FLUX_XTABLES_WRITER_OWNER_START_TICKS="${XTABLES_WRITER_OWNER_START_TICKS}" \
+        FLUX_XTABLES_WRITER_OWNER_BOOT_ID="${XTABLES_WRITER_OWNER_BOOT_ID}" \
+        sh "${ADDRSYNC_SCRIPT}" stop </dev/null || rc=1
     return "${rc}"
 }
 
-_state_capture_start() {
+_stop_capture_generation() {
+    local rc=0
+
+    _claim_shell_networking_writer || return 1
+    _stop_capture_generation_locked "$@" || rc=$?
+    _release_shell_networking_writer || rc=1
+    return "${rc}"
+}
+
+_state_capture_start_locked() {
     local generation="${1:-}"
     local active_generation=""
 
@@ -827,14 +928,20 @@ _state_capture_start() {
     rm -f "${CAPTURE_VERIFIED_FILE}" 2>/dev/null || true
     _write_generation_record "${CAPTURE_ACTIVE_FILE}" "${generation}" || return 1
 
-    if ! sh "${ADDRSYNC_SCRIPT}" start </dev/null; then
+    if ! FLUX_XTABLES_WRITER_OWNER_PID="${XTABLES_WRITER_OWNER_PID}" \
+        FLUX_XTABLES_WRITER_OWNER_START_TICKS="${XTABLES_WRITER_OWNER_START_TICKS}" \
+        FLUX_XTABLES_WRITER_OWNER_BOOT_ID="${XTABLES_WRITER_OWNER_BOOT_ID}" \
+        sh "${ADDRSYNC_SCRIPT}" start </dev/null; then
         log_error "Address synchronization startup failed"
         if ! _capture_start_compensate; then
             log_error "Partial capture cleanup remains pending"
         fi
         return 1
     fi
-    if ! sh "${TPROXY_SCRIPT}" start </dev/null; then
+    if ! FLUX_XTABLES_WRITER_OWNER_PID="${XTABLES_WRITER_OWNER_PID}" \
+        FLUX_XTABLES_WRITER_OWNER_START_TICKS="${XTABLES_WRITER_OWNER_START_TICKS}" \
+        FLUX_XTABLES_WRITER_OWNER_BOOT_ID="${XTABLES_WRITER_OWNER_BOOT_ID}" \
+        sh "${TPROXY_SCRIPT}" start </dev/null; then
         log_error "Capture path startup failed"
         if ! _capture_start_compensate; then
             log_error "Partial capture cleanup remains pending"
@@ -842,6 +949,15 @@ _state_capture_start() {
         return 1
     fi
     return 0
+}
+
+_state_capture_start() {
+    local rc=0
+
+    _claim_shell_networking_writer || return 1
+    _state_capture_start_locked "$@" || rc=$?
+    _release_shell_networking_writer || rc=1
+    return "${rc}"
 }
 
 _state_capture_stop() {
@@ -857,7 +973,7 @@ _state_capture_stop() {
     rm -f "${CAPTURE_ACTIVE_FILE}" 2>/dev/null || true
 }
 
-_state_address_resync() {
+_state_address_resync_locked() {
     local generation=""
     local capture_generation=""
 
@@ -869,7 +985,19 @@ _state_address_resync() {
         return 1
     }
     _load_generation_config "${generation}" || return 1
-    sh "${ADDRSYNC_SCRIPT}" resync </dev/null
+    FLUX_XTABLES_WRITER_OWNER_PID="${XTABLES_WRITER_OWNER_PID}" \
+        FLUX_XTABLES_WRITER_OWNER_START_TICKS="${XTABLES_WRITER_OWNER_START_TICKS}" \
+        FLUX_XTABLES_WRITER_OWNER_BOOT_ID="${XTABLES_WRITER_OWNER_BOOT_ID}" \
+        sh "${ADDRSYNC_SCRIPT}" resync </dev/null
+}
+
+_state_address_resync() {
+    local rc=0
+
+    _claim_shell_networking_writer || return 1
+    _state_address_resync_locked "$@" || rc=$?
+    _release_shell_networking_writer || rc=1
+    return "${rc}"
 }
 
 _state_capture_verify() {
@@ -1066,19 +1194,30 @@ _state_start() {
         return 1
     fi
 
-    if _parallel_run start; then
+    if _with_shell_networking_writer _legacy_start_networking_transaction; then
         sync_prop "RUNNING"
         log_info "Flux Service is READY"
     else
-        _state_fail
         return 1
     fi
+}
+
+_legacy_start_networking_transaction() {
+    if _parallel_run start; then
+        return 0
+    fi
+    _state_fail_locked || true
+    return 1
+}
+
+_legacy_stop_networking_transaction() {
+    _parallel_run stop || true
 }
 
 _state_stop() {
     _claim_dispatch_mode legacy || return 1
     log_banner "STOPPING FLUX"
-    _parallel_run stop || true
+    _with_shell_networking_writer _legacy_stop_networking_transaction || return 1
     sync_prop "STOPPED"
     rm -f "${DISPATCH_MODE_FILE}" 2>/dev/null || true
     log_info "Flux Service stopped"
@@ -1186,23 +1325,33 @@ _state_restart() {
 
     log_banner "RESTARTING FLUX"
 
-    _parallel_run stop || true
-
-    if _parallel_run start; then
+    if _with_shell_networking_writer _legacy_restart_networking_transaction; then
         sync_prop "RUNNING"
         log_info "Flux Service is READY"
     else
-        _state_fail
         return 1
     fi
 }
 
-_state_fail() {
+_legacy_restart_networking_transaction() {
+    _parallel_run stop || true
+    if _parallel_run start; then
+        return 0
+    fi
+    _state_fail_locked || true
+    return 1
+}
+
+_state_fail_locked() {
     log_warn "Rolling back..."
     _parallel_run stop || true
     sync_prop "FAILED"
     rm -f "${DISPATCH_MODE_FILE}" 2>/dev/null || true
     return 0
+}
+
+_state_fail() {
+    _with_shell_networking_writer _state_fail_locked
 }
 
 # ==============================================================================
@@ -1261,7 +1410,9 @@ _with_dispatch_lock() {
     fi
 
     local rc=0
-    trap 'rm -f "${DISPATCH_LOCK_OWNER_FILE}" 2>/dev/null || true; rmdir "${DISPATCH_LOCK_DIR}" 2>/dev/null || true' EXIT INT TERM
+    trap '_release_shell_networking_writer 2>/dev/null || true; rm -f "${DISPATCH_LOCK_OWNER_FILE}" 2>/dev/null || true; rmdir "${DISPATCH_LOCK_DIR}" 2>/dev/null || true' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
 
     "$@" || rc=$?
 
@@ -1276,6 +1427,10 @@ main() {
     local event_type="${1:-}"
     local watched_path="${2:-}"
     local event_name="${3:-${watched_path##*/}}"
+
+    reset_shell_xtables_writer_lock_state || return 1
+    unset _DISPATCHER_SHELL_WRITER_DEPTH 2>/dev/null || return 1
+    _DISPATCHER_SHELL_WRITER_DEPTH=0
 
     if [ "${FLUXD_BRIDGE:-0}" != "1" ]; then
         [ ! -t 2 ] && [ -n "${FLUX_LOG}" ] && exec 2>>"${FLUX_LOG}"

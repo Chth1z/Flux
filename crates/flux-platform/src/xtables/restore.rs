@@ -22,6 +22,12 @@ const XTABLES_RESTORE_DIGEST_DOMAIN: &[u8] =
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum XtablesRestoreAction {
     Apply,
+    /// Atomically replace the contents of already-owned user chains.
+    ///
+    /// Canonical replace artifacts flush one or more chains first and then
+    /// append their complete new contents. They cannot create chains, edit
+    /// built-in hooks, delete rules, or delete chains.
+    Replace,
     Cleanup,
 }
 
@@ -329,6 +335,9 @@ pub enum XtablesRestoreParseErrorKind {
     CleanupOrdering {
         command: XtablesRestoreCommandKind,
     },
+    ReplaceOrdering {
+        command: XtablesRestoreCommandKind,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -376,7 +385,7 @@ struct TransactionBuilder {
     table: XtablesRestoreTable,
     entries: Vec<XtablesRestoreEntry>,
     saw_command: bool,
-    cleanup_stage: CleanupStage,
+    command_stage: CommandStage,
 }
 
 impl TransactionBuilder {
@@ -385,7 +394,7 @@ impl TransactionBuilder {
             table,
             entries: Vec::new(),
             saw_command: false,
-            cleanup_stage: CleanupStage::DeleteRules,
+            command_stage: CommandStage::Initial,
         }
     }
 
@@ -398,10 +407,11 @@ impl TransactionBuilder {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd)]
-enum CleanupStage {
-    DeleteRules,
-    FlushChains,
-    DeleteChains,
+enum CommandStage {
+    Initial,
+    Flushing,
+    Populating,
+    DeletingChains,
 }
 
 /// Parse canonical restore bytes without performing filesystem, process, or kernel I/O.
@@ -479,11 +489,11 @@ pub fn parse_xtables_restore(
                 line_number,
                 context,
                 transaction.table,
-                transaction.cleanup_stage,
+                transaction.command_stage,
             )?;
             transaction.saw_command = true;
-            transaction.cleanup_stage =
-                cleanup_stage_after(transaction.cleanup_stage, command.kind);
+            transaction.command_stage =
+                command_stage_after(context.action, transaction.command_stage, command.kind);
             tokens += 2 + command.arguments.len();
             commands += 1;
             transaction
@@ -650,7 +660,7 @@ fn parse_command(
     line_number: usize,
     context: XtablesRestoreContext,
     table: XtablesRestoreTable,
-    cleanup_stage: CleanupStage,
+    command_stage: CommandStage,
 ) -> Result<XtablesRestoreCommand, XtablesRestoreParseError> {
     let token_count = line.as_bytes().iter().filter(|byte| **byte == b' ').count() + 1;
     ensure_line_limit(
@@ -696,7 +706,7 @@ fn parse_command(
             return Err(XtablesRestoreParseError::at_line(line_number, kind));
         }
     }
-    validate_cleanup_order(cleanup_stage, kind, line_number)?;
+    validate_command_order(context.action, command_stage, kind, line_number)?;
 
     let chain = parts[1];
     validate_chain(chain, line_number)?;
@@ -751,6 +761,10 @@ fn validate_action(
             command,
             XtablesRestoreCommandKind::Append | XtablesRestoreCommandKind::Insert
         ),
+        XtablesRestoreAction::Replace => matches!(
+            command,
+            XtablesRestoreCommandKind::Flush | XtablesRestoreCommandKind::Append
+        ),
         XtablesRestoreAction::Cleanup => matches!(
             command,
             XtablesRestoreCommandKind::Delete
@@ -791,37 +805,71 @@ fn validate_command_arity(
     }
 }
 
-fn validate_cleanup_order(
-    stage: CleanupStage,
+fn validate_command_order(
+    action: XtablesRestoreAction,
+    stage: CommandStage,
     command: XtablesRestoreCommandKind,
     line_number: usize,
 ) -> Result<(), XtablesRestoreParseError> {
-    let valid = match command {
-        XtablesRestoreCommandKind::Delete => stage == CleanupStage::DeleteRules,
-        XtablesRestoreCommandKind::Flush => stage <= CleanupStage::FlushChains,
-        XtablesRestoreCommandKind::DeleteChain => stage >= CleanupStage::FlushChains,
-        XtablesRestoreCommandKind::Append | XtablesRestoreCommandKind::Insert => true,
+    let valid = match action {
+        XtablesRestoreAction::Apply => true,
+        XtablesRestoreAction::Replace => match command {
+            XtablesRestoreCommandKind::Flush => {
+                matches!(stage, CommandStage::Initial | CommandStage::Flushing)
+            }
+            XtablesRestoreCommandKind::Append => {
+                matches!(stage, CommandStage::Flushing | CommandStage::Populating)
+            }
+            XtablesRestoreCommandKind::Insert
+            | XtablesRestoreCommandKind::Delete
+            | XtablesRestoreCommandKind::DeleteChain => false,
+        },
+        XtablesRestoreAction::Cleanup => match command {
+            XtablesRestoreCommandKind::Delete => stage == CommandStage::Initial,
+            XtablesRestoreCommandKind::Flush => {
+                matches!(stage, CommandStage::Initial | CommandStage::Flushing)
+            }
+            XtablesRestoreCommandKind::DeleteChain => {
+                matches!(stage, CommandStage::Flushing | CommandStage::DeletingChains)
+            }
+            XtablesRestoreCommandKind::Append | XtablesRestoreCommandKind::Insert => false,
+        },
     };
     if valid {
         Ok(())
     } else {
         Err(XtablesRestoreParseError::at_line(
             line_number,
-            XtablesRestoreParseErrorKind::CleanupOrdering { command },
+            match action {
+                XtablesRestoreAction::Replace => {
+                    XtablesRestoreParseErrorKind::ReplaceOrdering { command }
+                }
+                XtablesRestoreAction::Cleanup => {
+                    XtablesRestoreParseErrorKind::CleanupOrdering { command }
+                }
+                XtablesRestoreAction::Apply => unreachable!("apply ordering is unrestricted"),
+            },
         ))
     }
 }
 
-const fn cleanup_stage_after(
-    stage: CleanupStage,
+const fn command_stage_after(
+    action: XtablesRestoreAction,
+    stage: CommandStage,
     command: XtablesRestoreCommandKind,
-) -> CleanupStage {
-    match command {
-        XtablesRestoreCommandKind::Flush => CleanupStage::FlushChains,
-        XtablesRestoreCommandKind::DeleteChain => CleanupStage::DeleteChains,
-        XtablesRestoreCommandKind::Append
-        | XtablesRestoreCommandKind::Insert
-        | XtablesRestoreCommandKind::Delete => stage,
+) -> CommandStage {
+    match (action, command) {
+        (XtablesRestoreAction::Replace, XtablesRestoreCommandKind::Flush)
+        | (XtablesRestoreAction::Cleanup, XtablesRestoreCommandKind::Flush) => {
+            CommandStage::Flushing
+        }
+        (XtablesRestoreAction::Replace, XtablesRestoreCommandKind::Append) => {
+            CommandStage::Populating
+        }
+        (XtablesRestoreAction::Cleanup, XtablesRestoreCommandKind::DeleteChain) => {
+            CommandStage::DeletingChains
+        }
+        _ => stage,
     }
 }
 
@@ -1040,6 +1088,9 @@ fn has_reserved_flux_chain_prefix(chain: &str) -> bool {
 }
 
 fn flux_chain_family(chain: &str) -> Option<XtablesRestoreFamily> {
+    if let Some(family) = capture_stable_chain_family(chain) {
+        return Some(family);
+    }
     if let Some(family) = capture_generation_chain_family(chain) {
         return Some(family);
     }
@@ -1073,6 +1124,14 @@ fn flux_chain_family(chain: &str) -> Option<XtablesRestoreFamily> {
         }
     }
     None
+}
+
+fn capture_stable_chain_family(chain: &str) -> Option<XtablesRestoreFamily> {
+    match chain {
+        "FLX4SP" | "FLX4SO" => Some(XtablesRestoreFamily::Ipv4),
+        "FLX6SP" | "FLX6SO" => Some(XtablesRestoreFamily::Ipv6),
+        _ => None,
+    }
 }
 
 fn capture_generation_chain_family(chain: &str) -> Option<XtablesRestoreFamily> {
@@ -1189,6 +1248,7 @@ fn digest_restore(context: XtablesRestoreContext, canonical: &[u8]) -> XtablesRe
     digest.update([match context.action {
         XtablesRestoreAction::Apply => 1,
         XtablesRestoreAction::Cleanup => 2,
+        XtablesRestoreAction::Replace => 3,
     }]);
     digest.update([match context.family {
         XtablesRestoreFamily::Ipv4 => 4,

@@ -1,7 +1,7 @@
 # Fluxd Rewrite Blueprint
 
 - Status: accepted, evolving architecture
-- Last updated: 2026-07-16
+- Last updated: 2026-07-17
 - Minimum supported kernel: Linux 5.10
 
 ## Executive decision
@@ -25,10 +25,10 @@ ownership retains the frozen shell generator. Separately, canonical lowering pre
 schema-v1 forwarded identities and represents local OUTPUT through pure schema-v2 `O`/`P`
 transaction artifacts while all five optional extensions remain unsupported. Neither non-mutating
 compiler split promotes a shadow artifact or transfers writer ownership. A kernel ownership
-transition occurs only after stable-hook/native-writer integration, required adjunct semantics,
-renderer parity, readback, recovery, rollback, and real-device gates pass for that component; the
-replaced runtime code is then removed promptly. No bridge, shadow, parity, or partial-cutover state
-is releasable. See
+transition occurs only after the already-delivered private stable-hook/native-writer mechanism is
+bound to production engine/canary/Android authorities, its single-writer lease disables shell
+mutation, and the remaining real-device gates pass for that component; the replaced runtime code is
+then removed promptly. No bridge, shadow, parity, or partial-cutover state is releasable. See
 [ADR-0010](../adr/0010-freeze-shell-networking-as-a-shadow-compiler-oracle.md) and
 [ADR-0011](../adr/0011-pre-release-rust-only-release-gate.md).
 
@@ -190,8 +190,8 @@ The separate Phase 4 lowerer may consume the artifact with a non-authorizing nam
 candidate, and optional descriptive per-family routing targets, but does not mutate or promote the
 source value. Forwarded-only input retains exact schema v1; local-OUTPUT input selects schema v2
 and represents the separate OUTPUT classifier, loopback PREROUTING companion, typed listener/
-routing/escape requirements, and dependency order. The bridge shell remains the sole executed
-networking writer, and no shadow or lowered output is accepted by the Phase 1
+routing/escape requirements, and dependency order. The bridge shell remains the sole production
+bridge networking writer, and no shadow or lowered output is accepted by the Phase 1
 `RuntimeCoordinator`.
 
 ### 3. Runtime Reconciler module
@@ -213,22 +213,37 @@ The delivered Phase 1 Adapter is `RuntimeCoordinator`, placed behind the existin
 
 ### 4. Kernel Plane module
 
-Internal interface:
+Internal caller interface:
 
 ```rust
 trait KernelPlane {
-    async fn observe(&mut self) -> Result<KernelSnapshot>;
-    async fn prepare(&mut self, generation: &CompiledGeneration)
-        -> Result<PreparedKernelGeneration>;
-    async fn activate(&mut self, prepared: PreparedKernelGeneration)
-        -> Result<ActiveKernelGeneration>;
-    async fn retire(&mut self, generation: &GenerationRecord) -> Result<RetireReport>;
+    async fn converge(&mut self, target: KernelTarget)
+        -> Result<KernelConvergenceReport>;
+    async fn recover(&mut self) -> Result<KernelRecoveryReport>;
 }
 ```
 
-The prepared and active values are opaque ownership tokens. Their Rust types enforce ordering: an unprepared generation cannot be activated, and a committed generation cannot be silently dropped without being recorded.
+Observation, prepare, activate, verify, rollback, and retire are private dependencies and typestates,
+not caller-driven lifecycle verbs. A deep backend owner durably records the next mutation boundary,
+holds the component writer lease, performs fresh observation after every ambiguous result, and
+returns only a converged or explicitly uncertain report. Opaque prepared/active values may still
+enforce internal ordering, but callers cannot interleave them or retain raw mutation authority.
 
 Production uses Linux/Android adapters. Tests use a deterministic in-memory kernel adapter with failure injection. This is a real seam because at least two adapters exist.
+
+The delivered native xtables sub-owner follows this interface exactly. It accepts only
+`converge(Active(target) | Stopped)` and `recover()`, owns `FLX{4|6}SP` PREROUTING plus
+`FLX{4|6}SO` OUTPUT stable roots, direct restore/save, transaction-scoped rtnetlink, exact readback,
+rollback, crash recovery, and the shell-visible transition lease. Its real process/netlink Adapter
+exists. Durable payload schema 2 binds target/previous identities to artifact and coherent tool-set
+digests plus a complete dual-family policy-routing audit digest, including loopback name/index
+identity. Every policy access validates that live binding in both directions, and both xtables
+families plus both routing audit identities must be exact or absent before `Active` or `CleanAbsent`
+is published.
+Terminal current-journal recovery remains under the native guard and shared writer fence, retaining
+any surviving lease until fresh global dual-family absence permits terminal-artifact retirement.
+Positive production target admission remains uninhabited until Android mark/RPDB and release-device
+authorities are delivered.
 
 The first Phase 3 slice is deliberately observation-only. A `NetworkInventorySource` publishes immutable, canonical snapshots with a monotonic `NetworkEpoch`; raw rtnetlink messages, dump sequencing, batching, debounce, and loss recovery remain private implementation details. The production Adapter subscribes before its initial dump and shares the daemon's existing reactor. `MSG_TRUNC`, `ENOBUFS`, `NLMSG_OVERRUN`, interrupted or incomplete dumps, parse ambiguity, and sequence inconsistency discard partial state and require a full resync before another snapshot can be published. Native route/rule mutation is not admitted by this slice.
 
@@ -314,25 +329,29 @@ The Phase 1 bridge implements the first concrete generation fence before the ful
 2. Refresh the Network Inventory if its epoch changed.
 3. Select and explain a Backend Plan.
 4. Render a generation-specific Sing-Box configuration and run `sing-box check`.
-5. Create backend resources without attaching traffic to them:
+5. Persist the backend's activating intent, fsync it, and acquire its component transition lease.
+   The lease must already block the previous writer before the first kernel mutation.
+6. Create backend resources without attaching traffic to them, advancing the durable next-write
+   boundary before every restore, netlink request, BPF attach, or equivalent mutation:
    - nftables tables/chains/sets in one uncommitted message batch or under generation-specific names;
    - generation-specific ipsets populated before their generation chain is referenced;
    - xtables generation chains not yet referenced by stable entry chains;
    - eBPF maps/programs loaded but not attached;
    - policy routes whose marks cannot yet be produced;
    - TUN engine configuration with Flux-owned routing still inactive.
-6. Persist a `prepared` journal record and fsync it.
+7. Prove the exact prepared live state; a command exit status alone is not preparation evidence.
 
 ### Activate
 
 1. Stage or start Sing-Box and wait for generation-specific readiness.
-2. Install policy-routing prerequisites.
+2. Install policy-routing prerequisites under the already-held component lease.
 3. Atomically attach the Capture Path:
    - commit one nftables batch;
    - atomically point stable xtables dispatch chains at generation chains that already reference generation-specific ipsets;
    - attach or update eBPF links in dormant/pass-through state and publish acceleration separately;
    - activate TUN routing rules after the interface is ready.
-4. Persist the `activating` generation record using fsync plus rename.
+4. Re-read the exact attached state and only then publish the active Generation. The activating
+   record and lease precede all writes; they are not a post-attachment receipt.
 
 ### Verify
 
@@ -460,15 +479,20 @@ The compiler emits backend-neutral Capture Policy first, then an nftables progra
 
 This path preserves broad Android compatibility.
 
-The first non-mutating Phase 4 compiler cutover is delivered. Rust-owned preparation exclusively
-invokes `fluxd render-legacy-rules`; explicit legacy ownership exclusively sources `scripts/rules`
-as the frozen rollback oracle. The cache records its `rust` or `shell` producer and never silently
-falls back between them. `scripts/tproxy` remains the sole restore executor and kernel writer.
+The first non-mutating Phase 4 compiler cutover remains the current production bridge. Rust-owned
+preparation exclusively invokes `fluxd render-legacy-rules`; explicit legacy ownership exclusively
+sources `scripts/rules` as the frozen rollback oracle. The cache records its `rust` or `shell`
+producer and never silently falls back between them. In that production composition,
+`scripts/tproxy` remains the sole restore executor and kernel writer. Separately, the delivered
+bounded native owner consumes canonical artifacts through test-only target admission and owns stable
+roots, direct restore/save, policy routing, exact readback, rollback, recovery, and the transition
+lease.
 
 The delivered `LegacyRulesPlan` preserves validated legacy source shape; it is not a lowering of the
-Phase 2 shadow Capture Program and does not claim target semantic or device parity. A later native
-transition disables the shell writer before its first restore mutation so both implementations are
-never active writers.
+Phase 2 shadow Capture Program and does not claim target semantic or device parity. Backlog item 3
+binds production authorities and reviewed Android 5.10/ARM64 evidence to the native owner, then uses
+its already-delivered lease to disable the shell writer before the first production restore mutation
+so both implementations are never active writers.
 
 The separate canonical lowerer now has two deliberately distinct contracts. Forwarded-only input
 retains exact schema-v1 bytes, `FLX{4|6}F{generation:010}` names, resource accounting, and digests.
@@ -480,20 +504,23 @@ The private chains remain unattached and never place TPROXY directly in OUTPUT.
 
 Schema v2 also records typed per-family RPDB/local-route identity, exact transparent-listener
 family/address/port/protocol requirements, compatibility engine credentials plus bypass-mark loop
-escape, and descriptive transaction ordering. The dependency order prepares private chains,
+escape, and descriptive transaction ordering. The routing identity includes nonzero route and rule
+protocols, an explicit nonzero metric, IPv4 HOST or IPv6 UNIVERSE scope, and the loopback name later
+bound to its admitted live interface index. The dependency order prepares private chains,
 listener, routing, and escape before attaching `P`, optional `F`, and `O` last; retirement detaches
 `O`, optional `F`, and `P` before releasing escape, routing, listener, and private objects. This
 metadata does not allocate or mutate any of those objects. Positive UID membership preserves local
 allowlist set algebra; ordered direct returns preserve denylist and safety decisions.
 
-Both schemas have no stable-hook mutation, restore invocation, routing writer, live readback,
-rollback, cleanup-invertibility proof, mark/route/listener lease, writer/ownership token,
-prepared/active conversion, receipt authority, or Runtime Reconciler entry point. The production
-xtables driver therefore remains `Unsupported`. Established-flow caching, transparent-socket
-DIVERT, FakeIP ICMP, QUIC rejection, and MSS clamping remain explicit unsupported extensions. A
-native transition still requires stable-hook activation, exact restore/readback/rollback, the
-single-writer transition lease, production evidence authorities, and reviewed Android release
-qualification.
+Both schemas themselves have no stable-hook mutation, restore invocation, routing writer, live
+readback, rollback, cleanup-invertibility proof, mark/route/listener lease, writer/ownership token,
+prepared/active conversion, receipt authority, or Runtime Reconciler entry point; they remain
+non-authorizing artifacts. The separate private owner consumes them and supplies stable-hook
+activation, exact restore/readback/rollback, and the single-writer transition lease. Its positive
+production target factory remains `Unsupported` until independent evidence authorities, daemon
+composition, and reviewed Android release qualification are bound to that exact transaction.
+Established-flow caching, transparent-socket DIVERT, FakeIP ICMP, QUIC rejection, and MSS clamping
+remain explicit unsupported extensions.
 
 The bridge now binds that source-shape output before Generation publication. Domain-separated plan,
 mandatory family apply/cleanup pair, and enabled-family set identities are renderer-owned.
@@ -519,13 +546,29 @@ Design requirements:
 - snapshot and verify restore output, then re-read the owned chains;
 - serialize access around the xtables lock and expose lock timeout distinctly from syntax or feature errors.
 
-The first bullet now has an unwired internal implementation checkpoint: exact restore paths reject
-a final-component symlink and are descriptor-pinned and byte-digested, matching reported legacy/nf_tables family flavors are
-boundedly probed, and direct children receive fixed argv plus canonical stdin with bounded
-diagnostics, timeout, unrelated-descriptor closure, parent-death, and process-group cleanup. All
-post-spawn restore failures conservatively report possible mutation. This is only the process Adapter
-behind the future deep native-owner Module. Stable hooks, command/save discovery, live readback,
-rtnetlink, journaling, rollback, transition leasing, and production composition remain open.
+The first, second, sixth, and seventh requirements now have one private implementation: a coherent
+trusted command/restore/save set is descriptor-pinned before version execution; a deep owner keeps
+stable roots and generation chains private; complete bounded save plus fresh groups-zero rtnetlink
+proves live state; policy routing requires a nonzero route protocol, nonzero rule protocol, explicit
+nonzero route metric, IPv4 HOST scope, and IPv6 UNIVERSE scope; schema-2 durable identity digests the
+complete IPv4/IPv6 audit plus loopback name/index; and `Active`/`CleanAbsent` require both-family
+xtables and routing residue checks. Live loopback validation proves both name-to-index and
+index-to-name mappings. A durable journal, advisory guard, authenticated shared writer lock,
+rollback, and component lease own the transaction. A current terminal journal keeps the guard,
+writer fence, and optional lease until global IPv4/IPv6 xtables and routing absence retires the
+terminal artifacts. The exact previous-boot revision-1 `Activating` journal-before-lease boundary is
+recoverable when the inherited native scope is coherent; same-boot or mismatched missing-lease state
+remains fail-closed.
+
+Shell-owner v2 retains parent plus optional child PID/start identities and one boot ID. Either live
+participant blocks. One parent-bound mutating `addrsync` or `tproxy` phase child at a time changes
+only the child slot and remains blocking if the parent dies; a live parent may reclaim a dead child.
+Both-dead, PID-reused, and previous-boot records retire only after exact revalidation. Bare,
+malformed, mixed, or unverifiable locks stay blocking. Every legacy start, stop, restart, and
+failure-cleanup phase transaction holds this fence before `addrsync` or `tproxy` mutation. The
+standalone daemon lifetime remains a later component-cutover responsibility.
+Rooted x86_64 WSA execution is mechanism evidence only. Production composition, authority binding,
+and reviewed Android 5.10/ARM64 qualification remain open.
 
 ### Managed TUN path
 
@@ -736,14 +779,14 @@ private evidence promotion. The completed non-cloneable per-flow receipt contrac
 request, probe UID, nonce, tuple, payload, listener cookie, authoritative delivery event, sequence/
 loss state, and chronology. The gate evidence owns that receipt and revalidates it with the retained
 flows and client cleanup lifetime. Its sealed production verifier authority remains uninhabited.
-The current zero-state xtables driver reports `Unsupported` with cleanup `NotRequired` before
-mutation because it does not implement or authorize that complete local-OUTPUT transaction; the
-prepared/raw type is uninhabited, so no
-positive evidence can be emitted. Required mode treats that result as a failed gate and never
-reaches `RUNNING`. Attempt-owned UID/GID/PID/start-tick/handle binding, observer/report parsing and
-factories, actual prebound collector use, a real traffic producer, capability-qualified execution,
-and production Android qualification remain separate gates. A separately qualified cgroup-BPF authority is
-optional, and no production path loads or unloads a `.ko`.
+The production xtables gate still reports `Unsupported` with cleanup `NotRequired` before mutation
+because its positive target factory remains uninhabited. The delivered private owner is reachable
+only through test admission, so it cannot emit production prepared/raw or positive evidence.
+Required mode treats that result as a failed gate and never reaches `RUNNING`. Attempt-owned
+UID/GID/PID/start-tick/handle binding, observer/report parsing and factories, actual prebound
+collector use, a real traffic producer, capability-qualified execution, and production Android
+qualification remain separate gates. A separately qualified cgroup-BPF authority is optional, and
+no production path loads or unloads a `.ko`.
 REDIRECT/DNAT, ingress promotion, counters, route lookups, and veth-bounce substitutions cannot
 qualify TPROXY. Host evidence still cannot authorize production `functional_passed`.
 

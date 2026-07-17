@@ -52,6 +52,56 @@ All notable changes to the Flux project will be documented in this file.
   perform readback/rollback, or grant mark, writer, ownership, prepared/active, coordinator, or
   activation authority. The production xtables driver remains `Unsupported`.
 
+### Native xtables transaction owner
+- Added the private `NativeXtablesOwner` deep Module with only `converge(target)` and `recover()`.
+  It owns stable `FLX{4|6}SP` PREROUTING and `FLX{4|6}SO` OUTPUT roots, generation replacement,
+  coherent descriptor-pinned restore/save, journaled policy-routing netlink, exact structured
+  readback, rollback, crash recovery, cleanup invertibility, and the shell transition lease. Durable
+  owner-payload schema 2 binds target and optional previous identities to the artifact digest,
+  coherent tool-set digest, and a domain-separated digest of the complete IPv4/IPv6 policy-routing
+  audit, including the exact loopback name/index binding.
+- Hardened durable ownership with a boot/network-namespace/journal component lease, shell-visible
+  writer lock plus native scope marker, lease-lifetime advisory guard, atomic Generation rebind,
+  terminal-before-lease-release ordering, and recovery for every interrupted publication boundary.
+  Current terminal-journal recovery retains the native guard, shared writer fence, and any
+  still-present lease through fresh global IPv4/IPv6 xtables plus policy-routing absence, then
+  retires the terminal lease/journal artifacts and fence. An exact previous-boot revision-1
+  `Activating` boundary interrupted at `JournalDurable` or `JournalBeforeLease` is also recoverable
+  when its inherited native-owner scope matches the journal and the same live-absence proof passes;
+  same-boot or mismatched missing-lease states remain fail-closed.
+- Replaced the shell writer record with canonical shell-owner v2 parent plus optional child PID/start-tick
+  identities and one boot ID. Either live participant blocks Rust and shell competitors. Each
+  parent-bound mutating `addrsync` or `tproxy` phase command adds and clears only the single child
+  slot, without replacing the parent; the dispatcher serializes those phase writers, and a surviving
+  child remains blocking if the parent dies. A live parent may reclaim a dead child. Both-dead,
+  PID-reused, and previous-boot records retire only after exact revalidation, while malformed, bare,
+  mixed-owner, or unverifiable locks remain fail-closed.
+- Routed every legacy start, stop, restart, and failure-cleanup networking transaction through the
+  shared writer fence before any `addrsync` or `tproxy` mutation, so a native lease rejects the
+  phase transaction before a networking component is invoked. Dispatcher entry discards ambient
+  internal ownership state, nested claims revalidate the native lease and exact parent record,
+  release authenticates the current parent/child identity, and `INT`/`TERM` exit through authenticated
+  `EXIT` cleanup so execution cannot resume into later mutation. This phase fence does not transfer
+  ownership of the long-lived standalone `addrsyncd` daemon; that remains part of the production
+  cutover.
+- Added a groups-zero `NETLINK_ROUTE` session with EXT_ACK/CAP_ACK, bounded deadlines and dumps,
+  exact sender/sequence validation, route-before-rule apply, rule-before-route delete, fresh-session
+  recovery after ambiguous ACKs, Linux-5.10 IPv6 `RTA_PREF` normalization, bidirectional live
+  loopback name/index validation before every routing observation or mutation, and exact duplicate/
+  conflict readback. Both xtables families and both routing audit identities must be clean or exact
+  before the owner may publish `Active` or `CleanAbsent`; opposite-family residue fails closed.
+- Expanded the coherent xtables tool set to command/restore/save for both families, validating the
+  complete trusted descriptor mapping and shared multicall digest before any version execution.
+  Added full-save projection with absolute hook ordinals, legacy conflicts, zero-table clean
+  absence, and canonical default TPROXY `--on-ip` normalization.
+- Deterministic tests cover every restore/rtnetlink mutation boundary, dual-stack partial success,
+  replacement rollback, retained uncertainty, monotonic crash recovery, and lease retention. The
+  same real Adapter passed dual-stack apply, active-journal recovery, stop, and exact cleanup in a
+  rooted disposable WSA Android 13 x86_64 namespace. Production target admission, Android
+  5.10/ARM64 qualification, daemon cutover, and shell-duty deletion remain open. WSA remains
+  mechanism-only evidence, eBPF remains optional, and this checkpoint adds no production `.ko`/KPM
+  loading path.
+
 ### Native xtables process groundwork
 - Added the first internal native restore-process Adapter. It opens caller-selected absolute
   `iptables-restore` and optional `ip6tables-restore` tools with final-component symlink rejection and descriptor pinning,
@@ -64,11 +114,10 @@ All notable changes to the Flux project will be documented in this file.
   failure returns promptly with a deferred reaper rather than blocking past the operation deadline.
   Crate-private tests cover exact IPv4/IPv6 argv and stdin, unsafe paths, missing families, nonzero exit,
   oversized diagnostics, timeout, descendant cleanup, path replacement, and in-place mutation.
-  This primitive remains crate-private and is not wired
-  to the bridge, Runtime Reconciler, or functional-canary driver. It adds no stable-hook,
-  rtnetlink, readback, rollback, journal, transition lease, writer, or activation authority;
-  `scripts/tproxy` remains the sole current restore executor and the production driver remains
-  `Unsupported`.
+  This original primitive remained non-authorizing when introduced; it is now consumed only inside
+  the private transaction owner above. The bridge, Runtime Reconciler, and functional-canary driver
+  still cannot construct positive production target admission, so `scripts/tproxy` remains the
+  production restore executor and the production driver remains `Unsupported`.
 
 ### Bridge contract audit corrections
 - Added Generation-bound attestation for Rust-generated legacy restore artifacts. Domain-separated
@@ -87,7 +136,7 @@ All notable changes to the Flux project will be documented in this file.
 - Added a bounded, observation-only xtables restore parser/canonical codec in `flux-platform`. It preserves repeated table transactions, command/token order, duplicates, apply/cleanup opcode separation, per-transaction mangle cleanup ordering, explicit family context with current family-marker validation, resource usage, and a domain-separated byte digest while exposing no shell execution, restore process, Capture-policy-to-restore renderer, Generation, writer, ownership, prepared/active, coordinator, or activation path. Current-shaped synthetic fixtures exercise the closed grammar; the pinned raw shell fixtures are a separate byte-characterization gate. The later legacy source-shape renderer uses that gate. The pure canonical Capture Program lowerer described above now also uses the sealed grammar, while kernel and device parity remain open.
 - Corrected the frozen shell oracle's IPv6 jump-tree classification for compressed zero-prefix destinations: `::1/128` and `::ffff:0:0/96` now enter the high-nibble-zero chain reached by `0000::/4`, instead of unreachable zone-1/zone-15 chains.
 - Stabilized the frozen shell rule oracle across gawk and mawk by emitting multi-user UID rules in canonical numeric order and excluded-interface rules in configured order; cross-AWK regression coverage now protects both byte-order contracts before full restore fixtures are admitted.
-- Added the bounded Phase-2 shadow Capture Program checkpoint and ADR-0010 migration boundary. Pure Rust compilation now targets deterministic, separately ordered local-OUTPUT/forwarded-ingress policy with a canonical mandatory safety baseline, optional inventory-host provenance, bounded resource accounting, semantic digest, and explicit assumptions/deferred prerequisites, while the frozen shell path remains the sole executed networking writer and compatibility oracle. Shadow artifacts have no Generation ID, Planning Authority, writer token, mutation-authorizing renderer, prepared/active conversion, Runtime Coordinator or functional-canary path, parity claim, eBPF attach/pin, TUN activation, implicit module request, or `.ko`/KPM loading; the separate pure canonical lowerer does not change those boundaries, and each legacy component requires an independently qualified single-writer cutover before retirement.
+- Added the bounded Phase-2 shadow Capture Program checkpoint and ADR-0010 migration boundary. Pure Rust compilation now targets deterministic, separately ordered local-OUTPUT/forwarded-ingress policy with a canonical mandatory safety baseline, optional inventory-host provenance, bounded resource accounting, semantic digest, and explicit assumptions/deferred prerequisites, while the frozen shell path remains the sole production bridge networking writer and compatibility oracle. Shadow artifacts have no Generation ID, Planning Authority, writer token, mutation-authorizing renderer, prepared/active conversion, Runtime Coordinator or functional-canary path, parity claim, eBPF attach/pin, TUN activation, implicit module request, or `.ko`/KPM loading; the separate pure canonical lowerer does not change those boundaries, and each legacy component requires an independently qualified single-writer cutover before retirement.
 - Made `fluxctl status [--json]` delegate to authoritative live `fluxd` state instead of inferring the Rust-owned Sing-Box lifecycle from the legacy PID file.
 - Completed installer migration for proxy mode, reserved TUN values, and Android multi-user scope; every backup/restore is checked, post-extraction failure restores the retained user configuration, and upgrade preservation is documented per file.
 - Restricted the current development Phase-1 configuration to `PROXY_MODE=tproxy` and `BYPASS_SET_BACKEND=zone`; unsupported future choices now fail during configuration validation instead of being reported as active.

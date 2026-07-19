@@ -33,6 +33,11 @@ The current development checkpoint is a Phase-1 bridge:
 - Current pre-release bridge capture verification is still structural. The stricter functional local-OUTPUT
   canary exists as staged development work but is not yet an Android release qualification.
 - Kernels below 5.10 remain queryable in a non-mutating read-only state.
+- Capability Profile schema 2 can carry exact Android product/build/vendor/security-patch,
+  verified-boot, kernel-build, SELinux-policy, netd/Connectivity, tool-artifact, and network-
+  namespace identity. Device-qualified mark policy and census evidence now require that complete,
+  namespace-consistent identity. The production collector still reports it unavailable until the
+  reviewed Android collector and policy catalog are implemented, so no new mutation is admitted.
 - eBPF is optional future observation/acceleration work. Flux packages no `.ko`, KPM, or opaque
   kernel-module payload and invokes no explicit module-loading API. The legacy shell bridge has not
   yet proved that every xtables dependency is already active without implicit kernel autoload.

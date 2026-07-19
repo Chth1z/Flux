@@ -28,6 +28,7 @@ fn unverified_kernel_profile() -> CapabilityProfile {
     let supported = CapabilityProfileFixture::supported();
     CapabilityProfile::initial(
         supported.boot_identity().clone(),
+        supported.device_identity().clone(),
         KernelFacts::from_release(Observation::Unavailable),
         supported.selinux().clone(),
         supported.legacy_bridge().clone(),
@@ -109,9 +110,10 @@ fn status_returns_one_coherent_capability_profile_and_control_snapshot() {
             "{\"protocol_version\":3,\"request_id\":8,",
             "\"result\":{\"status\":\"ok\",\"body\":{\"kind\":\"snapshot\",",
             "\"kernel\":{\"status\":\"supported\",\"version\":\"5.10.198\"},",
-            "\"capability_profile\":{\"schema_version\":1,\"revision\":1,",
+            "\"capability_profile\":{\"schema_version\":2,\"revision\":1,",
             "\"boot_identity\":{\"status\":\"verified\",",
             "\"value\":\"01234567-89ab-cdef-0123-456789abcdef\"},",
+            "\"device_identity\":{\"status\":\"unavailable\"},",
             "\"kernel\":{\"release\":{\"status\":\"verified\",",
             "\"value\":\"5.10.198-android12-9-gki\"},",
             "\"version\":{\"status\":\"verified\",\"value\":\"5.10.198\"},",

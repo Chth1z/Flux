@@ -11,7 +11,8 @@ use crate::android_tproxy_topology::{
     StaleAndroidTproxyTopologyScopeReport,
 };
 use crate::capability::{
-    BootIdentity, CapabilityProfile, CapabilityProfileRevision, ObservationKind,
+    BootIdentity, CapabilityProfile, CapabilityProfileRevision, NetworkNamespaceIdentity,
+    ObservationKind,
 };
 use crate::fwmark_audit::{
     FwmarkCandidate, FwmarkEvidenceSource, FwmarkEvidenceState, FwmarkPartialAudit,
@@ -88,36 +89,6 @@ const REMAINING_PRE_MARK_ANDROID_TPROXY_PREREQUISITES: [DeferredAndroidTproxyPre
 ];
 
 static NEXT_COMPLETE_FWMARK_CENSUS_OBSERVATION_ID: AtomicU64 = AtomicU64::new(1);
-
-/// Kernel object identity for one observed network namespace.
-///
-/// Linux namespace file identities are compared as the complete `st_dev`/`st_ino` pair rather
-/// than by a process-local file descriptor or a textual symlink rendering.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct NetworkNamespaceIdentity {
-    device: u64,
-    inode: NonZeroU64,
-}
-
-impl NetworkNamespaceIdentity {
-    #[must_use]
-    pub const fn new(device: u64, inode: u64) -> Option<Self> {
-        match NonZeroU64::new(inode) {
-            Some(inode) => Some(Self { device, inode }),
-            None => None,
-        }
-    }
-
-    #[must_use]
-    pub const fn device(self) -> u64 {
-        self.device
-    }
-
-    #[must_use]
-    pub const fn inode(self) -> u64 {
-        self.inode.get()
-    }
-}
 
 /// Exact nonzero identity of the durable Flux ownership-journal artifact.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -581,6 +552,17 @@ impl AndroidMarkDevicePolicy {
                 observation: capability_profile.boot_identity().kind(),
             });
         }
+        let device_identity = capability_profile.device_identity().verified().ok_or(
+            AndroidMarkDevicePolicyError::UnverifiedDeviceIdentity {
+                observation: capability_profile.device_identity().kind(),
+            },
+        )?;
+        if device_identity.network_namespace() != network_namespace {
+            return Err(AndroidMarkDevicePolicyError::NetworkNamespaceMismatch {
+                profile: device_identity.network_namespace(),
+                observed: network_namespace,
+            });
+        }
 
         let identity =
             AndroidMarkDevicePolicyIdentity::device_qualified_cooperative(name, artifact_digest);
@@ -629,7 +611,16 @@ impl AndroidMarkDevicePolicy {
 pub enum AndroidMarkDevicePolicyError {
     IneligibleCandidate(AndroidMarkCandidateEligibilityError),
     EmptyPlaneGrant,
-    UnverifiedBootIdentity { observation: ObservationKind },
+    UnverifiedBootIdentity {
+        observation: ObservationKind,
+    },
+    UnverifiedDeviceIdentity {
+        observation: ObservationKind,
+    },
+    NetworkNamespaceMismatch {
+        profile: NetworkNamespaceIdentity,
+        observed: NetworkNamespaceIdentity,
+    },
 }
 
 impl fmt::Display for AndroidMarkDevicePolicyError {
@@ -643,6 +634,18 @@ impl fmt::Display for AndroidMarkDevicePolicyError {
                 formatter,
                 "device-qualified Android mark policy requires a verified boot identity, not {observation:?}"
             ),
+            Self::UnverifiedDeviceIdentity { observation } => write!(
+                formatter,
+                "device-qualified Android mark policy requires a verified exact device identity, not {observation:?}"
+            ),
+            Self::NetworkNamespaceMismatch { profile, observed } => write!(
+                formatter,
+                "device-qualified Android mark policy observed network namespace {}:{} but the capability profile binds {}:{}",
+                observed.device(),
+                observed.inode(),
+                profile.device(),
+                profile.inode()
+            ),
         }
     }
 }
@@ -651,7 +654,10 @@ impl Error for AndroidMarkDevicePolicyError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::IneligibleCandidate(error) => Some(error),
-            Self::EmptyPlaneGrant | Self::UnverifiedBootIdentity { .. } => None,
+            Self::EmptyPlaneGrant
+            | Self::UnverifiedBootIdentity { .. }
+            | Self::UnverifiedDeviceIdentity { .. }
+            | Self::NetworkNamespaceMismatch { .. } => None,
         }
     }
 }
@@ -836,6 +842,17 @@ impl CompleteFwmarkCensus {
                 observation: capability_profile.boot_identity().kind(),
             });
         }
+        let device_identity = capability_profile.device_identity().verified().ok_or(
+            CompleteFwmarkCensusError::UnverifiedDeviceIdentity {
+                observation: capability_profile.device_identity().kind(),
+            },
+        )?;
+        if device_identity.network_namespace() != network_namespace {
+            return Err(CompleteFwmarkCensusError::NetworkNamespaceMismatch {
+                profile: device_identity.network_namespace(),
+                observed: network_namespace,
+            });
+        }
         let mut canonical_coverage = Vec::with_capacity(COMPLETE_FWMARK_CENSUS_COVERAGE_RECORDS);
         for record in coverage {
             if canonical_coverage.len() == COMPLETE_FWMARK_CENSUS_COVERAGE_RECORDS {
@@ -1016,6 +1033,13 @@ pub enum CompleteFwmarkCensusError {
     UnverifiedBootIdentity {
         observation: ObservationKind,
     },
+    UnverifiedDeviceIdentity {
+        observation: ObservationKind,
+    },
+    NetworkNamespaceMismatch {
+        profile: NetworkNamespaceIdentity,
+        observed: NetworkNamespaceIdentity,
+    },
     TooManyCoverageRecords {
         maximum: usize,
         required_at_least: usize,
@@ -1054,6 +1078,18 @@ impl fmt::Display for CompleteFwmarkCensusError {
             Self::UnverifiedBootIdentity { observation } => write!(
                 formatter,
                 "complete fwmark census requires a verified boot identity, not {observation:?}"
+            ),
+            Self::UnverifiedDeviceIdentity { observation } => write!(
+                formatter,
+                "complete fwmark census requires a verified exact device identity, not {observation:?}"
+            ),
+            Self::NetworkNamespaceMismatch { profile, observed } => write!(
+                formatter,
+                "complete fwmark census observed network namespace {}:{} but the capability profile binds {}:{}",
+                observed.device(),
+                observed.inode(),
+                profile.device(),
+                profile.inode()
             ),
             Self::TooManyCoverageRecords {
                 maximum,

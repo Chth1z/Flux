@@ -450,6 +450,24 @@ where
         .is_err()
         || writeln!(
             stdout,
+            "device identity: {}",
+            format_observation(capability_profile.device_identity(), |identity| {
+                format!(
+                    "product={} build={} vendor={} patch={} kernel={} namespace={}:{} tools={}",
+                    identity.android_product(),
+                    identity.android_build(),
+                    identity.vendor_build(),
+                    identity.security_patch(),
+                    identity.kernel_build(),
+                    identity.network_namespace().device(),
+                    identity.network_namespace().inode(),
+                    identity.tools().len()
+                )
+            })
+        )
+        .is_err()
+        || writeln!(
+            stdout,
             "SELinux: {}",
             format_observation(capability_profile.selinux(), |mode| {
                 selinux_mode_label(*mode).to_owned()

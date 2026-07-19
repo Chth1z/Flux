@@ -36,6 +36,7 @@ fn system_source_collects_one_read_only_snapshot_without_executing_artifacts() {
         &Observation::Verified(SelinuxMode::Enforcing)
     );
     assert!(profile.boot_identity().verified().is_some());
+    assert_eq!(profile.device_identity(), &Observation::Unavailable);
     assert_eq!(
         profile
             .legacy_bridge()

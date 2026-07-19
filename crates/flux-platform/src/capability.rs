@@ -93,7 +93,16 @@ impl CapabilityProfileSource for SystemCapabilityProfileSource {
             observe_artifact(&self.paths.addrsync),
         );
 
-        CapabilityProfile::initial(boot_identity, kernel, selinux, legacy_bridge)
+        // Exact Android product/build/artifact identity is intentionally not inferred from generic
+        // Linux files or a self-authenticating runtime manifest. A reviewed Android collector will
+        // populate this observation in a later Phase 3 slice.
+        CapabilityProfile::initial(
+            boot_identity,
+            Observation::Unavailable,
+            kernel,
+            selinux,
+            legacy_bridge,
+        )
     }
 }
 

@@ -43,9 +43,9 @@ pub use android_mark_authority::{
     FwmarkCensusCollectorRevision, FwmarkCensusConflict, FwmarkCensusCoverageRecord,
     FwmarkCensusCoverageState, FwmarkPlane, FwmarkPlaneSet, FwmarkUseOperation, FwmarkUseRecord,
     FwmarkUseRecordError, MAX_ANDROID_MARK_DEVICE_POLICY_NAME_BYTES,
-    MAX_COMPLETE_FWMARK_CENSUS_MARK_USES, NetworkNamespaceIdentity,
-    OWNERSHIP_JOURNAL_IDENTITY_BYTES, OwnershipJournalIdentity, OwnershipJournalIdentityError,
-    OwnershipJournalRevision, authorize_android_mark_planning,
+    MAX_COMPLETE_FWMARK_CENSUS_MARK_USES, OWNERSHIP_JOURNAL_IDENTITY_BYTES,
+    OwnershipJournalIdentity, OwnershipJournalIdentityError, OwnershipJournalRevision,
+    authorize_android_mark_planning,
 };
 pub use android_rpdb::{
     AndroidRpdbClassificationReport, AndroidRpdbPlacementPlanError, AndroidRpdbPolicyProfile,
@@ -68,13 +68,19 @@ pub use android_tproxy_topology::{
     assess_android_tproxy_topology_scope,
 };
 pub use capability::{
+    AndroidBuildIdentity, AndroidProductIdentity, ArtifactIdentity, ArtifactIdentityError,
     BootIdentity, BootIdentityMutationStatus, CAPABILITY_PROFILE_SCHEMA_VERSION, CapabilityProfile,
-    CapabilityProfileRevision, CapabilityProfileSource, KernelFacts, KernelMutationStatus,
-    KernelRelease, KernelReleaseError, KernelSupport, KernelVersion, LegacyAddressSynchronization,
-    LegacyArtifactReadiness, LegacyArtifactResolution, LegacyBridgeFacts, LegacyMutationGate,
-    LegacyMutationWriter, LegacyRuleBackend, MAX_BOOT_IDENTITY_BYTES, MAX_KERNEL_RELEASE_BYTES,
-    MIN_SUPPORTED_KERNEL, Observation, ObservationKind, ParseBootIdentityError,
-    ParseBootIdentityErrorKind, ParseKernelVersionError, SelinuxMode,
+    CapabilityProfileRevision, CapabilityProfileSource, DeviceIdentity, DeviceIdentityError,
+    IdentityTextError, IdentityTextErrorKind, KernelBuildIdentity, KernelFacts,
+    KernelMutationStatus, KernelRelease, KernelReleaseError, KernelSupport, KernelVersion,
+    LegacyAddressSynchronization, LegacyArtifactReadiness, LegacyArtifactResolution,
+    LegacyBridgeFacts, LegacyMutationGate, LegacyMutationWriter, LegacyRuleBackend,
+    MAX_BOOT_IDENTITY_BYTES, MAX_DEVICE_IDENTITY_TEXT_BYTES, MAX_DEVICE_TOOL_IDENTITIES,
+    MAX_KERNEL_RELEASE_BYTES, MAX_TOOL_ID_BYTES, MIN_SUPPORTED_KERNEL, NetworkNamespaceIdentity,
+    Observation, ObservationKind, ParseBootIdentityError, ParseBootIdentityErrorKind,
+    ParseKernelVersionError, ReviewedPolicySelector, SHA256_DIGEST_BYTES, SecurityPatchLevel,
+    SelinuxMode, SelinuxPolicyIdentity, Sha256Digest, Sha256DigestError, ToolId,
+    VendorBuildIdentity, VerifiedBootIdentity, VerifiedBootState,
 };
 pub use capture_program::{
     CaptureApplicationMode, CaptureApplicationPolicy, CaptureApplicationPolicyError,

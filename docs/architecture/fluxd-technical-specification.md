@@ -58,7 +58,7 @@ In the delivered Phase 1 bridge, `RuntimeCoordinator` implements `LegacyDispatch
 
 ## 3. Local control socket and Module routing
 
-The control socket is `/data/adb/flux/run/fluxd.sock`, Unix `SOCK_SEQPACKET`, protocol version 3. Version 2 introduced the coherent boot-scoped Capability Profile; version 3 adds a required orthogonal runtime-verification field. Version-1 and version-2 requests are rejected explicitly rather than decoded against the new response shape.
+The control socket is `/data/adb/flux/run/fluxd.sock`, Unix `SOCK_SEQPACKET`, protocol version 3. Version 2 introduced the coherent boot-scoped Capability Profile; version 3 adds a required orthogonal runtime-verification field. The nested Capability Profile has its own schema version and now uses schema 2 for exact device identity. Version-1 and version-2 requests are rejected explicitly rather than decoded against the new response shape.
 
 ### 3.1 Request envelope
 
@@ -444,16 +444,24 @@ enum ProbeAttemptOutcome {
 }
 ```
 
-The target record includes exact device identity, but the delivered `CapabilityProfile` model is
-currently narrower: it binds boot identity, kernel facts, SELinux state, and the legacy bridge, but
-not exact Android product/build/vendor identity or the selected netd/Connectivity artifact. A
-production positive mark-policy loader therefore remains blocked until those facts enter the full
-freshness-bound profile. Production assertions are selected from a compile-time reviewed policy
-catalog keyed by `ReviewedPolicySelector` and an externally reviewed artifact digest/revision. The
-selected assertion is then freshness-bound to the full Capability Profile, verified boot, boot ID,
-and observed network namespace. Runtime-only boot/namespace identities are never literal catalog
-keys. Parsing an arbitrary runtime manifest and hashing its own bytes must not create a
-device-qualified grant.
+Capability Profile schema 2 now includes the exact typed `DeviceIdentity`: Android product/build/
+vendor/security-patch, verified-boot state plus vbmeta digest, kernel build, SELinux-policy, netd,
+Connectivity, a bounded duplicate-free tool-artifact map, and network-namespace identity. Artifact
+identity binds a nonzero SHA-256 digest and nonzero byte length. `ReviewedPolicySelector` derives
+only the stable product/build/kernel/policy/tool catalog key; runtime verified-boot and namespace
+bindings are deliberately excluded from the literal key and are rechecked after selection. Exact
+text identities are bounded printable ASCII, and SELinux policy uses a distinct
+`SelinuxPolicyIdentity` newtype so it cannot be interchanged with netd or Connectivity at a typed
+construction boundary.
+
+The generic system source reports the new exact identity observation as `Unavailable`; it does not
+infer authority from generic Linux files or parse a self-authenticating runtime manifest. A
+production positive mark-policy loader therefore remains blocked until a reviewed Android
+property/artifact collector and compile-time policy catalog populate and select those facts. The
+positive policy factory and complete-census boundary already reject every non-verified identity and
+any mismatch between the separately observed namespace and the full profile. The selected assertion
+is then freshness-bound to the full Capability Profile, verified boot, boot ID, and observed network
+namespace.
 
 `CapabilityStatus` records durable availability. Timeout, interruption, temporary resource
 pressure, and other retryable failures are retained as `ProbeAttemptOutcome` evidence with bounded

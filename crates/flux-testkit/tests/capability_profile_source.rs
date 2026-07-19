@@ -25,3 +25,17 @@ fn fixtures_include_queryable_read_only_profiles() {
         ));
     }
 }
+
+#[test]
+fn device_qualified_fixture_contains_exact_freshness_bound_identity() {
+    let profile = CapabilityProfileFixture::device_qualified();
+    let identity = profile
+        .device_identity()
+        .verified()
+        .expect("device-qualified fixture identity");
+
+    assert_eq!(identity.android_product().as_str(), "google/redfin/redfin");
+    assert_eq!(identity.network_namespace().device(), 10);
+    assert_eq!(identity.network_namespace().inode(), 20);
+    assert_eq!(identity.tools().len(), 1);
+}

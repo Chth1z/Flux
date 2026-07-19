@@ -3,13 +3,15 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use flux_core::{
-    AdministrativeState, BootIdentity, BootIdentityMutationStatus,
-    CAPABILITY_PROFILE_SCHEMA_VERSION, CapabilityProfile, ConfigurationChangeReport, ControlError,
-    ControlService, ControlSnapshot, KernelFacts, KernelMutationStatus, KernelRelease,
-    KernelSupport, KernelVersion, LegacyAddressSynchronization, LegacyArtifactReadiness,
-    LegacyArtifactResolution, LegacyBridgeFacts, LegacyIntent, LegacyMutationGate,
-    LegacyMutationWriter, LegacyRuleBackend, MIN_SUPPORTED_KERNEL, Observation, OperationReport,
-    Reason, SelinuxMode,
+    AdministrativeState, AndroidBuildIdentity, AndroidProductIdentity, ArtifactIdentity,
+    BootIdentity, BootIdentityMutationStatus, CAPABILITY_PROFILE_SCHEMA_VERSION, CapabilityProfile,
+    ConfigurationChangeReport, ControlError, ControlService, ControlSnapshot, DeviceIdentity,
+    KernelBuildIdentity, KernelFacts, KernelMutationStatus, KernelRelease, KernelSupport,
+    KernelVersion, LegacyAddressSynchronization, LegacyArtifactReadiness, LegacyArtifactResolution,
+    LegacyBridgeFacts, LegacyIntent, LegacyMutationGate, LegacyMutationWriter, LegacyRuleBackend,
+    MIN_SUPPORTED_KERNEL, NetworkNamespaceIdentity, Observation, OperationReport, Reason,
+    SecurityPatchLevel, SelinuxMode, SelinuxPolicyIdentity, Sha256Digest, ToolId,
+    VendorBuildIdentity, VerifiedBootIdentity, VerifiedBootState,
 };
 use flux_platform::Uid;
 use serde::{Deserialize, Serialize};
@@ -694,6 +696,7 @@ pub(crate) struct WireCapabilityProfile {
     schema_version: u16,
     revision: u64,
     boot_identity: WireObservation<String>,
+    device_identity: Option<WireObservation<WireDeviceIdentity>>,
     kernel: WireKernelFacts,
     selinux: WireObservation<WireSelinuxMode>,
     legacy_bridge: WireLegacyBridgeFacts,
@@ -705,6 +708,7 @@ impl From<&CapabilityProfile> for WireCapabilityProfile {
             schema_version: profile.schema_version(),
             revision: profile.revision().get(),
             boot_identity: wire_boot_identity(profile.boot_identity()),
+            device_identity: Some(wire_device_identity(profile.device_identity())),
             kernel: WireKernelFacts {
                 release: wire_kernel_release(profile.kernel().release()),
                 version: wire_kernel_version(profile.kernel().version()),
@@ -721,26 +725,42 @@ impl TryFrom<WireCapabilityProfile> for CapabilityProfile {
     type Error = ControlError;
 
     fn try_from(wire: WireCapabilityProfile) -> Result<Self, Self::Error> {
-        if wire.schema_version != CAPABILITY_PROFILE_SCHEMA_VERSION {
+        let WireCapabilityProfile {
+            schema_version,
+            revision,
+            boot_identity,
+            device_identity,
+            kernel,
+            selinux,
+            legacy_bridge,
+        } = wire;
+        if schema_version != CAPABILITY_PROFILE_SCHEMA_VERSION {
             return Err(invalid_capability_profile(format!(
                 "schema version {} is unsupported; expected {CAPABILITY_PROFILE_SCHEMA_VERSION}",
-                wire.schema_version
+                schema_version
             )));
         }
-        let revision = flux_core::CapabilityProfileRevision::new(wire.revision)
+        let revision = flux_core::CapabilityProfileRevision::new(revision)
             .ok_or_else(|| invalid_capability_profile("revision must be nonzero".to_owned()))?;
 
-        let boot_identity = wire.boot_identity.try_map(|value| {
+        let boot_identity = boot_identity.try_map(|value| {
             BootIdentity::parse(&value).map_err(|error| {
                 invalid_capability_profile(format!("invalid boot identity: {error}"))
             })
         })?;
+        let device_identity = device_identity
+            .ok_or_else(|| {
+                invalid_capability_profile(
+                    "schema-2 capability profile is missing device identity".to_owned(),
+                )
+            })?
+            .try_map(DeviceIdentity::try_from)?;
         let WireKernelFacts {
             release,
             version,
             minimum,
             gate,
-        } = wire.kernel;
+        } = kernel;
         let release = release.try_map(|value| {
             KernelRelease::new(value).map_err(|error| {
                 invalid_capability_profile(format!("invalid kernel release: {error}"))
@@ -761,16 +781,223 @@ impl TryFrom<WireCapabilityProfile> for CapabilityProfile {
             )));
         }
 
-        let selinux = wire.selinux.try_map(|mode| Ok(mode.into()))?;
-        let legacy_bridge = wire.legacy_bridge.try_into()?;
-        let profile =
-            CapabilityProfile::new(revision, boot_identity, kernel, selinux, legacy_bridge);
+        let selinux = selinux.try_map(|mode| Ok(mode.into()))?;
+        let legacy_bridge = legacy_bridge.try_into()?;
+        let profile = CapabilityProfile::new(
+            revision,
+            boot_identity,
+            device_identity,
+            kernel,
+            selinux,
+            legacy_bridge,
+        );
         if gate != profile.legacy_mutation_gate().into() {
             return Err(invalid_capability_profile(
                 "reported mutation gate disagrees with kernel and boot observations".to_owned(),
             ));
         }
         Ok(profile)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct WireDeviceIdentity {
+    android_product: String,
+    android_build: String,
+    vendor_build: String,
+    security_patch: String,
+    verified_boot: WireVerifiedBootIdentity,
+    kernel_build: String,
+    selinux_policy: WireArtifactIdentity,
+    netd: WireArtifactIdentity,
+    connectivity: WireArtifactIdentity,
+    tools: Vec<WireToolIdentity>,
+    network_namespace: WireNetworkNamespaceIdentity,
+}
+
+impl From<&DeviceIdentity> for WireDeviceIdentity {
+    fn from(identity: &DeviceIdentity) -> Self {
+        Self {
+            android_product: identity.android_product().as_str().to_owned(),
+            android_build: identity.android_build().as_str().to_owned(),
+            vendor_build: identity.vendor_build().as_str().to_owned(),
+            security_patch: identity.security_patch().as_str().to_owned(),
+            verified_boot: identity.verified_boot().into(),
+            kernel_build: identity.kernel_build().as_str().to_owned(),
+            selinux_policy: identity.selinux_policy().artifact().into(),
+            netd: identity.netd().into(),
+            connectivity: identity.connectivity().into(),
+            tools: identity
+                .tools()
+                .iter()
+                .map(|(id, artifact)| WireToolIdentity {
+                    id: id.as_str().to_owned(),
+                    artifact: (*artifact).into(),
+                })
+                .collect(),
+            network_namespace: identity.network_namespace().into(),
+        }
+    }
+}
+
+impl TryFrom<WireDeviceIdentity> for DeviceIdentity {
+    type Error = ControlError;
+
+    fn try_from(identity: WireDeviceIdentity) -> Result<Self, Self::Error> {
+        let tools = identity
+            .tools
+            .into_iter()
+            .map(|tool| {
+                Ok((
+                    ToolId::new(&tool.id).map_err(|error| {
+                        invalid_capability_profile(format!("invalid tool identity: {error}"))
+                    })?,
+                    tool.artifact.try_into()?,
+                ))
+            })
+            .collect::<Result<Vec<_>, ControlError>>()?;
+        DeviceIdentity::new(
+            AndroidProductIdentity::new(&identity.android_product).map_err(|error| {
+                invalid_capability_profile(format!("invalid Android product identity: {error}"))
+            })?,
+            AndroidBuildIdentity::new(&identity.android_build).map_err(|error| {
+                invalid_capability_profile(format!("invalid Android build identity: {error}"))
+            })?,
+            VendorBuildIdentity::new(&identity.vendor_build).map_err(|error| {
+                invalid_capability_profile(format!("invalid vendor build identity: {error}"))
+            })?,
+            SecurityPatchLevel::new(&identity.security_patch).map_err(|error| {
+                invalid_capability_profile(format!("invalid security patch identity: {error}"))
+            })?,
+            identity.verified_boot.try_into()?,
+            KernelBuildIdentity::new(&identity.kernel_build).map_err(|error| {
+                invalid_capability_profile(format!("invalid kernel build identity: {error}"))
+            })?,
+            SelinuxPolicyIdentity::from(ArtifactIdentity::try_from(identity.selinux_policy)?),
+            identity.netd.try_into()?,
+            identity.connectivity.try_into()?,
+            tools,
+            identity.network_namespace.try_into()?,
+        )
+        .map_err(|error| invalid_capability_profile(format!("invalid device identity: {error}")))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WireVerifiedBootState {
+    Green,
+    Yellow,
+    Orange,
+    Red,
+}
+
+impl From<VerifiedBootState> for WireVerifiedBootState {
+    fn from(state: VerifiedBootState) -> Self {
+        match state {
+            VerifiedBootState::Green => Self::Green,
+            VerifiedBootState::Yellow => Self::Yellow,
+            VerifiedBootState::Orange => Self::Orange,
+            VerifiedBootState::Red => Self::Red,
+        }
+    }
+}
+
+impl From<WireVerifiedBootState> for VerifiedBootState {
+    fn from(state: WireVerifiedBootState) -> Self {
+        match state {
+            WireVerifiedBootState::Green => Self::Green,
+            WireVerifiedBootState::Yellow => Self::Yellow,
+            WireVerifiedBootState::Orange => Self::Orange,
+            WireVerifiedBootState::Red => Self::Red,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct WireVerifiedBootIdentity {
+    state: WireVerifiedBootState,
+    device_locked: bool,
+    vbmeta_sha256: String,
+}
+
+impl From<VerifiedBootIdentity> for WireVerifiedBootIdentity {
+    fn from(identity: VerifiedBootIdentity) -> Self {
+        Self {
+            state: identity.state().into(),
+            device_locked: identity.device_locked(),
+            vbmeta_sha256: encode_digest(identity.vbmeta_digest()),
+        }
+    }
+}
+
+impl TryFrom<WireVerifiedBootIdentity> for VerifiedBootIdentity {
+    type Error = ControlError;
+
+    fn try_from(identity: WireVerifiedBootIdentity) -> Result<Self, Self::Error> {
+        Ok(Self::new(
+            identity.state.into(),
+            identity.device_locked,
+            decode_digest(&identity.vbmeta_sha256, "verified-boot vbmeta digest")?,
+        ))
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct WireArtifactIdentity {
+    sha256: String,
+    size: u64,
+}
+
+impl From<ArtifactIdentity> for WireArtifactIdentity {
+    fn from(identity: ArtifactIdentity) -> Self {
+        Self {
+            sha256: encode_digest(identity.digest()),
+            size: identity.size(),
+        }
+    }
+}
+
+impl TryFrom<WireArtifactIdentity> for ArtifactIdentity {
+    type Error = ControlError;
+
+    fn try_from(identity: WireArtifactIdentity) -> Result<Self, Self::Error> {
+        ArtifactIdentity::new(
+            decode_digest(&identity.sha256, "artifact digest")?,
+            identity.size,
+        )
+        .map_err(|error| invalid_capability_profile(format!("invalid artifact identity: {error}")))
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct WireToolIdentity {
+    id: String,
+    artifact: WireArtifactIdentity,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct WireNetworkNamespaceIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl From<NetworkNamespaceIdentity> for WireNetworkNamespaceIdentity {
+    fn from(identity: NetworkNamespaceIdentity) -> Self {
+        Self {
+            device: identity.device(),
+            inode: identity.inode(),
+        }
+    }
+}
+
+impl TryFrom<WireNetworkNamespaceIdentity> for NetworkNamespaceIdentity {
+    type Error = ControlError;
+
+    fn try_from(identity: WireNetworkNamespaceIdentity) -> Result<Self, Self::Error> {
+        Self::new(identity.device, identity.inode).ok_or_else(|| {
+            invalid_capability_profile("network namespace inode must be nonzero".to_owned())
+        })
     }
 }
 
@@ -1020,6 +1247,43 @@ impl From<BootIdentityMutationStatus> for WireBootIdentityMutationStatus {
 
 fn wire_boot_identity(identity: &Observation<BootIdentity>) -> WireObservation<String> {
     wire_observation(identity, |identity| identity.as_str().to_owned())
+}
+
+fn wire_device_identity(
+    identity: &Observation<DeviceIdentity>,
+) -> WireObservation<WireDeviceIdentity> {
+    wire_observation(identity, |identity| identity.into())
+}
+
+fn encode_digest(digest: Sha256Digest) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(64);
+    for byte in digest.as_bytes() {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
+fn decode_digest(value: &str, field: &'static str) -> Result<Sha256Digest, ControlError> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(invalid_capability_profile(format!(
+            "{field} must be exactly 64 hexadecimal characters"
+        )));
+    }
+    let mut bytes = [0_u8; 32];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        let offset = index * 2;
+        *byte = u8::from_str_radix(&value[offset..offset + 2], 16).map_err(|_| {
+            invalid_capability_profile(format!("{field} contains invalid hexadecimal"))
+        })?;
+    }
+    Sha256Digest::new(bytes)
+        .map_err(|error| invalid_capability_profile(format!("invalid {field}: {error}")))
 }
 
 fn wire_kernel_release(release: &Observation<KernelRelease>) -> WireObservation<String> {
@@ -1644,6 +1908,7 @@ mod tests {
         let profile = CapabilityProfile::new(
             revision,
             initial.boot_identity().clone(),
+            initial.device_identity().clone(),
             initial.kernel().clone(),
             initial.selinux().clone(),
             initial.legacy_bridge().clone(),
@@ -1661,6 +1926,95 @@ mod tests {
         let snapshot = decode_status_response(&response, 92).expect("coherent status");
 
         assert_eq!(snapshot.capability_profile.revision(), revision);
+    }
+
+    #[test]
+    fn status_decoder_round_trips_the_exact_device_identity() {
+        let profile = CapabilityProfileFixture::device_qualified();
+        let response = encode_response(ResponseEnvelope::ok(
+            94,
+            ResponseBody::Snapshot {
+                kernel: profile.kernel_support().map(Into::into),
+                capability_profile: Box::new((&profile).into()),
+                control: (&ControlSnapshot::default()).into(),
+                runtime: WireRuntimeSnapshot::default(),
+            },
+        ));
+
+        let document: serde_json::Value =
+            serde_json::from_slice(&response).expect("encoded status JSON");
+        assert_eq!(
+            document.pointer("/result/body/capability_profile/device_identity"),
+            Some(&serde_json::json!({
+                "status": "verified",
+                "value": {
+                    "android_product": "google/redfin/redfin",
+                    "android_build": "google/redfin/redfin:13/TQ3A.230805.001/1:user/release-keys",
+                    "vendor_build": "google/redfin/redfin:13/TQ3A.230805.001/1:user/release-keys",
+                    "security_patch": "2023-08-05",
+                    "verified_boot": {
+                        "state": "green",
+                        "device_locked": true,
+                        "vbmeta_sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+                    },
+                    "kernel_build": "5.10.198-android13-gki fixture-build",
+                    "selinux_policy": {
+                        "sha256": "2121212121212121212121212121212121212121212121212121212121212121",
+                        "size": 4096
+                    },
+                    "netd": {
+                        "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+                        "size": 8192
+                    },
+                    "connectivity": {
+                        "sha256": "2323232323232323232323232323232323232323232323232323232323232323",
+                        "size": 16384
+                    },
+                    "tools": [{
+                        "id": "fluxd",
+                        "artifact": {
+                            "sha256": "2424242424242424242424242424242424242424242424242424242424242424",
+                            "size": 32768
+                        }
+                    }],
+                    "network_namespace": { "device": 10, "inode": 20 }
+                }
+            }))
+        );
+
+        let snapshot = decode_status_response(&response, 94).expect("coherent exact identity");
+
+        assert_eq!(snapshot.capability_profile, profile);
+    }
+
+    #[test]
+    fn status_decoder_rejects_schema_one_before_requiring_schema_two_fields() {
+        let profile = CapabilityProfileFixture::supported();
+        let response = encode_response(ResponseEnvelope::ok(
+            96,
+            ResponseBody::Snapshot {
+                kernel: profile.kernel_support().map(Into::into),
+                capability_profile: Box::new((&profile).into()),
+                control: (&ControlSnapshot::default()).into(),
+                runtime: WireRuntimeSnapshot::default(),
+            },
+        ));
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&response).expect("encoded status JSON");
+        let capability_profile = document
+            .pointer_mut("/result/body/capability_profile")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("capability profile object");
+        capability_profile.insert("schema_version".to_owned(), serde_json::json!(1));
+        capability_profile.remove("device_identity");
+        let response = serde_json::to_vec(&document).expect("schema-1 status JSON");
+
+        let error = decode_status_response(&response, 96).expect_err("schema 1 is unsupported");
+
+        assert_eq!(
+            error.to_string(),
+            "control protocol: invalid daemon capability profile: schema version 1 is unsupported; expected 2"
+        );
     }
 
     #[test]

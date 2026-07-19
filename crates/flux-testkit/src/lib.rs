@@ -3,8 +3,11 @@
 use std::cell::Cell;
 
 use flux_core::{
-    BootIdentity, CapabilityProfile, CapabilityProfileSource, KernelFacts, KernelRelease,
-    LegacyArtifactReadiness, LegacyArtifactResolution, LegacyBridgeFacts, Observation, SelinuxMode,
+    AndroidBuildIdentity, AndroidProductIdentity, ArtifactIdentity, BootIdentity,
+    CapabilityProfile, CapabilityProfileSource, DeviceIdentity, KernelBuildIdentity, KernelFacts,
+    KernelRelease, LegacyArtifactReadiness, LegacyArtifactResolution, LegacyBridgeFacts,
+    NetworkNamespaceIdentity, Observation, SecurityPatchLevel, SelinuxMode, SelinuxPolicyIdentity,
+    Sha256Digest, ToolId, VendorBuildIdentity, VerifiedBootIdentity, VerifiedBootState,
 };
 use flux_platform::{KernelReleaseSource, PlatformError};
 
@@ -60,21 +63,74 @@ impl CapabilityProfileFixture {
     pub fn unverified_boot() -> CapabilityProfile {
         fixture(Observation::Unavailable, "5.10.198-android12-9-gki")
     }
+
+    #[must_use]
+    pub fn device_qualified() -> CapabilityProfile {
+        fixture_with_device(
+            Observation::Verified(test_boot_identity()),
+            Observation::Verified(test_device_identity()),
+            "5.10.198-android13-gki",
+        )
+    }
 }
 
 fn fixture(boot_identity: Observation<BootIdentity>, release: &str) -> CapabilityProfile {
+    fixture_with_device(boot_identity, Observation::Unavailable, release)
+}
+
+fn fixture_with_device(
+    boot_identity: Observation<BootIdentity>,
+    device_identity: Observation<DeviceIdentity>,
+    release: &str,
+) -> CapabilityProfile {
     let ready = Observation::Verified(LegacyArtifactReadiness::new(
         LegacyArtifactResolution::Direct,
         true,
     ));
     CapabilityProfile::initial(
         boot_identity,
+        device_identity,
         KernelFacts::from_release(Observation::Verified(
             KernelRelease::new(release).expect("fixture kernel release is bounded"),
         )),
         Observation::Verified(SelinuxMode::Enforcing),
         LegacyBridgeFacts::new(ready.clone(), ready.clone(), ready),
     )
+}
+
+fn test_device_identity() -> DeviceIdentity {
+    DeviceIdentity::new(
+        AndroidProductIdentity::new("google/redfin/redfin").expect("product identity"),
+        AndroidBuildIdentity::new("google/redfin/redfin:13/TQ3A.230805.001/1:user/release-keys")
+            .expect("Android build identity"),
+        VendorBuildIdentity::new("google/redfin/redfin:13/TQ3A.230805.001/1:user/release-keys")
+            .expect("vendor build identity"),
+        SecurityPatchLevel::new("2023-08-05").expect("security patch level"),
+        VerifiedBootIdentity::new(
+            VerifiedBootState::Green,
+            true,
+            Sha256Digest::new([0x11; 32]).expect("vbmeta digest"),
+        ),
+        KernelBuildIdentity::new("5.10.198-android13-gki fixture-build")
+            .expect("kernel build identity"),
+        SelinuxPolicyIdentity::from(artifact(0x21, 4_096)),
+        artifact(0x22, 8_192),
+        artifact(0x23, 16_384),
+        [(
+            ToolId::new("fluxd").expect("tool identity"),
+            artifact(0x24, 32_768),
+        )],
+        NetworkNamespaceIdentity::new(10, 20).expect("namespace identity"),
+    )
+    .expect("complete device identity")
+}
+
+fn artifact(byte: u8, size: u64) -> ArtifactIdentity {
+    ArtifactIdentity::new(
+        Sha256Digest::new([byte; 32]).expect("nonzero artifact digest"),
+        size,
+    )
+    .expect("nonempty artifact")
 }
 
 fn test_boot_identity() -> BootIdentity {

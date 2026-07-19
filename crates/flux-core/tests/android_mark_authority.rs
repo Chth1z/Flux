@@ -1,27 +1,30 @@
 use flux_core::{
-    ANDROID_DEVICE_QUALIFIED_CANDIDATE_MASK, AndroidMarkDeviceGrantKind, AndroidMarkDevicePolicy,
-    AndroidMarkDevicePolicyArtifactDigest, AndroidMarkDevicePolicyArtifactDigestError,
-    AndroidMarkDevicePolicyError, AndroidMarkDevicePolicyKind, AndroidMarkDevicePolicyName,
-    AndroidMarkDevicePolicyNameError, AndroidMarkDevicePolicyRevision,
-    AndroidMarkPlanningAuthorizationError, AndroidRpdbClassificationReport,
-    AndroidRpdbPolicyProfile, AndroidTproxyRoutingShape, AndroidTproxyTopologyScopeReport,
-    AndroidTproxyTopologyScopeRequest, AndroidTproxyTrafficDomainRequest, BootIdentity,
+    ANDROID_DEVICE_QUALIFIED_CANDIDATE_MASK, AndroidBuildIdentity, AndroidMarkDeviceGrantKind,
+    AndroidMarkDevicePolicy, AndroidMarkDevicePolicyArtifactDigest,
+    AndroidMarkDevicePolicyArtifactDigestError, AndroidMarkDevicePolicyError,
+    AndroidMarkDevicePolicyKind, AndroidMarkDevicePolicyName, AndroidMarkDevicePolicyNameError,
+    AndroidMarkDevicePolicyRevision, AndroidMarkPlanningAuthorizationError, AndroidProductIdentity,
+    AndroidRpdbClassificationReport, AndroidRpdbPolicyProfile, AndroidTproxyRoutingShape,
+    AndroidTproxyTopologyScopeReport, AndroidTproxyTopologyScopeRequest,
+    AndroidTproxyTrafficDomainRequest, ArtifactIdentity, BootIdentity,
     COMPLETE_FWMARK_CENSUS_COVERAGE_RECORDS, CapabilityProfile, CapabilityProfileRevision,
     CompleteFwmarkCensus, CompleteFwmarkCensusError, DeferredAndroidMarkActivationPrerequisite,
-    DeferredAndroidTproxyPrerequisite, FwmarkCandidate, FwmarkCensusCollectorRevision,
-    FwmarkCensusCoverageRecord, FwmarkCensusCoverageState, FwmarkEvidenceSource,
-    FwmarkEvidenceState, FwmarkPartialAuditOutcome, FwmarkPlane, FwmarkPlaneSet,
-    FwmarkUseOperation, FwmarkUseRecord, FwmarkUseRecordError, InterfaceHardwareType,
-    InterfaceIndex, InterfaceLinkFlags, InterfaceLinkRecord, InterfaceName, KernelFacts,
-    KernelRelease, LegacyAddressSynchronization, LegacyArtifactReadiness, LegacyArtifactResolution,
-    LegacyBridgeFacts, LegacyMutationWriter, LegacyRuleBackend,
-    MAX_ANDROID_MARK_DEVICE_POLICY_NAME_BYTES, MAX_COMPLETE_FWMARK_CENSUS_MARK_USES,
-    NetworkAddressFamily, NetworkInventory, NetworkInventoryTracker, NetworkNamespaceIdentity,
-    NetworkRuleRecord, Observation, OpaqueRuleAttribute, OwnershipJournalIdentity,
-    OwnershipJournalIdentityError, OwnershipJournalRevision, RuleAction, RuleAttributeOpacity,
-    RuleFlags, RuleFwMark, RuleOpaqueAttributeFingerprint, RulePrefix, RulePriority,
-    RuleProperties, RuleProtocol, RuleTableId, SelinuxMode, assess_android_tproxy_topology_scope,
-    authorize_android_mark_planning, classify_android_rpdb,
+    DeferredAndroidTproxyPrerequisite, DeviceIdentity, FwmarkCandidate,
+    FwmarkCensusCollectorRevision, FwmarkCensusCoverageRecord, FwmarkCensusCoverageState,
+    FwmarkEvidenceSource, FwmarkEvidenceState, FwmarkPartialAuditOutcome, FwmarkPlane,
+    FwmarkPlaneSet, FwmarkUseOperation, FwmarkUseRecord, FwmarkUseRecordError,
+    InterfaceHardwareType, InterfaceIndex, InterfaceLinkFlags, InterfaceLinkRecord, InterfaceName,
+    KernelBuildIdentity, KernelFacts, KernelRelease, LegacyAddressSynchronization,
+    LegacyArtifactReadiness, LegacyArtifactResolution, LegacyBridgeFacts, LegacyMutationWriter,
+    LegacyRuleBackend, MAX_ANDROID_MARK_DEVICE_POLICY_NAME_BYTES,
+    MAX_COMPLETE_FWMARK_CENSUS_MARK_USES, NetworkAddressFamily, NetworkInventory,
+    NetworkInventoryTracker, NetworkNamespaceIdentity, NetworkRuleRecord, Observation,
+    OpaqueRuleAttribute, OwnershipJournalIdentity, OwnershipJournalIdentityError,
+    OwnershipJournalRevision, RuleAction, RuleAttributeOpacity, RuleFlags, RuleFwMark,
+    RuleOpaqueAttributeFingerprint, RulePrefix, RulePriority, RuleProperties, RuleProtocol,
+    RuleTableId, SecurityPatchLevel, SelinuxMode, SelinuxPolicyIdentity, Sha256Digest, ToolId,
+    VendorBuildIdentity, VerifiedBootIdentity, VerifiedBootState,
+    assess_android_tproxy_topology_scope, authorize_android_mark_planning, classify_android_rpdb,
 };
 
 const NET_ID_MASK: u32 = 0x0000_ffff;
@@ -100,6 +103,73 @@ fn generic_aosp_is_always_a_zero_grant() {
         error,
         AndroidMarkPlanningAuthorizationError::NoPositiveDeviceGrant {
             policy_kind: AndroidMarkDevicePolicyKind::GenericAospNoGrant,
+        }
+    );
+}
+
+#[test]
+fn positive_policy_and_census_require_exact_namespace_consistent_device_identity() {
+    let context = TestContext::standard();
+    let unavailable = CapabilityProfile::new(
+        context.capability_profile.revision(),
+        context.capability_profile.boot_identity().clone(),
+        Observation::Unavailable,
+        context.capability_profile.kernel().clone(),
+        context.capability_profile.selinux().clone(),
+        context.capability_profile.legacy_bridge().clone(),
+    );
+    assert!(matches!(
+        cooperative_policy(
+            "missing-device-identity",
+            [0x31; 32],
+            AndroidMarkDevicePolicyRevision::INITIAL,
+            context.candidate,
+            &context.topology_scope,
+            &unavailable,
+            context.network_namespace,
+            FwmarkPlaneSet::ALL,
+        )
+        .expect_err("a boot ID alone cannot mint a device-qualified grant"),
+        AndroidMarkDevicePolicyError::UnverifiedDeviceIdentity { .. }
+    ));
+    assert!(matches!(
+        census_with(
+            &context.inventory,
+            &unavailable,
+            context.network_namespace,
+            &AndroidMarkDevicePolicy::generic_aosp(),
+            context.collector_revision,
+            context.ownership_journal_identity,
+            context.ownership_journal_revision,
+            complete_absent_coverage(),
+            [],
+        )
+        .expect_err("a census cannot self-assert missing exact device facts"),
+        CompleteFwmarkCensusError::UnverifiedDeviceIdentity { .. }
+    ));
+
+    let profile_namespace = namespace(11, 20);
+    let mismatched = verified_capability_profile(
+        context.capability_profile.revision(),
+        "01234567-89ab-cdef-0123-456789abcdef",
+        SelinuxMode::Enforcing,
+        profile_namespace,
+    );
+    assert_eq!(
+        cooperative_policy(
+            "namespace-mismatch",
+            [0x32; 32],
+            AndroidMarkDevicePolicyRevision::INITIAL,
+            context.candidate,
+            &context.topology_scope,
+            &mismatched,
+            context.network_namespace,
+            FwmarkPlaneSet::ALL,
+        )
+        .expect_err("the separate observation must match the full profile"),
+        AndroidMarkDevicePolicyError::NetworkNamespaceMismatch {
+            profile: profile_namespace,
+            observed: context.network_namespace,
         }
     );
 }
@@ -559,6 +629,7 @@ fn opaque_rpdb_evidence_rejects_even_when_the_census_claims_complete_coverage() 
         CapabilityProfileRevision::INITIAL,
         "01234567-89ab-cdef-0123-456789abcdef",
         SelinuxMode::Enforcing,
+        namespace(10, 20),
     );
     let network_namespace = namespace(10, 20);
     let policy = cooperative_policy(
@@ -633,6 +704,7 @@ fn census_conflict_precedes_an_otherwise_incomplete_topology_scope() {
         CapabilityProfileRevision::INITIAL,
         "01234567-89ab-cdef-0123-456789abcdef",
         SelinuxMode::Enforcing,
+        namespace(10, 20),
     );
     let network_namespace = namespace(10, 20);
     let policy = cooperative_policy(
@@ -764,6 +836,7 @@ fn candidate_and_exact_topology_scope_are_bound_by_the_positive_grant() {
         CapabilityProfileRevision::INITIAL,
         "01234567-89ab-cdef-0123-456789abcdef",
         SelinuxMode::Enforcing,
+        namespace(10, 20),
     );
     let network_namespace = namespace(10, 20);
     let policy = cooperative_policy(
@@ -819,6 +892,7 @@ fn grant_binds_boot_namespace_and_full_capability_facts_not_only_revision() {
         context.capability_profile.revision(),
         "fedcba98-7654-3210-fedc-ba9876543210",
         SelinuxMode::Enforcing,
+        context.network_namespace,
     );
     let boot_census = census_with(
         &context.inventory,
@@ -851,9 +925,15 @@ fn grant_binds_boot_namespace_and_full_capability_facts_not_only_revision() {
     );
 
     for different_namespace in [namespace(10, 21), namespace(11, 20)] {
+        let different_namespace_profile = verified_capability_profile(
+            context.capability_profile.revision(),
+            "01234567-89ab-cdef-0123-456789abcdef",
+            SelinuxMode::Enforcing,
+            different_namespace,
+        );
         let namespace_census = census_with(
             &context.inventory,
-            &context.capability_profile,
+            &different_namespace_profile,
             different_namespace,
             &context.policy,
             context.collector_revision,
@@ -868,7 +948,7 @@ fn grant_binds_boot_namespace_and_full_capability_facts_not_only_revision() {
                 &context.inventory,
                 &context.classification,
                 &context.topology_scope,
-                &context.capability_profile,
+                &different_namespace_profile,
                 different_namespace,
                 context.ownership_journal_identity,
                 context.ownership_journal_revision,
@@ -889,6 +969,7 @@ fn grant_binds_boot_namespace_and_full_capability_facts_not_only_revision() {
         context.capability_profile.revision(),
         "01234567-89ab-cdef-0123-456789abcdef",
         SelinuxMode::Permissive,
+        context.network_namespace,
     );
     let capability_census = census_with(
         &context.inventory,
@@ -999,6 +1080,7 @@ fn census_binds_inventory_boot_namespace_and_full_capability_profile() {
         context.capability_profile.revision(),
         "fedcba98-7654-3210-fedc-ba9876543210",
         SelinuxMode::Enforcing,
+        context.network_namespace,
     );
     let boot_census = census_with(
         &context.inventory,
@@ -1020,9 +1102,15 @@ fn census_binds_inventory_boot_namespace_and_full_capability_profile() {
     );
 
     let different_namespace = namespace(11, 20);
+    let different_namespace_profile = verified_capability_profile(
+        context.capability_profile.revision(),
+        "01234567-89ab-cdef-0123-456789abcdef",
+        SelinuxMode::Enforcing,
+        different_namespace,
+    );
     let namespace_census = census_with(
         &context.inventory,
-        &context.capability_profile,
+        &different_namespace_profile,
         different_namespace,
         &context.policy,
         context.collector_revision,
@@ -1046,6 +1134,7 @@ fn census_binds_inventory_boot_namespace_and_full_capability_profile() {
         context.capability_profile.revision(),
         "01234567-89ab-cdef-0123-456789abcdef",
         SelinuxMode::Permissive,
+        context.network_namespace,
     );
     let capability_census = census_with(
         &context.inventory,
@@ -1437,6 +1526,7 @@ fn census_rejects_unverified_boot_identity_at_its_trust_boundary() {
     let unverified = CapabilityProfile::new(
         CapabilityProfileRevision::INITIAL,
         Observation::Absent,
+        Observation::Verified(verified_device_identity(namespace(10, 20))),
         KernelFacts::from_release(Observation::Verified(
             KernelRelease::new("5.10.198-android13-gki").expect("kernel release"),
         )),
@@ -1480,12 +1570,13 @@ impl TestContext {
         let classification =
             classify_android_rpdb(&inventory, AndroidRpdbPolicyProfile::AospAndroid13R1);
         let topology_scope = local_scope(&inventory, &classification);
+        let network_namespace = namespace(10, 20);
         let capability_profile = verified_capability_profile(
             CapabilityProfileRevision::INITIAL,
             "01234567-89ab-cdef-0123-456789abcdef",
             SelinuxMode::Enforcing,
+            network_namespace,
         );
-        let network_namespace = namespace(10, 20);
         let candidate = candidate();
         let policy = cooperative_policy(
             "synthetic-cooperative-policy",
@@ -1667,10 +1758,12 @@ fn verified_capability_profile(
     revision: CapabilityProfileRevision,
     boot_identity: &str,
     selinux: SelinuxMode,
+    network_namespace: NetworkNamespaceIdentity,
 ) -> CapabilityProfile {
     CapabilityProfile::new(
         revision,
         Observation::Verified(BootIdentity::parse(boot_identity).expect("valid boot identity")),
+        Observation::Verified(verified_device_identity(network_namespace)),
         KernelFacts::from_release(Observation::Verified(
             KernelRelease::new("5.10.198-android13-gki").expect("bounded kernel release"),
         )),
@@ -1696,6 +1789,41 @@ fn ready_legacy_bridge() -> LegacyBridgeFacts {
 
 fn namespace(device: u64, inode: u64) -> NetworkNamespaceIdentity {
     NetworkNamespaceIdentity::new(device, inode).expect("nonzero namespace inode")
+}
+
+fn verified_device_identity(network_namespace: NetworkNamespaceIdentity) -> DeviceIdentity {
+    DeviceIdentity::new(
+        AndroidProductIdentity::new("google/redfin/redfin").expect("product identity"),
+        AndroidBuildIdentity::new("google/redfin/redfin:13/TQ3A.230805.001/1:user/release-keys")
+            .expect("Android build identity"),
+        VendorBuildIdentity::new("google/redfin/redfin:13/TQ3A.230805.001/1:user/release-keys")
+            .expect("vendor build identity"),
+        SecurityPatchLevel::new("2023-08-05").expect("security patch level"),
+        VerifiedBootIdentity::new(
+            VerifiedBootState::Green,
+            true,
+            Sha256Digest::new([0x11; 32]).expect("vbmeta digest"),
+        ),
+        KernelBuildIdentity::new("5.10.198-android13-gki synthetic-build")
+            .expect("kernel build identity"),
+        SelinuxPolicyIdentity::from(artifact(0x21, 4_096)),
+        artifact(0x22, 8_192),
+        artifact(0x23, 16_384),
+        [(
+            ToolId::new("fluxd").expect("tool identity"),
+            artifact(0x24, 32_768),
+        )],
+        network_namespace,
+    )
+    .expect("complete device identity")
+}
+
+fn artifact(byte: u8, size: u64) -> ArtifactIdentity {
+    ArtifactIdentity::new(
+        Sha256Digest::new([byte; 32]).expect("nonzero artifact digest"),
+        size,
+    )
+    .expect("nonempty artifact")
 }
 
 fn journal_identity(byte: u8) -> OwnershipJournalIdentity {

@@ -4,6 +4,23 @@ All notable changes to the Flux project will be documented in this file.
 
 ## [Unreleased]
 
+### Exact Android device identity
+- Bumped the boot-scoped Capability Profile to schema 2 and added typed exact Android product,
+  build, vendor, security-patch, verified-boot/vbmeta, kernel-build, SELinux-policy, netd,
+  Connectivity, bounded tool-artifact, and network-namespace identities. Artifact identities bind a
+  nonzero SHA-256 digest and byte length; exact text is bounded printable ASCII; tool identities are
+  canonical, bounded, and duplicate-free. SELinux policy has a distinct domain type so adjacent
+  artifact arguments cannot be swapped accidentally.
+- Added a stable `ReviewedPolicySelector` that excludes runtime-only verified-boot and namespace
+  bindings from compile-time catalog keys while retaining every stable product/build/kernel/policy/
+  tool artifact identity. Capability status JSON round-trips the full schema; text status reports
+  exact-identity availability.
+- Tightened Android mark-policy and complete-census trust boundaries: a boot UUID alone can no
+  longer mint device-qualified evidence, and the separately observed network namespace must match
+  the full Capability Profile. The generic system collector intentionally reports exact device
+  identity as unavailable until a reviewed Android property/artifact collector exists; legacy
+  mutation admission remains based only on the existing kernel-floor and boot-identity gate.
+
 ### Rewrite release policy
 - Established the pre-release Rust-only release gate in ADR-0011. Bridge, shadow, parity, and
   migration checkpoints are development-only; obsolete internal compatibility may be broken to

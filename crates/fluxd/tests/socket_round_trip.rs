@@ -68,6 +68,7 @@ fn seqpacket_status_preserves_the_capability_profile_revision() {
     let profile = CapabilityProfile::new(
         revision,
         initial.boot_identity().clone(),
+        initial.device_identity().clone(),
         initial.kernel().clone(),
         initial.selinux().clone(),
         initial.legacy_bridge().clone(),

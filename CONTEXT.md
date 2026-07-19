@@ -153,7 +153,11 @@ A period during which the Android network topology relevant to Flux is stable; a
 _Avoid_: Interface event, resync window
 
 **Capability Profile**:
-Verified facts about what the current device permits Flux to use, distinct from what its kernel version or configuration merely claims to support.
+Freshness-bound facts about what the current device permits Flux to use, distinct from what its
+kernel version or configuration merely claims to support. Schema 2 can retain exact Android
+product/build/vendor/security-patch, verified-boot/vbmeta, kernel-build, SELinux-policy,
+netd/Connectivity, tool-artifact, boot, and network-namespace identity; an unavailable observation
+cannot authorize a device-qualified mark policy.
 _Avoid_: Kernel flags, device preset
 
 **Engine Capability Profile**:

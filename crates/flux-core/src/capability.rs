@@ -1,10 +1,16 @@
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
+use std::num::NonZeroU64;
 
-pub const CAPABILITY_PROFILE_SCHEMA_VERSION: u16 = 1;
+pub const CAPABILITY_PROFILE_SCHEMA_VERSION: u16 = 2;
 pub const MIN_SUPPORTED_KERNEL: KernelVersion = KernelVersion::new(5, 10, 0);
 pub const MAX_BOOT_IDENTITY_BYTES: usize = 128;
 pub const MAX_KERNEL_RELEASE_BYTES: usize = 256;
+pub const MAX_DEVICE_IDENTITY_TEXT_BYTES: usize = 1_024;
+pub const MAX_TOOL_ID_BYTES: usize = 128;
+pub const MAX_DEVICE_TOOL_IDENTITIES: usize = 32;
+pub const SHA256_DIGEST_BYTES: usize = 32;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ObservationKind {
@@ -93,6 +99,7 @@ pub struct CapabilityProfile {
     schema_version: u16,
     revision: CapabilityProfileRevision,
     boot_identity: Observation<BootIdentity>,
+    device_identity: Observation<DeviceIdentity>,
     kernel: KernelFacts,
     selinux: Observation<SelinuxMode>,
     legacy_bridge: LegacyBridgeFacts,
@@ -102,6 +109,7 @@ impl CapabilityProfile {
     #[must_use]
     pub const fn initial(
         boot_identity: Observation<BootIdentity>,
+        device_identity: Observation<DeviceIdentity>,
         kernel: KernelFacts,
         selinux: Observation<SelinuxMode>,
         legacy_bridge: LegacyBridgeFacts,
@@ -109,6 +117,7 @@ impl CapabilityProfile {
         Self::new(
             CapabilityProfileRevision::INITIAL,
             boot_identity,
+            device_identity,
             kernel,
             selinux,
             legacy_bridge,
@@ -119,6 +128,7 @@ impl CapabilityProfile {
     pub const fn new(
         revision: CapabilityProfileRevision,
         boot_identity: Observation<BootIdentity>,
+        device_identity: Observation<DeviceIdentity>,
         kernel: KernelFacts,
         selinux: Observation<SelinuxMode>,
         legacy_bridge: LegacyBridgeFacts,
@@ -127,6 +137,7 @@ impl CapabilityProfile {
             schema_version: CAPABILITY_PROFILE_SCHEMA_VERSION,
             revision,
             boot_identity,
+            device_identity,
             kernel,
             selinux,
             legacy_bridge,
@@ -146,6 +157,11 @@ impl CapabilityProfile {
     #[must_use]
     pub const fn boot_identity(&self) -> &Observation<BootIdentity> {
         &self.boot_identity
+    }
+
+    #[must_use]
+    pub const fn device_identity(&self) -> &Observation<DeviceIdentity> {
+        &self.device_identity
     }
 
     #[must_use]
@@ -302,6 +318,658 @@ impl fmt::Display for ParseBootIdentityError {
 }
 
 impl Error for ParseBootIdentityError {}
+
+macro_rules! bounded_identity_text {
+    ($name:ident, $label:literal, $maximum:expr) => {
+        #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+        pub struct $name(Box<str>);
+
+        impl $name {
+            pub fn new(value: &str) -> Result<Self, IdentityTextError> {
+                if value.is_empty() {
+                    return Err(IdentityTextError::new($label, IdentityTextErrorKind::Empty));
+                }
+                if value.len() > $maximum {
+                    return Err(IdentityTextError::new(
+                        $label,
+                        IdentityTextErrorKind::TooLong {
+                            maximum: $maximum,
+                            actual: value.len(),
+                        },
+                    ));
+                }
+                if value.trim() != value {
+                    return Err(IdentityTextError::new(
+                        $label,
+                        IdentityTextErrorKind::InvalidFormat,
+                    ));
+                }
+                if value.chars().any(char::is_control) {
+                    return Err(IdentityTextError::new(
+                        $label,
+                        IdentityTextErrorKind::ControlCharacter,
+                    ));
+                }
+                if !value.is_ascii() {
+                    return Err(IdentityTextError::new(
+                        $label,
+                        IdentityTextErrorKind::InvalidFormat,
+                    ));
+                }
+                Ok(Self(value.into()))
+            }
+
+            #[must_use]
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str(&self.0)
+            }
+        }
+    };
+}
+
+bounded_identity_text!(
+    AndroidProductIdentity,
+    "Android product identity",
+    MAX_DEVICE_IDENTITY_TEXT_BYTES
+);
+bounded_identity_text!(
+    AndroidBuildIdentity,
+    "Android build identity",
+    MAX_DEVICE_IDENTITY_TEXT_BYTES
+);
+bounded_identity_text!(
+    VendorBuildIdentity,
+    "vendor build identity",
+    MAX_DEVICE_IDENTITY_TEXT_BYTES
+);
+bounded_identity_text!(
+    KernelBuildIdentity,
+    "kernel build identity",
+    MAX_DEVICE_IDENTITY_TEXT_BYTES
+);
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ToolId(Box<str>);
+
+impl ToolId {
+    pub fn new(value: &str) -> Result<Self, IdentityTextError> {
+        if value.is_empty() {
+            return Err(IdentityTextError::new(
+                "tool identity",
+                IdentityTextErrorKind::Empty,
+            ));
+        }
+        if value.len() > MAX_TOOL_ID_BYTES {
+            return Err(IdentityTextError::new(
+                "tool identity",
+                IdentityTextErrorKind::TooLong {
+                    maximum: MAX_TOOL_ID_BYTES,
+                    actual: value.len(),
+                },
+            ));
+        }
+        let mut bytes = value.bytes();
+        if !bytes
+            .next()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+            || !bytes.all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'.' | b'_' | b'-')
+            })
+        {
+            return Err(IdentityTextError::new(
+                "tool identity",
+                IdentityTextErrorKind::InvalidFormat,
+            ));
+        }
+        Ok(Self(value.into()))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ToolId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct SecurityPatchLevel(Box<str>);
+
+impl SecurityPatchLevel {
+    pub fn new(value: &str) -> Result<Self, IdentityTextError> {
+        if value.is_empty() {
+            return Err(IdentityTextError::new(
+                "Android security patch level",
+                IdentityTextErrorKind::Empty,
+            ));
+        }
+        if !is_valid_security_patch_level(value) {
+            return Err(IdentityTextError::new(
+                "Android security patch level",
+                IdentityTextErrorKind::InvalidFormat,
+            ));
+        }
+        Ok(Self(value.into()))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for SecurityPatchLevel {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+fn is_valid_security_patch_level(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 10
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes
+            .iter()
+            .enumerate()
+            .any(|(index, byte)| !matches!(index, 4 | 7) && !byte.is_ascii_digit())
+    {
+        return false;
+    }
+    let year = parse_decimal(&bytes[0..4]);
+    let month = parse_decimal(&bytes[5..7]);
+    let day = parse_decimal(&bytes[8..10]);
+    let maximum_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => return false,
+    };
+    year != 0 && (1..=maximum_day).contains(&day)
+}
+
+fn parse_decimal(bytes: &[u8]) -> u32 {
+    bytes
+        .iter()
+        .fold(0_u32, |value, byte| value * 10 + u32::from(byte - b'0'))
+}
+
+const fn is_leap_year(year: u32) -> bool {
+    year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IdentityTextErrorKind {
+    Empty,
+    TooLong { maximum: usize, actual: usize },
+    ControlCharacter,
+    InvalidFormat,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IdentityTextError {
+    field: &'static str,
+    kind: IdentityTextErrorKind,
+}
+
+impl IdentityTextError {
+    const fn new(field: &'static str, kind: IdentityTextErrorKind) -> Self {
+        Self { field, kind }
+    }
+
+    #[must_use]
+    pub const fn field(self) -> &'static str {
+        self.field
+    }
+
+    #[must_use]
+    pub const fn kind(self) -> IdentityTextErrorKind {
+        self.kind
+    }
+}
+
+impl fmt::Display for IdentityTextError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.kind {
+            IdentityTextErrorKind::Empty => write!(formatter, "{} is empty", self.field),
+            IdentityTextErrorKind::TooLong { maximum, actual } => write!(
+                formatter,
+                "{} is {actual} bytes but its limit is {maximum}",
+                self.field
+            ),
+            IdentityTextErrorKind::ControlCharacter => {
+                write!(formatter, "{} contains a control character", self.field)
+            }
+            IdentityTextErrorKind::InvalidFormat => {
+                write!(formatter, "{} has an invalid format", self.field)
+            }
+        }
+    }
+}
+
+impl Error for IdentityTextError {}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct Sha256Digest([u8; SHA256_DIGEST_BYTES]);
+
+impl Sha256Digest {
+    pub const fn new(bytes: [u8; SHA256_DIGEST_BYTES]) -> Result<Self, Sha256DigestError> {
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] != 0 {
+                return Ok(Self(bytes));
+            }
+            index += 1;
+        }
+        Err(Sha256DigestError::AllZero)
+    }
+
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; SHA256_DIGEST_BYTES] {
+        &self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Sha256DigestError {
+    AllZero,
+}
+
+impl fmt::Display for Sha256DigestError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SHA-256 identity digest is all zero")
+    }
+}
+
+impl Error for Sha256DigestError {}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ArtifactIdentity {
+    digest: Sha256Digest,
+    size: NonZeroU64,
+}
+
+impl ArtifactIdentity {
+    pub const fn new(digest: Sha256Digest, size: u64) -> Result<Self, ArtifactIdentityError> {
+        match NonZeroU64::new(size) {
+            Some(size) => Ok(Self { digest, size }),
+            None => Err(ArtifactIdentityError::EmptyArtifact),
+        }
+    }
+
+    #[must_use]
+    pub const fn digest(self) -> Sha256Digest {
+        self.digest
+    }
+
+    #[must_use]
+    pub const fn size(self) -> u64 {
+        self.size.get()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArtifactIdentityError {
+    EmptyArtifact,
+}
+
+impl fmt::Display for ArtifactIdentityError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("artifact identity has zero size")
+    }
+}
+
+impl Error for ArtifactIdentityError {}
+
+/// Exact identity of the loaded SELinux policy artifact.
+///
+/// This remains a distinct domain type so a netd or Connectivity artifact cannot be passed in its
+/// place accidentally at a reviewed-policy boundary.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct SelinuxPolicyIdentity(ArtifactIdentity);
+
+impl SelinuxPolicyIdentity {
+    pub const fn new(digest: Sha256Digest, size: u64) -> Result<Self, ArtifactIdentityError> {
+        match ArtifactIdentity::new(digest, size) {
+            Ok(identity) => Ok(Self(identity)),
+            Err(error) => Err(error),
+        }
+    }
+
+    #[must_use]
+    pub const fn artifact(self) -> ArtifactIdentity {
+        self.0
+    }
+
+    #[must_use]
+    pub const fn digest(self) -> Sha256Digest {
+        self.0.digest()
+    }
+
+    #[must_use]
+    pub const fn size(self) -> u64 {
+        self.0.size()
+    }
+}
+
+impl From<ArtifactIdentity> for SelinuxPolicyIdentity {
+    fn from(identity: ArtifactIdentity) -> Self {
+        Self(identity)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum VerifiedBootState {
+    Green,
+    Yellow,
+    Orange,
+    Red,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct VerifiedBootIdentity {
+    state: VerifiedBootState,
+    device_locked: bool,
+    vbmeta_digest: Sha256Digest,
+}
+
+impl VerifiedBootIdentity {
+    #[must_use]
+    pub const fn new(
+        state: VerifiedBootState,
+        device_locked: bool,
+        vbmeta_digest: Sha256Digest,
+    ) -> Self {
+        Self {
+            state,
+            device_locked,
+            vbmeta_digest,
+        }
+    }
+
+    #[must_use]
+    pub const fn state(self) -> VerifiedBootState {
+        self.state
+    }
+
+    #[must_use]
+    pub const fn device_locked(self) -> bool {
+        self.device_locked
+    }
+
+    #[must_use]
+    pub const fn vbmeta_digest(self) -> Sha256Digest {
+        self.vbmeta_digest
+    }
+}
+
+/// Kernel object identity for one observed network namespace.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct NetworkNamespaceIdentity {
+    device: u64,
+    inode: NonZeroU64,
+}
+
+impl NetworkNamespaceIdentity {
+    #[must_use]
+    pub const fn new(device: u64, inode: u64) -> Option<Self> {
+        match NonZeroU64::new(inode) {
+            Some(inode) => Some(Self { device, inode }),
+            None => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn device(self) -> u64 {
+        self.device
+    }
+
+    #[must_use]
+    pub const fn inode(self) -> u64 {
+        self.inode.get()
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct DeviceIdentity {
+    android_product: AndroidProductIdentity,
+    android_build: AndroidBuildIdentity,
+    vendor_build: VendorBuildIdentity,
+    security_patch: SecurityPatchLevel,
+    verified_boot: VerifiedBootIdentity,
+    kernel_build: KernelBuildIdentity,
+    selinux_policy: SelinuxPolicyIdentity,
+    netd: ArtifactIdentity,
+    connectivity: ArtifactIdentity,
+    tools: BTreeMap<ToolId, ArtifactIdentity>,
+    network_namespace: NetworkNamespaceIdentity,
+}
+
+impl DeviceIdentity {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        android_product: AndroidProductIdentity,
+        android_build: AndroidBuildIdentity,
+        vendor_build: VendorBuildIdentity,
+        security_patch: SecurityPatchLevel,
+        verified_boot: VerifiedBootIdentity,
+        kernel_build: KernelBuildIdentity,
+        selinux_policy: SelinuxPolicyIdentity,
+        netd: ArtifactIdentity,
+        connectivity: ArtifactIdentity,
+        tools: impl IntoIterator<Item = (ToolId, ArtifactIdentity)>,
+        network_namespace: NetworkNamespaceIdentity,
+    ) -> Result<Self, DeviceIdentityError> {
+        let mut canonical_tools = BTreeMap::new();
+        for (tool, identity) in tools {
+            if canonical_tools.contains_key(&tool) {
+                return Err(DeviceIdentityError::DuplicateTool { tool });
+            }
+            if canonical_tools.len() == MAX_DEVICE_TOOL_IDENTITIES {
+                return Err(DeviceIdentityError::TooManyTools {
+                    maximum: MAX_DEVICE_TOOL_IDENTITIES,
+                    required_at_least: MAX_DEVICE_TOOL_IDENTITIES + 1,
+                });
+            }
+            canonical_tools.insert(tool, identity);
+        }
+        if canonical_tools.is_empty() {
+            return Err(DeviceIdentityError::NoTools);
+        }
+        Ok(Self {
+            android_product,
+            android_build,
+            vendor_build,
+            security_patch,
+            verified_boot,
+            kernel_build,
+            selinux_policy,
+            netd,
+            connectivity,
+            tools: canonical_tools,
+            network_namespace,
+        })
+    }
+
+    #[must_use]
+    pub const fn android_product(&self) -> &AndroidProductIdentity {
+        &self.android_product
+    }
+
+    #[must_use]
+    pub const fn android_build(&self) -> &AndroidBuildIdentity {
+        &self.android_build
+    }
+
+    #[must_use]
+    pub const fn vendor_build(&self) -> &VendorBuildIdentity {
+        &self.vendor_build
+    }
+
+    #[must_use]
+    pub const fn security_patch(&self) -> &SecurityPatchLevel {
+        &self.security_patch
+    }
+
+    #[must_use]
+    pub const fn verified_boot(&self) -> VerifiedBootIdentity {
+        self.verified_boot
+    }
+
+    #[must_use]
+    pub const fn kernel_build(&self) -> &KernelBuildIdentity {
+        &self.kernel_build
+    }
+
+    #[must_use]
+    pub const fn selinux_policy(&self) -> SelinuxPolicyIdentity {
+        self.selinux_policy
+    }
+
+    #[must_use]
+    pub const fn netd(&self) -> ArtifactIdentity {
+        self.netd
+    }
+
+    #[must_use]
+    pub const fn connectivity(&self) -> ArtifactIdentity {
+        self.connectivity
+    }
+
+    #[must_use]
+    pub const fn tools(&self) -> &BTreeMap<ToolId, ArtifactIdentity> {
+        &self.tools
+    }
+
+    #[must_use]
+    pub const fn network_namespace(&self) -> NetworkNamespaceIdentity {
+        self.network_namespace
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DeviceIdentityError {
+    NoTools,
+    TooManyTools {
+        maximum: usize,
+        required_at_least: usize,
+    },
+    DuplicateTool {
+        tool: ToolId,
+    },
+}
+
+impl fmt::Display for DeviceIdentityError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoTools => formatter.write_str("device identity contains no tool artifacts"),
+            Self::TooManyTools {
+                maximum,
+                required_at_least,
+            } => write!(
+                formatter,
+                "device identity contains at least {required_at_least} tool artifacts but its limit is {maximum}"
+            ),
+            Self::DuplicateTool { tool } => {
+                write!(formatter, "device identity repeats tool {tool}")
+            }
+        }
+    }
+}
+
+impl Error for DeviceIdentityError {}
+
+/// Stable catalog key derived from an exact device identity.
+///
+/// Boot state and network namespace are deliberately excluded: they freshness-bind a selected
+/// assertion but are not compile-time catalog keys.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ReviewedPolicySelector {
+    android_product: AndroidProductIdentity,
+    android_build: AndroidBuildIdentity,
+    vendor_build: VendorBuildIdentity,
+    security_patch: SecurityPatchLevel,
+    kernel_build: KernelBuildIdentity,
+    selinux_policy: SelinuxPolicyIdentity,
+    netd: ArtifactIdentity,
+    connectivity: ArtifactIdentity,
+    tools: BTreeMap<ToolId, ArtifactIdentity>,
+}
+
+impl ReviewedPolicySelector {
+    #[must_use]
+    pub fn from_device_identity(identity: &DeviceIdentity) -> Self {
+        Self {
+            android_product: identity.android_product.clone(),
+            android_build: identity.android_build.clone(),
+            vendor_build: identity.vendor_build.clone(),
+            security_patch: identity.security_patch.clone(),
+            kernel_build: identity.kernel_build.clone(),
+            selinux_policy: identity.selinux_policy,
+            netd: identity.netd,
+            connectivity: identity.connectivity,
+            tools: identity.tools.clone(),
+        }
+    }
+
+    #[must_use]
+    pub const fn android_product(&self) -> &AndroidProductIdentity {
+        &self.android_product
+    }
+
+    #[must_use]
+    pub const fn android_build(&self) -> &AndroidBuildIdentity {
+        &self.android_build
+    }
+
+    #[must_use]
+    pub const fn vendor_build(&self) -> &VendorBuildIdentity {
+        &self.vendor_build
+    }
+
+    #[must_use]
+    pub const fn security_patch(&self) -> &SecurityPatchLevel {
+        &self.security_patch
+    }
+
+    #[must_use]
+    pub const fn kernel_build(&self) -> &KernelBuildIdentity {
+        &self.kernel_build
+    }
+
+    #[must_use]
+    pub const fn selinux_policy(&self) -> SelinuxPolicyIdentity {
+        self.selinux_policy
+    }
+
+    #[must_use]
+    pub const fn netd(&self) -> ArtifactIdentity {
+        self.netd
+    }
+
+    #[must_use]
+    pub const fn connectivity(&self) -> ArtifactIdentity {
+        self.connectivity
+    }
+
+    #[must_use]
+    pub const fn tools(&self) -> &BTreeMap<ToolId, ArtifactIdentity> {
+        &self.tools
+    }
+}
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct KernelRelease(String);

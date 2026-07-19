@@ -490,9 +490,10 @@ lease.
 
 The delivered `LegacyRulesPlan` preserves validated legacy source shape; it is not a lowering of the
 Phase 2 shadow Capture Program and does not claim target semantic or device parity. Backlog item 3
-binds production authorities and reviewed Android 5.10/ARM64 evidence to the native owner, then uses
-its already-delivered lease to disable the shell writer before the first production restore mutation
-so both implementations are never active writers.
+binds the complete address/routing/capture and production-authority target. Backlog item 4 then binds
+reviewed Android 5.10/ARM64 evidence and uses the already-delivered lease to stop every shell
+networking writer and standalone address synchronizer before the first production mutation, so both
+implementations are never active writers.
 
 The separate canonical lowerer now has two deliberately distinct contracts. Forwarded-only input
 retains exact schema-v1 bytes, `FLX{4|6}F{generation:010}` names, resource accounting, and digests.

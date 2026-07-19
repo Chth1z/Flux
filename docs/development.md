@@ -209,7 +209,8 @@ surviving phase child remains blocking after parent death, and a live parent can
 child. Release authenticates the current participant and unchanged record. Only both-dead,
 PID-reused, or previous-boot records retire after exact record/directory revalidation. Bare,
 malformed, mixed-owner, and unverifiable state remains blocking. The slot covers the controller
-command lifetime, not the standalone daemon that item 3 must remove.
+command lifetime, not the standalone daemon that item 4 must remove after item 3 supplies its
+Rust-owned replacement inputs.
 
 The ignored real-Adapter test is:
 

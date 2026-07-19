@@ -842,8 +842,9 @@ deliberate rollback producer. Render failure does not silently change producers 
 the active Generation. In either mode, `scripts/tproxy` remains the sole xtables restore executor
 and kernel writer in production composition. The delivered private owner enforces the transition
 lease, failure/recovery, exact readback, and rollback in deterministic and disposable WSA tests, but
-positive production target admission is uninhabited. The item-3 cutover must bind real-device
-authorities and disable the shell writer before the first production native mutation.
+positive production target admission is uninhabited. Item 3 must bind the full target and
+real-device authority inputs; item 4 must disable every shell networking writer and standalone
+address synchronizer before the first production native mutation.
 
 The completed `flux-platform` syntax checkpoint remains a frozen-syntax observer. A pure parser
 accepts an explicit IPv4/IPv6 plus apply/cleanup context and a bounded canonical byte slice; it
@@ -1138,7 +1139,7 @@ mutation, and each mutating child authenticates into the single child slot. `INT
 130 and 143 through authenticated `EXIT` cleanup, so control cannot resume into later mutation. A
 native lease therefore rejects the phase transaction before a networking component is invoked. This
 does not transfer ownership of the intentionally long-lived standalone `addrsyncd` daemon, which
-remains a backlog item-3 cutover responsibility.
+remains a backlog item-4 atomic-cutover responsibility after item 3 supplies its replacement inputs.
 
 Deterministic tests cover zero-to-active, idempotence, replacement, stop, every route/rule/restore
 write boundary, dual-stack partial success, rollback failure, monotonic crash recovery, and lease
@@ -1597,9 +1598,11 @@ PREROUTING TPROXY. It never emits TPROXY in OUTPUT, falls back to REDIRECT/DNAT,
 PREROUTING evidence, infers success from counters or route lookups, or uses a veth bounce. The
 required-mode coordinator treats the still-unsupported production admission result as a failed
 functional gate, post-observes the attempt binding, compensates capture first, and never publishes
-`RUNNING`. `scripts/tproxy` remains the sole production restore writer until backlog item 3 binds
-the engine/canary and ownership authorities, qualifies reviewed Android 5.10/ARM64 profiles, and
-transfers the lease before the first native production write. The pure canonical lowerer remains
+`RUNNING`. `scripts/tproxy` remains the sole production restore writer while backlog item 3 binds
+the engine/canary, address-policy, routing, and ownership authorities into one complete target.
+Backlog item 4 must then qualify reviewed Android 5.10/ARM64 profiles, stop every shell networking
+writer and standalone address synchronizer, and transfer the lease before the first native
+production write. The pure canonical lowerer remains
 non-authorizing by itself, while the private owner supplies transaction mechanics without supplying
 production prepared-target admission, receipt authority, daemon composition, or Android release
 qualification.

@@ -163,5 +163,6 @@ omission. Nonempty missing-mangle output and nondefault `--on-ip` remain conflic
 
 Production remains `Unsupported`: this mechanism test does not supply Android 5.10/ARM64 mark
 authority, RPDB/VPN/netd coexistence, distinct engine identity, functional receipts, or release
-qualification, and it does not authorize shell-duty removal before the item-3 cutover gate. eBPF
+qualification, and it does not authorize shell-duty removal before item 3 completes the target and
+item 4 passes the atomic cutover gate. eBPF
 remains an optional separately qualified mechanism, and production loads no `.ko`/KPM payload.

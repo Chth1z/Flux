@@ -1,7 +1,7 @@
 ---
 status: accepted
 decision_date: 2026-07-14
-last_reviewed: 2026-07-17
+last_reviewed: 2026-07-20
 ---
 
 # Freeze shell networking as the oracle for a non-authorizing Rust shadow compiler
@@ -42,9 +42,10 @@ nor device semantic parity.
 Each compatibility component is retired only after its Rust replacement passes all applicable
 gates: canonical rendering and differential fixtures, backend and real-device behavior, failure
 and recovery injection, exact live readback and Managed Object ownership, rollback, and an atomic
-single-writer transition. Roadmap backlog item 3 transfers xtables plus its transaction-local
-policy-routing identities; item 4 separately transfers the remaining PBR and address-derived rule
-ownership. Until a transfer is complete, Rust may observe
+single-writer transition. Roadmap backlog item 3 completes one canonical target containing the
+address-derived policy and every routing/authority input needed by the native transaction. Item 4
+then transfers xtables, policy routing, and address synchronization together because the native
+Generation lease intentionally excludes every shell networking writer. Until that transfer is complete, Rust may observe
 and compile but must not execute that component's networking mutations. The final package may
 retain only platform-required Magisk installation, launch, disable, and uninstall glue; it retains
 no legacy compatibility wrapper or shell networking policy/cleanup implementation.

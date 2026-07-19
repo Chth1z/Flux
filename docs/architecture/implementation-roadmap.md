@@ -21,7 +21,7 @@ This roadmap turns the [blueprint](fluxd-blueprint.md) and [technical specificat
   the completed Rust runtime after legacy runtime writers, helpers, and compatibility wrappers are
   absent from the package; see ADR-0011.
 
-## Current staged priority (2026-07-17)
+## Current staged priority (2026-07-20)
 
 The 2026-07-15 direction review closes the shadow/compiler/parser/oracle proof-infrastructure and
 host bridge-attestation stage. The attested shell bridge is now a frozen development safety/oracle
@@ -44,11 +44,16 @@ guard, writer fence, and optional lease through fresh global dual-family absence
 previous-boot revision-1 `Activating` pre-lease boundary is recoverable, while same-boot or mismatched
 missing-lease state and malformed/bare/mixed shell locks fail closed. Every legacy start, stop,
 restart, and failure cleanup claims the fence before networking mutation. Production target
-admission remains uninhabited, so the shell bridge is still the sole production writer. The immediate delivery lane is backlog item
-3: bind the already delivered engine/process/canary authorities to this exact owner on reviewed
-Android 5.10/ARM64 profiles, transfer the writer lease, and then delete the replaced shell rule and
-restore duties. Other evidence work may proceed in parallel, but it must not displace that
-ownership/removal lane or create another open-ended non-authorizing checkpoint.
+admission remains uninhabited, so the shell bridge is still the sole production writer.
+
+The native owner cannot be cut over while standalone address synchronization or shell policy
+routing remains active: its durable Generation lease deliberately blocks every mutating
+`addrsync`, `tproxy`, and dispatcher phase. The immediate delivery lane is therefore backlog item 3:
+finish the canonical Generation and exact device/mark/routing/address inputs required by one
+complete native transaction. Backlog item 4 then qualifies that complete transaction on reviewed
+Android 5.10/ARM64 profiles, stops every shell networking writer and standalone address synchronizer
+before the first Rust write, transfers the lease atomically, and deletes the replaced duties. No
+supported intermediate native-xtables/shell-addrsync composition exists.
 
 Correctness gates retain strict ordering:
 
@@ -111,7 +116,7 @@ verifier can pass, and a verifier pass cannot override ADR-0011's runtime-comple
    and TUN remains rejected until one exact routing owner passes readback and forced-death cleanup
    canaries.
    The remaining 13b-2b driver-child retirement, listener/report, and collector/factory work are now
-   production authority-binding prerequisites for backlog item 3 and the delivered owner, not
+   production authority-binding prerequisites in backlog item 3 for the delivered owner, not
    grounds for another backend-mechanics checkpoint. Cgroup-BPF remains unassigned until a separate
    TCP/UDP-complete authority design and exit gate exist.
 2. **Phase 2 shadow policy — complete and frozen:** the deterministic, backend-neutral shadow
@@ -122,7 +127,14 @@ verifier can pass, and a verifier pass cannot override ADR-0011's runtime-comple
    lowerer may consume an artifact with a caller-supplied non-authorizing namespace, mark candidate,
    and optional descriptive local-routing targets; forwarded-only results remain schema v1 and
    local-OUTPUT results select schema v2. Neither form promotes or mutates the Phase 2 artifact.
-3. **Phase 4 bridge substrate — frozen; bounded native owner delivered, production cutover next:**
+3. **Native Phase 3 activation prerequisites — current:** complete exact device/artifact identity,
+   the positive mark-policy catalog, remaining census cells and point-in-time coordination,
+   observer continuity, mark preservation, domain/network-selection handoff, route reachability,
+   canonical Generation finalization, and in-process address-derived policy. These inputs must
+   describe one complete transaction before production target admission exists. They confer no
+   mutation authority by themselves and must not create another public raw-writer seam.
+4. **Phase 4 bridge substrate — frozen; bounded native owner delivered, production cutover follows
+   Phase 3:**
    the validated legacy source-shape renderer independently reproduces the pinned IPv4/IPv6
    apply/cleanup fixtures, and Rust-owned preparation exclusively invokes
    `fluxd render-legacy-rules`. Explicit legacy ownership alone sources `scripts/rules`; the cache
@@ -135,15 +147,10 @@ verifier can pass, and a verifier pass cannot override ADR-0011's runtime-comple
    exact readback, rollback, crash recovery, and the shell-visible transition lease. Its rooted
    x86_64 WSA execution is mechanism evidence only; positive production target construction remains
    uninhabited. Do not expand the bridge into a release-qualification project. Reuse it for targeted
-   cutover fault injection while backlog item 3 binds the production authorities, qualifies reviewed
-   Android 5.10/ARM64 profiles, transfers the writer lease before the first Rust write, and deletes
-   the replaced shell rule/restore duties. There is no dual-writer interval and no public bridge
-   release.
-4. **Native Phase 3 correctness evidence:** continue exact device/artifact identity, positive mark
-   policy catalog, remaining census cells, point-in-time coordination, observer continuity, mark
-   preservation, domain/network-selection handoff, and route reachability as bounded supporting
-   work. Do not let it delay production authority binding, Android qualification, and the writer
-   cutover or confer mutation authority prematurely.
+   cutover fault injection only after backlog item 3 completes the production inputs. Backlog item 4
+   then qualifies reviewed Android 5.10/ARM64 profiles, stops standalone address synchronization and
+   all shell route/xtables mutation before the first Rust write, transfers the writer lease, and
+   deletes the replaced duties. There is no dual-writer interval and no public bridge release.
 5. **Optional eBPF probe — deferred:** isolated, opt-in `xt_bpf` mechanics may run only in a
    disposable test namespace without persistent pins, production daemon integration, Capability
    Profile publication, implicit module autoload, or writes to live Flux chains. Production-state
@@ -448,7 +455,7 @@ Keep the four evidence levels distinct:
    boundary. Deterministic write-boundary injection and rooted disposable-WSA apply/recover/stop
    passed. Production target admission, functional receipts, reviewed Android 5.10/ARM64 behavior,
    and packet-path release qualification
-   remain backlog item 3 rather than being inferred from this mechanism checkpoint.
+   remain backlog items 3 and 4 rather than being inferred from this mechanism checkpoint.
 
 The canonical oracle pin and fixture inventory live in `tests/oracle/xtables/manifest.json`; the
 operational commands live in `docs/development.md`. The bounded raw profile excludes QUIC, PBR,
@@ -498,13 +505,16 @@ intentionally absent from normal `cargo xtask ci`.
   only both-dead, PID-reused, or previous-boot records retire after exact revalidation. Ambient state
   is discarded, release is authenticated, signals exit through cleanup, and bare, malformed, mixed,
   and unverifiable locks remain blocking. Legacy start/stop/restart/failure cleanup holds this fence
-  before `addrsync` or `tproxy` mutation. The standalone daemon remains an item-3 cutover duty.
+  before `addrsync` or `tproxy` mutation. The standalone daemon remains an item-4 cutover duty after
+  item 3 has supplied its Rust-owned replacement inputs.
   Deterministic tests cover every mutation boundary, and the real Adapter passes apply/recover/stop
   in a rooted disposable x86_64 WSA namespace as mechanism evidence only. Positive production
   target admission remains intentionally uninhabited.
-- **Open production cutover checkpoint:** bind exact Android mark/RPDB, engine/process/canary,
-  ownership, and no-autoload evidence to the delivered owner; qualify reviewed Android 5.10/ARM64
-  profiles; then transfer the writer lease and delete the replaced shell rule/restore duties.
+- **Open production prerequisite and cutover checkpoints:** first bind exact Android mark/RPDB,
+  engine/process/canary, address-policy, ownership, and no-autoload evidence into one canonical
+  Generation target. Then qualify reviewed Android 5.10/ARM64 profiles, stop standalone address
+  synchronization and every shell route/xtables writer, transfer the lease, and delete the replaced
+  duties.
   Established-flow caching, transparent-socket DIVERT, FakeIP ICMP, QUIC rejection, and MSS
   clamping remain typed unsupported extensions and should be implemented only where the supported
   runtime actually requires them.
@@ -554,9 +564,10 @@ or previous-boot claims retire after exact re-read; missing, malformed, mixed, o
 records remain fail-closed. Every legacy start, stop, restart, and failure-cleanup phase transaction
 acquires this fence before `addrsync` or `tproxy`. No production path can yet construct an admitted
 native target or acquire its lease.
-Backlog item 3 must bind the production authorities and disable shell mutation before the first Rust
-write; only then does `fluxd` become the sole writer of Flux xtables state. There is no shadow/native
-dual-writer interval.
+Backlog item 3 must complete the production authorities and full transaction target without native
+mutation. Backlog item 4 must then disable standalone address synchronization and every shell
+route/xtables mutation before the first Rust write; only then does `fluxd` become the sole writer of
+Flux networking state. There is no shadow/native dual-writer interval.
 
 ### Current-stage exit gate
 
@@ -567,7 +578,8 @@ dual-writer interval.
   without executing `scripts/rules`; explicit legacy ownership retains the shell rollback producer.
 - **Complete in the current production bridge:** `scripts/tproxy` remains the only restore
   executor/writer, and renderer failure aborts the candidate without replacing the active Generation
-  or falling back to shell. The delivered native owner remains test-admitted until backlog item 3.
+  or falling back to shell. The delivered native owner remains test-admitted through backlog item 3
+  and until backlog item 4's atomic transfer.
 - **Complete structurally:** explicit legacy restart prepares fresh settings, replacement Sing-Box
   configuration, and replacement caches before stopping the active runtime.
 - **Complete in host implementation:** each Rust-owned candidate has one exact Generation/family
@@ -856,20 +868,20 @@ Before a backend may be selected automatically, its documentation must include:
    failure-injected, and the real Adapter passes apply/recover/stop in a rooted disposable x86_64 WSA
    mechanism test.
    The source-shape renderer remains an oracle and is not promoted into the native compiler.
-   Production admission remains `Unsupported`, as required before item 3; WSA is not release
-   authority.
-3. **Current: qualify and cut over the xtables writer.** Bind the already delivered engine/process/
-   canary evidence to the executed backend, qualify the complete transaction on reviewed Android
-   5.10/ARM64 profiles, transfer the writer lease by disabling shell mutation before the first Rust
-   write, and only then delete the replaced `scripts/rules` and `scripts/tproxy` runtime duties. Add
-   established-flow cache, transparent-
-   socket DIVERT, FakeIP ICMP, QUIC rejection, or MSS clamping only when the advertised runtime
-   requires and separately qualifies that extension. No dual writer and no compatibility release.
-4. **Cut over remaining PBR and address synchronization.** Complete the exact device/artifact Capability
-   Profile, positive mark-policy catalog, point-in-time 27-cell census, RPDB/domain placement, route
-   reachability, observer continuity, and rollback. Move address-derived rules into the `fluxd`
-   reactor, disable the shell route writer, then remove standalone `addrsyncd` and
-   `scripts/addrsync` from runtime and packaging.
+   Production admission remains `Unsupported` throughout item 3 and until item 4's atomic transfer;
+   WSA is not release authority.
+3. **Current: complete one native activation target.** Finish the canonical Generation/config
+   authority, exact device/artifact Capability Profile, positive mark-policy catalog, point-in-time
+   27-cell census, RPDB/domain placement, route reachability, observer continuity, rollback inputs,
+   and in-process address-derived policy. Bind the delivered engine/process/canary evidence to that
+   complete target without admitting production mutation or exposing raw native writer verbs.
+4. **Qualify and atomically cut over the networking writer.** Qualify the complete transaction on
+   reviewed Android 5.10/ARM64 profiles. Stop standalone `addrsyncd` and disable every shell
+   address/PBR/xtables mutation before the first Rust write, transfer the native Generation lease,
+   and only then remove `scripts/addrsync`, the replaced `scripts/rules`/`scripts/tproxy` duties, and
+   the standalone binary from runtime and packaging. Add established-flow cache, transparent-socket
+   DIVERT, FakeIP ICMP, QUIC rejection, or MSS clamping only when the advertised runtime requires and
+   separately qualifies that extension. No dual writer and no compatibility release.
 5. **Move configuration, subscription, and remaining lifecycle policy into Rust.** Implement Rust
    config/subscription generation, bounded network transport, assets, DNS/fake-IP persistence,
    diagnostics, offline cleanup, and direct Rust CLI entry points. Remove runtime dependencies on

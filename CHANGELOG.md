@@ -26,6 +26,13 @@ All notable changes to the Flux project will be documented in this file.
 - Qualified the collector mechanism on rooted x86_64 WSA: its green verified-boot string is
   correctly rejected as `Absent` because device-lock, vbmeta algorithm and digest facts are absent.
   This is mechanism evidence only, not Android 5.10/ARM64 production authority.
+- Added the compile-time reviewed Android mark-policy catalog boundary. It validates bounded literal
+  entries, exact stable selectors, canonical tool ordering, unique entry IDs/selectors, eligible
+  candidates, policy digest/revision, and asserted mark planes before selection. Catalog entry ID is
+  retained in policy identity and therefore in complete-census freshness checks. The production
+  entry table is intentionally empty until a physical ARM64 profile is independently reviewed;
+  verified nonmatching profiles receive the generic-AOSP zero grant and incomplete identity fails
+  closed, so no current device can receive a positive grant.
 
 ### Rewrite release policy
 - Established the pre-release Rust-only release gate in ADR-0011. Bridge, shadow, parity, and

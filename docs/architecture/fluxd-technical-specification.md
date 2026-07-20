@@ -472,13 +472,20 @@ process network-namespace object, kernel-build identity, and complete property s
 unchanged. Missing, denied, malformed, inconsistent, unexpected-symlink, empty, oversized, changed,
 or unsafe facts fail closed. The runtime XML is a locator, not a self-authenticating authority.
 
-A production positive mark-policy loader remains blocked until the compile-time policy catalog
-selects these facts. The positive policy factory and complete-census boundary reject every
-non-verified identity and any mismatch between the separately observed namespace and the full
-profile. The selected assertion is then freshness-bound to the full Capability Profile, verified
-boot, boot ID, and observed network namespace. Rooted x86_64 WSA validates the collector mechanism
-and settles `Absent` because it lacks lock, vbmeta-algorithm and digest properties; it is not
-Android 5.10/ARM64 production authority.
+The compile-time reviewed mark-policy selector now validates the complete literal catalog before
+selection: entry count, canonical entry ID, every stable selector field, nonzero artifact sizes and
+digests, strictly ordered unique tools, policy name/digest/revision, device-qualified candidate,
+asserted plane set, and unique IDs/selectors. It accepts no caller-supplied runtime catalog or
+self-authenticating manifest. An exact match retains `ReviewedPolicyCatalogEntryId` in the device-
+policy identity, so the existing complete-census identity binding cannot lose catalog provenance.
+No match returns the explicit generic-AOSP zero-grant policy.
+
+The production catalog is intentionally empty until independent physical Android 5.10/ARM64 review
+supplies a complete entry. Positive-policy construction is crate-private, so external adapters can
+obtain a catalog-backed assertion only through the reviewed selector. Catalog selection rejects
+non-verified identity or namespace mismatch, and the selected assertion is freshness-bound to the
+full Capability Profile, verified boot, boot ID, and observed network namespace. Rooted x86_64 WSA
+validates collection mechanics and settles `Absent`; it cannot populate the production catalog.
 
 `CapabilityStatus` records durable availability. Timeout, interruption, temporary resource
 pressure, and other retryable failures are retained as `ProbeAttemptOutcome` evidence with bounded

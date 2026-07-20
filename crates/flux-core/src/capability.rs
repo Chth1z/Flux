@@ -910,6 +910,40 @@ pub struct ReviewedPolicySelector {
 }
 
 impl ReviewedPolicySelector {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_exact_parts(
+        android_product: AndroidProductIdentity,
+        android_build: AndroidBuildIdentity,
+        vendor_build: VendorBuildIdentity,
+        security_patch: SecurityPatchLevel,
+        kernel_build: KernelBuildIdentity,
+        selinux_policy: SelinuxPolicyIdentity,
+        netd: ArtifactIdentity,
+        connectivity: ArtifactIdentity,
+        tools: BTreeMap<ToolId, ArtifactIdentity>,
+    ) -> Result<Self, DeviceIdentityError> {
+        if tools.is_empty() {
+            return Err(DeviceIdentityError::NoTools);
+        }
+        if tools.len() > MAX_DEVICE_TOOL_IDENTITIES {
+            return Err(DeviceIdentityError::TooManyTools {
+                maximum: MAX_DEVICE_TOOL_IDENTITIES,
+                required_at_least: MAX_DEVICE_TOOL_IDENTITIES + 1,
+            });
+        }
+        Ok(Self {
+            android_product,
+            android_build,
+            vendor_build,
+            security_patch,
+            kernel_build,
+            selinux_policy,
+            netd,
+            connectivity,
+            tools,
+        })
+    }
+
     #[must_use]
     pub fn from_device_identity(identity: &DeviceIdentity) -> Self {
         Self {

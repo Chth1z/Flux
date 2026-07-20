@@ -31,7 +31,8 @@ Flux 是面向 Magisk、KernelSU 与 APatch 的 Android 透明代理模块。它
   verified boot、内核构建、SELinux policy、netd/Connectivity、工具产物及网络命名空间身份。
   device-qualified mark policy 与完整 census 现在必须绑定这套完整且命名空间一致的身份。Android
   专用收集器现已直接读取并复核系统属性、已加载 policy、netd、活动 Connectivity APEX、当前 Flux
-  二进制及网络命名空间；AVB 证据不完整时仍会拒绝，且评审 catalog 尚未实现，因此不会新增任何修改权限。
+  二进制及网络命名空间；AVB 证据不完整时仍会拒绝。编译期评审 policy catalog 的选择边界已经实现，
+  但在真实 ARM64 设备完成独立评审前，生产条目表保持为空，因此不会新增任何修改权限。
 - eBPF 仅是未来可选的观测/加速能力。Flux 不打包 `.ko`、KPM 或不透明内核模块载荷，也不调用
   显式模块加载 API；但当前旧 shell 桥接尚未证明所有 xtables 依赖均已预先启用、不会触发内核隐式
   自动加载。

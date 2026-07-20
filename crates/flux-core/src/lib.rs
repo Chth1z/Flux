@@ -8,6 +8,7 @@
 
 mod address_bypass;
 mod android_mark_authority;
+mod android_mark_policy_catalog;
 mod android_rpdb;
 mod android_tproxy_topology;
 mod capability;
@@ -45,7 +46,12 @@ pub use android_mark_authority::{
     FwmarkUseRecordError, MAX_ANDROID_MARK_DEVICE_POLICY_NAME_BYTES,
     MAX_COMPLETE_FWMARK_CENSUS_MARK_USES, OWNERSHIP_JOURNAL_IDENTITY_BYTES,
     OwnershipJournalIdentity, OwnershipJournalIdentityError, OwnershipJournalRevision,
-    authorize_android_mark_planning,
+    ReviewedPolicyCatalogEntryId, authorize_android_mark_planning,
+};
+pub use android_mark_policy_catalog::{
+    MAX_REVIEWED_ANDROID_MARK_POLICY_CATALOG_ENTRIES, ReviewedAndroidMarkPolicyCatalogError,
+    ReviewedAndroidMarkPolicyCatalogField, ReviewedAndroidMarkPolicySelection,
+    select_reviewed_android_mark_policy,
 };
 pub use android_rpdb::{
     AndroidRpdbClassificationReport, AndroidRpdbPlacementPlanError, AndroidRpdbPolicyProfile,

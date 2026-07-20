@@ -29,6 +29,8 @@ use crate::network_inventory::{NetworkEpoch, NetworkInventory, NetworkInventoryS
 pub const ANDROID_DEVICE_QUALIFIED_CANDIDATE_MASK: u32 = 0x7fe0_0000;
 /// Maximum UTF-8 bytes accepted for a device-qualified policy name.
 pub const MAX_ANDROID_MARK_DEVICE_POLICY_NAME_BYTES: usize = 128;
+/// Maximum ASCII bytes accepted for a reviewed policy-catalog entry ID.
+pub(crate) const MAX_REVIEWED_POLICY_CATALOG_ENTRY_ID_BYTES: usize = 128;
 /// Exact byte length of a SHA-256 device-policy artifact digest.
 pub const ANDROID_MARK_DEVICE_POLICY_ARTIFACT_DIGEST_BYTES: usize = 32;
 /// Exact byte length of a durable ownership-journal identity.
@@ -282,6 +284,72 @@ impl fmt::Display for AndroidMarkDevicePolicyArtifactDigestError {
 
 impl Error for AndroidMarkDevicePolicyArtifactDigestError {}
 
+/// Stable machine-readable identity of one source-reviewed policy-catalog entry.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ReviewedPolicyCatalogEntryId(Box<str>);
+
+impl ReviewedPolicyCatalogEntryId {
+    pub(crate) fn new(value: &str) -> Result<Self, ReviewedPolicyCatalogEntryIdError> {
+        if value.is_empty() {
+            return Err(ReviewedPolicyCatalogEntryIdError::Empty);
+        }
+        if value.len() > MAX_REVIEWED_POLICY_CATALOG_ENTRY_ID_BYTES {
+            return Err(ReviewedPolicyCatalogEntryIdError::TooLong {
+                maximum: MAX_REVIEWED_POLICY_CATALOG_ENTRY_ID_BYTES,
+                actual: value.len(),
+            });
+        }
+        let mut bytes = value.bytes();
+        if !bytes
+            .next()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+            || !bytes.all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'.' | b'_' | b'-')
+            })
+        {
+            return Err(ReviewedPolicyCatalogEntryIdError::InvalidFormat);
+        }
+        Ok(Self(value.into()))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ReviewedPolicyCatalogEntryId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReviewedPolicyCatalogEntryIdError {
+    Empty,
+    TooLong { maximum: usize, actual: usize },
+    InvalidFormat,
+}
+
+impl fmt::Display for ReviewedPolicyCatalogEntryIdError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => formatter.write_str("reviewed policy-catalog entry ID is empty"),
+            Self::TooLong { maximum, actual } => write!(
+                formatter,
+                "reviewed policy-catalog entry ID is {actual} bytes but its limit is {maximum}"
+            ),
+            Self::InvalidFormat => formatter.write_str(
+                "reviewed policy-catalog entry ID must use lowercase ASCII letters, digits, '.', '_' or '-'",
+            ),
+        }
+    }
+}
+
+impl Error for ReviewedPolicyCatalogEntryIdError {}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum AndroidMarkDevicePolicyKind {
     /// Generic AOSP supplies no public mark allocator and therefore grants no field.
@@ -294,6 +362,7 @@ pub enum AndroidMarkDevicePolicyKind {
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct AndroidMarkDevicePolicyIdentity {
     kind: AndroidMarkDevicePolicyKind,
+    catalog_entry: Option<ReviewedPolicyCatalogEntryId>,
     name: Option<AndroidMarkDevicePolicyName>,
     artifact_digest: Option<AndroidMarkDevicePolicyArtifactDigest>,
 }
@@ -302,17 +371,20 @@ impl AndroidMarkDevicePolicyIdentity {
     const fn generic_aosp() -> Self {
         Self {
             kind: AndroidMarkDevicePolicyKind::GenericAospNoGrant,
+            catalog_entry: None,
             name: None,
             artifact_digest: None,
         }
     }
 
     fn device_qualified_cooperative(
+        catalog_entry: ReviewedPolicyCatalogEntryId,
         name: AndroidMarkDevicePolicyName,
         artifact_digest: AndroidMarkDevicePolicyArtifactDigest,
     ) -> Self {
         Self {
             kind: AndroidMarkDevicePolicyKind::DeviceQualifiedCooperative,
+            catalog_entry: Some(catalog_entry),
             name: Some(name),
             artifact_digest: Some(artifact_digest),
         }
@@ -321,6 +393,11 @@ impl AndroidMarkDevicePolicyIdentity {
     #[must_use]
     pub const fn kind(&self) -> AndroidMarkDevicePolicyKind {
         self.kind
+    }
+
+    #[must_use]
+    pub const fn catalog_entry(&self) -> Option<&ReviewedPolicyCatalogEntryId> {
+        self.catalog_entry.as_ref()
     }
 
     #[must_use]
@@ -435,8 +512,9 @@ impl Error for AndroidMarkCandidateEligibilityError {}
 
 /// Exact positive assertion made by a device-qualified cooperative policy.
 ///
-/// There is deliberately no public constructor. Callers can obtain this evidence only from the
-/// explicitly named `AndroidMarkDevicePolicy::device_qualified_cooperative` factory.
+/// There is deliberately no public constructor. The crate-private policy constructor is reached by
+/// the compiled reviewed-policy catalog after exact literal validation; external adapters cannot
+/// manufacture this evidence directly.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AndroidMarkPositiveGrant {
     candidate: FwmarkCandidate,
@@ -506,8 +584,8 @@ pub enum AndroidMarkDeviceGrantKind {
 
 /// Device-specific mark allocation policy.
 ///
-/// The generic AOSP profile is explicitly zero-grant. A positive assertion exists only behind the
-/// device-qualified cooperative factory and remains subject to complete live reauthorization.
+/// The generic AOSP profile is explicitly zero-grant. A positive assertion retains one reviewed
+/// catalog entry ID and remains subject to complete live reauthorization.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AndroidMarkDevicePolicy {
     identity: AndroidMarkDevicePolicyIdentity,
@@ -525,14 +603,16 @@ impl AndroidMarkDevicePolicy {
         }
     }
 
-    /// Records an externally established cooperative device-policy assertion.
+    /// Constructs a cooperative device-policy assertion from one validated catalog entry.
     ///
-    /// This factory does not inspect a device-policy artifact or prove vendor cooperation. The
-    /// caller crosses a trust boundary by supplying the reviewed artifact identity and exact
-    /// evidence bindings; live authorization still rechecks topology, inventory, policy, profile,
-    /// namespace, ownership-journal, and complete census evidence.
+    /// This crate-private factory does not independently inspect the reviewed artifact. The catalog
+    /// module must validate the source-coded entry before calling it. External adapters can obtain a
+    /// positive policy only through `select_reviewed_android_mark_policy`; live authorization still
+    /// rechecks topology, inventory, policy, profile, namespace, ownership-journal, and complete
+    /// census evidence.
     #[allow(clippy::too_many_arguments)]
-    pub fn device_qualified_cooperative(
+    pub(crate) fn device_qualified_cooperative(
+        catalog_entry: ReviewedPolicyCatalogEntryId,
         name: AndroidMarkDevicePolicyName,
         revision: AndroidMarkDevicePolicyRevision,
         artifact_digest: AndroidMarkDevicePolicyArtifactDigest,
@@ -564,8 +644,11 @@ impl AndroidMarkDevicePolicy {
             });
         }
 
-        let identity =
-            AndroidMarkDevicePolicyIdentity::device_qualified_cooperative(name, artifact_digest);
+        let identity = AndroidMarkDevicePolicyIdentity::device_qualified_cooperative(
+            catalog_entry,
+            name,
+            artifact_digest,
+        );
         let positive_grant = AndroidMarkPositiveGrant {
             candidate,
             topology_scope: topology_scope.clone(),
@@ -1866,3 +1949,6 @@ impl Error for AndroidMarkPlanningAuthorizationError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

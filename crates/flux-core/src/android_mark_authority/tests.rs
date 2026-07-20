@@ -1,4 +1,4 @@
-use flux_core::{
+use crate::{
     ANDROID_DEVICE_QUALIFIED_CANDIDATE_MASK, AndroidBuildIdentity, AndroidMarkDeviceGrantKind,
     AndroidMarkDevicePolicy, AndroidMarkDevicePolicyArtifactDigest,
     AndroidMarkDevicePolicyArtifactDigestError, AndroidMarkDevicePolicyError,
@@ -25,6 +25,11 @@ use flux_core::{
     RuleTableId, SecurityPatchLevel, SelinuxMode, SelinuxPolicyIdentity, Sha256Digest, ToolId,
     VendorBuildIdentity, VerifiedBootIdentity, VerifiedBootState,
     assess_android_tproxy_topology_scope, authorize_android_mark_planning, classify_android_rpdb,
+};
+
+use super::{
+    MAX_REVIEWED_POLICY_CATALOG_ENTRY_ID_BYTES, ReviewedPolicyCatalogEntryId,
+    ReviewedPolicyCatalogEntryIdError,
 };
 
 const NET_ID_MASK: u32 = 0x0000_ffff;
@@ -244,6 +249,24 @@ fn device_qualified_candidate_eligibility_is_only_a_structural_prerequisite() {
 
 #[test]
 fn trust_boundary_values_reject_empty_or_unbounded_identities_and_masks() {
+    assert_eq!(
+        ReviewedPolicyCatalogEntryId::new("").expect_err("empty catalog entry ID"),
+        ReviewedPolicyCatalogEntryIdError::Empty
+    );
+    assert_eq!(
+        ReviewedPolicyCatalogEntryId::new("Uppercase")
+            .expect_err("catalog entry IDs use a canonical machine grammar"),
+        ReviewedPolicyCatalogEntryIdError::InvalidFormat
+    );
+    let oversized_entry_id = "x".repeat(MAX_REVIEWED_POLICY_CATALOG_ENTRY_ID_BYTES + 1);
+    assert_eq!(
+        ReviewedPolicyCatalogEntryId::new(&oversized_entry_id)
+            .expect_err("catalog entry IDs are byte bounded"),
+        ReviewedPolicyCatalogEntryIdError::TooLong {
+            maximum: MAX_REVIEWED_POLICY_CATALOG_ENTRY_ID_BYTES,
+            actual: MAX_REVIEWED_POLICY_CATALOG_ENTRY_ID_BYTES + 1,
+        }
+    );
     assert_eq!(
         AndroidMarkDevicePolicyName::new(" \t ").expect_err("trimmed empty policy name"),
         AndroidMarkDevicePolicyNameError::Empty
@@ -698,7 +721,7 @@ fn census_conflict_precedes_an_otherwise_incomplete_topology_scope() {
     let topology_scope = local_scope(&inventory, &classification);
     assert!(matches!(
         topology_scope.structural_feasibility(),
-        flux_core::AndroidTproxyTopologyScopeStructuralFeasibility::IncompleteEvidence { .. }
+        crate::AndroidTproxyTopologyScopeStructuralFeasibility::IncompleteEvidence { .. }
     ));
     let capability_profile = verified_capability_profile(
         CapabilityProfileRevision::INITIAL,
@@ -1164,6 +1187,18 @@ fn policy_collector_and_ownership_journal_bindings_are_exact() {
     let context = TestContext::standard();
 
     for different_identity_policy in [
+        cooperative_policy_with_catalog_entry(
+            "synthetic-redfin-policy-v2",
+            "synthetic-cooperative-policy",
+            [0x21; 32],
+            context.policy.revision(),
+            context.candidate,
+            &context.topology_scope,
+            &context.capability_profile,
+            context.network_namespace,
+            FwmarkPlaneSet::ALL,
+        )
+        .expect("policy with independently changed catalog entry"),
         cooperative_policy(
             "different-policy-name",
             [0x21; 32],
@@ -1200,9 +1235,9 @@ fn policy_collector_and_ownership_journal_bindings_are_exact() {
         )
         .expect("census bound to another policy identity");
         assert_eq!(
-            context
-                .authorize(identity_census)
-                .expect_err("policy name and artifact digest are independently exact"),
+            context.authorize(identity_census).expect_err(
+                "catalog entry, policy name and artifact digest are independently exact",
+            ),
             AndroidMarkPlanningAuthorizationError::CensusDevicePolicyIdentityMismatch
         );
     }
@@ -1624,8 +1659,7 @@ impl TestContext {
     fn authorize(
         &self,
         census: CompleteFwmarkCensus,
-    ) -> Result<flux_core::AndroidMarkPlanningAuthority, AndroidMarkPlanningAuthorizationError>
-    {
+    ) -> Result<crate::AndroidMarkPlanningAuthority, AndroidMarkPlanningAuthorizationError> {
         authorize_android_mark_planning(
             &self.inventory,
             &self.classification,
@@ -1658,7 +1692,33 @@ fn cooperative_policy(
     network_namespace: NetworkNamespaceIdentity,
     planes: FwmarkPlaneSet,
 ) -> Result<AndroidMarkDevicePolicy, AndroidMarkDevicePolicyError> {
+    cooperative_policy_with_catalog_entry(
+        "synthetic-redfin-policy-v1",
+        name,
+        digest,
+        revision,
+        candidate,
+        topology_scope,
+        capability_profile,
+        network_namespace,
+        planes,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cooperative_policy_with_catalog_entry(
+    catalog_entry: &str,
+    name: &str,
+    digest: [u8; 32],
+    revision: AndroidMarkDevicePolicyRevision,
+    candidate: FwmarkCandidate,
+    topology_scope: &AndroidTproxyTopologyScopeReport,
+    capability_profile: &CapabilityProfile,
+    network_namespace: NetworkNamespaceIdentity,
+    planes: FwmarkPlaneSet,
+) -> Result<AndroidMarkDevicePolicy, AndroidMarkDevicePolicyError> {
     AndroidMarkDevicePolicy::device_qualified_cooperative(
+        ReviewedPolicyCatalogEntryId::new(catalog_entry).expect("valid test catalog entry ID"),
         AndroidMarkDevicePolicyName::new(name).expect("valid test policy name"),
         revision,
         AndroidMarkDevicePolicyArtifactDigest::new(digest).expect("nonzero artifact digest"),

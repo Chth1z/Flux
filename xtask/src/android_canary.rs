@@ -54,37 +54,51 @@ pub(super) struct Options {
 }
 
 pub(super) fn parse_options(arguments: &[OsString]) -> Result<Options, String> {
-    let mut serial = None;
-    let mut adb = None;
-    let mut index = 0;
-    while index < arguments.len() {
-        let flag = arguments[index].to_string_lossy();
-        let value = arguments
-            .get(index.saturating_add(1))
-            .ok_or_else(|| format!("{flag} requires a value"))?;
-        match flag.as_ref() {
-            "--serial" if serial.is_none() => {
-                let value = value
-                    .to_str()
-                    .ok_or_else(|| "--serial must contain valid UTF-8".to_owned())?;
-                validate_serial(value)?;
-                serial = Some(value.to_owned());
+    Options::parse(
+        arguments,
+        "test-functional-canary-android-x86_64-output-tproxy",
+    )
+}
+
+impl Options {
+    pub(super) fn parse(arguments: &[OsString], command: &str) -> Result<Self, String> {
+        let mut serial = None;
+        let mut adb = None;
+        let mut index = 0;
+        while index < arguments.len() {
+            let flag = arguments[index].to_string_lossy();
+            let value = arguments
+                .get(index.saturating_add(1))
+                .ok_or_else(|| format!("{flag} requires a value"))?;
+            match flag.as_ref() {
+                "--serial" if serial.is_none() => {
+                    let value = value
+                        .to_str()
+                        .ok_or_else(|| "--serial must contain valid UTF-8".to_owned())?;
+                    validate_serial(value)?;
+                    serial = Some(value.to_owned());
+                }
+                "--adb" if adb.is_none() => adb = Some(value.clone()),
+                "--serial" | "--adb" => return Err(format!("{flag} may only be supplied once")),
+                unknown => return Err(format!("unknown Android checkpoint option '{unknown}'")),
             }
-            "--adb" if adb.is_none() => adb = Some(value.clone()),
-            "--serial" | "--adb" => return Err(format!("{flag} may only be supplied once")),
-            unknown => return Err(format!("unknown Android canary option '{unknown}'")),
+            index = index.saturating_add(2);
         }
-        index = index.saturating_add(2);
+        Ok(Self {
+            serial: serial.ok_or_else(|| format!("{command} requires --serial SERIAL"))?,
+            adb: adb
+                .or_else(|| env::var_os("ADB"))
+                .unwrap_or_else(|| OsString::from("adb")),
+        })
     }
-    Ok(Options {
-        serial: serial.ok_or_else(|| {
-            "test-functional-canary-android-x86_64-output-tproxy requires --serial SERIAL"
-                .to_owned()
-        })?,
-        adb: adb
-            .or_else(|| env::var_os("ADB"))
-            .unwrap_or_else(|| OsString::from("adb")),
-    })
+
+    pub(super) fn serial(&self) -> &str {
+        &self.serial
+    }
+
+    pub(super) fn adb(&self) -> &OsString {
+        &self.adb
+    }
 }
 
 pub(super) fn run(options: Options) -> Result<(), String> {
@@ -583,7 +597,7 @@ fn cleanup_remote_directory(
     revalidate_device(options, expected_device, "after remote cleanup proof")
 }
 
-fn adb_text(options: &Options, arguments: &[&str]) -> Result<String, String> {
+pub(super) fn adb_text(options: &Options, arguments: &[&str]) -> Result<String, String> {
     let output = adb_output(options, arguments, ADB_QUERY_TIMEOUT)?;
     if !output.status.success() {
         return Err(format!(
@@ -642,6 +656,32 @@ type OutputReader = JoinHandle<std::io::Result<Vec<u8>>>;
 unsafe extern "C" {
     #[link_name = "kill"]
     fn c_kill(pid: i32, signal: i32) -> i32;
+}
+
+pub(super) fn adb_root_shell_output(
+    options: &Options,
+    script: &[u8],
+    timeout: Duration,
+    description: &str,
+) -> Result<Output, String> {
+    let mut command = Command::new(options.adb());
+    command
+        .args([
+            "-s",
+            options.serial(),
+            "shell",
+            "su",
+            "-c",
+            "/system/bin/sh",
+        ])
+        .stdin(Stdio::piped());
+    command_output_bounded(
+        &mut command,
+        Some(script),
+        timeout,
+        MAX_ADB_CAPTURE_BYTES,
+        description,
+    )
 }
 
 fn command_output_bounded(
@@ -976,7 +1016,7 @@ fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-fn bounded_diagnostic(bytes: &[u8]) -> String {
+pub(super) fn bounded_diagnostic(bytes: &[u8]) -> String {
     let end = bytes.len().min(MAX_DIAGNOSTIC_BYTES);
     String::from_utf8_lossy(&bytes[..end]).into_owned()
 }

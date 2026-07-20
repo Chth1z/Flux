@@ -42,3 +42,21 @@ mark semantics through listener delivery and observation, and pass VPN/netd coex
 mark-preservation canaries. Expansion of the remaining 21 census cells pauses until such a target
 and qualification procedure are viable; source-count growth must not displace the current
 activation blocker.
+
+## 2026-07-21 implementation checkpoint
+
+The development-only `preflight-android-arm64-mark-ordering` xtask now determines whether one
+explicit rooted serial is viable for the later qualification procedure without changing device
+networking. It reuses bounded ADB execution and stable boot/fingerprint revalidation, checks the
+production identity collector's required property and artifact inputs, requires ARM64, Linux 5.10+,
+enforcing SELinux, and PID-1 network-namespace identity, and reads only mangle tables already
+initialized by Android. Its bounded parser requires the exact unconditional INPUT child hook,
+one declared `routectrl_mangle_INPUT`, unique cross-family-consistent interface-scoped writers, one
+supported incoming mask, zero candidate-envelope bits in writer values, and no unknown child rule
+in either family.
+
+The report is explicitly diagnostic-only, hashes rather than prints raw table snapshots, and has no
+authority conversion. A pass establishes only that the target and read-only procedure are usable;
+it does not authenticate the netd/Connectivity artifact digest to a source profile, prove the Flux
+Capture Path order on that boot, observe listener mark behavior, or pass VPN/netd coexistence and
+mark-preservation canaries.

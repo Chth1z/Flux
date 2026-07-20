@@ -47,7 +47,10 @@ The current development checkpoint is a Phase-1 bridge:
   write is an ordered lifetime/coexistence qualification blocker rather than a proven simultaneous
   collision; it remains non-authorizing. Expansion of the other 21 cells is paused until a physical
   ARM64 target can bind the runtime netd profile and prove listener/observer mark preservation, and
-  the fragments still cannot be assembled into planning authority.
+  the fragments still cannot be assembled into planning authority. An explicit-serial read-only
+  ARM64 preflight now checks whether a rooted device has the required identity inputs, namespaces,
+  enforcing SELinux, initialized mangle tables, exact INPUT hook, and supported interface-scoped
+  writers; even a passing report remains diagnostic and grants no authority.
 - eBPF is optional future observation/acceleration work. Flux packages no `.ko`, KPM, or opaque
   kernel-module payload and invokes no explicit module-loading API. The legacy shell bridge has not
   yet proved that every xtables dependency is already active without implicit kernel autoload.

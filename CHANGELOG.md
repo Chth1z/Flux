@@ -48,6 +48,16 @@ All notable changes to the Flux project will be documented in this file.
   or mutation authority was added. Remaining census-source expansion is paused until an exact
   physical Android ARM64 profile can support runtime chain/profile binding and mark-preservation
   coexistence qualification.
+- Added `cargo xtask preflight-android-arm64-mark-ordering --serial SERIAL [--adb PROGRAM]` as a
+  read-only, explicit-target ADR-0013 viability check. It reuses bounded/reaped ADB execution,
+  requires root plus stable boot/fingerprint, checks ARM64/kernel/SELinux/namespace and production
+  identity-collector inputs, and reads only already initialized IPv4/IPv6 mangle tables. Its bounded
+  parser requires one unconditional INPUT hook, the declared `routectrl_mangle_INPUT` chain,
+  unique cross-family-consistent interface writers, one source-pinned mask, zero Flux-candidate bits
+  in writer values, and no unknown child rule. Reports are explicitly diagnostic-only; they hash
+  rather than print raw tables and still defer artifact/source-profile authentication, exact Capture
+  Path ordering, listener/observer mark preservation, and VPN/netd coexistence. The command never
+  pushes a binary or runs restore/rule mutation.
 
 ### Rewrite release policy
 - Established the pre-release Rust-only release gate in ADR-0011. Bridge, shadow, parity, and

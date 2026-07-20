@@ -38,6 +38,7 @@ cargo test -p flux-core android_mark_authority::tests::
 cargo test -p flux-core android_mark_policy_catalog::tests::
 cargo test -p flux-core --test android_net_id_fwmark_census
 cargo test -p flux-core --test rpdb_fwmark_census
+cargo xtask preflight-android-arm64-mark-ordering --serial SERIAL --adb PROGRAM
 ```
 
 These are pure evidence/planning checkpoints. The source-pinned Android `netId` and inventory-bound
@@ -49,6 +50,18 @@ grant, and still fails closed. Definite overlaps retain precedence. Passing host
 replace runtime profile/chain binding or listener/observer mark-preservation evidence on a physical
 Android ARM64 target. The remaining 21 source-plane cells are intentionally paused until that
 qualification target is viable.
+
+The ARM64 preflight requires one explicit serial and accepts an explicit ADB program, including a
+Windows `adb.exe` path from WSL. It performs no push, temporary-directory creation, restore, rule
+mutation, module request, or live Flux-chain write. After root and stable boot/fingerprint checks,
+it reads the production identity collector's property/artifact prerequisites, PID-1/self network
+namespaces, SELinux mode, and only mangle tables already listed in `/proc/net/*_tables_names`. The
+bounded report requires exact dual-family `routectrl_mangle_INPUT` declarations, one unconditional
+built-in INPUT jump, unique cross-family-consistent interface-scoped MARK writers, one supported
+mask, zero candidate-envelope bits in writer values, and no unknown child rule. Raw table bytes are
+not printed. A `viable_for_full_qualification` result is still diagnostic-only: runtime artifact
+digest/source-profile authentication, exact Capture Path ordering, listener/observer mark
+preservation, and VPN/netd coexistence remain separate physical-device gates.
 
 The compatibility submodule remains separate:
 

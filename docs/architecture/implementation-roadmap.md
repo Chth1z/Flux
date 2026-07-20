@@ -63,6 +63,14 @@ ARM64 target. Establishing a viable ordered-lifetime/coexistence target and proc
 mark-authority step. Only then should source-collector expansion resume; adding more non-authorizing
 cells first would not advance the production activation target.
 
+The host-side procedure is now implemented as the explicit-serial, read-only
+`preflight-android-arm64-mark-ordering` xtask. It binds stable boot/fingerprint observations around a
+rooted snapshot and checks ARM64/kernel/SELinux/namespace facts, production identity-collector
+inputs, and exact dual-family INPUT-chain/writer shape without push, restore, rule mutation, or raw
+table disclosure. A passing result means only that a physical target is viable for the remaining
+artifact/profile, Capture Path ordering, listener-observer, mark-preservation, and VPN/netd
+coexistence work. It does not resume the 21 cells or inhabit production authority.
+
 Correctness gates retain strict ordering:
 
 Phase numbers below preserve architectural workstreams and implementation history. They are not the
@@ -407,6 +415,14 @@ selection and exposes no complete-census conversion or authority. The two fragme
 cells; the remaining 21 cells and point-in-time coordination are paused until that target and
 coexistence procedure are viable.
 
+The diagnostic target-viability procedure is delivered. One explicit rooted ARM64 serial is checked
+through bounded/reaped ADB commands, stable boot/fingerprint revalidation, production identity-input
+availability, enforcing SELinux, PID-1 network-namespace identity, initialized dual-family mangle
+tables, and exact `routectrl_mangle_INPUT` hook/writer shape, including unique cross-family
+interfaces and candidate-zero writer values. It reads only and produces no trusted profile, census,
+planning, writer, or activation object. Live physical-device execution and the remaining
+artifact/profile plus mark-preservation/coexistence gates are still pending.
+
 ### Deliverables
 
 - Reimplement the required `addrsyncd` netlink behavior behind private `flux-platform` modules; do not expose raw rtnetlink framing as the product Interface. Resolve the standalone subproject's `UNLICENSED` provenance before copying source text into the GPL workspace.
@@ -421,7 +437,9 @@ coexistence procedure are viable.
 - **Delivered empty catalog boundary:** select positive policy only from bounded source-coded entries keyed by stable product/build/kernel/policy/tool artifact identities and external policy digest/revision; retain catalog entry ID through census identity, bind matches to verified boot/profile/namespace, and reject arbitrary runtime catalogs or manifests. Production entries remain pending independent physical-device review.
 - **Paused behind ADR-0013:** before continuing the remaining 21 bounded source-plane cells, make
   one physical Android ARM64 ordered-lifetime/coexistence target viable with exact runtime
-  netd profile and INPUT-chain binding plus listener/observer mark-preservation canaries. Then
+  netd profile and INPUT-chain binding plus listener/observer mark-preservation canaries. The
+  read-only explicit-serial viability preflight is delivered; an attached target and the positive
+  artifact/profile plus coexistence evidence are still required. Then
   assemble the fresh complete 27-cell fwmark census collector; source fragments cannot authorize
   planning, and generic AOSP must continue to produce zero grant.
 - Rust rtnetlink PBR apply/verify/cleanup.
@@ -902,7 +920,9 @@ Before a backend may be selected automatically, its documentation must include:
    WSA is not release authority.
 3. **Current: complete one native activation target.** Finish the canonical Generation/config
    authority and exact device/artifact Capability Profile, then make one physical Android ARM64
-   ordered-mark-lifetime/coexistence target viable under ADR-0013. Keep the remaining 21 census
+   ordered-mark-lifetime/coexistence target viable under ADR-0013. The explicit-serial read-only
+   preflight contract is delivered; run it on an attached physical target, then bind the positive
+   artifact/source-profile and mark-preservation/coexistence evidence. Keep the remaining 21 census
    cells paused until the runtime netd profile/INPUT chain and listener/observer mark-preservation
    procedure can be bound to that target; then complete the point-in-time 27-cell census,
    RPDB/domain placement, route reachability, observer continuity, rollback inputs, and in-process

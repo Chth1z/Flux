@@ -1279,6 +1279,18 @@ cross-source point-in-time coordinator is paused until one physical Android ARM6
 the exact runtime profile/chain and support the ordered-lifetime, listener-observer, and
 mark-preservation coexistence procedure required by ADR-0013.
 
+A development-only explicit-serial ARM64 preflight now establishes whether that procedure can be
+attempted without mutating networking. The host runner uses bounded/reaped ADB commands, root and
+boot/fingerprint revalidation, and accepts an explicit Windows ADB path under WSL. The rooted shell
+reads required identity properties, collector-input file availability, SELinux and network-
+namespace state, and only IPv4/IPv6 mangle tables already listed as initialized in procfs. A bounded
+host parser requires one exact unconditional built-in INPUT jump, the declared
+`routectrl_mangle_INPUT` child, unique cross-family-consistent interface-scoped MARK writers, a
+uniform supported mask, zero candidate-envelope bits in writer values, and no unknown child rule.
+It records snapshot digests instead of raw tables. Even
+`viable_for_full_qualification` is diagnostic-only and cannot construct census, planning, lease,
+writer, ownership, mutation, or activation evidence.
+
 ### 11.2 Network events
 
 Subscribe to link, IPv4/IPv6 address, route, and rule groups required by the active plan. Use sequence-aware dump reconciliation after startup, overrun, receive truncation, or suspected event loss.

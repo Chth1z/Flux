@@ -38,7 +38,10 @@ Flux 是面向 Magisk、KernelSU 与 APatch 的 Android 透明代理模块。它
   envelope，但源码追踪表明这些 writer 位于 PREROUTING 与入站路由选择之后的 mangle INPUT。该精确
   packet write 因此是仍需验证顺序、生命周期与共存性的 blocker，而不是已证明的同时冲突；它仍不授予
   权限。在真实 ARM64 目标能够绑定运行时 netd profile，并验证 listener/observer 的 mark 保留行为之前，
-  其余 21 个 cell 暂停扩展；这些 fragment 仍不能组装为 planning authority。
+  其余 21 个 cell 暂停扩展；这些 fragment 仍不能组装为 planning authority。现在已有一个要求显式指定
+  serial 的只读 ARM64 preflight，用于检查 rooted 设备的身份输入、namespace、SELinux enforcing、已初始化
+  mangle table、精确 INPUT hook 与受支持的 interface-scoped writer；即使报告通过，也仍只是诊断结果，不会
+  授予任何权限。
 - eBPF 仅是未来可选的观测/加速能力。Flux 不打包 `.ko`、KPM 或不透明内核模块载荷，也不调用
   显式模块加载 API；但当前旧 shell 桥接尚未证明所有 xtables 依赖均已预先启用、不会触发内核隐式
   自动加载。

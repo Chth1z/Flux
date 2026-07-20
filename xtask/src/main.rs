@@ -9,6 +9,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 mod android_canary;
+mod android_mark_preflight;
 mod xtables_oracle;
 
 const ANDROID_TARGET: &str = "aarch64-linux-android";
@@ -158,6 +159,9 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
         }
         "test-functional-canary-android-x86_64-output-tproxy" => {
             android_canary::run(android_canary::parse_options(&arguments)?)
+        }
+        "preflight-android-arm64-mark-ordering" => {
+            android_mark_preflight::run(android_mark_preflight::parse_options(&arguments)?)
         }
         "xtables-oracle" => {
             let mode = xtables_oracle::parse_options(&arguments)?;
@@ -2210,6 +2214,7 @@ fn print_help() {
            test-functional-canary-linux-output-tproxy  Run the local-OUTPUT loopback TPROXY checkpoint\n\
            test-functional-canary-linux-output-preflight  Preflight distinct local-OUTPUT credentials (no traffic)\n\
            test-functional-canary-android-x86_64-output-tproxy  Cross-build and run the exact checkpoint on one explicit rooted x86_64 Android serial\n\
+           preflight-android-arm64-mark-ordering  Read-only ADR-0013 target viability report for one explicit rooted ARM64 Android serial\n\
            xtables-oracle Verify or explicitly update pinned shell-generated restore fixtures; requires --check or --update\n\
            stage-module   Build and stage a Magisk tree; requires --stage DIR --runtime-binaries DIR\n\
            verify-package Verify a populated release stage; requires --stage DIR\n\

@@ -36,13 +36,16 @@ The focused Phase 3 Android mark-authority model can be exercised with:
 ```text
 cargo test -p flux-core android_mark_authority::tests::
 cargo test -p flux-core android_mark_policy_catalog::tests::
+cargo test -p flux-core --test android_net_id_fwmark_census
 cargo test -p flux-core --test rpdb_fwmark_census
 ```
 
-These are pure evidence/planning checkpoints. The RPDB test covers only one inventory-backed source
-fragment; it does not create a complete Mark Census or Planning Authority. Passing host tests do
-not replace production Android device-policy verification, the remaining source collectors,
-cross-source freshness, or activation canaries.
+These are pure evidence/planning checkpoints. The source-pinned Android `netId` and inventory-bound
+RPDB tests model only six source-plane cells; they do not create a complete Mark Census or Planning
+Authority. The exact pinned incoming-packet writer masks intersect the complete device-qualified
+candidate envelope, so the fragment is conflict evidence rather than a mark grant. Passing host
+tests do not replace production Android device-policy verification, the remaining source
+collectors, cross-source freshness, or activation canaries.
 
 The compatibility submodule remains separate:
 

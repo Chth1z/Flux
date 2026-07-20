@@ -40,7 +40,10 @@ The current development checkpoint is a Phase-1 bridge:
   properties, loaded policy, netd, the active Connectivity APEX, the running Flux binary, and its
   network namespace. Incomplete AVB evidence remains non-authorizing. The compile-time reviewed
   policy-catalog selector now exists, but its production entry table is empty pending independent
-  physical ARM64 review, so no new mutation is admitted.
+  physical ARM64 review, so no new mutation is admitted. Source-pinned Android `netId` and
+  inventory-bound RPDB fragments now model six of the 27 fwmark census cells. The pinned netd
+  incoming-packet writers overlap the complete device-qualified candidate envelope, and the
+  fragments cannot be assembled into planning authority.
 - eBPF is optional future observation/acceleration work. Flux packages no `.ko`, KPM, or opaque
   kernel-module payload and invokes no explicit module-loading API. The legacy shell bridge has not
   yet proved that every xtables dependency is already active without implicit kernel autoload.

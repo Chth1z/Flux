@@ -1,5 +1,5 @@
 use flux_core::{
-    AndroidRpdbPolicyProfile, AndroidRpdbRuleRole, AndroidTproxyEvidenceCoverage,
+    AndroidNetdSourceProfile, AndroidRpdbRuleRole, AndroidTproxyEvidenceCoverage,
     AndroidTproxyRoutingShape, AndroidTproxyRuleDisposition, AndroidTproxySelectorDisjointReason,
     AndroidTproxyStructuralFeasibility, AndroidTproxyTopologyError,
     AndroidTproxyTopologyScopeError, AndroidTproxyTopologyScopeRequest,
@@ -21,7 +21,7 @@ const DEFAULT_NETWORK_TABLE: u32 = 1_003;
 
 #[test]
 fn android_12_local_anchor_has_no_single_rule_window() {
-    let profile = AndroidRpdbPolicyProfile::AospAndroid12R1;
+    let profile = AndroidNetdSourceProfile::AospAndroid12R1;
     let inventory = profile_inventory(profile, false);
     let classification = classify_android_rpdb(&inventory, profile);
     let anchor = classification
@@ -69,7 +69,7 @@ fn android_12_local_anchor_has_no_single_rule_window() {
 
 #[test]
 fn android_13_local_anchor_exposes_only_residual_30999_evidence() {
-    let profile = AndroidRpdbPolicyProfile::AospAndroid13R1;
+    let profile = AndroidNetdSourceProfile::AospAndroid13R1;
     let inventory = profile_inventory(profile, true);
     let classification = classify_android_rpdb(&inventory, profile);
     let anchor = role_index(
@@ -156,7 +156,7 @@ fn android_13_local_anchor_exposes_only_residual_30999_evidence() {
 
 #[test]
 fn exact_tether_anchor_has_a_separate_20000_to_21000_window() {
-    let profile = AndroidRpdbPolicyProfile::AospNetd20250324;
+    let profile = AndroidNetdSourceProfile::AospNetd20250324;
     let inventory = profile_inventory(profile, true);
     let classification = classify_android_rpdb(&inventory, profile);
     let anchor = role_index(
@@ -230,7 +230,7 @@ fn exact_tether_anchor_has_a_separate_20000_to_21000_window() {
 
 #[test]
 fn unknown_rules_fail_closed_before_selector_disjointness_is_considered() {
-    let profile = AndroidRpdbPolicyProfile::AospAndroid13R1;
+    let profile = AndroidNetdSourceProfile::AospAndroid13R1;
     let mut fixture = profile_fixture(profile, true);
     fixture.rules.push(
         RuleSpec::netd(20_500, 1_777, RuleAction::TO_TABLE)
@@ -273,7 +273,7 @@ fn unknown_rules_fail_closed_before_selector_disjointness_is_considered() {
 
 #[test]
 fn unknown_rules_in_another_family_do_not_poison_the_selected_domain() {
-    let profile = AndroidRpdbPolicyProfile::AospAndroid13R1;
+    let profile = AndroidNetdSourceProfile::AospAndroid13R1;
     let mut fixture = profile_fixture_for_families(
         profile,
         [NetworkAddressFamily::Ipv4, NetworkAddressFamily::Ipv6],
@@ -304,7 +304,7 @@ fn unknown_rules_in_another_family_do_not_poison_the_selected_domain() {
 
 #[test]
 fn static_profile_bounds_cannot_replace_an_observed_active_anchor() {
-    let profile = AndroidRpdbPolicyProfile::AospAndroid13R1;
+    let profile = AndroidNetdSourceProfile::AospAndroid13R1;
     let fixture = profile_fixture_without_default();
     let inventory = make_inventory(fixture.links, fixture.rules);
     let classification = classify_android_rpdb(&inventory, profile);
@@ -329,7 +329,7 @@ fn static_profile_bounds_cannot_replace_an_observed_active_anchor() {
 
 #[test]
 fn anchor_requires_the_exact_present_admin_up_link_identity() {
-    let profile = AndroidRpdbPolicyProfile::AospAndroid13R1;
+    let profile = AndroidNetdSourceProfile::AospAndroid13R1;
     let mut fixture = profile_fixture(profile, true);
     fixture
         .links
@@ -380,7 +380,7 @@ fn anchor_requires_the_exact_present_admin_up_link_identity() {
 
 #[test]
 fn overlapping_same_interface_tether_tables_are_ambiguous() {
-    let profile = AndroidRpdbPolicyProfile::AospAndroid13R1;
+    let profile = AndroidNetdSourceProfile::AospAndroid13R1;
     let mut fixture = profile_fixture(profile, true);
     fixture.rules.push(
         RuleSpec::netd(21_000, 1_006, RuleAction::TO_TABLE)
@@ -429,7 +429,7 @@ fn overlapping_same_interface_tether_tables_are_ambiguous() {
 
 #[test]
 fn overlapping_default_network_selectors_cannot_choose_between_tables() {
-    let profile = AndroidRpdbPolicyProfile::AospAndroid13R1;
+    let profile = AndroidNetdSourceProfile::AospAndroid13R1;
     let mut fixture = profile_fixture(profile, false);
     fixture.rules.push(
         RuleSpec::netd(31_000, 1_004, RuleAction::TO_TABLE)
@@ -462,7 +462,7 @@ fn overlapping_default_network_selectors_cannot_choose_between_tables() {
 
 #[test]
 fn nested_android_permission_masks_are_not_mistaken_for_disjoint_anchors() {
-    let profile = AndroidRpdbPolicyProfile::AospAndroid13R1;
+    let profile = AndroidNetdSourceProfile::AospAndroid13R1;
     let mut fixture = profile_fixture(profile, false);
     fixture.rules.push(
         RuleSpec::netd(31_000, 1_004, RuleAction::TO_TABLE)
@@ -499,7 +499,7 @@ fn nested_android_permission_masks_are_not_mistaken_for_disjoint_anchors() {
 
 #[test]
 fn invalid_family_profile_makes_even_a_recognized_anchor_untrusted() {
-    let profile = AndroidRpdbPolicyProfile::AospAndroid13R1;
+    let profile = AndroidNetdSourceProfile::AospAndroid13R1;
     let mut fixture = profile_fixture(profile, false);
     fixture.rules.retain(|rule| rule.priority().get() != 20_000);
     let inventory = make_inventory(fixture.links, fixture.rules);
@@ -517,7 +517,7 @@ fn invalid_family_profile_makes_even_a_recognized_anchor_untrusted() {
 
 #[test]
 fn reports_reject_cross_snapshot_inputs_and_stale_future_use() {
-    let profile = AndroidRpdbPolicyProfile::AospAndroid13R1;
+    let profile = AndroidNetdSourceProfile::AospAndroid13R1;
     let first = profile_inventory(profile, false);
     let first_classification = classify_android_rpdb(&first, profile);
     let second = profile_inventory(profile, false);
@@ -546,7 +546,7 @@ fn reports_reject_cross_snapshot_inputs_and_stale_future_use() {
     assert_eq!(stale.reported_profile(), profile);
     assert_eq!(stale.current_profile(), profile);
 
-    let wrong_profile = AndroidRpdbPolicyProfile::AospAndroid12R1;
+    let wrong_profile = AndroidNetdSourceProfile::AospAndroid12R1;
     let wrong_classification = classify_android_rpdb(&first, wrong_profile);
     let stale = report
         .ensure_current(&first, &wrong_classification)
@@ -562,7 +562,7 @@ fn reports_reject_cross_snapshot_inputs_and_stale_future_use() {
 
 #[test]
 fn scope_atomically_assesses_dual_stack_local_and_tether_domains() {
-    let profile = AndroidRpdbPolicyProfile::AospAndroid13R1;
+    let profile = AndroidNetdSourceProfile::AospAndroid13R1;
     let fixture = profile_fixture_for_families(
         profile,
         [NetworkAddressFamily::Ipv4, NetworkAddressFamily::Ipv6],
@@ -639,7 +639,7 @@ fn scope_atomically_assesses_dual_stack_local_and_tether_domains() {
 
 #[test]
 fn scope_preserves_negative_evidence_with_definite_failure_precedence() {
-    let profile = AndroidRpdbPolicyProfile::AospAndroid12R1;
+    let profile = AndroidNetdSourceProfile::AospAndroid12R1;
     let mut fixture = profile_fixture_for_families(
         profile,
         [NetworkAddressFamily::Ipv4, NetworkAddressFamily::Ipv6],
@@ -707,7 +707,7 @@ fn scope_preserves_negative_evidence_with_definite_failure_precedence() {
 
 #[test]
 fn scope_summary_is_incomplete_only_when_no_definite_failure_exists() {
-    let profile = AndroidRpdbPolicyProfile::AospAndroid13R1;
+    let profile = AndroidNetdSourceProfile::AospAndroid13R1;
     let mut fixture = profile_fixture(profile, true);
     fixture.rules.push(
         RuleSpec::netd(20_500, 1_777, RuleAction::TO_TABLE)
@@ -744,7 +744,7 @@ fn scope_summary_is_incomplete_only_when_no_definite_failure_exists() {
 
 #[test]
 fn known_slot_exhaustion_precedes_unknown_same_domain_rules() {
-    let profile = AndroidRpdbPolicyProfile::AospAndroid12R1;
+    let profile = AndroidNetdSourceProfile::AospAndroid12R1;
     let mut fixture = profile_fixture(profile, false);
     fixture.rules.push(
         RuleSpec::netd(20_500, 1_777, RuleAction::TO_TABLE)
@@ -810,7 +810,7 @@ fn scope_request_is_nonempty_bounded_and_duplicate_free() {
 
 #[test]
 fn scope_requires_every_requested_domain_to_have_an_observed_anchor() {
-    let profile = AndroidRpdbPolicyProfile::AospAndroid13R1;
+    let profile = AndroidNetdSourceProfile::AospAndroid13R1;
     let inventory = profile_inventory(profile, false);
     let classification = classify_android_rpdb(&inventory, profile);
     let missing_ipv6 =
@@ -830,7 +830,7 @@ fn scope_requires_every_requested_domain_to_have_an_observed_anchor() {
 
 #[test]
 fn scope_includes_every_matching_anchor_and_enforces_its_report_bound() {
-    let profile = AndroidRpdbPolicyProfile::AospAndroid13R1;
+    let profile = AndroidNetdSourceProfile::AospAndroid13R1;
     let mut fixture = profile_fixture(profile, false);
     fixture
         .rules
@@ -883,7 +883,7 @@ fn scope_includes_every_matching_anchor_and_enforces_its_report_bound() {
 
 #[test]
 fn scope_freshness_reassesses_complete_anchor_discovery() {
-    let profile = AndroidRpdbPolicyProfile::AospAndroid13R1;
+    let profile = AndroidNetdSourceProfile::AospAndroid13R1;
     let first = profile_inventory(profile, false);
     let first_classification = classify_android_rpdb(&first, profile);
     let request = AndroidTproxyTopologyScopeRequest::new(
@@ -920,17 +920,17 @@ fn scope_freshness_reassesses_complete_anchor_discovery() {
     ));
 }
 
-fn profile_inventory(profile: AndroidRpdbPolicyProfile, tether: bool) -> NetworkInventory {
+fn profile_inventory(profile: AndroidNetdSourceProfile, tether: bool) -> NetworkInventory {
     let fixture = profile_fixture(profile, tether);
     make_inventory(fixture.links, fixture.rules)
 }
 
-fn profile_fixture(profile: AndroidRpdbPolicyProfile, tether: bool) -> Fixture {
+fn profile_fixture(profile: AndroidNetdSourceProfile, tether: bool) -> Fixture {
     profile_fixture_for_families(profile, [NetworkAddressFamily::Ipv4], tether)
 }
 
 fn profile_fixture_for_families(
-    profile: AndroidRpdbPolicyProfile,
+    profile: AndroidNetdSourceProfile,
     families: impl IntoIterator<Item = NetworkAddressFamily>,
     tether: bool,
 ) -> Fixture {
@@ -1007,7 +1007,7 @@ fn skeleton_for(family: NetworkAddressFamily) -> Vec<NetworkRuleRecord> {
 }
 
 fn default_network_for(
-    profile: AndroidRpdbPolicyProfile,
+    profile: AndroidNetdSourceProfile,
     family: NetworkAddressFamily,
 ) -> NetworkRuleRecord {
     RuleSpec::netd(

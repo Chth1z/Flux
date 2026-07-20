@@ -1,9 +1,8 @@
 use std::error::Error;
 use std::fmt;
 
-use crate::android_rpdb::{
-    AndroidRpdbClassificationReport, AndroidRpdbPolicyProfile, AndroidRpdbRuleRole,
-};
+use crate::android_netd::AndroidNetdSourceProfile;
+use crate::android_rpdb::{AndroidRpdbClassificationReport, AndroidRpdbRuleRole};
 use crate::network_inventory::{
     InterfaceIndex, InterfaceLinkFlags, InterfaceName, NetworkEpoch, NetworkInventory,
     NetworkInventorySnapshotId,
@@ -442,7 +441,7 @@ pub struct AndroidTproxyTopologyFeasibilityReport {
     snapshot_id: NetworkInventorySnapshotId,
     epoch: NetworkEpoch,
     classifier_revision: RpdbClassifierRevision,
-    profile: AndroidRpdbPolicyProfile,
+    profile: AndroidNetdSourceProfile,
     kind: AndroidTproxyTrafficDomainKind,
     selector: AndroidTproxyDomainSelector,
     input_interface_index: InterfaceIndex,
@@ -469,7 +468,7 @@ impl AndroidTproxyTopologyFeasibilityReport {
     }
 
     #[must_use]
-    pub const fn profile(&self) -> AndroidRpdbPolicyProfile {
+    pub const fn profile(&self) -> AndroidNetdSourceProfile {
         self.profile
     }
 
@@ -599,8 +598,8 @@ pub struct StaleAndroidTproxyTopologyReport {
     reported_epoch: NetworkEpoch,
     current_inventory_epoch: NetworkEpoch,
     current_classification_epoch: NetworkEpoch,
-    reported_profile: AndroidRpdbPolicyProfile,
-    current_profile: AndroidRpdbPolicyProfile,
+    reported_profile: AndroidNetdSourceProfile,
+    current_profile: AndroidNetdSourceProfile,
     reported_classifier_revision: RpdbClassifierRevision,
     current_classifier_revision: RpdbClassifierRevision,
 }
@@ -637,12 +636,12 @@ impl StaleAndroidTproxyTopologyReport {
     }
 
     #[must_use]
-    pub const fn reported_profile(self) -> AndroidRpdbPolicyProfile {
+    pub const fn reported_profile(self) -> AndroidNetdSourceProfile {
         self.reported_profile
     }
 
     #[must_use]
-    pub const fn current_profile(self) -> AndroidRpdbPolicyProfile {
+    pub const fn current_profile(self) -> AndroidNetdSourceProfile {
         self.current_profile
     }
 
@@ -715,7 +714,7 @@ pub struct AndroidTproxyTopologyScopeReport {
     snapshot_id: NetworkInventorySnapshotId,
     epoch: NetworkEpoch,
     classifier_revision: RpdbClassifierRevision,
-    profile: AndroidRpdbPolicyProfile,
+    profile: AndroidNetdSourceProfile,
     request: AndroidTproxyTopologyScopeRequest,
     entries: Box<[AndroidTproxyTopologyScopeEntry]>,
     structural_feasibility: AndroidTproxyTopologyScopeStructuralFeasibility,
@@ -738,7 +737,7 @@ impl AndroidTproxyTopologyScopeReport {
     }
 
     #[must_use]
-    pub const fn profile(&self) -> AndroidRpdbPolicyProfile {
+    pub const fn profile(&self) -> AndroidNetdSourceProfile {
         self.profile
     }
 
@@ -796,8 +795,8 @@ pub struct StaleAndroidTproxyTopologyScopeReport {
     reported_epoch: NetworkEpoch,
     current_inventory_epoch: NetworkEpoch,
     current_classification_epoch: NetworkEpoch,
-    reported_profile: AndroidRpdbPolicyProfile,
-    current_profile: AndroidRpdbPolicyProfile,
+    reported_profile: AndroidNetdSourceProfile,
+    current_profile: AndroidNetdSourceProfile,
     reported_classifier_revision: RpdbClassifierRevision,
     current_classifier_revision: RpdbClassifierRevision,
 }
@@ -834,12 +833,12 @@ impl StaleAndroidTproxyTopologyScopeReport {
     }
 
     #[must_use]
-    pub const fn reported_profile(self) -> AndroidRpdbPolicyProfile {
+    pub const fn reported_profile(self) -> AndroidNetdSourceProfile {
         self.reported_profile
     }
 
     #[must_use]
-    pub const fn current_profile(self) -> AndroidRpdbPolicyProfile {
+    pub const fn current_profile(self) -> AndroidNetdSourceProfile {
         self.current_profile
     }
 

@@ -3,9 +3,9 @@ use crate::{
     AndroidMarkDevicePolicy, AndroidMarkDevicePolicyArtifactDigest,
     AndroidMarkDevicePolicyArtifactDigestError, AndroidMarkDevicePolicyError,
     AndroidMarkDevicePolicyKind, AndroidMarkDevicePolicyName, AndroidMarkDevicePolicyNameError,
-    AndroidMarkDevicePolicyRevision, AndroidMarkPlanningAuthorizationError, AndroidProductIdentity,
-    AndroidRpdbClassificationReport, AndroidRpdbPolicyProfile, AndroidTproxyRoutingShape,
-    AndroidTproxyTopologyScopeReport, AndroidTproxyTopologyScopeRequest,
+    AndroidMarkDevicePolicyRevision, AndroidMarkPlanningAuthorizationError,
+    AndroidNetdSourceProfile, AndroidProductIdentity, AndroidRpdbClassificationReport,
+    AndroidTproxyRoutingShape, AndroidTproxyTopologyScopeReport, AndroidTproxyTopologyScopeRequest,
     AndroidTproxyTrafficDomainRequest, ArtifactIdentity, BootIdentity,
     COMPLETE_FWMARK_CENSUS_COVERAGE_RECORDS, CapabilityProfile, CapabilityProfileRevision,
     CompleteFwmarkCensus, CompleteFwmarkCensusError, DeferredAndroidMarkActivationPrerequisite,
@@ -646,7 +646,7 @@ fn opaque_rpdb_evidence_rejects_even_when_the_census_claims_complete_coverage() 
     fixture.rules.sort_by_key(NetworkRuleRecord::priority);
     let inventory = make_inventory(fixture.links, fixture.rules);
     let classification =
-        classify_android_rpdb(&inventory, AndroidRpdbPolicyProfile::AospAndroid13R1);
+        classify_android_rpdb(&inventory, AndroidNetdSourceProfile::AospAndroid13R1);
     let topology_scope = local_scope(&inventory, &classification);
     let capability_profile = verified_capability_profile(
         CapabilityProfileRevision::INITIAL,
@@ -717,7 +717,7 @@ fn census_conflict_precedes_an_otherwise_incomplete_topology_scope() {
     fixture.rules.sort_by_key(NetworkRuleRecord::priority);
     let inventory = make_inventory(fixture.links, fixture.rules);
     let classification =
-        classify_android_rpdb(&inventory, AndroidRpdbPolicyProfile::AospAndroid13R1);
+        classify_android_rpdb(&inventory, AndroidNetdSourceProfile::AospAndroid13R1);
     let topology_scope = local_scope(&inventory, &classification);
     assert!(matches!(
         topology_scope.structural_feasibility(),
@@ -843,7 +843,7 @@ fn candidate_and_exact_topology_scope_are_bound_by_the_positive_grant() {
     let fixture = profile_fixture(true);
     let inventory = make_inventory(fixture.links, fixture.rules);
     let classification =
-        classify_android_rpdb(&inventory, AndroidRpdbPolicyProfile::AospAndroid13R1);
+        classify_android_rpdb(&inventory, AndroidNetdSourceProfile::AospAndroid13R1);
     let local = local_scope(&inventory, &classification);
     let tether_request = AndroidTproxyTopologyScopeRequest::new(
         AndroidTproxyRoutingShape::PreMarkAddressHostSet,
@@ -1358,7 +1358,7 @@ fn stale_topology_scope_is_rejected_even_when_an_identical_dump_is_recollected()
     let current_inventory = make_inventory(fixture.links, fixture.rules);
     let current_classification = classify_android_rpdb(
         &current_inventory,
-        AndroidRpdbPolicyProfile::AospAndroid13R1,
+        AndroidNetdSourceProfile::AospAndroid13R1,
     );
     let census = census_with(
         &current_inventory,
@@ -1603,7 +1603,7 @@ impl TestContext {
         let fixture = profile_fixture(false);
         let inventory = make_inventory(fixture.links, fixture.rules);
         let classification =
-            classify_android_rpdb(&inventory, AndroidRpdbPolicyProfile::AospAndroid13R1);
+            classify_android_rpdb(&inventory, AndroidNetdSourceProfile::AospAndroid13R1);
         let topology_scope = local_scope(&inventory, &classification);
         let network_namespace = namespace(10, 20);
         let capability_profile = verified_capability_profile(

@@ -5,10 +5,121 @@ use crate::android_mark_authority::{
     FwmarkCensusCoverageRecord, FwmarkCensusCoverageState, FwmarkPlane, FwmarkUseOperation,
     FwmarkUseRecord, MAX_COMPLETE_FWMARK_CENSUS_MARK_USES,
 };
-use crate::fwmark_audit::FwmarkEvidenceSource;
+use crate::android_netd::AndroidNetdSourceProfile;
+use crate::fwmark_audit::{ANDROID_NET_ID_FWMARK_MASK, FwmarkEvidenceSource};
 use crate::network_inventory::{NetworkEpoch, NetworkInventory, NetworkInventorySnapshotId};
 
+const ANDROID_NET_ID_COVERAGE_RECORDS: usize = 3;
+const ANDROID_NET_ID_MARK_USE_RECORDS: usize = 3;
+const ANDROID_12_13_INCOMING_PACKET_FWMARK_MASK: u32 = 0xffef_ffff;
+const ANDROID_2025_INCOMING_PACKET_FWMARK_MASK: u32 = 0x7fef_ffff;
 const RPDB_COVERAGE_RECORDS: usize = 3;
+
+/// Static Android `netId` source evidence for a future complete fwmark census.
+///
+/// The selected AOSP netd profiles define bits 0-15 as `netId`. Their incoming-packet rule writes
+/// every mark bit except UID billing and, in the 2025 profile, ingress CPU wakeup; `FwmarkServer`
+/// reads then updates the low-16-bit field in socket marks. Direct conntrack use is absent;
+/// packet/socket/conntrack copy operations belong to the separate `ConnmarkAndSocketTransfers`
+/// source. This fragment does not select a profile for a device and exposes no conversion into a
+/// complete census or planning authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AndroidNetIdFwmarkCensusFragment {
+    profile: AndroidNetdSourceProfile,
+    coverage: [FwmarkCensusCoverageRecord; ANDROID_NET_ID_COVERAGE_RECORDS],
+    raw_mark_uses: [FwmarkUseRecord; ANDROID_NET_ID_MARK_USE_RECORDS],
+}
+
+impl AndroidNetIdFwmarkCensusFragment {
+    #[must_use]
+    pub const fn profile(&self) -> AndroidNetdSourceProfile {
+        self.profile
+    }
+
+    #[must_use]
+    pub const fn source_revision(&self) -> &'static str {
+        self.profile.source_revision()
+    }
+
+    /// Returns Android `netId` coverage in packet, socket, then conntrack plane order.
+    #[must_use]
+    pub const fn coverage(&self) -> &[FwmarkCensusCoverageRecord] {
+        &self.coverage
+    }
+
+    /// Returns packet masked-write, socket predicate-read, then socket masked-write evidence.
+    #[must_use]
+    pub const fn raw_mark_uses(&self) -> &[FwmarkUseRecord] {
+        &self.raw_mark_uses
+    }
+}
+
+/// Projects the direct Android `netId` operations defined by one explicit source-pinned profile.
+///
+/// All currently modeled profiles share the same low-16-bit socket semantics, while their exact
+/// incoming-packet writer masks differ. Keeping the profile explicit prevents this static fragment
+/// from authenticating a runtime netd binary or being mistaken for point-in-time cross-source
+/// coordination.
+#[must_use]
+pub fn project_android_net_id_fwmark_census_fragment(
+    profile: AndroidNetdSourceProfile,
+) -> AndroidNetIdFwmarkCensusFragment {
+    let coverage = [
+        FwmarkCensusCoverageRecord::new(
+            FwmarkEvidenceSource::AndroidNetId,
+            FwmarkPlane::Packet,
+            FwmarkCensusCoverageState::CompletePresent,
+        ),
+        FwmarkCensusCoverageRecord::new(
+            FwmarkEvidenceSource::AndroidNetId,
+            FwmarkPlane::Socket,
+            FwmarkCensusCoverageState::CompletePresent,
+        ),
+        FwmarkCensusCoverageRecord::new(
+            FwmarkEvidenceSource::AndroidNetId,
+            FwmarkPlane::Conntrack,
+            FwmarkCensusCoverageState::CompleteAbsent,
+        ),
+    ];
+    let raw_mark_uses = [
+        FwmarkUseRecord::new(
+            FwmarkEvidenceSource::AndroidNetId,
+            FwmarkPlane::Packet,
+            FwmarkUseOperation::MaskedWrite,
+            incoming_packet_fwmark_mask(profile),
+        )
+        .expect("the source-pinned Android incoming-packet mask is nonzero"),
+        FwmarkUseRecord::new(
+            FwmarkEvidenceSource::AndroidNetId,
+            FwmarkPlane::Socket,
+            FwmarkUseOperation::PredicateRead,
+            ANDROID_NET_ID_FWMARK_MASK,
+        )
+        .expect("the Android netId mask is nonzero"),
+        FwmarkUseRecord::new(
+            FwmarkEvidenceSource::AndroidNetId,
+            FwmarkPlane::Socket,
+            FwmarkUseOperation::MaskedWrite,
+            ANDROID_NET_ID_FWMARK_MASK,
+        )
+        .expect("the Android netId mask is nonzero"),
+    ];
+
+    AndroidNetIdFwmarkCensusFragment {
+        profile,
+        coverage,
+        raw_mark_uses,
+    }
+}
+
+const fn incoming_packet_fwmark_mask(profile: AndroidNetdSourceProfile) -> u32 {
+    match profile {
+        AndroidNetdSourceProfile::AospAndroid12R1 | AndroidNetdSourceProfile::AospAndroid13R1 => {
+            ANDROID_12_13_INCOMING_PACKET_FWMARK_MASK
+        }
+        AndroidNetdSourceProfile::AospNetd20250324 => ANDROID_2025_INCOMING_PACKET_FWMARK_MASK,
+    }
+}
 
 /// Inventory-bound RPDB source evidence for a future complete fwmark census.
 ///

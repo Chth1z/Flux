@@ -381,8 +381,18 @@ raw pairs, opaque rules keep both flow-origin cells opaque while retaining known
 snapshot/epoch binding rejects drift and equal-epoch cross-tracker evidence. The fragment accepts
 at most 512 raw records—256 marked rules—and rejects selector 257 without truncation. It has no
 complete-collector revision, policy or ownership binding, complete-census conversion, Planning
-Authority, lease, writer, or mutation capability. The remaining 24 cells and cross-source
-point-in-time coordination are still pending.
+Authority, lease, writer, or mutation capability. At that first checkpoint, the remaining 24 cells
+and cross-source point-in-time coordination were still pending.
+
+The second source-scoped checkpoint is a static `AndroidNetIdFwmarkCensusFragment` under one
+canonical explicit `AndroidNetdSourceProfile` shared with RPDB classification. It records the exact
+incoming-packet masked writer—`0xffef_ffff` on Android 12/13 and `0x7fef_ffff` at the pinned March
+2025 revision—plus low-16-bit socket predicate-read/masked-write semantics. Every pinned packet
+writer overlaps the complete `0x7fe0_0000` device-qualified candidate envelope. The direct
+conntrack cell is complete-absent because connmark copy operations remain a separate transfer
+source. It performs no runtime artifact authentication or automatic profile selection and exposes
+no complete-census conversion or authority. The two fragments now model six cells; the remaining
+21 cells and point-in-time coordination are pending.
 
 ### Deliverables
 
@@ -396,7 +406,7 @@ point-in-time coordination are still pending.
   and namespace identity to the freshness-bound profile. Android collection is direct, bounded and
   point-in-time rechecked; generic Linux remains `Unavailable`, and WSA cannot satisfy complete AVB.
 - **Delivered empty catalog boundary:** select positive policy only from bounded source-coded entries keyed by stable product/build/kernel/policy/tool artifact identities and external policy digest/revision; retain catalog entry ID through census identity, bind matches to verified boot/profile/namespace, and reject arbitrary runtime catalogs or manifests. Production entries remain pending independent physical-device review.
-- Continue bounded source-by-source mark-evidence collection and then assemble the fresh complete 27-cell fwmark census collector; source fragments cannot authorize planning, and generic AOSP must continue to produce zero grant.
+- Continue the remaining 21 bounded source-plane cells and then assemble the fresh complete 27-cell fwmark census collector; source fragments cannot authorize planning, and generic AOSP must continue to produce zero grant.
 - Rust rtnetlink PBR apply/verify/cleanup.
 - Generation journal and startup recovery for routes/rules.
 - Remove the standalone `addrsyncd` process from runtime. Its binary may remain only in controlled

@@ -1,6 +1,7 @@
 use super::*;
 use crate::android_mark_authority::{AndroidMarkDeviceGrantKind, FwmarkPlaneSet};
-use crate::android_rpdb::{AndroidRpdbPolicyProfile, classify_android_rpdb};
+use crate::android_netd::AndroidNetdSourceProfile;
+use crate::android_rpdb::classify_android_rpdb;
 use crate::android_tproxy_topology::{
     AndroidTproxyRoutingShape, AndroidTproxyTopologyScopeRequest,
     AndroidTproxyTrafficDomainRequest, assess_android_tproxy_topology_scope,
@@ -450,7 +451,7 @@ fn topology_scope() -> AndroidTproxyTopologyScopeReport {
         .expect("complete inventory")
         .clone();
     let classification =
-        classify_android_rpdb(&inventory, AndroidRpdbPolicyProfile::AospAndroid13R1);
+        classify_android_rpdb(&inventory, AndroidNetdSourceProfile::AospAndroid13R1);
     let request = AndroidTproxyTopologyScopeRequest::new(
         AndroidTproxyRoutingShape::PreMarkAddressHostSet,
         [AndroidTproxyTrafficDomainRequest::residual_local_output(

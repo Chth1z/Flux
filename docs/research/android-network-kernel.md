@@ -137,7 +137,7 @@ There is no public allocator for third-party mark bits. Even AOSP-reserved bits 
 
 Negative conflict analysis cannot allocate a mark field. Generic AOSP has no public allocator and is modeled as an explicit zero grant. The inclusive bits 21–30 mask (`0x7fe0_0000`) is only a syntactic envelope in which an exact device-qualified policy may name a candidate; it is not a reservation, and taking the complement of observed masks is forbidden.
 
-A positive grant is an external trust-boundary assertion, not verification performed by `flux-core`. It binds the exact mask/proxy/bypass candidate, exact atomic TPROXY topology scope, full `CapabilityProfile` with verified boot identity, network-namespace identity, a named cooperative policy with a nonzero SHA-256 artifact digest and policy revision, and the exact nonempty mark-plane set asserted by that policy. A partial plane assertion is representable but insufficient: planning authorization requires packet, socket, and conntrack coverage. Automatic and explicit mark configuration supply candidates only and require the same grant; explicit input is not an override.
+A positive grant can be constructed inside `flux-core` only after exact selection from the compiled reviewed-policy catalog; external adapters cannot inject one directly. It binds the exact mask/proxy/bypass candidate, exact atomic TPROXY topology scope, full `CapabilityProfile` with verified boot identity, network-namespace identity, a named cooperative policy with a nonzero SHA-256 artifact digest and policy revision, and the exact nonempty mark-plane set asserted by that policy. A partial plane assertion is representable but insufficient: planning authorization requires packet, socket, and conntrack coverage. Automatic and explicit mark configuration supply candidates only and require the same grant; explicit input is not an override.
 
 Live authorization consumes one point-in-time, non-cloneable complete census. It requires exactly nine sources across all three planes, or 27 complete-present/complete-absent coverage records:
 
@@ -159,6 +159,19 @@ predicate read. It records the RPDB conntrack cell as complete-absent because FI
 directly read ctmark; any ctmark-to-packet influence belongs to the separate transfer evidence
 source. Opaque rule attributes make both flow-origin cells opaque without discarding known
 selectors. [S43], [S44], [S45], [S46], [S47]
+
+The second source fragment models Android `netId` only under an explicitly selected, source-pinned
+AOSP netd profile shared with RPDB classification. The inspected Android 12 r1, Android 13 r1, and
+March 2025 sources all define bits 0-15 as `netId`, but `modifyIncomingPacketMark` deliberately uses
+a wider xtables mask. Android 12/13 preserve only UID billing and therefore write `0xffef_ffff`; the
+pinned 2025 source also preserves ingress CPU wakeup and writes `0x7fef_ffff`. Both masks intersect
+every bit in Flux's `0x7fe0_0000` device-qualified candidate envelope. `FwmarkServer` separately
+reads the existing socket mark, consults `netId`, updates the low-16-bit field, and writes the merged
+mark back. The fragment therefore records the exact profile-specific packet `MaskedWrite` plus
+low-16-bit socket `PredicateRead` and `MaskedWrite`. Direct conntrack coverage is complete-absent
+because AOSP's packet-to-conntrack save rules are represented by the separate transfer source. This
+static source profile does not authenticate the runtime netd binary or select itself for a device.
+[S8], [S9], [S40], [S53], [S54], [S55], [S56]
 
 Unsupported, duplicate, incomplete, opaque, denied, unknown, inconsistent, over-budget, or transient-attempt coverage grants no authority. The census accepts at most 512 raw predicate-read, masked-write, transfer-read, or transfer-write records before canonical sorting and deduplication, and binds the exact inventory snapshot identity/epoch, full capability facts and boot, namespace, policy identity/revision, collector revision, and durable ownership-journal identity/revision. Any candidate-mask overlap with an external use rejects regardless of the compared values. Opaque RPDB evidence rejects even if another census cell claims completeness, and known conflicts are decided before an otherwise incomplete topology report.
 
@@ -568,3 +581,7 @@ Acceptance invariants:
 [S50]: https://source.android.com/docs/core/architecture/kernel/stable-kmi
 [S51]: https://source.android.com/docs/core/architecture/kernel/vendor-module-guidelines
 [S52]: https://source.android.com/docs/core/architecture/partitions/vendor-odm-dlkm-partition
+[S53]: https://android.googlesource.com/platform/system/netd/+/5ca3d903c0253ec29fb4c3e3390f292494612e88/server/RouteController.cpp
+[S54]: https://android.googlesource.com/platform/system/netd/+/03311137011f7ca55f263b61a8c86681c1581518/server/RouteController.cpp
+[S55]: https://android.googlesource.com/platform/system/netd/+/5ca3d903c0253ec29fb4c3e3390f292494612e88/include/Fwmark.h
+[S56]: https://android.googlesource.com/platform/system/netd/+/03311137011f7ca55f263b61a8c86681c1581518/include/Fwmark.h

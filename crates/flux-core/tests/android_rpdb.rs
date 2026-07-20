@@ -1,7 +1,7 @@
 use std::net::{IpAddr, Ipv4Addr};
 
 use flux_core::{
-    AndroidRpdbPlacementPlanError, AndroidRpdbPolicyProfile, AndroidRpdbPriorityBand,
+    AndroidNetdSourceProfile, AndroidRpdbPlacementPlanError, AndroidRpdbPriorityBand,
     AndroidRpdbProfileIssue, AndroidRpdbRuleRole, AndroidRpdbUnknownReason, InterfaceName,
     MAX_ANDROID_RPDB_UNKNOWN_RULES, NetworkAddressFamily, NetworkInventory,
     NetworkInventoryTracker, NetworkRuleRecord, OpaqueRuleAttribute, RpdbFamilyPlacement,
@@ -26,21 +26,21 @@ const LOCAL_COPY_TABLE: u32 = 1_000_000_003;
 fn profiles_are_explicitly_revisioned_and_expose_the_structural_two_rule_blocker() {
     let profiles = [
         (
-            AndroidRpdbPolicyProfile::AospAndroid12R1,
+            AndroidNetdSourceProfile::AospAndroid12R1,
             "5ca3d903c0253ec29fb4c3e3390f292494612e88",
             28_999,
             29_000,
             0,
         ),
         (
-            AndroidRpdbPolicyProfile::AospAndroid13R1,
+            AndroidNetdSourceProfile::AospAndroid13R1,
             "03311137011f7ca55f263b61a8c86681c1581518",
             30_998,
             31_000,
             1,
         ),
         (
-            AndroidRpdbPolicyProfile::AospNetd20250324,
+            AndroidNetdSourceProfile::AospNetd20250324,
             "e11b8688b1f99292ade06f89f957c1f7e76ceae9",
             30_998,
             31_000,
@@ -71,12 +71,12 @@ fn profiles_are_explicitly_revisioned_and_expose_the_structural_two_rule_blocker
 
 #[test]
 fn android_12_profile_recognizes_the_complete_role_grammar_in_order() {
-    assert_complete_role_fixture(AndroidRpdbPolicyProfile::AospAndroid12R1);
+    assert_complete_role_fixture(AndroidNetdSourceProfile::AospAndroid12R1);
 }
 
 #[test]
 fn android_13_profile_recognizes_the_complete_role_grammar_in_order() {
-    assert_complete_role_fixture(AndroidRpdbPolicyProfile::AospAndroid13R1);
+    assert_complete_role_fixture(AndroidNetdSourceProfile::AospAndroid13R1);
 }
 
 #[test]
@@ -85,7 +85,7 @@ fn paired_ipv4_and_ipv6_initialization_skeletons_are_validated_independently() {
     rules.extend(skeleton_for(NetworkAddressFamily::Ipv6));
     sort_rules(&mut rules);
     let inventory = inventory(rules);
-    let report = classify_android_rpdb(&inventory, AndroidRpdbPolicyProfile::AospAndroid13R1);
+    let report = classify_android_rpdb(&inventory, AndroidNetdSourceProfile::AospAndroid13R1);
 
     assert_eq!(report.unknown_rule_count(), 0);
     assert!(report.profile_issues().is_empty());
@@ -111,7 +111,7 @@ fn paired_ipv4_and_ipv6_initialization_skeletons_are_validated_independently() {
 
 #[test]
 fn pinned_u_plus_profile_adds_only_the_dynamic_physical_local_role() {
-    assert_complete_role_fixture(AndroidRpdbPolicyProfile::AospNetd20250324);
+    assert_complete_role_fixture(AndroidNetdSourceProfile::AospNetd20250324);
 
     let physical_local = RuleSpec::netd(20_000, NETWORK_TABLE, RuleAction::TO_TABLE)
         .mark(0, EXPLICIT)
@@ -121,7 +121,7 @@ fn pinned_u_plus_profile_adds_only_the_dynamic_physical_local_role() {
     sort_rules(&mut rules);
     let inventory = inventory(rules.clone());
 
-    let android_13 = classify_android_rpdb(&inventory, AndroidRpdbPolicyProfile::AospAndroid13R1);
+    let android_13 = classify_android_rpdb(&inventory, AndroidNetdSourceProfile::AospAndroid13R1);
     let physical_index = inventory
         .rules()
         .iter()
@@ -144,7 +144,7 @@ fn pinned_u_plus_profile_adds_only_the_dynamic_physical_local_role() {
         }
     );
 
-    let pinned = classify_android_rpdb(&inventory, AndroidRpdbPolicyProfile::AospNetd20250324);
+    let pinned = classify_android_rpdb(&inventory, AndroidNetdSourceProfile::AospNetd20250324);
     assert_eq!(pinned.unknown_rule_count(), 0);
     assert_eq!(
         pinned.roles()[physical_index],
@@ -198,7 +198,7 @@ fn system_permission_and_base_priority_role_variants_are_recognized() {
     rules.extend(variants.iter().map(|(_, rule)| rule.clone()));
     sort_rules(&mut rules);
     let inventory = inventory(rules);
-    let report = classify_android_rpdb(&inventory, AndroidRpdbPolicyProfile::AospAndroid13R1);
+    let report = classify_android_rpdb(&inventory, AndroidNetdSourceProfile::AospAndroid13R1);
 
     assert_eq!(report.unknown_rule_count(), 0);
     for (expected_role, rule) in variants {
@@ -225,7 +225,7 @@ fn default_subpriority_extremes_follow_the_selected_profile_exactly() {
     s_rules.extend([s_default.clone(), s_unreachable.clone()]);
     sort_rules(&mut s_rules);
     let s_inventory = inventory(s_rules);
-    let s_report = classify_android_rpdb(&s_inventory, AndroidRpdbPolicyProfile::AospAndroid12R1);
+    let s_report = classify_android_rpdb(&s_inventory, AndroidNetdSourceProfile::AospAndroid12R1);
     assert_eq!(s_report.unknown_rule_count(), 0);
     assert_eq!(
         s_report.roles()[rule_index(&s_inventory, &s_default)],
@@ -259,7 +259,7 @@ fn default_subpriority_extremes_follow_the_selected_profile_exactly() {
     ]);
     sort_rules(&mut t_rules);
     let t_inventory = inventory(t_rules);
-    let t_report = classify_android_rpdb(&t_inventory, AndroidRpdbPolicyProfile::AospAndroid13R1);
+    let t_report = classify_android_rpdb(&t_inventory, AndroidNetdSourceProfile::AospAndroid13R1);
     assert_eq!(
         t_report.roles()[rule_index(&t_inventory, &t_default)],
         Some(AndroidRpdbRuleRole::UidDefaultNetwork)
@@ -293,14 +293,14 @@ fn profile_sensitive_tail_rules_never_cross_dialects() {
     s_rules.push(s_fallthrough.clone());
     sort_rules(&mut s_rules);
     let s_inventory = inventory(s_rules);
-    let s_report = classify_android_rpdb(&s_inventory, AndroidRpdbPolicyProfile::AospAndroid12R1);
+    let s_report = classify_android_rpdb(&s_inventory, AndroidNetdSourceProfile::AospAndroid12R1);
     let s_index = rule_index(&s_inventory, &s_fallthrough);
     assert_eq!(
         s_report.roles()[s_index],
         Some(AndroidRpdbRuleRole::VpnFallthrough)
     );
 
-    let t_report = classify_android_rpdb(&s_inventory, AndroidRpdbPolicyProfile::AospAndroid13R1);
+    let t_report = classify_android_rpdb(&s_inventory, AndroidNetdSourceProfile::AospAndroid13R1);
     assert_eq!(t_report.roles()[s_index], None);
     assert_eq!(
         t_report.unknown_rules()[0].reason(),
@@ -318,14 +318,14 @@ fn profile_sensitive_tail_rules_never_cross_dialects() {
     t_rules.push(t_uid_local.clone());
     sort_rules(&mut t_rules);
     let t_inventory = inventory(t_rules);
-    let t_report = classify_android_rpdb(&t_inventory, AndroidRpdbPolicyProfile::AospAndroid13R1);
+    let t_report = classify_android_rpdb(&t_inventory, AndroidNetdSourceProfile::AospAndroid13R1);
     let t_index = rule_index(&t_inventory, &t_uid_local);
     assert_eq!(
         t_report.roles()[t_index],
         Some(AndroidRpdbRuleRole::UidLocalRoutes)
     );
 
-    let s_report = classify_android_rpdb(&t_inventory, AndroidRpdbPolicyProfile::AospAndroid12R1);
+    let s_report = classify_android_rpdb(&t_inventory, AndroidNetdSourceProfile::AospAndroid12R1);
     assert_eq!(s_report.roles()[t_index], None);
     assert_eq!(
         s_report.unknown_rules()[0].reason(),
@@ -418,7 +418,7 @@ fn every_modeled_field_is_part_of_default_network_recognition() {
         rules.push(variant.clone());
         sort_rules(&mut rules);
         let inventory = inventory(rules);
-        let report = classify_android_rpdb(&inventory, AndroidRpdbPolicyProfile::AospAndroid12R1);
+        let report = classify_android_rpdb(&inventory, AndroidNetdSourceProfile::AospAndroid12R1);
         let index = rule_index(&inventory, &variant);
         assert_eq!(report.roles()[index], None, "variant: {variant:?}");
         assert_eq!(
@@ -440,7 +440,7 @@ fn every_modeled_field_is_part_of_default_network_recognition() {
     sort_rules(&mut exact_rules);
     let exact_inventory = inventory(exact_rules);
     let exact_report =
-        classify_android_rpdb(&exact_inventory, AndroidRpdbPolicyProfile::AospAndroid12R1);
+        classify_android_rpdb(&exact_inventory, AndroidNetdSourceProfile::AospAndroid12R1);
     assert_eq!(
         exact_report.roles()[rule_index(&exact_inventory, &exact)],
         Some(AndroidRpdbRuleRole::DefaultNetwork)
@@ -451,9 +451,9 @@ fn every_modeled_field_is_part_of_default_network_recognition() {
 fn every_recognized_role_rejects_an_unrelated_selector() {
     let tunnel_id = RuleTunnelId::new(1).expect("test tunnel ID");
     for profile in [
-        AndroidRpdbPolicyProfile::AospAndroid12R1,
-        AndroidRpdbPolicyProfile::AospAndroid13R1,
-        AndroidRpdbPolicyProfile::AospNetd20250324,
+        AndroidNetdSourceProfile::AospAndroid12R1,
+        AndroidNetdSourceProfile::AospAndroid13R1,
+        AndroidNetdSourceProfile::AospNetd20250324,
     ] {
         let fixture = complete_role_fixture(profile);
         for (changed_index, (expected_role, _)) in fixture.iter().enumerate() {
@@ -485,7 +485,7 @@ fn opaque_rules_remain_unknown_before_any_shape_is_trusted() {
     rules.push(opaque.clone());
     sort_rules(&mut rules);
     let inventory = inventory(rules);
-    let report = classify_android_rpdb(&inventory, AndroidRpdbPolicyProfile::AospAndroid12R1);
+    let report = classify_android_rpdb(&inventory, AndroidNetdSourceProfile::AospAndroid12R1);
     let index = rule_index(&inventory, &opaque);
 
     assert_eq!(report.roles()[index], None);
@@ -503,7 +503,7 @@ fn missing_anchors_and_nonmonotonic_family_order_downgrade_recognized_rules() {
     let missing_inventory = inventory(missing);
     let missing_report = classify_android_rpdb(
         &missing_inventory,
-        AndroidRpdbPolicyProfile::AospAndroid12R1,
+        AndroidNetdSourceProfile::AospAndroid12R1,
     );
     assert!(missing_report.profile_issues().contains(
         &AndroidRpdbProfileIssue::MissingRequiredRole {
@@ -536,7 +536,7 @@ fn missing_anchors_and_nonmonotonic_family_order_downgrade_recognized_rules() {
     let wrong_local_inventory = inventory(wrong_local_net_id);
     let wrong_local_report = classify_android_rpdb(
         &wrong_local_inventory,
-        AndroidRpdbPolicyProfile::AospAndroid12R1,
+        AndroidNetdSourceProfile::AospAndroid12R1,
     );
     assert!(wrong_local_report.profile_issues().contains(
         &AndroidRpdbProfileIssue::MissingRequiredRole {
@@ -563,7 +563,7 @@ fn missing_anchors_and_nonmonotonic_family_order_downgrade_recognized_rules() {
     let nonmonotonic_inventory = inventory(nonmonotonic);
     let nonmonotonic_report = classify_android_rpdb(
         &nonmonotonic_inventory,
-        AndroidRpdbPolicyProfile::AospAndroid12R1,
+        AndroidNetdSourceProfile::AospAndroid12R1,
     );
     assert!(matches!(
         nonmonotonic_report.profile_issues()[0],
@@ -594,7 +594,7 @@ fn exact_duplicates_preserve_multiplicity_and_diagnostic_evidence_is_bounded() {
     let duplicate_inventory = inventory(duplicate_rules);
     let duplicate_report = classify_android_rpdb(
         &duplicate_inventory,
-        AndroidRpdbPolicyProfile::AospAndroid12R1,
+        AndroidNetdSourceProfile::AospAndroid12R1,
     );
     assert_eq!(duplicate_report.unknown_rule_count(), 0);
     assert_eq!(
@@ -613,7 +613,7 @@ fn exact_duplicates_preserve_multiplicity_and_diagnostic_evidence_is_bounded() {
     let unknown_inventory = inventory(unknown_rules);
     let unknown_report = classify_android_rpdb(
         &unknown_inventory,
-        AndroidRpdbPolicyProfile::AospAndroid12R1,
+        AndroidNetdSourceProfile::AospAndroid12R1,
     );
     assert_eq!(unknown_report.unknown_rule_count(), 70);
     assert_eq!(
@@ -647,7 +647,7 @@ fn classifier_audit_carries_static_bounds_into_the_generic_and_android_planners(
     ]);
     sort_rules(&mut rules);
     let inventory = inventory(rules);
-    let report = classify_android_rpdb(&inventory, AndroidRpdbPolicyProfile::AospAndroid12R1);
+    let report = classify_android_rpdb(&inventory, AndroidNetdSourceProfile::AospAndroid12R1);
     assert_eq!(report.unknown_rule_count(), 0);
 
     let placement = RpdbFamilyPlacement::new(
@@ -682,7 +682,7 @@ fn classifier_audit_carries_static_bounds_into_the_generic_and_android_planners(
     );
 }
 
-fn assert_complete_role_fixture(profile: AndroidRpdbPolicyProfile) {
+fn assert_complete_role_fixture(profile: AndroidNetdSourceProfile) {
     let fixture = complete_role_fixture(profile);
     let expected_roles = fixture
         .iter()
@@ -718,7 +718,7 @@ fn assert_complete_role_fixture(profile: AndroidRpdbPolicyProfile) {
 }
 
 fn complete_role_fixture(
-    profile: AndroidRpdbPolicyProfile,
+    profile: AndroidNetdSourceProfile,
 ) -> Vec<(AndroidRpdbRuleRole, NetworkRuleRecord)> {
     let mut fixture = vec![
         (AndroidRpdbRuleRole::KernelLocal, kernel_local()),
@@ -818,7 +818,7 @@ fn complete_role_fixture(
                 .build(),
         ),
     ];
-    if profile == AndroidRpdbPolicyProfile::AospNetd20250324 {
+    if profile == AndroidNetdSourceProfile::AospNetd20250324 {
         fixture.push((
             AndroidRpdbRuleRole::PhysicalLocalNetwork,
             RuleSpec::netd(20_000, NETWORK_TABLE, RuleAction::TO_TABLE)
@@ -867,7 +867,7 @@ fn complete_role_fixture(
     ]);
 
     match profile {
-        AndroidRpdbPolicyProfile::AospAndroid12R1 => fixture.extend([
+        AndroidNetdSourceProfile::AospAndroid12R1 => fixture.extend([
             (
                 AndroidRpdbRuleRole::VpnFallthrough,
                 RuleSpec::netd(26_000, NETWORK_TABLE, RuleAction::TO_TABLE)
@@ -895,7 +895,7 @@ fn complete_role_fixture(
             ),
             (AndroidRpdbRuleRole::DefaultNetwork, default_network(29_000)),
         ]),
-        AndroidRpdbPolicyProfile::AospAndroid13R1 | AndroidRpdbPolicyProfile::AospNetd20250324 => {
+        AndroidNetdSourceProfile::AospAndroid13R1 | AndroidNetdSourceProfile::AospNetd20250324 => {
             fixture.extend([
                 (
                     AndroidRpdbRuleRole::UidLocalRoutes,

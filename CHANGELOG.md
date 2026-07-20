@@ -33,6 +33,13 @@ All notable changes to the Flux project will be documented in this file.
   entry table is intentionally empty until a physical ARM64 profile is independently reviewed;
   verified nonmatching profiles receive the generic-AOSP zero grant and incomplete identity fails
   closed, so no current device can receive a positive grant.
+- Added a source-pinned Android `netId` fwmark census fragment for the three direct source-plane
+  cells. One canonical netd source profile now pins RPDB and `netId` semantics together. The
+  fragment records the exact incoming-packet writer masks (`0xffef_ffff` on Android 12/13 and
+  `0x7fef_ffff` at the pinned March 2025 revision), proving that every modeled profile overlaps the
+  full Flux candidate envelope, plus low-16-bit socket read/write semantics. Connmark transfers
+  remain a separate source. The fragment cannot authenticate a runtime profile, assemble a
+  complete census, or authorize planning.
 
 ### Rewrite release policy
 - Established the pre-release Rust-only release gate in ADR-0011. Bridge, shadow, parity, and

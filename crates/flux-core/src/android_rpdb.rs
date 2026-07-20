@@ -1,6 +1,7 @@
 use std::error::Error;
 use std::fmt;
 
+use crate::android_netd::AndroidNetdSourceProfile;
 use crate::network_inventory::{InterfaceName, NetworkInventory};
 use crate::network_route::NetworkAddressFamily;
 use crate::network_rule::{
@@ -44,31 +45,7 @@ const REQUIRED_INITIALIZATION_ROLES: [AndroidRpdbRuleRole; 7] = [
 /// Maximum ordered unknown-rule diagnostics retained by one classifier report.
 pub const MAX_ANDROID_RPDB_UNKNOWN_RULES: usize = 64;
 
-/// Explicit, source-pinned AOSP netd policy-rule grammar.
-///
-/// Callers must select this profile from independently verified runtime artifact identity. The
-/// classifier never infers a profile from priorities, an SDK level, or the observed rule lattice.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub enum AndroidRpdbPolicyProfile {
-    /// AOSP `android-12.0.0_r1`, netd commit `5ca3d903...`.
-    AospAndroid12R1,
-    /// AOSP `android-13.0.0_r1`, netd commit `03311137...`.
-    AospAndroid13R1,
-    /// Repository-pinned AOSP netd commit `e11b8688...` from 2025-03-24.
-    AospNetd20250324,
-}
-
-impl AndroidRpdbPolicyProfile {
-    /// Returns the exact AOSP netd source revision modeled by this profile.
-    #[must_use]
-    pub const fn source_revision(self) -> &'static str {
-        match self {
-            Self::AospAndroid12R1 => "5ca3d903c0253ec29fb4c3e3390f292494612e88",
-            Self::AospAndroid13R1 => "03311137011f7ca55f263b61a8c86681c1581518",
-            Self::AospNetd20250324 => "e11b8688b1f99292ade06f89f957c1f7e76ceae9",
-        }
-    }
-
+impl AndroidNetdSourceProfile {
     /// Returns the classifier implementation revision for this exact source profile.
     ///
     /// These values must change whenever matching or classification semantics change, even when
@@ -308,7 +285,7 @@ impl AndroidRpdbProfileIssue {
 /// Ordered role and classification evidence for one exact network inventory snapshot.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AndroidRpdbClassificationReport {
-    profile: AndroidRpdbPolicyProfile,
+    profile: AndroidNetdSourceProfile,
     audit: RpdbRuleAudit,
     roles: Box<[Option<AndroidRpdbRuleRole>]>,
     unknown_rule_count: u32,
@@ -319,7 +296,7 @@ pub struct AndroidRpdbClassificationReport {
 
 impl AndroidRpdbClassificationReport {
     #[must_use]
-    pub const fn profile(&self) -> AndroidRpdbPolicyProfile {
+    pub const fn profile(&self) -> AndroidNetdSourceProfile {
         self.profile
     }
 
@@ -411,7 +388,7 @@ impl Error for AndroidRpdbPlacementPlanError {
 #[must_use]
 pub fn classify_android_rpdb(
     inventory: &NetworkInventory,
-    profile: AndroidRpdbPolicyProfile,
+    profile: AndroidNetdSourceProfile,
 ) -> AndroidRpdbClassificationReport {
     let mut roles = Vec::with_capacity(inventory.rules().len());
     let mut classifications = Vec::with_capacity(inventory.rules().len());
@@ -572,7 +549,7 @@ impl RuleDecision {
     }
 }
 
-fn classify_rule(rule: &NetworkRuleRecord, profile: AndroidRpdbPolicyProfile) -> RuleDecision {
+fn classify_rule(rule: &NetworkRuleRecord, profile: AndroidNetdSourceProfile) -> RuleDecision {
     if !rule.has_complete_attribute_coverage() {
         return RuleDecision::unknown(AndroidRpdbUnknownReason::OpaqueAttributes);
     }
@@ -625,7 +602,7 @@ fn classify_rule(rule: &NetworkRuleRecord, profile: AndroidRpdbPolicyProfile) ->
 }
 
 fn priority_band(
-    profile: AndroidRpdbPolicyProfile,
+    profile: AndroidNetdSourceProfile,
     priority: u32,
 ) -> Option<AndroidRpdbPriorityBand> {
     let common = match priority {
@@ -653,14 +630,14 @@ fn priority_band(
     }
 
     match profile {
-        AndroidRpdbPolicyProfile::AospAndroid12R1 => match priority {
+        AndroidNetdSourceProfile::AospAndroid12R1 => match priority {
             26_000 => Some(AndroidRpdbPriorityBand::VpnFallthrough),
             27_000..=27_999 => Some(AndroidRpdbPriorityBand::UidDefaultNetwork),
             28_000..=28_999 => Some(AndroidRpdbPriorityBand::UidDefaultUnreachable),
             29_000 => Some(AndroidRpdbPriorityBand::DefaultNetwork),
             _ => None,
         },
-        AndroidRpdbPolicyProfile::AospAndroid13R1 | AndroidRpdbPolicyProfile::AospNetd20250324 => {
+        AndroidNetdSourceProfile::AospAndroid13R1 | AndroidNetdSourceProfile::AospNetd20250324 => {
             match priority {
                 25_000 => Some(AndroidRpdbPriorityBand::UidLocalRoutes),
                 26_000 => Some(AndroidRpdbPriorityBand::LocalRoutes),
@@ -835,7 +812,7 @@ fn match_legacy_network(rule: &NetworkRuleRecord) -> Option<AndroidRpdbRuleRole>
 
 fn match_local_network(
     rule: &NetworkRuleRecord,
-    profile: AndroidRpdbPolicyProfile,
+    profile: AndroidNetdSourceProfile,
 ) -> Option<AndroidRpdbRuleRole> {
     if !mark_is(rule, 0, ANDROID_EXPLICITLY_SELECTED) || !no_interfaces_or_uid(rule) {
         return None;

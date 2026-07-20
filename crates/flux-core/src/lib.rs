@@ -9,6 +9,7 @@
 mod address_bypass;
 mod android_mark_authority;
 mod android_mark_policy_catalog;
+mod android_netd;
 mod android_rpdb;
 mod android_tproxy_topology;
 mod capability;
@@ -53,11 +54,12 @@ pub use android_mark_policy_catalog::{
     ReviewedAndroidMarkPolicyCatalogField, ReviewedAndroidMarkPolicySelection,
     select_reviewed_android_mark_policy,
 };
+pub use android_netd::AndroidNetdSourceProfile;
 pub use android_rpdb::{
-    AndroidRpdbClassificationReport, AndroidRpdbPlacementPlanError, AndroidRpdbPolicyProfile,
-    AndroidRpdbPriorityBand, AndroidRpdbPriorityContract, AndroidRpdbProfileIssue,
-    AndroidRpdbRuleRole, AndroidRpdbUnknownReason, AndroidRpdbUnknownRule,
-    MAX_ANDROID_RPDB_UNKNOWN_RULES, classify_android_rpdb, plan_android_rpdb_placement,
+    AndroidRpdbClassificationReport, AndroidRpdbPlacementPlanError, AndroidRpdbPriorityBand,
+    AndroidRpdbPriorityContract, AndroidRpdbProfileIssue, AndroidRpdbRuleRole,
+    AndroidRpdbUnknownReason, AndroidRpdbUnknownRule, MAX_ANDROID_RPDB_UNKNOWN_RULES,
+    classify_android_rpdb, plan_android_rpdb_placement,
 };
 pub use android_tproxy_topology::{
     AndroidTproxyDomainSelector, AndroidTproxyEvidenceCoverage, AndroidTproxyPriorityInterval,
@@ -121,7 +123,8 @@ pub use fwmark_audit::{
     StaleFwmarkPartialAudit, audit_fwmark_candidate_partial,
 };
 pub use fwmark_census::{
-    RpdbFwmarkCensusFragment, RpdbFwmarkCensusFragmentError, StaleRpdbFwmarkCensusFragment,
+    AndroidNetIdFwmarkCensusFragment, RpdbFwmarkCensusFragment, RpdbFwmarkCensusFragmentError,
+    StaleRpdbFwmarkCensusFragment, project_android_net_id_fwmark_census_fragment,
     project_rpdb_fwmark_census_fragment,
 };
 pub use network_inventory::{

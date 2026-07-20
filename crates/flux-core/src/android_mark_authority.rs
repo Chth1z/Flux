@@ -1251,6 +1251,41 @@ impl FwmarkCensusConflict {
     }
 }
 
+/// Source-specific reason an overlapping packet write needs ordering qualification.
+///
+/// This is not compatibility evidence. It only prevents a known late-writer question from being
+/// misreported as a proven simultaneous collision.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum FwmarkOrderedPacketWriteRequirement {
+    /// The pinned Android `netId` writer runs in mangle INPUT after input routing.
+    AndroidNetIdInputAfterRouting,
+}
+
+/// Candidate-mask overlap whose exact packet ordering remains non-authorizing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FwmarkCensusOrderedPacketWrite {
+    mark_use: FwmarkUseRecord,
+    overlap: u32,
+    requirement: FwmarkOrderedPacketWriteRequirement,
+}
+
+impl FwmarkCensusOrderedPacketWrite {
+    #[must_use]
+    pub const fn mark_use(self) -> FwmarkUseRecord {
+        self.mark_use
+    }
+
+    #[must_use]
+    pub const fn overlap(self) -> u32 {
+        self.overlap
+    }
+
+    #[must_use]
+    pub const fn requirement(self) -> FwmarkOrderedPacketWriteRequirement {
+        self.requirement
+    }
+}
+
 /// Activation evidence deliberately left outside this read-only planning authority.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum DeferredAndroidMarkActivationPrerequisite {
@@ -1531,21 +1566,34 @@ pub fn authorize_android_mark_planning(
         );
     }
 
-    let census_conflicts: Vec<_> = census
-        .mark_uses
-        .iter()
-        .filter_map(|mark_use| {
-            let overlap = candidate.mask() & mark_use.mask();
-            (overlap != 0).then_some(FwmarkCensusConflict {
-                mark_use: *mark_use,
+    let mut census_conflicts = Vec::new();
+    let mut ordered_packet_writes = Vec::new();
+    for mark_use in census.mark_uses.iter().copied() {
+        let overlap = candidate.mask() & mark_use.mask();
+        if overlap == 0 {
+            continue;
+        }
+        if let Some(requirement) = ordered_packet_write_requirement(mark_use) {
+            ordered_packet_writes.push(FwmarkCensusOrderedPacketWrite {
+                mark_use,
                 overlap,
-            })
-        })
-        .collect();
+                requirement,
+            });
+        } else {
+            census_conflicts.push(FwmarkCensusConflict { mark_use, overlap });
+        }
+    }
     if !census_conflicts.is_empty() {
         return Err(AndroidMarkPlanningAuthorizationError::CensusConflict {
             conflicts: census_conflicts.into_boxed_slice(),
         });
+    }
+    if !ordered_packet_writes.is_empty() {
+        return Err(
+            AndroidMarkPlanningAuthorizationError::OrderedPacketWriteQualificationRequired {
+                overlaps: ordered_packet_writes.into_boxed_slice(),
+            },
+        );
     }
 
     let incomplete_partial_source = [
@@ -1597,6 +1645,23 @@ pub fn authorize_android_mark_planning(
         census,
         partial_audit,
     })
+}
+
+const fn ordered_packet_write_requirement(
+    mark_use: FwmarkUseRecord,
+) -> Option<FwmarkOrderedPacketWriteRequirement> {
+    if matches!(
+        (mark_use.source(), mark_use.plane(), mark_use.operation(),),
+        (
+            FwmarkEvidenceSource::AndroidNetId,
+            FwmarkPlane::Packet,
+            FwmarkUseOperation::MaskedWrite,
+        )
+    ) {
+        Some(FwmarkOrderedPacketWriteRequirement::AndroidNetIdInputAfterRouting)
+    } else {
+        None
+    }
 }
 
 fn ensure_candidate_eligible(
@@ -1775,6 +1840,9 @@ pub enum AndroidMarkPlanningAuthorizationError {
     CensusConflict {
         conflicts: Box<[FwmarkCensusConflict]>,
     },
+    OrderedPacketWriteQualificationRequired {
+        overlaps: Box<[FwmarkCensusOrderedPacketWrite]>,
+    },
     NonFreshCensusObservation {
         previous_observation_id: CompleteFwmarkCensusObservationId,
         replacement_observation_id: CompleteFwmarkCensusObservationId,
@@ -1795,6 +1863,14 @@ impl AndroidMarkPlanningAuthorizationError {
     pub fn census_conflicts(&self) -> &[FwmarkCensusConflict] {
         match self {
             Self::CensusConflict { conflicts } => conflicts,
+            _ => &[],
+        }
+    }
+
+    #[must_use]
+    pub fn ordered_packet_write_overlaps(&self) -> &[FwmarkCensusOrderedPacketWrite] {
+        match self {
+            Self::OrderedPacketWriteQualificationRequired { overlaps } => overlaps,
             _ => &[],
         }
     }
@@ -1926,6 +2002,11 @@ impl fmt::Display for AndroidMarkPlanningAuthorizationError {
                 formatter,
                 "complete fwmark census found {} candidate-mask conflicts",
                 conflicts.len()
+            ),
+            Self::OrderedPacketWriteQualificationRequired { overlaps } => write!(
+                formatter,
+                "complete fwmark census found {} ordered packet writes requiring device qualification",
+                overlaps.len()
             ),
             Self::NonFreshCensusObservation {
                 previous_observation_id,

@@ -11,20 +11,21 @@ use crate::{
     CompleteFwmarkCensus, CompleteFwmarkCensusError, DeferredAndroidMarkActivationPrerequisite,
     DeferredAndroidTproxyPrerequisite, DeviceIdentity, FwmarkCandidate,
     FwmarkCensusCollectorRevision, FwmarkCensusCoverageRecord, FwmarkCensusCoverageState,
-    FwmarkEvidenceSource, FwmarkEvidenceState, FwmarkPartialAuditOutcome, FwmarkPlane,
-    FwmarkPlaneSet, FwmarkUseOperation, FwmarkUseRecord, FwmarkUseRecordError,
-    InterfaceHardwareType, InterfaceIndex, InterfaceLinkFlags, InterfaceLinkRecord, InterfaceName,
-    KernelBuildIdentity, KernelFacts, KernelRelease, LegacyAddressSynchronization,
-    LegacyArtifactReadiness, LegacyArtifactResolution, LegacyBridgeFacts, LegacyMutationWriter,
-    LegacyRuleBackend, MAX_ANDROID_MARK_DEVICE_POLICY_NAME_BYTES,
-    MAX_COMPLETE_FWMARK_CENSUS_MARK_USES, NetworkAddressFamily, NetworkInventory,
-    NetworkInventoryTracker, NetworkNamespaceIdentity, NetworkRuleRecord, Observation,
-    OpaqueRuleAttribute, OwnershipJournalIdentity, OwnershipJournalIdentityError,
-    OwnershipJournalRevision, RuleAction, RuleAttributeOpacity, RuleFlags, RuleFwMark,
-    RuleOpaqueAttributeFingerprint, RulePrefix, RulePriority, RuleProperties, RuleProtocol,
-    RuleTableId, SecurityPatchLevel, SelinuxMode, SelinuxPolicyIdentity, Sha256Digest, ToolId,
-    VendorBuildIdentity, VerifiedBootIdentity, VerifiedBootState,
-    assess_android_tproxy_topology_scope, authorize_android_mark_planning, classify_android_rpdb,
+    FwmarkEvidenceSource, FwmarkEvidenceState, FwmarkOrderedPacketWriteRequirement,
+    FwmarkPartialAuditOutcome, FwmarkPlane, FwmarkPlaneSet, FwmarkUseOperation, FwmarkUseRecord,
+    FwmarkUseRecordError, InterfaceHardwareType, InterfaceIndex, InterfaceLinkFlags,
+    InterfaceLinkRecord, InterfaceName, KernelBuildIdentity, KernelFacts, KernelRelease,
+    LegacyAddressSynchronization, LegacyArtifactReadiness, LegacyArtifactResolution,
+    LegacyBridgeFacts, LegacyMutationWriter, LegacyRuleBackend,
+    MAX_ANDROID_MARK_DEVICE_POLICY_NAME_BYTES, MAX_COMPLETE_FWMARK_CENSUS_MARK_USES,
+    NetworkAddressFamily, NetworkInventory, NetworkInventoryTracker, NetworkNamespaceIdentity,
+    NetworkRuleRecord, Observation, OpaqueRuleAttribute, OwnershipJournalIdentity,
+    OwnershipJournalIdentityError, OwnershipJournalRevision, RuleAction, RuleAttributeOpacity,
+    RuleFlags, RuleFwMark, RuleOpaqueAttributeFingerprint, RulePrefix, RulePriority,
+    RuleProperties, RuleProtocol, RuleTableId, SecurityPatchLevel, SelinuxMode,
+    SelinuxPolicyIdentity, Sha256Digest, ToolId, VendorBuildIdentity, VerifiedBootIdentity,
+    VerifiedBootState, assess_android_tproxy_topology_scope, authorize_android_mark_planning,
+    classify_android_rpdb,
 };
 
 use super::{
@@ -511,7 +512,7 @@ fn complete_census_bounds_raw_mark_use_evidence_at_five_hundred_twelve_records()
 }
 
 #[test]
-fn every_source_plane_and_operation_overlap_rejects_authority() {
+fn every_overlap_fails_closed_while_the_netid_input_writer_requires_ordering_qualification() {
     for source in SOURCES {
         for plane in PLANES {
             for operation in OPERATIONS {
@@ -523,18 +524,74 @@ fn every_source_plane_and_operation_overlap_rejects_authority() {
                     .expect("complete conflict census");
                 let error = context
                     .authorize(census)
-                    .expect_err("every kind of external overlap is a conflict");
-                let conflicts = error.census_conflicts();
-                assert_eq!(conflicts.len(), 1);
-                assert_eq!(conflicts[0].mark_use(), mark_use);
-                assert_eq!(conflicts[0].overlap(), CANDIDATE_MASK);
-                assert!(matches!(
-                    error,
-                    AndroidMarkPlanningAuthorizationError::CensusConflict { .. }
-                ));
+                    .expect_err("every kind of external overlap remains non-authorizing");
+                if (source, plane, operation)
+                    == (
+                        FwmarkEvidenceSource::AndroidNetId,
+                        FwmarkPlane::Packet,
+                        FwmarkUseOperation::MaskedWrite,
+                    )
+                {
+                    assert!(error.census_conflicts().is_empty());
+                    let overlaps = error.ordered_packet_write_overlaps();
+                    assert_eq!(overlaps.len(), 1);
+                    assert_eq!(overlaps[0].mark_use(), mark_use);
+                    assert_eq!(overlaps[0].overlap(), CANDIDATE_MASK);
+                    assert_eq!(
+                        overlaps[0].requirement(),
+                        FwmarkOrderedPacketWriteRequirement::AndroidNetIdInputAfterRouting
+                    );
+                    assert!(matches!(
+                        error,
+                        AndroidMarkPlanningAuthorizationError::OrderedPacketWriteQualificationRequired { .. }
+                    ));
+                } else {
+                    assert!(error.ordered_packet_write_overlaps().is_empty());
+                    let conflicts = error.census_conflicts();
+                    assert_eq!(conflicts.len(), 1);
+                    assert_eq!(conflicts[0].mark_use(), mark_use);
+                    assert_eq!(conflicts[0].overlap(), CANDIDATE_MASK);
+                    assert!(matches!(
+                        error,
+                        AndroidMarkPlanningAuthorizationError::CensusConflict { .. }
+                    ));
+                }
             }
         }
     }
+}
+
+#[test]
+fn definite_conflicts_precede_an_ordered_netid_packet_write() {
+    let context = TestContext::standard();
+    let ordered = FwmarkUseRecord::new(
+        FwmarkEvidenceSource::AndroidNetId,
+        FwmarkPlane::Packet,
+        FwmarkUseOperation::MaskedWrite,
+        CANDIDATE_MASK,
+    )
+    .expect("ordered packet overlap");
+    let definite = FwmarkUseRecord::new(
+        FwmarkEvidenceSource::Rpdb,
+        FwmarkPlane::Packet,
+        FwmarkUseOperation::PredicateRead,
+        CANDIDATE_MASK,
+    )
+    .expect("definite predicate overlap");
+    let census = context
+        .census(coverage_for_uses([ordered, definite]), [ordered, definite])
+        .expect("complete mixed-overlap census");
+
+    let error = context
+        .authorize(census)
+        .expect_err("the definite conflict must win");
+    assert!(matches!(
+        error,
+        AndroidMarkPlanningAuthorizationError::CensusConflict { .. }
+    ));
+    assert_eq!(error.census_conflicts().len(), 1);
+    assert_eq!(error.census_conflicts()[0].mark_use(), definite);
+    assert!(error.ordered_packet_write_overlaps().is_empty());
 }
 
 #[test]

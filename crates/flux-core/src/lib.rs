@@ -43,11 +43,11 @@ pub use android_mark_authority::{
     COMPLETE_FWMARK_CENSUS_COVERAGE_RECORDS, CompleteFwmarkCensus, CompleteFwmarkCensusError,
     CompleteFwmarkCensusObservationId, DeferredAndroidMarkActivationPrerequisite,
     FwmarkCensusCollectorRevision, FwmarkCensusConflict, FwmarkCensusCoverageRecord,
-    FwmarkCensusCoverageState, FwmarkPlane, FwmarkPlaneSet, FwmarkUseOperation, FwmarkUseRecord,
-    FwmarkUseRecordError, MAX_ANDROID_MARK_DEVICE_POLICY_NAME_BYTES,
-    MAX_COMPLETE_FWMARK_CENSUS_MARK_USES, OWNERSHIP_JOURNAL_IDENTITY_BYTES,
-    OwnershipJournalIdentity, OwnershipJournalIdentityError, OwnershipJournalRevision,
-    ReviewedPolicyCatalogEntryId, authorize_android_mark_planning,
+    FwmarkCensusCoverageState, FwmarkCensusOrderedPacketWrite, FwmarkOrderedPacketWriteRequirement,
+    FwmarkPlane, FwmarkPlaneSet, FwmarkUseOperation, FwmarkUseRecord, FwmarkUseRecordError,
+    MAX_ANDROID_MARK_DEVICE_POLICY_NAME_BYTES, MAX_COMPLETE_FWMARK_CENSUS_MARK_USES,
+    OWNERSHIP_JOURNAL_IDENTITY_BYTES, OwnershipJournalIdentity, OwnershipJournalIdentityError,
+    OwnershipJournalRevision, ReviewedPolicyCatalogEntryId, authorize_android_mark_planning,
 };
 pub use android_mark_policy_catalog::{
     MAX_REVIEWED_ANDROID_MARK_POLICY_CATALOG_ENTRIES, ReviewedAndroidMarkPolicyCatalogError,

@@ -55,6 +55,14 @@ Android 5.10/ARM64 profiles, stops every shell networking writer and standalone 
 before the first Rust write, transfers the lease atomically, and deletes the replaced duties. No
 supported intermediate native-xtables/shell-addrsync composition exists.
 
+Within backlog item 3, the remaining 21 fwmark census cells are paused. The pinned Android `netId`
+packet writer is ordered under mangle INPUT after input route selection, so its envelope overlap is
+not yet a proven simultaneous collision; it is also not compatible until the runtime netd
+profile/chain, listener observation, and mark preservation can be bound on one physical Android
+ARM64 target. Establishing a viable ordered-lifetime/coexistence target and procedure is the next
+mark-authority step. Only then should source-collector expansion resume; adding more non-authorizing
+cells first would not advance the production activation target.
+
 Correctness gates retain strict ordering:
 
 Phase numbers below preserve architectural workstreams and implementation history. They are not the
@@ -128,11 +136,12 @@ verifier can pass, and a verifier pass cannot override ADR-0011's runtime-comple
    and optional descriptive local-routing targets; forwarded-only results remain schema v1 and
    local-OUTPUT results select schema v2. Neither form promotes or mutates the Phase 2 artifact.
 3. **Native Phase 3 activation prerequisites — current:** complete exact device/artifact identity,
-   the positive mark-policy catalog, remaining census cells and point-in-time coordination,
-   observer continuity, mark preservation, domain/network-selection handoff, route reachability,
-   canonical Generation finalization, and in-process address-derived policy. These inputs must
-   describe one complete transaction before production target admission exists. They confer no
-   mutation authority by themselves and must not create another public raw-writer seam.
+   then make one physical ARM64 ordered-mark-lifetime/coexistence target viable before resuming the
+   remaining census cells and point-in-time coordination. Complete observer continuity, mark
+   preservation, domain/network-selection handoff, route reachability, canonical Generation
+   finalization, and in-process address-derived policy. These inputs must describe one complete
+   transaction before production target admission exists. They confer no mutation authority by
+   themselves and must not create another public raw-writer seam.
 4. **Phase 4 bridge substrate — frozen; bounded native owner delivered, production cutover follows
    Phase 3:**
    the validated legacy source-shape renderer independently reproduces the pinned IPv4/IPv6
@@ -371,7 +380,7 @@ The next pure checkpoint now aggregates those reports atomically for a bounded r
 
 The positive Android mark-authority model is now implemented as the next pure checkpoint. Generic AOSP is a zero-grant policy; bits 21–30 are only a syntactic envelope for a device-qualified candidate. Capability Profile schema 2 now carries typed exact Android product/build/vendor/security-patch, kernel-build, verified-boot/vbmeta, SELinux-policy, netd/Connectivity, bounded tool-artifact, boot, and namespace identity. A stable `ReviewedPolicySelector` excludes runtime-only verified-boot and namespace bindings from literal catalog keys. The positive policy and complete-census trust boundaries reject every non-verified device identity and any mismatch between the separately observed namespace and the full profile. The Android-target collector directly reads and double-samples immutable properties, kernel and namespace facts; hashes fixed SELinux-policy, netd and active-Connectivity paths through bounded no-follow reads; hashes the executing image through `/proc/self/exe`; revalidates path and descriptor metadata; and requires complete AVB lock/algorithm/digest evidence. Generic Linux remains unavailable. Rooted x86_64 WSA correctly settles `Absent` because its apparent green state lacks the other AVB facts. The compiled catalog selector now validates exact literal entries and retains catalog-entry provenance through policy/census identity, but its production entry table remains empty until independent physical-device review; therefore this checkpoint still cannot manufacture authority. Planning authorization separately requires the assertion to cover packet, socket, and conntrack marks.
 
-Planning authorization consumes a non-`Clone` census with exactly nine evidence sources—Android `netId`, RPDB, device policy, legacy xtables, nftables, TC/BPF, XFRM, connmark/socket transfers, and existing Flux ownership—across all three planes. Every one of the 27 source-plane cells must be complete-present or complete-absent, at most 512 raw uses are accepted before canonical sorting and deduplication, and the observation binds inventory snapshot/epoch, full capability facts, namespace, policy identity/revision, collector revision, and ownership-journal identity/revision. Any external read/write/transfer overlap rejects regardless of values, opaque RPDB rejects, and known conflicts take precedence over incomplete topology evidence. The result exposes only a consuming, freshness-checked `AndroidMarkPlanningAuthority`; it cannot produce a `MarkLease`, priority, table, route, encoder, mutation, writer, or activation conversion, and reauthorization requires a fresh census.
+Planning authorization consumes a non-`Clone` census with exactly nine evidence sources—Android `netId`, RPDB, device policy, legacy xtables, nftables, TC/BPF, XFRM, connmark/socket transfers, and existing Flux ownership—across all three planes. Every one of the 27 source-plane cells must be complete-present or complete-absent, at most 512 raw uses are accepted before canonical sorting and deduplication, and the observation binds inventory snapshot/epoch, full capability facts, namespace, policy identity/revision, collector revision, and ownership-journal identity/revision. Definite or unresolved external read/write/transfer overlap rejects regardless of values, opaque RPDB rejects, and known definite conflicts take precedence over incomplete topology evidence. The exact Android `netId` packet masked writer is separately reported as an ordered-write qualification requirement under ADR-0013; it also rejects, and any definite conflict takes precedence. The result exposes only a consuming, freshness-checked `AndroidMarkPlanningAuthority`; it cannot produce a `MarkLease`, priority, table, route, encoder, mutation, writer, or activation conversion, and reauthorization requires a fresh census.
 
 The first source-scoped mark-evidence checkpoint is now implemented as a pure
 `RpdbFwmarkCensusFragment`. It projects each ordered RPDB fwmark selector into adjacent packet- and
@@ -388,11 +397,15 @@ The second source-scoped checkpoint is a static `AndroidNetIdFwmarkCensusFragmen
 canonical explicit `AndroidNetdSourceProfile` shared with RPDB classification. It records the exact
 incoming-packet masked writer—`0xffef_ffff` on Android 12/13 and `0x7fef_ffff` at the pinned March
 2025 revision—plus low-16-bit socket predicate-read/masked-write semantics. Every pinned packet
-writer overlaps the complete `0x7fe0_0000` device-qualified candidate envelope. The direct
-conntrack cell is complete-absent because connmark copy operations remain a separate transfer
-source. It performs no runtime artifact authentication or automatic profile selection and exposes
-no complete-census conversion or authority. The two fragments now model six cells; the remaining
-21 cells and point-in-time coordination are pending.
+writer overlaps the complete `0x7fe0_0000` device-qualified candidate envelope. Source tracing
+places that writer below mangle INPUT after input route selection, so the exact packet overlap is an
+ordered qualification blocker rather than a proven simultaneous collision. It still rejects until
+the runtime profile/chain and listener/observer mark preservation are qualified on a physical ARM64
+target. The direct conntrack cell is complete-absent because connmark copy operations remain a
+separate transfer source. It performs no runtime artifact authentication or automatic profile
+selection and exposes no complete-census conversion or authority. The two fragments now model six
+cells; the remaining 21 cells and point-in-time coordination are paused until that target and
+coexistence procedure are viable.
 
 ### Deliverables
 
@@ -406,7 +419,11 @@ no complete-census conversion or authority. The two fragments now model six cell
   and namespace identity to the freshness-bound profile. Android collection is direct, bounded and
   point-in-time rechecked; generic Linux remains `Unavailable`, and WSA cannot satisfy complete AVB.
 - **Delivered empty catalog boundary:** select positive policy only from bounded source-coded entries keyed by stable product/build/kernel/policy/tool artifact identities and external policy digest/revision; retain catalog entry ID through census identity, bind matches to verified boot/profile/namespace, and reject arbitrary runtime catalogs or manifests. Production entries remain pending independent physical-device review.
-- Continue the remaining 21 bounded source-plane cells and then assemble the fresh complete 27-cell fwmark census collector; source fragments cannot authorize planning, and generic AOSP must continue to produce zero grant.
+- **Paused behind ADR-0013:** before continuing the remaining 21 bounded source-plane cells, make
+  one physical Android ARM64 ordered-lifetime/coexistence target viable with exact runtime
+  netd profile and INPUT-chain binding plus listener/observer mark-preservation canaries. Then
+  assemble the fresh complete 27-cell fwmark census collector; source fragments cannot authorize
+  planning, and generic AOSP must continue to produce zero grant.
 - Rust rtnetlink PBR apply/verify/cleanup.
 - Generation journal and startup recovery for routes/rules.
 - Remove the standalone `addrsyncd` process from runtime. Its binary may remain only in controlled
@@ -884,10 +901,13 @@ Before a backend may be selected automatically, its documentation must include:
    Production admission remains `Unsupported` throughout item 3 and until item 4's atomic transfer;
    WSA is not release authority.
 3. **Current: complete one native activation target.** Finish the canonical Generation/config
-   authority, exact device/artifact Capability Profile, positive mark-policy catalog, point-in-time
-   27-cell census, RPDB/domain placement, route reachability, observer continuity, rollback inputs,
-   and in-process address-derived policy. Bind the delivered engine/process/canary evidence to that
-   complete target without admitting production mutation or exposing raw native writer verbs.
+   authority and exact device/artifact Capability Profile, then make one physical Android ARM64
+   ordered-mark-lifetime/coexistence target viable under ADR-0013. Keep the remaining 21 census
+   cells paused until the runtime netd profile/INPUT chain and listener/observer mark-preservation
+   procedure can be bound to that target; then complete the point-in-time 27-cell census,
+   RPDB/domain placement, route reachability, observer continuity, rollback inputs, and in-process
+   address-derived policy. Bind the delivered engine/process/canary evidence to that complete target
+   without admitting production mutation or exposing raw native writer verbs.
 4. **Qualify and atomically cut over the networking writer.** Qualify the complete transaction on
    reviewed Android 5.10/ARM64 profiles. Stop standalone `addrsyncd` and disable every shell
    address/PBR/xtables mutation before the first Rust write, transfer the native Generation lease,

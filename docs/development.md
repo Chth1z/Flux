@@ -43,9 +43,12 @@ cargo test -p flux-core --test rpdb_fwmark_census
 These are pure evidence/planning checkpoints. The source-pinned Android `netId` and inventory-bound
 RPDB tests model only six source-plane cells; they do not create a complete Mark Census or Planning
 Authority. The exact pinned incoming-packet writer masks intersect the complete device-qualified
-candidate envelope, so the fragment is conflict evidence rather than a mark grant. Passing host
-tests do not replace production Android device-policy verification, the remaining source
-collectors, cross-source freshness, or activation canaries.
+candidate envelope, but the packet writer runs under mangle INPUT after input route selection. Its
+exact overlap is therefore reported as an ordered-write qualification requirement, not a mark
+grant, and still fails closed. Definite overlaps retain precedence. Passing host tests do not
+replace runtime profile/chain binding or listener/observer mark-preservation evidence on a physical
+Android ARM64 target. The remaining 21 source-plane cells are intentionally paused until that
+qualification target is viable.
 
 The compatibility submodule remains separate:
 

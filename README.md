@@ -42,8 +42,12 @@ The current development checkpoint is a Phase-1 bridge:
   policy-catalog selector now exists, but its production entry table is empty pending independent
   physical ARM64 review, so no new mutation is admitted. Source-pinned Android `netId` and
   inventory-bound RPDB fragments now model six of the 27 fwmark census cells. The pinned netd
-  incoming-packet writers overlap the complete device-qualified candidate envelope, and the
-  fragments cannot be assembled into planning authority.
+  incoming-packet writers overlap the complete device-qualified candidate envelope, but source
+  tracing places them in mangle INPUT after PREROUTING and input route selection. That exact packet
+  write is an ordered lifetime/coexistence qualification blocker rather than a proven simultaneous
+  collision; it remains non-authorizing. Expansion of the other 21 cells is paused until a physical
+  ARM64 target can bind the runtime netd profile and prove listener/observer mark preservation, and
+  the fragments still cannot be assembled into planning authority.
 - eBPF is optional future observation/acceleration work. Flux packages no `.ko`, KPM, or opaque
   kernel-module payload and invokes no explicit module-loading API. The legacy shell bridge has not
   yet proved that every xtables dependency is already active without implicit kernel autoload.

@@ -35,7 +35,10 @@ Flux 是面向 Magisk、KernelSU 与 APatch 的 Android 透明代理模块。它
   但在真实 ARM64 设备完成独立评审前，生产条目表保持为空，因此不会新增任何修改权限。显式 source-
   pinned 的 Android `netId` fragment 与 inventory-bound RPDB fragment 目前只建模 27 个 fwmark census
   cell 中的 6 个；固定 netd revision 的入站 packet writer 会覆盖完整的 device-qualified candidate
-  envelope，而且这些 fragment 尚不能组装为 planning authority。
+  envelope，但源码追踪表明这些 writer 位于 PREROUTING 与入站路由选择之后的 mangle INPUT。该精确
+  packet write 因此是仍需验证顺序、生命周期与共存性的 blocker，而不是已证明的同时冲突；它仍不授予
+  权限。在真实 ARM64 目标能够绑定运行时 netd profile，并验证 listener/observer 的 mark 保留行为之前，
+  其余 21 个 cell 暂停扩展；这些 fragment 仍不能组装为 planning authority。
 - eBPF 仅是未来可选的观测/加速能力。Flux 不打包 `.ko`、KPM 或不透明内核模块载荷，也不调用
   显式模块加载 API；但当前旧 shell 桥接尚未证明所有 xtables 依赖均已预先启用、不会触发内核隐式
   自动加载。

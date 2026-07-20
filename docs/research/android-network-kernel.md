@@ -173,9 +173,26 @@ because AOSP's packet-to-conntrack save rules are represented by the separate tr
 static source profile does not authenticate the runtime netd binary or select itself for a device.
 [S8], [S9], [S40], [S53], [S54], [S55], [S56]
 
-Unsupported, duplicate, incomplete, opaque, denied, unknown, inconsistent, over-budget, or transient-attempt coverage grants no authority. The census accepts at most 512 raw predicate-read, masked-write, transfer-read, or transfer-write records before canonical sorting and deduplication, and binds the exact inventory snapshot identity/epoch, full capability facts and boot, namespace, policy identity/revision, collector revision, and durable ownership-journal identity/revision. Any candidate-mask overlap with an external use rejects regardless of the compared values. Opaque RPDB evidence rejects even if another census cell claims completeness, and known conflicts are decided before an otherwise incomplete topology report.
+The packet overlap has an important lifetime boundary. All three pinned sources append the
+incoming-packet writer to `routectrl_mangle_INPUT`; netd creates that child below the built-in
+mangle INPUT hook. Linux IPv4 and IPv6 receive paths run PREROUTING, complete the input route lookup,
+and reach LOCAL_IN afterward. Canonical Flux forwarded capture consumes its candidate during
+PREROUTING plus local route selection, while local OUTPUT consumes it during output rerouting and
+the loopback-reinjected PREROUTING route decision. The exact Android `netId` packet masked writer is
+therefore a known ordered late write, not by itself a proven simultaneous routing collision.
+[S11], [S57], [S58]
 
-The resulting `AndroidMarkPlanningAuthority` is privately constructed, non-`Clone`, and limited to pure planning. It exposes no `MarkLease`, rule priority, route table, route intent, encoder, writer, ownership operation, mutation authority, or activation conversion. Reauthorization consumes it and requires a newly collected census. Exact writer semantics, mark-observer continuity, and a mark-preservation canary remain mark-specific prerequisites; Capture Program ordering, domain/network-selection handoff, route reachability, topology observer continuity, durable ownership, exact mutation identity, engine loop escape, and shape-specific one-rule address handling remain separate topology prerequisites.
+That static ordering still grants no compatibility. The later INPUT rewrite can affect the mark
+seen by the transparent listener or an observer, and source text does not bind the live netd
+artifact, chain shape, or input-interface selector to one device Traffic Domain. The exact overlap
+must remain fail-closed until a physical Android ARM64 profile proves runtime source/chain binding,
+listener and observer continuity, VPN/netd coexistence, and mark preservation. Definite or unknown
+overlaps retain conflict precedence. The remaining 21 source-plane cells should not displace this
+gate and are paused until that target and qualification procedure are viable.
+
+Unsupported, duplicate, incomplete, opaque, denied, unknown, inconsistent, over-budget, or transient-attempt coverage grants no authority. The census accepts at most 512 raw predicate-read, masked-write, transfer-read, or transfer-write records before canonical sorting and deduplication, and binds the exact inventory snapshot identity/epoch, full capability facts and boot, namespace, policy identity/revision, collector revision, and durable ownership-journal identity/revision. Every candidate-mask overlap still rejects regardless of compared values: definite or unknown uses are conflicts, while only the exact Android `netId` packet masked writer receives the ordered-qualification diagnostic. Opaque RPDB evidence rejects even if another census cell claims completeness, and definite conflicts are decided before ordered writes or an otherwise incomplete topology report.
+
+The resulting `AndroidMarkPlanningAuthority` is privately constructed, non-`Clone`, and limited to pure planning. It exposes no `MarkLease`, rule priority, route table, route intent, encoder, writer, ownership operation, mutation authority, or activation conversion. Reauthorization consumes it and requires a newly collected census. Exact writer semantics, authenticated runtime hook/profile ordering, listener and mark-observer continuity, and a physical-device mark-preservation/coexistence canary remain mark-specific prerequisites; Capture Program ordering, domain/network-selection handoff, route reachability, topology observer continuity, durable ownership, exact mutation identity, engine loop escape, and shape-specific one-rule address handling remain separate topology prerequisites.
 
 All writes use masked merge semantics:
 
@@ -585,3 +602,5 @@ Acceptance invariants:
 [S54]: https://android.googlesource.com/platform/system/netd/+/03311137011f7ca55f263b61a8c86681c1581518/server/RouteController.cpp
 [S55]: https://android.googlesource.com/platform/system/netd/+/5ca3d903c0253ec29fb4c3e3390f292494612e88/include/Fwmark.h
 [S56]: https://android.googlesource.com/platform/system/netd/+/03311137011f7ca55f263b61a8c86681c1581518/include/Fwmark.h
+[S57]: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/net/ipv4/ip_input.c?id=738ac465e4e900d4a391a27da4e20c090eaa1e75
+[S58]: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/net/ipv6/ip6_input.c?id=738ac465e4e900d4a391a27da4e20c090eaa1e75

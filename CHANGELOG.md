@@ -40,6 +40,14 @@ All notable changes to the Flux project will be documented in this file.
   full Flux candidate envelope, plus low-16-bit socket read/write semantics. Connmark transfers
   remain a separate source. The fragment cannot authenticate a runtime profile, assemble a
   complete census, or authorize planning.
+- Corrected the packet-mark lifetime diagnosis without weakening the gate. The pinned incoming
+  writer is installed under netd's mangle INPUT chain after PREROUTING and input route selection, so
+  the exact Android `netId` packet masked-write overlap now returns a typed ordered-write
+  qualification requirement rather than being reported as a proven simultaneous collision. Every
+  overlap remains fail-closed, definite conflicts take precedence, and no planning, lease, writer,
+  or mutation authority was added. Remaining census-source expansion is paused until an exact
+  physical Android ARM64 profile can support runtime chain/profile binding and mark-preservation
+  coexistence qualification.
 
 ### Rewrite release policy
 - Established the pre-release Rust-only release gate in ADR-0011. Bridge, shadow, parity, and

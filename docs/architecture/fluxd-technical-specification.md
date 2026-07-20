@@ -454,14 +454,31 @@ text identities are bounded printable ASCII, and SELinux policy uses a distinct
 `SelinuxPolicyIdentity` newtype so it cannot be interchanged with netd or Connectivity at a typed
 construction boundary.
 
-The generic system source reports the new exact identity observation as `Unavailable`; it does not
-infer authority from generic Linux files or parse a self-authenticating runtime manifest. A
-production positive mark-policy loader therefore remains blocked until a reviewed Android
-property/artifact collector and compile-time policy catalog populate and select those facts. The
-positive policy factory and complete-census boundary already reject every non-verified identity and
-any mismatch between the separately observed namespace and the full profile. The selected assertion
-is then freshness-bound to the full Capability Profile, verified boot, boot ID, and observed network
-namespace.
+The system source remains `Unavailable` on generic Linux. On Android it uses bionic's read-only
+property callback API and samples the exact property set twice around artifact collection. Product
+identity is the unambiguous `brand/name/device` tuple; system and vendor fingerprints and the
+canonical security-patch date remain separate. Verified boot requires a recognized state, a
+consistent locked/unlocked fact, explicit `sha256` vbmeta algorithm, and an exact nonzero digest;
+the state string alone is insufficient.
+
+The Android collector streams bounded SHA-256 observations of the loaded SELinux policy,
+`/system/bin/netd`, the executing Flux image, and the active `com.android.tethering` APEX package.
+Fixed artifact paths use no-follow reads; the executing image is intentionally opened through
+`/proc/self/exe` so an atomic on-disk upgrade cannot substitute different bytes. Path and descriptor
+metadata are revalidated around each read. The collector parses bounded `/apex/apex-info-list.xml`
+only to select one active package that is a direct child of a reviewed root, then hashes the
+selected package bytes and requires the same selection after collection. It also requires the
+process network-namespace object, kernel-build identity, and complete property snapshot to remain
+unchanged. Missing, denied, malformed, inconsistent, unexpected-symlink, empty, oversized, changed,
+or unsafe facts fail closed. The runtime XML is a locator, not a self-authenticating authority.
+
+A production positive mark-policy loader remains blocked until the compile-time policy catalog
+selects these facts. The positive policy factory and complete-census boundary reject every
+non-verified identity and any mismatch between the separately observed namespace and the full
+profile. The selected assertion is then freshness-bound to the full Capability Profile, verified
+boot, boot ID, and observed network namespace. Rooted x86_64 WSA validates the collector mechanism
+and settles `Absent` because it lacks lock, vbmeta-algorithm and digest properties; it is not
+Android 5.10/ARM64 production authority.
 
 `CapabilityStatus` records durable availability. Timeout, interruption, temporary resource
 pressure, and other retryable failures are retained as `ProbeAttemptOutcome` evidence with bounded

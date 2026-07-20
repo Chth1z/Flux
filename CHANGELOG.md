@@ -17,9 +17,15 @@ All notable changes to the Flux project will be documented in this file.
   exact-identity availability.
 - Tightened Android mark-policy and complete-census trust boundaries: a boot UUID alone can no
   longer mint device-qualified evidence, and the separately observed network namespace must match
-  the full Capability Profile. The generic system collector intentionally reports exact device
-  identity as unavailable until a reviewed Android property/artifact collector exists; legacy
-  mutation admission remains based only on the existing kernel-floor and boot-identity gate.
+  the full Capability Profile. The Android-target system collector now uses direct bionic property
+  reads, double-samples identity and namespace facts, hashes fixed policy/netd/APEX paths through
+  bounded no-follow reads, hashes the executing image through `/proc/self/exe`, revalidates path and
+  descriptor metadata, and requires complete lock/hash/digest AVB evidence. Generic Linux remains
+  unavailable; legacy mutation admission remains based only on the existing kernel-floor and
+  boot-identity gate.
+- Qualified the collector mechanism on rooted x86_64 WSA: its green verified-boot string is
+  correctly rejected as `Absent` because device-lock, vbmeta algorithm and digest facts are absent.
+  This is mechanism evidence only, not Android 5.10/ARM64 production authority.
 
 ### Rewrite release policy
 - Established the pre-release Rust-only release gate in ADR-0011. Bridge, shadow, parity, and

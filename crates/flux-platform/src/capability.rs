@@ -8,6 +8,7 @@ use flux_core::{
     Observation, SelinuxMode,
 };
 
+use crate::android_identity::observe_system_android_device_identity;
 use crate::{PlatformError, system_kernel_release};
 
 const DEFAULT_ROOT: &str = "/data/adb/flux";
@@ -93,12 +94,9 @@ impl CapabilityProfileSource for SystemCapabilityProfileSource {
             observe_artifact(&self.paths.addrsync),
         );
 
-        // Exact Android product/build/artifact identity is intentionally not inferred from generic
-        // Linux files or a self-authenticating runtime manifest. A reviewed Android collector will
-        // populate this observation in a later Phase 3 slice.
         CapabilityProfile::initial(
             boot_identity,
-            Observation::Unavailable,
+            observe_system_android_device_identity(),
             kernel,
             selinux,
             legacy_bridge,

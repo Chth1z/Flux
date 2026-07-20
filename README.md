@@ -36,8 +36,10 @@ The current development checkpoint is a Phase-1 bridge:
 - Capability Profile schema 2 can carry exact Android product/build/vendor/security-patch,
   verified-boot, kernel-build, SELinux-policy, netd/Connectivity, tool-artifact, and network-
   namespace identity. Device-qualified mark policy and census evidence now require that complete,
-  namespace-consistent identity. The production collector still reports it unavailable until the
-  reviewed Android collector and policy catalog are implemented, so no new mutation is admitted.
+  namespace-consistent identity. The Android-target collector now reads and rechecks exact system
+  properties, loaded policy, netd, the active Connectivity APEX, the running Flux binary, and its
+  network namespace. Incomplete AVB evidence remains non-authorizing, and the reviewed policy
+  catalog is still absent, so no new mutation is admitted.
 - eBPF is optional future observation/acceleration work. Flux packages no `.ko`, KPM, or opaque
   kernel-module payload and invokes no explicit module-loading API. The legacy shell bridge has not
   yet proved that every xtables dependency is already active without implicit kernel autoload.

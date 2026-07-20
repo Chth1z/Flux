@@ -7,6 +7,7 @@ use std::fmt;
 // owns the higher-level snapshot interface that consumes it.
 #[allow(dead_code)]
 mod address_sync;
+mod android_identity;
 mod capability;
 mod child_process;
 mod legacy_dispatcher;

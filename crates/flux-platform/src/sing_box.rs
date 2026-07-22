@@ -27,6 +27,7 @@ const DIAGNOSTIC_LIMIT: usize = 16 * 1024;
 const CAPTURE_STREAM_LIMIT: usize = DIAGNOSTIC_LIMIT / 2;
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const CLEANUP_GRACE: Duration = Duration::from_millis(250);
+const CAPTURE_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 const INTERFACE_NAME_MAX_BYTES: usize = 15;
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -361,6 +362,10 @@ pub enum SingBoxProcessError {
         maximum: usize,
         actual: usize,
     },
+    ProbeOutputDrainTimedOut {
+        timeout: Duration,
+        diagnostics: ProcessDiagnostics,
+    },
     ExitedBeforeReady {
         exit: SingBoxExit,
         diagnostics: ProcessDiagnostics,
@@ -389,6 +394,7 @@ impl SingBoxProcessError {
             | Self::CheckTimedOut { diagnostics, .. }
             | Self::VersionFailed { diagnostics, .. }
             | Self::VersionTimedOut { diagnostics, .. }
+            | Self::ProbeOutputDrainTimedOut { diagnostics, .. }
             | Self::ExitedBeforeReady { diagnostics, .. }
             | Self::ReadinessTimedOut { diagnostics, .. }
             | Self::PostSignalReapTimedOut { diagnostics, .. }
@@ -509,6 +515,10 @@ impl fmt::Display for SingBoxProcessError {
                 formatter,
                 "Sing-Box version {stream} is {actual} bytes, exceeding {maximum}"
             ),
+            Self::ProbeOutputDrainTimedOut { timeout, .. } => write!(
+                formatter,
+                "Sing-Box probe output did not close within {timeout:?} after process cleanup"
+            ),
             Self::ExitedBeforeReady { exit, .. } => {
                 write!(
                     formatter,
@@ -563,6 +573,7 @@ impl Error for SingBoxProcessError {
             | Self::VersionFailed { .. }
             | Self::VersionTimedOut { .. }
             | Self::VersionOutputTooLarge { .. }
+            | Self::ProbeOutputDrainTimedOut { .. }
             | Self::ValidationGroupCleanupTimedOut { .. }
             | Self::ExitedBeforeReady { .. }
             | Self::ReadinessTimedOut { .. }
@@ -674,9 +685,7 @@ impl SingBoxProcessAdapter {
                 kill_and_reap_bounded(child, CLEANUP_GRACE);
                 let group_cleanup_error = group_signal_error
                     .or_else(|| wait_validation_group_exit(pid, CLEANUP_GRACE).err());
-                if group_cleanup_error.is_some() {
-                    capture_stop.store(true, Ordering::Release);
-                }
+                capture_stop.store(true, Ordering::Release);
                 let output = collect_capture(stdout_reader, stderr_reader)?;
                 let diagnostics = output.diagnostics();
                 if let Some(source) = group_cleanup_error {
@@ -693,7 +702,11 @@ impl SingBoxProcessAdapter {
         if group_cleanup_error.is_some() {
             capture_stop.store(true, Ordering::Release);
         }
-        let output = collect_capture(stdout_reader, stderr_reader)?;
+        let output = if group_cleanup_error.is_some() {
+            collect_capture(stdout_reader, stderr_reader)?
+        } else {
+            collect_capture_bounded(stdout_reader, stderr_reader, &capture_stop)?
+        };
         if let Some(source) = group_cleanup_error {
             return Err(validation_group_cleanup_error(
                 pid,
@@ -1324,6 +1337,29 @@ fn collect_capture(
         stdout: stdout?,
         stderr: stderr?,
     })
+}
+
+fn collect_capture_bounded(
+    stdout: thread::JoinHandle<Result<CapturedStream, io::Error>>,
+    stderr: thread::JoinHandle<Result<CapturedStream, io::Error>>,
+    stop: &AtomicBool,
+) -> Result<CapturedOutput, SingBoxProcessError> {
+    let deadline = Instant::now() + CAPTURE_DRAIN_TIMEOUT;
+    while !(stdout.is_finished() && stderr.is_finished()) && Instant::now() < deadline {
+        sleep_until_poll(deadline);
+    }
+    let drained = stdout.is_finished() && stderr.is_finished();
+    if !drained {
+        stop.store(true, Ordering::Release);
+    }
+    let output = collect_capture(stdout, stderr)?;
+    if !drained {
+        return Err(SingBoxProcessError::ProbeOutputDrainTimedOut {
+            timeout: CAPTURE_DRAIN_TIMEOUT,
+            diagnostics: output.diagnostics(),
+        });
+    }
+    Ok(output)
 }
 
 fn exact_version_report(

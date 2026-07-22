@@ -2373,6 +2373,7 @@ fn classify_validation_error(error: SingBoxProcessError) -> HostFailure {
             | SingBoxProcessError::Spawn { .. }
             | SingBoxProcessError::CheckFailed { .. }
             | SingBoxProcessError::CheckTimedOut { .. }
+            | SingBoxProcessError::ProbeOutputDrainTimedOut { .. }
     ) {
         HostFailure::Expected(safe_process_error_summary(&error))
     } else {

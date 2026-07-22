@@ -294,6 +294,11 @@ and contain exactly one `sing-box version <release>` header in total; the releas
 domain-separated profile revision binds the exact launch binding, binary/config/optional-launcher
 artifact set, parsed release, and complete stdout/stderr build output.
 
+After each probe process exits and its process group is cleaned, both nonblocking output readers
+must reach EOF within a bounded 250 ms drain. A detached descendant that retains either pipe makes
+the probe fail closed with bounded diagnostics; it cannot extend capability collection indefinitely
+or contribute truncated output to a successful profile.
+
 Schema 1 proves only that exact-build identity and the exact pinned binary's acceptance of the
 bound canonical config during the probe. Listener staging/delivery, TCP/UDP and dual-stack runtime
 behavior, DNS fields, reload, TUN controls/stacks, FD handoff, and supervised delivery reports are
@@ -1483,6 +1488,7 @@ Delivered Phase 1 supervision additionally requires:
 - startup and stop timeout fields in `1..=60000` milliseconds;
 - SHA-256 identities for the exact binary, configuration, and optional BusyBox launcher;
 - descriptor-pinned `sing-box check` and `run`, followed by a rehash of the same descriptors before readiness acceptance;
+- a bounded post-process stdout/stderr drain that rejects detached output owners instead of waiting indefinitely or accepting truncated success output;
 - PID plus `/proc` start-tick identity before every signal and child-owned listener readiness evidence for the admitted TPROXY bridge; the strict TUN readiness manifest form remains reserved for the future proven single-owner plan;
 - a direct-child `PR_SET_PDEATHSIG(SIGKILL)` lease with a post-arm parent-identity race check for Sing-Box and phase-shell processes;
 - bounded TERM/KILL/reap, restart windows, exponential backoff, and retained ownership until disappearance is observed.

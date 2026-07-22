@@ -91,6 +91,47 @@ fn version_query_rejects_output_larger_than_the_exact_capture_budget() {
 }
 
 #[test]
+fn version_query_rejects_a_detached_descendant_that_retains_output_pipes() {
+    let fixture = Fixture::new("success");
+    fs::write(
+        fixture.spec.working_directory.join("retain-version-output"),
+        [],
+    )
+    .expect("enable retained version output fixture");
+    let pinned = pin_launch(&fixture.spec);
+    let started = Instant::now();
+
+    let error = SingBoxProcessAdapter
+        .query_version_pinned(&pinned, &fixture.spec)
+        .expect_err("detached output owner must fail closed");
+
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "probe output draining must remain bounded"
+    );
+    let SingBoxProcessError::ProbeOutputDrainTimedOut {
+        timeout,
+        diagnostics,
+    } = error
+    else {
+        panic!("unexpected retained-output error: {error:?}");
+    };
+    assert_eq!(timeout, Duration::from_millis(250));
+    assert!(
+        diagnostics
+            .stdout_tail()
+            .contains("sing-box version 1.13.14")
+    );
+
+    let descendant_pid =
+        read_recorded_pid(&fixture.spec.working_directory.join("version-writer.pid"));
+    // SAFETY: this PID was published by the isolated detached fixture below.
+    let result = unsafe { libc::kill(descendant_pid.cast_signed(), libc::SIGKILL) };
+    assert_eq!(result, 0, "kill detached version-output fixture");
+    wait_for_proc_exit(descendant_pid);
+}
+
+#[test]
 fn validation_timeout_is_bounded_and_forcibly_reaps_the_check() {
     let mut fixture = Fixture::new("timeout");
     fixture.spec.startup_timeout = Duration::from_millis(75);
@@ -623,6 +664,10 @@ fn fake_sing_box(directory: &Path) -> PathBuf {
 mode=$1
 if [ "$mode" = version ]; then
     [ "$#" -eq 1 ] || exit 66
+    if [ -f "$PWD/retain-version-output" ]; then
+        /usr/bin/setsid /bin/sh -c 'printf "%s\n" "$$" > "$1"; sleep 4' sh "$PWD/version-writer.pid" &
+        while [ ! -s "$PWD/version-writer.pid" ]; do :; done
+    fi
     printf '%s\n\n%s\n' 'sing-box version 1.13.14' 'Environment: go1.24.5 linux/amd64'
     exit 0
 fi

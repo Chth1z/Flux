@@ -26,6 +26,10 @@ All notable changes to the Flux project will be documented in this file.
   8 KiB limit per stream; invalid UTF-8, unsafe control text, missing/ambiguous headers, and
   malformed bounded semantic releases fail closed. The schema-1 revision length-prefixes and binds
   the exact launch binding, artifact set, parsed release, and complete captured build output.
+- Bounded the post-process probe-output drain. An otherwise successful `version` or config-check
+  process now fails closed if a detached descendant keeps stdout or stderr open after process-group
+  cleanup; diagnostics remain bounded and the Supervisor can no longer wait indefinitely outside
+  the declared probe timeout plus cleanup grace.
 - Added a pure deterministic `TproxyGenerationCandidate` compiler that consumes that exact engine
   profile and binding with a complete inventory snapshot and a device Capability Profile. It
   requires verified boot/device identity and the supported kernel floor, but deliberately carries

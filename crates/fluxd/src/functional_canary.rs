@@ -19,7 +19,7 @@ use flux_platform::socket_diagnostics::{
 use sha2::{Digest, Sha256};
 
 use crate::engine_supervisor::EngineChildAuthority;
-use crate::{EngineArtifactDigest, EngineSpec, OwnedEngineIdentity};
+use crate::{EngineArtifactSetIdentity, EngineSpec, OwnedEngineIdentity};
 
 pub(crate) const FUNCTIONAL_CANARY_SCHEMA_VERSION: u16 = 2;
 pub(crate) const FUNCTIONAL_CANARY_NONCE_BYTES: usize = 32;
@@ -946,24 +946,6 @@ impl CanarySocketCorrelation {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct CanaryArtifactIdentity {
-    binary: EngineArtifactDigest,
-    config: EngineArtifactDigest,
-    launcher: Option<EngineArtifactDigest>,
-}
-
-impl CanaryArtifactIdentity {
-    #[must_use]
-    pub(crate) const fn from_spec(spec: &EngineSpec) -> Self {
-        Self {
-            binary: spec.binary_digest(),
-            config: spec.config_digest(),
-            launcher: spec.launcher_digest(),
-        }
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CanaryListenerIdentity {
     port: NonZeroU16,
@@ -987,7 +969,7 @@ pub(crate) struct CanaryEngineBinding {
     generation: NonZeroU32,
     engine: OwnedEngineIdentity,
     engine_snapshot_revision: NonZeroU64,
-    artifacts: CanaryArtifactIdentity,
+    artifacts: EngineArtifactSetIdentity,
     listener: CanaryListenerIdentity,
 }
 
@@ -1029,7 +1011,7 @@ impl CanaryEngineBinding {
             generation,
             engine,
             engine_snapshot_revision,
-            artifacts: CanaryArtifactIdentity::from_spec(spec),
+            artifacts: spec.artifacts(),
             listener,
         })
     }
@@ -1050,7 +1032,7 @@ impl CanaryEngineBinding {
     }
 
     #[must_use]
-    pub(crate) const fn artifacts(&self) -> CanaryArtifactIdentity {
+    pub(crate) const fn artifacts(&self) -> EngineArtifactSetIdentity {
         self.artifacts
     }
 
@@ -4845,7 +4827,7 @@ pub(crate) mod tests {
             23
         );
         assert_eq!(
-            fixture.request.pre_binding.engine.artifacts.binary,
+            fixture.request.pre_binding.engine.artifacts.binary(),
             fixture
                 ._engine
                 .as_ref()
@@ -4854,7 +4836,7 @@ pub(crate) mod tests {
                 .binary_digest()
         );
         assert_eq!(
-            fixture.request.pre_binding.engine.artifacts.config,
+            fixture.request.pre_binding.engine.artifacts.config(),
             fixture
                 ._engine
                 .as_ref()

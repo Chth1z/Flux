@@ -332,8 +332,24 @@ listener-delivery evidence, or activation/mutation authority. It has no Generati
 the Runtime Coordinator or private native owner, whose production admission remains uninhabited.
 The follow-on pure launch-artifact binding now rejects config-content mismatch, listener-port
 mismatch, and TUN readiness before retaining the exact inspected binary/config/optional-launcher
-digests. This still is not a complete `EngineSpec` identity or Engine Capability Profile and runs
-no binary validation, file reverification, listener observation, process launch, or mutation.
+digests. The binding itself remains below a complete `EngineSpec` identity and runs no binary
+validation, file reverification, listener observation, process launch, or mutation.
+
+The first exact-binary profile slice is now delivered immediately above that binding and before
+the pure Generation compiler. It requires the binding and `EngineSpec` artifact sets to match,
+then performs descriptor-pinned `version`, reverify, exact config `check`, and reverify steps.
+Successful stdout/stderr are exact and limited to 8 KiB per stream; safe UTF-8, one unambiguous
+version header, and a bounded semantic release are required. The schema-1 profile revision binds
+the exact binding, artifact set, parsed release, and complete captured build output. Its only
+positive engine claims are exact-build identity and acceptance of that exact config during the
+probe.
+
+A pure deterministic `TproxyGenerationCandidate` now consumes the matching profile/binding pair,
+a complete inventory snapshot/epoch, and a device Capability Profile with verified boot/device
+identity and supported kernel. This is still not the complete `GenerationArtifact`: listener
+delivery, dual-stack runtime behavior, routing/mark evidence, candidate selection, planning
+authority, Generation identity, writer ownership, activation, and production native admission all
+remain absent. Physical ARM64 qualification remains deferred rather than inferred from host tests.
 
 The bounded raw oracle checkpoint is also complete and frozen. The canonical environment, input,
 and fixture pin contract lives in `tests/oracle/xtables/manifest.json`; do not duplicate or update

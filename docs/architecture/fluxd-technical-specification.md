@@ -280,10 +280,29 @@ digests in a separate domain-separated identity.
 
 This binds an artifact set and intended pre-launch readiness shape, not the complete `EngineSpec`:
 paths, working directory, launcher identity, timeouts, restart policy, and logs are deliberately
-outside the binding. It also does not query the binary, build an `EngineCapabilityProfile`, run
-Sing-Box validation, reverify files, observe a listener, prove dual-stack behavior or delivery,
-assign a Generation ID, or authorize process/kernel activity. Those remain separate later stages;
-the Supervisor's descriptor-pinned validation/reverification contract is unchanged.
+outside the binding. The binding itself does not query the binary, run Sing-Box validation,
+reverify files, observe a listener, prove dual-stack behavior or delivery, assign a Generation ID,
+or authorize process/kernel activity.
+
+The next pre-compilation checkpoint builds the minimal schema-1 `EngineCapabilityProfile` from this
+binding and the matching `EngineSpec`. Artifact-set mismatch fails before execution. The Supervisor
+then opens and pins the exact artifacts, runs descriptor-pinned `sing-box version`, reverifies,
+runs the existing exact configuration check, and reverifies again. Successful version stdout and
+stderr are retained byte-for-byte with an 8 KiB limit per stream. Both streams must be safe UTF-8
+and contain exactly one `sing-box version <release>` header in total; the release must be a bounded
+`major.minor.patch` semantic version with optional prerelease/build suffixes. The length-prefixed,
+domain-separated profile revision binds the exact launch binding, binary/config/optional-launcher
+artifact set, parsed release, and complete stdout/stderr build output.
+
+Schema 1 proves only that exact-build identity and the exact pinned binary's acceptance of the
+bound canonical config during the probe. Listener staging/delivery, TCP/UDP and dual-stack runtime
+behavior, DNS fields, reload, TUN controls/stacks, FD handoff, and supervised delivery reports are
+negative or unmodeled. The pure follow-on `TproxyGenerationCandidate` accepts only a matching
+profile/binding pair, a complete inventory snapshot/epoch, and a device Capability Profile with
+verified boot identity, exact device identity, and a supported kernel. It remains below
+`GenerationArtifact`: it has no candidate-set selection, planning authority/receipt, mark or route
+program, Generation ID, writer/ownership token, prepared/active conversion, Runtime Coordinator
+entry point, or mutation authority. Production native admission therefore remains uninhabited.
 
 `PlanningEvidenceReceipts` contains no authority or mutation capability. A mark-dependent domain plan
 requires the compiler to consume a fresh `AndroidMarkPlanningAuthority` and retain the resulting

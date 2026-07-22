@@ -20,6 +20,17 @@ All notable changes to the Flux project will be documented in this file.
   artifact to the inspected binary/config/optional-launcher identities. It is deliberately not a
   complete launch-spec identity, Engine Capability Profile, runtime readiness observation,
   Generation, or activation path.
+- Added the first pre-compilation exact-binary Engine Capability Profile collector. It queries
+  `sing-box version` through descriptor-pinned artifacts, reverifies them, checks the exact bound
+  configuration, and reverifies them again. Version stdout/stderr are retained exactly with an
+  8 KiB limit per stream; invalid UTF-8, unsafe control text, missing/ambiguous headers, and
+  malformed bounded semantic releases fail closed. The schema-1 revision length-prefixes and binds
+  the exact launch binding, artifact set, parsed release, and complete captured build output.
+- Added a pure deterministic `TproxyGenerationCandidate` compiler that consumes that exact engine
+  profile and binding with a complete inventory snapshot and a device Capability Profile. It
+  requires verified boot/device identity and the supported kernel floor, but deliberately carries
+  no mark/routing authority, Generation ID, writer token, prepared/active conversion, Runtime
+  Coordinator path, or production mutation admission.
 
 ### Exact Android device identity
 - Bumped the boot-scoped Capability Profile to schema 2 and added typed exact Android product,

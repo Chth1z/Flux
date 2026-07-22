@@ -51,6 +51,46 @@ fn validation_uses_exact_arguments_and_reports_check_failure() {
 }
 
 #[test]
+fn version_query_uses_only_the_pinned_binary_and_returns_exact_bounded_output() {
+    let fixture = Fixture::new("success");
+    let pinned = pin_launch(&fixture.spec);
+
+    let report = SingBoxProcessAdapter
+        .query_version_pinned(&pinned, &fixture.spec)
+        .expect("version query succeeds");
+
+    assert_eq!(
+        report.stdout(),
+        b"sing-box version 1.13.14\n\nEnvironment: go1.24.5 linux/amd64\n"
+    );
+    assert!(report.stderr().is_empty());
+}
+
+#[test]
+fn version_query_rejects_output_larger_than_the_exact_capture_budget() {
+    let fixture = Fixture::new("success");
+    let oversized = "x".repeat(8 * 1024 + 1);
+    write_executable(
+        &fixture.spec.binary,
+        &format!("#!/bin/sh\nprintf '%s' '{oversized}'\n"),
+    );
+    let pinned = pin_launch(&fixture.spec);
+
+    let error = SingBoxProcessAdapter
+        .query_version_pinned(&pinned, &fixture.spec)
+        .expect_err("oversized version output must fail closed");
+
+    assert!(matches!(
+        error,
+        SingBoxProcessError::VersionOutputTooLarge {
+            stream: "stdout",
+            maximum: 8192,
+            actual: 8193,
+        }
+    ));
+}
+
+#[test]
 fn validation_timeout_is_bounded_and_forcibly_reaps_the_check() {
     let mut fixture = Fixture::new("timeout");
     fixture.spec.startup_timeout = Duration::from_millis(75);
@@ -275,6 +315,18 @@ fn pinned_busybox_check_uses_fd_paths_and_is_reusable_for_run() {
     )
     .expect("validate pinned descriptors");
     let adapter = SingBoxProcessAdapter;
+
+    adapter
+        .query_version_pinned(&pinned, &fixture.spec)
+        .expect("query version through pinned BusyBox");
+    let version_arguments = read_arguments(&busybox_record);
+    assert_eq!(version_arguments[0], "setuidgid");
+    assert_eq!(version_arguments[1], "1000:3003");
+    assert_eq!(
+        version_arguments[2],
+        format!("/proc/self/fd/{}", pinned.binary().as_raw_fd())
+    );
+    assert_eq!(version_arguments[3..], ["version"]);
 
     adapter
         .validate_pinned(&pinned, &fixture.spec)
@@ -569,6 +621,11 @@ fn fake_sing_box(directory: &Path) -> PathBuf {
         &script,
         r#"#!/bin/sh
 mode=$1
+if [ "$mode" = version ]; then
+    [ "$#" -eq 1 ] || exit 66
+    printf '%s\n\n%s\n' 'sing-box version 1.13.14' 'Environment: go1.24.5 linux/amd64'
+    exit 0
+fi
 printf '%s\n' "$@" > "$5/invocation"
 case "$mode" in
   check)

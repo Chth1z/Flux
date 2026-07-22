@@ -37,10 +37,11 @@ pub use engine_manifest::{
 };
 pub use engine_supervisor::{
     CaptureBlockedAction, CaptureObservation, DesiredEngine, EngineArtifact, EngineArtifactDigest,
-    EnginePhase, EngineReport, EngineSnapshot, EngineSpec, EngineSpecError, EngineSpecIoOperation,
-    EngineSupervisor, EngineSupervisorError, EngineSupervisorErrorKind, MAX_ENGINE_BINARY_BYTES,
-    MAX_ENGINE_CONFIG_BYTES, MAX_ENGINE_DIAGNOSTIC_BYTES, OwnedEngineIdentity, RestartPolicy,
-    RestartPolicyError, SHA256_DIGEST_BYTES,
+    EngineArtifactSetIdentity, EnginePhase, EngineReport, EngineSnapshot, EngineSpec,
+    EngineSpecError, EngineSpecIoOperation, EngineSupervisor, EngineSupervisorError,
+    EngineSupervisorErrorKind, MAX_ENGINE_BINARY_BYTES, MAX_ENGINE_CONFIG_BYTES,
+    MAX_ENGINE_DIAGNOSTIC_BYTES, OwnedEngineIdentity, RestartPolicy, RestartPolicyError,
+    SHA256_DIGEST_BYTES,
 };
 pub use intent_store::{AdministrativeIntentStore, IntentStoreError};
 pub use legacy_rules_cli::{

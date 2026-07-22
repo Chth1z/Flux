@@ -178,11 +178,26 @@ The separate `fluxd` engine-configuration groundwork remains below this complete
 interface. It deterministically emits one bounded canonical TPROXY config artifact, then may bind
 that artifact to an already inspected `EngineSpec` only when exact config content and the declared
 listener port agree. The resulting identity retains the exact binary/config/optional-launcher
-artifact digests but is not a complete launch-spec identity, Engine Capability Profile, runtime
-readiness observation, Generation, or activation token. Exact-binary capability query/validation
-remains pre-compilation collection work that supplies an immutable Engine Capability Profile;
-deterministic Generation composition remains inside future pure compiler work. Neither may be
-replaced by a caller-asserted seam.
+artifact digests but is not a complete launch-spec identity, runtime readiness observation,
+Generation, or activation token.
+
+The delivered pre-compilation collector consumes that binding and the matching `EngineSpec`. It
+opens and pins the inspected artifacts, executes the exact binary's `version` query, reverifies the
+artifacts, executes the exact bound configuration check, and reverifies again. Each version stream
+is exact and limited to 8 KiB; the parser requires safe UTF-8, exactly one
+`sing-box version <release>` header across both streams, and a bounded semantic release. The
+schema-1 `EngineCapabilityProfile` revision length-prefixes the exact binding, artifact set, parsed
+release, and complete stdout/stderr build identity. It claims only exact-build identity and
+acceptance of this exact canonical TPROXY config; listener staging/delivery, dual-stack runtime
+behavior, DNS, reload, TUN, FD handoff, and supervised reports remain unclaimed.
+
+The first pure consumer is a deterministic, non-authorizing `TproxyGenerationCandidate`. It binds
+the matching engine profile/config pair to a complete inventory snapshot/epoch and a device
+Capability Profile with verified boot identity, exact device identity, and a supported kernel. It
+is not the bounded candidate set or `GenerationArtifact` above and carries no planning authority,
+mark/routing receipt, Generation ID, writer token, prepared/active conversion, or runtime entry
+point. Exact-binary collection remains outside the pure compiler, and neither profile nor candidate
+may be replaced by a caller assertion.
 
 The current Phase 2 tracer bullet stops below both interfaces above. A pure shadow compiler accepts
 already typed and resolved compatibility inputs and emits deterministic, backend-neutral,

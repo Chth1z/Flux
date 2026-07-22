@@ -79,7 +79,8 @@ pub use xtables::{
 pub mod internal {
     pub use crate::sing_box::{
         PinnedSingBoxLaunch, ProcessDiagnostics, SingBoxChild, SingBoxChildIdentity,
-        SingBoxProcessAdapter, SingBoxProcessError, TerminationOutcome, ValidationReport,
+        SingBoxProcessAdapter, SingBoxProcessError, SingBoxVersionReport, TerminationOutcome,
+        ValidationReport,
     };
 }
 

@@ -8,12 +8,19 @@ use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Number, Value};
 use sha2::{Digest, Sha256};
 
+use flux_core::{
+    CapabilityProfile, KernelSupport, NetworkEpoch, NetworkInventory, NetworkInventorySnapshotId,
+    ObservationKind,
+};
 use flux_platform::SingBoxReadiness;
 
-use crate::{EngineArtifactDigest, EngineSpec, MAX_ENGINE_CONFIG_BYTES};
+use crate::engine_supervisor::{EngineCapabilityProbeError, EngineCapabilityProbeErrorKind};
+use crate::{EngineArtifactDigest, EngineArtifactSetIdentity, EngineSpec, MAX_ENGINE_CONFIG_BYTES};
 
 pub(crate) const GENERATION_ENGINE_CONFIG_SCHEMA_VERSION: u16 = 1;
 pub(crate) const ENGINE_CONFIG_LAUNCH_BINDING_SCHEMA_VERSION: u16 = 1;
+pub(crate) const ENGINE_CAPABILITY_PROFILE_SCHEMA_VERSION: u16 = 1;
+pub(crate) const TPROXY_GENERATION_CANDIDATE_SCHEMA_VERSION: u16 = 1;
 pub(crate) const MAX_GENERATION_ENGINE_CONFIG_INBOUNDS: usize = 256;
 
 const ENGINE_CONFIG_DIGEST_BYTES: usize = 32;
@@ -23,6 +30,10 @@ const ARTIFACT_DIGEST_DOMAIN: &[u8] =
     b"Flux Generation Sing-Box engine config artifact\0sha256-v1\0";
 const LAUNCH_BINDING_DIGEST_DOMAIN: &[u8] =
     b"Flux Generation Sing-Box engine config launch binding\0sha256-v1\0";
+const ENGINE_CAPABILITY_PROFILE_DIGEST_DOMAIN: &[u8] =
+    b"Flux Sing-Box Engine Capability Profile\0sha256-v1\0";
+const SING_BOX_VERSION_PREFIX: &str = "sing-box version ";
+const MAX_SING_BOX_RELEASE_BYTES: usize = 128;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(transparent)]
@@ -170,9 +181,7 @@ impl fmt::Display for EngineConfigLaunchBindingDigest {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct EngineConfigLaunchBinding {
     artifact: EngineConfigArtifact,
-    binary_digest: EngineArtifactDigest,
-    config_digest: EngineArtifactDigest,
-    launcher_digest: Option<EngineArtifactDigest>,
+    artifacts: EngineArtifactSetIdentity,
     digest: EngineConfigLaunchBindingDigest,
 }
 
@@ -188,24 +197,366 @@ impl EngineConfigLaunchBinding {
     }
 
     #[must_use]
+    pub(crate) const fn artifacts(&self) -> EngineArtifactSetIdentity {
+        self.artifacts
+    }
+
+    #[must_use]
     pub(crate) const fn binary_digest(&self) -> EngineArtifactDigest {
-        self.binary_digest
+        self.artifacts.binary()
     }
 
     #[must_use]
     pub(crate) const fn config_digest(&self) -> EngineArtifactDigest {
-        self.config_digest
+        self.artifacts.config()
     }
 
     #[must_use]
     pub(crate) const fn launcher_digest(&self) -> Option<EngineArtifactDigest> {
-        self.launcher_digest
+        self.artifacts.launcher()
     }
 
     #[must_use]
     pub(crate) const fn digest(&self) -> EngineConfigLaunchBindingDigest {
         self.digest
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(transparent)]
+pub(crate) struct EngineCapabilityProfileRevision([u8; ENGINE_CONFIG_DIGEST_BYTES]);
+
+impl EngineCapabilityProfileRevision {
+    #[must_use]
+    pub(crate) const fn as_bytes(&self) -> &[u8; ENGINE_CONFIG_DIGEST_BYTES] {
+        &self.0
+    }
+}
+
+impl fmt::Display for EngineCapabilityProfileRevision {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SingBoxVersionIdentity {
+    release: Box<str>,
+    major: u16,
+    minor: u16,
+    patch: u16,
+}
+
+impl SingBoxVersionIdentity {
+    #[must_use]
+    pub(crate) fn release(&self) -> &str {
+        &self.release
+    }
+
+    #[must_use]
+    pub(crate) const fn major(&self) -> u16 {
+        self.major
+    }
+
+    #[must_use]
+    pub(crate) const fn minor(&self) -> u16 {
+        self.minor
+    }
+
+    #[must_use]
+    pub(crate) const fn patch(&self) -> u16 {
+        self.patch
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SingBoxBuildIdentity {
+    stdout: Box<str>,
+    stderr: Box<str>,
+}
+
+impl SingBoxBuildIdentity {
+    #[must_use]
+    pub(crate) fn stdout(&self) -> &str {
+        &self.stdout
+    }
+
+    #[must_use]
+    pub(crate) fn stderr(&self) -> &str {
+        &self.stderr
+    }
+}
+
+/// Minimal immutable profile for the first canonical TPROXY Generation candidate.
+///
+/// Schema 1 proves only parsed exact-build identity and descriptor-pinned acceptance of the exact
+/// config binding. Every other engine feature remains unclaimed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct EngineCapabilityProfile {
+    artifacts: EngineArtifactSetIdentity,
+    validated_binding: EngineConfigLaunchBindingDigest,
+    version: SingBoxVersionIdentity,
+    build: SingBoxBuildIdentity,
+    revision: EngineCapabilityProfileRevision,
+}
+
+impl EngineCapabilityProfile {
+    #[must_use]
+    pub(crate) const fn schema_version(&self) -> u16 {
+        ENGINE_CAPABILITY_PROFILE_SCHEMA_VERSION
+    }
+
+    #[must_use]
+    pub(crate) const fn artifacts(&self) -> EngineArtifactSetIdentity {
+        self.artifacts
+    }
+
+    #[must_use]
+    pub(crate) const fn validated_binding(&self) -> EngineConfigLaunchBindingDigest {
+        self.validated_binding
+    }
+
+    #[must_use]
+    pub(crate) const fn version(&self) -> &SingBoxVersionIdentity {
+        &self.version
+    }
+
+    #[must_use]
+    pub(crate) const fn build(&self) -> &SingBoxBuildIdentity {
+        &self.build
+    }
+
+    #[must_use]
+    pub(crate) const fn revision(&self) -> EngineCapabilityProfileRevision {
+        self.revision
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EngineVersionOutputErrorKind {
+    InvalidUtf8 { stream: &'static str },
+    UnsafeText { stream: &'static str },
+    MissingVersionHeader,
+    AmbiguousVersionHeader,
+    InvalidRelease,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EngineCapabilityProfileErrorKind {
+    ArtifactSetMismatch,
+    Probe(EngineCapabilityProbeErrorKind),
+    VersionOutput(EngineVersionOutputErrorKind),
+}
+
+#[derive(Debug)]
+pub(crate) struct EngineCapabilityProfileError {
+    kind: EngineCapabilityProfileErrorKind,
+    source: Option<Box<EngineCapabilityProbeError>>,
+}
+
+impl EngineCapabilityProfileError {
+    #[must_use]
+    pub(crate) const fn kind(&self) -> EngineCapabilityProfileErrorKind {
+        self.kind
+    }
+
+    const fn without_source(kind: EngineCapabilityProfileErrorKind) -> Self {
+        Self { kind, source: None }
+    }
+}
+
+impl fmt::Display for EngineCapabilityProfileError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.kind {
+            EngineCapabilityProfileErrorKind::ArtifactSetMismatch => formatter.write_str(
+                "engine config binding and EngineSpec identify different launch artifacts",
+            ),
+            EngineCapabilityProfileErrorKind::Probe(_) => {
+                formatter.write_str("exact Proxy Engine capability probe failed")
+            }
+            EngineCapabilityProfileErrorKind::VersionOutput(kind) => {
+                write!(
+                    formatter,
+                    "invalid exact Proxy Engine version output: {kind:?}"
+                )
+            }
+        }
+    }
+}
+
+impl Error for EngineCapabilityProfileError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        self.source
+            .as_ref()
+            .map(|source| source as &(dyn Error + 'static))
+    }
+}
+
+pub(crate) fn collect_tproxy_engine_capability_profile(
+    binding: &EngineConfigLaunchBinding,
+    spec: &EngineSpec,
+) -> Result<EngineCapabilityProfile, EngineCapabilityProfileError> {
+    if binding.artifacts() != spec.artifacts() {
+        return Err(EngineCapabilityProfileError::without_source(
+            EngineCapabilityProfileErrorKind::ArtifactSetMismatch,
+        ));
+    }
+
+    let probe = spec.probe_capabilities().map_err(|source| {
+        let kind = EngineCapabilityProfileErrorKind::Probe(source.kind());
+        EngineCapabilityProfileError {
+            kind,
+            source: Some(Box::new(source)),
+        }
+    })?;
+    debug_assert_eq!(probe.artifacts(), binding.artifacts());
+    let (version, build) =
+        parse_sing_box_version_output(probe.version_stdout(), probe.version_stderr())?;
+    let revision = EngineCapabilityProfileRevision(digest_engine_capability_profile(
+        binding, &version, &build,
+    ));
+    Ok(EngineCapabilityProfile {
+        artifacts: probe.artifacts(),
+        validated_binding: binding.digest(),
+        version,
+        build,
+        revision,
+    })
+}
+
+/// Deterministic, non-authorizing input bundle for later complete Generation compilation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TproxyGenerationCandidate {
+    device_profile: CapabilityProfile,
+    inventory_snapshot: NetworkInventorySnapshotId,
+    inventory_epoch: NetworkEpoch,
+    engine_profile: EngineCapabilityProfile,
+    engine_config: EngineConfigLaunchBinding,
+}
+
+impl TproxyGenerationCandidate {
+    #[must_use]
+    pub(crate) const fn schema_version(&self) -> u16 {
+        TPROXY_GENERATION_CANDIDATE_SCHEMA_VERSION
+    }
+
+    #[must_use]
+    pub(crate) const fn device_profile(&self) -> &CapabilityProfile {
+        &self.device_profile
+    }
+
+    #[must_use]
+    pub(crate) const fn inventory_snapshot(&self) -> NetworkInventorySnapshotId {
+        self.inventory_snapshot
+    }
+
+    #[must_use]
+    pub(crate) const fn inventory_epoch(&self) -> NetworkEpoch {
+        self.inventory_epoch
+    }
+
+    #[must_use]
+    pub(crate) const fn engine_profile(&self) -> &EngineCapabilityProfile {
+        &self.engine_profile
+    }
+
+    #[must_use]
+    pub(crate) const fn engine_config(&self) -> &EngineConfigLaunchBinding {
+        &self.engine_config
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TproxyGenerationCandidateErrorKind {
+    EngineArtifactSetMismatch,
+    EngineBindingMismatch,
+    BootIdentityNotVerified { observation: ObservationKind },
+    DeviceIdentityNotVerified { observation: ObservationKind },
+    KernelNotSupported { support: Option<KernelSupport> },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TproxyGenerationCandidateError {
+    kind: TproxyGenerationCandidateErrorKind,
+}
+
+impl TproxyGenerationCandidateError {
+    #[must_use]
+    pub(crate) const fn kind(self) -> TproxyGenerationCandidateErrorKind {
+        self.kind
+    }
+}
+
+impl fmt::Display for TproxyGenerationCandidateError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.kind {
+            TproxyGenerationCandidateErrorKind::EngineArtifactSetMismatch => formatter.write_str(
+                "Engine Capability Profile and config binding identify different artifacts",
+            ),
+            TproxyGenerationCandidateErrorKind::EngineBindingMismatch => formatter
+                .write_str("Engine Capability Profile did not validate this exact config binding"),
+            TproxyGenerationCandidateErrorKind::BootIdentityNotVerified { .. } => {
+                formatter.write_str("device boot identity is not verified")
+            }
+            TproxyGenerationCandidateErrorKind::DeviceIdentityNotVerified { .. } => {
+                formatter.write_str("exact device identity is not verified")
+            }
+            TproxyGenerationCandidateErrorKind::KernelNotSupported { .. } => {
+                formatter.write_str("device kernel is not verified at the supported floor")
+            }
+        }
+    }
+}
+
+impl Error for TproxyGenerationCandidateError {}
+
+pub(crate) fn compile_tproxy_generation_candidate(
+    device_profile: CapabilityProfile,
+    inventory: &NetworkInventory,
+    engine_profile: EngineCapabilityProfile,
+    engine_config: EngineConfigLaunchBinding,
+) -> Result<TproxyGenerationCandidate, TproxyGenerationCandidateError> {
+    if engine_profile.artifacts() != engine_config.artifacts() {
+        return Err(TproxyGenerationCandidateError {
+            kind: TproxyGenerationCandidateErrorKind::EngineArtifactSetMismatch,
+        });
+    }
+    if engine_profile.validated_binding() != engine_config.digest() {
+        return Err(TproxyGenerationCandidateError {
+            kind: TproxyGenerationCandidateErrorKind::EngineBindingMismatch,
+        });
+    }
+    if device_profile.boot_identity().verified().is_none() {
+        return Err(TproxyGenerationCandidateError {
+            kind: TproxyGenerationCandidateErrorKind::BootIdentityNotVerified {
+                observation: device_profile.boot_identity().kind(),
+            },
+        });
+    }
+    if device_profile.device_identity().verified().is_none() {
+        return Err(TproxyGenerationCandidateError {
+            kind: TproxyGenerationCandidateErrorKind::DeviceIdentityNotVerified {
+                observation: device_profile.device_identity().kind(),
+            },
+        });
+    }
+    let support = device_profile.kernel_support();
+    if !support.is_some_and(KernelSupport::is_supported) {
+        return Err(TproxyGenerationCandidateError {
+            kind: TproxyGenerationCandidateErrorKind::KernelNotSupported { support },
+        });
+    }
+
+    Ok(TproxyGenerationCandidate {
+        device_profile,
+        inventory_snapshot: inventory.snapshot_id(),
+        inventory_epoch: inventory.epoch(),
+        engine_profile,
+        engine_config,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -287,19 +638,14 @@ pub(crate) fn bind_engine_config_to_spec(
         }
     }
 
-    let binary_digest = spec.binary_digest();
-    let launcher_digest = spec.launcher_digest();
+    let artifacts = spec.artifacts();
     let digest = EngineConfigLaunchBindingDigest(digest_engine_config_launch_binding(
         artifact.digest(),
-        binary_digest,
-        config_digest,
-        launcher_digest,
+        artifacts,
     ));
     Ok(EngineConfigLaunchBinding {
         artifact,
-        binary_digest,
-        config_digest,
-        launcher_digest,
+        artifacts,
         digest,
     })
 }
@@ -548,6 +894,125 @@ fn bytes_exceed_limit(actual: usize, maximum: u64) -> bool {
     u64::try_from(actual).map_or(true, |actual| actual > maximum)
 }
 
+fn parse_sing_box_version_output(
+    stdout: &[u8],
+    stderr: &[u8],
+) -> Result<(SingBoxVersionIdentity, SingBoxBuildIdentity), EngineCapabilityProfileError> {
+    let stdout = exact_safe_version_text(stdout, "stdout")?;
+    let stderr = exact_safe_version_text(stderr, "stderr")?;
+    let mut release = None;
+    for line in stdout.lines().chain(stderr.lines()) {
+        let Some(candidate) = line.strip_prefix(SING_BOX_VERSION_PREFIX) else {
+            continue;
+        };
+        if release.replace(candidate).is_some() {
+            return Err(engine_version_output_error(
+                EngineVersionOutputErrorKind::AmbiguousVersionHeader,
+            ));
+        }
+    }
+    let release = release.ok_or_else(|| {
+        engine_version_output_error(EngineVersionOutputErrorKind::MissingVersionHeader)
+    })?;
+    let (major, minor, patch) = parse_sing_box_release(release)
+        .ok_or_else(|| engine_version_output_error(EngineVersionOutputErrorKind::InvalidRelease))?;
+
+    Ok((
+        SingBoxVersionIdentity {
+            release: release.into(),
+            major,
+            minor,
+            patch,
+        },
+        SingBoxBuildIdentity {
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+        },
+    ))
+}
+
+fn exact_safe_version_text<'a>(
+    bytes: &'a [u8],
+    stream: &'static str,
+) -> Result<&'a str, EngineCapabilityProfileError> {
+    let text = std::str::from_utf8(bytes).map_err(|_| {
+        engine_version_output_error(EngineVersionOutputErrorKind::InvalidUtf8 { stream })
+    })?;
+    let unsafe_control = text
+        .chars()
+        .any(|character| character.is_control() && !matches!(character, '\n' | '\r' | '\t'));
+    let bare_carriage_return = bytes
+        .iter()
+        .enumerate()
+        .any(|(index, byte)| *byte == b'\r' && bytes.get(index + 1) != Some(&b'\n'));
+    if unsafe_control || bare_carriage_return {
+        return Err(engine_version_output_error(
+            EngineVersionOutputErrorKind::UnsafeText { stream },
+        ));
+    }
+    Ok(text)
+}
+
+fn parse_sing_box_release(release: &str) -> Option<(u16, u16, u16)> {
+    if release.is_empty() || release.len() > MAX_SING_BOX_RELEASE_BYTES || !release.is_ascii() {
+        return None;
+    }
+
+    let (without_build, build) = match release.split_once('+') {
+        Some((version, build)) if valid_semver_identifiers(build, false) => (version, Some(build)),
+        Some(_) => return None,
+        None => (release, None),
+    };
+    debug_assert!(build.is_none_or(|value| !value.is_empty()));
+    let (core, prerelease) = match without_build.split_once('-') {
+        Some((core, prerelease)) if valid_semver_identifiers(prerelease, true) => {
+            (core, Some(prerelease))
+        }
+        Some(_) => return None,
+        None => (without_build, None),
+    };
+    debug_assert!(prerelease.is_none_or(|value| !value.is_empty()));
+
+    let mut components = core.split('.');
+    let major = parse_semver_component(components.next()?)?;
+    let minor = parse_semver_component(components.next()?)?;
+    let patch = parse_semver_component(components.next()?)?;
+    if components.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch))
+}
+
+fn parse_semver_component(component: &str) -> Option<u16> {
+    if component.is_empty()
+        || !component.bytes().all(|byte| byte.is_ascii_digit())
+        || (component.len() > 1 && component.starts_with('0'))
+    {
+        return None;
+    }
+    component.parse().ok()
+}
+
+fn valid_semver_identifiers(value: &str, reject_numeric_leading_zero: bool) -> bool {
+    !value.is_empty()
+        && value.split('.').all(|identifier| {
+            !identifier.is_empty()
+                && identifier
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                && (!reject_numeric_leading_zero
+                    || !identifier.bytes().all(|byte| byte.is_ascii_digit())
+                    || identifier.len() == 1
+                    || !identifier.starts_with('0'))
+        })
+}
+
+fn engine_version_output_error(kind: EngineVersionOutputErrorKind) -> EngineCapabilityProfileError {
+    EngineCapabilityProfileError::without_source(EngineCapabilityProfileErrorKind::VersionOutput(
+        kind,
+    ))
+}
+
 fn digest_engine_config_artifact(
     listener_port: NonZeroU16,
     template_digest: [u8; ENGINE_CONFIG_DIGEST_BYTES],
@@ -568,17 +1033,15 @@ fn digest_engine_config_artifact(
 
 fn digest_engine_config_launch_binding(
     artifact_digest: EngineConfigArtifactDigest,
-    binary_digest: EngineArtifactDigest,
-    config_digest: EngineArtifactDigest,
-    launcher_digest: Option<EngineArtifactDigest>,
+    artifacts: EngineArtifactSetIdentity,
 ) -> [u8; ENGINE_CONFIG_DIGEST_BYTES] {
     let mut digest = Sha256::new();
     digest.update(LAUNCH_BINDING_DIGEST_DOMAIN);
     digest.update(ENGINE_CONFIG_LAUNCH_BINDING_SCHEMA_VERSION.to_be_bytes());
     digest.update(artifact_digest.as_bytes());
-    digest.update(binary_digest.as_bytes());
-    digest.update(config_digest.as_bytes());
-    match launcher_digest {
+    digest.update(artifacts.binary().as_bytes());
+    digest.update(artifacts.config().as_bytes());
+    match artifacts.launcher() {
         Some(launcher_digest) => {
             digest.update([1]);
             digest.update(launcher_digest.as_bytes());
@@ -586,6 +1049,42 @@ fn digest_engine_config_launch_binding(
         None => digest.update([0]),
     }
     digest.finalize().into()
+}
+
+fn digest_engine_capability_profile(
+    binding: &EngineConfigLaunchBinding,
+    version: &SingBoxVersionIdentity,
+    build: &SingBoxBuildIdentity,
+) -> [u8; ENGINE_CONFIG_DIGEST_BYTES] {
+    let mut digest = Sha256::new();
+    digest.update(ENGINE_CAPABILITY_PROFILE_DIGEST_DOMAIN);
+    update_length_prefixed(
+        &mut digest,
+        &ENGINE_CAPABILITY_PROFILE_SCHEMA_VERSION.to_be_bytes(),
+    );
+    update_length_prefixed(&mut digest, binding.digest().as_bytes());
+    let artifacts = binding.artifacts();
+    update_length_prefixed(&mut digest, artifacts.binary().as_bytes());
+    update_length_prefixed(&mut digest, artifacts.config().as_bytes());
+    match artifacts.launcher() {
+        Some(launcher) => {
+            update_length_prefixed(&mut digest, &[1]);
+            update_length_prefixed(&mut digest, launcher.as_bytes());
+        }
+        None => update_length_prefixed(&mut digest, &[0]),
+    }
+    update_length_prefixed(&mut digest, version.release().as_bytes());
+    update_length_prefixed(&mut digest, &version.major().to_be_bytes());
+    update_length_prefixed(&mut digest, &version.minor().to_be_bytes());
+    update_length_prefixed(&mut digest, &version.patch().to_be_bytes());
+    update_length_prefixed(&mut digest, build.stdout().as_bytes());
+    update_length_prefixed(&mut digest, build.stderr().as_bytes());
+    digest.finalize().into()
+}
+
+fn update_length_prefixed(digest: &mut Sha256, bytes: &[u8]) {
+    digest.update(length_bytes(bytes.len()));
+    digest.update(bytes);
 }
 
 fn digest_with_domain(domain: &[u8], bytes: &[u8]) -> [u8; ENGINE_CONFIG_DIGEST_BYTES] {
@@ -723,16 +1222,28 @@ impl<'de> Visitor<'de> for StrictJsonVisitor {
 mod tests {
     use std::fs;
     use std::num::NonZeroU16;
+    use std::os::unix::fs::PermissionsExt;
     use std::time::Duration;
 
+    use flux_core::{
+        CapabilityProfile, InterfaceAddressRecord, InterfaceLinkRecord, KernelSupport,
+        NetworkInventoryTracker, ObservationKind,
+    };
+    use flux_platform::internal::SingBoxProcessError;
     use flux_platform::{SingBoxLaunchSpec, SingBoxLauncher, SingBoxReadiness};
+    use flux_testkit::CapabilityProfileFixture;
 
     use super::{
-        ENGINE_CONFIG_LAUNCH_BINDING_SCHEMA_VERSION, EngineConfigBindingErrorKind,
-        EngineConfigCompileErrorKind, GENERATION_ENGINE_CONFIG_SCHEMA_VERSION,
-        MAX_GENERATION_ENGINE_CONFIG_INBOUNDS, TproxyEngineConfigRequest,
-        bind_engine_config_to_spec, compile_tproxy_engine_config,
+        ENGINE_CAPABILITY_PROFILE_SCHEMA_VERSION, ENGINE_CONFIG_LAUNCH_BINDING_SCHEMA_VERSION,
+        EngineCapabilityProfileErrorKind, EngineConfigBindingErrorKind,
+        EngineConfigCompileErrorKind, EngineVersionOutputErrorKind,
+        GENERATION_ENGINE_CONFIG_SCHEMA_VERSION, MAX_GENERATION_ENGINE_CONFIG_INBOUNDS,
+        TPROXY_GENERATION_CANDIDATE_SCHEMA_VERSION, TproxyEngineConfigRequest,
+        TproxyGenerationCandidateErrorKind, bind_engine_config_to_spec,
+        collect_tproxy_engine_capability_profile, compile_tproxy_engine_config,
+        compile_tproxy_generation_candidate, parse_sing_box_version_output,
     };
+    use crate::engine_supervisor::EngineCapabilityProbeError;
     use crate::{EngineSpec, MAX_ENGINE_CONFIG_BYTES, RestartPolicy};
 
     const PORT: u16 = 1536;
@@ -961,6 +1472,290 @@ mod tests {
     }
 
     #[test]
+    fn collects_exact_binary_profile_and_pins_its_revision() {
+        let artifact = compile(br#"{"inbounds":[]}"#, PORT).unwrap();
+        let fixture = EngineSpecFixture::new_executable(
+            artifact.bytes(),
+            PROFILE_SCRIPT,
+            listener_readiness(),
+        );
+        let binding = bind_engine_config_to_spec(artifact, &fixture.spec).unwrap();
+
+        let profile = collect_tproxy_engine_capability_profile(&binding, &fixture.spec)
+            .expect("exact binary accepts its exact canonical config");
+
+        assert_eq!(
+            profile.schema_version(),
+            ENGINE_CAPABILITY_PROFILE_SCHEMA_VERSION
+        );
+        assert_eq!(profile.artifacts(), binding.artifacts());
+        assert_eq!(profile.validated_binding(), binding.digest());
+        assert_eq!(profile.version().release(), "1.13.14-rc.1+flux.2");
+        assert_eq!(profile.version().major(), 1);
+        assert_eq!(profile.version().minor(), 13);
+        assert_eq!(profile.version().patch(), 14);
+        assert_eq!(
+            profile.build().stdout(),
+            "sing-box version 1.13.14-rc.1+flux.2\n\nEnvironment: go1.24.5 linux/amd64\n"
+        );
+        assert_eq!(profile.build().stderr(), "Tags: with_quic,with_wireguard\n");
+        assert_eq!(
+            profile.revision().to_string(),
+            "d129642ba9e1ac385d42a36a7d125b240514d477268a63fdcda448b42edc02ec"
+        );
+        assert_eq!(profile.revision().as_bytes().len(), 32);
+    }
+
+    #[test]
+    fn profile_collection_rejects_artifact_mismatch_before_execution() {
+        let artifact = compile(br#"{"inbounds":[]}"#, PORT).unwrap();
+        let fixture = EngineSpecFixture::new_executable(
+            artifact.bytes(),
+            PROFILE_SCRIPT,
+            listener_readiness(),
+        );
+        let binding = bind_engine_config_to_spec(artifact, &fixture.spec).unwrap();
+        let marker_directory = tempfile::tempdir().expect("create probe marker directory");
+        let marker = marker_directory.path().join("probe-invoked");
+        let mismatched_script = format!(
+            "#!/bin/sh\nprintf invoked > \"{}\"\n{}",
+            marker.display(),
+            std::str::from_utf8(PROFILE_SCRIPT)
+                .unwrap()
+                .trim_start_matches("#!/bin/sh\n")
+        );
+        let mismatched = EngineSpecFixture::new_executable(
+            binding.artifact().bytes(),
+            mismatched_script.as_bytes(),
+            listener_readiness(),
+        );
+
+        let error = collect_tproxy_engine_capability_profile(&binding, &mismatched.spec)
+            .expect_err("artifact-set mismatch must fail before probing");
+
+        assert!(matches!(
+            error.kind(),
+            EngineCapabilityProfileErrorKind::ArtifactSetMismatch
+        ));
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn version_output_requires_one_valid_safe_header_across_both_streams() {
+        let cases: &[(&[u8], &[u8], EngineVersionOutputErrorKind)] = &[
+            (
+                b"Environment: go1.24.5 linux/amd64\n",
+                b"",
+                EngineVersionOutputErrorKind::MissingVersionHeader,
+            ),
+            (
+                b"sing-box version 1.13.14\n",
+                b"sing-box version 1.13.14\n",
+                EngineVersionOutputErrorKind::AmbiguousVersionHeader,
+            ),
+            (
+                b"sing-box version 1.13\n",
+                b"",
+                EngineVersionOutputErrorKind::InvalidRelease,
+            ),
+            (
+                b"sing-box version 01.13.14\n",
+                b"",
+                EngineVersionOutputErrorKind::InvalidRelease,
+            ),
+            (
+                b"sing-box version 1.13.14-rc..1\n",
+                b"",
+                EngineVersionOutputErrorKind::InvalidRelease,
+            ),
+        ];
+
+        for (stdout, stderr, expected) in cases {
+            let error = parse_sing_box_version_output(stdout, stderr)
+                .expect_err("invalid version output must fail closed");
+            assert_eq!(
+                error.kind(),
+                EngineCapabilityProfileErrorKind::VersionOutput(*expected)
+            );
+        }
+
+        let invalid_utf8 = parse_sing_box_version_output(b"sing-box version 1.13.14\n\xff", b"")
+            .expect_err("version output must be exact UTF-8");
+        assert_eq!(
+            invalid_utf8.kind(),
+            EngineCapabilityProfileErrorKind::VersionOutput(
+                EngineVersionOutputErrorKind::InvalidUtf8 { stream: "stdout" }
+            )
+        );
+
+        let unsafe_text = parse_sing_box_version_output(b"sing-box version 1.13.14\n\x1b[31m", b"")
+            .expect_err("terminal control output must fail closed");
+        assert_eq!(
+            unsafe_text.kind(),
+            EngineCapabilityProfileErrorKind::VersionOutput(
+                EngineVersionOutputErrorKind::UnsafeText { stream: "stdout" }
+            )
+        );
+    }
+
+    #[test]
+    fn profile_collection_propagates_exact_configuration_check_failure() {
+        let artifact = compile(br#"{"inbounds":[]}"#, PORT).unwrap();
+        let fixture = EngineSpecFixture::new_executable(
+            artifact.bytes(),
+            PROFILE_CHECK_FAILURE_SCRIPT,
+            listener_readiness(),
+        );
+        let binding = bind_engine_config_to_spec(artifact, &fixture.spec).unwrap();
+
+        let error = collect_tproxy_engine_capability_profile(&binding, &fixture.spec)
+            .expect_err("configuration rejection must fail profile collection");
+
+        assert_eq!(
+            error.kind(),
+            EngineCapabilityProfileErrorKind::Probe(
+                crate::engine_supervisor::EngineCapabilityProbeErrorKind::Process
+            )
+        );
+        assert!(matches!(
+            error.source.as_deref(),
+            Some(EngineCapabilityProbeError::Process {
+                source: SingBoxProcessError::CheckFailed { .. }
+            })
+        ));
+    }
+
+    #[test]
+    fn compiles_the_same_non_authorizing_candidate_for_identical_inputs() {
+        let (binding, profile, _fixture) = collected_profile();
+        let mut tracker = NetworkInventoryTracker::new();
+        let inventory = empty_inventory(&mut tracker);
+        let device_profile = CapabilityProfileFixture::device_qualified();
+
+        let first = compile_tproxy_generation_candidate(
+            device_profile.clone(),
+            inventory,
+            profile.clone(),
+            binding.clone(),
+        )
+        .expect("verified inputs compile");
+        let second = compile_tproxy_generation_candidate(
+            device_profile.clone(),
+            inventory,
+            profile,
+            binding,
+        )
+        .expect("identical verified inputs compile");
+
+        assert_eq!(first, second);
+        assert_eq!(
+            first.schema_version(),
+            TPROXY_GENERATION_CANDIDATE_SCHEMA_VERSION
+        );
+        assert_eq!(first.device_profile(), &device_profile);
+        assert_eq!(first.inventory_snapshot(), inventory.snapshot_id());
+        assert_eq!(first.inventory_epoch(), inventory.epoch());
+        assert_eq!(
+            first.engine_profile().validated_binding(),
+            first.engine_config().digest()
+        );
+    }
+
+    #[test]
+    fn candidate_rejects_mismatched_engine_binding_or_artifact_set() {
+        let (binding, profile, fixture) = collected_profile();
+        let mut tracker = NetworkInventoryTracker::new();
+        let inventory = empty_inventory(&mut tracker);
+        let device_profile = CapabilityProfileFixture::device_qualified();
+        let source_drift =
+            compile(br#"{"inbounds":[{"type":"tun","tag":"removed"}]}"#, PORT).unwrap();
+        assert_eq!(source_drift.bytes(), binding.artifact().bytes());
+        let different_binding = bind_engine_config_to_spec(source_drift, &fixture.spec).unwrap();
+
+        let error = compile_tproxy_generation_candidate(
+            device_profile.clone(),
+            inventory,
+            profile.clone(),
+            different_binding,
+        )
+        .expect_err("profile must validate the exact binding");
+        assert_eq!(
+            error.kind(),
+            TproxyGenerationCandidateErrorKind::EngineBindingMismatch
+        );
+
+        let other_fixture = EngineSpecFixture::new_executable(
+            binding.artifact().bytes(),
+            PROFILE_ALTERNATE_BINARY_SCRIPT,
+            listener_readiness(),
+        );
+        let other_artifact = compile(br#"{"inbounds":[]}"#, PORT).unwrap();
+        let other_binding =
+            bind_engine_config_to_spec(other_artifact, &other_fixture.spec).unwrap();
+        let error =
+            compile_tproxy_generation_candidate(device_profile, inventory, profile, other_binding)
+                .expect_err("profile and binding artifact sets must agree");
+        assert_eq!(
+            error.kind(),
+            TproxyGenerationCandidateErrorKind::EngineArtifactSetMismatch
+        );
+    }
+
+    #[test]
+    fn candidate_requires_verified_device_identity_and_supported_kernel() {
+        let (binding, profile, _fixture) = collected_profile();
+        let mut tracker = NetworkInventoryTracker::new();
+        let inventory = empty_inventory(&mut tracker);
+
+        let error = compile_tproxy_generation_candidate(
+            CapabilityProfileFixture::unverified_boot(),
+            inventory,
+            profile.clone(),
+            binding.clone(),
+        )
+        .expect_err("boot identity must be verified");
+        assert_eq!(
+            error.kind(),
+            TproxyGenerationCandidateErrorKind::BootIdentityNotVerified {
+                observation: ObservationKind::Unavailable,
+            }
+        );
+
+        let error = compile_tproxy_generation_candidate(
+            CapabilityProfileFixture::supported(),
+            inventory,
+            profile.clone(),
+            binding.clone(),
+        )
+        .expect_err("exact device identity must be verified");
+        assert_eq!(
+            error.kind(),
+            TproxyGenerationCandidateErrorKind::DeviceIdentityNotVerified {
+                observation: ObservationKind::Unavailable,
+            }
+        );
+
+        let qualified = CapabilityProfileFixture::device_qualified();
+        let unsupported = CapabilityProfileFixture::unsupported_kernel();
+        let unsupported = CapabilityProfile::new(
+            qualified.revision(),
+            qualified.boot_identity().clone(),
+            qualified.device_identity().clone(),
+            unsupported.kernel().clone(),
+            qualified.selinux().clone(),
+            qualified.legacy_bridge().clone(),
+        );
+        let error = compile_tproxy_generation_candidate(unsupported, inventory, profile, binding)
+            .expect_err("unsupported kernel must fail closed");
+        assert!(matches!(
+            error.kind(),
+            TproxyGenerationCandidateErrorKind::KernelNotSupported {
+                support: Some(KernelSupport::Unsupported { .. })
+            }
+        ));
+    }
+
+    #[test]
     fn rejects_duplicate_or_ambiguous_json_before_compilation() {
         for template in [
             br#"{"inbounds":[],"inbounds":[]}"#.as_slice(),
@@ -1056,6 +1851,81 @@ mod tests {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 
+    fn listener_readiness() -> SingBoxReadiness {
+        SingBoxReadiness::Listener {
+            port: NonZeroU16::new(PORT).unwrap(),
+        }
+    }
+
+    fn collected_profile() -> (
+        super::EngineConfigLaunchBinding,
+        super::EngineCapabilityProfile,
+        EngineSpecFixture,
+    ) {
+        let artifact = compile(br#"{"inbounds":[]}"#, PORT).unwrap();
+        let fixture = EngineSpecFixture::new_executable(
+            artifact.bytes(),
+            PROFILE_SCRIPT,
+            listener_readiness(),
+        );
+        let binding = bind_engine_config_to_spec(artifact, &fixture.spec).unwrap();
+        let profile = collect_tproxy_engine_capability_profile(&binding, &fixture.spec).unwrap();
+        (binding, profile, fixture)
+    }
+
+    fn empty_inventory(tracker: &mut NetworkInventoryTracker) -> &flux_core::NetworkInventory {
+        tracker
+            .publish_complete(
+                Vec::<InterfaceLinkRecord>::new(),
+                Vec::<InterfaceAddressRecord>::new(),
+            )
+            .expect("publish complete empty inventory")
+    }
+
+    const PROFILE_SCRIPT: &[u8] = br#"#!/bin/sh
+case "$1" in
+    version)
+        printf '%s\n\n%s\n' 'sing-box version 1.13.14-rc.1+flux.2' 'Environment: go1.24.5 linux/amd64'
+        printf '%s\n' 'Tags: with_quic,with_wireguard' >&2
+        ;;
+    check)
+        exit 0
+        ;;
+    *)
+        exit 64
+        ;;
+esac
+"#;
+
+    const PROFILE_CHECK_FAILURE_SCRIPT: &[u8] = br#"#!/bin/sh
+case "$1" in
+    version)
+        printf '%s\n' 'sing-box version 1.13.14'
+        ;;
+    check)
+        printf '%s\n' 'configuration rejected' >&2
+        exit 42
+        ;;
+    *)
+        exit 64
+        ;;
+esac
+"#;
+
+    const PROFILE_ALTERNATE_BINARY_SCRIPT: &[u8] = br#"#!/bin/sh
+case "$1" in
+    version)
+        printf '%s\n' 'sing-box version 1.13.15'
+        ;;
+    check)
+        exit 0
+        ;;
+    *)
+        exit 64
+        ;;
+esac
+"#;
+
     struct EngineSpecFixture {
         spec: EngineSpec,
         _directory: tempfile::TempDir,
@@ -1073,6 +1943,15 @@ mod tests {
             readiness: SingBoxReadiness,
         ) -> Self {
             Self::build(config, binary, Some(busybox), readiness)
+        }
+
+        fn new_executable(config: &[u8], binary: &[u8], readiness: SingBoxReadiness) -> Self {
+            let fixture = Self::new(config, binary, readiness);
+            let path = &fixture.spec.process().binary;
+            let mut permissions = fs::metadata(path).expect("read fixture mode").permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(path, permissions).expect("make engine fixture executable");
+            fixture
         }
 
         fn build(

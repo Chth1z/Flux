@@ -14,7 +14,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
 use flux_platform::internal::{
     PinnedSingBoxLaunch, SingBoxChild, SingBoxProcessAdapter, SingBoxProcessError,
-    TerminationOutcome,
+    SingBoxVersionReport, TerminationOutcome,
 };
 use flux_platform::{
     ProcessHandle, ProcessHandleError, ProcessHandleErrorKind, ProcessObservation,
@@ -43,6 +43,31 @@ impl fmt::Display for EngineArtifactDigest {
             write!(formatter, "{byte:02x}")?;
         }
         Ok(())
+    }
+}
+
+/// Exact content identity of every executable/configuration artifact in an `EngineSpec`.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct EngineArtifactSetIdentity {
+    binary: EngineArtifactDigest,
+    config: EngineArtifactDigest,
+    launcher: Option<EngineArtifactDigest>,
+}
+
+impl EngineArtifactSetIdentity {
+    #[must_use]
+    pub const fn binary(self) -> EngineArtifactDigest {
+        self.binary
+    }
+
+    #[must_use]
+    pub const fn config(self) -> EngineArtifactDigest {
+        self.config
+    }
+
+    #[must_use]
+    pub const fn launcher(self) -> Option<EngineArtifactDigest> {
+        self.launcher
     }
 }
 
@@ -186,6 +211,80 @@ impl Error for EngineSpecError {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EngineCapabilityProbeErrorKind {
+    Artifact,
+    Process,
+}
+
+#[derive(Debug)]
+pub(crate) enum EngineCapabilityProbeError {
+    Artifact { source: EngineSpecError },
+    Process { source: SingBoxProcessError },
+}
+
+impl EngineCapabilityProbeError {
+    #[must_use]
+    pub(crate) const fn kind(&self) -> EngineCapabilityProbeErrorKind {
+        match self {
+            Self::Artifact { .. } => EngineCapabilityProbeErrorKind::Artifact,
+            Self::Process { .. } => EngineCapabilityProbeErrorKind::Process,
+        }
+    }
+}
+
+impl fmt::Display for EngineCapabilityProbeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Artifact { source } => {
+                write!(
+                    formatter,
+                    "cannot verify Proxy Engine capability artifacts: {source}"
+                )
+            }
+            Self::Process { source } => {
+                write!(
+                    formatter,
+                    "cannot query and validate the exact Proxy Engine: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl Error for EngineCapabilityProbeError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Artifact { source } => Some(source),
+            Self::Process { source } => Some(source),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct EngineCapabilityProbeReport {
+    artifacts: EngineArtifactSetIdentity,
+    version_stdout: Box<[u8]>,
+    version_stderr: Box<[u8]>,
+}
+
+impl EngineCapabilityProbeReport {
+    #[must_use]
+    pub(crate) const fn artifacts(&self) -> EngineArtifactSetIdentity {
+        self.artifacts
+    }
+
+    #[must_use]
+    pub(crate) fn version_stdout(&self) -> &[u8] {
+        &self.version_stdout
+    }
+
+    #[must_use]
+    pub(crate) fn version_stderr(&self) -> &[u8] {
+        &self.version_stderr
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// An inspected launch request whose identity includes SHA-256 digests of every
 /// executable and configuration artifact involved in the launch.
@@ -196,9 +295,7 @@ impl Error for EngineSpecError {
 pub struct EngineSpec {
     process: SingBoxLaunchSpec,
     restart: RestartPolicy,
-    binary_digest: EngineArtifactDigest,
-    config_digest: EngineArtifactDigest,
-    launcher_digest: Option<EngineArtifactDigest>,
+    artifacts: EngineArtifactSetIdentity,
 }
 
 impl EngineSpec {
@@ -228,9 +325,11 @@ impl EngineSpec {
         Ok(Self {
             process,
             restart,
-            binary_digest,
-            config_digest,
-            launcher_digest,
+            artifacts: EngineArtifactSetIdentity {
+                binary: binary_digest,
+                config: config_digest,
+                launcher: launcher_digest,
+            },
         })
     }
 
@@ -245,18 +344,49 @@ impl EngineSpec {
     }
 
     #[must_use]
+    pub const fn artifacts(&self) -> EngineArtifactSetIdentity {
+        self.artifacts
+    }
+
+    #[must_use]
     pub const fn binary_digest(&self) -> EngineArtifactDigest {
-        self.binary_digest
+        self.artifacts.binary()
     }
 
     #[must_use]
     pub const fn config_digest(&self) -> EngineArtifactDigest {
-        self.config_digest
+        self.artifacts.config()
     }
 
     #[must_use]
     pub const fn launcher_digest(&self) -> Option<EngineArtifactDigest> {
-        self.launcher_digest
+        self.artifacts.launcher()
+    }
+
+    /// Query and validate the exact pinned artifacts without launching a long-lived process.
+    pub(crate) fn probe_capabilities(
+        &self,
+    ) -> Result<EngineCapabilityProbeReport, EngineCapabilityProbeError> {
+        let opened = self
+            .open_verified_artifacts()
+            .map_err(|source| EngineCapabilityProbeError::Artifact { source })?;
+        let prepared = opened
+            .pin()
+            .map_err(|source| EngineCapabilityProbeError::Process { source })?;
+        let adapter = SingBoxProcessAdapter;
+        let version = adapter
+            .query_version_pinned(&prepared.pinned, &self.process)
+            .map_err(|source| EngineCapabilityProbeError::Process { source })?;
+        prepared
+            .reverify()
+            .map_err(|source| EngineCapabilityProbeError::Artifact { source })?;
+        adapter
+            .validate_pinned(&prepared.pinned, &self.process)
+            .map_err(|source| EngineCapabilityProbeError::Process { source })?;
+        prepared
+            .reverify()
+            .map_err(|source| EngineCapabilityProbeError::Artifact { source })?;
+        Ok(engine_capability_probe_report(self.artifacts, version))
     }
 
     fn open_verified_artifacts(&self) -> Result<OpenedEngineArtifacts, EngineSpecError> {
@@ -264,15 +394,15 @@ impl EngineSpec {
             &self.process.binary,
             EngineArtifact::Binary,
             MAX_ENGINE_BINARY_BYTES,
-            self.binary_digest,
+            self.artifacts.binary(),
         )?;
         let config = open_verified_artifact(
             &self.process.config,
             EngineArtifact::Config,
             MAX_ENGINE_CONFIG_BYTES,
-            self.config_digest,
+            self.artifacts.config(),
         )?;
-        let launcher = match (&self.process.launcher, self.launcher_digest) {
+        let launcher = match (&self.process.launcher, self.artifacts.launcher()) {
             (SingBoxLauncher::Direct, None) => None,
             (SingBoxLauncher::BusyBoxSetuidgid { busybox, .. }, Some(launcher_digest)) => {
                 Some(open_verified_artifact(
@@ -292,6 +422,17 @@ impl EngineSpec {
             config,
             launcher,
         })
+    }
+}
+
+fn engine_capability_probe_report(
+    artifacts: EngineArtifactSetIdentity,
+    version: SingBoxVersionReport,
+) -> EngineCapabilityProbeReport {
+    EngineCapabilityProbeReport {
+        artifacts,
+        version_stdout: version.stdout().into(),
+        version_stderr: version.stderr().into(),
     }
 }
 
@@ -3889,9 +4030,9 @@ mod tests {
             return Ok(());
         };
         let (path, expected) = match artifact {
-            EngineArtifact::Binary => (&spec.process.binary, spec.binary_digest),
-            EngineArtifact::Config => (&spec.process.config, spec.config_digest),
-            EngineArtifact::Launcher => match (&spec.process.launcher, spec.launcher_digest) {
+            EngineArtifact::Binary => (&spec.process.binary, spec.artifacts.binary()),
+            EngineArtifact::Config => (&spec.process.config, spec.artifacts.config()),
+            EngineArtifact::Launcher => match (&spec.process.launcher, spec.artifacts.launcher()) {
                 (SingBoxLauncher::BusyBoxSetuidgid { busybox, .. }, Some(launcher_digest)) => {
                     (busybox, launcher_digest)
                 }

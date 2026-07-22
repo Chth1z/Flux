@@ -235,6 +235,25 @@ pub struct ValidationReport {
     pub diagnostics: ProcessDiagnostics,
 }
 
+/// Exact bounded output from `sing-box version` executed through pinned launch artifacts.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SingBoxVersionReport {
+    stdout: Box<[u8]>,
+    stderr: Box<[u8]>,
+}
+
+impl SingBoxVersionReport {
+    #[must_use]
+    pub fn stdout(&self) -> &[u8] {
+        &self.stdout
+    }
+
+    #[must_use]
+    pub fn stderr(&self) -> &[u8] {
+        &self.stderr
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReadinessEvidence {
     Listener { port: NonZeroU16, table: PathBuf },
@@ -329,6 +348,19 @@ pub enum SingBoxProcessError {
         timeout: Duration,
         diagnostics: ProcessDiagnostics,
     },
+    VersionFailed {
+        exit: SingBoxExit,
+        diagnostics: ProcessDiagnostics,
+    },
+    VersionTimedOut {
+        timeout: Duration,
+        diagnostics: ProcessDiagnostics,
+    },
+    VersionOutputTooLarge {
+        stream: &'static str,
+        maximum: usize,
+        actual: usize,
+    },
     ExitedBeforeReady {
         exit: SingBoxExit,
         diagnostics: ProcessDiagnostics,
@@ -355,6 +387,8 @@ impl SingBoxProcessError {
         match self {
             Self::CheckFailed { diagnostics, .. }
             | Self::CheckTimedOut { diagnostics, .. }
+            | Self::VersionFailed { diagnostics, .. }
+            | Self::VersionTimedOut { diagnostics, .. }
             | Self::ExitedBeforeReady { diagnostics, .. }
             | Self::ReadinessTimedOut { diagnostics, .. }
             | Self::PostSignalReapTimedOut { diagnostics, .. }
@@ -371,6 +405,7 @@ impl SingBoxProcessError {
             | Self::Capture { .. }
             | Self::CaptureWorkerSpawn { .. }
             | Self::CaptureThreadPanicked { .. }
+            | Self::VersionOutputTooLarge { .. }
             | Self::ReadinessProbe { .. } => None,
         }
     }
@@ -460,6 +495,20 @@ impl fmt::Display for SingBoxProcessError {
                     "Sing-Box configuration check exceeded {timeout:?}"
                 )
             }
+            Self::VersionFailed { exit, .. } => {
+                write!(formatter, "Sing-Box version query failed with {exit}")
+            }
+            Self::VersionTimedOut { timeout, .. } => {
+                write!(formatter, "Sing-Box version query exceeded {timeout:?}")
+            }
+            Self::VersionOutputTooLarge {
+                stream,
+                maximum,
+                actual,
+            } => write!(
+                formatter,
+                "Sing-Box version {stream} is {actual} bytes, exceeding {maximum}"
+            ),
             Self::ExitedBeforeReady { exit, .. } => {
                 write!(
                     formatter,
@@ -511,6 +560,9 @@ impl Error for SingBoxProcessError {
             | Self::CaptureThreadPanicked { .. }
             | Self::CheckFailed { .. }
             | Self::CheckTimedOut { .. }
+            | Self::VersionFailed { .. }
+            | Self::VersionTimedOut { .. }
+            | Self::VersionOutputTooLarge { .. }
             | Self::ValidationGroupCleanupTimedOut { .. }
             | Self::ExitedBeforeReady { .. }
             | Self::ReadinessTimedOut { .. }
@@ -520,6 +572,18 @@ impl Error for SingBoxProcessError {
 }
 
 impl SingBoxProcessAdapter {
+    pub fn query_version_pinned(
+        &self,
+        pinned: &PinnedSingBoxLaunch,
+        spec: &SingBoxLaunchSpec,
+    ) -> Result<SingBoxVersionReport, SingBoxProcessError> {
+        ensure_supported()?;
+        validate_spec(spec)?;
+        let prepared = pinned_version_command(pinned, spec)?;
+        let completed = self.run_pinned_probe(prepared, spec, PinnedProbe::Version)?;
+        exact_version_report(completed.output)
+    }
+
     pub fn validate_pinned(
         &self,
         pinned: &PinnedSingBoxLaunch,
@@ -528,14 +592,20 @@ impl SingBoxProcessAdapter {
         ensure_supported()?;
         validate_spec(spec)?;
         let prepared = pinned_command(pinned, spec, "check")?;
-        self.run_validation(prepared, spec)
+        let completed = self.run_pinned_probe(prepared, spec, PinnedProbe::Check)?;
+        let exit = classify_exit(completed.status);
+        Ok(ValidationReport {
+            exit,
+            diagnostics: completed.output.diagnostics(),
+        })
     }
 
-    fn run_validation(
+    fn run_pinned_probe(
         &self,
         mut prepared: PreparedCommand,
         spec: &SingBoxLaunchSpec,
-    ) -> Result<ValidationReport, SingBoxProcessError> {
+        probe: PinnedProbe,
+    ) -> Result<CompletedProbe, SingBoxProcessError> {
         let deadline = deadline_after(spec.startup_timeout, "startup_timeout")?;
         prepared
             .command
@@ -598,37 +668,44 @@ impl SingBoxProcessAdapter {
             }
         };
         let group_signal_error = signal_validation_group(pid).err();
-        capture_stop.store(true, Ordering::Release);
         let status = match result {
             Ok(status) => status,
             Err(error) => {
                 kill_and_reap_bounded(child, CLEANUP_GRACE);
                 let group_cleanup_error = group_signal_error
                     .or_else(|| wait_validation_group_exit(pid, CLEANUP_GRACE).err());
-                let diagnostics = collect_capture(stdout_reader, stderr_reader)?;
+                if group_cleanup_error.is_some() {
+                    capture_stop.store(true, Ordering::Release);
+                }
+                let output = collect_capture(stdout_reader, stderr_reader)?;
+                let diagnostics = output.diagnostics();
                 if let Some(source) = group_cleanup_error {
                     return Err(validation_group_cleanup_error(pid, source, diagnostics));
                 }
                 if let Some(error) = error {
                     return Err(error);
                 }
-                return Err(SingBoxProcessError::CheckTimedOut {
-                    timeout: spec.startup_timeout,
-                    diagnostics,
-                });
+                return Err(probe.timed_out(spec.startup_timeout, diagnostics));
             }
         };
         let group_cleanup_error =
             group_signal_error.or_else(|| wait_validation_group_exit(pid, CLEANUP_GRACE).err());
-        let diagnostics = collect_capture(stdout_reader, stderr_reader)?;
+        if group_cleanup_error.is_some() {
+            capture_stop.store(true, Ordering::Release);
+        }
+        let output = collect_capture(stdout_reader, stderr_reader)?;
         if let Some(source) = group_cleanup_error {
-            return Err(validation_group_cleanup_error(pid, source, diagnostics));
+            return Err(validation_group_cleanup_error(
+                pid,
+                source,
+                output.diagnostics(),
+            ));
         }
         let exit = classify_exit(status);
         if !status.success() {
-            return Err(SingBoxProcessError::CheckFailed { exit, diagnostics });
+            return Err(probe.failed(exit, output.diagnostics()));
         }
-        Ok(ValidationReport { exit, diagnostics })
+        Ok(CompletedProbe { status, output })
     }
 
     pub fn spawn_pinned(
@@ -914,6 +991,39 @@ fn sleep_until_poll(deadline: Instant) {
     thread::sleep(POLL_INTERVAL.min(remaining));
 }
 
+#[derive(Clone, Copy)]
+enum PinnedProbe {
+    Check,
+    Version,
+}
+
+impl PinnedProbe {
+    fn failed(self, exit: SingBoxExit, diagnostics: ProcessDiagnostics) -> SingBoxProcessError {
+        match self {
+            Self::Check => SingBoxProcessError::CheckFailed { exit, diagnostics },
+            Self::Version => SingBoxProcessError::VersionFailed { exit, diagnostics },
+        }
+    }
+
+    fn timed_out(self, timeout: Duration, diagnostics: ProcessDiagnostics) -> SingBoxProcessError {
+        match self {
+            Self::Check => SingBoxProcessError::CheckTimedOut {
+                timeout,
+                diagnostics,
+            },
+            Self::Version => SingBoxProcessError::VersionTimedOut {
+                timeout,
+                diagnostics,
+            },
+        }
+    }
+}
+
+struct CompletedProbe {
+    status: ExitStatus,
+    output: CapturedOutput,
+}
+
 struct PreparedCommand {
     command: Command,
     program: PathBuf,
@@ -926,16 +1036,44 @@ fn pinned_command(
     spec: &SingBoxLaunchSpec,
     subcommand: &'static str,
 ) -> Result<PreparedCommand, SingBoxProcessError> {
-    let binary = descriptor_path(&pinned.binary);
+    let mut prepared = pinned_base_command(pinned, spec)?;
     let config = descriptor_path(&pinned.config);
-    let config_fd = pinned.config.as_raw_fd();
+    prepared.inherited_fds.push(pinned.config.as_raw_fd());
+    prepared.inherited_fds.sort_unstable();
+    prepared.inherited_fds.dedup();
+    prepared
+        .command
+        .arg(subcommand)
+        .arg("-c")
+        .arg(config)
+        .arg("-D")
+        .arg(&spec.working_directory);
+    Ok(prepared)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn pinned_version_command(
+    pinned: &PinnedSingBoxLaunch,
+    spec: &SingBoxLaunchSpec,
+) -> Result<PreparedCommand, SingBoxProcessError> {
+    let mut prepared = pinned_base_command(pinned, spec)?;
+    prepared.command.arg("version");
+    Ok(prepared)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn pinned_base_command(
+    pinned: &PinnedSingBoxLaunch,
+    spec: &SingBoxLaunchSpec,
+) -> Result<PreparedCommand, SingBoxProcessError> {
+    let binary = descriptor_path(&pinned.binary);
     let binary_fd = pinned.binary.as_raw_fd();
-    let (mut command, program, mut inherited_fds) = match &spec.launcher {
+    let (command, program, mut inherited_fds) = match &spec.launcher {
         SingBoxLauncher::Direct => {
             let inherited = if descriptor_is_script("binary", &pinned.binary)? {
-                vec![config_fd, binary_fd]
+                vec![binary_fd]
             } else {
-                vec![config_fd]
+                Vec::new()
             };
             (Command::new(&binary), binary.clone(), inherited)
         }
@@ -949,7 +1087,7 @@ fn pinned_command(
             let busybox_path = descriptor_path(busybox);
             let mut command = Command::new(&busybox_path);
             command.arg("setuidgid").arg(identity).arg(&binary);
-            let mut inherited = vec![config_fd, binary_fd];
+            let mut inherited = vec![binary_fd];
             if descriptor_is_script("busybox", busybox)? {
                 inherited.push(busybox.as_raw_fd());
             }
@@ -958,12 +1096,6 @@ fn pinned_command(
     };
     inherited_fds.sort_unstable();
     inherited_fds.dedup();
-    command
-        .arg(subcommand)
-        .arg("-c")
-        .arg(config)
-        .arg("-D")
-        .arg(&spec.working_directory);
     Ok(PreparedCommand {
         command,
         program,
@@ -976,6 +1108,16 @@ fn pinned_command(
     _pinned: &PinnedSingBoxLaunch,
     _spec: &SingBoxLaunchSpec,
     _subcommand: &'static str,
+) -> Result<PreparedCommand, SingBoxProcessError> {
+    Err(SingBoxProcessError::UnsupportedPlatform {
+        platform: std::env::consts::OS,
+    })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn pinned_version_command(
+    _pinned: &PinnedSingBoxLaunch,
+    _spec: &SingBoxLaunchSpec,
 ) -> Result<PreparedCommand, SingBoxProcessError> {
     Err(SingBoxProcessError::UnsupportedPlatform {
         platform: std::env::consts::OS,
@@ -1101,29 +1243,31 @@ fn capture_stream<R>(
     mut stream: R,
     stop: Arc<AtomicBool>,
     stream_name: &'static str,
-) -> Result<thread::JoinHandle<Result<Vec<u8>, io::Error>>, SingBoxProcessError>
+) -> Result<thread::JoinHandle<Result<CapturedStream, io::Error>>, SingBoxProcessError>
 where
     R: Read + Send + 'static,
 {
     thread::Builder::new()
-        .name(format!("flux-check-{stream_name}"))
+        .name(format!("flux-engine-probe-{stream_name}"))
         .spawn(move || {
             let mut tail = Vec::with_capacity(CAPTURE_STREAM_LIMIT);
+            let mut total = 0_usize;
             let mut buffer = [0_u8; 4096];
             loop {
                 let stopping = stop.load(Ordering::Acquire);
                 match stream.read(&mut buffer) {
-                    Ok(0) => return Ok(tail),
+                    Ok(0) => return Ok(CapturedStream { tail, total }),
                     Ok(read) => {
+                        total = total.saturating_add(read);
                         retain_tail(&mut tail, &buffer[..read], CAPTURE_STREAM_LIMIT);
                         if stopping {
-                            return Ok(tail);
+                            return Ok(CapturedStream { tail, total });
                         }
                     }
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                         if stop.load(Ordering::Acquire) {
-                            return Ok(tail);
+                            return Ok(CapturedStream { tail, total });
                         }
                         thread::sleep(POLL_INTERVAL);
                     }
@@ -1135,6 +1279,26 @@ where
             stream: stream_name,
             source,
         })
+}
+
+struct CapturedStream {
+    tail: Vec<u8>,
+    total: usize,
+}
+
+struct CapturedOutput {
+    stdout: CapturedStream,
+    stderr: CapturedStream,
+}
+
+impl CapturedOutput {
+    fn diagnostics(&self) -> ProcessDiagnostics {
+        ProcessDiagnostics {
+            stdout_tail: bounded_lossy_tail(&self.stdout.tail, CAPTURE_STREAM_LIMIT),
+            stderr_tail: bounded_lossy_tail(&self.stderr.tail, CAPTURE_STREAM_LIMIT),
+            log_tail: String::new(),
+        }
+    }
 }
 
 fn retain_tail(tail: &mut Vec<u8>, bytes: &[u8], limit: usize) {
@@ -1151,18 +1315,39 @@ fn retain_tail(tail: &mut Vec<u8>, bytes: &[u8], limit: usize) {
 }
 
 fn collect_capture(
-    stdout: thread::JoinHandle<Result<Vec<u8>, io::Error>>,
-    stderr: thread::JoinHandle<Result<Vec<u8>, io::Error>>,
-) -> Result<ProcessDiagnostics, SingBoxProcessError> {
-    let stdout_tail = join_capture(stdout, "stdout");
-    let stderr_tail = join_capture(stderr, "stderr");
-    let stdout_tail = stdout_tail?;
-    let stderr_tail = stderr_tail?;
-    Ok(ProcessDiagnostics {
-        stdout_tail: bounded_lossy_tail(&stdout_tail, CAPTURE_STREAM_LIMIT),
-        stderr_tail: bounded_lossy_tail(&stderr_tail, CAPTURE_STREAM_LIMIT),
-        log_tail: String::new(),
+    stdout: thread::JoinHandle<Result<CapturedStream, io::Error>>,
+    stderr: thread::JoinHandle<Result<CapturedStream, io::Error>>,
+) -> Result<CapturedOutput, SingBoxProcessError> {
+    let stdout = join_capture(stdout, "stdout");
+    let stderr = join_capture(stderr, "stderr");
+    Ok(CapturedOutput {
+        stdout: stdout?,
+        stderr: stderr?,
     })
+}
+
+fn exact_version_report(
+    output: CapturedOutput,
+) -> Result<SingBoxVersionReport, SingBoxProcessError> {
+    Ok(SingBoxVersionReport {
+        stdout: exact_version_stream(output.stdout, "stdout")?,
+        stderr: exact_version_stream(output.stderr, "stderr")?,
+    })
+}
+
+fn exact_version_stream(
+    stream: CapturedStream,
+    name: &'static str,
+) -> Result<Box<[u8]>, SingBoxProcessError> {
+    if stream.total > CAPTURE_STREAM_LIMIT {
+        return Err(SingBoxProcessError::VersionOutputTooLarge {
+            stream: name,
+            maximum: CAPTURE_STREAM_LIMIT,
+            actual: stream.total,
+        });
+    }
+    debug_assert_eq!(stream.total, stream.tail.len());
+    Ok(stream.tail.into_boxed_slice())
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -1176,9 +1361,9 @@ fn set_pipe_nonblocking<T>(_stream: &T) -> io::Result<()> {
 }
 
 fn join_capture(
-    reader: thread::JoinHandle<Result<Vec<u8>, io::Error>>,
+    reader: thread::JoinHandle<Result<CapturedStream, io::Error>>,
     stream: &'static str,
-) -> Result<Vec<u8>, SingBoxProcessError> {
+) -> Result<CapturedStream, SingBoxProcessError> {
     reader
         .join()
         .map_err(|_| SingBoxProcessError::CaptureThreadPanicked { stream })?

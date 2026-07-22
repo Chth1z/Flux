@@ -951,13 +951,19 @@ Before a backend may be selected automatically, its documentation must include:
 3. **Current: complete one native activation target.** Finish the canonical Generation/config
    authority and exact device/artifact Capability Profile, then make one physical Android ARM64
    ordered-mark-lifetime/coexistence target viable under ADR-0013. The explicit-serial read-only
-   preflight contract is delivered. A first pure canonical `EngineConfigArtifact` compiler is also
-   delivered together with an exact inspected launch-artifact/config/listener-shape binding, but
-   remains unbound to a Generation, Engine Capability Profile, observed runtime listener, or
-   activation path. Run the preflight on an attached physical target when ARM64 qualification
-   resumes, then bind the positive artifact/source-profile and mark-preservation/coexistence
-   evidence. Keep the remaining 21 census cells paused until the runtime netd profile/INPUT chain
-   and listener/observer mark-preservation procedure can be bound to that target; then complete the
+   preflight contract, pure canonical `EngineConfigArtifact` compiler, exact inspected
+   launch-artifact/config/listener-shape binding, schema-1 `EngineCapabilityProfile`, and
+   deterministic non-authorizing `TproxyGenerationCandidate` are delivered. The candidate remains
+   below a complete Generation: it has no Android mark-planning authority or receipt, routing
+   program, observed runtime listener, Generation identity, native target admission, or activation
+   path. A complete mark-dependent `GenerationArtifact` cannot be produced from host fixtures or
+   placeholder evidence because finalization must consume the exact non-cloneable
+   `AndroidMarkPlanningAuthority` for the selected target. While physical ARM64 qualification is
+   postponed, pause this lane at that evidence boundary rather than adding another detached proof
+   abstraction. Run the preflight on an attached physical target when qualification resumes, then
+   bind the positive artifact/source-profile and mark-preservation/coexistence evidence. Keep the
+   remaining 21 census cells paused until the runtime netd profile/INPUT chain and
+   listener/observer mark-preservation procedure can be bound to that target; then complete the
    point-in-time 27-cell census,
    RPDB/domain placement, route reachability, observer continuity, rollback inputs, and in-process
    address-derived policy. Bind the delivered engine/process/canary evidence to that complete target

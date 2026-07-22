@@ -12,6 +12,10 @@ use serde::Serialize;
 mod daemon;
 mod engine_manifest;
 mod engine_supervisor;
+// Pure Generation configuration groundwork. It remains disconnected from the bridge and native
+// writer until the complete planning/evidence authority exists.
+#[allow(dead_code)]
+mod generation_engine_config;
 // The required Stage 1 gate is wired behind an explicit coordinator seam, but
 // production remains structural-only until a platform adapter is qualified.
 #[allow(dead_code)]

@@ -253,6 +253,24 @@ struct PlanningEvidenceReceipts {
 
 `GenerationArtifact` is the deterministic, digest-bearing compiler output. Capture, route, and eBPF programs inside it use logical Managed Object keys rather than concrete kernel names. The Controller assigns the `GenerationId` only after successful compilation, and adapters derive bounded concrete names deterministically from that ID during preparation; creation/update timestamps belong to `GenerationRecord`, not the artifact. All numeric kernel identifiers use validated newtypes. Generation IDs use a monotonic local sequence plus an artifact-digest prefix; correctness does not depend on wall-clock uniqueness.
 
+The first canonical engine-configuration checkpoint is a crate-private, pure
+`EngineConfigArtifact` compiler in `fluxd`. It accepts at most 16 MiB of strict JSON template bytes
+and one nonzero TPROXY listener port, rejects duplicate object keys recursively, requires an object
+root and at most 256 object-shaped inbounds with string `type` fields, removes inherited TUN
+inbounds, and rejects more than one inherited TPROXY inbound. It deterministically sorts object
+keys and either adds or normalizes exactly one TPROXY inbound to `listen = "::"`, the selected port,
+and Sing-Box's absent-`network` TCP+UDP configuration shape. The immutable result retains the
+canonical template digest, exact output SHA-256, domain-separated artifact digest, bounded input/
+output byte and inbound counts, and canonical newline-terminated bytes.
+
+This checkpoint is only a future member of `GenerationArtifact`, not a complete Generation. The
+unspecified listener address and TCP+UDP configuration shape do not establish an
+`EngineCapabilityProfile`, exact-binary dialect validation, dual-stack runtime binding, readiness,
+listener-delivery evidence, or a functional canary. The artifact has no Generation ID, profile
+lease, process or listener authority, writer token, prepared/active conversion, or activation
+entry point; it is disconnected from `RuntimeCoordinator` and the private native xtables owner.
+Production mutation admission therefore remains uninhabited.
+
 `PlanningEvidenceReceipts` contains no authority or mutation capability. A mark-dependent domain plan
 requires the compiler to consume a fresh `AndroidMarkPlanningAuthority` and retain the resulting
 receipt; a plan containing no mark reads, writes, or transfers records that mark authority was not required. Activation rechecks

@@ -4,6 +4,18 @@ All notable changes to the Flux project will be documented in this file.
 
 ## [Unreleased]
 
+### Canonical Generation engine configuration groundwork
+- Added a crate-private, pure `fluxd` compiler for a bounded canonical Sing-Box TPROXY
+  `EngineConfigArtifact`. It rejects recursive duplicate JSON keys and ambiguous inbound shapes,
+  removes inherited TUN inbounds, normalizes or adds one unspecified-address listener for the
+  selected nonzero port and TCP+UDP configuration shape, and emits deterministic object ordering.
+  Canonical template identity, exact output SHA-256, a domain-separated artifact digest, and
+  resource usage remain attached to the immutable result.
+- Kept the artifact deliberately non-authorizing and disconnected from the Runtime Coordinator and
+  private native writer. Listener normalization does not establish an Engine Capability Profile,
+  exact-binary validation, dual-stack runtime behavior, listener delivery, a Generation ID, or
+  activation/mutation authority; positive production target admission remains uninhabited.
+
 ### Exact Android device identity
 - Bumped the boot-scoped Capability Profile to schema 2 and added typed exact Android product,
   build, vendor, security-patch, verified-boot/vbmeta, kernel-build, SELinux-policy, netd,

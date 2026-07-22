@@ -321,6 +321,16 @@ lease behind test-only admission. Production authority binding and real-device c
 before xtables ownership transfers; established-flow caching, transparent-socket DIVERT, FakeIP ICMP,
 QUIC rejection, and MSS clamping remain separately unsupported extensions.
 
+The first device-independent canonical engine-configuration slice is now delivered separately in
+`fluxd`. Its pure, crate-private compiler strictly parses and canonicalizes a bounded Sing-Box JSON
+template, removes inherited TUN inbounds, and emits exactly one normalized TPROXY inbound for a
+selected nonzero port. It retains canonical source identity, exact output identity, a
+domain-separated artifact digest, and resource accounting. The result is only a prospective
+`GenerationArtifact` member: `listen = "::"` and absent `network` describe configuration shape,
+not an Engine Capability Profile, exact-binary validation, proven dual-stack runtime behavior,
+listener-delivery evidence, or activation/mutation authority. It has no Generation ID or path into
+the Runtime Coordinator or private native owner, whose production admission remains uninhabited.
+
 The bounded raw oracle checkpoint is also complete and frozen. The canonical environment, input,
 and fixture pin contract lives in `tests/oracle/xtables/manifest.json`; do not duplicate or update
 its hashes in narrative documentation. `cargo xtask xtables-oracle --check` verifies the four raw
@@ -921,10 +931,13 @@ Before a backend may be selected automatically, its documentation must include:
 3. **Current: complete one native activation target.** Finish the canonical Generation/config
    authority and exact device/artifact Capability Profile, then make one physical Android ARM64
    ordered-mark-lifetime/coexistence target viable under ADR-0013. The explicit-serial read-only
-   preflight contract is delivered; run it on an attached physical target, then bind the positive
-   artifact/source-profile and mark-preservation/coexistence evidence. Keep the remaining 21 census
-   cells paused until the runtime netd profile/INPUT chain and listener/observer mark-preservation
-   procedure can be bound to that target; then complete the point-in-time 27-cell census,
+   preflight contract is delivered. A first pure canonical `EngineConfigArtifact` compiler is also
+   delivered, but remains unbound to a Generation, Engine Capability Profile, runtime listener, or
+   activation path. Run the preflight on an attached physical target when ARM64 qualification
+   resumes, then bind the positive artifact/source-profile and mark-preservation/coexistence
+   evidence. Keep the remaining 21 census cells paused until the runtime netd profile/INPUT chain
+   and listener/observer mark-preservation procedure can be bound to that target; then complete the
+   point-in-time 27-cell census,
    RPDB/domain placement, route reachability, observer continuity, rollback inputs, and in-process
    address-derived policy. Bind the delivered engine/process/canary evidence to that complete target
    without admitting production mutation or exposing raw native writer verbs.

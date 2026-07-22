@@ -9,6 +9,7 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+flux-platform = { path = "../crates/flux-platform" }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha2.workspace = true

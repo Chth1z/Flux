@@ -54,9 +54,11 @@ qualification target is viable.
 The ARM64 preflight requires one explicit serial and accepts an explicit ADB program, including a
 Windows `adb.exe` path from WSL. It performs no push, temporary-directory creation, restore, rule
 mutation, module request, or live Flux-chain write. After root and stable boot/fingerprint checks,
-it reads the production identity collector's property/artifact prerequisites, PID-1/self network
-namespaces, SELinux mode, and only mangle tables already listed in `/proc/net/*_tables_names`. The
-bounded report requires exact dual-family `routectrl_mangle_INPUT` declarations, exactly one total
+it reads the production identity collector's property/artifact prerequisites, validates properties
+through the same bounded parser (including at least one consistent device-lock fact), checks
+PID-1/self network namespaces and SELinux mode, and reads only mangle tables already listed in
+`/proc/net/*_tables_names`. The bounded report requires exact dual-family
+`routectrl_mangle_INPUT` declarations, exactly one total
 `-j`/`-g` reference to each child and requires that reference to be the unconditional built-in INPUT
 jump, unique cross-family-consistent interface-scoped MARK writers, one supported
 mask, zero candidate-envelope bits in writer values, and no unknown child rule. Raw table bytes are

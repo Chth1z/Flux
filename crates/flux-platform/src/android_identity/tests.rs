@@ -58,6 +58,47 @@ fn inconsistent_device_lock_facts_are_malformed() {
 }
 
 #[test]
+fn either_valid_device_lock_fact_is_sufficient() {
+    for absent_property in ["ro.boot.vbmeta.device_state", "ro.boot.flash.locked"] {
+        let fixture = Fixture::new();
+        let mut values = complete_property_values();
+        values.remove(absent_property);
+        let properties = StableProperties::new(values);
+        let kernel = || {
+            KernelBuildIdentity::new("5.10.198-android13-gki #1 SMP PREEMPT")
+                .map_err(|_| IdentityFactFailure::Malformed)
+        };
+
+        assert!(
+            collect_android_device_identity(&properties, &fixture.paths, kernel)
+                .verified()
+                .is_some(),
+            "{absent_property}"
+        );
+    }
+}
+
+#[test]
+fn oversized_identity_property_is_malformed() {
+    let fixture = Fixture::new();
+    let mut values = complete_property_values();
+    values.insert(
+        "ro.product.brand".to_owned(),
+        vec![b'a'; crate::android_identity_properties::MAX_ANDROID_IDENTITY_PROPERTY_BYTES + 1],
+    );
+    let properties = StableProperties::new(values);
+    let kernel = || {
+        KernelBuildIdentity::new("5.10.198-android13-gki #1 SMP PREEMPT")
+            .map_err(|_| IdentityFactFailure::Malformed)
+    };
+
+    assert_eq!(
+        collect_android_device_identity(&properties, &fixture.paths, kernel),
+        Observation::Malformed
+    );
+}
+
+#[test]
 fn a_kernel_change_between_samples_is_malformed() {
     let fixture = Fixture::new();
     let properties = StableProperties::complete();

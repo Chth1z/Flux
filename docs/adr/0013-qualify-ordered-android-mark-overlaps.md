@@ -48,7 +48,8 @@ activation blocker.
 The development-only `preflight-android-arm64-mark-ordering` xtask now determines whether one
 explicit rooted serial is viable for the later qualification procedure without changing device
 networking. It reuses bounded ADB execution and stable boot/fingerprint revalidation, checks the
-production identity collector's required property and artifact inputs, requires ARM64, Linux 5.10+,
+production identity collector's shared bounded property contract and artifact inputs, requires
+at least one valid device-lock property (and agreement when both exist), ARM64, Linux 5.10+,
 enforcing SELinux, and PID-1 network-namespace identity, and reads only mangle tables already
 initialized by Android. Its bounded parser requires the exact unconditional INPUT child hook,
 one declared `routectrl_mangle_INPUT`, no other `-j` or `-g` reference to that child from any chain,

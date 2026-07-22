@@ -8,6 +8,7 @@ use std::fmt;
 #[allow(dead_code)]
 mod address_sync;
 mod android_identity;
+mod android_identity_properties;
 mod capability;
 mod child_process;
 mod legacy_dispatcher;
@@ -77,6 +78,11 @@ pub use xtables::{
 
 #[doc(hidden)]
 pub mod internal {
+    pub use crate::android_identity_properties::{
+        ANDROID_IDENTITY_PROPERTY_NAMES, AndroidIdentityPropertyError,
+        MAX_ANDROID_IDENTITY_PROPERTY_BYTES, validate_android_identity_properties,
+        validate_android_verified_boot_properties,
+    };
     pub use crate::sing_box::{
         PinnedSingBoxLaunch, ProcessDiagnostics, SingBoxChild, SingBoxChildIdentity,
         SingBoxProcessAdapter, SingBoxProcessError, SingBoxVersionReport, TerminationOutcome,

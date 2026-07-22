@@ -16,47 +16,23 @@ mod implementation {
     use std::path::{Component, Path, PathBuf};
 
     use flux_core::{
-        AndroidBuildIdentity, AndroidProductIdentity, ArtifactIdentity, DeviceIdentity,
-        KernelBuildIdentity, NetworkNamespaceIdentity, Observation, SecurityPatchLevel,
-        SelinuxPolicyIdentity, Sha256Digest, ToolId, VendorBuildIdentity, VerifiedBootIdentity,
-        VerifiedBootState,
+        ArtifactIdentity, DeviceIdentity, KernelBuildIdentity, NetworkNamespaceIdentity,
+        Observation, SelinuxPolicyIdentity, Sha256Digest, ToolId,
     };
     use sha2::{Digest, Sha256};
+
+    use crate::android_identity_properties::{
+        ANDROID_IDENTITY_PROPERTY_NAMES, AndroidIdentityPropertyError,
+        parse_android_identity_properties,
+    };
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
-    const MAX_ANDROID_PROPERTY_BYTES: usize = 1_024;
     const MAX_APEX_INFO_BYTES: usize = 64 * 1024;
     const MAX_IDENTITY_ARTIFACT_BYTES: u64 = 128 * 1024 * 1024;
     const CONNECTIVITY_APEX_MODULE: &str = "com.android.tethering";
     const PROC_SELF_EXE: &str = "/proc/self/exe";
-
-    const PRODUCT_BRAND_PROPERTY: &str = "ro.product.brand";
-    const PRODUCT_NAME_PROPERTY: &str = "ro.product.name";
-    const PRODUCT_DEVICE_PROPERTY: &str = "ro.product.device";
-    const BUILD_FINGERPRINT_PROPERTY: &str = "ro.build.fingerprint";
-    const VENDOR_BUILD_FINGERPRINT_PROPERTY: &str = "ro.vendor.build.fingerprint";
-    const SECURITY_PATCH_PROPERTY: &str = "ro.build.version.security_patch";
-    const VERIFIED_BOOT_STATE_PROPERTY: &str = "ro.boot.verifiedbootstate";
-    const VBMETA_DEVICE_STATE_PROPERTY: &str = "ro.boot.vbmeta.device_state";
-    const FLASH_LOCKED_PROPERTY: &str = "ro.boot.flash.locked";
-    const VBMETA_HASH_ALGORITHM_PROPERTY: &str = "ro.boot.vbmeta.hash_alg";
-    const VBMETA_DIGEST_PROPERTY: &str = "ro.boot.vbmeta.digest";
-
-    const REQUIRED_PROPERTY_NAMES: [&str; 11] = [
-        PRODUCT_BRAND_PROPERTY,
-        PRODUCT_NAME_PROPERTY,
-        PRODUCT_DEVICE_PROPERTY,
-        BUILD_FINGERPRINT_PROPERTY,
-        VENDOR_BUILD_FINGERPRINT_PROPERTY,
-        SECURITY_PATCH_PROPERTY,
-        VERIFIED_BOOT_STATE_PROPERTY,
-        VBMETA_DEVICE_STATE_PROPERTY,
-        FLASH_LOCKED_PROPERTY,
-        VBMETA_HASH_ALGORITHM_PROPERTY,
-        VBMETA_DIGEST_PROPERTY,
-    ];
 
     #[cfg(target_os = "android")]
     pub(super) fn observe_system_android_device_identity() -> Observation<DeviceIdentity> {
@@ -144,7 +120,13 @@ mod implementation {
     {
         let namespace_before = observe_network_namespace(&paths.network_namespace)?;
         let properties_before = observe_property_snapshot(properties)?;
-        let parsed_properties = parse_property_snapshot(&properties_before)?;
+        let parsed_properties = parse_android_identity_properties(|name| {
+            properties_before
+                .values
+                .get(name)
+                .map(|value| value.as_deref())
+        })
+        .map_err(identity_property_failure)?;
         let kernel_before = kernel_build()?;
         let connectivity_path_before = observe_active_apex_path(paths)?;
 
@@ -194,168 +176,18 @@ mod implementation {
         source: &impl AndroidPropertySource,
     ) -> Result<AndroidPropertySnapshot, IdentityFactFailure> {
         let mut values = BTreeMap::new();
-        for name in REQUIRED_PROPERTY_NAMES {
+        for name in ANDROID_IDENTITY_PROPERTY_NAMES {
             let value = source.read_property(name)?;
-            if value
-                .as_ref()
-                .is_some_and(|value| value.len() > MAX_ANDROID_PROPERTY_BYTES)
-            {
-                return Err(IdentityFactFailure::Malformed);
-            }
             values.insert(name, value);
         }
         Ok(AndroidPropertySnapshot { values })
     }
 
-    #[derive(Clone, Debug, Eq, PartialEq)]
-    struct ParsedAndroidProperties {
-        android_product: AndroidProductIdentity,
-        android_build: AndroidBuildIdentity,
-        vendor_build: VendorBuildIdentity,
-        security_patch: SecurityPatchLevel,
-        verified_boot: VerifiedBootIdentity,
-    }
-
-    fn parse_property_snapshot(
-        snapshot: &AndroidPropertySnapshot,
-    ) -> Result<ParsedAndroidProperties, IdentityFactFailure> {
-        let product_brand = product_component(snapshot, PRODUCT_BRAND_PROPERTY)?;
-        let product_name = product_component(snapshot, PRODUCT_NAME_PROPERTY)?;
-        let product_device = product_component(snapshot, PRODUCT_DEVICE_PROPERTY)?;
-        let android_product = AndroidProductIdentity::new(&format!(
-            "{product_brand}/{product_name}/{product_device}"
-        ))
-        .map_err(|_| IdentityFactFailure::Malformed)?;
-        let android_build =
-            AndroidBuildIdentity::new(&build_fingerprint(snapshot, BUILD_FINGERPRINT_PROPERTY)?)
-                .map_err(|_| IdentityFactFailure::Malformed)?;
-        let vendor_build = VendorBuildIdentity::new(&build_fingerprint(
-            snapshot,
-            VENDOR_BUILD_FINGERPRINT_PROPERTY,
-        )?)
-        .map_err(|_| IdentityFactFailure::Malformed)?;
-        let security_patch =
-            SecurityPatchLevel::new(&required_property_text(snapshot, SECURITY_PATCH_PROPERTY)?)
-                .map_err(|_| IdentityFactFailure::Malformed)?;
-        let verified_boot = parse_verified_boot(snapshot)?;
-
-        Ok(ParsedAndroidProperties {
-            android_product,
-            android_build,
-            vendor_build,
-            security_patch,
-            verified_boot,
-        })
-    }
-
-    fn parse_verified_boot(
-        snapshot: &AndroidPropertySnapshot,
-    ) -> Result<VerifiedBootIdentity, IdentityFactFailure> {
-        let state = match required_property_text(snapshot, VERIFIED_BOOT_STATE_PROPERTY)?.as_str() {
-            "green" => VerifiedBootState::Green,
-            "yellow" => VerifiedBootState::Yellow,
-            "orange" => VerifiedBootState::Orange,
-            "red" => VerifiedBootState::Red,
-            _ => return Err(IdentityFactFailure::Malformed),
-        };
-        let device_state = optional_property_text(snapshot, VBMETA_DEVICE_STATE_PROPERTY)?
-            .map(|value| match value.as_str() {
-                "locked" => Ok(true),
-                "unlocked" => Ok(false),
-                _ => Err(IdentityFactFailure::Malformed),
-            })
-            .transpose()?;
-        let flash_locked = optional_property_text(snapshot, FLASH_LOCKED_PROPERTY)?
-            .map(|value| match value.as_str() {
-                "1" => Ok(true),
-                "0" => Ok(false),
-                _ => Err(IdentityFactFailure::Malformed),
-            })
-            .transpose()?;
-        let device_locked = match (device_state, flash_locked) {
-            (Some(left), Some(right)) if left != right => {
-                return Err(IdentityFactFailure::Malformed);
-            }
-            (Some(value), Some(_) | None) | (None, Some(value)) => value,
-            (None, None) => return Err(IdentityFactFailure::Absent),
-        };
-        if required_property_text(snapshot, VBMETA_HASH_ALGORITHM_PROPERTY)? != "sha256" {
-            return Err(IdentityFactFailure::Malformed);
+    const fn identity_property_failure(error: AndroidIdentityPropertyError) -> IdentityFactFailure {
+        match error {
+            AndroidIdentityPropertyError::Absent => IdentityFactFailure::Absent,
+            AndroidIdentityPropertyError::Malformed => IdentityFactFailure::Malformed,
         }
-        let vbmeta_digest =
-            parse_sha256(&required_property_text(snapshot, VBMETA_DIGEST_PROPERTY)?)?;
-        Ok(VerifiedBootIdentity::new(
-            state,
-            device_locked,
-            vbmeta_digest,
-        ))
-    }
-
-    fn required_property_text(
-        snapshot: &AndroidPropertySnapshot,
-        name: &'static str,
-    ) -> Result<String, IdentityFactFailure> {
-        optional_property_text(snapshot, name)?.ok_or(IdentityFactFailure::Absent)
-    }
-
-    fn product_component(
-        snapshot: &AndroidPropertySnapshot,
-        name: &'static str,
-    ) -> Result<String, IdentityFactFailure> {
-        let value = required_property_text(snapshot, name)?;
-        if value.trim() != value
-            || !value.is_ascii()
-            || value.chars().any(char::is_control)
-            || value.contains('/')
-        {
-            return Err(IdentityFactFailure::Malformed);
-        }
-        Ok(value)
-    }
-
-    fn build_fingerprint(
-        snapshot: &AndroidPropertySnapshot,
-        name: &'static str,
-    ) -> Result<String, IdentityFactFailure> {
-        let value = required_property_text(snapshot, name)?;
-        if !value.bytes().all(|byte| byte.is_ascii_graphic()) {
-            return Err(IdentityFactFailure::Malformed);
-        }
-        Ok(value)
-    }
-
-    fn optional_property_text(
-        snapshot: &AndroidPropertySnapshot,
-        name: &'static str,
-    ) -> Result<Option<String>, IdentityFactFailure> {
-        let value = snapshot
-            .values
-            .get(name)
-            .ok_or(IdentityFactFailure::Malformed)?;
-        match value {
-            None => Ok(None),
-            Some(value) if value.is_empty() => Err(IdentityFactFailure::Malformed),
-            Some(value) => String::from_utf8(value.clone())
-                .map(Some)
-                .map_err(|_| IdentityFactFailure::Malformed),
-        }
-    }
-
-    fn parse_sha256(value: &str) -> Result<Sha256Digest, IdentityFactFailure> {
-        if value.len() != 64
-            || !value
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
-            return Err(IdentityFactFailure::Malformed);
-        }
-        let mut bytes = [0_u8; 32];
-        for (index, byte) in bytes.iter_mut().enumerate() {
-            let offset = index * 2;
-            *byte = u8::from_str_radix(&value[offset..offset + 2], 16)
-                .map_err(|_| IdentityFactFailure::Malformed)?;
-        }
-        Sha256Digest::new(bytes).map_err(|_| IdentityFactFailure::Malformed)
     }
 
     fn observe_active_apex_path(

@@ -93,6 +93,10 @@ All notable changes to the Flux project will be documented in this file.
 - Corrected preflight child-chain admission to count every `-j` and `-g` reference from every
   mangle chain. A result is viable only when the sole reference is the exact unconditional built-in
   INPUT jump; an additional INPUT goto or reference from another chain now blocks qualification.
+- Unified preflight identity-property admission with the production Android collector's property
+  names, byte bound, typed values, and verified-boot parser. Either valid device-lock property is
+  sufficient, both must agree when present, and malformed product/build/patch/AVB inputs still
+  block the diagnostic result.
 
 ### Rewrite release policy
 - Established the pre-release Rust-only release gate in ADR-0011. Bridge, shadow, parity, and

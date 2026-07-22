@@ -395,6 +395,7 @@ dependencies = [
 name = "xtask"
 version = "0.1.0"
 dependencies = [
+ "flux-platform",
  "serde",
  "serde_json",
  "sha2",

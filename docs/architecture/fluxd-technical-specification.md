@@ -1338,9 +1338,11 @@ mark-preservation coexistence procedure required by ADR-0013.
 A development-only explicit-serial ARM64 preflight now establishes whether that procedure can be
 attempted without mutating networking. The host runner uses bounded/reaped ADB commands, root and
 boot/fingerprint revalidation, and accepts an explicit Windows ADB path under WSL. The rooted shell
-reads required identity properties, collector-input file availability, SELinux and network-
-namespace state, and only IPv4/IPv6 mangle tables already listed as initialized in procfs. A bounded
-host parser requires the declared `routectrl_mangle_INPUT` child to have exactly one total `-j` or
+reads the production collector's identity properties, collector-input file availability, SELinux
+and network-namespace state, and only IPv4/IPv6 mangle tables already listed as initialized in
+procfs. The host reuses the production bounded property and verified-boot parser: at least one
+valid device-lock property is required and both must agree when present. A bounded host parser
+requires the declared `routectrl_mangle_INPUT` child to have exactly one total `-j` or
 `-g` reference across the mangle table and requires that sole reference to be the exact
 unconditional built-in INPUT jump. It also requires exactly one `routectrl_mangle_INPUT` child
 declaration, unique cross-family-consistent interface-scoped MARK writers, a

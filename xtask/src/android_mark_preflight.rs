@@ -7,6 +7,11 @@ use std::time::Duration;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+use flux_platform::internal::{
+    ANDROID_IDENTITY_PROPERTY_NAMES, MAX_ANDROID_IDENTITY_PROPERTY_BYTES,
+    validate_android_identity_properties, validate_android_verified_boot_properties,
+};
+
 use super::android_canary::{self, Options};
 
 const COMMAND: &str = "preflight-android-arm64-mark-ordering";
@@ -22,24 +27,10 @@ const ROUTECTRL_INPUT_CHAIN: &str = "routectrl_mangle_INPUT";
 const ANDROID_12_13_INCOMING_MASK: u32 = 0xffef_ffff;
 const PINNED_2025_INCOMING_MASK: u32 = 0x7fef_ffff;
 const FLUX_CANDIDATE_ENVELOPE: u32 = 0x7fe0_0000;
-const MAX_ANDROID_PROPERTY_BYTES: usize = 1_024;
 const MAX_MANGLE_LINES: usize = 4_096;
 const MAX_MANGLE_LINE_BYTES: usize = 8 * 1_024;
 const MAX_INCOMING_WRITERS: usize = 256;
-const REQUIRED_PROPERTIES: [&str; 12] = [
-    "ro.product.brand",
-    "ro.product.name",
-    "ro.product.device",
-    "ro.build.fingerprint",
-    "ro.vendor.build.fingerprint",
-    "ro.build.version.security_patch",
-    "ro.boot.verifiedbootstate",
-    "ro.boot.vbmeta.device_state",
-    "ro.boot.flash.locked",
-    "ro.boot.vbmeta.hash_alg",
-    "ro.boot.vbmeta.digest",
-    "ro.kernel.qemu",
-];
+const EMULATOR_PROPERTY: &str = "ro.kernel.qemu";
 const TRUSTED_ANDROID_PATH: &str = concat!(
     "/product/bin:",
     "/apex/com.android.runtime/bin:",
@@ -239,9 +230,14 @@ fn valid_boot_id(value: &str) -> bool {
         })
 }
 
+fn preflight_property_names() -> impl Iterator<Item = &'static str> {
+    ANDROID_IDENTITY_PROPERTY_NAMES
+        .into_iter()
+        .chain([EMULATOR_PROPERTY])
+}
+
 fn remote_snapshot_script() -> String {
-    let properties = REQUIRED_PROPERTIES
-        .iter()
+    let properties = preflight_property_names()
         .map(|name| format!("property {name}"))
         .collect::<Vec<_>>()
         .join("\n");
@@ -324,12 +320,12 @@ fn parse_remote_snapshot(bytes: &[u8]) -> Result<RemoteSnapshot, String> {
     let mut fields = parse_fields(metadata)?;
     fields.extend(parse_fields(tail)?);
     let mut properties = BTreeMap::new();
-    for name in REQUIRED_PROPERTIES {
+    for name in preflight_property_names() {
         let key = format!("property.{name}");
         let value = take_field(&mut fields, &key)?;
-        if value.len() > MAX_ANDROID_PROPERTY_BYTES {
+        if value.len() > MAX_ANDROID_IDENTITY_PROPERTY_BYTES {
             return Err(format!(
-                "Android preflight property {name:?} exceeds {MAX_ANDROID_PROPERTY_BYTES} bytes"
+                "Android preflight property {name:?} exceeds {MAX_ANDROID_IDENTITY_PROPERTY_BYTES} bytes"
             ));
         }
         properties.insert(name.to_owned(), value);
@@ -527,24 +523,20 @@ fn build_report(serial: &str, device: DeviceProfile, snapshot: RemoteSnapshot) -
     }
     if snapshot
         .properties
-        .get("ro.kernel.qemu")
+        .get(EMULATOR_PROPERTY)
         .is_some_and(|value| value == "1")
     {
         blocking_reasons.push("ro.kernel.qemu=1 identifies an emulator target".to_owned());
     }
 
-    let required_properties_present = REQUIRED_PROPERTIES
-        .iter()
-        .filter(|name| **name != "ro.kernel.qemu")
-        .all(|name| {
-            snapshot
-                .properties
-                .get(*name)
-                .is_some_and(|value| !value.is_empty())
-        });
+    let required_properties_present = validate_android_identity_properties(|name| {
+        preflight_identity_property(&snapshot.properties, name)
+    })
+    .is_ok();
     if !required_properties_present {
-        blocking_reasons
-            .push("production Android identity collector properties are missing".to_owned());
+        blocking_reasons.push(
+            "production Android identity collector properties are missing or malformed".to_owned(),
+        );
     }
     if snapshot.properties.get("ro.build.fingerprint") != Some(&device.build_fingerprint) {
         blocking_reasons.push(
@@ -645,39 +637,17 @@ fn build_report(serial: &str, device: DeviceProfile, snapshot: RemoteSnapshot) -
 }
 
 fn verified_boot_inputs_complete(properties: &BTreeMap<String, String>) -> bool {
-    let state_is_recognized = properties
-        .get("ro.boot.verifiedbootstate")
-        .is_some_and(|value| matches!(value.as_str(), "green" | "yellow" | "orange" | "red"));
-    let device_locked = match properties
-        .get("ro.boot.vbmeta.device_state")
-        .map(String::as_str)
-    {
-        Some("locked") => Some(true),
-        Some("unlocked") => Some(false),
-        _ => None,
-    };
-    let flash_locked = match properties.get("ro.boot.flash.locked").map(String::as_str) {
-        Some("1") => Some(true),
-        Some("0") => Some(false),
-        _ => None,
-    };
-    let digest_is_canonical_nonzero =
-        properties
-            .get("ro.boot.vbmeta.digest")
-            .is_some_and(|value| {
-                value.len() == 64
-                    && value
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-                    && value.bytes().any(|byte| byte != b'0')
-            });
-    state_is_recognized
-        && device_locked.is_some()
-        && device_locked == flash_locked
-        && properties
-            .get("ro.boot.vbmeta.hash_alg")
-            .is_some_and(|value| value == "sha256")
-        && digest_is_canonical_nonzero
+    validate_android_verified_boot_properties(|name| preflight_identity_property(properties, name))
+        .is_ok()
+}
+
+fn preflight_identity_property<'a>(
+    properties: &'a BTreeMap<String, String>,
+    name: &'static str,
+) -> Option<Option<&'a [u8]>> {
+    properties
+        .get(name)
+        .map(|value| (!value.is_empty()).then_some(value.as_bytes()))
 }
 
 fn kernel_meets_floor(release: &str) -> bool {
@@ -1393,6 +1363,43 @@ mod tests {
             "ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_owned(),
         );
         assert!(!verified_boot_inputs_complete(&uppercase));
+    }
+
+    #[test]
+    fn one_valid_lock_property_matches_the_production_identity_contract() {
+        for absent_property in ["ro.boot.vbmeta.device_state", "ro.boot.flash.locked"] {
+            let mut candidate = snapshot(PINNED_2025_INCOMING_MASK);
+            candidate
+                .properties
+                .insert(absent_property.to_owned(), String::new());
+
+            let report = build_report("SERIAL", device(), candidate);
+
+            assert_eq!(
+                report.disposition,
+                Disposition::ViableForFullQualification,
+                "{absent_property}: {:?}",
+                report.blocking_reasons
+            );
+            assert!(report.profile_inputs.required_properties_present);
+            assert!(report.profile_inputs.verified_boot_inputs_complete);
+        }
+    }
+
+    #[test]
+    fn malformed_production_identity_property_blocks_viability() {
+        let mut candidate = snapshot(PINNED_2025_INCOMING_MASK);
+        candidate
+            .properties
+            .insert("ro.product.brand".to_owned(), "vendor/other".to_owned());
+
+        let report = build_report("SERIAL", device(), candidate);
+
+        assert_eq!(report.disposition, Disposition::Blocked);
+        assert!(!report.profile_inputs.required_properties_present);
+        assert!(report.blocking_reasons.iter().any(|reason| {
+            reason.contains("identity collector properties are missing or malformed")
+        }));
     }
 
     #[test]

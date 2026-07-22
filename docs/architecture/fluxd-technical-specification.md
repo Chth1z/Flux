@@ -271,6 +271,20 @@ lease, process or listener authority, writer token, prepared/active conversion, 
 entry point; it is disconnected from `RuntimeCoordinator` and the private native xtables owner.
 Production mutation admission therefore remains uninhabited.
 
+The follow-on pure checkpoint consumes this artifact with an already inspected `EngineSpec` and
+produces an `EngineConfigLaunchBinding` only when the canonical output SHA-256 exactly equals the
+specification's config digest and the specification declares TPROXY listener readiness on the same
+port. TUN readiness and port/content drift fail closed. The schema-1 binding owns the config
+artifact and retains the exact inspected binary, config, and presence-tagged optional launcher
+digests in a separate domain-separated identity.
+
+This binds an artifact set and intended pre-launch readiness shape, not the complete `EngineSpec`:
+paths, working directory, launcher identity, timeouts, restart policy, and logs are deliberately
+outside the binding. It also does not query the binary, build an `EngineCapabilityProfile`, run
+Sing-Box validation, reverify files, observe a listener, prove dual-stack behavior or delivery,
+assign a Generation ID, or authorize process/kernel activity. Those remain separate later stages;
+the Supervisor's descriptor-pinned validation/reverification contract is unchanged.
+
 `PlanningEvidenceReceipts` contains no authority or mutation capability. A mark-dependent domain plan
 requires the compiler to consume a fresh `AndroidMarkPlanningAuthority` and retain the resulting
 receipt; a plan containing no mark reads, writes, or transfers records that mark authority was not required. Activation rechecks

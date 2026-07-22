@@ -174,6 +174,16 @@ The implementation is pure computation. It hides normalization, policy ordering,
 
 The compiler must return the same byte-for-byte candidate set for identical normalized discovery inputs and the same byte-for-byte `GenerationArtifact` for identical candidates/evidence/selection. It must not read files, invoke commands, or mutate the kernel. The Controller assigns a monotonic `GenerationId` and the Generation Store adds timestamps only after compilation; neither is part of the artifact digest.
 
+The separate `fluxd` engine-configuration groundwork remains below this complete compiler
+interface. It deterministically emits one bounded canonical TPROXY config artifact, then may bind
+that artifact to an already inspected `EngineSpec` only when exact config content and the declared
+listener port agree. The resulting identity retains the exact binary/config/optional-launcher
+artifact digests but is not a complete launch-spec identity, Engine Capability Profile, runtime
+readiness observation, Generation, or activation token. Exact-binary capability query/validation
+remains pre-compilation collection work that supplies an immutable Engine Capability Profile;
+deterministic Generation composition remains inside future pure compiler work. Neither may be
+replaced by a caller-asserted seam.
+
 The current Phase 2 tracer bullet stops below both interfaces above. A pure shadow compiler accepts
 already typed and resolved compatibility inputs and emits deterministic, backend-neutral,
 separately ordered local-OUTPUT and forwarded-ingress programs. It keeps a canonical mandatory

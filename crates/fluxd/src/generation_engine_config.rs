@@ -8,9 +8,12 @@ use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Number, Value};
 use sha2::{Digest, Sha256};
 
-use crate::MAX_ENGINE_CONFIG_BYTES;
+use flux_platform::SingBoxReadiness;
+
+use crate::{EngineArtifactDigest, EngineSpec, MAX_ENGINE_CONFIG_BYTES};
 
 pub(crate) const GENERATION_ENGINE_CONFIG_SCHEMA_VERSION: u16 = 1;
+pub(crate) const ENGINE_CONFIG_LAUNCH_BINDING_SCHEMA_VERSION: u16 = 1;
 pub(crate) const MAX_GENERATION_ENGINE_CONFIG_INBOUNDS: usize = 256;
 
 const ENGINE_CONFIG_DIGEST_BYTES: usize = 32;
@@ -18,6 +21,8 @@ const TEMPLATE_DIGEST_DOMAIN: &[u8] =
     b"Flux Generation Sing-Box template\0semantic-json\0sha256-v1\0";
 const ARTIFACT_DIGEST_DOMAIN: &[u8] =
     b"Flux Generation Sing-Box engine config artifact\0sha256-v1\0";
+const LAUNCH_BINDING_DIGEST_DOMAIN: &[u8] =
+    b"Flux Generation Sing-Box engine config launch binding\0sha256-v1\0";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(transparent)]
@@ -135,6 +140,168 @@ impl EngineConfigArtifact {
     pub(crate) const fn bytes(&self) -> &[u8] {
         &self.bytes
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(transparent)]
+pub(crate) struct EngineConfigLaunchBindingDigest([u8; ENGINE_CONFIG_DIGEST_BYTES]);
+
+impl EngineConfigLaunchBindingDigest {
+    #[must_use]
+    pub(crate) const fn as_bytes(&self) -> &[u8; ENGINE_CONFIG_DIGEST_BYTES] {
+        &self.0
+    }
+}
+
+impl fmt::Display for EngineConfigLaunchBindingDigest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Canonical configuration bound to one exact inspected launch-artifact set.
+///
+/// This is not an Engine Capability Profile, runtime readiness observation, process identity,
+/// Generation, or activation token. It records only immutable artifact identities and the
+/// pre-launch listener shape already declared by `EngineSpec`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct EngineConfigLaunchBinding {
+    artifact: EngineConfigArtifact,
+    binary_digest: EngineArtifactDigest,
+    config_digest: EngineArtifactDigest,
+    launcher_digest: Option<EngineArtifactDigest>,
+    digest: EngineConfigLaunchBindingDigest,
+}
+
+impl EngineConfigLaunchBinding {
+    #[must_use]
+    pub(crate) const fn schema_version(&self) -> u16 {
+        ENGINE_CONFIG_LAUNCH_BINDING_SCHEMA_VERSION
+    }
+
+    #[must_use]
+    pub(crate) const fn artifact(&self) -> &EngineConfigArtifact {
+        &self.artifact
+    }
+
+    #[must_use]
+    pub(crate) const fn binary_digest(&self) -> EngineArtifactDigest {
+        self.binary_digest
+    }
+
+    #[must_use]
+    pub(crate) const fn config_digest(&self) -> EngineArtifactDigest {
+        self.config_digest
+    }
+
+    #[must_use]
+    pub(crate) const fn launcher_digest(&self) -> Option<EngineArtifactDigest> {
+        self.launcher_digest
+    }
+
+    #[must_use]
+    pub(crate) const fn digest(&self) -> EngineConfigLaunchBindingDigest {
+        self.digest
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EngineConfigBindingErrorKind {
+    ConfigDigestMismatch {
+        artifact: [u8; ENGINE_CONFIG_DIGEST_BYTES],
+        engine_spec: EngineArtifactDigest,
+    },
+    ListenerPortMismatch {
+        artifact: NonZeroU16,
+        engine_spec: NonZeroU16,
+    },
+    TunReadinessUnsupported,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct EngineConfigBindingError {
+    kind: EngineConfigBindingErrorKind,
+}
+
+impl EngineConfigBindingError {
+    #[must_use]
+    pub(crate) const fn kind(self) -> EngineConfigBindingErrorKind {
+        self.kind
+    }
+}
+
+impl fmt::Display for EngineConfigBindingError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.kind {
+            EngineConfigBindingErrorKind::ConfigDigestMismatch { .. } => formatter.write_str(
+                "canonical engine configuration does not match the inspected EngineSpec config digest",
+            ),
+            EngineConfigBindingErrorKind::ListenerPortMismatch {
+                artifact,
+                engine_spec,
+            } => write!(
+                formatter,
+                "canonical TPROXY listener port {artifact} does not match EngineSpec listener port {engine_spec}"
+            ),
+            EngineConfigBindingErrorKind::TunReadinessUnsupported => formatter.write_str(
+                "canonical TPROXY engine configuration cannot bind to EngineSpec TUN readiness",
+            ),
+        }
+    }
+}
+
+impl Error for EngineConfigBindingError {}
+
+/// Bind a canonical config to one already inspected launch request without I/O or runtime claims.
+pub(crate) fn bind_engine_config_to_spec(
+    artifact: EngineConfigArtifact,
+    spec: &EngineSpec,
+) -> Result<EngineConfigLaunchBinding, EngineConfigBindingError> {
+    let config_digest = spec.config_digest();
+    if artifact.content_sha256() != config_digest.as_bytes() {
+        return Err(EngineConfigBindingError {
+            kind: EngineConfigBindingErrorKind::ConfigDigestMismatch {
+                artifact: *artifact.content_sha256(),
+                engine_spec: config_digest,
+            },
+        });
+    }
+
+    match &spec.process().readiness {
+        SingBoxReadiness::Listener { port } if *port == artifact.listener_port() => {}
+        SingBoxReadiness::Listener { port } => {
+            return Err(EngineConfigBindingError {
+                kind: EngineConfigBindingErrorKind::ListenerPortMismatch {
+                    artifact: artifact.listener_port(),
+                    engine_spec: *port,
+                },
+            });
+        }
+        SingBoxReadiness::TunInterface { .. } => {
+            return Err(EngineConfigBindingError {
+                kind: EngineConfigBindingErrorKind::TunReadinessUnsupported,
+            });
+        }
+    }
+
+    let binary_digest = spec.binary_digest();
+    let launcher_digest = spec.launcher_digest();
+    let digest = EngineConfigLaunchBindingDigest(digest_engine_config_launch_binding(
+        artifact.digest(),
+        binary_digest,
+        config_digest,
+        launcher_digest,
+    ));
+    Ok(EngineConfigLaunchBinding {
+        artifact,
+        binary_digest,
+        config_digest,
+        launcher_digest,
+        digest,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -399,6 +566,28 @@ fn digest_engine_config_artifact(
     digest.finalize().into()
 }
 
+fn digest_engine_config_launch_binding(
+    artifact_digest: EngineConfigArtifactDigest,
+    binary_digest: EngineArtifactDigest,
+    config_digest: EngineArtifactDigest,
+    launcher_digest: Option<EngineArtifactDigest>,
+) -> [u8; ENGINE_CONFIG_DIGEST_BYTES] {
+    let mut digest = Sha256::new();
+    digest.update(LAUNCH_BINDING_DIGEST_DOMAIN);
+    digest.update(ENGINE_CONFIG_LAUNCH_BINDING_SCHEMA_VERSION.to_be_bytes());
+    digest.update(artifact_digest.as_bytes());
+    digest.update(binary_digest.as_bytes());
+    digest.update(config_digest.as_bytes());
+    match launcher_digest {
+        Some(launcher_digest) => {
+            digest.update([1]);
+            digest.update(launcher_digest.as_bytes());
+        }
+        None => digest.update([0]),
+    }
+    digest.finalize().into()
+}
+
 fn digest_with_domain(domain: &[u8], bytes: &[u8]) -> [u8; ENGINE_CONFIG_DIGEST_BYTES] {
     let mut digest = Sha256::new();
     digest.update(domain);
@@ -532,14 +721,19 @@ impl<'de> Visitor<'de> for StrictJsonVisitor {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::num::NonZeroU16;
+    use std::time::Duration;
+
+    use flux_platform::{SingBoxLaunchSpec, SingBoxLauncher, SingBoxReadiness};
 
     use super::{
+        ENGINE_CONFIG_LAUNCH_BINDING_SCHEMA_VERSION, EngineConfigBindingErrorKind,
         EngineConfigCompileErrorKind, GENERATION_ENGINE_CONFIG_SCHEMA_VERSION,
         MAX_GENERATION_ENGINE_CONFIG_INBOUNDS, TproxyEngineConfigRequest,
-        compile_tproxy_engine_config,
+        bind_engine_config_to_spec, compile_tproxy_engine_config,
     };
-    use crate::MAX_ENGINE_CONFIG_BYTES;
+    use crate::{EngineSpec, MAX_ENGINE_CONFIG_BYTES, RestartPolicy};
 
     const PORT: u16 = 1536;
 
@@ -641,6 +835,132 @@ mod tests {
     }
 
     #[test]
+    fn binds_exact_config_listener_and_launch_artifact_identities() {
+        let artifact =
+            compile(br#"{"inbounds":[{"type":"tproxy","network":"udp"}]}"#, PORT).unwrap();
+        let artifact_digest = artifact.digest();
+        let fixture = EngineSpecFixture::new(
+            artifact.bytes(),
+            b"sing-box-v1",
+            SingBoxReadiness::Listener {
+                port: NonZeroU16::new(PORT).unwrap(),
+            },
+        );
+
+        let binding = bind_engine_config_to_spec(artifact, &fixture.spec).unwrap();
+
+        assert_eq!(
+            binding.schema_version(),
+            ENGINE_CONFIG_LAUNCH_BINDING_SCHEMA_VERSION
+        );
+        assert_eq!(binding.artifact().digest(), artifact_digest);
+        assert_eq!(binding.binary_digest(), fixture.spec.binary_digest());
+        assert_eq!(binding.config_digest(), fixture.spec.config_digest());
+        assert_eq!(binding.launcher_digest(), None);
+        assert_eq!(binding.digest().as_bytes().len(), 32);
+        assert_eq!(
+            binding.digest().to_string(),
+            "fdacd3c8d087371e5c7f51c879298a3aa42e4369c559dde4fe9337ba97630f5f"
+        );
+    }
+
+    #[test]
+    fn rejects_config_content_or_listener_shape_drift() {
+        let artifact = compile(br#"{"inbounds":[]}"#, PORT).unwrap();
+        let mismatched_config = EngineSpecFixture::new(
+            b"{}\n",
+            b"sing-box",
+            SingBoxReadiness::Listener {
+                port: NonZeroU16::new(PORT).unwrap(),
+            },
+        );
+        let expected_artifact = *artifact.content_sha256();
+        let expected_spec = mismatched_config.spec.config_digest();
+        let error = bind_engine_config_to_spec(artifact, &mismatched_config.spec).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            EngineConfigBindingErrorKind::ConfigDigestMismatch {
+                artifact: expected_artifact,
+                engine_spec: expected_spec,
+            }
+        );
+
+        let artifact = compile(br#"{"inbounds":[]}"#, PORT).unwrap();
+        let mismatched_port = EngineSpecFixture::new(
+            artifact.bytes(),
+            b"sing-box",
+            SingBoxReadiness::Listener {
+                port: NonZeroU16::new(PORT + 1).unwrap(),
+            },
+        );
+        let error = bind_engine_config_to_spec(artifact, &mismatched_port.spec).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            EngineConfigBindingErrorKind::ListenerPortMismatch {
+                artifact: NonZeroU16::new(PORT).unwrap(),
+                engine_spec: NonZeroU16::new(PORT + 1).unwrap(),
+            }
+        );
+
+        let artifact = compile(br#"{"inbounds":[]}"#, PORT).unwrap();
+        let tun = EngineSpecFixture::new(
+            artifact.bytes(),
+            b"sing-box",
+            SingBoxReadiness::TunInterface {
+                name: "tun0".to_owned(),
+            },
+        );
+        let error = bind_engine_config_to_spec(artifact, &tun.spec).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            EngineConfigBindingErrorKind::TunReadinessUnsupported
+        );
+    }
+
+    #[test]
+    fn binding_identity_retains_binary_and_removed_template_provenance() {
+        let empty = compile(br#"{"inbounds":[]}"#, PORT).unwrap();
+        let old_tun = compile(br#"{"inbounds":[{"type":"tun","tag":"old-tun"}]}"#, PORT).unwrap();
+        assert_eq!(empty.bytes(), old_tun.bytes());
+
+        let first_engine = EngineSpecFixture::new(
+            empty.bytes(),
+            b"sing-box-v1",
+            SingBoxReadiness::Listener {
+                port: NonZeroU16::new(PORT).unwrap(),
+            },
+        );
+        let second_engine = EngineSpecFixture::new(
+            empty.bytes(),
+            b"sing-box-v2",
+            SingBoxReadiness::Listener {
+                port: NonZeroU16::new(PORT).unwrap(),
+            },
+        );
+        let launcher_engine = EngineSpecFixture::new_with_busybox(
+            empty.bytes(),
+            b"sing-box-v1",
+            b"busybox-v1",
+            SingBoxReadiness::Listener {
+                port: NonZeroU16::new(PORT).unwrap(),
+            },
+        );
+
+        let first = bind_engine_config_to_spec(empty.clone(), &first_engine.spec).unwrap();
+        let binary_drift = bind_engine_config_to_spec(empty.clone(), &second_engine.spec).unwrap();
+        let launcher_drift = bind_engine_config_to_spec(empty, &launcher_engine.spec).unwrap();
+        let source_drift = bind_engine_config_to_spec(old_tun, &first_engine.spec).unwrap();
+
+        assert_ne!(first.digest(), binary_drift.digest());
+        assert_ne!(first.digest(), launcher_drift.digest());
+        assert_eq!(
+            launcher_drift.launcher_digest(),
+            launcher_engine.spec.launcher_digest()
+        );
+        assert_ne!(first.digest(), source_drift.digest());
+    }
+
+    #[test]
     fn rejects_duplicate_or_ambiguous_json_before_compilation() {
         for template in [
             br#"{"inbounds":[],"inbounds":[]}"#.as_slice(),
@@ -734,5 +1054,75 @@ mod tests {
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    struct EngineSpecFixture {
+        spec: EngineSpec,
+        _directory: tempfile::TempDir,
+    }
+
+    impl EngineSpecFixture {
+        fn new(config: &[u8], binary: &[u8], readiness: SingBoxReadiness) -> Self {
+            Self::build(config, binary, None, readiness)
+        }
+
+        fn new_with_busybox(
+            config: &[u8],
+            binary: &[u8],
+            busybox: &[u8],
+            readiness: SingBoxReadiness,
+        ) -> Self {
+            Self::build(config, binary, Some(busybox), readiness)
+        }
+
+        fn build(
+            config: &[u8],
+            binary: &[u8],
+            busybox: Option<&[u8]>,
+            readiness: SingBoxReadiness,
+        ) -> Self {
+            let directory = tempfile::tempdir().expect("create engine config binding fixture");
+            let binary_path = directory.path().join("sing-box");
+            let config_path = directory.path().join("config.json");
+            fs::write(&binary_path, binary).expect("write engine binary fixture");
+            fs::write(&config_path, config).expect("write engine config fixture");
+            let launcher = match busybox {
+                Some(bytes) => {
+                    let path = directory.path().join("busybox");
+                    fs::write(&path, bytes).expect("write engine launcher fixture");
+                    SingBoxLauncher::BusyBoxSetuidgid {
+                        busybox: path,
+                        identity: "1000:1000".into(),
+                    }
+                }
+                None => SingBoxLauncher::Direct,
+            };
+            let restart = RestartPolicy::new(
+                3,
+                Duration::from_secs(60),
+                Duration::from_secs(1),
+                Duration::from_secs(8),
+                Duration::from_secs(10),
+            )
+            .expect("valid restart policy");
+            let spec = EngineSpec::new(
+                SingBoxLaunchSpec {
+                    binary: binary_path,
+                    config: config_path,
+                    working_directory: directory.path().to_path_buf(),
+                    log: directory.path().join("sing-box.log"),
+                    launcher,
+                    readiness,
+                    startup_timeout: Duration::from_secs(1),
+                    stop_timeout: Duration::from_secs(1),
+                },
+                restart,
+            )
+            .expect("inspect engine config binding fixture");
+            Self {
+                spec,
+                _directory: directory,
+            }
+        }
     }
 }

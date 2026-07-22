@@ -330,6 +330,10 @@ domain-separated artifact digest, and resource accounting. The result is only a 
 not an Engine Capability Profile, exact-binary validation, proven dual-stack runtime behavior,
 listener-delivery evidence, or activation/mutation authority. It has no Generation ID or path into
 the Runtime Coordinator or private native owner, whose production admission remains uninhabited.
+The follow-on pure launch-artifact binding now rejects config-content mismatch, listener-port
+mismatch, and TUN readiness before retaining the exact inspected binary/config/optional-launcher
+digests. This still is not a complete `EngineSpec` identity or Engine Capability Profile and runs
+no binary validation, file reverification, listener observation, process launch, or mutation.
 
 The bounded raw oracle checkpoint is also complete and frozen. The canonical environment, input,
 and fixture pin contract lives in `tests/oracle/xtables/manifest.json`; do not duplicate or update
@@ -932,7 +936,8 @@ Before a backend may be selected automatically, its documentation must include:
    authority and exact device/artifact Capability Profile, then make one physical Android ARM64
    ordered-mark-lifetime/coexistence target viable under ADR-0013. The explicit-serial read-only
    preflight contract is delivered. A first pure canonical `EngineConfigArtifact` compiler is also
-   delivered, but remains unbound to a Generation, Engine Capability Profile, runtime listener, or
+   delivered together with an exact inspected launch-artifact/config/listener-shape binding, but
+   remains unbound to a Generation, Engine Capability Profile, observed runtime listener, or
    activation path. Run the preflight on an attached physical target when ARM64 qualification
    resumes, then bind the positive artifact/source-profile and mark-preservation/coexistence
    evidence. Keep the remaining 21 census cells paused until the runtime netd profile/INPUT chain

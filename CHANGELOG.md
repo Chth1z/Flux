@@ -15,6 +15,11 @@ All notable changes to the Flux project will be documented in this file.
   private native writer. Listener normalization does not establish an Engine Capability Profile,
   exact-binary validation, dual-stack runtime behavior, listener delivery, a Generation ID, or
   activation/mutation authority; positive production target admission remains uninhabited.
+- Added a consuming pure launch-artifact binding that accepts only an exact `EngineSpec` config
+  digest and matching TPROXY listener port, rejects TUN readiness, and binds the canonical config
+  artifact to the inspected binary/config/optional-launcher identities. It is deliberately not a
+  complete launch-spec identity, Engine Capability Profile, runtime readiness observation,
+  Generation, or activation path.
 
 ### Exact Android device identity
 - Bumped the boot-scoped Capability Profile to schema 2 and added typed exact Android product,

@@ -51,7 +51,8 @@ networking. It reuses bounded ADB execution and stable boot/fingerprint revalida
 production identity collector's required property and artifact inputs, requires ARM64, Linux 5.10+,
 enforcing SELinux, and PID-1 network-namespace identity, and reads only mangle tables already
 initialized by Android. Its bounded parser requires the exact unconditional INPUT child hook,
-one declared `routectrl_mangle_INPUT`, unique cross-family-consistent interface-scoped writers, one
+one declared `routectrl_mangle_INPUT`, no other `-j` or `-g` reference to that child from any chain,
+unique cross-family-consistent interface-scoped writers, one
 supported incoming mask, zero candidate-envelope bits in writer values, and no unknown child rule
 in either family.
 

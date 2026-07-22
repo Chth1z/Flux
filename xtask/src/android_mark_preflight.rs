@@ -773,7 +773,7 @@ fn build_family_report(
     }
     if observation.input_hook_references != 1 || observation.input_hook_ordinal.is_none() {
         report.blocking_reasons.push(
-            "built-in INPUT does not contain exactly one unconditional routectrl_mangle_INPUT jump"
+            "routectrl_mangle_INPUT must have exactly one reference: an unconditional built-in INPUT jump"
                 .to_owned(),
         );
     }
@@ -901,15 +901,16 @@ fn parse_mangle_dump(dump: &str) -> Result<MangleObservation, String> {
                 line_index + 1
             ));
         }
+        let references = rule_target_references(&tokens, ROUTECTRL_INPUT_CHAIN);
+        input_hook_references = input_hook_references
+            .checked_add(references)
+            .ok_or_else(|| "routectrl chain reference count overflow".to_owned())?;
         if tokens[1] == "INPUT" {
             input_ordinal = input_ordinal
                 .checked_add(1)
                 .ok_or_else(|| "INPUT rule ordinal overflow".to_owned())?;
-            if rule_target(&tokens) == Some(ROUTECTRL_INPUT_CHAIN) {
-                input_hook_references += 1;
-                if tokens == ["-A", "INPUT", "-j", ROUTECTRL_INPUT_CHAIN] {
-                    input_hook_ordinal = Some(input_ordinal);
-                }
+            if tokens == ["-A", "INPUT", "-j", ROUTECTRL_INPUT_CHAIN] {
+                input_hook_ordinal = Some(input_ordinal);
             }
             continue;
         }
@@ -944,10 +945,11 @@ fn parse_mangle_dump(dump: &str) -> Result<MangleObservation, String> {
     })
 }
 
-fn rule_target<'a>(tokens: &'a [&str]) -> Option<&'a str> {
+fn rule_target_references(tokens: &[&str], target: &str) -> usize {
     tokens
         .windows(2)
-        .find_map(|pair| (pair[0] == "-j").then_some(pair[1]))
+        .filter(|pair| matches!(pair[0], "-j" | "-g") && pair[1] == target)
+        .count()
 }
 
 struct IncomingWriter {
@@ -1238,6 +1240,29 @@ mod tests {
         );
         let observation = parse_mangle_dump(&duplicate).expect("well-framed snapshot");
         assert_eq!(observation.input_hook_references, 2);
+    }
+
+    #[test]
+    fn goto_and_non_input_references_to_the_child_chain_block_viability() {
+        for extra_reference in [
+            "-A INPUT -g routectrl_mangle_INPUT\n",
+            "-A OUTPUT -j routectrl_mangle_INPUT\n",
+        ] {
+            let mut candidate = snapshot(PINNED_2025_INCOMING_MASK);
+            candidate.ipv4_mangle = candidate.ipv4_mangle.replace(
+                "-A INPUT -j routectrl_mangle_INPUT\n",
+                &format!("-A INPUT -j routectrl_mangle_INPUT\n{extra_reference}"),
+            );
+
+            let report = build_report("SERIAL", device(), candidate);
+
+            assert_eq!(report.disposition, Disposition::Blocked);
+            assert!(report.ipv4.blocking_reasons.iter().any(|reason| {
+                reason.contains(
+                    "routectrl_mangle_INPUT must have exactly one reference: an unconditional built-in INPUT jump",
+                )
+            }));
+        }
     }
 
     #[test]

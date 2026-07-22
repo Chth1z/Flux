@@ -90,6 +90,9 @@ All notable changes to the Flux project will be documented in this file.
   rather than print raw tables and still defer artifact/source-profile authentication, exact Capture
   Path ordering, listener/observer mark preservation, and VPN/netd coexistence. The command never
   pushes a binary or runs restore/rule mutation.
+- Corrected preflight child-chain admission to count every `-j` and `-g` reference from every
+  mangle chain. A result is viable only when the sole reference is the exact unconditional built-in
+  INPUT jump; an additional INPUT goto or reference from another chain now blocks qualification.
 
 ### Rewrite release policy
 - Established the pre-release Rust-only release gate in ADR-0011. Bridge, shadow, parity, and

@@ -56,8 +56,9 @@ Windows `adb.exe` path from WSL. It performs no push, temporary-directory creati
 mutation, module request, or live Flux-chain write. After root and stable boot/fingerprint checks,
 it reads the production identity collector's property/artifact prerequisites, PID-1/self network
 namespaces, SELinux mode, and only mangle tables already listed in `/proc/net/*_tables_names`. The
-bounded report requires exact dual-family `routectrl_mangle_INPUT` declarations, one unconditional
-built-in INPUT jump, unique cross-family-consistent interface-scoped MARK writers, one supported
+bounded report requires exact dual-family `routectrl_mangle_INPUT` declarations, exactly one total
+`-j`/`-g` reference to each child and requires that reference to be the unconditional built-in INPUT
+jump, unique cross-family-consistent interface-scoped MARK writers, one supported
 mask, zero candidate-envelope bits in writer values, and no unknown child rule. Raw table bytes are
 not printed. A `viable_for_full_qualification` result is still diagnostic-only: runtime artifact
 digest/source-profile authentication, exact Capture Path ordering, listener/observer mark

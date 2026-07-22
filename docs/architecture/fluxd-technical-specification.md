@@ -1340,8 +1340,10 @@ attempted without mutating networking. The host runner uses bounded/reaped ADB c
 boot/fingerprint revalidation, and accepts an explicit Windows ADB path under WSL. The rooted shell
 reads required identity properties, collector-input file availability, SELinux and network-
 namespace state, and only IPv4/IPv6 mangle tables already listed as initialized in procfs. A bounded
-host parser requires one exact unconditional built-in INPUT jump, the declared
-`routectrl_mangle_INPUT` child, unique cross-family-consistent interface-scoped MARK writers, a
+host parser requires the declared `routectrl_mangle_INPUT` child to have exactly one total `-j` or
+`-g` reference across the mangle table and requires that sole reference to be the exact
+unconditional built-in INPUT jump. It also requires exactly one `routectrl_mangle_INPUT` child
+declaration, unique cross-family-consistent interface-scoped MARK writers, a
 uniform supported mask, zero candidate-envelope bits in writer values, and no unknown child rule.
 It records snapshot digests instead of raw tables. Even
 `viable_for_full_qualification` is diagnostic-only and cannot construct census, planning, lease,

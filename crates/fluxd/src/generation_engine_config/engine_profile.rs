@@ -1,3 +1,22 @@
+use std::error::Error;
+use std::fmt;
+
+use sha2::{Digest, Sha256};
+
+use super::compiler::{
+    ENGINE_CONFIG_DIGEST_BYTES, EngineConfigLaunchBinding, EngineConfigLaunchBindingDigest,
+    length_bytes,
+};
+use crate::engine_supervisor::{EngineCapabilityProbeError, EngineCapabilityProbeErrorKind};
+use crate::{EngineArtifactSetIdentity, EngineSpec};
+
+pub(crate) const ENGINE_CAPABILITY_PROFILE_SCHEMA_VERSION: u16 = 1;
+
+const ENGINE_CAPABILITY_PROFILE_DIGEST_DOMAIN: &[u8] =
+    b"Flux Sing-Box Engine Capability Profile\0sha256-v1\0";
+const SING_BOX_VERSION_PREFIX: &str = "sing-box version ";
+const MAX_SING_BOX_RELEASE_BYTES: usize = 128;
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(transparent)]
 pub(crate) struct EngineCapabilityProfileRevision([u8; ENGINE_CONFIG_DIGEST_BYTES]);
@@ -356,21 +375,3 @@ fn update_length_prefixed(digest: &mut Sha256, bytes: &[u8]) {
     digest.update(length_bytes(bytes.len()));
     digest.update(bytes);
 }
-use std::error::Error;
-use std::fmt;
-
-use sha2::{Digest, Sha256};
-
-use super::compiler::{
-    ENGINE_CONFIG_DIGEST_BYTES, EngineConfigLaunchBinding, EngineConfigLaunchBindingDigest,
-    length_bytes,
-};
-use crate::engine_supervisor::{EngineCapabilityProbeError, EngineCapabilityProbeErrorKind};
-use crate::{EngineArtifactSetIdentity, EngineSpec};
-
-pub(crate) const ENGINE_CAPABILITY_PROFILE_SCHEMA_VERSION: u16 = 1;
-
-const ENGINE_CAPABILITY_PROFILE_DIGEST_DOMAIN: &[u8] =
-    b"Flux Sing-Box Engine Capability Profile\0sha256-v1\0";
-const SING_BOX_VERSION_PREFIX: &str = "sing-box version ";
-const MAX_SING_BOX_RELEASE_BYTES: usize = 128;

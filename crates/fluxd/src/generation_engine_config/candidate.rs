@@ -1,3 +1,16 @@
+use std::error::Error;
+use std::fmt;
+
+use flux_core::{
+    CapabilityProfile, KernelSupport, NetworkEpoch, NetworkInventory, NetworkInventorySnapshotId,
+    ObservationKind,
+};
+
+use super::compiler::EngineConfigLaunchBinding;
+use super::engine_profile::EngineCapabilityProfile;
+
+pub(crate) const TPROXY_GENERATION_CANDIDATE_SCHEMA_VERSION: u16 = 1;
+
 /// Deterministic, non-authorizing input bundle for later complete Generation compilation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TproxyGenerationCandidate {
@@ -129,15 +142,3 @@ pub(crate) fn compile_tproxy_generation_candidate(
         engine_config,
     })
 }
-use std::error::Error;
-use std::fmt;
-
-use flux_core::{
-    CapabilityProfile, KernelSupport, NetworkEpoch, NetworkInventory, NetworkInventorySnapshotId,
-    ObservationKind,
-};
-
-use super::compiler::EngineConfigLaunchBinding;
-use super::engine_profile::EngineCapabilityProfile;
-
-pub(crate) const TPROXY_GENERATION_CANDIDATE_SCHEMA_VERSION: u16 = 1;

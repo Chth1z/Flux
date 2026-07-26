@@ -74,6 +74,334 @@ fn zero_to_active_and_idempotent_active_use_one_exact_transaction() {
 }
 
 #[test]
+fn durable_target_archive_round_trips_exact_runtime_material() {
+    let temp = TempDir::new().unwrap();
+    let store = NativeXtablesDurableStore::new(temp.path().join("run"));
+    let target = target(7, AddressHostFamilySelection::DualStack, true);
+    let resolver = DurableNativeXtablesTargetResolver::open(store.clone()).unwrap();
+
+    resolver.stage(target.clone()).unwrap();
+    assert_eq!(resolver.identities().unwrap(), [target.identity()]);
+
+    let mut reopened = DurableNativeXtablesTargetResolver::open(store).unwrap();
+    let recovered = reopened.resolve(target.identity()).unwrap();
+    assert_eq!(recovered, target);
+}
+
+#[test]
+fn durable_target_archive_retains_replacement_pair_then_prunes_to_settled_state() {
+    let temp = TempDir::new().unwrap();
+    let store = NativeXtablesDurableStore::new(temp.path().join("run"));
+    let old = target(7, AddressHostFamilySelection::Ipv4, false);
+    let new = target(8, AddressHostFamilySelection::Ipv4, true);
+    let resolver = DurableNativeXtablesTargetResolver::open(store.clone()).unwrap();
+
+    resolver.stage(old.clone()).unwrap();
+    resolver.stage(new.clone()).unwrap();
+    assert_eq!(
+        resolver.identities().unwrap(),
+        [old.identity(), new.identity()]
+    );
+    resolver
+        .retain_state(NativeXtablesConvergedState::Active(new.identity()))
+        .unwrap();
+
+    let reopened = DurableNativeXtablesTargetResolver::open(store).unwrap();
+    assert_eq!(reopened.identities().unwrap(), [new.identity()]);
+}
+
+#[test]
+fn durable_target_archive_rejects_corruption_before_resolution() {
+    let temp = TempDir::new().unwrap();
+    let store = NativeXtablesDurableStore::new(temp.path().join("run"));
+    let resolver = DurableNativeXtablesTargetResolver::open(store.clone()).unwrap();
+    resolver
+        .stage(target(7, AddressHostFamilySelection::Ipv4, false))
+        .unwrap();
+    let path = store.target_archive_path();
+    let mut encoded = std::fs::read(&path).unwrap();
+    encoded[0] ^= 0xff;
+    std::fs::write(path, encoded).unwrap();
+
+    let error = match DurableNativeXtablesTargetResolver::open(store) {
+        Ok(_) => panic!("corrupted target archive must fail closed"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        NativeXtablesTargetArchiveError::Invalid("archive checksum does not match")
+    ));
+}
+
+#[test]
+fn durable_target_archive_never_discards_unsettled_third_target() {
+    let temp = TempDir::new().unwrap();
+    let store = NativeXtablesDurableStore::new(temp.path().join("run"));
+    let first = target(7, AddressHostFamilySelection::Ipv4, false);
+    let second = target(8, AddressHostFamilySelection::Ipv4, true);
+    let third = target(9, AddressHostFamilySelection::Ipv4, false);
+    let resolver = DurableNativeXtablesTargetResolver::open(store.clone()).unwrap();
+    resolver.stage(first.clone()).unwrap();
+    resolver.stage(second.clone()).unwrap();
+
+    assert!(matches!(
+        resolver.stage(third),
+        Err(NativeXtablesTargetArchiveError::CapacityExceeded)
+    ));
+    let reopened = DurableNativeXtablesTargetResolver::open(store).unwrap();
+    assert_eq!(
+        reopened.identities().unwrap(),
+        [first.identity(), second.identity()]
+    );
+}
+
+#[test]
+fn runtime_writer_requires_recovery_before_any_convergence() {
+    let target = target(7, AddressHostFamilySelection::Ipv4, false);
+    let fixture = Fixture::new([target.clone()]);
+    let mut writer = NativeXtablesRuntimeWriter::new(
+        FakeAdapter::new(vec![target.clone()]),
+        fixture.store.clone(),
+        fixture.environment.clone(),
+    )
+    .unwrap();
+
+    let error = writer
+        .converge(NativeXtablesDesiredTarget::Active(target))
+        .expect_err("convergence before recovery must fail closed");
+
+    assert!(matches!(
+        error,
+        NativeXtablesRuntimeWriterError::RecoveryRequired
+    ));
+    assert!(writer.test_adapter().operations.is_empty());
+    assert!(writer.test_archived_identities().unwrap().is_empty());
+}
+
+#[test]
+fn runtime_writer_persists_target_before_owner_journal_can_name_it() {
+    let target = target(7, AddressHostFamilySelection::Ipv4, false);
+    let fixture = Fixture::new([target.clone()]);
+    let mut writer = NativeXtablesRuntimeWriter::new(
+        FakeAdapter::new(vec![target.clone()]),
+        fixture.store.clone(),
+        fixture.environment.clone(),
+    )
+    .unwrap();
+    writer.recover().unwrap();
+    fixture
+        .store
+        .set_failpoint(Some(DurableEvent::JournalTempDurable));
+
+    let error = writer
+        .converge(NativeXtablesDesiredTarget::Active(target.clone()))
+        .expect_err("injected journal interruption must fail convergence");
+    assert!(matches!(
+        error,
+        NativeXtablesRuntimeWriterError::Owner(source)
+            if matches!(
+                source.as_ref(),
+                NativeXtablesOwnerError::Durable(NativeXtablesDurableError::InterruptedAt(
+                    DurableEvent::JournalTempDurable
+                ))
+            )
+    ));
+    drop(writer);
+
+    let resolver = DurableNativeXtablesTargetResolver::open(fixture.store.clone()).unwrap();
+    assert_eq!(resolver.identities().unwrap(), [target.identity()]);
+}
+
+#[test]
+fn runtime_writer_serializes_archive_and_owner_journal_as_one_transaction() {
+    let target = target(7, AddressHostFamilySelection::Ipv4, false);
+    let fixture = Fixture::new([target.clone()]);
+    let mut writer = NativeXtablesRuntimeWriter::new(
+        FakeAdapter::new(vec![target.clone()]),
+        fixture.store.clone(),
+        fixture.environment.clone(),
+    )
+    .unwrap();
+    writer.recover().unwrap();
+    fixture.store.pause_at(DurableEvent::JournalDurable);
+
+    let writer_thread =
+        std::thread::spawn(move || writer.converge(NativeXtablesDesiredTarget::Active(target)));
+    fixture
+        .store
+        .wait_until_paused(DurableEvent::JournalDurable);
+
+    let competing_store = fixture.store.clone();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let competing_thread = std::thread::spawn(move || {
+        sender
+            .send(competing_store.acquire_runtime_guard())
+            .unwrap();
+    });
+    let early = receiver.recv_timeout(Duration::from_millis(50));
+    fixture.store.release_pause();
+
+    assert!(matches!(
+        early,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    ));
+    assert!(writer_thread.join().unwrap().is_ok());
+    let guard = receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("competing runtime guard acquisition must finish after convergence")
+        .expect("competing runtime guard acquisition must succeed after convergence");
+    drop(guard);
+    competing_thread.join().unwrap();
+}
+
+#[test]
+fn runtime_writer_restart_recovers_active_target_without_current_configuration() {
+    let target = target(7, AddressHostFamilySelection::DualStack, true);
+    let fixture = Fixture::new([target.clone()]);
+    let mut writer = NativeXtablesRuntimeWriter::new(
+        FakeAdapter::new(vec![target.clone()]),
+        fixture.store.clone(),
+        fixture.environment.clone(),
+    )
+    .unwrap();
+    writer.recover().unwrap();
+    writer
+        .converge(NativeXtablesDesiredTarget::Active(target.clone()))
+        .unwrap();
+    let (adapter, durable, environment) = writer.into_parts();
+
+    let mut restarted = NativeXtablesRuntimeWriter::new(adapter, durable, environment).unwrap();
+    let report = restarted.recover().unwrap();
+
+    assert_eq!(
+        report.state(),
+        NativeXtablesConvergedState::Active(target.identity())
+    );
+    assert!(!report.changed());
+    assert_eq!(
+        restarted.test_archived_identities().unwrap(),
+        [target.identity()]
+    );
+}
+
+#[test]
+fn runtime_writer_recovery_resolves_replacement_rollback_then_prunes_candidate() {
+    let old = target(7, AddressHostFamilySelection::Ipv4, false);
+    let new = target(8, AddressHostFamilySelection::Ipv4, true);
+    let fixture = Fixture::new([old.clone(), new.clone()]);
+    let mut writer = NativeXtablesRuntimeWriter::new(
+        FakeAdapter::new(vec![old.clone(), new.clone()]),
+        fixture.store.clone(),
+        fixture.environment.clone(),
+    )
+    .unwrap();
+    writer.recover().unwrap();
+    writer
+        .converge(NativeXtablesDesiredTarget::Active(old.clone()))
+        .unwrap();
+    writer.test_adapter_mut().write_count = 0;
+    writer.test_adapter_mut().failures = vec![Failure {
+        write: 1,
+        after_apply: false,
+    }];
+
+    let error = writer
+        .converge(NativeXtablesDesiredTarget::Active(new.clone()))
+        .expect_err("replacement failure must report rollback");
+    assert!(matches!(
+        error,
+        NativeXtablesRuntimeWriterError::Owner(source)
+            if matches!(
+                source.as_ref(),
+                NativeXtablesOwnerError::RolledBack {
+                    state: NativeXtablesConvergedState::Active(identity),
+                    ..
+                } if *identity == old.identity()
+            )
+    ));
+    assert_eq!(
+        writer.test_archived_identities().unwrap(),
+        [old.identity(), new.identity()]
+    );
+
+    writer.test_adapter_mut().failures.clear();
+    let report = writer.recover().unwrap();
+    assert_eq!(
+        report.state(),
+        NativeXtablesConvergedState::Active(old.identity())
+    );
+    assert_eq!(writer.test_archived_identities().unwrap(), [old.identity()]);
+}
+
+#[test]
+fn runtime_writer_stop_reaches_exact_absence_and_prunes_target_material() {
+    let target = target(7, AddressHostFamilySelection::Ipv4, false);
+    let target_identity = target.identity();
+    let fixture = Fixture::new([target.clone()]);
+    let mut writer = NativeXtablesRuntimeWriter::new(
+        FakeAdapter::new(vec![target.clone()]),
+        fixture.store.clone(),
+        fixture.environment.clone(),
+    )
+    .unwrap();
+    writer.recover().unwrap();
+    writer
+        .converge(NativeXtablesDesiredTarget::Active(target))
+        .unwrap();
+
+    let report = writer
+        .converge(NativeXtablesDesiredTarget::Stopped)
+        .unwrap();
+
+    assert_eq!(report.state(), NativeXtablesConvergedState::CleanAbsent);
+    assert_eq!(
+        writer.test_archived_identities().unwrap(),
+        [target_identity]
+    );
+    assert_eq!(
+        fixture.store.load_journal().unwrap().unwrap().phase(),
+        NativeXtablesJournalPhase::CleanAbsent
+    );
+    assert!(fixture.store.load_lease().unwrap().is_none());
+
+    let recovered = writer.recover().unwrap();
+    assert_eq!(recovered.state(), NativeXtablesConvergedState::CleanAbsent);
+    assert!(writer.test_archived_identities().unwrap().is_empty());
+    assert!(fixture.store.load_journal().unwrap().is_none());
+}
+
+#[test]
+fn runtime_writer_dry_run_reports_intent_without_archive_journal_or_kernel_mutation() {
+    let target = target(7, AddressHostFamilySelection::Ipv4, false);
+    let fixture = Fixture::new([target.clone()]);
+    let mut writer = NativeXtablesRuntimeWriter::new(
+        FakeAdapter::new(vec![target.clone()]),
+        fixture.store.clone(),
+        fixture.environment.clone(),
+    )
+    .unwrap();
+
+    let report = writer
+        .observe(NativeXtablesDryRunTarget::Active(&target))
+        .unwrap();
+
+    assert!(!report.recovered());
+    assert!(!report.journal_present());
+    assert!(report.archived_targets().is_empty());
+    assert_eq!(report.desired_identity(), Some(target.identity()));
+    assert!(report.tool_identity_matches());
+    assert!(!report.exact_desired());
+    assert!(report.clean_absent());
+    assert_eq!(
+        report.disposition(),
+        NativeXtablesDryRunDisposition::Activate
+    );
+    assert!(writer.test_adapter().operations.is_empty());
+    assert!(fixture.store.load_target_archive().unwrap().is_none());
+    assert!(fixture.store.load_journal().unwrap().is_none());
+}
+
+#[test]
 fn opposite_family_routing_residue_blocks_activation_before_any_write() {
     let target = target(7, AddressHostFamilySelection::Ipv4, false);
     let fixture = Fixture::new([target.clone()]);
@@ -453,8 +781,8 @@ fn restart_resolves_same_artifacts_by_bound_loopback_identity() {
         InterfaceIndex::new(7).unwrap(),
     );
     assert_eq!(
-        other_binding.identity().artifact_digest(),
-        active.identity().artifact_digest()
+        other_binding.source_artifact_digest(),
+        active.source_artifact_digest()
     );
     assert_eq!(
         other_binding.identity().tool_digest(),
@@ -1024,13 +1352,12 @@ impl FakeAdapter {
         artifact: &XtablesRestoreArtifact,
     ) -> (&'static str, NativeXtablesTargetIdentity) {
         for target in &self.targets {
-            let Some(pair) = target.artifacts().pair(family) else {
+            let Some(plan) = target.topology().family(family) else {
                 continue;
             };
-            let plan = target.topology().family(family).unwrap();
             for (name, candidate) in [
-                ("prepare", pair.prepare()),
-                ("retire", pair.retire()),
+                ("prepare", plan.prepare()),
+                ("retire", plan.retire()),
                 ("install", plan.install()),
                 ("switch", plan.switch()),
                 ("detach_remaining", plan.detach_remaining()),

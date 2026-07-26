@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use flux_core::{ControlError, LegacyDispatcher, LegacyIntent, Reason};
+use flux_core::{ControlError, FluxConfig, LegacyDispatcher, LegacyIntent, Reason};
 use flux_platform::{
     DispatcherPhaseCommand, PhaseDispatcherError, PhaseDispatcherPaths, ProcessPhaseDispatcher,
 };
@@ -21,6 +21,18 @@ use crate::functional_canary::{
     FunctionalCanaryError, FunctionalCanaryGateMode, UnqualifiedFunctionalCanaryExecution,
     UnqualifiedFunctionalCanaryExecutor,
 };
+use crate::generation_engine_config::{
+    AddressReconciler, AddressReconciliationOutcome, AdmittedGeneration,
+    BridgePreparationPublication, CanonicalEngineConfigPreparationError,
+    DesiredStateEngineBindingError, EngineConfigBindingError, EngineConfigCompileError,
+    PreparedGenerationRecord, bind_engine_config_to_spec, bind_engine_spec_to_desired_state,
+    publish_bridge_preparation, publish_validated_subscription_bridge_preparation,
+};
+use crate::subscription::{
+    SubscriptionRefreshCompletion, SubscriptionRefreshDecision, SubscriptionRefreshError,
+    SubscriptionRefreshReport,
+};
+use crate::subscription::{SubscriptionRefreshRuntime, ValidatedSubscriptionEngineConfig};
 use crate::{
     CaptureObservation, DesiredEngine, EngineManifest, EngineManifestError, EnginePhase,
     EngineReport, EngineSnapshot, EngineSpec, EngineSupervisor, EngineSupervisorError,
@@ -41,10 +53,48 @@ pub(crate) struct PreparedGeneration {
     spec: EngineSpec,
 }
 
+impl PreparedGeneration {
+    #[must_use]
+    pub(crate) const fn new(id: NonZeroU32, spec: EngineSpec) -> Self {
+        Self { id, spec }
+    }
+
+    #[must_use]
+    pub(crate) const fn id(&self) -> NonZeroU32 {
+        self.id
+    }
+}
+
+/// Read-only A2 projection consumed at the coordinator seam without entering the legacy writer.
+#[allow(
+    dead_code,
+    reason = "A2 keeps admitted Generation inspection disconnected from production mutation"
+)]
+pub(crate) fn inspect_admitted_generation(
+    generation: &AdmittedGeneration,
+) -> PreparedGenerationRecord {
+    PreparedGenerationRecord::from_admitted(generation)
+}
+
 pub(crate) trait LegacyRuntimeWriter: Send + 'static {
     type Error: Error + Send + Sync + 'static;
 
     fn prepare(&mut self, reason: Reason) -> Result<PreparedGeneration, Self::Error>;
+    fn prepare_address_successor(
+        &mut self,
+        _inputs: &crate::generation_engine_config::AddressReconciledGenerationInputs,
+    ) -> Result<Option<PreparedGeneration>, Self::Error> {
+        Ok(None)
+    }
+    fn prepare_subscription(
+        &mut self,
+        _config: &ValidatedSubscriptionEngineConfig,
+    ) -> Result<Option<PreparedGeneration>, Self::Error> {
+        Ok(None)
+    }
+    fn accept_deferred_subscription(&mut self, _config: ValidatedSubscriptionEngineConfig) -> bool {
+        false
+    }
     fn capture_start(&mut self, generation: &PreparedGeneration) -> Result<(), Self::Error>;
     fn capture_stop(&mut self) -> Result<(), Self::Error>;
     fn verify_capture(&mut self, generation: &PreparedGeneration) -> Result<(), Self::Error>;
@@ -146,16 +196,22 @@ impl RuntimeFunctionalCanary {
 
 #[derive(Debug)]
 pub(crate) enum ProcessRuntimeWriterError {
+    CanonicalConfig(CanonicalEngineConfigPreparationError),
     Phase(PhaseDispatcherError),
     Manifest {
         path: PathBuf,
         source: Box<EngineManifestError>,
     },
+    Binding(EngineConfigBindingError),
+    DesiredStateBinding(DesiredStateEngineBindingError),
+    SubscriptionArtifact(EngineConfigCompileError),
+    SubscriptionUnavailable,
 }
 
 impl fmt::Display for ProcessRuntimeWriterError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::CanonicalConfig(error) => error.fmt(formatter),
             Self::Phase(error) => error.fmt(formatter),
             Self::Manifest { path, source } => {
                 write!(
@@ -164,6 +220,11 @@ impl fmt::Display for ProcessRuntimeWriterError {
                     path.display()
                 )
             }
+            Self::Binding(error) => error.fmt(formatter),
+            Self::DesiredStateBinding(error) => error.fmt(formatter),
+            Self::SubscriptionArtifact(error) => error.fmt(formatter),
+            Self::SubscriptionUnavailable => formatter
+                .write_str("enabled subscription intent has no accepted validated engine snapshot"),
         }
     }
 }
@@ -171,8 +232,13 @@ impl fmt::Display for ProcessRuntimeWriterError {
 impl Error for ProcessRuntimeWriterError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::CanonicalConfig(error) => Some(error),
             Self::Phase(error) => Some(error),
             Self::Manifest { source, .. } => Some(source),
+            Self::Binding(error) => Some(error),
+            Self::DesiredStateBinding(error) => Some(error),
+            Self::SubscriptionArtifact(error) => Some(error),
+            Self::SubscriptionUnavailable => None,
         }
     }
 }
@@ -180,14 +246,39 @@ impl Error for ProcessRuntimeWriterError {
 pub(crate) struct ProcessRuntimeWriter {
     dispatcher: ProcessPhaseDispatcher,
     manifest_path: PathBuf,
+    desired_state_path: PathBuf,
+    engine_config_path: PathBuf,
+    bridge_environment_path: PathBuf,
+    accepted_subscription: Option<ValidatedSubscriptionEngineConfig>,
+    pending_subscription: Option<(NonZeroU32, Option<ValidatedSubscriptionEngineConfig>)>,
 }
 
 impl ProcessRuntimeWriter {
-    pub(crate) fn new(paths: PhaseDispatcherPaths, manifest_path: impl AsRef<Path>) -> Self {
+    pub(crate) fn new(
+        paths: PhaseDispatcherPaths,
+        manifest_path: impl AsRef<Path>,
+        desired_state_path: impl AsRef<Path>,
+        engine_config_path: impl AsRef<Path>,
+        bridge_environment_path: impl AsRef<Path>,
+    ) -> Self {
         Self {
             dispatcher: ProcessPhaseDispatcher::new(paths),
             manifest_path: manifest_path.as_ref().to_path_buf(),
+            desired_state_path: desired_state_path.as_ref().to_path_buf(),
+            engine_config_path: engine_config_path.as_ref().to_path_buf(),
+            bridge_environment_path: bridge_environment_path.as_ref().to_path_buf(),
+            accepted_subscription: None,
+            pending_subscription: None,
         }
+    }
+
+    #[must_use]
+    pub(crate) fn with_subscription_source(
+        mut self,
+        source: Option<ValidatedSubscriptionEngineConfig>,
+    ) -> Self {
+        self.accepted_subscription = source;
+        self
     }
 
     fn execute_phase(
@@ -198,12 +289,11 @@ impl ProcessRuntimeWriter {
             .execute(command)
             .map_err(ProcessRuntimeWriterError::Phase)
     }
-}
 
-impl LegacyRuntimeWriter for ProcessRuntimeWriter {
-    type Error = ProcessRuntimeWriterError;
-
-    fn prepare(&mut self, _reason: Reason) -> Result<PreparedGeneration, Self::Error> {
+    fn prepare_publication(
+        &mut self,
+        publication: BridgePreparationPublication,
+    ) -> Result<PreparedGeneration, ProcessRuntimeWriterError> {
         self.execute_phase(DispatcherPhaseCommand::Prepare)?;
         let prepared = EngineManifest::load_prepared(&self.manifest_path).map_err(|source| {
             ProcessRuntimeWriterError::Manifest {
@@ -211,10 +301,97 @@ impl LegacyRuntimeWriter for ProcessRuntimeWriter {
                 source: Box::new(source),
             }
         })?;
+        let (desired_state, artifact, _bridge_environment) = publication.into_parts();
+        let generation = prepared.generation();
+        let spec = bind_engine_spec_to_desired_state(&desired_state, prepared.into_engine())
+            .map_err(ProcessRuntimeWriterError::DesiredStateBinding)?;
+        let _binding = bind_engine_config_to_spec(artifact, &spec)
+            .map_err(ProcessRuntimeWriterError::Binding)?;
         Ok(PreparedGeneration {
-            id: prepared.generation(),
-            spec: prepared.into_engine(),
+            id: generation,
+            spec,
         })
+    }
+
+    fn publish_subscription_preparation(
+        &self,
+        source: &ValidatedSubscriptionEngineConfig,
+    ) -> Result<BridgePreparationPublication, ProcessRuntimeWriterError> {
+        let artifact = source
+            .reconstruct_artifact(source.desired_state().listener().port())
+            .map_err(ProcessRuntimeWriterError::SubscriptionArtifact)?;
+        publish_validated_subscription_bridge_preparation(
+            &self.desired_state_path,
+            source.desired_state(),
+            artifact,
+            &self.engine_config_path,
+            &self.bridge_environment_path,
+        )
+        .map_err(ProcessRuntimeWriterError::CanonicalConfig)
+    }
+
+    fn commit_pending_subscription(&mut self, phase: PublishedRuntimeState) {
+        let Some((candidate, source)) = self.pending_subscription.take() else {
+            return;
+        };
+        if matches!(
+            phase,
+            PublishedRuntimeState::Running { generation } if generation == candidate
+        ) {
+            self.accepted_subscription = source;
+        }
+    }
+}
+
+impl LegacyRuntimeWriter for ProcessRuntimeWriter {
+    type Error = ProcessRuntimeWriterError;
+
+    fn prepare(&mut self, _reason: Reason) -> Result<PreparedGeneration, Self::Error> {
+        let current = FluxConfig::load(&self.desired_state_path).map_err(|source| {
+            ProcessRuntimeWriterError::CanonicalConfig(
+                CanonicalEngineConfigPreparationError::DesiredState {
+                    path: self.desired_state_path.clone(),
+                    source,
+                },
+            )
+        })?;
+        let source = if current.subscription().enabled() {
+            Some(
+                self.accepted_subscription
+                    .clone()
+                    .ok_or(ProcessRuntimeWriterError::SubscriptionUnavailable)?,
+            )
+        } else {
+            None
+        };
+        let publication = match source.as_ref() {
+            Some(source) => self.publish_subscription_preparation(source)?,
+            None => publish_bridge_preparation(
+                &self.desired_state_path,
+                &self.engine_config_path,
+                &self.bridge_environment_path,
+            )
+            .map_err(ProcessRuntimeWriterError::CanonicalConfig)?,
+        };
+        let prepared = self.prepare_publication(publication)?;
+        self.pending_subscription = Some((prepared.id, source));
+        Ok(prepared)
+    }
+
+    fn prepare_subscription(
+        &mut self,
+        source: &ValidatedSubscriptionEngineConfig,
+    ) -> Result<Option<PreparedGeneration>, Self::Error> {
+        let publication = self.publish_subscription_preparation(source)?;
+        let prepared = self.prepare_publication(publication)?;
+        self.pending_subscription = Some((prepared.id, Some(source.clone())));
+        Ok(Some(prepared))
+    }
+
+    fn accept_deferred_subscription(&mut self, source: ValidatedSubscriptionEngineConfig) -> bool {
+        self.pending_subscription = None;
+        self.accepted_subscription = Some(source);
+        true
     }
 
     fn capture_start(&mut self, generation: &PreparedGeneration) -> Result<(), Self::Error> {
@@ -236,15 +413,18 @@ impl LegacyRuntimeWriter for ProcessRuntimeWriter {
     fn publish(&mut self, phase: PublishedRuntimeState) -> Result<(), Self::Error> {
         let command = match phase {
             PublishedRuntimeState::Running { generation } => {
-                return self
-                    .dispatcher
+                self.dispatcher
                     .execute_for_generation(DispatcherPhaseCommand::StateRunning, generation)
-                    .map_err(ProcessRuntimeWriterError::Phase);
+                    .map_err(ProcessRuntimeWriterError::Phase)?;
+                self.commit_pending_subscription(phase);
+                return Ok(());
             }
             PublishedRuntimeState::Stopped => DispatcherPhaseCommand::StateStopped,
             PublishedRuntimeState::Failed => DispatcherPhaseCommand::StateFailed,
         };
-        self.execute_phase(command)
+        self.execute_phase(command)?;
+        self.commit_pending_subscription(phase);
+        Ok(())
     }
 
     fn resync_addresses(&mut self) -> Result<(), Self::Error> {
@@ -311,6 +491,21 @@ struct QualifiedRunningGeneration {
     disposition: FunctionalCanaryDisposition,
 }
 
+struct PendingSubscriptionActivation {
+    completion: SubscriptionRefreshCompletion,
+    candidate: NonZeroU32,
+    node_count: u32,
+    cleanup_pending: bool,
+    failure: SubscriptionRefreshError,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SubscriptionActivationSettlement {
+    Accepted,
+    Pending,
+    Rejected,
+}
+
 impl QualifiedRunningGeneration {
     const fn verification(&self) -> RuntimeVerificationState {
         match &self.disposition {
@@ -330,8 +525,12 @@ pub(crate) struct RuntimeCoordinator<W, E = EngineSupervisor> {
     functional_canary: RuntimeFunctionalCanary,
     ownership: RuntimeOwnership,
     maintenance_interval: Duration,
+    address_reconciler: Option<AddressReconciler>,
+    address_reconciliation_pending: bool,
     runtime: RuntimeSnapshotSource,
     pending_publication: Option<PublishedRuntimeState>,
+    subscription_refresh: Option<SubscriptionRefreshRuntime>,
+    pending_subscription_activation: Option<PendingSubscriptionActivation>,
 }
 
 impl<W, E> RuntimeCoordinator<W, E>
@@ -360,9 +559,25 @@ where
             functional_canary,
             ownership: RuntimeOwnership::Stopped,
             maintenance_interval,
+            address_reconciler: None,
+            address_reconciliation_pending: false,
             runtime,
             pending_publication: None,
+            subscription_refresh: None,
+            pending_subscription_activation: None,
         }
+    }
+
+    #[must_use]
+    pub(crate) fn with_address_reconciler(mut self, reconciler: AddressReconciler) -> Self {
+        self.address_reconciler = Some(reconciler);
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_subscription_runtime(mut self, runtime: SubscriptionRefreshRuntime) -> Self {
+        self.subscription_refresh = Some(runtime);
+        self
     }
 
     #[cfg(test)]
@@ -405,6 +620,7 @@ where
                 "leave the current generation untouched and repair preparation inputs",
             )
         })?;
+        self.request_address_reconciliation();
         self.activate_prepared(generation)
     }
 
@@ -432,6 +648,19 @@ where
                 "leave the active generation untouched and repair preparation inputs",
             )
         })?;
+        self.request_address_reconciliation();
+        self.reload_prepared(candidate)
+    }
+
+    fn reload_prepared(&mut self, candidate: PreparedGeneration) -> Result<(), ControlError> {
+        if matches!(
+            self.ownership,
+            RuntimeOwnership::CaptureRepairPending { .. }
+                | RuntimeOwnership::DetachPending { .. }
+                | RuntimeOwnership::Retiring { .. }
+        ) {
+            return Err(retirement_pending_error("reload prepared runtime"));
+        }
         let candidate_id = candidate.id;
         self.mark_functional_gate_pending();
         let ownership = std::mem::replace(&mut self.ownership, RuntimeOwnership::Stopped);
@@ -849,6 +1078,283 @@ where
             );
         }
         Ok(())
+    }
+
+    fn request_address_reconciliation(&mut self) {
+        if let Some(reconciler) = self.address_reconciler.as_mut() {
+            reconciler.request_reconciliation();
+        }
+    }
+
+    fn maintain_address_reconciliation(&mut self) -> Result<(), ControlError> {
+        {
+            let Some(reconciler) = self.address_reconciler.as_mut() else {
+                return Ok(());
+            };
+            match reconciler.reconcile() {
+                Ok(AddressReconciliationOutcome::Reconciled(_)) => {
+                    self.address_reconciliation_pending = true;
+                }
+                Ok(AddressReconciliationOutcome::Invalidated(previous)) => {
+                    self.address_reconciliation_pending = false;
+                    eprintln!(
+                        "fluxd: network inventory snapshot {} at epoch {} invalidated; awaiting full resynchronization",
+                        previous.snapshot_id().get(),
+                        previous.epoch().get()
+                    );
+                }
+                Ok(
+                    AddressReconciliationOutcome::AwaitingSource
+                    | AddressReconciliationOutcome::Unchanged(_)
+                    | AddressReconciliationOutcome::Blocked { .. },
+                ) => {}
+                Ok(AddressReconciliationOutcome::AwaitingCompleteSnapshot) => {
+                    self.address_reconciliation_pending = false;
+                }
+                Err(error) => {
+                    self.address_reconciliation_pending = false;
+                    eprintln!("fluxd: non-mutating address reconciliation blocked: {error}");
+                }
+            }
+        }
+        let runtime = self.runtime.snapshot();
+        let can_reload = matches!(
+            self.ownership,
+            RuntimeOwnership::Engine {
+                capture: CaptureObservation::Published,
+                ..
+            }
+        ) && runtime.phase == RuntimePhase::Running
+            && runtime.capture == RuntimeCaptureState::Published
+            && runtime.engine == RuntimeEngineState::Ready;
+        if !can_reload || !self.address_reconciliation_pending {
+            return Ok(());
+        }
+        let reconciled = self
+            .address_reconciler
+            .as_ref()
+            .and_then(AddressReconciler::current)
+            .cloned()
+            .ok_or_else(|| {
+                ControlError::runtime(
+                    "load pending address reconciliation",
+                    io::Error::other(
+                        "pending address reconciliation has no complete compiled inputs",
+                    ),
+                    "wait for a fresh complete network inventory snapshot",
+                )
+            })?;
+        self.address_reconciliation_pending = false;
+        let candidate = self
+            .writer
+            .prepare_address_successor(&reconciled)
+            .map_err(|source| {
+                runtime_writer_error(
+                    "prepare address-driven runtime Generation",
+                    source,
+                    "retain the active Generation and retry after fresh complete inventory",
+                )
+            })?;
+        let Some(candidate) = candidate else {
+            return Ok(());
+        };
+        let (capture_state, active_generation) = self.ownership_summary();
+        self.publish_runtime(
+            RuntimePhase::Preparing,
+            capture_state,
+            self.observed_engine_state(),
+            active_generation,
+            None,
+        );
+        self.reload_prepared(candidate)
+    }
+
+    fn maintain_subscription_refresh(&mut self) {
+        if self.settle_pending_subscription_activation() {
+            return;
+        }
+        let completion = self
+            .subscription_refresh
+            .as_mut()
+            .and_then(SubscriptionRefreshRuntime::poll);
+        let Some(completion) = completion else {
+            if let Some(runtime) = self.subscription_refresh.as_mut() {
+                runtime.schedule_observed_refresh();
+                runtime.schedule_periodic(Instant::now());
+            }
+            return;
+        };
+        self.handle_subscription_refresh_completion(completion);
+    }
+
+    fn handle_subscription_refresh_completion(
+        &mut self,
+        completion: SubscriptionRefreshCompletion,
+    ) {
+        if let Some(terminal) = completion.terminal() {
+            match terminal {
+                Ok(report) => completion.respond(SubscriptionRefreshDecision::Accept(report)),
+                Err(error) => completion.respond(SubscriptionRefreshDecision::Reject(error)),
+            }
+            if let Some(runtime) = self.subscription_refresh.as_mut() {
+                runtime.schedule_periodic(Instant::now());
+            }
+            return;
+        }
+        let Some((source, cleanup_pending)) = completion.published() else {
+            completion.respond(SubscriptionRefreshDecision::Reject(
+                SubscriptionRefreshError::activation(
+                    "subscription worker returned no terminal result or published candidate",
+                ),
+            ));
+            return;
+        };
+        let source = source.clone();
+        let node_count = source.node_count();
+        if matches!(self.ownership, RuntimeOwnership::Stopped) {
+            if self.writer.accept_deferred_subscription(source) {
+                completion.respond(SubscriptionRefreshDecision::Accept(
+                    SubscriptionRefreshReport::updated_deferred(node_count, cleanup_pending),
+                ));
+            } else {
+                completion.respond(SubscriptionRefreshDecision::Reject(
+                    SubscriptionRefreshError::activation(
+                        "runtime writer cannot retain a deferred subscription snapshot",
+                    ),
+                ));
+            }
+            return;
+        }
+
+        let candidate = match self.writer.prepare_subscription(&source) {
+            Ok(Some(candidate)) => candidate,
+            Ok(None) => {
+                completion.respond(SubscriptionRefreshDecision::Reject(
+                    SubscriptionRefreshError::activation(
+                        "runtime writer does not support validated subscription preparation",
+                    ),
+                ));
+                return;
+            }
+            Err(source) => {
+                completion.respond(SubscriptionRefreshDecision::Reject(
+                    SubscriptionRefreshError::activation(
+                        runtime_writer_error(
+                            "prepare subscription-driven runtime Generation",
+                            source,
+                            "retain the active Generation and repair subscription preparation",
+                        )
+                        .to_string(),
+                    ),
+                ));
+                return;
+            }
+        };
+        let candidate_id = candidate.id;
+        let (capture_state, active_generation) = self.ownership_summary();
+        self.publish_runtime(
+            RuntimePhase::Preparing,
+            capture_state,
+            self.observed_engine_state(),
+            active_generation,
+            None,
+        );
+        match self.reload_prepared(candidate) {
+            Ok(()) => completion.respond(SubscriptionRefreshDecision::Accept(
+                SubscriptionRefreshReport::updated(
+                    u64::from(candidate_id.get()),
+                    node_count,
+                    cleanup_pending,
+                ),
+            )),
+            Err(error) => {
+                let failure = SubscriptionRefreshError::activation(error.to_string());
+                match self.subscription_activation_settlement(candidate_id) {
+                    SubscriptionActivationSettlement::Accepted => completion.respond(
+                        SubscriptionRefreshDecision::Accept(SubscriptionRefreshReport::updated(
+                            u64::from(candidate_id.get()),
+                            node_count,
+                            cleanup_pending,
+                        )),
+                    ),
+                    SubscriptionActivationSettlement::Pending => {
+                        self.pending_subscription_activation =
+                            Some(PendingSubscriptionActivation {
+                                completion,
+                                candidate: candidate_id,
+                                node_count,
+                                cleanup_pending,
+                                failure,
+                            });
+                    }
+                    SubscriptionActivationSettlement::Rejected => {
+                        completion.respond(SubscriptionRefreshDecision::Reject(failure));
+                    }
+                }
+            }
+        }
+    }
+
+    fn settle_pending_subscription_activation(&mut self) -> bool {
+        let Some(pending) = self.pending_subscription_activation.take() else {
+            return false;
+        };
+        match self.subscription_activation_settlement(pending.candidate) {
+            SubscriptionActivationSettlement::Accepted => {
+                pending
+                    .completion
+                    .respond(SubscriptionRefreshDecision::Accept(
+                        SubscriptionRefreshReport::updated(
+                            u64::from(pending.candidate.get()),
+                            pending.node_count,
+                            pending.cleanup_pending,
+                        ),
+                    ));
+                false
+            }
+            SubscriptionActivationSettlement::Pending => {
+                self.pending_subscription_activation = Some(pending);
+                true
+            }
+            SubscriptionActivationSettlement::Rejected => {
+                pending
+                    .completion
+                    .respond(SubscriptionRefreshDecision::Reject(pending.failure));
+                false
+            }
+        }
+    }
+
+    fn subscription_activation_settlement(
+        &self,
+        candidate: NonZeroU32,
+    ) -> SubscriptionActivationSettlement {
+        let runtime = self.runtime.snapshot();
+        if matches!(
+            &self.ownership,
+            RuntimeOwnership::Engine {
+                generation,
+                capture: CaptureObservation::Published,
+            } if generation.id == candidate
+        ) && runtime.phase == RuntimePhase::Running
+            && runtime.capture == RuntimeCaptureState::Published
+            && runtime.engine == RuntimeEngineState::Ready
+            && runtime.generation == Some(u64::from(candidate.get()))
+        {
+            return SubscriptionActivationSettlement::Accepted;
+        }
+        let candidate_owned = match &self.ownership {
+            RuntimeOwnership::Stopped => false,
+            RuntimeOwnership::Engine { generation, .. }
+            | RuntimeOwnership::CaptureRepairPending { generation }
+            | RuntimeOwnership::DetachPending { generation, .. }
+            | RuntimeOwnership::Retiring { generation, .. } => generation.id == candidate,
+        };
+        if candidate_owned {
+            SubscriptionActivationSettlement::Pending
+        } else {
+            SubscriptionActivationSettlement::Rejected
+        }
     }
 
     fn reconcile_capture_repair(
@@ -1611,6 +2117,7 @@ where
     }
 
     fn resync_active_addresses(&mut self) -> Result<(), ControlError> {
+        self.request_address_reconciliation();
         if self.functional_canary.mode() == FunctionalCanaryGateMode::StructuralOnlyCompatibility {
             return self.writer.resync_addresses().map_err(|source| {
                 runtime_writer_error(
@@ -1769,7 +2276,16 @@ where
     fn execute(&mut self, intent: &LegacyIntent) -> Result<(), ControlError> {
         let result = match *intent {
             LegacyIntent::Running { reason } => self.start(reason),
-            LegacyIntent::Reload { reason } => self.reload(reason),
+            LegacyIntent::Reload { reason } => {
+                let result = self.reload(reason);
+                if result.is_ok()
+                    && reason == Reason::ConfigChanged
+                    && let Some(runtime) = self.subscription_refresh.as_mut()
+                {
+                    runtime.request_observed_refresh();
+                }
+                result
+            }
             LegacyIntent::Stopped { .. } => self.stop(),
             LegacyIntent::ResyncAddresses { .. }
                 if !matches!(&self.ownership, RuntimeOwnership::Engine { .. }) =>
@@ -1784,6 +2300,12 @@ where
         result
     }
 
+    fn configuration_inputs_consumed(&mut self) {
+        if let Some(runtime) = self.subscription_refresh.as_mut() {
+            runtime.request_observed_refresh();
+        }
+    }
+
     fn maintenance_interval(&self) -> Option<Duration> {
         Some(self.maintenance_interval)
     }
@@ -1792,7 +2314,13 @@ where
         if let Err(error) = self.maintain_runtime() {
             self.publish_runtime_error(&error);
             eprintln!("Flux runtime maintenance failed: {error}");
+            return;
         }
+        if let Err(error) = self.maintain_address_reconciliation() {
+            self.publish_runtime_error(&error);
+            eprintln!("Flux address-driven Generation reconciliation failed: {error}");
+        }
+        self.maintain_subscription_refresh();
     }
 
     fn shutdown(&mut self) {
@@ -1982,12 +2510,17 @@ mod tests {
     use std::collections::VecDeque;
     use std::fs;
     use std::io;
+    use std::net::IpAddr;
     use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    use flux_core::{LegacyDispatcher, LegacyIntent, Reason};
+    use flux_core::{
+        InterfaceAddressFlags, InterfaceAddressRecord, InterfaceIndex, LegacyDispatcher,
+        LegacyIntent, NetworkInventoryTracker, Reason,
+    };
     use flux_platform::{ReadinessEvidence, SingBoxLaunchSpec, SingBoxLauncher, SingBoxReadiness};
 
     use super::*;
@@ -2001,7 +2534,623 @@ mod tests {
         CanaryAddressFamilies, CanaryCleanupStatus, CanaryErrorKind, CanaryNonce,
         CanarySocketObserverBinding, FUNCTIONAL_CANARY_NONCE_BYTES, UnqualifiedCanaryGateEvidence,
     };
+    use crate::generation_engine_config::{
+        TproxyEngineConfigRequest, compile_tproxy_engine_config,
+    };
     use crate::{EngineReport, OwnedEngineIdentity, RestartPolicy};
+
+    const PACKAGED_DESIRED_STATE: &str = include_str!("../../../conf/flux.toml");
+    const PACKAGED_ENGINE_TEMPLATE: &[u8] = include_bytes!("../../../conf/template.json");
+
+    #[test]
+    fn maintenance_reconciles_inventory_without_invoking_the_legacy_address_writer() {
+        let (directory, _process_writer, _output_path) = process_writer_fixture(false);
+        let desired_state_path = directory.path().join("flux/conf/flux.toml");
+        let (source, reconciler) = AddressReconciler::replay(desired_state_path);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let writer = ScriptedWriter {
+            events: Arc::clone(&events),
+            prepared: VecDeque::new(),
+            next_generation_id: 1,
+            capture_start_failure: false,
+            capture_stop_failures: 0,
+            verify_failure: false,
+        };
+        let engine = ScriptedEngine {
+            events: Arc::clone(&events),
+            reports: Arc::new(Mutex::new(VecDeque::new())),
+        };
+        let mut coordinator = RuntimeCoordinator::with_structural_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+        )
+        .with_address_reconciler(reconciler);
+        let mut tracker = NetworkInventoryTracker::new();
+        let interface = InterfaceIndex::new(7).expect("test interface index");
+        let address = InterfaceAddressRecord::new(
+            interface,
+            "8.8.8.8".parse::<IpAddr>().expect("test address"),
+            32,
+            InterfaceAddressFlags::from_bits(0),
+        )
+        .expect("test interface address");
+        let inventory = Arc::new(
+            tracker
+                .publish_complete([], [address])
+                .expect("publish replay inventory")
+                .clone(),
+        );
+        source.publish(Some(Arc::clone(&inventory)));
+
+        coordinator.maintain();
+
+        let current = coordinator
+            .address_reconciler
+            .as_ref()
+            .and_then(AddressReconciler::current)
+            .expect("maintenance reconciles the replay inventory");
+        assert_eq!(current.inventory(), inventory.as_ref());
+        assert_eq!(current.host_bypass().hosts().len(), 1);
+        assert!(
+            coordinator.address_reconciliation_pending,
+            "a reconciled snapshot must remain pending while runtime ownership is stopped"
+        );
+        assert!(
+            !events
+                .lock()
+                .expect("events lock")
+                .contains(&Event::AddressesResynchronized),
+            "observed inventory must not invoke the legacy address writer"
+        );
+
+        let fixture = EngineFixture::new();
+        coordinator.ownership = RuntimeOwnership::Engine {
+            generation: Box::new(PreparedGeneration::new(generation(1), fixture.spec.clone())),
+            capture: CaptureObservation::Published,
+        };
+        coordinator.publish_runtime(
+            RuntimePhase::Running,
+            RuntimeCaptureState::Published,
+            RuntimeEngineState::Ready,
+            Some(1),
+            None,
+        );
+        events.lock().expect("events lock").clear();
+
+        coordinator.maintain();
+
+        assert_eq!(
+            *events.lock().expect("events lock"),
+            [
+                Event::EngineRunning(CaptureObservation::Published),
+                Event::AddressSuccessorPrepared,
+            ]
+        );
+        assert!(!coordinator.address_reconciliation_pending);
+    }
+
+    #[test]
+    fn stopped_subscription_refresh_is_accepted_only_as_deferred_source() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let accepted = Arc::new(Mutex::new(None));
+        let writer = SubscriptionScriptedWriter::new(
+            ScriptedWriter {
+                events: Arc::clone(&events),
+                prepared: VecDeque::new(),
+                next_generation_id: 1,
+                capture_start_failure: false,
+                capture_stop_failures: 0,
+                verify_failure: false,
+            },
+            Arc::clone(&accepted),
+        );
+        let engine = ScriptedEngine {
+            events: Arc::clone(&events),
+            reports: Arc::new(Mutex::new(VecDeque::new())),
+        };
+        let mut coordinator = RuntimeCoordinator::with_structural_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+        );
+        let source = validated_subscription_config([41; 32], 7);
+        let (completion, decision) =
+            SubscriptionRefreshCompletion::published_for_test(source, true);
+
+        coordinator.handle_subscription_refresh_completion(completion);
+
+        let report = match decision
+            .recv_timeout(Duration::from_secs(1))
+            .expect("decision")
+        {
+            SubscriptionRefreshDecision::Accept(report) => report,
+            SubscriptionRefreshDecision::Reject(error) => {
+                panic!("deferred refresh was rejected: {error}")
+            }
+        };
+        assert_eq!(
+            report.disposition(),
+            crate::subscription::SubscriptionRefreshDisposition::UpdatedDeferred
+        );
+        assert_eq!(report.node_count(), Some(7));
+        assert!(report.cleanup_pending());
+        assert_eq!(
+            *accepted.lock().expect("accepted source lock"),
+            Some([41; 32])
+        );
+        assert_eq!(
+            *events.lock().expect("events lock"),
+            [Event::SubscriptionDeferred]
+        );
+    }
+
+    #[test]
+    fn running_subscription_refresh_commits_only_the_verified_successor() {
+        let active = EngineFixture::new();
+        let candidate = EngineFixture::new();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let accepted = Arc::new(Mutex::new(Some([40; 32])));
+        let writer = SubscriptionScriptedWriter::new(
+            ScriptedWriter {
+                events: Arc::clone(&events),
+                prepared: VecDeque::from([active.spec.clone(), candidate.spec.clone()]),
+                next_generation_id: 1,
+                capture_start_failure: false,
+                capture_stop_failures: 0,
+                verify_failure: false,
+            },
+            Arc::clone(&accepted),
+        );
+        let engine = ScriptedEngine {
+            events: Arc::clone(&events),
+            reports: Arc::new(Mutex::new(VecDeque::new())),
+        };
+        let mut coordinator = RuntimeCoordinator::with_structural_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+        );
+        coordinator
+            .execute(&LegacyIntent::Running {
+                reason: Reason::Boot,
+            })
+            .expect("initial Generation");
+        events.lock().expect("events lock").clear();
+        let source = validated_subscription_config([42; 32], 8);
+        let (completion, decision) =
+            SubscriptionRefreshCompletion::published_for_test(source, false);
+
+        coordinator.handle_subscription_refresh_completion(completion);
+
+        let report = match decision
+            .recv_timeout(Duration::from_secs(1))
+            .expect("decision")
+        {
+            SubscriptionRefreshDecision::Accept(report) => report,
+            SubscriptionRefreshDecision::Reject(error) => {
+                panic!("running refresh was rejected: {error}")
+            }
+        };
+        assert_eq!(
+            report.disposition(),
+            crate::subscription::SubscriptionRefreshDisposition::Updated
+        );
+        assert_eq!(report.generation(), Some(2));
+        assert_eq!(report.node_count(), Some(8));
+        assert_eq!(
+            *accepted.lock().expect("accepted source lock"),
+            Some([42; 32])
+        );
+        assert_eq!(
+            *events.lock().expect("events lock"),
+            [
+                Event::SubscriptionPrepared,
+                Event::Prepared(Reason::ConfigChanged),
+                Event::CaptureStopped,
+                Event::EngineRunning(CaptureObservation::Detached),
+                Event::CaptureStarted,
+                Event::CaptureVerified,
+                Event::Published(PublishedRuntimeState::Running {
+                    generation: generation(2),
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_subscription_activation_restores_prior_generation_before_rejection() {
+        let active = EngineFixture::new();
+        let candidate = EngineFixture::new();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let accepted = Arc::new(Mutex::new(Some([43; 32])));
+        let mut writer = SubscriptionScriptedWriter::new(
+            ScriptedWriter {
+                events: Arc::clone(&events),
+                prepared: VecDeque::from([candidate.spec.clone()]),
+                next_generation_id: 2,
+                capture_start_failure: false,
+                capture_stop_failures: 0,
+                verify_failure: false,
+            },
+            Arc::clone(&accepted),
+        );
+        writer.fail_capture_start_on = Some(1);
+        let engine = ScriptedEngine {
+            events: Arc::clone(&events),
+            reports: Arc::new(Mutex::new(VecDeque::new())),
+        };
+        let mut coordinator = RuntimeCoordinator::with_structural_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+        );
+        coordinator.ownership = RuntimeOwnership::Engine {
+            generation: Box::new(PreparedGeneration::new(generation(1), active.spec.clone())),
+            capture: CaptureObservation::Published,
+        };
+        coordinator.publish_runtime(
+            RuntimePhase::Running,
+            RuntimeCaptureState::Published,
+            RuntimeEngineState::Ready,
+            Some(1),
+            None,
+        );
+        let source = validated_subscription_config([44; 32], 9);
+        let (completion, decision) =
+            SubscriptionRefreshCompletion::published_for_test(source, false);
+
+        coordinator.handle_subscription_refresh_completion(completion);
+
+        let error = match decision
+            .recv_timeout(Duration::from_secs(1))
+            .expect("decision")
+        {
+            SubscriptionRefreshDecision::Accept(report) => {
+                panic!("failed refresh was accepted: {report:?}")
+            }
+            SubscriptionRefreshDecision::Reject(error) => error,
+        };
+        assert_eq!(
+            error.kind(),
+            crate::subscription::SubscriptionRefreshErrorKind::Activation
+        );
+        assert_eq!(
+            *accepted.lock().expect("accepted source lock"),
+            Some([43; 32])
+        );
+        assert!(matches!(
+            coordinator.ownership,
+            RuntimeOwnership::Engine {
+                generation: active_generation,
+                capture: CaptureObservation::Published,
+            } if active_generation.id == generation(1)
+        ));
+        assert!(matches!(
+            events.lock().expect("events lock").last(),
+            Some(Event::Published(PublishedRuntimeState::Running { generation: id }))
+                if *id == generation(1)
+        ));
+    }
+
+    #[test]
+    fn failed_runtime_maintenance_blocks_address_replacement_until_runtime_recovers() {
+        let fixture = EngineFixture::new();
+        let (directory, _process_writer, _output_path) = process_writer_fixture(false);
+        let desired_state_path = directory.path().join("flux/conf/flux.toml");
+        let (source, reconciler) = AddressReconciler::replay(desired_state_path);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let writer = ScriptedWriter {
+            events: Arc::clone(&events),
+            prepared: VecDeque::from([fixture.spec.clone()]),
+            next_generation_id: 1,
+            capture_start_failure: false,
+            capture_stop_failures: 0,
+            verify_failure: false,
+        };
+        let engine = RequiredScriptedEngine::new(
+            Arc::clone(&events),
+            std::iter::empty::<Arc<EngineSnapshot>>(),
+        );
+        let mut coordinator = RuntimeCoordinator::with_structural_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+        )
+        .with_address_reconciler(reconciler);
+        coordinator
+            .execute(&LegacyIntent::Running {
+                reason: Reason::Boot,
+            })
+            .expect("initial runtime converges");
+        coordinator.engine.fail_next_running = true;
+
+        let mut tracker = NetworkInventoryTracker::new();
+        let interface = InterfaceIndex::new(7).expect("test interface index");
+        let address = InterfaceAddressRecord::new(
+            interface,
+            "8.8.4.4".parse::<IpAddr>().expect("test address"),
+            32,
+            InterfaceAddressFlags::from_bits(0),
+        )
+        .expect("test interface address");
+        source.publish(Some(Arc::new(
+            tracker
+                .publish_complete([], [address])
+                .expect("publish replay inventory")
+                .clone(),
+        )));
+        events.lock().expect("events lock").clear();
+
+        coordinator.maintain();
+
+        assert_eq!(
+            *events.lock().expect("events lock"),
+            [Event::EngineRunning(CaptureObservation::Published)]
+        );
+        assert!(
+            coordinator
+                .address_reconciler
+                .as_ref()
+                .and_then(AddressReconciler::current)
+                .is_none(),
+            "failed runtime maintenance must leave the inventory update unconsumed"
+        );
+
+        events.lock().expect("events lock").clear();
+        coordinator.maintain();
+
+        assert_eq!(
+            *events.lock().expect("events lock"),
+            [
+                Event::EngineRunning(CaptureObservation::Published),
+                Event::AddressSuccessorPrepared,
+            ]
+        );
+    }
+
+    #[test]
+    fn process_writer_publishes_and_binds_the_canonical_engine_config() {
+        let (directory, mut writer, output_path) = process_writer_fixture(false);
+
+        let prepared = writer.prepare(Reason::Boot).expect("prepared Generation");
+
+        assert_eq!(prepared.id.get(), 1);
+        assert_eq!(
+            prepared.spec.process().config,
+            directory.path().join("flux/run/generations/1/config.json")
+        );
+        assert_eq!(
+            fs::read(&output_path).expect("canonical shared config"),
+            fs::read(&prepared.spec.process().config).expect("immutable Generation config")
+        );
+        let bridge_environment =
+            fs::read_to_string(directory.path().join("flux/run/desired-state.env"))
+                .expect("Rust-owned bridge environment");
+        assert!(bridge_environment.contains("ENGINE_BINARY='"));
+        assert!(bridge_environment.contains("PROXY_PORT='1536'"));
+        assert!(!bridge_environment.contains("KFEAT_"));
+        assert_eq!(
+            prepared.spec.process().readiness,
+            SingBoxReadiness::Listener {
+                port: NonZeroU16::new(1536).unwrap(),
+            }
+        );
+    }
+
+    #[test]
+    fn process_writer_commits_subscription_source_only_after_running_publication() {
+        let (directory, mut writer, output_path) = process_writer_fixture(false);
+        replace_process_writer_desired_state(&directory, "enabled = false", "enabled = true");
+        let desired_state_path = directory.path().join("flux/conf/flux.toml");
+        let desired_state = FluxConfig::load(&desired_state_path).expect("enabled Desired State");
+        let template = fs::read(desired_state.engine().template()).expect("engine template");
+        let first_artifact = compile_tproxy_engine_config(TproxyEngineConfigRequest::new(
+            &template,
+            desired_state.listener().port(),
+        ))
+        .expect("first subscription artifact");
+        let first_source = ValidatedSubscriptionEngineConfig::for_test(
+            desired_state.clone(),
+            first_artifact,
+            [51; 32],
+            4,
+        );
+
+        let first = writer
+            .prepare_subscription(&first_source)
+            .expect("prepare first subscription")
+            .expect("process writer supports subscriptions");
+
+        assert!(writer.accepted_subscription.is_none());
+        assert_eq!(fs::read(&output_path).unwrap(), first_source.bytes());
+        writer.commit_pending_subscription(PublishedRuntimeState::Running {
+            generation: first.id,
+        });
+        assert_eq!(
+            writer
+                .accepted_subscription
+                .as_ref()
+                .map(ValidatedSubscriptionEngineConfig::snapshot_digest),
+            Some([51; 32])
+        );
+
+        let second_artifact = compile_tproxy_engine_config(TproxyEngineConfigRequest::new(
+            &template,
+            desired_state.listener().port(),
+        ))
+        .expect("second subscription artifact");
+        let second_source = ValidatedSubscriptionEngineConfig::for_test(
+            desired_state,
+            second_artifact,
+            [52; 32],
+            5,
+        );
+        fs::remove_file(directory.path().join("flux/run/generations/1/config.json"))
+            .expect("reset fixed-generation process-writer fixture");
+        writer
+            .prepare_subscription(&second_source)
+            .expect("prepare second subscription")
+            .expect("process writer supports subscriptions");
+        assert_eq!(
+            writer
+                .accepted_subscription
+                .as_ref()
+                .map(ValidatedSubscriptionEngineConfig::snapshot_digest),
+            Some([51; 32])
+        );
+
+        writer.commit_pending_subscription(PublishedRuntimeState::Failed);
+
+        assert_eq!(
+            writer
+                .accepted_subscription
+                .as_ref()
+                .map(ValidatedSubscriptionEngineConfig::snapshot_digest),
+            Some([51; 32])
+        );
+    }
+
+    #[test]
+    fn process_writer_rejects_shell_drift_from_the_canonical_engine_config() {
+        let (_directory, mut writer, _output_path) = process_writer_fixture(true);
+
+        let error = match writer.prepare(Reason::Boot) {
+            Ok(_) => panic!("shell-modified Generation config must fail binding"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, ProcessRuntimeWriterError::Binding(_)));
+    }
+
+    #[test]
+    fn process_writer_rejects_shell_drift_from_the_desired_engine_binary() {
+        let (directory, mut writer, _output_path) = process_writer_fixture(false);
+        let replacement_binary = directory.path().join("flux/bin/sing-box-next");
+        fs::write(&replacement_binary, b"next sing-box fixture\n")
+            .expect("write replacement engine binary");
+        replace_process_writer_desired_state(
+            &directory,
+            directory
+                .path()
+                .join("flux/bin/sing-box")
+                .to_str()
+                .expect("UTF-8 original binary path"),
+            replacement_binary
+                .to_str()
+                .expect("UTF-8 replacement binary path"),
+        );
+
+        let error = match writer.prepare(Reason::Boot) {
+            Ok(_) => panic!("shell-selected engine binary must match Desired State"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            ProcessRuntimeWriterError::DesiredStateBinding(DesiredStateEngineBindingError::Binary)
+        ));
+    }
+
+    #[test]
+    fn process_writer_rejects_shell_drift_from_the_startup_timeout() {
+        let (directory, mut writer, _output_path) = process_writer_fixture(false);
+        replace_process_writer_desired_state(
+            &directory,
+            "startup_timeout_ms = 5000",
+            "startup_timeout_ms = 6000",
+        );
+
+        let error = match writer.prepare(Reason::Boot) {
+            Ok(_) => panic!("shell startup timeout must match Desired State"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            ProcessRuntimeWriterError::DesiredStateBinding(
+                DesiredStateEngineBindingError::StartupTimeout
+            )
+        ));
+    }
+
+    #[test]
+    fn process_writer_rejects_shell_drift_from_the_stop_timeout() {
+        let (directory, mut writer, _output_path) = process_writer_fixture(false);
+        replace_process_writer_desired_state(
+            &directory,
+            "stop_timeout_ms = 5000",
+            "stop_timeout_ms = 6000",
+        );
+
+        let error = match writer.prepare(Reason::Boot) {
+            Ok(_) => panic!("shell stop timeout must match Desired State"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            ProcessRuntimeWriterError::DesiredStateBinding(
+                DesiredStateEngineBindingError::StopTimeout
+            )
+        ));
+    }
+
+    #[test]
+    fn process_writer_rejects_shell_drift_from_the_launch_identity() {
+        let (directory, mut writer, _output_path) = process_writer_fixture(false);
+        replace_process_writer_desired_state(&directory, "runtime_uid = 0", "runtime_uid = 1000");
+        replace_process_writer_desired_state(&directory, "runtime_gid = 0", "runtime_gid = 1000");
+
+        let error = match writer.prepare(Reason::Boot) {
+            Ok(_) => panic!("shell launch identity must match Desired State"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            ProcessRuntimeWriterError::DesiredStateBinding(
+                DesiredStateEngineBindingError::Launcher
+            )
+        ));
+    }
+
+    #[test]
+    fn process_writer_applies_the_current_desired_state_restart_policy() {
+        let (directory, mut writer, _output_path) = process_writer_fixture(false);
+        let desired_state_path = directory.path().join("flux/conf/flux.toml");
+        let desired_state = fs::read_to_string(&desired_state_path)
+            .expect("read process-writer Desired State")
+            .replacen("restart_max_attempts = 3", "restart_max_attempts = 7", 1)
+            .replacen("restart_window_ms = 60000", "restart_window_ms = 45000", 1)
+            .replacen(
+                "restart_initial_backoff_ms = 1000",
+                "restart_initial_backoff_ms = 1500",
+                1,
+            )
+            .replacen(
+                "restart_maximum_backoff_ms = 30000",
+                "restart_maximum_backoff_ms = 12000",
+                1,
+            )
+            .replacen(
+                "restart_stable_reset_ms = 30000",
+                "restart_stable_reset_ms = 20000",
+                1,
+            );
+        fs::write(&desired_state_path, desired_state).expect("update restart policy");
+
+        let prepared = writer
+            .prepare(Reason::ConfigChanged)
+            .expect("prepared reload");
+        let restart = prepared.spec.restart_policy();
+
+        assert_eq!(restart.max_attempts(), 7);
+        assert_eq!(restart.window(), Duration::from_millis(45_000));
+        assert_eq!(restart.initial_backoff(), Duration::from_millis(1_500));
+        assert_eq!(restart.maximum_backoff(), Duration::from_millis(12_000));
+        assert_eq!(restart.stable_reset(), Duration::from_millis(20_000));
+    }
 
     #[test]
     fn start_orders_prepare_engine_capture_verify_and_publication() {
@@ -4321,7 +5470,140 @@ mod tests {
         CanaryExecuted(NonZeroU32),
         CanaryReobserved(NonZeroU32),
         AddressesResynchronized,
+        AddressSuccessorPrepared,
+        SubscriptionPrepared,
+        SubscriptionDeferred,
         Published(PublishedRuntimeState),
+    }
+
+    fn validated_subscription_config(
+        snapshot_digest: [u8; 32],
+        node_count: u32,
+    ) -> ValidatedSubscriptionEngineConfig {
+        let desired_state = FluxConfig::parse(PACKAGED_DESIRED_STATE)
+            .expect("packaged subscription test Desired State");
+        let artifact = compile_tproxy_engine_config(TproxyEngineConfigRequest::new(
+            PACKAGED_ENGINE_TEMPLATE,
+            desired_state.listener().port(),
+        ))
+        .expect("subscription test artifact");
+        ValidatedSubscriptionEngineConfig::for_test(
+            desired_state,
+            artifact,
+            snapshot_digest,
+            node_count,
+        )
+    }
+
+    fn process_writer_fixture(
+        rewrite_generation_config: bool,
+    ) -> (tempfile::TempDir, ProcessRuntimeWriter, PathBuf) {
+        let directory = tempfile::tempdir().expect("process writer fixture");
+        let root = directory.path().join("flux");
+        let conf = root.join("conf");
+        let run = root.join("run");
+        let generation = run.join("generations/1");
+        let bin = root.join("bin");
+        let scripts = root.join("scripts");
+        for path in [&conf, &run, &bin, &scripts] {
+            fs::create_dir_all(path).expect("create process writer directory");
+        }
+        let binary_path = bin.join("sing-box");
+        let template_path = conf.join("template.json");
+        let desired_state_path = conf.join("flux.toml");
+        let output_path = conf.join("config.json");
+        let bridge_environment_path = run.join("desired-state.env");
+        let manifest_path = run.join("engine.manifest");
+        let dispatcher_path = scripts.join("dispatcher");
+        fs::write(&binary_path, b"sing-box fixture\n").expect("write engine binary");
+        fs::write(
+            &template_path,
+            br#"{
+                "dns":{"servers":[{"type":"fakeip","inet4_range":"198.18.0.0/15","inet6_range":"fc00::/18"}]},
+                "inbounds":[{"type":"tun","tag":"removed"}],
+                "log":{"level":"warn"}
+            }"#,
+        )
+        .expect("write engine template");
+        let desired_state = PACKAGED_DESIRED_STATE
+            .replacen(
+                "/data/adb/flux/bin/sing-box",
+                binary_path.to_str().expect("UTF-8 binary path"),
+                1,
+            )
+            .replacen(
+                "/data/adb/flux/conf/template.json",
+                template_path.to_str().expect("UTF-8 template path"),
+                1,
+            );
+        fs::write(&desired_state_path, desired_state).expect("write Desired State");
+
+        let rewrite = if rewrite_generation_config {
+            "chmod u+w \"${generation_dir}/config.json\"\n\
+             printf ' ' >>\"${generation_dir}/config.json\"\n"
+        } else {
+            ""
+        };
+        let dispatcher = format!(
+            "#!/bin/sh\nset -eu\n\
+             [ \"${{1:-}}\" = prepare ] || exit 64\n\
+             generation_dir='{}'\n\
+             mkdir -p \"${{generation_dir}}\"\n\
+             cp '{}' \"${{generation_dir}}/config.json\"\n\
+             {}\
+             cat >'{}' <<'EOF'\n\
+             FLUX_ENGINE_MANIFEST_V1\n\
+             generation=1\n\
+             binary={}\n\
+             config={}/config.json\n\
+             working_directory={}\n\
+             log={}/sing-box.log\n\
+             launcher=direct\n\
+             readiness=listener\n\
+             startup_timeout_ms=5000\n\
+             stop_timeout_ms=5000\n\
+             listener_port=1536\n\
+             EOF\n",
+            generation.display(),
+            output_path.display(),
+            rewrite,
+            manifest_path.display(),
+            binary_path.display(),
+            generation.display(),
+            run.display(),
+            generation.display(),
+        );
+        fs::write(&dispatcher_path, dispatcher).expect("write dispatcher");
+        let mut permissions = fs::metadata(&dispatcher_path)
+            .expect("dispatcher metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&dispatcher_path, permissions).expect("make dispatcher executable");
+
+        let writer = ProcessRuntimeWriter::new(
+            PhaseDispatcherPaths {
+                shell: PathBuf::from("/bin/sh"),
+                shell_args: Vec::new(),
+                dispatcher: dispatcher_path,
+            },
+            manifest_path,
+            desired_state_path,
+            &output_path,
+            bridge_environment_path,
+        );
+        (directory, writer, output_path)
+    }
+
+    fn replace_process_writer_desired_state(directory: &tempfile::TempDir, from: &str, to: &str) {
+        let desired_state_path = directory.path().join("flux/conf/flux.toml");
+        let desired_state =
+            fs::read_to_string(&desired_state_path).expect("read process-writer Desired State");
+        assert!(
+            desired_state.contains(from),
+            "process-writer Desired State must contain replacement source"
+        );
+        fs::write(&desired_state_path, desired_state.replacen(from, to, 1))
+            .expect("update process-writer Desired State");
     }
 
     fn generation(value: u32) -> NonZeroU32 {
@@ -4347,6 +5629,100 @@ mod tests {
         inner: ScriptedWriter,
         capture_start_calls: usize,
         capture_stop_calls: usize,
+    }
+
+    struct SubscriptionScriptedWriter {
+        inner: ScriptedWriter,
+        accepted: Arc<Mutex<Option<[u8; 32]>>>,
+        pending: Option<[u8; 32]>,
+        capture_start_calls: usize,
+        fail_capture_start_on: Option<usize>,
+    }
+
+    impl SubscriptionScriptedWriter {
+        fn new(inner: ScriptedWriter, accepted: Arc<Mutex<Option<[u8; 32]>>>) -> Self {
+            Self {
+                inner,
+                accepted,
+                pending: None,
+                capture_start_calls: 0,
+                fail_capture_start_on: None,
+            }
+        }
+    }
+
+    impl LegacyRuntimeWriter for SubscriptionScriptedWriter {
+        type Error = io::Error;
+
+        fn prepare(&mut self, reason: Reason) -> Result<PreparedGeneration, Self::Error> {
+            self.inner.prepare(reason)
+        }
+
+        fn prepare_subscription(
+            &mut self,
+            source: &ValidatedSubscriptionEngineConfig,
+        ) -> Result<Option<PreparedGeneration>, Self::Error> {
+            self.inner
+                .events
+                .lock()
+                .expect("events lock")
+                .push(Event::SubscriptionPrepared);
+            let prepared = self.inner.prepare(Reason::ConfigChanged)?;
+            self.pending = Some(source.snapshot_digest());
+            Ok(Some(prepared))
+        }
+
+        fn accept_deferred_subscription(
+            &mut self,
+            source: ValidatedSubscriptionEngineConfig,
+        ) -> bool {
+            self.inner
+                .events
+                .lock()
+                .expect("events lock")
+                .push(Event::SubscriptionDeferred);
+            *self.accepted.lock().expect("accepted source lock") = Some(source.snapshot_digest());
+            true
+        }
+
+        fn capture_start(&mut self, generation: &PreparedGeneration) -> Result<(), Self::Error> {
+            self.inner.capture_start(generation)?;
+            self.capture_start_calls += 1;
+            if self.fail_capture_start_on == Some(self.capture_start_calls) {
+                Err(io::Error::other(
+                    "injected subscription capture publication failure",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn capture_stop(&mut self) -> Result<(), Self::Error> {
+            self.inner.capture_stop()
+        }
+
+        fn verify_capture(&mut self, generation: &PreparedGeneration) -> Result<(), Self::Error> {
+            self.inner.verify_capture(generation)
+        }
+
+        fn publish(&mut self, phase: PublishedRuntimeState) -> Result<(), Self::Error> {
+            self.inner.publish(phase)?;
+            match phase {
+                PublishedRuntimeState::Running { .. } => {
+                    if let Some(pending) = self.pending.take() {
+                        *self.accepted.lock().expect("accepted source lock") = Some(pending);
+                    }
+                }
+                PublishedRuntimeState::Stopped | PublishedRuntimeState::Failed => {
+                    self.pending = None;
+                }
+            }
+            Ok(())
+        }
+
+        fn resync_addresses(&mut self) -> Result<(), Self::Error> {
+            self.inner.resync_addresses()
+        }
     }
 
     impl LegacyRuntimeWriter for CandidateActivationFailingWriter {
@@ -4446,6 +5822,17 @@ mod tests {
                 .pop_front()
                 .ok_or_else(|| io::Error::other("no scripted generation remains"))?;
             Ok(PreparedGeneration { id, spec })
+        }
+
+        fn prepare_address_successor(
+            &mut self,
+            _inputs: &crate::generation_engine_config::AddressReconciledGenerationInputs,
+        ) -> Result<Option<PreparedGeneration>, Self::Error> {
+            self.events
+                .lock()
+                .expect("events lock")
+                .push(Event::AddressSuccessorPrepared);
+            Ok(None)
         }
 
         fn capture_start(&mut self, _generation: &PreparedGeneration) -> Result<(), Self::Error> {

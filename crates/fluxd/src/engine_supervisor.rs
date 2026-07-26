@@ -349,6 +349,12 @@ impl EngineSpec {
     }
 
     #[must_use]
+    pub(crate) fn with_restart_policy(mut self, restart: RestartPolicy) -> Self {
+        self.restart = restart;
+        self
+    }
+
+    #[must_use]
     pub const fn binary_digest(&self) -> EngineArtifactDigest {
         self.artifacts.binary()
     }
@@ -387,6 +393,22 @@ impl EngineSpec {
             .reverify()
             .map_err(|source| EngineCapabilityProbeError::Artifact { source })?;
         Ok(engine_capability_probe_report(self.artifacts, version))
+    }
+
+    /// Validate this exact configuration through pinned binary, config, and launcher descriptors.
+    pub(crate) fn validate_configuration(&self) -> Result<(), EngineCapabilityProbeError> {
+        let opened = self
+            .open_verified_artifacts()
+            .map_err(|source| EngineCapabilityProbeError::Artifact { source })?;
+        let prepared = opened
+            .pin()
+            .map_err(|source| EngineCapabilityProbeError::Process { source })?;
+        SingBoxProcessAdapter
+            .validate_pinned(&prepared.pinned, &self.process)
+            .map_err(|source| EngineCapabilityProbeError::Process { source })?;
+        prepared
+            .reverify()
+            .map_err(|source| EngineCapabilityProbeError::Artifact { source })
     }
 
     fn open_verified_artifacts(&self) -> Result<OpenedEngineArtifacts, EngineSpecError> {

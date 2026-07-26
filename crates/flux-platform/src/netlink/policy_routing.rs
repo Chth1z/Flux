@@ -271,6 +271,121 @@ impl ManagedPolicyRoutingIdentity {
     pub(crate) const fn rule(self) -> ManagedFwmarkRuleIdentity {
         self.rule
     }
+
+    pub(crate) fn from_recovery(
+        record: ManagedPolicyRoutingRecoveryRecord,
+    ) -> Result<Self, ManagedPolicyRoutingIdentityError> {
+        if record.loopback_name.as_bytes() != b"lo" {
+            return Err(
+                ManagedPolicyRoutingIdentityError::LoopbackInterfaceMismatch {
+                    actual: record.loopback_name,
+                },
+            );
+        }
+        if record.destination != RoutePrefix::unspecified(record.family) {
+            return Err(ManagedPolicyRoutingIdentityError::DestinationNotDefault);
+        }
+        let expected_scope = canonical_route_scope(record.family);
+        if record.route_scope != expected_scope {
+            return Err(ManagedPolicyRoutingIdentityError::NonCanonicalRouteScope {
+                expected: expected_scope,
+                actual: record.route_scope,
+            });
+        }
+        if record.route_type.raw() != RTN_LOCAL {
+            return Err(ManagedPolicyRoutingIdentityError::NonLocalRouteType {
+                actual: record.route_type,
+            });
+        }
+        if record.output_interface != record.loopback_index {
+            return Err(ManagedPolicyRoutingIdentityError::InvalidRecovery(
+                "route output interface differs from the bound loopback index",
+            ));
+        }
+        if record.route_table != record.rule_table {
+            return Err(ManagedPolicyRoutingIdentityError::InvalidRecovery(
+                "route and rule tables differ",
+            ));
+        }
+        if matches!(record.route_table.get(), 0 | 252 | 253 | 254 | 255) {
+            return Err(ManagedPolicyRoutingIdentityError::InvalidRecovery(
+                "managed table is reserved",
+            ));
+        }
+        if record.route_protocol.raw() == 0 || record.rule_protocol.raw() == 0 {
+            return Err(ManagedPolicyRoutingIdentityError::InvalidRecovery(
+                "managed route and rule protocols must be nonzero",
+            ));
+        }
+        if record.rule_priority.get() == 0 {
+            return Err(ManagedPolicyRoutingIdentityError::InvalidRecovery(
+                "managed rule priority must be nonzero",
+            ));
+        }
+        let loopback = ManagedInterfaceIdentity {
+            name: record.loopback_name,
+            index: record.loopback_index,
+        };
+        Ok(Self {
+            family: record.family,
+            loopback,
+            route: ManagedLocalRouteIdentity {
+                family: record.family,
+                destination: record.destination,
+                table: record.route_table,
+                protocol: record.route_protocol,
+                scope: record.route_scope,
+                route_type: record.route_type,
+                metric: record.route_metric,
+                output_interface: record.output_interface,
+            },
+            rule: ManagedFwmarkRuleIdentity {
+                family: record.family,
+                priority: record.rule_priority,
+                table: record.rule_table,
+                mark: record.mark,
+                protocol: record.rule_protocol,
+            },
+        })
+    }
+
+    #[must_use]
+    pub(crate) const fn recovery_record(self) -> ManagedPolicyRoutingRecoveryRecord {
+        ManagedPolicyRoutingRecoveryRecord {
+            family: self.family,
+            loopback_name: self.loopback.name,
+            loopback_index: self.loopback.index,
+            destination: self.route.destination,
+            route_table: self.route.table,
+            route_protocol: self.route.protocol,
+            route_scope: self.route.scope,
+            route_type: self.route.route_type,
+            route_metric: self.route.metric,
+            output_interface: self.route.output_interface,
+            rule_priority: self.rule.priority,
+            rule_table: self.rule.table,
+            mark: self.rule.mark,
+            rule_protocol: self.rule.protocol,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ManagedPolicyRoutingRecoveryRecord {
+    pub(crate) family: NetworkAddressFamily,
+    pub(crate) loopback_name: InterfaceName,
+    pub(crate) loopback_index: InterfaceIndex,
+    pub(crate) destination: RoutePrefix,
+    pub(crate) route_table: RouteTableId,
+    pub(crate) route_protocol: RouteProtocol,
+    pub(crate) route_scope: RouteScope,
+    pub(crate) route_type: RouteType,
+    pub(crate) route_metric: NonZeroU32,
+    pub(crate) output_interface: InterfaceIndex,
+    pub(crate) rule_priority: RulePriority,
+    pub(crate) rule_table: RouteTableId,
+    pub(crate) mark: RuleFwMark,
+    pub(crate) rule_protocol: RuleProtocol,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -286,6 +401,7 @@ pub(crate) enum ManagedPolicyRoutingIdentityError {
     LoopbackInterfaceMismatch {
         actual: InterfaceName,
     },
+    InvalidRecovery(&'static str),
 }
 
 impl fmt::Display for ManagedPolicyRoutingIdentityError {
@@ -310,6 +426,12 @@ impl fmt::Display for ManagedPolicyRoutingIdentityError {
                 "managed local route interface {:?} is not loopback 'lo'",
                 actual.as_bytes()
             ),
+            Self::InvalidRecovery(reason) => {
+                write!(
+                    formatter,
+                    "invalid recovered policy-routing identity: {reason}"
+                )
+            }
         }
     }
 }

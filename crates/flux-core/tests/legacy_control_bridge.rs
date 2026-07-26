@@ -1,11 +1,11 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use flux_core::{
-    AdministrativeState, ConfigurationChangeReport, ControlError, LegacyControlBridge,
-    LegacyDispatcher, LegacyIntent, OperationReport, Reason,
+    AdministrativeState, ConfigurationChangeReport, ControlError, ControlObservation,
+    LegacyControlBridge, LegacyDispatcher, LegacyIntent, OperationReport, Reason,
 };
 
 #[test]
@@ -251,6 +251,157 @@ fn maintenance_and_shutdown_share_the_serialized_writer() {
     }
 }
 
+#[test]
+fn observations_coalesce_without_blocking_or_dropping_when_the_queue_is_full() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(0);
+    let bridge = LegacyControlBridge::start(
+        BlockingRecordingDispatcher {
+            calls: Arc::clone(&calls),
+            entered_tx: Some(entered_tx),
+            release_rx,
+        },
+        1,
+    )
+    .expect("start bridge");
+    let first = bridge
+        .submit(LegacyIntent::ResyncAddresses {
+            reason: Reason::Fluxctl,
+        })
+        .expect("accept blocking operation");
+    entered_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("writer enters blocking operation");
+    let queued = bridge
+        .submit(LegacyIntent::ResyncAddresses {
+            reason: Reason::Fluxctl,
+        })
+        .expect("fill bounded writer queue");
+
+    let ingress = bridge.observation_ingress().expect("observation ingress");
+    ingress
+        .submit(ControlObservation::ConfigurationInputsChanged)
+        .expect("coalesce configuration observation behind full queue");
+    ingress
+        .submit(ControlObservation::DisableStateChanged { disabled: true })
+        .expect("coalesce initial disable observation");
+    ingress
+        .submit(ControlObservation::DisableStateChanged { disabled: false })
+        .expect("latest disable state replaces the stale observation");
+
+    release_tx.send(()).expect("release writer");
+    first.wait().expect("first operation succeeds");
+    queued.wait().expect("queued operation succeeds");
+
+    assert_eq!(
+        calls.lock().expect("calls lock").as_slice(),
+        &[
+            LegacyIntent::ResyncAddresses {
+                reason: Reason::Fluxctl,
+            },
+            LegacyIntent::Running {
+                reason: Reason::DisableRemoved,
+            },
+            LegacyIntent::ResyncAddresses {
+                reason: Reason::Fluxctl,
+            },
+        ]
+    );
+    assert_eq!(
+        bridge.snapshot().administrative_state,
+        AdministrativeState::Running
+    );
+}
+
+#[test]
+fn observed_configuration_change_is_deferred_while_stopped() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let bridge = LegacyControlBridge::start(
+        RecordingDispatcher {
+            calls: Arc::clone(&calls),
+        },
+        2,
+    )
+    .expect("start bridge");
+    bridge
+        .submit(LegacyIntent::Stopped {
+            reason: Reason::Fluxctl,
+        })
+        .expect("accept stop")
+        .wait()
+        .expect("stop succeeds");
+
+    bridge
+        .observation_ingress()
+        .expect("observation ingress")
+        .submit(ControlObservation::ConfigurationInputsChanged)
+        .expect("submit asynchronous configuration observation");
+    wait_until(Duration::from_secs(1), || {
+        bridge.snapshot().configuration_dirty
+    });
+
+    assert_eq!(
+        calls.lock().expect("calls lock").as_slice(),
+        &[LegacyIntent::Stopped {
+            reason: Reason::Fluxctl,
+        }]
+    );
+}
+
+#[test]
+fn observed_configuration_consumed_by_disable_removal_notifies_the_dispatcher_once() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let consumptions = Arc::new(AtomicUsize::new(0));
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(0);
+    let bridge = LegacyControlBridge::start(
+        ConfigurationConsumptionDispatcher {
+            calls: Arc::clone(&calls),
+            consumptions: Arc::clone(&consumptions),
+            entered_tx: Some(entered_tx),
+            release_rx,
+        },
+        2,
+    )
+    .expect("start bridge");
+    let blocking = bridge
+        .submit(LegacyIntent::ResyncAddresses {
+            reason: Reason::Fluxctl,
+        })
+        .expect("accept blocking operation");
+    entered_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("writer enters blocking operation");
+
+    let ingress = bridge.observation_ingress().expect("observation ingress");
+    ingress
+        .submit(ControlObservation::ConfigurationInputsChanged)
+        .expect("record configuration observation");
+    ingress
+        .submit(ControlObservation::DisableStateChanged { disabled: false })
+        .expect("record disable removal");
+    release_tx.send(()).expect("release writer");
+    blocking.wait().expect("blocking operation succeeds");
+    wait_until(Duration::from_secs(1), || {
+        consumptions.load(Ordering::SeqCst) == 1
+    });
+
+    assert_eq!(
+        calls.lock().expect("calls lock").as_slice(),
+        &[
+            LegacyIntent::ResyncAddresses {
+                reason: Reason::Fluxctl,
+            },
+            LegacyIntent::Running {
+                reason: Reason::DisableRemoved,
+            },
+        ]
+    );
+    assert!(!bridge.snapshot().configuration_dirty);
+    assert_eq!(consumptions.load(Ordering::SeqCst), 1);
+}
+
 struct RecordingDispatcher {
     calls: Arc<Mutex<Vec<LegacyIntent>>>,
 }
@@ -295,6 +446,61 @@ impl LegacyDispatcher for RecordingDispatcher {
 
 struct NotifyingDispatcher {
     completed_tx: mpsc::Sender<LegacyIntent>,
+}
+
+struct BlockingRecordingDispatcher {
+    calls: Arc<Mutex<Vec<LegacyIntent>>>,
+    entered_tx: Option<mpsc::SyncSender<()>>,
+    release_rx: mpsc::Receiver<()>,
+}
+
+struct ConfigurationConsumptionDispatcher {
+    calls: Arc<Mutex<Vec<LegacyIntent>>>,
+    consumptions: Arc<AtomicUsize>,
+    entered_tx: Option<mpsc::SyncSender<()>>,
+    release_rx: mpsc::Receiver<()>,
+}
+
+impl LegacyDispatcher for BlockingRecordingDispatcher {
+    fn execute(&mut self, intent: &LegacyIntent) -> Result<(), ControlError> {
+        self.calls.lock().expect("calls lock").push(*intent);
+        if let Some(entered_tx) = self.entered_tx.take() {
+            entered_tx
+                .send(())
+                .map_err(|error| ControlError::dispatcher(error.to_string()))?;
+            self.release_rx
+                .recv()
+                .map_err(|error| ControlError::dispatcher(error.to_string()))?;
+        }
+        Ok(())
+    }
+}
+
+impl LegacyDispatcher for ConfigurationConsumptionDispatcher {
+    fn execute(&mut self, intent: &LegacyIntent) -> Result<(), ControlError> {
+        self.calls.lock().expect("calls lock").push(*intent);
+        if let Some(entered_tx) = self.entered_tx.take() {
+            entered_tx
+                .send(())
+                .map_err(|error| ControlError::dispatcher(error.to_string()))?;
+            self.release_rx
+                .recv()
+                .map_err(|error| ControlError::dispatcher(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn configuration_inputs_consumed(&mut self) {
+        self.consumptions.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+fn wait_until(timeout: Duration, condition: impl Fn() -> bool) {
+    let deadline = Instant::now() + timeout;
+    while !condition() {
+        assert!(Instant::now() < deadline, "condition timed out");
+        thread::sleep(Duration::from_millis(2));
+    }
 }
 
 impl LegacyDispatcher for NotifyingDispatcher {

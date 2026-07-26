@@ -368,7 +368,7 @@ main() {
 
     # 2. Extract module files to MODPATH (for Magisk)
     ui_print "- Extracting module files..."
-    unzip -o "${ZIPFILE}" 'module.prop' 'webroot/*' -d "${MODPATH}" >&2 || abort "! Failed to extract module.prop"
+    unzip -o "${ZIPFILE}" 'module.prop' 'uninstall.sh' 'webroot/*' -d "${MODPATH}" >&2 || abort "! Failed to extract module metadata"
 
     # Deploy the boot launcher as the module-local late_start service. Remove
     # the legacy global service.d copies so only one watchdog can own fluxd.
@@ -441,6 +441,7 @@ main() {
     set_perm_recursive "${BIN_DIR}" 0 0 0755 0700
     set_perm_recursive "${SCRIPTS_DIR}" 0 0 0755 0700
     set_perm "${MODPATH}/service.sh" 0 0 0700
+    set_perm "${MODPATH}/uninstall.sh" 0 0 0700
 
     chmod ugo+x "${BIN_DIR}"/* 2>/dev/null || abort "! Failed to set executable bits for binaries"
     chmod ugo+x "${SCRIPTS_DIR}"/* 2>/dev/null || abort "! Failed to set executable bits for scripts"

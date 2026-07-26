@@ -490,7 +490,7 @@ This ordering makes failure tend toward direct connectivity rather than a dead p
 - config or UID-set change;
 - suspend/resume audit;
 - periodic low-frequency full audit;
-- manual `fluxctl reconcile`.
+- manual `fluxd reconcile`.
 
 ### 10.5 Transactions and journals
 
@@ -528,7 +528,7 @@ Acceptance invariants:
 - VPN lockdown cannot be bypassed in the default policy;
 - daemon/worker death converges to fail-open direct networking unless the user explicitly selected fail-closed;
 - no duplicate capture across backends;
-- all optional-feature failures are visible in `fluxctl status`;
+- all optional-feature failures are visible in `fluxd status`;
 - repeated apply/cleanup/reconcile operations are idempotent.
 
 ## 12. Recommended architecture decisions for the blueprint

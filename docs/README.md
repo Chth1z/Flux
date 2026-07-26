@@ -9,8 +9,7 @@
 
 1. [ADR-0011](adr/0011-pre-release-rust-only-release-gate.md) is the release gate.
 2. The [implementation roadmap](architecture/implementation-roadmap.md) is the authoritative
-   execution order. Phase numbers identify architectural workstreams and historical checkpoints;
-   they are not the current sequence by themselves.
+   execution order. Its named lanes, gates, and backlog IDs define the current sequence.
 3. The [blueprint](architecture/fluxd-blueprint.md) and
    [technical specification](architecture/fluxd-technical-specification.md) define the target
    architecture and contracts.
@@ -20,9 +19,11 @@
 
 ## Start here
 
+- [Comprehensive project review (2026-07)](architecture/project-review-2026-07.md) - current
+  implementation assessment, strengths, risks, alternatives, and Rust-unification recommendation.
 - [Fluxd rewrite blueprint](architecture/fluxd-blueprint.md) — recommended architecture and design decisions.
 - [Technical specification](architecture/fluxd-technical-specification.md) — types, protocols, probes, transactions, backend behavior, and packaging contract.
-- [Implementation roadmap](architecture/implementation-roadmap.md) — phased migration and verification gates.
+- [Implementation roadmap](architecture/implementation-roadmap.md) — Rust-unification critical path and verification gates.
 - [Functional capture canary](architecture/functional-capture-canary.md) — supporting
   Generation-scoped qualification contract, resumed when a real Rust-owned backend can inhabit it.
 - [Controller interface comparison](architecture/interface-comparison.md) — three alternative Interfaces and the selected hybrid.
@@ -40,6 +41,7 @@
 - [Peer kernel/proxy projects and `xt_bpf` (2026-07, Chinese)](research/peer-kernel-projects-2026-07.zh-CN.md)
 - [Expanded eBPF and kernel-extension assessment (2026-07)](research/ebpf-and-kernel-extensions-2026-07.md)
 - [Local-origin transparent-capture mechanisms on Linux 5.10 (2026-07)](research/local-output-capture-mechanisms-2026-07.md)
+- [Open-source architecture comparison for the Rust cutover (2026-07)](research/open-source-architecture-comparison-2026-07.md)
 
 ## Architecture alternatives
 

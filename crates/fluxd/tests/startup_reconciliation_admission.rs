@@ -22,10 +22,10 @@ const UNSUPPORTED_HELPER_ROOT: &str = "FLUXD_TEST_UNSUPPORTED_HELPER_ROOT";
 const SUPPORTED_PROFILE_BOOT_ID: &str = "01234567-89ab-cdef-0123-456789abcdef";
 
 #[test]
-fn packaged_default_config_matches_the_strict_phase_one_schema() {
+fn packaged_default_config_matches_the_strict_product_schema() {
     let config = FluxConfig::parse(PACKAGED_CONFIG).expect("packaged flux.toml must be valid");
 
-    assert_eq!(config.schema(), 1);
+    assert_eq!(config.schema(), 3);
     assert_eq!(config.daemon().fail_policy(), FailurePolicy::Open);
     assert_eq!(
         config.daemon().reconcile_debounce().get(),
@@ -354,6 +354,7 @@ fn unsupported_kernel_daemon_helper() {
     let run = root.join("run");
     let options = DaemonOptions {
         socket_path: run.join("fluxd.sock"),
+        daemon_lease_path: run.join("fluxd.lease"),
         config_path: root.join("conf/flux.toml"),
         shell: if cfg!(target_os = "android") {
             PathBuf::from("/system/bin/sh")
@@ -363,6 +364,9 @@ fn unsupported_kernel_daemon_helper() {
         dispatcher_script: root.join("scripts/dispatcher"),
         addrsync_script: root.join("scripts/addrsync"),
         engine_manifest_path: run.join("engine.manifest"),
+        engine_config_path: root.join("conf/config.json"),
+        bridge_environment_path: run.join("desired-state.env"),
+        subscription_store_path: root.join("state/subscription"),
         intent_path: root.join("state/administrative-intent.json"),
         boot_id_path: root.join("boot-id"),
         selinux_enforce_path: root.join("selinux-enforce"),
@@ -399,11 +403,15 @@ fn daemon_options(
 
     DaemonOptions {
         socket_path: run.join("fluxd.sock"),
+        daemon_lease_path: run.join("fluxd.lease"),
         config_path: root.join("conf/flux.toml"),
         shell: PathBuf::from("/bin/sh"),
         dispatcher_script,
         addrsync_script,
         engine_manifest_path: run.join("engine.manifest"),
+        engine_config_path: root.join("conf/config.json"),
+        bridge_environment_path: run.join("desired-state.env"),
+        subscription_store_path: root.join("state/subscription"),
         intent_path,
         boot_id_path: root.join("must-not-be-read-boot-id"),
         selinux_enforce_path: root.join("selinux-enforce"),

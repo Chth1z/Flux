@@ -38,8 +38,8 @@ prepared/active state, listener identity, or Runtime Coordinator entry point. A 
 successful frozen-oracle fixture comparison therefore cannot satisfy structural verification,
 construct an attempt, authorize traffic, or publish any functional status. The observation-only
 shadow compiler is complete and frozen; `scripts/tproxy` remains the sole production restore writer
-while backlog item 3 completes the full target and until backlog item 4 qualifies and atomically
-transfers the native networking lease.
+while roadmap Lane A completes the host target, Lane C qualifies the physical Android authority,
+and Gate 1 atomically transfers the native networking lease.
 
 Legacy source-shape renderer parity and canonical xtables lowering are complete as non-authorizing
 artifacts. Forwarded-only input preserves exact schema-v1 bytes and identities. Any local-OUTPUT
@@ -66,12 +66,12 @@ participant blocks; one serialized parent-bound mutating `addrsync` or `tproxy` 
 only its slot and remains blocking after parent death; a live parent can reclaim a dead child; and
 only both-dead, PID-reused, or previous-boot records retire after revalidation. Bare, malformed,
 mixed, and unverifiable locks stay fail-closed. Legacy start/stop/restart/failure cleanup holds the
-same fence before `addrsync` or `tproxy` mutation. The standalone daemon remains a later cutover
+same fence before `addrsync` or `tproxy` mutation. Removing the standalone daemon remains a Gate 1
 duty. Positive production target
-admission remains deliberately uninhabited, and WSA is not release authority. Backlog item 3 must
-still bind the complete engine/canary, address-policy, routing, and ownership target. Backlog item 4
-must qualify reviewed Android 5.10/ARM64 profiles, stop every shell networking writer, transfer the
-lease, and delete the replaced duties. Established-flow caching, transparent-socket DIVERT, FakeIP ICMP, QUIC
+admission remains deliberately uninhabited, and WSA is not release authority. Roadmap Lane A must
+still bind the complete host engine, address-policy, and ownership target. Lane C must qualify the
+canary, routing, and reviewed Android 5.10/ARM64 authority; Gate 1 then stops every shell networking
+writer, transfers the lease, and deletes the replaced duties. Established-flow caching, transparent-socket DIVERT, FakeIP ICMP, QUIC
 rejection, and MSS clamping remain later gates. Neither lane adds an eBPF attach/pin path, TUN
 activation, implicit module request, or `.ko`/KPM loading that could provide an alternate evidence
 source.
@@ -336,17 +336,18 @@ deliberately uninhabited. This is an admission fence, not an absent transaction 
 stable hooks, restore/save, journaled routing, exact readback, rollback, recovery, and cleanup under
 deterministic and rooted disposable-WSA mechanism tests. The exact routing identity requires
 nonzero route and rule protocols, an explicit nonzero route metric, IPv4 HOST scope, and IPv6
-UNIVERSE scope. Its payload schema 2 additionally binds the complete dual-family route/rule audit and
-loopback name/index, and publication requires both xtables families plus both routing identities to
-be exact or absent.
+UNIVERSE scope. Its payload schema 3 stores only target/previous identities; each binds the complete
+private runtime plan, dual-family route/rule audit, and loopback name/index. A separate bounded
+checksum-protected archive retains exact active/replacement recovery material, and publication
+requires both xtables families plus both routing identities to be exact or absent.
 
 That private mechanism never attempts TPROXY in OUTPUT and never substitutes REDIRECT, DNAT,
 ingress PREROUTING traffic, a veth bounce, counters, or route-lookup inference. WSA does not supply
 release authority, and the concrete production capture/process receipt authorities and factory
 input remain uninhabited, so this seam cannot produce a positive production result. `scripts/tproxy`
-remains the sole production restore writer while backlog item 3 completes the full target and until
-backlog item 4 qualifies Android 5.10/ARM64 and transfers the networking lease after every shell
-writer is stopped.
+remains the sole production restore writer while roadmap Lane A completes the host target, Lane C
+qualifies Android 5.10/ARM64, and Gate 1 transfers the networking lease after every shell writer is
+stopped.
 
 The remaining integration subcheckpoints must bind client/peer authority to driver-retained
 children, establish final verifier completion chronology, construct the delivered report-object
@@ -372,9 +373,10 @@ The contained topology is split into a boot-scoped facility and Generation-scope
 1. Before any Generation is planned or an active Generation exists, the one serialized networking
    writer creates a uniquely named, journaled peer network namespace and veth pair. In the Phase 1
    bridge this is a dedicated shell writer phase ordered by Rust; `fluxd` does not issue a second
-   set of network mutations. Backlog item 3 must bind the facility into the complete target without
-   mutation authority; backlog item 4 admits the delivered native owner into production composition
-   and creates the facility before collecting the final Network Inventory. Reload
+   set of network mutations. Roadmap Lane A must bind the facility into the complete target without
+   mutation authority; Lane C qualifies its physical-device evidence, and Gate 1 admits the
+   delivered native owner into production composition and creates the facility before collecting
+   the final Network Inventory. Reload
    reuses the existing verified facility and never creates or
    replaces it while the prior Generation is active.
 2. The daemon side stays in the engine's network namespace; the peer side is reserved for bounded

@@ -19,15 +19,23 @@ jobs:
           toolchain: 1.93.0
           components: clippy,rustfmt
           targets: aarch64-linux-android
+      - uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r27d
+          add-to-path: false
+          local-cache: true
       - uses: Swatinem/rust-cache@v2
       - run: cargo xtask ci
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
       - name: Check Magisk shell bridge syntax
         run: >-
           bash -n customize.sh flux_service.sh scripts/dispatcher
-          scripts/fluxctl scripts/lib scripts/flux-event scripts/rules
+          scripts/lib scripts/flux-event scripts/rules
           tests/shell/config_installer_contract.sh
           tests/shell/rules_generation.sh tests/shell/run-dispatcher-tests.sh
-          tests/shell/run-fluxctl-tests.sh tests/shell/run-installer-tests.sh
+          tests/shell/run-installer-tests.sh
       - name: Test installer and configuration contract
         run: sh tests/shell/config_installer_contract.sh
       - name: Test legacy rule generation semantics
@@ -46,10 +54,6 @@ jobs:
         run: >-
           sudo env "PATH=${PATH}" FLUX_INSTALLER_TESTS_REQUIRED=1
           sh tests/shell/run-installer-tests.sh
-      - name: Test fluxctl status delegation
-        run: >-
-          sudo env "PATH=${PATH}" FLUXCTL_STATUS_TESTS_REQUIRED=1
-          sh tests/shell/run-fluxctl-tests.sh
       - name: Check legacy addrsyncd compatibility
         run: |
           cargo test --manifest-path addrsyncd/Cargo.toml

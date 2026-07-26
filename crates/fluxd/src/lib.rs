@@ -20,13 +20,21 @@ mod generation_engine_config;
 // production remains structural-only until a platform adapter is qualified.
 #[allow(dead_code)]
 mod functional_canary;
+mod inspection;
 mod intent_store;
 mod legacy_rules_cli;
 mod legacy_rules_manifest;
+#[allow(
+    dead_code,
+    reason = "A4 host-verifies native composition before the Gate 1 cutover"
+)]
+mod native_runtime_writer;
+mod offline_cleanup;
 mod protocol;
 mod runtime_coordinator;
 mod runtime_status;
 mod socket;
+mod subscription;
 
 use protocol::WireCapabilityProfile;
 
@@ -43,6 +51,10 @@ pub use engine_supervisor::{
     MAX_ENGINE_DIAGNOSTIC_BYTES, OwnedEngineIdentity, RestartPolicy, RestartPolicyError,
     SHA256_DIGEST_BYTES,
 };
+pub use inspection::{
+    DEFAULT_LOG_LINES, DiagnosticItem, DiagnosticReport, DiagnosticState, ExplainAddressFamilies,
+    ExplainApplicationMode, ExplainReport, LogReport, LogStream, MAX_LOG_LINES, MAX_LOG_TAIL_BYTES,
+};
 pub use intent_store::{AdministrativeIntentStore, IntentStoreError};
 pub use legacy_rules_cli::{
     LegacyRulesEnvironment, ProcessLegacyRulesEnvironment, run_legacy_package_snapshot_cli,
@@ -54,6 +66,11 @@ pub use legacy_rules_manifest::{
     LegacyRulesSetManifest, LegacyRulesSetManifestError, LegacyRulesSetManifestErrorKind,
     MAX_LEGACY_RULES_SET_MANIFEST_BYTES,
 };
+pub use offline_cleanup::{
+    DaemonLeaseError, DaemonLeaseErrorKind, OFFLINE_CLEANUP_BUSY_EXIT, OfflineCleanupDisposition,
+    OfflineCleanupError, OfflineCleanupErrorKind, OfflineCleanupReport, run_offline_cleanup,
+    run_offline_cleanup_cli,
+};
 pub use protocol::{
     DaemonSnapshot, EventDisposition, EventReport, MAX_CONTROL_PACKET_BYTES, ProtocolHandler,
     RequestPeerId,
@@ -63,16 +80,34 @@ pub use runtime_status::{
     RuntimeSnapshotSource, RuntimeVerificationState,
 };
 pub use socket::{ControlConnectionHandler, ControlSocketError, SocketControlClient};
+pub use subscription::{SubscriptionRefreshDisposition, SubscriptionRefreshReport};
 
 pub trait DaemonClient: ControlClient {
     fn ping(&self) -> Result<(), ControlError>;
     fn status(&self) -> Result<DaemonSnapshot, ControlError>;
+    fn update_subscription(&self) -> Result<SubscriptionRefreshReport, ControlError>;
+    fn diagnose(&self) -> Result<DiagnosticReport, ControlError> {
+        Err(inspection_unavailable())
+    }
+    fn logs(&self, _stream: LogStream, _lines: u16) -> Result<LogReport, ControlError> {
+        Err(inspection_unavailable())
+    }
+    fn explain(&self) -> Result<ExplainReport, ControlError> {
+        Err(inspection_unavailable())
+    }
     fn send_event(
         &self,
         event_type: &str,
         watched_path: &str,
         event_name: &str,
     ) -> Result<EventReport, ControlError>;
+}
+
+fn inspection_unavailable() -> ControlError {
+    ControlError::request_rejected(
+        "inspection_unavailable",
+        "read-only inspection is unavailable for this daemon client",
+    )
 }
 
 impl DaemonClient for SocketControlClient {
@@ -82,6 +117,22 @@ impl DaemonClient for SocketControlClient {
 
     fn status(&self) -> Result<DaemonSnapshot, ControlError> {
         SocketControlClient::status(self)
+    }
+
+    fn update_subscription(&self) -> Result<SubscriptionRefreshReport, ControlError> {
+        SocketControlClient::update_subscription(self)
+    }
+
+    fn diagnose(&self) -> Result<DiagnosticReport, ControlError> {
+        SocketControlClient::diagnose(self)
+    }
+
+    fn logs(&self, stream: LogStream, lines: u16) -> Result<LogReport, ControlError> {
+        SocketControlClient::logs(self, stream, lines)
+    }
+
+    fn explain(&self) -> Result<ExplainReport, ControlError> {
+        SocketControlClient::explain(self)
     }
 
     fn send_event(
@@ -180,6 +231,14 @@ where
             None => run_status(args, kernel_source, stdout, stderr),
         },
         "control" => run_control(args, kernel_source, control, stdout, stderr),
+        "start" | "stop" | "restart" | "reload" | "resync" => run_control_action(
+            command.as_ref(),
+            args,
+            kernel_source,
+            control,
+            stdout,
+            stderr,
+        ),
         "ping" => match daemon {
             Some(daemon) => run_ping(args, daemon, stdout, stderr),
             None => unavailable_online_command("ping", stderr),
@@ -187,6 +246,26 @@ where
         "event" => match daemon {
             Some(daemon) => run_event(args, daemon, stdout, stderr),
             None => unavailable_online_command("event", stderr),
+        },
+        "subscription" => match daemon {
+            Some(daemon) => run_subscription(args, daemon, stdout, stderr),
+            None => unavailable_online_command("subscription", stderr),
+        },
+        "diagnose" => match daemon {
+            Some(daemon) => run_diagnose(args, daemon, stdout, stderr),
+            None => unavailable_online_command("diagnose", stderr),
+        },
+        "logs" => match daemon {
+            Some(daemon) => run_logs(args, daemon, stdout, stderr),
+            None => unavailable_online_command("logs", stderr),
+        },
+        "backend" => match daemon {
+            Some(daemon) => run_backend(args, daemon, stdout, stderr),
+            None => unavailable_online_command("backend", stderr),
+        },
+        "plan" | "rules-preview" | "preview" => match daemon {
+            Some(daemon) => run_explain(args, daemon, stdout, stderr),
+            None => unavailable_online_command("explain", stderr),
         },
         "--help" | "-h" | "help" => write_help(stdout),
         "--version" | "-V" | "version" => {
@@ -220,7 +299,33 @@ where
         let _ = writeln!(stderr, "fluxd: control action is required");
         return EXIT_USAGE;
     };
-    if let Some(extra) = args.next() {
+    run_control_action(
+        action.as_ref(),
+        args,
+        kernel_source,
+        control,
+        stdout,
+        stderr,
+    )
+}
+
+fn run_control_action<I, T, S, C, O, E>(
+    action: &str,
+    args: I,
+    kernel_source: &S,
+    control: &C,
+    stdout: &mut O,
+    stderr: &mut E,
+) -> i32
+where
+    I: IntoIterator<Item = T>,
+    T: AsRef<str>,
+    S: KernelReleaseSource,
+    C: ControlClient + ?Sized,
+    O: Write,
+    E: Write,
+{
+    if let Some(extra) = args.into_iter().next() {
         let _ = writeln!(
             stderr,
             "fluxd: unexpected control argument '{}'",
@@ -229,7 +334,7 @@ where
         return EXIT_USAGE;
     }
 
-    let intent = match action.as_ref() {
+    let intent = match action {
         "start" => LegacyIntent::Running {
             reason: Reason::Fluxctl,
         },
@@ -343,6 +448,452 @@ where
             let _ = writeln!(stderr, "fluxd: {error}");
             mutating_error_exit(&error)
         }
+    }
+}
+
+fn run_subscription<I, T, O, E>(
+    args: I,
+    daemon: &dyn DaemonClient,
+    stdout: &mut O,
+    stderr: &mut E,
+) -> i32
+where
+    I: IntoIterator<Item = T>,
+    T: AsRef<str>,
+    O: Write,
+    E: Write,
+{
+    let mut args = args.into_iter();
+    let Some(action) = args.next() else {
+        let _ = writeln!(stderr, "fluxd: subscription action is required");
+        return EXIT_USAGE;
+    };
+    if action.as_ref() != "update" {
+        let _ = writeln!(
+            stderr,
+            "fluxd: unknown subscription action '{}'",
+            action.as_ref()
+        );
+        return EXIT_USAGE;
+    }
+    if let Some(extra) = args.next() {
+        let _ = writeln!(
+            stderr,
+            "fluxd: unexpected subscription argument '{}'",
+            extra.as_ref()
+        );
+        return EXIT_USAGE;
+    }
+
+    let report = match daemon.update_subscription() {
+        Ok(report) => report,
+        Err(error) => {
+            let _ = writeln!(stderr, "fluxd: subscription update failed: {error}");
+            return mutating_error_exit(&error);
+        }
+    };
+    let cleanup_pending = report.cleanup_pending();
+    let result = match report.disposition() {
+        SubscriptionRefreshDisposition::Updated => writeln!(
+            stdout,
+            "subscription updated generation={} nodes={} cleanup_pending={cleanup_pending}",
+            report
+                .generation()
+                .expect("updated subscription report has a Generation"),
+            report
+                .node_count()
+                .expect("updated subscription report has a node count")
+        ),
+        SubscriptionRefreshDisposition::UpdatedDeferred => writeln!(
+            stdout,
+            "subscription updated_deferred nodes={} cleanup_pending={cleanup_pending}",
+            report
+                .node_count()
+                .expect("deferred subscription report has a node count")
+        ),
+        SubscriptionRefreshDisposition::Unchanged => writeln!(
+            stdout,
+            "subscription unchanged nodes={} cleanup_pending={cleanup_pending}",
+            report
+                .node_count()
+                .expect("unchanged subscription report has a node count")
+        ),
+        SubscriptionRefreshDisposition::Disabled => writeln!(
+            stdout,
+            "subscription disabled cleanup_pending={cleanup_pending}"
+        ),
+        SubscriptionRefreshDisposition::Busy => {
+            let _ = writeln!(stderr, "fluxd: subscription busy");
+            return EXIT_RUNTIME_ERROR;
+        }
+    };
+    if result.is_ok() {
+        EXIT_SUCCESS
+    } else {
+        EXIT_RUNTIME_ERROR
+    }
+}
+
+fn run_diagnose<I, T, O, E>(
+    args: I,
+    daemon: &dyn DaemonClient,
+    stdout: &mut O,
+    stderr: &mut E,
+) -> i32
+where
+    I: IntoIterator<Item = T>,
+    T: AsRef<str>,
+    O: Write,
+    E: Write,
+{
+    let Some(json) = parse_flag_options(args, false, stderr, "diagnose") else {
+        return EXIT_USAGE;
+    };
+    let snapshot = match daemon.status() {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            let _ = writeln!(stderr, "fluxd: diagnose status failed: {error}");
+            return EXIT_RUNTIME_ERROR;
+        }
+    };
+    let diagnostics = match daemon.diagnose() {
+        Ok(report) => report,
+        Err(error) => {
+            let _ = writeln!(stderr, "fluxd: diagnose failed: {error}");
+            return EXIT_RUNTIME_ERROR;
+        }
+    };
+
+    if json {
+        let document = DiagnosticCliDocument {
+            status: online_status_document(snapshot),
+            diagnostics,
+        };
+        if serde_json::to_writer(&mut *stdout, &document).is_err() || writeln!(stdout).is_err() {
+            return EXIT_RUNTIME_ERROR;
+        }
+        return EXIT_SUCCESS;
+    }
+
+    let daemon_state = daemon_state_label(&snapshot.capability_profile);
+    let generation = snapshot
+        .runtime
+        .generation
+        .map_or_else(|| "none".to_owned(), |value| value.to_string());
+    if writeln!(stdout, "[status]").is_err()
+        || writeln!(stdout, "daemon: {daemon_state}").is_err()
+        || writeln!(stdout, "control revision: {}", snapshot.control.revision).is_err()
+        || writeln!(stdout, "runtime revision: {}", snapshot.runtime.revision).is_err()
+        || writeln!(
+            stdout,
+            "runtime phase: {}",
+            runtime_phase_label(snapshot.runtime.phase)
+        )
+        .is_err()
+        || writeln!(
+            stdout,
+            "runtime verification: {}",
+            runtime_verification_label(snapshot.runtime.verification)
+        )
+        .is_err()
+        || writeln!(stdout, "runtime generation: {generation}").is_err()
+        || writeln!(stdout, "\n[checks]").is_err()
+        || write_diagnostic_item(stdout, "desired state", diagnostics.desired_state()).is_err()
+        || write_diagnostic_item(stdout, "engine manifest", diagnostics.engine_manifest()).is_err()
+        || write_diagnostic_item(stdout, "runtime log", diagnostics.runtime_log()).is_err()
+        || write_diagnostic_item(stdout, "daemon log", diagnostics.daemon_log()).is_err()
+        || write_diagnostic_item(stdout, "engine log", diagnostics.engine_log()).is_err()
+    {
+        return EXIT_RUNTIME_ERROR;
+    }
+    EXIT_SUCCESS
+}
+
+fn run_logs<I, T, O, E>(args: I, daemon: &dyn DaemonClient, stdout: &mut O, stderr: &mut E) -> i32
+where
+    I: IntoIterator<Item = T>,
+    T: AsRef<str>,
+    O: Write,
+    E: Write,
+{
+    let arguments = args
+        .into_iter()
+        .map(|argument| argument.as_ref().to_owned())
+        .collect::<Vec<_>>();
+    let mut stream = LogStream::Runtime;
+    let mut stream_set = false;
+    let mut lines = DEFAULT_LOG_LINES;
+    let mut lines_set = false;
+    let mut json = false;
+    let mut index = 0;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "runtime" | "daemon" | "engine" if !stream_set => {
+                stream = match arguments[index].as_str() {
+                    "runtime" => LogStream::Runtime,
+                    "daemon" => LogStream::Daemon,
+                    "engine" => LogStream::Engine,
+                    _ => unreachable!(),
+                };
+                stream_set = true;
+            }
+            "--lines" if !lines_set => {
+                let Some(value) = arguments.get(index + 1) else {
+                    let _ = writeln!(stderr, "fluxd: logs --lines requires a value");
+                    return EXIT_USAGE;
+                };
+                lines = match value.parse::<u16>() {
+                    Ok(value) if (1..=MAX_LOG_LINES).contains(&value) => value,
+                    _ => {
+                        let _ =
+                            writeln!(stderr, "fluxd: logs --lines must be in 1..={MAX_LOG_LINES}");
+                        return EXIT_USAGE;
+                    }
+                };
+                lines_set = true;
+                index += 1;
+            }
+            "--json" if !json => json = true,
+            unknown => {
+                let _ = writeln!(stderr, "fluxd: unknown logs option '{unknown}'");
+                return EXIT_USAGE;
+            }
+        }
+        index += 1;
+    }
+
+    let report = match daemon.logs(stream, lines) {
+        Ok(report) => report,
+        Err(error) => {
+            let _ = writeln!(stderr, "fluxd: logs failed: {error}");
+            return EXIT_RUNTIME_ERROR;
+        }
+    };
+    if json {
+        if serde_json::to_writer(&mut *stdout, &report).is_err() || writeln!(stdout).is_err() {
+            return EXIT_RUNTIME_ERROR;
+        }
+        return EXIT_SUCCESS;
+    }
+    if stdout.write_all(report.content().as_bytes()).is_err() {
+        return EXIT_RUNTIME_ERROR;
+    }
+    if !report.content().is_empty()
+        && !report.content().ends_with('\n')
+        && writeln!(stdout).is_err()
+    {
+        return EXIT_RUNTIME_ERROR;
+    }
+    EXIT_SUCCESS
+}
+
+fn run_backend<I, T, O, E>(
+    args: I,
+    daemon: &dyn DaemonClient,
+    stdout: &mut O,
+    stderr: &mut E,
+) -> i32
+where
+    I: IntoIterator<Item = T>,
+    T: AsRef<str>,
+    O: Write,
+    E: Write,
+{
+    let mut args = args.into_iter();
+    let Some(action) = args.next() else {
+        let _ = writeln!(stderr, "fluxd: backend action is required");
+        return EXIT_USAGE;
+    };
+    if action.as_ref() != "explain" {
+        let _ = writeln!(
+            stderr,
+            "fluxd: unknown backend action '{}'",
+            action.as_ref()
+        );
+        return EXIT_USAGE;
+    }
+    run_explain(args, daemon, stdout, stderr)
+}
+
+fn run_explain<I, T, O, E>(
+    args: I,
+    daemon: &dyn DaemonClient,
+    stdout: &mut O,
+    stderr: &mut E,
+) -> i32
+where
+    I: IntoIterator<Item = T>,
+    T: AsRef<str>,
+    O: Write,
+    E: Write,
+{
+    let Some(json) = parse_flag_options(args, true, stderr, "explain") else {
+        return EXIT_USAGE;
+    };
+    let report = match daemon.explain() {
+        Ok(report) => report,
+        Err(error) => {
+            let _ = writeln!(stderr, "fluxd: explain failed: {error}");
+            return EXIT_RUNTIME_ERROR;
+        }
+    };
+    if json {
+        if serde_json::to_writer(&mut *stdout, &report).is_err() || writeln!(stdout).is_err() {
+            return EXIT_RUNTIME_ERROR;
+        }
+        return EXIT_SUCCESS;
+    }
+
+    if writeln!(stdout, "authorization: non_authorizing").is_err()
+        || writeln!(
+            stdout,
+            "desired state schema: {}",
+            report.desired_state_schema()
+        )
+        .is_err()
+        || writeln!(stdout, "backend: {}", report.backend()).is_err()
+        || writeln!(stdout, "listener port: {}", report.listener_port()).is_err()
+        || writeln!(
+            stdout,
+            "address families: {}",
+            explain_families_label(report.address_families())
+        )
+        .is_err()
+        || writeln!(
+            stdout,
+            "traffic domains: local_output={} forwarded_ingress={}",
+            report.local_output(),
+            report.forwarded_ingress()
+        )
+        .is_err()
+        || writeln!(
+            stdout,
+            "protocols: tcp={} udp={}",
+            report.tcp(),
+            report.udp()
+        )
+        .is_err()
+        || writeln!(
+            stdout,
+            "applications: mode={} packages={}",
+            explain_application_mode_label(report.application_mode()),
+            report.application_packages()
+        )
+        .is_err()
+        || writeln!(
+            stdout,
+            "interfaces: excluded={} forwarded_proxy={} local_bypass={}",
+            report.excluded_interfaces(),
+            report.forwarded_proxy_interfaces(),
+            report.local_bypass_interfaces()
+        )
+        .is_err()
+        || writeln!(
+            stdout,
+            "configured bypass prefixes: {}",
+            report.configured_bypass_prefixes()
+        )
+        .is_err()
+        || writeln!(
+            stdout,
+            "subscription enabled: {}",
+            report.subscription_enabled()
+        )
+        .is_err()
+        || writeln!(
+            stdout,
+            "respect Android VPN: {}",
+            report.respect_android_vpn()
+        )
+        .is_err()
+        || writeln!(
+            stdout,
+            "functional canary required: {}",
+            report.require_functional_canary()
+        )
+        .is_err()
+        || writeln!(
+            stdout,
+            "engine config: schema={} bytes={} digest={}",
+            report.engine_config_schema(),
+            report.engine_config_bytes(),
+            report.engine_config_digest()
+        )
+        .is_err()
+        || writeln!(
+            stdout,
+            "bridge compatible: {} ({})",
+            report.bridge_compatible(),
+            report.bridge_detail()
+        )
+        .is_err()
+    {
+        return EXIT_RUNTIME_ERROR;
+    }
+    EXIT_SUCCESS
+}
+
+fn parse_flag_options<I, T>(
+    args: I,
+    allow_dry_run: bool,
+    stderr: &mut impl Write,
+    command: &str,
+) -> Option<bool>
+where
+    I: IntoIterator<Item = T>,
+    T: AsRef<str>,
+{
+    let mut json = false;
+    let mut dry_run = false;
+    for argument in args {
+        match argument.as_ref() {
+            "--json" if !json => json = true,
+            "--dry-run" if allow_dry_run && !dry_run => dry_run = true,
+            unknown => {
+                let _ = writeln!(stderr, "fluxd: unknown {command} option '{unknown}'");
+                return None;
+            }
+        }
+    }
+    Some(json)
+}
+
+fn write_diagnostic_item(
+    output: &mut impl Write,
+    label: &str,
+    item: &DiagnosticItem,
+) -> std::io::Result<()> {
+    writeln!(
+        output,
+        "{label}: {} ({})",
+        diagnostic_state_label(item.state()),
+        item.detail()
+    )
+}
+
+const fn diagnostic_state_label(state: DiagnosticState) -> &'static str {
+    match state {
+        DiagnosticState::Ready => "ready",
+        DiagnosticState::Missing => "missing",
+        DiagnosticState::Invalid => "invalid",
+        DiagnosticState::Unsafe => "unsafe",
+        DiagnosticState::Unavailable => "unavailable",
+    }
+}
+
+const fn explain_families_label(families: ExplainAddressFamilies) -> &'static str {
+    match families {
+        ExplainAddressFamilies::Ipv4 => "ipv4",
+        ExplainAddressFamilies::Ipv6 => "ipv6",
+        ExplainAddressFamilies::DualStack => "dual_stack",
+    }
+}
+
+const fn explain_application_mode_label(mode: ExplainApplicationMode) -> &'static str {
+    match mode {
+        ExplainApplicationMode::All => "all",
+        ExplainApplicationMode::Allowlist => "allowlist",
+        ExplainApplicationMode::Denylist => "denylist",
     }
 }
 
@@ -647,7 +1198,7 @@ where
 fn write_help(output: &mut impl Write) -> i32 {
     let result = writeln!(
         output,
-        "Usage: fluxd <COMMAND>\n\nCommands:\n  status [--json]\n  control <start|stop|restart|reload|resync>\n  ping\n  event <EVENT_TYPE> <WATCHED_PATH> <EVENT_NAME>\n  render-legacy-rules --packages-list PATH --family 4|6 --action apply|cleanup\n  snapshot-legacy-packages --source PATH\n  attest-legacy-rules-set --generation ID --packages-list PATH --ipv4-apply PATH --ipv4-cleanup PATH [--ipv6-apply PATH --ipv6-cleanup PATH]\n  help\n  version"
+        "Usage: fluxd <COMMAND>\n\nCommands:\n  status [--json]\n  start|stop|restart|reload|resync\n  control <start|stop|restart|reload|resync>\n  diagnose [--json]\n  logs [runtime|daemon|engine] [--lines N] [--json]\n  backend explain [--json]\n  plan [--dry-run] [--json]\n  rules-preview [--json]\n  ping\n  event <EVENT_TYPE> <WATCHED_PATH> <EVENT_NAME>\n  subscription update\n  cleanup --offline\n  render-legacy-rules --packages-list PATH --family 4|6 --action apply|cleanup\n  snapshot-legacy-packages --source PATH\n  attest-legacy-rules-set --generation ID --packages-list PATH --ipv4-apply PATH --ipv4-cleanup PATH [--ipv6-apply PATH --ipv6-cleanup PATH]\n  help\n  version"
     );
     if result.is_ok() {
         EXIT_SUCCESS
@@ -678,6 +1229,33 @@ struct OnlineStatusDocument {
     capability_profile: WireCapabilityProfile,
     control: OnlineControlDocument,
     runtime: OnlineRuntimeDocument,
+}
+
+#[derive(Serialize)]
+struct DiagnosticCliDocument {
+    status: OnlineStatusDocument,
+    diagnostics: DiagnosticReport,
+}
+
+fn online_status_document(snapshot: DaemonSnapshot) -> OnlineStatusDocument {
+    OnlineStatusDocument {
+        daemon: daemon_state_label(&snapshot.capability_profile),
+        kernel: online_kernel_document(&snapshot.capability_profile),
+        capability_profile: (&snapshot.capability_profile).into(),
+        control: OnlineControlDocument::from(snapshot.control),
+        runtime: OnlineRuntimeDocument::from(snapshot.runtime),
+    }
+}
+
+fn daemon_state_label(capability_profile: &flux_core::CapabilityProfile) -> &'static str {
+    match capability_profile.legacy_mutation_gate() {
+        LegacyMutationGate::Allowed => "running",
+        LegacyMutationGate::ReadOnly {
+            kernel: KernelMutationStatus::Unsupported { .. },
+            ..
+        } => "unsupported_kernel",
+        LegacyMutationGate::ReadOnly { .. } => "read_only_profile",
+    }
 }
 
 #[derive(Serialize)]

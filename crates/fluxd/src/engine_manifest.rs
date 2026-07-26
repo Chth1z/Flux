@@ -251,6 +251,24 @@ impl Error for EngineManifestError {
 pub struct EngineManifest;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct EngineManifestSummary {
+    generation: NonZeroU32,
+    log: PathBuf,
+}
+
+impl EngineManifestSummary {
+    #[must_use]
+    pub(crate) const fn generation(&self) -> NonZeroU32 {
+        self.generation
+    }
+
+    #[must_use]
+    pub(crate) fn log(&self) -> &Path {
+        &self.log
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PreparedEngineManifest {
     generation: NonZeroU32,
     engine: EngineSpec,
@@ -279,43 +297,13 @@ impl EngineManifest {
     }
 
     pub fn load_prepared(path: &Path) -> Result<PreparedEngineManifest, EngineManifestError> {
-        let mut file = open_manifest(path)?;
-        let metadata = file.metadata().map_err(|source| EngineManifestError::Io {
-            operation: EngineManifestIoOperation::InspectDescriptor,
-            path: path.to_path_buf(),
-            source,
-        })?;
-        if !metadata.is_file() {
-            return Err(EngineManifestError::UnsafeFileType {
-                path: path.to_path_buf(),
-                source: None,
-            });
-        }
-        if metadata.len() > MAX_ENGINE_MANIFEST_BYTES as u64 {
-            return Err(EngineManifestError::DocumentTooLarge {
-                path: Some(path.to_path_buf()),
-                observed: metadata.len(),
-                limit: MAX_ENGINE_MANIFEST_BYTES,
-            });
-        }
-
-        let mut document = Vec::with_capacity(metadata.len() as usize);
-        file.by_ref()
-            .take((MAX_ENGINE_MANIFEST_BYTES + 1) as u64)
-            .read_to_end(&mut document)
-            .map_err(|source| EngineManifestError::Io {
-                operation: EngineManifestIoOperation::Read,
-                path: path.to_path_buf(),
-                source,
-            })?;
-        if document.len() > MAX_ENGINE_MANIFEST_BYTES {
-            return Err(EngineManifestError::DocumentTooLarge {
-                path: Some(path.to_path_buf()),
-                observed: document.len() as u64,
-                limit: MAX_ENGINE_MANIFEST_BYTES,
-            });
-        }
+        let document = read_manifest_document(path)?;
         Self::parse_prepared(&document)
+    }
+
+    pub(crate) fn load_summary(path: &Path) -> Result<EngineManifestSummary, EngineManifestError> {
+        let document = read_manifest_document(path)?;
+        Self::parse_summary(&document)
     }
 
     pub fn parse(document: &[u8]) -> Result<EngineSpec, EngineManifestError> {
@@ -323,82 +311,146 @@ impl EngineManifest {
     }
 
     pub fn parse_prepared(document: &[u8]) -> Result<PreparedEngineManifest, EngineManifestError> {
-        if document.len() > MAX_ENGINE_MANIFEST_BYTES {
-            return Err(EngineManifestError::DocumentTooLarge {
-                path: None,
-                observed: document.len() as u64,
-                limit: MAX_ENGINE_MANIFEST_BYTES,
+        let parsed = parse_manifest_document(document)?;
+        let engine = EngineSpec::new(parsed.process, phase_one_restart_policy())
+            .map_err(|source| EngineManifestError::EngineSpec { source })?;
+        Ok(PreparedEngineManifest {
+            generation: parsed.generation,
+            engine,
+        })
+    }
+
+    fn parse_summary(document: &[u8]) -> Result<EngineManifestSummary, EngineManifestError> {
+        let parsed = parse_manifest_document(document)?;
+        Ok(EngineManifestSummary {
+            generation: parsed.generation,
+            log: parsed.process.log,
+        })
+    }
+}
+
+struct ParsedEngineManifest {
+    generation: NonZeroU32,
+    process: SingBoxLaunchSpec,
+}
+
+fn read_manifest_document(path: &Path) -> Result<Vec<u8>, EngineManifestError> {
+    let mut file = open_manifest(path)?;
+    let metadata = file.metadata().map_err(|source| EngineManifestError::Io {
+        operation: EngineManifestIoOperation::InspectDescriptor,
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !metadata.is_file() {
+        return Err(EngineManifestError::UnsafeFileType {
+            path: path.to_path_buf(),
+            source: None,
+        });
+    }
+    if metadata.len() > MAX_ENGINE_MANIFEST_BYTES as u64 {
+        return Err(EngineManifestError::DocumentTooLarge {
+            path: Some(path.to_path_buf()),
+            observed: metadata.len(),
+            limit: MAX_ENGINE_MANIFEST_BYTES,
+        });
+    }
+
+    let mut document = Vec::with_capacity(metadata.len() as usize);
+    file.by_ref()
+        .take((MAX_ENGINE_MANIFEST_BYTES + 1) as u64)
+        .read_to_end(&mut document)
+        .map_err(|source| EngineManifestError::Io {
+            operation: EngineManifestIoOperation::Read,
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if document.len() > MAX_ENGINE_MANIFEST_BYTES {
+        return Err(EngineManifestError::DocumentTooLarge {
+            path: Some(path.to_path_buf()),
+            observed: document.len() as u64,
+            limit: MAX_ENGINE_MANIFEST_BYTES,
+        });
+    }
+    Ok(document)
+}
+
+fn parse_manifest_document(document: &[u8]) -> Result<ParsedEngineManifest, EngineManifestError> {
+    if document.len() > MAX_ENGINE_MANIFEST_BYTES {
+        return Err(EngineManifestError::DocumentTooLarge {
+            path: None,
+            observed: document.len() as u64,
+            limit: MAX_ENGINE_MANIFEST_BYTES,
+        });
+    }
+    let document = std::str::from_utf8(document)
+        .map_err(|source| EngineManifestError::InvalidUtf8 { source })?;
+    let document = document.strip_suffix('\n').unwrap_or(document);
+    let mut lines = document.split('\n');
+    if lines.next() != Some(MANIFEST_HEADER) {
+        return Err(EngineManifestError::InvalidHeader);
+    }
+
+    let mut fields = BTreeMap::new();
+    for (offset, line) in lines.enumerate() {
+        let line_number = offset + 2;
+        if line.is_empty() {
+            return Err(EngineManifestError::BlankLine { line: line_number });
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(EngineManifestError::MalformedLine { line: line_number });
+        };
+        if key.is_empty() {
+            return Err(EngineManifestError::MalformedLine { line: line_number });
+        }
+        if !is_known_field(key) {
+            return Err(EngineManifestError::UnknownField {
+                field: key.to_owned(),
+                line: line_number,
             });
         }
-        let document = std::str::from_utf8(document)
-            .map_err(|source| EngineManifestError::InvalidUtf8 { source })?;
-        let document = document.strip_suffix('\n').unwrap_or(document);
-        let mut lines = document.split('\n');
-        if lines.next() != Some(MANIFEST_HEADER) {
-            return Err(EngineManifestError::InvalidHeader);
+        if let Some(previous) = fields.insert(
+            key,
+            ManifestField {
+                value,
+                line: line_number,
+            },
+        ) {
+            return Err(EngineManifestError::DuplicateField {
+                field: key.to_owned(),
+                first_line: previous.line,
+                duplicate_line: line_number,
+            });
         }
-
-        let mut fields = BTreeMap::new();
-        for (offset, line) in lines.enumerate() {
-            let line_number = offset + 2;
-            if line.is_empty() {
-                return Err(EngineManifestError::BlankLine { line: line_number });
-            }
-            let Some((key, value)) = line.split_once('=') else {
-                return Err(EngineManifestError::MalformedLine { line: line_number });
-            };
-            if key.is_empty() {
-                return Err(EngineManifestError::MalformedLine { line: line_number });
-            }
-            if !is_known_field(key) {
-                return Err(EngineManifestError::UnknownField {
-                    field: key.to_owned(),
-                    line: line_number,
-                });
-            }
-            if let Some(previous) = fields.insert(
-                key,
-                ManifestField {
-                    value,
-                    line: line_number,
-                },
-            ) {
-                return Err(EngineManifestError::DuplicateField {
-                    field: key.to_owned(),
-                    first_line: previous.line,
-                    duplicate_line: line_number,
-                });
-            }
-        }
-
-        let generation = parse_generation(required(&fields, "generation")?)?;
-        let binary = parse_absolute_path("binary", required(&fields, "binary")?)?;
-        let config = parse_absolute_path("config", required(&fields, "config")?)?;
-        let working_directory =
-            parse_absolute_path("working_directory", required(&fields, "working_directory")?)?;
-        let log = parse_absolute_path("log", required(&fields, "log")?)?;
-        let launcher = parse_launcher(&fields)?;
-        let readiness = parse_readiness(&fields)?;
-        let startup_timeout = parse_timeout(
-            "startup_timeout_ms",
-            required(&fields, "startup_timeout_ms")?,
-        )?;
-        let stop_timeout = parse_timeout("stop_timeout_ms", required(&fields, "stop_timeout_ms")?)?;
-
-        let process = SingBoxLaunchSpec {
-            binary,
-            config,
-            working_directory,
-            log,
-            launcher,
-            readiness,
-            startup_timeout,
-            stop_timeout,
-        };
-        let engine = EngineSpec::new(process, phase_one_restart_policy())
-            .map_err(|source| EngineManifestError::EngineSpec { source })?;
-        Ok(PreparedEngineManifest { generation, engine })
     }
+
+    let generation = parse_generation(required(&fields, "generation")?)?;
+    let binary = parse_absolute_path("binary", required(&fields, "binary")?)?;
+    let config = parse_absolute_path("config", required(&fields, "config")?)?;
+    let working_directory =
+        parse_absolute_path("working_directory", required(&fields, "working_directory")?)?;
+    let log = parse_absolute_path("log", required(&fields, "log")?)?;
+    let launcher = parse_launcher(&fields)?;
+    let readiness = parse_readiness(&fields)?;
+    let startup_timeout = parse_timeout(
+        "startup_timeout_ms",
+        required(&fields, "startup_timeout_ms")?,
+    )?;
+    let stop_timeout = parse_timeout("stop_timeout_ms", required(&fields, "stop_timeout_ms")?)?;
+
+    let process = SingBoxLaunchSpec {
+        binary,
+        config,
+        working_directory,
+        log,
+        launcher,
+        readiness,
+        startup_timeout,
+        stop_timeout,
+    };
+    Ok(ParsedEngineManifest {
+        generation,
+        process,
+    })
 }
 
 #[derive(Clone, Copy)]

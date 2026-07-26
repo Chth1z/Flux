@@ -13,8 +13,8 @@ use std::os::unix::process::CommandExt;
 use serde_json::Value;
 
 use super::{
-    ANDROID_NDK_REVISION, LINUX_CANARY_INTERNAL_ENVS, LINUX_OUTPUT_TPROXY_CANARY_TEST,
-    android_linker, verify_ndk_revision,
+    ANDROID_NDK_REVISION, ANDROID_RUSTFLAGS, LINUX_CANARY_INTERNAL_ENVS,
+    LINUX_OUTPUT_TPROXY_CANARY_TEST, android_linker, verify_ndk_revision,
 };
 
 pub(super) const TARGET: &str = "x86_64-linux-android";
@@ -330,7 +330,7 @@ fn revalidate_device(
     }
 }
 
-fn build_test_artifact(linker: &Path) -> Result<PathBuf, String> {
+fn android_test_build_command(linker: &Path) -> Command {
     let mut command = Command::new("cargo");
     command.args([
         "test",
@@ -346,6 +346,16 @@ fn build_test_artifact(linker: &Path) -> Result<PathBuf, String> {
         "CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER",
         linker.as_os_str(),
     );
+    command.env("CC_x86_64_linux_android", linker.as_os_str());
+    command.env(
+        "CARGO_TARGET_X86_64_LINUX_ANDROID_RUSTFLAGS",
+        ANDROID_RUSTFLAGS,
+    );
+    command
+}
+
+fn build_test_artifact(linker: &Path) -> Result<PathBuf, String> {
+    let mut command = android_test_build_command(linker);
     let output = command_output_bounded(
         &mut command,
         None,
@@ -1064,6 +1074,34 @@ mod tests {
             PathBuf::from("/tmp/fluxd-test")
         );
         assert!(test_artifact_from_cargo_messages(b"{}").is_err());
+    }
+
+    #[test]
+    fn android_test_build_uses_pinned_compiler_for_rust_and_native_code() {
+        let linker = Path::new("/ndk/toolchains/llvm/bin/x86_64-linux-android31-clang");
+        let command = android_test_build_command(linker);
+        let environment = command
+            .get_envs()
+            .collect::<std::collections::BTreeMap<_, _>>();
+
+        assert_eq!(
+            environment.get(std::ffi::OsStr::new(
+                "CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER"
+            )),
+            Some(&Some(linker.as_os_str()))
+        );
+        assert_eq!(
+            environment.get(std::ffi::OsStr::new("CC_x86_64_linux_android")),
+            Some(&Some(linker.as_os_str()))
+        );
+        assert_eq!(
+            environment.get(std::ffi::OsStr::new(
+                "CARGO_TARGET_X86_64_LINUX_ANDROID_RUSTFLAGS"
+            )),
+            Some(&Some(std::ffi::OsStr::new(ANDROID_RUSTFLAGS)))
+        );
+        assert!(ANDROID_RUSTFLAGS.contains("max-page-size=16384"));
+        assert!(ANDROID_RUSTFLAGS.contains("common-page-size=16384"));
     }
 
     #[test]

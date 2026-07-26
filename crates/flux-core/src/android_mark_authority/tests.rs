@@ -1542,6 +1542,49 @@ fn synthetic_cooperative_policy_yields_read_only_planning_authority_and_separate
 }
 
 #[test]
+fn planning_evidence_digest_binds_census_observation_and_canonical_contents() {
+    let context = TestContext::standard();
+    let first = context
+        .authorize(
+            context
+                .census(complete_absent_coverage(), [])
+                .expect("first complete census"),
+        )
+        .expect("first planning authority");
+    let repeated_digest = first.evidence_digest();
+    assert_eq!(repeated_digest, first.evidence_digest());
+
+    let fresh = context
+        .authorize(
+            context
+                .census(complete_absent_coverage(), [])
+                .expect("fresh complete census"),
+        )
+        .expect("fresh planning authority");
+    assert_ne!(
+        first.census().observation_id(),
+        fresh.census().observation_id()
+    );
+    assert_ne!(repeated_digest, fresh.evidence_digest());
+
+    let observed_use = FwmarkUseRecord::new(
+        FwmarkEvidenceSource::LegacyXtables,
+        FwmarkPlane::Packet,
+        FwmarkUseOperation::PredicateRead,
+        0x0000_0001,
+    )
+    .expect("nonempty nonoverlapping mark use");
+    let changed = context
+        .authorize(
+            context
+                .census(coverage_for_uses([observed_use]), [observed_use])
+                .expect("complete census with canonical mark use"),
+        )
+        .expect("changed planning authority");
+    assert_ne!(fresh.evidence_digest(), changed.evidence_digest());
+}
+
+#[test]
 fn reauthorization_consumes_authority_and_requires_a_fresh_census_observation() {
     let context = TestContext::standard();
     let first_census = context

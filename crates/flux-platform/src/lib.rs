@@ -11,6 +11,7 @@ mod android_identity;
 mod android_identity_properties;
 mod capability;
 mod child_process;
+mod file_observer;
 mod legacy_dispatcher;
 mod netlink;
 #[allow(dead_code)]
@@ -25,6 +26,7 @@ pub mod socket_diagnostics;
 mod xtables;
 
 pub use capability::{CapabilityProfilePaths, SystemCapabilityProfileSource};
+pub use file_observer::{FileObservationBatch, FileObservationError, FileObservationPaths};
 pub use legacy_dispatcher::{LegacyScriptPaths, ProcessLegacyDispatcher};
 pub use network_observer::NetworkInventorySource;
 pub use phase_dispatcher::{
@@ -55,15 +57,17 @@ pub use xtables::{
     MAX_XTABLES_RESTORE_CHAIN_BYTES, MAX_XTABLES_RESTORE_COMMANDS, MAX_XTABLES_RESTORE_LINE_BYTES,
     MAX_XTABLES_RESTORE_LINES, MAX_XTABLES_RESTORE_TOKEN_BYTES,
     MAX_XTABLES_RESTORE_TOKENS_PER_COMMAND, MAX_XTABLES_RESTORE_TRANSACTIONS,
-    XTABLES_CAPTURE_DIGEST_BYTES, XTABLES_CAPTURE_LOWERING_SCHEMA_VERSION,
-    XTABLES_RESTORE_DIGEST_BYTES, XTABLES_RESTORE_SCHEMA_VERSION, XtablesCaptureArtifactPair,
-    XtablesCaptureArtifactPairDigest, XtablesCaptureArtifactSet, XtablesCaptureArtifactSetDigest,
-    XtablesCaptureEntryPoint, XtablesCaptureEntryPointRole, XtablesCaptureEntrySelector,
-    XtablesCaptureExtension, XtablesCaptureExtensions, XtablesCaptureHook,
-    XtablesCaptureLoweringBudget, XtablesCaptureLoweringDigest, XtablesCaptureLoweringError,
-    XtablesCaptureLoweringRequest, XtablesCaptureNamespace, XtablesCapturePredicateKind,
-    XtablesCaptureResourceUsage, XtablesCaptureTransactionOrder, XtablesCaptureTransactionStep,
-    XtablesChainDeclaration, XtablesInterfaceRenderErrorKind, XtablesLocalOutputRoutingRequirement,
+    NativeCaptureConvergedState, NativeCaptureConvergence, NativeCaptureConvergenceReport,
+    NativeCaptureDesired, NativeCaptureTargetIdentity, XTABLES_CAPTURE_DIGEST_BYTES,
+    XTABLES_CAPTURE_LOWERING_SCHEMA_VERSION, XTABLES_RESTORE_DIGEST_BYTES,
+    XTABLES_RESTORE_SCHEMA_VERSION, XtablesCaptureArtifactPair, XtablesCaptureArtifactPairDigest,
+    XtablesCaptureArtifactSet, XtablesCaptureArtifactSetDigest, XtablesCaptureEntryPoint,
+    XtablesCaptureEntryPointRole, XtablesCaptureEntrySelector, XtablesCaptureExtension,
+    XtablesCaptureExtensions, XtablesCaptureHook, XtablesCaptureLoweringBudget,
+    XtablesCaptureLoweringDigest, XtablesCaptureLoweringError, XtablesCaptureLoweringRequest,
+    XtablesCaptureNamespace, XtablesCapturePredicateKind, XtablesCaptureResourceUsage,
+    XtablesCaptureTransactionOrder, XtablesCaptureTransactionStep, XtablesChainDeclaration,
+    XtablesInterfaceRenderErrorKind, XtablesLocalOutputRoutingRequirement,
     XtablesLocalOutputRoutingSpec, XtablesLocalOutputRoutingSpecError,
     XtablesLocalOutputRoutingTarget, XtablesLocalOutputRoutingTargetError,
     XtablesLocalOutputTransactionRequirements, XtablesLoopEscapeRequirement, XtablesRestoreAction,
@@ -74,6 +78,11 @@ pub use xtables::{
     XtablesRestoreTransaction, XtablesTproxyTarget, XtablesTransparentListenerRequirement,
     lower_xtables_capture, parse_xtables_restore, render_legacy_rules_pair,
     render_legacy_rules_restore, render_legacy_rules_set,
+};
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use xtables::{
+    NativeXtablesCaptureConvergenceError, NativeXtablesCaptureConverger, NativeXtablesCaptureTarget,
 };
 
 #[doc(hidden)]

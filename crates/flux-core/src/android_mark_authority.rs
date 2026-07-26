@@ -10,13 +10,15 @@ use crate::android_tproxy_topology::{
     AndroidTproxyTopologyScopeStructuralFeasibility, DeferredAndroidTproxyPrerequisite,
     StaleAndroidTproxyTopologyScopeReport,
 };
+use crate::canonical_evidence::CanonicalEvidenceDigest;
 use crate::capability::{
     BootIdentity, CapabilityProfile, CapabilityProfileRevision, NetworkNamespaceIdentity,
     ObservationKind,
 };
 use crate::fwmark_audit::{
     FwmarkCandidate, FwmarkEvidenceSource, FwmarkEvidenceState, FwmarkPartialAudit,
-    FwmarkPartialAuditOutcome, audit_fwmark_candidate_partial,
+    FwmarkPartialAuditOutcome, audit_fwmark_candidate_partial, fwmark_evidence_source_tag,
+    update_fwmark_candidate_evidence,
 };
 use crate::network_inventory::{NetworkEpoch, NetworkInventory, NetworkInventorySnapshotId};
 
@@ -33,10 +35,15 @@ pub const MAX_ANDROID_MARK_DEVICE_POLICY_NAME_BYTES: usize = 128;
 pub(crate) const MAX_REVIEWED_POLICY_CATALOG_ENTRY_ID_BYTES: usize = 128;
 /// Exact byte length of a SHA-256 device-policy artifact digest.
 pub const ANDROID_MARK_DEVICE_POLICY_ARTIFACT_DIGEST_BYTES: usize = 32;
+/// Exact byte length of a canonical Android mark-planning evidence digest.
+pub const ANDROID_MARK_PLANNING_EVIDENCE_DIGEST_BYTES: usize = 32;
 /// Exact byte length of a durable ownership-journal identity.
 pub const OWNERSHIP_JOURNAL_IDENTITY_BYTES: usize = 32;
 /// Maximum raw mark-use records accepted by one complete point-in-time census.
 pub const MAX_COMPLETE_FWMARK_CENSUS_MARK_USES: usize = 512;
+
+const ANDROID_MARK_PLANNING_EVIDENCE_DIGEST_DOMAIN: &[u8] =
+    b"Flux Android mark planning evidence\0canonical-schema-v1\0sha256-v1\0";
 
 const ALL_FWMARK_EVIDENCE_SOURCES: [FwmarkEvidenceSource; 9] = [
     FwmarkEvidenceSource::AndroidNetId,
@@ -1294,6 +1301,18 @@ pub enum DeferredAndroidMarkActivationPrerequisite {
     MarkPreservationCanary,
 }
 
+/// Domain-separated SHA-256 identity of all evidence retained by mark-planning authority.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(transparent)]
+pub struct AndroidMarkPlanningEvidenceDigest([u8; ANDROID_MARK_PLANNING_EVIDENCE_DIGEST_BYTES]);
+
+impl AndroidMarkPlanningEvidenceDigest {
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; ANDROID_MARK_PLANNING_EVIDENCE_DIGEST_BYTES] {
+        &self.0
+    }
+}
+
 /// Read-only positive authority to continue pure Android mark planning.
 ///
 /// This type has no public constructor and exposes no priority, table, route, mutation intent,
@@ -1385,6 +1404,23 @@ impl AndroidMarkPlanningAuthority {
         &self.partial_audit
     }
 
+    /// Returns the exact point-in-time identity consumed by further pure planning.
+    #[must_use]
+    pub fn evidence_digest(&self) -> AndroidMarkPlanningEvidenceDigest {
+        let mut digest = CanonicalEvidenceDigest::new(ANDROID_MARK_PLANNING_EVIDENCE_DIGEST_DOMAIN);
+        update_fwmark_candidate_evidence(&mut digest, self.candidate);
+        digest.bytes(&self.topology_scope.evidence_digest());
+        digest.bytes(self.capability_profile.digest().as_bytes());
+        digest.bytes(self.boot_identity().as_str().as_bytes());
+        digest_network_namespace(&mut digest, self.network_namespace);
+        digest_policy_identity(&mut digest, &self.policy_identity);
+        digest.u64(self.policy_revision.get());
+        digest.tag(self.planes.bits());
+        digest_complete_census(&mut digest, &self.census);
+        digest.bytes(&self.partial_audit.evidence_digest());
+        AndroidMarkPlanningEvidenceDigest(digest.finish())
+    }
+
     #[must_use]
     /// Returns only the mark-authority-specific activation gaps.
     ///
@@ -1456,6 +1492,101 @@ impl AndroidMarkPlanningAuthority {
             candidate,
             replacement_census,
         )
+    }
+}
+
+fn digest_network_namespace(
+    digest: &mut CanonicalEvidenceDigest,
+    identity: NetworkNamespaceIdentity,
+) {
+    digest.u64(identity.device());
+    digest.u64(identity.inode());
+}
+
+fn digest_policy_identity(
+    digest: &mut CanonicalEvidenceDigest,
+    identity: &AndroidMarkDevicePolicyIdentity,
+) {
+    digest.tag(match identity.kind {
+        AndroidMarkDevicePolicyKind::GenericAospNoGrant => 0,
+        AndroidMarkDevicePolicyKind::DeviceQualifiedCooperative => 1,
+    });
+    match &identity.catalog_entry {
+        Some(entry) => {
+            digest.tag(1);
+            digest.bytes(entry.as_str().as_bytes());
+        }
+        None => digest.tag(0),
+    }
+    match &identity.name {
+        Some(name) => {
+            digest.tag(1);
+            digest.bytes(name.as_str().as_bytes());
+        }
+        None => digest.tag(0),
+    }
+    match identity.artifact_digest {
+        Some(artifact) => {
+            digest.tag(1);
+            digest.bytes(artifact.as_bytes());
+        }
+        None => digest.tag(0),
+    }
+}
+
+fn digest_complete_census(digest: &mut CanonicalEvidenceDigest, census: &CompleteFwmarkCensus) {
+    digest.u64(census.observation_id.get());
+    digest.u64(census.snapshot_id.get());
+    digest.u64(census.epoch.get());
+    digest.bytes(census.capability_profile.digest().as_bytes());
+    digest.bytes(census.boot_identity().as_str().as_bytes());
+    digest_network_namespace(digest, census.network_namespace);
+    digest_policy_identity(digest, &census.device_policy_identity);
+    digest.u64(census.device_policy_revision.get());
+    digest.u64(census.collector_revision.get());
+    digest.bytes(census.ownership_journal_identity.as_bytes());
+    digest.u64(census.ownership_journal_revision.get());
+    digest.usize(census.coverage.len());
+    for coverage in &census.coverage {
+        digest.tag(fwmark_evidence_source_tag(coverage.source));
+        digest.tag(fwmark_plane_tag(coverage.plane));
+        digest.tag(fwmark_census_coverage_state_tag(coverage.state));
+    }
+    digest.usize(census.mark_uses.len());
+    for mark_use in &census.mark_uses {
+        digest.tag(fwmark_evidence_source_tag(mark_use.source));
+        digest.tag(fwmark_plane_tag(mark_use.plane));
+        digest.tag(fwmark_use_operation_tag(mark_use.operation));
+        digest.u32(mark_use.mask.get());
+    }
+}
+
+const fn fwmark_plane_tag(plane: FwmarkPlane) -> u8 {
+    match plane {
+        FwmarkPlane::Packet => 0,
+        FwmarkPlane::Socket => 1,
+        FwmarkPlane::Conntrack => 2,
+    }
+}
+
+const fn fwmark_census_coverage_state_tag(state: FwmarkCensusCoverageState) -> u8 {
+    match state {
+        FwmarkCensusCoverageState::CompletePresent => 0,
+        FwmarkCensusCoverageState::CompleteAbsent => 1,
+        FwmarkCensusCoverageState::Incomplete => 2,
+        FwmarkCensusCoverageState::Opaque => 3,
+        FwmarkCensusCoverageState::Denied => 4,
+        FwmarkCensusCoverageState::Transient => 5,
+        FwmarkCensusCoverageState::Unavailable => 6,
+    }
+}
+
+const fn fwmark_use_operation_tag(operation: FwmarkUseOperation) -> u8 {
+    match operation {
+        FwmarkUseOperation::PredicateRead => 0,
+        FwmarkUseOperation::MaskedWrite => 1,
+        FwmarkUseOperation::TransferRead => 2,
+        FwmarkUseOperation::TransferWrite => 3,
     }
 }
 

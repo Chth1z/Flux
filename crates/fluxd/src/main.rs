@@ -37,6 +37,22 @@ fn main() {
         );
         std::process::exit(exit);
     }
+    if args.get(1).is_some_and(|command| command == "cleanup") {
+        let options = match fluxd::DaemonOptions::from_environment() {
+            Ok(options) => options,
+            Err(error) => {
+                eprintln!("fluxd: {error}");
+                std::process::exit(1);
+            }
+        };
+        let exit = fluxd::run_offline_cleanup_cli(
+            &args,
+            &options,
+            &mut std::io::stdout(),
+            &mut std::io::stderr(),
+        );
+        std::process::exit(exit);
+    }
     let source = SystemKernelReleaseSource;
     if args.get(1).is_some_and(|command| command == "daemon") {
         if args.len() != 2 {

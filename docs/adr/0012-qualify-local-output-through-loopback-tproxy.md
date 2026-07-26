@@ -1,7 +1,7 @@
 ---
 status: accepted
 decision_date: 2026-07-15
-last_reviewed: 2026-07-17
+last_reviewed: 2026-07-23
 ---
 
 # Qualify local OUTPUT through loopback-reinjected PREROUTING TPROXY
@@ -134,12 +134,13 @@ OUTPUT detach, rule delete, route delete, remaining-root detach, then private-ch
 Replacement keeps the built-in jumps stable and atomically rebinds the durable Generation journal
 without releasing the component lease.
 
-Owner-payload schema 2 binds the target and optional previous Generation to artifact/tool digests and
-a domain-separated digest of the complete IPv4/IPv6 routing audit, including the exact loopback
-name/index identity. The real Adapter proves that live identity in both directions before every
-route/rule observation or mutation. Both xtables families and both routing audit identities are read
-before `Active` or `CleanAbsent`; any opposite-family residue blocks publication rather than being
-ignored because a family is absent from the target.
+Owner-payload schema 3 stores only target and optional previous identities. Each identity binds the
+source artifact, coherent tool set, complete private runtime plan, and a domain-separated digest of
+the complete IPv4/IPv6 routing audit including exact loopback name/index identity. A bounded
+checksum-protected archive retains exact recovery material for active plus replacement under the
+same runtime transaction lock. The real Adapter proves live loopback identity in both directions
+before every route/rule observation or mutation. Both xtables families and both routing audit
+identities are read before `Active` or `CleanAbsent`; opposite-family residue blocks publication.
 
 Current terminal-journal recovery retains the native guard, shared writer fence, and optional lease
 through a fresh global IPv4/IPv6 xtables plus policy absence proof, then retires the terminal
@@ -153,7 +154,8 @@ only the child slot and remains blocking after parent death; a live parent may r
 Both-dead, PID-reused, and previous-boot records retire only after exact revalidation. Ambient state
 is discarded, release is authenticated, signals exit through cleanup, and bare, malformed, mixed,
 and unverifiable locks remain fail-closed. Legacy start, stop, restart, and failure cleanup hold the
-same fence before `addrsync` or `tproxy` mutation; the standalone daemon remains a later cutover duty.
+same fence before `addrsync` or `tproxy` mutation; removing the standalone daemon remains a Gate 1
+duty.
 
 The same real process/netlink Adapter passed apply, active-journal recovery, stop, and exact absence
 in a rooted disposable WSA Android 13 x86_64 namespace. That run also established two bounded legacy
@@ -163,6 +165,6 @@ omission. Nonempty missing-mangle output and nondefault `--on-ip` remain conflic
 
 Production remains `Unsupported`: this mechanism test does not supply Android 5.10/ARM64 mark
 authority, RPDB/VPN/netd coexistence, distinct engine identity, functional receipts, or release
-qualification, and it does not authorize shell-duty removal before item 3 completes the target and
-item 4 passes the atomic cutover gate. eBPF
+qualification, and it does not authorize shell-duty removal before roadmap Lane A completes the
+host target, Lane C supplies the exact Android authority, and Gate 1 passes the fenced cutover. eBPF
 remains an optional separately qualified mechanism, and production loads no `.ko`/KPM payload.

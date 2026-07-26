@@ -12,9 +12,9 @@
 readonly TABLE_ID=2025
 
 # Netfilter Marks
-readonly IPV4_MARK=0x14
-readonly IPV6_MARK=0x19
-readonly BYPASS_MARK=0x11
+IPV4_MARK="${IPV4_MARK:-0x14}"
+IPV6_MARK="${IPV6_MARK:-0x19}"
+BYPASS_MARK="${BYPASS_MARK:-0x11}"
 
 # ==============================================================================
 # [ Timeout Constants ]
@@ -99,6 +99,8 @@ readonly XTABLES_WRITER_SHELL_OWNER_FILE="${XTABLES_WRITER_LOCK_DIR}/shell-owner
 readonly XTABLES_WRITER_NATIVE_OWNER_FILE="${XTABLES_WRITER_LOCK_DIR}/native-owner"
 readonly XTABLES_WRITER_SHELL_OWNER_MAGIC="flux-shell-xtables-writer-owner-v2"
 readonly ENGINE_MANIFEST_FILE="${RUN_DIR}/engine.manifest"
+readonly DESIRED_STATE_ENV_FILE="${RUN_DIR}/desired-state.env"
+readonly DESIRED_STATE_ENV_MAX_BYTES=131072
 readonly ENGINE_GENERATIONS_DIR="${RUN_DIR}/generations"
 readonly ENGINE_GENERATION_SEQUENCE_FILE="${RUN_DIR}/engine.generation-sequence"
 readonly ENGINE_ACTIVE_GENERATION_FILE="${RUN_DIR}/engine.active"
@@ -120,9 +122,6 @@ readonly LIB_SCRIPT="${SCRIPTS_DIR}/lib"
 readonly LOG_SCRIPT="${SCRIPTS_DIR}/log"
 readonly RULES_SCRIPT="${SCRIPTS_DIR}/rules"
 readonly TPROXY_SCRIPT="${SCRIPTS_DIR}/tproxy"
-readonly UPDATE_SCRIPT="${SCRIPTS_DIR}/updater.sh"
-readonly FLUXCTL_SCRIPT="${SCRIPTS_DIR}/fluxctl"
-readonly FLUX_EVENT_SCRIPT="${SCRIPTS_DIR}/flux-event"
 
 # ==============================================================================
 # [ Cache Files ]
@@ -975,6 +974,21 @@ wait_pids_timeout() {
 # ==============================================================================
 
 load_config() {
+    if [ "${FLUXD_ENGINE_OWNER:-legacy}" = "rust" ]; then
+        _validate_rust_desired_state_env || {
+            log_error "Rust-owned Desired State environment is missing, unsafe, or malformed"
+            return 1
+        }
+        set -a
+        . "${DESIRED_STATE_ENV_FILE}"
+        set +a
+        [ "${FLUX_BRIDGE_ENV_SCHEMA:-}" = "1" ] || {
+            log_error "Rust-owned Desired State environment has an unsupported schema"
+            return 1
+        }
+        return 0
+    fi
+
     if [ -f "${EVENT_CACHE_OK}" ] && [ -f "${CACHE_CONFIG_FILE}" ]; then
         set -a
         . "${CACHE_CONFIG_FILE}"
@@ -1016,4 +1030,36 @@ load_config() {
     rm -f "${tmp_cfg}"
     log_error "Failed to load validated settings"
     return 1
+}
+
+_validate_rust_desired_state_env() {
+    local size=""
+
+    [ -s "${DESIRED_STATE_ENV_FILE}" ] && [ ! -L "${DESIRED_STATE_ENV_FILE}" ] || return 1
+    size=$(file_size "${DESIRED_STATE_ENV_FILE}") || return 1
+    [ "${size}" -le "${DESIRED_STATE_ENV_MAX_BYTES}" ] || return 1
+
+    awk '
+        BEGIN {
+            fields = "FLUX_BRIDGE_ENV_SCHEMA ENGINE_BINARY ENGINE_STARTUP_TIMEOUT_MS ENGINE_STOP_TIMEOUT_MS CORE_USER CORE_GROUP CORE_TIMEOUT LOG_LEVEL LOG_MAX_SIZE PROXY_MODE PROXY_PORT PROXY_IPV6 APP_PROXY_MODE APP_LIST APP_USER_SCOPE APP_USER_LIST MOBILE_INTERFACE PROXY_MOBILE WIFI_INTERFACE PROXY_WIFI HOTSPOT_INTERFACE PROXY_HOTSPOT USB_INTERFACE PROXY_USB EXCLUDE_INTERFACES FAKEIP_V4_RANGE FAKEIP_V6_RANGE MARK_MASK IPV4_MARK IPV6_MARK BYPASS_MARK ROUTING_MARK RULE_BACKEND BYPASS_SET_BACKEND MSS_CLAMP_ENABLE BLOCK_QUIC PERFORMANCE_MODE PRIVATE_DNS_GUARD IPV6_FORCE_DISABLE VENDOR_FIX_PROFILE HOTSPOT_FIX"
+            count = split(fields, names, " ")
+            for (i = 1; i <= count; i++) allowed[names[i]] = 1
+        }
+        NR == 1 {
+            if ($0 != "# FLUX_DESIRED_STATE_ENV_V1") exit 1
+            next
+        }
+        {
+            if ($0 !~ /^[A-Z][A-Z0-9_]*=\047[A-Za-z0-9_ .\/:+*-]*\047$/) exit 1
+            key = $0
+            sub(/=.*/, "", key)
+            if (!(key in allowed) || (key in seen)) exit 1
+            seen[key] = 1
+            observed++
+        }
+        END {
+            if (NR != count + 1 || observed != count) exit 1
+            for (i = 1; i <= count; i++) if (!(names[i] in seen)) exit 1
+        }
+    ' "${DESIRED_STATE_ENV_FILE}"
 }

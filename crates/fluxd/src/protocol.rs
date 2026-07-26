@@ -16,9 +16,13 @@ use flux_core::{
 use flux_platform::Uid;
 use serde::{Deserialize, Serialize};
 
+use crate::inspection::InspectionSource;
+use crate::subscription::{
+    SubscriptionRefreshClient, SubscriptionRefreshDisposition, SubscriptionRefreshReport,
+};
 use crate::{
-    RuntimeCaptureState, RuntimeEngineState, RuntimeFailure, RuntimePhase, RuntimeSnapshot,
-    RuntimeSnapshotSource, RuntimeVerificationState,
+    DiagnosticReport, ExplainReport, LogReport, LogStream, RuntimeCaptureState, RuntimeEngineState,
+    RuntimeFailure, RuntimePhase, RuntimeSnapshot, RuntimeSnapshotSource, RuntimeVerificationState,
 };
 
 const PROTOCOL_VERSION: u16 = 3;
@@ -64,6 +68,8 @@ pub struct ProtocolHandler<C> {
     capability_profile: Arc<CapabilityProfile>,
     control: C,
     runtime: RuntimeSnapshotSource,
+    subscription: Option<SubscriptionRefreshClient>,
+    inspection: Option<Arc<dyn InspectionSource>>,
     recent_results: Mutex<RecentResults>,
 }
 
@@ -86,10 +92,39 @@ where
         control: C,
         runtime: RuntimeSnapshotSource,
     ) -> Self {
+        Self::with_runtime_snapshot_and_subscription(capability_profile, control, runtime, None)
+    }
+
+    #[must_use]
+    pub(crate) fn with_runtime_snapshot_and_subscription(
+        capability_profile: Arc<CapabilityProfile>,
+        control: C,
+        runtime: RuntimeSnapshotSource,
+        subscription: Option<SubscriptionRefreshClient>,
+    ) -> Self {
+        Self::with_runtime_subscription_and_inspection(
+            capability_profile,
+            control,
+            runtime,
+            subscription,
+            None,
+        )
+    }
+
+    #[must_use]
+    pub(crate) fn with_runtime_subscription_and_inspection(
+        capability_profile: Arc<CapabilityProfile>,
+        control: C,
+        runtime: RuntimeSnapshotSource,
+        subscription: Option<SubscriptionRefreshClient>,
+        inspection: Option<Arc<dyn InspectionSource>>,
+    ) -> Self {
         Self {
             capability_profile,
             control,
             runtime,
+            subscription,
+            inspection,
             recent_results: Mutex::new(RecentResults::default()),
         }
     }
@@ -207,6 +242,87 @@ where
                 watched_path: _,
                 event_name,
             } => self.handle_event(request.request_id, &event_type, &event_name),
+            WireCommand::SubscriptionUpdate => self.handle_subscription_update(request.request_id),
+            WireCommand::Diagnose => self.handle_diagnose(request.request_id),
+            WireCommand::Logs { stream, lines } => {
+                self.handle_logs(request.request_id, stream, lines)
+            }
+            WireCommand::Explain => self.handle_explain(request.request_id),
+        }
+    }
+
+    fn handle_diagnose(&self, request_id: u64) -> Vec<u8> {
+        let Some(inspection) = self.inspection.as_ref() else {
+            return inspection_unavailable_response(request_id);
+        };
+        encode_response(ResponseEnvelope::ok(
+            request_id,
+            ResponseBody::Diagnostics {
+                report: inspection.diagnose(),
+            },
+        ))
+    }
+
+    fn handle_logs(&self, request_id: u64, stream: LogStream, lines: u16) -> Vec<u8> {
+        let Some(inspection) = self.inspection.as_ref() else {
+            return inspection_unavailable_response(request_id);
+        };
+        match inspection.logs(stream, lines) {
+            Ok(report) => encode_response(ResponseEnvelope::ok(
+                request_id,
+                ResponseBody::Logs { report },
+            )),
+            Err(error) => encode_response(ResponseEnvelope::error(
+                request_id,
+                error.kind().rejection_code(),
+                error.to_string(),
+            )),
+        }
+    }
+
+    fn handle_explain(&self, request_id: u64) -> Vec<u8> {
+        let Some(inspection) = self.inspection.as_ref() else {
+            return inspection_unavailable_response(request_id);
+        };
+        match inspection.explain() {
+            Ok(report) => encode_response(ResponseEnvelope::ok(
+                request_id,
+                ResponseBody::Explain { report },
+            )),
+            Err(error) => encode_response(ResponseEnvelope::error(
+                request_id,
+                error.kind().rejection_code(),
+                error.to_string(),
+            )),
+        }
+    }
+
+    fn handle_subscription_update(&self, request_id: u64) -> Vec<u8> {
+        if let Some(response) = self.mutation_gate_response(request_id) {
+            return response;
+        }
+        let Some(subscription) = self.subscription.as_ref() else {
+            return encode_response(ResponseEnvelope::error(
+                request_id,
+                "subscription_unavailable",
+                "subscription refresh is unavailable in this daemon runtime".to_owned(),
+            ));
+        };
+        match subscription.refresh() {
+            Ok(report) => encode_response(ResponseEnvelope::ok(
+                request_id,
+                ResponseBody::SubscriptionUpdate {
+                    disposition: report.disposition().into(),
+                    generation: report.generation(),
+                    node_count: report.node_count(),
+                    cleanup_pending: report.cleanup_pending(),
+                },
+            )),
+            Err(error) => encode_response(ResponseEnvelope::error(
+                request_id,
+                error.kind().rejection_code(),
+                error.to_string(),
+            )),
         }
     }
 
@@ -336,6 +452,14 @@ where
     }
 }
 
+fn inspection_unavailable_response(request_id: u64) -> Vec<u8> {
+    encode_response(ResponseEnvelope::error(
+        request_id,
+        "inspection_unavailable",
+        "read-only inspection is unavailable in this daemon runtime".to_owned(),
+    ))
+}
+
 #[derive(Deserialize, Serialize)]
 struct RequestEnvelope {
     protocol_version: u16,
@@ -357,11 +481,21 @@ enum WireCommand {
         watched_path: String,
         event_name: String,
     },
+    SubscriptionUpdate,
+    Diagnose,
+    Logs {
+        stream: LogStream,
+        lines: u16,
+    },
+    Explain,
 }
 
 impl WireCommand {
     const fn is_mutating(&self) -> bool {
-        matches!(self, Self::Control { .. } | Self::Event { .. })
+        matches!(
+            self,
+            Self::Control { .. } | Self::Event { .. } | Self::SubscriptionUpdate
+        )
     }
 }
 
@@ -650,6 +784,21 @@ enum ResponseBody {
         disposition: WireEventDisposition,
         revision: u64,
     },
+    SubscriptionUpdate {
+        disposition: WireSubscriptionRefreshDisposition,
+        generation: Option<u64>,
+        node_count: Option<u32>,
+        cleanup_pending: bool,
+    },
+    Diagnostics {
+        report: DiagnosticReport,
+    },
+    Logs {
+        report: LogReport,
+    },
+    Explain {
+        report: ExplainReport,
+    },
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
@@ -797,6 +946,28 @@ impl TryFrom<WireCapabilityProfile> for CapabilityProfile {
             ));
         }
         Ok(profile)
+    }
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WireSubscriptionRefreshDisposition {
+    Updated,
+    UpdatedDeferred,
+    Unchanged,
+    Disabled,
+    Busy,
+}
+
+impl From<SubscriptionRefreshDisposition> for WireSubscriptionRefreshDisposition {
+    fn from(disposition: SubscriptionRefreshDisposition) -> Self {
+        match disposition {
+            SubscriptionRefreshDisposition::Updated => Self::Updated,
+            SubscriptionRefreshDisposition::UpdatedDeferred => Self::UpdatedDeferred,
+            SubscriptionRefreshDisposition::Unchanged => Self::Unchanged,
+            SubscriptionRefreshDisposition::Disabled => Self::Disabled,
+            SubscriptionRefreshDisposition::Busy => Self::Busy,
+        }
     }
 }
 
@@ -1752,6 +1923,42 @@ pub(crate) fn encode_event_request(
     })
 }
 
+pub(crate) fn encode_subscription_update_request(request_id: u64) -> Result<Vec<u8>, ControlError> {
+    encode_request(RequestEnvelope {
+        protocol_version: PROTOCOL_VERSION,
+        request_id,
+        command: WireCommand::SubscriptionUpdate,
+    })
+}
+
+pub(crate) fn encode_diagnose_request(request_id: u64) -> Result<Vec<u8>, ControlError> {
+    encode_request(RequestEnvelope {
+        protocol_version: PROTOCOL_VERSION,
+        request_id,
+        command: WireCommand::Diagnose,
+    })
+}
+
+pub(crate) fn encode_logs_request(
+    request_id: u64,
+    stream: LogStream,
+    lines: u16,
+) -> Result<Vec<u8>, ControlError> {
+    encode_request(RequestEnvelope {
+        protocol_version: PROTOCOL_VERSION,
+        request_id,
+        command: WireCommand::Logs { stream, lines },
+    })
+}
+
+pub(crate) fn encode_explain_request(request_id: u64) -> Result<Vec<u8>, ControlError> {
+    encode_request(RequestEnvelope {
+        protocol_version: PROTOCOL_VERSION,
+        request_id,
+        command: WireCommand::Explain,
+    })
+}
+
 pub(crate) fn decode_control_response(
     packet: &[u8],
     expected_request_id: u64,
@@ -1835,6 +2042,145 @@ pub(crate) fn decode_event_response(
     }
 }
 
+pub(crate) fn decode_subscription_update_response(
+    packet: &[u8],
+    expected_request_id: u64,
+) -> Result<SubscriptionRefreshReport, ControlError> {
+    let response = decode_response(packet, expected_request_id)?;
+    match response.result {
+        WireResult::Ok {
+            body:
+                ResponseBody::SubscriptionUpdate {
+                    disposition,
+                    generation,
+                    node_count,
+                    cleanup_pending,
+                },
+        } => {
+            decode_subscription_refresh_report(disposition, generation, node_count, cleanup_pending)
+        }
+        WireResult::Ok { .. } => Err(unexpected_response("subscription update")),
+        WireResult::Error { code, message } => Err(rejected_response(code, message)),
+    }
+}
+
+pub(crate) fn decode_diagnose_response(
+    packet: &[u8],
+    expected_request_id: u64,
+) -> Result<DiagnosticReport, ControlError> {
+    let response = decode_response(packet, expected_request_id)?;
+    match response.result {
+        WireResult::Ok {
+            body: ResponseBody::Diagnostics { report },
+        } if report.validate() => Ok(report),
+        WireResult::Ok {
+            body: ResponseBody::Diagnostics { .. },
+        } => Err(ControlError::protocol(
+            "daemon returned an invalid diagnostic report".to_owned(),
+        )),
+        WireResult::Ok { .. } => Err(unexpected_response("diagnose")),
+        WireResult::Error { code, message } => Err(rejected_response(code, message)),
+    }
+}
+
+pub(crate) fn decode_logs_response(
+    packet: &[u8],
+    expected_request_id: u64,
+    requested_stream: LogStream,
+    requested_lines: u16,
+) -> Result<LogReport, ControlError> {
+    let response = decode_response(packet, expected_request_id)?;
+    match response.result {
+        WireResult::Ok {
+            body: ResponseBody::Logs { report },
+        } if report.stream() == requested_stream && report.validate(requested_lines) => Ok(report),
+        WireResult::Ok {
+            body: ResponseBody::Logs { .. },
+        } => Err(ControlError::protocol(
+            "daemon returned an invalid bounded log report".to_owned(),
+        )),
+        WireResult::Ok { .. } => Err(unexpected_response("logs")),
+        WireResult::Error { code, message } => Err(rejected_response(code, message)),
+    }
+}
+
+pub(crate) fn decode_explain_response(
+    packet: &[u8],
+    expected_request_id: u64,
+) -> Result<ExplainReport, ControlError> {
+    let response = decode_response(packet, expected_request_id)?;
+    match response.result {
+        WireResult::Ok {
+            body: ResponseBody::Explain { report },
+        } if report.validate() => Ok(report),
+        WireResult::Ok {
+            body: ResponseBody::Explain { .. },
+        } => Err(ControlError::protocol(
+            "daemon returned an invalid Desired State explanation".to_owned(),
+        )),
+        WireResult::Ok { .. } => Err(unexpected_response("explain")),
+        WireResult::Error { code, message } => Err(rejected_response(code, message)),
+    }
+}
+
+fn decode_subscription_refresh_report(
+    disposition: WireSubscriptionRefreshDisposition,
+    generation: Option<u64>,
+    node_count: Option<u32>,
+    cleanup_pending: bool,
+) -> Result<SubscriptionRefreshReport, ControlError> {
+    let invalid = || {
+        ControlError::protocol(
+            "daemon returned incoherent subscription update disposition metadata".to_owned(),
+        )
+    };
+    match disposition {
+        WireSubscriptionRefreshDisposition::Updated => Ok(SubscriptionRefreshReport::updated(
+            generation
+                .filter(|generation| *generation != 0)
+                .ok_or_else(invalid)?,
+            node_count
+                .filter(|node_count| *node_count != 0)
+                .ok_or_else(invalid)?,
+            cleanup_pending,
+        )),
+        WireSubscriptionRefreshDisposition::UpdatedDeferred => {
+            if generation.is_some() {
+                return Err(invalid());
+            }
+            Ok(SubscriptionRefreshReport::updated_deferred(
+                node_count
+                    .filter(|node_count| *node_count != 0)
+                    .ok_or_else(invalid)?,
+                cleanup_pending,
+            ))
+        }
+        WireSubscriptionRefreshDisposition::Unchanged => {
+            if generation.is_some() {
+                return Err(invalid());
+            }
+            Ok(SubscriptionRefreshReport::unchanged(
+                node_count
+                    .filter(|node_count| *node_count != 0)
+                    .ok_or_else(invalid)?,
+                cleanup_pending,
+            ))
+        }
+        WireSubscriptionRefreshDisposition::Disabled => {
+            if generation.is_some() || node_count.is_some() || cleanup_pending {
+                return Err(invalid());
+            }
+            Ok(SubscriptionRefreshReport::disabled())
+        }
+        WireSubscriptionRefreshDisposition::Busy => {
+            if generation.is_some() || node_count.is_some() || cleanup_pending {
+                return Err(invalid());
+            }
+            Ok(SubscriptionRefreshReport::busy())
+        }
+    }
+}
+
 fn encode_request(request: RequestEnvelope) -> Result<Vec<u8>, ControlError> {
     serde_json::to_vec(&request)
         .map_err(|error| ControlError::protocol(format!("encode control request: {error}")))
@@ -1873,10 +2219,296 @@ fn rejected_response(code: String, message: String) -> ControlError {
 
 #[cfg(test)]
 mod tests {
-    use flux_core::{CapabilityProfile, CapabilityProfileRevision};
+    use std::fs;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use flux_core::{
+        CapabilityProfile, CapabilityProfileRevision, ConfigurationChangeClient,
+        ConfigurationChangeReport, ControlClient, ControlSnapshotSource, LegacyIntent,
+        OperationReport,
+    };
     use flux_testkit::CapabilityProfileFixture;
 
     use super::*;
+    use crate::DiagnosticState;
+    use crate::inspection::ProcessInspectionSource;
+    use crate::subscription::{SubscriptionRefreshError, SubscriptionRefreshErrorKind};
+
+    #[derive(Default)]
+    struct TestControl;
+
+    impl ControlClient for TestControl {
+        fn submit_and_wait(&self, intent: LegacyIntent) -> Result<OperationReport, ControlError> {
+            Ok(OperationReport {
+                intent,
+                revision: 1,
+            })
+        }
+    }
+
+    impl ControlSnapshotSource for TestControl {
+        fn snapshot(&self) -> Arc<ControlSnapshot> {
+            Arc::new(ControlSnapshot::default())
+        }
+    }
+
+    impl ConfigurationChangeClient for TestControl {
+        fn configuration_changed(
+            &self,
+            _reason: Reason,
+        ) -> Result<ConfigurationChangeReport, ControlError> {
+            Ok(ConfigurationChangeReport::Deferred { revision: 1 })
+        }
+    }
+
+    #[test]
+    fn read_only_inspection_round_trips_bounded_reports_without_mutation_caching() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let run = directory.path().join("run");
+        fs::create_dir(&run).expect("create run directory");
+        fs::write(run.join("flux.log"), "one\ntwo\nthree\n").expect("write runtime log");
+        let inspection = Arc::new(ProcessInspectionSource::new(
+            directory.path().join("flux.toml"),
+            run.join("engine.manifest"),
+        ));
+        let handler = ProtocolHandler::with_runtime_subscription_and_inspection(
+            Arc::new(CapabilityProfileFixture::supported()),
+            TestControl,
+            RuntimeSnapshotSource::default(),
+            None,
+            Some(inspection.clone()),
+        );
+
+        let request = encode_logs_request(91, LogStream::Runtime, 2).expect("log request");
+        assert_eq!(
+            String::from_utf8(request.clone()).expect("UTF-8 request"),
+            "{\"protocol_version\":3,\"request_id\":91,\"command\":{\"kind\":\"logs\",\"stream\":\"runtime\",\"lines\":2}}"
+        );
+        let first = handler.handle_for_peer(&request, RequestPeerId::new(Uid::ROOT, 72));
+        let report = decode_logs_response(&first, 91, LogStream::Runtime, 2).expect("log report");
+        assert_eq!(report.content(), "two\nthree\n");
+        assert_eq!(report.line_count(), 2);
+
+        fs::write(run.join("flux.log"), "changed\n").expect("replace runtime log");
+        let second = handler.handle_for_peer(&request, RequestPeerId::new(Uid::ROOT, 72));
+        let report =
+            decode_logs_response(&second, 91, LogStream::Runtime, 2).expect("fresh log report");
+        assert_eq!(report.content(), "changed\n");
+        assert_ne!(
+            second, first,
+            "read-only requests must not use mutation deduplication"
+        );
+
+        let request = encode_diagnose_request(92).expect("diagnostic request");
+        let response = handler.handle(&request);
+        let diagnostics = decode_diagnose_response(&response, 92).expect("diagnostic report");
+        assert_eq!(
+            diagnostics.desired_state().state(),
+            DiagnosticState::Missing
+        );
+        assert_eq!(diagnostics.runtime_log().state(), DiagnosticState::Ready);
+
+        let request = encode_logs_request(93, LogStream::Runtime, 0).expect("invalid log request");
+        let response = handler.handle(&request);
+        let error = decode_logs_response(&response, 93, LogStream::Runtime, 0)
+            .expect_err("zero-line request must fail");
+        assert_eq!(error.rejection_code(), Some("inspection_invalid_request"));
+
+        let template_path = directory.path().join("template.json");
+        fs::write(
+            &template_path,
+            include_bytes!("../../../conf/template.json"),
+        )
+        .expect("write engine template");
+        let config = include_str!("../../../conf/flux.toml").replace(
+            "/data/adb/flux/conf/template.json",
+            template_path.to_str().expect("UTF-8 template path"),
+        );
+        fs::write(directory.path().join("flux.toml"), config).expect("write Desired State");
+        let request = encode_explain_request(94).expect("explain request");
+        let response = handler.handle(&request);
+        let explanation = decode_explain_response(&response, 94).expect("explain report");
+        assert!(explanation.non_authorizing());
+        assert_eq!(explanation.backend(), "xtables");
+
+        let read_only_handler = ProtocolHandler::with_runtime_subscription_and_inspection(
+            Arc::new(CapabilityProfileFixture::unsupported_kernel()),
+            TestControl,
+            RuntimeSnapshotSource::default(),
+            None,
+            Some(inspection),
+        );
+        let request =
+            encode_logs_request(95, LogStream::Runtime, 1).expect("read-only log request");
+        let response = read_only_handler.handle(&request);
+        let report = decode_logs_response(&response, 95, LogStream::Runtime, 1)
+            .expect("inspection remains available under a read-only capability profile");
+        assert_eq!(report.content(), "changed\n");
+    }
+
+    #[test]
+    fn subscription_update_round_trips_one_typed_mutating_response() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let refresh_calls = Arc::clone(&calls);
+        let subscription = SubscriptionRefreshClient::for_test(move || {
+            refresh_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(SubscriptionRefreshReport::updated(71, 23, true))
+        });
+        let handler = ProtocolHandler::with_runtime_snapshot_and_subscription(
+            Arc::new(CapabilityProfileFixture::supported()),
+            TestControl,
+            RuntimeSnapshotSource::default(),
+            Some(subscription),
+        );
+        let request = encode_subscription_update_request(101).expect("subscription request");
+
+        let response = handler.handle_for_peer(&request, RequestPeerId::new(Uid::ROOT, 44));
+        let report =
+            decode_subscription_update_response(&response, 101).expect("subscription response");
+
+        assert_eq!(
+            String::from_utf8(response).expect("UTF-8 response"),
+            concat!(
+                "{\"protocol_version\":3,\"request_id\":101,",
+                "\"result\":{\"status\":\"ok\",\"body\":{",
+                "\"kind\":\"subscription_update\",\"disposition\":\"updated\",",
+                "\"generation\":71,\"node_count\":23,\"cleanup_pending\":true}}}\n"
+            )
+        );
+        assert_eq!(report, SubscriptionRefreshReport::updated(71, 23, true));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn subscription_update_uses_mutation_gate_and_recent_request_deduplication() {
+        let gated_calls = Arc::new(AtomicUsize::new(0));
+        let refresh_calls = Arc::clone(&gated_calls);
+        let subscription = SubscriptionRefreshClient::for_test(move || {
+            refresh_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(SubscriptionRefreshReport::disabled())
+        });
+        let gated = ProtocolHandler::with_runtime_snapshot_and_subscription(
+            Arc::new(CapabilityProfileFixture::unsupported_kernel()),
+            TestControl,
+            RuntimeSnapshotSource::default(),
+            Some(subscription),
+        );
+        let request = encode_subscription_update_request(102).expect("subscription request");
+
+        let response = gated.handle_for_peer(&request, RequestPeerId::new(Uid::ROOT, 45));
+
+        assert_eq!(
+            String::from_utf8(response).expect("UTF-8 response"),
+            concat!(
+                "{\"protocol_version\":3,\"request_id\":102,",
+                "\"result\":{\"status\":\"error\",\"code\":\"unsupported_kernel\",",
+                "\"message\":\"kernel 5.4.280 is below minimum 5.10.0\"}}\n"
+            )
+        );
+        assert_eq!(gated_calls.load(Ordering::SeqCst), 0);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let refresh_calls = Arc::clone(&calls);
+        let subscription = SubscriptionRefreshClient::for_test(move || {
+            refresh_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(SubscriptionRefreshReport::unchanged(17, false))
+        });
+        let handler = ProtocolHandler::with_runtime_snapshot_and_subscription(
+            Arc::new(CapabilityProfileFixture::supported()),
+            TestControl,
+            RuntimeSnapshotSource::default(),
+            Some(subscription),
+        );
+        let peer = RequestPeerId::new(Uid::ROOT, 46);
+        let request = encode_subscription_update_request(103).expect("subscription request");
+
+        let first = handler.handle_for_peer(&request, peer);
+        let duplicate = handler.handle_for_peer(&request, peer);
+
+        assert_eq!(duplicate, first);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn subscription_update_errors_have_stable_codes_and_incoherent_reports_fail_closed() {
+        let expected_codes = [
+            (
+                SubscriptionRefreshErrorKind::Configuration,
+                "subscription_configuration_failed",
+            ),
+            (
+                SubscriptionRefreshErrorKind::UnsupportedIdentity,
+                "subscription_identity_unsupported",
+            ),
+            (
+                SubscriptionRefreshErrorKind::Source,
+                "subscription_source_failed",
+            ),
+            (
+                SubscriptionRefreshErrorKind::Preparation,
+                "subscription_preparation_failed",
+            ),
+            (
+                SubscriptionRefreshErrorKind::Store,
+                "subscription_store_failed",
+            ),
+            (
+                SubscriptionRefreshErrorKind::SourceChanged,
+                "subscription_source_changed",
+            ),
+            (
+                SubscriptionRefreshErrorKind::WorkerUnavailable,
+                "subscription_worker_unavailable",
+            ),
+            (
+                SubscriptionRefreshErrorKind::Activation,
+                "subscription_activation_failed",
+            ),
+            (
+                SubscriptionRefreshErrorKind::Rollback,
+                "subscription_rollback_failed",
+            ),
+        ];
+        for (kind, expected) in expected_codes {
+            assert_eq!(kind.rejection_code(), expected);
+        }
+
+        let subscription = SubscriptionRefreshClient::for_test(|| {
+            Err(SubscriptionRefreshError::activation(
+                "candidate activation failed",
+            ))
+        });
+        let handler = ProtocolHandler::with_runtime_snapshot_and_subscription(
+            Arc::new(CapabilityProfileFixture::supported()),
+            TestControl,
+            RuntimeSnapshotSource::default(),
+            Some(subscription),
+        );
+        let request = encode_subscription_update_request(104).expect("subscription request");
+        let response = handler.handle(&request);
+        let error = decode_subscription_update_response(&response, 104)
+            .expect_err("activation failure must be rejected");
+        assert_eq!(
+            error.rejection_code(),
+            Some("subscription_activation_failed")
+        );
+
+        let incoherent = encode_response(ResponseEnvelope::ok(
+            105,
+            ResponseBody::SubscriptionUpdate {
+                disposition: WireSubscriptionRefreshDisposition::Updated,
+                generation: None,
+                node_count: Some(9),
+                cleanup_pending: false,
+            },
+        ));
+        let error = decode_subscription_update_response(&incoherent, 105)
+            .expect_err("missing Generation must fail closed");
+        assert_eq!(
+            error.to_string(),
+            "control protocol: daemon returned incoherent subscription update disposition metadata"
+        );
+    }
 
     #[test]
     fn status_decoder_rejects_an_incoherent_legacy_kernel_field() {

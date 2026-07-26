@@ -8,11 +8,14 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+base64.workspace = true
 flux-core = { path = "../flux-core" }
 flux-platform = { path = "../flux-platform" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+ureq.workspace = true
+url.workspace = true
 
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 libc.workspace = true

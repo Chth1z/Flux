@@ -12,6 +12,7 @@ mod android_mark_policy_catalog;
 mod android_netd;
 mod android_rpdb;
 mod android_tproxy_topology;
+mod canonical_evidence;
 mod capability;
 mod capture_program;
 mod config;
@@ -35,11 +36,13 @@ pub use address_bypass::{
 };
 pub use android_mark_authority::{
     ANDROID_DEVICE_QUALIFIED_CANDIDATE_MASK, ANDROID_MARK_DEVICE_POLICY_ARTIFACT_DIGEST_BYTES,
-    AndroidMarkCandidateEligibilityError, AndroidMarkDeviceGrantKind, AndroidMarkDevicePolicy,
-    AndroidMarkDevicePolicyArtifactDigest, AndroidMarkDevicePolicyArtifactDigestError,
-    AndroidMarkDevicePolicyError, AndroidMarkDevicePolicyIdentity, AndroidMarkDevicePolicyKind,
-    AndroidMarkDevicePolicyName, AndroidMarkDevicePolicyNameError, AndroidMarkDevicePolicyRevision,
-    AndroidMarkPlanningAuthority, AndroidMarkPlanningAuthorizationError, AndroidMarkPositiveGrant,
+    ANDROID_MARK_PLANNING_EVIDENCE_DIGEST_BYTES, AndroidMarkCandidateEligibilityError,
+    AndroidMarkDeviceGrantKind, AndroidMarkDevicePolicy, AndroidMarkDevicePolicyArtifactDigest,
+    AndroidMarkDevicePolicyArtifactDigestError, AndroidMarkDevicePolicyError,
+    AndroidMarkDevicePolicyIdentity, AndroidMarkDevicePolicyKind, AndroidMarkDevicePolicyName,
+    AndroidMarkDevicePolicyNameError, AndroidMarkDevicePolicyRevision,
+    AndroidMarkPlanningAuthority, AndroidMarkPlanningAuthorizationError,
+    AndroidMarkPlanningEvidenceDigest, AndroidMarkPositiveGrant,
     COMPLETE_FWMARK_CENSUS_COVERAGE_RECORDS, CompleteFwmarkCensus, CompleteFwmarkCensusError,
     CompleteFwmarkCensusObservationId, DeferredAndroidMarkActivationPrerequisite,
     FwmarkCensusCollectorRevision, FwmarkCensusConflict, FwmarkCensusCoverageRecord,
@@ -77,7 +80,8 @@ pub use android_tproxy_topology::{
 };
 pub use capability::{
     AndroidBuildIdentity, AndroidProductIdentity, ArtifactIdentity, ArtifactIdentityError,
-    BootIdentity, BootIdentityMutationStatus, CAPABILITY_PROFILE_SCHEMA_VERSION, CapabilityProfile,
+    BootIdentity, BootIdentityMutationStatus, CAPABILITY_PROFILE_DIGEST_BYTES,
+    CAPABILITY_PROFILE_SCHEMA_VERSION, CapabilityProfile, CapabilityProfileDigest,
     CapabilityProfileRevision, CapabilityProfileSource, DeviceIdentity, DeviceIdentityError,
     IdentityTextError, IdentityTextErrorKind, KernelBuildIdentity, KernelFacts,
     KernelMutationStatus, KernelRelease, KernelReleaseError, KernelSupport, KernelVersion,
@@ -108,13 +112,16 @@ pub use capture_program::{
     compile_shadow_capture_program,
 };
 pub use config::{
-    ConfigError, ConfigErrorKind, DaemonConfig, EventQueueCapacity, FailurePolicy, FluxConfig,
-    GenerationHistory, MAX_CONFIG_DOCUMENT_BYTES, ReconcileDebounce,
+    AndroidPackageName, AndroidUserSelection, ApplicationConfig, BypassConfig, CaptureBackend,
+    CaptureConfig, ConfigError, ConfigErrorKind, DaemonConfig, EngineConfig, EngineRestartConfig,
+    EventQueueCapacity, FailurePolicy, FluxConfig, GenerationHistory, InterfaceConfig,
+    ListenerConfig, MAX_CONFIG_DOCUMENT_BYTES, ReconcileDebounce, SafetyConfig, SubscriptionConfig,
 };
 pub use control::{
     AdministrativeState, ConfigurationChangeClient, ConfigurationChangeReport, ControlClient,
-    ControlError, ControlService, ControlSnapshot, ControlSnapshotSource, LegacyControlBridge,
-    LegacyDispatcher, LegacyIntent, OperationHandle, OperationReport, Reason,
+    ControlError, ControlObservation, ControlObservationIngress, ControlService, ControlSnapshot,
+    ControlSnapshotSource, LegacyControlBridge, LegacyDispatcher, LegacyIntent, OperationHandle,
+    OperationReport, Reason,
 };
 pub use fwmark_audit::{
     ANDROID_NET_ID_FWMARK_MASK, DeferredFwmarkPrerequisite, FwmarkCandidate, FwmarkCandidateError,

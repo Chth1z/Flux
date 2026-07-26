@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use tempfile::tempdir;
 
+use flux_core::AdministrativeState;
 use fluxd::{
     RuntimeCaptureState, RuntimeEngineState, RuntimePhase, RuntimeVerificationState,
     SocketControlClient,
@@ -24,7 +25,7 @@ unsafe extern "C" {
 }
 
 #[test]
-fn process_directed_sigterm_stops_daemon_cleanly_with_live_runtime_writer() {
+fn native_file_observation_drives_lifecycle_and_sigterm_stops_daemon_cleanly() {
     let directory = tempdir().expect("temporary directory");
     let root = directory.path().join("flux");
     let socket_path = root.join("run/fluxd.sock");
@@ -41,7 +42,40 @@ fn process_directed_sigterm_stops_daemon_cleanly_with_live_runtime_writer() {
     fs::create_dir_all(root.join("conf")).expect("create config directory");
     fs::create_dir_all(root.join("state")).expect("create state directory");
     fs::create_dir_all(root.join("run")).expect("create run directory");
-    fs::write(root.join("conf/flux.toml"), PACKAGED_CONFIG).expect("write configuration");
+    let configured = PACKAGED_CONFIG
+        .replacen(
+            "/data/adb/flux/bin/sing-box",
+            root.join("bin/sing-box")
+                .to_str()
+                .expect("UTF-8 engine fixture path"),
+            1,
+        )
+        .replacen(
+            "/data/adb/flux/conf/template.json",
+            root.join("conf/template.json")
+                .to_str()
+                .expect("UTF-8 template fixture path"),
+            1,
+        )
+        .replacen(
+            "/data/adb/flux/conf/subscription.url",
+            root.join("conf/subscription.url")
+                .to_str()
+                .expect("UTF-8 subscription URL fixture path"),
+            1,
+        )
+        .replacen("port = 1536", &format!("port = {listener_port}"), 1);
+    fs::write(root.join("conf/flux.toml"), configured).expect("write configuration");
+    fs::write(
+        root.join("conf/template.json"),
+        concat!(
+            "{\"dns\":{\"servers\":[{\"type\":\"fakeip\",",
+            "\"inet4_range\":\"198.18.0.0/15\",",
+            "\"inet6_range\":\"fc00::/18\"}]},\"inbounds\":[]}\n"
+        ),
+    )
+    .expect("write engine template");
+    fs::write(root.join("conf/subscription.url"), "").expect("write subscription URL file");
     fs::write(root.join("conf/config.json"), "{}\n").expect("write engine configuration");
     fs::write(&boot_id_path, "33333333-3333-4333-8333-333333333333\n").expect("write boot ID");
     fs::write(&selinux_enforce_path, "1\n").expect("write SELinux mode");
@@ -52,22 +86,28 @@ fn process_directed_sigterm_stops_daemon_cleanly_with_live_runtime_writer() {
              command=${{1:-}}\n\
              printf '%s\\n' \"$command\" >> '{}'\n\
              if [ \"$command\" = prepare ]; then\n\
-                 cat > '{}' <<'EOF'\n\
+                 generation_file='{}'\n\
+                 generation=0\n\
+                 [ ! -f \"$generation_file\" ] || generation=$(cat \"$generation_file\")\n\
+                 generation=$((generation + 1))\n\
+                 printf '%s\\n' \"$generation\" > \"$generation_file\"\n\
+                 cat > '{}' <<EOF\n\
 FLUX_ENGINE_MANIFEST_V1\n\
-generation=1\n\
+generation=$generation\n\
 binary={}\n\
 config={}\n\
 working_directory={}\n\
 log={}\n\
 launcher=direct\n\
 readiness=listener\n\
-startup_timeout_ms=3000\n\
-stop_timeout_ms=3000\n\
+startup_timeout_ms=5000\n\
+stop_timeout_ms=5000\n\
 listener_port={}\n\
 EOF\n\
              fi\n\
              exit 0\n",
             dispatcher_record.display(),
+            root.join("run/test-generation").display(),
             root.join("run/engine.manifest").display(),
             root.join("bin/sing-box").display(),
             root.join("conf/config.json").display(),
@@ -115,6 +155,49 @@ EOF\n\
         RuntimeVerificationState::StructuralOnly
     );
     assert_eq!(snapshot.runtime.generation, Some(1));
+
+    fs::write(&disable_path, "").expect("create disable entry");
+    wait_until(Duration::from_secs(3), || {
+        SocketControlClient::new(&socket_path)
+            .status()
+            .is_ok_and(|snapshot| {
+                snapshot.control.administrative_state == AdministrativeState::Stopped
+                    && snapshot.runtime.phase == RuntimePhase::Stopped
+            })
+    });
+
+    fs::remove_file(&disable_path).expect("remove disable entry");
+    wait_until(Duration::from_secs(3), || {
+        SocketControlClient::new(&socket_path)
+            .status()
+            .is_ok_and(|snapshot| {
+                snapshot.control.administrative_state == AdministrativeState::Running
+                    && snapshot.runtime.phase == RuntimePhase::Running
+                    && snapshot.runtime.generation == Some(2)
+            })
+    });
+
+    let template_replacement = root.join("conf/template.next");
+    fs::write(
+        &template_replacement,
+        concat!(
+            "{\"dns\":{\"servers\":[{\"type\":\"fakeip\",",
+            "\"inet4_range\":\"198.18.0.0/15\",",
+            "\"inet6_range\":\"fc00::/18\"}]},\"inbounds\":[]}\n\n"
+        ),
+    )
+    .expect("write replacement engine template");
+    fs::rename(&template_replacement, root.join("conf/template.json"))
+        .expect("atomically replace engine template");
+    wait_until(Duration::from_secs(3), || {
+        SocketControlClient::new(&socket_path)
+            .status()
+            .is_ok_and(|snapshot| {
+                snapshot.runtime.phase == RuntimePhase::Running
+                    && snapshot.runtime.generation == Some(3)
+            })
+    });
+
     // SAFETY: `child.id()` names the live daemon process observed ready above.
     assert_eq!(unsafe { kill(child.id() as std::ffi::c_int, SIGTERM) }, 0);
 
@@ -134,6 +217,17 @@ EOF\n\
         [
             "startup-recover",
             "prepare",
+            "capture-start",
+            "capture-verify",
+            "state-running",
+            "capture-stop",
+            "state-stopped",
+            "prepare",
+            "capture-start",
+            "capture-verify",
+            "state-running",
+            "prepare",
+            "capture-stop",
             "capture-start",
             "capture-verify",
             "state-running",
@@ -160,7 +254,7 @@ fn write_script(path: &Path, body: &str) {
 }
 
 fn wait_for_daemon_ready(child: &mut Child, socket_path: &Path, dispatcher_record: &Path) {
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(7);
     loop {
         if socket_path.exists() && dispatcher_record.exists() {
             return;
@@ -182,6 +276,14 @@ fn wait_for_exit(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
         if Instant::now() >= deadline {
             return None;
         }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn wait_until(timeout: Duration, condition: impl Fn() -> bool) {
+    let deadline = Instant::now() + timeout;
+    while !condition() {
+        assert!(Instant::now() < deadline, "condition timed out");
         thread::sleep(Duration::from_millis(10));
     }
 }

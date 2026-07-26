@@ -1,7 +1,7 @@
 # Fluxd Technical Specification
 
 - Status: accepted living specification
-- Last updated: 2026-07-17
+- Last updated: 2026-07-26
 - Companion document: [Fluxd Rewrite Blueprint](fluxd-blueprint.md)
 
 This specification describes both the target architecture and temporary development checkpoints.
@@ -32,33 +32,42 @@ The code compiles only for Linux/Android. Android-specific behavior is runtime-d
 ```text
 fluxd daemon
 fluxd status [--json]
-fluxd start|stop|reload
-fluxd reconcile [--wait]
-fluxd capabilities [--json] [--refresh]
+fluxd start|stop|restart|reload|resync
+fluxd diagnose [--json]
+fluxd logs [runtime|daemon|engine] [--lines N] [--json]
 fluxd backend explain [--json]
 fluxd plan [--json] [--dry-run]
+fluxd rules-preview [--json]
 fluxd subscription update
+fluxd cleanup --offline
+fluxd ping
+```
+
+The remaining target-state commands are:
+
+```text
+fluxd reconcile [--wait]
+fluxd capabilities [--json] [--refresh]
 fluxd diagnose [--bundle PATH]
 fluxd repair
-fluxd recover --offline
-fluxd cleanup --offline
+# Offline cleanup is implemented; salvage remains intentionally separate from this contract.
 # optional, only if it does not delay cutover:
 fluxd migrate --check-only
 ```
 
-The target-state `fluxctl` is a symlink/hardlink or direct multicall entry into the same Rust binary;
-it is not a policy-bearing shell compatibility wrapper. In the delivered pre-release Phase 1
-bridge, the temporary shell wrapper delegates authoritative status and every mutating control to
-`fluxd`, while `diagnose`, rule preview, logs, and other compatibility observations still use
-legacy read-only paths. That wrapper and those paths are removed as their Rust call sites land.
+The delivered command surface is the Rust `fluxd` binary; B2.4 removes the temporary shell
+`fluxctl` wrapper and the cache-mutating shell preview branch. No `fluxctl` spelling or compatibility
+entry remains. Read-only inspection accepts only same-effective-user
+socket peers and fixed bounded sources; it does not enter mutation gating or mutation-result
+deduplication.
 
-Only `fluxd daemon` is long-lived. Sing-Box is its child. A boot shell watchdog may restart `fluxd` after a crash or fatal invariant exit, but it contains no policy logic, never invokes a second recovery owner, and does not restart a settled `UnsupportedKernel` daemon. Normal journal recovery runs inside daemon startup before mutating commands are accepted. `fluxd recover --offline` is an explicit salvage command that requires the daemon lease to be absent. The legacy `fluxctl restart` verb is a client alias for `ReloadSources` followed by `Converge(Configured)`; it has no separate protocol or lifecycle meaning.
+Only `fluxd daemon` is long-lived. Sing-Box is its child. A boot shell watchdog may restart `fluxd` after a crash or fatal invariant exit, but it contains no policy logic, never invokes a second recovery owner, and does not restart a settled `UnsupportedKernel` daemon. Normal journal recovery runs inside daemon startup before mutating commands are accepted. `fluxd cleanup --offline` is a bounded pre-socket command that requires the persistent daemon lease to be available and consumes only durable ownership records through the existing recovery Adapter. `fluxd restart` is a client alias for `ReloadSources` followed by `Converge(Configured)`; it has no separate protocol or lifecycle meaning.
 
-In the delivered Phase 1 bridge, `RuntimeCoordinator` implements `LegacyDispatcher` and runs on the one bounded `LegacyControlBridge` worker. The worker serializes requests, address resynchronization, idle maintenance, and shutdown. `EngineSupervisor` owns the Sing-Box child. Rust-owned preparation compiles the legacy restore caches, but shell phase scripts remain the only production rules/routes/address-sync writer and `scripts/tproxy` remains the sole production restore executor. A boot-scoped mode lease rejects legacy `scripts/core` verbs for the duration of a Rust-owned engine run. This bridge currently admits only TPROXY: `prepare` rejects `PROXY_MODE=tun` before initialization and manifest publication because the shell Flux PBR is TPROXY-specific and exact Sing-Box route cleanup after forced death has no device-qualified proof.
+In the delivered Phase 1 bridge, `RuntimeCoordinator` implements `LegacyDispatcher` and runs on the one bounded `LegacyControlBridge` worker. The worker serializes requests, address resynchronization, idle maintenance, and shutdown. `EngineSupervisor` owns the Sing-Box child. Schema-3 `flux.toml` is the sole Rust-owned product-policy source: before dispatch, Rust publishes canonical engine JSON and one strict compatibility environment from the same snapshot. Rust-owned preparation compiles the legacy restore caches, while shell phase scripts remain the production rules/routes writer, standalone `addrsyncd` retains address synchronization, and `scripts/tproxy` remains the sole production xtables restore executor. A boot-scoped mode lease rejects legacy `scripts/core` verbs for the duration of a Rust-owned engine run. This bridge currently admits only TPROXY: unrepresentable Desired State fails before initialization and manifest publication because the shell Flux PBR is TPROXY-specific and exact Sing-Box route cleanup after forced death has no device-qualified proof.
 
 ## 3. Local control socket and Module routing
 
-The control socket is `/data/adb/flux/run/fluxd.sock`, Unix `SOCK_SEQPACKET`, protocol version 3. Version 2 introduced the coherent boot-scoped Capability Profile; version 3 adds a required orthogonal runtime-verification field. The nested Capability Profile has its own schema version and now uses schema 2 for exact device identity. Version-1 and version-2 requests are rejected explicitly rather than decoded against the new response shape.
+The control socket is `/data/adb/flux/run/fluxd.sock`, Unix `SOCK_SEQPACKET`, protocol version 3. Version 2 introduced the coherent boot-scoped Capability Profile; version 3 adds a required orthogonal runtime-verification field, subscription maintenance, and additive read-only diagnostic/log/explain commands. The nested Capability Profile has its own schema version and now uses schema 2 for exact device identity. Version-1 and version-2 requests are rejected explicitly rather than decoded against the new response shape.
 
 ### 3.1 Request envelope
 
@@ -111,7 +120,7 @@ enum MaintenanceCommand {
 
 The socket router is not the Controller Module. `ControllerWireCommand` maps to the selected `submit` Interface; `InspectCommand` maps to `snapshot`/`watch`; maintenance commands are dispatched to separate capability, planning, subscription, diagnostics, optional migration, or recovery Modules with their own authorization and failure contracts. The migration variant is omitted from the first release if implementing it would delay the Rust-only cutover.
 
-Separate Modules do not imply separate kernel writers. Capability probes, online repair, and every other operation that may create, attach, replace, or delete a kernel object are submitted through the same kernel-mutation scheduler and Generation fence as reconciliation. Offline `recover` and `cleanup` require the exclusive daemon lease and refuse to run while a live daemon owns it. Read-only planning/diagnostics and file-only migration may execute outside the kernel writer but use their own bounded state/configuration locks.
+Separate Modules do not create independent mutation paths. Capability probes, online repair, and every other operation that may create, attach, replace, or delete a kernel object are submitted through the same kernel-mutation scheduler and Generation fence as reconciliation. Offline `cleanup` requires the exclusive daemon lease and refuses to run while a live daemon owns it. Read-only planning/diagnostics and file-only migration may execute outside the mutation scheduler but use their own bounded state/configuration locks.
 
 ### 3.3 Response envelope
 
@@ -216,7 +225,9 @@ struct CompiledGeneration {
 struct GenerationArtifact {
     desired_digest: Digest,
     capability_profile_revision: CapabilityProfileRevision,
+    capability_profile_digest: CapabilityProfileDigest,
     engine_profile_revision: EngineCapabilityProfileRevision,
+    planning_evidence_digest: PlanningEvidenceDigest,
     planning_evidence: PlanningEvidenceReceipts,
     engine_binary_digest: Digest,
     backend_plan: BackendPlan,
@@ -242,8 +253,10 @@ struct AndroidMarkPlanningReceipt {
     ownership_journal_identity: OwnershipJournalIdentity,
     ownership_journal_revision: OwnershipJournalRevision,
     capability_profile_revision: CapabilityProfileRevision,
+    capability_profile_digest: CapabilityProfileDigest,
     boot_id: BootId,
     network_namespace: NetworkNamespaceIdentity,
+    partial_audit_digest: Sha256Digest,
 }
 
 struct PlanningEvidenceReceipts {
@@ -252,6 +265,16 @@ struct PlanningEvidenceReceipts {
 ```
 
 `GenerationArtifact` is the deterministic, digest-bearing compiler output. Capture, route, and eBPF programs inside it use logical Managed Object keys rather than concrete kernel names. The Controller assigns the `GenerationId` only after successful compilation, and adapters derive bounded concrete names deterministically from that ID during preparation; creation/update timestamps belong to `GenerationRecord`, not the artifact. All numeric kernel identifiers use validated newtypes. Generation IDs use a monotonic local sequence plus an artifact-digest prefix; correctness does not depend on wall-clock uniqueness.
+
+The delivered A2 checkpoint is a narrower coordinator-facing implementation named
+`AdmittedGeneration`. `GenerationAssembler::assemble` consumes the complete immutable inputs plus
+an optional prior owned identity, assigns the next monotonic number, performs canonical xtables
+lowering, and emits a lineage-aware assembly digest. That digest binds the complete predecessor,
+product Desired State, full Capability Profile identity, full Android planning authority and RPDB
+placement evidence, engine profile/config/launch identity, Capture Program, and lowered artifact.
+It is deliberately distinct from the future semantic-only `GenerationArtifact` digest above. Its
+read-only coordinator projection and prepared record cannot be converted into a native target or
+used to mutate the kernel.
 
 The first canonical engine-configuration checkpoint is a crate-private, pure
 `EngineConfigArtifact` compiler in `fluxd`. It accepts at most 16 MiB of strict JSON template bytes
@@ -263,13 +286,16 @@ and Sing-Box's absent-`network` TCP+UDP configuration shape. The immutable resul
 canonical template digest, exact output SHA-256, domain-separated artifact digest, bounded input/
 output byte and inbound counts, and canonical newline-terminated bytes.
 
-This checkpoint is only a future member of `GenerationArtifact`, not a complete Generation. The
-unspecified listener address and TCP+UDP configuration shape do not establish an
+This checkpoint is now a production input to the Phase 1 bridge, but it is not a complete
+`GenerationArtifact`. `ProcessRuntimeWriter` atomically publishes its bytes before dispatch and
+requires the returned Generation config digest and listener to match. The unspecified listener
+address and TCP+UDP configuration shape still do not establish an
 `EngineCapabilityProfile`, exact-binary dialect validation, dual-stack runtime binding, readiness,
 listener-delivery evidence, or a functional canary. The artifact has no Generation ID, profile
 lease, process or listener authority, writer token, prepared/active conversion, or activation
-entry point; it is disconnected from `RuntimeCoordinator` and the private native xtables owner.
-Production mutation admission therefore remains uninhabited.
+entry point of its own; production connects it through the temporary writer while the private native
+xtables owner remains disconnected. Production native-mutation admission therefore remains
+uninhabited.
 
 The follow-on pure checkpoint consumes this artifact with an already inspected `EngineSpec` and
 produces an `EngineConfigLaunchBinding` only when the canonical output SHA-256 exactly equals the
@@ -278,9 +304,11 @@ port. TUN readiness and port/content drift fail closed. The schema-1 binding own
 artifact and retains the exact inspected binary, config, and presence-tagged optional launcher
 digests in a separate domain-separated identity.
 
-This binds an artifact set and intended pre-launch readiness shape, not the complete `EngineSpec`:
-paths, working directory, launcher identity, timeouts, restart policy, and logs are deliberately
-outside the binding. The binding itself does not query the binary, run Sing-Box validation,
+This binding type owns an artifact set and intended pre-launch readiness shape, not the complete
+`EngineSpec`: paths, working directory, launcher identity, timeouts, restart policy, and logs remain
+outside its identity. The production bridge separately requires the manifest binary, numeric launch
+identity, startup and stop timeouts to equal the current Desired State and replaces the bridge
+restart default with the typed policy before activation. The binding itself does not query the binary, run Sing-Box validation,
 reverify files, observe a listener, prove dual-stack behavior or delivery, assign a Generation ID,
 or authorize process/kernel activity.
 
@@ -348,8 +376,7 @@ The authoritative user file is `conf/flux.toml`.
 - Unknown fields are errors unless explicitly reserved by the active schema.
 - Duplicate fields are errors.
 - Durations and sizes have bounded numeric representations.
-- CIDRs are parsed and canonicalized; host bits outside the prefix are rejected or normalized with an explicit diagnostic according to field policy.
-- Marks and masks accept decimal or `0x` syntax and are stored as `u32`.
+- CIDRs are parsed as canonical network prefixes; host bits outside the prefix are rejected.
 - Package lists are names only; UID resolution happens from the Android inventory.
 - Secrets are read from separately permissioned files by default.
 - No configuration file is evaluated as shell.
@@ -357,7 +384,7 @@ The authoritative user file is `conf/flux.toml`.
 ### 5.2 Required sections
 
 ```toml
-schema = 1
+schema = 3
 
 [daemon]
 fail_policy = "open"
@@ -367,60 +394,41 @@ generation_history = 2
 
 [engine]
 binary = "/data/adb/flux/bin/sing-box"
-template = "/data/adb/flux/conf/sing-box.json"
-runtime_user = "root"
-runtime_group = "root"
-startup_timeout_ms = 8000
-restart_burst = 3
-restart_window_secs = 60
+template = "/data/adb/flux/conf/template.json"
+runtime_uid = 0
+runtime_gid = 0
+startup_timeout_ms = 5000
+stop_timeout_ms = 5000
+restart_max_attempts = 3
+restart_window_ms = 60000
+restart_initial_backoff_ms = 1000
+restart_maximum_backoff_ms = 30000
+restart_stable_reset_ms = 30000
 
 [capture]
-mode = "auto"
-backend = "auto"
-ipv6 = "auto"
+backend = "xtables"
+local_output = true
+forwarded_ingress = true
+ipv4 = true
+ipv6 = false
+tcp = true
+udp = true
 
-[capture.marks]
-allocation = "auto" # auto | explicit
-# mask = "0x..."         # required only for explicit
-# proxy_value = "0x..."  # required only for explicit
-# bypass_value = "0x..." # required only for explicit
+[listener]
+port = 1536
 
-[capture.routing]
-allocation = "auto"
-
-[android]
-respect_android_vpn = true
-
-[capture.ebpf]
-mode = "auto"
-sample_rate = 0
-
-[capture.tun]
-interface = "flux0"
-ipv4 = "172.19.0.1/30"
-ipv6 = "fdfe:dcba:9876::1/126"
-mtu = 9000
-stack = "auto"       # auto | system | mixed | gvisor
-offload = "auto"
-multiqueue = "auto"
-
-[scope]
+[applications]
+mode = "all"
 android_users = "owner"
-app_mode = "all"
+user_ids = []
 packages = []
 
-[[scope.interfaces]]
-pattern = "rmnet_data*"
-action = "proxy"
-
-[[scope.interfaces]]
-pattern = "wlan0"
-action = "proxy"
+[interfaces]
+forwarded_proxy = ["rmnet_data*", "wlan0", "wlan2", "rndis*"]
+local_bypass = []
+excluded = []
 
 [bypass]
-private = true
-local_addresses = true
-multicast = true
 cidrs = []
 
 [subscription]
@@ -429,12 +437,37 @@ url_file = "/data/adb/flux/conf/subscription.url"
 update_interval_secs = 86400
 download_timeout_secs = 10
 max_download_bytes = 16777216
+max_decoded_bytes = 16777216
 max_nodes = 10000
+
+[safety]
+respect_android_vpn = false
+require_functional_canary = false
 ```
 
-For marks, `auto` asks the planner to derive a candidate; it does not create authority or promise that a candidate exists. `explicit` requires every commented mark value and supplies only a candidate subject to the same conflict, freshness, ownership, and activation gates as `auto`. It is not an expert override. The legacy mark values (`0x14`, `0x19`, `0x11` under mask `0xff`) are imported only as explicit compatibility candidates. Generic AOSP grants Flux no mark field, so neither a new-installation `auto` request nor an explicit value may become a TPROXY mark plan without a matching device-qualified positive assertion and complete live evidence.
+The active schema exposes no backend auto-selection, mark allocation, routing allocation, TUN, or
+eBPF fields. The first Rust-only target is explicit xtables TPROXY; deferred mechanisms become new
+schema versions only when their planners and authority gates are executable. Numeric engine UID/GID
+and normalized absolute paths avoid shell name or expression evaluation. Mandatory loopback,
+link-local, multicast, private/reserved, and invalid-address exclusions remain compiler-owned; the
+`bypass.cidrs` list can only add exclusions.
 
-Routing currently admits only `allocation = "auto"`, meaning topology-qualified candidate derivation rather than a promise of success. A singular explicit table/priority schema is deliberately deferred: one atomic Traffic Scope retains per-anchor intervals and may have no common priority across residual-local and tether domains. The legacy table/priority `2025` is therefore a migration diagnostic, not a native routing candidate, until the next Phase 3 slice defines the per-domain realization contract.
+In the current bridge, one parse produces the canonical engine artifact, a non-authorizing shadow
+Capture Program artifact, and a bounded 41-field compatibility environment. Publication atomically
+replaces read-only `conf/config.json` and `run/desired-state.env`. The environment compiler fails
+closed for schema-3 intent the frozen renderer cannot express exactly. Shell validates the complete
+allowlist, adds only observed `KFEAT_*` fields, and does not source `settings.ini`, legacy cache
+policy, or generated JSON in Rust-owned mode. Those legacy inputs and packaged `jq` remain available
+only to the mutually exclusive rollback owner.
+
+When subscriptions are enabled, the Rust subscription Module replaces template-only engine
+compilation with an exact store-validated canonical artifact. One bounded synchronous worker owns
+HTTPS retrieval, decoding, normalization, remote binary rule-set localization, Sing-Box validation,
+active/predecessor publication, startup recovery/bootstrap, periodic scheduling, and manual
+refresh. A completed candidate enters the same serialized Generation reload path; rejection or
+missing acknowledgement conditionally restores the exact prior store index. The worker never calls
+`scripts/updater.sh`, and no shell initialization path may call or require that script. The current
+private store modes support only the packaged root-owned engine identity.
 
 ## 6. Capability Profile
 
@@ -592,7 +625,13 @@ Probe objects carry an RAII cleanup guard. A process crash may still leave kerne
 
 Before Generation compilation, Flux queries and validates the exact Sing-Box binary and builds an `EngineCapabilityProfile` containing an immutable revision, binary digest, parsed version/build identity, supported configuration dialect, TPROXY listener staging, TUN route-automation control, `system`/`mixed`/`gvisor` stacks, mark/interface controls, DNS fields, reload behavior, any documented FD-handoff contract, and any authoritative supervised delivery-report producer. A report capability is positive only when it binds the exact producer process, transport and framing, schema revision, sequence/loss behavior, attempt-owned object lifecycle, and shutdown/cleanup semantics to that immutable engine artifact; ordinary logs, management APIs, or observed proxy success are not assumed to satisfy it. The planner rejects plans whose engine requirements are not proven even when the kernel path is available.
 
-Every `CompiledGeneration` records both the device `CapabilityProfileRevision` and the `EngineCapabilityProfileRevision` used by the planner. A boot change, runtime capability demotion, Sing-Box binary replacement, or engine-profile refresh invalidates the planning lease: Flux must recompile or explicitly prove that the active Generation's requirements are still satisfied before repairing or reactivating it.
+Every `CompiledGeneration` records both the device `CapabilityProfileRevision` and the
+`EngineCapabilityProfileRevision` used by the planner. Revision is a freshness counter, not a
+globally unique identity: the canonical `CapabilityProfileDigest` also binds every retained boot,
+device, kernel, SELinux, namespace, tool, and legacy-readiness field. A boot change, runtime
+capability demotion, Sing-Box binary replacement, or engine-profile refresh invalidates the
+planning lease: Flux must recompile or explicitly prove that the active Generation's requirements
+are still satisfied before repairing or reactivating it.
 
 ### 6.5 Preloaded Kernel Extension Profile
 
@@ -887,7 +926,9 @@ Default hard limits, configurable only within compiled maxima:
 | eBPF map locked memory | 32 MiB |
 | Control event queue | 256 |
 | Netlink receive batch | 64 messages, dynamically bounded |
-| Subscription download | 16 MiB |
+| Subscription encoded download | 16 MiB |
+| Subscription decoded content | 16 MiB |
+| Subscription local assets | 64 MiB aggregate |
 | Subscription nodes | 10,000 |
 
 Limits are starting values to be revised by device benchmarks. Exceeding a limit is a compile error, never silent truncation.
@@ -923,16 +964,18 @@ Extended acknowledgements are captured and mapped to the specific generated oper
 
 ## 10. xtables and ipset specification
 
-The first non-mutating Phase 4 cutover is delivered. Rust-owned preparation exclusively invokes
+The non-mutating Phase 4 compiler checkpoint is delivered. Rust-owned preparation exclusively invokes
 `fluxd render-legacy-rules`, records `rust` as the cache producer, and never sources `scripts/rules`.
 Explicit legacy ownership exclusively sources the frozen generator, records `shell`, and remains a
 deliberate rollback producer. Render failure does not silently change producers and cannot replace
 the active Generation. In either mode, `scripts/tproxy` remains the sole xtables restore executor
-and kernel writer in production composition. The delivered private owner enforces the transition
+and xtables/Flux PBR writer in production composition; standalone `addrsyncd` separately owns
+address synchronization. The delivered private owner enforces the transition
 lease, failure/recovery, exact readback, and rollback in deterministic and disposable WSA tests, but
-positive production target admission is uninhabited. Item 3 must bind the full target and
-real-device authority inputs; item 4 must disable every shell networking writer and standalone
-address synchronizer before the first production native mutation.
+positive production target admission is uninhabited. Roadmap Lane A must bind the complete host
+target, Lane C must supply the exact real-device authority inputs, and Gate 1 must disable every
+shell networking writer and standalone address synchronizer before the first production native
+mutation.
 
 The completed `flux-platform` syntax checkpoint remains a frozen-syntax observer. A pure parser
 accepts an explicit IPv4/IPv6 plus apply/cleanup context and a bounded canonical byte slice; it
@@ -1041,10 +1084,13 @@ parsing/identity verification; shell does not claim to parse every manifest fiel
 are invalidated and rebuilt/re-attested, never reused directly. An unresolved mismatch or failed
 attestation prevents `cache_valid` publication. The dispatcher copies the exact receipt into the
 candidate Generation as `legacy-rules.manifest` before `engine.manifest` and directory immutability.
-A non-Generation `fluxctl rules-preview` rebuild is serialized under the same dispatcher lock,
-deliberately emits no receipt, and cannot authorize later publication. The manifest exposes no restore execution API,
+A direct `fluxd rules-preview` is a non-authorizing alias of the Rust explain path. It parses the
+schema-3 Desired State, reads the bounded engine template, and compiles canonical engine JSON in
+memory without entering the dispatcher, touching shared caches, or publishing a Generation or
+receipt. It currently reports configured intent and temporary bridge representability, not resolved
+Android application UIDs, live Network Inventory, or a complete Capture Program. The manifest exposes no restore execution API,
 writer/ownership token, live readback, rollback proof, prepared-capture conversion, or functional
-verification claim; `scripts/tproxy` remains the sole production restore executor and kernel writer.
+verification claim; `scripts/tproxy` remains the sole production xtables restore executor and writer.
 
 These compatibility-only renderer, snapshot, and attestation commands are removed or made private
 with the bridge when the remaining canonical semantics and native restore ownership pass their
@@ -1182,10 +1228,13 @@ therefore fails before policy state can authorize a transition.
 Before the first write, the owner publishes activating intent and a component-scoped lease bound to
 boot, network namespace, and ownership-journal identity. `native_xtables.lease` blocks shell
 mutation; `xtables-writer.lock` serializes publication; and a descriptor-held advisory guard
-prevents duplicate native recovery. Journal revisions name target/previous Generation and artifact
-plus tool digests. Owner-payload schema 2 adds a domain-separated routing digest over the complete
-IPv4/IPv6 audit: loopback name and index, route destination/table/protocol/scope/type/metric/output
-interface, and rule priority/table/mark/mask/protocol. Replacement atomically rebinds the Generation
+prevents duplicate native recovery. Owner-payload schema 3 stores only target/previous identities.
+Each identity binds the source artifact, coherent tool set, complete private runtime plan, and a
+domain-separated routing digest over the complete IPv4/IPv6 audit: loopback name and index, route
+destination/table/protocol/scope/type/metric/output interface, and rule
+priority/table/mark/mask/protocol. A checksum-protected `native_xtables.targets` archive retains the
+exact material for active plus replacement. `.native_xtables.runtime.lock` spans archive refresh,
+staging, journal/kernel convergence, and settling. Replacement atomically rebinds the Generation
 journal without releasing the component lease. Clean absence is durably published before lease
 deletion.
 
@@ -1226,8 +1275,9 @@ parent record. Start, stop, restart, and failure cleanup claim it before any `ad
 mutation, and each mutating child authenticates into the single child slot. `INT` and `TERM` exit as
 130 and 143 through authenticated `EXIT` cleanup, so control cannot resume into later mutation. A
 native lease therefore rejects the phase transaction before a networking component is invoked. This
-does not transfer ownership of the intentionally long-lived standalone `addrsyncd` daemon, which
-remains a backlog item-4 atomic-cutover responsibility after item 3 supplies its replacement inputs.
+does not transfer ownership of the intentionally long-lived standalone `addrsyncd` daemon. Roadmap
+Lane A must supply its replacement behavior and inputs, and Gate 1 remains responsible for removing
+the daemon during the fenced cutover.
 
 Deterministic tests cover zero-to-active, idempotence, replacement, stop, every route/rule/restore
 write boundary, dual-stack partial success, rollback failure, monotonic crash recovery, and lease
@@ -1627,7 +1677,7 @@ through the actual socket observations. No production required-mode context exis
 
 The internal functional-canary evidence model is schema v2. The control protocol remains v3, the
 supervised inbound-delivery report validation format is independently schema v1, and `flux.toml`
-remains schema v1. The schema defines evidence admission; it does not establish that the selected
+uses schema 2. The schema defines evidence admission; it does not establish that the selected
 engine artifact actually exposes an authoritative report producer.
 Request construction selects TPROXY only. `REDIRECT` and `DNAT` values are negative evidence used
 to reject backend substitution, not supported request backends.
@@ -1724,11 +1774,11 @@ PREROUTING TPROXY. It never emits TPROXY in OUTPUT, falls back to REDIRECT/DNAT,
 PREROUTING evidence, infers success from counters or route lookups, or uses a veth bounce. The
 required-mode coordinator treats the still-unsupported production admission result as a failed
 functional gate, post-observes the attempt binding, compensates capture first, and never publishes
-`RUNNING`. `scripts/tproxy` remains the sole production restore writer while backlog item 3 binds
-the engine/canary, address-policy, routing, and ownership authorities into one complete target.
-Backlog item 4 must then qualify reviewed Android 5.10/ARM64 profiles, stop every shell networking
-writer and standalone address synchronizer, and transfer the lease before the first native
-production write. The pure canonical lowerer remains
+`RUNNING`. `scripts/tproxy` remains the sole production xtables restore writer while roadmap Lane A
+binds the engine, address-policy, and host ownership inputs and Lane C supplies the exact canary,
+routing, and physical-device authorities for one complete target. Gate 1 must then stop every shell
+networking writer and standalone address synchronizer and transfer the lease before the first
+native production write. The pure canonical lowerer remains
 non-authorizing by itself, while the private owner supplies transaction mechanics without supplying
 production prepared-target admission, receipt authority, daemon composition, or Android release
 qualification.
@@ -1763,15 +1813,18 @@ The parent-death lease is deliberately described as direct-child containment, no
 struct GenerationRecord {
     schema: u16,
     id: GenerationId,
+    assembly_digest: GenerationAssemblyDigest,
     phase: GenerationPhase,
     desired_digest: Digest,
     capability_profile_revision: CapabilityProfileRevision,
+    capability_profile_digest: CapabilityProfileDigest,
     engine_profile_revision: EngineCapabilityProfileRevision,
+    planning_evidence_digest: PlanningEvidenceDigest,
     engine_binary_digest: Digest,
     backend_plan: BackendPlan,
     engine: Option<EngineIdentity>,
     managed_objects: Vec<ManagedObjectRecord>,
-    previous: Option<GenerationId>,
+    previous: Option<GenerationIdentity>,
     created_at: SystemTime,
     updated_at: SystemTime,
 }
@@ -1785,6 +1838,13 @@ enum GenerationPhase {
     Failed,
 }
 ```
+
+The delivered A2 `PreparedGenerationRecord` is the non-authoritative prepared subset of this
+future journal. Its strict JSON binds the assembly identity and immediate predecessor, admission
+kind, complete capability/planning digests, inventory snapshot/epoch, engine profile/config,
+Capture Program, and xtables artifact. It is limited to 16 KiB, accepts only lowercase SHA-256
+hex, rejects noncontiguous lineage and symlinks, and uses the same file-fsync, rename, and
+directory-fsync discipline. No production active pointer consumes it yet.
 
 ### 15.2 Persistence protocol
 
@@ -1807,16 +1867,18 @@ delivered native xtables owner stores:
 - the current Generation in the journal binding, atomically rebindable under the unchanged
   component lease during replacement;
 - monotonic revision, phase, and next mutation boundary;
-- owner-payload schema 2 with exact target and optional previous Generation plus canonical
-  artifact-set, coherent tool-set, and complete dual-family policy-routing audit digests; the routing
-  digest includes the loopback name/index and every exact route/rule identity field; and
+- owner-payload schema 3 with only the exact target and optional previous identities, each binding
+  the canonical artifact set, coherent tool set, complete private runtime plan, and dual-family
+  policy-routing audit; the routing digest includes loopback name/index and every route/rule field;
 - resolvable immutable identities rather than restore programs in the bounded payload.
 
-Its files are `native_xtables.journal`, `native_xtables.lease`, the transient
-`xtables-writer.lock/` directory with a durable native-owner scope marker, and a private advisory
-guard file. Activating intent and the lease are durable before the first restore or rtnetlink
-request. Every later write is preceded by the next journal boundary. A terminal clean-absence
-record is durable before lease deletion, and recovery explicitly handles a crash between lease
+Its files are `native_xtables.journal`, `native_xtables.lease`, the checksum-protected bounded
+`native_xtables.targets` archive, the transient `xtables-writer.lock/` directory with a durable
+native-owner scope marker, and private owner/runtime advisory guard files. The runtime guard spans
+archive refresh/staging, owner journal/kernel mutation, and archive settling. Activating intent and
+the lease are durable before the first restore or rtnetlink request. Every later write is preceded
+by the next journal boundary. A terminal clean-absence record is durable before lease deletion, and
+recovery explicitly handles a crash between lease
 deletion and transient-lock removal. A live advisory guard cannot be adopted by another recovery;
 current terminal recovery retains the guard, shared writer marker, and optional surviving lease
 until the terminal payload resolves and fresh global IPv4/IPv6 xtables plus policy absence succeeds. Only
@@ -1912,6 +1974,16 @@ enum RuntimeEvent {
 }
 ```
 
+Delivered B2.2 implements the configuration subset as an internal reactor source for
+mutation-capable profiles. It watches parent directories for the authoritative Desired State, its
+selected engine template and subscription URL file, and the module `disable` entry. Raw inotify
+records are bounded and reduced to configuration-input and disable-state facts before entering a
+two-slot coalescer on the existing serialized writer. Overflow, invalidation, missing parents,
+atomic replacement, and ancestor-directory replacement trigger bounded reread, identity checks,
+and watch reinstallation. Runtime-invalid `disable` entries fail closed as disabled; invalid
+Desired State retains the last valid dynamic watch set while normal Generation compensation rejects
+the reload. Read-only profiles attach no file observer.
+
 ### 17.2 Coalescing
 
 - Config and package changes are debounced.
@@ -1928,7 +2000,14 @@ The Phase 1 serialized worker calls `maintain` after each request and after boun
 
 ## 18. Kernel I/O runtime
 
-The mandatory target baseline is one custom `epoll` reactor derived from the current `addrsyncd` design. Phase 1 currently integrates the control descriptor and shutdown `signalfd`; nonblocking route/netfilter netlink sockets, timerfd, pidfds, child pipes, and pollable BPF buffers remain later work. It owns TUN queue FDs only in a future `FluxOwnedTunFd` plan; in `EngineOwnedTun`, packet I/O stays entirely inside Sing-Box. Handlers drain bounded batches to `EAGAIN` and yield after a work budget.
+The mandatory target baseline is one custom `epoll` reactor. Phase 1 currently integrates the
+control descriptor, shutdown `signalfd`, worker `eventfd`, nonblocking route-network inventory, and
+the bounded inotify file-observation driver. File readiness is limited to eight 16 KiB reads per
+turn; missing/invalidation recovery and directory-identity checks share the reactor deadline.
+Netfilter netlink sockets, timerfd, pidfds, child pipes, and pollable BPF buffers remain later work.
+The reactor owns TUN queue FDs only in a future `FluxOwnedTunFd` plan; in `EngineOwnedTun`, packet
+I/O stays entirely inside Sing-Box. Handlers drain bounded batches to `EAGAIN` and yield after a work
+budget.
 
 Higher-level async tasks communicate through bounded channels. `io_uring` is a separate `FluxOwnedTunFd` TUN I/O Adapter selected only when the FD-handoff contract, `io_uring_setup`, required opcode probes, cancellation, a real TUN read/write smoke test, policy permissions, and device benchmarks all succeed.
 
@@ -1949,19 +2028,30 @@ The current bridge implements a deliberately split boundary:
 
 ```text
 cargo xtask build-android
-cargo xtask stage-module --stage <dir> --runtime-binaries <dir>
-cargo xtask verify-package --stage <dir>
+cargo xtask stage-module --profile bridge|rust-only --stage <dir> --runtime-binaries <dir>
+cargo xtask verify-package --profile bridge|rust-only --stage <dir>
 cargo xtask test-functional-canary-android-x86_64-output-tproxy --serial <serial> [--adb <program>]
 ```
 
-`stage-module` creates a development tree and does not claim release compliance. The current
-`verify-package` is a strict consistency boundary for that temporary hybrid inventory, not a
-release-candidate authorization. It requires a clean root worktree and clean `addrsyncd` submodule,
-binds their manifest revisions to the exact Git HEADs, byte-compares the
-reviewed source-owned module inventory, and rejects every package file outside the exact four
-binaries, reviewed module files, declared evidence, and release metadata. Required binaries must
+`conf/manifest.json` schema 2 is the checked package contract. Its `bridge` profile is explicitly
+`development-only`; its `rust-only` profile is explicitly `failing-until-complete`. The former
+requires the current 28 runtime/module paths. The latter requires the 13 final `fluxd`, Sing-Box,
+Rust-owned configuration/asset, and platform-glue paths and names the exact other 15 bridge paths as
+forbidden. The verifier proves that this forbidden set equals bridge-required minus
+Rust-only-required, so no removed bridge path can be omitted from policy.
+
+`stage-module` copies only the selected paths. `verify-package` requires the staged profile policy
+to equal the checked-in policy, then applies exact file, source-byte, binary, payload, provenance,
+and evidence checks for that selection. The bridge requires clean root and `addrsyncd` worktrees and
+binds both manifest revisions; Rust-only does not derive authority from a removed submodule. A
+successful bridge check is printed only as development evidence. Rust-only verification remains a
+deliberate failing release gate until runtime ownership converges and the checked status is changed
+in the later package cutover. Required binaries must
 be ELF64 little-endian AArch64 with a bounded file-backed executable entry, congruent load segments,
-and either no interpreter or an Android linker path. Manifest sources require a well-formed HTTPS
+power-of-two `PT_LOAD` alignment of at least `2**14` for every non-empty load segment, and either
+no interpreter or an Android linker path. NDK r27 ARM64 release and x86_64 checkpoint links receive
+both explicit `max-page-size=16384` and `common-page-size=16384` options; final ELF inspection,
+not flag presence, is authoritative. Manifest sources require a well-formed HTTPS
 host/path, immutable revision, version, target, artifact hash, and a recognized SPDX identifier or
 explicitly reviewed `LicenseRef`. Schema-1 device evidence is hashed and bound to the exact source
 revision plus operational-payload digest, Android build fingerprint, kernel 5.10+ release, boot ID,
@@ -1979,10 +2069,9 @@ also required. Symbolic links, special files, unsafe paths, hidden or ordinary `
 and unreviewed Magisk root payloads fail.
 
 This command does not authenticate self-authored third-party provenance or unsigned device JSON.
-It also verifies a package shape that deliberately still contains temporary bridge components.
-Before any rewrite release, the inventory and verifier must be updated to the Rust-only runtime;
-standalone `addrsyncd`, `jq`, legacy scripts, and compatibility wrappers must then be rejected rather
-than required. Even a pass of the updated verifier is necessary but not sufficient for publication:
+The Rust-only inventory already rejects standalone `addrsyncd`, `jq`, legacy scripts, and
+compatibility wrappers, but its failing status is not a substitute for completing their runtime
+ownership. Even a future pass after promotion is necessary but not sufficient for publication:
 ADR-0011's runtime-completion gate and the later `package-magisk` signed/reproducible provenance plus
 trusted device/CI attestation gate must also pass. The checked-in manifest intentionally retains
 blank third-party fields, so an unqualified development stage must fail this command.
@@ -2006,15 +2095,16 @@ cannot be classified by the current extension checks. Production `fluxd` does no
 
 | Development checkpoint | Runtime behavior | Releasable? |
 |---|---|---|
-| Bridge | `fluxd` owns Sing-Box through the atomic runtime coordinator; serialized shell phases still own networking writes | No |
+| Bridge | `fluxd` owns Sing-Box through the atomic runtime coordinator; serialized `scripts/tproxy` phases own xtables/Flux PBR writes and standalone `addrsyncd` owns address synchronization | No |
 | Shadow compiler | Rust emits deterministic observation-only Capture Programs; no shadow artifact enters a Generation or activation path | No |
 | Rust generation bridge | Rust prepares and attests legacy-shaped restore caches; `scripts/tproxy` remains the production restore executor/writer | No |
 | Canonical xtables lowering | Rust preserves exact schema-v1 forwarded identities and lowers local OUTPUT with pure schema-v2 `O`/`P` transaction metadata, typed routing/listener/escape requirements, and descriptive lifecycle order; five extensions remain rejected and nothing executes | No |
 | x86_64 Android mechanism checkpoint | The exact ignored local-OUTPUT TPROXY transaction passes on one rooted WSA development profile with remote cleanup; production execution, receipts, driver, and release matrix remain open | No |
-| Private native xtables owner | Rust owns stable hooks, restore/save, schema-2 dual-family routing identity, bidirectional loopback validation, complete IPv4/IPv6 residue audits, authenticated shell/native fencing, rollback, recovery, cleanup, and the transition lease behind test-only target admission; the production shell writer remains | No |
+| Private native xtables owner | Rust owns stable hooks, restore/save, schema-2 dual-family routing identity, bidirectional loopback validation, complete IPv4/IPv6 residue audits, authenticated shell/native fencing, rollback, recovery, cleanup, and the transition lease behind test-only target admission; the production `scripts/tproxy` xtables/PBR writer remains | No |
 | Native xtables production cutover | Reviewed Android authorities and functional receipts admit the private owner, the lease transfers before the first Rust write, and replaced shell rule/restore duties are deleted | No, until all intended runtime duties are Rust-owned |
 | PBR/address-sync cutover | Rust owns routing and address-derived rules; standalone `addrsyncd` and shell route writers are removed | No |
-| Remaining runtime cutover | Rust owns configuration, subscription, diagnostics, recovery, and offline cleanup; legacy runtime scripts, `jq`/AWK/curl adapters, and wrappers are removed | No |
+| Rust subscription cutover | One bounded Rust worker owns fetch, parsing, assets, validation, recovery, periodic/manual refresh, and Generation reload; the packaged shell updater is non-invoked and awaits B3 removal | No |
+| Remaining runtime cutover | Rust owns configuration, subscription, direct diagnostics, internal file observation, coordinator startup recovery, offline cleanup, and the sole CLI surface; networking-effect ownership and legacy runtime scripts plus `jq`/AWK/curl artifacts remain | No |
 | Rust-only qualification | Only platform-required install/boot/disable/uninstall glue remains outside Rust; supported runtime scope passes Android, recovery, performance, security, provenance, and packaging gates | Yes, after ADR-0011 and every final gate pass |
 
 None of the bridge, shadow, parity, or partial-cutover checkpoints may be named or published as an

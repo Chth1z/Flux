@@ -1,6 +1,7 @@
 mod lowering;
 #[allow(dead_code)]
 mod native;
+mod native_capture;
 #[allow(dead_code)]
 mod owner;
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -25,6 +26,16 @@ pub use lowering::{
     XtablesLocalOutputRoutingTarget, XtablesLocalOutputRoutingTargetError,
     XtablesLocalOutputTransactionRequirements, XtablesLoopEscapeRequirement, XtablesTproxyTarget,
     XtablesTransparentListenerRequirement, lower_xtables_capture,
+};
+
+pub use native_capture::{
+    NativeCaptureConvergedState, NativeCaptureConvergence, NativeCaptureConvergenceReport,
+    NativeCaptureDesired, NativeCaptureTargetIdentity,
+};
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use owner::{
+    NativeXtablesCaptureConvergenceError, NativeXtablesCaptureConverger, NativeXtablesCaptureTarget,
 };
 
 pub use render::{

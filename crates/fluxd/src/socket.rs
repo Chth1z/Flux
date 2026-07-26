@@ -9,13 +9,18 @@ use flux_core::{
 };
 use flux_platform::{PlatformError, ReactorError, SeqpacketConnection};
 
+use crate::inspection::InspectionSource;
 use crate::protocol::{
-    decode_control_response, decode_event_response, decode_ping_response, decode_status_response,
-    encode_control_request, encode_event_request, encode_ping_request, encode_status_request,
+    decode_control_response, decode_diagnose_response, decode_event_response,
+    decode_explain_response, decode_logs_response, decode_ping_response, decode_status_response,
+    decode_subscription_update_response, encode_control_request, encode_diagnose_request,
+    encode_event_request, encode_explain_request, encode_logs_request, encode_ping_request,
+    encode_status_request, encode_subscription_update_request,
 };
+use crate::subscription::{SubscriptionRefreshClient, SubscriptionRefreshReport};
 use crate::{
-    DaemonSnapshot, EventReport, MAX_CONTROL_PACKET_BYTES, ProtocolHandler, RequestPeerId,
-    RuntimeSnapshotSource,
+    DaemonSnapshot, DiagnosticReport, EventReport, ExplainReport, LogReport, LogStream,
+    MAX_CONTROL_PACKET_BYTES, ProtocolHandler, RequestPeerId, RuntimeSnapshotSource,
 };
 
 static NEXT_CONTROL_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
@@ -57,6 +62,34 @@ impl SocketControlClient {
         let request = encode_event_request(request_id, event_type, watched_path, event_name)?;
         let response = self.exchange(&request)?;
         decode_event_response(&response, request_id)
+    }
+
+    pub fn update_subscription(&self) -> Result<SubscriptionRefreshReport, ControlError> {
+        let request_id = self.next_request_id();
+        let request = encode_subscription_update_request(request_id)?;
+        let response = self.exchange(&request)?;
+        decode_subscription_update_response(&response, request_id)
+    }
+
+    pub fn diagnose(&self) -> Result<DiagnosticReport, ControlError> {
+        let request_id = self.next_request_id();
+        let request = encode_diagnose_request(request_id)?;
+        let response = self.exchange(&request)?;
+        decode_diagnose_response(&response, request_id)
+    }
+
+    pub fn logs(&self, stream: LogStream, lines: u16) -> Result<LogReport, ControlError> {
+        let request_id = self.next_request_id();
+        let request = encode_logs_request(request_id, stream, lines)?;
+        let response = self.exchange(&request)?;
+        decode_logs_response(&response, request_id, stream, lines)
+    }
+
+    pub fn explain(&self) -> Result<ExplainReport, ControlError> {
+        let request_id = self.next_request_id();
+        let request = encode_explain_request(request_id)?;
+        let response = self.exchange(&request)?;
+        decode_explain_response(&response, request_id)
     }
 
     fn next_request_id(&self) -> u64 {
@@ -119,6 +152,43 @@ where
         }
     }
 
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_runtime_snapshot_and_subscription(
+        capability_profile: Arc<CapabilityProfile>,
+        control: C,
+        runtime: RuntimeSnapshotSource,
+        subscription: Option<SubscriptionRefreshClient>,
+    ) -> Self {
+        Self {
+            handler: ProtocolHandler::with_runtime_snapshot_and_subscription(
+                capability_profile,
+                control,
+                runtime,
+                subscription,
+            ),
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn with_runtime_subscription_and_inspection(
+        capability_profile: Arc<CapabilityProfile>,
+        control: C,
+        runtime: RuntimeSnapshotSource,
+        subscription: Option<SubscriptionRefreshClient>,
+        inspection: Arc<dyn InspectionSource>,
+    ) -> Self {
+        Self {
+            handler: ProtocolHandler::with_runtime_subscription_and_inspection(
+                capability_profile,
+                control,
+                runtime,
+                subscription,
+                Some(inspection),
+            ),
+        }
+    }
+
     pub fn serve(&self, connection: SeqpacketConnection) -> Result<(), ControlSocketError> {
         let credentials = connection
             .require_same_effective_user()
@@ -160,4 +230,64 @@ impl Error for ControlSocketError {
 
 fn control_transport_error(error: PlatformError) -> ControlError {
     ControlError::transport(error.to_string())
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
+
+    use flux_core::{LegacyControlBridge, LegacyDispatcher};
+    use flux_platform::{DaemonReactor, ShutdownSignal};
+    use flux_testkit::CapabilityProfileFixture;
+    use tempfile::tempdir;
+
+    use super::*;
+    use crate::SubscriptionRefreshReport;
+
+    struct NoopDispatcher;
+
+    impl LegacyDispatcher for NoopDispatcher {
+        fn execute(&mut self, _intent: &LegacyIntent) -> Result<(), ControlError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn seqpacket_subscription_update_round_trips_the_typed_report() {
+        let directory = tempdir().expect("temporary directory");
+        let socket_path = directory.path().join("fluxd.sock");
+        let shutdown = ShutdownSignal::install().expect("install shutdown signal source");
+        let refreshes = Arc::new(AtomicUsize::new(0));
+        let refresh_calls = Arc::clone(&refreshes);
+        let subscription = SubscriptionRefreshClient::for_test(move || {
+            refresh_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(SubscriptionRefreshReport::updated(82, 29, false))
+        });
+        let bridge = LegacyControlBridge::start(NoopDispatcher, 2).expect("start bridge");
+        let handler = ControlConnectionHandler::with_runtime_snapshot_and_subscription(
+            Arc::new(CapabilityProfileFixture::supported()),
+            bridge,
+            RuntimeSnapshotSource::default(),
+            Some(subscription),
+        );
+        let (reactor, stop) = DaemonReactor::bind(&socket_path, shutdown, move |connection| {
+            handler.serve(connection).expect("serve control connection");
+        })
+        .expect("bind reactor");
+        let client_path = socket_path.clone();
+        let client_thread = thread::spawn(move || {
+            let report = SocketControlClient::new(client_path)
+                .update_subscription()
+                .expect("subscription update");
+            stop.request_stop().expect("request reactor stop");
+            report
+        });
+
+        reactor.run().expect("run reactor");
+        let report = client_thread.join().expect("client thread");
+
+        assert_eq!(report, SubscriptionRefreshReport::updated(82, 29, false));
+        assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+    }
 }

@@ -3,7 +3,10 @@ use std::error::Error;
 use std::fmt;
 use std::num::NonZeroU64;
 
+use crate::canonical_evidence::CanonicalEvidenceDigest;
+
 pub const CAPABILITY_PROFILE_SCHEMA_VERSION: u16 = 2;
+pub const CAPABILITY_PROFILE_DIGEST_BYTES: usize = 32;
 pub const MIN_SUPPORTED_KERNEL: KernelVersion = KernelVersion::new(5, 10, 0);
 pub const MAX_BOOT_IDENTITY_BYTES: usize = 128;
 pub const MAX_KERNEL_RELEASE_BYTES: usize = 256;
@@ -11,6 +14,9 @@ pub const MAX_DEVICE_IDENTITY_TEXT_BYTES: usize = 1_024;
 pub const MAX_TOOL_ID_BYTES: usize = 128;
 pub const MAX_DEVICE_TOOL_IDENTITIES: usize = 32;
 pub const SHA256_DIGEST_BYTES: usize = 32;
+
+const CAPABILITY_PROFILE_DIGEST_DOMAIN: &[u8] =
+    b"Flux complete Capability Profile\0canonical-schema-v2\0sha256-v1\0";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ObservationKind {
@@ -94,6 +100,21 @@ impl CapabilityProfileRevision {
     }
 }
 
+/// Domain-separated SHA-256 identity of every retained Capability Profile field.
+///
+/// The monotonic revision remains useful for freshness checks, but it is not globally unique.
+/// This digest prevents independent profiles with the same revision from sharing an identity.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(transparent)]
+pub struct CapabilityProfileDigest([u8; CAPABILITY_PROFILE_DIGEST_BYTES]);
+
+impl CapabilityProfileDigest {
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; CAPABILITY_PROFILE_DIGEST_BYTES] {
+        &self.0
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CapabilityProfile {
     schema_version: u16,
@@ -154,6 +175,32 @@ impl CapabilityProfile {
         self.revision
     }
 
+    /// Returns the canonical identity of this complete point-in-time profile.
+    #[must_use]
+    pub fn digest(&self) -> CapabilityProfileDigest {
+        let mut digest = CanonicalEvidenceDigest::new(CAPABILITY_PROFILE_DIGEST_DOMAIN);
+        digest.u16(self.schema_version);
+        digest.u64(self.revision.get());
+        digest_observation(&mut digest, &self.boot_identity, |digest, identity| {
+            digest.bytes(identity.as_str().as_bytes());
+        });
+        digest_observation(&mut digest, &self.device_identity, digest_device_identity);
+        digest_observation(&mut digest, self.kernel.release(), |digest, release| {
+            digest.bytes(release.as_str().as_bytes());
+        });
+        digest_observation(&mut digest, self.kernel.version(), |digest, version| {
+            digest_kernel_version(digest, *version);
+        });
+        digest_observation(&mut digest, &self.selinux, |digest, mode| {
+            digest.tag(match mode {
+                SelinuxMode::Enforcing => 0,
+                SelinuxMode::Permissive => 1,
+            });
+        });
+        digest_legacy_bridge(&mut digest, &self.legacy_bridge);
+        CapabilityProfileDigest(digest.finish())
+    }
+
     #[must_use]
     pub const fn boot_identity(&self) -> &Observation<BootIdentity> {
         &self.boot_identity
@@ -211,6 +258,82 @@ impl CapabilityProfile {
                 boot_identity,
             }
         }
+    }
+}
+
+fn digest_observation<T>(
+    digest: &mut CanonicalEvidenceDigest,
+    observation: &Observation<T>,
+    encode: impl FnOnce(&mut CanonicalEvidenceDigest, &T),
+) {
+    match observation {
+        Observation::Verified(value) => {
+            digest.tag(0);
+            encode(digest, value);
+        }
+        Observation::Absent => digest.tag(1),
+        Observation::Denied => digest.tag(2),
+        Observation::Malformed => digest.tag(3),
+        Observation::Unavailable => digest.tag(4),
+    }
+}
+
+fn digest_device_identity(digest: &mut CanonicalEvidenceDigest, identity: &DeviceIdentity) {
+    digest.bytes(identity.android_product.as_str().as_bytes());
+    digest.bytes(identity.android_build.as_str().as_bytes());
+    digest.bytes(identity.vendor_build.as_str().as_bytes());
+    digest.bytes(identity.security_patch.as_str().as_bytes());
+
+    let verified_boot = identity.verified_boot;
+    digest.tag(match verified_boot.state() {
+        VerifiedBootState::Green => 0,
+        VerifiedBootState::Yellow => 1,
+        VerifiedBootState::Orange => 2,
+        VerifiedBootState::Red => 3,
+    });
+    digest.boolean(verified_boot.device_locked());
+    digest.bytes(verified_boot.vbmeta_digest().as_bytes());
+
+    digest.bytes(identity.kernel_build.as_str().as_bytes());
+    digest_artifact(digest, identity.selinux_policy.artifact());
+    digest_artifact(digest, identity.netd);
+    digest_artifact(digest, identity.connectivity);
+    digest.usize(identity.tools.len());
+    for (tool, artifact) in &identity.tools {
+        digest.bytes(tool.as_str().as_bytes());
+        digest_artifact(digest, *artifact);
+    }
+    digest_network_namespace(digest, identity.network_namespace);
+}
+
+fn digest_artifact(digest: &mut CanonicalEvidenceDigest, identity: ArtifactIdentity) {
+    digest.bytes(identity.digest().as_bytes());
+    digest.u64(identity.size());
+}
+
+fn digest_network_namespace(
+    digest: &mut CanonicalEvidenceDigest,
+    identity: NetworkNamespaceIdentity,
+) {
+    digest.u64(identity.device());
+    digest.u64(identity.inode());
+}
+
+fn digest_kernel_version(digest: &mut CanonicalEvidenceDigest, version: KernelVersion) {
+    digest.u16(version.major());
+    digest.u16(version.minor());
+    digest.u16(version.patch());
+}
+
+fn digest_legacy_bridge(digest: &mut CanonicalEvidenceDigest, bridge: &LegacyBridgeFacts) {
+    for observation in [&bridge.shell, &bridge.dispatcher, &bridge.addrsync] {
+        digest_observation(digest, observation, |digest, readiness| {
+            digest.tag(match readiness.resolution() {
+                LegacyArtifactResolution::Direct => 0,
+                LegacyArtifactResolution::SymbolicLink => 1,
+            });
+            digest.boolean(readiness.is_ready());
+        });
     }
 }
 

@@ -64,7 +64,7 @@ The rewrite should move these behaviors behind `fluxd` modules instead of replac
 7. Use Aya as the default eBPF loader and Rust eBPF framework. It avoids libbpf, BCC, libelf, and zlib at runtime; includes program/map/helper feature probes; and supports the TC, cgroup, socket, ring-buffer, and map capabilities needed here.[12][13]
 8. Retain libbpf-rs as an optional engineering or experimental backend, especially for newer-kernel netfilter BPF experiments. Its CO-RE and skeleton workflow is mature, and its tree contains a netfilter example, but the native C build and Android dependency chain are materially more complex.[15][16][17][18]
 9. Make eBPF optional to correctness in the first production rewrite. It should first observe, then accelerate verified classifications or mark writes while nftables, xtables, or TUN remains a complete fallback.
-10. Expose the complete capability decision as `fluxctl capabilities --json`, including kernel version, probe operation, result, errno, extack/verifier log, selected fallback, and the boot epoch in which the probe was run.
+10. Expose the complete capability decision as `fluxd capabilities --json`, including kernel version, probe operation, result, errno, extack/verifier log, selected fallback, and the boot epoch in which the probe was run.
 
 ## Recommended kernel-plane decomposition
 
@@ -659,7 +659,7 @@ Compile Rust eBPF programs as separate no-`std` BPF objects, then embed or packa
 
 ## Observability requirements
 
-The capability report is part of correctness, not a debug afterthought. `fluxctl capabilities --json` should expose:
+The capability report is part of correctness, not a debug afterthought. `fluxd capabilities --json` should expose:
 
 - parsed kernel release and raw `uname` string;
 - Android build fingerprint, ABI, SELinux context, net namespace, and boot ID;

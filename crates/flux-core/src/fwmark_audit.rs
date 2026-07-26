@@ -2,6 +2,7 @@ use std::error::Error;
 use std::fmt;
 use std::num::NonZeroU32;
 
+use crate::canonical_evidence::CanonicalEvidenceDigest;
 use crate::network_inventory::{NetworkEpoch, NetworkInventory, NetworkInventorySnapshotId};
 use crate::network_route::NetworkAddressFamily;
 use crate::network_rule::{RuleFwMark, RulePriority};
@@ -10,6 +11,9 @@ use crate::network_rule::{RuleFwMark, RulePriority};
 pub const ANDROID_NET_ID_FWMARK_MASK: u32 = 0x0000_ffff;
 /// Maximum detailed conflicts retained in one partial fwmark audit.
 pub const MAX_FWMARK_PARTIAL_CONFLICTS: usize = 64;
+
+const FWMARK_PARTIAL_AUDIT_EVIDENCE_DIGEST_DOMAIN: &[u8] =
+    b"Flux partial fwmark audit evidence\0canonical-schema-v1\0sha256-v1\0";
 
 const FWMARK_SOURCE_STATUSES: [FwmarkSourceStatus; 9] = [
     FwmarkSourceStatus::new(
@@ -322,6 +326,52 @@ impl FwmarkPartialAudit {
         self.omitted_conflicts
     }
 
+    pub(crate) fn evidence_digest(&self) -> [u8; 32] {
+        let mut digest = CanonicalEvidenceDigest::new(FWMARK_PARTIAL_AUDIT_EVIDENCE_DIGEST_DOMAIN);
+        digest.u64(self.snapshot_id.get());
+        digest.u64(self.epoch.get());
+        update_fwmark_candidate_evidence(&mut digest, self.candidate);
+        digest.tag(match self.outcome {
+            FwmarkPartialAuditOutcome::Conflicting => 0,
+            FwmarkPartialAuditOutcome::Incomplete => 1,
+        });
+        digest.usize(self.sources.len());
+        for source in self.sources {
+            digest.tag(fwmark_evidence_source_tag(source.source));
+            digest.tag(match source.state {
+                FwmarkEvidenceState::Available => 0,
+                FwmarkEvidenceState::Opaque => 1,
+                FwmarkEvidenceState::Unavailable => 2,
+            });
+        }
+        digest.usize(self.conflicts.len());
+        for conflict in &self.conflicts {
+            match conflict {
+                FwmarkPartialConflict::AndroidNetIdOverlap { overlap } => {
+                    digest.tag(0);
+                    digest.u32(*overlap);
+                }
+                FwmarkPartialConflict::RpdbSelectorOverlap {
+                    dump_index,
+                    family,
+                    priority,
+                    selector,
+                    overlap,
+                } => {
+                    digest.tag(1);
+                    digest.usize(*dump_index);
+                    digest.tag(network_family_tag(*family));
+                    digest.u32(priority.get());
+                    digest.u32(selector.value());
+                    digest.u32(selector.mask());
+                    digest.u32(*overlap);
+                }
+            }
+        }
+        digest.u32(self.omitted_conflicts);
+        digest.finish()
+    }
+
     #[must_use]
     /// Returns the currently identified minimum prerequisites for a future mark lease.
     ///
@@ -345,6 +395,36 @@ impl FwmarkPartialAudit {
                 current_epoch: inventory.epoch(),
             })
         }
+    }
+}
+
+pub(crate) fn update_fwmark_candidate_evidence(
+    digest: &mut CanonicalEvidenceDigest,
+    candidate: FwmarkCandidate,
+) {
+    digest.u32(candidate.mask());
+    digest.u32(candidate.proxy_value());
+    digest.u32(candidate.bypass_value());
+}
+
+pub(crate) const fn fwmark_evidence_source_tag(source: FwmarkEvidenceSource) -> u8 {
+    match source {
+        FwmarkEvidenceSource::AndroidNetId => 0,
+        FwmarkEvidenceSource::Rpdb => 1,
+        FwmarkEvidenceSource::DeviceMarkPolicy => 2,
+        FwmarkEvidenceSource::LegacyXtables => 3,
+        FwmarkEvidenceSource::Nftables => 4,
+        FwmarkEvidenceSource::TrafficControlAndBpf => 5,
+        FwmarkEvidenceSource::Xfrm => 6,
+        FwmarkEvidenceSource::ConnmarkAndSocketTransfers => 7,
+        FwmarkEvidenceSource::ExistingFluxOwnership => 8,
+    }
+}
+
+pub(crate) const fn network_family_tag(family: NetworkAddressFamily) -> u8 {
+    match family {
+        NetworkAddressFamily::Ipv4 => 4,
+        NetworkAddressFamily::Ipv6 => 6,
     }
 }
 

@@ -24,11 +24,14 @@ unused_must_use = "deny"
 undocumented_unsafe_blocks = "deny"
 
 [workspace.dependencies]
+base64 = "=0.22.1"
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 toml = "0.8"
+ureq = { version = "=3.3.0", default-features = false, features = ["rustls", "gzip", "brotli"] }
+url = "=2.5.8"
 
 [profile.release]
 opt-level = 3

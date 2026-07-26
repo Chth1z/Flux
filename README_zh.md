@@ -17,12 +17,18 @@ Flux 是面向 Magisk、KernelSU 与 APatch 的 Android 透明代理模块。它
 当前开发检查点仍是 Phase 1 过渡桥接：
 
 - `fluxd` 负责管理意图、串行生命周期、Generation 恢复以及 Sing-Box 子进程。
+- Rust 所有权下，schema-3 `flux.toml` 是唯一产品策略来源。`fluxd` 会原子发布规范化
+  `config.json` 与严格兼容环境；shell 只能追加观测得到的 `KFEAT_*`，不能从 `settings.ini`
+  读取策略，也不能用 `jq` 检查生成后的 JSON。
+- `fluxd` 已接管有界 HTTPS 订阅获取、解码、规范化、规则资产存储、Sing-Box 校验、启动恢复/
+  首次获取、周期刷新和手动 `subscription update` 命令。只有获准快照才能进入既有 Generation
+  reload 路径；准入失败会恢复精确的上一份持久快照。
 - Rust 所有权下的准备阶段只调用 `fluxd render-legacy-rules`，生成保留的 source-shape restore
   缓存，并将其生产者记录为 `rust`；它不会静默回退到 shell 生成器。
 - 只有显式旧所有权路径会 source `scripts/rules`，并将缓存生产者记录为 `shell`；该路径是互斥的
   回滚路径，其他情况下 `scripts/rules` 仅作为冻结 oracle 保留。
-- `scripts/tproxy` 仍是唯一 restore 执行器和 xtables 内核写入者。在后续所有权切换前，策略路由与
-  地址派生规则也仍由 shell 适配器修改。
+- `scripts/tproxy` 仍是唯一 restore 执行器和 xtables 内核写入者。在 Gate 1 的单次网络写入者切换前，
+  策略路由与地址派生规则也仍由 shell 适配器修改。
 - 当前开发桥接仅接受 `PROXY_MODE="tproxy"`。TUN 字段为未来单一所有者方案保留，在激活前会被拒绝。
 - 当前预发布桥接的抓取验证仍是结构验证。更严格的本地 OUTPUT 功能 canary 已分阶段实现，但尚未构成
   Android 发布资格证据。
@@ -49,9 +55,9 @@ Flux 是面向 Magisk、KernelSU 与 APatch 的 Android 透明代理模块。它
 详细设计和当前门槛见 [`docs/`](docs/README.md)。
 
 临时 shell 组件继续存在，只因为它们仍是某些网络状态唯一已经证明可用的写入者或 oracle；这不是兼容
-承诺。每个 Rust 替代组件一旦通过 readback、rollback、recovery、单写入者和 Android 切换门槛，对应
-旧运行时组件就应立即删除。最终包只允许保留平台必需的安装、启动、禁用与卸载胶水，而且这些胶水不得包含
-网络策略或清理实现。
+承诺。完整 Rust 替代路径通过 readback、rollback、recovery、单写入者和 Android 门槛后，Gate 1 会整体
+移除这些网络写入者。最终包只允许保留平台必需的安装、启动、禁用与卸载胶水，而且这些胶水不得包含网络
+策略或清理实现。
 
 ## 当前能力
 
@@ -60,7 +66,8 @@ Flux 是面向 Magisk、KernelSU 与 APatch 的 Android 透明代理模块。它
 - 基于 UID 的应用允许/拒绝策略，以及 Android 用户/工作资料范围。
 - 通过过渡期独立进程 `addrsyncd` 动态协调本机地址规则。
 - Generation 级配置快照、有界回滚和启动恢复。
-- 订阅下载、过滤、模板合并和 Sing-Box 配置校验。
+- Rust 所有的订阅下载、过滤、模板合并、内容寻址规则资产和有界 active/predecessor 恢复已接入
+  `fluxd` 生产调用路径。
 - 通过 `fluxd` 私有 Unix socket 提供命令行控制。
 - 配置的 Sing-Box API 可用时，可通过 `http://127.0.0.1:9090/ui/` 进入 Zashboard。
 
@@ -76,7 +83,7 @@ alpha、beta、release candidate 或正式版本。
 升级时按文件分别处理：
 
 - `flux.toml` 始终保留，因为它是 Rust 控制器的权威配置。
-- `settings.ini` 始终迁移到新包所带的 schema。
+- `settings.ini` 始终为显式旧回滚路径迁移；Rust 所有权下的准备阶段不会读取它。
 - `template.json` 与 `addrsyncd.toml` 分别显示独立的音量键保留/重置提示。
 - 生成的桥接缓存会被清理；已有 `run/`、`state/` 和生成的 `config.json` 会保留，供启动恢复进行
   协调，后续更新/重载策略再决定何时重新生成 Sing-Box 配置。
@@ -91,12 +98,14 @@ flowchart TD
     Boot["Android late-start"] --> Service["模块内 service.sh"]
     Service --> Watchdog["有界 fluxd watchdog"]
     Watchdog --> Fluxd["fluxd daemon"]
-    Service --> Inotify["inotifyd 事实监听"]
-    Inotify --> Event["flux-event"]
-    Event --> Fluxd
-    CLI["fluxctl / fluxd CLI"] --> Socket["私有 Unix 控制 socket"]
+    CLI["fluxd CLI"] --> Socket["私有 Unix 控制 socket"]
     Socket --> Fluxd
+    Fluxd --> Observer["有界 inotify 文件观察器"]
+    Observer --> Coordinator
     Fluxd --> Coordinator["串行 RuntimeCoordinator"]
+    Fluxd --> Subscription["有界订阅 worker"]
+    Subscription --> Store["已校验 active + predecessor 存储"]
+    Subscription --> Coordinator
     Coordinator --> Engine["EngineSupervisor"]
     Engine --> SingBox["sing-box 子进程"]
     Coordinator --> Bridge["LegacyDispatcher 适配器"]
@@ -129,7 +138,8 @@ Android 软件包清单。渲染失败会使准备阶段失败，不会切换写
 
 只有显式旧所有权路径会 source `scripts/rules`；它将生产者记录为 `shell`，并作为互斥回滚路径存在。
 其他情况下该脚本仅作为冻结的字节级 oracle 保留。两条路径都只发布 restore 缓存；在生产桥接路径中，
-真正执行缓存和写入网络状态的组件仍只有 `scripts/tproxy`。
+`scripts/tproxy` 是唯一 xtables restore 执行器与写入者。`scripts/addrsync` 和独立 `addrsyncd`
+仍负责桥接的策略路由与地址派生修改。
 
 当前由实际桥接使用的 Rust 实现是旧兼容/source-shape 渲染器。它复现保留的 shell 契约，包括差分
 一致性所需的顺序与重复形式；它不是后端无关 Capture Program 的规范 lowering，也不授予原生写入
@@ -142,11 +152,13 @@ Android 软件包清单。渲染失败会使准备阶段失败，不会切换写
 
 私有 `NativeXtablesOwner` 只暴露 `converge(target)` 与 `recover()`，并在目标经过独立准入后负责稳定的
 `FLX{4|6}SP` PREROUTING / `FLX{4|6}SO` OUTPUT 根链、固定描述符的 command/restore/save、精确 xtables
-与策略路由 readback、回滚、持久 journal 恢复、清理及 shell 可见的迁移租约。持久 owner payload
-schema 2 将目标及可选上一 Generation 绑定到产物摘要、工具集摘要，以及完整 IPv4/IPv6 策略路由审计
-摘要；后者包含精确的 loopback 名称/索引身份。每次路由观察或修改前都会双向验证实时的名称到索引和
-索引到名称映射；只有 IPv4/IPv6 两套 xtables 与两族路由审计均精确或为空时，才能发布 `Active` 或
-`CleanAbsent`，因此未启用族中的残留也会阻止状态推进。
+与策略路由 readback、回滚、持久 journal 恢复、清理及 shell 可见的迁移租约。owner payload schema 3
+只保存目标及可选上一 Generation 的身份；每个身份绑定源产物、相干工具集、完整私有运行计划，以及包含
+精确 loopback 名称/索引的 IPv4/IPv6 策略路由审计。带校验和的 `native_xtables.targets` 归档最多保留
+活动目标与替换候选的精确恢复材料；一个 no-follow 运行锁覆盖归档刷新/暂存、journal 与内核收敛以及归档
+收尾。每次路由观察或修改前都会双向验证实时的名称到索引和索引到名称映射；只有 IPv4/IPv6 两套
+xtables 与两族路由审计均精确或为空时，才能发布 `Active` 或 `CleanAbsent`，因此未启用族中的残留也会
+阻止状态推进。
 
 共享 writer fence 使用 shell-owner-v2 记录：父进程 PID/`/proc` 启动 tick、可选子进程 PID/启动 tick，
 以及同一个 boot ID。任一参与者仍存活都会保持 busy。父进程绑定的 `addrsync` 或 `tproxy` 修改阶段会串行
@@ -182,87 +194,76 @@ missing-lease 状态继续 fail-closed。所有旧模式 start、stop、restart 
 ├── bin/
 │   ├── fluxd                 # Rust 控制器与 CLI
 │   ├── addrsyncd             # 过渡期地址规则协调器/回滚二进制
-│   ├── jq                    # 桥接 JSON 适配器
+│   ├── jq                    # 仅供显式旧回滚使用的 JSON 适配器
 │   └── sing-box              # 独立代理引擎
 ├── conf/
 │   ├── flux.toml             # 严格 fluxd schema
-│   ├── settings.ini          # 旧网络/订阅设置
+│   ├── settings.ini          # 仅供显式旧回滚使用的设置
 │   ├── addrsyncd.toml
 │   ├── template.json
-│   ├── config.json           # 生成的 Sing-Box 配置
+│   ├── config.json           # Rust 生成的规范化 Sing-Box 配置
 │   └── manifest.json         # 发布 provenance 契约
 ├── cache/
 │   ├── cache_rules_* / cache_cleanup_*  # Rust 或 shell 生成的 restore 文档
 │   ├── cache_packages       # Rust 软件包快照；shell 路径中不存在，无需解析时为空
 │   └── cache_valid          # 缓存生产者标记：rust 或 shell
 ├── state/
-│   └── administrative-intent.json
+│   ├── administrative-intent.json
+│   └── subscription/         # Rust 所有的已校验快照与本地规则资产
 ├── run/
 │   ├── fluxd.sock
 │   ├── fluxd.pid
+│   ├── fluxd.lease             # 内核锁；仅锁状态有效，文件存在不代表存活
 │   ├── fluxd.log
+│   ├── desired-state.env     # 只读 Rust-to-shell 桥接输入
 │   ├── generations/          # 不可变的待激活 Generation 快照
 │   └── capture.* / engine.*  # Generation 所有权与恢复记录
 └── scripts/
-    ├── fluxctl               # 兼容 CLI 包装器
-    ├── flux-event            # 原始 inotify 事实适配器
+    ├── flux-event            # 已打包的旧事件适配器；运行时无调用者
     ├── dispatcher            # 串行 shell 阶段适配器
-    ├── init / config / updater.sh
+    ├── init / config
+    ├── updater.sh            # 冻结的 bridge oracle；运行时绝不调用
     ├── rules                # 冻结 source-shape oracle 与显式旧路径回滚生成器
     ├── tproxy               # 唯一 restore 执行器与 xtables 内核写入者
     ├── addrsync
     └── lib / log / core      # 公共与仅回滚使用的辅助脚本
 ```
 
-模块管理目录 `/data/adb/modules/flux/` 包含 `service.sh`、`module.prop`、面板重定向页以及由管理器
+模块管理目录 `/data/adb/modules/flux/` 包含 `service.sh`、`uninstall.sh`、`module.prop`、面板重定向页以及由管理器
 维护的 `disable` 标记。安装器会移除旧的全局 `/data/adb/*/service.d/flux_service.sh`，确保只有模块内
 watchdog 拥有 `fluxd`。
 
 ## 配置说明
 
-`flux.toml` 配置 Rust 守护进程。它采用严格 schema：未知或缺失字段会失败，当前修改后需要重启
-守护进程。`settings.ini` 配置保留的网络与订阅桥接。
+Rust 所有权下，[`conf/flux.toml`](conf/flux.toml) 是唯一 Flux 路由、抓取与生命周期策略来源。
+Schema 3 会拒绝未知、重复或缺失字段。具备修改权限的守护进程会观察 `flux.toml`、其中选定的引擎
+模板、选定的订阅 URL 文件以及模块 `disable` 条目；变更会合并后进入已有的串行协调器，无需重启
+守护进程。稳定的只读 profile 不会附加文件观察器。Sing-Box 专属的路由、DNS、outbound 与 API
+内容仍位于单独校验的 `template.json`；它是引擎源文档，不是第二个 Flux 抓取策略权威来源。
 
-### 订阅与日志
+| Section | 负责内容 |
+|---|---|
+| `[daemon]` | fail-open 策略、协调 debounce、队列容量与 Generation 保留数量 |
+| `[engine]` / `[listener]` | Sing-Box 路径与模板、数字 UID/GID、生命周期/重启超时及 TPROXY 端口 |
+| `[capture]` | 显式 xtables 后端、本地/转发流量域、地址族及 TCP/UDP 选择 |
+| `[applications]` | 全部/允许列表/拒绝列表应用策略与 Android 用户范围 |
+| `[interfaces]` / `[bypass]` | 转发、本地绕过、排除接口及额外规范 CIDR |
+| `[subscription]` | Rust HTTPS 刷新策略、URL 文件、周期、编码/解码字节上限及节点上限 |
+| `[safety]` | Android VPN 与功能 canary 意图；启用值仍等待对应授权门槛 |
 
-| 选项 | 描述 | 默认值 |
-|---|---|---|
-| `SUBSCRIPTION_URL` | 订阅地址 | 空 |
-| `UPDATE_TIMEOUT` | 下载超时（秒） | `5` |
-| `RETRY_COUNT` | 下载重试次数 | `2` |
-| `UPDATE_INTERVAL` | 刷新间隔；`0` 禁用自动刷新 | `86400` |
-| `PREF_CLEANUP_EMOJI` | 删除节点名称中的 emoji | `1` |
-| `LOG_LEVEL` | `0` 关闭至 `4` 调试 | `3` |
-| `LOG_MAX_SIZE` | 日志轮转阈值（字节） | `1048576` |
+`template.json` 仍是独立的 Sing-Box 源文档。关闭订阅时，Rust 会通过有界、禁止 follow symlink
+的读取校验直接编译规范引擎产物；启用订阅时，有界 worker 会下载并规范化受支持的来源和规则资产，
+用 Sing-Box 校验精确合并后的候选，再通过同一套只读 `config.json` 与
+`run/desired-state.env` 桥接准备流程发布。观察到模板、URL 或 Desired State 变更时，会在配置
+协调成功后调度该 worker；禁用期间观察到的变更保持 dirty，并在移除 `disable` 时一并消费。
 
-### 代理引擎
-
-| 选项 | 描述 | 默认值 |
-|---|---|---|
-| `CORE_USER` / `CORE_GROUP` | Sing-Box 执行身份 | `root` / `root` |
-| `CORE_TIMEOUT` | 引擎启动超时（秒） | `5` |
-| `PROXY_PORT` | TPROXY 监听端口；只从 `tproxy` inbound 自动提取 | `1536` |
-| `FAKEIP_V4_RANGE` | FakeIP IPv4 范围 | `198.18.0.0/15` |
-| `FAKEIP_V6_RANGE` | FakeIP IPv6 范围 | `fc00::/18` |
-| `PROXY_MODE` | 当前桥接模式；仅接受 `tproxy` | `tproxy` |
-| `TUN_INTERFACE`、`TUN_INET4_ADDRESS`、`TUN_INET6_ADDRESS`、`TUN_MTU` | 会迁移保留，但 Phase 1 不支持 | 包内默认值 |
-
-`mixed` inbound 不是透明 TPROXY 监听器，因此不会用于自动提取端口。
-
-### 接口与应用范围
-
-| 选项 | 描述 | 默认值 |
-|---|---|---|
-| `MOBILE_INTERFACE` | 移动网络接口模式 | `rmnet_data+` |
-| `WIFI_INTERFACE` | Wi-Fi 接口 | `wlan0` |
-| `HOTSPOT_INTERFACE` | 热点接口 | `wlan2` |
-| `USB_INTERFACE` | USB 共享接口模式 | `rndis+` |
-| `PROXY_MOBILE`、`PROXY_WIFI`、`PROXY_HOTSPOT`、`PROXY_USB` | 各接口代理开关 | `1` |
-| `PROXY_IPV6` | 启用 IPv6 代理规则 | `0` |
-| `APP_PROXY_MODE` | `0` 禁用，`1` 拒绝列表/绕过列出应用，`2` 允许列表/仅代理列出应用 | `0` |
-| `APP_LIST` | 应用包名列表 | 空 |
-| `APP_USER_SCOPE` | `owner`、`all` 或 `list` | `owner` |
-| `APP_USER_LIST` | `list` 范围使用的 Android 用户 ID | `0` |
+临时 shell renderer 只能精确表达 schema 3 的一个严格子集：必须同时启用本地与转发抓取、TCP 与
+UDP，支持 IPv4-only 或双栈，不允许用户 CIDR 绕过，必须关闭 VPN 与 required-canary 意图，并且
+转发或本地绕过接口角色最多四个。启用订阅时必须已有获准的 Rust 快照，并使用当前打包的 root
+Sing-Box 身份；私有快照存储尚不支持非 root 遍历。超出这些桥接限制的有效配置会让准备阶段失败，
+不会被静默缩减。Shell 会验证精确的 41 字段环境 allowlist，并且只能追加观测到的 `KFEAT_*`。
+`scripts/updater.sh` 运行时绝不调用；它与 `settings.ini`、`jq` 仅为冻结 bridge 对照或显式旧回滚
+保留，B3 会将其移出包。
 
 ### 路由 mark 与兼容字段
 
@@ -272,39 +273,49 @@ watchdog 拥有 `fluxd`。
 
 | 选项 | 描述 | 默认值 |
 |---|---|---|
-| `ROUTING_MARK` | 可选的引擎绕过 mark；为空时使用 owner 匹配 | 空 |
+| `ROUTING_MARK` | 固定为空的桥接值；通过 owner 匹配避免代理循环 | 空 |
 | `MARK_MASK` | 旧 connmark 掩码 | `0xff` |
 | `RULE_BACKEND` | 已实现的规则适配器 | `iptables_restore` |
 | `BYPASS_SET_BACKEND` | 已实现的绕过分类器 | `zone` |
 | `MSS_CLAMP_ENABLE` | TCP MSS 钳制 | `1` |
 | `BLOCK_QUIC` | 阻断 UDP/443 | `0` |
 
-其他兼容字段见 [`conf/settings.ini`](conf/settings.ini)。
+这些值是由 Rust 输出的、经过评审的桥接常量，不是用户配置。移除 shell writer 时会一并移除，
+不会成为原生规划器的默认值。
 
 ## CLI
 
 ```bash
-/data/adb/flux/scripts/fluxctl status [--json]
-/data/adb/flux/scripts/fluxctl start
-/data/adb/flux/scripts/fluxctl stop
-/data/adb/flux/scripts/fluxctl restart
-/data/adb/flux/scripts/fluxctl reload
-/data/adb/flux/scripts/fluxctl resync
-/data/adb/flux/scripts/fluxctl diagnose
-/data/adb/flux/scripts/fluxctl rules-preview
-/data/adb/flux/scripts/fluxctl logs [file]
+/data/adb/flux/bin/fluxd status [--json]
+/data/adb/flux/bin/fluxd start|stop|restart|reload|resync
+/data/adb/flux/bin/fluxd diagnose [--json]
+/data/adb/flux/bin/fluxd logs [runtime|daemon|engine] [--lines 1..1000] [--json]
+/data/adb/flux/bin/fluxd backend explain [--json]
+/data/adb/flux/bin/fluxd plan [--dry-run] [--json]
+/data/adb/flux/bin/fluxd rules-preview [--json]
+/data/adb/flux/bin/fluxd subscription update
+/data/adb/flux/bin/fluxd cleanup --offline
 ```
 
 `status` 直接返回权威的 `fluxd` 状态，其中包括由 Rust 管理的 Sing-Box 运行状态。所有修改命令只通过
-私有控制 socket 执行，不会回退到直接调用 shell 修改系统。
+私有控制 socket 执行，不会回退到直接调用 shell 修改系统。`diagnose`、固定日志流和
+explain/preview 都是同 UID、有界、只读的 socket 操作；日志最多读取 256 KiB 源尾部，且不接受任意
+文件路径。`cleanup --offline` 不连接控制 socket，而是由 Rust 获取 `run/fluxd.lease` 后执行有界的
+持久所有权恢复；daemon 活跃或正在启动时以退出码 `75` 拒绝。lease 文件、PID 文件和 socket 的存在
+都不是存活依据。`uninstall.sh` 在 daemon 可响应时委托 Rust `stop`，否则委托该离线命令；脚本不包含
+网络或记录清理策略。Explain 只在内存中编译 schema-3 Desired State 与规范 engine JSON，不发布 Generation、
+cache、receipt 或 writer lease；它尚未把 Android package UID 和实时网络 inventory 解析为完整的
+Capture Program。安装包不再包含 shell 控制/诊断包装器；Rust preview 不进入 dispatcher，也不发布共享 cache。
 
 ## 开发状态
 
 构建、测试、特权 canary、Android 交叉编译、模块暂存和包一致性验证说明见
 [`docs/development.md`](docs/development.md)。开发暂存目录不等于可发布产物；当前
-`cargo xtask verify-package` 只检查临时 hybrid 包的一致性，即使通过也不能绕过 ADR-0011。发布前必须先
-把验证清单切换为纯 Rust 运行时，拒绝 standalone `addrsyncd`、`jq`、旧运行时脚本与兼容包装器，再完成
-不可变来源/哈希、SBOM、设备证据、固定工具链、完整校验和、可复现 provenance 与可信 attestation。
+`cargo xtask verify-package --profile bridge` 只检查临时 hybrid 包，并始终把通过结果标记为仅供开发。
+独立的 `--profile rust-only` 已要求最终 13 个路径，并拒绝 standalone `addrsyncd`、`jq`、两份旧配置和
+全部现有运行时脚本，但其状态仍明确为 `failing-until-complete`。两种 profile 都不能绕过 ADR-0011、
+可信实体设备证据、不可变来源/哈希、SBOM、固定工具链、完整校验和、可复现 provenance 与可信
+attestation。
 
 已交付的桥接渲染器只是 xtables 第一个非修改型切换：Rust 负责准备兼容字节，shell 仍负责 restore
 执行、readback、回滚与内核修改。独立的规范 lowerer 已保留 schema-v1 转发入口身份，并描述完整的

@@ -15,7 +15,9 @@ Research was performed against pinned primary-source checkouts and official docu
 4. Capability selection must use a contained create/use/observe/delete probe. Durable availability is classified as supported, unsupported, denied, conflicting, broken, or unknown; transient failures remain attempt evidence with bounded retry/backoff rather than becoming a durable capability class.
 5. Netlink notifications are lossy. Initial/full dumps, `ENOBUFS`, interrupted dumps, sequence validation, and resynchronization are correctness requirements.
 6. Sing-Box should remain an external supervised Proxy Engine. Its Clash API is not a full reload interface, and its current reload paths do not provide old-generation rollback.
-7. nftables is the preferred target because of atomic batches and sets, but the first Rust implementation should use a fingerprinted `nft` JSON Adapter as an oracle before promoting a narrow native nfnetlink codec.
+7. nftables remains the preferred long-term backend because of atomic batches and sets, but it
+   follows the first Rust-only xtables release. Its first implementation should use a fingerprinted
+   `nft` JSON Adapter as an oracle before promoting a narrow native nfnetlink codec.
 8. Android's legacy xtables path remains the guaranteed compatibility baseline; generation-specific ipsets are an optional set-population accelerator, while the stable xtables jump performs cutover and the bounded jump structure remains the last fallback.
 9. TUN must be a first-class managed Capture Path. Flux owns route/policy lifecycle and direct UAPI probes; Sing-Box remains the practical packet-stack owner until a supported FD handoff exists.
 10. eBPF must stay optional to correctness. The first sequence is `xt_bpf` observation and proxy-positive matching inside Flux-owned xtables chains, followed by TC observation on verified Generation-scoped TUN links. TUN ioctl steering still requires the future `FluxOwnedTunFd` contract; physical-interface TC/XDP and Android root-cgroup hooks are not automatic targets.
@@ -32,6 +34,14 @@ Research was performed against pinned primary-source checkouts and official docu
     Android 5.10/ARM64 production and release qualification remain open, TC `bpf_sk_assign()` is a
     separate experimental candidate requiring its own ADR, and production `.ko` loading remains
     prohibited.
+18. The shortest safe ownership path is the already-built native xtables/rtnetlink owner, not a new
+    nftables implementation. One nft ruleset batch is atomic, but routes, RPDB, listener readiness,
+    process identity, and Generation publication remain outside it; the durable transaction model is
+    still required.
+19. Root-owned proxy sockets do not automatically inherit an intercepted application's Android
+    VPN/network context. `respect_android_vpn` needs capture exclusion or an exact per-origin,
+    profile-probed egress adapter. The pinned NDK r27d package also needs an explicit 16 KB ELF
+    alignment gate.
 
 ## Notes
 
@@ -69,6 +79,27 @@ Traces local OUTPUT through Linux 5.10 routing and loopback receive processing, 
 TPROXY, `sk_lookup`, cgroup rewriting, TC `bpf_sk_assign()`, and LKM options, and defines the exact
 dual-stack TCP/UDP qualification and cleanup evidence. It also records the successful rooted
 x86_64 WSA mechanism run and the remaining Android 5.10/ARM64 production gates.
+
+### [Open-source architecture comparison for the Rust cutover (2026-07)](open-source-architecture-comparison-2026-07.md)
+
+Compares current Sing-Box/Sing-Tun, mihomo, dae, Netavark, active rooted-Android proxy modules,
+Linux/Netfilter, AOSP netd/xtables, Magisk, and Android build contracts against Flux's actual
+composition. It concludes that the existing native xtables owner is the fastest safe Rust cutover,
+records exact source refs and licenses, and adds VPN egress, netd restart, and 16 KB ELF gates.
+
+### [Android 16 KiB ELF compatibility with NDK r27 (2026-07)](android-16kb-elf-compatibility-2026-07.md)
+
+Pins the Android, NDK r27d, LLVM LLD, Bionic loader, AOSP helper, and Cargo sources behind B3.1.
+It requires both maximum/common 16 KiB linker page-size options for raw Cargo links and structured
+inspection of every `PT_LOAD`, while keeping 4 KiB WSA execution separate from 16 KiB runtime
+qualification.
+
+### [Rust HTTP/TLS dependency spike for P0-B1 (2026-07)](rust-http-tls-dependency-spike-2026-07.md)
+
+Compares exact `ureq` and `minreq` releases for the bounded synchronous subscription Adapter,
+including redirect, timeout, compression, encoded/decoded size, proxy-environment, Android TLS,
+cross-build, licensing, and RustSec constraints. It recommends exact `ureq 3.3.0` with Rustls,
+pending explicit production-dependency approval.
 
 ## Cloned source families
 

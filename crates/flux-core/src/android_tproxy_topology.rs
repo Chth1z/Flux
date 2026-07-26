@@ -3,6 +3,7 @@ use std::fmt;
 
 use crate::android_netd::AndroidNetdSourceProfile;
 use crate::android_rpdb::{AndroidRpdbClassificationReport, AndroidRpdbRuleRole};
+use crate::canonical_evidence::CanonicalEvidenceDigest;
 use crate::network_inventory::{
     InterfaceIndex, InterfaceLinkFlags, InterfaceName, NetworkEpoch, NetworkInventory,
     NetworkInventorySnapshotId,
@@ -13,6 +14,8 @@ use crate::rpdb_placement::{RpdbClassifierRevision, RpdbRuleClassification};
 
 const ANDROID_LOCAL_NETWORK_PRIORITY: RulePriority = RulePriority::from_raw(20_000);
 const ANDROID_TETHERING_PRIORITY: RulePriority = RulePriority::from_raw(21_000);
+const ANDROID_TPROXY_TOPOLOGY_EVIDENCE_DIGEST_DOMAIN: &[u8] =
+    b"Flux Android TPROXY topology evidence\0canonical-schema-v1\0sha256-v1\0";
 
 /// Maximum traffic domains accepted by one atomic topology-scope request.
 pub const MAX_ANDROID_TPROXY_REQUESTED_DOMAINS: usize = 64;
@@ -756,6 +759,24 @@ impl AndroidTproxyTopologyScopeReport {
         self.structural_feasibility
     }
 
+    pub(crate) fn evidence_digest(&self) -> [u8; 32] {
+        let mut digest =
+            CanonicalEvidenceDigest::new(ANDROID_TPROXY_TOPOLOGY_EVIDENCE_DIGEST_DOMAIN);
+        digest.u64(self.snapshot_id.get());
+        digest.u64(self.epoch.get());
+        digest.u64(self.classifier_revision.get());
+        digest.bytes(self.profile.source_revision().as_bytes());
+        digest_topology_scope_request(&mut digest, &self.request);
+        digest.usize(self.entries.len());
+        for entry in &self.entries {
+            digest_traffic_domain_request(&mut digest, entry.domain);
+            digest_topology_report(&mut digest, &entry.report);
+            digest_structural_feasibility(&mut digest, entry.structural_feasibility);
+        }
+        digest_scope_structural_feasibility(&mut digest, self.structural_feasibility);
+        digest.finish()
+    }
+
     #[must_use]
     pub const fn deferred_prerequisites(&self) -> &'static [DeferredAndroidTproxyPrerequisite] {
         deferred_prerequisites_for_shape(self.request.shape)
@@ -784,6 +805,201 @@ impl AndroidTproxyTopologyScopeReport {
                 current_classifier_revision: classification.audit().classifier_revision(),
             })
         }
+    }
+}
+
+fn digest_topology_scope_request(
+    digest: &mut CanonicalEvidenceDigest,
+    request: &AndroidTproxyTopologyScopeRequest,
+) {
+    digest.tag(routing_shape_tag(request.shape));
+    digest.usize(request.domains.len());
+    for domain in &request.domains {
+        digest_traffic_domain_request(digest, *domain);
+    }
+}
+
+fn digest_traffic_domain_request(
+    digest: &mut CanonicalEvidenceDigest,
+    request: AndroidTproxyTrafficDomainRequest,
+) {
+    match request {
+        AndroidTproxyTrafficDomainRequest::ResidualLocalOutput { family } => {
+            digest.tag(0);
+            digest.tag(family_tag(family));
+        }
+        AndroidTproxyTrafficDomainRequest::TetherIngress {
+            family,
+            input_interface,
+        } => {
+            digest.tag(1);
+            digest.tag(family_tag(family));
+            digest.bytes(input_interface.as_bytes());
+        }
+    }
+}
+
+fn digest_topology_report(
+    digest: &mut CanonicalEvidenceDigest,
+    report: &AndroidTproxyTopologyFeasibilityReport,
+) {
+    digest.u64(report.snapshot_id.get());
+    digest.u64(report.epoch.get());
+    digest.u64(report.classifier_revision.get());
+    digest.bytes(report.profile.source_revision().as_bytes());
+    digest.tag(traffic_domain_kind_tag(report.kind));
+
+    digest.tag(family_tag(report.selector.family));
+    digest.bytes(report.selector.input_interface.as_bytes());
+    match report.selector.android_fwmark {
+        Some(mark) => {
+            digest.tag(1);
+            digest.u32(mark.value());
+            digest.u32(mark.mask());
+        }
+        None => digest.tag(0),
+    }
+    digest.u32(report.input_interface_index.get());
+
+    digest.usize(report.anchor.dump_index);
+    digest.tag(android_rpdb_role_tag(report.anchor.role));
+    digest.u32(report.anchor.priority.get());
+    digest.u32(report.anchor.lookup_table.get());
+    digest.u32(report.interval.android_first_through.get());
+    digest.u32(report.interval.flux_first_before.get());
+    digest.usize(report.dispositions.len());
+    for disposition in &report.dispositions {
+        match disposition {
+            AndroidTproxyRuleDisposition::OtherFamily => digest.tag(0),
+            AndroidTproxyRuleDisposition::AndroidFirst => digest.tag(1),
+            AndroidTproxyRuleDisposition::FluxFirstRequiresHandoff => digest.tag(2),
+            AndroidTproxyRuleDisposition::SelectorDisjoint(reason) => {
+                digest.tag(3);
+                digest.tag(match reason {
+                    AndroidTproxySelectorDisjointReason::InputInterfaceMismatch => 0,
+                    AndroidTproxySelectorDisjointReason::FwmarkPredicateConflict => 1,
+                });
+            }
+            AndroidTproxyRuleDisposition::Unknown => digest.tag(4),
+        }
+    }
+    digest.u32(report.unknown_rule_count);
+}
+
+fn digest_structural_feasibility(
+    digest: &mut CanonicalEvidenceDigest,
+    feasibility: AndroidTproxyStructuralFeasibility,
+) {
+    match feasibility {
+        AndroidTproxyStructuralFeasibility::IncompatibleTrafficDomain { shape, domain } => {
+            digest.tag(0);
+            digest.tag(routing_shape_tag(shape));
+            digest.tag(traffic_domain_kind_tag(domain));
+        }
+        AndroidTproxyStructuralFeasibility::IncompleteEvidence { unknown_rule_count } => {
+            digest.tag(1);
+            digest.u32(unknown_rule_count);
+        }
+        AndroidTproxyStructuralFeasibility::InsufficientPrioritySlots {
+            shape,
+            required,
+            available,
+        } => {
+            digest.tag(2);
+            digest.tag(routing_shape_tag(shape));
+            digest.tag(required);
+            digest.u32(available);
+        }
+        AndroidTproxyStructuralFeasibility::ResidualCandidateWindow {
+            shape,
+            required,
+            available,
+        } => {
+            digest.tag(3);
+            digest.tag(routing_shape_tag(shape));
+            digest.tag(required);
+            digest.u32(available);
+        }
+    }
+}
+
+fn digest_scope_structural_feasibility(
+    digest: &mut CanonicalEvidenceDigest,
+    feasibility: AndroidTproxyTopologyScopeStructuralFeasibility,
+) {
+    match feasibility {
+        AndroidTproxyTopologyScopeStructuralFeasibility::DefiniteStructuralRejection {
+            rejected_anchor_count,
+        } => {
+            digest.tag(0);
+            digest.u32(rejected_anchor_count);
+        }
+        AndroidTproxyTopologyScopeStructuralFeasibility::IncompleteEvidence {
+            incomplete_anchor_count,
+        } => {
+            digest.tag(1);
+            digest.u32(incomplete_anchor_count);
+        }
+        AndroidTproxyTopologyScopeStructuralFeasibility::AllMatchedAnchorsHaveResidualCandidateWindows {
+            anchor_count,
+        } => {
+            digest.tag(2);
+            digest.u32(anchor_count);
+        }
+    }
+}
+
+const fn family_tag(family: NetworkAddressFamily) -> u8 {
+    match family {
+        NetworkAddressFamily::Ipv4 => 4,
+        NetworkAddressFamily::Ipv6 => 6,
+    }
+}
+
+const fn traffic_domain_kind_tag(kind: AndroidTproxyTrafficDomainKind) -> u8 {
+    match kind {
+        AndroidTproxyTrafficDomainKind::ResidualLocalOutput => 0,
+        AndroidTproxyTrafficDomainKind::TetherIngress => 1,
+    }
+}
+
+const fn routing_shape_tag(shape: AndroidTproxyRoutingShape) -> u8 {
+    match shape {
+        AndroidTproxyRoutingShape::DedicatedAddressBypassRule => 0,
+        AndroidTproxyRoutingShape::PreMarkAddressHostSet => 1,
+    }
+}
+
+const fn android_rpdb_role_tag(role: AndroidRpdbRuleRole) -> u8 {
+    match role {
+        AndroidRpdbRuleRole::KernelLocal => 0,
+        AndroidRpdbRuleRole::VpnOverrideSystem => 1,
+        AndroidRpdbRuleRole::VpnOverrideOutputInterface => 2,
+        AndroidRpdbRuleRole::VpnOutputToLocal => 3,
+        AndroidRpdbRuleRole::SecureVpn => 4,
+        AndroidRpdbRuleRole::ProhibitNonVpn => 5,
+        AndroidRpdbRuleRole::UidExplicitNetwork => 6,
+        AndroidRpdbRuleRole::UidExplicitUnreachable => 7,
+        AndroidRpdbRuleRole::LocalNetworkExplicit => 8,
+        AndroidRpdbRuleRole::ExplicitNetwork => 9,
+        AndroidRpdbRuleRole::OutputInterface => 10,
+        AndroidRpdbRuleRole::LegacySystem => 11,
+        AndroidRpdbRuleRole::LegacyNetwork => 12,
+        AndroidRpdbRuleRole::LocalNetwork => 13,
+        AndroidRpdbRuleRole::PhysicalLocalNetwork => 14,
+        AndroidRpdbRuleRole::Tethering => 15,
+        AndroidRpdbRuleRole::UidImplicitNetwork => 16,
+        AndroidRpdbRuleRole::UidImplicitUnreachable => 17,
+        AndroidRpdbRuleRole::ImplicitNetwork => 18,
+        AndroidRpdbRuleRole::BypassableVpnNoLocalExclusion => 19,
+        AndroidRpdbRuleRole::UidLocalRoutes => 20,
+        AndroidRpdbRuleRole::LocalRoutes => 21,
+        AndroidRpdbRuleRole::BypassableVpnLocalExclusion => 22,
+        AndroidRpdbRuleRole::VpnFallthrough => 23,
+        AndroidRpdbRuleRole::UidDefaultNetwork => 24,
+        AndroidRpdbRuleRole::UidDefaultUnreachable => 25,
+        AndroidRpdbRuleRole::DefaultNetwork => 26,
+        AndroidRpdbRuleRole::FinalUnreachable => 27,
     }
 }
 

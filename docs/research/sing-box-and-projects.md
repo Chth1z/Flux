@@ -294,7 +294,7 @@ Flux policy should be:
 - non-loopback bind: explicit opt-in, generated strong secret, restricted origins, and a prominent status warning;
 - treat websocket query tokens as sensitive and avoid logging full URLs;
 - never make Clash API reachability the only readiness probe;
-- do not map `fluxctl reload` to `/configs`; use the `fluxd` control protocol;
+- do not map `fluxd reload` to `/configs`; use the `fluxd` control protocol;
 - proxy only the compatibility endpoints that the bundled UI needs, if Flux places an authorization layer in front.
 
 ## 6. Adjacent TUN and userspace-stack projects
@@ -398,7 +398,7 @@ Idle -> Preparing -> ReadyToSwitch -> Switching -> DrainingOld -> Active
 Switching failure  -> RollingBack -> Active(old) or Degraded
 ```
 
-Every stage must be observable through `fluxctl status --json`, and a crash-recovery journal must say which generation owns which kernel objects.
+Every stage must be observable through `fluxd status --json`, and a crash-recovery journal must say which generation owns which kernel objects.
 
 ## 8. Magisk lifecycle requirements
 

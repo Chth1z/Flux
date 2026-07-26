@@ -12,6 +12,8 @@ use crate::netlink::policy_routing::{
     ManagedInterfaceIdentity, ManagedPolicyRoutingIdentity, PolicyRoutingMutation,
 };
 
+#[cfg(test)]
+use super::super::XtablesCaptureArtifactSet;
 use super::super::owner_durable::{
     NativeXtablesDurableError, NativeXtablesDurableStore, NativeXtablesGeneration,
     NativeXtablesJournalBinding, NativeXtablesJournalPhase, NativeXtablesJournalRecord,
@@ -22,15 +24,17 @@ use super::super::save::{
     XtablesExpectedState, XtablesExpectedStatePhase, XtablesSaveProjection,
     XtablesSaveProjectionError,
 };
-use super::super::{XtablesCaptureArtifactSet, XtablesRestoreArtifact, XtablesRestoreFamily};
+use super::super::{XtablesRestoreArtifact, XtablesRestoreFamily};
 use super::{XtablesStableFamilyPlan, XtablesStableTopologyError, XtablesStableTopologyPlan};
 
-const OWNER_PAYLOAD_SCHEMA: u16 = 2;
+const OWNER_PAYLOAD_SCHEMA: u16 = 3;
 const IDENTITY_DIGEST_BYTES: usize = 32;
 const ALL_XTABLES_FAMILIES: [XtablesRestoreFamily; 2] =
     [XtablesRestoreFamily::Ipv4, XtablesRestoreFamily::Ipv6];
 const ROUTING_IDENTITY_DIGEST_DOMAIN: &[u8] =
     b"Flux native xtables bound policy-routing audit\0sha256-v1\0";
+const TARGET_RECOVERY_MATERIAL_DIGEST_DOMAIN: &[u8] =
+    b"Flux native xtables exact recovery material\0sha256-v1\0";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct NativePolicyRoutingAudit {
@@ -84,7 +88,7 @@ impl Error for NativePolicyRoutingAuditError {}
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct NativeXtablesTargetIdentity {
     generation: NativeXtablesGeneration,
-    artifact_digest: [u8; IDENTITY_DIGEST_BYTES],
+    target_digest: [u8; IDENTITY_DIGEST_BYTES],
     tool_digest: [u8; IDENTITY_DIGEST_BYTES],
     routing_digest: [u8; IDENTITY_DIGEST_BYTES],
 }
@@ -96,8 +100,8 @@ impl NativeXtablesTargetIdentity {
     }
 
     #[must_use]
-    pub(crate) const fn artifact_digest(self) -> [u8; IDENTITY_DIGEST_BYTES] {
-        self.artifact_digest
+    pub(crate) const fn target_digest(self) -> [u8; IDENTITY_DIGEST_BYTES] {
+        self.target_digest
     }
 
     #[must_use]
@@ -118,7 +122,7 @@ impl NativeXtablesTargetIdentity {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct NativeXtablesAdmittedTarget {
     identity: NativeXtablesTargetIdentity,
-    artifacts: Box<XtablesCaptureArtifactSet>,
+    source_artifact_digest: [u8; IDENTITY_DIGEST_BYTES],
     topology: Box<XtablesStableTopologyPlan>,
     routing: Box<[ManagedPolicyRoutingIdentity]>,
     routing_audit: Box<NativePolicyRoutingAudit>,
@@ -179,14 +183,83 @@ impl NativeXtablesAdmittedTarget {
             return Err(NativeXtablesTargetError::AuditRoutingMismatch);
         }
 
+        let source_artifact_digest = *artifacts.digest().as_bytes();
+        let routing_digest = digest_policy_routing_audit(&routing_audit);
+        let target_digest = digest_target_recovery_material(
+            generation,
+            source_artifact_digest,
+            tool_digest,
+            routing_digest,
+            &topology,
+            &routing,
+            &routing_audit,
+        );
         Ok(Self {
             identity: NativeXtablesTargetIdentity {
                 generation,
-                artifact_digest: *artifacts.digest().as_bytes(),
+                target_digest,
                 tool_digest,
-                routing_digest: digest_policy_routing_audit(&routing_audit),
+                routing_digest,
             },
-            artifacts: Box::new(artifacts),
+            source_artifact_digest,
+            topology: Box::new(topology),
+            routing: routing.into_boxed_slice(),
+            routing_audit: Box::new(routing_audit),
+        })
+    }
+
+    fn from_recovery(
+        identity: NativeXtablesTargetIdentity,
+        source_artifact_digest: [u8; IDENTITY_DIGEST_BYTES],
+        topology: XtablesStableTopologyPlan,
+        mut routing: Vec<ManagedPolicyRoutingIdentity>,
+        routing_audit: NativePolicyRoutingAudit,
+    ) -> Result<Self, NativeXtablesTargetError> {
+        routing.sort_by_key(|identity| family_key(identity.family()));
+        if routing
+            .windows(2)
+            .any(|pair| pair[0].family() == pair[1].family())
+        {
+            return Err(NativeXtablesTargetError::UnexpectedRouting);
+        }
+        for family in topology.families() {
+            let has_routing = routing
+                .iter()
+                .any(|identity| restore_family(identity.family()) == family.family());
+            if family.output_root().is_some() != has_routing {
+                return Err(if has_routing {
+                    NativeXtablesTargetError::UnexpectedRouting
+                } else {
+                    NativeXtablesTargetError::MissingRouting {
+                        family: family.family(),
+                    }
+                });
+            }
+        }
+        if routing
+            .iter()
+            .any(|identity| routing_audit.identity(identity.family()) != *identity)
+        {
+            return Err(NativeXtablesTargetError::AuditRoutingMismatch);
+        }
+        if digest_policy_routing_audit(&routing_audit) != identity.routing_digest {
+            return Err(NativeXtablesTargetError::RecoveryRoutingDigestMismatch);
+        }
+        let target_digest = digest_target_recovery_material(
+            identity.generation,
+            source_artifact_digest,
+            identity.tool_digest,
+            identity.routing_digest,
+            &topology,
+            &routing,
+            &routing_audit,
+        );
+        if target_digest != identity.target_digest {
+            return Err(NativeXtablesTargetError::RecoveryMaterialDigestMismatch);
+        }
+        Ok(Self {
+            identity,
+            source_artifact_digest,
             topology: Box::new(topology),
             routing: routing.into_boxed_slice(),
             routing_audit: Box::new(routing_audit),
@@ -199,8 +272,8 @@ impl NativeXtablesAdmittedTarget {
     }
 
     #[must_use]
-    pub(crate) const fn artifacts(&self) -> &XtablesCaptureArtifactSet {
-        &self.artifacts
+    pub(crate) const fn source_artifact_digest(&self) -> [u8; IDENTITY_DIGEST_BYTES] {
+        self.source_artifact_digest
     }
 
     #[must_use]
@@ -226,6 +299,8 @@ pub(crate) enum NativeXtablesTargetError {
     RoutingMismatch { family: XtablesRestoreFamily },
     UnexpectedRouting,
     AuditRoutingMismatch,
+    RecoveryRoutingDigestMismatch,
+    RecoveryMaterialDigestMismatch,
 }
 
 impl fmt::Display for NativeXtablesTargetError {
@@ -248,6 +323,11 @@ impl fmt::Display for NativeXtablesTargetError {
             Self::AuditRoutingMismatch => formatter.write_str(
                 "target policy-routing identity differs from its complete recovery audit",
             ),
+            Self::RecoveryRoutingDigestMismatch => formatter.write_str(
+                "recovered target policy-routing audit digest does not match its identity",
+            ),
+            Self::RecoveryMaterialDigestMismatch => formatter
+                .write_str("recovered target runtime material digest does not match its identity"),
         }
     }
 }
@@ -600,7 +680,7 @@ fn encode_optional_identity(identity: Option<NativeXtablesTargetIdentity>) -> St
     format!(
         "{}:{}:{}:{}",
         identity.generation.get(),
-        encode_hex(&identity.artifact_digest),
+        encode_hex(&identity.target_digest),
         encode_hex(&identity.tool_digest),
         encode_hex(&identity.routing_digest),
     )
@@ -620,12 +700,12 @@ fn parse_optional_identity(
         .ok_or(NativeXtablesOwnerError::InvalidPayload(
             "invalid target generation",
         ))?;
-    let artifact_digest =
+    let target_digest =
         fields
             .next()
             .and_then(decode_digest)
             .ok_or(NativeXtablesOwnerError::InvalidPayload(
-                "invalid target artifact digest",
+                "invalid target digest",
             ))?;
     let tool_digest =
         fields
@@ -648,7 +728,7 @@ fn parse_optional_identity(
     }
     Ok(Some(NativeXtablesTargetIdentity {
         generation,
-        artifact_digest,
+        target_digest,
         tool_digest,
         routing_digest,
     }))
@@ -658,43 +738,127 @@ fn digest_policy_routing_audit(audit: &NativePolicyRoutingAudit) -> [u8; IDENTIT
     let mut digest = Sha256::new();
     digest.update(ROUTING_IDENTITY_DIGEST_DOMAIN);
     for identity in audit.identities() {
-        digest.update([family_key(identity.family())]);
-        let loopback = identity.loopback();
-        digest.update((loopback.name().as_bytes().len() as u32).to_be_bytes());
-        digest.update(loopback.name().as_bytes());
-        digest.update(loopback.index().get().to_be_bytes());
-
-        let route = identity.route();
-        digest.update([family_key(route.family())]);
-        match route.destination().address() {
-            IpAddr::V4(address) => {
-                digest.update([4]);
-                digest.update(address.octets());
-            }
-            IpAddr::V6(address) => {
-                digest.update([6]);
-                digest.update(address.octets());
-            }
-        }
-        digest.update([route.destination().prefix_length()]);
-        digest.update(route.table().get().to_be_bytes());
-        digest.update([
-            route.protocol().raw(),
-            route.scope().raw(),
-            route.route_type().raw(),
-        ]);
-        digest.update(route.metric().get().to_be_bytes());
-        digest.update(route.output_interface().get().to_be_bytes());
-
-        let rule = identity.rule();
-        digest.update([family_key(rule.family())]);
-        digest.update(rule.priority().get().to_be_bytes());
-        digest.update(rule.table().get().to_be_bytes());
-        digest.update(rule.mark().value().to_be_bytes());
-        digest.update(rule.mark().mask().to_be_bytes());
-        digest.update([rule.protocol().raw()]);
+        update_policy_routing_identity(&mut digest, *identity);
     }
     digest.finalize().into()
+}
+
+fn digest_target_recovery_material(
+    generation: NativeXtablesGeneration,
+    artifact_digest: [u8; IDENTITY_DIGEST_BYTES],
+    tool_digest: [u8; IDENTITY_DIGEST_BYTES],
+    routing_digest: [u8; IDENTITY_DIGEST_BYTES],
+    topology: &XtablesStableTopologyPlan,
+    routing: &[ManagedPolicyRoutingIdentity],
+    routing_audit: &NativePolicyRoutingAudit,
+) -> [u8; IDENTITY_DIGEST_BYTES] {
+    let mut digest = Sha256::new();
+    digest.update(TARGET_RECOVERY_MATERIAL_DIGEST_DOMAIN);
+    digest.update(generation.get().to_be_bytes());
+    digest.update(artifact_digest);
+    digest.update(tool_digest);
+    digest.update(routing_digest);
+    update_count(&mut digest, topology.families().len());
+    for family in topology.families() {
+        digest.update([restore_family_key(family.family())]);
+        update_count(&mut digest, family.private_chains().len());
+        for chain in family.private_chains() {
+            update_bytes(&mut digest, chain.as_bytes());
+        }
+        update_optional_text(&mut digest, family.prerouting_root());
+        update_optional_text(&mut digest, family.output_root());
+        for artifact in [
+            Some(family.prepare()),
+            Some(family.retire()),
+            Some(family.install()),
+            Some(family.switch()),
+            family.detach_output(),
+            Some(family.detach_remaining()),
+        ] {
+            match artifact {
+                Some(artifact) => {
+                    digest.update([1]);
+                    update_bytes(&mut digest, &artifact.render_canonical());
+                }
+                None => digest.update([0]),
+            }
+        }
+    }
+    update_count(&mut digest, routing.len());
+    for identity in routing {
+        update_policy_routing_identity(&mut digest, *identity);
+    }
+    for identity in routing_audit.identities() {
+        update_policy_routing_identity(&mut digest, *identity);
+    }
+    digest.finalize().into()
+}
+
+fn update_policy_routing_identity(digest: &mut Sha256, identity: ManagedPolicyRoutingIdentity) {
+    digest.update([family_key(identity.family())]);
+    let loopback = identity.loopback();
+    update_bytes(digest, loopback.name().as_bytes());
+    digest.update(loopback.index().get().to_be_bytes());
+
+    let route = identity.route();
+    digest.update([family_key(route.family())]);
+    match route.destination().address() {
+        IpAddr::V4(address) => {
+            digest.update([4]);
+            digest.update(address.octets());
+        }
+        IpAddr::V6(address) => {
+            digest.update([6]);
+            digest.update(address.octets());
+        }
+    }
+    digest.update([route.destination().prefix_length()]);
+    digest.update(route.table().get().to_be_bytes());
+    digest.update([
+        route.protocol().raw(),
+        route.scope().raw(),
+        route.route_type().raw(),
+    ]);
+    digest.update(route.metric().get().to_be_bytes());
+    digest.update(route.output_interface().get().to_be_bytes());
+
+    let rule = identity.rule();
+    digest.update([family_key(rule.family())]);
+    digest.update(rule.priority().get().to_be_bytes());
+    digest.update(rule.table().get().to_be_bytes());
+    digest.update(rule.mark().value().to_be_bytes());
+    digest.update(rule.mark().mask().to_be_bytes());
+    digest.update([rule.protocol().raw()]);
+}
+
+fn update_optional_text(digest: &mut Sha256, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            digest.update([1]);
+            update_bytes(digest, value.as_bytes());
+        }
+        None => digest.update([0]),
+    }
+}
+
+fn update_bytes(digest: &mut Sha256, value: &[u8]) {
+    update_count(digest, value.len());
+    digest.update(value);
+}
+
+fn update_count(digest: &mut Sha256, value: usize) {
+    digest.update(
+        u64::try_from(value)
+            .expect("native recovery material length fits u64")
+            .to_be_bytes(),
+    );
+}
+
+const fn restore_family_key(family: XtablesRestoreFamily) -> u8 {
+    match family {
+        XtablesRestoreFamily::Ipv4 => 4,
+        XtablesRestoreFamily::Ipv6 => 6,
+    }
 }
 
 fn encode_hex(bytes: &[u8]) -> String {
@@ -1328,11 +1492,7 @@ where
                 NativeXtablesJournalPhase::Activating,
                 prepare_step(family.family()),
             )?;
-            let pair = target
-                .artifacts()
-                .pair(family.family())
-                .expect("topology family has an artifact pair");
-            self.adapter.restore(family.family(), pair.prepare())?;
+            self.adapter.restore(family.family(), family.prepare())?;
         }
         self.require_prepared_state(&[target], None)?;
 
@@ -1461,11 +1621,7 @@ where
                 NativeXtablesJournalPhase::Activating,
                 prepare_step(family.family()),
             )?;
-            let pair = target
-                .artifacts()
-                .pair(family.family())
-                .expect("replacement topology family has an artifact pair");
-            self.adapter.restore(family.family(), pair.prepare())?;
+            self.adapter.restore(family.family(), family.prepare())?;
         }
         self.require_active_state(&[current, target], current)?;
         self.require_policy_exact(current)?;
@@ -1487,11 +1643,7 @@ where
                 NativeXtablesJournalPhase::Activating,
                 retire_step(family.family()),
             )?;
-            let pair = current
-                .artifacts()
-                .pair(family.family())
-                .expect("current topology family has an artifact pair");
-            self.adapter.restore(family.family(), pair.retire())?;
+            self.adapter.restore(family.family(), family.retire())?;
         }
         self.require_active_state(&[target], target)?;
         self.require_policy_exact(target)
@@ -1510,23 +1662,19 @@ where
             NativeOwnerStep::Rollback,
         )?;
         for family in current.topology().families() {
-            let pair = current
-                .artifacts()
-                .pair(family.family())
-                .expect("current topology family has an artifact pair");
             let observed = self.adapter.observe_xtables(family.family())?;
-            if !private_target_present(&observed, pair)? {
+            if !private_target_present(&observed, family)? {
                 cursor.advance(
                     lease,
                     NativeXtablesJournalPhase::Activating,
                     prepare_step(family.family()),
                 )?;
-                if let Err(error) = self.adapter.restore(family.family(), pair.prepare()) {
+                if let Err(error) = self.adapter.restore(family.family(), family.prepare()) {
                     let prepared_despite_error = error.certainty()
                         == NativeMutationCertainty::MayHaveMutated
                         && private_target_present(
                             &self.adapter.observe_xtables(family.family())?,
-                            pair,
+                            family,
                         )?;
                     if !prepared_despite_error {
                         return Err(error.into());
@@ -1534,11 +1682,11 @@ where
                 }
             }
             let observed = self.adapter.observe_xtables(family.family())?;
-            let target_pair = target
-                .artifacts()
-                .pair(family.family())
-                .expect("replacement topology family has an artifact pair");
-            let target_present = private_target_present(&observed, target_pair)?;
+            let target_family = target
+                .topology()
+                .family(family.family())
+                .expect("replacement topology family has a family plan");
+            let target_present = private_target_present(&observed, target_family)?;
             let prepared = if target_present {
                 vec![current, target]
             } else {
@@ -1575,11 +1723,11 @@ where
         }
         for family in current.topology().families() {
             let observed = self.adapter.observe_xtables(family.family())?;
-            let target_pair = target
-                .artifacts()
-                .pair(family.family())
-                .expect("replacement topology family has an artifact pair");
-            let prepared = if private_target_present(&observed, target_pair)? {
+            let target_family = target
+                .topology()
+                .family(family.family())
+                .expect("replacement topology family has a family plan");
+            let prepared = if private_target_present(&observed, target_family)? {
                 vec![current, target]
             } else {
                 vec![current]
@@ -1594,21 +1742,17 @@ where
         }
 
         for family in target.topology().families() {
-            let pair = target
-                .artifacts()
-                .pair(family.family())
-                .expect("replacement topology family has an artifact pair");
             let observed = self.adapter.observe_xtables(family.family())?;
-            if private_target_present(&observed, pair)? {
+            if private_target_present(&observed, family)? {
                 cursor.advance(
                     lease,
                     NativeXtablesJournalPhase::Activating,
                     retire_step(family.family()),
                 )?;
-                if let Err(error) = self.adapter.restore(family.family(), pair.retire()) {
+                if let Err(error) = self.adapter.restore(family.family(), family.retire()) {
                     let observed = self.adapter.observe_xtables(family.family())?;
                     if error.certainty() != NativeMutationCertainty::MayHaveMutated
-                        || private_target_present(&observed, pair)?
+                        || private_target_present(&observed, family)?
                     {
                         return Err(error.into());
                     }
@@ -1773,20 +1917,20 @@ where
             }
 
             for target in &refs {
-                let Some(pair) = target.artifacts().pair(family) else {
+                let Some(target_family) = target.topology().family(family) else {
                     continue;
                 };
                 let observed = self.adapter.observe_xtables(family)?;
-                if private_target_present(&observed, pair)? {
+                if private_target_present(&observed, target_family)? {
                     cursor.advance(
                         lease,
                         NativeXtablesJournalPhase::Retiring,
                         retire_step(family),
                     )?;
-                    if let Err(error) = self.adapter.restore(family, pair.retire()) {
+                    if let Err(error) = self.adapter.restore(family, target_family.retire()) {
                         let observed = self.adapter.observe_xtables(family)?;
                         if error.certainty() != NativeMutationCertainty::MayHaveMutated
-                            || private_target_present(&observed, pair)?
+                            || private_target_present(&observed, target_family)?
                         {
                             return Err(error.into());
                         }
@@ -2225,8 +2369,8 @@ fn expected_state<'a>(
 ) -> Result<XtablesExpectedState, NativeXtablesOwnerError> {
     let mut artifacts = Vec::new();
     for target in prepared {
-        if let Some(pair) = target.artifacts().pair(family) {
-            artifacts.push(pair.prepare());
+        if let Some(target_family) = target.topology().family(family) {
+            artifacts.push(target_family.prepare());
         }
     }
     let phase =
@@ -2275,10 +2419,10 @@ fn present_targets_for_family<'a>(
 ) -> Result<Vec<&'a NativeXtablesAdmittedTarget>, NativeXtablesOwnerError> {
     let mut present = Vec::new();
     for target in targets {
-        let Some(pair) = target.artifacts().pair(family) else {
+        let Some(target_family) = target.topology().family(family) else {
             continue;
         };
-        if private_target_present(observed, pair)? {
+        if private_target_present(observed, target_family)? {
             present.push(*target);
         }
     }
@@ -2335,15 +2479,15 @@ fn unique_audit_routing(
 
 fn private_target_present(
     observed: &XtablesSaveProjection,
-    pair: &super::super::XtablesCaptureArtifactPair,
+    target: &XtablesStableFamilyPlan,
 ) -> Result<bool, NativeXtablesOwnerError> {
     let mut present = 0_usize;
-    for entry in pair.entries() {
-        present += usize::from(observed.chain(entry.chain()).is_some());
+    for chain in target.private_chains() {
+        present += usize::from(observed.chain(chain).is_some());
     }
     if present == 0 {
         Ok(false)
-    } else if present == pair.entries().len() {
+    } else if present == target.private_chains().len() {
         Ok(true)
     } else {
         Err(NativeXtablesOwnerError::LiveStateConflict(
@@ -2355,8 +2499,24 @@ fn private_target_present(
 #[path = "owner_process_adapter.rs"]
 mod process_adapter;
 
+#[path = "owner_target_archive.rs"]
+mod target_archive;
+
+#[path = "owner_runtime_writer.rs"]
+mod runtime_writer;
+
 #[allow(unused_imports)]
 pub(crate) use process_adapter::NativeXtablesProcessOwnerAdapter;
+#[allow(unused_imports)]
+pub(crate) use runtime_writer::*;
+#[allow(unused_imports)]
+pub use runtime_writer::{
+    NativeXtablesCaptureConvergenceError, NativeXtablesCaptureConverger, NativeXtablesCaptureTarget,
+};
+#[allow(unused_imports)]
+pub(crate) use target_archive::{
+    DurableNativeXtablesTargetResolver, NativeXtablesTargetArchiveError,
+};
 
 #[cfg(test)]
 #[path = "owner_runtime_tests.rs"]

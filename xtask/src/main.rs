@@ -15,46 +15,14 @@ mod xtables_oracle;
 const ANDROID_TARGET: &str = "aarch64-linux-android";
 const ANDROID_API_LEVEL: &str = "31";
 const ANDROID_NDK_REVISION: &str = "27.3.13750724";
-const REQUIRED_MODULE_FILES: [&str; 28] = [
-    "META-INF/com/google/android/update-binary",
-    "META-INF/com/google/android/updater-script",
-    "bin/fluxd",
-    "bin/addrsyncd",
-    "bin/jq",
-    "bin/sing-box",
-    "conf/flux.toml",
-    "conf/settings.ini",
-    "conf/addrsyncd.toml",
-    "conf/template.json",
-    "conf/manifest.json",
-    "scripts/addrsync",
-    "scripts/config",
-    "scripts/core",
-    "scripts/dispatcher",
-    "scripts/flux-event",
-    "scripts/fluxctl",
-    "scripts/init",
-    "scripts/lib",
-    "scripts/log",
-    "scripts/rules",
-    "scripts/tproxy",
-    "scripts/updater.sh",
-    "webroot/index.html",
-    "customize.sh",
-    "flux_service.sh",
-    "module.prop",
-    "LICENSE",
-];
-const SOURCE_BOUND_MODULE_ENTRIES: [&str; 8] = [
-    "META-INF",
-    "conf",
-    "scripts",
-    "webroot",
-    "customize.sh",
-    "flux_service.sh",
-    "module.prop",
-    "LICENSE",
-];
+const ANDROID_MIN_LOAD_ALIGNMENT: u64 = 1 << 14;
+const ANDROID_RUSTFLAGS: &str = concat!(
+    "-C link-arg=-Wl,-z,max-page-size=16384 ",
+    "-C link-arg=-Wl,-z,common-page-size=16384"
+);
+const ANDROID_TARGET_RUSTFLAGS_ENV: &str = "CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS";
+const PACKAGE_METADATA_FILES: [&str; 3] =
+    ["SBOM.spdx.json", "checksums.sha256", "build-metadata.json"];
 const REQUIRED_DEVICE_TESTS: [&str; 7] = [
     "module_boot",
     "status",
@@ -135,7 +103,7 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
         }
         "check-android" => {
             require_no_arguments(&arguments)?;
-            cargo(["check", "-p", "fluxd", "--target", ANDROID_TARGET], &[])
+            check_android()
         }
         "build-android" => {
             require_no_arguments(&arguments)?;
@@ -185,7 +153,7 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
                 ],
                 &[],
             )?;
-            cargo(["check", "-p", "fluxd", "--target", ANDROID_TARGET], &[])
+            check_android()
         }
         unknown => Err(format!(
             "unknown command '{unknown}'; run `cargo xtask help`"
@@ -294,17 +262,19 @@ fn require_no_arguments(arguments: &[OsString]) -> Result<(), String> {
 struct StageModuleOptions {
     stage: PathBuf,
     runtime_binaries: PathBuf,
+    profile: PackageProfileName,
 }
 
 #[derive(Debug)]
 struct VerifyPackageOptions {
     stage: PathBuf,
+    profile: PackageProfileName,
 }
 
 #[derive(Debug)]
 struct WorkspaceSourceRevisions {
     fluxd: String,
-    addrsyncd: String,
+    addrsyncd: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -317,7 +287,7 @@ struct ReleaseManifest {
     note: String,
     binaries: Vec<BinaryManifest>,
     device_test_evidence: Vec<DeviceEvidenceManifest>,
-    default_package_profiles: Vec<PackageProfile>,
+    package_profiles: Vec<PackageProfile>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -349,11 +319,48 @@ struct DeviceEvidenceManifest {
     captured_at_utc: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PackageProfile {
-    name: String,
+    name: PackageProfileName,
+    status: PackageProfileStatus,
     description: String,
+    required_files: Vec<String>,
+    forbidden_files: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum PackageProfileName {
+    Bridge,
+    RustOnly,
+}
+
+impl PackageProfileName {
+    fn parse(value: &std::ffi::OsStr) -> Result<Self, String> {
+        match value.to_str() {
+            Some("bridge") => Ok(Self::Bridge),
+            Some("rust-only") => Ok(Self::RustOnly),
+            Some(other) => Err(format!(
+                "unsupported package profile '{other}'; expected bridge or rust-only"
+            )),
+            None => Err("package profile must be valid UTF-8".to_owned()),
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Bridge => "bridge",
+            Self::RustOnly => "rust-only",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum PackageProfileStatus {
+    DevelopmentOnly,
+    FailingUntilComplete,
 }
 
 #[derive(Debug, Deserialize)]
@@ -458,18 +465,22 @@ struct DeviceEvidenceTest {
 fn parse_stage_module_options(arguments: &[OsString]) -> Result<StageModuleOptions, String> {
     let mut stage = None;
     let mut runtime_binaries = None;
+    let mut profile = None;
     let mut index = 0;
     while index < arguments.len() {
         let flag = arguments[index].to_string_lossy();
         let value = arguments
             .get(index.saturating_add(1))
-            .ok_or_else(|| format!("{flag} requires a path"))?;
+            .ok_or_else(|| format!("{flag} requires a value"))?;
         match flag.as_ref() {
             "--stage" if stage.is_none() => stage = Some(PathBuf::from(value)),
             "--runtime-binaries" if runtime_binaries.is_none() => {
                 runtime_binaries = Some(PathBuf::from(value));
             }
-            "--stage" | "--runtime-binaries" => {
+            "--profile" if profile.is_none() => {
+                profile = Some(PackageProfileName::parse(value)?);
+            }
+            "--stage" | "--runtime-binaries" | "--profile" => {
                 return Err(format!("{flag} may only be supplied once"));
             }
             unknown => return Err(format!("unknown stage-module option '{unknown}'")),
@@ -481,20 +492,25 @@ fn parse_stage_module_options(arguments: &[OsString]) -> Result<StageModuleOptio
         stage: stage.ok_or_else(|| "stage-module requires --stage DIR".to_owned())?,
         runtime_binaries: runtime_binaries
             .ok_or_else(|| "stage-module requires --runtime-binaries DIR".to_owned())?,
+        profile: profile.unwrap_or(PackageProfileName::Bridge),
     })
 }
 
 fn parse_verify_package_options(arguments: &[OsString]) -> Result<VerifyPackageOptions, String> {
     let mut stage = None;
+    let mut profile = None;
     let mut index = 0;
     while index < arguments.len() {
         let flag = arguments[index].to_string_lossy();
         let value = arguments
             .get(index.saturating_add(1))
-            .ok_or_else(|| format!("{flag} requires a path"))?;
+            .ok_or_else(|| format!("{flag} requires a value"))?;
         match flag.as_ref() {
             "--stage" if stage.is_none() => stage = Some(PathBuf::from(value)),
-            "--stage" => return Err("--stage may only be supplied once".to_owned()),
+            "--profile" if profile.is_none() => {
+                profile = Some(PackageProfileName::parse(value)?);
+            }
+            "--stage" | "--profile" => return Err(format!("{flag} may only be supplied once")),
             unknown => return Err(format!("unknown verify-package option '{unknown}'")),
         }
         index = index.saturating_add(2);
@@ -502,10 +518,179 @@ fn parse_verify_package_options(arguments: &[OsString]) -> Result<VerifyPackageO
 
     Ok(VerifyPackageOptions {
         stage: stage.ok_or_else(|| "verify-package requires --stage DIR".to_owned())?,
+        profile: profile.unwrap_or(PackageProfileName::Bridge),
     })
 }
 
-fn build_android() -> Result<(), String> {
+fn read_release_manifest(path: &Path) -> Result<ReleaseManifest, String> {
+    serde_json::from_slice(
+        &fs::read(path).map_err(|error| format!("cannot read {}: {error}", path.display()))?,
+    )
+    .map_err(|error| format!("invalid {}: {error}", path.display()))
+}
+
+fn package_profile(
+    profiles: &[PackageProfile],
+    name: PackageProfileName,
+) -> Result<&PackageProfile, String> {
+    profiles
+        .iter()
+        .find(|profile| profile.name == name)
+        .ok_or_else(|| {
+            format!(
+                "release manifest is missing the {} package profile",
+                name.as_str()
+            )
+        })
+}
+
+fn profile_requires(profile: &PackageProfile, relative: &str) -> bool {
+    profile
+        .required_files
+        .iter()
+        .any(|required| required == relative)
+}
+
+fn validate_package_profiles(profiles: &[PackageProfile]) -> Result<(), String> {
+    if profiles.len() != 2 {
+        return Err(
+            "release manifest must declare exactly the bridge and rust-only package profiles"
+                .to_owned(),
+        );
+    }
+
+    let mut names = std::collections::BTreeSet::new();
+    for profile in profiles {
+        if !names.insert(profile.name) {
+            return Err(format!(
+                "release manifest contains duplicate {} package profiles",
+                profile.name.as_str()
+            ));
+        }
+        require_manifest_text(
+            &format!("package_profiles[{}].description", profile.name.as_str()),
+            &profile.description,
+        )?;
+        let required = validate_profile_path_list(
+            profile.name,
+            "required_files",
+            &profile.required_files,
+            false,
+        )?;
+        let forbidden = validate_profile_path_list(
+            profile.name,
+            "forbidden_files",
+            &profile.forbidden_files,
+            true,
+        )?;
+        if let Some(overlap) = required.intersection(&forbidden).next() {
+            return Err(format!(
+                "{} package profile path {overlap} cannot be both required and forbidden",
+                profile.name.as_str()
+            ));
+        }
+    }
+
+    let bridge = package_profile(profiles, PackageProfileName::Bridge)?;
+    let rust_only = package_profile(profiles, PackageProfileName::RustOnly)?;
+    if bridge.status != PackageProfileStatus::DevelopmentOnly {
+        return Err("bridge package profile must be marked development-only".to_owned());
+    }
+    if rust_only.status != PackageProfileStatus::FailingUntilComplete {
+        return Err(
+            "rust-only package profile must be marked failing-until-complete at Gate 0".to_owned(),
+        );
+    }
+    if !bridge.forbidden_files.is_empty() {
+        return Err("bridge package profile must not declare forbidden files".to_owned());
+    }
+
+    let bridge_required = bridge
+        .required_files
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    let rust_required = rust_only
+        .required_files
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    if rust_required.len() >= bridge_required.len() || !rust_required.is_subset(&bridge_required) {
+        return Err(
+            "rust-only required files must be a strict subset of the bridge required files"
+                .to_owned(),
+        );
+    }
+    let expected_forbidden = bridge_required
+        .difference(&rust_required)
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let actual_forbidden = rust_only
+        .forbidden_files
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    if actual_forbidden != expected_forbidden {
+        let missing = expected_forbidden.difference(&actual_forbidden).next();
+        let extra = actual_forbidden.difference(&expected_forbidden).next();
+        return Err(format!(
+            "rust-only forbidden files must exactly name every bridge-only path (missing={}, extra={})",
+            missing.map_or("none", |value| *value),
+            extra.map_or("none", |value| *value)
+        ));
+    }
+
+    for required in ["bin/fluxd", "bin/sing-box", "conf/manifest.json"] {
+        if !rust_required.contains(required) {
+            return Err(format!(
+                "rust-only package profile must require final runtime path {required}"
+            ));
+        }
+    }
+    for forbidden in [
+        "bin/addrsyncd",
+        "bin/jq",
+        "conf/settings.ini",
+        "conf/addrsyncd.toml",
+    ] {
+        if !actual_forbidden.contains(forbidden) {
+            return Err(format!(
+                "rust-only package profile must forbid bridge path {forbidden}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_profile_path_list<'a>(
+    profile: PackageProfileName,
+    field: &str,
+    paths: &'a [String],
+    allow_empty: bool,
+) -> Result<std::collections::BTreeSet<&'a str>, String> {
+    if paths.is_empty() && !allow_empty {
+        return Err(format!(
+            "{} package profile {field} must not be empty",
+            profile.as_str()
+        ));
+    }
+    let mut unique = std::collections::BTreeSet::new();
+    for path in paths {
+        validated_relative_path(
+            &format!("package_profiles[{}].{field}", profile.as_str()),
+            path,
+        )?;
+        if !unique.insert(path.as_str()) {
+            return Err(format!(
+                "{} package profile {field} contains duplicate path {path}",
+                profile.as_str()
+            ));
+        }
+    }
+    Ok(unique)
+}
+
+fn android_compiler_from_environment() -> Result<PathBuf, String> {
     let ndk_root = env::var_os("ANDROID_NDK_HOME")
         .or_else(|| env::var_os("ANDROID_NDK_ROOT"))
         .map(PathBuf::from)
@@ -514,8 +699,18 @@ fn build_android() -> Result<(), String> {
         })?;
 
     verify_ndk_revision(&ndk_root)?;
-    let linker = android_linker(&ndk_root, ANDROID_TARGET, "aarch64-linux-android")?;
-    let linker_env = linker.into_os_string();
+    android_linker(&ndk_root, ANDROID_TARGET, "aarch64-linux-android")
+}
+
+fn check_android() -> Result<(), String> {
+    let compiler = android_compiler_from_environment()?.into_os_string();
+    let envs = android_cargo_environment(compiler.as_os_str());
+    cargo(["check", "-p", "fluxd", "--target", ANDROID_TARGET], &envs)
+}
+
+fn build_android() -> Result<(), String> {
+    let compiler = android_compiler_from_environment()?.into_os_string();
+    let envs = android_cargo_environment(compiler.as_os_str());
     cargo(
         [
             "build",
@@ -525,31 +720,63 @@ fn build_android() -> Result<(), String> {
             "--target",
             ANDROID_TARGET,
         ],
-        &[(
-            "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER",
-            linker_env.as_os_str(),
-        )],
-    )
+        &envs,
+    )?;
+
+    let artifact = workspace_root()?
+        .join("target")
+        .join(ANDROID_TARGET)
+        .join("release")
+        .join("fluxd");
+    validate_aarch64_elf("fluxd", &artifact)?;
+    println!(
+        "validated Android fluxd ELF with PT_LOAD alignment of at least {} bytes at {}",
+        ANDROID_MIN_LOAD_ALIGNMENT,
+        artifact.display()
+    );
+    Ok(())
+}
+
+fn android_cargo_environment(compiler: &std::ffi::OsStr) -> [(&'static str, &std::ffi::OsStr); 3] {
+    [
+        ("CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER", compiler),
+        ("CC_aarch64_linux_android", compiler),
+        (
+            ANDROID_TARGET_RUSTFLAGS_ENV,
+            std::ffi::OsStr::new(ANDROID_RUSTFLAGS),
+        ),
+    ]
 }
 
 fn stage_module(options: StageModuleOptions) -> Result<(), String> {
+    let root = workspace_root()?;
+    let source_manifest = read_release_manifest(&root.join("conf/manifest.json"))?;
+    validate_package_profiles(&source_manifest.package_profiles)?;
+    let profile = package_profile(&source_manifest.package_profiles, options.profile)?;
+
     build_android()?;
 
     require_empty_stage(&options.stage)?;
-    let root = workspace_root()?;
-    for relative in [
-        "META-INF",
-        "conf",
-        "scripts",
-        "webroot",
-        "customize.sh",
-        "flux_service.sh",
-        "module.prop",
-        "LICENSE",
-    ] {
+    for relative in &profile.required_files {
+        if relative.starts_with("bin/") {
+            continue;
+        }
         copy_entry(&root.join(relative), &options.stage.join(relative))?;
     }
-    copy_entry(&options.runtime_binaries, &options.stage.join("bin"))?;
+
+    for relative in profile
+        .required_files
+        .iter()
+        .filter(|relative| relative.starts_with("bin/") && relative.as_str() != "bin/fluxd")
+    {
+        let file_name = Path::new(relative)
+            .file_name()
+            .ok_or_else(|| format!("package binary path {relative} has no file name"))?;
+        copy_entry(
+            &options.runtime_binaries.join(file_name),
+            &options.stage.join(relative),
+        )?;
+    }
 
     let fluxd_source = root
         .join("target")
@@ -575,44 +802,67 @@ fn stage_module(options: StageModuleOptions) -> Result<(), String> {
         )
     })?;
 
-    for relative in REQUIRED_MODULE_FILES {
-        let required = options.stage.join(relative);
-        if !required.is_file() {
-            return Err(format!(
-                "staged module is missing required file {}",
-                required.display()
-            ));
-        }
-    }
+    require_package_layout(&options.stage, profile)?;
+    reject_forbidden_profile_files(&options.stage, profile)?;
+    validate_staged_runtime_inventory(&options.stage, profile)?;
 
+    let status = match profile.status {
+        PackageProfileStatus::DevelopmentOnly => "development-only",
+        PackageProfileStatus::FailingUntilComplete => "failing-until-complete",
+    };
     println!(
-        "staged development Android module at {}",
+        "staged {status} {} Android module at {}",
+        profile.name.as_str(),
         options.stage.display()
     );
     println!(
-        "release publication still requires `cargo xtask verify-package --stage {}`",
-        options.stage.display()
+        "check it with `cargo xtask verify-package --profile {} --stage {}`",
+        profile.name.as_str(),
+        options.stage.display(),
     );
     Ok(())
 }
 
 fn verify_package(options: VerifyPackageOptions) -> Result<(), String> {
     let source_root = workspace_root()?;
-    let source_revisions = verify_workspace_source_state(&source_root)?;
-    verify_package_dir_with_source(&options.stage, &source_root)?;
-    validate_package_source_revisions(&options.stage, &source_revisions)?;
-    println!("verified release package at {}", options.stage.display());
-    Ok(())
+    let source_manifest = read_release_manifest(&source_root.join("conf/manifest.json"))?;
+    validate_package_profiles(&source_manifest.package_profiles)?;
+    let profile = package_profile(&source_manifest.package_profiles, options.profile)?;
+    let source_revisions = verify_workspace_source_state(&source_root, profile)?;
+    verify_package_dir_with_source(&options.stage, &source_root, options.profile)?;
+    validate_package_source_revisions(&options.stage, &source_revisions, profile)?;
+
+    match profile.status {
+        PackageProfileStatus::DevelopmentOnly => {
+            println!(
+                "verified development-only bridge package at {}; this is not Rust-only release evidence",
+                options.stage.display()
+            );
+            Ok(())
+        }
+        PackageProfileStatus::FailingUntilComplete => Err(format!(
+            "{} package consistency passed, but the checked profile is marked failing-until-complete and cannot authorize a release",
+            profile.name.as_str()
+        )),
+    }
 }
 
-fn verify_workspace_source_state(root: &Path) -> Result<WorkspaceSourceRevisions, String> {
+fn verify_workspace_source_state(
+    root: &Path,
+    profile: &PackageProfile,
+) -> Result<WorkspaceSourceRevisions, String> {
     require_clean_git_worktree(root, "Flux workspace")?;
-    let addrsyncd = root.join("addrsyncd");
-    require_clean_git_worktree(&addrsyncd, "addrsyncd submodule")?;
     let fluxd_revision = git_stdout(root, &["rev-parse", "HEAD"])?;
-    let addrsyncd_revision = git_stdout(&addrsyncd, &["rev-parse", "HEAD"])?;
     validate_source_revision("Flux workspace HEAD", &fluxd_revision)?;
-    validate_source_revision("addrsyncd submodule HEAD", &addrsyncd_revision)?;
+    let addrsyncd_revision = if profile_requires(profile, "bin/addrsyncd") {
+        let addrsyncd = root.join("addrsyncd");
+        require_clean_git_worktree(&addrsyncd, "addrsyncd submodule")?;
+        let revision = git_stdout(&addrsyncd, &["rev-parse", "HEAD"])?;
+        validate_source_revision("addrsyncd submodule HEAD", &revision)?;
+        Some(revision)
+    } else {
+        None
+    };
     Ok(WorkspaceSourceRevisions {
         fluxd: fluxd_revision,
         addrsyncd: addrsyncd_revision,
@@ -662,24 +912,28 @@ fn git_stdout(root: &Path, arguments: &[&str]) -> Result<String, String> {
 fn validate_package_source_revisions(
     stage: &Path,
     revisions: &WorkspaceSourceRevisions,
+    profile: &PackageProfile,
 ) -> Result<(), String> {
     let manifest_path = stage.join("conf/manifest.json");
-    let manifest: ReleaseManifest = serde_json::from_slice(
-        &fs::read(&manifest_path)
-            .map_err(|error| format!("cannot read {}: {error}", manifest_path.display()))?,
-    )
-    .map_err(|error| format!("invalid {}: {error}", manifest_path.display()))?;
-    validate_first_party_source_revisions(&manifest, revisions)
+    let manifest = read_release_manifest(&manifest_path)?;
+    validate_first_party_source_revisions(&manifest, revisions, profile)
 }
 
 fn validate_first_party_source_revisions(
     manifest: &ReleaseManifest,
     revisions: &WorkspaceSourceRevisions,
+    profile: &PackageProfile,
 ) -> Result<(), String> {
-    for (name, expected) in [
-        ("fluxd", revisions.fluxd.as_str()),
-        ("addrsyncd", revisions.addrsyncd.as_str()),
-    ] {
+    let mut required = vec![("fluxd", revisions.fluxd.as_str())];
+    if profile_requires(profile, "bin/addrsyncd") {
+        required.push((
+            "addrsyncd",
+            revisions.addrsyncd.as_deref().ok_or_else(|| {
+                "bridge profile is missing the addrsyncd source revision".to_owned()
+            })?,
+        ));
+    }
+    for (name, expected) in required {
         let actual = manifest
             .binaries
             .iter()
@@ -695,7 +949,11 @@ fn validate_first_party_source_revisions(
     Ok(())
 }
 
-fn verify_package_dir_with_source(stage: &Path, source_root: &Path) -> Result<(), String> {
+fn verify_package_dir_with_source(
+    stage: &Path,
+    source_root: &Path,
+    profile_name: PackageProfileName,
+) -> Result<(), String> {
     let stage_metadata = fs::symlink_metadata(stage)
         .map_err(|error| format!("cannot inspect package stage {}: {error}", stage.display()))?;
     if stage_metadata.file_type().is_symlink() || !stage_metadata.is_dir() {
@@ -705,15 +963,15 @@ fn verify_package_dir_with_source(stage: &Path, source_root: &Path) -> Result<()
         ));
     }
 
-    require_package_layout(stage)?;
+    let source_manifest = read_release_manifest(&source_root.join("conf/manifest.json"))?;
+    validate_package_profiles(&source_manifest.package_profiles)?;
+    let source_profile = package_profile(&source_manifest.package_profiles, profile_name)?;
+
+    require_package_layout(stage, source_profile)?;
+    reject_forbidden_profile_files(stage, source_profile)?;
     reject_unsafe_package_entries(stage, stage)?;
-    validate_source_bound_module_files(stage, source_root)?;
-    for relative in [
-        "conf/manifest.json",
-        "SBOM.spdx.json",
-        "checksums.sha256",
-        "build-metadata.json",
-    ] {
+    validate_source_bound_module_files(stage, source_root, source_profile)?;
+    for relative in PACKAGE_METADATA_FILES {
         let path = stage.join(relative);
         if !path.is_file() {
             return Err(format!(
@@ -730,23 +988,32 @@ fn verify_package_dir_with_source(stage: &Path, source_root: &Path) -> Result<()
     }
 
     let manifest_path = stage.join("conf/manifest.json");
-    let manifest_bytes = fs::read(&manifest_path)
-        .map_err(|error| format!("cannot read {}: {error}", manifest_path.display()))?;
-    let manifest: ReleaseManifest = serde_json::from_slice(&manifest_bytes)
-        .map_err(|error| format!("invalid {}: {error}", manifest_path.display()))?;
-    validate_package_file_inventory(stage, &manifest)?;
-    validate_release_manifest(stage, &manifest)?;
+    let manifest = read_release_manifest(&manifest_path)?;
+    validate_package_profiles(&manifest.package_profiles)?;
+    if manifest.package_profiles != source_manifest.package_profiles {
+        return Err(
+            "staged package profile policy differs from checked-in conf/manifest.json".to_owned(),
+        );
+    }
+    let profile = package_profile(&manifest.package_profiles, profile_name)?;
+    validate_package_file_inventory(stage, &manifest, profile)?;
+    validate_release_manifest(stage, &manifest, profile)?;
     validate_spdx_document(&stage.join("SBOM.spdx.json"), &manifest)?;
     validate_build_metadata(&stage.join("build-metadata.json"), &manifest)?;
     validate_package_checksums(stage, &stage.join("checksums.sha256"))
 }
 
-fn validate_package_file_inventory(stage: &Path, manifest: &ReleaseManifest) -> Result<(), String> {
-    let mut allowed = REQUIRED_MODULE_FILES
-        .into_iter()
-        .map(str::to_owned)
+fn validate_package_file_inventory(
+    stage: &Path,
+    manifest: &ReleaseManifest,
+    profile: &PackageProfile,
+) -> Result<(), String> {
+    let mut allowed = profile
+        .required_files
+        .iter()
+        .cloned()
         .collect::<std::collections::BTreeSet<_>>();
-    for relative in ["SBOM.spdx.json", "checksums.sha256", "build-metadata.json"] {
+    for relative in PACKAGE_METADATA_FILES {
         allowed.insert(relative.to_owned());
     }
     for evidence in &manifest.device_test_evidence {
@@ -760,7 +1027,29 @@ fn validate_package_file_inventory(stage: &Path, manifest: &ReleaseManifest) -> 
         let missing = allowed.difference(&actual).next();
         let extra = actual.difference(&allowed).next();
         return Err(format!(
-            "release package file inventory differs from the reviewed full profile (missing={}, extra={})",
+            "release package file inventory differs from the reviewed {} profile (missing={}, extra={})",
+            profile.name.as_str(),
+            missing.map_or("none", String::as_str),
+            extra.map_or("none", String::as_str)
+        ));
+    }
+    Ok(())
+}
+
+fn validate_staged_runtime_inventory(stage: &Path, profile: &PackageProfile) -> Result<(), String> {
+    let expected = profile
+        .required_files
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut actual = std::collections::BTreeSet::new();
+    collect_package_files(stage, stage, &mut actual)?;
+    if actual != expected {
+        let missing = expected.difference(&actual).next();
+        let extra = actual.difference(&expected).next();
+        return Err(format!(
+            "staged module file inventory differs from the {} profile (missing={}, extra={})",
+            profile.name.as_str(),
             missing.map_or("none", String::as_str),
             extra.map_or("none", String::as_str)
         ));
@@ -827,8 +1116,12 @@ fn reject_unsafe_package_entries(root: &Path, current: &Path) -> Result<(), Stri
     Ok(())
 }
 
-fn validate_release_manifest(stage: &Path, manifest: &ReleaseManifest) -> Result<(), String> {
-    if manifest.schema_version != 1 {
+fn validate_release_manifest(
+    stage: &Path,
+    manifest: &ReleaseManifest,
+    profile: &PackageProfile,
+) -> Result<(), String> {
+    if manifest.schema_version != 2 {
         return Err(format!(
             "unsupported manifest schema version {}",
             manifest.schema_version
@@ -843,16 +1136,7 @@ fn validate_release_manifest(stage: &Path, manifest: &ReleaseManifest) -> Result
     }
     require_non_placeholder("generated_by", &manifest.generated_by)?;
     let _ = &manifest.note;
-
-    if manifest.default_package_profiles.len() != 1
-        || manifest.default_package_profiles[0].name != "full"
-    {
-        return Err("release manifest must declare exactly the full package profile".to_owned());
-    }
-    require_manifest_text(
-        "default_package_profiles[0].description",
-        &manifest.default_package_profiles[0].description,
-    )?;
+    validate_package_profiles(&manifest.package_profiles)?;
 
     if manifest.device_test_evidence.is_empty() {
         return Err("release manifest has no required device-test evidence".to_owned());
@@ -863,7 +1147,7 @@ fn validate_release_manifest(stage: &Path, manifest: &ReleaseManifest) -> Result
         .find(|binary| binary.name == "fluxd")
         .map(|binary| binary.source_revision.as_str())
         .ok_or_else(|| "device evidence cannot bind a missing fluxd manifest record".to_owned())?;
-    let payload_sha256 = operational_payload_sha256(stage)?;
+    let payload_sha256 = operational_payload_sha256(stage, profile)?;
     for evidence in &manifest.device_test_evidence {
         let relative = validated_relative_path("device_test_evidence.path", &evidence.path)?;
         if !relative.starts_with("evidence")
@@ -981,27 +1265,23 @@ fn validate_release_manifest(stage: &Path, manifest: &ReleaseManifest) -> Result
         validate_aarch64_elf(&binary.name, &binary_path)?;
     }
 
-    let required_binaries = [
-        ("fluxd", "bin/fluxd"),
-        ("sing-box", "bin/sing-box"),
-        ("jq", "bin/jq"),
-        ("addrsyncd", "bin/addrsyncd"),
-    ];
+    let required_binaries = profile_binary_inventory(profile)?;
     let required_names = required_binaries
         .iter()
-        .map(|(name, _)| *name)
+        .map(|(name, _)| name.as_str())
         .collect::<std::collections::BTreeSet<_>>();
     if names != required_names {
         let missing = required_names.difference(&names).next();
         let extra = names.difference(&required_names).next();
         return Err(format!(
-            "release manifest binary inventory must exactly match the full bridge profile (missing={}, extra={})",
+            "release manifest binary inventory must exactly match the {} profile (missing={}, extra={})",
+            profile.name.as_str(),
             missing.map_or("none", |value| *value),
             extra.map_or("none", |value| *value)
         ));
     }
     for (required, required_path) in required_binaries {
-        if !names.contains(required) {
+        if !names.contains(required.as_str()) {
             return Err(format!(
                 "release manifest is missing required binary '{required}'"
             ));
@@ -1021,12 +1301,44 @@ fn validate_release_manifest(stage: &Path, manifest: &ReleaseManifest) -> Result
     reject_unmanifested_binaries(stage, &paths)
 }
 
-fn require_package_layout(stage: &Path) -> Result<(), String> {
-    for relative in REQUIRED_MODULE_FILES {
+fn profile_binary_inventory(profile: &PackageProfile) -> Result<Vec<(String, String)>, String> {
+    let mut binaries = Vec::new();
+    let mut names = std::collections::BTreeSet::new();
+    for path in profile
+        .required_files
+        .iter()
+        .filter(|path| path.starts_with("bin/"))
+    {
+        let relative = Path::new(path);
+        if relative.parent() != Some(Path::new("bin")) {
+            return Err(format!(
+                "{} package binary path must be directly below bin/: {path}",
+                profile.name.as_str()
+            ));
+        }
+        let name = relative
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| format!("package binary path {path} has no UTF-8 file name"))?
+            .to_owned();
+        if !names.insert(name.clone()) {
+            return Err(format!(
+                "{} package profile contains duplicate binary name {name}",
+                profile.name.as_str()
+            ));
+        }
+        binaries.push((name, path.clone()));
+    }
+    Ok(binaries)
+}
+
+fn require_package_layout(stage: &Path, profile: &PackageProfile) -> Result<(), String> {
+    for relative in &profile.required_files {
         let path = stage.join(relative);
         if !path.is_file() {
             return Err(format!(
-                "full release package is missing required file {relative}"
+                "{} package is missing required file {relative}",
+                profile.name.as_str()
             ));
         }
         if fs::metadata(&path)
@@ -1035,45 +1347,34 @@ fn require_package_layout(stage: &Path) -> Result<(), String> {
             == 0
         {
             return Err(format!(
-                "full release package required file {relative} is empty"
+                "{} package required file {relative} is empty",
+                profile.name.as_str()
             ));
         }
     }
-    validate_module_content(stage)
+    validate_module_content(stage, profile)
 }
 
-fn validate_source_bound_module_files(stage: &Path, source_root: &Path) -> Result<(), String> {
-    let expected_files = REQUIRED_MODULE_FILES
-        .into_iter()
-        .filter(|relative| !relative.starts_with("bin/") && *relative != "conf/manifest.json")
-        .map(str::to_owned)
-        .collect::<std::collections::BTreeSet<_>>();
-    let source_files = collect_source_bound_module_files(source_root)?;
-    let staged_files = collect_source_bound_module_files(stage)?;
-    if source_files != expected_files {
-        let missing = expected_files.difference(&source_files).next();
-        let extra = source_files.difference(&expected_files).next();
-        return Err(format!(
-            "authoritative source-bound module inventory differs from the reviewed package inventory (missing={}, extra={})",
-            missing.map_or("none", String::as_str),
-            extra.map_or("none", String::as_str)
-        ));
-    }
-    if staged_files != expected_files {
-        let missing = expected_files.difference(&staged_files).next();
-        let extra = staged_files.difference(&expected_files).next();
-        return Err(format!(
-            "release package source-bound module inventory differs from the reviewed package inventory (missing={}, extra={})",
-            missing.map_or("none", String::as_str),
-            extra.map_or("none", String::as_str)
-        ));
-    }
-
-    for relative in expected_files {
-        let source_path = source_root.join(&relative);
+fn validate_source_bound_module_files(
+    stage: &Path,
+    source_root: &Path,
+    profile: &PackageProfile,
+) -> Result<(), String> {
+    for relative in profile.required_files.iter().filter(|relative| {
+        !relative.starts_with("bin/") && relative.as_str() != "conf/manifest.json"
+    }) {
+        let source_path = source_root.join(relative);
+        let source_metadata = fs::symlink_metadata(&source_path)
+            .map_err(|error| format!("cannot inspect {}: {error}", source_path.display()))?;
+        if source_metadata.file_type().is_symlink() || !source_metadata.is_file() {
+            return Err(format!(
+                "authoritative source-bound module path must be a regular file: {}",
+                source_path.display()
+            ));
+        }
         let source = fs::read(&source_path)
             .map_err(|error| format!("cannot read {}: {error}", source_path.display()))?;
-        let staged_path = stage.join(&relative);
+        let staged_path = stage.join(relative);
         let staged = fs::read(&staged_path)
             .map_err(|error| format!("cannot read {}: {error}", staged_path.display()))?;
         if staged != source {
@@ -1086,82 +1387,48 @@ fn validate_source_bound_module_files(stage: &Path, source_root: &Path) -> Resul
     Ok(())
 }
 
-fn collect_source_bound_module_files(
-    root: &Path,
-) -> Result<std::collections::BTreeSet<String>, String> {
-    let mut files = std::collections::BTreeSet::new();
-    for relative in SOURCE_BOUND_MODULE_ENTRIES {
-        collect_source_bound_module_entry(root, &root.join(relative), &mut files)?;
-    }
-    files.remove("conf/manifest.json");
-    Ok(files)
-}
-
-fn collect_source_bound_module_entry(
-    root: &Path,
-    path: &Path,
-    files: &mut std::collections::BTreeSet<String>,
-) -> Result<(), String> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| {
-        format!(
-            "cannot inspect source-bound module entry {}: {error}",
-            path.display()
-        )
-    })?;
-    if metadata.file_type().is_symlink() {
-        return Err(format!(
-            "source-bound module entry is a symbolic link: {}",
-            path.display()
-        ));
-    }
-    if metadata.is_file() {
-        let relative = path
-            .strip_prefix(root)
-            .map_err(|error| format!("cannot relativize {}: {error}", path.display()))?;
-        files.insert(portable_relative_path(relative)?);
-        return Ok(());
-    }
-    if !metadata.is_dir() {
-        return Err(format!(
-            "source-bound module entry is not a regular file or directory: {}",
-            path.display()
-        ));
-    }
-    for entry in fs::read_dir(path).map_err(|error| {
-        format!(
-            "cannot read source-bound directory {}: {error}",
-            path.display()
-        )
-    })? {
-        let entry = entry.map_err(|error| {
-            format!(
-                "cannot enumerate source-bound directory {}: {error}",
-                path.display()
-            )
-        })?;
-        collect_source_bound_module_entry(root, &entry.path(), files)?;
+fn reject_forbidden_profile_files(stage: &Path, profile: &PackageProfile) -> Result<(), String> {
+    for relative in &profile.forbidden_files {
+        match fs::symlink_metadata(stage.join(relative)) {
+            Ok(_) => {
+                return Err(format!(
+                    "{} package contains forbidden bridge path {relative}",
+                    profile.name.as_str()
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "cannot inspect forbidden package path {}: {error}",
+                    stage.join(relative).display()
+                ));
+            }
+        }
     }
     Ok(())
 }
 
-fn validate_module_content(stage: &Path) -> Result<(), String> {
+fn validate_module_content(stage: &Path, profile: &PackageProfile) -> Result<(), String> {
     for relative in [
         "META-INF/com/google/android/update-binary",
         "customize.sh",
         "flux_service.sh",
+        "uninstall.sh",
         "scripts/addrsync",
         "scripts/config",
         "scripts/core",
         "scripts/dispatcher",
         "scripts/flux-event",
-        "scripts/fluxctl",
         "scripts/init",
         "scripts/lib",
         "scripts/log",
         "scripts/rules",
         "scripts/tproxy",
         "scripts/updater.sh",
-    ] {
+    ]
+    .into_iter()
+    .filter(|relative| profile_requires(profile, relative))
+    {
         let path = stage.join(relative);
         let contents =
             fs::read(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
@@ -1172,67 +1439,80 @@ fn validate_module_content(stage: &Path) -> Result<(), String> {
         }
     }
 
-    let updater = fs::read_to_string(stage.join("META-INF/com/google/android/updater-script"))
-        .map_err(|error| format!("cannot read updater-script: {error}"))?;
-    if updater.trim() != "#MAGISK" {
-        return Err("META-INF updater-script must contain exactly #MAGISK".to_owned());
-    }
-
-    let module_prop = fs::read_to_string(stage.join("module.prop"))
-        .map_err(|error| format!("cannot read module.prop: {error}"))?;
-    let properties = module_prop
-        .lines()
-        .filter_map(|line| line.split_once('='))
-        .collect::<std::collections::BTreeMap<_, _>>();
-    for key in [
-        "id",
-        "name",
-        "version",
-        "versionCode",
-        "author",
-        "description",
-    ] {
-        if properties
-            .get(key)
-            .is_none_or(|value| value.trim().is_empty())
-        {
-            return Err(format!("module.prop is missing required property {key}"));
+    if profile_requires(profile, "META-INF/com/google/android/updater-script") {
+        let updater = fs::read_to_string(stage.join("META-INF/com/google/android/updater-script"))
+            .map_err(|error| format!("cannot read updater-script: {error}"))?;
+        if updater.trim() != "#MAGISK" {
+            return Err("META-INF updater-script must contain exactly #MAGISK".to_owned());
         }
     }
-    if properties.get("id") != Some(&"flux")
-        || properties["versionCode"]
-            .parse::<u64>()
-            .ok()
-            .filter(|value| *value > 0)
-            .is_none()
-    {
-        return Err("module.prop must bind id=flux and a positive numeric versionCode".to_owned());
+
+    if profile_requires(profile, "module.prop") {
+        let module_prop = fs::read_to_string(stage.join("module.prop"))
+            .map_err(|error| format!("cannot read module.prop: {error}"))?;
+        let properties = module_prop
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        for key in [
+            "id",
+            "name",
+            "version",
+            "versionCode",
+            "author",
+            "description",
+        ] {
+            if properties
+                .get(key)
+                .is_none_or(|value| value.trim().is_empty())
+            {
+                return Err(format!("module.prop is missing required property {key}"));
+            }
+        }
+        if properties.get("id") != Some(&"flux")
+            || properties["versionCode"]
+                .parse::<u64>()
+                .ok()
+                .filter(|value| *value > 0)
+                .is_none()
+        {
+            return Err(
+                "module.prop must bind id=flux and a positive numeric versionCode".to_owned(),
+            );
+        }
     }
 
-    let template = fs::read(stage.join("conf/template.json"))
-        .map_err(|error| format!("cannot read conf/template.json: {error}"))?;
-    let template: serde_json::Value = serde_json::from_slice(&template)
-        .map_err(|error| format!("invalid conf/template.json: {error}"))?;
-    if !template.is_object() {
-        return Err("conf/template.json must contain a JSON object".to_owned());
+    if profile_requires(profile, "conf/template.json") {
+        let template = fs::read(stage.join("conf/template.json"))
+            .map_err(|error| format!("cannot read conf/template.json: {error}"))?;
+        let template: serde_json::Value = serde_json::from_slice(&template)
+            .map_err(|error| format!("invalid conf/template.json: {error}"))?;
+        if !template.is_object() {
+            return Err("conf/template.json must contain a JSON object".to_owned());
+        }
     }
-    for relative in ["conf/flux.toml", "conf/addrsyncd.toml"] {
+    for relative in ["conf/flux.toml", "conf/addrsyncd.toml"]
+        .into_iter()
+        .filter(|relative| profile_requires(profile, relative))
+    {
         let contents = fs::read_to_string(stage.join(relative))
             .map_err(|error| format!("cannot read {relative}: {error}"))?;
         contents
             .parse::<toml::Value>()
             .map_err(|error| format!("invalid {relative}: {error}"))?;
     }
-    let settings = fs::read_to_string(stage.join("conf/settings.ini"))
-        .map_err(|error| format!("cannot read conf/settings.ini: {error}"))?;
-    for key in ["PROXY_MODE", "BYPASS_SET_BACKEND"] {
-        if !settings
-            .lines()
-            .any(|line| line.starts_with(&format!("{key}=")))
-        {
-            return Err(format!(
-                "conf/settings.ini is missing required setting {key}"
-            ));
+    if profile_requires(profile, "conf/settings.ini") {
+        let settings = fs::read_to_string(stage.join("conf/settings.ini"))
+            .map_err(|error| format!("cannot read conf/settings.ini: {error}"))?;
+        for key in ["PROXY_MODE", "BYPASS_SET_BACKEND"] {
+            if !settings
+                .lines()
+                .any(|line| line.starts_with(&format!("{key}=")))
+            {
+                return Err(format!(
+                    "conf/settings.ini is missing required setting {key}"
+                ));
+            }
         }
     }
     Ok(())
@@ -1529,9 +1809,9 @@ fn sha256_file(path: &Path) -> Result<String, String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn operational_payload_sha256(stage: &Path) -> Result<String, String> {
+fn operational_payload_sha256(stage: &Path, profile: &PackageProfile) -> Result<String, String> {
     let mut hasher = Sha256::new();
-    for relative in REQUIRED_MODULE_FILES {
+    for relative in &profile.required_files {
         if relative == "conf/manifest.json" {
             continue;
         }
@@ -1654,9 +1934,14 @@ fn validate_aarch64_elf(name: &str, path: &Path) -> Result<(), String> {
         let memory_end = virtual_address
             .checked_add(memory_size)
             .ok_or_else(|| format!("manifest binary '{name}' load address overflows"))?;
-        let alignment_valid = alignment <= 1
-            || (alignment.is_power_of_two()
-                && segment_offset % alignment == virtual_address % alignment);
+        if alignment < ANDROID_MIN_LOAD_ALIGNMENT {
+            return Err(format!(
+                "manifest binary '{name}' has PT_LOAD alignment {alignment} below the Android {}-byte requirement",
+                ANDROID_MIN_LOAD_ALIGNMENT
+            ));
+        }
+        let alignment_valid = alignment.is_power_of_two()
+            && segment_offset % alignment == virtual_address % alignment;
         if file_size > 0 && memory_size >= file_size && segment_end <= file_len && alignment_valid {
             loadable = true;
             let file_backed_end = virtual_address
@@ -2141,16 +2426,21 @@ fn android_linker(ndk_root: &Path, target: &str, clang_target: &str) -> Result<P
 }
 
 fn cargo<const N: usize>(args: [&str; N], envs: &[(&str, &std::ffi::OsStr)]) -> Result<(), String> {
-    let mut command = Command::new("cargo");
-    command.args(args);
-    for (key, value) in envs {
-        command.env(key, value);
-    }
+    let mut command = cargo_command(args, envs);
     let rendered = format!("cargo {}", args.join(" "));
     let status = command
         .status()
         .map_err(|error| format!("failed to execute `{rendered}`: {error}"))?;
     require_success(&rendered, status)
+}
+
+fn cargo_command<const N: usize>(args: [&str; N], envs: &[(&str, &std::ffi::OsStr)]) -> Command {
+    let mut command = Command::new("cargo");
+    command.args(args);
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    command
 }
 
 fn cargo_stdout<const N: usize>(args: [&str; N]) -> Result<String, String> {
@@ -2207,7 +2497,7 @@ fn print_help() {
            check-host     Type-check the host workspace\n\
            test-host      Run host tests\n\
            clippy         Run Clippy with warnings denied\n\
-           check-android  Type-check fluxd for aarch64-linux-android\n\
+           check-android  Type-check fluxd with pinned NDK {ANDROID_NDK_REVISION}, API {ANDROID_API_LEVEL}\n\
            build-android  Build release fluxd with NDK {ANDROID_NDK_REVISION}, API {ANDROID_API_LEVEL}\n\
            test-functional-canary-linux  Run the opt-in ignored privileged Linux canary checkpoint\n\
            test-functional-canary-linux-tproxy  Run the ingress-only Linux TPROXY checkpoint\n\
@@ -2216,9 +2506,9 @@ fn print_help() {
            test-functional-canary-android-x86_64-output-tproxy  Cross-build and run the exact checkpoint on one explicit rooted x86_64 Android serial\n\
            preflight-android-arm64-mark-ordering  Read-only ADR-0013 target viability report for one explicit rooted ARM64 Android serial\n\
            xtables-oracle Verify or explicitly update pinned shell-generated restore fixtures; requires --check or --update\n\
-           stage-module   Build and stage a Magisk tree; requires --stage DIR --runtime-binaries DIR\n\
-           verify-package Verify a populated release stage; requires --stage DIR\n\
-           ci             Run all checks that do not require an NDK linker"
+           stage-module   Build and stage a Magisk tree; requires --stage DIR --runtime-binaries DIR [--profile bridge|rust-only]\n\
+           verify-package Verify one package contract; requires --stage DIR [--profile bridge|rust-only]\n\
+           ci             Run host gates plus the pinned-NDK Android cross-check"
     );
 }
 
@@ -2263,7 +2553,11 @@ mod tests {
     }
 
     fn write_aarch64_elf(path: &Path, label: &str) {
-        let mut bytes = vec![0_u8; 128];
+        write_aarch64_elf_with_load_alignments(path, label, [ANDROID_MIN_LOAD_ALIGNMENT; 2]);
+    }
+
+    fn write_aarch64_elf_with_load_alignments(path: &Path, label: &str, alignments: [u64; 2]) {
+        let mut bytes = vec![0_u8; 192];
         bytes.extend_from_slice(&0xd65f03c0_u32.to_le_bytes());
         bytes.extend_from_slice(label.as_bytes());
         let file_size = u64::try_from(bytes.len()).expect("fixture length");
@@ -2274,29 +2568,64 @@ mod tests {
         bytes[16..18].copy_from_slice(&3_u16.to_le_bytes());
         bytes[18..20].copy_from_slice(&183_u16.to_le_bytes());
         bytes[20..24].copy_from_slice(&1_u32.to_le_bytes());
-        bytes[24..32].copy_from_slice(&128_u64.to_le_bytes());
+        bytes[24..32].copy_from_slice(&192_u64.to_le_bytes());
         bytes[32..40].copy_from_slice(&64_u64.to_le_bytes());
         bytes[52..54].copy_from_slice(&64_u16.to_le_bytes());
         bytes[54..56].copy_from_slice(&56_u16.to_le_bytes());
-        bytes[56..58].copy_from_slice(&1_u16.to_le_bytes());
+        bytes[56..58].copy_from_slice(&2_u16.to_le_bytes());
         bytes[64..68].copy_from_slice(&1_u32.to_le_bytes());
         bytes[68..72].copy_from_slice(&5_u32.to_le_bytes());
         bytes[72..80].copy_from_slice(&0_u64.to_le_bytes());
         bytes[96..104].copy_from_slice(&file_size.to_le_bytes());
         bytes[104..112].copy_from_slice(&file_size.to_le_bytes());
-        bytes[112..120].copy_from_slice(&4096_u64.to_le_bytes());
+        bytes[112..120].copy_from_slice(&alignments[0].to_le_bytes());
+        bytes[120..124].copy_from_slice(&1_u32.to_le_bytes());
+        bytes[124..128].copy_from_slice(&4_u32.to_le_bytes());
+        bytes[128..136].copy_from_slice(&0_u64.to_le_bytes());
+        bytes[152..160].copy_from_slice(&file_size.to_le_bytes());
+        bytes[160..168].copy_from_slice(&file_size.to_le_bytes());
+        bytes[168..176].copy_from_slice(&alignments[1].to_le_bytes());
         fs::write(path, bytes).expect("write AArch64 ELF fixture");
     }
 
-    fn write_required_module_fixture(stage: &Path) {
-        for relative in REQUIRED_MODULE_FILES {
+    fn checked_release_manifest() -> ReleaseManifest {
+        serde_json::from_str(include_str!("../../conf/manifest.json"))
+            .expect("checked release manifest must parse")
+    }
+
+    fn checked_profile(name: PackageProfileName) -> PackageProfile {
+        checked_release_manifest()
+            .package_profiles
+            .into_iter()
+            .find(|profile| profile.name == name)
+            .expect("checked package profile must exist")
+    }
+
+    fn package_profile_mut(
+        profiles: &mut [PackageProfile],
+        name: PackageProfileName,
+    ) -> &mut PackageProfile {
+        profiles
+            .iter_mut()
+            .find(|profile| profile.name == name)
+            .expect("mutable package profile must exist")
+    }
+
+    fn checked_package_profiles_json() -> serde_json::Value {
+        serde_json::from_str::<serde_json::Value>(include_str!("../../conf/manifest.json"))
+            .expect("checked release manifest JSON must parse")["package_profiles"]
+            .clone()
+    }
+
+    fn write_required_module_fixture(stage: &Path, profile: &PackageProfile) {
+        for relative in &profile.required_files {
             if relative == "conf/manifest.json" || relative.starts_with("bin/") {
                 continue;
             }
             let path = stage.join(relative);
             fs::create_dir_all(path.parent().expect("required file parent"))
                 .expect("create required fixture parent");
-            let contents = match relative {
+            let contents = match relative.as_str() {
                 "META-INF/com/google/android/updater-script" => "#MAGISK\n".to_owned(),
                 "module.prop" => concat!(
                     "id=flux\n",
@@ -2316,6 +2645,7 @@ mod tests {
                     if value == "META-INF/com/google/android/update-binary"
                         || value == "customize.sh"
                         || value == "flux_service.sh"
+                        || value == "uninstall.sh"
                         || value.starts_with("scripts/") =>
                 {
                     "#!/system/bin/sh\nexit 0\n".to_owned()
@@ -2334,6 +2664,98 @@ mod tests {
         assert_eq!(parse_linux_canary_required(Some("0")), Ok(false));
         assert_eq!(parse_linux_canary_required(Some("1")), Ok(true));
         assert!(parse_linux_canary_required(Some("true")).is_err());
+    }
+
+    #[test]
+    fn android_build_environment_sets_pinned_compilers_and_16k_linker_flag() {
+        let compiler =
+            std::ffi::OsStr::new("/ndk/toolchains/llvm/bin/aarch64-linux-android31-clang");
+        let envs = android_cargo_environment(compiler);
+        let command = cargo_command(
+            [
+                "build",
+                "-p",
+                "fluxd",
+                "--release",
+                "--target",
+                ANDROID_TARGET,
+            ],
+            &envs,
+        );
+        let environment = command
+            .get_envs()
+            .collect::<std::collections::BTreeMap<_, _>>();
+
+        assert_eq!(
+            environment.get(std::ffi::OsStr::new(
+                "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER"
+            )),
+            Some(&Some(compiler))
+        );
+        assert_eq!(
+            environment.get(std::ffi::OsStr::new("CC_aarch64_linux_android")),
+            Some(&Some(compiler))
+        );
+        assert_eq!(
+            environment.get(std::ffi::OsStr::new(ANDROID_TARGET_RUSTFLAGS_ENV)),
+            Some(&Some(std::ffi::OsStr::new(ANDROID_RUSTFLAGS)))
+        );
+        assert!(ANDROID_RUSTFLAGS.contains("max-page-size=16384"));
+        assert!(ANDROID_RUSTFLAGS.contains("common-page-size=16384"));
+    }
+
+    #[test]
+    fn package_profile_options_default_to_bridge_and_accept_rust_only() {
+        let stage = parse_stage_module_options(&[
+            OsString::from("--stage"),
+            OsString::from("stage"),
+            OsString::from("--runtime-binaries"),
+            OsString::from("runtime"),
+        ])
+        .expect("bridge stage options must parse");
+        assert_eq!(stage.profile, PackageProfileName::Bridge);
+
+        let verify = parse_verify_package_options(&[
+            OsString::from("--profile"),
+            OsString::from("rust-only"),
+            OsString::from("--stage"),
+            OsString::from("stage"),
+        ])
+        .expect("rust-only verify options must parse");
+        assert_eq!(verify.profile, PackageProfileName::RustOnly);
+
+        let error = parse_verify_package_options(&[
+            OsString::from("--stage"),
+            OsString::from("stage"),
+            OsString::from("--profile"),
+            OsString::from("full"),
+        ])
+        .expect_err("retired full profile must fail");
+        assert!(error.contains("expected bridge or rust-only"));
+    }
+
+    #[test]
+    fn checked_package_contract_names_the_exact_bridge_difference() {
+        let manifest = checked_release_manifest();
+        validate_package_profiles(&manifest.package_profiles)
+            .expect("checked package profiles must be internally complete");
+        let bridge = package_profile(&manifest.package_profiles, PackageProfileName::Bridge)
+            .expect("bridge profile");
+        let rust_only = package_profile(&manifest.package_profiles, PackageProfileName::RustOnly)
+            .expect("rust-only profile");
+        assert_eq!(bridge.status, PackageProfileStatus::DevelopmentOnly);
+        assert_eq!(rust_only.status, PackageProfileStatus::FailingUntilComplete);
+        assert_eq!(bridge.required_files.len(), 28);
+        assert_eq!(rust_only.required_files.len(), 13);
+        assert_eq!(rust_only.forbidden_files.len(), 15);
+
+        let mut incomplete = manifest.package_profiles.clone();
+        package_profile_mut(&mut incomplete, PackageProfileName::RustOnly)
+            .forbidden_files
+            .retain(|path| path != "bin/jq");
+        let error = validate_package_profiles(&incomplete)
+            .expect_err("an unnamed bridge-only path must fail the contract");
+        assert!(error.contains("missing=bin/jq"));
     }
 
     #[test]
@@ -2392,8 +2814,9 @@ mod tests {
         let source_directory = TestDirectory::new("release-source-root");
         let stage = &stage_directory.0;
         let source_root = &source_directory.0;
-        write_required_module_fixture(stage);
-        write_required_module_fixture(source_root);
+        let bridge = checked_profile(PackageProfileName::Bridge);
+        write_required_module_fixture(stage, &bridge);
+        write_required_module_fixture(source_root, &bridge);
 
         fs::write(stage.join("conf/manifest.json"), "release-populated\n")
             .expect("write staged manifest");
@@ -2402,31 +2825,15 @@ mod tests {
             "source-placeholder\n",
         )
         .expect("write source manifest");
-        validate_source_bound_module_files(stage, source_root)
+        validate_source_bound_module_files(stage, source_root, &bridge)
             .expect("matching tracked module files must verify");
-
-        fs::write(
-            stage.join("scripts/unreviewed"),
-            "#!/system/bin/sh\nexit 0\n",
-        )
-        .expect("write staged unreviewed file");
-        fs::write(
-            source_root.join("scripts/unreviewed"),
-            "#!/system/bin/sh\nexit 0\n",
-        )
-        .expect("write source unreviewed file");
-        let error = validate_source_bound_module_files(stage, source_root)
-            .expect_err("an unreviewed source-owned file must fail");
-        assert!(error.contains("extra=scripts/unreviewed"));
-        fs::remove_file(stage.join("scripts/unreviewed")).expect("remove staged extra file");
-        fs::remove_file(source_root.join("scripts/unreviewed")).expect("remove source extra file");
 
         fs::write(
             stage.join("scripts/config"),
             "#!/system/bin/sh\n# package-only change\nexit 0\n",
         )
         .expect("tamper staged tracked file");
-        let error = validate_source_bound_module_files(stage, source_root)
+        let error = validate_source_bound_module_files(stage, source_root, &bridge)
             .expect_err("staged tracked file divergence must fail");
         assert!(error.contains("scripts/config differs from authoritative source"));
     }
@@ -2438,7 +2845,8 @@ mod tests {
         for relative in ["bin", "conf", "evidence"] {
             fs::create_dir_all(stage.join(relative)).expect("create fixture directory");
         }
-        write_required_module_fixture(stage);
+        let bridge = checked_profile(PackageProfileName::Bridge);
+        write_required_module_fixture(stage, &bridge);
         for name in ["fluxd", "sing-box", "jq", "addrsyncd"] {
             write_aarch64_elf(&stage.join("bin").join(name), name);
         }
@@ -2454,7 +2862,8 @@ mod tests {
             }"#,
         )
         .expect("write metadata");
-        let payload_sha256 = operational_payload_sha256(stage).expect("hash operational payload");
+        let payload_sha256 =
+            operational_payload_sha256(stage, &bridge).expect("hash operational payload");
         let evidence_tests = REQUIRED_DEVICE_TESTS
             .into_iter()
             .map(|id| format!("{{\"id\":\"{id}\",\"result\":\"passed\"}}"))
@@ -2501,24 +2910,25 @@ mod tests {
             "{{\"spdxVersion\":\"SPDX-2.3\",\"dataLicense\":\"CC0-1.0\",\"SPDXID\":\"SPDXRef-DOCUMENT\",\"name\":\"Flux release fixture\",\"documentNamespace\":\"https://github.com/Chth1z/Flux/spdx/0123456789abcdef0123456789abcdef01234567\",\"creationInfo\":{{\"created\":\"2026-07-14T00:00:00Z\",\"creators\":[\"Tool: cargo xtask package-magisk\"]}},\"documentDescribes\":[{spdx_describes}],\"packages\":[{spdx_packages}]}}"
         );
         fs::write(stage.join("SBOM.spdx.json"), &sbom).expect("write SBOM");
+        let package_profiles = checked_package_profiles_json();
         let manifest = format!(
-            "{{\"schema_version\":1,\"project\":\"Flux\",\"generated_by\":\"cargo xtask package-magisk\",\"binaries\":[{binaries}],\"device_test_evidence\":[{{\"path\":\"evidence/device.json\",\"sha256\":\"{evidence_hash}\",\"source_revision\":\"0123456789abcdef0123456789abcdef01234567\",\"payload_sha256\":\"{payload_sha256}\",\"device_profile\":\"test-gki-arm64\",\"android_build_fingerprint\":\"flux/test/device:14/UP1A.231005.007/1234567:user/release-keys\",\"kernel_release\":\"5.10.198-android12-9-gki\",\"boot_id\":\"12345678-1234-4abc-8def-1234567890ab\",\"verified_boot_state\":\"green\",\"selinux_enforcing\":true,\"captured_at_utc\":\"2026-07-14T00:00:00Z\"}}],\"default_package_profiles\":[{{\"name\":\"full\",\"description\":\"Complete package\"}}]}}"
+            "{{\"schema_version\":2,\"project\":\"Flux\",\"generated_by\":\"cargo xtask package-magisk\",\"binaries\":[{binaries}],\"device_test_evidence\":[{{\"path\":\"evidence/device.json\",\"sha256\":\"{evidence_hash}\",\"source_revision\":\"0123456789abcdef0123456789abcdef01234567\",\"payload_sha256\":\"{payload_sha256}\",\"device_profile\":\"test-gki-arm64\",\"android_build_fingerprint\":\"flux/test/device:14/UP1A.231005.007/1234567:user/release-keys\",\"kernel_release\":\"5.10.198-android12-9-gki\",\"boot_id\":\"12345678-1234-4abc-8def-1234567890ab\",\"verified_boot_state\":\"green\",\"selinux_enforcing\":true,\"captured_at_utc\":\"2026-07-14T00:00:00Z\"}}],\"package_profiles\":{package_profiles}}}"
         );
         fs::write(stage.join("conf/manifest.json"), &manifest).expect("write manifest");
         let parsed_manifest: ReleaseManifest =
             serde_json::from_str(&manifest).expect("parse complete manifest");
         let expected_revisions = WorkspaceSourceRevisions {
             fluxd: "0123456789abcdef0123456789abcdef01234567".to_owned(),
-            addrsyncd: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+            addrsyncd: Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
         };
-        validate_first_party_source_revisions(&parsed_manifest, &expected_revisions)
+        validate_first_party_source_revisions(&parsed_manifest, &expected_revisions, &bridge)
             .expect("matching first-party revisions must verify");
         let wrong_revisions = WorkspaceSourceRevisions {
             fluxd: "1123456789abcdef0123456789abcdef01234567".to_owned(),
             addrsyncd: expected_revisions.addrsyncd.clone(),
         };
         let revision_error =
-            validate_first_party_source_revisions(&parsed_manifest, &wrong_revisions)
+            validate_first_party_source_revisions(&parsed_manifest, &wrong_revisions, &bridge)
                 .expect_err("mismatched workspace revision must fail");
         assert!(revision_error.contains("must equal the clean workspace revision"));
         let mut incomplete_evidence: serde_json::Value =
@@ -2541,11 +2951,16 @@ mod tests {
         fs::write(stage.join("evidence/device.json"), &evidence).expect("restore evidence");
         write_fixture_checksums(stage);
 
-        verify_package_dir_with_source(stage, stage).expect("complete fixture must verify");
+        verify_package_dir_with_source(stage, stage, PackageProfileName::Bridge)
+            .expect("complete bridge fixture must verify");
+        let rust_only_error =
+            verify_package_dir_with_source(stage, stage, PackageProfileName::RustOnly)
+                .expect_err("bridge fixture must fail the Rust-only contract");
+        assert!(rust_only_error.contains("forbidden bridge path bin/addrsyncd"));
 
         fs::write(stage.join("post-fs-data.sh"), "#!/system/bin/sh\nexit 0\n")
             .expect("write unreviewed Magisk root payload");
-        let error = verify_package_dir_with_source(stage, stage)
+        let error = verify_package_dir_with_source(stage, stage, PackageProfileName::Bridge)
             .expect_err("unreviewed package-root payload must fail");
         assert!(error.contains("extra=post-fs-data.sh"));
         fs::remove_file(stage.join("post-fs-data.sh"))
@@ -2562,7 +2977,7 @@ mod tests {
             serde_json::to_vec(&dangling_description).expect("encode dangling SPDX reference"),
         )
         .expect("write dangling SPDX reference");
-        let error = verify_package_dir_with_source(stage, stage)
+        let error = verify_package_dir_with_source(stage, stage, PackageProfileName::Bridge)
             .expect_err("dangling documentDescribes reference must fail");
         assert!(error.contains("documentDescribes must exactly match"));
         fs::write(stage.join("SBOM.spdx.json"), &sbom).expect("restore SBOM");
@@ -2570,7 +2985,7 @@ mod tests {
         let customize = fs::read(stage.join("customize.sh")).expect("read required file");
         fs::remove_file(stage.join("customize.sh")).expect("remove required file");
         write_fixture_checksums(stage);
-        let error = verify_package_dir_with_source(stage, stage)
+        let error = verify_package_dir_with_source(stage, stage, PackageProfileName::Bridge)
             .expect_err("incomplete full layout must fail");
         assert!(error.contains("missing required file customize.sh"));
         fs::write(stage.join("customize.sh"), customize).expect("restore required file");
@@ -2579,7 +2994,7 @@ mod tests {
         let module_prop = fs::read(stage.join("module.prop")).expect("read module.prop");
         fs::write(stage.join("module.prop"), b"").expect("empty required file");
         write_fixture_checksums(stage);
-        let error = verify_package_dir_with_source(stage, stage)
+        let error = verify_package_dir_with_source(stage, stage, PackageProfileName::Bridge)
             .expect_err("empty required file must fail");
         assert!(error.contains("required file module.prop is empty"));
         fs::write(stage.join("module.prop"), module_prop).expect("restore module.prop");
@@ -2595,27 +3010,27 @@ mod tests {
             serde_json::to_vec(&wrong_path).expect("encode wrong-path manifest"),
         )
         .expect("write wrong-path manifest");
-        let error = verify_package_dir_with_source(stage, stage)
+        let error = verify_package_dir_with_source(stage, stage, PackageProfileName::Bridge)
             .expect_err("required path substitution must fail");
         assert!(error.contains("extra=bin/not-fluxd"));
         fs::remove_file(stage.join("bin/not-fluxd")).expect("remove renamed fixture");
         fs::write(stage.join("conf/manifest.json"), &manifest).expect("restore manifest");
 
         fs::write(stage.join("bin/extension.ko"), "forbidden\n").expect("write payload");
-        let error =
-            verify_package_dir_with_source(stage, stage).expect_err("kernel payload must fail");
+        let error = verify_package_dir_with_source(stage, stage, PackageProfileName::Bridge)
+            .expect_err("kernel payload must fail");
         assert!(error.contains("forbidden kernel payload"));
 
         fs::remove_file(stage.join("bin/extension.ko")).expect("remove payload");
         fs::write(stage.join("bin/.ko"), "forbidden\n").expect("write hidden payload");
-        let error = verify_package_dir_with_source(stage, stage)
+        let error = verify_package_dir_with_source(stage, stage, PackageProfileName::Bridge)
             .expect_err("hidden kernel payload must fail");
         assert!(error.contains("forbidden kernel payload bin/.ko"));
         fs::remove_file(stage.join("bin/.ko")).expect("remove hidden payload");
         fs::create_dir(stage.join("bin/helpers")).expect("create nested binary directory");
         fs::write(stage.join("bin/helpers/unmanifested"), "unexpected\n")
             .expect("write unmanifested binary");
-        let error = verify_package_dir_with_source(stage, stage)
+        let error = verify_package_dir_with_source(stage, stage, PackageProfileName::Bridge)
             .expect_err("nested unmanifested binary must fail");
         assert!(error.contains("extra=bin/helpers/unmanifested"));
 
@@ -2623,38 +3038,33 @@ mod tests {
         let mut metadata = fs::read(stage.join("build-metadata.json")).expect("read metadata");
         metadata.push(b'\n');
         fs::write(stage.join("build-metadata.json"), metadata).expect("tamper metadata");
-        let error = verify_package_dir_with_source(stage, stage)
+        let error = verify_package_dir_with_source(stage, stage, PackageProfileName::Bridge)
             .expect_err("stale checksum inventory must fail");
         assert!(error.contains("package checksum mismatch"));
     }
 
     #[test]
     fn release_manifest_rejects_blank_device_evidence_and_machine_local_sources() {
-        let manifest: ReleaseManifest = serde_json::from_str(
-            r#"{
-                "schema_version": 1,
-                "project": "Flux",
-                "generated_by": "test",
-                "binaries": [{
-                    "name": "fluxd",
-                    "path": "bin/fluxd",
-                    "source": "D:/Github/Flux",
-                    "source_revision": "0123456789abcdef0123456789abcdef01234567",
-                    "version": "0.1.0",
-                    "target": "aarch64-linux-android",
-                    "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
-                    "license": "GPL-3.0-only"
-                }],
-                "device_test_evidence": [],
-                "default_package_profiles": [{
-                    "name": "full",
-                    "description": "Complete package"
-                }]
-            }"#,
-        )
-        .expect("parse manifest fixture");
+        let mut manifest_value: serde_json::Value =
+            serde_json::from_str(include_str!("../../conf/manifest.json"))
+                .expect("parse checked manifest fixture");
+        manifest_value["generated_by"] = serde_json::Value::String("test".to_owned());
+        manifest_value["binaries"] = serde_json::json!([{
+            "name": "fluxd",
+            "path": "bin/fluxd",
+            "source": "D:/Github/Flux",
+            "source_revision": "0123456789abcdef0123456789abcdef01234567",
+            "version": "0.1.0",
+            "target": "aarch64-linux-android",
+            "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+            "license": "GPL-3.0-only"
+        }]);
+        let manifest: ReleaseManifest =
+            serde_json::from_value(manifest_value).expect("parse manifest fixture");
+        let bridge = package_profile(&manifest.package_profiles, PackageProfileName::Bridge)
+            .expect("bridge profile");
         let directory = TestDirectory::new("invalid-manifest");
-        let error = validate_release_manifest(&directory.0, &manifest)
+        let error = validate_release_manifest(&directory.0, &manifest, bridge)
             .expect_err("missing evidence must fail before source acceptance");
         assert!(error.contains("no required device-test evidence"));
 
@@ -2699,5 +3109,33 @@ mod tests {
         let no_entry_error = validate_aarch64_elf("fluxd", &no_entry_binary)
             .expect_err("ELF without an executable entry point must fail");
         assert!(no_entry_error.contains("executable/shared-object header"));
+    }
+
+    #[test]
+    fn aarch64_elf_alignment_checks_every_load_segment_against_16k_minimum() {
+        let directory = TestDirectory::new("elf-load-alignment");
+
+        for (name, alignment) in [("16k", 1 << 14), ("64k", 1 << 16)] {
+            let binary = directory.0.join(format!("{name}-aligned-elf"));
+            write_aarch64_elf_with_load_alignments(&binary, name, [alignment, alignment]);
+            validate_aarch64_elf("fluxd", &binary)
+                .expect("at-least-16 KiB-aligned ELF fixture must pass");
+        }
+
+        let under_aligned = directory.0.join("8k-aligned-elf");
+        write_aarch64_elf_with_load_alignments(&under_aligned, "8k", [1 << 13, 1 << 14]);
+        let alignment_error = validate_aarch64_elf("fluxd", &under_aligned)
+            .expect_err("8 KiB PT_LOAD alignment must fail");
+        assert!(alignment_error.contains("below the Android 16384-byte requirement"));
+
+        let later_under_aligned = directory.0.join("later-4k-aligned-elf");
+        write_aarch64_elf_with_load_alignments(
+            &later_under_aligned,
+            "later-4k",
+            [1 << 14, 1 << 12],
+        );
+        let later_error = validate_aarch64_elf("sing-box", &later_under_aligned)
+            .expect_err("later 4 KiB PT_LOAD alignment must fail");
+        assert!(later_error.contains("below the Android 16384-byte requirement"));
     }
 }

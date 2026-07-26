@@ -1,8 +1,8 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "project": "Flux",
   "generated_by": "manual",
-  "note": "Development placeholder only. Release verification requires a clean root/submodule revision, exact HTTPS provenance/version/target/hash/license fields, payload-bound device evidence with exact device and test identities, SPDX, complete checksums, and pinned build metadata. Publication additionally requires trusted provenance and device attestations.",
+  "note": "Development placeholder only. The bridge profile is development-only and the Rust-only profile is failing-until-complete. Release verification additionally requires clean applicable source revisions, exact HTTPS provenance/version/target/hash/license fields, payload-bound physical-device evidence, SPDX, complete checksums, and pinned build metadata.",
   "binaries": [
     {
       "name": "fluxd",
@@ -46,10 +46,79 @@
     }
   ],
   "device_test_evidence": [],
-  "default_package_profiles": [
+  "package_profiles": [
     {
-      "name": "full",
-      "description": "Contains all required binaries."
+      "name": "bridge",
+      "status": "development-only",
+      "description": "Temporary hybrid package used only for development, WSA mechanism checks, and rollback-oracle comparison; it is never release evidence.",
+      "required_files": [
+        "META-INF/com/google/android/update-binary",
+        "META-INF/com/google/android/updater-script",
+        "bin/fluxd",
+        "bin/addrsyncd",
+        "bin/jq",
+        "bin/sing-box",
+        "conf/flux.toml",
+        "conf/settings.ini",
+        "conf/addrsyncd.toml",
+        "conf/template.json",
+        "conf/manifest.json",
+        "scripts/addrsync",
+        "scripts/config",
+        "scripts/core",
+        "scripts/dispatcher",
+        "scripts/flux-event",
+        "scripts/init",
+        "scripts/lib",
+        "scripts/log",
+        "scripts/rules",
+        "scripts/tproxy",
+        "scripts/updater.sh",
+        "webroot/index.html",
+        "customize.sh",
+        "flux_service.sh",
+        "uninstall.sh",
+        "module.prop",
+        "LICENSE"
+      ],
+      "forbidden_files": []
+    },
+    {
+      "name": "rust-only",
+      "status": "failing-until-complete",
+      "description": "Target package containing fluxd, Sing-Box, Rust-owned configuration and assets, and platform-required installation and boot glue only.",
+      "required_files": [
+        "META-INF/com/google/android/update-binary",
+        "META-INF/com/google/android/updater-script",
+        "bin/fluxd",
+        "bin/sing-box",
+        "conf/flux.toml",
+        "conf/template.json",
+        "conf/manifest.json",
+        "webroot/index.html",
+        "customize.sh",
+        "flux_service.sh",
+        "uninstall.sh",
+        "module.prop",
+        "LICENSE"
+      ],
+      "forbidden_files": [
+        "bin/addrsyncd",
+        "bin/jq",
+        "conf/settings.ini",
+        "conf/addrsyncd.toml",
+        "scripts/addrsync",
+        "scripts/config",
+        "scripts/core",
+        "scripts/dispatcher",
+        "scripts/flux-event",
+        "scripts/init",
+        "scripts/lib",
+        "scripts/log",
+        "scripts/rules",
+        "scripts/tproxy",
+        "scripts/updater.sh"
+      ]
     }
   ]
 }

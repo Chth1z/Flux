@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::fmt;
 
-use crate::PlatformError;
+use crate::{FileObservationError, PlatformError};
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 const MAX_ACCEPTS_PER_TURN: usize = 8;
@@ -54,6 +54,8 @@ impl Error for NetworkInventoryDegradation {
 #[derive(Debug)]
 pub enum ReactorError {
     Platform(PlatformError),
+    FileObservation(FileObservationError),
+    FileObservationAlreadyAttached,
     WorkerSpawn {
         source: std::io::Error,
     },
@@ -75,6 +77,10 @@ impl fmt::Display for ReactorError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Platform(error) => error.fmt(formatter),
+            Self::FileObservation(error) => write!(formatter, "file observation: {error}"),
+            Self::FileObservationAlreadyAttached => {
+                formatter.write_str("file observation is already attached to the daemon reactor")
+            }
             Self::WorkerSpawn { source } => {
                 write!(formatter, "spawn reactor worker failed: {source}")
             }
@@ -107,6 +113,8 @@ impl Error for ReactorError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Platform(error) => Some(error),
+            Self::FileObservation(error) => Some(error),
+            Self::FileObservationAlreadyAttached => None,
             Self::WorkerSpawn { source } => Some(source),
             Self::WorkerPanicked { .. }
             | Self::WorkerIdentifierExhausted
@@ -120,6 +128,12 @@ impl Error for ReactorError {
 impl From<PlatformError> for ReactorError {
     fn from(error: PlatformError) -> Self {
         Self::Platform(error)
+    }
+}
+
+impl From<FileObservationError> for ReactorError {
+    fn from(error: FileObservationError) -> Self {
+        Self::FileObservation(error)
     }
 }
 
@@ -138,17 +152,22 @@ mod implementation {
         StopDisposition,
     };
     use crate::address_sync::AddressEventPolicy;
+    use crate::file_observer::{FileObservationDriveReport, FileObserverDriver};
     use crate::network_observer::NetworkInventorySource;
     use crate::network_observer::driver::{
         RouteNetworkInventoryDriver, RouteNetworkInventoryWorkBudget,
     };
-    use crate::{PlatformError, SeqpacketConnection, SeqpacketListener, ShutdownSignal};
+    use crate::{
+        FileObservationBatch, FileObservationError, FileObservationPaths, PlatformError,
+        SeqpacketConnection, SeqpacketListener, ShutdownSignal,
+    };
 
     const LISTENER_TOKEN: u64 = 1;
     const SHUTDOWN_TOKEN: u64 = 2;
     const WAKE_TOKEN: u64 = 3;
     const NETWORK_INVENTORY_TOKEN: u64 = 4;
-    const EPOLL_EVENT_CAPACITY: usize = 4;
+    const FILE_OBSERVATION_TOKEN: u64 = 5;
+    const EPOLL_EVENT_CAPACITY: usize = 5;
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum StopPhase {
@@ -320,6 +339,7 @@ mod implementation {
         wake: bool,
         network_inventory: bool,
         network_inventory_failure: Option<u32>,
+        file_observation: bool,
     }
 
     struct NetworkInventoryRegistration {
@@ -352,6 +372,57 @@ mod implementation {
         }
     }
 
+    struct FileObservationRegistration {
+        driver: FileObserverDriver,
+        on_observation: Box<dyn FnMut(FileObservationBatch) -> Option<FileObservationPaths> + Send>,
+        on_issue: Box<dyn FnMut(FileObservationError) + Send>,
+    }
+
+    impl FileObservationRegistration {
+        fn next_deadline(&self) -> Instant {
+            self.driver.next_deadline()
+        }
+
+        fn reconcile_initial(&mut self, now: Instant) {
+            self.apply_observation(FileObservationBatch::all(), now);
+        }
+
+        fn drive_ready(&mut self, now: Instant) -> Result<(), FileObservationError> {
+            let report = self.driver.drive_ready(now)?;
+            self.apply_report(report, now);
+            Ok(())
+        }
+
+        fn drive_due(&mut self, now: Instant) {
+            let report = self.driver.drive_due(now);
+            self.apply_report(report, now);
+        }
+
+        fn apply_report(&mut self, report: FileObservationDriveReport, now: Instant) {
+            for issue in report.issues {
+                (self.on_issue)(issue);
+            }
+            self.apply_observation(report.observation, now);
+        }
+
+        fn apply_observation(&mut self, observation: FileObservationBatch, now: Instant) {
+            if observation.is_empty() {
+                return;
+            }
+            let Some(paths) = (self.on_observation)(observation) else {
+                return;
+            };
+            match self.driver.replace_paths(&paths, now) {
+                Ok(issues) => {
+                    for issue in issues {
+                        (self.on_issue)(issue);
+                    }
+                }
+                Err(error) => (self.on_issue)(error),
+            }
+        }
+    }
+
     pub struct DaemonReactor {
         epoll: OwnedFd,
         listener: Option<SeqpacketListener>,
@@ -363,6 +434,7 @@ mod implementation {
         workers: HashMap<u64, JoinHandle<()>>,
         next_worker_id: u64,
         network_inventory: Option<NetworkInventoryRegistration>,
+        file_observation: Option<FileObservationRegistration>,
         // Keep this last: its field drop restores the installing thread's
         // signal mask only after every other daemon-owned value is gone.
         shutdown: ShutdownSignal,
@@ -401,6 +473,7 @@ mod implementation {
                     workers: HashMap::with_capacity(MAX_WORKERS),
                     next_worker_id: 1,
                     network_inventory: None,
+                    file_observation: None,
                     shutdown,
                 },
                 stop,
@@ -444,6 +517,39 @@ mod implementation {
             Ok((reactor, stop, Some(source)))
         }
 
+        pub fn attach_file_observation<O, I>(
+            &mut self,
+            paths: &FileObservationPaths,
+            on_observation: O,
+            on_issue: I,
+        ) -> Result<(), ReactorError>
+        where
+            O: FnMut(FileObservationBatch) -> Option<FileObservationPaths> + Send + 'static,
+            I: FnMut(FileObservationError) + Send + 'static,
+        {
+            if self.file_observation.is_some() {
+                return Err(ReactorError::FileObservationAlreadyAttached);
+            }
+            let now = Instant::now();
+            let (driver, initial_issues) = FileObserverDriver::open(paths, now)?;
+            add_epoll_interest(
+                self.epoll.as_raw_fd(),
+                driver.readiness_fd(),
+                FILE_OBSERVATION_TOKEN,
+            )?;
+            let mut registration = FileObservationRegistration {
+                driver,
+                on_observation: Box::new(on_observation),
+                on_issue: Box::new(on_issue),
+            };
+            for issue in initial_issues {
+                (registration.on_issue)(issue);
+            }
+            registration.reconcile_initial(Instant::now());
+            self.file_observation = Some(registration);
+            Ok(())
+        }
+
         pub fn run(mut self) -> Result<(), ReactorError> {
             let terminal_error = self.drive().err();
             self.close_listener_and_drain(terminal_error)
@@ -483,6 +589,16 @@ mod implementation {
                     return Ok(());
                 }
 
+                if ready.file_observation {
+                    self.file_observation
+                        .as_mut()
+                        .expect("ready file observation remains attached")
+                        .drive_ready(Instant::now())?;
+                }
+                if self.wake.is_stopping() {
+                    return Ok(());
+                }
+
                 if let Some(events) = ready.network_inventory_failure {
                     self.degrade_network_inventory(
                         NetworkInventoryDegradation::DescriptorFailure { events },
@@ -507,17 +623,26 @@ mod implementation {
                 if let Some(error) = error {
                     self.degrade_network_inventory(NetworkInventoryDegradation::Runtime(error));
                 }
+                if let Some(registration) = self.file_observation.as_mut() {
+                    registration.drive_due(Instant::now());
+                }
             }
         }
 
         fn wait_for_ready_descriptors(&self) -> Result<ReadySet, ReactorError> {
             let mut events = [libc::epoll_event { events: 0, u64: 0 }; EPOLL_EVENT_CAPACITY];
             let count = loop {
+                let network_deadline = self
+                    .network_inventory
+                    .as_ref()
+                    .and_then(NetworkInventoryRegistration::next_deadline);
+                let file_deadline = self
+                    .file_observation
+                    .as_ref()
+                    .map(FileObservationRegistration::next_deadline);
                 let timeout = epoll_wait_timeout(
                     Instant::now(),
-                    self.network_inventory
-                        .as_ref()
-                        .and_then(NetworkInventoryRegistration::next_deadline),
+                    earliest_deadline(network_deadline, file_deadline),
                 );
                 // SAFETY: `events` is writable for its full cardinality and the
                 // epoll descriptor remains valid for this blocking call.
@@ -694,6 +819,7 @@ mod implementation {
             // no new work can arrive while existing handlers are drained.
             drop(self.listener.take());
             self.listener_registered = false;
+            drop(self.file_observation.take());
             self.disable_network_inventory();
 
             for (worker_id, worker) in self.workers.drain() {
@@ -716,6 +842,7 @@ mod implementation {
             self.wake.begin_shutdown();
             drop(self.listener.take());
             self.listener_registered = false;
+            drop(self.file_observation.take());
             self.disable_network_inventory();
             for (_worker_id, worker) in self.workers.drain() {
                 let _ = worker.join();
@@ -732,6 +859,7 @@ mod implementation {
             wake: false,
             network_inventory: false,
             network_inventory_failure: None,
+            file_observation: false,
         };
         for event in events {
             let token = event.u64;
@@ -758,6 +886,7 @@ mod implementation {
                 LISTENER_TOKEN => ready.listener = true,
                 SHUTDOWN_TOKEN => ready.shutdown = true,
                 WAKE_TOKEN => ready.wake = true,
+                FILE_OBSERVATION_TOKEN => ready.file_observation = true,
                 _ => return Err(ReactorError::UnknownEpollToken(token)),
             }
         }
@@ -774,6 +903,14 @@ mod implementation {
         }
         let milliseconds = remaining.as_nanos().div_ceil(1_000_000);
         i32::try_from(milliseconds).unwrap_or(i32::MAX)
+    }
+
+    fn earliest_deadline(first: Option<Instant>, second: Option<Instant>) -> Option<Instant> {
+        match (first, second) {
+            (Some(first), Some(second)) => Some(first.min(second)),
+            (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+            (None, None) => None,
+        }
     }
 
     fn create_epoll() -> Result<OwnedFd, PlatformError> {
@@ -843,6 +980,7 @@ mod implementation {
             LISTENER_TOKEN => Ok("reactor listener"),
             SHUTDOWN_TOKEN => Ok("reactor signalfd"),
             WAKE_TOKEN => Ok("reactor eventfd"),
+            FILE_OBSERVATION_TOKEN => Ok("reactor inotify descriptor"),
             _ => Err(ReactorError::UnknownEpollToken(token)),
         }
     }
@@ -921,7 +1059,10 @@ mod implementation {
     use std::path::Path;
 
     use super::{NetworkInventoryDegradation, ReactorError, StopDisposition};
-    use crate::{NetworkInventorySource, PlatformError, SeqpacketConnection, ShutdownSignal};
+    use crate::{
+        FileObservationBatch, FileObservationError, FileObservationPaths, NetworkInventorySource,
+        PlatformError, SeqpacketConnection, ShutdownSignal,
+    };
 
     pub struct DaemonReactor;
 
@@ -946,6 +1087,19 @@ mod implementation {
         where
             H: Fn(SeqpacketConnection) + Send + Sync + 'static,
             D: FnOnce(NetworkInventoryDegradation) + Send + 'static,
+        {
+            Err(PlatformError::UnsupportedPlatform(std::env::consts::OS).into())
+        }
+
+        pub fn attach_file_observation<O, I>(
+            &mut self,
+            _paths: &FileObservationPaths,
+            _on_observation: O,
+            _on_issue: I,
+        ) -> Result<(), ReactorError>
+        where
+            O: FnMut(FileObservationBatch) -> Option<FileObservationPaths> + Send + 'static,
+            I: FnMut(FileObservationError) + Send + 'static,
         {
             Err(PlatformError::UnsupportedPlatform(std::env::consts::OS).into())
         }

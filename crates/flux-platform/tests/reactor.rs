@@ -1,6 +1,7 @@
 #![cfg(any(target_os = "linux", target_os = "android"))]
 
 use std::collections::HashSet;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,8 +10,8 @@ use std::thread::{self, JoinHandle, ThreadId};
 use std::time::{Duration, Instant};
 
 use flux_platform::{
-    DaemonReactor, ReactorError, ReactorStopHandle, SeqpacketConnection, ShutdownSignal,
-    StopDisposition,
+    DaemonReactor, FileObservationBatch, FileObservationPaths, ReactorError, ReactorStopHandle,
+    SeqpacketConnection, ShutdownSignal, StopDisposition,
 };
 use tempfile::tempdir;
 
@@ -507,6 +508,142 @@ fn worker_panic_stops_the_reactor_after_listener_cleanup() {
     );
 }
 
+#[test]
+fn file_observation_reports_atomic_replacement_and_disable_state_changes() {
+    let directory = tempdir().expect("temporary directory");
+    let root = directory.path();
+    let configuration = root.join("conf");
+    fs::create_dir(&configuration).expect("create configuration directory");
+    let paths = FileObservationPaths::new(
+        configuration.join("flux.toml"),
+        configuration.join("template.json"),
+        configuration.join("subscription-url.txt"),
+        root.join("disable"),
+    );
+    write_observed_inputs(&paths);
+    let replacement = Arc::new(Mutex::new(None));
+    let (running, observations, issues) =
+        spawn_file_observing_reactor(root.join("fluxd.sock"), paths.clone(), replacement);
+    assert_initial_file_reconciliation(&observations);
+
+    fs::write(configuration.join("unrelated.tmp"), "ignored").expect("write unrelated file");
+    assert_eq!(
+        observations.recv_timeout(Duration::from_millis(100)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    );
+
+    let replacement_template = configuration.join("template.next");
+    fs::write(&replacement_template, "replacement").expect("write replacement template");
+    fs::rename(&replacement_template, paths.engine_template())
+        .expect("replace template atomically");
+    recv_file_observation(&observations, Duration::from_secs(1), |observation| {
+        observation.configuration_inputs_changed()
+    });
+
+    fs::write(paths.disable(), "").expect("create disable entry");
+    recv_file_observation(&observations, Duration::from_secs(1), |observation| {
+        observation.disable_state_changed()
+    });
+    assert!(issues.try_iter().collect::<Vec<_>>().is_empty());
+    stop_and_join(running);
+}
+
+#[test]
+fn file_observation_replaces_dynamic_targets_from_the_reconciliation_callback() {
+    let directory = tempdir().expect("temporary directory");
+    let root = directory.path();
+    let old_configuration = root.join("old");
+    let new_configuration = root.join("new");
+    fs::create_dir(&old_configuration).expect("create old configuration directory");
+    fs::create_dir(&new_configuration).expect("create new configuration directory");
+    let initial = FileObservationPaths::new(
+        old_configuration.join("flux.toml"),
+        old_configuration.join("template.json"),
+        old_configuration.join("subscription-url.txt"),
+        root.join("disable"),
+    );
+    let updated = FileObservationPaths::new(
+        initial.desired_state(),
+        new_configuration.join("template.json"),
+        new_configuration.join("subscription-url.txt"),
+        initial.disable(),
+    );
+    write_observed_inputs(&initial);
+    fs::write(updated.engine_template(), "new template").expect("write new template");
+    fs::write(updated.subscription_url(), "new URL").expect("write new URL");
+    let replacement = Arc::new(Mutex::new(None));
+    let (running, observations, issues) = spawn_file_observing_reactor(
+        root.join("fluxd.sock"),
+        initial.clone(),
+        Arc::clone(&replacement),
+    );
+    assert_initial_file_reconciliation(&observations);
+    *replacement.lock().expect("replacement lock") = Some(updated.clone());
+
+    fs::write(initial.desired_state(), "changed desired state").expect("change desired state");
+    recv_file_observation(&observations, Duration::from_secs(1), |observation| {
+        observation.configuration_inputs_changed()
+    });
+    thread::sleep(Duration::from_millis(50));
+    while observations.try_recv().is_ok() {}
+
+    fs::write(initial.engine_template(), "old target changed").expect("change old template");
+    assert_eq!(
+        observations.recv_timeout(Duration::from_millis(100)),
+        Err(mpsc::RecvTimeoutError::Timeout),
+        "the replaced template target must no longer produce a fact"
+    );
+    fs::write(updated.engine_template(), "new target changed").expect("change new template");
+    recv_file_observation(&observations, Duration::from_secs(1), |observation| {
+        observation.configuration_inputs_changed()
+    });
+
+    assert!(issues.try_iter().collect::<Vec<_>>().is_empty());
+    stop_and_join(running);
+}
+
+#[test]
+fn file_observation_recovers_after_an_ancestor_directory_is_replaced() {
+    let directory = tempdir().expect("temporary directory");
+    let root = directory.path();
+    let active = root.join("active");
+    let configuration = active.join("conf");
+    fs::create_dir_all(&configuration).expect("create active configuration directory");
+    let paths = FileObservationPaths::new(
+        configuration.join("flux.toml"),
+        configuration.join("template.json"),
+        configuration.join("subscription-url.txt"),
+        root.join("disable"),
+    );
+    write_observed_inputs(&paths);
+    let replacement = Arc::new(Mutex::new(None));
+    let (running, observations, issues) =
+        spawn_file_observing_reactor(root.join("fluxd.sock"), paths.clone(), replacement);
+    assert_initial_file_reconciliation(&observations);
+
+    fs::rename(&active, root.join("retired")).expect("retire observed ancestor");
+    fs::create_dir_all(&configuration).expect("replace observed ancestor");
+    write_observed_inputs(&paths);
+    recv_file_observation(&observations, Duration::from_secs(3), |observation| {
+        observation.configuration_inputs_changed()
+    });
+    thread::sleep(Duration::from_millis(300));
+    while observations.try_recv().is_ok() {}
+
+    fs::write(paths.engine_template(), "changed after reinstall")
+        .expect("change reinstalled target");
+    recv_file_observation(&observations, Duration::from_secs(1), |observation| {
+        observation.configuration_inputs_changed()
+    });
+    assert!(
+        issues
+            .try_iter()
+            .all(|issue| issue.contains("open observed directory")),
+        "only the bounded transient replacement gap may be reported"
+    );
+    stop_and_join(running);
+}
+
 fn spawn_reactor<H>(path: PathBuf, handler: H) -> RunningReactor
 where
     H: Fn(SeqpacketConnection) + Send + Sync + 'static,
@@ -548,6 +685,58 @@ where
         native_thread,
         thread,
     }
+}
+
+fn spawn_file_observing_reactor(
+    socket_path: PathBuf,
+    paths: FileObservationPaths,
+    replacement: Arc<Mutex<Option<FileObservationPaths>>>,
+) -> (
+    RunningReactor,
+    mpsc::Receiver<FileObservationBatch>,
+    mpsc::Receiver<String>,
+) {
+    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+    let (observation_tx, observation_rx) = mpsc::channel();
+    let (issue_tx, issue_rx) = mpsc::channel();
+    let thread = thread::spawn(move || {
+        let shutdown = ShutdownSignal::install().expect("install shutdown signal source");
+        let (mut reactor, stop) = DaemonReactor::bind(&socket_path, shutdown, drop_connection)
+            .expect("bind file-observing reactor");
+        reactor
+            .attach_file_observation(
+                &paths,
+                move |observation| {
+                    observation_tx
+                        .send(observation)
+                        .expect("publish file observation");
+                    replacement.lock().expect("replacement lock").take()
+                },
+                move |error| {
+                    issue_tx
+                        .send(error.to_string())
+                        .expect("publish file observation issue");
+                },
+            )
+            .expect("attach file observation");
+        // SAFETY: pthread_self has no pointer arguments or preconditions.
+        let native_thread = unsafe { libc::pthread_self() } as usize;
+        ready_tx
+            .send((stop, thread::current().id(), native_thread))
+            .expect("publish file-observing reactor");
+        reactor.run()
+    });
+    let (stop, reactor_thread, native_thread) = ready_rx.recv().expect("reactor setup result");
+    (
+        RunningReactor {
+            stop,
+            reactor_thread,
+            native_thread,
+            thread,
+        },
+        observation_rx,
+        issue_rx,
+    )
 }
 
 fn bind_reactor<H>(path: PathBuf, handler: H) -> BoundReactor
@@ -608,6 +797,37 @@ fn release_workers(permits: &Arc<(Mutex<usize>, Condvar)>, count: usize) {
     let (lock, changed) = &**permits;
     *lock.lock().expect("worker permit lock") += count;
     changed.notify_all();
+}
+
+fn write_observed_inputs(paths: &FileObservationPaths) {
+    fs::write(paths.desired_state(), "desired state").expect("write desired state");
+    fs::write(paths.engine_template(), "template").expect("write engine template");
+    fs::write(paths.subscription_url(), "URL").expect("write subscription URL");
+}
+
+fn assert_initial_file_reconciliation(observations: &mpsc::Receiver<FileObservationBatch>) {
+    let initial = observations
+        .recv_timeout(Duration::from_secs(1))
+        .expect("initial file reconciliation");
+    assert!(initial.configuration_inputs_changed());
+    assert!(initial.disable_state_changed());
+}
+
+fn recv_file_observation(
+    observations: &mpsc::Receiver<FileObservationBatch>,
+    timeout: Duration,
+    predicate: impl Fn(FileObservationBatch) -> bool,
+) -> FileObservationBatch {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let observation = observations
+            .recv_timeout(remaining)
+            .expect("receive matching file observation");
+        if predicate(observation) {
+            return observation;
+        }
+    }
 }
 
 fn drop_connection(_connection: SeqpacketConnection) {}

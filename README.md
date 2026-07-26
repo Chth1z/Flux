@@ -20,6 +20,14 @@ The current development checkpoint is a Phase-1 bridge:
 
 - `fluxd` owns administrative intent, serialized lifecycle, Generation recovery, and the Sing-Box
   child process.
+- Schema-3 `flux.toml` is the sole product-policy source for Rust-owned preparation. `fluxd`
+  atomically publishes canonical `config.json` plus a strict compatibility environment; shell may
+  append observed `KFEAT_*` facts but does not read policy from `settings.ini` or inspect generated
+  JSON with `jq`.
+- `fluxd` owns bounded HTTPS subscription retrieval, decoding, normalization, rule-asset storage,
+  Sing-Box validation, startup recovery/bootstrap, periodic refresh, and the manual
+  `subscription update` command. Only an accepted snapshot enters the existing Generation reload
+  path; failed admission restores the exact prior durable snapshot.
 - Rust-owned preparation exclusively invokes `fluxd render-legacy-rules` to compile the retained
   source-shape restore caches and records `rust` as their producer. It never silently falls back to
   the shell generator.
@@ -27,7 +35,8 @@ The current development checkpoint is a Phase-1 bridge:
   producer, and remains a mutually exclusive rollback path. `scripts/rules` is otherwise retained
   as the frozen oracle.
 - `scripts/tproxy` remains the sole restore executor and xtables kernel writer. Shell adapters also
-  retain policy-routing and address-derived rule mutation until their later ownership cutovers.
+  retain policy-routing and address-derived rule mutation until the single Gate 1 networking-writer
+  cutover.
 - The development bridge accepts only `PROXY_MODE="tproxy"`. TUN fields are reserved for a future
   single-owner implementation and are rejected before activation.
 - Current pre-release bridge capture verification is still structural. The stricter functional local-OUTPUT
@@ -58,10 +67,11 @@ The current development checkpoint is a Phase-1 bridge:
 The detailed design and current gates are documented under [`docs/`](docs/README.md).
 
 Temporary shell components remain only because they are still the sole proven writer/oracle for
-specific networking state. They are not a compatibility promise: each is removed as soon as its
-Rust replacement passes the required readback, rollback, recovery, single-writer, and Android
-cutover gates. The final package may retain only platform-required installation/boot/disable/uninstall glue;
-that glue will contain no networking policy or cleanup implementation.
+specific networking state. They are not a compatibility promise: Gate 1 removes the networking
+writers together after the complete Rust replacement passes the required readback, rollback,
+recovery, single-writer, and Android gates. The final package may retain only platform-required
+installation/boot/disable/uninstall glue; that glue will contain no networking policy or cleanup
+implementation.
 
 ## Capabilities
 
@@ -70,7 +80,8 @@ that glue will contain no networking policy or cleanup implementation.
 - UID-based application allow/deny policy with Android user/profile scope.
 - Dynamic address-rule reconciliation through the standalone bridge `addrsyncd`.
 - Generation-scoped configuration snapshots, bounded rollback, and startup recovery.
-- Subscription download, filtering, template merge, and Sing-Box validation.
+- Rust-owned subscription download, filtering, template merge, content-addressed rule assets, and
+  bounded active/predecessor recovery are production-connected through `fluxd`.
 - CLI control through the private `fluxd` Unix socket.
 - Zashboard redirect at `http://127.0.0.1:9090/ui/` when the configured Sing-Box API is available.
 
@@ -88,7 +99,8 @@ change incompatibly before release:
 Upgrade preservation is per file:
 
 - `flux.toml` is always preserved because it is the authoritative Rust-controller configuration.
-- `settings.ini` is always migrated into the newly packaged schema.
+- `settings.ini` is always migrated for the explicit legacy rollback path; it is not consulted by
+  Rust-owned preparation.
 - `template.json` and `addrsyncd.toml` each receive their own Vol+/Vol− keep/reset prompt.
 - The generated bridge cache is cleared. Existing `run/`, `state/`, and generated `config.json`
   records are retained so startup recovery can reconcile them; later update/reload policy decides
@@ -105,12 +117,14 @@ flowchart TD
     Boot["Android late-start"] --> Service["module-local service.sh"]
     Service --> Watchdog["bounded fluxd watchdog"]
     Watchdog --> Fluxd["fluxd daemon"]
-    Service --> Inotify["inotifyd fact watcher"]
-    Inotify --> Event["flux-event"]
-    Event --> Fluxd
-    CLI["fluxctl / fluxd CLI"] --> Socket["private Unix control socket"]
+    CLI["fluxd CLI"] --> Socket["private Unix control socket"]
     Socket --> Fluxd
+    Fluxd --> Observer["bounded inotify file observer"]
+    Observer --> Coordinator
     Fluxd --> Coordinator["serialized RuntimeCoordinator"]
+    Fluxd --> Subscription["bounded subscription worker"]
+    Subscription --> Store["validated active + predecessor store"]
+    Subscription --> Coordinator
     Coordinator --> Engine["EngineSupervisor"]
     Engine --> SingBox["sing-box child"]
     Coordinator --> Bridge["LegacyDispatcher adapter"]
@@ -148,7 +162,8 @@ fails preparation without switching writers or falling back to shell.
 Explicit legacy ownership is the only path that sources `scripts/rules`; it records `shell` as the
 producer and exists as a mutually exclusive rollback path. The script is otherwise retained as a
 frozen byte-level oracle. Both paths publish restore caches, while `scripts/tproxy` remains their
-sole production bridge executor and networking writer.
+sole production xtables restore executor and writer. `scripts/addrsync` and standalone `addrsyncd`
+still own the bridge's policy-routing and address-derived mutations.
 
 The Rust implementation used by the executed bridge is a legacy compatibility/source-shape
 renderer. It reproduces the retained shell contract, including ordering and duplicate forms needed
@@ -172,9 +187,12 @@ activation authority. A private `NativeXtablesOwner` now consumes only independe
 targets behind `converge(target)` and `recover()`. It owns stable `FLX{4|6}SP` PREROUTING and
 `FLX{4|6}SO` OUTPUT roots, coherent descriptor-pinned command/restore/save execution, exact xtables
 and policy-routing readback, rollback, durable journal recovery, cleanup, and a shell-visible
-transition lease. Durable payload schema 2 binds the target and optional previous Generation to the
-artifact and tool digests plus a complete IPv4/IPv6 policy-routing audit digest containing the exact
-loopback name/index identity. The owner validates that live interface binding in both directions and
+transition lease. Owner-payload schema 3 stores only the target and optional previous identities;
+each identity binds the source artifact, coherent tool set, complete private runtime plan, and the
+IPv4/IPv6 policy-routing audit including exact loopback name/index identity. The checksum-protected
+`native_xtables.targets` archive retains exact recovery material for at most the active and
+replacement targets. One no-follow runtime lock spans archive refresh/staging, journal and kernel
+convergence, and archive settling. The owner validates live interface binding in both directions and
 audits both xtables families and both routing identities before publishing `Active` or `CleanAbsent`,
 so opposite-family residue cannot be hidden by a single-family target.
 
@@ -219,89 +237,82 @@ Runtime files live under `/data/adb/flux/`:
 ├── bin/
 │   ├── fluxd                 # Rust controller and CLI
 │   ├── addrsyncd             # Bridge address-rule reconciler / rollback binary
-│   ├── jq                    # JSON adapter used by the bridge
+│   ├── jq                    # Explicit legacy-rollback JSON adapter
 │   └── sing-box              # External proxy engine
 ├── conf/
 │   ├── flux.toml             # Strict fluxd schema
-│   ├── settings.ini          # Legacy networking/subscription settings
+│   ├── settings.ini          # Explicit legacy-rollback settings
 │   ├── addrsyncd.toml
 │   ├── template.json
-│   ├── config.json           # Generated Sing-Box configuration
+│   ├── config.json           # Canonical Rust-generated Sing-Box configuration
 │   └── manifest.json         # Release provenance contract
 ├── cache/
 │   ├── cache_rules_* / cache_cleanup_*  # Rust- or shell-produced restore documents
 │   ├── cache_packages       # Rust package snapshot; absent for shell, empty when resolution is inactive
 │   └── cache_valid          # Cache producer marker: rust or shell
 ├── state/
-│   └── administrative-intent.json
+│   ├── administrative-intent.json
+│   └── subscription/         # Rust-owned validated snapshots and local rule assets
 ├── run/
 │   ├── fluxd.sock
 │   ├── fluxd.pid
+│   ├── fluxd.lease             # Kernel-backed daemon/offline exclusion; presence is not liveness
 │   ├── fluxd.log
+│   ├── desired-state.env     # Read-only Rust-to-shell bridge input
 │   ├── generations/          # Immutable prepared Generation snapshots
 │   └── capture.* / engine.*  # Generation ownership and recovery records
 └── scripts/
-    ├── fluxctl               # Compatibility CLI wrapper
-    ├── flux-event            # Raw inotify fact adapter
+    ├── flux-event            # Packaged legacy event adapter; no runtime caller
     ├── dispatcher            # Serialized shell phase adapter
-    ├── init / config / updater.sh
+    ├── init / config
+    ├── updater.sh            # Frozen, packaged bridge oracle; never invoked at runtime
     ├── rules                # Frozen source-shape oracle and explicit legacy rollback generator
     ├── tproxy               # Sole restore executor and xtables kernel writer
     ├── addrsync
     └── lib / log / core      # Shared and rollback-only helpers
 ```
 
-The module manager directory `/data/adb/modules/flux/` contains `service.sh`, `module.prop`, the
+The module manager directory `/data/adb/modules/flux/` contains `service.sh`, `uninstall.sh`, `module.prop`, the
 dashboard redirect, and the manager-owned `disable` marker. The installer removes obsolete global
 `/data/adb/*/service.d/flux_service.sh` launchers so only the module-local watchdog owns `fluxd`.
 
 ## Configuration
 
-`flux.toml` configures the Rust daemon. Its schema is strict: unknown or missing fields fail, and
-changes currently require a daemon restart. `settings.ini` configures the retained networking and
-subscription bridge.
+[`conf/flux.toml`](conf/flux.toml) is the sole Flux routing, capture, and lifecycle-policy source
+during Rust-owned operation. Schema 3 rejects unknown, duplicate, or missing fields. A
+mutation-capable daemon observes `flux.toml`, its selected engine template, its selected subscription
+URL file, and the module `disable` entry; changes are coalesced into the existing serialized
+coordinator without requiring a daemon restart. Settled read-only profiles attach no file observer.
+Sing-Box-specific routing, DNS, outbound, and API content remains in the separately validated
+`template.json`; it is an engine source document, not a second Flux capture-policy authority.
 
-### Subscription and logging
+| Section | Owns |
+|---|---|
+| `[daemon]` | Fail-open policy, reconciliation debounce, queue capacity, and Generation retention |
+| `[engine]` / `[listener]` | Sing-Box path and template, numeric UID/GID, lifecycle/restart timeouts, and TPROXY port |
+| `[capture]` | Explicit xtables backend, local/forwarded domains, address families, and TCP/UDP selection |
+| `[applications]` | All/allowlist/denylist package policy and Android user scope |
+| `[interfaces]` / `[bypass]` | Forwarded, local-bypass, excluded interfaces, and additional canonical CIDRs |
+| `[subscription]` | Rust HTTPS refresh policy, URL file, interval, encoded/decoded byte limits, and node limit |
+| `[safety]` | Android VPN and functional-canary intent; positive values await their authority gates |
 
-| Option | Description | Default |
-|---|---|---|
-| `SUBSCRIPTION_URL` | Subscription URL | empty |
-| `UPDATE_TIMEOUT` | Download timeout in seconds | `5` |
-| `RETRY_COUNT` | Download retry count | `2` |
-| `UPDATE_INTERVAL` | Refresh interval; `0` disables automatic refresh | `86400` |
-| `PREF_CLEANUP_EMOJI` | Remove emoji from node names | `1` |
-| `LOG_LEVEL` | `0` off through `4` debug | `3` |
-| `LOG_MAX_SIZE` | Log rotation threshold in bytes | `1048576` |
+`template.json` remains the separate Sing-Box source document. With subscriptions disabled, Rust
+opens it with bounded no-follow checks and compiles the canonical engine artifact directly. With
+subscriptions enabled, the bounded worker downloads and normalizes the supported sources and rule
+assets, validates the exact merged candidate with Sing-Box, and publishes it through the same
+read-only `config.json` plus `run/desired-state.env` bridge preparation. An observed template, URL,
+or Desired State change schedules that worker after successful configuration reconciliation;
+changes observed while disabled remain dirty and are consumed when `disable` is removed.
 
-### Proxy engine
-
-| Option | Description | Default |
-|---|---|---|
-| `CORE_USER` / `CORE_GROUP` | Sing-Box execution identity | `root` / `root` |
-| `CORE_TIMEOUT` | Engine startup timeout in seconds | `5` |
-| `PROXY_PORT` | TPROXY listener port; extracted only from a `tproxy` inbound | `1536` |
-| `FAKEIP_V4_RANGE` | FakeIP IPv4 range | `198.18.0.0/15` |
-| `FAKEIP_V6_RANGE` | FakeIP IPv6 range | `fc00::/18` |
-| `PROXY_MODE` | Current development bridge mode; only `tproxy` is accepted | `tproxy` |
-| `TUN_INTERFACE`, `TUN_INET4_ADDRESS`, `TUN_INET6_ADDRESS`, `TUN_MTU` | Reserved and migrated, but unsupported in Phase 1 | packaged values |
-
-A `mixed` inbound is not a transparent TPROXY listener and is therefore not used for automatic
-port extraction.
-
-### Interfaces and application scope
-
-| Option | Description | Default |
-|---|---|---|
-| `MOBILE_INTERFACE` | Mobile interface pattern | `rmnet_data+` |
-| `WIFI_INTERFACE` | Wi-Fi interface | `wlan0` |
-| `HOTSPOT_INTERFACE` | Hotspot interface | `wlan2` |
-| `USB_INTERFACE` | USB tethering interface pattern | `rndis+` |
-| `PROXY_MOBILE`, `PROXY_WIFI`, `PROXY_HOTSPOT`, `PROXY_USB` | Per-interface proxy switches | `1` |
-| `PROXY_IPV6` | Enable IPv6 proxy rules | `0` |
-| `APP_PROXY_MODE` | `0` disabled, `1` denylist/bypass listed apps, `2` allowlist/proxy listed apps | `0` |
-| `APP_LIST` | Package-name list | empty |
-| `APP_USER_SCOPE` | `owner`, `all`, or `list` | `owner` |
-| `APP_USER_LIST` | Android user IDs used by `list` scope | `0` |
+The temporary shell renderer can express only a strict subset of schema 3. It requires local and
+forwarded capture, TCP and UDP, IPv4 or dual stack, no user bypass CIDRs, disabled VPN and
+required-canary intent, and at most four forwarded or local-bypass interface roles. Enabled
+subscriptions require an accepted Rust snapshot and the packaged root-owned Sing-Box identity;
+non-root traversal of the private snapshot store is not yet supported. A valid configuration
+outside those bridge limits fails preparation instead of being silently narrowed. The shell
+validates the exact 41-field environment allowlist and may append only observed `KFEAT_*` values.
+`scripts/updater.sh` is never invoked; it, `settings.ini`, and `jq` remain packaged only for frozen
+bridge comparison or explicit legacy rollback until B3 removes them.
 
 ### Routing marks and compatibility
 
@@ -312,41 +323,53 @@ port extraction.
 
 | Option | Description | Default |
 |---|---|---|
-| `ROUTING_MARK` | Optional engine bypass mark; empty uses owner matching | empty |
+| `ROUTING_MARK` | Fixed empty bridge value; owner matching provides loop escape | empty |
 | `MARK_MASK` | Legacy connmark mask | `0xff` |
 | `RULE_BACKEND` | Implemented rules adapter | `iptables_restore` |
 | `BYPASS_SET_BACKEND` | Implemented bypass classifier | `zone` |
 | `MSS_CLAMP_ENABLE` | TCP MSS clamp | `1` |
 | `BLOCK_QUIC` | Block UDP/443 | `0` |
 
-Additional compatibility fields are documented in [`conf/settings.ini`](conf/settings.ini).
+These values are reviewed bridge constants emitted by Rust, not user configuration. They disappear
+with the shell writer rather than becoming the native planner's defaults.
 
 ## CLI
 
 ```bash
-/data/adb/flux/scripts/fluxctl status [--json]
-/data/adb/flux/scripts/fluxctl start
-/data/adb/flux/scripts/fluxctl stop
-/data/adb/flux/scripts/fluxctl restart
-/data/adb/flux/scripts/fluxctl reload
-/data/adb/flux/scripts/fluxctl resync
-/data/adb/flux/scripts/fluxctl diagnose
-/data/adb/flux/scripts/fluxctl rules-preview
-/data/adb/flux/scripts/fluxctl logs [file]
+/data/adb/flux/bin/fluxd status [--json]
+/data/adb/flux/bin/fluxd start|stop|restart|reload|resync
+/data/adb/flux/bin/fluxd diagnose [--json]
+/data/adb/flux/bin/fluxd logs [runtime|daemon|engine] [--lines 1..1000] [--json]
+/data/adb/flux/bin/fluxd backend explain [--json]
+/data/adb/flux/bin/fluxd plan [--dry-run] [--json]
+/data/adb/flux/bin/fluxd rules-preview [--json]
+/data/adb/flux/bin/fluxd subscription update
+/data/adb/flux/bin/fluxd cleanup --offline
 ```
 
 `status` is authoritative `fluxd` status, including the Rust-owned Sing-Box runtime state. Mutating
 commands use only the private control socket and never fall back to direct shell mutation.
+`diagnose`, fixed-stream logs, and explain/preview are same-user, bounded, read-only socket
+operations. Logs read at most a 256 KiB source tail and never accept an arbitrary path. Explain
+compiles schema-3 Desired State and canonical engine JSON in memory without publishing a Generation,
+cache, receipt, or writer lease; it does not yet resolve Android package UIDs or live network
+inventory into a complete Capture Program. The package exposes no shell control/diagnostic wrapper,
+and direct Rust preview never enters the dispatcher or publishes shared caches. `cleanup --offline`
+is a pre-socket Rust command: it acquires `run/fluxd.lease`, runs bounded durable-record recovery,
+and refuses with exit `75` while a daemon is active or starting. The lease inode, PID file, and socket
+are not liveness signals. Module `uninstall.sh` delegates to Rust `stop` when the daemon answers and
+otherwise invokes this offline command; it contains no networking or record-cleanup policy.
 
 ## Development status
 
 Build, test, privileged canary, Android cross-build, staging, and package-consistency instructions
-are in [`docs/development.md`](docs/development.md). The current `cargo xtask verify-package` checks
-the temporary hybrid stage and cannot make it releasable. Before publication, its inventory must be
-changed to the Rust-only runtime and reject standalone `addrsyncd`, `jq`, legacy runtime scripts,
-and compatibility wrappers, in addition to enforcing AArch64 ELF, immutable provenance/hashes,
-SBOM/license binding, trusted device evidence, pinned build metadata, checksums, and the no-kernel-
-payload policy.
+are in [`docs/development.md`](docs/development.md). `cargo xtask verify-package --profile bridge`
+checks the temporary hybrid stage and always labels a pass development-only. The separate
+`--profile rust-only` gate already requires the final 13-path inventory and forbids standalone
+`addrsyncd`, `jq`, both legacy configuration files, and all current runtime scripts, but remains
+explicitly `failing-until-complete`. Neither profile can bypass ADR-0011, trusted physical-device
+evidence, immutable provenance/hashes, SBOM/license binding, pinned build metadata, checksums, or the
+no-kernel-payload policy.
 
 The delivered bridge renderer is only the first non-mutating xtables cutover: Rust prepares
 compatibility bytes, while shell still owns restore execution, readback, rollback, and kernel

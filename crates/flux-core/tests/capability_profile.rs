@@ -93,6 +93,36 @@ fn nonzero_same_schema_revisions_can_be_preserved_by_adapters() {
 }
 
 #[test]
+fn complete_profile_digest_distinguishes_equal_revisions() {
+    let revision = CapabilityProfileRevision::new(7).expect("nonzero revision");
+    let enforcing = CapabilityProfile::new(
+        revision,
+        Observation::Verified(
+            BootIdentity::parse("01234567-89ab-cdef-0123-456789abcdef")
+                .expect("canonical boot identity"),
+        ),
+        Observation::Unavailable,
+        KernelFacts::from_release(Observation::Verified(
+            KernelRelease::new("5.10.0").expect("bounded kernel release"),
+        )),
+        Observation::Verified(SelinuxMode::Enforcing),
+        ready_legacy_bridge(),
+    );
+    let permissive = CapabilityProfile::new(
+        revision,
+        enforcing.boot_identity().clone(),
+        enforcing.device_identity().clone(),
+        enforcing.kernel().clone(),
+        Observation::Verified(SelinuxMode::Permissive),
+        enforcing.legacy_bridge().clone(),
+    );
+
+    assert_eq!(enforcing.revision(), permissive.revision());
+    assert_eq!(enforcing.digest(), enforcing.digest());
+    assert_ne!(enforcing.digest(), permissive.digest());
+}
+
+#[test]
 fn exact_device_identity_is_ordered_and_catalog_keys_exclude_runtime_bindings() {
     let first = device_identity(
         NetworkNamespaceIdentity::new(10, 20).expect("namespace"),

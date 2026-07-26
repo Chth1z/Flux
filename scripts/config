@@ -490,6 +490,16 @@ _detect_kernel() {
 # One-stop config: init defaults, validate, export cache to stdout
 # Also validates sing-box config
 build_config() {
+    if [ "${FLUXD_ENGINE_OWNER:-legacy}" = "rust" ]; then
+        _validate_rust_desired_state_env || {
+            log_error "Rust-owned Desired State environment is missing, unsafe, or malformed"
+            return 1
+        }
+        cat "${DESIRED_STATE_ENV_FILE}" || return 1
+        _detect_kernel || return 1
+        return 0
+    fi
+
     local tmp_settings
     tmp_settings=$(mktemp "${RUN_DIR:-/tmp}/cfgsettings.XXXXXX") || return 1
 
@@ -503,9 +513,7 @@ build_config() {
     set +a
     _apply_proxy_mode_config || return 1
     _extract_json_config || return 1
-    if [ "${FLUXD_ENGINE_OWNER:-legacy}" != "rust" ]; then
-        _validate_singbox_config || return 1
-    fi
+    _validate_singbox_config || return 1
     cat "${tmp_settings}"
     rm -f "${tmp_settings}"
     _detect_kernel || return 1

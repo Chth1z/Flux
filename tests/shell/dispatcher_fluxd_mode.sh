@@ -172,6 +172,12 @@ prepare_generation() {
     manifest_value generation
 }
 
+edit_desired_state_env() {
+    chmod u+w "${RUN_ROOT}/desired-state.env"
+    sed -i "$@" "${RUN_ROOT}/desired-state.env"
+    chmod 0444 "${RUN_ROOT}/desired-state.env"
+}
+
 write_stub() {
     local name="${1}"
     local body="${2}"
@@ -200,18 +206,64 @@ reset_fixture() {
     cp /src/scripts/dispatcher /src/scripts/lib /src/scripts/log "${FLUX_ROOT}/scripts/"
     chmod 0755 "${DISPATCHER}"
 
-    cat >"${FLUX_ROOT}/cache/cache_config" <<'EOF'
-LOG_LEVEL=0
-LOG_MAX_SIZE=1048576
-CORE_USER=root
-CORE_GROUP=root
-CORE_TIMEOUT=5
-PROXY_MODE=tproxy
-PROXY_PORT=1536
-PROXY_IPV6=0
-KFEAT_OWNER=1
-TUN_INTERFACE=tun0
+    cat >"${RUN_ROOT}/desired-state.env" <<'EOF'
+# FLUX_DESIRED_STATE_ENV_V1
+FLUX_BRIDGE_ENV_SCHEMA='1'
+ENGINE_BINARY='/data/adb/flux/bin/sing-box'
+ENGINE_STARTUP_TIMEOUT_MS='5000'
+ENGINE_STOP_TIMEOUT_MS='5000'
+CORE_USER='0'
+CORE_GROUP='0'
+CORE_TIMEOUT='5'
+LOG_LEVEL='0'
+LOG_MAX_SIZE='1048576'
+PROXY_MODE='tproxy'
+PROXY_PORT='1536'
+PROXY_IPV6='0'
+APP_PROXY_MODE='0'
+APP_LIST=''
+APP_USER_SCOPE='owner'
+APP_USER_LIST=''
+MOBILE_INTERFACE='rndis+'
+PROXY_MOBILE='1'
+WIFI_INTERFACE='wlan0'
+PROXY_WIFI='1'
+HOTSPOT_INTERFACE='wlan2'
+PROXY_HOTSPOT='1'
+USB_INTERFACE='rmnet_data+'
+PROXY_USB='1'
+EXCLUDE_INTERFACES=''
+FAKEIP_V4_RANGE='198.18.0.0/15'
+FAKEIP_V6_RANGE='fc00::/18'
+MARK_MASK='0xff'
+IPV4_MARK='0x14'
+IPV6_MARK='0x19'
+BYPASS_MARK='0x11'
+ROUTING_MARK=''
+RULE_BACKEND='iptables_restore'
+BYPASS_SET_BACKEND='zone'
+MSS_CLAMP_ENABLE='1'
+BLOCK_QUIC='0'
+PERFORMANCE_MODE='0'
+PRIVATE_DNS_GUARD='0'
+IPV6_FORCE_DISABLE='0'
+VENDOR_FIX_PROFILE='none'
+HOTSPOT_FIX='0'
 EOF
+    chmod 0444 "${RUN_ROOT}/desired-state.env"
+    cp "${RUN_ROOT}/desired-state.env" "${FLUX_ROOT}/cache/cache_config"
+    chmod 0644 "${FLUX_ROOT}/cache/cache_config"
+    cat >>"${FLUX_ROOT}/cache/cache_config" <<'EOF'
+KFEAT_TPROXY=1
+KFEAT_OWNER=1
+KFEAT_MARK=1
+KFEAT_CONNTRACK=1
+KFEAT_SOCKET_TCP=0
+KFEAT_SOCKET_UDP=0
+KFEAT_IPV6_NAT=1
+UPDATE_INTERVAL=0
+EOF
+    printf '1\n' >"${RUN_ROOT}/test-kfeat-owner"
     printf '*mangle\nCOMMIT\n' >"${FLUX_ROOT}/cache/cache_rules_ipv4"
     printf '*mangle\nCOMMIT\n' >"${FLUX_ROOT}/cache/cache_cleanup_ipv4"
     : >"${FLUX_ROOT}/cache/cache_packages"
@@ -233,6 +285,16 @@ _detect_kernel() {
 printf "init:%s\n" "$*" >>/data/adb/flux/run/test-calls
 [ ! -f /data/adb/flux/run/fail-init ] || exit 41
 if [ "${FLUXD_ENGINE_OWNER:-legacy}" = rust ]; then
+    cp /data/adb/flux/run/desired-state.env /data/adb/flux/cache/cache_config
+    cat >>/data/adb/flux/cache/cache_config <<EOF
+KFEAT_TPROXY=1
+KFEAT_OWNER=$(cat /data/adb/flux/run/test-kfeat-owner)
+KFEAT_MARK=1
+KFEAT_CONNTRACK=1
+KFEAT_SOCKET_TCP=0
+KFEAT_SOCKET_UDP=0
+KFEAT_IPV6_NAT=1
+EOF
     printf "FLUX_LEGACY_RULES_SET_MANIFEST_V1\ngeneration=%s\nfamilies=ipv4\n" "${FLUX_GENERATION_ID:?missing generation}" >/data/adb/flux/cache/cache_rules_manifest
 fi
 : >/data/adb/flux/cache/cache_valid
@@ -276,37 +338,38 @@ fi
 }
 
 install_real_init_fixture() {
-    printf 'UPDATE_INTERVAL=0\n' >>"${FLUX_ROOT}/cache/cache_config"
+    chmod u+w "${RUN_ROOT}/desired-state.env"
+    sed -i \
+        -e "s/^APP_PROXY_MODE=.*/APP_PROXY_MODE='2'/" \
+        -e "s/^APP_LIST=.*/APP_LIST='com.example.alpha'/" \
+        "${RUN_ROOT}/desired-state.env"
+    chmod 0444 "${RUN_ROOT}/desired-state.env"
     cp /src/scripts/init "${FLUX_ROOT}/scripts/init"
     chmod 0755 "${FLUX_ROOT}/scripts/init"
     cat >"${FLUX_ROOT}/scripts/config" <<'EOF'
 _process_settings() {
-    cat /data/adb/flux/cache/cache_config
+    cat /data/adb/flux/run/desired-state.env
 }
 
 _detect_kernel() {
-    return 0
+    cat <<'KERNEL'
+KFEAT_TPROXY=1
+KFEAT_OWNER=1
+KFEAT_MARK=1
+KFEAT_CONNTRACK=1
+KFEAT_SOCKET_TCP=0
+KFEAT_SOCKET_UDP=0
+KFEAT_IPV6_NAT=1
+KERNEL
 }
 
 build_config() {
-    cat <<'CONFIG'
-LOG_LEVEL='0'
-LOG_MAX_SIZE='1048576'
-UPDATE_INTERVAL='0'
-CORE_USER='root'
-CORE_GROUP='root'
-CORE_TIMEOUT='5'
-PROXY_MODE='tproxy'
-PROXY_PORT='1536'
-PROXY_IPV6='0'
-APP_PROXY_MODE='2'
-APP_LIST='com.example.alpha'
-KFEAT_OWNER=1
-CONFIG
-}
+    cat /data/adb/flux/run/desired-state.env
+    _detect_kernel
+    [ "${FLUXD_ENGINE_OWNER:-legacy}" = rust ] || printf 'UPDATE_INTERVAL=0\n'
+    }
 EOF
     write_stub updater.sh 'exit 0'
-    write_stub fluxctl 'exit 0'
     for binary in jq addrsyncd; do
         printf '#!/usr/bin/sh\nexit 0\n' >"${FLUX_ROOT}/bin/${binary}"
         chmod 0755 "${FLUX_ROOT}/bin/${binary}"
@@ -321,6 +384,17 @@ EOF
 
 run_bridge() {
     FLUXD_BRIDGE=1 sh "${DISPATCHER}" "$@"
+}
+
+test_direct_dispatcher_lifecycle_alias_is_removed() {
+    reset_fixture
+    direct_rc=0
+    sh "${DISPATCHER}" start || direct_rc=$?
+    [ "${direct_rc}" -eq 2 ] ||
+        fail "direct dispatcher lifecycle alias remains available (rc=${direct_rc})"
+    assert_not_called core
+    assert_not_called tproxy
+    assert_not_called addrsync
 }
 
 test_prepare_writes_exact_direct_manifest_without_core() {
@@ -357,6 +431,40 @@ EOF
         fail "generation environment snapshot is mutable"
     grep -qx 'init:init' "${CALLS_FILE}" || fail "prepare must run init/config generation"
     assert_not_called core
+}
+
+test_prepare_uses_only_the_rust_desired_state_environment_for_product_policy() {
+    reset_fixture
+    sed -i "s/^PROXY_PORT=.*/PROXY_PORT='9999'/" "${FLUX_ROOT}/cache/cache_config"
+    printf 'PROXY_PORT=8888\n' >"${FLUX_ROOT}/conf/settings.ini"
+    rm -f "${FLUX_ROOT}/bin/jq"
+
+    generation=$(prepare_generation)
+
+    [ "$(manifest_value listener_port)" = "1536" ] ||
+        fail "prepare trusted legacy cache/settings policy over Rust Desired State"
+    grep -qx "PROXY_PORT='1536'" "${GENERATIONS_ROOT}/${generation}/cache_config" ||
+        fail "Generation did not retain the Rust-owned listener input"
+    ! grep -q '9999\|8888' "${GENERATIONS_ROOT}/${generation}/cache_config" ||
+        fail "Generation retained legacy cache/settings policy"
+}
+
+test_prepare_rejects_unlisted_desired_state_environment_fields_before_init() {
+    reset_fixture
+    chmod u+w "${RUN_ROOT}/desired-state.env"
+    printf "PATH='/hostile'\n" >>"${RUN_ROOT}/desired-state.env"
+    chmod 0444 "${RUN_ROOT}/desired-state.env"
+    : >"${CALLS_FILE}"
+
+    if run_bridge prepare; then
+        fail "prepare sourced an unlisted Desired State environment field"
+    fi
+
+    assert_not_called init
+    [ ! -e "${RUN_ROOT}/engine.manifest" ] ||
+        fail "malformed Desired State environment published an engine manifest"
+    [ ! -d "${GENERATIONS_ROOT}/1" ] ||
+        fail "malformed Desired State environment allocated Generation artifacts"
 }
 
 test_real_init_uses_rust_renderer_and_snapshots_one_package_inventory() {
@@ -415,7 +523,7 @@ EOF
 test_real_init_attests_and_snapshots_one_dual_family_rule_set() {
     reset_fixture
     install_real_init_fixture
-    sed -i "s/PROXY_IPV6='0'/PROXY_IPV6='1'/" "${FLUX_ROOT}/scripts/config"
+    edit_desired_state_env "s/^PROXY_IPV6=.*/PROXY_IPV6='1'/"
     cat >"${FLUX_ROOT}/scripts/rules" <<'EOF'
 return 99
 EOF
@@ -494,105 +602,6 @@ EOF
         fail "real init reused the stale receipt instead of re-attesting Generation 2"
     grep -qx 'generation=2' "${FLUX_ROOT}/cache/cache_rules_manifest" ||
         fail "real init did not replace the stale receipt"
-}
-
-test_serialized_cache_preview_bootstraps_without_a_generation_receipt() {
-    reset_fixture
-    install_real_init_fixture
-    cat >"${FLUX_ROOT}/scripts/rules" <<'EOF'
-return 99
-EOF
-    cat >"${FLUX_ROOT}/bin/fluxd" <<'EOF'
-#!/usr/bin/sh
-set -eu
-case "${1:-}" in
-snapshot-legacy-packages)
-    cat "${3}"
-    ;;
-render-legacy-rules)
-    printf 'preview-render:%s\n' "$*" >>/data/adb/flux/run/test-calls
-    printf '*mangle\nCOMMIT\n'
-    ;;
-attest-legacy-rules-set)
-    printf 'preview-attest:%s\n' "$*" >>/data/adb/flux/run/test-calls
-    exit 97
-    ;;
-*) exit 2 ;;
-esac
-EOF
-    chmod 0755 "${FLUX_ROOT}/bin/fluxd"
-    printf 'stale-receipt\n' >"${FLUX_ROOT}/cache/cache_rules_manifest"
-
-    if FLUXD_ENGINE_OWNER=rust sh "${FLUX_ROOT}/scripts/init" cache; then
-        fail "direct cache preview bypassed dispatcher serialization"
-    fi
-    run_bridge cache-preview ||
-        fail "serialized cache preview did not bootstrap without exported config"
-
-    [ "$(grep -c '^preview-render:' "${CALLS_FILE}")" -eq 2 ] ||
-        fail "direct cache preview did not render the IPv4 pair"
-    ! grep -q '^preview-attest:' "${CALLS_FILE}" ||
-        fail "non-Generation cache preview invoked the attester"
-    [ ! -e "${FLUX_ROOT}/cache/cache_rules_manifest" ] ||
-        fail "non-Generation cache preview retained a misleading receipt"
-    [ "$(cat "${FLUX_ROOT}/cache/cache_valid")" = rust ] ||
-        fail "direct cache preview did not publish its Rust cache producer"
-}
-
-test_cache_preview_cannot_overlap_generation_attestation() {
-    reset_fixture
-    install_real_init_fixture
-    cat >"${FLUX_ROOT}/scripts/rules" <<'EOF'
-return 99
-EOF
-    cat >"${FLUX_ROOT}/bin/fluxd" <<'EOF'
-#!/usr/bin/sh
-set -eu
-case "${1:-}" in
-snapshot-legacy-packages)
-    cat "${3}"
-    ;;
-render-legacy-rules)
-    printf '*mangle\nCOMMIT\n'
-    ;;
-attest-legacy-rules-set)
-    : >/data/adb/flux/run/attestation-started
-    while [ ! -e /data/adb/flux/run/release-attestation ]; do
-        sleep 0.01
-    done
-    printf 'FLUX_LEGACY_RULES_SET_MANIFEST_V1\ngeneration=%s\nfamilies=ipv4\n' "${3}"
-    ;;
-*) exit 2 ;;
-esac
-EOF
-    chmod 0755 "${FLUX_ROOT}/bin/fluxd"
-
-    run_bridge prepare &
-    prepare_pid=$!
-    attempts=0
-    while [ ! -e "${RUN_ROOT}/attestation-started" ] && [ "${attempts}" -lt 500 ]; do
-        sleep 0.01
-        attempts=$((attempts + 1))
-    done
-    [ -e "${RUN_ROOT}/attestation-started" ] || {
-        : >"${RUN_ROOT}/release-attestation"
-        wait "${prepare_pid}" 2>/dev/null || true
-        fail "Generation preparation did not reach attestation"
-    }
-
-    preview_rc=0
-    run_bridge cache-preview || preview_rc=$?
-    [ "${preview_rc}" -eq 75 ] || {
-        : >"${RUN_ROOT}/release-attestation"
-        wait "${prepare_pid}" 2>/dev/null || true
-        fail "cache preview overlapped Generation attestation (rc=${preview_rc})"
-    }
-
-    : >"${RUN_ROOT}/release-attestation"
-    wait "${prepare_pid}" || fail "serialized Generation preparation failed"
-    generation=$(manifest_value generation)
-    grep -qx "generation=${generation}" "${GENERATIONS_ROOT}/${generation}/legacy-rules.manifest" ||
-        fail "serialized Generation did not retain its attested receipt"
 }
 
 test_real_init_keeps_explicit_shell_renderer_rollback_for_legacy_owner() {
@@ -808,7 +817,7 @@ test_prepare_creates_distinct_immutable_generation_artifacts() {
     cp "${GENERATIONS_ROOT}/${first_generation}/cache_rules_ipv4" "${RUN_ROOT}/first-rules"
 
     printf '{"revision":2}\n' >"${FLUX_ROOT}/conf/config.json"
-    sed -i 's/^PROXY_PORT=.*/PROXY_PORT=2536/' "${FLUX_ROOT}/cache/cache_config"
+    edit_desired_state_env "s/^PROXY_PORT=.*/PROXY_PORT='2536'/"
     printf '*mangle\n:GENERATION_TWO - [0:0]\nCOMMIT\n' >"${FLUX_ROOT}/cache/cache_rules_ipv4"
     second_generation=$(prepare_generation)
 
@@ -817,7 +826,7 @@ test_prepare_creates_distinct_immutable_generation_artifacts() {
     assert_file_equals "${RUN_ROOT}/first-config" "${GENERATIONS_ROOT}/${first_generation}/config.json"
     assert_file_equals "${RUN_ROOT}/first-env" "${GENERATIONS_ROOT}/${first_generation}/cache_config"
     assert_file_equals "${RUN_ROOT}/first-rules" "${GENERATIONS_ROOT}/${first_generation}/cache_rules_ipv4"
-    grep -qx 'PROXY_PORT=2536' "${GENERATIONS_ROOT}/${second_generation}/cache_config" ||
+    grep -qx "PROXY_PORT='2536'" "${GENERATIONS_ROOT}/${second_generation}/cache_config" ||
         fail "second generation did not snapshot its environment"
     grep -q 'GENERATION_TWO' "${GENERATIONS_ROOT}/${second_generation}/cache_rules_ipv4" ||
         fail "second generation did not snapshot its rules"
@@ -837,7 +846,7 @@ test_previous_generation_can_be_selected_after_newer_prepare() {
     run_bridge state-running "${first_generation}" || fail "initial state-running failed"
 
     printf '{"revision":2}\n' >"${FLUX_ROOT}/conf/config.json"
-    sed -i 's/^PROXY_PORT=.*/PROXY_PORT=2536/' "${FLUX_ROOT}/cache/cache_config"
+    edit_desired_state_env "s/^PROXY_PORT=.*/PROXY_PORT='2536'/"
     second_generation=$(prepare_generation)
     [ "${second_generation}" = "2" ] || fail "newer prepare did not allocate generation 2"
 
@@ -859,7 +868,7 @@ test_generation_mismatch_is_rejected_for_verification_and_publication() {
     reset_fixture
 
     first_generation=$(prepare_generation)
-    sed -i 's/^PROXY_PORT=.*/PROXY_PORT=2536/' "${FLUX_ROOT}/cache/cache_config"
+    edit_desired_state_env "s/^PROXY_PORT=.*/PROXY_PORT='2536'/"
     second_generation=$(prepare_generation)
     run_bridge capture-start "${first_generation}" || fail "capture-start for generation mismatch test failed"
 
@@ -886,14 +895,14 @@ test_running_publication_retains_only_current_and_previous_generations() {
     run_bridge capture-verify "${first_generation}" || fail "generation 1 capture-verify failed"
     run_bridge state-running "${first_generation}" || fail "generation 1 state-running failed"
 
-    sed -i 's/^PROXY_PORT=.*/PROXY_PORT=2536/' "${FLUX_ROOT}/cache/cache_config"
+    edit_desired_state_env "s/^PROXY_PORT=.*/PROXY_PORT='2536'/"
     second_generation=$(prepare_generation)
     run_bridge capture-stop || fail "generation 1 detach failed"
     run_bridge capture-start "${second_generation}" || fail "generation 2 capture-start failed"
     run_bridge capture-verify "${second_generation}" || fail "generation 2 capture-verify failed"
     run_bridge state-running "${second_generation}" || fail "generation 2 state-running failed"
 
-    sed -i 's/^PROXY_PORT=.*/PROXY_PORT=3536/' "${FLUX_ROOT}/cache/cache_config"
+    edit_desired_state_env "s/^PROXY_PORT=.*/PROXY_PORT='3536'/"
     third_generation=$(prepare_generation)
     run_bridge capture-stop || fail "generation 2 detach failed"
     run_bridge capture-start "${third_generation}" || fail "generation 3 capture-start failed"
@@ -908,8 +917,9 @@ test_running_publication_retains_only_current_and_previous_generations() {
 
 test_prepare_writes_exact_busybox_manifest() {
     reset_fixture
-    sed -i 's/^CORE_USER=.*/CORE_USER=1000/' "${FLUX_ROOT}/cache/cache_config"
-    sed -i 's/^CORE_GROUP=.*/CORE_GROUP=3003/' "${FLUX_ROOT}/cache/cache_config"
+    edit_desired_state_env \
+        -e "s/^CORE_USER=.*/CORE_USER='1000'/" \
+        -e "s/^CORE_GROUP=.*/CORE_GROUP='3003'/"
     printf '#!/usr/bin/sh\nexit 0\n' >/data/adb/magisk/busybox
     chmod 0755 /data/adb/magisk/busybox
 
@@ -937,8 +947,7 @@ EOF
 
 test_prepare_rejects_tun_before_init_or_manifest() {
     reset_fixture
-    sed -i 's/^PROXY_MODE=.*/PROXY_MODE=tun/' "${FLUX_ROOT}/cache/cache_config"
-    sed -i 's/^TUN_INTERFACE=.*/TUN_INTERFACE=flux-tun0/' "${FLUX_ROOT}/cache/cache_config"
+    edit_desired_state_env "s/^PROXY_MODE=.*/PROXY_MODE='tun'/"
     : >"${CALLS_FILE}"
 
     if run_bridge prepare; then
@@ -955,7 +964,7 @@ test_prepare_rejects_tun_before_init_or_manifest() {
 
 test_prepare_rejects_missing_proxy_mode_without_artifacts() {
     reset_fixture
-    sed -i '/^PROXY_MODE=/d' "${FLUX_ROOT}/cache/cache_config"
+    edit_desired_state_env '/^PROXY_MODE=/d'
     : >"${CALLS_FILE}"
 
     if run_bridge prepare; then
@@ -998,7 +1007,7 @@ test_active_tproxy_prepare_rejects_tun_without_disturbance() {
     cp "${RUN_ROOT}/capture.active" "${RUN_ROOT}/tproxy-capture-active"
     cp "${RUN_ROOT}/capture.verified" "${RUN_ROOT}/tproxy-capture-verified"
     cp "${RUN_ROOT}/engine.active" "${RUN_ROOT}/tproxy-engine-active"
-    sed -i 's/^PROXY_MODE=.*/PROXY_MODE=tun/' "${FLUX_ROOT}/cache/cache_config"
+    edit_desired_state_env "s/^PROXY_MODE=.*/PROXY_MODE='tun'/"
 
     if run_bridge prepare; then
         fail "active TPROXY generation admitted a TUN replacement"
@@ -1013,7 +1022,7 @@ test_active_tproxy_prepare_rejects_tun_without_disturbance() {
     assert_file_equals "${RUN_ROOT}/tproxy-engine-active" "${RUN_ROOT}/engine.active"
 }
 
-test_rust_owned_config_build_skips_unpinned_sing_box_check() {
+test_rust_owned_config_build_skips_rewrite_and_unpinned_sing_box_check() {
     reset_fixture
     cat >"${FLUX_ROOT}/bin/sing-box" <<'EOF'
 #!/usr/bin/sh
@@ -1027,26 +1036,89 @@ EOF
         . /data/adb/flux/scripts/lib
         . /data/adb/flux/scripts/log
         . /src/scripts/config
-        _extract_json_config() { :; }
-        _process_settings() { printf "%s\n" "CORE_TIMEOUT=5"; }
-        _apply_proxy_mode_config() { :; }
+        _extract_json_config() {
+            : >/data/adb/flux/run/json-extraction-attempted
+            return 96
+        }
+        _process_settings() {
+            : >/data/adb/flux/run/settings-processing-attempted
+            return 95
+        }
+        _apply_proxy_mode_config() {
+            : >/data/adb/flux/run/shell-config-rewrite-attempted
+            return 97
+        }
         _detect_kernel() { :; }
         build_config >/dev/null
     ' || fail "Rust-owned config build invoked shell validation"
 
     assert_not_called sing-box
+    [ ! -e "${RUN_ROOT}/shell-config-rewrite-attempted" ] ||
+        fail "Rust-owned config build invoked the shell/JQ rewrite hook"
+    [ ! -e "${RUN_ROOT}/json-extraction-attempted" ] ||
+        fail "Rust-owned config build inspected canonical JSON through jq"
+    [ ! -e "${RUN_ROOT}/settings-processing-attempted" ] ||
+        fail "Rust-owned config build parsed settings.ini"
 }
 
-test_prepare_rejects_missing_xt_owner_before_init_or_generation_publication() {
+test_rust_owned_init_never_invokes_the_subscription_updater() {
     reset_fixture
-    sed -i 's/^KFEAT_OWNER=.*/KFEAT_OWNER=0/' "${FLUX_ROOT}/cache/cache_config"
+    install_real_init_fixture
+    write_stub updater.sh '
+: >/data/adb/flux/run/updater-invoked
+exit 98'
+    printf '#!/usr/bin/sh\nexit 0\n' >"${FLUX_ROOT}/bin/fluxd"
+    chmod 0755 "${FLUX_ROOT}/bin/fluxd"
+    rm -f "${FLUX_ROOT}/bin/jq" "${FLUX_ROOT}/conf/settings.ini"
+    cat >"${FLUX_ROOT}/cache/cache_rules_manifest" <<'EOF'
+FLUX_LEGACY_RULES_SET_MANIFEST_V1
+generation=1
+families=ipv4
+EOF
+    touch -d '@1' "${FLUX_ROOT}/conf/config.json"
+
+    FLUX_CACHE_BUILD_SERIALIZED=1 FLUXD_ENGINE_OWNER=rust FLUX_GENERATION_ID=1 sh -c '
+        set -a
+        . /data/adb/flux/run/desired-state.env
+        set +a
+        exec sh /data/adb/flux/scripts/init init
+    ' ||
+        fail "Rust-owned init failed while preserving canonical config.json"
+
+    [ ! -e "${RUN_ROOT}/updater-invoked" ] ||
+        fail "Rust-owned init invoked the shell subscription updater"
+}
+
+test_legacy_init_no_longer_requires_the_subscription_updater() {
+    reset_fixture
+    install_real_init_fixture
+    write_stub rules '
+generate() {
+    printf "*mangle\nCOMMIT\n"
+}'
+    rm -f "${FLUX_ROOT}/scripts/updater.sh"
+    printf 'shell\n' >"${FLUX_ROOT}/cache/cache_valid"
+    cp "${FLUX_ROOT}/conf/config.json" "${RUN_ROOT}/expected-config.json"
+    touch -d '@1' "${FLUX_ROOT}/conf/config.json"
+
+    FLUX_CACHE_BUILD_SERIALIZED=1 FLUXD_ENGINE_OWNER=legacy \
+        sh "${FLUX_ROOT}/scripts/init" init ||
+        fail "Legacy rollback init still required the shell subscription updater"
+
+    assert_file_equals "${RUN_ROOT}/expected-config.json" "${FLUX_ROOT}/conf/config.json"
+}
+
+test_prepare_rejects_observed_missing_xt_owner_before_generation_publication() {
+    reset_fixture
+    printf '0\n' >"${RUN_ROOT}/test-kfeat-owner"
     : >"${CALLS_FILE}"
 
     if run_bridge prepare; then
         fail "prepare accepted Rust-owned capture without xt_owner loop prevention"
     fi
 
-    assert_not_called init
+    grep -qx 'init:init' "${CALLS_FILE}" ||
+        fail "xt_owner rejection did not use the freshly observed kernel capabilities"
     [ ! -e "${RUN_ROOT}/engine.manifest" ] ||
         fail "xt_owner rejection published an engine manifest"
     [ ! -d "${GENERATIONS_ROOT}/1" ] ||
@@ -2171,8 +2243,9 @@ EOF
 
 test_startup_recover_quarantines_a_busybox_generation_after_detach() {
     reset_fixture
-    sed -i 's/^CORE_USER=.*/CORE_USER=1000/' "${FLUX_ROOT}/cache/cache_config"
-    sed -i 's/^CORE_GROUP=.*/CORE_GROUP=3003/' "${FLUX_ROOT}/cache/cache_config"
+    edit_desired_state_env \
+        -e "s/^CORE_USER=.*/CORE_USER='1000'/" \
+        -e "s/^CORE_GROUP=.*/CORE_GROUP='3003'/"
     printf '#!/usr/bin/sh\nexit 0\n' >/data/adb/magisk/busybox
     chmod 0755 /data/adb/magisk/busybox
     generation=$(prepare_generation)
@@ -2200,8 +2273,9 @@ test_startup_recover_quarantines_a_busybox_generation_after_detach() {
 
 test_startup_recover_quarantines_a_pre_capture_busybox_generation() {
     reset_fixture
-    sed -i 's/^CORE_USER=.*/CORE_USER=1000/' "${FLUX_ROOT}/cache/cache_config"
-    sed -i 's/^CORE_GROUP=.*/CORE_GROUP=3003/' "${FLUX_ROOT}/cache/cache_config"
+    edit_desired_state_env \
+        -e "s/^CORE_USER=.*/CORE_USER='1000'/" \
+        -e "s/^CORE_GROUP=.*/CORE_GROUP='3003'/"
     printf '#!/usr/bin/sh\nexit 0\n' >/data/adb/magisk/busybox
     chmod 0755 /data/adb/magisk/busybox
     generation=$(prepare_generation)
@@ -2223,8 +2297,9 @@ test_startup_recover_quarantines_a_prepared_busybox_reload_candidate() {
     run_bridge capture-start "${active_generation}" || fail "direct capture-start before BusyBox reload failed"
     run_bridge capture-verify "${active_generation}" || fail "direct capture-verify before BusyBox reload failed"
     run_bridge state-running "${active_generation}" || fail "direct state-running before BusyBox reload failed"
-    sed -i 's/^CORE_USER=.*/CORE_USER=1000/' "${FLUX_ROOT}/cache/cache_config"
-    sed -i 's/^CORE_GROUP=.*/CORE_GROUP=3003/' "${FLUX_ROOT}/cache/cache_config"
+    edit_desired_state_env \
+        -e "s/^CORE_USER=.*/CORE_USER='1000'/" \
+        -e "s/^CORE_GROUP=.*/CORE_GROUP='3003'/"
     printf '#!/usr/bin/sh\nexit 0\n' >/data/adb/magisk/busybox
     chmod 0755 /data/adb/magisk/busybox
     candidate_generation=$(prepare_generation)
@@ -2336,12 +2411,13 @@ test_legacy_and_rust_owned_verbs_cannot_mix() {
     [ ! -e "${RUN_ROOT}/engine.manifest" ] || fail "rejected mixed prepare retained manifest"
 }
 
+test_direct_dispatcher_lifecycle_alias_is_removed
 test_prepare_writes_exact_direct_manifest_without_core
+test_prepare_uses_only_the_rust_desired_state_environment_for_product_policy
+test_prepare_rejects_unlisted_desired_state_environment_fields_before_init
 test_real_init_uses_rust_renderer_and_snapshots_one_package_inventory
 test_real_init_attests_and_snapshots_one_dual_family_rule_set
 test_real_init_rebuilds_before_reusing_a_stale_generation_receipt
-test_serialized_cache_preview_bootstraps_without_a_generation_receipt
-test_cache_preview_cannot_overlap_generation_attestation
 test_real_init_keeps_explicit_shell_renderer_rollback_for_legacy_owner
 test_legacy_restart_prepares_before_stopping_the_active_runtime
 test_failed_rust_render_preserves_the_active_generation
@@ -2356,8 +2432,10 @@ test_prepare_rejects_tun_before_init_or_manifest
 test_prepare_rejects_missing_proxy_mode_without_artifacts
 test_prepare_revalidates_proxy_mode_generated_by_init
 test_active_tproxy_prepare_rejects_tun_without_disturbance
-test_rust_owned_config_build_skips_unpinned_sing_box_check
-test_prepare_rejects_missing_xt_owner_before_init_or_generation_publication
+test_rust_owned_config_build_skips_rewrite_and_unpinned_sing_box_check
+test_rust_owned_init_never_invokes_the_subscription_updater
+test_legacy_init_no_longer_requires_the_subscription_updater
+test_prepare_rejects_observed_missing_xt_owner_before_generation_publication
 test_prepare_revalidates_xt_owner_generated_by_init
 test_capture_start_owns_only_addrsync_and_tproxy
 test_capture_start_compensates_partial_failure

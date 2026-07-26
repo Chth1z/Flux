@@ -5,7 +5,7 @@
 # Description: Phase 1 networking writer invoked only through fluxd.
 #
 # Runtime call graph:
-#   service/inotify/fluxctl -> fluxd -> FLUXD_BRIDGE=1 dispatcher
+#   service/direct CLI -> fluxd -> FLUXD_BRIDGE=1 dispatcher
 #   legacy mode: dispatcher -> init/core/tproxy/addrsync
 #   Rust-owned mode: dispatcher -> init/tproxy/addrsync (never core)
 #
@@ -35,17 +35,6 @@ readonly ENGINE_MANIFEST_MAX_BYTES=16384
 # Keep arithmetic portable across Android shells while leaving ample runtime
 # reload headroom.
 readonly ENGINE_GENERATION_MAX=2147483647
-
-_forward_to_fluxd_control() {
-    local action="${1}"
-
-    [ -x "${FLUXD_BIN}" ] || {
-        log_error "fluxd binary missing or not executable: ${FLUXD_BIN}"
-        return 127
-    }
-
-    exec "${FLUXD_BIN}" control "${action}"
-}
 
 # ==============================================================================
 # [ Component Control ]
@@ -633,13 +622,15 @@ _emit_engine_manifest() {
     local generation_dir="${2}"
     local generation_config="${generation_dir}/config.json"
     local generation_log="${generation_dir}/sing-box.log"
-    local startup_timeout_ms=$((CORE_TIMEOUT * 1000))
-    local stop_timeout_ms="${startup_timeout_ms}"
+    local startup_timeout_ms="${ENGINE_STARTUP_TIMEOUT_MS}"
+    local stop_timeout_ms="${ENGINE_STOP_TIMEOUT_MS}"
     local launcher="direct"
     local busybox_path=""
     local identity="${CORE_USER}:${CORE_GROUP}"
 
-    if [ "${identity}" != "root:root" ]; then
+    case "${identity}" in
+    root:root | 0:0) ;;
+    *)
         busybox_path=$(command -v busybox 2>/dev/null) || {
             log_error "Non-root engine launch requires BusyBox setuidgid"
             return 1
@@ -658,19 +649,21 @@ _emit_engine_manifest() {
         _manifest_safe_value busybox "${busybox_path}" || return 1
         _manifest_safe_value identity "${identity}" || return 1
         launcher="busybox-setuidgid"
-    fi
+        ;;
+    esac
 
     _validate_generation_id "${generation}" || return 1
-    _manifest_safe_value binary "${SING_BOX_BIN}" || return 1
+    _manifest_safe_value binary "${ENGINE_BINARY}" || return 1
     _manifest_safe_value config "${generation_config}" || return 1
     _manifest_safe_value working_directory "${RUN_DIR}" || return 1
     _manifest_safe_value log "${generation_log}" || return 1
     is_int "${startup_timeout_ms}" || return 1
+    is_int "${stop_timeout_ms}" || return 1
 
     printf '%s\n' \
         'FLUX_ENGINE_MANIFEST_V1' \
         "generation=${generation}" \
-        "binary=${SING_BOX_BIN}" \
+        "binary=${ENGINE_BINARY}" \
         "config=${generation_config}" \
         "working_directory=${RUN_DIR}" \
         "log=${generation_log}" \
@@ -737,6 +730,15 @@ _state_prepare() {
     rm -f "${ENGINE_MANIFEST_FILE}" 2>/dev/null || true
     _claim_dispatch_mode rust-owned || return 1
 
+    FLUXD_ENGINE_OWNER=rust
+    export FLUXD_ENGINE_OWNER
+    if ! load_config; then
+        return 1
+    fi
+    if ! _require_rust_owned_bridge_proxy_mode; then
+        return 1
+    fi
+
     generation=$(_allocate_generation_id) || return 1
     generation_dir=$(_generation_dir "${generation}") || return 1
     mkdir "${generation_dir}" || {
@@ -750,18 +752,6 @@ _state_prepare() {
         return 1
     fi
 
-    if ! load_config; then
-        _discard_incomplete_generation "${generation_dir}" || true
-        return 1
-    fi
-    if ! _require_rust_owned_bridge_proxy_mode; then
-        _discard_incomplete_generation "${generation_dir}" || true
-        return 1
-    fi
-    if ! _require_rust_owned_bridge_loop_prevention; then
-        _discard_incomplete_generation "${generation_dir}" || true
-        return 1
-    fi
     if ! FLUX_CACHE_BUILD_SERIALIZED=1 \
         FLUXD_ENGINE_OWNER=rust \
         FLUX_GENERATION_ID="${generation}" \
@@ -795,10 +785,6 @@ _state_prepare() {
         return 1
     fi
     return 0
-}
-
-_state_cache_preview() {
-    FLUX_CACHE_BUILD_SERIALIZED=1 FLUXD_ENGINE_OWNER=rust sh "${INIT_SCRIPT}" cache
 }
 
 _capture_start_compensate() {
@@ -1434,19 +1420,8 @@ main() {
 
     if [ "${FLUXD_BRIDGE:-0}" != "1" ]; then
         [ ! -t 2 ] && [ -n "${FLUX_LOG}" ] && exec 2>>"${FLUX_LOG}"
-
-        case "${event_type}" in
-        start | stop | restart | reload | resync)
-            _forward_to_fluxd_control "${event_type}"
-            return $?
-            ;;
-        esac
-
-        [ "$#" -eq 3 ] || {
-            log_error "dispatcher is internal; use fluxd control"
-            return 2
-        }
-        exec "${FLUX_EVENT_SCRIPT}" "$@"
+        log_error "dispatcher is internal; use fluxd"
+        return 2
     fi
 
     case "${event_type}" in
@@ -1464,14 +1439,6 @@ main() {
             return 2
         }
         _with_dispatch_lock _state_prepare
-        return $?
-        ;;
-    cache-preview)
-        [ "$#" -eq 1 ] || {
-            log_error "cache-preview does not accept arguments"
-            return 2
-        }
-        _with_dispatch_lock _state_cache_preview
         return $?
         ;;
     capture-start)

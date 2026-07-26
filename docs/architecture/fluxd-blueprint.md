@@ -1,34 +1,44 @@
 # Fluxd Rewrite Blueprint
 
 - Status: accepted, evolving architecture
-- Last updated: 2026-07-17
+- Last updated: 2026-07-26
 - Minimum supported kernel: Linux 5.10
 
 ## Executive decision
 
 Flux should become a generation-based desired-state reconciler implemented in one Rust binary, `fluxd`. The binary absorbs `addrsyncd` and all runtime-critical shell behavior. Sing-Box remains an external, supervised Proxy Engine so it can be upgraded and validated independently from Flux.
 
-The primary Capture Path is selected at runtime:
+The target-state Capture Path selection order is:
 
 1. native nftables TPROXY when the complete required expression set can be actively verified;
 2. xtables TPROXY, using ipset for large address sets when available and the current bounded jump structure otherwise;
 3. a Flux-managed Sing-Box TUN path when explicitly requested or when transparent netfilter capture is unavailable;
 4. unsupported, with an explainable capability report, when none of the safe paths can satisfy the requested Traffic Scope.
 
+The first Rust-only release intentionally implements item 2 only. ADR-0005 retains nftables as the
+eventual automatic preference, while the implementation roadmap defers that backend until after the
+conventional xtables runtime is Rust-unified and qualified.
+
 eBPF is a first-class optional plane with two stages: observability first, then verified acceleration. It does not replace nftables/xtables/TUN as the correctness path in the initial rewrite.
 
-Migration is component-by-component rather than an unsafe dual-writer switch. During pre-release
-development, the serialized shell networking path is frozen as the executable compatibility oracle
-and remains the sole writer for each not-yet-cut-over component. Rust-owned preparation now
+Host preparation and product-plane migration proceed incrementally, but networking writer ownership
+moves at one fenced cutover. During pre-release development, the serialized legacy networking path
+is frozen as the executable compatibility oracle: `scripts/tproxy` owns xtables and Flux PBR
+writes, while standalone `addrsyncd` owns address synchronization. Rust-owned preparation now
 compiles the legacy restore caches through a validated source-shape renderer while explicit legacy
-ownership retains the frozen shell generator. Separately, canonical lowering preserves exact
-schema-v1 forwarded identities and represents local OUTPUT through pure schema-v2 `O`/`P`
-transaction artifacts while all five optional extensions remain unsupported. Neither non-mutating
-compiler split promotes a shadow artifact or transfers writer ownership. A kernel ownership
-transition occurs only after the already-delivered private stable-hook/native-writer mechanism is
-bound to production engine/canary/Android authorities, its single-writer lease disables shell
-mutation, and the remaining real-device gates pass for that component; the replaced runtime code is
-then removed promptly. No bridge, shadow, parity, or partial-cutover state is releasable. See
+ownership retains the frozen shell generator.
+Schema-3 `flux.toml` is also the sole Rust-owned product-policy source: `fluxd` publishes canonical
+engine JSON and a strict compatibility environment from one snapshot, and shell may add only
+observed kernel-capability facts. `settings.ini` and `jq` remain explicit legacy-rollback artifacts,
+not authorities for the Rust-owned bridge.
+Separately, canonical lowering preserves exact schema-v1 forwarded identities and represents local
+OUTPUT through pure schema-v2 `O`/`P` transaction artifacts while all five optional extensions
+remain unsupported. Neither non-mutating compiler path promotes a shadow artifact or transfers
+writer ownership. Gate 1 occurs only after the private stable-hook/native-writer mechanism is bound
+to the production engine, canary, and Android authorities; it stops all shell networking writers and
+the standalone address synchronizer before the first native mutation, then removes the replaced
+runtime code in the same milestone. No bridge, shadow, parity, or partial-cutover state is
+releasable. See
 [ADR-0010](../adr/0010-freeze-shell-networking-as-a-shadow-compiler-oracle.md) and
 [ADR-0011](../adr/0011-pre-release-rust-only-release-gate.md).
 
@@ -199,7 +209,19 @@ mark/routing receipt, Generation ID, writer token, prepared/active conversion, o
 point. Exact-binary collection remains outside the pure compiler, and neither profile nor candidate
 may be replaced by a caller assertion.
 
-The current Phase 2 tracer bullet stops below both interfaces above. A pure shadow compiler accepts
+The delivered A2 `GenerationAssembler` composes this candidate with the complete Desired State,
+shadow Capture Program, canonical xtables lowering, exact engine launch specification, Network
+Inventory, planning authority, and optional prior owned identity. Its one-call interface returns a
+non-mutating `AdmittedGeneration`; host authority is explicitly inspection-only, while Android
+planning consumes the existing non-`Clone` authority and current RPDB placement evidence. The
+assembly identity binds the monotonic Generation number, complete predecessor identity, full
+Capability Profile digest, complete Android planning-evidence digest, engine/capture/xtables
+artifacts, and complete product policy. This lineage-aware assembly digest is distinct from the
+future semantic-only `GenerationArtifact` digest described above. The read-only coordinator
+projection and strict prepared record expose no writer token, activation lease, native-target
+conversion, or mutation method.
+
+The Capture Program input to that assembler remains a shadow artifact. Its pure compiler accepts
 already typed and resolved compatibility inputs and emits deterministic, backend-neutral,
 separately ordered local-OUTPUT and forwarded-ingress programs. It keeps a canonical mandatory
 safety baseline distinct from configurable bypasses, retains optional inventory-host
@@ -216,8 +238,9 @@ candidate, and optional descriptive per-family routing targets, but does not mut
 source value. Forwarded-only input retains exact schema v1; local-OUTPUT input selects schema v2
 and represents the separate OUTPUT classifier, loopback PREROUTING companion, typed listener/
 routing/escape requirements, and dependency order. The bridge shell remains the sole production
-bridge networking writer, and no shadow or lowered output is accepted by the Phase 1
-`RuntimeCoordinator`.
+xtables/Flux PBR writer, while standalone `addrsyncd` remains the address-sync writer. The Phase 1
+`RuntimeCoordinator` can inspect the assembled result, but its production mutation path still uses
+that serialized legacy composition.
 
 ### 3. Runtime Reconciler module
 
@@ -234,7 +257,7 @@ The implementation hides the prepare/activate/verify/retire protocol, failure co
 
 Only one reconciliation may commit at a time. New events may supersede pending work, but they cannot interleave kernel mutations from two Generations.
 
-The delivered Phase 1 Adapter is `RuntimeCoordinator`, placed behind the existing `LegacyDispatcher` seam and executed by the bounded, serialized `LegacyControlBridge` worker. It composes a shell networking writer with the Rust `EngineSupervisor`, hiding start, stop, reload, rollback, abnormal-exit repair, and state-publication retry from control callers. Shell remains the networking writer in this phase; Rust owns Sing-Box and lifecycle ordering. Failed stop/failure compensation is represented explicitly as `DetachPending`: engine ownership, generation evidence, and terminal intent are retained, replacement is blocked, and neither engine retirement nor terminal publication may proceed until maintenance proves capture removal. Uncertain detach of a still-desired generation uses `CaptureRepairPending` instead and repairs that generation rather than treating it as terminal.
+The delivered Phase 1 Adapter is `RuntimeCoordinator`, placed behind the existing `LegacyDispatcher` seam and executed by the bounded, serialized `LegacyControlBridge` worker. It composes the legacy `scripts/tproxy` and standalone `addrsyncd` writers with the Rust `EngineSupervisor`, hiding start, stop, reload, rollback, abnormal-exit repair, and state-publication retry from control callers. Those fenced legacy writers retain networking mutation in this phase; Rust owns Sing-Box and lifecycle ordering. Failed stop/failure compensation is represented explicitly as `DetachPending`: engine ownership, generation evidence, and terminal intent are retained, replacement is blocked, and neither engine retirement nor terminal publication may proceed until maintenance proves capture removal. Uncertain detach of a still-desired generation uses `CaptureRepairPending` instead and repairs that generation rather than treating it as terminal.
 
 ### 4. Kernel Plane module
 
@@ -260,11 +283,13 @@ The delivered native xtables sub-owner follows this interface exactly. It accept
 `converge(Active(target) | Stopped)` and `recover()`, owns `FLX{4|6}SP` PREROUTING plus
 `FLX{4|6}SO` OUTPUT stable roots, direct restore/save, transaction-scoped rtnetlink, exact readback,
 rollback, crash recovery, and the shell-visible transition lease. Its real process/netlink Adapter
-exists. Durable payload schema 2 binds target/previous identities to artifact and coherent tool-set
-digests plus a complete dual-family policy-routing audit digest, including loopback name/index
-identity. Every policy access validates that live binding in both directions, and both xtables
-families plus both routing audit identities must be exact or absent before `Active` or `CleanAbsent`
-is published.
+exists. Owner-payload schema 3 stores only target/previous identities; each identity binds the
+source artifact, coherent tool set, complete private runtime plan, and dual-family policy-routing
+audit including loopback name/index identity. A checksum-protected bounded target archive stores
+the exact recovery material for active plus replacement, and one runtime lock spans archive staging,
+journal/kernel convergence, and settling. Every policy access validates the live binding in both
+directions, and both xtables families plus both routing audit identities must be exact or absent
+before `Active` or `CleanAbsent` is published.
 Terminal current-journal recovery remains under the native guard and shared writer fence, retaining
 any surviving lease until fresh global dual-family absence permits terminal-artifact retirement.
 Positive production target admission remains uninhabited until Android mark/RPDB and release-device
@@ -302,16 +327,19 @@ It returns structured evidence rather than booleans. Every capability has a stat
 Interface:
 
 ```rust
-pub async fn refresh_subscription(
-    source: &SubscriptionSource,
-    previous: Option<&SubscriptionSnapshot>,
-) -> Result<SubscriptionSnapshot>;
+trait SubscriptionRefresh {
+    fn refresh(&self) -> Result<SubscriptionRefreshReport>;
+}
 ```
 
-It owns bounded download, decoding, parsing, normalization, filtering, naming, template merge,
-validation, and atomic snapshot publication. Fetch transport is an internal seam. A temporary
-external `curl` adapter may exist only during pre-release migration; the Rust-only release uses a
-Rust transport and ships no curl compatibility dependency.
+It owns bounded HTTPS download, decoding, parsing, normalization, filtering, stable naming,
+template merge, content-addressed remote rule assets, Sing-Box validation, bounded
+active/predecessor recovery, and conditional rollback. Fetch transport and snapshot validation are
+internal seams. The delivered adapter is synchronous Rustls-backed HTTP on one capacity-one worker;
+network and parsing work never runs on the serialized runtime writer. Startup bootstrap, periodic
+refresh, and manual control all enter the same operation, and only a completed validated snapshot
+crosses into the Generation reload path. `scripts/updater.sh` remains a packaged pre-release oracle
+only and has no runtime caller.
 
 ## Runtime state model
 
@@ -437,7 +465,11 @@ Evidence sources are retained separately:
 - active create/load/attach/ack probe;
 - runtime failure and demotion history.
 
-Capability evidence is revisioned per boot. Every compiled Generation records the exact device-capability and Sing-Box Engine Capability Profile revisions used by its planner; a boot change, runtime demotion, or engine binary/profile change forces revalidation or recompilation before activation.
+Capability evidence is revisioned per boot. Every compiled Generation records the exact
+device-capability and Sing-Box Engine Capability Profile revisions used by its planner. The A2
+assembly additionally binds the canonical digest of every retained device-profile field, so two
+independent profiles with the same local revision cannot collide. A boot change, runtime demotion,
+or engine binary/profile change forces revalidation or recompilation before activation.
 
 A hint can skip an impossible probe, but only a successful active probe selects an advanced backend in `auto` mode.
 
@@ -504,20 +536,20 @@ The compiler emits backend-neutral Capture Policy first, then an nftables progra
 
 This path preserves broad Android compatibility.
 
-The first non-mutating Phase 4 compiler cutover remains the current production bridge. Rust-owned
+The non-mutating Phase 4 compiler checkpoint remains the current production bridge. Rust-owned
 preparation exclusively invokes `fluxd render-legacy-rules`; explicit legacy ownership exclusively
 sources `scripts/rules` as the frozen rollback oracle. The cache records its `rust` or `shell`
 producer and never silently falls back between them. In that production composition,
-`scripts/tproxy` remains the sole restore executor and kernel writer. Separately, the delivered
+`scripts/tproxy` remains the sole xtables restore executor and writer. Separately, the delivered
 bounded native owner consumes canonical artifacts through test-only target admission and owns stable
 roots, direct restore/save, policy routing, exact readback, rollback, recovery, and the transition
 lease.
 
 The delivered `LegacyRulesPlan` preserves validated legacy source shape; it is not a lowering of the
-Phase 2 shadow Capture Program and does not claim target semantic or device parity. Backlog item 3
-binds the complete address/routing/capture and production-authority target. Backlog item 4 then binds
-reviewed Android 5.10/ARM64 evidence and uses the already-delivered lease to stop every shell
-networking writer and standalone address synchronizer before the first production mutation, so both
+Phase 2 shadow Capture Program and does not claim target semantic or device parity. Roadmap Lane A
+binds the complete host address/capture target, while Lane C supplies the routing and physical
+production authority. Gate 1 then uses the already-delivered lease to stop every shell networking
+writer and standalone address synchronizer before the first production mutation, so both
 implementations are never active writers.
 
 The separate canonical lowerer now has two deliberately distinct contracts. Forwarded-only input
@@ -880,58 +912,84 @@ Use one versioned `flux.toml` as the user-facing Flux configuration and retain a
 Top-level model:
 
 ```toml
-schema = 1
+schema = 3
 
 [daemon]
 fail_policy = "open"
 reconcile_debounce_ms = 250
+event_queue_capacity = 256
+generation_history = 2
 
 [engine]
 binary = "/data/adb/flux/bin/sing-box"
-template = "/data/adb/flux/conf/sing-box.json"
-startup_timeout_ms = 8000
+template = "/data/adb/flux/conf/template.json"
+runtime_uid = 0
+runtime_gid = 0
+startup_timeout_ms = 5000
+stop_timeout_ms = 5000
+restart_max_attempts = 3
+restart_window_ms = 60000
+restart_initial_backoff_ms = 1000
+restart_maximum_backoff_ms = 30000
+restart_stable_reset_ms = 30000
 
 [capture]
-mode = "auto"       # auto | tproxy | tun
-backend = "auto"    # auto | nftables | xtables
-ipv6 = "auto"       # auto | on | off
+backend = "xtables"
+local_output = true
+forwarded_ingress = true
+ipv4 = true
+ipv6 = false
+tcp = true
+udp = true
 
-[capture.marks]
-allocation = "auto" # auto | explicit
-# mask = "0x..."         # required only for explicit
-# proxy_value = "0x..."  # required only for explicit
-# bypass_value = "0x..." # required only for explicit
+[listener]
+port = 1536
 
-[capture.routing]
-allocation = "auto"
-
-[android]
-respect_android_vpn = true
-
-[capture.ebpf]
-mode = "auto"       # auto | off | observe | accelerate
-
-[capture.tun]
-interface = "flux0"
-mtu = 9000
-offload = "auto"
-
-[scope]
+[applications]
+mode = "all"
 android_users = "owner"
-app_mode = "all"
+user_ids = []
 packages = []
+
+[interfaces]
+forwarded_proxy = ["rmnet_data*", "wlan0", "wlan2", "rndis*"]
+local_bypass = []
+excluded = []
+
+[bypass]
+cidrs = []
 
 [subscription]
 enabled = false
 url_file = "/data/adb/flux/conf/subscription.url"
 update_interval_secs = 86400
+download_timeout_secs = 10
+max_download_bytes = 16777216
+max_decoded_bytes = 16777216
+max_nodes = 10000
+
+[safety]
+respect_android_vpn = false
+require_functional_canary = false
 ```
 
-The exact schema belongs in the technical specification. Unknown fields fail by default. Deprecated fields produce migration diagnostics with a removal version.
+Schema 3 is deliberately narrower than the long-term planner: it admits only explicit xtables
+TPROXY behavior. nftables, TUN, eBPF, automatic backend selection, explicit marks, and routing
+allocation are not reserved compatibility fields; adding any of them to the active file fails as an
+unknown field. Mandatory safety exclusions remain compiler-owned. Subscription intent is now
+executed by the bounded Rust refresh worker. VPN/canary intent remains typed but its positive
+runtime authority is delivered by later gates rather than inferred from successful parsing.
 
-For marks, `auto` requests candidate selection and `explicit` supplies the commented numeric values as candidates. Neither mode bypasses positive mark authority, ownership, or activation checks; on generic AOSP a mark-dependent plan therefore has no grant merely because `allocation = "auto"` was selected.
-
-Routing remains `auto`-only until the Phase 3 routing slice defines a per-domain realization schema. A single explicit priority cannot represent an atomic scope whose residual-local and tether anchors have different intervals, so legacy fixed routing values remain migration diagnostics rather than native candidates.
+The current bridge loads this file before shell preparation and compiles three immutable views from
+the same snapshot: canonical Sing-Box JSON, the non-authorizing shadow Capture Program artifact,
+and a bounded 41-field shell compatibility environment. For enabled subscriptions, the first view
+is the exact store-validated merged artifact rather than a fresh template compilation. The
+environment compiler rejects any valid schema-3 shape the frozen renderer cannot express exactly.
+Shell validates the complete allowlist before sourcing, may append only `KFEAT_*` observations, and
+cannot read policy from `settings.ini`, legacy caches, or generated engine JSON.
+`ProcessRuntimeWriter` then binds the returned binary, numeric launch identity, startup/stop
+timeouts, config digest, and listener to the snapshot and installs its typed restart policy before
+activation.
 
 ### Migration
 
@@ -969,15 +1027,15 @@ Requirements:
   state/
     active.json
     capabilities.json
+    subscription/
     generations/
       <generation-id>/
         manifest.json
         sing-box.json
         backend-plan.json
-  cache/
-    subscriptions/
   run/
     fluxd.sock
+    fluxd.lease                 # kernel lock; presence is not liveness
     fluxd.log
     sing-box.log
     diagnostics/
@@ -998,7 +1056,7 @@ Online socket/client commands:
 - `status [--json]`
 - `start`, `stop`
 - `reload`
-- `fluxctl restart` as a Rust multicall client alias for reload plus convergence
+- `restart` as a Rust alias for reload plus convergence
 - `reconcile`
 - `capabilities`
 - `backend explain`
@@ -1008,17 +1066,32 @@ Online socket/client commands:
 - `repair`
 - optional `migrate --check-only` for already published legacy settings
 
+Delivered B2.1 covers direct lifecycle aliases, authoritative status, same-user bounded
+`diagnose`/fixed-stream `logs`, subscription update, and the non-authorizing
+`backend explain`/`plan`/`rules-preview` aliases. The explanation compiles Desired State and
+canonical engine JSON in memory but deliberately stops short of resolved application UIDs, live
+Network Inventory, or a complete Capture Program. Diagnostic bundles, active repair, and capability
+refresh remain target-state work rather than accepted aliases. The bounded offline cleanup command
+is now an accepted Rust multicall path.
+
+Delivered B2.2 moves configuration and module-disable observation into the same daemon `epoll`
+reactor. The file-observation Module watches parent directories for the authoritative `flux.toml`,
+its currently selected engine template and subscription URL file, and the module `disable` entry.
+It exposes only coalesced configuration-input and disable-state facts, recovers from overflow,
+atomic replacement, invalidated watches, missing parents, and ancestor-directory replacement, and
+submits them without blocking to the existing serialized mutation scheduler. Read-only profiles
+attach no observer. The prior `inotifyd`/`flux-event` runtime path is gone; the adapter remains only
+as a development-package artifact pending B3 deletion.
+
 Offline multicall commands, which are not routed over the live daemon socket:
 
-- `recover --offline`
 - `cleanup --offline`
 
-The same binary implements `fluxd daemon`, explicit offline salvage/cleanup, and CLI client behavior.
-Normal boot recovery is owned by daemon startup, not by a second wrapper command. The final
-`fluxctl` name resolves directly to the Rust multicall binary through a symlink/hardlink or equivalent
-platform entry; no shell compatibility wrapper remains.
+The same `fluxd` binary implements daemon, bounded offline cleanup, and CLI client behavior.
+Normal boot recovery is owned by daemon startup, not by a second wrapper command. No `fluxctl`
+spelling or shell compatibility wrapper remains in the delivered command surface.
 
-All online work that can mutate kernel state—including active capability probes and repair—enters the same serialized mutation scheduler and Generation fence. Offline salvage/cleanup requires the daemon lease to be absent; separate maintenance Modules do not bypass the single-writer invariant.
+All online work that can mutate kernel state—including active capability probes and repair—enters the same serialized mutation scheduler and Generation fence. Offline cleanup requires the persistent `run/fluxd.lease` kernel lock to be available; stale PID/socket/watchdog records are ignored, and separate maintenance Modules do not bypass the single-writer invariant.
 
 ## Reliability and security
 
@@ -1076,7 +1149,7 @@ The Phase 1 projection exposes `ControlSnapshot` and `RuntimeSnapshot` as separa
 
 1. No kernel below 5.10 is supported.
 2. Kernel version alone never proves an optional feature usable.
-3. One task is the sole writer of Flux-owned kernel state.
+3. Every Flux-owned kernel object has exactly one writer, and writer transfer is fenced.
 4. A Generation is immutable after compilation.
 5. Traffic is attached only after the target Proxy Engine is ready.
 6. Stop and fatal-repair detach capture before stopping the Proxy Engine.
@@ -1094,7 +1167,7 @@ The Phase 1 projection exposes `ControlSnapshot` and `RuntimeSnapshot` as separa
 16. Compatibility components transfer to Rust atomically and individually; shell remains the sole
     writer for a component until its transition lease disables that path.
 
-Phase 1 is a pre-release bridge exception to invariant 12's final-state wording: shell phase scripts still apply networking state, but the serialized worker is their only caller and the boot-scoped lease excludes `scripts/core` from Rust-owned engine runs. Rust-owned preparation compiles rule caches; explicit legacy ownership alone executes the frozen shell generator; `scripts/tproxy` applies either prepared cache. Their networking behavior is frozen under ADR-0010 except for correctness, security, cutover-contract, and rollback fixes. ADR-0011 forbids publishing this exception.
+Phase 1 is a pre-release bridge exception to invariant 12's final-state wording: shell phase scripts still apply networking state, but the serialized worker is their only caller and the boot-scoped lease excludes `scripts/core` from Rust-owned engine runs. Rust owns the configuration snapshot and compatibility inputs and compiles rule caches; explicit legacy ownership alone executes the frozen shell config/rule path; `scripts/tproxy` applies either prepared cache. Their networking behavior is frozen under ADR-0010 except for correctness, security, cutover-contract, and rollback fixes. ADR-0011 forbids publishing this exception.
 
 ## Completion criteria for the rewrite
 

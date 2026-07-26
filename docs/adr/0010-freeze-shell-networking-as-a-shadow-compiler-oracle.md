@@ -1,7 +1,7 @@
 ---
 status: accepted
 decision_date: 2026-07-14
-last_reviewed: 2026-07-20
+last_reviewed: 2026-07-23
 ---
 
 # Freeze shell networking as the oracle for a non-authorizing Rust shadow compiler
@@ -42,9 +42,10 @@ nor device semantic parity.
 Each compatibility component is retired only after its Rust replacement passes all applicable
 gates: canonical rendering and differential fixtures, backend and real-device behavior, failure
 and recovery injection, exact live readback and Managed Object ownership, rollback, and an atomic
-single-writer transition. Roadmap backlog item 3 completes one canonical target containing the
-address-derived policy and every routing/authority input needed by the native transaction. Item 4
-then transfers xtables, policy routing, and address synchronization together because the native
+single-writer transition. Roadmap Lane A completes one canonical target containing the
+address-derived policy and every host-buildable input needed by the native transaction, while Lane
+C supplies the exact physical-device routing and authority evidence. Gate 1 then transfers xtables,
+policy routing, and address synchronization together because the native
 Generation lease intentionally excludes every shell networking writer. Until that transfer is complete, Rust may observe
 and compile but must not execute that component's networking mutations. The final package may
 retain only platform-required Magisk installation, launch, disable, and uninstall glue; it retains
@@ -120,14 +121,16 @@ compiler must follow ADR-0012 and retire any superseded shell behavior at the co
 
 ## 2026-07-17 native-owner checkpoint
 
-Backlog item 2 now has one complete private Rust transaction owner rather than another shadow
+This checkpoint has one complete private Rust transaction owner rather than another shadow
 artifact. `NativeXtablesOwner` exposes only `converge(target)` and `recover()` and owns stable
 PREROUTING/OUTPUT roots, coherent descriptor-pinned restore/save, journaled policy-routing
 netlink, exact structured readback, rollback, crash recovery, cleanup invertibility, and the
 shell-visible transition lease. Its exact routing identity requires nonzero route and rule
 protocols, an explicit nonzero route metric, IPv4 HOST scope, and IPv6 UNIVERSE scope. Durable
-owner-payload schema 2 binds target and optional previous identities to artifact/tool digests plus a
-domain-separated digest of the complete IPv4/IPv6 route/rule audit and exact loopback name/index.
+owner-payload schema 3 stores only target and optional previous identities; each binds the source
+artifact, coherent tool set, complete private runtime plan, and a domain-separated digest of the
+complete IPv4/IPv6 route/rule audit and exact loopback name/index. A separate bounded,
+checksum-protected archive retains exact active/replacement recovery material under the runtime lock.
 The real Adapter validates the live mapping name-to-index and index-to-name before every policy access, and both
 xtables families plus both routing audit identities must be exact or absent before `Active` or
 `CleanAbsent` can be published.

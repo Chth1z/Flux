@@ -313,6 +313,8 @@ pub(crate) enum EngineConfigCompileErrorKind {
     InboundTypeNotString { index: usize },
     MultipleTproxyInbounds,
     OutputTooLarge { actual: usize, maximum: u64 },
+    NonCanonical,
+    ContentDigestMismatch,
     Encode,
 }
 
@@ -337,6 +339,10 @@ impl EngineConfigCompileError {
             kind,
             source: Some(source),
         }
+    }
+
+    pub(crate) const fn content_digest_mismatch() -> Self {
+        Self::without_source(EngineConfigCompileErrorKind::ContentDigestMismatch)
     }
 }
 
@@ -379,6 +385,12 @@ impl fmt::Display for EngineConfigCompileError {
             EngineConfigCompileErrorKind::OutputTooLarge { actual, maximum } => write!(
                 formatter,
                 "compiled Sing-Box configuration is {actual} bytes, exceeding the {maximum}-byte Generation budget"
+            ),
+            EngineConfigCompileErrorKind::NonCanonical => formatter.write_str(
+                "prepared Sing-Box configuration is not the exact canonical TPROXY artifact",
+            ),
+            EngineConfigCompileErrorKind::ContentDigestMismatch => formatter.write_str(
+                "prepared Sing-Box configuration does not match its validated content digest",
             ),
             EngineConfigCompileErrorKind::Encode => match &self.source {
                 Some(source) => write!(
@@ -520,6 +532,21 @@ pub(crate) fn compile_tproxy_engine_config(
         },
         bytes: bytes.into_boxed_slice(),
     })
+}
+
+/// Reconstruct an artifact only when the supplied bytes are already its exact canonical encoding.
+pub(crate) fn reconstruct_canonical_tproxy_engine_config(
+    bytes: &[u8],
+    listener_port: NonZeroU16,
+) -> Result<EngineConfigArtifact, EngineConfigCompileError> {
+    let artifact =
+        compile_tproxy_engine_config(TproxyEngineConfigRequest::new(bytes, listener_port))?;
+    if artifact.bytes() != bytes {
+        return Err(EngineConfigCompileError::without_source(
+            EngineConfigCompileErrorKind::NonCanonical,
+        ));
+    }
+    Ok(artifact)
 }
 
 fn normalize_tproxy_inbound(inbound: &mut Map<String, Value>, port: NonZeroU16) {

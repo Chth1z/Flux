@@ -2,7 +2,7 @@
 
 # ==============================================================================
 # [ Flux Boot Service ]
-# Description: Module-local fluxd watchdog and raw inotify event launcher.
+# Description: Module-local fluxd watchdog.
 # ==============================================================================
 
 set -eu
@@ -18,7 +18,6 @@ readonly LOG_COMPONENT="Flux"
 FLUXD_CHILD_PID=""
 ADOPTED_FLUXD_PID=""
 ADOPTED_FLUXD_START=""
-INOTIFY_PID=""
 WATCHDOG_LEASE_HELD=0
 WATCHDOG_START_TICKS=""
 WATCHDOG_BOOT_ID=""
@@ -31,37 +30,6 @@ _wait_for_boot() {
         count=$((count + 1))
     done
     return 1
-}
-
-_start_inotify_module() {
-    [ -x "${FLUX_EVENT_SCRIPT}" ] || {
-        log_error "Event bridge missing or not executable: ${FLUX_EVENT_SCRIPT}"
-        return 1
-    }
-    command -v inotifyd >/dev/null 2>&1 || {
-        log_error "inotifyd command missing"
-        return 1
-    }
-
-    pkill -f "inotifyd.*${FLUX_EVENT_SCRIPT}" >/dev/null 2>&1 || true
-    nohup inotifyd \
-        "${FLUX_EVENT_SCRIPT}" \
-        "${MODDIR}:nd" \
-        "${CONF_DIR}:y" \
-        >>"${FLUX_LOG}" 2>&1 &
-    INOTIFY_PID=$!
-}
-
-_ensure_inotify_module() {
-    if [ -n "${INOTIFY_PID}" ] \
-        && pid_alive "${INOTIFY_PID}" \
-        && pid_matches_cmd "${INOTIFY_PID}" "${FLUX_EVENT_SCRIPT}"; then
-        return 0
-    fi
-
-    [ -n "${INOTIFY_PID}" ] && wait "${INOTIFY_PID}" 2>/dev/null || true
-    INOTIFY_PID=""
-    _start_inotify_module
 }
 
 _wait_for_fluxd_socket() {
@@ -440,7 +408,6 @@ _watch_adopted_fluxd() {
     local pid="${1}"
     local expected_start=""
     local count=0
-    local watcher_backoff=1
 
     expected_start=$(_process_start_ticks "${pid}") || {
         _clear_owned_fluxd_pid_file "${pid}"
@@ -478,16 +445,7 @@ _watch_adopted_fluxd() {
             _stop_adopted_fluxd "${pid}" "${expected_start}" || return 1
             break
         fi
-        if _ensure_inotify_module; then
-            watcher_backoff=1
-            sleep 2
-        else
-            log_error "Adopted fluxd watcher unavailable; retrying in ${watcher_backoff}s"
-            sleep "${watcher_backoff}"
-            watcher_backoff=$((watcher_backoff * 2))
-            [ "${watcher_backoff}" -le "${FLUXD_RESTART_BACKOFF_MAX}" ] \
-                || watcher_backoff="${FLUXD_RESTART_BACKOFF_MAX}"
-        fi
+        sleep 2
     done
 
     _clear_owned_fluxd_pid_file "${pid}"
@@ -497,12 +455,6 @@ _watch_adopted_fluxd() {
 }
 
 _stop_children() {
-    if [ -n "${INOTIFY_PID}" ]; then
-        kill "${INOTIFY_PID}" 2>/dev/null || true
-        wait "${INOTIFY_PID}" 2>/dev/null || true
-        INOTIFY_PID=""
-    fi
-
     if [ -n "${FLUXD_CHILD_PID}" ]; then
         local child_pid="${FLUXD_CHILD_PID}"
         _stop_fluxd_child "${child_pid}"
@@ -544,12 +496,7 @@ _watch_fluxd() {
             return 1
         }
 
-        if _wait_for_fluxd_socket "${FLUXD_CHILD_PID}"; then
-            if ! _ensure_inotify_module; then
-                log_error "Failed to start inotify event watcher"
-                _stop_fluxd_child "${FLUXD_CHILD_PID}"
-            fi
-        else
+        if ! _wait_for_fluxd_socket "${FLUXD_CHILD_PID}"; then
             log_error "fluxd did not create its control socket"
             _stop_fluxd_child "${FLUXD_CHILD_PID}"
         fi
@@ -557,11 +504,6 @@ _watch_fluxd() {
         while _fluxd_child_running "${FLUXD_CHILD_PID}"; do
             if ! _fluxd_ready; then
                 log_error "fluxd lost its control socket"
-                _stop_fluxd_child "${FLUXD_CHILD_PID}"
-                break
-            fi
-            if ! _ensure_inotify_module; then
-                log_error "inotify event watcher exited and could not restart"
                 _stop_fluxd_child "${FLUXD_CHILD_PID}"
                 break
             fi

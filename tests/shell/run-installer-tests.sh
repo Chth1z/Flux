@@ -63,6 +63,7 @@ mkdir -p \
 
 printf 'id=flux\nname=Flux\n' >"${fixture}/module.prop"
 printf '#!/system/bin/sh\nexit 0\n' >"${fixture}/flux_service.sh"
+printf '#!/system/bin/sh\nexit 0\n' >"${fixture}/uninstall.sh"
 printf '<html></html>\n' >"${fixture}/webroot/index.html"
 for binary in addrsyncd jq sing-box; do
     printf '%s-new\n' "${binary}" >"${fixture}/bin/${binary}"
@@ -115,4 +116,70 @@ for file in flux.toml settings.ini template.json addrsyncd.toml; do
         fail "post-extraction failure did not restore ${file}"
 done
 
-printf 'installer rollback shell tests: PASS\n'
+uninstall_calls="${data_root}/adb/flux/run/uninstall.calls"
+mkdir -p "${data_root}/adb/flux/bin" "${data_root}/adb/flux/run"
+printf '%s\n' \
+    '#!/usr/bin/sh' \
+    'printf '\''%s\n'\'' "$*" >>/data/adb/flux/run/uninstall.calls' \
+    'case "${1:-}" in' \
+    'ping) exit "${FLUX_UNINSTALL_TEST_PING_RC}" ;;' \
+    'stop) exit "${FLUX_UNINSTALL_TEST_STOP_RC}" ;;' \
+    'cleanup)' \
+    '    [ "$#" -eq 2 ] && [ "${2}" = "--offline" ] || exit 98' \
+    '    exit "${FLUX_UNINSTALL_TEST_CLEANUP_RC}"' \
+    '    ;;' \
+    '*) exit 99 ;;' \
+    'esac' >"${data_root}/adb/flux/bin/fluxd"
+chmod 0700 "${data_root}/adb/flux/bin/fluxd"
+
+run_uninstall_case() {
+    uninstall_case="${1}"
+    uninstall_ping_rc="${2}"
+    uninstall_stop_rc="${3}"
+    uninstall_cleanup_rc="${4}"
+    : >"${uninstall_calls}"
+    set +e
+    "${BWRAP_BIN}" \
+        --tmpfs / \
+        --ro-bind /usr /usr \
+        --ro-bind /etc /etc \
+        --symlink usr/bin /bin \
+        --symlink usr/lib /lib \
+        --symlink usr/lib64 /lib64 \
+        --proc /proc \
+        --dev /dev \
+        --bind "${data_root}" /data \
+        --ro-bind "${REPO_ROOT}" /src \
+        --setenv FLUX_UNINSTALL_TEST_PING_RC "${uninstall_ping_rc}" \
+        --setenv FLUX_UNINSTALL_TEST_STOP_RC "${uninstall_stop_rc}" \
+        --setenv FLUX_UNINSTALL_TEST_CLEANUP_RC "${uninstall_cleanup_rc}" \
+        /usr/bin/sh /src/uninstall.sh \
+        >"${tmp_dir}/uninstall-${uninstall_case}.out" \
+        2>"${tmp_dir}/uninstall-${uninstall_case}.err"
+    uninstall_exit=$?
+    set -e
+}
+
+run_uninstall_case online 0 0 91
+[ "${uninstall_exit}" -eq 0 ] || fail "online uninstall delegation failed: ${uninstall_exit}"
+actual_calls=$(cat "${uninstall_calls}")
+expected_calls=$(printf 'ping\nstop')
+[ "${actual_calls}" = "${expected_calls}" ] ||
+    fail "online uninstall did not stop after successful daemon delegation"
+
+run_uninstall_case offline 7 88 0
+[ "${uninstall_exit}" -eq 0 ] || fail "offline uninstall delegation failed: ${uninstall_exit}"
+actual_calls=$(cat "${uninstall_calls}")
+expected_calls=$(printf 'ping\ncleanup --offline')
+[ "${actual_calls}" = "${expected_calls}" ] ||
+    fail "offline uninstall did not invoke the exact cleanup command"
+
+run_uninstall_case stop-failed 0 9 75
+[ "${uninstall_exit}" -eq 75 ] ||
+    fail "uninstall did not propagate offline cleanup failure: ${uninstall_exit}"
+actual_calls=$(cat "${uninstall_calls}")
+expected_calls=$(printf 'ping\nstop\ncleanup --offline')
+[ "${actual_calls}" = "${expected_calls}" ] ||
+    fail "failed online stop did not fall back to exact offline cleanup"
+
+printf 'installer rollback and uninstall delegation shell tests: PASS\n'

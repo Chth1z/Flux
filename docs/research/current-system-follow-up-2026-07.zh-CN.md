@@ -138,9 +138,9 @@ TUN 模式下规则生成器会输出空 mangle 程序，但 [`scripts/tproxy`](
 
 - 包安装、卸载、UID 重用和新 Android user 不会自动触发应用规则重编译；`all` 仅枚举 user `0..99`。
 - 当 Sing-Box 以 `root:root` 运行时，owner 防环路规则也会让其他 root/root 流量 bypass。
-- Rust-owned Sing-Box 不再写旧 PID 文件，但旧 `fluxctl status` 仍读取该文件。
+- `fluxd status` 已直接返回 Rust-owned Sing-Box 状态；旧 `fluxctl` shell 包装器已删除。
 - 安装迁移没有覆盖全部 TUN、用户范围和 `PROXY_MODE` 字段。
-- 尚无完成的 `fluxd cleanup --offline`/uninstall 路径。
+- `fluxd cleanup --offline` 与 `uninstall.sh` 已完成 Rust 委托；设备级运行资格仍未验证。
 - `conf/manifest.json` 的二进制来源、版本和 SHA-256 仍为空，stage 工具没有验证它们。
 
 ## 与外部项目比较时的定位

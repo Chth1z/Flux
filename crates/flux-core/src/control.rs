@@ -1,6 +1,6 @@
 use std::error::Error;
 use std::fmt;
-use std::sync::{Arc, RwLock, mpsc};
+use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -58,6 +58,12 @@ pub enum ConfigurationChangeReport {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ControlObservation {
+    ConfigurationInputsChanged,
+    DisableStateChanged { disabled: bool },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ControlSnapshot {
     pub revision: u64,
     pub administrative_state: AdministrativeState,
@@ -80,6 +86,10 @@ impl Default for ControlSnapshot {
 
 pub trait LegacyDispatcher: Send + 'static {
     fn execute(&mut self, intent: &LegacyIntent) -> Result<(), ControlError>;
+
+    fn observation_failed(&mut self, _observation: ControlObservation, _error: &ControlError) {}
+
+    fn configuration_inputs_consumed(&mut self) {}
 
     fn maintenance_interval(&self) -> Option<Duration> {
         None
@@ -118,6 +128,7 @@ impl<T> ControlService for T where
 
 pub struct LegacyControlBridge {
     sender: Option<mpsc::SyncSender<WorkerRequest>>,
+    observations: Arc<Mutex<PendingControlObservations>>,
     snapshot: Arc<RwLock<Arc<ControlSnapshot>>>,
     worker: Option<JoinHandle<()>>,
 }
@@ -132,15 +143,20 @@ impl LegacyControlBridge {
         }
 
         let (sender, receiver) = mpsc::sync_channel(queue_capacity);
+        let observations = Arc::new(Mutex::new(PendingControlObservations::default()));
+        let worker_observations = Arc::clone(&observations);
         let snapshot = Arc::new(RwLock::new(Arc::new(ControlSnapshot::default())));
         let worker_snapshot = Arc::clone(&snapshot);
         let worker = thread::Builder::new()
             .name("flux-legacy-writer".to_owned())
-            .spawn(move || worker_loop(dispatcher, receiver, &worker_snapshot))
+            .spawn(move || {
+                worker_loop(dispatcher, receiver, &worker_observations, &worker_snapshot);
+            })
             .map_err(|error| ControlError::WorkerStart(error.to_string()))?;
 
         Ok(Self {
             sender: Some(sender),
+            observations,
             snapshot,
             worker: Some(worker),
         })
@@ -197,6 +213,17 @@ impl LegacyControlBridge {
             .map_err(|_| ControlError::BridgeStopped)?
     }
 
+    pub fn observation_ingress(&self) -> Result<ControlObservationIngress, ControlError> {
+        Ok(ControlObservationIngress {
+            sender: self
+                .sender
+                .as_ref()
+                .ok_or(ControlError::BridgeStopped)?
+                .clone(),
+            pending: Arc::clone(&self.observations),
+        })
+    }
+
     #[must_use]
     pub fn snapshot(&self) -> Arc<ControlSnapshot> {
         match self.snapshot.read() {
@@ -229,9 +256,40 @@ impl ConfigurationChangeClient for LegacyControlBridge {
 
 impl Drop for LegacyControlBridge {
     fn drop(&mut self) {
-        self.sender.take();
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.send(WorkerRequest::Shutdown);
+        }
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct ControlObservationIngress {
+    sender: mpsc::SyncSender<WorkerRequest>,
+    pending: Arc<Mutex<PendingControlObservations>>,
+}
+
+impl ControlObservationIngress {
+    pub fn submit(&self, observation: ControlObservation) -> Result<(), ControlError> {
+        let should_wake = {
+            let mut pending = self
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            pending.record(observation);
+            let should_wake = !pending.wake_owed;
+            pending.wake_owed = true;
+            should_wake
+        };
+        if !should_wake {
+            return Ok(());
+        }
+
+        match self.sender.try_send(WorkerRequest::ObservationsReady) {
+            Ok(()) | Err(mpsc::TrySendError::Full(_)) => Ok(()),
+            Err(mpsc::TrySendError::Disconnected(_)) => Err(ControlError::BridgeStopped),
         }
     }
 }
@@ -413,11 +471,50 @@ enum WorkerRequest {
         reason: Reason,
         completion_tx: mpsc::SyncSender<Result<ConfigurationChangeReport, ControlError>>,
     },
+    ObservationsReady,
+    Shutdown,
+}
+
+#[derive(Default)]
+struct PendingControlObservations {
+    configuration_inputs_changed: bool,
+    disable_state: Option<bool>,
+    wake_owed: bool,
+}
+
+impl PendingControlObservations {
+    fn record(&mut self, observation: ControlObservation) {
+        match observation {
+            ControlObservation::ConfigurationInputsChanged => {
+                self.configuration_inputs_changed = true;
+            }
+            ControlObservation::DisableStateChanged { disabled } => {
+                self.disable_state = Some(disabled);
+            }
+        }
+    }
+
+    fn take(&mut self) -> ControlObservationBatch {
+        let batch = ControlObservationBatch {
+            configuration_inputs_changed: self.configuration_inputs_changed,
+            disable_state: self.disable_state.take(),
+        };
+        self.configuration_inputs_changed = false;
+        self.wake_owed = false;
+        batch
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ControlObservationBatch {
+    configuration_inputs_changed: bool,
+    disable_state: Option<bool>,
 }
 
 fn worker_loop<D>(
     mut dispatcher: D,
     receiver: mpsc::Receiver<WorkerRequest>,
+    observations: &Mutex<PendingControlObservations>,
     snapshot: &RwLock<Arc<ControlSnapshot>>,
 ) where
     D: LegacyDispatcher,
@@ -430,19 +527,27 @@ fn worker_loop<D>(
             Some(interval) => match receiver.recv_timeout(interval) {
                 Ok(request) => Some(request),
                 Err(mpsc::RecvTimeoutError::Timeout) => {
+                    drain_control_observations(&mut dispatcher, observations, snapshot);
                     dispatcher.maintain();
                     None
                 }
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    drain_control_observations(&mut dispatcher, observations, snapshot);
+                    break;
+                }
             },
             None => match receiver.recv() {
                 Ok(request) => Some(request),
-                Err(_) => break,
+                Err(_) => {
+                    drain_control_observations(&mut dispatcher, observations, snapshot);
+                    break;
+                }
             },
         };
         let Some(request) = request else {
             continue;
         };
+        let shutdown = matches!(request, WorkerRequest::Shutdown);
         match request {
             WorkerRequest::Execute {
                 intent,
@@ -457,22 +562,80 @@ fn worker_loop<D>(
                 reason,
                 completion_tx,
             } => {
-                let result = if read_snapshot(snapshot).administrative_state
-                    == AdministrativeState::Running
-                {
-                    execute_intent(&mut dispatcher, snapshot, LegacyIntent::Reload { reason })
-                        .map(ConfigurationChangeReport::Reloaded)
-                } else {
-                    Ok(ConfigurationChangeReport::Deferred {
-                        revision: mark_dirty(snapshot),
-                    })
-                };
+                let result = apply_configuration_change(&mut dispatcher, snapshot, reason);
                 let _ = completion_tx.send(result);
             }
+            WorkerRequest::ObservationsReady | WorkerRequest::Shutdown => {}
+        }
+        drain_control_observations(&mut dispatcher, observations, snapshot);
+        if shutdown {
+            break;
         }
         dispatcher.maintain();
     }
     dispatcher.shutdown();
+}
+
+fn drain_control_observations<D>(
+    dispatcher: &mut D,
+    observations: &Mutex<PendingControlObservations>,
+    snapshot: &RwLock<Arc<ControlSnapshot>>,
+) where
+    D: LegacyDispatcher,
+{
+    let pending = observations
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    let mut configuration_consumed = false;
+
+    if pending.configuration_inputs_changed && pending.disable_state == Some(false) {
+        mark_dirty(snapshot);
+    }
+
+    if let Some(disabled) = pending.disable_state {
+        let observation = ControlObservation::DisableStateChanged { disabled };
+        let intent = if disabled {
+            LegacyIntent::Stopped {
+                reason: Reason::DisableCreated,
+            }
+        } else {
+            LegacyIntent::Running {
+                reason: Reason::DisableRemoved,
+            }
+        };
+        match execute_intent(dispatcher, snapshot, intent) {
+            Ok(_) if !disabled => configuration_consumed = true,
+            Ok(_) => {}
+            Err(error) => dispatcher.observation_failed(observation, &error),
+        }
+    }
+
+    if pending.configuration_inputs_changed && !configuration_consumed {
+        let observation = ControlObservation::ConfigurationInputsChanged;
+        if let Err(error) = apply_configuration_change(dispatcher, snapshot, Reason::ConfigChanged)
+        {
+            dispatcher.observation_failed(observation, &error);
+        }
+    }
+}
+
+fn apply_configuration_change<D>(
+    dispatcher: &mut D,
+    snapshot: &RwLock<Arc<ControlSnapshot>>,
+    reason: Reason,
+) -> Result<ConfigurationChangeReport, ControlError>
+where
+    D: LegacyDispatcher,
+{
+    if read_snapshot(snapshot).administrative_state == AdministrativeState::Running {
+        execute_intent(dispatcher, snapshot, LegacyIntent::Reload { reason })
+            .map(ConfigurationChangeReport::Reloaded)
+    } else {
+        Ok(ConfigurationChangeReport::Deferred {
+            revision: mark_dirty(snapshot),
+        })
+    }
 }
 
 fn execute_intent<D>(
@@ -490,8 +653,12 @@ where
         in_flight: Some(intent),
         last_completed: current.last_completed,
     });
+    let configuration_was_dirty = started.configuration_dirty;
 
     let result = dispatcher.execute(&intent);
+    if result.is_ok() && configuration_was_dirty && matches!(intent, LegacyIntent::Running { .. }) {
+        dispatcher.configuration_inputs_consumed();
+    }
     let completed_revision = started.revision.saturating_add(1);
     let operation = result.map(|()| OperationReport {
         intent,

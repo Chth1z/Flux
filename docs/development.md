@@ -2,11 +2,16 @@
 
 The Rust rewrite is pre-release development. The root Cargo workspace is authoritative while the
 legacy `addrsyncd` submodule remains independently locked and buildable only as temporary cutover
-evidence. The shell restore path remains the sole production bridge networking writer until each Rust component passes
-its cutover gate, then the replaced runtime component is removed promptly. Rust-owned preparation
+evidence. The shell phase path and standalone `addrsyncd` remain the production bridge networking
+writers until one fenced cutover transfers all networking mutation ownership to Rust, then the
+replaced runtime code is removed promptly. Rust-owned preparation
 now compiles the legacy restore caches, while the frozen shell generator remains an explicit
 legacy-owner rollback oracle rather than a silent fallback. No bridge, shadow, parity, staged
 module, or package-verifier result is a release candidate.
+
+Subscription retrieval and asset management are now production-connected Rust behavior. The
+bridge still packages `scripts/updater.sh` for frozen comparison until B3, but no initialization or
+runtime path references or invokes it.
 
 ## Toolchain contract
 
@@ -16,7 +21,14 @@ module, or package-verifier result is a release candidate.
 - Android API level: 31.
 - Release-link NDK: revision `27.3.13750724` (NDK r27d).
 
-The root [`rust-toolchain.toml`](../rust-toolchain.toml) installs the Rust components and Android standard library. `cargo check` for Android does not require an NDK linker. A release build does.
+The root [`rust-toolchain.toml`](../rust-toolchain.toml) installs the Rust components and Android
+standard library. The subscription TLS graph includes `ring`, whose Android build script compiles C
+and assembly even during `cargo check`. Android checks and release builds therefore both require the
+pinned NDK; `xtask` validates its revision and binds the API-31 compiler as Cargo's linker and the
+target-specific `cc` compiler. Because NDK r27d still defaults to 4 KiB ELF load alignment,
+`xtask` also passes both `-z max-page-size=16384` and
+`-z common-page-size=16384` through target-specific Rust flags for every final ARM64 and x86_64
+Android link.
 
 ## Common commands
 
@@ -29,7 +41,9 @@ cargo xtask check-android
 cargo xtask ci
 ```
 
-`cargo xtask ci` runs formatting, host checks/tests, Clippy with warnings denied, and the Android cross-check for the new workspace.
+Set `ANDROID_NDK_HOME` or `ANDROID_NDK_ROOT` to NDK `27.3.13750724` before running
+`check-android`, `build-android`, or `ci`. `cargo xtask ci` runs formatting, host checks/tests,
+Clippy with warnings denied, and the pinned-NDK Android cross-check for the new workspace.
 
 The focused Phase 3 Android mark-authority model can be exercised with:
 
@@ -82,11 +96,10 @@ The bridge shell regression suites are:
 sh tests/shell/config_installer_contract.sh
 sh tests/shell/rules_generation.sh
 sh tests/shell/run-installer-tests.sh
-sh tests/shell/run-fluxctl-tests.sh
 sh tests/shell/run-dispatcher-tests.sh
 ```
 
-The first two suites are host-only and cover installer migration/configuration admissibility and legacy rule-generation semantics. The remaining three wrappers run in isolated Bubblewrap roots: installer rollback after post-extraction failure, authoritative `fluxctl` delegation, and the complete Rust-owned dispatcher lifecycle. Local hosts without Bubblewrap report an isolated-suite skip. CI makes unavailable or prohibited Bubblewrap environments failures.
+The first two suites are host-only and cover installer migration/configuration admissibility and legacy rule-generation semantics. The remaining two wrappers run in isolated Bubblewrap roots: installer rollback/uninstall delegation and the complete Rust-owned dispatcher lifecycle. Local hosts without Bubblewrap report an isolated-suite skip. CI makes unavailable or prohibited Bubblewrap environments failures.
 
 ### Completed Phase 2 shadow Capture Program workflow
 
@@ -205,9 +218,14 @@ a surviving mutating `addrsync` phase child that remains blocking after dispatch
 The owner durably publishes activating intent and acquires the component transition lease before its
 first restore or rtnetlink write. The lease scope is bound to boot, network namespace, component, and
 ownership-journal identity and deliberately survives an atomic Generation rebind; the journal
-binding carries the current Generation. Owner-payload schema 2 stores target and optional previous
-identities with artifact, coherent tool-set, and complete IPv4/IPv6 policy-routing audit digests. The
-routing digest includes every exact route/rule field and the loopback name/index identity.
+binding carries the current Generation. Owner-payload schema 3 stores only target and optional
+previous identities. Each identity binds the source artifact, coherent tool set, complete private
+runtime plan, and the IPv4/IPv6 policy-routing audit; the routing digest includes every exact
+route/rule field and the loopback name/index identity. The bounded checksum-protected
+`native_xtables.targets` archive stores exact restore/topology/routing material for at most the
+active and replacement targets. `.native_xtables.runtime.lock` spans archive refresh and staging,
+owner journal/kernel convergence, and archive settling, so another process cannot prune material
+while a durable journal references it.
 Stable `FLX{4|6}SP` PREROUTING roots precede `FLX{4|6}SO` OUTPUT activation; stop and recovery detach
 OUTPUT before deleting the rule, route, remaining roots, and private chains. The journal and lease
 remain retained whenever exact active or clean-absent state cannot be proved. Every routing access
@@ -232,8 +250,8 @@ surviving phase child remains blocking after parent death, and a live parent can
 child. Release authenticates the current participant and unchanged record. Only both-dead,
 PID-reused, or previous-boot records retire after exact record/directory revalidation. Bare,
 malformed, mixed-owner, and unverifiable state remains blocking. The slot covers the controller
-command lifetime, not the standalone daemon that item 4 must remove after item 3 supplies its
-Rust-owned replacement inputs.
+command lifetime, not the standalone daemon. Roadmap Lane A must supply its Rust-owned replacement
+behavior and inputs, and Gate 1 must remove the daemon during the fenced writer cutover.
 
 The ignored real-Adapter test is:
 
@@ -250,8 +268,9 @@ rooted WSA Android 13 x86_64 profile. WSA remains mechanism evidence only.
 
 The owner and real Adapter are crate-private. Production target admission is still uninhabited, so
 the Runtime Reconciler and functional-canary driver remain `Unsupported` for native execution and
-`scripts/tproxy` remains the production bridge writer until the Android 5.10/ARM64 cutover gate. WSA
-is mechanism evidence only, eBPF remains optional, and production loads no `.ko`/KPM payload.
+`scripts/tproxy` remains the production bridge xtables/Flux PBR writer until the Android 5.10/ARM64
+cutover gate. WSA is mechanism evidence only, eBPF remains optional, and production loads no
+`.ko`/KPM payload.
 
 ### Rust legacy-rule renderer and frozen oracle workflow
 
@@ -263,7 +282,6 @@ cargo test -p flux-platform --test xtables_restore_oracle
 cargo test -p flux-platform --test xtables_legacy_render
 cargo test -p flux-platform --test xtables_legacy_identity
 cargo test -p fluxd --test legacy_rules_cli
-sh tests/shell/run-fluxctl-tests.sh
 sh tests/shell/run-dispatcher-tests.sh
 ```
 
@@ -308,7 +326,9 @@ test proves this command runs before daemon socket routing and emits no stdout o
 
 Rust-owned preparation has a mutually exclusive cache-producer contract:
 
-1. `scripts/init` compiles and exports `cache_config`.
+1. `fluxd` atomically publishes the validated 41-field `run/desired-state.env`; `scripts/config`
+   validates that exact allowlist, copies it into `cache_config`, and appends only observed
+   `KFEAT_*` values.
 2. When application selection needs package resolution, it invokes
    `fluxd snapshot-legacy-packages --source "${PACKAGES_LIST}"` through `atomic_write` to publish one
    descriptor-validated, at-most-4-MiB read-only `cache_packages`; otherwise it publishes an empty
@@ -321,13 +341,14 @@ Rust-owned preparation has a mutually exclusive cache-producer contract:
 5. Successful Rust preparation records `rust` in `cache_valid` and copies `cache_packages`, the
    restore caches, and the receipt into the immutable Generation as `legacy-rules.manifest` before
    `engine.manifest` publication. Stale receipts are deleted and rebuilt/re-attested rather than
-   reused. `fluxctl rules-preview` runs under the same dispatcher lock and intentionally publishes
-   no receipt, so it cannot race Generation snapshotting or authorize later publication.
+   reused. Direct `fluxd rules-preview` no longer enters the dispatcher or rebuilds shared caches;
+   it compiles the current Desired State and canonical engine JSON in memory and returns an explicit
+   non-authorizing explanation.
 6. Explicit legacy ownership alone sources `scripts/rules`, removes the package snapshot, records
    `shell`, and remains the rollback producer. Rust render failure aborts candidate preparation and
    preserves the active Generation; it never falls back silently to shell generation.
 
-In both modes, `scripts/tproxy` remains the sole restore executor and kernel writer. These host
+In both modes, `scripts/tproxy` remains the sole xtables restore executor and writer. These host
 tests do not establish kernel acceptance, exact live readback, Android/Magisk packet-path parity, or
 production native writer ownership. The bounded raw cache-artifact regeneration workflow remains
 separate and explicit:
@@ -450,6 +471,9 @@ timeout or setup failure. The runner records kernel architecture/release, build 
 boot ID, requires the exact same profile after the cross-build and around cleanup, and removes plus
 independently proves absence of the remote directory. It remains outside `cargo xtask ci`, module
 staging, package verification, release manifests, and AArch64 artifacts.
+`xtask` applies the same two 16 KiB compatibility linker options to this non-shipping artifact,
+but a WSA runtime that reports `getconf PAGE_SIZE=4096` remains functional evidence only and
+cannot satisfy the separate 16 KiB Android runtime gate.
 `--adb PROGRAM` is optional; the runner uses `$ADB` when set and otherwise `adb`. A Linux `adb`
 client may address WSA directly after connecting the explicit serial. To use a Windows
 platform-tools client from WSL:
@@ -647,21 +671,32 @@ Set `ANDROID_NDK_HOME` or `ANDROID_NDK_ROOT` to the pinned NDK revision and run:
 cargo xtask build-android
 ```
 
-The task validates `source.properties`, selects the API-suffixed NDK clang linker for the host OS, and builds the `fluxd` release binary. It refuses a different NDK revision instead of silently producing an unqualified artifact.
+The task validates `source.properties`, selects the API-suffixed NDK clang linker for the host OS,
+applies both NDK-r27 16 KiB page-compatibility options, and builds the `fluxd` release binary. It
+then parses the final ELF program-header table and rejects any non-empty `PT_LOAD` whose
+`p_align` is not a congruent power of two at least `2**14`. It refuses a different NDK revision
+or an under-aligned final artifact instead of silently producing an unqualified binary.
 
 ## Magisk module staging
 
 The development bridge is staged only after a successful pinned Android release-profile build:
 
 ```text
-cargo xtask stage-module --stage dist/module --runtime-binaries /path/to/runtime-binaries
+cargo xtask stage-module --profile bridge --stage dist/module --runtime-binaries /path/to/runtime-binaries
 ```
 
 `--runtime-binaries` must contain the independently sourced `sing-box`, `jq`, and rollback
-`addrsyncd` Android binaries required by the current temporary hybrid stage. The task copies the
-tracked module tree, installs the newly built `fluxd` at `bin/fluxd`, and refuses a non-empty stage
-or a stage missing any required runtime file. This is a development staging boundary only; its
-inventory is explicitly forbidden in the final Rust-only package.
+`addrsyncd` Android binaries required by the current temporary hybrid stage. The task reads the
+checked profile contract from `conf/manifest.json`, copies only its required source and binary
+paths, installs the newly built `fluxd` at `bin/fluxd`, and refuses a non-empty stage, missing file,
+forbidden path, or extra staged file. `bridge` is the compatibility default when `--profile` is
+omitted, but every successful result is labeled development-only.
+
+`--profile rust-only` stages only the 13 final paths and needs only Sing-Box from the runtime-binary
+directory. The development bridge currently has 28 required paths, with the exact 15-path difference
+forbidden by Rust-only. It is a migration skeleton, not a runnable or releasable package: the checked
+profile is deliberately marked `failing-until-complete`, and the current bridge-oriented manifest
+metadata and platform glue have not completed the later ownership and policy gates.
 
 To exercise the current hybrid package-consistency boundary, populate every blank
 source/source-revision/version/hash/license field in
@@ -673,58 +708,172 @@ document, exact pinned-toolchain build metadata, and a
 complete recursive `checksums.sha256` inventory. Then run:
 
 ```text
-cargo xtask verify-package --stage dist/module
+cargo xtask verify-package --profile bridge --stage dist/module
+cargo xtask verify-package --profile rust-only --stage dist/module
 ```
 
-The verifier requires clean root/submodule Git state and binds `fluxd`/`addrsyncd` revisions to
-their exact HEADs. It enforces the complete allowed file inventory; byte-compares reviewed module
-scripts, configuration, and defaults; requires exactly four manifest binaries; validates bounded
+The first command checks the temporary bridge and, even on success, reports it as development-only.
+The second is the Rust-unification gate: today's bridge stage fails immediately on an explicitly
+forbidden path, and a structurally complete Rust-only stage still cannot authorize release while
+the checked status is `failing-until-complete`.
+
+The verifier requires a clean root Git state and, for the bridge only, a clean `addrsyncd` submodule.
+It binds each applicable first-party binary revision to its exact HEAD. It requires the staged
+schema-2 profile policy to equal the checked-in policy; enforces the selected exact file inventory;
+byte-compares selected source-owned files; derives the exact manifest binary set from the profile;
+validates bounded
 file-backed AArch64 executable entries and Android interpreter paths; rehashes every artifact and
 payload-bound device record; cross-binds exact SPDX package/source/license/hash records; verifies
 pinned build metadata and complete checksums; and rejects unreviewed Magisk root files, unsafe
 paths, symbolic links, `.ko`/`.kpm` payloads, placeholder/unreviewed licenses or evidence, and any
-profile other than `full`. The checked-in manifest is intentionally not release-complete; a
-normal development stage must fail until its metadata and device evidence are supplied. This does
-not make the hybrid stage releasable. Before release, the staged inventory and verifier are updated
-to reject standalone `addrsyncd`, `jq`, legacy runtime scripts, and compatibility wrappers rather
-than requiring them.
+unknown or altered profile policy. The Rust-only contract requires `fluxd`, Sing-Box, Rust-owned
+configuration/assets, and platform glue, while forbidding standalone `addrsyncd`, `jq`, both legacy
+configuration files, and all 11 current runtime scripts. The checked-in metadata remains
+intentionally incomplete, so an ordinary staged tree also fails provenance and device-evidence
+requirements.
 
 The current verifier establishes internal consistency, not external trust in an unsigned evidence
 file or self-declared third-party build. Passing it cannot override ADR-0011. Publication remains
-blocked until the runtime is fully Rust-owned, the verifier targets that final inventory, and
+blocked until the runtime is fully Rust-owned, the Rust-only profile is promoted only after its
+ownership gates pass, and
 `package-magisk` verifies signed or reproducible third-party provenance and trusted device/CI
 attestations.
 
 ## Pre-release Phase 1 development bridge
 
-The packaged module installs `flux_service.sh` as module-local `service.sh`. It launches a bounded watchdog for `fluxd daemon` and an `inotifyd` Adapter that forwards raw facts through `scripts/flux-event`; event-to-intent policy remains in Rust.
+The packaged module installs `flux_service.sh` as module-local `service.sh`. It launches only a
+bounded watchdog for `fluxd daemon`; mutation-capable daemon profiles own file observation inside
+the existing reactor. `scripts/flux-event` remains in the development bridge inventory as a legacy
+adapter with no runtime caller and is removed with the other bridge artifacts in B3.
 
 Native online commands are:
 
 ```text
 fluxd ping
 fluxd status [--json]
+fluxd start|stop|restart|reload|resync
 fluxd control start|stop|restart|reload|resync
+fluxd diagnose [--json]
+fluxd logs [runtime|daemon|engine] [--lines 1..1000] [--json]
+fluxd backend explain [--json]
+fluxd plan [--dry-run] [--json]
+fluxd rules-preview [--json]
 fluxd event EVENT_TYPE WATCHED_PATH EVENT_NAME
+fluxd subscription update
+fluxd cleanup --offline
 ```
 
-The local `SOCK_SEQPACKET` control contract is protocol version 3. Version 2 introduced the coherent Capability Profile; version 3 adds the required orthogonal runtime-verification state to status responses. The nested Capability Profile is independently versioned and now uses schema 2 for exact device identity. Version-1 and version-2 requests are rejected explicitly instead of being decoded against the new response shape.
+The `event` form is retained only for compatibility testing. Module boot and the dispatcher do not
+invoke it after B2.2.
 
-The socket defaults to `/data/adb/flux/run/fluxd.sock` with mode `0600`. Accepted peers must match the daemon effective UID. Administrative intent is atomically recorded in `/data/adb/flux/state/administrative-intent.json` with the current Linux boot ID, so a daemon restart replays desired running/stopped state before normal control traffic. Startup reconciliation must complete before the socket binds; journal, dispatcher, peer, or socket-safety failures remain fatal and are handled by the bounded watchdog.
+The local `SOCK_SEQPACKET` control contract is protocol version 3. Version 2 introduced the coherent Capability Profile; version 3 adds the required orthogonal runtime-verification state, subscription maintenance, and additive read-only diagnostic/log/explain commands. The nested Capability Profile is independently versioned and now uses schema 2 for exact device identity. Version-1 and version-2 requests are rejected explicitly instead of being decoded against the new response shape.
 
-The authoritative Phase 1 user configuration is `/data/adb/flux/conf/flux.toml` (override with `FLUXD_CONFIG_PATH` for development and tests). Schema 1 is intentionally exact: unknown or missing fields are rejected, and only `fail_policy = "open"` is accepted. `daemon.event_queue_capacity` sizes the bounded legacy-writer queue; the other accepted daemon fields reserve the validated contract for later Phase 1 slices. Configuration is loaded once during mutation-allowed startup, so changes to `flux.toml` currently require a daemon restart. When the Capability Profile permits mutation, a missing or invalid file is fatal before the legacy writer starts or the control socket is admitted.
+The socket defaults to `/data/adb/flux/run/fluxd.sock` with mode `0600`. Accepted peers must match
+the daemon effective UID. `/data/adb/flux/run/fluxd.lease` is a persistent regular file whose
+nonblocking exclusive kernel lock is the only daemon/offline ownership fact; its presence,
+`fluxd.pid`, and the socket do not authorize cleanup. Administrative intent is atomically recorded
+in `/data/adb/flux/state/administrative-intent.json` with the current Linux boot ID, so a daemon
+restart replays desired running/stopped state before normal control traffic. Startup reconciliation
+must complete before the socket binds; journal, dispatcher, peer, or socket-safety failures remain
+fatal and are handled by the bounded watchdog. `fluxd cleanup --offline` acquires the same lease
+before invoking bounded `startup-recover`, and returns exit `75` when a daemon is active or starting.
+
+The authoritative Phase 1 user configuration is `/data/adb/flux/conf/flux.toml` (override with
+`FLUXD_CONFIG_PATH` for development and tests). Schema 3 is intentionally exact: unknown,
+duplicate, or missing fields are rejected; only explicit xtables TPROXY and
+`fail_policy = "open"` are admitted. It types daemon, engine, capture, listener,
+application/user, interface, bypass, subscription, and safety intent, including separate
+encoded-download and decoded-content byte budgets. `daemon.event_queue_capacity` sizes the bounded
+legacy-writer queue. Mutation-allowed startup validates the file before admitting the writer or
+control socket, and every subsequent preparation reloads it so one immutable current snapshot feeds
+canonical engine compilation. The daemon observes the parent directories of `flux.toml`, its
+selected template, its selected subscription URL file, and the module `disable` entry. A valid
+Desired State edit retargets the dynamic watches; an invalid edit queues a fail-closed reload while
+retaining the last valid watch set.
 
 When the kernel is below 5.10, or when the kernel version or boot identity cannot be verified, `fluxd` enters its settled read-only service without loading `flux.toml`, reading administrative intent or disable state, or starting the legacy mutation writer. In particular, every verified below-5.10 kernel is guaranteed to remain queryable without mutation. Read-only Capability Profile collection may still inspect boot identity, SELinux state, and legacy artifact metadata, but it never executes the dispatcher. Schema 2 also exposes exact Android device identity. Generic Linux reports that observation as `Unavailable`; Android reads properties through bionic, requires complete verified-boot lock/algorithm/digest facts, rechecks properties/kernel/namespace and the active Connectivity APEX selection, hashes fixed policy/netd/APEX paths through bounded no-follow reads, and hashes the executing image through `/proc/self/exe` with path/descriptor metadata revalidation. Any missing, denied, malformed, changing, unsafe or oversized fact fails closed. The compiled reviewed-policy selector accepts only exact source-coded entries and currently has an empty production entry table: verified nonmatches receive zero grant, while incomplete identity fails closed, pending independent physical ARM64 review. Tests and nonstandard environments may override the first two legacy probe files with `FLUX_BOOT_ID_PATH` and `FLUX_SELINUX_ENFORCE_PATH`. This keeps status queries available while preventing mutation-configuration or persistence failures from turning a read-only device into a watchdog restart loop. Module upgrades automatically preserve an existing `flux.toml`; a first installation receives the packaged default.
 
-The Phase 1 daemon now owns control admission and shutdown through one `epoll` reactor covering the Unix listener and shutdown `signalfd`. A stop request closes admission before in-flight connection work drains. This delivered baseline does not yet claim the future netlink, timerfd, pidfd, or BPF event sources planned for later phases.
+The Phase 1 daemon owns control admission, shutdown, route-network observation, and file observation
+through one `epoll` reactor. The inotify driver uses nonblocking parent-directory watches, processes
+at most eight 16 KiB reads per readiness turn, treats queue overflow and watch invalidation as full
+reconciliation facts, retries missing watches, and periodically detects replaced directories by
+identity. Directory ancestry is opened without following symbolic links. Recoverable watch-install
+failures keep the daemon alive; a fatal inotify descriptor/read failure remains a reactor error. A
+stop request closes admission before in-flight connection work drains. Timerfd, pidfd, netfilter
+netlink, and BPF event sources remain later work.
 
-Mutating `fluxctl` commands use this socket exclusively and never fall back to direct script execution. Read-only diagnostics still use legacy inspection paths during this pre-release bridge. The legacy dispatcher accepts networking mutations only with `FLUXD_BRIDGE=1`, serializes them with an identity-bearing lock, and remains the sole production bridge networking writer until the component cutover removes it. Its legacy start, stop, restart, and failure-cleanup paths also acquire the shared xtables writer fence before each parent-bound mutating `addrsync` or `tproxy` phase child. Those phase children are serialized into one authenticated slot, so a survivor remains blocking after dispatcher death; a native lease rejects the phase transaction before networking mutation.
+Supported lifecycle, status, diagnostic, log, and explain/preview commands run directly through `fluxd`; no shell control wrapper remains. Read-only diagnostics, fixed `runtime`/`daemon`/`engine` log streams, and explain/preview use same-effective-user socket requests, do not enter mutation deduplication, and never invoke `ip`, `iptables-save`, shell, or shared-cache generation. The obsolete dispatcher `cache-preview` branch is also removed. Log requests are limited to 1,000 lines and a 256 KiB source tail. Explain is explicitly non-authorizing and does not publish a Generation, cache, receipt, or writer lease; it reports configured intent and canonical engine identity but does not yet resolve application UIDs or live network inventory into the full Capture Program. The legacy dispatcher accepts networking mutations only with `FLUXD_BRIDGE=1` and serializes the two production bridge writers with an identity-bearing lock: `scripts/tproxy` owns xtables/Flux PBR writes, while standalone `addrsyncd` owns address synchronization. Its legacy start, stop, restart, and failure-cleanup paths also acquire the shared writer fence before each parent-bound mutating `addrsync` or `tproxy` phase child. Those phase children are serialized into one authenticated slot, so a survivor remains blocking after dispatcher death; a native lease rejects the phase transaction before networking mutation.
+
+### A2 host-only Generation assembly
+
+`GenerationAssembler::assemble` now provides one internal deterministic path from the schema-2
+Desired State, canonical engine and Capture Program artifacts, exact Capability/Engine Profiles,
+Network Inventory, planning evidence, and optional prior owned identity to a complete
+`AdmittedGeneration`. Equal numeric capability revisions do not substitute for exact profile
+identity: canonical SHA-256 digests bind every retained profile field and all Android planning
+evidence, including topology, census observation/content, policy, ownership journal, namespace,
+planes, and partial audit. The Generation identity also binds exact RPDB placement and predecessor
+identity.
+
+The coordinator currently exposes only a read-only inspection projection. Its strict prepared
+record is limited to 16 KiB, validates lowercase SHA-256 values and contiguous lineage, rejects
+symlinks, and publishes with file/directory fsync plus atomic rename. This path has no daemon CLI,
+native-target conversion, writer token, activation lease, or mutation method. WSA can supply
+development evidence when attached, but neither WSA nor a host fixture authorizes Android release
+or changes the fenced legacy networking writers.
 
 ### Rust-owned engine handoff shell contract
 
-The delivered Phase 1 handoff invokes `FLUXD_BRIDGE=1 scripts/dispatcher` through the phase verbs `startup-recover`, `prepare`, `capture-start GENERATION`, `capture-stop`, `capture-verify GENERATION`, `address-resync`, `state-running GENERATION`, `state-stopped`, and `state-failed`. These verbs never invoke `scripts/core`. A boot-scoped dispatcher mode lease rejects mixing them with the retained legacy `start`, `stop`, and `restart` rollback path; `state-stopped` releases the Rust-owned lease only after capture is detached. This makes Rust the sole Sing-Box owner for the daemon run while shell remains the serialized networking writer for Phase 1 capture, policy-routing, and address-synchronization mutations.
+The delivered Phase 1 handoff invokes `FLUXD_BRIDGE=1 scripts/dispatcher` through the phase verbs `startup-recover`, `prepare`, `capture-start GENERATION`, `capture-stop`, `capture-verify GENERATION`, `address-resync`, `state-running GENERATION`, `state-stopped`, and `state-failed`. These verbs never invoke `scripts/core`. A boot-scoped dispatcher mode lease rejects mixing them with the retained legacy `start`, `stop`, and `restart` rollback path; `state-stopped` releases the Rust-owned lease only after capture is detached. This makes Rust the sole Sing-Box owner for the daemon run while the dispatcher serializes the legacy `scripts/tproxy` capture/PBR writer and standalone `addrsyncd` address-sync writer.
 
-`prepare` runs under the dispatcher lock, allocates a positive shell-owned generation ID, and snapshots the generated configuration, environment, rule/cleanup caches, manifest, and generation-local Sing-Box log under `/data/adb/flux/run/generations/<id>/`. Later mutation phases load those immutable generation artifacts instead of the shared live cache. The compatibility path `/data/adb/flux/run/engine.manifest` is atomically published from that generation's manifest for Rust intake; failure discards the incomplete generation and removes the compatibility manifest. The manifest is at most 16 KiB and has this strict line grammar:
+Before invoking `prepare`, `ProcessRuntimeWriter` reloads schema 3, opens the configured template as
+a bounded regular non-symlink file, compiles the listener into deterministic canonical JSON, derives
+the temporary renderer inputs in Rust, and atomically publishes read-only
+`/data/adb/flux/conf/config.json` and `/data/adb/flux/run/desired-state.env` from the same snapshot.
+The environment has one strict 41-field allowlist and cannot carry shell syntax. It binds engine
+path, numeric launch identity, startup/stop timeouts, listener, application/user and interface
+selection, family policy, structurally parsed FakeIP ranges, and reviewed fixed bridge constants.
+No `init` branch runs the shell subscription updater. Rust-owned preparation also never reads
+`settings.ini`, legacy cache policy, generated JSON, or `jq`; only kernel observation may append
+`KFEAT_*` fields.
+
+The compatibility compiler fails closed when valid schema-3 intent cannot be represented by the
+frozen renderer, including missing local/forwarded capture, single-protocol or IPv6-only capture,
+user bypass CIDRs, Android VPN intent, required functional canaries, or interface-role overflow.
+Enabled subscription intent is admitted only with an exact store-validated Rust artifact and the
+current root-owned engine identity. After the dispatcher snapshots the artifacts, Rust requires the
+returned manifest's binary, launch identity, startup and stop timeouts, config digest, and listener
+to match the same Desired State. The typed restart policy replaces the manifest's bridge default.
+Any shell drift fails before engine activation.
+
+### Rust subscription runtime
+
+The daemon owns one capacity-one synchronous subscription worker outside the serialized runtime
+writer. It applies the schema-3 HTTPS, redirect, timeout, encoded-byte, decoded-byte, aggregate
+asset, and node-count limits; accepts the frozen supported outbound/URI formats; normalizes stable
+node names; rewrites supported remote binary rule sets to content-addressed local files; and runs a
+descriptor-pinned `sing-box check` before committing the snapshot under
+`/data/adb/flux/state/subscription/`.
+
+Startup first recovers the bounded active/predecessor index without network access. It performs one
+bootstrap fetch only when subscription intent is enabled and no validated snapshot can be
+recovered. Periodic refresh uses `subscription.update_interval_secs`; the manual path is
+`fluxd subscription update`. Observed Desired State, template, or subscription URL changes request
+an immediate refresh after successful configuration reconciliation. A busy worker retains one
+coalesced pending refresh, and configuration observed while disabled requests it when the deferred
+inputs are consumed during restart. A published candidate crosses back to `RuntimeCoordinator`, which
+either reloads it through the normal Generation compensation path, retains it as an explicit
+deferred source while stopped, or rejects it and waits for exact-digest store rollback. Startup
+admission uses the same accept/reject handshake. Retrieval, parsing, validation, persistence,
+source drift, activation, timeout, or shutdown failure preserves the prior active snapshot.
+
+Manual output distinguishes `updated`, `updated_deferred`, `unchanged`, `disabled`, and `busy`;
+typed failures exit nonzero. The snapshot store is currently private (`0700` directories and
+`0600` files), so subscription-backed activation rejects non-root engine UID/GID until a secure
+traversal/read-mode contract is implemented. Static WebPKI roots intentionally do not inherit
+Android user-installed or enterprise CAs.
+
+`prepare` runs under the dispatcher lock, allocates a positive shell-owned generation ID, and snapshots the Rust-generated configuration, environment, rule/cleanup caches, manifest, and generation-local Sing-Box log under `/data/adb/flux/run/generations/<id>/`. Later mutation phases load those immutable generation artifacts instead of the shared live cache. The compatibility path `/data/adb/flux/run/engine.manifest` is atomically published from that generation's manifest for Rust intake; failure discards the incomplete generation and removes the compatibility manifest. The manifest is at most 16 KiB and has this strict line grammar:
 
 ```text
 FLUX_ENGINE_MANIFEST_V1

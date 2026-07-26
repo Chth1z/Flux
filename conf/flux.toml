@@ -1,7 +1,59 @@
-schema = 1
+schema = 3
 
 [daemon]
 fail_policy = "open"
 reconcile_debounce_ms = 250
 event_queue_capacity = 256
 generation_history = 2
+
+[engine]
+binary = "/data/adb/flux/bin/sing-box"
+template = "/data/adb/flux/conf/template.json"
+runtime_uid = 0
+runtime_gid = 0
+startup_timeout_ms = 5000
+stop_timeout_ms = 5000
+restart_max_attempts = 3
+restart_window_ms = 60000
+restart_initial_backoff_ms = 1000
+restart_maximum_backoff_ms = 30000
+restart_stable_reset_ms = 30000
+
+[capture]
+backend = "xtables"
+local_output = true
+forwarded_ingress = true
+ipv4 = true
+ipv6 = false
+tcp = true
+udp = true
+
+[listener]
+port = 1536
+
+[applications]
+mode = "all"
+android_users = "owner"
+user_ids = []
+packages = []
+
+[interfaces]
+forwarded_proxy = ["rmnet_data*", "wlan0", "wlan2", "rndis*"]
+local_bypass = []
+excluded = []
+
+[bypass]
+cidrs = []
+
+[subscription]
+enabled = false
+url_file = "/data/adb/flux/conf/subscription.url"
+update_interval_secs = 86400
+download_timeout_secs = 10
+max_download_bytes = 16777216
+max_decoded_bytes = 16777216
+max_nodes = 10000
+
+[safety]
+respect_android_vpn = false
+require_functional_canary = false

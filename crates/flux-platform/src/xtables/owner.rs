@@ -8,8 +8,8 @@ use super::{
     XTABLES_CAPTURE_LOWERING_SCHEMA_VERSION, XtablesCaptureArtifactPair, XtablesCaptureArtifactSet,
     XtablesCaptureEntryPoint, XtablesCaptureEntryPointRole, XtablesCaptureEntrySelector,
     XtablesCaptureHook, XtablesCaptureTransactionStep, XtablesRestoreAction,
-    XtablesRestoreArtifact, XtablesRestoreContext, XtablesRestoreFamily, XtablesRestoreParseError,
-    parse_xtables_restore,
+    XtablesRestoreArtifact, XtablesRestoreContext, XtablesRestoreEntry, XtablesRestoreFamily,
+    XtablesRestoreParseError, parse_xtables_restore,
 };
 
 const STABLE_PREROUTING_SUFFIX: &str = "SP";
@@ -65,6 +65,30 @@ impl XtablesStableTopologyPlan {
         })
     }
 
+    pub(crate) fn from_recovery(
+        mut families: Vec<XtablesStableFamilyPlan>,
+    ) -> Result<Self, XtablesStableTopologyError> {
+        families.sort_by_key(|plan| match plan.family() {
+            XtablesRestoreFamily::Ipv4 => 4,
+            XtablesRestoreFamily::Ipv6 => 6,
+        });
+        if families.is_empty() {
+            return Err(XtablesStableTopologyError::NoEnabledFamilies);
+        }
+        if families
+            .windows(2)
+            .any(|pair| pair[0].family() == pair[1].family())
+        {
+            return Err(XtablesStableTopologyError::DuplicateRecoveryFamily);
+        }
+        if !families.iter().any(|family| family.output_root().is_some()) {
+            return Err(XtablesStableTopologyError::MissingLocalOutput);
+        }
+        Ok(Self {
+            families: families.into_boxed_slice(),
+        })
+    }
+
     #[must_use]
     pub(crate) fn families(&self) -> &[XtablesStableFamilyPlan] {
         &self.families
@@ -79,6 +103,9 @@ impl XtablesStableTopologyPlan {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct XtablesStableFamilyPlan {
     family: XtablesRestoreFamily,
+    private_chains: Box<[Box<str>]>,
+    prepare: XtablesRestoreArtifact,
+    retire: XtablesRestoreArtifact,
     prerouting_root: Option<Box<str>>,
     output_root: Option<Box<str>>,
     install: XtablesRestoreArtifact,
@@ -210,8 +237,82 @@ impl XtablesStableFamilyPlan {
             [pair.prepare(), &install],
         )?;
 
+        let mut private_chains = pair
+            .entries()
+            .iter()
+            .map(|entry| Box::<str>::from(entry.chain()))
+            .collect::<Vec<_>>();
+        private_chains.sort_unstable();
         Ok(Self {
             family,
+            private_chains: private_chains.into_boxed_slice(),
+            prepare: pair.prepare().clone(),
+            retire: pair.retire().clone(),
+            prerouting_root,
+            output_root,
+            install,
+            switch,
+            detach_output,
+            detach_remaining,
+            prepared_state,
+            active_state,
+            output_detached_state,
+        })
+    }
+
+    pub(crate) fn from_recovery(
+        material: XtablesStableFamilyRecoveryMaterial,
+    ) -> Result<Self, XtablesStableTopologyError> {
+        let XtablesStableFamilyRecoveryMaterial {
+            family,
+            private_chains,
+            prerouting_root,
+            output_root,
+            prepare,
+            retire,
+            install,
+            switch,
+            detach_output,
+            detach_remaining,
+        } = material;
+        validate_recovery_artifact(&prepare, family, XtablesRestoreAction::Apply)?;
+        validate_recovery_artifact(&retire, family, XtablesRestoreAction::Cleanup)?;
+        validate_recovery_artifact(&install, family, XtablesRestoreAction::Apply)?;
+        validate_recovery_artifact(&switch, family, XtablesRestoreAction::Replace)?;
+        if let Some(detach_output) = &detach_output {
+            validate_recovery_artifact(detach_output, family, XtablesRestoreAction::Cleanup)?;
+        }
+        validate_recovery_artifact(&detach_remaining, family, XtablesRestoreAction::Cleanup)?;
+        validate_recovery_root(
+            family,
+            XtablesCaptureHook::Prerouting,
+            prerouting_root.as_deref(),
+        )?;
+        validate_recovery_root(family, XtablesCaptureHook::Output, output_root.as_deref())?;
+        if output_root.is_some() != detach_output.is_some() {
+            return Err(XtablesStableTopologyError::InvalidRecoveryMaterial(
+                "OUTPUT root and detachment artifact must either both exist or both be absent",
+            ));
+        }
+        validate_private_chains(family, &private_chains, &prepare)?;
+
+        let prepared_state =
+            expected_state(family, XtablesExpectedStatePhase::Prepared, [&prepare])?;
+        let active_state = expected_state(
+            family,
+            XtablesExpectedStatePhase::Active,
+            [&prepare, &install],
+        )?;
+        let output_detached_state = expected_state(
+            family,
+            XtablesExpectedStatePhase::OutputDetached,
+            [&prepare, &install],
+        )?;
+        Ok(Self {
+            family,
+            private_chains,
+            prepare,
+            retire,
             prerouting_root,
             output_root,
             install,
@@ -227,6 +328,21 @@ impl XtablesStableFamilyPlan {
     #[must_use]
     pub(crate) const fn family(&self) -> XtablesRestoreFamily {
         self.family
+    }
+
+    #[must_use]
+    pub(crate) const fn private_chains(&self) -> &[Box<str>] {
+        &self.private_chains
+    }
+
+    #[must_use]
+    pub(crate) const fn prepare(&self) -> &XtablesRestoreArtifact {
+        &self.prepare
+    }
+
+    #[must_use]
+    pub(crate) const fn retire(&self) -> &XtablesRestoreArtifact {
+        &self.retire
     }
 
     #[must_use]
@@ -275,6 +391,19 @@ impl XtablesStableFamilyPlan {
     }
 }
 
+pub(crate) struct XtablesStableFamilyRecoveryMaterial {
+    pub(crate) family: XtablesRestoreFamily,
+    pub(crate) private_chains: Box<[Box<str>]>,
+    pub(crate) prerouting_root: Option<Box<str>>,
+    pub(crate) output_root: Option<Box<str>>,
+    pub(crate) prepare: XtablesRestoreArtifact,
+    pub(crate) retire: XtablesRestoreArtifact,
+    pub(crate) install: XtablesRestoreArtifact,
+    pub(crate) switch: XtablesRestoreArtifact,
+    pub(crate) detach_output: Option<XtablesRestoreArtifact>,
+    pub(crate) detach_remaining: XtablesRestoreArtifact,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum XtablesStableTopologyPhase {
     Install,
@@ -302,6 +431,8 @@ pub(crate) enum XtablesStableTopologyError {
     UnsupportedExtensions,
     NoEnabledFamilies,
     MissingLocalOutput,
+    DuplicateRecoveryFamily,
+    InvalidRecoveryMaterial(&'static str),
     MissingTransactionOrder {
         family: XtablesRestoreFamily,
     },
@@ -355,6 +486,15 @@ impl fmt::Display for XtablesStableTopologyError {
             Self::MissingLocalOutput => {
                 formatter.write_str("native stable topology has no local-OUTPUT transaction")
             }
+            Self::DuplicateRecoveryFamily => {
+                formatter.write_str("native stable topology recovery repeats an address family")
+            }
+            Self::InvalidRecoveryMaterial(reason) => {
+                write!(
+                    formatter,
+                    "invalid native stable topology recovery material: {reason}"
+                )
+            }
             Self::MissingTransactionOrder { family } => {
                 write!(
                     formatter,
@@ -406,6 +546,75 @@ impl fmt::Display for XtablesStableTopologyError {
                 "cannot derive {family:?} native topology expected state {phase:?}: {source}"
             ),
         }
+    }
+}
+
+fn validate_recovery_artifact(
+    artifact: &XtablesRestoreArtifact,
+    family: XtablesRestoreFamily,
+    action: XtablesRestoreAction,
+) -> Result<(), XtablesStableTopologyError> {
+    if artifact.context() == XtablesRestoreContext::new(action, family) {
+        Ok(())
+    } else {
+        Err(XtablesStableTopologyError::InvalidRecoveryMaterial(
+            "restore artifact context differs from its recovery slot",
+        ))
+    }
+}
+
+fn validate_recovery_root(
+    family: XtablesRestoreFamily,
+    hook: XtablesCaptureHook,
+    root: Option<&str>,
+) -> Result<(), XtablesStableTopologyError> {
+    if root.is_none_or(|root| root == stable_root_name(family, hook).as_ref()) {
+        Ok(())
+    } else {
+        Err(XtablesStableTopologyError::InvalidRecoveryMaterial(
+            "stable root name is not canonical for its family and hook",
+        ))
+    }
+}
+
+fn validate_private_chains(
+    family: XtablesRestoreFamily,
+    private_chains: &[Box<str>],
+    prepare: &XtablesRestoreArtifact,
+) -> Result<(), XtablesStableTopologyError> {
+    if private_chains.is_empty()
+        || private_chains
+            .windows(2)
+            .any(|pair| pair[0].as_ref() >= pair[1].as_ref())
+    {
+        return Err(XtablesStableTopologyError::InvalidRecoveryMaterial(
+            "private chain identities must be nonempty, sorted, and unique",
+        ));
+    }
+    let declarations = prepare
+        .transactions()
+        .iter()
+        .flat_map(|transaction| transaction.entries())
+        .filter_map(|entry| match entry {
+            XtablesRestoreEntry::ChainDeclaration(declaration) => Some(declaration.chain()),
+            XtablesRestoreEntry::Command(_) => None,
+        })
+        .collect::<Vec<_>>();
+    let expected_prefix = match family {
+        XtablesRestoreFamily::Ipv4 => "FLX4",
+        XtablesRestoreFamily::Ipv6 => "FLX6",
+    };
+    if private_chains.iter().all(|chain| {
+        chain.starts_with(expected_prefix)
+            && declarations
+                .iter()
+                .any(|declaration| declaration == &chain.as_ref())
+    }) {
+        Ok(())
+    } else {
+        Err(XtablesStableTopologyError::InvalidRecoveryMaterial(
+            "private chain identity is absent from the prepared artifact",
+        ))
     }
 }
 
@@ -699,6 +908,12 @@ fn expected_state<'a>(
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[path = "owner_runtime.rs"]
 mod runtime;
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[allow(unused_imports)]
+pub use runtime::{
+    NativeXtablesCaptureConvergenceError, NativeXtablesCaptureConverger, NativeXtablesCaptureTarget,
+};
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[allow(unused_imports)]

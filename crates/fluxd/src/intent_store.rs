@@ -29,7 +29,7 @@ impl AdministrativeIntentStore {
     }
 
     pub fn load(&self) -> Result<AdministrativeState, IntentStoreError> {
-        let Some(encoded) = record_io::read(&self.record_path)? else {
+        let Some(encoded) = record_io::read(&self.record_path, MAX_INTENT_RECORD_BYTES)? else {
             return Ok(AdministrativeState::Unknown);
         };
         let record = serde_json::from_slice::<IntentRecord>(&encoded)
@@ -174,22 +174,25 @@ impl Error for IntentStoreError {
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-mod record_io {
-    use std::ffi::{CString, OsStr};
-    use std::fs::File;
+pub(crate) mod record_io {
+    use std::ffi::{CString, OsStr, OsString};
+    use std::fs::{self, File};
     use std::io::{self, Read, Write};
     use std::os::fd::{AsRawFd, FromRawFd, RawFd};
     use std::os::unix::ffi::OsStrExt;
     use std::path::{Component, Path, PathBuf};
 
-    use super::{IntentStoreError, MAX_INTENT_RECORD_BYTES, NEXT_TEMP_ID, Ordering};
+    use super::{IntentStoreError, NEXT_TEMP_ID, Ordering};
 
     struct ParentDirectory {
         directory: File,
         record_name: CString,
     }
 
-    pub(super) fn read(path: &Path) -> Result<Option<Vec<u8>>, IntentStoreError> {
+    pub(crate) fn read(
+        path: &Path,
+        maximum_bytes: usize,
+    ) -> Result<Option<Vec<u8>>, IntentStoreError> {
         let Some(parent) = open_parent_directory(path, false)? else {
             return Ok(None);
         };
@@ -217,11 +220,11 @@ mod record_io {
         // SAFETY: `openat` returned a new owned descriptor on success.
         let mut file = unsafe { File::from_raw_fd(descriptor) };
         require_regular_file(&file, path)?;
-        let encoded = read_bounded(&mut file)?;
+        let encoded = read_bounded(&mut file, maximum_bytes)?;
         Ok(Some(encoded))
     }
 
-    pub(super) fn write(path: &Path, encoded: &[u8]) -> Result<(), IntentStoreError> {
+    pub(crate) fn write(path: &Path, encoded: &[u8]) -> Result<(), IntentStoreError> {
         let parent = open_parent_directory(path, true)?.ok_or_else(|| {
             IntentStoreError::io(
                 "create intent directory",
@@ -278,6 +281,59 @@ mod record_io {
             let _ = unlink_at(parent.directory.as_raw_fd(), &temp_name);
         }
         result
+    }
+
+    pub(crate) fn list(
+        directory_path: &Path,
+        maximum_entries: usize,
+    ) -> Result<Option<Vec<OsString>>, IntentStoreError> {
+        if maximum_entries == 0 {
+            return Err(IntentStoreError::io(
+                "list record directory",
+                io::Error::new(io::ErrorKind::InvalidInput, "entry limit must be nonzero"),
+            ));
+        }
+        let listing_anchor = directory_path.join(".fluxd-directory-listing");
+        let Some(parent) = open_parent_directory(&listing_anchor, false)? else {
+            return Ok(None);
+        };
+        let descriptor_path =
+            PathBuf::from(format!("/proc/self/fd/{}", parent.directory.as_raw_fd()));
+        let entries = fs::read_dir(descriptor_path)
+            .map_err(|error| IntentStoreError::io("list record directory", error))?;
+        let mut names = Vec::new();
+        for entry in entries {
+            let entry =
+                entry.map_err(|error| IntentStoreError::io("read record directory", error))?;
+            if names.len() == maximum_entries {
+                return Err(IntentStoreError::io(
+                    "list record directory",
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "record directory exceeds its entry limit",
+                    ),
+                ));
+            }
+            names.push(entry.file_name());
+        }
+        Ok(Some(names))
+    }
+
+    pub(crate) fn remove(path: &Path) -> Result<bool, IntentStoreError> {
+        let Some(parent) = open_parent_directory(path, false)? else {
+            return Ok(false);
+        };
+        match unlink_at(parent.directory.as_raw_fd(), &parent.record_name) {
+            Ok(()) => {
+                parent
+                    .directory
+                    .sync_all()
+                    .map_err(|error| IntentStoreError::io("sync record directory", error))?;
+                Ok(true)
+            }
+            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => Ok(false),
+            Err(error) => Err(IntentStoreError::io("remove record", error)),
+        }
     }
 
     fn open_parent_directory(
@@ -491,14 +547,14 @@ mod record_io {
         )
     }
 
-    fn read_bounded(file: &mut File) -> Result<Vec<u8>, IntentStoreError> {
-        let mut encoded = Vec::with_capacity(MAX_INTENT_RECORD_BYTES.min(256));
-        file.take((MAX_INTENT_RECORD_BYTES + 1) as u64)
+    fn read_bounded(file: &mut File, maximum_bytes: usize) -> Result<Vec<u8>, IntentStoreError> {
+        let mut encoded = Vec::with_capacity(maximum_bytes.min(256));
+        file.take((maximum_bytes + 1) as u64)
             .read_to_end(&mut encoded)
             .map_err(|error| IntentStoreError::io("read intent record", error))?;
-        if encoded.len() > MAX_INTENT_RECORD_BYTES {
+        if encoded.len() > maximum_bytes {
             return Err(IntentStoreError::RecordTooLarge {
-                limit: MAX_INTENT_RECORD_BYTES,
+                limit: maximum_bytes,
             });
         }
         Ok(encoded)
@@ -517,14 +573,18 @@ mod record_io {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
-mod record_io {
+pub(crate) mod record_io {
+    use std::ffi::OsString;
     use std::fs::{self, File, OpenOptions};
     use std::io::{self, Read, Write};
     use std::path::Path;
 
-    use super::{IntentStoreError, MAX_INTENT_RECORD_BYTES, NEXT_TEMP_ID, Ordering};
+    use super::{IntentStoreError, NEXT_TEMP_ID, Ordering};
 
-    pub(super) fn read(path: &Path) -> Result<Option<Vec<u8>>, IntentStoreError> {
+    pub(crate) fn read(
+        path: &Path,
+        maximum_bytes: usize,
+    ) -> Result<Option<Vec<u8>>, IntentStoreError> {
         reject_symlink(path)?;
         let mut file = match File::open(path) {
             Ok(file) => file,
@@ -532,11 +592,11 @@ mod record_io {
             Err(error) => return Err(IntentStoreError::io("read intent record", error)),
         };
         require_regular_file(&file, path)?;
-        let encoded = read_bounded(&mut file)?;
+        let encoded = read_bounded(&mut file, maximum_bytes)?;
         Ok(Some(encoded))
     }
 
-    pub(super) fn write(path: &Path, encoded: &[u8]) -> Result<(), IntentStoreError> {
+    pub(crate) fn write(path: &Path, encoded: &[u8]) -> Result<(), IntentStoreError> {
         let parent = path
             .parent()
             .filter(|path| !path.as_os_str().is_empty())
@@ -571,6 +631,57 @@ mod record_io {
             let _ = fs::remove_file(&temp_path);
         }
         result
+    }
+
+    pub(crate) fn list(
+        directory_path: &Path,
+        maximum_entries: usize,
+    ) -> Result<Option<Vec<OsString>>, IntentStoreError> {
+        if maximum_entries == 0 {
+            return Err(IntentStoreError::io(
+                "list record directory",
+                io::Error::new(io::ErrorKind::InvalidInput, "entry limit must be nonzero"),
+            ));
+        }
+        reject_symlink(directory_path)?;
+        let entries = match fs::read_dir(directory_path) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(IntentStoreError::io("list record directory", error));
+            }
+        };
+        let mut names = Vec::new();
+        for entry in entries {
+            let entry =
+                entry.map_err(|error| IntentStoreError::io("read record directory", error))?;
+            if names.len() == maximum_entries {
+                return Err(IntentStoreError::io(
+                    "list record directory",
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "record directory exceeds its entry limit",
+                    ),
+                ));
+            }
+            names.push(entry.file_name());
+        }
+        Ok(Some(names))
+    }
+
+    pub(crate) fn remove(path: &Path) -> Result<bool, IntentStoreError> {
+        let parent = path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        match fs::remove_file(path) {
+            Ok(()) => {
+                sync_parent_directory(parent)?;
+                Ok(true)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(IntentStoreError::io("remove record", error)),
+        }
     }
 
     fn reject_symlink(path: &Path) -> Result<(), IntentStoreError> {
@@ -633,14 +744,14 @@ mod record_io {
         Ok(())
     }
 
-    fn read_bounded(file: &mut File) -> Result<Vec<u8>, IntentStoreError> {
-        let mut encoded = Vec::with_capacity(MAX_INTENT_RECORD_BYTES.min(256));
-        file.take((MAX_INTENT_RECORD_BYTES + 1) as u64)
+    fn read_bounded(file: &mut File, maximum_bytes: usize) -> Result<Vec<u8>, IntentStoreError> {
+        let mut encoded = Vec::with_capacity(maximum_bytes.min(256));
+        file.take((maximum_bytes + 1) as u64)
             .read_to_end(&mut encoded)
             .map_err(|error| IntentStoreError::io("read intent record", error))?;
-        if encoded.len() > MAX_INTENT_RECORD_BYTES {
+        if encoded.len() > maximum_bytes {
             return Err(IntentStoreError::RecordTooLarge {
-                limit: MAX_INTENT_RECORD_BYTES,
+                limit: maximum_bytes,
             });
         }
         Ok(encoded)

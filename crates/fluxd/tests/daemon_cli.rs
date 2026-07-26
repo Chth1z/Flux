@@ -6,9 +6,9 @@ use flux_core::{
 };
 use flux_testkit::{CapabilityProfileFixture, StaticKernelReleaseSource};
 use fluxd::{
-    DaemonClient, DaemonSnapshot, EventDisposition, EventReport, RuntimeCaptureState,
-    RuntimeEngineState, RuntimeFailure, RuntimePhase, RuntimeSnapshot, RuntimeVerificationState,
-    run_cli_with_daemon,
+    DaemonClient, DaemonSnapshot, DiagnosticReport, EventDisposition, EventReport, ExplainReport,
+    LogReport, LogStream, RuntimeCaptureState, RuntimeEngineState, RuntimeFailure, RuntimePhase,
+    RuntimeSnapshot, RuntimeVerificationState, SubscriptionRefreshReport, run_cli_with_daemon,
 };
 
 #[test]
@@ -85,6 +85,116 @@ fn unsupported_kernel_event_uses_the_stable_unsupported_exit_code() {
         "fluxd: control request rejected (unsupported_kernel): kernel 5.4.280 is below minimum 5.10.0\n"
     );
     assert!(client.events().is_empty());
+}
+
+#[test]
+fn subscription_update_reports_every_terminal_disposition() {
+    let cases = [
+        (
+            SubscriptionRefreshReport::updated(23, 41, false),
+            0,
+            "subscription updated generation=23 nodes=41 cleanup_pending=false\n",
+            "",
+        ),
+        (
+            SubscriptionRefreshReport::updated_deferred(42, true),
+            0,
+            "subscription updated_deferred nodes=42 cleanup_pending=true\n",
+            "",
+        ),
+        (
+            SubscriptionRefreshReport::unchanged(43, false),
+            0,
+            "subscription unchanged nodes=43 cleanup_pending=false\n",
+            "",
+        ),
+        (
+            SubscriptionRefreshReport::disabled(),
+            0,
+            "subscription disabled cleanup_pending=false\n",
+            "",
+        ),
+        (
+            SubscriptionRefreshReport::busy(),
+            1,
+            "",
+            "fluxd: subscription busy\n",
+        ),
+    ];
+
+    for (report, expected_exit, expected_stdout, expected_stderr) in cases {
+        let source = StaticKernelReleaseSource::new("5.10.0");
+        let client = RecordingDaemonClient::with_subscription_result(Ok(report));
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let exit = run_cli_with_daemon(
+            ["fluxd", "subscription", "update"],
+            &source,
+            &client,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(exit, expected_exit);
+        assert_eq!(
+            String::from_utf8(stdout).expect("UTF-8 output"),
+            expected_stdout
+        );
+        assert_eq!(
+            String::from_utf8(stderr).expect("UTF-8 error"),
+            expected_stderr
+        );
+        assert_eq!(client.subscription_updates(), 1);
+    }
+}
+
+#[test]
+fn subscription_update_reports_typed_rejection_and_usage_errors() {
+    let source = StaticKernelReleaseSource::new("5.10.0");
+    let client =
+        RecordingDaemonClient::with_subscription_result(Err(ControlError::request_rejected(
+            "subscription_source_changed",
+            "subscription inputs changed during refresh",
+        )));
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    let exit = run_cli_with_daemon(
+        ["fluxd", "subscription", "update"],
+        &source,
+        &client,
+        &mut stdout,
+        &mut stderr,
+    );
+
+    assert_eq!(exit, 1);
+    assert!(stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(stderr).expect("UTF-8 error"),
+        concat!(
+            "fluxd: subscription update failed: control request rejected ",
+            "(subscription_source_changed): subscription inputs changed during refresh\n"
+        )
+    );
+    assert_eq!(client.subscription_updates(), 1);
+
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let exit = run_cli_with_daemon(
+        ["fluxd", "subscription", "refresh"],
+        &source,
+        &client,
+        &mut stdout,
+        &mut stderr,
+    );
+    assert_eq!(exit, 2);
+    assert!(stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(stderr).expect("UTF-8 usage error"),
+        "fluxd: unknown subscription action 'refresh'\n"
+    );
+    assert_eq!(client.subscription_updates(), 1);
 }
 
 #[test]
@@ -266,9 +376,105 @@ fn text_status_reports_the_capability_profile_evidence() {
     assert_eq!(source.calls(), 0);
 }
 
+#[test]
+fn bounded_log_cli_uses_a_fixed_stream_and_rejects_arbitrary_paths() {
+    let source = StaticKernelReleaseSource::new("5.10.0");
+    let client = RecordingDaemonClient::default();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    let exit = run_cli_with_daemon(
+        ["fluxd", "logs", "engine", "--lines", "2"],
+        &source,
+        &client,
+        &mut stdout,
+        &mut stderr,
+    );
+
+    assert_eq!(exit, 0);
+    assert_eq!(
+        String::from_utf8(stdout).expect("UTF-8 log"),
+        "first\nsecond\n"
+    );
+    assert!(stderr.is_empty());
+    assert_eq!(client.log_requests(), vec![(LogStream::Engine, 2)]);
+
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let exit = run_cli_with_daemon(
+        ["fluxd", "logs", "/data/local/tmp/secret"],
+        &source,
+        &client,
+        &mut stdout,
+        &mut stderr,
+    );
+    assert_eq!(exit, 2);
+    assert!(stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(stderr).expect("UTF-8 usage error"),
+        "fluxd: unknown logs option '/data/local/tmp/secret'\n"
+    );
+    assert_eq!(client.log_requests(), vec![(LogStream::Engine, 2)]);
+}
+
+#[test]
+fn diagnostics_combine_authoritative_status_with_bounded_checks() {
+    let source = StaticKernelReleaseSource::new("5.10.0");
+    let client = RecordingDaemonClient::default();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    let exit = run_cli_with_daemon(
+        ["fluxd", "diagnose", "--json"],
+        &source,
+        &client,
+        &mut stdout,
+        &mut stderr,
+    );
+
+    assert_eq!(exit, 0);
+    assert!(stderr.is_empty());
+    let document: serde_json::Value = serde_json::from_slice(&stdout).expect("diagnostic JSON");
+    assert_eq!(document["status"]["daemon"], "running");
+    assert_eq!(document["status"]["runtime"]["generation"], 19);
+    assert_eq!(document["diagnostics"]["desired_state"]["state"], "ready");
+    assert_eq!(client.diagnoses(), 1);
+    assert_eq!(source.calls(), 0);
+}
+
+#[test]
+fn explain_aliases_return_the_same_non_authorizing_rust_plan() {
+    let source = StaticKernelReleaseSource::new("5.10.0");
+    for arguments in [
+        vec!["fluxd", "backend", "explain"],
+        vec!["fluxd", "plan", "--dry-run"],
+        vec!["fluxd", "rules-preview"],
+        vec!["fluxd", "preview"],
+    ] {
+        let client = RecordingDaemonClient::default();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let exit = run_cli_with_daemon(arguments, &source, &client, &mut stdout, &mut stderr);
+
+        assert_eq!(exit, 0);
+        assert!(stderr.is_empty());
+        let output = String::from_utf8(stdout).expect("UTF-8 explanation");
+        assert!(output.starts_with("authorization: non_authorizing\n"));
+        assert!(output.contains("backend: xtables\n"));
+        assert!(output.contains("bridge compatible: true"));
+        assert_eq!(client.explanations(), 1);
+    }
+}
+
 struct RecordingDaemonClient {
     pings: Mutex<usize>,
     events: Mutex<Vec<(String, String, String)>>,
+    subscription_updates: Mutex<usize>,
+    subscription_result: Mutex<Result<SubscriptionRefreshReport, ControlError>>,
+    log_requests: Mutex<Vec<(LogStream, u16)>>,
+    diagnoses: Mutex<usize>,
+    explanations: Mutex<usize>,
     profile: CapabilityProfile,
     unsupported_events: bool,
 }
@@ -284,8 +490,20 @@ impl RecordingDaemonClient {
         Self {
             pings: Mutex::new(0),
             events: Mutex::new(Vec::new()),
+            subscription_updates: Mutex::new(0),
+            subscription_result: Mutex::new(Ok(SubscriptionRefreshReport::disabled())),
+            log_requests: Mutex::new(Vec::new()),
+            diagnoses: Mutex::new(0),
+            explanations: Mutex::new(0),
             profile,
             unsupported_events: false,
+        }
+    }
+
+    fn with_subscription_result(result: Result<SubscriptionRefreshReport, ControlError>) -> Self {
+        Self {
+            subscription_result: Mutex::new(result),
+            ..Self::default()
         }
     }
 
@@ -302,6 +520,25 @@ impl RecordingDaemonClient {
 
     fn events(&self) -> Vec<(String, String, String)> {
         self.events.lock().expect("events lock").clone()
+    }
+
+    fn subscription_updates(&self) -> usize {
+        *self
+            .subscription_updates
+            .lock()
+            .expect("subscription updates lock")
+    }
+
+    fn log_requests(&self) -> Vec<(LogStream, u16)> {
+        self.log_requests.lock().expect("log requests lock").clone()
+    }
+
+    fn diagnoses(&self) -> usize {
+        *self.diagnoses.lock().expect("diagnoses lock")
+    }
+
+    fn explanations(&self) -> usize {
+        *self.explanations.lock().expect("explanations lock")
     }
 }
 
@@ -335,6 +572,45 @@ impl DaemonClient for RecordingDaemonClient {
         })
     }
 
+    fn update_subscription(&self) -> Result<SubscriptionRefreshReport, ControlError> {
+        let mut updates = self
+            .subscription_updates
+            .lock()
+            .expect("subscription updates lock");
+        *updates = updates.saturating_add(1);
+        self.subscription_result
+            .lock()
+            .expect("subscription result lock")
+            .clone()
+    }
+
+    fn diagnose(&self) -> Result<DiagnosticReport, ControlError> {
+        let mut calls = self.diagnoses.lock().expect("diagnoses lock");
+        *calls = calls.saturating_add(1);
+        Ok(diagnostic_report())
+    }
+
+    fn logs(&self, stream: LogStream, lines: u16) -> Result<LogReport, ControlError> {
+        self.log_requests
+            .lock()
+            .expect("log requests lock")
+            .push((stream, lines));
+        serde_json::from_value(serde_json::json!({
+            "stream": stream,
+            "content": "first\nsecond\n",
+            "line_count": 2,
+            "truncated": true,
+        }))
+        .map_err(|error| ControlError::protocol(error.to_string()))
+    }
+
+    fn explain(&self) -> Result<ExplainReport, ControlError> {
+        let mut calls = self.explanations.lock().expect("explanations lock");
+        *calls = calls.saturating_add(1);
+        serde_json::from_value(explain_value())
+            .map_err(|error| ControlError::protocol(error.to_string()))
+    }
+
     fn send_event(
         &self,
         event_type: &str,
@@ -357,6 +633,45 @@ impl DaemonClient for RecordingDaemonClient {
             revision: 19,
         })
     }
+}
+
+fn diagnostic_report() -> DiagnosticReport {
+    serde_json::from_value(serde_json::json!({
+        "desired_state": {"state": "ready", "detail": "schema=3"},
+        "engine_manifest": {"state": "ready", "detail": "generation=19"},
+        "runtime_log": {"state": "ready", "detail": "bytes=120"},
+        "daemon_log": {"state": "ready", "detail": "bytes=90"},
+        "engine_log": {"state": "missing", "detail": "file is absent"},
+    }))
+    .expect("diagnostic fixture")
+}
+
+fn explain_value() -> serde_json::Value {
+    serde_json::json!({
+        "desired_state_schema": 3,
+        "backend": "xtables",
+        "listener_port": 9898,
+        "address_families": "dual_stack",
+        "local_output": true,
+        "forwarded_ingress": true,
+        "tcp": true,
+        "udp": true,
+        "application_mode": "all",
+        "application_packages": 0,
+        "configured_bypass_prefixes": 0,
+        "excluded_interfaces": 1,
+        "forwarded_proxy_interfaces": 2,
+        "local_bypass_interfaces": 0,
+        "subscription_enabled": false,
+        "respect_android_vpn": false,
+        "require_functional_canary": false,
+        "engine_config_schema": 1,
+        "engine_config_digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "engine_config_bytes": 4096,
+        "bridge_compatible": true,
+        "bridge_detail": "representable by the fenced bridge",
+        "non_authorizing": true,
+    })
 }
 
 fn observed_runtime() -> RuntimeSnapshot {

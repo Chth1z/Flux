@@ -40,26 +40,22 @@ fn control_commands_map_to_legacy_intents_and_wait_for_completion() {
     ];
 
     for (command, expected) in cases {
-        let source = StaticKernelReleaseSource::new("5.10.0-android12");
-        let client = RecordingControlClient::default();
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
+        for arguments in [vec!["fluxd", "control", command], vec!["fluxd", command]] {
+            let source = StaticKernelReleaseSource::new("5.10.0-android12");
+            let client = RecordingControlClient::default();
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
 
-        let exit = run_cli_with_control(
-            ["fluxd", "control", command],
-            &source,
-            &client,
-            &mut stdout,
-            &mut stderr,
-        );
+            let exit = run_cli_with_control(arguments, &source, &client, &mut stdout, &mut stderr);
 
-        assert_eq!(exit, 0, "command {command}");
-        assert!(stderr.is_empty(), "command {command}");
-        assert_eq!(
-            String::from_utf8(stdout).expect("UTF-8 output"),
-            "completed revision 41\n"
-        );
-        assert_eq!(client.intents(), vec![expected]);
+            assert_eq!(exit, 0, "command {command}");
+            assert!(stderr.is_empty(), "command {command}");
+            assert_eq!(
+                String::from_utf8(stdout).expect("UTF-8 output"),
+                "completed revision 41\n"
+            );
+            assert_eq!(client.intents(), vec![expected]);
+        }
     }
 }
 

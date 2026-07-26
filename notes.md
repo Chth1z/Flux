@@ -1584,3 +1584,19 @@ It does not yet validate the production Rust composition because that compositio
   populate the positive reviewed catalog or construct `AndroidMarkPlanningAuthority`. Q2.2 must
   independently authenticate the observed platform artifacts to reviewed source and resolve the
   catalog's current executing-binary self-hash cycle.
+
+## Physical ARM64 Q2.2 Artifact Authentication (2026-07-27)
+
+- Exact SHA-256/size observations bind the loaded SELinux policy, `/system/bin/netd`, and active
+  Connectivity APEX to the current runtime, but they are not an authenticated source manifest.
+- The netd Build ID is derived from linked output, and Connectivity's APEX version is injected by
+  the release build. Neither identifies one source commit; the same incoming-mark mask and chain
+  shape occur across multiple AOSP releases.
+- The 27-source primary review found bounded behavior compatibility with the post-2023 AOSP netd
+  family, not exact provenance for `AndroidNetdSourceProfile::AospNetd20250324`. The observed
+  unlocked/orange Verified Boot state cannot upgrade on-device hashes to an OEM attestation.
+- Production therefore retains an empty reviewed-policy catalog and generic zero grant. Q2.3 can
+  add read-only diagnostic evidence, but Q2.4 authority and R4-R6 require either producer-signed
+  source mapping/reproducibility or an explicitly redesigned and reviewed security contract.
+- The review used only previously sanitized evidence. It accessed no device and required no device
+  cleanup.

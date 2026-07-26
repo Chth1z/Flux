@@ -1017,8 +1017,9 @@ impl Error for DeviceIdentityError {}
 
 /// Stable catalog key derived from an exact device identity.
 ///
-/// Boot state and network namespace are deliberately excluded: they freshness-bind a selected
-/// assertion but are not compile-time catalog keys.
+/// Boot state, network namespace, and executing-tool artifacts are deliberately excluded. They
+/// freshness-bind selected evidence, but an executable cannot contain its own full-file digest as
+/// a compile-time catalog key without creating a self-referential build.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ReviewedPolicySelector {
     android_product: AndroidProductIdentity,
@@ -1029,7 +1030,6 @@ pub struct ReviewedPolicySelector {
     selinux_policy: SelinuxPolicyIdentity,
     netd: ArtifactIdentity,
     connectivity: ArtifactIdentity,
-    tools: BTreeMap<ToolId, ArtifactIdentity>,
 }
 
 impl ReviewedPolicySelector {
@@ -1043,18 +1043,8 @@ impl ReviewedPolicySelector {
         selinux_policy: SelinuxPolicyIdentity,
         netd: ArtifactIdentity,
         connectivity: ArtifactIdentity,
-        tools: BTreeMap<ToolId, ArtifactIdentity>,
-    ) -> Result<Self, DeviceIdentityError> {
-        if tools.is_empty() {
-            return Err(DeviceIdentityError::NoTools);
-        }
-        if tools.len() > MAX_DEVICE_TOOL_IDENTITIES {
-            return Err(DeviceIdentityError::TooManyTools {
-                maximum: MAX_DEVICE_TOOL_IDENTITIES,
-                required_at_least: MAX_DEVICE_TOOL_IDENTITIES + 1,
-            });
-        }
-        Ok(Self {
+    ) -> Self {
+        Self {
             android_product,
             android_build,
             vendor_build,
@@ -1063,8 +1053,7 @@ impl ReviewedPolicySelector {
             selinux_policy,
             netd,
             connectivity,
-            tools,
-        })
+        }
     }
 
     #[must_use]
@@ -1078,7 +1067,6 @@ impl ReviewedPolicySelector {
             selinux_policy: identity.selinux_policy,
             netd: identity.netd,
             connectivity: identity.connectivity,
-            tools: identity.tools.clone(),
         }
     }
 
@@ -1120,11 +1108,6 @@ impl ReviewedPolicySelector {
     #[must_use]
     pub const fn connectivity(&self) -> ArtifactIdentity {
         self.connectivity
-    }
-
-    #[must_use]
-    pub const fn tools(&self) -> &BTreeMap<ToolId, ArtifactIdentity> {
-        &self.tools
     }
 }
 

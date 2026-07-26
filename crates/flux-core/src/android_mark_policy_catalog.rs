@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 
@@ -8,12 +7,12 @@ use crate::android_mark_authority::{
     AndroidMarkDevicePolicyName, AndroidMarkDevicePolicyRevision, FwmarkPlaneSet,
     ReviewedPolicyCatalogEntryId,
 };
+use crate::android_netd::AndroidNetdSourceProfile;
 use crate::android_tproxy_topology::AndroidTproxyTopologyScopeReport;
 use crate::capability::{
     AndroidBuildIdentity, AndroidProductIdentity, ArtifactIdentity, CapabilityProfile,
-    KernelBuildIdentity, MAX_DEVICE_TOOL_IDENTITIES, NetworkNamespaceIdentity, ObservationKind,
-    ReviewedPolicySelector, SecurityPatchLevel, SelinuxPolicyIdentity, Sha256Digest, ToolId,
-    VendorBuildIdentity,
+    KernelBuildIdentity, NetworkNamespaceIdentity, ObservationKind, ReviewedPolicySelector,
+    SecurityPatchLevel, SelinuxPolicyIdentity, Sha256Digest, VendorBuildIdentity,
 };
 use crate::fwmark_audit::FwmarkCandidate;
 
@@ -26,36 +25,69 @@ pub const MAX_REVIEWED_ANDROID_MARK_POLICY_CATALOG_ENTRIES: usize = 64;
 /// exact selector fact plus the cooperative policy digest, revision, candidate, and plane set.
 const REVIEWED_ANDROID_MARK_POLICY_CATALOG: &[ReviewedAndroidMarkPolicyCatalogEntry] = &[];
 
-/// Result of exact selection against the compiled Android mark-policy catalog.
+/// First-stage exact selection against the compiled Android mark-policy catalog.
 ///
-/// No match retains the explicit generic-AOSP zero-grant policy. A matched policy contains the
-/// exact catalog entry ID in its policy identity, so later census and authorization bindings retain
-/// catalog provenance.
+/// A match exposes only the reviewed netd source profile needed to classify RPDB/topology. The
+/// selection must then be consumed by [`Self::bind_topology`] before a positive policy exists. No
+/// match binds to the explicit generic-AOSP zero-grant policy.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReviewedAndroidMarkPolicySelection {
-    policy: AndroidMarkDevicePolicy,
+    matched: Option<MatchedReviewedAndroidMarkPolicy>,
 }
 
 impl ReviewedAndroidMarkPolicySelection {
     #[must_use]
-    pub const fn policy(&self) -> &AndroidMarkDevicePolicy {
-        &self.policy
-    }
-
-    #[must_use]
     pub fn catalog_entry(&self) -> Option<&ReviewedPolicyCatalogEntryId> {
-        self.policy.identity().catalog_entry()
+        self.matched.as_ref().map(|matched| &matched.catalog_entry)
     }
 
     #[must_use]
     pub fn is_match(&self) -> bool {
-        self.catalog_entry().is_some()
+        self.matched.is_some()
     }
 
     #[must_use]
-    pub fn into_policy(self) -> AndroidMarkDevicePolicy {
-        self.policy
+    pub fn netd_source_profile(&self) -> Option<AndroidNetdSourceProfile> {
+        self.matched
+            .as_ref()
+            .map(|matched| matched.netd_source_profile)
     }
+
+    /// Consumes the selection and binds topology classified with the selected netd profile.
+    pub fn bind_topology(
+        self,
+        topology_scope: &AndroidTproxyTopologyScopeReport,
+    ) -> Result<AndroidMarkDevicePolicy, ReviewedAndroidMarkPolicyCatalogError> {
+        let Some(matched) = self.matched else {
+            return Ok(AndroidMarkDevicePolicy::generic_aosp());
+        };
+        AndroidMarkDevicePolicy::device_qualified_cooperative(
+            matched.catalog_entry,
+            matched.policy_name,
+            matched.policy_revision,
+            matched.policy_artifact_digest,
+            matched.candidate,
+            matched.netd_source_profile,
+            topology_scope,
+            &matched.capability_profile,
+            matched.network_namespace,
+            matched.planes,
+        )
+        .map_err(ReviewedAndroidMarkPolicyCatalogError::PolicyConstruction)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MatchedReviewedAndroidMarkPolicy {
+    catalog_entry: ReviewedPolicyCatalogEntryId,
+    policy_name: AndroidMarkDevicePolicyName,
+    policy_revision: AndroidMarkDevicePolicyRevision,
+    policy_artifact_digest: AndroidMarkDevicePolicyArtifactDigest,
+    candidate: FwmarkCandidate,
+    netd_source_profile: AndroidNetdSourceProfile,
+    capability_profile: CapabilityProfile,
+    network_namespace: NetworkNamespaceIdentity,
+    planes: FwmarkPlaneSet,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -69,7 +101,6 @@ pub enum ReviewedAndroidMarkPolicyCatalogField {
     SelinuxPolicy,
     Netd,
     Connectivity,
-    Tools,
     PolicyName,
     PolicyRevision,
     PolicyArtifactDigest,
@@ -166,7 +197,7 @@ impl Error for ReviewedAndroidMarkPolicyCatalogError {
     }
 }
 
-/// Selects one exact source-reviewed Android mark policy from the compiled catalog.
+/// Selects one exact source-reviewed Android platform profile from the compiled catalog.
 ///
 /// The current production catalog is empty, so a verified device receives the explicit generic-
 /// AOSP zero grant. Runtime manifests, WSA observations, and caller-supplied catalog entries are not
@@ -180,13 +211,11 @@ impl Error for ReviewedAndroidMarkPolicyCatalogError {
 /// let _ = AndroidMarkDevicePolicy::device_qualified_cooperative;
 /// ```
 pub fn select_reviewed_android_mark_policy(
-    topology_scope: &AndroidTproxyTopologyScopeReport,
     capability_profile: &CapabilityProfile,
     network_namespace: NetworkNamespaceIdentity,
 ) -> Result<ReviewedAndroidMarkPolicySelection, ReviewedAndroidMarkPolicyCatalogError> {
     select_from_catalog(
         REVIEWED_ANDROID_MARK_POLICY_CATALOG,
-        topology_scope,
         capability_profile,
         network_namespace,
     )
@@ -194,7 +223,6 @@ pub fn select_reviewed_android_mark_policy(
 
 fn select_from_catalog(
     entries: &[ReviewedAndroidMarkPolicyCatalogEntry],
-    topology_scope: &AndroidTproxyTopologyScopeReport,
     capability_profile: &CapabilityProfile,
     network_namespace: NetworkNamespaceIdentity,
 ) -> Result<ReviewedAndroidMarkPolicySelection, ReviewedAndroidMarkPolicyCatalogError> {
@@ -225,24 +253,22 @@ fn select_from_catalog(
         .into_iter()
         .find(|entry| entry.selector == selector)
     else {
-        return Ok(ReviewedAndroidMarkPolicySelection {
-            policy: AndroidMarkDevicePolicy::generic_aosp(),
-        });
+        return Ok(ReviewedAndroidMarkPolicySelection { matched: None });
     };
 
-    let policy = AndroidMarkDevicePolicy::device_qualified_cooperative(
-        validated.catalog_entry,
-        validated.policy_name,
-        validated.policy_revision,
-        validated.policy_artifact_digest,
-        validated.candidate,
-        topology_scope,
-        capability_profile,
-        network_namespace,
-        validated.planes,
-    )
-    .map_err(ReviewedAndroidMarkPolicyCatalogError::PolicyConstruction)?;
-    Ok(ReviewedAndroidMarkPolicySelection { policy })
+    Ok(ReviewedAndroidMarkPolicySelection {
+        matched: Some(MatchedReviewedAndroidMarkPolicy {
+            catalog_entry: validated.catalog_entry,
+            policy_name: validated.policy_name,
+            policy_revision: validated.policy_revision,
+            policy_artifact_digest: validated.policy_artifact_digest,
+            candidate: validated.candidate,
+            netd_source_profile: validated.netd_source_profile,
+            capability_profile: capability_profile.clone(),
+            network_namespace,
+            planes: validated.planes,
+        }),
+    })
 }
 
 fn validate_catalog(
@@ -312,6 +338,7 @@ fn validate_entry(
         policy_revision,
         policy_artifact_digest,
         candidate,
+        netd_source_profile: entry.netd_source_profile,
         planes,
     })
 }
@@ -338,23 +365,7 @@ fn validate_selector(
         .map_err(|_| invalid(ReviewedAndroidMarkPolicyCatalogField::Netd))?;
     let connectivity = validate_artifact(selector.connectivity)
         .map_err(|_| invalid(ReviewedAndroidMarkPolicyCatalogField::Connectivity))?;
-    if selector.tools.is_empty() || selector.tools.len() > MAX_DEVICE_TOOL_IDENTITIES {
-        return Err(invalid(ReviewedAndroidMarkPolicyCatalogField::Tools));
-    }
-    let mut tools = BTreeMap::new();
-    let mut previous = None;
-    for literal in selector.tools {
-        let tool = ToolId::new(literal.id)
-            .map_err(|_| invalid(ReviewedAndroidMarkPolicyCatalogField::Tools))?;
-        let artifact = validate_artifact(literal.artifact)
-            .map_err(|_| invalid(ReviewedAndroidMarkPolicyCatalogField::Tools))?;
-        if previous.as_ref().is_some_and(|previous| previous >= &tool) {
-            return Err(invalid(ReviewedAndroidMarkPolicyCatalogField::Tools));
-        }
-        previous = Some(tool.clone());
-        tools.insert(tool, artifact);
-    }
-    ReviewedPolicySelector::from_exact_parts(
+    Ok(ReviewedPolicySelector::from_exact_parts(
         android_product,
         android_build,
         vendor_build,
@@ -363,9 +374,7 @@ fn validate_selector(
         selinux_policy,
         netd,
         connectivity,
-        tools,
-    )
-    .map_err(|_| invalid(ReviewedAndroidMarkPolicyCatalogField::Tools))
+    ))
 }
 
 fn validate_artifact(literal: ReviewedArtifactLiteral) -> Result<ArtifactIdentity, ()> {
@@ -381,6 +390,7 @@ struct ValidatedCatalogEntry {
     policy_revision: AndroidMarkDevicePolicyRevision,
     policy_artifact_digest: AndroidMarkDevicePolicyArtifactDigest,
     candidate: FwmarkCandidate,
+    netd_source_profile: AndroidNetdSourceProfile,
     planes: FwmarkPlaneSet,
 }
 
@@ -388,12 +398,6 @@ struct ValidatedCatalogEntry {
 struct ReviewedArtifactLiteral {
     digest: [u8; 32],
     size: u64,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ReviewedToolArtifactLiteral {
-    id: &'static str,
-    artifact: ReviewedArtifactLiteral,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -406,7 +410,6 @@ struct ReviewedPolicySelectorLiteral {
     selinux_policy: ReviewedArtifactLiteral,
     netd: ReviewedArtifactLiteral,
     connectivity: ReviewedArtifactLiteral,
-    tools: &'static [ReviewedToolArtifactLiteral],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -416,6 +419,7 @@ struct ReviewedAndroidMarkPolicyCatalogEntry {
     policy_name: &'static str,
     policy_revision: u64,
     policy_artifact_digest: [u8; 32],
+    netd_source_profile: AndroidNetdSourceProfile,
     candidate_mask: u32,
     proxy_value: u32,
     bypass_value: u32,

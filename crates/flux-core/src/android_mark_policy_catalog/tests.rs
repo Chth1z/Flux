@@ -9,7 +9,7 @@ use crate::android_tproxy_topology::{
 use crate::capability::{
     BootIdentity, CapabilityProfileRevision, DeviceIdentity, KernelFacts, KernelRelease,
     LegacyAddressSynchronization, LegacyArtifactReadiness, LegacyArtifactResolution,
-    LegacyBridgeFacts, LegacyMutationWriter, LegacyRuleBackend, Observation, SelinuxMode,
+    LegacyBridgeFacts, LegacyMutationWriter, LegacyRuleBackend, Observation, SelinuxMode, ToolId,
     VerifiedBootIdentity, VerifiedBootState,
 };
 use crate::network_inventory::{
@@ -30,18 +30,6 @@ const CANDIDATE_MASK: u32 = 0x0300_0000;
 const PROXY_VALUE: u32 = 0x0100_0000;
 const BYPASS_VALUE: u32 = 0x0200_0000;
 
-const FLUXD_TOOL: &[ReviewedToolArtifactLiteral] = &[ReviewedToolArtifactLiteral {
-    id: "fluxd",
-    artifact: artifact_literal(0x24, 32_768),
-}];
-const CHANGED_TOOL_ID: &[ReviewedToolArtifactLiteral] = &[ReviewedToolArtifactLiteral {
-    id: "fluxd-v2",
-    artifact: artifact_literal(0x24, 32_768),
-}];
-const CHANGED_TOOL_ARTIFACT: &[ReviewedToolArtifactLiteral] = &[ReviewedToolArtifactLiteral {
-    id: "fluxd",
-    artifact: artifact_literal(0x25, 32_768),
-}];
 const SELECTOR: ReviewedPolicySelectorLiteral = ReviewedPolicySelectorLiteral {
     android_product: "google/redfin/redfin",
     android_build: "google/redfin/redfin:13/TQ3A.230805.001/1:user/release-keys",
@@ -51,7 +39,6 @@ const SELECTOR: ReviewedPolicySelectorLiteral = ReviewedPolicySelectorLiteral {
     selinux_policy: artifact_literal(0x21, 4_096),
     netd: artifact_literal(0x22, 8_192),
     connectivity: artifact_literal(0x23, 16_384),
-    tools: FLUXD_TOOL,
 };
 const ENTRY: ReviewedAndroidMarkPolicyCatalogEntry = ReviewedAndroidMarkPolicyCatalogEntry {
     id: "google-redfin-tq3a-20230805-v1",
@@ -59,6 +46,7 @@ const ENTRY: ReviewedAndroidMarkPolicyCatalogEntry = ReviewedAndroidMarkPolicyCa
     policy_name: "synthetic cooperative policy",
     policy_revision: 1,
     policy_artifact_digest: [0x31; 32],
+    netd_source_profile: AndroidNetdSourceProfile::AospAndroid13R1,
     candidate_mask: CANDIDATE_MASK,
     proxy_value: PROXY_VALUE,
     bypass_value: BYPASS_VALUE,
@@ -71,15 +59,16 @@ fn empty_production_catalog_returns_explicit_zero_grant() {
     let profile = capability_profile(namespace);
     let topology = topology_scope();
 
-    let selection = select_reviewed_android_mark_policy(&topology, &profile, namespace)
+    let selection = select_reviewed_android_mark_policy(&profile, namespace)
         .expect("empty compiled catalog is valid");
 
     assert!(!selection.is_match());
     assert!(selection.catalog_entry().is_none());
-    assert_eq!(
-        selection.policy().grant_kind(),
-        AndroidMarkDeviceGrantKind::NoGrant
-    );
+    assert!(selection.netd_source_profile().is_none());
+    let policy = selection
+        .bind_topology(&topology)
+        .expect("zero grant binds without positive topology authority");
+    assert_eq!(policy.grant_kind(), AndroidMarkDeviceGrantKind::NoGrant);
 }
 
 #[test]
@@ -88,21 +77,31 @@ fn exact_entry_selects_positive_policy_and_retains_catalog_provenance() {
     let profile = capability_profile(namespace);
     let topology = topology_scope();
 
-    let selection =
-        select_from_catalog(&[ENTRY], &topology, &profile, namespace).expect("exact match");
-    let policy = selection.policy();
-    let grant = policy.positive_grant().expect("matched positive policy");
+    let selection = select_from_catalog(&[ENTRY], &profile, namespace).expect("exact match");
 
     assert!(selection.is_match());
+    assert_eq!(
+        selection.netd_source_profile(),
+        Some(AndroidNetdSourceProfile::AospAndroid13R1)
+    );
     assert_eq!(
         selection
             .catalog_entry()
             .map(ReviewedPolicyCatalogEntryId::as_str),
         Some("google-redfin-tq3a-20230805-v1")
     );
+    let policy = selection
+        .bind_topology(&topology)
+        .expect("selected profile binds matching topology");
+    let grant = policy.positive_grant().expect("matched positive policy");
+
     assert_eq!(policy.grant_kind(), AndroidMarkDeviceGrantKind::Positive);
     assert_eq!(policy.revision().get(), 1);
     assert_eq!(grant.candidate().mask(), CANDIDATE_MASK);
+    assert_eq!(
+        grant.netd_source_profile(),
+        AndroidNetdSourceProfile::AospAndroid13R1
+    );
     assert_eq!(grant.planes(), FwmarkPlaneSet::ALL);
     assert_eq!(grant.capability_profile(), &profile);
     assert_eq!(grant.network_namespace(), namespace);
@@ -117,10 +116,59 @@ fn exact_entry_selects_positive_policy_and_retains_catalog_provenance() {
 }
 
 #[test]
+fn runtime_tool_identity_binds_the_grant_without_becoming_a_self_hash_selector() {
+    let namespace = namespace(4, 40);
+    let first = capability_profile_with_tool(namespace, 0x24);
+    let changed = capability_profile_with_tool(namespace, 0x25);
+    let first_identity = first.device_identity().verified().expect("first identity");
+    let changed_identity = changed
+        .device_identity()
+        .verified()
+        .expect("changed identity");
+
+    assert_ne!(first, changed);
+    assert_eq!(
+        ReviewedPolicySelector::from_device_identity(first_identity),
+        ReviewedPolicySelector::from_device_identity(changed_identity),
+        "the compile-time selector cannot contain the executing ELF's self-referential digest"
+    );
+
+    let selection = select_from_catalog(&[ENTRY], &changed, namespace).expect("platform match");
+    let policy = selection
+        .bind_topology(&topology_scope())
+        .expect("matching topology");
+    assert_eq!(
+        policy
+            .positive_grant()
+            .expect("positive grant")
+            .capability_profile(),
+        &changed,
+        "the exact executing-tool artifact remains freshness-bound after selection"
+    );
+}
+
+#[test]
+fn selected_netd_profile_must_build_the_bound_topology() {
+    let namespace = namespace(4, 40);
+    let selection =
+        select_from_catalog(&[ENTRY], &capability_profile(namespace), namespace).expect("match");
+    let topology = topology_scope_for(AndroidNetdSourceProfile::AospNetd20250324);
+
+    assert_eq!(
+        selection.bind_topology(&topology),
+        Err(ReviewedAndroidMarkPolicyCatalogError::PolicyConstruction(
+            AndroidMarkDevicePolicyError::NetdSourceProfileMismatch {
+                selected: AndroidNetdSourceProfile::AospAndroid13R1,
+                topology: AndroidNetdSourceProfile::AospNetd20250324,
+            }
+        ))
+    );
+}
+
+#[test]
 fn every_stable_selector_fact_drift_returns_zero_grant() {
     let namespace = namespace(4, 40);
     let profile = capability_profile(namespace);
-    let topology = topology_scope();
     let changed_selectors = [
         ReviewedPolicySelectorLiteral {
             android_product: "google/redfin/other",
@@ -154,26 +202,18 @@ fn every_stable_selector_fact_drift_returns_zero_grant() {
             connectivity: artifact_literal(0x43, 16_384),
             ..SELECTOR
         },
-        ReviewedPolicySelectorLiteral {
-            tools: CHANGED_TOOL_ID,
-            ..SELECTOR
-        },
-        ReviewedPolicySelectorLiteral {
-            tools: CHANGED_TOOL_ARTIFACT,
-            ..SELECTOR
-        },
     ];
 
     for selector in changed_selectors {
         let changed = ReviewedAndroidMarkPolicyCatalogEntry { selector, ..ENTRY };
-        let selection = select_from_catalog(&[changed], &topology, &profile, namespace)
+        let selection = select_from_catalog(&[changed], &profile, namespace)
             .expect("valid nonmatching catalog");
 
         assert!(!selection.is_match());
-        assert_eq!(
-            selection.policy().grant_kind(),
-            AndroidMarkDeviceGrantKind::NoGrant
-        );
+        let policy = selection
+            .bind_topology(&topology_scope())
+            .expect("nonmatch remains a zero grant");
+        assert_eq!(policy.grant_kind(), AndroidMarkDeviceGrantKind::NoGrant);
     }
 }
 
@@ -218,32 +258,7 @@ fn duplicate_ids_selectors_and_oversized_catalogs_fail_closed() {
 }
 
 #[test]
-fn malformed_tools_candidate_and_planes_fail_closed() {
-    const UNSORTED_TOOLS: &[ReviewedToolArtifactLiteral] = &[
-        ReviewedToolArtifactLiteral {
-            id: "z-tool",
-            artifact: artifact_literal(0x41, 1),
-        },
-        ReviewedToolArtifactLiteral {
-            id: "a-tool",
-            artifact: artifact_literal(0x42, 1),
-        },
-    ];
-    let unsorted_tools = ReviewedAndroidMarkPolicyCatalogEntry {
-        selector: ReviewedPolicySelectorLiteral {
-            tools: UNSORTED_TOOLS,
-            ..SELECTOR
-        },
-        ..ENTRY
-    };
-    assert_eq!(
-        validate_catalog(&[unsorted_tools]),
-        Err(ReviewedAndroidMarkPolicyCatalogError::InvalidEntry {
-            index: 0,
-            field: ReviewedAndroidMarkPolicyCatalogField::Tools,
-        })
-    );
-
+fn malformed_candidate_and_planes_fail_closed() {
     let ineligible_candidate = ReviewedAndroidMarkPolicyCatalogEntry {
         candidate_mask: 0xc000_0000,
         proxy_value: 0x8000_0000,
@@ -284,7 +299,6 @@ fn malformed_tools_candidate_and_planes_fail_closed() {
 fn malformed_unrelated_entry_poisoning_is_rejected_before_exact_selection() {
     let namespace = namespace(4, 40);
     let profile = capability_profile(namespace);
-    let topology = topology_scope();
     let malformed_unrelated = ReviewedAndroidMarkPolicyCatalogEntry {
         id: "unrelated-invalid-entry",
         selector: ReviewedPolicySelectorLiteral {
@@ -296,12 +310,7 @@ fn malformed_unrelated_entry_poisoning_is_rejected_before_exact_selection() {
     };
 
     assert_eq!(
-        select_from_catalog(
-            &[ENTRY, malformed_unrelated],
-            &topology,
-            &profile,
-            namespace,
-        ),
+        select_from_catalog(&[ENTRY, malformed_unrelated], &profile, namespace),
         Err(ReviewedAndroidMarkPolicyCatalogError::InvalidEntry {
             index: 1,
             field: ReviewedAndroidMarkPolicyCatalogField::PolicyRevision,
@@ -312,7 +321,6 @@ fn malformed_unrelated_entry_poisoning_is_rejected_before_exact_selection() {
 #[test]
 fn selection_rejects_unverified_boot_identity_and_namespace_drift() {
     let profile_namespace = namespace(4, 40);
-    let topology = topology_scope();
     let verified = capability_profile(profile_namespace);
     let unavailable_boot = CapabilityProfile::initial(
         Observation::Unavailable,
@@ -322,7 +330,7 @@ fn selection_rejects_unverified_boot_identity_and_namespace_drift() {
         verified.legacy_bridge().clone(),
     );
     assert_eq!(
-        select_from_catalog(&[ENTRY], &topology, &unavailable_boot, profile_namespace,),
+        select_from_catalog(&[ENTRY], &unavailable_boot, profile_namespace,),
         Err(
             ReviewedAndroidMarkPolicyCatalogError::UnverifiedBootIdentity {
                 observation: ObservationKind::Unavailable,
@@ -342,7 +350,7 @@ fn selection_rejects_unverified_boot_identity_and_namespace_drift() {
         ready_legacy_bridge(),
     );
     assert_eq!(
-        select_from_catalog(&[ENTRY], &topology, &unavailable, profile_namespace),
+        select_from_catalog(&[ENTRY], &unavailable, profile_namespace),
         Err(
             ReviewedAndroidMarkPolicyCatalogError::UnverifiedDeviceIdentity {
                 observation: ObservationKind::Unavailable,
@@ -353,7 +361,7 @@ fn selection_rejects_unverified_boot_identity_and_namespace_drift() {
     let profile = capability_profile(profile_namespace);
     let other_namespace = namespace(4, 41);
     assert_eq!(
-        select_from_catalog(&[ENTRY], &topology, &profile, other_namespace),
+        select_from_catalog(&[ENTRY], &profile, other_namespace),
         Err(
             ReviewedAndroidMarkPolicyCatalogError::NetworkNamespaceMismatch {
                 profile: profile_namespace,
@@ -375,6 +383,13 @@ fn namespace(device: u64, inode: u64) -> NetworkNamespaceIdentity {
 }
 
 fn capability_profile(network_namespace: NetworkNamespaceIdentity) -> CapabilityProfile {
+    capability_profile_with_tool(network_namespace, 0x24)
+}
+
+fn capability_profile_with_tool(
+    network_namespace: NetworkNamespaceIdentity,
+    tool_digest_byte: u8,
+) -> CapabilityProfile {
     CapabilityProfile::new(
         CapabilityProfileRevision::INITIAL,
         Observation::Verified(
@@ -397,7 +412,7 @@ fn capability_profile(network_namespace: NetworkNamespaceIdentity) -> Capability
                 artifact(0x23, 16_384),
                 [(
                     ToolId::new("fluxd").expect("tool ID"),
-                    artifact(0x24, 32_768),
+                    artifact(tool_digest_byte, 32_768),
                 )],
                 network_namespace,
             )
@@ -435,6 +450,10 @@ fn ready_legacy_bridge() -> LegacyBridgeFacts {
 }
 
 fn topology_scope() -> AndroidTproxyTopologyScopeReport {
+    topology_scope_for(AndroidNetdSourceProfile::AospAndroid13R1)
+}
+
+fn topology_scope_for(profile: AndroidNetdSourceProfile) -> AndroidTproxyTopologyScopeReport {
     let mut tracker = NetworkInventoryTracker::new();
     let inventory = tracker
         .publish_complete_with_routing(
@@ -450,8 +469,7 @@ fn topology_scope() -> AndroidTproxyTopologyScopeReport {
         )
         .expect("complete inventory")
         .clone();
-    let classification =
-        classify_android_rpdb(&inventory, AndroidNetdSourceProfile::AospAndroid13R1);
+    let classification = classify_android_rpdb(&inventory, profile);
     let request = AndroidTproxyTopologyScopeRequest::new(
         AndroidTproxyRoutingShape::PreMarkAddressHostSet,
         [AndroidTproxyTrafficDomainRequest::residual_local_output(

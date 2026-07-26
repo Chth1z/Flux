@@ -2041,14 +2041,24 @@ and a verified clean post-test baseline.
 - [x] Q2.1: Add and host-verify an explicit-serial ARM64 runner for the production
   `SystemCapabilityProfileSource`; bind the exact probe ELF, boot, fingerprint, namespace, SELinux,
   netd, Connectivity APEX, and reviewed selector facts, then prove its unique remote path absent.
-- [ ] Q2.2: Authenticate the observed netd and Connectivity artifacts to one reviewed source profile;
-  keep the catalog at zero grant until that independent mapping is recorded and compiled.
+- [x] Q2.2: Evaluate whether the observed netd and Connectivity artifacts authenticate one reviewed
+  source profile; the negative result keeps the catalog at zero grant.
 - [ ] Q2.3: Implement the bounded point-in-time collector for all 27 source/plane coverage cells and
   exact mark-use records, including RPDB, xtables, socket, and conntrack semantics.
 - [ ] Q2.4: Collect one coherent live inventory, classify RPDB/topology, select a collision-free
   candidate, and demonstrate one-shot `AndroidMarkPlanningAuthority` without mutation.
 - [ ] Q2.5: Record sanitized C2 evidence, revalidate the exact target, and commit the collector,
   reviewed policy, and authority checkpoints separately.
+
+### Q2.2 Execution Plan
+- [x] Q2.2a: Remove the impossible executing-ELF self-hash from the compile-time selector while
+  retaining exact tool identity in the full capability/grant/census/release evidence.
+- [x] Q2.2b: Make catalog selection precede RPDB/topology construction and carry one typed
+  `AndroidNetdSourceProfile`; reject topology classified with any other profile.
+- [x] Q2.2c: Establish from primary sources and bounded artifact inspection whether the observed
+  netd/Connectivity pair has exact source provenance or only reviewed behavior compatibility.
+- [x] Q2.2d: Reconcile ADR/specification language, run full verification, and commit the zero-grant
+  selector correction before adding any physical-device catalog entry.
 
 ### Decisions
 - Use the repository's checked-in `xtask` entry points and exact tests rather than ad hoc live
@@ -2060,6 +2070,20 @@ and a verified clean post-test baseline.
   them.
 - The existing installed Flux bridge remains live during read-only qualification. Do not stop its
   `addrsyncd` or Sing-Box processes until a reviewed Gate 1 transition owns rollback and cleanup.
+- Compile-time policy lookup uses only stable platform facts: product/build/vendor/security patch,
+  kernel build, SELinux policy, netd, and Connectivity. The complete runtime profile still includes
+  the exact executing tool and is rebound at every later evidence step. This removes an impossible
+  self-referential digest without treating a runtime manifest as authentication.
+- Catalog selection is a two-stage interface: first select the exact platform and obtain its typed
+  netd profile, then classify RPDB/topology and consume the selection to bind that exact profile.
+  No positive policy exists between those stages, and the production catalog remains empty until
+  the independent source/compatibility review and complete live evidence pass.
+- The bridge was live only at Q0 discovery. It was already stopped before the second Q2.1 run for
+  reasons not caused by the collector; preserve that stopped state and do not claim it as Gate 1
+  quiescence evidence.
+- Exact runtime hashes, the netd ELF Build ID, the Connectivity APEX version/signature, and the
+  observed rule shape do not authenticate the Samsung artifacts to one AOSP commit. Keep
+  `AndroidNetdSourceProfile::AospNetd20250324` source-pinned and the production catalog empty.
 
 ### Q0-Q1 Evidence
 - Exactly one physical target and one WSA target were connected. Explicit-serial checks bound
@@ -2092,6 +2116,18 @@ and a verified clean post-test baseline.
 - The first notes append patch targeted a sentence fragment rather than the exact current tail and
   changed no file. Re-read the bounded tail and append the sanitized Q2.1 evidence against the
   actual C1 section.
+- The first Q2.2 research dispatch combined full-history inheritance with an explicit worker type,
+  which the collaboration interface rejects. No agent started and no file changed; relaunch with
+  inherited type and the same single-document ownership.
+- Two read-only Android metadata commands lost nested quoting: `tr` attempted a write to the
+  read-only root and `stat` split its format argument. Both failed before collecting data and
+  changed no device state. Use bounded host-side parsing and ordinary `stat` output instead.
+- Direct `adb pull /system/bin/netd` was denied by the device security policy despite ordinary mode
+  bits. Stream the exact read-only artifact through root to an owner-only host temporary directory;
+  the rechecked size and SHA-256 matched Q2.1 exactly.
+- The first focused selector compile found that tests had inherited `ToolId` through a production
+  import removed by the refactor. Add the explicit test-only import; the unchanged nine-test
+  catalog target then passed.
 
 ### Q2.1 Evidence
 - The dedicated release-mode ARM64/API-31 probe is 368,704 bytes rather than the prior 118 MB test
@@ -2117,7 +2153,26 @@ and a verified clean post-test baseline.
 - `git diff --check`, exact serial/boot-ID scan, and bounded secret scan passed; all nine bridge
   scripts and `/data/adb/flux` remain unchanged.
 
+### Q2.2 Evidence
+- The observed netd and Connectivity files remain byte-bound by SHA-256 and size, and the incoming
+  rule shape is compatible with the reviewed post-2023 AOSP implementation family.
+- The same mask and rule structure span multiple AOSP revisions. The ELF Build ID derives from
+  linked output, and the APEX version is release-injected; neither maps the exact files to source.
+- The target is unlocked with orange Verified Boot, so on-device hashes alone are not an OEM
+  supply-chain attestation. A producer-signed artifact/source mapping or exact reproducible build is
+  still required for the existing source-authentication contract.
+- The separate source review checked 27 official Android/AOSP URLs successfully and records the
+  remaining literal `0x0/0x7fefffff` rule-value ambiguity. It accessed no device state.
+
+### Q2.2 Verification
+- Focused reviewed-policy catalog tests: 9 passed, 0 failed.
+- Full `cargo test -p flux-core` and warnings-denied `flux-core` Clippy: passed.
+- `cargo xtask ci`: exit 0, including the pinned ARM64/API-31 cross-check.
+- `git diff --check`: passed; the production catalog remains empty.
+
 ### Status
-**Q2.2 in progress** - C1 and the bounded Q2.1 collector pass on the same stable target, with exact
-cleanup. Authenticate netd/Connectivity to reviewed source and remove the catalog self-hash cycle
-before any positive policy entry; preserve `/data/adb/flux` and the stopped baseline until Gate 1.
+**Q2.2 complete with a negative authentication result** - C1 and Q2.1 pass, and the selector's
+self-hash cycle is removed, but the observed artifacts do not authenticate the pinned source
+profile. Q2.3 may continue as read-only diagnostic evidence; Q2.4 cannot mint positive planning
+authority, and R4-R6 remain blocked unless stronger provenance is obtained or the security contract
+is explicitly redesigned and reviewed. Preserve `/data/adb/flux` and the stopped baseline.

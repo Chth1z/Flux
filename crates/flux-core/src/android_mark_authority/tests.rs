@@ -1823,6 +1823,7 @@ fn cooperative_policy_with_catalog_entry(
         revision,
         AndroidMarkDevicePolicyArtifactDigest::new(digest).expect("nonzero artifact digest"),
         candidate,
+        AndroidNetdSourceProfile::AospAndroid13R1,
         topology_scope,
         capability_profile,
         network_namespace,

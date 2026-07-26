@@ -4,6 +4,7 @@ use std::num::{NonZeroU32, NonZeroU64};
 use std::ops::{BitOr, BitOrAssign};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::android_netd::AndroidNetdSourceProfile;
 use crate::android_rpdb::AndroidRpdbClassificationReport;
 use crate::android_tproxy_topology::{
     AndroidTproxyRoutingShape, AndroidTproxyTopologyScopeReport,
@@ -525,6 +526,7 @@ impl Error for AndroidMarkCandidateEligibilityError {}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AndroidMarkPositiveGrant {
     candidate: FwmarkCandidate,
+    netd_source_profile: AndroidNetdSourceProfile,
     topology_scope: AndroidTproxyTopologyScopeReport,
     capability_profile: CapabilityProfile,
     network_namespace: NetworkNamespaceIdentity,
@@ -537,6 +539,11 @@ impl AndroidMarkPositiveGrant {
     #[must_use]
     pub const fn candidate(&self) -> FwmarkCandidate {
         self.candidate
+    }
+
+    #[must_use]
+    pub const fn netd_source_profile(&self) -> AndroidNetdSourceProfile {
+        self.netd_source_profile
     }
 
     #[must_use]
@@ -624,6 +631,7 @@ impl AndroidMarkDevicePolicy {
         revision: AndroidMarkDevicePolicyRevision,
         artifact_digest: AndroidMarkDevicePolicyArtifactDigest,
         candidate: FwmarkCandidate,
+        netd_source_profile: AndroidNetdSourceProfile,
         topology_scope: &AndroidTproxyTopologyScopeReport,
         capability_profile: &CapabilityProfile,
         network_namespace: NetworkNamespaceIdentity,
@@ -633,6 +641,12 @@ impl AndroidMarkDevicePolicy {
             .map_err(AndroidMarkDevicePolicyError::IneligibleCandidate)?;
         if planes.is_empty() {
             return Err(AndroidMarkDevicePolicyError::EmptyPlaneGrant);
+        }
+        if topology_scope.profile() != netd_source_profile {
+            return Err(AndroidMarkDevicePolicyError::NetdSourceProfileMismatch {
+                selected: netd_source_profile,
+                topology: topology_scope.profile(),
+            });
         }
         if capability_profile.boot_identity().verified().is_none() {
             return Err(AndroidMarkDevicePolicyError::UnverifiedBootIdentity {
@@ -658,6 +672,7 @@ impl AndroidMarkDevicePolicy {
         );
         let positive_grant = AndroidMarkPositiveGrant {
             candidate,
+            netd_source_profile,
             topology_scope: topology_scope.clone(),
             capability_profile: capability_profile.clone(),
             network_namespace,
@@ -701,6 +716,10 @@ impl AndroidMarkDevicePolicy {
 pub enum AndroidMarkDevicePolicyError {
     IneligibleCandidate(AndroidMarkCandidateEligibilityError),
     EmptyPlaneGrant,
+    NetdSourceProfileMismatch {
+        selected: AndroidNetdSourceProfile,
+        topology: AndroidNetdSourceProfile,
+    },
     UnverifiedBootIdentity {
         observation: ObservationKind,
     },
@@ -720,6 +739,10 @@ impl fmt::Display for AndroidMarkDevicePolicyError {
             Self::EmptyPlaneGrant => {
                 formatter.write_str("device-qualified Android mark policy grants no mark plane")
             }
+            Self::NetdSourceProfileMismatch { selected, topology } => write!(
+                formatter,
+                "device-qualified Android mark policy selected netd profile {selected:?} but topology used {topology:?}"
+            ),
             Self::UnverifiedBootIdentity { observation } => write!(
                 formatter,
                 "device-qualified Android mark policy requires a verified boot identity, not {observation:?}"
@@ -745,6 +768,7 @@ impl Error for AndroidMarkDevicePolicyError {
         match self {
             Self::IneligibleCandidate(error) => Some(error),
             Self::EmptyPlaneGrant
+            | Self::NetdSourceProfileMismatch { .. }
             | Self::UnverifiedBootIdentity { .. }
             | Self::UnverifiedDeviceIdentity { .. }
             | Self::NetworkNamespaceMismatch { .. } => None,

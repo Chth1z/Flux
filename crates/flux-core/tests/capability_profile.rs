@@ -123,7 +123,7 @@ fn complete_profile_digest_distinguishes_equal_revisions() {
 }
 
 #[test]
-fn exact_device_identity_is_ordered_and_catalog_keys_exclude_runtime_bindings() {
+fn exact_device_identity_is_ordered_and_catalog_keys_exclude_runtime_and_self_hash_bindings() {
     let first = device_identity(
         NetworkNamespaceIdentity::new(10, 20).expect("namespace"),
         VerifiedBootState::Green,
@@ -134,12 +134,31 @@ fn exact_device_identity_is_ordered_and_catalog_keys_exclude_runtime_bindings() 
         VerifiedBootState::Orange,
         0x12,
     );
+    let changed_tool = base_device_identity(
+        NetworkNamespaceIdentity::new(10, 20).expect("namespace"),
+        VerifiedBootState::Green,
+        0x11,
+        [
+            (
+                ToolId::new("iptables-restore").expect("tool ID"),
+                artifact(0x25, 10),
+            ),
+            (ToolId::new("fluxd").expect("tool ID"), artifact(0x26, 9)),
+        ],
+    )
+    .expect("changed tool identity");
 
     assert_ne!(first, second);
     assert_eq!(
         ReviewedPolicySelector::from_device_identity(&first),
         ReviewedPolicySelector::from_device_identity(&second),
         "verified-boot and namespace freshness must not become literal catalog keys"
+    );
+    assert_ne!(first, changed_tool);
+    assert_eq!(
+        ReviewedPolicySelector::from_device_identity(&first),
+        ReviewedPolicySelector::from_device_identity(&changed_tool),
+        "an executable's full-file self hash cannot be embedded in its own compile-time selector"
     );
     assert_eq!(
         first.tools().keys().map(ToolId::as_str).collect::<Vec<_>>(),

@@ -12,7 +12,7 @@
 
 在本快照之后，Network Inventory 已经进入纯规划层，而不再只是未消费的只读库存。分支已经加入：版本化 Android RPDB 分类、按 Traffic Domain 聚合的拓扑可行性报告、正向设备策略约束的 mark planning authority，以及第一块 snapshot-bound RPDB fwmark census fragment。
 
-这些提交仍然刻意不产生 priority、table、mark lease 或 mutation 权限。下一顺序应是：先把精确 Android 产品/构建/vendor、kernel build、verified boot、SELinux policy、netd/Connectivity artifact、工具、boot 和 namespace 身份纳入 freshness-bound profile；再用稳定的产品/构建/kernel/policy/tool artifact 身份查询编译期审阅策略目录，并把选中的 assertion 绑定到 verified boot、boot ID 与当前 namespace；随后完成剩余 24 个 census cells 和跨来源同一时点 coordinator。运行时自带一份能哈希自身字节的 manifest 不能为自己创建设备授权。
+这些提交仍然刻意不产生 priority、table、mark lease 或 mutation 权限。下一顺序应是：先把精确 Android 产品/构建/vendor、kernel build、verified boot、SELinux policy、netd/Connectivity artifact、工具、boot 和 namespace 身份纳入 freshness-bound profile；再用稳定的平台 artifact 身份查询编译期审阅策略目录，由目录给出唯一 netd profile，并把选中的 assertion 绑定到包含执行工具、verified boot、boot ID 与当前 namespace 的完整 profile；随后完成剩余 census cells 和跨来源同一时点 coordinator。执行文件不能把自身完整哈希嵌回同一执行文件作为编译期 key，运行时 manifest 也不能为自己创建设备授权；这一修正由 ADR-0014 记录。
 
 ## 结论先行
 

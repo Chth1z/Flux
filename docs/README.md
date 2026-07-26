@@ -70,3 +70,4 @@
 - [ADR-0011: keep the rewrite pre-release until the runtime is fully Rust-owned](adr/0011-pre-release-rust-only-release-gate.md)
 - [ADR-0012: qualify local OUTPUT through loopback-reinjected PREROUTING TPROXY](adr/0012-qualify-local-output-through-loopback-tproxy.md)
 - [ADR-0013: qualify ordered Android mark overlaps without granting authority](adr/0013-qualify-ordered-android-mark-overlaps.md)
+- [ADR-0014: separate platform policy selection from runtime tool identity](adr/0014-separate-platform-policy-selection-from-runtime-tool-identity.md)

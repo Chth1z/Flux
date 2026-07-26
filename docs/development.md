@@ -27,8 +27,11 @@ The root [`rust-toolchain.toml`](../rust-toolchain.toml) installs the Rust compo
 standard library. The subscription TLS graph includes `ring`, whose Android build script compiles C
 and assembly even during `cargo check`. Android checks and release builds therefore both require the
 pinned NDK; `xtask` validates its revision and binds the API-31 compiler as Cargo's linker and the
-target-specific `cc` compiler. Because NDK r27d still defaults to 4 KiB ELF load alignment,
-`xtask` also passes both `-z max-page-size=16384` and
+target-specific `cc` compiler. On Linux/WSL, every `xtask`-owned Android Cargo child also receives
+`TMPDIR=/tmp`, preventing inherited Windows temp paths from breaking native NDK builds. Native
+Windows and macOS retain their platform temp behavior. Because NDK r27d still defaults to 4 KiB ELF
+load alignment, `xtask` also passes both
+`-z max-page-size=16384` and
 `-z common-page-size=16384` through target-specific Rust flags for every final ARM64 and x86_64
 Android link.
 
@@ -739,8 +742,9 @@ cargo xtask build-android
 ```
 
 The task validates `source.properties`, selects the API-suffixed NDK clang linker for the host OS,
-applies both NDK-r27 16 KiB page-compatibility options, and builds the `fluxd` release binary. It
-then parses the final ELF program-header table and rejects any non-empty `PT_LOAD` whose
+binds Linux/WSL builds to host temp directory `/tmp`, applies both NDK-r27 16 KiB page-compatibility
+options, and builds the `fluxd` release binary. It then parses the final ELF program-header table
+and rejects any non-empty `PT_LOAD` whose
 `p_align` is not a congruent power of two at least `2**14`. It refuses a different NDK revision
 or an under-aligned final artifact instead of silently producing an unqualified binary.
 

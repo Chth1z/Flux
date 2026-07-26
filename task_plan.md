@@ -1950,3 +1950,56 @@ checkpoint, record the exact physical-device gap, and leave every R4-R6 authorit
 **Complete on 2026-07-27** - the x86_64 WSA checkpoint passes without a caller temp override and its
 remote directory is absent after cleanup. This remains non-authorizing development evidence; the
 physical ARM64 blocker and every R4-R6 ownership boundary remain unchanged.
+
+## Execution: Android Host Build Temp Ownership (2026-07-27)
+
+### Goal
+Make every `xtask`-owned Android Cargo build independent of inherited Windows temp paths while
+preserving the pinned NDK/API/linker contract and all device-qualification boundaries.
+
+### Priorities
+- P0: Reproduce the standard ARM64 cross-check without a caller `TMPDIR` override.
+- P0: Make the shared Android Cargo environment bind Linux `/tmp`, with a focused regression.
+- P1: Reuse one host-temp constant in the ARM64 and WSA x86_64 build paths to prevent drift.
+- P2: Do not treat a successful ARM64 cross-build as runtime, C1-C3, Gate 1, or release evidence.
+
+### Phases
+- [x] T0: Reproduce and record the caller-environment dependency in `cargo xtask check-android`.
+- [x] T1: Add a red regression, implement the shared binding, and rerun the focused test.
+- [x] T2: Run the standard Android cross-check without a caller override, full focused gates, and
+  create a separate local commit.
+
+### Errors Encountered
+- A warm `cargo xtask check-android` passed because the native Android dependency graph was already
+  cached. Running the compiled `xtask` with a fresh 119 MB Cargo target forced `ring`'s assembly
+  build and reproduced NDK Clang's `unable to make temporary file: Read-only file system` failure.
+  The exact `/tmp/flux-android-check.0CNbD6` reproduction directory was then removed and its absence
+  verified.
+- The focused ARM64 environment assertion failed before implementation because `TMPDIR` was absent.
+  Moving one shared `/tmp` constant into both Android build paths made the unchanged ARM64 and WSA
+  assertions pass.
+- The first T2 rustfmt check requested only canonical wrapping for the shared import and four-entry
+  environment array. `cargo fmt --all` applied those layout changes before the unchanged full gate.
+- The first full CI PTY reached the final Clippy/Android stages without a reported failure but closed
+  before its exit status was retained. The identical cached `cargo xtask ci` rerun completed with
+  captured exit status 0; only that rerun is final gate evidence.
+- One combined final-evidence patch placed the plan context under `notes.md`, matched nothing, and
+  changed no file. Splitting the note and plan hunks against their exact tails resolved it.
+- Final diff review found that the general ARM64 linker selection supports native Windows and macOS,
+  where hard-coded `/tmp` would be invalid. Restrict the override to Linux/WSL, retain native host
+  temp behavior elsewhere, and test all three host selections before committing.
+
+### T2 Verification
+- The fresh-target ARM64 cross-check passed 119 build units in 30.88 seconds without a caller temp
+  override; both exact temporary targets were removed and verified absent.
+- Both ARM64 and x86_64 Android command-environment regressions passed against the shared constant.
+- `cargo xtask ci` passed with captured exit status 0 and no caller `TMPDIR`, including source
+  policy, rustfmt, workspace check/test/doc-tests, warnings-denied Clippy, and pinned ARM64 cross-check.
+- Final rustfmt and `git diff --check` passed. Scope review found only the intended five files, no
+  credential material, no temporary build targets, exactly nine bridge scripts, and unchanged
+  production writer, public offline-recovery, and Rust-only profile selections.
+
+### Status
+**Complete on 2026-07-27** - all `xtask` Android Cargo children own the same Linux host temp
+directory and the complete local CI gate passes without caller setup. This is host-build evidence
+only; the physical ARM64 and R4-R6 authority boundaries are unchanged.

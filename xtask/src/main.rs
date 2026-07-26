@@ -17,6 +17,7 @@ mod xtables_oracle;
 const ANDROID_TARGET: &str = "aarch64-linux-android";
 const ANDROID_API_LEVEL: &str = "31";
 const ANDROID_NDK_REVISION: &str = "27.3.13750724";
+const LINUX_ANDROID_HOST_BUILD_TMPDIR: &str = "/tmp";
 const RELEASE_MANIFEST_SCHEMA_VERSION: u32 = 3;
 const RETIRED_RUNTIME_PATHS: [&str; 2] = ["scripts/flux-event", "scripts/updater.sh"];
 const ANDROID_MIN_LOAD_ALIGNMENT: u64 = 1 << 14;
@@ -981,15 +982,23 @@ fn build_android() -> Result<(), String> {
     Ok(())
 }
 
-fn android_cargo_environment(compiler: &std::ffi::OsStr) -> [(&'static str, &std::ffi::OsStr); 3] {
-    [
+fn android_cargo_environment(compiler: &std::ffi::OsStr) -> Vec<(&'static str, &std::ffi::OsStr)> {
+    let mut environment = vec![
         ("CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER", compiler),
         ("CC_aarch64_linux_android", compiler),
         (
             ANDROID_TARGET_RUSTFLAGS_ENV,
             std::ffi::OsStr::new(ANDROID_RUSTFLAGS),
         ),
-    ]
+    ];
+    if let Some(tmpdir) = android_host_build_tmpdir(env::consts::OS) {
+        environment.push(("TMPDIR", tmpdir));
+    }
+    environment
+}
+
+fn android_host_build_tmpdir(host_os: &str) -> Option<&'static std::ffi::OsStr> {
+    (host_os == "linux").then_some(std::ffi::OsStr::new(LINUX_ANDROID_HOST_BUILD_TMPDIR))
 }
 
 fn stage_module(options: StageModuleOptions) -> Result<(), String> {
@@ -3063,6 +3072,19 @@ mod tests {
             environment.get(std::ffi::OsStr::new(ANDROID_TARGET_RUSTFLAGS_ENV)),
             Some(&Some(std::ffi::OsStr::new(ANDROID_RUSTFLAGS)))
         );
+        match android_host_build_tmpdir(env::consts::OS) {
+            Some(tmpdir) => assert_eq!(
+                environment.get(std::ffi::OsStr::new("TMPDIR")),
+                Some(&Some(tmpdir))
+            ),
+            None => assert!(!environment.contains_key(std::ffi::OsStr::new("TMPDIR"))),
+        }
+        assert_eq!(
+            android_host_build_tmpdir("linux"),
+            Some(std::ffi::OsStr::new(LINUX_ANDROID_HOST_BUILD_TMPDIR))
+        );
+        assert_eq!(android_host_build_tmpdir("windows"), None);
+        assert_eq!(android_host_build_tmpdir("macos"), None);
         assert!(ANDROID_RUSTFLAGS.contains("max-page-size=16384"));
         assert!(ANDROID_RUSTFLAGS.contains("common-page-size=16384"));
     }

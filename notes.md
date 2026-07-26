@@ -1519,3 +1519,25 @@ It does not yet validate the production Rust composition because that compositio
 - This is non-shipping x86_64 mechanism evidence only. It does not satisfy C1-C3, Gate 1, the
   Android 5.10/ARM64 release matrix, 16 KiB runtime qualification, production writer transfer,
   public offline-recovery transfer, bridge deletion, or Rust-only package promotion.
+
+## Shared Android Host Build Temp Follow-Up (2026-07-27)
+
+- The WSA fix initially covered only `android_test_build_command`; the standard ARM64
+  `android_cargo_environment` still exposed `check-android`, `build-android`, and package staging to
+  inherited Windows `TEMP`/`TMP` paths.
+- A warm `cargo xtask check-android` passed from cache. Repeating the compiled task with a fresh
+  `/tmp/flux-android-check.0CNbD6` Cargo target forced `ring`'s NDK assembly and reproduced
+  `clang: error: unable to make temporary file: Read-only file system`. The temporary 119 MB target
+  was removed afterward and absence verified.
+- The existing ARM64 build-environment test then failed red because the generated Cargo command had
+  no `TMPDIR`. One shared `LINUX_ANDROID_HOST_BUILD_TMPDIR` now supplies `/tmp` to the Linux ARM64
+  Cargo environment and the x86_64 WSA builder; native Windows/macOS keep their platform temp
+  behavior, and both focused command-environment tests pass.
+- Repeating the ARM64 check from an empty `/tmp/flux-android-check.KYRykG` target passed all 119
+  build units, including `ring`, in 30.88 seconds. The resulting 320 MB temporary target was removed
+  and absence verified.
+- The repository-defined `cargo xtask ci` then passed with no caller temp override, including source
+  policy, rustfmt, workspace checks/tests and doc tests, warnings-denied Clippy, and the pinned ARM64
+  Android cross-check.
+- This proves host cross-compilation mechanics only. No ARM64 device ran the artifact, and no C1-C3,
+  Gate 1, R4-R6, runtime page-size, coexistence, or release authority changed.

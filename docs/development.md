@@ -387,8 +387,9 @@ acceptance nor Android/Magisk-device parity. Raw fixtures alone create no render
 writer/ownership authority, prepared/active conversion, coordinator path, or activation claim;
 their role in the separate Rust differential suite does not widen that authority.
 
-The privileged Linux functional-canary harness is an independent opt-in checkpoint and is not part
-of `cargo xtask ci`:
+The privileged Linux functional-canary topology harness remains outside the portable
+`cargo xtask ci` command. The standard Linux workflow runs it separately in required mode so an
+unavailable namespace prerequisite fails CI; local execution supports both modes:
 
 ```text
 cargo xtask test-functional-canary-linux
@@ -656,8 +657,10 @@ optional mode and fail in required mode. Exact-map, namespace, or credential dri
 availability probe fails in both modes. Root/root, same-UID, broad-map, overflow-ID, inherited-
 group, and confined mapped-root fallbacks are rejected. This proves credential capability only;
 it does not install local-OUTPUT capture, run Sing-Box, construct schema-v2 evidence, or qualify
-Android. None of the four Linux commands is part of `cargo xtask ci`, and none may invoke `sudo`,
-`modprobe`, load a `.ko`, or trigger implicit module autoload. The ingress TPROXY preflight runs
+Android. None of the four Linux commands is part of the portable `cargo xtask ci` command, and none
+may invoke `sudo`, `modprobe`, load a `.ko`, or trigger implicit module autoload. The standard Linux
+workflow requires only the non-capture dual-stack topology checkpoint. The ingress, local-OUTPUT,
+and distinct-UID checkpoints remain explicit environment gates. The ingress TPROXY preflight runs
 before rule mutation and refuses to continue unless the target, mark/comment matches, family
 TPROXY support, and selected xtables backend support are already active under `/sys/module`.
 

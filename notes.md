@@ -993,3 +993,39 @@ It does not yet validate the production Rust composition because that compositio
   searches returned no matches, and the complete seven-file documentation/plan diff was reviewed.
 - B3 has exhausted the independent host/package work. C1/C2 on a rooted physical ARM64 target are
   now the exact prerequisites for target authority and the later Gate 1 writer transfer.
+
+## P1-R1 Host Assurance Review (2026-07-26)
+
+- The workspace already enforces `unsafe_op_in_unsafe_fn = "deny"` and
+  `clippy::undocumented_unsafe_blocks = "deny"`. Strict all-target Clippy passed with the explicit
+  lint enabled. The member production/tool `src` trees contain 27 files with 213 actual
+  `unsafe { ... }` blocks and 216 `SAFETY:` annotations. Including integration-test targets under
+  `crates/` raises that census to 38 files, 264 blocks, and 267 annotations. A broad token search
+  finds one extra file because `DiagnosticState::Unsafe` is an enum variant rather than unsafe Rust.
+  The complete target set also declares one Android `unsafe extern "C" fn` callback and three
+  unsafe foreign blocks; no unsafe trait or impl is present. This is a corrected mechanical census,
+  not the explicit unsafe-boundary audit still required by the release roadmap.
+- The host provides unprivileged user/mount/network namespaces plus `ip`, xtables, and Bubblewrap.
+  Required-mode `cargo xtask test-functional-canary-linux` passed one exact disposable dual-stack
+  topology/cleanup test with 298 filtered.
+- Required ingress TPROXY refused to run because `xt_TPROXY` was not already active. Required
+  local-OUTPUT TPROXY found no already-active module/procfs/built-in support proof. The tests did not
+  load a module, preserving the project policy that Flux cannot manufacture kernel capability.
+- Required distinct-UID preflight rejected inherited supplementary groups while outer `setgroups`
+  is denied in this WSL environment. This keeps the credential mechanism unqualified rather than
+  weakening its authority checks.
+- The standard CI can honestly require the passing topology checkpoint as mechanism evidence. The
+  stronger TPROXY, production-composition, and Android/device gates remain open and separately
+  reported.
+- The exact pidfd exit test passed after switching its wait primitive to pidfd readiness. Five
+  repeated parallel `flux-platform` library runs each passed 350 tests with four privileged ignores,
+  and strict all-target `flux-platform` Clippy passed.
+- `TMPDIR=/tmp cargo xtask ci` passed, including workspace tests, documentation tests, strict
+  Clippy, and the pinned ARM64/API-31 Android cross-check. The required topology checkpoint then
+  passed again with one exact test and 298 filtered.
+- Python structured workflow parsing, repository rustfmt, `git diff --check`, the scoped stale-
+  authority search, and the high-confidence secret-signature scan passed. Independent Standards
+  and Spec review found no source or authority-boundary issue after correcting the unsafe census.
+- No GitHub-hosted runner execution is claimed for the unpushed workflow change. That evidence can
+  exist only after the local commit is pushed or otherwise run on the hosted workflow; it is not a
+  reason to weaken the required-mode failure contract locally.

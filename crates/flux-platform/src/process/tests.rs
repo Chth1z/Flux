@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use super::implementation::{
     ProcessCredentialMapObservation, ProcessObservationCensusPass, ProcessTaskNamespaces,
     ProcessTaskObservation, digest_process_id_map, parse_pidfd_info, parse_proc_stat,
-    parse_proc_status, require_waitable_child, validate_process_observation_census,
+    parse_proc_status, require_live, require_waitable_child, validate_process_observation_census,
 };
 use super::{
     ProcessCredentialMapKind, ProcessHandle, ProcessHandleError, ProcessHandleErrorKind,
@@ -564,13 +564,18 @@ fn pidfd_handle_reports_exit_without_claiming_reap_authority() {
 
     let deadline = Instant::now() + Duration::from_secs(1);
     loop {
-        match handle.reobserve() {
+        match require_live(&handle.transport.pidfd, handle.identity().pid()) {
             Err(error) if error.kind() == ProcessHandleErrorKind::Exited => break,
             Ok(_) if Instant::now() < deadline => std::thread::yield_now(),
             Ok(_) => panic!("pidfd did not report child exit before the test deadline"),
-            Err(error) => panic!("unexpected pre-reap observation failure: {error}"),
+            Err(error) => panic!("unexpected pre-reap pidfd failure: {error}"),
         }
     }
+
+    let error = handle
+        .reobserve()
+        .expect_err("an exited unreaped child cannot produce a live observation");
+    assert_eq!(error.kind(), ProcessHandleErrorKind::Exited);
 
     child.wait();
 

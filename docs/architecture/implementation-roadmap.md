@@ -487,12 +487,16 @@ release; final qualification follows.
 - Format, workspace check/test, Clippy with warnings denied, and Android cross-check.
 - Unit/model/property tests for configuration, Generation assembly, planner, state machine,
   journal replay, and failure injection.
+- The disposable dual-stack user/mount/network namespace topology and exact-cleanup checkpoint is
+  required in standard Linux CI. It remains mechanism evidence because it installs no capture and
+  does not run the production native composition.
 - Required privileged Linux namespace tests for the real production composition. These may not be
   silently ignored in the release pipeline.
 - Fuzz targets for TOML/JSON/control/subscription inputs and netlink/xtables readback parsers, with a
   bounded CI smoke run and retained crash corpus.
-- Dependency vulnerability/license audit, unsafe-code review, and reproducible build/provenance
-  checks.
+- Unsafe operations in unsafe functions and undocumented unsafe blocks are denied workspace-wide
+  through the standard strict Clippy gate. Dependency vulnerability/license audit, explicit unsafe
+  boundary review, and reproducible build/provenance checks remain required.
 
 ### Required Android Set
 

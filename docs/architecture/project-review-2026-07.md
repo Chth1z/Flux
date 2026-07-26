@@ -282,8 +282,10 @@ that can authorize the exact conventional target.
 
 984 root tests and extensive failure injection are strong evidence for pure logic. Critical Linux
 namespace canaries are ignored by normal workspace tests, physical device tests are external, and
-there are no committed fuzz, dependency-vulnerability, sanitizer/Miri, coverage, or unsafe-review
-gates. Test count does not offset the missing production-composition test.
+there are no committed fuzz, dependency-vulnerability, sanitizer/Miri, or coverage gates. The
+workspace does deny unsafe operations in unsafe functions and undocumented unsafe blocks, and the
+disposable non-capture topology checkpoint is now required separately in Linux CI. Neither replaces
+the missing production-composition test or an explicit unsafe-boundary audit.
 
 Recommendation: make one privileged real-composition namespace job required before cutover; add
 bounded fuzz smoke tests for exposed parsers; add dependency/license and unsafe review gates; keep

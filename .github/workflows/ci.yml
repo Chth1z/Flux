@@ -29,6 +29,10 @@ jobs:
       - run: cargo xtask ci
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+      - name: Test required disposable namespace topology
+        run: cargo xtask test-functional-canary-linux
+        env:
+          FLUX_LINUX_CANARY_REQUIRED: "1"
       - name: Check Magisk shell bridge syntax
         run: >-
           bash -n customize.sh flux_service.sh scripts/dispatcher

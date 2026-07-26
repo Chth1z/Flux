@@ -1314,3 +1314,84 @@ release-authorizing work is C1/C2 on a rooted physical ARM64 target.
 - Final `cargo fmt --all -- --check` and `git diff --check` passed. Scoped stale-B3/progress searches
   and the high-confidence secret-signature scan returned no matches; the complete seven-file
   documentation/plan diff was reviewed before staging.
+
+## Execution: P1-R1 Required Host Assurance Baseline
+
+### Goal
+Turn already-implemented, host-verifiable safety checks into required CI evidence while physical
+ARM64 C1/C2 remains unavailable, without representing isolated Linux mechanisms as production or
+Android qualification.
+
+### Phases
+- [x] R1.1: Re-audit the required host backlog, workspace unsafe lints, ignored privileged tests,
+  available host tools, and exact qualification boundaries.
+- [x] R1.2: Make the passing disposable dual-stack namespace topology checkpoint a required CI step
+  without enabling unsupported TPROXY or distinct-UID claims.
+- [x] R1.3: Reconcile the roadmap/review with the existing enforced unsafe boundary and new CI
+  checkpoint.
+- [x] R1.4: Run focused, full, Android, workflow, diff, and secret gates; review and commit locally.
+
+### Decisions
+- Keep physical ARM64 C1/C2 as the P0 release-authorizing boundary. P1 host assurance may proceed
+  while hardware is unavailable but cannot mint Android or native-writer authority.
+- Require only `cargo xtask test-functional-canary-linux` in the standard Linux CI job. This test
+  proved disposable user/mount/network namespace topology and cleanup on the current host, but its
+  own contract explicitly excludes TPROXY, production composition, and Android qualification.
+- Do not require the ingress/local-OUTPUT TPROXY checkpoints on a generic runner whose kernel has
+  not already exposed the necessary targets and expressions. Flux tests must not load kernel
+  modules merely to turn a capability absence into a pass.
+- Do not add a duplicate unsafe tool. The workspace already denies unsafe operations in unsafe
+  functions and undocumented unsafe blocks; strict all-target Clippy is the required enforcement
+  surface.
+
+### Errors Encountered
+- Required ingress TPROXY failed closed because `/sys/module/xt_TPROXY` was absent. Required
+  local-OUTPUT TPROXY likewise found no already-active module/procfs/built-in proof. These are honest
+  host capability failures; no module was loaded and neither result is a code regression.
+- Required distinct-UID preflight rejected the WSL environment because outer `setgroups` is denied
+  while inherited supplementary groups remain. Keep the credential gate external until a host can
+  provide its exact authority.
+- The first workflow syntax probe selected Ruby's YAML parser, but Ruby is not installed on this
+  host. The workflow was unchanged; use the available structured Python YAML parser for the same
+  read-only syntax check.
+- The first final R1 `cargo xtask ci` run reached the parallel `flux-platform` library target and
+  exposed a pre-existing pidfd exit race: the unreaped child lost
+  `/proc/<pid>/task/<pid>/ns/net`, and the test treated that observation failure as unexpected.
+  Preserve the failing output, build a repeated focused feedback loop, and correct only the proven
+  observation/test contract before rerunning the unchanged full gate.
+- The first corrected pidfd-test compile could not access the implementation-private `require_live`
+  primitive from its sibling test module. Give that existing helper parent-module visibility and
+  import it only under the Linux test module; this does not widen the crate's public interface.
+- The first focused post-fix rustfmt check requested only the canonical one-line signature for the
+  newly parent-visible `require_live` helper. Apply repository formatting and rerun the unchanged
+  focused and full gates.
+- The first unsafe census used a broad `unsafe` token search over member `src` trees and counted the
+  `DiagnosticState::Unsafe` enum variant as unsafe Rust. It also used a pattern that missed an
+  `unsafe extern "C" fn` Android property callback. The fixed review records both the exact
+  block-based production/tool census and the larger all-target census, names the callback/foreign
+  blocks, and leaves the explicit semantic boundary audit open.
+- The first final staging attempt could not create `.git/index.lock` because the managed sandbox
+  exposes Git metadata read-only. No index entry changed; retry the same explicit eight-path stage
+  with repository-metadata permission, without widening the file set.
+
+### Verification
+- The exact pidfd regression passed, five repeated parallel `flux-platform` library runs each passed
+  350 tests with four privileged ignores, and strict all-target `flux-platform` Clippy passed.
+- `TMPDIR=/tmp cargo xtask ci` returned success after workspace, documentation, strict Clippy, and
+  pinned ARM64/API-31 Android cross-check gates. `flux-platform` reported 350 passed with four
+  privileged ignores; `fluxd` reported 295 passed with four privileged ignores; `xtask` reported
+  44 passed with four intentional fixture ignores.
+- Required-mode `cargo xtask test-functional-canary-linux` passed its one exact disposable
+  dual-stack topology/cleanup test with 298 filtered. The unsupported ingress/local-OUTPUT TPROXY
+  and distinct-UID gates remain fail-closed environment evidence rather than CI requirements.
+- Python structured workflow parsing, `cargo fmt --all -- --check`, `git diff --check`, scoped stale-
+  authority wording, and high-confidence secret-signature checks passed.
+- Independent Standards and Spec reviews found no code smell, public-interface widening, scope
+  creep, or authority-boundary regression after the unsafe inventory correction. A GitHub-hosted
+  run remains pending because this workflow change has not been pushed; local success is not
+  represented as hosted-runner evidence.
+
+### Status
+**Local P1-R1 checkpoint complete on 2026-07-26** - the required host topology step and pidfd test
+correction are verified and ready for the local checkpoint commit. Physical ARM64 C1/C2 and the
+first GitHub-hosted execution of the new required step remain external evidence, not local claims.

@@ -601,10 +601,11 @@ impl ProcessHandle {
 
     /// Reobserve the same live pidfd-bound process.
     ///
-    /// Exit is reported as [`ProcessHandleErrorKind::Exited`]. Success proves
-    /// only a live exact identity plus point-in-time credential and process-
-    /// domain observations; it does not prove that a later exit was reaped by
-    /// the parent.
+    /// Once pidfd readiness observes exit, it is reported as
+    /// [`ProcessHandleErrorKind::Exited`]. Success proves only a live exact
+    /// identity plus point-in-time credential and process-domain observations;
+    /// it does not prove that a later exit was reaped by the parent. Callers
+    /// must not use the complete procfs census as an exit-wait primitive.
     pub fn reobserve(&self) -> Result<ProcessObservation, ProcessHandleError> {
         implementation::reobserve(self)
     }
@@ -1251,7 +1252,7 @@ mod implementation {
         Ok(())
     }
 
-    fn require_live(pidfd: &OwnedFd, pid: NonZeroU32) -> Result<(), ProcessHandleError> {
+    pub(super) fn require_live(pidfd: &OwnedFd, pid: NonZeroU32) -> Result<(), ProcessHandleError> {
         let mut poll_fd = libc::pollfd {
             fd: pidfd.as_raw_fd(),
             events: libc::POLLIN,

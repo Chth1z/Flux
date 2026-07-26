@@ -1136,7 +1136,7 @@ development bridge remains the production writer rollback boundary until Gate 1.
 - [x] B3.1: Add explicit NDK-r27 16 KB linker compatibility flags to Android builds and extend ELF
   verification plus fixtures to require every non-empty `PT_LOAD` segment to align to at least
   `2**14`.
-- [ ] B3.2: Add Rust-only platform-glue source policy and hostile fixtures for forbidden networking,
+- [x] B3.2: Add Rust-only platform-glue source policy and hostile fixtures for forbidden networking,
   subscription, configuration-compilation, and cleanup implementation.
 - [ ] B3.3: Prove exact 13-path Rust-only staging and exact legacy-artifact rejection without
   promoting its `failing-until-complete` status or deleting the still-active bridge.
@@ -1144,12 +1144,10 @@ development bridge remains the production writer rollback boundary until Gate 1.
   periodic local Conventional Commit checkpoints without pushing.
 
 ### Status
-**B3.1 complete on 2026-07-26; B3.2 next** - NDK-r27 ARM64 release and x86_64 checkpoint Cargo
-commands export both explicit 16 KB maximum/common page-size linker options, final ARM64 builds
-run the structured verifier, and every packaged binary must have all non-empty `PT_LOAD` segments
-aligned to a congruent power of two at least `2**14`. The real ARM64 cross-build and WSA checkpoint
-artifacts each expose four `0x4000` load segments. WSA passed the exact canary on a 4096-byte-page
-runtime, so it remains development mechanism evidence and not 16 KB runtime or release authority.
+**B3.2 complete on 2026-07-26; B3.3 next** - the Rust-only verifier now bounds and scans the exact
+four final platform-glue sources, requires direct installer/daemon/uninstall delegation, and rejects
+the tested ownership-drift categories. The active bridge remains unchanged and passes only its
+development profile; B3.3 will provide minimal profile-specific sources and prove exact staging.
 
 ### Decisions
 - WSA is development mechanism evidence only. It cannot construct physical Android ARM64 planning,
@@ -1163,6 +1161,10 @@ runtime, so it remains development mechanism evidence and not 16 KB runtime or r
 - Follow the current Android compatibility guide for raw NDK-r27 Cargo links: pass both
   `max-page-size=16384` and `common-page-size=16384`. The final structured ELF inspection, not the
   presence of either flag, is authoritative.
+- Apply the platform-glue source policy only to the Rust-only profile. Require exact installation,
+  daemon, and uninstall delegation markers; reject networking mutation, subscription retrieval,
+  configuration compilation, owned-state cleanup, legacy runtime paths, and dynamic shell command
+  construction without weakening or rewriting the active bridge.
 
 ### Errors Encountered
 - Windows Computer Use initialization failed before UI automation because the Node runtime rejected
@@ -1190,6 +1192,17 @@ runtime, so it remains development mechanism evidence and not 16 KB runtime or r
 - The first strict B3.1 Clippy pass rejected an explicit lifetime on the Android Cargo-environment
   helper as needless. Eliding only that lifetime cleared strict all-target Clippy; the subsequent
   rustfmt check requested its canonical one-line signature, which `cargo fmt -p xtask` applied.
+- The first B3.2 `xtask` suite exposed a punctuation-sensitive `ping` delegation marker in the
+  synthetic minimal uninstall fixture, which also made the complete bridge fixture fail before its
+  expected Rust-only forbidden-path check. Parse required commands as exact normalized shell tokens
+  so punctuation cannot change the policy result.
+- That B3.2 run also tried to validate every live bridge source directly and reached the unrelated
+  data-style `scripts/config` entry, which intentionally has no shebang. Copy only the four active
+  platform-glue sources into an otherwise canonical bridge fixture to prove their bridge admission
+  and Rust-only rejection without widening this gate to legacy script semantics.
+- The first B3.2 checkpoint staging command could not create `.git/index.lock` because the managed
+  sandbox mounted Git metadata read-only. No file was staged; rerun the same exact five-file `git
+  add` with Git-metadata write authority, then verify the cached diff before committing locally.
 
 ### B3.0 Verification
 - The command-environment regression failed before the fix on the absent
@@ -1226,3 +1239,18 @@ runtime, so it remains development mechanism evidence and not 16 KB runtime or r
   passed. Existing CRLF normalization notices remain warnings only.
 - No physical ARM64 or 16 KB Android runtime target was available. ARM64 remains cross-build and
   structural evidence; WSA remains 4 KB x86_64 mechanism evidence.
+- Local checkpoint `585a57f` records the complete verified rewrite through B3.1; it was not pushed.
+
+### B3.2 Verification
+- The source-policy gate runs only for `rust-only` and inspects exactly the four manifest-required
+  platform-glue paths. Each source is bounded to 128 KiB, non-NUL ASCII, normalized for case,
+  whitespace, CRLF, and shell line continuations, and checked for exact delegation markers/tokens.
+- A compliant minimal fixture passes. Eight hostile cases reject `iptables-restore`, `curl`, `jq`,
+  `awk`, `/data/adb/flux/run/active_runtime`, `/data/adb/flux/scripts/lib`, `eval`, and `sh -c`;
+  line-continuation variants prove the normalizer cannot be bypassed by splitting the command.
+- The four active shared bridge glue files still pass bridge content validation and fail when
+  evaluated under Rust-only policy. No bridge source, writer selection, or package profile status
+  changed.
+- `TMPDIR=/tmp cargo test -p xtask --no-fail-fast`: 42 passed, 0 failed, 4 intentional fixture
+  ignores. `TMPDIR=/tmp cargo clippy -p xtask --all-targets -- -D warnings` passed.
+- Repository rustfmt, `git diff --check`, and the scoped high-confidence secret scan passed.

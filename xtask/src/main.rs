@@ -23,6 +23,51 @@ const ANDROID_RUSTFLAGS: &str = concat!(
 const ANDROID_TARGET_RUSTFLAGS_ENV: &str = "CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS";
 const PACKAGE_METADATA_FILES: [&str; 3] =
     ["SBOM.spdx.json", "checksums.sha256", "build-metadata.json"];
+const RUST_ONLY_PLATFORM_GLUE_FILES: [&str; 4] = [
+    "META-INF/com/google/android/update-binary",
+    "customize.sh",
+    "flux_service.sh",
+    "uninstall.sh",
+];
+const MAX_PLATFORM_GLUE_SOURCE_BYTES: usize = 128 * 1024;
+const FORBIDDEN_PLATFORM_GLUE_EXECUTABLES: [(&str, &str); 16] = [
+    ("networking mutation", "ip"),
+    ("networking mutation", "iptables"),
+    ("networking mutation", "ip6tables"),
+    ("networking mutation", "iptables-restore"),
+    ("networking mutation", "ip6tables-restore"),
+    ("networking mutation", "nft"),
+    ("networking mutation", "tc"),
+    ("networking mutation", "bpftool"),
+    ("kernel mutation", "insmod"),
+    ("kernel mutation", "modprobe"),
+    ("kernel mutation", "rmmod"),
+    ("subscription retrieval", "curl"),
+    ("subscription retrieval", "wget"),
+    ("configuration compilation", "jq"),
+    ("configuration compilation", "awk"),
+    ("dynamic command construction", "eval"),
+];
+const FORBIDDEN_PLATFORM_GLUE_FRAGMENTS: [(&str, &str); 18] = [
+    ("networking mutation", "/proc/sys/net/"),
+    ("networking mutation", "/sys/fs/bpf"),
+    ("networking mutation", "fwmark"),
+    ("networking mutation", "tproxy"),
+    ("subscription retrieval", "subscription"),
+    ("subscription retrieval", "updater.sh"),
+    ("configuration compilation", "settings.ini"),
+    ("configuration compilation", "addrsyncd.toml"),
+    ("configuration compilation", "singbox.json"),
+    ("configuration compilation", "render-legacy"),
+    ("owned-state cleanup", "/run/active_"),
+    ("owned-state cleanup", "cache_cleanup"),
+    ("owned-state cleanup", "startup-recover"),
+    ("legacy runtime", "/scripts/"),
+    ("legacy runtime", "addrsyncd"),
+    ("runtime orchestration", "/data/adb/flux/bin/sing-box"),
+    ("dynamic command construction", "sh -c "),
+    ("dynamic command construction", "`"),
+];
 const REQUIRED_DEVICE_TESTS: [&str; 7] = [
     "module_boot",
     "status",
@@ -644,6 +689,13 @@ fn validate_package_profiles(profiles: &[PackageProfile]) -> Result<(), String> 
         if !rust_required.contains(required) {
             return Err(format!(
                 "rust-only package profile must require final runtime path {required}"
+            ));
+        }
+    }
+    for required in RUST_ONLY_PLATFORM_GLUE_FILES {
+        if !rust_required.contains(required) {
+            return Err(format!(
+                "rust-only package profile must require platform glue path {required}"
             ));
         }
     }
@@ -1439,6 +1491,10 @@ fn validate_module_content(stage: &Path, profile: &PackageProfile) -> Result<(),
         }
     }
 
+    if profile.name == PackageProfileName::RustOnly {
+        validate_rust_only_platform_glue(stage)?;
+    }
+
     if profile_requires(profile, "META-INF/com/google/android/updater-script") {
         let updater = fs::read_to_string(stage.join("META-INF/com/google/android/updater-script"))
             .map_err(|error| format!("cannot read updater-script: {error}"))?;
@@ -1514,6 +1570,111 @@ fn validate_module_content(stage: &Path, profile: &PackageProfile) -> Result<(),
                 ));
             }
         }
+    }
+    Ok(())
+}
+
+fn validate_rust_only_platform_glue(stage: &Path) -> Result<(), String> {
+    for relative in RUST_ONLY_PLATFORM_GLUE_FILES {
+        let path = stage.join(relative);
+        let bytes = fs::read(&path)
+            .map_err(|error| format!("cannot read Rust-only platform glue {relative}: {error}"))?;
+        if bytes.len() > MAX_PLATFORM_GLUE_SOURCE_BYTES {
+            return Err(format!(
+                "Rust-only platform glue {relative} exceeds {MAX_PLATFORM_GLUE_SOURCE_BYTES} bytes"
+            ));
+        }
+        let source = std::str::from_utf8(&bytes)
+            .map_err(|_| format!("Rust-only platform glue {relative} must be UTF-8"))?;
+        if !source.is_ascii() || source.contains('\0') {
+            return Err(format!(
+                "Rust-only platform glue {relative} must contain only non-NUL ASCII text"
+            ));
+        }
+        let normalized = normalize_platform_glue_source(source);
+        require_platform_glue_delegation_markers(relative, &normalized)?;
+
+        for token in platform_glue_source_tokens(&normalized) {
+            let executable = token.rsplit('/').next().unwrap_or(token);
+            if let Some((category, _)) = FORBIDDEN_PLATFORM_GLUE_EXECUTABLES
+                .iter()
+                .find(|(_, forbidden)| executable == *forbidden)
+            {
+                return Err(format!(
+                    "Rust-only platform glue {relative} contains forbidden {category} executable token '{executable}'"
+                ));
+            }
+        }
+        if let Some((category, fragment)) = FORBIDDEN_PLATFORM_GLUE_FRAGMENTS
+            .iter()
+            .find(|(_, forbidden)| normalized.contains(*forbidden))
+        {
+            return Err(format!(
+                "Rust-only platform glue {relative} contains forbidden {category} marker '{fragment}'"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn normalize_platform_glue_source(source: &str) -> String {
+    let joined = source.replace("\\\r\n", "").replace("\\\n", "");
+    let mut normalized = String::with_capacity(joined.len().saturating_add(2));
+    normalized.push(' ');
+    for character in joined.chars() {
+        if character.is_ascii_whitespace() {
+            if !normalized.ends_with(' ') {
+                normalized.push(' ');
+            }
+        } else {
+            normalized.push(character.to_ascii_lowercase());
+        }
+    }
+    if !normalized.ends_with(' ') {
+        normalized.push(' ');
+    }
+    normalized
+}
+
+fn platform_glue_source_tokens(source: &str) -> impl Iterator<Item = &str> {
+    source.split(|character: char| {
+        !(character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '/' | '.'))
+    })
+}
+
+fn require_platform_glue_delegation_markers(
+    relative: &str,
+    normalized: &str,
+) -> Result<(), String> {
+    let (required_fragments, required_tokens): (&[&str], &[&str]) = match relative {
+        "META-INF/com/google/android/update-binary" => (&[], &["install_module"]),
+        "customize.sh" => (&["bin/fluxd", "flux_service.sh", "uninstall.sh"], &[]),
+        "flux_service.sh" => (&["/data/adb/flux/bin/fluxd"], &["daemon"]),
+        "uninstall.sh" => (
+            &["/data/adb/flux/bin/fluxd"],
+            &["ping", "stop", "cleanup", "--offline"],
+        ),
+        _ => {
+            return Err(format!(
+                "unreviewed Rust-only platform glue path {relative}"
+            ));
+        }
+    };
+    if let Some(missing) = required_fragments
+        .iter()
+        .find(|required| !normalized.contains(**required))
+    {
+        return Err(format!(
+            "Rust-only platform glue {relative} is missing required delegation marker '{missing}'"
+        ));
+    }
+    if let Some(missing) = required_tokens
+        .iter()
+        .find(|required| !platform_glue_source_tokens(normalized).any(|token| token == **required))
+    {
+        return Err(format!(
+            "Rust-only platform glue {relative} is missing required delegation token '{missing}'"
+        ));
     }
     Ok(())
 }
@@ -2626,6 +2787,27 @@ mod tests {
             fs::create_dir_all(path.parent().expect("required file parent"))
                 .expect("create required fixture parent");
             let contents = match relative.as_str() {
+                "META-INF/com/google/android/update-binary" => {
+                    "#!/sbin/sh\ninstall_module\n".to_owned()
+                }
+                "customize.sh" => concat!(
+                    "#!/system/bin/sh\n",
+                    "[ -x \"${MODPATH}/bin/fluxd\" ] || abort \"missing fluxd\"\n",
+                    "[ -f \"${MODPATH}/flux_service.sh\" ] || abort \"missing service\"\n",
+                    "[ -f \"${MODPATH}/uninstall.sh\" ] || abort \"missing uninstall\"\n"
+                )
+                .to_owned(),
+                "flux_service.sh" => {
+                    "#!/system/bin/sh\nexec /data/adb/flux/bin/fluxd daemon\n".to_owned()
+                }
+                "uninstall.sh" => concat!(
+                    "#!/system/bin/sh\n",
+                    "if /data/adb/flux/bin/fluxd ping; then\n",
+                    "    /data/adb/flux/bin/fluxd stop && exit 0\n",
+                    "fi\n",
+                    "exec /data/adb/flux/bin/fluxd cleanup --offline\n"
+                )
+                .to_owned(),
                 "META-INF/com/google/android/updater-script" => "#MAGISK\n".to_owned(),
                 "module.prop" => concat!(
                     "id=flux\n",
@@ -2641,15 +2823,7 @@ mod tests {
                 "conf/settings.ini" => {
                     "PROXY_MODE=\"tproxy\"\nBYPASS_SET_BACKEND=\"zone\"\n".to_owned()
                 }
-                value
-                    if value == "META-INF/com/google/android/update-binary"
-                        || value == "customize.sh"
-                        || value == "flux_service.sh"
-                        || value == "uninstall.sh"
-                        || value.starts_with("scripts/") =>
-                {
-                    "#!/system/bin/sh\nexit 0\n".to_owned()
-                }
+                value if value.starts_with("scripts/") => "#!/system/bin/sh\nexit 0\n".to_owned(),
                 "webroot/index.html" => "<html></html>\n".to_owned(),
                 "LICENSE" => "fixture license\n".to_owned(),
                 other => panic!("unhandled required fixture file {other}"),
@@ -2748,6 +2922,12 @@ mod tests {
         assert_eq!(bridge.required_files.len(), 28);
         assert_eq!(rust_only.required_files.len(), 13);
         assert_eq!(rust_only.forbidden_files.len(), 15);
+        for required in RUST_ONLY_PLATFORM_GLUE_FILES {
+            assert!(
+                rust_only.required_files.iter().any(|path| path == required),
+                "Rust-only contract must require platform glue {required}"
+            );
+        }
 
         let mut incomplete = manifest.package_profiles.clone();
         package_profile_mut(&mut incomplete, PackageProfileName::RustOnly)
@@ -2756,6 +2936,123 @@ mod tests {
         let error = validate_package_profiles(&incomplete)
             .expect_err("an unnamed bridge-only path must fail the contract");
         assert!(error.contains("missing=bin/jq"));
+    }
+
+    #[test]
+    fn rust_only_platform_glue_accepts_delegation_and_rejects_owned_behavior() {
+        let directory = TestDirectory::new("rust-only-platform-glue");
+        let stage = &directory.0;
+        let rust_only = checked_profile(PackageProfileName::RustOnly);
+        write_required_module_fixture(stage, &rust_only);
+        validate_rust_only_platform_glue(stage)
+            .expect("minimal Rust-only platform glue must delegate directly to fluxd");
+
+        let hostile_cases = [
+            (
+                "continued iptables-restore",
+                "IPTABLES\\\n-RESTORE < \"${MODPATH}/rules\"\n",
+                "networking mutation",
+            ),
+            (
+                "absolute curl",
+                "/system/bin/curl https://example.invalid/subscription\n",
+                "subscription retrieval",
+            ),
+            (
+                "jq compilation",
+                "jq '.route' \"${MODPATH}/conf/template.json\"\n",
+                "configuration compilation",
+            ),
+            (
+                "awk compilation",
+                "awk '{ print $1 }' \"${MODPATH}/conf/flux.toml\"\n",
+                "configuration compilation",
+            ),
+            (
+                "owned runtime cleanup",
+                "rm -f /data/adb/flux/run/active_runtime\n",
+                "owned-state cleanup",
+            ),
+            (
+                "legacy runtime source",
+                ". /data/adb/flux/scripts/lib\n",
+                "legacy runtime",
+            ),
+            (
+                "eval command construction",
+                "eval \"${command}\"\n",
+                "dynamic command construction",
+            ),
+            (
+                "continued sh -c command construction",
+                "sh \\\n-c \"${command}\"\n",
+                "dynamic command construction",
+            ),
+        ];
+
+        for (label, hostile_source, expected_category) in hostile_cases {
+            write_required_module_fixture(stage, &rust_only);
+            let path = stage.join("customize.sh");
+            let mut source = fs::read_to_string(&path).expect("read clean glue fixture");
+            source.push_str(hostile_source);
+            fs::write(&path, source).expect("write hostile glue fixture");
+            let error = validate_rust_only_platform_glue(stage)
+                .expect_err("platform glue ownership drift must fail");
+            assert!(
+                error.contains(expected_category),
+                "{label} returned unexpected policy error: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn rust_only_platform_glue_rejects_unbounded_or_non_ascii_source() {
+        let directory = TestDirectory::new("rust-only-platform-glue-text");
+        let stage = &directory.0;
+        let rust_only = checked_profile(PackageProfileName::RustOnly);
+        write_required_module_fixture(stage, &rust_only);
+
+        fs::write(
+            stage.join("customize.sh"),
+            vec![b'a'; MAX_PLATFORM_GLUE_SOURCE_BYTES + 1],
+        )
+        .expect("write oversized glue fixture");
+        let oversized =
+            validate_rust_only_platform_glue(stage).expect_err("oversized platform glue must fail");
+        assert!(oversized.contains("exceeds 131072 bytes"));
+
+        write_required_module_fixture(stage, &rust_only);
+        let path = stage.join("customize.sh");
+        let mut source = fs::read(&path).expect("read clean glue fixture");
+        source.extend_from_slice(&[0xc3, 0xa9]);
+        fs::write(&path, source).expect("write non-ASCII glue fixture");
+        let non_ascii =
+            validate_rust_only_platform_glue(stage).expect_err("non-ASCII platform glue must fail");
+        assert!(non_ascii.contains("non-NUL ASCII text"));
+    }
+
+    #[test]
+    fn current_bridge_glue_stays_bridge_valid_but_is_not_rust_only() {
+        let source_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask must be directly below the workspace root");
+        let directory = TestDirectory::new("current-bridge-platform-glue");
+        let stage = &directory.0;
+        let bridge = checked_profile(PackageProfileName::Bridge);
+        write_required_module_fixture(stage, &bridge);
+        for relative in RUST_ONLY_PLATFORM_GLUE_FILES {
+            fs::copy(source_root.join(relative), stage.join(relative))
+                .expect("copy active bridge platform glue into fixture");
+        }
+        validate_module_content(stage, &bridge)
+            .expect("the active shared bridge content must remain valid");
+
+        let error = validate_rust_only_platform_glue(stage)
+            .expect_err("active shared bridge glue must not satisfy Rust-only policy");
+        assert!(
+            error.contains("customize.sh"),
+            "unexpected bridge-policy rejection: {error}"
+        );
     }
 
     #[test]

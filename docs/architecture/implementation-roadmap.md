@@ -344,6 +344,12 @@ Exit: all supported runtime and diagnostic commands work with only `fluxd` plus 
   non-power-of-two, incongruent, or below-`2**14` alignment. The real ARM64 cross-build and WSA
   checkpoint artifacts each expose four `0x4000` load segments; WSA's 4 KB runtime remains
   mechanism-only evidence.
+- **B3.2 complete 2026-07-26:** Rust-only verification now bounds and normalizes the exact four final
+  platform-glue sources, requires direct installation, daemon, and online/offline uninstall
+  delegation, and rejects networking/kernel mutation, subscription retrieval, configuration
+  compilation, owned-state cleanup, legacy runtime paths, direct Sing-Box orchestration, and dynamic
+  command construction. A minimal fixture passes eight hostile ownership-drift cases; the unchanged
+  shared bridge glue remains valid only for the development profile.
 - Preserve frozen oracle fixtures under tests only as long as they add differential value; they are
   not staged into the module.
 

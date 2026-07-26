@@ -918,3 +918,24 @@ It does not yet validate the production Rust composition because that compositio
   ARM64/API-31 `check-android`, `git diff --check`, the new research-index target, and the scoped
   high-confidence secret scan. Clippy's only initial finding was an elidable helper lifetime; the
   correction was formatting-only and the unchanged 43-test suite remained green.
+
+## P0-B3.2 Rust-Only Platform-Glue Policy (2026-07-26)
+
+- `xtask` applies the new source policy only to the Rust-only profile and only to the exact final
+  glue inventory: `META-INF/com/google/android/update-binary`, `customize.sh`, `flux_service.sh`,
+  and `uninstall.sh`. The development bridge path and `ProcessRuntimeWriter` remain unchanged.
+- Every glue source is limited to 128 KiB of non-NUL ASCII. Inspection lowercases text, collapses
+  whitespace, and joins LF/CRLF shell continuations before requiring installer, `fluxd daemon`, and
+  online/offline uninstall delegation markers.
+- Exact executable tokens reject networking/kernel mutation, subscription clients, `jq`/`awk`
+  configuration compilation, and `eval`. Normalized fragments reject sysctl/BPF paths, TPROXY and
+  mark implementation, legacy configuration/runtime paths, owned-state cleanup, direct Sing-Box
+  orchestration, `sh -c`, and backtick command construction.
+- A minimal Rust-only fixture passes. Eight hostile fixtures cover `iptables-restore`, `curl`, `jq`,
+  `awk`, the active-runtime ownership path, the legacy script library, `eval`, and `sh -c`, including
+  split-line command attempts. Oversized and non-ASCII sources also fail.
+- A fixture composed from the four unchanged live bridge glue files passes bridge content validation
+  and is rejected by the Rust-only policy. The complete bridge package fixture still fails the
+  Rust-only contract first on the exact forbidden `bin/addrsyncd` path.
+- Focused verification passed all 46 `xtask` tests (42 passed, 4 intentional fixture ignores) and
+  strict all-target `xtask` Clippy. No Android runtime or physical-device claim is part of B3.2.

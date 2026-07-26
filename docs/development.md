@@ -732,6 +732,15 @@ configuration files, and all 11 current runtime scripts. The checked-in metadata
 intentionally incomplete, so an ordinary staged tree also fails provenance and device-evidence
 requirements.
 
+For `rust-only` only, module-content verification also inspects the exact four platform-glue sources:
+the Magisk update binary, installer customizer, boot service, and uninstaller. Each is limited to
+128 KiB of non-NUL ASCII, must contain the expected direct installer/`fluxd` delegation, and is
+rejected if normalized source contains networking or kernel mutation, subscription retrieval,
+configuration compilation, owned-state cleanup, legacy runtime paths, direct Sing-Box orchestration,
+or dynamic `eval`/`sh -c`/backtick command construction. This policy is deliberately not applied to
+the active development bridge; its shared installer/watchdog remains the rollback oracle and fails
+when evaluated as Rust-only until profile-specific minimal glue is staged.
+
 The current verifier establishes internal consistency, not external trust in an unsigned evidence
 file or self-declared third-party build. Passing it cannot override ADR-0011. Publication remains
 blocked until the runtime is fully Rust-owned, the Rust-only profile is promoted only after its

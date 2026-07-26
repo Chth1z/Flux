@@ -2084,6 +2084,8 @@ and a verified clean post-test baseline.
 - Exact runtime hashes, the netd ELF Build ID, the Connectivity APEX version/signature, and the
   observed rule shape do not authenticate the Samsung artifacts to one AOSP commit. Keep
   `AndroidNetdSourceProfile::AospNetd20250324` source-pinned and the production catalog empty.
+- Stop this target before C3/Gate 1 if Q2.3 finds a definite external overlap. Do not finish the
+  remaining census merely to turn an already-negative result into an apparently fuller grant.
 
 ### Q0-Q1 Evidence
 - Exactly one physical target and one WSA target were connected. Explicit-serial checks bound
@@ -2128,6 +2130,9 @@ and a verified clean post-test baseline.
 - The first focused selector compile found that tests had inherited `ToolId` through a production
   import removed by the refactor. Add the explicit test-only import; the unchanged nine-test
   catalog target then passed.
+- One exploratory XFRM command printed endpoint-bearing policy lines before its intended bounded
+  summary. The output was not written to disk or tracked. Replace it immediately with an on-device
+  aggregate that emits only record and mark counts; do not repeat or retain the endpoint data.
 
 ### Q2.1 Evidence
 - The dedicated release-mode ARM64/API-31 probe is 368,704 bytes rather than the prior 118 MB test
@@ -2170,9 +2175,25 @@ and a verified clean post-test baseline.
 - `cargo xtask ci`: exit 0, including the pinned ARM64/API-31 cross-check.
 - `git diff --check`: passed; the production catalog remains empty.
 
+### Q2.3 Read-Only Stop Evidence
+- Exact dual-stack legacy-xtables snapshots resolved the earlier incoming-value ambiguity: the
+  three complete values are nonzero and stable across IPv4/IPv6 with mask `0x7fefffff`.
+- IPv6 also contains vendor packet-mark writes with mask `0xffffffff`. This overlaps every eligible
+  bit in `ANDROID_DEVICE_QUALIFIED_CANDIDATE_MASK` and is a definite conflict under the current
+  all-external-writes-fail-closed census rule.
+- The mangle path references one pinned Android egress BPF program. Its bounded xlated dump is a
+  small statistics/accounting socket filter with no observed mark access, but this fact cannot
+  remove the independent full-mask xtables conflict or prove every TC/BPF attachment absent.
+- Sanitized XFRM aggregation found eight policies, zero policy mark records, zero states, and zero
+  state mark records without retaining endpoints. Both xtables save tools report the legacy
+  backend.
+- The post-read device check again found no `fluxd`, `addrsyncd`, Sing-Box, or generated
+  `/data/local/tmp/flux-*` directory. SELinux, boot, namespace, and the stopped baseline were stable.
+
 ### Status
-**Q2.2 complete with a negative authentication result** - C1 and Q2.1 pass, and the selector's
-self-hash cycle is removed, but the observed artifacts do not authenticate the pinned source
-profile. Q2.3 may continue as read-only diagnostic evidence; Q2.4 cannot mint positive planning
-authority, and R4-R6 remain blocked unless stronger provenance is obtained or the security contract
-is explicitly redesigned and reviewed. Preserve `/data/adb/flux` and the stopped baseline.
+**R4-R6 blocked fail-closed at Q2/C2** - C1 and Q2.1 pass, and the selector's self-hash cycle is
+removed, but the observed artifacts do not authenticate the pinned source profile. The first
+bounded Q2.3 live read also found an IPv6 full-mask external writer that definitively overlaps every
+eligible candidate. Q2.4 cannot mint positive planning authority, so C3, Gate 1, production writer
+selection, bridge deletion, and package promotion must not run. Preserve `/data/adb/flux` and the
+verified clean stopped baseline unless a separately reviewed policy changes these two boundaries.

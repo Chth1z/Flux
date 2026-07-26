@@ -1600,3 +1600,21 @@ It does not yet validate the production Rust composition because that compositio
   source mapping/reproducibility or an explicitly redesigned and reviewed security contract.
 - The review used only previously sanitized evidence. It accessed no device and required no device
   cleanup.
+
+## Physical ARM64 Q2.3 Fail-Closed Stop (2026-07-27)
+
+- A fresh bounded read resolved the earlier projected-zero ambiguity: both families contain the
+  same three nonzero Android incoming MARK values with mask `0x7fefffff`.
+- The IPv6 mangle table also contains vendor packet MARK operations with mask `0xffffffff`. Because
+  the current authority rejects every external overlapping write except the separately ordered
+  Android netId INPUT writer, no eligible bit 21-30 candidate can pass this target's census.
+- The active backend is legacy xtables. A pinned egress BPF filter is present; its xlated program is
+  statistics/accounting logic with no observed mark access, but a complete TC/BPF absence claim was
+  not made. Sanitized XFRM counts show eight policies and no mark-bearing policy/state record.
+- Read-only exploration accidentally emitted XFRM endpoint lines once to transient command output.
+  Nothing was persisted or committed, and the corrected aggregation emits counts/marks only.
+- No device mutation occurred. The final independent check found no Flux process or generated
+  `/data/local/tmp/flux-*` directory and retained the same Enforcing, boot, namespace, and stopped
+  process baseline.
+- R4 must stop before C3/Gate 1. R5 and R6 cannot start because their prerequisite writer transfer
+  has no positive C2 authority.

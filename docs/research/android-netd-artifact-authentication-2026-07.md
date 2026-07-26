@@ -101,7 +101,7 @@ logic, but identify only a broad post-`0a47ca4f...` implementation family. The t
 interfaces and their order reflect runtime network creation and are not a source-revision
 fingerprint.
 
-### Literal zero-value ambiguity
+### Literal zero-value ambiguity (resolved by follow-up observation)
 
 The supplied live-rule summary rendered the rules as
 `--set-xmark 0x0/0x7fefffff`. Taken literally, that value is not an exact match for the cited AOSP
@@ -110,11 +110,16 @@ VPN-protection bit before applying the mask. Repository fixtures likewise use no
 An xtables save/restore round trip may normalize `--set-mark` to `--set-xmark`; that spelling is not
 the discrepancy. The complete numeric value is.
 
-**Recommendation.** Before declaring even behavioral equivalence, retain and compare the complete
-unsanitized-on-host rule value, mask, interface, family, chain position, and generation. If `0x0`
-was a projection showing only zero bits inside Flux's candidate envelope, document that projection.
-If it was the literal whole MARK value, treat the difference as unresolved. Mask and topology alone
-remain source-compatible, not exact semantic proof.
+After this source review, a fresh explicit-serial, read-only snapshot retained the complete bounded
+mark expressions without retaining unrelated traffic data. Both families exposed the same three
+nonzero incoming values, respectively `0xf0065`, `0x30066`, and `0xf0067`, with mask
+`0x7fefffff`. The earlier `0x0` was therefore a lossy projection rather than the literal MARK value.
+
+**Fact.** This resolves the live-value ambiguity and strengthens behavior compatibility with the
+reviewed AOSP implementation family. It still does not authenticate the binary to one source
+revision. The same snapshot also found IPv6 vendor `MARK --set-xmark` operations with mask
+`0xffffffff`; under Flux's current complete-census contract, those are definite candidate-field
+overlaps rather than source-authentication evidence.
 
 ## Why the remaining identifiers do not authenticate source
 

@@ -8,6 +8,8 @@ run/
 .agent/
 lrqibazk/
 bin/
+!crates/flux-platform/src/bin/
+!crates/flux-platform/src/bin/android-profile-probe.rs
 /target/
 /dist/
 /ebpf/target/

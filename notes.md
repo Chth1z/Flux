@@ -1557,3 +1557,30 @@ It does not yet validate the production Rust composition because that compositio
 - This is C1 viability, not C2 authority. Runtime artifact authentication, exact hook/route order,
   a complete 27-cell mark census, listener/observer preservation, VPN/netd coexistence, functional
   traffic, failure injection, and cleanup evidence remain open before Gate 1.
+
+## Physical ARM64 C2.1 Profile Collection (2026-07-27)
+
+- Before the new run, the exact physical target retained the C1 boot, build, SELinux Enforcing, and
+  PID-1 network namespace identity. `fluxd`, `addrsyncd`, and Sing-Box were all absent, unlike the
+  original live-bridge baseline. This stopped state is recorded as baseline drift and grants no
+  Gate 1 quiescence or writer-transfer evidence; `/data/adb/flux` was not modified or restarted.
+- Q2.1 now cross-builds a dedicated stripped release-mode `android-profile-probe` instead of a
+  118 MB Rust test harness. The exact API-31 ARM64 payload was 368,704 bytes, and all four ELF
+  `LOAD` segments had `0x4000` alignment.
+- The probe invoked the production `SystemCapabilityProfileSource` and emitted the exact 27-field
+  line protocol. It bound Samsung product/build/vendor identities, Android security patch
+  `2026-04-05`, verified-boot orange/unlocked state, Linux 5.15.207, SELinux Enforcing, and network
+  namespace device/inode `4:4026531840` without retaining the raw boot ID or hardware serial here.
+- Platform artifact evidence was stable across both Q2.1 collections: SELinux policy
+  `d90a3e32fc844a714bf37ceadc6ea5b7574862900e43f1419e37a008dd63c01f` at 2,825,193 bytes,
+  netd `aabeab176d29a2ef299fdda318002dde253e00a1c47506f3af062b73112d0add` at 1,033,576 bytes,
+  and Connectivity APEX
+  `ec4d66b24a5d7bf2fe4f0aff2204dd51b4049748569ee0c0bc850104bf0d7549` at 36,827,136 bytes.
+- The runner created only one owner-only `/data/local/tmp/flux-profile.XXXXXX` directory, executed
+  under a bounded timeout, removed it through both its remote trap and host cleanup path, and
+  independently proved no matching directory or probe process remained. Boot, SELinux, namespace,
+  and the stopped Flux process baseline were unchanged afterward.
+- This evidence binds the collector probe, not the production `fluxd` ELF, and therefore cannot
+  populate the positive reviewed catalog or construct `AndroidMarkPlanningAuthority`. Q2.2 must
+  independently authenticate the observed platform artifacts to reviewed source and resolve the
+  catalog's current executing-binary self-hash cycle.

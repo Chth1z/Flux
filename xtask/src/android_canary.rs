@@ -500,7 +500,10 @@ fn push_and_execute(
     }
 }
 
-fn artifact_path_for_adb(options: &Options, artifact: &Path) -> Result<OsString, String> {
+pub(super) fn artifact_path_for_adb(
+    options: &Options,
+    artifact: &Path,
+) -> Result<OsString, String> {
     if !uses_windows_adb(&options.adb) {
         return Ok(artifact.as_os_str().to_os_string());
     }
@@ -630,7 +633,7 @@ pub(super) fn adb_text(options: &Options, arguments: &[&str]) -> Result<String, 
         })
 }
 
-fn adb_success_with_timeout(
+pub(super) fn adb_success_with_timeout(
     options: &Options,
     arguments: &[&str],
     timeout: Duration,
@@ -696,7 +699,7 @@ pub(super) fn adb_root_shell_output(
     )
 }
 
-fn command_output_bounded(
+pub(super) fn command_output_bounded(
     command: &mut Command,
     input: Option<&[u8]>,
     timeout: Duration,
@@ -1017,14 +1020,14 @@ fn render_adb_command(options: &Options, arguments: &[&str]) -> String {
     format!("{} {}", options.adb.to_string_lossy(), arguments.join(" "))
 }
 
-fn forward_output(output: &Output) -> Result<(), String> {
+pub(super) fn forward_output(output: &Output) -> Result<(), String> {
     std::io::stdout()
         .write_all(&output.stdout)
         .and_then(|()| std::io::stderr().write_all(&output.stderr))
         .map_err(|error| format!("forward ADB output: {error}"))
 }
 
-fn shell_single_quote(value: &str) -> String {
+pub(super) fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 

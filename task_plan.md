@@ -2037,6 +2037,19 @@ and a verified clean post-test baseline.
 - [ ] Q4: Only after C1-C3 pass on the same bound target, execute the reviewed Gate 1 writer-transfer
   series, verify rollback/cleanup, and commit each ownership boundary separately.
 
+### Q2 Work Breakdown
+- [x] Q2.1: Add and host-verify an explicit-serial ARM64 runner for the production
+  `SystemCapabilityProfileSource`; bind the exact probe ELF, boot, fingerprint, namespace, SELinux,
+  netd, Connectivity APEX, and reviewed selector facts, then prove its unique remote path absent.
+- [ ] Q2.2: Authenticate the observed netd and Connectivity artifacts to one reviewed source profile;
+  keep the catalog at zero grant until that independent mapping is recorded and compiled.
+- [ ] Q2.3: Implement the bounded point-in-time collector for all 27 source/plane coverage cells and
+  exact mark-use records, including RPDB, xtables, socket, and conntrack semantics.
+- [ ] Q2.4: Collect one coherent live inventory, classify RPDB/topology, select a collision-free
+  candidate, and demonstrate one-shot `AndroidMarkPlanningAuthority` without mutation.
+- [ ] Q2.5: Record sanitized C2 evidence, revalidate the exact target, and commit the collector,
+  reviewed policy, and authority checkpoints separately.
+
 ### Decisions
 - Use the repository's checked-in `xtask` entry points and exact tests rather than ad hoc live
   mutation. Stop when the next gate lacks an implemented safe runner or required evidence.
@@ -2067,8 +2080,44 @@ and a verified clean post-test baseline.
 - One read-only remote `for` loop used an Android `su -c` argument shape that lost its loop body and
   returned `syntax error: unexpected 'do'`. It performed no mutation. Exact single-process `pidof`
   queries replaced it and established the existing bridge process baseline.
+- The interrupted Q2.1 refactor left the parser fixture in the old JSON shape while production had
+  moved to an exact 27-field line report, so the focused test failed at its first malformed line.
+  Replace the fixture with the production wire shape; no device command ran for this failure.
+- The repository-wide `bin/` ignore rule also hid the dedicated Android profile probe from Git.
+  Add the narrowest exception for that one source path so the runner cannot be committed without
+  its payload implementation.
+- The first corrected line-report fixture reached `capability_profile_sha256` and proved the field
+  validator rejected digits even though multiple exact schema keys contain `sha256`. Permit ASCII
+  digits in keys while retaining the exact 27-name set and add a malformed-name regression.
+- The first notes append patch targeted a sentence fragment rather than the exact current tail and
+  changed no file. Re-read the bounded tail and append the sanitized Q2.1 evidence against the
+  actual C1 section.
+
+### Q2.1 Evidence
+- The dedicated release-mode ARM64/API-31 probe is 368,704 bytes rather than the prior 118 MB test
+  harness, is stripped, and has four `LOAD` segments aligned to `0x4000`.
+- The exact 27-field production-source report passed host validation and bound the stable target,
+  three platform artifact identities, SELinux Enforcing, verified boot, and PID-1 namespace.
+- Remote execution used one generated owner-only `/data/local/tmp/flux-profile.XXXXXX` directory.
+  Both runner cleanup and an independent read-only check proved the directory and probe process
+  absent; boot, SELinux, namespace, and the pre-run stopped Flux baseline were unchanged.
+- No raw hardware serial or boot ID is stored in tracked files. The probe identity is diagnostic
+  only and does not impersonate or authorize the production daemon identity.
+
+### Q2.1 Verification
+- `cargo test -p xtask android_profile`: 4 passed, 0 failed.
+- `cargo clippy -p flux-platform -p xtask --all-targets -- -D warnings`: passed.
+- Pinned NDK r27d ARM64/API-31 release build: passed; the 368,704-byte stripped probe has four
+  `0x4000`-aligned `LOAD` segments.
+- `cargo xtask ci`: exit 0, including source policy, rustfmt, workspace checks/tests/doc-tests,
+  warnings-denied Clippy, and the pinned ARM64 cross-check.
+- Device: repeated read-only C1 passed; Q2.1 passed; an independent post-run check found no probe
+  process or `flux-profile.*` directory and confirmed unchanged boot, SELinux, namespace, and
+  stopped Flux process baseline.
+- `git diff --check`, exact serial/boot-ID scan, and bounded secret scan passed; all nine bridge
+  scripts and `/data/adb/flux` remain unchanged.
 
 ### Status
-**Q2 in progress** - C1 viability is positive but no live complete census or one-shot Android
-planning-authority adapter exists yet. Inspect and implement that bounded path before any device
-mutation; preserve the existing bridge until Gate 1.
+**Q2.2 in progress** - C1 and the bounded Q2.1 collector pass on the same stable target, with exact
+cleanup. Authenticate netd/Connectivity to reviewed source and remove the catalog self-hash cycle
+before any positive policy entry; preserve `/data/adb/flux` and the stopped baseline until Gate 1.

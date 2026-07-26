@@ -52,7 +52,11 @@ fn control_commands_map_to_legacy_intents_and_wait_for_completion() {
             assert!(stderr.is_empty(), "command {command}");
             assert_eq!(
                 String::from_utf8(stdout).expect("UTF-8 output"),
-                "completed revision 41\n"
+                if command == "resync" {
+                    "completed revision 41 resync accepted_deferred\n"
+                } else {
+                    "completed revision 41\n"
+                }
             );
             assert_eq!(client.intents(), vec![expected]);
         }
@@ -100,6 +104,8 @@ impl ControlClient for RecordingControlClient {
         Ok(OperationReport {
             intent,
             revision: 41,
+            address_resync: matches!(intent, LegacyIntent::ResyncAddresses { .. })
+                .then_some(flux_core::AddressResyncDisposition::AcceptedDeferred),
         })
     }
 }

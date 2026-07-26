@@ -189,11 +189,25 @@ fn forwarded_direct_rules_preserve_safety_host_loopback_and_configured_order() {
     let lowered = lower(&report, 9, default_target()).unwrap();
     let prepare = restore_text(lowered.ipv4().unwrap().prepare());
     let mandatory = prepare.find("-d 0.0.0.0/8 -j RETURN").unwrap();
-    let host = prepare.find("-d 203.0.113.7 -j RETURN").unwrap();
+    let host = prepare.find("-d 203.0.113.7/32 -j RETURN").unwrap();
     let loopback = prepare.find("-i lo -j RETURN").unwrap();
     let configured = prepare.find("-d 100.64.0.0/10 -j RETURN").unwrap();
     let proxy = prepare.find("-i wlan0 -p tcp -j TPROXY").unwrap();
     assert!(mandatory < host && host < loopback && loopback < configured && configured < proxy);
+}
+
+#[test]
+fn address_hosts_render_as_save_canonical_full_length_prefixes() {
+    let report = compile_program_with_host(
+        scope(AddressHostFamilySelection::Ipv6, false, true),
+        interfaces(&[], &[exact("wlan0")], &[]),
+        CaptureProtocolSet::TCP,
+        &[],
+        Some(host_plan("2001:4860:4860::8888")),
+    );
+    let lowered = lower(&report, 10, default_target()).unwrap();
+    let prepare = restore_text(lowered.ipv6().unwrap().prepare());
+    assert!(prepare.contains("-d 2001:4860:4860::8888/128 -j RETURN"));
 }
 
 #[test]
@@ -638,7 +652,7 @@ fn local_direct_rules_preserve_owner_destination_interface_uid_and_proxy_order()
 
     let owner = prepare.find("--uid-owner 1000 --gid-owner 1000").unwrap();
     let mandatory = prepare.find("-d 0.0.0.0/8 -j RETURN").unwrap();
-    let host = prepare.find("-d 203.0.113.7 -j RETURN").unwrap();
+    let host = prepare.find("-d 203.0.113.7/32 -j RETURN").unwrap();
     let configured = prepare.find("-d 100.64.0.0/10 -j RETURN").unwrap();
     let excluded = prepare.find("-o tun0 -j RETURN").unwrap();
     let local_prefix = prepare.find("-o wlan+ -j RETURN").unwrap();
@@ -1218,12 +1232,13 @@ fn host_plan(address: &str) -> AddressHostSetPlan {
         )
         .unwrap()
         .clone();
+    let families = match address {
+        IpAddr::V4(_) => AddressHostFamilySelection::Ipv4,
+        IpAddr::V6(_) => AddressHostFamilySelection::Ipv6,
+    };
     plan_address_host_set(
         &inventory,
-        &AddressHostSetPolicy::new(
-            AddressHostFamilySelection::Ipv4,
-            AddressBypassRuleBudget::new(64).unwrap(),
-        ),
+        &AddressHostSetPolicy::new(families, AddressBypassRuleBudget::new(64).unwrap()),
     )
     .unwrap()
 }

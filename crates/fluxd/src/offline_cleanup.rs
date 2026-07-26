@@ -9,9 +9,13 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 
-use flux_platform::{DispatcherPhaseCommand, ProcessPhaseDispatcher};
+use flux_platform::{
+    DispatcherPhaseCommand, NativeCaptureConvergedState, NativeCaptureConvergence,
+    NativeCaptureDesired, ProcessPhaseDispatcher,
+};
 
 use crate::daemon::DaemonOptions;
+use crate::runtime_layout::{RuntimeLayout, RuntimeLayoutError};
 
 pub const OFFLINE_CLEANUP_BUSY_EXIT: i32 = 75;
 const EXIT_SUCCESS: i32 = 0;
@@ -156,6 +160,149 @@ pub struct OfflineCleanupReport {
     disposition: OfflineCleanupDisposition,
 }
 
+/// Proof returned only after recovery has verified that managed runtime state is cleanly absent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct VerifiedCleanAbsence(());
+
+pub(crate) trait OfflineRecovery {
+    type Error: Error + Send + Sync + 'static;
+
+    fn recover_stopped(&mut self) -> Result<VerifiedCleanAbsence, Self::Error>;
+}
+
+/// Transitional development bridge for the shell-backed package profile.
+///
+/// The public command keeps this adapter until physical Gate 1 transfers writer ownership;
+/// Rust-only packaging must then select `NativeOfflineRecovery`.
+struct BridgeOfflineRecovery {
+    dispatcher: ProcessPhaseDispatcher,
+}
+
+impl BridgeOfflineRecovery {
+    fn from_options(options: &DaemonOptions) -> Self {
+        Self {
+            dispatcher: ProcessPhaseDispatcher::new(options.phase_dispatcher_paths()),
+        }
+    }
+}
+
+impl OfflineRecovery for BridgeOfflineRecovery {
+    type Error = flux_platform::PhaseDispatcherError;
+
+    fn recover_stopped(&mut self) -> Result<VerifiedCleanAbsence, Self::Error> {
+        self.dispatcher
+            .execute(DispatcherPhaseCommand::StartupRecover)?;
+        Ok(VerifiedCleanAbsence(()))
+    }
+}
+
+/// Dispatcher-free offline recovery for the Rust-only native composition.
+///
+/// Recovery is deliberately followed by an explicit stopped convergence even when observation is
+/// already clean, then one final recovery proof retires the terminal cleanup journal. Only the
+/// convergence implementation can interpret and remove stale/foreign durable state, and only exact
+/// clean absence produces the cleanup proof.
+#[allow(
+    dead_code,
+    reason = "the Rust-only cleanup composition is selected only after physical Gate 1"
+)]
+pub(crate) struct NativeOfflineRecovery<C>
+where
+    C: NativeCaptureConvergence,
+{
+    convergence: C,
+}
+
+#[allow(
+    dead_code,
+    reason = "the Rust-only cleanup composition is selected only after physical Gate 1"
+)]
+impl<C> NativeOfflineRecovery<C>
+where
+    C: NativeCaptureConvergence,
+{
+    #[must_use]
+    pub(crate) const fn new(convergence: C) -> Self {
+        Self { convergence }
+    }
+}
+
+impl<C> OfflineRecovery for NativeOfflineRecovery<C>
+where
+    C: NativeCaptureConvergence,
+{
+    type Error = NativeOfflineRecoveryError;
+
+    fn recover_stopped(&mut self) -> Result<VerifiedCleanAbsence, Self::Error> {
+        self.convergence
+            .recover()
+            .map_err(|source| NativeOfflineRecoveryError::Recover(Box::new(source)))?;
+        let stopped = self
+            .convergence
+            .converge(NativeCaptureDesired::Stopped)
+            .map_err(|source| NativeOfflineRecoveryError::Stop(Box::new(source)))?;
+        if !matches!(stopped.state(), NativeCaptureConvergedState::CleanAbsent) {
+            return Err(NativeOfflineRecoveryError::NotCleanAbsent);
+        }
+        let settled = self
+            .convergence
+            .recover()
+            .map_err(|source| NativeOfflineRecoveryError::Recover(Box::new(source)))?;
+        if !matches!(settled.state(), NativeCaptureConvergedState::CleanAbsent) {
+            return Err(NativeOfflineRecoveryError::NotCleanAbsent);
+        }
+        Ok(VerifiedCleanAbsence(()))
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NativeOfflineRecoveryErrorKind {
+    Recover,
+    Stop,
+    NotCleanAbsent,
+}
+
+#[derive(Debug)]
+pub(crate) enum NativeOfflineRecoveryError {
+    Recover(Box<dyn Error + Send + Sync>),
+    Stop(Box<dyn Error + Send + Sync>),
+    NotCleanAbsent,
+}
+
+impl NativeOfflineRecoveryError {
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn kind(&self) -> NativeOfflineRecoveryErrorKind {
+        match self {
+            Self::Recover(_) => NativeOfflineRecoveryErrorKind::Recover,
+            Self::Stop(_) => NativeOfflineRecoveryErrorKind::Stop,
+            Self::NotCleanAbsent => NativeOfflineRecoveryErrorKind::NotCleanAbsent,
+        }
+    }
+}
+
+impl fmt::Display for NativeOfflineRecoveryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Recover(source) => write!(formatter, "recover native capture: {source}"),
+            Self::Stop(source) => write!(formatter, "converge native capture stopped: {source}"),
+            Self::NotCleanAbsent => {
+                formatter.write_str("native stopped convergence did not verify exact clean absence")
+            }
+        }
+    }
+}
+
+impl Error for NativeOfflineRecoveryError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Recover(source) | Self::Stop(source) => Some(source.as_ref()),
+            Self::NotCleanAbsent => None,
+        }
+    }
+}
+
 impl OfflineCleanupReport {
     #[must_use]
     pub const fn disposition(self) -> OfflineCleanupDisposition {
@@ -166,20 +313,23 @@ impl OfflineCleanupReport {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OfflineCleanupErrorKind {
     Busy,
+    RuntimeLayout,
     Lease,
     Recovery,
 }
 
 #[derive(Debug)]
 pub enum OfflineCleanupError {
+    RuntimeLayout(RuntimeLayoutError),
     Lease(DaemonLeaseError),
-    Recovery(flux_platform::PhaseDispatcherError),
+    Recovery(Box<dyn Error + Send + Sync>),
 }
 
 impl OfflineCleanupError {
     #[must_use]
     pub const fn kind(&self) -> OfflineCleanupErrorKind {
         match self {
+            Self::RuntimeLayout(_) => OfflineCleanupErrorKind::RuntimeLayout,
             Self::Lease(error) if matches!(error.kind(), DaemonLeaseErrorKind::Busy) => {
                 OfflineCleanupErrorKind::Busy
             }
@@ -192,6 +342,7 @@ impl OfflineCleanupError {
 impl fmt::Display for OfflineCleanupError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::RuntimeLayout(error) => write!(formatter, "runtime layout failed: {error}"),
             Self::Lease(error) => write!(formatter, "daemon exclusion failed: {error}"),
             Self::Recovery(error) => write!(formatter, "bounded recovery failed: {error}"),
         }
@@ -201,8 +352,9 @@ impl fmt::Display for OfflineCleanupError {
 impl Error for OfflineCleanupError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::RuntimeLayout(error) => Some(error),
             Self::Lease(error) => Some(error),
-            Self::Recovery(error) => Some(error),
+            Self::Recovery(error) => Some(error.as_ref()),
         }
     }
 }
@@ -210,12 +362,26 @@ impl Error for OfflineCleanupError {
 pub fn run_offline_cleanup(
     options: &DaemonOptions,
 ) -> Result<OfflineCleanupReport, OfflineCleanupError> {
-    let recovery = while_holding_daemon_lease(&options.daemon_lease_path, || {
-        let mut dispatcher = ProcessPhaseDispatcher::new(options.phase_dispatcher_paths());
-        dispatcher.execute(DispatcherPhaseCommand::StartupRecover)
-    })
-    .map_err(OfflineCleanupError::Lease)?;
-    recovery.map_err(OfflineCleanupError::Recovery)?;
+    let layout = RuntimeLayout::bootstrap(&options.runtime_root)
+        .map_err(OfflineCleanupError::RuntimeLayout)?;
+    layout
+        .require_run_child("daemon lease", &options.daemon_lease_path)
+        .map_err(OfflineCleanupError::RuntimeLayout)?;
+    let mut recovery = BridgeOfflineRecovery::from_options(options);
+    run_offline_cleanup_with_recovery(&options.daemon_lease_path, &mut recovery)
+}
+
+fn run_offline_cleanup_with_recovery<R>(
+    daemon_lease_path: &Path,
+    recovery: &mut R,
+) -> Result<OfflineCleanupReport, OfflineCleanupError>
+where
+    R: OfflineRecovery,
+{
+    let recovery = while_holding_daemon_lease(daemon_lease_path, || recovery.recover_stopped())
+        .map_err(OfflineCleanupError::Lease)?;
+    let _clean_absence =
+        recovery.map_err(|source| OfflineCleanupError::Recovery(Box::new(source)))?;
     Ok(OfflineCleanupReport {
         disposition: OfflineCleanupDisposition::Complete,
     })
@@ -531,6 +697,7 @@ fn effective_uid() -> u32 {
 mod tests {
     use std::fs;
     use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::sync::{Arc, Mutex};
 
     use tempfile::TempDir;
 
@@ -655,6 +822,31 @@ mod tests {
     }
 
     #[test]
+    fn public_cleanup_bootstraps_a_fresh_runtime_layout_before_leasing() {
+        let fixture = Fixture::new("exit 0\n");
+        fs::remove_dir(&fixture.run).expect("remove precreated run directory");
+
+        let report = run_offline_cleanup(&fixture.options).expect("clean fresh runtime layout");
+
+        assert_eq!(report.disposition(), OfflineCleanupDisposition::Complete);
+        assert!(fixture.run.is_dir());
+        assert!(fixture.root.path().join("state").is_dir());
+        assert!(fixture.options.daemon_lease_path.is_file());
+    }
+
+    #[test]
+    fn public_cleanup_rejects_a_lease_outside_the_owned_run_directory() {
+        let mut fixture = Fixture::new("exit 0\n");
+        fixture.options.daemon_lease_path = fixture.root.path().join("foreign.lease");
+
+        let error = run_offline_cleanup(&fixture.options)
+            .expect_err("cleanup lease outside run must fail closed");
+
+        assert_eq!(error.kind(), OfflineCleanupErrorKind::RuntimeLayout);
+        assert!(!fixture.options.daemon_lease_path.exists());
+    }
+
+    #[test]
     fn cleanup_cli_has_exact_syntax_and_stable_terminal_exits() {
         let fixture = Fixture::new("exit 0\n");
         let mut stdout = Vec::new();
@@ -707,6 +899,226 @@ mod tests {
         assert_eq!(stderr, b"fluxd: cleanup requires exactly --offline\n");
     }
 
+    #[test]
+    fn native_offline_recovery_is_idempotent_and_always_converges_stopped() {
+        let state = ScriptedNativeState::new(None);
+        let mut recovery = NativeOfflineRecovery::new(state.convergence());
+
+        recovery
+            .recover_stopped()
+            .expect("first clean-absence recovery");
+        recovery
+            .recover_stopped()
+            .expect("idempotent clean-absence recovery");
+
+        assert_eq!(
+            state.events(),
+            [
+                NativeRecoveryEvent::Recover(None),
+                NativeRecoveryEvent::Stop,
+                NativeRecoveryEvent::Recover(None),
+                NativeRecoveryEvent::Recover(None),
+                NativeRecoveryEvent::Stop,
+                NativeRecoveryEvent::Recover(None),
+            ]
+        );
+        assert_eq!(state.active(), None);
+    }
+
+    #[test]
+    fn native_offline_recovery_removes_stale_or_foreign_active_state() {
+        let state = ScriptedNativeState::new(Some(99));
+        let mut recovery = NativeOfflineRecovery::new(state.convergence());
+
+        recovery
+            .recover_stopped()
+            .expect("remove recovered foreign target");
+
+        assert_eq!(
+            state.events(),
+            [
+                NativeRecoveryEvent::Recover(Some(99)),
+                NativeRecoveryEvent::Stop,
+                NativeRecoveryEvent::Recover(None),
+            ]
+        );
+        assert_eq!(state.active(), None);
+    }
+
+    #[test]
+    fn native_offline_recovery_reports_partial_cleanup_without_proof() {
+        let state = ScriptedNativeState::new(Some(7));
+        state.fail_stop_once();
+        let mut recovery = NativeOfflineRecovery::new(state.convergence());
+
+        let error = recovery
+            .recover_stopped()
+            .expect_err("partial cleanup cannot issue clean-absence proof");
+
+        assert_eq!(error.kind(), NativeOfflineRecoveryErrorKind::Stop);
+        assert_eq!(state.active(), Some(7));
+    }
+
+    #[test]
+    fn native_offline_recovery_resumes_after_a_crash_interrupted_cleanup() {
+        let state = ScriptedNativeState::new(Some(11));
+        state.fail_stop_once();
+        let mut interrupted = NativeOfflineRecovery::new(state.convergence());
+        interrupted
+            .recover_stopped()
+            .expect_err("first cleanup is interrupted");
+        drop(interrupted);
+
+        NativeOfflineRecovery::new(state.convergence())
+            .recover_stopped()
+            .expect("next process recovers and finishes cleanup");
+
+        assert_eq!(state.active(), None);
+        assert_eq!(
+            state.events(),
+            [
+                NativeRecoveryEvent::Recover(Some(11)),
+                NativeRecoveryEvent::Stop,
+                NativeRecoveryEvent::Recover(Some(11)),
+                NativeRecoveryEvent::Stop,
+                NativeRecoveryEvent::Recover(None),
+            ]
+        );
+    }
+
+    #[test]
+    fn native_offline_recovery_rejects_a_false_stopped_report() {
+        let state = ScriptedNativeState::new(Some(13));
+        state.report_active_after_stop();
+        let mut recovery = NativeOfflineRecovery::new(state.convergence());
+
+        let error = recovery
+            .recover_stopped()
+            .expect_err("active stopped report cannot issue proof");
+
+        assert_eq!(error.kind(), NativeOfflineRecoveryErrorKind::NotCleanAbsent);
+        assert_eq!(state.active(), Some(13));
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum NativeRecoveryEvent {
+        Recover(Option<u64>),
+        Stop,
+    }
+
+    struct ScriptedNativeInner {
+        active: Option<u64>,
+        fail_stop_once: bool,
+        report_active_after_stop: bool,
+        events: Vec<NativeRecoveryEvent>,
+    }
+
+    #[derive(Clone)]
+    struct ScriptedNativeState {
+        inner: Arc<Mutex<ScriptedNativeInner>>,
+    }
+
+    impl ScriptedNativeState {
+        fn new(active: Option<u64>) -> Self {
+            Self {
+                inner: Arc::new(Mutex::new(ScriptedNativeInner {
+                    active,
+                    fail_stop_once: false,
+                    report_active_after_stop: false,
+                    events: Vec::new(),
+                })),
+            }
+        }
+
+        fn convergence(&self) -> ScriptedNativeConvergence {
+            ScriptedNativeConvergence {
+                inner: Arc::clone(&self.inner),
+            }
+        }
+
+        fn fail_stop_once(&self) {
+            self.inner
+                .lock()
+                .expect("native recovery state")
+                .fail_stop_once = true;
+        }
+
+        fn report_active_after_stop(&self) {
+            self.inner
+                .lock()
+                .expect("native recovery state")
+                .report_active_after_stop = true;
+        }
+
+        fn active(&self) -> Option<u64> {
+            self.inner.lock().expect("native recovery state").active
+        }
+
+        fn events(&self) -> Vec<NativeRecoveryEvent> {
+            self.inner
+                .lock()
+                .expect("native recovery state")
+                .events
+                .clone()
+        }
+    }
+
+    struct ScriptedNativeConvergence {
+        inner: Arc<Mutex<ScriptedNativeInner>>,
+    }
+
+    impl NativeCaptureConvergence for ScriptedNativeConvergence {
+        type Target = u64;
+        type Identity = u64;
+        type Error = io::Error;
+
+        fn target_identity(target: &Self::Target) -> Self::Identity {
+            *target
+        }
+
+        fn recover(
+            &mut self,
+        ) -> Result<flux_platform::NativeCaptureConvergenceReport<Self::Identity>, Self::Error>
+        {
+            let mut inner = self.inner.lock().expect("native recovery state");
+            let active = inner.active;
+            inner.events.push(NativeRecoveryEvent::Recover(active));
+            Ok(flux_platform::NativeCaptureConvergenceReport::new(
+                match active {
+                    Some(identity) => NativeCaptureConvergedState::Active(identity),
+                    None => NativeCaptureConvergedState::CleanAbsent,
+                },
+                false,
+            ))
+        }
+
+        fn converge(
+            &mut self,
+            desired: NativeCaptureDesired<Self::Target>,
+        ) -> Result<flux_platform::NativeCaptureConvergenceReport<Self::Identity>, Self::Error>
+        {
+            assert_eq!(desired, NativeCaptureDesired::Stopped);
+            let mut inner = self.inner.lock().expect("native recovery state");
+            inner.events.push(NativeRecoveryEvent::Stop);
+            if inner.fail_stop_once {
+                inner.fail_stop_once = false;
+                return Err(io::Error::other("injected partial cleanup"));
+            }
+            if inner.report_active_after_stop {
+                let identity = inner.active.expect("active false-report fixture");
+                return Ok(flux_platform::NativeCaptureConvergenceReport::new(
+                    NativeCaptureConvergedState::Active(identity),
+                    false,
+                ));
+            }
+            let changed = inner.active.take().is_some();
+            Ok(flux_platform::NativeCaptureConvergenceReport::new(
+                NativeCaptureConvergedState::CleanAbsent,
+                changed,
+            ))
+        }
+    }
+
     struct Fixture {
         root: TempDir,
         run: PathBuf,
@@ -727,6 +1139,7 @@ mod tests {
             );
             fs::write(&dispatcher, format!("#!/bin/sh\n{body}")).expect("write dispatcher");
             let options = DaemonOptions {
+                runtime_root: root.path().to_path_buf(),
                 socket_path: run.join("fluxd.sock"),
                 daemon_lease_path: run.join("fluxd.lease"),
                 config_path: root.path().join("conf/flux.toml"),

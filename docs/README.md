@@ -21,6 +21,8 @@
 
 - [Comprehensive project review (2026-07)](architecture/project-review-2026-07.md) - current
   implementation assessment, strengths, risks, alternatives, and Rust-unification recommendation.
+- [Shell runtime retirement review and plan (2026-07)](architecture/shell-runtime-retirement-plan-2026-07.md) -
+  current deviations, complete script ownership map, and the gated Rust implementation/removal sequence.
 - [Fluxd rewrite blueprint](architecture/fluxd-blueprint.md) — recommended architecture and design decisions.
 - [Technical specification](architecture/fluxd-technical-specification.md) — types, protocols, probes, transactions, backend behavior, and packaging contract.
 - [Implementation roadmap](architecture/implementation-roadmap.md) — Rust-unification critical path and verification gates.

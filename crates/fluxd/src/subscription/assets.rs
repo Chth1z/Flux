@@ -914,7 +914,7 @@ fn validate_adapter_resource(resource: &FetchedResource, maximum: u32) -> Result
     }
 }
 
-fn redacted_source_id(url: &Url) -> RedactedSourceId {
+pub(super) fn redacted_source_id(url: &Url) -> RedactedSourceId {
     let mut digest = Sha256::new();
     digest.update(REDACTED_SOURCE_DIGEST_DOMAIN);
     digest.update(url.as_str().as_bytes());

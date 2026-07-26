@@ -12,12 +12,16 @@ cleanup_install_stage() {
     [ -z "${INSTALL_STAGE}" ] || rm -rf "${INSTALL_STAGE}"
 }
 
+interrupt_install() {
+    exit 130
+}
+
 [ "${BOOTMODE:-false}" = "true" ] || abort "! Boot-mode installation is required"
 [ ! -e "${FLUX_DIR}" ] || abort "! Rust-only installation requires an empty ${FLUX_DIR}"
 [ ! -e "${INSTALL_STAGE}" ] || abort "! Temporary install path already exists"
 
-trap 'cleanup_install_stage' EXIT
-trap 'exit 130' INT TERM
+trap cleanup_install_stage EXIT
+trap interrupt_install INT TERM
 mkdir -p "${INSTALL_STAGE}" || abort "! Cannot create the runtime staging directory"
 
 unzip -o "${ZIPFILE}" \

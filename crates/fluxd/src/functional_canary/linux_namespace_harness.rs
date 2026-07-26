@@ -56,6 +56,8 @@ mod distinct_uid;
 #[cfg(target_os = "linux")]
 mod ingress_tproxy;
 mod local_output_tproxy;
+#[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+mod native_composition;
 #[path = "linux_namespace_harness/ingress_tproxy/transparent_tcp.rs"]
 mod transparent_tcp;
 #[path = "linux_namespace_harness/ingress_tproxy/transparent_udp.rs"]
@@ -97,6 +99,13 @@ fn privileged_local_output_tproxy_checkpoint_exercises_loopback_reinjection_and_
 #[ignore = "requires Linux user-namespace authority for distinct subordinate credentials"]
 fn privileged_local_output_distinct_uid_capability_preflight() {
     distinct_uid::run();
+}
+
+#[test]
+#[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+#[ignore = "requires Linux user/mount/network namespace and native xtables authority"]
+fn privileged_native_composition_exercises_lifecycle_recovery_and_exact_cleanup() {
+    native_composition::run();
 }
 
 fn run_outer() -> Result<(), String> {

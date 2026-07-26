@@ -1,16 +1,23 @@
 use std::error::Error;
 use std::fmt;
 use std::num::NonZeroU32;
+use std::time::Duration;
 
-use flux_core::Reason;
+use flux_core::{AddressResyncDisposition, Reason};
 use flux_platform::{
     NativeCaptureConvergedState, NativeCaptureConvergence, NativeCaptureDesired,
     NativeCaptureTargetIdentity,
 };
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use flux_platform::{NativeXtablesCaptureConverger, NativeXtablesCaptureTarget};
 
-use crate::EngineSpec;
 use crate::generation_engine_config::AddressReconciledGenerationInputs;
-use crate::runtime_coordinator::{LegacyRuntimeWriter, PreparedGeneration, PublishedRuntimeState};
+use crate::runtime_coordinator::{
+    AddressResyncStrategy, LegacyRuntimeWriter, PreparedGeneration, PublishedRuntimeState,
+    RuntimeCoordinator, RuntimeFunctionalCanary,
+};
+use crate::subscription::ValidatedSubscriptionEngineConfig;
+use crate::{EngineSpec, EngineSupervisor};
 
 pub(crate) trait NativeCoordinatorGenerationIdentity {
     fn coordinator_generation(self) -> Option<NonZeroU32>;
@@ -37,6 +44,16 @@ impl<T> PreparedNativeGeneration<T> {
             target,
         }
     }
+
+    #[must_use]
+    pub(crate) const fn runtime(&self) -> &PreparedGeneration {
+        &self.runtime
+    }
+
+    #[must_use]
+    pub(crate) const fn target(&self) -> &T {
+        &self.target
+    }
 }
 
 /// Lazy source accepted only after native recovery has reached verified clean absence.
@@ -54,6 +71,26 @@ pub(crate) trait NativeGenerationSource<T, I>: Send + 'static {
         inputs: &AddressReconciledGenerationInputs,
         prior: I,
     ) -> Result<Option<PreparedNativeGeneration<T>>, Self::Error>;
+
+    fn prepare_subscription(
+        &mut self,
+        _config: &ValidatedSubscriptionEngineConfig,
+        _prior: Option<I>,
+    ) -> Result<Option<PreparedNativeGeneration<T>>, Self::Error> {
+        Ok(None)
+    }
+
+    fn accept_deferred_subscription(&mut self, _config: ValidatedSubscriptionEngineConfig) -> bool {
+        false
+    }
+
+    fn settle(
+        &mut self,
+        _phase: PublishedRuntimeState,
+        _target: Option<I>,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
 }
 
 struct RetainedNativeGeneration<T> {
@@ -295,6 +332,38 @@ where
     }
 }
 
+/// Production-shaped native runtime composition with no phase-dispatch or shell dependency.
+///
+/// The caller supplies only an already composed opaque platform converger and a lazy Generation
+/// source. Recovery reaches verified clean absence before the source factory can observe any
+/// configuration. Production daemon selection remains separately fenced in `daemon`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[allow(
+    dead_code,
+    reason = "the privileged Linux gate exercises this before physical Android writer cutover"
+)]
+pub(crate) fn compose_native_runtime<S, F>(
+    convergence: NativeXtablesCaptureConverger,
+    source_factory: F,
+    maintenance_interval: Duration,
+    functional_canary: RuntimeFunctionalCanary,
+) -> Result<
+    RuntimeCoordinator<NativeCoordinatorWriter<NativeXtablesCaptureConverger, S>, EngineSupervisor>,
+    NativeCoordinatorWriterError,
+>
+where
+    S: NativeGenerationSource<NativeXtablesCaptureTarget, NativeCaptureTargetIdentity>,
+    F: FnOnce() -> S,
+{
+    let writer = NativeCoordinatorWriter::recover_then_accept_source(convergence, source_factory)?;
+    Ok(RuntimeCoordinator::with_dependencies(
+        writer,
+        EngineSupervisor::new(),
+        maintenance_interval,
+        functional_canary,
+    ))
+}
+
 impl<C, S> LegacyRuntimeWriter for NativeCoordinatorWriter<C, S>
 where
     C: NativeCaptureConvergence,
@@ -332,6 +401,29 @@ where
             .transpose()
     }
 
+    fn prepare_subscription(
+        &mut self,
+        config: &ValidatedSubscriptionEngineConfig,
+    ) -> Result<Option<PreparedGeneration>, Self::Error> {
+        let prior = self.prior_identity();
+        let prepared = self
+            .source
+            .prepare_subscription(config, prior)
+            .map_err(|source| {
+                NativeCoordinatorWriterError::preparation(
+                    "prepare subscription-backed native Generation",
+                    source,
+                )
+            })?;
+        prepared
+            .map(|prepared| self.retain_candidate(prepared))
+            .transpose()
+    }
+
+    fn accept_deferred_subscription(&mut self, config: ValidatedSubscriptionEngineConfig) -> bool {
+        self.source.accept_deferred_subscription(config)
+    }
+
     fn capture_start(&mut self, generation: &PreparedGeneration) -> Result<(), Self::Error> {
         self.converge_active(generation.id())
     }
@@ -356,11 +448,30 @@ where
             PublishedRuntimeState::Running { generation } => self.commit_running(generation),
             PublishedRuntimeState::Stopped => self.commit_terminal(),
             PublishedRuntimeState::Failed => self.commit_failed_activation(),
-        }
+        }?;
+        let target = match phase {
+            PublishedRuntimeState::Running { generation } => {
+                Some(C::target_identity(&self.retained(generation)?.target))
+            }
+            PublishedRuntimeState::Failed => self.prior_identity(),
+            PublishedRuntimeState::Stopped => None,
+        };
+        self.source.settle(phase, target).map_err(|source| {
+            NativeCoordinatorWriterError::preparation(
+                "settle native Generation source transaction",
+                source,
+            )
+        })
     }
 
-    fn resync_addresses(&mut self) -> Result<(), Self::Error> {
-        Ok(())
+    fn resync_addresses(&mut self) -> Result<AddressResyncDisposition, Self::Error> {
+        Err(NativeCoordinatorWriterError::Invariant(
+            "native address resync must use coordinator-owned synchronous reconciliation",
+        ))
+    }
+
+    fn address_resync_strategy(&self) -> AddressResyncStrategy {
+        AddressResyncStrategy::CoordinatorSynchronous
     }
 }
 
@@ -937,6 +1048,178 @@ mod tests {
         let snapshot = coordinator.runtime_snapshot_source().snapshot();
         assert_eq!(snapshot.phase, RuntimePhase::Running);
         assert_eq!(snapshot.generation, Some(2));
+    }
+
+    #[test]
+    fn explicit_native_resync_defers_while_complete_inventory_is_unavailable() {
+        let active = EngineFixture::new();
+        let (_configuration, desired_state_path) = desired_state_fixture();
+        let (_inventory_source, reconciler) = AddressReconciler::replay(&desired_state_path);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let writer = writer(&events, None, None, [generation(1, &active)], []);
+        events.lock().expect("native events lock").clear();
+        let mut coordinator = coordinator(writer, &events).with_address_reconciler(reconciler);
+        coordinator
+            .execute(&LegacyIntent::Running {
+                reason: Reason::Boot,
+            })
+            .expect("initial native Generation converges");
+        events.lock().expect("native events lock").clear();
+
+        let completion = coordinator
+            .execute(&LegacyIntent::ResyncAddresses {
+                reason: Reason::Fluxctl,
+            })
+            .expect("missing inventory is a deferred resync");
+
+        assert_eq!(
+            completion,
+            flux_core::DispatcherCompletion::AddressResync(
+                AddressResyncDisposition::AcceptedDeferred
+            )
+        );
+        assert!(events.lock().expect("native events lock").is_empty());
+    }
+
+    #[test]
+    fn explicit_native_resync_reports_complete_no_change_only_after_fresh_compilation() {
+        let active = EngineFixture::new();
+        let (_configuration, desired_state_path) = desired_state_fixture();
+        let (inventory_source, reconciler) = AddressReconciler::replay(&desired_state_path);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let writer = writer(&events, None, None, [generation(1, &active)], []);
+        events.lock().expect("native events lock").clear();
+        let mut coordinator = coordinator(writer, &events).with_address_reconciler(reconciler);
+        coordinator
+            .execute(&LegacyIntent::Running {
+                reason: Reason::Boot,
+            })
+            .expect("initial native Generation converges");
+        events.lock().expect("native events lock").clear();
+        inventory_source.publish(Some(complete_inventory()));
+
+        let completion = coordinator
+            .execute(&LegacyIntent::ResyncAddresses {
+                reason: Reason::Fluxctl,
+            })
+            .expect("fresh no-change resync");
+
+        assert_eq!(
+            completion,
+            flux_core::DispatcherCompletion::AddressResync(
+                AddressResyncDisposition::CompleteNoChange
+            )
+        );
+        assert!(events.lock().expect("native events lock").is_empty());
+    }
+
+    #[test]
+    fn explicit_native_resync_reports_success_only_after_successor_convergence() {
+        let active = EngineFixture::new();
+        let successor = EngineFixture::new();
+        let (_configuration, desired_state_path) = desired_state_fixture();
+        let (inventory_source, reconciler) = AddressReconciler::replay(&desired_state_path);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let writer = writer(
+            &events,
+            None,
+            None,
+            [generation(1, &active)],
+            [generation(2, &successor)],
+        );
+        events.lock().expect("native events lock").clear();
+        let mut coordinator = coordinator(writer, &events).with_address_reconciler(reconciler);
+        coordinator
+            .execute(&LegacyIntent::Running {
+                reason: Reason::Boot,
+            })
+            .expect("initial native Generation converges");
+        events.lock().expect("native events lock").clear();
+        inventory_source.publish(Some(complete_inventory()));
+
+        let completion = coordinator
+            .execute(&LegacyIntent::ResyncAddresses {
+                reason: Reason::Fluxctl,
+            })
+            .expect("address successor converges synchronously");
+
+        assert_eq!(
+            completion,
+            flux_core::DispatcherCompletion::AddressResync(
+                AddressResyncDisposition::SuccessorConverged
+            )
+        );
+        assert_eq!(
+            *events.lock().expect("native events lock"),
+            [
+                Event::PreparedAddress {
+                    generation: 2,
+                    prior: 1,
+                },
+                Event::ConvergedStopped,
+                Event::EngineRunning(CaptureObservation::Detached),
+                Event::ConvergedActive(2),
+            ]
+        );
+        assert_eq!(
+            coordinator.runtime_snapshot_source().snapshot().generation,
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn explicit_native_resync_does_not_claim_queued_success_before_runtime_readiness() {
+        let active = EngineFixture::new();
+        let failed = EngineFixture::new();
+        let successor = EngineFixture::new();
+        let (_configuration, desired_state_path) = desired_state_fixture();
+        let (inventory_source, reconciler) = AddressReconciler::replay(&desired_state_path);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let writer = writer(
+            &events,
+            None,
+            Some(2),
+            [generation(1, &active), generation(2, &failed)],
+            [generation(2, &successor)],
+        );
+        events.lock().expect("native events lock").clear();
+        let mut coordinator = coordinator(writer, &events).with_address_reconciler(reconciler);
+        coordinator
+            .execute(&LegacyIntent::Running {
+                reason: Reason::Boot,
+            })
+            .expect("initial native Generation converges");
+        coordinator
+            .execute(&LegacyIntent::Reload {
+                reason: Reason::Fluxctl,
+            })
+            .expect_err("injected candidate failure degrades the active runtime");
+        assert_eq!(
+            coordinator.runtime_snapshot_source().snapshot().phase,
+            RuntimePhase::Degraded
+        );
+        events.lock().expect("native events lock").clear();
+        inventory_source.publish(Some(complete_inventory()));
+
+        let completion = coordinator
+            .execute(&LegacyIntent::ResyncAddresses {
+                reason: Reason::Fluxctl,
+            })
+            .expect("unready runtime queues address reconciliation");
+
+        assert_eq!(
+            completion,
+            flux_core::DispatcherCompletion::AddressResync(
+                AddressResyncDisposition::AcceptedDeferred
+            )
+        );
+        assert!(events.lock().expect("native events lock").is_empty());
+
+        coordinator.maintain();
+        assert_eq!(
+            coordinator.runtime_snapshot_source().snapshot().generation,
+            Some(2)
+        );
     }
 
     #[test]

@@ -7,6 +7,9 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+native-composition-test = ["flux-platform/native-composition-test"]
+
 [dependencies]
 base64.workspace = true
 flux-core = { path = "../flux-core" }
@@ -23,6 +26,13 @@ libc.workspace = true
 [dev-dependencies]
 flux-testkit = { path = "../flux-testkit" }
 tempfile = "3"
+
+[[bin]]
+name = "flux-native-composition-engine"
+path = "src/bin/native_composition_engine.rs"
+required-features = ["native-composition-test"]
+test = false
+bench = false
 
 [lints]
 workspace = true

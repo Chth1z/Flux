@@ -26,12 +26,19 @@ mod legacy_rules_cli;
 mod legacy_rules_manifest;
 #[allow(
     dead_code,
+    reason = "H4 composes the native Generation source before the physical writer cutover"
+)]
+mod native_generation_source;
+#[allow(
+    dead_code,
     reason = "A4 host-verifies native composition before the Gate 1 cutover"
 )]
 mod native_runtime_writer;
 mod offline_cleanup;
 mod protocol;
 mod runtime_coordinator;
+mod runtime_layout;
+mod runtime_logging;
 mod runtime_status;
 mod socket;
 mod subscription;
@@ -74,6 +81,10 @@ pub use offline_cleanup::{
 pub use protocol::{
     DaemonSnapshot, EventDisposition, EventReport, MAX_CONTROL_PACKET_BYTES, ProtocolHandler,
     RequestPeerId,
+};
+pub use runtime_layout::{RuntimeLayoutError, RuntimeLayoutErrorKind};
+pub use runtime_logging::{
+    MAX_RUNTIME_LOG_FILE_BYTES, MAX_RUNTIME_LOG_RECORD_BYTES, RuntimeLogError, RuntimeLogErrorKind,
 };
 pub use runtime_status::{
     RuntimeCaptureState, RuntimeEngineState, RuntimeFailure, RuntimePhase, RuntimeSnapshot,
@@ -374,7 +385,16 @@ where
 
     match control.submit_and_wait(intent) {
         Ok(report) => {
-            if writeln!(stdout, "completed revision {}", report.revision).is_ok() {
+            let written = match report.address_resync {
+                Some(disposition) => writeln!(
+                    stdout,
+                    "completed revision {} resync {}",
+                    report.revision,
+                    disposition.as_token()
+                ),
+                None => writeln!(stdout, "completed revision {}", report.revision),
+            };
+            if written.is_ok() {
                 EXIT_SUCCESS
             } else {
                 EXIT_RUNTIME_ERROR
@@ -962,6 +982,11 @@ where
         .last_error
         .as_ref()
         .map_or_else(|| "none".to_owned(), format_runtime_failure);
+    let address_resync = snapshot
+        .control
+        .last_completed
+        .and_then(|report| report.address_resync)
+        .map_or("none", flux_core::AddressResyncDisposition::as_token);
     if writeln!(stdout, "daemon: {daemon_state}").is_err()
         || writeln!(
             stdout,
@@ -1078,6 +1103,7 @@ where
         )
         .is_err()
         || writeln!(stdout, "revision: {}", snapshot.control.revision).is_err()
+        || writeln!(stdout, "last address resync: {address_resync}").is_err()
         || writeln!(stdout, "runtime revision: {}", snapshot.runtime.revision).is_err()
         || writeln!(
             stdout,
@@ -1353,6 +1379,8 @@ impl From<LegacyIntent> for OnlineIntentDocument {
 struct OnlineOperationDocument {
     intent: OnlineIntentDocument,
     revision: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    address_resync: Option<&'static str>,
 }
 
 impl From<OperationReport> for OnlineOperationDocument {
@@ -1360,6 +1388,9 @@ impl From<OperationReport> for OnlineOperationDocument {
         Self {
             intent: report.intent.into(),
             revision: report.revision,
+            address_resync: report
+                .address_resync
+                .map(flux_core::AddressResyncDisposition::as_token),
         }
     }
 }

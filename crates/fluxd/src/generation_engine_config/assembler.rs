@@ -10,24 +10,23 @@ use flux_core::{
     CapabilityProfile, CaptureApplicationMode, CaptureBackend, CaptureInterfaceSelectorKind,
     CaptureTrafficDomain, CaptureTransportProtocol, FluxConfig, FwmarkCandidate,
     NetworkAddressFamily, NetworkEpoch, NetworkInventory, NetworkInventorySnapshotId,
-    NetworkNamespaceIdentity, RouteProtocol, RouteTableId, RpdbPlacementLease, RuleProtocol,
-    StaleRpdbPlacementLease,
+    NetworkNamespaceIdentity, RpdbPlacementLease, StaleRpdbPlacementLease,
 };
 use flux_platform::{
     SingBoxLauncher, SingBoxReadiness, XtablesCaptureArtifactSet, XtablesCaptureLoweringError,
     XtablesCaptureLoweringRequest, XtablesCaptureNamespace, XtablesLocalOutputRoutingSpec,
-    XtablesLocalOutputRoutingTarget, XtablesTproxyTarget, lower_xtables_capture,
+    XtablesTproxyTarget, lower_xtables_capture, plan_native_xtables_local_output_routing,
 };
 use sha2::{Digest, Sha256};
 
 use super::{
     DesiredStateArtifacts, EngineCapabilityProfile, EngineConfigBindingError,
-    TproxyGenerationCandidate, TproxyGenerationCandidateError, bind_engine_config_to_spec,
-    compile_tproxy_generation_candidate,
+    SelectedEngineSourceIdentity, TproxyGenerationCandidate, TproxyGenerationCandidateError,
+    bind_engine_config_to_spec, compile_tproxy_generation_candidate,
 };
 use crate::{EngineSpec, RestartPolicy, RestartPolicyError};
 
-pub(crate) const ADMITTED_GENERATION_SCHEMA_VERSION: u16 = 1;
+pub(crate) const ADMITTED_GENERATION_SCHEMA_VERSION: u16 = 2;
 const GENERATION_ASSEMBLY_DIGEST_BYTES: usize = 32;
 const GENERATION_ASSEMBLY_DIGEST_DOMAIN: &[u8] =
     b"Flux coordinator-facing admitted Generation\0sha256-v1\0";
@@ -35,9 +34,6 @@ const GENERATION_PLANNING_DIGEST_DOMAIN: &[u8] =
     b"Flux complete Generation planning authority\0canonical-schema-v1\0sha256-v1\0";
 const PRODUCT_DESIRED_STATE_DIGEST_DOMAIN: &[u8] =
     b"Flux product Desired State\0schema-v3\0sha256-v1\0";
-const DEFAULT_ROUTE_METRIC: u32 = 1_024;
-const DEFAULT_ROUTE_PROTOCOL: u8 = 4;
-const DEFAULT_RULE_PROTOCOL: u8 = 99;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(transparent)]
@@ -170,6 +166,14 @@ impl GenerationPlanningAuthority {
             Self::Android { .. } => GenerationAdmissionKind::AndroidPlanningEvidence,
         }
     }
+
+    #[must_use]
+    pub(crate) const fn capability_profile(&self) -> &CapabilityProfile {
+        match self {
+            Self::HostInspection(authority) => &authority.capability_profile,
+            Self::Android { mark, .. } => mark.capability_profile(),
+        }
+    }
 }
 
 pub(crate) struct GenerationAssemblyRequest<'a> {
@@ -225,6 +229,7 @@ pub(crate) struct AdmittedGeneration {
     candidate: TproxyGenerationCandidate,
     engine_spec: EngineSpec,
     capture: flux_core::ShadowCompilationReport,
+    engine_source: SelectedEngineSourceIdentity,
     xtables: XtablesCaptureArtifactSet,
     planning_digest: GenerationPlanningDigest,
     planning: GenerationPlanningAuthority,
@@ -277,6 +282,11 @@ impl AdmittedGeneration {
     }
 
     #[must_use]
+    pub(crate) const fn engine_source(&self) -> SelectedEngineSourceIdentity {
+        self.engine_source
+    }
+
+    #[must_use]
     pub(crate) const fn xtables(&self) -> &XtablesCaptureArtifactSet {
         &self.xtables
     }
@@ -285,7 +295,94 @@ impl AdmittedGeneration {
     pub(crate) const fn planning_digest(&self) -> GenerationPlanningDigest {
         self.planning_digest
     }
+
+    pub(crate) fn into_native_target_request(
+        self,
+    ) -> Result<NativeGenerationTargetRequest, NativeGenerationPromotionError> {
+        match self.planning {
+            GenerationPlanningAuthority::HostInspection(_) => {
+                Err(NativeGenerationPromotionError::HostInspectionNonPromotable)
+            }
+            GenerationPlanningAuthority::Android { mark, placement } => {
+                let placement =
+                    placement.ok_or(NativeGenerationPromotionError::MissingAndroidPlacement)?;
+                Ok(NativeGenerationTargetRequest {
+                    mark: *mark,
+                    placement,
+                    xtables: self.xtables,
+                })
+            }
+        }
+    }
+
+    #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+    pub(crate) fn into_linux_composition_test_request(
+        self,
+    ) -> Result<LinuxCompositionTestTargetRequest, LinuxCompositionTestPromotionError> {
+        match self.planning {
+            GenerationPlanningAuthority::HostInspection(authority) => {
+                Ok(LinuxCompositionTestTargetRequest {
+                    network_namespace: authority.network_namespace,
+                    xtables: self.xtables,
+                })
+            }
+            GenerationPlanningAuthority::Android { .. } => {
+                Err(LinuxCompositionTestPromotionError::AndroidAuthorityForbidden)
+            }
+        }
+    }
 }
+
+pub(crate) struct NativeGenerationTargetRequest {
+    pub(crate) mark: AndroidMarkPlanningAuthority,
+    pub(crate) placement: RpdbPlacementLease,
+    pub(crate) xtables: XtablesCaptureArtifactSet,
+}
+
+#[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+pub(crate) struct LinuxCompositionTestTargetRequest {
+    pub(crate) network_namespace: NetworkNamespaceIdentity,
+    pub(crate) xtables: XtablesCaptureArtifactSet,
+}
+
+#[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LinuxCompositionTestPromotionError {
+    AndroidAuthorityForbidden,
+}
+
+#[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+impl fmt::Display for LinuxCompositionTestPromotionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(
+            "Android planning evidence cannot enter the Linux native-composition test seam",
+        )
+    }
+}
+
+#[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+impl Error for LinuxCompositionTestPromotionError {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NativeGenerationPromotionError {
+    HostInspectionNonPromotable,
+    MissingAndroidPlacement,
+}
+
+impl fmt::Display for NativeGenerationPromotionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::HostInspectionNonPromotable => formatter.write_str(
+                "host inspection evidence cannot be promoted to native mutation authority",
+            ),
+            Self::MissingAndroidPlacement => formatter.write_str(
+                "Android planning evidence has no RPDB placement for native target admission",
+            ),
+        }
+    }
+}
+
+impl Error for NativeGenerationPromotionError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GenerationPlanningErrorKind {
@@ -422,10 +519,11 @@ impl GenerationAssembler {
             planning,
             prior_owned,
         } = request;
-        let (desired_state, engine_config, capture) = desired_state.into_parts();
+        let (desired_state, engine_source, capture) = desired_state.into_parts();
+        let engine_source_identity = engine_source.identity();
         let engine_spec = bind_engine_spec_to_desired_state(&desired_state, engine_spec)
             .map_err(GenerationAssemblyError::DesiredStateEngine)?;
-        let binding = bind_engine_config_to_spec(engine_config, &engine_spec)
+        let binding = bind_engine_config_to_spec(engine_source.into_artifact(), &engine_spec)
             .map_err(GenerationAssemblyError::EngineConfig)?;
         let candidate = compile_tproxy_generation_candidate(
             capability_profile,
@@ -446,15 +544,16 @@ impl GenerationAssembler {
             lowering = lowering.with_local_output_routing(routing);
         }
         let xtables = lower_xtables_capture(lowering).map_err(GenerationAssemblyError::Xtables)?;
-        let digest = digest_generation(
+        let digest = digest_generation(GenerationDigestInput {
             generation,
             prior_owned,
-            &desired_state,
-            &candidate,
-            &engine_spec,
-            &xtables,
+            desired_state: &desired_state,
+            candidate: &candidate,
+            engine_spec: &engine_spec,
+            engine_source_identity,
+            xtables: &xtables,
             planning_context,
-        );
+        });
 
         Ok(AdmittedGeneration {
             identity: AdmittedGenerationIdentity { generation, digest },
@@ -463,6 +562,7 @@ impl GenerationAssembler {
             candidate,
             engine_spec,
             capture,
+            engine_source: engine_source_identity,
             xtables,
             planning_digest: planning_context.digest,
             planning,
@@ -664,28 +764,14 @@ fn routing_from_placement(
     placement: RpdbPlacementLease,
     families: AddressHostFamilySelection,
 ) -> Result<XtablesLocalOutputRoutingSpec, GenerationPlanningError> {
-    let mut targets = [None, None];
-    for (index, family) in [NetworkAddressFamily::Ipv4, NetworkAddressFamily::Ipv6]
-        .into_iter()
-        .enumerate()
-    {
-        let family_placement = placement.family(family);
-        if family_placement.is_some() != families.includes(family) {
-            return Err(GenerationPlanningError::RoutingFamilyMismatch { family });
+    plan_native_xtables_local_output_routing(placement, families).map_err(|source| match source {
+        flux_platform::NativeXtablesRoutingPlanError::FamilyMismatch { family } => {
+            GenerationPlanningError::RoutingFamilyMismatch { family }
         }
-        targets[index] = family_placement.map(|placement| {
-            XtablesLocalOutputRoutingTarget::new(
-                placement.proxy_priority(),
-                RouteTableId::from_raw(placement.private_table().get()),
-                NonZeroU32::new(DEFAULT_ROUTE_METRIC).expect("route metric is nonzero"),
-                RouteProtocol::from_raw(DEFAULT_ROUTE_PROTOCOL),
-                RuleProtocol::from_raw(DEFAULT_RULE_PROTOCOL),
-            )
-            .expect("reviewed routing constants and placement are structurally valid")
-        });
-    }
-    XtablesLocalOutputRoutingSpec::new(targets[0], targets[1])
-        .map_err(|_| GenerationPlanningError::MissingLocalOutputRouting)
+        flux_platform::NativeXtablesRoutingPlanError::NoEnabledFamilies => {
+            GenerationPlanningError::MissingLocalOutputRouting
+        }
+    })
 }
 
 fn next_generation(
@@ -781,15 +867,28 @@ pub(crate) fn bind_engine_spec_to_desired_state(
     Ok(spec.with_restart_policy(restart))
 }
 
-fn digest_generation(
+struct GenerationDigestInput<'a> {
     generation: NonZeroU32,
     prior_owned: Option<AdmittedGenerationIdentity>,
-    desired_state: &FluxConfig,
-    candidate: &TproxyGenerationCandidate,
-    engine_spec: &EngineSpec,
-    xtables: &XtablesCaptureArtifactSet,
-    planning: PlanningContext,
-) -> GenerationAssemblyDigest {
+    desired_state: &'a FluxConfig,
+    candidate: &'a TproxyGenerationCandidate,
+    engine_spec: &'a EngineSpec,
+    engine_source_identity: SelectedEngineSourceIdentity,
+    xtables: &'a XtablesCaptureArtifactSet,
+    planning_context: PlanningContext,
+}
+
+fn digest_generation(input: GenerationDigestInput<'_>) -> GenerationAssemblyDigest {
+    let GenerationDigestInput {
+        generation,
+        prior_owned,
+        desired_state,
+        candidate,
+        engine_spec,
+        engine_source_identity,
+        xtables,
+        planning_context,
+    } = input;
     let mut digest = Sha256::new();
     digest.update(GENERATION_ASSEMBLY_DIGEST_DOMAIN);
     update_field(
@@ -807,6 +906,20 @@ fn digest_generation(
     }
     update_field(&mut digest, &digest_product_desired_state(desired_state));
     update_field(&mut digest, candidate.engine_config().digest().as_bytes());
+    match engine_source_identity {
+        SelectedEngineSourceIdentity::Template { template_digest } => {
+            digest.update([0]);
+            update_field(&mut digest, &template_digest);
+        }
+        SelectedEngineSourceIdentity::Subscription {
+            snapshot_digest,
+            subscription_source,
+        } => {
+            digest.update([1]);
+            update_field(&mut digest, &snapshot_digest);
+            update_field(&mut digest, &subscription_source);
+        }
+    }
     update_field(
         &mut digest,
         candidate.engine_profile().revision().as_bytes(),
@@ -826,21 +939,21 @@ fn digest_generation(
     );
     update_field(&mut digest, xtables.digest().as_bytes());
     update_engine_spec(&mut digest, engine_spec);
-    update_field(&mut digest, planning.digest.as_bytes());
-    digest.update([match planning.kind {
+    update_field(&mut digest, planning_context.digest.as_bytes());
+    digest.update([match planning_context.kind {
         GenerationAdmissionKind::HostInspectionOnly => 0,
         GenerationAdmissionKind::AndroidPlanningEvidence => 1,
     }]);
     update_field(
         &mut digest,
-        &planning.network_namespace.device().to_be_bytes(),
+        &planning_context.network_namespace.device().to_be_bytes(),
     );
     update_field(
         &mut digest,
-        &planning.network_namespace.inode().to_be_bytes(),
+        &planning_context.network_namespace.inode().to_be_bytes(),
     );
-    update_mark(&mut digest, planning.mark);
-    update_routing(&mut digest, planning.routing);
+    update_mark(&mut digest, planning_context.mark);
+    update_routing(&mut digest, planning_context.routing);
     GenerationAssemblyDigest(digest.finalize().into())
 }
 

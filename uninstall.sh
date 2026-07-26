@@ -11,12 +11,12 @@ readonly FLUXD_BIN="/data/adb/flux/bin/fluxd"
 [ -x "${FLUXD_BIN}" ] || exit 0
 
 # Let the live daemon serialize its own stop/recovery while its lease is held.
-if "${FLUXD_BIN}" ping >/dev/null 2>&1; then
-    if "${FLUXD_BIN}" stop; then
+if /data/adb/flux/bin/fluxd ping >/dev/null 2>&1; then
+    if /data/adb/flux/bin/fluxd stop; then
         exit 0
     fi
 fi
 
 # If no daemon answers, Rust's kernel lease and durable ownership records decide
 # whether bounded offline cleanup may proceed.
-exec "${FLUXD_BIN}" cleanup --offline
+exec /data/adb/flux/bin/fluxd cleanup --offline

@@ -6,6 +6,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -20,6 +21,7 @@ use tempfile::tempdir;
 const PACKAGED_CONFIG: &str = include_str!("../../../conf/flux.toml");
 const UNSUPPORTED_HELPER_ROOT: &str = "FLUXD_TEST_UNSUPPORTED_HELPER_ROOT";
 const SUPPORTED_PROFILE_BOOT_ID: &str = "01234567-89ab-cdef-0123-456789abcdef";
+static RUN_DAEMON_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
 fn packaged_default_config_matches_the_strict_product_schema() {
@@ -37,6 +39,7 @@ fn packaged_default_config_matches_the_strict_product_schema() {
 
 #[test]
 fn failed_startup_reconciliation_never_admits_a_control_socket() {
+    let _run_daemon_guard = run_daemon_test_guard();
     let directory = tempdir().expect("temporary directory");
     let root = directory.path().join("flux");
     let disable_path = directory.path().join("disable");
@@ -66,22 +69,17 @@ fn failed_startup_reconciliation_never_admits_a_control_socket() {
 
 #[test]
 fn startup_persistence_error_preserves_its_source_chain_before_socket_admission() {
+    let _run_daemon_guard = run_daemon_test_guard();
     let directory = tempdir().expect("temporary directory");
     let root = directory.path().join("flux");
     let disable_path = directory.path().join("disable");
-    let blocked_parent = root.join("state/not-a-directory");
+    let blocked_intent = root.join("state/administrative-intent.json");
 
     fs::create_dir_all(root.join("state")).expect("create state directory");
-    fs::write(&blocked_parent, "blocks intent directory traversal\n")
-        .expect("create non-directory intent parent");
+    fs::create_dir(&blocked_intent).expect("create non-file intent path");
     fs::write(&disable_path, "").expect("request stopped startup state");
 
-    let options = daemon_options(
-        &root,
-        &disable_path,
-        blocked_parent.join("administrative-intent.json"),
-        "exit 73\n",
-    );
+    let options = daemon_options(&root, &disable_path, blocked_intent, "exit 73\n");
     let socket_path = options.socket_path.clone();
     let profile_source = supported_profile_source();
 
@@ -108,6 +106,7 @@ fn startup_persistence_error_preserves_its_source_chain_before_socket_admission(
 
 #[test]
 fn cold_desired_stopped_runs_startup_recovery_before_the_initial_intent() {
+    let _run_daemon_guard = run_daemon_test_guard();
     let directory = tempdir().expect("temporary directory");
     let root = directory.path().join("flux");
     let disable_path = directory.path().join("disable");
@@ -163,6 +162,7 @@ fn cold_desired_stopped_runs_startup_recovery_before_the_initial_intent() {
 
 #[test]
 fn failed_startup_recovery_never_persists_or_executes_the_initial_intent() {
+    let _run_daemon_guard = run_daemon_test_guard();
     let directory = tempdir().expect("temporary directory");
     let root = directory.path().join("flux");
     let disable_path = directory.path().join("disable");
@@ -212,6 +212,7 @@ enum ConfigFailureCase {
 }
 
 fn assert_supported_config_failure(case: ConfigFailureCase) {
+    let _run_daemon_guard = run_daemon_test_guard();
     let directory = tempdir().expect("temporary directory");
     let root = directory.path().join("flux");
     let disable_path = directory.path().join("disable");
@@ -353,6 +354,7 @@ fn unsupported_kernel_daemon_helper() {
     };
     let run = root.join("run");
     let options = DaemonOptions {
+        runtime_root: root.clone(),
         socket_path: run.join("fluxd.sock"),
         daemon_lease_path: run.join("fluxd.lease"),
         config_path: root.join("conf/flux.toml"),
@@ -402,6 +404,7 @@ fn daemon_options(
     write_script(&addrsync_script, "exit 0\n");
 
     DaemonOptions {
+        runtime_root: root.to_path_buf(),
         socket_path: run.join("fluxd.sock"),
         daemon_lease_path: run.join("fluxd.lease"),
         config_path: root.join("conf/flux.toml"),
@@ -421,6 +424,12 @@ fn daemon_options(
 
 fn supported_profile_source() -> StaticCapabilityProfileSource {
     StaticCapabilityProfileSource::new(CapabilityProfileFixture::supported())
+}
+
+fn run_daemon_test_guard() -> MutexGuard<'static, ()> {
+    RUN_DAEMON_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn wait_for_socket(child: &mut Child, socket_path: &Path) {

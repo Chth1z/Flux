@@ -1874,7 +1874,11 @@ fn render_direct_clause(
         }
         CapturePredicate::DestinationHosts(hosts) => {
             for host in hosts {
-                rules.push(format!("-A {chain} -d {host} -j RETURN"));
+                let prefix_length = match host {
+                    IpAddr::V4(_) => 32,
+                    IpAddr::V6(_) => 128,
+                };
+                rules.push(format!("-A {chain} -d {host}/{prefix_length} -j RETURN"));
             }
         }
         CapturePredicate::InterfaceMatches {

@@ -4,8 +4,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use flux_core::{
-    AdministrativeState, ConfigurationChangeReport, ControlError, ControlObservation,
-    LegacyControlBridge, LegacyDispatcher, LegacyIntent, OperationReport, Reason,
+    AddressResyncDisposition, AdministrativeState, ConfigurationChangeReport, ControlError,
+    ControlObservation, DispatcherCompletion, LegacyControlBridge, LegacyDispatcher, LegacyIntent,
+    OperationReport, Reason,
 };
 
 #[test]
@@ -31,6 +32,7 @@ fn running_intent_updates_the_snapshot_after_dispatcher_success() {
                 reason: Reason::Fluxctl,
             },
             revision: 2,
+            address_resync: None,
         }
     );
     assert_eq!(
@@ -418,10 +420,11 @@ struct MaintenanceDispatcher {
 }
 
 impl LegacyDispatcher for MaintenanceDispatcher {
-    fn execute(&mut self, _intent: &LegacyIntent) -> Result<(), ControlError> {
+    fn execute(&mut self, intent: &LegacyIntent) -> Result<DispatcherCompletion, ControlError> {
         self.event_tx
             .send(MaintenanceEvent::Executed)
             .map_err(|error| ControlError::dispatcher(error.to_string()))
+            .map(|()| completion_for(intent))
     }
 
     fn maintenance_interval(&self) -> Option<Duration> {
@@ -438,9 +441,9 @@ impl LegacyDispatcher for MaintenanceDispatcher {
 }
 
 impl LegacyDispatcher for RecordingDispatcher {
-    fn execute(&mut self, intent: &LegacyIntent) -> Result<(), ControlError> {
+    fn execute(&mut self, intent: &LegacyIntent) -> Result<DispatcherCompletion, ControlError> {
         self.calls.lock().expect("calls lock").push(*intent);
-        Ok(())
+        Ok(completion_for(intent))
     }
 }
 
@@ -462,7 +465,7 @@ struct ConfigurationConsumptionDispatcher {
 }
 
 impl LegacyDispatcher for BlockingRecordingDispatcher {
-    fn execute(&mut self, intent: &LegacyIntent) -> Result<(), ControlError> {
+    fn execute(&mut self, intent: &LegacyIntent) -> Result<DispatcherCompletion, ControlError> {
         self.calls.lock().expect("calls lock").push(*intent);
         if let Some(entered_tx) = self.entered_tx.take() {
             entered_tx
@@ -472,12 +475,12 @@ impl LegacyDispatcher for BlockingRecordingDispatcher {
                 .recv()
                 .map_err(|error| ControlError::dispatcher(error.to_string()))?;
         }
-        Ok(())
+        Ok(completion_for(intent))
     }
 }
 
 impl LegacyDispatcher for ConfigurationConsumptionDispatcher {
-    fn execute(&mut self, intent: &LegacyIntent) -> Result<(), ControlError> {
+    fn execute(&mut self, intent: &LegacyIntent) -> Result<DispatcherCompletion, ControlError> {
         self.calls.lock().expect("calls lock").push(*intent);
         if let Some(entered_tx) = self.entered_tx.take() {
             entered_tx
@@ -487,7 +490,7 @@ impl LegacyDispatcher for ConfigurationConsumptionDispatcher {
                 .recv()
                 .map_err(|error| ControlError::dispatcher(error.to_string()))?;
         }
-        Ok(())
+        Ok(completion_for(intent))
     }
 
     fn configuration_inputs_consumed(&mut self) {
@@ -504,10 +507,11 @@ fn wait_until(timeout: Duration, condition: impl Fn() -> bool) {
 }
 
 impl LegacyDispatcher for NotifyingDispatcher {
-    fn execute(&mut self, intent: &LegacyIntent) -> Result<(), ControlError> {
+    fn execute(&mut self, intent: &LegacyIntent) -> Result<DispatcherCompletion, ControlError> {
         self.completed_tx
             .send(*intent)
             .map_err(|error| ControlError::dispatcher(error.to_string()))
+            .map(|()| completion_for(intent))
     }
 }
 
@@ -519,17 +523,28 @@ struct ConcurrencyCheckingDispatcher {
 struct FailingDispatcher;
 
 impl LegacyDispatcher for FailingDispatcher {
-    fn execute(&mut self, _intent: &LegacyIntent) -> Result<(), ControlError> {
+    fn execute(&mut self, _intent: &LegacyIntent) -> Result<DispatcherCompletion, ControlError> {
         Err(ControlError::dispatcher("injected failure"))
     }
 }
 
 impl LegacyDispatcher for ConcurrencyCheckingDispatcher {
-    fn execute(&mut self, _intent: &LegacyIntent) -> Result<(), ControlError> {
+    fn execute(&mut self, intent: &LegacyIntent) -> Result<DispatcherCompletion, ControlError> {
         let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
         self.maximum.fetch_max(active, Ordering::SeqCst);
         thread::sleep(Duration::from_millis(5));
         self.active.fetch_sub(1, Ordering::SeqCst);
-        Ok(())
+        Ok(completion_for(intent))
+    }
+}
+
+fn completion_for(intent: &LegacyIntent) -> DispatcherCompletion {
+    match intent {
+        LegacyIntent::ResyncAddresses { .. } => {
+            DispatcherCompletion::AddressResync(AddressResyncDisposition::CompleteNoChange)
+        }
+        LegacyIntent::Running { .. }
+        | LegacyIntent::Stopped { .. }
+        | LegacyIntent::Reload { .. } => DispatcherCompletion::Completed,
     }
 }

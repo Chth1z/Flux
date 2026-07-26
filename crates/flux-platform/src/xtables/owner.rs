@@ -909,10 +909,19 @@ fn expected_state<'a>(
 #[path = "owner_runtime.rs"]
 mod runtime;
 
+#[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+pub use runtime::{
+    NativeLinuxCompositionTestAdmission, NativeLinuxCompositionTestAuthority,
+    NativeLinuxCompositionTestConfig, NativeLinuxCompositionTestError,
+    NativeLinuxCompositionTestRuntime,
+};
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[allow(unused_imports)]
 pub use runtime::{
-    NativeXtablesCaptureConvergenceError, NativeXtablesCaptureConverger, NativeXtablesCaptureTarget,
+    NativeXtablesCaptureAdmission, NativeXtablesCaptureAdmissionError,
+    NativeXtablesCaptureConvergenceError, NativeXtablesCaptureConverger,
+    NativeXtablesCaptureTarget, NativeXtablesRoutingPlanError,
+    plan_native_xtables_local_output_routing,
 };
 
 #[cfg(any(target_os = "linux", target_os = "android"))]

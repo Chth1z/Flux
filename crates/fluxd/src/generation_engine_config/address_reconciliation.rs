@@ -1,6 +1,5 @@
 use std::error::Error;
 use std::fmt;
-use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
@@ -15,10 +14,9 @@ use flux_core::{
 };
 use flux_platform::NetworkInventorySource;
 
-use super::preparation::read_bounded_regular_file;
 use super::{
-    DesiredStateArtifacts, DesiredStateCompileError, DesiredStateCompileErrorKind,
-    DesiredStateCompileRequest, compile_desired_state,
+    DesiredStateCaptureArtifacts, DesiredStateCompileError, DesiredStateCompileErrorKind,
+    DesiredStateCompileRequest, compile_desired_state_capture,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -142,7 +140,7 @@ pub(crate) enum AddressReconciliationOutcome {
 pub(crate) struct AddressReconciledGenerationInputs {
     inventory: Arc<NetworkInventory>,
     host_bypass: AddressHostSetPlan,
-    desired_state: DesiredStateArtifacts,
+    capture: DesiredStateCaptureArtifacts,
 }
 
 impl AddressReconciledGenerationInputs {
@@ -157,8 +155,13 @@ impl AddressReconciledGenerationInputs {
     }
 
     #[must_use]
-    pub(crate) const fn desired_state(&self) -> &DesiredStateArtifacts {
-        &self.desired_state
+    pub(crate) const fn desired_state(&self) -> &FluxConfig {
+        self.capture.desired_state()
+    }
+
+    #[must_use]
+    pub(crate) const fn capture(&self) -> &DesiredStateCaptureArtifacts {
+        &self.capture
     }
 
     #[must_use]
@@ -167,7 +170,7 @@ impl AddressReconciledGenerationInputs {
             snapshot_id: self.inventory.snapshot_id(),
             epoch: self.inventory.epoch(),
             host_count: self.host_bypass.hosts().len(),
-            capture_digest: self.desired_state.capture().artifact().digest(),
+            capture_digest: self.capture.capture().artifact().digest(),
         }
     }
 
@@ -180,9 +183,9 @@ impl AddressReconciledGenerationInputs {
     ) -> (
         Arc<NetworkInventory>,
         AddressHostSetPlan,
-        DesiredStateArtifacts,
+        DesiredStateCaptureArtifacts,
     ) {
-        (self.inventory, self.host_bypass, self.desired_state)
+        (self.inventory, self.host_bypass, self.capture)
     }
 }
 
@@ -194,7 +197,6 @@ pub(crate) enum AddressReconciliationErrorKind {
         count: usize,
     },
     HostPlan,
-    Template,
     Compile(DesiredStateCompileErrorKind),
 }
 
@@ -209,10 +211,6 @@ pub(crate) enum AddressReconciliationError {
         count: usize,
     },
     HostPlan(AddressHostSetPlanError),
-    Template {
-        path: PathBuf,
-        source: io::Error,
-    },
     Compile(DesiredStateCompileError),
 }
 
@@ -228,7 +226,6 @@ impl AddressReconciliationError {
                 }
             }
             Self::HostPlan(_) => AddressReconciliationErrorKind::HostPlan,
-            Self::Template { .. } => AddressReconciliationErrorKind::Template,
             Self::Compile(source) => AddressReconciliationErrorKind::Compile(source.kind()),
         }
     }
@@ -247,11 +244,6 @@ impl fmt::Display for AddressReconciliationError {
                 "cannot compile address reconciliation for {mode:?} policy with {count} unresolved packages"
             ),
             Self::HostPlan(source) => source.fmt(formatter),
-            Self::Template { path, source } => write!(
-                formatter,
-                "cannot load address-reconciliation engine template {}: {source}",
-                path.display()
-            ),
             Self::Compile(source) => source.fmt(formatter),
         }
     }
@@ -262,7 +254,6 @@ impl Error for AddressReconciliationError {
         match self {
             Self::DesiredState { source, .. } => Some(source),
             Self::HostPlan(source) => Some(source),
-            Self::Template { source, .. } => Some(source),
             Self::Compile(source) => Some(source),
             Self::UnresolvedApplicationPackages { .. } => None,
         }
@@ -365,7 +356,7 @@ impl AddressReconciler {
     }
 }
 
-fn compile_address_reconciliation(
+pub(crate) fn compile_address_reconciliation(
     desired_state_path: &Path,
     inventory: Arc<NetworkInventory>,
 ) -> Result<AddressReconciledGenerationInputs, AddressReconciliationError> {
@@ -390,23 +381,17 @@ fn compile_address_reconciliation(
     let host_policy = AddressHostSetPolicy::new(config.capture().scope().families(), rule_budget);
     let host_bypass = plan_address_host_set(&inventory, &host_policy)
         .map_err(AddressReconciliationError::HostPlan)?;
-    let template_path = config.engine().template().to_path_buf();
-    let template = read_bounded_regular_file(&template_path).map_err(|source| {
-        AddressReconciliationError::Template {
-            path: template_path,
-            source,
-        }
-    })?;
-    let desired_state = compile_desired_state(
-        DesiredStateCompileRequest::new(config, applications, Some(host_bypass.clone())),
-        &template,
-    )
+    let capture = compile_desired_state_capture(DesiredStateCompileRequest::new(
+        config,
+        applications,
+        Some(host_bypass.clone()),
+    ))
     .map_err(AddressReconciliationError::Compile)?;
 
     Ok(AddressReconciledGenerationInputs {
         inventory,
         host_bypass,
-        desired_state,
+        capture,
     })
 }
 
@@ -484,7 +469,7 @@ mod tests {
             [IpAddr::from_str("8.8.8.8").expect("global IPv4 address")]
         );
         let provenance = current
-            .desired_state()
+            .capture()
             .capture()
             .host_set_provenance()
             .expect("host provenance");
@@ -492,7 +477,7 @@ mod tests {
         assert_eq!(provenance.epoch(), inventory.epoch());
         assert!(
             current
-                .desired_state()
+                .capture()
                 .capture()
                 .artifact()
                 .programs()
@@ -504,6 +489,45 @@ mod tests {
                         if hosts.as_ref() == current.host_bypass().hosts()
                 ))
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconciliation_does_not_reopen_the_selected_engine_source() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("address reconciliation fixture");
+        let target_directory = directory.path().join("template-target");
+        std::fs::create_dir(&target_directory).expect("create template target directory");
+        std::fs::write(
+            target_directory.join("template.json"),
+            br#"{"inbounds":[]}"#,
+        )
+        .expect("write engine template");
+        let linked_directory = directory.path().join("template-source");
+        symlink(&target_directory, &linked_directory).expect("link template ancestor");
+        let template_path = linked_directory.join("template.json");
+        let desired_state_path = directory.path().join("flux.toml");
+        let desired_state = PACKAGED_DESIRED_STATE.replacen(
+            "/data/adb/flux/conf/template.json",
+            template_path.to_str().expect("UTF-8 template path"),
+            1,
+        );
+        std::fs::write(&desired_state_path, desired_state).expect("write Desired State");
+        let source = ReplayNetworkInventorySource::default();
+        let mut reconciler = AddressReconciler::new(&desired_state_path, Box::new(source.clone()));
+        let mut tracker = NetworkInventoryTracker::new();
+        source.publish(Some(publish_inventory(&mut tracker, ["8.8.8.8"])));
+
+        let outcome = reconciler
+            .reconcile()
+            .expect("capture reconciliation must not realize the engine source");
+
+        assert!(matches!(
+            outcome,
+            AddressReconciliationOutcome::Reconciled(_)
+        ));
+        assert!(reconciler.current().is_some());
     }
 
     #[test]

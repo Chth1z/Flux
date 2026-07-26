@@ -219,10 +219,8 @@ missing-lease 状态继续 fail-closed。所有旧模式 start、stop、restart 
 │   ├── generations/          # 不可变的待激活 Generation 快照
 │   └── capture.* / engine.*  # Generation 所有权与恢复记录
 └── scripts/
-    ├── flux-event            # 已打包的旧事件适配器；运行时无调用者
     ├── dispatcher            # 串行 shell 阶段适配器
     ├── init / config
-    ├── updater.sh            # 冻结的 bridge oracle；运行时绝不调用
     ├── rules                # 冻结 source-shape oracle 与显式旧路径回滚生成器
     ├── tproxy               # 唯一 restore 执行器与 xtables 内核写入者
     ├── addrsync
@@ -262,8 +260,9 @@ UDP，支持 IPv4-only 或双栈，不允许用户 CIDR 绕过，必须关闭 VP
 转发或本地绕过接口角色最多四个。启用订阅时必须已有获准的 Rust 快照，并使用当前打包的 root
 Sing-Box 身份；私有快照存储尚不支持非 root 遍历。超出这些桥接限制的有效配置会让准备阶段失败，
 不会被静默缩减。Shell 会验证精确的 41 字段环境 allowlist，并且只能追加观测到的 `KFEAT_*`。
-`scripts/updater.sh` 运行时绝不调用；它与 `settings.ini`、`jq` 仅为冻结 bridge 对照或显式旧回滚
-保留，B3 会将其移出包。
+已被替代的 `scripts/updater.sh` 与 `scripts/flux-event` 已从源码和两个打包 profile 中退役；
+manifest schema 3 会在所有 staged package 中拒绝这两个路径。`settings.ini` 与 `jq` 只保留在
+development bridge 中用于显式旧路径回滚；其余九个脚本在 Gate 1 写入权转移前继续保持隔离。
 
 ### 路由 mark 与兼容字段
 

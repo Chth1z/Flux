@@ -35,7 +35,17 @@ pub use native_capture::{
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use owner::{
-    NativeXtablesCaptureConvergenceError, NativeXtablesCaptureConverger, NativeXtablesCaptureTarget,
+    NativeXtablesCaptureAdmission, NativeXtablesCaptureAdmissionError,
+    NativeXtablesCaptureConvergenceError, NativeXtablesCaptureConverger,
+    NativeXtablesCaptureTarget, NativeXtablesRoutingPlanError,
+    plan_native_xtables_local_output_routing,
+};
+
+#[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+pub use owner::{
+    NativeLinuxCompositionTestAdmission, NativeLinuxCompositionTestAuthority,
+    NativeLinuxCompositionTestConfig, NativeLinuxCompositionTestError,
+    NativeLinuxCompositionTestRuntime,
 };
 
 pub use render::{

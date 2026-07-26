@@ -351,18 +351,14 @@ impl ProcessInspectionSource {
     pub(crate) fn new(
         desired_state_path: impl AsRef<Path>,
         engine_manifest_path: impl AsRef<Path>,
+        runtime_log_path: impl AsRef<Path>,
+        daemon_log_path: impl AsRef<Path>,
     ) -> Self {
-        let engine_manifest_path = engine_manifest_path.as_ref().to_path_buf();
-        let run_directory = engine_manifest_path
-            .parent()
-            .filter(|path| !path.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("/data/adb/flux/run"))
-            .to_path_buf();
         Self {
             desired_state_path: desired_state_path.as_ref().to_path_buf(),
-            engine_manifest_path,
-            runtime_log_path: run_directory.join("flux.log"),
-            daemon_log_path: run_directory.join("fluxd.log"),
+            engine_manifest_path: engine_manifest_path.as_ref().to_path_buf(),
+            runtime_log_path: runtime_log_path.as_ref().to_path_buf(),
+            daemon_log_path: daemon_log_path.as_ref().to_path_buf(),
         }
     }
 
@@ -829,7 +825,12 @@ mod tests {
         );
         fs::write(&config_path, config).expect("write config");
         let manifest_path = directory.path().join("engine.manifest");
-        let source = ProcessInspectionSource::new(&config_path, &manifest_path);
+        let source = ProcessInspectionSource::new(
+            &config_path,
+            &manifest_path,
+            directory.path().join("flux.log"),
+            directory.path().join("fluxd.log"),
+        );
 
         let report = source.explain().expect("compile explanation");
 
@@ -838,6 +839,42 @@ mod tests {
         assert!(report.validate());
         assert!(!manifest_path.exists());
         assert_eq!(fs::read_dir(&directory).expect("list fixture").count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explanation_rejects_a_symbolic_link_template_ancestor() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir().expect("temporary directory");
+        let target_directory = directory.path().join("template-target");
+        fs::create_dir(&target_directory).expect("create template target directory");
+        fs::write(
+            target_directory.join("template.json"),
+            include_bytes!("../../../conf/template.json"),
+        )
+        .expect("write template");
+        let linked_directory = directory.path().join("template-source");
+        symlink(&target_directory, &linked_directory).expect("link template ancestor");
+        let template_path = linked_directory.join("template.json");
+        let config_path = directory.path().join("flux.toml");
+        let config = include_str!("../../../conf/flux.toml").replace(
+            "/data/adb/flux/conf/template.json",
+            template_path.to_str().expect("UTF-8 path"),
+        );
+        fs::write(&config_path, config).expect("write config");
+        let source = ProcessInspectionSource::new(
+            &config_path,
+            directory.path().join("engine.manifest"),
+            directory.path().join("flux.log"),
+            directory.path().join("fluxd.log"),
+        );
+
+        let error = source
+            .explain()
+            .expect_err("template ancestor symlink must fail closed");
+
+        assert_eq!(error.kind(), InspectionErrorKind::Template);
     }
 
     #[test]
@@ -867,6 +904,8 @@ mod tests {
         let source = ProcessInspectionSource::new(
             directory.path().join("missing-flux.toml"),
             &manifest_path,
+            directory.path().join("flux.log"),
+            directory.path().join("fluxd.log"),
         );
 
         let diagnostics = source.diagnose();

@@ -237,7 +237,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
 
-    use flux_core::{LegacyControlBridge, LegacyDispatcher};
+    use flux_core::{DispatcherCompletion, LegacyControlBridge, LegacyDispatcher};
     use flux_platform::{DaemonReactor, ShutdownSignal};
     use flux_testkit::CapabilityProfileFixture;
     use tempfile::tempdir;
@@ -248,8 +248,13 @@ mod tests {
     struct NoopDispatcher;
 
     impl LegacyDispatcher for NoopDispatcher {
-        fn execute(&mut self, _intent: &LegacyIntent) -> Result<(), ControlError> {
-            Ok(())
+        fn execute(&mut self, intent: &LegacyIntent) -> Result<DispatcherCompletion, ControlError> {
+            Ok(match intent {
+                LegacyIntent::ResyncAddresses { .. } => DispatcherCompletion::AddressResync(
+                    flux_core::AddressResyncDisposition::CompleteNoChange,
+                ),
+                _ => DispatcherCompletion::Completed,
+            })
         }
     }
 

@@ -9,9 +9,10 @@ now compiles the legacy restore caches, while the frozen shell generator remains
 legacy-owner rollback oracle rather than a silent fallback. No bridge, shadow, parity, staged
 module, or package-verifier result is a release candidate.
 
-Subscription retrieval and asset management are now production-connected Rust behavior. The
-development bridge still packages `scripts/updater.sh` for frozen comparison until Gate 1, but no
-initialization or runtime path references or invokes it. The exact Rust-only stage excludes it.
+Subscription retrieval and asset management are now production-connected Rust behavior.
+`scripts/updater.sh` and the no-caller `scripts/flux-event` adapter are retired from source and both
+package profiles. Manifest schema 3 records both paths in a profile-independent denylist, so neither
+can reappear in a staged bridge or Rust-only package.
 
 ## Toolchain contract
 
@@ -757,8 +758,9 @@ forbidden path, or extra staged file. `bridge` is the compatibility default when
 omitted, but every successful result is labeled development-only.
 
 `--profile rust-only` stages only the 13 final paths and needs only Sing-Box from the runtime-binary
-directory. The development bridge currently has 28 required paths, with the exact 15-path difference
-forbidden by Rust-only. Staging selects the minimal tracked `customize.sh` and `flux_service.sh`
+directory. The development bridge currently has 26 required paths, with the exact 13-path difference
+forbidden by Rust-only; schema 3 separately denies the two retired runtime paths for every profile.
+Staging selects the minimal tracked `customize.sh` and `flux_service.sh`
 sources under `packaging/rust-only/`; the already-minimal update binary and Rust-delegating
 uninstaller remain shared. The installer is deliberately fresh-install-only and refuses an existing
 `/data/adb/flux` rather than migrating bridge state in shell. This is still a non-runnable,
@@ -819,8 +821,8 @@ attestations.
 
 The packaged module installs `flux_service.sh` as module-local `service.sh`. It launches only a
 bounded watchdog for `fluxd daemon`; mutation-capable daemon profiles own file observation inside
-the existing reactor. `scripts/flux-event` remains in the development bridge inventory as a legacy
-adapter with no runtime caller and is removed with the other bridge artifacts in B3.
+the existing reactor. The former event adapter is retired, and the manifest denies its old path in
+every package profile.
 
 Native online commands are:
 
@@ -842,7 +844,7 @@ fluxd cleanup --offline
 The `event` form is retained only for compatibility testing. Module boot and the dispatcher do not
 invoke it after B2.2.
 
-The local `SOCK_SEQPACKET` control contract is protocol version 3. Version 2 introduced the coherent Capability Profile; version 3 adds the required orthogonal runtime-verification state, subscription maintenance, and additive read-only diagnostic/log/explain commands. The nested Capability Profile is independently versioned and now uses schema 2 for exact device identity. Version-1 and version-2 requests are rejected explicitly instead of being decoded against the new response shape.
+The local `SOCK_SEQPACKET` control contract is protocol version 4. Version 2 introduced the coherent Capability Profile; version 3 added the required orthogonal runtime-verification state, subscription maintenance, and additive read-only diagnostic/log/explain commands. Version 4 adds the required typed address-resync result to `OperationReport`: `complete_no_change`, `successor_converged`, or `accepted_deferred`. The nested Capability Profile is independently versioned and now uses schema 2 for exact device identity. Protocol versions 1 through 3 are rejected explicitly instead of being decoded against the new response shape.
 
 The socket defaults to `/data/adb/flux/run/fluxd.sock` with mode `0600`. Accepted peers must match
 the daemon effective UID. `/data/adb/flux/run/fluxd.lease` is a persistent regular file whose

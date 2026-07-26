@@ -54,10 +54,20 @@ jobs:
         run: cargo xtask test-functional-canary-linux
         env:
           FLUX_LINUX_CANARY_REQUIRED: "1"
+      - name: Ensure native composition tools are available
+        run: |
+          if ! command -v ip >/dev/null 2>&1 || ! command -v iptables >/dev/null 2>&1 || ! command -v ip6tables >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install --yes --no-install-recommends iproute2 iptables
+          fi
+      - name: Test required dispatcher-free native composition
+        run: cargo xtask test-native-composition-linux
+        env:
+          FLUX_NATIVE_COMPOSITION_REQUIRED: "1"
       - name: Check Magisk shell bridge syntax
         run: >-
           bash -n customize.sh flux_service.sh scripts/dispatcher
-          scripts/lib scripts/flux-event scripts/rules
+          scripts/lib scripts/rules
           tests/shell/config_installer_contract.sh
           tests/shell/rules_generation.sh tests/shell/run-dispatcher-tests.sh
           tests/shell/run-installer-tests.sh tests/shell/run-rust-only-glue-tests.sh

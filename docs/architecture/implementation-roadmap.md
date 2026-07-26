@@ -109,12 +109,13 @@ Lane C may pause when hardware is unavailable. Lanes A and B do not pause with i
 
 Status: **package-profile gate complete on 2026-07-25; scope freeze remains in force**.
 
-`conf/manifest.json` schema 2 now records both checked contracts. `bridge` is
+`conf/manifest.json` schema 3 records both checked contracts. `bridge` is
 `development-only`; `rust-only` is `failing-until-complete`. The verifier derives its selected
-runtime, binary, source-binding, and payload inventories from that manifest and proves the 15
-Rust-only forbidden paths are exactly the 28-path bridge inventory minus the 13 final paths. The
-focused `xtask` suite exercises a bridge pass and Rust-only rejection. This gate does not resolve
-the `addrsyncd` license for reuse and does not authorize release or physical Android behavior.
+runtime, binary, source-binding, and payload inventories from that manifest and proves the 13
+Rust-only forbidden paths are exactly the 26-path bridge inventory minus the 13 final paths. Its
+profile-independent retired set contains the former event and updater paths and is rejected for
+every stage. This gate does not resolve the `addrsyncd` license for reuse and does not authorize
+release or physical Android behavior.
 
 ### Work
 
@@ -285,10 +286,9 @@ Status: **complete on 2026-07-26**.
 - Completed candidates enter the existing serialized coordinator reload/rollback path. The current
   bridge supports subscription-backed activation only for the packaged root-owned Sing-Box identity;
   secure non-root store traversal remains a later compatibility task.
-- `scripts/init` no longer calls or requires `scripts/updater.sh` in either ownership mode. The
-  script remains in the development-only bridge inventory solely as a frozen comparison artifact;
-  B3 excludes it from the exact Rust-only stage, while the development bridge retains it until the
-  Gate 1 writer transfer.
+- `scripts/init` no longer calls or requires the former shell updater in either ownership mode. The
+  no-caller updater was retired from source and both package profiles after its source-binding and
+  rollback regressions passed; manifest schema 3 prevents its path from returning.
 - Flux does not yet own a separate persisted Sing-Box FakeIP/reverse-mapping database. B1 binds the
   exact canonical engine configuration and rule assets; a future owned cache must introduce its own
   versioned migration/corruption contract rather than delaying updater retirement for nonexistent
@@ -312,9 +312,9 @@ Android/API-31 cross-build pass. No WSA or physical ARM64 runtime qualification 
   Parent-directory watches recover from overflow, invalidation, missing paths, atomic replacement,
   and ancestor-directory replacement. Two typed facts coalesce behind the existing serialized
   writer, startup-gap reconciliation uses metadata identity, and observed subscription inputs
-  schedule one immediate or pending refresh. Module boot no longer starts `inotifyd`, and neither
-  service nor dispatcher invokes `scripts/flux-event`; B3 excludes its file from Rust-only staging,
-  while the development bridge retains it until Gate 1.
+  schedule one immediate or pending refresh. Module boot no longer starts `inotifyd`; the no-caller
+  event adapter is retired from source and both package profiles, with its old path denied by
+  manifest schema 3.
 - **B2.3 complete 2026-07-26:** one bounded `fluxd cleanup --offline` path now acquires a
   persistent daemon lease before startup recovery, consumes durable ownership records and exact
   absence checks, and is delegated by the platform uninstall glue. Shell never reconstructs rules.
@@ -355,8 +355,8 @@ Exit: all supported runtime and diagnostic commands work with only `fluxd` plus 
   shared bridge glue remains valid only for the development profile.
 - **B3.3 complete 2026-07-26:** staging and source-byte verification select two tracked Rust-only
   overrides for the installer and bounded watchdog while bridge continues to select the root
-  sources. Real-source tests prove exact 13/28-path trees, rejection of each of the 15 legacy paths,
-  and override tamper detection. Isolated shell tests prove fresh placement, fail-closed reinstall,
+  sources. Real-source tests now prove exact 13/26-path trees, rejection of each of the 13 active
+  bridge-only paths plus both retired paths, and override tamper detection. Isolated shell tests prove fresh placement, fail-closed reinstall,
   daemon-only recovery, and the five-failure restart bound; profile status remains
   `failing-until-complete`.
 - **B3.4 complete 2026-07-26:** full repository CI, the exact shell matrix, the pinned ARM64 release
@@ -489,9 +489,13 @@ release; final qualification follows.
   journal replay, and failure injection.
 - The disposable dual-stack user/mount/network namespace topology and exact-cleanup checkpoint is
   required in standard Linux CI. It remains mechanism evidence because it installs no capture and
-  does not run the production native composition.
-- Required privileged Linux namespace tests for the real production composition. These may not be
-  silently ignored in the release pipeline.
+  does not run the production-shaped native composition.
+- **Complete 2026-07-26:** `cargo xtask test-native-composition-linux` is required on the supported
+  Linux runner and executes the dispatcher-free production-shaped composition through start,
+  ordinary and subscription reload, address successor, engine recovery, failed-candidate
+  settlement, crash recovery, stop, idempotent offline recovery, forbidden-subprocess audit, and
+  exact dual-stack cleanup. It cannot construct Android authority and does not authorize production
+  writer selection.
 - Fuzz targets for TOML/JSON/control/subscription inputs and netlink/xtables readback parsers, with a
   bounded CI smoke run and retained crash corpus.
 - Unsafe operations in unsafe functions and undocumented unsafe blocks are denied workspace-wide
@@ -546,9 +550,9 @@ The list below is the working order. Items with the same prefix may run in paral
    read-only coordinator inspection, evidence/lineage identity, and bounded prepared record.
 4. `P0-A3` **Done 2026-07-25:** feed `NetworkInventorySource` into serialized non-mutating
    reconciliation, bind exact snapshot provenance, and absorb address-observation behavior/tests.
-5. `P0-A4` **Host checkpoint done 2026-07-25:** the exact archive/facade/coordinator path is built and
-   deterministic tests pass. Complete the qualified target source, required canary, real namespace
-   composition, and production selection only with C2/Gate 1 authority.
+5. `P0-A4` **Host composition gate done 2026-07-26:** the exact archive/facade/coordinator path,
+   qualified target source, typed resync, native offline recovery, and required real namespace
+   composition pass. Production selection still requires physical C1-C3 and Gate 1 authority.
 6. `P0-B1` **Done 2026-07-26:** move subscription, asset, template processing, validated snapshot
    recovery, periodic/manual refresh, and Generation reload into Rust; retire every runtime caller
    of the packaged updater oracle.
@@ -566,7 +570,8 @@ Items 5-8 continue when items 9-11 are hardware-blocked.
 
 ### P1: Release Assurance
 
-1. Require privileged production-composition tests in CI.
+1. **Privileged production-composition host gate complete 2026-07-26:** the exact test is required
+   in supported Linux CI; physical Android qualification remains separate.
 2. **Dependency and unsafe-boundary assurance complete 2026-07-26:** the locked root workspace has
    a required advisory/license/source gate, and all 264 unsafe blocks in root-workspace targets have
    an explicit semantic audit with re-audit triggers. A bounded deterministic parser-fuzz smoke is

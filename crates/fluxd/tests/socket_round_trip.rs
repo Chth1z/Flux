@@ -7,8 +7,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use flux_core::{
-    CapabilityProfile, CapabilityProfileRevision, ControlClient, ControlError, LegacyControlBridge,
-    LegacyDispatcher, LegacyIntent, Reason,
+    AddressResyncDisposition, CapabilityProfile, CapabilityProfileRevision, ControlClient,
+    ControlError, DispatcherCompletion, LegacyControlBridge, LegacyDispatcher, LegacyIntent,
+    Reason,
 };
 use flux_platform::{DaemonReactor, SeqpacketConnection, ShutdownSignal};
 use flux_testkit::CapabilityProfileFixture;
@@ -265,7 +266,7 @@ fn stop_requested_before_run_closes_the_listener_without_dispatching_queued_clie
     .expect("bind reactor");
     let queued = SeqpacketConnection::connect(&socket_path).expect("queue client");
     queued
-        .send_packet(br#"{"protocol_version":3,"request_id":7,"command":{"kind":"ping"}}"#)
+        .send_packet(br#"{"protocol_version":4,"request_id":7,"command":{"kind":"ping"}}"#)
         .expect("send queued request");
 
     stop.request_stop().expect("request reactor stop");
@@ -353,19 +354,29 @@ struct BlockingDispatcher {
 }
 
 impl LegacyDispatcher for BlockingDispatcher {
-    fn execute(&mut self, _intent: &LegacyIntent) -> Result<(), ControlError> {
+    fn execute(&mut self, intent: &LegacyIntent) -> Result<DispatcherCompletion, ControlError> {
         self.started_tx
             .send(())
             .map_err(|error| ControlError::dispatcher(error.to_string()))?;
         self.release_rx
             .recv()
-            .map_err(|error| ControlError::dispatcher(error.to_string()))
+            .map_err(|error| ControlError::dispatcher(error.to_string()))?;
+        Ok(completion_for(intent))
     }
 }
 
 impl LegacyDispatcher for RecordingDispatcher {
-    fn execute(&mut self, intent: &LegacyIntent) -> Result<(), ControlError> {
+    fn execute(&mut self, intent: &LegacyIntent) -> Result<DispatcherCompletion, ControlError> {
         self.calls.lock().expect("calls lock").push(*intent);
-        Ok(())
+        Ok(completion_for(intent))
+    }
+}
+
+fn completion_for(intent: &LegacyIntent) -> DispatcherCompletion {
+    match intent {
+        LegacyIntent::ResyncAddresses { .. } => {
+            DispatcherCompletion::AddressResync(AddressResyncDisposition::AcceptedDeferred)
+        }
+        _ => DispatcherCompletion::Completed,
     }
 }

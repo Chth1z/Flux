@@ -12,7 +12,6 @@ use crate::netlink::policy_routing::{
     ManagedInterfaceIdentity, ManagedPolicyRoutingIdentity, PolicyRoutingMutation,
 };
 
-#[cfg(test)]
 use super::super::XtablesCaptureArtifactSet;
 use super::super::owner_durable::{
     NativeXtablesDurableError, NativeXtablesDurableStore, NativeXtablesGeneration,
@@ -115,10 +114,11 @@ impl NativeXtablesTargetIdentity {
     }
 }
 
-/// Complete test-admitted immutable transaction target.
+/// Complete platform-admitted immutable transaction target.
 ///
-/// There is deliberately no non-test constructor. Production mark/RPDB admission remains
-/// uninhabited until the Android authority and device gates in the roadmap exist.
+/// The raw constructor remains private. Production callers can obtain only the opaque public target
+/// after the platform adapter has consumed Android planning evidence and checked every activation
+/// prerequisite.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct NativeXtablesAdmittedTarget {
     identity: NativeXtablesTargetIdentity,
@@ -129,8 +129,7 @@ pub(crate) struct NativeXtablesAdmittedTarget {
 }
 
 impl NativeXtablesAdmittedTarget {
-    #[cfg(test)]
-    pub(crate) fn admit_for_test(
+    fn admit(
         artifacts: XtablesCaptureArtifactSet,
         routing: impl IntoIterator<Item = ManagedPolicyRoutingIdentity>,
         routing_audit: NativePolicyRoutingAudit,
@@ -206,6 +205,16 @@ impl NativeXtablesAdmittedTarget {
             routing: routing.into_boxed_slice(),
             routing_audit: Box::new(routing_audit),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn admit_for_test(
+        artifacts: XtablesCaptureArtifactSet,
+        routing: impl IntoIterator<Item = ManagedPolicyRoutingIdentity>,
+        routing_audit: NativePolicyRoutingAudit,
+        tool_digest: [u8; IDENTITY_DIGEST_BYTES],
+    ) -> Result<Self, NativeXtablesTargetError> {
+        Self::admit(artifacts, routing, routing_audit, tool_digest)
     }
 
     fn from_recovery(
@@ -2509,9 +2518,18 @@ mod runtime_writer;
 pub(crate) use process_adapter::NativeXtablesProcessOwnerAdapter;
 #[allow(unused_imports)]
 pub(crate) use runtime_writer::*;
+#[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+pub use runtime_writer::{
+    NativeLinuxCompositionTestAdmission, NativeLinuxCompositionTestAuthority,
+    NativeLinuxCompositionTestConfig, NativeLinuxCompositionTestError,
+    NativeLinuxCompositionTestRuntime,
+};
 #[allow(unused_imports)]
 pub use runtime_writer::{
-    NativeXtablesCaptureConvergenceError, NativeXtablesCaptureConverger, NativeXtablesCaptureTarget,
+    NativeXtablesCaptureAdmission, NativeXtablesCaptureAdmissionError,
+    NativeXtablesCaptureConvergenceError, NativeXtablesCaptureConverger,
+    NativeXtablesCaptureTarget, NativeXtablesRoutingPlanError,
+    plan_native_xtables_local_output_routing,
 };
 #[allow(unused_imports)]
 pub(crate) use target_archive::{

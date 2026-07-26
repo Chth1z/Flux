@@ -249,9 +249,10 @@ A passing verifier is therefore not evidence for ADR-0011.
 Recommendation: add a separate Rust-only package profile now and let it fail until the required
 files are removed. This makes the final state measurable throughout the work.
 
-Status update: B3 implements that recommendation with exact 13/28-path contracts, profile-specific
-source binding, no-policy platform-glue checks, and a still-failing Rust-only release status. A
-passing development bridge remains non-authorizing.
+Status update: B3 implemented that recommendation. Manifest schema 3 now records exact 13/26-path
+contracts plus a profile-independent two-path retired denylist, profile-specific source binding,
+no-policy platform-glue checks, and a still-failing Rust-only release status. A passing development
+bridge remains non-authorizing.
 
 ### P0. VPN Respect Is Not Yet An Engine Egress Contract
 
@@ -432,8 +433,9 @@ The canonical plan is the [Rust-unification roadmap](implementation-roadmap.md).
 - **B2 complete:** the daemon-exclusive offline cleanup contract is connected, and the forwarding
   wrapper, direct dispatcher lifecycle alias, and cache-mutating preview path are removed.
 - **B3 structural package gate complete:** the exact 13-path Rust-only stage excludes `jq`, legacy
-  configs, all runtime scripts, and standalone `addrsyncd`; the active 28-path bridge retains its
-  rollback artifacts until Gate 1. Minimal installer/watchdog source is separately policy-checked.
+  configs, all runtime scripts, and standalone `addrsyncd`; the active 26-path bridge retains its
+  remaining rollback artifacts until Gate 1. A two-path retired denylist applies to both profiles,
+  and minimal installer/watchdog source is separately policy-checked.
 
 ### Lane C: Physical Android Authority
 

@@ -3,10 +3,11 @@ use std::fmt;
 use std::num::{NonZeroI32, NonZeroU32};
 
 use flux_core::{
-    InterfaceIndex, InterfaceName, NetworkAddressFamily, NetworkRouteRecord, NetworkRuleRecord,
-    RouteFlags, RoutePath, RoutePreference, RoutePrefix, RouteProperties, RouteProtocol,
-    RouteScope, RouteTableId, RouteType, RuleAction, RuleFlags, RuleFwMark, RulePrefix,
-    RulePriority, RuleProperties, RuleProtocol, RuleTableId,
+    FwmarkCandidate, FwmarkRole, InterfaceIndex, InterfaceName, NetworkAddressFamily,
+    NetworkRouteRecord, NetworkRuleRecord, RouteFlags, RoutePath, RoutePreference, RoutePrefix,
+    RouteProperties, RouteProtocol, RouteScope, RouteTableId, RouteType, RpdbFamilyPlacement,
+    RuleAction, RuleFlags, RuleFwMark, RulePrefix, RulePriority, RuleProperties, RuleProtocol,
+    RuleTableId,
 };
 
 use super::route::{InterfaceRouteEvent, RouteEventDecodeErrorKind, RtnetlinkRouteEventDecoder};
@@ -15,6 +16,8 @@ use super::{
     NETLINK_ATTRIBUTE_HEADER_LENGTH, NETLINK_HEADER_LENGTH, NLMSG_ERROR, NetlinkAttributeIter,
     NetlinkMessageIter, align4,
 };
+#[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+use crate::xtables::XtablesLocalOutputRoutingTarget;
 use crate::xtables::{XtablesLocalOutputRoutingRequirement, XtablesRestoreFamily};
 
 const ROUTING_HEADER_LENGTH: usize = 12;
@@ -250,6 +253,77 @@ impl ManagedPolicyRoutingIdentity {
             route,
             rule,
         })
+    }
+
+    pub(crate) fn bind_planned_android_target(
+        family: NetworkAddressFamily,
+        placement: RpdbFamilyPlacement,
+        mark: FwmarkCandidate,
+        loopback_index: InterfaceIndex,
+        route_metric: NonZeroU32,
+        route_protocol: RouteProtocol,
+        rule_protocol: RuleProtocol,
+    ) -> Self {
+        let loopback = ManagedInterfaceIdentity {
+            name: InterfaceName::new(b"lo").expect("canonical loopback name is valid"),
+            index: loopback_index,
+        };
+        let table = RouteTableId::from_raw(placement.private_table().get());
+        Self {
+            family,
+            loopback,
+            route: ManagedLocalRouteIdentity {
+                family,
+                destination: RoutePrefix::unspecified(family),
+                table,
+                protocol: route_protocol,
+                scope: canonical_route_scope(family),
+                route_type: RouteType::from_raw(RTN_LOCAL),
+                metric: route_metric,
+                output_interface: loopback_index,
+            },
+            rule: ManagedFwmarkRuleIdentity {
+                family,
+                priority: placement.proxy_priority(),
+                table,
+                mark: mark.selector(FwmarkRole::Proxy),
+                protocol: rule_protocol,
+            },
+        }
+    }
+
+    #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+    pub(crate) fn bind_linux_composition_test_target(
+        family: NetworkAddressFamily,
+        target: XtablesLocalOutputRoutingTarget,
+        mark: FwmarkCandidate,
+        loopback_index: InterfaceIndex,
+    ) -> Self {
+        let loopback = ManagedInterfaceIdentity {
+            name: InterfaceName::new(b"lo").expect("canonical loopback name is valid"),
+            index: loopback_index,
+        };
+        Self {
+            family,
+            loopback,
+            route: ManagedLocalRouteIdentity {
+                family,
+                destination: RoutePrefix::unspecified(family),
+                table: target.table(),
+                protocol: target.route_protocol(),
+                scope: canonical_route_scope(family),
+                route_type: RouteType::from_raw(RTN_LOCAL),
+                metric: target.route_metric(),
+                output_interface: loopback_index,
+            },
+            rule: ManagedFwmarkRuleIdentity {
+                family,
+                priority: target.priority(),
+                table: target.table(),
+                mark: mark.selector(FwmarkRole::Proxy),
+                protocol: target.rule_protocol(),
+            },
+        }
     }
 
     #[must_use]

@@ -369,7 +369,6 @@ build_config() {
     [ "${FLUXD_ENGINE_OWNER:-legacy}" = rust ] || printf 'UPDATE_INTERVAL=0\n'
     }
 EOF
-    write_stub updater.sh 'exit 0'
     for binary in jq addrsyncd; do
         printf '#!/usr/bin/sh\nexit 0\n' >"${FLUX_ROOT}/bin/${binary}"
         chmod 0755 "${FLUX_ROOT}/bin/${binary}"
@@ -1061,34 +1060,6 @@ EOF
         fail "Rust-owned config build parsed settings.ini"
 }
 
-test_rust_owned_init_never_invokes_the_subscription_updater() {
-    reset_fixture
-    install_real_init_fixture
-    write_stub updater.sh '
-: >/data/adb/flux/run/updater-invoked
-exit 98'
-    printf '#!/usr/bin/sh\nexit 0\n' >"${FLUX_ROOT}/bin/fluxd"
-    chmod 0755 "${FLUX_ROOT}/bin/fluxd"
-    rm -f "${FLUX_ROOT}/bin/jq" "${FLUX_ROOT}/conf/settings.ini"
-    cat >"${FLUX_ROOT}/cache/cache_rules_manifest" <<'EOF'
-FLUX_LEGACY_RULES_SET_MANIFEST_V1
-generation=1
-families=ipv4
-EOF
-    touch -d '@1' "${FLUX_ROOT}/conf/config.json"
-
-    FLUX_CACHE_BUILD_SERIALIZED=1 FLUXD_ENGINE_OWNER=rust FLUX_GENERATION_ID=1 sh -c '
-        set -a
-        . /data/adb/flux/run/desired-state.env
-        set +a
-        exec sh /data/adb/flux/scripts/init init
-    ' ||
-        fail "Rust-owned init failed while preserving canonical config.json"
-
-    [ ! -e "${RUN_ROOT}/updater-invoked" ] ||
-        fail "Rust-owned init invoked the shell subscription updater"
-}
-
 test_legacy_init_no_longer_requires_the_subscription_updater() {
     reset_fixture
     install_real_init_fixture
@@ -1096,7 +1067,6 @@ test_legacy_init_no_longer_requires_the_subscription_updater() {
 generate() {
     printf "*mangle\nCOMMIT\n"
 }'
-    rm -f "${FLUX_ROOT}/scripts/updater.sh"
     printf 'shell\n' >"${FLUX_ROOT}/cache/cache_valid"
     cp "${FLUX_ROOT}/conf/config.json" "${RUN_ROOT}/expected-config.json"
     touch -d '@1' "${FLUX_ROOT}/conf/config.json"
@@ -2433,7 +2403,6 @@ test_prepare_rejects_missing_proxy_mode_without_artifacts
 test_prepare_revalidates_proxy_mode_generated_by_init
 test_active_tproxy_prepare_rejects_tun_without_disturbance
 test_rust_owned_config_build_skips_rewrite_and_unpinned_sing_box_check
-test_rust_owned_init_never_invokes_the_subscription_updater
 test_legacy_init_no_longer_requires_the_subscription_updater
 test_prepare_rejects_observed_missing_xt_owner_before_generation_publication
 test_prepare_revalidates_xt_owner_generated_by_init

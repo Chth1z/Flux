@@ -155,7 +155,7 @@ REDIRECT/DNAT path.
 
 ## Runtime status contract
 
-Protocol version 3 carries a required verification field inside the independently revisioned
+Protocol version 4 carries a required verification field inside the independently revisioned
 `RuntimeSnapshot`. It is deliberately orthogonal to operational phase:
 
 - `structural_only` is the conservative baseline: no functional pass authorizes the current
@@ -609,7 +609,7 @@ functional pass.
 1. **Complete:** typed attempt/evidence types, an injectable canary executor, coordinator ordering,
    failure injection, deadline, stale-identity, cleanup, retry, restart, resynchronization, and
    rollback tests. Existing structural verification remains a separate prerequisite, and protocol
-   version 3 exposes the orthogonal verification result without enabling the production gate.
+   version 4 exposes the orthogonal verification result without enabling the production gate.
 2. **Complete:** the first privileged Linux namespace checkpoint exercises real dual-stack TCP,
    UDP, and DNS traffic and independently verifies exact topology cleanup. It proves the
    traffic-flow contracts and contained test topology without installing capture.

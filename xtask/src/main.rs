@@ -10,11 +10,15 @@ use sha2::{Digest, Sha256};
 
 mod android_canary;
 mod android_mark_preflight;
+mod platform_glue;
+mod source_policy;
 mod xtables_oracle;
 
 const ANDROID_TARGET: &str = "aarch64-linux-android";
 const ANDROID_API_LEVEL: &str = "31";
 const ANDROID_NDK_REVISION: &str = "27.3.13750724";
+const RELEASE_MANIFEST_SCHEMA_VERSION: u32 = 3;
+const RETIRED_RUNTIME_PATHS: [&str; 2] = ["scripts/flux-event", "scripts/updater.sh"];
 const ANDROID_MIN_LOAD_ALIGNMENT: u64 = 1 << 14;
 const ANDROID_RUSTFLAGS: &str = concat!(
     "-C link-arg=-Wl,-z,max-page-size=16384 ",
@@ -84,6 +88,10 @@ const LINUX_CANARY_TEST: &str = "functional_canary::linux_namespace_harness::pri
 const LINUX_TPROXY_CANARY_TEST: &str = "functional_canary::linux_namespace_harness::privileged_ingress_tproxy_checkpoint_exercises_real_capture_counters_and_cleanup";
 const LINUX_OUTPUT_TPROXY_CANARY_TEST: &str = "functional_canary::linux_namespace_harness::privileged_local_output_tproxy_checkpoint_exercises_loopback_reinjection_and_cleanup";
 const LINUX_OUTPUT_UID_PREFLIGHT_TEST: &str = "functional_canary::linux_namespace_harness::privileged_local_output_distinct_uid_capability_preflight";
+const NATIVE_COMPOSITION_REQUIRED_ENV: &str = "FLUX_NATIVE_COMPOSITION_REQUIRED";
+const NATIVE_COMPOSITION_TEST: &str = "functional_canary::linux_namespace_harness::privileged_native_composition_exercises_lifecycle_recovery_and_exact_cleanup";
+const NATIVE_COMPOSITION_FEATURE: &str = "native-composition-test";
+const NATIVE_COMPOSITION_ENGINE_BIN: &str = "flux-native-composition-engine";
 const PARSER_FUZZ_SMOKE_TESTS: [&str; 7] = [
     "address_sync::tests::deterministic_arbitrary_datagrams_never_panic",
     "netlink::link::tests::deterministic_arbitrary_datagrams_never_panic",
@@ -111,6 +119,17 @@ const LINUX_CANARY_INTERNAL_ENVS: [&str; 17] = [
     "FLUX_LINUX_CANARY_INNER_NETNS",
     "FLUX_LINUX_CANARY_INNER_USERNS",
     "FLUX_LINUX_CANARY_INNER_MOUNTNS",
+];
+const NATIVE_COMPOSITION_INTERNAL_ENVS: [&str; 9] = [
+    "FLUX_NATIVE_COMPOSITION_HARNESS_MODE",
+    "FLUX_NATIVE_COMPOSITION_ROOT",
+    "FLUX_NATIVE_COMPOSITION_REENTRY_TOKEN",
+    "FLUX_NATIVE_COMPOSITION_OUTER_NETNS",
+    "FLUX_NATIVE_COMPOSITION_OUTER_USERNS",
+    "FLUX_NATIVE_COMPOSITION_ENGINE_BIN",
+    "FLUX_NATIVE_COMPOSITION_EXEC_AUDIT",
+    "FLUX_NATIVE_COMPOSITION_ENGINE_PID_LOG",
+    "FLUX_NATIVE_COMPOSITION_FAIL_CHECK",
 ];
 
 fn main() {
@@ -161,6 +180,10 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
             require_no_arguments(&arguments)?;
             check_android()
         }
+        "check-shell-bridge-sources" => {
+            require_no_arguments(&arguments)?;
+            source_policy::validate(&workspace_root()?)
+        }
         "build-android" => {
             require_no_arguments(&arguments)?;
             build_android()
@@ -181,6 +204,10 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
             require_no_arguments(&arguments)?;
             test_functional_canary_linux_output_preflight()
         }
+        "test-native-composition-linux" => {
+            require_no_arguments(&arguments)?;
+            test_native_composition_linux()
+        }
         "test-parser-fuzz-smoke" => {
             require_no_arguments(&arguments)?;
             test_parser_fuzz_smoke()
@@ -199,6 +226,7 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
         "verify-package" => verify_package(parse_verify_package_options(&arguments)?),
         "ci" => {
             require_no_arguments(&arguments)?;
+            source_policy::validate(&workspace_root()?)?;
             cargo(["fmt", "--all", "--", "--check"], &[])?;
             cargo(["check", "--workspace", "--all-targets"], &[])?;
             cargo(["test", "--workspace"], &[])?;
@@ -235,6 +263,60 @@ fn test_functional_canary_linux_output_tproxy() -> Result<(), String> {
 
 fn test_functional_canary_linux_output_preflight() -> Result<(), String> {
     test_linux_canary(LINUX_OUTPUT_UID_PREFLIGHT_TEST)
+}
+
+fn test_native_composition_linux() -> Result<(), String> {
+    let required = native_composition_required()?;
+    if env::consts::OS != "linux" {
+        return linux_canary_skip_or_fail(
+            required,
+            "the native composition checkpoint requires a Linux host",
+        );
+    }
+
+    cargo_scrubbed([
+        "build",
+        "-p",
+        "fluxd",
+        "--features",
+        NATIVE_COMPOSITION_FEATURE,
+        "--bin",
+        NATIVE_COMPOSITION_ENGINE_BIN,
+    ])?;
+    let listed = cargo_stdout([
+        "test",
+        "-p",
+        "fluxd",
+        "--features",
+        NATIVE_COMPOSITION_FEATURE,
+        "--lib",
+        NATIVE_COMPOSITION_TEST,
+        "--",
+        "--ignored",
+        "--exact",
+        "--list",
+    ])?;
+    if !linux_canary_test_is_listed(&listed, NATIVE_COMPOSITION_TEST) {
+        return linux_canary_skip_or_fail(
+            required,
+            "the privileged Linux native-composition harness is not implemented in this checkout",
+        );
+    }
+
+    cargo_scrubbed([
+        "test",
+        "-p",
+        "fluxd",
+        "--features",
+        NATIVE_COMPOSITION_FEATURE,
+        "--lib",
+        NATIVE_COMPOSITION_TEST,
+        "--",
+        "--ignored",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1",
+    ])
 }
 
 fn test_parser_fuzz_smoke() -> Result<(), String> {
@@ -316,6 +398,24 @@ fn parse_linux_canary_required(value: Option<&str>) -> Result<bool, String> {
     }
 }
 
+fn native_composition_required() -> Result<bool, String> {
+    match env::var(NATIVE_COMPOSITION_REQUIRED_ENV) {
+        Ok(value) => parse_native_composition_required(Some(&value)),
+        Err(env::VarError::NotPresent) => parse_native_composition_required(None),
+        Err(env::VarError::NotUnicode(_)) => Err(format!(
+            "{NATIVE_COMPOSITION_REQUIRED_ENV} must contain valid UTF-8"
+        )),
+    }
+}
+
+fn parse_native_composition_required(value: Option<&str>) -> Result<bool, String> {
+    match value {
+        None | Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(_) => Err(format!("{NATIVE_COMPOSITION_REQUIRED_ENV} must be 0 or 1")),
+    }
+}
+
 fn linux_canary_test_is_listed(listing: &str, test_name: &str) -> bool {
     let expected = format!("{test_name}: test");
     listing.lines().any(|line| line.trim() == expected)
@@ -367,6 +467,7 @@ struct ReleaseManifest {
     note: String,
     binaries: Vec<BinaryManifest>,
     device_test_evidence: Vec<DeviceEvidenceManifest>,
+    retired_runtime_paths: Vec<String>,
     package_profiles: Vec<PackageProfile>,
 }
 
@@ -631,7 +732,51 @@ fn profile_requires(profile: &PackageProfile, relative: &str) -> bool {
         .any(|required| required == relative)
 }
 
-fn validate_package_profiles(profiles: &[PackageProfile]) -> Result<(), String> {
+fn validate_package_contract(manifest: &ReleaseManifest) -> Result<(), String> {
+    if manifest.schema_version != RELEASE_MANIFEST_SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported manifest schema version {}",
+            manifest.schema_version
+        ));
+    }
+    let retired = validate_retired_runtime_paths(&manifest.retired_runtime_paths)?;
+    validate_package_profiles(&manifest.package_profiles, &retired)
+}
+
+fn validate_retired_runtime_paths(
+    paths: &[String],
+) -> Result<std::collections::BTreeSet<&str>, String> {
+    if paths.is_empty() {
+        return Err("release manifest retired_runtime_paths must not be empty".to_owned());
+    }
+    let mut actual = std::collections::BTreeSet::new();
+    for path in paths {
+        validated_relative_path("retired_runtime_paths", path)?;
+        if !actual.insert(path.as_str()) {
+            return Err(format!(
+                "release manifest retired_runtime_paths contains duplicate path {path}"
+            ));
+        }
+    }
+    let expected = RETIRED_RUNTIME_PATHS
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    if actual != expected {
+        let missing = expected.difference(&actual).next().copied();
+        let extra = actual.difference(&expected).next().copied();
+        return Err(format!(
+            "release manifest retired_runtime_paths changed (missing={}, extra={})",
+            missing.unwrap_or("none"),
+            extra.unwrap_or("none")
+        ));
+    }
+    Ok(actual)
+}
+
+fn validate_package_profiles(
+    profiles: &[PackageProfile],
+    retired: &std::collections::BTreeSet<&str>,
+) -> Result<(), String> {
     if profiles.len() != 2 {
         return Err(
             "release manifest must declare exactly the bridge and rust-only package profiles"
@@ -666,6 +811,18 @@ fn validate_package_profiles(profiles: &[PackageProfile]) -> Result<(), String> 
         if let Some(overlap) = required.intersection(&forbidden).next() {
             return Err(format!(
                 "{} package profile path {overlap} cannot be both required and forbidden",
+                profile.name.as_str()
+            ));
+        }
+        if let Some(path) = required.intersection(retired).next() {
+            return Err(format!(
+                "{} package profile cannot require retired runtime path {path}",
+                profile.name.as_str()
+            ));
+        }
+        if let Some(path) = forbidden.intersection(retired).next() {
+            return Err(format!(
+                "{} package profile must not duplicate retired runtime path {path} in forbidden_files",
                 profile.name.as_str()
             ));
         }
@@ -838,7 +995,7 @@ fn android_cargo_environment(compiler: &std::ffi::OsStr) -> [(&'static str, &std
 fn stage_module(options: StageModuleOptions) -> Result<(), String> {
     let root = workspace_root()?;
     let source_manifest = read_release_manifest(&root.join("conf/manifest.json"))?;
-    validate_package_profiles(&source_manifest.package_profiles)?;
+    validate_package_contract(&source_manifest)?;
     let profile = package_profile(&source_manifest.package_profiles, options.profile)?;
 
     build_android()?;
@@ -854,6 +1011,7 @@ fn stage_module(options: StageModuleOptions) -> Result<(), String> {
         &options.runtime_binaries,
         &fluxd_source,
         profile,
+        &source_manifest.retired_runtime_paths,
     )?;
 
     let status = match profile.status {
@@ -879,6 +1037,7 @@ fn stage_module_from_artifacts(
     runtime_binaries: &Path,
     fluxd_source: &Path,
     profile: &PackageProfile,
+    retired_runtime_paths: &[String],
 ) -> Result<(), String> {
     if !fluxd_source.is_file() {
         return Err(format!(
@@ -910,6 +1069,7 @@ fn stage_module_from_artifacts(
     copy_entry(fluxd_source, &stage.join("bin/fluxd"))?;
 
     require_package_layout(stage, profile)?;
+    reject_retired_runtime_paths(stage, retired_runtime_paths)?;
     reject_forbidden_profile_files(stage, profile)?;
     validate_staged_runtime_inventory(stage, profile)
 }
@@ -917,7 +1077,7 @@ fn stage_module_from_artifacts(
 fn verify_package(options: VerifyPackageOptions) -> Result<(), String> {
     let source_root = workspace_root()?;
     let source_manifest = read_release_manifest(&source_root.join("conf/manifest.json"))?;
-    validate_package_profiles(&source_manifest.package_profiles)?;
+    validate_package_contract(&source_manifest)?;
     let profile = package_profile(&source_manifest.package_profiles, options.profile)?;
     let source_revisions = verify_workspace_source_state(&source_root, profile)?;
     verify_package_dir_with_source(&options.stage, &source_root, options.profile)?;
@@ -1055,10 +1215,11 @@ fn verify_package_dir_with_source(
     }
 
     let source_manifest = read_release_manifest(&source_root.join("conf/manifest.json"))?;
-    validate_package_profiles(&source_manifest.package_profiles)?;
+    validate_package_contract(&source_manifest)?;
     let source_profile = package_profile(&source_manifest.package_profiles, profile_name)?;
 
     require_package_layout(stage, source_profile)?;
+    reject_retired_runtime_paths(stage, &source_manifest.retired_runtime_paths)?;
     reject_forbidden_profile_files(stage, source_profile)?;
     reject_unsafe_package_entries(stage, stage)?;
     validate_source_bound_module_files(stage, source_root, source_profile)?;
@@ -1080,10 +1241,12 @@ fn verify_package_dir_with_source(
 
     let manifest_path = stage.join("conf/manifest.json");
     let manifest = read_release_manifest(&manifest_path)?;
-    validate_package_profiles(&manifest.package_profiles)?;
-    if manifest.package_profiles != source_manifest.package_profiles {
+    validate_package_contract(&manifest)?;
+    if manifest.package_profiles != source_manifest.package_profiles
+        || manifest.retired_runtime_paths != source_manifest.retired_runtime_paths
+    {
         return Err(
-            "staged package profile policy differs from checked-in conf/manifest.json".to_owned(),
+            "staged package path policy differs from checked-in conf/manifest.json".to_owned(),
         );
     }
     let profile = package_profile(&manifest.package_profiles, profile_name)?;
@@ -1212,12 +1375,7 @@ fn validate_release_manifest(
     manifest: &ReleaseManifest,
     profile: &PackageProfile,
 ) -> Result<(), String> {
-    if manifest.schema_version != 2 {
-        return Err(format!(
-            "unsupported manifest schema version {}",
-            manifest.schema_version
-        ));
-    }
+    validate_package_contract(manifest)?;
     require_manifest_text("project", &manifest.project)?;
     if manifest.project != "Flux" {
         return Err(format!(
@@ -1227,8 +1385,6 @@ fn validate_release_manifest(
     }
     require_non_placeholder("generated_by", &manifest.generated_by)?;
     let _ = &manifest.note;
-    validate_package_profiles(&manifest.package_profiles)?;
-
     if manifest.device_test_evidence.is_empty() {
         return Err("release manifest has no required device-test evidence".to_owned());
     }
@@ -1515,6 +1671,24 @@ fn reject_forbidden_profile_files(stage: &Path, profile: &PackageProfile) -> Res
     Ok(())
 }
 
+fn reject_retired_runtime_paths(stage: &Path, paths: &[String]) -> Result<(), String> {
+    for relative in paths {
+        match fs::symlink_metadata(stage.join(relative)) {
+            Ok(_) => {
+                return Err(format!("package contains retired runtime path {relative}"));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "cannot inspect retired package path {}: {error}",
+                    stage.join(relative).display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_module_content(stage: &Path, profile: &PackageProfile) -> Result<(), String> {
     for relative in [
         "META-INF/com/google/android/update-binary",
@@ -1524,12 +1698,10 @@ fn validate_module_content(stage: &Path, profile: &PackageProfile) -> Result<(),
         "scripts/addrsync",
         "scripts/core",
         "scripts/dispatcher",
-        "scripts/flux-event",
         "scripts/init",
         "scripts/lib",
         "scripts/log",
         "scripts/tproxy",
-        "scripts/updater.sh",
     ]
     .into_iter()
     .filter(|relative| profile_requires(profile, relative))
@@ -1644,90 +1816,7 @@ fn validate_rust_only_platform_glue(stage: &Path) -> Result<(), String> {
                 "Rust-only platform glue {relative} must contain only non-NUL ASCII text"
             ));
         }
-        let normalized = normalize_platform_glue_source(source);
-        require_platform_glue_delegation_markers(relative, &normalized)?;
-
-        for token in platform_glue_source_tokens(&normalized) {
-            let executable = token.rsplit('/').next().unwrap_or(token);
-            if let Some((category, _)) = FORBIDDEN_PLATFORM_GLUE_EXECUTABLES
-                .iter()
-                .find(|(_, forbidden)| executable == *forbidden)
-            {
-                return Err(format!(
-                    "Rust-only platform glue {relative} contains forbidden {category} executable token '{executable}'"
-                ));
-            }
-        }
-        if let Some((category, fragment)) = FORBIDDEN_PLATFORM_GLUE_FRAGMENTS
-            .iter()
-            .find(|(_, forbidden)| normalized.contains(*forbidden))
-        {
-            return Err(format!(
-                "Rust-only platform glue {relative} contains forbidden {category} marker '{fragment}'"
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn normalize_platform_glue_source(source: &str) -> String {
-    let joined = source.replace("\\\r\n", "").replace("\\\n", "");
-    let mut normalized = String::with_capacity(joined.len().saturating_add(2));
-    normalized.push(' ');
-    for character in joined.chars() {
-        if character.is_ascii_whitespace() {
-            if !normalized.ends_with(' ') {
-                normalized.push(' ');
-            }
-        } else {
-            normalized.push(character.to_ascii_lowercase());
-        }
-    }
-    if !normalized.ends_with(' ') {
-        normalized.push(' ');
-    }
-    normalized
-}
-
-fn platform_glue_source_tokens(source: &str) -> impl Iterator<Item = &str> {
-    source.split(|character: char| {
-        !(character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '/' | '.'))
-    })
-}
-
-fn require_platform_glue_delegation_markers(
-    relative: &str,
-    normalized: &str,
-) -> Result<(), String> {
-    let (required_fragments, required_tokens): (&[&str], &[&str]) = match relative {
-        "META-INF/com/google/android/update-binary" => (&[], &["install_module"]),
-        "customize.sh" => (&["bin/fluxd", "flux_service.sh", "uninstall.sh"], &[]),
-        "flux_service.sh" => (&["/data/adb/flux/bin/fluxd"], &["daemon"]),
-        "uninstall.sh" => (
-            &["/data/adb/flux/bin/fluxd"],
-            &["ping", "stop", "cleanup", "--offline"],
-        ),
-        _ => {
-            return Err(format!(
-                "unreviewed Rust-only platform glue path {relative}"
-            ));
-        }
-    };
-    if let Some(missing) = required_fragments
-        .iter()
-        .find(|required| !normalized.contains(**required))
-    {
-        return Err(format!(
-            "Rust-only platform glue {relative} is missing required delegation marker '{missing}'"
-        ));
-    }
-    if let Some(missing) = required_tokens
-        .iter()
-        .find(|required| !platform_glue_source_tokens(normalized).any(|token| token == **required))
-    {
-        return Err(format!(
-            "Rust-only platform glue {relative} is missing required delegation token '{missing}'"
-        ));
+        platform_glue::validate_structure(relative, source)?;
     }
     Ok(())
 }
@@ -2692,6 +2781,9 @@ fn scrub_linux_canary_internal_environment(command: &mut Command) {
     for variable in LINUX_CANARY_INTERNAL_ENVS {
         command.env_remove(variable);
     }
+    for variable in NATIVE_COMPOSITION_INTERNAL_ENVS {
+        command.env_remove(variable);
+    }
 }
 
 fn require_success(command: &str, status: ExitStatus) -> Result<(), String> {
@@ -2717,6 +2809,7 @@ fn print_help() {
            test-functional-canary-linux-tproxy  Run the ingress-only Linux TPROXY checkpoint\n\
            test-functional-canary-linux-output-tproxy  Run the local-OUTPUT loopback TPROXY checkpoint\n\
            test-functional-canary-linux-output-preflight  Preflight distinct local-OUTPUT credentials (no traffic)\n\
+           test-native-composition-linux  Run the dispatcher-free native lifecycle and recovery checkpoint\n\
            test-parser-fuzz-smoke  Run bounded deterministic parser no-panic smoke tests\n\
            test-functional-canary-android-x86_64-output-tproxy  Cross-build and run the exact checkpoint on one explicit rooted x86_64 Android serial\n\
            preflight-android-arm64-mark-ordering  Read-only ADR-0013 target viability report for one explicit rooted ARM64 Android serial\n\
@@ -2832,6 +2925,12 @@ mod tests {
             .clone()
     }
 
+    fn checked_retired_runtime_paths_json() -> serde_json::Value {
+        serde_json::from_str::<serde_json::Value>(include_str!("../../conf/manifest.json"))
+            .expect("checked release manifest JSON must parse")["retired_runtime_paths"]
+            .clone()
+    }
+
     fn write_required_module_fixture(stage: &Path, profile: &PackageProfile) {
         for relative in &profile.required_files {
             if relative == "conf/manifest.json" || relative.starts_with("bin/") {
@@ -2923,6 +3022,14 @@ mod tests {
     }
 
     #[test]
+    fn native_composition_required_contract_accepts_only_zero_one_or_unset() {
+        assert_eq!(parse_native_composition_required(None), Ok(false));
+        assert_eq!(parse_native_composition_required(Some("0")), Ok(false));
+        assert_eq!(parse_native_composition_required(Some("1")), Ok(true));
+        assert!(parse_native_composition_required(Some("true")).is_err());
+    }
+
+    #[test]
     fn android_build_environment_sets_pinned_compilers_and_16k_linker_flag() {
         let compiler =
             std::ffi::OsStr::new("/ndk/toolchains/llvm/bin/aarch64-linux-android31-clang");
@@ -2993,7 +3100,7 @@ mod tests {
     #[test]
     fn checked_package_contract_names_the_exact_bridge_difference() {
         let manifest = checked_release_manifest();
-        validate_package_profiles(&manifest.package_profiles)
+        validate_package_contract(&manifest)
             .expect("checked package profiles must be internally complete");
         let bridge = package_profile(&manifest.package_profiles, PackageProfileName::Bridge)
             .expect("bridge profile");
@@ -3001,9 +3108,13 @@ mod tests {
             .expect("rust-only profile");
         assert_eq!(bridge.status, PackageProfileStatus::DevelopmentOnly);
         assert_eq!(rust_only.status, PackageProfileStatus::FailingUntilComplete);
-        assert_eq!(bridge.required_files.len(), 28);
+        assert_eq!(
+            manifest.retired_runtime_paths,
+            RETIRED_RUNTIME_PATHS.map(str::to_owned)
+        );
+        assert_eq!(bridge.required_files.len(), 26);
         assert_eq!(rust_only.required_files.len(), 13);
-        assert_eq!(rust_only.forbidden_files.len(), 15);
+        assert_eq!(rust_only.forbidden_files.len(), 13);
         for required in RUST_ONLY_PLATFORM_GLUE_FILES {
             assert!(
                 rust_only.required_files.iter().any(|path| path == required),
@@ -3011,13 +3122,41 @@ mod tests {
             );
         }
 
-        let mut incomplete = manifest.package_profiles.clone();
-        package_profile_mut(&mut incomplete, PackageProfileName::RustOnly)
-            .forbidden_files
-            .retain(|path| path != "bin/jq");
-        let error = validate_package_profiles(&incomplete)
+        let mut incomplete = checked_release_manifest();
+        package_profile_mut(
+            &mut incomplete.package_profiles,
+            PackageProfileName::RustOnly,
+        )
+        .forbidden_files
+        .retain(|path| path != "bin/jq");
+        let error = validate_package_contract(&incomplete)
             .expect_err("an unnamed bridge-only path must fail the contract");
         assert!(error.contains("missing=bin/jq"));
+    }
+
+    #[test]
+    fn every_package_profile_rejects_retired_runtime_paths() {
+        let manifest = checked_release_manifest();
+        for name in [PackageProfileName::Bridge, PackageProfileName::RustOnly] {
+            let directory = TestDirectory::new(&format!("{}-retired-path", name.as_str()));
+            let profile =
+                package_profile(&manifest.package_profiles, name).expect("package profile");
+            for relative in &manifest.retired_runtime_paths {
+                let path = directory.0.join(relative);
+                fs::create_dir_all(path.parent().expect("retired path parent"))
+                    .expect("create retired path parent");
+                fs::write(&path, "retired residue\n").expect("write retired path fixture");
+                let error =
+                    reject_retired_runtime_paths(&directory.0, &manifest.retired_runtime_paths)
+                        .expect_err("retired path must fail every package profile");
+                assert!(
+                    error.contains(relative),
+                    "unexpected {} rejection for {relative}: {error}",
+                    profile.name.as_str()
+                );
+                fs::remove_file(&path).expect("remove retired path fixture");
+            }
+        }
     }
 
     #[test]
@@ -3070,6 +3209,26 @@ mod tests {
                 "sh \\\n-c \"${command}\"\n",
                 "dynamic command construction",
             ),
+            (
+                "adjacent quote command concatenation",
+                "ip\"\"tables -L\n",
+                "networking mutation",
+            ),
+            (
+                "variable executable",
+                "tool=iptables\n\"${tool}\" -L\n",
+                "dynamic command construction",
+            ),
+            (
+                "function indirection",
+                "mutate() { iptables -L; }\nmutate\n",
+                "networking mutation",
+            ),
+            (
+                "command substitution",
+                "probe=\"$(iptables -L)\"\n",
+                "dynamic command construction",
+            ),
         ];
 
         for (label, hostile_source, expected_category) in hostile_cases {
@@ -3085,6 +3244,37 @@ mod tests {
                 "{label} returned unexpected policy error: {error}"
             );
         }
+    }
+
+    #[test]
+    fn rust_only_platform_glue_uses_commands_not_comments_or_strings_as_delegation() {
+        let directory = TestDirectory::new("rust-only-platform-glue-structure");
+        let stage = &directory.0;
+        let rust_only = checked_profile(PackageProfileName::RustOnly);
+        write_required_module_fixture(stage, &rust_only);
+
+        let customize = stage.join("customize.sh");
+        let mut source = fs::read_to_string(&customize).expect("read clean customize fixture");
+        source.push_str("# iptables and /scripts/ are comments, not commands\n");
+        fs::write(&customize, source).expect("write comment fixture");
+        validate_rust_only_platform_glue(stage)
+            .expect("forbidden words in comments must not invent runtime behavior");
+
+        fs::write(
+            stage.join("flux_service.sh"),
+            concat!(
+                "#!/system/bin/sh\n",
+                "# /data/adb/flux/bin/fluxd daemon\n",
+                "echo '/data/adb/flux/bin/fluxd daemon'\n",
+            ),
+        )
+        .expect("write comment-only delegation fixture");
+        let error = validate_rust_only_platform_glue(stage)
+            .expect_err("comment and string markers must not satisfy delegation");
+        assert!(
+            error.contains("missing required direct delegation command"),
+            "unexpected structural policy error: {error}"
+        );
     }
 
     #[test]
@@ -3144,7 +3334,7 @@ mod tests {
             .expect("xtask must be directly below the workspace root");
 
         for (name, expected_count) in [
-            (PackageProfileName::Bridge, 28),
+            (PackageProfileName::Bridge, 26),
             (PackageProfileName::RustOnly, 13),
         ] {
             let stage_directory = TestDirectory::new(&format!("{}-stage", name.as_str()));
@@ -3159,6 +3349,7 @@ mod tests {
                 &runtime_binaries,
                 &fluxd,
                 &profile,
+                &checked_release_manifest().retired_runtime_paths,
             )
             .expect("checked profile must stage from authoritative sources");
             assert_eq!(profile.required_files.len(), expected_count);
@@ -3204,6 +3395,7 @@ mod tests {
             &runtime_binaries,
             &fluxd,
             &rust_only,
+            &checked_release_manifest().retired_runtime_paths,
         )
         .expect("Rust-only fixture must stage exactly");
 
@@ -3269,6 +3461,15 @@ mod tests {
             &output_preflight,
             LINUX_TPROXY_CANARY_TEST
         ));
+        let native_composition = format!("{NATIVE_COMPOSITION_TEST}: test\n");
+        assert!(linux_canary_test_is_listed(
+            &native_composition,
+            NATIVE_COMPOSITION_TEST
+        ));
+        assert!(!linux_canary_test_is_listed(
+            &native_composition,
+            LINUX_CANARY_TEST
+        ));
     }
 
     #[test]
@@ -3277,10 +3478,18 @@ mod tests {
         for variable in LINUX_CANARY_INTERNAL_ENVS {
             command.env(variable, "hostile-parent-value");
         }
+        for variable in NATIVE_COMPOSITION_INTERNAL_ENVS {
+            command.env(variable, "hostile-parent-value");
+        }
 
         scrub_linux_canary_internal_environment(&mut command);
 
         for variable in LINUX_CANARY_INTERNAL_ENVS {
+            assert!(command.get_envs().any(|(name, value)| {
+                name == std::ffi::OsStr::new(variable) && value.is_none()
+            }));
+        }
+        for variable in NATIVE_COMPOSITION_INTERNAL_ENVS {
             assert!(command.get_envs().any(|(name, value)| {
                 name == std::ffi::OsStr::new(variable) && value.is_none()
             }));
@@ -3390,8 +3599,9 @@ mod tests {
         );
         fs::write(stage.join("SBOM.spdx.json"), &sbom).expect("write SBOM");
         let package_profiles = checked_package_profiles_json();
+        let retired_runtime_paths = checked_retired_runtime_paths_json();
         let manifest = format!(
-            "{{\"schema_version\":2,\"project\":\"Flux\",\"generated_by\":\"cargo xtask package-magisk\",\"binaries\":[{binaries}],\"device_test_evidence\":[{{\"path\":\"evidence/device.json\",\"sha256\":\"{evidence_hash}\",\"source_revision\":\"0123456789abcdef0123456789abcdef01234567\",\"payload_sha256\":\"{payload_sha256}\",\"device_profile\":\"test-gki-arm64\",\"android_build_fingerprint\":\"flux/test/device:14/UP1A.231005.007/1234567:user/release-keys\",\"kernel_release\":\"5.10.198-android12-9-gki\",\"boot_id\":\"12345678-1234-4abc-8def-1234567890ab\",\"verified_boot_state\":\"green\",\"selinux_enforcing\":true,\"captured_at_utc\":\"2026-07-14T00:00:00Z\"}}],\"package_profiles\":{package_profiles}}}"
+            "{{\"schema_version\":3,\"project\":\"Flux\",\"generated_by\":\"cargo xtask package-magisk\",\"binaries\":[{binaries}],\"device_test_evidence\":[{{\"path\":\"evidence/device.json\",\"sha256\":\"{evidence_hash}\",\"source_revision\":\"0123456789abcdef0123456789abcdef01234567\",\"payload_sha256\":\"{payload_sha256}\",\"device_profile\":\"test-gki-arm64\",\"android_build_fingerprint\":\"flux/test/device:14/UP1A.231005.007/1234567:user/release-keys\",\"kernel_release\":\"5.10.198-android12-9-gki\",\"boot_id\":\"12345678-1234-4abc-8def-1234567890ab\",\"verified_boot_state\":\"green\",\"selinux_enforcing\":true,\"captured_at_utc\":\"2026-07-14T00:00:00Z\"}}],\"retired_runtime_paths\":{retired_runtime_paths},\"package_profiles\":{package_profiles}}}"
         );
         fs::write(stage.join("conf/manifest.json"), &manifest).expect("write manifest");
         let parsed_manifest: ReleaseManifest =

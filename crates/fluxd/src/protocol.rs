@@ -3,15 +3,15 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use flux_core::{
-    AdministrativeState, AndroidBuildIdentity, AndroidProductIdentity, ArtifactIdentity,
-    BootIdentity, BootIdentityMutationStatus, CAPABILITY_PROFILE_SCHEMA_VERSION, CapabilityProfile,
-    ConfigurationChangeReport, ControlError, ControlService, ControlSnapshot, DeviceIdentity,
-    KernelBuildIdentity, KernelFacts, KernelMutationStatus, KernelRelease, KernelSupport,
-    KernelVersion, LegacyAddressSynchronization, LegacyArtifactReadiness, LegacyArtifactResolution,
-    LegacyBridgeFacts, LegacyIntent, LegacyMutationGate, LegacyMutationWriter, LegacyRuleBackend,
-    MIN_SUPPORTED_KERNEL, NetworkNamespaceIdentity, Observation, OperationReport, Reason,
-    SecurityPatchLevel, SelinuxMode, SelinuxPolicyIdentity, Sha256Digest, ToolId,
-    VendorBuildIdentity, VerifiedBootIdentity, VerifiedBootState,
+    AddressResyncDisposition, AdministrativeState, AndroidBuildIdentity, AndroidProductIdentity,
+    ArtifactIdentity, BootIdentity, BootIdentityMutationStatus, CAPABILITY_PROFILE_SCHEMA_VERSION,
+    CapabilityProfile, ConfigurationChangeReport, ControlError, ControlService, ControlSnapshot,
+    DeviceIdentity, KernelBuildIdentity, KernelFacts, KernelMutationStatus, KernelRelease,
+    KernelSupport, KernelVersion, LegacyAddressSynchronization, LegacyArtifactReadiness,
+    LegacyArtifactResolution, LegacyBridgeFacts, LegacyIntent, LegacyMutationGate,
+    LegacyMutationWriter, LegacyRuleBackend, MIN_SUPPORTED_KERNEL, NetworkNamespaceIdentity,
+    Observation, OperationReport, Reason, SecurityPatchLevel, SelinuxMode, SelinuxPolicyIdentity,
+    Sha256Digest, ToolId, VendorBuildIdentity, VerifiedBootIdentity, VerifiedBootState,
 };
 use flux_platform::Uid;
 use serde::{Deserialize, Serialize};
@@ -25,7 +25,7 @@ use crate::{
     RuntimeFailure, RuntimePhase, RuntimeSnapshot, RuntimeSnapshotSource, RuntimeVerificationState,
 };
 
-const PROTOCOL_VERSION: u16 = 3;
+const PROTOCOL_VERSION: u16 = 4;
 const RECENT_RESULT_CAPACITY: usize = 128;
 const RECENT_RESULT_FINGERPRINT_BYTES: usize = MAX_CONTROL_PACKET_BYTES;
 const RECENT_RESULT_RESPONSE_BYTES: usize = MAX_CONTROL_PACKET_BYTES;
@@ -338,11 +338,16 @@ where
             WireAction::Restart | WireAction::Reload => LegacyIntent::Reload { reason },
             WireAction::Resync => LegacyIntent::ResyncAddresses { reason },
         };
-        match self.control.submit_and_wait(intent) {
+        match self
+            .control
+            .submit_and_wait(intent)
+            .and_then(validate_operation_report)
+        {
             Ok(report) => encode_response(ResponseEnvelope::ok(
                 request_id,
                 ResponseBody::Operation {
                     revision: report.revision,
+                    address_resync: report.address_resync.map(Into::into),
                 },
             )),
             Err(error) => encode_response(ResponseEnvelope::error(
@@ -779,6 +784,8 @@ enum ResponseBody {
     },
     Operation {
         revision: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        address_resync: Option<WireAddressResyncDisposition>,
     },
     Event {
         disposition: WireEventDisposition,
@@ -807,6 +814,34 @@ enum WireEventDisposition {
     Applied,
     Deferred,
     Ignored,
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WireAddressResyncDisposition {
+    CompleteNoChange,
+    SuccessorConverged,
+    AcceptedDeferred,
+}
+
+impl From<AddressResyncDisposition> for WireAddressResyncDisposition {
+    fn from(disposition: AddressResyncDisposition) -> Self {
+        match disposition {
+            AddressResyncDisposition::CompleteNoChange => Self::CompleteNoChange,
+            AddressResyncDisposition::SuccessorConverged => Self::SuccessorConverged,
+            AddressResyncDisposition::AcceptedDeferred => Self::AcceptedDeferred,
+        }
+    }
+}
+
+impl From<WireAddressResyncDisposition> for AddressResyncDisposition {
+    fn from(disposition: WireAddressResyncDisposition) -> Self {
+        match disposition {
+            WireAddressResyncDisposition::CompleteNoChange => Self::CompleteNoChange,
+            WireAddressResyncDisposition::SuccessorConverged => Self::SuccessorConverged,
+            WireAddressResyncDisposition::AcceptedDeferred => Self::AcceptedDeferred,
+        }
+    }
 }
 
 impl From<WireEventDisposition> for EventDisposition {
@@ -1513,15 +1548,21 @@ impl From<&ControlSnapshot> for WireControlSnapshot {
     }
 }
 
-impl From<WireControlSnapshot> for ControlSnapshot {
-    fn from(snapshot: WireControlSnapshot) -> Self {
-        Self {
+impl TryFrom<WireControlSnapshot> for ControlSnapshot {
+    type Error = ControlError;
+
+    fn try_from(snapshot: WireControlSnapshot) -> Result<Self, Self::Error> {
+        Ok(Self {
             revision: snapshot.revision,
             administrative_state: snapshot.administrative_state.into(),
             configuration_dirty: snapshot.configuration_dirty,
             in_flight: snapshot.in_flight.map(Into::into),
-            last_completed: snapshot.last_completed.map(Into::into),
-        }
+            last_completed: snapshot
+                .last_completed
+                .map(Into::into)
+                .map(validate_operation_report)
+                .transpose()?,
+        })
     }
 }
 
@@ -1814,6 +1855,8 @@ impl From<WireIntent> for LegacyIntent {
 struct WireOperationReport {
     intent: WireIntent,
     revision: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    address_resync: Option<WireAddressResyncDisposition>,
 }
 
 impl From<OperationReport> for WireOperationReport {
@@ -1821,6 +1864,7 @@ impl From<OperationReport> for WireOperationReport {
         Self {
             intent: report.intent.into(),
             revision: report.revision,
+            address_resync: report.address_resync.map(Into::into),
         }
     }
 }
@@ -1830,6 +1874,7 @@ impl From<WireOperationReport> for OperationReport {
         Self {
             intent: report.intent.into(),
             revision: report.revision,
+            address_resync: report.address_resync.map(Into::into),
         }
     }
 }
@@ -1967,10 +2012,38 @@ pub(crate) fn decode_control_response(
     let response = decode_response(packet, expected_request_id)?;
     match response.result {
         WireResult::Ok {
-            body: ResponseBody::Operation { revision },
-        } => Ok(OperationReport { intent, revision }),
+            body:
+                ResponseBody::Operation {
+                    revision,
+                    address_resync,
+                },
+        } => validate_operation_report(OperationReport {
+            intent,
+            revision,
+            address_resync: address_resync.map(Into::into),
+        }),
         WireResult::Ok { .. } => Err(unexpected_response("control")),
         WireResult::Error { code, message } => Err(rejected_response(code, message)),
+    }
+}
+
+fn validate_operation_report(report: OperationReport) -> Result<OperationReport, ControlError> {
+    let valid = matches!(
+        (report.intent, report.address_resync),
+        (LegacyIntent::ResyncAddresses { .. }, Some(_))
+            | (
+                LegacyIntent::Running { .. }
+                    | LegacyIntent::Stopped { .. }
+                    | LegacyIntent::Reload { .. },
+                None
+            )
+    );
+    if valid {
+        Ok(report)
+    } else {
+        Err(ControlError::protocol(
+            "operation resync disposition does not match its intent",
+        ))
     }
 }
 
@@ -2012,7 +2085,7 @@ pub(crate) fn decode_status_response(
             }
             Ok(DaemonSnapshot {
                 capability_profile,
-                control: control.into(),
+                control: control.try_into()?,
                 runtime: runtime.into(),
             })
         }
@@ -2242,6 +2315,8 @@ mod tests {
             Ok(OperationReport {
                 intent,
                 revision: 1,
+                address_resync: matches!(intent, LegacyIntent::ResyncAddresses { .. })
+                    .then_some(AddressResyncDisposition::AcceptedDeferred),
             })
         }
     }
@@ -2270,6 +2345,8 @@ mod tests {
         let inspection = Arc::new(ProcessInspectionSource::new(
             directory.path().join("flux.toml"),
             run.join("engine.manifest"),
+            run.join("flux.log"),
+            run.join("fluxd.log"),
         ));
         let handler = ProtocolHandler::with_runtime_subscription_and_inspection(
             Arc::new(CapabilityProfileFixture::supported()),
@@ -2282,7 +2359,7 @@ mod tests {
         let request = encode_logs_request(91, LogStream::Runtime, 2).expect("log request");
         assert_eq!(
             String::from_utf8(request.clone()).expect("UTF-8 request"),
-            "{\"protocol_version\":3,\"request_id\":91,\"command\":{\"kind\":\"logs\",\"stream\":\"runtime\",\"lines\":2}}"
+            "{\"protocol_version\":4,\"request_id\":91,\"command\":{\"kind\":\"logs\",\"stream\":\"runtime\",\"lines\":2}}"
         );
         let first = handler.handle_for_peer(&request, RequestPeerId::new(Uid::ROOT, 72));
         let report = decode_logs_response(&first, 91, LogStream::Runtime, 2).expect("log report");
@@ -2369,7 +2446,7 @@ mod tests {
         assert_eq!(
             String::from_utf8(response).expect("UTF-8 response"),
             concat!(
-                "{\"protocol_version\":3,\"request_id\":101,",
+                "{\"protocol_version\":4,\"request_id\":101,",
                 "\"result\":{\"status\":\"ok\",\"body\":{",
                 "\"kind\":\"subscription_update\",\"disposition\":\"updated\",",
                 "\"generation\":71,\"node_count\":23,\"cleanup_pending\":true}}}\n"
@@ -2400,7 +2477,7 @@ mod tests {
         assert_eq!(
             String::from_utf8(response).expect("UTF-8 response"),
             concat!(
-                "{\"protocol_version\":3,\"request_id\":102,",
+                "{\"protocol_version\":4,\"request_id\":102,",
                 "\"result\":{\"status\":\"error\",\"code\":\"unsupported_kernel\",",
                 "\"message\":\"kernel 5.4.280 is below minimum 5.10.0\"}}\n"
             )

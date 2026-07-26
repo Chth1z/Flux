@@ -607,7 +607,7 @@ fn a_successful_parent_cannot_leave_a_descendant_holding_capture_pipes() {
     let fixture = Fixture::new();
     let descendant_pid = fixture.path("descendant.pid");
     let body = format!(
-        "{SLEEP} 30 &\nchild=$!\n{PRINTF} '%s\\n' \"$child\" > {}\nexit 0",
+        "{CAT} >/dev/null\n{SLEEP} 30 &\nchild=$!\n{PRINTF} '%s\\n' \"$child\" > {}\nexit 0",
         shell_quote(&descendant_pid)
     );
     let script = fixture.script("iptables-restore", LEGACY_VERSION, &body);

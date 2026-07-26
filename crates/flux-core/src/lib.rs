@@ -118,9 +118,10 @@ pub use config::{
     ListenerConfig, MAX_CONFIG_DOCUMENT_BYTES, ReconcileDebounce, SafetyConfig, SubscriptionConfig,
 };
 pub use control::{
-    AdministrativeState, ConfigurationChangeClient, ConfigurationChangeReport, ControlClient,
-    ControlError, ControlObservation, ControlObservationIngress, ControlService, ControlSnapshot,
-    ControlSnapshotSource, LegacyControlBridge, LegacyDispatcher, LegacyIntent, OperationHandle,
+    AddressResyncDisposition, AdministrativeState, ConfigurationChangeClient,
+    ConfigurationChangeReport, ControlClient, ControlError, ControlObservation,
+    ControlObservationIngress, ControlService, ControlSnapshot, ControlSnapshotSource,
+    DispatcherCompletion, LegacyControlBridge, LegacyDispatcher, LegacyIntent, OperationHandle,
     OperationReport, Reason,
 };
 pub use fwmark_audit::{

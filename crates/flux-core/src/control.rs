@@ -49,6 +49,31 @@ pub enum AdministrativeState {
 pub struct OperationReport {
     pub intent: LegacyIntent,
     pub revision: u64,
+    pub address_resync: Option<AddressResyncDisposition>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AddressResyncDisposition {
+    CompleteNoChange,
+    SuccessorConverged,
+    AcceptedDeferred,
+}
+
+impl AddressResyncDisposition {
+    #[must_use]
+    pub const fn as_token(self) -> &'static str {
+        match self {
+            Self::CompleteNoChange => "complete_no_change",
+            Self::SuccessorConverged => "successor_converged",
+            Self::AcceptedDeferred => "accepted_deferred",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DispatcherCompletion {
+    Completed,
+    AddressResync(AddressResyncDisposition),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -85,7 +110,7 @@ impl Default for ControlSnapshot {
 }
 
 pub trait LegacyDispatcher: Send + 'static {
-    fn execute(&mut self, intent: &LegacyIntent) -> Result<(), ControlError>;
+    fn execute(&mut self, intent: &LegacyIntent) -> Result<DispatcherCompletion, ControlError>;
 
     fn observation_failed(&mut self, _observation: ControlObservation, _error: &ControlError) {}
 
@@ -655,14 +680,38 @@ where
     });
     let configuration_was_dirty = started.configuration_dirty;
 
-    let result = dispatcher.execute(&intent);
+    let result = dispatcher.execute(&intent).and_then(|completion| {
+        let valid = matches!(
+            (intent, completion),
+            (
+                LegacyIntent::ResyncAddresses { .. },
+                DispatcherCompletion::AddressResync(_)
+            ) | (
+                LegacyIntent::Running { .. }
+                    | LegacyIntent::Stopped { .. }
+                    | LegacyIntent::Reload { .. },
+                DispatcherCompletion::Completed
+            )
+        );
+        if valid {
+            Ok(completion)
+        } else {
+            Err(ControlError::dispatcher(
+                "dispatcher returned a completion that does not match the requested intent",
+            ))
+        }
+    });
     if result.is_ok() && configuration_was_dirty && matches!(intent, LegacyIntent::Running { .. }) {
         dispatcher.configuration_inputs_consumed();
     }
     let completed_revision = started.revision.saturating_add(1);
-    let operation = result.map(|()| OperationReport {
+    let operation = result.map(|completion| OperationReport {
         intent,
         revision: completed_revision,
+        address_resync: match completion {
+            DispatcherCompletion::Completed => None,
+            DispatcherCompletion::AddressResync(disposition) => Some(disposition),
+        },
     });
 
     replace_snapshot(snapshot, |current| ControlSnapshot {

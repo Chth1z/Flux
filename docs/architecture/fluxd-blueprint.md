@@ -338,8 +338,8 @@ active/predecessor recovery, and conditional rollback. Fetch transport and snaps
 internal seams. The delivered adapter is synchronous Rustls-backed HTTP on one capacity-one worker;
 network and parsing work never runs on the serialized runtime writer. Startup bootstrap, periodic
 refresh, and manual control all enter the same operation, and only a completed validated snapshot
-crosses into the Generation reload path. `scripts/updater.sh` remains a packaged pre-release oracle
-only and has no runtime caller.
+crosses into the Generation reload path. The replaced shell updater is retired from source and both
+package profiles; manifest schema 3 denies its old path from staged packages.
 
 ## Runtime state model
 
@@ -368,7 +368,7 @@ stateDiagram-v2
 
 In the final architecture, `Running` means Observed State matches all required parts of Desired State. The Phase 1 projection uses `Running` as the operational engine/capture phase and reports verification orthogonally, so callers must require the appropriate verification state when functional authorization matters. `Degraded` is valid only when the compiler marked the missing behavior optional and the report names the omitted capability.
 
-During Phase 1, status exposes two deliberately separate immutable views. `ControlSnapshot` reports desired/control progress (administrative state, in-flight intent, dirty configuration, and last completion). The independently revisioned `RuntimeSnapshot` reports observed runtime phase, capture state, engine state, orthogonal verification state, generation, and a bounded last error. Protocol version 3 requires verification as `structural_only`, `functional_pending`, `functional_passed`, or `functional_failed`; a verification-only transition advances the runtime revision. `RUNNING` remains an operational phase and does not by itself claim functional or Android qualification. A successful control response therefore does not substitute for runtime observation.
+During Phase 1, status exposes two deliberately separate immutable views. `ControlSnapshot` reports desired/control progress (administrative state, in-flight intent, dirty configuration, and last completion). Protocol version 4 requires a resync completion to carry exactly one typed disposition: `complete_no_change`, `successor_converged`, or `accepted_deferred`; other intents carry none. The independently revisioned `RuntimeSnapshot` reports observed runtime phase, capture state, engine state, orthogonal verification state, generation, and a bounded last error. Version 4 retains the required verification states `structural_only`, `functional_pending`, `functional_passed`, and `functional_failed`; a verification-only transition advances the runtime revision. Protocol versions 1 through 3 are rejected. `RUNNING` remains an operational phase and does not by itself claim functional or Android qualification. A successful control response therefore does not substitute for runtime observation.
 
 ## Generation transaction protocol
 
@@ -1080,9 +1080,9 @@ its currently selected engine template and subscription URL file, and the module
 It exposes only coalesced configuration-input and disable-state facts, recovers from overflow,
 atomic replacement, invalidated watches, missing parents, and ancestor-directory replacement, and
 submits them without blocking to the existing serialized mutation scheduler. Read-only profiles
-attach no observer. The prior `inotifyd`/`flux-event` runtime path is gone; the adapter remains only
-as a development-bridge artifact and is absent from the exact Rust-only stage. It leaves the bridge
-only with the other rollback artifacts at Gate 1.
+attach no observer. The prior `inotifyd`/`flux-event` runtime path and its no-caller adapter are
+retired from source and both package profiles. The manifest denylist prevents the old path from
+returning as bridge or Rust-only residue.
 
 Offline multicall commands, which are not routed over the live daemon socket:
 
@@ -1132,7 +1132,7 @@ Expose a structured snapshot containing:
 - eBPF verifier/attach state and counters;
 - last successful reconciliation and last failure.
 
-The Phase 1 projection exposes `ControlSnapshot` and `RuntimeSnapshot` as separate protocol fields, including the required version-3 runtime verification state, and each prepared Generation has its own runtime log. Long-term bounded rotation/retention policy and retained redacted diagnostic bundles are not yet delivered; current supervisor diagnostics are bounded and raw tails are excluded from public snapshots.
+The Phase 1 projection exposes `ControlSnapshot` and `RuntimeSnapshot` as separate protocol fields, including the required version-4 typed resync completion and runtime verification state, and each prepared Generation has its own runtime log. Long-term retained redacted diagnostic bundles are not yet delivered; current daemon/runtime sinks and supervisor diagnostics are bounded, and raw tails are excluded from public snapshots.
 
 ## Additional proposed features
 

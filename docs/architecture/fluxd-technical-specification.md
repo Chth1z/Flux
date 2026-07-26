@@ -67,7 +67,7 @@ In the delivered Phase 1 bridge, `RuntimeCoordinator` implements `LegacyDispatch
 
 ## 3. Local control socket and Module routing
 
-The control socket is `/data/adb/flux/run/fluxd.sock`, Unix `SOCK_SEQPACKET`, protocol version 3. Version 2 introduced the coherent boot-scoped Capability Profile; version 3 adds a required orthogonal runtime-verification field, subscription maintenance, and additive read-only diagnostic/log/explain commands. The nested Capability Profile has its own schema version and now uses schema 2 for exact device identity. Version-1 and version-2 requests are rejected explicitly rather than decoded against the new response shape.
+The control socket is `/data/adb/flux/run/fluxd.sock`, Unix `SOCK_SEQPACKET`, protocol version 4. Version 2 introduced the coherent boot-scoped Capability Profile; version 3 added a required orthogonal runtime-verification field, subscription maintenance, and additive read-only diagnostic/log/explain commands. Version 4 adds the required typed address-resync result to `OperationReport`: `complete_no_change`, `successor_converged`, or `accepted_deferred`. The nested Capability Profile has its own schema version and now uses schema 2 for exact device identity. Protocol versions 1 through 3 are rejected explicitly rather than decoded against the new response shape.
 
 ### 3.1 Request envelope
 
@@ -136,7 +136,7 @@ Packets larger than 1 MiB are rejected. The daemon verifies peer credentials and
 
 Request IDs are retained in a bounded recent-result cache so a retried mutating request is not applied twice.
 
-Phase 1 status returns `control` and `runtime` separately. `ControlSnapshot` describes desired/control progress. `RuntimeSnapshot` is an independently revisioned observed projection containing runtime phase, capture state, engine state, verification state, generation, and an optional bounded operation/message/recovery failure. Verification is required on the version-3 wire shape and is one of `structural_only`, `functional_pending`, `functional_passed`, or `functional_failed`. `structural_only` is the conservative no-functional-authorization baseline rather than proof that structural verification has completed. A functional pass is bound to the exact current Generation, engine, environment, and successful `RUNNING` publication; publication failure, identity loss, address resynchronization, restart, repair, or rollback invalidates it until a fresh gate succeeds. Clients must not infer observed health solely from administrative intent, request completion, runtime phase, or verification state in isolation. The current pre-release Phase 1 composition remains structural-only and Android-unqualified.
+Phase 1 status returns `control` and `runtime` separately. `ControlSnapshot` describes desired/control progress. Its immutable `OperationReport` carries exactly one address-resync disposition for a completed resync request and none for other intents: `complete_no_change` means the fresh snapshot required no successor, `successor_converged` means the successor reached verified running state synchronously, and `accepted_deferred` means observation/resynchronization was queued without claiming a kernel mutation completed. `RuntimeSnapshot` is an independently revisioned observed projection containing runtime phase, capture state, engine state, verification state, generation, and an optional bounded operation/message/recovery failure. Verification is required on the version-4 wire shape and is one of `structural_only`, `functional_pending`, `functional_passed`, or `functional_failed`. `structural_only` is the conservative no-functional-authorization baseline rather than proof that structural verification has completed. A functional pass is bound to the exact current Generation, engine, environment, and successful `RUNNING` publication; publication failure, identity loss, address resynchronization, restart, repair, or rollback invalidates it until a fresh gate succeeds. Clients must not infer observed health solely from administrative intent, request completion, runtime phase, or verification state in isolation. The current pre-release Phase 1 composition remains structural-only and Android-unqualified.
 
 ## 4. Core domain types
 
@@ -465,9 +465,9 @@ compilation with an exact store-validated canonical artifact. One bounded synchr
 HTTPS retrieval, decoding, normalization, remote binary rule-set localization, Sing-Box validation,
 active/predecessor publication, startup recovery/bootstrap, periodic scheduling, and manual
 refresh. A completed candidate enters the same serialized Generation reload path; rejection or
-missing acknowledgement conditionally restores the exact prior store index. The worker never calls
-`scripts/updater.sh`, and no shell initialization path may call or require that script. The current
-private store modes support only the packaged root-owned engine identity.
+missing acknowledgement conditionally restores the exact prior store index. The replaced shell
+updater is retired from source and both package profiles, and manifest schema 3 denies its old path.
+The current private store modes support only the packaged root-owned engine identity.
 
 ## 6. Capability Profile
 
@@ -1675,7 +1675,7 @@ through the actual socket observations. No production required-mode context exis
 
 ### 14.2 Functional-canary schema-v2 listener delivery
 
-The internal functional-canary evidence model is schema v2. The control protocol remains v3, the
+The internal functional-canary evidence model is schema v2. The control protocol is version 4, the
 supervised inbound-delivery report validation format is independently schema v1, and `flux.toml`
 uses schema 2. The schema defines evidence admission; it does not establish that the selected
 engine artifact actually exposes an authoritative report producer.
@@ -2033,12 +2033,13 @@ cargo xtask verify-package --profile bridge|rust-only --stage <dir>
 cargo xtask test-functional-canary-android-x86_64-output-tproxy --serial <serial> [--adb <program>]
 ```
 
-`conf/manifest.json` schema 2 is the checked package contract. Its `bridge` profile is explicitly
+`conf/manifest.json` schema 3 is the checked package contract. Its `bridge` profile is explicitly
 `development-only`; its `rust-only` profile is explicitly `failing-until-complete`. The former
-requires the current 28 runtime/module paths. The latter requires the 13 final `fluxd`, Sing-Box,
-Rust-owned configuration/asset, and platform-glue paths and names the exact other 15 bridge paths as
-forbidden. The verifier proves that this forbidden set equals bridge-required minus
-Rust-only-required, so no removed bridge path can be omitted from policy.
+requires the current 26 runtime/module paths. The latter requires the 13 final `fluxd`, Sing-Box,
+Rust-owned configuration/asset, and platform-glue paths and names the exact other 13 bridge paths as
+forbidden. A profile-independent denylist names the two already-retired runtime paths. The verifier
+proves that the profile difference and retired set are exact, so no removed path can be omitted from
+policy or reintroduced in a staged package.
 
 `stage-module` copies only the selected paths. `verify-package` requires the staged profile policy
 to equal the checked-in policy, then applies exact file, source-byte, binary, payload, provenance,

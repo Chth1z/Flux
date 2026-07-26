@@ -28,6 +28,8 @@ use crate::offline_cleanup::{DaemonLease, DaemonLeaseError};
 use crate::runtime_coordinator::{
     ProcessRuntimeWriter, RuntimeCoordinator, RuntimeFunctionalCanary,
 };
+use crate::runtime_layout::RuntimeLayout;
+use crate::runtime_logging::{self, LogSeverity, daemon_log};
 use crate::subscription::{SubscriptionRefreshRuntime, SubscriptionRuntimePaths};
 use crate::{
     AdministrativeIntentStore, ControlConnectionHandler, ControlSocketError, EngineSupervisor,
@@ -43,6 +45,7 @@ const MAX_ENGINE_MAINTENANCE_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DaemonOptions {
+    pub runtime_root: PathBuf,
     pub socket_path: PathBuf,
     pub daemon_lease_path: PathBuf,
     pub config_path: PathBuf,
@@ -90,6 +93,7 @@ impl DaemonOptions {
             .unwrap_or_else(|| PathBuf::from(DEFAULT_DISABLE_PATH));
 
         Ok(Self {
+            runtime_root: root.clone(),
             socket_path,
             daemon_lease_path,
             config_path,
@@ -131,212 +135,260 @@ pub fn run_daemon<S>(profile_source: &S, options: DaemonOptions) -> Result<(), D
 where
     S: CapabilityProfileSource,
 {
+    let runtime_layout =
+        RuntimeLayout::bootstrap(&options.runtime_root).map_err(DaemonError::RuntimeLayout)?;
+    validate_runtime_layout_paths(&runtime_layout, &options)?;
     let _daemon_lease =
         DaemonLease::acquire(&options.daemon_lease_path).map_err(DaemonError::Lease)?;
-    // Block process-directed termination before any daemon worker can be
-    // created. Every in-process thread then inherits the mask, leaving
-    // signalfd as the sole shutdown consumer. Phase-dispatcher and Proxy
-    // Engine children explicitly restore a clean mask before exec.
-    let shutdown = ShutdownSignal::install()
-        .map_err(|error| DaemonError::Socket(ControlSocketError::Platform(error)))?;
-    let profile = Arc::new(profile_source.collect_capability_profile());
-    let (
-        control,
-        runtime,
-        address_reconciliation_attachment,
-        subscription_client,
-        file_observation,
-    ) = match profile.legacy_mutation_gate() {
-        LegacyMutationGate::Allowed => {
-            let boot_identity =
-                profile
-                    .boot_identity()
-                    .verified()
-                    .cloned()
-                    .ok_or(DaemonError::Invariant(
-                        "legacy mutation gate allowed startup without a verified boot identity",
-                    ))?;
-            let phase_paths = options.phase_dispatcher_paths();
-            let mut startup_recovery = ProcessPhaseDispatcher::new(phase_paths.clone());
-            startup_recovery
-                .execute(DispatcherPhaseCommand::StartupRecover)
-                .map_err(|error| {
-                    DaemonError::Control(ControlError::runtime(
-                        "recover stale runtime before daemon admission",
-                        error,
-                        "repair the dispatcher ownership evidence and restart fluxd",
-                    ))
-                })?;
-            // Startup recovery relies only on immutable generation artifacts
-            // and ownership records. It must run before parsing the current
-            // user configuration so a broken edit cannot strand same-boot
-            // capture. Once recovery succeeds, the strict user configuration
-            // becomes authoritative for the new runtime.
-            let config = FluxConfig::load(&options.config_path).map_err(DaemonError::FluxConfig)?;
-            let observation_paths =
-                file_observation_paths(&options.config_path, &options.disable_path, &config);
-            let observation_baseline = ObservedInputsFingerprint::capture(&observation_paths)
-                .map_err(DaemonError::Configuration)?;
-            let queue_capacity = usize::try_from(config.daemon().event_queue_capacity().get())
-                .map_err(|_| {
-                    DaemonError::Configuration(
-                        "daemon.event_queue_capacity does not fit this target".to_owned(),
-                    )
-                })?;
-            let store = AdministrativeIntentStore::new(&options.intent_path, boot_identity);
-            let disable_present =
-                inspect_disable_path(&options.disable_path).map_err(DaemonError::Configuration)?;
-            let initial_intent = initial_intent(&store, disable_present)?;
-            let subscription_working_directory = options
-                .engine_manifest_path
-                .parent()
-                .filter(|path| !path.as_os_str().is_empty())
-                .ok_or_else(|| {
-                    DaemonError::Configuration(
-                        "engine manifest path has no subscription working directory".to_owned(),
-                    )
-                })?;
-            let subscription = SubscriptionRefreshRuntime::start(SubscriptionRuntimePaths::new(
-                &options.config_path,
-                &options.subscription_store_path,
-                subscription_working_directory,
-                options
+    let _runtime_logs =
+        runtime_logging::install(&runtime_layout).map_err(DaemonError::RuntimeLog)?;
+    daemon_log(
+        LogSeverity::Info,
+        "daemon",
+        format_args!(
+            "runtime layout admitted at {}",
+            runtime_layout.root_path().display()
+        ),
+    );
+    let result = (|| {
+        // Block process-directed termination before any daemon worker can be
+        // created. Every in-process thread then inherits the mask, leaving
+        // signalfd as the sole shutdown consumer. Phase-dispatcher and Proxy
+        // Engine children explicitly restore a clean mask before exec.
+        let shutdown = ShutdownSignal::install()
+            .map_err(|error| DaemonError::Socket(ControlSocketError::Platform(error)))?;
+        let profile = Arc::new(profile_source.collect_capability_profile());
+        let (
+            control,
+            runtime,
+            address_reconciliation_attachment,
+            subscription_client,
+            file_observation,
+        ) = match profile.legacy_mutation_gate() {
+            LegacyMutationGate::Allowed => {
+                let boot_identity =
+                    profile
+                        .boot_identity()
+                        .verified()
+                        .cloned()
+                        .ok_or(DaemonError::Invariant(
+                            "legacy mutation gate allowed startup without a verified boot identity",
+                        ))?;
+                let phase_paths = options.phase_dispatcher_paths();
+                let mut startup_recovery = ProcessPhaseDispatcher::new(phase_paths.clone());
+                startup_recovery
+                    .execute(DispatcherPhaseCommand::StartupRecover)
+                    .map_err(|error| {
+                        DaemonError::Control(ControlError::runtime(
+                            "recover stale runtime before daemon admission",
+                            error,
+                            "repair the dispatcher ownership evidence and restart fluxd",
+                        ))
+                    })?;
+                // Startup recovery relies only on immutable generation artifacts
+                // and ownership records. It must run before parsing the current
+                // user configuration so a broken edit cannot strand same-boot
+                // capture. Once recovery succeeds, the strict user configuration
+                // becomes authoritative for the new runtime.
+                let config =
+                    FluxConfig::load(&options.config_path).map_err(DaemonError::FluxConfig)?;
+                let observation_paths =
+                    file_observation_paths(&options.config_path, &options.disable_path, &config);
+                let observation_baseline = ObservedInputsFingerprint::capture(&observation_paths)
+                    .map_err(DaemonError::Configuration)?;
+                let queue_capacity = usize::try_from(config.daemon().event_queue_capacity().get())
+                    .map_err(|_| {
+                        DaemonError::Configuration(
+                            "daemon.event_queue_capacity does not fit this target".to_owned(),
+                        )
+                    })?;
+                let store = AdministrativeIntentStore::new(&options.intent_path, boot_identity);
+                let disable_present = inspect_disable_path(&options.disable_path)
+                    .map_err(DaemonError::Configuration)?;
+                let initial_intent = initial_intent(&store, disable_present)?;
+                let subscription_working_directory = options
                     .engine_manifest_path
-                    .with_file_name("subscription-check.log"),
-            ))
-            .map_err(|error| {
-                DaemonError::Configuration(format!("cannot start subscription runtime: {error}"))
-            })?;
-            let bootstrap_digest = subscription.bootstrap_digest;
-            let subscription_client = subscription.client.clone();
-            let writer = ProcessRuntimeWriter::new(
-                phase_paths,
-                &options.engine_manifest_path,
-                &options.config_path,
-                &options.engine_config_path,
-                &options.bridge_environment_path,
-            )
-            .with_subscription_source(subscription.active);
-            let maintenance_interval =
-                engine_maintenance_interval(config.daemon().reconcile_debounce().get());
-            let (address_reconciliation_attachment, address_reconciler) =
-                AddressReconciler::deferred(&options.config_path);
-            let dispatcher = RuntimeCoordinator::with_dependencies(
-                writer,
-                EngineSupervisor::new(),
-                maintenance_interval,
-                RuntimeFunctionalCanary::StructuralOnlyCompatibility,
-            )
-            .with_address_reconciler(address_reconciler)
-            .with_subscription_runtime(subscription.runtime);
-            let runtime = dispatcher.runtime_snapshot_source();
-            let dispatcher = PersistingLegacyDispatcher { dispatcher, store };
-            let bridge = LegacyControlBridge::start(dispatcher, queue_capacity)
-                .map_err(DaemonError::Control)?;
-            let admission = bridge
-                .submit(initial_intent)
-                .and_then(flux_core::OperationHandle::wait);
-            if let Err(admission_error) = admission {
-                if let Some(digest) = bootstrap_digest
-                    && let Err(rollback_error) = subscription_client.reject_bootstrap(digest)
-                {
-                    return Err(DaemonError::Configuration(format!(
-                        "initial runtime admission failed ({admission_error}); cannot restore the unadmitted subscription snapshot ({rollback_error})"
-                    )));
+                    .parent()
+                    .filter(|path| !path.as_os_str().is_empty())
+                    .ok_or_else(|| {
+                        DaemonError::Configuration(
+                            "engine manifest path has no subscription working directory".to_owned(),
+                        )
+                    })?;
+                let subscription =
+                    SubscriptionRefreshRuntime::start(SubscriptionRuntimePaths::new(
+                        &options.config_path,
+                        &options.subscription_store_path,
+                        subscription_working_directory,
+                        options
+                            .engine_manifest_path
+                            .with_file_name("subscription-check.log"),
+                    ))
+                    .map_err(|error| {
+                        DaemonError::Configuration(format!(
+                            "cannot start subscription runtime: {error}"
+                        ))
+                    })?;
+                let bootstrap_digest = subscription.bootstrap_digest;
+                let subscription_client = subscription.client.clone();
+                let writer = ProcessRuntimeWriter::new(
+                    phase_paths,
+                    &options.engine_manifest_path,
+                    &options.config_path,
+                    &options.engine_config_path,
+                    &options.bridge_environment_path,
+                )
+                .with_subscription_source(subscription.active);
+                let maintenance_interval =
+                    engine_maintenance_interval(config.daemon().reconcile_debounce().get());
+                let (address_reconciliation_attachment, address_reconciler) =
+                    AddressReconciler::deferred(&options.config_path);
+                let dispatcher = RuntimeCoordinator::with_dependencies(
+                    writer,
+                    EngineSupervisor::new(),
+                    maintenance_interval,
+                    RuntimeFunctionalCanary::StructuralOnlyCompatibility,
+                )
+                .with_address_reconciler(address_reconciler)
+                .with_subscription_runtime(subscription.runtime);
+                let runtime = dispatcher.runtime_snapshot_source();
+                let dispatcher = PersistingLegacyDispatcher { dispatcher, store };
+                let bridge = LegacyControlBridge::start(dispatcher, queue_capacity)
+                    .map_err(DaemonError::Control)?;
+                let admission = bridge
+                    .submit(initial_intent)
+                    .and_then(flux_core::OperationHandle::wait);
+                if let Err(admission_error) = admission {
+                    if let Some(digest) = bootstrap_digest
+                        && let Err(rollback_error) = subscription_client.reject_bootstrap(digest)
+                    {
+                        return Err(DaemonError::Configuration(format!(
+                            "initial runtime admission failed ({admission_error}); cannot restore the unadmitted subscription snapshot ({rollback_error})"
+                        )));
+                    }
+                    return Err(DaemonError::Control(admission_error));
                 }
-                return Err(DaemonError::Control(admission_error));
-            }
-            if let Some(digest) = bootstrap_digest {
-                subscription_client
+                if let Some(digest) = bootstrap_digest {
+                    subscription_client
                     .accept_bootstrap(digest)
                     .map_err(|error| {
                         DaemonError::Configuration(format!(
                             "initial runtime was admitted but the subscription worker could not commit its startup snapshot: {error}"
                         ))
                     })?;
+                }
+                let observation_ingress =
+                    bridge.observation_ingress().map_err(DaemonError::Control)?;
+                let observation_controller = FileObservationController {
+                    desired_state_path: options.config_path.clone(),
+                    disable_path: options.disable_path.clone(),
+                    effective_disabled: disable_present,
+                    disable_path_invalid: false,
+                    initial_inputs: Some(observation_baseline),
+                    ingress: observation_ingress,
+                };
+                (
+                    DaemonControl::Bridge(bridge),
+                    runtime,
+                    Some(address_reconciliation_attachment),
+                    Some(subscription_client),
+                    Some((observation_paths, observation_controller)),
+                )
             }
-            let observation_ingress = bridge.observation_ingress().map_err(DaemonError::Control)?;
-            let observation_controller = FileObservationController {
-                desired_state_path: options.config_path.clone(),
-                disable_path: options.disable_path.clone(),
-                effective_disabled: disable_present,
-                disable_path_invalid: false,
-                initial_inputs: Some(observation_baseline),
-                ingress: observation_ingress,
-            };
-            (
-                DaemonControl::Bridge(bridge),
-                runtime,
-                Some(address_reconciliation_attachment),
-                Some(subscription_client),
-                Some((observation_paths, observation_controller)),
-            )
-        }
-        LegacyMutationGate::ReadOnly { .. } => (
-            DaemonControl::ReadOnly,
-            RuntimeSnapshotSource::default(),
-            None,
-            None,
-            None,
-        ),
-    };
+            LegacyMutationGate::ReadOnly { .. } => (
+                DaemonControl::ReadOnly,
+                RuntimeSnapshotSource::default(),
+                None,
+                None,
+                None,
+            ),
+        };
 
-    let inspection = Arc::new(ProcessInspectionSource::new(
-        &options.config_path,
-        &options.engine_manifest_path,
-    ));
-    let handler = ControlConnectionHandler::with_runtime_subscription_and_inspection(
-        Arc::clone(&profile),
-        control,
-        runtime,
-        subscription_client,
-        inspection,
-    );
-    let serve_connection = move |connection| {
-        if let Err(error) = handler.serve(connection) {
-            eprintln!("fluxd: rejected control connection: {error}");
-        }
-    };
-    let network_inventory_enabled = address_reconciliation_attachment.is_some();
-    let (mut reactor, _stop, network_inventory) = if network_inventory_enabled {
-        DaemonReactor::bind_with_network_inventory(
-            &options.socket_path,
-            shutdown,
-            serve_connection,
-            |degradation| {
-                eprintln!("fluxd: network inventory observation disabled: {degradation}");
-            },
-        )
-    } else {
-        DaemonReactor::bind(&options.socket_path, shutdown, serve_connection)
-            .map(|(reactor, stop)| (reactor, stop, None))
-    }
-    .map_err(ControlSocketError::Reactor)
-    .map_err(DaemonError::Socket)?;
-    if let (Some(attachment), Some(source)) = (address_reconciliation_attachment, network_inventory)
-    {
-        attachment.attach(source).map_err(|_| {
-            DaemonError::Invariant(
-                "network inventory source was attached more than once before reactor startup",
-            )
-        })?;
-    }
-    if let Some((paths, mut controller)) = file_observation {
-        reactor
-            .attach_file_observation(
-                &paths,
-                move |observation| controller.observe(observation),
-                |error| {
-                    eprintln!("fluxd: file observation interrupted; retrying: {error}");
+        let inspection = Arc::new(ProcessInspectionSource::new(
+            &options.config_path,
+            &options.engine_manifest_path,
+            runtime_layout.runtime_log_path(),
+            runtime_layout.daemon_log_path(),
+        ));
+        let handler = ControlConnectionHandler::with_runtime_subscription_and_inspection(
+            Arc::clone(&profile),
+            control,
+            runtime,
+            subscription_client,
+            inspection,
+        );
+        let serve_connection = move |connection| {
+            if let Err(error) = handler.serve(connection) {
+                daemon_log(
+                    LogSeverity::Warn,
+                    "control",
+                    format_args!("rejected control connection: {error}"),
+                );
+            }
+        };
+        let network_inventory_enabled = address_reconciliation_attachment.is_some();
+        let (mut reactor, _stop, network_inventory) = if network_inventory_enabled {
+            DaemonReactor::bind_with_network_inventory(
+                &options.socket_path,
+                shutdown,
+                serve_connection,
+                |degradation| {
+                    daemon_log(
+                        LogSeverity::Warn,
+                        "network_inventory",
+                        format_args!("observation disabled: {degradation}"),
+                    );
                 },
             )
-            .map_err(ControlSocketError::Reactor)
-            .map_err(DaemonError::Socket)?;
-    }
-    reactor
-        .run()
+        } else {
+            DaemonReactor::bind(&options.socket_path, shutdown, serve_connection)
+                .map(|(reactor, stop)| (reactor, stop, None))
+        }
         .map_err(ControlSocketError::Reactor)
-        .map_err(DaemonError::Socket)
+        .map_err(DaemonError::Socket)?;
+        if let (Some(attachment), Some(source)) =
+            (address_reconciliation_attachment, network_inventory)
+        {
+            attachment.attach(source).map_err(|_| {
+                DaemonError::Invariant(
+                    "network inventory source was attached more than once before reactor startup",
+                )
+            })?;
+        }
+        if let Some((paths, mut controller)) = file_observation {
+            reactor
+                .attach_file_observation(
+                    &paths,
+                    move |observation| controller.observe(observation),
+                    |error| {
+                        daemon_log(
+                            LogSeverity::Warn,
+                            "file_observer",
+                            format_args!("observation interrupted; retrying: {error}"),
+                        );
+                    },
+                )
+                .map_err(ControlSocketError::Reactor)
+                .map_err(DaemonError::Socket)?;
+        }
+        reactor
+            .run()
+            .map_err(ControlSocketError::Reactor)
+            .map_err(DaemonError::Socket)
+    })();
+    match &result {
+        Ok(()) => daemon_log(
+            LogSeverity::Info,
+            "daemon",
+            format_args!("daemon shutdown completed"),
+        ),
+        Err(error) => daemon_log(
+            LogSeverity::Error,
+            "daemon",
+            format_args!("daemon stopped with an error: {error}"),
+        ),
+    }
+    result
 }
 
 enum DaemonControl {
@@ -383,7 +435,10 @@ impl<D> LegacyDispatcher for PersistingLegacyDispatcher<D>
 where
     D: LegacyDispatcher,
 {
-    fn execute(&mut self, intent: &LegacyIntent) -> Result<(), ControlError> {
+    fn execute(
+        &mut self,
+        intent: &LegacyIntent,
+    ) -> Result<flux_core::DispatcherCompletion, ControlError> {
         let state = match intent {
             LegacyIntent::Running { .. } => Some(AdministrativeState::Running),
             LegacyIntent::Stopped { .. } => Some(AdministrativeState::Stopped),
@@ -407,7 +462,11 @@ where
             ControlObservation::DisableStateChanged { disabled: true } => "disable activation",
             ControlObservation::DisableStateChanged { disabled: false } => "disable removal",
         };
-        eprintln!("fluxd: observed {fact} could not be reconciled: {error}");
+        daemon_log(
+            LogSeverity::Error,
+            "observation",
+            format_args!("observed {fact} could not be reconciled: {error}"),
+        );
     }
 
     fn configuration_inputs_consumed(&mut self) {
@@ -446,7 +505,11 @@ impl FileObservationController {
                 }
                 Err(error) => {
                     if !self.disable_path_invalid {
-                        eprintln!("fluxd: {error}; treating the module as disabled");
+                        daemon_log(
+                            LogSeverity::Warn,
+                            "file_observer",
+                            format_args!("{error}; treating the module as disabled"),
+                        );
                     }
                     self.disable_path_invalid = true;
                     true
@@ -457,7 +520,11 @@ impl FileObservationController {
                     .ingress
                     .submit(ControlObservation::DisableStateChanged { disabled })
                 {
-                    eprintln!("fluxd: cannot enqueue observed disable state: {error}");
+                    daemon_log(
+                        LogSeverity::Error,
+                        "file_observer",
+                        format_args!("cannot enqueue observed disable state: {error}"),
+                    );
                 } else {
                     self.effective_disabled = disabled;
                 }
@@ -487,9 +554,13 @@ impl FileObservationController {
             Err(error) => {
                 self.initial_inputs.take();
                 self.submit_configuration_observation();
-                eprintln!(
-                    "fluxd: cannot refresh observed paths from {}: {error}",
-                    self.desired_state_path.display()
+                daemon_log(
+                    LogSeverity::Warn,
+                    "file_observer",
+                    format_args!(
+                        "cannot refresh observed paths from {}: {error}",
+                        self.desired_state_path.display()
+                    ),
                 );
                 None
             }
@@ -501,7 +572,11 @@ impl FileObservationController {
             .ingress
             .submit(ControlObservation::ConfigurationInputsChanged)
         {
-            eprintln!("fluxd: cannot enqueue observed configuration change: {error}");
+            daemon_log(
+                LogSeverity::Error,
+                "file_observer",
+                format_args!("cannot enqueue observed configuration change: {error}"),
+            );
         }
     }
 }
@@ -652,6 +727,8 @@ fn initial_intent(
 pub enum DaemonError {
     Configuration(String),
     FluxConfig(ConfigError),
+    RuntimeLayout(crate::RuntimeLayoutError),
+    RuntimeLog(crate::RuntimeLogError),
     Invariant(&'static str),
     Intent(IntentStoreError),
     Lease(DaemonLeaseError),
@@ -664,6 +741,8 @@ impl fmt::Display for DaemonError {
         match self {
             Self::Configuration(message) => write!(formatter, "daemon configuration: {message}"),
             Self::FluxConfig(error) => write!(formatter, "daemon configuration: {error}"),
+            Self::RuntimeLayout(error) => write!(formatter, "runtime layout: {error}"),
+            Self::RuntimeLog(error) => write!(formatter, "runtime logging: {error}"),
             Self::Invariant(message) => write!(formatter, "daemon invariant: {message}"),
             Self::Intent(error) => write!(formatter, "administrative intent: {error}"),
             Self::Lease(error) => write!(formatter, "daemon exclusion: {error}"),
@@ -677,6 +756,8 @@ impl Error for DaemonError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::FluxConfig(error) => Some(error),
+            Self::RuntimeLayout(error) => Some(error),
+            Self::RuntimeLog(error) => Some(error),
             Self::Control(error) => Some(error),
             Self::Intent(error) => Some(error),
             Self::Lease(error) => Some(error),
@@ -684,6 +765,37 @@ impl Error for DaemonError {
             Self::Configuration(_) | Self::Invariant(_) => None,
         }
     }
+}
+
+fn validate_runtime_layout_paths(
+    layout: &RuntimeLayout,
+    options: &DaemonOptions,
+) -> Result<(), DaemonError> {
+    for (label, path) in [
+        ("control socket", options.socket_path.as_path()),
+        ("daemon lease", options.daemon_lease_path.as_path()),
+        ("engine manifest", options.engine_manifest_path.as_path()),
+        (
+            "bridge environment",
+            options.bridge_environment_path.as_path(),
+        ),
+    ] {
+        layout
+            .require_run_child(label, path)
+            .map_err(DaemonError::RuntimeLayout)?;
+    }
+    for (label, path) in [
+        (
+            "subscription store",
+            options.subscription_store_path.as_path(),
+        ),
+        ("administrative intent", options.intent_path.as_path()),
+    ] {
+        layout
+            .require_state_child(label, path)
+            .map_err(DaemonError::RuntimeLayout)?;
+    }
+    Ok(())
 }
 
 fn default_shell() -> PathBuf {

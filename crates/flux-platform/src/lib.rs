@@ -82,7 +82,17 @@ pub use xtables::{
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use xtables::{
-    NativeXtablesCaptureConvergenceError, NativeXtablesCaptureConverger, NativeXtablesCaptureTarget,
+    NativeXtablesCaptureAdmission, NativeXtablesCaptureAdmissionError,
+    NativeXtablesCaptureConvergenceError, NativeXtablesCaptureConverger,
+    NativeXtablesCaptureTarget, NativeXtablesRoutingPlanError,
+    plan_native_xtables_local_output_routing,
+};
+
+#[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+pub use xtables::{
+    NativeLinuxCompositionTestAdmission, NativeLinuxCompositionTestAuthority,
+    NativeLinuxCompositionTestConfig, NativeLinuxCompositionTestError,
+    NativeLinuxCompositionTestRuntime,
 };
 
 #[doc(hidden)]

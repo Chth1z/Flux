@@ -351,9 +351,68 @@ mod implementation {
     }
 }
 
+pub(crate) fn configure_child_process(
+    command: &mut std::process::Command,
+    config: ChildProcessConfig,
+) -> Result<(), std::io::Error> {
+    #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+    record_native_composition_test_exec(command)?;
+    implementation::configure_child_process(command, config)
+}
+
+#[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+fn record_native_composition_test_exec(
+    command: &std::process::Command,
+) -> Result<(), std::io::Error> {
+    use std::io::Write;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::sync::{Mutex, OnceLock};
+
+    const AUDIT_ENV: &str = "FLUX_NATIVE_COMPOSITION_EXEC_AUDIT";
+    static AUDIT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    let Some(path) = std::env::var_os(AUDIT_ENV) else {
+        return Ok(());
+    };
+    let path = std::path::PathBuf::from(path);
+    if !path.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{AUDIT_ENV} must be an absolute path"),
+        ));
+    }
+
+    let _guard = AUDIT_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| std::io::Error::other("native composition exec audit lock is poisoned"))?;
+    let mut record = String::from("v1\t");
+    push_hex(&mut record, command.get_program().as_bytes());
+    for argument in command.get_args() {
+        record.push('\t');
+        push_hex(&mut record, argument.as_bytes());
+    }
+    record.push('\n');
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(record.as_bytes())
+}
+
+#[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+fn push_hex(output: &mut String, bytes: &[u8]) {
+    use std::fmt::Write;
+
+    for byte in bytes {
+        write!(output, "{byte:02x}").expect("writing into a String cannot fail");
+    }
+}
+
 pub(crate) use implementation::{
-    configure_child_process, is_no_such_process, process_group_exists, signal_process,
-    signal_process_group,
+    is_no_such_process, process_group_exists, signal_process, signal_process_group,
 };
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub(crate) use implementation::{set_close_on_exec, set_nonblocking};

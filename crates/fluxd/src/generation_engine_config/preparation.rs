@@ -2,7 +2,7 @@ use std::error::Error;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -17,6 +17,7 @@ use super::{
     compile_tproxy_engine_config, compile_validated_subscription_bridge_environment,
 };
 use crate::MAX_ENGINE_CONFIG_BYTES;
+use crate::intent_store::{IntentStoreError, record_io};
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -258,30 +259,24 @@ pub(crate) fn publish_validated_subscription_bridge_preparation(
 }
 
 pub(crate) fn read_bounded_regular_file(path: &Path) -> io::Result<Vec<u8>> {
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "engine template must be a regular non-symbolic-link file",
-        ));
+    let maximum = usize::try_from(MAX_ENGINE_CONFIG_BYTES).unwrap_or(usize::MAX);
+    match record_io::read(path, maximum) {
+        Ok(Some(bytes)) => Ok(bytes),
+        Ok(None) => Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("engine template {} is missing", path.display()),
+        )),
+        Err(source) => {
+            let kind = match source {
+                IntentStoreError::Symlink(_) | IntentStoreError::NotRegularFile(_) => {
+                    io::ErrorKind::InvalidInput
+                }
+                IntentStoreError::RecordTooLarge { .. } => io::ErrorKind::InvalidData,
+                _ => io::ErrorKind::Other,
+            };
+            Err(io::Error::new(kind, source))
+        }
     }
-
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    let file = options.open(path)?;
-    if !file.metadata()?.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "engine template descriptor is not a regular file",
-        ));
-    }
-
-    let mut bytes = Vec::new();
-    file.take(MAX_ENGINE_CONFIG_BYTES.saturating_add(1))
-        .read_to_end(&mut bytes)?;
-    Ok(bytes)
 }
 
 fn atomic_publish(path: &Path, bytes: &[u8]) -> io::Result<()> {

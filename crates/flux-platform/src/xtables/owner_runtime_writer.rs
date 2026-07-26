@@ -1,15 +1,39 @@
 use std::error::Error;
 use std::fmt;
-use std::num::NonZeroU64;
+use std::num::{NonZeroU32, NonZeroU64};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use super::{
-    DurableNativeXtablesTargetResolver, NativeXtablesAdmittedTarget, NativeXtablesConvergedState,
-    NativeXtablesConvergenceReport, NativeXtablesDesiredTarget, NativeXtablesEnvironment,
-    NativeXtablesOwner, NativeXtablesOwnerAdapter, NativeXtablesOwnerError,
-    NativeXtablesProcessOwnerAdapter, NativeXtablesTargetArchiveError, NativeXtablesTargetIdentity,
+#[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+use std::ffi::{CStr, CString};
+#[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+use std::fs::File;
+#[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+use std::os::fd::{AsRawFd, FromRawFd};
+#[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+use std::os::unix::fs::MetadataExt;
+
+use flux_core::{
+    AddressHostFamilySelection, AndroidMarkPlanningAuthority, AndroidTproxyTrafficDomainRequest,
+    DeferredAndroidMarkActivationPrerequisite, DeferredAndroidTproxyPrerequisite, FwmarkCandidate,
+    InterfaceIndex, NetworkAddressFamily, RouteProtocol, RouteTableId, RpdbFamilyPlacement,
+    RpdbPlacementLease, RuleProtocol,
 };
+#[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+use flux_core::{BootIdentity, NetworkNamespaceIdentity, OwnershipJournalIdentity};
+#[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+use sha2::{Digest, Sha256};
+
+use super::{
+    DurableNativeXtablesTargetResolver, NativePolicyRoutingAudit, NativeXtablesAdmittedTarget,
+    NativeXtablesConvergedState, NativeXtablesConvergenceReport, NativeXtablesDesiredTarget,
+    NativeXtablesEnvironment, NativeXtablesOwner, NativeXtablesOwnerAdapter,
+    NativeXtablesOwnerError, NativeXtablesProcessOwnerAdapter, NativeXtablesTargetArchiveError,
+    NativeXtablesTargetIdentity,
+};
+use crate::netlink::policy_routing::ManagedPolicyRoutingIdentity;
 use crate::xtables::native::{
     XtablesRestoreProcessConfig, XtablesRestoreProcessError, XtablesToolSetProcessAdapter,
 };
@@ -18,8 +42,736 @@ use crate::xtables::owner_durable::{
 };
 use crate::xtables::{
     NativeCaptureConvergedState, NativeCaptureConvergence, NativeCaptureConvergenceReport,
-    NativeCaptureDesired, NativeCaptureTargetIdentity,
+    NativeCaptureDesired, NativeCaptureTargetIdentity, XtablesCaptureArtifactSet,
+    XtablesLocalOutputRoutingSpec, XtablesLocalOutputRoutingTarget, XtablesRestoreFamily,
 };
+
+const NATIVE_ROUTE_METRIC: u32 = 1_024;
+const NATIVE_ROUTE_PROTOCOL: u8 = 4;
+const NATIVE_RULE_PROTOCOL: u8 = 99;
+
+#[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+const NS_GET_USERNS: libc::c_ulong = 0xb701;
+
+/// Builds the canonical, non-authorizing local-OUTPUT routing plan used by both lowering and
+/// platform admission.
+pub fn plan_native_xtables_local_output_routing(
+    placement: RpdbPlacementLease,
+    families: AddressHostFamilySelection,
+) -> Result<XtablesLocalOutputRoutingSpec, NativeXtablesRoutingPlanError> {
+    let mut targets = [None, None];
+    for (index, family) in [NetworkAddressFamily::Ipv4, NetworkAddressFamily::Ipv6]
+        .into_iter()
+        .enumerate()
+    {
+        let family_placement = placement.family(family);
+        if family_placement.is_some() != families.includes(family) {
+            return Err(NativeXtablesRoutingPlanError::FamilyMismatch { family });
+        }
+        targets[index] = family_placement.map(canonical_routing_target);
+    }
+    XtablesLocalOutputRoutingSpec::new(targets[0], targets[1])
+        .map_err(|_| NativeXtablesRoutingPlanError::NoEnabledFamilies)
+}
+
+fn canonical_routing_target(placement: RpdbFamilyPlacement) -> XtablesLocalOutputRoutingTarget {
+    XtablesLocalOutputRoutingTarget::new(
+        placement.proxy_priority(),
+        RouteTableId::from_raw(placement.private_table().get()),
+        NonZeroU32::new(NATIVE_ROUTE_METRIC).expect("native route metric is nonzero"),
+        RouteProtocol::from_raw(NATIVE_ROUTE_PROTOCOL),
+        RuleProtocol::from_raw(NATIVE_RULE_PROTOCOL),
+    )
+    .expect("reviewed native routing constants and placement are structurally valid")
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeXtablesRoutingPlanError {
+    FamilyMismatch { family: NetworkAddressFamily },
+    NoEnabledFamilies,
+}
+
+impl fmt::Display for NativeXtablesRoutingPlanError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::FamilyMismatch { family } => write!(
+                formatter,
+                "RPDB placement does not match the enabled {family:?} capture family"
+            ),
+            Self::NoEnabledFamilies => {
+                formatter.write_str("native local-OUTPUT routing enables no address family")
+            }
+        }
+    }
+}
+
+impl Error for NativeXtablesRoutingPlanError {}
+
+/// Opaque platform admission bound to the exact discovered xtables tool identity.
+///
+/// There is no public constructor. Platform composition creates this value together with the
+/// process converger, so callers cannot assert an arbitrary tool digest. Android planning evidence
+/// remains one-shot and is consumed even when admission is rejected.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeXtablesCaptureAdmission {
+    tool_digest: [u8; 32],
+}
+
+impl NativeXtablesCaptureAdmission {
+    pub(crate) const fn from_tool_digest(tool_digest: [u8; 32]) -> Self {
+        Self { tool_digest }
+    }
+
+    pub fn admit_android(
+        &self,
+        authority: AndroidMarkPlanningAuthority,
+        placement: RpdbPlacementLease,
+        artifacts: XtablesCaptureArtifactSet,
+    ) -> Result<NativeXtablesCaptureTarget, NativeXtablesCaptureAdmissionError> {
+        let mark_prerequisites = authority.deferred_mark_activation_prerequisites();
+        if let Some(first) = mark_prerequisites.first().copied() {
+            return Err(
+                NativeXtablesCaptureAdmissionError::MarkActivationPrerequisitesRemain {
+                    first,
+                    count: mark_prerequisites.len(),
+                },
+            );
+        }
+        let topology_prerequisites = authority.topology_deferred_prerequisites();
+        if let Some(first) = topology_prerequisites.first().copied() {
+            return Err(
+                NativeXtablesCaptureAdmissionError::TopologyActivationPrerequisitesRemain {
+                    first,
+                    count: topology_prerequisites.len(),
+                },
+            );
+        }
+
+        let topology = authority.topology_scope();
+        if placement.snapshot_id() != topology.snapshot_id() {
+            return Err(NativeXtablesCaptureAdmissionError::PlacementSnapshotMismatch);
+        }
+        if placement.epoch() != topology.epoch() {
+            return Err(NativeXtablesCaptureAdmissionError::PlacementEpochMismatch);
+        }
+        if placement.classifier_revision() != topology.classifier_revision() {
+            return Err(NativeXtablesCaptureAdmissionError::PlacementClassifierMismatch);
+        }
+
+        let loopback = [
+            local_output_loopback_index(&authority, NetworkAddressFamily::Ipv4)?,
+            local_output_loopback_index(&authority, NetworkAddressFamily::Ipv6)?,
+        ];
+        if loopback[0] != loopback[1] {
+            return Err(NativeXtablesCaptureAdmissionError::LoopbackIdentityMismatch);
+        }
+        let routing = [
+            admitted_routing_identity(
+                NetworkAddressFamily::Ipv4,
+                placement,
+                authority.candidate(),
+                loopback[0],
+            )?,
+            admitted_routing_identity(
+                NetworkAddressFamily::Ipv6,
+                placement,
+                authority.candidate(),
+                loopback[1],
+            )?,
+        ];
+        let routing_audit = NativePolicyRoutingAudit::new(routing)
+            .expect("one canonical routing identity was derived for each address family");
+        let active_routing = [
+            artifacts
+                .pair(XtablesRestoreFamily::Ipv4)
+                .is_some_and(|pair| pair.local_output().is_some())
+                .then_some(routing[0]),
+            artifacts
+                .pair(XtablesRestoreFamily::Ipv6)
+                .is_some_and(|pair| pair.local_output().is_some())
+                .then_some(routing[1]),
+        ]
+        .into_iter()
+        .flatten();
+        let admitted = NativeXtablesAdmittedTarget::admit(
+            artifacts,
+            active_routing,
+            routing_audit,
+            self.tool_digest,
+        )
+        .map_err(|source| NativeXtablesCaptureAdmissionError::Target(source.to_string().into()))?;
+        Ok(NativeXtablesCaptureTarget::from_admitted(admitted))
+    }
+}
+
+fn local_output_loopback_index(
+    authority: &AndroidMarkPlanningAuthority,
+    family: NetworkAddressFamily,
+) -> Result<InterfaceIndex, NativeXtablesCaptureAdmissionError> {
+    let mut found = None;
+    for entry in authority.topology_scope().entries() {
+        if entry.domain() != AndroidTproxyTrafficDomainRequest::residual_local_output(family) {
+            continue;
+        }
+        let observed = entry.report().input_interface_index();
+        if found.is_some_and(|prior| prior != observed) {
+            return Err(NativeXtablesCaptureAdmissionError::LoopbackIdentityMismatch);
+        }
+        found = Some(observed);
+    }
+    found.ok_or(NativeXtablesCaptureAdmissionError::MissingLocalOutputEvidence { family })
+}
+
+fn admitted_routing_identity(
+    family: NetworkAddressFamily,
+    placement: RpdbPlacementLease,
+    mark: FwmarkCandidate,
+    loopback_index: InterfaceIndex,
+) -> Result<ManagedPolicyRoutingIdentity, NativeXtablesCaptureAdmissionError> {
+    let placement = placement
+        .family(family)
+        .ok_or(NativeXtablesCaptureAdmissionError::MissingPlacementFamily { family })?;
+    Ok(ManagedPolicyRoutingIdentity::bind_planned_android_target(
+        family,
+        placement,
+        mark,
+        loopback_index,
+        NonZeroU32::new(NATIVE_ROUTE_METRIC).expect("native route metric is nonzero"),
+        RouteProtocol::from_raw(NATIVE_ROUTE_PROTOCOL),
+        RuleProtocol::from_raw(NATIVE_RULE_PROTOCOL),
+    ))
+}
+
+#[derive(Debug)]
+pub enum NativeXtablesCaptureAdmissionError {
+    MarkActivationPrerequisitesRemain {
+        first: DeferredAndroidMarkActivationPrerequisite,
+        count: usize,
+    },
+    TopologyActivationPrerequisitesRemain {
+        first: DeferredAndroidTproxyPrerequisite,
+        count: usize,
+    },
+    PlacementSnapshotMismatch,
+    PlacementEpochMismatch,
+    PlacementClassifierMismatch,
+    MissingLocalOutputEvidence {
+        family: NetworkAddressFamily,
+    },
+    LoopbackIdentityMismatch,
+    MissingPlacementFamily {
+        family: NetworkAddressFamily,
+    },
+    Target(Box<str>),
+}
+
+impl fmt::Display for NativeXtablesCaptureAdmissionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MarkActivationPrerequisitesRemain { first, count } => write!(
+                formatter,
+                "Android mark activation retains {count} unresolved prerequisites (first: {first:?})"
+            ),
+            Self::TopologyActivationPrerequisitesRemain { first, count } => write!(
+                formatter,
+                "Android TPROXY topology retains {count} unresolved prerequisites (first: {first:?})"
+            ),
+            Self::PlacementSnapshotMismatch => formatter
+                .write_str("RPDB placement snapshot differs from Android planning evidence"),
+            Self::PlacementEpochMismatch => formatter
+                .write_str("RPDB placement epoch differs from Android planning evidence"),
+            Self::PlacementClassifierMismatch => formatter.write_str(
+                "RPDB placement classifier revision differs from Android planning evidence",
+            ),
+            Self::MissingLocalOutputEvidence { family } => write!(
+                formatter,
+                "Android planning evidence has no residual local-OUTPUT anchor for {family:?}"
+            ),
+            Self::LoopbackIdentityMismatch => formatter.write_str(
+                "Android planning evidence does not identify one exact dual-stack loopback interface",
+            ),
+            Self::MissingPlacementFamily { family } => write!(
+                formatter,
+                "RPDB placement has no complete {family:?} routing identity"
+            ),
+            Self::Target(detail) => write!(formatter, "native target admission rejected: {detail}"),
+        }
+    }
+}
+
+impl Error for NativeXtablesCaptureAdmissionError {}
+
+/// Sealed mutation authority for the privileged Linux composition checkpoint.
+///
+/// The only constructor observes the current process and requires UID 0 in isolated user and
+/// network namespaces. This type is available only under the explicit test feature and never
+/// constructs or stands in for Android planning authority.
+#[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+#[derive(Debug)]
+pub struct NativeLinuxCompositionTestAuthority {
+    boot_identity: BootIdentity,
+    network_namespace: NetworkNamespaceIdentity,
+    loopback_index: InterfaceIndex,
+}
+
+#[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+impl NativeLinuxCompositionTestAuthority {
+    pub fn acquire() -> Result<Self, NativeLinuxCompositionTestError> {
+        // SAFETY: `geteuid` has no arguments, does not dereference pointers, and cannot fail.
+        let effective_uid = unsafe { libc::geteuid() };
+        if effective_uid != 0 {
+            return Err(NativeLinuxCompositionTestError::NotRoot { effective_uid });
+        }
+
+        let (network_handle, network_namespace) = observed_namespace("/proc/self/ns/net")?;
+        let (_user_handle, user_namespace) = observed_namespace("/proc/self/ns/user")?;
+        if !observed_uid_map_is_isolated()? {
+            return Err(NativeLinuxCompositionTestError::NamespaceNotIsolated {
+                namespace: "user",
+            });
+        }
+
+        let network_owner = namespace_ioctl(&network_handle, NS_GET_USERNS).map_err(|source| {
+            NativeLinuxCompositionTestError::Io {
+                operation: "resolve network namespace owner",
+                path: PathBuf::from("/proc/self/ns/net"),
+                source,
+            }
+        })?;
+        let network_owner_namespace =
+            observed_namespace_handle(&network_owner, Path::new("/proc/self/ns/net(owner-user)"))?;
+        if network_owner_namespace != user_namespace {
+            return Err(NativeLinuxCompositionTestError::NamespaceNotIsolated {
+                namespace: "network",
+            });
+        }
+
+        let boot_path = Path::new("/proc/sys/kernel/random/boot_id");
+        let boot_text = std::fs::read_to_string(boot_path).map_err(|source| {
+            NativeLinuxCompositionTestError::Io {
+                operation: "read boot identity",
+                path: boot_path.to_owned(),
+                source,
+            }
+        })?;
+        let boot_identity = BootIdentity::parse(&boot_text).map_err(|source| {
+            NativeLinuxCompositionTestError::Invalid(
+                format!("cannot parse current boot identity: {source}").into_boxed_str(),
+            )
+        })?;
+
+        let loopback = CString::new("lo").expect("canonical loopback name contains no NUL");
+        // SAFETY: `loopback` is a readable NUL-terminated interface name for this call.
+        let raw_index = unsafe { libc::if_nametoindex(loopback.as_ptr()) };
+        let loopback_index = InterfaceIndex::new(raw_index).ok_or_else(|| {
+            NativeLinuxCompositionTestError::Invalid(
+                format!(
+                    "isolated namespace has no loopback interface: {}",
+                    std::io::Error::last_os_error()
+                )
+                .into_boxed_str(),
+            )
+        })?;
+        let mut resolved = [0 as libc::c_char; libc::IF_NAMESIZE];
+        // SAFETY: `resolved` is writable for IF_NAMESIZE bytes and `loopback_index` is nonzero.
+        let resolved_ptr = unsafe { libc::if_indextoname(raw_index, resolved.as_mut_ptr()) };
+        if resolved_ptr.is_null() {
+            return Err(NativeLinuxCompositionTestError::Invalid(
+                format!(
+                    "cannot reverse-resolve isolated loopback interface: {}",
+                    std::io::Error::last_os_error()
+                )
+                .into_boxed_str(),
+            ));
+        }
+        // SAFETY: successful `if_indextoname` writes one NUL-terminated name into `resolved`.
+        if unsafe { CStr::from_ptr(resolved_ptr) }.to_bytes() != b"lo" {
+            return Err(NativeLinuxCompositionTestError::Invalid(
+                "isolated loopback index does not resolve back to 'lo'".into(),
+            ));
+        }
+
+        Ok(Self {
+            boot_identity,
+            network_namespace,
+            loopback_index,
+        })
+    }
+
+    #[must_use]
+    pub const fn network_namespace(&self) -> NetworkNamespaceIdentity {
+        self.network_namespace
+    }
+
+    pub fn compose(
+        self,
+        config: NativeLinuxCompositionTestConfig,
+        routing: XtablesLocalOutputRoutingSpec,
+        mark: FwmarkCandidate,
+    ) -> Result<NativeLinuxCompositionTestRuntime, NativeLinuxCompositionTestError> {
+        if !config.tool_root.is_absolute() || !config.durable_root.is_absolute() {
+            return Err(NativeLinuxCompositionTestError::Invalid(
+                "native composition tool and durable roots must be absolute".into(),
+            ));
+        }
+
+        let ipv4 = routing.routing_for(NetworkAddressFamily::Ipv4).ok_or(
+            NativeLinuxCompositionTestError::MissingRoutingFamily {
+                family: NetworkAddressFamily::Ipv4,
+            },
+        )?;
+        let ipv6 = routing.routing_for(NetworkAddressFamily::Ipv6).ok_or(
+            NativeLinuxCompositionTestError::MissingRoutingFamily {
+                family: NetworkAddressFamily::Ipv6,
+            },
+        )?;
+        let routing_audit = NativePolicyRoutingAudit::new([
+            ManagedPolicyRoutingIdentity::bind_linux_composition_test_target(
+                NetworkAddressFamily::Ipv4,
+                ipv4,
+                mark,
+                self.loopback_index,
+            ),
+            ManagedPolicyRoutingIdentity::bind_linux_composition_test_target(
+                NetworkAddressFamily::Ipv6,
+                ipv6,
+                mark,
+                self.loopback_index,
+            ),
+        ])
+        .map_err(|source| NativeLinuxCompositionTestError::Invalid(source.to_string().into()))?;
+
+        let process = XtablesRestoreProcessConfig::new(config.wait_seconds, config.timeout)
+            .map_err(|source| {
+                NativeLinuxCompositionTestError::Process(source.to_string().into())
+            })?;
+        let tools =
+            XtablesToolSetProcessAdapter::discover_standard(&config.tool_root, true, process)
+                .map_err(|source| {
+                    NativeLinuxCompositionTestError::Process(source.to_string().into())
+                })?;
+        let tool_digest = *tools.identity().digest().as_bytes();
+        let journal_identity = linux_test_journal_identity(
+            &self.boot_identity,
+            self.network_namespace,
+            &config.durable_root,
+            tool_digest,
+        )?;
+        let admission = NativeLinuxCompositionTestAdmission {
+            network_namespace: self.network_namespace,
+            loopback_index: self.loopback_index,
+            routing_audit,
+            tool_digest,
+        };
+        let environment = NativeXtablesEnvironment::new(
+            self.boot_identity,
+            self.network_namespace,
+            journal_identity,
+            routing_audit,
+        );
+        let writer = NativeXtablesRuntimeWriter::new(
+            NativeXtablesProcessOwnerAdapter::new(tools),
+            NativeXtablesDurableStore::new(config.durable_root),
+            environment,
+        )
+        .map_err(|source| NativeLinuxCompositionTestError::Runtime(source.to_string().into()))?;
+        Ok(NativeLinuxCompositionTestRuntime {
+            admission,
+            convergence: NativeXtablesCaptureConverger::from_runtime_writer(writer),
+        })
+    }
+}
+
+#[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+fn observed_namespace(
+    path: &'static str,
+) -> Result<(File, NetworkNamespaceIdentity), NativeLinuxCompositionTestError> {
+    let path = Path::new(path);
+    let handle = File::open(path).map_err(|source| NativeLinuxCompositionTestError::Io {
+        operation: "open namespace identity",
+        path: path.to_owned(),
+        source,
+    })?;
+    let identity = observed_namespace_handle(&handle, path)?;
+    Ok((handle, identity))
+}
+
+#[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+fn observed_namespace_handle(
+    handle: &File,
+    path: &Path,
+) -> Result<NetworkNamespaceIdentity, NativeLinuxCompositionTestError> {
+    let metadata = handle
+        .metadata()
+        .map_err(|source| NativeLinuxCompositionTestError::Io {
+            operation: "inspect namespace identity",
+            path: path.to_owned(),
+            source,
+        })?;
+    NetworkNamespaceIdentity::new(metadata.dev(), metadata.ino()).ok_or_else(|| {
+        NativeLinuxCompositionTestError::Invalid(
+            format!("namespace {} has a zero inode", path.display()).into_boxed_str(),
+        )
+    })
+}
+
+#[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+fn namespace_ioctl(handle: &File, request: libc::c_ulong) -> Result<File, std::io::Error> {
+    // SAFETY: `handle` is a pinned namespace descriptor and both requests return a new descriptor
+    // without reading a variadic argument. A nonnegative result is uniquely owned by this call.
+    let descriptor = unsafe { libc::ioctl(handle.as_raw_fd(), request) };
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: successful namespace ioctls return a new descriptor owned by the caller.
+    Ok(unsafe { File::from_raw_fd(descriptor) })
+}
+
+#[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+fn observed_uid_map_is_isolated() -> Result<bool, NativeLinuxCompositionTestError> {
+    const INITIAL_UID_MAP: (u64, u64, u64) = (0, 0, u32::MAX as u64);
+    const MAX_UID_MAP_BYTES: usize = 4 * 1024;
+
+    let path = Path::new("/proc/self/uid_map");
+    let text =
+        std::fs::read_to_string(path).map_err(|source| NativeLinuxCompositionTestError::Io {
+            operation: "read current user namespace UID map",
+            path: path.to_owned(),
+            source,
+        })?;
+    if text.len() > MAX_UID_MAP_BYTES {
+        return Err(NativeLinuxCompositionTestError::Invalid(
+            "current user namespace UID map exceeds 4 KiB".into(),
+        ));
+    }
+
+    let mut mappings = Vec::new();
+    for line in text.lines() {
+        let fields = line.split_ascii_whitespace().collect::<Vec<_>>();
+        if fields.len() != 3 {
+            return Err(NativeLinuxCompositionTestError::Invalid(
+                "current user namespace UID map has an invalid field count".into(),
+            ));
+        }
+        let mut parsed = [0_u64; 3];
+        for (target, field) in parsed.iter_mut().zip(fields) {
+            *target = field.parse::<u64>().map_err(|_| {
+                NativeLinuxCompositionTestError::Invalid(
+                    "current user namespace UID map contains a non-decimal field".into(),
+                )
+            })?;
+        }
+        let [inside, outside, length] = parsed;
+        let id_domain_end = u64::from(u32::MAX) + 1;
+        if length == 0
+            || inside
+                .checked_add(length)
+                .is_none_or(|end| end > id_domain_end)
+            || outside
+                .checked_add(length)
+                .is_none_or(|end| end > id_domain_end)
+        {
+            return Err(NativeLinuxCompositionTestError::Invalid(
+                "current user namespace UID map contains an invalid range".into(),
+            ));
+        }
+        mappings.push((inside, outside, length));
+    }
+    if mappings.is_empty() || !mappings.iter().any(|&(inside, _, _)| inside == 0) {
+        return Ok(false);
+    }
+    Ok(mappings.as_slice() != [INITIAL_UID_MAP])
+}
+
+#[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+fn linux_test_journal_identity(
+    boot_identity: &BootIdentity,
+    network_namespace: NetworkNamespaceIdentity,
+    durable_root: &Path,
+    tool_digest: [u8; 32],
+) -> Result<OwnershipJournalIdentity, NativeLinuxCompositionTestError> {
+    let mut digest = Sha256::new();
+    digest.update(b"Flux privileged Linux native composition journal\0sha256-v1\0");
+    digest.update(boot_identity.as_str().as_bytes());
+    digest.update(network_namespace.device().to_be_bytes());
+    digest.update(network_namespace.inode().to_be_bytes());
+    digest.update(durable_root.as_os_str().as_bytes());
+    digest.update(tool_digest);
+    OwnershipJournalIdentity::new(digest.finalize().into()).map_err(|source| {
+        NativeLinuxCompositionTestError::Invalid(source.to_string().into_boxed_str())
+    })
+}
+
+/// Process and durable-store configuration for the Linux-only native composition checkpoint.
+#[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeLinuxCompositionTestConfig {
+    tool_root: PathBuf,
+    durable_root: PathBuf,
+    wait_seconds: u16,
+    timeout: Duration,
+}
+
+#[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+impl NativeLinuxCompositionTestConfig {
+    #[must_use]
+    pub fn new(
+        tool_root: impl AsRef<Path>,
+        durable_root: impl AsRef<Path>,
+        wait_seconds: u16,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            tool_root: tool_root.as_ref().to_owned(),
+            durable_root: durable_root.as_ref().to_owned(),
+            wait_seconds,
+            timeout,
+        }
+    }
+}
+
+/// Opaque host-test admission tied to one isolated namespace, routing audit, and tool digest.
+#[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+pub struct NativeLinuxCompositionTestAdmission {
+    network_namespace: NetworkNamespaceIdentity,
+    loopback_index: InterfaceIndex,
+    routing_audit: NativePolicyRoutingAudit,
+    tool_digest: [u8; 32],
+}
+
+#[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+impl NativeLinuxCompositionTestAdmission {
+    pub fn admit_linux_test(
+        &self,
+        network_namespace: NetworkNamespaceIdentity,
+        artifacts: XtablesCaptureArtifactSet,
+    ) -> Result<NativeXtablesCaptureTarget, NativeLinuxCompositionTestError> {
+        if network_namespace != self.network_namespace {
+            return Err(NativeLinuxCompositionTestError::NamespaceBindingMismatch);
+        }
+
+        let mut routing = Vec::with_capacity(2);
+        for (family, restore_family) in [
+            (NetworkAddressFamily::Ipv4, XtablesRestoreFamily::Ipv4),
+            (NetworkAddressFamily::Ipv6, XtablesRestoreFamily::Ipv6),
+        ] {
+            let requirements = artifacts
+                .pair(restore_family)
+                .and_then(|pair| pair.local_output())
+                .ok_or(NativeLinuxCompositionTestError::MissingRoutingFamily { family })?;
+            let identity =
+                ManagedPolicyRoutingIdentity::bind(requirements.routing(), self.loopback_index)
+                    .map_err(|source| {
+                        NativeLinuxCompositionTestError::Admission(source.to_string().into())
+                    })?;
+            if identity != self.routing_audit.identity(family) {
+                return Err(NativeLinuxCompositionTestError::RoutingBindingMismatch { family });
+            }
+            routing.push(identity);
+        }
+        let admitted = NativeXtablesAdmittedTarget::admit(
+            artifacts,
+            routing,
+            self.routing_audit,
+            self.tool_digest,
+        )
+        .map_err(|source| NativeLinuxCompositionTestError::Admission(source.to_string().into()))?;
+        Ok(NativeXtablesCaptureTarget::from_admitted(admitted))
+    }
+}
+
+/// Dispatcher-free platform half of the privileged native composition checkpoint.
+#[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+pub struct NativeLinuxCompositionTestRuntime {
+    admission: NativeLinuxCompositionTestAdmission,
+    convergence: NativeXtablesCaptureConverger,
+}
+
+#[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+impl NativeLinuxCompositionTestRuntime {
+    #[must_use]
+    pub fn into_parts(
+        self,
+    ) -> (
+        NativeLinuxCompositionTestAdmission,
+        NativeXtablesCaptureConverger,
+    ) {
+        (self.admission, self.convergence)
+    }
+}
+
+#[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+#[derive(Debug)]
+pub enum NativeLinuxCompositionTestError {
+    NotRoot {
+        effective_uid: libc::uid_t,
+    },
+    NamespaceNotIsolated {
+        namespace: &'static str,
+    },
+    NamespaceBindingMismatch,
+    MissingRoutingFamily {
+        family: NetworkAddressFamily,
+    },
+    RoutingBindingMismatch {
+        family: NetworkAddressFamily,
+    },
+    Io {
+        operation: &'static str,
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    Invalid(Box<str>),
+    Process(Box<str>),
+    Runtime(Box<str>),
+    Admission(Box<str>),
+}
+
+#[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+impl fmt::Display for NativeLinuxCompositionTestError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotRoot { effective_uid } => write!(
+                formatter,
+                "native composition test requires isolated effective UID 0, found {effective_uid}"
+            ),
+            Self::NamespaceNotIsolated { namespace } => write!(
+                formatter,
+                "native composition test requires an isolated {namespace} namespace"
+            ),
+            Self::NamespaceBindingMismatch => formatter.write_str(
+                "host Generation namespace differs from the sealed Linux test namespace",
+            ),
+            Self::MissingRoutingFamily { family } => write!(
+                formatter,
+                "native composition test requires local-OUTPUT routing for {family:?}"
+            ),
+            Self::RoutingBindingMismatch { family } => write!(
+                formatter,
+                "admitted {family:?} artifacts differ from the sealed routing audit"
+            ),
+            Self::Io {
+                operation,
+                path,
+                source,
+            } => write!(formatter, "{operation} {}: {source}", path.display()),
+            Self::Invalid(detail) => formatter.write_str(detail),
+            Self::Process(detail) => write!(formatter, "xtables process composition: {detail}"),
+            Self::Runtime(detail) => write!(formatter, "native runtime composition: {detail}"),
+            Self::Admission(detail) => write!(formatter, "native test target admission: {detail}"),
+        }
+    }
+}
+
+#[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+impl Error for NativeLinuxCompositionTestError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Io { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
 
 pub(crate) struct NativeXtablesRuntimeWriter<A>
 where
@@ -518,5 +1270,30 @@ impl Error for NativeXtablesRuntimeWriterError {
             Self::SettledDurable { source, .. } => Some(source.as_ref()),
             Self::RecoveryRequired => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use flux_core::{RpdbFamilyPlacement, RulePriority, RuleTableId};
+
+    use super::*;
+
+    #[test]
+    fn canonical_routing_target_pins_platform_owned_identity_constants() {
+        let placement = RpdbFamilyPlacement::new(
+            RulePriority::from_raw(30_998),
+            RulePriority::from_raw(30_999),
+            RuleTableId::from_raw(20_253),
+        )
+        .expect("fixture placement");
+
+        let routing = canonical_routing_target(placement);
+
+        assert_eq!(routing.priority(), placement.proxy_priority());
+        assert_eq!(routing.table().get(), placement.private_table().get());
+        assert_eq!(routing.route_metric().get(), 1_024);
+        assert_eq!(routing.route_protocol().raw(), 4);
+        assert_eq!(routing.rule_protocol().raw(), 99);
     }
 }

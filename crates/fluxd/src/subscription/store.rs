@@ -97,6 +97,10 @@ impl ValidatedSubscriptionSnapshot {
         self.prepared.digest()
     }
 
+    pub(super) const fn subscription_source(&self) -> RedactedSourceId {
+        self.prepared.subscription_source()
+    }
+
     pub(super) const fn node_count(&self) -> u32 {
         self.prepared.node_count()
     }

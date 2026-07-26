@@ -1,5 +1,6 @@
 use std::error::Error;
 use std::fmt;
+use std::num::NonZeroU16;
 
 use flux_core::{
     AddressHostSetPlan, CaptureApplicationMode, CaptureApplicationPolicy, FluxConfig,
@@ -42,8 +43,105 @@ impl DesiredStateCompileRequest {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DesiredStateArtifacts {
     desired_state: FluxConfig,
-    engine_config: EngineConfigArtifact,
+    engine_source: SelectedEngineSource,
     capture: ShadowCompilationReport,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) enum SelectedEngineSourceIdentity {
+    Template {
+        template_digest: [u8; 32],
+    },
+    Subscription {
+        snapshot_digest: [u8; 32],
+        subscription_source: [u8; 32],
+    },
+}
+
+/// Exact accepted engine artifact and the source identity that selected it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SelectedEngineSource {
+    identity: SelectedEngineSourceIdentity,
+    artifact: EngineConfigArtifact,
+}
+
+impl SelectedEngineSource {
+    #[must_use]
+    pub(crate) fn template(artifact: EngineConfigArtifact) -> Self {
+        Self {
+            identity: SelectedEngineSourceIdentity::Template {
+                template_digest: *artifact.template_digest(),
+            },
+            artifact,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn subscription(
+        artifact: EngineConfigArtifact,
+        snapshot_digest: [u8; 32],
+        subscription_source: [u8; 32],
+    ) -> Self {
+        Self {
+            identity: SelectedEngineSourceIdentity::Subscription {
+                snapshot_digest,
+                subscription_source,
+            },
+            artifact,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn identity(&self) -> SelectedEngineSourceIdentity {
+        self.identity
+    }
+
+    #[must_use]
+    pub(crate) const fn artifact(&self) -> &EngineConfigArtifact {
+        &self.artifact
+    }
+
+    pub(crate) fn into_artifact(self) -> EngineConfigArtifact {
+        self.artifact
+    }
+}
+
+/// Realization-neutral capture half of one Desired State snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DesiredStateCaptureArtifacts {
+    desired_state: FluxConfig,
+    capture: ShadowCompilationReport,
+}
+
+impl DesiredStateCaptureArtifacts {
+    #[must_use]
+    pub(crate) const fn desired_state(&self) -> &FluxConfig {
+        &self.desired_state
+    }
+
+    #[must_use]
+    pub(crate) const fn capture(&self) -> &ShadowCompilationReport {
+        &self.capture
+    }
+
+    pub(crate) fn with_engine_source(
+        self,
+        engine_source: SelectedEngineSource,
+    ) -> Result<DesiredStateArtifacts, DesiredStateCompileError> {
+        let configured = self.desired_state.listener().port();
+        let selected = engine_source.artifact().listener_port();
+        if configured != selected {
+            return Err(DesiredStateCompileError::EngineSourceListenerPortMismatch {
+                configured,
+                selected,
+            });
+        }
+        Ok(DesiredStateArtifacts {
+            desired_state: self.desired_state,
+            engine_source,
+            capture: self.capture,
+        })
+    }
 }
 
 impl DesiredStateArtifacts {
@@ -54,7 +152,12 @@ impl DesiredStateArtifacts {
 
     #[must_use]
     pub(crate) const fn engine_config(&self) -> &EngineConfigArtifact {
-        &self.engine_config
+        self.engine_source.artifact()
+    }
+
+    #[must_use]
+    pub(crate) const fn engine_source(&self) -> &SelectedEngineSource {
+        &self.engine_source
     }
 
     #[must_use]
@@ -62,8 +165,8 @@ impl DesiredStateArtifacts {
         &self.capture
     }
 
-    pub(crate) fn into_parts(self) -> (FluxConfig, EngineConfigArtifact, ShadowCompilationReport) {
-        (self.desired_state, self.engine_config, self.capture)
+    pub(crate) fn into_parts(self) -> (FluxConfig, SelectedEngineSource, ShadowCompilationReport) {
+        (self.desired_state, self.engine_source, self.capture)
     }
 }
 
@@ -74,6 +177,10 @@ pub(crate) enum DesiredStateCompileErrorKind {
         resolved: CaptureApplicationMode,
     },
     EngineConfig(EngineConfigCompileErrorKind),
+    EngineSourceListenerPortMismatch {
+        configured: NonZeroU16,
+        selected: NonZeroU16,
+    },
     Capture,
 }
 
@@ -84,6 +191,10 @@ pub(crate) enum DesiredStateCompileError {
         resolved: CaptureApplicationMode,
     },
     EngineConfig(EngineConfigCompileError),
+    EngineSourceListenerPortMismatch {
+        configured: NonZeroU16,
+        selected: NonZeroU16,
+    },
     Capture(ShadowCaptureCompileError),
 }
 
@@ -99,6 +210,13 @@ impl DesiredStateCompileError {
                 resolved: *resolved,
             },
             Self::EngineConfig(error) => DesiredStateCompileErrorKind::EngineConfig(error.kind()),
+            Self::EngineSourceListenerPortMismatch {
+                configured,
+                selected,
+            } => DesiredStateCompileErrorKind::EngineSourceListenerPortMismatch {
+                configured: *configured,
+                selected: *selected,
+            },
             Self::Capture(_) => DesiredStateCompileErrorKind::Capture,
         }
     }
@@ -115,6 +233,13 @@ impl fmt::Display for DesiredStateCompileError {
                 "resolved application mode {resolved:?} does not match configured mode {configured:?}"
             ),
             Self::EngineConfig(error) => error.fmt(formatter),
+            Self::EngineSourceListenerPortMismatch {
+                configured,
+                selected,
+            } => write!(
+                formatter,
+                "selected engine source listener port {selected} does not match Desired State port {configured}"
+            ),
             Self::Capture(error) => error.fmt(formatter),
         }
     }
@@ -123,7 +248,8 @@ impl fmt::Display for DesiredStateCompileError {
 impl Error for DesiredStateCompileError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::ApplicationModeMismatch { .. } => None,
+            Self::ApplicationModeMismatch { .. }
+            | Self::EngineSourceListenerPortMismatch { .. } => None,
             Self::EngineConfig(error) => Some(error),
             Self::Capture(error) => Some(error),
         }
@@ -135,6 +261,20 @@ pub(crate) fn compile_desired_state(
     request: DesiredStateCompileRequest,
     engine_template: &[u8],
 ) -> Result<DesiredStateArtifacts, DesiredStateCompileError> {
+    let listener_port = request.config.listener().port();
+    let engine_config = compile_tproxy_engine_config(TproxyEngineConfigRequest::new(
+        engine_template,
+        listener_port,
+    ))
+    .map_err(DesiredStateCompileError::EngineConfig)?;
+    compile_desired_state_capture(request)?
+        .with_engine_source(SelectedEngineSource::template(engine_config))
+}
+
+/// Compile the capture half without selecting or reopening an engine source.
+pub(crate) fn compile_desired_state_capture(
+    request: DesiredStateCompileRequest,
+) -> Result<DesiredStateCaptureArtifacts, DesiredStateCompileError> {
     let DesiredStateCompileRequest {
         config,
         application_policy,
@@ -149,11 +289,6 @@ pub(crate) fn compile_desired_state(
         });
     }
 
-    let engine_config = compile_tproxy_engine_config(TproxyEngineConfigRequest::new(
-        engine_template,
-        config.listener().port(),
-    ))
-    .map_err(DesiredStateCompileError::EngineConfig)?;
     let capture = compile_shadow_capture_program(ShadowCaptureProgramRequest::new(
         config.capture().scope(),
         config.engine().credentials(),
@@ -165,9 +300,8 @@ pub(crate) fn compile_desired_state(
     ))
     .map_err(DesiredStateCompileError::Capture)?;
 
-    Ok(DesiredStateArtifacts {
+    Ok(DesiredStateCaptureArtifacts {
         desired_state: config,
-        engine_config,
         capture,
     })
 }

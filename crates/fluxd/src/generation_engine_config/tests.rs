@@ -30,14 +30,16 @@ use super::{
     GenerationAssembler, GenerationAssemblyDigest, GenerationAssemblyError,
     GenerationAssemblyRequest, GenerationPlanningAuthority, GenerationPlanningErrorKind,
     HostInspectionPlanningAuthority, MAX_GENERATION_ENGINE_CONFIG_INBOUNDS,
-    MAX_PREPARED_GENERATION_RECORD_BYTES, PREPARED_GENERATION_RECORD_SCHEMA_VERSION,
-    PreparedGenerationRecord, PreparedGenerationRecordError, PreparedGenerationRecordStore,
-    TPROXY_GENERATION_CANDIDATE_SCHEMA_VERSION, TproxyEngineConfigRequest,
-    TproxyGenerationCandidateErrorKind, bind_engine_config_to_spec,
+    MAX_PREPARED_GENERATION_RECORD_BYTES, NativeGenerationPromotionError,
+    PREPARED_GENERATION_RECORD_SCHEMA_VERSION, PreparedGenerationRecord,
+    PreparedGenerationRecordError, PreparedGenerationRecordStore, SelectedEngineSource,
+    SelectedEngineSourceIdentity, TPROXY_GENERATION_CANDIDATE_SCHEMA_VERSION,
+    TproxyEngineConfigRequest, TproxyGenerationCandidateErrorKind, bind_engine_config_to_spec,
     collect_tproxy_engine_capability_profile, compile_bridge_environment, compile_desired_state,
-    compile_tproxy_engine_config, compile_tproxy_generation_candidate,
-    parse_sing_box_version_output, publish_bridge_preparation, publish_canonical_engine_config,
-    publish_validated_subscription_bridge_preparation, reconstruct_canonical_tproxy_engine_config,
+    compile_desired_state_capture, compile_tproxy_engine_config,
+    compile_tproxy_generation_candidate, parse_sing_box_version_output, publish_bridge_preparation,
+    publish_canonical_engine_config, publish_validated_subscription_bridge_preparation,
+    reconstruct_canonical_tproxy_engine_config,
 };
 use crate::engine_supervisor::EngineCapabilityProbeError;
 use crate::{EngineSpec, MAX_ENGINE_CONFIG_BYTES, RestartPolicy};
@@ -542,6 +544,42 @@ fn canonical_engine_publication_rejects_a_symbolic_link_template() {
 
     let error = match publish_canonical_engine_config(&desired_state_path, &output_path) {
         Ok(_) => panic!("template symlink must fail closed"),
+        Err(error) => error,
+    };
+
+    assert_eq!(
+        error.kind(),
+        CanonicalEngineConfigPreparationErrorKind::Template
+    );
+    assert!(!output_path.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn canonical_engine_publication_rejects_a_symbolic_link_template_ancestor() {
+    use std::os::unix::fs::symlink;
+
+    let directory = tempfile::tempdir().expect("canonical config fixture");
+    let target_directory = directory.path().join("template-target");
+    fs::create_dir(&target_directory).expect("create template target directory");
+    fs::write(
+        target_directory.join("template.json"),
+        br#"{"inbounds":[]}"#,
+    )
+    .expect("write template target");
+    let linked_directory = directory.path().join("template-source");
+    symlink(&target_directory, &linked_directory).expect("link template ancestor");
+    let template_path = linked_directory.join("template.json");
+    let desired_state_path = directory.path().join("flux.toml");
+    let output_path = directory.path().join("config.json");
+    fs::write(
+        &desired_state_path,
+        desired_state_with_template(&template_path),
+    )
+    .expect("write Desired State");
+
+    let error = match publish_canonical_engine_config(&desired_state_path, &output_path) {
+        Ok(_) => panic!("template ancestor symlink must fail closed"),
         Err(error) => error,
     };
 
@@ -1115,6 +1153,27 @@ fn assembler_produces_one_complete_host_inspection_generation() {
 }
 
 #[test]
+fn host_inspection_generation_cannot_be_promoted_to_a_native_target() {
+    let generation = HostAssemblyFixture::new()
+        .assemble(None, None)
+        .expect("complete host-inspection Generation");
+
+    let error = match generation.into_native_target_request() {
+        Ok(_) => panic!("host evidence unexpectedly crossed the native target seam"),
+        Err(error) => error,
+    };
+
+    assert_eq!(
+        error,
+        NativeGenerationPromotionError::HostInspectionNonPromotable
+    );
+    assert_eq!(
+        error.to_string(),
+        "host inspection evidence cannot be promoted to native mutation authority"
+    );
+}
+
+#[test]
 fn assembler_is_deterministic_and_advances_from_prior_owned_identity() {
     let fixture = HostAssemblyFixture::new();
     let first = fixture.assemble(None, None).expect("first Generation");
@@ -1152,6 +1211,45 @@ fn assembler_successor_identity_binds_the_complete_prior_identity() {
 
     assert_eq!(successor.generation(), alternate.generation());
     assert_ne!(successor.identity(), alternate.identity());
+}
+
+#[test]
+fn assembler_identity_binds_the_selected_subscription_source() {
+    let fixture = HostAssemblyFixture::new();
+    let config = FluxConfig::parse(&fixture.base_desired_state).expect("fixture Desired State");
+    let applications =
+        CaptureApplicationPolicy::new(CaptureApplicationMode::All, []).expect("all applications");
+    let capture =
+        compile_desired_state_capture(DesiredStateCompileRequest::new(config, applications, None))
+            .expect("capture artifacts");
+    let artifact = fixture.desired_state.engine_config().clone();
+    let first_source = SelectedEngineSource::subscription(artifact.clone(), [0x11; 32], [0x21; 32]);
+    let second_source = SelectedEngineSource::subscription(artifact, [0x12; 32], [0x22; 32]);
+    let first = fixture
+        .assemble(
+            None,
+            Some(capture.clone().with_engine_source(first_source).unwrap()),
+        )
+        .expect("first subscription-backed Generation");
+    let second = fixture
+        .assemble(
+            None,
+            Some(capture.with_engine_source(second_source).unwrap()),
+        )
+        .expect("second subscription-backed Generation");
+
+    assert_eq!(first.candidate(), second.candidate());
+    assert_eq!(first.capture(), second.capture());
+    assert_eq!(first.xtables(), second.xtables());
+    assert_eq!(
+        first.engine_source(),
+        SelectedEngineSourceIdentity::Subscription {
+            snapshot_digest: [0x11; 32],
+            subscription_source: [0x21; 32],
+        }
+    );
+    assert_ne!(first.engine_source(), second.engine_source());
+    assert_ne!(first.identity(), second.identity());
 }
 
 #[test]

@@ -15,11 +15,12 @@ use crate::generation_engine_config::{
     EngineConfigArtifact, EngineConfigCompileError, reconstruct_canonical_tproxy_engine_config,
 };
 use crate::intent_store::record_io;
+use crate::runtime_logging::{LogSeverity, runtime_log};
 use crate::{EngineSpec, MAX_ENGINE_CONFIG_BYTES, RestartPolicy};
 
 use super::assets::{
-    PrepareSubscriptionError, PrepareSubscriptionRequest, SubscriptionRefreshLimits,
-    prepare_subscription_refresh,
+    PrepareSubscriptionError, PrepareSubscriptionRequest, RedactedSourceId,
+    SubscriptionRefreshLimits, prepare_subscription_refresh, redacted_source_id,
 };
 use super::fetch::{FetchAdapter, UreqFetchAdapter};
 use super::store::{
@@ -196,6 +197,7 @@ pub(crate) struct ValidatedSubscriptionEngineConfig {
     bytes: Arc<[u8]>,
     content_sha256: [u8; 32],
     snapshot_digest: [u8; 32],
+    subscription_source: RedactedSourceId,
     node_count: u32,
 }
 
@@ -206,6 +208,7 @@ impl ValidatedSubscriptionEngineConfig {
             bytes: Arc::from(snapshot.bytes()),
             content_sha256: *snapshot.content_sha256(),
             snapshot_digest: *snapshot.digest(),
+            subscription_source: snapshot.subscription_source(),
             node_count: snapshot.node_count(),
         }
     }
@@ -234,6 +237,10 @@ impl ValidatedSubscriptionEngineConfig {
         self.snapshot_digest
     }
 
+    pub(crate) const fn subscription_source(&self) -> [u8; 32] {
+        self.subscription_source.as_bytes()
+    }
+
     pub(crate) const fn node_count(&self) -> u32 {
         self.node_count
     }
@@ -250,6 +257,7 @@ impl ValidatedSubscriptionEngineConfig {
             bytes: Arc::from(artifact.bytes()),
             content_sha256: *artifact.content_sha256(),
             snapshot_digest,
+            subscription_source: RedactedSourceId::from_bytes(snapshot_digest),
             node_count,
         }
     }
@@ -359,10 +367,17 @@ impl<A: FetchAdapter + Send + 'static> ProductionRefreshOperation<A> {
     ) -> Result<(Option<ValidatedSubscriptionEngineConfig>, bool), SubscriptionRefreshError> {
         let report = self.store.recover().map_err(store_error)?;
         let cleanup_pending = report.cleanup_pending();
+        if !desired_state.subscription().enabled() {
+            return Ok((None, cleanup_pending));
+        }
+        let current_source = subscription_source(desired_state)?;
         Ok((
-            report.into_active().map(|snapshot| {
-                ValidatedSubscriptionEngineConfig::from_snapshot(snapshot, desired_state)
-            }),
+            report
+                .into_active()
+                .filter(|snapshot| snapshot.subscription_source() == current_source)
+                .map(|snapshot| {
+                    ValidatedSubscriptionEngineConfig::from_snapshot(snapshot, desired_state)
+                }),
             cleanup_pending,
         ))
     }
@@ -380,6 +395,7 @@ impl<A: FetchAdapter + Send + 'static> ProductionRefreshOperation<A> {
         let validation_spec = validation_engine(config, &self.paths)?;
         self.validator.install(validation_spec.clone());
         let subscription_url = read_subscription_url(config.subscription().url_file())?;
+        let expected_subscription_source = redacted_source_id(&subscription_url);
         let prepared = prepare_subscription_refresh(
             &self.adapter,
             PrepareSubscriptionRequest::new(
@@ -396,23 +412,30 @@ impl<A: FetchAdapter + Send + 'static> ProductionRefreshOperation<A> {
             ),
         )
         .map_err(preparation_error)?;
+        debug_assert_eq!(prepared.subscription_source(), expected_subscription_source);
         let candidate_digest = *prepared.digest();
         let report = self.store.publish(prepared).map_err(store_error)?;
         let publication = report.publication();
         let cleanup_pending = report.cleanup_pending();
 
-        let current_config = FluxConfig::load(&self.paths.desired_state)
-            .map_err(|source| configuration_error(&self.paths.desired_state, source))?;
-        let current_template = read_required_file(
-            current_config.engine().template(),
-            usize::try_from(MAX_ENGINE_CONFIG_BYTES).unwrap_or(usize::MAX),
-            "engine template",
-        )?;
-        let current_engine = validation_engine(&current_config, &self.paths)?;
-        if &current_config != config
-            || current_template != template
-            || current_engine != validation_spec
-        {
+        let sources_unchanged = (|| {
+            let current_config = FluxConfig::load(&self.paths.desired_state)
+                .map_err(|source| configuration_error(&self.paths.desired_state, source))?;
+            let current_template = read_required_file(
+                current_config.engine().template(),
+                usize::try_from(MAX_ENGINE_CONFIG_BYTES).unwrap_or(usize::MAX),
+                "engine template",
+            )?;
+            let current_engine = validation_engine(&current_config, &self.paths)?;
+            let current_subscription_source = subscription_source(&current_config)?;
+            Ok::<bool, SubscriptionRefreshError>(
+                &current_config == config
+                    && current_template == template
+                    && current_engine == validation_spec
+                    && current_subscription_source == expected_subscription_source,
+            )
+        })();
+        if !matches!(sources_unchanged, Ok(true)) {
             if publication == SnapshotPublicationDisposition::Published {
                 self.store
                     .reject_active(candidate_digest)
@@ -559,6 +582,10 @@ fn read_subscription_url(path: &Path) -> Result<Url, SubscriptionRefreshError> {
             "subscription URL file does not contain a valid URL",
         )
     })
+}
+
+fn subscription_source(config: &FluxConfig) -> Result<RedactedSourceId, SubscriptionRefreshError> {
+    read_subscription_url(config.subscription().url_file()).map(|url| redacted_source_id(&url))
 }
 
 fn read_required_file(
@@ -855,7 +882,12 @@ impl SubscriptionRefreshRuntime {
         }
         let (mut active, cleanup_pending) = operation.recover(&initial_config)?;
         if cleanup_pending {
-            eprintln!("fluxd: subscription snapshot cleanup remains pending after recovery");
+            runtime_log(
+                LogSeverity::Warn,
+                "subscription",
+                None,
+                format_args!("snapshot cleanup remains pending after recovery"),
+            );
         }
         let mut bootstrap_digest = None;
         if initial_config.subscription().enabled() && active.is_none() {
@@ -1000,7 +1032,12 @@ impl SubscriptionRefreshRuntime {
                 self.next_periodic = self.interval.and_then(|interval| now.checked_add(interval));
             }
             Ok(false) => {}
-            Err(error) => eprintln!("fluxd: cannot schedule subscription refresh: {error}"),
+            Err(error) => runtime_log(
+                LogSeverity::Warn,
+                "subscription",
+                None,
+                format_args!("cannot schedule refresh: {error}"),
+            ),
         }
     }
 
@@ -1016,9 +1053,12 @@ impl SubscriptionRefreshRuntime {
         match self.client.request_observed() {
             Ok(true) => self.observed_refresh_pending = false,
             Ok(false) => {}
-            Err(error) => {
-                eprintln!("fluxd: cannot schedule observed subscription refresh: {error}")
-            }
+            Err(error) => runtime_log(
+                LogSeverity::Warn,
+                "subscription",
+                None,
+                format_args!("cannot schedule observed refresh: {error}"),
+            ),
         }
     }
 
@@ -1063,7 +1103,12 @@ impl Drop for RefreshWorkerState {
         if let Some(digest) = self.pending_bootstrap
             && let Err(error) = self.operation.reject(digest)
         {
-            eprintln!("fluxd: cannot restore unadmitted startup subscription snapshot: {error}");
+            runtime_log(
+                LogSeverity::Error,
+                "subscription",
+                None,
+                format_args!("cannot restore unadmitted startup snapshot: {error}"),
+            );
         }
     }
 }
@@ -1107,8 +1152,8 @@ fn refresh_worker_loop(
                 if result.is_ok() {
                     state.pending_bootstrap = None;
                 }
-                let _ = completion.send(result);
                 busy.store(false, Ordering::Release);
+                let _ = completion.send(result);
                 continue;
             }
         };
@@ -1155,6 +1200,7 @@ fn refresh_worker_loop(
                 ),
             ),
         };
+        busy.store(false, Ordering::Release);
         if let Some(completion) = completion {
             let _ = completion.send(final_result.clone());
         } else if let Err(error) = &final_result {
@@ -1163,9 +1209,13 @@ fn refresh_worker_loop(
                 RefreshTrigger::Periodic => "periodic",
                 RefreshTrigger::Observed => "observed",
             };
-            eprintln!("fluxd: {source} subscription refresh failed: {error}");
+            runtime_log(
+                LogSeverity::Error,
+                "subscription",
+                None,
+                format_args!("{source} refresh failed: {error}"),
+            );
         }
-        busy.store(false, Ordering::Release);
         if sent.is_err() {
             break;
         }

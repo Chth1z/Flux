@@ -24,7 +24,7 @@ Primary local sources:
 - [`scripts/rules`](../../scripts/rules)
 - [`scripts/tproxy`](../../scripts/tproxy)
 - [`scripts/core`](../../scripts/core)
-- [`scripts/updater.sh`](../../scripts/updater.sh)
+- `scripts/updater.sh` (historical source; retired on 2026-07-26)
 - [`addrsyncd/src`](../../addrsyncd/src)
 
 ### `addrsyncd` migration provenance

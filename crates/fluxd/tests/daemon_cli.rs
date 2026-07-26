@@ -363,6 +363,7 @@ fn text_status_reports_the_capability_profile_evidence() {
             "administrative state: stopped\n",
             "configuration dirty: yes\n",
             "revision: 18\n",
+            "last address resync: none\n",
             "runtime revision: 7\n",
             "runtime phase: repairing\n",
             "runtime capture: detached\n",
@@ -547,6 +548,8 @@ impl ControlClient for RecordingDaemonClient {
         Ok(OperationReport {
             intent,
             revision: 17,
+            address_resync: matches!(intent, LegacyIntent::ResyncAddresses { .. })
+                .then_some(flux_core::AddressResyncDisposition::AcceptedDeferred),
         })
     }
 }

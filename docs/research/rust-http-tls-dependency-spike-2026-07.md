@@ -226,7 +226,7 @@ response bodies, or error variants. This keeps retry, snapshot retention, parsin
 publication independent of the HTTP library and avoids coupling tests to ureq's explicitly
 unversioned connector API.
 
-Minimum deterministic coverage before replacing `scripts/updater.sh`:
+Minimum deterministic coverage used to retire the former `scripts/updater.sh`:
 
 - HTTPS-only initial URL and HTTPS-to-HTTP downgrade rejection;
 - redirect loop, sixth redirect, relative location, cross-host redirect, and stripped authorization;
@@ -264,7 +264,7 @@ product contract.
 
 Local project sources:
 
-- [L-UPDATER] [`scripts/updater.sh`](../../scripts/updater.sh)
+- [L-UPDATER] `scripts/updater.sh` (historical source retired on 2026-07-26)
 - [L-SPEC] [Flux technical specification](../architecture/fluxd-technical-specification.md)
 
 Pinned upstream and official sources:

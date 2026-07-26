@@ -1208,3 +1208,293 @@ It does not yet validate the production Rust composition because that compositio
   branch remains unpushed. Deterministic smoke still does not provide a retained fuzz corpus,
   branch coverage, sanitizer evidence, Android/ARM64 qualification, production composition, or
   Rust-only writer authority.
+
+## Shell Runtime Retirement Review (2026-07-26)
+
+### Baseline
+- Branch: `codex/fluxd-rust-rewrite`, clean at `35fdfc3`; it is 111 commits ahead of `origin/main`
+  and has no divergent upstream commit.
+- Fixed point: `e738e8c`, the last HEAD named by `review_report.md`; the incremental review covers
+  nine commits through `35fdfc3`.
+- Authoritative execution source: `docs/architecture/implementation-roadmap.md`, revised
+  2026-07-26. The target is one Rust-owned `fluxd` plus external Sing-Box, with shell limited to
+  platform install/boot/disable/uninstall delegation.
+- Package contract: bridge requires 28 paths; Rust-only requires 13 and forbids the exact 15-path
+  difference. All 11 files under `scripts/` are forbidden from Rust-only staging, whose status is
+  still `failing-until-complete`.
+- Script inventory: 11 files, 5,573 lines total. Largest files are `dispatcher` (1,530), `lib`
+  (1,065), `tproxy` (566), `config` (521), and `updater.sh` (508).
+
+### Initial Design Judgment
+- The requested next task should close ownership and packaging gaps, not port 5,573 shell lines
+  mechanically. Subscription, direct control, observation, diagnostics, the offline-cleanup command
+  surface, Desired State compilation, and much of native networking are implemented in Rust, but
+  offline cleanup itself still delegates to the shell dispatcher.
+- The remaining production composition gap is deliberate: `ProcessRuntimeWriter` and the shell
+  dispatcher remain the active bridge writer, while `NativeRuntimeWriter` is host-composed but not
+  production-selected. Physical ARM64 C1-C3 evidence and the Gate 1 writer fence remain mandatory.
+- A credible plan must therefore separate (1) delete-after-proof bridge artifacts, (2) test-only
+  oracle retention, (3) any small missing Rust behavior, and (4) device-gated native activation.
+
+### Runtime Caller Classification
+- Active Rust-owned bridge path (7 files): `dispatcher`, `init`, `config`, `tproxy`, `addrsync`,
+  `lib`, and `log`. `ProcessRuntimeWriter` invokes phase verbs through `dispatcher`; preparation
+  reaches `init`/`config`; capture and address phases reach `tproxy`/`addrsync`; all source the
+  common library and logger.
+- Explicit legacy rollback only (2 files): `core` and `rules`. The Rust-owned bridge never invokes
+  `core`; only the legacy cache owner sources `rules`.
+- No runtime caller (2 files): `flux-event` and `updater.sh`. Reactor file observation and the Rust
+  subscription worker replaced them; they remain bridge inventory only.
+- The implementation plan removes those two no-caller files immediately after their Rust contracts
+  are corrected, then removes the remaining nine only after Gate 1. The canonical roadmap's current
+  retain-until-Gate-1 wording must be reconciled in that early cleanup slice.
+
+### Script-To-Rust Ownership Map
+- `addrsync`: lifecycle/PID/signals around standalone `addrsyncd` and the shared shell writer
+  fence. Rust has one reactor-owned `NetworkInventorySource`, `AddressReconciler`, native policy
+  routing, and native owner convergence; production selection remains device-gated.
+- `config`: legacy settings parsing, Sing-Box JSON mutation, and shell kernel-feature export. Rust
+  schema 3, canonical engine compilation, bridge-environment compilation, and Capability Profile
+  own the target behavior. TUN and legacy compatibility knobs are intentionally outside release
+  scope.
+- `core`: direct Sing-Box launch/readiness/PID cleanup. `EngineSupervisor` and the descriptor-pinned
+  process adapters already own this behavior; only the rollback path calls the script.
+- `dispatcher`: Generation preparation/publication, lifecycle ordering, recovery, shell fencing,
+  and component calls. `RuntimeCoordinator`, `NativeCoordinatorWriter`, durable native owner,
+  intent store, and reactor own the target design; production still constructs
+  `ProcessRuntimeWriter`.
+- `flux-event`: inotify event forwarding. `file_observer`, `DaemonReactor`, and the typed
+  observation controller replace it; no caller remains.
+- `init`: directory/integrity/log preparation and legacy cache generation. Canonical configuration,
+  engine validation, package verification, Generation preparation, and Rust renderers cover the
+  target behavior. Runtime directory bootstrap and an owned log sink/rotation contract remain
+  unclear in the Rust-only package.
+- `lib`: shared paths, process/PID helpers, atomic writes, shell writer locks, task wrappers, and
+  legacy environment loading. Equivalent target behavior is distributed behind typed Rust modules;
+  the file itself should not become a Rust utility grab bag.
+- `log`: formatted bridge logging, log rotation support, and cosmetic `module.prop` state updates.
+  Rust implements bounded log reading but creates neither `run/fluxd.log` nor a rotation policy;
+  Rust-only service glue currently launches the daemon without a log redirect.
+- `rules`: frozen shell restore compiler including compatibility-only DIVERT, FakeIP ICMP, QUIC,
+  MSS, and zone behavior. Rust has the exact bridge renderer/oracle and canonical schema-v2 lowerer;
+  unsupported optional extensions must be rejected or dropped, not carried into the first release.
+- `tproxy`: xtables restore, RPDB/routes, readback, rollback, cleanup, and compatibility mutations.
+  The native owner/process adapter/durable archive implement the target mechanism, but positive
+  production target construction and selection remain blocked on C1-C3/Gate 1.
+- `updater.sh`: HTTP/curl, Base64/URI/AWK/JQ transformation, validation, and atomic publication.
+  The Rust HTTPS worker/compiler/store is production-connected and deliberately stricter; there is
+  no runtime caller to the script.
+
+### Confirmed Deviations And Gaps
+- P1 subscription source-stability mismatch: refresh reads the URL before fetch but rechecks only
+  Desired State, template, and engine identity. Recovery restores a persisted
+  `subscription_source`, then `ValidatedSubscriptionEngineConfig::from_snapshot` drops it. URL drift
+  during fetch or while stopped can therefore activate or reuse a snapshot from the wrong source.
+- P0 status/implementation mismatch: roadmap B2.3 and the technical specification describe
+  `cleanup --offline` as Rust-owned durable recovery, but `run_offline_cleanup` constructs
+  `ProcessPhaseDispatcher` and executes shell `startup-recover`. The Rust-only uninstall path calls
+  this command while its package contract forbids the dispatcher.
+- P0 open Gate 1 prerequisite, not a completed-design deviation:
+  `NativeCoordinatorWriter::resync_addresses()` returns `Ok(())` without convergence. The roadmap
+  already requires completed-versus-deferred native resync semantics before production selection.
+- P0 expected, not a deviation: `run_daemon` still selects `ProcessRuntimeWriter` and
+  `StructuralOnlyCompatibility`. The roadmap explicitly blocks native selection on physical ARM64
+  C1-C3 evidence and the writer fence.
+- P1 package-proof gap: Rust-only installer/watchdog tests use a fake `fluxd` and verify inventory
+  and bounded relaunch only. The installer creates neither `run` nor `state`, while the real daemon
+  requires `run/fluxd.lease`; no staged-tree smoke proves a real binary can initialize.
+- P1 final-surface gap: the same `fluxd` binary staged for Rust-only still exposes
+  `render-legacy-rules`, `snapshot-legacy-packages`, and `attest-legacy-rules-set`. ADR-0011 forbids
+  legacy compatibility wrappers in the final shipped package, but the current path-only verifier
+  cannot detect this binary-level residue.
+- P1 observability gap: the CLI can read fixed log files, but Rust-only startup does not create or
+  rotate the daemon/runtime logs that those commands address. This is partial command-surface
+  implementation, not a reason to port the shell logger wholesale.
+- P1 glue-policy mismatch: normalized raw-text validation counts delegation markers in comments or
+  strings and misses adjacent shell quoting such as `ip""tables`, so it does not prove the direct
+  delegation claimed by B3.2.
+- P1 no-follow mismatch: canonical template loading rejects a final symlink but uses path-based open
+  and follows symlinked ancestors, weaker than the roadmap's descriptor-relative loading rule.
+- P2 judgment call: `xtask/src/main.rs` is 3,620 lines and combines unrelated build, test, package,
+  provenance, ELF, and source-policy responsibilities despite an existing submodule pattern.
+
+### Planning Verification
+- `scripts/`: 11 regular files, 5,573 total lines.
+- `conf/manifest.json`: bridge 28 required, Rust-only 13 required/15 forbidden, exact difference 15.
+- All 42 local links in the retirement plan and `docs/README.md` index entry resolve; heading scan
+  passes.
+- `git diff --check e738e8c...HEAD` and worktree `git diff --check` pass.
+- Fresh `TMPDIR=/tmp cargo xtask ci` passes on the final planning state. Parser fuzz smoke, the
+  required Linux topology canary, and the Rust-only, installer, and dispatcher shell suites passed
+  earlier in this audit and were not rerun after the documentation-only edits.
+- No WSA or physical ARM64 target was used; C1-C3, Gate 1, native production selection, and Gate 2
+  remain unverified.
+
+## R0-R3 Implementation Evidence (2026-07-26)
+
+### H0 Subscription Source Binding Reproduction And Fix
+- Added focused production-operation tests for URL-file replacement while the daemon is stopped and
+  URL-file mutation from inside the fetch adapter. Before the fix, both tests failed: recovery
+  returned the old active snapshot and the raced candidate was published successfully.
+- `ValidatedSubscriptionEngineConfig` now retains the persisted `RedactedSourceId`; recovery reuses
+  a snapshot only when it matches the current bounded URL-file source.
+- Refresh publication rereads the Desired State, template, engine identity, and URL source as one
+  acceptance check. Any failed or mismatched recheck rejects a newly published candidate before it
+  reaches the coordinator.
+- Focused verification: `TMPDIR=/tmp cargo test -p fluxd subscription::runtime::tests:: --lib`
+  passes 12 tests after failing exactly the two new regressions before implementation.
+
+### H1 Descriptor-Safe Template Loading
+- Added ancestor-symlink regressions for canonical publication, address reconciliation, and
+  non-authorizing explanation. All three succeeded unexpectedly before the implementation change.
+- `read_bounded_regular_file` now delegates to the existing descriptor-relative `record_io::read`
+  path, preserving missing-file, regular-file, and maximum-size failure semantics while rejecting
+  symlinks in final or ancestor path components on Linux/Android.
+- Focused verification: `TMPDIR=/tmp cargo test -p fluxd symbolic_link_template_ancestor --lib`
+  passes all three callers after failing all three before implementation.
+
+### H2 No-Caller Script Retirement
+- Deleted the no-caller `scripts/flux-event` and `scripts/updater.sh` sources after the Rust reactor,
+  subscription source-binding, recovery, and reload paths passed their focused regressions.
+- `conf/manifest.json` schema 3 owns an exact, profile-independent `retired_runtime_paths` set for
+  both old paths. The bridge inventory shrank from 28 to 26 required paths; Rust-only remains 13
+  required paths and its exact bridge difference shrank from 15 to 13 forbidden paths.
+- `xtask` rejects retired paths in every staged profile, requires staged policy to match the
+  checked-in retired set, and the source-policy command rejects either retired path in the repository
+  source tree. The bridge script inventory is now exactly nine files.
+- Removed updater-only dispatcher fixtures while preserving the legacy-init missing-updater
+  regression. Active documentation and historical Markdown links no longer claim either file is
+  packaged.
+- Focused verification: `cargo test -p xtask` passed 48 tests with 4 ignored; standalone source
+  policy, Bash syntax, Rust formatting, and `git diff --check` all pass.
+
+### H3 Rust-Owned Runtime Layout And Logging
+- `RuntimeLayout` walks the absolute root descriptor-relatively, rejects ancestor/final symlinks
+  and non-direct owned paths, creates only `run/` and `state/`, enforces effective-user ownership,
+  and normalizes their modes to `0700` before daemon or offline-cleanup lease acquisition.
+- `runtime_logging` owns private `fluxd.log` and `flux.log` files through retained `run/`
+  descriptors. Records are structured, single-line, redacted, and capped at 4 KiB; files rotate at
+  1 MiB with one predecessor and no-follow path revalidation on every append.
+- Process-global installation is lease-scoped through a drop guard. Repeated in-process daemon
+  tests are serialized because production permits one installed daemon logger per process; a
+  discovered subscription worker handoff race was fixed by clearing `busy` before publishing the
+  terminal settlement result.
+- `ProcessInspectionSource` now takes explicit runtime/daemon log paths, and current daemon,
+  coordinator, address-reconciliation, file-observer, and subscription diagnostics use the owned
+  sinks with active Generation correlation where available.
+- A real `fluxd` integration smoke starts against a fresh script-free root using deliberately
+  unverified boot identity to keep the production capability path read-only. It creates private
+  `run/`/`state`, lease, logs, and socket, serves status, and records clean SIGTERM shutdown.
+- Verification: layout 4/4, logging 4/4, offline cleanup 9/9, real-process smoke 1/1, startup
+  reconciliation 9/9; full `cargo test -p fluxd` passed 311 library tests with 4 privileged ignores
+  plus every integration target.
+
+### H4 Interface Decision
+- `OperationReport` will carry an optional `AddressResyncDisposition`; resync completions require
+  exactly one of `CompleteNoChange`, `SuccessorConverged`, or `AcceptedDeferred`, while every other
+  intent carries none. This keeps duplicate-request caching and status snapshots on the existing
+  immutable completion value instead of adding a second result channel.
+- `LegacyDispatcher::execute` will return a small typed completion value. The control worker remains
+  the only serializer and owns revision assignment; coordinator and writer modules decide only the
+  operation-specific disposition.
+- The native Generation source will be the deep module at the Generation seam. It retains the
+  accepted `SelectedEngineSource`, current immutable inputs, lineage, and one candidate transaction;
+  address reconciliation supplies only inventory/capture inputs and cannot reopen or choose an
+  engine source.
+- Platform admission consumes the Android variant of `GenerationPlanningAuthority`; host inspection
+  is structurally non-convertible. The resulting `NativeXtablesCaptureTarget` remains opaque.
+- Production remains on `ProcessRuntimeWriter` and `BridgeOfflineRecovery`. H4/H5 add composable
+  native implementations and tests only; physical C1-C3 and Gate 1 still control writer transfer.
+
+### H4 Native Composition Evidence
+- Protocol version 4 carries exactly one typed address-resync disposition for resync completion:
+  `complete_no_change`, `successor_converged`, or `accepted_deferred`. Focused protocol, socket,
+  daemon-CLI, and control-CLI verification passed 41 tests.
+- `AssembledNativeGenerationSource` owns immutable selected engine source, inventory-bound capture
+  inputs, lineage, candidate files, and settlement. Six transaction tests cover unchanged and
+  successor addresses, failed candidates, exact rollback, missing inventory, and stopped pruning.
+- `NativeCoordinatorWriter` declares coordinator-synchronous address resync. Fresh reconciliation
+  reports no-change, converged successor, or accepted-deferred without treating queued work as
+  completed; ten focused native-writer tests pass.
+- `NativeOfflineRecovery` runs `recover()`, `converge(Stopped)`, then a final `recover()` and
+  authorizes success only from verified clean absence after terminal-journal retirement. Fourteen
+  focused cleanup tests cover idempotence, foreign/stale state, partial failure, crash continuation,
+  and false-clean rejection.
+- `NativeXtablesCaptureAdmission` has no public constructor and consumes only Android mark planning
+  evidence, RPDB placement, and lowered artifacts. It rejects every still-deferred mark/topology
+  prerequisite, validates snapshot/epoch/classifier binding, derives loopback, dual-stack routing
+  audit, canonical route/rule identities, and the exact platform tool digest, then returns only the
+  opaque target. Host Generation promotion has an explicit non-promotable error.
+- Canonical native route metric/protocol values now live behind one platform planning function used
+  by both Generation lowering and target admission, preventing assembler/platform drift.
+- Verification: `TMPDIR=/tmp cargo check -p fluxd --all-targets` passes; the focused canonical
+  routing and host-nonpromotion tests each pass. No public raw-target constructor, production writer
+  selection, script deletion, Android authority, or package-profile promotion was added.
+
+### H5 Privileged Native Composition Evidence
+- `compose_native_runtime` is the production-shaped constructor: it accepts an opaque native
+  converger and lazy Generation source, runs native recovery to verified clean absence before source
+  access, and wires `NativeCoordinatorWriter`, `EngineSupervisor`, `RuntimeCoordinator`, and the
+  configured canary without `ProcessPhaseDispatcher`.
+- Linux test admission is feature-gated and sealed. It promotes only host inspection data through a
+  Linux-composition request; Android planning evidence is structurally rejected and no Linux test
+  can manufacture the Android authority used by production target admission.
+- The isolated harness proves initial activation, ordinary reload, validated subscription reload,
+  address-driven successor with `successor_converged`, forced engine exit/recovery, validation
+  failure settlement, successful post-failure reload, stop, coordinator-drop recovery, and repeated
+  offline cleanup against the real native xtables/RPDB/route process adapter.
+- The subscription reload enters through a test-only wrapper around the same
+  `SubscriptionRefreshCompletion` handler used by the real worker. The accepted validated snapshot
+  is retained across coordinator reconstruction to model the production store-recovery handoff;
+  omitting it caused the first strengthened crash test to fail closed as designed.
+- Native offline cleanup now executes `recover()` -> `converge(Stopped)` -> `recover()`. The second
+  recovery retires the terminal journal before success. The test requires journal, lease, and lock
+  absence while preserving the bounded canonical empty target archive, then repeats the operation
+  to prove idempotence.
+- The subprocess audit records every executed program/argument and rejects shells, dispatcher,
+  standalone `addrsyncd`, `jq`, `curl`, AWK, legacy CLI, or any `scripts` path component. It also
+  requires the engine `version`, `check`, and `run` invocations.
+- Exact cleanup checks both IPv4 and IPv6 mangle tables plus RPDB and route identities. Host address
+  predicates render the canonical xtables-save forms IPv4 `/32` and IPv6 `/128` so readback is
+  byte-stable.
+- `cargo xtask test-native-composition-linux` builds the feature-gated engine fixture, verifies the
+  exact ignored test is listed, scrubs harness reentry variables, and runs one test thread. Required
+  mode fails unsupported hosts instead of counting an ignored test as evidence.
+- Final focused result after adding subscription coverage:
+  `FLUX_NATIVE_COMPOSITION_REQUIRED=1 cargo xtask test-native-composition-linux` passed 1 test,
+  failed 0, ignored 0, with 331 filtered out; isolated lifecycle time was 51.18 seconds.
+- Supported Linux CI conditionally installs `iproute2` and `iptables` and requires this command.
+  Production remains on `ProcessRuntimeWriter` and `BridgeOfflineRecovery`; nine scripts and the
+  `failing-until-complete` Rust-only profile remain intentionally unchanged pending physical ARM64
+  C1-C3 and Gate 1.
+
+### H6 Final Verification Evidence
+- The first full CI attempt exposed a test-fixture race, not a production relaxation: the successful
+  descendant fixture did not read restore stdin, so under scheduling pressure the adapter correctly
+  rejected incomplete delivery as `Restore/Ipv4/Stdin: Broken pipe`. Draining stdin before spawning
+  the descendant preserves the capture-pipe cleanup assertion and leaves production `EPIPE`
+  handling fail-closed. The corrected test passed 100/100 exact runs and eight concurrent full
+  library targets; each full target passed 354 tests with four privileged ignores.
+- Strict all-target/all-feature workspace Clippy passed with warnings and undocumented unsafe blocks
+  denied. Repository rustfmt and `git diff --check` passed.
+- `TMPDIR=/tmp cargo xtask ci` passed source policy, workspace checks/tests and documentation tests,
+  warnings-denied Clippy, and the pinned ARM64/API-31 Android cross-check. `fluxd` passed 426 tests
+  with four privileged ignores, `xtask` passed 49 with four fixture ignores, and the complete
+  xtables-lowering integration target passed 23.
+- Required host-native checkpoints passed on the final source state: the existing dual-stack
+  topology canary passed one test with 330 filtered, native composition passed one test with 331
+  filtered in 49.33 seconds, and the seven exact deterministic parser smoke tests passed.
+- Shell syntax and all five active bridge/package suites passed: configuration/installer contract,
+  rule generation, required dispatcher, required installer rollback/uninstall delegation, and
+  required Rust-only installer/watchdog. The wrappers ran directly through bubblewrap because this
+  environment cannot authenticate host `sudo`; namespace isolation and required-mode behavior were
+  still exercised.
+- All 148 local Markdown targets across 49 files resolve. Active protocol-v3 and stale composition
+  scans are empty; retired-script references are limited to explicit denylist/history statements.
+  The bridge inventory is exactly nine files and 5,026 lines. Manifest schema 3 retains 26 bridge
+  required files, 13 Rust-only required files, 13 exact Rust-only forbidden files, and the two-path
+  profile-independent retired denylist.
+- Host work does not authorize cutover. Production and public offline cleanup still select
+  `ProcessRuntimeWriter` and `BridgeOfflineRecovery`; Rust-only remains
+  `failing-until-complete`. Physical ARM64 C1-C3 and Gate 1 remain mandatory before R4 writer
+  selection, R5 bridge deletion, or R6 package promotion.

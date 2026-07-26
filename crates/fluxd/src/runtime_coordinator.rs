@@ -6,7 +6,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use flux_core::{ControlError, FluxConfig, LegacyDispatcher, LegacyIntent, Reason};
+use flux_core::{
+    AddressResyncDisposition, ControlError, DispatcherCompletion, FluxConfig, LegacyDispatcher,
+    LegacyIntent, Reason,
+};
 use flux_platform::{
     DispatcherPhaseCommand, PhaseDispatcherError, PhaseDispatcherPaths, ProcessPhaseDispatcher,
 };
@@ -28,6 +31,7 @@ use crate::generation_engine_config::{
     PreparedGenerationRecord, bind_engine_config_to_spec, bind_engine_spec_to_desired_state,
     publish_bridge_preparation, publish_validated_subscription_bridge_preparation,
 };
+use crate::runtime_logging::{LogSeverity, runtime_log};
 use crate::subscription::{
     SubscriptionRefreshCompletion, SubscriptionRefreshDecision, SubscriptionRefreshError,
     SubscriptionRefreshReport,
@@ -99,7 +103,16 @@ pub(crate) trait LegacyRuntimeWriter: Send + 'static {
     fn capture_stop(&mut self) -> Result<(), Self::Error>;
     fn verify_capture(&mut self, generation: &PreparedGeneration) -> Result<(), Self::Error>;
     fn publish(&mut self, phase: PublishedRuntimeState) -> Result<(), Self::Error>;
-    fn resync_addresses(&mut self) -> Result<(), Self::Error>;
+    fn resync_addresses(&mut self) -> Result<AddressResyncDisposition, Self::Error>;
+    fn address_resync_strategy(&self) -> AddressResyncStrategy {
+        AddressResyncStrategy::WriterManaged
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AddressResyncStrategy {
+    WriterManaged,
+    CoordinatorSynchronous,
 }
 
 pub(crate) trait EngineRuntime: Send + 'static {
@@ -427,8 +440,9 @@ impl LegacyRuntimeWriter for ProcessRuntimeWriter {
         Ok(())
     }
 
-    fn resync_addresses(&mut self) -> Result<(), Self::Error> {
-        self.execute_phase(DispatcherPhaseCommand::AddressResync)
+    fn resync_addresses(&mut self) -> Result<AddressResyncDisposition, Self::Error> {
+        self.execute_phase(DispatcherPhaseCommand::AddressResync)?;
+        Ok(AddressResyncDisposition::AcceptedDeferred)
     }
 }
 
@@ -844,7 +858,10 @@ where
             };
             return runtime_writer_error(
                 "detach failed capture",
-                source,
+                FailedActivationCompensation {
+                    activation: activation_failure,
+                    compensation: source,
+                },
                 "retain the proxy engine until capture detachment can be proven",
             );
         }
@@ -1087,6 +1104,7 @@ where
     }
 
     fn maintain_address_reconciliation(&mut self) -> Result<(), ControlError> {
+        let active_generation = self.ownership_summary().1;
         {
             let Some(reconciler) = self.address_reconciler.as_mut() else {
                 return Ok(());
@@ -1097,10 +1115,15 @@ where
                 }
                 Ok(AddressReconciliationOutcome::Invalidated(previous)) => {
                     self.address_reconciliation_pending = false;
-                    eprintln!(
-                        "fluxd: network inventory snapshot {} at epoch {} invalidated; awaiting full resynchronization",
-                        previous.snapshot_id().get(),
-                        previous.epoch().get()
+                    runtime_log(
+                        LogSeverity::Warn,
+                        "address_reconciliation",
+                        active_generation,
+                        format_args!(
+                            "network inventory snapshot {} at epoch {} invalidated; awaiting full resynchronization",
+                            previous.snapshot_id().get(),
+                            previous.epoch().get()
+                        ),
                     );
                 }
                 Ok(
@@ -1113,7 +1136,12 @@ where
                 }
                 Err(error) => {
                     self.address_reconciliation_pending = false;
-                    eprintln!("fluxd: non-mutating address reconciliation blocked: {error}");
+                    runtime_log(
+                        LogSeverity::Warn,
+                        "address_reconciliation",
+                        active_generation,
+                        format_args!("non-mutating reconciliation blocked: {error}"),
+                    );
                 }
             }
         }
@@ -1293,6 +1321,18 @@ where
                 }
             }
         }
+    }
+
+    #[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
+    pub(crate) fn inject_subscription_refresh_for_native_composition_test(
+        &mut self,
+        config: ValidatedSubscriptionEngineConfig,
+        cleanup_pending: bool,
+    ) -> std::sync::mpsc::Receiver<SubscriptionRefreshDecision> {
+        let (completion, decision) =
+            SubscriptionRefreshCompletion::published_for_test(config, cleanup_pending);
+        self.handle_subscription_refresh_completion(completion);
+        decision
     }
 
     fn settle_pending_subscription_activation(&mut self) -> bool {
@@ -2116,8 +2156,11 @@ where
         runtime_engine_state(self.engine.snapshot().phase())
     }
 
-    fn resync_active_addresses(&mut self) -> Result<(), ControlError> {
+    fn resync_active_addresses(&mut self) -> Result<AddressResyncDisposition, ControlError> {
         self.request_address_reconciliation();
+        if self.writer.address_resync_strategy() == AddressResyncStrategy::CoordinatorSynchronous {
+            return self.resync_coordinator_addresses();
+        }
         if self.functional_canary.mode() == FunctionalCanaryGateMode::StructuralOnlyCompatibility {
             return self.writer.resync_addresses().map_err(|source| {
                 runtime_writer_error(
@@ -2137,19 +2180,19 @@ where
             } => (generation, capture),
             other => {
                 self.ownership = other;
-                return Ok(());
+                return Ok(AddressResyncDisposition::CompleteNoChange);
             }
         };
         self.pending_publication = Some(PublishedRuntimeState::Running {
             generation: generation.id,
         });
         match self.writer.resync_addresses() {
-            Ok(()) => {
+            Ok(disposition) => {
                 self.ownership = RuntimeOwnership::Engine {
                     generation,
                     capture,
                 };
-                Ok(())
+                Ok(disposition)
             }
             Err(source) => {
                 self.ownership = RuntimeOwnership::CaptureRepairPending { generation };
@@ -2160,6 +2203,90 @@ where
                 ))
             }
         }
+    }
+
+    fn resync_coordinator_addresses(&mut self) -> Result<AddressResyncDisposition, ControlError> {
+        let outcome = {
+            let Some(reconciler) = self.address_reconciler.as_mut() else {
+                return Ok(AddressResyncDisposition::AcceptedDeferred);
+            };
+            reconciler.reconcile().map_err(|source| {
+                ControlError::runtime(
+                    "compile fresh address reconciliation",
+                    source,
+                    "retain the active Generation and retry after fresh complete inventory",
+                )
+            })?
+        };
+        match outcome {
+            AddressReconciliationOutcome::Reconciled(_)
+            | AddressReconciliationOutcome::Unchanged(_) => {
+                self.address_reconciliation_pending = true;
+            }
+            AddressReconciliationOutcome::Invalidated(_)
+            | AddressReconciliationOutcome::AwaitingSource
+            | AddressReconciliationOutcome::AwaitingCompleteSnapshot
+            | AddressReconciliationOutcome::Blocked { .. } => {
+                self.address_reconciliation_pending = false;
+                return Ok(AddressResyncDisposition::AcceptedDeferred);
+            }
+        }
+
+        if !self.can_reload_address_successor() {
+            return Ok(AddressResyncDisposition::AcceptedDeferred);
+        }
+        let reconciled = self
+            .address_reconciler
+            .as_ref()
+            .and_then(AddressReconciler::current)
+            .cloned()
+            .ok_or_else(|| {
+                ControlError::runtime(
+                    "load explicit address reconciliation",
+                    io::Error::other(
+                        "fresh address reconciliation has no complete compiled inputs",
+                    ),
+                    "retry after a complete network inventory snapshot is available",
+                )
+            })?;
+        self.address_reconciliation_pending = false;
+        let candidate = self
+            .writer
+            .prepare_address_successor(&reconciled)
+            .map_err(|source| {
+                runtime_writer_error(
+                    "prepare explicit address-driven runtime Generation",
+                    source,
+                    "retain the active Generation and retry after fresh complete inventory",
+                )
+            })?;
+        let Some(candidate) = candidate else {
+            return Ok(AddressResyncDisposition::CompleteNoChange);
+        };
+
+        let (capture_state, active_generation) = self.ownership_summary();
+        self.publish_runtime(
+            RuntimePhase::Preparing,
+            capture_state,
+            self.observed_engine_state(),
+            active_generation,
+            None,
+        );
+        self.reload_prepared(candidate)?;
+        Ok(AddressResyncDisposition::SuccessorConverged)
+    }
+
+    fn can_reload_address_successor(&self) -> bool {
+        let runtime = self.runtime.snapshot();
+        matches!(
+            self.ownership,
+            RuntimeOwnership::Engine {
+                capture: CaptureObservation::Published,
+                ..
+            }
+        ) && runtime.phase == RuntimePhase::Running
+            && runtime.capture == RuntimeCaptureState::Published
+            && runtime.engine == RuntimeEngineState::Ready
     }
 
     fn current_verification(&self) -> RuntimeVerificationState {
@@ -2273,9 +2400,11 @@ where
     W: LegacyRuntimeWriter,
     E: EngineRuntime,
 {
-    fn execute(&mut self, intent: &LegacyIntent) -> Result<(), ControlError> {
+    fn execute(&mut self, intent: &LegacyIntent) -> Result<DispatcherCompletion, ControlError> {
         let result = match *intent {
-            LegacyIntent::Running { reason } => self.start(reason),
+            LegacyIntent::Running { reason } => {
+                self.start(reason).map(|()| DispatcherCompletion::Completed)
+            }
             LegacyIntent::Reload { reason } => {
                 let result = self.reload(reason);
                 if result.is_ok()
@@ -2284,15 +2413,19 @@ where
                 {
                     runtime.request_observed_refresh();
                 }
-                result
+                result.map(|()| DispatcherCompletion::Completed)
             }
-            LegacyIntent::Stopped { .. } => self.stop(),
+            LegacyIntent::Stopped { .. } => self.stop().map(|()| DispatcherCompletion::Completed),
             LegacyIntent::ResyncAddresses { .. }
                 if !matches!(&self.ownership, RuntimeOwnership::Engine { .. }) =>
             {
-                Ok(())
+                Ok(DispatcherCompletion::AddressResync(
+                    AddressResyncDisposition::CompleteNoChange,
+                ))
             }
-            LegacyIntent::ResyncAddresses { .. } => self.resync_active_addresses(),
+            LegacyIntent::ResyncAddresses { .. } => self
+                .resync_active_addresses()
+                .map(DispatcherCompletion::AddressResync),
         };
         if let Err(error) = &result {
             self.publish_runtime_error(error);
@@ -2313,12 +2446,22 @@ where
     fn maintain(&mut self) {
         if let Err(error) = self.maintain_runtime() {
             self.publish_runtime_error(&error);
-            eprintln!("Flux runtime maintenance failed: {error}");
+            runtime_log(
+                LogSeverity::Error,
+                "runtime_coordinator",
+                self.ownership_summary().1,
+                format_args!("runtime maintenance failed: {error}"),
+            );
             return;
         }
         if let Err(error) = self.maintain_address_reconciliation() {
             self.publish_runtime_error(&error);
-            eprintln!("Flux address-driven Generation reconciliation failed: {error}");
+            runtime_log(
+                LogSeverity::Error,
+                "runtime_coordinator",
+                self.ownership_summary().1,
+                format_args!("address-driven Generation reconciliation failed: {error}"),
+            );
         }
         self.maintain_subscription_refresh();
     }
@@ -2347,7 +2490,12 @@ where
         }
         if let Some(error) = last_error {
             self.publish_runtime_error(&error);
-            eprintln!("Flux runtime shutdown failed: {error}");
+            runtime_log(
+                LogSeverity::Error,
+                "runtime_coordinator",
+                self.ownership_summary().1,
+                format_args!("runtime shutdown failed: {error}"),
+            );
         }
     }
 }
@@ -2492,6 +2640,34 @@ where
     E: Error + Send + Sync + 'static,
 {
     ControlError::runtime(operation, source, recovery)
+}
+
+#[derive(Debug)]
+struct FailedActivationCompensation<E> {
+    activation: ControlError,
+    compensation: E,
+}
+
+impl<E> fmt::Display for FailedActivationCompensation<E>
+where
+    E: Error,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "activation failed: {}; capture compensation failed: {}",
+            self.activation, self.compensation
+        )
+    }
+}
+
+impl<E> Error for FailedActivationCompensation<E>
+where
+    E: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.compensation)
+    }
 }
 
 fn functional_canary_error<E>(
@@ -5720,7 +5896,7 @@ mod tests {
             Ok(())
         }
 
-        fn resync_addresses(&mut self) -> Result<(), Self::Error> {
+        fn resync_addresses(&mut self) -> Result<AddressResyncDisposition, Self::Error> {
             self.inner.resync_addresses()
         }
     }
@@ -5764,7 +5940,7 @@ mod tests {
             self.inner.publish(phase)
         }
 
-        fn resync_addresses(&mut self) -> Result<(), Self::Error> {
+        fn resync_addresses(&mut self) -> Result<AddressResyncDisposition, Self::Error> {
             self.inner.resync_addresses()
         }
     }
@@ -5798,7 +5974,7 @@ mod tests {
             }
         }
 
-        fn resync_addresses(&mut self) -> Result<(), Self::Error> {
+        fn resync_addresses(&mut self) -> Result<AddressResyncDisposition, Self::Error> {
             self.inner.resync_addresses()
         }
     }
@@ -5880,12 +6056,12 @@ mod tests {
             Ok(())
         }
 
-        fn resync_addresses(&mut self) -> Result<(), Self::Error> {
+        fn resync_addresses(&mut self) -> Result<AddressResyncDisposition, Self::Error> {
             self.events
                 .lock()
                 .expect("events lock")
                 .push(Event::AddressesResynchronized);
-            Ok(())
+            Ok(AddressResyncDisposition::AcceptedDeferred)
         }
     }
 

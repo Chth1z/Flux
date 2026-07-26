@@ -1,5 +1,11 @@
 use std::collections::VecDeque;
+#[cfg(target_os = "linux")]
+use std::fs;
 use std::num::NonZeroU16;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(target_os = "linux")]
+use std::path::PathBuf;
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -9,6 +15,8 @@ use super::*;
 use crate::generation_engine_config::{
     EngineConfigCompileErrorKind, TproxyEngineConfigRequest, compile_tproxy_engine_config,
 };
+#[cfg(target_os = "linux")]
+use crate::subscription::fetch::{FetchError, FetchPurpose, FetchRequest, FetchedResource};
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -111,6 +119,7 @@ fn validated_config(
         bytes: Arc::from(artifact.bytes()),
         content_sha256: *artifact.content_sha256(),
         snapshot_digest,
+        subscription_source: RedactedSourceId::from_bytes(snapshot_digest),
         node_count,
     }
 }
@@ -118,6 +127,87 @@ fn validated_config(
 fn test_desired_state() -> FluxConfig {
     FluxConfig::parse(include_str!("../../../../../conf/flux.toml"))
         .expect("packaged test Desired State")
+}
+
+#[cfg(target_os = "linux")]
+struct RuntimeFixtureFetch {
+    subscription: Vec<u8>,
+    rewrite_url_file: Option<(PathBuf, String)>,
+}
+
+#[cfg(target_os = "linux")]
+impl FetchAdapter for RuntimeFixtureFetch {
+    fn fetch(&self, request: FetchRequest<'_>) -> Result<FetchedResource, FetchError> {
+        assert_eq!(request.purpose(), FetchPurpose::Subscription);
+        if let Some((path, value)) = &self.rewrite_url_file {
+            fs::write(path, value).expect("rewrite subscription URL during fetch");
+        }
+        Ok(FetchedResource::from_bytes(self.subscription.clone()))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn production_operation_fixture() -> (
+    tempfile::TempDir,
+    SubscriptionRuntimePaths,
+    FluxConfig,
+    PathBuf,
+) {
+    let directory = tempfile::tempdir().expect("subscription runtime fixture");
+    let binary_path = directory.path().join("sing-box");
+    let template_path = directory.path().join("template.json");
+    let url_file = directory.path().join("subscription.url");
+    let desired_state_path = directory.path().join("flux.toml");
+    fs::write(&binary_path, b"#!/bin/sh\nexit 0\n").expect("write fake Sing-Box");
+    fs::set_permissions(&binary_path, fs::Permissions::from_mode(0o700))
+        .expect("make fake Sing-Box executable");
+    fs::write(
+        &template_path,
+        br#"{
+            "outbounds":[
+                {"type":"direct","tag":"DIRECT"},
+                {"type":"selector","tag":"PROXY","outbounds":[]}
+            ],
+            "route":{"rules":[]}
+        }"#,
+    )
+    .expect("write engine template");
+    fs::write(&url_file, "https://provider-a.example/subscription\n")
+        .expect("write subscription URL");
+    let desired_state = include_str!("../../../../../conf/flux.toml")
+        .replacen(
+            "/data/adb/flux/bin/sing-box",
+            binary_path.to_str().expect("UTF-8 binary path"),
+            1,
+        )
+        .replacen(
+            "/data/adb/flux/conf/template.json",
+            template_path.to_str().expect("UTF-8 template path"),
+            1,
+        )
+        .replacen(
+            "/data/adb/flux/conf/subscription.url",
+            url_file.to_str().expect("UTF-8 URL-file path"),
+            1,
+        )
+        .replacen("enabled = false", "enabled = true", 1);
+    fs::write(&desired_state_path, &desired_state).expect("write Desired State");
+    let config = FluxConfig::parse(&desired_state).expect("parse Desired State fixture");
+    let paths = SubscriptionRuntimePaths::new(
+        desired_state_path,
+        directory.path().join("subscriptions"),
+        directory.path(),
+        directory.path().join("validation.log"),
+    );
+    (directory, paths, config, url_file)
+}
+
+#[cfg(target_os = "linux")]
+fn fixture_subscription(name: &str) -> Vec<u8> {
+    format!(
+        "[{{\"type\":\"vless\",\"tag\":\"{name}\",\"server\":\"{name}.example\",\"server_port\":443,\"uuid\":\"id-{name}\"}}]"
+    )
+    .into_bytes()
 }
 
 fn poll_completion(runtime: &mut SubscriptionRefreshRuntime) -> SubscriptionRefreshCompletion {
@@ -158,6 +248,74 @@ fn canonical_reconstruction_reports_an_explicit_content_digest_mismatch() {
     assert_eq!(
         error.kind(),
         EngineConfigCompileErrorKind::ContentDigestMismatch
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn recovery_does_not_reuse_a_snapshot_from_a_different_url_file_source() {
+    let (_directory, paths, config, url_file) = production_operation_fixture();
+    let mut publisher = ProductionRefreshOperation::new(
+        paths.clone(),
+        RuntimeFixtureFetch {
+            subscription: fixture_subscription("first"),
+            rewrite_url_file: None,
+        },
+    )
+    .expect("subscription publisher");
+    assert!(matches!(
+        publisher.refresh_inner(&config),
+        Ok(RefreshPayload::Published { .. })
+    ));
+
+    fs::write(&url_file, "https://provider-b.example/subscription\n")
+        .expect("replace subscription URL while stopped");
+    let mut recovery = ProductionRefreshOperation::new(
+        paths,
+        RuntimeFixtureFetch {
+            subscription: fixture_subscription("second"),
+            rewrite_url_file: None,
+        },
+    )
+    .expect("subscription recovery");
+
+    let (active, _) = recovery.recover(&config).expect("recover snapshot store");
+    assert!(
+        active.is_none(),
+        "a snapshot validated for another URL source must not be reactivated"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn url_file_mutation_during_fetch_rolls_back_the_candidate() {
+    let (_directory, paths, config, url_file) = production_operation_fixture();
+    let mut operation = ProductionRefreshOperation::new(
+        paths,
+        RuntimeFixtureFetch {
+            subscription: fixture_subscription("candidate"),
+            rewrite_url_file: Some((
+                url_file,
+                "https://provider-b.example/subscription\n".to_owned(),
+            )),
+        },
+    )
+    .expect("subscription operation");
+
+    let error = match operation.refresh_inner(&config) {
+        Ok(_) => panic!("URL mutation must prevent candidate acceptance"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.kind(), SubscriptionRefreshErrorKind::SourceChanged);
+    assert!(
+        operation
+            .store
+            .recover()
+            .expect("recover after rollback")
+            .active()
+            .is_none(),
+        "the source-raced candidate must not remain active"
     );
 }
 

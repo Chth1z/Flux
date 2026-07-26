@@ -1613,3 +1613,276 @@ scans, and the fixed-point Standards/Spec review all pass. The scoped local chec
 commit without pushing; hosted workflow evidence and the previously documented fuzz corpus,
 coverage, sanitizer, physical ARM64, production-composition, and Rust-only writer gates remain
 open.
+
+## Execution: P0-D1 Shell Runtime Retirement Planning (2026-07-26)
+
+### Goal
+Review implementation progress since the last fixed-point report, identify design deviations, and
+publish an implementation-ready plan that retires every runtime responsibility represented by the
+11 files under `scripts/` into Rust without preserving a second policy or writer implementation.
+
+### Priorities
+- P0: Reconcile actual production callers and package profiles with the canonical roadmap and
+  ADR-0010/ADR-0011 authority boundaries.
+- P0: Map every script responsibility to an existing Rust owner, a remaining Rust gap, or a frozen
+  test-only oracle, including removal and acceptance criteria.
+- P0: Keep physical Android authority and the fenced networking-writer transfer explicit; a host
+  plan may not manufacture C1-C3 evidence or select the native writer prematurely.
+- P1: Define focused tests, package checks, documentation changes, and an executable commit order.
+- P2: Defer line-by-line shell transliteration, optional backends, and unrelated release-assurance
+  work.
+
+### Phases
+- [x] D1.0: Pin the prior review boundary, confirm the worktree/branch baseline, and inventory the
+  authoritative roadmap, package profiles, and `scripts/` tree.
+- [x] D1.1: Map script entry points, production callers, ownership decisions, Rust counterparts,
+  and remaining gaps.
+- [x] D1.2: Review `e738e8c...HEAD` on Standards and Spec axes and audit current design claims
+  against the production call graph.
+- [x] D1.3: Write the prioritized Rust implementation/removal plan with per-slice acceptance gates.
+- [x] D1.4: Verify paths, counts, links, Markdown, and diff hygiene; report exact changed and
+  untouched files.
+
+### Decisions
+- Interpret "fully implement the shell scripts using Rust" as functional ownership convergence and
+  removal from the shipped runtime, not source-for-source translation. Several responsibilities
+  are already Rust-owned, while the networking writer cannot be activated before C1-C3/Gate 1.
+- Preserve platform-required root-framework glue outside `scripts/`; the manifest already requires
+  all 11 `scripts/` paths to be absent from the Rust-only package.
+- Remove the two no-caller scripts in R0.5 and move their paths from the exact bridge-profile
+  difference into a profile-independent retired-path denylist; remove the nine active/rollback
+  bridge scripts only after Gate 1.
+- Make no production-code, script, manifest, or canonical-roadmap change during this planning pass.
+  The durable deliverable is
+  `docs/architecture/shell-runtime-retirement-plan-2026-07.md`.
+
+### Errors Encountered
+- The first Standards-review dispatch combined full-history inheritance with an explicit agent
+  type, which the collaboration tool rejects. No agent started and no file changed; the same
+  bounded review was relaunched with inherited context only.
+- The first combined documentation patch missed because the retirement-plan draft changed during
+  the review. The failed patch changed nothing; the latest file was reread and updated with smaller
+  context-stable edits.
+- The first manifest-count check used the wrong `required_paths` field and an unparenthesized `jq`
+  expression, so two read-only probes exited 5. The corrected `required_files` query returned
+  bridge/Rust-only/forbidden counts `28/13/15` and proved the forbidden set is the exact difference.
+
+### Status
+**Complete on 2026-07-26** - the fixed-point Standards/Spec review, full script ownership map,
+R0-R6 implementation/removal sequence, verification matrix, and final path/link/diff checks are
+recorded. Implementation has not started; physical C1-C3 and Gate 1 remain external prerequisites
+for production writer selection and bridge deletion.
+
+## Execution: R0-R3 Host-Ready Shell Retirement Implementation (2026-07-26)
+
+### Goal
+Implement every host-verifiable prerequisite in R0 through R3, remove the two scripts that already
+have no runtime callers, and leave production networking mutation fail-closed until physical ARM64
+C1-C3 and Gate 1 can authorize R4.
+
+### Scope And Priorities
+- P0: Fix subscription source binding, address-successor engine-source ownership, native/bridge
+  offline-recovery separation, descriptor-safe template loading, and structural platform-glue
+  verification with focused regression tests.
+- P0: Complete Rust-owned runtime layout, logging, native Generation/resync/offline recovery, and
+  the real privileged Linux composition gate without selecting the production native writer.
+- P1: Remove `scripts/flux-event` and `scripts/updater.sh` plus their bridge inventory residue after
+  their replacement contracts pass.
+- P2: Do not perform physical writer transfer, delete the remaining nine scripts, or promote the
+  Rust-only profile without C1-C3/Gate 1 evidence.
+
+### Phases
+- [x] H0: Reconfirm baseline behavior, module boundaries, test commands, and exact R0 failure
+  reproductions.
+- [x] H1: Implement and verify the five R0 correctness/security contracts and the shell-reference
+  source guard.
+- [x] H2: Remove the two no-caller scripts and update manifest, source policy, fixtures, and docs.
+- [x] H3: Implement and verify Rust-owned runtime layout and bounded logging.
+- [x] H4: Implement and verify native Generation source, typed resync, and native offline recovery.
+- [x] H5: Implement and require the real privileged Linux native-composition test without granting
+  Android authority.
+- [x] H6: Run focused and full verification, reconcile canonical documentation, and report the
+  exact physical-device blocker for R4-R6.
+
+### Decisions
+- Preserve the existing single-writer fence: host tests may inject sealed test authority, but
+  `run_daemon` remains on `ProcessRuntimeWriter` until R4.
+- Make protocol/schema changes explicitly because the branch is pre-release; do not hide typed
+  resync outcomes behind the current success-only contract.
+- Reuse descriptor-relative record I/O and existing typed native owner interfaces instead of
+  introducing parallel filesystem or networking implementations.
+- Work with the four existing planning-file changes; do not discard or commit them.
+
+### Errors Encountered
+- The first strict H6 all-feature Clippy sweep found four mechanical issues: an elidable lifetime in
+  the platform-glue parser, an over-wide Generation-digest helper signature, a manual even-length
+  check in audit decoding, and an undocumented test-only `kill(2)` call. Elide the lifetime, group
+  the digest inputs, use `is_multiple_of(2)`, and document the validated positive-PID boundary; the
+  unchanged strict gate then passed without suppressions.
+- The first H4.2 platform-admission patch used a stale `native_generation_source.rs` import context,
+  so `apply_patch` rejected the complete multi-file patch without changing any file. Split the edit
+  into exact per-file patches against the current import shape.
+- The first H4.2 all-target compile reached `flux-platform` and found that the new admission items
+  were visible only through an existing `pub(crate)` runtime-writer glob; moving raw admission out
+  of `#[cfg(test)]` also exposed its test-only artifact import. Add the items to the explicit public
+  re-export and make the artifact type import unconditional; the unchanged all-target check passes.
+- The first H4.2 synchronous-resync fixture tried to inspect sibling-module private coordinator
+  fields and therefore failed at test compilation. Exercise the same queued state through a real
+  injected reload failure and public dispatcher/maintenance behavior; do not widen production or
+  test visibility.
+- The first H4.2 source-test compile used `expect_err` on
+  `Result<PreparedNativeGeneration<_>, _>`, but the deliberately opaque prepared type has no
+  `Debug` implementation. Replace the fixture assertion with an explicit result match; production
+  code was not reached.
+- The v4 control/status tests passed, then the text-status fixture reported the intentional new
+  `last address resync: none` line as an exact-output mismatch. Update that operator-facing fixture;
+  JSON and protocol resync assertions already passed.
+- After the protocol bump, the first v4 fixture run retained one stale expected error string
+  (`expected 3`) and therefore failed only the explicit old-version rejection test. Generalize the
+  case to prove both versions 2 and 3 are rejected in favor of 4.
+- The first H4.1 focused control test correctly rejected the concurrency fixture because it returned
+  a generic completion for eight resync intents. Return the typed resync completion from that
+  fixture; production serialization and revision behavior were unchanged.
+- A combined H4.1 fixture patch matched the runtime-writer wrappers but not the exact
+  `socket_round_trip.rs` import layout, so `apply_patch` rejected the whole patch before changing
+  either file. Split production-test wrappers from integration-test imports.
+- The first H4.1 control patch targeted an older grouped import shape in
+  `runtime_coordinator.rs`, so `apply_patch` rejected the complete multi-file edit before changing
+  either Rust file. Re-read the exact imports/signatures and apply smaller exact-context hunks.
+- The first H3.1 focused compile found the new `runtime_root` field missing from the offline-cleanup
+  `DaemonOptions` fixture. Add the same explicit root to every direct fixture initializer and rerun
+  the unchanged runtime-layout tests; production behavior was not reached.
+- The first H3.2 logging compile moved the fixed log-name `CString` into `BoundedLogSink` before
+  deriving its diagnostic path. Derive the path before constructing the sink and rerun the same
+  focused logging tests; no runtime behavior was reached.
+- The next H3.2 focused run passed rotation and symlink rejection but exposed a credential leak in
+  redaction: `token=` inside a URL query won assignment precedence and left URL user-info visible.
+  Give a URL scheme precedence over sensitive markers that occur later in the same token, retain
+  assignment redaction before the scheme, and rerun the unchanged secret-leak assertions.
+- The first full H3 `cargo test -p fluxd` run stopped in the library suite when
+  `startup_rejection_restores_only_the_exact_pending_bootstrap_candidate` observed the subscription
+  worker busy during startup settlement. Rerun the exact test, then reproduce under parallel load
+  before deciding whether this is timing exposed by diagnostic routing or an independent flaky
+  handoff; do not weaken the rollback assertion.
+- The first real-process H3 smoke created the fresh layout and logs, then selected the supported
+  legacy mutation path because that gate depends on kernel support plus boot identity rather than
+  script readiness. Use a deliberately malformed controlled boot-identity fixture so this
+  script-free R1 smoke exercises the production read-only initialization path; do not add a fake
+  dispatcher or change writer authority.
+- The first privileged H5 design tried to compare namespace identity through `/proc/1/ns/*`, which
+  is inaccessible on the supported hosted runner. Prove non-initial mapped-root user authority from
+  bounded `/proc/self/uid_map`, then use `NS_GET_USERNS` on the isolated network namespace FD to
+  bind its owning user namespace without weakening the isolation contract.
+- The first real H5 platform convergence rejected host-installed xtables helpers because their host
+  ownership did not map to UID 0 inside the user namespace. Stage byte-identical copies of the six
+  installed helpers under the private fixture root so their namespace ownership and tool digests
+  satisfy the real adapter contract.
+- The first real H5 readback found that xtables-save canonicalizes address hosts as IPv4 `/32` and
+  IPv6 `/128`. Render those exact canonical prefixes and retain a focused lowering regression.
+- After adding the required subscription reload to H5, the first crash-recovery pass failed closed
+  because the reconstructed test source did not receive the accepted validated subscription
+  snapshot. Retain that accepted snapshot across coordinator reconstruction, matching the production
+  subscription-store recovery handoff; the unchanged privileged gate then passed.
+- The first final H6 `TMPDIR=/tmp cargo xtask ci` run failed only in
+  `a_successful_parent_cannot_leave_a_descendant_holding_capture_pipes` when its successful shell
+  fixture exited without consuming restore stdin. Under load this raced the adapter's stdin worker
+  and correctly produced `Restore/Ipv4/Stdin: Broken pipe`; the exact test passed alone, while four
+  of eight concurrent full library targets reproduced it. Drain the canonical restore input before
+  spawning the descendant so the fixture tests only capture-pipe cleanup. Production incomplete-
+  stdin handling remains fail-closed; 100 exact runs and eight concurrent full library targets then
+  passed.
+- The final consistency scan found one old functional-canary paragraph still naming control
+  protocol v3 and one bridge-cleanup comment still naming R2 as the selection point. Update both to
+  protocol version 4 and physical Gate 1; no runtime composition changed.
+- The first attempt to mirror the hosted shell commands through `sudo` was blocked by the sandbox's
+  no-new-privileges setting, and the escalated host command required an interactive password. The
+  wrappers need namespace isolation rather than host root here, so rerun all three directly through
+  their required bubblewrap mode; dispatcher, installer, and Rust-only glue suites passed.
+- The first final `jq` manifest assertion bound profile objects across an unparenthesized boolean
+  pipeline and failed with `Cannot index boolean with string "status"`; it did not evaluate or
+  modify the manifest. Bind the profile arrays and objects before the conjunction; the corrected
+  schema/status/count/exact-difference assertion passed.
+
+### H2 Verification
+- Deleted `scripts/flux-event` and `scripts/updater.sh`; `scripts/` now contains nine files and
+  5,026 lines.
+- Bumped `conf/manifest.json` to schema 3 with an exact two-path `retired_runtime_paths` policy.
+  Bridge required paths are 26; Rust-only required/forbidden paths are 13/13.
+- `cargo test -p xtask`: 48 passed, 0 failed, 4 ignored.
+- `cargo xtask check-shell-bridge-sources`, `bash -n tests/shell/dispatcher_fluxd_mode.sh`,
+  `cargo fmt --all -- --check`, and `git diff --check`: passed.
+
+### H3 Verification
+- `RuntimeLayout` bootstraps descriptor-relatively before lease acquisition, creates only private
+  `run/` and `state/`, and validates all daemon-owned paths as exact direct children.
+- Rust owns bounded `run/fluxd.log` and `run/flux.log` sinks: 4 KiB records, 1 MiB current file,
+  one predecessor, `openat`/`renameat`/`unlinkat`, no-follow revalidation, mode/owner checks,
+  structured severity/component/Generation fields, and credential/query/assignment redaction.
+- Daemon, coordinator, and subscription diagnostics use the new sinks; inspection is explicitly
+  bound to the layout-owned paths. Offline cleanup bootstraps the same layout before leasing.
+- The real-binary fresh-root smoke starts without a `scripts/` directory under controlled read-only
+  capability evidence, creates the exact layout/logs/socket, and records a clean SIGTERM shutdown.
+- Focused checks: runtime layout 4/4, runtime logging 4/4, offline cleanup 9/9, real-process smoke
+  1/1, startup reconciliation 9/9. Full `cargo test -p fluxd`: 311 library tests passed, 4
+  privileged tests ignored, and all integration targets passed.
+
+### H4 Execution Plan
+- [x] H4.1: Make control completion carry an explicit native address-resync disposition and bump
+  the strict wire protocol, including CLI/status and duplicate-request coverage.
+- [x] H4.2: Add the production native Generation source around `GenerationAssembler`, retain the
+  exact selected engine source transactionally, and admit opaque platform targets only by consuming
+  Android planning evidence.
+- [x] H4.3: Implement native offline recovery as `recover()` plus `converge(Stopped)` and require
+  verified clean absence, without selecting it in the bridge package yet.
+- [x] H4.4: Prove no-change, successor, deferred/loss, subscription preservation, failure, rollback,
+  crash recovery, foreign/stale ownership, partial cleanup, and idempotence through focused tests.
+
+### H5 Execution Plan
+- [x] H5.1: Add a production-composition constructor that contains no dispatcher dependency and
+  accepts only an already admitted opaque target/source seam.
+- [x] H5.2: Add the ignored privileged Linux namespace lifecycle test and exact `xtask` command,
+  including subprocess-deny evidence and exact dual-stack cleanup.
+- [x] H5.3: Require the command in supported Linux CI while preserving a clear unsupported-host
+  failure instead of treating an ignored test as evidence.
+
+### H5 Verification
+- `compose_native_runtime` wires the real native process converger, transactional Generation
+  source, `EngineSupervisor`, coordinator, and canary with no dispatcher dependency. Linux receives
+  only sealed feature-gated test authority and cannot construct or impersonate Android authority.
+- The exact ignored test covers initial start, ordinary reload, validated subscription reload,
+  address-driven successor plus typed disposition, forced engine recovery, candidate rejection and
+  settlement, stop, coordinator-drop recovery, repeated native offline recovery, subprocess denial,
+  and exact dual-stack xtables/RPDB/route cleanup.
+- `NativeOfflineRecovery` performs `recover()` -> `converge(Stopped)` -> `recover()`; the final pass
+  retires the terminal journal before verified-clean success. The canonical empty target archive is
+  retained while journal, lease, and writer lock are absent.
+- `FLUX_NATIVE_COMPOSITION_REQUIRED=1 cargo xtask test-native-composition-linux`: 1 passed, 0 failed,
+  331 filtered out; final lifecycle execution completed in 51.18 seconds after subscription coverage.
+- Supported Linux CI installs the required platform tools and sets the command to required mode.
+  Production still selects `ProcessRuntimeWriter` and `BridgeOfflineRecovery`.
+
+### H6 Verification
+- The corrected descendant-cleanup fixture passed 100 exact repetitions and eight concurrent full
+  `flux-platform` library targets. Every stressed target reported 354 passed and four privileged
+  ignores; production `EPIPE` handling was not changed.
+- `cargo fmt --all -- --check` and strict all-target/all-feature workspace Clippy passed with
+  warnings and undocumented unsafe blocks denied.
+- `TMPDIR=/tmp cargo xtask ci` passed source policy, formatting, all-target checks, the complete
+  workspace tests and documentation tests, warnings-denied Clippy, and the pinned ARM64/API-31
+  Android cross-check. `fluxd` passed 426 tests with four privileged ignores; `xtask` passed 49
+  with four fixture ignores; the full xtables-lowering target passed 23.
+- Required Linux evidence passed on the final source state: the existing dual-stack topology canary
+  passed one test with 330 filtered, the dispatcher-free native composition passed one test with
+  331 filtered in 49.33 seconds, and all seven deterministic parser smoke tests passed.
+- Shell syntax, configuration/installer, rule generation, required dispatcher, required installer
+  rollback/uninstall, and required Rust-only installer/watchdog suites passed. Source policy still
+  permits only the reviewed bridge references.
+- All 148 local Markdown targets across 49 files resolve. Protocol/composition/retired-path scans,
+  exact nine-file/5,026-line script inventory, manifest profile counts, repository formatting, and
+  `git diff --check` passed.
+
+### Status
+**Complete on 2026-07-26** - every host-verifiable R0-R3 prerequisite and the full H6 matrix pass.
+Production and public offline cleanup deliberately remain on `ProcessRuntimeWriter` and
+`BridgeOfflineRecovery`; nine scripts remain, and Rust-only stays `failing-until-complete` until a
+physical ARM64 target supplies C1-C3 and Gate 1 authority for R4-R6.

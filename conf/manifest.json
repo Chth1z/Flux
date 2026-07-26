@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "project": "Flux",
   "generated_by": "manual",
   "note": "Development placeholder only. The bridge profile is development-only and the Rust-only profile is failing-until-complete. Release verification additionally requires clean applicable source revisions, exact HTTPS provenance/version/target/hash/license fields, payload-bound physical-device evidence, SPDX, complete checksums, and pinned build metadata.",
@@ -46,6 +46,10 @@
     }
   ],
   "device_test_evidence": [],
+  "retired_runtime_paths": [
+    "scripts/flux-event",
+    "scripts/updater.sh"
+  ],
   "package_profiles": [
     {
       "name": "bridge",
@@ -67,13 +71,11 @@
         "scripts/config",
         "scripts/core",
         "scripts/dispatcher",
-        "scripts/flux-event",
         "scripts/init",
         "scripts/lib",
         "scripts/log",
         "scripts/rules",
         "scripts/tproxy",
-        "scripts/updater.sh",
         "webroot/index.html",
         "customize.sh",
         "flux_service.sh",
@@ -111,13 +113,11 @@
         "scripts/config",
         "scripts/core",
         "scripts/dispatcher",
-        "scripts/flux-event",
         "scripts/init",
         "scripts/lib",
         "scripts/log",
         "scripts/rules",
-        "scripts/tproxy",
-        "scripts/updater.sh"
+        "scripts/tproxy"
       ]
     }
   ]

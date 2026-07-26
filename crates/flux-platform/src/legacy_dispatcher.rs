@@ -2,7 +2,9 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-use flux_core::{ControlError, LegacyDispatcher, LegacyIntent};
+use flux_core::{
+    AddressResyncDisposition, ControlError, DispatcherCompletion, LegacyDispatcher, LegacyIntent,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LegacyScriptPaths {
@@ -36,7 +38,7 @@ impl ProcessLegacyDispatcher {
 }
 
 impl LegacyDispatcher for ProcessLegacyDispatcher {
-    fn execute(&mut self, intent: &LegacyIntent) -> Result<(), ControlError> {
+    fn execute(&mut self, intent: &LegacyIntent) -> Result<DispatcherCompletion, ControlError> {
         let (script, arguments) = self.command_for(intent);
         let mut command = Command::new(&self.paths.shell);
         command
@@ -57,7 +59,14 @@ impl LegacyDispatcher for ProcessLegacyDispatcher {
         })?;
 
         if status.success() {
-            Ok(())
+            Ok(match intent {
+                LegacyIntent::ResyncAddresses { .. } => {
+                    DispatcherCompletion::AddressResync(AddressResyncDisposition::AcceptedDeferred)
+                }
+                LegacyIntent::Running { .. }
+                | LegacyIntent::Stopped { .. }
+                | LegacyIntent::Reload { .. } => DispatcherCompletion::Completed,
+            })
         } else {
             Err(ControlError::dispatcher(format!(
                 "{} {} exited with {status}",

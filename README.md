@@ -262,10 +262,8 @@ Runtime files live under `/data/adb/flux/`:
 │   ├── generations/          # Immutable prepared Generation snapshots
 │   └── capture.* / engine.*  # Generation ownership and recovery records
 └── scripts/
-    ├── flux-event            # Packaged legacy event adapter; no runtime caller
     ├── dispatcher            # Serialized shell phase adapter
     ├── init / config
-    ├── updater.sh            # Frozen, packaged bridge oracle; never invoked at runtime
     ├── rules                # Frozen source-shape oracle and explicit legacy rollback generator
     ├── tproxy               # Sole restore executor and xtables kernel writer
     ├── addrsync
@@ -311,9 +309,10 @@ subscriptions require an accepted Rust snapshot and the packaged root-owned Sing
 non-root traversal of the private snapshot store is not yet supported. A valid configuration
 outside those bridge limits fails preparation instead of being silently narrowed. The shell
 validates the exact 41-field environment allowlist and may append only observed `KFEAT_*` values.
-`scripts/updater.sh` is never invoked; it, `settings.ini`, and `jq` remain packaged only for frozen
-bridge comparison or explicit legacy rollback. The exact Rust-only stage excludes them now; the
-development bridge retains them until the fenced Gate 1 writer transfer.
+The replaced `scripts/updater.sh` and `scripts/flux-event` entry points are retired from source and
+both package profiles; manifest schema 3 denies either path in every staged package. `settings.ini`
+and `jq` remain only in the development bridge for explicit legacy rollback. The exact Rust-only
+stage excludes them, while the remaining nine scripts stay fenced until the Gate 1 writer transfer.
 
 ### Routing marks and compatibility
 

@@ -1140,14 +1140,14 @@ development bridge remains the production writer rollback boundary until Gate 1.
   subscription, configuration-compilation, and cleanup implementation.
 - [x] B3.3: Prove exact 13-path Rust-only staging and exact legacy-artifact rejection without
   promoting its `failing-until-complete` status or deleting the still-active bridge.
-- [ ] B3.4: Reconcile active documentation, run focused/full/Android/WSA/diff gates, and create
+- [x] B3.4: Reconcile active documentation, run focused/full/Android/WSA/diff gates, and create
   periodic local Conventional Commit checkpoints without pushing.
 
 ### Status
-**B3.3 complete on 2026-07-26; B3.4 next** - Rust-only staging selects two minimal tracked source
-overrides and produces the exact 13-path tree; bridge staging still selects its 28 root sources. All
-15 declared bridge-only paths fail Rust-only admission, source-byte binding follows the selected
-profile, and the fresh-install glue/watchdog passes isolated execution tests.
+**B3 complete on 2026-07-26 through the structural package gate** - the exact Rust-only stage,
+platform-glue policy, Android ELF contract, full repository gates, and connected WSA mechanism
+checkpoint pass. Production remains on the development bridge and `ProcessRuntimeWriter`; the next
+release-authorizing work is C1/C2 on a rooted physical ARM64 target.
 
 ### Decisions
 - WSA is development mechanism evidence only. It cannot construct physical Android ARM64 planning,
@@ -1212,6 +1212,9 @@ profile, and the fresh-install glue/watchdog passes isolated execution tests.
 - The first B3.3 strict Clippy run found one needless borrow of the already borrowed `fluxd_source`
   path at the extracted post-build staging seam. Remove only the redundant `&`; shell tests and the
   48-test `xtask` suite had already passed with unchanged behavior.
+- The first combined B3.4 documentation patch missed one wrapped roadmap sentence and was rejected
+  before changing any file. Re-read the exact B1/B2 contexts and apply the reconciliation as scoped
+  per-file patches.
 
 ### B3.0 Verification
 - The command-environment regression failed before the fix on the absent
@@ -1287,3 +1290,27 @@ profile, and the fresh-install glue/watchdog passes isolated execution tests.
   syntax checks passed.
 - Repository rustfmt, `git diff --check`, and the scoped high-confidence secret scan passed. The
   existing `.github/workflows/ci.yml` CRLF normalization notice remains warning-only.
+
+### B3.4 Verification
+- `TMPDIR=/tmp cargo xtask ci` passed with pinned NDK r27d. The `fluxd` library reported 295 passed
+  with four privileged ignores, `xtask` reported 44 passed with four fixture ignores, and workspace,
+  documentation, and ARM64 cross-check targets passed.
+- `TMPDIR=/tmp cargo xtask build-android` produced
+  `target/aarch64-linux-android/release/fluxd` at 4,128,000 bytes with SHA-256
+  `5a49abc896ccb95593de2f0bb088c501ce4f99c96bbaae84790fcc94fd26aa36`. Independent pinned-NDK
+  `llvm-readelf -lW` inspection reported four `LOAD` segments, all aligned to `0x4000`.
+- The authorized WSA serial `127.0.0.1:58526` reported WSA 2407.40000.4.0, Android 13 / SDK 33,
+  rooted x86_64, and a 4096-byte runtime page size. The exact local-OUTPUT TPROXY checkpoint passed
+  one test with 277 filtered; its x86_64 ELF also had four `0x4000` load segments.
+- The WSA runner removed `/data/local/tmp/flux-output-tproxy.BcLpuT`; an exact absence probe and a
+  prefix-wide search found no retained test directory. This is x86_64 mechanism evidence only and
+  does not authorize an ARM64 profile, native writer selection, or release.
+- Full Bash syntax, config/installer contract, rules generation, dispatcher, bridge installer, and
+  Rust-only installer/watchdog suites passed. Their exercised rejection diagnostics are expected
+  fail-closed cases, and every suite returned success.
+- Active documentation now distinguishes the exact 13-path Rust-only skeleton from the still-active
+  28-path development bridge and records fresh-install-only behavior. Production composition was
+  re-read at `crates/fluxd/src/daemon.rs` and still constructs `ProcessRuntimeWriter`.
+- Final `cargo fmt --all -- --check` and `git diff --check` passed. Scoped stale-B3/progress searches
+  and the high-confidence secret-signature scan returned no matches; the complete seven-file
+  documentation/plan diff was reviewed before staging.

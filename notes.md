@@ -967,3 +967,29 @@ It does not yet validate the production Rust composition because that compositio
   all-target Clippy, both installer suites, and shell syntax. Production still constructs
   `ProcessRuntimeWriter`; the Rust-only profile remains `failing-until-complete` and is not runtime,
   device, or release evidence.
+
+## P0-B3.4 Structural Package Gate Closure (2026-07-26)
+
+- Active README, blueprint, roadmap, project review, and development guidance now describe the exact
+  Rust-only stage as structurally complete while the 28-path development bridge remains the active
+  rollback boundary. The Rust-only installer is explicitly fresh-install-only; shell never migrates
+  or deletes bridge runtime state.
+- The final `TMPDIR=/tmp cargo xtask ci` run passed with pinned NDK r27d: 295 `fluxd` library tests
+  passed with four privileged ignores, 44 `xtask` tests passed with four fixture ignores, and all
+  workspace, documentation, and ARM64 cross-check targets passed.
+- The final ARM64 release artifact was 4,128,000 bytes with SHA-256
+  `5a49abc896ccb95593de2f0bb088c501ce4f99c96bbaae84790fcc94fd26aa36`. Independent pinned-NDK
+  `llvm-readelf -lW` inspection found four `LOAD` segments, each aligned to `0x4000`.
+- Authorized WSA at `127.0.0.1:58526` reported WSA 2407.40000.4.0, Android 13 / SDK 33, rooted
+  x86_64, and `PAGE_SIZE=4096`. The exact local-OUTPUT TPROXY checkpoint passed one test with 277
+  filtered; its x86_64 ELF also exposed four `0x4000` load segments.
+- The WSA runner removed `/data/local/tmp/flux-output-tproxy.BcLpuT`. Exact-path and prefix-wide
+  probes found no retained directory. WSA remains 4 KiB x86_64 mechanism evidence and cannot bind a
+  physical ARM64 device profile or authorize `NativeRuntimeWriter` selection.
+- Full Bash syntax, config/installer contract, rules-generation, dispatcher, bridge installer, and
+  Rust-only installer/watchdog suites passed. Production source inspection still finds
+  `ProcessRuntimeWriter::new` in `crates/fluxd/src/daemon.rs`; no cutover occurred.
+- Final rustfmt and diff-integrity checks passed. Scoped stale-status and high-confidence secret
+  searches returned no matches, and the complete seven-file documentation/plan diff was reviewed.
+- B3 has exhausted the independent host/package work. C1/C2 on a rooted physical ARM64 target are
+  now the exact prerequisites for target authority and the later Gate 1 writer transfer.

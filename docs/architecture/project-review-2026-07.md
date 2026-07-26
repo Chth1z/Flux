@@ -13,14 +13,14 @@ and an external supervised Sing-Box engine. The implementation also contains sub
 Rust machinery for those decisions.
 
 At the review baseline, the project was not close to its declared Rust-only release boundary in
-production composition. Since then, Gate 0, A1-A3, the A4 host composition checkpoint, and B1 have
-landed: schema-3 `FluxConfig` owns the complete product Desired State, A2 assembles complete
-non-mutating Generations, A3 consumes live network inventory into snapshot-bound Capture Program
-inputs, and the Rust subscription worker now owns retrieval, assets, validation, recovery, and
-Generation reload. The main topology problem remains: `fluxd` still delegates every networking
-mutation phase to shell; `scripts/tproxy` remains the actual xtables/RPDB writer; standalone
-`addrsyncd` remains a second runtime owner; parts of the CLI/diagnostics remain legacy; and
-production uses structural rather than functional verification.
+production composition. Since then, Gate 0, A1-A4, and B1-B3 have landed: schema-3 `FluxConfig` owns
+the complete product Desired State, A2 assembles complete non-mutating Generations, A3 consumes live
+network inventory into snapshot-bound Capture Program inputs, A4 composes the native writer behind
+non-forgeable authority, Rust now owns subscription/control/observation/offline cleanup, and an exact
+13-path Rust-only package skeleton is machine-checked. The main topology problem remains: `fluxd`
+still constructs `ProcessRuntimeWriter` and delegates networking mutation to shell;
+`scripts/tproxy` remains the actual xtables/RPDB writer; standalone `addrsyncd` remains a second
+runtime owner; and production uses structural rather than functional verification.
 
 The recommendation is **not to rewrite the rewrite**. Keep the architecture and change the
 schedule immediately:
@@ -119,11 +119,11 @@ managed hybrid, not a Rust-owned runtime.
 | Generation compilation | Complete non-mutating Rust assembler; bridge still snapshots networking artifacts | A2 complete, activation disconnected | Connect native writer |
 | Capture and RPDB | `scripts/tproxy` | Legacy owner | Native owner cutover |
 | Network observation | Rust observer plus serialized `AddressReconciler` | A3 complete, non-authorizing | Feed native Generation activation |
-| Address synchronization | standalone `addrsyncd`; Rust compiles shadow host bypass | Second mutation owner remains | Transfer mutation in A4 |
+| Address synchronization | standalone `addrsyncd`; native Rust maintenance is host-composed but not selected | Second production mutation owner remains | Select only at Gate 1 |
 | Runtime verification | Structural in production | Insufficient for release | Required functional adapter |
-| Subscription/assets | Bounded Rust worker and content-addressed active/predecessor store | B1 complete; updater is non-invoked package oracle | Remove oracle from B3 package |
-| CLI/events/diagnostics | Direct Rust lifecycle/status/diagnostics/log/explain, internal reactor file observation, and bounded offline cleanup; only the no-caller event adapter remains packaged | B2 complete; wrapper and shell preview paths removed | B3 deletes the event artifact with bridge files |
-| Package verification | Strong bridge verifier | Wrong final inventory | Rust-only profile and gate |
+| Subscription/assets | Bounded Rust worker and content-addressed active/predecessor store | B1 complete; updater exists only in the development bridge | Rust-only stage excludes the oracle |
+| CLI/events/diagnostics | Direct Rust lifecycle/status/diagnostics/log/explain, internal reactor file observation, and bounded offline cleanup | B2 complete; no-caller event file exists only in the bridge | Rust-only stage excludes the adapter |
+| Package verification | Exact bridge and Rust-only contracts, source policy, source binding, and staging | B3 structurally complete; release status intentionally failing | Retain status through Gate 1 and add real provenance/evidence |
 | Optional backends | Specification/research only | Not on critical path | Defer |
 
 ## Strengths
@@ -248,6 +248,10 @@ A passing verifier is therefore not evidence for ADR-0011.
 
 Recommendation: add a separate Rust-only package profile now and let it fail until the required
 files are removed. This makes the final state measurable throughout the work.
+
+Status update: B3 implements that recommendation with exact 13/28-path contracts, profile-specific
+source binding, no-policy platform-glue checks, and a still-failing Rust-only release status. A
+passing development bridge remains non-authorizing.
 
 ### P0. VPN Respect Is Not Yet An Engine Egress Contract
 
@@ -403,8 +407,9 @@ The canonical plan is the [Rust-unification roadmap](implementation-roadmap.md).
   read-only coordinator inspection.
 - **A3 complete:** the daemon's one `NetworkInventorySource` now drives serialized, stale-invalidating,
   non-mutating address reconciliation with snapshot-bound Capture Program provenance.
-- Construct the production native writer behind exact authority and pass real namespace lifecycle
-  tests through `run_daemon`.
+- **A4 host composition complete:** the native writer facade, recovery, coordinator adapter, and
+  address maintenance are connected behind exact authority. Production selection remains blocked on
+  C2/Gate 1 physical authority and real namespace lifecycle evidence.
 
 ### Lane B: Rust Product Plane
 
@@ -417,9 +422,10 @@ The canonical plan is the [Rust-unification roadmap](implementation-roadmap.md).
   watch-loss reconciliation, disable-state handling, and observed subscription refresh run inside
   `DaemonReactor`; the shell watcher/event invocation path is gone.
 - **B2 complete:** the daemon-exclusive offline cleanup contract is connected, and the forwarding
-  wrapper, direct dispatcher lifecycle alias, and cache-mutating preview path are removed. B3
-  deletes the no-caller bridge event artifact with the rest of the legacy package inventory.
-- Add the final package profile and remove `jq`, legacy configs, runtime scripts, and `addrsyncd`.
+  wrapper, direct dispatcher lifecycle alias, and cache-mutating preview path are removed.
+- **B3 structural package gate complete:** the exact 13-path Rust-only stage excludes `jq`, legacy
+  configs, all runtime scripts, and standalone `addrsyncd`; the active 28-path bridge retains its
+  rollback artifacts until Gate 1. Minimal installer/watchdog source is separately policy-checked.
 
 ### Lane C: Physical Android Authority
 
@@ -469,8 +475,8 @@ Optional backend count is not part of this definition.
 | Privileged CI | Require real composition namespace tests and parser fuzz smoke | Unit suite can remain green while integration is broken |
 | Package profile | Done: keep the checked Rust-only verifier failing until final ownership converges | Weakening or bypassing it would make bridge verification misleading |
 
-The smallest useful host-executable next step is now `P0-B3`: remove the no-caller event/updater
-artifacts, `jq`, legacy configuration, and the remaining runtime scripts from the package profile
-while keeping the frozen writer rollback boundary until Gate 1. `P0-A4` production selection
-remains correctly blocked on C2/Gate 1 physical authority. Do not spend this interval on optional
-backends or new detached proof types.
+The structural host/package work through B3 is complete. The next release-authorizing step is C1/C2
+on a rooted physical ARM64 device: bind one reviewed profile and produce exact mark/RPDB/topology
+authority. WSA may continue to exercise x86_64 mechanisms but cannot unlock production A4 selection,
+which remains correctly blocked on C2/Gate 1. Do not spend this interval on optional backends or new
+detached proof types.

@@ -1081,7 +1081,8 @@ It exposes only coalesced configuration-input and disable-state facts, recovers 
 atomic replacement, invalidated watches, missing parents, and ancestor-directory replacement, and
 submits them without blocking to the existing serialized mutation scheduler. Read-only profiles
 attach no observer. The prior `inotifyd`/`flux-event` runtime path is gone; the adapter remains only
-as a development-package artifact pending B3 deletion.
+as a development-bridge artifact and is absent from the exact Rust-only stage. It leaves the bridge
+only with the other rollback artifacts at Gate 1.
 
 Offline multicall commands, which are not routed over the live daemon socket:
 

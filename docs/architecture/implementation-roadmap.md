@@ -287,7 +287,8 @@ Status: **complete on 2026-07-26**.
   secure non-root store traversal remains a later compatibility task.
 - `scripts/init` no longer calls or requires `scripts/updater.sh` in either ownership mode. The
   script remains in the development-only bridge inventory solely as a frozen comparison artifact;
-  B3 removes it from the package together with the other legacy runtime files.
+  B3 excludes it from the exact Rust-only stage, while the development bridge retains it until the
+  Gate 1 writer transfer.
 - Flux does not yet own a separate persisted Sing-Box FakeIP/reverse-mapping database. B1 binds the
   exact canonical engine configuration and rule assets; a future owned cache must introduce its own
   versioned migration/corruption contract rather than delaying updater retirement for nonexistent
@@ -312,14 +313,16 @@ Android/API-31 cross-build pass. No WSA or physical ARM64 runtime qualification 
   and ancestor-directory replacement. Two typed facts coalesce behind the existing serialized
   writer, startup-gap reconciliation uses metadata identity, and observed subscription inputs
   schedule one immediate or pending refresh. Module boot no longer starts `inotifyd`, and neither
-  service nor dispatcher invokes `scripts/flux-event`; its packaged file remains for B3 deletion.
+  service nor dispatcher invokes `scripts/flux-event`; B3 excludes its file from Rust-only staging,
+  while the development bridge retains it until Gate 1.
 - **B2.3 complete 2026-07-26:** one bounded `fluxd cleanup --offline` path now acquires a
   persistent daemon lease before startup recovery, consumes durable ownership records and exact
   absence checks, and is delegated by the platform uninstall glue. Shell never reconstructs rules.
 - **B2.4 complete 2026-07-26:** `scripts/fluxctl`, its legacy-init dependency, the external
   dispatcher lifecycle alias, and the cache-mutating shell preview branch are removed. Direct Rust
   CLI tests and the dispatcher/package contracts pass. The no-caller event adapter remains only in
-  the development bridge inventory until B3 removes legacy package artifacts together.
+  the development bridge inventory; the exact Rust-only stage excludes it and every other declared
+  bridge-only artifact.
 - Keep status honest: distinguish desired, observed, verification, degraded, and recovery-pending
   state.
 
@@ -356,6 +359,9 @@ Exit: all supported runtime and diagnostic commands work with only `fluxd` plus 
   and override tamper detection. Isolated shell tests prove fresh placement, fail-closed reinstall,
   daemon-only recovery, and the five-failure restart bound; profile status remains
   `failing-until-complete`.
+- **B3.4 complete 2026-07-26:** full repository CI, the exact shell matrix, the pinned ARM64 release
+  build with four `0x4000` `LOAD` segments, and the rooted x86_64 WSA mechanism checkpoint pass.
+  Active documentation is reconciled; physical ARM64 C1/C2 remains the next authority boundary.
 - Preserve frozen oracle fixtures under tests only as long as they add differential value; they are
   not staged into the module.
 
@@ -540,8 +546,9 @@ The list below is the working order. Items with the same prefix may run in paral
    of the packaged updater oracle.
 7. `P0-B2` **Done 2026-07-26:** Rust owns direct control, observation, diagnostics, offline cleanup,
    and uninstall delegation; the forwarding wrapper and shell preview path are removed.
-8. `P0-B3` Remove `jq`, legacy configs, runtime scripts, and `addrsyncd` from the package profile;
-   enforce 16 KB-compatible Android ELF alignment.
+8. `P0-B3` **Structural gate done 2026-07-26:** the exact Rust-only stage excludes `jq`, legacy
+   configs, runtime scripts, and `addrsyncd`, and enforces 16 KB-compatible Android ELF alignment.
+   Keep it non-releasable until the physical-device and writer-cutover gates pass.
 9. `P0-C1` Bind one physical Android 5.10/ARM64 device profile.
 10. `P0-C2` Complete mark/RPDB/topology authority for that exact target.
 11. `P0-C3` Pass functional, VPN/netd, dual-stack, tethering, and cleanup qualification.

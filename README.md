@@ -312,7 +312,8 @@ non-root traversal of the private snapshot store is not yet supported. A valid c
 outside those bridge limits fails preparation instead of being silently narrowed. The shell
 validates the exact 41-field environment allowlist and may append only observed `KFEAT_*` values.
 `scripts/updater.sh` is never invoked; it, `settings.ini`, and `jq` remain packaged only for frozen
-bridge comparison or explicit legacy rollback until B3 removes them.
+bridge comparison or explicit legacy rollback. The exact Rust-only stage excludes them now; the
+development bridge retains them until the fenced Gate 1 writer transfer.
 
 ### Routing marks and compatibility
 
@@ -367,7 +368,9 @@ are in [`docs/development.md`](docs/development.md). `cargo xtask verify-package
 checks the temporary hybrid stage and always labels a pass development-only. The separate
 `--profile rust-only` gate already requires the final 13-path inventory and forbids standalone
 `addrsyncd`, `jq`, both legacy configuration files, and all current runtime scripts, but remains
-explicitly `failing-until-complete`. Neither profile can bypass ADR-0011, trusted physical-device
+explicitly `failing-until-complete`. It selects two minimal tracked installer/watchdog sources,
+enforces the no-networking-policy glue contract, and refuses an existing runtime root rather than
+migrating bridge state in shell. Neither profile can bypass ADR-0011, trusted physical-device
 evidence, immutable provenance/hashes, SBOM/license binding, pinned build metadata, checksums, or the
 no-kernel-payload policy.
 

@@ -287,13 +287,15 @@ operations in unsafe functions and undocumented unsafe blocks. Standard Linux CI
 requires both the disposable non-capture topology checkpoint and a locked Rust workspace
 advisory/license/source policy using a digest-pinned cargo-deny binary. The subsequent explicit
 38-file/264-block unsafe review corrected zero process-signal targets and records module-level
-contracts plus re-audit triggers. These gates do not replace the missing production-composition
-test, parser fuzzing/sanitizer applicability, or final package SBOM and provenance review.
+contracts plus re-audit triggers. CI now also requires a bounded deterministic parser-fuzz smoke
+across netlink and socket-diagnostics decoders. These gates do not replace the missing
+production-composition test, retained crash corpus, branch-coverage/sanitizer applicability, or
+final package SBOM and provenance review.
 
 Recommendation: make one privileged real-composition namespace job required before cutover; add
-bounded fuzz smoke tests for exposed parsers and coverage visibility; complete package-wide SBOM,
-license, provenance, and reproducibility evidence; keep physical-device evidence payload-bound and
-separate.
+retain any future parser crash corpus and add coverage/sanitizer visibility; complete package-wide
+SBOM, license, provenance, and reproducibility evidence; keep physical-device evidence payload-bound
+and separate.
 
 ### P1. Complexity Is Concentrated In Several Very Large Modules
 

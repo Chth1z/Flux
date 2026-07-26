@@ -237,6 +237,29 @@ fn decoder_rejects_framing_terminal_and_transaction_ambiguity() {
 }
 
 #[test]
+fn deterministic_arbitrary_datagrams_never_panic() {
+    const CASES: usize = 4_096;
+    const MAX_LENGTH: usize = 768;
+
+    let mut state = 0x5e8d_2a41_7c93_b06f_u64;
+    for case in 0..CASES {
+        let length = (next_random(&mut state) as usize) % (MAX_LENGTH + 1);
+        let mut datagram = vec![0_u8; length];
+        for byte in &mut datagram {
+            *byte = next_random(&mut state) as u8;
+        }
+
+        for spec in DumpSpec::all() {
+            let outcome = std::panic::catch_unwind(|| decoder(spec).decode_datagram(&datagram));
+            assert!(
+                outcome.is_ok(),
+                "socket-diagnostics decoder panicked for deterministic case {case} ({spec:?})"
+            );
+        }
+    }
+}
+
+#[test]
 fn decoder_rejects_unconnected_udp_missing_cookie_and_malformed_attributes() {
     let udp = DumpSpec {
         address_family: InetSocketAddressFamily::Ipv4,
@@ -708,6 +731,13 @@ fn netlink_message(
     message[12..16].copy_from_slice(&port_id.to_ne_bytes());
     message[16..length].copy_from_slice(payload);
     message
+}
+
+fn next_random(state: &mut u64) -> u64 {
+    *state = state
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(1_442_695_040_888_963_407);
+    *state
 }
 
 fn snapshot_with(sockets: Vec<InetSocketDiagnostic>) -> ProcessSocketDiagnostics {

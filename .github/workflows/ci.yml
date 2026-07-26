@@ -48,6 +48,8 @@ jobs:
       - run: cargo xtask ci
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+      - name: Run bounded deterministic parser fuzz smoke
+        run: cargo xtask test-parser-fuzz-smoke
       - name: Test required disposable namespace topology
         run: cargo xtask test-functional-canary-linux
         env:

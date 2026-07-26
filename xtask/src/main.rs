@@ -84,6 +84,15 @@ const LINUX_CANARY_TEST: &str = "functional_canary::linux_namespace_harness::pri
 const LINUX_TPROXY_CANARY_TEST: &str = "functional_canary::linux_namespace_harness::privileged_ingress_tproxy_checkpoint_exercises_real_capture_counters_and_cleanup";
 const LINUX_OUTPUT_TPROXY_CANARY_TEST: &str = "functional_canary::linux_namespace_harness::privileged_local_output_tproxy_checkpoint_exercises_loopback_reinjection_and_cleanup";
 const LINUX_OUTPUT_UID_PREFLIGHT_TEST: &str = "functional_canary::linux_namespace_harness::privileged_local_output_distinct_uid_capability_preflight";
+const PARSER_FUZZ_SMOKE_TESTS: [&str; 7] = [
+    "address_sync::tests::deterministic_arbitrary_datagrams_never_panic",
+    "netlink::link::tests::deterministic_arbitrary_datagrams_never_panic",
+    "netlink::route::tests::deterministic_arbitrary_datagrams_never_panic",
+    "netlink::rule::tests::deterministic_arbitrary_datagrams_never_panic",
+    "netlink::route::tests::complex_route_prefixes_and_structured_mutations_are_atomic_and_panic_free",
+    "netlink::rule::tests::complex_rule_prefixes_and_structured_mutations_are_atomic_and_panic_free",
+    "socket_diagnostics::tests::deterministic_arbitrary_datagrams_never_panic",
+];
 const LINUX_CANARY_INTERNAL_ENVS: [&str; 17] = [
     "FLUX_LINUX_CANARY_HARNESS_MODE",
     "FLUX_LINUX_CANARY_HARNESS_CONFIG",
@@ -172,6 +181,10 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
             require_no_arguments(&arguments)?;
             test_functional_canary_linux_output_preflight()
         }
+        "test-parser-fuzz-smoke" => {
+            require_no_arguments(&arguments)?;
+            test_parser_fuzz_smoke()
+        }
         "test-functional-canary-android-x86_64-output-tproxy" => {
             android_canary::run(android_canary::parse_options(&arguments)?)
         }
@@ -222,6 +235,26 @@ fn test_functional_canary_linux_output_tproxy() -> Result<(), String> {
 
 fn test_functional_canary_linux_output_preflight() -> Result<(), String> {
     test_linux_canary(LINUX_OUTPUT_UID_PREFLIGHT_TEST)
+}
+
+fn test_parser_fuzz_smoke() -> Result<(), String> {
+    for test in PARSER_FUZZ_SMOKE_TESTS {
+        cargo(
+            [
+                "test",
+                "-p",
+                "flux-platform",
+                "--lib",
+                test,
+                "--",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ],
+            &[],
+        )?;
+    }
+    Ok(())
 }
 
 fn test_linux_canary(test_name: &str) -> Result<(), String> {
@@ -2684,6 +2717,7 @@ fn print_help() {
            test-functional-canary-linux-tproxy  Run the ingress-only Linux TPROXY checkpoint\n\
            test-functional-canary-linux-output-tproxy  Run the local-OUTPUT loopback TPROXY checkpoint\n\
            test-functional-canary-linux-output-preflight  Preflight distinct local-OUTPUT credentials (no traffic)\n\
+           test-parser-fuzz-smoke  Run bounded deterministic parser no-panic smoke tests\n\
            test-functional-canary-android-x86_64-output-tproxy  Cross-build and run the exact checkpoint on one explicit rooted x86_64 Android serial\n\
            preflight-android-arm64-mark-ordering  Read-only ADR-0013 target viability report for one explicit rooted ARM64 Android serial\n\
            xtables-oracle Verify or explicitly update pinned shell-generated restore fixtures; requires --check or --update\n\

@@ -569,8 +569,9 @@ Items 5-8 continue when items 9-11 are hardware-blocked.
 1. Require privileged production-composition tests in CI.
 2. **Dependency and unsafe-boundary assurance complete 2026-07-26:** the locked root workspace has
    a required advisory/license/source gate, and all 264 unsafe blocks in root-workspace targets have
-   an explicit semantic audit with re-audit triggers. Add parser fuzzing and coverage visibility;
-   resolve the excluded bridge license only if that code will be reused or shipped.
+   an explicit semantic audit with re-audit triggers. A bounded deterministic parser-fuzz smoke is
+   now required in CI; add coverage visibility, a retained crash corpus, and sanitizer applicability
+   evidence. Resolve the excluded bridge license only if that code will be reused or shipped.
 3. Qualify the second maintained Android kernel/vendor profile and every advertised root framework.
 4. Capture final resource/performance baselines and chaos evidence.
 5. Complete SBOM, source/hash/license, build metadata, reproducibility/signing, migration, and

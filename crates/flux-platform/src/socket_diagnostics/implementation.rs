@@ -69,6 +69,11 @@ impl DumpSpec {
         },
     ];
 
+    #[cfg(test)]
+    pub(super) const fn all() -> [Self; 4] {
+        Self::ALL
+    }
+
     const fn family_number(self) -> u8 {
         match self.address_family {
             InetSocketAddressFamily::Ipv4 => libc::AF_INET as u8,

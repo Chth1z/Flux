@@ -1176,3 +1176,35 @@ It does not yet validate the production Rust composition because that compositio
   breach or baseline smell after the unsafe-census correction; the Spec axis found no missing R3
   requirement, scope creep, or authority-boundary regression. The only prior findings (the missed
   unsafe callback and off-by-one census scope) are corrected and reconciled in the audit.
+
+## P1-R4 Deterministic Parser Fuzz Smoke (2026-07-26)
+
+- The workspace already has four deterministic arbitrary-datagram no-panic tests: rtnetlink
+  address, link, route, and rule decoders. Each generates 4,096 fixed-seed cases up to 512 or 768
+  bytes and catches unwinding. Route and rule also mutate every byte of a valid structured fixture
+  and test every prefix for atomic, panic-free behavior.
+- Socket-diagnostics has strong valid/malformed framing tests but no arbitrary-input no-panic loop.
+  R4 adds one across all four IPv4/IPv6 TCP/UDP `DumpSpec` variants with the same bounded fixed-seed
+  model.
+- The planned CI command will run seven exact tests: the four arbitrary datagram suites, the new
+  socket-diagnostics suite, and the two structured route/rule mutation suites. This is deterministic
+  parser smoke evidence, not a libFuzzer/AFL corpus, coverage result, sanitizer result, or Android
+  qualification.
+- R4 implementation adds `cargo xtask test-parser-fuzz-smoke` and a required hosted-workflow step.
+  It does not add a production dependency or change `Cargo.lock`; the command runs each exact test
+  in one thread with bounded output and preserves the normal workspace test behavior.
+- Focused verification passed the new socket-diagnostics test and the complete seven-test command.
+  The first compile attempt correctly failed on private `DumpSpec::ALL`; the test now uses a local
+  four-variant array, preserving implementation visibility. No runtime API or dependency changed.
+
+- The final `TMPDIR=/tmp cargo xtask ci` returned exit code 0. Strict all-target/all-feature
+  `flux-platform` Clippy, the required disposable Linux namespace canary, and the exact seven-test
+  parser smoke were rerun after the accessor refinement and all passed.
+- Repository formatting, diff integrity, structured workflow ordering, unchanged `Cargo.lock`, the
+  38-file/264-block/267-annotation unsafe census, the production `ProcessRuntimeWriter` fence, and
+  the high-confidence secret scan passed. Standards and Spec fixed-point review found no actionable
+  R4 issue or scope creep.
+- The workflow step is locally parsed and exercised but has no hosted-runner result while this
+  branch remains unpushed. Deterministic smoke still does not provide a retained fuzz corpus,
+  branch coverage, sanitizer evidence, Android/ARM64 qualification, production composition, or
+  Rust-only writer authority.

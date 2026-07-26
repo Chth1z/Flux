@@ -1545,3 +1545,71 @@ not confuse lint annotations or block counts with soundness evidence.
 primary-source binding, full local gate, required namespace checkpoint, and x86_64 WSA callback
 probe are complete. Final link/security checks pass and the fixed-point Standards/Spec review found
 no actionable issue. The scoped local checkpoint is ready to commit locally without pushing.
+
+## Execution: P1-R4 Deterministic Parser Fuzz Smoke
+
+### Goal
+Promote the existing bounded arbitrary-datagram no-panic checks into an explicit required CI
+checkpoint, add equivalent coverage for the socket-diagnostics decoder, and keep the evidence
+honest about the absence of a coverage corpus, sanitizer, or physical-device qualification.
+
+### Phases
+- [x] R4.1: Inventory parser fuzz-like tests and freeze the exact seven-test smoke contract.
+- [x] R4.2: Add the socket-diagnostics arbitrary-input test, `xtask` command, and required workflow
+  step without adding a runtime or fuzzing dependency.
+- [x] R4.3: Reconcile development/roadmap/review documentation and record the remaining fuzz,
+  coverage, sanitizer, and device limits.
+- [x] R4.4: Run focused/full verification, perform Standards/Spec review, and create a scoped local
+  checkpoint commit without pushing.
+
+### Decisions
+- Use deterministic fixed-seed generators already present in the parser tests; each selected test
+  remains bounded and reproducible, and `catch_unwind` proves malformed bytes do not panic.
+- Include address, link, route, rule, socket-diagnostics, and the two structured route/rule mutation
+  suites. Do not call this a libFuzzer/AFL corpus or claim branch coverage.
+- Keep the production dependency graph and `Cargo.lock` unchanged. A future native fuzzer can
+  consume these contracts separately after toolchain/sanitizer applicability is established.
+- Require the smoke in hosted CI while leaving privileged TPROXY, production composition, physical
+  ARM64 C1/C2, and Rust-only writer authority on their existing gates.
+
+### Errors Encountered
+- The first socket-diagnostics smoke test tried to read the implementation-private `DumpSpec::ALL`
+  constant from its sibling test module. The crate did not compile and no test ran; keep the
+  production visibility unchanged and use an explicit local four-variant test array.
+
+### Verification
+- Focused `cargo test -p flux-platform --lib
+  socket_diagnostics::tests::deterministic_arbitrary_datagrams_never_panic -- --exact` passed.
+- `cargo xtask test-parser-fuzz-smoke` passed all seven exact tests: four 4,096-case arbitrary
+  datagram suites, two structured route/rule mutation suites, and the four-family socket-
+  diagnostics smoke. The implementation-private `DumpSpec::ALL` was not widened for tests.
+
+- Fresh `TMPDIR=/tmp cargo xtask ci` returned exit code 0, including workspace checks/tests,
+  documentation tests, strict workspace Clippy, and the pinned Android/API-31 cross-check.
+- Strict `cargo clippy -p flux-platform --all-targets --all-features -- -D warnings
+  -D clippy::undocumented_unsafe_blocks` passed after the final accessor refinement. Required-mode
+  `FLUX_LINUX_CANARY_REQUIRED=1 cargo xtask test-functional-canary-linux` passed the disposable
+  dual-stack topology/cleanup test with 298 filtered tests.
+- `cargo fmt --all -- --check`, `git diff --check`, structured workflow parsing, the unchanged
+  `Cargo.lock` check, the 38-file/264-block/267-annotation census, the production writer fence, and
+  the high-confidence secret scan passed. No `NativeRuntimeWriter` production selection was added.
+
+### Fixed-Point Review
+- Standards axis: pass. The seven-test contract is explicit, bounded, deterministic, and named in
+  one `xtask` constant; the test-only `DumpSpec::all()` accessor does not widen production
+  visibility. The workflow, Rust formatting, lint, and documentation conventions are preserved;
+  no actionable baseline smell or undocumented-standard breach remains in the R4 diff.
+- Spec axis: pass. R4.1-R4.3 are implemented and the required workflow checkpoint invokes exactly
+  the seven documented tests. The documentation states the deterministic-smoke limits and keeps
+  coverage, corpus, sanitizer, Android/ARM64, production-composition, and writer-authority claims
+  separate. No runtime dependency, `Cargo.lock` entry, public API, or release authority changed.
+- The local workflow contract and command pass are recorded; a GitHub-hosted execution remains
+  unclaimed because this branch has not been pushed.
+
+### Status
+**R4.4 complete on 2026-07-26** - the seven-test command, socket-diagnostics arbitrary-input
+coverage, required workflow step, full local CI, focused lint/canary reruns, workflow/security
+scans, and the fixed-point Standards/Spec review all pass. The scoped local checkpoint is ready to
+commit without pushing; hosted workflow evidence and the previously documented fuzz corpus,
+coverage, sanitizer, physical ARM64, production-composition, and Rust-only writer gates remain
+open.

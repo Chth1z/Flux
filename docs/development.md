@@ -88,6 +88,24 @@ kernel-returned length, child identity, or signal target changes. A passing lint
 do not qualify physical ARM64, authorize `NativeRuntimeWriter`, replace parser fuzzing/sanitizers,
 or satisfy final package provenance.
 
+## Deterministic parser fuzz smoke
+
+The host CI job requires a bounded, reproducible malformed-input smoke for the root netlink and
+socket-diagnostics decoders:
+
+```text
+cargo xtask test-parser-fuzz-smoke
+```
+
+The command runs seven exact `flux-platform` library tests. Four generate 4,096 fixed-seed arbitrary
+datagrams for address/link/route/rule decoders; route and rule additionally test every prefix and
+single-byte mutation of a valid structured fixture; the socket-diagnostics test runs the same
+4,096 cases across IPv4/IPv6 TCP/UDP dump specifications. Each case is bounded and wrapped in
+`catch_unwind`, so a panic or unexpected process abort fails the job. This is deterministic parser
+smoke evidence only: it is not a libFuzzer/AFL corpus, a branch-coverage result, a sanitizer run,
+or Android/ARM64 qualification. Keep any future crash reproducer as a checked-in test before
+expanding the generator or adding a native fuzzing toolchain.
+
 The focused Phase 3 Android mark-authority model can be exercised with:
 
 ```text

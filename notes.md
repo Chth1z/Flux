@@ -89,8 +89,9 @@ runtime, and completing more detached evidence types would not close the ownersh
 - CI also runs shell configuration/installer/rule/dispatcher/CLI suites and a pinned xtables oracle.
 - Critical privileged Linux canaries are ignored by ordinary workspace tests and are not required
   by `cargo xtask ci`.
-- No committed fuzz target, coverage gate, dependency-vulnerability gate, or sanitizer/Miri job was
-  found, despite several roadmap fuzzing and hardening commitments.
+- At the 2026-07-23 review baseline, no committed fuzz target, coverage gate,
+  dependency-vulnerability gate, or sanitizer/Miri job was found despite several roadmap fuzzing
+  and hardening commitments. P1-R2 later closes the root Rust workspace dependency gate only.
 
 The suite strongly validates pure models, parsers, lifecycle state machines, and fault injection.
 It does not yet validate the production Rust composition because that composition does not exist.
@@ -1029,3 +1030,36 @@ It does not yet validate the production Rust composition because that compositio
 - No GitHub-hosted runner execution is claimed for the unpushed workflow change. That evidence can
   exist only after the local commit is pushed or otherwise run on the hosted workflow; it is not a
   reason to weaken the required-mode failure contract locally.
+
+## P1-R2 Rust Dependency Assurance (2026-07-26)
+
+- Primary cargo-deny 0.20.2, RustSec, crates.io, and action sources are recorded in
+  `docs/research/rust-dependency-assurance-2026-07.md`. The selected upstream musl archive is
+  4,936,832 bytes and matched SHA-256
+  `9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f`.
+- The all-feature locked graph contains 113 packages: five workspace paths, 108 crates.io packages,
+  and zero Git packages. With RustSec database commit
+  `29638ff054fdbb83d2844240f7ef7e576cb52629`, advisories and sources passed immediately.
+- The first license policy rejected only the five GPL-3.0-only Flux members and exact
+  `webpki-roots 1.0.9` under CDLA-Permissive-2.0. The final deny-by-default policy allows the project
+  license and constrains CDLA to that exact root-certificate data version; the complete policy then
+  passed advisories, licenses, and sources without changing `Cargo.lock`.
+- CI downloads the exact cargo-deny release rather than using its official Docker action, whose
+  pinned Dockerfile does not verify the downloaded archive. The parsed checked-in workflow step
+  passed end to end in a disposable Cargo home: checksum verification, extraction, live advisory
+  refresh, locked metadata, and all three policy checks succeeded.
+- A hostile run replaced the expected digest with 64 zeroes. `sha256sum --check --strict` rejected
+  the archive before extraction, and no cargo-deny binary appeared under the temporary extraction
+  root.
+- This gate covers only the root workspace. The excluded `addrsyncd` bridge remains `UNLICENSED`
+  and is forbidden by the Rust-only package; no workspace audit result is bridge-license approval,
+  final package SBOM evidence, or reproducible-build evidence.
+- Final `TMPDIR=/tmp cargo xtask ci` passed all workspace, documentation, strict Clippy, and pinned
+  ARM64/API-31 cross-check gates. The required Linux topology checkpoint also passed one exact test
+  with 298 filtered.
+- Workflow/TOML contract parsing, extracted-step Bash syntax, repository rustfmt, diff integrity,
+  local research-index binding, stale-status wording, and the high-confidence secret scan passed.
+  All ten new primary-source URLs returned HTTP 200, and the complete fixed-point diff was reviewed
+  on both Standards and Spec axes before staging.
+- No hosted-workflow execution is claimed for the uncommitted R2 change. The live RustSec refresh is
+  deliberately time-sensitive and may expose a new required failure when the hosted job first runs.

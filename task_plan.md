@@ -1395,3 +1395,68 @@ Android qualification.
 **Local P1-R1 checkpoint complete on 2026-07-26** - the required host topology step and pidfd test
 correction are verified and ready for the local checkpoint commit. Physical ARM64 C1/C2 and the
 first GitHub-hosted execution of the new required step remain external evidence, not local claims.
+
+## Execution: P1-R2 Rust Dependency Assurance
+
+### Goal
+Add a required, pinned advisory/license/source policy for the root Rust workspace dependency
+graph without adding a production dependency or misrepresenting the excluded `addrsyncd`
+development bridge as release-license-approved.
+
+### Phases
+- [x] R2.1: Research the current RustSec/cargo-deny contracts and audit the exact locked workspace
+  graph with a temporary, pinned tool.
+- [x] R2.2: Freeze the smallest explicit advisory, license, and registry/source policy that the
+  current graph can satisfy without broad exceptions.
+- [x] R2.3: Integrate the policy into required CI and reconcile development/roadmap evidence and
+  the separate `addrsyncd` boundary.
+- [x] R2.4: Run focused and full verification, perform Standards/Spec review, and make
+  a scoped local checkpoint commit without pushing.
+
+### Decisions
+- Use primary RustSec and cargo-deny sources and pin every introduced CI/tool contract; do not rely
+  on an unversioned global installation.
+- Audit the root `Cargo.lock` and complete workspace graph. The excluded `addrsyncd` crate remains a
+  development-bridge artifact with `UNLICENSED` metadata and cannot be covered up by a workspace-
+  only pass; the Rust-only package already forbids its binary.
+- Do not add or update runtime dependencies merely to make the policy pass. Any advisory or license
+  finding must be evaluated explicitly before changing the graph or adding a narrow exception.
+
+### Errors Encountered
+- The first research-agent dispatch combined full-context inheritance with an explicit worker type,
+  which the collaboration tool rejects. No agent started and no file changed; retry the same bounded
+  one-file research task without full-context inheritance.
+- The first temporary cargo-deny run reached Cargo metadata but could not cache two Windows target
+  crates under the sandbox's read-only default Cargo home. No repository file changed; a task-local
+  Cargo home under `/tmp` retained the locked graph and allowed the audit inputs to download.
+- The first strict license run correctly rejected the five GPL-3.0-only workspace members and
+  `webpki-roots 1.0.9` under CDLA-Permissive-2.0. Add the project license to the global compatible
+  set and one exact-version CDLA exception; do not weaken deny-by-default license evaluation.
+- The pinned official cargo-deny action commit installs its release archive without checking a
+  digest. Do not use that Docker action for Flux; download the same upstream 0.20.2 musl archive in
+  the workflow, require its published SHA-256, and execute only after verification.
+
+### Verification
+- The pinned cargo-deny 0.20.2 archive matched its published SHA-256. The all-feature locked graph
+  contains 113 packages (five workspace, 108 crates.io, zero Git), and the final checked-in policy
+  passed advisories, licenses, and sources against RustSec commit
+  `29638ff054fdbb83d2844240f7ef7e576cb52629` with no advisory ignore.
+- The exact dependency workflow step was parsed from YAML and executed in a disposable Cargo home.
+  Download, strict checksum verification, extraction, live advisory refresh, locked metadata, and
+  all three policy checks passed. Replacing the expected digest with 64 zeroes failed before
+  extraction and left no cargo-deny binary under the temporary root.
+- `TMPDIR=/tmp cargo xtask ci` passed workspace checks/tests, documentation tests, strict Clippy,
+  and the pinned ARM64/API-31 Android cross-check. `fluxd` reported 295 passed with four privileged
+  ignores; `xtask` reported 44 passed with four intentional fixture ignores.
+- The separately required topology checkpoint passed one exact disposable dual-stack test with 298
+  filtered. Workflow/TOML contract parsing, Bash syntax, repository rustfmt, `git diff --check`, the
+  scoped stale-status/secret scans, and the new local research-index target passed.
+- All ten new primary-source URLs returned HTTP 200. Fixed-point Standards and Spec review found no
+  scope creep, baseline smell, policy broadening, runtime dependency change, lockfile change, or
+  false bridge/package authority claim.
+
+### Status
+**Local P1-R2 checkpoint complete on 2026-07-26** - the root Rust workspace dependency policy and
+digest-pinned required CI step are verified and ready for the local checkpoint commit. The first
+GitHub-hosted run remains external evidence; `addrsyncd` licensing, package SBOM/provenance,
+reproducible builds, explicit unsafe review, fuzzing, and coverage remain open.

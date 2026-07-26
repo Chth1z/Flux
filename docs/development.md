@@ -20,6 +20,7 @@ initialization or runtime path references or invokes it. The exact Rust-only sta
 - Development checkpoint target: `x86_64-linux-android` (test-only; never packaged).
 - Android API level: 31.
 - Release-link NDK: revision `27.3.13750724` (NDK r27d).
+- Dependency policy tool: cargo-deny `0.20.2`.
 
 The root [`rust-toolchain.toml`](../rust-toolchain.toml) installs the Rust components and Android
 standard library. The subscription TLS graph includes `ring`, whose Android build script compiles C
@@ -44,6 +45,27 @@ cargo xtask ci
 Set `ANDROID_NDK_HOME` or `ANDROID_NDK_ROOT` to NDK `27.3.13750724` before running
 `check-android`, `build-android`, or `ci`. `cargo xtask ci` runs formatting, host checks/tests,
 Clippy with warnings denied, and the pinned-NDK Android cross-check for the new workspace.
+
+## Rust dependency assurance
+
+The standard Linux workflow separately requires the root workspace advisory, license, and source
+policy because it refreshes network-owned RustSec data and is not part of portable `cargo xtask ci`:
+
+```text
+cargo deny --manifest-path Cargo.toml --config deny.toml --all-features --locked \
+  check advisories licenses sources
+```
+
+Use cargo-deny `0.20.2`. CI downloads the official x86_64 Linux musl archive and requires SHA-256
+`9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f` before execution. The
+policy denies vulnerable/unsound advisories, yanked packages, unknown registries, Git dependencies,
+and license expressions outside the explicit compatible set. A new advisory may therefore fail CI
+without a repository change; review the advisory rather than weakening the required gate.
+
+This command covers the root workspace lockfile, including development and target-specific
+dependencies. It does not cover the excluded `addrsyncd` development bridge, whose manifest remains
+`UNLICENSED`; the Rust-only package forbids that binary, and a passing workspace audit is not
+release-license approval for the bridge or a replacement for the final package SBOM.
 
 The focused Phase 3 Android mark-authority model can be exercised with:
 

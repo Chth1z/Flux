@@ -495,8 +495,10 @@ release; final qualification follows.
 - Fuzz targets for TOML/JSON/control/subscription inputs and netlink/xtables readback parsers, with a
   bounded CI smoke run and retained crash corpus.
 - Unsafe operations in unsafe functions and undocumented unsafe blocks are denied workspace-wide
-  through the standard strict Clippy gate. Dependency vulnerability/license audit, explicit unsafe
-  boundary review, and reproducible build/provenance checks remain required.
+  through the standard strict Clippy gate. The locked root workspace advisory/license/source policy
+  is also required in standard Linux CI with a digest-pinned cargo-deny binary. Explicit unsafe
+  boundary review and reproducible build/provenance checks remain required; the workspace audit does
+  not approve the excluded `addrsyncd` bridge license or replace the final package SBOM.
 
 ### Required Android Set
 
@@ -563,7 +565,9 @@ Items 5-8 continue when items 9-11 are hardware-blocked.
 ### P1: Release Assurance
 
 1. Require privileged production-composition tests in CI.
-2. Add parser fuzzing, dependency/license audit, unsafe review, and coverage visibility.
+2. **Dependency assurance complete 2026-07-26:** the locked root workspace now has a required
+   advisory/license/source gate. Add parser fuzzing, explicit unsafe review, and coverage visibility;
+   resolve the excluded bridge license only if that code will be reused or shipped.
 3. Qualify the second maintained Android kernel/vendor profile and every advertised root framework.
 4. Capture final resource/performance baselines and chaos evidence.
 5. Complete SBOM, source/hash/license, build metadata, reproducibility/signing, migration, and

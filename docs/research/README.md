@@ -101,6 +101,12 @@ including redirect, timeout, compression, encoded/decoded size, proxy-environmen
 cross-build, licensing, and RustSec constraints. It recommends exact `ureq 3.3.0` with Rustls,
 pending explicit production-dependency approval.
 
+### [Rust dependency assurance for P1-R2 (2026-07)](rust-dependency-assurance-2026-07.md)
+
+Pins cargo-deny, RustSec, the exact locked workspace graph, its allowed license expressions, and
+the one version-scoped root-certificate data exception. It defines a digest-verified required CI
+gate while keeping the excluded `addrsyncd` bridge outside any release-license claim.
+
 ## Cloned source families
 
 - AOSP: `system/netd`, `packages/modules/Connectivity`, `frameworks/base`, `system/core`, `system/sepolicy`, `kernel/configs`, `external/iptables`.

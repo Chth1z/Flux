@@ -1541,3 +1541,19 @@ It does not yet validate the production Rust composition because that compositio
   Android cross-check.
 - This proves host cross-compilation mechanics only. No ARM64 device ran the artifact, and no C1-C3,
   Gate 1, R4-R6, runtime page-size, coexistence, or release authority changed.
+
+## Physical ARM64 C1 Viability (2026-07-27)
+
+- Tracked alias: `physical-arm64-01`; the hardware serial is deliberately excluded from tracked
+  notes. The exact target is ARM64, Android API 36, Linux 5.15.207, 4 KiB pages, SELinux Enforcing,
+  and rooted through a confined KernelSU domain in PID 1's network namespace.
+- The phone already contains the Flux bridge under `/data/adb/flux`; `addrsyncd` and Sing-Box were
+  live at discovery. Read-only qualification did not stop, signal, replace, or inspect unrelated
+  application/user data. No stale Flux canary directory existed below `/data/local/tmp`.
+- The explicit-serial checked-in ARM64 mark-ordering preflight returned exit 0 with
+  `viable_for_full_qualification`. Both families reported the same three incoming interfaces, mask
+  `0x7fefffff`, one exact INPUT reference, zero unknown child rules, readable platform artifacts,
+  complete verified-boot inputs, and no blocking reasons.
+- This is C1 viability, not C2 authority. Runtime artifact authentication, exact hook/route order,
+  a complete 27-cell mark census, listener/observer preservation, VPN/netd coexistence, functional
+  traffic, failure injection, and cleanup evidence remain open before Gate 1.

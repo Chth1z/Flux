@@ -2003,3 +2003,72 @@ preserving the pinned NDK/API/linker contract and all device-qualification bound
 **Complete on 2026-07-27** - all `xtask` Android Cargo children own the same Linux host temp
 directory and the complete local CI gate passes without caller setup. This is host-build evidence
 only; the physical ARM64 and R4-R6 authority boundaries are unchanged.
+
+## Execution: Physical ARM64 Qualification And Secure Cleanup (2026-07-27)
+
+### Goal
+Qualify one exact rooted physical ARM64 target through C1-C3 and Gate 1 only when each predecessor
+passes, while preserving the device's user data, platform security state, foreign networking state,
+and a verified clean post-test baseline.
+
+### Security Boundaries
+- Address one explicit ADB serial in every command; never broadcast to all connected devices.
+- Complete read-only identity and topology collection before any push, process launch, namespace,
+  rule, route, or temporary-directory mutation.
+- Do not reboot, unlock, flash, remount system partitions, change SELinux, alter persistent settings,
+  load/unload kernel modules, install packages, or inspect unrelated app/user data.
+- Push only repository-built test artifacts into unique owner-only paths below `/data/local/tmp`;
+  verify identity before execution and remove the exact paths afterward.
+- Snapshot only the bounded kernel/network facts required by the checked-in qualification contract.
+  Do not collect broad `logcat`, application databases, credentials, tokens, or personal files.
+- After every mutating checkpoint, terminate owned processes, remove owned namespaces/rules/routes/
+  chains/files, independently prove their absence, and compare the required baseline facts.
+- A failed cleanup stops all further mutation. WSA, cross-builds, or a partial physical-device pass
+  cannot authorize C1-C3, Gate 1, writer transfer, script deletion, or package promotion.
+
+### Phases
+- [x] Q0: Confirm a clean repository, resolve one exact ARM64 serial, inventory host/device entry
+  facts read-only, and identify the repository-owned cleanup contracts.
+- [x] Q1: Run the explicit-serial read-only ARM64 mark-ordering preflight and evaluate C1 viability.
+- [ ] Q2: If Q1 passes, collect and validate the complete C2 mark/RPDB/topology authority without
+  retaining raw unrelated device data.
+- [ ] Q3: If C2 authority is complete, run bounded C3 functional/coexistence checkpoints with
+  per-checkpoint cleanup and final baseline comparison.
+- [ ] Q4: Only after C1-C3 pass on the same bound target, execute the reviewed Gate 1 writer-transfer
+  series, verify rollback/cleanup, and commit each ownership boundary separately.
+
+### Decisions
+- Use the repository's checked-in `xtask` entry points and exact tests rather than ad hoc live
+  mutation. Stop when the next gate lacks an implemented safe runner or required evidence.
+- Treat device disconnect, boot/namespace drift, root loss, baseline drift, or cleanup uncertainty as
+  a hard failure requiring re-observation before any retry.
+- Refer to the physical target as `physical-arm64-01` in tracked notes. Do not commit its hardware
+  serial; retain exact boot/profile facts only inside bounded qualification evidence that requires
+  them.
+- The existing installed Flux bridge remains live during read-only qualification. Do not stop its
+  `addrsyncd` or Sing-Box processes until a reviewed Gate 1 transition owns rollback and cleanup.
+
+### Q0-Q1 Evidence
+- Exactly one physical target and one WSA target were connected. Explicit-serial checks bound
+  `physical-arm64-01` as ARM64, API 36, Linux 5.15.207, 4 KiB pages, SELinux Enforcing, rooted through
+  a confined KernelSU domain, with root and PID 1 in the same network namespace.
+- No stale `/data/local/tmp/flux-output-tproxy.*` directory was present. An existing
+  `/data/adb/flux` bridge installation had live `addrsyncd` and Sing-Box processes, so C1 remained
+  read-only and did not disturb them.
+- `cargo xtask preflight-android-arm64-mark-ordering` completed with exit 0 and
+  `viable_for_full_qualification`. IPv4 and IPv6 each exposed one exact INPUT-chain reference,
+  three matching interface-scoped writers, mask `0x7fefffff`, zero unknown child rules, and no
+  blocking reason.
+- The report remains `diagnostic_only_no_authority_conversion` and explicitly defers runtime
+  artifact/source binding, exact hook/route ordering, listener/observer mark preservation, and
+  VPN/netd coexistence. Q1 therefore authorizes investigation of Q2, not mutation or writer transfer.
+
+### Errors Encountered
+- One read-only remote `for` loop used an Android `su -c` argument shape that lost its loop body and
+  returned `syntax error: unexpected 'do'`. It performed no mutation. Exact single-process `pidof`
+  queries replaced it and established the existing bridge process baseline.
+
+### Status
+**Q2 in progress** - C1 viability is positive but no live complete census or one-shot Android
+planning-authority adapter exists yet. Inspect and implement that bounded path before any device
+mutation; preserve the existing bridge until Gate 1.

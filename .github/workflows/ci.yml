@@ -35,7 +35,8 @@ jobs:
           scripts/lib scripts/flux-event scripts/rules
           tests/shell/config_installer_contract.sh
           tests/shell/rules_generation.sh tests/shell/run-dispatcher-tests.sh
-          tests/shell/run-installer-tests.sh
+          tests/shell/run-installer-tests.sh tests/shell/run-rust-only-glue-tests.sh
+          packaging/rust-only/customize.sh packaging/rust-only/flux_service.sh
       - name: Test installer and configuration contract
         run: sh tests/shell/config_installer_contract.sh
       - name: Test legacy rule generation semantics
@@ -54,6 +55,10 @@ jobs:
         run: >-
           sudo env "PATH=${PATH}" FLUX_INSTALLER_TESTS_REQUIRED=1
           sh tests/shell/run-installer-tests.sh
+      - name: Test Rust-only package glue
+        run: >-
+          sudo env "PATH=${PATH}" FLUX_RUST_ONLY_GLUE_TESTS_REQUIRED=1
+          sh tests/shell/run-rust-only-glue-tests.sh
       - name: Check legacy addrsyncd compatibility
         run: |
           cargo test --manifest-path addrsyncd/Cargo.toml

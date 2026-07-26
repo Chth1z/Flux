@@ -29,6 +29,8 @@ const RUST_ONLY_PLATFORM_GLUE_FILES: [&str; 4] = [
     "flux_service.sh",
     "uninstall.sh",
 ];
+const RUST_ONLY_SOURCE_OVERRIDE_DIR: &str = "packaging/rust-only";
+const RUST_ONLY_SOURCE_OVERRIDE_FILES: [&str; 2] = ["customize.sh", "flux_service.sh"];
 const MAX_PLATFORM_GLUE_SOURCE_BYTES: usize = 128 * 1024;
 const FORBIDDEN_PLATFORM_GLUE_EXECUTABLES: [(&str, &str); 16] = [
     ("networking mutation", "ip"),
@@ -808,55 +810,18 @@ fn stage_module(options: StageModuleOptions) -> Result<(), String> {
 
     build_android()?;
 
-    require_empty_stage(&options.stage)?;
-    for relative in &profile.required_files {
-        if relative.starts_with("bin/") {
-            continue;
-        }
-        copy_entry(&root.join(relative), &options.stage.join(relative))?;
-    }
-
-    for relative in profile
-        .required_files
-        .iter()
-        .filter(|relative| relative.starts_with("bin/") && relative.as_str() != "bin/fluxd")
-    {
-        let file_name = Path::new(relative)
-            .file_name()
-            .ok_or_else(|| format!("package binary path {relative} has no file name"))?;
-        copy_entry(
-            &options.runtime_binaries.join(file_name),
-            &options.stage.join(relative),
-        )?;
-    }
-
     let fluxd_source = root
         .join("target")
         .join(ANDROID_TARGET)
         .join("release")
         .join("fluxd");
-    if !fluxd_source.is_file() {
-        return Err(format!(
-            "Android build succeeded but {} is missing",
-            fluxd_source.display()
-        ));
-    }
-    let fluxd_target = options.stage.join("bin/fluxd");
-    if let Some(parent) = fluxd_target.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
-    }
-    fs::copy(&fluxd_source, &fluxd_target).map_err(|error| {
-        format!(
-            "cannot copy {} to {}: {error}",
-            fluxd_source.display(),
-            fluxd_target.display()
-        )
-    })?;
-
-    require_package_layout(&options.stage, profile)?;
-    reject_forbidden_profile_files(&options.stage, profile)?;
-    validate_staged_runtime_inventory(&options.stage, profile)?;
+    stage_module_from_artifacts(
+        &root,
+        &options.stage,
+        &options.runtime_binaries,
+        &fluxd_source,
+        profile,
+    )?;
 
     let status = match profile.status {
         PackageProfileStatus::DevelopmentOnly => "development-only",
@@ -873,6 +838,47 @@ fn stage_module(options: StageModuleOptions) -> Result<(), String> {
         options.stage.display(),
     );
     Ok(())
+}
+
+fn stage_module_from_artifacts(
+    root: &Path,
+    stage: &Path,
+    runtime_binaries: &Path,
+    fluxd_source: &Path,
+    profile: &PackageProfile,
+) -> Result<(), String> {
+    if !fluxd_source.is_file() {
+        return Err(format!(
+            "Android build succeeded but {} is missing",
+            fluxd_source.display()
+        ));
+    }
+
+    require_empty_stage(stage)?;
+    for relative in &profile.required_files {
+        if relative.starts_with("bin/") {
+            continue;
+        }
+        let source = authoritative_module_source_path(root, profile, relative);
+        copy_entry(&source, &stage.join(relative))?;
+    }
+
+    for relative in profile
+        .required_files
+        .iter()
+        .filter(|relative| relative.starts_with("bin/") && relative.as_str() != "bin/fluxd")
+    {
+        let file_name = Path::new(relative)
+            .file_name()
+            .ok_or_else(|| format!("package binary path {relative} has no file name"))?;
+        copy_entry(&runtime_binaries.join(file_name), &stage.join(relative))?;
+    }
+
+    copy_entry(fluxd_source, &stage.join("bin/fluxd"))?;
+
+    require_package_layout(stage, profile)?;
+    reject_forbidden_profile_files(stage, profile)?;
+    validate_staged_runtime_inventory(stage, profile)
 }
 
 fn verify_package(options: VerifyPackageOptions) -> Result<(), String> {
@@ -1415,7 +1421,7 @@ fn validate_source_bound_module_files(
     for relative in profile.required_files.iter().filter(|relative| {
         !relative.starts_with("bin/") && relative.as_str() != "conf/manifest.json"
     }) {
-        let source_path = source_root.join(relative);
+        let source_path = authoritative_module_source_path(source_root, profile, relative);
         let source_metadata = fs::symlink_metadata(&source_path)
             .map_err(|error| format!("cannot inspect {}: {error}", source_path.display()))?;
         if source_metadata.file_type().is_symlink() || !source_metadata.is_file() {
@@ -1437,6 +1443,22 @@ fn validate_source_bound_module_files(
         }
     }
     Ok(())
+}
+
+fn authoritative_module_source_path(
+    source_root: &Path,
+    profile: &PackageProfile,
+    relative: &str,
+) -> PathBuf {
+    if profile.name == PackageProfileName::RustOnly
+        && RUST_ONLY_SOURCE_OVERRIDE_FILES.contains(&relative)
+    {
+        source_root
+            .join(RUST_ONLY_SOURCE_OVERRIDE_DIR)
+            .join(relative)
+    } else {
+        source_root.join(relative)
+    }
 }
 
 fn reject_forbidden_profile_files(stage: &Path, profile: &PackageProfile) -> Result<(), String> {
@@ -1467,14 +1489,12 @@ fn validate_module_content(stage: &Path, profile: &PackageProfile) -> Result<(),
         "flux_service.sh",
         "uninstall.sh",
         "scripts/addrsync",
-        "scripts/config",
         "scripts/core",
         "scripts/dispatcher",
         "scripts/flux-event",
         "scripts/init",
         "scripts/lib",
         "scripts/log",
-        "scripts/rules",
         "scripts/tproxy",
         "scripts/updater.sh",
     ]
@@ -2832,6 +2852,34 @@ mod tests {
         }
     }
 
+    fn write_staging_binary_fixtures(
+        artifacts: &Path,
+        profile: &PackageProfile,
+    ) -> (PathBuf, PathBuf) {
+        let runtime_binaries = artifacts.join("runtime-binaries");
+        fs::create_dir_all(&runtime_binaries).expect("create runtime binary fixture directory");
+        let fluxd = artifacts.join("fluxd");
+        fs::write(&fluxd, "fixture fluxd\n").expect("write fluxd fixture");
+        for (name, _) in profile_binary_inventory(profile).expect("profile binary inventory") {
+            if name != "fluxd" {
+                fs::write(runtime_binaries.join(&name), format!("fixture {name}\n"))
+                    .expect("write runtime binary fixture");
+            }
+        }
+        (runtime_binaries, fluxd)
+    }
+
+    fn assert_exact_staged_inventory(stage: &Path, profile: &PackageProfile) {
+        let expected = profile
+            .required_files
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut actual = std::collections::BTreeSet::new();
+        collect_package_files(stage, stage, &mut actual).expect("collect staged fixture inventory");
+        assert_eq!(actual, expected);
+    }
+
     #[test]
     fn linux_canary_required_contract_accepts_only_zero_one_or_unset() {
         assert_eq!(parse_linux_canary_required(None), Ok(false));
@@ -3053,6 +3101,106 @@ mod tests {
             error.contains("customize.sh"),
             "unexpected bridge-policy rejection: {error}"
         );
+    }
+
+    #[test]
+    fn staging_selects_exact_bridge_and_rust_only_source_inventories() {
+        let source_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask must be directly below the workspace root");
+
+        for (name, expected_count) in [
+            (PackageProfileName::Bridge, 28),
+            (PackageProfileName::RustOnly, 13),
+        ] {
+            let stage_directory = TestDirectory::new(&format!("{}-stage", name.as_str()));
+            let artifact_directory = TestDirectory::new(&format!("{}-artifacts", name.as_str()));
+            let profile = checked_profile(name);
+            let (runtime_binaries, fluxd) =
+                write_staging_binary_fixtures(&artifact_directory.0, &profile);
+
+            stage_module_from_artifacts(
+                source_root,
+                &stage_directory.0,
+                &runtime_binaries,
+                &fluxd,
+                &profile,
+            )
+            .expect("checked profile must stage from authoritative sources");
+            assert_eq!(profile.required_files.len(), expected_count);
+            assert_exact_staged_inventory(&stage_directory.0, &profile);
+            validate_source_bound_module_files(&stage_directory.0, source_root, &profile)
+                .expect("staged source-owned files must retain their selected source bytes");
+
+            for relative in RUST_ONLY_SOURCE_OVERRIDE_FILES {
+                let selected =
+                    fs::read(stage_directory.0.join(relative)).expect("read staged profile source");
+                let expected_source =
+                    authoritative_module_source_path(source_root, &profile, relative);
+                assert_eq!(
+                    selected,
+                    fs::read(&expected_source).expect("read authoritative profile source")
+                );
+                if name == PackageProfileName::RustOnly {
+                    assert_ne!(
+                        selected,
+                        fs::read(source_root.join(relative)).expect("read bridge source"),
+                        "Rust-only staging must not reuse bridge source {relative}"
+                    );
+                } else {
+                    assert_eq!(expected_source, source_root.join(relative));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rust_only_stage_rejects_every_declared_legacy_path_and_binds_overrides() {
+        let source_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask must be directly below the workspace root");
+        let stage_directory = TestDirectory::new("rust-only-forbidden-stage");
+        let artifact_directory = TestDirectory::new("rust-only-forbidden-artifacts");
+        let rust_only = checked_profile(PackageProfileName::RustOnly);
+        let (runtime_binaries, fluxd) =
+            write_staging_binary_fixtures(&artifact_directory.0, &rust_only);
+        stage_module_from_artifacts(
+            source_root,
+            &stage_directory.0,
+            &runtime_binaries,
+            &fluxd,
+            &rust_only,
+        )
+        .expect("Rust-only fixture must stage exactly");
+
+        assert_eq!(rust_only.status, PackageProfileStatus::FailingUntilComplete);
+        for relative in &rust_only.forbidden_files {
+            let path = stage_directory.0.join(relative);
+            fs::create_dir_all(path.parent().expect("legacy path parent"))
+                .expect("create legacy path parent");
+            fs::write(&path, "legacy residue\n").expect("write legacy path fixture");
+            let error = reject_forbidden_profile_files(&stage_directory.0, &rust_only)
+                .expect_err("every declared bridge-only path must fail Rust-only staging");
+            assert!(
+                error.contains(relative),
+                "unexpected rejection for {relative}: {error}"
+            );
+            fs::remove_file(&path).expect("remove legacy path fixture");
+        }
+        validate_staged_runtime_inventory(&stage_directory.0, &rust_only)
+            .expect("removing hostile fixtures must restore the exact 13-path inventory");
+
+        let customize = stage_directory.0.join("customize.sh");
+        let original = fs::read(&customize).expect("read staged Rust-only installer");
+        let mut tampered = original.clone();
+        tampered.extend_from_slice(b"# package-only drift\n");
+        fs::write(&customize, tampered).expect("tamper staged Rust-only installer");
+        let error = validate_source_bound_module_files(&stage_directory.0, source_root, &rust_only)
+            .expect_err("staged Rust-only override drift must fail source binding");
+        assert!(error.contains("packaging/rust-only/customize.sh"));
+        fs::write(&customize, original).expect("restore staged Rust-only installer");
+        validate_source_bound_module_files(&stage_directory.0, source_root, &rust_only)
+            .expect("restored Rust-only override must match its authoritative source");
     }
 
     #[test]

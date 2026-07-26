@@ -939,3 +939,31 @@ It does not yet validate the production Rust composition because that compositio
   Rust-only contract first on the exact forbidden `bin/addrsyncd` path.
 - Focused verification passed all 46 `xtask` tests (42 passed, 4 intentional fixture ignores) and
   strict all-target `xtask` Clippy. No Android runtime or physical-device claim is part of B3.2.
+
+## P0-B3.3 Exact Rust-Only Staging (2026-07-26)
+
+- `packaging/rust-only/customize.sh` and `packaging/rust-only/flux_service.sh` are the only
+  profile-specific source overrides. The shared update binary and `uninstall.sh` are already minimal
+  and policy-compliant, so they remain one source for both profiles.
+- One static source resolver is used by staging and verifier source-byte binding. Tests stage from
+  the actual checkout: bridge selects 28 root paths, while Rust-only selects exactly 13 paths and
+  copies both overrides under their manifest names without staging the `packaging/` directory.
+- Every one of the 15 declared bridge-only paths was inserted into an otherwise exact Rust-only
+  stage and rejected by its exact path. A staged override byte change also failed against its
+  authoritative `packaging/rust-only/` source.
+- The existing `scripts/config` and `scripts/rules` files are sourced bridge fragments rather than
+  executable entries. Removing them from the shebang-only list allows the real 28-path bridge source
+  tree to pass staging without changing either file or weakening exact source/inventory binding.
+- The Rust-only installer supports a clean install only. It refuses an existing
+  `/data/adb/flux`, stages `bin/` and `conf/` on the same filesystem, installs the module-local
+  service/uninstaller/metadata, applies permissions, and publishes the runtime tree only after all
+  required files exist. Shell performs no bridge migration or runtime-state cleanup.
+- The minimal service performs a bounded boot wait and at most five `fluxd daemon` launches, with
+  capped exponential delay and no networking, recovery, PID, or ownership-record logic.
+- A new required Bubblewrap suite verifies fresh placement, absence of legacy scripts/binaries,
+  fail-closed reinstall, exact daemon-only invocation, recovery on attempt three, and final failure
+  after attempt five. The existing bridge installer suite remains unchanged and passes.
+- Focused verification passed 48 `xtask` tests (44 passed, 4 intentional fixture ignores), strict
+  all-target Clippy, both installer suites, and shell syntax. Production still constructs
+  `ProcessRuntimeWriter`; the Rust-only profile remains `failing-until-complete` and is not runtime,
+  device, or release evidence.

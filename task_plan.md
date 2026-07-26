@@ -1138,16 +1138,16 @@ development bridge remains the production writer rollback boundary until Gate 1.
   `2**14`.
 - [x] B3.2: Add Rust-only platform-glue source policy and hostile fixtures for forbidden networking,
   subscription, configuration-compilation, and cleanup implementation.
-- [ ] B3.3: Prove exact 13-path Rust-only staging and exact legacy-artifact rejection without
+- [x] B3.3: Prove exact 13-path Rust-only staging and exact legacy-artifact rejection without
   promoting its `failing-until-complete` status or deleting the still-active bridge.
 - [ ] B3.4: Reconcile active documentation, run focused/full/Android/WSA/diff gates, and create
   periodic local Conventional Commit checkpoints without pushing.
 
 ### Status
-**B3.2 complete on 2026-07-26; B3.3 next** - the Rust-only verifier now bounds and scans the exact
-four final platform-glue sources, requires direct installer/daemon/uninstall delegation, and rejects
-the tested ownership-drift categories. The active bridge remains unchanged and passes only its
-development profile; B3.3 will provide minimal profile-specific sources and prove exact staging.
+**B3.3 complete on 2026-07-26; B3.4 next** - Rust-only staging selects two minimal tracked source
+overrides and produces the exact 13-path tree; bridge staging still selects its 28 root sources. All
+15 declared bridge-only paths fail Rust-only admission, source-byte binding follows the selected
+profile, and the fresh-install glue/watchdog passes isolated execution tests.
 
 ### Decisions
 - WSA is development mechanism evidence only. It cannot construct physical Android ARM64 planning,
@@ -1165,6 +1165,12 @@ development profile; B3.3 will provide minimal profile-specific sources and prov
   daemon, and uninstall delegation markers; reject networking mutation, subscription retrieval,
   configuration compilation, owned-state cleanup, legacy runtime paths, and dynamic shell command
   construction without weakening or rewriting the active bridge.
+- Override only `customize.sh` and `flux_service.sh` below `packaging/rust-only/`. The shared update
+  binary and Rust-delegating uninstaller already satisfy the final policy and should not be copied
+  into a second source tree.
+- Keep the Rust-only installer fresh-install-only in B3.3. It may place the reviewed package payload
+  but must refuse an existing `/data/adb/flux` tree rather than migrate or delete bridge/runtime
+  state in shell; the profile remains non-releasable until the Rust-owned cutover/migration gate.
 
 ### Errors Encountered
 - Windows Computer Use initialization failed before UI automation because the Node runtime rejected
@@ -1203,6 +1209,9 @@ development profile; B3.3 will provide minimal profile-specific sources and prov
 - The first B3.2 checkpoint staging command could not create `.git/index.lock` because the managed
   sandbox mounted Git metadata read-only. No file was staged; rerun the same exact five-file `git
   add` with Git-metadata write authority, then verify the cached diff before committing locally.
+- The first B3.3 strict Clippy run found one needless borrow of the already borrowed `fluxd_source`
+  path at the extracted post-build staging seam. Remove only the redundant `&`; shell tests and the
+  48-test `xtask` suite had already passed with unchanged behavior.
 
 ### B3.0 Verification
 - The command-environment regression failed before the fix on the absent
@@ -1254,3 +1263,27 @@ development profile; B3.3 will provide minimal profile-specific sources and prov
 - `TMPDIR=/tmp cargo test -p xtask --no-fail-fast`: 42 passed, 0 failed, 4 intentional fixture
   ignores. `TMPDIR=/tmp cargo clippy -p xtask --all-targets -- -D warnings` passed.
 - Repository rustfmt, `git diff --check`, and the scoped high-confidence secret scan passed.
+
+### B3.3 Verification
+- Only `customize.sh` and `flux_service.sh` resolve from `packaging/rust-only/`; the shared Magisk
+  update binary and Rust-delegating `uninstall.sh` remain single authoritative sources. Staging and
+  later source-byte verification call the same static resolver.
+- The extracted post-build staging seam uses the real checked source tree in tests. Bridge produces
+  exactly 28 paths from the root sources; Rust-only produces exactly 13 paths and its two staged
+  overrides differ from the active bridge files.
+- Each of the exact 15 Rust-only forbidden paths was injected independently and rejected by name.
+  Tampering staged Rust-only `customize.sh` failed against
+  `packaging/rust-only/customize.sh`; restoring its bytes passed.
+- The Rust-only installer is deliberately fresh-install-only: it stages/publishes only the reviewed
+  `bin/` and `conf/` payload, installs module metadata/service/uninstaller, and refuses an existing
+  `/data/adb/flux` instead of migrating or deleting bridge/runtime state in shell.
+- The Rust-only service waits boundedly for boot, invokes only `fluxd daemon`, exits after a clean
+  daemon return, and stops after five nonzero launches with exponential backoff capped at 16 seconds.
+- The isolated Bubblewrap suite passed fresh placement, exact no-legacy assertions, fail-closed
+  reinstall without payload drift, recovery on launch three, and the five-failure bound. The active
+  bridge installer/uninstaller suite remained green.
+- `TMPDIR=/tmp cargo test -p xtask --no-fail-fast`: 44 passed, 0 failed, 4 intentional fixture
+  ignores. Strict all-target `xtask` Clippy passed after removing one redundant borrowed path; shell
+  syntax checks passed.
+- Repository rustfmt, `git diff --check`, and the scoped high-confidence secret scan passed. The
+  existing `.github/workflows/ci.yml` CRLF normalization notice remains warning-only.

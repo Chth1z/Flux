@@ -694,9 +694,12 @@ omitted, but every successful result is labeled development-only.
 
 `--profile rust-only` stages only the 13 final paths and needs only Sing-Box from the runtime-binary
 directory. The development bridge currently has 28 required paths, with the exact 15-path difference
-forbidden by Rust-only. It is a migration skeleton, not a runnable or releasable package: the checked
-profile is deliberately marked `failing-until-complete`, and the current bridge-oriented manifest
-metadata and platform glue have not completed the later ownership and policy gates.
+forbidden by Rust-only. Staging selects the minimal tracked `customize.sh` and `flux_service.sh`
+sources under `packaging/rust-only/`; the already-minimal update binary and Rust-delegating
+uninstaller remain shared. The installer is deliberately fresh-install-only and refuses an existing
+`/data/adb/flux` rather than migrating bridge state in shell. This is still a non-runnable,
+non-releasable migration skeleton: the checked profile remains `failing-until-complete`, production
+still selects the bridge writer, and provenance/device/cutover gates remain incomplete.
 
 To exercise the current hybrid package-consistency boundary, populate every blank
 source/source-revision/version/hash/license field in

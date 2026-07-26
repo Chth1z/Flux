@@ -2044,7 +2044,11 @@ Rust-only-required, so no removed bridge path can be omitted from policy.
 to equal the checked-in policy, then applies exact file, source-byte, binary, payload, provenance,
 and evidence checks for that selection. The bridge requires clean root and `addrsyncd` worktrees and
 binds both manifest revisions; Rust-only does not derive authority from a removed submodule. A
-successful bridge check is printed only as development evidence. Rust-only verification remains a
+static source resolver selects only `packaging/rust-only/customize.sh` and
+`packaging/rust-only/flux_service.sh` for the Rust-only profile; bridge continues to bind the root
+files, and both selections are verified byte-for-byte. The Rust-only installer is fresh-install-only
+at this gate and refuses an existing runtime root rather than implementing bridge migration in shell.
+A successful bridge check is printed only as development evidence. Rust-only verification remains a
 deliberate failing release gate until runtime ownership converges and the checked status is changed
 in the later package cutover. Required binaries must
 be ELF64 little-endian AArch64 with a bounded file-backed executable entry, congruent load segments,

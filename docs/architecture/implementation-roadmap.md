@@ -350,6 +350,12 @@ Exit: all supported runtime and diagnostic commands work with only `fluxd` plus 
   compilation, owned-state cleanup, legacy runtime paths, direct Sing-Box orchestration, and dynamic
   command construction. A minimal fixture passes eight hostile ownership-drift cases; the unchanged
   shared bridge glue remains valid only for the development profile.
+- **B3.3 complete 2026-07-26:** staging and source-byte verification select two tracked Rust-only
+  overrides for the installer and bounded watchdog while bridge continues to select the root
+  sources. Real-source tests prove exact 13/28-path trees, rejection of each of the 15 legacy paths,
+  and override tamper detection. Isolated shell tests prove fresh placement, fail-closed reinstall,
+  daemon-only recovery, and the five-failure restart bound; profile status remains
+  `failing-until-complete`.
 - Preserve frozen oracle fixtures under tests only as long as they add differential value; they are
   not staged into the module.
 

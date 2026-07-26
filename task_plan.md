@@ -1886,3 +1886,67 @@ C1-C3 and Gate 1 can authorize R4.
 Production and public offline cleanup deliberately remain on `ProcessRuntimeWriter` and
 `BridgeOfflineRecovery`; nine scripts remain, and Rust-only stays `failing-until-complete` until a
 physical ARM64 target supplies C1-C3 and Gate 1 authority for R4-R6.
+
+## Execution: R4 Readiness Without Physical ARM64 (2026-07-27)
+
+### Goal
+Use the connected rooted x86_64 WSA target only for the supported non-shipping Android mechanism
+checkpoint, record the exact physical-device gap, and leave every R4-R6 authority boundary intact.
+
+### Priorities
+- P0: Preserve the rule that WSA cannot satisfy ARM64 C1-C3, Gate 1, production writer selection,
+  bridge deletion, or Rust-only promotion.
+- P0: Run the repository-defined x86_64 Android local-OUTPUT TPROXY checkpoint against one explicit
+  serial and require its remote cleanup proof.
+- P1: Reconcile the current target facts and new evidence in durable notes, then commit the bounded
+  follow-up separately from the R0-R3 implementation.
+- P2: Do not run the ARM64 preflight against a known x86_64 target or implement device-policy
+  assumptions without a qualifying physical device.
+
+### Phases
+- [x] F0: Commit the verified host-ready R0-R3 implementation and confirm a clean worktree.
+- [x] F1: Inventory the connected target and re-read the C1-C3/Gate 1 requirements.
+- [x] F2: Run the supported WSA x86_64 mechanism checkpoint with exact cleanup.
+- [x] F3: Record evidence, rerun documentation/diff checks, and create a focused follow-up commit.
+
+### Decisions
+- The only connected target is `127.0.0.1:58526`: Android 13/API 33, x86_64, 4 KiB runtime pages.
+  It is suitable only for the existing non-shipping WSA command.
+- Skip the read-only ARM64 mark-ordering preflight because the known ABI cannot meet its entry
+  contract; an expected architecture rejection would add no qualification evidence.
+- Keep `ProcessRuntimeWriter`, `BridgeOfflineRecovery`, all nine bridge scripts, and
+  `failing-until-complete` unchanged.
+
+### F2 Evidence
+- The diagnostic `TMPDIR=/tmp` run passed one test with 307 filtered out in 3.79 seconds and removed
+  `/data/local/tmp/flux-output-tproxy.ZRtjBQ`.
+- After moving the host temp binding into `xtask`, the exact repository command passed without a
+  caller override: one test passed with 307 filtered out in 3.80 seconds, and the runner independently
+  proved `/data/local/tmp/flux-output-tproxy.CJOvZz` absent after cleanup.
+- The result is x86_64/4 KiB WSA mechanism evidence only; it grants no C1-C3, Gate 1, R4-R6, ARM64,
+  16 KiB runtime, production writer, recovery, deletion, or package authority.
+
+### Errors Encountered
+- The first parallel discovery wrapper had an unmatched JavaScript string delimiter and was
+  rejected before any command ran. Split the read-only checks into simpler command strings; target,
+  roadmap, diff, and secret-scan discovery then completed without repository or device mutation.
+- The first WSA checkpoint build inherited Windows `TMPDIR`/`TEMP` values below
+  `/mnt/c/Users/Chth1z/AppData/Local/Temp`; NDK Clang could not create a temporary file there in the
+  restricted WSL environment, so the command failed before any `adb push`. A caller-supplied
+  `TMPDIR=/tmp` rerun passed, proving the device path while exposing an undocumented host dependency.
+- The focused `android_test_build_uses_pinned_compiler_for_rust_and_native_code` regression failed
+  before implementation because the generated Cargo command had no `TMPDIR` override. Bind the
+  Android cross-build itself to Linux `/tmp` and rerun the unchanged assertion.
+
+### F3 Verification
+- The focused command-environment regression passed after failing before implementation.
+- `cargo test -p xtask`: 49 passed, 0 failed, 4 ignored process/oracle fixtures.
+- `cargo xtask clippy`: warnings-denied workspace all-target Clippy passed.
+- `cargo fmt --all -- --check` and `git diff --check`: passed.
+- Final scope review found four intended changed files, no credential material, exactly nine scripts,
+  and unchanged production writer, public offline-recovery, and Rust-only profile selections.
+
+### Status
+**Complete on 2026-07-27** - the x86_64 WSA checkpoint passes without a caller temp override and its
+remote directory is absent after cleanup. This remains non-authorizing development evidence; the
+physical ARM64 blocker and every R4-R6 ownership boundary remain unchanged.

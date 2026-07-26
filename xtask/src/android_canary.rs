@@ -46,6 +46,7 @@ const ADB_CLEANUP_TIMEOUT: Duration = Duration::from_secs(20);
 const CARGO_BUILD_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const HOST_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const HOST_OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(2);
+const HOST_BUILD_TMPDIR: &str = "/tmp";
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(super) struct Options {
@@ -351,6 +352,7 @@ fn android_test_build_command(linker: &Path) -> Command {
         "CARGO_TARGET_X86_64_LINUX_ANDROID_RUSTFLAGS",
         ANDROID_RUSTFLAGS,
     );
+    command.env("TMPDIR", HOST_BUILD_TMPDIR);
     command
 }
 
@@ -1099,6 +1101,10 @@ mod tests {
                 "CARGO_TARGET_X86_64_LINUX_ANDROID_RUSTFLAGS"
             )),
             Some(&Some(std::ffi::OsStr::new(ANDROID_RUSTFLAGS)))
+        );
+        assert_eq!(
+            environment.get(std::ffi::OsStr::new("TMPDIR")),
+            Some(&Some(std::ffi::OsStr::new(HOST_BUILD_TMPDIR)))
         );
         assert!(ANDROID_RUSTFLAGS.contains("max-page-size=16384"));
         assert!(ANDROID_RUSTFLAGS.contains("common-page-size=16384"));

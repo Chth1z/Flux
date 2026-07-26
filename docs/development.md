@@ -525,9 +525,11 @@ ANDROID_NDK_HOME=/path/to/android-ndk-r27d \
 
 The command requires Linux/WSL, the pinned NDK 27.3.13750724, API 31 linker, installed
 `x86_64-linux-android` Rust target, one explicit ADB serial advertising x86_64, SDK 31 or later, and
-`su` UID 0. It parses Cargo JSON to select exactly one library-test ELF, creates a unique private
-directory below `/data/local/tmp`, fixes ownership/mode after `adb push`, sanitizes Android `PATH`,
-sets a private `TMPDIR`, clears every harness re-entry variable, forces
+`su` UID 0. The runner binds the host cross-build `TMPDIR` to Linux `/tmp` so inherited Windows
+environment values cannot redirect NDK Clang into a WSL-inaccessible directory. It parses Cargo
+JSON to select exactly one library-test ELF, creates a unique private directory below
+`/data/local/tmp`, fixes ownership/mode after `adb push`, sanitizes Android `PATH`, sets a private
+remote `TMPDIR`, clears every harness re-entry variable, forces
 `FLUX_LINUX_CANARY_REQUIRED=1`, and requires the exact normalized libtest listing before execution.
 Every Cargo, ADB, and WSL path command has a host deadline with bounded output plus kill/reap on
 timeout or setup failure. The runner records kernel architecture/release, build fingerprint, and

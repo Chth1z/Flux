@@ -1498,3 +1498,24 @@ It does not yet validate the production Rust composition because that compositio
   `ProcessRuntimeWriter` and `BridgeOfflineRecovery`; Rust-only remains
   `failing-until-complete`. Physical ARM64 C1-C3 and Gate 1 remain mandatory before R4 writer
   selection, R5 bridge deletion, or R6 package promotion.
+
+## WSA x86_64 Mechanism Checkpoint Follow-Up (2026-07-27)
+
+- Target: explicit ADB serial `127.0.0.1:58526`, WSA Android 13/API 33, x86_64 kernel and userspace,
+  kernel `5.15.104-windows-subsystem-for-android-20230927+`, build
+  `Windows/windows_x86_64/windows_x86_64:13/TQ3A.230901.001/2407.40000.4.0:user/release-keys`, and
+  4 KiB runtime pages.
+- The first repository-defined checkpoint failed during the host cross-build, before any `adb push`.
+  NDK Clang inherited Windows `TMPDIR`/`TEMP` under
+  `/mnt/c/Users/Chth1z/AppData/Local/Temp` and reported `unable to make temporary file: Read-only file
+  system` in the restricted WSL environment.
+- A diagnostic rerun with caller-supplied `TMPDIR=/tmp` passed. A red regression then proved
+  `android_test_build_command` did not own that requirement; `xtask` now binds the cross-build
+  `TMPDIR` to `/tmp` and tests the generated command environment.
+- The exact command was rerun without a caller-supplied temp override:
+  `cargo xtask test-functional-canary-android-x86_64-output-tproxy --serial 127.0.0.1:58526 --adb
+  /usr/bin/adb`. It passed one exact test with 307 filtered out in 3.80 seconds and independently
+  verified removal of `/data/local/tmp/flux-output-tproxy.CJOvZz`.
+- This is non-shipping x86_64 mechanism evidence only. It does not satisfy C1-C3, Gate 1, the
+  Android 5.10/ARM64 release matrix, 16 KiB runtime qualification, production writer transfer,
+  public offline-recovery transfer, bridge deletion, or Rust-only package promotion.

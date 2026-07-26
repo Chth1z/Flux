@@ -496,9 +496,11 @@ release; final qualification follows.
   bounded CI smoke run and retained crash corpus.
 - Unsafe operations in unsafe functions and undocumented unsafe blocks are denied workspace-wide
   through the standard strict Clippy gate. The locked root workspace advisory/license/source policy
-  is also required in standard Linux CI with a digest-pinned cargo-deny binary. Explicit unsafe
-  boundary review and reproducible build/provenance checks remain required; the workspace audit does
-  not approve the excluded `addrsyncd` bridge license or replace the final package SBOM.
+  is also required in standard Linux CI with a digest-pinned cargo-deny binary. The explicit
+  38-file/264-block unsafe-boundary review completed on 2026-07-26 and corrected zero process-signal
+  targets before `kill(2)`; its documented triggers require review again when a boundary or ABI
+  changes. Reproducible build/provenance checks remain required, and neither workspace audit
+  approves the excluded `addrsyncd` bridge license or replaces the final package SBOM.
 
 ### Required Android Set
 
@@ -565,8 +567,9 @@ Items 5-8 continue when items 9-11 are hardware-blocked.
 ### P1: Release Assurance
 
 1. Require privileged production-composition tests in CI.
-2. **Dependency assurance complete 2026-07-26:** the locked root workspace now has a required
-   advisory/license/source gate. Add parser fuzzing, explicit unsafe review, and coverage visibility;
+2. **Dependency and unsafe-boundary assurance complete 2026-07-26:** the locked root workspace has
+   a required advisory/license/source gate, and all 264 unsafe blocks in root-workspace targets have
+   an explicit semantic audit with re-audit triggers. Add parser fuzzing and coverage visibility;
    resolve the excluded bridge license only if that code will be reused or shipped.
 3. Qualify the second maintained Android kernel/vendor profile and every advertised root framework.
 4. Capture final resource/performance baselines and chaos evidence.

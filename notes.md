@@ -1063,3 +1063,116 @@ It does not yet validate the production Rust composition because that compositio
   on both Standards and Spec axes before staging.
 - No hosted-workflow execution is claimed for the uncommitted R2 change. The live RustSec refresh is
   deliberately time-sensitive and may expose a new required failure when the hosted job first runs.
+
+## P1-R3 Explicit Unsafe-Boundary Audit (2026-07-26)
+
+### Exact Inventory And Ownership Groups
+
+- The member production/tool `src` census remains 27 files, 213 `unsafe { ... }` blocks, and 216
+  `SAFETY:` annotations. The all-target census remains 38 files, 264 blocks, and 267 annotations.
+  The construct inventory separately includes the Android property callback declared as
+  `unsafe extern "C" fn`, plus unsafe foreign blocks in `android_identity.rs`,
+  `xtask/src/android_canary.rs`, and `fluxd/tests/daemon_shutdown_signal.rs`. No unsafe trait or
+  unsafe impl exists. These numbers are navigation evidence, not a soundness result.
+- Group A, representation/configuration: `flux-core/src/config.rs`,
+  `flux-platform/src/file_observer.rs`, and the platform-error constructors in
+  `flux-platform/src/lib.rs` (17 blocks).
+- Group B, Android property identity/FFI: `flux-platform/src/android_identity.rs`, its test module,
+  and the Android-canary tool boundary (11 blocks, one unsafe callback, two unsafe foreign blocks).
+- Group C, process/signal/reactor/IPC: `child_process.rs`, `process.rs`, `reactor.rs`, `seqpacket.rs`,
+  and `shutdown.rs` (61 blocks), with their in-source and integration tests classified separately.
+- Group D, netlink/routing: `netlink/policy_routing_session.rs` and `netlink/socket.rs` (22 blocks).
+- Group E, socket diagnostics: `socket_diagnostics/implementation.rs` and its test module
+  (11 blocks).
+- Group F, xtables ownership/durability: `xtables/native.rs`, `native_tests.rs`,
+  `owner_durable.rs`, `owner_process_adapter.rs`, and `owner_runtime_tests.rs` (27 blocks).
+- Group G, daemon persistence/cleanup: `fluxd/src/intent_store.rs` and `offline_cleanup.rs`
+  (19 blocks).
+- Group H, qualification and test-only helpers: Linux namespace/TCP/UDP/distinct-UID canaries and
+  integration tests under `crates/flux-core/tests`, `crates/flux-platform/tests`, and
+  `crates/fluxd/tests`. These boundaries remain review-relevant because a faulty harness can mint
+  false evidence, but they do not carry production runtime authority.
+
+### Process, Signal, Reactor, Seqpacket, And Shutdown Review
+
+- `signal_process(0, ...)` and `signal_process_group(0, ...)` were a proven fail-closed contract
+  defect: both converted zero successfully and then invoked `kill(0, signal)`, which addresses the
+  caller's process group rather than one process or one explicitly named group. Current production
+  callers obtain nonzero IDs from `Child::id()`, so no observed production path supplied zero, but
+  the helpers and their safety claim admitted the broader target.
+- `child_process.rs` now centralizes pure target validation, rejects zero before any syscall, and
+  reuses the same process-group validator for the signal and signal-zero existence paths. Focused
+  tests verify zero rejection and positive/negative target preservation without ever invoking
+  `kill(2)` from the test.
+- The remaining process boundaries preserve positive `NonZeroU32` identities, unique `OwnedFd`
+  transfers, exact initialized output storage, non-reaping `waitid(..., WNOWAIT)` probes, bounded
+  procfs reads, and explicit child-origin/reap authority. `pidfd_open` is returned by the kernel in
+  the file-descriptor integer domain before its unique `OwnedFd` transfer.
+- Reactor eventfd/epoll calls borrow live descriptors, use initialized fixed-size event storage,
+  slice only the count returned by `epoll_wait`, retry `EINTR`, and transfer each newly returned
+  descriptor exactly once. The mutex-protected wake phase keeps the shared eventfd notification
+  contract synchronized.
+- Seqpacket address construction starts from zeroed `sockaddr_un`, checks NUL/capacity and
+  `socklen_t` conversion before copying, validates exact `ucred` output length before
+  `assume_init`, bounds `MSG_TRUNC` results before truncating the vector, uses `MSG_NOSIGNAL`, and
+  transfers socket/accept descriptors once. No pointer outlives its source buffer or borrowed FD.
+- `ShutdownSignal` keeps signal-mask restoration thread-affine through a non-`Send`, non-`Sync`
+  marker, initializes each signal/output structure before use, restores the previous mask on
+  signalfd construction failure and Drop, and validates an exact-size read before `assume_init`.
+- Focused command: `cargo test -p flux-platform child_process::implementation::tests -- --nocapture`
+  passed 2 tests with 354 unrelated library tests filtered.
+
+### Remaining Semantic Groups
+
+- Configuration, kernel-release, file-observer, and Android identity boundaries use no-follow
+  descriptor ownership, initialized kernel output structures, bounded unaligned inotify decoding,
+  and a synchronous Bionic property callback whose stack cookie cannot escape. The callback source
+  contract cross-builds and passed the exact rooted x86_64 WSA mechanism probe, but physical ARM64
+  runtime behavior remains a C1/C2 evidence item.
+- Route/policy netlink and socket-diagnostic paths use ABI-asserted address structures, fixed boxed
+  receive slabs, exact returned-count bounds, sender validation, and explicit truncation/loss
+  outcomes before any frame gains authority. No kernel-returned length reaches a slice or
+  `assume_init` unchecked.
+- Xtables and daemon durable-state paths transfer each raw descriptor once, traverse components
+  relative to owned directory descriptors with `O_NOFOLLOW`, validate initialized metadata,
+  recheck lock identity, and sync temporary files plus directories around atomic publication.
+- Transparent TCP/UDP, namespace, distinct-UID, and Android-host canaries retain their
+  qualification-only scope. The ancillary parser uses aligned backing storage, checks payload and
+  control truncation, validates every CMSG length/alignment before unaligned reads, and rejects
+  unexpected or duplicate original-destination data.
+- In-source and integration-test unsafe boundaries were reviewed separately. They use bounded FIFO
+  fixtures, isolated credential/rlimit helpers, scoped signal actions, retained live child/thread
+  identities, and owned lock/descriptor fixtures. They can support mechanism evidence but cannot
+  authorize runtime composition or a device profile.
+- The durable audit is `docs/security/unsafe-boundary-audit-2026-07.md`; it records all 38 files,
+  exact authority classes, the corrected defect, accepted invariants, residual risks, and re-audit
+  triggers. Its primary-source interpretation is separately pinned under `docs/research/`.
+
+### Primary Sources And Final Verification
+
+- `docs/research/rust-unsafe-boundary-primary-sources-2026-07.md` binds the review to 50 unique
+  official Rust, Linux man-pages/kernel, AOSP/Bionic, and Android/NDK sources. Its 50 definitions,
+  substantive citations, catalog entries, and URLs reconcile exactly; all 50 URLs returned HTTP
+  200 on 2026-07-26.
+- The source pack makes the remaining post-fork boundary explicit: `setrlimit`, `prctl`,
+  `close_range`, generic `syscall`, and libc errno access are accepted only against reviewed
+  Linux/Bionic implementation contracts, not as portable POSIX claims. Unsupported
+  `CLOSE_RANGE_CLOEXEC` fails before `exec`. The callback copies bytes synchronously and contains no
+  user-controlled panic path across its non-unwinding C ABI.
+- `TMPDIR=/tmp cargo xtask ci` passed the workspace tests, documentation tests, strict Clippy, and
+  pinned ARM64/API-31 cross-check. `flux-platform` reported 352 library tests passed with four
+  privileged ignores, `fluxd` reported 295 passed with four privileged ignores, and `xtask`
+  reported 44 passed with four fixture ignores.
+- Required-mode `cargo xtask test-functional-canary-linux` passed the exact disposable dual-stack
+  topology/cleanup test once with 298 filtered. Repository rustfmt, the 38/264/267 unsafe census,
+  diff integrity, production writer-composition fence, stale-authority scan, and high-confidence
+  secret scan passed.
+- The pinned x86_64 Android/API-31 test ELF exposed four `0x4000` load segments. On connected rooted
+  WSA Android 13/API 33, x86_64 with a 4096-byte runtime page size, the exact Android-only Bionic
+  identity/property callback test passed once with 343 filtered. The private remote directory was
+  removed and an exact absence probe confirmed cleanup. This never supplies ARM64, 16 KiB runtime,
+  native-writer, Rust-only package, or release authority.
+- Fixed-point review against `02bc604`: the Standards axis found no actionable documented-standard
+  breach or baseline smell after the unsafe-census correction; the Spec axis found no missing R3
+  requirement, scope creep, or authority-boundary regression. The only prior findings (the missed
+  unsafe callback and off-by-one census scope) are corrected and reconciled in the audit.

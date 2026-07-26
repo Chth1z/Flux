@@ -29,6 +29,9 @@
 - [Controller interface comparison](architecture/interface-comparison.md) — three alternative Interfaces and the selected hybrid.
 - [Domain language](../CONTEXT.md) — canonical project terms.
 - [Development and build workflow](development.md) — pinned Rust/Android toolchains and verification commands.
+- [Explicit unsafe-boundary audit (2026-07)](security/unsafe-boundary-audit-2026-07.md) - exact
+  construct inventory, semantic review, corrected signal contract, residual risk, and re-audit
+  triggers.
 
 ## Research
 
@@ -42,6 +45,7 @@
 - [Expanded eBPF and kernel-extension assessment (2026-07)](research/ebpf-and-kernel-extensions-2026-07.md)
 - [Local-origin transparent-capture mechanisms on Linux 5.10 (2026-07)](research/local-output-capture-mechanisms-2026-07.md)
 - [Open-source architecture comparison for the Rust cutover (2026-07)](research/open-source-architecture-comparison-2026-07.md)
+- [Primary sources for the explicit Rust unsafe-boundary audit (2026-07)](research/rust-unsafe-boundary-primary-sources-2026-07.md)
 
 ## Architecture alternatives
 

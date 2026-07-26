@@ -107,6 +107,12 @@ Pins cargo-deny, RustSec, the exact locked workspace graph, its allowed license 
 the one version-scoped root-certificate data exception. It defines a digest-verified required CI
 gate while keeping the excluded `addrsyncd` bridge outside any release-license claim.
 
+### [Primary sources for the explicit Rust unsafe-boundary audit (2026-07)](rust-unsafe-boundary-primary-sources-2026-07.md)
+
+Pins the Rust, standard-library, Linux man-pages, and Bionic contracts used to review initialization,
+raw descriptor ownership, pre-exec restrictions, signal scope, socket/netlink framing, and the
+synchronous Android property callback.
+
 ## Cloned source families
 
 - AOSP: `system/netd`, `packages/modules/Connectivity`, `frameworks/base`, `system/core`, `system/sepolicy`, `kernel/configs`, `external/iptables`.

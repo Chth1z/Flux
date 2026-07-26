@@ -67,6 +67,27 @@ dependencies. It does not cover the excluded `addrsyncd` development bridge, who
 `UNLICENSED`; the Rust-only package forbids that binary, and a passing workspace audit is not
 release-license approval for the bridge or a replacement for the final package SBOM.
 
+## Unsafe-boundary assurance
+
+The [explicit unsafe-boundary audit](security/unsafe-boundary-audit-2026-07.md) semantically reviews
+all 264 unsafe blocks in the 38 root-workspace source and test files that contain them. The census
+also records one unsafe Android callback, three unsafe foreign blocks, and no unsafe trait or impl.
+The review corrected one fail-closed signal contract: internal process and process-group helpers now
+reject zero before it can become the process-group-wide `kill(0, signal)` target.
+
+The workspace lints remain required mechanical controls:
+
+```text
+cargo clippy --workspace --all-targets --all-features -- -D warnings \
+  -D clippy::undocumented_unsafe_blocks
+```
+
+Repeat the semantic review whenever an unsafe construct or foreign declaration changes, or when
+Rust, `libc`, the pinned NDK/API, a supported syscall ABI, callback lifetime, descriptor owner,
+kernel-returned length, child identity, or signal target changes. A passing lint and source review
+do not qualify physical ARM64, authorize `NativeRuntimeWriter`, replace parser fuzzing/sanitizers,
+or satisfy final package provenance.
+
 The focused Phase 3 Android mark-authority model can be exercised with:
 
 ```text

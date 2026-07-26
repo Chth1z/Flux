@@ -143,37 +143,18 @@ mod implementation {
     }
 
     pub(crate) fn signal_process(pid: u32, signal: ProcessSignal) -> Result<(), io::Error> {
-        let pid = libc::pid_t::try_from(pid)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "PID exceeds pid_t"))?;
-        signal_target(pid, signal)
+        signal_target(process_target(pid)?, signal)
     }
 
     pub(crate) fn signal_process_group(
         process_group: u32,
         signal: ProcessSignal,
     ) -> Result<(), io::Error> {
-        let process_group = libc::pid_t::try_from(process_group).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidInput, "process group exceeds pid_t")
-        })?;
-        let target = process_group
-            .checked_neg()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid process group"))?;
-        signal_target(target, signal)
+        signal_target(process_group_target(process_group)?, signal)
     }
 
     pub(crate) fn process_group_exists(process_group: u32) -> Result<bool, io::Error> {
-        let process_group = libc::pid_t::try_from(process_group).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidInput, "process group exceeds pid_t")
-        })?;
-        if process_group == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "process group must be nonzero",
-            ));
-        }
-        let target = process_group
-            .checked_neg()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid process group"))?;
+        let target = process_group_target(process_group)?;
         // SAFETY: signal zero performs an existence/permission probe only; the
         // validated negative target addresses one process group and mutates no
         // process state.
@@ -207,6 +188,33 @@ mod implementation {
         } else {
             Err(io::Error::last_os_error())
         }
+    }
+
+    fn process_target(pid: u32) -> Result<libc::pid_t, io::Error> {
+        let pid = libc::pid_t::try_from(pid)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "PID exceeds pid_t"))?;
+        if pid == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "PID must be nonzero",
+            ));
+        }
+        Ok(pid)
+    }
+
+    fn process_group_target(process_group: u32) -> Result<libc::pid_t, io::Error> {
+        let process_group = libc::pid_t::try_from(process_group).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "process group exceeds pid_t")
+        })?;
+        if process_group == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "process group must be nonzero",
+            ));
+        }
+        process_group
+            .checked_neg()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid process group"))
     }
 
     fn preferred_nofile_limit(enabled: bool) -> Option<libc::rlimit> {
@@ -258,6 +266,31 @@ mod implementation {
         // SAFETY: immediately after the failed libc call, Bionic exposes the
         // calling thread's errno through this allocation-free TLS pointer.
         unsafe { *libc::__errno() }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::io;
+
+        use super::{process_group_target, process_target};
+
+        #[test]
+        fn signal_targets_reject_zero_before_the_kill_syscall() {
+            assert_eq!(
+                process_target(0).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+            assert_eq!(
+                process_group_target(0).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+
+        #[test]
+        fn signal_targets_preserve_process_and_group_addressing() {
+            assert_eq!(process_target(42).unwrap(), 42);
+            assert_eq!(process_group_target(42).unwrap(), -42);
+        }
     }
 }
 

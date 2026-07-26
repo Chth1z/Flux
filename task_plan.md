@@ -1460,3 +1460,88 @@ development bridge as release-license-approved.
 digest-pinned required CI step are verified and ready for the local checkpoint commit. The first
 GitHub-hosted run remains external evidence; `addrsyncd` licensing, package SBOM/provenance,
 reproducible builds, explicit unsafe review, fuzzing, and coverage remain open.
+
+## Execution: P1-R3 Explicit Unsafe-Boundary Audit
+
+### Goal
+Semantically review every unsafe boundary in the root workspace production/tool sources and their
+test-only counterparts, correct any proven contract defect, and publish a durable audit that does
+not confuse lint annotations or block counts with soundness evidence.
+
+### Phases
+- [x] R3.1: Generate the exact production/tool and all-target unsafe inventories, group them by
+  owner/API contract, and identify every unsafe callable, foreign block, trait, and impl.
+- [x] R3.2: Review each group for pointer validity, initialized memory, descriptor ownership,
+  syscall ABI/length conversion, aliasing/lifetime, callback, signal, and concurrency assumptions.
+- [x] R3.3: Fix and test only proven defects; publish the module-level audit, residual risks, and
+  re-audit triggers, including a separate classification for test-only unsafe helpers.
+- [x] R3.4: Run focused/full verification, perform Standards/Spec review, and create a scoped local
+  checkpoint commit without pushing.
+
+### Decisions
+- Use actual unsafe constructs, not the broad `unsafe` token, as the census. The member `src` trees
+  currently contain 27 files with 213 `unsafe { ... }` blocks and 216 `SAFETY:` annotations; all
+  workspace targets contain 38 files, 264 blocks, 267 annotations, one unsafe Android callback,
+  three unsafe foreign blocks, and no unsafe trait or impl.
+- Treat `unsafe_op_in_unsafe_fn` and `clippy::undocumented_unsafe_blocks` as required mechanical
+  controls, not proof that a safety comment is correct or complete.
+- Keep required Linux/Android syscall and FFI adapters narrow. Do not pursue a cosmetic zero-unsafe
+  rewrite or replace reviewed standard-library gaps with an unproven abstraction.
+- Separate production/tool findings from integration-test helpers. Test-only unsafe can invalidate
+  verification and must still be reviewed, but it does not carry production runtime authority.
+- Preserve physical ARM64 C1/C2 as the release-authorizing boundary; a host source audit cannot
+  authorize `NativeRuntimeWriter` or the Rust-only release profile.
+
+### Errors Encountered
+- The first R3 primary-source research dispatch combined full-history inheritance with an explicit
+  worker role, which the collaboration tool rejects. No agent started and no file changed; retry
+  the same one-file assignment with an isolated worker context.
+- The first WSA identity-probe cross-build omitted the target-specific linker environment and
+  therefore invoked host `cc`, which could not resolve Android `liblog` or `libunwind`. It produced
+  no test artifact and made no device change; rerun with the pinned NDK API-31 x86_64 linker and
+  the repository's two 16 KiB linker options.
+- The first rooted WSA execution wrapper changed directory before invoking the test through Android
+  `env`, which then could not resolve the relative executable. The already-validated binary and
+  device state were unchanged; invoking the same test by absolute path passed, and exact cleanup
+  followed.
+- The first final Standards-review dispatch combined full-history inheritance with an explicit
+  reviewer type, which the collaboration tool rejects. No reviewer started and no file changed;
+  the completed independent review reports and a local post-correction two-axis review supplied
+  the same read-only evidence for this checkpoint.
+- The first explicit ten-path staging attempt could not create `.git/index.lock` because the
+  managed sandbox exposes repository metadata read-only. No index entry changed; retry the same
+  exact path list with repository-metadata permission and do not widen the staged set.
+
+### Verification
+- The exact target-conversion regression passed 2 tests. Strict all-target/all-feature
+  `flux-platform` Clippy passed with undocumented unsafe blocks denied, and the full all-target/
+  all-feature crate suite passed 352 library tests with four privileged ignores plus every
+  integration-test target.
+- `TMPDIR=/tmp cargo xtask ci` passed workspace checks/tests, documentation tests, strict Clippy,
+  and the pinned ARM64/API-31 cross-check. Required-mode
+  `cargo xtask test-functional-canary-linux` passed its one disposable dual-stack topology/cleanup
+  test with 298 filtered.
+- The 38-file/264-block/267-annotation census reconciled, including one unsafe callback and three
+  unsafe foreign blocks. All 50 primary-source URLs returned HTTP 200, and their definitions,
+  substantive citations, source catalog, and unique URL set reconcile exactly.
+- The exact Android-only Bionic identity/property callback test passed once on rooted x86_64 WSA
+  Android 13/API 33 with 343 filtered. The test ELF had four `0x4000` load segments; WSA reported a
+  4096-byte runtime page size. The private remote directory was removed and independently proved
+  absent. This is x86_64 mechanism evidence only and does not affect ARM64 or release authority.
+
+### Fixed-Point Review
+- Standards axis: pass after reconciling the prior independent review findings. The corrected
+  census names the unsafe Android callback and all foreign blocks; the Rust guard is small, private,
+  tested without signaling, and compatible with the workspace lint/format standards. No actionable
+  documented-standard breach or baseline smell remains in the scoped hunks.
+- Spec axis: pass. R3.1/R3.2 inventory and semantic review, the zero-target fail-closed correction,
+  the module-level audit, test-only classification, primary-source pack, and verification evidence
+  satisfy the R3 goal. No production dependency, writer selection, Rust-only release claim, or
+  hardware authority was added; physical ARM64 C1/C2, production composition, fuzzing, coverage,
+  provenance, and reproducibility remain explicitly open requirements.
+
+### Status
+**R3.4 complete on 2026-07-26** - the semantic audit, one fail-closed signal correction,
+primary-source binding, full local gate, required namespace checkpoint, and x86_64 WSA callback
+probe are complete. Final link/security checks pass and the fixed-point Standards/Spec review found
+no actionable issue. The scoped local checkpoint is ready to commit locally without pushing.

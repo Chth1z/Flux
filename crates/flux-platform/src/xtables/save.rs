@@ -1076,7 +1076,7 @@ fn is_native_chain(chain: &str) -> bool {
 }
 
 fn is_known_legacy_chain(chain: &str) -> bool {
-    const BASES: [&str; 8] = [
+    const BASES: [&str; 9] = [
         "PROXY_PREROUTING",
         "PROXY_OUTPUT",
         "BYPASS_IP",
@@ -1085,6 +1085,7 @@ fn is_known_legacy_chain(chain: &str) -> bool {
         "ACTION_PROXY_OUT",
         "ACTION_BYPASS",
         "DIVERT",
+        "BLOCK_QUIC",
     ];
     if BASES
         .into_iter()
@@ -1093,6 +1094,11 @@ fn is_known_legacy_chain(chain: &str) -> bool {
         return true;
     }
     (0..16).any(|index| chain == format!("BYP_Z{index}") || chain == format!("BYP_Z{index}6"))
+}
+
+/// Recognizes every native or bridge-era chain name owned by Flux.
+pub(crate) fn is_flux_owned_chain(chain: &str) -> bool {
+    is_native_chain(chain) || is_known_legacy_chain(chain)
 }
 
 fn digest_projection(

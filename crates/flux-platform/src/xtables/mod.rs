@@ -12,6 +12,18 @@ mod restore;
 #[allow(dead_code)]
 mod save;
 
+pub(crate) use save::is_flux_owned_chain;
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) use owner::{
+    NativeXtablesTargetArchiveObservation, observe_native_xtables_target_archive,
+};
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) use owner_durable::{
+    NativeXtablesDurableReadOnlyObservation, NativeXtablesDurableRootIdentity,
+    NativeXtablesDurableStore,
+};
+
 pub use lowering::{
     MAX_XTABLES_CAPTURE_COMMANDS_PER_ARTIFACT, XTABLES_CAPTURE_DIGEST_BYTES,
     XTABLES_CAPTURE_LOWERING_SCHEMA_VERSION, XtablesCaptureArtifactPair,

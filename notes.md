@@ -1737,3 +1737,25 @@ It does not yet validate the production Rust composition because that compositio
   targeted credential/device-identifier scans pass. `cargo xtask ci` also exits zero across source
   policy, workspace checks/tests/doc-tests, strict Clippy, and Android cross-compilation. No device
   command or mutation occurred.
+
+## U2.1d Existing Flux Absence Evidence (2026-07-27)
+
+- `collect_android_existing_flux_ownership` is read-only: it never creates the durable root,
+  acquires an ownership lock, reads process command lines, signals a process, or changes kernel
+  state. Durable files are observed twice through one no-follow root descriptor; exact Flux process
+  identities are observed twice through bounded no-follow `/proc/<pid>/stat` reads.
+- Any journal, lease, shared writer lock, retained archived target, exact `fluxd`/`addrsyncd`/
+  `sing-box` process, native or bridge-era chain, legacy table/priority, native rule protocol, or
+  canonical native local route rejects clean absence. Missing roots and checksum-valid zero-target
+  archives are clean; malformed archives and symlinked roots/stat files fail closed.
+- The process budget includes numeric and nonnumeric entries. Leading-zero or overflowing numeric
+  entries reject instead of hiding possible ownership, while PID plus start-time identity prevents
+  reuse from making two scans appear equal.
+- The observed missing-journal identity binds the Capability Profile digest, namespace, inventory
+  snapshot/epoch/counts, durable path/root identity, complete xtables digest, archive presence and
+  digest, six named ownership counts, and packet/socket/conntrack complete-absence signatures.
+- Verification passes 13 focused ownership tests, 47 complete census tests with three privileged
+  smokes ignored, 403 complete `flux-platform` library tests with seven documented host/root
+  ignores, all-target compile, strict all-feature Clippy, pinned ARM64/API-31 cross-check,
+  repository CI, rustfmt, diff hygiene, and scoped secret/device-identifier scans. No device command
+  or mutation occurred.

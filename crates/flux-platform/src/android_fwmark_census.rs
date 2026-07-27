@@ -10,10 +10,18 @@ use flux_core::{
 };
 use sha2::{Digest, Sha256};
 
+mod existing_flux;
 mod nftables;
 mod read_only_netlink;
 mod traffic_control_bpf;
 mod xfrm;
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use existing_flux::collect_android_existing_flux_ownership;
+pub use existing_flux::{
+    AndroidExistingFluxOwnershipDigest, AndroidExistingFluxOwnershipError,
+    AndroidExistingFluxOwnershipErrorKind, AndroidExistingFluxOwnershipObservation,
+};
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use nftables::collect_android_nftables_fwmarks;
@@ -1218,7 +1226,7 @@ impl ParsedRuleset {
         self.tables
             .values()
             .flat_map(|table| table.chains.keys())
-            .filter(|chain| chain.starts_with("FLX"))
+            .filter(|chain| crate::xtables::is_flux_owned_chain(chain))
             .count()
     }
 

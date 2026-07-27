@@ -39,6 +39,49 @@ const MAX_ARCHIVE_TARGETS: usize = 2;
 const MAX_PRIVATE_CHAINS_PER_FAMILY: usize = 8;
 const MAX_STABLE_ARTIFACT_BYTES: usize = 64 * 1024;
 
+/// Privacy-reduced validation result for one durable target archive.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NativeXtablesTargetArchiveObservation {
+    present: bool,
+    target_count: usize,
+    digest: [u8; 32],
+}
+
+impl NativeXtablesTargetArchiveObservation {
+    #[must_use]
+    pub(crate) const fn present(self) -> bool {
+        self.present
+    }
+
+    #[must_use]
+    pub(crate) const fn target_count(self) -> usize {
+        self.target_count
+    }
+
+    #[must_use]
+    pub(crate) const fn digest(self) -> [u8; 32] {
+        self.digest
+    }
+}
+
+pub(crate) fn observe_native_xtables_target_archive(
+    encoded: Option<&[u8]>,
+) -> Result<NativeXtablesTargetArchiveObservation, NativeXtablesTargetArchiveError> {
+    let Some(encoded) = encoded else {
+        return Ok(NativeXtablesTargetArchiveObservation {
+            present: false,
+            target_count: 0,
+            digest: [0; 32],
+        });
+    };
+    let targets = decode_archive(encoded)?;
+    Ok(NativeXtablesTargetArchiveObservation {
+        present: true,
+        target_count: targets.len(),
+        digest: Sha256::digest(encoded).into(),
+    })
+}
+
 #[derive(Clone)]
 pub(crate) struct DurableNativeXtablesTargetResolver {
     store: NativeXtablesDurableStore,

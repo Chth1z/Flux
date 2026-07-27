@@ -2266,7 +2266,7 @@ rollback, and exact cleanup.
 - [x] U2.1c: Bracket every TC filter plus the kernel-global loaded-eBPF superset, retain exact
   verifier-rewritten program digests, and conservatively classify reachable mark planes without
   trusting program names or rewritten private offsets.
-- [ ] U2.1d: Prove existing Flux absence across durable files, processes, chains, policy routing,
+- [x] U2.1d: Prove existing Flux absence across durable files, processes, chains, policy routing,
   journal, lease, lock, and archive; derive the clean-journal identity from that observed proof.
 - [ ] U2.1e: Assemble all 27 source-plane cells and one bounded sanitized diagnostic projection,
   with adversarial completeness, budget, drift, and privacy tests.
@@ -2333,6 +2333,17 @@ rollback, and exact cleanup.
   `0644` documentation before staging; their byte content and compiled policy digest are unchanged.
 
 ### U2 Errors Encountered
+- U2.1d semantic review found that the process-scan budget counted only successfully parsed PID
+  entries and silently skipped malformed all-numeric names. Count every `/proc` entry against the
+  bound and reject leading-zero or overflowing numeric names, so a hostile namespace cannot hide
+  work or ownership evidence behind an unbounded or noncanonical process directory.
+- The first U2.1d clean-absence digest ended with three unlabeled zero bytes. Replace them with one
+  versioned fixed-order signature plus six explicitly encoded zero counts and the exact three-plane
+  complete-absence signature; the journal identity remains domain-separated but its grammar is now
+  reviewable and covered by archive-presence binding tests.
+- The first U2.1d all-target compile ran before its declared nested test module existed and also
+  found one Rust-1.93 method-reference mismatch plus two broad import groups. Add the hostile
+  fixture module, use an explicit `Option` closure, and narrow the imports; no test binary ran.
 - The first one-shot inventory check stopped at rustfmt on three wrapping-only differences before
   compilation. Apply canonical formatting and rerun the unchanged `flux-platform` check.
 - The first U2.1 parser compile found three `Result<_, ()>` helpers whose failures were not yet
@@ -2439,8 +2450,22 @@ rollback, and exact cleanup.
 - The original-instruction analyzer was removed rather than retained as non-authorizing runtime
   work; `traffic_control_bpf.rs` decreased from 1,965 to 1,005 lines before final formatting.
 - No device command or mutation occurred during U2.1c host implementation.
+- U2.1d adds one strictly read-only existing-Flux collector. It brackets descriptor-anchored
+  journal/lease/writer-lock/archive observation around two bounded exact-name `/proc` scans, rejects
+  native and bridge-era chains plus legacy/native routing residue, and accepts only a missing or
+  checksum-valid zero-target archive as clean.
+- The missing-journal identity is derived from a domain-separated canonical absence digest binding
+  the Capability Profile, network namespace, inventory snapshot/epoch/counts, durable root
+  path/identity, complete xtables digest, validated archive, six explicit zero ownership counts,
+  and the exact three-plane complete-absence signature.
+- U2.1d verification passes 13 focused ownership tests, 47 complete census tests with three
+  privileged smokes ignored, and 403 complete `flux-platform` library tests with seven documented
+  host/root ignores. All-target compile, strict all-target/all-feature Clippy, the pinned
+  ARM64/API-31 cross-check, rustfmt, diff hygiene, scoped credential/device-identifier scans, and
+  the complete `cargo xtask ci` gate pass.
+- No device command or mutation occurred during U2.1d host implementation.
 
 ### Status
-**U2.1c complete; U2.1 in progress** - native inventory, xtables, nftables, XFRM, TC-filter, and
-loaded-eBPF observation are host-verified. Implement Flux-absence/journal evidence, then assemble
-the complete 27-cell external A/native/B coordinator before device work.
+**U2.1d complete; U2.1e is next** - every individual external source plus existing-Flux absence is
+host-verified. Assemble the exact 27-cell matrix and bounded sanitized diagnostic projection with
+hostile completeness, budget, drift, and privacy tests before any device work.

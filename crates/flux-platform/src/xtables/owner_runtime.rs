@@ -2534,6 +2534,7 @@ pub use runtime_writer::{
 #[allow(unused_imports)]
 pub(crate) use target_archive::{
     DurableNativeXtablesTargetResolver, NativeXtablesTargetArchiveError,
+    NativeXtablesTargetArchiveObservation, observe_native_xtables_target_archive,
 };
 
 #[cfg(test)]

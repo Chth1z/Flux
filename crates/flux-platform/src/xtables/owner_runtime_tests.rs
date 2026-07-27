@@ -89,6 +89,29 @@ fn durable_target_archive_round_trips_exact_runtime_material() {
 }
 
 #[test]
+fn read_only_archive_observation_distinguishes_retained_target_from_clean_settlement() {
+    let temp = TempDir::new().unwrap();
+    let store = NativeXtablesDurableStore::new(temp.path().join("run"));
+    let target = target(7, AddressHostFamilySelection::Ipv4, false);
+    let resolver = DurableNativeXtablesTargetResolver::open(store.clone()).unwrap();
+
+    resolver.stage(target).unwrap();
+    let durable = store.observe_read_only().unwrap();
+    let archived = observe_native_xtables_target_archive(durable.target_archive()).unwrap();
+    assert!(archived.present());
+    assert_eq!(archived.target_count(), 1);
+
+    resolver
+        .retain_state(NativeXtablesConvergedState::CleanAbsent)
+        .unwrap();
+    let durable = store.observe_read_only().unwrap();
+    let settled = observe_native_xtables_target_archive(durable.target_archive()).unwrap();
+    assert!(settled.present());
+    assert_eq!(settled.target_count(), 0);
+    assert_ne!(archived.digest(), settled.digest());
+}
+
+#[test]
 fn durable_target_archive_retains_replacement_pair_then_prunes_to_settled_state() {
     let temp = TempDir::new().unwrap();
     let store = NativeXtablesDurableStore::new(temp.path().join("run"));

@@ -7,6 +7,7 @@ use std::mem::MaybeUninit;
 use std::num::NonZeroU64;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -264,6 +265,62 @@ pub(crate) struct NativeXtablesDurableStore {
     test_control: TestControl,
 }
 
+/// Stable identity of one descriptor-anchored durable root.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NativeXtablesDurableRootIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl NativeXtablesDurableRootIdentity {
+    #[must_use]
+    pub(crate) const fn device(self) -> u64 {
+        self.device
+    }
+
+    #[must_use]
+    pub(crate) const fn inode(self) -> u64 {
+        self.inode
+    }
+}
+
+/// One strictly read-only, no-follow snapshot of native ownership artifacts.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NativeXtablesDurableReadOnlyObservation {
+    root_identity: Option<NativeXtablesDurableRootIdentity>,
+    journal_present: bool,
+    lease_present: bool,
+    writer_lock_present: bool,
+    target_archive: Option<Box<[u8]>>,
+}
+
+impl NativeXtablesDurableReadOnlyObservation {
+    #[must_use]
+    pub(crate) const fn root_identity(&self) -> Option<NativeXtablesDurableRootIdentity> {
+        self.root_identity
+    }
+
+    #[must_use]
+    pub(crate) const fn journal_present(&self) -> bool {
+        self.journal_present
+    }
+
+    #[must_use]
+    pub(crate) const fn lease_present(&self) -> bool {
+        self.lease_present
+    }
+
+    #[must_use]
+    pub(crate) const fn writer_lock_present(&self) -> bool {
+        self.writer_lock_present
+    }
+
+    #[must_use]
+    pub(crate) fn target_archive(&self) -> Option<&[u8]> {
+        self.target_archive.as_deref()
+    }
+}
+
 impl NativeXtablesDurableStore {
     #[must_use]
     pub(crate) fn new(root: impl AsRef<Path>) -> Self {
@@ -292,6 +349,46 @@ impl NativeXtablesDurableStore {
     #[must_use]
     pub(crate) fn target_archive_path(&self) -> PathBuf {
         self.root.join(NATIVE_XTABLES_TARGET_ARCHIVE_FILE_NAME)
+    }
+
+    /// Observes all ownership-bearing artifacts through one anchored root without creating,
+    /// locking, parsing, renaming, or removing any path.
+    pub(crate) fn observe_read_only(
+        &self,
+    ) -> Result<NativeXtablesDurableReadOnlyObservation, NativeXtablesDurableError> {
+        let Some(root) = open_root(&self.root, false)? else {
+            return Ok(NativeXtablesDurableReadOnlyObservation {
+                root_identity: None,
+                journal_present: false,
+                lease_present: false,
+                writer_lock_present: false,
+                target_archive: None,
+            });
+        };
+        let metadata = root.metadata().map_err(|source| {
+            NativeXtablesDurableError::io("inspect native xtables durable root", source)
+        })?;
+        let root_identity = Some(NativeXtablesDurableRootIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        });
+        let journal_present = named_entry_exists(&root, NATIVE_XTABLES_JOURNAL_FILE_NAME)?;
+        let lease_present = named_entry_exists(&root, NATIVE_XTABLES_LEASE_FILE_NAME)?;
+        let writer_lock_present = named_entry_exists(&root, XTABLES_WRITER_LOCK_DIRECTORY_NAME)?;
+        let target_archive = read_record_bounded(
+            &root,
+            NATIVE_XTABLES_TARGET_ARCHIVE_FILE_NAME,
+            DurableArtifact::TargetArchive,
+            MAX_NATIVE_XTABLES_TARGET_ARCHIVE_BYTES,
+        )?
+        .map(Vec::into_boxed_slice);
+        Ok(NativeXtablesDurableReadOnlyObservation {
+            root_identity,
+            journal_present,
+            lease_present,
+            writer_lock_present,
+            target_archive,
+        })
     }
 
     pub(crate) fn load_target_archive(&self) -> Result<Option<Vec<u8>>, NativeXtablesDurableError> {
@@ -1646,6 +1743,15 @@ fn classify_path_error(
         }
     }
     NativeXtablesDurableError::io("open native xtables durable path", source)
+}
+
+fn named_entry_exists(root: &File, name: &str) -> Result<bool, NativeXtablesDurableError> {
+    let name = static_c_string(name);
+    entry_kind(root.as_raw_fd(), &name)
+        .map(|kind| kind.is_some())
+        .map_err(|source| {
+            NativeXtablesDurableError::io("inspect native xtables durable artifact", source)
+        })
 }
 
 fn read_journal(

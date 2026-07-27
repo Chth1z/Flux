@@ -2258,6 +2258,18 @@ rollback, and exact cleanup.
 - [ ] U2.7: Run focused and repository-wide verification, security/path scans, update durable
   evidence, review the complete diff, and create the separate U2 commit before C3 mutation.
 
+### U2.1 Execution Plan
+- [x] U2.1a: Implement the bounded subscribed one-shot route inventory and complete dual-stack
+  xtables parser; verify and commit the isolated foundation.
+- [x] U2.1b: Add bounded read-only netlink framing plus native nftables and privacy-reduced XFRM
+  enumeration. Unknown, interrupted, truncated, drifting, or unmodeled semantics must fail closed.
+- [ ] U2.1c: Enumerate relevant TC/BPF attachment domains, retrieve every exact attached program,
+  and classify packet/socket/conntrack mark reads and writes without trusting program names.
+- [ ] U2.1d: Prove existing Flux absence across durable files, processes, chains, policy routing,
+  journal, lease, lock, and archive; derive the clean-journal identity from that observed proof.
+- [ ] U2.1e: Assemble all 27 source-plane cells and one bounded sanitized diagnostic projection,
+  with adversarial completeness, budget, drift, and privacy tests.
+
 ### U2 Decisions
 - The native rtnetlink inventory is the sole links/addresses/routes/rules snapshot. External mark
   state must compare canonically equal on both sides of that transaction; merging observations from
@@ -2340,6 +2352,27 @@ rollback, and exact cleanup.
 - The first checkpoint `git add` could not create `.git/index.lock` under the workspace's read-only
   Git metadata boundary. The approved, path-scoped staging retry succeeded; no repository content
   changed during the failed attempt.
+- The first U2.1b warnings-denied Clippy run found only two local style issues: a collapsible
+  nftables FIB-mark predicate and one needless digest borrow. Apply the canonical forms and rerun
+  the unchanged focused gate; all-target compilation had already passed.
+- The two ignored live U2.1b smoke tests reached their native netlink requests on WSL but both
+  received `EPERM` from the unprivileged host namespace. Retain them as explicit privileged smoke
+  gates; this host result is not absence evidence and does not replace ARM64 execution.
+- The first transfer-separation compile found one missing local nftables limit-error constructor
+  introduced when the transfer budget reused the existing typed failure. Add that constructor; no
+  test binary ran in the failed compile.
+- The first semantic-hardening patch for terminal netlink framing matched an older context and
+  changed no file. Reapply the transport extraction as one exact-context hunk, then add its test
+  separately.
+- The new message-after-completion regression first found that its pure framing helper was private
+  to the implementation child module. Narrowly expose it to the parent module with `pub(super)`;
+  production execution was not reached by the failed test compile.
+- The first XFRM opaque-payload privacy rerun stopped at rustfmt on one fixture wrapping change
+  before compiling tests. Apply canonical formatting, remove the now-unused raw-byte digest helper,
+  and rerun the unchanged focused and complete checkpoint gates.
+- The first combined final credential/serial regex had mismatched shell quoting and performed no
+  scan. Split it into simple hardware-serial, private-key/cloud-key, and credential-assignment
+  scans; each corrected check passed.
 
 ### U1 Verification
 - `cargo test -p flux-core`: passed all unit, integration, and documentation tests.
@@ -2350,17 +2383,28 @@ rollback, and exact cleanup.
 
 ### U2.1 Checkpoint Evidence
 - The bounded subscribed one-shot route inventory and complete dual-stack xtables canonical parser
-  are implemented as the first U2.1 foundation. The remaining external sources, completeness
-  matrix, sanitized report, and coordinator are deliberately not claimed by this checkpoint.
-- `cargo test -p flux-platform android_fwmark_census --lib`: 12 passed, 0 failed.
-- `cargo test -p flux-platform --lib`: 367 passed, 0 failed, 4 ignored for documented host/root
+  are implemented as the first U2.1 foundation.
+- U2.1b adds one 30-second-maximum, 16 MiB/65,536-message read-only netlink transport. It rejects
+  non-kernel senders, subscribed notifications, `DUMP_INTR`, truncation/overrun, malformed terminal
+  framing, messages after completion, resource exhaustion, kernel rejection, and deadline expiry.
+- Native nftables enumeration uses `NETLINK_NETFILTER`, not an `nft` executable. It projects
+  packet/socket/conntrack mark operations, keeps exact cross-plane register copies under separate
+  transfer evidence, and makes unknown, compat, dynamic, or ambiguous semantics opaque.
+- Native XFRM state/policy enumeration retains only counts, mark masks, and a canonical digest;
+  endpoint-bearing fixed fields and unknown-attribute payload bytes are deliberately excluded. The
+  fixed 224-byte state and 168-byte policy UAPI offsets remain an explicit ARM64 runtime-validation
+  item.
+- `cargo test -p flux-platform android_fwmark_census --lib`: 27 passed, 0 failed, 2 privileged
+  smoke tests ignored.
+- `cargo test -p flux-platform --lib`: 382 passed, 0 failed, 6 ignored for documented host/root
   requirements.
 - `cargo check -p flux-platform --all-targets`: passed.
 - `cargo clippy -p flux-platform --all-targets --all-features -- -D warnings`: passed.
-- `cargo fmt --all -- --check`, `git diff --check`, and the exact hardware-serial scan passed.
+- `cargo xtask check-android`, `cargo fmt --all -- --check`, `git diff --check`, and the
+  hardware-serial/credential scan passed.
 - No device command or mutation occurred during this host checkpoint.
 
 ### Status
-**U2.1 in progress** - the one-shot native inventory and xtables parser are verified and ready for a
-local checkpoint commit. Implement kernel nftables, TC/BPF, XFRM, Flux-absence/journal evidence,
-then assemble the complete 27-cell external A/native/B coordinator before any device mutation.
+**U2.1b complete; U2.1 in progress** - native inventory, xtables, nftables, XFRM, and the shared
+read-only netlink transport are host-verified. Implement TC/BPF inspection, Flux-absence/journal
+evidence, then assemble the complete 27-cell external A/native/B coordinator before device work.

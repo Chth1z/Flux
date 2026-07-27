@@ -1678,3 +1678,26 @@ It does not yet validate the production Rust composition because that compositio
 - This is a commit-sized foundation, not a complete census. Kernel nftables enumeration, exact
   TC/BPF attachment inspection, sanitized XFRM parsing, Flux absence/journal identity, the 27-cell
   matrix, A/native/B coordination, diagnostic output, and ARM64 execution remain open.
+
+## U2.1b Native Nftables And XFRM Census (2026-07-27)
+
+- One shared read-only netlink transport enforces a 1 ms to 30 second caller bound, 1 MiB datagram,
+  16 MiB retained-byte, and 65,536-message ceilings. It validates the kernel sender and exact
+  sequence, rejects subscribed multicast drift regardless of notification sequence, and rejects
+  truncation, overrun, interrupted dumps, malformed terminal payloads, messages after completion,
+  resource exhaustion, kernel errors, and timeout.
+- Native nftables rule collection uses `NETLINK_NETFILTER` and subscribes before the dump, so the
+  result does not depend on an `nft` executable. Packet, socket, conntrack, and FIB mark access is
+  conservatively full-mask; unknown, compat, dynamic, and ambiguous expression flows are opaque.
+- Exact adjacent cross-plane register copies are projected separately under
+  `ConnmarkAndSocketTransfers`; nonadjacent or multi-access flows cannot be mistaken for an exact
+  transfer. A missing/unsupported kernel subsystem is distinguished from `EPERM`, which remains a
+  hard observation error rather than absence.
+- Native XFRM state and policy dumps retain only record counts, mark masks, opaque-attribute counts,
+  and a domain-separated digest. Fixed endpoint-bearing structures never enter that digest or the
+  public observation. The 224-byte `xfrm_usersa_info` and 168-byte `xfrm_userpolicy_info` offsets
+  are host-header consistent but still require execution validation on the ARM64 target.
+- Final host verification: 27 focused census tests passed with two privileged netlink smokes
+  ignored; the complete `flux-platform` library passed 382 tests with six documented ignores;
+  all-target check, warnings-denied all-feature Clippy, rustfmt, diff hygiene, and the pinned Android
+  cross-check passed. No device command or mutation occurred.

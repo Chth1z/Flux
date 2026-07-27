@@ -27,10 +27,16 @@ pub mod socket_diagnostics;
 mod xtables;
 
 pub use android_fwmark_census::{
+    AndroidNftablesFwmarkObservation, AndroidNftablesFwmarkObservationError,
+    AndroidNftablesFwmarkObservationErrorKind, AndroidNftablesSnapshotDigest,
+    AndroidXfrmFwmarkObservation, AndroidXfrmFwmarkObservationError,
+    AndroidXfrmFwmarkObservationErrorKind, AndroidXfrmSnapshotDigest,
     AndroidXtablesFwmarkObservation, AndroidXtablesFwmarkObservationError,
     AndroidXtablesFwmarkObservationErrorKind, AndroidXtablesSnapshotDigest,
     observe_android_xtables_fwmarks,
 };
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use android_fwmark_census::{collect_android_nftables_fwmarks, collect_android_xfrm_fwmarks};
 pub use capability::{CapabilityProfilePaths, SystemCapabilityProfileSource};
 pub use file_observer::{FileObservationBatch, FileObservationError, FileObservationPaths};
 pub use legacy_dispatcher::{LegacyScriptPaths, ProcessLegacyDispatcher};

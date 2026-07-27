@@ -10,6 +10,23 @@ use flux_core::{
 };
 use sha2::{Digest, Sha256};
 
+mod nftables;
+mod read_only_netlink;
+mod xfrm;
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use nftables::collect_android_nftables_fwmarks;
+pub use nftables::{
+    AndroidNftablesFwmarkObservation, AndroidNftablesFwmarkObservationError,
+    AndroidNftablesFwmarkObservationErrorKind, AndroidNftablesSnapshotDigest,
+};
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use xfrm::collect_android_xfrm_fwmarks;
+pub use xfrm::{
+    AndroidXfrmFwmarkObservation, AndroidXfrmFwmarkObservationError,
+    AndroidXfrmFwmarkObservationErrorKind, AndroidXfrmSnapshotDigest,
+};
+
 const MAX_XTABLES_SNAPSHOT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_XTABLES_SNAPSHOT_LINES: usize = 65_536;
 const MAX_XTABLES_LINE_BYTES: usize = 8 * 1024;

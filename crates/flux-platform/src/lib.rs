@@ -7,6 +7,7 @@ use std::fmt;
 // owns the higher-level snapshot interface that consumes it.
 #[allow(dead_code)]
 mod address_sync;
+mod android_fwmark_census;
 mod android_identity;
 mod android_identity_properties;
 mod capability;
@@ -25,10 +26,17 @@ mod sing_box;
 pub mod socket_diagnostics;
 mod xtables;
 
+pub use android_fwmark_census::{
+    AndroidXtablesFwmarkObservation, AndroidXtablesFwmarkObservationError,
+    AndroidXtablesFwmarkObservationErrorKind, AndroidXtablesSnapshotDigest,
+    observe_android_xtables_fwmarks,
+};
 pub use capability::{CapabilityProfilePaths, SystemCapabilityProfileSource};
 pub use file_observer::{FileObservationBatch, FileObservationError, FileObservationPaths};
 pub use legacy_dispatcher::{LegacyScriptPaths, ProcessLegacyDispatcher};
 pub use network_observer::NetworkInventorySource;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use network_observer::collect_network_inventory_once;
 pub use phase_dispatcher::{
     DispatcherPhaseCommand, PhaseDispatcherError, PhaseDispatcherErrorKind, PhaseDispatcherPaths,
     ProcessPhaseDispatcher,

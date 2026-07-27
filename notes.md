@@ -1654,3 +1654,27 @@ It does not yet validate the production Rust composition because that compositio
   rejects.
 - Focused `flux-core` tests pass all unit, integration, and documentation targets. Warnings-denied
   all-feature/all-target `flux-core` Clippy also passes. No device mutation occurred during U1.
+
+## U2.1 Android Mark Census Foundation (2026-07-27)
+
+- `flux-platform` now exposes one bounded, subscribed LINK -> ADDRESS -> ROUTE -> RULE inventory
+  transaction using the same loss-aware observer as the daemon. Zero and greater-than-30-second
+  bounds fail before socket creation; repeated poll interruption and saturated receive draining
+  cannot extend the caller's deadline.
+- The dual-stack xtables collector accepts only complete bounded `iptables-save` documents. Its
+  canonical digest ignores comments and counters, preserves semantic per-chain rule order, and
+  changes on selector, target, value, mask, or family drift.
+- Packet predicates/writes remain separate from conntrack/socket transfers. Effective mutation
+  masks include value bits outside supplied masks; exact no-op operations and zero transfer planes
+  emit no false mark use. Unknown mark-related options, duplicate targets/mutations, malformed
+  family/line syntax, dynamic Android incoming selectors, and opaque contexts reject.
+- Ordered INPUT/POSTROUTING records require one direct hook, exact child/rule ordinals, a selector
+  digest, no candidate-overlapping persistence, and no earlier potentially matching overlap. Exact
+  positive input/output interface differences are the only selector disjointness proof currently
+  admitted.
+- Host verification passes: 12 focused parser tests; 367 `flux-platform` library tests with four
+  environment-dependent ignores; all-target compile; warnings-denied all-feature/all-target
+  Clippy; rustfmt and diff checks. No device command or mutation occurred.
+- This is a commit-sized foundation, not a complete census. Kernel nftables enumeration, exact
+  TC/BPF attachment inspection, sanitized XFRM parsing, Flux absence/journal identity, the 27-cell
+  matrix, A/native/B coordination, diagnostic output, and ARM64 execution remain open.

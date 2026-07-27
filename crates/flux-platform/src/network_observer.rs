@@ -19,6 +19,9 @@ use crate::netlink::rule::{NetworkRuleEvent, RuleDatagram, RuleEventDecodeError}
 
 pub(crate) mod driver;
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use driver::collect_network_inventory_once;
+
 /// A cloneable view of the latest complete network inventory.
 ///
 /// Clones share immutable snapshots. `snapshot` returns `None` before the

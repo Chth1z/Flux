@@ -2,9 +2,13 @@ use std::io;
 use std::num::NonZeroUsize;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use std::os::fd::BorrowedFd;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use flux_core::NetworkEpoch;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use flux_core::NetworkInventory;
 
 use crate::PlatformError;
 use crate::address_sync::{AddressEventPolicy, RtnetlinkAddressEventDecoder};
@@ -31,6 +35,8 @@ const DEFAULT_MAXIMUM_DEBOUNCE: Duration = Duration::from_millis(250);
 const DEFAULT_DUMP_SEND_RETRY: Duration = Duration::from_millis(50);
 const DEFAULT_READY_DATAGRAM_BUDGET: usize = 16;
 const DEFAULT_READY_BYTE_BUDGET: usize = 1024 * 1024;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const MAX_ONE_SHOT_INVENTORY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A hard per-turn receive budget for the route inventory driver.
 ///
@@ -175,6 +181,121 @@ impl RouteNetworkInventoryDriver {
     /// before any permanent transport error is returned.
     pub(crate) fn disable(&mut self) {
         self.inner.disable();
+    }
+}
+
+/// Collects one complete subscribed route-netlink inventory within an explicit bound.
+///
+/// This drives the same loss-aware LINK, ADDRESS, ROUTE, and RULE transaction as the daemon's
+/// long-lived observer. The socket is subscribed before the first dump request, and no partial or
+/// stale inventory is returned.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn collect_network_inventory_once(
+    timeout: Duration,
+) -> Result<Arc<NetworkInventory>, PlatformError> {
+    if timeout.is_zero() || timeout > MAX_ONE_SHOT_INVENTORY_TIMEOUT {
+        return Err(invalid_one_shot_timeout());
+    }
+    let started = Instant::now();
+    let deadline = started
+        .checked_add(timeout)
+        .ok_or_else(invalid_one_shot_timeout)?;
+    let (mut driver, source) =
+        RouteNetworkInventoryDriver::open(AddressEventPolicy::new(true), started)?;
+
+    loop {
+        if let Some(snapshot) = source.snapshot() {
+            return Ok(snapshot);
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            driver.disable();
+            return Err(one_shot_timeout());
+        }
+        driver.drive_due(now)?;
+        if let Some(snapshot) = source.snapshot() {
+            return Ok(snapshot);
+        }
+
+        wait_for_inventory_readiness(
+            driver.readiness_fd(),
+            driver
+                .next_deadline()
+                .map_or(deadline, |next| next.min(deadline)),
+        )?;
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                driver.disable();
+                return Err(one_shot_timeout());
+            }
+            let report = driver.drive_ready(RouteNetworkInventoryWorkBudget::default(), now)?;
+            if report.disposition() != RouteNetworkInventoryDriveDisposition::BudgetExhausted {
+                break;
+            }
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn wait_for_inventory_readiness(
+    descriptor: BorrowedFd<'_>,
+    deadline: Instant,
+) -> Result<(), PlatformError> {
+    use std::os::fd::AsRawFd;
+
+    let mut poll_fd = libc::pollfd {
+        fd: descriptor.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let timeout_ms = remaining.as_millis().min(i32::MAX as u128) as i32;
+        // SAFETY: `poll_fd` points to one initialized poll descriptor borrowed for this call.
+        let result = unsafe { libc::poll(&raw mut poll_fd, 1, timeout_ms) };
+        if result >= 0 {
+            if poll_fd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+                return Err(PlatformError::SystemCall {
+                    operation: "wait for one-shot route-netlink inventory",
+                    source: io::Error::other(format!(
+                        "route-netlink descriptor reported events {:#x}",
+                        poll_fd.revents
+                    )),
+                });
+            }
+            return Ok(());
+        }
+        let source = io::Error::last_os_error();
+        if source.raw_os_error() != Some(libc::EINTR) {
+            return Err(PlatformError::SystemCall {
+                operation: "wait for one-shot route-netlink inventory",
+                source,
+            });
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn invalid_one_shot_timeout() -> PlatformError {
+    PlatformError::SystemCall {
+        operation: "validate one-shot route-netlink inventory timeout",
+        source: io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("timeout must be nonzero and at most {MAX_ONE_SHOT_INVENTORY_TIMEOUT:?}"),
+        ),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn one_shot_timeout() -> PlatformError {
+    PlatformError::SystemCall {
+        operation: "collect one-shot route-netlink inventory",
+        source: io::Error::new(
+            io::ErrorKind::TimedOut,
+            "complete LINK/ADDRESS/ROUTE/RULE inventory was not published before the deadline",
+        ),
     }
 }
 
@@ -779,6 +900,22 @@ mod tests {
         );
         assert!(RouteNetworkInventoryWorkBudget::new(0, 1024 * 1024).is_none());
         assert!(RouteNetworkInventoryWorkBudget::new(1, ROUTE_DATAGRAM_CAPACITY - 1).is_none());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn one_shot_timeout_bounds_fail_before_socket_open() {
+        for timeout in [Duration::ZERO, Duration::from_secs(31)] {
+            let error = collect_network_inventory_once(timeout)
+                .expect_err("invalid bounds must fail before opening route netlink");
+            assert!(matches!(
+                error,
+                PlatformError::SystemCall {
+                    operation: "validate one-shot route-netlink inventory timeout",
+                    source,
+                } if source.kind() == io::ErrorKind::InvalidInput
+            ));
+        }
     }
 
     #[test]

@@ -2236,6 +2236,42 @@ rollback, and exact cleanup.
 - [ ] U5: Complete R6 by promoting, staging, verifying, installing, exercising, uninstalling, and
   cleaning the exact Rust-only package; commit Gate 2 evidence and final profile status.
 
+### U2 Subphases
+- [ ] U2.1: Freeze the bounded external-source snapshot protocol, canonical parser, completeness
+  matrix, sanitized diagnostic report, and exact ordered-write selector-digest grammar with hostile
+  host fixtures.
+- [ ] U2.2: Add one production-shaped `flux-platform` coordinator that brackets a native
+  rtnetlink inventory with identical external snapshots A/B, binds capability identity before and
+  after, and returns either a non-authorizing diagnostic or one consumed planning authority.
+- [ ] U2.3: Add the explicit-serial `xtask` runner and stripped ARM64 collector probe. Require the
+  repository root-shell stdin contract, bounded output/time, owner-only generated remote paths,
+  independent process/file cleanup, and post-run identity revalidation.
+- [ ] U2.4: Run diagnostic mode read-only on the clean target, retain only bounded counts, masks,
+  ordinals, chain names, and selector digests, and stop on any incomplete/opaque/denied cell or A/B
+  drift. Do not persist raw endpoints, boot ID, hardware serial, credentials, or unrelated state.
+- [ ] U2.5: Review the exact sanitized ordered-write records, publish Samsung policy v2 with a new
+  document digest and revision, and add catalog regression tests. No live observation may rewrite
+  or supply catalog policy at runtime.
+- [ ] U2.6: Rerun the same coherent collector on the unchanged boot/profile, consume the complete
+  census once into one `AndroidMarkPlanningAuthority`, verify its canonical evidence binding, and
+  independently prove device cleanup and identity stability.
+- [ ] U2.7: Run focused and repository-wide verification, security/path scans, update durable
+  evidence, review the complete diff, and create the separate U2 commit before C3 mutation.
+
+### U2 Decisions
+- The native rtnetlink inventory is the sole links/addresses/routes/rules snapshot. External mark
+  state must compare canonically equal on both sides of that transaction; merging observations from
+  different times is non-authorizing.
+- Absence of an `nft` executable is not nftables absence. TC/BPF enumeration must cover relevant
+  attachment points and inspect exact programs; XFRM reporting must exclude endpoints.
+- MARK predicate/write operations and CONNMARK/socket transfers remain distinct evidence records.
+  Existing Flux absence covers durable files, processes, chains, RPDB/routes, and ownership state.
+- A clean missing journal receives a domain-separated observed-absence identity derived from the
+  exact absence proof and bound capability/inventory facts. A hard-coded or caller-invented journal
+  identity cannot authorize planning.
+- U2 diagnostic mode may run with policy v1 and must remain non-authorizing. Only a checked-in,
+  independently reviewed v2 can admit the exact ordered-write set observed by a later fresh run.
+
 ### Fresh U0 Evidence
 - The repository worktree is clean at `de12787`; no local-only uncommitted file is carried into the
   revised qualification.
@@ -2272,6 +2308,39 @@ rollback, and exact cleanup.
 - The two newly created Markdown artifacts inherited executable mode. Normalize them to ordinary
   `0644` documentation before staging; their byte content and compiled policy digest are unchanged.
 
+### U2 Errors Encountered
+- The first one-shot inventory check stopped at rustfmt on three wrapping-only differences before
+  compilation. Apply canonical formatting and rerun the unchanged `flux-platform` check.
+- The first U2.1 parser compile found three `Result<_, ()>` helpers whose failures were not yet
+  mapped into the typed family/line error and one `&Box<str>` reference projection. Map the helper
+  failures at their rule boundary and return borrowed `&str` values; no parser test executed.
+- The first U2.1 parser run passed four of eight tests. It exposed one real arithmetic gap in
+  `--and-mark`/effective set-mask handling plus three fixture assertions that counted chains rather
+  than rules, expected both families to inherit one-family transfer drift, or compared the first
+  sorted record instead of the changed INPUT record. Correct the arithmetic and tighten the tests.
+- The next formatted U2.1 parser run passed two of eight tests because the arithmetic correction
+  parsed every mutation token as a scalar before dispatching `--set-mark`/`--set-xmark`; valid
+  `value/mask` forms therefore failed as `InvalidMarkValue`. Dispatch by operation first, retain an
+  explicit no-op result, and add hostile syntax/context fixtures before rerunning the same target.
+- The expanded U2.1 run passed eight of twelve tests. Exact Android incoming writers on different
+  interfaces were conservatively treated as earlier matching overlaps, suppressing their ordered
+  records, and one old negative fixture still expected `value` bits outside a supplied set-mask to
+  be invalid rather than part of the effective write mask. Prove only exact positive interface
+  selectors disjoint and update that fixture to assert the expanded mask.
+- One combined follow-up patch did not match a rustfmt-wrapped mutation fixture and changed no
+  files. Split the plan, source, and test hunks against their current exact contexts.
+- The first split test patch encoded literal fixture line feeds incorrectly and matched nothing.
+  Reapply that test-only hunk with an explicit backslash; the source ordering fix already applied.
+- The disjoint-interface helper compile reached one redundant `.copied()` on an `Option<&str>`.
+  Remove it; `Option::filter` already preserves the borrowed string.
+- Pre-commit diff review found that repeated `poll(2)` interruption could reuse the full wait and a
+  continuously budget-exhausted receive queue could outlive the one-shot deadline. Recompute the
+  remaining poll bound after every `EINTR`, check the outer deadline between receive budgets, and
+  cover invalid public bounds before any socket open.
+- The first checkpoint `git add` could not create `.git/index.lock` under the workspace's read-only
+  Git metadata boundary. The approved, path-scoped staging retry succeeded; no repository content
+  changed during the failed attempt.
+
 ### U1 Verification
 - `cargo test -p flux-core`: passed all unit, integration, and documentation tests.
 - `cargo clippy -p flux-core --all-targets --all-features -- -D warnings`: passed.
@@ -2279,7 +2348,19 @@ rollback, and exact cleanup.
   warnings-denied Clippy, and the pinned ARM64/API-31 cross-check.
 - `cargo fmt --all -- --check`, `git diff --check`, and the hardware-serial scan passed.
 
+### U2.1 Checkpoint Evidence
+- The bounded subscribed one-shot route inventory and complete dual-stack xtables canonical parser
+  are implemented as the first U2.1 foundation. The remaining external sources, completeness
+  matrix, sanitized report, and coordinator are deliberately not claimed by this checkpoint.
+- `cargo test -p flux-platform android_fwmark_census --lib`: 12 passed, 0 failed.
+- `cargo test -p flux-platform --lib`: 367 passed, 0 failed, 4 ignored for documented host/root
+  requirements.
+- `cargo check -p flux-platform --all-targets`: passed.
+- `cargo clippy -p flux-platform --all-targets --all-features -- -D warnings`: passed.
+- `cargo fmt --all -- --check`, `git diff --check`, and the exact hardware-serial scan passed.
+- No device command or mutation occurred during this host checkpoint.
+
 ### Status
-**U2 next** - U1 is implemented and full repository verification passes without device mutation. Build the
-bounded coherent collector, update the reviewed policy only from sanitized exact records, and prove
-one-shot C2 authority before any C3 or writer-transfer mutation.
+**U2.1 in progress** - the one-shot native inventory and xtables parser are verified and ready for a
+local checkpoint commit. Implement kernel nftables, TC/BPF, XFRM, Flux-absence/journal evidence,
+then assemble the complete 27-cell external A/native/B coordinator before any device mutation.

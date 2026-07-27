@@ -1814,3 +1814,87 @@ It does not yet validate the production Rust composition because that compositio
 - Final verification passes all eight focused tests, the complete `flux-platform` suite and doc
   tests, all-target compilation, warnings-denied all-target/all-feature Clippy, the pinned Android
   cross-check, and the complete repository CI gate. No device command or mutation occurred.
+
+## U2.3a Fixed-Path Production Census Source (2026-07-27)
+
+- `SystemAndroidFwmarkCensusSource` is the fixed production adapter for the U2.2 coordinator. It
+  uses `SystemCapabilityProfileSource`, the subscribed one-shot rtnetlink inventory, native
+  nftables/TC-BPF/XFRM collectors, `/system/bin` xtables save applets, and the read-only existing-Flux
+  observer rooted at `/data/adb/flux/run`.
+- `collect_android_xtables_save_snapshots` exposes only two bounded snapshot byte strings. It opens
+  and pins `iptables-save` and `ip6tables-save` before running either, requires one executable
+  digest/release/flavor, permits only fixed version probes and zero-argument saves, revalidates both
+  identities around collection, and shares one aggregate monotonic deadline. Command and restore
+  applets are neither discovered nor required.
+- One external-stage deadline covers xtables, nftables, TC/BPF, and XFRM collection. Report-facing
+  source failures contain only a stable error class; detailed local causes remain available through
+  the trusted error chain without entering the census projection.
+- Three save-boundary tests prove save-only discovery, pre-probe split-binary rejection, and
+  pre-access invalid-bound rejection. Two production-source tests prove fixed paths/stage rejection
+  and sanitized errors; a third checks that detailed causes remain private.
+- Host verification passes 5 focused tests, all-target compilation, warnings-denied
+  all-target/all-feature Clippy, and the complete `flux-platform` suite with 549 passed and 7
+  documented privileged ignores. No device command, collection, or mutation occurred.
+
+## U2.3b Diagnostic ARM64 Census Probe (2026-07-27)
+
+- The Android-only `android-fwmark-census-probe` has no CLI-configurable policy or paths. Its exact
+  request fixes `AospNetd20250324`, candidate mask/proxy/bypass values
+  `0x03000000/0x01000000/0x02000000`, `PreMarkAddressHostSet`, IPv4 and IPv6 residual local-OUTPUT
+  domains, diagnostic purpose, and a 30-second per-stage bound.
+- Execution requires `FLUX_ANDROID_FWMARK_CENSUS_REQUIRED=1`. Coordinator failures are reduced to
+  stable stage/class labels, and report output contains no capability facts, boot ID, hardware
+  serial, endpoint, credentials, raw rulesets, BPF instructions, selectors, or interface names.
+- Primary and post-primary cleanup reports each carry exactly 27 ordered source/plane cells,
+  canonical source/plane/operation/mask mark uses, bounded ordered-write provenance and selector
+  digests, exactly 36 ordered metrics, and one projection digest. The cleanup report independently
+  requires complete absence for all existing-Flux planes and zero for all eight ownership metrics.
+- The probe does not compare primary and cleanup projection digests because the separately collected
+  inventories have distinct snapshot and epoch identities. Both reports are emitted before the
+  fail-closed complete-cell check, keeping diagnostic failures bounded and reviewable without
+  creating authority.
+- Three host tests cover the compiled request, cleanup absence rules, and canonical report
+  vocabulary. The focused test, warnings-denied Clippy, and pinned NDK r27d/API-31 Android-target
+  check pass. No device command, collection, or mutation occurred.
+
+## U2.3c/U2.3d Explicit-Serial Runner And Cleanup Proof (2026-07-27)
+
+- `flux-platform` now owns the canonical projection report renderer, exact two-report parser, and
+  typed/parsed success validators. The Android probe and host runner share the same labels, metric
+  order, 512-use/128-write limits, and 128-byte core chain-name bound. Four tests round-trip a real
+  typed projection and reject one-byte-over-limit, reordered, extra, and noncanonical records.
+- The host fixes a cryptographically generated 256-bit remote token before any mutation. Root-shell
+  creation installs an inode-bound cleanup trap before `mkdir`, writes a root-owned marker, captures
+  the directory identity, and grants the observed ADB shell UID/GID mode-0700 access only for the
+  bounded push. The executable is re-hashed and sized after root ownership is restored.
+- Host cleanup is attempted after every dispatched creation transaction, including malformed or
+  lost creation output. Before deletion, both the host and root script require the original build,
+  boot, architecture, and PID-1 network namespace; deletion also requires the exact marker and,
+  when creation output arrived, the original directory device/inode. Unmarked fallback deletion is
+  forbidden. Cleanup never kills by name and separately proves process, binary, and directory
+  absence afterward.
+- Ten runner tests pass. Two execute a fake ADB around production functions to prove lost creation
+  output still dispatches cleanup plus absence proof and changed boot identity dispatches neither.
+  Additional tests cover dual execution/cleanup failure reporting, exact artifact selection,
+  owner/identity script contracts, and POSIX syntax for every generated root script. Strict
+  `xtask` and `flux-platform` Clippy pass. No device command, collection, or mutation occurred.
+
+## U2.3e Final Host Verification (2026-07-27)
+
+- `cargo xtask ci` exited zero after workspace checks, all workspace tests and documentation tests,
+  strict Clippy, and the pinned Android cross-build. Standalone suites passed 63 `xtask` tests with
+  four intentional ignores and 556 `flux-platform` tests across targets/doc tests with seven
+  documented privileged or environment-dependent ignores.
+- `cargo fmt --all -- --check`, `cargo check -p flux-platform --all-targets`, warnings-denied
+  `xtask` and all-target/all-feature `flux-platform` Clippy, `cargo xtask check-android`, and
+  `git diff --check` pass.
+- The exact release probe is a stripped Android 31 AArch64 PIE built with NDK r27d. Its host size is
+  1,017,136 bytes, SHA-256 is
+  `575f03925e5421afb109810e9a652416626fceae5b31d5411aa68a3eff378519`, and each of its four
+  `PT_LOAD` segments is aligned to `0x4000`. These are host-artifact facts, not device evidence.
+- Complete review covers 10 tracked modifications and four new Rust modules. The report schema is
+  defined only in `assembly/report.rs`; there is no `mktemp` fallback or duplicated host parser.
+  Corrected private-key, cloud-token, and credential-assignment scans found no matches. Identifier
+  and Android-path review found only synthetic test identities and the fixed paths required by the
+  source/runner contract; no physical serial, boot identity, endpoint, or credential was added.
+- No physical-device command, collection, or mutation occurred before the U2.3 checkpoint.

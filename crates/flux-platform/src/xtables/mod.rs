@@ -14,6 +14,8 @@ mod save;
 
 pub(crate) use save::is_flux_owned_chain;
 
+pub(crate) use native::collect_android_xtables_save_snapshots;
+
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub(crate) use owner::{
     NativeXtablesTargetArchiveObservation, observe_native_xtables_target_archive,

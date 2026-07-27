@@ -9,6 +9,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 mod android_canary;
+mod android_fwmark_census;
 mod android_mark_preflight;
 mod android_profile;
 mod platform_glue;
@@ -222,6 +223,9 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
         }
         "collect-android-arm64-profile" => {
             android_profile::run(android_profile::parse_options(&arguments)?)
+        }
+        "collect-android-arm64-fwmark-census" => {
+            android_fwmark_census::run(android_fwmark_census::parse_options(&arguments)?)
         }
         "xtables-oracle" => {
             let mode = xtables_oracle::parse_options(&arguments)?;
@@ -2827,6 +2831,7 @@ fn print_help() {
            test-functional-canary-android-x86_64-output-tproxy  Cross-build and run the exact checkpoint on one explicit rooted x86_64 Android serial\n\
            preflight-android-arm64-mark-ordering  Read-only ADR-0013 target viability report for one explicit rooted ARM64 Android serial\n\
            collect-android-arm64-profile  Run the production profile collector in one cleaned explicit-serial ARM64 test directory\n\
+           collect-android-arm64-fwmark-census  Run the coherent read-only fwmark census in one cleaned explicit-serial ARM64 test directory\n\
            xtables-oracle Verify or explicitly update pinned shell-generated restore fixtures; requires --check or --update\n\
            stage-module   Build and stage a Magisk tree; requires --stage DIR --runtime-binaries DIR [--profile bridge|rust-only]\n\
            verify-package Verify one package contract; requires --stage DIR [--profile bridge|rust-only]\n\

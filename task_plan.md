@@ -62,6 +62,23 @@ possible.
   ELF alignment; neither may be inferred from root UID, kernel version, or a successful cross-build.
 
 ## Errors Encountered
+- The first generated patch that removed the now-shared host report parser retained one extra blank
+  boundary and failed `apply_patch` verification without changing the file. Trim the generated
+  boundary and reapply the same parser move through `apply_patch`.
+- One parallel focused-test wrapper contained an extra JavaScript parenthesis and was rejected
+  before either Cargo command ran. Rerun the two unchanged focused commands with valid wrapper
+  syntax and capture their exits separately.
+- The first hardening patch for unmarked partial-directory cleanup encoded Rust string-continuation
+  backslashes as patch syntax and was rejected without changing the file. Reapply against the exact
+  formatted lines; host fallback cleanup now requires the ownership marker, while only the creating
+  shell's inode-bound EXIT trap may remove an unmarked partial directory.
+- The first U2.3 review-agent dispatch combined full-history inheritance with an explicit agent
+  type, which the collaboration tool rejects before starting an agent. Relaunch the same read-only
+  review with inherited agent type; no repository or device state changed.
+- The first U2.3c Cargo-artifact ambiguity test duplicated the same executable path, which the
+  production selector deliberately canonicalizes as one unique artifact. Change the hostile fixture
+  to report a second distinct executable path so it exercises real artifact ambiguity; production
+  runner behavior is unchanged.
 - The first final B2.1 `cargo xtask ci` invocation yielded into a child session whose final status
   was not retained by the wrapper; no Cargo/xtask process remained afterward, so the partial compile
   output is not evidence. Rerun with explicit session polling and record only the captured exit.
@@ -2243,7 +2260,7 @@ rollback, and exact cleanup.
 - [x] U2.2: Add one production-shaped `flux-platform` coordinator that brackets a native
   rtnetlink inventory with identical external snapshots A/B, binds capability identity before and
   after, and returns either a non-authorizing diagnostic or one consumed planning authority.
-- [ ] U2.3: Add the explicit-serial `xtask` runner and stripped ARM64 collector probe. Require the
+- [x] U2.3: Add the explicit-serial `xtask` runner and stripped ARM64 collector probe. Require the
   repository root-shell stdin contract, bounded output/time, owner-only generated remote paths,
   independent process/file cleanup, and post-run identity revalidation.
 - [ ] U2.4: Run diagnostic mode read-only on the clean target, retain only bounded counts, masks,
@@ -2280,6 +2297,90 @@ rollback, and exact cleanup.
   consume it exactly once through `authorize_android_mark_planning` in authority mode.
 - [x] U2.2d: Add deterministic sequence, drift, context, failure-precedence, diagnostic, and
   authority-boundary tests; run focused and repository-wide host verification.
+
+### U2.3 Execution Plan
+- [x] U2.3a: Add a fixed-path, deadline-bounded system coordinator source. Its xtables boundary may
+  execute only descriptor-pinned dual-stack save applets and must not expose a restore or arbitrary
+  command interface.
+- [x] U2.3b: Add a stripped release ARM64 diagnostic probe with an explicit runner-authority
+  environment gate, exact bounded sanitized report, complete-cell stop, and a second read-only
+  cleanup/absence transaction.
+- [x] U2.3c: Add the explicit-serial `xtask` runner with pinned NDK artifact selection, generated
+  owner-only remote path, root-shell stdin execution, exact pushed-ELF validation, bounded output
+  and time, and unconditional host cleanup.
+- [x] U2.3d: Independently prove probe-process absence, exact remote directory/file absence, no Flux
+  ownership residue, and unchanged build/boot/architecture/namespace identity; cover the contracts
+  with hostile host tests.
+- [x] U2.3e: Run focused and repository-wide host verification, review the scoped diff and security
+  boundaries, update durable evidence, and create a local checkpoint before device collection.
+
+### U2.3a Host Checkpoint
+- The production source fixes xtables discovery at `/system/bin` and existing-Flux durable-state
+  observation at `/data/adb/flux/run`; callers cannot substitute paths or obtain a restore or
+  arbitrary-command interface.
+- Both dual-stack save applets are opened and descriptor-pinned before execution. Their executable
+  digest, release, and flavor must agree, each identity is revalidated before and after collection,
+  and only `--version` plus zero-argument save operations are admitted under one aggregate deadline.
+- External xtables, nftables, TC/BPF, and XFRM observations share one monotonic stage deadline. The
+  public source error exposes only a stable class; concrete diagnostic context remains confined to
+  the trusted error chain and cannot enter the sanitized census report.
+- Focused collector/source tests pass 5/5. `cargo check -p flux-platform --all-targets`, strict
+  all-target/all-feature Clippy, and the complete `flux-platform` suite pass with seven intentionally
+  ignored privileged tests. No device command or mutation occurred.
+
+### U2.3b Host Checkpoint
+- `android-fwmark-census-probe` is Android-only and requires the exact
+  `FLUX_ANDROID_FWMARK_CENSUS_REQUIRED=1` runner gate. It can request only diagnostic coordinator
+  purpose with the compiled AOSP-2025 netd profile, `0x03000000/0x01000000/0x02000000` candidate,
+  `PreMarkAddressHostSet`, and IPv4 plus IPv6 residual local-OUTPUT domains.
+- The probe runs two independent system-source transactions. Each report contains only the exact
+  27 ordered coverage cells, canonical mark uses, bounded ordered writes, 36 ordered metrics, one
+  projection digest, and minimal authority/schema/count fields. Error labels expose no raw source
+  detail or device identity.
+- Both reports are emitted before completeness validation so a bounded non-authorizing failure can
+  be diagnosed. Success requires every cell in both projections to be complete, all three cleanup
+  existing-Flux cells to be `CompleteAbsent`, and all eight cleanup ownership metrics to be zero;
+  the two projection digests are deliberately not compared.
+- The compiled-request probe test plus four shared renderer/parser tests, warnings-denied probe
+  Clippy, and an exact pinned-NDK/API-31 Android target check pass. The shared contract round-trips
+  a real typed projection and accepts the canonical 128-byte chain limit while rejecting 129 bytes.
+  The workspace release profile supplies LTO, aborting panics, and stripping; the U2.3c runner must
+  still select and validate the exact release ELF. No device command or mutation occurred.
+
+### U2.3c/U2.3d Host Checkpoint
+- The explicit-serial runner selects exactly one Cargo JSON release artifact, validates the pinned
+  NDK r27d/API-31 AArch64 ELF and 16 KiB load alignment, and admits only the compiled diagnostic
+  probe request. The probe and host now share one canonical report renderer/parser/validator rather
+  than duplicating schema labels, limits, and cleanup rules.
+- A host-generated 256-bit token fixes the exact remote path before mutation. A root-shell creation
+  transaction binds that path to an owner marker and directory device/inode, then grants only the
+  observed ADB shell identity owner-only push access. Every later execution or removal rechecks the
+  marker, inode when available, owner/mode, build fingerprint, boot ID, ARM64 architecture, and
+  PID-1 network namespace before mutation.
+- Creation installs an inode-bound EXIT trap before the first `mkdir`; malformed or lost creation
+  output still enters host cleanup. Host fallback deletion requires the exact owner marker and never
+  deletes an unmarked directory. Cleanup first proves the exact process name absent and never sends
+  a signal; a surviving process, changed identity, replaced path, or missing marker fails closed.
+- Ten focused runner tests pass, including executable fake-ADB creation-output loss, cleanup and
+  independent absence dispatch, identity drift before cleanup dispatch, execution/cleanup dual
+  failure preservation, and POSIX syntax checks for every generated root script. Strict `xtask`
+  and `flux-platform` Clippy pass. No device command, collection, or mutation occurred.
+
+### U2.3e Host Checkpoint
+- `cargo xtask ci` exited zero after all workspace checks, tests, documentation tests, strict
+  Clippy gates, and the pinned Android cross-build. Standalone verification also passed 63 `xtask`
+  tests with four intentional ignores and 556 `flux-platform` tests across targets/doc tests with
+  seven documented privileged or environment-dependent ignores.
+- The release probe is a stripped Android 31 AArch64 PIE built with NDK r27d. It is 1,017,136 bytes,
+  has SHA-256 `575f03925e5421afb109810e9a652416626fceae5b31d5411aa68a3eff378519`, and all four
+  `PT_LOAD` segments satisfy the required `0x4000` alignment. This is host-artifact evidence only.
+- `cargo fmt --all -- --check`, all-target `flux-platform` check, warnings-denied `xtask` and
+  all-feature `flux-platform` Clippy, `cargo xtask check-android`, `git diff --check`, the complete
+  scoped diff review, and corrected private-key/cloud-token/credential scans pass. Identifier and
+  path review found only synthetic test identities and the fixed Android paths required by the
+  runner/source contract; no physical serial, boot identity, endpoint, or credential was added.
+- The host checkpoint contains 10 tracked modifications and four new Rust modules. No device
+  command, collection, or mutation occurred before this checkpoint.
 
 ### U2 Decisions
 - The native rtnetlink inventory is the sole links/addresses/routes/rules snapshot. External mark
@@ -2548,7 +2649,21 @@ rollback, and exact cleanup.
   `cargo xtask check-android`, and the complete `cargo xtask ci` gate pass. Rustfmt and diff hygiene
   are clean. No device command, collection, or mutation occurred during U2.2.
 
+### U2.3 Errors Encountered
+- Two exploratory read-only commands guessed obsolete module filenames
+  (`crates/flux-platform/src/xtables.rs` and `crates/flux-core/src/android_mark_policy.rs`) and
+  exited without changing files. The actual modules are `xtables/mod.rs` and
+  `android_mark_authority.rs`; subsequent reads use those paths.
+- The first combined final credential regex contained mismatched shell quoting and exited before
+  scanning. Rerun three independent private-key/cloud-token/credential-assignment scans with
+  simple quoting; all returned no matches in the 14-file U2.3 scope.
+- The first final U2.3 `git add` could not create `.git/index.lock` under the workspace's read-only
+  Git metadata boundary. The approved path-scoped retry staged exactly the 14 reviewed files; no
+  generated artifact or unrelated path entered the index.
+
 ### Status
-**U2.2 complete; U2.3 is next** - the A/native/B freshness coordinator and one-shot authority
-boundary are host-verified. Add the explicit-serial runner and stripped ARM64 collector probe before
-any physical-device census run.
+**U2.3 complete; U2.4 is next after the separate local checkpoint** - the shared report contract,
+explicit-serial runner, owner-marked transaction, unconditional cleanup path, hostile host
+coverage, and complete host gate are ready without device access. Run only the diagnostic census
+next, and stop fail-closed on noncomplete coverage, freshness drift, identity drift, or cleanup
+uncertainty.

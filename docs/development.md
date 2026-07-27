@@ -145,6 +145,29 @@ not printed. A `viable_for_full_qualification` result is still diagnostic-only: 
 digest/source-profile authentication, exact Capture Path ordering, listener/observer mark
 preservation, and VPN/netd coexistence remain separate physical-device gates.
 
+The coherent ARM64 fwmark census is a separate read-only diagnostic checkpoint:
+
+```text
+cargo xtask collect-android-arm64-fwmark-census --serial SERIAL --adb PROGRAM
+```
+
+The command requires the pinned NDK r27d/API-31 toolchain and one explicit rooted ARM64 target. It
+builds and validates the stripped 16 KiB-aligned release probe, then runs two independent census
+transactions under a compiled diagnostic-only authority gate. Output is limited to the canonical
+27 source/plane cells, mark operations and masks, bounded ordered-write chain/ordinal/selector
+records, 36 counts, and projection digests. It excludes the hardware serial, boot ID, build
+fingerprint, endpoints, credentials, raw rulesets, BPF instructions, and interface names.
+
+Before the first push, the runner proves a host-generated 256-bit remote path absent on the same
+build, boot, ARM64 architecture, and PID-1 network namespace. The owner-only directory carries an
+exact ownership marker and filesystem identity; every root script is supplied on standard input.
+Execution failure, malformed or lost creation output, timeout, disconnect, incomplete/opaque/
+denied census coverage, and ownership residue all enter mandatory cleanup. Cleanup never kills a
+process by name and refuses to delete unless the target identity and ownership proof still match.
+Success requires an independent process/file/directory absence proof plus an unchanged device
+identity. This command cannot create an `AndroidMarkPlanningAuthority`, modify networking, install
+a module, or qualify a release by itself.
+
 The compatibility submodule remains separate:
 
 ```text

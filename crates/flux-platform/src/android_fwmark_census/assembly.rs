@@ -20,6 +20,7 @@ use super::{
 };
 
 mod coordinator;
+mod report;
 
 pub use coordinator::{
     ANDROID_FWMARK_CENSUS_COLLECTOR_REVISION, AndroidFwmarkCensusCollectionStage,
@@ -29,6 +30,12 @@ pub use coordinator::{
     AndroidFwmarkCensusExternalPhase, AndroidFwmarkCensusExternalSnapshot,
     AndroidFwmarkCensusExternalSnapshotDigest, MAX_ANDROID_FWMARK_CENSUS_STAGE_BOUND,
     coordinate_android_fwmark_census,
+};
+pub use report::{
+    AndroidFwmarkCensusProbeReports, AndroidFwmarkCensusReportPhase,
+    parse_android_fwmark_census_probe_reports, validate_android_fwmark_census_probe_reports,
+    validate_android_fwmark_census_projection_report,
+    write_android_fwmark_census_projection_report,
 };
 
 pub const ANDROID_FWMARK_CENSUS_PROJECTION_CELLS: usize = 27;

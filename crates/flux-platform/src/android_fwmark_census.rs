@@ -14,6 +14,8 @@ mod assembly;
 mod existing_flux;
 mod nftables;
 mod read_only_netlink;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod system_source;
 mod traffic_control_bpf;
 mod xfrm;
 
@@ -25,9 +27,13 @@ pub use assembly::{
     AndroidFwmarkCensusCoordinatorRequest, AndroidFwmarkCensusCoordinatorRequestError,
     AndroidFwmarkCensusCoordinatorSource, AndroidFwmarkCensusExternalPhase,
     AndroidFwmarkCensusExternalSnapshot, AndroidFwmarkCensusExternalSnapshotDigest,
-    AndroidFwmarkCensusMetric, AndroidFwmarkCensusMetricKind, AndroidFwmarkCensusProjection,
-    AndroidFwmarkCensusProjectionDigest, MAX_ANDROID_FWMARK_CENSUS_STAGE_BOUND,
+    AndroidFwmarkCensusMetric, AndroidFwmarkCensusMetricKind, AndroidFwmarkCensusProbeReports,
+    AndroidFwmarkCensusProjection, AndroidFwmarkCensusProjectionDigest,
+    AndroidFwmarkCensusReportPhase, MAX_ANDROID_FWMARK_CENSUS_STAGE_BOUND,
     assemble_android_fwmark_census_projection, coordinate_android_fwmark_census,
+    parse_android_fwmark_census_probe_reports, validate_android_fwmark_census_probe_reports,
+    validate_android_fwmark_census_projection_report,
+    write_android_fwmark_census_projection_report,
 };
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -54,6 +60,12 @@ pub use xfrm::collect_android_xfrm_fwmarks;
 pub use xfrm::{
     AndroidXfrmFwmarkObservation, AndroidXfrmFwmarkObservationError,
     AndroidXfrmFwmarkObservationErrorKind, AndroidXfrmSnapshotDigest,
+};
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use system_source::{
+    SystemAndroidFwmarkCensusSource, SystemAndroidFwmarkCensusSourceError,
+    SystemAndroidFwmarkCensusSourceErrorKind,
 };
 
 const MAX_XTABLES_SNAPSHOT_BYTES: usize = 4 * 1024 * 1024;

@@ -36,8 +36,9 @@ pub use android_fwmark_census::{
     AndroidFwmarkCensusCoordinatorRequest, AndroidFwmarkCensusCoordinatorRequestError,
     AndroidFwmarkCensusCoordinatorSource, AndroidFwmarkCensusExternalPhase,
     AndroidFwmarkCensusExternalSnapshot, AndroidFwmarkCensusExternalSnapshotDigest,
-    AndroidFwmarkCensusMetric, AndroidFwmarkCensusMetricKind, AndroidFwmarkCensusProjection,
-    AndroidFwmarkCensusProjectionDigest, AndroidNftablesFwmarkObservation,
+    AndroidFwmarkCensusMetric, AndroidFwmarkCensusMetricKind, AndroidFwmarkCensusProbeReports,
+    AndroidFwmarkCensusProjection, AndroidFwmarkCensusProjectionDigest,
+    AndroidFwmarkCensusReportPhase, AndroidNftablesFwmarkObservation,
     AndroidNftablesFwmarkObservationError, AndroidNftablesFwmarkObservationErrorKind,
     AndroidNftablesSnapshotDigest, AndroidTrafficControlBpfFwmarkObservation,
     AndroidTrafficControlBpfFwmarkObservationError,
@@ -48,11 +49,16 @@ pub use android_fwmark_census::{
     AndroidXtablesFwmarkObservationErrorKind, AndroidXtablesSnapshotDigest,
     MAX_ANDROID_FWMARK_CENSUS_STAGE_BOUND, assemble_android_fwmark_census_projection,
     coordinate_android_fwmark_census, observe_android_xtables_fwmarks,
+    parse_android_fwmark_census_probe_reports, validate_android_fwmark_census_probe_reports,
+    validate_android_fwmark_census_projection_report,
+    write_android_fwmark_census_projection_report,
 };
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use android_fwmark_census::{
-    collect_android_existing_flux_ownership, collect_android_nftables_fwmarks,
-    collect_android_traffic_control_bpf_fwmarks, collect_android_xfrm_fwmarks,
+    SystemAndroidFwmarkCensusSource, SystemAndroidFwmarkCensusSourceError,
+    SystemAndroidFwmarkCensusSourceErrorKind, collect_android_existing_flux_ownership,
+    collect_android_nftables_fwmarks, collect_android_traffic_control_bpf_fwmarks,
+    collect_android_xfrm_fwmarks,
 };
 pub use capability::{CapabilityProfilePaths, SystemCapabilityProfileSource};
 pub use file_observer::{FileObservationBatch, FileObservationError, FileObservationPaths};

@@ -1,0 +1,1460 @@
+use std::collections::BTreeSet;
+use std::env;
+use std::ffi::OsString;
+use std::fs;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::Duration;
+
+use flux_platform::{
+    parse_android_fwmark_census_probe_reports, validate_android_fwmark_census_probe_reports,
+};
+use serde_json::Value;
+
+use super::android_canary::{
+    Options, adb_root_shell_output, adb_text, artifact_path_for_adb, bounded_diagnostic,
+    command_output_bounded, shell_single_quote,
+};
+use super::{
+    ANDROID_MIN_LOAD_ALIGNMENT, ANDROID_NDK_REVISION, ANDROID_RUSTFLAGS, ANDROID_TARGET,
+    ANDROID_TARGET_RUSTFLAGS_ENV, LINUX_ANDROID_HOST_BUILD_TMPDIR, android_linker, sha256_file,
+    validate_aarch64_elf, verify_ndk_revision,
+};
+
+const COMMAND: &str = "collect-android-arm64-fwmark-census";
+const CLANG_TARGET: &str = "aarch64-linux-android";
+const LINKER_ENV: &str = "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER";
+const CC_ENV: &str = "CC_aarch64_linux_android";
+const REQUIRED_ENV: &str = "FLUX_ANDROID_FWMARK_CENSUS_REQUIRED";
+const PROBE_BINARY_TARGET: &str = "android-fwmark-census-probe";
+const PROCESS_AND_REMOTE_BINARY_NAME: &str = "flx-census";
+const REMOTE_DIRECTORY_PREFIX: &str = "/data/local/tmp/flux-census.";
+const REMOTE_DIRECTORY_TOKEN_BYTES: usize = 32;
+const REMOTE_OWNER_FILE: &str = ".flux-census-owner";
+const REMOTE_OWNER_DOMAIN: &str = "flux-android-fwmark-census-owner-v1";
+const REMOTE_DIRECTORY_IDENTITY_BEGIN: &str = "FLUX_ANDROID_FWMARK_CENSUS_DIRECTORY_BEGIN";
+const REMOTE_DIRECTORY_IDENTITY_END: &str = "FLUX_ANDROID_FWMARK_CENSUS_DIRECTORY_END";
+const ROOT_IDENTITY_BEGIN: &str = "FLUX_ANDROID_ROOT_IDENTITY_BEGIN";
+const ROOT_IDENTITY_END: &str = "FLUX_ANDROID_ROOT_IDENTITY_END";
+const REMOTE_ABSENCE_PROVED: &str = "FLUX_ANDROID_FWMARK_CENSUS_REMOTE_ABSENT";
+const TRUSTED_ANDROID_PATH: &str = concat!(
+    "/product/bin:",
+    "/apex/com.android.runtime/bin:",
+    "/apex/com.android.art/bin:",
+    "/system_ext/bin:",
+    "/system/bin:",
+    "/system/xbin:",
+    "/odm/bin:",
+    "/vendor/bin:",
+    "/vendor/xbin"
+);
+const MINIMUM_ANDROID_SDK: u32 = 31;
+const MAX_ADB_CAPTURE_BYTES: usize = 256 * 1024;
+const MAX_CARGO_CAPTURE_BYTES: usize = 16 * 1024 * 1024;
+const ADB_QUERY_TIMEOUT: Duration = Duration::from_secs(20);
+const ADB_PUSH_TIMEOUT: Duration = Duration::from_secs(120);
+const ADB_EXEC_TIMEOUT: Duration = Duration::from_secs(240);
+const ADB_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
+const CARGO_BUILD_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const REMOTE_TEST_TIMEOUT_SECONDS: u64 = 210;
+const REMOTE_TEST_KILL_GRACE_SECONDS: u64 = 5;
+
+pub(super) fn parse_options(arguments: &[OsString]) -> Result<Options, String> {
+    Options::parse(arguments, COMMAND)
+}
+
+pub(super) fn run(options: Options) -> Result<(), String> {
+    if env::consts::OS != "linux" {
+        return Err("the ARM64 Android fwmark census runner requires a Linux/WSL host".to_owned());
+    }
+    let device = verify_device(&options)?;
+    prove_process_absent(&options, "before building the probe")?;
+    let ndk_root = env::var_os("ANDROID_NDK_HOME")
+        .or_else(|| env::var_os("ANDROID_NDK_ROOT"))
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            format!("ANDROID_NDK_HOME must point to Android NDK revision {ANDROID_NDK_REVISION}")
+        })?;
+    verify_ndk_revision(&ndk_root)?;
+    let linker = android_linker(&ndk_root, ANDROID_TARGET, CLANG_TARGET)?;
+    let artifact = build_probe_artifact(&linker)?;
+    let artifact_identity = ArtifactIdentity::from_file(&artifact)?;
+    validate_aarch64_elf(PROBE_BINARY_TARGET, &artifact)?;
+    revalidate_device(&options, &device, "before creating the remote directory")?;
+
+    println!(
+        "validated rooted ARM64 target model={} sdk={} abi={} kernel_arch={} kernel_release={}",
+        device.model, device.sdk, device.abi_list, device.kernel_arch, device.kernel_release,
+    );
+    println!(
+        "validated stripped release census ELF sha256={} size={} minimum_load_alignment={ANDROID_MIN_LOAD_ALIGNMENT}",
+        artifact_identity.sha256, artifact_identity.size,
+    );
+
+    let mut remote = RemoteDirectory::generate()?;
+    preflight_remote_directory(&options, &device, &remote)?;
+    let result = run_remote_transaction(
+        &mut remote,
+        |remote| create_remote_directory(&options, &device, remote),
+        |remote| {
+            push_execute_and_validate(&options, &artifact, &artifact_identity, &device, remote)
+        },
+        |remote| cleanup_remote_directory(&options, &device, remote),
+    );
+    match result {
+        Ok(()) => {
+            println!(
+                "read-only ARM64 fwmark census passed and independently proved process, binary, and directory absence"
+            );
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NetworkNamespaceIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FilesystemIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RemoteDirectory {
+    path: String,
+    token: String,
+    identity: Option<FilesystemIdentity>,
+}
+
+impl RemoteDirectory {
+    fn generate() -> Result<Self, String> {
+        let mut bytes = [0_u8; REMOTE_DIRECTORY_TOKEN_BYTES];
+        fs::File::open("/dev/urandom")
+            .and_then(|mut source| source.read_exact(&mut bytes))
+            .map_err(|error| format!("generate fwmark census directory token: {error}"))?;
+        Self::from_token(&encode_lower_hex(&bytes))
+    }
+
+    fn from_token(token: &str) -> Result<Self, String> {
+        if token.len() != REMOTE_DIRECTORY_TOKEN_BYTES * 2
+            || !token
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err("fwmark census directory token is not canonical 256-bit hex".to_owned());
+        }
+        Ok(Self {
+            path: format!("{REMOTE_DIRECTORY_PREFIX}{token}"),
+            token: token.to_owned(),
+            identity: None,
+        })
+    }
+
+    fn owner_record(&self) -> String {
+        format!("{REMOTE_OWNER_DOMAIN}:{}", self.token)
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct DeviceProfile {
+    model: String,
+    sdk: u32,
+    abi_list: String,
+    kernel_arch: String,
+    kernel_release: String,
+    build_fingerprint: String,
+    boot_id: String,
+    network_namespace: NetworkNamespaceIdentity,
+    shell_uid: u32,
+    shell_gid: u32,
+}
+
+fn verify_device(options: &Options) -> Result<DeviceProfile, String> {
+    let state = adb_text(options, &["-s", options.serial(), "get-state"])?;
+    if state != "device" {
+        return Err("the explicit ADB target is not in device state".to_owned());
+    }
+    let abi_list = adb_text(
+        options,
+        &[
+            "-s",
+            options.serial(),
+            "shell",
+            "getprop",
+            "ro.product.cpu.abilist",
+        ],
+    )?;
+    validate_profile_text("ABI list", &abi_list, 1024)?;
+    if !abi_list
+        .split(',')
+        .any(|candidate| candidate.trim() == "arm64-v8a")
+    {
+        return Err("the explicit Android target does not advertise arm64-v8a".to_owned());
+    }
+    let kernel_arch = adb_text(options, &["-s", options.serial(), "shell", "uname", "-m"])?;
+    if !matches!(kernel_arch.as_str(), "aarch64" | "arm64") {
+        return Err("the explicit Android target is not running an ARM64 kernel".to_owned());
+    }
+    let kernel_release = adb_text(options, &["-s", options.serial(), "shell", "uname", "-r"])?;
+    validate_profile_text("kernel release", &kernel_release, 256)?;
+    let sdk_text = adb_text(
+        options,
+        &[
+            "-s",
+            options.serial(),
+            "shell",
+            "getprop",
+            "ro.build.version.sdk",
+        ],
+    )?;
+    let sdk = sdk_text
+        .parse::<u32>()
+        .map_err(|_| "the explicit Android target returned a malformed SDK".to_owned())?;
+    if sdk < MINIMUM_ANDROID_SDK {
+        return Err(format!(
+            "the explicit Android target SDK is below qualification minimum {MINIMUM_ANDROID_SDK}"
+        ));
+    }
+    let model = adb_text(
+        options,
+        &[
+            "-s",
+            options.serial(),
+            "shell",
+            "getprop",
+            "ro.product.model",
+        ],
+    )?;
+    validate_profile_text("product model", &model, 256)?;
+    let build_fingerprint = adb_text(
+        options,
+        &[
+            "-s",
+            options.serial(),
+            "shell",
+            "getprop",
+            "ro.build.fingerprint",
+        ],
+    )?;
+    validate_profile_text("build fingerprint", &build_fingerprint, 1024)?;
+    let boot_id = adb_text(
+        options,
+        &[
+            "-s",
+            options.serial(),
+            "shell",
+            "cat",
+            "/proc/sys/kernel/random/boot_id",
+        ],
+    )?;
+    if !valid_boot_id(&boot_id) {
+        return Err("the explicit Android target returned a malformed boot identity".to_owned());
+    }
+    let shell_uid = parse_canonical_u32(
+        &adb_text(
+            options,
+            &["-s", options.serial(), "shell", "/system/bin/id", "-u"],
+        )?,
+        "ADB shell UID",
+    )?;
+    let shell_gid = parse_canonical_u32(
+        &adb_text(
+            options,
+            &["-s", options.serial(), "shell", "/system/bin/id", "-g"],
+        )?,
+        "ADB shell GID",
+    )?;
+    let network_namespace = collect_root_identity(options)?;
+    Ok(DeviceProfile {
+        model,
+        sdk,
+        abi_list,
+        kernel_arch,
+        kernel_release,
+        build_fingerprint,
+        boot_id,
+        network_namespace,
+        shell_uid,
+        shell_gid,
+    })
+}
+
+fn collect_root_identity(options: &Options) -> Result<NetworkNamespaceIdentity, String> {
+    let output = adb_root_shell_output(
+        options,
+        root_identity_script().as_bytes(),
+        ADB_QUERY_TIMEOUT,
+        "collect bounded root and network-namespace identity",
+    )?;
+    if !output.status.success() {
+        return Err(
+            "the explicit Android target did not provide root identity evidence".to_owned(),
+        );
+    }
+    if !output.stderr.is_empty() {
+        return Err("root identity collection emitted unexpected diagnostics".to_owned());
+    }
+    parse_root_identity(&output.stdout)
+}
+
+fn root_identity_script() -> String {
+    format!(
+        "set -eu\n\
+         export PATH='{TRUSTED_ANDROID_PATH}'\n\
+         echo '{ROOT_IDENTITY_BEGIN}'\n\
+         echo \"uid=$(/system/bin/id -u)\"\n\
+         echo \"self_namespace=$(/system/bin/stat -Lc '%d:%i' /proc/self/ns/net)\"\n\
+         echo \"pid1_namespace=$(/system/bin/stat -Lc '%d:%i' /proc/1/ns/net)\"\n\
+         echo '{ROOT_IDENTITY_END}'\n"
+    )
+}
+
+fn parse_root_identity(bytes: &[u8]) -> Result<NetworkNamespaceIdentity, String> {
+    let text =
+        std::str::from_utf8(bytes).map_err(|_| "root identity evidence is not UTF-8".to_owned())?;
+    let lines = text.trim_end_matches('\n').split('\n').collect::<Vec<_>>();
+    let [begin, uid, self_namespace, pid1_namespace, end] = lines.as_slice() else {
+        return Err("root identity evidence has an invalid line count".to_owned());
+    };
+    if *begin != ROOT_IDENTITY_BEGIN || *end != ROOT_IDENTITY_END || *uid != "uid=0" {
+        return Err("root identity evidence does not match the exact schema".to_owned());
+    }
+    let self_namespace = parse_namespace_field(self_namespace, "self_namespace")?;
+    let pid1_namespace = parse_namespace_field(pid1_namespace, "pid1_namespace")?;
+    if self_namespace != pid1_namespace {
+        return Err("root shell is not in PID 1's network namespace".to_owned());
+    }
+    Ok(self_namespace)
+}
+
+fn parse_namespace_field(line: &str, key: &str) -> Result<NetworkNamespaceIdentity, String> {
+    let value = line
+        .strip_prefix(key)
+        .and_then(|suffix| suffix.strip_prefix('='))
+        .ok_or_else(|| format!("root identity field {key} is missing"))?;
+    let (device, inode) = value
+        .split_once(':')
+        .ok_or_else(|| format!("root identity field {key} is malformed"))?;
+    let device = parse_canonical_u64(device, key)?;
+    let inode = parse_canonical_u64(inode, key)?;
+    if inode == 0 {
+        return Err(format!("root identity field {key} has a zero inode"));
+    }
+    Ok(NetworkNamespaceIdentity { device, inode })
+}
+
+fn validate_profile_text(label: &str, value: &str, maximum_bytes: usize) -> Result<(), String> {
+    if value.is_empty() || value.len() > maximum_bytes || value.chars().any(char::is_control) {
+        Err(format!(
+            "Android {label} must be one non-empty control-free line of at most {maximum_bytes} bytes"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn valid_boot_id(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
+
+fn revalidate_device(
+    options: &Options,
+    expected: &DeviceProfile,
+    boundary: &str,
+) -> Result<(), String> {
+    let actual = verify_device(options)
+        .map_err(|error| format!("revalidate exact Android identity {boundary}: {error}"))?;
+    if &actual == expected {
+        Ok(())
+    } else {
+        Err(format!("exact Android identity changed {boundary}"))
+    }
+}
+
+fn android_build_command(linker: &Path) -> Command {
+    let mut command = Command::new("cargo");
+    command.args([
+        "build",
+        "-p",
+        "flux-platform",
+        "--bin",
+        PROBE_BINARY_TARGET,
+        "--release",
+        "--target",
+        ANDROID_TARGET,
+        "--message-format=json-render-diagnostics",
+    ]);
+    command.env(LINKER_ENV, linker.as_os_str());
+    command.env(CC_ENV, linker.as_os_str());
+    command.env(ANDROID_TARGET_RUSTFLAGS_ENV, ANDROID_RUSTFLAGS);
+    command.env("TMPDIR", LINUX_ANDROID_HOST_BUILD_TMPDIR);
+    command
+}
+
+fn build_probe_artifact(linker: &Path) -> Result<PathBuf, String> {
+    let mut command = android_build_command(linker);
+    let output = command_output_bounded(
+        &mut command,
+        None,
+        CARGO_BUILD_TIMEOUT,
+        MAX_CARGO_CAPTURE_BYTES,
+        &format!("cross-build {ANDROID_TARGET} fwmark census probe ELF"),
+    )?;
+    if !output.stderr.is_empty() {
+        std::io::stderr()
+            .write_all(&output.stderr)
+            .map_err(|error| format!("forward Cargo diagnostics: {error}"))?;
+    }
+    if !output.status.success() {
+        return Err(format!(
+            "cross-build of {ANDROID_TARGET} fwmark census probe ELF exited with {}: {}",
+            output.status,
+            bounded_diagnostic(&output.stdout)
+        ));
+    }
+    let artifact = artifact_from_cargo_messages(&output.stdout)?;
+    if !artifact.is_file() {
+        return Err("Cargo reported a missing Android fwmark census probe".to_owned());
+    }
+    Ok(artifact)
+}
+
+fn artifact_from_cargo_messages(messages: &[u8]) -> Result<PathBuf, String> {
+    let mut artifacts = BTreeSet::new();
+    for line in messages.split(|byte| *byte == b'\n') {
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let message: Value = serde_json::from_slice(line).map_err(|error| {
+            format!(
+                "decode Cargo JSON message {:?}: {error}",
+                bounded_diagnostic(line)
+            )
+        })?;
+        if message.get("reason").and_then(Value::as_str) != Some("compiler-artifact")
+            || message.pointer("/target/name").and_then(Value::as_str) != Some(PROBE_BINARY_TARGET)
+            || !message
+                .pointer("/target/kind")
+                .and_then(Value::as_array)
+                .is_some_and(|kinds| kinds.iter().any(|kind| kind.as_str() == Some("bin")))
+            || message.pointer("/profile/test").and_then(Value::as_bool) != Some(false)
+        {
+            continue;
+        }
+        if let Some(executable) = message.get("executable").and_then(Value::as_str) {
+            artifacts.insert(PathBuf::from(executable));
+        }
+    }
+    let artifacts = artifacts.into_iter().collect::<Vec<_>>();
+    let [artifact] = artifacts.as_slice() else {
+        return Err(
+            "Cargo JSON did not report exactly one release fwmark census probe executable"
+                .to_owned(),
+        );
+    };
+    Ok(artifact.clone())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ArtifactIdentity {
+    sha256: String,
+    size: u64,
+}
+
+impl ArtifactIdentity {
+    fn from_file(path: &Path) -> Result<Self, String> {
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|error| format!("inspect exact census probe {}: {error}", path.display()))?;
+        if metadata.file_type().is_symlink()
+            || !metadata.file_type().is_file()
+            || metadata.len() == 0
+        {
+            return Err("the exact census probe must be one non-empty regular file".to_owned());
+        }
+        Ok(Self {
+            sha256: sha256_file(path)?,
+            size: metadata.len(),
+        })
+    }
+}
+
+fn prove_process_absent(options: &Options, boundary: &str) -> Result<(), String> {
+    let output = adb_root_shell_output(
+        options,
+        process_absence_script().as_bytes(),
+        ADB_QUERY_TIMEOUT,
+        "prove exact fwmark census process absence",
+    )?;
+    if output.status.success() && output.stdout.is_empty() && output.stderr.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "could not prove exact {PROCESS_AND_REMOTE_BINARY_NAME} process absence {boundary}"
+        ))
+    }
+}
+
+fn process_absence_function() -> String {
+    format!(
+        "probe_process_absent() {{\n\
+           for COMM in /proc/[0-9]*/comm; do\n\
+             [ -e \"$COMM\" ] || continue\n\
+             if ! NAME=$(/system/bin/cat \"$COMM\"); then\n\
+               [ ! -e \"$COMM\" ] && continue\n\
+               return 71\n\
+             fi\n\
+             [ \"$NAME\" != '{PROCESS_AND_REMOTE_BINARY_NAME}' ] || return 72\n\
+           done\n\
+         }}\n"
+    )
+}
+
+fn process_absence_script() -> String {
+    format!(
+        "set -eu\n\
+         export PATH='{TRUSTED_ANDROID_PATH}'\n\
+         {}\
+         probe_process_absent\n",
+        process_absence_function()
+    )
+}
+
+fn preflight_remote_directory(
+    options: &Options,
+    expected_device: &DeviceProfile,
+    remote: &RemoteDirectory,
+) -> Result<(), String> {
+    if !valid_remote_directory(&remote.path) {
+        return Err("refusing to preflight an invalid fwmark census directory".to_owned());
+    }
+    revalidate_device(options, expected_device, "before remote-path preflight")?;
+    let output = adb_root_shell_output(
+        options,
+        preflight_remote_directory_script(remote, expected_device).as_bytes(),
+        ADB_QUERY_TIMEOUT,
+        "prove the generated fwmark census path absent",
+    )?;
+    if !output.status.success() || !output.stdout.is_empty() || !output.stderr.is_empty() {
+        return Err("generated fwmark census path is not cleanly absent".to_owned());
+    }
+    revalidate_device(options, expected_device, "after remote-path preflight")
+}
+
+fn run_remote_transaction<Create, Execute, Cleanup>(
+    remote: &mut RemoteDirectory,
+    create: Create,
+    execute: Execute,
+    cleanup: Cleanup,
+) -> Result<(), String>
+where
+    Create: FnOnce(&RemoteDirectory) -> Result<FilesystemIdentity, String>,
+    Execute: FnOnce(&RemoteDirectory) -> Result<(), String>,
+    Cleanup: FnOnce(&RemoteDirectory) -> Result<(), String>,
+{
+    let execution = match create(remote) {
+        Ok(identity) => {
+            remote.identity = Some(identity);
+            execute(remote)
+        }
+        Err(error) => Err(error),
+    };
+    combine_execution_and_cleanup(execution, cleanup(remote))
+}
+
+fn combine_execution_and_cleanup(
+    execution: Result<(), String>,
+    cleanup: Result<(), String>,
+) -> Result<(), String> {
+    match (execution, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(cleanup_error)) => Err(cleanup_error),
+        (Err(error), Err(cleanup_error)) => Err(format!(
+            "{error}; mandatory remote cleanup also failed: {cleanup_error}"
+        )),
+    }
+}
+
+fn create_remote_directory(
+    options: &Options,
+    expected_device: &DeviceProfile,
+    remote: &RemoteDirectory,
+) -> Result<FilesystemIdentity, String> {
+    let output = adb_root_shell_output(
+        options,
+        create_remote_directory_script(remote, expected_device).as_bytes(),
+        ADB_QUERY_TIMEOUT,
+        "create exact owner-marked fwmark census directory",
+    )?;
+    if !output.status.success() || !output.stderr.is_empty() {
+        return Err("owner-marked fwmark census directory creation failed".to_owned());
+    }
+    parse_remote_directory_identity(&output.stdout)
+}
+
+fn parse_remote_directory_identity(bytes: &[u8]) -> Result<FilesystemIdentity, String> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| "fwmark census directory identity is not UTF-8".to_owned())?;
+    let lines = text.trim_end_matches('\n').split('\n').collect::<Vec<_>>();
+    let [begin, identity, end] = lines.as_slice() else {
+        return Err("fwmark census directory identity has an invalid line count".to_owned());
+    };
+    if *begin != REMOTE_DIRECTORY_IDENTITY_BEGIN || *end != REMOTE_DIRECTORY_IDENTITY_END {
+        return Err("fwmark census directory identity has an invalid schema".to_owned());
+    }
+    parse_filesystem_identity_field(identity, "directory_identity")
+}
+
+fn parse_filesystem_identity_field(line: &str, key: &str) -> Result<FilesystemIdentity, String> {
+    let value = line
+        .strip_prefix(key)
+        .and_then(|suffix| suffix.strip_prefix('='))
+        .ok_or_else(|| format!("{key} is missing"))?;
+    let (device, inode) = value
+        .split_once(':')
+        .ok_or_else(|| format!("{key} is malformed"))?;
+    let device = parse_canonical_u64(device, key)?;
+    let inode = parse_canonical_u64(inode, key)?;
+    if inode == 0 {
+        return Err(format!("{key} has a zero inode"));
+    }
+    Ok(FilesystemIdentity { device, inode })
+}
+
+fn valid_remote_directory(path: &str) -> bool {
+    path.strip_prefix(REMOTE_DIRECTORY_PREFIX)
+        .is_some_and(|suffix| {
+            suffix.len() == REMOTE_DIRECTORY_TOKEN_BYTES * 2
+                && suffix
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+}
+
+fn push_execute_and_validate(
+    options: &Options,
+    artifact: &Path,
+    artifact_identity: &ArtifactIdentity,
+    expected_device: &DeviceProfile,
+    remote: &RemoteDirectory,
+) -> Result<(), String> {
+    let remote_binary = format!("{}/{}", remote.path, PROCESS_AND_REMOTE_BINARY_NAME);
+    let adb_artifact = artifact_path_for_adb(options, artifact)?;
+    let mut push = Command::new(options.adb());
+    push.args(["-s", options.serial(), "push"])
+        .arg(adb_artifact)
+        .arg(&remote_binary);
+    let output = command_output_bounded(
+        &mut push,
+        None,
+        ADB_PUSH_TIMEOUT,
+        MAX_ADB_CAPTURE_BYTES,
+        "push exact ARM64 fwmark census probe ELF",
+    )?;
+    if !output.status.success() {
+        return Err("ADB push of the exact fwmark census probe failed".to_owned());
+    }
+    revalidate_device(options, expected_device, "after the remote push")?;
+
+    let script = remote_script(remote, artifact_identity, expected_device)?;
+    let output = adb_root_shell_output(
+        options,
+        script.as_bytes(),
+        ADB_EXEC_TIMEOUT,
+        "run bounded read-only ARM64 fwmark census",
+    )?;
+    let reports = parse_android_fwmark_census_probe_reports(&output.stdout)?;
+    std::io::stdout()
+        .write_all(&output.stdout)
+        .map_err(|error| format!("forward sanitized census reports: {error}"))?;
+    validate_android_fwmark_census_probe_reports(&reports)?;
+    if output.status.success() {
+        if output.stderr.is_empty() {
+            Ok(())
+        } else {
+            Err("successful census probe emitted unexpected diagnostics".to_owned())
+        }
+    } else {
+        Err(format!(
+            "fwmark census probe exited with {} after emitting valid reports",
+            output.status
+        ))
+    }
+}
+
+fn preflight_remote_directory_script(
+    remote: &RemoteDirectory,
+    expected_device: &DeviceProfile,
+) -> String {
+    let root = shell_single_quote(&remote.path);
+    format!(
+        "set -eu\n\
+         ROOT={root}\n\
+         export PATH='{TRUSTED_ANDROID_PATH}'\n\
+         {}\
+         {}\
+         identity_matches\n\
+         probe_process_absent\n\
+         [ ! -e \"$ROOT\" ]\n",
+        device_identity_function(expected_device),
+        process_absence_function(),
+    )
+}
+
+fn create_remote_directory_script(
+    remote: &RemoteDirectory,
+    expected_device: &DeviceProfile,
+) -> String {
+    let root = shell_single_quote(&remote.path);
+    let owner_record = shell_single_quote(&remote.owner_record());
+    let shell_uid = expected_device.shell_uid;
+    let shell_gid = expected_device.shell_gid;
+    format!(
+        "set -eu\n\
+         umask 077\n\
+         ROOT={root}\n\
+         OWNER=\"$ROOT/{REMOTE_OWNER_FILE}\"\n\
+         OWNER_TMP=\"$OWNER.tmp\"\n\
+         EXPECTED_OWNER_RECORD={owner_record}\n\
+         EXPECTED_SHELL_UID='{shell_uid}'\n\
+         EXPECTED_SHELL_GID='{shell_gid}'\n\
+         export PATH='{TRUSTED_ANDROID_PATH}'\n\
+         {}\
+         {}\
+         CREATED='0'\n\
+         CREATED_ID=''\n\
+         cleanup_partial() {{\n\
+           [ \"$CREATED\" = '1' ] || return 0\n\
+           identity_matches || return 70\n\
+           probe_process_absent\n\
+           [ -d \"$ROOT\" ] && [ ! -L \"$ROOT\" ]\n\
+           [ \"$(/system/bin/stat -Lc '%d:%i' \"$ROOT\")\" = \"$CREATED_ID\" ]\n\
+           /system/bin/rm -rf \"$ROOT\"\n\
+         }}\n\
+         trap cleanup_partial EXIT\n\
+         trap 'exit 70' HUP INT TERM\n\
+         identity_matches\n\
+         probe_process_absent\n\
+         [ ! -e \"$ROOT\" ]\n\
+         /system/bin/mkdir -m 700 \"$ROOT\"\n\
+         CREATED='1'\n\
+         CREATED_ID=$(/system/bin/stat -Lc '%d:%i' \"$ROOT\")\n\
+         printf '%s\\n' \"$EXPECTED_OWNER_RECORD\" >\"$OWNER_TMP\"\n\
+         /system/bin/chown 0:0 \"$OWNER_TMP\"\n\
+         /system/bin/chmod 600 \"$OWNER_TMP\"\n\
+         /system/bin/mv \"$OWNER_TMP\" \"$OWNER\"\n\
+         /system/bin/chown \"$EXPECTED_SHELL_UID:$EXPECTED_SHELL_GID\" \"$ROOT\"\n\
+         [ \"$(/system/bin/stat -c '%a:%u:%g' \"$ROOT\")\" = \"700:$EXPECTED_SHELL_UID:$EXPECTED_SHELL_GID\" ]\n\
+         [ -f \"$OWNER\" ] && [ ! -L \"$OWNER\" ]\n\
+         [ \"$(/system/bin/stat -c '%a:%u:%g' \"$OWNER\")\" = '600:0:0' ]\n\
+         [ \"$(/system/bin/cat \"$OWNER\")\" = \"$EXPECTED_OWNER_RECORD\" ]\n\
+         echo '{REMOTE_DIRECTORY_IDENTITY_BEGIN}'\n\
+         echo \"directory_identity=$CREATED_ID\"\n\
+         echo '{REMOTE_DIRECTORY_IDENTITY_END}'\n\
+         CREATED='0'\n\
+         trap - EXIT HUP INT TERM\n",
+        device_identity_function(expected_device),
+        process_absence_function(),
+    )
+}
+
+fn remote_script(
+    remote: &RemoteDirectory,
+    artifact: &ArtifactIdentity,
+    expected_device: &DeviceProfile,
+) -> Result<String, String> {
+    if remote.identity.is_none() {
+        return Err("fwmark census directory identity is unavailable before execution".to_owned());
+    }
+    let expected_sha256 = shell_single_quote(&artifact.sha256);
+    let expected_size = artifact.size;
+    Ok(format!(
+        "set -eu\n\
+         umask 077\n\
+         {}\
+         BIN=\"$ROOT/{PROCESS_AND_REMOTE_BINARY_NAME}\"\n\
+         TMPDIR=\"$ROOT/tmp\"\n\
+         EXPECTED_SHA256={expected_sha256}\n\
+         EXPECTED_SIZE='{expected_size}'\n\
+         export PATH='{TRUSTED_ANDROID_PATH}'\n\
+         {}\
+         {}\
+         {}\
+         trap remove_owned_root EXIT\n\
+         trap 'exit 70' HUP INT TERM\n\
+         identity_matches\n\
+         probe_process_absent\n\
+         owned_root_matches\n\
+         [ -f \"$BIN\" ] && [ ! -L \"$BIN\" ]\n\
+         /system/bin/chown -R 0:0 \"$ROOT\"\n\
+         /system/bin/chmod 700 \"$ROOT\" \"$BIN\"\n\
+         owned_root_matches\n\
+         [ \"$(/system/bin/stat -c '%a:%u:%g' \"$BIN\")\" = '700:0:0' ]\n\
+         ACTUAL_SHA256=$(/system/bin/sha256sum \"$BIN\" | /system/bin/cut -d ' ' -f 1)\n\
+         [ \"$ACTUAL_SHA256\" = \"$EXPECTED_SHA256\" ]\n\
+         [ \"$(/system/bin/stat -c '%s' \"$BIN\")\" = \"$EXPECTED_SIZE\" ]\n\
+         /system/bin/mkdir \"$TMPDIR\"\n\
+         /system/bin/chmod 700 \"$TMPDIR\"\n\
+         export TMPDIR {REQUIRED_ENV}=1\n\
+         set +e\n\
+         /system/bin/timeout -k {REMOTE_TEST_KILL_GRACE_SECONDS} {REMOTE_TEST_TIMEOUT_SECONDS} \"$BIN\"\n\
+         STATUS=$?\n\
+         set -e\n\
+         probe_process_absent\n\
+         remove_owned_root\n\
+         [ ! -e \"$BIN\" ]\n\
+         [ ! -e \"$ROOT\" ]\n\
+         probe_process_absent\n\
+         identity_matches\n\
+         trap - EXIT HUP INT TERM\n\
+         exit \"$STATUS\"\n",
+        remote_directory_variables(remote, expected_device),
+        device_identity_function(expected_device),
+        process_absence_function(),
+        owned_root_functions(),
+    ))
+}
+
+fn cleanup_remote_directory(
+    options: &Options,
+    expected_device: &DeviceProfile,
+    remote: &RemoteDirectory,
+) -> Result<(), String> {
+    if !valid_remote_directory(&remote.path) {
+        return Err("refusing cleanup for an invalid fwmark census directory".to_owned());
+    }
+
+    let before = verify_device(options)
+        .map_err(|error| format!("revalidate Android identity before cleanup: {error}"))?;
+    require_expected_device(
+        expected_device,
+        &before,
+        "before cleanup; no cleanup mutation was attempted",
+    )?;
+
+    let removal = adb_root_shell_output(
+        options,
+        cleanup_script(remote, expected_device).as_bytes(),
+        ADB_CLEANUP_TIMEOUT,
+        "remove exact owner-marked fwmark census directory",
+    );
+    let absence = adb_root_shell_output(
+        options,
+        remote_absence_script(remote, expected_device).as_bytes(),
+        ADB_CLEANUP_TIMEOUT,
+        "independently prove fwmark census process and path absence",
+    );
+    let identity_after = verify_device(options);
+
+    let after = identity_after
+        .map_err(|error| format!("revalidate Android identity after cleanup: {error}"))?;
+    require_expected_device(expected_device, &after, "after cleanup")?;
+
+    let removal =
+        removal.map_err(|error| format!("remove exact remote census directory: {error}"))?;
+    if !removal.status.success() || !removal.stdout.is_empty() || !removal.stderr.is_empty() {
+        return Err(
+            "exact owner-marked census directory removal did not complete cleanly".to_owned(),
+        );
+    }
+    let absence = absence.map_err(|error| format!("prove remote census absence: {error}"))?;
+    if !absence.status.success()
+        || absence.stdout != format!("{REMOTE_ABSENCE_PROVED}\n").as_bytes()
+        || !absence.stderr.is_empty()
+    {
+        return Err(
+            "independent remote proof did not confirm process, binary, and directory absence"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn require_expected_device(
+    expected: &DeviceProfile,
+    actual: &DeviceProfile,
+    boundary: &str,
+) -> Result<(), String> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(format!(
+            "Android build, boot, architecture, or namespace drifted {boundary}"
+        ))
+    }
+}
+
+fn cleanup_script(remote: &RemoteDirectory, expected_device: &DeviceProfile) -> String {
+    format!(
+        "set -eu\n\
+         {}\
+         export PATH='{TRUSTED_ANDROID_PATH}'\n\
+         {}\
+         {}\
+         {}\
+         identity_matches\n\
+         remove_owned_root\n",
+        remote_directory_variables(remote, expected_device),
+        device_identity_function(expected_device),
+        process_absence_function(),
+        owned_root_functions(),
+    )
+}
+
+fn remote_absence_script(remote: &RemoteDirectory, expected_device: &DeviceProfile) -> String {
+    format!(
+        "set -eu\n\
+         {}\
+         BIN=\"$ROOT/{PROCESS_AND_REMOTE_BINARY_NAME}\"\n\
+         export PATH='{TRUSTED_ANDROID_PATH}'\n\
+         {}\
+         {}\
+         identity_matches\n\
+         [ ! -e \"$BIN\" ]\n\
+         [ ! -e \"$ROOT\" ]\n\
+         probe_process_absent\n\
+         echo '{REMOTE_ABSENCE_PROVED}'\n",
+        remote_directory_variables(remote, expected_device),
+        device_identity_function(expected_device),
+        process_absence_function(),
+    )
+}
+
+fn remote_directory_variables(remote: &RemoteDirectory, expected_device: &DeviceProfile) -> String {
+    let root = shell_single_quote(&remote.path);
+    let owner_record = shell_single_quote(&remote.owner_record());
+    let expected_identity = remote
+        .identity
+        .as_ref()
+        .map(|identity| format!("{}:{}", identity.device, identity.inode))
+        .unwrap_or_default();
+    let expected_identity = shell_single_quote(&expected_identity);
+    let shell_uid = expected_device.shell_uid;
+    let shell_gid = expected_device.shell_gid;
+    format!(
+        "ROOT={root}\n\
+         OWNER=\"$ROOT/{REMOTE_OWNER_FILE}\"\n\
+         EXPECTED_OWNER_RECORD={owner_record}\n\
+         EXPECTED_DIRECTORY_ID={expected_identity}\n\
+         EXPECTED_SHELL_OWNER='700:{shell_uid}:{shell_gid}'\n"
+    )
+}
+
+fn device_identity_function(expected_device: &DeviceProfile) -> String {
+    let expected_boot_id = shell_single_quote(&expected_device.boot_id);
+    let expected_fingerprint = shell_single_quote(&expected_device.build_fingerprint);
+    let expected_arch = shell_single_quote(&expected_device.kernel_arch);
+    let expected_namespace = shell_single_quote(&format!(
+        "{}:{}",
+        expected_device.network_namespace.device, expected_device.network_namespace.inode
+    ));
+    format!(
+        "EXPECTED_BOOT_ID={expected_boot_id}\n\
+         EXPECTED_FINGERPRINT={expected_fingerprint}\n\
+         EXPECTED_ARCH={expected_arch}\n\
+         EXPECTED_NAMESPACE={expected_namespace}\n\
+         identity_matches() {{\n\
+           [ \"$(/system/bin/cat /proc/sys/kernel/random/boot_id)\" = \"$EXPECTED_BOOT_ID\" ] &&\n\
+           [ \"$(/system/bin/getprop ro.build.fingerprint)\" = \"$EXPECTED_FINGERPRINT\" ] &&\n\
+           [ \"$(/system/bin/uname -m)\" = \"$EXPECTED_ARCH\" ] &&\n\
+           [ \"$(/system/bin/stat -Lc '%d:%i' /proc/self/ns/net)\" = \"$EXPECTED_NAMESPACE\" ]\n\
+         }}\n"
+    )
+}
+
+fn owned_root_functions() -> String {
+    "owned_root_matches() {\n\
+       [ -d \"$ROOT\" ] && [ ! -L \"$ROOT\" ] || return 1\n\
+       CURRENT_DIRECTORY_ID=$(/system/bin/stat -Lc '%d:%i' \"$ROOT\") || return 1\n\
+       [ -z \"$EXPECTED_DIRECTORY_ID\" ] || [ \"$CURRENT_DIRECTORY_ID\" = \"$EXPECTED_DIRECTORY_ID\" ] || return 1\n\
+       ROOT_OWNER=$(/system/bin/stat -c '%a:%u:%g' \"$ROOT\") || return 1\n\
+       [ \"$ROOT_OWNER\" = '700:0:0' ] || [ \"$ROOT_OWNER\" = \"$EXPECTED_SHELL_OWNER\" ] || return 1\n\
+       [ -f \"$OWNER\" ] && [ ! -L \"$OWNER\" ] || return 1\n\
+       [ \"$(/system/bin/stat -c '%a:%u:%g' \"$OWNER\")\" = '600:0:0' ] || return 1\n\
+       [ \"$(/system/bin/cat \"$OWNER\")\" = \"$EXPECTED_OWNER_RECORD\" ]\n\
+     }\n\
+     remove_owned_root() {\n\
+       identity_matches || return 70\n\
+       probe_process_absent\n\
+       [ -e \"$ROOT\" ] || return 0\n\
+       owned_root_matches || return 73\n\
+       /system/bin/rm -rf \"$ROOT\"\n\
+       [ ! -e \"$ROOT\" ]\n\
+     }\n"
+        .to_owned()
+}
+
+fn encode_lower_hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        encoded.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
+fn parse_canonical_u64(value: &str, field: &str) -> Result<u64, String> {
+    if value.is_empty()
+        || (value.len() > 1 && value.starts_with('0'))
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(format!("{field} is not a canonical unsigned decimal"));
+    }
+    value
+        .parse::<u64>()
+        .map_err(|_| format!("{field} exceeds the u64 domain"))
+}
+
+fn parse_canonical_u32(value: &str, field: &str) -> Result<u32, String> {
+    u32::try_from(parse_canonical_u64(value, field)?)
+        .map_err(|_| format!("{field} exceeds the u32 domain"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    fn expected_device() -> DeviceProfile {
+        DeviceProfile {
+            model: "SM-S9180".to_owned(),
+            sdk: 36,
+            abi_list: "arm64-v8a,armeabi-v7a".to_owned(),
+            kernel_arch: "aarch64".to_owned(),
+            kernel_release: "5.15.207-test".to_owned(),
+            build_fingerprint: "vendor/product/device:16/BUILD/1:user/release-keys".to_owned(),
+            boot_id: "01234567-89ab-cdef-0123-456789abcdef".to_owned(),
+            network_namespace: NetworkNamespaceIdentity {
+                device: 4,
+                inode: 4_026_531_840,
+            },
+            shell_uid: 2000,
+            shell_gid: 2000,
+        }
+    }
+
+    fn remote_directory() -> RemoteDirectory {
+        let mut remote = RemoteDirectory::from_token(&"a1".repeat(32)).expect("remote token");
+        remote.identity = Some(FilesystemIdentity {
+            device: 253,
+            inode: 91_337,
+        });
+        remote
+    }
+
+    #[cfg(target_os = "linux")]
+    struct FakeAdb {
+        root: PathBuf,
+        program: PathBuf,
+        log: PathBuf,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl FakeAdb {
+        fn new(boot_id: &str) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            use std::sync::atomic::{AtomicU64, Ordering};
+
+            static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+            let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+            let root = env::temp_dir().join(format!(
+                "flux-fwmark-census-fake-adb-{}-{sequence}",
+                std::process::id()
+            ));
+            fs::create_dir(&root).expect("create fake ADB directory");
+            let program = root.join("adb");
+            let log = root.join("calls.log");
+            let log_value = shell_single_quote(log.to_str().expect("UTF-8 fake ADB log path"));
+            let boot_value = shell_single_quote(boot_id);
+            let script = format!(
+                "#!/bin/sh\n\
+                 set -eu\n\
+                 LOG={log_value}\n\
+                 BOOT_ID={boot_value}\n\
+                 [ \"$1\" = '-s' ]\n\
+                 shift 2\n\
+                 ARGS=\"$*\"\n\
+                 case \"$ARGS\" in\n\
+                   'get-state') echo device ;;\n\
+                   'shell getprop ro.product.cpu.abilist') echo 'arm64-v8a,armeabi-v7a' ;;\n\
+                   'shell uname -m') echo aarch64 ;;\n\
+                   'shell uname -r') echo '5.15.207-test' ;;\n\
+                   'shell getprop ro.build.version.sdk') echo 36 ;;\n\
+                   'shell getprop ro.product.model') echo 'SM-S9180' ;;\n\
+                   'shell getprop ro.build.fingerprint') echo 'vendor/product/device:16/BUILD/1:user/release-keys' ;;\n\
+                   'shell cat /proc/sys/kernel/random/boot_id') echo \"$BOOT_ID\" ;;\n\
+                   'shell /system/bin/id -u') echo 2000 ;;\n\
+                   'shell /system/bin/id -g') echo 2000 ;;\n\
+                   'shell su -c /system/bin/sh')\n\
+                     SCRIPT=$(/bin/cat)\n\
+                     case \"$SCRIPT\" in\n\
+                       *FLUX_ANDROID_ROOT_IDENTITY_BEGIN*)\n\
+                         echo identity >>\"$LOG\"\n\
+                         echo FLUX_ANDROID_ROOT_IDENTITY_BEGIN\n\
+                         echo uid=0\n\
+                         echo self_namespace=4:4026531840\n\
+                         echo pid1_namespace=4:4026531840\n\
+                         echo FLUX_ANDROID_ROOT_IDENTITY_END\n\
+                         ;;\n\
+                       *FLUX_ANDROID_FWMARK_CENSUS_DIRECTORY_BEGIN*)\n\
+                         echo create >>\"$LOG\"\n\
+                         echo malformed-directory-identity\n\
+                         ;;\n\
+                       *FLUX_ANDROID_FWMARK_CENSUS_REMOTE_ABSENT*)\n\
+                         echo absence >>\"$LOG\"\n\
+                         echo FLUX_ANDROID_FWMARK_CENSUS_REMOTE_ABSENT\n\
+                         ;;\n\
+                       *remove_owned_root*) echo cleanup >>\"$LOG\" ;;\n\
+                       *) exit 91 ;;\n\
+                     esac\n\
+                     ;;\n\
+                   *) exit 92 ;;\n\
+                 esac\n"
+            );
+            fs::write(&program, script).expect("write fake ADB");
+            fs::set_permissions(&program, fs::Permissions::from_mode(0o700))
+                .expect("make fake ADB executable");
+            Self { root, program, log }
+        }
+
+        fn options(&self) -> Options {
+            Options::parse(
+                &[
+                    OsString::from("--serial"),
+                    OsString::from("fixture-serial"),
+                    OsString::from("--adb"),
+                    self.program.as_os_str().to_owned(),
+                ],
+                COMMAND,
+            )
+            .expect("fake ADB options")
+        }
+
+        fn calls(&self) -> Vec<String> {
+            fs::read_to_string(&self.log)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_owned)
+                .collect()
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for FakeAdb {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn build_command_uses_the_pinned_release_arm64_toolchain_and_host_tmpdir() {
+        let linker = Path::new("/ndk/toolchains/llvm/bin/aarch64-linux-android31-clang");
+        let command = android_build_command(linker);
+        let arguments = command.get_args().collect::<Vec<_>>();
+        assert!(
+            arguments
+                .windows(2)
+                .any(|args| { args == [OsStr::new("--bin"), OsStr::new(PROBE_BINARY_TARGET),] })
+        );
+        assert!(arguments.contains(&OsStr::new("--release")));
+        let environment = command
+            .get_envs()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        for name in [LINKER_ENV, CC_ENV] {
+            assert_eq!(
+                environment.get(OsStr::new(name)),
+                Some(&Some(linker.as_os_str()))
+            );
+        }
+        assert_eq!(
+            environment.get(OsStr::new(ANDROID_TARGET_RUSTFLAGS_ENV)),
+            Some(&Some(OsStr::new(ANDROID_RUSTFLAGS)))
+        );
+        assert_eq!(
+            environment.get(OsStr::new("TMPDIR")),
+            Some(&Some(OsStr::new(LINUX_ANDROID_HOST_BUILD_TMPDIR)))
+        );
+    }
+
+    #[test]
+    fn cargo_json_selects_exactly_one_release_probe_binary() {
+        let artifact = "/tmp/android-fwmark-census-probe";
+        let messages = format!(
+            "{{\"reason\":\"compiler-artifact\",\"target\":{{\"name\":\"other\",\"kind\":[\"bin\"]}},\"profile\":{{\"test\":false}},\"executable\":\"/tmp/other\"}}\n\
+             {{\"reason\":\"compiler-artifact\",\"target\":{{\"name\":\"{PROBE_BINARY_TARGET}\",\"kind\":[\"bin\"]}},\"profile\":{{\"test\":false}},\"executable\":\"{artifact}\"}}\n"
+        );
+        assert_eq!(
+            artifact_from_cargo_messages(messages.as_bytes()).expect("exact artifact"),
+            PathBuf::from(artifact)
+        );
+        let second = messages.replace(artifact, "/tmp/second-android-fwmark-census-probe");
+        let ambiguous = format!("{messages}{second}");
+        assert!(artifact_from_cargo_messages(ambiguous.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn root_identity_requires_uid_zero_and_pid1_network_namespace() {
+        let valid = format!(
+            "{ROOT_IDENTITY_BEGIN}\nuid=0\nself_namespace=4:4026531840\npid1_namespace=4:4026531840\n{ROOT_IDENTITY_END}\n"
+        );
+        assert_eq!(
+            parse_root_identity(valid.as_bytes()).expect("root identity"),
+            NetworkNamespaceIdentity {
+                device: 4,
+                inode: 4_026_531_840,
+            }
+        );
+        assert!(parse_root_identity(valid.replace("uid=0", "uid=2000").as_bytes()).is_err());
+        assert!(
+            parse_root_identity(
+                valid
+                    .replace("pid1_namespace=4:4026531840", "pid1_namespace=4:99")
+                    .as_bytes()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn remote_path_scripts_pin_owner_only_execution_and_independent_cleanup() {
+        let remote = remote_directory();
+        assert!(valid_remote_directory(&remote.path));
+        assert!(!valid_remote_directory(&format!("{}/child", remote.path)));
+        assert!(!valid_remote_directory(&format!(
+            "/data/local/tmp/other.{}",
+            remote.token
+        )));
+        assert!(PROCESS_AND_REMOTE_BINARY_NAME.len() <= 15);
+        let script = remote_script(
+            &remote,
+            &ArtifactIdentity {
+                sha256: "11".repeat(32),
+                size: 4096,
+            },
+            &expected_device(),
+        )
+        .expect("remote script");
+        for required in [
+            "trap remove_owned_root EXIT",
+            "EXPECTED_OWNER_RECORD=",
+            "EXPECTED_DIRECTORY_ID=",
+            "owned_root_matches",
+            "identity_matches",
+            "stat -c '%a:%u:%g'",
+            "sha256sum \"$BIN\"",
+            "FLUX_ANDROID_FWMARK_CENSUS_REQUIRED=1",
+            "probe_process_absent",
+            "[ ! -e \"$BIN\" ]",
+            "[ ! -e \"$ROOT\" ]",
+            "stat -Lc '%d:%i' /proc/self/ns/net",
+        ] {
+            assert!(script.contains(required), "missing {required:?}");
+        }
+        for forbidden in ["iptables-restore", "ip rule add", "/data/adb/flux/scripts"] {
+            assert!(!script.contains(forbidden), "unexpected {forbidden:?}");
+        }
+        let cleanup = cleanup_script(&remote, &expected_device());
+        assert!(cleanup.find("identity_matches").unwrap() < cleanup.find("rm -rf").unwrap());
+        assert!(cleanup.find("probe_process_absent").unwrap() < cleanup.find("rm -rf").unwrap());
+        let absence = remote_absence_script(&remote, &expected_device());
+        assert!(absence.contains("probe_process_absent"));
+        assert!(absence.contains("[ ! -e \"$BIN\" ]"));
+        assert!(absence.contains("[ ! -e \"$ROOT\" ]"));
+        assert!(!absence.contains("kill"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn every_generated_root_script_has_valid_posix_shell_syntax() {
+        use std::process::Stdio;
+
+        let remote = remote_directory();
+        let device = expected_device();
+        let scripts = [
+            root_identity_script(),
+            process_absence_script(),
+            preflight_remote_directory_script(&remote, &device),
+            create_remote_directory_script(&remote, &device),
+            remote_script(
+                &remote,
+                &ArtifactIdentity {
+                    sha256: "11".repeat(32),
+                    size: 4096,
+                },
+                &device,
+            )
+            .expect("remote script"),
+            cleanup_script(&remote, &device),
+            remote_absence_script(&remote, &device),
+        ];
+        for script in scripts {
+            let mut child = Command::new("/bin/sh")
+                .arg("-n")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn shell syntax checker");
+            child
+                .stdin
+                .take()
+                .expect("piped shell stdin")
+                .write_all(script.as_bytes())
+                .expect("write generated shell script");
+            let output = child.wait_with_output().expect("wait for shell checker");
+            assert!(
+                output.status.success(),
+                "generated script failed shell syntax: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[test]
+    fn remote_transaction_attempts_cleanup_after_lost_creation_output() {
+        use std::cell::RefCell;
+
+        let events = RefCell::new(Vec::new());
+        let mut remote = RemoteDirectory::from_token(&"b2".repeat(32)).expect("remote token");
+        let error = run_remote_transaction(
+            &mut remote,
+            |_| {
+                events.borrow_mut().push("create");
+                Err("creation output was lost".to_owned())
+            },
+            |_| panic!("execution must not follow uncertain creation"),
+            |remote| {
+                events.borrow_mut().push("cleanup");
+                assert!(remote.identity.is_none());
+                Ok(())
+            },
+        )
+        .expect_err("lost creation output must fail");
+        assert_eq!(error, "creation output was lost");
+        assert_eq!(*events.borrow(), ["create", "cleanup"]);
+    }
+
+    #[test]
+    fn remote_transaction_cleans_execution_failure_and_preserves_dual_failure() {
+        use std::cell::RefCell;
+
+        let events = RefCell::new(Vec::new());
+        let mut remote = RemoteDirectory::from_token(&"c3".repeat(32)).expect("remote token");
+        let error = run_remote_transaction(
+            &mut remote,
+            |_| {
+                events.borrow_mut().push("create");
+                Ok(FilesystemIdentity {
+                    device: 7,
+                    inode: 11,
+                })
+            },
+            |remote| {
+                events.borrow_mut().push("execute");
+                assert!(remote.identity.is_some());
+                Err("probe execution timed out".to_owned())
+            },
+            |remote| {
+                events.borrow_mut().push("cleanup");
+                assert!(remote.identity.is_some());
+                Err("process residue survived".to_owned())
+            },
+        )
+        .expect_err("dual failure must remain visible");
+        assert!(error.contains("probe execution timed out"), "{error}");
+        assert!(error.contains("process residue survived"), "{error}");
+        assert_eq!(*events.borrow(), ["create", "execute", "cleanup"]);
+    }
+
+    #[test]
+    fn cleanup_identity_gate_rejects_drift_before_mutation() {
+        let expected = expected_device();
+        let mut drifted = expected.clone();
+        drifted.boot_id = "fedcba98-7654-3210-fedc-ba9876543210".to_owned();
+        let error = require_expected_device(
+            &expected,
+            &drifted,
+            "before cleanup; no cleanup mutation was attempted",
+        )
+        .expect_err("identity drift must stop cleanup");
+        assert!(
+            error.contains("no cleanup mutation was attempted"),
+            "{error}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fake_adb_lost_creation_output_still_runs_cleanup_and_absence_proof() {
+        let fake = FakeAdb::new("01234567-89ab-cdef-0123-456789abcdef");
+        let options = fake.options();
+        let device = expected_device();
+        let mut remote =
+            RemoteDirectory::from_token(&"d4".repeat(32)).expect("remote directory token");
+        let error = run_remote_transaction(
+            &mut remote,
+            |remote| create_remote_directory(&options, &device, remote),
+            |_| panic!("execution must not follow malformed creation output"),
+            |remote| cleanup_remote_directory(&options, &device, remote),
+        )
+        .expect_err("malformed creation output must fail");
+        assert!(
+            error.contains("directory identity has an invalid line count"),
+            "{error}"
+        );
+        let calls = fake.calls();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.as_str() == "cleanup")
+                .count(),
+            1
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.as_str() == "absence")
+                .count(),
+            1
+        );
+        assert!(
+            calls.iter().position(|call| call == "create")
+                < calls.iter().position(|call| call == "cleanup")
+        );
+        assert!(
+            calls.iter().position(|call| call == "cleanup")
+                < calls.iter().position(|call| call == "absence")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fake_adb_identity_drift_stops_before_cleanup_dispatch() {
+        let fake = FakeAdb::new("fedcba98-7654-3210-fedc-ba9876543210");
+        let error =
+            cleanup_remote_directory(&fake.options(), &expected_device(), &remote_directory())
+                .expect_err("boot drift must stop cleanup");
+        assert!(
+            error.contains("no cleanup mutation was attempted"),
+            "{error}"
+        );
+        let calls = fake.calls();
+        assert!(calls.iter().any(|call| call == "identity"));
+        assert!(!calls.iter().any(|call| call == "cleanup"));
+        assert!(!calls.iter().any(|call| call == "absence"));
+    }
+}

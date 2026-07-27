@@ -27,6 +27,7 @@ use std::os::unix::process::CommandExt as _;
 const MAX_WAIT_SECONDS: u16 = 60;
 const MAX_PROCESS_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_CAPTURE_BYTES: usize = 16 * 1024;
+const MAX_ANDROID_CENSUS_SAVE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_TOOL_BYTES: u64 = 64 * 1024 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const CLEANUP_GRACE: Duration = Duration::from_millis(250);
@@ -437,6 +438,28 @@ impl XtablesSaveProcessOutput {
     #[must_use]
     pub(crate) const fn stderr(&self) -> &str {
         &self.stderr
+    }
+}
+
+/// Complete dual-stack save bytes collected through the read-only Android census boundary.
+///
+/// Tool identities and diagnostics remain private to the process adapter. Callers receive only the
+/// two bounded snapshots needed by the typed fwmark parser.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AndroidXtablesSaveSnapshots {
+    ipv4: Box<[u8]>,
+    ipv6: Box<[u8]>,
+}
+
+impl AndroidXtablesSaveSnapshots {
+    #[must_use]
+    pub(crate) const fn ipv4(&self) -> &[u8] {
+        &self.ipv4
+    }
+
+    #[must_use]
+    pub(crate) const fn ipv6(&self) -> &[u8] {
+        &self.ipv6
     }
 }
 
@@ -1112,6 +1135,134 @@ impl PinnedXtablesTool {
                 mutation,
             })
         }
+    }
+}
+
+/// Collects complete IPv4 and IPv6 save output without admitting command or restore applets.
+///
+/// Both fixed save applets are opened and descriptor-pinned before either is executed. The pair
+/// must identify one coherent multicall executable and one normalized version/flavor. Only the
+/// fixed `--version` probes and zero-argument save operations can be executed through this API.
+pub(crate) fn collect_android_xtables_save_snapshots(
+    root_path: &Path,
+    bound: Duration,
+) -> Result<AndroidXtablesSaveSnapshots, XtablesRestoreProcessError> {
+    ensure_supported()?;
+    if bound.is_zero() || bound > MAX_PROCESS_TIMEOUT {
+        return Err(XtablesRestoreProcessError::InvalidConfig {
+            field: "Android census xtables deadline",
+            reason: format!("must be nonzero and at most {MAX_PROCESS_TIMEOUT:?}").into_boxed_str(),
+        });
+    }
+    let deadline = Instant::now().checked_add(bound).ok_or_else(|| {
+        XtablesRestoreProcessError::InvalidConfig {
+            field: "Android census xtables deadline",
+            reason: Box::from("cannot be represented by a monotonic deadline"),
+        }
+    })?;
+    validate_discovery_root(root_path)?;
+    let root = open_discovery_root(root_path)?;
+    let mut ipv4 = open_discovered_tool(
+        &root,
+        root_path,
+        XtablesRestoreFamily::Ipv4,
+        XtablesToolRole::Save,
+    )?;
+    census_remaining(deadline, bound, XtablesRestoreFamily::Ipv4)?;
+    let mut ipv6 = open_discovered_tool(
+        &root,
+        root_path,
+        XtablesRestoreFamily::Ipv6,
+        XtablesToolRole::Save,
+    )?;
+    census_remaining(deadline, bound, XtablesRestoreFamily::Ipv6)?;
+
+    if ipv4.identity.digest != ipv6.identity.digest {
+        return Err(tool_set_coherence_error(
+            &ipv6.identity,
+            "executable digest differs from the admitted dual-stack save profile".to_owned(),
+        ));
+    }
+
+    ipv4.probe(census_remaining(
+        deadline,
+        bound,
+        XtablesRestoreFamily::Ipv4,
+    )?)?;
+    ipv6.probe(census_remaining(
+        deadline,
+        bound,
+        XtablesRestoreFamily::Ipv6,
+    )?)?;
+    if ipv4.identity.reported_flavor != ipv6.identity.reported_flavor {
+        return Err(tool_set_coherence_error(
+            &ipv6.identity,
+            format!(
+                "reported {:?}, expected {:?}",
+                ipv6.identity.reported_flavor, ipv4.identity.reported_flavor
+            ),
+        ));
+    }
+    if ipv4.identity.release != ipv6.identity.release {
+        return Err(tool_set_coherence_error(
+            &ipv6.identity,
+            format!(
+                "reported release {}, expected {}",
+                ipv6.identity.release, ipv4.identity.release
+            ),
+        ));
+    }
+
+    verify_android_census_save_tools(&ipv4, &ipv6)?;
+    let ipv4_output = run_pinned_process(
+        &ipv4,
+        XtablesRestoreProcessOperation::Save,
+        &[],
+        ProcessStdin::Null,
+        CapturePolicy::Complete(MAX_ANDROID_CENSUS_SAVE_BYTES),
+        census_remaining(deadline, bound, XtablesRestoreFamily::Ipv4)?,
+    )?;
+    let ipv6_output = run_pinned_process(
+        &ipv6,
+        XtablesRestoreProcessOperation::Save,
+        &[],
+        ProcessStdin::Null,
+        CapturePolicy::Complete(MAX_ANDROID_CENSUS_SAVE_BYTES),
+        census_remaining(deadline, bound, XtablesRestoreFamily::Ipv6)?,
+    )?;
+    verify_android_census_save_tools(&ipv4, &ipv6)?;
+    census_remaining(deadline, bound, XtablesRestoreFamily::Ipv6)?;
+
+    Ok(AndroidXtablesSaveSnapshots {
+        ipv4: ipv4_output.stdout.bytes.into_boxed_slice(),
+        ipv6: ipv6_output.stdout.bytes.into_boxed_slice(),
+    })
+}
+
+fn verify_android_census_save_tools(
+    ipv4: &PinnedXtablesTool,
+    ipv6: &PinnedXtablesTool,
+) -> Result<(), XtablesRestoreProcessError> {
+    ipv4.verify_identity(XtablesRestoreMutationDisposition::NotStarted)?;
+    ipv6.verify_identity(XtablesRestoreMutationDisposition::NotStarted)
+}
+
+fn census_remaining(
+    deadline: Instant,
+    bound: Duration,
+    family: XtablesRestoreFamily,
+) -> Result<Duration, XtablesRestoreProcessError> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        Err(XtablesRestoreProcessError::TimedOut {
+            operation: XtablesRestoreProcessOperation::Save,
+            family,
+            timeout: bound,
+            stdout: Box::from(""),
+            stderr: Box::from(""),
+        })
+    } else {
+        Ok(remaining)
     }
 }
 

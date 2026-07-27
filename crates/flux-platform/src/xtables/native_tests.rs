@@ -859,6 +859,75 @@ fn strict_multicall_discovery_proves_argv0_restore_and_save_dispatch() {
     assert_eq!(saved.stdout(), b"*mangle\nCOMMIT\n");
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn android_census_collector_opens_only_dual_stack_save_applets() {
+    let fixture = Fixture::new();
+    let applet_root = fixture.path("census-save-bin");
+    fs::create_dir(&applet_root).unwrap();
+    let multicall = compile_multicall_fixture(&fixture);
+    for family in [XtablesRestoreFamily::Ipv4, XtablesRestoreFamily::Ipv6] {
+        symlink(
+            &multicall,
+            applet_root.join(XtablesToolRole::Save.applet(family)),
+        )
+        .unwrap();
+    }
+
+    let snapshots = collect_android_xtables_save_snapshots(&applet_root, Duration::from_secs(3))
+        .expect("save-only census collector must not require command or restore applets");
+
+    assert_eq!(snapshots.ipv4(), b"*mangle\nCOMMIT\n");
+    assert_eq!(snapshots.ipv6(), b"*mangle\nCOMMIT\n");
+    assert!(!applet_root.join("iptables").exists());
+    assert!(!applet_root.join("iptables-restore").exists());
+    assert!(!applet_root.join("ip6tables").exists());
+    assert!(!applet_root.join("ip6tables-restore").exists());
+}
+
+#[test]
+fn android_census_collector_rejects_split_binaries_before_any_probe() {
+    let fixture = Fixture::new();
+    let applet_root = fixture.path("split-census-save-bin");
+    fs::create_dir(&applet_root).unwrap();
+    let probe_record = fixture.path("unexpected-census-probe");
+    for (family, suffix) in [
+        (XtablesRestoreFamily::Ipv4, "v4"),
+        (XtablesRestoreFamily::Ipv6, "v6"),
+    ] {
+        let path = applet_root.join(XtablesToolRole::Save.applet(family));
+        write_custom_script(
+            &path,
+            &format!(
+                "{PRINTF} '%s\\n' {suffix} >> {}\n{PRINTF} '%s\\n' {}\nexit 0",
+                shell_quote(&probe_record),
+                shell_quote_text(&tool_version(
+                    family,
+                    XtablesToolRole::Save,
+                    "1.8.11",
+                    "legacy"
+                )),
+            ),
+            "exit 0",
+            0o700,
+        );
+    }
+
+    let error = collect_android_xtables_save_snapshots(&applet_root, Duration::from_secs(2))
+        .expect_err("split save executables must fail the multicall profile");
+
+    assert_eq!(error.kind(), XtablesRestoreProcessErrorKind::ToolCoherence);
+    assert!(!probe_record.exists());
+}
+
+#[test]
+fn android_census_collector_rejects_an_invalid_aggregate_bound() {
+    let fixture = Fixture::new();
+    let error = collect_android_xtables_save_snapshots(fixture.directory.path(), Duration::ZERO)
+        .expect_err("zero aggregate bound must fail before opening applets");
+    assert_eq!(error.kind(), XtablesRestoreProcessErrorKind::InvalidConfig);
+}
+
 #[test]
 fn tool_set_rejects_wrong_role_and_mixed_release_reports() {
     let wrong_role = Fixture::new();

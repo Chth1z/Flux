@@ -2263,8 +2263,9 @@ rollback, and exact cleanup.
   xtables parser; verify and commit the isolated foundation.
 - [x] U2.1b: Add bounded read-only netlink framing plus native nftables and privacy-reduced XFRM
   enumeration. Unknown, interrupted, truncated, drifting, or unmodeled semantics must fail closed.
-- [ ] U2.1c: Enumerate relevant TC/BPF attachment domains, retrieve every exact attached program,
-  and classify packet/socket/conntrack mark reads and writes without trusting program names.
+- [x] U2.1c: Bracket every TC filter plus the kernel-global loaded-eBPF superset, retain exact
+  verifier-rewritten program digests, and conservatively classify reachable mark planes without
+  trusting program names or rewritten private offsets.
 - [ ] U2.1d: Prove existing Flux absence across durable files, processes, chains, policy routing,
   journal, lease, lock, and archive; derive the clean-journal identity from that observed proof.
 - [ ] U2.1e: Assemble all 27 source-plane cells and one bounded sanitized diagnostic projection,
@@ -2274,6 +2275,17 @@ rollback, and exact cleanup.
 - The native rtnetlink inventory is the sole links/addresses/routes/rules snapshot. External mark
   state must compare canonically equal on both sides of that transaction; merging observations from
   different times is non-authorizing.
+- TC/BPF completeness does not treat global eBPF program IDs as an attachment census. Subscribed
+  `RTM_GETTFILTER` snapshots bracket every TC classifier/action, including TC-attached classic BPF;
+  the separately bracketed global eBPF ID set is a conservative loaded-program superset for eBPF
+  attachment mechanisms. An already-loaded relevant eBPF program remains opaque whether attached
+  or detached, which permits false positives but not a false absence from attachment-state drift.
+- `BPF_OBJ_GET_INFO_BY_FD` returns verifier-rewritten instructions: UAPI context fields have become
+  private kernel-structure offsets and ordinary helper IDs have become kernel-relative call
+  targets. The collector therefore retains only their digest/count and proves complete absence
+  solely for program types without a fwmark-capable context; every other or inaccessible type is
+  opaque. Process-private classic `SO_ATTACH_FILTER` receive filters are outside this
+  routing/capture-owner source boundary and are not falsely described as globally enumerable.
 - Absence of an `nft` executable is not nftables absence. TC/BPF enumeration must cover relevant
   attachment points and inspect exact programs; XFRM reporting must exclude endpoints.
 - MARK predicate/write operations and CONNMARK/socket transfers remain distinct evidence records.
@@ -2373,6 +2385,14 @@ rollback, and exact cleanup.
 - The first combined final credential/serial regex had mismatched shell quoting and performed no
   scan. Split it into simple hardware-serial, private-key/cloud-key, and credential-assignment
   scans; each corrected check passed.
+- The first U2.1c semantic-hardening patch targeted a stale version of the instruction-projection
+  context and changed no file. Reapply the correction against the current collector before any
+  verification claim.
+- The first strict U2.1c Clippy run found one fixture-only bitwise-precedence warning. Name the
+  aligned attribute length explicitly and rerun the unchanged warnings-denied gate.
+- The initial U2.1c design analyzed verifier-rewritten bytes using stable UAPI context offsets and
+  helper IDs. Linux 5.15 source review disproved that assumption; remove the 720-line analyzer and
+  classify every mark-capable, unknown, or inaccessible program type as opaque.
 
 ### U1 Verification
 - `cargo test -p flux-core`: passed all unit, integration, and documentation tests.
@@ -2403,8 +2423,24 @@ rollback, and exact cleanup.
 - `cargo xtask check-android`, `cargo fmt --all -- --check`, `git diff --check`, and the
   hardware-serial/credential scan passed.
 - No device command or mutation occurred during this host checkpoint.
+- U2.1c adds subscribed before/after TC-filter dumps and before/after global eBPF-program ID passes.
+  It retrieves at most 65,536 programs, 1 MiB per program, and 16 MiB total verifier-rewritten
+  instructions under the shared 1 ms to 30 second deadline. Accessible program descriptors stay
+  open through the after-pass, preventing ID-reuse ABA drift from matching the original ID set.
+- Any TC filter makes packet/conntrack coverage opaque. Loaded eBPF types without a fwmark context
+  (`XDP`, cgroup-device, LIRC, and cgroup-sysctl) can remain complete-absent; all networking,
+  tracing, extension, unknown, or inaccessible types fail closed on their reachable planes.
+- `cargo test -p flux-platform traffic_control_bpf --lib`: 7 passed, 0 failed, 1 privileged smoke
+  ignored. `cargo test -p flux-platform android_fwmark_census --lib`: 34 passed, 0 failed, 3
+  privileged smokes ignored. Strict all-target/all-feature `flux-platform` Clippy passed.
+- `cargo test -p flux-platform --lib`: 389 passed, 0 failed, 7 documented host/root ignores.
+  All-target compile, the pinned ARM64/API-31 cross-check, rustfmt, diff hygiene, targeted
+  credential/device-identifier scans, and the complete `cargo xtask ci` gate passed.
+- The original-instruction analyzer was removed rather than retained as non-authorizing runtime
+  work; `traffic_control_bpf.rs` decreased from 1,965 to 1,005 lines before final formatting.
+- No device command or mutation occurred during U2.1c host implementation.
 
 ### Status
-**U2.1b complete; U2.1 in progress** - native inventory, xtables, nftables, XFRM, and the shared
-read-only netlink transport are host-verified. Implement TC/BPF inspection, Flux-absence/journal
-evidence, then assemble the complete 27-cell external A/native/B coordinator before device work.
+**U2.1c complete; U2.1 in progress** - native inventory, xtables, nftables, XFRM, TC-filter, and
+loaded-eBPF observation are host-verified. Implement Flux-absence/journal evidence, then assemble
+the complete 27-cell external A/native/B coordinator before device work.

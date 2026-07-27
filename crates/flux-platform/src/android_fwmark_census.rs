@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 
 mod nftables;
 mod read_only_netlink;
+mod traffic_control_bpf;
 mod xfrm;
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -19,6 +20,12 @@ pub use nftables::collect_android_nftables_fwmarks;
 pub use nftables::{
     AndroidNftablesFwmarkObservation, AndroidNftablesFwmarkObservationError,
     AndroidNftablesFwmarkObservationErrorKind, AndroidNftablesSnapshotDigest,
+};
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use traffic_control_bpf::collect_android_traffic_control_bpf_fwmarks;
+pub use traffic_control_bpf::{
+    AndroidTrafficControlBpfFwmarkObservation, AndroidTrafficControlBpfFwmarkObservationError,
+    AndroidTrafficControlBpfFwmarkObservationErrorKind, AndroidTrafficControlBpfSnapshotDigest,
 };
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use xfrm::collect_android_xfrm_fwmarks;

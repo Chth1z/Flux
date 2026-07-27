@@ -1701,3 +1701,39 @@ It does not yet validate the production Rust composition because that compositio
   ignored; the complete `flux-platform` library passed 382 tests with six documented ignores;
   all-target check, warnings-denied all-feature Clippy, rustfmt, diff hygiene, and the pinned Android
   cross-check passed. No device command or mutation occurred.
+
+## U2.1c Native TC And BPF Census (2026-07-27)
+
+- The collector brackets exact subscribed `RTM_GETTFILTER` snapshots around two kernel-global eBPF
+  program-ID passes. TC presence covers TC-attached classic BPF and non-BPF classifiers/actions;
+  global IDs are used only as a conservative loaded-eBPF superset, not misrepresented as a complete
+  attachment inventory.
+- Each accessible eBPF program is opened by ID and read twice through `BPF_OBJ_GET_INFO_BY_FD` to
+  bind its type, tag, verifier-rewritten length, and exact rewritten-byte digest. Limits are 65,536
+  programs, 1 MiB per program, 16 MiB total, and the existing 1 ms to 30 second deadline. Opened
+  descriptors pin accessible IDs through the after-snapshot check so an unload/reuse cannot create
+  an ABA identity match. A denied program becomes all-plane opaque; enumeration denial,
+  disappearance, malformed metadata, resource exhaustion, deadline expiry, or before/after drift
+  returns a typed failure.
+- Official Linux v5.15 source invalidated the initial UAPI-offset analyzer. `convert_ctx_accesses`
+  rewrites public BPF context accesses into private `struct sk_buff`/`struct sock` accesses before
+  `do_misc_fixups` replaces ordinary helper IDs with kernel-relative call targets.
+  `bpf_prog_get_info_by_fd` copies this verifier-rewritten `prog->insnsi` stream after only bounded
+  dump sanitization; it does not reconstruct the original UAPI instruction stream.
+- The 720-line analyzer was therefore removed. Exact rewritten bytes now influence only the digest
+  and instruction count. XDP, cgroup-device, LIRC, and cgroup-sysctl programs can prove
+  complete-absent because their contexts cannot carry fwmarks; every networking, tracing,
+  extension, unknown, or inaccessible program is opaque on its conservatively reachable planes.
+  Any TC filter makes packet and conntrack coverage opaque.
+- Classic `SO_ATTACH_FILTER` programs can exist outside the eBPF ID registry. Linux v5.15 socket
+  diagnostics exposes original classic-filter data for AF_PACKET, but no generic equivalent exists
+  across inet/unix families. Those process-private receive filters can read ancillary packet marks
+  but do not write routing/capture-owner marks, so they are explicitly outside this source boundary;
+  TC-attached classic filters remain covered by the TC dump.
+- Final host verification passes 7 focused TC/BPF tests with one privileged smoke ignored, 34
+  complete census tests with three privileged smokes ignored, and 389 complete `flux-platform`
+  library tests with seven documented host/root ignores. All-target compile, strict
+  all-target/all-feature Clippy, the pinned ARM64/API-31 cross-check, rustfmt, diff hygiene, and
+  targeted credential/device-identifier scans pass. `cargo xtask ci` also exits zero across source
+  policy, workspace checks/tests/doc-tests, strict Clippy, and Android cross-compilation. No device
+  command or mutation occurred.

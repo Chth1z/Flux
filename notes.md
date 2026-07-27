@@ -1791,3 +1791,26 @@ It does not yet validate the production Rust composition because that compositio
   all-target/all-feature Clippy, pinned ARM64/API-31 cross-compilation, `cargo xtask ci`, rustfmt,
   diff hygiene, and scoped credential/device-identifier scans. No device command, collection, or
   mutation occurred.
+
+## U2.2 A/Native/B Freshness Coordinator (2026-07-27)
+
+- The coordinator owns one fixed read-only sequence: Capability A, complete external A, the sole
+  subscribed rtnetlink inventory, inventory-bound existing-Flux absence, complete external B, and
+  Capability B. Policy/topology binding, projection assembly, and any complete-census construction
+  occur only after full typed A/B equality.
+- External snapshots contain only the already privacy-reduced xtables, native nftables, TC/BPF, and
+  XFRM observations plus one domain-separated aggregate digest. Equality compares the complete
+  typed observations; drift errors expose only aggregate digests.
+- Diagnostic mode returns the non-`Clone` projection directly. Planning mode is the only caller of
+  the private projection-to-`CompleteFwmarkCensus` conversion and immediately consumes that census
+  through `authorize_android_mark_planning`.
+- Eight deterministic host tests cover bound rejection, exact six-stage order, capability drift,
+  external drift after Capability B, capability precedence under simultaneous drift, wrong A
+  context before native collection, exact source-failure attribution, and the one-shot authority
+  boundary. All eight pass. The exact Samsung policy v1 deliberately reaches core and rejects for
+  missing ordered-packet-write qualification; U2.5 must review and compile policy v2 before a real
+  positive authority can exist.
+- No device command, collection, or mutation occurred during this focused checkpoint.
+- Final verification passes all eight focused tests, the complete `flux-platform` suite and doc
+  tests, all-target compilation, warnings-denied all-target/all-feature Clippy, the pinned Android
+  cross-check, and the complete repository CI gate. No device command or mutation occurred.

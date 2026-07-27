@@ -2240,7 +2240,7 @@ rollback, and exact cleanup.
 - [x] U2.1: Freeze the bounded external-source snapshot protocol, canonical parser, completeness
   matrix, sanitized diagnostic report, and exact ordered-write selector-digest grammar with hostile
   host fixtures.
-- [ ] U2.2: Add one production-shaped `flux-platform` coordinator that brackets a native
+- [x] U2.2: Add one production-shaped `flux-platform` coordinator that brackets a native
   rtnetlink inventory with identical external snapshots A/B, binds capability identity before and
   after, and returns either a non-authorizing diagnostic or one consumed planning authority.
 - [ ] U2.3: Add the explicit-serial `xtask` runner and stripped ARM64 collector probe. Require the
@@ -2270,6 +2270,16 @@ rollback, and exact cleanup.
   journal, lease, lock, and archive; derive the clean-journal identity from that observed proof.
 - [x] U2.1e: Assemble all 27 source-plane cells and one bounded sanitized diagnostic projection,
   with adversarial completeness, budget, drift, and privacy tests.
+
+### U2.2 Execution Plan
+- [x] U2.2a: Add the typed coordinator request, collection stages, privacy-reduced external snapshot
+  identity, diagnostic/authority purpose, outcome, and error surface.
+- [x] U2.2b: Enforce capability A/B and external A/B equality around the sole rtnetlink inventory
+  plus existing-Flux proof before policy binding, assembly, or any authority conversion.
+- [x] U2.2c: Keep the projection-to-`CompleteFwmarkCensus` conversion private to the coordinator and
+  consume it exactly once through `authorize_android_mark_planning` in authority mode.
+- [x] U2.2d: Add deterministic sequence, drift, context, failure-precedence, diagnostic, and
+  authority-boundary tests; run focused and repository-wide host verification.
 
 ### U2 Decisions
 - The native rtnetlink inventory is the sole links/addresses/routes/rules snapshot. External mark
@@ -2306,6 +2316,16 @@ rollback, and exact cleanup.
   have no public projection field.
 - U2 diagnostic mode may run with policy v1 and must remain non-authorizing. Only a checked-in,
   independently reviewed v2 can admit the exact ordered-write set observed by a later fresh run.
+- U2.2 fixes the read-only transaction order as Capability A, external A, the sole subscribed
+  rtnetlink inventory, the inventory-bound existing-Flux proof, external B, then Capability B.
+  Existing-Flux uses A's xtables identity; complete typed A/B equality proves the same external
+  mark state still exists after that proof.
+- The coordinator compares full typed Capability Profiles and external observations, not only their
+  SHA-256 identities. Public drift errors retain only revisions and privacy-reduced digests.
+- Diagnostic and planning-authority modes share the exact collection path. Only authority mode can
+  enter the private projection conversion, and it immediately consumes the complete census through
+  core authorization. Policy v1 is expected to reject there until U2.5 supplies reviewed ordered
+  writes; that expected rejection does not weaken or bypass the boundary.
 
 ### Fresh U0 Evidence
 - The repository worktree is clean at `de12787`; no local-only uncommitted file is carried into the
@@ -2344,6 +2364,13 @@ rollback, and exact cleanup.
   `0644` documentation before staging; their byte content and compiled policy digest are unchanged.
 
 ### U2 Errors Encountered
+- The first final U2.2 `cargo xtask ci` invocation yielded after workspace compilation, but its
+  wrapper printed neither the child session ID nor a final exit code. No Cargo/xtask process
+  remained, so the partial output is not verification evidence. Rerun the unchanged gate with an
+  explicit one-second yield and poll the captured session through completion.
+- The first U2.2 all-target compile passed but reported that the external phase-to-stage helper was
+  test-only dead code. Make it a public read-only accessor and use it in production collection-error
+  mapping before running warnings-denied Clippy; no runtime behavior or authority surface changed.
 - The first U2.1e staging attempt could not create `.git/index.lock` because the managed workspace
   exposes Git metadata read-only inside the default sandbox. No index, source, or device state
   changed; retry the same explicit 11-path `git add` with Git-metadata permission.
@@ -2503,7 +2530,25 @@ rollback, and exact cleanup.
   credential/device-identifier scans pass.
 - No device command, collection, or mutation occurred during U2.1e host implementation.
 
+### U2.2 Checkpoint Evidence
+- `flux-platform` owns one public typed coordinator and trusted read-only source seam. The exact
+  six-stage order is Capability A, external A, native inventory, existing-Flux proof, external B,
+  and Capability B; complete typed capability and external equality is required before assembly.
+- The only `flux-platform` projection-to-`CompleteFwmarkCensus` conversion is private to the
+  coordinator. Diagnostic mode returns the non-authorizing projection; authority mode consumes the
+  projection and census exactly once through core authorization.
+- Eight focused coordinator tests pass. They cover invalid bounds, exact order, capability drift,
+  external drift, simultaneous-drift precedence, wrong snapshot context, exact source-stage failure,
+  and the policy-v1 authority boundary.
+- The complete census suite passed before the final precedence-only test, and the final repository
+  CI rerun exercised the complete updated suite. Standalone `flux-platform` verification passed 421
+  tests with seven documented environment-dependent ignores before that additional focused test;
+  two documentation tests also passed.
+- `cargo check -p flux-platform --all-targets`, warnings-denied all-target/all-feature Clippy,
+  `cargo xtask check-android`, and the complete `cargo xtask ci` gate pass. Rustfmt and diff hygiene
+  are clean. No device command, collection, or mutation occurred during U2.2.
+
 ### Status
-**U2.1 complete; U2.2 is next** - every source and the exact 27-cell sanitized projection are
-host-verified. Add the production-shaped A/native/B freshness coordinator and its one-shot
-authority-consumption boundary before building or running any device collector.
+**U2.2 complete; U2.3 is next** - the A/native/B freshness coordinator and one-shot authority
+boundary are host-verified. Add the explicit-serial runner and stripped ARM64 collector probe before
+any physical-device census run.

@@ -18,10 +18,16 @@ mod traffic_control_bpf;
 mod xfrm;
 
 pub use assembly::{
-    ANDROID_FWMARK_CENSUS_PROJECTION_CELLS, ANDROID_FWMARK_CENSUS_PROJECTION_METRICS,
-    AndroidFwmarkCensusAssemblyError, AndroidFwmarkCensusMetric, AndroidFwmarkCensusMetricKind,
-    AndroidFwmarkCensusProjection, AndroidFwmarkCensusProjectionDigest,
-    assemble_android_fwmark_census_projection,
+    ANDROID_FWMARK_CENSUS_COLLECTOR_REVISION, ANDROID_FWMARK_CENSUS_PROJECTION_CELLS,
+    ANDROID_FWMARK_CENSUS_PROJECTION_METRICS, AndroidFwmarkCensusAssemblyError,
+    AndroidFwmarkCensusCollectionStage, AndroidFwmarkCensusCoordinatorError,
+    AndroidFwmarkCensusCoordinatorOutcome, AndroidFwmarkCensusCoordinatorPurpose,
+    AndroidFwmarkCensusCoordinatorRequest, AndroidFwmarkCensusCoordinatorRequestError,
+    AndroidFwmarkCensusCoordinatorSource, AndroidFwmarkCensusExternalPhase,
+    AndroidFwmarkCensusExternalSnapshot, AndroidFwmarkCensusExternalSnapshotDigest,
+    AndroidFwmarkCensusMetric, AndroidFwmarkCensusMetricKind, AndroidFwmarkCensusProjection,
+    AndroidFwmarkCensusProjectionDigest, MAX_ANDROID_FWMARK_CENSUS_STAGE_BOUND,
+    assemble_android_fwmark_census_projection, coordinate_android_fwmark_census,
 };
 
 #[cfg(any(target_os = "linux", target_os = "android"))]

@@ -19,6 +19,18 @@ use super::{
     AndroidXtablesFwmarkObservation,
 };
 
+mod coordinator;
+
+pub use coordinator::{
+    ANDROID_FWMARK_CENSUS_COLLECTOR_REVISION, AndroidFwmarkCensusCollectionStage,
+    AndroidFwmarkCensusCoordinatorError, AndroidFwmarkCensusCoordinatorOutcome,
+    AndroidFwmarkCensusCoordinatorPurpose, AndroidFwmarkCensusCoordinatorRequest,
+    AndroidFwmarkCensusCoordinatorRequestError, AndroidFwmarkCensusCoordinatorSource,
+    AndroidFwmarkCensusExternalPhase, AndroidFwmarkCensusExternalSnapshot,
+    AndroidFwmarkCensusExternalSnapshotDigest, MAX_ANDROID_FWMARK_CENSUS_STAGE_BOUND,
+    coordinate_android_fwmark_census,
+};
+
 pub const ANDROID_FWMARK_CENSUS_PROJECTION_CELLS: usize = 27;
 pub const ANDROID_FWMARK_CENSUS_PROJECTION_METRICS: usize = 36;
 

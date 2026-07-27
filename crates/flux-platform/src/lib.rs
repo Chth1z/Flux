@@ -27,20 +27,27 @@ pub mod socket_diagnostics;
 mod xtables;
 
 pub use android_fwmark_census::{
-    ANDROID_FWMARK_CENSUS_PROJECTION_CELLS, ANDROID_FWMARK_CENSUS_PROJECTION_METRICS,
-    AndroidExistingFluxOwnershipDigest, AndroidExistingFluxOwnershipError,
-    AndroidExistingFluxOwnershipErrorKind, AndroidExistingFluxOwnershipObservation,
-    AndroidFwmarkCensusAssemblyError, AndroidFwmarkCensusMetric, AndroidFwmarkCensusMetricKind,
-    AndroidFwmarkCensusProjection, AndroidFwmarkCensusProjectionDigest,
-    AndroidNftablesFwmarkObservation, AndroidNftablesFwmarkObservationError,
-    AndroidNftablesFwmarkObservationErrorKind, AndroidNftablesSnapshotDigest,
-    AndroidTrafficControlBpfFwmarkObservation, AndroidTrafficControlBpfFwmarkObservationError,
+    ANDROID_FWMARK_CENSUS_COLLECTOR_REVISION, ANDROID_FWMARK_CENSUS_PROJECTION_CELLS,
+    ANDROID_FWMARK_CENSUS_PROJECTION_METRICS, AndroidExistingFluxOwnershipDigest,
+    AndroidExistingFluxOwnershipError, AndroidExistingFluxOwnershipErrorKind,
+    AndroidExistingFluxOwnershipObservation, AndroidFwmarkCensusAssemblyError,
+    AndroidFwmarkCensusCollectionStage, AndroidFwmarkCensusCoordinatorError,
+    AndroidFwmarkCensusCoordinatorOutcome, AndroidFwmarkCensusCoordinatorPurpose,
+    AndroidFwmarkCensusCoordinatorRequest, AndroidFwmarkCensusCoordinatorRequestError,
+    AndroidFwmarkCensusCoordinatorSource, AndroidFwmarkCensusExternalPhase,
+    AndroidFwmarkCensusExternalSnapshot, AndroidFwmarkCensusExternalSnapshotDigest,
+    AndroidFwmarkCensusMetric, AndroidFwmarkCensusMetricKind, AndroidFwmarkCensusProjection,
+    AndroidFwmarkCensusProjectionDigest, AndroidNftablesFwmarkObservation,
+    AndroidNftablesFwmarkObservationError, AndroidNftablesFwmarkObservationErrorKind,
+    AndroidNftablesSnapshotDigest, AndroidTrafficControlBpfFwmarkObservation,
+    AndroidTrafficControlBpfFwmarkObservationError,
     AndroidTrafficControlBpfFwmarkObservationErrorKind, AndroidTrafficControlBpfSnapshotDigest,
     AndroidXfrmFwmarkObservation, AndroidXfrmFwmarkObservationError,
     AndroidXfrmFwmarkObservationErrorKind, AndroidXfrmSnapshotDigest,
     AndroidXtablesFwmarkObservation, AndroidXtablesFwmarkObservationError,
     AndroidXtablesFwmarkObservationErrorKind, AndroidXtablesSnapshotDigest,
-    assemble_android_fwmark_census_projection, observe_android_xtables_fwmarks,
+    MAX_ANDROID_FWMARK_CENSUS_STAGE_BOUND, assemble_android_fwmark_census_projection,
+    coordinate_android_fwmark_census, observe_android_xtables_fwmarks,
 };
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use android_fwmark_census::{

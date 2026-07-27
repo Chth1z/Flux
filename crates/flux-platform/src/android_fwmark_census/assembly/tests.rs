@@ -31,18 +31,18 @@ const NETWORK_PERMISSION: u32 = 0x0004_0000;
 const SYSTEM_PERMISSION: u32 = 0x000c_0000;
 const EMPTY_XTABLES: &[u8] = b"*mangle\n:INPUT ACCEPT [0:0]\n:POSTROUTING ACCEPT [0:0]\nCOMMIT\n";
 
-struct Fixture {
-    inventory: NetworkInventory,
-    capability_profile: CapabilityProfile,
-    network_namespace: NetworkNamespaceIdentity,
-    device_policy: AndroidMarkDevicePolicy,
-    android_net_id: AndroidNetIdFwmarkCensusFragment,
-    rpdb: RpdbFwmarkCensusFragment,
-    xtables: AndroidXtablesFwmarkObservation,
-    nftables: AndroidNftablesFwmarkObservation,
-    traffic_control_bpf: AndroidTrafficControlBpfFwmarkObservation,
-    xfrm: AndroidXfrmFwmarkObservation,
-    existing_flux: AndroidExistingFluxOwnershipObservation,
+pub(super) struct Fixture {
+    pub(super) inventory: NetworkInventory,
+    pub(super) capability_profile: CapabilityProfile,
+    pub(super) network_namespace: NetworkNamespaceIdentity,
+    pub(super) device_policy: AndroidMarkDevicePolicy,
+    pub(super) android_net_id: AndroidNetIdFwmarkCensusFragment,
+    pub(super) rpdb: RpdbFwmarkCensusFragment,
+    pub(super) xtables: AndroidXtablesFwmarkObservation,
+    pub(super) nftables: AndroidNftablesFwmarkObservation,
+    pub(super) traffic_control_bpf: AndroidTrafficControlBpfFwmarkObservation,
+    pub(super) xfrm: AndroidXfrmFwmarkObservation,
+    pub(super) existing_flux: AndroidExistingFluxOwnershipObservation,
 }
 
 impl Fixture {
@@ -494,7 +494,7 @@ fn endpoint_and_private_identity_changes_do_not_escape_the_sanitized_surface() {
     }
 }
 
-fn fixture(endpoint: Ipv4Addr, positive_policy: bool) -> Fixture {
+pub(super) fn fixture(endpoint: Ipv4Addr, positive_policy: bool) -> Fixture {
     let network_namespace = NetworkNamespaceIdentity::new(20, 234_673).expect("namespace");
     let inventory = inventory(endpoint);
     let capability_profile = samsung_capability_profile(network_namespace);

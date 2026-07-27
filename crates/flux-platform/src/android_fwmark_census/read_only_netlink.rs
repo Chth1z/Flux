@@ -87,6 +87,11 @@ impl ReadOnlyNetlinkError {
     pub(super) const fn raw_os_error(self) -> Option<i32> {
         self.raw_os_error
     }
+
+    #[cfg(test)]
+    pub(super) const fn fixture(kind: ReadOnlyNetlinkErrorKind, raw_os_error: Option<i32>) -> Self {
+        Self::os(kind, raw_os_error)
+    }
 }
 
 impl fmt::Display for ReadOnlyNetlinkError {

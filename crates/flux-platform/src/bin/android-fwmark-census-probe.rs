@@ -196,6 +196,16 @@ const fn nftables_error_label(class: SystemAndroidNftablesObservationErrorClass)
             "nftables-permission-denied"
         }
         SystemAndroidNftablesObservationErrorClass::Transport => "nftables-transport",
+        SystemAndroidNftablesObservationErrorClass::SystemCall => "nftables-system-call",
+        SystemAndroidNftablesObservationErrorClass::Timeout => "nftables-timeout",
+        SystemAndroidNftablesObservationErrorClass::ShortWrite => "nftables-short-write",
+        SystemAndroidNftablesObservationErrorClass::UnexpectedSender => {
+            "nftables-unexpected-sender"
+        }
+        SystemAndroidNftablesObservationErrorClass::MalformedDatagram => {
+            "nftables-malformed-datagram"
+        }
+        SystemAndroidNftablesObservationErrorClass::KernelRejected => "nftables-kernel-rejected",
         SystemAndroidNftablesObservationErrorClass::SnapshotDrift => "nftables-snapshot-drift",
         SystemAndroidNftablesObservationErrorClass::InvalidMessageType => {
             "nftables-invalid-message-type"
@@ -257,6 +267,12 @@ mod tests {
             SystemAndroidNftablesObservationErrorClass::InvalidBound,
             SystemAndroidNftablesObservationErrorClass::PermissionDenied,
             SystemAndroidNftablesObservationErrorClass::Transport,
+            SystemAndroidNftablesObservationErrorClass::SystemCall,
+            SystemAndroidNftablesObservationErrorClass::Timeout,
+            SystemAndroidNftablesObservationErrorClass::ShortWrite,
+            SystemAndroidNftablesObservationErrorClass::UnexpectedSender,
+            SystemAndroidNftablesObservationErrorClass::MalformedDatagram,
+            SystemAndroidNftablesObservationErrorClass::KernelRejected,
             SystemAndroidNftablesObservationErrorClass::SnapshotDrift,
             SystemAndroidNftablesObservationErrorClass::InvalidMessageType,
             SystemAndroidNftablesObservationErrorClass::InvalidFamilyHeader,

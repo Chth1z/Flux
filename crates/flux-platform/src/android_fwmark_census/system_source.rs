@@ -9,6 +9,7 @@ use flux_core::{
     NetworkInventory, NetworkNamespaceIdentity,
 };
 
+use super::nftables::AndroidNftablesTransportErrorKind;
 use super::{
     AndroidExistingFluxOwnershipObservation, AndroidFwmarkCensusCollectionStage,
     AndroidFwmarkCensusCoordinatorSource, AndroidFwmarkCensusExternalPhase,
@@ -48,6 +49,12 @@ pub enum SystemAndroidNftablesObservationErrorClass {
     InvalidBound,
     PermissionDenied,
     Transport,
+    SystemCall,
+    Timeout,
+    ShortWrite,
+    UnexpectedSender,
+    MalformedDatagram,
+    KernelRejected,
     SnapshotDrift,
     InvalidMessageType,
     InvalidFamilyHeader,
@@ -101,6 +108,7 @@ impl SystemAndroidFwmarkCensusSourceError {
             kind: SystemAndroidFwmarkCensusSourceErrorKind::NftablesObservation,
             nftables_class: Some(classify_nftables_observation_error(
                 source.kind(),
+                source.transport_kind(),
                 source.raw_os_error(),
             )),
             source: Some(Box::new(source)),
@@ -286,6 +294,7 @@ fn map_nftables_observation(
 
 const fn classify_nftables_observation_error(
     kind: AndroidNftablesFwmarkObservationErrorKind,
+    transport_kind: Option<AndroidNftablesTransportErrorKind>,
     raw_os_error: Option<i32>,
 ) -> SystemAndroidNftablesObservationErrorClass {
     match kind {
@@ -296,6 +305,54 @@ const fn classify_nftables_observation_error(
             if matches!(raw_os_error, Some(libc::EPERM) | Some(libc::EACCES)) =>
         {
             SystemAndroidNftablesObservationErrorClass::PermissionDenied
+        }
+        AndroidNftablesFwmarkObservationErrorKind::Transport
+            if matches!(
+                transport_kind,
+                Some(AndroidNftablesTransportErrorKind::SystemCall)
+            ) =>
+        {
+            SystemAndroidNftablesObservationErrorClass::SystemCall
+        }
+        AndroidNftablesFwmarkObservationErrorKind::Transport
+            if matches!(
+                transport_kind,
+                Some(AndroidNftablesTransportErrorKind::Timeout)
+            ) =>
+        {
+            SystemAndroidNftablesObservationErrorClass::Timeout
+        }
+        AndroidNftablesFwmarkObservationErrorKind::Transport
+            if matches!(
+                transport_kind,
+                Some(AndroidNftablesTransportErrorKind::ShortWrite)
+            ) =>
+        {
+            SystemAndroidNftablesObservationErrorClass::ShortWrite
+        }
+        AndroidNftablesFwmarkObservationErrorKind::Transport
+            if matches!(
+                transport_kind,
+                Some(AndroidNftablesTransportErrorKind::UnexpectedSender)
+            ) =>
+        {
+            SystemAndroidNftablesObservationErrorClass::UnexpectedSender
+        }
+        AndroidNftablesFwmarkObservationErrorKind::Transport
+            if matches!(
+                transport_kind,
+                Some(AndroidNftablesTransportErrorKind::MalformedDatagram)
+            ) =>
+        {
+            SystemAndroidNftablesObservationErrorClass::MalformedDatagram
+        }
+        AndroidNftablesFwmarkObservationErrorKind::Transport
+            if matches!(
+                transport_kind,
+                Some(AndroidNftablesTransportErrorKind::KernelRejected)
+            ) =>
+        {
+            SystemAndroidNftablesObservationErrorClass::KernelRejected
         }
         AndroidNftablesFwmarkObservationErrorKind::Transport => {
             SystemAndroidNftablesObservationErrorClass::Transport
@@ -387,6 +444,7 @@ mod tests {
         assert_eq!(
             classify_nftables_observation_error(
                 AndroidNftablesFwmarkObservationErrorKind::Transport,
+                Some(AndroidNftablesTransportErrorKind::KernelRejected),
                 Some(libc::EPERM),
             ),
             SystemAndroidNftablesObservationErrorClass::PermissionDenied
@@ -394,6 +452,23 @@ mod tests {
         assert_eq!(
             classify_nftables_observation_error(
                 AndroidNftablesFwmarkObservationErrorKind::Transport,
+                Some(AndroidNftablesTransportErrorKind::KernelRejected),
+                Some(libc::EINVAL),
+            ),
+            SystemAndroidNftablesObservationErrorClass::KernelRejected
+        );
+        assert_eq!(
+            classify_nftables_observation_error(
+                AndroidNftablesFwmarkObservationErrorKind::Transport,
+                Some(AndroidNftablesTransportErrorKind::Timeout),
+                None,
+            ),
+            SystemAndroidNftablesObservationErrorClass::Timeout
+        );
+        assert_eq!(
+            classify_nftables_observation_error(
+                AndroidNftablesFwmarkObservationErrorKind::Transport,
+                None,
                 Some(libc::EINVAL),
             ),
             SystemAndroidNftablesObservationErrorClass::Transport
@@ -401,6 +476,7 @@ mod tests {
         assert_eq!(
             classify_nftables_observation_error(
                 AndroidNftablesFwmarkObservationErrorKind::InvalidExpression,
+                None,
                 None,
             ),
             SystemAndroidNftablesObservationErrorClass::InvalidExpression

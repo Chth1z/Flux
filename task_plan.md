@@ -2708,6 +2708,9 @@ rollback, and exact cleanup.
   `EPERM`/`EACCES` permission class but still combines kernel rejection, syscall, timeout,
   short-write, unexpected-sender, and malformed-datagram paths. Mandatory cleanup returned and an
   independent root proof found zero census paths and processes.
+- The first U2.4g rustfmt check requested canonical layout in the new internal-kind mapping, test
+  fixture signature, and one probe label arm. Apply `cargo fmt --all` and rerun the unchanged
+  focused and cross-target verification; runtime behavior was unaffected.
 
 ### Status
 **U2.4 stopped cleanly at a non-permission nftables transport failure** - commit `5ef4074` is clean,

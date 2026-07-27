@@ -155,8 +155,19 @@ pub enum AndroidNftablesFwmarkObservationErrorKind {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum AndroidNftablesTransportErrorKind {
+    SystemCall,
+    Timeout,
+    ShortWrite,
+    UnexpectedSender,
+    MalformedDatagram,
+    KernelRejected,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AndroidNftablesFwmarkObservationError {
     kind: AndroidNftablesFwmarkObservationErrorKind,
+    transport_kind: Option<AndroidNftablesTransportErrorKind>,
     raw_os_error: Option<i32>,
 }
 
@@ -164,34 +175,55 @@ impl AndroidNftablesFwmarkObservationError {
     const fn new(kind: AndroidNftablesFwmarkObservationErrorKind) -> Self {
         Self {
             kind,
+            transport_kind: None,
             raw_os_error: None,
         }
     }
 
     const fn transport(source: ReadOnlyNetlinkError) -> Self {
-        let kind = match source.kind() {
-            ReadOnlyNetlinkErrorKind::InvalidBound => {
-                AndroidNftablesFwmarkObservationErrorKind::InvalidBound
-            }
+        let (kind, transport_kind) = match source.kind() {
+            ReadOnlyNetlinkErrorKind::InvalidBound => (
+                AndroidNftablesFwmarkObservationErrorKind::InvalidBound,
+                None,
+            ),
             ReadOnlyNetlinkErrorKind::ConcurrentNotification
-            | ReadOnlyNetlinkErrorKind::DumpInterrupted => {
-                AndroidNftablesFwmarkObservationErrorKind::SnapshotDrift
-            }
+            | ReadOnlyNetlinkErrorKind::DumpInterrupted => (
+                AndroidNftablesFwmarkObservationErrorKind::SnapshotDrift,
+                None,
+            ),
             ReadOnlyNetlinkErrorKind::LimitExceeded
-            | ReadOnlyNetlinkErrorKind::TruncatedDatagram => {
-                AndroidNftablesFwmarkObservationErrorKind::LimitExceeded
-            }
-            ReadOnlyNetlinkErrorKind::SystemCall
-            | ReadOnlyNetlinkErrorKind::Timeout
-            | ReadOnlyNetlinkErrorKind::ShortWrite
-            | ReadOnlyNetlinkErrorKind::UnexpectedSender
-            | ReadOnlyNetlinkErrorKind::MalformedDatagram
-            | ReadOnlyNetlinkErrorKind::KernelRejected => {
-                AndroidNftablesFwmarkObservationErrorKind::Transport
-            }
+            | ReadOnlyNetlinkErrorKind::TruncatedDatagram => (
+                AndroidNftablesFwmarkObservationErrorKind::LimitExceeded,
+                None,
+            ),
+            ReadOnlyNetlinkErrorKind::SystemCall => (
+                AndroidNftablesFwmarkObservationErrorKind::Transport,
+                Some(AndroidNftablesTransportErrorKind::SystemCall),
+            ),
+            ReadOnlyNetlinkErrorKind::Timeout => (
+                AndroidNftablesFwmarkObservationErrorKind::Transport,
+                Some(AndroidNftablesTransportErrorKind::Timeout),
+            ),
+            ReadOnlyNetlinkErrorKind::ShortWrite => (
+                AndroidNftablesFwmarkObservationErrorKind::Transport,
+                Some(AndroidNftablesTransportErrorKind::ShortWrite),
+            ),
+            ReadOnlyNetlinkErrorKind::UnexpectedSender => (
+                AndroidNftablesFwmarkObservationErrorKind::Transport,
+                Some(AndroidNftablesTransportErrorKind::UnexpectedSender),
+            ),
+            ReadOnlyNetlinkErrorKind::MalformedDatagram => (
+                AndroidNftablesFwmarkObservationErrorKind::Transport,
+                Some(AndroidNftablesTransportErrorKind::MalformedDatagram),
+            ),
+            ReadOnlyNetlinkErrorKind::KernelRejected => (
+                AndroidNftablesFwmarkObservationErrorKind::Transport,
+                Some(AndroidNftablesTransportErrorKind::KernelRejected),
+            ),
         };
         Self {
             kind,
+            transport_kind,
             raw_os_error: source.raw_os_error(),
         }
     }
@@ -204,6 +236,10 @@ impl AndroidNftablesFwmarkObservationError {
     #[must_use]
     pub const fn raw_os_error(self) -> Option<i32> {
         self.raw_os_error
+    }
+
+    pub(super) const fn transport_kind(self) -> Option<AndroidNftablesTransportErrorKind> {
+        self.transport_kind
     }
 }
 
@@ -842,6 +878,46 @@ fn digest_usize(digest: &mut Sha256, value: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transport_errors_preserve_payload_free_internal_kinds() {
+        for (source_kind, expected) in [
+            (
+                ReadOnlyNetlinkErrorKind::SystemCall,
+                AndroidNftablesTransportErrorKind::SystemCall,
+            ),
+            (
+                ReadOnlyNetlinkErrorKind::Timeout,
+                AndroidNftablesTransportErrorKind::Timeout,
+            ),
+            (
+                ReadOnlyNetlinkErrorKind::ShortWrite,
+                AndroidNftablesTransportErrorKind::ShortWrite,
+            ),
+            (
+                ReadOnlyNetlinkErrorKind::UnexpectedSender,
+                AndroidNftablesTransportErrorKind::UnexpectedSender,
+            ),
+            (
+                ReadOnlyNetlinkErrorKind::MalformedDatagram,
+                AndroidNftablesTransportErrorKind::MalformedDatagram,
+            ),
+            (
+                ReadOnlyNetlinkErrorKind::KernelRejected,
+                AndroidNftablesTransportErrorKind::KernelRejected,
+            ),
+        ] {
+            let error = AndroidNftablesFwmarkObservationError::transport(
+                ReadOnlyNetlinkError::fixture(source_kind, Some(libc::EINVAL)),
+            );
+            assert_eq!(
+                error.kind(),
+                AndroidNftablesFwmarkObservationErrorKind::Transport
+            );
+            assert_eq!(error.transport_kind(), Some(expected));
+            assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
+        }
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

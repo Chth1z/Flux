@@ -318,6 +318,11 @@ fn absent_observation(kernel_supported: bool) -> AndroidXfrmFwmarkObservation {
         .expect("empty XFRM snapshots are always complete absence")
 }
 
+#[cfg(test)]
+pub(super) fn test_absent_observation(kernel_supported: bool) -> AndroidXfrmFwmarkObservation {
+    absent_observation(kernel_supported)
+}
+
 struct AttributeProjection {
     mark_uses: Vec<FwmarkUseRecord>,
     mark_attribute_count: usize,

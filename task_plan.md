@@ -2237,7 +2237,7 @@ rollback, and exact cleanup.
   cleaning the exact Rust-only package; commit Gate 2 evidence and final profile status.
 
 ### U2 Subphases
-- [ ] U2.1: Freeze the bounded external-source snapshot protocol, canonical parser, completeness
+- [x] U2.1: Freeze the bounded external-source snapshot protocol, canonical parser, completeness
   matrix, sanitized diagnostic report, and exact ordered-write selector-digest grammar with hostile
   host fixtures.
 - [ ] U2.2: Add one production-shaped `flux-platform` coordinator that brackets a native
@@ -2268,7 +2268,7 @@ rollback, and exact cleanup.
   trusting program names or rewritten private offsets.
 - [x] U2.1d: Prove existing Flux absence across durable files, processes, chains, policy routing,
   journal, lease, lock, and archive; derive the clean-journal identity from that observed proof.
-- [ ] U2.1e: Assemble all 27 source-plane cells and one bounded sanitized diagnostic projection,
+- [x] U2.1e: Assemble all 27 source-plane cells and one bounded sanitized diagnostic projection,
   with adversarial completeness, budget, drift, and privacy tests.
 
 ### U2 Decisions
@@ -2293,6 +2293,17 @@ rollback, and exact cleanup.
 - A clean missing journal receives a domain-separated observed-absence identity derived from the
   exact absence proof and bound capability/inventory facts. A hard-coded or caller-invented journal
   identity cannot authorize planning.
+- U2.1e returns one non-authorizing, non-`Clone` projection. It binds but does not expose raw
+  capability/device facts, and it cannot mint a `CompleteFwmarkCensus` until the U2.2 A/native/B
+  coordinator consumes it after freshness checks.
+- The projection uses the core source order and plane order exactly. It combines xtables and native
+  nftables transfer evidence into the single `ConnmarkAndSocketTransfers` source, enforces global
+  raw-use and ordered-write budgets before canonicalization, and keeps noncomplete cells as bounded
+  diagnostics rather than turning them into constructor errors or false absence.
+- The sanitized surface is a fixed matrix plus typed mark masks, ordered-write chain/ordinal/
+  selector identities, fixed labeled counts, and one domain-separated aggregate digest. Paths,
+  endpoints, boot ID, hardware serial, credentials, opaque bytes, instructions, and unrelated state
+  have no public projection field.
 - U2 diagnostic mode may run with policy v1 and must remain non-authorizing. Only a checked-in,
   independently reviewed v2 can admit the exact ordered-write set observed by a later fresh run.
 
@@ -2333,6 +2344,16 @@ rollback, and exact cleanup.
   `0644` documentation before staging; their byte content and compiled policy digest are unchanged.
 
 ### U2 Errors Encountered
+- The first U2.1e staging attempt could not create `.git/index.lock` because the managed workspace
+  exposes Git metadata read-only inside the default sandbox. No index, source, or device state
+  changed; retry the same explicit 11-path `git add` with Git-metadata permission.
+- The first U2.1e combined credential/device-identifier scan used an unmatched shell quote and both
+  commands stopped before scanning any file. Split the check into simple private-key,
+  credential-assignment, ADB-serial, and Android-serial-property patterns; no repository or device
+  state changed in the failed attempt.
+- The first U2.1e assembly patch expected a stale `lib.rs` re-export context, so the combined
+  module/export patch was rejected without changing any file. Re-read the current export surface
+  and apply the assembly module, parent re-exports, and crate-root re-exports as separate patches.
 - U2.1d semantic review found that the process-scan budget counted only successfully parsed PID
   entries and silently skipped malformed all-numeric names. Count every `/proc` entry against the
   bound and reject leading-zero or overflowing numeric names, so a hostile namespace cannot hide
@@ -2464,8 +2485,25 @@ rollback, and exact cleanup.
   ARM64/API-31 cross-check, rustfmt, diff hygiene, scoped credential/device-identifier scans, and
   the complete `cargo xtask ci` gate pass.
 - No device command or mutation occurred during U2.1d host implementation.
+- U2.1e adds one non-`Clone`, non-authorizing projection with the exact core 9-source by 3-plane
+  order, canonical typed mark masks, sanitized ordered-write identities, exactly 36 stable count
+  labels, and one domain-separated aggregate SHA-256 digest. No conversion into
+  `CompleteFwmarkCensus` exists.
+- Assembly validates RPDB/existing-Flux inventory identity, Capability Profile, namespace, xtables
+  digest, netd profile, positive-policy candidate, coverage shape, mark-use provenance,
+  coverage/use consistency, ordered-write membership/uniqueness, and the global 512-use/128-write
+  budgets before canonicalization. Generic policy planes remain `Unavailable` diagnostics.
+- The xtables observation and digest now bind both the semantic netd profile and candidate because
+  ordered-write qualification depends on both. Xtables and nftables transfer evidence merge under
+  one explicit fail-closed state precedence.
+- U2.1e verification passes 10 focused assembly tests, 58 complete census tests with three
+  privileged smokes ignored, and 414 complete `flux-platform` library tests with seven documented
+  host/root ignores. All-target compile, strict all-target/all-feature Clippy, the pinned
+  ARM64/API-31 cross-check, the complete `cargo xtask ci` gate, rustfmt, diff hygiene, and scoped
+  credential/device-identifier scans pass.
+- No device command, collection, or mutation occurred during U2.1e host implementation.
 
 ### Status
-**U2.1d complete; U2.1e is next** - every individual external source plus existing-Flux absence is
-host-verified. Assemble the exact 27-cell matrix and bounded sanitized diagnostic projection with
-hostile completeness, budget, drift, and privacy tests before any device work.
+**U2.1 complete; U2.2 is next** - every source and the exact 27-cell sanitized projection are
+host-verified. Add the production-shaped A/native/B freshness coordinator and its one-shot
+authority-consumption boundary before building or running any device collector.

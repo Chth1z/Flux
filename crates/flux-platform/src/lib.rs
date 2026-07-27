@@ -27,8 +27,11 @@ pub mod socket_diagnostics;
 mod xtables;
 
 pub use android_fwmark_census::{
+    ANDROID_FWMARK_CENSUS_PROJECTION_CELLS, ANDROID_FWMARK_CENSUS_PROJECTION_METRICS,
     AndroidExistingFluxOwnershipDigest, AndroidExistingFluxOwnershipError,
     AndroidExistingFluxOwnershipErrorKind, AndroidExistingFluxOwnershipObservation,
+    AndroidFwmarkCensusAssemblyError, AndroidFwmarkCensusMetric, AndroidFwmarkCensusMetricKind,
+    AndroidFwmarkCensusProjection, AndroidFwmarkCensusProjectionDigest,
     AndroidNftablesFwmarkObservation, AndroidNftablesFwmarkObservationError,
     AndroidNftablesFwmarkObservationErrorKind, AndroidNftablesSnapshotDigest,
     AndroidTrafficControlBpfFwmarkObservation, AndroidTrafficControlBpfFwmarkObservationError,
@@ -37,7 +40,7 @@ pub use android_fwmark_census::{
     AndroidXfrmFwmarkObservationErrorKind, AndroidXfrmSnapshotDigest,
     AndroidXtablesFwmarkObservation, AndroidXtablesFwmarkObservationError,
     AndroidXtablesFwmarkObservationErrorKind, AndroidXtablesSnapshotDigest,
-    observe_android_xtables_fwmarks,
+    assemble_android_fwmark_census_projection, observe_android_xtables_fwmarks,
 };
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use android_fwmark_census::{

@@ -10,11 +10,19 @@ use flux_core::{
 };
 use sha2::{Digest, Sha256};
 
+mod assembly;
 mod existing_flux;
 mod nftables;
 mod read_only_netlink;
 mod traffic_control_bpf;
 mod xfrm;
+
+pub use assembly::{
+    ANDROID_FWMARK_CENSUS_PROJECTION_CELLS, ANDROID_FWMARK_CENSUS_PROJECTION_METRICS,
+    AndroidFwmarkCensusAssemblyError, AndroidFwmarkCensusMetric, AndroidFwmarkCensusMetricKind,
+    AndroidFwmarkCensusProjection, AndroidFwmarkCensusProjectionDigest,
+    assemble_android_fwmark_census_projection,
+};
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use existing_flux::collect_android_existing_flux_ownership;
@@ -74,6 +82,8 @@ impl AndroidXtablesSnapshotDigest {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AndroidXtablesFwmarkObservation {
     digest: AndroidXtablesSnapshotDigest,
+    netd_source_profile: AndroidNetdSourceProfile,
+    candidate: FwmarkCandidate,
     legacy_mark_uses: Box<[FwmarkUseRecord]>,
     transfer_mark_uses: Box<[FwmarkUseRecord]>,
     ordered_late_writes: Box<[FwmarkOrderedLateWriteQualification]>,
@@ -87,6 +97,16 @@ impl AndroidXtablesFwmarkObservation {
     #[must_use]
     pub const fn digest(&self) -> AndroidXtablesSnapshotDigest {
         self.digest
+    }
+
+    #[must_use]
+    pub const fn netd_source_profile(&self) -> AndroidNetdSourceProfile {
+        self.netd_source_profile
+    }
+
+    #[must_use]
+    pub const fn candidate(&self) -> FwmarkCandidate {
+        self.candidate
     }
 
     #[must_use]
@@ -244,6 +264,10 @@ pub fn observe_android_xtables_fwmarks(
 
     let mut digest = Sha256::new();
     digest.update(XTABLES_SNAPSHOT_DIGEST_DOMAIN);
+    digest.update([netd_source_profile_tag(profile)]);
+    digest.update(candidate.mask().to_be_bytes());
+    digest.update(candidate.proxy_value().to_be_bytes());
+    digest.update(candidate.bypass_value().to_be_bytes());
     digest.update(ipv4.canonical_digest());
     digest.update(ipv6.canonical_digest());
     let table_count = ipv4.tables.len() + ipv6.tables.len();
@@ -253,6 +277,8 @@ pub fn observe_android_xtables_fwmarks(
 
     Ok(AndroidXtablesFwmarkObservation {
         digest: AndroidXtablesSnapshotDigest(digest.finalize().into()),
+        netd_source_profile: profile,
+        candidate,
         legacy_mark_uses: legacy_mark_uses.into_iter().collect(),
         transfer_mark_uses: transfer_mark_uses.into_iter().collect(),
         ordered_late_writes: ordered_late_writes.into_boxed_slice(),
@@ -261,6 +287,14 @@ pub fn observe_android_xtables_fwmarks(
         rule_count,
         flux_owned_chain_count,
     })
+}
+
+const fn netd_source_profile_tag(profile: AndroidNetdSourceProfile) -> u8 {
+    match profile {
+        AndroidNetdSourceProfile::AospAndroid12R1 => 0,
+        AndroidNetdSourceProfile::AospAndroid13R1 => 1,
+        AndroidNetdSourceProfile::AospNetd20250324 => 2,
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

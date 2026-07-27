@@ -488,6 +488,12 @@ fn observe_programs(
     })
 }
 
+#[cfg(test)]
+pub(super) fn test_absent_observation() -> AndroidTrafficControlBpfFwmarkObservation {
+    observe_programs(&[], &TrafficControlFilterSnapshot::empty())
+        .expect("empty TC and BPF snapshots are complete absence")
+}
+
 fn program_opaque_planes(program_type: u32) -> Option<[bool; ALL_PLANES.len()]> {
     match program_type {
         BPF_PROG_TYPE_XDP

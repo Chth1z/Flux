@@ -432,3 +432,39 @@ fn canonical_snapshot_digest_detects_semantic_ab_drift() {
     .unwrap();
     assert_ne!(first.digest(), second.digest());
 }
+
+#[test]
+fn canonical_snapshot_digest_binds_profile_and_candidate() {
+    let empty = b"*mangle\n:INPUT ACCEPT [0:0]\n:POSTROUTING ACCEPT [0:0]\nCOMMIT\n";
+    let candidate = candidate();
+    let other_candidate = FwmarkCandidate::new(0x0c00_0000, 0x0400_0000, 0x0800_0000).unwrap();
+    let first = observe_android_xtables_fwmarks(
+        empty,
+        empty,
+        AndroidNetdSourceProfile::AospNetd20250324,
+        candidate,
+    )
+    .unwrap();
+    let other_profile = observe_android_xtables_fwmarks(
+        empty,
+        empty,
+        AndroidNetdSourceProfile::AospAndroid13R1,
+        candidate,
+    )
+    .unwrap();
+    let other_candidate_observation = observe_android_xtables_fwmarks(
+        empty,
+        empty,
+        AndroidNetdSourceProfile::AospNetd20250324,
+        other_candidate,
+    )
+    .unwrap();
+
+    assert_eq!(
+        first.netd_source_profile(),
+        AndroidNetdSourceProfile::AospNetd20250324
+    );
+    assert_eq!(first.candidate(), candidate);
+    assert_ne!(first.digest(), other_profile.digest());
+    assert_ne!(first.digest(), other_candidate_observation.digest());
+}

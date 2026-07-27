@@ -1759,3 +1759,35 @@ It does not yet validate the production Rust composition because that compositio
   ignores, all-target compile, strict all-feature Clippy, pinned ARM64/API-31 cross-check,
   repository CI, rustfmt, diff hygiene, and scoped secret/device-identifier scans. No device command
   or mutation occurred.
+
+## U2.1e Sanitized 27-Cell Census Projection (2026-07-27)
+
+- `assemble_android_fwmark_census_projection` normalizes the exact core source order across packet,
+  socket, and conntrack planes. Its result is non-`Clone`, has no complete-census conversion, and
+  remains diagnostic even when all 27 cells are complete.
+- The public surface is limited to 27 typed coverage cells, canonical `FwmarkUseRecord` masks,
+  ordered-write family/hook/chain/ordinal/selector/placement facts, exactly 36 stable labeled
+  counts, and one aggregate SHA-256 digest. Capability/device facts, paths, endpoints, boot ID,
+  hardware serial, credentials, opaque payloads, and BPF instructions are not retained publicly.
+- Global budgets are checked on raw inputs before sorting or deduplication: at most 512 mark uses
+  and 128 ordered writes. Coverage source/plane shape, mark-use provenance, complete-state/use
+  consistency, and ordered-write membership/uniqueness fail closed. Noncomplete coverage remains a
+  bounded diagnostic state rather than becoming false absence.
+- RPDB and existing-Flux inputs must match the inventory; existing-Flux must also match the
+  Capability Profile digest, namespace, and exact xtables digest. Xtables binds the semantic netd
+  profile and candidate, and a positive policy must match its profile, Capability Profile,
+  namespace, and candidate. A generic zero grant projects all three policy planes as `Unavailable`.
+- Legacy xtables and native nftables transfer evidence combine only under the single
+  `ConnmarkAndSocketTransfers` source. Complete-present dominates complete-absent; any noncomplete
+  state dominates complete evidence under the fixed order unavailable, opaque, incomplete,
+  transient, then denied.
+- Ten hostile assembly tests cover exact cell/metric order, generic-policy incompleteness,
+  missing/duplicate/wrong-source coverage, provenance and state/use contradictions, the 513th raw
+  use, the 129th ordered write, membership/duplication, transfer precedence, every cross-binding
+  drift class, and endpoint/private-identity surface reduction. An additional parser regression
+  proves xtables profile and candidate digest binding.
+- Final host verification passes 58 census tests with three privileged smokes ignored, 414 complete
+  `flux-platform` tests with seven documented host/root ignores, all-target compile, strict
+  all-target/all-feature Clippy, pinned ARM64/API-31 cross-compilation, `cargo xtask ci`, rustfmt,
+  diff hygiene, and scoped credential/device-identifier scans. No device command, collection, or
+  mutation occurred.

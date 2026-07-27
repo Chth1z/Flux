@@ -424,6 +424,11 @@ fn absent_observation(kernel_supported: bool) -> AndroidNftablesFwmarkObservatio
     }
 }
 
+#[cfg(test)]
+pub(super) fn test_absent_observation(kernel_supported: bool) -> AndroidNftablesFwmarkObservation {
+    absent_observation(kernel_supported)
+}
+
 struct ParsedRule<'a> {
     table: &'a [u8],
     chain: &'a [u8],

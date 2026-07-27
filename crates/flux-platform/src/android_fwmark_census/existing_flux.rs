@@ -1,7 +1,12 @@
 use std::error::Error;
 use std::fmt;
 
-use flux_core::{FwmarkCensusCoverageRecord, OwnershipJournalIdentity, OwnershipJournalRevision};
+use flux_core::{
+    CapabilityProfileDigest, FwmarkCensusCoverageRecord, NetworkEpoch, NetworkInventorySnapshotId,
+    NetworkNamespaceIdentity, OwnershipJournalIdentity, OwnershipJournalRevision,
+};
+
+use super::AndroidXtablesSnapshotDigest;
 
 /// Domain-separated digest of one complete existing-Flux absence proof.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -19,6 +24,11 @@ impl AndroidExistingFluxOwnershipDigest {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AndroidExistingFluxOwnershipObservation {
     digest: AndroidExistingFluxOwnershipDigest,
+    snapshot_id: NetworkInventorySnapshotId,
+    epoch: NetworkEpoch,
+    capability_profile_digest: CapabilityProfileDigest,
+    network_namespace: NetworkNamespaceIdentity,
+    xtables_digest: AndroidXtablesSnapshotDigest,
     ownership_journal_identity: OwnershipJournalIdentity,
     ownership_journal_revision: OwnershipJournalRevision,
     coverage: [FwmarkCensusCoverageRecord; 3],
@@ -36,6 +46,31 @@ impl AndroidExistingFluxOwnershipObservation {
     #[must_use]
     pub const fn digest(&self) -> AndroidExistingFluxOwnershipDigest {
         self.digest
+    }
+
+    #[must_use]
+    pub const fn snapshot_id(&self) -> NetworkInventorySnapshotId {
+        self.snapshot_id
+    }
+
+    #[must_use]
+    pub const fn epoch(&self) -> NetworkEpoch {
+        self.epoch
+    }
+
+    #[must_use]
+    pub const fn capability_profile_digest(&self) -> CapabilityProfileDigest {
+        self.capability_profile_digest
+    }
+
+    #[must_use]
+    pub const fn network_namespace(&self) -> NetworkNamespaceIdentity {
+        self.network_namespace
+    }
+
+    #[must_use]
+    pub const fn xtables_digest(&self) -> AndroidXtablesSnapshotDigest {
+        self.xtables_digest
     }
 
     #[must_use]
@@ -91,6 +126,52 @@ impl AndroidExistingFluxOwnershipObservation {
     #[must_use]
     pub const fn flux_rule_count(&self) -> usize {
         self.flux_rule_count
+    }
+}
+
+#[cfg(test)]
+pub(super) fn test_clean_observation(
+    snapshot_id: NetworkInventorySnapshotId,
+    epoch: NetworkEpoch,
+    capability_profile_digest: CapabilityProfileDigest,
+    network_namespace: NetworkNamespaceIdentity,
+    xtables_digest: AndroidXtablesSnapshotDigest,
+) -> AndroidExistingFluxOwnershipObservation {
+    AndroidExistingFluxOwnershipObservation {
+        digest: AndroidExistingFluxOwnershipDigest([0x51; 32]),
+        snapshot_id,
+        epoch,
+        capability_profile_digest,
+        network_namespace,
+        xtables_digest,
+        ownership_journal_identity: OwnershipJournalIdentity::new([0x52; 32])
+            .expect("test journal identity is nonzero"),
+        ownership_journal_revision: OwnershipJournalRevision::INITIAL,
+        coverage: [
+            FwmarkCensusCoverageRecord::new(
+                flux_core::FwmarkEvidenceSource::ExistingFluxOwnership,
+                flux_core::FwmarkPlane::Packet,
+                flux_core::FwmarkCensusCoverageState::CompleteAbsent,
+            ),
+            FwmarkCensusCoverageRecord::new(
+                flux_core::FwmarkEvidenceSource::ExistingFluxOwnership,
+                flux_core::FwmarkPlane::Socket,
+                flux_core::FwmarkCensusCoverageState::CompleteAbsent,
+            ),
+            FwmarkCensusCoverageRecord::new(
+                flux_core::FwmarkEvidenceSource::ExistingFluxOwnership,
+                flux_core::FwmarkPlane::Conntrack,
+                flux_core::FwmarkCensusCoverageState::CompleteAbsent,
+            ),
+        ],
+        durable_root_present: false,
+        empty_target_archive_present: false,
+        durable_artifact_count: 0,
+        archived_target_count: 0,
+        flux_process_count: 0,
+        flux_chain_count: 0,
+        flux_route_count: 0,
+        flux_rule_count: 0,
     }
 }
 
@@ -359,6 +440,11 @@ flux-process-count\0flux-chain-count\0flux-route-count\0flux-rule-count\0";
         ];
         Ok(AndroidExistingFluxOwnershipObservation {
             digest,
+            snapshot_id: inventory.snapshot_id(),
+            epoch: inventory.epoch(),
+            capability_profile_digest: capability_profile.digest(),
+            network_namespace,
+            xtables_digest: xtables.digest(),
             ownership_journal_identity,
             ownership_journal_revision: OwnershipJournalRevision::INITIAL,
             coverage,

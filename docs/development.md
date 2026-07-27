@@ -148,7 +148,7 @@ preservation, and VPN/netd coexistence remain separate physical-device gates.
 The coherent ARM64 fwmark census is a separate read-only diagnostic checkpoint:
 
 ```text
-cargo xtask collect-android-arm64-fwmark-census --serial SERIAL --adb PROGRAM
+cargo --quiet xtask collect-android-arm64-fwmark-census --serial SERIAL --adb PROGRAM
 ```
 
 The command requires the pinned NDK r27d/API-31 toolchain and one explicit rooted ARM64 target. It
@@ -157,6 +157,8 @@ transactions under a compiled diagnostic-only authority gate. Output is limited 
 27 source/plane cells, mark operations and masks, bounded ordered-write chain/ordinal/selector
 records, 36 counts, and projection digests. It excludes the hardware serial, boot ID, build
 fingerprint, endpoints, credentials, raw rulesets, BPF instructions, and interface names.
+The `--quiet` Cargo flag is required because Cargo otherwise echoes the full child argument list,
+including the explicit serial, before `xtask` starts.
 
 Before the first push, the runner proves a host-generated 256-bit remote path absent on the same
 build, boot, ARM64 architecture, and PID-1 network namespace. The owner-only directory carries an

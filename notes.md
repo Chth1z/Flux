@@ -1898,3 +1898,25 @@ It does not yet validate the production Rust composition because that compositio
   and Android-path review found only synthetic test identities and the fixed paths required by the
   source/runner contract; no physical serial, boot identity, endpoint, or credential was added.
 - No physical-device command, collection, or mutation occurred before the U2.3 checkpoint.
+
+## U2.4 First Diagnostic Attempt And Cleanup (2026-07-27)
+
+- Exactly one ADB client saw exactly one target, identified only as the expected SM-S9180 ARM64
+  model in durable evidence. A root read-only preflight proved no prior `flux-census.*` directory
+  and no `flx-census` process without emitting the hardware serial or any path contents.
+- The committed U2.3 runner revalidated the target and the exact
+  `575f03925e5421afb109810e9a652416626fceae5b31d5411aa68a3eff378519` probe, then stopped before
+  accepting a report with `fwmark census reports are not canonical LF text`. No census data was
+  retained and no policy or networking mutation followed.
+- Mandatory runner cleanup returned, and a separate root read-only check independently proved zero
+  `flux-census.*` directories and zero `flx-census` processes. The device is clean for diagnosis.
+- The run exposed two host defects. Non-quiet Cargo echoed the explicit serial in transient terminal
+  output, and malformed/absent stdout masked a bounded nonzero probe failure class. Neither value
+  entered tracked evidence.
+- Two deterministic host regressions first failed on those exact symptoms. The runner now accepts
+  only one complete lowercase/digit/hyphen probe error label of at most 160 bytes after a nonzero
+  pre-report failure; arbitrary stderr remains generic. The documented command now requires
+  `cargo --quiet xtask`, and both focused tests pass.
+- Final host verification passes all 65 `xtask` tests with four intentional ignores, warnings-denied
+  all-target `xtask` Clippy, rustfmt, diff hygiene, and the scoped secret/identifier review. The
+  device has not been retried yet.

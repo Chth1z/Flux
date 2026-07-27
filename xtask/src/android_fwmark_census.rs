@@ -8,7 +8,8 @@ use std::process::Command;
 use std::time::Duration;
 
 use flux_platform::{
-    parse_android_fwmark_census_probe_reports, validate_android_fwmark_census_probe_reports,
+    AndroidFwmarkCensusProbeReports, parse_android_fwmark_census_probe_reports,
+    validate_android_fwmark_census_probe_reports,
 };
 use serde_json::Value;
 
@@ -59,6 +60,8 @@ const ADB_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
 const CARGO_BUILD_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const REMOTE_TEST_TIMEOUT_SECONDS: u64 = 210;
 const REMOTE_TEST_KILL_GRACE_SECONDS: u64 = 5;
+const PROBE_ERROR_PREFIX: &[u8] = b"Android fwmark census probe: ";
+const MAX_PROBE_ERROR_LABEL_BYTES: usize = 160;
 
 pub(super) fn parse_options(arguments: &[OsString]) -> Result<Options, String> {
     Options::parse(arguments, COMMAND)
@@ -676,7 +679,11 @@ fn push_execute_and_validate(
         ADB_EXEC_TIMEOUT,
         "run bounded read-only ARM64 fwmark census",
     )?;
-    let reports = parse_android_fwmark_census_probe_reports(&output.stdout)?;
+    let reports = parse_probe_reports_or_sanitized_failure(
+        output.status.success(),
+        &output.stdout,
+        &output.stderr,
+    )?;
     std::io::stdout()
         .write_all(&output.stdout)
         .map_err(|error| format!("forward sanitized census reports: {error}"))?;
@@ -693,6 +700,38 @@ fn push_execute_and_validate(
             output.status
         ))
     }
+}
+
+fn parse_probe_reports_or_sanitized_failure(
+    success: bool,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> Result<AndroidFwmarkCensusProbeReports, String> {
+    match parse_android_fwmark_census_probe_reports(stdout) {
+        Ok(reports) => Ok(reports),
+        Err(error) if success => Err(error),
+        Err(_) => match sanitized_probe_error_label(stderr) {
+            Some(label) => Err(format!(
+                "fwmark census probe stopped before reports: {label}"
+            )),
+            None => Err("fwmark census probe failed before emitting canonical reports".to_owned()),
+        },
+    }
+}
+
+fn sanitized_probe_error_label(stderr: &[u8]) -> Option<&str> {
+    let line = stderr
+        .strip_suffix(b"\n")?
+        .strip_prefix(PROBE_ERROR_PREFIX)?;
+    if line.is_empty()
+        || line.len() > MAX_PROBE_ERROR_LABEL_BYTES
+        || !line
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+    {
+        return None;
+    }
+    std::str::from_utf8(line).ok()
 }
 
 fn preflight_remote_directory_script(
@@ -1204,6 +1243,44 @@ mod tests {
         let second = messages.replace(artifact, "/tmp/second-android-fwmark-census-probe");
         let ambiguous = format!("{messages}{second}");
         assert!(artifact_from_cargo_messages(ambiguous.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn pre_report_probe_failure_surfaces_only_the_sanitized_probe_label() {
+        let error = match parse_probe_reports_or_sanitized_failure(
+            false,
+            b"",
+            b"Android fwmark census probe: collection-external-before-nftables-observation\n",
+        ) {
+            Ok(_) => panic!("a pre-report probe failure must stop"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error,
+            "fwmark census probe stopped before reports: collection-external-before-nftables-observation"
+        );
+
+        let hostile = b"Android fwmark census probe: secret=/data/user/0/private\n";
+        let error = match parse_probe_reports_or_sanitized_failure(false, b"", hostile) {
+            Ok(_) => panic!("hostile diagnostics must not become a report"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error,
+            "fwmark census probe failed before emitting canonical reports"
+        );
+        assert!(!error.contains("private"));
+    }
+
+    #[test]
+    fn documented_census_invocation_suppresses_cargo_argument_echo() {
+        let development = include_str!("../../docs/development.md");
+        assert!(development.contains(
+            "cargo --quiet xtask collect-android-arm64-fwmark-census --serial SERIAL --adb PROGRAM"
+        ));
+        assert!(!development.contains(
+            "cargo xtask collect-android-arm64-fwmark-census --serial SERIAL --adb PROGRAM"
+        ));
     }
 
     #[test]

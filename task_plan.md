@@ -2382,6 +2382,17 @@ rollback, and exact cleanup.
 - The host checkpoint contains 10 tracked modifications and four new Rust modules. No device
   command, collection, or mutation occurred before this checkpoint.
 
+### U2.4 Diagnostic Execution Plan
+- [x] U2.4a: Resolve exactly one connected target without printing or storing its hardware serial,
+  then prove no prior `flux-census.*` path or `flx-census` process exists before the first run.
+- [x] U2.4b: Run the committed diagnostic once, stop on the first report-contract failure, and
+  independently prove all generated process/path state absent before any diagnosis or retry.
+- [x] U2.4c: Add red/green host regressions for Cargo serial-argument echo and sanitized pre-report
+  probe failures; retain exact report parsing for successful processes and generic handling for all
+  noncanonical stderr.
+- [ ] U2.4d: Commit the host fix, rerun through `cargo --quiet xtask`, retain only the canonical
+  sanitized report, and independently re-prove process/path absence and device identity stability.
+
 ### U2 Decisions
 - The native rtnetlink inventory is the sole links/addresses/routes/rules snapshot. External mark
   state must compare canonically equal on both sides of that transaction; merging observations from
@@ -2661,9 +2672,21 @@ rollback, and exact cleanup.
   Git metadata boundary. The approved path-scoped retry staged exactly the 14 reviewed files; no
   generated artifact or unrelated path entered the index.
 
+### U2.4 Errors Encountered
+- The first documented `cargo xtask` device invocation caused Cargo to echo its full child argument
+  list, including the explicit serial, to transient terminal output. No raw serial entered tracked
+  evidence. Require `cargo --quiet xtask` in documentation and regression coverage before retrying.
+- The first diagnostic returned no canonical report and the host collapsed the nonzero probe into
+  `fwmark census reports are not canonical LF text`, hiding the probe's bounded sanitized failure
+  class. The run stopped fail-closed; an independent root read proved zero census directories and
+  zero probe processes afterward. A minimized regression now requires a canonical lowercase/hyphen
+  label or a generic pre-report error without copying arbitrary stderr.
+- The first U2.4 host-fix rustfmt check requested one wrapping-only change in the sanitized error
+  parser. Apply `cargo fmt --all` and rerun the unchanged tests, Clippy, and hygiene checks.
+
 ### Status
-**U2.3 complete; U2.4 is next after the separate local checkpoint** - the shared report contract,
-explicit-serial runner, owner-marked transaction, unconditional cleanup path, hostile host
-coverage, and complete host gate are ready without device access. Run only the diagnostic census
-next, and stop fail-closed on noncomplete coverage, freshness drift, identity drift, or cleanup
-uncertainty.
+**U2.4 host fix is verified and ready to commit** - the first physical diagnostic stopped before
+report acceptance and independently cleaned all generated state. The focused regressions, all 65
+`xtask` tests, strict Clippy, rustfmt, diff hygiene, and scoped security review pass. Commit the fix,
+then rerun only the quiet diagnostic and stop fail-closed on noncomplete coverage, freshness drift,
+identity drift, or cleanup uncertainty.

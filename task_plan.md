@@ -2396,9 +2396,16 @@ rollback, and exact cleanup.
   masks plus SELinux/seccomp state without retaining the serial or unrelated process data.
 - [x] U2.4f: Add and commit one payload-free nftables failure sub-class, rerun the diagnostic,
   identify a non-permission transport failure, and independently prove process/path absence.
-- [ ] U2.4g: Preserve the internal read-only-netlink failure kind behind another payload-free
-  classifier, distinguish kernel rejection, syscall, timeout, framing, sender, and short-write
-  failure, then rerun once and independently clean before deciding whether U2.4 can continue.
+- [x] U2.4g: Preserve the internal read-only-netlink failure kind behind another payload-free
+  classifier, identify kernel rejection rather than syscall/framing/timeout failure, rerun once,
+  and independently prove process/path absence.
+- [ ] U2.4h: Categorize the remaining kernel rejection without emitting its numeric errno,
+  distinguish invalid request, unsupported family/device, resource, busy, and other rejection,
+  rerun once, and independently clean before deciding the native nftables source treatment.
+- [ ] U2.4i: Add a bounded in-process `/proc/config.gz` no-autoload gate before the first nftables
+  dump. `CONFIG_NF_TABLES=n` proves complete absence, `=y` permits collection, and modular,
+  unavailable, malformed, or drifting evidence fails closed until a race-safe active-handler proof
+  exists. Never use another dump request as an availability probe.
 
 ### U2 Decisions
 - The native rtnetlink inventory is the sole links/addresses/routes/rules snapshot. External mark
@@ -2711,10 +2718,27 @@ rollback, and exact cleanup.
 - The first U2.4g rustfmt check requested canonical layout in the new internal-kind mapping, test
   fixture signature, and one probe label arm. Apply `cargo fmt --all` and rerun the unchanged
   focused and cross-target verification; runtime behavior was unaffected.
+- The committed U2.4g probe stopped at
+  `collection-external-before-nftables-kernel-rejected`. The netlink socket/request/response path
+  therefore reached a kernel `NLMSG_ERROR`; it was not a syscall, timeout, short-write, sender, or
+  framing failure. It also was not an already accepted unsupported or explicit permission errno.
+  Mandatory cleanup and a separate root proof again found zero census paths and processes.
+- The first attempt to stage the U2.4g device-evidence checkpoint was rejected before execution
+  because the Git-metadata approval service returned an internal 404. Leave both evidence files
+  unstaged and continue host-only work without bypassing the repository permission boundary.
+- The first nftables kernel-feature probe assumed Android toybox exposed `awk` and `grep` applets
+  and stopped without canonical output when neither was present. Retry read-only by streaming the
+  readable `/proc/config.gz` through host `gzip`/`awk`; do not install tools, mount debugfs, or load
+  modules on the device.
+- Review found that the existing U2.1b nftables collector sends its first dump before proving the
+  nf_tables handler built in or already active. Kernel netlink dispatch may call `request_module`
+  for a missing subsystem, contradicting the repository's production no-autoload rule. A second
+  dump would repeat the defect. Gate the first request from bounded in-process kernel-config
+  evidence; adding direct `flate2` use requires explicit production-dependency approval.
 
 ### Status
-**U2.4 stopped cleanly at a non-permission nftables transport failure** - commit `5ef4074` is clean,
-the quiet diagnostic returned one bounded transport label, mandatory cleanup completed, and a
-separate root check proved zero generated paths and processes. All 41 kernel capabilities are
-present, so the next safe step is one internal-kind classifier; do not proceed to U2.5 policy work
-or weaken census completeness while transport still combines several materially different causes.
+**U2.4 has authoritative diagnostic evidence that this kernel omits nf_tables and exposed a
+no-autoload design defect** - exported running-kernel config reports `CONFIG_NF_TABLES=n`, matching
+the kernel-rejected dump, and final cleanup is clean. The production collector must gate before its
+first request using in-process config parsing. Do not proceed to U2.5, issue another availability
+dump, or make generic `EINVAL` equivalent to absence.

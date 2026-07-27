@@ -206,6 +206,18 @@ const fn nftables_error_label(class: SystemAndroidNftablesObservationErrorClass)
             "nftables-malformed-datagram"
         }
         SystemAndroidNftablesObservationErrorClass::KernelRejected => "nftables-kernel-rejected",
+        SystemAndroidNftablesObservationErrorClass::KernelRejectedInvalidRequest => {
+            "nftables-kernel-rejected-invalid-request"
+        }
+        SystemAndroidNftablesObservationErrorClass::KernelRejectedUnsupported => {
+            "nftables-kernel-rejected-unsupported"
+        }
+        SystemAndroidNftablesObservationErrorClass::KernelRejectedResource => {
+            "nftables-kernel-rejected-resource"
+        }
+        SystemAndroidNftablesObservationErrorClass::KernelRejectedBusy => {
+            "nftables-kernel-rejected-busy"
+        }
         SystemAndroidNftablesObservationErrorClass::SnapshotDrift => "nftables-snapshot-drift",
         SystemAndroidNftablesObservationErrorClass::InvalidMessageType => {
             "nftables-invalid-message-type"
@@ -273,6 +285,10 @@ mod tests {
             SystemAndroidNftablesObservationErrorClass::UnexpectedSender,
             SystemAndroidNftablesObservationErrorClass::MalformedDatagram,
             SystemAndroidNftablesObservationErrorClass::KernelRejected,
+            SystemAndroidNftablesObservationErrorClass::KernelRejectedInvalidRequest,
+            SystemAndroidNftablesObservationErrorClass::KernelRejectedUnsupported,
+            SystemAndroidNftablesObservationErrorClass::KernelRejectedResource,
+            SystemAndroidNftablesObservationErrorClass::KernelRejectedBusy,
             SystemAndroidNftablesObservationErrorClass::SnapshotDrift,
             SystemAndroidNftablesObservationErrorClass::InvalidMessageType,
             SystemAndroidNftablesObservationErrorClass::InvalidFamilyHeader,

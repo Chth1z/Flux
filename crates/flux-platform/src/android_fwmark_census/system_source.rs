@@ -55,6 +55,10 @@ pub enum SystemAndroidNftablesObservationErrorClass {
     UnexpectedSender,
     MalformedDatagram,
     KernelRejected,
+    KernelRejectedInvalidRequest,
+    KernelRejectedUnsupported,
+    KernelRejectedResource,
+    KernelRejectedBusy,
     SnapshotDrift,
     InvalidMessageType,
     InvalidFamilyHeader,
@@ -352,7 +356,7 @@ const fn classify_nftables_observation_error(
                 Some(AndroidNftablesTransportErrorKind::KernelRejected)
             ) =>
         {
-            SystemAndroidNftablesObservationErrorClass::KernelRejected
+            classify_nftables_kernel_rejection(raw_os_error)
         }
         AndroidNftablesFwmarkObservationErrorKind::Transport => {
             SystemAndroidNftablesObservationErrorClass::Transport
@@ -375,6 +379,26 @@ const fn classify_nftables_observation_error(
         AndroidNftablesFwmarkObservationErrorKind::LimitExceeded => {
             SystemAndroidNftablesObservationErrorClass::LimitExceeded
         }
+    }
+}
+
+const fn classify_nftables_kernel_rejection(
+    raw_os_error: Option<i32>,
+) -> SystemAndroidNftablesObservationErrorClass {
+    match raw_os_error {
+        Some(libc::EINVAL | libc::EBADMSG | libc::EMSGSIZE | libc::EPROTO) => {
+            SystemAndroidNftablesObservationErrorClass::KernelRejectedInvalidRequest
+        }
+        Some(libc::EAFNOSUPPORT | libc::ENODEV | libc::ENOSYS) => {
+            SystemAndroidNftablesObservationErrorClass::KernelRejectedUnsupported
+        }
+        Some(libc::ENOBUFS | libc::ENOMEM | libc::ENOSPC) => {
+            SystemAndroidNftablesObservationErrorClass::KernelRejectedResource
+        }
+        Some(libc::EAGAIN | libc::EBUSY | libc::EINTR) => {
+            SystemAndroidNftablesObservationErrorClass::KernelRejectedBusy
+        }
+        _ => SystemAndroidNftablesObservationErrorClass::KernelRejected,
     }
 }
 
@@ -454,6 +478,38 @@ mod tests {
                 AndroidNftablesFwmarkObservationErrorKind::Transport,
                 Some(AndroidNftablesTransportErrorKind::KernelRejected),
                 Some(libc::EINVAL),
+            ),
+            SystemAndroidNftablesObservationErrorClass::KernelRejectedInvalidRequest
+        );
+        assert_eq!(
+            classify_nftables_observation_error(
+                AndroidNftablesFwmarkObservationErrorKind::Transport,
+                Some(AndroidNftablesTransportErrorKind::KernelRejected),
+                Some(libc::EAFNOSUPPORT),
+            ),
+            SystemAndroidNftablesObservationErrorClass::KernelRejectedUnsupported
+        );
+        assert_eq!(
+            classify_nftables_observation_error(
+                AndroidNftablesFwmarkObservationErrorKind::Transport,
+                Some(AndroidNftablesTransportErrorKind::KernelRejected),
+                Some(libc::ENOBUFS),
+            ),
+            SystemAndroidNftablesObservationErrorClass::KernelRejectedResource
+        );
+        assert_eq!(
+            classify_nftables_observation_error(
+                AndroidNftablesFwmarkObservationErrorKind::Transport,
+                Some(AndroidNftablesTransportErrorKind::KernelRejected),
+                Some(libc::EBUSY),
+            ),
+            SystemAndroidNftablesObservationErrorClass::KernelRejectedBusy
+        );
+        assert_eq!(
+            classify_nftables_observation_error(
+                AndroidNftablesFwmarkObservationErrorKind::Transport,
+                Some(AndroidNftablesTransportErrorKind::KernelRejected),
+                Some(libc::EIO),
             ),
             SystemAndroidNftablesObservationErrorClass::KernelRejected
         );

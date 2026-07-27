@@ -1970,3 +1970,50 @@ It does not yet validate the production Rust composition because that compositio
 - Mandatory runner cleanup returned. An independent root read on the same expected model then
   proved zero census paths and zero probe processes. No report, policy, networking mutation, module
   installation, or U2.5 authority step was accepted.
+
+## U2.4 Kernel-Rejected Nftables Result And Cleanup (2026-07-27)
+
+- Commit `180b1b5` preserves the six payload-free netlink transport kinds. Before device use, 434
+  `flux-platform` library tests plus all binary, integration, and documentation targets passed with
+  seven intentional privileged/environment ignores. Strict all-target/all-feature Clippy, the
+  pinned Android cross-check, rustfmt, and diff hygiene also passed.
+- Its exact release probe has SHA-256
+  `d6822b0e677ca756cd6d67cb547cd1fa581ef15263380d29ccf8fb089e8ddac4` and size 1,019,056
+  bytes. The runner revalidated the Android 31 ARM64 and 16 KiB-alignment contract.
+- The preflight again resolved one expected SM-S9180 target without emitting or retaining its
+  serial and proved zero census paths and processes. The quiet diagnostic then stopped at
+  `collection-external-before-nftables-kernel-rejected`.
+- This proves the request reached a kernel `NLMSG_ERROR`; it was not a syscall, timeout,
+  short-write, unexpected-sender, or malformed-datagram failure. The rejection was also not
+  `EOPNOTSUPP`, `EPROTONOSUPPORT`, or `ENOENT`, which the collector already treats as unsupported
+  complete absence, and not the `EPERM`/`EACCES` permission class. The numeric errno was not emitted
+  or retained.
+- Mandatory runner cleanup returned, and a separate root read proved zero census paths and zero
+  probe processes. No report, networking mutation, module installation, policy revision, or
+  authority step was accepted.
+
+## U2.4 Kernel Nftables Feature Census (2026-07-27)
+
+- The first read-only feature probe stopped before canonical output because this Android toybox
+  exposes `zcat` but not `awk` or `grep`. It made no device change. The retry streamed the readable
+  `/proc/config.gz` through host `gzip` and `awk` without writing either host or device files.
+- The running kernel config reports `CONFIG_NETFILTER=y`, `CONFIG_NETFILTER_NETLINK=y`,
+  `CONFIG_NF_CONNTRACK_MARK=y`, `CONFIG_NF_TABLES=n`, `CONFIG_NF_TABLES_INET=n`, `CONFIG_NFT_CT=n`,
+  `CONFIG_NFT_SOCKET=n`, and `CONFIG_NFT_FIB=n`.
+- `/sys/module/nf_tables` and `/sys/module/nfnetlink` are absent, and neither name occurs as a loaded
+  module in `/proc/modules`. Module absence alone would not prove a built-in feature absent; the
+  exported running-kernel config provides that missing distinction for diagnostic purposes.
+- This explains why a valid nf_tables subsystem request can reach `NETLINK_NETFILTER` yet receive a
+  kernel rejection: generic netfilter netlink and conntrack marks are compiled in, but nf_tables is
+  not. Production census logic must still prove that condition through its own bounded protocol
+  rather than accepting every `EINVAL` as absence or depending on external shell tools.
+- Repository no-autoload requirements also reveal a defect in the current U2.1b collector: sending
+  the first nf_tables dump before proving its handler built in or already active can invoke the
+  kernel's `request_module` path. No module appeared on this target before or after the probes, and
+  the final independent check still found zero census paths and processes, but production cannot
+  rely on that device-specific outcome.
+- The safe implementation is an in-process, no-follow, byte-bounded `/proc/config.gz` reader.
+  `CONFIG_NF_TABLES=n` can return native complete absence without netlink; `=y` can admit the dump;
+  modular, unavailable, malformed, or changing evidence remains fail closed until a race-safe
+  active-handler proof exists. `flate2` is already transitive in `Cargo.lock`, but making it a
+  direct `flux-platform` production dependency still requires explicit approval.

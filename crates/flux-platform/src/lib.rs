@@ -56,9 +56,9 @@ pub use android_fwmark_census::{
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use android_fwmark_census::{
     SystemAndroidFwmarkCensusSource, SystemAndroidFwmarkCensusSourceError,
-    SystemAndroidFwmarkCensusSourceErrorKind, collect_android_existing_flux_ownership,
-    collect_android_nftables_fwmarks, collect_android_traffic_control_bpf_fwmarks,
-    collect_android_xfrm_fwmarks,
+    SystemAndroidFwmarkCensusSourceErrorKind, SystemAndroidNftablesObservationErrorClass,
+    collect_android_existing_flux_ownership, collect_android_nftables_fwmarks,
+    collect_android_traffic_control_bpf_fwmarks, collect_android_xfrm_fwmarks,
 };
 pub use capability::{CapabilityProfilePaths, SystemCapabilityProfileSource};
 pub use file_observer::{FileObservationBatch, FileObservationError, FileObservationPaths};

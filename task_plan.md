@@ -2390,8 +2390,12 @@ rollback, and exact cleanup.
 - [x] U2.4c: Add red/green host regressions for Cargo serial-argument echo and sanitized pre-report
   probe failures; retain exact report parsing for successful processes and generic handling for all
   noncanonical stderr.
-- [ ] U2.4d: Commit the host fix, rerun through `cargo --quiet xtask`, retain only the canonical
-  sanitized report, and independently re-prove process/path absence and device identity stability.
+- [x] U2.4d: Commit the host fix, rerun through `cargo --quiet xtask`, stop on the exact
+  external-before nftables observation class, and independently re-prove process/path absence.
+- [x] U2.4e: Probe and record the root probe's complete kernel capability ceiling and inherited
+  masks plus SELinux/seccomp state without retaining the serial or unrelated process data.
+- [ ] U2.4f: Add and commit one payload-free nftables failure sub-class, rerun the diagnostic to
+  distinguish permission, parser, drift, transport, and limit failure, then independently clean.
 
 ### U2 Decisions
 - The native rtnetlink inventory is the sole links/addresses/routes/rules snapshot. External mark
@@ -2683,10 +2687,24 @@ rollback, and exact cleanup.
   label or a generic pre-report error without copying arbitrary stderr.
 - The first U2.4 host-fix rustfmt check requested one wrapping-only change in the sanitized error
   parser. Apply `cargo fmt --all` and rerun the unchanged tests, Clippy, and hygiene checks.
+- The first quiet diagnostic correctly exposed
+  `collection-external-before-nftables-observation`, still too broad to distinguish SELinux denial
+  from strict vendor-rule rejection or snapshot drift. Mandatory cleanup and a separate root proof
+  again found zero census paths and processes; no policy step ran.
+- The first focused nftables-label test used `--exact` without its module-qualified test name and
+  therefore matched zero tests. Rerun the named filter without `--exact`; both the source classifier
+  and probe-label tests execute and pass.
+- The first classifier checkpoint also found an Android-only import used by a host probe-label test,
+  plus two rustfmt import wraps. Gate the class import/label helper under `android || test`, apply
+  canonical formatting, and rerun the unchanged focused tests.
+- The first U2.4f `git add` could not create `.git/index.lock` under the workspace's read-only Git
+  metadata boundary. Retry the same explicit six-path stage operation with repository-scoped
+  permission; no file was staged or changed by the failed command.
 
 ### Status
-**U2.4 host fix is verified and ready to commit** - the first physical diagnostic stopped before
-report acceptance and independently cleaned all generated state. The focused regressions, all 65
-`xtask` tests, strict Clippy, rustfmt, diff hygiene, and scoped security review pass. Commit the fix,
-then rerun only the quiet diagnostic and stop fail-closed on noncomplete coverage, freshness drift,
-identity drift, or cleanup uncertainty.
+**U2.4 privacy-safe nftables classification is ready to commit** - the quiet rerun stopped at the
+external-before native nftables observation and independently cleaned all generated state. The root
+probe has all 41 kernel capabilities through `CAP_CHECKPOINT_RESTORE`, including `CAP_NET_ADMIN`,
+so missing capability bits are ruled out. The classifier passes 558 `flux-platform` tests, strict
+Clippy, the pinned Android cross-check, rustfmt, and diff hygiene. Commit it, rerun only the
+diagnostic, and stop fail-closed on permission, parser, drift, transport, or limit failure.

@@ -1920,3 +1920,36 @@ It does not yet validate the production Rust composition because that compositio
 - Final host verification passes all 65 `xtask` tests with four intentional ignores, warnings-denied
   all-target `xtask` Clippy, rustfmt, diff hygiene, and the scoped secret/identifier review. The
   device has not been retried yet.
+
+## U2.4 Quiet Rerun And Kernel Capability Record (2026-07-27)
+
+- Commit `c0fa2a2` reran through `cargo --quiet xtask`; Cargo emitted no argument line or hardware
+  serial. Target/artifact validation passed, then the probe stopped before reports at the sanitized
+  class `collection-external-before-nftables-observation`.
+- Mandatory cleanup returned, and a separate root read-only check again proved zero
+  `flux-census.*` directories and zero `flx-census` processes. No report, policy, or networking
+  mutation was accepted.
+- The user-authorized root capability probe ran through shell stdin and retained no serial. It
+  observed UID 0, SELinux domain `u:r:ksu:s0`, `cap_last_cap=40`, `NoNewPrivs=0`, `Seccomp=0`, and
+  `Seccomp_filters=0`.
+- `CapPrm`, `CapEff`, and `CapBnd` are each `000001ffffffffff`; `CapInh` and `CapAmb` are each
+  `0000000000000000`. Every kernel capability from 0 through 40 is therefore permitted, effective,
+  and bounding: `CAP_CHOWN`, `CAP_DAC_OVERRIDE`, `CAP_DAC_READ_SEARCH`, `CAP_FOWNER`, `CAP_FSETID`,
+  `CAP_KILL`, `CAP_SETGID`, `CAP_SETUID`, `CAP_SETPCAP`, `CAP_LINUX_IMMUTABLE`,
+  `CAP_NET_BIND_SERVICE`, `CAP_NET_BROADCAST`, `CAP_NET_ADMIN`, `CAP_NET_RAW`, `CAP_IPC_LOCK`,
+  `CAP_IPC_OWNER`, `CAP_SYS_MODULE`, `CAP_SYS_RAWIO`, `CAP_SYS_CHROOT`, `CAP_SYS_PTRACE`,
+  `CAP_SYS_PACCT`, `CAP_SYS_ADMIN`, `CAP_SYS_BOOT`, `CAP_SYS_NICE`, `CAP_SYS_RESOURCE`,
+  `CAP_SYS_TIME`, `CAP_SYS_TTY_CONFIG`, `CAP_MKNOD`, `CAP_LEASE`, `CAP_AUDIT_WRITE`,
+  `CAP_AUDIT_CONTROL`, `CAP_SETFCAP`, `CAP_MAC_OVERRIDE`, `CAP_MAC_ADMIN`, `CAP_SYSLOG`,
+  `CAP_WAKE_ALARM`, `CAP_BLOCK_SUSPEND`, `CAP_AUDIT_READ`, `CAP_PERFMON`, `CAP_BPF`, and
+  `CAP_CHECKPOINT_RESTORE`.
+- `CAP_NET_ADMIN` is conclusively present in the probe process. If the next typed class is
+  permission-denied, the likely boundary is SELinux/kernel nfnetlink policy rather than Linux
+  capability omission. The current broad label cannot yet distinguish that from a strict vendor
+  rule/expression rejection, drift, transport, or a resource limit.
+- The payload-free nftables sub-class preserves the existing public source kind and private error
+  chain while distinguishing invalid bound, permission denial, other transport, snapshot drift,
+  invalid message/family/rule/expression, and limit exhaustion. It never emits errno or rule data.
+- Host verification passes 558 `flux-platform` tests across targets/doc tests with seven intentional
+  ignores, warnings-denied all-target/all-feature Clippy, the pinned Android cross-check, rustfmt,
+  and diff hygiene. The refined probe has not yet run on the device.

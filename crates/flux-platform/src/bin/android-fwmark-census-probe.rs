@@ -10,6 +10,8 @@ use flux_core::{
 };
 #[cfg(any(target_os = "android", test))]
 use flux_platform::AndroidFwmarkCensusCoordinatorRequest;
+#[cfg(any(target_os = "android", test))]
+use flux_platform::SystemAndroidNftablesObservationErrorClass;
 #[cfg(target_os = "android")]
 use flux_platform::{
     AndroidFwmarkCensusCoordinatorError, AndroidFwmarkCensusCoordinatorOutcome,
@@ -129,7 +131,7 @@ fn coordinator_error_label(
         AndroidFwmarkCensusCoordinatorError::Collection { stage, source } => format!(
             "collection-{}-{}",
             stage.as_str(),
-            source_error_label(source.kind())
+            source_error_label(source)
         ),
         AndroidFwmarkCensusCoordinatorError::CapabilityDeviceIdentityUnavailable { .. } => {
             "capability-device-identity-unavailable".to_owned()
@@ -160,8 +162,8 @@ fn coordinator_error_label(
 }
 
 #[cfg(target_os = "android")]
-const fn source_error_label(kind: SystemAndroidFwmarkCensusSourceErrorKind) -> &'static str {
-    match kind {
+const fn source_error_label(source: &SystemAndroidFwmarkCensusSourceError) -> &'static str {
+    match source.kind() {
         SystemAndroidFwmarkCensusSourceErrorKind::InvalidCapabilityStage => {
             "invalid-capability-stage"
         }
@@ -169,7 +171,12 @@ const fn source_error_label(kind: SystemAndroidFwmarkCensusSourceErrorKind) -> &
         SystemAndroidFwmarkCensusSourceErrorKind::DeadlineExceeded => "deadline-exceeded",
         SystemAndroidFwmarkCensusSourceErrorKind::XtablesProcess => "xtables-process",
         SystemAndroidFwmarkCensusSourceErrorKind::XtablesObservation => "xtables-observation",
-        SystemAndroidFwmarkCensusSourceErrorKind::NftablesObservation => "nftables-observation",
+        SystemAndroidFwmarkCensusSourceErrorKind::NftablesObservation => {
+            match source.nftables_class() {
+                Some(class) => nftables_error_label(class),
+                None => "nftables-observation",
+            }
+        }
         SystemAndroidFwmarkCensusSourceErrorKind::TrafficControlBpfObservation => {
             "traffic-control-bpf-observation"
         }
@@ -178,6 +185,29 @@ const fn source_error_label(kind: SystemAndroidFwmarkCensusSourceErrorKind) -> &
         SystemAndroidFwmarkCensusSourceErrorKind::ExistingFluxOwnership => {
             "existing-flux-ownership"
         }
+    }
+}
+
+#[cfg(any(target_os = "android", test))]
+const fn nftables_error_label(class: SystemAndroidNftablesObservationErrorClass) -> &'static str {
+    match class {
+        SystemAndroidNftablesObservationErrorClass::InvalidBound => "nftables-invalid-bound",
+        SystemAndroidNftablesObservationErrorClass::PermissionDenied => {
+            "nftables-permission-denied"
+        }
+        SystemAndroidNftablesObservationErrorClass::Transport => "nftables-transport",
+        SystemAndroidNftablesObservationErrorClass::SnapshotDrift => "nftables-snapshot-drift",
+        SystemAndroidNftablesObservationErrorClass::InvalidMessageType => {
+            "nftables-invalid-message-type"
+        }
+        SystemAndroidNftablesObservationErrorClass::InvalidFamilyHeader => {
+            "nftables-invalid-family-header"
+        }
+        SystemAndroidNftablesObservationErrorClass::InvalidRule => "nftables-invalid-rule",
+        SystemAndroidNftablesObservationErrorClass::InvalidExpression => {
+            "nftables-invalid-expression"
+        }
+        SystemAndroidNftablesObservationErrorClass::LimitExceeded => "nftables-limit-exceeded",
     }
 }
 
@@ -211,5 +241,36 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn nftables_error_labels_are_bounded_and_payload_free() {
+        assert_eq!(
+            nftables_error_label(SystemAndroidNftablesObservationErrorClass::PermissionDenied),
+            "nftables-permission-denied"
+        );
+        assert_eq!(
+            nftables_error_label(SystemAndroidNftablesObservationErrorClass::InvalidExpression),
+            "nftables-invalid-expression"
+        );
+        for class in [
+            SystemAndroidNftablesObservationErrorClass::InvalidBound,
+            SystemAndroidNftablesObservationErrorClass::PermissionDenied,
+            SystemAndroidNftablesObservationErrorClass::Transport,
+            SystemAndroidNftablesObservationErrorClass::SnapshotDrift,
+            SystemAndroidNftablesObservationErrorClass::InvalidMessageType,
+            SystemAndroidNftablesObservationErrorClass::InvalidFamilyHeader,
+            SystemAndroidNftablesObservationErrorClass::InvalidRule,
+            SystemAndroidNftablesObservationErrorClass::InvalidExpression,
+            SystemAndroidNftablesObservationErrorClass::LimitExceeded,
+        ] {
+            let label = nftables_error_label(class);
+            assert!(label.len() <= 40);
+            assert!(
+                label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'-')
+            );
+        }
     }
 }

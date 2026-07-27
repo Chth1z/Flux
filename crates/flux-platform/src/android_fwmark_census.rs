@@ -65,7 +65,7 @@ pub use xfrm::{
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use system_source::{
     SystemAndroidFwmarkCensusSource, SystemAndroidFwmarkCensusSourceError,
-    SystemAndroidFwmarkCensusSourceErrorKind,
+    SystemAndroidFwmarkCensusSourceErrorKind, SystemAndroidNftablesObservationErrorClass,
 };
 
 const MAX_XTABLES_SNAPSHOT_BYTES: usize = 4 * 1024 * 1024;

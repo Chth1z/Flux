@@ -13,11 +13,12 @@ use super::{
     AndroidExistingFluxOwnershipObservation, AndroidFwmarkCensusCollectionStage,
     AndroidFwmarkCensusCoordinatorSource, AndroidFwmarkCensusExternalPhase,
     AndroidFwmarkCensusExternalSnapshot, AndroidNftablesFwmarkObservationError,
-    AndroidTrafficControlBpfFwmarkObservationError, AndroidXfrmFwmarkObservationError,
-    AndroidXtablesFwmarkObservation, AndroidXtablesFwmarkObservationError,
-    MAX_ANDROID_FWMARK_CENSUS_STAGE_BOUND, collect_android_existing_flux_ownership,
-    collect_android_nftables_fwmarks, collect_android_traffic_control_bpf_fwmarks,
-    collect_android_xfrm_fwmarks, observe_android_xtables_fwmarks,
+    AndroidNftablesFwmarkObservationErrorKind, AndroidTrafficControlBpfFwmarkObservationError,
+    AndroidXfrmFwmarkObservationError, AndroidXtablesFwmarkObservation,
+    AndroidXtablesFwmarkObservationError, MAX_ANDROID_FWMARK_CENSUS_STAGE_BOUND,
+    collect_android_existing_flux_ownership, collect_android_nftables_fwmarks,
+    collect_android_traffic_control_bpf_fwmarks, collect_android_xfrm_fwmarks,
+    observe_android_xtables_fwmarks,
 };
 use crate::xtables::collect_android_xtables_save_snapshots;
 use crate::{SystemCapabilityProfileSource, collect_network_inventory_once};
@@ -41,12 +42,27 @@ pub enum SystemAndroidFwmarkCensusSourceErrorKind {
     ExistingFluxOwnership,
 }
 
+/// Privacy-safe native nftables failure class retained by the production source boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SystemAndroidNftablesObservationErrorClass {
+    InvalidBound,
+    PermissionDenied,
+    Transport,
+    SnapshotDrift,
+    InvalidMessageType,
+    InvalidFamilyHeader,
+    InvalidRule,
+    InvalidExpression,
+    LimitExceeded,
+}
+
 /// Sanitized production-source error.
 ///
 /// Display and Debug expose only the stable class. The concrete source remains available through
 /// the standard error chain for trusted local diagnostics and is never copied into census reports.
 pub struct SystemAndroidFwmarkCensusSourceError {
     kind: SystemAndroidFwmarkCensusSourceErrorKind,
+    nftables_class: Option<SystemAndroidNftablesObservationErrorClass>,
     source: Option<Box<dyn Error + 'static>>,
 }
 
@@ -56,8 +72,17 @@ impl SystemAndroidFwmarkCensusSourceError {
         self.kind
     }
 
+    #[must_use]
+    pub const fn nftables_class(&self) -> Option<SystemAndroidNftablesObservationErrorClass> {
+        self.nftables_class
+    }
+
     const fn new(kind: SystemAndroidFwmarkCensusSourceErrorKind) -> Self {
-        Self { kind, source: None }
+        Self {
+            kind,
+            nftables_class: None,
+            source: None,
+        }
     }
 
     fn with_source(
@@ -66,6 +91,18 @@ impl SystemAndroidFwmarkCensusSourceError {
     ) -> Self {
         Self {
             kind,
+            nftables_class: None,
+            source: Some(Box::new(source)),
+        }
+    }
+
+    fn with_nftables_source(source: AndroidNftablesFwmarkObservationError) -> Self {
+        Self {
+            kind: SystemAndroidFwmarkCensusSourceErrorKind::NftablesObservation,
+            nftables_class: Some(classify_nftables_observation_error(
+                source.kind(),
+                source.raw_os_error(),
+            )),
             source: Some(Box::new(source)),
         }
     }
@@ -244,10 +281,44 @@ fn map_xtables_observation(
 fn map_nftables_observation(
     source: AndroidNftablesFwmarkObservationError,
 ) -> SystemAndroidFwmarkCensusSourceError {
-    SystemAndroidFwmarkCensusSourceError::with_source(
-        SystemAndroidFwmarkCensusSourceErrorKind::NftablesObservation,
-        source,
-    )
+    SystemAndroidFwmarkCensusSourceError::with_nftables_source(source)
+}
+
+const fn classify_nftables_observation_error(
+    kind: AndroidNftablesFwmarkObservationErrorKind,
+    raw_os_error: Option<i32>,
+) -> SystemAndroidNftablesObservationErrorClass {
+    match kind {
+        AndroidNftablesFwmarkObservationErrorKind::InvalidBound => {
+            SystemAndroidNftablesObservationErrorClass::InvalidBound
+        }
+        AndroidNftablesFwmarkObservationErrorKind::Transport
+            if matches!(raw_os_error, Some(libc::EPERM) | Some(libc::EACCES)) =>
+        {
+            SystemAndroidNftablesObservationErrorClass::PermissionDenied
+        }
+        AndroidNftablesFwmarkObservationErrorKind::Transport => {
+            SystemAndroidNftablesObservationErrorClass::Transport
+        }
+        AndroidNftablesFwmarkObservationErrorKind::SnapshotDrift => {
+            SystemAndroidNftablesObservationErrorClass::SnapshotDrift
+        }
+        AndroidNftablesFwmarkObservationErrorKind::InvalidMessageType => {
+            SystemAndroidNftablesObservationErrorClass::InvalidMessageType
+        }
+        AndroidNftablesFwmarkObservationErrorKind::InvalidFamilyHeader => {
+            SystemAndroidNftablesObservationErrorClass::InvalidFamilyHeader
+        }
+        AndroidNftablesFwmarkObservationErrorKind::InvalidRule => {
+            SystemAndroidNftablesObservationErrorClass::InvalidRule
+        }
+        AndroidNftablesFwmarkObservationErrorKind::InvalidExpression => {
+            SystemAndroidNftablesObservationErrorClass::InvalidExpression
+        }
+        AndroidNftablesFwmarkObservationErrorKind::LimitExceeded => {
+            SystemAndroidNftablesObservationErrorClass::LimitExceeded
+        }
+    }
 }
 
 fn map_traffic_control_bpf_observation(
@@ -309,5 +380,30 @@ mod tests {
         assert!(error.source().is_some());
         assert!(!format!("{error:?}").contains("fixture"));
         assert!(!error.to_string().contains("fixture"));
+    }
+
+    #[test]
+    fn nftables_error_class_preserves_semantics_without_raw_errno() {
+        assert_eq!(
+            classify_nftables_observation_error(
+                AndroidNftablesFwmarkObservationErrorKind::Transport,
+                Some(libc::EPERM),
+            ),
+            SystemAndroidNftablesObservationErrorClass::PermissionDenied
+        );
+        assert_eq!(
+            classify_nftables_observation_error(
+                AndroidNftablesFwmarkObservationErrorKind::Transport,
+                Some(libc::EINVAL),
+            ),
+            SystemAndroidNftablesObservationErrorClass::Transport
+        );
+        assert_eq!(
+            classify_nftables_observation_error(
+                AndroidNftablesFwmarkObservationErrorKind::InvalidExpression,
+                None,
+            ),
+            SystemAndroidNftablesObservationErrorClass::InvalidExpression
+        );
     }
 }

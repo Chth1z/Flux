@@ -91,6 +91,7 @@ fn capability_drift_rejects_after_both_brackets_without_assembly() {
 fn external_drift_rejects_after_capability_revalidation() {
     let (mut source, request) = source_and_request();
     source.external_after = AndroidFwmarkCensusExternalSnapshot::new(
+        source.external_after.kernel_config_digest(),
         source.external_after.xtables.clone(),
         nftables::test_absent_observation(false),
         source.external_after.traffic_control_bpf.clone(),
@@ -111,10 +112,35 @@ fn external_drift_rejects_after_capability_revalidation() {
 }
 
 #[test]
+fn kernel_config_drift_is_external_snapshot_drift() {
+    let (mut source, request) = source_and_request();
+    source.external_after = AndroidFwmarkCensusExternalSnapshot::new(
+        test_kernel_config_digest(true),
+        source.external_after.xtables.clone(),
+        source.external_after.nftables.clone(),
+        source.external_after.traffic_control_bpf.clone(),
+        source.external_after.xfrm.clone(),
+    );
+
+    let error = coordinate_android_fwmark_census(
+        &mut source,
+        &request,
+        AndroidFwmarkCensusCoordinatorPurpose::Diagnostic,
+    )
+    .expect_err("kernel config A/B drift must reject");
+    assert!(matches!(
+        error,
+        AndroidFwmarkCensusCoordinatorError::ExternalSnapshotDrift { .. }
+    ));
+    assert_eq!(source.events, complete_sequence());
+}
+
+#[test]
 fn capability_drift_precedes_simultaneous_external_drift() {
     let (mut source, request) = source_and_request();
     source.capability_after = revised_profile(&source.capability_before);
     source.external_after = AndroidFwmarkCensusExternalSnapshot::new(
+        source.external_after.kernel_config_digest(),
         source.external_after.xtables.clone(),
         nftables::test_absent_observation(false),
         source.external_after.traffic_control_bpf.clone(),
@@ -147,6 +173,7 @@ fn wrong_before_snapshot_context_stops_before_native_collection() {
     )
     .expect("complete alternate-context snapshot");
     source.external_before = AndroidFwmarkCensusExternalSnapshot::new(
+        source.external_before.kernel_config_digest(),
         xtables,
         source.external_before.nftables.clone(),
         source.external_before.traffic_control_bpf.clone(),
@@ -332,6 +359,7 @@ fn source_and_request() -> (FakeSource, AndroidFwmarkCensusCoordinatorRequest) {
     )
     .expect("bounded coordinator request");
     let external = AndroidFwmarkCensusExternalSnapshot::new(
+        test_kernel_config_digest(false),
         fixture.xtables,
         fixture.nftables,
         fixture.traffic_control_bpf,
@@ -347,6 +375,17 @@ fn source_and_request() -> (FakeSource, AndroidFwmarkCensusCoordinatorRequest) {
         events: Vec::new(),
     };
     (source, request)
+}
+
+fn test_kernel_config_digest(nftables_built_in: bool) -> AndroidKernelConfigDigest {
+    let bytes = if nftables_built_in {
+        b"CONFIG_NF_TABLES=y\n".as_slice()
+    } else {
+        b"# CONFIG_NF_TABLES is not set\n".as_slice()
+    };
+    crate::parse_android_kernel_config(bytes)
+        .expect("canonical test kernel config")
+        .digest()
 }
 
 fn topology_request() -> AndroidTproxyTopologyScopeRequest {

@@ -35,6 +35,7 @@ pub(super) struct Fixture {
     pub(super) inventory: NetworkInventory,
     pub(super) capability_profile: CapabilityProfile,
     pub(super) network_namespace: NetworkNamespaceIdentity,
+    pub(super) kernel_config_digest: AndroidKernelConfigDigest,
     pub(super) device_policy: AndroidMarkDevicePolicy,
     pub(super) android_net_id: AndroidNetIdFwmarkCensusFragment,
     pub(super) rpdb: RpdbFwmarkCensusFragment,
@@ -53,6 +54,7 @@ impl Fixture {
             &self.inventory,
             &self.capability_profile,
             self.network_namespace,
+            self.kernel_config_digest,
             &self.device_policy,
             &self.android_net_id,
             &self.rpdb,
@@ -494,10 +496,47 @@ fn endpoint_and_private_identity_changes_do_not_escape_the_sanitized_surface() {
     }
 }
 
+#[test]
+fn projection_digest_binds_the_complete_kernel_config_identity() {
+    let fixture = fixture(Ipv4Addr::new(203, 0, 113, 77), true);
+    let first = fixture.projection().expect("first projection");
+    let changed_kernel_config = crate::parse_android_kernel_config(
+        b"CONFIG_NETFILTER=y\nCONFIG_NETFILTER_NETLINK=y\nCONFIG_NF_TABLES=y\n",
+    )
+    .expect("changed kernel config")
+    .digest();
+    let second = assemble_android_fwmark_census_projection(
+        &fixture.inventory,
+        &fixture.capability_profile,
+        fixture.network_namespace,
+        changed_kernel_config,
+        &fixture.device_policy,
+        &fixture.android_net_id,
+        &fixture.rpdb,
+        &fixture.xtables,
+        &fixture.nftables,
+        &fixture.traffic_control_bpf,
+        &fixture.xfrm,
+        &fixture.existing_flux,
+    )
+    .expect("projection with changed config identity");
+
+    assert_eq!(first.cells(), second.cells());
+    assert_eq!(first.mark_uses(), second.mark_uses());
+    assert_eq!(first.ordered_late_writes(), second.ordered_late_writes());
+    assert_eq!(first.metrics(), second.metrics());
+    assert_ne!(first.digest(), second.digest());
+}
+
 pub(super) fn fixture(endpoint: Ipv4Addr, positive_policy: bool) -> Fixture {
     let network_namespace = NetworkNamespaceIdentity::new(20, 234_673).expect("namespace");
     let inventory = inventory(endpoint);
     let capability_profile = samsung_capability_profile(network_namespace);
+    let kernel_config_digest = crate::parse_android_kernel_config(
+        b"CONFIG_NETFILTER=y\nCONFIG_NETFILTER_NETLINK=y\n# CONFIG_NF_TABLES is not set\n",
+    )
+    .expect("fixture kernel config")
+    .digest();
     let candidate = FwmarkCandidate::new(CANDIDATE_MASK, PROXY_VALUE, BYPASS_VALUE)
         .expect("reviewed candidate");
     let android_net_id = project_android_net_id_fwmark_census_fragment(PROFILE);
@@ -517,6 +556,7 @@ pub(super) fn fixture(endpoint: Ipv4Addr, positive_policy: bool) -> Fixture {
         inventory,
         capability_profile,
         network_namespace,
+        kernel_config_digest,
         device_policy,
         android_net_id,
         rpdb,
@@ -541,6 +581,7 @@ fn assemble_with(
         inventory,
         capability_profile,
         network_namespace,
+        fixture.kernel_config_digest,
         &fixture.device_policy,
         android_net_id,
         &fixture.rpdb,

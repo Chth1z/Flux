@@ -180,6 +180,11 @@ pub fn compile_generation(
 
 Candidate enumeration may produce only bounded, non-authorizing syntactic/topology candidates. `PlanningEvidenceSet` is then passed by value and owns a bounded candidate-keyed set of freshness-bound authorities. In particular, an Android mark-dependent plan must carry the exact non-`Clone` `AndroidMarkPlanningAuthority`; the compiler does not manufacture it from negative scans or generic AOSP facts. Explicit selection evaluates only the named candidate and fails on missing/stale evidence. `auto` boundedly visits ranked candidates, retains evidence failures as rejection reasons, and selects the first candidate whose exact evidence remains fresh. Consuming the selected authority leaves a non-authorizing receipt in the artifact, binding the reviewed catalog entry/digest, candidate/topology, inventory epoch/snapshot, complete census observation identity/digest and collector revision, ownership-journal identity/revision, Capability Profile, boot, and namespace. Activation rechecks the receipt and still requires separate writer, observer, canary, topology, ownership, and mutation proofs.
 
+The complete census identity includes a collector-evidence digest in addition to its grammar
+revision. Android collector revision 2 derives this from projection schema 2, which binds the
+complete bounded running-kernel configuration digest used to admit or suppress native nftables
+collection.
+
 The implementation is pure computation. It hides normalization, policy ordering, bounded mark/routing candidate enumeration and scoring, authorized candidate finalization, UID expansion, CIDR canonicalization, Sing-Box overlay generation, resource budgeting, and safety validation. It does not collect census evidence, assert device cooperation, allocate by complement, or turn planning evidence into an activation lease.
 
 The compiler must return the same byte-for-byte candidate set for identical normalized discovery inputs and the same byte-for-byte `GenerationArtifact` for identical candidates/evidence/selection. It must not read files, invoke commands, or mutate the kernel. The Controller assigns a monotonic `GenerationId` and the Generation Store adds timestamps only after compilation; neither is part of the artifact digest.

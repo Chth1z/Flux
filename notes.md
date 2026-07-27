@@ -2017,3 +2017,47 @@ It does not yet validate the production Rust composition because that compositio
   modular, unavailable, malformed, or changing evidence remains fail closed until a race-safe
   active-handler proof exists. `flate2` is already transitive in `Cargo.lock`, but making it a
   direct `flux-platform` production dependency still requires explicit approval.
+
+## Capability-First Design Reconciliation (2026-07-27)
+
+- Accepted ADR-0005 still defines the target order as qualified native nftables TPROXY, legacy
+  xtables TPROXY, managed TUN, then inactive. The July implementation roadmap narrowed the first
+  Rust-only release to xtables to remove shell sooner; it did not supersede the multi-path target.
+- The active Rust schema accepts only explicit xtables, `CapabilityProfile` observes kernel release
+  rather than config features, and shell `_detect_kernel` reduces mixed config/module/registration
+  evidence into unbound `KFEAT_*` booleans. There is no single deterministic selector today.
+- The fwmark census additionally performs an nftables dump before capability discovery. On kernels
+  without built-in nf_tables this may enter kernel module-request dispatch, violating the project's
+  no-autoload invariant even though the operation is intended to be observational.
+- The corrected module interface separates three facts: complete bounded kernel-config evidence,
+  per-path behavioral qualification, and deterministic selection. Kernel config can prove stable
+  absence or eligibility, but cannot mint `Qualified` or any writer authority.
+- Automatic mode selects the first qualified path in ADR order. When none is qualified, it returns
+  no activation path and identifies the first unqualified path as the next work item. Explicit mode
+  never falls back. eBPF and ipset are recorded as optional capabilities, not capture candidates.
+- For the current SM-S9180 evidence, native nftables is `Missing` because `CONFIG_NF_TABLES=n`.
+  Legacy xtables is the next path to qualify, with managed TUN behind it. This preserves the current
+  R4 work direction while removing the accidental xtables-only architectural constraint.
+
+## Capability-First Host Implementation (2026-07-27)
+
+- `android_kernel_capabilities` parses the complete bounded `/proc/config.gz` option set and exposes
+  43 capture-relevant typed features. The selector covers native nftables TPROXY, legacy xtables
+  TPROXY, and managed TUN in ADR-0005 order; its exhaustive 216-state matrix selects only a
+  behaviorally `Qualified` path.
+- The production fwmark source now collects kernel config before any backend-specific observation.
+  `CONFIG_NF_TABLES=n` returns complete native absence without opening netlink; built-in netfilter,
+  netfilter-netlink, and nf_tables admit the existing dump. Modular, unreported, malformed, denied,
+  unavailable, or drifting config evidence fails closed.
+- External snapshot schema 2 binds the complete kernel-config digest on both sides of the native
+  inventory transaction. Projection schema 2 binds the same digest, and Android collector revision
+  2 carries the projection identity into `CompleteFwmarkCensus` and the final planning-evidence
+  digest rather than discarding the admission evidence after A/B equality.
+- Focused verification currently passes 12 capability/parser/selector tests, the config-only
+  projection-digest regression, the two new sanitized source-label assertions, and
+  `cargo check -p flux-platform --all-targets`.
+- Full host verification passes both affected-crate suites, warnings-denied all-target/all-feature
+  Clippy, rustfmt, the pinned Android 31 ARM64 cross-check, `git diff --check`, and the complete
+  `cargo xtask ci` gate. Payload-suppressing scans found no added private-key header, cloud token,
+  credential assignment, hardware-serial assignment, or device identifier. No device command or
+  mutation occurred during this host implementation phase.

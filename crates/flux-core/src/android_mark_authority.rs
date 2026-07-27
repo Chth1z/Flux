@@ -39,6 +39,8 @@ pub(crate) const MAX_REVIEWED_POLICY_CATALOG_ENTRY_ID_BYTES: usize = 128;
 pub const ANDROID_MARK_DEVICE_POLICY_ARTIFACT_DIGEST_BYTES: usize = 32;
 /// Exact byte length of a canonical Android mark-planning evidence digest.
 pub const ANDROID_MARK_PLANNING_EVIDENCE_DIGEST_BYTES: usize = 32;
+/// Exact byte length of a collector-specific complete-census evidence digest.
+pub const FWMARK_CENSUS_COLLECTOR_EVIDENCE_DIGEST_BYTES: usize = 32;
 /// Exact byte length of a durable ownership-journal identity.
 pub const OWNERSHIP_JOURNAL_IDENTITY_BYTES: usize = 32;
 /// Maximum raw mark-use records accepted by one complete point-in-time census.
@@ -51,7 +53,7 @@ pub const MAX_FWMARK_NETFILTER_CHAIN_NAME_BYTES: usize = 128;
 pub const FWMARK_ORDERED_SELECTOR_DIGEST_BYTES: usize = 32;
 
 const ANDROID_MARK_PLANNING_EVIDENCE_DIGEST_DOMAIN: &[u8] =
-    b"Flux Android mark planning evidence\0canonical-schema-v1\0sha256-v1\0";
+    b"Flux Android mark planning evidence\0canonical-schema-v2\0sha256-v1\0";
 
 const ALL_FWMARK_EVIDENCE_SOURCES: [FwmarkEvidenceSource; 9] = [
     FwmarkEvidenceSource::AndroidNetId,
@@ -183,6 +185,27 @@ impl FwmarkCensusCollectorRevision {
     #[must_use]
     pub const fn get(self) -> u64 {
         self.0.get()
+    }
+}
+
+/// Domain-separated SHA-256 identity of collector evidence behind one complete census.
+///
+/// Platform collectors use this field to retain freshness-bound source evidence that the core
+/// census deliberately does not model field by field. It is evidence identity only and grants no
+/// collection, planning, or mutation authority.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(transparent)]
+pub struct FwmarkCensusCollectorEvidenceDigest([u8; FWMARK_CENSUS_COLLECTOR_EVIDENCE_DIGEST_BYTES]);
+
+impl FwmarkCensusCollectorEvidenceDigest {
+    #[must_use]
+    pub const fn new(bytes: [u8; FWMARK_CENSUS_COLLECTOR_EVIDENCE_DIGEST_BYTES]) -> Self {
+        Self(bytes)
+    }
+
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; FWMARK_CENSUS_COLLECTOR_EVIDENCE_DIGEST_BYTES] {
+        &self.0
     }
 }
 
@@ -1243,6 +1266,7 @@ pub struct CompleteFwmarkCensus {
     device_policy_identity: AndroidMarkDevicePolicyIdentity,
     device_policy_revision: AndroidMarkDevicePolicyRevision,
     collector_revision: FwmarkCensusCollectorRevision,
+    collector_evidence_digest: FwmarkCensusCollectorEvidenceDigest,
     ownership_journal_identity: OwnershipJournalIdentity,
     ownership_journal_revision: OwnershipJournalRevision,
     coverage: Box<[FwmarkCensusCoverageRecord]>,
@@ -1264,6 +1288,7 @@ impl CompleteFwmarkCensus {
         device_policy_identity: &AndroidMarkDevicePolicyIdentity,
         device_policy_revision: AndroidMarkDevicePolicyRevision,
         collector_revision: FwmarkCensusCollectorRevision,
+        collector_evidence_digest: FwmarkCensusCollectorEvidenceDigest,
         ownership_journal_identity: OwnershipJournalIdentity,
         ownership_journal_revision: OwnershipJournalRevision,
         coverage: impl IntoIterator<Item = FwmarkCensusCoverageRecord>,
@@ -1400,6 +1425,7 @@ impl CompleteFwmarkCensus {
             device_policy_identity: device_policy_identity.clone(),
             device_policy_revision,
             collector_revision,
+            collector_evidence_digest,
             ownership_journal_identity,
             ownership_journal_revision,
             coverage: canonical_coverage.into_boxed_slice(),
@@ -1464,6 +1490,11 @@ impl CompleteFwmarkCensus {
     #[must_use]
     pub const fn collector_revision(&self) -> FwmarkCensusCollectorRevision {
         self.collector_revision
+    }
+
+    #[must_use]
+    pub const fn collector_evidence_digest(&self) -> FwmarkCensusCollectorEvidenceDigest {
+        self.collector_evidence_digest
     }
 
     #[must_use]
@@ -1790,6 +1821,11 @@ impl AndroidMarkPlanningAuthority {
     }
 
     #[must_use]
+    pub const fn census_collector_evidence_digest(&self) -> FwmarkCensusCollectorEvidenceDigest {
+        self.census.collector_evidence_digest
+    }
+
+    #[must_use]
     pub const fn ownership_journal_identity(&self) -> OwnershipJournalIdentity {
         self.census.ownership_journal_identity
     }
@@ -1949,6 +1985,7 @@ fn digest_complete_census(digest: &mut CanonicalEvidenceDigest, census: &Complet
     digest_policy_identity(digest, &census.device_policy_identity);
     digest.u64(census.device_policy_revision.get());
     digest.u64(census.collector_revision.get());
+    digest.bytes(census.collector_evidence_digest.as_bytes());
     digest.bytes(census.ownership_journal_identity.as_bytes());
     digest.u64(census.ownership_journal_revision.get());
     digest.usize(census.coverage.len());

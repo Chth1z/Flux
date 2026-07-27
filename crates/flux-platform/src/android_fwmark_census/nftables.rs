@@ -14,6 +14,8 @@ use super::read_only_netlink::collect_read_only_netlink_dump;
 use super::read_only_netlink::{
     ReadOnlyNetlinkError, ReadOnlyNetlinkErrorKind, ReadOnlyNetlinkMessage,
 };
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use crate::android_kernel_capabilities::AndroidNftablesObservationGate;
 use crate::netlink::{NLA_F_NESTED, NetlinkAttribute, NetlinkAttributeIter};
 
 const NFTABLES_SNAPSHOT_DIGEST_DOMAIN: &[u8] =
@@ -259,14 +261,19 @@ impl fmt::Display for AndroidNftablesFwmarkObservationError {
 
 impl Error for AndroidNftablesFwmarkObservationError {}
 
-/// Collects the complete native nf_tables rule dump through `NETLINK_NETFILTER`.
+/// Collects the complete native nf_tables rule dump through `NETLINK_NETFILTER` after the
+/// capability module has decided that doing so cannot request module autoload.
 ///
 /// A missing `nft` executable is irrelevant. A kernel-level unsupported response is represented as
 /// complete absence at this point in time; permission failures and all other errors remain errors.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-pub fn collect_android_nftables_fwmarks(
+pub(super) fn collect_android_nftables_fwmarks(
+    gate: AndroidNftablesObservationGate,
     bound: Duration,
 ) -> Result<AndroidNftablesFwmarkObservation, AndroidNftablesFwmarkObservationError> {
+    if gate == AndroidNftablesObservationGate::CompleteAbsent {
+        return Ok(absent_observation(false));
+    }
     let sequence = 1;
     let request = nft_rule_dump_request(sequence);
     let group_mask = 1_u32 << (NFNLGRP_NFTABLES - 1);
@@ -923,8 +930,24 @@ mod tests {
     #[test]
     #[ignore = "requires CAP_NET_ADMIN in the current network namespace"]
     fn privileged_native_nftables_dump_smoke() {
-        collect_android_nftables_fwmarks(Duration::from_secs(2))
-            .expect("collect native nftables state");
+        collect_android_nftables_fwmarks(
+            AndroidNftablesObservationGate::Collect,
+            Duration::from_secs(2),
+        )
+        .expect("collect native nftables state");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn complete_absence_gate_returns_before_netlink_validation() {
+        let observation = collect_android_nftables_fwmarks(
+            AndroidNftablesObservationGate::CompleteAbsent,
+            Duration::ZERO,
+        )
+        .expect("stable config absence requires no netlink operation");
+        assert!(!observation.kernel_supported());
+        assert!(observation.mark_uses().is_empty());
+        assert!(observation.transfer_mark_uses().is_empty());
     }
 
     #[test]

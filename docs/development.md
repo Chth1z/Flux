@@ -170,6 +170,39 @@ Success requires an independent process/file/directory absence proof plus an unc
 identity. This command cannot create an `AndroidMarkPlanningAuthority`, modify networking, install
 a module, or qualify a release by itself.
 
+### Capability-first Capture Path discovery
+
+`flux-platform::SystemAndroidKernelConfigSource` reads `/proc/config.gz` in process through a
+no-follow descriptor. Compressed input is limited to 4 MiB, decompressed input to 16 MiB, each line
+to 4 KiB, and the complete option map to 65,536 entries. The strict parser retains every
+`CONFIG_*` option as built-in, modular, disabled, or configured and binds names plus values into a
+canonical digest; raw option values do not enter diagnostics.
+
+The typed projection covers the nftables, legacy xtables, routing, TUN, ipset, and optional BPF
+features used by Flux. `select_android_capture_path` combines that eligibility evidence with
+separate behavioral-probe states and applies ADR-0005's fixed nftables, xtables, TUN order. It
+returns only a behaviorally qualified selection; otherwise it identifies the next unqualified path
+without granting writer authority. Explicit path requests never fall back, and the active product
+schema continues to accept only the implemented xtables adapter.
+
+The fwmark census obtains and digests this snapshot before any xtables or nftables collection.
+Built-in `CONFIG_NF_TABLES=y` permits the existing bounded read-only dump;
+`CONFIG_NF_TABLES=n` produces complete nftables absence without opening netlink. Modular,
+unreported, malformed, denied, unavailable, or drifting evidence fails closed. The low-level
+nftables collector is private so callers cannot bypass this gate.
+
+Android fwmark collector revision 2 binds the complete kernel-config digest into projection schema
+2. Planning mode carries that projection identity into the non-`Clone` complete census and final
+planning-evidence digest; the A/B freshness check therefore cannot become an unrecorded admission
+input after authority construction.
+
+Run the focused parser, gate, and 216-state selector matrix with:
+
+```text
+cargo test -p flux-platform android_kernel_capabilities --lib
+cargo test -p flux-platform complete_absence_gate_returns_before_netlink_validation --lib
+```
+
 The compatibility submodule remains separate:
 
 ```text

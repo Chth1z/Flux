@@ -43,8 +43,6 @@ pub use existing_flux::{
     AndroidExistingFluxOwnershipErrorKind, AndroidExistingFluxOwnershipObservation,
 };
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
-pub use nftables::collect_android_nftables_fwmarks;
 pub use nftables::{
     AndroidNftablesFwmarkObservation, AndroidNftablesFwmarkObservationError,
     AndroidNftablesFwmarkObservationErrorKind, AndroidNftablesSnapshotDigest,

@@ -192,6 +192,10 @@ gate and are paused until that target and qualification procedure are viable.
 
 Unsupported, duplicate, incomplete, opaque, denied, unknown, inconsistent, over-budget, or transient-attempt coverage grants no authority. The census accepts at most 512 raw predicate-read, masked-write, transfer-read, or transfer-write records before canonical sorting and deduplication, and binds the exact inventory snapshot identity/epoch, full capability facts and boot, namespace, policy identity/revision, collector revision, and durable ownership-journal identity/revision. Every candidate-mask overlap still rejects regardless of compared values: definite or unknown uses are conflicts, while only the exact Android `netId` packet masked writer receives the ordered-qualification diagnostic. Opaque RPDB evidence rejects even if another census cell claims completeness, and definite conflicts are decided before ordered writes or an otherwise incomplete topology report.
 
+The complete census now also retains a collector-evidence digest. Android collector revision 2
+derives it from projection schema 2, including the complete bounded running-kernel configuration
+digest used to gate native nftables observation.
+
 The resulting `AndroidMarkPlanningAuthority` is privately constructed, non-`Clone`, and limited to pure planning. It exposes no `MarkLease`, rule priority, route table, route intent, encoder, writer, ownership operation, mutation authority, or activation conversion. Reauthorization consumes it and requires a newly collected census. Exact writer semantics, authenticated runtime hook/profile ordering, listener and mark-observer continuity, and a physical-device mark-preservation/coexistence canary remain mark-specific prerequisites; Capture Program ordering, domain/network-selection handoff, route reachability, topology observer continuity, durable ownership, exact mutation identity, engine loop escape, and shape-specific one-rule address handling remain separate topology prerequisites.
 
 All writes use masked merge semantics:

@@ -10,6 +10,7 @@ mod address_sync;
 mod android_fwmark_census;
 mod android_identity;
 mod android_identity_properties;
+mod android_kernel_capabilities;
 mod capability;
 mod child_process;
 mod file_observer;
@@ -57,8 +58,24 @@ pub use android_fwmark_census::{
 pub use android_fwmark_census::{
     SystemAndroidFwmarkCensusSource, SystemAndroidFwmarkCensusSourceError,
     SystemAndroidFwmarkCensusSourceErrorKind, SystemAndroidNftablesObservationErrorClass,
-    collect_android_existing_flux_ownership, collect_android_nftables_fwmarks,
-    collect_android_traffic_control_bpf_fwmarks, collect_android_xfrm_fwmarks,
+    collect_android_existing_flux_ownership, collect_android_traffic_control_bpf_fwmarks,
+    collect_android_xfrm_fwmarks,
+};
+pub use android_kernel_capabilities::{
+    ALL_ANDROID_KERNEL_FEATURES, ANDROID_CAPTURE_PATH_COUNT, ANDROID_KERNEL_CONFIG_DIGEST_BYTES,
+    AndroidCapturePath, AndroidCapturePathCandidate, AndroidCapturePathDecision,
+    AndroidCapturePathPreference, AndroidCapturePathProbeState, AndroidCapturePathQualifications,
+    AndroidCapturePathState, AndroidKernelConfigDigest, AndroidKernelConfigOptionState,
+    AndroidKernelConfigParseError, AndroidKernelConfigParseErrorKind, AndroidKernelConfigSnapshot,
+    AndroidKernelFeature, AndroidKernelFeatureState, AndroidNftablesObservationGate,
+    AndroidNftablesObservationGateError, MAX_ANDROID_KERNEL_CONFIG_COMPRESSED_BYTES,
+    MAX_ANDROID_KERNEL_CONFIG_DECOMPRESSED_BYTES, MAX_ANDROID_KERNEL_CONFIG_LINE_BYTES,
+    MAX_ANDROID_KERNEL_CONFIG_OPTIONS, parse_android_kernel_config, select_android_capture_path,
+};
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use android_kernel_capabilities::{
+    SystemAndroidKernelConfigError, SystemAndroidKernelConfigErrorKind,
+    SystemAndroidKernelConfigSource,
 };
 pub use capability::{CapabilityProfilePaths, SystemCapabilityProfileSource};
 pub use file_observer::{FileObservationBatch, FileObservationError, FileObservationPaths};

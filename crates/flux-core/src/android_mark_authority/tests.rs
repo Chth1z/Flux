@@ -10,24 +10,25 @@ use crate::{
     BootIdentity, COMPLETE_FWMARK_CENSUS_COVERAGE_RECORDS, CapabilityProfile,
     CapabilityProfileRevision, CompleteFwmarkCensus, CompleteFwmarkCensusError,
     DeferredAndroidMarkActivationPrerequisite, DeferredAndroidTproxyPrerequisite, DeviceIdentity,
-    FwmarkCandidate, FwmarkCensusCollectorRevision, FwmarkCensusCoverageRecord,
-    FwmarkCensusCoverageState, FwmarkEvidenceSource, FwmarkEvidenceState,
-    FwmarkNetfilterBuiltinHook, FwmarkNetfilterChainName, FwmarkOrderedLateWritePlacement,
-    FwmarkOrderedLateWriteQualification, FwmarkOrderedLateWriteQualificationError,
-    FwmarkOrderedPacketWriteRequirement, FwmarkPacketSelectorDigest, FwmarkPartialAuditOutcome,
-    FwmarkPlane, FwmarkPlaneSet, FwmarkUseOperation, FwmarkUseRecord, FwmarkUseRecordError,
-    InterfaceHardwareType, InterfaceIndex, InterfaceLinkFlags, InterfaceLinkRecord, InterfaceName,
-    KernelBuildIdentity, KernelFacts, KernelRelease, LegacyAddressSynchronization,
-    LegacyArtifactReadiness, LegacyArtifactResolution, LegacyBridgeFacts, LegacyMutationWriter,
-    LegacyRuleBackend, MAX_ANDROID_MARK_DEVICE_POLICY_NAME_BYTES,
-    MAX_COMPLETE_FWMARK_CENSUS_MARK_USES, NetworkAddressFamily, NetworkInventory,
-    NetworkInventoryTracker, NetworkNamespaceIdentity, NetworkRuleRecord, Observation,
-    OpaqueRuleAttribute, OwnershipJournalIdentity, OwnershipJournalIdentityError,
-    OwnershipJournalRevision, RuleAction, RuleAttributeOpacity, RuleFlags, RuleFwMark,
-    RuleOpaqueAttributeFingerprint, RulePrefix, RulePriority, RuleProperties, RuleProtocol,
-    RuleTableId, SecurityPatchLevel, SelinuxMode, SelinuxPolicyIdentity, Sha256Digest, ToolId,
-    VendorBuildIdentity, VerifiedBootIdentity, VerifiedBootState,
-    assess_android_tproxy_topology_scope, authorize_android_mark_planning, classify_android_rpdb,
+    FwmarkCandidate, FwmarkCensusCollectorEvidenceDigest, FwmarkCensusCollectorRevision,
+    FwmarkCensusCoverageRecord, FwmarkCensusCoverageState, FwmarkEvidenceSource,
+    FwmarkEvidenceState, FwmarkNetfilterBuiltinHook, FwmarkNetfilterChainName,
+    FwmarkOrderedLateWritePlacement, FwmarkOrderedLateWriteQualification,
+    FwmarkOrderedLateWriteQualificationError, FwmarkOrderedPacketWriteRequirement,
+    FwmarkPacketSelectorDigest, FwmarkPartialAuditOutcome, FwmarkPlane, FwmarkPlaneSet,
+    FwmarkUseOperation, FwmarkUseRecord, FwmarkUseRecordError, InterfaceHardwareType,
+    InterfaceIndex, InterfaceLinkFlags, InterfaceLinkRecord, InterfaceName, KernelBuildIdentity,
+    KernelFacts, KernelRelease, LegacyAddressSynchronization, LegacyArtifactReadiness,
+    LegacyArtifactResolution, LegacyBridgeFacts, LegacyMutationWriter, LegacyRuleBackend,
+    MAX_ANDROID_MARK_DEVICE_POLICY_NAME_BYTES, MAX_COMPLETE_FWMARK_CENSUS_MARK_USES,
+    NetworkAddressFamily, NetworkInventory, NetworkInventoryTracker, NetworkNamespaceIdentity,
+    NetworkRuleRecord, Observation, OpaqueRuleAttribute, OwnershipJournalIdentity,
+    OwnershipJournalIdentityError, OwnershipJournalRevision, RuleAction, RuleAttributeOpacity,
+    RuleFlags, RuleFwMark, RuleOpaqueAttributeFingerprint, RulePrefix, RulePriority,
+    RuleProperties, RuleProtocol, RuleTableId, SecurityPatchLevel, SelinuxMode,
+    SelinuxPolicyIdentity, Sha256Digest, ToolId, VendorBuildIdentity, VerifiedBootIdentity,
+    VerifiedBootState, assess_android_tproxy_topology_scope, authorize_android_mark_planning,
+    classify_android_rpdb,
 };
 
 use super::{
@@ -1727,6 +1728,10 @@ fn synthetic_cooperative_policy_yields_read_only_planning_authority_and_separate
         context.collector_revision
     );
     assert_eq!(
+        authority.census_collector_evidence_digest(),
+        test_collector_evidence_digest()
+    );
+    assert_eq!(
         authority.ownership_journal_identity(),
         context.ownership_journal_identity
     );
@@ -2213,12 +2218,17 @@ fn census_with_ordered(
         policy.identity(),
         policy.revision(),
         collector_revision,
+        test_collector_evidence_digest(),
         ownership_journal_identity,
         ownership_journal_revision,
         coverage,
         mark_uses,
         ordered_late_writes,
     )
+}
+
+fn test_collector_evidence_digest() -> FwmarkCensusCollectorEvidenceDigest {
+    FwmarkCensusCollectorEvidenceDigest::new([0x5c; 32])
 }
 
 fn complete_absent_coverage() -> Vec<FwmarkCensusCoverageRecord> {

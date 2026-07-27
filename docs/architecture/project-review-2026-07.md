@@ -1,7 +1,7 @@
 # Flux Comprehensive Project Review
 
 Review date: 2026-07-23
-Implementation status updated: 2026-07-26
+Implementation status updated: 2026-07-27
 
 ## Conclusion
 
@@ -31,7 +31,9 @@ schedule immediately:
 3. Join them only at one fenced native-writer cutover.
 4. Remove shell networking, standalone `addrsyncd`, packaged `jq`, and legacy configuration as part
    of that cutover, not in a distant final phase.
-5. Defer nftables, TUN, eBPF, ipset, and new proof abstractions until the Rust-only gate passes.
+5. Defer nftables/TUN mutation adapters, eBPF/ipset acceleration, and new proof abstractions until
+   the Rust-only gate passes; retain capability-first discovery and explainable path selection so
+   optional-backend absence cannot block or autoload ahead of the xtables cutover.
 
 This direction is now encoded in the revised
 [implementation roadmap](implementation-roadmap.md).
@@ -365,6 +367,12 @@ ruleset batches are materially better primitives. It is not the fastest path to 
 
 Ship one Rust-owned xtables path first. Re-evaluate nftables immediately afterward using measured
 limitations and real-device capability evidence.
+
+This delivery order does not justify an xtables-only capability model. The running-kernel feature
+census and deterministic ADR-0005 selector belong before backend-specific probes. They can classify
+nftables as missing and identify xtables as the next path to qualify without implementing or
+authorizing an nftables writer. On the current Samsung qualification target,
+`CONFIG_NF_TABLES=n` produces exactly that result and avoids a potentially autoloading netlink dump.
 
 ## Alternatives Considered
 

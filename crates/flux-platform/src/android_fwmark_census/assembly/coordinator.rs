@@ -7,10 +7,10 @@ use flux_core::{
     AndroidMarkPlanningAuthority, AndroidMarkPlanningAuthorizationError, AndroidNetdSourceProfile,
     AndroidTproxyTopologyScopeError, AndroidTproxyTopologyScopeRequest, CapabilityProfile,
     CapabilityProfileDigest, CapabilityProfileRevision, CompleteFwmarkCensus,
-    CompleteFwmarkCensusError, FwmarkCandidate, FwmarkCensusCollectorRevision, NetworkInventory,
-    NetworkNamespaceIdentity, ObservationKind, ReviewedAndroidMarkPolicyCatalogError,
-    RpdbFwmarkCensusFragmentError, assess_android_tproxy_topology_scope,
-    authorize_android_mark_planning, classify_android_rpdb,
+    CompleteFwmarkCensusError, FwmarkCandidate, FwmarkCensusCollectorEvidenceDigest,
+    FwmarkCensusCollectorRevision, NetworkInventory, NetworkNamespaceIdentity, ObservationKind,
+    ReviewedAndroidMarkPolicyCatalogError, RpdbFwmarkCensusFragmentError,
+    assess_android_tproxy_topology_scope, authorize_android_mark_planning, classify_android_rpdb,
     project_android_net_id_fwmark_census_fragment, project_rpdb_fwmark_census_fragment,
     select_reviewed_android_mark_policy,
 };
@@ -25,13 +25,14 @@ use crate::android_fwmark_census::{
     AndroidTrafficControlBpfFwmarkObservation, AndroidXfrmFwmarkObservation,
     AndroidXtablesFwmarkObservation,
 };
+use crate::android_kernel_capabilities::AndroidKernelConfigDigest;
 
 pub const ANDROID_FWMARK_CENSUS_COLLECTOR_REVISION: FwmarkCensusCollectorRevision =
-    FwmarkCensusCollectorRevision::INITIAL;
+    FwmarkCensusCollectorRevision::new(2).expect("collector revision two is nonzero");
 pub const MAX_ANDROID_FWMARK_CENSUS_STAGE_BOUND: Duration = Duration::from_secs(30);
 
 const EXTERNAL_SNAPSHOT_DIGEST_DOMAIN: &[u8] =
-    b"Flux Android fwmark external snapshot\0canonical-schema-v1\0sha256-v1\0";
+    b"Flux Android fwmark external snapshot\0canonical-schema-v2\0sha256-v1\0";
 
 /// Purpose of one coherent census collection.
 ///
@@ -104,6 +105,7 @@ impl AndroidFwmarkCensusExternalSnapshotDigest {
 /// raw xtables text, BPF instructions, XFRM selectors, endpoints, and device identities are absent.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AndroidFwmarkCensusExternalSnapshot {
+    kernel_config_digest: AndroidKernelConfigDigest,
     xtables: AndroidXtablesFwmarkObservation,
     nftables: AndroidNftablesFwmarkObservation,
     traffic_control_bpf: AndroidTrafficControlBpfFwmarkObservation,
@@ -114,13 +116,21 @@ pub struct AndroidFwmarkCensusExternalSnapshot {
 impl AndroidFwmarkCensusExternalSnapshot {
     #[must_use]
     pub fn new(
+        kernel_config_digest: AndroidKernelConfigDigest,
         xtables: AndroidXtablesFwmarkObservation,
         nftables: AndroidNftablesFwmarkObservation,
         traffic_control_bpf: AndroidTrafficControlBpfFwmarkObservation,
         xfrm: AndroidXfrmFwmarkObservation,
     ) -> Self {
-        let digest = digest_external_snapshot(&xtables, &nftables, &traffic_control_bpf, &xfrm);
+        let digest = digest_external_snapshot(
+            kernel_config_digest,
+            &xtables,
+            &nftables,
+            &traffic_control_bpf,
+            &xfrm,
+        );
         Self {
+            kernel_config_digest,
             xtables,
             nftables,
             traffic_control_bpf,
@@ -132,6 +142,11 @@ impl AndroidFwmarkCensusExternalSnapshot {
     #[must_use]
     pub const fn digest(&self) -> AndroidFwmarkCensusExternalSnapshotDigest {
         self.digest
+    }
+
+    #[must_use]
+    pub const fn kernel_config_digest(&self) -> AndroidKernelConfigDigest {
+        self.kernel_config_digest
     }
 }
 
@@ -533,6 +548,7 @@ pub fn coordinate_android_fwmark_census<S: AndroidFwmarkCensusCoordinatorSource>
         &inventory,
         &capability_before,
         network_namespace,
+        external_before.kernel_config_digest,
         &device_policy,
         &android_net_id,
         &rpdb,
@@ -618,7 +634,7 @@ fn complete_census_from_projection(
         mark_uses,
         ordered_late_writes,
         metrics: _,
-        digest: _,
+        digest,
     } = projection;
     CompleteFwmarkCensus::from_complete_observation(
         inventory,
@@ -627,6 +643,7 @@ fn complete_census_from_projection(
         device_policy.identity(),
         device_policy.revision(),
         ANDROID_FWMARK_CENSUS_COLLECTOR_REVISION,
+        FwmarkCensusCollectorEvidenceDigest::new(*digest.as_bytes()),
         ownership_journal_identity,
         ownership_journal_revision,
         cells,
@@ -636,6 +653,7 @@ fn complete_census_from_projection(
 }
 
 fn digest_external_snapshot(
+    kernel_config_digest: AndroidKernelConfigDigest,
     xtables: &AndroidXtablesFwmarkObservation,
     nftables: &AndroidNftablesFwmarkObservation,
     traffic_control_bpf: &AndroidTrafficControlBpfFwmarkObservation,
@@ -643,6 +661,8 @@ fn digest_external_snapshot(
 ) -> AndroidFwmarkCensusExternalSnapshotDigest {
     let mut digest = Sha256::new();
     digest.update(EXTERNAL_SNAPSHOT_DIGEST_DOMAIN);
+    digest.update(b"kernel-config\0");
+    digest.update(kernel_config_digest.as_bytes());
     digest.update(b"xtables\0");
     digest.update(xtables.digest().as_bytes());
     digest.update(b"nftables\0");

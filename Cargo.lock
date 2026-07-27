@@ -178,6 +178,7 @@ dependencies = [
 name = "flux-platform"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "flux-core",
  "libc",
  "sha2",

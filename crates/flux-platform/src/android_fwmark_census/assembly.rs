@@ -18,6 +18,7 @@ use super::{
     AndroidTrafficControlBpfFwmarkObservation, AndroidXfrmFwmarkObservation,
     AndroidXtablesFwmarkObservation,
 };
+use crate::android_kernel_capabilities::AndroidKernelConfigDigest;
 
 mod coordinator;
 mod report;
@@ -42,7 +43,7 @@ pub const ANDROID_FWMARK_CENSUS_PROJECTION_CELLS: usize = 27;
 pub const ANDROID_FWMARK_CENSUS_PROJECTION_METRICS: usize = 36;
 
 const PROJECTION_DIGEST_DOMAIN: &[u8] =
-    b"Flux Android fwmark census diagnostic projection\0canonical-schema-v1\0sha256-v1\0";
+    b"Flux Android fwmark census diagnostic projection\0canonical-schema-v2\0sha256-v1\0";
 const ALL_SOURCES: [FwmarkEvidenceSource; 9] = [
     FwmarkEvidenceSource::AndroidNetId,
     FwmarkEvidenceSource::Rpdb,
@@ -376,6 +377,7 @@ pub fn assemble_android_fwmark_census_projection(
     inventory: &NetworkInventory,
     capability_profile: &CapabilityProfile,
     network_namespace: NetworkNamespaceIdentity,
+    kernel_config_digest: AndroidKernelConfigDigest,
     device_policy: &AndroidMarkDevicePolicy,
     android_net_id: &AndroidNetIdFwmarkCensusFragment,
     rpdb: &RpdbFwmarkCensusFragment,
@@ -503,6 +505,7 @@ pub fn assemble_android_fwmark_census_projection(
         inventory,
         capability_profile_digest: capability_profile.digest(),
         network_namespace,
+        kernel_config_digest,
         device_policy,
         android_net_id,
         rpdb,
@@ -866,6 +869,7 @@ struct ProjectionDigestBindings<'a> {
     inventory: &'a NetworkInventory,
     capability_profile_digest: CapabilityProfileDigest,
     network_namespace: NetworkNamespaceIdentity,
+    kernel_config_digest: AndroidKernelConfigDigest,
     device_policy: &'a AndroidMarkDevicePolicy,
     android_net_id: &'a AndroidNetIdFwmarkCensusFragment,
     rpdb: &'a RpdbFwmarkCensusFragment,
@@ -890,6 +894,7 @@ fn digest_projection(
     digest.update(bindings.capability_profile_digest.as_bytes());
     digest.update(bindings.network_namespace.device().to_be_bytes());
     digest.update(bindings.network_namespace.inode().to_be_bytes());
+    digest.update(bindings.kernel_config_digest.as_bytes());
     digest_policy(&mut digest, bindings.device_policy);
     digest.update([netd_source_profile_tag(bindings.android_net_id.profile())]);
     digest.update(bindings.rpdb.snapshot_id().get().to_be_bytes());

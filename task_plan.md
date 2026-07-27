@@ -2742,3 +2742,82 @@ no-autoload design defect** - exported running-kernel config reports `CONFIG_NF_
 the kernel-rejected dump, and final cleanup is clean. The production collector must gate before its
 first request using in-process config parsing. Do not proceed to U2.5, issue another availability
 dump, or make generic `EINVAL` equivalent to absence.
+
+## Execution: Capability-First Capture-Path Selection (2026-07-27)
+
+### Goal
+Restore ADR-0005's capability-driven multi-path design without weakening the current activation
+gates: collect bounded typed kernel evidence before backend-specific probes, classify nftables,
+legacy xtables, and managed TUN independently, select only a behaviorally qualified path, and expose
+the highest-priority unqualified path as the next qualification task.
+
+### Design Reconciliation
+- ADR-0005 defines automatic preference as native nftables TPROXY, legacy xtables TPROXY, managed
+  TUN, then inactive. The July Rust-unification roadmap intentionally narrowed the first release to
+  xtables, but the active code now incorrectly lacks the earlier discovery/selection layer rather
+  than merely deferring additional mutation adapters.
+- Kernel release and boot identity in `CapabilityProfile` are not a feature census. Shell
+  `_detect_kernel` retains only lossy `KFEAT_*` booleans, while the native nftables census currently
+  sends a dump before proving the handler built in. Capability discovery must precede both legacy
+  compatibility projection and backend-specific probing.
+- Kernel config is eligibility evidence, not behavioral qualification. A candidate becomes
+  `Qualified` only from a separate exact behavioral probe; config/module/tool facts may instead
+  classify it as `Missing`, `Denied`, `Conflicting`, `Broken`, or `Unqualified`.
+- Automatic mode may select only the first qualified candidate in the fixed ADR order. If none is
+  qualified, it returns no activation choice and names the first unqualified candidate to probe.
+  An explicit request never falls back silently. Optional eBPF/ipset facts are observed separately
+  and never become a correctness path.
+- On the current SM-S9180 kernel, `CONFIG_NF_TABLES=n` makes native nftables a stable missing
+  candidate without netlink. Legacy xtables is therefore the next path to qualify; TUN remains a
+  later fallback. This is a work-selection result, not production mutation authority.
+
+### Phases
+- [x] S0: Review ADR-0005, the July roadmap, active config schema, Capability Profile, shell
+  `KFEAT_*` detection, native collectors, and canary availability taxonomy.
+- [x] S1: Add a no-follow, compressed/decompressed-byte-bounded in-process `/proc/config.gz`
+  collector and strict parser that retains every option's typed state plus a canonical digest.
+- [x] S2: Add typed relevant-feature projections, nftables no-autoload observation gating, the
+  three-path candidate matrix, explicit/automatic selection, and deterministic matrix tests.
+- [x] S3: Route the Android fwmark census through one pre-netlink kernel snapshot. Disabled
+  `CONFIG_NF_TABLES` must emit complete nftables absence; built-in permits the existing dump;
+  modular, absent, denied, malformed, unavailable, or drifting evidence must fail closed.
+- [x] S4: Reconcile ADR/roadmap/development documentation so staged implementation breadth is not
+  mistaken for an xtables-only target architecture. Do not enable unimplemented config variants.
+- [x] S5: Run focused and full host verification, strict Clippy, rustfmt, the pinned Android
+  cross-build, security/diff scans, and create a host checkpoint.
+- [ ] S6: Run one quiet sanitized diagnostic on the unchanged expected device, independently prove
+  zero generated process/path residue and stable identity, record only bounded evidence, and create
+  a separate device-evidence checkpoint before U2.5.
+
+### Status
+**S6 ready** - the bounded parser, 43-feature projection, three-path selector, no-autoload nftables
+gate, A/B drift binding, schema-2 projection identity, collector revision 2, and reconciled design
+documents pass focused tests, full affected-crate suites, strict Clippy, rustfmt, the pinned Android
+cross-build, repository CI, diff hygiene, and scoped secret/device-identifier scans. The host
+checkpoint records this state before one quiet device diagnostic. No device command or mutation
+has occurred in this phase.
+
+### Errors Encountered
+- The first focused test/all-target check compile found that the new byte parser used the
+  string-only `split_terminator` method and that explicit selection retained a reference to a
+  match-local path. Use byte-slice `split` after the already-required final LF and branch selection
+  directly by preference. Compilation stopped before tests or runtime code; no device command
+  occurred.
+- The corrected compile then required an explicit `Box<str>` annotation for the canonical
+  config-symbol map key. Add the ownership type without changing parsing or selection behavior and
+  rerun the same focused test/all-target check.
+- The first census-wiring compile correctly found that `system_source` still imported the nftables
+  collector through the public re-export removed by the no-bypass design. Import it from the
+  private sibling module instead; the production source remains its only non-test caller.
+- The first final-binding rustfmt check requested canonical wrapping in two core imports and the new
+  digest type. Apply `cargo fmt --all`; no behavior changed.
+- The first all-target compile of the host probe-label regression found that its helper was enabled
+  under `android || test` while the source-error-kind import remained Android-only. Move that enum
+  import to the same cfg boundary and rerun; all targets then compile.
+- The first documentation update used a mid-line fragment as an `apply_patch` anchor against a
+  long canonical paragraph and made no changes when the exact line did not match. Retry with the
+  complete paragraph as context and append the schema note separately.
+- The first scoped scan attempt used PCRE noncapturing groups without `rg -P`, then two patterns
+  retained conflicting shell quotes. Those commands either returned syntax status 2 or no match and
+  did not print candidate values. Rerun payload-suppressing PCRE checks with quote-free assignment
+  patterns; every private-key, cloud-token, credential, and device-identifier scan returns no match.

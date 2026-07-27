@@ -1355,6 +1355,11 @@ The multi-domain scope checkpoint keeps that evidence atomic without turning it 
 
 The positive Android mark-authority checkpoint is also planning-only. Generic AOSP is an explicit zero-grant policy, and bits 21–30 are merely the device-qualified candidate envelope. Positive construction is crate-private and reachable by external adapters only through an exact match in the compiled reviewed-policy catalog. Selection first returns the entry's typed `AndroidNetdSourceProfile`; the caller classifies RPDB/topology with that profile and must consume the selection to bind the result. A scope classified with another profile rejects before positive construction. The selected policy binds the assurance class, exact netd semantic profile, mark candidate and topology scope, the full `CapabilityProfile` with verified boot and executing-tool identity, network-namespace identity, a named cooperative device policy with a nonzero SHA-256 artifact digest and revision, and the exact nonempty plane set asserted by that policy. A partial assertion is representable for diagnostics but cannot authorize planning; authorization requires the grant to cover packet, socket, and conntrack marks. It then consumes one non-`Clone`, point-in-time census with exactly 27 complete-present/complete-absent coverage records: Android `netId`, RPDB, device policy, legacy xtables, nftables, TC/BPF, XFRM, connmark/socket transfers, and existing Flux ownership across all three planes. The census accepts at most 512 raw mark-use records before canonical sorting and deduplication, and binds the exact inventory snapshot/epoch, full Capability Profile, namespace, policy identity/revision, collector revision, and ownership-journal identity/revision.
 
+The census also retains one collector-evidence digest for complete source evidence that core does
+not model field by field. Android collector revision 2 uses projection schema 2 for that identity;
+the projection includes the complete bounded running-kernel configuration digest that admitted or
+suppressed native nftables collection.
+
 Definite or unresolved candidate-mask overlap with an external predicate read, masked write,
 transfer read, or transfer write rejects regardless of values; opaque RPDB evidence also rejects.
 An overlapping packet masked write can avoid that rejection only through an exact canonical

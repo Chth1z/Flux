@@ -1,6 +1,6 @@
 # Flux Rust-Unification Implementation Roadmap
 
-Last revised: 2026-07-26
+Last revised: 2026-07-27
 
 This roadmap is the authoritative execution order for the Flux rewrite. The
 [blueprint](fluxd-blueprint.md) and [technical specification](fluxd-technical-specification.md)
@@ -20,9 +20,11 @@ The first releasable runtime is:
   shell networking policy, runtime orchestration, or cleanup implementation;
 - one conventional, fully Rust-owned xtables TPROXY Capture Path.
 
-Native nftables, managed TUN, eBPF, ipset acceleration, and heterogeneous backend planning are not
-requirements for that release. They remain valid future directions, but they must not delay removal
-of the shell runtime, standalone `addrsyncd`, or packaged `jq`.
+Native nftables and managed TUN mutation adapters, eBPF, and ipset acceleration are not requirements
+for that release. Capability-first discovery and deterministic Capture Path selection are safety
+infrastructure, not additional release backends: they preserve ADR-0005's target order while the
+only currently activatable Rust path remains xtables. Additional adapters must not delay removal of
+the shell runtime, standalone `addrsyncd`, or packaged `jq`.
 
 Physical Android authority remains mandatory before production native networking activation. It is
 no longer a global scheduling barrier: host-side runtime composition, configuration, subscription, CLI,
@@ -119,12 +121,15 @@ release or physical Android behavior.
 
 ### Work
 
-- Record xtables TPROXY as the only required first-release Capture Path.
+- Record xtables TPROXY as the only required first-release mutation adapter while retaining
+  ADR-0005's nftables, xtables, TUN, inactive selection order.
 - Freeze the shell bridge as a correctness/rollback oracle. Admit only security, correctness,
   cutover-contract, and rollback fixes.
-- Stop work on nftables, TUN, eBPF, ipset, backend `auto`, established-flow caching, DIVERT,
-  `sk_lookup`, TC/TCX, kernel extensions, and new proof abstractions unless a P0 deliverable is
-  blocked on one exact missing fact.
+- Do not implement or activate nftables/TUN mutation, eBPF/ipset acceleration, established-flow
+  caching, DIVERT, `sk_lookup`, TC/TCX, kernel extensions, or new proof abstractions unless a P0
+  deliverable is blocked on one exact missing fact. Bounded capability discovery and a
+  non-authorizing selector remain in scope because backend probes must not trigger autoload and
+  absent optional mechanisms must not block a viable path.
 - Define a machine-checked Rust-only package profile now, even though it initially fails. Its final
   inventory is `fluxd`, Sing-Box, Rust-owned configuration/assets, and platform glue only.
 - Make the bridge package profile explicitly development-only so a passing bridge verifier cannot
@@ -584,13 +589,14 @@ Items 5-8 continue when items 9-11 are hardware-blocked.
 
 ### P2: After The Rust-Only Release
 
-1. Re-evaluate native nftables against measured xtables limitations; promote only with real device
-   evidence and atomic/readback parity.
-2. Add managed TUN only for a concrete product scope that xtables cannot meet.
+1. Implement the native nftables mutation adapter behind the existing capability selector;
+   promote only with real-device behavioral qualification and atomic/readback parity.
+2. Implement managed TUN behind the same selector only for a concrete product scope that qualified
+   netfilter paths cannot meet.
 3. Add eBPF observation, then acceleration, only when a conventional fallback remains complete and
    benchmarks show material value.
 4. Revisit ipset, established-flow caching, DIVERT, `sk_lookup`, TC/TCX, and heterogeneous Traffic
-   Domain planning independently.
+   Domain planning independently; none may bypass the selector's qualification states.
 5. Consume an already-loaded kernel extension only under a separate ADR and exact read-only
    interface; never make Flux a module loader.
 

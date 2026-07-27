@@ -9,7 +9,7 @@ use flux_core::{
     NetworkInventory, NetworkNamespaceIdentity,
 };
 
-use super::nftables::AndroidNftablesTransportErrorKind;
+use super::nftables::{AndroidNftablesTransportErrorKind, collect_android_nftables_fwmarks};
 use super::{
     AndroidExistingFluxOwnershipObservation, AndroidFwmarkCensusCollectionStage,
     AndroidFwmarkCensusCoordinatorSource, AndroidFwmarkCensusExternalPhase,
@@ -17,12 +17,13 @@ use super::{
     AndroidNftablesFwmarkObservationErrorKind, AndroidTrafficControlBpfFwmarkObservationError,
     AndroidXfrmFwmarkObservationError, AndroidXtablesFwmarkObservation,
     AndroidXtablesFwmarkObservationError, MAX_ANDROID_FWMARK_CENSUS_STAGE_BOUND,
-    collect_android_existing_flux_ownership, collect_android_nftables_fwmarks,
-    collect_android_traffic_control_bpf_fwmarks, collect_android_xfrm_fwmarks,
-    observe_android_xtables_fwmarks,
+    collect_android_existing_flux_ownership, collect_android_traffic_control_bpf_fwmarks,
+    collect_android_xfrm_fwmarks, observe_android_xtables_fwmarks,
 };
 use crate::xtables::collect_android_xtables_save_snapshots;
-use crate::{SystemCapabilityProfileSource, collect_network_inventory_once};
+use crate::{
+    SystemAndroidKernelConfigSource, SystemCapabilityProfileSource, collect_network_inventory_once,
+};
 
 const SYSTEM_XTABLES_TOOL_ROOT: &str = "/system/bin";
 const SYSTEM_FLUX_DURABLE_ROOT: &str = "/data/adb/flux/run";
@@ -34,6 +35,8 @@ pub enum SystemAndroidFwmarkCensusSourceErrorKind {
     InvalidCapabilityStage,
     InvalidBound,
     DeadlineExceeded,
+    KernelConfig,
+    NftablesGate,
     XtablesProcess,
     XtablesObservation,
     NftablesObservation,
@@ -149,6 +152,7 @@ impl Error for SystemAndroidFwmarkCensusSourceError {
 #[derive(Debug, Default)]
 pub struct SystemAndroidFwmarkCensusSource {
     capability_profile: SystemCapabilityProfileSource,
+    kernel_config: SystemAndroidKernelConfigSource,
 }
 
 impl SystemAndroidFwmarkCensusSource {
@@ -185,6 +189,21 @@ impl AndroidFwmarkCensusCoordinatorSource for SystemAndroidFwmarkCensusSource {
         bound: Duration,
     ) -> Result<AndroidFwmarkCensusExternalSnapshot, Self::Error> {
         let deadline = stage_deadline(bound)?;
+        let kernel_config = self.kernel_config.collect().map_err(|source| {
+            SystemAndroidFwmarkCensusSourceError::with_source(
+                SystemAndroidFwmarkCensusSourceErrorKind::KernelConfig,
+                source,
+            )
+        })?;
+        ensure_before(deadline)?;
+        let nftables_gate = kernel_config
+            .nftables_observation_gate()
+            .map_err(|source| {
+                SystemAndroidFwmarkCensusSourceError::with_source(
+                    SystemAndroidFwmarkCensusSourceErrorKind::NftablesGate,
+                    source,
+                )
+            })?;
         let saves = collect_android_xtables_save_snapshots(
             Path::new(SYSTEM_XTABLES_TOOL_ROOT),
             remaining(deadline)?,
@@ -203,7 +222,7 @@ impl AndroidFwmarkCensusCoordinatorSource for SystemAndroidFwmarkCensusSource {
         )
         .map_err(map_xtables_observation)?;
         ensure_before(deadline)?;
-        let nftables = collect_android_nftables_fwmarks(remaining(deadline)?)
+        let nftables = collect_android_nftables_fwmarks(nftables_gate, remaining(deadline)?)
             .map_err(map_nftables_observation)?;
         let traffic_control_bpf = collect_android_traffic_control_bpf_fwmarks(remaining(deadline)?)
             .map_err(map_traffic_control_bpf_observation)?;
@@ -211,6 +230,7 @@ impl AndroidFwmarkCensusCoordinatorSource for SystemAndroidFwmarkCensusSource {
             collect_android_xfrm_fwmarks(remaining(deadline)?).map_err(map_xfrm_observation)?;
         ensure_before(deadline)?;
         Ok(AndroidFwmarkCensusExternalSnapshot::new(
+            kernel_config.digest(),
             xtables,
             nftables,
             traffic_control_bpf,

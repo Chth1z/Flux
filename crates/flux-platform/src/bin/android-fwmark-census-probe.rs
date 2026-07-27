@@ -10,16 +10,18 @@ use flux_core::{
 };
 #[cfg(any(target_os = "android", test))]
 use flux_platform::AndroidFwmarkCensusCoordinatorRequest;
-#[cfg(any(target_os = "android", test))]
-use flux_platform::SystemAndroidNftablesObservationErrorClass;
 #[cfg(target_os = "android")]
 use flux_platform::{
     AndroidFwmarkCensusCoordinatorError, AndroidFwmarkCensusCoordinatorOutcome,
     AndroidFwmarkCensusCoordinatorPurpose, AndroidFwmarkCensusProjection,
     AndroidFwmarkCensusReportPhase, SystemAndroidFwmarkCensusSource,
-    SystemAndroidFwmarkCensusSourceError, SystemAndroidFwmarkCensusSourceErrorKind,
-    coordinate_android_fwmark_census, validate_android_fwmark_census_projection_report,
+    SystemAndroidFwmarkCensusSourceError, coordinate_android_fwmark_census,
+    validate_android_fwmark_census_projection_report,
     write_android_fwmark_census_projection_report,
+};
+#[cfg(any(target_os = "android", test))]
+use flux_platform::{
+    SystemAndroidFwmarkCensusSourceErrorKind, SystemAndroidNftablesObservationErrorClass,
 };
 
 #[cfg(target_os = "android")]
@@ -164,19 +166,29 @@ fn coordinator_error_label(
 #[cfg(target_os = "android")]
 const fn source_error_label(source: &SystemAndroidFwmarkCensusSourceError) -> &'static str {
     match source.kind() {
-        SystemAndroidFwmarkCensusSourceErrorKind::InvalidCapabilityStage => {
-            "invalid-capability-stage"
-        }
-        SystemAndroidFwmarkCensusSourceErrorKind::InvalidBound => "invalid-bound",
-        SystemAndroidFwmarkCensusSourceErrorKind::DeadlineExceeded => "deadline-exceeded",
-        SystemAndroidFwmarkCensusSourceErrorKind::XtablesProcess => "xtables-process",
-        SystemAndroidFwmarkCensusSourceErrorKind::XtablesObservation => "xtables-observation",
         SystemAndroidFwmarkCensusSourceErrorKind::NftablesObservation => {
             match source.nftables_class() {
                 Some(class) => nftables_error_label(class),
                 None => "nftables-observation",
             }
         }
+        kind => direct_source_error_label(kind),
+    }
+}
+
+#[cfg(any(target_os = "android", test))]
+const fn direct_source_error_label(kind: SystemAndroidFwmarkCensusSourceErrorKind) -> &'static str {
+    match kind {
+        SystemAndroidFwmarkCensusSourceErrorKind::InvalidCapabilityStage => {
+            "invalid-capability-stage"
+        }
+        SystemAndroidFwmarkCensusSourceErrorKind::InvalidBound => "invalid-bound",
+        SystemAndroidFwmarkCensusSourceErrorKind::DeadlineExceeded => "deadline-exceeded",
+        SystemAndroidFwmarkCensusSourceErrorKind::KernelConfig => "kernel-config",
+        SystemAndroidFwmarkCensusSourceErrorKind::NftablesGate => "nftables-gate",
+        SystemAndroidFwmarkCensusSourceErrorKind::XtablesProcess => "xtables-process",
+        SystemAndroidFwmarkCensusSourceErrorKind::XtablesObservation => "xtables-observation",
+        SystemAndroidFwmarkCensusSourceErrorKind::NftablesObservation => "nftables-observation",
         SystemAndroidFwmarkCensusSourceErrorKind::TrafficControlBpfObservation => {
             "traffic-control-bpf-observation"
         }
@@ -304,5 +316,17 @@ mod tests {
                     .all(|byte| byte.is_ascii_lowercase() || byte == b'-')
             );
         }
+    }
+
+    #[test]
+    fn kernel_capability_source_labels_are_stable_and_payload_free() {
+        assert_eq!(
+            direct_source_error_label(SystemAndroidFwmarkCensusSourceErrorKind::KernelConfig),
+            "kernel-config"
+        );
+        assert_eq!(
+            direct_source_error_label(SystemAndroidFwmarkCensusSourceErrorKind::NftablesGate),
+            "nftables-gate"
+        );
     }
 }

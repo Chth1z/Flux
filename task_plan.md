@@ -2394,8 +2394,11 @@ rollback, and exact cleanup.
   external-before nftables observation class, and independently re-prove process/path absence.
 - [x] U2.4e: Probe and record the root probe's complete kernel capability ceiling and inherited
   masks plus SELinux/seccomp state without retaining the serial or unrelated process data.
-- [ ] U2.4f: Add and commit one payload-free nftables failure sub-class, rerun the diagnostic to
-  distinguish permission, parser, drift, transport, and limit failure, then independently clean.
+- [x] U2.4f: Add and commit one payload-free nftables failure sub-class, rerun the diagnostic,
+  identify a non-permission transport failure, and independently prove process/path absence.
+- [ ] U2.4g: Preserve the internal read-only-netlink failure kind behind another payload-free
+  classifier, distinguish kernel rejection, syscall, timeout, framing, sender, and short-write
+  failure, then rerun once and independently clean before deciding whether U2.4 can continue.
 
 ### U2 Decisions
 - The native rtnetlink inventory is the sole links/addresses/routes/rules snapshot. External mark
@@ -2700,11 +2703,15 @@ rollback, and exact cleanup.
 - The first U2.4f `git add` could not create `.git/index.lock` under the workspace's read-only Git
   metadata boundary. Retry the same explicit six-path stage operation with repository-scoped
   permission; no file was staged or changed by the failed command.
+- The committed refined probe stopped at
+  `collection-external-before-nftables-transport`. This rules out the classifier's explicit
+  `EPERM`/`EACCES` permission class but still combines kernel rejection, syscall, timeout,
+  short-write, unexpected-sender, and malformed-datagram paths. Mandatory cleanup returned and an
+  independent root proof found zero census paths and processes.
 
 ### Status
-**U2.4 privacy-safe nftables classification is ready to commit** - the quiet rerun stopped at the
-external-before native nftables observation and independently cleaned all generated state. The root
-probe has all 41 kernel capabilities through `CAP_CHECKPOINT_RESTORE`, including `CAP_NET_ADMIN`,
-so missing capability bits are ruled out. The classifier passes 558 `flux-platform` tests, strict
-Clippy, the pinned Android cross-check, rustfmt, and diff hygiene. Commit it, rerun only the
-diagnostic, and stop fail-closed on permission, parser, drift, transport, or limit failure.
+**U2.4 stopped cleanly at a non-permission nftables transport failure** - commit `5ef4074` is clean,
+the quiet diagnostic returned one bounded transport label, mandatory cleanup completed, and a
+separate root check proved zero generated paths and processes. All 41 kernel capabilities are
+present, so the next safe step is one internal-kind classifier; do not proceed to U2.5 policy work
+or weaken census completeness while transport still combines several materially different causes.

@@ -1953,3 +1953,20 @@ It does not yet validate the production Rust composition because that compositio
 - Host verification passes 558 `flux-platform` tests across targets/doc tests with seven intentional
   ignores, warnings-denied all-target/all-feature Clippy, the pinned Android cross-check, rustfmt,
   and diff hygiene. The refined probe has not yet run on the device.
+
+## U2.4 Refined Nftables Transport Result And Cleanup (2026-07-27)
+
+- Commit `5ef4074` adds the payload-free nftables failure classes. Its exact release probe has
+  SHA-256 `ef280e6b6d8ef7810cd6b4d5d73adc39c77dbe6f04d76b55eccff2457841e5ee` and size
+  1,017,776 bytes; the runner revalidated the pinned Android 31 ARM64 and 16 KiB-alignment contract.
+- A read-only preflight resolved one expected SM-S9180 ARM64 target without emitting or retaining
+  its serial and proved zero `/data/local/tmp/flux-census.*` entries and zero `flx-census`
+  processes.
+- The quiet diagnostic stopped before reports at the bounded class
+  `collection-external-before-nftables-transport`. This is not the explicit `EPERM`/`EACCES`
+  permission class, so Linux capability omission and those two permission failures are ruled out.
+  It does not yet distinguish kernel rejection, another syscall failure, timeout, short write,
+  unexpected sender, or malformed response framing.
+- Mandatory runner cleanup returned. An independent root read on the same expected model then
+  proved zero census paths and zero probe processes. No report, policy, networking mutation, module
+  installation, or U2.5 authority step was accepted.

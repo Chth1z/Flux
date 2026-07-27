@@ -2197,3 +2197,89 @@ bounded Q2.3 live read also found an IPv6 full-mask external writer that definit
 eligible candidate. Q2.4 cannot mint positive planning authority, so C3, Gate 1, production writer
 selection, bridge deletion, and package promotion must not run. Preserve `/data/adb/flux` and the
 verified clean stopped baseline unless a separately reviewed policy changes these two boundaries.
+
+## Execution: Custom-Root Behavior Qualification And R4-R6 (2026-07-27)
+
+### Goal
+Complete R4-R6 for the clean rebooted Samsung S23 Ultra by replacing unattainable OEM source
+provenance with an explicit exact-artifact, observed-behavior assurance class, while retaining
+boot/namespace freshness, ordered-write analysis, functional qualification, fenced ownership,
+rollback, and exact cleanup.
+
+### Authorization And Boundaries
+- The user explicitly authorized a less stringent provenance requirement for an official Samsung
+  system running in a heavily customized root environment. This does not waive live behavior,
+  collision, VPN/egress, functional, rollback, or cleanup evidence.
+- `AuthenticatedSource` remains available for locked/reproducible deployments.
+  `ExactArtifactObservedBehavior` is a separately named lower-assurance class; it must never be
+  described as source-authenticated or transferable to another binary, build, boot, or namespace.
+- A vendor full-mask write may be admitted only as a typed ordered late write when its exact hook,
+  chain, selector, and absence of socket/conntrack persistence prove it occurs after Flux's final
+  routing/capture decision. Unknown or earlier overlapping writes still reject.
+- No raw hardware serial, boot ID, network endpoint, credential, application data, or unrelated
+  user state enters tracked evidence.
+- Every device mutation remains confined to generated owner-only test paths or Flux-owned kernel
+  identities and must end in independently verified absence before the next checkpoint.
+
+### Phases
+- [x] U0: Revalidate the clean post-reboot device, repository, security state, old-runtime absence,
+  and generated-test-path absence without mutation.
+- [x] U1: Add the behavior-qualified assurance model, ordered late-write contract, ADR/policy
+  artifact, exact catalog binding, and exhaustive fail-closed tests; commit before device mutation.
+- [ ] U2: Implement and run the coherent 27-cell collector plus one-shot C2 authority on the same
+  fresh boot, with sanitized evidence and cleanup; commit separately.
+- [ ] U3: Implement/run bounded C3 canaries and the no-overlap Gate 1 native writer transition,
+  including failure injection, rollback, restart/recovery, and exact cleanup; commit the writer
+  selection separately.
+- [ ] U4: Complete R5 by deleting the bridge scripts, standalone helpers, legacy CLI/configuration,
+  callers, tests, and bridge package profile; run full host/device regression and commit.
+- [ ] U5: Complete R6 by promoting, staging, verifying, installing, exercising, uninstalling, and
+  cleaning the exact Rust-only package; commit Gate 2 evidence and final profile status.
+
+### Fresh U0 Evidence
+- The repository worktree is clean at `de12787`; no local-only uncommitted file is carried into the
+  revised qualification.
+- The exact physical target reports SM-S9180, ARM64 userspace/kernel, the expected official Samsung
+  Android 16 build, SELinux Enforcing, KernelSU root, orange Verified Boot, and an unlocked state.
+- The reboot changed the boot-bound identity, so no previous C1/C2 authority will be reused.
+- `fluxd`, `addrsyncd`, and Sing-Box are absent. `/data/adb/flux`, the old module directory, its
+  disable marker, and generated `/data/local/tmp/flux-*` directories are absent.
+
+### U1 Evidence
+- Fresh read-only validation reconfirmed all eight stable selector fields. The three artifact
+  hashes/sizes match the prior observation; no raw serial or boot ID was retained.
+- ADR-0015 defines non-convertible `AuthenticatedSource` and
+  `ExactArtifactObservedBehavior` classes. The class is bound through selection, grant, census,
+  authority, and canonical evidence.
+- Reviewed Samsung policy v1 and its compiled SHA-256 select the exact platform but admit no
+  ordered-write exception. This preserves a fail-closed boundary until U2 supplies a coherent exact
+  record set and a reviewed policy revision.
+- The ordered-late-write type rejects wrong source/hook/placement, non-packet operations,
+  socket/conntrack persistence, earlier matching overlap, empty ordinals, invalid chain names, and
+  zero selector digests. Policy/census set drift rejects planning.
+- `cargo test -p flux-core` and warnings-denied all-target/all-feature `flux-core` Clippy pass.
+
+### U1 Errors Encountered
+- The confined root SELinux domain denied direct `sha256sum`/`stat` opens of the loaded SELinux
+  policy and netd. Read-only root `cat` streams into host-side digest and byte counters revalidated
+  both exact artifacts without persistent files or device mutation.
+- A focused negative test exposed two equivalent ordered-write mismatch variants after incremental
+  wiring. Consolidating on one canonical `OrderedLateWriteQualificationMismatch` path removed the
+  duplicate digest/check logic; the full focused suite then passed.
+- Final diff review found that the census assurance accessor assumed every valid census was bound
+  to a positive policy, although a generic zero-grant negative census is also valid. Preserve the
+  identity's `Option` at that accessor and assert the generic case instead of exposing a panic.
+- The two newly created Markdown artifacts inherited executable mode. Normalize them to ordinary
+  `0644` documentation before staging; their byte content and compiled policy digest are unchanged.
+
+### U1 Verification
+- `cargo test -p flux-core`: passed all unit, integration, and documentation tests.
+- `cargo clippy -p flux-core --all-targets --all-features -- -D warnings`: passed.
+- `cargo xtask ci`: exit 0, including source policy, workspace checks/tests/doc-tests,
+  warnings-denied Clippy, and the pinned ARM64/API-31 cross-check.
+- `cargo fmt --all -- --check`, `git diff --check`, and the hardware-serial scan passed.
+
+### Status
+**U2 next** - U1 is implemented and full repository verification passes without device mutation. Build the
+bounded coherent collector, update the reviewed policy only from sanitized exact records, and prove
+one-shot C2 authority before any C3 or writer-transfer mutation.

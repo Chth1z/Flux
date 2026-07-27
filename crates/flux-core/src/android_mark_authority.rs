@@ -22,6 +22,7 @@ use crate::fwmark_audit::{
     update_fwmark_candidate_evidence,
 };
 use crate::network_inventory::{NetworkEpoch, NetworkInventory, NetworkInventorySnapshotId};
+use crate::network_route::NetworkAddressFamily;
 
 /// Device-policy mark bits that are structurally eligible for this checkpoint.
 ///
@@ -42,6 +43,12 @@ pub const ANDROID_MARK_PLANNING_EVIDENCE_DIGEST_BYTES: usize = 32;
 pub const OWNERSHIP_JOURNAL_IDENTITY_BYTES: usize = 32;
 /// Maximum raw mark-use records accepted by one complete point-in-time census.
 pub const MAX_COMPLETE_FWMARK_CENSUS_MARK_USES: usize = 512;
+/// Maximum number of exact ordered-late packet writes retained by one census or policy.
+pub const MAX_ORDERED_LATE_PACKET_WRITES: usize = 128;
+/// Maximum UTF-8 bytes accepted for one observed netfilter child-chain name.
+pub const MAX_FWMARK_NETFILTER_CHAIN_NAME_BYTES: usize = 128;
+/// Exact byte length of a canonical ordered-write selector digest.
+pub const FWMARK_ORDERED_SELECTOR_DIGEST_BYTES: usize = 32;
 
 const ANDROID_MARK_PLANNING_EVIDENCE_DIGEST_DOMAIN: &[u8] =
     b"Flux Android mark planning evidence\0canonical-schema-v1\0sha256-v1\0";
@@ -292,7 +299,7 @@ impl fmt::Display for AndroidMarkDevicePolicyArtifactDigestError {
 
 impl Error for AndroidMarkDevicePolicyArtifactDigestError {}
 
-/// Stable machine-readable identity of one source-reviewed policy-catalog entry.
+/// Stable machine-readable identity of one independently reviewed policy-catalog entry.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ReviewedPolicyCatalogEntryId(Box<str>);
 
@@ -366,10 +373,24 @@ pub enum AndroidMarkDevicePolicyKind {
     DeviceQualifiedCooperative,
 }
 
+/// Assurance supplied by the reviewed artifact behind a positive Android mark policy.
+///
+/// These classes are deliberately not ordered. Exact-artifact behavior evidence must never be
+/// promoted to source authentication by comparison, conversion, or a shared boolean flag.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum AndroidMarkPolicyAssuranceClass {
+    /// A producer-authenticated or exactly reproducible artifact-to-source mapping was reviewed.
+    AuthenticatedSource,
+    /// Exact runtime artifacts and their bounded observed behavior were reviewed without source
+    /// provenance authentication.
+    ExactArtifactObservedBehavior,
+}
+
 /// Stable identity of the exact policy whose evidence was observed.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct AndroidMarkDevicePolicyIdentity {
     kind: AndroidMarkDevicePolicyKind,
+    assurance_class: Option<AndroidMarkPolicyAssuranceClass>,
     catalog_entry: Option<ReviewedPolicyCatalogEntryId>,
     name: Option<AndroidMarkDevicePolicyName>,
     artifact_digest: Option<AndroidMarkDevicePolicyArtifactDigest>,
@@ -379,6 +400,7 @@ impl AndroidMarkDevicePolicyIdentity {
     const fn generic_aosp() -> Self {
         Self {
             kind: AndroidMarkDevicePolicyKind::GenericAospNoGrant,
+            assurance_class: None,
             catalog_entry: None,
             name: None,
             artifact_digest: None,
@@ -386,12 +408,14 @@ impl AndroidMarkDevicePolicyIdentity {
     }
 
     fn device_qualified_cooperative(
+        assurance_class: AndroidMarkPolicyAssuranceClass,
         catalog_entry: ReviewedPolicyCatalogEntryId,
         name: AndroidMarkDevicePolicyName,
         artifact_digest: AndroidMarkDevicePolicyArtifactDigest,
     ) -> Self {
         Self {
             kind: AndroidMarkDevicePolicyKind::DeviceQualifiedCooperative,
+            assurance_class: Some(assurance_class),
             catalog_entry: Some(catalog_entry),
             name: Some(name),
             artifact_digest: Some(artifact_digest),
@@ -401,6 +425,11 @@ impl AndroidMarkDevicePolicyIdentity {
     #[must_use]
     pub const fn kind(&self) -> AndroidMarkDevicePolicyKind {
         self.kind
+    }
+
+    #[must_use]
+    pub const fn assurance_class(&self) -> Option<AndroidMarkPolicyAssuranceClass> {
+        self.assurance_class
     }
 
     #[must_use]
@@ -533,6 +562,7 @@ pub struct AndroidMarkPositiveGrant {
     policy_identity: AndroidMarkDevicePolicyIdentity,
     policy_revision: AndroidMarkDevicePolicyRevision,
     planes: FwmarkPlaneSet,
+    ordered_late_writes: Box<[FwmarkOrderedLateWriteQualification]>,
 }
 
 impl AndroidMarkPositiveGrant {
@@ -580,6 +610,13 @@ impl AndroidMarkPositiveGrant {
     }
 
     #[must_use]
+    pub const fn assurance_class(&self) -> AndroidMarkPolicyAssuranceClass {
+        self.policy_identity
+            .assurance_class
+            .expect("positive Android mark grant retains an assurance class")
+    }
+
+    #[must_use]
     pub const fn policy_revision(&self) -> AndroidMarkDevicePolicyRevision {
         self.policy_revision
     }
@@ -587,6 +624,11 @@ impl AndroidMarkPositiveGrant {
     #[must_use]
     pub const fn planes(&self) -> FwmarkPlaneSet {
         self.planes
+    }
+
+    #[must_use]
+    pub fn ordered_late_writes(&self) -> &[FwmarkOrderedLateWriteQualification] {
+        &self.ordered_late_writes
     }
 }
 
@@ -626,6 +668,7 @@ impl AndroidMarkDevicePolicy {
     /// census evidence.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn device_qualified_cooperative(
+        assurance_class: AndroidMarkPolicyAssuranceClass,
         catalog_entry: ReviewedPolicyCatalogEntryId,
         name: AndroidMarkDevicePolicyName,
         revision: AndroidMarkDevicePolicyRevision,
@@ -636,12 +679,26 @@ impl AndroidMarkDevicePolicy {
         capability_profile: &CapabilityProfile,
         network_namespace: NetworkNamespaceIdentity,
         planes: FwmarkPlaneSet,
+        ordered_late_writes: Box<[FwmarkOrderedLateWriteQualification]>,
     ) -> Result<Self, AndroidMarkDevicePolicyError> {
         ensure_candidate_eligible(candidate)
             .map_err(AndroidMarkDevicePolicyError::IneligibleCandidate)?;
         if planes.is_empty() {
             return Err(AndroidMarkDevicePolicyError::EmptyPlaneGrant);
         }
+        let mut ordered_late_writes = ordered_late_writes.into_vec();
+        ordered_late_writes.sort_unstable();
+        if ordered_late_writes.len() > MAX_ORDERED_LATE_PACKET_WRITES
+            || ordered_late_writes
+                .windows(2)
+                .any(|records| records[0] == records[1])
+            || ordered_late_writes
+                .iter()
+                .any(|record| record.mark_use().mask() & candidate.mask() == 0)
+        {
+            return Err(AndroidMarkDevicePolicyError::InvalidOrderedLateWriteSet);
+        }
+        let ordered_late_writes = ordered_late_writes.into_boxed_slice();
         if topology_scope.profile() != netd_source_profile {
             return Err(AndroidMarkDevicePolicyError::NetdSourceProfileMismatch {
                 selected: netd_source_profile,
@@ -666,6 +723,7 @@ impl AndroidMarkDevicePolicy {
         }
 
         let identity = AndroidMarkDevicePolicyIdentity::device_qualified_cooperative(
+            assurance_class,
             catalog_entry,
             name,
             artifact_digest,
@@ -679,6 +737,7 @@ impl AndroidMarkDevicePolicy {
             policy_identity: identity.clone(),
             policy_revision: revision,
             planes,
+            ordered_late_writes: ordered_late_writes.clone(),
         };
         Ok(Self {
             identity,
@@ -716,6 +775,7 @@ impl AndroidMarkDevicePolicy {
 pub enum AndroidMarkDevicePolicyError {
     IneligibleCandidate(AndroidMarkCandidateEligibilityError),
     EmptyPlaneGrant,
+    InvalidOrderedLateWriteSet,
     NetdSourceProfileMismatch {
         selected: AndroidNetdSourceProfile,
         topology: AndroidNetdSourceProfile,
@@ -739,6 +799,9 @@ impl fmt::Display for AndroidMarkDevicePolicyError {
             Self::EmptyPlaneGrant => {
                 formatter.write_str("device-qualified Android mark policy grants no mark plane")
             }
+            Self::InvalidOrderedLateWriteSet => formatter.write_str(
+                "device-qualified Android mark policy has an invalid ordered-late write set",
+            ),
             Self::NetdSourceProfileMismatch { selected, topology } => write!(
                 formatter,
                 "device-qualified Android mark policy selected netd profile {selected:?} but topology used {topology:?}"
@@ -768,6 +831,7 @@ impl Error for AndroidMarkDevicePolicyError {
         match self {
             Self::IneligibleCandidate(error) => Some(error),
             Self::EmptyPlaneGrant
+            | Self::InvalidOrderedLateWriteSet
             | Self::NetdSourceProfileMismatch { .. }
             | Self::UnverifiedBootIdentity { .. }
             | Self::UnverifiedDeviceIdentity { .. }
@@ -901,6 +965,259 @@ impl fmt::Display for FwmarkUseRecordError {
 
 impl Error for FwmarkUseRecordError {}
 
+/// Exact validated child-chain name retained by an ordered packet-write qualification.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct FwmarkNetfilterChainName(Box<str>);
+
+impl FwmarkNetfilterChainName {
+    pub fn new(value: &str) -> Result<Self, FwmarkNetfilterChainNameError> {
+        if value.is_empty() {
+            return Err(FwmarkNetfilterChainNameError::Empty);
+        }
+        if value.len() > MAX_FWMARK_NETFILTER_CHAIN_NAME_BYTES {
+            return Err(FwmarkNetfilterChainNameError::TooLong {
+                maximum: MAX_FWMARK_NETFILTER_CHAIN_NAME_BYTES,
+                actual: value.len(),
+            });
+        }
+        if !value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':' | b'+')
+        }) {
+            return Err(FwmarkNetfilterChainNameError::InvalidCharacter);
+        }
+        Ok(Self(value.into()))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FwmarkNetfilterChainNameError {
+    Empty,
+    TooLong { maximum: usize, actual: usize },
+    InvalidCharacter,
+}
+
+impl fmt::Display for FwmarkNetfilterChainNameError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => formatter.write_str("netfilter child-chain name is empty"),
+            Self::TooLong { maximum, actual } => write!(
+                formatter,
+                "netfilter child-chain name is {actual} bytes but its limit is {maximum}"
+            ),
+            Self::InvalidCharacter => formatter.write_str(
+                "netfilter child-chain name contains a character outside the canonical ASCII grammar",
+            ),
+        }
+    }
+}
+
+impl Error for FwmarkNetfilterChainNameError {}
+
+/// Nonzero SHA-256 digest of one canonical family/hook/selector rule description.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct FwmarkPacketSelectorDigest([u8; FWMARK_ORDERED_SELECTOR_DIGEST_BYTES]);
+
+impl FwmarkPacketSelectorDigest {
+    pub const fn new(
+        bytes: [u8; FWMARK_ORDERED_SELECTOR_DIGEST_BYTES],
+    ) -> Result<Self, FwmarkPacketSelectorDigestError> {
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] != 0 {
+                return Ok(Self(bytes));
+            }
+            index += 1;
+        }
+        Err(FwmarkPacketSelectorDigestError::AllZero)
+    }
+
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; FWMARK_ORDERED_SELECTOR_DIGEST_BYTES] {
+        &self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FwmarkPacketSelectorDigestError {
+    AllZero,
+}
+
+impl fmt::Display for FwmarkPacketSelectorDigestError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ordered packet selector digest is all zero")
+    }
+}
+
+impl Error for FwmarkPacketSelectorDigestError {}
+
+/// Built-in netfilter hook at which an exact ordered writer was observed.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum FwmarkNetfilterBuiltinHook {
+    Input,
+    Postrouting,
+}
+
+/// Placement relation that makes a packet write a candidate for ordered qualification.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum FwmarkOrderedLateWritePlacement {
+    /// Android's incoming netId write occurs after input route selection.
+    InputAfterRouting,
+    /// A vendor POSTROUTING write occurs after Flux's final route/capture decision.
+    PostroutingAfterFinalFluxUse,
+}
+
+/// Exact structural evidence for one packet MARK write that may be admitted as ordered-late.
+///
+/// The constructor accepts the collector's explicit lifetime and ordering observations and only
+/// returns a record when the write is packet-only, has no earlier matching overlap, and its source,
+/// hook, and placement relation agree. The selector digest covers the complete canonical rule
+/// selectors, including dynamic interface names and MARK value/mask.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct FwmarkOrderedLateWriteQualification {
+    mark_use: FwmarkUseRecord,
+    family: NetworkAddressFamily,
+    hook: FwmarkNetfilterBuiltinHook,
+    child_chain: FwmarkNetfilterChainName,
+    hook_ordinal: NonZeroU32,
+    rule_ordinal: NonZeroU32,
+    selector_digest: FwmarkPacketSelectorDigest,
+    placement: FwmarkOrderedLateWritePlacement,
+}
+
+impl FwmarkOrderedLateWriteQualification {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        mark_use: FwmarkUseRecord,
+        family: NetworkAddressFamily,
+        hook: FwmarkNetfilterBuiltinHook,
+        child_chain: FwmarkNetfilterChainName,
+        hook_ordinal: u32,
+        rule_ordinal: u32,
+        selector_digest: FwmarkPacketSelectorDigest,
+        placement: FwmarkOrderedLateWritePlacement,
+        socket_persistent: bool,
+        conntrack_persistent: bool,
+        earlier_matching_overlap: bool,
+    ) -> Result<Self, FwmarkOrderedLateWriteQualificationError> {
+        if mark_use.plane() != FwmarkPlane::Packet
+            || mark_use.operation() != FwmarkUseOperation::MaskedWrite
+        {
+            return Err(FwmarkOrderedLateWriteQualificationError::NotPacketMaskedWrite);
+        }
+        if socket_persistent || conntrack_persistent {
+            return Err(FwmarkOrderedLateWriteQualificationError::PersistentTransfer);
+        }
+        if earlier_matching_overlap {
+            return Err(FwmarkOrderedLateWriteQualificationError::EarlierMatchingOverlap);
+        }
+        let expected = match placement {
+            FwmarkOrderedLateWritePlacement::InputAfterRouting => (
+                FwmarkEvidenceSource::AndroidNetId,
+                FwmarkNetfilterBuiltinHook::Input,
+            ),
+            FwmarkOrderedLateWritePlacement::PostroutingAfterFinalFluxUse => (
+                FwmarkEvidenceSource::LegacyXtables,
+                FwmarkNetfilterBuiltinHook::Postrouting,
+            ),
+        };
+        if mark_use.source() != expected.0 || hook != expected.1 {
+            return Err(FwmarkOrderedLateWriteQualificationError::SourceHookPlacementMismatch);
+        }
+        let hook_ordinal = NonZeroU32::new(hook_ordinal)
+            .ok_or(FwmarkOrderedLateWriteQualificationError::EmptyHookOrdinal)?;
+        let rule_ordinal = NonZeroU32::new(rule_ordinal)
+            .ok_or(FwmarkOrderedLateWriteQualificationError::EmptyRuleOrdinal)?;
+        Ok(Self {
+            mark_use,
+            family,
+            hook,
+            child_chain,
+            hook_ordinal,
+            rule_ordinal,
+            selector_digest,
+            placement,
+        })
+    }
+
+    #[must_use]
+    pub const fn mark_use(&self) -> FwmarkUseRecord {
+        self.mark_use
+    }
+
+    #[must_use]
+    pub const fn family(&self) -> NetworkAddressFamily {
+        self.family
+    }
+
+    #[must_use]
+    pub const fn hook(&self) -> FwmarkNetfilterBuiltinHook {
+        self.hook
+    }
+
+    #[must_use]
+    pub fn child_chain(&self) -> &FwmarkNetfilterChainName {
+        &self.child_chain
+    }
+
+    #[must_use]
+    pub const fn hook_ordinal(&self) -> u32 {
+        self.hook_ordinal.get()
+    }
+
+    #[must_use]
+    pub const fn rule_ordinal(&self) -> u32 {
+        self.rule_ordinal.get()
+    }
+
+    #[must_use]
+    pub const fn selector_digest(&self) -> FwmarkPacketSelectorDigest {
+        self.selector_digest
+    }
+
+    #[must_use]
+    pub const fn placement(&self) -> FwmarkOrderedLateWritePlacement {
+        self.placement
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FwmarkOrderedLateWriteQualificationError {
+    NotPacketMaskedWrite,
+    PersistentTransfer,
+    EarlierMatchingOverlap,
+    SourceHookPlacementMismatch,
+    EmptyHookOrdinal,
+    EmptyRuleOrdinal,
+}
+
+impl fmt::Display for FwmarkOrderedLateWriteQualificationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::NotPacketMaskedWrite => {
+                "ordered-late qualification requires a packet masked write"
+            }
+            Self::PersistentTransfer => {
+                "ordered-late packet write persists to socket or conntrack state"
+            }
+            Self::EarlierMatchingOverlap => {
+                "an earlier matching packet write overlaps the candidate"
+            }
+            Self::SourceHookPlacementMismatch => {
+                "ordered-late write source, hook, and placement do not agree"
+            }
+            Self::EmptyHookOrdinal => "ordered-late write has an empty hook ordinal",
+            Self::EmptyRuleOrdinal => "ordered-late write has an empty rule ordinal",
+        })
+    }
+}
+
+impl Error for FwmarkOrderedLateWriteQualificationError {}
+
 /// Opaque process-local identity of one consumed point-in-time census observation.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct CompleteFwmarkCensusObservationId(NonZeroU64);
@@ -930,6 +1247,7 @@ pub struct CompleteFwmarkCensus {
     ownership_journal_revision: OwnershipJournalRevision,
     coverage: Box<[FwmarkCensusCoverageRecord]>,
     mark_uses: Box<[FwmarkUseRecord]>,
+    ordered_late_writes: Box<[FwmarkOrderedLateWriteQualification]>,
 }
 
 impl CompleteFwmarkCensus {
@@ -950,6 +1268,7 @@ impl CompleteFwmarkCensus {
         ownership_journal_revision: OwnershipJournalRevision,
         coverage: impl IntoIterator<Item = FwmarkCensusCoverageRecord>,
         mark_uses: impl IntoIterator<Item = FwmarkUseRecord>,
+        ordered_late_writes: impl IntoIterator<Item = FwmarkOrderedLateWriteQualification>,
     ) -> Result<Self, CompleteFwmarkCensusError> {
         if capability_profile.boot_identity().verified().is_none() {
             return Err(CompleteFwmarkCensusError::UnverifiedBootIdentity {
@@ -1021,6 +1340,26 @@ impl CompleteFwmarkCensus {
         canonical_mark_uses.sort_unstable();
         canonical_mark_uses.dedup();
 
+        let mut canonical_ordered_late_writes: Vec<_> = ordered_late_writes.into_iter().collect();
+        if canonical_ordered_late_writes.len() > MAX_ORDERED_LATE_PACKET_WRITES {
+            return Err(CompleteFwmarkCensusError::TooManyOrderedLateWrites {
+                maximum: MAX_ORDERED_LATE_PACKET_WRITES,
+                required_at_least: canonical_ordered_late_writes.len(),
+            });
+        }
+        canonical_ordered_late_writes.sort_unstable();
+        if canonical_ordered_late_writes
+            .windows(2)
+            .any(|records| records[0] == records[1])
+        {
+            return Err(CompleteFwmarkCensusError::DuplicateOrderedLateWrite);
+        }
+        for record in &canonical_ordered_late_writes {
+            if !canonical_mark_uses.contains(&record.mark_use()) {
+                return Err(CompleteFwmarkCensusError::OrderedLateWriteHasNoMarkUse);
+            }
+        }
+
         for coverage in &canonical_coverage {
             let has_mark_use = canonical_mark_uses
                 .iter()
@@ -1065,6 +1404,7 @@ impl CompleteFwmarkCensus {
             ownership_journal_revision,
             coverage: canonical_coverage.into_boxed_slice(),
             mark_uses: canonical_mark_uses.into_boxed_slice(),
+            ordered_late_writes: canonical_ordered_late_writes.into_boxed_slice(),
         })
     }
 
@@ -1112,6 +1452,11 @@ impl CompleteFwmarkCensus {
     }
 
     #[must_use]
+    pub const fn assurance_class(&self) -> Option<AndroidMarkPolicyAssuranceClass> {
+        self.device_policy_identity.assurance_class
+    }
+
+    #[must_use]
     pub const fn device_policy_revision(&self) -> AndroidMarkDevicePolicyRevision {
         self.device_policy_revision
     }
@@ -1139,6 +1484,11 @@ impl CompleteFwmarkCensus {
     #[must_use]
     pub fn mark_uses(&self) -> &[FwmarkUseRecord] {
         &self.mark_uses
+    }
+
+    #[must_use]
+    pub fn ordered_late_writes(&self) -> &[FwmarkOrderedLateWriteQualification] {
+        &self.ordered_late_writes
     }
 }
 
@@ -1175,6 +1525,12 @@ pub enum CompleteFwmarkCensusError {
         maximum: usize,
         required_at_least: usize,
     },
+    TooManyOrderedLateWrites {
+        maximum: usize,
+        required_at_least: usize,
+    },
+    DuplicateOrderedLateWrite,
+    OrderedLateWriteHasNoMarkUse,
     PresentCoverageHasNoMarkUse {
         source: FwmarkEvidenceSource,
         plane: FwmarkPlane,
@@ -1234,6 +1590,19 @@ impl fmt::Display for CompleteFwmarkCensusError {
             } => write!(
                 formatter,
                 "complete fwmark census has at least {required_at_least} mark-use records but its limit is {maximum}"
+            ),
+            Self::TooManyOrderedLateWrites {
+                maximum,
+                required_at_least,
+            } => write!(
+                formatter,
+                "complete fwmark census has at least {required_at_least} ordered-late writes but its limit is {maximum}"
+            ),
+            Self::DuplicateOrderedLateWrite => {
+                formatter.write_str("complete fwmark census repeats an ordered-late write")
+            }
+            Self::OrderedLateWriteHasNoMarkUse => formatter.write_str(
+                "complete fwmark census retains an ordered-late write without its canonical mark-use record",
             ),
             Self::PresentCoverageHasNoMarkUse { source, plane } => write!(
                 formatter,
@@ -1394,6 +1763,13 @@ impl AndroidMarkPlanningAuthority {
     }
 
     #[must_use]
+    pub const fn assurance_class(&self) -> AndroidMarkPolicyAssuranceClass {
+        self.policy_identity
+            .assurance_class
+            .expect("Android mark planning authority retains an assurance class")
+    }
+
+    #[must_use]
     pub const fn policy_revision(&self) -> AndroidMarkDevicePolicyRevision {
         self.policy_revision
     }
@@ -1535,6 +1911,11 @@ fn digest_policy_identity(
         AndroidMarkDevicePolicyKind::GenericAospNoGrant => 0,
         AndroidMarkDevicePolicyKind::DeviceQualifiedCooperative => 1,
     });
+    match identity.assurance_class {
+        Some(AndroidMarkPolicyAssuranceClass::AuthenticatedSource) => digest.tag(1),
+        Some(AndroidMarkPolicyAssuranceClass::ExactArtifactObservedBehavior) => digest.tag(2),
+        None => digest.tag(0),
+    }
     match &identity.catalog_entry {
         Some(entry) => {
             digest.tag(1);
@@ -1582,6 +1963,29 @@ fn digest_complete_census(digest: &mut CanonicalEvidenceDigest, census: &Complet
         digest.tag(fwmark_plane_tag(mark_use.plane));
         digest.tag(fwmark_use_operation_tag(mark_use.operation));
         digest.u32(mark_use.mask.get());
+    }
+    digest.usize(census.ordered_late_writes.len());
+    for record in &census.ordered_late_writes {
+        digest.tag(fwmark_evidence_source_tag(record.mark_use.source));
+        digest.tag(fwmark_plane_tag(record.mark_use.plane));
+        digest.tag(fwmark_use_operation_tag(record.mark_use.operation));
+        digest.u32(record.mark_use.mask.get());
+        digest.tag(match record.family {
+            NetworkAddressFamily::Ipv4 => 0,
+            NetworkAddressFamily::Ipv6 => 1,
+        });
+        digest.tag(match record.hook {
+            FwmarkNetfilterBuiltinHook::Input => 0,
+            FwmarkNetfilterBuiltinHook::Postrouting => 1,
+        });
+        digest.bytes(record.child_chain.as_str().as_bytes());
+        digest.u32(record.hook_ordinal.get());
+        digest.u32(record.rule_ordinal.get());
+        digest.bytes(record.selector_digest.as_bytes());
+        digest.tag(match record.placement {
+            FwmarkOrderedLateWritePlacement::InputAfterRouting => 0,
+            FwmarkOrderedLateWritePlacement::PostroutingAfterFinalFluxUse => 1,
+        });
     }
 }
 
@@ -1728,6 +2132,13 @@ pub fn authorize_android_mark_planning(
         if overlap == 0 {
             continue;
         }
+        if census
+            .ordered_late_writes
+            .iter()
+            .any(|record| record.mark_use() == mark_use)
+        {
+            continue;
+        }
         if let Some(requirement) = ordered_packet_write_requirement(mark_use) {
             ordered_packet_writes.push(FwmarkCensusOrderedPacketWrite {
                 mark_use,
@@ -1742,6 +2153,14 @@ pub fn authorize_android_mark_planning(
         return Err(AndroidMarkPlanningAuthorizationError::CensusConflict {
             conflicts: census_conflicts.into_boxed_slice(),
         });
+    }
+    if grant.ordered_late_writes != census.ordered_late_writes {
+        return Err(
+            AndroidMarkPlanningAuthorizationError::OrderedLateWriteQualificationMismatch {
+                expected: grant.ordered_late_writes.clone(),
+                observed: census.ordered_late_writes.clone(),
+            },
+        );
     }
     if !ordered_packet_writes.is_empty() {
         return Err(
@@ -1998,6 +2417,10 @@ pub enum AndroidMarkPlanningAuthorizationError {
     OrderedPacketWriteQualificationRequired {
         overlaps: Box<[FwmarkCensusOrderedPacketWrite]>,
     },
+    OrderedLateWriteQualificationMismatch {
+        expected: Box<[FwmarkOrderedLateWriteQualification]>,
+        observed: Box<[FwmarkOrderedLateWriteQualification]>,
+    },
     NonFreshCensusObservation {
         previous_observation_id: CompleteFwmarkCensusObservationId,
         replacement_observation_id: CompleteFwmarkCensusObservationId,
@@ -2026,6 +2449,22 @@ impl AndroidMarkPlanningAuthorizationError {
     pub fn ordered_packet_write_overlaps(&self) -> &[FwmarkCensusOrderedPacketWrite] {
         match self {
             Self::OrderedPacketWriteQualificationRequired { overlaps } => overlaps,
+            _ => &[],
+        }
+    }
+
+    #[must_use]
+    pub fn ordered_late_write_expected(&self) -> &[FwmarkOrderedLateWriteQualification] {
+        match self {
+            Self::OrderedLateWriteQualificationMismatch { expected, .. } => expected,
+            _ => &[],
+        }
+    }
+
+    #[must_use]
+    pub fn ordered_late_write_observed(&self) -> &[FwmarkOrderedLateWriteQualification] {
+        match self {
+            Self::OrderedLateWriteQualificationMismatch { observed, .. } => observed,
             _ => &[],
         }
     }
@@ -2162,6 +2601,12 @@ impl fmt::Display for AndroidMarkPlanningAuthorizationError {
                 formatter,
                 "complete fwmark census found {} ordered packet writes requiring device qualification",
                 overlaps.len()
+            ),
+            Self::OrderedLateWriteQualificationMismatch { expected, observed } => write!(
+                formatter,
+                "ordered-late write qualification set differs (expected {}, observed {})",
+                expected.len(),
+                observed.len()
             ),
             Self::NonFreshCensusObservation {
                 previous_observation_id,

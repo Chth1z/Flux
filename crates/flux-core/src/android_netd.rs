@@ -1,8 +1,9 @@
-/// Explicit, source-pinned AOSP netd revision shared by source-specific models.
+/// Explicit, source-pinned AOSP netd semantics shared by Android behavior models.
 ///
-/// Callers must select this profile from independently verified runtime artifact identity. No
-/// source-specific classifier or census fragment infers it from an SDK level, observed rules, or
-/// artifact names.
+/// The profile identifies the source revision whose rule grammar Flux models. Under
+/// `ExactArtifactObservedBehavior`, selecting it asserts reviewed semantic compatibility only; it
+/// does not authenticate the runtime artifact to that source revision. No classifier or census
+/// fragment infers a profile from an SDK level, observed rules, or artifact names.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum AndroidNetdSourceProfile {
     /// AOSP `android-12.0.0_r1`, netd commit `5ca3d903...`.

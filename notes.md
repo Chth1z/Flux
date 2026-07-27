@@ -1618,3 +1618,39 @@ It does not yet validate the production Rust composition because that compositio
   process baseline.
 - R4 must stop before C3/Gate 1. R5 and R6 cannot start because their prerequisite writer transfer
   has no positive C2 authority.
+
+## Clean Reboot And Revised Qualification Contract (2026-07-27)
+
+- The user confirmed the target is an SM-S9180 running the official Samsung system in a customized
+  rooted environment and explicitly accepted a lower source-provenance bar for this deployment.
+- The new boot invalidates all earlier boot-bound evidence. Fresh read-only admission found the
+  expected ARM64 build, KernelSU root, SELinux Enforcing, orange/unlocked Verified Boot, and no old
+  Flux runtime, module root, disable marker, or generated test directory.
+- The revised design will distinguish exact-artifact observed behavior from authenticated source.
+  It will not relabel the former as provenance, and every exact hash/build/behavior mismatch will
+  return zero grant.
+- The IPv6 full-mask vendor writes require a typed late-write proof, not a blanket overlap bypass.
+  Only exact POSTROUTING operations proven to occur after Flux's final routing/capture use and not
+  persist into socket/conntrack state can be admitted.
+
+## U1 Exact-Artifact Policy Model (2026-07-27)
+
+- A fresh read-only selector revalidation matched the same Samsung product/system/vendor builds,
+  `2026-04-05` security patch, kernel build, SELinux policy, netd, and Connectivity identities as
+  the prior observation. SELinux remained Enforcing and Verified Boot remained orange/unlocked.
+- Direct root-domain `sha256sum`/`stat` access to the SELinux policy and netd was denied by the
+  device SELinux policy. Streaming each exact file through root into host-side SHA-256 and byte
+  counters succeeded without creating a host file or changing device state; both identities match.
+- `AndroidMarkPolicyAssuranceClass` keeps `AuthenticatedSource` separate from
+  `ExactArtifactObservedBehavior`. The class survives selection, policy identity, grant, complete
+  census, planning authority, and canonical evidence hashing.
+- The production catalog now contains the exact SM-S9180 selector under observed-behavior
+  assurance. Its `AndroidNetdSourceProfile::AospNetd20250324` value is a reviewed semantic grammar,
+  not a provenance claim. Every nonmatching selector remains generic zero grant.
+- Reviewed policy v1 intentionally admits zero ordered-late writes. The new typed record requires
+  exact family, hook, child chain, hook/rule ordinals, selector digest, packet-only lifetime, no
+  earlier matching overlap, and a source/hook/placement match. Policy and census sets must be
+  identical; missing, extra, changed, duplicated, socket, conntrack, or transferred evidence
+  rejects.
+- Focused `flux-core` tests pass all unit, integration, and documentation targets. Warnings-denied
+  all-feature/all-target `flux-core` Clippy also passes. No device mutation occurred during U1.

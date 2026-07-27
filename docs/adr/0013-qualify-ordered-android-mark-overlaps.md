@@ -62,3 +62,18 @@ authority conversion. A pass establishes only that the target and read-only proc
 it does not authenticate the netd/Connectivity artifact digest to a source profile, prove the Flux
 Capture Path order on that boot, observe listener mark behavior, or pass VPN/netd coexistence and
 mark-preservation canaries.
+
+## 2026-07-27 assurance and ordered-write amendment
+
+ADR-0015 separates source authentication from exact-artifact observed behavior. Under either
+positive assurance class, an ordered overlap can be admitted to planning only when the reviewed
+policy and complete live census retain the identical canonical
+`FwmarkOrderedLateWriteQualification` set. Each record binds the exact family, built-in hook, child
+chain, hook and rule ordinals, and selector digest. Construction rejects non-packet writes,
+socket/conntrack persistence, any earlier matching overlap, and a source/hook/placement mismatch.
+
+This replaces the prior rule that every ordered write must always stop planning. It does not create
+activation authority: listener/observer continuity, mark-preservation, VPN/netd coexistence,
+rollback, restart/recovery, and cleanup canaries remain mandatory. The initial Samsung observed-
+behavior policy admits no ordered record and therefore retains the earlier fail-closed result until
+an exact later policy revision and coherent live census agree.

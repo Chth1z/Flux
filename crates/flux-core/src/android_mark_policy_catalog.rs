@@ -4,8 +4,10 @@ use std::fmt;
 use crate::android_mark_authority::{
     ANDROID_DEVICE_QUALIFIED_CANDIDATE_MASK, AndroidMarkDevicePolicy,
     AndroidMarkDevicePolicyArtifactDigest, AndroidMarkDevicePolicyError,
-    AndroidMarkDevicePolicyName, AndroidMarkDevicePolicyRevision, FwmarkPlaneSet,
-    ReviewedPolicyCatalogEntryId,
+    AndroidMarkDevicePolicyName, AndroidMarkDevicePolicyRevision, AndroidMarkPolicyAssuranceClass,
+    FwmarkNetfilterBuiltinHook, FwmarkNetfilterChainName, FwmarkOrderedLateWritePlacement,
+    FwmarkOrderedLateWriteQualification, FwmarkPacketSelectorDigest, FwmarkPlaneSet,
+    FwmarkUseOperation, FwmarkUseRecord, ReviewedPolicyCatalogEntryId,
 };
 use crate::android_netd::AndroidNetdSourceProfile;
 use crate::android_tproxy_topology::AndroidTproxyTopologyScopeReport;
@@ -15,15 +17,65 @@ use crate::capability::{
     SecurityPatchLevel, SelinuxPolicyIdentity, Sha256Digest, VendorBuildIdentity,
 };
 use crate::fwmark_audit::FwmarkCandidate;
+use crate::fwmark_audit::FwmarkEvidenceSource;
+use crate::network_route::NetworkAddressFamily;
 
-/// Maximum number of source-reviewed entries admitted by the compiled Android policy catalog.
+/// Maximum number of independently reviewed entries admitted by the compiled Android policy catalog.
 pub const MAX_REVIEWED_ANDROID_MARK_POLICY_CATALOG_ENTRIES: usize = 64;
 
-/// The production catalog deliberately starts empty.
-///
-/// A positive entry may be added only after independent physical-device review supplies every
-/// exact selector fact plus the cooperative policy digest, revision, candidate, and plane set.
-const REVIEWED_ANDROID_MARK_POLICY_CATALOG: &[ReviewedAndroidMarkPolicyCatalogEntry] = &[];
+const SAMSUNG_SM_S9180_FZDP_OBSERVED_BEHAVIOR_V1: ReviewedAndroidMarkPolicyCatalogEntry =
+    ReviewedAndroidMarkPolicyCatalogEntry {
+        id: "samsung-sm-s9180-fzdp-observed-behavior-v1",
+        selector: ReviewedPolicySelectorLiteral {
+            android_product: "samsung/dm3qzhx/dm3q",
+            android_build: "samsung/dm3qzhx/dm3q:16/BP4A.251205.006/S9180ZHU7FZDP:user/release-keys",
+            vendor_build: "samsung/dm3qzhx/dm3q:13/TP1A.220624.014/S9180ZHU7FZDP:user/release-keys",
+            security_patch: "2026-04-05",
+            kernel_build: "5.15.207-Qkernel-ga2c4e0b796 #3 SMP PREEMPT Fri May 22 14:03:17 UTC 2026",
+            selinux_policy: ReviewedArtifactLiteral {
+                digest: [
+                    0xd9, 0x0a, 0x3e, 0x32, 0xfc, 0x84, 0x4a, 0x71, 0x4b, 0xf3, 0x7c, 0xea, 0xdc,
+                    0x6e, 0xa5, 0xb7, 0x57, 0x48, 0x62, 0x90, 0x0e, 0x43, 0xf1, 0x41, 0x9e, 0x37,
+                    0xa0, 0x08, 0xdd, 0x63, 0xc0, 0x1f,
+                ],
+                size: 2_825_193,
+            },
+            netd: ReviewedArtifactLiteral {
+                digest: [
+                    0xaa, 0xbe, 0xab, 0x17, 0x6d, 0x29, 0xa2, 0xef, 0x29, 0x9f, 0xdd, 0xa3, 0x18,
+                    0x00, 0x2d, 0xde, 0x25, 0x3e, 0x00, 0xa1, 0xc4, 0x75, 0x06, 0xf3, 0xaf, 0x06,
+                    0x2b, 0x73, 0x11, 0x2d, 0x0a, 0xdd,
+                ],
+                size: 1_033_576,
+            },
+            connectivity: ReviewedArtifactLiteral {
+                digest: [
+                    0xec, 0x4d, 0x66, 0xb2, 0x4a, 0x5d, 0x7b, 0xf2, 0xfe, 0x4f, 0x0a, 0xff, 0x22,
+                    0x04, 0xdd, 0x51, 0xb4, 0x04, 0x97, 0x48, 0x56, 0x9e, 0xe0, 0xc0, 0xbc, 0x85,
+                    0x01, 0x04, 0xbf, 0x0d, 0x75, 0x49,
+                ],
+                size: 36_827_136,
+            },
+        },
+        assurance_class: AndroidMarkPolicyAssuranceClass::ExactArtifactObservedBehavior,
+        policy_name: "Samsung SM-S9180 FZDP observed behavior",
+        policy_revision: 1,
+        policy_artifact_digest: [
+            0xfc, 0x69, 0xfb, 0x25, 0xbd, 0x35, 0x08, 0x57, 0x52, 0x50, 0xb8, 0xcc, 0x8d, 0x52,
+            0xcc, 0x6a, 0xc8, 0xb0, 0x08, 0xe8, 0xf0, 0xf6, 0x26, 0x6f, 0xad, 0x8e, 0xed, 0x36,
+            0xf7, 0x7a, 0xfc, 0x87,
+        ],
+        netd_source_profile: AndroidNetdSourceProfile::AospNetd20250324,
+        candidate_mask: 0x0300_0000,
+        proxy_value: 0x0100_0000,
+        bypass_value: 0x0200_0000,
+        planes: FwmarkPlaneSet::ALL.bits(),
+        ordered_late_writes: &[],
+    };
+
+/// Exact reviewed Android mark policies compiled into production selection.
+const REVIEWED_ANDROID_MARK_POLICY_CATALOG: &[ReviewedAndroidMarkPolicyCatalogEntry] =
+    &[SAMSUNG_SM_S9180_FZDP_OBSERVED_BEHAVIOR_V1];
 
 /// First-stage exact selection against the compiled Android mark-policy catalog.
 ///
@@ -53,6 +105,11 @@ impl ReviewedAndroidMarkPolicySelection {
             .map(|matched| matched.netd_source_profile)
     }
 
+    #[must_use]
+    pub fn assurance_class(&self) -> Option<AndroidMarkPolicyAssuranceClass> {
+        self.matched.as_ref().map(|matched| matched.assurance_class)
+    }
+
     /// Consumes the selection and binds topology classified with the selected netd profile.
     pub fn bind_topology(
         self,
@@ -62,6 +119,7 @@ impl ReviewedAndroidMarkPolicySelection {
             return Ok(AndroidMarkDevicePolicy::generic_aosp());
         };
         AndroidMarkDevicePolicy::device_qualified_cooperative(
+            matched.assurance_class,
             matched.catalog_entry,
             matched.policy_name,
             matched.policy_revision,
@@ -72,6 +130,7 @@ impl ReviewedAndroidMarkPolicySelection {
             &matched.capability_profile,
             matched.network_namespace,
             matched.planes,
+            matched.ordered_late_writes,
         )
         .map_err(ReviewedAndroidMarkPolicyCatalogError::PolicyConstruction)
     }
@@ -79,6 +138,7 @@ impl ReviewedAndroidMarkPolicySelection {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct MatchedReviewedAndroidMarkPolicy {
+    assurance_class: AndroidMarkPolicyAssuranceClass,
     catalog_entry: ReviewedPolicyCatalogEntryId,
     policy_name: AndroidMarkDevicePolicyName,
     policy_revision: AndroidMarkDevicePolicyRevision,
@@ -88,6 +148,7 @@ struct MatchedReviewedAndroidMarkPolicy {
     capability_profile: CapabilityProfile,
     network_namespace: NetworkNamespaceIdentity,
     planes: FwmarkPlaneSet,
+    ordered_late_writes: Box<[FwmarkOrderedLateWriteQualification]>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -106,6 +167,7 @@ pub enum ReviewedAndroidMarkPolicyCatalogField {
     PolicyArtifactDigest,
     Candidate,
     Planes,
+    OrderedLateWrites,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -197,11 +259,10 @@ impl Error for ReviewedAndroidMarkPolicyCatalogError {
     }
 }
 
-/// Selects one exact source-reviewed Android platform profile from the compiled catalog.
+/// Selects one exact reviewed Android platform profile from the compiled catalog.
 ///
-/// The current production catalog is empty, so a verified device receives the explicit generic-
-/// AOSP zero grant. Runtime manifests, WSA observations, and caller-supplied catalog entries are not
-/// accepted by this API.
+/// An unmatched verified device receives the explicit generic-AOSP zero grant. Runtime manifests,
+/// WSA observations, and caller-supplied catalog entries are not accepted by this API.
 ///
 /// External crates cannot bypass the selector through the crate-private positive constructor:
 ///
@@ -258,6 +319,7 @@ fn select_from_catalog(
 
     Ok(ReviewedAndroidMarkPolicySelection {
         matched: Some(MatchedReviewedAndroidMarkPolicy {
+            assurance_class: validated.assurance_class,
             catalog_entry: validated.catalog_entry,
             policy_name: validated.policy_name,
             policy_revision: validated.policy_revision,
@@ -267,6 +329,7 @@ fn select_from_catalog(
             capability_profile: capability_profile.clone(),
             network_namespace,
             planes: validated.planes,
+            ordered_late_writes: validated.ordered_late_writes,
         }),
     })
 }
@@ -330,8 +393,19 @@ fn validate_entry(
     let planes = FwmarkPlaneSet::from_bits(entry.planes)
         .filter(|planes| !planes.is_empty())
         .ok_or_else(|| invalid(ReviewedAndroidMarkPolicyCatalogField::Planes))?;
+    let ordered_late_writes = validate_ordered_late_writes(entry.ordered_late_writes)
+        .map_err(|_| invalid(ReviewedAndroidMarkPolicyCatalogField::OrderedLateWrites))?;
+    if ordered_late_writes
+        .iter()
+        .any(|record| record.mark_use().mask() & candidate.mask() == 0)
+    {
+        return Err(invalid(
+            ReviewedAndroidMarkPolicyCatalogField::OrderedLateWrites,
+        ));
+    }
 
     Ok(ValidatedCatalogEntry {
+        assurance_class: entry.assurance_class,
         catalog_entry,
         selector,
         policy_name,
@@ -340,6 +414,7 @@ fn validate_entry(
         candidate,
         netd_source_profile: entry.netd_source_profile,
         planes,
+        ordered_late_writes,
     })
 }
 
@@ -384,6 +459,7 @@ fn validate_artifact(literal: ReviewedArtifactLiteral) -> Result<ArtifactIdentit
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ValidatedCatalogEntry {
+    assurance_class: AndroidMarkPolicyAssuranceClass,
     catalog_entry: ReviewedPolicyCatalogEntryId,
     selector: ReviewedPolicySelector,
     policy_name: AndroidMarkDevicePolicyName,
@@ -392,6 +468,7 @@ struct ValidatedCatalogEntry {
     candidate: FwmarkCandidate,
     netd_source_profile: AndroidNetdSourceProfile,
     planes: FwmarkPlaneSet,
+    ordered_late_writes: Box<[FwmarkOrderedLateWriteQualification]>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -416,6 +493,7 @@ struct ReviewedPolicySelectorLiteral {
 struct ReviewedAndroidMarkPolicyCatalogEntry {
     id: &'static str,
     selector: ReviewedPolicySelectorLiteral,
+    assurance_class: AndroidMarkPolicyAssuranceClass,
     policy_name: &'static str,
     policy_revision: u64,
     policy_artifact_digest: [u8; 32],
@@ -424,6 +502,62 @@ struct ReviewedAndroidMarkPolicyCatalogEntry {
     proxy_value: u32,
     bypass_value: u32,
     planes: u8,
+    ordered_late_writes: &'static [ReviewedOrderedLateWriteLiteral],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReviewedOrderedLateWriteLiteral {
+    source: FwmarkEvidenceSource,
+    family: NetworkAddressFamily,
+    hook: FwmarkNetfilterBuiltinHook,
+    child_chain: &'static str,
+    hook_ordinal: u32,
+    rule_ordinal: u32,
+    selector_digest: [u8; 32],
+    placement: FwmarkOrderedLateWritePlacement,
+    mask: u32,
+}
+
+fn validate_ordered_late_writes(
+    literals: &[ReviewedOrderedLateWriteLiteral],
+) -> Result<Box<[FwmarkOrderedLateWriteQualification]>, ()> {
+    if literals.len() > crate::android_mark_authority::MAX_ORDERED_LATE_PACKET_WRITES {
+        return Err(());
+    }
+    let mut records = Vec::with_capacity(literals.len());
+    for literal in literals {
+        let operation = FwmarkUseOperation::MaskedWrite;
+        let mark_use = FwmarkUseRecord::new(
+            literal.source,
+            crate::android_mark_authority::FwmarkPlane::Packet,
+            operation,
+            literal.mask,
+        )
+        .map_err(|_| ())?;
+        let chain = FwmarkNetfilterChainName::new(literal.child_chain).map_err(|_| ())?;
+        let selector_digest =
+            FwmarkPacketSelectorDigest::new(literal.selector_digest).map_err(|_| ())?;
+        let record = FwmarkOrderedLateWriteQualification::new(
+            mark_use,
+            literal.family,
+            literal.hook,
+            chain,
+            literal.hook_ordinal,
+            literal.rule_ordinal,
+            selector_digest,
+            literal.placement,
+            false,
+            false,
+            false,
+        )
+        .map_err(|_| ())?;
+        if records.contains(&record) {
+            return Err(());
+        }
+        records.push(record);
+    }
+    records.sort_unstable();
+    Ok(records.into_boxed_slice())
 }
 
 #[cfg(test)]

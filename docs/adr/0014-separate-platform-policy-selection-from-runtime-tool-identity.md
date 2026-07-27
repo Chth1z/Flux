@@ -30,7 +30,9 @@ No runtime file, caller-supplied selector, WSA observation, artifact hash alone,
 may add a catalog entry. A positive entry still requires a checked-in independent review artifact,
 exact platform identities, source or explicitly bounded behavior-compatibility evidence, a
 complete point-in-time census, a collision-free candidate, and the physical coexistence procedure.
-Until those facts pass, the production catalog remains empty and generic AOSP remains zero grant.
+At this decision's original checkpoint the production catalog remained empty. ADR-0015 later
+introduced a separately named exact-artifact observed-behavior class; that class may populate the
+catalog without claiming source authentication. Unmatched generic AOSP remains zero grant.
 
 This decision narrows the tool-key clause in ADR-0006. It does not weaken its full-profile
 freshness binding, census, topology, verified-boot, namespace, or positive-grant requirements.

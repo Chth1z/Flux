@@ -21,6 +21,7 @@ use crate::network_rule::{
     NetworkRuleRecord, RuleAction, RuleFlags, RuleFwMark, RulePrefix, RulePriority, RuleProperties,
     RuleProtocol, RuleTableId,
 };
+use sha2::{Digest, Sha256};
 
 const NET_ID_MASK: u32 = 0x0000_ffff;
 const EXPLICIT_NETWORK: u32 = 0x0001_0000;
@@ -43,6 +44,7 @@ const SELECTOR: ReviewedPolicySelectorLiteral = ReviewedPolicySelectorLiteral {
 const ENTRY: ReviewedAndroidMarkPolicyCatalogEntry = ReviewedAndroidMarkPolicyCatalogEntry {
     id: "google-redfin-tq3a-20230805-v1",
     selector: SELECTOR,
+    assurance_class: AndroidMarkPolicyAssuranceClass::AuthenticatedSource,
     policy_name: "synthetic cooperative policy",
     policy_revision: 1,
     policy_artifact_digest: [0x31; 32],
@@ -51,10 +53,11 @@ const ENTRY: ReviewedAndroidMarkPolicyCatalogEntry = ReviewedAndroidMarkPolicyCa
     proxy_value: PROXY_VALUE,
     bypass_value: BYPASS_VALUE,
     planes: FwmarkPlaneSet::ALL.bits(),
+    ordered_late_writes: &[],
 };
 
 #[test]
-fn empty_production_catalog_returns_explicit_zero_grant() {
+fn unmatched_production_selector_returns_explicit_zero_grant() {
     let namespace = namespace(4, 40);
     let profile = capability_profile(namespace);
     let topology = topology_scope();
@@ -103,6 +106,10 @@ fn exact_entry_selects_positive_policy_and_retains_catalog_provenance() {
         AndroidNetdSourceProfile::AospAndroid13R1
     );
     assert_eq!(grant.planes(), FwmarkPlaneSet::ALL);
+    assert_eq!(
+        grant.assurance_class(),
+        AndroidMarkPolicyAssuranceClass::AuthenticatedSource
+    );
     assert_eq!(grant.capability_profile(), &profile);
     assert_eq!(grant.network_namespace(), namespace);
     assert_eq!(
@@ -112,6 +119,84 @@ fn exact_entry_selects_positive_policy_and_retains_catalog_provenance() {
             .expect("policy artifact")
             .as_bytes(),
         &[0x31; 32]
+    );
+}
+
+#[test]
+fn exact_production_samsung_selector_is_observed_behavior_not_source_authenticated() {
+    let namespace = namespace(20, 234_673);
+    let selector = SAMSUNG_SM_S9180_FZDP_OBSERVED_BEHAVIOR_V1.selector;
+    let profile = capability_profile_for_selector(namespace, 0x71, selector);
+    let selection = select_reviewed_android_mark_policy(&profile, namespace)
+        .expect("exact reviewed Samsung platform selector");
+
+    assert_eq!(
+        selection.assurance_class(),
+        Some(AndroidMarkPolicyAssuranceClass::ExactArtifactObservedBehavior)
+    );
+    assert_eq!(
+        selection
+            .catalog_entry()
+            .map(ReviewedPolicyCatalogEntryId::as_str),
+        Some("samsung-sm-s9180-fzdp-observed-behavior-v1")
+    );
+    assert_eq!(
+        selection.netd_source_profile(),
+        Some(AndroidNetdSourceProfile::AospNetd20250324),
+        "the source-named profile is a semantic grammar under observed-behavior assurance"
+    );
+
+    let policy = selection
+        .bind_topology(&topology_scope_for(
+            AndroidNetdSourceProfile::AospNetd20250324,
+        ))
+        .expect("matching reviewed semantic topology");
+    let grant = policy.positive_grant().expect("exact positive assertion");
+    assert_eq!(
+        grant.assurance_class(),
+        AndroidMarkPolicyAssuranceClass::ExactArtifactObservedBehavior
+    );
+    assert!(grant.ordered_late_writes().is_empty());
+}
+
+#[test]
+fn policy_artifact_digest_is_compiled_from_the_exact_reviewed_document() {
+    let bytes = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../docs/policy/samsung-sm-s9180-fzdp-observed-behavior-v1.md"
+    ));
+    let digest = Sha256::digest(bytes);
+    assert_eq!(
+        digest.as_slice(),
+        SAMSUNG_SM_S9180_FZDP_OBSERVED_BEHAVIOR_V1.policy_artifact_digest
+    );
+}
+
+#[test]
+fn assurance_classes_remain_distinct_for_otherwise_identical_entries() {
+    let namespace = namespace(4, 40);
+    let profile = capability_profile(namespace);
+    let authenticated = select_from_catalog(&[ENTRY], &profile, namespace)
+        .expect("authenticated synthetic policy")
+        .bind_topology(&topology_scope())
+        .expect("matching authenticated topology");
+    let observed_entry = ReviewedAndroidMarkPolicyCatalogEntry {
+        assurance_class: AndroidMarkPolicyAssuranceClass::ExactArtifactObservedBehavior,
+        ..ENTRY
+    };
+    let observed = select_from_catalog(&[observed_entry], &profile, namespace)
+        .expect("observed-behavior synthetic policy")
+        .bind_topology(&topology_scope())
+        .expect("matching observed topology");
+
+    assert_ne!(authenticated.identity(), observed.identity());
+    assert_eq!(
+        authenticated.identity().assurance_class(),
+        Some(AndroidMarkPolicyAssuranceClass::AuthenticatedSource)
+    );
+    assert_eq!(
+        observed.identity().assurance_class(),
+        Some(AndroidMarkPolicyAssuranceClass::ExactArtifactObservedBehavior)
     );
 }
 
@@ -390,6 +475,14 @@ fn capability_profile_with_tool(
     network_namespace: NetworkNamespaceIdentity,
     tool_digest_byte: u8,
 ) -> CapabilityProfile {
+    capability_profile_for_selector(network_namespace, tool_digest_byte, SELECTOR)
+}
+
+fn capability_profile_for_selector(
+    network_namespace: NetworkNamespaceIdentity,
+    tool_digest_byte: u8,
+    selector: ReviewedPolicySelectorLiteral,
+) -> CapabilityProfile {
     CapabilityProfile::new(
         CapabilityProfileRevision::INITIAL,
         Observation::Verified(
@@ -397,19 +490,19 @@ fn capability_profile_with_tool(
         ),
         Observation::Verified(
             DeviceIdentity::new(
-                AndroidProductIdentity::new(SELECTOR.android_product).expect("product"),
-                AndroidBuildIdentity::new(SELECTOR.android_build).expect("Android build"),
-                VendorBuildIdentity::new(SELECTOR.vendor_build).expect("vendor build"),
-                SecurityPatchLevel::new(SELECTOR.security_patch).expect("security patch"),
+                AndroidProductIdentity::new(selector.android_product).expect("product"),
+                AndroidBuildIdentity::new(selector.android_build).expect("Android build"),
+                VendorBuildIdentity::new(selector.vendor_build).expect("vendor build"),
+                SecurityPatchLevel::new(selector.security_patch).expect("security patch"),
                 VerifiedBootIdentity::new(
                     VerifiedBootState::Green,
                     true,
                     Sha256Digest::new([0x11; 32]).expect("vbmeta digest"),
                 ),
-                KernelBuildIdentity::new(SELECTOR.kernel_build).expect("kernel build"),
-                SelinuxPolicyIdentity::from(artifact(0x21, 4_096)),
-                artifact(0x22, 8_192),
-                artifact(0x23, 16_384),
+                KernelBuildIdentity::new(selector.kernel_build).expect("kernel build"),
+                SelinuxPolicyIdentity::from(artifact_from_literal(selector.selinux_policy)),
+                artifact_from_literal(selector.netd),
+                artifact_from_literal(selector.connectivity),
                 [(
                     ToolId::new("fluxd").expect("tool ID"),
                     artifact(tool_digest_byte, 32_768),
@@ -419,11 +512,25 @@ fn capability_profile_with_tool(
             .expect("device identity"),
         ),
         KernelFacts::from_release(Observation::Verified(
-            KernelRelease::new("5.10.198-android13-gki").expect("kernel release"),
+            KernelRelease::new(
+                selector
+                    .kernel_build
+                    .split_once(' ')
+                    .map_or(selector.kernel_build, |(release, _)| release),
+            )
+            .expect("kernel release"),
         )),
         Observation::Verified(SelinuxMode::Enforcing),
         ready_legacy_bridge(),
     )
+}
+
+fn artifact_from_literal(literal: ReviewedArtifactLiteral) -> ArtifactIdentity {
+    ArtifactIdentity::new(
+        Sha256Digest::new(literal.digest).expect("artifact digest"),
+        literal.size,
+    )
+    .expect("nonempty artifact")
 }
 
 fn artifact(byte: u8, size: u64) -> ArtifactIdentity {

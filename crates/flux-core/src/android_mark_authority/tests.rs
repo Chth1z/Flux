@@ -4,28 +4,30 @@ use crate::{
     AndroidMarkDevicePolicyArtifactDigestError, AndroidMarkDevicePolicyError,
     AndroidMarkDevicePolicyKind, AndroidMarkDevicePolicyName, AndroidMarkDevicePolicyNameError,
     AndroidMarkDevicePolicyRevision, AndroidMarkPlanningAuthorizationError,
-    AndroidNetdSourceProfile, AndroidProductIdentity, AndroidRpdbClassificationReport,
-    AndroidTproxyRoutingShape, AndroidTproxyTopologyScopeReport, AndroidTproxyTopologyScopeRequest,
-    AndroidTproxyTrafficDomainRequest, ArtifactIdentity, BootIdentity,
-    COMPLETE_FWMARK_CENSUS_COVERAGE_RECORDS, CapabilityProfile, CapabilityProfileRevision,
-    CompleteFwmarkCensus, CompleteFwmarkCensusError, DeferredAndroidMarkActivationPrerequisite,
-    DeferredAndroidTproxyPrerequisite, DeviceIdentity, FwmarkCandidate,
-    FwmarkCensusCollectorRevision, FwmarkCensusCoverageRecord, FwmarkCensusCoverageState,
-    FwmarkEvidenceSource, FwmarkEvidenceState, FwmarkOrderedPacketWriteRequirement,
-    FwmarkPartialAuditOutcome, FwmarkPlane, FwmarkPlaneSet, FwmarkUseOperation, FwmarkUseRecord,
-    FwmarkUseRecordError, InterfaceHardwareType, InterfaceIndex, InterfaceLinkFlags,
-    InterfaceLinkRecord, InterfaceName, KernelBuildIdentity, KernelFacts, KernelRelease,
-    LegacyAddressSynchronization, LegacyArtifactReadiness, LegacyArtifactResolution,
-    LegacyBridgeFacts, LegacyMutationWriter, LegacyRuleBackend,
-    MAX_ANDROID_MARK_DEVICE_POLICY_NAME_BYTES, MAX_COMPLETE_FWMARK_CENSUS_MARK_USES,
-    NetworkAddressFamily, NetworkInventory, NetworkInventoryTracker, NetworkNamespaceIdentity,
-    NetworkRuleRecord, Observation, OpaqueRuleAttribute, OwnershipJournalIdentity,
-    OwnershipJournalIdentityError, OwnershipJournalRevision, RuleAction, RuleAttributeOpacity,
-    RuleFlags, RuleFwMark, RuleOpaqueAttributeFingerprint, RulePrefix, RulePriority,
-    RuleProperties, RuleProtocol, RuleTableId, SecurityPatchLevel, SelinuxMode,
-    SelinuxPolicyIdentity, Sha256Digest, ToolId, VendorBuildIdentity, VerifiedBootIdentity,
-    VerifiedBootState, assess_android_tproxy_topology_scope, authorize_android_mark_planning,
-    classify_android_rpdb,
+    AndroidMarkPolicyAssuranceClass, AndroidNetdSourceProfile, AndroidProductIdentity,
+    AndroidRpdbClassificationReport, AndroidTproxyRoutingShape, AndroidTproxyTopologyScopeReport,
+    AndroidTproxyTopologyScopeRequest, AndroidTproxyTrafficDomainRequest, ArtifactIdentity,
+    BootIdentity, COMPLETE_FWMARK_CENSUS_COVERAGE_RECORDS, CapabilityProfile,
+    CapabilityProfileRevision, CompleteFwmarkCensus, CompleteFwmarkCensusError,
+    DeferredAndroidMarkActivationPrerequisite, DeferredAndroidTproxyPrerequisite, DeviceIdentity,
+    FwmarkCandidate, FwmarkCensusCollectorRevision, FwmarkCensusCoverageRecord,
+    FwmarkCensusCoverageState, FwmarkEvidenceSource, FwmarkEvidenceState,
+    FwmarkNetfilterBuiltinHook, FwmarkNetfilterChainName, FwmarkOrderedLateWritePlacement,
+    FwmarkOrderedLateWriteQualification, FwmarkOrderedLateWriteQualificationError,
+    FwmarkOrderedPacketWriteRequirement, FwmarkPacketSelectorDigest, FwmarkPartialAuditOutcome,
+    FwmarkPlane, FwmarkPlaneSet, FwmarkUseOperation, FwmarkUseRecord, FwmarkUseRecordError,
+    InterfaceHardwareType, InterfaceIndex, InterfaceLinkFlags, InterfaceLinkRecord, InterfaceName,
+    KernelBuildIdentity, KernelFacts, KernelRelease, LegacyAddressSynchronization,
+    LegacyArtifactReadiness, LegacyArtifactResolution, LegacyBridgeFacts, LegacyMutationWriter,
+    LegacyRuleBackend, MAX_ANDROID_MARK_DEVICE_POLICY_NAME_BYTES,
+    MAX_COMPLETE_FWMARK_CENSUS_MARK_USES, NetworkAddressFamily, NetworkInventory,
+    NetworkInventoryTracker, NetworkNamespaceIdentity, NetworkRuleRecord, Observation,
+    OpaqueRuleAttribute, OwnershipJournalIdentity, OwnershipJournalIdentityError,
+    OwnershipJournalRevision, RuleAction, RuleAttributeOpacity, RuleFlags, RuleFwMark,
+    RuleOpaqueAttributeFingerprint, RulePrefix, RulePriority, RuleProperties, RuleProtocol,
+    RuleTableId, SecurityPatchLevel, SelinuxMode, SelinuxPolicyIdentity, Sha256Digest, ToolId,
+    VendorBuildIdentity, VerifiedBootIdentity, VerifiedBootState,
+    assess_android_tproxy_topology_scope, authorize_android_mark_planning, classify_android_rpdb,
 };
 
 use super::{
@@ -91,6 +93,7 @@ fn generic_aosp_is_always_a_zero_grant() {
         [],
     )
     .expect("generic AOSP can still be the identity bound by a negative census");
+    assert_eq!(census.assurance_class(), None);
     let error = authorize_android_mark_planning(
         &context.inventory,
         &context.classification,
@@ -307,6 +310,139 @@ fn trust_boundary_values_reject_empty_or_unbounded_identities_and_masks() {
         )
         .expect_err("mark-use evidence requires a nonzero mask"),
         FwmarkUseRecordError::EmptyMask
+    );
+    assert!(FwmarkNetfilterChainName::new("").is_err());
+    assert!(FwmarkNetfilterChainName::new("bad chain").is_err());
+    assert!(FwmarkPacketSelectorDigest::new([0; 32]).is_err());
+}
+
+#[test]
+fn ordered_late_write_constructor_rejects_every_unsafe_lifetime_or_placement() {
+    let packet_write = FwmarkUseRecord::new(
+        FwmarkEvidenceSource::LegacyXtables,
+        FwmarkPlane::Packet,
+        FwmarkUseOperation::MaskedWrite,
+        u32::MAX,
+    )
+    .expect("full-mask packet write");
+    let valid = |mark_use, hook, hook_ordinal, rule_ordinal, socket, conntrack, earlier| {
+        FwmarkOrderedLateWriteQualification::new(
+            mark_use,
+            NetworkAddressFamily::Ipv6,
+            hook,
+            FwmarkNetfilterChainName::new("vendor_mangle_POSTROUTING").expect("chain"),
+            hook_ordinal,
+            rule_ordinal,
+            FwmarkPacketSelectorDigest::new([0x41; 32]).expect("selector digest"),
+            FwmarkOrderedLateWritePlacement::PostroutingAfterFinalFluxUse,
+            socket,
+            conntrack,
+            earlier,
+        )
+    };
+
+    assert!(
+        valid(
+            packet_write,
+            FwmarkNetfilterBuiltinHook::Postrouting,
+            4,
+            2,
+            false,
+            false,
+            false
+        )
+        .is_ok()
+    );
+    let predicate = FwmarkUseRecord::new(
+        FwmarkEvidenceSource::LegacyXtables,
+        FwmarkPlane::Packet,
+        FwmarkUseOperation::PredicateRead,
+        u32::MAX,
+    )
+    .expect("predicate");
+    assert_eq!(
+        valid(
+            predicate,
+            FwmarkNetfilterBuiltinHook::Postrouting,
+            4,
+            2,
+            false,
+            false,
+            false
+        ),
+        Err(FwmarkOrderedLateWriteQualificationError::NotPacketMaskedWrite)
+    );
+    assert_eq!(
+        valid(
+            packet_write,
+            FwmarkNetfilterBuiltinHook::Input,
+            4,
+            2,
+            false,
+            false,
+            false
+        ),
+        Err(FwmarkOrderedLateWriteQualificationError::SourceHookPlacementMismatch)
+    );
+    assert_eq!(
+        valid(
+            packet_write,
+            FwmarkNetfilterBuiltinHook::Postrouting,
+            4,
+            2,
+            true,
+            false,
+            false
+        ),
+        Err(FwmarkOrderedLateWriteQualificationError::PersistentTransfer)
+    );
+    assert_eq!(
+        valid(
+            packet_write,
+            FwmarkNetfilterBuiltinHook::Postrouting,
+            4,
+            2,
+            false,
+            true,
+            false
+        ),
+        Err(FwmarkOrderedLateWriteQualificationError::PersistentTransfer)
+    );
+    assert_eq!(
+        valid(
+            packet_write,
+            FwmarkNetfilterBuiltinHook::Postrouting,
+            4,
+            2,
+            false,
+            false,
+            true
+        ),
+        Err(FwmarkOrderedLateWriteQualificationError::EarlierMatchingOverlap)
+    );
+    assert_eq!(
+        valid(
+            packet_write,
+            FwmarkNetfilterBuiltinHook::Postrouting,
+            0,
+            2,
+            false,
+            false,
+            false
+        ),
+        Err(FwmarkOrderedLateWriteQualificationError::EmptyHookOrdinal)
+    );
+    assert_eq!(
+        valid(
+            packet_write,
+            FwmarkNetfilterBuiltinHook::Postrouting,
+            4,
+            0,
+            false,
+            false,
+            false
+        ),
+        Err(FwmarkOrderedLateWriteQualificationError::EmptyRuleOrdinal)
     );
 }
 
@@ -559,6 +695,117 @@ fn every_overlap_fails_closed_while_the_netid_input_writer_requires_ordering_qua
             }
         }
     }
+}
+
+#[test]
+fn exact_ordered_late_write_set_survives_policy_census_and_planning_evidence() {
+    let input = ordered_write(
+        FwmarkEvidenceSource::AndroidNetId,
+        NetworkAddressFamily::Ipv4,
+        FwmarkNetfilterBuiltinHook::Input,
+        "routectrl_mangle_INPUT",
+        3,
+        1,
+        0x7fef_ffff,
+        0x51,
+        FwmarkOrderedLateWritePlacement::InputAfterRouting,
+    );
+    let postrouting = ordered_write(
+        FwmarkEvidenceSource::LegacyXtables,
+        NetworkAddressFamily::Ipv6,
+        FwmarkNetfilterBuiltinHook::Postrouting,
+        "vendor_mangle_POSTROUTING",
+        4,
+        2,
+        u32::MAX,
+        0x52,
+        FwmarkOrderedLateWritePlacement::PostroutingAfterFinalFluxUse,
+    );
+    let expected = vec![postrouting.clone(), input.clone()];
+    let context = TestContext::with_policy(
+        AndroidMarkPolicyAssuranceClass::ExactArtifactObservedBehavior,
+        expected.clone().into_boxed_slice(),
+    );
+    let uses = [input.mark_use(), postrouting.mark_use()];
+    let census = context
+        .census_with_ordered(coverage_for_uses(uses), uses, expected.clone())
+        .expect("exact ordered-late census");
+
+    assert_eq!(
+        census.assurance_class(),
+        Some(AndroidMarkPolicyAssuranceClass::ExactArtifactObservedBehavior)
+    );
+    assert_eq!(
+        census.ordered_late_writes(),
+        [input.clone(), postrouting.clone()]
+    );
+    let authority = context
+        .authorize(census)
+        .expect("identical reviewed and observed late-write sets authorize pure planning");
+    assert_eq!(
+        authority.assurance_class(),
+        AndroidMarkPolicyAssuranceClass::ExactArtifactObservedBehavior
+    );
+    assert_eq!(
+        authority.census().ordered_late_writes(),
+        [input, postrouting]
+    );
+    assert_ne!(authority.evidence_digest().as_bytes(), &[0; 32]);
+}
+
+#[test]
+fn missing_extra_or_changed_ordered_late_write_records_reject() {
+    let expected = ordered_write(
+        FwmarkEvidenceSource::AndroidNetId,
+        NetworkAddressFamily::Ipv4,
+        FwmarkNetfilterBuiltinHook::Input,
+        "routectrl_mangle_INPUT",
+        3,
+        1,
+        0x7fef_ffff,
+        0x61,
+        FwmarkOrderedLateWritePlacement::InputAfterRouting,
+    );
+    let context = TestContext::with_policy(
+        AndroidMarkPolicyAssuranceClass::AuthenticatedSource,
+        vec![expected.clone()].into_boxed_slice(),
+    );
+    let mark_use = expected.mark_use();
+    let missing = context
+        .census(coverage_for_uses([mark_use]), [mark_use])
+        .expect("complete census without ordering evidence");
+    assert!(matches!(
+        context.authorize(missing),
+        Err(AndroidMarkPlanningAuthorizationError::OrderedLateWriteQualificationMismatch { .. })
+    ));
+
+    let changed = ordered_write(
+        FwmarkEvidenceSource::AndroidNetId,
+        NetworkAddressFamily::Ipv4,
+        FwmarkNetfilterBuiltinHook::Input,
+        "routectrl_mangle_INPUT",
+        3,
+        1,
+        0x7fef_ffff,
+        0x62,
+        FwmarkOrderedLateWritePlacement::InputAfterRouting,
+    );
+    let changed_census = context
+        .census_with_ordered(coverage_for_uses([mark_use]), [mark_use], [changed])
+        .expect("structurally valid but policy-mismatched ordering evidence");
+    assert!(matches!(
+        context.authorize(changed_census),
+        Err(AndroidMarkPlanningAuthorizationError::OrderedLateWriteQualificationMismatch { .. })
+    ));
+
+    let no_exception = TestContext::standard();
+    let extra = no_exception
+        .census_with_ordered(coverage_for_uses([mark_use]), [mark_use], [expected])
+        .expect("structurally valid unreviewed ordering evidence");
+    assert!(matches!(
+        no_exception.authorize(extra),
+        Err(AndroidMarkPlanningAuthorizationError::OrderedLateWriteQualificationMismatch { .. })
+    ));
 }
 
 #[test]
@@ -1700,6 +1947,16 @@ struct TestContext {
 
 impl TestContext {
     fn standard() -> Self {
+        Self::with_policy(
+            AndroidMarkPolicyAssuranceClass::AuthenticatedSource,
+            Box::new([]),
+        )
+    }
+
+    fn with_policy(
+        assurance_class: AndroidMarkPolicyAssuranceClass,
+        ordered_late_writes: Box<[FwmarkOrderedLateWriteQualification]>,
+    ) -> Self {
         let fixture = profile_fixture(false);
         let inventory = make_inventory(fixture.links, fixture.rules);
         let classification =
@@ -1713,7 +1970,8 @@ impl TestContext {
             network_namespace,
         );
         let candidate = candidate();
-        let policy = cooperative_policy(
+        let policy = cooperative_policy_with_assurance(
+            assurance_class,
             "synthetic-cooperative-policy",
             [0x21; 32],
             AndroidMarkDevicePolicyRevision::INITIAL,
@@ -1722,6 +1980,7 @@ impl TestContext {
             &capability_profile,
             network_namespace,
             FwmarkPlaneSet::ALL,
+            ordered_late_writes,
         )
         .expect("valid synthetic cooperative policy");
         Self {
@@ -1743,7 +2002,16 @@ impl TestContext {
         coverage: impl IntoIterator<Item = FwmarkCensusCoverageRecord>,
         mark_uses: impl IntoIterator<Item = FwmarkUseRecord>,
     ) -> Result<CompleteFwmarkCensus, CompleteFwmarkCensusError> {
-        census_with(
+        self.census_with_ordered(coverage, mark_uses, [])
+    }
+
+    fn census_with_ordered(
+        &self,
+        coverage: impl IntoIterator<Item = FwmarkCensusCoverageRecord>,
+        mark_uses: impl IntoIterator<Item = FwmarkUseRecord>,
+        ordered_late_writes: impl IntoIterator<Item = FwmarkOrderedLateWriteQualification>,
+    ) -> Result<CompleteFwmarkCensus, CompleteFwmarkCensusError> {
+        census_with_ordered(
             &self.inventory,
             &self.capability_profile,
             self.network_namespace,
@@ -1753,6 +2021,7 @@ impl TestContext {
             self.ownership_journal_revision,
             coverage,
             mark_uses,
+            ordered_late_writes,
         )
     }
 
@@ -1782,6 +2051,41 @@ fn candidate() -> FwmarkCandidate {
 }
 
 #[allow(clippy::too_many_arguments)]
+fn ordered_write(
+    source: FwmarkEvidenceSource,
+    family: NetworkAddressFamily,
+    hook: FwmarkNetfilterBuiltinHook,
+    chain: &str,
+    hook_ordinal: u32,
+    rule_ordinal: u32,
+    mask: u32,
+    selector_digest_byte: u8,
+    placement: FwmarkOrderedLateWritePlacement,
+) -> FwmarkOrderedLateWriteQualification {
+    FwmarkOrderedLateWriteQualification::new(
+        FwmarkUseRecord::new(
+            source,
+            FwmarkPlane::Packet,
+            FwmarkUseOperation::MaskedWrite,
+            mask,
+        )
+        .expect("ordered write mask"),
+        family,
+        hook,
+        FwmarkNetfilterChainName::new(chain).expect("ordered write chain"),
+        hook_ordinal,
+        rule_ordinal,
+        FwmarkPacketSelectorDigest::new([selector_digest_byte; 32])
+            .expect("ordered selector digest"),
+        placement,
+        false,
+        false,
+        false,
+    )
+    .expect("safe ordered-late write fixture")
+}
+
+#[allow(clippy::too_many_arguments)]
 fn cooperative_policy(
     name: &str,
     digest: [u8; 32],
@@ -1806,6 +2110,36 @@ fn cooperative_policy(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn cooperative_policy_with_assurance(
+    assurance_class: AndroidMarkPolicyAssuranceClass,
+    name: &str,
+    digest: [u8; 32],
+    revision: AndroidMarkDevicePolicyRevision,
+    candidate: FwmarkCandidate,
+    topology_scope: &AndroidTproxyTopologyScopeReport,
+    capability_profile: &CapabilityProfile,
+    network_namespace: NetworkNamespaceIdentity,
+    planes: FwmarkPlaneSet,
+    ordered_late_writes: Box<[FwmarkOrderedLateWriteQualification]>,
+) -> Result<AndroidMarkDevicePolicy, AndroidMarkDevicePolicyError> {
+    AndroidMarkDevicePolicy::device_qualified_cooperative(
+        assurance_class,
+        ReviewedPolicyCatalogEntryId::new("synthetic-redfin-policy-v1")
+            .expect("valid test catalog entry ID"),
+        AndroidMarkDevicePolicyName::new(name).expect("valid test policy name"),
+        revision,
+        AndroidMarkDevicePolicyArtifactDigest::new(digest).expect("nonzero artifact digest"),
+        candidate,
+        AndroidNetdSourceProfile::AospAndroid13R1,
+        topology_scope,
+        capability_profile,
+        network_namespace,
+        planes,
+        ordered_late_writes,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn cooperative_policy_with_catalog_entry(
     catalog_entry: &str,
     name: &str,
@@ -1818,6 +2152,7 @@ fn cooperative_policy_with_catalog_entry(
     planes: FwmarkPlaneSet,
 ) -> Result<AndroidMarkDevicePolicy, AndroidMarkDevicePolicyError> {
     AndroidMarkDevicePolicy::device_qualified_cooperative(
+        AndroidMarkPolicyAssuranceClass::AuthenticatedSource,
         ReviewedPolicyCatalogEntryId::new(catalog_entry).expect("valid test catalog entry ID"),
         AndroidMarkDevicePolicyName::new(name).expect("valid test policy name"),
         revision,
@@ -1828,6 +2163,7 @@ fn cooperative_policy_with_catalog_entry(
         capability_profile,
         network_namespace,
         planes,
+        Box::new([]),
     )
 }
 
@@ -1843,6 +2179,33 @@ fn census_with(
     coverage: impl IntoIterator<Item = FwmarkCensusCoverageRecord>,
     mark_uses: impl IntoIterator<Item = FwmarkUseRecord>,
 ) -> Result<CompleteFwmarkCensus, CompleteFwmarkCensusError> {
+    census_with_ordered(
+        inventory,
+        capability_profile,
+        network_namespace,
+        policy,
+        collector_revision,
+        ownership_journal_identity,
+        ownership_journal_revision,
+        coverage,
+        mark_uses,
+        [],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn census_with_ordered(
+    inventory: &NetworkInventory,
+    capability_profile: &CapabilityProfile,
+    network_namespace: NetworkNamespaceIdentity,
+    policy: &AndroidMarkDevicePolicy,
+    collector_revision: FwmarkCensusCollectorRevision,
+    ownership_journal_identity: OwnershipJournalIdentity,
+    ownership_journal_revision: OwnershipJournalRevision,
+    coverage: impl IntoIterator<Item = FwmarkCensusCoverageRecord>,
+    mark_uses: impl IntoIterator<Item = FwmarkUseRecord>,
+    ordered_late_writes: impl IntoIterator<Item = FwmarkOrderedLateWriteQualification>,
+) -> Result<CompleteFwmarkCensus, CompleteFwmarkCensusError> {
     CompleteFwmarkCensus::from_complete_observation(
         inventory,
         capability_profile,
@@ -1854,6 +2217,7 @@ fn census_with(
         ownership_journal_revision,
         coverage,
         mark_uses,
+        ordered_late_writes,
     )
 }
 

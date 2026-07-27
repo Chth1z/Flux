@@ -71,3 +71,8 @@
 - [ADR-0012: qualify local OUTPUT through loopback-reinjected PREROUTING TPROXY](adr/0012-qualify-local-output-through-loopback-tproxy.md)
 - [ADR-0013: qualify ordered Android mark overlaps without granting authority](adr/0013-qualify-ordered-android-mark-overlaps.md)
 - [ADR-0014: separate platform policy selection from runtime tool identity](adr/0014-separate-platform-policy-selection-from-runtime-tool-identity.md)
+- [ADR-0015: separate Android policy assurance classes](adr/0015-separate-android-policy-assurance-classes.md)
+
+## Reviewed policies
+
+- [Samsung SM-S9180 FZDP observed-behavior mark policy v1](policy/samsung-sm-s9180-fzdp-observed-behavior-v1.md)

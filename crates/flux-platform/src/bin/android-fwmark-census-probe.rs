@@ -21,7 +21,7 @@ use flux_platform::{
 };
 #[cfg(any(target_os = "android", test))]
 use flux_platform::{
-    SystemAndroidFwmarkCensusSourceErrorKind, SystemAndroidKernelConfigErrorKind,
+    SystemAndroidFwmarkCensusSourceErrorKind, SystemAndroidKernelConfigErrorClass,
     SystemAndroidNftablesObservationErrorClass,
 };
 
@@ -168,8 +168,8 @@ fn coordinator_error_label(
 const fn source_error_label(source: &SystemAndroidFwmarkCensusSourceError) -> &'static str {
     match source.kind() {
         SystemAndroidFwmarkCensusSourceErrorKind::KernelConfig => {
-            match source.kernel_config_kind() {
-                Some(kind) => kernel_config_error_label(kind),
+            match source.kernel_config_class() {
+                Some(class) => kernel_config_error_label(class),
                 None => "kernel-config",
             }
         }
@@ -208,13 +208,25 @@ const fn direct_source_error_label(kind: SystemAndroidFwmarkCensusSourceErrorKin
 }
 
 #[cfg(any(target_os = "android", test))]
-const fn kernel_config_error_label(kind: SystemAndroidKernelConfigErrorKind) -> &'static str {
-    match kind {
-        SystemAndroidKernelConfigErrorKind::Absent => "kernel-config-absent",
-        SystemAndroidKernelConfigErrorKind::Denied => "kernel-config-denied",
-        SystemAndroidKernelConfigErrorKind::Malformed => "kernel-config-malformed",
-        SystemAndroidKernelConfigErrorKind::LimitExceeded => "kernel-config-limit-exceeded",
-        SystemAndroidKernelConfigErrorKind::Unavailable => "kernel-config-unavailable",
+const fn kernel_config_error_label(class: SystemAndroidKernelConfigErrorClass) -> &'static str {
+    match class {
+        SystemAndroidKernelConfigErrorClass::Absent => "kernel-config-absent",
+        SystemAndroidKernelConfigErrorClass::Denied => "kernel-config-denied",
+        SystemAndroidKernelConfigErrorClass::PathType => "kernel-config-path-type",
+        SystemAndroidKernelConfigErrorClass::NoFollowOpen => "kernel-config-no-follow-open",
+        SystemAndroidKernelConfigErrorClass::GzipDecoding => "kernel-config-gzip-decoding",
+        SystemAndroidKernelConfigErrorClass::ParserEmpty => "kernel-config-parser-empty",
+        SystemAndroidKernelConfigErrorClass::ParserMissingFinalLineFeed => {
+            "kernel-config-missing-final-lf"
+        }
+        SystemAndroidKernelConfigErrorClass::ParserNonAscii => "kernel-config-non-ascii",
+        SystemAndroidKernelConfigErrorClass::ParserInvalidLine => "kernel-config-invalid-line",
+        SystemAndroidKernelConfigErrorClass::ParserInvalidSymbol => "kernel-config-invalid-symbol",
+        SystemAndroidKernelConfigErrorClass::ParserDuplicateOption => {
+            "kernel-config-duplicate-option"
+        }
+        SystemAndroidKernelConfigErrorClass::LimitExceeded => "kernel-config-limit-exceeded",
+        SystemAndroidKernelConfigErrorClass::Unavailable => "kernel-config-unavailable",
     }
 }
 
@@ -346,29 +358,61 @@ mod tests {
             direct_source_error_label(SystemAndroidFwmarkCensusSourceErrorKind::NftablesGate),
             "nftables-gate"
         );
-        for (kind, expected) in [
+        for (class, expected) in [
             (
-                SystemAndroidKernelConfigErrorKind::Absent,
+                SystemAndroidKernelConfigErrorClass::Absent,
                 "kernel-config-absent",
             ),
             (
-                SystemAndroidKernelConfigErrorKind::Denied,
+                SystemAndroidKernelConfigErrorClass::Denied,
                 "kernel-config-denied",
             ),
             (
-                SystemAndroidKernelConfigErrorKind::Malformed,
-                "kernel-config-malformed",
+                SystemAndroidKernelConfigErrorClass::PathType,
+                "kernel-config-path-type",
             ),
             (
-                SystemAndroidKernelConfigErrorKind::LimitExceeded,
+                SystemAndroidKernelConfigErrorClass::NoFollowOpen,
+                "kernel-config-no-follow-open",
+            ),
+            (
+                SystemAndroidKernelConfigErrorClass::GzipDecoding,
+                "kernel-config-gzip-decoding",
+            ),
+            (
+                SystemAndroidKernelConfigErrorClass::ParserEmpty,
+                "kernel-config-parser-empty",
+            ),
+            (
+                SystemAndroidKernelConfigErrorClass::ParserMissingFinalLineFeed,
+                "kernel-config-missing-final-lf",
+            ),
+            (
+                SystemAndroidKernelConfigErrorClass::ParserNonAscii,
+                "kernel-config-non-ascii",
+            ),
+            (
+                SystemAndroidKernelConfigErrorClass::ParserInvalidLine,
+                "kernel-config-invalid-line",
+            ),
+            (
+                SystemAndroidKernelConfigErrorClass::ParserInvalidSymbol,
+                "kernel-config-invalid-symbol",
+            ),
+            (
+                SystemAndroidKernelConfigErrorClass::ParserDuplicateOption,
+                "kernel-config-duplicate-option",
+            ),
+            (
+                SystemAndroidKernelConfigErrorClass::LimitExceeded,
                 "kernel-config-limit-exceeded",
             ),
             (
-                SystemAndroidKernelConfigErrorKind::Unavailable,
+                SystemAndroidKernelConfigErrorClass::Unavailable,
                 "kernel-config-unavailable",
             ),
         ] {
-            let label = kernel_config_error_label(kind);
+            let label = kernel_config_error_label(class);
             assert_eq!(label, expected);
             assert!(label.len() <= 32);
             assert!(

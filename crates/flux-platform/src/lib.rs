@@ -74,8 +74,8 @@ pub use android_kernel_capabilities::{
 };
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use android_kernel_capabilities::{
-    SystemAndroidKernelConfigError, SystemAndroidKernelConfigErrorKind,
-    SystemAndroidKernelConfigSource,
+    SystemAndroidKernelConfigError, SystemAndroidKernelConfigErrorClass,
+    SystemAndroidKernelConfigErrorKind, SystemAndroidKernelConfigSource,
 };
 pub use capability::{CapabilityProfilePaths, SystemCapabilityProfileSource};
 pub use file_observer::{FileObservationBatch, FileObservationError, FileObservationPaths};

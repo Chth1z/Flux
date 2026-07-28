@@ -22,8 +22,9 @@ use super::{
 };
 use crate::xtables::collect_android_xtables_save_snapshots;
 use crate::{
-    SystemAndroidKernelConfigError, SystemAndroidKernelConfigErrorKind,
-    SystemAndroidKernelConfigSource, SystemCapabilityProfileSource, collect_network_inventory_once,
+    SystemAndroidKernelConfigError, SystemAndroidKernelConfigErrorClass,
+    SystemAndroidKernelConfigErrorKind, SystemAndroidKernelConfigSource,
+    SystemCapabilityProfileSource, collect_network_inventory_once,
 };
 
 const SYSTEM_XTABLES_TOOL_ROOT: &str = "/system/bin";
@@ -77,7 +78,7 @@ pub enum SystemAndroidNftablesObservationErrorClass {
 /// the standard error chain for trusted local diagnostics and is never copied into census reports.
 pub struct SystemAndroidFwmarkCensusSourceError {
     kind: SystemAndroidFwmarkCensusSourceErrorKind,
-    kernel_config_kind: Option<SystemAndroidKernelConfigErrorKind>,
+    kernel_config_class: Option<SystemAndroidKernelConfigErrorClass>,
     nftables_class: Option<SystemAndroidNftablesObservationErrorClass>,
     source: Option<Box<dyn Error + 'static>>,
 }
@@ -95,13 +96,21 @@ impl SystemAndroidFwmarkCensusSourceError {
 
     #[must_use]
     pub const fn kernel_config_kind(&self) -> Option<SystemAndroidKernelConfigErrorKind> {
-        self.kernel_config_kind
+        match self.kernel_config_class {
+            Some(class) => Some(class.kind()),
+            None => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn kernel_config_class(&self) -> Option<SystemAndroidKernelConfigErrorClass> {
+        self.kernel_config_class
     }
 
     const fn new(kind: SystemAndroidFwmarkCensusSourceErrorKind) -> Self {
         Self {
             kind,
-            kernel_config_kind: None,
+            kernel_config_class: None,
             nftables_class: None,
             source: None,
         }
@@ -113,7 +122,7 @@ impl SystemAndroidFwmarkCensusSourceError {
     ) -> Self {
         Self {
             kind,
-            kernel_config_kind: None,
+            kernel_config_class: None,
             nftables_class: None,
             source: Some(Box::new(source)),
         }
@@ -122,7 +131,7 @@ impl SystemAndroidFwmarkCensusSourceError {
     fn with_kernel_config_source(source: SystemAndroidKernelConfigError) -> Self {
         Self {
             kind: SystemAndroidFwmarkCensusSourceErrorKind::KernelConfig,
-            kernel_config_kind: Some(source.kind()),
+            kernel_config_class: Some(source.class()),
             nftables_class: None,
             source: Some(Box::new(source)),
         }
@@ -131,7 +140,7 @@ impl SystemAndroidFwmarkCensusSourceError {
     fn with_nftables_source(source: AndroidNftablesFwmarkObservationError) -> Self {
         Self {
             kind: SystemAndroidFwmarkCensusSourceErrorKind::NftablesObservation,
-            kernel_config_kind: None,
+            kernel_config_class: None,
             nftables_class: Some(classify_nftables_observation_error(
                 source.kind(),
                 source.transport_kind(),

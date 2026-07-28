@@ -854,7 +854,7 @@ impl SystemAndroidKernelConfigSource {
                     + 1,
             )
             .read_to_end(&mut decompressed)
-            .map_err(SystemAndroidKernelConfigError::malformed)?;
+            .map_err(SystemAndroidKernelConfigError::gzip_decoding)?;
         if decompressed.len() > MAX_ANDROID_KERNEL_CONFIG_DECOMPRESSED_BYTES {
             return Err(SystemAndroidKernelConfigError::limit_exceeded());
         }
@@ -870,6 +870,7 @@ fn read_bounded_regular_file(
     let metadata = fs::symlink_metadata(path).map_err(SystemAndroidKernelConfigError::from_io)?;
     if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
         return Err(SystemAndroidKernelConfigError::malformed_message(
+            SystemAndroidKernelConfigErrorClass::PathType,
             "kernel config source is not a direct regular file",
         ));
     }
@@ -882,6 +883,7 @@ fn read_bounded_regular_file(
         .is_file()
     {
         return Err(SystemAndroidKernelConfigError::malformed_message(
+            SystemAndroidKernelConfigErrorClass::PathType,
             "opened kernel config source is not a regular file",
         ));
     }
@@ -916,9 +918,49 @@ pub enum SystemAndroidKernelConfigErrorKind {
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SystemAndroidKernelConfigErrorClass {
+    Absent,
+    Denied,
+    PathType,
+    NoFollowOpen,
+    GzipDecoding,
+    ParserEmpty,
+    ParserMissingFinalLineFeed,
+    ParserNonAscii,
+    ParserInvalidLine,
+    ParserInvalidSymbol,
+    ParserDuplicateOption,
+    LimitExceeded,
+    Unavailable,
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+impl SystemAndroidKernelConfigErrorClass {
+    #[must_use]
+    pub const fn kind(self) -> SystemAndroidKernelConfigErrorKind {
+        match self {
+            Self::Absent => SystemAndroidKernelConfigErrorKind::Absent,
+            Self::Denied => SystemAndroidKernelConfigErrorKind::Denied,
+            Self::PathType
+            | Self::NoFollowOpen
+            | Self::GzipDecoding
+            | Self::ParserEmpty
+            | Self::ParserMissingFinalLineFeed
+            | Self::ParserNonAscii
+            | Self::ParserInvalidLine
+            | Self::ParserInvalidSymbol
+            | Self::ParserDuplicateOption => SystemAndroidKernelConfigErrorKind::Malformed,
+            Self::LimitExceeded => SystemAndroidKernelConfigErrorKind::LimitExceeded,
+            Self::Unavailable => SystemAndroidKernelConfigErrorKind::Unavailable,
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[derive(Debug)]
 pub struct SystemAndroidKernelConfigError {
-    kind: SystemAndroidKernelConfigErrorKind,
+    class: SystemAndroidKernelConfigErrorClass,
     source: Option<Box<dyn Error + Send + Sync>>,
 }
 
@@ -926,54 +968,89 @@ pub struct SystemAndroidKernelConfigError {
 impl SystemAndroidKernelConfigError {
     #[must_use]
     pub const fn kind(&self) -> SystemAndroidKernelConfigErrorKind {
-        self.kind
+        self.class.kind()
+    }
+
+    #[must_use]
+    pub const fn class(&self) -> SystemAndroidKernelConfigErrorClass {
+        self.class
     }
 
     fn from_io(source: std::io::Error) -> Self {
-        let kind = match source.kind() {
-            std::io::ErrorKind::NotFound => SystemAndroidKernelConfigErrorKind::Absent,
-            std::io::ErrorKind::PermissionDenied => SystemAndroidKernelConfigErrorKind::Denied,
-            _ => SystemAndroidKernelConfigErrorKind::Unavailable,
+        let class = match source.kind() {
+            std::io::ErrorKind::NotFound => SystemAndroidKernelConfigErrorClass::Absent,
+            std::io::ErrorKind::PermissionDenied => SystemAndroidKernelConfigErrorClass::Denied,
+            _ => SystemAndroidKernelConfigErrorClass::Unavailable,
         };
         Self {
-            kind,
+            class,
             source: Some(Box::new(source)),
         }
     }
 
     fn from_open_io(source: std::io::Error) -> Self {
         if source.raw_os_error() == Some(libc::ELOOP) {
-            return Self::malformed(source);
+            return Self::malformed(SystemAndroidKernelConfigErrorClass::NoFollowOpen, source);
         }
         Self::from_io(source)
     }
 
-    fn malformed(source: impl Error + Send + Sync + 'static) -> Self {
+    fn gzip_decoding(source: impl Error + Send + Sync + 'static) -> Self {
+        Self::malformed(SystemAndroidKernelConfigErrorClass::GzipDecoding, source)
+    }
+
+    fn malformed(
+        class: SystemAndroidKernelConfigErrorClass,
+        source: impl Error + Send + Sync + 'static,
+    ) -> Self {
         Self {
-            kind: SystemAndroidKernelConfigErrorKind::Malformed,
+            class,
             source: Some(Box::new(source)),
         }
     }
 
-    fn malformed_message(message: &'static str) -> Self {
-        Self::malformed(StaticKernelConfigError(message))
+    fn malformed_message(
+        class: SystemAndroidKernelConfigErrorClass,
+        message: &'static str,
+    ) -> Self {
+        Self::malformed(class, StaticKernelConfigError(message))
     }
 
     const fn limit_exceeded() -> Self {
         Self {
-            kind: SystemAndroidKernelConfigErrorKind::LimitExceeded,
+            class: SystemAndroidKernelConfigErrorClass::LimitExceeded,
             source: None,
         }
     }
 
     fn parse(source: AndroidKernelConfigParseError) -> Self {
-        if source.kind() == AndroidKernelConfigParseErrorKind::LimitExceeded {
-            return Self {
-                kind: SystemAndroidKernelConfigErrorKind::LimitExceeded,
-                source: Some(Box::new(source)),
-            };
+        let class = match source.kind() {
+            AndroidKernelConfigParseErrorKind::Empty => {
+                SystemAndroidKernelConfigErrorClass::ParserEmpty
+            }
+            AndroidKernelConfigParseErrorKind::LimitExceeded => {
+                SystemAndroidKernelConfigErrorClass::LimitExceeded
+            }
+            AndroidKernelConfigParseErrorKind::MissingFinalLineFeed => {
+                SystemAndroidKernelConfigErrorClass::ParserMissingFinalLineFeed
+            }
+            AndroidKernelConfigParseErrorKind::NonAscii => {
+                SystemAndroidKernelConfigErrorClass::ParserNonAscii
+            }
+            AndroidKernelConfigParseErrorKind::InvalidLine => {
+                SystemAndroidKernelConfigErrorClass::ParserInvalidLine
+            }
+            AndroidKernelConfigParseErrorKind::InvalidSymbol => {
+                SystemAndroidKernelConfigErrorClass::ParserInvalidSymbol
+            }
+            AndroidKernelConfigParseErrorKind::DuplicateOption => {
+                SystemAndroidKernelConfigErrorClass::ParserDuplicateOption
+            }
+        };
+        Self {
+            class,
+            source: Some(Box::new(source)),
         }
-        Self::malformed(source)
     }
 }
 
@@ -983,7 +1060,7 @@ impl fmt::Display for SystemAndroidKernelConfigError {
         write!(
             formatter,
             "system Android kernel config collection failed: {:?}",
-            self.kind
+            self.kind()
         )
     }
 }
@@ -1123,6 +1200,53 @@ mod tests {
                 .unwrap_err()
                 .kind(),
             AndroidKernelConfigParseErrorKind::LimitExceeded
+        );
+    }
+
+    #[test]
+    fn system_error_refines_every_parser_and_no_follow_class() {
+        for (bytes, expected) in [
+            (
+                b"".as_slice(),
+                SystemAndroidKernelConfigErrorClass::ParserEmpty,
+            ),
+            (
+                b"CONFIG_A=y".as_slice(),
+                SystemAndroidKernelConfigErrorClass::ParserMissingFinalLineFeed,
+            ),
+            (
+                b"CONFIG_A=\xff\n".as_slice(),
+                SystemAndroidKernelConfigErrorClass::ParserNonAscii,
+            ),
+            (
+                b"not-a-config-line\n".as_slice(),
+                SystemAndroidKernelConfigErrorClass::ParserInvalidLine,
+            ),
+            (
+                b"CONFIG_bad=y\n".as_slice(),
+                SystemAndroidKernelConfigErrorClass::ParserInvalidSymbol,
+            ),
+            (
+                b"CONFIG_A=y\nCONFIG_A=m\n".as_slice(),
+                SystemAndroidKernelConfigErrorClass::ParserDuplicateOption,
+            ),
+        ] {
+            let parse_error = parse_android_kernel_config(bytes).unwrap_err();
+            let error = SystemAndroidKernelConfigError::parse(parse_error);
+            assert_eq!(error.class(), expected);
+            assert_eq!(error.kind(), SystemAndroidKernelConfigErrorKind::Malformed);
+        }
+
+        let no_follow = SystemAndroidKernelConfigError::from_open_io(
+            std::io::Error::from_raw_os_error(libc::ELOOP),
+        );
+        assert_eq!(
+            no_follow.class(),
+            SystemAndroidKernelConfigErrorClass::NoFollowOpen
+        );
+        assert_eq!(
+            no_follow.kind(),
+            SystemAndroidKernelConfigErrorKind::Malformed
         );
     }
 
@@ -1363,8 +1487,8 @@ mod tests {
             SystemAndroidKernelConfigSource::for_path(link_path)
                 .collect()
                 .unwrap_err()
-                .kind(),
-            SystemAndroidKernelConfigErrorKind::Malformed
+                .class(),
+            SystemAndroidKernelConfigErrorClass::PathType
         );
     }
 
@@ -1377,8 +1501,8 @@ mod tests {
             SystemAndroidKernelConfigSource::for_path(invalid)
                 .collect()
                 .unwrap_err()
-                .kind(),
-            SystemAndroidKernelConfigErrorKind::Malformed
+                .class(),
+            SystemAndroidKernelConfigErrorClass::GzipDecoding
         );
 
         let oversized = directory.path().join("oversized.gz");
@@ -1394,8 +1518,8 @@ mod tests {
             SystemAndroidKernelConfigSource::for_path(oversized)
                 .collect()
                 .unwrap_err()
-                .kind(),
-            SystemAndroidKernelConfigErrorKind::LimitExceeded
+                .class(),
+            SystemAndroidKernelConfigErrorClass::LimitExceeded
         );
     }
 }

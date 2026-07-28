@@ -9,8 +9,9 @@ use flux_core::{
     CapabilityProfileDigest, CapabilityProfileRevision, CompleteFwmarkCensus,
     CompleteFwmarkCensusError, FwmarkCandidate, FwmarkCensusCollectorEvidenceDigest,
     FwmarkCensusCollectorRevision, NetworkInventory, NetworkNamespaceIdentity, ObservationKind,
-    ReviewedAndroidMarkPolicyCatalogError, RpdbFwmarkCensusFragmentError,
-    assess_android_tproxy_topology_scope, authorize_android_mark_planning, classify_android_rpdb,
+    ReviewedAndroidMarkPolicyCatalogError, ReviewedPolicyCatalogEntryId,
+    RpdbFwmarkCensusFragmentError, assess_android_tproxy_topology_scope,
+    authorize_android_mark_planning, classify_android_rpdb,
     project_android_net_id_fwmark_census_fragment, project_rpdb_fwmark_census_fragment,
     select_reviewed_android_mark_policy,
 };
@@ -239,6 +240,7 @@ pub trait AndroidFwmarkCensusCoordinatorSource {
         phase: AndroidFwmarkCensusExternalPhase,
         netd_source_profile: AndroidNetdSourceProfile,
         candidate: FwmarkCandidate,
+        reviewed_policy: Option<&ReviewedPolicyCatalogEntryId>,
         bound: Duration,
     ) -> Result<AndroidFwmarkCensusExternalSnapshot, Self::Error>;
 
@@ -467,6 +469,7 @@ pub fn coordinate_android_fwmark_census<S: AndroidFwmarkCensusCoordinatorSource>
             AndroidFwmarkCensusExternalPhase::Before,
             request.netd_source_profile,
             request.candidate,
+            policy_selection.catalog_entry(),
             request.stage_bound,
         )
         .map_err(|source| AndroidFwmarkCensusCoordinatorError::Collection {
@@ -501,6 +504,7 @@ pub fn coordinate_android_fwmark_census<S: AndroidFwmarkCensusCoordinatorSource>
             AndroidFwmarkCensusExternalPhase::After,
             request.netd_source_profile,
             request.candidate,
+            policy_selection.catalog_entry(),
             request.stage_bound,
         )
         .map_err(|source| AndroidFwmarkCensusCoordinatorError::Collection {

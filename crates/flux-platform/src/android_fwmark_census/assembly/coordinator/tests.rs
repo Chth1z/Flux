@@ -304,6 +304,7 @@ impl AndroidFwmarkCensusCoordinatorSource for FakeSource {
         phase: AndroidFwmarkCensusExternalPhase,
         netd_source_profile: AndroidNetdSourceProfile,
         _candidate: FwmarkCandidate,
+        reviewed_policy: Option<&ReviewedPolicyCatalogEntryId>,
         bound: Duration,
     ) -> Result<AndroidFwmarkCensusExternalSnapshot, Self::Error> {
         let stage = phase.collection_stage();
@@ -314,6 +315,10 @@ impl AndroidFwmarkCensusCoordinatorSource for FakeSource {
             AndroidFwmarkCensusExternalPhase::After => &self.external_after,
         };
         assert_eq!(snapshot.xtables.netd_source_profile(), netd_source_profile);
+        assert_eq!(
+            reviewed_policy.map(ReviewedPolicyCatalogEntryId::as_str),
+            Some("samsung-sm-s9180-fzdp-observed-behavior-v1")
+        );
         Ok(snapshot.clone())
     }
 

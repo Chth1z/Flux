@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use flux_core::{
     FwmarkCensusCoverageRecord, FwmarkCensusCoverageState, FwmarkEvidenceSource, FwmarkPlane,
-    FwmarkUseRecord,
+    FwmarkUseRecord, ReviewedPolicyCatalogEntryId,
 };
 use sha2::{Digest, Sha256};
 
@@ -18,19 +18,26 @@ use super::read_only_netlink::{
 use crate::netlink::NetlinkAttributeIter;
 
 const BPF_SNAPSHOT_DIGEST_DOMAIN: &[u8] =
-    b"Flux loaded BPF fwmark census\0canonical-schema-v1\0sha256-v1\0";
+    b"Flux loaded BPF fwmark census\0canonical-schema-v2\0sha256-v1\0";
 const BPF_PROGRAM_DIGEST_DOMAIN: &[u8] =
     b"Flux exact xlated BPF program\0canonical-schema-v1\0sha256-v1\0";
+const BPF_LINK_IDENTITY_DIGEST_DOMAIN: &[u8] =
+    b"Flux BPF link identity\0canonical-schema-v1\0sha256-v1\0";
+const BPF_REVIEW_PROFILE_DIGEST_DOMAIN: &[u8] =
+    b"Flux reviewed BPF no-fwmark profile\0canonical-schema-v1\0sha256-v1\0";
 const TC_FILTER_IDENTITY_DIGEST_DOMAIN: &[u8] =
     b"Flux TC filter identity\0canonical-schema-v1\0sha256-v1\0";
 const BPF_INSTRUCTION_BYTES: usize = 8;
 const MAX_BPF_PROGRAMS: usize = 65_536;
+const MAX_BPF_LINKS: usize = 65_536;
 const MAX_BPF_PROGRAM_BYTES: usize = 1024 * 1024;
 const MAX_BPF_TOTAL_BYTES: usize = 16 * 1024 * 1024;
 
 const BPF_PROG_GET_NEXT_ID: u32 = 11;
 const BPF_PROG_GET_FD_BY_ID: u32 = 13;
 const BPF_OBJ_GET_INFO_BY_FD: u32 = 15;
+const BPF_LINK_GET_FD_BY_ID: u32 = 30;
+const BPF_LINK_GET_NEXT_ID: u32 = 31;
 
 const BPF_PROG_TYPE_SOCKET_FILTER: u32 = 1;
 const BPF_PROG_TYPE_KPROBE: u32 = 2;
@@ -64,6 +71,160 @@ const BPF_PROG_TYPE_LSM: u32 = 29;
 const BPF_PROG_TYPE_SK_LOOKUP: u32 = 30;
 const BPF_PROG_TYPE_SYSCALL: u32 = 31;
 const BPF_PROG_TYPE_NETFILTER: u32 = 32;
+
+const BPF_LINK_TYPE_RAW_TRACEPOINT: u32 = 1;
+const BPF_LINK_TYPE_TRACING: u32 = 2;
+const BPF_LINK_TYPE_CGROUP: u32 = 3;
+const BPF_LINK_TYPE_ITER: u32 = 4;
+const BPF_LINK_TYPE_NETNS: u32 = 5;
+const BPF_LINK_TYPE_XDP: u32 = 6;
+const BPF_LINK_TYPE_PERF_EVENT: u32 = 7;
+const BPF_LINK_TYPE_KPROBE_MULTI: u32 = 8;
+const BPF_LINK_TYPE_STRUCT_OPS: u32 = 9;
+const BPF_LINK_TYPE_NETFILTER: u32 = 10;
+const BPF_LINK_TYPE_TCX: u32 = 11;
+const BPF_LINK_TYPE_UPROBE_MULTI: u32 = 12;
+const BPF_LINK_TYPE_NETKIT: u32 = 13;
+const BPF_LINK_TYPE_SOCKMAP: u32 = 14;
+
+const SAMSUNG_SM_S9180_FZDP_POLICY_V1: &str = "samsung-sm-s9180-fzdp-observed-behavior-v1";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReviewedNoFwmarkProgram {
+    program_type: u32,
+    tag: [u8; 8],
+    raw_xlated_sha256: [u8; 32],
+}
+
+const SAMSUNG_SM_S9180_FZDP_NO_FWMARK_PROGRAMS_V1: &[ReviewedNoFwmarkProgram] = &[
+    reviewed_no_fwmark_program(
+        BPF_PROG_TYPE_CGROUP_SKB,
+        "40e069329ba49e7d",
+        "c8ef87e2d8d861b637b2cb53f8eefdfdec40fcec75a023350634d1898b416aa9",
+    ),
+    reviewed_no_fwmark_program(
+        BPF_PROG_TYPE_CGROUP_SKB,
+        "e0779ea72e69433a",
+        "06d8122f41450bc130f1e5fad149d55fd3f6df917d2ec6219956295a5f292e53",
+    ),
+    reviewed_no_fwmark_program(
+        BPF_PROG_TYPE_CGROUP_SOCK,
+        "cea87e3ec965b36a",
+        "26e1be56d4c24d3dde7e8f6b60e991385886359d41b45fc83cca9936b1e1a9a1",
+    ),
+    reviewed_no_fwmark_program(
+        BPF_PROG_TYPE_CGROUP_SOCK,
+        "f29419b678cbdebf",
+        "e383a1ac1f056a8d43e867a21b80b7b1cb669ec3ceaf4bd7ad7239f77dc0c5b8",
+    ),
+    reviewed_no_fwmark_program(
+        BPF_PROG_TYPE_CGROUP_SOCK_ADDR,
+        "11d3e712279be333",
+        "2aecaddd37222eddfe32166323916562ca83c9dab8dcc438f64a50c72dada970",
+    ),
+    reviewed_no_fwmark_program(
+        BPF_PROG_TYPE_CGROUP_SOCK_ADDR,
+        "57cd311f2e27366b",
+        "b11459a0e11ca14cbaa33cc108ffff8ff07ba54b6c389514b3c122ab54b34551",
+    ),
+    reviewed_no_fwmark_program(
+        BPF_PROG_TYPE_CGROUP_SOCKOPT,
+        "08d88dc82eb557d3",
+        "f4d484d3b95a1f215548bd2f7a9b39c6f1f81d65acb0d082313cbeafd67bd660",
+    ),
+    reviewed_no_fwmark_program(
+        BPF_PROG_TYPE_CGROUP_SOCKOPT,
+        "6710908637052bf9",
+        "4ca61c8d16cfe14cd073008e0c6d0881893504b01251b9a1cb4b0cf22b0f9942",
+    ),
+    reviewed_no_fwmark_program(
+        BPF_PROG_TYPE_SOCKET_FILTER,
+        "31644e2c3ced33bd",
+        "58c935eec53f4faf59837d7761ceb6da1959c412b6c2660491f89c35cb2964dd",
+    ),
+    reviewed_no_fwmark_program(
+        BPF_PROG_TYPE_SOCKET_FILTER,
+        "48d358c1b05b407f",
+        "ab2f33fbb6efcc9c45e7b9e269e92c7bb4676de1de59b19e4b0ea345c75ca198",
+    ),
+    reviewed_no_fwmark_program(
+        BPF_PROG_TYPE_SOCKET_FILTER,
+        "5b66a4f866f45c5f",
+        "6f75333462ac1dc2b5c3990164d55aa58647fd5fb18e5d2a165524908bb0cfba",
+    ),
+    reviewed_no_fwmark_program(
+        BPF_PROG_TYPE_SOCKET_FILTER,
+        "80d88f4843641ecd",
+        "52b3cfd923720b566711210a8d9a884c9b848ffbef0e50068b676583990f67f8",
+    ),
+    reviewed_no_fwmark_program(
+        BPF_PROG_TYPE_SOCKET_FILTER,
+        "9951c9549a5ee17a",
+        "3e32a087abe42cf1ef90cb4e3103a6568c99c0c71894ee775a1d57c6f9e9bda2",
+    ),
+    reviewed_no_fwmark_program(
+        BPF_PROG_TYPE_SOCKET_FILTER,
+        "a949fa08ab16ff6c",
+        "2d9d7aa5ba85a6c0ee3f70f34e8b3ec4dbdeed22747bc79e5b084a4d76809b27",
+    ),
+    reviewed_no_fwmark_program(
+        BPF_PROG_TYPE_SOCKET_FILTER,
+        "ac07339589cf4481",
+        "cabd30c765774b56930eacc080695b95929c304d17ae2ddef81cf060d633ffd0",
+    ),
+    reviewed_no_fwmark_program(
+        BPF_PROG_TYPE_SOCKET_FILTER,
+        "be318b3c229f7498",
+        "57d076cf5f956aa5b19c4ec5a844de6dd867aa362a3afecbcc33142f1a029f45",
+    ),
+    reviewed_no_fwmark_program(
+        BPF_PROG_TYPE_SOCKET_FILTER,
+        "e991db169b5517fd",
+        "d351fbfdda1aadc45ed91843d5478116c62f5d81fbfe98e1ca2790c2c9a14fab",
+    ),
+    reviewed_no_fwmark_program(
+        BPF_PROG_TYPE_SOCKET_FILTER,
+        "f20113889914f45a",
+        "4ea5cc8b5a342e3fd80086251034da296110dfeb0e6c234e2ebcc180e36d6c2c",
+    ),
+    reviewed_no_fwmark_program(
+        BPF_PROG_TYPE_SOCKET_FILTER,
+        "f996e37eaee10540",
+        "c97d9312b287b518e9c411f3758a43ec652e36a1b17cb8ccdd02802f5fdead25",
+    ),
+];
+
+const fn reviewed_no_fwmark_program(
+    program_type: u32,
+    tag: &str,
+    raw_xlated_sha256: &str,
+) -> ReviewedNoFwmarkProgram {
+    ReviewedNoFwmarkProgram {
+        program_type,
+        tag: decode_hex::<8>(tag.as_bytes()),
+        raw_xlated_sha256: decode_hex::<32>(raw_xlated_sha256.as_bytes()),
+    }
+}
+
+const fn decode_hex<const N: usize>(hex: &[u8]) -> [u8; N] {
+    assert!(hex.len() == N * 2);
+    let mut decoded = [0_u8; N];
+    let mut index = 0_usize;
+    while index < N {
+        decoded[index] =
+            (decode_hex_nibble(hex[index * 2]) << 4) | decode_hex_nibble(hex[index * 2 + 1]);
+        index += 1;
+    }
+    decoded
+}
+
+const fn decode_hex_nibble(byte: u8) -> u8 {
+    match byte {
+        b'0'..=b'9' => byte - b'0',
+        b'a'..=b'f' => byte - b'a' + 10,
+        _ => panic!("invalid lowercase hexadecimal byte"),
+    }
+}
 
 const RTM_NEWTFILTER: u16 = 44;
 const RTM_GETTFILTER: u16 = 46;
@@ -162,6 +323,7 @@ pub enum AndroidTrafficControlBpfFwmarkObservationErrorKind {
     SystemCall,
     SnapshotDrift,
     InvalidTrafficControlInfo,
+    InvalidLinkInfo,
     InvalidProgramInfo,
     LimitExceeded,
 }
@@ -252,12 +414,22 @@ impl AndroidTrafficControlBpfFwmarkObservationError {
 /// names or filesystem pins. A subscribed TC filter dump separately prevents classic BPF and
 /// non-BPF classifiers/actions from creating false absence. Loaded but detached programs can cause
 /// conservative false positives. The kernel exports verifier-rewritten, not original, instructions;
-/// relevant programs therefore remain opaque until a reviewed exact-artifact interpretation exists.
-/// Identical TC identities and program-ID passes around exact instruction retrieval reject relevant
-/// endpoint drift.
+/// a reviewed policy entry can admit only exact type, tag, and translated-byte fingerprints whose
+/// device-bound lower-assurance review found no fwmark access. BPF link IDs and program IDs are
+/// bracketed while their descriptors remain open; unknown links, unknown artifacts, inaccessible
+/// programs, and any snapshot drift stay opaque or fail closed.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn collect_android_traffic_control_bpf_fwmarks(
     bound: Duration,
+) -> Result<AndroidTrafficControlBpfFwmarkObservation, AndroidTrafficControlBpfFwmarkObservationError>
+{
+    collect_android_traffic_control_bpf_fwmarks_for_reviewed_policy(bound, None)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(super) fn collect_android_traffic_control_bpf_fwmarks_for_reviewed_policy(
+    bound: Duration,
+    reviewed_policy: Option<&ReviewedPolicyCatalogEntryId>,
 ) -> Result<AndroidTrafficControlBpfFwmarkObservation, AndroidTrafficControlBpfFwmarkObservationError>
 {
     validate_bound(bound).map_err(|_| {
@@ -271,6 +443,16 @@ pub fn collect_android_traffic_control_bpf_fwmarks(
         )
     })?;
     let traffic_control_before = implementation::collect_traffic_control_filters(deadline)?;
+    let link_ids_before = implementation::enumerate_link_ids(deadline)?;
+    let mut links = Vec::with_capacity(link_ids_before.len());
+    let mut link_fds = Vec::with_capacity(link_ids_before.len());
+    for id in &link_ids_before {
+        let (link, link_fd) = implementation::read_link(*id, deadline)?;
+        links.push(link);
+        if let Some(link_fd) = link_fd {
+            link_fds.push((links.len() - 1, link_fd));
+        }
+    }
     let program_ids_before = implementation::enumerate_program_ids(deadline)?;
     let mut programs = Vec::with_capacity(program_ids_before.len());
     let mut program_fds = Vec::with_capacity(program_ids_before.len());
@@ -289,16 +471,33 @@ pub fn collect_android_traffic_control_bpf_fwmarks(
         }
     }
     let program_ids_after = implementation::enumerate_program_ids(deadline)?;
+    let link_ids_after = implementation::enumerate_link_ids(deadline)?;
     let traffic_control_after = implementation::collect_traffic_control_filters(deadline)?;
-    if program_ids_before != program_ids_after || traffic_control_before != traffic_control_after {
+    if program_ids_before != program_ids_after
+        || link_ids_before != link_ids_after
+        || traffic_control_before != traffic_control_after
+    {
         return Err(AndroidTrafficControlBpfFwmarkObservationError::new(
             AndroidTrafficControlBpfFwmarkObservationErrorKind::SnapshotDrift,
         ));
     }
+    for (index, link_fd) in &link_fds {
+        if implementation::reread_link(link_fd, deadline)? != links[*index] {
+            return Err(AndroidTrafficControlBpfFwmarkObservationError::new(
+                AndroidTrafficControlBpfFwmarkObservationErrorKind::SnapshotDrift,
+            ));
+        }
+    }
     implementation::ensure_before(deadline)?;
-    let observation = observe_programs(&programs, &traffic_control_before)?;
+    let observation = observe_programs(
+        &programs,
+        &traffic_control_before,
+        &links,
+        reviewed_policy.map(ReviewedPolicyCatalogEntryId::as_str),
+    )?;
     implementation::ensure_before(deadline)?;
     drop(program_fds);
+    drop(link_fds);
     Ok(observation)
 }
 
@@ -372,6 +571,31 @@ fn observe_traffic_control_messages(
     })
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LinkSnapshot {
+    id: u32,
+    link_type: Option<u32>,
+    program_id: Option<u32>,
+}
+
+impl LinkSnapshot {
+    const fn inaccessible(id: u32) -> Self {
+        Self {
+            id,
+            link_type: None,
+            program_id: None,
+        }
+    }
+
+    const fn exact(id: u32, link_type: u32, program_id: u32) -> Self {
+        Self {
+            id,
+            link_type: Some(link_type),
+            program_id: Some(program_id),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ProgramSnapshot {
     id: u32,
@@ -407,16 +631,63 @@ impl ProgramSnapshot {
 fn observe_programs(
     programs: &[ProgramSnapshot],
     traffic_control: &TrafficControlFilterSnapshot,
+    links: &[LinkSnapshot],
+    reviewed_policy_id: Option<&str>,
 ) -> Result<AndroidTrafficControlBpfFwmarkObservation, AndroidTrafficControlBpfFwmarkObservationError>
 {
-    if programs.len() > MAX_BPF_PROGRAMS {
+    if programs.len() > MAX_BPF_PROGRAMS || links.len() > MAX_BPF_LINKS {
         return Err(limit_error());
+    }
+    let mut previous_program_id = None;
+    for program in programs {
+        if program.id == 0 || previous_program_id.is_some_and(|previous| previous >= program.id) {
+            return Err(AndroidTrafficControlBpfFwmarkObservationError::new(
+                AndroidTrafficControlBpfFwmarkObservationErrorKind::InvalidProgramInfo,
+            ));
+        }
+        previous_program_id = Some(program.id);
     }
     let mut digest = Sha256::new();
     digest.update(BPF_SNAPSHOT_DIGEST_DOMAIN);
     traffic_control.update_digest(&mut digest);
-    digest_usize(&mut digest, programs.len());
+    update_review_profile_digest(&mut digest, reviewed_policy_id);
+    digest.update(BPF_LINK_IDENTITY_DIGEST_DOMAIN);
+    digest_usize(&mut digest, links.len());
+    let mut linked_program_ids = Vec::with_capacity(links.len());
+    let program_ids = programs
+        .iter()
+        .map(|program| program.id)
+        .collect::<Vec<_>>();
+    let mut previous_link_id = None;
     let mut opaque_planes = [false; ALL_PLANES.len()];
+    for link in links {
+        if link.id == 0 || previous_link_id.is_some_and(|previous| previous >= link.id) {
+            return Err(invalid_link_info());
+        }
+        previous_link_id = Some(link.id);
+        digest.update(link.id.to_be_bytes());
+        let (Some(link_type), Some(program_id)) = (link.link_type, link.program_id) else {
+            if link.link_type.is_some() || link.program_id.is_some() {
+                return Err(invalid_link_info());
+            }
+            digest.update([0xff]);
+            opaque_planes.fill(true);
+            continue;
+        };
+        if link_type == 0 || program_id == 0 || program_ids.binary_search(&program_id).is_err() {
+            return Err(invalid_link_info());
+        }
+        digest.update([0]);
+        digest.update(link_type.to_be_bytes());
+        digest.update(program_id.to_be_bytes());
+        linked_program_ids.push(program_id);
+        if !is_known_link_type(link_type) {
+            opaque_planes.fill(true);
+        }
+    }
+    linked_program_ids.sort_unstable();
+    linked_program_ids.dedup();
+    digest_usize(&mut digest, programs.len());
     if traffic_control.filter_count() != 0 {
         opaque_planes[plane_index(FwmarkPlane::Packet)] = true;
         opaque_planes[plane_index(FwmarkPlane::Conntrack)] = true;
@@ -426,14 +697,7 @@ fn observe_programs(
     let mut opaque_program_count = 0_usize;
     let mut instruction_count = 0_usize;
 
-    let mut previous_id = None;
     for program in programs {
-        if program.id == 0 || previous_id.is_some_and(|previous| previous >= program.id) {
-            return Err(AndroidTrafficControlBpfFwmarkObservationError::new(
-                AndroidTrafficControlBpfFwmarkObservationErrorKind::InvalidProgramInfo,
-            ));
-        }
-        previous_id = Some(program.id);
         digest.update(program.id.to_be_bytes());
         let Some(program_type) = program.program_type else {
             inaccessible_program_count += 1;
@@ -471,12 +735,23 @@ fn observe_programs(
         program_digest.update(instructions);
         digest.update(program_digest.finalize());
 
-        // BPF_OBJ_GET_INFO_BY_FD exposes verifier-rewritten instructions. Context accesses use
-        // private kernel-structure offsets and helper calls no longer carry UAPI helper IDs, so
-        // these bytes are retained only as a digest and bounded count. Program types that can
-        // reach a routing/capture mark plane remain opaque.
+        // The exact no-fwmark catalog is selected only by the already-bound reviewed device policy.
+        // Unknown profiles and any type, tag, or byte drift deliberately miss this exception.
         if let Some(program_opaque_planes) = program_opaque_planes(program_type) {
             relevant_program_count += 1;
+            if is_proven_detached(
+                program.id,
+                program_type,
+                traffic_control,
+                &linked_program_ids,
+            ) || is_reviewed_no_fwmark_program(
+                program_type,
+                tag,
+                instructions,
+                reviewed_no_fwmark_catalog(reviewed_policy_id),
+            ) {
+                continue;
+            }
             opaque_program_count += 1;
             for (index, opaque) in program_opaque_planes.into_iter().enumerate() {
                 opaque_planes[index] |= opaque;
@@ -508,8 +783,77 @@ fn observe_programs(
 
 #[cfg(test)]
 pub(super) fn test_absent_observation() -> AndroidTrafficControlBpfFwmarkObservation {
-    observe_programs(&[], &TrafficControlFilterSnapshot::empty())
+    observe_programs(&[], &TrafficControlFilterSnapshot::empty(), &[], None)
         .expect("empty TC and BPF snapshots are complete absence")
+}
+
+fn update_review_profile_digest(digest: &mut Sha256, reviewed_policy_id: Option<&str>) {
+    digest.update(BPF_REVIEW_PROFILE_DIGEST_DOMAIN);
+    match reviewed_policy_id {
+        Some(reviewed_policy_id) => {
+            digest.update([1]);
+            digest_usize(digest, reviewed_policy_id.len());
+            digest.update(reviewed_policy_id.as_bytes());
+        }
+        None => digest.update([0]),
+    }
+}
+
+fn reviewed_no_fwmark_catalog(reviewed_policy_id: Option<&str>) -> &[ReviewedNoFwmarkProgram] {
+    match reviewed_policy_id {
+        Some(SAMSUNG_SM_S9180_FZDP_POLICY_V1) => SAMSUNG_SM_S9180_FZDP_NO_FWMARK_PROGRAMS_V1,
+        _ => &[],
+    }
+}
+
+fn is_reviewed_no_fwmark_program(
+    program_type: u32,
+    tag: [u8; 8],
+    instructions: &[u8],
+    catalog: &[ReviewedNoFwmarkProgram],
+) -> bool {
+    let raw_xlated_sha256: [u8; 32] = Sha256::digest(instructions).into();
+    catalog.iter().any(|entry| {
+        entry.program_type == program_type
+            && entry.tag == tag
+            && entry.raw_xlated_sha256 == raw_xlated_sha256
+    })
+}
+
+fn is_proven_detached(
+    program_id: u32,
+    program_type: u32,
+    traffic_control: &TrafficControlFilterSnapshot,
+    linked_program_ids: &[u32],
+) -> bool {
+    let is_linked = linked_program_ids.binary_search(&program_id).is_ok();
+    match program_type {
+        BPF_PROG_TYPE_SCHED_CLS | BPF_PROG_TYPE_SCHED_ACT => {
+            traffic_control.filter_count() == 0 && !is_linked
+        }
+        BPF_PROG_TYPE_NETFILTER => !is_linked,
+        _ => false,
+    }
+}
+
+fn is_known_link_type(link_type: u32) -> bool {
+    matches!(
+        link_type,
+        BPF_LINK_TYPE_RAW_TRACEPOINT
+            | BPF_LINK_TYPE_TRACING
+            | BPF_LINK_TYPE_CGROUP
+            | BPF_LINK_TYPE_ITER
+            | BPF_LINK_TYPE_NETNS
+            | BPF_LINK_TYPE_XDP
+            | BPF_LINK_TYPE_PERF_EVENT
+            | BPF_LINK_TYPE_KPROBE_MULTI
+            | BPF_LINK_TYPE_STRUCT_OPS
+            | BPF_LINK_TYPE_NETFILTER
+            | BPF_LINK_TYPE_TCX
+            | BPF_LINK_TYPE_UPROBE_MULTI
+            | BPF_LINK_TYPE_NETKIT
+            | BPF_LINK_TYPE_SOCKMAP
+    )
 }
 
 fn program_opaque_planes(program_type: u32) -> Option<[bool; ALL_PLANES.len()]> {
@@ -570,6 +914,12 @@ fn invalid_traffic_control_info() -> AndroidTrafficControlBpfFwmarkObservationEr
     )
 }
 
+fn invalid_link_info() -> AndroidTrafficControlBpfFwmarkObservationError {
+    AndroidTrafficControlBpfFwmarkObservationError::new(
+        AndroidTrafficControlBpfFwmarkObservationErrorKind::InvalidLinkInfo,
+    )
+}
+
 fn digest_usize(digest: &mut Sha256, value: usize) {
     digest.update(u64::try_from(value).unwrap_or(u64::MAX).to_be_bytes());
 }
@@ -585,7 +935,7 @@ mod implementation {
     #[derive(Clone, Copy, Debug, Default)]
     #[repr(C)]
     struct BpfGetIdAttr {
-        start_or_program_id: u32,
+        start_or_object_id: u32,
         next_id: u32,
         open_flags: u32,
     }
@@ -610,9 +960,19 @@ mod implementation {
         xlated_program: u64,
     }
 
+    #[derive(Clone, Copy, Debug, Default)]
+    #[repr(C, align(8))]
+    struct BpfLinkInfoPrefix {
+        link_type: u32,
+        id: u32,
+        program_id: u32,
+        _padding: u32,
+    }
+
     const _: () = assert!(mem::size_of::<BpfGetIdAttr>() == 12);
     const _: () = assert!(mem::size_of::<BpfInfoAttr>() == 16);
     const _: () = assert!(mem::size_of::<BpfProgramInfoPrefix>() == 40);
+    const _: () = assert!(mem::size_of::<BpfLinkInfoPrefix>() == 16);
 
     pub(super) fn collect_traffic_control_filters(
         deadline: Instant,
@@ -644,7 +1004,7 @@ mod implementation {
         loop {
             ensure_before(deadline)?;
             let mut attributes = BpfGetIdAttr {
-                start_or_program_id: start_id,
+                start_or_object_id: start_id,
                 ..BpfGetIdAttr::default()
             };
             match bpf_call(
@@ -685,13 +1045,144 @@ mod implementation {
         Ok(ids)
     }
 
+    pub(super) fn enumerate_link_ids(
+        deadline: Instant,
+    ) -> Result<Vec<u32>, AndroidTrafficControlBpfFwmarkObservationError> {
+        let mut ids = Vec::new();
+        let mut start_id = 0_u32;
+        loop {
+            ensure_before(deadline)?;
+            let mut attributes = BpfGetIdAttr {
+                start_or_object_id: start_id,
+                ..BpfGetIdAttr::default()
+            };
+            match bpf_call(
+                BPF_LINK_GET_NEXT_ID,
+                std::ptr::from_mut(&mut attributes).cast(),
+                mem::size_of::<BpfGetIdAttr>(),
+                deadline,
+            ) {
+                Ok(_) => {}
+                Err(error) if error.raw_os_error() == Some(libc::ENOENT) => break,
+                Err(error)
+                    if matches!(error.raw_os_error(), Some(libc::EPERM) | Some(libc::EACCES)) =>
+                {
+                    return Err(AndroidTrafficControlBpfFwmarkObservationError::os(
+                        AndroidTrafficControlBpfFwmarkObservationErrorKind::Denied,
+                        error.raw_os_error().expect("matched access error"),
+                    ));
+                }
+                Err(error) if error.raw_os_error() == Some(libc::ENOSYS) => {
+                    return Err(AndroidTrafficControlBpfFwmarkObservationError::os(
+                        AndroidTrafficControlBpfFwmarkObservationErrorKind::Unsupported,
+                        libc::ENOSYS,
+                    ));
+                }
+                Err(error) => return Err(error),
+            }
+            if attributes.next_id == 0 || attributes.next_id <= start_id {
+                return Err(invalid_link_info());
+            }
+            if ids.len() == MAX_BPF_LINKS {
+                return Err(limit_error());
+            }
+            ids.push(attributes.next_id);
+            start_id = attributes.next_id;
+        }
+        Ok(ids)
+    }
+
+    pub(super) fn read_link(
+        id: u32,
+        deadline: Instant,
+    ) -> Result<(LinkSnapshot, Option<OwnedFd>), AndroidTrafficControlBpfFwmarkObservationError>
+    {
+        let mut attributes = BpfGetIdAttr {
+            start_or_object_id: id,
+            ..BpfGetIdAttr::default()
+        };
+        let raw_fd = match bpf_call(
+            BPF_LINK_GET_FD_BY_ID,
+            std::ptr::from_mut(&mut attributes).cast(),
+            mem::size_of::<BpfGetIdAttr>(),
+            deadline,
+        ) {
+            Ok(raw_fd) => raw_fd,
+            Err(error) if is_inaccessible(error) => {
+                return Ok((LinkSnapshot::inaccessible(id), None));
+            }
+            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
+                return Err(AndroidTrafficControlBpfFwmarkObservationError::new(
+                    AndroidTrafficControlBpfFwmarkObservationErrorKind::SnapshotDrift,
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        let raw_fd = i32::try_from(raw_fd).map_err(|_| invalid_link_info())?;
+        // SAFETY: BPF_LINK_GET_FD_BY_ID returned one new owned descriptor on success.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+        let link = match read_link_info(&fd, deadline) {
+            Ok(link) => link,
+            Err(error) if is_inaccessible(error) => {
+                return Ok((LinkSnapshot::inaccessible(id), Some(fd)));
+            }
+            Err(error) => return Err(error),
+        };
+        if link.id != id || link.link_type == 0 || link.program_id == 0 {
+            return Err(invalid_link_info());
+        }
+        Ok((
+            LinkSnapshot::exact(link.id, link.link_type, link.program_id),
+            Some(fd),
+        ))
+    }
+
+    pub(super) fn reread_link(
+        fd: &OwnedFd,
+        deadline: Instant,
+    ) -> Result<LinkSnapshot, AndroidTrafficControlBpfFwmarkObservationError> {
+        let link = read_link_info(fd, deadline)?;
+        if link.id == 0 || link.link_type == 0 || link.program_id == 0 {
+            return Err(invalid_link_info());
+        }
+        Ok(LinkSnapshot::exact(
+            link.id,
+            link.link_type,
+            link.program_id,
+        ))
+    }
+
+    fn read_link_info(
+        fd: &OwnedFd,
+        deadline: Instant,
+    ) -> Result<BpfLinkInfoPrefix, AndroidTrafficControlBpfFwmarkObservationError> {
+        use std::os::fd::AsRawFd;
+
+        let mut info = BpfLinkInfoPrefix::default();
+        let mut attributes = BpfInfoAttr {
+            bpf_fd: u32::try_from(fd.as_raw_fd()).map_err(|_| invalid_link_info())?,
+            info_len: mem::size_of::<BpfLinkInfoPrefix>() as u32,
+            info: std::ptr::from_mut(&mut info) as u64,
+        };
+        bpf_call(
+            BPF_OBJ_GET_INFO_BY_FD,
+            std::ptr::from_mut(&mut attributes).cast(),
+            mem::size_of::<BpfInfoAttr>(),
+            deadline,
+        )?;
+        if attributes.info_len < mem::size_of::<BpfLinkInfoPrefix>() as u32 {
+            return Err(invalid_link_info());
+        }
+        Ok(info)
+    }
+
     pub(super) fn read_program(
         id: u32,
         deadline: Instant,
     ) -> Result<(ProgramSnapshot, Option<OwnedFd>), AndroidTrafficControlBpfFwmarkObservationError>
     {
         let mut attributes = BpfGetIdAttr {
-            start_or_program_id: id,
+            start_or_object_id: id,
             ..BpfGetIdAttr::default()
         };
         let raw_fd = match bpf_call(
@@ -864,7 +1355,8 @@ mod tests {
 
     #[test]
     fn empty_loaded_program_set_is_complete_absence() {
-        let observation = observe_programs(&[], &TrafficControlFilterSnapshot::empty()).unwrap();
+        let observation =
+            observe_programs(&[], &TrafficControlFilterSnapshot::empty(), &[], None).unwrap();
         assert_eq!(observation.attached_traffic_control_filter_count(), 0);
         assert_eq!(observation.loaded_program_count(), 0);
         assert!(observation.mark_uses().is_empty());
@@ -879,7 +1371,7 @@ mod tests {
     #[test]
     fn attached_traffic_control_filters_are_bounded_opaque_evidence() {
         let snapshot = observe_traffic_control_messages(&[tc_filter_message(b"bpf\0")]).unwrap();
-        let observation = observe_programs(&[], &snapshot).unwrap();
+        let observation = observe_programs(&[], &snapshot, &[], None).unwrap();
         assert_eq!(observation.attached_traffic_control_filter_count(), 1);
         assert_eq!(
             observation.coverage()[plane_index(FwmarkPlane::Packet)].state(),
@@ -910,8 +1402,13 @@ mod tests {
             vec![0; 2 * BPF_INSTRUCTION_BYTES],
         );
         let socket = program(2, BPF_PROG_TYPE_CGROUP_SOCK, vec![0; BPF_INSTRUCTION_BYTES]);
-        let observation =
-            observe_programs(&[packet, socket], &TrafficControlFilterSnapshot::empty()).unwrap();
+        let observation = observe_programs(
+            &[packet, socket],
+            &TrafficControlFilterSnapshot::empty(),
+            &[LinkSnapshot::exact(1, BPF_LINK_TYPE_TCX, 1)],
+            None,
+        )
+        .unwrap();
         assert_eq!(observation.loaded_program_count(), 2);
         assert_eq!(observation.relevant_program_count(), 2);
         assert_eq!(observation.opaque_program_count(), 2);
@@ -953,7 +1450,7 @@ mod tests {
         })
         .collect::<Vec<_>>();
         let observation =
-            observe_programs(&programs, &TrafficControlFilterSnapshot::empty()).unwrap();
+            observe_programs(&programs, &TrafficControlFilterSnapshot::empty(), &[], None).unwrap();
         assert_eq!(observation.relevant_program_count(), 0);
         assert_eq!(observation.opaque_program_count(), 0);
         assert!(
@@ -996,6 +1493,8 @@ mod tests {
                 ProgramSnapshot::inaccessible(2),
             ],
             &TrafficControlFilterSnapshot::empty(),
+            &[],
+            None,
         )
         .unwrap();
         assert_eq!(observation.relevant_program_count(), 1);
@@ -1010,15 +1509,246 @@ mod tests {
     }
 
     #[test]
+    fn detached_tc_and_netfilter_programs_are_complete_absence() {
+        let observation = observe_programs(
+            &[
+                program(1, BPF_PROG_TYPE_SCHED_CLS, vec![0; BPF_INSTRUCTION_BYTES]),
+                program(2, BPF_PROG_TYPE_SCHED_ACT, vec![0; BPF_INSTRUCTION_BYTES]),
+                program(3, BPF_PROG_TYPE_NETFILTER, vec![0; BPF_INSTRUCTION_BYTES]),
+            ],
+            &TrafficControlFilterSnapshot::empty(),
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(observation.relevant_program_count(), 3);
+        assert_eq!(observation.opaque_program_count(), 0);
+        assert!(
+            observation
+                .coverage()
+                .iter()
+                .all(|record| record.state() == FwmarkCensusCoverageState::CompleteAbsent)
+        );
+    }
+
+    #[test]
+    fn linked_tc_and_netfilter_programs_remain_opaque() {
+        let observation = observe_programs(
+            &[
+                program(1, BPF_PROG_TYPE_SCHED_CLS, vec![0; BPF_INSTRUCTION_BYTES]),
+                program(2, BPF_PROG_TYPE_NETFILTER, vec![0; BPF_INSTRUCTION_BYTES]),
+            ],
+            &TrafficControlFilterSnapshot::empty(),
+            &[
+                LinkSnapshot::exact(10, BPF_LINK_TYPE_TCX, 1),
+                LinkSnapshot::exact(11, BPF_LINK_TYPE_NETFILTER, 2),
+            ],
+            None,
+        )
+        .unwrap();
+        assert_eq!(observation.relevant_program_count(), 2);
+        assert_eq!(observation.opaque_program_count(), 2);
+        assert_eq!(
+            observation.coverage()[plane_index(FwmarkPlane::Packet)].state(),
+            FwmarkCensusCoverageState::Opaque
+        );
+        assert_eq!(
+            observation.coverage()[plane_index(FwmarkPlane::Socket)].state(),
+            FwmarkCensusCoverageState::CompleteAbsent
+        );
+        assert_eq!(
+            observation.coverage()[plane_index(FwmarkPlane::Conntrack)].state(),
+            FwmarkCensusCoverageState::Opaque
+        );
+    }
+
+    #[test]
+    fn tc_dump_prevents_detached_classifier_inference() {
+        let traffic_control =
+            observe_traffic_control_messages(&[tc_filter_message(b"bpf\0")]).unwrap();
+        let observation = observe_programs(
+            &[program(
+                1,
+                BPF_PROG_TYPE_SCHED_CLS,
+                vec![0; BPF_INSTRUCTION_BYTES],
+            )],
+            &traffic_control,
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(observation.opaque_program_count(), 1);
+        assert_eq!(
+            observation.coverage()[plane_index(FwmarkPlane::Packet)].state(),
+            FwmarkCensusCoverageState::Opaque
+        );
+    }
+
+    #[test]
+    fn unknown_or_inaccessible_links_fail_closed() {
+        let program = program(
+            1,
+            BPF_PROG_TYPE_RAW_TRACEPOINT,
+            vec![0; BPF_INSTRUCTION_BYTES],
+        );
+        for link in [
+            LinkSnapshot::exact(1, u32::MAX, 1),
+            LinkSnapshot::inaccessible(1),
+        ] {
+            let observation = observe_programs(
+                std::slice::from_ref(&program),
+                &TrafficControlFilterSnapshot::empty(),
+                &[link],
+                None,
+            )
+            .unwrap();
+            assert!(
+                observation
+                    .coverage()
+                    .iter()
+                    .all(|record| record.state() == FwmarkCensusCoverageState::Opaque)
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_link_identity_or_program_reference_is_rejected() {
+        let program = program(
+            1,
+            BPF_PROG_TYPE_RAW_TRACEPOINT,
+            vec![0; BPF_INSTRUCTION_BYTES],
+        );
+        for links in [
+            vec![LinkSnapshot::exact(1, BPF_LINK_TYPE_RAW_TRACEPOINT, 2)],
+            vec![
+                LinkSnapshot::exact(1, BPF_LINK_TYPE_RAW_TRACEPOINT, 1),
+                LinkSnapshot::exact(1, BPF_LINK_TYPE_RAW_TRACEPOINT, 1),
+            ],
+            vec![LinkSnapshot {
+                id: 1,
+                link_type: Some(BPF_LINK_TYPE_RAW_TRACEPOINT),
+                program_id: None,
+            }],
+        ] {
+            assert_eq!(
+                observe_programs(
+                    std::slice::from_ref(&program),
+                    &TrafficControlFilterSnapshot::empty(),
+                    &links,
+                    None,
+                )
+                .unwrap_err()
+                .kind(),
+                AndroidTrafficControlBpfFwmarkObservationErrorKind::InvalidLinkInfo
+            );
+        }
+    }
+
+    #[test]
+    fn reviewed_no_fwmark_match_requires_exact_type_tag_and_bytes() {
+        let instructions = vec![0x5a; 2 * BPF_INSTRUCTION_BYTES];
+        let tag = [0x2c; 8];
+        let entry = ReviewedNoFwmarkProgram {
+            program_type: BPF_PROG_TYPE_CGROUP_SOCK,
+            tag,
+            raw_xlated_sha256: Sha256::digest(&instructions).into(),
+        };
+        assert!(is_reviewed_no_fwmark_program(
+            BPF_PROG_TYPE_CGROUP_SOCK,
+            tag,
+            &instructions,
+            &[entry]
+        ));
+        assert!(!is_reviewed_no_fwmark_program(
+            BPF_PROG_TYPE_CGROUP_SKB,
+            tag,
+            &instructions,
+            &[entry]
+        ));
+        assert!(!is_reviewed_no_fwmark_program(
+            BPF_PROG_TYPE_CGROUP_SOCK,
+            [0x2d; 8],
+            &instructions,
+            &[entry]
+        ));
+        let mut changed = instructions;
+        changed[0] ^= 1;
+        assert!(!is_reviewed_no_fwmark_program(
+            BPF_PROG_TYPE_CGROUP_SOCK,
+            tag,
+            &changed,
+            &[entry]
+        ));
+    }
+
+    #[test]
+    fn samsung_no_fwmark_catalog_is_exact_and_policy_bound() {
+        let catalog = reviewed_no_fwmark_catalog(Some(SAMSUNG_SM_S9180_FZDP_POLICY_V1));
+        assert_eq!(catalog.len(), 19);
+        assert!(reviewed_no_fwmark_catalog(None).is_empty());
+        assert!(reviewed_no_fwmark_catalog(Some("unknown-policy")).is_empty());
+        for (index, entry) in catalog.iter().enumerate() {
+            assert!(matches!(
+                entry.program_type,
+                BPF_PROG_TYPE_SOCKET_FILTER
+                    | BPF_PROG_TYPE_CGROUP_SKB
+                    | BPF_PROG_TYPE_CGROUP_SOCK
+                    | BPF_PROG_TYPE_CGROUP_SOCK_ADDR
+                    | BPF_PROG_TYPE_CGROUP_SOCKOPT
+            ));
+            assert_ne!(entry.tag, [0; 8]);
+            assert_ne!(entry.raw_xlated_sha256, [0; 32]);
+            assert!(!catalog[..index].contains(entry));
+        }
+    }
+
+    #[test]
+    fn link_and_review_profile_change_snapshot_identity() {
+        let program = program(
+            1,
+            BPF_PROG_TYPE_RAW_TRACEPOINT,
+            vec![0; BPF_INSTRUCTION_BYTES],
+        );
+        let base = observe_programs(
+            std::slice::from_ref(&program),
+            &TrafficControlFilterSnapshot::empty(),
+            &[],
+            None,
+        )
+        .unwrap();
+        let linked = observe_programs(
+            std::slice::from_ref(&program),
+            &TrafficControlFilterSnapshot::empty(),
+            &[LinkSnapshot::exact(1, BPF_LINK_TYPE_RAW_TRACEPOINT, 1)],
+            None,
+        )
+        .unwrap();
+        let reviewed = observe_programs(
+            &[program],
+            &TrafficControlFilterSnapshot::empty(),
+            &[],
+            Some(SAMSUNG_SM_S9180_FZDP_POLICY_V1),
+        )
+        .unwrap();
+        assert_ne!(base.digest(), linked.digest());
+        assert_ne!(base.digest(), reviewed.digest());
+    }
+
+    #[test]
     fn invalid_program_identity_and_instruction_shape_fail_closed() {
         let duplicate = [
             program(1, BPF_PROG_TYPE_XDP, vec![0; BPF_INSTRUCTION_BYTES]),
             program(1, BPF_PROG_TYPE_XDP, vec![0; BPF_INSTRUCTION_BYTES]),
         ];
         assert_eq!(
-            observe_programs(&duplicate, &TrafficControlFilterSnapshot::empty())
-                .unwrap_err()
-                .kind(),
+            observe_programs(
+                &duplicate,
+                &TrafficControlFilterSnapshot::empty(),
+                &[],
+                None,
+            )
+            .unwrap_err()
+            .kind(),
             AndroidTrafficControlBpfFwmarkObservationErrorKind::InvalidProgramInfo
         );
 
@@ -1027,6 +1757,8 @@ mod tests {
                 observe_programs(
                     &[program(1, BPF_PROG_TYPE_XDP, instructions)],
                     &TrafficControlFilterSnapshot::empty(),
+                    &[],
+                    None,
                 )
                 .unwrap_err()
                 .kind(),
@@ -1044,6 +1776,8 @@ mod tests {
                 vec![0; BPF_INSTRUCTION_BYTES],
             )],
             &TrafficControlFilterSnapshot::empty(),
+            &[],
+            None,
         )
         .unwrap();
         let second = observe_programs(
@@ -1053,6 +1787,8 @@ mod tests {
                 vec![1; BPF_INSTRUCTION_BYTES],
             )],
             &TrafficControlFilterSnapshot::empty(),
+            &[],
+            None,
         )
         .unwrap();
         assert_ne!(first.digest(), second.digest());

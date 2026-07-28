@@ -6,10 +6,11 @@ use std::time::{Duration, Instant};
 
 use flux_core::{
     AndroidNetdSourceProfile, CapabilityProfile, CapabilityProfileSource, FwmarkCandidate,
-    NetworkInventory, NetworkNamespaceIdentity,
+    NetworkInventory, NetworkNamespaceIdentity, ReviewedPolicyCatalogEntryId,
 };
 
 use super::nftables::{AndroidNftablesTransportErrorKind, collect_android_nftables_fwmarks};
+use super::traffic_control_bpf::collect_android_traffic_control_bpf_fwmarks_for_reviewed_policy;
 use super::{
     AndroidExistingFluxOwnershipError, AndroidExistingFluxOwnershipErrorKind,
     AndroidExistingFluxOwnershipObservation, AndroidExistingFluxProcessObservationErrorClass,
@@ -19,8 +20,7 @@ use super::{
     AndroidTrafficControlBpfFwmarkObservationError, AndroidXfrmFwmarkObservationError,
     AndroidXtablesFwmarkObservation, AndroidXtablesFwmarkObservationError,
     MAX_ANDROID_FWMARK_CENSUS_STAGE_BOUND, collect_android_existing_flux_ownership,
-    collect_android_traffic_control_bpf_fwmarks, collect_android_xfrm_fwmarks,
-    observe_android_xtables_fwmarks,
+    collect_android_xfrm_fwmarks, observe_android_xtables_fwmarks,
 };
 use crate::xtables::collect_android_xtables_save_snapshots;
 use crate::{
@@ -249,6 +249,7 @@ impl AndroidFwmarkCensusCoordinatorSource for SystemAndroidFwmarkCensusSource {
         _phase: AndroidFwmarkCensusExternalPhase,
         netd_source_profile: AndroidNetdSourceProfile,
         candidate: FwmarkCandidate,
+        reviewed_policy: Option<&ReviewedPolicyCatalogEntryId>,
         bound: Duration,
     ) -> Result<AndroidFwmarkCensusExternalSnapshot, Self::Error> {
         let deadline = stage_deadline(bound)?;
@@ -285,8 +286,11 @@ impl AndroidFwmarkCensusCoordinatorSource for SystemAndroidFwmarkCensusSource {
         ensure_before(deadline)?;
         let nftables = collect_android_nftables_fwmarks(nftables_gate, remaining(deadline)?)
             .map_err(map_nftables_observation)?;
-        let traffic_control_bpf = collect_android_traffic_control_bpf_fwmarks(remaining(deadline)?)
-            .map_err(map_traffic_control_bpf_observation)?;
+        let traffic_control_bpf = collect_android_traffic_control_bpf_fwmarks_for_reviewed_policy(
+            remaining(deadline)?,
+            reviewed_policy,
+        )
+        .map_err(map_traffic_control_bpf_observation)?;
         let xfrm =
             collect_android_xfrm_fwmarks(remaining(deadline)?).map_err(map_xfrm_observation)?;
         ensure_before(deadline)?;

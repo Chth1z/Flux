@@ -25,6 +25,7 @@ mod network_inventory;
 mod network_route;
 mod network_rule;
 mod rpdb_placement;
+mod statistics;
 
 pub use address_bypass::{
     AddressBypassInventoryAddressErrorKind, AddressBypassPlan, AddressBypassPlanError,
@@ -169,4 +170,16 @@ pub use rpdb_placement::{
     RpdbFamilyPlacementError, RpdbPlacementLease, RpdbPlacementPlanError, RpdbPlacementRequest,
     RpdbPlacementRequestError, RpdbPriorityRole, RpdbPriorityWindow, RpdbRuleAudit,
     RpdbRuleAuditError, RpdbRuleClassification, StaleRpdbPlacementLease, plan_rpdb_placement,
+};
+pub use statistics::{
+    MAX_TRAFFIC_COUNTER_CELLS, MAX_TRAFFIC_SAMPLE_DECODED_BYTES, MAX_TRAFFIC_UPDATE_WORK_UNITS,
+    StatisticsEpoch, StatisticsLoss, StatisticsRevision, StatisticsUpdate,
+    TRAFFIC_STATISTICS_INTERNAL_SNAPSHOT_RETENTION, TRAFFIC_UPDATE_BASE_WORK_UNITS,
+    TRAFFIC_UPDATE_WORK_UNITS_PER_CELL, TrafficAggregate, TrafficAggregateKey,
+    TrafficAggregateSnapshot, TrafficCounterCellId, TrafficCounterPlan, TrafficCounterPlanCell,
+    TrafficCounterPlanError, TrafficCounterPlanId, TrafficCounterSample, TrafficCounterSampleCell,
+    TrafficCounterSampleError, TrafficCounterSourceId, TrafficCumulativeCounters,
+    TrafficProtocolScope, TrafficReportedLoss, TrafficSampleSequence, TrafficSampleSignal,
+    TrafficStatisticsAccumulator, TrafficStatisticsError, TrafficStatisticsLimits,
+    TrafficStatisticsSourceState,
 };

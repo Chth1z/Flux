@@ -62,6 +62,7 @@ const REMOTE_TEST_TIMEOUT_SECONDS: u64 = 210;
 const REMOTE_TEST_KILL_GRACE_SECONDS: u64 = 5;
 const PROBE_ERROR_PREFIX: &[u8] = b"Android fwmark census probe: ";
 const SANITIZED_PROBE_FAILURE_PREFIX: &str = "fwmark census probe stopped before reports: ";
+const SANITIZED_POST_REPORT_FAILURE_PREFIX: &str = "fwmark census probe stopped after reports: ";
 const RUNNER_STAGE_FAILURE_PREFIX: &str = "fwmark census runner stopped at ";
 const MAX_PROBE_ERROR_LABEL_BYTES: usize = 160;
 
@@ -244,10 +245,7 @@ fn runner_stage_error(stage: RunnerStage) -> String {
 }
 
 fn sanitize_probe_execution_error(error: String) -> String {
-    if error
-        .strip_prefix(SANITIZED_PROBE_FAILURE_PREFIX)
-        .is_some_and(canonical_probe_error_label)
-    {
+    if is_sanitized_probe_failure(&error) {
         error
     } else {
         runner_stage_error(RunnerStage::RemoteProbeExecution)
@@ -258,15 +256,24 @@ fn sanitize_remote_transaction_error(error: String) -> String {
     if error.contains("; mandatory remote cleanup also failed: ") {
         return runner_stage_error(RunnerStage::RemoteCleanup);
     }
-    if is_runner_stage_error(&error)
-        || error
-            .strip_prefix(SANITIZED_PROBE_FAILURE_PREFIX)
-            .is_some_and(canonical_probe_error_label)
-    {
+    if is_runner_stage_error(&error) || is_sanitized_probe_failure(&error) {
         error
     } else {
         runner_stage_error(RunnerStage::RemoteTransaction)
     }
+}
+
+fn is_sanitized_probe_failure(error: &str) -> bool {
+    [
+        SANITIZED_PROBE_FAILURE_PREFIX,
+        SANITIZED_POST_REPORT_FAILURE_PREFIX,
+    ]
+    .into_iter()
+    .any(|prefix| {
+        error
+            .strip_prefix(prefix)
+            .is_some_and(canonical_probe_error_label)
+    })
 }
 
 fn is_runner_stage_error(error: &str) -> bool {
@@ -878,18 +885,34 @@ fn push_execute_and_validate(
     std::io::stdout()
         .write_all(&output.stdout)
         .map_err(|error| format!("forward sanitized census reports: {error}"))?;
-    validate_android_fwmark_census_probe_reports(&reports)?;
-    if output.status.success() {
-        if output.stderr.is_empty() {
-            Ok(())
-        } else {
-            Err("successful census probe emitted unexpected diagnostics".to_owned())
+    validate_post_report_probe_result(
+        termination,
+        validate_android_fwmark_census_probe_reports(&reports),
+        &output.stderr,
+    )
+}
+
+fn validate_post_report_probe_result(
+    termination: ProbeTermination,
+    validation: Result<(), String>,
+    stderr: &[u8],
+) -> Result<(), String> {
+    match validation {
+        Ok(()) if termination == ProbeTermination::Success && stderr.is_empty() => Ok(()),
+        Ok(()) if termination == ProbeTermination::Success => Err(sanitized_post_report_failure(
+            "probe-valid-reports-diagnostics",
+        )),
+        Ok(()) => Err(sanitized_post_report_failure("probe-valid-reports-failed")),
+        Err(expected)
+            if termination != ProbeTermination::Success
+                && canonical_probe_error_label(&expected)
+                && sanitized_probe_error_label(stderr) == Some(expected.as_str()) =>
+        {
+            Err(sanitized_post_report_failure(&expected))
         }
-    } else {
-        Err(format!(
-            "fwmark census probe exited with {} after emitting valid reports",
-            output.status
-        ))
+        Err(_) => Err(sanitized_post_report_failure(
+            "probe-report-validation-mismatch",
+        )),
     }
 }
 
@@ -920,6 +943,11 @@ fn parse_probe_reports_or_sanitized_failure(
 fn sanitized_probe_failure(label: &'static str) -> String {
     debug_assert!(canonical_probe_error_label(label));
     format!("{SANITIZED_PROBE_FAILURE_PREFIX}{label}")
+}
+
+fn sanitized_post_report_failure(label: &str) -> String {
+    debug_assert!(canonical_probe_error_label(label));
+    format!("{SANITIZED_POST_REPORT_FAILURE_PREFIX}{label}")
 }
 
 fn sanitized_probe_error_label(stderr: &[u8]) -> Option<&str> {
@@ -1559,6 +1587,73 @@ mod tests {
     }
 
     #[test]
+    fn post_report_validation_preserves_only_the_independently_derived_probe_label() {
+        let expected = "primary-noncomplete-cell-traffic-control-and-bpf-packet-opaque";
+        let stderr = format!("Android fwmark census probe: {expected}\n");
+        let error = validate_post_report_probe_result(
+            ProbeTermination::Failed,
+            Err(expected.to_owned()),
+            stderr.as_bytes(),
+        )
+        .expect_err("matching report validation must stop with its bounded label");
+        assert_eq!(
+            error,
+            format!("{SANITIZED_POST_REPORT_FAILURE_PREFIX}{expected}")
+        );
+
+        for (termination, validation, diagnostics) in [
+            (
+                ProbeTermination::Failed,
+                Err(expected.to_owned()),
+                b"Android fwmark census probe: different-canonical-label\n".as_slice(),
+            ),
+            (
+                ProbeTermination::Failed,
+                Err(expected.to_owned()),
+                b"Android fwmark census probe: secret=/data/user/0/private\n".as_slice(),
+            ),
+            (
+                ProbeTermination::Success,
+                Err(expected.to_owned()),
+                stderr.as_bytes(),
+            ),
+            (
+                ProbeTermination::Failed,
+                Err("host validation leaked /data/user/0/private".to_owned()),
+                stderr.as_bytes(),
+            ),
+        ] {
+            let error = validate_post_report_probe_result(termination, validation, diagnostics)
+                .expect_err("inconsistent post-report output must stop");
+            assert_eq!(
+                error,
+                format!("{SANITIZED_POST_REPORT_FAILURE_PREFIX}probe-report-validation-mismatch")
+            );
+            assert!(!error.contains("private"), "{error}");
+        }
+    }
+
+    #[test]
+    fn post_report_success_requires_successful_silent_probe_termination() {
+        validate_post_report_probe_result(ProbeTermination::Success, Ok(()), b"")
+            .expect("valid reports and silent successful termination");
+        assert_eq!(
+            validate_post_report_probe_result(
+                ProbeTermination::Success,
+                Ok(()),
+                b"unexpected /data/private diagnostics\n",
+            )
+            .expect_err("diagnostics after valid reports must stop"),
+            format!("{SANITIZED_POST_REPORT_FAILURE_PREFIX}probe-valid-reports-diagnostics")
+        );
+        assert_eq!(
+            validate_post_report_probe_result(ProbeTermination::Killed, Ok(()), b"")
+                .expect_err("nonzero termination after valid reports must stop"),
+            format!("{SANITIZED_POST_REPORT_FAILURE_PREFIX}probe-valid-reports-failed")
+        );
+    }
+
+    #[test]
     fn runner_stage_errors_discard_serials_paths_and_low_level_diagnostics() {
         let hostile =
             "adb -s fixture-serial shell cat /data/user/0/private: permission denied".to_owned();
@@ -1591,11 +1686,17 @@ mod tests {
         let bounded =
             format!("{SANITIZED_PROBE_FAILURE_PREFIX}collection-external-before-kernel-config");
         assert_eq!(sanitize_probe_execution_error(bounded.clone()), bounded);
+        let bounded = format!(
+            "{SANITIZED_POST_REPORT_FAILURE_PREFIX}primary-noncomplete-cell-traffic-control-and-bpf-packet-opaque"
+        );
+        assert_eq!(sanitize_probe_execution_error(bounded.clone()), bounded);
 
         for hostile in [
             "adb -s fixture-serial shell su -c /system/bin/sh",
             "fwmark census probe stopped before reports: secret=/data/private",
             "fwmark census probe stopped before reports: valid-label; extra",
+            "fwmark census probe stopped after reports: secret=/data/private",
+            "fwmark census probe stopped after reports: valid-label; extra",
         ] {
             let error = sanitize_probe_execution_error(hostile.to_owned());
             assert_eq!(error, runner_stage_error(RunnerStage::RemoteProbeExecution));

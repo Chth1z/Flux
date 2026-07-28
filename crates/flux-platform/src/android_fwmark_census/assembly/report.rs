@@ -239,17 +239,22 @@ pub fn parse_android_fwmark_census_probe_reports(
 }
 
 /// Requires both parsed reports complete and the cleanup projection free of Flux ownership.
+///
+/// Every returned error is the same bounded canonical label emitted by the Android probe for the
+/// equivalent typed projection. Callers may compare the label with sanitized probe diagnostics,
+/// but must not trust probe diagnostics without this independent validation.
 pub fn validate_android_fwmark_census_probe_reports(
     reports: &AndroidFwmarkCensusProbeReports,
 ) -> Result<(), String> {
     require_complete_report(&reports.primary, AndroidFwmarkCensusReportPhase::Primary)?;
     require_complete_report(&reports.cleanup, AndroidFwmarkCensusReportPhase::Cleanup)?;
     for index in 24..27 {
-        if reports.cleanup.cells[index] != ParsedCoverageState::CompleteAbsent {
+        let state = reports.cleanup.cells[index];
+        if state != ParsedCoverageState::CompleteAbsent {
             return Err(format!(
-                "cleanup census did not prove {} {} absence",
-                source_label(ALL_SOURCES[index / ALL_PLANES.len()]),
-                plane_label(ALL_PLANES[index % ALL_PLANES.len()])
+                "cleanup-existing-flux-cell-{}-{}",
+                plane_label(ALL_PLANES[index % ALL_PLANES.len()]),
+                state.label(),
             ));
         }
     }
@@ -264,10 +269,11 @@ pub fn validate_android_fwmark_census_probe_reports(
         AndroidFwmarkCensusMetricKind::ExistingFluxRules,
     ] {
         let index = kind as usize;
-        if reports.cleanup.metrics[index] != 0 {
+        let value = reports.cleanup.metrics[index];
+        if value != 0 {
             return Err(format!(
-                "cleanup census ownership metric {} is nonzero",
-                kind.as_str()
+                "cleanup-existing-flux-metric-{}-{value}",
+                kind.as_str(),
             ));
         }
     }
@@ -288,6 +294,18 @@ enum ParsedCoverageState {
 impl ParsedCoverageState {
     const fn is_complete(self) -> bool {
         matches!(self, Self::CompletePresent | Self::CompleteAbsent)
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::CompletePresent => "complete-present",
+            Self::CompleteAbsent => "complete-absent",
+            Self::Incomplete => "incomplete",
+            Self::Opaque => "opaque",
+            Self::Denied => "denied",
+            Self::Transient => "transient",
+            Self::Unavailable => "unavailable",
+        }
     }
 }
 
@@ -651,10 +669,11 @@ fn require_complete_report(
         .find(|(_, state)| !state.is_complete())
     {
         Err(format!(
-            "{} census stopped on noncomplete {} {} cell {state:?}",
+            "{}-noncomplete-cell-{}-{}-{}",
             phase.label(),
             source_label(ALL_SOURCES[index / ALL_PLANES.len()]),
-            plane_label(ALL_PLANES[index % ALL_PLANES.len()])
+            plane_label(ALL_PLANES[index % ALL_PLANES.len()]),
+            state.label(),
         ))
     } else {
         Ok(())
@@ -897,10 +916,10 @@ mod tests {
             );
         let reports = parse_android_fwmark_census_probe_reports(noncomplete.as_bytes())
             .expect("bounded noncomplete diagnostic report");
-        assert!(
+        assert_eq!(
             validate_android_fwmark_census_probe_reports(&reports)
-                .expect_err("noncomplete primary cell must stop")
-                .contains("noncomplete")
+                .expect_err("noncomplete primary cell must stop"),
+            "primary-noncomplete-cell-android-net-id-packet-opaque"
         );
 
         let residue = String::from_utf8(probe_output(16))
@@ -912,10 +931,10 @@ mod tests {
             );
         let reports = parse_android_fwmark_census_probe_reports(residue.as_bytes())
             .expect("bounded cleanup residue report");
-        assert!(
+        assert_eq!(
             validate_android_fwmark_census_probe_reports(&reports)
-                .expect_err("cleanup ownership residue must stop")
-                .contains("existing-flux-processes")
+                .expect_err("cleanup ownership residue must stop"),
+            "cleanup-existing-flux-metric-existing-flux-processes-1"
         );
     }
 }

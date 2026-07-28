@@ -1,13 +1,20 @@
 # Fluxd Technical Specification
 
 - Status: accepted living specification
-- Last updated: 2026-07-26
+- Last updated: 2026-07-28
 - Companion document: [Fluxd Rewrite Blueprint](fluxd-blueprint.md)
 
 This specification describes both the target architecture and temporary development checkpoints.
 ADR-0011 controls publication: bridge, shadow, parity, and migration states are not releasable, and
 obsolete internal contracts may break when that accelerates the full Rust cutover. A final package
 contains no legacy runtime networking component or compatibility wrapper.
+
+Commits `8bf0533`, `1863553`, and `6180397` completed the code-first R4-R6 cutover: production
+composition now selects the native Rust Generation/runtime owner, the legacy bridge and standalone
+helpers are removed, and schema-4 packaging has one exact native development profile. Detailed
+Phase-1 bridge passages below are retained as historical checkpoint design, not present executable
+behavior. The current runtime and command contract is summarized in the root README and development
+guide; physical-device and release qualification remain open.
 
 ## 1. Supported platform contract
 
@@ -63,7 +70,13 @@ deduplication.
 
 Only `fluxd daemon` is long-lived. Sing-Box is its child. A boot shell watchdog may restart `fluxd` after a crash or fatal invariant exit, but it contains no policy logic, never invokes a second recovery owner, and does not restart a settled `UnsupportedKernel` daemon. Normal journal recovery runs inside daemon startup before mutating commands are accepted. `fluxd cleanup --offline` is a bounded pre-socket command that requires the persistent daemon lease to be available and consumes only durable ownership records through the existing recovery Adapter. `fluxd restart` is a client alias for `ReloadSources` followed by `Converge(Configured)`; it has no separate protocol or lifecycle meaning.
 
-In the delivered Phase 1 bridge, `RuntimeCoordinator` implements `LegacyDispatcher` and runs on the one bounded `LegacyControlBridge` worker. The worker serializes requests, address resynchronization, idle maintenance, and shutdown. `EngineSupervisor` owns the Sing-Box child. Schema-3 `flux.toml` is the sole Rust-owned product-policy source: before dispatch, Rust publishes canonical engine JSON and one strict compatibility environment from the same snapshot. Rust-owned preparation compiles the legacy restore caches, while shell phase scripts remain the production rules/routes writer, standalone `addrsyncd` retains address synchronization, and `scripts/tproxy` remains the sole production xtables restore executor. A boot-scoped mode lease rejects legacy `scripts/core` verbs for the duration of a Rust-owned engine run. This bridge currently admits only TPROXY: unrepresentable Desired State fails before initialization and manifest publication because the shell Flux PBR is TPROXY-specific and exact Sing-Box route cleanup after forced death has no device-qualified proof.
+In the delivered native composition, `RuntimeCoordinator` serializes requests, native address
+reconciliation, idle maintenance, and shutdown. `EngineSupervisor` owns the Sing-Box child,
+`AssembledNativeGenerationSource` prepares immutable Generations, and the native xtables/rtnetlink
+runtime owns capture and policy routing behind exact device admission. Schema-3 `flux.toml` is the
+sole product-policy source. No legacy dispatcher, shell networking phase, or standalone address
+daemon remains. Only xtables TPROXY has a production mutation adapter; nftables and managed TUN
+remain modeled, non-authorizing candidates.
 
 ## 3. Local control socket and Module routing
 
@@ -2024,7 +2037,7 @@ The Phase 1 serialized worker calls `maintain` after each request and after boun
 
 ## 18. Kernel I/O runtime
 
-The mandatory target baseline is one custom `epoll` reactor. Phase 1 currently integrates the
+The mandatory target baseline is one custom `epoll` reactor. The native composition integrates the
 control descriptor, shutdown `signalfd`, worker `eventfd`, nonblocking route-network inventory, and
 the bounded inotify file-observation driver. File readiness is limited to eight 16 KiB reads per
 turn; missing/invalidation recovery and directory-identity checks share the reactor deadline.
@@ -2040,42 +2053,34 @@ Higher-level async tasks communicate through bounded channels. `io_uring` is a s
 ### 19.1 Build outputs
 
 - `fluxd` for `aarch64-linux-android`;
-- optional eBPF object(s), only when a qualified advertised plane is selected, embedded in `fluxd`
-  or packaged with verified hashes;
+- no separate eBPF or kernel payload in the current exact native profile;
 - Sing-Box binary supplied by the release pipeline;
 - generated `manifest.json`, SBOM, checksums, and build metadata;
 - Magisk-compatible ZIP.
 
 ### 19.2 `xtask`
 
-The current bridge implements a deliberately split boundary:
+The current native package commands are:
 
 ```text
 cargo xtask build-android
-cargo xtask stage-module --profile bridge|rust-only --stage <dir> --runtime-binaries <dir>
-cargo xtask verify-package --profile bridge|rust-only --stage <dir>
+cargo xtask stage-module --stage <dir> --runtime-binaries <dir>
+cargo xtask verify-package --stage <dir>
 cargo xtask test-functional-canary-android-x86_64-output-tproxy --serial <serial> [--adb <program>]
 ```
 
-`conf/manifest.json` schema 3 is the checked package contract. Its `bridge` profile is explicitly
-`development-only`; its `rust-only` profile is explicitly `failing-until-complete`. The former
-requires the current 26 runtime/module paths. The latter requires the 13 final `fluxd`, Sing-Box,
-Rust-owned configuration/asset, and platform-glue paths and names the exact other 13 bridge paths as
-forbidden. A profile-independent denylist names the two already-retired runtime paths. The verifier
-proves that the profile difference and retired set are exact, so no removed path can be omitted from
-policy or reintroduced in a staged package.
+`conf/manifest.json` schema 4 is the checked package contract. It contains one `native` profile,
+marked `development-only`, with the exact 13 final `fluxd`, Sing-Box, Rust-owned configuration/asset,
+and platform-glue paths. Exact inventory equality rejects any removed legacy path or other residue;
+there is no profile selector, difference list, retired-path list, or submodule provenance.
 
-`stage-module` copies only the selected paths. `verify-package` requires the staged profile policy
-to equal the checked-in policy, then applies exact file, source-byte, binary, payload, provenance,
-and evidence checks for that selection. The bridge requires clean root and `addrsyncd` worktrees and
-binds both manifest revisions; Rust-only does not derive authority from a removed submodule. A
-static source resolver selects only `packaging/rust-only/customize.sh` and
-`packaging/rust-only/flux_service.sh` for the Rust-only profile; bridge continues to bind the root
-files, and both selections are verified byte-for-byte. The Rust-only installer is fresh-install-only
-at this gate and refuses an existing runtime root rather than implementing bridge migration in shell.
-A successful bridge check is printed only as development evidence. Rust-only verification remains a
-deliberate failing release gate until runtime ownership converges and the checked status is changed
-in the later package cutover. Required binaries must
+`stage-module` rebuilds `fluxd`, copies only the exact native paths, takes only Sing-Box from the
+runtime-binary directory, and refuses a non-empty stage, missing payload, unsafe entry, or extra
+file. `verify-package` requires a clean root worktree, byte-compares source-owned paths, and applies
+the binary, payload, provenance, evidence, SPDX, build-metadata, and checksum gates. Root
+`customize.sh`, `flux_service.sh`, `uninstall.sh`, and the update binary are the authoritative
+platform glue. The installer is fresh-install-only and refuses an existing runtime root rather
+than migrating customized state in shell. Required binaries must
 be ELF64 little-endian AArch64 with a bounded file-backed executable entry, congruent load segments,
 power-of-two `PT_LOAD` alignment of at least `2**14` for every non-empty load segment, and either
 no interpreter or an Android linker path. NDK r27 ARM64 release and x86_64 checkpoint links receive
@@ -2098,15 +2103,15 @@ also required. Symbolic links, special files, unsafe paths, hidden or ordinary `
 and unreviewed Magisk root payloads fail.
 
 This command does not authenticate self-authored third-party provenance or unsigned device JSON.
-The Rust-only inventory already rejects standalone `addrsyncd`, `jq`, legacy scripts, and
-compatibility wrappers, but its failing status is not a substitute for completing their runtime
-ownership. Even a future pass after promotion is necessary but not sufficient for publication:
+The exact native inventory rejects standalone `addrsyncd`, `jq`, legacy scripts, compatibility
+wrappers, and all undeclared residue. Even a future pass after promotion is necessary but not
+sufficient for publication:
 ADR-0011's runtime-completion gate and the later `package-magisk` signed/reproducible provenance plus
 trusted device/CI attestation gate must also pass. The checked-in manifest intentionally retains
 blank third-party fields, so an unqualified development stage must fail this command.
 
-The target release toolchain still requires real-kernel tests, final packaging, and device tests as
-later deliverables. `build-ebpf` is required only when an eBPF plane is advertised:
+The following target-state commands are later deliverables and do not exist in the current `xtask`
+surface. `build-ebpf` would be required only if a future release advertised an eBPF plane:
 
 ```text
 cargo xtask test-linux
@@ -2124,17 +2129,18 @@ cannot be classified by the current extension checks. Production `fluxd` does no
 
 | Development checkpoint | Runtime behavior | Releasable? |
 |---|---|---|
-| Bridge | `fluxd` owns Sing-Box through the atomic runtime coordinator; serialized `scripts/tproxy` phases own xtables/Flux PBR writes and standalone `addrsyncd` owns address synchronization | No |
+| Bridge (retired) | Historical shell networking composition removed by R5 | No |
 | Shadow compiler | Rust emits deterministic observation-only Capture Programs; no shadow artifact enters a Generation or activation path | No |
-| Rust generation bridge | Rust prepares and attests legacy-shaped restore caches; `scripts/tproxy` remains the production restore executor/writer | No |
+| Rust generation bridge (retired) | Historical compatibility renderer and restore-cache handoff removed by R5-R6 | No |
 | Canonical xtables lowering | Rust preserves exact schema-v1 forwarded identities and lowers local OUTPUT with pure schema-v2 `O`/`P` transaction metadata, typed routing/listener/escape requirements, and descriptive lifecycle order; five extensions remain rejected and nothing executes | No |
 | x86_64 Android mechanism checkpoint | The exact ignored local-OUTPUT TPROXY transaction passes on one rooted WSA development profile with remote cleanup; production execution, receipts, driver, and release matrix remain open | No |
-| Private native xtables owner | Rust owns stable hooks, restore/save, schema-2 dual-family routing identity, bidirectional loopback validation, complete IPv4/IPv6 residue audits, authenticated shell/native fencing, rollback, recovery, cleanup, and the transition lease behind test-only target admission; the production `scripts/tproxy` xtables/PBR writer remains | No |
-| Native xtables production cutover | Reviewed Android authorities and functional receipts admit the private owner, the lease transfers before the first Rust write, and replaced shell rule/restore duties are deleted | No, until all intended runtime duties are Rust-owned |
-| PBR/address-sync cutover | Rust owns routing and address-derived rules; standalone `addrsyncd` and shell route writers are removed | No |
+| Private native xtables owner | Rust owns stable hooks, restore/save, routing identity, readback, rollback, recovery, cleanup, and the transition lease | No |
+| Native xtables production code cutover | Native Generation/runtime composition is selected and every shell networking writer is deleted; final physical qualification remains open | No |
+| PBR/address-sync code cutover | Rust owns routing and address-derived reconciliation; standalone and shell owners are removed | No |
 | Rust subscription cutover | One bounded Rust worker owns fetch, parsing, assets, validation, recovery, periodic/manual refresh, and Generation reload; the packaged shell updater is non-invoked and awaits B3 removal | No |
-| Remaining runtime cutover | Rust owns configuration, subscription, direct diagnostics, internal file observation, coordinator startup recovery, offline cleanup, and the sole CLI surface; networking-effect ownership and legacy runtime scripts plus `jq`/AWK/curl artifacts remain | No |
-| Rust-only qualification | Only platform-required install/boot/disable/uninstall glue remains outside Rust; supported runtime scope passes Android, recovery, performance, security, provenance, and packaging gates | Yes, after ADR-0011 and every final gate pass |
+| Remaining runtime cutover | Rust owns configuration, subscription, diagnostics, observation, recovery, offline cleanup, and the sole CLI; legacy runtime scripts and helper binaries are removed | No |
+| Native package structural cutover | One exact 13-file development profile contains only Rust, Sing-Box, assets, and platform glue | No |
+| Native release qualification | The exact payload passes Android, recovery, performance, security, provenance, and packaging gates | Yes, after ADR-0011 and every final gate pass |
 
 None of the bridge, shadow, parity, or partial-cutover checkpoints may be named or published as an
 alpha, beta, release candidate, or release. No development checkpoint may have two independent

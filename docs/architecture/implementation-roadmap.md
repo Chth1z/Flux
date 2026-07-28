@@ -1,6 +1,6 @@
 # Flux Rust-Unification Implementation Roadmap
 
-Last revised: 2026-07-27
+Last revised: 2026-07-28
 
 This roadmap is the authoritative execution order for the Flux rewrite. The
 [blueprint](fluxd-blueprint.md) and [technical specification](fluxd-technical-specification.md)
@@ -49,98 +49,81 @@ Rust unification does not relax the safety design:
 
 ## Current Baseline
 
-The repository is healthy but the production composition is still hybrid.
+The code-first R4-R6 cutover is complete in commits `8bf0533`, `1863553`, and `6180397`.
+Production composition now selects the native Rust runtime; the legacy shell bridge, standalone
+helper daemon, compatibility configuration, packaged `jq`, and bridge package profile are removed.
+This is an implementation checkpoint, not release qualification.
 
 | Area | Delivered evidence | Production status |
 |---|---|---|
 | Control and lifecycle | Unix control socket, serialized intent, durable administrative state, startup recovery, runtime status | Rust-owned |
 | Proxy Engine | Descriptor-pinned Sing-Box validation, launch, readiness, bounded stop/reap, restart compensation | Rust-owned |
-| Generation lifecycle | Prepare/attach/verify/publish/retire coordinator with fail-open rollback | Rust coordinator, shell effects |
-| Legacy rendering | Rust source-shape renderer, receipts, and pinned shell oracle | Development bridge only |
-| Canonical Generation assembly | Desired State, engine/capture artifacts, complete capability/planning identity, prior lineage, and strict prepared record | Read-only coordinator inspection delivered; native mutation remains disconnected |
-| Network inventory | Strict link/address/route/rule observer with loss recovery | Drives serialized, snapshot-bound address reconciliation; native mutation remains disconnected |
-| Canonical xtables | Schema-v2 lowering, native restore/save adapter, durable transaction owner, exact readback and recovery | Positive target constructor is test-only |
-| Functional canary | Detailed evidence model and privileged Linux harnesses | Production selects structural-only compatibility |
-| Address synchronization | Standalone Rust `addrsyncd` plus shell controller | Separate legacy owner |
-| Product configuration | Complete strict schema-3 Desired State plus bounded bridge compiler | Rust-owned in the active bridge |
+| Generation lifecycle | Prepare/attach/verify/publish/retire coordinator with fail-open rollback | Native Rust composition selected |
+| Canonical Generation assembly | Desired State, engine/capture artifacts, capability/planning identity, prior lineage, and strict records | Production-connected |
+| Network inventory | Strict link/address/route/rule observer with loss recovery | Drives native serialized address reconciliation |
+| Canonical xtables | Schema-v2 lowering, native restore/save adapter, durable transaction owner, exact readback and recovery | Production-connected behind exact device admission |
+| Functional canary | Detailed evidence model and privileged Linux/Android development harnesses | Final packaged ARM64 qualification remains open |
+| Address synchronization | Snapshot-bound native successor/retirement reconciliation | Rust-owned; standalone helper removed |
+| Product configuration | Complete strict schema-3 Desired State and canonical engine/capture compilation | Rust-owned; compatibility compiler removed |
 | Subscription and assets | Bounded Rust HTTPS worker, compiler, local asset store, Sing-Box validation, active/predecessor recovery, periodic/manual refresh, and Generation reload | Production-connected; shell updater has no runtime caller |
-| Package | Strong hashes, device evidence, SBOM, and provenance validation | Verifier requires bridge binaries/scripts |
+| Package | Schema-4 exact 13-file native inventory and strict verifier | Development-only; final evidence/provenance incomplete |
 
-Verification at the review baseline:
+Verification at the R6 checkpoint:
 
-- `cargo xtask ci`: pass;
-- root workspace: 984 passed, 0 failed, 12 ignored;
-- excluded `addrsyncd`: 98 passed, 0 failed, 1 ignored;
-- no physical Android ARM64 qualification was available in the review environment.
+- `cargo xtask ci`: pass, including workspace tests, strict Clippy, and pinned ARM64 cross-check;
+- `cargo xtask build-android`: pass with at least 16 KiB ELF `PT_LOAD` alignment;
+- native module-glue syntax and isolated behavior suite: pass;
+- physical packaged ARM64 install/runtime/rollback/uninstall qualification: pending.
 
-The completed A1 host checkpoint adds 30 engine/Desired-State compiler tests, 7 production-writer
-binding tests, and the passing full dispatcher suite. These are host correctness results, not Android
-release authorization.
-
-The native mechanisms are therefore credible, but they do not yet form a production data path.
-Future progress is measured by reducing that composition gap, not by the number of new
-non-authorizing artifacts.
+Future progress is measured by qualifying the exact payload and completing release trust metadata,
+not by rebuilding a bridge or adding non-authorizing test infrastructure.
 
 ## Delivery Model
 
-Three lanes run concurrently and join at one fenced networking-writer cutover.
+The original three lanes converged in the code-first R4-R6 cutover. The remaining executable order
+is payload qualification, then release trust completion:
 
 ```mermaid
 flowchart LR
-    G0["Gate 0: freeze minimum Rust-only scope"]
-    A1["Lane A: host runtime composition"]
-    A2["Generation + inventory + native owner"]
-    B1["Lane B: Rust product plane"]
-    B2["Config + subscription + CLI + package"]
-    C1["Lane C: physical Android qualification"]
-    C2["Mark + RPDB + canary + coexistence"]
-    D1["Gate 1: cutover-ready target"]
-    D2["Fenced writer transfer"]
-    D3["Gate 2: Rust-only package"]
-    R["Release qualification"]
-
-    G0 --> A1 --> A2 --> D1
-    G0 --> B1 --> B2 --> D3
-    G0 --> C1 --> C2 --> D1
-    D1 --> D2 --> D3 --> R
+    Code["R4-R6 native code cutover"] --> Stage["Exact ARM64 payload stage"]
+    Stage --> Device["Clean-baseline physical qualification"]
+    Device --> Trust["Provenance, SPDX, metadata, checksums"]
+    Trust --> Promote["Promote native profile"]
+    Promote --> R["Release qualification"]
 ```
 
-Lane C may pause when hardware is unavailable. Lanes A and B do not pause with it.
+The lane sections below retain the implementation record and define the evidence still required.
+They do not authorize rebuilding the retired bridge.
 
 ## Gate 0: Freeze The Minimum Release Scope
 
-Status: **package-profile gate complete on 2026-07-25; scope freeze remains in force**.
+Status: **complete and collapsed to one native profile by R6 on 2026-07-28; scope freeze remains in
+force**.
 
-`conf/manifest.json` schema 3 records both checked contracts. `bridge` is
-`development-only`; `rust-only` is `failing-until-complete`. The verifier derives its selected
-runtime, binary, source-binding, and payload inventories from that manifest and proves the 13
-Rust-only forbidden paths are exactly the 26-path bridge inventory minus the 13 final paths. Its
-profile-independent retired set contains the former event and updater paths and is rejected for
-every stage. This gate does not resolve the `addrsyncd` license for reuse and does not authorize
-release or physical Android behavior.
+`conf/manifest.json` schema 4 records one `native` profile, marked `development-only`, with the exact
+13-file runtime/module inventory and exactly two binaries. Inventory equality rejects every removed
+bridge path and all other undeclared residue. There is no compatibility profile, profile selector,
+forbidden-difference list, retired-path list, or `addrsyncd` source/provenance boundary. This gate
+still does not authorize release or physical Android behavior.
 
 ### Work
 
 - Record xtables TPROXY as the only required first-release mutation adapter while retaining
   ADR-0005's nftables, xtables, TUN, inactive selection order.
-- Freeze the shell bridge as a correctness/rollback oracle. Admit only security, correctness,
-  cutover-contract, and rollback fixes.
+- Keep historical bridge evidence in Git/dated records only; do not restore runtime or oracle code.
 - Do not implement or activate nftables/TUN mutation, eBPF/ipset acceleration, established-flow
   caching, DIVERT, `sk_lookup`, TC/TCX, kernel extensions, or new proof abstractions unless a P0
   deliverable is blocked on one exact missing fact. Bounded capability discovery and a
   non-authorizing selector remain in scope because backend probes must not trigger autoload and
   absent optional mechanisms must not block a viable path.
-- Define a machine-checked Rust-only package profile now, even though it initially fails. Its final
-  inventory is `fluxd`, Sing-Box, Rust-owned configuration/assets, and platform glue only.
-- Make the bridge package profile explicitly development-only so a passing bridge verifier cannot
-  be mistaken for release readiness.
-- Resolve the license disposition of the `addrsyncd` submodule before copying code or producing a
-  release SBOM. Its current `UNLICENSED` manifest is not an approved reusable license.
+- Preserve the machine-checked native inventory: `fluxd`, Sing-Box, Rust-owned
+  configuration/assets, and platform glue only.
+- Keep the single profile development-only until physical and release-evidence gates pass.
 
 ### Exit Gate
 
-- One checked manifest names every final runtime path and every forbidden bridge path.
-- CI can distinguish bridge verification from the failing-until-complete Rust-only release gate.
+- One checked manifest names every final runtime path and rejects all undeclared residue.
+- CI verifies one native composition and one module-glue workflow.
 - No active work item outside the lanes below can delay Rust unification.
 
 ## Lane A: Host Runtime Composition
@@ -335,43 +318,22 @@ Exit: all supported runtime and diagnostic commands work with only `fluxd` plus 
 
 ### B3. Rust-Only Package Profile
 
-- Promote the manifest-owned Rust-only profile introduced at Gate 0 only after the final runtime
-  inventory and ownership checks pass; keep bridge staging explicitly development-only until Gate 1
-  completes.
-- Exclude `bin/addrsyncd`, `bin/jq`, `conf/settings.ini`, `conf/addrsyncd.toml`, and all runtime
-  dispatcher/config/core/addrsync/rules/tproxy/updater/control scripts from the Rust-only profile.
-  Do not delete the still-active bridge or its rollback oracle before the fenced writer transfer.
-- Keep only root-framework-required install, boot exec/restart, disable, and uninstall glue. Verify
-  by policy that those files contain no `iptables`, `ip6tables`, `ip rule`, `ip route`, `nft`, BPF,
-  subscription, configuration compilation, or owned-state cleanup logic.
-- Update SBOM, immutable source revisions, hashes, licenses, checksums, build metadata, and
-  reproducibility/signing evidence for the reduced binary set.
-- **B3.1 complete 2026-07-26:** because the pinned NDK r27d predates default 16 KB alignment, every
-  ARM64 release and x86_64 checkpoint link now receives explicit 16 KB maximum/common page-size
-  options. The structured verifier rejects any packaged ELF when any non-empty `PT_LOAD` has
-  non-power-of-two, incongruent, or below-`2**14` alignment. The real ARM64 cross-build and WSA
-  checkpoint artifacts each expose four `0x4000` load segments; WSA's 4 KB runtime remains
-  mechanism-only evidence.
-- **B3.2 complete 2026-07-26:** Rust-only verification now bounds and normalizes the exact four final
-  platform-glue sources, requires direct installation, daemon, and online/offline uninstall
-  delegation, and rejects networking/kernel mutation, subscription retrieval, configuration
-  compilation, owned-state cleanup, legacy runtime paths, direct Sing-Box orchestration, and dynamic
-  command construction. A minimal fixture passes eight hostile ownership-drift cases; the unchanged
-  shared bridge glue remains valid only for the development profile.
-- **B3.3 complete 2026-07-26:** staging and source-byte verification select two tracked Rust-only
-  overrides for the installer and bounded watchdog while bridge continues to select the root
-  sources. Real-source tests now prove exact 13/26-path trees, rejection of each of the 13 active
-  bridge-only paths plus both retired paths, and override tamper detection. Isolated shell tests prove fresh placement, fail-closed reinstall,
-  daemon-only recovery, and the five-failure restart bound; profile status remains
-  `failing-until-complete`.
-- **B3.4 complete 2026-07-26:** full repository CI, the exact shell matrix, the pinned ARM64 release
-  build with four `0x4000` `LOAD` segments, and the rooted x86_64 WSA mechanism checkpoint pass.
-  Active documentation is reconciled; physical ARM64 C1/C2 remains the next authority boundary.
-- Preserve frozen oracle fixtures under tests only as long as they add differential value; they are
-  not staged into the module.
+Status: **structural/code cutover complete in R6 on 2026-07-28; release qualification open**.
 
-Exit: the Rust-only verifier accepts the intended file inventory and rejects every legacy runtime
-artifact. It remains unreleasable until Lane C and the cutover gate pass.
+- Schema 4 has one exact native profile with `fluxd`, Sing-Box, configuration/assets, and platform
+  glue. It rejects every undeclared file rather than maintaining a compatibility difference list.
+- Root platform glue is bounded and contains no networking policy, subscription retrieval,
+  configuration compilation, or owned-state cleanup implementation.
+- The installer is fresh-only, the module-local service runs a bounded daemon restart loop, and
+  uninstall delegates online/offline recovery to Rust.
+- ARM64 and x86_64 Android links require at least 16 KiB load alignment and structured ELF
+  validation.
+- Legacy helper binaries, configuration, runtime scripts, source-policy/oracle tooling, and oracle
+  fixtures are deleted.
+- Remaining work is trusted physical evidence, complete provenance/licenses, SPDX, build metadata,
+  checksums, reproducibility/signing, and explicit profile promotion.
+
+Exit for release: the verifier accepts the exact payload with every release-evidence gate complete.
 
 ## Lane C: Physical Android Qualification
 
@@ -430,37 +392,38 @@ boot/namespace/device profile.
 Exit: the exact native target is cutover-ready. Evidence from a different boot, binary, namespace,
 or device does not transfer.
 
-## Gate 1: Fenced Networking Writer Cutover
+## Gate 1: Native Writer Code Cutover And Qualification
 
-Prerequisites: Lane A through A4 and Lane C through C3 are complete for the same target.
+Status: **code cutover complete in R4-R5; physical qualification pending**.
 
-### Procedure
+The code-first correction deliberately allowed intermediate commits that were not release artifacts.
+The native composition was selected and the bridge was deleted before the final packaged device
+run. Therefore the project cannot retroactively claim that this source revision observed a live
+bridge-to-native fence transfer on the target. Historical device state is preserved only as prior
+evidence, not as authority for the new payload.
 
-1. Prepare the complete Rust Generation while the legacy networking writers remain active and unchanged.
-2. Quiesce the dispatcher and stop standalone `addrsyncd`; prove their parent and child identities
-   are gone.
-3. Detach the legacy capture path and prove exact legacy xtables/address/RPDB absence.
-4. While capture is detached, reconcile the exact pinned Sing-Box Generation to a ready listener;
-   this may retain an already-matching child or perform the coordinator's bounded replacement.
-5. Transfer the shared writer fence to the native owner before its first write.
-6. Converge routes/rules and attach native capture last, run exact readback, and require the
-   functional canary before publishing Running.
-7. On failure, the native owner first reaches verified clean absence. Only then may the legacy
-   owner reacquire the fence for a development rollback. No two writers overlap.
-8. Repeat start, reload, crash recovery, address churn, stop, and rollback until evidence is stable.
-9. Delete the replaced runtime code and rollback adapter from the shipped package. Git history and
-   frozen fixtures, not a dormant compatibility path, preserve prior behavior.
+The remaining Gate 1 procedure starts from an independently proven clean Flux baseline:
 
-The transfer is atomic only with respect to Flux writer authority. It intentionally allows a
-verified fail-open interval between legacy detachment and native attachment; it does not claim that
-engine, xtables, RPDB, and route changes share one kernel transaction.
+1. Stop the existing user runtime and prove exact Flux process and kernel-object absence.
+2. Preserve the customized old runtime/module trees in a validated root-only device-local backup.
+3. Install the exact native payload only after `/data/adb/flux` is absent.
+4. Converge the reviewed Generation, attach capture last, read back every owned object, and require
+   the scoped functional canary before Running.
+5. Inject bounded native failures and prove verified clean fail-open recovery without a second
+   writer or compatibility fallback.
+6. Exercise restart, address churn, stop, offline cleanup, reboot recovery, and uninstall.
+7. Prove zero Flux-owned residue, then restore the exact pre-test backup or leave Flux absent
+   according to the reviewed test outcome.
+
+This procedure qualifies fresh native ownership and cleanup. It does not manufacture evidence for
+the retired live-transfer step.
 
 ### Exit Gate
 
 - Production `run_daemon` constructs the native writer, consumes live inventory, and selects the
   required functional canary.
-- `ProcessRuntimeWriter`, production `ProcessPhaseDispatcher`, standalone `addrsyncd`, and shell
-  networking mutation are absent from the production call graph.
+- Legacy runtime writers, helper daemons, and shell networking mutation are absent from the
+  production call graph.
 - Every tested failure ends old-active, new-active, or verified clean fail-open.
 - Reboot and same-/previous-boot journal recovery pass on the physical target.
 - Native `resync` returns completion only after exact no-change or successor convergence; queued work
@@ -468,7 +431,10 @@ engine, xtables, RPDB, and route changes share one kernel transaction.
 
 ## Gate 2: Rust-Only Package
 
-Prerequisites: Gate 1 and Lane B through B3 are complete.
+Status: **structural/code gate complete in R6; evidence/promotion gate pending**.
+
+Prerequisites for promotion: the remaining Gate 1 physical qualification and Lane B release
+metadata are complete for the exact staged payload.
 
 The package must satisfy all of the following:
 
@@ -482,8 +448,10 @@ The package must satisfy all of the following:
   mutable/unpinned sources, invalid licenses, mismatched SBOM/checksums, and Android ELF programs
   without 16 KB-compatible `LOAD` alignment.
 
-Passing Gate 2 means the architecture is Rust-unified. It does not by itself authorize a public
-release; final qualification follows.
+The first four structural bullets are implemented by schema 4 and the module-glue policy. The
+status/physical evidence and release metadata bullets remain open. Passing all of Gate 2 means the
+architecture is Rust-unified and payload-qualified; it still does not by itself authorize a public
+release because final trust and release qualification follow.
 
 ## Release Qualification
 
@@ -547,31 +515,33 @@ The list below is the working order. Items with the same prefix may run in paral
 
 ### P0: Rust Unification
 
-1. `P0-G0` **Done 2026-07-25:** add the explicit failing Rust-only package profile and freeze
-   optional scope.
+1. `P0-G0` **Done 2026-07-28:** freeze optional scope and collapse the temporary profiles into one
+   exact native development contract.
 2. `P0-A1` **Done 2026-07-25:** make `FluxConfig` the complete product Desired State, connect canonical
    engine publication, and remove shell/`jq` product-policy derivation from Rust-owned preparation.
 3. `P0-A2` **Done 2026-07-25:** implement the complete non-mutating Generation assembler,
    read-only coordinator inspection, evidence/lineage identity, and bounded prepared record.
 4. `P0-A3` **Done 2026-07-25:** feed `NetworkInventorySource` into serialized non-mutating
    reconciliation, bind exact snapshot provenance, and absorb address-observation behavior/tests.
-5. `P0-A4` **Host composition gate done 2026-07-26:** the exact archive/facade/coordinator path,
+5. `P0-A4` **Production code selection done 2026-07-28:** the exact archive/facade/coordinator path,
    qualified target source, typed resync, native offline recovery, and required real namespace
-   composition pass. Production selection still requires physical C1-C3 and Gate 1 authority.
+   composition pass; final payload qualification remains C1-C3.
 6. `P0-B1` **Done 2026-07-26:** move subscription, asset, template processing, validated snapshot
    recovery, periodic/manual refresh, and Generation reload into Rust; retire every runtime caller
    of the packaged updater oracle.
 7. `P0-B2` **Done 2026-07-26:** Rust owns direct control, observation, diagnostics, offline cleanup,
    and uninstall delegation; the forwarding wrapper and shell preview path are removed.
-8. `P0-B3` **Structural gate done 2026-07-26:** the exact Rust-only stage excludes `jq`, legacy
-   configs, runtime scripts, and `addrsyncd`, and enforces 16 KB-compatible Android ELF alignment.
-   Keep it non-releasable until the physical-device and writer-cutover gates pass.
-9. `P0-C1` Bind one physical Android 5.10/ARM64 device profile.
-10. `P0-C2` Complete mark/RPDB/topology authority for that exact target.
-11. `P0-C3` Pass functional, VPN/netd, dual-stack, tethering, and cleanup qualification.
-12. `P0-D1` Execute the fenced cutover, remove legacy runtime ownership, and pass Gate 2.
-
-Items 5-8 continue when items 9-11 are hardware-blocked.
+8. `P0-B3` **Code gate done 2026-07-28:** schema 4 has one exact native stage; bridge profiles,
+   helpers, configs, scripts, and oracle tooling are removed; ARM64 ELF alignment is enforced.
+9. `P0-C1` **Collection machinery and reviewed target evidence partially complete:** bind the final
+   staged `fluxd` plus Sing-Box payload to one fresh physical ARM64 qualification run.
+10. `P0-C2` **Planning implementation complete, final payload proof pending:** rerun exact
+    mark/RPDB/topology admission on the unchanged qualification identity.
+11. `P0-C3` Pass packaged functional, VPN/netd, dual-stack, tethering, failure, and cleanup
+    qualification.
+12. `P0-D1` **Code cutover done 2026-07-28:** native Rust composition is selected and legacy runtime
+    ownership is deleted. Complete the bounded install/boot/runtime/rollback/uninstall proof before
+    treating Gate 2 as release-qualified.
 
 ### P1: Release Assurance
 
@@ -581,7 +551,8 @@ Items 5-8 continue when items 9-11 are hardware-blocked.
    a required advisory/license/source gate, and all 264 unsafe blocks in root-workspace targets have
    an explicit semantic audit with re-audit triggers. A bounded deterministic parser-fuzz smoke is
    now required in CI; add coverage visibility, a retained crash corpus, and sanitizer applicability
-   evidence. Resolve the excluded bridge license only if that code will be reused or shipped.
+   evidence. Removed bridge code is outside the package and must not be copied back without a new
+   source/license review.
 3. Qualify the second maintained Android kernel/vendor profile and every advertised root framework.
 4. Capture final resource/performance baselines and chaos evidence.
 5. Complete SBOM, source/hash/license, build metadata, reproducibility/signing, migration, and

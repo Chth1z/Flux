@@ -41,6 +41,7 @@ pub use existing_flux::collect_android_existing_flux_ownership;
 pub use existing_flux::{
     AndroidExistingFluxOwnershipDigest, AndroidExistingFluxOwnershipError,
     AndroidExistingFluxOwnershipErrorKind, AndroidExistingFluxOwnershipObservation,
+    AndroidExistingFluxProcessObservationErrorClass,
 };
 
 pub use nftables::{

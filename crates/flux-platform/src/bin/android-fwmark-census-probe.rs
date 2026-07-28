@@ -12,8 +12,9 @@ use flux_core::{
 use flux_platform::AndroidFwmarkCensusCoordinatorRequest;
 #[cfg(any(target_os = "android", test))]
 use flux_platform::{
-    AndroidExistingFluxOwnershipErrorKind, SystemAndroidFwmarkCensusSourceErrorKind,
-    SystemAndroidKernelConfigErrorClass, SystemAndroidNftablesObservationErrorClass,
+    AndroidExistingFluxOwnershipErrorKind, AndroidExistingFluxProcessObservationErrorClass,
+    SystemAndroidFwmarkCensusSourceErrorKind, SystemAndroidKernelConfigErrorClass,
+    SystemAndroidNftablesObservationErrorClass,
 };
 #[cfg(target_os = "android")]
 use flux_platform::{
@@ -180,9 +181,16 @@ const fn source_error_label(source: &SystemAndroidFwmarkCensusSourceError) -> &'
             }
         }
         SystemAndroidFwmarkCensusSourceErrorKind::ExistingFluxOwnership => {
-            match source.existing_flux_kind() {
-                Some(kind) => existing_flux_error_label(kind),
-                None => "existing-flux-ownership",
+            match (
+                source.existing_flux_kind(),
+                source.existing_flux_process_class(),
+            ) {
+                (
+                    Some(AndroidExistingFluxOwnershipErrorKind::ProcessObservationFailed),
+                    Some(class),
+                ) => existing_flux_process_error_label(class),
+                (Some(kind), _) => existing_flux_error_label(kind),
+                (None, _) => "existing-flux-ownership",
             }
         }
         kind => direct_source_error_label(kind),
@@ -269,6 +277,34 @@ const fn existing_flux_error_label(kind: AndroidExistingFluxOwnershipErrorKind) 
         }
         AndroidExistingFluxOwnershipErrorKind::JournalIdentityUnavailable => {
             "existing-flux-journal-identity"
+        }
+    }
+}
+
+#[cfg(any(target_os = "android", test))]
+const fn existing_flux_process_error_label(
+    class: AndroidExistingFluxProcessObservationErrorClass,
+) -> &'static str {
+    match class {
+        AndroidExistingFluxProcessObservationErrorClass::ProcRootOpen => {
+            "existing-flux-proc-root-open"
+        }
+        AndroidExistingFluxProcessObservationErrorClass::ProcRootRead => {
+            "existing-flux-proc-root-read"
+        }
+        AndroidExistingFluxProcessObservationErrorClass::ProcEntryRead => {
+            "existing-flux-proc-entry-read"
+        }
+        AndroidExistingFluxProcessObservationErrorClass::LimitExceeded => {
+            "existing-flux-proc-limit"
+        }
+        AndroidExistingFluxProcessObservationErrorClass::InvalidPid => {
+            "existing-flux-proc-invalid-pid"
+        }
+        AndroidExistingFluxProcessObservationErrorClass::PidOpen => "existing-flux-proc-pid-open",
+        AndroidExistingFluxProcessObservationErrorClass::StatRead => "existing-flux-proc-stat-read",
+        AndroidExistingFluxProcessObservationErrorClass::StatMalformed => {
+            "existing-flux-proc-stat-malformed"
         }
     }
 }
@@ -515,6 +551,50 @@ mod tests {
             ),
         ] {
             let label = existing_flux_error_label(kind);
+            assert_eq!(label, expected);
+            assert!(label.len() <= 40);
+            assert!(
+                label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'-')
+            );
+        }
+
+        for (class, expected) in [
+            (
+                AndroidExistingFluxProcessObservationErrorClass::ProcRootOpen,
+                "existing-flux-proc-root-open",
+            ),
+            (
+                AndroidExistingFluxProcessObservationErrorClass::ProcRootRead,
+                "existing-flux-proc-root-read",
+            ),
+            (
+                AndroidExistingFluxProcessObservationErrorClass::ProcEntryRead,
+                "existing-flux-proc-entry-read",
+            ),
+            (
+                AndroidExistingFluxProcessObservationErrorClass::LimitExceeded,
+                "existing-flux-proc-limit",
+            ),
+            (
+                AndroidExistingFluxProcessObservationErrorClass::InvalidPid,
+                "existing-flux-proc-invalid-pid",
+            ),
+            (
+                AndroidExistingFluxProcessObservationErrorClass::PidOpen,
+                "existing-flux-proc-pid-open",
+            ),
+            (
+                AndroidExistingFluxProcessObservationErrorClass::StatRead,
+                "existing-flux-proc-stat-read",
+            ),
+            (
+                AndroidExistingFluxProcessObservationErrorClass::StatMalformed,
+                "existing-flux-proc-stat-malformed",
+            ),
+        ] {
+            let label = existing_flux_process_error_label(class);
             assert_eq!(label, expected);
             assert!(label.len() <= 40);
             assert!(

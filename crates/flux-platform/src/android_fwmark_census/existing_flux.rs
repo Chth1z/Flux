@@ -190,11 +190,24 @@ pub enum AndroidExistingFluxOwnershipErrorKind {
     JournalIdentityUnavailable,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AndroidExistingFluxProcessObservationErrorClass {
+    ProcRootOpen,
+    ProcRootRead,
+    ProcEntryRead,
+    LimitExceeded,
+    InvalidPid,
+    PidOpen,
+    StatRead,
+    StatMalformed,
+}
+
 /// Sanitized failure from existing-Flux ownership observation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AndroidExistingFluxOwnershipError {
     kind: AndroidExistingFluxOwnershipErrorKind,
     observed_count: Option<usize>,
+    process_observation_class: Option<AndroidExistingFluxProcessObservationErrorClass>,
 }
 
 impl AndroidExistingFluxOwnershipError {
@@ -208,10 +221,18 @@ impl AndroidExistingFluxOwnershipError {
         self.observed_count
     }
 
+    #[must_use]
+    pub const fn process_observation_class(
+        self,
+    ) -> Option<AndroidExistingFluxProcessObservationErrorClass> {
+        self.process_observation_class
+    }
+
     const fn new(kind: AndroidExistingFluxOwnershipErrorKind) -> Self {
         Self {
             kind,
             observed_count: None,
+            process_observation_class: None,
         }
     }
 
@@ -219,6 +240,15 @@ impl AndroidExistingFluxOwnershipError {
         Self {
             kind,
             observed_count: Some(count),
+            process_observation_class: None,
+        }
+    }
+
+    const fn process_observation(class: AndroidExistingFluxProcessObservationErrorClass) -> Self {
+        Self {
+            kind: AndroidExistingFluxOwnershipErrorKind::ProcessObservationFailed,
+            observed_count: None,
+            process_observation_class: Some(class),
         }
     }
 }
@@ -296,6 +326,7 @@ mod implementation {
     use super::{
         AndroidExistingFluxOwnershipDigest, AndroidExistingFluxOwnershipError,
         AndroidExistingFluxOwnershipErrorKind, AndroidExistingFluxOwnershipObservation,
+        AndroidExistingFluxProcessObservationErrorClass,
     };
     use crate::android_fwmark_census::AndroidXtablesFwmarkObservation;
 
@@ -625,38 +656,32 @@ flux-process-count\0flux-chain-count\0flux-route-count\0flux-rule-count\0";
     fn observe_flux_processes(
         proc_root: &Path,
     ) -> Result<FluxProcessSnapshot, AndroidExistingFluxOwnershipError> {
-        scan_flux_processes(proc_root).map_err(|_| {
-            AndroidExistingFluxOwnershipError::new(
-                AndroidExistingFluxOwnershipErrorKind::ProcessObservationFailed,
-            )
-        })
+        scan_flux_processes(proc_root)
+            .map_err(AndroidExistingFluxOwnershipError::process_observation)
     }
 
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    enum ProcessScanError {
-        Io,
-        LimitExceeded,
-        Malformed,
-    }
-
-    fn scan_flux_processes(proc_root: &Path) -> Result<FluxProcessSnapshot, ProcessScanError> {
+    fn scan_flux_processes(
+        proc_root: &Path,
+    ) -> Result<FluxProcessSnapshot, AndroidExistingFluxProcessObservationErrorClass> {
         scan_flux_processes_bounded(proc_root, MAX_SYSTEM_PROCESS_ENTRIES)
     }
 
     fn scan_flux_processes_bounded(
         proc_root: &Path,
         max_entries: usize,
-    ) -> Result<FluxProcessSnapshot, ProcessScanError> {
-        let root = open_directory(proc_root).map_err(|_| ProcessScanError::Io)?;
-        let mut entries =
-            std::fs::read_dir(descriptor_path(&root)).map_err(|_| ProcessScanError::Io)?;
+    ) -> Result<FluxProcessSnapshot, AndroidExistingFluxProcessObservationErrorClass> {
+        let root = open_directory(proc_root)
+            .map_err(|_| AndroidExistingFluxProcessObservationErrorClass::ProcRootOpen)?;
+        let mut entries = std::fs::read_dir(descriptor_path(&root))
+            .map_err(|_| AndroidExistingFluxProcessObservationErrorClass::ProcRootRead)?;
         let mut observed_entries = 0_usize;
         let mut flux_processes = BTreeSet::new();
         for entry in &mut entries {
-            let entry = entry.map_err(|_| ProcessScanError::Io)?;
+            let entry = entry
+                .map_err(|_| AndroidExistingFluxProcessObservationErrorClass::ProcEntryRead)?;
             observed_entries = observed_entries.saturating_add(1);
             if observed_entries > max_entries {
-                return Err(ProcessScanError::LimitExceeded);
+                return Err(AndroidExistingFluxProcessObservationErrorClass::LimitExceeded);
             }
             let Some(pid) = parse_pid(entry.file_name().as_bytes())? else {
                 continue;
@@ -665,14 +690,15 @@ flux-process-count\0flux-chain-count\0flux-route-count\0flux-rule-count\0";
             {
                 Ok(directory) => directory,
                 Err(error) if process_disappeared(&error) => continue,
-                Err(_) => return Err(ProcessScanError::Io),
+                Err(_) => return Err(AndroidExistingFluxProcessObservationErrorClass::PidOpen),
             };
             let stat = match read_bounded_stat(&pid_directory) {
                 Ok(stat) => stat,
                 Err(error) if process_disappeared(&error) => continue,
-                Err(_) => return Err(ProcessScanError::Io),
+                Err(_) => return Err(AndroidExistingFluxProcessObservationErrorClass::StatRead),
             };
-            let parsed = parse_proc_stat(&stat, pid).ok_or(ProcessScanError::Malformed)?;
+            let parsed = parse_proc_stat(&stat, pid)
+                .ok_or(AndroidExistingFluxProcessObservationErrorClass::StatMalformed)?;
             if let Some(kind) = flux_process_kind(parsed.command) {
                 flux_processes.insert(FluxProcessIdentity {
                     kind,
@@ -716,16 +742,18 @@ flux-process-count\0flux-chain-count\0flux-route-count\0flux-rule-count\0";
         matches!(error.raw_os_error(), Some(code) if code == libc::ENOENT || code == libc::ESRCH)
     }
 
-    fn parse_pid(bytes: &[u8]) -> Result<Option<u32>, ProcessScanError> {
+    fn parse_pid(
+        bytes: &[u8],
+    ) -> Result<Option<u32>, AndroidExistingFluxProcessObservationErrorClass> {
         if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_digit) {
             return Ok(None);
         }
         if bytes[0] == b'0' {
-            return Err(ProcessScanError::Malformed);
+            return Err(AndroidExistingFluxProcessObservationErrorClass::InvalidPid);
         }
         let pid = parse_decimal(bytes)
             .and_then(|pid| u32::try_from(pid).ok())
-            .ok_or(ProcessScanError::Malformed)?;
+            .ok_or(AndroidExistingFluxProcessObservationErrorClass::InvalidPid)?;
         Ok(Some(pid))
     }
 

@@ -270,8 +270,8 @@ fn malformed_or_linked_proc_stat_cannot_prove_process_absence() {
         malformed
             .collect()
             .expect_err("malformed stat must fail")
-            .kind(),
-        AndroidExistingFluxOwnershipErrorKind::ProcessObservationFailed
+            .process_observation_class(),
+        Some(AndroidExistingFluxProcessObservationErrorClass::StatMalformed)
     );
 
     let linked = Fixture::new();
@@ -281,8 +281,11 @@ fn malformed_or_linked_proc_stat_cannot_prove_process_absence() {
     fs::write(&target, proc_stat(43, "init", 43)).expect("write link target");
     std::os::unix::fs::symlink(target, directory.join("stat")).expect("link proc stat");
     assert_eq!(
-        linked.collect().expect_err("linked stat must fail").kind(),
-        AndroidExistingFluxOwnershipErrorKind::ProcessObservationFailed
+        linked
+            .collect()
+            .expect_err("linked stat must fail")
+            .process_observation_class(),
+        Some(AndroidExistingFluxProcessObservationErrorClass::StatRead)
     );
 }
 
@@ -295,8 +298,8 @@ fn malformed_numeric_proc_entries_fail_closed() {
             fixture
                 .collect()
                 .expect_err("malformed numeric PID entry must fail")
-                .kind(),
-            AndroidExistingFluxOwnershipErrorKind::ProcessObservationFailed,
+                .process_observation_class(),
+            Some(AndroidExistingFluxProcessObservationErrorClass::InvalidPid),
             "entry {name}"
         );
     }
@@ -310,7 +313,7 @@ fn process_scan_budget_counts_nonnumeric_entries() {
 
     assert_eq!(
         scan_flux_processes_bounded(temp.path(), 1),
-        Err(ProcessScanError::LimitExceeded)
+        Err(AndroidExistingFluxProcessObservationErrorClass::LimitExceeded)
     );
 }
 

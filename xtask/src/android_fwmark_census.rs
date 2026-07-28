@@ -4,7 +4,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, ExitStatus, Output};
 use std::time::Duration;
 
 use flux_platform::{
@@ -64,6 +64,54 @@ const PROBE_ERROR_PREFIX: &[u8] = b"Android fwmark census probe: ";
 const SANITIZED_PROBE_FAILURE_PREFIX: &str = "fwmark census probe stopped before reports: ";
 const RUNNER_STAGE_FAILURE_PREFIX: &str = "fwmark census runner stopped at ";
 const MAX_PROBE_ERROR_LABEL_BYTES: usize = 160;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProbeTermination {
+    Success,
+    TimedOut,
+    Aborted,
+    Killed,
+    SegmentationFault,
+    RemoteIdentityChanged,
+    RemoteProcessCheckFailed,
+    RemoteProcessResidue,
+    RemoteOwnerCheckFailed,
+    Failed,
+}
+
+impl ProbeTermination {
+    fn from_exit_status(status: ExitStatus) -> Self {
+        if status.success() {
+            return Self::Success;
+        }
+        match status.code() {
+            Some(124) => Self::TimedOut,
+            Some(134) => Self::Aborted,
+            Some(137) => Self::Killed,
+            Some(139) => Self::SegmentationFault,
+            Some(70) => Self::RemoteIdentityChanged,
+            Some(71) => Self::RemoteProcessCheckFailed,
+            Some(72) => Self::RemoteProcessResidue,
+            Some(73) => Self::RemoteOwnerCheckFailed,
+            _ => Self::Failed,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Success => "probe-noncanonical-report",
+            Self::TimedOut => "probe-timeout",
+            Self::Aborted => "probe-aborted",
+            Self::Killed => "probe-killed",
+            Self::SegmentationFault => "probe-segfault",
+            Self::RemoteIdentityChanged => "remote-identity-changed",
+            Self::RemoteProcessCheckFailed => "remote-process-check-failed",
+            Self::RemoteProcessResidue => "remote-process-residue",
+            Self::RemoteOwnerCheckFailed => "remote-owner-check-failed",
+            Self::Failed => "probe-failed-without-label",
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RunnerStage {
@@ -793,7 +841,8 @@ fn push_execute_and_validate(
     remote: &RemoteDirectory,
 ) -> Result<(), String> {
     let remote_binary = format!("{}/{}", remote.path, PROCESS_AND_REMOTE_BINARY_NAME);
-    let adb_artifact = artifact_path_for_adb(options, artifact)?;
+    let adb_artifact = artifact_path_for_adb(options, artifact)
+        .map_err(|_| sanitized_probe_failure("remote-artifact-path"))?;
     let mut push = Command::new(options.adb());
     push.args(["-s", options.serial(), "push"])
         .arg(adb_artifact)
@@ -804,24 +853,28 @@ fn push_execute_and_validate(
         ADB_PUSH_TIMEOUT,
         MAX_ADB_CAPTURE_BYTES,
         "push exact ARM64 fwmark census probe ELF",
-    )?;
+    )
+    .map_err(|_| sanitized_probe_failure("remote-push-transport"))?;
     if !output.status.success() {
         return Err("ADB push of the exact fwmark census probe failed".to_owned());
     }
-    revalidate_device(options, expected_device, "after the remote push")?;
+    revalidate_device(options, expected_device, "after the remote push")
+        .map_err(|_| sanitized_probe_failure("remote-post-push-identity"))?;
 
-    let script = remote_script(remote, artifact_identity, expected_device)?;
-    let output = normalize_adb_shell_output(adb_root_shell_output(
+    let script = remote_script(remote, artifact_identity, expected_device)
+        .map_err(|_| sanitized_probe_failure("remote-script"))?;
+    let output = adb_root_shell_output(
         options,
         script.as_bytes(),
         ADB_EXEC_TIMEOUT,
         "run bounded read-only ARM64 fwmark census",
-    )?)?;
-    let reports = parse_probe_reports_or_sanitized_failure(
-        output.status.success(),
-        &output.stdout,
-        &output.stderr,
-    )?;
+    )
+    .map_err(|_| sanitized_probe_failure("remote-execution-transport"))?;
+    let output = normalize_adb_shell_output(output)
+        .map_err(|_| sanitized_probe_failure("remote-execution-newlines"))?;
+    let termination = ProbeTermination::from_exit_status(output.status);
+    let reports =
+        parse_probe_reports_or_sanitized_failure(termination, &output.stdout, &output.stderr)?;
     std::io::stdout()
         .write_all(&output.stdout)
         .map_err(|error| format!("forward sanitized census reports: {error}"))?;
@@ -841,18 +894,32 @@ fn push_execute_and_validate(
 }
 
 fn parse_probe_reports_or_sanitized_failure(
-    success: bool,
+    termination: ProbeTermination,
     stdout: &[u8],
     stderr: &[u8],
 ) -> Result<AndroidFwmarkCensusProbeReports, String> {
     match parse_android_fwmark_census_probe_reports(stdout) {
         Ok(reports) => Ok(reports),
-        Err(error) if success => Err(error),
+        Err(_) if termination == ProbeTermination::Success => {
+            Err(sanitized_probe_failure(termination.label()))
+        }
         Err(_) => match sanitized_probe_error_label(stderr) {
             Some(label) => Err(format!("{SANITIZED_PROBE_FAILURE_PREFIX}{label}")),
-            None => Err("fwmark census probe failed before emitting canonical reports".to_owned()),
+            None if termination != ProbeTermination::Failed => {
+                Err(sanitized_probe_failure(termination.label()))
+            }
+            None if !stderr.is_empty() => {
+                Err(sanitized_probe_failure("probe-noncanonical-diagnostics"))
+            }
+            None if !stdout.is_empty() => Err(sanitized_probe_failure("probe-noncanonical-report")),
+            None => Err(sanitized_probe_failure(termination.label())),
         },
     }
+}
+
+fn sanitized_probe_failure(label: &'static str) -> String {
+    debug_assert!(canonical_probe_error_label(label));
+    format!("{SANITIZED_PROBE_FAILURE_PREFIX}{label}")
 }
 
 fn sanitized_probe_error_label(stderr: &[u8]) -> Option<&str> {
@@ -1415,7 +1482,7 @@ mod tests {
     #[test]
     fn pre_report_probe_failure_surfaces_only_the_sanitized_probe_label() {
         let error = match parse_probe_reports_or_sanitized_failure(
-            false,
+            ProbeTermination::Failed,
             b"",
             b"Android fwmark census probe: collection-external-before-nftables-observation\n",
         ) {
@@ -1428,15 +1495,67 @@ mod tests {
         );
 
         let hostile = b"Android fwmark census probe: secret=/data/user/0/private\n";
-        let error = match parse_probe_reports_or_sanitized_failure(false, b"", hostile) {
+        let error = match parse_probe_reports_or_sanitized_failure(
+            ProbeTermination::Failed,
+            b"",
+            hostile,
+        ) {
             Ok(_) => panic!("hostile diagnostics must not become a report"),
             Err(error) => error,
         };
         assert_eq!(
             error,
-            "fwmark census probe failed before emitting canonical reports"
+            "fwmark census probe stopped before reports: probe-noncanonical-diagnostics"
         );
         assert!(!error.contains("private"));
+    }
+
+    #[test]
+    fn pre_report_termination_classes_are_bounded_and_payload_free() {
+        for (termination, stdout, stderr, expected) in [
+            (
+                ProbeTermination::TimedOut,
+                b"".as_slice(),
+                b"timeout: private diagnostics\n".as_slice(),
+                "probe-timeout",
+            ),
+            (
+                ProbeTermination::Aborted,
+                b"".as_slice(),
+                b"abort at /data/private\n".as_slice(),
+                "probe-aborted",
+            ),
+            (
+                ProbeTermination::SegmentationFault,
+                b"".as_slice(),
+                b"".as_slice(),
+                "probe-segfault",
+            ),
+            (
+                ProbeTermination::Failed,
+                b"noncanonical report\n".as_slice(),
+                b"".as_slice(),
+                "probe-noncanonical-report",
+            ),
+            (
+                ProbeTermination::Failed,
+                b"".as_slice(),
+                b"".as_slice(),
+                "probe-failed-without-label",
+            ),
+            (
+                ProbeTermination::Success,
+                b"".as_slice(),
+                b"".as_slice(),
+                "probe-noncanonical-report",
+            ),
+        ] {
+            let error = parse_probe_reports_or_sanitized_failure(termination, stdout, stderr)
+                .expect_err("a pre-report termination must stop");
+            assert_eq!(error, format!("{SANITIZED_PROBE_FAILURE_PREFIX}{expected}"));
+            assert!(!error.contains("private"));
+            assert!(canonical_probe_error_label(expected));
+        }
     }
 
     #[test]

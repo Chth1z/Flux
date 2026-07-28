@@ -102,7 +102,7 @@ fn read_word(relative: &str, bytes: &[u8], index: &mut usize) -> Result<ShellWor
                 *index += 1;
                 if *index >= bytes.len() {
                     return Err(format!(
-                        "Rust-only platform glue {relative} ends with an incomplete escape"
+                        "native platform glue {relative} ends with an incomplete escape"
                     ));
                 }
                 if bytes[*index] == b'\r' && *index + 1 < bytes.len() && bytes[*index + 1] == b'\n'
@@ -120,7 +120,7 @@ fn read_word(relative: &str, bytes: &[u8], index: &mut usize) -> Result<ShellWor
             b'$' => read_dollar(relative, bytes, index, &mut literal, &mut dynamic)?,
             b'`' => {
                 return Err(format!(
-                    "Rust-only platform glue {relative} contains forbidden dynamic command construction using backticks"
+                    "native platform glue {relative} contains forbidden dynamic command construction using backticks"
                 ));
             }
             byte => {
@@ -131,7 +131,7 @@ fn read_word(relative: &str, bytes: &[u8], index: &mut usize) -> Result<ShellWor
     }
     if literal.is_empty() && !dynamic {
         return Err(format!(
-            "Rust-only platform glue {relative} contains an empty shell word at byte {start}"
+            "native platform glue {relative} contains an empty shell word at byte {start}"
         ));
     }
     Ok(ShellWord { literal, dynamic })
@@ -150,7 +150,7 @@ fn read_single_quoted(
     }
     if *index == bytes.len() {
         return Err(format!(
-            "Rust-only platform glue {relative} contains an unterminated single quote"
+            "native platform glue {relative} contains an unterminated single quote"
         ));
     }
     literal.push_str(std::str::from_utf8(&bytes[start..*index]).expect("ASCII source"));
@@ -183,7 +183,7 @@ fn read_double_quoted(
             b'$' => read_dollar(relative, bytes, index, literal, dynamic)?,
             b'`' => {
                 return Err(format!(
-                    "Rust-only platform glue {relative} contains forbidden dynamic command construction using backticks"
+                    "native platform glue {relative} contains forbidden dynamic command construction using backticks"
                 ));
             }
             byte => {
@@ -194,7 +194,7 @@ fn read_double_quoted(
     }
     if *index == bytes.len() {
         return Err(format!(
-            "Rust-only platform glue {relative} contains an unterminated double quote"
+            "native platform glue {relative} contains an unterminated double quote"
         ));
     }
     *index += 1;
@@ -219,7 +219,7 @@ fn read_dollar(
             return Ok(());
         }
         return Err(format!(
-            "Rust-only platform glue {relative} contains forbidden dynamic command construction using command substitution"
+            "native platform glue {relative} contains forbidden dynamic command construction using command substitution"
         ));
     }
     if bytes[*index] == b'{' {
@@ -229,7 +229,7 @@ fn read_dollar(
         }
         if *index == bytes.len() {
             return Err(format!(
-                "Rust-only platform glue {relative} contains an unterminated parameter expansion"
+                "native platform glue {relative} contains an unterminated parameter expansion"
             ));
         }
         *index += 1;
@@ -266,7 +266,7 @@ fn skip_arithmetic(relative: &str, bytes: &[u8], index: &mut usize) -> Result<()
         }
     }
     Err(format!(
-        "Rust-only platform glue {relative} contains an unterminated arithmetic expansion"
+        "native platform glue {relative} contains an unterminated arithmetic expansion"
     ))
 }
 
@@ -328,7 +328,7 @@ fn parse_commands(relative: &str, tokens: &[Token]) -> Result<Vec<CommandNode>, 
     }
     if commands.is_empty() {
         return Err(format!(
-            "Rust-only platform glue {relative} contains no executable commands"
+            "native platform glue {relative} contains no executable commands"
         ));
     }
     Ok(commands)
@@ -397,7 +397,7 @@ fn validate_commands(relative: &str, commands: &[CommandNode]) -> Result<(), Str
             .find(|(_, forbidden)| executable == *forbidden)
         {
             return Err(format!(
-                "Rust-only platform glue {relative} invokes forbidden {category} executable '{executable}'"
+                "native platform glue {relative} invokes forbidden {category} executable '{executable}'"
             ));
         }
         if matches!(
@@ -405,16 +405,16 @@ fn validate_commands(relative: &str, commands: &[CommandNode]) -> Result<(), Str
             "sh" | "ash" | "bash" | "dash" | "busybox" | "toybox" | "env" | "xargs" | "command"
         ) {
             return Err(format!(
-                "Rust-only platform glue {relative} contains forbidden dynamic command construction through '{executable}'"
+                "native platform glue {relative} contains forbidden dynamic command construction through '{executable}'"
             ));
         }
         if executable == "trap" {
             let action = effective.arguments.first().ok_or_else(|| {
-                format!("Rust-only platform glue {relative} contains a trap without an action")
+                format!("native platform glue {relative} contains a trap without an action")
             })?;
             if action.dynamic || (action.literal != "-" && !is_identifier(&action.literal)) {
                 return Err(format!(
-                    "Rust-only platform glue {relative} contains forbidden dynamic command construction in a trap action"
+                    "native platform glue {relative} contains forbidden dynamic command construction in a trap action"
                 ));
             }
         }
@@ -425,7 +425,7 @@ fn validate_commands(relative: &str, commands: &[CommandNode]) -> Result<(), Str
                 .find(|(_, forbidden)| normalized.contains(*forbidden))
             {
                 return Err(format!(
-                    "Rust-only platform glue {relative} contains forbidden {category} marker '{fragment}' in shell syntax"
+                    "native platform glue {relative} contains forbidden {category} marker '{fragment}' in shell syntax"
                 ));
             }
         }
@@ -436,18 +436,18 @@ fn validate_commands(relative: &str, commands: &[CommandNode]) -> Result<(), Str
 fn effective_command(relative: &str, command: &CommandNode) -> Result<CommandNode, String> {
     if command.executable.dynamic {
         return Err(format!(
-            "Rust-only platform glue {relative} contains forbidden dynamic command construction in executable position"
+            "native platform glue {relative} contains forbidden dynamic command construction in executable position"
         ));
     }
     if command.executable.literal != "exec" {
         return Ok(command.clone());
     }
     let (executable, arguments) = command.arguments.split_first().ok_or_else(|| {
-        format!("Rust-only platform glue {relative} contains exec without a direct command")
+        format!("native platform glue {relative} contains exec without a direct command")
     })?;
     if executable.dynamic {
         return Err(format!(
-            "Rust-only platform glue {relative} contains forbidden dynamic command construction after exec"
+            "native platform glue {relative} contains forbidden dynamic command construction after exec"
         ));
     }
     Ok(CommandNode {
@@ -472,7 +472,7 @@ fn validate_delegation(relative: &str, commands: &[CommandNode]) -> Result<(), S
                 });
                 if !found {
                     return Err(format!(
-                        "Rust-only platform glue {relative} is missing required placement check '{required}'"
+                        "native platform glue {relative} is missing required placement check '{required}'"
                     ));
                 }
             }
@@ -491,9 +491,7 @@ fn validate_delegation(relative: &str, commands: &[CommandNode]) -> Result<(), S
                 &["cleanup", "--offline"],
             )
         }
-        _ => Err(format!(
-            "unreviewed Rust-only platform glue path {relative}"
-        )),
+        _ => Err(format!("unreviewed native platform glue path {relative}")),
     }
 }
 
@@ -518,7 +516,7 @@ fn require_command(
         Ok(())
     } else {
         Err(format!(
-            "Rust-only platform glue {relative} is missing required direct delegation command '{executable} {}'",
+            "native platform glue {relative} is missing required direct delegation command '{executable} {}'",
             arguments.join(" ")
         ))
     }

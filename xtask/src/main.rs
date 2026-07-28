@@ -13,15 +13,12 @@ mod android_fwmark_census;
 mod android_mark_preflight;
 mod android_profile;
 mod platform_glue;
-mod source_policy;
-mod xtables_oracle;
 
 const ANDROID_TARGET: &str = "aarch64-linux-android";
 const ANDROID_API_LEVEL: &str = "31";
 const ANDROID_NDK_REVISION: &str = "27.3.13750724";
 const LINUX_ANDROID_HOST_BUILD_TMPDIR: &str = "/tmp";
-const RELEASE_MANIFEST_SCHEMA_VERSION: u32 = 3;
-const RETIRED_RUNTIME_PATHS: [&str; 2] = ["scripts/flux-event", "scripts/updater.sh"];
+const RELEASE_MANIFEST_SCHEMA_VERSION: u32 = 4;
 const ANDROID_MIN_LOAD_ALIGNMENT: u64 = 1 << 14;
 const ANDROID_RUSTFLAGS: &str = concat!(
     "-C link-arg=-Wl,-z,max-page-size=16384 ",
@@ -30,14 +27,27 @@ const ANDROID_RUSTFLAGS: &str = concat!(
 const ANDROID_TARGET_RUSTFLAGS_ENV: &str = "CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS";
 const PACKAGE_METADATA_FILES: [&str; 3] =
     ["SBOM.spdx.json", "checksums.sha256", "build-metadata.json"];
-const RUST_ONLY_PLATFORM_GLUE_FILES: [&str; 4] = [
+const NATIVE_PLATFORM_GLUE_FILES: [&str; 4] = [
     "META-INF/com/google/android/update-binary",
     "customize.sh",
     "flux_service.sh",
     "uninstall.sh",
 ];
-const RUST_ONLY_SOURCE_OVERRIDE_DIR: &str = "packaging/rust-only";
-const RUST_ONLY_SOURCE_OVERRIDE_FILES: [&str; 2] = ["customize.sh", "flux_service.sh"];
+const NATIVE_REQUIRED_FILES: [&str; 13] = [
+    "META-INF/com/google/android/update-binary",
+    "META-INF/com/google/android/updater-script",
+    "bin/fluxd",
+    "bin/sing-box",
+    "conf/flux.toml",
+    "conf/template.json",
+    "conf/manifest.json",
+    "webroot/index.html",
+    "customize.sh",
+    "flux_service.sh",
+    "uninstall.sh",
+    "module.prop",
+    "LICENSE",
+];
 const MAX_PLATFORM_GLUE_SOURCE_BYTES: usize = 128 * 1024;
 const FORBIDDEN_PLATFORM_GLUE_EXECUTABLES: [(&str, &str); 16] = [
     ("networking mutation", "ip"),
@@ -183,10 +193,6 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
             require_no_arguments(&arguments)?;
             check_android()
         }
-        "check-shell-bridge-sources" => {
-            require_no_arguments(&arguments)?;
-            source_policy::validate(&workspace_root()?)
-        }
         "build-android" => {
             require_no_arguments(&arguments)?;
             build_android()
@@ -227,15 +233,10 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
         "collect-android-arm64-fwmark-census" => {
             android_fwmark_census::run(android_fwmark_census::parse_options(&arguments)?)
         }
-        "xtables-oracle" => {
-            let mode = xtables_oracle::parse_options(&arguments)?;
-            xtables_oracle::run(mode)
-        }
         "stage-module" => stage_module(parse_stage_module_options(&arguments)?),
         "verify-package" => verify_package(parse_verify_package_options(&arguments)?),
         "ci" => {
             require_no_arguments(&arguments)?;
-            source_policy::validate(&workspace_root()?)?;
             cargo(["fmt", "--all", "--", "--check"], &[])?;
             cargo(["check", "--workspace", "--all-targets"], &[])?;
             cargo(["test", "--workspace"], &[])?;
@@ -451,19 +452,16 @@ fn require_no_arguments(arguments: &[OsString]) -> Result<(), String> {
 struct StageModuleOptions {
     stage: PathBuf,
     runtime_binaries: PathBuf,
-    profile: PackageProfileName,
 }
 
 #[derive(Debug)]
 struct VerifyPackageOptions {
     stage: PathBuf,
-    profile: PackageProfileName,
 }
 
 #[derive(Debug)]
 struct WorkspaceSourceRevisions {
     fluxd: String,
-    addrsyncd: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -476,8 +474,7 @@ struct ReleaseManifest {
     note: String,
     binaries: Vec<BinaryManifest>,
     device_test_evidence: Vec<DeviceEvidenceManifest>,
-    retired_runtime_paths: Vec<String>,
-    package_profiles: Vec<PackageProfile>,
+    package_profile: PackageProfile,
 }
 
 #[derive(Debug, Deserialize)]
@@ -516,32 +513,18 @@ struct PackageProfile {
     status: PackageProfileStatus,
     description: String,
     required_files: Vec<String>,
-    forbidden_files: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 enum PackageProfileName {
-    Bridge,
-    RustOnly,
+    Native,
 }
 
 impl PackageProfileName {
-    fn parse(value: &std::ffi::OsStr) -> Result<Self, String> {
-        match value.to_str() {
-            Some("bridge") => Ok(Self::Bridge),
-            Some("rust-only") => Ok(Self::RustOnly),
-            Some(other) => Err(format!(
-                "unsupported package profile '{other}'; expected bridge or rust-only"
-            )),
-            None => Err("package profile must be valid UTF-8".to_owned()),
-        }
-    }
-
     const fn as_str(self) -> &'static str {
         match self {
-            Self::Bridge => "bridge",
-            Self::RustOnly => "rust-only",
+            Self::Native => "native",
         }
     }
 }
@@ -550,7 +533,6 @@ impl PackageProfileName {
 #[serde(rename_all = "kebab-case")]
 enum PackageProfileStatus {
     DevelopmentOnly,
-    FailingUntilComplete,
 }
 
 #[derive(Debug, Deserialize)]
@@ -655,7 +637,6 @@ struct DeviceEvidenceTest {
 fn parse_stage_module_options(arguments: &[OsString]) -> Result<StageModuleOptions, String> {
     let mut stage = None;
     let mut runtime_binaries = None;
-    let mut profile = None;
     let mut index = 0;
     while index < arguments.len() {
         let flag = arguments[index].to_string_lossy();
@@ -667,10 +648,7 @@ fn parse_stage_module_options(arguments: &[OsString]) -> Result<StageModuleOptio
             "--runtime-binaries" if runtime_binaries.is_none() => {
                 runtime_binaries = Some(PathBuf::from(value));
             }
-            "--profile" if profile.is_none() => {
-                profile = Some(PackageProfileName::parse(value)?);
-            }
-            "--stage" | "--runtime-binaries" | "--profile" => {
+            "--stage" | "--runtime-binaries" => {
                 return Err(format!("{flag} may only be supplied once"));
             }
             unknown => return Err(format!("unknown stage-module option '{unknown}'")),
@@ -682,13 +660,11 @@ fn parse_stage_module_options(arguments: &[OsString]) -> Result<StageModuleOptio
         stage: stage.ok_or_else(|| "stage-module requires --stage DIR".to_owned())?,
         runtime_binaries: runtime_binaries
             .ok_or_else(|| "stage-module requires --runtime-binaries DIR".to_owned())?,
-        profile: profile.unwrap_or(PackageProfileName::Bridge),
     })
 }
 
 fn parse_verify_package_options(arguments: &[OsString]) -> Result<VerifyPackageOptions, String> {
     let mut stage = None;
-    let mut profile = None;
     let mut index = 0;
     while index < arguments.len() {
         let flag = arguments[index].to_string_lossy();
@@ -697,10 +673,7 @@ fn parse_verify_package_options(arguments: &[OsString]) -> Result<VerifyPackageO
             .ok_or_else(|| format!("{flag} requires a value"))?;
         match flag.as_ref() {
             "--stage" if stage.is_none() => stage = Some(PathBuf::from(value)),
-            "--profile" if profile.is_none() => {
-                profile = Some(PackageProfileName::parse(value)?);
-            }
-            "--stage" | "--profile" => return Err(format!("{flag} may only be supplied once")),
+            "--stage" => return Err(format!("{flag} may only be supplied once")),
             unknown => return Err(format!("unknown verify-package option '{unknown}'")),
         }
         index = index.saturating_add(2);
@@ -708,7 +681,6 @@ fn parse_verify_package_options(arguments: &[OsString]) -> Result<VerifyPackageO
 
     Ok(VerifyPackageOptions {
         stage: stage.ok_or_else(|| "verify-package requires --stage DIR".to_owned())?,
-        profile: profile.unwrap_or(PackageProfileName::Bridge),
     })
 }
 
@@ -717,21 +689,6 @@ fn read_release_manifest(path: &Path) -> Result<ReleaseManifest, String> {
         &fs::read(path).map_err(|error| format!("cannot read {}: {error}", path.display()))?,
     )
     .map_err(|error| format!("invalid {}: {error}", path.display()))
-}
-
-fn package_profile(
-    profiles: &[PackageProfile],
-    name: PackageProfileName,
-) -> Result<&PackageProfile, String> {
-    profiles
-        .iter()
-        .find(|profile| profile.name == name)
-        .ok_or_else(|| {
-            format!(
-                "release manifest is missing the {} package profile",
-                name.as_str()
-            )
-        })
 }
 
 fn profile_requires(profile: &PackageProfile, relative: &str) -> bool {
@@ -748,169 +705,34 @@ fn validate_package_contract(manifest: &ReleaseManifest) -> Result<(), String> {
             manifest.schema_version
         ));
     }
-    let retired = validate_retired_runtime_paths(&manifest.retired_runtime_paths)?;
-    validate_package_profiles(&manifest.package_profiles, &retired)
+    validate_package_profile(&manifest.package_profile)
 }
 
-fn validate_retired_runtime_paths(
-    paths: &[String],
-) -> Result<std::collections::BTreeSet<&str>, String> {
-    if paths.is_empty() {
-        return Err("release manifest retired_runtime_paths must not be empty".to_owned());
+fn validate_package_profile(profile: &PackageProfile) -> Result<(), String> {
+    if profile.name != PackageProfileName::Native {
+        return Err("release manifest package profile must be native".to_owned());
     }
-    let mut actual = std::collections::BTreeSet::new();
-    for path in paths {
-        validated_relative_path("retired_runtime_paths", path)?;
-        if !actual.insert(path.as_str()) {
-            return Err(format!(
-                "release manifest retired_runtime_paths contains duplicate path {path}"
-            ));
-        }
+    if profile.status != PackageProfileStatus::DevelopmentOnly {
+        return Err("native package profile must be marked development-only".to_owned());
     }
-    let expected = RETIRED_RUNTIME_PATHS
+    require_manifest_text("package_profile.description", &profile.description)?;
+    let actual = validate_profile_path_list(
+        profile.name,
+        "required_files",
+        &profile.required_files,
+        false,
+    )?;
+    let expected = NATIVE_REQUIRED_FILES
         .into_iter()
         .collect::<std::collections::BTreeSet<_>>();
     if actual != expected {
         let missing = expected.difference(&actual).next().copied();
         let extra = actual.difference(&expected).next().copied();
         return Err(format!(
-            "release manifest retired_runtime_paths changed (missing={}, extra={})",
+            "native package required files changed (missing={}, extra={})",
             missing.unwrap_or("none"),
             extra.unwrap_or("none")
         ));
-    }
-    Ok(actual)
-}
-
-fn validate_package_profiles(
-    profiles: &[PackageProfile],
-    retired: &std::collections::BTreeSet<&str>,
-) -> Result<(), String> {
-    if profiles.len() != 2 {
-        return Err(
-            "release manifest must declare exactly the bridge and rust-only package profiles"
-                .to_owned(),
-        );
-    }
-
-    let mut names = std::collections::BTreeSet::new();
-    for profile in profiles {
-        if !names.insert(profile.name) {
-            return Err(format!(
-                "release manifest contains duplicate {} package profiles",
-                profile.name.as_str()
-            ));
-        }
-        require_manifest_text(
-            &format!("package_profiles[{}].description", profile.name.as_str()),
-            &profile.description,
-        )?;
-        let required = validate_profile_path_list(
-            profile.name,
-            "required_files",
-            &profile.required_files,
-            false,
-        )?;
-        let forbidden = validate_profile_path_list(
-            profile.name,
-            "forbidden_files",
-            &profile.forbidden_files,
-            true,
-        )?;
-        if let Some(overlap) = required.intersection(&forbidden).next() {
-            return Err(format!(
-                "{} package profile path {overlap} cannot be both required and forbidden",
-                profile.name.as_str()
-            ));
-        }
-        if let Some(path) = required.intersection(retired).next() {
-            return Err(format!(
-                "{} package profile cannot require retired runtime path {path}",
-                profile.name.as_str()
-            ));
-        }
-        if let Some(path) = forbidden.intersection(retired).next() {
-            return Err(format!(
-                "{} package profile must not duplicate retired runtime path {path} in forbidden_files",
-                profile.name.as_str()
-            ));
-        }
-    }
-
-    let bridge = package_profile(profiles, PackageProfileName::Bridge)?;
-    let rust_only = package_profile(profiles, PackageProfileName::RustOnly)?;
-    if bridge.status != PackageProfileStatus::DevelopmentOnly {
-        return Err("bridge package profile must be marked development-only".to_owned());
-    }
-    if rust_only.status != PackageProfileStatus::FailingUntilComplete {
-        return Err(
-            "rust-only package profile must be marked failing-until-complete at Gate 0".to_owned(),
-        );
-    }
-    if !bridge.forbidden_files.is_empty() {
-        return Err("bridge package profile must not declare forbidden files".to_owned());
-    }
-
-    let bridge_required = bridge
-        .required_files
-        .iter()
-        .map(String::as_str)
-        .collect::<std::collections::BTreeSet<_>>();
-    let rust_required = rust_only
-        .required_files
-        .iter()
-        .map(String::as_str)
-        .collect::<std::collections::BTreeSet<_>>();
-    if rust_required.len() >= bridge_required.len() || !rust_required.is_subset(&bridge_required) {
-        return Err(
-            "rust-only required files must be a strict subset of the bridge required files"
-                .to_owned(),
-        );
-    }
-    let expected_forbidden = bridge_required
-        .difference(&rust_required)
-        .copied()
-        .collect::<std::collections::BTreeSet<_>>();
-    let actual_forbidden = rust_only
-        .forbidden_files
-        .iter()
-        .map(String::as_str)
-        .collect::<std::collections::BTreeSet<_>>();
-    if actual_forbidden != expected_forbidden {
-        let missing = expected_forbidden.difference(&actual_forbidden).next();
-        let extra = actual_forbidden.difference(&expected_forbidden).next();
-        return Err(format!(
-            "rust-only forbidden files must exactly name every bridge-only path (missing={}, extra={})",
-            missing.map_or("none", |value| *value),
-            extra.map_or("none", |value| *value)
-        ));
-    }
-
-    for required in ["bin/fluxd", "bin/sing-box", "conf/manifest.json"] {
-        if !rust_required.contains(required) {
-            return Err(format!(
-                "rust-only package profile must require final runtime path {required}"
-            ));
-        }
-    }
-    for required in RUST_ONLY_PLATFORM_GLUE_FILES {
-        if !rust_required.contains(required) {
-            return Err(format!(
-                "rust-only package profile must require platform glue path {required}"
-            ));
-        }
-    }
-    for forbidden in [
-        "bin/addrsyncd",
-        "bin/jq",
-        "conf/settings.ini",
-        "conf/addrsyncd.toml",
-    ] {
-        if !actual_forbidden.contains(forbidden) {
-            return Err(format!(
-                "rust-only package profile must forbid bridge path {forbidden}"
-            ));
-        }
     }
     Ok(())
 }
@@ -930,7 +752,7 @@ fn validate_profile_path_list<'a>(
     let mut unique = std::collections::BTreeSet::new();
     for path in paths {
         validated_relative_path(
-            &format!("package_profiles[{}].{field}", profile.as_str()),
+            &format!("package_profile[{}].{field}", profile.as_str()),
             path,
         )?;
         if !unique.insert(path.as_str()) {
@@ -1013,7 +835,7 @@ fn stage_module(options: StageModuleOptions) -> Result<(), String> {
     let root = workspace_root()?;
     let source_manifest = read_release_manifest(&root.join("conf/manifest.json"))?;
     validate_package_contract(&source_manifest)?;
-    let profile = package_profile(&source_manifest.package_profiles, options.profile)?;
+    let profile = &source_manifest.package_profile;
 
     build_android()?;
 
@@ -1028,12 +850,10 @@ fn stage_module(options: StageModuleOptions) -> Result<(), String> {
         &options.runtime_binaries,
         &fluxd_source,
         profile,
-        &source_manifest.retired_runtime_paths,
     )?;
 
     let status = match profile.status {
         PackageProfileStatus::DevelopmentOnly => "development-only",
-        PackageProfileStatus::FailingUntilComplete => "failing-until-complete",
     };
     println!(
         "staged {status} {} Android module at {}",
@@ -1041,8 +861,7 @@ fn stage_module(options: StageModuleOptions) -> Result<(), String> {
         options.stage.display()
     );
     println!(
-        "check it with `cargo xtask verify-package --profile {} --stage {}`",
-        profile.name.as_str(),
+        "check it with `cargo xtask verify-package --stage {}`",
         options.stage.display(),
     );
     Ok(())
@@ -1054,7 +873,6 @@ fn stage_module_from_artifacts(
     runtime_binaries: &Path,
     fluxd_source: &Path,
     profile: &PackageProfile,
-    retired_runtime_paths: &[String],
 ) -> Result<(), String> {
     if !fluxd_source.is_file() {
         return Err(format!(
@@ -1068,7 +886,7 @@ fn stage_module_from_artifacts(
         if relative.starts_with("bin/") {
             continue;
         }
-        let source = authoritative_module_source_path(root, profile, relative);
+        let source = authoritative_module_source_path(root, relative);
         copy_entry(&source, &stage.join(relative))?;
     }
 
@@ -1086,8 +904,6 @@ fn stage_module_from_artifacts(
     copy_entry(fluxd_source, &stage.join("bin/fluxd"))?;
 
     require_package_layout(stage, profile)?;
-    reject_retired_runtime_paths(stage, retired_runtime_paths)?;
-    reject_forbidden_profile_files(stage, profile)?;
     validate_staged_runtime_inventory(stage, profile)
 }
 
@@ -1095,45 +911,28 @@ fn verify_package(options: VerifyPackageOptions) -> Result<(), String> {
     let source_root = workspace_root()?;
     let source_manifest = read_release_manifest(&source_root.join("conf/manifest.json"))?;
     validate_package_contract(&source_manifest)?;
-    let profile = package_profile(&source_manifest.package_profiles, options.profile)?;
-    let source_revisions = verify_workspace_source_state(&source_root, profile)?;
-    verify_package_dir_with_source(&options.stage, &source_root, options.profile)?;
-    validate_package_source_revisions(&options.stage, &source_revisions, profile)?;
+    let profile = &source_manifest.package_profile;
+    let source_revisions = verify_workspace_source_state(&source_root)?;
+    verify_package_dir_with_source(&options.stage, &source_root)?;
+    validate_package_source_revisions(&options.stage, &source_revisions)?;
 
     match profile.status {
         PackageProfileStatus::DevelopmentOnly => {
             println!(
-                "verified development-only bridge package at {}; this is not Rust-only release evidence",
+                "verified development-only native package at {}; this is not release evidence",
                 options.stage.display()
             );
             Ok(())
         }
-        PackageProfileStatus::FailingUntilComplete => Err(format!(
-            "{} package consistency passed, but the checked profile is marked failing-until-complete and cannot authorize a release",
-            profile.name.as_str()
-        )),
     }
 }
 
-fn verify_workspace_source_state(
-    root: &Path,
-    profile: &PackageProfile,
-) -> Result<WorkspaceSourceRevisions, String> {
+fn verify_workspace_source_state(root: &Path) -> Result<WorkspaceSourceRevisions, String> {
     require_clean_git_worktree(root, "Flux workspace")?;
     let fluxd_revision = git_stdout(root, &["rev-parse", "HEAD"])?;
     validate_source_revision("Flux workspace HEAD", &fluxd_revision)?;
-    let addrsyncd_revision = if profile_requires(profile, "bin/addrsyncd") {
-        let addrsyncd = root.join("addrsyncd");
-        require_clean_git_worktree(&addrsyncd, "addrsyncd submodule")?;
-        let revision = git_stdout(&addrsyncd, &["rev-parse", "HEAD"])?;
-        validate_source_revision("addrsyncd submodule HEAD", &revision)?;
-        Some(revision)
-    } else {
-        None
-    };
     Ok(WorkspaceSourceRevisions {
         fluxd: fluxd_revision,
-        addrsyncd: addrsyncd_revision,
     })
 }
 
@@ -1180,48 +979,33 @@ fn git_stdout(root: &Path, arguments: &[&str]) -> Result<String, String> {
 fn validate_package_source_revisions(
     stage: &Path,
     revisions: &WorkspaceSourceRevisions,
-    profile: &PackageProfile,
 ) -> Result<(), String> {
     let manifest_path = stage.join("conf/manifest.json");
     let manifest = read_release_manifest(&manifest_path)?;
-    validate_first_party_source_revisions(&manifest, revisions, profile)
+    validate_first_party_source_revisions(&manifest, revisions)
 }
 
 fn validate_first_party_source_revisions(
     manifest: &ReleaseManifest,
     revisions: &WorkspaceSourceRevisions,
-    profile: &PackageProfile,
 ) -> Result<(), String> {
-    let mut required = vec![("fluxd", revisions.fluxd.as_str())];
-    if profile_requires(profile, "bin/addrsyncd") {
-        required.push((
-            "addrsyncd",
-            revisions.addrsyncd.as_deref().ok_or_else(|| {
-                "bridge profile is missing the addrsyncd source revision".to_owned()
-            })?,
+    let name = "fluxd";
+    let expected = revisions.fluxd.as_str();
+    let actual = manifest
+        .binaries
+        .iter()
+        .find(|binary| binary.name == name)
+        .map(|binary| binary.source_revision.as_str())
+        .ok_or_else(|| format!("release manifest is missing first-party binary '{name}'"))?;
+    if actual != expected {
+        return Err(format!(
+            "manifest source_revision for '{name}' must equal the clean workspace revision {expected}, found {actual}"
         ));
-    }
-    for (name, expected) in required {
-        let actual = manifest
-            .binaries
-            .iter()
-            .find(|binary| binary.name == name)
-            .map(|binary| binary.source_revision.as_str())
-            .ok_or_else(|| format!("release manifest is missing first-party binary '{name}'"))?;
-        if actual != expected {
-            return Err(format!(
-                "manifest source_revision for '{name}' must equal the clean workspace revision {expected}, found {actual}"
-            ));
-        }
     }
     Ok(())
 }
 
-fn verify_package_dir_with_source(
-    stage: &Path,
-    source_root: &Path,
-    profile_name: PackageProfileName,
-) -> Result<(), String> {
+fn verify_package_dir_with_source(stage: &Path, source_root: &Path) -> Result<(), String> {
     let stage_metadata = fs::symlink_metadata(stage)
         .map_err(|error| format!("cannot inspect package stage {}: {error}", stage.display()))?;
     if stage_metadata.file_type().is_symlink() || !stage_metadata.is_dir() {
@@ -1233,11 +1017,9 @@ fn verify_package_dir_with_source(
 
     let source_manifest = read_release_manifest(&source_root.join("conf/manifest.json"))?;
     validate_package_contract(&source_manifest)?;
-    let source_profile = package_profile(&source_manifest.package_profiles, profile_name)?;
+    let source_profile = &source_manifest.package_profile;
 
     require_package_layout(stage, source_profile)?;
-    reject_retired_runtime_paths(stage, &source_manifest.retired_runtime_paths)?;
-    reject_forbidden_profile_files(stage, source_profile)?;
     reject_unsafe_package_entries(stage, stage)?;
     validate_source_bound_module_files(stage, source_root, source_profile)?;
     for relative in PACKAGE_METADATA_FILES {
@@ -1259,14 +1041,12 @@ fn verify_package_dir_with_source(
     let manifest_path = stage.join("conf/manifest.json");
     let manifest = read_release_manifest(&manifest_path)?;
     validate_package_contract(&manifest)?;
-    if manifest.package_profiles != source_manifest.package_profiles
-        || manifest.retired_runtime_paths != source_manifest.retired_runtime_paths
-    {
+    if manifest.package_profile != source_manifest.package_profile {
         return Err(
             "staged package path policy differs from checked-in conf/manifest.json".to_owned(),
         );
     }
-    let profile = package_profile(&manifest.package_profiles, profile_name)?;
+    let profile = &manifest.package_profile;
     validate_package_file_inventory(stage, &manifest, profile)?;
     validate_release_manifest(stage, &manifest, profile)?;
     validate_spdx_document(&stage.join("SBOM.spdx.json"), &manifest)?;
@@ -1627,7 +1407,7 @@ fn validate_source_bound_module_files(
     for relative in profile.required_files.iter().filter(|relative| {
         !relative.starts_with("bin/") && relative.as_str() != "conf/manifest.json"
     }) {
-        let source_path = authoritative_module_source_path(source_root, profile, relative);
+        let source_path = authoritative_module_source_path(source_root, relative);
         let source_metadata = fs::symlink_metadata(&source_path)
             .map_err(|error| format!("cannot inspect {}: {error}", source_path.display()))?;
         if source_metadata.file_type().is_symlink() || !source_metadata.is_file() {
@@ -1651,59 +1431,8 @@ fn validate_source_bound_module_files(
     Ok(())
 }
 
-fn authoritative_module_source_path(
-    source_root: &Path,
-    profile: &PackageProfile,
-    relative: &str,
-) -> PathBuf {
-    if profile.name == PackageProfileName::RustOnly
-        && RUST_ONLY_SOURCE_OVERRIDE_FILES.contains(&relative)
-    {
-        source_root
-            .join(RUST_ONLY_SOURCE_OVERRIDE_DIR)
-            .join(relative)
-    } else {
-        source_root.join(relative)
-    }
-}
-
-fn reject_forbidden_profile_files(stage: &Path, profile: &PackageProfile) -> Result<(), String> {
-    for relative in &profile.forbidden_files {
-        match fs::symlink_metadata(stage.join(relative)) {
-            Ok(_) => {
-                return Err(format!(
-                    "{} package contains forbidden bridge path {relative}",
-                    profile.name.as_str()
-                ));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(format!(
-                    "cannot inspect forbidden package path {}: {error}",
-                    stage.join(relative).display()
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn reject_retired_runtime_paths(stage: &Path, paths: &[String]) -> Result<(), String> {
-    for relative in paths {
-        match fs::symlink_metadata(stage.join(relative)) {
-            Ok(_) => {
-                return Err(format!("package contains retired runtime path {relative}"));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(format!(
-                    "cannot inspect retired package path {}: {error}",
-                    stage.join(relative).display()
-                ));
-            }
-        }
-    }
-    Ok(())
+fn authoritative_module_source_path(source_root: &Path, relative: &str) -> PathBuf {
+    source_root.join(relative)
 }
 
 fn validate_module_content(stage: &Path, profile: &PackageProfile) -> Result<(), String> {
@@ -1712,13 +1441,6 @@ fn validate_module_content(stage: &Path, profile: &PackageProfile) -> Result<(),
         "customize.sh",
         "flux_service.sh",
         "uninstall.sh",
-        "scripts/addrsync",
-        "scripts/core",
-        "scripts/dispatcher",
-        "scripts/init",
-        "scripts/lib",
-        "scripts/log",
-        "scripts/tproxy",
     ]
     .into_iter()
     .filter(|relative| profile_requires(profile, relative))
@@ -1733,9 +1455,7 @@ fn validate_module_content(stage: &Path, profile: &PackageProfile) -> Result<(),
         }
     }
 
-    if profile.name == PackageProfileName::RustOnly {
-        validate_rust_only_platform_glue(stage)?;
-    }
+    validate_native_platform_glue(stage)?;
 
     if profile_requires(profile, "META-INF/com/google/android/updater-script") {
         let updater = fs::read_to_string(stage.join("META-INF/com/google/android/updater-script"))
@@ -1789,48 +1509,30 @@ fn validate_module_content(stage: &Path, profile: &PackageProfile) -> Result<(),
             return Err("conf/template.json must contain a JSON object".to_owned());
         }
     }
-    for relative in ["conf/flux.toml", "conf/addrsyncd.toml"]
-        .into_iter()
-        .filter(|relative| profile_requires(profile, relative))
-    {
-        let contents = fs::read_to_string(stage.join(relative))
-            .map_err(|error| format!("cannot read {relative}: {error}"))?;
-        contents
-            .parse::<toml::Value>()
-            .map_err(|error| format!("invalid {relative}: {error}"))?;
-    }
-    if profile_requires(profile, "conf/settings.ini") {
-        let settings = fs::read_to_string(stage.join("conf/settings.ini"))
-            .map_err(|error| format!("cannot read conf/settings.ini: {error}"))?;
-        for key in ["PROXY_MODE", "BYPASS_SET_BACKEND"] {
-            if !settings
-                .lines()
-                .any(|line| line.starts_with(&format!("{key}=")))
-            {
-                return Err(format!(
-                    "conf/settings.ini is missing required setting {key}"
-                ));
-            }
-        }
-    }
+    let relative = "conf/flux.toml";
+    let contents = fs::read_to_string(stage.join(relative))
+        .map_err(|error| format!("cannot read {relative}: {error}"))?;
+    contents
+        .parse::<toml::Value>()
+        .map_err(|error| format!("invalid {relative}: {error}"))?;
     Ok(())
 }
 
-fn validate_rust_only_platform_glue(stage: &Path) -> Result<(), String> {
-    for relative in RUST_ONLY_PLATFORM_GLUE_FILES {
+fn validate_native_platform_glue(stage: &Path) -> Result<(), String> {
+    for relative in NATIVE_PLATFORM_GLUE_FILES {
         let path = stage.join(relative);
         let bytes = fs::read(&path)
-            .map_err(|error| format!("cannot read Rust-only platform glue {relative}: {error}"))?;
+            .map_err(|error| format!("cannot read native platform glue {relative}: {error}"))?;
         if bytes.len() > MAX_PLATFORM_GLUE_SOURCE_BYTES {
             return Err(format!(
-                "Rust-only platform glue {relative} exceeds {MAX_PLATFORM_GLUE_SOURCE_BYTES} bytes"
+                "native platform glue {relative} exceeds {MAX_PLATFORM_GLUE_SOURCE_BYTES} bytes"
             ));
         }
         let source = std::str::from_utf8(&bytes)
-            .map_err(|_| format!("Rust-only platform glue {relative} must be UTF-8"))?;
+            .map_err(|_| format!("native platform glue {relative} must be UTF-8"))?;
         if !source.is_ascii() || source.contains('\0') {
             return Err(format!(
-                "Rust-only platform glue {relative} must contain only non-NUL ASCII text"
+                "native platform glue {relative} must contain only non-NUL ASCII text"
             ));
         }
         platform_glue::validate_structure(relative, source)?;
@@ -2832,9 +2534,8 @@ fn print_help() {
            preflight-android-arm64-mark-ordering  Read-only ADR-0013 target viability report for one explicit rooted ARM64 Android serial\n\
            collect-android-arm64-profile  Run the production profile collector in one cleaned explicit-serial ARM64 test directory\n\
            collect-android-arm64-fwmark-census  Run the coherent read-only fwmark census in one cleaned explicit-serial ARM64 test directory\n\
-           xtables-oracle Verify or explicitly update pinned shell-generated restore fixtures; requires --check or --update\n\
-           stage-module   Build and stage a Magisk tree; requires --stage DIR --runtime-binaries DIR [--profile bridge|rust-only]\n\
-           verify-package Verify one package contract; requires --stage DIR [--profile bridge|rust-only]\n\
+           stage-module   Build and stage the native Magisk tree; requires --stage DIR --runtime-binaries DIR\n\
+           verify-package Verify the native package contract; requires --stage DIR\n\
            ci             Run host gates plus the pinned-NDK Android cross-check"
     );
 }
@@ -2920,33 +2621,13 @@ mod tests {
             .expect("checked release manifest must parse")
     }
 
-    fn checked_profile(name: PackageProfileName) -> PackageProfile {
-        checked_release_manifest()
-            .package_profiles
-            .into_iter()
-            .find(|profile| profile.name == name)
-            .expect("checked package profile must exist")
+    fn checked_profile() -> PackageProfile {
+        checked_release_manifest().package_profile
     }
 
-    fn package_profile_mut(
-        profiles: &mut [PackageProfile],
-        name: PackageProfileName,
-    ) -> &mut PackageProfile {
-        profiles
-            .iter_mut()
-            .find(|profile| profile.name == name)
-            .expect("mutable package profile must exist")
-    }
-
-    fn checked_package_profiles_json() -> serde_json::Value {
+    fn checked_package_profile_json() -> serde_json::Value {
         serde_json::from_str::<serde_json::Value>(include_str!("../../conf/manifest.json"))
-            .expect("checked release manifest JSON must parse")["package_profiles"]
-            .clone()
-    }
-
-    fn checked_retired_runtime_paths_json() -> serde_json::Value {
-        serde_json::from_str::<serde_json::Value>(include_str!("../../conf/manifest.json"))
-            .expect("checked release manifest JSON must parse")["retired_runtime_paths"]
+            .expect("checked release manifest JSON must parse")["package_profile"]
             .clone()
     }
 
@@ -2991,11 +2672,7 @@ mod tests {
                 )
                 .to_owned(),
                 "conf/template.json" => "{}\n".to_owned(),
-                "conf/flux.toml" | "conf/addrsyncd.toml" => "fixture = true\n".to_owned(),
-                "conf/settings.ini" => {
-                    "PROXY_MODE=\"tproxy\"\nBYPASS_SET_BACKEND=\"zone\"\n".to_owned()
-                }
-                value if value.starts_with("scripts/") => "#!/system/bin/sh\nexit 0\n".to_owned(),
+                "conf/flux.toml" => "fixture = true\n".to_owned(),
                 "webroot/index.html" => "<html></html>\n".to_owned(),
                 "LICENSE" => "fixture license\n".to_owned(),
                 other => panic!("unhandled required fixture file {other}"),
@@ -3100,105 +2777,61 @@ mod tests {
     }
 
     #[test]
-    fn package_profile_options_default_to_bridge_and_accept_rust_only() {
-        let stage = parse_stage_module_options(&[
+    fn package_commands_accept_only_native_contract_arguments() {
+        parse_stage_module_options(&[
             OsString::from("--stage"),
             OsString::from("stage"),
             OsString::from("--runtime-binaries"),
             OsString::from("runtime"),
         ])
-        .expect("bridge stage options must parse");
-        assert_eq!(stage.profile, PackageProfileName::Bridge);
+        .expect("native stage options must parse");
 
-        let verify = parse_verify_package_options(&[
-            OsString::from("--profile"),
-            OsString::from("rust-only"),
-            OsString::from("--stage"),
-            OsString::from("stage"),
-        ])
-        .expect("rust-only verify options must parse");
-        assert_eq!(verify.profile, PackageProfileName::RustOnly);
+        parse_verify_package_options(&[OsString::from("--stage"), OsString::from("stage")])
+            .expect("native verify options must parse");
 
         let error = parse_verify_package_options(&[
             OsString::from("--stage"),
             OsString::from("stage"),
             OsString::from("--profile"),
-            OsString::from("full"),
+            OsString::from("bridge"),
         ])
-        .expect_err("retired full profile must fail");
-        assert!(error.contains("expected bridge or rust-only"));
+        .expect_err("removed profile selector must fail");
+        assert!(error.contains("unknown verify-package option '--profile'"));
     }
 
     #[test]
-    fn checked_package_contract_names_the_exact_bridge_difference() {
+    fn checked_package_contract_is_the_exact_native_inventory() {
         let manifest = checked_release_manifest();
-        validate_package_contract(&manifest)
-            .expect("checked package profiles must be internally complete");
-        let bridge = package_profile(&manifest.package_profiles, PackageProfileName::Bridge)
-            .expect("bridge profile");
-        let rust_only = package_profile(&manifest.package_profiles, PackageProfileName::RustOnly)
-            .expect("rust-only profile");
-        assert_eq!(bridge.status, PackageProfileStatus::DevelopmentOnly);
-        assert_eq!(rust_only.status, PackageProfileStatus::FailingUntilComplete);
-        assert_eq!(
-            manifest.retired_runtime_paths,
-            RETIRED_RUNTIME_PATHS.map(str::to_owned)
-        );
-        assert_eq!(bridge.required_files.len(), 26);
-        assert_eq!(rust_only.required_files.len(), 13);
-        assert_eq!(rust_only.forbidden_files.len(), 13);
-        for required in RUST_ONLY_PLATFORM_GLUE_FILES {
+        validate_package_contract(&manifest).expect("checked native profile must be complete");
+        let profile = &manifest.package_profile;
+        assert_eq!(profile.name, PackageProfileName::Native);
+        assert_eq!(profile.status, PackageProfileStatus::DevelopmentOnly);
+        assert_eq!(profile.required_files.len(), NATIVE_REQUIRED_FILES.len());
+        for required in NATIVE_PLATFORM_GLUE_FILES {
             assert!(
-                rust_only.required_files.iter().any(|path| path == required),
-                "Rust-only contract must require platform glue {required}"
+                profile.required_files.iter().any(|path| path == required),
+                "native contract must require platform glue {required}"
             );
         }
 
         let mut incomplete = checked_release_manifest();
-        package_profile_mut(
-            &mut incomplete.package_profiles,
-            PackageProfileName::RustOnly,
-        )
-        .forbidden_files
-        .retain(|path| path != "bin/jq");
+        incomplete
+            .package_profile
+            .required_files
+            .retain(|path| path != "bin/sing-box");
         let error = validate_package_contract(&incomplete)
-            .expect_err("an unnamed bridge-only path must fail the contract");
-        assert!(error.contains("missing=bin/jq"));
+            .expect_err("missing native path must fail the contract");
+        assert!(error.contains("missing=bin/sing-box"));
     }
 
     #[test]
-    fn every_package_profile_rejects_retired_runtime_paths() {
-        let manifest = checked_release_manifest();
-        for name in [PackageProfileName::Bridge, PackageProfileName::RustOnly] {
-            let directory = TestDirectory::new(&format!("{}-retired-path", name.as_str()));
-            let profile =
-                package_profile(&manifest.package_profiles, name).expect("package profile");
-            for relative in &manifest.retired_runtime_paths {
-                let path = directory.0.join(relative);
-                fs::create_dir_all(path.parent().expect("retired path parent"))
-                    .expect("create retired path parent");
-                fs::write(&path, "retired residue\n").expect("write retired path fixture");
-                let error =
-                    reject_retired_runtime_paths(&directory.0, &manifest.retired_runtime_paths)
-                        .expect_err("retired path must fail every package profile");
-                assert!(
-                    error.contains(relative),
-                    "unexpected {} rejection for {relative}: {error}",
-                    profile.name.as_str()
-                );
-                fs::remove_file(&path).expect("remove retired path fixture");
-            }
-        }
-    }
-
-    #[test]
-    fn rust_only_platform_glue_accepts_delegation_and_rejects_owned_behavior() {
-        let directory = TestDirectory::new("rust-only-platform-glue");
+    fn native_platform_glue_accepts_delegation_and_rejects_owned_behavior() {
+        let directory = TestDirectory::new("native-platform-glue");
         let stage = &directory.0;
-        let rust_only = checked_profile(PackageProfileName::RustOnly);
-        write_required_module_fixture(stage, &rust_only);
-        validate_rust_only_platform_glue(stage)
-            .expect("minimal Rust-only platform glue must delegate directly to fluxd");
+        let native = checked_profile();
+        write_required_module_fixture(stage, &native);
+        validate_native_platform_glue(stage)
+            .expect("minimal native platform glue must delegate directly to fluxd");
 
         let hostile_cases = [
             (
@@ -3264,12 +2897,12 @@ mod tests {
         ];
 
         for (label, hostile_source, expected_category) in hostile_cases {
-            write_required_module_fixture(stage, &rust_only);
+            write_required_module_fixture(stage, &native);
             let path = stage.join("customize.sh");
             let mut source = fs::read_to_string(&path).expect("read clean glue fixture");
             source.push_str(hostile_source);
             fs::write(&path, source).expect("write hostile glue fixture");
-            let error = validate_rust_only_platform_glue(stage)
+            let error = validate_native_platform_glue(stage)
                 .expect_err("platform glue ownership drift must fail");
             assert!(
                 error.contains(expected_category),
@@ -3279,17 +2912,17 @@ mod tests {
     }
 
     #[test]
-    fn rust_only_platform_glue_uses_commands_not_comments_or_strings_as_delegation() {
-        let directory = TestDirectory::new("rust-only-platform-glue-structure");
+    fn native_platform_glue_uses_commands_not_comments_or_strings_as_delegation() {
+        let directory = TestDirectory::new("native-platform-glue-structure");
         let stage = &directory.0;
-        let rust_only = checked_profile(PackageProfileName::RustOnly);
-        write_required_module_fixture(stage, &rust_only);
+        let native = checked_profile();
+        write_required_module_fixture(stage, &native);
 
         let customize = stage.join("customize.sh");
         let mut source = fs::read_to_string(&customize).expect("read clean customize fixture");
         source.push_str("# iptables and /scripts/ are comments, not commands\n");
         fs::write(&customize, source).expect("write comment fixture");
-        validate_rust_only_platform_glue(stage)
+        validate_native_platform_glue(stage)
             .expect("forbidden words in comments must not invent runtime behavior");
 
         fs::write(
@@ -3301,7 +2934,7 @@ mod tests {
             ),
         )
         .expect("write comment-only delegation fixture");
-        let error = validate_rust_only_platform_glue(stage)
+        let error = validate_native_platform_glue(stage)
             .expect_err("comment and string markers must not satisfy delegation");
         assert!(
             error.contains("missing required direct delegation command"),
@@ -3310,11 +2943,11 @@ mod tests {
     }
 
     #[test]
-    fn rust_only_platform_glue_rejects_unbounded_or_non_ascii_source() {
-        let directory = TestDirectory::new("rust-only-platform-glue-text");
+    fn native_platform_glue_rejects_unbounded_or_non_ascii_source() {
+        let directory = TestDirectory::new("native-platform-glue-text");
         let stage = &directory.0;
-        let rust_only = checked_profile(PackageProfileName::RustOnly);
-        write_required_module_fixture(stage, &rust_only);
+        let native = checked_profile();
+        write_required_module_fixture(stage, &native);
 
         fs::write(
             stage.join("customize.sh"),
@@ -3322,143 +2955,80 @@ mod tests {
         )
         .expect("write oversized glue fixture");
         let oversized =
-            validate_rust_only_platform_glue(stage).expect_err("oversized platform glue must fail");
+            validate_native_platform_glue(stage).expect_err("oversized platform glue must fail");
         assert!(oversized.contains("exceeds 131072 bytes"));
 
-        write_required_module_fixture(stage, &rust_only);
+        write_required_module_fixture(stage, &native);
         let path = stage.join("customize.sh");
         let mut source = fs::read(&path).expect("read clean glue fixture");
         source.extend_from_slice(&[0xc3, 0xa9]);
         fs::write(&path, source).expect("write non-ASCII glue fixture");
         let non_ascii =
-            validate_rust_only_platform_glue(stage).expect_err("non-ASCII platform glue must fail");
+            validate_native_platform_glue(stage).expect_err("non-ASCII platform glue must fail");
         assert!(non_ascii.contains("non-NUL ASCII text"));
     }
 
     #[test]
-    fn current_bridge_glue_stays_bridge_valid_but_is_not_rust_only() {
+    fn staging_uses_the_exact_native_source_inventory() {
         let source_root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("xtask must be directly below the workspace root");
-        let directory = TestDirectory::new("current-bridge-platform-glue");
-        let stage = &directory.0;
-        let bridge = checked_profile(PackageProfileName::Bridge);
-        write_required_module_fixture(stage, &bridge);
-        for relative in RUST_ONLY_PLATFORM_GLUE_FILES {
-            fs::copy(source_root.join(relative), stage.join(relative))
-                .expect("copy active bridge platform glue into fixture");
-        }
-        validate_module_content(stage, &bridge)
-            .expect("the active shared bridge content must remain valid");
-
-        let error = validate_rust_only_platform_glue(stage)
-            .expect_err("active shared bridge glue must not satisfy Rust-only policy");
-        assert!(
-            error.contains("customize.sh"),
-            "unexpected bridge-policy rejection: {error}"
-        );
-    }
-
-    #[test]
-    fn staging_selects_exact_bridge_and_rust_only_source_inventories() {
-        let source_root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("xtask must be directly below the workspace root");
-
-        for (name, expected_count) in [
-            (PackageProfileName::Bridge, 26),
-            (PackageProfileName::RustOnly, 13),
-        ] {
-            let stage_directory = TestDirectory::new(&format!("{}-stage", name.as_str()));
-            let artifact_directory = TestDirectory::new(&format!("{}-artifacts", name.as_str()));
-            let profile = checked_profile(name);
-            let (runtime_binaries, fluxd) =
-                write_staging_binary_fixtures(&artifact_directory.0, &profile);
-
-            stage_module_from_artifacts(
-                source_root,
-                &stage_directory.0,
-                &runtime_binaries,
-                &fluxd,
-                &profile,
-                &checked_release_manifest().retired_runtime_paths,
-            )
-            .expect("checked profile must stage from authoritative sources");
-            assert_eq!(profile.required_files.len(), expected_count);
-            assert_exact_staged_inventory(&stage_directory.0, &profile);
-            validate_source_bound_module_files(&stage_directory.0, source_root, &profile)
-                .expect("staged source-owned files must retain their selected source bytes");
-
-            for relative in RUST_ONLY_SOURCE_OVERRIDE_FILES {
-                let selected =
-                    fs::read(stage_directory.0.join(relative)).expect("read staged profile source");
-                let expected_source =
-                    authoritative_module_source_path(source_root, &profile, relative);
-                assert_eq!(
-                    selected,
-                    fs::read(&expected_source).expect("read authoritative profile source")
-                );
-                if name == PackageProfileName::RustOnly {
-                    assert_ne!(
-                        selected,
-                        fs::read(source_root.join(relative)).expect("read bridge source"),
-                        "Rust-only staging must not reuse bridge source {relative}"
-                    );
-                } else {
-                    assert_eq!(expected_source, source_root.join(relative));
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn rust_only_stage_rejects_every_declared_legacy_path_and_binds_overrides() {
-        let source_root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("xtask must be directly below the workspace root");
-        let stage_directory = TestDirectory::new("rust-only-forbidden-stage");
-        let artifact_directory = TestDirectory::new("rust-only-forbidden-artifacts");
-        let rust_only = checked_profile(PackageProfileName::RustOnly);
+        let stage_directory = TestDirectory::new("native-stage");
+        let artifact_directory = TestDirectory::new("native-artifacts");
+        let profile = checked_profile();
         let (runtime_binaries, fluxd) =
-            write_staging_binary_fixtures(&artifact_directory.0, &rust_only);
+            write_staging_binary_fixtures(&artifact_directory.0, &profile);
+
         stage_module_from_artifacts(
             source_root,
             &stage_directory.0,
             &runtime_binaries,
             &fluxd,
-            &rust_only,
-            &checked_release_manifest().retired_runtime_paths,
+            &profile,
         )
-        .expect("Rust-only fixture must stage exactly");
+        .expect("native profile must stage from authoritative sources");
+        assert_exact_staged_inventory(&stage_directory.0, &profile);
+        validate_source_bound_module_files(&stage_directory.0, source_root, &profile)
+            .expect("staged source-owned files must retain authoritative bytes");
+    }
 
-        assert_eq!(rust_only.status, PackageProfileStatus::FailingUntilComplete);
-        for relative in &rust_only.forbidden_files {
-            let path = stage_directory.0.join(relative);
-            fs::create_dir_all(path.parent().expect("legacy path parent"))
-                .expect("create legacy path parent");
-            fs::write(&path, "legacy residue\n").expect("write legacy path fixture");
-            let error = reject_forbidden_profile_files(&stage_directory.0, &rust_only)
-                .expect_err("every declared bridge-only path must fail Rust-only staging");
-            assert!(
-                error.contains(relative),
-                "unexpected rejection for {relative}: {error}"
-            );
-            fs::remove_file(&path).expect("remove legacy path fixture");
-        }
-        validate_staged_runtime_inventory(&stage_directory.0, &rust_only)
-            .expect("removing hostile fixtures must restore the exact 13-path inventory");
+    #[test]
+    fn native_stage_rejects_undeclared_residue_and_binds_root_sources() {
+        let source_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask must be directly below the workspace root");
+        let stage_directory = TestDirectory::new("native-residue-stage");
+        let artifact_directory = TestDirectory::new("native-residue-artifacts");
+        let native = checked_profile();
+        let (runtime_binaries, fluxd) =
+            write_staging_binary_fixtures(&artifact_directory.0, &native);
+        stage_module_from_artifacts(
+            source_root,
+            &stage_directory.0,
+            &runtime_binaries,
+            &fluxd,
+            &native,
+        )
+        .expect("native fixture must stage exactly");
+
+        let residue = stage_directory.0.join("bin/undeclared-helper");
+        fs::write(&residue, "undeclared residue\n").expect("write residue fixture");
+        let residue_error = validate_staged_runtime_inventory(&stage_directory.0, &native)
+            .expect_err("undeclared package residue must fail exact inventory");
+        assert!(residue_error.contains("extra=bin/undeclared-helper"));
+        fs::remove_file(&residue).expect("remove residue fixture");
 
         let customize = stage_directory.0.join("customize.sh");
-        let original = fs::read(&customize).expect("read staged Rust-only installer");
+        let original = fs::read(&customize).expect("read staged native installer");
         let mut tampered = original.clone();
         tampered.extend_from_slice(b"# package-only drift\n");
-        fs::write(&customize, tampered).expect("tamper staged Rust-only installer");
-        let error = validate_source_bound_module_files(&stage_directory.0, source_root, &rust_only)
-            .expect_err("staged Rust-only override drift must fail source binding");
-        assert!(error.contains("packaging/rust-only/customize.sh"));
-        fs::write(&customize, original).expect("restore staged Rust-only installer");
-        validate_source_bound_module_files(&stage_directory.0, source_root, &rust_only)
-            .expect("restored Rust-only override must match its authoritative source");
+        fs::write(&customize, tampered).expect("tamper staged native installer");
+        let error = validate_source_bound_module_files(&stage_directory.0, source_root, &native)
+            .expect_err("staged native source drift must fail binding");
+        assert!(error.contains("customize.sh"));
+        fs::write(&customize, original).expect("restore staged native installer");
+        validate_source_bound_module_files(&stage_directory.0, source_root, &native)
+            .expect("restored native installer must match its authoritative source");
     }
 
     #[test]
@@ -3534,9 +3104,9 @@ mod tests {
         let source_directory = TestDirectory::new("release-source-root");
         let stage = &stage_directory.0;
         let source_root = &source_directory.0;
-        let bridge = checked_profile(PackageProfileName::Bridge);
-        write_required_module_fixture(stage, &bridge);
-        write_required_module_fixture(source_root, &bridge);
+        let native = checked_profile();
+        write_required_module_fixture(stage, &native);
+        write_required_module_fixture(source_root, &native);
 
         fs::write(stage.join("conf/manifest.json"), "release-populated\n")
             .expect("write staged manifest");
@@ -3545,17 +3115,14 @@ mod tests {
             "source-placeholder\n",
         )
         .expect("write source manifest");
-        validate_source_bound_module_files(stage, source_root, &bridge)
+        validate_source_bound_module_files(stage, source_root, &native)
             .expect("matching tracked module files must verify");
 
-        fs::write(
-            stage.join("scripts/config"),
-            "#!/system/bin/sh\n# package-only change\nexit 0\n",
-        )
-        .expect("tamper staged tracked file");
-        let error = validate_source_bound_module_files(stage, source_root, &bridge)
+        fs::write(stage.join("customize.sh"), "#!/system/bin/sh\nexit 0\n")
+            .expect("tamper staged tracked file");
+        let error = validate_source_bound_module_files(stage, source_root, &native)
             .expect_err("staged tracked file divergence must fail");
-        assert!(error.contains("scripts/config differs from authoritative source"));
+        assert!(error.contains("customize.sh differs from authoritative source"));
     }
 
     #[test]
@@ -3565,9 +3132,9 @@ mod tests {
         for relative in ["bin", "conf", "evidence"] {
             fs::create_dir_all(stage.join(relative)).expect("create fixture directory");
         }
-        let bridge = checked_profile(PackageProfileName::Bridge);
-        write_required_module_fixture(stage, &bridge);
-        for name in ["fluxd", "sing-box", "jq", "addrsyncd"] {
+        let native = checked_profile();
+        write_required_module_fixture(stage, &native);
+        for name in ["fluxd", "sing-box"] {
             write_aarch64_elf(&stage.join("bin").join(name), name);
         }
         fs::write(
@@ -3583,7 +3150,7 @@ mod tests {
         )
         .expect("write metadata");
         let payload_sha256 =
-            operational_payload_sha256(stage, &bridge).expect("hash operational payload");
+            operational_payload_sha256(stage, &native).expect("hash operational payload");
         let evidence_tests = REQUIRED_DEVICE_TESTS
             .into_iter()
             .map(|id| format!("{{\"id\":\"{id}\",\"result\":\"passed\"}}"))
@@ -3596,7 +3163,7 @@ mod tests {
         let evidence_hash =
             sha256_file(&stage.join("evidence/device.json")).expect("hash evidence");
 
-        let artifacts = ["fluxd", "sing-box", "jq", "addrsyncd"]
+        let artifacts = ["fluxd", "sing-box"]
             .into_iter()
             .map(|name| {
                 let hash = sha256_file(&stage.join("bin").join(name)).expect("hash fixture");
@@ -3621,7 +3188,7 @@ mod tests {
             .map(|(_, package)| package.as_str())
             .collect::<Vec<_>>()
             .join(",");
-        let spdx_describes = ["fluxd", "sing-box", "jq", "addrsyncd"]
+        let spdx_describes = ["fluxd", "sing-box"]
             .into_iter()
             .map(|name| format!("\"SPDXRef-Package-{name}\""))
             .collect::<Vec<_>>()
@@ -3630,26 +3197,23 @@ mod tests {
             "{{\"spdxVersion\":\"SPDX-2.3\",\"dataLicense\":\"CC0-1.0\",\"SPDXID\":\"SPDXRef-DOCUMENT\",\"name\":\"Flux release fixture\",\"documentNamespace\":\"https://github.com/Chth1z/Flux/spdx/0123456789abcdef0123456789abcdef01234567\",\"creationInfo\":{{\"created\":\"2026-07-14T00:00:00Z\",\"creators\":[\"Tool: cargo xtask package-magisk\"]}},\"documentDescribes\":[{spdx_describes}],\"packages\":[{spdx_packages}]}}"
         );
         fs::write(stage.join("SBOM.spdx.json"), &sbom).expect("write SBOM");
-        let package_profiles = checked_package_profiles_json();
-        let retired_runtime_paths = checked_retired_runtime_paths_json();
+        let package_profile = checked_package_profile_json();
         let manifest = format!(
-            "{{\"schema_version\":3,\"project\":\"Flux\",\"generated_by\":\"cargo xtask package-magisk\",\"binaries\":[{binaries}],\"device_test_evidence\":[{{\"path\":\"evidence/device.json\",\"sha256\":\"{evidence_hash}\",\"source_revision\":\"0123456789abcdef0123456789abcdef01234567\",\"payload_sha256\":\"{payload_sha256}\",\"device_profile\":\"test-gki-arm64\",\"android_build_fingerprint\":\"flux/test/device:14/UP1A.231005.007/1234567:user/release-keys\",\"kernel_release\":\"5.10.198-android12-9-gki\",\"boot_id\":\"12345678-1234-4abc-8def-1234567890ab\",\"verified_boot_state\":\"green\",\"selinux_enforcing\":true,\"captured_at_utc\":\"2026-07-14T00:00:00Z\"}}],\"retired_runtime_paths\":{retired_runtime_paths},\"package_profiles\":{package_profiles}}}"
+            "{{\"schema_version\":4,\"project\":\"Flux\",\"generated_by\":\"cargo xtask package-magisk\",\"binaries\":[{binaries}],\"device_test_evidence\":[{{\"path\":\"evidence/device.json\",\"sha256\":\"{evidence_hash}\",\"source_revision\":\"0123456789abcdef0123456789abcdef01234567\",\"payload_sha256\":\"{payload_sha256}\",\"device_profile\":\"test-gki-arm64\",\"android_build_fingerprint\":\"flux/test/device:14/UP1A.231005.007/1234567:user/release-keys\",\"kernel_release\":\"5.10.198-android12-9-gki\",\"boot_id\":\"12345678-1234-4abc-8def-1234567890ab\",\"verified_boot_state\":\"green\",\"selinux_enforcing\":true,\"captured_at_utc\":\"2026-07-14T00:00:00Z\"}}],\"package_profile\":{package_profile}}}"
         );
         fs::write(stage.join("conf/manifest.json"), &manifest).expect("write manifest");
         let parsed_manifest: ReleaseManifest =
             serde_json::from_str(&manifest).expect("parse complete manifest");
         let expected_revisions = WorkspaceSourceRevisions {
             fluxd: "0123456789abcdef0123456789abcdef01234567".to_owned(),
-            addrsyncd: Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
         };
-        validate_first_party_source_revisions(&parsed_manifest, &expected_revisions, &bridge)
+        validate_first_party_source_revisions(&parsed_manifest, &expected_revisions)
             .expect("matching first-party revisions must verify");
         let wrong_revisions = WorkspaceSourceRevisions {
             fluxd: "1123456789abcdef0123456789abcdef01234567".to_owned(),
-            addrsyncd: expected_revisions.addrsyncd.clone(),
         };
         let revision_error =
-            validate_first_party_source_revisions(&parsed_manifest, &wrong_revisions, &bridge)
+            validate_first_party_source_revisions(&parsed_manifest, &wrong_revisions)
                 .expect_err("mismatched workspace revision must fail");
         assert!(revision_error.contains("must equal the clean workspace revision"));
         let mut incomplete_evidence: serde_json::Value =
@@ -3672,16 +3236,11 @@ mod tests {
         fs::write(stage.join("evidence/device.json"), &evidence).expect("restore evidence");
         write_fixture_checksums(stage);
 
-        verify_package_dir_with_source(stage, stage, PackageProfileName::Bridge)
-            .expect("complete bridge fixture must verify");
-        let rust_only_error =
-            verify_package_dir_with_source(stage, stage, PackageProfileName::RustOnly)
-                .expect_err("bridge fixture must fail the Rust-only contract");
-        assert!(rust_only_error.contains("forbidden bridge path bin/addrsyncd"));
+        verify_package_dir_with_source(stage, stage).expect("complete native fixture must verify");
 
         fs::write(stage.join("post-fs-data.sh"), "#!/system/bin/sh\nexit 0\n")
             .expect("write unreviewed Magisk root payload");
-        let error = verify_package_dir_with_source(stage, stage, PackageProfileName::Bridge)
+        let error = verify_package_dir_with_source(stage, stage)
             .expect_err("unreviewed package-root payload must fail");
         assert!(error.contains("extra=post-fs-data.sh"));
         fs::remove_file(stage.join("post-fs-data.sh"))
@@ -3698,7 +3257,7 @@ mod tests {
             serde_json::to_vec(&dangling_description).expect("encode dangling SPDX reference"),
         )
         .expect("write dangling SPDX reference");
-        let error = verify_package_dir_with_source(stage, stage, PackageProfileName::Bridge)
+        let error = verify_package_dir_with_source(stage, stage)
             .expect_err("dangling documentDescribes reference must fail");
         assert!(error.contains("documentDescribes must exactly match"));
         fs::write(stage.join("SBOM.spdx.json"), &sbom).expect("restore SBOM");
@@ -3706,7 +3265,7 @@ mod tests {
         let customize = fs::read(stage.join("customize.sh")).expect("read required file");
         fs::remove_file(stage.join("customize.sh")).expect("remove required file");
         write_fixture_checksums(stage);
-        let error = verify_package_dir_with_source(stage, stage, PackageProfileName::Bridge)
+        let error = verify_package_dir_with_source(stage, stage)
             .expect_err("incomplete full layout must fail");
         assert!(error.contains("missing required file customize.sh"));
         fs::write(stage.join("customize.sh"), customize).expect("restore required file");
@@ -3715,7 +3274,7 @@ mod tests {
         let module_prop = fs::read(stage.join("module.prop")).expect("read module.prop");
         fs::write(stage.join("module.prop"), b"").expect("empty required file");
         write_fixture_checksums(stage);
-        let error = verify_package_dir_with_source(stage, stage, PackageProfileName::Bridge)
+        let error = verify_package_dir_with_source(stage, stage)
             .expect_err("empty required file must fail");
         assert!(error.contains("required file module.prop is empty"));
         fs::write(stage.join("module.prop"), module_prop).expect("restore module.prop");
@@ -3731,27 +3290,27 @@ mod tests {
             serde_json::to_vec(&wrong_path).expect("encode wrong-path manifest"),
         )
         .expect("write wrong-path manifest");
-        let error = verify_package_dir_with_source(stage, stage, PackageProfileName::Bridge)
+        let error = verify_package_dir_with_source(stage, stage)
             .expect_err("required path substitution must fail");
         assert!(error.contains("extra=bin/not-fluxd"));
         fs::remove_file(stage.join("bin/not-fluxd")).expect("remove renamed fixture");
         fs::write(stage.join("conf/manifest.json"), &manifest).expect("restore manifest");
 
         fs::write(stage.join("bin/extension.ko"), "forbidden\n").expect("write payload");
-        let error = verify_package_dir_with_source(stage, stage, PackageProfileName::Bridge)
-            .expect_err("kernel payload must fail");
+        let error =
+            verify_package_dir_with_source(stage, stage).expect_err("kernel payload must fail");
         assert!(error.contains("forbidden kernel payload"));
 
         fs::remove_file(stage.join("bin/extension.ko")).expect("remove payload");
         fs::write(stage.join("bin/.ko"), "forbidden\n").expect("write hidden payload");
-        let error = verify_package_dir_with_source(stage, stage, PackageProfileName::Bridge)
+        let error = verify_package_dir_with_source(stage, stage)
             .expect_err("hidden kernel payload must fail");
         assert!(error.contains("forbidden kernel payload bin/.ko"));
         fs::remove_file(stage.join("bin/.ko")).expect("remove hidden payload");
         fs::create_dir(stage.join("bin/helpers")).expect("create nested binary directory");
         fs::write(stage.join("bin/helpers/unmanifested"), "unexpected\n")
             .expect("write unmanifested binary");
-        let error = verify_package_dir_with_source(stage, stage, PackageProfileName::Bridge)
+        let error = verify_package_dir_with_source(stage, stage)
             .expect_err("nested unmanifested binary must fail");
         assert!(error.contains("extra=bin/helpers/unmanifested"));
 
@@ -3759,7 +3318,7 @@ mod tests {
         let mut metadata = fs::read(stage.join("build-metadata.json")).expect("read metadata");
         metadata.push(b'\n');
         fs::write(stage.join("build-metadata.json"), metadata).expect("tamper metadata");
-        let error = verify_package_dir_with_source(stage, stage, PackageProfileName::Bridge)
+        let error = verify_package_dir_with_source(stage, stage)
             .expect_err("stale checksum inventory must fail");
         assert!(error.contains("package checksum mismatch"));
     }
@@ -3782,10 +3341,8 @@ mod tests {
         }]);
         let manifest: ReleaseManifest =
             serde_json::from_value(manifest_value).expect("parse manifest fixture");
-        let bridge = package_profile(&manifest.package_profiles, PackageProfileName::Bridge)
-            .expect("bridge profile");
         let directory = TestDirectory::new("invalid-manifest");
-        let error = validate_release_manifest(&directory.0, &manifest, bridge)
+        let error = validate_release_manifest(&directory.0, &manifest, &manifest.package_profile)
             .expect_err("missing evidence must fail before source acceptance");
         assert!(error.contains("no required device-test evidence"));
 
@@ -3803,7 +3360,7 @@ mod tests {
         let license_error =
             validate_spdx_license("fluxd", "NOT-A-REAL-LICENSE").expect_err("invalid SPDX id");
         assert!(license_error.contains("recognized SPDX identifier"));
-        let unlicensed_error = validate_spdx_license("addrsyncd", "LicenseRef-UNLICENSED")
+        let unlicensed_error = validate_spdx_license("fixture", "LicenseRef-UNLICENSED")
             .expect_err("unlicensed placeholder must not become a reviewed custom license");
         assert!(unlicensed_error.contains("explicitly reviewed LicenseRef"));
 

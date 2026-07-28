@@ -12,8 +12,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: true
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.93.0
@@ -60,59 +58,21 @@ jobs:
             sudo apt-get update
             sudo apt-get install --yes --no-install-recommends iproute2 iptables
           fi
-      - name: Test required dispatcher-free native composition
+      - name: Test required native composition
         run: cargo xtask test-native-composition-linux
         env:
           FLUX_NATIVE_COMPOSITION_REQUIRED: "1"
-      - name: Check Magisk shell bridge syntax
+      - name: Check module platform glue syntax
         run: >-
-          bash -n customize.sh flux_service.sh scripts/dispatcher
-          scripts/lib scripts/rules
-          tests/shell/config_installer_contract.sh
-          tests/shell/rules_generation.sh tests/shell/run-dispatcher-tests.sh
-          tests/shell/run-installer-tests.sh tests/shell/run-rust-only-glue-tests.sh
-          packaging/rust-only/customize.sh packaging/rust-only/flux_service.sh
-      - name: Test installer and configuration contract
-        run: sh tests/shell/config_installer_contract.sh
-      - name: Test legacy rule generation semantics
-        run: sh tests/shell/rules_generation.sh
+          bash -n META-INF/com/google/android/update-binary customize.sh
+          flux_service.sh uninstall.sh tests/shell/run-module-glue-tests.sh
       - name: Ensure bubblewrap is available
         run: |
           if ! command -v bwrap >/dev/null 2>&1; then
             sudo apt-get update
             sudo apt-get install --yes --no-install-recommends bubblewrap
           fi
-      - name: Test Rust-owned dispatcher bridge
+      - name: Test native module platform glue
         run: >-
-          sudo env "PATH=${PATH}" FLUX_DISPATCHER_TESTS_REQUIRED=1
-          sh tests/shell/run-dispatcher-tests.sh
-      - name: Test installer rollback
-        run: >-
-          sudo env "PATH=${PATH}" FLUX_INSTALLER_TESTS_REQUIRED=1
-          sh tests/shell/run-installer-tests.sh
-      - name: Test Rust-only package glue
-        run: >-
-          sudo env "PATH=${PATH}" FLUX_RUST_ONLY_GLUE_TESTS_REQUIRED=1
-          sh tests/shell/run-rust-only-glue-tests.sh
-      - name: Check legacy addrsyncd compatibility
-        run: |
-          cargo test --manifest-path addrsyncd/Cargo.toml
-          cargo clippy --manifest-path addrsyncd/Cargo.toml --all-targets -- -D warnings
-          cargo check --manifest-path addrsyncd/Cargo.toml --target aarch64-linux-android --all-targets
-
-  xtables-oracle:
-    name: Pinned xtables shell oracle
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.93.0
-      - uses: Swatinem/rust-cache@v2
-      - name: Pull exact BusyBox linux/amd64 oracle image
-        run: >-
-          docker pull --platform=linux/amd64
-          docker.io/library/busybox@sha256:dfb66b2b3e6981fefa54fd2cd4faf662c35b4a4baeff48295a9409ddf3224c48
-      - name: Verify pinned xtables restore fixtures
-        run: cargo xtask xtables-oracle --check
+          sudo env "PATH=${PATH}" FLUX_MODULE_GLUE_TESTS_REQUIRED=1
+          sh tests/shell/run-module-glue-tests.sh

@@ -1,7 +1,6 @@
-# Frozen semantic oracle copied from scripts/rules BYPASS_IPv4_LIST and
-# BYPASS_IPv6_LIST, plus the owner/application examples in
-# tests/shell/rules_generation.sh. This records source semantics only; it is
-# not an iptables renderer fixture and makes no renderer-parity claim.
+# Frozen semantic baseline imported from the retired shell rules owner. This
+# records source semantics only; it is not an iptables renderer fixture and
+# makes no renderer-parity claim.
 shell_bypass_ipv4=0.0.0.0/8
 shell_bypass_ipv4=10.0.0.0/8
 shell_bypass_ipv4=100.64.0.0/10

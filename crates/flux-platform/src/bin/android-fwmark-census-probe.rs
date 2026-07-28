@@ -167,9 +167,12 @@ fn coordinator_error_label(
 #[cfg(target_os = "android")]
 const fn source_error_label(source: &SystemAndroidFwmarkCensusSourceError) -> &'static str {
     match source.kind() {
-        SystemAndroidFwmarkCensusSourceErrorKind::KernelConfig => source
-            .kernel_config_kind()
-            .map_or("kernel-config", kernel_config_error_label),
+        SystemAndroidFwmarkCensusSourceErrorKind::KernelConfig => {
+            match source.kernel_config_kind() {
+                Some(kind) => kernel_config_error_label(kind),
+                None => "kernel-config",
+            }
+        }
         SystemAndroidFwmarkCensusSourceErrorKind::NftablesObservation => {
             match source.nftables_class() {
                 Some(class) => nftables_error_label(class),

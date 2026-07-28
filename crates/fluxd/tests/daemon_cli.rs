@@ -37,7 +37,11 @@ fn ping_uses_the_daemon_transport() {
 fn subscription_update_reports_every_terminal_disposition() {
     let cases = [
         (
-            SubscriptionRefreshReport::updated(23, 41, false),
+            SubscriptionRefreshReport::updated(
+                flux_core::GenerationId::new(23).expect("test Generation"),
+                41,
+                false,
+            ),
             0,
             "subscription updated generation=23 nodes=41 cleanup_pending=false\n",
             "",
@@ -595,7 +599,7 @@ fn observed_runtime() -> RuntimeSnapshot {
         capture: RuntimeCaptureState::Detached,
         engine: RuntimeEngineState::BackingOff,
         verification: RuntimeVerificationState::FunctionalFailed,
-        generation: Some(19),
+        generation: flux_core::GenerationId::new(19),
         last_error: Some(RuntimeFailure {
             operation: "maintain proxy engine".to_owned(),
             message: "owned child exited unexpectedly".to_owned(),

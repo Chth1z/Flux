@@ -5,8 +5,8 @@ use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
 
 use flux_core::{
-    InterfaceIndex, InterfaceName, NetworkAddressFamily, RoutePrefix, RouteProtocol, RouteScope,
-    RouteTableId, RouteType, RuleFwMark, RulePriority, RuleProtocol,
+    GenerationId, InterfaceIndex, InterfaceName, NetworkAddressFamily, RoutePrefix, RouteProtocol,
+    RouteScope, RouteTableId, RouteType, RuleFwMark, RulePriority, RuleProtocol,
 };
 use sha2::{Digest, Sha256};
 
@@ -17,7 +17,6 @@ use crate::netlink::policy_routing::{
 
 use super::super::super::owner_durable::{
     MAX_NATIVE_XTABLES_TARGET_ARCHIVE_BYTES, NativeXtablesDurableError, NativeXtablesDurableStore,
-    NativeXtablesGeneration,
 };
 use super::super::super::{
     MAX_XTABLES_RESTORE_BYTES, MAX_XTABLES_RESTORE_CHAIN_BYTES, XtablesRestoreAction,
@@ -33,7 +32,7 @@ use super::{
 };
 
 const ARCHIVE_MAGIC: &[u8] = b"flux-native-xtables-target-archive\0";
-const ARCHIVE_SCHEMA: u16 = 1;
+const ARCHIVE_SCHEMA: u16 = 2;
 const ARCHIVE_CHECKSUM_BYTES: usize = 32;
 const MAX_ARCHIVE_TARGETS: usize = 2;
 const MAX_PRIVATE_CHAINS_PER_FAMILY: usize = 8;
@@ -384,7 +383,7 @@ fn encode_target(
     target: &NativeXtablesAdmittedTarget,
 ) -> Result<(), NativeXtablesTargetArchiveError> {
     let identity = target.identity();
-    put_u64(encoded, identity.generation().get());
+    put_u32(encoded, identity.generation().get());
     encoded.extend_from_slice(&identity.target_digest());
     encoded.extend_from_slice(&target.source_artifact_digest());
     encoded.extend_from_slice(&identity.tool_digest());
@@ -407,7 +406,7 @@ fn encode_target(
 fn decode_target(
     cursor: &mut Cursor<'_>,
 ) -> Result<NativeXtablesAdmittedTarget, NativeXtablesTargetArchiveError> {
-    let generation = NativeXtablesGeneration::new(cursor.u64()?).ok_or(
+    let generation = GenerationId::new(cursor.u32()?).ok_or(
         NativeXtablesTargetArchiveError::Invalid("target generation is zero"),
     )?;
     let target_digest = cursor.array()?;
@@ -700,10 +699,6 @@ fn put_u32(encoded: &mut Vec<u8>, value: u32) {
     encoded.extend_from_slice(&value.to_be_bytes());
 }
 
-fn put_u64(encoded: &mut Vec<u8>, value: u64) {
-    encoded.extend_from_slice(&value.to_be_bytes());
-}
-
 fn checked_u8(value: usize) -> Result<u8, NativeXtablesTargetArchiveError> {
     u8::try_from(value).map_err(|_| {
         NativeXtablesTargetArchiveError::Invalid("archive collection length does not fit u8")
@@ -786,10 +781,6 @@ impl<'a> Cursor<'a> {
 
     fn u32(&mut self) -> Result<u32, NativeXtablesTargetArchiveError> {
         Ok(u32::from_be_bytes(self.array()?))
-    }
-
-    fn u64(&mut self) -> Result<u64, NativeXtablesTargetArchiveError> {
-        Ok(u64::from_be_bytes(self.array()?))
     }
 
     fn bytes(&mut self, maximum: usize) -> Result<&'a [u8], NativeXtablesTargetArchiveError> {

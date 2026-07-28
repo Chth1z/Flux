@@ -1,9 +1,8 @@
 use std::error::Error;
 use std::fmt;
-use std::num::NonZeroU32;
 use std::time::Duration;
 
-use flux_core::{AddressResyncDisposition, Reason};
+use flux_core::{AddressResyncDisposition, GenerationId, Reason};
 use flux_platform::{
     NativeCaptureConvergedState, NativeCaptureConvergence, NativeCaptureDesired,
     NativeCaptureTargetIdentity,
@@ -20,14 +19,12 @@ use crate::subscription::ValidatedSubscriptionEngineConfig;
 use crate::{EngineSpec, EngineSupervisor};
 
 pub(crate) trait NativeCoordinatorGenerationIdentity {
-    fn coordinator_generation(self) -> Option<NonZeroU32>;
+    fn coordinator_generation(self) -> Option<GenerationId>;
 }
 
 impl NativeCoordinatorGenerationIdentity for NativeCaptureTargetIdentity {
-    fn coordinator_generation(self) -> Option<NonZeroU32> {
-        u32::try_from(self.generation().get())
-            .ok()
-            .and_then(NonZeroU32::new)
+    fn coordinator_generation(self) -> Option<GenerationId> {
+        Some(self.generation())
     }
 }
 
@@ -38,7 +35,7 @@ pub(crate) struct PreparedNativeGeneration<T> {
 
 impl<T> PreparedNativeGeneration<T> {
     #[must_use]
-    pub(crate) fn new(id: NonZeroU32, spec: EngineSpec, target: T) -> Self {
+    pub(crate) fn new(id: GenerationId, spec: EngineSpec, target: T) -> Self {
         Self {
             runtime: PreparedGeneration::new(id, spec),
             target,
@@ -113,7 +110,7 @@ where
     convergence: C,
     source: S,
     retained: Vec<RetainedNativeGeneration<C::Target>>,
-    committed_generation: Option<NonZeroU32>,
+    committed_generation: Option<GenerationId>,
     converged_identity: Option<C::Identity>,
     recovery_required: bool,
 }
@@ -206,7 +203,7 @@ where
 
     fn retained(
         &self,
-        generation: NonZeroU32,
+        generation: GenerationId,
     ) -> Result<&RetainedNativeGeneration<C::Target>, NativeCoordinatorWriterError> {
         self.retained
             .iter()
@@ -236,7 +233,7 @@ where
 
     fn converge_active(
         &mut self,
-        generation: NonZeroU32,
+        generation: GenerationId,
     ) -> Result<(), NativeCoordinatorWriterError> {
         self.recover_if_required()?;
         let retained = self.retained(generation)?;
@@ -293,7 +290,7 @@ where
 
     fn commit_running(
         &mut self,
-        generation: NonZeroU32,
+        generation: GenerationId,
     ) -> Result<(), NativeCoordinatorWriterError> {
         let expected = C::target_identity(&self.retained(generation)?.target);
         if self.converged_identity != Some(expected) {
@@ -557,8 +554,8 @@ mod tests {
     const PACKAGED_DESIRED_STATE: &str = include_str!("../../../conf/flux.toml");
 
     impl NativeCoordinatorGenerationIdentity for u64 {
-        fn coordinator_generation(self) -> Option<NonZeroU32> {
-            u32::try_from(self).ok().and_then(NonZeroU32::new)
+        fn coordinator_generation(self) -> Option<GenerationId> {
+            u32::try_from(self).ok().and_then(GenerationId::new)
         }
     }
 
@@ -812,7 +809,7 @@ mod tests {
 
     fn generation(id: u32, fixture: &EngineFixture) -> PreparedNativeGeneration<ScriptedTarget> {
         PreparedNativeGeneration::new(
-            NonZeroU32::new(id).expect("nonzero native Generation"),
+            GenerationId::new(id).expect("nonzero native Generation"),
             fixture.spec.clone(),
             ScriptedTarget(u64::from(id)),
         )
@@ -885,7 +882,7 @@ mod tests {
         let fixture = EngineFixture::new();
         let events = Arc::new(Mutex::new(Vec::new()));
         let mismatched = PreparedNativeGeneration::new(
-            NonZeroU32::new(1).expect("nonzero coordinator Generation"),
+            GenerationId::INITIAL,
             fixture.spec.clone(),
             ScriptedTarget(2),
         );
@@ -937,7 +934,7 @@ mod tests {
             snapshot.verification,
             RuntimeVerificationState::StructuralOnly
         );
-        assert_eq!(snapshot.generation, Some(1));
+        assert_eq!(snapshot.generation, GenerationId::new(1));
     }
 
     #[test]
@@ -989,7 +986,7 @@ mod tests {
         assert_eq!(snapshot.phase, RuntimePhase::Degraded);
         assert_eq!(snapshot.capture, RuntimeCaptureState::Published);
         assert_eq!(snapshot.engine, RuntimeEngineState::Ready);
-        assert_eq!(snapshot.generation, Some(1));
+        assert_eq!(snapshot.generation, GenerationId::new(1));
         assert!(snapshot.last_error.is_some());
 
         events.lock().expect("native events lock").clear();
@@ -1000,7 +997,7 @@ mod tests {
         );
         let settled = coordinator.runtime_snapshot_source().snapshot();
         assert_eq!(settled.phase, RuntimePhase::Running);
-        assert_eq!(settled.generation, Some(1));
+        assert_eq!(settled.generation, GenerationId::new(1));
         assert_eq!(settled.last_error, None);
     }
 
@@ -1045,7 +1042,7 @@ mod tests {
         );
         let snapshot = coordinator.runtime_snapshot_source().snapshot();
         assert_eq!(snapshot.phase, RuntimePhase::Running);
-        assert_eq!(snapshot.generation, Some(2));
+        assert_eq!(snapshot.generation, GenerationId::new(2));
     }
 
     #[test]
@@ -1161,7 +1158,7 @@ mod tests {
         );
         assert_eq!(
             coordinator.runtime_snapshot_source().snapshot().generation,
-            Some(2)
+            GenerationId::new(2)
         );
     }
 
@@ -1216,7 +1213,7 @@ mod tests {
         coordinator.maintain();
         assert_eq!(
             coordinator.runtime_snapshot_source().snapshot().generation,
-            Some(2)
+            GenerationId::new(2)
         );
     }
 

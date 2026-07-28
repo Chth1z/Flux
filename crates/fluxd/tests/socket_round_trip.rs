@@ -120,7 +120,7 @@ fn seqpacket_status_preserves_the_observed_runtime_snapshot() {
         capture: RuntimeCaptureState::Published,
         engine: RuntimeEngineState::Ready,
         verification: RuntimeVerificationState::FunctionalPending,
-        generation: Some(91),
+        generation: flux_core::GenerationId::new(91),
         last_error: Some(RuntimeFailure {
             operation: "verify published capture".to_owned(),
             message: "functional probe timed out".to_owned(),

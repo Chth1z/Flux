@@ -269,7 +269,11 @@ mod tests {
         let refresh_calls = Arc::clone(&refreshes);
         let subscription = SubscriptionRefreshClient::for_test(move || {
             refresh_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(SubscriptionRefreshReport::updated(82, 29, false))
+            Ok(SubscriptionRefreshReport::updated(
+                flux_core::GenerationId::new(82).expect("test Generation"),
+                29,
+                false,
+            ))
         });
         let runtime = RuntimeControl::start(NoopDispatcher, 2).expect("start runtime");
         let handler = ControlConnectionHandler::with_runtime_snapshot_and_subscription(
@@ -295,7 +299,14 @@ mod tests {
         reactor.run().expect("run reactor");
         let report = client_thread.join().expect("client thread");
 
-        assert_eq!(report, SubscriptionRefreshReport::updated(82, 29, false));
+        assert_eq!(
+            report,
+            SubscriptionRefreshReport::updated(
+                flux_core::GenerationId::new(82).expect("test Generation"),
+                29,
+                false,
+            )
+        );
         assert_eq!(refreshes.load(Ordering::SeqCst), 1);
     }
 }

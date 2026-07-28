@@ -7,10 +7,10 @@ use flux_core::{
     CaptureApplicationMode, CaptureApplicationPolicy, CaptureBypassPolicy, CaptureGroupId,
     CaptureInterfacePolicy, CaptureInterfaceSelector, CaptureIpPrefix, CaptureProgram,
     CaptureProgramCompilation, CaptureProgramRequest, CaptureProtocolSet, CaptureTrafficDomain,
-    CaptureTrafficScope, CaptureUserId, EngineCredentials, FwmarkCandidate, InterfaceAddressFlags,
-    InterfaceAddressRecord, InterfaceIndex, InterfaceName, NetworkAddressFamily,
-    NetworkInventoryTracker, RouteProtocol, RouteTableId, RuleFwMark, RulePriority, RuleProtocol,
-    compile_capture_program, plan_address_host_set,
+    CaptureTrafficScope, CaptureUserId, EngineCredentials, FwmarkCandidate, GenerationId,
+    InterfaceAddressFlags, InterfaceAddressRecord, InterfaceIndex, InterfaceName,
+    NetworkAddressFamily, NetworkInventoryTracker, RouteProtocol, RouteTableId, RuleFwMark,
+    RulePriority, RuleProtocol, compile_capture_program, plan_address_host_set,
 };
 use flux_platform::{
     MAX_XTABLES_RESTORE_BYTES, XTABLES_CAPTURE_LOWERING_SCHEMA_VERSION, XtablesCaptureArtifactSet,
@@ -1272,7 +1272,7 @@ fn lowering_request(
 ) -> XtablesCaptureLoweringRequest<'_> {
     XtablesCaptureLoweringRequest::new(
         artifact,
-        XtablesCaptureNamespace::new(NonZeroU32::new(generation).unwrap()),
+        XtablesCaptureNamespace::new(GenerationId::new(generation).unwrap()),
         target,
     )
 }

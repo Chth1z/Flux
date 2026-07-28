@@ -1,6 +1,6 @@
 use std::error::Error;
 use std::fmt;
-use std::num::{NonZeroU32, NonZeroU64};
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -1185,8 +1185,7 @@ fn public_report(
 
 fn public_identity(identity: NativeXtablesTargetIdentity) -> NativeCaptureTargetIdentity {
     NativeCaptureTargetIdentity::new(
-        NonZeroU64::new(identity.generation().get())
-            .expect("native xtables target generations are nonzero"),
+        identity.generation(),
         identity.target_digest(),
         identity.tool_digest(),
         identity.routing_digest(),

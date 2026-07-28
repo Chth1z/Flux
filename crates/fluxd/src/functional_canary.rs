@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use flux_core::{
-    BootIdentity, CapabilityProfileRevision, InterfaceIndex, InterfaceName, NetworkEpoch,
-    NetworkInventorySnapshotId, NetworkNamespaceIdentity, OwnershipJournalIdentity,
+    BootIdentity, CapabilityProfileRevision, GenerationId, InterfaceIndex, InterfaceName,
+    NetworkEpoch, NetworkInventorySnapshotId, NetworkNamespaceIdentity, OwnershipJournalIdentity,
     OwnershipJournalRevision, RouteTableId, RulePriority,
 };
 use flux_platform::ReadinessEvidence;
@@ -249,7 +249,7 @@ impl CanaryAttemptObjectIdentity {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct CanaryAttemptObjectIdentities {
-    generation: NonZeroU32,
+    generation: GenerationId,
     nonce: CanaryNonce,
     selector: CanaryAttemptObjectIdentity,
     leak_guard: CanaryAttemptObjectIdentity,
@@ -259,7 +259,7 @@ pub(crate) struct CanaryAttemptObjectIdentities {
 
 impl CanaryAttemptObjectIdentities {
     pub(crate) fn new(
-        generation: NonZeroU32,
+        generation: GenerationId,
         nonce: CanaryNonce,
         selector: CanaryAttemptObjectIdentity,
         leak_guard: CanaryAttemptObjectIdentity,
@@ -283,7 +283,7 @@ impl CanaryAttemptObjectIdentities {
     }
 
     #[must_use]
-    pub(crate) const fn generation(self) -> NonZeroU32 {
+    pub(crate) const fn generation(self) -> GenerationId {
         self.generation
     }
 
@@ -353,7 +353,7 @@ impl CaptureOwnerRecordDigest {
 pub(crate) struct CaptureOwnerRecordBinding {
     schema_version: NonZeroU16,
     boot_identity: BootIdentity,
-    generation: NonZeroU32,
+    generation: GenerationId,
     file_identity: CanaryFileIdentity,
     digest: CaptureOwnerRecordDigest,
 }
@@ -363,7 +363,7 @@ impl CaptureOwnerRecordBinding {
     pub(crate) const fn new(
         schema_version: NonZeroU16,
         boot_identity: BootIdentity,
-        generation: NonZeroU32,
+        generation: GenerationId,
         file_identity: CanaryFileIdentity,
         digest: CaptureOwnerRecordDigest,
     ) -> Self {
@@ -387,7 +387,7 @@ impl CaptureOwnerRecordBinding {
     }
 
     #[must_use]
-    pub(crate) const fn generation(&self) -> NonZeroU32 {
+    pub(crate) const fn generation(&self) -> GenerationId {
         self.generation
     }
 
@@ -966,7 +966,7 @@ impl CanaryListenerIdentity {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CanaryEngineBinding {
-    generation: NonZeroU32,
+    generation: GenerationId,
     engine: OwnedEngineIdentity,
     engine_snapshot_revision: NonZeroU64,
     artifacts: EngineArtifactSetIdentity,
@@ -975,7 +975,7 @@ pub(crate) struct CanaryEngineBinding {
 
 impl CanaryEngineBinding {
     pub(crate) fn from_identity_parts(
-        generation: NonZeroU32,
+        generation: GenerationId,
         pid: NonZeroU32,
         start_time_ticks: NonZeroU64,
         engine_snapshot_revision: NonZeroU64,
@@ -992,7 +992,7 @@ impl CanaryEngineBinding {
     }
 
     pub(crate) fn new(
-        generation: NonZeroU32,
+        generation: GenerationId,
         engine: OwnedEngineIdentity,
         engine_snapshot_revision: NonZeroU64,
         spec: &EngineSpec,
@@ -1017,7 +1017,7 @@ impl CanaryEngineBinding {
     }
 
     #[must_use]
-    pub(crate) const fn generation(&self) -> NonZeroU32 {
+    pub(crate) const fn generation(&self) -> GenerationId {
         self.generation
     }
 
@@ -1195,7 +1195,7 @@ impl CanaryResponderPorts {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct CanaryFacilityAdmissionScope {
-    generation: NonZeroU32,
+    generation: GenerationId,
     nonce: CanaryNonce,
     facility: CanaryFacilityIdentity,
     facility_digest: CanaryFacilityAuditDigest,
@@ -1205,7 +1205,7 @@ pub(crate) struct CanaryFacilityAdmissionScope {
 impl CanaryFacilityAdmissionScope {
     #[must_use]
     pub(crate) const fn new(
-        generation: NonZeroU32,
+        generation: GenerationId,
         nonce: CanaryNonce,
         facility: CanaryFacilityIdentity,
         facility_digest: CanaryFacilityAuditDigest,
@@ -2379,7 +2379,7 @@ impl CanaryInboundDeliveryEvent {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CanaryTproxyListenerSocketIdentity {
-    generation: NonZeroU32,
+    generation: GenerationId,
     engine: OwnedEngineIdentity,
     listener: CanaryListenerIdentity,
     daemon_network_namespace: NetworkNamespaceIdentity,
@@ -2401,7 +2401,7 @@ impl CanaryTproxyListenerSocketIdentity {
     #[cfg(test)]
     #[must_use]
     const fn new(
-        generation: NonZeroU32,
+        generation: GenerationId,
         engine: OwnedEngineIdentity,
         listener: CanaryListenerIdentity,
         daemon_network_namespace: NetworkNamespaceIdentity,
@@ -2875,7 +2875,7 @@ impl CanaryListenerDeliveryReportCleanupEvidence {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct CanaryAttemptRecordRetirementEvidence {
-    generation: NonZeroU32,
+    generation: GenerationId,
     nonce: CanaryNonce,
     retired_at: Instant,
     absent_observed_at: Instant,
@@ -2884,7 +2884,7 @@ pub(crate) struct CanaryAttemptRecordRetirementEvidence {
 impl CanaryAttemptRecordRetirementEvidence {
     #[must_use]
     pub(crate) const fn new(
-        generation: NonZeroU32,
+        generation: GenerationId,
         nonce: CanaryNonce,
         retired_at: Instant,
         absent_observed_at: Instant,
@@ -4988,7 +4988,7 @@ pub(crate) mod tests {
 
         let mut generation = fixture.successful_evidence();
         tproxy_listener_mut(&mut generation, flow).generation =
-            NonZeroU32::new(18).expect("different generation");
+            GenerationId::new(18).expect("different generation");
         assert_eq!(
             validate(&fixture, generation).expect_err("generation drift cannot pass"),
             CanaryEvidenceError::InboundListenerGenerationMismatch { flow }
@@ -6426,7 +6426,7 @@ pub(crate) mod tests {
             .expect("nonzero attempt object identity");
         assert_eq!(
             CanaryAttemptObjectIdentities::new(
-                NonZeroU32::new(1).expect("generation"),
+                GenerationId::INITIAL,
                 CanaryNonce::from_bytes([2; FUNCTIONAL_CANARY_NONCE_BYTES]),
                 identity,
                 identity,
@@ -6802,7 +6802,7 @@ pub(crate) mod tests {
             families,
             started_at,
             nonce,
-            NonZeroU32::new(17).expect("nonzero generation"),
+            GenerationId::new(17).expect("nonzero generation"),
             NonZeroU32::new(4242).expect("nonzero pid"),
             NonZeroU64::new(98_765).expect("nonzero start ticks"),
             NonZeroU64::new(23).expect("nonzero snapshot revision"),
@@ -6815,7 +6815,7 @@ pub(crate) mod tests {
         families: CanaryAddressFamilies,
         started_at: Instant,
         nonce: CanaryNonce,
-        generation: NonZeroU32,
+        generation: GenerationId,
         pid: NonZeroU32,
         start_time_ticks: NonZeroU64,
         engine_snapshot_revision: NonZeroU64,
@@ -6860,7 +6860,7 @@ pub(crate) mod tests {
     }
 
     fn environment(
-        generation: NonZeroU32,
+        generation: GenerationId,
         nonce: CanaryNonce,
         attempt_started_at: Instant,
     ) -> CanaryEnvironmentBinding {

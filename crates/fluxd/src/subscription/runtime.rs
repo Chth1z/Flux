@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use flux_core::FluxConfig;
+use flux_core::{FluxConfig, GenerationId};
 use flux_platform::{SingBoxLaunchSpec, SingBoxLauncher, SingBoxReadiness};
 use url::Url;
 
@@ -46,7 +46,7 @@ pub enum SubscriptionRefreshDisposition {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SubscriptionRefreshReport {
     disposition: SubscriptionRefreshDisposition,
-    generation: Option<u64>,
+    generation: Option<GenerationId>,
     node_count: Option<u32>,
     cleanup_pending: bool,
 }
@@ -58,7 +58,7 @@ impl SubscriptionRefreshReport {
     }
 
     #[must_use]
-    pub const fn generation(self) -> Option<u64> {
+    pub const fn generation(self) -> Option<GenerationId> {
         self.generation
     }
 
@@ -73,7 +73,7 @@ impl SubscriptionRefreshReport {
     }
 
     #[must_use]
-    pub const fn updated(generation: u64, node_count: u32, cleanup_pending: bool) -> Self {
+    pub const fn updated(generation: GenerationId, node_count: u32, cleanup_pending: bool) -> Self {
         Self {
             disposition: SubscriptionRefreshDisposition::Updated,
             generation: Some(generation),

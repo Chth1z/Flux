@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use flux_core::{
     AddressResyncDisposition, CapabilityProfile, DispatcherCompletion, FluxConfig, FwmarkCandidate,
-    InterfaceAddressFlags, InterfaceAddressRecord, InterfaceIndex, NetworkInventory,
+    GenerationId, InterfaceAddressFlags, InterfaceAddressRecord, InterfaceIndex, NetworkInventory,
     NetworkInventoryTracker, NetworkNamespaceIdentity, Reason, RouteProtocol, RouteTableId,
     RulePriority, RuleProtocol, RuntimeDispatcher, RuntimeIntent,
 };
@@ -202,7 +202,7 @@ fn execute_isolated(root: &Path) -> Result<(), String> {
         },
         "start initial native Generation",
     )?;
-    assert_running(&first.coordinator, 1)?;
+    assert_running(&first.coordinator, generation(1))?;
     assert_active_kernel_state()?;
 
     execute(
@@ -212,7 +212,7 @@ fn execute_isolated(root: &Path) -> Result<(), String> {
         },
         "reload native successor",
     )?;
-    assert_running(&first.coordinator, 2)?;
+    assert_running(&first.coordinator, generation(2))?;
     assert_active_kernel_state()?;
 
     let subscription = fixture.subscription_candidate([0x5a; 32], 7)?;
@@ -234,7 +234,7 @@ fn execute_isolated(root: &Path) -> Result<(), String> {
         }
     };
     if report.disposition() != SubscriptionRefreshDisposition::Updated
-        || report.generation() != Some(3)
+        || report.generation() != Some(generation(3))
         || report.node_count() != Some(7)
         || report.cleanup_pending()
     {
@@ -243,7 +243,7 @@ fn execute_isolated(root: &Path) -> Result<(), String> {
         ));
     }
     fixture.accept_subscription(recovered_subscription);
-    assert_running(&first.coordinator, 3)?;
+    assert_running(&first.coordinator, generation(3))?;
     assert_active_kernel_state()?;
 
     fixture
@@ -266,13 +266,13 @@ fn execute_isolated(root: &Path) -> Result<(), String> {
             "address resync did not report synchronous successor convergence: {completion:?}"
         ));
     }
-    assert_running(&first.coordinator, 4)?;
+    assert_running(&first.coordinator, generation(4))?;
     assert_active_kernel_state()?;
 
     let exited_pid = latest_engine_pid(&fixture.pid_log)?;
     kill_engine(exited_pid)?;
     wait_for_engine_recovery(&mut first.coordinator, &fixture.pid_log, exited_pid)?;
-    assert_running(&first.coordinator, 4)?;
+    assert_running(&first.coordinator, generation(4))?;
     assert_active_kernel_state()?;
 
     fs::write(&fixture.fail_check, b"fail next check\n")
@@ -317,7 +317,7 @@ fn execute_isolated(root: &Path) -> Result<(), String> {
         .snapshot()
         .generation
         .ok_or_else(|| "recovered reload has no Generation".to_owned())?;
-    if recovered_generation <= 4 {
+    if recovered_generation <= generation(4) {
         return Err(format!(
             "recovered reload did not advance the committed Generation: {recovered_generation}"
         ));
@@ -673,7 +673,11 @@ fn execute(
         .map_err(|error| format!("{operation}: {error}"))
 }
 
-fn assert_running(coordinator: &TestCoordinator, generation: u64) -> Result<(), String> {
+fn generation(value: u32) -> GenerationId {
+    GenerationId::new(value).expect("test Generation must be nonzero")
+}
+
+fn assert_running(coordinator: &TestCoordinator, generation: GenerationId) -> Result<(), String> {
     let snapshot = coordinator.runtime_snapshot_source().snapshot();
     if snapshot.phase != RuntimePhase::Running
         || snapshot.capture != RuntimeCaptureState::Published

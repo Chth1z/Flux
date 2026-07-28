@@ -3,7 +3,8 @@ use std::os::unix::fs::symlink;
 use std::path::Path;
 
 use flux_core::{
-    BootIdentity, NetworkNamespaceIdentity, OwnershipJournalIdentity, OwnershipJournalRevision,
+    BootIdentity, GenerationId, NetworkNamespaceIdentity, OwnershipJournalIdentity,
+    OwnershipJournalRevision,
 };
 use tempfile::TempDir;
 
@@ -178,7 +179,7 @@ fn recovery_rejects_each_stale_binding_dimension() {
         NativeXtablesJournalBinding::new(
             actual.boot_identity().clone(),
             actual.network_namespace(),
-            NativeXtablesGeneration::new(actual.generation().get() + 1).unwrap(),
+            GenerationId::new(actual.generation().get() + 1).unwrap(),
             actual.journal_identity(),
         ),
         NativeXtablesJournalBinding::new(
@@ -846,7 +847,7 @@ fn recovery_inspection_keeps_same_boot_incomplete_matrices_fatal() {
     let binding = NativeXtablesJournalBinding::new(
         scope.boot_identity().clone(),
         scope.network_namespace(),
-        NativeXtablesGeneration::new(1).unwrap(),
+        GenerationId::new(1).unwrap(),
         scope.journal_identity(),
     );
     fs::create_dir_all(journal_only.root()).unwrap();
@@ -874,7 +875,7 @@ fn same_boot_initial_journal_before_lease_remains_fail_closed() {
     let binding = NativeXtablesJournalBinding::new(
         scope.boot_identity().clone(),
         scope.network_namespace(),
-        NativeXtablesGeneration::new(85).unwrap(),
+        GenerationId::new(85).unwrap(),
         scope.journal_identity(),
     );
     fixture
@@ -1293,19 +1294,19 @@ fn test_binding(seed: u8) -> NativeXtablesJournalBinding {
     NativeXtablesJournalBinding::new(
         BootIdentity::parse(boot).unwrap(),
         NetworkNamespaceIdentity::new(u64::from(seed) + 10, u64::from(seed) + 100).unwrap(),
-        NativeXtablesGeneration::new(u64::from(seed) + 1).unwrap(),
+        GenerationId::new(u32::from(seed) + 1).unwrap(),
         OwnershipJournalIdentity::new([seed.max(1); 32]).unwrap(),
     )
 }
 
 fn replacement_binding(
     current: &NativeXtablesJournalBinding,
-    generation: u64,
+    generation: u32,
 ) -> NativeXtablesJournalBinding {
     NativeXtablesJournalBinding::new(
         current.boot_identity().clone(),
         current.network_namespace(),
-        NativeXtablesGeneration::new(generation).unwrap(),
+        GenerationId::new(generation).unwrap(),
         current.journal_identity(),
     )
 }

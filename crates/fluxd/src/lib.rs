@@ -1195,7 +1195,7 @@ struct OnlineRuntimeDocument {
     capture: &'static str,
     engine: &'static str,
     verification: &'static str,
-    generation: Option<u64>,
+    generation: Option<u32>,
     last_error: Option<OnlineRuntimeFailureDocument>,
 }
 
@@ -1207,7 +1207,7 @@ impl From<RuntimeSnapshot> for OnlineRuntimeDocument {
             capture: runtime_capture_label(snapshot.capture),
             engine: runtime_engine_label(snapshot.engine),
             verification: runtime_verification_label(snapshot.verification),
-            generation: snapshot.generation,
+            generation: snapshot.generation.map(flux_core::GenerationId::get),
             last_error: snapshot.last_error.map(Into::into),
         }
     }

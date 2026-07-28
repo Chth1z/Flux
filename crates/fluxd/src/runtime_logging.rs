@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use flux_core::GenerationId;
+
 use crate::runtime_layout::RuntimeLayout;
 
 pub const MAX_RUNTIME_LOG_RECORD_BYTES: usize = 4 * 1024;
@@ -173,7 +175,7 @@ impl RuntimeLogs {
         stream: RuntimeLogStream,
         severity: LogSeverity,
         component: &'static str,
-        generation: Option<u64>,
+        generation: Option<GenerationId>,
         message: fmt::Arguments<'_>,
     ) -> Result<(), RuntimeLogError> {
         let record = encode_record(severity, component, generation, &message.to_string());
@@ -234,7 +236,7 @@ pub(crate) fn daemon_log(
 pub(crate) fn runtime_log(
     severity: LogSeverity,
     component: &'static str,
-    generation: Option<u64>,
+    generation: Option<GenerationId>,
     message: fmt::Arguments<'_>,
 ) {
     write_global(
@@ -250,7 +252,7 @@ fn write_global(
     stream: RuntimeLogStream,
     severity: LogSeverity,
     component: &'static str,
-    generation: Option<u64>,
+    generation: Option<GenerationId>,
     message: fmt::Arguments<'_>,
 ) {
     let rendered = message.to_string();
@@ -574,7 +576,7 @@ fn entry_kind(directory: RawFd, name: &CString) -> io::Result<Option<EntryKind>>
 fn encode_record(
     severity: LogSeverity,
     component: &str,
-    generation: Option<u64>,
+    generation: Option<GenerationId>,
     message: &str,
 ) -> Vec<u8> {
     let timestamp = SystemTime::now()
@@ -694,7 +696,7 @@ mod tests {
         let record = encode_record(
             LogSeverity::Warn,
             "subscription",
-            Some(42),
+            GenerationId::new(42),
             &format!("refresh failed url={secret} authorization=BearerSecret\nnext"),
         );
         let text = String::from_utf8(record).expect("UTF-8 record");

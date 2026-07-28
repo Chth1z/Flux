@@ -3,8 +3,8 @@ use std::fmt;
 use std::net::IpAddr;
 
 use flux_core::{
-    BootIdentity, NetworkAddressFamily, NetworkNamespaceIdentity, OwnershipJournalIdentity,
-    OwnershipJournalRevision,
+    BootIdentity, GenerationId, NetworkAddressFamily, NetworkNamespaceIdentity,
+    OwnershipJournalIdentity, OwnershipJournalRevision,
 };
 use sha2::{Digest, Sha256};
 
@@ -14,10 +14,10 @@ use crate::netlink::policy_routing::{
 
 use super::super::XtablesCaptureArtifactSet;
 use super::super::owner_durable::{
-    NativeXtablesDurableError, NativeXtablesDurableStore, NativeXtablesGeneration,
-    NativeXtablesJournalBinding, NativeXtablesJournalPhase, NativeXtablesJournalRecord,
-    NativeXtablesLeaseScope, NativeXtablesOwnerPayload, NativeXtablesRecovery,
-    NativeXtablesRecoveryFence, NativeXtablesRecoveryInspection, NativeXtablesTransitionLease,
+    NativeXtablesDurableError, NativeXtablesDurableStore, NativeXtablesJournalBinding,
+    NativeXtablesJournalPhase, NativeXtablesJournalRecord, NativeXtablesLeaseScope,
+    NativeXtablesOwnerPayload, NativeXtablesRecovery, NativeXtablesRecoveryFence,
+    NativeXtablesRecoveryInspection, NativeXtablesTransitionLease,
 };
 use super::super::save::{
     XtablesExpectedState, XtablesExpectedStatePhase, XtablesSaveProjection,
@@ -86,7 +86,7 @@ impl Error for NativePolicyRoutingAuditError {}
 /// Exact immutable target identity retained in the bounded durable owner payload.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct NativeXtablesTargetIdentity {
-    generation: NativeXtablesGeneration,
+    generation: GenerationId,
     target_digest: [u8; IDENTITY_DIGEST_BYTES],
     tool_digest: [u8; IDENTITY_DIGEST_BYTES],
     routing_digest: [u8; IDENTITY_DIGEST_BYTES],
@@ -94,7 +94,7 @@ pub(crate) struct NativeXtablesTargetIdentity {
 
 impl NativeXtablesTargetIdentity {
     #[must_use]
-    pub(crate) const fn generation(self) -> NativeXtablesGeneration {
+    pub(crate) const fn generation(self) -> GenerationId {
         self.generation
     }
 
@@ -137,9 +137,7 @@ impl NativeXtablesAdmittedTarget {
     ) -> Result<Self, NativeXtablesTargetError> {
         let topology = XtablesStableTopologyPlan::from_artifacts(&artifacts)
             .map_err(NativeXtablesTargetError::Topology)?;
-        let generation =
-            NativeXtablesGeneration::new(u64::from(artifacts.namespace().generation().get()))
-                .expect("lowered xtables generations are nonzero");
+        let generation = artifacts.namespace().generation();
         let mut routing = routing.into_iter().collect::<Vec<_>>();
         routing.sort_by_key(|identity| family_key(identity.family()));
 
@@ -512,7 +510,7 @@ impl NativeXtablesEnvironment {
         }
     }
 
-    fn binding(&self, generation: NativeXtablesGeneration) -> NativeXtablesJournalBinding {
+    fn binding(&self, generation: GenerationId) -> NativeXtablesJournalBinding {
         NativeXtablesJournalBinding::new(
             self.boot_identity.clone(),
             self.network_namespace,
@@ -704,8 +702,8 @@ fn parse_optional_identity(
     let mut fields = token.split(':');
     let generation = fields
         .next()
-        .and_then(|value| value.parse::<u64>().ok())
-        .and_then(NativeXtablesGeneration::new)
+        .and_then(|value| value.parse::<u32>().ok())
+        .and_then(GenerationId::new)
         .ok_or(NativeXtablesOwnerError::InvalidPayload(
             "invalid target generation",
         ))?;
@@ -753,7 +751,7 @@ fn digest_policy_routing_audit(audit: &NativePolicyRoutingAudit) -> [u8; IDENTIT
 }
 
 fn digest_target_recovery_material(
-    generation: NativeXtablesGeneration,
+    generation: GenerationId,
     artifact_digest: [u8; IDENTITY_DIGEST_BYTES],
     tool_digest: [u8; IDENTITY_DIGEST_BYTES],
     routing_digest: [u8; IDENTITY_DIGEST_BYTES],

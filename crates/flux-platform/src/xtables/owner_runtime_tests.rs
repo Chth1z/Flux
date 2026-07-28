@@ -7,8 +7,8 @@ use flux_core::{
     AddressHostFamilySelection, CaptureApplicationMode, CaptureApplicationPolicy,
     CaptureBypassPolicy, CaptureGroupId, CaptureInterfacePolicy, CaptureInterfaceSelector,
     CaptureIpPrefix, CaptureProgramRequest, CaptureProtocolSet, CaptureTrafficScope, CaptureUserId,
-    EngineCredentials, FwmarkCandidate, InterfaceIndex, InterfaceName, RouteProtocol, RouteTableId,
-    RulePriority, RuleProtocol, compile_capture_program,
+    EngineCredentials, FwmarkCandidate, GenerationId, InterfaceIndex, InterfaceName, RouteProtocol,
+    RouteTableId, RulePriority, RuleProtocol, compile_capture_program,
 };
 use tempfile::TempDir;
 
@@ -81,6 +81,12 @@ fn durable_target_archive_round_trips_exact_runtime_material() {
 
     resolver.stage(target.clone()).unwrap();
     assert_eq!(resolver.identities().unwrap(), [target.identity()]);
+    let encoded = store.load_target_archive().unwrap().unwrap();
+    let generation_offset = b"flux-native-xtables-target-archive\0".len() + 2 + 1;
+    assert_eq!(
+        &encoded[generation_offset..generation_offset + std::mem::size_of::<u32>()],
+        &7_u32.to_be_bytes()
+    );
 
     let mut reopened = DurableNativeXtablesTargetResolver::open(store).unwrap();
     let recovered = reopened.resolve(target.identity()).unwrap();
@@ -1673,7 +1679,7 @@ fn lowered_artifacts(
     lower_xtables_capture(
         XtablesCaptureLoweringRequest::new(
             program.program(),
-            XtablesCaptureNamespace::new(NonZeroU32::new(generation).unwrap()),
+            XtablesCaptureNamespace::new(GenerationId::new(generation).unwrap()),
             XtablesTproxyTarget::new(
                 NonZeroU16::new(1536).unwrap(),
                 FwmarkCandidate::new(MARK_MASK, PROXY_MARK, BYPASS_MARK).unwrap(),

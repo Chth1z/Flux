@@ -80,7 +80,7 @@ fn status_returns_one_coherent_capability_profile_and_control_snapshot() {
         capture: RuntimeCaptureState::Detached,
         engine: RuntimeEngineState::BackingOff,
         verification: RuntimeVerificationState::FunctionalFailed,
-        generation: Some(74),
+        generation: flux_core::GenerationId::new(74),
         last_error: Some(RuntimeFailure {
             operation: "maintain proxy engine".to_owned(),
             message: "owned child exited unexpectedly".to_owned(),

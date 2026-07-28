@@ -4,7 +4,7 @@ use flux_core::{
     AddressHostFamilySelection, CaptureApplicationMode, CaptureApplicationPolicy,
     CaptureBypassPolicy, CaptureGroupId, CaptureInterfacePolicy, CaptureIpPrefix,
     CaptureProgramRequest, CaptureProtocolSet, CaptureTrafficScope, CaptureUserId,
-    EngineCredentials, FwmarkCandidate, compile_capture_program,
+    EngineCredentials, FwmarkCandidate, GenerationId, compile_capture_program,
 };
 
 use super::*;
@@ -675,7 +675,7 @@ fn routing_requirement(family: NetworkAddressFamily) -> XtablesLocalOutputRoutin
     .unwrap();
     let request = XtablesCaptureLoweringRequest::new(
         report.program(),
-        XtablesCaptureNamespace::new(nonzero(7)),
+        XtablesCaptureNamespace::new(GenerationId::new(7).unwrap()),
         XtablesTproxyTarget::new(
             NonZeroU16::new(1536).unwrap(),
             FwmarkCandidate::new(TEST_MASK, TEST_MARK, 0x0040_0000).unwrap(),

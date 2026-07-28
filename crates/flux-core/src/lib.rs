@@ -14,11 +14,13 @@ mod android_rpdb;
 mod android_tproxy_topology;
 mod canonical_evidence;
 mod capability;
+mod capture_path;
 mod capture_program;
 mod config;
 mod control;
 mod fwmark_audit;
 mod fwmark_census;
+mod generation;
 mod network_inventory;
 mod network_route;
 mod network_rule;
@@ -98,6 +100,7 @@ pub use capability::{
     SHA256_DIGEST_BYTES, SecurityPatchLevel, SelinuxMode, SelinuxPolicyIdentity, Sha256Digest,
     Sha256DigestError, ToolId, VendorBuildIdentity, VerifiedBootIdentity, VerifiedBootState,
 };
+pub use capture_path::CapturePathId;
 pub use capture_program::{
     AddressHostSetProvenance, CAPTURE_PROGRAM_SCHEMA_VERSION, CaptureApplicationMode,
     CaptureApplicationPolicy, CaptureApplicationPolicyError, CaptureBypassPolicy,
@@ -137,6 +140,7 @@ pub use fwmark_census::{
     StaleRpdbFwmarkCensusFragment, project_android_net_id_fwmark_census_fragment,
     project_rpdb_fwmark_census_fragment,
 };
+pub use generation::GenerationId;
 pub use network_inventory::{
     AddressFlagConflict, INTERFACE_LINK_KIND_MAX_BYTES, INTERFACE_NAME_MAX_BYTES,
     InterfaceAddressFlags, InterfaceAddressRecord, InterfaceAddressRecordError,

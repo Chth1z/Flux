@@ -539,7 +539,7 @@ mod capture_receipt {
             assert_expected_request_rejected(
                 |request| {
                     request.pre_binding.engine.generation =
-                        NonZeroU32::new(2).expect("nonzero generation")
+                        flux_core::GenerationId::new(2).expect("nonzero generation")
                 },
                 TproxyLocalOutputCaptureReceiptError::RequestMismatch,
             );

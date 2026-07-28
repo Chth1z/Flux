@@ -1,13 +1,13 @@
 use std::error::Error;
 use std::fmt;
 use std::io;
-use std::num::{NonZeroU32, NonZeroU64};
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use flux_core::{
-    AddressResyncDisposition, ControlError, DispatcherCompletion, Reason, RuntimeDispatcher,
-    RuntimeIntent,
+    AddressResyncDisposition, ControlError, DispatcherCompletion, GenerationId, Reason,
+    RuntimeDispatcher, RuntimeIntent,
 };
 
 use crate::engine_supervisor::{
@@ -37,25 +37,25 @@ use crate::{
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PublishedRuntimeState {
-    Running { generation: NonZeroU32 },
+    Running { generation: GenerationId },
     Stopped,
     Failed,
 }
 
 #[derive(Clone)]
 pub(crate) struct PreparedGeneration {
-    id: NonZeroU32,
+    id: GenerationId,
     spec: EngineSpec,
 }
 
 impl PreparedGeneration {
     #[must_use]
-    pub(crate) const fn new(id: NonZeroU32, spec: EngineSpec) -> Self {
+    pub(crate) const fn new(id: GenerationId, spec: EngineSpec) -> Self {
         Self { id, spec }
     }
 
     #[must_use]
-    pub(crate) const fn id(&self) -> NonZeroU32 {
+    pub(crate) const fn id(&self) -> GenerationId {
         self.id
     }
 }
@@ -162,7 +162,7 @@ impl UnqualifiedFunctionalCanaryAttemptInputs {
 pub(crate) trait UnqualifiedFunctionalCanaryAttemptContext: Send + 'static {
     fn prepare_attempt(
         &mut self,
-        generation: NonZeroU32,
+        generation: GenerationId,
     ) -> Result<UnqualifiedFunctionalCanaryAttemptInputs, FunctionalCanaryError>;
 
     fn reobserve_environment(
@@ -250,13 +250,13 @@ enum RetirementProgress {
 }
 
 struct QualifiedRunningGeneration {
-    generation: NonZeroU32,
+    generation: GenerationId,
     disposition: FunctionalCanaryDisposition,
 }
 
 struct PendingSubscriptionActivation {
     completion: SubscriptionRefreshCompletion,
-    candidate: NonZeroU32,
+    candidate: GenerationId,
     node_count: u32,
     cleanup_pending: bool,
     failure: SubscriptionRefreshError,
@@ -516,7 +516,7 @@ where
             RuntimeCaptureState::Detached,
             RuntimeEngineState::Starting,
             self.pending_verification(),
-            Some(u64::from(generation.id.get())),
+            Some(generation.id),
             None,
         );
         self.ownership = RuntimeOwnership::Engine {
@@ -559,7 +559,7 @@ where
             RuntimeCaptureState::Published,
             RuntimeEngineState::Ready,
             self.pending_verification(),
-            Some(u64::from(generation.id.get())),
+            Some(generation.id),
             None,
         );
         let qualification = match self.verify_running_gate(
@@ -588,7 +588,7 @@ where
             RuntimeCaptureState::Published,
             RuntimeEngineState::Ready,
             verification,
-            Some(u64::from(generation.id.get())),
+            Some(generation.id),
             None,
         );
         Ok(())
@@ -705,7 +705,7 @@ where
                 runtime_capture_state(capture),
                 RuntimeEngineState::Exited,
                 self.pending_verification(),
-                Some(u64::from(generation.id.get())),
+                Some(generation.id),
                 None,
             );
             if capture == CaptureObservation::Published
@@ -753,7 +753,7 @@ where
                 runtime_phase_for_report(&report),
                 RuntimeCaptureState::Detached,
                 runtime_engine_for_report(&report),
-                Some(u64::from(generation_id.get())),
+                Some(generation_id),
                 None,
             );
             return Ok(());
@@ -780,7 +780,7 @@ where
                 RuntimeCaptureState::Published,
                 RuntimeEngineState::Ready,
                 self.pending_verification(),
-                Some(u64::from(generation_id.get())),
+                Some(generation_id),
                 None,
             );
             if self.functional_canary.mode() == FunctionalCanaryGateMode::RequiredUnqualified
@@ -820,7 +820,7 @@ where
                 RuntimeCaptureState::Published,
                 RuntimeEngineState::Ready,
                 verification,
-                Some(u64::from(generation_id.get())),
+                Some(generation_id),
                 None,
             );
             return Ok(());
@@ -839,7 +839,7 @@ where
                 runtime_phase_for_report(&report),
                 runtime_capture_state(capture),
                 runtime_engine_for_report(&report),
-                Some(u64::from(generation_id.get())),
+                Some(generation_id),
                 None,
             );
         }
@@ -1037,18 +1037,14 @@ where
         );
         match self.reload_prepared(candidate) {
             Ok(()) => completion.respond(SubscriptionRefreshDecision::Accept(
-                SubscriptionRefreshReport::updated(
-                    u64::from(candidate_id.get()),
-                    node_count,
-                    cleanup_pending,
-                ),
+                SubscriptionRefreshReport::updated(candidate_id, node_count, cleanup_pending),
             )),
             Err(error) => {
                 let failure = SubscriptionRefreshError::activation(error.to_string());
                 match self.subscription_activation_settlement(candidate_id) {
                     SubscriptionActivationSettlement::Accepted => completion.respond(
                         SubscriptionRefreshDecision::Accept(SubscriptionRefreshReport::updated(
-                            u64::from(candidate_id.get()),
+                            candidate_id,
                             node_count,
                             cleanup_pending,
                         )),
@@ -1093,7 +1089,7 @@ where
                     .completion
                     .respond(SubscriptionRefreshDecision::Accept(
                         SubscriptionRefreshReport::updated(
-                            u64::from(pending.candidate.get()),
+                            pending.candidate,
                             pending.node_count,
                             pending.cleanup_pending,
                         ),
@@ -1115,7 +1111,7 @@ where
 
     fn subscription_activation_settlement(
         &self,
-        candidate: NonZeroU32,
+        candidate: GenerationId,
     ) -> SubscriptionActivationSettlement {
         let runtime = self.runtime.snapshot();
         if matches!(
@@ -1127,7 +1123,7 @@ where
         ) && runtime.phase == RuntimePhase::Running
             && runtime.capture == RuntimeCaptureState::Published
             && runtime.engine == RuntimeEngineState::Ready
-            && runtime.generation == Some(u64::from(candidate.get()))
+            && runtime.generation == Some(candidate)
         {
             return SubscriptionActivationSettlement::Accepted;
         }
@@ -1190,7 +1186,7 @@ where
             runtime_phase_for_report(&report),
             RuntimeCaptureState::Detached,
             runtime_engine_for_report(&report),
-            Some(u64::from(generation_id.get())),
+            Some(generation_id),
             None,
         );
         Ok(())
@@ -1233,7 +1229,7 @@ where
             RuntimeCaptureState::Published,
             RuntimeEngineState::Ready,
             self.pending_verification(),
-            Some(u64::from(generation.id.get())),
+            Some(generation.id),
             None,
         );
         let qualification = match self.verify_running_gate(
@@ -1263,7 +1259,7 @@ where
             RuntimeCaptureState::Published,
             RuntimeEngineState::Ready,
             verification,
-            Some(u64::from(generation_id.get())),
+            Some(generation_id),
             None,
         );
         Ok(())
@@ -1348,7 +1344,7 @@ where
             runtime_capture_state(capture),
             RuntimeEngineState::Stopping,
             RuntimeVerificationState::StructuralOnly,
-            Some(u64::from(generation.id.get())),
+            Some(generation.id),
             None,
         );
         if capture == CaptureObservation::Published
@@ -1442,7 +1438,7 @@ where
                 RuntimePhase::Stopping,
                 RuntimeCaptureState::Detached,
                 runtime_engine_for_report(&report),
-                Some(u64::from(generation_id.get())),
+                Some(generation_id),
                 None,
             );
             return Ok(RetirementProgress::Pending(report));
@@ -1559,28 +1555,22 @@ where
         }
     }
 
-    fn ownership_summary(&self) -> (RuntimeCaptureState, Option<u64>) {
+    fn ownership_summary(&self) -> (RuntimeCaptureState, Option<GenerationId>) {
         match &self.ownership {
             RuntimeOwnership::Stopped => (RuntimeCaptureState::Detached, None),
             RuntimeOwnership::Engine {
                 generation,
                 capture,
-            } => (
-                runtime_capture_state(*capture),
-                Some(u64::from(generation.id.get())),
-            ),
-            RuntimeOwnership::DetachPending { generation, .. } => (
-                RuntimeCaptureState::Published,
-                Some(u64::from(generation.id.get())),
-            ),
-            RuntimeOwnership::CaptureRepairPending { generation } => (
-                RuntimeCaptureState::Published,
-                Some(u64::from(generation.id.get())),
-            ),
-            RuntimeOwnership::Retiring { generation, .. } => (
-                RuntimeCaptureState::Detached,
-                Some(u64::from(generation.id.get())),
-            ),
+            } => (runtime_capture_state(*capture), Some(generation.id)),
+            RuntimeOwnership::DetachPending { generation, .. } => {
+                (RuntimeCaptureState::Published, Some(generation.id))
+            }
+            RuntimeOwnership::CaptureRepairPending { generation } => {
+                (RuntimeCaptureState::Published, Some(generation.id))
+            }
+            RuntimeOwnership::Retiring { generation, .. } => {
+                (RuntimeCaptureState::Detached, Some(generation.id))
+            }
         }
     }
 
@@ -1825,7 +1815,7 @@ where
 
     fn retry_pending_running_publication(
         &mut self,
-        generation: NonZeroU32,
+        generation: GenerationId,
     ) -> Result<(), ControlError> {
         let Some(state) = self.pending_publication else {
             return Ok(());
@@ -2092,7 +2082,7 @@ where
         phase: RuntimePhase,
         capture: RuntimeCaptureState,
         engine: RuntimeEngineState,
-        generation: Option<u64>,
+        generation: Option<GenerationId>,
         last_error: Option<RuntimeFailure>,
     ) {
         self.publish_runtime_with_verification(
@@ -2111,7 +2101,7 @@ where
         capture: RuntimeCaptureState,
         engine: RuntimeEngineState,
         verification: RuntimeVerificationState,
-        generation: Option<u64>,
+        generation: Option<GenerationId>,
         last_error: Option<RuntimeFailure>,
     ) {
         self.runtime.publish(RuntimeSnapshot {
@@ -2534,7 +2524,7 @@ mod tests {
             RuntimePhase::Running,
             RuntimeCaptureState::Published,
             RuntimeEngineState::Ready,
-            Some(1),
+            Some(generation(1)),
             None,
         );
         events.lock().expect("events lock").clear();
@@ -2657,7 +2647,7 @@ mod tests {
             report.disposition(),
             crate::subscription::SubscriptionRefreshDisposition::Updated
         );
-        assert_eq!(report.generation(), Some(2));
+        assert_eq!(report.generation(), Some(generation(2)));
         assert_eq!(report.node_count(), Some(8));
         assert_eq!(
             *accepted.lock().expect("accepted source lock"),
@@ -2714,7 +2704,7 @@ mod tests {
             RuntimePhase::Running,
             RuntimeCaptureState::Published,
             RuntimeEngineState::Ready,
-            Some(1),
+            Some(generation(1)),
             None,
         );
         let source = validated_subscription_config([44; 32], 9);
@@ -2909,7 +2899,7 @@ mod tests {
             snapshot.verification,
             RuntimeVerificationState::StructuralOnly
         );
-        assert_eq!(snapshot.generation, Some(1));
+        assert_eq!(snapshot.generation, Some(generation(1)));
         assert_eq!(snapshot.last_error, None);
     }
 
@@ -3032,7 +3022,7 @@ mod tests {
             .expect_err("candidate preparation fails before active binding changes");
 
         let snapshot = runtime.snapshot();
-        assert_eq!(snapshot.generation, Some(17));
+        assert_eq!(snapshot.generation, Some(generation(17)));
         assert_eq!(
             snapshot.verification,
             RuntimeVerificationState::FunctionalPassed
@@ -3085,7 +3075,7 @@ mod tests {
             .expect_err("uncertain capture detachment blocks replacement");
 
         let snapshot = runtime.snapshot();
-        assert_eq!(snapshot.generation, Some(17));
+        assert_eq!(snapshot.generation, Some(generation(17)));
         assert_eq!(
             snapshot.verification,
             RuntimeVerificationState::FunctionalPending
@@ -4325,7 +4315,7 @@ mod tests {
         let degraded = runtime.snapshot();
         assert_eq!(degraded.phase, RuntimePhase::Degraded);
         assert_eq!(degraded.capture, RuntimeCaptureState::Published);
-        assert_eq!(degraded.generation, Some(2));
+        assert_eq!(degraded.generation, Some(generation(2)));
     }
 
     #[test]
@@ -5143,9 +5133,9 @@ mod tests {
         CaptureStarted,
         CaptureStopped,
         CaptureVerified,
-        CanaryPrepared(NonZeroU32),
-        CanaryExecuted(NonZeroU32),
-        CanaryReobserved(NonZeroU32),
+        CanaryPrepared(GenerationId),
+        CanaryExecuted(GenerationId),
+        CanaryReobserved(GenerationId),
         AddressesResynchronized,
         AddressSuccessorPrepared,
         SubscriptionPrepared,
@@ -5179,8 +5169,8 @@ mod tests {
         (directory, path)
     }
 
-    fn generation(value: u32) -> NonZeroU32 {
-        NonZeroU32::new(value).expect("test generation must be nonzero")
+    fn generation(value: u32) -> GenerationId {
+        GenerationId::new(value).expect("test generation must be nonzero")
     }
 
     struct ScriptedWriter {
@@ -5380,7 +5370,7 @@ mod tests {
         type Error = io::Error;
 
         fn prepare(&mut self, reason: Reason) -> Result<PreparedGeneration, Self::Error> {
-            let id = NonZeroU32::new(self.next_generation_id)
+            let id = GenerationId::new(self.next_generation_id)
                 .ok_or_else(|| io::Error::other("scripted generation must be nonzero"))?;
             self.next_generation_id = id
                 .get()
@@ -5584,7 +5574,7 @@ mod tests {
     impl UnqualifiedFunctionalCanaryAttemptContext for ScriptedCanaryContext {
         fn prepare_attempt(
             &mut self,
-            generation: NonZeroU32,
+            generation: GenerationId,
         ) -> Result<UnqualifiedFunctionalCanaryAttemptInputs, FunctionalCanaryError> {
             let mut script = self.script.lock().expect("canary script");
             let attempt = script.attempts.pop_front().ok_or_else(|| {

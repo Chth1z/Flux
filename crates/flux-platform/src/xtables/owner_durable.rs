@@ -4,7 +4,6 @@ use std::fmt;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::mem::MaybeUninit;
-use std::num::NonZeroU64;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
@@ -13,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use flux_core::{
-    BootIdentity, NetworkNamespaceIdentity, OWNERSHIP_JOURNAL_IDENTITY_BYTES,
+    BootIdentity, GenerationId, NetworkNamespaceIdentity, OWNERSHIP_JOURNAL_IDENTITY_BYTES,
     OwnershipJournalIdentity, OwnershipJournalRevision,
 };
 use sha2::{Digest, Sha256};
@@ -39,30 +38,11 @@ const NATIVE_OWNER_GUARD_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(1);
 const NATIVE_OWNER_GUARD_RETRY_INTERVAL: Duration = Duration::from_millis(2);
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-#[repr(transparent)]
-pub(crate) struct NativeXtablesGeneration(NonZeroU64);
-
-impl NativeXtablesGeneration {
-    #[must_use]
-    pub(crate) const fn new(value: u64) -> Option<Self> {
-        match NonZeroU64::new(value) {
-            Some(value) => Some(Self(value)),
-            None => None,
-        }
-    }
-
-    #[must_use]
-    pub(crate) const fn get(self) -> u64 {
-        self.0.get()
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct NativeXtablesJournalBinding {
     boot_identity: BootIdentity,
     network_namespace: NetworkNamespaceIdentity,
-    generation: NativeXtablesGeneration,
+    generation: GenerationId,
     journal_identity: OwnershipJournalIdentity,
 }
 
@@ -117,7 +97,7 @@ impl NativeXtablesJournalBinding {
     pub(crate) const fn new(
         boot_identity: BootIdentity,
         network_namespace: NetworkNamespaceIdentity,
-        generation: NativeXtablesGeneration,
+        generation: GenerationId,
         journal_identity: OwnershipJournalIdentity,
     ) -> Self {
         Self {
@@ -139,7 +119,7 @@ impl NativeXtablesJournalBinding {
     }
 
     #[must_use]
-    pub(crate) const fn generation(&self) -> NativeXtablesGeneration {
+    pub(crate) const fn generation(&self) -> GenerationId {
         self.generation
     }
 
@@ -1377,7 +1357,8 @@ fn parse_binding(
     let network_namespace = NetworkNamespaceIdentity::new(device, inode)
         .ok_or_else(|| invalid_record(artifact, "invalid namespace identity"))?;
     let generation = parse_nonzero_u64(field(lines[3], "generation", artifact)?)
-        .and_then(NativeXtablesGeneration::new)
+        .and_then(|value| u32::try_from(value).ok())
+        .and_then(GenerationId::new)
         .ok_or_else(|| invalid_record(artifact, "invalid generation"))?;
     let identity_bytes =
         decode_fixed_hex::<OWNERSHIP_JOURNAL_IDENTITY_BYTES>(field(lines[4], "journal", artifact)?)

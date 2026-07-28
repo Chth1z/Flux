@@ -1,7 +1,6 @@
 use std::error::Error;
 use std::fmt;
 use std::marker::PhantomData;
-use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -9,8 +8,9 @@ use std::time::Duration;
 use flux_core::{
     AndroidNetdSourceProfile, AndroidTproxyRoutingShape, AndroidTproxyTopologyScopeRequest,
     AndroidTproxyTrafficDomainRequest, CaptureTrafficDomain, FluxConfig, FwmarkCandidate,
-    NetworkAddressFamily, NetworkInventory, Reason, RpdbFamilyPlacement, RpdbPlacementRequest,
-    RulePriority, RuleTableId, classify_android_rpdb, plan_android_rpdb_placement,
+    GenerationId, NetworkAddressFamily, NetworkInventory, Reason, RpdbFamilyPlacement,
+    RpdbPlacementRequest, RulePriority, RuleTableId, classify_android_rpdb,
+    plan_android_rpdb_placement,
 };
 use flux_platform::{
     AndroidFwmarkCensusCoordinatorOutcome, AndroidFwmarkCensusCoordinatorPurpose,
@@ -391,7 +391,7 @@ impl NativeGenerationSourcePaths {
         )
     }
 
-    fn generation_config(&self, generation: NonZeroU32) -> PathBuf {
+    fn generation_config(&self, generation: GenerationId) -> PathBuf {
         self.state_root
             .join("generations")
             .join(format!("engine-{}.json", generation.get()))
@@ -546,8 +546,9 @@ where
         }
         let prior_owned = self.committed.as_ref().map(|current| current.identity);
         let next = prior_owned
-            .map_or(Some(1), |prior| prior.generation().get().checked_add(1))
-            .and_then(NonZeroU32::new)
+            .map_or(Some(GenerationId::INITIAL), |prior| {
+                prior.generation().checked_next()
+            })
             .ok_or(NativeGenerationSourceError::GenerationSequenceExhausted)?;
         let config_path = self.paths.generation_config(next);
         record_io::write(&config_path, engine_source.artifact().bytes())
@@ -573,7 +574,7 @@ where
         engine_source: SelectedEngineSource,
         subscription: Option<ValidatedSubscriptionEngineConfig>,
         prior_owned: Option<AdmittedGenerationIdentity>,
-        expected_generation: NonZeroU32,
+        expected_generation: GenerationId,
         config_path: PathBuf,
     ) -> Result<PreparedNativeGeneration<A::Target>, NativeGenerationSourceError> {
         let desired_state = inputs.desired_state().clone();
@@ -644,7 +645,7 @@ where
 
     fn settle_running(
         &mut self,
-        generation: NonZeroU32,
+        generation: GenerationId,
         target: Option<I>,
     ) -> Result<(), NativeGenerationSourceError> {
         let target = target.ok_or(NativeGenerationSourceError::Invariant(
@@ -1351,7 +1352,7 @@ esac
             .source
             .settle(
                 PublishedRuntimeState::Running {
-                    generation: NonZeroU32::new(1).unwrap(),
+                    generation: GenerationId::INITIAL,
                 },
                 Some(1),
             )

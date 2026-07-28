@@ -1,5 +1,7 @@
 use std::sync::{Arc, RwLock};
 
+use flux_core::GenerationId;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimePhase {
     Unknown,
@@ -61,7 +63,7 @@ pub struct RuntimeSnapshot {
     pub capture: RuntimeCaptureState,
     pub engine: RuntimeEngineState,
     pub verification: RuntimeVerificationState,
-    pub generation: Option<u64>,
+    pub generation: Option<GenerationId>,
     pub last_error: Option<RuntimeFailure>,
 }
 
@@ -148,7 +150,7 @@ mod tests {
             capture: RuntimeCaptureState::Published,
             engine: RuntimeEngineState::Ready,
             verification: RuntimeVerificationState::StructuralOnly,
-            generation: Some(7),
+            generation: GenerationId::new(7),
             last_error: None,
         };
 
@@ -210,7 +212,7 @@ mod tests {
             capture: RuntimeCaptureState::Published,
             engine: RuntimeEngineState::Ready,
             verification: RuntimeVerificationState::FunctionalPending,
-            generation: Some(7),
+            generation: GenerationId::new(7),
             last_error: None,
         });
 
@@ -220,7 +222,7 @@ mod tests {
             capture: RuntimeCaptureState::Published,
             engine: RuntimeEngineState::Ready,
             verification: RuntimeVerificationState::FunctionalPassed,
-            generation: Some(7),
+            generation: GenerationId::new(7),
             last_error: None,
         });
 

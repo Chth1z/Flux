@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use flux_core::{
     AddressResyncDisposition, AdministrativeState, AndroidBuildIdentity, AndroidProductIdentity,
     ArtifactIdentity, BootIdentity, BootIdentityMutationStatus, CAPABILITY_PROFILE_SCHEMA_VERSION,
-    CapabilityProfile, ControlError, ControlService, ControlSnapshot, DeviceIdentity,
+    CapabilityProfile, ControlError, ControlService, ControlSnapshot, DeviceIdentity, GenerationId,
     KernelBuildIdentity, KernelFacts, KernelMutationStatus, KernelRelease, KernelVersion,
     MIN_SUPPORTED_KERNEL, MutationGate, NetworkNamespaceIdentity, Observation, OperationReport,
     Reason, RuntimeIntent, SecurityPatchLevel, SelinuxMode, SelinuxPolicyIdentity, Sha256Digest,
@@ -312,7 +312,7 @@ where
                 request_id,
                 ResponseBody::SubscriptionUpdate {
                     disposition: report.disposition().into(),
-                    generation: report.generation(),
+                    generation: report.generation().map(GenerationId::get),
                     node_count: report.node_count(),
                     cleanup_pending: report.cleanup_pending(),
                 },
@@ -701,7 +701,7 @@ enum ResponseBody {
     },
     SubscriptionUpdate {
         disposition: WireSubscriptionRefreshDisposition,
-        generation: Option<u64>,
+        generation: Option<u32>,
         node_count: Option<u32>,
         cleanup_pending: bool,
     },
@@ -1382,7 +1382,7 @@ struct WireRuntimeSnapshot {
     capture: WireRuntimeCaptureState,
     engine: WireRuntimeEngineState,
     verification: WireRuntimeVerificationState,
-    generation: Option<u64>,
+    generation: Option<u32>,
     last_error: Option<WireRuntimeFailure>,
 }
 
@@ -1394,23 +1394,33 @@ impl From<&RuntimeSnapshot> for WireRuntimeSnapshot {
             capture: snapshot.capture.into(),
             engine: snapshot.engine.into(),
             verification: snapshot.verification.into(),
-            generation: snapshot.generation,
+            generation: snapshot.generation.map(GenerationId::get),
             last_error: snapshot.last_error.as_ref().map(Into::into),
         }
     }
 }
 
-impl From<WireRuntimeSnapshot> for RuntimeSnapshot {
-    fn from(snapshot: WireRuntimeSnapshot) -> Self {
-        Self {
+impl TryFrom<WireRuntimeSnapshot> for RuntimeSnapshot {
+    type Error = ControlError;
+
+    fn try_from(snapshot: WireRuntimeSnapshot) -> Result<Self, Self::Error> {
+        let generation = match snapshot.generation {
+            Some(value) => Some(GenerationId::new(value).ok_or_else(|| {
+                ControlError::protocol(
+                    "daemon returned a zero runtime Generation identifier".to_owned(),
+                )
+            })?),
+            None => None,
+        };
+        Ok(Self {
             revision: snapshot.revision,
             phase: snapshot.phase.into(),
             capture: snapshot.capture.into(),
             engine: snapshot.engine.into(),
             verification: snapshot.verification.into(),
-            generation: snapshot.generation,
+            generation,
             last_error: snapshot.last_error.map(Into::into),
-        }
+        })
     }
 }
 
@@ -1873,7 +1883,7 @@ pub(crate) fn decode_status_response(
                 capability_profile,
                 native_admission: native_admission.into(),
                 control: control.try_into()?,
-                runtime: runtime.into(),
+                runtime: runtime.try_into()?,
             })
         }
         WireResult::Ok { .. } => Err(unexpected_response("status")),
@@ -1964,7 +1974,7 @@ pub(crate) fn decode_explain_response(
 
 fn decode_subscription_refresh_report(
     disposition: WireSubscriptionRefreshDisposition,
-    generation: Option<u64>,
+    generation: Option<u32>,
     node_count: Option<u32>,
     cleanup_pending: bool,
 ) -> Result<SubscriptionRefreshReport, ControlError> {
@@ -1975,9 +1985,7 @@ fn decode_subscription_refresh_report(
     };
     match disposition {
         WireSubscriptionRefreshDisposition::Updated => Ok(SubscriptionRefreshReport::updated(
-            generation
-                .filter(|generation| *generation != 0)
-                .ok_or_else(invalid)?,
+            generation.and_then(GenerationId::new).ok_or_else(invalid)?,
             node_count
                 .filter(|node_count| *node_count != 0)
                 .ok_or_else(invalid)?,
@@ -2197,7 +2205,11 @@ mod tests {
         let refresh_calls = Arc::clone(&calls);
         let subscription = SubscriptionRefreshClient::for_test(move || {
             refresh_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(SubscriptionRefreshReport::updated(71, 23, true))
+            Ok(SubscriptionRefreshReport::updated(
+                GenerationId::new(71).expect("test Generation"),
+                23,
+                true,
+            ))
         });
         let handler = ProtocolHandler::with_runtime_snapshot_and_subscription(
             Arc::new(CapabilityProfileFixture::supported()),
@@ -2221,7 +2233,14 @@ mod tests {
                 "\"generation\":71,\"node_count\":23,\"cleanup_pending\":true}}}\n"
             )
         );
-        assert_eq!(report, SubscriptionRefreshReport::updated(71, 23, true));
+        assert_eq!(
+            report,
+            SubscriptionRefreshReport::updated(
+                GenerationId::new(71).expect("test Generation"),
+                23,
+                true,
+            )
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
@@ -2357,6 +2376,18 @@ mod tests {
             error.to_string(),
             "control protocol: daemon returned incoherent subscription update disposition metadata"
         );
+
+        let incoherent = encode_response(ResponseEnvelope::ok(
+            106,
+            ResponseBody::SubscriptionUpdate {
+                disposition: WireSubscriptionRefreshDisposition::Updated,
+                generation: Some(0),
+                node_count: Some(9),
+                cleanup_pending: false,
+            },
+        ));
+        decode_subscription_update_response(&incoherent, 106)
+            .expect_err("zero Generation must fail closed");
     }
 
     #[test]
@@ -2483,7 +2514,7 @@ mod tests {
             capture: RuntimeCaptureState::Detached,
             engine: RuntimeEngineState::BackingOff,
             verification: RuntimeVerificationState::FunctionalFailed,
-            generation: Some(48),
+            generation: GenerationId::new(48),
             last_error: Some(RuntimeFailure {
                 operation: "maintain proxy engine".to_owned(),
                 message: "owned child exited unexpectedly".to_owned(),
@@ -2503,6 +2534,31 @@ mod tests {
         let snapshot = decode_status_response(&response, 93).expect("coherent status");
 
         assert_eq!(snapshot.runtime, runtime);
+    }
+
+    #[test]
+    fn status_decoder_rejects_a_zero_runtime_generation() {
+        let profile = CapabilityProfileFixture::supported();
+        let response = encode_response(ResponseEnvelope::ok(
+            97,
+            ResponseBody::Snapshot {
+                capability_profile: Box::new((&profile).into()),
+                native_admission: NativeAdmissionState::Admitted.into(),
+                control: (&ControlSnapshot::default()).into(),
+                runtime: WireRuntimeSnapshot {
+                    generation: Some(0),
+                    ..WireRuntimeSnapshot::default()
+                },
+            },
+        ));
+
+        let error = decode_status_response(&response, 97)
+            .expect_err("zero runtime Generation must fail closed");
+
+        assert_eq!(
+            error.to_string(),
+            "control protocol: daemon returned a zero runtime Generation identifier"
+        );
     }
 
     #[test]

@@ -1,8 +1,8 @@
 use std::error::Error;
 use std::fmt;
-use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
+use flux_core::GenerationId;
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -370,7 +370,7 @@ fn decode_identity(
     stored: StoredGenerationIdentity,
     digest_field: &'static str,
 ) -> Result<AdmittedGenerationIdentity, PreparedGenerationRecordError> {
-    let generation = NonZeroU32::new(stored.generation)
+    let generation = GenerationId::new(stored.generation)
         .ok_or(PreparedGenerationRecordError::InvalidGeneration)?;
     let digest = GenerationAssemblyDigest::from_bytes(decode_digest(&stored.digest, digest_field)?);
     Ok(AdmittedGenerationIdentity::new(generation, digest))

@@ -1,6 +1,7 @@
 use std::error::Error;
 use std::fmt::Debug;
-use std::num::NonZeroU64;
+
+use flux_core::GenerationId;
 
 /// Opaque identity of one exact native capture target.
 ///
@@ -8,7 +9,7 @@ use std::num::NonZeroU64;
 /// diagnostic identity only and do not grant mutation authority.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct NativeCaptureTargetIdentity {
-    generation: NonZeroU64,
+    generation: GenerationId,
     target_digest: [u8; 32],
     tool_digest: [u8; 32],
     routing_digest: [u8; 32],
@@ -17,7 +18,7 @@ pub struct NativeCaptureTargetIdentity {
 impl NativeCaptureTargetIdentity {
     #[must_use]
     pub(crate) const fn new(
-        generation: NonZeroU64,
+        generation: GenerationId,
         target_digest: [u8; 32],
         tool_digest: [u8; 32],
         routing_digest: [u8; 32],
@@ -31,7 +32,7 @@ impl NativeCaptureTargetIdentity {
     }
 
     #[must_use]
-    pub const fn generation(self) -> NonZeroU64 {
+    pub const fn generation(self) -> GenerationId {
         self.generation
     }
 

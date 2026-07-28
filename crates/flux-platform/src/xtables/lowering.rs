@@ -8,8 +8,9 @@ use flux_core::{
     CaptureDomainProgram, CaptureInterfaceDirection, CaptureInterfaceSelector,
     CaptureInterfaceSelectorKind, CapturePredicate, CaptureProgram, CaptureProgramDigest,
     CaptureProtocolSet, CaptureTrafficDomain, CaptureTransportProtocol, CaptureUserId,
-    EngineCredentials, FwmarkCandidate, FwmarkRole, InterfaceName, NetworkAddressFamily,
-    RouteProtocol, RouteScope, RouteTableId, RouteType, RuleFwMark, RulePriority, RuleProtocol,
+    EngineCredentials, FwmarkCandidate, FwmarkRole, GenerationId, InterfaceName,
+    NetworkAddressFamily, RouteProtocol, RouteScope, RouteTableId, RouteType, RuleFwMark,
+    RulePriority, RuleProtocol,
 };
 use sha2::{Digest, Sha256};
 
@@ -128,17 +129,17 @@ impl XtablesCaptureExtensions {
 /// Non-authorizing namespace used only to derive deterministic generation-scoped chain names.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct XtablesCaptureNamespace {
-    generation: NonZeroU32,
+    generation: GenerationId,
 }
 
 impl XtablesCaptureNamespace {
     #[must_use]
-    pub const fn new(generation: NonZeroU32) -> Self {
+    pub const fn new(generation: GenerationId) -> Self {
         Self { generation }
     }
 
     #[must_use]
-    pub const fn generation(self) -> NonZeroU32 {
+    pub const fn generation(self) -> GenerationId {
         self.generation
     }
 }
@@ -2213,7 +2214,7 @@ fn ensure_byte_limit(
 fn capture_chain_name(
     family: NetworkAddressFamily,
     role: XtablesCaptureEntryPointRole,
-    generation: NonZeroU32,
+    generation: GenerationId,
 ) -> Box<str> {
     let role = match role {
         XtablesCaptureEntryPointRole::LocalOutputClassifier => 'O',

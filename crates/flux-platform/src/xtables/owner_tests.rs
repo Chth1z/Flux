@@ -4,8 +4,8 @@ use flux_core::{
     AddressHostFamilySelection, CaptureApplicationMode, CaptureApplicationPolicy,
     CaptureBypassPolicy, CaptureGroupId, CaptureInterfacePolicy, CaptureInterfaceSelector,
     CaptureIpPrefix, CaptureProgramRequest, CaptureProtocolSet, CaptureTrafficScope, CaptureUserId,
-    EngineCredentials, FwmarkCandidate, InterfaceName, RouteProtocol, RouteTableId, RulePriority,
-    RuleProtocol, compile_capture_program,
+    EngineCredentials, FwmarkCandidate, GenerationId, InterfaceName, RouteProtocol, RouteTableId,
+    RulePriority, RuleProtocol, compile_capture_program,
 };
 
 use super::*;
@@ -173,7 +173,7 @@ fn artifacts(
     .unwrap();
     let request = XtablesCaptureLoweringRequest::new(
         report.program(),
-        XtablesCaptureNamespace::new(NonZeroU32::new(GENERATION).unwrap()),
+        XtablesCaptureNamespace::new(GenerationId::new(GENERATION).unwrap()),
         XtablesTproxyTarget::new(
             NonZeroU16::new(1536).unwrap(),
             FwmarkCandidate::new(MARK_MASK, PROXY_MARK, BYPASS_MARK).unwrap(),

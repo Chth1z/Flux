@@ -2,13 +2,12 @@ use std::error::Error;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::net::IpAddr;
-use std::num::NonZeroU32;
 use std::path::Path;
 
 use flux_core::{
     AddressHostFamilySelection, AndroidMarkPlanningAuthority, AndroidUserSelection,
     CapabilityProfile, CaptureApplicationMode, CaptureBackend, CaptureInterfaceSelectorKind,
-    CaptureTrafficDomain, CaptureTransportProtocol, FluxConfig, FwmarkCandidate,
+    CaptureTrafficDomain, CaptureTransportProtocol, FluxConfig, FwmarkCandidate, GenerationId,
     NetworkAddressFamily, NetworkEpoch, NetworkInventory, NetworkInventorySnapshotId,
     NetworkNamespaceIdentity, RpdbPlacementLease, StaleRpdbPlacementLease,
 };
@@ -74,19 +73,19 @@ impl GenerationPlanningDigest {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct AdmittedGenerationIdentity {
-    generation: NonZeroU32,
+    generation: GenerationId,
     digest: GenerationAssemblyDigest,
 }
 
 impl AdmittedGenerationIdentity {
     #[cfg(test)]
     #[must_use]
-    pub(crate) const fn new(generation: NonZeroU32, digest: GenerationAssemblyDigest) -> Self {
+    pub(crate) const fn new(generation: GenerationId, digest: GenerationAssemblyDigest) -> Self {
         Self { generation, digest }
     }
 
     #[must_use]
-    pub(crate) const fn generation(self) -> NonZeroU32 {
+    pub(crate) const fn generation(self) -> GenerationId {
         self.generation
     }
 
@@ -274,7 +273,7 @@ impl AdmittedGeneration {
     }
 
     #[must_use]
-    pub(crate) const fn generation(&self) -> NonZeroU32 {
+    pub(crate) const fn generation(&self) -> GenerationId {
         self.identity.generation
     }
 
@@ -823,13 +822,12 @@ fn routing_from_placement(
 
 fn next_generation(
     prior_owned: Option<AdmittedGenerationIdentity>,
-) -> Result<NonZeroU32, GenerationAssemblyError> {
-    let next = match prior_owned {
-        Some(prior) => prior.generation.get().checked_add(1),
-        None => Some(1),
-    };
-    next.and_then(NonZeroU32::new)
-        .ok_or(GenerationAssemblyError::GenerationSequenceExhausted)
+) -> Result<GenerationId, GenerationAssemblyError> {
+    match prior_owned {
+        Some(prior) => prior.generation.checked_next(),
+        None => Some(GenerationId::INITIAL),
+    }
+    .ok_or(GenerationAssemblyError::GenerationSequenceExhausted)
 }
 
 #[derive(Debug)]
@@ -915,7 +913,7 @@ pub(crate) fn bind_engine_spec_to_desired_state(
 }
 
 struct GenerationDigestInput<'a> {
-    generation: NonZeroU32,
+    generation: GenerationId,
     prior_owned: Option<AdmittedGenerationIdentity>,
     desired_state: &'a FluxConfig,
     candidate: &'a TproxyGenerationCandidate,

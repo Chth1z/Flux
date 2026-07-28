@@ -418,7 +418,11 @@ fn manual_refresh_is_busy_until_the_serialized_acceptance_arrives() {
     assert_eq!(published.node_count(), 5);
     assert!(cleanup_pending);
     completion.respond(SubscriptionRefreshDecision::Accept(
-        SubscriptionRefreshReport::updated(12, 5, true),
+        SubscriptionRefreshReport::updated(
+            flux_core::GenerationId::new(12).expect("test Generation"),
+            5,
+            true,
+        ),
     ));
 
     let report = waiting
@@ -429,7 +433,7 @@ fn manual_refresh_is_busy_until_the_serialized_acceptance_arrives() {
         report.disposition(),
         SubscriptionRefreshDisposition::Updated
     );
-    assert_eq!(report.generation(), Some(12));
+    assert_eq!(report.generation(), flux_core::GenerationId::new(12));
     assert_eq!(report.node_count(), Some(5));
     assert!(report.cleanup_pending());
     assert!(rejections.lock().expect("rejection record lock").is_empty());

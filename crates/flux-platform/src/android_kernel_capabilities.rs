@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 
+use flux_core::CapturePathId;
 use sha2::{Digest, Sha256};
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -515,17 +516,10 @@ impl fmt::Display for AndroidNftablesObservationGateError {
 
 impl Error for AndroidNftablesObservationGateError {}
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub enum AndroidCapturePath {
-    NativeNftablesTproxy,
-    XtablesTproxy,
-    ManagedTun,
-}
-
-const AUTOMATIC_PATH_ORDER: [AndroidCapturePath; ANDROID_CAPTURE_PATH_COUNT] = [
-    AndroidCapturePath::NativeNftablesTproxy,
-    AndroidCapturePath::XtablesTproxy,
-    AndroidCapturePath::ManagedTun,
+const AUTOMATIC_PATH_ORDER: [CapturePathId; ANDROID_CAPTURE_PATH_COUNT] = [
+    CapturePathId::NftablesTproxy,
+    CapturePathId::XtablesTproxy,
+    CapturePathId::ManagedTun,
 ];
 
 const NFTABLES_REQUIRED_FEATURES: &[AndroidKernelFeature] = &[
@@ -569,13 +563,11 @@ const TUN_REQUIRED_FEATURES: &[AndroidKernelFeature] = &[
     AndroidKernelFeature::Tun,
 ];
 
-impl AndroidCapturePath {
-    const fn required_features(self) -> &'static [AndroidKernelFeature] {
-        match self {
-            Self::NativeNftablesTproxy => NFTABLES_REQUIRED_FEATURES,
-            Self::XtablesTproxy => XTABLES_REQUIRED_FEATURES,
-            Self::ManagedTun => TUN_REQUIRED_FEATURES,
-        }
+fn required_features(path: CapturePathId) -> &'static [AndroidKernelFeature] {
+    match path {
+        CapturePathId::NftablesTproxy => NFTABLES_REQUIRED_FEATURES,
+        CapturePathId::XtablesTproxy => XTABLES_REQUIRED_FEATURES,
+        CapturePathId::ManagedTun => TUN_REQUIRED_FEATURES,
     }
 }
 
@@ -620,11 +612,11 @@ impl AndroidCapturePathQualifications {
         }
     }
 
-    const fn for_path(self, path: AndroidCapturePath) -> AndroidCapturePathProbeState {
+    const fn for_path(self, path: CapturePathId) -> AndroidCapturePathProbeState {
         match path {
-            AndroidCapturePath::NativeNftablesTproxy => self.nftables,
-            AndroidCapturePath::XtablesTproxy => self.xtables,
-            AndroidCapturePath::ManagedTun => self.tun,
+            CapturePathId::NftablesTproxy => self.nftables,
+            CapturePathId::XtablesTproxy => self.xtables,
+            CapturePathId::ManagedTun => self.tun,
         }
     }
 }
@@ -642,12 +634,12 @@ impl Default for AndroidCapturePathQualifications {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AndroidCapturePathPreference {
     Automatic,
-    Explicit(AndroidCapturePath),
+    Explicit(CapturePathId),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AndroidCapturePathCandidate {
-    path: AndroidCapturePath,
+    path: CapturePathId,
     state: AndroidCapturePathState,
     probe_state: AndroidCapturePathProbeState,
     first_kernel_gap: Option<(AndroidKernelFeature, AndroidKernelFeatureState)>,
@@ -655,7 +647,7 @@ pub struct AndroidCapturePathCandidate {
 
 impl AndroidCapturePathCandidate {
     #[must_use]
-    pub const fn path(self) -> AndroidCapturePath {
+    pub const fn path(self) -> CapturePathId {
         self.path
     }
 
@@ -681,8 +673,8 @@ impl AndroidCapturePathCandidate {
 pub struct AndroidCapturePathDecision {
     preference: AndroidCapturePathPreference,
     candidates: [AndroidCapturePathCandidate; ANDROID_CAPTURE_PATH_COUNT],
-    selected: Option<AndroidCapturePath>,
-    next_to_qualify: Option<AndroidCapturePath>,
+    selected: Option<CapturePathId>,
+    next_to_qualify: Option<CapturePathId>,
 }
 
 impl AndroidCapturePathDecision {
@@ -697,17 +689,17 @@ impl AndroidCapturePathDecision {
     }
 
     #[must_use]
-    pub const fn selected(self) -> Option<AndroidCapturePath> {
+    pub const fn selected(self) -> Option<CapturePathId> {
         self.selected
     }
 
     #[must_use]
-    pub const fn next_to_qualify(self) -> Option<AndroidCapturePath> {
+    pub const fn next_to_qualify(self) -> Option<CapturePathId> {
         self.next_to_qualify
     }
 
     #[must_use]
-    pub fn candidate(&self, path: AndroidCapturePath) -> AndroidCapturePathCandidate {
+    pub fn candidate(&self, path: CapturePathId) -> AndroidCapturePathCandidate {
         self.candidates
             .iter()
             .copied()
@@ -760,7 +752,7 @@ pub fn select_android_capture_path(
 
 fn candidate_has_state(
     candidates: &[AndroidCapturePathCandidate; ANDROID_CAPTURE_PATH_COUNT],
-    path: AndroidCapturePath,
+    path: CapturePathId,
     state: AndroidCapturePathState,
 ) -> bool {
     candidates
@@ -770,19 +762,14 @@ fn candidate_has_state(
 
 fn capture_path_candidate(
     config: &AndroidKernelConfigSnapshot,
-    path: AndroidCapturePath,
+    path: CapturePathId,
     probe_state: AndroidCapturePathProbeState,
 ) -> AndroidCapturePathCandidate {
-    let first_kernel_gap = path
-        .required_features()
-        .iter()
-        .copied()
-        .find_map(|feature| {
-            let state = config.feature_state(feature);
-            (state != AndroidKernelFeatureState::BuiltIn).then_some((feature, state))
-        });
-    let disabled = path
-        .required_features()
+    let first_kernel_gap = required_features(path).iter().copied().find_map(|feature| {
+        let state = config.feature_state(feature);
+        (state != AndroidKernelFeatureState::BuiltIn).then_some((feature, state))
+    });
+    let disabled = required_features(path)
         .iter()
         .copied()
         .find(|feature| config.feature_state(*feature) == AndroidKernelFeatureState::Disabled);
@@ -1296,10 +1283,7 @@ mod tests {
             ),
             AndroidCapturePathPreference::Automatic,
         );
-        assert_eq!(
-            decision.selected(),
-            Some(AndroidCapturePath::NativeNftablesTproxy)
-        );
+        assert_eq!(decision.selected(), Some(CapturePathId::NftablesTproxy));
         assert_eq!(decision.next_to_qualify(), None);
     }
 
@@ -1315,17 +1299,13 @@ mod tests {
             ),
             AndroidCapturePathPreference::Automatic,
         );
-        assert_eq!(decision.selected(), Some(AndroidCapturePath::ManagedTun));
+        assert_eq!(decision.selected(), Some(CapturePathId::ManagedTun));
         assert_eq!(
-            decision
-                .candidate(AndroidCapturePath::NativeNftablesTproxy)
-                .state(),
+            decision.candidate(CapturePathId::NftablesTproxy).state(),
             AndroidCapturePathState::Denied
         );
         assert_eq!(
-            decision
-                .candidate(AndroidCapturePath::XtablesTproxy)
-                .state(),
+            decision.candidate(CapturePathId::XtablesTproxy).state(),
             AndroidCapturePathState::Conflicting
         );
     }
@@ -1390,9 +1370,9 @@ mod tests {
         assert_eq!(decision.selected(), None);
         assert_eq!(
             decision.next_to_qualify(),
-            Some(AndroidCapturePath::XtablesTproxy)
+            Some(CapturePathId::XtablesTproxy)
         );
-        let nftables = decision.candidate(AndroidCapturePath::NativeNftablesTproxy);
+        let nftables = decision.candidate(CapturePathId::NftablesTproxy);
         assert_eq!(nftables.state(), AndroidCapturePathState::Missing);
         assert_eq!(
             nftables.first_kernel_gap(),
@@ -1416,7 +1396,7 @@ mod tests {
                 AndroidCapturePathProbeState::Qualified,
                 AndroidCapturePathProbeState::Qualified,
             ),
-            AndroidCapturePathPreference::Explicit(AndroidCapturePath::NativeNftablesTproxy),
+            AndroidCapturePathPreference::Explicit(CapturePathId::NftablesTproxy),
         );
         assert_eq!(decision.selected(), None);
         assert_eq!(decision.next_to_qualify(), None);
@@ -1438,15 +1418,13 @@ mod tests {
             AndroidCapturePathPreference::Automatic,
         );
         assert_eq!(
-            decision
-                .candidate(AndroidCapturePath::NativeNftablesTproxy)
-                .state(),
+            decision.candidate(CapturePathId::NftablesTproxy).state(),
             AndroidCapturePathState::Broken
         );
         assert_eq!(decision.selected(), None);
         assert_eq!(
             decision.next_to_qualify(),
-            Some(AndroidCapturePath::XtablesTproxy)
+            Some(CapturePathId::XtablesTproxy)
         );
     }
 

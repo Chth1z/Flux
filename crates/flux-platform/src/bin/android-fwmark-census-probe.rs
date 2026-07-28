@@ -21,7 +21,8 @@ use flux_platform::{
 };
 #[cfg(any(target_os = "android", test))]
 use flux_platform::{
-    SystemAndroidFwmarkCensusSourceErrorKind, SystemAndroidNftablesObservationErrorClass,
+    SystemAndroidFwmarkCensusSourceErrorKind, SystemAndroidKernelConfigErrorKind,
+    SystemAndroidNftablesObservationErrorClass,
 };
 
 #[cfg(target_os = "android")]
@@ -166,6 +167,9 @@ fn coordinator_error_label(
 #[cfg(target_os = "android")]
 const fn source_error_label(source: &SystemAndroidFwmarkCensusSourceError) -> &'static str {
     match source.kind() {
+        SystemAndroidFwmarkCensusSourceErrorKind::KernelConfig => source
+            .kernel_config_kind()
+            .map_or("kernel-config", kernel_config_error_label),
         SystemAndroidFwmarkCensusSourceErrorKind::NftablesObservation => {
             match source.nftables_class() {
                 Some(class) => nftables_error_label(class),
@@ -197,6 +201,17 @@ const fn direct_source_error_label(kind: SystemAndroidFwmarkCensusSourceErrorKin
         SystemAndroidFwmarkCensusSourceErrorKind::ExistingFluxOwnership => {
             "existing-flux-ownership"
         }
+    }
+}
+
+#[cfg(any(target_os = "android", test))]
+const fn kernel_config_error_label(kind: SystemAndroidKernelConfigErrorKind) -> &'static str {
+    match kind {
+        SystemAndroidKernelConfigErrorKind::Absent => "kernel-config-absent",
+        SystemAndroidKernelConfigErrorKind::Denied => "kernel-config-denied",
+        SystemAndroidKernelConfigErrorKind::Malformed => "kernel-config-malformed",
+        SystemAndroidKernelConfigErrorKind::LimitExceeded => "kernel-config-limit-exceeded",
+        SystemAndroidKernelConfigErrorKind::Unavailable => "kernel-config-unavailable",
     }
 }
 
@@ -328,5 +343,36 @@ mod tests {
             direct_source_error_label(SystemAndroidFwmarkCensusSourceErrorKind::NftablesGate),
             "nftables-gate"
         );
+        for (kind, expected) in [
+            (
+                SystemAndroidKernelConfigErrorKind::Absent,
+                "kernel-config-absent",
+            ),
+            (
+                SystemAndroidKernelConfigErrorKind::Denied,
+                "kernel-config-denied",
+            ),
+            (
+                SystemAndroidKernelConfigErrorKind::Malformed,
+                "kernel-config-malformed",
+            ),
+            (
+                SystemAndroidKernelConfigErrorKind::LimitExceeded,
+                "kernel-config-limit-exceeded",
+            ),
+            (
+                SystemAndroidKernelConfigErrorKind::Unavailable,
+                "kernel-config-unavailable",
+            ),
+        ] {
+            let label = kernel_config_error_label(kind);
+            assert_eq!(label, expected);
+            assert!(label.len() <= 32);
+            assert!(
+                label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'-')
+            );
+        }
     }
 }

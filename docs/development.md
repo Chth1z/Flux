@@ -163,6 +163,9 @@ lowercase/hyphen collector class; arbitrary ADB, path, kernel, and tool diagnost
 Structured root-shell text accepts canonical LF or uniform Windows-ADB CRLF at the transport
 boundary and normalizes it to LF before parsing. Mixed endings and bare carriage returns fail
 closed.
+Kernel-config collection failures are reduced to one of `absent`, `denied`, `malformed`,
+`limit-exceeded`, or `unavailable`; the runner never emits the path, errno, option contents, or
+parse line.
 The `--quiet` Cargo flag is required because Cargo otherwise echoes the full child argument list,
 including the explicit serial, before `xtask` starts.
 

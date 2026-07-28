@@ -198,6 +198,8 @@ pub enum AndroidExistingFluxProcessObservationErrorClass {
     LimitExceeded,
     InvalidPid,
     PidOpen,
+    CommRead,
+    CommMalformed,
     StatRead,
     StatMalformed,
 }
@@ -339,6 +341,7 @@ flux-process-count\0flux-chain-count\0flux-route-count\0flux-rule-count\0";
     const COMPLETE_ABSENCE_COVERAGE_SIGNATURE: &[u8] =
         b"packet=complete-absent\0socket=complete-absent\0conntrack=complete-absent\0";
     const MAX_SYSTEM_PROCESS_ENTRIES: usize = 65_536;
+    const MAX_PROC_COMM_BYTES: usize = 256;
     const MAX_PROC_STAT_BYTES: usize = 4 * 1024;
     const LEGACY_ROUTE_TABLE: u32 = 2_025;
     const LEGACY_RULE_PRIORITY: u32 = 2_025;
@@ -692,6 +695,14 @@ flux-process-count\0flux-chain-count\0flux-route-count\0flux-rule-count\0";
                 Err(error) if process_disappeared(&error) => continue,
                 Err(_) => return Err(AndroidExistingFluxProcessObservationErrorClass::PidOpen),
             };
+            let comm = match read_bounded_comm(&pid_directory) {
+                Ok(comm) => comm,
+                Err(error) if process_disappeared(&error) => continue,
+                Err(_) => return Err(AndroidExistingFluxProcessObservationErrorClass::CommRead),
+            };
+            let Some(kind) = classify_flux_process_comm(&comm)? else {
+                continue;
+            };
             let stat = match read_bounded_stat(&pid_directory) {
                 Ok(stat) => stat,
                 Err(error) if process_disappeared(&error) => continue,
@@ -699,13 +710,14 @@ flux-process-count\0flux-chain-count\0flux-route-count\0flux-rule-count\0";
             };
             let parsed = parse_proc_stat(&stat, pid)
                 .ok_or(AndroidExistingFluxProcessObservationErrorClass::StatMalformed)?;
-            if let Some(kind) = flux_process_kind(parsed.command) {
-                flux_processes.insert(FluxProcessIdentity {
-                    kind,
-                    pid,
-                    start_time_ticks: parsed.start_time_ticks,
-                });
+            if flux_process_kind(parsed.command) != Some(kind) {
+                return Err(AndroidExistingFluxProcessObservationErrorClass::StatMalformed);
             }
+            flux_processes.insert(FluxProcessIdentity {
+                kind,
+                pid,
+                start_time_ticks: parsed.start_time_ticks,
+            });
         }
         Ok(FluxProcessSnapshot { flux_processes })
     }
@@ -719,6 +731,23 @@ flux-process-count\0flux-chain-count\0flux-route-count\0flux-rule-count\0";
 
     fn descriptor_path(file: &File) -> PathBuf {
         Path::new("/proc/self/fd").join(file.as_raw_fd().to_string())
+    }
+
+    fn read_bounded_comm(pid_directory: &File) -> io::Result<Vec<u8>> {
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOFOLLOW)
+            .open(descriptor_path(pid_directory).join("comm"))?;
+        let mut bytes = Vec::with_capacity(32);
+        file.take((MAX_PROC_COMM_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > MAX_PROC_COMM_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "proc comm exceeds its hard byte limit",
+            ));
+        }
+        Ok(bytes)
     }
 
     fn read_bounded_stat(pid_directory: &File) -> io::Result<Vec<u8>> {
@@ -804,6 +833,18 @@ flux-process-count\0flux-chain-count\0flux-route-count\0flux-rule-count\0";
         bytes.iter().try_fold(0_u64, |value, byte| {
             value.checked_mul(10)?.checked_add(u64::from(byte - b'0'))
         })
+    }
+
+    fn classify_flux_process_comm(
+        bytes: &[u8],
+    ) -> Result<Option<FluxProcessKind>, AndroidExistingFluxProcessObservationErrorClass> {
+        if let Some(command) = bytes.strip_suffix(b"\n") {
+            return Ok(flux_process_kind(command));
+        }
+        if flux_process_kind(bytes).is_some() {
+            return Err(AndroidExistingFluxProcessObservationErrorClass::CommMalformed);
+        }
+        Ok(None)
     }
 
     fn flux_process_kind(command: &[u8]) -> Option<FluxProcessKind> {

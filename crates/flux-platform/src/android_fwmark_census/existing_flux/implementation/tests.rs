@@ -265,6 +265,7 @@ fn malformed_or_linked_proc_stat_cannot_prove_process_absence() {
     let malformed = Fixture::new();
     let directory = malformed.proc_root.join("42");
     fs::create_dir(&directory).expect("create PID directory");
+    fs::write(directory.join("comm"), b"fluxd\n").expect("write process comm");
     fs::write(directory.join("stat"), b"42 (fluxd) S\n").expect("write malformed stat");
     assert_eq!(
         malformed
@@ -277,6 +278,7 @@ fn malformed_or_linked_proc_stat_cannot_prove_process_absence() {
     let linked = Fixture::new();
     let directory = linked.proc_root.join("43");
     fs::create_dir(&directory).expect("create PID directory");
+    fs::write(directory.join("comm"), b"fluxd\n").expect("write process comm");
     let target = linked._temp.path().join("foreign-stat");
     fs::write(&target, proc_stat(43, "init", 43)).expect("write link target");
     std::os::unix::fs::symlink(target, directory.join("stat")).expect("link proc stat");
@@ -286,6 +288,66 @@ fn malformed_or_linked_proc_stat_cannot_prove_process_absence() {
             .expect_err("linked stat must fail")
             .process_observation_class(),
         Some(AndroidExistingFluxProcessObservationErrorClass::StatRead)
+    );
+}
+
+#[test]
+fn unrelated_processes_do_not_require_parseable_proc_stat() {
+    let fixture = Fixture::new();
+    let directory = fixture.proc_root.join("44");
+    fs::create_dir(&directory).expect("create PID directory");
+    fs::write(directory.join("comm"), b"custom-root-ui\n").expect("write unrelated comm");
+    fs::write(directory.join("stat"), b"vendor-specific stat shape\n")
+        .expect("write unrelated stat");
+
+    fixture
+        .collect()
+        .expect("unrelated process stat is outside Flux ownership evidence");
+}
+
+#[test]
+fn candidate_comm_and_stat_must_identify_the_same_process() {
+    let fixture = Fixture::new();
+    let directory = fixture.proc_root.join("45");
+    fs::create_dir(&directory).expect("create PID directory");
+    fs::write(directory.join("comm"), b"fluxd\n").expect("write candidate comm");
+    fs::write(directory.join("stat"), proc_stat(45, "init", 45)).expect("write changed stat");
+
+    assert_eq!(
+        fixture
+            .collect()
+            .expect_err("candidate identity drift must fail")
+            .process_observation_class(),
+        Some(AndroidExistingFluxProcessObservationErrorClass::StatMalformed)
+    );
+}
+
+#[test]
+fn candidate_comm_requires_the_kernel_newline_and_no_follow_file() {
+    let malformed = Fixture::new();
+    let directory = malformed.proc_root.join("46");
+    fs::create_dir(&directory).expect("create PID directory");
+    fs::write(directory.join("comm"), b"fluxd").expect("write malformed comm");
+    assert_eq!(
+        malformed
+            .collect()
+            .expect_err("malformed candidate comm must fail")
+            .process_observation_class(),
+        Some(AndroidExistingFluxProcessObservationErrorClass::CommMalformed)
+    );
+
+    let linked = Fixture::new();
+    let directory = linked.proc_root.join("47");
+    fs::create_dir(&directory).expect("create PID directory");
+    let target = linked._temp.path().join("foreign-comm");
+    fs::write(&target, b"fluxd\n").expect("write link target");
+    std::os::unix::fs::symlink(target, directory.join("comm")).expect("link proc comm");
+    assert_eq!(
+        linked
+            .collect()
+            .expect_err("linked comm must fail")
+            .process_observation_class(),
+        Some(AndroidExistingFluxProcessObservationErrorClass::CommRead)
     );
 }
 
@@ -550,6 +612,7 @@ fn loopback_index() -> InterfaceIndex {
 fn write_process(root: &Path, pid: u32, command: &str, start_time_ticks: u64) {
     let directory = root.join(pid.to_string());
     fs::create_dir(&directory).expect("create process directory");
+    fs::write(directory.join("comm"), format!("{command}\n")).expect("write process comm");
     fs::write(
         directory.join("stat"),
         proc_stat(pid, command, start_time_ticks),

@@ -302,6 +302,10 @@ const fn existing_flux_process_error_label(
             "existing-flux-proc-invalid-pid"
         }
         AndroidExistingFluxProcessObservationErrorClass::PidOpen => "existing-flux-proc-pid-open",
+        AndroidExistingFluxProcessObservationErrorClass::CommRead => "existing-flux-proc-comm-read",
+        AndroidExistingFluxProcessObservationErrorClass::CommMalformed => {
+            "existing-flux-proc-comm-malformed"
+        }
         AndroidExistingFluxProcessObservationErrorClass::StatRead => "existing-flux-proc-stat-read",
         AndroidExistingFluxProcessObservationErrorClass::StatMalformed => {
             "existing-flux-proc-stat-malformed"
@@ -584,6 +588,14 @@ mod tests {
             (
                 AndroidExistingFluxProcessObservationErrorClass::PidOpen,
                 "existing-flux-proc-pid-open",
+            ),
+            (
+                AndroidExistingFluxProcessObservationErrorClass::CommRead,
+                "existing-flux-proc-comm-read",
+            ),
+            (
+                AndroidExistingFluxProcessObservationErrorClass::CommMalformed,
+                "existing-flux-proc-comm-malformed",
             ),
             (
                 AndroidExistingFluxProcessObservationErrorClass::StatRead,

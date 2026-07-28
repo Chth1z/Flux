@@ -10,6 +10,11 @@ use flux_core::{
 };
 #[cfg(any(target_os = "android", test))]
 use flux_platform::AndroidFwmarkCensusCoordinatorRequest;
+#[cfg(any(target_os = "android", test))]
+use flux_platform::{
+    AndroidExistingFluxOwnershipErrorKind, SystemAndroidFwmarkCensusSourceErrorKind,
+    SystemAndroidKernelConfigErrorClass, SystemAndroidNftablesObservationErrorClass,
+};
 #[cfg(target_os = "android")]
 use flux_platform::{
     AndroidFwmarkCensusCoordinatorError, AndroidFwmarkCensusCoordinatorOutcome,
@@ -18,11 +23,6 @@ use flux_platform::{
     SystemAndroidFwmarkCensusSourceError, coordinate_android_fwmark_census,
     validate_android_fwmark_census_projection_report,
     write_android_fwmark_census_projection_report,
-};
-#[cfg(any(target_os = "android", test))]
-use flux_platform::{
-    SystemAndroidFwmarkCensusSourceErrorKind, SystemAndroidKernelConfigErrorClass,
-    SystemAndroidNftablesObservationErrorClass,
 };
 
 #[cfg(target_os = "android")]
@@ -179,6 +179,12 @@ const fn source_error_label(source: &SystemAndroidFwmarkCensusSourceError) -> &'
                 None => "nftables-observation",
             }
         }
+        SystemAndroidFwmarkCensusSourceErrorKind::ExistingFluxOwnership => {
+            match source.existing_flux_kind() {
+                Some(kind) => existing_flux_error_label(kind),
+                None => "existing-flux-ownership",
+            }
+        }
         kind => direct_source_error_label(kind),
     }
 }
@@ -227,6 +233,43 @@ const fn kernel_config_error_label(class: SystemAndroidKernelConfigErrorClass) -
         }
         SystemAndroidKernelConfigErrorClass::LimitExceeded => "kernel-config-limit-exceeded",
         SystemAndroidKernelConfigErrorClass::Unavailable => "kernel-config-unavailable",
+    }
+}
+
+#[cfg(any(target_os = "android", test))]
+const fn existing_flux_error_label(kind: AndroidExistingFluxOwnershipErrorKind) -> &'static str {
+    match kind {
+        AndroidExistingFluxOwnershipErrorKind::UnsafeDurableRoot => "existing-flux-unsafe-root",
+        AndroidExistingFluxOwnershipErrorKind::CapabilityNamespaceMismatch => {
+            "existing-flux-namespace-mismatch"
+        }
+        AndroidExistingFluxOwnershipErrorKind::DurableObservationFailed => {
+            "existing-flux-durable-observation"
+        }
+        AndroidExistingFluxOwnershipErrorKind::DurableSnapshotChanged => {
+            "existing-flux-durable-drift"
+        }
+        AndroidExistingFluxOwnershipErrorKind::ProcessObservationFailed => {
+            "existing-flux-process-observation"
+        }
+        AndroidExistingFluxOwnershipErrorKind::ProcessSnapshotChanged => {
+            "existing-flux-process-drift"
+        }
+        AndroidExistingFluxOwnershipErrorKind::DurableOwnershipPresent => {
+            "existing-flux-durable-present"
+        }
+        AndroidExistingFluxOwnershipErrorKind::ProcessOwnershipPresent => {
+            "existing-flux-process-present"
+        }
+        AndroidExistingFluxOwnershipErrorKind::ChainOwnershipPresent => {
+            "existing-flux-chain-present"
+        }
+        AndroidExistingFluxOwnershipErrorKind::PolicyRoutingOwnershipPresent => {
+            "existing-flux-policy-routing-present"
+        }
+        AndroidExistingFluxOwnershipErrorKind::JournalIdentityUnavailable => {
+            "existing-flux-journal-identity"
+        }
     }
 }
 
@@ -415,6 +458,65 @@ mod tests {
             let label = kernel_config_error_label(class);
             assert_eq!(label, expected);
             assert!(label.len() <= 32);
+            assert!(
+                label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'-')
+            );
+        }
+    }
+
+    #[test]
+    fn existing_flux_source_labels_are_stable_and_payload_free() {
+        for (kind, expected) in [
+            (
+                AndroidExistingFluxOwnershipErrorKind::UnsafeDurableRoot,
+                "existing-flux-unsafe-root",
+            ),
+            (
+                AndroidExistingFluxOwnershipErrorKind::CapabilityNamespaceMismatch,
+                "existing-flux-namespace-mismatch",
+            ),
+            (
+                AndroidExistingFluxOwnershipErrorKind::DurableObservationFailed,
+                "existing-flux-durable-observation",
+            ),
+            (
+                AndroidExistingFluxOwnershipErrorKind::DurableSnapshotChanged,
+                "existing-flux-durable-drift",
+            ),
+            (
+                AndroidExistingFluxOwnershipErrorKind::ProcessObservationFailed,
+                "existing-flux-process-observation",
+            ),
+            (
+                AndroidExistingFluxOwnershipErrorKind::ProcessSnapshotChanged,
+                "existing-flux-process-drift",
+            ),
+            (
+                AndroidExistingFluxOwnershipErrorKind::DurableOwnershipPresent,
+                "existing-flux-durable-present",
+            ),
+            (
+                AndroidExistingFluxOwnershipErrorKind::ProcessOwnershipPresent,
+                "existing-flux-process-present",
+            ),
+            (
+                AndroidExistingFluxOwnershipErrorKind::ChainOwnershipPresent,
+                "existing-flux-chain-present",
+            ),
+            (
+                AndroidExistingFluxOwnershipErrorKind::PolicyRoutingOwnershipPresent,
+                "existing-flux-policy-routing-present",
+            ),
+            (
+                AndroidExistingFluxOwnershipErrorKind::JournalIdentityUnavailable,
+                "existing-flux-journal-identity",
+            ),
+        ] {
+            let label = existing_flux_error_label(kind);
+            assert_eq!(label, expected);
+            assert!(label.len() <= 40);
             assert!(
                 label
                     .bytes()

@@ -11,6 +11,7 @@ use flux_core::{
 
 use super::nftables::{AndroidNftablesTransportErrorKind, collect_android_nftables_fwmarks};
 use super::{
+    AndroidExistingFluxOwnershipError, AndroidExistingFluxOwnershipErrorKind,
     AndroidExistingFluxOwnershipObservation, AndroidFwmarkCensusCollectionStage,
     AndroidFwmarkCensusCoordinatorSource, AndroidFwmarkCensusExternalPhase,
     AndroidFwmarkCensusExternalSnapshot, AndroidNftablesFwmarkObservationError,
@@ -80,6 +81,7 @@ pub struct SystemAndroidFwmarkCensusSourceError {
     kind: SystemAndroidFwmarkCensusSourceErrorKind,
     kernel_config_class: Option<SystemAndroidKernelConfigErrorClass>,
     nftables_class: Option<SystemAndroidNftablesObservationErrorClass>,
+    existing_flux_kind: Option<AndroidExistingFluxOwnershipErrorKind>,
     source: Option<Box<dyn Error + 'static>>,
 }
 
@@ -107,11 +109,17 @@ impl SystemAndroidFwmarkCensusSourceError {
         self.kernel_config_class
     }
 
+    #[must_use]
+    pub const fn existing_flux_kind(&self) -> Option<AndroidExistingFluxOwnershipErrorKind> {
+        self.existing_flux_kind
+    }
+
     const fn new(kind: SystemAndroidFwmarkCensusSourceErrorKind) -> Self {
         Self {
             kind,
             kernel_config_class: None,
             nftables_class: None,
+            existing_flux_kind: None,
             source: None,
         }
     }
@@ -124,6 +132,7 @@ impl SystemAndroidFwmarkCensusSourceError {
             kind,
             kernel_config_class: None,
             nftables_class: None,
+            existing_flux_kind: None,
             source: Some(Box::new(source)),
         }
     }
@@ -133,6 +142,7 @@ impl SystemAndroidFwmarkCensusSourceError {
             kind: SystemAndroidFwmarkCensusSourceErrorKind::KernelConfig,
             kernel_config_class: Some(source.class()),
             nftables_class: None,
+            existing_flux_kind: None,
             source: Some(Box::new(source)),
         }
     }
@@ -146,6 +156,17 @@ impl SystemAndroidFwmarkCensusSourceError {
                 source.transport_kind(),
                 source.raw_os_error(),
             )),
+            existing_flux_kind: None,
+            source: Some(Box::new(source)),
+        }
+    }
+
+    fn with_existing_flux_source(source: AndroidExistingFluxOwnershipError) -> Self {
+        Self {
+            kind: SystemAndroidFwmarkCensusSourceErrorKind::ExistingFluxOwnership,
+            kernel_config_class: None,
+            nftables_class: None,
+            existing_flux_kind: Some(source.kind()),
             source: Some(Box::new(source)),
         }
     }
@@ -290,12 +311,7 @@ impl AndroidFwmarkCensusCoordinatorSource for SystemAndroidFwmarkCensusSource {
             network_namespace,
             xtables,
         )
-        .map_err(|source| {
-            SystemAndroidFwmarkCensusSourceError::with_source(
-                SystemAndroidFwmarkCensusSourceErrorKind::ExistingFluxOwnership,
-                source,
-            )
-        })
+        .map_err(SystemAndroidFwmarkCensusSourceError::with_existing_flux_source)
     }
 }
 

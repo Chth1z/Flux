@@ -9,6 +9,7 @@ use flux_core::{
 use super::compiler::EngineConfigLaunchBinding;
 use super::engine_profile::EngineCapabilityProfile;
 
+#[cfg(test)]
 pub(crate) const TPROXY_GENERATION_CANDIDATE_SCHEMA_VERSION: u16 = 1;
 
 /// Deterministic, non-authorizing input bundle for later complete Generation compilation.
@@ -22,6 +23,7 @@ pub(crate) struct TproxyGenerationCandidate {
 }
 
 impl TproxyGenerationCandidate {
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn schema_version(&self) -> u16 {
         TPROXY_GENERATION_CANDIDATE_SCHEMA_VERSION
@@ -68,6 +70,7 @@ pub(crate) struct TproxyGenerationCandidateError {
 }
 
 impl TproxyGenerationCandidateError {
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn kind(self) -> TproxyGenerationCandidateErrorKind {
         self.kind

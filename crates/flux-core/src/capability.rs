@@ -232,7 +232,7 @@ impl CapabilityProfile {
     }
 
     #[must_use]
-    pub fn legacy_mutation_gate(&self) -> LegacyMutationGate {
+    pub fn mutation_gate(&self) -> MutationGate {
         let kernel = match self.kernel_support() {
             Some(KernelSupport::Supported(_)) => KernelMutationStatus::Eligible,
             Some(KernelSupport::Unsupported { found, minimum }) => {
@@ -251,9 +251,9 @@ impl CapabilityProfile {
         if matches!(kernel, KernelMutationStatus::Eligible)
             && matches!(boot_identity, BootIdentityMutationStatus::Verified)
         {
-            LegacyMutationGate::Allowed
+            MutationGate::Allowed
         } else {
-            LegacyMutationGate::ReadOnly {
+            MutationGate::ReadOnly {
                 kernel,
                 boot_identity,
             }
@@ -338,7 +338,7 @@ fn digest_legacy_bridge(digest: &mut CanonicalEvidenceDigest, bridge: &LegacyBri
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum LegacyMutationGate {
+pub enum MutationGate {
     Allowed,
     ReadOnly {
         kernel: KernelMutationStatus,

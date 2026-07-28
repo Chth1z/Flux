@@ -1,39 +1,39 @@
 use std::sync::Mutex;
 
-use flux_core::{ControlClient, ControlError, LegacyIntent, OperationReport, Reason};
+use flux_core::{ControlClient, ControlError, OperationReport, Reason, RuntimeIntent};
 use flux_testkit::StaticKernelReleaseSource;
 use fluxd::run_cli_with_control;
 
 #[test]
-fn control_commands_map_to_legacy_intents_and_wait_for_completion() {
+fn control_commands_map_to_runtime_intents_and_wait_for_completion() {
     let cases = [
         (
             "start",
-            LegacyIntent::Running {
+            RuntimeIntent::Running {
                 reason: Reason::Fluxctl,
             },
         ),
         (
             "stop",
-            LegacyIntent::Stopped {
+            RuntimeIntent::Stopped {
                 reason: Reason::Fluxctl,
             },
         ),
         (
             "restart",
-            LegacyIntent::Reload {
+            RuntimeIntent::Reload {
                 reason: Reason::Fluxctl,
             },
         ),
         (
             "reload",
-            LegacyIntent::Reload {
+            RuntimeIntent::Reload {
                 reason: Reason::Fluxctl,
             },
         ),
         (
             "resync",
-            LegacyIntent::ResyncAddresses {
+            RuntimeIntent::ResyncAddresses {
                 reason: Reason::Fluxctl,
             },
         ),
@@ -89,22 +89,22 @@ fn control_command_on_an_unsupported_kernel_never_reaches_the_writer() {
 
 #[derive(Default)]
 struct RecordingControlClient {
-    intents: Mutex<Vec<LegacyIntent>>,
+    intents: Mutex<Vec<RuntimeIntent>>,
 }
 
 impl RecordingControlClient {
-    fn intents(&self) -> Vec<LegacyIntent> {
+    fn intents(&self) -> Vec<RuntimeIntent> {
         self.intents.lock().expect("intents lock").clone()
     }
 }
 
 impl ControlClient for RecordingControlClient {
-    fn submit_and_wait(&self, intent: LegacyIntent) -> Result<OperationReport, ControlError> {
+    fn submit_and_wait(&self, intent: RuntimeIntent) -> Result<OperationReport, ControlError> {
         self.intents.lock().expect("intents lock").push(intent);
         Ok(OperationReport {
             intent,
             revision: 41,
-            address_resync: matches!(intent, LegacyIntent::ResyncAddresses { .. })
+            address_resync: matches!(intent, RuntimeIntent::ResyncAddresses { .. })
                 .then_some(flux_core::AddressResyncDisposition::AcceptedDeferred),
         })
     }

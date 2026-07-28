@@ -14,9 +14,11 @@ use flux_core::{
 };
 use flux_platform::NetworkInventorySource;
 
+#[cfg(test)]
+use super::DesiredStateCompileErrorKind;
 use super::{
-    DesiredStateCaptureArtifacts, DesiredStateCompileError, DesiredStateCompileErrorKind,
-    DesiredStateCompileRequest, compile_desired_state_capture,
+    DesiredStateCaptureArtifacts, DesiredStateCompileError, DesiredStateCompileRequest,
+    compile_desired_state_capture,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -111,14 +113,10 @@ impl AddressReconciliationInspection {
         self.epoch
     }
 
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn host_count(self) -> usize {
         self.host_count
-    }
-
-    #[must_use]
-    pub(crate) const fn capture_digest(self) -> CaptureProgramDigest {
-        self.capture_digest
     }
 }
 
@@ -149,6 +147,7 @@ impl AddressReconciledGenerationInputs {
         &self.inventory
     }
 
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn host_bypass(&self) -> &AddressHostSetPlan {
         &self.host_bypass
@@ -189,6 +188,7 @@ impl AddressReconciledGenerationInputs {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AddressReconciliationErrorKind {
     DesiredState,
@@ -215,6 +215,7 @@ pub(crate) enum AddressReconciliationError {
 }
 
 impl AddressReconciliationError {
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn kind(&self) -> AddressReconciliationErrorKind {
         match self {

@@ -8,8 +8,7 @@ use std::time::{Duration, Instant};
 
 use flux_core::{
     AddressResyncDisposition, CapabilityProfile, CapabilityProfileRevision, ControlClient,
-    ControlError, DispatcherCompletion, LegacyControlBridge, LegacyDispatcher, LegacyIntent,
-    Reason,
+    ControlError, DispatcherCompletion, Reason, RuntimeControl, RuntimeDispatcher, RuntimeIntent,
 };
 use flux_platform::{DaemonReactor, SeqpacketConnection, ShutdownSignal};
 use flux_testkit::CapabilityProfileFixture;
@@ -26,21 +25,21 @@ fn seqpacket_client_and_reactor_complete_a_control_operation() {
     let socket_path = directory.path().join("fluxd.sock");
     let shutdown = ShutdownSignal::install().expect("install shutdown signal source");
     let calls = Arc::new(Mutex::new(Vec::new()));
-    let bridge = LegacyControlBridge::start(
+    let runtime = RuntimeControl::start(
         RecordingDispatcher {
             calls: Arc::clone(&calls),
         },
         4,
     )
-    .expect("start bridge");
+    .expect("start runtime");
     let handler =
-        ControlConnectionHandler::new(Arc::new(CapabilityProfileFixture::supported()), bridge);
+        ControlConnectionHandler::new(Arc::new(CapabilityProfileFixture::supported()), runtime);
     let (reactor, stop) = DaemonReactor::bind(&socket_path, shutdown, move |connection| {
         handler.serve(connection).expect("serve control connection");
     })
     .expect("bind reactor");
 
-    let intent = LegacyIntent::Running {
+    let intent = RuntimeIntent::Running {
         reason: Reason::Fluxctl,
     };
     let client_path = socket_path.clone();
@@ -75,14 +74,14 @@ fn seqpacket_status_preserves_the_capability_profile_revision() {
         initial.legacy_bridge().clone(),
     );
     let expected_profile = profile.clone();
-    let bridge = LegacyControlBridge::start(
+    let runtime = RuntimeControl::start(
         RecordingDispatcher {
             calls: Arc::new(Mutex::new(Vec::new())),
         },
         4,
     )
-    .expect("start bridge");
-    let handler = ControlConnectionHandler::new(Arc::new(profile), bridge);
+    .expect("start runtime");
+    let handler = ControlConnectionHandler::new(Arc::new(profile), runtime);
     let (reactor, stop) = DaemonReactor::bind(&socket_path, shutdown, move |connection| {
         handler.serve(connection).expect("serve control connection");
     })
@@ -122,17 +121,17 @@ fn seqpacket_status_preserves_the_observed_runtime_snapshot() {
             recovery: "detach capture before retiring the proxy engine".to_owned(),
         }),
     });
-    let runtime = runtime_source.snapshot().as_ref().clone();
-    let bridge = LegacyControlBridge::start(
+    let expected_runtime = runtime_source.snapshot().as_ref().clone();
+    let runtime_control = RuntimeControl::start(
         RecordingDispatcher {
             calls: Arc::new(Mutex::new(Vec::new())),
         },
         4,
     )
-    .expect("start bridge");
+    .expect("start runtime");
     let handler = ControlConnectionHandler::with_runtime_snapshot_source(
         Arc::new(CapabilityProfileFixture::supported()),
-        bridge,
+        runtime_control,
         runtime_source,
     );
     let (reactor, stop) = DaemonReactor::bind(&socket_path, shutdown, move |connection| {
@@ -151,7 +150,7 @@ fn seqpacket_status_preserves_the_observed_runtime_snapshot() {
     reactor.run().expect("run reactor");
     let snapshot = client_thread.join().expect("client thread");
 
-    assert_eq!(snapshot.runtime, runtime);
+    assert_eq!(snapshot.runtime, expected_runtime);
     assert_socket_absent(&socket_path);
 }
 
@@ -160,15 +159,15 @@ fn daemon_keeps_serving_after_a_client_disconnects_before_sending() {
     let directory = tempdir().expect("temporary directory");
     let socket_path = directory.path().join("fluxd.sock");
     let shutdown = ShutdownSignal::install().expect("install shutdown signal source");
-    let bridge = LegacyControlBridge::start(
+    let runtime = RuntimeControl::start(
         RecordingDispatcher {
             calls: Arc::new(Mutex::new(Vec::new())),
         },
         4,
     )
-    .expect("start bridge");
+    .expect("start runtime");
     let handler =
-        ControlConnectionHandler::new(Arc::new(CapabilityProfileFixture::supported()), bridge);
+        ControlConnectionHandler::new(Arc::new(CapabilityProfileFixture::supported()), runtime);
     let (reactor, stop) = DaemonReactor::bind(&socket_path, shutdown, move |connection| {
         if let Err(error) = handler.serve(connection) {
             eprintln!("rejected test connection: {error}");
@@ -199,16 +198,16 @@ fn ping_remains_responsive_while_a_control_operation_is_in_flight() {
     let shutdown = ShutdownSignal::install().expect("install shutdown signal source");
     let (started_tx, started_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
-    let bridge = LegacyControlBridge::start(
+    let runtime = RuntimeControl::start(
         BlockingDispatcher {
             started_tx,
             release_rx,
         },
         4,
     )
-    .expect("start bridge");
+    .expect("start runtime");
     let handler =
-        ControlConnectionHandler::new(Arc::new(CapabilityProfileFixture::supported()), bridge);
+        ControlConnectionHandler::new(Arc::new(CapabilityProfileFixture::supported()), runtime);
     let (reactor, stop) = DaemonReactor::bind(&socket_path, shutdown, move |connection| {
         handler.serve(connection).expect("serve control connection");
     })
@@ -217,7 +216,7 @@ fn ping_remains_responsive_while_a_control_operation_is_in_flight() {
     let client_thread = thread::spawn(move || {
         let control_path = client_path.clone();
         let control = thread::spawn(move || {
-            SocketControlClient::new(control_path).submit_and_wait(LegacyIntent::Running {
+            SocketControlClient::new(control_path).submit_and_wait(RuntimeIntent::Running {
                 reason: Reason::Fluxctl,
             })
         });
@@ -248,15 +247,15 @@ fn stop_requested_before_run_closes_the_listener_without_dispatching_queued_clie
     let directory = tempdir().expect("temporary directory");
     let socket_path = directory.path().join("fluxd.sock");
     let shutdown = ShutdownSignal::install().expect("install shutdown signal source");
-    let bridge = LegacyControlBridge::start(
+    let runtime = RuntimeControl::start(
         RecordingDispatcher {
             calls: Arc::new(Mutex::new(Vec::new())),
         },
         4,
     )
-    .expect("start bridge");
+    .expect("start runtime");
     let handler =
-        ControlConnectionHandler::new(Arc::new(CapabilityProfileFixture::supported()), bridge);
+        ControlConnectionHandler::new(Arc::new(CapabilityProfileFixture::supported()), runtime);
     let served = Arc::new(AtomicBool::new(false));
     let handler_served = Arc::clone(&served);
     let (reactor, stop) = DaemonReactor::bind(&socket_path, shutdown, move |connection| {
@@ -283,16 +282,16 @@ fn stop_closes_control_admission_before_a_running_mutation_drains() {
     let shutdown = ShutdownSignal::install().expect("install shutdown signal source");
     let (started_tx, started_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
-    let bridge = LegacyControlBridge::start(
+    let runtime = RuntimeControl::start(
         BlockingDispatcher {
             started_tx,
             release_rx,
         },
         4,
     )
-    .expect("start bridge");
+    .expect("start runtime");
     let handler =
-        ControlConnectionHandler::new(Arc::new(CapabilityProfileFixture::supported()), bridge);
+        ControlConnectionHandler::new(Arc::new(CapabilityProfileFixture::supported()), runtime);
     let (reactor, stop) = DaemonReactor::bind(&socket_path, shutdown, move |connection| {
         handler.serve(connection).expect("serve control connection");
     })
@@ -301,7 +300,7 @@ fn stop_closes_control_admission_before_a_running_mutation_drains() {
     let coordinator = thread::spawn(move || {
         let control_path = client_path.clone();
         let control = thread::spawn(move || {
-            SocketControlClient::new(control_path).submit_and_wait(LegacyIntent::Running {
+            SocketControlClient::new(control_path).submit_and_wait(RuntimeIntent::Running {
                 reason: Reason::Fluxctl,
             })
         });
@@ -345,7 +344,7 @@ fn assert_socket_absent(path: &Path) {
 }
 
 struct RecordingDispatcher {
-    calls: Arc<Mutex<Vec<LegacyIntent>>>,
+    calls: Arc<Mutex<Vec<RuntimeIntent>>>,
 }
 
 struct BlockingDispatcher {
@@ -353,8 +352,8 @@ struct BlockingDispatcher {
     release_rx: mpsc::Receiver<()>,
 }
 
-impl LegacyDispatcher for BlockingDispatcher {
-    fn execute(&mut self, intent: &LegacyIntent) -> Result<DispatcherCompletion, ControlError> {
+impl RuntimeDispatcher for BlockingDispatcher {
+    fn execute(&mut self, intent: &RuntimeIntent) -> Result<DispatcherCompletion, ControlError> {
         self.started_tx
             .send(())
             .map_err(|error| ControlError::dispatcher(error.to_string()))?;
@@ -365,16 +364,16 @@ impl LegacyDispatcher for BlockingDispatcher {
     }
 }
 
-impl LegacyDispatcher for RecordingDispatcher {
-    fn execute(&mut self, intent: &LegacyIntent) -> Result<DispatcherCompletion, ControlError> {
+impl RuntimeDispatcher for RecordingDispatcher {
+    fn execute(&mut self, intent: &RuntimeIntent) -> Result<DispatcherCompletion, ControlError> {
         self.calls.lock().expect("calls lock").push(*intent);
         Ok(completion_for(intent))
     }
 }
 
-fn completion_for(intent: &LegacyIntent) -> DispatcherCompletion {
+fn completion_for(intent: &RuntimeIntent) -> DispatcherCompletion {
     match intent {
-        LegacyIntent::ResyncAddresses { .. } => {
+        RuntimeIntent::ResyncAddresses { .. } => {
             DispatcherCompletion::AddressResync(AddressResyncDisposition::AcceptedDeferred)
         }
         _ => DispatcherCompletion::Completed,

@@ -36,7 +36,7 @@ fn parses_the_complete_desired_state_schema() {
             .includes_domain(CaptureTrafficDomain::LocalOutput)
     );
     assert!(
-        config
+        !config
             .capture()
             .scope()
             .includes_domain(CaptureTrafficDomain::ForwardedIngress)
@@ -225,9 +225,7 @@ fn capture_requires_a_family_domain_and_transport() {
         let mut input = COMPLETE_CONFIG.replacen(first, second, 1);
         input = match expected_field {
             "capture.ipv4" => input,
-            "capture.local_output" => {
-                input.replacen("forwarded_ingress = true", "forwarded_ingress = false", 1)
-            }
+            "capture.local_output" => input,
             "capture.tcp" => input.replacen("udp = true", "udp = false", 1),
             _ => unreachable!(),
         };

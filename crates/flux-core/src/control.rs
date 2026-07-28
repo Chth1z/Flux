@@ -31,7 +31,7 @@ impl Reason {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum LegacyIntent {
+pub enum RuntimeIntent {
     Running { reason: Reason },
     Stopped { reason: Reason },
     Reload { reason: Reason },
@@ -47,7 +47,7 @@ pub enum AdministrativeState {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OperationReport {
-    pub intent: LegacyIntent,
+    pub intent: RuntimeIntent,
     pub revision: u64,
     pub address_resync: Option<AddressResyncDisposition>,
 }
@@ -93,7 +93,7 @@ pub struct ControlSnapshot {
     pub revision: u64,
     pub administrative_state: AdministrativeState,
     pub configuration_dirty: bool,
-    pub in_flight: Option<LegacyIntent>,
+    pub in_flight: Option<RuntimeIntent>,
     pub last_completed: Option<OperationReport>,
 }
 
@@ -109,8 +109,8 @@ impl Default for ControlSnapshot {
     }
 }
 
-pub trait LegacyDispatcher: Send + 'static {
-    fn execute(&mut self, intent: &LegacyIntent) -> Result<DispatcherCompletion, ControlError>;
+pub trait RuntimeDispatcher: Send + 'static {
+    fn execute(&mut self, intent: &RuntimeIntent) -> Result<DispatcherCompletion, ControlError>;
 
     fn observation_failed(&mut self, _observation: ControlObservation, _error: &ControlError) {}
 
@@ -126,7 +126,7 @@ pub trait LegacyDispatcher: Send + 'static {
 }
 
 pub trait ControlClient {
-    fn submit_and_wait(&self, intent: LegacyIntent) -> Result<OperationReport, ControlError>;
+    fn submit_and_wait(&self, intent: RuntimeIntent) -> Result<OperationReport, ControlError>;
 }
 
 pub trait ControlSnapshotSource {
@@ -151,17 +151,17 @@ impl<T> ControlService for T where
 {
 }
 
-pub struct LegacyControlBridge {
+pub struct RuntimeControl {
     sender: Option<mpsc::SyncSender<WorkerRequest>>,
     observations: Arc<Mutex<PendingControlObservations>>,
     snapshot: Arc<RwLock<Arc<ControlSnapshot>>>,
     worker: Option<JoinHandle<()>>,
 }
 
-impl LegacyControlBridge {
+impl RuntimeControl {
     pub fn start<D>(dispatcher: D, queue_capacity: usize) -> Result<Self, ControlError>
     where
-        D: LegacyDispatcher,
+        D: RuntimeDispatcher,
     {
         if queue_capacity == 0 {
             return Err(ControlError::InvalidQueueCapacity);
@@ -173,7 +173,7 @@ impl LegacyControlBridge {
         let snapshot = Arc::new(RwLock::new(Arc::new(ControlSnapshot::default())));
         let worker_snapshot = Arc::clone(&snapshot);
         let worker = thread::Builder::new()
-            .name("flux-legacy-writer".to_owned())
+            .name("flux-runtime-control".to_owned())
             .spawn(move || {
                 worker_loop(dispatcher, receiver, &worker_observations, &worker_snapshot);
             })
@@ -187,8 +187,8 @@ impl LegacyControlBridge {
         })
     }
 
-    pub fn submit(&self, intent: LegacyIntent) -> Result<OperationHandle, ControlError> {
-        let sender = self.sender.as_ref().ok_or(ControlError::BridgeStopped)?;
+    pub fn submit(&self, intent: RuntimeIntent) -> Result<OperationHandle, ControlError> {
+        let sender = self.sender.as_ref().ok_or(ControlError::RuntimeStopped)?;
         let (completion_tx, completion_rx) = mpsc::sync_channel(1);
         sender
             .try_send(WorkerRequest::Execute {
@@ -197,7 +197,7 @@ impl LegacyControlBridge {
             })
             .map_err(|error| match error {
                 mpsc::TrySendError::Full(_) => ControlError::QueueFull,
-                mpsc::TrySendError::Disconnected(_) => ControlError::BridgeStopped,
+                mpsc::TrySendError::Disconnected(_) => ControlError::RuntimeStopped,
             })?;
         Ok(OperationHandle {
             completion_rx: Some(completion_rx),
@@ -205,24 +205,24 @@ impl LegacyControlBridge {
     }
 
     pub fn mark_configuration_dirty(&self) -> Result<u64, ControlError> {
-        let sender = self.sender.as_ref().ok_or(ControlError::BridgeStopped)?;
+        let sender = self.sender.as_ref().ok_or(ControlError::RuntimeStopped)?;
         let (completion_tx, completion_rx) = mpsc::sync_channel(1);
         sender
             .try_send(WorkerRequest::MarkConfigurationDirty { completion_tx })
             .map_err(|error| match error {
                 mpsc::TrySendError::Full(_) => ControlError::QueueFull,
-                mpsc::TrySendError::Disconnected(_) => ControlError::BridgeStopped,
+                mpsc::TrySendError::Disconnected(_) => ControlError::RuntimeStopped,
             })?;
         completion_rx
             .recv()
-            .map_err(|_| ControlError::BridgeStopped)?
+            .map_err(|_| ControlError::RuntimeStopped)?
     }
 
     pub fn configuration_changed(
         &self,
         reason: Reason,
     ) -> Result<ConfigurationChangeReport, ControlError> {
-        let sender = self.sender.as_ref().ok_or(ControlError::BridgeStopped)?;
+        let sender = self.sender.as_ref().ok_or(ControlError::RuntimeStopped)?;
         let (completion_tx, completion_rx) = mpsc::sync_channel(1);
         sender
             .try_send(WorkerRequest::ConfigurationChanged {
@@ -231,11 +231,11 @@ impl LegacyControlBridge {
             })
             .map_err(|error| match error {
                 mpsc::TrySendError::Full(_) => ControlError::QueueFull,
-                mpsc::TrySendError::Disconnected(_) => ControlError::BridgeStopped,
+                mpsc::TrySendError::Disconnected(_) => ControlError::RuntimeStopped,
             })?;
         completion_rx
             .recv()
-            .map_err(|_| ControlError::BridgeStopped)?
+            .map_err(|_| ControlError::RuntimeStopped)?
     }
 
     pub fn observation_ingress(&self) -> Result<ControlObservationIngress, ControlError> {
@@ -243,7 +243,7 @@ impl LegacyControlBridge {
             sender: self
                 .sender
                 .as_ref()
-                .ok_or(ControlError::BridgeStopped)?
+                .ok_or(ControlError::RuntimeStopped)?
                 .clone(),
             pending: Arc::clone(&self.observations),
         })
@@ -258,28 +258,28 @@ impl LegacyControlBridge {
     }
 }
 
-impl ControlClient for LegacyControlBridge {
-    fn submit_and_wait(&self, intent: LegacyIntent) -> Result<OperationReport, ControlError> {
+impl ControlClient for RuntimeControl {
+    fn submit_and_wait(&self, intent: RuntimeIntent) -> Result<OperationReport, ControlError> {
         self.submit(intent)?.wait()
     }
 }
 
-impl ControlSnapshotSource for LegacyControlBridge {
+impl ControlSnapshotSource for RuntimeControl {
     fn snapshot(&self) -> Arc<ControlSnapshot> {
-        LegacyControlBridge::snapshot(self)
+        RuntimeControl::snapshot(self)
     }
 }
 
-impl ConfigurationChangeClient for LegacyControlBridge {
+impl ConfigurationChangeClient for RuntimeControl {
     fn configuration_changed(
         &self,
         reason: Reason,
     ) -> Result<ConfigurationChangeReport, ControlError> {
-        LegacyControlBridge::configuration_changed(self, reason)
+        RuntimeControl::configuration_changed(self, reason)
     }
 }
 
-impl Drop for LegacyControlBridge {
+impl Drop for RuntimeControl {
     fn drop(&mut self) {
         if let Some(sender) = self.sender.take() {
             let _ = sender.send(WorkerRequest::Shutdown);
@@ -314,7 +314,7 @@ impl ControlObservationIngress {
 
         match self.sender.try_send(WorkerRequest::ObservationsReady) {
             Ok(()) | Err(mpsc::TrySendError::Full(_)) => Ok(()),
-            Err(mpsc::TrySendError::Disconnected(_)) => Err(ControlError::BridgeStopped),
+            Err(mpsc::TrySendError::Disconnected(_)) => Err(ControlError::RuntimeStopped),
         }
     }
 }
@@ -329,7 +329,7 @@ impl OperationHandle {
             .completion_rx
             .take()
             .ok_or(ControlError::OperationAlreadyConsumed)?;
-        receiver.recv().map_err(|_| ControlError::BridgeStopped)?
+        receiver.recv().map_err(|_| ControlError::RuntimeStopped)?
     }
 }
 
@@ -337,7 +337,7 @@ impl OperationHandle {
 pub enum ControlError {
     InvalidQueueCapacity,
     QueueFull,
-    BridgeStopped,
+    RuntimeStopped,
     OperationAlreadyConsumed,
     WorkerStart(String),
     Persistence {
@@ -413,7 +413,7 @@ impl ControlError {
             Self::RequestRejected { code, .. } => Some(code),
             Self::InvalidQueueCapacity
             | Self::QueueFull
-            | Self::BridgeStopped
+            | Self::RuntimeStopped
             | Self::OperationAlreadyConsumed
             | Self::WorkerStart(_)
             | Self::Persistence { .. }
@@ -429,15 +429,15 @@ impl fmt::Display for ControlError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidQueueCapacity => {
-                formatter.write_str("legacy writer queue capacity must be greater than zero")
+                formatter.write_str("runtime control queue capacity must be greater than zero")
             }
-            Self::QueueFull => formatter.write_str("legacy writer queue is full"),
-            Self::BridgeStopped => formatter.write_str("legacy control bridge is stopped"),
+            Self::QueueFull => formatter.write_str("runtime control queue is full"),
+            Self::RuntimeStopped => formatter.write_str("runtime control is stopped"),
             Self::OperationAlreadyConsumed => {
                 formatter.write_str("operation result was already consumed")
             }
             Self::WorkerStart(message) => {
-                write!(formatter, "cannot start legacy writer: {message}")
+                write!(formatter, "cannot start runtime control worker: {message}")
             }
             Self::Persistence {
                 operation,
@@ -460,7 +460,7 @@ impl fmt::Display for ControlError {
             }
             Self::Protocol(message) => write!(formatter, "control protocol: {message}"),
             Self::Transport(message) => write!(formatter, "control transport: {message}"),
-            Self::Dispatcher(message) => write!(formatter, "legacy dispatcher failed: {message}"),
+            Self::Dispatcher(message) => write!(formatter, "runtime dispatcher failed: {message}"),
         }
     }
 }
@@ -473,7 +473,7 @@ impl Error for ControlError {
             }
             Self::InvalidQueueCapacity
             | Self::QueueFull
-            | Self::BridgeStopped
+            | Self::RuntimeStopped
             | Self::OperationAlreadyConsumed
             | Self::WorkerStart(_)
             | Self::RequestRejected { .. }
@@ -486,7 +486,7 @@ impl Error for ControlError {
 
 enum WorkerRequest {
     Execute {
-        intent: LegacyIntent,
+        intent: RuntimeIntent,
         completion_tx: mpsc::SyncSender<Result<OperationReport, ControlError>>,
     },
     MarkConfigurationDirty {
@@ -542,7 +542,7 @@ fn worker_loop<D>(
     observations: &Mutex<PendingControlObservations>,
     snapshot: &RwLock<Arc<ControlSnapshot>>,
 ) where
-    D: LegacyDispatcher,
+    D: RuntimeDispatcher,
 {
     let maintenance_interval = dispatcher
         .maintenance_interval()
@@ -606,7 +606,7 @@ fn drain_control_observations<D>(
     observations: &Mutex<PendingControlObservations>,
     snapshot: &RwLock<Arc<ControlSnapshot>>,
 ) where
-    D: LegacyDispatcher,
+    D: RuntimeDispatcher,
 {
     let pending = observations
         .lock()
@@ -621,11 +621,11 @@ fn drain_control_observations<D>(
     if let Some(disabled) = pending.disable_state {
         let observation = ControlObservation::DisableStateChanged { disabled };
         let intent = if disabled {
-            LegacyIntent::Stopped {
+            RuntimeIntent::Stopped {
                 reason: Reason::DisableCreated,
             }
         } else {
-            LegacyIntent::Running {
+            RuntimeIntent::Running {
                 reason: Reason::DisableRemoved,
             }
         };
@@ -651,10 +651,10 @@ fn apply_configuration_change<D>(
     reason: Reason,
 ) -> Result<ConfigurationChangeReport, ControlError>
 where
-    D: LegacyDispatcher,
+    D: RuntimeDispatcher,
 {
     if read_snapshot(snapshot).administrative_state == AdministrativeState::Running {
-        execute_intent(dispatcher, snapshot, LegacyIntent::Reload { reason })
+        execute_intent(dispatcher, snapshot, RuntimeIntent::Reload { reason })
             .map(ConfigurationChangeReport::Reloaded)
     } else {
         Ok(ConfigurationChangeReport::Deferred {
@@ -666,10 +666,10 @@ where
 fn execute_intent<D>(
     dispatcher: &mut D,
     snapshot: &RwLock<Arc<ControlSnapshot>>,
-    intent: LegacyIntent,
+    intent: RuntimeIntent,
 ) -> Result<OperationReport, ControlError>
 where
-    D: LegacyDispatcher,
+    D: RuntimeDispatcher,
 {
     let started = replace_snapshot(snapshot, |current| ControlSnapshot {
         revision: current.revision.saturating_add(1),
@@ -684,12 +684,12 @@ where
         let valid = matches!(
             (intent, completion),
             (
-                LegacyIntent::ResyncAddresses { .. },
+                RuntimeIntent::ResyncAddresses { .. },
                 DispatcherCompletion::AddressResync(_)
             ) | (
-                LegacyIntent::Running { .. }
-                    | LegacyIntent::Stopped { .. }
-                    | LegacyIntent::Reload { .. },
+                RuntimeIntent::Running { .. }
+                    | RuntimeIntent::Stopped { .. }
+                    | RuntimeIntent::Reload { .. },
                 DispatcherCompletion::Completed
             )
         );
@@ -701,7 +701,8 @@ where
             ))
         }
     });
-    if result.is_ok() && configuration_was_dirty && matches!(intent, LegacyIntent::Running { .. }) {
+    if result.is_ok() && configuration_was_dirty && matches!(intent, RuntimeIntent::Running { .. })
+    {
         dispatcher.configuration_inputs_consumed();
     }
     let completed_revision = started.revision.saturating_add(1);
@@ -720,8 +721,8 @@ where
         configuration_dirty: operation
             .as_ref()
             .map_or(current.configuration_dirty, |report| match report.intent {
-                LegacyIntent::Running { .. } | LegacyIntent::Reload { .. } => false,
-                LegacyIntent::Stopped { .. } | LegacyIntent::ResyncAddresses { .. } => {
+                RuntimeIntent::Running { .. } | RuntimeIntent::Reload { .. } => false,
+                RuntimeIntent::Stopped { .. } | RuntimeIntent::ResyncAddresses { .. } => {
                     current.configuration_dirty
                 }
             }),
@@ -765,11 +766,11 @@ fn replace_snapshot(
 
 const fn next_administrative_state(
     current: AdministrativeState,
-    intent: LegacyIntent,
+    intent: RuntimeIntent,
 ) -> AdministrativeState {
     match intent {
-        LegacyIntent::Running { .. } => AdministrativeState::Running,
-        LegacyIntent::Stopped { .. } => AdministrativeState::Stopped,
-        LegacyIntent::Reload { .. } | LegacyIntent::ResyncAddresses { .. } => current,
+        RuntimeIntent::Running { .. } => AdministrativeState::Running,
+        RuntimeIntent::Stopped { .. } => AdministrativeState::Stopped,
+        RuntimeIntent::Reload { .. } | RuntimeIntent::ResyncAddresses { .. } => current,
     }
 }

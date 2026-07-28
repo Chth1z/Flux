@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use flux_core::{
-    CapabilityProfile, ControlClient, ControlError, ControlService, LegacyIntent, OperationReport,
+    CapabilityProfile, ControlClient, ControlError, ControlService, OperationReport, RuntimeIntent,
 };
 use flux_platform::{PlatformError, ReactorError, SeqpacketConnection};
 
@@ -114,7 +114,7 @@ impl SocketControlClient {
 }
 
 impl ControlClient for SocketControlClient {
-    fn submit_and_wait(&self, intent: LegacyIntent) -> Result<OperationReport, ControlError> {
+    fn submit_and_wait(&self, intent: RuntimeIntent) -> Result<OperationReport, ControlError> {
         let request_id = self.next_request_id();
         let request = encode_control_request(request_id, intent)?;
         let response = self.exchange(&request)?;
@@ -237,7 +237,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
 
-    use flux_core::{DispatcherCompletion, LegacyControlBridge, LegacyDispatcher};
+    use flux_core::{DispatcherCompletion, RuntimeControl, RuntimeDispatcher};
     use flux_platform::{DaemonReactor, ShutdownSignal};
     use flux_testkit::CapabilityProfileFixture;
     use tempfile::tempdir;
@@ -247,10 +247,13 @@ mod tests {
 
     struct NoopDispatcher;
 
-    impl LegacyDispatcher for NoopDispatcher {
-        fn execute(&mut self, intent: &LegacyIntent) -> Result<DispatcherCompletion, ControlError> {
+    impl RuntimeDispatcher for NoopDispatcher {
+        fn execute(
+            &mut self,
+            intent: &RuntimeIntent,
+        ) -> Result<DispatcherCompletion, ControlError> {
             Ok(match intent {
-                LegacyIntent::ResyncAddresses { .. } => DispatcherCompletion::AddressResync(
+                RuntimeIntent::ResyncAddresses { .. } => DispatcherCompletion::AddressResync(
                     flux_core::AddressResyncDisposition::CompleteNoChange,
                 ),
                 _ => DispatcherCompletion::Completed,
@@ -269,10 +272,10 @@ mod tests {
             refresh_calls.fetch_add(1, Ordering::SeqCst);
             Ok(SubscriptionRefreshReport::updated(82, 29, false))
         });
-        let bridge = LegacyControlBridge::start(NoopDispatcher, 2).expect("start bridge");
+        let runtime = RuntimeControl::start(NoopDispatcher, 2).expect("start runtime");
         let handler = ControlConnectionHandler::with_runtime_snapshot_and_subscription(
             Arc::new(CapabilityProfileFixture::supported()),
-            bridge,
+            runtime,
             RuntimeSnapshotSource::default(),
             Some(subscription),
         );

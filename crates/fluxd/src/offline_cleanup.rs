@@ -11,9 +11,8 @@ use std::path::{Component, Path, PathBuf};
 
 use flux_core::{CapabilityProfileSource, ObservationKind};
 use flux_platform::{
-    DispatcherPhaseCommand, NativeCaptureConvergedState, NativeCaptureConvergence,
-    NativeCaptureDesired, NativeXtablesAndroidRuntime, ProcessPhaseDispatcher,
-    SystemCapabilityProfileSource,
+    NativeCaptureConvergedState, NativeCaptureConvergence, NativeCaptureDesired,
+    NativeXtablesAndroidRuntime, SystemCapabilityProfileSource,
 };
 
 use crate::daemon::DaemonOptions;
@@ -172,33 +171,7 @@ pub(crate) trait OfflineRecovery {
     fn recover_stopped(&mut self) -> Result<VerifiedCleanAbsence, Self::Error>;
 }
 
-/// Transitional development bridge for the shell-backed package profile.
-///
-/// The public command keeps this adapter until physical Gate 1 transfers writer ownership;
-/// Rust-only packaging must then select `NativeOfflineRecovery`.
-struct BridgeOfflineRecovery {
-    dispatcher: ProcessPhaseDispatcher,
-}
-
-impl BridgeOfflineRecovery {
-    fn from_options(options: &DaemonOptions) -> Self {
-        Self {
-            dispatcher: ProcessPhaseDispatcher::new(options.phase_dispatcher_paths()),
-        }
-    }
-}
-
-impl OfflineRecovery for BridgeOfflineRecovery {
-    type Error = flux_platform::PhaseDispatcherError;
-
-    fn recover_stopped(&mut self) -> Result<VerifiedCleanAbsence, Self::Error> {
-        self.dispatcher
-            .execute(DispatcherPhaseCommand::StartupRecover)?;
-        Ok(VerifiedCleanAbsence(()))
-    }
-}
-
-/// Dispatcher-free offline recovery for the Rust-only native composition.
+/// Process-free offline recovery for the native composition.
 ///
 /// Recovery is deliberately followed by an explicit stopped convergence even when observation is
 /// already clean, then one final recovery proof retires the terminal cleanup journal. Only the
@@ -363,11 +336,7 @@ pub fn run_offline_cleanup(
         .map_err(OfflineCleanupError::RuntimeLayout)?;
     let profile = SystemCapabilityProfileSource::new(options.capability_profile_paths())
         .collect_capability_profile();
-    if profile.device_identity().verified().is_some() {
-        return run_native_offline_cleanup(options, &layout, &profile);
-    }
-    let mut recovery = BridgeOfflineRecovery::from_options(options);
-    run_offline_cleanup_with_recovery(&options.daemon_lease_path, &mut recovery)
+    run_native_offline_cleanup(options, &layout, &profile)
 }
 
 fn run_native_offline_cleanup(
@@ -383,7 +352,13 @@ fn run_native_offline_cleanup(
     let network_namespace = profile
         .device_identity()
         .verified()
-        .expect("native cleanup selection checked the verified device identity")
+        .ok_or_else(|| {
+            OfflineCleanupError::Recovery(Box::new(
+                NativeOfflineBootstrapError::MissingDeviceIdentity {
+                    observation: profile.device_identity().kind(),
+                },
+            ))
+        })?
         .network_namespace();
     let config = options.native_xtables_runtime_config(layout);
     let recovery = while_holding_daemon_lease(&options.daemon_lease_path, || {
@@ -408,6 +383,7 @@ fn run_native_offline_cleanup(
 #[derive(Debug)]
 enum NativeOfflineBootstrapError {
     MissingBootIdentity { observation: ObservationKind },
+    MissingDeviceIdentity { observation: ObservationKind },
     Composition(Box<dyn Error + Send + Sync>),
     Recovery(NativeOfflineRecoveryError),
 }
@@ -418,6 +394,10 @@ impl fmt::Display for NativeOfflineBootstrapError {
             Self::MissingBootIdentity { observation } => write!(
                 formatter,
                 "native offline cleanup requires a verified boot identity, found {observation:?}"
+            ),
+            Self::MissingDeviceIdentity { observation } => write!(
+                formatter,
+                "native offline cleanup requires a verified device identity, found {observation:?}"
             ),
             Self::Composition(source) => write!(formatter, "compose native recovery: {source}"),
             Self::Recovery(source) => source.fmt(formatter),
@@ -430,11 +410,12 @@ impl Error for NativeOfflineBootstrapError {
         match self {
             Self::Composition(source) => Some(source.as_ref()),
             Self::Recovery(source) => Some(source),
-            Self::MissingBootIdentity { .. } => None,
+            Self::MissingBootIdentity { .. } | Self::MissingDeviceIdentity { .. } => None,
         }
     }
 }
 
+#[cfg(test)]
 fn run_offline_cleanup_with_recovery<R>(
     daemon_lease_path: &Path,
     recovery: &mut R,
@@ -769,17 +750,21 @@ mod tests {
 
     #[test]
     fn daemon_and_offline_cleanup_are_mutually_exclusive() {
-        let fixture = Fixture::new("exit 0\n");
+        let fixture = Fixture::new();
+        let state = ScriptedNativeState::new(None);
+        let mut recovery = NativeOfflineRecovery::new(state.convergence());
         let lease = DaemonLease::acquire(&fixture.options.daemon_lease_path)
             .expect("acquire daemon-side lease");
 
-        let error = run_offline_cleanup(&fixture.options)
-            .expect_err("offline cleanup must reject a live daemon lease");
+        let error =
+            run_offline_cleanup_with_recovery(&fixture.options.daemon_lease_path, &mut recovery)
+                .expect_err("offline cleanup must reject a live daemon lease");
         assert_eq!(error.kind(), OfflineCleanupErrorKind::Busy);
 
         drop(lease);
+        let mut recovery = NativeOfflineRecovery::new(state.convergence());
         assert_eq!(
-            run_offline_cleanup(&fixture.options)
+            run_offline_cleanup_with_recovery(&fixture.options.daemon_lease_path, &mut recovery,)
                 .expect("unlocked persistent lease file must not block cleanup")
                 .disposition(),
             OfflineCleanupDisposition::Complete
@@ -788,19 +773,19 @@ mod tests {
 
     #[test]
     fn stale_pid_socket_and_unlocked_lease_files_do_not_authorize_or_block_cleanup() {
-        let fixture = Fixture::new(&format!(
-            "[ \"${{1:-}}\" = startup-recover ] || exit 64\nprintf complete >{}\n",
-            fixture_path_placeholder("recovered")
-        ));
+        let fixture = Fixture::new();
         fs::write(fixture.run.join("fluxd.pid"), "999999\n").expect("write stale PID");
         fs::write(fixture.run.join("fluxd.sock"), "stale socket placeholder\n")
             .expect("write stale socket");
         fs::write(&fixture.options.daemon_lease_path, "stale unlocked lease\n")
             .expect("write unlocked lease");
 
-        run_offline_cleanup(&fixture.options).expect("cleanup ignores stale hints");
+        let state = ScriptedNativeState::new(None);
+        let mut recovery = NativeOfflineRecovery::new(state.convergence());
+        run_offline_cleanup_with_recovery(&fixture.options.daemon_lease_path, &mut recovery)
+            .expect("cleanup ignores stale hints");
 
-        assert!(fixture.root.path().join("recovered").is_file());
+        assert!(!state.events().is_empty());
     }
 
     #[test]
@@ -836,7 +821,7 @@ mod tests {
 
     #[test]
     fn lease_remains_held_for_the_complete_recovery_operation() {
-        let fixture = Fixture::new("exit 0\n");
+        let fixture = Fixture::new();
         let nested = while_holding_daemon_lease(&fixture.options.daemon_lease_path, || {
             let error = DaemonLease::acquire(&fixture.options.daemon_lease_path)
                 .expect_err("recovery must retain the daemon lease");
@@ -852,7 +837,7 @@ mod tests {
 
     #[test]
     fn dropping_lease_unlocks_a_fork_inherited_open_file_description() {
-        let fixture = Fixture::new("exit 0\n");
+        let fixture = Fixture::new();
         let lease = DaemonLease::acquire(&fixture.options.daemon_lease_path)
             .expect("acquire process lease");
         // `dup` models the shared open-file description that exists between `fork` and `exec`.
@@ -875,10 +860,14 @@ mod tests {
 
     #[test]
     fn recovery_failure_is_typed_and_releases_the_lease() {
-        let fixture = Fixture::new("exit 71\n");
+        let fixture = Fixture::new();
+        let state = ScriptedNativeState::new(Some(7));
+        state.fail_stop_once();
+        let mut recovery = NativeOfflineRecovery::new(state.convergence());
 
-        let error = run_offline_cleanup(&fixture.options)
-            .expect_err("dispatcher failure must remain a cleanup failure");
+        let error =
+            run_offline_cleanup_with_recovery(&fixture.options.daemon_lease_path, &mut recovery)
+                .expect_err("native recovery failure must remain a cleanup failure");
         assert_eq!(error.kind(), OfflineCleanupErrorKind::Recovery);
 
         DaemonLease::acquire(&fixture.options.daemon_lease_path)
@@ -887,20 +876,21 @@ mod tests {
 
     #[test]
     fn public_cleanup_bootstraps_a_fresh_runtime_layout_before_leasing() {
-        let fixture = Fixture::new("exit 0\n");
+        let fixture = Fixture::new();
         fs::remove_dir(&fixture.run).expect("remove precreated run directory");
 
-        let report = run_offline_cleanup(&fixture.options).expect("clean fresh runtime layout");
+        let error = run_offline_cleanup(&fixture.options)
+            .expect_err("host fixture has no verified native device identity");
 
-        assert_eq!(report.disposition(), OfflineCleanupDisposition::Complete);
+        assert_eq!(error.kind(), OfflineCleanupErrorKind::Recovery);
         assert!(fixture.run.is_dir());
         assert!(fixture.root.path().join("state").is_dir());
-        assert!(fixture.options.daemon_lease_path.is_file());
+        assert!(!fixture.options.daemon_lease_path.exists());
     }
 
     #[test]
     fn public_cleanup_rejects_a_lease_outside_the_owned_run_directory() {
-        let mut fixture = Fixture::new("exit 0\n");
+        let mut fixture = Fixture::new();
         fixture.options.daemon_lease_path = fixture.root.path().join("foreign.lease");
 
         let error = run_offline_cleanup(&fixture.options)
@@ -911,8 +901,13 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_cli_has_exact_syntax_and_stable_terminal_exits() {
-        let fixture = Fixture::new("exit 0\n");
+    fn cleanup_cli_has_exact_syntax_and_fails_closed_without_native_identity() {
+        let fixture = Fixture::new();
+        fs::write(
+            &fixture.options.boot_id_path,
+            "01234567-89ab-cdef-0123-456789abcdef\n",
+        )
+        .expect("write verified boot identity");
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         assert_eq!(
@@ -922,31 +917,14 @@ mod tests {
                 &mut stdout,
                 &mut stderr,
             ),
-            EXIT_SUCCESS
-        );
-        assert_eq!(stdout, b"cleanup complete\n");
-        assert!(stderr.is_empty());
-
-        let lease =
-            DaemonLease::acquire(&fixture.options.daemon_lease_path).expect("hold daemon lease");
-        stdout.clear();
-        stderr.clear();
-        assert_eq!(
-            run_offline_cleanup_cli(
-                ["fluxd", "cleanup", "--offline"],
-                &fixture.options,
-                &mut stdout,
-                &mut stderr,
-            ),
-            OFFLINE_CLEANUP_BUSY_EXIT
+            EXIT_RUNTIME_ERROR
         );
         assert!(stdout.is_empty());
         assert!(
             String::from_utf8(stderr.clone())
                 .expect("UTF-8 error")
-                .contains("cleanup busy")
+                .contains("verified device identity")
         );
-        drop(lease);
 
         stdout.clear();
         stderr.clear();
@@ -1190,29 +1168,15 @@ mod tests {
     }
 
     impl Fixture {
-        fn new(dispatcher_body: &str) -> Self {
+        fn new() -> Self {
             let root = TempDir::new().expect("temporary root");
             let run = root.path().join("run");
-            let scripts = root.path().join("scripts");
             fs::create_dir(&run).expect("create run directory");
-            fs::create_dir(&scripts).expect("create scripts directory");
-            let dispatcher = scripts.join("dispatcher");
-            let body = dispatcher_body.replace(
-                &fixture_path_placeholder("recovered"),
-                root.path().join("recovered").to_str().expect("UTF-8 path"),
-            );
-            fs::write(&dispatcher, format!("#!/bin/sh\n{body}")).expect("write dispatcher");
             let options = DaemonOptions {
                 runtime_root: root.path().to_path_buf(),
                 socket_path: run.join("fluxd.sock"),
                 daemon_lease_path: run.join("fluxd.lease"),
                 config_path: root.path().join("conf/flux.toml"),
-                shell: PathBuf::from("/bin/sh"),
-                dispatcher_script: dispatcher,
-                addrsync_script: scripts.join("addrsync"),
-                engine_manifest_path: run.join("engine.manifest"),
-                engine_config_path: root.path().join("conf/config.json"),
-                bridge_environment_path: run.join("desired-state.env"),
                 subscription_store_path: root.path().join("state/subscription"),
                 intent_path: root.path().join("state/administrative-intent.json"),
                 boot_id_path: root.path().join("boot-id"),
@@ -1221,9 +1185,5 @@ mod tests {
             };
             Self { root, run, options }
         }
-    }
-
-    fn fixture_path_placeholder(name: &str) -> String {
-        format!("__FIXTURE_PATH_{name}__")
     }
 }

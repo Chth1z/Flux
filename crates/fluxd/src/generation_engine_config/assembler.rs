@@ -40,6 +40,7 @@ const PRODUCT_DESIRED_STATE_DIGEST_DOMAIN: &[u8] =
 pub(crate) struct GenerationAssemblyDigest([u8; GENERATION_ASSEMBLY_DIGEST_BYTES]);
 
 impl GenerationAssemblyDigest {
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn from_bytes(bytes: [u8; GENERATION_ASSEMBLY_DIGEST_BYTES]) -> Self {
         Self(bytes)
@@ -78,6 +79,7 @@ pub(crate) struct AdmittedGenerationIdentity {
 }
 
 impl AdmittedGenerationIdentity {
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn new(generation: NonZeroU32, digest: GenerationAssemblyDigest) -> Self {
         Self { generation, digest }
@@ -96,6 +98,7 @@ impl AdmittedGenerationIdentity {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GenerationAdmissionKind {
+    #[cfg(test)]
     HostInspectionOnly,
     AndroidPlanningEvidence,
 }
@@ -104,6 +107,7 @@ pub(crate) enum GenerationAdmissionKind {
 ///
 /// This value can never construct a native target. It binds caller-selected mechanics to one
 /// exact capability and inventory snapshot so stale host fixtures fail through the same seam.
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct HostInspectionPlanningAuthority {
     capability_profile: CapabilityProfile,
@@ -114,6 +118,7 @@ pub(crate) struct HostInspectionPlanningAuthority {
     routing: Option<XtablesLocalOutputRoutingSpec>,
 }
 
+#[cfg(test)]
 impl HostInspectionPlanningAuthority {
     #[must_use]
     pub(crate) fn new(
@@ -136,6 +141,7 @@ impl HostInspectionPlanningAuthority {
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum GenerationPlanningAuthority {
+    #[cfg(test)]
     HostInspection(Box<HostInspectionPlanningAuthority>),
     Android {
         mark: Box<AndroidMarkPlanningAuthority>,
@@ -144,6 +150,7 @@ pub(crate) enum GenerationPlanningAuthority {
 }
 
 impl GenerationPlanningAuthority {
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn host_inspection(authority: HostInspectionPlanningAuthority) -> Self {
         Self::HostInspection(Box::new(authority))
@@ -160,6 +167,7 @@ impl GenerationPlanningAuthority {
         }
     }
 
+    #[cfg(test)]
     const fn kind(&self) -> GenerationAdmissionKind {
         match self {
             Self::HostInspection(_) => GenerationAdmissionKind::HostInspectionOnly,
@@ -170,6 +178,7 @@ impl GenerationPlanningAuthority {
     #[must_use]
     pub(crate) const fn capability_profile(&self) -> &CapabilityProfile {
         match self {
+            #[cfg(test)]
             Self::HostInspection(authority) => &authority.capability_profile,
             Self::Android { mark, .. } => mark.capability_profile(),
         }
@@ -184,8 +193,9 @@ impl GenerationPlanningAuthority {
                 mark,
                 placement: Some(placement),
             } => Some((mark, *placement)),
-            Self::HostInspection(_)
-            | Self::Android {
+            #[cfg(test)]
+            Self::HostInspection(_) => None,
+            Self::Android {
                 placement: None, ..
             } => None,
         }
@@ -252,6 +262,7 @@ pub(crate) struct AdmittedGeneration {
 }
 
 impl AdmittedGeneration {
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn schema_version(&self) -> u16 {
         ADMITTED_GENERATION_SCHEMA_VERSION
@@ -267,46 +278,55 @@ impl AdmittedGeneration {
         self.identity.generation
     }
 
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn admission_kind(&self) -> GenerationAdmissionKind {
         self.planning.kind()
     }
 
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn prior_owned(&self) -> Option<AdmittedGenerationIdentity> {
         self.prior_owned
     }
 
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn desired_state(&self) -> &FluxConfig {
         &self.desired_state
     }
 
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn candidate(&self) -> &TproxyGenerationCandidate {
         &self.candidate
     }
 
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn engine_spec(&self) -> &EngineSpec {
         &self.engine_spec
     }
 
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn capture(&self) -> &flux_core::ShadowCompilationReport {
         &self.capture
     }
 
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn engine_source(&self) -> SelectedEngineSourceIdentity {
         self.engine_source
     }
 
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn xtables(&self) -> &XtablesCaptureArtifactSet {
         &self.xtables
     }
 
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn planning_digest(&self) -> GenerationPlanningDigest {
         self.planning_digest
@@ -316,6 +336,7 @@ impl AdmittedGeneration {
         self,
     ) -> Result<NativeGenerationTargetRequest, NativeGenerationPromotionError> {
         match self.planning {
+            #[cfg(test)]
             GenerationPlanningAuthority::HostInspection(_) => {
                 Err(NativeGenerationPromotionError::HostInspectionNonPromotable)
             }
@@ -331,7 +352,7 @@ impl AdmittedGeneration {
         }
     }
 
-    #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+    #[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
     pub(crate) fn into_linux_composition_test_request(
         self,
     ) -> Result<LinuxCompositionTestTargetRequest, LinuxCompositionTestPromotionError> {
@@ -355,19 +376,19 @@ pub(crate) struct NativeGenerationTargetRequest {
     pub(crate) xtables: XtablesCaptureArtifactSet,
 }
 
-#[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+#[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
 pub(crate) struct LinuxCompositionTestTargetRequest {
     pub(crate) network_namespace: NetworkNamespaceIdentity,
     pub(crate) xtables: XtablesCaptureArtifactSet,
 }
 
-#[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+#[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum LinuxCompositionTestPromotionError {
     AndroidAuthorityForbidden,
 }
 
-#[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+#[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
 impl fmt::Display for LinuxCompositionTestPromotionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(
@@ -376,11 +397,12 @@ impl fmt::Display for LinuxCompositionTestPromotionError {
     }
 }
 
-#[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+#[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
 impl Error for LinuxCompositionTestPromotionError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum NativeGenerationPromotionError {
+    #[cfg(test)]
     HostInspectionNonPromotable,
     MissingAndroidPlacement,
 }
@@ -388,6 +410,7 @@ pub(crate) enum NativeGenerationPromotionError {
 impl fmt::Display for NativeGenerationPromotionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            #[cfg(test)]
             Self::HostInspectionNonPromotable => formatter.write_str(
                 "host inspection evidence cannot be promoted to native mutation authority",
             ),
@@ -400,6 +423,7 @@ impl fmt::Display for NativeGenerationPromotionError {
 
 impl Error for NativeGenerationPromotionError {}
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GenerationPlanningErrorKind {
     CapabilityProfileMismatch,
@@ -423,6 +447,7 @@ pub(crate) enum GenerationPlanningError {
 }
 
 impl GenerationPlanningError {
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn kind(&self) -> GenerationPlanningErrorKind {
         match self {
@@ -607,6 +632,7 @@ fn validate_planning(
         .includes_domain(CaptureTrafficDomain::LocalOutput);
     let digest = digest_generation_planning_authority(planning);
     match planning {
+        #[cfg(test)]
         GenerationPlanningAuthority::HostInspection(authority) => {
             ensure_common_planning_binding(
                 &authority.capability_profile,
@@ -667,6 +693,7 @@ fn digest_generation_planning_authority(
     let mut digest = Sha256::new();
     digest.update(GENERATION_PLANNING_DIGEST_DOMAIN);
     match planning {
+        #[cfg(test)]
         GenerationPlanningAuthority::HostInspection(authority) => {
             digest.update([0]);
             update_field(
@@ -755,6 +782,7 @@ fn ensure_common_planning_binding(
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_routing_shape(
     local_output: bool,
     families: AddressHostFamilySelection,
@@ -957,6 +985,7 @@ fn digest_generation(input: GenerationDigestInput<'_>) -> GenerationAssemblyDige
     update_engine_spec(&mut digest, engine_spec);
     update_field(&mut digest, planning_context.digest.as_bytes());
     digest.update([match planning_context.kind {
+        #[cfg(test)]
         GenerationAdmissionKind::HostInspectionOnly => 0,
         GenerationAdmissionKind::AndroidPlanningEvidence => 1,
     }]);

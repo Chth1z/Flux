@@ -2,7 +2,7 @@ use std::sync::Mutex;
 
 use flux_core::{
     AdministrativeState, CapabilityProfile, ControlClient, ControlError, ControlSnapshot,
-    LegacyIntent, OperationReport,
+    OperationReport, RuntimeIntent,
 };
 use flux_testkit::{CapabilityProfileFixture, StaticKernelReleaseSource};
 use fluxd::{
@@ -463,7 +463,7 @@ fn explain_aliases_return_the_same_non_authorizing_rust_plan() {
         let output = String::from_utf8(stdout).expect("UTF-8 explanation");
         assert!(output.starts_with("authorization: non_authorizing\n"));
         assert!(output.contains("backend: xtables\n"));
-        assert!(output.contains("bridge compatible: true"));
+        assert!(output.contains("engine config: schema=1 bytes=4096 digest="));
         assert_eq!(client.explanations(), 1);
     }
 }
@@ -544,11 +544,11 @@ impl RecordingDaemonClient {
 }
 
 impl ControlClient for RecordingDaemonClient {
-    fn submit_and_wait(&self, intent: LegacyIntent) -> Result<OperationReport, ControlError> {
+    fn submit_and_wait(&self, intent: RuntimeIntent) -> Result<OperationReport, ControlError> {
         Ok(OperationReport {
             intent,
             revision: 17,
-            address_resync: matches!(intent, LegacyIntent::ResyncAddresses { .. })
+            address_resync: matches!(intent, RuntimeIntent::ResyncAddresses { .. })
                 .then_some(flux_core::AddressResyncDisposition::AcceptedDeferred),
         })
     }
@@ -641,7 +641,6 @@ impl DaemonClient for RecordingDaemonClient {
 fn diagnostic_report() -> DiagnosticReport {
     serde_json::from_value(serde_json::json!({
         "desired_state": {"state": "ready", "detail": "schema=3"},
-        "engine_manifest": {"state": "ready", "detail": "generation=19"},
         "runtime_log": {"state": "ready", "detail": "bytes=120"},
         "daemon_log": {"state": "ready", "detail": "bytes=90"},
         "engine_log": {"state": "missing", "detail": "file is absent"},
@@ -671,8 +670,6 @@ fn explain_value() -> serde_json::Value {
         "engine_config_schema": 1,
         "engine_config_digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         "engine_config_bytes": 4096,
-        "bridge_compatible": true,
-        "bridge_detail": "representable by the fenced bridge",
         "non_authorizing": true,
     })
 }

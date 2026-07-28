@@ -224,11 +224,6 @@ impl ValidatedSubscriptionEngineConfig {
         Ok(artifact)
     }
 
-    #[cfg(test)]
-    pub(crate) fn bytes(&self) -> &[u8] {
-        &self.bytes
-    }
-
     pub(crate) fn desired_state(&self) -> &FluxConfig {
         &self.desired_state
     }

@@ -11,9 +11,9 @@ use std::time::{Duration, Instant};
 
 use flux_core::{
     AddressResyncDisposition, CapabilityProfile, DispatcherCompletion, FluxConfig, FwmarkCandidate,
-    InterfaceAddressFlags, InterfaceAddressRecord, InterfaceIndex, LegacyDispatcher, LegacyIntent,
-    NetworkInventory, NetworkInventoryTracker, NetworkNamespaceIdentity, Reason, RouteProtocol,
-    RouteTableId, RulePriority, RuleProtocol,
+    InterfaceAddressFlags, InterfaceAddressRecord, InterfaceIndex, NetworkInventory,
+    NetworkInventoryTracker, NetworkNamespaceIdentity, Reason, RouteProtocol, RouteTableId,
+    RulePriority, RuleProtocol, RuntimeDispatcher, RuntimeIntent,
 };
 use flux_platform::{
     NativeCaptureTargetIdentity, NativeLinuxCompositionTestAdmission,
@@ -197,7 +197,7 @@ fn execute_isolated(root: &Path) -> Result<(), String> {
     let mut first = fixture.compose_runtime()?;
     execute(
         &mut first.coordinator,
-        LegacyIntent::Running {
+        RuntimeIntent::Running {
             reason: Reason::Boot,
         },
         "start initial native Generation",
@@ -207,7 +207,7 @@ fn execute_isolated(root: &Path) -> Result<(), String> {
 
     execute(
         &mut first.coordinator,
-        LegacyIntent::Reload {
+        RuntimeIntent::Reload {
             reason: Reason::Fluxctl,
         },
         "reload native successor",
@@ -254,7 +254,7 @@ fn execute_isolated(root: &Path) -> Result<(), String> {
         .publish(Some(Arc::clone(&fixture.changed_inventory)));
     let completion = execute(
         &mut first.coordinator,
-        LegacyIntent::ResyncAddresses {
+        RuntimeIntent::ResyncAddresses {
             reason: Reason::Fluxctl,
         },
         "converge address-driven native successor",
@@ -279,7 +279,7 @@ fn execute_isolated(root: &Path) -> Result<(), String> {
         .map_err(|error| format!("arm {}: {error}", fixture.fail_check.display()))?;
     if first
         .coordinator
-        .execute(&LegacyIntent::Reload {
+        .execute(&RuntimeIntent::Reload {
             reason: Reason::Fluxctl,
         })
         .is_ok()
@@ -306,7 +306,7 @@ fn execute_isolated(root: &Path) -> Result<(), String> {
 
     execute(
         &mut first.coordinator,
-        LegacyIntent::Reload {
+        RuntimeIntent::Reload {
             reason: Reason::Fluxctl,
         },
         "reload after rejected candidate",
@@ -326,7 +326,7 @@ fn execute_isolated(root: &Path) -> Result<(), String> {
 
     execute(
         &mut first.coordinator,
-        LegacyIntent::Stopped {
+        RuntimeIntent::Stopped {
             reason: Reason::Fluxctl,
         },
         "stop native runtime",
@@ -337,7 +337,7 @@ fn execute_isolated(root: &Path) -> Result<(), String> {
 
     execute(
         &mut first.coordinator,
-        LegacyIntent::Running {
+        RuntimeIntent::Running {
             reason: Reason::Fluxctl,
         },
         "restart before crash recovery",
@@ -351,7 +351,7 @@ fn execute_isolated(root: &Path) -> Result<(), String> {
     assert_clean_state()?;
     execute(
         &mut recovered.coordinator,
-        LegacyIntent::Running {
+        RuntimeIntent::Running {
             reason: Reason::Boot,
         },
         "start after durable crash recovery",
@@ -359,7 +359,7 @@ fn execute_isolated(root: &Path) -> Result<(), String> {
     assert_active_kernel_state()?;
     execute(
         &mut recovered.coordinator,
-        LegacyIntent::Stopped {
+        RuntimeIntent::Stopped {
             reason: Reason::Fluxctl,
         },
         "stop recovered native runtime",
@@ -368,7 +368,7 @@ fn execute_isolated(root: &Path) -> Result<(), String> {
 
     execute(
         &mut recovered.coordinator,
-        LegacyIntent::Running {
+        RuntimeIntent::Running {
             reason: Reason::Fluxctl,
         },
         "start before offline recovery",
@@ -665,7 +665,7 @@ impl NativeGenerationPlanningSource for HostPlanning {
 
 fn execute(
     coordinator: &mut TestCoordinator,
-    intent: LegacyIntent,
+    intent: RuntimeIntent,
     operation: &str,
 ) -> Result<DispatcherCompletion, String> {
     coordinator

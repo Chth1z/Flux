@@ -13,11 +13,10 @@ use flux_core::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::MAX_ENGINE_CONFIG_BYTES;
 use crate::generation_engine_config::{
-    TproxyEngineConfigRequest, compile_bridge_environment, compile_tproxy_engine_config,
-    read_bounded_regular_file,
+    TproxyEngineConfigRequest, compile_tproxy_engine_config, read_bounded_regular_file,
 };
-use crate::{EngineManifest, MAX_ENGINE_CONFIG_BYTES};
 
 pub const DEFAULT_LOG_LINES: u16 = 120;
 pub const MAX_LOG_LINES: u16 = 1_000;
@@ -111,7 +110,6 @@ impl DiagnosticItem {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DiagnosticReport {
     desired_state: DiagnosticItem,
-    engine_manifest: DiagnosticItem,
     runtime_log: DiagnosticItem,
     daemon_log: DiagnosticItem,
     engine_log: DiagnosticItem,
@@ -121,11 +119,6 @@ impl DiagnosticReport {
     #[must_use]
     pub const fn desired_state(&self) -> &DiagnosticItem {
         &self.desired_state
-    }
-
-    #[must_use]
-    pub const fn engine_manifest(&self) -> &DiagnosticItem {
-        &self.engine_manifest
     }
 
     #[must_use]
@@ -146,7 +139,6 @@ impl DiagnosticReport {
     pub(crate) fn validate(&self) -> bool {
         [
             &self.desired_state,
-            &self.engine_manifest,
             &self.runtime_log,
             &self.daemon_log,
             &self.engine_log,
@@ -194,8 +186,6 @@ pub struct ExplainReport {
     engine_config_schema: u16,
     engine_config_digest: String,
     engine_config_bytes: usize,
-    bridge_compatible: bool,
-    bridge_detail: String,
     non_authorizing: bool,
 }
 
@@ -301,16 +291,6 @@ impl ExplainReport {
     }
 
     #[must_use]
-    pub const fn bridge_compatible(&self) -> bool {
-        self.bridge_compatible
-    }
-
-    #[must_use]
-    pub fn bridge_detail(&self) -> &str {
-        &self.bridge_detail
-    }
-
-    #[must_use]
     pub const fn non_authorizing(&self) -> bool {
         self.non_authorizing
     }
@@ -327,7 +307,6 @@ impl ExplainReport {
                 .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
             && u64::try_from(self.engine_config_bytes)
                 .is_ok_and(|bytes| bytes <= MAX_ENGINE_CONFIG_BYTES)
-            && self.bridge_detail.len() <= MAX_DIAGNOSTIC_DETAIL_BYTES
             && self.non_authorizing
     }
 }
@@ -341,33 +320,25 @@ pub(crate) trait InspectionSource: Send + Sync {
 #[derive(Clone, Debug)]
 pub(crate) struct ProcessInspectionSource {
     desired_state_path: PathBuf,
-    engine_manifest_path: PathBuf,
     runtime_log_path: PathBuf,
     daemon_log_path: PathBuf,
+    engine_log_path: PathBuf,
 }
 
 impl ProcessInspectionSource {
     #[must_use]
     pub(crate) fn new(
         desired_state_path: impl AsRef<Path>,
-        engine_manifest_path: impl AsRef<Path>,
         runtime_log_path: impl AsRef<Path>,
         daemon_log_path: impl AsRef<Path>,
+        engine_log_path: impl AsRef<Path>,
     ) -> Self {
         Self {
             desired_state_path: desired_state_path.as_ref().to_path_buf(),
-            engine_manifest_path: engine_manifest_path.as_ref().to_path_buf(),
             runtime_log_path: runtime_log_path.as_ref().to_path_buf(),
             daemon_log_path: daemon_log_path.as_ref().to_path_buf(),
+            engine_log_path: engine_log_path.as_ref().to_path_buf(),
         }
-    }
-
-    fn engine_log_path(&self) -> Result<PathBuf, InspectionError> {
-        EngineManifest::load_summary(&self.engine_manifest_path)
-            .map(|manifest| manifest.log().to_path_buf())
-            .map_err(|source| InspectionError::EngineManifest {
-                source: source.to_string(),
-            })
     }
 }
 
@@ -382,29 +353,11 @@ impl InspectionSource for ProcessInspectionSource {
                 classify_desired_state_error(&self.desired_state_path, &error.to_string())
             }
         };
-        let (engine_manifest, engine_log) =
-            match EngineManifest::load_summary(&self.engine_manifest_path) {
-                Ok(manifest) => (
-                    DiagnosticItem::new(
-                        DiagnosticState::Ready,
-                        format!("generation={}", manifest.generation()),
-                    ),
-                    observe_file(manifest.log()),
-                ),
-                Err(error) => (
-                    classify_manifest_error(&self.engine_manifest_path, &error.to_string()),
-                    DiagnosticItem::new(
-                        DiagnosticState::Unavailable,
-                        "engine log cannot be resolved without a valid manifest",
-                    ),
-                ),
-            };
         DiagnosticReport {
             desired_state,
-            engine_manifest,
             runtime_log: observe_file(&self.runtime_log_path),
             daemon_log: observe_file(&self.daemon_log_path),
-            engine_log,
+            engine_log: observe_file(&self.engine_log_path),
         }
     }
 
@@ -415,7 +368,7 @@ impl InspectionSource for ProcessInspectionSource {
         let path = match stream {
             LogStream::Runtime => self.runtime_log_path.clone(),
             LogStream::Daemon => self.daemon_log_path.clone(),
-            LogStream::Engine => self.engine_log_path()?,
+            LogStream::Engine => self.engine_log_path.clone(),
         };
         read_log_tail(&path, stream, lines)
     }
@@ -438,11 +391,6 @@ impl InspectionSource for ProcessInspectionSource {
         .map_err(|source| InspectionError::Compile {
             source: source.to_string(),
         })?;
-        let (bridge_compatible, bridge_detail) = match compile_bridge_environment(&config, &engine)
-        {
-            Ok(_) => (true, "representable by the fenced bridge".to_owned()),
-            Err(error) => (false, bounded_detail(error.to_string())),
-        };
         let scope = config.capture().scope();
         let protocols = config.capture().protocols();
         let interfaces = config.interfaces().policy();
@@ -475,8 +423,6 @@ impl InspectionSource for ProcessInspectionSource {
             engine_config_schema: engine.schema_version(),
             engine_config_digest: engine.digest().to_string(),
             engine_config_bytes: engine.usage().output_bytes(),
-            bridge_compatible,
-            bridge_detail,
             non_authorizing: true,
         })
     }
@@ -488,7 +434,6 @@ pub(crate) enum InspectionErrorKind {
     Missing,
     Unsafe,
     Io,
-    EngineManifest,
     DesiredState,
     Template,
     Compile,
@@ -501,7 +446,6 @@ impl InspectionErrorKind {
             Self::Missing => "inspection_missing",
             Self::Unsafe => "inspection_unsafe_file",
             Self::Io => "inspection_io_failed",
-            Self::EngineManifest => "inspection_engine_manifest_failed",
             Self::DesiredState => "inspection_desired_state_failed",
             Self::Template => "inspection_template_failed",
             Self::Compile => "inspection_compile_failed",
@@ -524,9 +468,6 @@ pub(crate) enum InspectionError {
         path: PathBuf,
         source: std::io::Error,
     },
-    EngineManifest {
-        source: String,
-    },
     DesiredState {
         source: String,
     },
@@ -545,7 +486,6 @@ impl InspectionError {
             Self::Missing { .. } => InspectionErrorKind::Missing,
             Self::Unsafe { .. } => InspectionErrorKind::Unsafe,
             Self::Io { .. } => InspectionErrorKind::Io,
-            Self::EngineManifest { .. } => InspectionErrorKind::EngineManifest,
             Self::DesiredState { .. } => InspectionErrorKind::DesiredState,
             Self::Template { .. } => InspectionErrorKind::Template,
             Self::Compile { .. } => InspectionErrorKind::Compile,
@@ -572,9 +512,6 @@ impl fmt::Display for InspectionError {
                     "cannot read log file {}: {source}",
                     path.display()
                 )
-            }
-            Self::EngineManifest { source } => {
-                write!(formatter, "cannot resolve the active engine log: {source}")
             }
             Self::DesiredState { source } => {
                 write!(
@@ -605,7 +542,6 @@ impl Error for InspectionError {
             Self::InvalidLineCount { .. }
             | Self::Missing { .. }
             | Self::Unsafe { .. }
-            | Self::EngineManifest { .. }
             | Self::DesiredState { .. }
             | Self::Template { .. }
             | Self::Compile { .. } => None,
@@ -725,21 +661,6 @@ fn observe_file(path: &Path) -> DiagnosticItem {
     }
 }
 
-fn classify_manifest_error(path: &Path, detail: &str) -> DiagnosticItem {
-    match fs::symlink_metadata(path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            DiagnosticItem::new(DiagnosticState::Missing, "manifest is absent")
-        }
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-            DiagnosticItem::new(
-                DiagnosticState::Unsafe,
-                "manifest is not a regular non-symbolic-link file",
-            )
-        }
-        _ => DiagnosticItem::new(DiagnosticState::Invalid, detail),
-    }
-}
-
 fn classify_desired_state_error(path: &Path, detail: &str) -> DiagnosticItem {
     match fs::symlink_metadata(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -824,12 +745,12 @@ mod tests {
             template_path.to_str().expect("UTF-8 path"),
         );
         fs::write(&config_path, config).expect("write config");
-        let manifest_path = directory.path().join("engine.manifest");
+        let engine_log_path = directory.path().join("sing-box.log");
         let source = ProcessInspectionSource::new(
             &config_path,
-            &manifest_path,
             directory.path().join("flux.log"),
             directory.path().join("fluxd.log"),
+            &engine_log_path,
         );
 
         let report = source.explain().expect("compile explanation");
@@ -837,7 +758,7 @@ mod tests {
         assert_eq!(report.backend(), "xtables");
         assert!(report.non_authorizing());
         assert!(report.validate());
-        assert!(!manifest_path.exists());
+        assert!(!engine_log_path.exists());
         assert_eq!(fs::read_dir(&directory).expect("list fixture").count(), 2);
     }
 
@@ -865,9 +786,9 @@ mod tests {
         fs::write(&config_path, config).expect("write config");
         let source = ProcessInspectionSource::new(
             &config_path,
-            directory.path().join("engine.manifest"),
             directory.path().join("flux.log"),
             directory.path().join("fluxd.log"),
+            directory.path().join("sing-box.log"),
         );
 
         let error = source
@@ -878,34 +799,15 @@ mod tests {
     }
 
     #[test]
-    fn diagnostics_resolve_engine_log_without_hashing_launch_artifacts() {
+    fn diagnostics_read_the_fixed_engine_log_without_launch_artifacts() {
         let directory = tempdir().expect("temporary directory");
         let log_path = directory.path().join("sing-box.log");
         fs::write(&log_path, "engine ready\n").expect("write engine log");
-        let manifest_path = directory.path().join("engine.manifest");
-        let manifest = format!(
-            "FLUX_ENGINE_MANIFEST_V1\n\
-             generation=7\n\
-             binary={}/missing-sing-box\n\
-             config={}/missing-config.json\n\
-             working_directory={}\n\
-             log={}\n\
-             launcher=direct\n\
-             readiness=listener\n\
-             listener_port=7893\n\
-             startup_timeout_ms=8000\n\
-             stop_timeout_ms=5000\n",
-            directory.path().display(),
-            directory.path().display(),
-            directory.path().display(),
-            log_path.display(),
-        );
-        fs::write(&manifest_path, &manifest).expect("write engine manifest");
         let source = ProcessInspectionSource::new(
             directory.path().join("missing-flux.toml"),
-            &manifest_path,
             directory.path().join("flux.log"),
             directory.path().join("fluxd.log"),
+            &log_path,
         );
 
         let diagnostics = source.diagnose();
@@ -913,27 +815,17 @@ mod tests {
             .logs(LogStream::Engine, 1)
             .expect("read resolved engine log");
 
-        assert_eq!(
-            diagnostics.engine_manifest().state(),
-            DiagnosticState::Ready
-        );
-        assert_eq!(diagnostics.engine_manifest().detail(), "generation=7");
         assert_eq!(diagnostics.engine_log().state(), DiagnosticState::Ready);
         assert_eq!(logs.content(), "engine ready\n");
 
-        fs::write(
-            &manifest_path,
-            manifest.replace("startup_timeout_ms=8000", "startup_timeout_ms=0"),
-        )
-        .expect("write invalid engine manifest");
+        fs::remove_file(&log_path).expect("remove engine log");
         assert_eq!(
-            source.diagnose().engine_manifest().state(),
-            DiagnosticState::Invalid,
-            "summary parsing must retain full manifest value validation"
+            source.diagnose().engine_log().state(),
+            DiagnosticState::Missing
         );
         assert!(matches!(
             source.logs(LogStream::Engine, 1),
-            Err(InspectionError::EngineManifest { .. })
+            Err(InspectionError::Missing { .. })
         ));
     }
 }

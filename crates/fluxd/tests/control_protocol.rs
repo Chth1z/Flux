@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use flux_core::{
     AdministrativeState, CapabilityProfile, ConfigurationChangeClient, ConfigurationChangeReport,
-    ControlClient, ControlError, ControlSnapshot, ControlSnapshotSource, KernelFacts, LegacyIntent,
-    Observation, OperationReport, Reason,
+    ControlClient, ControlError, ControlSnapshot, ControlSnapshotSource, KernelFacts, Observation,
+    OperationReport, Reason, RuntimeIntent,
 };
 use flux_platform::Uid;
 use flux_testkit::CapabilityProfileFixture;
@@ -94,7 +94,7 @@ fn status_returns_one_coherent_capability_profile_and_control_snapshot() {
             configuration_dirty: false,
             in_flight: None,
             last_completed: Some(OperationReport {
-                intent: LegacyIntent::Reload {
+                intent: RuntimeIntent::Reload {
                     reason: Reason::ConfigChanged,
                 },
                 revision: 73,
@@ -191,7 +191,7 @@ fn disable_removal_event_maps_to_a_running_intent() {
     );
     assert_eq!(
         handler.control().intents(),
-        vec![LegacyIntent::Running {
+        vec![RuntimeIntent::Running {
             reason: Reason::DisableRemoved,
         }]
     );
@@ -228,7 +228,7 @@ fn retried_mutation_with_the_same_peer_and_request_id_is_applied_once() {
     assert_eq!(retry, first);
     assert_eq!(
         handler.control().intents(),
-        vec![LegacyIntent::Running {
+        vec![RuntimeIntent::Running {
             reason: Reason::Fluxctl,
         }]
     );
@@ -242,7 +242,7 @@ fn resync_disposition_round_trips_through_control_status_and_duplicate_caching()
         configuration_dirty: false,
         in_flight: None,
         last_completed: Some(OperationReport {
-            intent: LegacyIntent::ResyncAddresses {
+            intent: RuntimeIntent::ResyncAddresses {
                 reason: Reason::Fluxctl,
             },
             revision: 80,
@@ -266,7 +266,7 @@ fn resync_disposition_round_trips_through_control_status_and_duplicate_caching()
     );
     assert_eq!(
         handler.control().intents(),
-        vec![LegacyIntent::ResyncAddresses {
+        vec![RuntimeIntent::ResyncAddresses {
             reason: Reason::Fluxctl,
         }]
     );
@@ -488,7 +488,7 @@ fn control_request_maps_wire_intent_and_returns_the_operation_revision() {
     );
     assert_eq!(
         handler.control().intents(),
-        vec![LegacyIntent::Reload {
+        vec![RuntimeIntent::Reload {
             reason: Reason::ConfigChanged,
         }]
     );
@@ -585,7 +585,7 @@ fn oversized_packet_is_rejected_before_json_parsing() {
 
 #[derive(Default)]
 struct RecordingClient {
-    intents: Mutex<Vec<LegacyIntent>>,
+    intents: Mutex<Vec<RuntimeIntent>>,
     snapshot: Mutex<ControlSnapshot>,
 }
 
@@ -597,18 +597,18 @@ impl RecordingClient {
         }
     }
 
-    fn intents(&self) -> Vec<LegacyIntent> {
+    fn intents(&self) -> Vec<RuntimeIntent> {
         self.intents.lock().expect("intents lock").clone()
     }
 }
 
 impl ControlClient for RecordingClient {
-    fn submit_and_wait(&self, intent: LegacyIntent) -> Result<OperationReport, ControlError> {
+    fn submit_and_wait(&self, intent: RuntimeIntent) -> Result<OperationReport, ControlError> {
         self.intents.lock().expect("intents lock").push(intent);
         Ok(OperationReport {
             intent,
             revision: 73,
-            address_resync: matches!(intent, LegacyIntent::ResyncAddresses { .. })
+            address_resync: matches!(intent, RuntimeIntent::ResyncAddresses { .. })
                 .then_some(flux_core::AddressResyncDisposition::AcceptedDeferred),
         })
     }
@@ -629,7 +629,7 @@ impl ConfigurationChangeClient for RecordingClient {
         if snapshot.administrative_state == AdministrativeState::Running {
             drop(snapshot);
             return self
-                .submit_and_wait(LegacyIntent::Reload { reason })
+                .submit_and_wait(RuntimeIntent::Reload { reason })
                 .map(ConfigurationChangeReport::Reloaded);
         }
         snapshot.revision = snapshot.revision.saturating_add(1);
@@ -669,7 +669,7 @@ impl BlockingClient {
 }
 
 impl ControlClient for BlockingClient {
-    fn submit_and_wait(&self, intent: LegacyIntent) -> Result<OperationReport, ControlError> {
+    fn submit_and_wait(&self, intent: RuntimeIntent) -> Result<OperationReport, ControlError> {
         let call = self.calls.fetch_add(1, Ordering::SeqCst);
         if call == 0 {
             self.first_call_entered.wait();
@@ -678,7 +678,7 @@ impl ControlClient for BlockingClient {
         Ok(OperationReport {
             intent,
             revision: 73,
-            address_resync: matches!(intent, LegacyIntent::ResyncAddresses { .. })
+            address_resync: matches!(intent, RuntimeIntent::ResyncAddresses { .. })
                 .then_some(flux_core::AddressResyncDisposition::AcceptedDeferred),
         })
     }
@@ -718,7 +718,7 @@ impl ErrorClient {
 }
 
 impl ControlClient for ErrorClient {
-    fn submit_and_wait(&self, _intent: LegacyIntent) -> Result<OperationReport, ControlError> {
+    fn submit_and_wait(&self, _intent: RuntimeIntent) -> Result<OperationReport, ControlError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Err(ControlError::dispatcher("x".repeat(self.message_bytes)))
     }
@@ -762,7 +762,7 @@ impl SynchronizedErrorClient {
 }
 
 impl ControlClient for SynchronizedErrorClient {
-    fn submit_and_wait(&self, _intent: LegacyIntent) -> Result<OperationReport, ControlError> {
+    fn submit_and_wait(&self, _intent: RuntimeIntent) -> Result<OperationReport, ControlError> {
         let call = self.calls.fetch_add(1, Ordering::SeqCst);
         if call < self.first_wave_size {
             self.first_wave.wait();

@@ -19,7 +19,7 @@ use flux_platform::{
     SingBoxLaunchSpec, SingBoxLauncher, SingBoxReadiness, SystemAndroidFwmarkCensusSource,
     collect_network_inventory_once, coordinate_android_fwmark_census_for_inventory,
 };
-#[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+#[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
 use flux_platform::{NativeLinuxCompositionTestAdmission, NativeLinuxCompositionTestError};
 
 use crate::generation_engine_config::{
@@ -299,12 +299,12 @@ impl NativeGenerationTargetAdmission for PlatformNativeGenerationTargetAdmission
     }
 }
 
-#[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+#[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
 pub(crate) struct PlatformNativeLinuxCompositionTestAdmission {
     platform: NativeLinuxCompositionTestAdmission,
 }
 
-#[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+#[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
 impl PlatformNativeLinuxCompositionTestAdmission {
     #[must_use]
     pub(crate) const fn new(platform: NativeLinuxCompositionTestAdmission) -> Self {
@@ -312,7 +312,7 @@ impl PlatformNativeLinuxCompositionTestAdmission {
     }
 }
 
-#[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+#[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
 impl NativeGenerationTargetAdmission for PlatformNativeLinuxCompositionTestAdmission {
     type Target = NativeXtablesCaptureTarget;
     type Error = PlatformNativeLinuxCompositionTestAdmissionError;
@@ -327,14 +327,14 @@ impl NativeGenerationTargetAdmission for PlatformNativeLinuxCompositionTestAdmis
     }
 }
 
-#[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+#[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
 #[derive(Debug)]
 pub(crate) enum PlatformNativeLinuxCompositionTestAdmissionError {
     Promotion(crate::generation_engine_config::LinuxCompositionTestPromotionError),
     Platform(NativeLinuxCompositionTestError),
 }
 
-#[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+#[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
 impl fmt::Display for PlatformNativeLinuxCompositionTestAdmissionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -344,7 +344,7 @@ impl fmt::Display for PlatformNativeLinuxCompositionTestAdmissionError {
     }
 }
 
-#[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+#[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
 impl Error for PlatformNativeLinuxCompositionTestAdmissionError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {

@@ -99,6 +99,7 @@ pub(crate) struct EngineCapabilityProfile {
 }
 
 impl EngineCapabilityProfile {
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn schema_version(&self) -> u16 {
         ENGINE_CAPABILITY_PROFILE_SCHEMA_VERSION
@@ -114,11 +115,13 @@ impl EngineCapabilityProfile {
         self.validated_binding
     }
 
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn version(&self) -> &SingBoxVersionIdentity {
         &self.version
     }
 
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn build(&self) -> &SingBoxBuildIdentity {
         &self.build
@@ -153,6 +156,7 @@ pub(crate) struct EngineCapabilityProfileError {
 }
 
 impl EngineCapabilityProfileError {
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn kind(&self) -> EngineCapabilityProfileErrorKind {
         self.kind

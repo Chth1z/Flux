@@ -3,14 +3,13 @@ use std::io::Write;
 use flux_core::{
     AdministrativeState, ControlClient, ControlError, ControlSnapshot, KernelMutationStatus,
     KernelSupport, LegacyAddressSynchronization, LegacyArtifactReadiness, LegacyArtifactResolution,
-    LegacyIntent, LegacyMutationGate, LegacyMutationWriter, LegacyRuleBackend,
-    MIN_SUPPORTED_KERNEL, Observation, OperationReport, Reason, SelinuxMode,
+    LegacyMutationWriter, LegacyRuleBackend, MIN_SUPPORTED_KERNEL, MutationGate, Observation,
+    OperationReport, Reason, RuntimeIntent, SelinuxMode,
 };
 use flux_platform::KernelReleaseSource;
 use serde::Serialize;
 
 mod daemon;
-mod engine_manifest;
 mod engine_supervisor;
 mod generation_engine_config;
 // The required Stage 1 gate is wired behind an explicit coordinator seam, but
@@ -19,8 +18,6 @@ mod generation_engine_config;
 mod functional_canary;
 mod inspection;
 mod intent_store;
-mod legacy_rules_cli;
-mod legacy_rules_manifest;
 mod native_generation_source;
 mod native_runtime_writer;
 mod offline_cleanup;
@@ -35,10 +32,6 @@ mod subscription;
 use protocol::WireCapabilityProfile;
 
 pub use daemon::{DaemonError, DaemonOptions, run_daemon};
-pub use engine_manifest::{
-    EngineManifest, EngineManifestError, EngineManifestErrorKind, EngineManifestIoOperation,
-    MAX_ENGINE_MANIFEST_BYTES, MAX_ENGINE_TIMEOUT_MS, PreparedEngineManifest,
-};
 pub use engine_supervisor::{
     CaptureBlockedAction, CaptureObservation, DesiredEngine, EngineArtifact, EngineArtifactDigest,
     EngineArtifactSetIdentity, EnginePhase, EngineReport, EngineSnapshot, EngineSpec,
@@ -52,16 +45,6 @@ pub use inspection::{
     ExplainApplicationMode, ExplainReport, LogReport, LogStream, MAX_LOG_LINES, MAX_LOG_TAIL_BYTES,
 };
 pub use intent_store::{AdministrativeIntentStore, IntentStoreError};
-pub use legacy_rules_cli::{
-    LegacyRulesEnvironment, ProcessLegacyRulesEnvironment, run_legacy_package_snapshot_cli,
-    run_legacy_rules_attestation_cli, run_legacy_rules_cli,
-};
-pub use legacy_rules_manifest::{
-    LEGACY_RULES_SET_MANIFEST_SCHEMA_VERSION, LegacyRulesArtifactManifest, LegacyRulesFamilyShape,
-    LegacyRulesManifestDigest, LegacyRulesManifestResourceTotals, LegacyRulesPairManifest,
-    LegacyRulesSetManifest, LegacyRulesSetManifestError, LegacyRulesSetManifestErrorKind,
-    MAX_LEGACY_RULES_SET_MANIFEST_BYTES,
-};
 pub use offline_cleanup::{
     DaemonLeaseError, DaemonLeaseErrorKind, OFFLINE_CLEANUP_BUSY_EXIT, OfflineCleanupDisposition,
     OfflineCleanupError, OfflineCleanupErrorKind, OfflineCleanupReport, run_offline_cleanup,
@@ -335,16 +318,16 @@ where
     }
 
     let intent = match action {
-        "start" => LegacyIntent::Running {
+        "start" => RuntimeIntent::Running {
             reason: Reason::Fluxctl,
         },
-        "stop" => LegacyIntent::Stopped {
+        "stop" => RuntimeIntent::Stopped {
             reason: Reason::Fluxctl,
         },
-        "restart" | "reload" => LegacyIntent::Reload {
+        "restart" | "reload" => RuntimeIntent::Reload {
             reason: Reason::Fluxctl,
         },
-        "resync" => LegacyIntent::ResyncAddresses {
+        "resync" => RuntimeIntent::ResyncAddresses {
             reason: Reason::Fluxctl,
         },
         unknown => {
@@ -608,7 +591,6 @@ where
         || writeln!(stdout, "runtime generation: {generation}").is_err()
         || writeln!(stdout, "\n[checks]").is_err()
         || write_diagnostic_item(stdout, "desired state", diagnostics.desired_state()).is_err()
-        || write_diagnostic_item(stdout, "engine manifest", diagnostics.engine_manifest()).is_err()
         || write_diagnostic_item(stdout, "runtime log", diagnostics.runtime_log()).is_err()
         || write_diagnostic_item(stdout, "daemon log", diagnostics.daemon_log()).is_err()
         || write_diagnostic_item(stdout, "engine log", diagnostics.engine_log()).is_err()
@@ -829,13 +811,6 @@ where
             report.engine_config_digest()
         )
         .is_err()
-        || writeln!(
-            stdout,
-            "bridge compatible: {} ({})",
-            report.bridge_compatible(),
-            report.bridge_detail()
-        )
-        .is_err()
     {
         return EXIT_RUNTIME_ERROR;
     }
@@ -937,13 +912,13 @@ where
         }
     };
     let capability_profile = &snapshot.capability_profile;
-    let daemon_state = match capability_profile.legacy_mutation_gate() {
-        LegacyMutationGate::Allowed => "running",
-        LegacyMutationGate::ReadOnly {
+    let daemon_state = match capability_profile.mutation_gate() {
+        MutationGate::Allowed => "running",
+        MutationGate::ReadOnly {
             kernel: KernelMutationStatus::Unsupported { .. },
             ..
         } => "unsupported_kernel",
-        LegacyMutationGate::ReadOnly { .. } => "read_only_profile",
+        MutationGate::ReadOnly { .. } => "read_only_profile",
     };
 
     if json {
@@ -1007,7 +982,7 @@ where
         || writeln!(
             stdout,
             "mutation gate: {}",
-            mutation_gate_label(capability_profile.legacy_mutation_gate())
+            mutation_gate_label(capability_profile.mutation_gate())
         )
         .is_err()
         || writeln!(
@@ -1213,7 +1188,7 @@ where
 fn write_help(output: &mut impl Write) -> i32 {
     let result = writeln!(
         output,
-        "Usage: fluxd <COMMAND>\n\nCommands:\n  status [--json]\n  start|stop|restart|reload|resync\n  control <start|stop|restart|reload|resync>\n  diagnose [--json]\n  logs [runtime|daemon|engine] [--lines N] [--json]\n  backend explain [--json]\n  plan [--dry-run] [--json]\n  rules-preview [--json]\n  ping\n  event <EVENT_TYPE> <WATCHED_PATH> <EVENT_NAME>\n  subscription update\n  cleanup --offline\n  render-legacy-rules --packages-list PATH --family 4|6 --action apply|cleanup\n  snapshot-legacy-packages --source PATH\n  attest-legacy-rules-set --generation ID --packages-list PATH --ipv4-apply PATH --ipv4-cleanup PATH [--ipv6-apply PATH --ipv6-cleanup PATH]\n  help\n  version"
+        "Usage: fluxd <COMMAND>\n\nCommands:\n  status [--json]\n  start|stop|restart|reload|resync\n  control <start|stop|restart|reload|resync>\n  diagnose [--json]\n  logs [runtime|daemon|engine] [--lines N] [--json]\n  backend explain [--json]\n  plan [--dry-run] [--json]\n  rules-preview [--json]\n  ping\n  event <EVENT_TYPE> <WATCHED_PATH> <EVENT_NAME>\n  subscription update\n  cleanup --offline\n  help\n  version"
     );
     if result.is_ok() {
         EXIT_SUCCESS
@@ -1263,13 +1238,13 @@ fn online_status_document(snapshot: DaemonSnapshot) -> OnlineStatusDocument {
 }
 
 fn daemon_state_label(capability_profile: &flux_core::CapabilityProfile) -> &'static str {
-    match capability_profile.legacy_mutation_gate() {
-        LegacyMutationGate::Allowed => "running",
-        LegacyMutationGate::ReadOnly {
+    match capability_profile.mutation_gate() {
+        MutationGate::Allowed => "running",
+        MutationGate::ReadOnly {
             kernel: KernelMutationStatus::Unsupported { .. },
             ..
         } => "unsupported_kernel",
-        LegacyMutationGate::ReadOnly { .. } => "read_only_profile",
+        MutationGate::ReadOnly { .. } => "read_only_profile",
     }
 }
 
@@ -1349,13 +1324,13 @@ struct OnlineIntentDocument {
     reason: &'static str,
 }
 
-impl From<LegacyIntent> for OnlineIntentDocument {
-    fn from(intent: LegacyIntent) -> Self {
+impl From<RuntimeIntent> for OnlineIntentDocument {
+    fn from(intent: RuntimeIntent) -> Self {
         let (action, reason) = match intent {
-            LegacyIntent::Running { reason } => ("start", reason),
-            LegacyIntent::Stopped { reason } => ("stop", reason),
-            LegacyIntent::Reload { reason } => ("reload", reason),
-            LegacyIntent::ResyncAddresses { reason } => ("resync", reason),
+            RuntimeIntent::Running { reason } => ("start", reason),
+            RuntimeIntent::Stopped { reason } => ("stop", reason),
+            RuntimeIntent::Reload { reason } => ("reload", reason),
+            RuntimeIntent::ResyncAddresses { reason } => ("resync", reason),
         };
         Self {
             action,
@@ -1480,14 +1455,14 @@ const fn runtime_verification_label(verification: RuntimeVerificationState) -> &
     }
 }
 
-const fn mutation_gate_label(gate: LegacyMutationGate) -> &'static str {
+const fn mutation_gate_label(gate: MutationGate) -> &'static str {
     match gate {
-        LegacyMutationGate::Allowed => "allowed",
-        LegacyMutationGate::ReadOnly {
+        MutationGate::Allowed => "allowed",
+        MutationGate::ReadOnly {
             kernel: KernelMutationStatus::Unsupported { .. },
             ..
         } => "unsupported_kernel",
-        LegacyMutationGate::ReadOnly { .. } => "read_only_profile",
+        MutationGate::ReadOnly { .. } => "read_only_profile",
     }
 }
 
@@ -1540,8 +1515,8 @@ struct UnavailableControlClient;
 impl ControlClient for UnavailableControlClient {
     fn submit_and_wait(
         &self,
-        _intent: LegacyIntent,
+        _intent: RuntimeIntent,
     ) -> Result<flux_core::OperationReport, ControlError> {
-        Err(ControlError::BridgeStopped)
+        Err(ControlError::RuntimeStopped)
     }
 }

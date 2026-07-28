@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
+use std::io;
 use std::num::NonZeroU16;
+use std::path::Path;
 
 use serde::Deserialize;
 use serde::de::{MapAccess, SeqAccess, Visitor};
@@ -10,6 +12,7 @@ use sha2::{Digest, Sha256};
 
 use flux_platform::SingBoxReadiness;
 
+use crate::intent_store::{IntentStoreError, record_io};
 use crate::{EngineArtifactDigest, EngineArtifactSetIdentity, EngineSpec, MAX_ENGINE_CONFIG_BYTES};
 
 pub(crate) const GENERATION_ENGINE_CONFIG_SCHEMA_VERSION: u16 = 1;
@@ -23,6 +26,27 @@ const ARTIFACT_DIGEST_DOMAIN: &[u8] =
     b"Flux Generation Sing-Box engine config artifact\0sha256-v1\0";
 const LAUNCH_BINDING_DIGEST_DOMAIN: &[u8] =
     b"Flux Generation Sing-Box engine config launch binding\0sha256-v1\0";
+
+pub(crate) fn read_bounded_regular_file(path: &Path) -> io::Result<Vec<u8>> {
+    let maximum = usize::try_from(MAX_ENGINE_CONFIG_BYTES).unwrap_or(usize::MAX);
+    match record_io::read(path, maximum) {
+        Ok(Some(bytes)) => Ok(bytes),
+        Ok(None) => Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("engine template {} is missing", path.display()),
+        )),
+        Err(source) => {
+            let kind = match source {
+                IntentStoreError::Symlink(_) | IntentStoreError::NotRegularFile(_) => {
+                    io::ErrorKind::InvalidInput
+                }
+                IntentStoreError::RecordTooLarge { .. } => io::ErrorKind::InvalidData,
+                _ => io::ErrorKind::Other,
+            };
+            Err(io::Error::new(kind, source))
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(transparent)]
@@ -69,6 +93,7 @@ pub(crate) struct EngineConfigResourceUsage {
 }
 
 impl EngineConfigResourceUsage {
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn input_bytes(self) -> usize {
         self.input_bytes
@@ -79,11 +104,13 @@ impl EngineConfigResourceUsage {
         self.output_bytes
     }
 
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn input_inbounds(self) -> usize {
         self.input_inbounds
     }
 
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn output_inbounds(self) -> usize {
         self.output_inbounds
@@ -175,11 +202,13 @@ pub(crate) struct EngineConfigLaunchBinding {
 }
 
 impl EngineConfigLaunchBinding {
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn schema_version(&self) -> u16 {
         ENGINE_CONFIG_LAUNCH_BINDING_SCHEMA_VERSION
     }
 
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn artifact(&self) -> &EngineConfigArtifact {
         &self.artifact
@@ -190,16 +219,19 @@ impl EngineConfigLaunchBinding {
         self.artifacts
     }
 
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn binary_digest(&self) -> EngineArtifactDigest {
         self.artifacts.binary()
     }
 
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn config_digest(&self) -> EngineArtifactDigest {
         self.artifacts.config()
     }
 
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn launcher_digest(&self) -> Option<EngineArtifactDigest> {
         self.artifacts.launcher()
@@ -229,6 +261,7 @@ pub(crate) struct EngineConfigBindingError {
 }
 
 impl EngineConfigBindingError {
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn kind(self) -> EngineConfigBindingErrorKind {
         self.kind
@@ -325,6 +358,7 @@ pub(crate) struct EngineConfigCompileError {
 }
 
 impl EngineConfigCompileError {
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn kind(&self) -> EngineConfigCompileErrorKind {
         self.kind
@@ -608,11 +642,6 @@ fn digest_engine_config_launch_binding(
         None => digest.update([0]),
     }
     digest.finalize().into()
-}
-
-fn update_length_prefixed(digest: &mut Sha256, bytes: &[u8]) {
-    digest.update(length_bytes(bytes.len()));
-    digest.update(bytes);
 }
 
 fn digest_with_domain(domain: &[u8], bytes: &[u8]) -> [u8; ENGINE_CONFIG_DIGEST_BYTES] {

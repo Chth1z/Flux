@@ -1,6 +1,5 @@
 use std::env;
 use std::error::Error;
-use std::ffi::OsString;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -14,13 +13,12 @@ use flux_core::{
     AdministrativeState, CapabilityProfile, CapabilityProfileSource, ConfigError,
     ConfigurationChangeClient, ConfigurationChangeReport, ControlClient, ControlError,
     ControlObservation, ControlObservationIngress, ControlSnapshot, ControlSnapshotSource,
-    FluxConfig, LegacyControlBridge, LegacyDispatcher, LegacyIntent, LegacyMutationGate,
-    OperationReport, Reason,
+    FluxConfig, MutationGate, OperationReport, Reason, RuntimeControl, RuntimeDispatcher,
+    RuntimeIntent,
 };
 use flux_platform::{
-    CapabilityProfilePaths, DaemonReactor, DispatcherPhaseCommand, FileObservationBatch,
-    FileObservationPaths, NativeCaptureTargetIdentity, NativeXtablesAndroidRuntime,
-    NativeXtablesAndroidRuntimeConfig, PhaseDispatcherPaths, ProcessPhaseDispatcher,
+    CapabilityProfilePaths, DaemonReactor, FileObservationBatch, FileObservationPaths,
+    NativeCaptureTargetIdentity, NativeXtablesAndroidRuntime, NativeXtablesAndroidRuntimeConfig,
     ShutdownSignal,
 };
 
@@ -35,17 +33,15 @@ use crate::native_runtime_writer::compose_native_runtime;
 use crate::offline_cleanup::{
     DaemonLease, DaemonLeaseError, NativeOfflineRecovery, OfflineRecovery,
 };
-use crate::runtime_coordinator::{
-    ProcessRuntimeWriter, RuntimeCoordinator, RuntimeFunctionalCanary,
-};
+use crate::runtime_coordinator::RuntimeFunctionalCanary;
 use crate::runtime_layout::RuntimeLayout;
 use crate::runtime_logging::{self, LogSeverity, daemon_log};
 use crate::subscription::{
     SubscriptionRefreshClient, SubscriptionRefreshRuntime, SubscriptionRuntimePaths,
 };
 use crate::{
-    AdministrativeIntentStore, ControlConnectionHandler, ControlSocketError, EngineSupervisor,
-    IntentStoreError, RuntimeSnapshotSource,
+    AdministrativeIntentStore, ControlConnectionHandler, ControlSocketError, IntentStoreError,
+    RuntimeSnapshotSource,
 };
 
 const DEFAULT_ROOT: &str = "/data/adb/flux";
@@ -64,12 +60,6 @@ pub struct DaemonOptions {
     pub socket_path: PathBuf,
     pub daemon_lease_path: PathBuf,
     pub config_path: PathBuf,
-    pub shell: PathBuf,
-    pub dispatcher_script: PathBuf,
-    pub addrsync_script: PathBuf,
-    pub engine_manifest_path: PathBuf,
-    pub engine_config_path: PathBuf,
-    pub bridge_environment_path: PathBuf,
     pub subscription_store_path: PathBuf,
     pub intent_path: PathBuf,
     pub boot_id_path: PathBuf,
@@ -91,9 +81,6 @@ impl DaemonOptions {
         let config_path = env::var_os("FLUXD_CONFIG_PATH")
             .map(PathBuf::from)
             .unwrap_or_else(|| root.join("conf/flux.toml"));
-        let shell = env::var_os("FLUX_SHELL")
-            .map(PathBuf::from)
-            .unwrap_or_else(default_shell);
         let intent_path = env::var_os("FLUXD_INTENT_PATH")
             .map(PathBuf::from)
             .unwrap_or_else(|| root.join("state/administrative-intent.json"));
@@ -112,12 +99,6 @@ impl DaemonOptions {
             socket_path,
             daemon_lease_path,
             config_path,
-            shell,
-            dispatcher_script: root.join("scripts/dispatcher"),
-            addrsync_script: root.join("scripts/addrsync"),
-            engine_manifest_path: root.join("run/engine.manifest"),
-            engine_config_path: root.join("conf/config.json"),
-            bridge_environment_path: root.join("run/desired-state.env"),
             subscription_store_path: root.join("state/subscription"),
             intent_path,
             boot_id_path,
@@ -128,21 +109,7 @@ impl DaemonOptions {
 
     #[must_use]
     pub fn capability_profile_paths(&self) -> CapabilityProfilePaths {
-        CapabilityProfilePaths::new(
-            &self.boot_id_path,
-            &self.selinux_enforce_path,
-            &self.shell,
-            &self.dispatcher_script,
-            &self.addrsync_script,
-        )
-    }
-
-    pub(crate) fn phase_dispatcher_paths(&self) -> PhaseDispatcherPaths {
-        PhaseDispatcherPaths {
-            shell: self.shell.clone(),
-            shell_args: Vec::<OsString>::new(),
-            dispatcher: self.dispatcher_script.clone(),
-        }
+        CapabilityProfilePaths::new(&self.boot_id_path, &self.selinux_enforce_path)
     }
 
     pub(crate) fn native_xtables_runtime_config(
@@ -181,8 +148,8 @@ where
     let result = (|| {
         // Block process-directed termination before any daemon worker can be
         // created. Every in-process thread then inherits the mask, leaving
-        // signalfd as the sole shutdown consumer. Phase-dispatcher and Proxy
-        // Engine children explicitly restore a clean mask before exec.
+        // signalfd as the sole shutdown consumer. Proxy Engine children
+        // explicitly restore a clean mask before exec.
         let shutdown = ShutdownSignal::install()
             .map_err(|error| DaemonError::Socket(ControlSocketError::Platform(error)))?;
         let profile = Arc::new(profile_source.collect_capability_profile());
@@ -192,160 +159,25 @@ where
             address_reconciliation_attachment,
             subscription_client,
             file_observation,
-        ) = if profile.device_identity().verified().is_some() {
+        ) = if matches!(profile.mutation_gate(), MutationGate::Allowed)
+            && profile.device_identity().verified().is_some()
+        {
             compose_native_daemon(&profile, &options, &runtime_layout)?
         } else {
-            match profile.legacy_mutation_gate() {
-                LegacyMutationGate::Allowed => {
-                    let boot_identity = profile.boot_identity().verified().cloned().ok_or(
-                        DaemonError::Invariant(
-                            "legacy mutation gate allowed startup without a verified boot identity",
-                        ),
-                    )?;
-                    let phase_paths = options.phase_dispatcher_paths();
-                    let mut startup_recovery = ProcessPhaseDispatcher::new(phase_paths.clone());
-                    startup_recovery
-                        .execute(DispatcherPhaseCommand::StartupRecover)
-                        .map_err(|error| {
-                            DaemonError::Control(ControlError::runtime(
-                                "recover stale runtime before daemon admission",
-                                error,
-                                "repair the dispatcher ownership evidence and restart fluxd",
-                            ))
-                        })?;
-                    // Startup recovery relies only on immutable generation artifacts
-                    // and ownership records. It must run before parsing the current
-                    // user configuration so a broken edit cannot strand same-boot
-                    // capture. Once recovery succeeds, the strict user configuration
-                    // becomes authoritative for the new runtime.
-                    let config =
-                        FluxConfig::load(&options.config_path).map_err(DaemonError::FluxConfig)?;
-                    let observation_paths = file_observation_paths(
-                        &options.config_path,
-                        &options.disable_path,
-                        &config,
-                    );
-                    let observation_baseline =
-                        ObservedInputsFingerprint::capture(&observation_paths)
-                            .map_err(DaemonError::Configuration)?;
-                    let queue_capacity = usize::try_from(
-                        config.daemon().event_queue_capacity().get(),
-                    )
-                    .map_err(|_| {
-                        DaemonError::Configuration(
-                            "daemon.event_queue_capacity does not fit this target".to_owned(),
-                        )
-                    })?;
-                    let store = AdministrativeIntentStore::new(&options.intent_path, boot_identity);
-                    let disable_present = inspect_disable_path(&options.disable_path)
-                        .map_err(DaemonError::Configuration)?;
-                    let initial_intent = initial_intent(&store, disable_present)?;
-                    let subscription_working_directory = options
-                        .engine_manifest_path
-                        .parent()
-                        .filter(|path| !path.as_os_str().is_empty())
-                        .ok_or_else(|| {
-                            DaemonError::Configuration(
-                                "engine manifest path has no subscription working directory"
-                                    .to_owned(),
-                            )
-                        })?;
-                    let subscription =
-                        SubscriptionRefreshRuntime::start(SubscriptionRuntimePaths::new(
-                            &options.config_path,
-                            &options.subscription_store_path,
-                            subscription_working_directory,
-                            options
-                                .engine_manifest_path
-                                .with_file_name("subscription-check.log"),
-                        ))
-                        .map_err(|error| {
-                            DaemonError::Configuration(format!(
-                                "cannot start subscription runtime: {error}"
-                            ))
-                        })?;
-                    let bootstrap_digest = subscription.bootstrap_digest;
-                    let subscription_client = subscription.client.clone();
-                    let writer = ProcessRuntimeWriter::new(
-                        phase_paths,
-                        &options.engine_manifest_path,
-                        &options.config_path,
-                        &options.engine_config_path,
-                        &options.bridge_environment_path,
-                    )
-                    .with_subscription_source(subscription.active);
-                    let maintenance_interval =
-                        engine_maintenance_interval(config.daemon().reconcile_debounce().get());
-                    let (address_reconciliation_attachment, address_reconciler) =
-                        AddressReconciler::deferred(&options.config_path);
-                    let dispatcher = RuntimeCoordinator::with_dependencies(
-                        writer,
-                        EngineSupervisor::new(),
-                        maintenance_interval,
-                        RuntimeFunctionalCanary::StructuralOnlyCompatibility,
-                    )
-                    .with_address_reconciler(address_reconciler)
-                    .with_subscription_runtime(subscription.runtime);
-                    let runtime = dispatcher.runtime_snapshot_source();
-                    let dispatcher = PersistingLegacyDispatcher { dispatcher, store };
-                    let bridge = LegacyControlBridge::start(dispatcher, queue_capacity)
-                        .map_err(DaemonError::Control)?;
-                    let admission = bridge
-                        .submit(initial_intent)
-                        .and_then(flux_core::OperationHandle::wait);
-                    if let Err(admission_error) = admission {
-                        if let Some(digest) = bootstrap_digest
-                            && let Err(rollback_error) =
-                                subscription_client.reject_bootstrap(digest)
-                        {
-                            return Err(DaemonError::Configuration(format!(
-                                "initial runtime admission failed ({admission_error}); cannot restore the unadmitted subscription snapshot ({rollback_error})"
-                            )));
-                        }
-                        return Err(DaemonError::Control(admission_error));
-                    }
-                    if let Some(digest) = bootstrap_digest {
-                        subscription_client
-                    .accept_bootstrap(digest)
-                    .map_err(|error| {
-                        DaemonError::Configuration(format!(
-                            "initial runtime was admitted but the subscription worker could not commit its startup snapshot: {error}"
-                        ))
-                    })?;
-                    }
-                    let observation_ingress =
-                        bridge.observation_ingress().map_err(DaemonError::Control)?;
-                    let observation_controller = FileObservationController {
-                        desired_state_path: options.config_path.clone(),
-                        disable_path: options.disable_path.clone(),
-                        effective_disabled: disable_present,
-                        disable_path_invalid: false,
-                        initial_inputs: Some(observation_baseline),
-                        ingress: observation_ingress,
-                    };
-                    (
-                        DaemonControl::Bridge(bridge),
-                        runtime,
-                        Some(address_reconciliation_attachment),
-                        Some(subscription_client),
-                        Some((observation_paths, observation_controller)),
-                    )
-                }
-                LegacyMutationGate::ReadOnly { .. } => (
-                    DaemonControl::ReadOnly,
-                    RuntimeSnapshotSource::default(),
-                    None,
-                    None,
-                    None,
-                ),
-            }
+            (
+                DaemonControl::ReadOnly,
+                RuntimeSnapshotSource::default(),
+                None,
+                None,
+                None,
+            )
         };
 
         let inspection = Arc::new(ProcessInspectionSource::new(
             &options.config_path,
-            &options.engine_manifest_path,
             runtime_layout.runtime_log_path(),
             runtime_layout.daemon_log_path(),
+            runtime_layout.run_path().join("sing-box.log"),
         ));
         let handler = ControlConnectionHandler::with_runtime_subscription_and_inspection(
             Arc::clone(&profile),
@@ -551,10 +383,10 @@ fn compose_native_daemon(
     .with_address_reconciler(address_reconciler)
     .with_subscription_runtime(subscription_runtime);
     let runtime = dispatcher.runtime_snapshot_source();
-    let dispatcher = PersistingLegacyDispatcher { dispatcher, store };
-    let bridge =
-        LegacyControlBridge::start(dispatcher, queue_capacity).map_err(DaemonError::Control)?;
-    let admission = bridge
+    let dispatcher = PersistingRuntimeDispatcher { dispatcher, store };
+    let control =
+        RuntimeControl::start(dispatcher, queue_capacity).map_err(DaemonError::Control)?;
+    let admission = control
         .submit(initial_intent)
         .and_then(flux_core::OperationHandle::wait);
     if let Err(admission_error) = admission {
@@ -576,7 +408,9 @@ fn compose_native_daemon(
                 ))
             })?;
     }
-    let observation_ingress = bridge.observation_ingress().map_err(DaemonError::Control)?;
+    let observation_ingress = control
+        .observation_ingress()
+        .map_err(DaemonError::Control)?;
     let observation_controller = FileObservationController {
         desired_state_path: options.config_path.clone(),
         disable_path: options.disable_path.clone(),
@@ -586,7 +420,7 @@ fn compose_native_daemon(
         ingress: observation_ingress,
     };
     Ok((
-        DaemonControl::Bridge(bridge),
+        DaemonControl::Runtime(control),
         runtime,
         Some(address_reconciliation_attachment),
         Some(subscription_client),
@@ -595,15 +429,15 @@ fn compose_native_daemon(
 }
 
 enum DaemonControl {
-    Bridge(LegacyControlBridge),
+    Runtime(RuntimeControl),
     ReadOnly,
 }
 
 impl ControlClient for DaemonControl {
-    fn submit_and_wait(&self, intent: LegacyIntent) -> Result<OperationReport, ControlError> {
+    fn submit_and_wait(&self, intent: RuntimeIntent) -> Result<OperationReport, ControlError> {
         match self {
-            Self::Bridge(bridge) => bridge.submit_and_wait(intent),
-            Self::ReadOnly => Err(ControlError::BridgeStopped),
+            Self::Runtime(control) => control.submit_and_wait(intent),
+            Self::ReadOnly => Err(ControlError::RuntimeStopped),
         }
     }
 }
@@ -611,7 +445,7 @@ impl ControlClient for DaemonControl {
 impl ControlSnapshotSource for DaemonControl {
     fn snapshot(&self) -> Arc<ControlSnapshot> {
         match self {
-            Self::Bridge(bridge) => bridge.snapshot(),
+            Self::Runtime(control) => control.snapshot(),
             Self::ReadOnly => Arc::new(ControlSnapshot::default()),
         }
     }
@@ -623,29 +457,29 @@ impl ConfigurationChangeClient for DaemonControl {
         reason: Reason,
     ) -> Result<ConfigurationChangeReport, ControlError> {
         match self {
-            Self::Bridge(bridge) => bridge.configuration_changed(reason),
-            Self::ReadOnly => Err(ControlError::BridgeStopped),
+            Self::Runtime(control) => control.configuration_changed(reason),
+            Self::ReadOnly => Err(ControlError::RuntimeStopped),
         }
     }
 }
 
-struct PersistingLegacyDispatcher<D> {
+struct PersistingRuntimeDispatcher<D> {
     dispatcher: D,
     store: AdministrativeIntentStore,
 }
 
-impl<D> LegacyDispatcher for PersistingLegacyDispatcher<D>
+impl<D> RuntimeDispatcher for PersistingRuntimeDispatcher<D>
 where
-    D: LegacyDispatcher,
+    D: RuntimeDispatcher,
 {
     fn execute(
         &mut self,
-        intent: &LegacyIntent,
+        intent: &RuntimeIntent,
     ) -> Result<flux_core::DispatcherCompletion, ControlError> {
         let state = match intent {
-            LegacyIntent::Running { .. } => Some(AdministrativeState::Running),
-            LegacyIntent::Stopped { .. } => Some(AdministrativeState::Stopped),
-            LegacyIntent::Reload { .. } | LegacyIntent::ResyncAddresses { .. } => None,
+            RuntimeIntent::Running { .. } => Some(AdministrativeState::Running),
+            RuntimeIntent::Stopped { .. } => Some(AdministrativeState::Stopped),
+            RuntimeIntent::Reload { .. } | RuntimeIntent::ResyncAddresses { .. } => None,
         };
         if let Some(state) = state {
             self.store.persist(state).map_err(|error| {
@@ -907,20 +741,20 @@ fn inspect_disable_path(disable_path: &Path) -> Result<bool, String> {
 fn initial_intent(
     store: &AdministrativeIntentStore,
     disable_present: bool,
-) -> Result<LegacyIntent, DaemonError> {
+) -> Result<RuntimeIntent, DaemonError> {
     if disable_present {
-        return Ok(LegacyIntent::Stopped {
+        return Ok(RuntimeIntent::Stopped {
             reason: Reason::DisableCreated,
         });
     }
     match store.load().map_err(DaemonError::Intent)? {
-        AdministrativeState::Running => Ok(LegacyIntent::Running {
+        AdministrativeState::Running => Ok(RuntimeIntent::Running {
             reason: Reason::DaemonRecovery,
         }),
-        AdministrativeState::Stopped => Ok(LegacyIntent::Stopped {
+        AdministrativeState::Stopped => Ok(RuntimeIntent::Stopped {
             reason: Reason::DaemonRecovery,
         }),
-        AdministrativeState::Unknown => Ok(LegacyIntent::Running {
+        AdministrativeState::Unknown => Ok(RuntimeIntent::Running {
             reason: Reason::Boot,
         }),
     }
@@ -965,7 +799,7 @@ impl fmt::Display for DaemonError {
             Self::NativeStartup { operation, source } => {
                 write!(formatter, "native startup cannot {operation}: {source}")
             }
-            Self::Control(error) => write!(formatter, "control bridge: {error}"),
+            Self::Control(error) => write!(formatter, "runtime control: {error}"),
             Self::Socket(error) => error.fmt(formatter),
         }
     }
@@ -994,11 +828,6 @@ fn validate_runtime_layout_paths(
     for (label, path) in [
         ("control socket", options.socket_path.as_path()),
         ("daemon lease", options.daemon_lease_path.as_path()),
-        ("engine manifest", options.engine_manifest_path.as_path()),
-        (
-            "bridge environment",
-            options.bridge_environment_path.as_path(),
-        ),
     ] {
         layout
             .require_run_child(label, path)
@@ -1016,14 +845,6 @@ fn validate_runtime_layout_paths(
             .map_err(DaemonError::RuntimeLayout)?;
     }
     Ok(())
-}
-
-fn default_shell() -> PathBuf {
-    if cfg!(target_os = "android") {
-        PathBuf::from("/system/bin/sh")
-    } else {
-        PathBuf::from("/bin/sh")
-    }
 }
 
 fn engine_maintenance_interval(configured: Duration) -> Duration {

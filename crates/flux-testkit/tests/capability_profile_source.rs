@@ -1,4 +1,4 @@
-use flux_core::{CapabilityProfileSource, LegacyMutationGate};
+use flux_core::{CapabilityProfileSource, MutationGate};
 use flux_testkit::{CapabilityProfileFixture, StaticCapabilityProfileSource};
 
 #[test]
@@ -10,7 +10,7 @@ fn static_source_replays_one_recorded_profile_deterministically() {
 
     assert_eq!(first, second);
     assert_eq!(source.calls(), 2);
-    assert_eq!(first.legacy_mutation_gate(), LegacyMutationGate::Allowed);
+    assert_eq!(first.mutation_gate(), MutationGate::Allowed);
 }
 
 #[test]
@@ -20,8 +20,8 @@ fn fixtures_include_queryable_read_only_profiles() {
         CapabilityProfileFixture::unverified_boot(),
     ] {
         assert!(matches!(
-            profile.legacy_mutation_gate(),
-            LegacyMutationGate::ReadOnly { .. }
+            profile.mutation_gate(),
+            MutationGate::ReadOnly { .. }
         ));
     }
 }

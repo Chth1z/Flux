@@ -14,11 +14,9 @@ mod android_kernel_capabilities;
 mod capability;
 mod child_process;
 mod file_observer;
-mod legacy_dispatcher;
 mod netlink;
 #[allow(dead_code)]
 mod network_observer;
-mod phase_dispatcher;
 mod process;
 mod reactor;
 mod seqpacket;
@@ -79,14 +77,9 @@ pub use android_kernel_capabilities::{
 };
 pub use capability::{CapabilityProfilePaths, SystemCapabilityProfileSource};
 pub use file_observer::{FileObservationBatch, FileObservationError, FileObservationPaths};
-pub use legacy_dispatcher::{LegacyScriptPaths, ProcessLegacyDispatcher};
 pub use network_observer::NetworkInventorySource;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use network_observer::collect_network_inventory_once;
-pub use phase_dispatcher::{
-    DispatcherPhaseCommand, PhaseDispatcherError, PhaseDispatcherErrorKind, PhaseDispatcherPaths,
-    ProcessPhaseDispatcher,
-};
 pub use process::{
     PROCESS_CREDENTIAL_MAP_DIGEST_BYTES, ProcessCredentialMapDigest, ProcessCredentialMapKind,
     ProcessCredentials, ProcessDomainObservation, ProcessHandle, ProcessHandleError,

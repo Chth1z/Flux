@@ -8,10 +8,10 @@ use flux_core::{
     CapabilityProfile, ConfigurationChangeReport, ControlError, ControlService, ControlSnapshot,
     DeviceIdentity, KernelBuildIdentity, KernelFacts, KernelMutationStatus, KernelRelease,
     KernelSupport, KernelVersion, LegacyAddressSynchronization, LegacyArtifactReadiness,
-    LegacyArtifactResolution, LegacyBridgeFacts, LegacyIntent, LegacyMutationGate,
-    LegacyMutationWriter, LegacyRuleBackend, MIN_SUPPORTED_KERNEL, NetworkNamespaceIdentity,
-    Observation, OperationReport, Reason, SecurityPatchLevel, SelinuxMode, SelinuxPolicyIdentity,
-    Sha256Digest, ToolId, VendorBuildIdentity, VerifiedBootIdentity, VerifiedBootState,
+    LegacyArtifactResolution, LegacyBridgeFacts, LegacyMutationWriter, LegacyRuleBackend,
+    MIN_SUPPORTED_KERNEL, MutationGate, NetworkNamespaceIdentity, Observation, OperationReport,
+    Reason, RuntimeIntent, SecurityPatchLevel, SelinuxMode, SelinuxPolicyIdentity, Sha256Digest,
+    ToolId, VendorBuildIdentity, VerifiedBootIdentity, VerifiedBootState,
 };
 use flux_platform::Uid;
 use serde::{Deserialize, Serialize};
@@ -333,10 +333,10 @@ where
 
         let reason = reason.into();
         let intent = match action {
-            WireAction::Start => LegacyIntent::Running { reason },
-            WireAction::Stop => LegacyIntent::Stopped { reason },
-            WireAction::Restart | WireAction::Reload => LegacyIntent::Reload { reason },
-            WireAction::Resync => LegacyIntent::ResyncAddresses { reason },
+            WireAction::Start => RuntimeIntent::Running { reason },
+            WireAction::Stop => RuntimeIntent::Stopped { reason },
+            WireAction::Restart | WireAction::Reload => RuntimeIntent::Reload { reason },
+            WireAction::Resync => RuntimeIntent::ResyncAddresses { reason },
         };
         match self
             .control
@@ -362,13 +362,13 @@ where
         match (event_name, event_type) {
             ("disable", "n") => self.handle_event_intent(
                 request_id,
-                LegacyIntent::Stopped {
+                RuntimeIntent::Stopped {
                     reason: Reason::DisableCreated,
                 },
             ),
             ("disable", "d") => self.handle_event_intent(
                 request_id,
-                LegacyIntent::Running {
+                RuntimeIntent::Running {
                     reason: Reason::DisableRemoved,
                 },
             ),
@@ -385,7 +385,7 @@ where
         }
     }
 
-    fn handle_event_intent(&self, request_id: u64, intent: LegacyIntent) -> Vec<u8> {
+    fn handle_event_intent(&self, request_id: u64, intent: RuntimeIntent) -> Vec<u8> {
         if let Some(response) = self.mutation_gate_response(request_id) {
             return response;
         }
@@ -437,9 +437,9 @@ where
     }
 
     fn mutation_gate_response(&self, request_id: u64) -> Option<Vec<u8>> {
-        match self.capability_profile.legacy_mutation_gate() {
-            LegacyMutationGate::Allowed => None,
-            LegacyMutationGate::ReadOnly {
+        match self.capability_profile.mutation_gate() {
+            MutationGate::Allowed => None,
+            MutationGate::ReadOnly {
                 kernel: KernelMutationStatus::Unsupported { found, minimum },
                 ..
             } => Some(encode_response(ResponseEnvelope::error(
@@ -447,7 +447,7 @@ where
                 "unsupported_kernel",
                 format!("kernel {found} is below minimum {minimum}"),
             ))),
-            LegacyMutationGate::ReadOnly { .. } => Some(encode_response(ResponseEnvelope::error(
+            MutationGate::ReadOnly { .. } => Some(encode_response(ResponseEnvelope::error(
                 request_id,
                 "read_only_profile",
                 "capability profile is read-only because kernel or boot identity is unverified"
@@ -897,7 +897,7 @@ impl From<&CapabilityProfile> for WireCapabilityProfile {
                 release: wire_kernel_release(profile.kernel().release()),
                 version: wire_kernel_version(profile.kernel().version()),
                 minimum: MIN_SUPPORTED_KERNEL.to_string(),
-                gate: profile.legacy_mutation_gate().into(),
+                gate: profile.mutation_gate().into(),
             },
             selinux: wire_selinux(profile.selinux()),
             legacy_bridge: profile.legacy_bridge().into(),
@@ -975,7 +975,7 @@ impl TryFrom<WireCapabilityProfile> for CapabilityProfile {
             selinux,
             legacy_bridge,
         );
-        if gate != profile.legacy_mutation_gate().into() {
+        if gate != profile.mutation_gate().into() {
             return Err(invalid_capability_profile(
                 "reported mutation gate disagrees with kernel and boot observations".to_owned(),
             ));
@@ -1212,7 +1212,7 @@ struct WireKernelFacts {
     release: WireObservation<String>,
     version: WireObservation<String>,
     minimum: String,
-    gate: WireLegacyMutationGate,
+    gate: WireMutationGate,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1391,7 +1391,7 @@ impl From<WireLegacyArtifactResolution> for LegacyArtifactResolution {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
-enum WireLegacyMutationGate {
+enum WireMutationGate {
     Allowed,
     ReadOnly {
         kernel: WireKernelMutationStatus,
@@ -1399,11 +1399,11 @@ enum WireLegacyMutationGate {
     },
 }
 
-impl From<LegacyMutationGate> for WireLegacyMutationGate {
-    fn from(gate: LegacyMutationGate) -> Self {
+impl From<MutationGate> for WireMutationGate {
+    fn from(gate: MutationGate) -> Self {
         match gate {
-            LegacyMutationGate::Allowed => Self::Allowed,
-            LegacyMutationGate::ReadOnly {
+            MutationGate::Allowed => Self::Allowed,
+            MutationGate::ReadOnly {
                 kernel,
                 boot_identity,
             } => Self::ReadOnly {
@@ -1824,13 +1824,13 @@ struct WireIntent {
     reason: WireReason,
 }
 
-impl From<LegacyIntent> for WireIntent {
-    fn from(intent: LegacyIntent) -> Self {
+impl From<RuntimeIntent> for WireIntent {
+    fn from(intent: RuntimeIntent) -> Self {
         let (action, reason) = match intent {
-            LegacyIntent::Running { reason } => (WireAction::Start, reason),
-            LegacyIntent::Stopped { reason } => (WireAction::Stop, reason),
-            LegacyIntent::Reload { reason } => (WireAction::Reload, reason),
-            LegacyIntent::ResyncAddresses { reason } => (WireAction::Resync, reason),
+            RuntimeIntent::Running { reason } => (WireAction::Start, reason),
+            RuntimeIntent::Stopped { reason } => (WireAction::Stop, reason),
+            RuntimeIntent::Reload { reason } => (WireAction::Reload, reason),
+            RuntimeIntent::ResyncAddresses { reason } => (WireAction::Resync, reason),
         };
         Self {
             action,
@@ -1839,7 +1839,7 @@ impl From<LegacyIntent> for WireIntent {
     }
 }
 
-impl From<WireIntent> for LegacyIntent {
+impl From<WireIntent> for RuntimeIntent {
     fn from(intent: WireIntent) -> Self {
         let reason = intent.reason.into();
         match intent.action {
@@ -1917,13 +1917,13 @@ fn encode_fixed_error_response(request_id: u64, code: &'static str, message: Str
 
 pub(crate) fn encode_control_request(
     request_id: u64,
-    intent: LegacyIntent,
+    intent: RuntimeIntent,
 ) -> Result<Vec<u8>, ControlError> {
     let (action, reason) = match intent {
-        LegacyIntent::Running { reason } => (WireAction::Start, reason),
-        LegacyIntent::Stopped { reason } => (WireAction::Stop, reason),
-        LegacyIntent::Reload { reason } => (WireAction::Reload, reason),
-        LegacyIntent::ResyncAddresses { reason } => (WireAction::Resync, reason),
+        RuntimeIntent::Running { reason } => (WireAction::Start, reason),
+        RuntimeIntent::Stopped { reason } => (WireAction::Stop, reason),
+        RuntimeIntent::Reload { reason } => (WireAction::Reload, reason),
+        RuntimeIntent::ResyncAddresses { reason } => (WireAction::Resync, reason),
     };
     encode_request(RequestEnvelope {
         protocol_version: PROTOCOL_VERSION,
@@ -2007,7 +2007,7 @@ pub(crate) fn encode_explain_request(request_id: u64) -> Result<Vec<u8>, Control
 pub(crate) fn decode_control_response(
     packet: &[u8],
     expected_request_id: u64,
-    intent: LegacyIntent,
+    intent: RuntimeIntent,
 ) -> Result<OperationReport, ControlError> {
     let response = decode_response(packet, expected_request_id)?;
     match response.result {
@@ -2030,11 +2030,11 @@ pub(crate) fn decode_control_response(
 fn validate_operation_report(report: OperationReport) -> Result<OperationReport, ControlError> {
     let valid = matches!(
         (report.intent, report.address_resync),
-        (LegacyIntent::ResyncAddresses { .. }, Some(_))
+        (RuntimeIntent::ResyncAddresses { .. }, Some(_))
             | (
-                LegacyIntent::Running { .. }
-                    | LegacyIntent::Stopped { .. }
-                    | LegacyIntent::Reload { .. },
+                RuntimeIntent::Running { .. }
+                    | RuntimeIntent::Stopped { .. }
+                    | RuntimeIntent::Reload { .. },
                 None
             )
     );
@@ -2297,8 +2297,8 @@ mod tests {
 
     use flux_core::{
         CapabilityProfile, CapabilityProfileRevision, ConfigurationChangeClient,
-        ConfigurationChangeReport, ControlClient, ControlSnapshotSource, LegacyIntent,
-        OperationReport,
+        ConfigurationChangeReport, ControlClient, ControlSnapshotSource, OperationReport,
+        RuntimeIntent,
     };
     use flux_testkit::CapabilityProfileFixture;
 
@@ -2311,11 +2311,11 @@ mod tests {
     struct TestControl;
 
     impl ControlClient for TestControl {
-        fn submit_and_wait(&self, intent: LegacyIntent) -> Result<OperationReport, ControlError> {
+        fn submit_and_wait(&self, intent: RuntimeIntent) -> Result<OperationReport, ControlError> {
             Ok(OperationReport {
                 intent,
                 revision: 1,
-                address_resync: matches!(intent, LegacyIntent::ResyncAddresses { .. })
+                address_resync: matches!(intent, RuntimeIntent::ResyncAddresses { .. })
                     .then_some(AddressResyncDisposition::AcceptedDeferred),
             })
         }
@@ -2344,9 +2344,9 @@ mod tests {
         fs::write(run.join("flux.log"), "one\ntwo\nthree\n").expect("write runtime log");
         let inspection = Arc::new(ProcessInspectionSource::new(
             directory.path().join("flux.toml"),
-            run.join("engine.manifest"),
             run.join("flux.log"),
             run.join("fluxd.log"),
+            run.join("sing-box.log"),
         ));
         let handler = ProtocolHandler::with_runtime_subscription_and_inspection(
             Arc::new(CapabilityProfileFixture::supported()),

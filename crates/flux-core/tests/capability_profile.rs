@@ -3,14 +3,14 @@ use flux_core::{
     CAPABILITY_PROFILE_SCHEMA_VERSION, CapabilityProfile, CapabilityProfileRevision,
     DeviceIdentity, DeviceIdentityError, IdentityTextErrorKind, KernelBuildIdentity, KernelFacts,
     KernelRelease, KernelVersion, LegacyAddressSynchronization, LegacyArtifactReadiness,
-    LegacyArtifactResolution, LegacyBridgeFacts, LegacyMutationGate, LegacyMutationWriter,
-    LegacyRuleBackend, NetworkNamespaceIdentity, Observation, ReviewedPolicySelector,
+    LegacyArtifactResolution, LegacyBridgeFacts, LegacyMutationWriter, LegacyRuleBackend,
+    MutationGate, NetworkNamespaceIdentity, Observation, ReviewedPolicySelector,
     SecurityPatchLevel, SelinuxMode, SelinuxPolicyIdentity, Sha256Digest, ToolId,
     VendorBuildIdentity, VerifiedBootIdentity, VerifiedBootState,
 };
 
 #[test]
-fn verified_boot_and_supported_kernel_allow_the_legacy_bridge_to_mutate() {
+fn verified_boot_and_supported_kernel_allow_runtime_mutation() {
     let profile = CapabilityProfile::initial(
         Observation::Verified(
             BootIdentity::parse("01234567-89ab-cdef-0123-456789abcdef")
@@ -30,7 +30,7 @@ fn verified_boot_and_supported_kernel_allow_the_legacy_bridge_to_mutate() {
         profile.kernel().version(),
         &Observation::Verified(KernelVersion::new(5, 10, 198))
     );
-    assert_eq!(profile.legacy_mutation_gate(), LegacyMutationGate::Allowed);
+    assert_eq!(profile.mutation_gate(), MutationGate::Allowed);
 }
 
 #[test]
@@ -50,8 +50,8 @@ fn malformed_kernel_keeps_the_raw_release_and_makes_the_profile_read_only() {
     assert_eq!(profile.kernel().release(), &Observation::Verified(release));
     assert_eq!(profile.kernel().version(), &Observation::Malformed);
     assert_eq!(
-        profile.legacy_mutation_gate(),
-        LegacyMutationGate::ReadOnly {
+        profile.mutation_gate(),
+        MutationGate::ReadOnly {
             kernel: flux_core::KernelMutationStatus::Unverified,
             boot_identity: flux_core::BootIdentityMutationStatus::Verified,
         }

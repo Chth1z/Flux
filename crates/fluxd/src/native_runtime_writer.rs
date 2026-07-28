@@ -13,8 +13,8 @@ use flux_platform::{NativeXtablesCaptureConverger, NativeXtablesCaptureTarget};
 
 use crate::generation_engine_config::AddressReconciledGenerationInputs;
 use crate::runtime_coordinator::{
-    AddressResyncStrategy, LegacyRuntimeWriter, PreparedGeneration, PublishedRuntimeState,
-    RuntimeCoordinator, RuntimeFunctionalCanary,
+    AddressResyncStrategy, PreparedGeneration, PublishedRuntimeState, RuntimeCoordinator,
+    RuntimeFunctionalCanary, RuntimeWriter,
 };
 use crate::subscription::ValidatedSubscriptionEngineConfig;
 use crate::{EngineSpec, EngineSupervisor};
@@ -45,11 +45,13 @@ impl<T> PreparedNativeGeneration<T> {
         }
     }
 
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn runtime(&self) -> &PreparedGeneration {
         &self.runtime
     }
 
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn target(&self) -> &T {
         &self.target
@@ -360,7 +362,7 @@ where
     ))
 }
 
-impl<C, S> LegacyRuntimeWriter for NativeCoordinatorWriter<C, S>
+impl<C, S> RuntimeWriter for NativeCoordinatorWriter<C, S>
 where
     C: NativeCaptureConvergence,
     C::Identity: NativeCoordinatorGenerationIdentity,
@@ -534,8 +536,8 @@ mod tests {
     use std::time::Duration;
 
     use flux_core::{
-        InterfaceAddressFlags, InterfaceAddressRecord, InterfaceIndex, LegacyDispatcher,
-        LegacyIntent, NetworkInventoryTracker,
+        InterfaceAddressFlags, InterfaceAddressRecord, InterfaceIndex, NetworkInventoryTracker,
+        RuntimeDispatcher, RuntimeIntent,
     };
     use flux_platform::{
         NativeCaptureConvergenceReport, ReadinessEvidence, SingBoxLaunchSpec, SingBoxLauncher,
@@ -909,7 +911,7 @@ mod tests {
         let mut coordinator = coordinator(writer, &events);
 
         coordinator
-            .execute(&LegacyIntent::Running {
+            .execute(&RuntimeIntent::Running {
                 reason: Reason::Boot,
             })
             .expect("native start converges");
@@ -953,14 +955,14 @@ mod tests {
         events.lock().expect("native events lock").clear();
         let mut coordinator = coordinator(writer, &events);
         coordinator
-            .execute(&LegacyIntent::Running {
+            .execute(&RuntimeIntent::Running {
                 reason: Reason::Boot,
             })
             .expect("initial native Generation converges");
         events.lock().expect("native events lock").clear();
 
         coordinator
-            .execute(&LegacyIntent::Reload {
+            .execute(&RuntimeIntent::Reload {
                 reason: Reason::Fluxctl,
             })
             .expect_err("injected native candidate failure is reported");
@@ -1019,7 +1021,7 @@ mod tests {
         events.lock().expect("native events lock").clear();
         let mut coordinator = coordinator(writer, &events).with_address_reconciler(reconciler);
         coordinator
-            .execute(&LegacyIntent::Running {
+            .execute(&RuntimeIntent::Running {
                 reason: Reason::Boot,
             })
             .expect("initial native Generation converges");
@@ -1056,14 +1058,14 @@ mod tests {
         events.lock().expect("native events lock").clear();
         let mut coordinator = coordinator(writer, &events).with_address_reconciler(reconciler);
         coordinator
-            .execute(&LegacyIntent::Running {
+            .execute(&RuntimeIntent::Running {
                 reason: Reason::Boot,
             })
             .expect("initial native Generation converges");
         events.lock().expect("native events lock").clear();
 
         let completion = coordinator
-            .execute(&LegacyIntent::ResyncAddresses {
+            .execute(&RuntimeIntent::ResyncAddresses {
                 reason: Reason::Fluxctl,
             })
             .expect("missing inventory is a deferred resync");
@@ -1087,7 +1089,7 @@ mod tests {
         events.lock().expect("native events lock").clear();
         let mut coordinator = coordinator(writer, &events).with_address_reconciler(reconciler);
         coordinator
-            .execute(&LegacyIntent::Running {
+            .execute(&RuntimeIntent::Running {
                 reason: Reason::Boot,
             })
             .expect("initial native Generation converges");
@@ -1095,7 +1097,7 @@ mod tests {
         inventory_source.publish(Some(complete_inventory()));
 
         let completion = coordinator
-            .execute(&LegacyIntent::ResyncAddresses {
+            .execute(&RuntimeIntent::ResyncAddresses {
                 reason: Reason::Fluxctl,
             })
             .expect("fresh no-change resync");
@@ -1126,7 +1128,7 @@ mod tests {
         events.lock().expect("native events lock").clear();
         let mut coordinator = coordinator(writer, &events).with_address_reconciler(reconciler);
         coordinator
-            .execute(&LegacyIntent::Running {
+            .execute(&RuntimeIntent::Running {
                 reason: Reason::Boot,
             })
             .expect("initial native Generation converges");
@@ -1134,7 +1136,7 @@ mod tests {
         inventory_source.publish(Some(complete_inventory()));
 
         let completion = coordinator
-            .execute(&LegacyIntent::ResyncAddresses {
+            .execute(&RuntimeIntent::ResyncAddresses {
                 reason: Reason::Fluxctl,
             })
             .expect("address successor converges synchronously");
@@ -1181,12 +1183,12 @@ mod tests {
         events.lock().expect("native events lock").clear();
         let mut coordinator = coordinator(writer, &events).with_address_reconciler(reconciler);
         coordinator
-            .execute(&LegacyIntent::Running {
+            .execute(&RuntimeIntent::Running {
                 reason: Reason::Boot,
             })
             .expect("initial native Generation converges");
         coordinator
-            .execute(&LegacyIntent::Reload {
+            .execute(&RuntimeIntent::Reload {
                 reason: Reason::Fluxctl,
             })
             .expect_err("injected candidate failure degrades the active runtime");
@@ -1198,7 +1200,7 @@ mod tests {
         inventory_source.publish(Some(complete_inventory()));
 
         let completion = coordinator
-            .execute(&LegacyIntent::ResyncAddresses {
+            .execute(&RuntimeIntent::ResyncAddresses {
                 reason: Reason::Fluxctl,
             })
             .expect("unready runtime queues address reconciliation");
@@ -1226,14 +1228,14 @@ mod tests {
         events.lock().expect("native events lock").clear();
         let mut coordinator = coordinator(writer, &events);
         coordinator
-            .execute(&LegacyIntent::Running {
+            .execute(&RuntimeIntent::Running {
                 reason: Reason::Boot,
             })
             .expect("native start converges");
         events.lock().expect("native events lock").clear();
 
         coordinator
-            .execute(&LegacyIntent::Stopped {
+            .execute(&RuntimeIntent::Stopped {
                 reason: Reason::Fluxctl,
             })
             .expect("native stop converges");

@@ -8,9 +8,11 @@ use flux_core::{
     compile_shadow_capture_program,
 };
 
+use super::compiler::EngineConfigArtifact;
+#[cfg(test)]
 use super::compiler::{
-    EngineConfigArtifact, EngineConfigCompileError, EngineConfigCompileErrorKind,
-    TproxyEngineConfigRequest, compile_tproxy_engine_config,
+    EngineConfigCompileError, EngineConfigCompileErrorKind, TproxyEngineConfigRequest,
+    compile_tproxy_engine_config,
 };
 
 /// Complete pure inputs for compiling one immutable Desired State snapshot.
@@ -145,21 +147,19 @@ impl DesiredStateCaptureArtifacts {
 }
 
 impl DesiredStateArtifacts {
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn desired_state(&self) -> &FluxConfig {
         &self.desired_state
     }
 
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn engine_config(&self) -> &EngineConfigArtifact {
         self.engine_source.artifact()
     }
 
-    #[must_use]
-    pub(crate) const fn engine_source(&self) -> &SelectedEngineSource {
-        &self.engine_source
-    }
-
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn capture(&self) -> &ShadowCompilationReport {
         &self.capture
@@ -170,6 +170,7 @@ impl DesiredStateArtifacts {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DesiredStateCompileErrorKind {
     ApplicationModeMismatch {
@@ -190,6 +191,7 @@ pub(crate) enum DesiredStateCompileError {
         configured: CaptureApplicationMode,
         resolved: CaptureApplicationMode,
     },
+    #[cfg(test)]
     EngineConfig(EngineConfigCompileError),
     EngineSourceListenerPortMismatch {
         configured: NonZeroU16,
@@ -199,6 +201,7 @@ pub(crate) enum DesiredStateCompileError {
 }
 
 impl DesiredStateCompileError {
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn kind(&self) -> DesiredStateCompileErrorKind {
         match self {
@@ -232,6 +235,7 @@ impl fmt::Display for DesiredStateCompileError {
                 formatter,
                 "resolved application mode {resolved:?} does not match configured mode {configured:?}"
             ),
+            #[cfg(test)]
             Self::EngineConfig(error) => error.fmt(formatter),
             Self::EngineSourceListenerPortMismatch {
                 configured,
@@ -250,6 +254,7 @@ impl Error for DesiredStateCompileError {
         match self {
             Self::ApplicationModeMismatch { .. }
             | Self::EngineSourceListenerPortMismatch { .. } => None,
+            #[cfg(test)]
             Self::EngineConfig(error) => Some(error),
             Self::Capture(error) => Some(error),
         }
@@ -257,6 +262,7 @@ impl Error for DesiredStateCompileError {
 }
 
 /// Compile one Desired State without I/O, subprocesses, or activation authority.
+#[cfg(test)]
 pub(crate) fn compile_desired_state(
     request: DesiredStateCompileRequest,
     engine_template: &[u8],

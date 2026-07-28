@@ -2,16 +2,12 @@ use std::error::Error;
 use std::fmt;
 use std::io;
 use std::num::{NonZeroU32, NonZeroU64};
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use flux_core::{
-    AddressResyncDisposition, ControlError, DispatcherCompletion, FluxConfig, LegacyDispatcher,
-    LegacyIntent, Reason,
-};
-use flux_platform::{
-    DispatcherPhaseCommand, PhaseDispatcherError, PhaseDispatcherPaths, ProcessPhaseDispatcher,
+    AddressResyncDisposition, ControlError, DispatcherCompletion, Reason, RuntimeDispatcher,
+    RuntimeIntent,
 };
 
 use crate::engine_supervisor::{
@@ -24,13 +20,9 @@ use crate::functional_canary::{
     FunctionalCanaryError, FunctionalCanaryGateMode, UnqualifiedFunctionalCanaryExecution,
     UnqualifiedFunctionalCanaryExecutor,
 };
-use crate::generation_engine_config::{
-    AddressReconciler, AddressReconciliationOutcome, AdmittedGeneration,
-    BridgePreparationPublication, CanonicalEngineConfigPreparationError,
-    DesiredStateEngineBindingError, EngineConfigBindingError, EngineConfigCompileError,
-    PreparedGenerationRecord, bind_engine_config_to_spec, bind_engine_spec_to_desired_state,
-    publish_bridge_preparation, publish_validated_subscription_bridge_preparation,
-};
+use crate::generation_engine_config::{AddressReconciler, AddressReconciliationOutcome};
+#[cfg(test)]
+use crate::generation_engine_config::{AdmittedGeneration, PreparedGenerationRecord};
 use crate::runtime_logging::{LogSeverity, runtime_log};
 use crate::subscription::{
     SubscriptionRefreshCompletion, SubscriptionRefreshDecision, SubscriptionRefreshError,
@@ -38,10 +30,9 @@ use crate::subscription::{
 };
 use crate::subscription::{SubscriptionRefreshRuntime, ValidatedSubscriptionEngineConfig};
 use crate::{
-    CaptureObservation, DesiredEngine, EngineManifest, EngineManifestError, EnginePhase,
-    EngineReport, EngineSnapshot, EngineSpec, EngineSupervisor, EngineSupervisorError,
-    RuntimeCaptureState, RuntimeEngineState, RuntimeFailure, RuntimePhase, RuntimeSnapshot,
-    RuntimeSnapshotSource, RuntimeVerificationState,
+    CaptureObservation, DesiredEngine, EnginePhase, EngineReport, EngineSnapshot, EngineSpec,
+    EngineSupervisor, EngineSupervisorError, RuntimeCaptureState, RuntimeEngineState,
+    RuntimeFailure, RuntimePhase, RuntimeSnapshot, RuntimeSnapshotSource, RuntimeVerificationState,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -69,18 +60,15 @@ impl PreparedGeneration {
     }
 }
 
-/// Read-only A2 projection consumed at the coordinator seam without entering the legacy writer.
-#[allow(
-    dead_code,
-    reason = "A2 keeps admitted Generation inspection disconnected from production mutation"
-)]
+/// Read-only projection of an admitted native Generation.
+#[cfg(test)]
 pub(crate) fn inspect_admitted_generation(
     generation: &AdmittedGeneration,
 ) -> PreparedGenerationRecord {
     PreparedGenerationRecord::from_admitted(generation)
 }
 
-pub(crate) trait LegacyRuntimeWriter: Send + 'static {
+pub(crate) trait RuntimeWriter: Send + 'static {
     type Error: Error + Send + Sync + 'static;
 
     fn prepare(&mut self, reason: Reason) -> Result<PreparedGeneration, Self::Error>;
@@ -207,245 +195,6 @@ impl RuntimeFunctionalCanary {
     }
 }
 
-#[derive(Debug)]
-pub(crate) enum ProcessRuntimeWriterError {
-    CanonicalConfig(CanonicalEngineConfigPreparationError),
-    Phase(PhaseDispatcherError),
-    Manifest {
-        path: PathBuf,
-        source: Box<EngineManifestError>,
-    },
-    Binding(EngineConfigBindingError),
-    DesiredStateBinding(DesiredStateEngineBindingError),
-    SubscriptionArtifact(EngineConfigCompileError),
-    SubscriptionUnavailable,
-}
-
-impl fmt::Display for ProcessRuntimeWriterError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::CanonicalConfig(error) => error.fmt(formatter),
-            Self::Phase(error) => error.fmt(formatter),
-            Self::Manifest { path, source } => {
-                write!(
-                    formatter,
-                    "cannot load engine manifest {}: {source}",
-                    path.display()
-                )
-            }
-            Self::Binding(error) => error.fmt(formatter),
-            Self::DesiredStateBinding(error) => error.fmt(formatter),
-            Self::SubscriptionArtifact(error) => error.fmt(formatter),
-            Self::SubscriptionUnavailable => formatter
-                .write_str("enabled subscription intent has no accepted validated engine snapshot"),
-        }
-    }
-}
-
-impl Error for ProcessRuntimeWriterError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::CanonicalConfig(error) => Some(error),
-            Self::Phase(error) => Some(error),
-            Self::Manifest { source, .. } => Some(source),
-            Self::Binding(error) => Some(error),
-            Self::DesiredStateBinding(error) => Some(error),
-            Self::SubscriptionArtifact(error) => Some(error),
-            Self::SubscriptionUnavailable => None,
-        }
-    }
-}
-
-pub(crate) struct ProcessRuntimeWriter {
-    dispatcher: ProcessPhaseDispatcher,
-    manifest_path: PathBuf,
-    desired_state_path: PathBuf,
-    engine_config_path: PathBuf,
-    bridge_environment_path: PathBuf,
-    accepted_subscription: Option<ValidatedSubscriptionEngineConfig>,
-    pending_subscription: Option<(NonZeroU32, Option<ValidatedSubscriptionEngineConfig>)>,
-}
-
-impl ProcessRuntimeWriter {
-    pub(crate) fn new(
-        paths: PhaseDispatcherPaths,
-        manifest_path: impl AsRef<Path>,
-        desired_state_path: impl AsRef<Path>,
-        engine_config_path: impl AsRef<Path>,
-        bridge_environment_path: impl AsRef<Path>,
-    ) -> Self {
-        Self {
-            dispatcher: ProcessPhaseDispatcher::new(paths),
-            manifest_path: manifest_path.as_ref().to_path_buf(),
-            desired_state_path: desired_state_path.as_ref().to_path_buf(),
-            engine_config_path: engine_config_path.as_ref().to_path_buf(),
-            bridge_environment_path: bridge_environment_path.as_ref().to_path_buf(),
-            accepted_subscription: None,
-            pending_subscription: None,
-        }
-    }
-
-    #[must_use]
-    pub(crate) fn with_subscription_source(
-        mut self,
-        source: Option<ValidatedSubscriptionEngineConfig>,
-    ) -> Self {
-        self.accepted_subscription = source;
-        self
-    }
-
-    fn execute_phase(
-        &mut self,
-        command: DispatcherPhaseCommand,
-    ) -> Result<(), ProcessRuntimeWriterError> {
-        self.dispatcher
-            .execute(command)
-            .map_err(ProcessRuntimeWriterError::Phase)
-    }
-
-    fn prepare_publication(
-        &mut self,
-        publication: BridgePreparationPublication,
-    ) -> Result<PreparedGeneration, ProcessRuntimeWriterError> {
-        self.execute_phase(DispatcherPhaseCommand::Prepare)?;
-        let prepared = EngineManifest::load_prepared(&self.manifest_path).map_err(|source| {
-            ProcessRuntimeWriterError::Manifest {
-                path: self.manifest_path.clone(),
-                source: Box::new(source),
-            }
-        })?;
-        let (desired_state, artifact, _bridge_environment) = publication.into_parts();
-        let generation = prepared.generation();
-        let spec = bind_engine_spec_to_desired_state(&desired_state, prepared.into_engine())
-            .map_err(ProcessRuntimeWriterError::DesiredStateBinding)?;
-        let _binding = bind_engine_config_to_spec(artifact, &spec)
-            .map_err(ProcessRuntimeWriterError::Binding)?;
-        Ok(PreparedGeneration {
-            id: generation,
-            spec,
-        })
-    }
-
-    fn publish_subscription_preparation(
-        &self,
-        source: &ValidatedSubscriptionEngineConfig,
-    ) -> Result<BridgePreparationPublication, ProcessRuntimeWriterError> {
-        let artifact = source
-            .reconstruct_artifact(source.desired_state().listener().port())
-            .map_err(ProcessRuntimeWriterError::SubscriptionArtifact)?;
-        publish_validated_subscription_bridge_preparation(
-            &self.desired_state_path,
-            source.desired_state(),
-            artifact,
-            &self.engine_config_path,
-            &self.bridge_environment_path,
-        )
-        .map_err(ProcessRuntimeWriterError::CanonicalConfig)
-    }
-
-    fn commit_pending_subscription(&mut self, phase: PublishedRuntimeState) {
-        let Some((candidate, source)) = self.pending_subscription.take() else {
-            return;
-        };
-        if matches!(
-            phase,
-            PublishedRuntimeState::Running { generation } if generation == candidate
-        ) {
-            self.accepted_subscription = source;
-        }
-    }
-}
-
-impl LegacyRuntimeWriter for ProcessRuntimeWriter {
-    type Error = ProcessRuntimeWriterError;
-
-    fn prepare(&mut self, _reason: Reason) -> Result<PreparedGeneration, Self::Error> {
-        let current = FluxConfig::load(&self.desired_state_path).map_err(|source| {
-            ProcessRuntimeWriterError::CanonicalConfig(
-                CanonicalEngineConfigPreparationError::DesiredState {
-                    path: self.desired_state_path.clone(),
-                    source,
-                },
-            )
-        })?;
-        let source = if current.subscription().enabled() {
-            Some(
-                self.accepted_subscription
-                    .clone()
-                    .ok_or(ProcessRuntimeWriterError::SubscriptionUnavailable)?,
-            )
-        } else {
-            None
-        };
-        let publication = match source.as_ref() {
-            Some(source) => self.publish_subscription_preparation(source)?,
-            None => publish_bridge_preparation(
-                &self.desired_state_path,
-                &self.engine_config_path,
-                &self.bridge_environment_path,
-            )
-            .map_err(ProcessRuntimeWriterError::CanonicalConfig)?,
-        };
-        let prepared = self.prepare_publication(publication)?;
-        self.pending_subscription = Some((prepared.id, source));
-        Ok(prepared)
-    }
-
-    fn prepare_subscription(
-        &mut self,
-        source: &ValidatedSubscriptionEngineConfig,
-    ) -> Result<Option<PreparedGeneration>, Self::Error> {
-        let publication = self.publish_subscription_preparation(source)?;
-        let prepared = self.prepare_publication(publication)?;
-        self.pending_subscription = Some((prepared.id, Some(source.clone())));
-        Ok(Some(prepared))
-    }
-
-    fn accept_deferred_subscription(&mut self, source: ValidatedSubscriptionEngineConfig) -> bool {
-        self.pending_subscription = None;
-        self.accepted_subscription = Some(source);
-        true
-    }
-
-    fn capture_start(&mut self, generation: &PreparedGeneration) -> Result<(), Self::Error> {
-        self.dispatcher
-            .execute_for_generation(DispatcherPhaseCommand::CaptureStart, generation.id)
-            .map_err(ProcessRuntimeWriterError::Phase)
-    }
-
-    fn capture_stop(&mut self) -> Result<(), Self::Error> {
-        self.execute_phase(DispatcherPhaseCommand::CaptureStop)
-    }
-
-    fn verify_capture(&mut self, generation: &PreparedGeneration) -> Result<(), Self::Error> {
-        self.dispatcher
-            .execute_for_generation(DispatcherPhaseCommand::CaptureVerify, generation.id)
-            .map_err(ProcessRuntimeWriterError::Phase)
-    }
-
-    fn publish(&mut self, phase: PublishedRuntimeState) -> Result<(), Self::Error> {
-        let command = match phase {
-            PublishedRuntimeState::Running { generation } => {
-                self.dispatcher
-                    .execute_for_generation(DispatcherPhaseCommand::StateRunning, generation)
-                    .map_err(ProcessRuntimeWriterError::Phase)?;
-                self.commit_pending_subscription(phase);
-                return Ok(());
-            }
-            PublishedRuntimeState::Stopped => DispatcherPhaseCommand::StateStopped,
-            PublishedRuntimeState::Failed => DispatcherPhaseCommand::StateFailed,
-        };
-        self.execute_phase(command)?;
-        self.commit_pending_subscription(phase);
-        Ok(())
-    }
-
-    fn resync_addresses(&mut self) -> Result<AddressResyncDisposition, Self::Error> {
-        self.execute_phase(DispatcherPhaseCommand::AddressResync)?;
-        Ok(AddressResyncDisposition::AcceptedDeferred)
-    }
-}
-
 impl EngineRuntime for EngineSupervisor {
     fn reconcile(
         &mut self,
@@ -549,7 +298,7 @@ pub(crate) struct RuntimeCoordinator<W, E = EngineSupervisor> {
 
 impl<W, E> RuntimeCoordinator<W, E>
 where
-    W: LegacyRuntimeWriter,
+    W: RuntimeWriter,
     E: EngineRuntime,
 {
     pub(crate) fn with_dependencies(
@@ -1526,7 +1275,7 @@ where
         let ownership = std::mem::replace(&mut self.ownership, RuntimeOwnership::Stopped);
         let (generation, capture) = match ownership {
             RuntimeOwnership::Stopped => {
-                self.publish_legacy_state(
+                self.publish_runtime_state(
                     PublishedRuntimeState::Stopped,
                     "publish stopped state",
                     "retry runtime reconciliation",
@@ -1733,7 +1482,7 @@ where
             }
         };
         self.ownership = RuntimeOwnership::Stopped;
-        self.publish_legacy_state(terminal, publish_operation, publish_recovery)?;
+        self.publish_runtime_state(terminal, publish_operation, publish_recovery)?;
         let verification = match terminal {
             PublishedRuntimeState::Stopped => RuntimeVerificationState::StructuralOnly,
             PublishedRuntimeState::Failed | PublishedRuntimeState::Running { .. } => {
@@ -1755,7 +1504,7 @@ where
         let ownership = std::mem::replace(&mut self.ownership, RuntimeOwnership::Stopped);
         let settlement = match ownership {
             RuntimeOwnership::Stopped => self
-                .publish_legacy_state(
+                .publish_runtime_state(
                     PublishedRuntimeState::Failed,
                     "publish failed state after rollback failure",
                     "retry failed-state publication while capture remains detached",
@@ -2052,7 +1801,7 @@ where
             FunctionalCanaryDisposition::StructuralOnlyCompatibility
             | FunctionalCanaryDisposition::AttemptPassedUnqualified(_) => {}
         }
-        self.publish_legacy_state(
+        self.publish_runtime_state(
             PublishedRuntimeState::Running {
                 generation: qualification.generation,
             },
@@ -2061,7 +1810,7 @@ where
         )
     }
 
-    fn publish_legacy_state(
+    fn publish_runtime_state(
         &mut self,
         state: PublishedRuntimeState,
         operation: &'static str,
@@ -2085,7 +1834,7 @@ where
         match state {
             PublishedRuntimeState::Running {
                 generation: pending_generation,
-            } if pending_generation == generation => self.publish_legacy_state(
+            } if pending_generation == generation => self.publish_runtime_state(
                 state,
                 "retry running state publication",
                 "retain the verified data path and retry publication",
@@ -2134,7 +1883,7 @@ where
                 ));
             }
         };
-        self.publish_legacy_state(state, operation, recovery)?;
+        self.publish_runtime_state(state, operation, recovery)?;
         let verification = match state {
             PublishedRuntimeState::Stopped => RuntimeVerificationState::StructuralOnly,
             PublishedRuntimeState::Failed | PublishedRuntimeState::Running { .. } => {
@@ -2166,7 +1915,7 @@ where
                 runtime_writer_error(
                     "resynchronize addresses",
                     source,
-                    "retry after repairing the legacy address writer",
+                    "retry after repairing the runtime writer",
                 )
             });
         }
@@ -2395,17 +2144,17 @@ where
     }
 }
 
-impl<W, E> LegacyDispatcher for RuntimeCoordinator<W, E>
+impl<W, E> RuntimeDispatcher for RuntimeCoordinator<W, E>
 where
-    W: LegacyRuntimeWriter,
+    W: RuntimeWriter,
     E: EngineRuntime,
 {
-    fn execute(&mut self, intent: &LegacyIntent) -> Result<DispatcherCompletion, ControlError> {
+    fn execute(&mut self, intent: &RuntimeIntent) -> Result<DispatcherCompletion, ControlError> {
         let result = match *intent {
-            LegacyIntent::Running { reason } => {
+            RuntimeIntent::Running { reason } => {
                 self.start(reason).map(|()| DispatcherCompletion::Completed)
             }
-            LegacyIntent::Reload { reason } => {
+            RuntimeIntent::Reload { reason } => {
                 let result = self.reload(reason);
                 if result.is_ok()
                     && reason == Reason::ConfigChanged
@@ -2415,15 +2164,15 @@ where
                 }
                 result.map(|()| DispatcherCompletion::Completed)
             }
-            LegacyIntent::Stopped { .. } => self.stop().map(|()| DispatcherCompletion::Completed),
-            LegacyIntent::ResyncAddresses { .. }
+            RuntimeIntent::Stopped { .. } => self.stop().map(|()| DispatcherCompletion::Completed),
+            RuntimeIntent::ResyncAddresses { .. }
                 if !matches!(&self.ownership, RuntimeOwnership::Engine { .. }) =>
             {
                 Ok(DispatcherCompletion::AddressResync(
                     AddressResyncDisposition::CompleteNoChange,
                 ))
             }
-            LegacyIntent::ResyncAddresses { .. } => self
+            RuntimeIntent::ResyncAddresses { .. } => self
                 .resync_active_addresses()
                 .map(DispatcherCompletion::AddressResync),
         };
@@ -2688,14 +2437,13 @@ mod tests {
     use std::io;
     use std::net::IpAddr;
     use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
-    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     use flux_core::{
-        InterfaceAddressFlags, InterfaceAddressRecord, InterfaceIndex, LegacyDispatcher,
-        LegacyIntent, NetworkInventoryTracker, Reason,
+        FluxConfig, InterfaceAddressFlags, InterfaceAddressRecord, InterfaceIndex,
+        NetworkInventoryTracker, Reason, RuntimeDispatcher, RuntimeIntent,
     };
     use flux_platform::{ReadinessEvidence, SingBoxLaunchSpec, SingBoxLauncher, SingBoxReadiness};
 
@@ -2719,9 +2467,8 @@ mod tests {
     const PACKAGED_ENGINE_TEMPLATE: &[u8] = include_bytes!("../../../conf/template.json");
 
     #[test]
-    fn maintenance_reconciles_inventory_without_invoking_the_legacy_address_writer() {
-        let (directory, _process_writer, _output_path) = process_writer_fixture(false);
-        let desired_state_path = directory.path().join("flux/conf/flux.toml");
+    fn maintenance_reconciles_inventory_without_invoking_writer_managed_resync() {
+        let (_directory, desired_state_path) = desired_state_fixture();
         let (source, reconciler) = AddressReconciler::replay(desired_state_path);
         let events = Arc::new(Mutex::new(Vec::new()));
         let writer = ScriptedWriter {
@@ -2777,7 +2524,7 @@ mod tests {
                 .lock()
                 .expect("events lock")
                 .contains(&Event::AddressesResynchronized),
-            "observed inventory must not invoke the legacy address writer"
+            "observed inventory must not invoke writer-managed address resync"
         );
 
         let fixture = EngineFixture::new();
@@ -2888,7 +2635,7 @@ mod tests {
             Duration::from_millis(100),
         );
         coordinator
-            .execute(&LegacyIntent::Running {
+            .execute(&RuntimeIntent::Running {
                 reason: Reason::Boot,
             })
             .expect("initial Generation");
@@ -3012,8 +2759,7 @@ mod tests {
     #[test]
     fn failed_runtime_maintenance_blocks_address_replacement_until_runtime_recovers() {
         let fixture = EngineFixture::new();
-        let (directory, _process_writer, _output_path) = process_writer_fixture(false);
-        let desired_state_path = directory.path().join("flux/conf/flux.toml");
+        let (_directory, desired_state_path) = desired_state_fixture();
         let (source, reconciler) = AddressReconciler::replay(desired_state_path);
         let events = Arc::new(Mutex::new(Vec::new()));
         let writer = ScriptedWriter {
@@ -3035,7 +2781,7 @@ mod tests {
         )
         .with_address_reconciler(reconciler);
         coordinator
-            .execute(&LegacyIntent::Running {
+            .execute(&RuntimeIntent::Running {
                 reason: Reason::Boot,
             })
             .expect("initial runtime converges");
@@ -3086,249 +2832,6 @@ mod tests {
     }
 
     #[test]
-    fn process_writer_publishes_and_binds_the_canonical_engine_config() {
-        let (directory, mut writer, output_path) = process_writer_fixture(false);
-
-        let prepared = writer.prepare(Reason::Boot).expect("prepared Generation");
-
-        assert_eq!(prepared.id.get(), 1);
-        assert_eq!(
-            prepared.spec.process().config,
-            directory.path().join("flux/run/generations/1/config.json")
-        );
-        assert_eq!(
-            fs::read(&output_path).expect("canonical shared config"),
-            fs::read(&prepared.spec.process().config).expect("immutable Generation config")
-        );
-        let bridge_environment =
-            fs::read_to_string(directory.path().join("flux/run/desired-state.env"))
-                .expect("Rust-owned bridge environment");
-        assert!(bridge_environment.contains("ENGINE_BINARY='"));
-        assert!(bridge_environment.contains("PROXY_PORT='1536'"));
-        assert!(!bridge_environment.contains("KFEAT_"));
-        assert_eq!(
-            prepared.spec.process().readiness,
-            SingBoxReadiness::Listener {
-                port: NonZeroU16::new(1536).unwrap(),
-            }
-        );
-    }
-
-    #[test]
-    fn process_writer_commits_subscription_source_only_after_running_publication() {
-        let (directory, mut writer, output_path) = process_writer_fixture(false);
-        replace_process_writer_desired_state(&directory, "enabled = false", "enabled = true");
-        let desired_state_path = directory.path().join("flux/conf/flux.toml");
-        let desired_state = FluxConfig::load(&desired_state_path).expect("enabled Desired State");
-        let template = fs::read(desired_state.engine().template()).expect("engine template");
-        let first_artifact = compile_tproxy_engine_config(TproxyEngineConfigRequest::new(
-            &template,
-            desired_state.listener().port(),
-        ))
-        .expect("first subscription artifact");
-        let first_source = ValidatedSubscriptionEngineConfig::for_test(
-            desired_state.clone(),
-            first_artifact,
-            [51; 32],
-            4,
-        );
-
-        let first = writer
-            .prepare_subscription(&first_source)
-            .expect("prepare first subscription")
-            .expect("process writer supports subscriptions");
-
-        assert!(writer.accepted_subscription.is_none());
-        assert_eq!(fs::read(&output_path).unwrap(), first_source.bytes());
-        writer.commit_pending_subscription(PublishedRuntimeState::Running {
-            generation: first.id,
-        });
-        assert_eq!(
-            writer
-                .accepted_subscription
-                .as_ref()
-                .map(ValidatedSubscriptionEngineConfig::snapshot_digest),
-            Some([51; 32])
-        );
-
-        let second_artifact = compile_tproxy_engine_config(TproxyEngineConfigRequest::new(
-            &template,
-            desired_state.listener().port(),
-        ))
-        .expect("second subscription artifact");
-        let second_source = ValidatedSubscriptionEngineConfig::for_test(
-            desired_state,
-            second_artifact,
-            [52; 32],
-            5,
-        );
-        fs::remove_file(directory.path().join("flux/run/generations/1/config.json"))
-            .expect("reset fixed-generation process-writer fixture");
-        writer
-            .prepare_subscription(&second_source)
-            .expect("prepare second subscription")
-            .expect("process writer supports subscriptions");
-        assert_eq!(
-            writer
-                .accepted_subscription
-                .as_ref()
-                .map(ValidatedSubscriptionEngineConfig::snapshot_digest),
-            Some([51; 32])
-        );
-
-        writer.commit_pending_subscription(PublishedRuntimeState::Failed);
-
-        assert_eq!(
-            writer
-                .accepted_subscription
-                .as_ref()
-                .map(ValidatedSubscriptionEngineConfig::snapshot_digest),
-            Some([51; 32])
-        );
-    }
-
-    #[test]
-    fn process_writer_rejects_shell_drift_from_the_canonical_engine_config() {
-        let (_directory, mut writer, _output_path) = process_writer_fixture(true);
-
-        let error = match writer.prepare(Reason::Boot) {
-            Ok(_) => panic!("shell-modified Generation config must fail binding"),
-            Err(error) => error,
-        };
-
-        assert!(matches!(error, ProcessRuntimeWriterError::Binding(_)));
-    }
-
-    #[test]
-    fn process_writer_rejects_shell_drift_from_the_desired_engine_binary() {
-        let (directory, mut writer, _output_path) = process_writer_fixture(false);
-        let replacement_binary = directory.path().join("flux/bin/sing-box-next");
-        fs::write(&replacement_binary, b"next sing-box fixture\n")
-            .expect("write replacement engine binary");
-        replace_process_writer_desired_state(
-            &directory,
-            directory
-                .path()
-                .join("flux/bin/sing-box")
-                .to_str()
-                .expect("UTF-8 original binary path"),
-            replacement_binary
-                .to_str()
-                .expect("UTF-8 replacement binary path"),
-        );
-
-        let error = match writer.prepare(Reason::Boot) {
-            Ok(_) => panic!("shell-selected engine binary must match Desired State"),
-            Err(error) => error,
-        };
-
-        assert!(matches!(
-            error,
-            ProcessRuntimeWriterError::DesiredStateBinding(DesiredStateEngineBindingError::Binary)
-        ));
-    }
-
-    #[test]
-    fn process_writer_rejects_shell_drift_from_the_startup_timeout() {
-        let (directory, mut writer, _output_path) = process_writer_fixture(false);
-        replace_process_writer_desired_state(
-            &directory,
-            "startup_timeout_ms = 5000",
-            "startup_timeout_ms = 6000",
-        );
-
-        let error = match writer.prepare(Reason::Boot) {
-            Ok(_) => panic!("shell startup timeout must match Desired State"),
-            Err(error) => error,
-        };
-
-        assert!(matches!(
-            error,
-            ProcessRuntimeWriterError::DesiredStateBinding(
-                DesiredStateEngineBindingError::StartupTimeout
-            )
-        ));
-    }
-
-    #[test]
-    fn process_writer_rejects_shell_drift_from_the_stop_timeout() {
-        let (directory, mut writer, _output_path) = process_writer_fixture(false);
-        replace_process_writer_desired_state(
-            &directory,
-            "stop_timeout_ms = 5000",
-            "stop_timeout_ms = 6000",
-        );
-
-        let error = match writer.prepare(Reason::Boot) {
-            Ok(_) => panic!("shell stop timeout must match Desired State"),
-            Err(error) => error,
-        };
-
-        assert!(matches!(
-            error,
-            ProcessRuntimeWriterError::DesiredStateBinding(
-                DesiredStateEngineBindingError::StopTimeout
-            )
-        ));
-    }
-
-    #[test]
-    fn process_writer_rejects_shell_drift_from_the_launch_identity() {
-        let (directory, mut writer, _output_path) = process_writer_fixture(false);
-        replace_process_writer_desired_state(&directory, "runtime_uid = 0", "runtime_uid = 1000");
-        replace_process_writer_desired_state(&directory, "runtime_gid = 0", "runtime_gid = 1000");
-
-        let error = match writer.prepare(Reason::Boot) {
-            Ok(_) => panic!("shell launch identity must match Desired State"),
-            Err(error) => error,
-        };
-
-        assert!(matches!(
-            error,
-            ProcessRuntimeWriterError::DesiredStateBinding(
-                DesiredStateEngineBindingError::Launcher
-            )
-        ));
-    }
-
-    #[test]
-    fn process_writer_applies_the_current_desired_state_restart_policy() {
-        let (directory, mut writer, _output_path) = process_writer_fixture(false);
-        let desired_state_path = directory.path().join("flux/conf/flux.toml");
-        let desired_state = fs::read_to_string(&desired_state_path)
-            .expect("read process-writer Desired State")
-            .replacen("restart_max_attempts = 3", "restart_max_attempts = 7", 1)
-            .replacen("restart_window_ms = 60000", "restart_window_ms = 45000", 1)
-            .replacen(
-                "restart_initial_backoff_ms = 1000",
-                "restart_initial_backoff_ms = 1500",
-                1,
-            )
-            .replacen(
-                "restart_maximum_backoff_ms = 30000",
-                "restart_maximum_backoff_ms = 12000",
-                1,
-            )
-            .replacen(
-                "restart_stable_reset_ms = 30000",
-                "restart_stable_reset_ms = 20000",
-                1,
-            );
-        fs::write(&desired_state_path, desired_state).expect("update restart policy");
-
-        let prepared = writer
-            .prepare(Reason::ConfigChanged)
-            .expect("prepared reload");
-        let restart = prepared.spec.restart_policy();
-
-        assert_eq!(restart.max_attempts(), 7);
-        assert_eq!(restart.window(), Duration::from_millis(45_000));
-        assert_eq!(restart.initial_backoff(), Duration::from_millis(1_500));
-        assert_eq!(restart.maximum_backoff(), Duration::from_millis(12_000));
-        assert_eq!(restart.stable_reset(), Duration::from_millis(20_000));
-    }
-
-    #[test]
     fn start_orders_prepare_engine_capture_verify_and_publication() {
         let fixture = EngineFixture::new();
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -3351,7 +2854,7 @@ mod tests {
         );
 
         coordinator
-            .execute(&LegacyIntent::Running {
+            .execute(&RuntimeIntent::Running {
                 reason: Reason::Boot,
             })
             .expect("start converges");
@@ -3394,7 +2897,7 @@ mod tests {
         let runtime = coordinator.runtime_snapshot_source();
 
         coordinator
-            .execute(&LegacyIntent::Running {
+            .execute(&RuntimeIntent::Running {
                 reason: Reason::Boot,
             })
             .expect("start converges");
@@ -3448,7 +2951,7 @@ mod tests {
         let runtime = coordinator.runtime_snapshot_source();
 
         coordinator
-            .execute(&LegacyIntent::Running {
+            .execute(&RuntimeIntent::Running {
                 reason: Reason::Boot,
             })
             .expect("required functional canary converges");
@@ -3519,13 +3022,13 @@ mod tests {
         );
         let runtime = coordinator.runtime_snapshot_source();
         coordinator
-            .execute(&LegacyIntent::Running {
+            .execute(&RuntimeIntent::Running {
                 reason: Reason::Boot,
             })
             .expect("active generation converges");
 
         coordinator
-            .execute(&LegacyIntent::Reload {
+            .execute(&RuntimeIntent::Reload {
                 reason: Reason::Fluxctl,
             })
             .expect_err("candidate preparation fails before active binding changes");
@@ -3572,13 +3075,13 @@ mod tests {
         );
         let runtime = coordinator.runtime_snapshot_source();
         coordinator
-            .execute(&LegacyIntent::Running {
+            .execute(&RuntimeIntent::Running {
                 reason: Reason::Boot,
             })
             .expect("active generation converges");
 
         coordinator
-            .execute(&LegacyIntent::Reload {
+            .execute(&RuntimeIntent::Reload {
                 reason: Reason::Fluxctl,
             })
             .expect_err("uncertain capture detachment blocks replacement");
@@ -3630,7 +3133,7 @@ mod tests {
         );
         let runtime = coordinator.runtime_snapshot_source();
         coordinator
-            .execute(&LegacyIntent::Running {
+            .execute(&RuntimeIntent::Running {
                 reason: Reason::Boot,
             })
             .expect("initial generation converges");
@@ -3695,7 +3198,7 @@ mod tests {
         );
         let runtime = coordinator.runtime_snapshot_source();
         coordinator
-            .execute(&LegacyIntent::Running {
+            .execute(&RuntimeIntent::Running {
                 reason: Reason::Boot,
             })
             .expect("initial generation converges");
@@ -3755,13 +3258,13 @@ mod tests {
         );
         let runtime = coordinator.runtime_snapshot_source();
         coordinator
-            .execute(&LegacyIntent::Running {
+            .execute(&RuntimeIntent::Running {
                 reason: Reason::Boot,
             })
             .expect("initial generation converges");
 
         coordinator
-            .execute(&LegacyIntent::ResyncAddresses {
+            .execute(&RuntimeIntent::ResyncAddresses {
                 reason: Reason::Fluxctl,
             })
             .expect("address resync completes");
@@ -3812,7 +3315,7 @@ mod tests {
         let runtime = coordinator.runtime_snapshot_source();
 
         coordinator
-            .execute(&LegacyIntent::Running {
+            .execute(&RuntimeIntent::Running {
                 reason: Reason::Boot,
             })
             .expect_err("stale post-attempt engine identity prevents running");
@@ -3878,7 +3381,7 @@ mod tests {
         let runtime = coordinator.runtime_snapshot_source();
 
         coordinator
-            .execute(&LegacyIntent::Running {
+            .execute(&RuntimeIntent::Running {
                 reason: Reason::Boot,
             })
             .expect_err("uncertain canary cleanup prevents running");
@@ -3948,7 +3451,7 @@ mod tests {
         let runtime = coordinator.runtime_snapshot_source();
 
         coordinator
-            .execute(&LegacyIntent::Running {
+            .execute(&RuntimeIntent::Running {
                 reason: Reason::Boot,
             })
             .expect_err("unsupported local-OUTPUT TPROXY prevents running");
@@ -4016,7 +3519,7 @@ mod tests {
         let runtime = coordinator.runtime_snapshot_source();
 
         coordinator
-            .execute(&LegacyIntent::Running {
+            .execute(&RuntimeIntent::Running {
                 reason: Reason::Boot,
             })
             .expect_err("denied engine authority prevents running");
@@ -4189,7 +3692,7 @@ mod tests {
         );
         let runtime = coordinator.runtime_snapshot_source();
         coordinator
-            .execute(&LegacyIntent::Running {
+            .execute(&RuntimeIntent::Running {
                 reason: Reason::Boot,
             })
             .expect_err("initial running publication fails");
@@ -4280,7 +3783,7 @@ mod tests {
         );
         let runtime = coordinator.runtime_snapshot_source();
         coordinator
-            .execute(&LegacyIntent::Running {
+            .execute(&RuntimeIntent::Running {
                 reason: Reason::Boot,
             })
             .expect_err("initial running publication fails");
@@ -4393,7 +3896,7 @@ mod tests {
         );
         let runtime = coordinator.runtime_snapshot_source();
         coordinator
-            .execute(&LegacyIntent::Running {
+            .execute(&RuntimeIntent::Running {
                 reason: Reason::Boot,
             })
             .expect("initial generation converges");
@@ -4510,7 +4013,7 @@ mod tests {
         );
         let runtime = coordinator.runtime_snapshot_source();
         coordinator
-            .execute(&LegacyIntent::Running {
+            .execute(&RuntimeIntent::Running {
                 reason: Reason::Boot,
             })
             .expect("active generation converges");
@@ -4533,7 +4036,7 @@ mod tests {
         ]);
 
         coordinator
-            .execute(&LegacyIntent::Reload {
+            .execute(&RuntimeIntent::Reload {
                 reason: Reason::Fluxctl,
             })
             .expect_err("candidate post-attempt identity changed");
@@ -4628,7 +4131,7 @@ mod tests {
         let runtime = coordinator.runtime_snapshot_source();
 
         coordinator
-            .execute(&LegacyIntent::Running {
+            .execute(&RuntimeIntent::Running {
                 reason: Reason::Boot,
             })
             .expect_err("initial state publication fails");
@@ -4681,7 +4184,7 @@ mod tests {
             Duration::from_millis(100),
         );
         coordinator
-            .execute(&LegacyIntent::Running {
+            .execute(&RuntimeIntent::Running {
                 reason: Reason::Boot,
             })
             .expect_err("initial state publication fails");
@@ -4743,7 +4246,7 @@ mod tests {
             Duration::from_millis(100),
         );
         coordinator
-            .execute(&LegacyIntent::Running {
+            .execute(&RuntimeIntent::Running {
                 reason: Reason::Boot,
             })
             .expect_err("initial state publication fails");
@@ -4796,14 +4299,14 @@ mod tests {
         );
         let runtime = coordinator.runtime_snapshot_source();
         coordinator
-            .execute(&LegacyIntent::Running {
+            .execute(&RuntimeIntent::Running {
                 reason: Reason::Boot,
             })
             .expect("initial generation converges");
         events.lock().expect("events lock").clear();
 
         coordinator
-            .execute(&LegacyIntent::Reload {
+            .execute(&RuntimeIntent::Reload {
                 reason: Reason::Fluxctl,
             })
             .expect_err("candidate state publication fails");
@@ -4849,14 +4352,14 @@ mod tests {
             Duration::from_millis(100),
         );
         coordinator
-            .execute(&LegacyIntent::Running {
+            .execute(&RuntimeIntent::Running {
                 reason: Reason::Boot,
             })
             .expect("start converges");
         events.lock().expect("events lock").clear();
 
         coordinator
-            .execute(&LegacyIntent::Stopped {
+            .execute(&RuntimeIntent::Stopped {
                 reason: Reason::Fluxctl,
             })
             .expect("stop converges");
@@ -4893,14 +4396,14 @@ mod tests {
             Duration::from_millis(100),
         );
         coordinator
-            .execute(&LegacyIntent::Running {
+            .execute(&RuntimeIntent::Running {
                 reason: Reason::Boot,
             })
             .expect("start converges");
         events.lock().expect("events lock").clear();
 
         coordinator
-            .execute(&LegacyIntent::Stopped {
+            .execute(&RuntimeIntent::Stopped {
                 reason: Reason::Fluxctl,
             })
             .expect_err("uncertain detachment keeps stop pending");
@@ -4940,7 +4443,7 @@ mod tests {
             Duration::from_millis(1),
         );
         coordinator
-            .execute(&LegacyIntent::Running {
+            .execute(&RuntimeIntent::Running {
                 reason: Reason::Boot,
             })
             .expect("start converges");
@@ -4954,7 +4457,7 @@ mod tests {
         ]);
 
         coordinator
-            .execute(&LegacyIntent::Stopped {
+            .execute(&RuntimeIntent::Stopped {
                 reason: Reason::Fluxctl,
             })
             .expect_err("first bounded stop remains pending");
@@ -4994,7 +4497,7 @@ mod tests {
         );
 
         coordinator
-            .execute(&LegacyIntent::ResyncAddresses {
+            .execute(&RuntimeIntent::ResyncAddresses {
                 reason: Reason::Fluxctl,
             })
             .expect("stopped address resync is idempotent");
@@ -5024,7 +4527,7 @@ mod tests {
             Duration::from_millis(100),
         );
         coordinator
-            .execute(&LegacyIntent::Running {
+            .execute(&RuntimeIntent::Running {
                 reason: Reason::Boot,
             })
             .expect("start converges");
@@ -5065,7 +4568,7 @@ mod tests {
             Duration::from_millis(1),
         );
         coordinator
-            .execute(&LegacyIntent::Running {
+            .execute(&RuntimeIntent::Running {
                 reason: Reason::Boot,
             })
             .expect("start converges");
@@ -5114,7 +4617,7 @@ mod tests {
         );
 
         coordinator
-            .execute(&LegacyIntent::Running {
+            .execute(&RuntimeIntent::Running {
                 reason: Reason::Boot,
             })
             .expect_err("failed verification rolls back");
@@ -5156,7 +4659,7 @@ mod tests {
         );
 
         coordinator
-            .execute(&LegacyIntent::Running {
+            .execute(&RuntimeIntent::Running {
                 reason: Reason::Boot,
             })
             .expect_err("failed verification leaves detachment pending");
@@ -5197,7 +4700,7 @@ mod tests {
         );
 
         coordinator
-            .execute(&LegacyIntent::Running {
+            .execute(&RuntimeIntent::Running {
                 reason: Reason::Boot,
             })
             .expect_err("failed capture publication rolls back");
@@ -5238,14 +4741,14 @@ mod tests {
             Duration::from_millis(100),
         );
         coordinator
-            .execute(&LegacyIntent::Running {
+            .execute(&RuntimeIntent::Running {
                 reason: Reason::Boot,
             })
             .expect("start converges");
         events.lock().expect("events lock").clear();
 
         coordinator
-            .execute(&LegacyIntent::Reload {
+            .execute(&RuntimeIntent::Reload {
                 reason: Reason::Fluxctl,
             })
             .expect("reload converges");
@@ -5289,7 +4792,7 @@ mod tests {
             Duration::from_millis(100),
         );
         coordinator
-            .execute(&LegacyIntent::Running {
+            .execute(&RuntimeIntent::Running {
                 reason: Reason::Boot,
             })
             .expect("start converges");
@@ -5306,7 +4809,7 @@ mod tests {
         ]);
 
         coordinator
-            .execute(&LegacyIntent::Reload {
+            .execute(&RuntimeIntent::Reload {
                 reason: Reason::Fluxctl,
             })
             .expect_err("candidate failure is reported after rollback");
@@ -5352,7 +4855,7 @@ mod tests {
         );
         let runtime = coordinator.runtime_snapshot_source();
         coordinator
-            .execute(&LegacyIntent::Running {
+            .execute(&RuntimeIntent::Running {
                 reason: Reason::Boot,
             })
             .expect("start converges");
@@ -5364,7 +4867,7 @@ mod tests {
         ]);
 
         coordinator
-            .execute(&LegacyIntent::Reload {
+            .execute(&RuntimeIntent::Reload {
                 reason: Reason::Fluxctl,
             })
             .expect_err("failed rollback is reported");
@@ -5408,14 +4911,14 @@ mod tests {
             Duration::from_millis(100),
         );
         coordinator
-            .execute(&LegacyIntent::Running {
+            .execute(&RuntimeIntent::Running {
                 reason: Reason::Boot,
             })
             .expect("start converges");
         events.lock().expect("events lock").clear();
 
         coordinator
-            .execute(&LegacyIntent::Reload {
+            .execute(&RuntimeIntent::Reload {
                 reason: Reason::Fluxctl,
             })
             .expect_err("uncertain capture detachment blocks replacement");
@@ -5464,14 +4967,14 @@ mod tests {
             Duration::from_millis(100),
         );
         coordinator
-            .execute(&LegacyIntent::Running {
+            .execute(&RuntimeIntent::Running {
                 reason: Reason::Boot,
             })
             .expect("initial generation converges");
         events.lock().expect("events lock").clear();
 
         coordinator
-            .execute(&LegacyIntent::Reload {
+            .execute(&RuntimeIntent::Reload {
                 reason: Reason::Fluxctl,
             })
             .expect_err("candidate capture and its compensation both fail");
@@ -5529,7 +5032,7 @@ mod tests {
             Duration::from_millis(100),
         );
         coordinator
-            .execute(&LegacyIntent::Running {
+            .execute(&RuntimeIntent::Running {
                 reason: Reason::Boot,
             })
             .expect("initial generation converges");
@@ -5550,7 +5053,7 @@ mod tests {
         ]);
 
         coordinator
-            .execute(&LegacyIntent::Reload {
+            .execute(&RuntimeIntent::Reload {
                 reason: Reason::Fluxctl,
             })
             .expect_err("candidate verification failure is reported");
@@ -5609,7 +5112,7 @@ mod tests {
             Duration::from_millis(100),
         );
         coordinator
-            .execute(&LegacyIntent::Running {
+            .execute(&RuntimeIntent::Running {
                 reason: Reason::Boot,
             })
             .expect("start converges");
@@ -5671,115 +5174,11 @@ mod tests {
         )
     }
 
-    fn process_writer_fixture(
-        rewrite_generation_config: bool,
-    ) -> (tempfile::TempDir, ProcessRuntimeWriter, PathBuf) {
-        let directory = tempfile::tempdir().expect("process writer fixture");
-        let root = directory.path().join("flux");
-        let conf = root.join("conf");
-        let run = root.join("run");
-        let generation = run.join("generations/1");
-        let bin = root.join("bin");
-        let scripts = root.join("scripts");
-        for path in [&conf, &run, &bin, &scripts] {
-            fs::create_dir_all(path).expect("create process writer directory");
-        }
-        let binary_path = bin.join("sing-box");
-        let template_path = conf.join("template.json");
-        let desired_state_path = conf.join("flux.toml");
-        let output_path = conf.join("config.json");
-        let bridge_environment_path = run.join("desired-state.env");
-        let manifest_path = run.join("engine.manifest");
-        let dispatcher_path = scripts.join("dispatcher");
-        fs::write(&binary_path, b"sing-box fixture\n").expect("write engine binary");
-        fs::write(
-            &template_path,
-            br#"{
-                "dns":{"servers":[{"type":"fakeip","inet4_range":"198.18.0.0/15","inet6_range":"fc00::/18"}]},
-                "inbounds":[{"type":"tun","tag":"removed"}],
-                "log":{"level":"warn"}
-            }"#,
-        )
-        .expect("write engine template");
-        let desired_state = PACKAGED_DESIRED_STATE
-            .replacen(
-                "/data/adb/flux/bin/sing-box",
-                binary_path.to_str().expect("UTF-8 binary path"),
-                1,
-            )
-            .replacen(
-                "/data/adb/flux/conf/template.json",
-                template_path.to_str().expect("UTF-8 template path"),
-                1,
-            );
-        fs::write(&desired_state_path, desired_state).expect("write Desired State");
-
-        let rewrite = if rewrite_generation_config {
-            "chmod u+w \"${generation_dir}/config.json\"\n\
-             printf ' ' >>\"${generation_dir}/config.json\"\n"
-        } else {
-            ""
-        };
-        let dispatcher = format!(
-            "#!/bin/sh\nset -eu\n\
-             [ \"${{1:-}}\" = prepare ] || exit 64\n\
-             generation_dir='{}'\n\
-             mkdir -p \"${{generation_dir}}\"\n\
-             cp '{}' \"${{generation_dir}}/config.json\"\n\
-             {}\
-             cat >'{}' <<'EOF'\n\
-             FLUX_ENGINE_MANIFEST_V1\n\
-             generation=1\n\
-             binary={}\n\
-             config={}/config.json\n\
-             working_directory={}\n\
-             log={}/sing-box.log\n\
-             launcher=direct\n\
-             readiness=listener\n\
-             startup_timeout_ms=5000\n\
-             stop_timeout_ms=5000\n\
-             listener_port=1536\n\
-             EOF\n",
-            generation.display(),
-            output_path.display(),
-            rewrite,
-            manifest_path.display(),
-            binary_path.display(),
-            generation.display(),
-            run.display(),
-            generation.display(),
-        );
-        fs::write(&dispatcher_path, dispatcher).expect("write dispatcher");
-        let mut permissions = fs::metadata(&dispatcher_path)
-            .expect("dispatcher metadata")
-            .permissions();
-        permissions.set_mode(0o700);
-        fs::set_permissions(&dispatcher_path, permissions).expect("make dispatcher executable");
-
-        let writer = ProcessRuntimeWriter::new(
-            PhaseDispatcherPaths {
-                shell: PathBuf::from("/bin/sh"),
-                shell_args: Vec::new(),
-                dispatcher: dispatcher_path,
-            },
-            manifest_path,
-            desired_state_path,
-            &output_path,
-            bridge_environment_path,
-        );
-        (directory, writer, output_path)
-    }
-
-    fn replace_process_writer_desired_state(directory: &tempfile::TempDir, from: &str, to: &str) {
-        let desired_state_path = directory.path().join("flux/conf/flux.toml");
-        let desired_state =
-            fs::read_to_string(&desired_state_path).expect("read process-writer Desired State");
-        assert!(
-            desired_state.contains(from),
-            "process-writer Desired State must contain replacement source"
-        );
-        fs::write(&desired_state_path, desired_state.replacen(from, to, 1))
-            .expect("update process-writer Desired State");
+    fn desired_state_fixture() -> (tempfile::TempDir, PathBuf) {
+        let directory = tempfile::tempdir().expect("Desired State fixture");
+        let path = directory.path().join("flux.toml");
+        fs::write(&path, PACKAGED_DESIRED_STATE).expect("write Desired State fixture");
+        (directory, path)
     }
 
     fn generation(value: u32) -> NonZeroU32 {
@@ -5827,7 +5226,7 @@ mod tests {
         }
     }
 
-    impl LegacyRuntimeWriter for SubscriptionScriptedWriter {
+    impl RuntimeWriter for SubscriptionScriptedWriter {
         type Error = io::Error;
 
         fn prepare(&mut self, reason: Reason) -> Result<PreparedGeneration, Self::Error> {
@@ -5901,7 +5300,7 @@ mod tests {
         }
     }
 
-    impl LegacyRuntimeWriter for CandidateActivationFailingWriter {
+    impl RuntimeWriter for CandidateActivationFailingWriter {
         type Error = io::Error;
 
         fn prepare(&mut self, reason: Reason) -> Result<PreparedGeneration, Self::Error> {
@@ -5945,7 +5344,7 @@ mod tests {
         }
     }
 
-    impl LegacyRuntimeWriter for PublicationFailingWriter {
+    impl RuntimeWriter for PublicationFailingWriter {
         type Error = io::Error;
 
         fn prepare(&mut self, reason: Reason) -> Result<PreparedGeneration, Self::Error> {
@@ -5979,7 +5378,7 @@ mod tests {
         }
     }
 
-    impl LegacyRuntimeWriter for ScriptedWriter {
+    impl RuntimeWriter for ScriptedWriter {
         type Error = io::Error;
 
         fn prepare(&mut self, reason: Reason) -> Result<PreparedGeneration, Self::Error> {

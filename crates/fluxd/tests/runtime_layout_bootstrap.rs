@@ -7,7 +7,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use flux_core::LegacyMutationGate;
+use flux_core::MutationGate;
 use fluxd::{MAX_RUNTIME_LOG_FILE_BYTES, SocketControlClient};
 use tempfile::tempdir;
 
@@ -48,8 +48,8 @@ fn real_daemon_bootstraps_and_owns_a_fresh_script_free_runtime_layout() {
         .status()
         .expect("query initialized daemon");
     assert!(matches!(
-        snapshot.capability_profile.legacy_mutation_gate(),
-        LegacyMutationGate::ReadOnly { .. }
+        snapshot.capability_profile.mutation_gate(),
+        MutationGate::ReadOnly { .. }
     ));
 
     assert_private_directory(&run);

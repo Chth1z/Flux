@@ -21,25 +21,21 @@ use flux_testkit::CapabilityProfileFixture;
 
 use super::{
     ADMITTED_GENERATION_SCHEMA_VERSION, AdmittedGeneration, AdmittedGenerationIdentity,
-    BRIDGE_ENVIRONMENT_SCHEMA_VERSION, BridgeEnvironmentCompileErrorKind,
-    CanonicalEngineConfigPreparationErrorKind, DesiredStateArtifacts, DesiredStateCompileErrorKind,
-    DesiredStateCompileRequest, ENGINE_CAPABILITY_PROFILE_SCHEMA_VERSION,
-    ENGINE_CONFIG_LAUNCH_BINDING_SCHEMA_VERSION, EngineCapabilityProfile,
-    EngineCapabilityProfileErrorKind, EngineConfigBindingErrorKind, EngineConfigCompileErrorKind,
-    EngineVersionOutputErrorKind, GENERATION_ENGINE_CONFIG_SCHEMA_VERSION, GenerationAdmissionKind,
-    GenerationAssembler, GenerationAssemblyDigest, GenerationAssemblyError,
-    GenerationAssemblyRequest, GenerationPlanningAuthority, GenerationPlanningErrorKind,
-    HostInspectionPlanningAuthority, MAX_GENERATION_ENGINE_CONFIG_INBOUNDS,
-    MAX_PREPARED_GENERATION_RECORD_BYTES, NativeGenerationPromotionError,
-    PREPARED_GENERATION_RECORD_SCHEMA_VERSION, PreparedGenerationRecord,
-    PreparedGenerationRecordError, PreparedGenerationRecordStore, SelectedEngineSource,
-    SelectedEngineSourceIdentity, TPROXY_GENERATION_CANDIDATE_SCHEMA_VERSION,
+    DesiredStateArtifacts, DesiredStateCompileErrorKind, DesiredStateCompileRequest,
+    ENGINE_CAPABILITY_PROFILE_SCHEMA_VERSION, ENGINE_CONFIG_LAUNCH_BINDING_SCHEMA_VERSION,
+    EngineCapabilityProfile, EngineCapabilityProfileErrorKind, EngineConfigBindingErrorKind,
+    EngineConfigCompileErrorKind, EngineVersionOutputErrorKind,
+    GENERATION_ENGINE_CONFIG_SCHEMA_VERSION, GenerationAdmissionKind, GenerationAssembler,
+    GenerationAssemblyDigest, GenerationAssemblyError, GenerationAssemblyRequest,
+    GenerationPlanningAuthority, GenerationPlanningErrorKind, HostInspectionPlanningAuthority,
+    MAX_GENERATION_ENGINE_CONFIG_INBOUNDS, MAX_PREPARED_GENERATION_RECORD_BYTES,
+    NativeGenerationPromotionError, PREPARED_GENERATION_RECORD_SCHEMA_VERSION,
+    PreparedGenerationRecord, PreparedGenerationRecordError, PreparedGenerationRecordStore,
+    SelectedEngineSource, SelectedEngineSourceIdentity, TPROXY_GENERATION_CANDIDATE_SCHEMA_VERSION,
     TproxyEngineConfigRequest, TproxyGenerationCandidateErrorKind, bind_engine_config_to_spec,
-    collect_tproxy_engine_capability_profile, compile_bridge_environment, compile_desired_state,
-    compile_desired_state_capture, compile_tproxy_engine_config,
-    compile_tproxy_generation_candidate, parse_sing_box_version_output, publish_bridge_preparation,
-    publish_canonical_engine_config, publish_validated_subscription_bridge_preparation,
-    reconstruct_canonical_tproxy_engine_config,
+    collect_tproxy_engine_capability_profile, compile_desired_state, compile_desired_state_capture,
+    compile_tproxy_engine_config, compile_tproxy_generation_candidate,
+    parse_sing_box_version_output, reconstruct_canonical_tproxy_engine_config,
 };
 use crate::engine_supervisor::EngineCapabilityProbeError;
 use crate::{EngineSpec, MAX_ENGINE_CONFIG_BYTES, RestartPolicy};
@@ -47,203 +43,6 @@ use crate::{EngineSpec, MAX_ENGINE_CONFIG_BYTES, RestartPolicy};
 const PORT: u16 = 1536;
 const PACKAGED_DESIRED_STATE: &str = include_str!("../../../../conf/flux.toml");
 const PACKAGED_ENGINE_TEMPLATE: &[u8] = include_bytes!("../../../../conf/template.json");
-
-#[test]
-fn bridge_environment_maps_the_packaged_desired_state_without_shell_policy_inputs() {
-    let config = FluxConfig::parse(PACKAGED_DESIRED_STATE).expect("packaged Desired State");
-    let engine = compile_tproxy_engine_config(TproxyEngineConfigRequest::new(
-        PACKAGED_ENGINE_TEMPLATE,
-        config.listener().port(),
-    ))
-    .expect("packaged engine artifact");
-
-    let first = compile_bridge_environment(&config, &engine).expect("packaged bridge environment");
-    let second =
-        compile_bridge_environment(&config, &engine).expect("deterministic bridge environment");
-    let document = std::str::from_utf8(first.bytes()).expect("UTF-8 bridge environment");
-
-    assert_eq!(first.schema_version(), BRIDGE_ENVIRONMENT_SCHEMA_VERSION);
-    assert_eq!(first, second);
-    assert!(document.starts_with("# FLUX_DESIRED_STATE_ENV_V1\n"));
-    for expected in [
-        "ENGINE_BINARY='/data/adb/flux/bin/sing-box'",
-        "ENGINE_STARTUP_TIMEOUT_MS='5000'",
-        "ENGINE_STOP_TIMEOUT_MS='5000'",
-        "CORE_USER='0'",
-        "CORE_GROUP='0'",
-        "PROXY_MODE='tproxy'",
-        "PROXY_PORT='1536'",
-        "PROXY_IPV6='0'",
-        "APP_PROXY_MODE='0'",
-        "MOBILE_INTERFACE='rndis+'",
-        "WIFI_INTERFACE='wlan0'",
-        "HOTSPOT_INTERFACE='wlan2'",
-        "USB_INTERFACE='rmnet_data+'",
-        "FAKEIP_V4_RANGE='198.18.0.0/15'",
-        "FAKEIP_V6_RANGE='fc00::/18'",
-        "RULE_BACKEND='iptables_restore'",
-        "BYPASS_SET_BACKEND='zone'",
-    ] {
-        assert!(
-            document.lines().any(|line| line == expected),
-            "missing {expected}"
-        );
-    }
-    assert!(!document.contains("settings.ini"));
-    assert!(!document.contains("JQ"));
-    assert!(!document.contains("KFEAT_"));
-}
-
-#[test]
-fn bridge_environment_maps_typed_app_user_interface_family_and_timeout_intent() {
-    let input = PACKAGED_DESIRED_STATE
-        .replacen("startup_timeout_ms = 5000", "startup_timeout_ms = 5500", 1)
-        .replacen("stop_timeout_ms = 5000", "stop_timeout_ms = 6200", 1)
-        .replacen("ipv6 = false", "ipv6 = true", 1)
-        .replacen("mode = \"all\"", "mode = \"allowlist\"", 1)
-        .replacen("android_users = \"owner\"", "android_users = \"list\"", 1)
-        .replacen("user_ids = []", "user_ids = [10, 2]", 1)
-        .replacen(
-            "packages = []",
-            "packages = [\"com.example.zeta\", \"com.example.alpha\"]",
-            1,
-        )
-        .replacen(
-            "forwarded_proxy = [\"rmnet_data*\", \"wlan0\", \"wlan2\", \"rndis*\"]",
-            "forwarded_proxy = [\"rmnet_data*\", \"wlan0\"]",
-            1,
-        )
-        .replacen("local_bypass = []", "local_bypass = [\"wlan1\"]", 1)
-        .replacen("excluded = []", "excluded = [\"tun*\"]", 1);
-    let config = FluxConfig::parse(&input).expect("custom bridge Desired State");
-    let engine = compile_tproxy_engine_config(TproxyEngineConfigRequest::new(
-        PACKAGED_ENGINE_TEMPLATE,
-        config.listener().port(),
-    ))
-    .expect("custom engine artifact");
-
-    let artifact = compile_bridge_environment(&config, &engine).expect("custom bridge environment");
-    let document = std::str::from_utf8(artifact.bytes()).unwrap();
-
-    for expected in [
-        "ENGINE_STARTUP_TIMEOUT_MS='5500'",
-        "ENGINE_STOP_TIMEOUT_MS='6200'",
-        "CORE_TIMEOUT='7'",
-        "PROXY_IPV6='1'",
-        "APP_PROXY_MODE='2'",
-        "APP_LIST='com.example.alpha com.example.zeta'",
-        "APP_USER_SCOPE='list'",
-        "APP_USER_LIST='2 10'",
-        "MOBILE_INTERFACE='wlan0'",
-        "PROXY_MOBILE='1'",
-        "WIFI_INTERFACE='rmnet_data+'",
-        "PROXY_WIFI='1'",
-        "HOTSPOT_INTERFACE='wlan1'",
-        "PROXY_HOTSPOT='0'",
-        "USB_INTERFACE=''",
-        "EXCLUDE_INTERFACES='tun+'",
-    ] {
-        assert!(
-            document.lines().any(|line| line == expected),
-            "missing {expected}"
-        );
-    }
-}
-
-#[test]
-fn bridge_environment_rejects_desired_state_shapes_the_fenced_renderer_cannot_express() {
-    let cases = [
-        (
-            PACKAGED_DESIRED_STATE.replacen("local_output = true", "local_output = false", 1),
-            BridgeEnvironmentCompileErrorKind::UnsupportedTrafficDomains,
-        ),
-        (
-            PACKAGED_DESIRED_STATE
-                .replacen("ipv4 = true", "ipv4 = false", 1)
-                .replacen("ipv6 = false", "ipv6 = true", 1),
-            BridgeEnvironmentCompileErrorKind::UnsupportedAddressFamilies,
-        ),
-        (
-            PACKAGED_DESIRED_STATE.replacen("tcp = true", "tcp = false", 1),
-            BridgeEnvironmentCompileErrorKind::UnsupportedProtocols,
-        ),
-        (
-            PACKAGED_DESIRED_STATE.replacen("cidrs = []", "cidrs = [\"203.0.113.0/24\"]", 1),
-            BridgeEnvironmentCompileErrorKind::ConfiguredBypassUnsupported,
-        ),
-        (
-            PACKAGED_DESIRED_STATE.replacen("enabled = false", "enabled = true", 1),
-            BridgeEnvironmentCompileErrorKind::SubscriptionUnsupported,
-        ),
-        (
-            PACKAGED_DESIRED_STATE.replacen(
-                "respect_android_vpn = false",
-                "respect_android_vpn = true",
-                1,
-            ),
-            BridgeEnvironmentCompileErrorKind::AndroidVpnUnsupported,
-        ),
-        (
-            PACKAGED_DESIRED_STATE.replacen(
-                "require_functional_canary = false",
-                "require_functional_canary = true",
-                1,
-            ),
-            BridgeEnvironmentCompileErrorKind::FunctionalCanaryUnsupported,
-        ),
-        (
-            PACKAGED_DESIRED_STATE.replacen("local_bypass = []", "local_bypass = [\"wlan1\"]", 1),
-            BridgeEnvironmentCompileErrorKind::TooManyInterfaceRoles {
-                actual: 5,
-                maximum: 4,
-            },
-        ),
-    ];
-
-    for (input, expected) in cases {
-        let config = FluxConfig::parse(&input).expect("schema-valid unsupported bridge shape");
-        let engine = compile_tproxy_engine_config(TproxyEngineConfigRequest::new(
-            PACKAGED_ENGINE_TEMPLATE,
-            config.listener().port(),
-        ))
-        .unwrap();
-        let error = compile_bridge_environment(&config, &engine)
-            .expect_err("non-representable bridge shape must fail closed");
-        assert_eq!(error.kind(), expected);
-    }
-}
-
-#[test]
-fn bridge_environment_requires_one_canonical_dual_family_fakeip_server() {
-    let config = FluxConfig::parse(PACKAGED_DESIRED_STATE).expect("packaged Desired State");
-    let cases: &[(&[u8], BridgeEnvironmentCompileErrorKind)] = &[
-        (
-            br#"{"dns":{"servers":[]},"inbounds":[]}"#,
-            BridgeEnvironmentCompileErrorKind::MissingFakeIpServer,
-        ),
-        (
-            br#"{"dns":{"servers":[{"type":"fakeip","inet4_range":"198.18.0.0/15","inet6_range":"fc00::/18"},{"type":"fakeip","inet4_range":"198.19.0.0/16","inet6_range":"fd00::/8"}]},"inbounds":[]}"#,
-            BridgeEnvironmentCompileErrorKind::MultipleFakeIpServers,
-        ),
-        (
-            br#"{"dns":{"servers":[{"type":"fakeip","inet4_range":"198.18.1.1/15","inet6_range":"fc00::/18"}]},"inbounds":[]}"#,
-            BridgeEnvironmentCompileErrorKind::InvalidFakeIpRange {
-                family: NetworkAddressFamily::Ipv4,
-            },
-        ),
-    ];
-
-    for (template, expected) in cases {
-        let engine = compile_tproxy_engine_config(TproxyEngineConfigRequest::new(
-            template,
-            config.listener().port(),
-        ))
-        .unwrap();
-        let error = compile_bridge_environment(&config, &engine)
-            .expect_err("invalid FakeIP bridge shape must fail closed");
-        assert_eq!(error.kind(), *expected);
-    }
-}
 
 #[test]
 fn desired_state_compiles_the_packaged_config_and_binds_the_listener() {
@@ -270,7 +69,7 @@ fn desired_state_compiles_the_packaged_config_and_binds_the_listener() {
             .windows(br#""listen_port":1536"#.len())
             .any(|window| window == br#""listen_port":1536"#)
     );
-    assert_eq!(artifacts.capture().artifact().programs().len(), 2);
+    assert_eq!(artifacts.capture().artifact().programs().len(), 1);
 }
 
 #[test]
@@ -278,6 +77,7 @@ fn desired_state_maps_scope_interfaces_and_resolved_applications() {
     let input = PACKAGED_DESIRED_STATE
         .replacen("mode = \"all\"", "mode = \"allowlist\"", 1)
         .replacen("packages = []", "packages = [\"com.example.client\"]", 1)
+        .replacen("forwarded_ingress = false", "forwarded_ingress = true", 1)
         .replacen("local_bypass = []", "local_bypass = [\"wlan1\"]", 1);
     let config = FluxConfig::parse(&input).expect("custom complete Desired State");
     let selected_uid = CaptureUserId::new(10_123).expect("ordinary Android application UID");
@@ -391,203 +191,6 @@ fn desired_state_propagates_engine_template_errors() {
         DesiredStateCompileErrorKind::EngineConfig(EngineConfigCompileErrorKind::InvalidJson)
     );
     assert!(error.source().is_some());
-}
-
-#[test]
-fn canonical_engine_publication_atomically_replaces_the_shared_config() {
-    let directory = tempfile::tempdir().expect("canonical config fixture");
-    let template_path = directory.path().join("template.json");
-    let desired_state_path = directory.path().join("flux.toml");
-    let output_path = directory.path().join("config.json");
-    fs::write(&template_path, br#"{"inbounds":[],"log":{"level":"warn"}}"#)
-        .expect("write template");
-    fs::write(
-        &desired_state_path,
-        desired_state_with_template(&template_path),
-    )
-    .expect("write Desired State");
-    fs::write(&output_path, b"stale shell-owned config\n").expect("write stale output");
-
-    let publication = publish_canonical_engine_config(&desired_state_path, &output_path)
-        .expect("publish canonical config");
-    let (desired_state, artifact) = publication.into_parts();
-
-    assert_eq!(desired_state.listener().port().get(), PORT);
-    assert_eq!(fs::read(&output_path).unwrap(), artifact.bytes());
-    assert_eq!(
-        fs::metadata(&output_path)
-            .expect("published metadata")
-            .permissions()
-            .mode()
-            & 0o777,
-        0o444
-    );
-    assert!(fs::read_dir(directory.path()).unwrap().all(|entry| {
-        !entry
-            .unwrap()
-            .file_name()
-            .to_string_lossy()
-            .contains(".fluxd-")
-    }));
-}
-
-#[test]
-fn bridge_preparation_publishes_read_only_engine_and_environment_artifacts() {
-    let directory = tempfile::tempdir().expect("bridge preparation fixture");
-    let template_path = directory.path().join("template.json");
-    let desired_state_path = directory.path().join("flux.toml");
-    let engine_path = directory.path().join("config.json");
-    let environment_path = directory.path().join("desired-state.env");
-    fs::write(&template_path, PACKAGED_ENGINE_TEMPLATE).expect("write template");
-    fs::write(
-        &desired_state_path,
-        desired_state_with_template(&template_path),
-    )
-    .expect("write Desired State");
-
-    let publication =
-        publish_bridge_preparation(&desired_state_path, &engine_path, &environment_path)
-            .expect("publish bridge preparation");
-    let (_desired_state, engine, environment) = publication.into_parts();
-
-    assert_eq!(fs::read(&engine_path).unwrap(), engine.bytes());
-    assert_eq!(fs::read(&environment_path).unwrap(), environment.bytes());
-    for path in [&engine_path, &environment_path] {
-        assert_eq!(
-            fs::metadata(path).unwrap().permissions().mode() & 0o777,
-            0o444
-        );
-    }
-}
-
-#[test]
-fn validated_subscription_bridge_preparation_requires_exact_unchanged_desired_state() {
-    let directory = tempfile::tempdir().expect("subscription bridge preparation fixture");
-    let template_path = directory.path().join("template.json");
-    let desired_state_path = directory.path().join("flux.toml");
-    let engine_path = directory.path().join("config.json");
-    let environment_path = directory.path().join("desired-state.env");
-    fs::write(&template_path, PACKAGED_ENGINE_TEMPLATE).expect("write template");
-    let desired_state = desired_state_with_template(&template_path).replacen(
-        "enabled = false",
-        "enabled = true",
-        1,
-    );
-    fs::write(&desired_state_path, &desired_state).expect("write enabled Desired State");
-    let expected = FluxConfig::parse(&desired_state).expect("enabled Desired State");
-    let artifact = compile_tproxy_engine_config(TproxyEngineConfigRequest::new(
-        PACKAGED_ENGINE_TEMPLATE,
-        expected.listener().port(),
-    ))
-    .expect("validated subscription engine artifact");
-
-    let publication = publish_validated_subscription_bridge_preparation(
-        &desired_state_path,
-        &expected,
-        artifact.clone(),
-        &engine_path,
-        &environment_path,
-    )
-    .expect("validated subscription bridge preparation");
-    let (published_state, published_engine, _) = publication.into_parts();
-
-    assert_eq!(published_state, expected);
-    assert_eq!(fs::read(&engine_path).unwrap(), published_engine.bytes());
-    let prior_engine = fs::read(&engine_path).unwrap();
-    let prior_environment = fs::read(&environment_path).unwrap();
-    fs::write(
-        &desired_state_path,
-        desired_state.replacen(
-            "update_interval_secs = 86400",
-            "update_interval_secs = 3600",
-            1,
-        ),
-    )
-    .expect("change Desired State after validation");
-
-    let error = match publish_validated_subscription_bridge_preparation(
-        &desired_state_path,
-        &expected,
-        artifact,
-        &engine_path,
-        &environment_path,
-    ) {
-        Ok(_) => panic!("changed Desired State must fail closed"),
-        Err(error) => error,
-    };
-
-    assert_eq!(
-        error.kind(),
-        CanonicalEngineConfigPreparationErrorKind::DesiredStateChanged
-    );
-    assert_eq!(fs::read(&engine_path).unwrap(), prior_engine);
-    assert_eq!(fs::read(&environment_path).unwrap(), prior_environment);
-}
-
-#[cfg(unix)]
-#[test]
-fn canonical_engine_publication_rejects_a_symbolic_link_template() {
-    use std::os::unix::fs::symlink;
-
-    let directory = tempfile::tempdir().expect("canonical config fixture");
-    let target = directory.path().join("template-target.json");
-    let template_path = directory.path().join("template.json");
-    let desired_state_path = directory.path().join("flux.toml");
-    let output_path = directory.path().join("config.json");
-    fs::write(&target, br#"{"inbounds":[]}"#).expect("write template target");
-    symlink(&target, &template_path).expect("link template");
-    fs::write(
-        &desired_state_path,
-        desired_state_with_template(&template_path),
-    )
-    .expect("write Desired State");
-
-    let error = match publish_canonical_engine_config(&desired_state_path, &output_path) {
-        Ok(_) => panic!("template symlink must fail closed"),
-        Err(error) => error,
-    };
-
-    assert_eq!(
-        error.kind(),
-        CanonicalEngineConfigPreparationErrorKind::Template
-    );
-    assert!(!output_path.exists());
-}
-
-#[cfg(unix)]
-#[test]
-fn canonical_engine_publication_rejects_a_symbolic_link_template_ancestor() {
-    use std::os::unix::fs::symlink;
-
-    let directory = tempfile::tempdir().expect("canonical config fixture");
-    let target_directory = directory.path().join("template-target");
-    fs::create_dir(&target_directory).expect("create template target directory");
-    fs::write(
-        target_directory.join("template.json"),
-        br#"{"inbounds":[]}"#,
-    )
-    .expect("write template target");
-    let linked_directory = directory.path().join("template-source");
-    symlink(&target_directory, &linked_directory).expect("link template ancestor");
-    let template_path = linked_directory.join("template.json");
-    let desired_state_path = directory.path().join("flux.toml");
-    let output_path = directory.path().join("config.json");
-    fs::write(
-        &desired_state_path,
-        desired_state_with_template(&template_path),
-    )
-    .expect("write Desired State");
-
-    let error = match publish_canonical_engine_config(&desired_state_path, &output_path) {
-        Ok(_) => panic!("template ancestor symlink must fail closed"),
-        Err(error) => error,
-    };
-
-    assert_eq!(
-        error.kind(),
-        CanonicalEngineConfigPreparationErrorKind::Template
-    );
-    assert!(!output_path.exists());
 }
 
 #[test]
@@ -1746,14 +1349,6 @@ fn compile(
         template,
         NonZeroU16::new(port).unwrap(),
     ))
-}
-
-fn desired_state_with_template(template_path: &std::path::Path) -> String {
-    PACKAGED_DESIRED_STATE.replacen(
-        "/data/adb/flux/conf/template.json",
-        template_path.to_str().expect("UTF-8 test path"),
-        1,
-    )
 }
 
 fn hex(bytes: &[u8]) -> String {

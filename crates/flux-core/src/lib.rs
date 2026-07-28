@@ -92,13 +92,13 @@ pub use capability::{
     IdentityTextError, IdentityTextErrorKind, KernelBuildIdentity, KernelFacts,
     KernelMutationStatus, KernelRelease, KernelReleaseError, KernelSupport, KernelVersion,
     LegacyAddressSynchronization, LegacyArtifactReadiness, LegacyArtifactResolution,
-    LegacyBridgeFacts, LegacyMutationGate, LegacyMutationWriter, LegacyRuleBackend,
-    MAX_BOOT_IDENTITY_BYTES, MAX_DEVICE_IDENTITY_TEXT_BYTES, MAX_DEVICE_TOOL_IDENTITIES,
-    MAX_KERNEL_RELEASE_BYTES, MAX_TOOL_ID_BYTES, MIN_SUPPORTED_KERNEL, NetworkNamespaceIdentity,
-    Observation, ObservationKind, ParseBootIdentityError, ParseBootIdentityErrorKind,
-    ParseKernelVersionError, ReviewedPolicySelector, SHA256_DIGEST_BYTES, SecurityPatchLevel,
-    SelinuxMode, SelinuxPolicyIdentity, Sha256Digest, Sha256DigestError, ToolId,
-    VendorBuildIdentity, VerifiedBootIdentity, VerifiedBootState,
+    LegacyBridgeFacts, LegacyMutationWriter, LegacyRuleBackend, MAX_BOOT_IDENTITY_BYTES,
+    MAX_DEVICE_IDENTITY_TEXT_BYTES, MAX_DEVICE_TOOL_IDENTITIES, MAX_KERNEL_RELEASE_BYTES,
+    MAX_TOOL_ID_BYTES, MIN_SUPPORTED_KERNEL, MutationGate, NetworkNamespaceIdentity, Observation,
+    ObservationKind, ParseBootIdentityError, ParseBootIdentityErrorKind, ParseKernelVersionError,
+    ReviewedPolicySelector, SHA256_DIGEST_BYTES, SecurityPatchLevel, SelinuxMode,
+    SelinuxPolicyIdentity, Sha256Digest, Sha256DigestError, ToolId, VendorBuildIdentity,
+    VerifiedBootIdentity, VerifiedBootState,
 };
 pub use capture_program::{
     CaptureApplicationMode, CaptureApplicationPolicy, CaptureApplicationPolicyError,
@@ -127,8 +127,8 @@ pub use control::{
     AddressResyncDisposition, AdministrativeState, ConfigurationChangeClient,
     ConfigurationChangeReport, ControlClient, ControlError, ControlObservation,
     ControlObservationIngress, ControlService, ControlSnapshot, ControlSnapshotSource,
-    DispatcherCompletion, LegacyControlBridge, LegacyDispatcher, LegacyIntent, OperationHandle,
-    OperationReport, Reason,
+    DispatcherCompletion, OperationHandle, OperationReport, Reason, RuntimeControl,
+    RuntimeDispatcher, RuntimeIntent,
 };
 pub use fwmark_audit::{
     ANDROID_NET_ID_FWMARK_MASK, DeferredFwmarkPrerequisite, FwmarkCandidate, FwmarkCandidateError,

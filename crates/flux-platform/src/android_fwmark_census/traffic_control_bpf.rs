@@ -32,19 +32,37 @@ const BPF_PROG_GET_NEXT_ID: u32 = 11;
 const BPF_PROG_GET_FD_BY_ID: u32 = 13;
 const BPF_OBJ_GET_INFO_BY_FD: u32 = 15;
 
-#[cfg(test)]
+const BPF_PROG_TYPE_SOCKET_FILTER: u32 = 1;
+const BPF_PROG_TYPE_KPROBE: u32 = 2;
 const BPF_PROG_TYPE_SCHED_CLS: u32 = 3;
+const BPF_PROG_TYPE_SCHED_ACT: u32 = 4;
+const BPF_PROG_TYPE_TRACEPOINT: u32 = 5;
 const BPF_PROG_TYPE_XDP: u32 = 6;
+const BPF_PROG_TYPE_PERF_EVENT: u32 = 7;
+const BPF_PROG_TYPE_CGROUP_SKB: u32 = 8;
 const BPF_PROG_TYPE_CGROUP_SOCK: u32 = 9;
+const BPF_PROG_TYPE_LWT_IN: u32 = 10;
+const BPF_PROG_TYPE_LWT_OUT: u32 = 11;
+const BPF_PROG_TYPE_LWT_XMIT: u32 = 12;
 const BPF_PROG_TYPE_SOCK_OPS: u32 = 13;
+const BPF_PROG_TYPE_SK_SKB: u32 = 14;
 const BPF_PROG_TYPE_CGROUP_DEVICE: u32 = 15;
 const BPF_PROG_TYPE_SK_MSG: u32 = 16;
+const BPF_PROG_TYPE_RAW_TRACEPOINT: u32 = 17;
 const BPF_PROG_TYPE_CGROUP_SOCK_ADDR: u32 = 18;
+const BPF_PROG_TYPE_LWT_SEG6LOCAL: u32 = 19;
 const BPF_PROG_TYPE_LIRC_MODE2: u32 = 20;
 const BPF_PROG_TYPE_SK_REUSEPORT: u32 = 21;
+const BPF_PROG_TYPE_FLOW_DISSECTOR: u32 = 22;
 const BPF_PROG_TYPE_CGROUP_SYSCTL: u32 = 23;
+const BPF_PROG_TYPE_RAW_TRACEPOINT_WRITABLE: u32 = 24;
 const BPF_PROG_TYPE_CGROUP_SOCKOPT: u32 = 25;
+const BPF_PROG_TYPE_TRACING: u32 = 26;
+const BPF_PROG_TYPE_STRUCT_OPS: u32 = 27;
+const BPF_PROG_TYPE_EXT: u32 = 28;
+const BPF_PROG_TYPE_LSM: u32 = 29;
 const BPF_PROG_TYPE_SK_LOOKUP: u32 = 30;
+const BPF_PROG_TYPE_SYSCALL: u32 = 31;
 const BPF_PROG_TYPE_NETFILTER: u32 = 32;
 
 const RTM_NEWTFILTER: u16 = 44;
@@ -496,10 +514,27 @@ pub(super) fn test_absent_observation() -> AndroidTrafficControlBpfFwmarkObserva
 
 fn program_opaque_planes(program_type: u32) -> Option<[bool; ALL_PLANES.len()]> {
     match program_type {
-        BPF_PROG_TYPE_XDP
+        BPF_PROG_TYPE_KPROBE
+        | BPF_PROG_TYPE_TRACEPOINT
+        | BPF_PROG_TYPE_XDP
+        | BPF_PROG_TYPE_PERF_EVENT
         | BPF_PROG_TYPE_CGROUP_DEVICE
+        | BPF_PROG_TYPE_RAW_TRACEPOINT
         | BPF_PROG_TYPE_LIRC_MODE2
-        | BPF_PROG_TYPE_CGROUP_SYSCTL => None,
+        | BPF_PROG_TYPE_FLOW_DISSECTOR
+        | BPF_PROG_TYPE_CGROUP_SYSCTL
+        | BPF_PROG_TYPE_TRACING
+        | BPF_PROG_TYPE_STRUCT_OPS
+        | BPF_PROG_TYPE_LSM
+        | BPF_PROG_TYPE_SYSCALL => None,
+        BPF_PROG_TYPE_SCHED_CLS
+        | BPF_PROG_TYPE_SCHED_ACT
+        | BPF_PROG_TYPE_CGROUP_SKB
+        | BPF_PROG_TYPE_LWT_IN
+        | BPF_PROG_TYPE_LWT_OUT
+        | BPF_PROG_TYPE_LWT_XMIT
+        | BPF_PROG_TYPE_LWT_SEG6LOCAL
+        | BPF_PROG_TYPE_NETFILTER => Some([true, false, true]),
         BPF_PROG_TYPE_CGROUP_SOCK
         | BPF_PROG_TYPE_SOCK_OPS
         | BPF_PROG_TYPE_SK_MSG
@@ -507,7 +542,10 @@ fn program_opaque_planes(program_type: u32) -> Option<[bool; ALL_PLANES.len()]> 
         | BPF_PROG_TYPE_SK_REUSEPORT
         | BPF_PROG_TYPE_CGROUP_SOCKOPT
         | BPF_PROG_TYPE_SK_LOOKUP => Some([false, true, true]),
-        BPF_PROG_TYPE_NETFILTER => Some([true, false, true]),
+        BPF_PROG_TYPE_SOCKET_FILTER
+        | BPF_PROG_TYPE_SK_SKB
+        | BPF_PROG_TYPE_RAW_TRACEPOINT_WRITABLE
+        | BPF_PROG_TYPE_EXT => Some([true; ALL_PLANES.len()]),
         _ => Some([true; ALL_PLANES.len()]),
     }
 }
@@ -890,10 +928,19 @@ mod tests {
     #[test]
     fn program_types_without_a_fwmark_context_remain_complete_absence() {
         let programs = [
+            BPF_PROG_TYPE_KPROBE,
+            BPF_PROG_TYPE_TRACEPOINT,
             BPF_PROG_TYPE_XDP,
+            BPF_PROG_TYPE_PERF_EVENT,
             BPF_PROG_TYPE_CGROUP_DEVICE,
+            BPF_PROG_TYPE_RAW_TRACEPOINT,
             BPF_PROG_TYPE_LIRC_MODE2,
+            BPF_PROG_TYPE_FLOW_DISSECTOR,
             BPF_PROG_TYPE_CGROUP_SYSCTL,
+            BPF_PROG_TYPE_TRACING,
+            BPF_PROG_TYPE_STRUCT_OPS,
+            BPF_PROG_TYPE_LSM,
+            BPF_PROG_TYPE_SYSCALL,
         ]
         .into_iter()
         .enumerate()
@@ -919,12 +966,24 @@ mod tests {
     #[test]
     fn program_type_groups_are_conservatively_opaque() {
         assert_eq!(
+            program_opaque_planes(BPF_PROG_TYPE_CGROUP_SKB),
+            Some([true, false, true])
+        );
+        assert_eq!(
             program_opaque_planes(BPF_PROG_TYPE_CGROUP_SOCK),
             Some([false, true, true])
         );
         assert_eq!(
             program_opaque_planes(BPF_PROG_TYPE_NETFILTER),
             Some([true, false, true])
+        );
+        assert_eq!(
+            program_opaque_planes(BPF_PROG_TYPE_SOCKET_FILTER),
+            Some([true; ALL_PLANES.len()])
+        );
+        assert_eq!(
+            program_opaque_planes(BPF_PROG_TYPE_RAW_TRACEPOINT_WRITABLE),
+            Some([true; ALL_PLANES.len()])
         );
         assert_eq!(
             program_opaque_planes(u32::MAX),

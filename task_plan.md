@@ -2790,12 +2790,13 @@ the highest-priority unqualified path as the next qualification task.
   a separate device-evidence checkpoint before U2.5.
 
 ### Status
-**S6 ready** - the bounded parser, 43-feature projection, three-path selector, no-autoload nftables
-gate, A/B drift binding, schema-2 projection identity, collector revision 2, and reconciled design
-documents pass focused tests, full affected-crate suites, strict Clippy, rustfmt, the pinned Android
-cross-build, repository CI, diff hygiene, and scoped secret/device-identifier scans. The host
-checkpoint records this state before one quiet device diagnostic. No device command or mutation
-has occurred in this phase.
+**S6 fixed-stage diagnostic checkpoint ready** - one attempt stopped before rebuilding the new
+probe, and a second attempt with the new artifact stopped before reports; the outer sanitizer made
+both failures generic. Both independent root proofs found zero generated census paths and zero
+probe processes with stable model/build/boot/architecture/fingerprint identity. The runner now
+discards every detailed host/ADB failure behind a fixed stage label, preserves only an already
+validated probe class, and gives cleanup failure precedence. Commit this host boundary before one
+stage-classified diagnostic.
 
 ### Errors Encountered
 - The first focused test/all-target check compile found that the new byte parser used the
@@ -2821,3 +2822,26 @@ has occurred in this phase.
   retained conflicting shell quotes. Those commands either returned syntax status 2 or no match and
   did not print candidate values. Rerun payload-suppressing PCRE checks with quote-free assignment
   patterns; every private-key, cloud-token, credential, and device-identifier scan returns no match.
+- The first S6 quiet invocation returned only the outer bounded class
+  `runner-failed-before-bounded-report`. The on-disk probe remained the prior
+  `d6822b0e677ca756cd6d67cb547cd1fa581ef15263380d29ccf8fb089e8ddac4` artifact, proving the
+  committed kernel-gated probe never executed. Independent root cleanup proved zero
+  `flux-census.*` paths and zero `flx-census` processes, while the expected build, boot,
+  architecture, and fingerprint stayed stable. A subsequent host-only exact release build passed
+  and produced the new 1,083,176-byte artifact
+  `838c1d7c9fd0a6dfd29b87a5b19eedebde66bf105050def91e5cd06a26f36ffd`; diagnose the
+  read-only device pre-build gates before another census rather than retrying blindly.
+- A shell-only reproduction initially reported `ndk-revision-failed` because its `awk -F'= '`
+  comparison retained whitespace in the key. The actual `source.properties` value is the required
+  `27.3.13750724`, the Rust verifier trims both sides, and the exact release build passes. Do not
+  treat that shell classifier as runner evidence.
+- A second quiet invocation used the new artifact but again returned only
+  `runner-failed-before-bounded-report`. Mandatory runner cleanup and a separate root proof found
+  zero generated paths and processes, and the exact device identity remained stable. The runner's
+  early error path could otherwise forward the explicit serial through low-level ADB diagnostics;
+  add a typed payload-free stage boundary before another device run. Fifteen focused runner tests,
+  strict Clippy, rustfmt, and diff hygiene pass for that boundary.
+- The first attempt to stage the fixed-stage host checkpoint did not execute because the
+  Git-metadata approval service returned HTTP 503. Leave all four reviewed files unstaged, do not
+  bypass the repository boundary, and do not run an uncommitted probe. Retry only after explicit
+  user approval following this recorded failure.

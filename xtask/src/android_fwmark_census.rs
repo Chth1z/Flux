@@ -18,9 +18,9 @@ use super::android_canary::{
     command_output_bounded, shell_single_quote,
 };
 use super::{
-    ANDROID_MIN_LOAD_ALIGNMENT, ANDROID_NDK_REVISION, ANDROID_RUSTFLAGS, ANDROID_TARGET,
-    ANDROID_TARGET_RUSTFLAGS_ENV, LINUX_ANDROID_HOST_BUILD_TMPDIR, android_linker, sha256_file,
-    validate_aarch64_elf, verify_ndk_revision,
+    ANDROID_MIN_LOAD_ALIGNMENT, ANDROID_RUSTFLAGS, ANDROID_TARGET, ANDROID_TARGET_RUSTFLAGS_ENV,
+    LINUX_ANDROID_HOST_BUILD_TMPDIR, android_linker, sha256_file, validate_aarch64_elf,
+    verify_ndk_revision,
 };
 
 const COMMAND: &str = "collect-android-arm64-fwmark-census";
@@ -61,7 +61,50 @@ const CARGO_BUILD_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const REMOTE_TEST_TIMEOUT_SECONDS: u64 = 210;
 const REMOTE_TEST_KILL_GRACE_SECONDS: u64 = 5;
 const PROBE_ERROR_PREFIX: &[u8] = b"Android fwmark census probe: ";
+const SANITIZED_PROBE_FAILURE_PREFIX: &str = "fwmark census probe stopped before reports: ";
+const RUNNER_STAGE_FAILURE_PREFIX: &str = "fwmark census runner stopped at ";
 const MAX_PROBE_ERROR_LABEL_BYTES: usize = 160;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RunnerStage {
+    DeviceProfile,
+    PrebuildProcessAbsence,
+    NdkEnvironment,
+    NdkRevision,
+    AndroidLinker,
+    ProbeBuild,
+    ArtifactIdentity,
+    ArtifactElfValidation,
+    PrecreateDeviceIdentity,
+    RemoteToken,
+    RemotePathPreflight,
+    RemoteDirectoryCreate,
+    RemoteProbeExecution,
+    RemoteCleanup,
+    RemoteTransaction,
+}
+
+impl RunnerStage {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::DeviceProfile => "device-profile",
+            Self::PrebuildProcessAbsence => "prebuild-process-absence",
+            Self::NdkEnvironment => "ndk-environment",
+            Self::NdkRevision => "ndk-revision",
+            Self::AndroidLinker => "android-linker",
+            Self::ProbeBuild => "probe-build",
+            Self::ArtifactIdentity => "artifact-identity",
+            Self::ArtifactElfValidation => "artifact-elf-validation",
+            Self::PrecreateDeviceIdentity => "precreate-device-identity",
+            Self::RemoteToken => "remote-token",
+            Self::RemotePathPreflight => "remote-path-preflight",
+            Self::RemoteDirectoryCreate => "remote-directory-create",
+            Self::RemoteProbeExecution => "remote-probe-execution",
+            Self::RemoteCleanup => "remote-cleanup",
+            Self::RemoteTransaction => "remote-transaction",
+        }
+    }
+}
 
 pub(super) fn parse_options(arguments: &[OsString]) -> Result<Options, String> {
     Options::parse(arguments, COMMAND)
@@ -71,20 +114,33 @@ pub(super) fn run(options: Options) -> Result<(), String> {
     if env::consts::OS != "linux" {
         return Err("the ARM64 Android fwmark census runner requires a Linux/WSL host".to_owned());
     }
-    let device = verify_device(&options)?;
-    prove_process_absent(&options, "before building the probe")?;
+    let device = at_runner_stage(RunnerStage::DeviceProfile, verify_device(&options))?;
+    at_runner_stage(
+        RunnerStage::PrebuildProcessAbsence,
+        prove_process_absent(&options, "before building the probe"),
+    )?;
     let ndk_root = env::var_os("ANDROID_NDK_HOME")
         .or_else(|| env::var_os("ANDROID_NDK_ROOT"))
         .map(PathBuf::from)
-        .ok_or_else(|| {
-            format!("ANDROID_NDK_HOME must point to Android NDK revision {ANDROID_NDK_REVISION}")
-        })?;
-    verify_ndk_revision(&ndk_root)?;
-    let linker = android_linker(&ndk_root, ANDROID_TARGET, CLANG_TARGET)?;
-    let artifact = build_probe_artifact(&linker)?;
-    let artifact_identity = ArtifactIdentity::from_file(&artifact)?;
-    validate_aarch64_elf(PROBE_BINARY_TARGET, &artifact)?;
-    revalidate_device(&options, &device, "before creating the remote directory")?;
+        .ok_or_else(|| runner_stage_error(RunnerStage::NdkEnvironment))?;
+    at_runner_stage(RunnerStage::NdkRevision, verify_ndk_revision(&ndk_root))?;
+    let linker = at_runner_stage(
+        RunnerStage::AndroidLinker,
+        android_linker(&ndk_root, ANDROID_TARGET, CLANG_TARGET),
+    )?;
+    let artifact = at_runner_stage(RunnerStage::ProbeBuild, build_probe_artifact(&linker))?;
+    let artifact_identity = at_runner_stage(
+        RunnerStage::ArtifactIdentity,
+        ArtifactIdentity::from_file(&artifact),
+    )?;
+    at_runner_stage(
+        RunnerStage::ArtifactElfValidation,
+        validate_aarch64_elf(PROBE_BINARY_TARGET, &artifact),
+    )?;
+    at_runner_stage(
+        RunnerStage::PrecreateDeviceIdentity,
+        revalidate_device(&options, &device, "before creating the remote directory"),
+    )?;
 
     println!(
         "validated rooted ARM64 target model={} sdk={} abi={} kernel_arch={} kernel_release={}",
@@ -95,16 +151,31 @@ pub(super) fn run(options: Options) -> Result<(), String> {
         artifact_identity.sha256, artifact_identity.size,
     );
 
-    let mut remote = RemoteDirectory::generate()?;
-    preflight_remote_directory(&options, &device, &remote)?;
+    let mut remote = at_runner_stage(RunnerStage::RemoteToken, RemoteDirectory::generate())?;
+    at_runner_stage(
+        RunnerStage::RemotePathPreflight,
+        preflight_remote_directory(&options, &device, &remote),
+    )?;
     let result = run_remote_transaction(
         &mut remote,
-        |remote| create_remote_directory(&options, &device, remote),
+        |remote| {
+            at_runner_stage(
+                RunnerStage::RemoteDirectoryCreate,
+                create_remote_directory(&options, &device, remote),
+            )
+        },
         |remote| {
             push_execute_and_validate(&options, &artifact, &artifact_identity, &device, remote)
+                .map_err(sanitize_probe_execution_error)
         },
-        |remote| cleanup_remote_directory(&options, &device, remote),
-    );
+        |remote| {
+            at_runner_stage(
+                RunnerStage::RemoteCleanup,
+                cleanup_remote_directory(&options, &device, remote),
+            )
+        },
+    )
+    .map_err(sanitize_remote_transaction_error);
     match result {
         Ok(()) => {
             println!(
@@ -114,6 +185,73 @@ pub(super) fn run(options: Options) -> Result<(), String> {
         }
         Err(error) => Err(error),
     }
+}
+
+fn at_runner_stage<T>(stage: RunnerStage, result: Result<T, String>) -> Result<T, String> {
+    result.map_err(|_| runner_stage_error(stage))
+}
+
+fn runner_stage_error(stage: RunnerStage) -> String {
+    format!("{RUNNER_STAGE_FAILURE_PREFIX}{}", stage.as_str())
+}
+
+fn sanitize_probe_execution_error(error: String) -> String {
+    if error
+        .strip_prefix(SANITIZED_PROBE_FAILURE_PREFIX)
+        .is_some_and(canonical_probe_error_label)
+    {
+        error
+    } else {
+        runner_stage_error(RunnerStage::RemoteProbeExecution)
+    }
+}
+
+fn sanitize_remote_transaction_error(error: String) -> String {
+    if error.contains("; mandatory remote cleanup also failed: ") {
+        return runner_stage_error(RunnerStage::RemoteCleanup);
+    }
+    if is_runner_stage_error(&error)
+        || error
+            .strip_prefix(SANITIZED_PROBE_FAILURE_PREFIX)
+            .is_some_and(canonical_probe_error_label)
+    {
+        error
+    } else {
+        runner_stage_error(RunnerStage::RemoteTransaction)
+    }
+}
+
+fn is_runner_stage_error(error: &str) -> bool {
+    error
+        .strip_prefix(RUNNER_STAGE_FAILURE_PREFIX)
+        .is_some_and(|stage| {
+            matches!(
+                stage,
+                "device-profile"
+                    | "prebuild-process-absence"
+                    | "ndk-environment"
+                    | "ndk-revision"
+                    | "android-linker"
+                    | "probe-build"
+                    | "artifact-identity"
+                    | "artifact-elf-validation"
+                    | "precreate-device-identity"
+                    | "remote-token"
+                    | "remote-path-preflight"
+                    | "remote-directory-create"
+                    | "remote-probe-execution"
+                    | "remote-cleanup"
+                    | "remote-transaction"
+            )
+        })
+}
+
+fn canonical_probe_error_label(label: &str) -> bool {
+    !label.is_empty()
+        && label.len() <= MAX_PROBE_ERROR_LABEL_BYTES
+        && label
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -711,9 +849,7 @@ fn parse_probe_reports_or_sanitized_failure(
         Ok(reports) => Ok(reports),
         Err(error) if success => Err(error),
         Err(_) => match sanitized_probe_error_label(stderr) {
-            Some(label) => Err(format!(
-                "fwmark census probe stopped before reports: {label}"
-            )),
+            Some(label) => Err(format!("{SANITIZED_PROBE_FAILURE_PREFIX}{label}")),
             None => Err("fwmark census probe failed before emitting canonical reports".to_owned()),
         },
     }
@@ -723,15 +859,8 @@ fn sanitized_probe_error_label(stderr: &[u8]) -> Option<&str> {
     let line = stderr
         .strip_suffix(b"\n")?
         .strip_prefix(PROBE_ERROR_PREFIX)?;
-    if line.is_empty()
-        || line.len() > MAX_PROBE_ERROR_LABEL_BYTES
-        || !line
-            .iter()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
-    {
-        return None;
-    }
-    std::str::from_utf8(line).ok()
+    let label = std::str::from_utf8(line).ok()?;
+    canonical_probe_error_label(label).then_some(label)
 }
 
 fn preflight_remote_directory_script(
@@ -1270,6 +1399,63 @@ mod tests {
             "fwmark census probe failed before emitting canonical reports"
         );
         assert!(!error.contains("private"));
+    }
+
+    #[test]
+    fn runner_stage_errors_discard_serials_paths_and_low_level_diagnostics() {
+        let hostile =
+            "adb -s fixture-serial shell cat /data/user/0/private: permission denied".to_owned();
+        for stage in [
+            RunnerStage::DeviceProfile,
+            RunnerStage::PrebuildProcessAbsence,
+            RunnerStage::NdkEnvironment,
+            RunnerStage::NdkRevision,
+            RunnerStage::AndroidLinker,
+            RunnerStage::ProbeBuild,
+            RunnerStage::ArtifactIdentity,
+            RunnerStage::ArtifactElfValidation,
+            RunnerStage::PrecreateDeviceIdentity,
+            RunnerStage::RemoteToken,
+            RunnerStage::RemotePathPreflight,
+            RunnerStage::RemoteDirectoryCreate,
+            RunnerStage::RemoteCleanup,
+        ] {
+            let error = at_runner_stage::<()>(stage, Err(hostile.clone()))
+                .expect_err("every detailed runner failure must stop");
+            assert_eq!(error, runner_stage_error(stage));
+            assert!(is_runner_stage_error(&error));
+            assert!(!error.contains("fixture-serial"), "{error}");
+            assert!(!error.contains("/data/"), "{error}");
+        }
+    }
+
+    #[test]
+    fn remote_error_sanitizer_preserves_only_a_canonical_probe_class() {
+        let bounded =
+            format!("{SANITIZED_PROBE_FAILURE_PREFIX}collection-external-before-kernel-config");
+        assert_eq!(sanitize_probe_execution_error(bounded.clone()), bounded);
+
+        for hostile in [
+            "adb -s fixture-serial shell su -c /system/bin/sh",
+            "fwmark census probe stopped before reports: secret=/data/private",
+            "fwmark census probe stopped before reports: valid-label; extra",
+        ] {
+            let error = sanitize_probe_execution_error(hostile.to_owned());
+            assert_eq!(error, runner_stage_error(RunnerStage::RemoteProbeExecution));
+            assert!(!error.contains("fixture-serial"), "{error}");
+            assert!(!error.contains("/data/"), "{error}");
+        }
+    }
+
+    #[test]
+    fn remote_cleanup_failure_takes_precedence_without_forwarding_payloads() {
+        let error = sanitize_remote_transaction_error(format!(
+            "{}; mandatory remote cleanup also failed: serial=fixture-serial path=/data/private",
+            runner_stage_error(RunnerStage::RemoteProbeExecution)
+        ));
+        assert_eq!(error, runner_stage_error(RunnerStage::RemoteCleanup));
+        assert!(!error.contains("fixture-serial"), "{error}");
+        assert!(!error.contains("/data/"), "{error}");
     }
 
     #[test]

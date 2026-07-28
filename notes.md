@@ -2061,3 +2061,29 @@ It does not yet validate the production Rust composition because that compositio
   `cargo xtask ci` gate. Payload-suppressing scans found no added private-key header, cloud token,
   credential assignment, hardware-serial assignment, or device identifier. No device command or
   mutation occurred during this host implementation phase.
+
+## Capability-First Early Runner Failures And Cleanup (2026-07-27)
+
+- The first quiet S6 runner invocation returned the bounded outer class
+  `runner-failed-before-bounded-report`. Its release artifact remained the prior
+  `d6822b0e677ca756cd6d67cb547cd1fa581ef15263380d29ccf8fb089e8ddac4` build, so the new
+  kernel-config gate did not execute and this attempt supplies no new census evidence.
+- The runner retained no serial or raw ADB output. A separate root read proved zero generated
+  census paths and zero probe processes. Independent post-run checks found the expected model,
+  build, boot, architecture, and fingerprint unchanged.
+- Repeating the runner's exact release build on the host succeeded and produced a 1,083,176-byte
+  Android 31 AArch64 PIE with SHA-256
+  `838c1d7c9fd0a6dfd29b87a5b19eedebde66bf105050def91e5cd06a26f36ffd`.
+- A shell-only NDK gate then failed because its temporary `awk` expression compared an untrimmed
+  key. This was not runner evidence: the installed revision is exactly `27.3.13750724`, the Rust
+  verifier trims it correctly, and the exact release build passes.
+- A second quiet invocation selected the new artifact but still stopped before canonical reports.
+  The outer sanitizer again retained only `runner-failed-before-bounded-report`. Mandatory cleanup
+  and an independent root proof found zero generated paths and processes, with stable exact device
+  identity.
+- Review found that early runner errors could carry the explicit serial inside low-level rendered
+  ADB commands, while the privacy-safe outer class erased the failing stage. The runner now maps
+  every device, toolchain, artifact, remote-path, execution, and cleanup boundary to one fixed
+  payload-free stage. It preserves only a validated lowercase/hyphen probe class and makes cleanup
+  failure take precedence. Fifteen focused tests cover this runner module, including three new
+  hostile serial/path regressions; strict Clippy, rustfmt, and diff hygiene pass.

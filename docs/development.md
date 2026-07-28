@@ -157,6 +157,9 @@ transactions under a compiled diagnostic-only authority gate. Output is limited 
 27 source/plane cells, mark operations and masks, bounded ordered-write chain/ordinal/selector
 records, 36 counts, and projection digests. It excludes the hardware serial, boot ID, build
 fingerprint, endpoints, credentials, raw rulesets, BPF instructions, and interface names.
+Runner-side failures expose only `fwmark census runner stopped at STAGE`, where `STAGE` is one
+fixed lowercase/hyphen label. A probe failure may additionally preserve its already-validated
+lowercase/hyphen collector class; arbitrary ADB, path, kernel, and tool diagnostics are discarded.
 The `--quiet` Cargo flag is required because Cargo otherwise echoes the full child argument list,
 including the explicit serial, before `xtask` starts.
 

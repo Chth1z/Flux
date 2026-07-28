@@ -3,9 +3,9 @@ use std::fmt;
 use std::num::NonZeroU16;
 
 use flux_core::{
-    AddressHostSetPlan, CaptureApplicationMode, CaptureApplicationPolicy, FluxConfig,
-    ShadowCaptureCompileError, ShadowCaptureProgramRequest, ShadowCompilationReport,
-    compile_shadow_capture_program,
+    AddressHostSetPlan, CaptureApplicationMode, CaptureApplicationPolicy,
+    CaptureProgramCompilation, CaptureProgramCompileError, CaptureProgramRequest, FluxConfig,
+    compile_capture_program,
 };
 
 use super::compiler::EngineConfigArtifact;
@@ -46,7 +46,7 @@ impl DesiredStateCompileRequest {
 pub(crate) struct DesiredStateArtifacts {
     desired_state: FluxConfig,
     engine_source: SelectedEngineSource,
-    capture: ShadowCompilationReport,
+    capture: CaptureProgramCompilation,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -112,7 +112,7 @@ impl SelectedEngineSource {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DesiredStateCaptureArtifacts {
     desired_state: FluxConfig,
-    capture: ShadowCompilationReport,
+    capture: CaptureProgramCompilation,
 }
 
 impl DesiredStateCaptureArtifacts {
@@ -122,7 +122,7 @@ impl DesiredStateCaptureArtifacts {
     }
 
     #[must_use]
-    pub(crate) const fn capture(&self) -> &ShadowCompilationReport {
+    pub(crate) const fn capture(&self) -> &CaptureProgramCompilation {
         &self.capture
     }
 
@@ -161,11 +161,13 @@ impl DesiredStateArtifacts {
 
     #[cfg(test)]
     #[must_use]
-    pub(crate) const fn capture(&self) -> &ShadowCompilationReport {
+    pub(crate) const fn capture(&self) -> &CaptureProgramCompilation {
         &self.capture
     }
 
-    pub(crate) fn into_parts(self) -> (FluxConfig, SelectedEngineSource, ShadowCompilationReport) {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (FluxConfig, SelectedEngineSource, CaptureProgramCompilation) {
         (self.desired_state, self.engine_source, self.capture)
     }
 }
@@ -197,7 +199,7 @@ pub(crate) enum DesiredStateCompileError {
         configured: NonZeroU16,
         selected: NonZeroU16,
     },
-    Capture(ShadowCaptureCompileError),
+    Capture(CaptureProgramCompileError),
 }
 
 impl DesiredStateCompileError {
@@ -295,7 +297,7 @@ pub(crate) fn compile_desired_state_capture(
         });
     }
 
-    let capture = compile_shadow_capture_program(ShadowCaptureProgramRequest::new(
+    let capture = compile_capture_program(CaptureProgramRequest::new(
         config.capture().scope(),
         config.engine().credentials(),
         config.bypass().policy().clone(),

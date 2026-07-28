@@ -650,7 +650,7 @@ fn classifier_audit_carries_static_bounds_into_the_generic_and_android_planners(
     let report = classify_android_rpdb(&inventory, AndroidNetdSourceProfile::AospAndroid12R1);
     assert_eq!(report.unknown_rule_count(), 0);
 
-    let placement = RpdbFamilyPlacement::new(
+    let placement = RpdbFamilyPlacement::with_address_bypass(
         RulePriority::from_raw(28_500),
         RulePriority::from_raw(28_600),
         RuleTableId::from_raw(500),
@@ -663,7 +663,7 @@ fn classifier_audit_carries_static_bounds_into_the_generic_and_android_planners(
         RpdbPlacementPlanError::PriorityWindowViolation {
             family: NetworkAddressFamily::Ipv4,
             last_must_precede: RulePriority::from_raw(28_999),
-            bypass: RulePriority::from_raw(28_500),
+            address_bypass: Some(RulePriority::from_raw(28_500)),
             proxy: RulePriority::from_raw(28_600),
             first_terminal_barrier: RulePriority::from_raw(29_000),
         }
@@ -675,7 +675,7 @@ fn classifier_audit_carries_static_bounds_into_the_generic_and_android_planners(
         AndroidRpdbPlacementPlanError::StaticPriorityWindowViolation {
             family: NetworkAddressFamily::Ipv4,
             last_reserved_must_precede: RulePriority::from_raw(28_999),
-            bypass: RulePriority::from_raw(28_500),
+            address_bypass: Some(RulePriority::from_raw(28_500)),
             proxy: RulePriority::from_raw(28_600),
             first_default_network: RulePriority::from_raw(29_000),
         }

@@ -10,11 +10,10 @@ use std::time::{Duration, SystemTime};
 use std::os::unix::fs::MetadataExt;
 
 use flux_core::{
-    AdministrativeState, CapabilityProfile, CapabilityProfileSource, ConfigError,
-    ConfigurationChangeClient, ConfigurationChangeReport, ControlClient, ControlError,
-    ControlObservation, ControlObservationIngress, ControlSnapshot, ControlSnapshotSource,
-    FluxConfig, MutationGate, OperationReport, Reason, RuntimeControl, RuntimeDispatcher,
-    RuntimeIntent,
+    AdministrativeState, CapabilityProfileSource, ConfigError, ConfigurationChangeClient,
+    ConfigurationChangeReport, ControlClient, ControlError, ControlObservation,
+    ControlObservationIngress, ControlSnapshot, ControlSnapshotSource, FluxConfig, OperationReport,
+    Reason, RuntimeControl, RuntimeDispatcher, RuntimeIntent,
 };
 use flux_platform::{
     CapabilityProfilePaths, DaemonReactor, FileObservationBatch, FileObservationPaths,
@@ -22,18 +21,20 @@ use flux_platform::{
     ShutdownSignal,
 };
 
-use crate::generation_engine_config::{AddressReconciler, AddressReconciliationAttachment};
+use crate::generation_engine_config::AddressReconciler;
 use crate::inspection::ProcessInspectionSource;
+use crate::native_admission::{
+    AdmittedNativeRuntime, ConfiguredNativeAdmission, NativeAdmissionCandidate,
+    NativeAdmissionRejection, NativeAdmissionState,
+};
 use crate::native_generation_source::{
     AssembledNativeGenerationSource, NativeGenerationSourcePaths,
     PlatformNativeGenerationTargetAdmission, SystemAndroidGenerationPlanningSource,
-    SystemNativeInventorySource,
 };
 use crate::native_runtime_writer::compose_native_runtime;
 use crate::offline_cleanup::{
     DaemonLease, DaemonLeaseError, NativeOfflineRecovery, OfflineRecovery,
 };
-use crate::runtime_coordinator::RuntimeFunctionalCanary;
 use crate::runtime_layout::RuntimeLayout;
 use crate::runtime_logging::{self, LogSeverity, daemon_log};
 use crate::subscription::{
@@ -152,25 +153,57 @@ where
         // explicitly restore a clean mask before exec.
         let shutdown = ShutdownSignal::install()
             .map_err(|error| DaemonError::Socket(ControlSocketError::Platform(error)))?;
+        let (mut reactor, _stop) = DaemonReactor::open(shutdown)
+            .map_err(ControlSocketError::Reactor)
+            .map_err(DaemonError::Socket)?;
         let profile = Arc::new(profile_source.collect_capability_profile());
-        let (
-            control,
-            runtime,
-            address_reconciliation_attachment,
-            subscription_client,
-            file_observation,
-        ) = if matches!(profile.mutation_gate(), MutationGate::Allowed)
-            && profile.device_identity().verified().is_some()
-        {
-            compose_native_daemon(&profile, &options, &runtime_layout)?
-        } else {
-            (
-                DaemonControl::ReadOnly,
-                RuntimeSnapshotSource::default(),
-                None,
-                None,
-                None,
-            )
+        let pending_admission = match NativeAdmissionCandidate::evaluate(&profile) {
+            Err(reason) => PendingNativeAdmission::Rejected(reason),
+            Ok(candidate) => {
+                let config =
+                    FluxConfig::load(&options.config_path).map_err(DaemonError::FluxConfig)?;
+                match candidate.configure(config) {
+                    Ok(configured) => PendingNativeAdmission::Configured(Box::new(configured)),
+                    Err(reason) => PendingNativeAdmission::Rejected(reason),
+                }
+            }
+        };
+
+        let network_inventory =
+            if matches!(pending_admission, PendingNativeAdmission::Configured(_)) {
+                reactor
+                    .attach_network_inventory(|degradation| {
+                        daemon_log(
+                            LogSeverity::Warn,
+                            "network_inventory",
+                            format_args!("observation disabled: {degradation}"),
+                        );
+                    })
+                    .map_err(ControlSocketError::Reactor)
+                    .map_err(DaemonError::Socket)?
+            } else {
+                None
+            };
+        let (native_admission, composition) = match pending_admission {
+            PendingNativeAdmission::Rejected(reason) => (
+                NativeAdmissionState::Rejected(reason),
+                DaemonComposition::read_only(),
+            ),
+            PendingNativeAdmission::Configured(configured) => {
+                match configured.admit(network_inventory) {
+                    Ok(admitted) => {
+                        recover_native_startup(&admitted, &options, &runtime_layout)?;
+                        (
+                            NativeAdmissionState::Admitted,
+                            compose_native_daemon(admitted, &options, &runtime_layout)?,
+                        )
+                    }
+                    Err(reason) => (
+                        NativeAdmissionState::Rejected(reason),
+                        DaemonComposition::read_only(),
+                    ),
+                }
+            }
         };
 
         let inspection = Arc::new(ProcessInspectionSource::new(
@@ -181,9 +214,10 @@ where
         ));
         let handler = ControlConnectionHandler::with_runtime_subscription_and_inspection(
             Arc::clone(&profile),
-            control,
-            runtime,
-            subscription_client,
+            native_admission,
+            composition.control,
+            composition.runtime,
+            composition.subscription_client,
             inspection,
         );
         let serve_connection = move |connection| {
@@ -195,36 +229,11 @@ where
                 );
             }
         };
-        let network_inventory_enabled = address_reconciliation_attachment.is_some();
-        let (mut reactor, _stop, network_inventory) = if network_inventory_enabled {
-            DaemonReactor::bind_with_network_inventory(
-                &options.socket_path,
-                shutdown,
-                serve_connection,
-                |degradation| {
-                    daemon_log(
-                        LogSeverity::Warn,
-                        "network_inventory",
-                        format_args!("observation disabled: {degradation}"),
-                    );
-                },
-            )
-        } else {
-            DaemonReactor::bind(&options.socket_path, shutdown, serve_connection)
-                .map(|(reactor, stop)| (reactor, stop, None))
-        }
-        .map_err(ControlSocketError::Reactor)
-        .map_err(DaemonError::Socket)?;
-        if let (Some(attachment), Some(source)) =
-            (address_reconciliation_attachment, network_inventory)
-        {
-            attachment.attach(source).map_err(|_| {
-                DaemonError::Invariant(
-                    "network inventory source was attached more than once before reactor startup",
-                )
-            })?;
-        }
-        if let Some((paths, mut controller)) = file_observation {
+        reactor
+            .bind_control(&options.socket_path, serve_connection)
+            .map_err(ControlSocketError::Reactor)
+            .map_err(DaemonError::Socket)?;
+        if let Some((paths, mut controller)) = composition.file_observation {
             reactor
                 .attach_file_observation(
                     &paths,
@@ -260,37 +269,39 @@ where
     result
 }
 
-type DaemonComposition = (
-    DaemonControl,
-    RuntimeSnapshotSource,
-    Option<AddressReconciliationAttachment>,
-    Option<SubscriptionRefreshClient>,
-    Option<(FileObservationPaths, FileObservationController)>,
-);
+enum PendingNativeAdmission {
+    Rejected(NativeAdmissionRejection),
+    Configured(Box<ConfiguredNativeAdmission>),
+}
 
-fn compose_native_daemon(
-    profile: &Arc<CapabilityProfile>,
+struct DaemonComposition {
+    control: DaemonControl,
+    runtime: RuntimeSnapshotSource,
+    subscription_client: Option<SubscriptionRefreshClient>,
+    file_observation: Option<(FileObservationPaths, FileObservationController)>,
+}
+
+impl DaemonComposition {
+    fn read_only() -> Self {
+        Self {
+            control: DaemonControl::ReadOnly,
+            runtime: RuntimeSnapshotSource::default(),
+            subscription_client: None,
+            file_observation: None,
+        }
+    }
+}
+
+fn recover_native_startup(
+    admitted: &AdmittedNativeRuntime,
     options: &DaemonOptions,
     runtime_layout: &RuntimeLayout,
-) -> Result<DaemonComposition, DaemonError> {
-    let boot_identity =
-        profile
-            .boot_identity()
-            .verified()
-            .cloned()
-            .ok_or(DaemonError::Invariant(
-                "verified device identity has no verified boot identity",
-            ))?;
-    let network_namespace = profile
-        .device_identity()
-        .verified()
-        .expect("native composition requires the checked verified identity")
-        .network_namespace();
+) -> Result<(), DaemonError> {
     let platform_config = options.native_xtables_runtime_config(runtime_layout);
     if let Some(convergence) = NativeXtablesAndroidRuntime::compose_recovery(
-        platform_config.clone(),
-        boot_identity.clone(),
-        network_namespace,
+        platform_config,
+        admitted.boot_identity.clone(),
+        admitted.network_namespace,
     )
     .map_err(|source| DaemonError::native("compose native startup recovery", source))?
     {
@@ -298,8 +309,23 @@ fn compose_native_daemon(
             .recover_stopped()
             .map_err(|source| DaemonError::native("recover native startup state", source))?;
     }
+    Ok(())
+}
 
-    let config = FluxConfig::load(&options.config_path).map_err(DaemonError::FluxConfig)?;
+fn compose_native_daemon(
+    admitted: AdmittedNativeRuntime,
+    options: &DaemonOptions,
+    runtime_layout: &RuntimeLayout,
+) -> Result<DaemonComposition, DaemonError> {
+    let AdmittedNativeRuntime {
+        boot_identity,
+        network_namespace,
+        config,
+        initial_inventory,
+        inventory,
+        functional_canary,
+    } = admitted;
+    let platform_config = options.native_xtables_runtime_config(runtime_layout);
     let observation_paths =
         file_observation_paths(&options.config_path, &options.disable_path, &config);
     let observation_baseline = ObservedInputsFingerprint::capture(&observation_paths)
@@ -315,8 +341,6 @@ fn compose_native_daemon(
         inspect_disable_path(&options.disable_path).map_err(DaemonError::Configuration)?;
     let initial_intent = initial_intent(&store, disable_present)?;
 
-    let initial_inventory = SystemNativeInventorySource::collect_initial()
-        .map_err(|source| DaemonError::native("collect initial network inventory", source))?;
     let mut planning =
         SystemAndroidGenerationPlanningSource::for_current_daemon(runtime_layout.run_path());
     let initial_planning = planning
@@ -364,20 +388,20 @@ fn compose_native_daemon(
     );
     let source = AssembledNativeGenerationSource::<_, _, _, NativeCaptureTargetIdentity>::new(
         source_paths,
-        SystemNativeInventorySource::new(initial_inventory),
+        inventory.clone(),
         planning,
         PlatformNativeGenerationTargetAdmission::new(admission),
         accepted_subscription,
     );
     let maintenance_interval =
         engine_maintenance_interval(config.daemon().reconcile_debounce().get());
-    let (address_reconciliation_attachment, address_reconciler) =
-        AddressReconciler::deferred(&options.config_path);
+    let address_reconciler =
+        AddressReconciler::for_network_inventory(&options.config_path, inventory);
     let dispatcher = compose_native_runtime(
         convergence,
         move || source,
         maintenance_interval,
-        RuntimeFunctionalCanary::StructuralOnlyCompatibility,
+        functional_canary,
     )
     .map_err(|source| DaemonError::native("compose native runtime coordinator", source))?
     .with_address_reconciler(address_reconciler)
@@ -419,13 +443,12 @@ fn compose_native_daemon(
         initial_inputs: Some(observation_baseline),
         ingress: observation_ingress,
     };
-    Ok((
-        DaemonControl::Runtime(control),
+    Ok(DaemonComposition {
+        control: DaemonControl::Runtime(control),
         runtime,
-        Some(address_reconciliation_attachment),
-        Some(subscription_client),
-        Some((observation_paths, observation_controller)),
-    ))
+        subscription_client: Some(subscription_client),
+        file_observation: Some((observation_paths, observation_controller)),
+    })
 }
 
 enum DaemonControl {

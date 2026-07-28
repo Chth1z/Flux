@@ -208,7 +208,7 @@ fn execute_isolated(root: &Path) -> Result<(), String> {
     execute(
         &mut first.coordinator,
         RuntimeIntent::Reload {
-            reason: Reason::Fluxctl,
+            reason: Reason::UserControl,
         },
         "reload native successor",
     )?;
@@ -255,7 +255,7 @@ fn execute_isolated(root: &Path) -> Result<(), String> {
     let completion = execute(
         &mut first.coordinator,
         RuntimeIntent::ResyncAddresses {
-            reason: Reason::Fluxctl,
+            reason: Reason::UserControl,
         },
         "converge address-driven native successor",
     )?;
@@ -280,7 +280,7 @@ fn execute_isolated(root: &Path) -> Result<(), String> {
     if first
         .coordinator
         .execute(&RuntimeIntent::Reload {
-            reason: Reason::Fluxctl,
+            reason: Reason::UserControl,
         })
         .is_ok()
     {
@@ -307,7 +307,7 @@ fn execute_isolated(root: &Path) -> Result<(), String> {
     execute(
         &mut first.coordinator,
         RuntimeIntent::Reload {
-            reason: Reason::Fluxctl,
+            reason: Reason::UserControl,
         },
         "reload after rejected candidate",
     )?;
@@ -327,7 +327,7 @@ fn execute_isolated(root: &Path) -> Result<(), String> {
     execute(
         &mut first.coordinator,
         RuntimeIntent::Stopped {
-            reason: Reason::Fluxctl,
+            reason: Reason::UserControl,
         },
         "stop native runtime",
     )?;
@@ -338,7 +338,7 @@ fn execute_isolated(root: &Path) -> Result<(), String> {
     execute(
         &mut first.coordinator,
         RuntimeIntent::Running {
-            reason: Reason::Fluxctl,
+            reason: Reason::UserControl,
         },
         "restart before crash recovery",
     )?;
@@ -360,7 +360,7 @@ fn execute_isolated(root: &Path) -> Result<(), String> {
     execute(
         &mut recovered.coordinator,
         RuntimeIntent::Stopped {
-            reason: Reason::Fluxctl,
+            reason: Reason::UserControl,
         },
         "stop recovered native runtime",
     )?;
@@ -369,7 +369,7 @@ fn execute_isolated(root: &Path) -> Result<(), String> {
     execute(
         &mut recovered.coordinator,
         RuntimeIntent::Running {
-            reason: Reason::Fluxctl,
+            reason: Reason::UserControl,
         },
         "start before offline recovery",
     )?;
@@ -500,9 +500,9 @@ impl Fixture {
             convergence,
             || source,
             MAINTENANCE_INTERVAL,
-            RuntimeFunctionalCanary::StructuralOnlyCompatibility,
+            RuntimeFunctionalCanary::StructuralVerificationOnly,
         )
-        .map_err(|error| format!("compose dispatcher-free native runtime: {error}"))?
+        .map_err(|error| format!("compose single-owner native runtime: {error}"))?
         .with_address_reconciler(reconciler);
         Ok(RuntimeInstance {
             coordinator,

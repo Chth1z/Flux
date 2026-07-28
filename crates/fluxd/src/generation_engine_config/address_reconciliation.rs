@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 #[cfg(test)]
 use std::sync::RwLock;
@@ -21,34 +21,13 @@ use super::{
     compile_desired_state_capture,
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum IncompleteInventoryState {
-    Unavailable,
-    Stale,
-}
-
-enum CompleteInventoryObservation {
-    Incomplete(IncompleteInventoryState),
-    Snapshot(Arc<NetworkInventory>),
-}
-
 trait CompleteNetworkInventorySource: Send + 'static {
-    fn observe(&self) -> CompleteInventoryObservation;
+    fn snapshot(&self) -> Option<Arc<NetworkInventory>>;
 }
 
-struct DeferredNetworkInventorySource {
-    source: Arc<OnceLock<NetworkInventorySource>>,
-}
-
-impl CompleteNetworkInventorySource for DeferredNetworkInventorySource {
-    fn observe(&self) -> CompleteInventoryObservation {
-        let Some(source) = self.source.get() else {
-            return CompleteInventoryObservation::Incomplete(IncompleteInventoryState::Unavailable);
-        };
-        match source.snapshot() {
-            Some(snapshot) => CompleteInventoryObservation::Snapshot(snapshot),
-            None => CompleteInventoryObservation::Incomplete(IncompleteInventoryState::Stale),
-        }
+impl CompleteNetworkInventorySource for NetworkInventorySource {
+    fn snapshot(&self) -> Option<Arc<NetworkInventory>> {
+        NetworkInventorySource::snapshot(self)
     }
 }
 
@@ -67,30 +46,11 @@ impl ReplayNetworkInventorySource {
 
 #[cfg(test)]
 impl CompleteNetworkInventorySource for ReplayNetworkInventorySource {
-    fn observe(&self) -> CompleteInventoryObservation {
-        match self
-            .current
+    fn snapshot(&self) -> Option<Arc<NetworkInventory>> {
+        self.current
             .read()
             .expect("replay source read lock")
             .clone()
-        {
-            Some(inventory) => CompleteInventoryObservation::Snapshot(inventory),
-            None => CompleteInventoryObservation::Incomplete(IncompleteInventoryState::Stale),
-        }
-    }
-}
-
-/// One-shot daemon-side handoff for the source returned after reactor binding.
-pub(crate) struct AddressReconciliationAttachment {
-    source: Arc<OnceLock<NetworkInventorySource>>,
-}
-
-impl AddressReconciliationAttachment {
-    pub(crate) fn attach(
-        self,
-        source: NetworkInventorySource,
-    ) -> Result<(), NetworkInventorySource> {
-        self.source.set(source)
     }
 }
 
@@ -122,7 +82,6 @@ impl AddressReconciliationInspection {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AddressReconciliationOutcome {
-    AwaitingSource,
     AwaitingCompleteSnapshot,
     Invalidated(AddressReconciliationInspection),
     Unchanged(AddressReconciliationInspection),
@@ -169,7 +128,7 @@ impl AddressReconciledGenerationInputs {
             snapshot_id: self.inventory.snapshot_id(),
             epoch: self.inventory.epoch(),
             host_count: self.host_bypass.hosts().len(),
-            capture_digest: self.capture.capture().artifact().digest(),
+            capture_digest: self.capture.capture().program().digest(),
         }
     }
 
@@ -271,19 +230,11 @@ pub(crate) struct AddressReconciler {
 
 impl AddressReconciler {
     #[must_use]
-    pub(crate) fn deferred(
+    pub(crate) fn for_network_inventory(
         desired_state_path: impl AsRef<Path>,
-    ) -> (AddressReconciliationAttachment, Self) {
-        let source = Arc::new(OnceLock::new());
-        (
-            AddressReconciliationAttachment {
-                source: Arc::clone(&source),
-            },
-            Self::new(
-                desired_state_path,
-                Box::new(DeferredNetworkInventorySource { source }),
-            ),
-        )
+        source: NetworkInventorySource,
+    ) -> Self {
+        Self::new(desired_state_path, Box::new(source))
     }
 
     #[cfg(test)]
@@ -320,11 +271,8 @@ impl AddressReconciler {
     pub(crate) fn reconcile(
         &mut self,
     ) -> Result<AddressReconciliationOutcome, AddressReconciliationError> {
-        let inventory = match self.source.observe() {
-            CompleteInventoryObservation::Incomplete(IncompleteInventoryState::Unavailable) => {
-                return Ok(AddressReconciliationOutcome::AwaitingSource);
-            }
-            CompleteInventoryObservation::Incomplete(IncompleteInventoryState::Stale) => {
+        let inventory = match self.source.snapshot() {
+            None => {
                 self.last_attempted = None;
                 self.reconciliation_requested = true;
                 return Ok(match self.current.take() {
@@ -334,7 +282,7 @@ impl AddressReconciler {
                     None => AddressReconciliationOutcome::AwaitingCompleteSnapshot,
                 });
             }
-            CompleteInventoryObservation::Snapshot(inventory) => inventory,
+            Some(inventory) => inventory,
         };
         let identity = (inventory.snapshot_id(), inventory.epoch());
         if !self.reconciliation_requested && self.last_attempted == Some(identity) {
@@ -472,7 +420,7 @@ mod tests {
         let provenance = current
             .capture()
             .capture()
-            .host_set_provenance()
+            .address_host_set_provenance()
             .expect("host provenance");
         assert_eq!(provenance.snapshot_id(), inventory.snapshot_id());
         assert_eq!(provenance.epoch(), inventory.epoch());
@@ -480,7 +428,7 @@ mod tests {
             current
                 .capture()
                 .capture()
-                .artifact()
+                .program()
                 .programs()
                 .iter()
                 .flat_map(|program| program.clauses())

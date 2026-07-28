@@ -175,19 +175,18 @@ pub enum RpdbPriorityRole {
 /// Candidate priorities and Flux-private route table for one address family.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct RpdbFamilyPlacement {
-    bypass_priority: RulePriority,
+    address_bypass_priority: Option<RulePriority>,
     proxy_priority: RulePriority,
     private_table: RuleTableId,
-    dedicated_address_bypass: bool,
 }
 
 impl RpdbFamilyPlacement {
-    pub fn new(
-        bypass_priority: RulePriority,
+    pub fn with_address_bypass(
+        address_bypass_priority: RulePriority,
         proxy_priority: RulePriority,
         private_table: RuleTableId,
     ) -> Result<Self, RpdbFamilyPlacementError> {
-        if bypass_priority.get() == 0 {
+        if address_bypass_priority.get() == 0 {
             return Err(RpdbFamilyPlacementError::UnspecifiedPriority {
                 role: RpdbPriorityRole::AddressBypass,
             });
@@ -197,9 +196,9 @@ impl RpdbFamilyPlacement {
                 role: RpdbPriorityRole::Proxy,
             });
         }
-        if bypass_priority >= proxy_priority {
+        if address_bypass_priority >= proxy_priority {
             return Err(RpdbFamilyPlacementError::PriorityOrder {
-                bypass: bypass_priority,
+                bypass: address_bypass_priority,
                 proxy: proxy_priority,
             });
         }
@@ -210,18 +209,13 @@ impl RpdbFamilyPlacement {
         }
 
         Ok(Self {
-            bypass_priority,
+            address_bypass_priority: Some(address_bypass_priority),
             proxy_priority,
             private_table,
-            dedicated_address_bypass: true,
         })
     }
 
     /// Builds a one-rule placement for Capture Programs that bypass addresses before marking.
-    ///
-    /// The stored bypass priority aliases the proxy priority so existing identity and diagnostic
-    /// formats remain stable. `dedicated_bypass_priority` is the authoritative indication that no
-    /// address-bypass RPDB rule is part of this placement.
     pub fn proxy_only(
         proxy_priority: RulePriority,
         private_table: RuleTableId,
@@ -238,25 +232,15 @@ impl RpdbFamilyPlacement {
         }
 
         Ok(Self {
-            bypass_priority: proxy_priority,
+            address_bypass_priority: None,
             proxy_priority,
             private_table,
-            dedicated_address_bypass: false,
         })
     }
 
     #[must_use]
-    pub const fn bypass_priority(self) -> RulePriority {
-        self.bypass_priority
-    }
-
-    #[must_use]
-    pub const fn dedicated_bypass_priority(self) -> Option<RulePriority> {
-        if self.dedicated_address_bypass {
-            Some(self.bypass_priority)
-        } else {
-            None
-        }
+    pub const fn address_bypass_priority(self) -> Option<RulePriority> {
+        self.address_bypass_priority
     }
 
     #[must_use]
@@ -267,6 +251,33 @@ impl RpdbFamilyPlacement {
     #[must_use]
     pub const fn private_table(self) -> RuleTableId {
         self.private_table
+    }
+
+    const fn first_priority(self) -> RulePriority {
+        match self.address_bypass_priority {
+            Some(priority) => priority,
+            None => self.proxy_priority,
+        }
+    }
+
+    /// Whether every material priority lies strictly inside one ordered window.
+    #[must_use]
+    pub const fn fits_priority_window(
+        self,
+        lower_exclusive: RulePriority,
+        upper_exclusive: RulePriority,
+    ) -> bool {
+        match self.address_bypass_priority {
+            Some(bypass) => {
+                lower_exclusive.get() < bypass.get()
+                    && bypass.get() < self.proxy_priority.get()
+                    && self.proxy_priority.get() < upper_exclusive.get()
+            }
+            None => {
+                lower_exclusive.get() < self.proxy_priority.get()
+                    && self.proxy_priority.get() < upper_exclusive.get()
+            }
+        }
     }
 }
 
@@ -469,10 +480,10 @@ impl RpdbPlacementLease {
             protocol,
             self.request
                 .ipv4
-                .and_then(RpdbFamilyPlacement::dedicated_bypass_priority),
+                .and_then(RpdbFamilyPlacement::address_bypass_priority),
             self.request
                 .ipv6
-                .and_then(RpdbFamilyPlacement::dedicated_bypass_priority),
+                .and_then(RpdbFamilyPlacement::address_bypass_priority),
         )
     }
 
@@ -580,13 +591,13 @@ pub enum RpdbPlacementPlanError {
         dump_index: usize,
         source: RulePriority,
         target: RulePriority,
-        bypass: RulePriority,
+        first_candidate: RulePriority,
         proxy: RulePriority,
     },
     PriorityWindowViolation {
         family: NetworkAddressFamily,
         last_must_precede: RulePriority,
-        bypass: RulePriority,
+        address_bypass: Option<RulePriority>,
         proxy: RulePriority,
         first_terminal_barrier: RulePriority,
     },
@@ -646,27 +657,40 @@ impl fmt::Display for RpdbPlacementPlanError {
                 dump_index,
                 source,
                 target,
-                bypass,
+                first_candidate,
                 proxy,
             } => write!(
                 formatter,
                 "RPDB GOTO rule {dump_index} for {family:?} from {} to {} intersects candidate window {}..{}",
                 source.get(),
                 target.get(),
-                bypass.get(),
+                first_candidate.get(),
                 proxy.get()
             ),
             Self::PriorityWindowViolation {
                 family,
                 last_must_precede,
-                bypass,
+                address_bypass: Some(address_bypass),
                 proxy,
                 first_terminal_barrier,
             } => write!(
                 formatter,
                 "RPDB placement for {family:?} does not satisfy {} < {} < {} < {}",
                 last_must_precede.get(),
-                bypass.get(),
+                address_bypass.get(),
+                proxy.get(),
+                first_terminal_barrier.get()
+            ),
+            Self::PriorityWindowViolation {
+                family,
+                last_must_precede,
+                address_bypass: None,
+                proxy,
+                first_terminal_barrier,
+            } => write!(
+                formatter,
+                "RPDB placement for {family:?} does not satisfy {} < {} < {}",
+                last_must_precede.get(),
                 proxy.get(),
                 first_terminal_barrier.get()
             ),
@@ -786,7 +810,7 @@ fn plan_family(
         let role = if rule.priority() == placement.proxy_priority {
             Some(RpdbPriorityRole::Proxy)
         } else if placement
-            .dedicated_bypass_priority()
+            .address_bypass_priority()
             .is_some_and(|priority| rule.priority() == priority)
         {
             Some(RpdbPriorityRole::AddressBypass)
@@ -808,35 +832,24 @@ fn plan_family(
         }
         if let Some(target) = rule.goto_target()
             && rule.priority() <= placement.proxy_priority
-            && target >= placement.bypass_priority
+            && target >= placement.first_priority()
         {
             return Err(RpdbPlacementPlanError::GotoIntersectsCandidateWindow {
                 family,
                 dump_index,
                 source: rule.priority(),
                 target,
-                bypass: placement.bypass_priority,
+                first_candidate: placement.first_priority(),
                 proxy: placement.proxy_priority,
             });
         }
     }
 
-    let priorities_fit = match placement.dedicated_bypass_priority() {
-        Some(bypass) => {
-            last_must_precede < bypass
-                && bypass < placement.proxy_priority
-                && placement.proxy_priority < first_terminal_barrier
-        }
-        None => {
-            last_must_precede < placement.proxy_priority
-                && placement.proxy_priority < first_terminal_barrier
-        }
-    };
-    if !priorities_fit {
+    if !placement.fits_priority_window(last_must_precede, first_terminal_barrier) {
         return Err(RpdbPlacementPlanError::PriorityWindowViolation {
             family,
             last_must_precede,
-            bypass: placement.bypass_priority,
+            address_bypass: placement.address_bypass_priority,
             proxy: placement.proxy_priority,
             first_terminal_barrier,
         });

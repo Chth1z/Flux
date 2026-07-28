@@ -454,14 +454,14 @@ fn nofollow_io_refuses_symlinks_directories_and_symlinked_roots() {
 }
 
 #[test]
-fn bare_shell_writer_lock_remains_fail_closed_and_is_never_adopted() {
+fn ownerless_writer_lock_remains_fail_closed_and_is_never_adopted() {
     let fixture = Fixture::new();
     fs::create_dir(fixture.store.writer_lock_path()).unwrap();
 
     let error = fixture
         .store
         .recover(&test_binding(65))
-        .expect_err("an ownerless shell lock cannot be identified as stale native state");
+        .expect_err("an ownerless lock cannot be identified as native state");
     assert!(matches!(
         error,
         NativeXtablesDurableError::InterruptedPublication
@@ -562,167 +562,29 @@ fn recovery_inspection_retires_an_internally_consistent_previous_boot_pair_on_fi
 }
 
 #[test]
-fn recovery_inspection_blocks_a_live_shell_writer_owner() {
-    let fixture = Fixture::new();
-    let scope = current_scope(70);
-    fs::create_dir(fixture.store.writer_lock_path()).unwrap();
-    fs::write(
-        fixture.store.writer_lock_path().join("shell-owner"),
-        format!(
-            "flux-shell-xtables-writer-owner-v2 {} {} 0 0 {}\n",
-            std::process::id(),
-            current_process_start_ticks(),
-            scope.boot_identity().as_str(),
-        ),
-    )
-    .unwrap();
-
-    assert!(matches!(
-        fixture.store.inspect_for_recovery(&scope).unwrap_err(),
-        NativeXtablesDurableError::ShellWriterBusy
-    ));
-    assert!(fixture.store.writer_lock_exists().unwrap());
-}
-
-#[test]
-fn recovery_inspection_treats_either_v2_shell_participant_as_live() {
-    for (seed, parent_pid, parent_start, child_pid, child_start) in [
-        (79, std::process::id(), current_process_start_ticks(), 0, 0),
-        (
-            80,
-            u32::MAX,
-            1,
-            std::process::id(),
-            current_process_start_ticks(),
-        ),
-    ] {
+fn unrecognized_or_mixed_writer_lock_entries_remain_fail_closed() {
+    for include_native in [false, true] {
         let fixture = Fixture::new();
-        let scope = current_scope(seed);
+        let scope = current_scope(if include_native { 86 } else { 70 });
         fs::create_dir(fixture.store.writer_lock_path()).unwrap();
+        if include_native {
+            fs::write(
+                fixture.store.writer_lock_path().join("native-owner"),
+                encode_writer_owner(&scope),
+            )
+            .unwrap();
+        }
         fs::write(
-            fixture.store.writer_lock_path().join("shell-owner"),
-            format!(
-                "flux-shell-xtables-writer-owner-v2 {parent_pid} {parent_start} {child_pid} {child_start} {}\n",
-                scope.boot_identity().as_str(),
-            ),
+            fixture.store.writer_lock_path().join("unrecognized-owner"),
+            b"opaque\n",
         )
         .unwrap();
 
         assert!(matches!(
             fixture.store.inspect_for_recovery(&scope).unwrap_err(),
-            NativeXtablesDurableError::ShellWriterBusy
+            NativeXtablesDurableError::InterruptedPublication
         ));
         assert!(fixture.store.writer_lock_exists().unwrap());
-    }
-}
-
-#[test]
-fn shell_writer_v2_parser_rejects_every_noncanonical_record_shape() {
-    let boot = "11111111-2222-3333-4444-555555555555";
-    for encoded in [
-        format!("wrong-magic 1 1 0 0 {boot}\n"),
-        format!("flux-shell-xtables-writer-owner-v2 1 1 0 {boot}\n"),
-        format!("flux-shell-xtables-writer-owner-v2 01 1 0 0 {boot}\n"),
-        format!("flux-shell-xtables-writer-owner-v2 1 01 0 0 {boot}\n"),
-        format!("flux-shell-xtables-writer-owner-v2 1 1 0 1 {boot}\n"),
-        format!("flux-shell-xtables-writer-owner-v2 1 1 2 0 {boot}\n"),
-        format!("flux-shell-xtables-writer-owner-v2 1 1 0 0 {boot}\r\n"),
-        format!("flux-shell-xtables-writer-owner-v2 1 1 0 0 {boot}\nextra\n"),
-        "flux-shell-xtables-writer-owner-v2 1 1 0 0 AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE\n"
-            .to_owned(),
-        format!("flux-shell-xtables-writer-owner-v2 1 10000000000000000000 0 0 {boot}\n"),
-    ] {
-        assert!(matches!(
-            parse_shell_writer_owner(encoded.as_bytes()),
-            Err(NativeXtablesDurableError::InvalidRecord {
-                artifact: DurableArtifact::ShellWriterOwner,
-                ..
-            })
-        ));
-    }
-}
-
-#[test]
-fn mixed_native_and_shell_writer_markers_remain_fail_closed() {
-    let fixture = Fixture::new();
-    let scope = current_scope(86);
-    fs::create_dir(fixture.store.writer_lock_path()).unwrap();
-    fs::write(
-        fixture.store.writer_lock_path().join("native-owner"),
-        encode_writer_owner(&scope),
-    )
-    .unwrap();
-    fs::write(
-        fixture.store.writer_lock_path().join("shell-owner"),
-        format!(
-            "flux-shell-xtables-writer-owner-v2 {} {} 0 0 {}\n",
-            std::process::id(),
-            current_process_start_ticks(),
-            scope.boot_identity().as_str(),
-        ),
-    )
-    .unwrap();
-
-    let error = fixture
-        .store
-        .inspect_for_recovery(&scope)
-        .expect_err("mixed native and shell ownership cannot be guessed safe");
-
-    assert!(matches!(
-        error,
-        NativeXtablesDurableError::InterruptedPublication
-    ));
-    assert!(fixture.store.writer_lock_exists().unwrap());
-}
-
-#[test]
-fn recovery_inspection_retires_dead_and_previous_boot_shell_writer_owners() {
-    for (seed, pid, boot) in [
-        (71, u32::MAX, None),
-        (
-            72,
-            std::process::id(),
-            Some("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
-        ),
-    ] {
-        let fixture = Fixture::new();
-        let scope = current_scope(seed);
-        fs::create_dir(fixture.store.writer_lock_path()).unwrap();
-        fs::write(
-            fixture.store.writer_lock_path().join("shell-owner"),
-            format!(
-                "flux-shell-xtables-writer-owner-v2 {} {} 0 0 {}\n",
-                pid,
-                if pid == std::process::id() {
-                    current_process_start_ticks()
-                } else {
-                    1
-                },
-                boot.unwrap_or_else(|| scope.boot_identity().as_str()),
-            ),
-        )
-        .unwrap();
-
-        let fence = match fixture.store.inspect_for_recovery(&scope).unwrap() {
-            NativeXtablesRecoveryInspection::Vacant(fence) => fence,
-            other => panic!("stale shell writer must become fenced vacant, found {other:?}"),
-        };
-        assert!(
-            !fixture
-                .store
-                .writer_lock_path()
-                .join("shell-owner")
-                .exists()
-        );
-        assert!(
-            fixture
-                .store
-                .writer_lock_path()
-                .join("native-owner")
-                .exists()
-        );
-        fence.finish_clean().unwrap();
-        assert!(!fixture.store.writer_lock_exists().unwrap());
     }
 }
 
@@ -1472,12 +1334,6 @@ fn current_scope_for_binding(binding: &NativeXtablesJournalBinding) -> NativeXta
         binding.network_namespace(),
         binding.journal_identity(),
     )
-}
-
-fn current_process_start_ticks() -> u64 {
-    let stat = fs::read_to_string("/proc/self/stat").unwrap();
-    let tail = stat.rsplit_once(") ").unwrap().1;
-    tail.split_whitespace().nth(19).unwrap().parse().unwrap()
 }
 
 fn record(

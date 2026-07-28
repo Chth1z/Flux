@@ -254,7 +254,7 @@ pub(crate) struct AdmittedGeneration {
     desired_state: FluxConfig,
     candidate: TproxyGenerationCandidate,
     engine_spec: EngineSpec,
-    capture: flux_core::ShadowCompilationReport,
+    capture: flux_core::CaptureProgramCompilation,
     engine_source: SelectedEngineSourceIdentity,
     xtables: XtablesCaptureArtifactSet,
     planning_digest: GenerationPlanningDigest,
@@ -310,7 +310,7 @@ impl AdmittedGeneration {
 
     #[cfg(test)]
     #[must_use]
-    pub(crate) const fn capture(&self) -> &flux_core::ShadowCompilationReport {
+    pub(crate) const fn capture(&self) -> &flux_core::CaptureProgramCompilation {
         &self.capture
     }
 
@@ -577,7 +577,7 @@ impl GenerationAssembler {
             .map_err(GenerationAssemblyError::Planning)?;
         let generation = next_generation(prior_owned)?;
         let mut lowering = XtablesCaptureLoweringRequest::new(
-            capture.artifact(),
+            capture.program(),
             XtablesCaptureNamespace::new(generation),
             XtablesTproxyTarget::new(desired_state.listener().port(), planning_context.mark),
         );
@@ -738,10 +738,13 @@ fn update_placement(digest: &mut Sha256, placement: Option<RpdbPlacementLease>) 
         match placement.family(family) {
             Some(family_placement) => {
                 digest.update([1]);
-                update_field(
-                    digest,
-                    &family_placement.bypass_priority().get().to_be_bytes(),
-                );
+                match family_placement.address_bypass_priority() {
+                    Some(priority) => {
+                        digest.update([1]);
+                        update_field(digest, &priority.get().to_be_bytes());
+                    }
+                    None => digest.update([0]),
+                }
                 update_field(
                     digest,
                     &family_placement.proxy_priority().get().to_be_bytes(),

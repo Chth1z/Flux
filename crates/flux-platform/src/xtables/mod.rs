@@ -7,7 +7,6 @@ mod owner;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[allow(dead_code)]
 mod owner_durable;
-mod render;
 mod restore;
 #[allow(dead_code)]
 mod save;
@@ -61,16 +60,6 @@ pub use owner::{
     NativeLinuxCompositionTestAdmission, NativeLinuxCompositionTestAuthority,
     NativeLinuxCompositionTestConfig, NativeLinuxCompositionTestError,
     NativeLinuxCompositionTestRuntime,
-};
-
-pub use render::{
-    LEGACY_RULES_DIGEST_BYTES, LEGACY_RULES_IDENTITY_SCHEMA_VERSION, LegacyApplicationMode,
-    LegacyApplicationPolicy, LegacyInterfacePattern, LegacyInterfacePolicy, LegacyInterfaceRole,
-    LegacyKernelFeatures, LegacyMarkValues, LegacyOwnerMatch, LegacyOwnerToken,
-    LegacyRulesArtifactPair, LegacyRulesArtifactSet, LegacyRulesPairDigest, LegacyRulesPlan,
-    LegacyRulesPlanDigest, LegacyRulesPlanError, LegacyRulesRenderError, LegacyRulesRenderRequest,
-    LegacyRulesResourceTotals, LegacyRulesSetDigest, MAX_LEGACY_APPLICATION_UIDS,
-    render_legacy_rules_pair, render_legacy_rules_restore, render_legacy_rules_set,
 };
 
 pub use restore::{

@@ -372,7 +372,7 @@ impl AddressHostFamilySelection {
 /// Deterministic selected local-interface host addresses for one complete inventory snapshot.
 ///
 /// This is realization-neutral evidence. A later Capture Program may consume it as a pre-mark
-/// bypass set, while the compatibility planner below projects the same hosts into RPDB rules. The
+/// bypass set, while the RPDB planner below projects the same hosts into routing rules. The
 /// plan proves neither backend ordering nor kernel mutation ownership.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AddressHostSetPlan {

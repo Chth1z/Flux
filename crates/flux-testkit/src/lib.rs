@@ -5,9 +5,9 @@ use std::cell::Cell;
 use flux_core::{
     AndroidBuildIdentity, AndroidProductIdentity, ArtifactIdentity, BootIdentity,
     CapabilityProfile, CapabilityProfileSource, DeviceIdentity, KernelBuildIdentity, KernelFacts,
-    KernelRelease, LegacyArtifactReadiness, LegacyArtifactResolution, LegacyBridgeFacts,
-    NetworkNamespaceIdentity, Observation, SecurityPatchLevel, SelinuxMode, SelinuxPolicyIdentity,
-    Sha256Digest, ToolId, VendorBuildIdentity, VerifiedBootIdentity, VerifiedBootState,
+    KernelRelease, NetworkNamespaceIdentity, Observation, SecurityPatchLevel, SelinuxMode,
+    SelinuxPolicyIdentity, Sha256Digest, ToolId, VendorBuildIdentity, VerifiedBootIdentity,
+    VerifiedBootState,
 };
 use flux_platform::{KernelReleaseSource, PlatformError};
 
@@ -83,10 +83,6 @@ fn fixture_with_device(
     device_identity: Observation<DeviceIdentity>,
     release: &str,
 ) -> CapabilityProfile {
-    let ready = Observation::Verified(LegacyArtifactReadiness::new(
-        LegacyArtifactResolution::Direct,
-        true,
-    ));
     CapabilityProfile::initial(
         boot_identity,
         device_identity,
@@ -94,7 +90,6 @@ fn fixture_with_device(
             KernelRelease::new(release).expect("fixture kernel release is bounded"),
         )),
         Observation::Verified(SelinuxMode::Enforcing),
-        LegacyBridgeFacts::new(ready.clone(), ready.clone(), ready),
     )
 }
 

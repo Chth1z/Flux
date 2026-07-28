@@ -48,7 +48,7 @@ const ALL_SOURCES: [FwmarkEvidenceSource; 9] = [
     FwmarkEvidenceSource::AndroidNetId,
     FwmarkEvidenceSource::Rpdb,
     FwmarkEvidenceSource::DeviceMarkPolicy,
-    FwmarkEvidenceSource::LegacyXtables,
+    FwmarkEvidenceSource::Xtables,
     FwmarkEvidenceSource::Nftables,
     FwmarkEvidenceSource::TrafficControlAndBpf,
     FwmarkEvidenceSource::Xfrm,
@@ -411,7 +411,7 @@ pub fn assemble_android_fwmark_census_projection(
     )?;
     append_mark_uses(
         &mut raw_mark_uses,
-        FwmarkEvidenceSource::LegacyXtables,
+        FwmarkEvidenceSource::Xtables,
         xtables.legacy_mark_uses(),
     )?;
     append_mark_uses(
@@ -1036,7 +1036,7 @@ const fn source_tag(source: FwmarkEvidenceSource) -> u8 {
         FwmarkEvidenceSource::AndroidNetId => 0,
         FwmarkEvidenceSource::Rpdb => 1,
         FwmarkEvidenceSource::DeviceMarkPolicy => 2,
-        FwmarkEvidenceSource::LegacyXtables => 3,
+        FwmarkEvidenceSource::Xtables => 3,
         FwmarkEvidenceSource::Nftables => 4,
         FwmarkEvidenceSource::TrafficControlAndBpf => 5,
         FwmarkEvidenceSource::Xfrm => 6,

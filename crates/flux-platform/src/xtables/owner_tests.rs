@@ -3,9 +3,9 @@ use std::num::{NonZeroU16, NonZeroU32};
 use flux_core::{
     AddressHostFamilySelection, CaptureApplicationMode, CaptureApplicationPolicy,
     CaptureBypassPolicy, CaptureGroupId, CaptureInterfacePolicy, CaptureInterfaceSelector,
-    CaptureIpPrefix, CaptureProtocolSet, CaptureTrafficScope, CaptureUserId,
-    CompatibilityEngineCredentials, FwmarkCandidate, InterfaceName, RouteProtocol, RouteTableId,
-    RulePriority, RuleProtocol, ShadowCaptureProgramRequest, compile_shadow_capture_program,
+    CaptureIpPrefix, CaptureProgramRequest, CaptureProtocolSet, CaptureTrafficScope, CaptureUserId,
+    EngineCredentials, FwmarkCandidate, InterfaceName, RouteProtocol, RouteTableId, RulePriority,
+    RuleProtocol, compile_capture_program,
 };
 
 use super::*;
@@ -143,13 +143,13 @@ fn dual_stack_topology_uses_family_scoped_stable_roots() {
 }
 
 #[test]
-fn forwarded_only_schema_v1_cannot_enter_the_native_owner_topology() {
+fn forwarded_only_program_cannot_enter_the_native_owner_topology() {
     let artifacts = artifacts(AddressHostFamilySelection::Ipv4, false, true);
     let error = XtablesStableTopologyPlan::from_artifacts(&artifacts)
-        .expect_err("schema-v1 artifact must remain outside native owner");
+        .expect_err("native owner requires local OUTPUT capture");
     assert!(matches!(
         error,
-        XtablesStableTopologyError::UnsupportedSchema { actual: 1 }
+        XtablesStableTopologyError::MissingLocalOutput
     ));
 }
 
@@ -161,9 +161,9 @@ fn artifacts(
     let scope = CaptureTrafficScope::new(families, local_output, forwarded_ingress).unwrap();
     let forwarded = forwarded_ingress.then_some(exact("wlan0"));
     let interfaces = CaptureInterfacePolicy::new([], forwarded, []).unwrap();
-    let report = compile_shadow_capture_program(ShadowCaptureProgramRequest::new(
+    let report = compile_capture_program(CaptureProgramRequest::new(
         scope,
-        CompatibilityEngineCredentials::new(uid(1000), gid(1000)),
+        EngineCredentials::new(uid(1000), gid(1000)),
         CaptureBypassPolicy::new(std::iter::empty::<CaptureIpPrefix>()).unwrap(),
         None,
         interfaces,
@@ -172,7 +172,7 @@ fn artifacts(
     ))
     .unwrap();
     let request = XtablesCaptureLoweringRequest::new(
-        report.artifact(),
+        report.program(),
         XtablesCaptureNamespace::new(NonZeroU32::new(GENERATION).unwrap()),
         XtablesTproxyTarget::new(
             NonZeroU16::new(1536).unwrap(),

@@ -743,7 +743,7 @@ impl ParsedRuleset {
                     let parsed = self.rule_mark_semantics(rule)?;
                     if let Some(mask) = parsed.packet_predicate_mask {
                         evidence.legacy_mark_uses.insert(mark_use(
-                            FwmarkEvidenceSource::LegacyXtables,
+                            FwmarkEvidenceSource::Xtables,
                             FwmarkPlane::Packet,
                             FwmarkUseOperation::PredicateRead,
                             mask,
@@ -766,7 +766,7 @@ impl ParsedRuleset {
                         self.validate_android_incoming_writer(rule, parsed, profile, candidate)?;
                         FwmarkEvidenceSource::AndroidNetId
                     } else {
-                        FwmarkEvidenceSource::LegacyXtables
+                        FwmarkEvidenceSource::Xtables
                     };
                     let use_record = mark_use(
                         source,
@@ -776,7 +776,7 @@ impl ParsedRuleset {
                         self.family,
                         rule.line,
                     )?;
-                    if source == FwmarkEvidenceSource::LegacyXtables {
+                    if source == FwmarkEvidenceSource::Xtables {
                         evidence.legacy_mark_uses.insert(use_record);
                     }
                     writes.push(WriteOccurrence {

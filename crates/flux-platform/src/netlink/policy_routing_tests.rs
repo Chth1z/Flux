@@ -3,8 +3,8 @@ use std::num::{NonZeroU16, NonZeroU32};
 use flux_core::{
     AddressHostFamilySelection, CaptureApplicationMode, CaptureApplicationPolicy,
     CaptureBypassPolicy, CaptureGroupId, CaptureInterfacePolicy, CaptureIpPrefix,
-    CaptureProtocolSet, CaptureTrafficScope, CaptureUserId, CompatibilityEngineCredentials,
-    FwmarkCandidate, ShadowCaptureProgramRequest, compile_shadow_capture_program,
+    CaptureProgramRequest, CaptureProtocolSet, CaptureTrafficScope, CaptureUserId,
+    EngineCredentials, FwmarkCandidate, compile_capture_program,
 };
 
 use super::*;
@@ -663,9 +663,9 @@ fn routing_requirement(family: NetworkAddressFamily) -> XtablesLocalOutputRoutin
         NetworkAddressFamily::Ipv6 => AddressHostFamilySelection::Ipv6,
     };
     let scope = CaptureTrafficScope::new(selected, true, false).unwrap();
-    let report = compile_shadow_capture_program(ShadowCaptureProgramRequest::new(
+    let report = compile_capture_program(CaptureProgramRequest::new(
         scope,
-        CompatibilityEngineCredentials::new(uid(1000), gid(1000)),
+        EngineCredentials::new(uid(1000), gid(1000)),
         CaptureBypassPolicy::new(std::iter::empty::<CaptureIpPrefix>()).unwrap(),
         None,
         CaptureInterfacePolicy::new([], None, []).unwrap(),
@@ -674,7 +674,7 @@ fn routing_requirement(family: NetworkAddressFamily) -> XtablesLocalOutputRoutin
     ))
     .unwrap();
     let request = XtablesCaptureLoweringRequest::new(
-        report.artifact(),
+        report.program(),
         XtablesCaptureNamespace::new(nonzero(7)),
         XtablesTproxyTarget::new(
             NonZeroU16::new(1536).unwrap(),

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use flux_core::{
     BootIdentity, CapabilityProfile, CapabilityProfileSource, KernelFacts, KernelRelease,
-    LegacyBridgeFacts, MAX_BOOT_IDENTITY_BYTES, Observation, SelinuxMode,
+    MAX_BOOT_IDENTITY_BYTES, Observation, SelinuxMode,
 };
 
 use crate::android_identity::observe_system_android_device_identity;
@@ -61,18 +61,11 @@ impl CapabilityProfileSource for SystemCapabilityProfileSource {
                 "0" => Observation::Verified(SelinuxMode::Permissive),
                 _ => Observation::Malformed,
             });
-        let legacy_bridge = LegacyBridgeFacts::new(
-            Observation::Absent,
-            Observation::Absent,
-            Observation::Absent,
-        );
-
         CapabilityProfile::initial(
             boot_identity,
             observe_system_android_device_identity(),
             kernel,
             selinux,
-            legacy_bridge,
         )
     }
 }

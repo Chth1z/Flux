@@ -50,7 +50,7 @@ impl PreparedGenerationRecord {
                 .revision()
                 .as_bytes(),
             engine_config_binding: *generation.candidate().engine_config().digest().as_bytes(),
-            capture_program_digest: *generation.capture().artifact().digest().as_bytes(),
+            capture_program_digest: *generation.capture().program().digest().as_bytes(),
             xtables_artifact_digest: *generation.xtables().digest().as_bytes(),
         }
     }

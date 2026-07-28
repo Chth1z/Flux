@@ -4,13 +4,12 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::num::{NonZeroU16, NonZeroU32};
 
 use flux_core::{
-    CaptureClause, CaptureClauseDecision, CaptureDecisionStage, CaptureDomainProgram,
-    CaptureInterfaceDirection, CaptureInterfaceSelector, CaptureInterfaceSelectorKind,
-    CapturePredicate, CaptureProgramDigest, CaptureProtocolSet, CaptureTrafficDomain,
-    CaptureTransportProtocol, CaptureUserId, CompatibilityEngineCredentials, FwmarkCandidate,
-    FwmarkRole, InterfaceName, NetworkAddressFamily, RouteProtocol, RouteScope, RouteTableId,
-    RouteType, RuleFwMark, RulePriority, RuleProtocol, SHADOW_CAPTURE_PROGRAM_SCHEMA_VERSION,
-    ShadowCaptureArtifact,
+    CAPTURE_PROGRAM_SCHEMA_VERSION, CaptureClause, CaptureClauseDecision, CaptureDecisionStage,
+    CaptureDomainProgram, CaptureInterfaceDirection, CaptureInterfaceSelector,
+    CaptureInterfaceSelectorKind, CapturePredicate, CaptureProgram, CaptureProgramDigest,
+    CaptureProtocolSet, CaptureTrafficDomain, CaptureTransportProtocol, CaptureUserId,
+    EngineCredentials, FwmarkCandidate, FwmarkRole, InterfaceName, NetworkAddressFamily,
+    RouteProtocol, RouteScope, RouteTableId, RouteType, RuleFwMark, RulePriority, RuleProtocol,
 };
 use sha2::{Digest, Sha256};
 
@@ -25,18 +24,11 @@ pub const XTABLES_CAPTURE_LOWERING_SCHEMA_VERSION: u16 = 2;
 pub const XTABLES_CAPTURE_DIGEST_BYTES: usize = 32;
 pub const MAX_XTABLES_CAPTURE_COMMANDS_PER_ARTIFACT: usize = MAX_XTABLES_RESTORE_COMMANDS;
 
-const XTABLES_CAPTURE_LOWERING_SCHEMA_VERSION_V1: u16 = 1;
-const LOWERING_DIGEST_DOMAIN_V1: &[u8] =
-    b"Flux canonical xtables Capture Program lowering\0schema-v1\0";
-const PAIR_DIGEST_DOMAIN_V1: &[u8] =
-    b"Flux canonical xtables Capture Program artifact pair\0schema-v1\0";
-const SET_DIGEST_DOMAIN_V1: &[u8] =
-    b"Flux canonical xtables Capture Program artifact set\0schema-v1\0";
-const LOWERING_DIGEST_DOMAIN_V2: &[u8] =
+const LOWERING_DIGEST_DOMAIN: &[u8] =
     b"Flux canonical xtables Capture Program lowering\0schema-v2\0";
-const PAIR_DIGEST_DOMAIN_V2: &[u8] =
+const PAIR_DIGEST_DOMAIN: &[u8] =
     b"Flux canonical xtables Capture Program artifact pair\0schema-v2\0";
-const SET_DIGEST_DOMAIN_V2: &[u8] =
+const SET_DIGEST_DOMAIN: &[u8] =
     b"Flux canonical xtables Capture Program artifact set\0schema-v2\0";
 const LINUX_ROUTE_SCOPE_UNIVERSE: u8 = 0;
 const LINUX_ROUTE_SCOPE_HOST: u8 = 254;
@@ -355,7 +347,7 @@ impl Default for XtablesCaptureLoweringBudget {
 
 #[derive(Clone, Copy, Debug)]
 pub struct XtablesCaptureLoweringRequest<'a> {
-    program: &'a ShadowCaptureArtifact,
+    program: &'a CaptureProgram,
     namespace: XtablesCaptureNamespace,
     target: XtablesTproxyTarget,
     local_output_routing: Option<XtablesLocalOutputRoutingSpec>,
@@ -366,7 +358,7 @@ pub struct XtablesCaptureLoweringRequest<'a> {
 impl<'a> XtablesCaptureLoweringRequest<'a> {
     #[must_use]
     pub const fn new(
-        program: &'a ShadowCaptureArtifact,
+        program: &'a CaptureProgram,
         namespace: XtablesCaptureNamespace,
         target: XtablesTproxyTarget,
     ) -> Self {
@@ -572,20 +564,20 @@ impl XtablesTransparentListenerRequirement {
     }
 }
 
-/// Bypass socket-mark selector that must remain valid through OUTPUT retirement.
+/// Engine identity and bypass socket mark that must remain valid through OUTPUT retirement.
 ///
-/// The copied compatibility credentials remain a policy predicate and diagnostic only. This type
-/// does not bind a supervised process identity, retained handle, mark authority, or escape lease.
+/// The credentials remain a policy predicate. This type does not bind a supervised process
+/// identity, retained handle, mark authority, or escape lease.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct XtablesLoopEscapeRequirement {
-    compatibility_credentials: CompatibilityEngineCredentials,
+    engine_credentials: EngineCredentials,
     socket_mark: RuleFwMark,
 }
 
 impl XtablesLoopEscapeRequirement {
     #[must_use]
-    pub const fn compatibility_credentials(self) -> CompatibilityEngineCredentials {
-        self.compatibility_credentials
+    pub const fn engine_credentials(self) -> EngineCredentials {
+        self.engine_credentials
     }
 
     #[must_use]
@@ -791,7 +783,7 @@ pub struct XtablesCaptureArtifactPair {
     family: XtablesRestoreFamily,
     entries: Box<[XtablesCaptureEntryPoint]>,
     local_output: Option<XtablesLocalOutputTransactionRequirements>,
-    transaction_order: Option<XtablesCaptureTransactionOrder>,
+    transaction_order: XtablesCaptureTransactionOrder,
     prepare: XtablesRestoreArtifact,
     retire: XtablesRestoreArtifact,
     usage: XtablesCaptureResourceUsage,
@@ -815,8 +807,8 @@ impl XtablesCaptureArtifactPair {
     }
 
     #[must_use]
-    pub const fn transaction_order(&self) -> Option<&XtablesCaptureTransactionOrder> {
-        self.transaction_order.as_ref()
+    pub const fn transaction_order(&self) -> &XtablesCaptureTransactionOrder {
+        &self.transaction_order
     }
 
     #[must_use]
@@ -1133,16 +1125,15 @@ impl Error for XtablesCaptureLoweringError {
 
 /// Lower Capture Programs into deterministic, non-authorizing xtables transaction artifacts.
 ///
-/// Forwarded-only input preserves the exact schema-v1 contract. Any local-OUTPUT program selects
-/// schema v2 and describes the complete ADR-0012 prerequisites and lifecycle ordering without
-/// executing restore, mutating stable hooks, or granting routing/listener ownership.
+/// The result describes complete lifecycle ordering without executing restore, mutating stable
+/// hooks, or granting routing/listener ownership.
 pub fn lower_xtables_capture(
     request: XtablesCaptureLoweringRequest<'_>,
 ) -> Result<XtablesCaptureArtifactSet, XtablesCaptureLoweringError> {
-    if request.program.schema_version() != SHADOW_CAPTURE_PROGRAM_SCHEMA_VERSION {
+    if request.program.schema_version() != CAPTURE_PROGRAM_SCHEMA_VERSION {
         return Err(XtablesCaptureLoweringError::UnsupportedProgramSchema {
             actual: request.program.schema_version(),
-            supported: SHADOW_CAPTURE_PROGRAM_SCHEMA_VERSION,
+            supported: CAPTURE_PROGRAM_SCHEMA_VERSION,
         });
     }
     if let Some(extension) = request.extensions.first_enabled() {
@@ -1153,29 +1144,18 @@ pub fn lower_xtables_capture(
         return Err(XtablesCaptureLoweringError::EmptyProgram);
     }
     validate_program_keys(programs)?;
-    let schema_version = if programs
-        .iter()
-        .any(|program| program.domain() == CaptureTrafficDomain::LocalOutput)
-    {
-        XTABLES_CAPTURE_LOWERING_SCHEMA_VERSION
-    } else {
-        XTABLES_CAPTURE_LOWERING_SCHEMA_VERSION_V1
-    };
-
-    let lowering_digest = digest_lowering(schema_version, request);
+    let lowering_digest = digest_lowering(request);
     let ipv4 = lower_family(
         programs,
         NetworkAddressFamily::Ipv4,
         request,
         lowering_digest,
-        schema_version,
     )?;
     let ipv6 = lower_family(
         programs,
         NetworkAddressFamily::Ipv6,
         request,
         lowering_digest,
-        schema_version,
     )?;
     let usage = ipv4
         .as_ref()
@@ -1186,16 +1166,10 @@ pub fn lower_xtables_capture(
                 .map(XtablesCaptureArtifactPair::usage)
                 .unwrap_or_default(),
         );
-    let digest = digest_set(
-        schema_version,
-        lowering_digest,
-        ipv4.as_ref(),
-        ipv6.as_ref(),
-        usage,
-    );
+    let digest = digest_set(lowering_digest, ipv4.as_ref(), ipv6.as_ref(), usage);
 
     Ok(XtablesCaptureArtifactSet {
-        schema_version,
+        schema_version: XTABLES_CAPTURE_LOWERING_SCHEMA_VERSION,
         source_program_schema_version: request.program.schema_version(),
         source_program_digest: request.program.digest(),
         namespace: request.namespace,
@@ -1237,7 +1211,7 @@ fn program_key(family: NetworkAddressFamily, domain: CaptureTrafficDomain) -> (u
 
 struct ProgramAnalysis<'a> {
     program: &'a CaptureDomainProgram,
-    engine_credentials: Option<CompatibilityEngineCredentials>,
+    engine_credentials: Option<EngineCredentials>,
     direct_clause_count: usize,
     proxy_scope: Option<ProxyScope<'a>>,
     protocols: Option<CaptureProtocolSet>,
@@ -1262,7 +1236,6 @@ fn lower_family(
     family: NetworkAddressFamily,
     request: XtablesCaptureLoweringRequest<'_>,
     lowering_digest: XtablesCaptureLoweringDigest,
-    schema_version: u16,
 ) -> Result<Option<XtablesCaptureArtifactPair>, XtablesCaptureLoweringError> {
     let selected = programs
         .iter()
@@ -1437,11 +1410,7 @@ fn lower_family(
         (Some(_), None, None) | (None, None, None) => None,
         _ => unreachable!("local routing validation keeps proxy requirements coherent"),
     };
-    let transaction_order = if schema_version == XTABLES_CAPTURE_LOWERING_SCHEMA_VERSION {
-        Some(build_transaction_order(&entries, local_output.is_some()))
-    } else {
-        None
-    };
+    let transaction_order = build_transaction_order(&entries, local_output.is_some());
 
     let usage = XtablesCaptureResourceUsage {
         domain_programs: analyses.len(),
@@ -1467,22 +1436,18 @@ fn lower_family(
             .map(|requirements| protocol_count(requirements.listener().protocols()))
             .unwrap_or(0),
         routing_objects: usize::from(local_output.is_some()) * 2,
-        transaction_steps: transaction_order
-            .as_ref()
-            .map(|order| order.prepare().len() + order.retire().len())
-            .unwrap_or(0),
+        transaction_steps: transaction_order.prepare().len() + transaction_order.retire().len(),
         prepare_commands,
         retire_commands,
         maximum_jump_depth: 1,
     };
     let entries = entries.into_boxed_slice();
     let digest = digest_pair(PairDigestInput {
-        schema_version,
         lowering: lowering_digest,
         family: restore_family,
         entries: &entries,
         local_output,
-        transaction_order: transaction_order.as_ref(),
+        transaction_order: &transaction_order,
         prepare: &prepare,
         retire: &retire,
         usage,
@@ -2001,7 +1966,7 @@ fn render_loopback_companion(
 
 fn build_local_output_requirements(
     family: NetworkAddressFamily,
-    engine_credentials: CompatibilityEngineCredentials,
+    engine_credentials: EngineCredentials,
     protocols: CaptureProtocolSet,
     routing: XtablesLocalOutputRoutingTarget,
     target: XtablesTproxyTarget,
@@ -2033,7 +1998,7 @@ fn build_local_output_requirements(
             protocols,
         },
         loop_escape: XtablesLoopEscapeRequirement {
-            compatibility_credentials: engine_credentials,
+            engine_credentials,
             socket_mark: target.mark().selector(FwmarkRole::Bypass),
         },
     }
@@ -2258,19 +2223,10 @@ fn capture_chain_name(
     format!("FLX{}{role}{:010}", family_tag(family), generation.get()).into_boxed_str()
 }
 
-fn digest_lowering(
-    schema_version: u16,
-    request: XtablesCaptureLoweringRequest<'_>,
-) -> XtablesCaptureLoweringDigest {
+fn digest_lowering(request: XtablesCaptureLoweringRequest<'_>) -> XtablesCaptureLoweringDigest {
     let mut digest = Sha256::new();
-    digest.update(
-        if schema_version == XTABLES_CAPTURE_LOWERING_SCHEMA_VERSION_V1 {
-            LOWERING_DIGEST_DOMAIN_V1
-        } else {
-            LOWERING_DIGEST_DOMAIN_V2
-        },
-    );
-    digest.update(schema_version.to_be_bytes());
+    digest.update(LOWERING_DIGEST_DOMAIN);
+    digest.update(XTABLES_CAPTURE_LOWERING_SCHEMA_VERSION.to_be_bytes());
     digest.update(request.program.schema_version().to_be_bytes());
     digest.update(request.program.digest().as_bytes());
     digest.update(request.namespace.generation().get().to_be_bytes());
@@ -2279,19 +2235,16 @@ fn digest_lowering(
     digest.update(request.target.mark().proxy_value().to_be_bytes());
     digest.update(request.target.mark().bypass_value().to_be_bytes());
     digest.update([request.extensions.bits()]);
-    if schema_version == XTABLES_CAPTURE_LOWERING_SCHEMA_VERSION {
-        digest_routing_spec(&mut digest, request.local_output_routing);
-    }
+    digest_routing_spec(&mut digest, request.local_output_routing);
     XtablesCaptureLoweringDigest(digest.finalize().into())
 }
 
 struct PairDigestInput<'a> {
-    schema_version: u16,
     lowering: XtablesCaptureLoweringDigest,
     family: XtablesRestoreFamily,
     entries: &'a [XtablesCaptureEntryPoint],
     local_output: Option<XtablesLocalOutputTransactionRequirements>,
-    transaction_order: Option<&'a XtablesCaptureTransactionOrder>,
+    transaction_order: &'a XtablesCaptureTransactionOrder,
     prepare: &'a XtablesRestoreArtifact,
     retire: &'a XtablesRestoreArtifact,
     usage: XtablesCaptureResourceUsage,
@@ -2299,14 +2252,8 @@ struct PairDigestInput<'a> {
 
 fn digest_pair(input: PairDigestInput<'_>) -> XtablesCaptureArtifactPairDigest {
     let mut digest = Sha256::new();
-    digest.update(
-        if input.schema_version == XTABLES_CAPTURE_LOWERING_SCHEMA_VERSION_V1 {
-            PAIR_DIGEST_DOMAIN_V1
-        } else {
-            PAIR_DIGEST_DOMAIN_V2
-        },
-    );
-    digest.update(input.schema_version.to_be_bytes());
+    digest.update(PAIR_DIGEST_DOMAIN);
+    digest.update(XTABLES_CAPTURE_LOWERING_SCHEMA_VERSION.to_be_bytes());
     digest.update(input.lowering.as_bytes());
     digest.update([restore_family_tag(input.family)]);
     digest.update(length_bytes(input.entries.len()));
@@ -2314,37 +2261,26 @@ fn digest_pair(input: PairDigestInput<'_>) -> XtablesCaptureArtifactPairDigest {
         digest.update([domain_tag(entry.domain)]);
         digest.update(length_bytes(entry.chain.len()));
         digest.update(entry.chain.as_bytes());
-        if input.schema_version == XTABLES_CAPTURE_LOWERING_SCHEMA_VERSION {
-            digest.update([entry_role_tag(entry.role), hook_tag(entry.hook)]);
-            digest_entry_selector(&mut digest, entry.selector);
-        }
+        digest.update([entry_role_tag(entry.role), hook_tag(entry.hook)]);
+        digest_entry_selector(&mut digest, entry.selector);
     }
-    if input.schema_version == XTABLES_CAPTURE_LOWERING_SCHEMA_VERSION {
-        digest_local_output_requirements(&mut digest, input.local_output);
-        digest_transaction_order(&mut digest, input.transaction_order);
-    }
+    digest_local_output_requirements(&mut digest, input.local_output);
+    digest_transaction_order(&mut digest, input.transaction_order);
     digest_restore_artifact(&mut digest, input.prepare);
     digest_restore_artifact(&mut digest, input.retire);
-    digest_usage(&mut digest, input.usage, input.schema_version);
+    digest_usage(&mut digest, input.usage);
     XtablesCaptureArtifactPairDigest(digest.finalize().into())
 }
 
 fn digest_set(
-    schema_version: u16,
     lowering: XtablesCaptureLoweringDigest,
     ipv4: Option<&XtablesCaptureArtifactPair>,
     ipv6: Option<&XtablesCaptureArtifactPair>,
     usage: XtablesCaptureResourceUsage,
 ) -> XtablesCaptureArtifactSetDigest {
     let mut digest = Sha256::new();
-    digest.update(
-        if schema_version == XTABLES_CAPTURE_LOWERING_SCHEMA_VERSION_V1 {
-            SET_DIGEST_DOMAIN_V1
-        } else {
-            SET_DIGEST_DOMAIN_V2
-        },
-    );
-    digest.update(schema_version.to_be_bytes());
+    digest.update(SET_DIGEST_DOMAIN);
+    digest.update(XTABLES_CAPTURE_LOWERING_SCHEMA_VERSION.to_be_bytes());
     digest.update(lowering.as_bytes());
     for pair in [ipv4, ipv6] {
         match pair {
@@ -2355,7 +2291,7 @@ fn digest_set(
             None => digest.update([0]),
         }
     }
-    digest_usage(&mut digest, usage, schema_version);
+    digest_usage(&mut digest, usage);
     XtablesCaptureArtifactSetDigest(digest.finalize().into())
 }
 
@@ -2428,8 +2364,8 @@ fn digest_local_output_requirements(
     digest.update([protocol_bits(listener.protocols())]);
 
     let escape = requirements.loop_escape();
-    digest.update(escape.compatibility_credentials().uid().get().to_be_bytes());
-    digest.update(escape.compatibility_credentials().gid().get().to_be_bytes());
+    digest.update(escape.engine_credentials().uid().get().to_be_bytes());
+    digest.update(escape.engine_credentials().gid().get().to_be_bytes());
     digest_rule_fwmark(digest, escape.socket_mark());
 }
 
@@ -2438,11 +2374,7 @@ fn digest_rule_fwmark(digest: &mut Sha256, mark: RuleFwMark) {
     digest.update(mark.mask().to_be_bytes());
 }
 
-fn digest_transaction_order(digest: &mut Sha256, order: Option<&XtablesCaptureTransactionOrder>) {
-    let Some(order) = order else {
-        digest.update([0]);
-        return;
-    };
+fn digest_transaction_order(digest: &mut Sha256, order: &XtablesCaptureTransactionOrder) {
     digest.update([1]);
     for steps in [order.prepare(), order.retire()] {
         digest.update(length_bytes(steps.len()));
@@ -2510,8 +2442,8 @@ fn digest_restore_artifact(digest: &mut Sha256, artifact: &XtablesRestoreArtifac
     }
 }
 
-fn digest_usage(digest: &mut Sha256, usage: XtablesCaptureResourceUsage, schema_version: u16) {
-    let v1_values = [
+fn digest_usage(digest: &mut Sha256, usage: XtablesCaptureResourceUsage) {
+    for value in [
         usage.domain_programs,
         usage.source_clauses,
         usage.expanded_match_rules,
@@ -2519,19 +2451,12 @@ fn digest_usage(digest: &mut Sha256, usage: XtablesCaptureResourceUsage, schema_
         usage.prepare_commands,
         usage.retire_commands,
         usage.maximum_jump_depth,
-    ];
-    for value in v1_values {
+        usage.entry_points,
+        usage.listener_requirements,
+        usage.routing_objects,
+        usage.transaction_steps,
+    ] {
         digest.update(length_bytes(value));
-    }
-    if schema_version == XTABLES_CAPTURE_LOWERING_SCHEMA_VERSION {
-        for value in [
-            usage.entry_points,
-            usage.listener_requirements,
-            usage.routing_objects,
-            usage.transaction_steps,
-        ] {
-            digest.update(length_bytes(value));
-        }
     }
 }
 

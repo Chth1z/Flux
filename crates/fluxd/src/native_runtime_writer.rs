@@ -334,7 +334,7 @@ where
     }
 }
 
-/// Production-shaped native runtime composition with no phase-dispatch or shell dependency.
+/// Production-shaped native runtime composition with direct typed ownership dependencies.
 ///
 /// The caller supplies only an already composed opaque platform converger and a lazy Generation
 /// source. Recovery reaches verified clean absence before the source factory can observe any
@@ -860,7 +860,7 @@ mod tests {
                 snapshot: Arc::new(Mutex::new(Arc::new(EngineSnapshot::default()))),
             },
             Duration::from_millis(100),
-            RuntimeFunctionalCanary::StructuralOnlyCompatibility,
+            RuntimeFunctionalCanary::StructuralVerificationOnly,
         )
     }
 
@@ -903,7 +903,7 @@ mod tests {
     }
 
     #[test]
-    fn coordinator_starts_engine_before_native_capture_without_dispatcher_events() {
+    fn coordinator_starts_engine_before_native_capture_without_out_of_band_events() {
         let fixture = EngineFixture::new();
         let events = Arc::new(Mutex::new(Vec::new()));
         let writer = writer(&events, None, None, [generation(1, &fixture)], []);
@@ -927,7 +927,7 @@ mod tests {
                 Event::EngineRunning(CaptureObservation::Detached),
                 Event::ConvergedActive(1),
             ],
-            "the native path exposes no dispatcher or legacy publication operation"
+            "the native path exposes no out-of-band publication operation"
         );
         let snapshot = coordinator.runtime_snapshot_source().snapshot();
         assert_eq!(snapshot.phase, RuntimePhase::Running);
@@ -963,7 +963,7 @@ mod tests {
 
         coordinator
             .execute(&RuntimeIntent::Reload {
-                reason: Reason::Fluxctl,
+                reason: Reason::UserControl,
             })
             .expect_err("injected native candidate failure is reported");
 
@@ -971,7 +971,7 @@ mod tests {
             *events.lock().expect("native events lock"),
             [
                 Event::PreparedIntent {
-                    reason: Reason::Fluxctl,
+                    reason: Reason::UserControl,
                     generation: 2,
                     prior: Some(1),
                 },
@@ -1066,7 +1066,7 @@ mod tests {
 
         let completion = coordinator
             .execute(&RuntimeIntent::ResyncAddresses {
-                reason: Reason::Fluxctl,
+                reason: Reason::UserControl,
             })
             .expect("missing inventory is a deferred resync");
 
@@ -1098,7 +1098,7 @@ mod tests {
 
         let completion = coordinator
             .execute(&RuntimeIntent::ResyncAddresses {
-                reason: Reason::Fluxctl,
+                reason: Reason::UserControl,
             })
             .expect("fresh no-change resync");
 
@@ -1137,7 +1137,7 @@ mod tests {
 
         let completion = coordinator
             .execute(&RuntimeIntent::ResyncAddresses {
-                reason: Reason::Fluxctl,
+                reason: Reason::UserControl,
             })
             .expect("address successor converges synchronously");
 
@@ -1189,7 +1189,7 @@ mod tests {
             .expect("initial native Generation converges");
         coordinator
             .execute(&RuntimeIntent::Reload {
-                reason: Reason::Fluxctl,
+                reason: Reason::UserControl,
             })
             .expect_err("injected candidate failure degrades the active runtime");
         assert_eq!(
@@ -1201,7 +1201,7 @@ mod tests {
 
         let completion = coordinator
             .execute(&RuntimeIntent::ResyncAddresses {
-                reason: Reason::Fluxctl,
+                reason: Reason::UserControl,
             })
             .expect("unready runtime queues address reconciliation");
 
@@ -1236,7 +1236,7 @@ mod tests {
 
         coordinator
             .execute(&RuntimeIntent::Stopped {
-                reason: Reason::Fluxctl,
+                reason: Reason::UserControl,
             })
             .expect("native stop converges");
 

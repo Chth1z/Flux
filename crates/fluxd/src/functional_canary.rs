@@ -43,7 +43,7 @@ pub(crate) const CANARY_INBOUND_DELIVERY_REPORT_SCHEMA_VERSION: u16 = 1;
 pub(crate) enum FunctionalCanaryGateMode {
     /// Retain the current Phase 1 structural gate without claiming functional
     /// traffic, DNS, or exact-process loop-escape qualification.
-    StructuralOnlyCompatibility,
+    StructuralVerificationOnly,
     /// Require the complete model below while still describing the result as
     /// unqualified until reviewed Android device evidence exists.
     RequiredUnqualified,
@@ -3108,7 +3108,7 @@ impl ValidatedUnqualifiedCanaryGateEvidence {
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum FunctionalCanaryDisposition {
-    StructuralOnlyCompatibility,
+    StructuralVerificationOnly,
     AttemptPassedUnqualified(Box<ValidatedUnqualifiedCanaryGateEvidence>),
 }
 

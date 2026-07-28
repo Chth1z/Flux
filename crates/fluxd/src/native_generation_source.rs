@@ -17,7 +17,7 @@ use flux_platform::{
     AndroidFwmarkCensusCoordinatorRequest, NativeXtablesCaptureAdmission,
     NativeXtablesCaptureAdmissionError, NativeXtablesCaptureTarget, NetworkInventorySource,
     SingBoxLaunchSpec, SingBoxLauncher, SingBoxReadiness, SystemAndroidFwmarkCensusSource,
-    collect_network_inventory_once, coordinate_android_fwmark_census_for_inventory,
+    coordinate_android_fwmark_census_for_inventory,
 };
 #[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
 use flux_platform::{NativeLinuxCompositionTestAdmission, NativeLinuxCompositionTestError};
@@ -57,38 +57,12 @@ pub(crate) trait NativeGenerationPlanningSource: Send + 'static {
     ) -> Result<GenerationPlanningAuthority, Self::Error>;
 }
 
-const SYSTEM_ANDROID_INVENTORY_BOUND: Duration = Duration::from_secs(30);
 const SYSTEM_ANDROID_CANDIDATE_MASK: u32 = 0x0300_0000;
+const SYSTEM_ANDROID_CENSUS_BOUND: Duration = Duration::from_secs(30);
 const SYSTEM_ANDROID_PROXY_VALUE: u32 = 0x0100_0000;
 const SYSTEM_ANDROID_BYPASS_VALUE: u32 = 0x0200_0000;
 const SYSTEM_ANDROID_PROXY_PRIORITY: u32 = 30_999;
 const SYSTEM_ANDROID_PRIVATE_TABLE: u32 = 20_253;
-
-/// Startup inventory followed by bounded one-shot refreshes for production Generation assembly.
-pub(crate) struct SystemNativeInventorySource {
-    initial: Option<Arc<NetworkInventory>>,
-}
-
-impl SystemNativeInventorySource {
-    #[must_use]
-    pub(crate) fn new(initial: Arc<NetworkInventory>) -> Self {
-        Self {
-            initial: Some(initial),
-        }
-    }
-
-    pub(crate) fn collect_initial() -> Result<Arc<NetworkInventory>, flux_platform::PlatformError> {
-        collect_network_inventory_once(SYSTEM_ANDROID_INVENTORY_BOUND)
-    }
-}
-
-impl CompleteNativeInventorySource for SystemNativeInventorySource {
-    fn snapshot(&mut self) -> Option<Arc<NetworkInventory>> {
-        self.initial
-            .take()
-            .or_else(|| collect_network_inventory_once(SYSTEM_ANDROID_INVENTORY_BOUND).ok())
-    }
-}
 
 /// Production Android planning adapter backed by the complete system census coordinator.
 pub(crate) struct SystemAndroidGenerationPlanningSource {
@@ -169,7 +143,7 @@ impl SystemAndroidGenerationPlanningSource {
             AndroidNetdSourceProfile::AospNetd20250324,
             candidate,
             topology,
-            SYSTEM_ANDROID_INVENTORY_BOUND,
+            SYSTEM_ANDROID_CENSUS_BOUND,
         )
         .expect("compiled Android census request is structurally valid");
         let outcome = coordinate_android_fwmark_census_for_inventory(
@@ -1342,7 +1316,7 @@ esac
 
         let retry = fixture
             .source
-            .prepare(Reason::Fluxctl, Some(1))
+            .prepare(Reason::UserControl, Some(1))
             .expect("retry from accepted source");
         assert_eq!(fs::read(fixture.generation_path(2)).unwrap(), first_bytes);
         fixture

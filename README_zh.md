@@ -156,8 +156,13 @@ cargo xtask verify-package --stage dist/module
 二进制来源/版本/hash/license 字段、可信且绑定 payload 的设备证据、SPDX、固定构建元数据和完整
 校验和。
 
-聚焦测试、capability collector、模块 staging 和真机安全流程请参阅
-[开发指南](docs/development.md)。架构决策和实现状态索引位于 [`docs/`](docs/README.md)。
+有界、只读的 Android fwmark census 必须显式指定 ADB 设备和命令路径：
+
+```text
+cargo --quiet xtask collect-android-arm64-fwmark-census --serial SERIAL --adb PROGRAM
+```
+
+仅应在可恢复的测试设备上运行设备探针，并先审查命令的变更与清理范围。
 
 ## 免责声明
 

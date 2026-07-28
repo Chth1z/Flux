@@ -25,9 +25,6 @@ fn system_source_collects_native_facts_without_legacy_artifact_probes() {
     );
     assert!(profile.boot_identity().verified().is_some());
     assert_eq!(profile.device_identity(), &Observation::Unavailable);
-    assert_eq!(profile.legacy_bridge().shell(), &Observation::Absent);
-    assert_eq!(profile.legacy_bridge().dispatcher(), &Observation::Absent);
-    assert_eq!(profile.legacy_bridge().addrsync(), &Observation::Absent);
     assert_eq!(profile.mutation_gate(), MutationGate::Allowed);
 }
 

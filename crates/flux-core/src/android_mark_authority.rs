@@ -59,7 +59,7 @@ const ALL_FWMARK_EVIDENCE_SOURCES: [FwmarkEvidenceSource; 9] = [
     FwmarkEvidenceSource::AndroidNetId,
     FwmarkEvidenceSource::Rpdb,
     FwmarkEvidenceSource::DeviceMarkPolicy,
-    FwmarkEvidenceSource::LegacyXtables,
+    FwmarkEvidenceSource::Xtables,
     FwmarkEvidenceSource::Nftables,
     FwmarkEvidenceSource::TrafficControlAndBpf,
     FwmarkEvidenceSource::Xfrm,
@@ -1144,7 +1144,7 @@ impl FwmarkOrderedLateWriteQualification {
                 FwmarkNetfilterBuiltinHook::Input,
             ),
             FwmarkOrderedLateWritePlacement::PostroutingAfterFinalFluxUse => (
-                FwmarkEvidenceSource::LegacyXtables,
+                FwmarkEvidenceSource::Xtables,
                 FwmarkNetfilterBuiltinHook::Postrouting,
             ),
         };

@@ -5,10 +5,8 @@ use std::time::{Duration, Instant};
 use flux_core::{
     AddressResyncDisposition, AdministrativeState, AndroidBuildIdentity, AndroidProductIdentity,
     ArtifactIdentity, BootIdentity, BootIdentityMutationStatus, CAPABILITY_PROFILE_SCHEMA_VERSION,
-    CapabilityProfile, ConfigurationChangeReport, ControlError, ControlService, ControlSnapshot,
-    DeviceIdentity, KernelBuildIdentity, KernelFacts, KernelMutationStatus, KernelRelease,
-    KernelSupport, KernelVersion, LegacyAddressSynchronization, LegacyArtifactReadiness,
-    LegacyArtifactResolution, LegacyBridgeFacts, LegacyMutationWriter, LegacyRuleBackend,
+    CapabilityProfile, ControlError, ControlService, ControlSnapshot, DeviceIdentity,
+    KernelBuildIdentity, KernelFacts, KernelMutationStatus, KernelRelease, KernelVersion,
     MIN_SUPPORTED_KERNEL, MutationGate, NetworkNamespaceIdentity, Observation, OperationReport,
     Reason, RuntimeIntent, SecurityPatchLevel, SelinuxMode, SelinuxPolicyIdentity, Sha256Digest,
     ToolId, VendorBuildIdentity, VerifiedBootIdentity, VerifiedBootState,
@@ -21,11 +19,12 @@ use crate::subscription::{
     SubscriptionRefreshClient, SubscriptionRefreshDisposition, SubscriptionRefreshReport,
 };
 use crate::{
-    DiagnosticReport, ExplainReport, LogReport, LogStream, RuntimeCaptureState, RuntimeEngineState,
-    RuntimeFailure, RuntimePhase, RuntimeSnapshot, RuntimeSnapshotSource, RuntimeVerificationState,
+    DiagnosticReport, ExplainReport, LogReport, LogStream, NativeAdmissionRejection,
+    NativeAdmissionState, RuntimeCaptureState, RuntimeEngineState, RuntimeFailure, RuntimePhase,
+    RuntimeSnapshot, RuntimeSnapshotSource, RuntimeVerificationState,
 };
 
-const PROTOCOL_VERSION: u16 = 4;
+const PROTOCOL_VERSION: u16 = 5;
 const RECENT_RESULT_CAPACITY: usize = 128;
 const RECENT_RESULT_FINGERPRINT_BYTES: usize = MAX_CONTROL_PACKET_BYTES;
 const RECENT_RESULT_RESPONSE_BYTES: usize = MAX_CONTROL_PACKET_BYTES;
@@ -47,25 +46,14 @@ impl RequestPeerId {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DaemonSnapshot {
     pub capability_profile: CapabilityProfile,
+    pub native_admission: NativeAdmissionState,
     pub control: ControlSnapshot,
     pub runtime: RuntimeSnapshot,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum EventDisposition {
-    Applied,
-    Deferred,
-    Ignored,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct EventReport {
-    pub disposition: EventDisposition,
-    pub revision: u64,
-}
-
 pub struct ProtocolHandler<C> {
     capability_profile: Arc<CapabilityProfile>,
+    native_admission: NativeAdmissionState,
     control: C,
     runtime: RuntimeSnapshotSource,
     subscription: Option<SubscriptionRefreshClient>,
@@ -78,9 +66,14 @@ where
     C: ControlService,
 {
     #[must_use]
-    pub fn new(capability_profile: Arc<CapabilityProfile>, control: C) -> Self {
+    pub fn new(
+        capability_profile: Arc<CapabilityProfile>,
+        native_admission: NativeAdmissionState,
+        control: C,
+    ) -> Self {
         Self::with_runtime_snapshot_source(
             capability_profile,
+            native_admission,
             control,
             RuntimeSnapshotSource::default(),
         )
@@ -89,21 +82,30 @@ where
     #[must_use]
     pub fn with_runtime_snapshot_source(
         capability_profile: Arc<CapabilityProfile>,
+        native_admission: NativeAdmissionState,
         control: C,
         runtime: RuntimeSnapshotSource,
     ) -> Self {
-        Self::with_runtime_snapshot_and_subscription(capability_profile, control, runtime, None)
+        Self::with_runtime_snapshot_and_subscription(
+            capability_profile,
+            native_admission,
+            control,
+            runtime,
+            None,
+        )
     }
 
     #[must_use]
     pub(crate) fn with_runtime_snapshot_and_subscription(
         capability_profile: Arc<CapabilityProfile>,
+        native_admission: NativeAdmissionState,
         control: C,
         runtime: RuntimeSnapshotSource,
         subscription: Option<SubscriptionRefreshClient>,
     ) -> Self {
         Self::with_runtime_subscription_and_inspection(
             capability_profile,
+            native_admission,
             control,
             runtime,
             subscription,
@@ -114,6 +116,7 @@ where
     #[must_use]
     pub(crate) fn with_runtime_subscription_and_inspection(
         capability_profile: Arc<CapabilityProfile>,
+        native_admission: NativeAdmissionState,
         control: C,
         runtime: RuntimeSnapshotSource,
         subscription: Option<SubscriptionRefreshClient>,
@@ -121,6 +124,7 @@ where
     ) -> Self {
         Self {
             capability_profile,
+            native_admission,
             control,
             runtime,
             subscription,
@@ -228,8 +232,8 @@ where
             WireCommand::Status => encode_response(ResponseEnvelope::ok(
                 request.request_id,
                 ResponseBody::Snapshot {
-                    kernel: self.capability_profile.kernel_support().map(Into::into),
                     capability_profile: Box::new(self.capability_profile.as_ref().into()),
+                    native_admission: self.native_admission.into(),
                     control: self.control.snapshot().as_ref().into(),
                     runtime: self.runtime.snapshot().as_ref().into(),
                 },
@@ -237,11 +241,6 @@ where
             WireCommand::Control { action, reason } => {
                 self.handle_control(request.request_id, action, reason)
             }
-            WireCommand::Event {
-                event_type,
-                watched_path: _,
-                event_name,
-            } => self.handle_event(request.request_id, &event_type, &event_name),
             WireCommand::SubscriptionUpdate => self.handle_subscription_update(request.request_id),
             WireCommand::Diagnose => self.handle_diagnose(request.request_id),
             WireCommand::Logs { stream, lines } => {
@@ -358,102 +357,24 @@ where
         }
     }
 
-    fn handle_event(&self, request_id: u64, event_type: &str, event_name: &str) -> Vec<u8> {
-        match (event_name, event_type) {
-            ("disable", "n") => self.handle_event_intent(
-                request_id,
-                RuntimeIntent::Stopped {
-                    reason: Reason::DisableCreated,
-                },
-            ),
-            ("disable", "d") => self.handle_event_intent(
-                request_id,
-                RuntimeIntent::Running {
-                    reason: Reason::DisableRemoved,
-                },
-            ),
-            ("settings.ini" | "config.json" | "addrsyncd.toml", "y") => {
-                self.handle_configuration_event(request_id)
-            }
-            _ => encode_response(ResponseEnvelope::ok(
-                request_id,
-                ResponseBody::Event {
-                    disposition: WireEventDisposition::Ignored,
-                    revision: self.control.snapshot().revision,
-                },
-            )),
-        }
-    }
-
-    fn handle_event_intent(&self, request_id: u64, intent: RuntimeIntent) -> Vec<u8> {
-        if let Some(response) = self.mutation_gate_response(request_id) {
-            return response;
-        }
-        match self.control.submit_and_wait(intent) {
-            Ok(report) => encode_response(ResponseEnvelope::ok(
-                request_id,
-                ResponseBody::Event {
-                    disposition: WireEventDisposition::Applied,
-                    revision: report.revision,
-                },
-            )),
-            Err(error) => encode_response(ResponseEnvelope::error(
-                request_id,
-                "event_failed",
-                error.to_string(),
-            )),
-        }
-    }
-
-    fn handle_configuration_event(&self, request_id: u64) -> Vec<u8> {
-        if let Some(response) = self.mutation_gate_response(request_id) {
-            return response;
-        }
-        match self.control.configuration_changed(Reason::ConfigChanged) {
-            Ok(ConfigurationChangeReport::Reloaded(report)) => {
-                encode_response(ResponseEnvelope::ok(
-                    request_id,
-                    ResponseBody::Event {
-                        disposition: WireEventDisposition::Applied,
-                        revision: report.revision,
-                    },
-                ))
-            }
-            Ok(ConfigurationChangeReport::Deferred { revision }) => {
-                encode_response(ResponseEnvelope::ok(
-                    request_id,
-                    ResponseBody::Event {
-                        disposition: WireEventDisposition::Deferred,
-                        revision,
-                    },
-                ))
-            }
-            Err(error) => encode_response(ResponseEnvelope::error(
-                request_id,
-                "event_failed",
-                error.to_string(),
-            )),
-        }
-    }
-
     fn mutation_gate_response(&self, request_id: u64) -> Option<Vec<u8>> {
-        match self.capability_profile.mutation_gate() {
-            MutationGate::Allowed => None,
-            MutationGate::ReadOnly {
-                kernel: KernelMutationStatus::Unsupported { found, minimum },
-                ..
-            } => Some(encode_response(ResponseEnvelope::error(
-                request_id,
-                "unsupported_kernel",
-                format!("kernel {found} is below minimum {minimum}"),
-            ))),
-            MutationGate::ReadOnly { .. } => Some(encode_response(ResponseEnvelope::error(
-                request_id,
-                "read_only_profile",
-                "capability profile is read-only because kernel or boot identity is unverified"
-                    .to_owned(),
-            ))),
-        }
+        let reason = self.native_admission.rejection()?;
+        let message = if reason == NativeAdmissionRejection::UnsupportedKernel {
+            match self.capability_profile.mutation_gate() {
+                MutationGate::ReadOnly {
+                    kernel: KernelMutationStatus::Unsupported { found, minimum },
+                    ..
+                } => format!("kernel {found} is below minimum {minimum}"),
+                _ => format!("native admission rejected: {reason}"),
+            }
+        } else {
+            format!("native admission rejected: {reason}")
+        };
+        Some(encode_response(ResponseEnvelope::error(
+            request_id,
+            reason.as_token(),
+            message,
+        )))
     }
 }
 
@@ -481,11 +402,6 @@ enum WireCommand {
         action: WireAction,
         reason: WireReason,
     },
-    Event {
-        event_type: String,
-        watched_path: String,
-        event_name: String,
-    },
     SubscriptionUpdate,
     Diagnose,
     Logs {
@@ -497,10 +413,7 @@ enum WireCommand {
 
 impl WireCommand {
     const fn is_mutating(&self) -> bool {
-        matches!(
-            self,
-            Self::Control { .. } | Self::Event { .. } | Self::SubscriptionUpdate
-        )
+        matches!(self, Self::Control { .. } | Self::SubscriptionUpdate)
     }
 }
 
@@ -700,7 +613,7 @@ enum WireAction {
 #[serde(rename_all = "snake_case")]
 enum WireReason {
     Boot,
-    Fluxctl,
+    UserControl,
     ConfigChanged,
     DisableCreated,
     DisableRemoved,
@@ -712,7 +625,7 @@ impl From<WireReason> for Reason {
     fn from(reason: WireReason) -> Self {
         match reason {
             WireReason::Boot => Self::Boot,
-            WireReason::Fluxctl => Self::Fluxctl,
+            WireReason::UserControl => Self::UserControl,
             WireReason::ConfigChanged => Self::ConfigChanged,
             WireReason::DisableCreated => Self::DisableCreated,
             WireReason::DisableRemoved => Self::DisableRemoved,
@@ -726,7 +639,7 @@ impl From<Reason> for WireReason {
     fn from(reason: Reason) -> Self {
         match reason {
             Reason::Boot => Self::Boot,
-            Reason::Fluxctl => Self::Fluxctl,
+            Reason::UserControl => Self::UserControl,
             Reason::ConfigChanged => Self::ConfigChanged,
             Reason::DisableCreated => Self::DisableCreated,
             Reason::DisableRemoved => Self::DisableRemoved,
@@ -776,9 +689,8 @@ enum WireResult {
 enum ResponseBody {
     Pong,
     Snapshot {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        kernel: Option<WireKernelSupport>,
         capability_profile: Box<WireCapabilityProfile>,
+        native_admission: WireNativeAdmission,
         control: WireControlSnapshot,
         runtime: WireRuntimeSnapshot,
     },
@@ -786,10 +698,6 @@ enum ResponseBody {
         revision: u64,
         #[serde(skip_serializing_if = "Option::is_none")]
         address_resync: Option<WireAddressResyncDisposition>,
-    },
-    Event {
-        disposition: WireEventDisposition,
-        revision: u64,
     },
     SubscriptionUpdate {
         disposition: WireSubscriptionRefreshDisposition,
@@ -806,14 +714,6 @@ enum ResponseBody {
     Explain {
         report: ExplainReport,
     },
-}
-
-#[derive(Clone, Copy, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum WireEventDisposition {
-    Applied,
-    Deferred,
-    Ignored,
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
@@ -844,37 +744,6 @@ impl From<WireAddressResyncDisposition> for AddressResyncDisposition {
     }
 }
 
-impl From<WireEventDisposition> for EventDisposition {
-    fn from(disposition: WireEventDisposition) -> Self {
-        match disposition {
-            WireEventDisposition::Applied => Self::Applied,
-            WireEventDisposition::Deferred => Self::Deferred,
-            WireEventDisposition::Ignored => Self::Ignored,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-enum WireKernelSupport {
-    Supported { version: String },
-    Unsupported { found: String, minimum: String },
-}
-
-impl From<KernelSupport> for WireKernelSupport {
-    fn from(support: KernelSupport) -> Self {
-        match support {
-            KernelSupport::Supported(version) => Self::Supported {
-                version: version.to_string(),
-            },
-            KernelSupport::Unsupported { found, minimum } => Self::Unsupported {
-                found: found.to_string(),
-                minimum: minimum.to_string(),
-            },
-        }
-    }
-}
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct WireCapabilityProfile {
     schema_version: u16,
@@ -883,7 +752,6 @@ pub(crate) struct WireCapabilityProfile {
     device_identity: Option<WireObservation<WireDeviceIdentity>>,
     kernel: WireKernelFacts,
     selinux: WireObservation<WireSelinuxMode>,
-    legacy_bridge: WireLegacyBridgeFacts,
 }
 
 impl From<&CapabilityProfile> for WireCapabilityProfile {
@@ -900,7 +768,6 @@ impl From<&CapabilityProfile> for WireCapabilityProfile {
                 gate: profile.mutation_gate().into(),
             },
             selinux: wire_selinux(profile.selinux()),
-            legacy_bridge: profile.legacy_bridge().into(),
         }
     }
 }
@@ -916,7 +783,6 @@ impl TryFrom<WireCapabilityProfile> for CapabilityProfile {
             device_identity,
             kernel,
             selinux,
-            legacy_bridge,
         } = wire;
         if schema_version != CAPABILITY_PROFILE_SCHEMA_VERSION {
             return Err(invalid_capability_profile(format!(
@@ -935,7 +801,7 @@ impl TryFrom<WireCapabilityProfile> for CapabilityProfile {
         let device_identity = device_identity
             .ok_or_else(|| {
                 invalid_capability_profile(
-                    "schema-2 capability profile is missing device identity".to_owned(),
+                    "capability profile is missing device identity".to_owned(),
                 )
             })?
             .try_map(DeviceIdentity::try_from)?;
@@ -966,15 +832,8 @@ impl TryFrom<WireCapabilityProfile> for CapabilityProfile {
         }
 
         let selinux = selinux.try_map(|mode| Ok(mode.into()))?;
-        let legacy_bridge = legacy_bridge.try_into()?;
-        let profile = CapabilityProfile::new(
-            revision,
-            boot_identity,
-            device_identity,
-            kernel,
-            selinux,
-            legacy_bridge,
-        );
+        let profile =
+            CapabilityProfile::new(revision, boot_identity, device_identity, kernel, selinux);
         if gate != profile.mutation_gate().into() {
             return Err(invalid_capability_profile(
                 "reported mutation gate disagrees with kernel and boot observations".to_owned(),
@@ -1266,130 +1125,6 @@ impl From<WireSelinuxMode> for SelinuxMode {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-struct WireLegacyBridgeFacts {
-    mutation_writer: WireLegacyMutationWriter,
-    rule_backend: WireLegacyRuleBackend,
-    address_synchronization: WireLegacyAddressSynchronization,
-    shell: WireObservation<WireLegacyArtifactReadiness>,
-    dispatcher: WireObservation<WireLegacyArtifactReadiness>,
-    addrsync: WireObservation<WireLegacyArtifactReadiness>,
-}
-
-impl From<&LegacyBridgeFacts> for WireLegacyBridgeFacts {
-    fn from(bridge: &LegacyBridgeFacts) -> Self {
-        Self {
-            mutation_writer: bridge.mutation_writer().into(),
-            rule_backend: bridge.rule_backend().into(),
-            address_synchronization: bridge.address_synchronization().into(),
-            shell: wire_legacy_artifact(bridge.shell()),
-            dispatcher: wire_legacy_artifact(bridge.dispatcher()),
-            addrsync: wire_legacy_artifact(bridge.addrsync()),
-        }
-    }
-}
-
-impl TryFrom<WireLegacyBridgeFacts> for LegacyBridgeFacts {
-    type Error = ControlError;
-
-    fn try_from(bridge: WireLegacyBridgeFacts) -> Result<Self, Self::Error> {
-        let WireLegacyBridgeFacts {
-            mutation_writer: WireLegacyMutationWriter::Dispatcher,
-            rule_backend: WireLegacyRuleBackend::IptablesRestore,
-            address_synchronization: WireLegacyAddressSynchronization::StandaloneAddrsyncdViaScript,
-            shell,
-            dispatcher,
-            addrsync,
-        } = bridge;
-        Ok(Self::new(
-            shell.try_map(|artifact| Ok(artifact.into()))?,
-            dispatcher.try_map(|artifact| Ok(artifact.into()))?,
-            addrsync.try_map(|artifact| Ok(artifact.into()))?,
-        ))
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum WireLegacyMutationWriter {
-    Dispatcher,
-}
-
-impl From<LegacyMutationWriter> for WireLegacyMutationWriter {
-    fn from(writer: LegacyMutationWriter) -> Self {
-        match writer {
-            LegacyMutationWriter::Dispatcher => Self::Dispatcher,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum WireLegacyRuleBackend {
-    IptablesRestore,
-}
-
-impl From<LegacyRuleBackend> for WireLegacyRuleBackend {
-    fn from(backend: LegacyRuleBackend) -> Self {
-        match backend {
-            LegacyRuleBackend::IptablesRestore => Self::IptablesRestore,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum WireLegacyAddressSynchronization {
-    StandaloneAddrsyncdViaScript,
-}
-
-impl From<LegacyAddressSynchronization> for WireLegacyAddressSynchronization {
-    fn from(address_synchronization: LegacyAddressSynchronization) -> Self {
-        match address_synchronization {
-            LegacyAddressSynchronization::StandaloneAddrsyncdViaScript => {
-                Self::StandaloneAddrsyncdViaScript
-            }
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-struct WireLegacyArtifactReadiness {
-    resolution: WireLegacyArtifactResolution,
-    ready: bool,
-}
-
-impl From<WireLegacyArtifactReadiness> for LegacyArtifactReadiness {
-    fn from(artifact: WireLegacyArtifactReadiness) -> Self {
-        Self::new(artifact.resolution.into(), artifact.ready)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum WireLegacyArtifactResolution {
-    Direct,
-    SymbolicLink,
-}
-
-impl From<LegacyArtifactResolution> for WireLegacyArtifactResolution {
-    fn from(resolution: LegacyArtifactResolution) -> Self {
-        match resolution {
-            LegacyArtifactResolution::Direct => Self::Direct,
-            LegacyArtifactResolution::SymbolicLink => Self::SymbolicLink,
-        }
-    }
-}
-
-impl From<WireLegacyArtifactResolution> for LegacyArtifactResolution {
-    fn from(resolution: WireLegacyArtifactResolution) -> Self {
-        match resolution {
-            WireLegacyArtifactResolution::Direct => Self::Direct,
-            WireLegacyArtifactResolution::SymbolicLink => Self::SymbolicLink,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 enum WireMutationGate {
     Allowed,
@@ -1507,15 +1242,6 @@ fn wire_selinux(mode: &Observation<SelinuxMode>) -> WireObservation<WireSelinuxM
     })
 }
 
-fn wire_legacy_artifact(
-    artifact: &Observation<LegacyArtifactReadiness>,
-) -> WireObservation<WireLegacyArtifactReadiness> {
-    wire_observation(artifact, |artifact| WireLegacyArtifactReadiness {
-        resolution: artifact.resolution().into(),
-        ready: artifact.is_ready(),
-    })
-}
-
 fn wire_observation<T, U>(
     observation: &Observation<T>,
     map: impl FnOnce(&T) -> U,
@@ -1525,6 +1251,89 @@ fn wire_observation<T, U>(
 
 fn invalid_capability_profile(message: String) -> ControlError {
     ControlError::protocol(format!("invalid daemon capability profile: {message}"))
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum WireNativeAdmission {
+    Admitted,
+    Rejected {
+        reason: WireNativeAdmissionRejection,
+    },
+}
+
+impl From<NativeAdmissionState> for WireNativeAdmission {
+    fn from(admission: NativeAdmissionState) -> Self {
+        match admission {
+            NativeAdmissionState::Admitted => Self::Admitted,
+            NativeAdmissionState::Rejected(reason) => Self::Rejected {
+                reason: reason.into(),
+            },
+        }
+    }
+}
+
+impl From<WireNativeAdmission> for NativeAdmissionState {
+    fn from(admission: WireNativeAdmission) -> Self {
+        match admission {
+            WireNativeAdmission::Admitted => Self::Admitted,
+            WireNativeAdmission::Rejected { reason } => Self::Rejected(reason.into()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WireNativeAdmissionRejection {
+    UnsupportedKernel,
+    UnverifiedKernel,
+    UnverifiedBootIdentity,
+    UnverifiedDeviceIdentity,
+    AndroidVpnPolicyUnavailable,
+    FunctionalCanaryUnavailable,
+    NetworkInventoryUnavailable,
+}
+
+impl From<NativeAdmissionRejection> for WireNativeAdmissionRejection {
+    fn from(reason: NativeAdmissionRejection) -> Self {
+        match reason {
+            NativeAdmissionRejection::UnsupportedKernel => Self::UnsupportedKernel,
+            NativeAdmissionRejection::UnverifiedKernel => Self::UnverifiedKernel,
+            NativeAdmissionRejection::UnverifiedBootIdentity => Self::UnverifiedBootIdentity,
+            NativeAdmissionRejection::UnverifiedDeviceIdentity => Self::UnverifiedDeviceIdentity,
+            NativeAdmissionRejection::AndroidVpnPolicyUnavailable => {
+                Self::AndroidVpnPolicyUnavailable
+            }
+            NativeAdmissionRejection::FunctionalCanaryUnavailable => {
+                Self::FunctionalCanaryUnavailable
+            }
+            NativeAdmissionRejection::NetworkInventoryUnavailable => {
+                Self::NetworkInventoryUnavailable
+            }
+        }
+    }
+}
+
+impl From<WireNativeAdmissionRejection> for NativeAdmissionRejection {
+    fn from(reason: WireNativeAdmissionRejection) -> Self {
+        match reason {
+            WireNativeAdmissionRejection::UnsupportedKernel => Self::UnsupportedKernel,
+            WireNativeAdmissionRejection::UnverifiedKernel => Self::UnverifiedKernel,
+            WireNativeAdmissionRejection::UnverifiedBootIdentity => Self::UnverifiedBootIdentity,
+            WireNativeAdmissionRejection::UnverifiedDeviceIdentity => {
+                Self::UnverifiedDeviceIdentity
+            }
+            WireNativeAdmissionRejection::AndroidVpnPolicyUnavailable => {
+                Self::AndroidVpnPolicyUnavailable
+            }
+            WireNativeAdmissionRejection::FunctionalCanaryUnavailable => {
+                Self::FunctionalCanaryUnavailable
+            }
+            WireNativeAdmissionRejection::NetworkInventoryUnavailable => {
+                Self::NetworkInventoryUnavailable
+            }
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -1951,23 +1760,6 @@ pub(crate) fn encode_status_request(request_id: u64) -> Result<Vec<u8>, ControlE
     })
 }
 
-pub(crate) fn encode_event_request(
-    request_id: u64,
-    event_type: &str,
-    watched_path: &str,
-    event_name: &str,
-) -> Result<Vec<u8>, ControlError> {
-    encode_request(RequestEnvelope {
-        protocol_version: PROTOCOL_VERSION,
-        request_id,
-        command: WireCommand::Event {
-            event_type: event_type.to_owned(),
-            watched_path: watched_path.to_owned(),
-            event_name: event_name.to_owned(),
-        },
-    })
-}
-
 pub(crate) fn encode_subscription_update_request(request_id: u64) -> Result<Vec<u8>, ControlError> {
     encode_request(RequestEnvelope {
         protocol_version: PROTOCOL_VERSION,
@@ -2070,47 +1862,21 @@ pub(crate) fn decode_status_response(
         WireResult::Ok {
             body:
                 ResponseBody::Snapshot {
-                    kernel,
                     capability_profile,
+                    native_admission,
                     control,
                     runtime,
                 },
         } => {
             let capability_profile: CapabilityProfile = (*capability_profile).try_into()?;
-            let expected_kernel = capability_profile.kernel_support().map(Into::into);
-            if kernel != expected_kernel {
-                return Err(invalid_capability_profile(
-                    "legacy kernel field disagrees with capability profile".to_owned(),
-                ));
-            }
             Ok(DaemonSnapshot {
                 capability_profile,
+                native_admission: native_admission.into(),
                 control: control.try_into()?,
                 runtime: runtime.into(),
             })
         }
         WireResult::Ok { .. } => Err(unexpected_response("status")),
-        WireResult::Error { code, message } => Err(rejected_response(code, message)),
-    }
-}
-
-pub(crate) fn decode_event_response(
-    packet: &[u8],
-    expected_request_id: u64,
-) -> Result<EventReport, ControlError> {
-    let response = decode_response(packet, expected_request_id)?;
-    match response.result {
-        WireResult::Ok {
-            body:
-                ResponseBody::Event {
-                    disposition,
-                    revision,
-                },
-        } => Ok(EventReport {
-            disposition: disposition.into(),
-            revision,
-        }),
-        WireResult::Ok { .. } => Err(unexpected_response("event")),
         WireResult::Error { code, message } => Err(rejected_response(code, message)),
     }
 }
@@ -2350,6 +2116,7 @@ mod tests {
         ));
         let handler = ProtocolHandler::with_runtime_subscription_and_inspection(
             Arc::new(CapabilityProfileFixture::supported()),
+            NativeAdmissionState::Admitted,
             TestControl,
             RuntimeSnapshotSource::default(),
             None,
@@ -2359,7 +2126,7 @@ mod tests {
         let request = encode_logs_request(91, LogStream::Runtime, 2).expect("log request");
         assert_eq!(
             String::from_utf8(request.clone()).expect("UTF-8 request"),
-            "{\"protocol_version\":4,\"request_id\":91,\"command\":{\"kind\":\"logs\",\"stream\":\"runtime\",\"lines\":2}}"
+            "{\"protocol_version\":5,\"request_id\":91,\"command\":{\"kind\":\"logs\",\"stream\":\"runtime\",\"lines\":2}}"
         );
         let first = handler.handle_for_peer(&request, RequestPeerId::new(Uid::ROOT, 72));
         let report = decode_logs_response(&first, 91, LogStream::Runtime, 2).expect("log report");
@@ -2410,6 +2177,7 @@ mod tests {
 
         let read_only_handler = ProtocolHandler::with_runtime_subscription_and_inspection(
             Arc::new(CapabilityProfileFixture::unsupported_kernel()),
+            NativeAdmissionState::Rejected(NativeAdmissionRejection::UnsupportedKernel),
             TestControl,
             RuntimeSnapshotSource::default(),
             None,
@@ -2433,6 +2201,7 @@ mod tests {
         });
         let handler = ProtocolHandler::with_runtime_snapshot_and_subscription(
             Arc::new(CapabilityProfileFixture::supported()),
+            NativeAdmissionState::Admitted,
             TestControl,
             RuntimeSnapshotSource::default(),
             Some(subscription),
@@ -2446,7 +2215,7 @@ mod tests {
         assert_eq!(
             String::from_utf8(response).expect("UTF-8 response"),
             concat!(
-                "{\"protocol_version\":4,\"request_id\":101,",
+                "{\"protocol_version\":5,\"request_id\":101,",
                 "\"result\":{\"status\":\"ok\",\"body\":{",
                 "\"kind\":\"subscription_update\",\"disposition\":\"updated\",",
                 "\"generation\":71,\"node_count\":23,\"cleanup_pending\":true}}}\n"
@@ -2466,6 +2235,7 @@ mod tests {
         });
         let gated = ProtocolHandler::with_runtime_snapshot_and_subscription(
             Arc::new(CapabilityProfileFixture::unsupported_kernel()),
+            NativeAdmissionState::Rejected(NativeAdmissionRejection::UnsupportedKernel),
             TestControl,
             RuntimeSnapshotSource::default(),
             Some(subscription),
@@ -2477,7 +2247,7 @@ mod tests {
         assert_eq!(
             String::from_utf8(response).expect("UTF-8 response"),
             concat!(
-                "{\"protocol_version\":4,\"request_id\":102,",
+                "{\"protocol_version\":5,\"request_id\":102,",
                 "\"result\":{\"status\":\"error\",\"code\":\"unsupported_kernel\",",
                 "\"message\":\"kernel 5.4.280 is below minimum 5.10.0\"}}\n"
             )
@@ -2492,6 +2262,7 @@ mod tests {
         });
         let handler = ProtocolHandler::with_runtime_snapshot_and_subscription(
             Arc::new(CapabilityProfileFixture::supported()),
+            NativeAdmissionState::Admitted,
             TestControl,
             RuntimeSnapshotSource::default(),
             Some(subscription),
@@ -2557,6 +2328,7 @@ mod tests {
         });
         let handler = ProtocolHandler::with_runtime_snapshot_and_subscription(
             Arc::new(CapabilityProfileFixture::supported()),
+            NativeAdmissionState::Admitted,
             TestControl,
             RuntimeSnapshotSource::default(),
             Some(subscription),
@@ -2588,29 +2360,6 @@ mod tests {
     }
 
     #[test]
-    fn status_decoder_rejects_an_incoherent_legacy_kernel_field() {
-        let profile = CapabilityProfileFixture::supported();
-        let response = encode_response(ResponseEnvelope::ok(
-            91,
-            ResponseBody::Snapshot {
-                kernel: Some(WireKernelSupport::Supported {
-                    version: "6.6.0".to_owned(),
-                }),
-                capability_profile: Box::new((&profile).into()),
-                control: (&ControlSnapshot::default()).into(),
-                runtime: WireRuntimeSnapshot::default(),
-            },
-        ));
-
-        let error = decode_status_response(&response, 91).expect_err("incoherent status");
-
-        assert_eq!(
-            error.to_string(),
-            "control protocol: invalid daemon capability profile: legacy kernel field disagrees with capability profile"
-        );
-    }
-
-    #[test]
     fn status_decoder_preserves_a_nonzero_profile_revision() {
         let initial = CapabilityProfileFixture::supported();
         let revision = CapabilityProfileRevision::new(47).expect("nonzero revision");
@@ -2620,13 +2369,12 @@ mod tests {
             initial.device_identity().clone(),
             initial.kernel().clone(),
             initial.selinux().clone(),
-            initial.legacy_bridge().clone(),
         );
         let response = encode_response(ResponseEnvelope::ok(
             92,
             ResponseBody::Snapshot {
-                kernel: profile.kernel_support().map(Into::into),
                 capability_profile: Box::new((&profile).into()),
+                native_admission: NativeAdmissionState::Admitted.into(),
                 control: (&ControlSnapshot::default()).into(),
                 runtime: WireRuntimeSnapshot::default(),
             },
@@ -2643,8 +2391,8 @@ mod tests {
         let response = encode_response(ResponseEnvelope::ok(
             94,
             ResponseBody::Snapshot {
-                kernel: profile.kernel_support().map(Into::into),
                 capability_profile: Box::new((&profile).into()),
+                native_admission: NativeAdmissionState::Admitted.into(),
                 control: (&ControlSnapshot::default()).into(),
                 runtime: WireRuntimeSnapshot::default(),
             },
@@ -2697,13 +2445,13 @@ mod tests {
     }
 
     #[test]
-    fn status_decoder_rejects_schema_one_before_requiring_schema_two_fields() {
+    fn status_decoder_rejects_an_unsupported_capability_profile_schema() {
         let profile = CapabilityProfileFixture::supported();
         let response = encode_response(ResponseEnvelope::ok(
             96,
             ResponseBody::Snapshot {
-                kernel: profile.kernel_support().map(Into::into),
                 capability_profile: Box::new((&profile).into()),
+                native_admission: NativeAdmissionState::Admitted.into(),
                 control: (&ControlSnapshot::default()).into(),
                 runtime: WireRuntimeSnapshot::default(),
             },
@@ -2722,7 +2470,7 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "control protocol: invalid daemon capability profile: schema version 1 is unsupported; expected 2"
+            "control protocol: invalid daemon capability profile: schema version 1 is unsupported; expected 3"
         );
     }
 
@@ -2745,8 +2493,8 @@ mod tests {
         let response = encode_response(ResponseEnvelope::ok(
             93,
             ResponseBody::Snapshot {
-                kernel: profile.kernel_support().map(Into::into),
                 capability_profile: Box::new((&profile).into()),
+                native_admission: NativeAdmissionState::Admitted.into(),
                 control: (&ControlSnapshot::default()).into(),
                 runtime: (&runtime).into(),
             },
@@ -2758,13 +2506,13 @@ mod tests {
     }
 
     #[test]
-    fn version_three_status_requires_runtime_verification() {
+    fn status_requires_runtime_verification() {
         let profile = CapabilityProfileFixture::supported();
         let response = encode_response(ResponseEnvelope::ok(
             94,
             ResponseBody::Snapshot {
-                kernel: profile.kernel_support().map(Into::into),
                 capability_profile: Box::new((&profile).into()),
+                native_admission: NativeAdmissionState::Admitted.into(),
                 control: (&ControlSnapshot::default()).into(),
                 runtime: WireRuntimeSnapshot::default(),
             },
@@ -2802,8 +2550,8 @@ mod tests {
             let response = encode_response(ResponseEnvelope::ok(
                 95,
                 ResponseBody::Snapshot {
-                    kernel: profile.kernel_support().map(Into::into),
                     capability_profile: Box::new((&profile).into()),
+                    native_admission: NativeAdmissionState::Admitted.into(),
                     control: (&ControlSnapshot::default()).into(),
                     runtime: (&runtime).into(),
                 },

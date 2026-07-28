@@ -69,7 +69,7 @@ fn desired_state_compiles_the_packaged_config_and_binds_the_listener() {
             .windows(br#""listen_port":1536"#.len())
             .any(|window| window == br#""listen_port":1536"#)
     );
-    assert_eq!(artifacts.capture().artifact().programs().len(), 1);
+    assert_eq!(artifacts.capture().program().programs().len(), 1);
 }
 
 #[test]
@@ -90,7 +90,7 @@ fn desired_state_maps_scope_interfaces_and_resolved_applications() {
         PACKAGED_ENGINE_TEMPLATE,
     )
     .expect("capture artifacts");
-    let programs = artifacts.capture().artifact().programs();
+    let programs = artifacts.capture().program().programs();
 
     assert_eq!(programs.len(), 2);
     assert!(
@@ -677,7 +677,6 @@ fn candidate_requires_verified_device_identity_and_supported_kernel() {
         qualified.device_identity().clone(),
         unsupported.kernel().clone(),
         qualified.selinux().clone(),
-        qualified.legacy_bridge().clone(),
     );
     let error = compile_tproxy_generation_candidate(unsupported, inventory, profile, binding)
         .expect_err("unsupported kernel must fail closed");
@@ -717,7 +716,7 @@ fn assembler_produces_one_complete_host_inspection_generation() {
     );
     assert_eq!(
         admitted.xtables().source_program_digest(),
-        admitted.capture().artifact().digest()
+        admitted.capture().program().digest()
     );
     assert!(admitted.xtables().ipv4().is_some());
     assert!(admitted.xtables().ipv6().is_none());
@@ -909,8 +908,8 @@ fn assembler_identity_binds_product_policy_outside_engine_and_xtables_bytes() {
     let fixture = HostAssemblyFixture::new();
     let baseline = fixture.assemble(None, None).expect("baseline Generation");
     let changed_source = fixture.base_desired_state.replacen(
-        "respect_android_vpn = false",
         "respect_android_vpn = true",
+        "respect_android_vpn = false",
         1,
     );
     let changed_desired_state = fixture.compile_desired_state(&changed_source);
@@ -936,7 +935,6 @@ fn assembler_identity_binds_complete_capability_profile_not_only_revision() {
         fixture.capability_profile.device_identity().clone(),
         fixture.capability_profile.kernel().clone(),
         Observation::Verified(SelinuxMode::Permissive),
-        fixture.capability_profile.legacy_bridge().clone(),
     );
     let planning = HostInspectionPlanningAuthority::new(
         &changed_profile,

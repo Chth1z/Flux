@@ -25,7 +25,6 @@ pub(crate) const XTABLES_WRITER_LOCK_DIRECTORY_NAME: &str = "xtables-writer.lock
 const NATIVE_XTABLES_OWNER_GUARD_FILE_NAME: &str = ".native_xtables.owner.lock";
 const NATIVE_XTABLES_RUNTIME_GUARD_FILE_NAME: &str = ".native_xtables.runtime.lock";
 const NATIVE_XTABLES_WRITER_OWNER_FILE_NAME: &str = "native-owner";
-const SHELL_XTABLES_WRITER_OWNER_FILE_NAME: &str = "shell-owner";
 pub(crate) const MAX_NATIVE_XTABLES_OWNER_PAYLOAD_BYTES: usize = 4096;
 pub(crate) const MAX_NATIVE_XTABLES_DURABLE_RECORD_BYTES: usize = 16 * 1024;
 pub(crate) const MAX_NATIVE_XTABLES_TARGET_ARCHIVE_BYTES: usize = 12 * 1024 * 1024;
@@ -33,7 +32,6 @@ pub(crate) const MAX_NATIVE_XTABLES_TARGET_ARCHIVE_BYTES: usize = 12 * 1024 * 10
 const JOURNAL_MAGIC: &str = "flux-native-xtables-journal-v1";
 const LEASE_MAGIC: &str = "flux-native-xtables-lease-v1";
 const WRITER_OWNER_MAGIC: &str = "flux-native-xtables-writer-owner-v1";
-const SHELL_WRITER_OWNER_MAGIC: &str = "flux-shell-xtables-writer-owner-v2";
 const COMPONENT_NAME: &str = "native_xtables";
 const CHECKSUM_BYTES: usize = 32;
 const MAX_TEMP_CREATE_ATTEMPTS: usize = 16;
@@ -438,7 +436,7 @@ impl NativeXtablesDurableStore {
             .map(|file| NativeXtablesRuntimeGuard { _file: file })
     }
 
-    /// Publishes the activating journal and then the shell-visible lease before returning any
+    /// Publishes the activating journal and then the durable writer lease before returning any
     /// mutation authority. A returned error after lock acquisition deliberately leaves the lock
     /// directory in place when publication may have been interrupted.
     pub(crate) fn acquire(
@@ -511,7 +509,7 @@ impl NativeXtablesDurableStore {
 
     /// Reconstructs an exact lease for startup recovery. A pre-existing publication lock is
     /// adopted only when a complete matching journal+lease pair proves that the durable lease
-    /// already blocks the shell writer. Partial publication stays blocked.
+    /// already blocks every competing writer. Partial publication stays blocked.
     pub(crate) fn recover(
         &self,
         expected: &NativeXtablesJournalBinding,
@@ -893,8 +891,8 @@ impl NativeXtablesTransitionLease {
         remove_writer_lock(&root, writer_lock, &self.store)
     }
 
-    /// Durably publishes clean absence before deleting the shell-visible lease. The transient
-    /// writer lock remains after any interrupted boundary, keeping shell mutation blocked.
+    /// Durably publishes clean absence before deleting the writer lease. The transient writer lock
+    /// remains after any interrupted boundary, keeping concurrent mutation blocked.
     pub(crate) fn complete(
         self,
         terminal: NativeXtablesJournalRecord,
@@ -1024,7 +1022,6 @@ pub(crate) enum DurableArtifact {
     Lease,
     TargetArchive,
     WriterOwner,
-    ShellWriterOwner,
 }
 
 impl fmt::Display for DurableArtifact {
@@ -1034,7 +1031,6 @@ impl fmt::Display for DurableArtifact {
             Self::Lease => formatter.write_str("lease"),
             Self::TargetArchive => formatter.write_str("target archive"),
             Self::WriterOwner => formatter.write_str("writer owner"),
-            Self::ShellWriterOwner => formatter.write_str("shell writer owner"),
         }
     }
 }
@@ -1063,7 +1059,6 @@ pub(crate) enum NativeXtablesDurableError {
     },
     NativeOwnerBusy,
     NativeRuntimeBusy,
-    ShellWriterBusy,
     LeaseConflict,
     UnresolvedJournal,
     InterruptedPublication,
@@ -1131,8 +1126,6 @@ impl fmt::Display for NativeXtablesDurableError {
             Self::NativeRuntimeBusy => formatter.write_str(
                 "another live native xtables runtime writer holds the archive transaction guard",
             ),
-            Self::ShellWriterBusy => formatter
-                .write_str("another live shell xtables writer holds the shared writer lock"),
             Self::LeaseConflict => formatter.write_str("native xtables lease already exists"),
             Self::UnresolvedJournal => {
                 formatter.write_str("nonterminal native xtables journal exists without a lease")
@@ -1365,99 +1358,6 @@ fn parse_writer_owner(
         ));
     }
     Ok(scope)
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct ShellWriterParticipant {
-    pid: u32,
-    start_ticks: u64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct ShellWriterOwner {
-    parent: ShellWriterParticipant,
-    child: Option<ShellWriterParticipant>,
-    boot_identity: BootIdentity,
-}
-
-fn parse_shell_writer_owner(encoded: &[u8]) -> Result<ShellWriterOwner, NativeXtablesDurableError> {
-    ensure_record_bound(encoded, DurableArtifact::ShellWriterOwner)?;
-    let text = std::str::from_utf8(encoded)
-        .map_err(|_| invalid_record(DurableArtifact::ShellWriterOwner, "record is not UTF-8"))?;
-    if !text.ends_with('\n') || text.contains('\r') {
-        return Err(invalid_record(
-            DurableArtifact::ShellWriterOwner,
-            "record is truncated or has noncanonical lines",
-        ));
-    }
-    let fields = text[..text.len() - 1].split(' ').collect::<Vec<_>>();
-    if fields.len() != 6 || fields.iter().any(|field| field.is_empty()) {
-        return Err(invalid_record(
-            DurableArtifact::ShellWriterOwner,
-            "wrong field count",
-        ));
-    }
-    if fields[0] != SHELL_WRITER_OWNER_MAGIC {
-        return Err(invalid_record(
-            DurableArtifact::ShellWriterOwner,
-            "wrong schema",
-        ));
-    }
-    let parent_pid = fields[1]
-        .parse::<u32>()
-        .ok()
-        .filter(|pid| *pid != 0 && pid.to_string() == fields[1])
-        .ok_or_else(|| invalid_record(DurableArtifact::ShellWriterOwner, "invalid parent pid"))?;
-    let parent_start_ticks = (fields[2].len() <= 19)
-        .then(|| parse_nonzero_u64(fields[2]))
-        .flatten()
-        .ok_or_else(|| {
-            invalid_record(
-                DurableArtifact::ShellWriterOwner,
-                "invalid parent process start ticks",
-            )
-        })?;
-    let child_pid = fields[3]
-        .parse::<u32>()
-        .ok()
-        .filter(|pid| pid.to_string() == fields[3])
-        .ok_or_else(|| invalid_record(DurableArtifact::ShellWriterOwner, "invalid child pid"))?;
-    let child_start_ticks = (fields[4].len() <= 19)
-        .then(|| fields[4].parse::<u64>().ok())
-        .flatten()
-        .filter(|ticks| ticks.to_string() == fields[4])
-        .ok_or_else(|| {
-            invalid_record(
-                DurableArtifact::ShellWriterOwner,
-                "invalid child process start ticks",
-            )
-        })?;
-    let child = match (child_pid, child_start_ticks) {
-        (0, 0) => None,
-        (0, _) | (_, 0) => {
-            return Err(invalid_record(
-                DurableArtifact::ShellWriterOwner,
-                "child pid and start ticks must both be present or absent",
-            ));
-        }
-        (pid, start_ticks) => Some(ShellWriterParticipant { pid, start_ticks }),
-    };
-    let boot_identity = BootIdentity::parse(fields[5])
-        .map_err(|_| invalid_record(DurableArtifact::ShellWriterOwner, "invalid boot identity"))?;
-    if boot_identity.as_str() != fields[5] {
-        return Err(invalid_record(
-            DurableArtifact::ShellWriterOwner,
-            "boot identity is not canonical lowercase",
-        ));
-    }
-    Ok(ShellWriterOwner {
-        parent: ShellWriterParticipant {
-            pid: parent_pid,
-            start_ticks: parent_start_ticks,
-        },
-        child,
-        boot_identity,
-    })
 }
 
 fn parse_binding(
@@ -2156,90 +2056,18 @@ fn recover_or_create_writer_lock(
         return create_writer_lock(root, expected, store).map(|lock| (lock, false));
     }
     let directory = open_writer_lock_directory(root)?;
-    let native_owner = read_record(
+    let encoded = read_record(
         &directory,
         NATIVE_XTABLES_WRITER_OWNER_FILE_NAME,
         DurableArtifact::WriterOwner,
-    )?;
-    let shell_owner = read_record(
-        &directory,
-        SHELL_XTABLES_WRITER_OWNER_FILE_NAME,
-        DurableArtifact::ShellWriterOwner,
-    )?;
-    match (native_owner, shell_owner) {
-        (Some(encoded), None) => {
-            let scope = parse_writer_owner(&encoded)?;
-            if scope.boot_identity == expected.boot_identity {
-                require_lease_scope(expected, &scope)?;
-            }
-            Ok((NativeWriterLock { directory, scope }, true))
-        }
-        (None, Some(encoded)) => {
-            let owner = parse_shell_writer_owner(&encoded)?;
-            if shell_writer_is_live(&owner, expected.boot_identity())? {
-                return Err(NativeXtablesDurableError::ShellWriterBusy);
-            }
-            remove_shell_writer_lock(root, directory, &owner, store)?;
-            create_writer_lock(root, expected, store).map(|lock| (lock, false))
-        }
-        (None, None) | (Some(_), Some(_)) => Err(NativeXtablesDurableError::InterruptedPublication),
+    )?
+    .ok_or(NativeXtablesDurableError::InterruptedPublication)?;
+    require_exact_native_writer_directory(&directory)?;
+    let scope = parse_writer_owner(&encoded)?;
+    if scope.boot_identity == expected.boot_identity {
+        require_lease_scope(expected, &scope)?;
     }
-}
-
-fn shell_writer_is_live(
-    owner: &ShellWriterOwner,
-    current_boot: &BootIdentity,
-) -> Result<bool, NativeXtablesDurableError> {
-    if &owner.boot_identity != current_boot {
-        return Ok(false);
-    }
-    if shell_writer_participant_is_live(&owner.parent)? {
-        return Ok(true);
-    }
-    owner
-        .child
-        .as_ref()
-        .map_or(Ok(false), shell_writer_participant_is_live)
-}
-
-fn shell_writer_participant_is_live(
-    participant: &ShellWriterParticipant,
-) -> Result<bool, NativeXtablesDurableError> {
-    Ok(read_process_start_ticks(participant.pid)? == Some(participant.start_ticks))
-}
-
-fn read_process_start_ticks(pid: u32) -> Result<Option<u64>, NativeXtablesDurableError> {
-    let path = PathBuf::from(format!("/proc/{pid}/stat"));
-    let stat = match std::fs::read_to_string(&path) {
-        Ok(stat) => stat,
-        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(source) => {
-            return Err(NativeXtablesDurableError::io(
-                "inspect shell xtables writer process identity",
-                source,
-            ));
-        }
-    };
-    let (_, tail) = stat.rsplit_once(") ").ok_or_else(|| {
-        NativeXtablesDurableError::io(
-            "parse shell xtables writer process identity",
-            io::Error::new(io::ErrorKind::InvalidData, "malformed /proc process stat"),
-        )
-    })?;
-    let start_ticks = tail
-        .split_whitespace()
-        .nth(19)
-        .and_then(parse_nonzero_u64)
-        .ok_or_else(|| {
-            NativeXtablesDurableError::io(
-                "parse shell xtables writer process identity",
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "invalid /proc process start ticks",
-                ),
-            )
-        })?;
-    Ok(Some(start_ticks))
+    Ok((NativeWriterLock { directory, scope }, true))
 }
 
 fn open_writer_lock_directory(root: &File) -> Result<File, NativeXtablesDurableError> {
@@ -2287,6 +2115,7 @@ fn remove_writer_lock(
     .ok_or(NativeXtablesDurableError::InterruptedPublication)?;
     let actual_scope = parse_writer_owner(&encoded)?;
     require_lease_scope(&writer_lock.scope, &actual_scope)?;
+    require_exact_native_writer_directory(&writer_lock.directory)?;
     require_same_entry(root, &name, &writer_lock.directory)?;
 
     let tombstone = unique_writer_lock_tombstone(root)?;
@@ -2310,66 +2139,19 @@ fn remove_writer_lock(
     checkpoint(store, DurableEvent::WriterLockReleased)
 }
 
-fn remove_shell_writer_lock(
-    root: &File,
-    directory: File,
-    expected: &ShellWriterOwner,
-    store: &NativeXtablesDurableStore,
+fn require_exact_native_writer_directory(
+    directory: &File,
 ) -> Result<(), NativeXtablesDurableError> {
-    if read_record(
-        &directory,
-        NATIVE_XTABLES_WRITER_OWNER_FILE_NAME,
-        DurableArtifact::WriterOwner,
-    )?
-    .is_some()
-    {
-        return Err(NativeXtablesDurableError::InterruptedPublication);
-    }
-    let encoded = read_record(
-        &directory,
-        SHELL_XTABLES_WRITER_OWNER_FILE_NAME,
-        DurableArtifact::ShellWriterOwner,
-    )?
-    .ok_or(NativeXtablesDurableError::InterruptedPublication)?;
-    if &parse_shell_writer_owner(&encoded)? != expected {
-        return Err(NativeXtablesDurableError::InterruptedPublication);
-    }
-    require_exact_shell_writer_directory(&directory)?;
-    let lock_name = static_c_string(XTABLES_WRITER_LOCK_DIRECTORY_NAME);
-    require_same_entry(root, &lock_name, &directory)?;
-
-    let tombstone = unique_writer_lock_tombstone(root)?;
-    rename_at(root.as_raw_fd(), &lock_name, &tombstone)?;
-    root.sync_all().map_err(|source| {
-        NativeXtablesDurableError::io("sync stale shell writer-lock retirement", source)
-    })?;
-    let owner_name = static_c_string(SHELL_XTABLES_WRITER_OWNER_FILE_NAME);
-    unlink_at(directory.as_raw_fd(), &owner_name, 0).map_err(|source| {
-        NativeXtablesDurableError::io("remove stale shell writer owner", source)
-    })?;
-    directory.sync_all().map_err(|source| {
-        NativeXtablesDurableError::io("sync stale shell writer-owner removal", source)
-    })?;
-    unlink_at(root.as_raw_fd(), &tombstone, libc::AT_REMOVEDIR).map_err(|source| {
-        NativeXtablesDurableError::io("remove stale shell writer-lock tombstone", source)
-    })?;
-    root.sync_all().map_err(|source| {
-        NativeXtablesDurableError::io("sync stale shell writer-lock removal", source)
-    })?;
-    checkpoint(store, DurableEvent::WriterLockReleased)
-}
-
-fn require_exact_shell_writer_directory(directory: &File) -> Result<(), NativeXtablesDurableError> {
     let path = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
     let entries = std::fs::read_dir(path).map_err(|source| {
-        NativeXtablesDurableError::io("inspect shell xtables writer-lock directory", source)
+        NativeXtablesDurableError::io("inspect native xtables writer-lock directory", source)
     })?;
     let mut owner_seen = false;
     for entry in entries {
         let entry = entry.map_err(|source| {
-            NativeXtablesDurableError::io("inspect shell xtables writer-lock entry", source)
+            NativeXtablesDurableError::io("inspect native xtables writer-lock entry", source)
         })?;
-        if entry.file_name().as_bytes() == SHELL_XTABLES_WRITER_OWNER_FILE_NAME.as_bytes()
+        if entry.file_name().as_bytes() == NATIVE_XTABLES_WRITER_OWNER_FILE_NAME.as_bytes()
             && !owner_seen
         {
             owner_seen = true;

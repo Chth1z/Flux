@@ -2,94 +2,24 @@ use std::net::IpAddr;
 
 use flux_core::{
     AddressBypassRuleBudget, AddressHostFamilySelection, AddressHostSetPlan, AddressHostSetPolicy,
-    CaptureApplicationMode, CaptureApplicationPolicy, CaptureApplicationPolicyError,
-    CaptureBypassPolicy, CaptureBypassPolicyError, CaptureClause, CaptureClauseDecision,
-    CaptureDecisionStage, CaptureDomainProgram, CaptureGroupId, CaptureInterfaceDirection,
-    CaptureInterfacePolicy, CaptureInterfacePolicyError, CaptureInterfaceSelector, CaptureIpPrefix,
-    CapturePredicate, CaptureProgramBudget, CaptureProgramBudgetError, CaptureProgramDigest,
-    CaptureProgramResourceKind, CaptureProtocolSet, CaptureProtocolSetError, CaptureTrafficDomain,
-    CaptureTrafficScope, CaptureTrafficScopeError, CaptureTransportProtocol, CaptureUserId,
-    CompatibilityEngineCredentials, InterfaceAddressFlags, InterfaceAddressRecord, InterfaceIndex,
-    InterfaceName, MAX_CAPTURE_HOST_ADDRESSES_PER_FAMILY, MAX_CAPTURE_INTERFACE_SELECTORS,
-    MAX_CAPTURE_POLICY_PREFIX_INPUTS, MAX_CAPTURE_POLICY_PREFIXES_PER_FAMILY,
-    MAX_CAPTURE_POLICY_UIDS, NetworkAddressFamily, NetworkInventoryTracker,
-    SHADOW_CAPTURE_PROGRAM_SCHEMA_VERSION, ShadowCaptureCompileError, ShadowCaptureProgramRequest,
-    ShadowCompatibilityAssumption, ShadowCompilationReport, ShadowDeferredPrerequisite,
-    compile_shadow_capture_program, plan_address_host_set,
+    CAPTURE_PROGRAM_SCHEMA_VERSION, CaptureApplicationMode, CaptureApplicationPolicy,
+    CaptureApplicationPolicyError, CaptureBypassPolicy, CaptureBypassPolicyError, CaptureClause,
+    CaptureClauseDecision, CaptureDecisionStage, CaptureDomainProgram, CaptureGroupId,
+    CaptureInterfaceDirection, CaptureInterfacePolicy, CaptureInterfacePolicyError,
+    CaptureInterfaceSelector, CaptureIpPrefix, CapturePredicate, CaptureProgramBudget,
+    CaptureProgramBudgetError, CaptureProgramCompilation, CaptureProgramCompileError,
+    CaptureProgramDigest, CaptureProgramRequest, CaptureProgramResourceKind, CaptureProtocolSet,
+    CaptureProtocolSetError, CaptureTrafficDomain, CaptureTrafficScope, CaptureTrafficScopeError,
+    CaptureTransportProtocol, CaptureUserId, EngineCredentials, InterfaceAddressFlags,
+    InterfaceAddressRecord, InterfaceIndex, InterfaceName, MAX_CAPTURE_HOST_ADDRESSES_PER_FAMILY,
+    MAX_CAPTURE_INTERFACE_SELECTORS, MAX_CAPTURE_POLICY_PREFIX_INPUTS,
+    MAX_CAPTURE_POLICY_PREFIXES_PER_FAMILY, MAX_CAPTURE_POLICY_UIDS, NetworkAddressFamily,
+    NetworkInventoryTracker, compile_capture_program, plan_address_host_set,
 };
 
-const LEGACY_ORACLE: &str = include_str!("fixtures/capture_program_legacy_oracle.fixture");
-
-#[test]
-fn frozen_shell_oracle_preserves_source_facts_but_compiles_canonical_semantics() {
-    let source_ipv4 = fixture_prefixes("shell_bypass_ipv4");
-    let source_ipv6 = fixture_prefixes("shell_bypass_ipv6");
-    assert_eq!(source_ipv4.len(), 15);
-    assert_eq!(source_ipv6.len(), 12);
-    assert!(source_ipv4.contains(&prefix("255.255.255.255/32")));
-    assert!(source_ipv6.contains(&prefix("::ffff:0:0/96")));
-
-    let rfc6598 = prefix("100.64.0.0/10");
-    let forbidden = fixture_prefixes("forbidden_regression_ipv4")[0];
-    assert!(source_ipv4.contains(&rfc6598));
-    assert!(!source_ipv4.contains(&forbidden));
-
-    let report = compile(request(
-        scope(AddressHostFamilySelection::Ipv4, true, false),
-        bypass([rfc6598]),
-        None,
-        interfaces(&[], &[], &[]),
-        applications(CaptureApplicationMode::All, &[]),
-        CaptureProtocolSet::TCP_AND_UDP,
-    ));
-    let compiled = program(
-        &report,
-        NetworkAddressFamily::Ipv4,
-        CaptureTrafficDomain::LocalOutput,
-    );
-
-    assert_eq!(
-        prefixes_at(compiled, CaptureDecisionStage::MandatorySafety),
-        [
-            prefix("0.0.0.0/8"),
-            prefix("127.0.0.0/8"),
-            prefix("169.254.0.0/16"),
-            prefix("224.0.0.0/4"),
-            prefix("240.0.0.0/4"),
-        ]
-    );
-    assert_eq!(
-        prefixes_at(compiled, CaptureDecisionStage::ConfigurableBypass),
-        [rfc6598]
-    );
-    assert!(!all_program_prefixes(compiled).contains(&forbidden));
-    assert!(!all_program_prefixes(compiled).contains(&prefix("255.255.255.255/32")));
-
-    assert_evaluation(
-        compiled,
-        local_packet(
-            "100.64.1.2",
-            CaptureTransportProtocol::Tcp,
-            20_000,
-            20_000,
-            "wlan0",
-        ),
-        CaptureDecisionStage::ConfigurableBypass,
-        CaptureClauseDecision::Direct,
-    );
-    assert_evaluation(
-        compiled,
-        local_packet(
-            "100.1.2.3",
-            CaptureTransportProtocol::Tcp,
-            20_000,
-            20_000,
-            "wlan0",
-        ),
-        CaptureDecisionStage::ProxyAction,
-        CaptureClauseDecision::Proxy,
-    );
-}
+const ENGINE_UID: u32 = 1_000;
+const ENGINE_GID: u32 = 1_000;
+const RESOLVED_UIDS: [u32; 2] = [10_123, 110_123];
 
 #[test]
 fn mandatory_safety_is_compiler_owned_and_cannot_be_removed_or_reclassified() {
@@ -118,7 +48,7 @@ fn mandatory_safety_is_compiler_owned_and_cannot_be_removed_or_reclassified() {
         CaptureProtocolSet::TCP_AND_UDP,
     ));
 
-    assert_eq!(baseline.artifact(), repeated_mandatory.artifact());
+    assert_eq!(baseline.program(), repeated_mandatory.program());
     for domain in [
         CaptureTrafficDomain::LocalOutput,
         CaptureTrafficDomain::ForwardedIngress,
@@ -205,7 +135,7 @@ fn local_and_forwarded_domains_compile_separate_ordered_programs_without_forward
     ));
     assert_eq!(
         report
-            .artifact()
+            .program()
             .programs()
             .iter()
             .map(|program| (program.family(), program.domain()))
@@ -230,7 +160,7 @@ fn local_and_forwarded_domains_compile_separate_ordered_programs_without_forward
         ]
     );
 
-    for compiled in report.artifact().programs() {
+    for compiled in report.program().programs() {
         assert!(
             compiled
                 .clauses()
@@ -279,8 +209,8 @@ fn application_modes_preserve_empty_populated_and_multi_user_semantics() {
         applications(CaptureApplicationMode::Denylist, &[]),
         CaptureProtocolSet::TCP_AND_UDP,
     ));
-    assert_eq!(all.artifact(), empty_denylist.artifact());
-    assert_eq!(all.artifact().digest(), empty_denylist.artifact().digest());
+    assert_eq!(all.program(), empty_denylist.program());
+    assert_eq!(all.program().digest(), empty_denylist.program().digest());
 
     let empty_allowlist = compile(request(
         local_scope,
@@ -306,10 +236,6 @@ fn application_modes_preserve_empty_populated_and_multi_user_semantics() {
         )
     }));
 
-    let resolved = fixture_values("resolved_uid")
-        .into_iter()
-        .map(|value| value.parse::<u32>().unwrap())
-        .collect::<Vec<_>>();
     let allowlist = compile(request(
         local_scope,
         bypass([]),
@@ -317,7 +243,7 @@ fn application_modes_preserve_empty_populated_and_multi_user_semantics() {
         interfaces(&[], &[], &[]),
         applications(
             CaptureApplicationMode::Allowlist,
-            &[resolved[1], resolved[0], resolved[1]],
+            &[RESOLVED_UIDS[1], RESOLVED_UIDS[0], RESOLVED_UIDS[1]],
         ),
         CaptureProtocolSet::TCP_AND_UDP,
     ));
@@ -330,7 +256,7 @@ fn application_modes_preserve_empty_populated_and_multi_user_semantics() {
         local_uid_predicate(allow_program),
         [uid(10_123), uid(110_123)]
     );
-    for selected in resolved {
+    for selected in RESOLVED_UIDS {
         assert_evaluation(
             allow_program,
             local_packet(
@@ -415,8 +341,8 @@ fn engine_loop_bypass_requires_the_exact_pair_and_precedes_safety_policy() {
         NetworkAddressFamily::Ipv4,
         CaptureTrafficDomain::LocalOutput,
     );
-    let engine_uid = fixture_u32("engine_uid");
-    let engine_gid = fixture_u32("engine_gid");
+    let engine_uid = ENGINE_UID;
+    let engine_gid = ENGINE_GID;
 
     assert_evaluation(
         program,
@@ -708,9 +634,9 @@ fn input_permutation_and_dedup_produce_identical_clauses_and_digest() {
         CaptureProtocolSet::TCP_AND_UDP,
     ));
 
-    assert_eq!(first.artifact().programs(), second.artifact().programs());
-    assert_eq!(first.artifact().digest(), second.artifact().digest());
-    assert_eq!(first.artifact().usage(), second.artifact().usage());
+    assert_eq!(first.program().programs(), second.program().programs());
+    assert_eq!(first.program().digest(), second.program().digest());
+    assert_eq!(first.program().usage(), second.program().usage());
 }
 
 #[test]
@@ -722,7 +648,7 @@ fn per_family_prefix_and_host_budgets_report_the_exact_exhausted_family() {
         8,
     );
     assert_eq!(
-        compile_shadow_capture_program(
+        compile_capture_program(
             request(
                 scope(AddressHostFamilySelection::DualStack, true, false),
                 bypass([]),
@@ -733,7 +659,7 @@ fn per_family_prefix_and_host_budgets_report_the_exact_exhausted_family() {
             )
             .with_budget(ipv4_too_small)
         ),
-        Err(ShadowCaptureCompileError::ResourceBudgetExceeded {
+        Err(CaptureProgramCompileError::ResourceBudgetExceeded {
             resource: CaptureProgramResourceKind::DestinationPrefixes,
             family: Some(NetworkAddressFamily::Ipv4),
             maximum: 4,
@@ -748,7 +674,7 @@ fn per_family_prefix_and_host_budgets_report_the_exact_exhausted_family() {
         8,
     );
     assert_eq!(
-        compile_shadow_capture_program(
+        compile_capture_program(
             request(
                 scope(AddressHostFamilySelection::DualStack, true, false),
                 bypass([prefix("2001:db8::/32")]),
@@ -759,7 +685,7 @@ fn per_family_prefix_and_host_budgets_report_the_exact_exhausted_family() {
             )
             .with_budget(ipv6_configured)
         ),
-        Err(ShadowCaptureCompileError::ResourceBudgetExceeded {
+        Err(CaptureProgramCompileError::ResourceBudgetExceeded {
             resource: CaptureProgramResourceKind::DestinationPrefixes,
             family: Some(NetworkAddressFamily::Ipv6),
             maximum: 5,
@@ -775,7 +701,7 @@ fn per_family_prefix_and_host_budgets_report_the_exact_exhausted_family() {
         0,
     );
     assert_eq!(
-        compile_shadow_capture_program(
+        compile_capture_program(
             request(
                 scope(AddressHostFamilySelection::Ipv6, true, false),
                 bypass([]),
@@ -786,7 +712,7 @@ fn per_family_prefix_and_host_budgets_report_the_exact_exhausted_family() {
             )
             .with_budget(no_hosts)
         ),
-        Err(ShadowCaptureCompileError::ResourceBudgetExceeded {
+        Err(CaptureProgramCompileError::ResourceBudgetExceeded {
             resource: CaptureProgramResourceKind::DestinationHosts,
             family: Some(NetworkAddressFamily::Ipv6),
             maximum: 0,
@@ -816,19 +742,19 @@ fn early_universal_bypass_charges_only_resources_reached_by_selected_family_prog
         .with_budget(budget(8, 0, 0, 0)),
     );
     assert_eq!(
-        all_families_terminate.artifact().usage().application_uids(),
+        all_families_terminate.program().usage().application_uids(),
         0
     );
     assert_eq!(
         all_families_terminate
-            .artifact()
+            .program()
             .usage()
             .interface_selectors(),
         0
     );
     assert!(
         all_families_terminate
-            .artifact()
+            .program()
             .programs()
             .iter()
             .all(|program| {
@@ -855,19 +781,13 @@ fn early_universal_bypass_charges_only_resources_reached_by_selected_family_prog
         )
         .with_budget(budget(8, 2, 3, 0)),
     );
+    assert_eq!(one_family_continues.program().usage().application_uids(), 2);
     assert_eq!(
-        one_family_continues.artifact().usage().application_uids(),
-        2
-    );
-    assert_eq!(
-        one_family_continues
-            .artifact()
-            .usage()
-            .interface_selectors(),
+        one_family_continues.program().usage().interface_selectors(),
         3
     );
     assert_eq!(
-        compile_shadow_capture_program(
+        compile_capture_program(
             request(
                 all_scope(),
                 bypass([prefix("0.0.0.0/0")]),
@@ -878,7 +798,7 @@ fn early_universal_bypass_charges_only_resources_reached_by_selected_family_prog
             )
             .with_budget(budget(8, 0, 3, 0))
         ),
-        Err(ShadowCaptureCompileError::ResourceBudgetExceeded {
+        Err(CaptureProgramCompileError::ResourceBudgetExceeded {
             resource: CaptureProgramResourceKind::ApplicationUids,
             family: None,
             maximum: 0,
@@ -981,13 +901,10 @@ fn irrelevant_domain_and_family_inputs_do_not_change_programs_or_digest() {
         applications(CaptureApplicationMode::All, &[]),
         CaptureProtocolSet::TCP_AND_UDP,
     ));
-    assert_eq!(
-        local_first.artifact(),
-        local_with_forwarded_inputs.artifact()
-    );
+    assert_eq!(local_first.program(), local_with_forwarded_inputs.program());
 
     let forwarded_scope = scope(AddressHostFamilySelection::Ipv4, false, true);
-    let forwarded_first = compile_request(ShadowCaptureProgramRequest::new(
+    let forwarded_first = compile_request(CaptureProgramRequest::new(
         forwarded_scope,
         engine_credentials(1000, 1000),
         bypass([]),
@@ -1000,7 +917,7 @@ fn irrelevant_domain_and_family_inputs_do_not_change_programs_or_digest() {
         applications(CaptureApplicationMode::All, &[]),
         CaptureProtocolSet::TCP_AND_UDP,
     ));
-    let forwarded_with_local_inputs = compile_request(ShadowCaptureProgramRequest::new(
+    let forwarded_with_local_inputs = compile_request(CaptureProgramRequest::new(
         forwarded_scope,
         engine_credentials(42_000, 43_000),
         bypass([]),
@@ -1014,8 +931,8 @@ fn irrelevant_domain_and_family_inputs_do_not_change_programs_or_digest() {
         CaptureProtocolSet::TCP_AND_UDP,
     ));
     assert_eq!(
-        forwarded_first.artifact(),
-        forwarded_with_local_inputs.artifact()
+        forwarded_first.program(),
+        forwarded_with_local_inputs.program()
     );
 }
 
@@ -1046,10 +963,12 @@ fn digest_excludes_budget_and_host_provenance_but_changes_with_semantics() {
         .with_budget(budget(64, 10, 10, 16)),
     );
 
-    assert_ne!(first.budget(), second.budget());
-    assert_ne!(first.host_set_provenance(), second.host_set_provenance());
-    assert_eq!(first.artifact().programs(), second.artifact().programs());
-    assert_eq!(first.artifact().digest(), second.artifact().digest());
+    assert_ne!(
+        first.address_host_set_provenance(),
+        second.address_host_set_provenance()
+    );
+    assert_eq!(first.program().programs(), second.program().programs());
+    assert_eq!(first.program().digest(), second.program().digest());
 
     let semantic_change = compile(request(
         scope(AddressHostFamilySelection::Ipv4, true, false),
@@ -1059,14 +978,11 @@ fn digest_excludes_budget_and_host_provenance_but_changes_with_semantics() {
         applications(CaptureApplicationMode::All, &[]),
         CaptureProtocolSet::TCP,
     ));
-    assert_ne!(
-        first.artifact().digest(),
-        semantic_change.artifact().digest()
-    );
+    assert_ne!(first.program().digest(), semantic_change.program().digest());
 }
 
 #[test]
-fn host_observation_coverage_reports_partial_and_complete_family_evidence() {
+fn compilation_retains_exact_address_host_set_provenance() {
     let partial = compile(request(
         all_scope(),
         bypass([]),
@@ -1079,24 +995,9 @@ fn host_observation_coverage_reports_partial_and_complete_family_evidence() {
         CaptureProtocolSet::TCP_AND_UDP,
     ));
     assert_eq!(
-        partial.host_set_provenance().unwrap().families(),
+        partial.address_host_set_provenance().unwrap().families(),
         AddressHostFamilySelection::Ipv4
     );
-    assert_eq!(
-        partial.missing_host_observation_families(),
-        [NetworkAddressFamily::Ipv6]
-    );
-    assert!(
-        partial
-            .deferred_prerequisites()
-            .contains(&ShadowDeferredPrerequisite::InventoryHostBypassObservation)
-    );
-    assert!(
-        partial
-            .deferred_prerequisites()
-            .contains(&ShadowDeferredPrerequisite::HostSetFreshnessAtGenerationFinalization)
-    );
-
     let complete = compile(request(
         all_scope(),
         bypass([]),
@@ -1109,24 +1010,13 @@ fn host_observation_coverage_reports_partial_and_complete_family_evidence() {
         CaptureProtocolSet::TCP_AND_UDP,
     ));
     assert_eq!(
-        complete.host_set_provenance().unwrap().families(),
+        complete.address_host_set_provenance().unwrap().families(),
         AddressHostFamilySelection::DualStack
-    );
-    assert!(complete.missing_host_observation_families().is_empty());
-    assert!(
-        !complete
-            .deferred_prerequisites()
-            .contains(&ShadowDeferredPrerequisite::InventoryHostBypassObservation)
-    );
-    assert!(
-        complete
-            .deferred_prerequisites()
-            .contains(&ShadowDeferredPrerequisite::HostSetFreshnessAtGenerationFinalization)
     );
 }
 
 #[test]
-fn schema_v1_small_fixture_has_a_fixed_digest_and_non_authorizing_report() {
+fn schema_v1_small_fixture_has_a_fixed_digest() {
     let report = compile(request(
         scope(AddressHostFamilySelection::Ipv4, true, false),
         bypass([]),
@@ -1136,40 +1026,18 @@ fn schema_v1_small_fixture_has_a_fixed_digest_and_non_authorizing_report() {
         CaptureProtocolSet::TCP_AND_UDP,
     ));
     assert_eq!(
-        report.artifact().schema_version(),
-        SHADOW_CAPTURE_PROGRAM_SCHEMA_VERSION
+        report.program().schema_version(),
+        CAPTURE_PROGRAM_SCHEMA_VERSION
     );
     assert_eq!(
-        digest_hex(report.artifact().digest()),
-        "fdee3e01e9f90c898a2147e3d288303b2a3593e24dfce878224c59fab8e8bc8d"
+        digest_hex(report.program().digest()),
+        "6e12d9b1205a952552bb7723821f032827cdffcf30999d48c3b1215644f5982b"
     );
-    assert_eq!(
-        report.compatibility_assumptions(),
-        [ShadowCompatibilityAssumption::CompatibilityEngineUidGidBypass]
-    );
-    assert_eq!(
-        report.deferred_prerequisites(),
-        [
-            ShadowDeferredPrerequisite::AndroidMarkAndRpdbAuthority,
-            ShadowDeferredPrerequisite::BackendRenderingAndReadback,
-            ShadowDeferredPrerequisite::EstablishedFlowDecisionCache,
-            ShadowDeferredPrerequisite::ExactControlAndEngineLoopPrevention,
-            ShadowDeferredPrerequisite::GenerationActivation,
-            ShadowDeferredPrerequisite::InventoryHostBypassObservation,
-            ShadowDeferredPrerequisite::KernelWriterOwnership,
-            ShadowDeferredPrerequisite::LegacyOracleParity,
-            ShadowDeferredPrerequisite::ProtocolSpecificCompatibilityRules,
-        ]
-    );
-    assert!(report.host_set_provenance().is_none());
-    assert_eq!(
-        report.missing_host_observation_families(),
-        [NetworkAddressFamily::Ipv4]
-    );
+    assert!(report.address_host_set_provenance().is_none());
 }
 
 #[test]
-fn report_exposes_host_assumptions_usage_and_deferred_authority_without_granting_it() {
+fn compilation_exposes_program_usage_and_inventory_provenance() {
     let report = compile(request(
         all_scope(),
         bypass([prefix("100.64.0.0/10")]),
@@ -1182,31 +1050,7 @@ fn report_exposes_host_assumptions_usage_and_deferred_authority_without_granting
         applications(CaptureApplicationMode::Allowlist, &[10_123, 110_123]),
         CaptureProtocolSet::TCP_AND_UDP,
     ));
-    assert_eq!(
-        report.compatibility_assumptions(),
-        [
-            ShadowCompatibilityAssumption::CompatibilityEngineUidGidBypass,
-            ShadowCompatibilityAssumption::InventoryHostBypassProjection,
-            ShadowCompatibilityAssumption::LegacyInterfacePrefixMatching,
-            ShadowCompatibilityAssumption::LegacyLoopbackInterfaceName,
-            ShadowCompatibilityAssumption::ResolvedApplicationUidInventory,
-        ]
-    );
-    assert_eq!(
-        report.deferred_prerequisites(),
-        [
-            ShadowDeferredPrerequisite::AndroidMarkAndRpdbAuthority,
-            ShadowDeferredPrerequisite::BackendRenderingAndReadback,
-            ShadowDeferredPrerequisite::EstablishedFlowDecisionCache,
-            ShadowDeferredPrerequisite::ExactControlAndEngineLoopPrevention,
-            ShadowDeferredPrerequisite::GenerationActivation,
-            ShadowDeferredPrerequisite::HostSetFreshnessAtGenerationFinalization,
-            ShadowDeferredPrerequisite::KernelWriterOwnership,
-            ShadowDeferredPrerequisite::LegacyOracleParity,
-            ShadowDeferredPrerequisite::ProtocolSpecificCompatibilityRules,
-        ]
-    );
-    let usage = report.artifact().usage();
+    let usage = report.program().usage();
     assert_eq!(usage.prefixes(NetworkAddressFamily::Ipv4), 6);
     assert_eq!(usage.prefixes(NetworkAddressFamily::Ipv6), 5);
     assert_eq!(usage.hosts(NetworkAddressFamily::Ipv4), 1);
@@ -1215,15 +1059,18 @@ fn report_exposes_host_assumptions_usage_and_deferred_authority_without_granting
     assert_eq!(usage.interface_selectors(), 3);
     assert_eq!(usage.domain_programs(), 4);
     assert!(usage.clauses() > 0);
-    assert!(report.host_set_provenance().is_some());
+    assert_eq!(
+        report.address_host_set_provenance().unwrap().families(),
+        AddressHostFamilySelection::DualStack
+    );
 }
 
-fn compile(request: ShadowCaptureProgramRequest) -> ShadowCompilationReport {
+fn compile(request: CaptureProgramRequest) -> CaptureProgramCompilation {
     compile_request(request)
 }
 
-fn compile_request(request: ShadowCaptureProgramRequest) -> ShadowCompilationReport {
-    compile_shadow_capture_program(request).expect("valid shadow Capture Program request")
+fn compile_request(request: CaptureProgramRequest) -> CaptureProgramCompilation {
+    compile_capture_program(request).expect("valid Capture Program request")
 }
 
 fn request(
@@ -1233,10 +1080,10 @@ fn request(
     interfaces: CaptureInterfacePolicy,
     applications: CaptureApplicationPolicy,
     protocols: CaptureProtocolSet,
-) -> ShadowCaptureProgramRequest {
-    ShadowCaptureProgramRequest::new(
+) -> CaptureProgramRequest {
+    CaptureProgramRequest::new(
         scope,
-        engine_credentials(fixture_u32("engine_uid"), fixture_u32("engine_gid")),
+        engine_credentials(ENGINE_UID, ENGINE_GID),
         configured_bypass,
         host_bypass,
         interfaces,
@@ -1294,12 +1141,12 @@ fn budget(
 }
 
 fn program(
-    report: &ShadowCompilationReport,
+    report: &CaptureProgramCompilation,
     family: NetworkAddressFamily,
     domain: CaptureTrafficDomain,
 ) -> &CaptureDomainProgram {
     report
-        .artifact()
+        .program()
         .programs()
         .iter()
         .find(|program| program.family() == family && program.domain() == domain)
@@ -1314,18 +1161,6 @@ fn prefixes_at(
         .clauses()
         .iter()
         .filter(|clause| clause.stage() == stage)
-        .filter_map(|clause| match clause.predicate() {
-            CapturePredicate::DestinationPrefixes(prefixes) => Some(prefixes.iter().copied()),
-            _ => None,
-        })
-        .flatten()
-        .collect()
-}
-
-fn all_program_prefixes(program: &CaptureDomainProgram) -> Vec<CaptureIpPrefix> {
-    program
-        .clauses()
-        .iter()
         .filter_map(|clause| match clause.predicate() {
             CapturePredicate::DestinationPrefixes(prefixes) => Some(prefixes.iter().copied()),
             _ => None,
@@ -1545,8 +1380,8 @@ fn gid(value: u32) -> CaptureGroupId {
     CaptureGroupId::new(value).unwrap()
 }
 
-fn engine_credentials(uid_value: u32, gid_value: u32) -> CompatibilityEngineCredentials {
-    CompatibilityEngineCredentials::new(uid(uid_value), gid(gid_value))
+fn engine_credentials(uid_value: u32, gid_value: u32) -> EngineCredentials {
+    EngineCredentials::new(uid(uid_value), gid(gid_value))
 }
 
 fn digest_hex(digest: CaptureProgramDigest) -> String {
@@ -1554,27 +1389,5 @@ fn digest_hex(digest: CaptureProgramDigest) -> String {
         .as_bytes()
         .iter()
         .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
-fn fixture_u32(key: &str) -> u32 {
-    fixture_values(key)[0].parse().unwrap()
-}
-
-fn fixture_prefixes(key: &str) -> Vec<CaptureIpPrefix> {
-    fixture_values(key).into_iter().map(prefix).collect()
-}
-
-fn fixture_values(key: &str) -> Vec<&'static str> {
-    LEGACY_ORACLE
-        .lines()
-        .filter_map(|line| {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                return None;
-            }
-            let (observed_key, value) = line.split_once('=').unwrap();
-            (observed_key == key).then_some(value)
-        })
         .collect()
 }

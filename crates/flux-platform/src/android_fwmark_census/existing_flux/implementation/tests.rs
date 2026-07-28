@@ -6,11 +6,10 @@ use flux_core::{
     AndroidNetdSourceProfile, CapabilityProfile, CapabilityProfileRevision, FwmarkCandidate,
     FwmarkCensusCoverageState, FwmarkEvidenceSource, FwmarkPlane, InterfaceAddressRecord,
     InterfaceHardwareType, InterfaceIndex, InterfaceLinkFlags, InterfaceLinkRecord, InterfaceName,
-    KernelFacts, LegacyBridgeFacts, NetworkAddressFamily, NetworkInventory,
-    NetworkInventoryTracker, NetworkRouteRecord, NetworkRuleRecord, Observation, RouteFlags,
-    RoutePath, RoutePrefix, RouteProperties, RouteProtocol, RouteScope, RouteTableId, RouteType,
-    RuleAction, RuleFlags, RuleFwMark, RulePrefix, RulePriority, RuleProperties, RuleProtocol,
-    RuleTableId,
+    KernelFacts, NetworkAddressFamily, NetworkInventory, NetworkInventoryTracker,
+    NetworkRouteRecord, NetworkRuleRecord, Observation, RouteFlags, RoutePath, RoutePrefix,
+    RouteProperties, RouteProtocol, RouteScope, RouteTableId, RouteType, RuleAction, RuleFlags,
+    RuleFwMark, RulePrefix, RulePriority, RuleProperties, RuleProtocol, RuleTableId,
 };
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
@@ -239,7 +238,7 @@ fn journal_lease_and_writer_lock_each_block_clean_absence() {
 
 #[test]
 fn exact_flux_process_names_block_without_reading_command_lines() {
-    for (index, command) in ["fluxd", "addrsyncd", "sing-box"].into_iter().enumerate() {
+    for (index, command) in ["fluxd", "sing-box"].into_iter().enumerate() {
         let fixture = Fixture::new();
         write_process(
             &fixture.proc_root,
@@ -297,15 +296,15 @@ fn startup_exclusion_applies_only_to_the_named_daemon_pid() {
     );
     assert_eq!(error.observed_count(), Some(1));
 
-    let helper = Fixture::new();
-    write_process(&helper.proc_root, 50, "addrsyncd", 500);
+    let engine = Fixture::new();
+    write_process(&engine.proc_root, 50, "sing-box", 500);
     let error = collect_from_roots(
-        &helper.durable_root,
-        &helper.proc_root,
-        &helper.inventory,
-        &helper.capability_profile,
-        helper.network_namespace,
-        &helper.xtables,
+        &engine.durable_root,
+        &engine.proc_root,
+        &engine.inventory,
+        &engine.capability_profile,
+        engine.network_namespace,
+        &engine.xtables,
         Some(50),
     )
     .expect_err("the PID exclusion cannot hide a different Flux process kind");
@@ -446,16 +445,8 @@ fn proc_stat_parser_handles_spaces_and_closing_parentheses_but_rejects_zero_star
 }
 
 #[test]
-fn native_and_every_bridge_chain_family_block_clean_absence() {
-    for chain in [
-        "FLX4O0000000001",
-        "PROXY_PREROUTING",
-        "PROXY_OUTPUT6",
-        "BYP_Z15",
-        "DIVERT6",
-        "BLOCK_QUIC",
-        "BLOCK_QUIC6",
-    ] {
+fn native_chain_namespace_blocks_clean_absence() {
+    for chain in ["FLX4O0000000001", "FLX4SP", "FLX6O0000000001"] {
         let mut fixture = Fixture::new();
         fixture.xtables = xtables(&[chain]);
         let error = fixture.collect().expect_err("Flux chain must block");
@@ -469,10 +460,8 @@ fn native_and_every_bridge_chain_family_block_clean_absence() {
 }
 
 #[test]
-fn legacy_and_native_policy_routing_identities_fail_closed() {
+fn native_policy_routing_identities_fail_closed() {
     let cases = [
-        (vec![legacy_route()], Vec::new(), "legacy route"),
-        (Vec::new(), vec![legacy_rule()], "legacy rule"),
         (vec![native_route()], Vec::new(), "native route"),
         (Vec::new(), vec![native_rule()], "native rule"),
     ];
@@ -521,11 +510,6 @@ fn capability_profile(revision: CapabilityProfileRevision) -> CapabilityProfile 
         Observation::Unavailable,
         KernelFacts::from_release(Observation::Unavailable),
         Observation::Unavailable,
-        LegacyBridgeFacts::new(
-            Observation::Unavailable,
-            Observation::Unavailable,
-            Observation::Unavailable,
-        ),
     )
 }
 
@@ -586,20 +570,6 @@ fn native_route() -> NetworkRouteRecord {
     )
 }
 
-fn legacy_route() -> NetworkRouteRecord {
-    route(
-        LEGACY_ROUTE_TABLE,
-        3,
-        RT_SCOPE_HOST,
-        RTN_LOCAL,
-        0,
-        RoutePath::Single {
-            output_interface: Some(loopback_index()),
-            gateway: None,
-        },
-    )
-}
-
 fn unrelated_static_route() -> NetworkRouteRecord {
     route(
         100,
@@ -638,10 +608,6 @@ fn route(
 
 fn native_rule() -> NetworkRuleRecord {
     rule(30_999, 20_253, NATIVE_RULE_PROTOCOL)
-}
-
-fn legacy_rule() -> NetworkRuleRecord {
-    rule(LEGACY_RULE_PRIORITY, LEGACY_ROUTE_TABLE, 0)
 }
 
 fn rule(priority: u32, table: u32, protocol: u8) -> NetworkRuleRecord {

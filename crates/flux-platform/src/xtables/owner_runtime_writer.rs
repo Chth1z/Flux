@@ -980,7 +980,7 @@ impl NativeLinuxCompositionTestAdmission {
     }
 }
 
-/// Dispatcher-free platform half of the privileged native composition checkpoint.
+/// Platform half of the single-owner privileged native composition checkpoint.
 #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
 pub struct NativeLinuxCompositionTestRuntime {
     admission: NativeLinuxCompositionTestAdmission,
@@ -1580,7 +1580,7 @@ mod admission_tests {
 
     #[test]
     fn canonical_routing_target_pins_platform_owned_identity_constants() {
-        let placement = RpdbFamilyPlacement::new(
+        let placement = RpdbFamilyPlacement::with_address_bypass(
             RulePriority::from_raw(30_998),
             RulePriority::from_raw(30_999),
             RuleTableId::from_raw(20_253),

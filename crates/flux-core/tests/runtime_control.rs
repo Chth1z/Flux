@@ -19,7 +19,7 @@ fn running_intent_updates_the_snapshot_after_dispatcher_success() {
 
     let report = runtime
         .submit(RuntimeIntent::Running {
-            reason: Reason::Fluxctl,
+            reason: Reason::UserControl,
         })
         .expect("accept operation")
         .wait()
@@ -29,7 +29,7 @@ fn running_intent_updates_the_snapshot_after_dispatcher_success() {
         report,
         OperationReport {
             intent: RuntimeIntent::Running {
-                reason: Reason::Fluxctl,
+                reason: Reason::UserControl,
             },
             revision: 2,
             address_resync: None,
@@ -38,7 +38,7 @@ fn running_intent_updates_the_snapshot_after_dispatcher_success() {
     assert_eq!(
         calls.lock().expect("calls lock").as_slice(),
         &[RuntimeIntent::Running {
-            reason: Reason::Fluxctl,
+            reason: Reason::UserControl,
         }]
     );
 
@@ -62,7 +62,7 @@ fn configuration_change_while_stopped_is_deferred_without_calling_the_dispatcher
     .expect("start runtime");
     runtime
         .submit(RuntimeIntent::Stopped {
-            reason: Reason::Fluxctl,
+            reason: Reason::UserControl,
         })
         .expect("accept stop")
         .wait()
@@ -190,7 +190,7 @@ fn concurrent_submissions_never_execute_more_than_one_dispatcher_call() {
         .map(|_| {
             runtime
                 .submit(RuntimeIntent::ResyncAddresses {
-                    reason: Reason::Fluxctl,
+                    reason: Reason::UserControl,
                 })
                 .expect("accept operation")
         })
@@ -220,7 +220,7 @@ fn maintenance_and_shutdown_share_the_serialized_writer() {
 
     runtime
         .submit(RuntimeIntent::Running {
-            reason: Reason::Fluxctl,
+            reason: Reason::UserControl,
         })
         .expect("accept operation")
         .wait()
@@ -269,7 +269,7 @@ fn observations_coalesce_without_blocking_or_dropping_when_the_queue_is_full() {
     .expect("start runtime");
     let first = runtime
         .submit(RuntimeIntent::ResyncAddresses {
-            reason: Reason::Fluxctl,
+            reason: Reason::UserControl,
         })
         .expect("accept blocking operation");
     entered_rx
@@ -277,7 +277,7 @@ fn observations_coalesce_without_blocking_or_dropping_when_the_queue_is_full() {
         .expect("writer enters blocking operation");
     let queued = runtime
         .submit(RuntimeIntent::ResyncAddresses {
-            reason: Reason::Fluxctl,
+            reason: Reason::UserControl,
         })
         .expect("fill bounded writer queue");
 
@@ -300,13 +300,13 @@ fn observations_coalesce_without_blocking_or_dropping_when_the_queue_is_full() {
         calls.lock().expect("calls lock").as_slice(),
         &[
             RuntimeIntent::ResyncAddresses {
-                reason: Reason::Fluxctl,
+                reason: Reason::UserControl,
             },
             RuntimeIntent::Running {
                 reason: Reason::DisableRemoved,
             },
             RuntimeIntent::ResyncAddresses {
-                reason: Reason::Fluxctl,
+                reason: Reason::UserControl,
             },
         ]
     );
@@ -328,7 +328,7 @@ fn observed_configuration_change_is_deferred_while_stopped() {
     .expect("start runtime");
     runtime
         .submit(RuntimeIntent::Stopped {
-            reason: Reason::Fluxctl,
+            reason: Reason::UserControl,
         })
         .expect("accept stop")
         .wait()
@@ -346,7 +346,7 @@ fn observed_configuration_change_is_deferred_while_stopped() {
     assert_eq!(
         calls.lock().expect("calls lock").as_slice(),
         &[RuntimeIntent::Stopped {
-            reason: Reason::Fluxctl,
+            reason: Reason::UserControl,
         }]
     );
 }
@@ -369,7 +369,7 @@ fn observed_configuration_consumed_by_disable_removal_notifies_the_dispatcher_on
     .expect("start runtime");
     let blocking = runtime
         .submit(RuntimeIntent::ResyncAddresses {
-            reason: Reason::Fluxctl,
+            reason: Reason::UserControl,
         })
         .expect("accept blocking operation");
     entered_rx
@@ -393,7 +393,7 @@ fn observed_configuration_consumed_by_disable_removal_notifies_the_dispatcher_on
         calls.lock().expect("calls lock").as_slice(),
         &[
             RuntimeIntent::ResyncAddresses {
-                reason: Reason::Fluxctl,
+                reason: Reason::UserControl,
             },
             RuntimeIntent::Running {
                 reason: Reason::DisableRemoved,

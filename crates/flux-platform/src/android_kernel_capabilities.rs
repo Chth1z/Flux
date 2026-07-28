@@ -518,13 +518,13 @@ impl Error for AndroidNftablesObservationGateError {}
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum AndroidCapturePath {
     NativeNftablesTproxy,
-    LegacyXtablesTproxy,
+    XtablesTproxy,
     ManagedTun,
 }
 
 const AUTOMATIC_PATH_ORDER: [AndroidCapturePath; ANDROID_CAPTURE_PATH_COUNT] = [
     AndroidCapturePath::NativeNftablesTproxy,
-    AndroidCapturePath::LegacyXtablesTproxy,
+    AndroidCapturePath::XtablesTproxy,
     AndroidCapturePath::ManagedTun,
 ];
 
@@ -573,7 +573,7 @@ impl AndroidCapturePath {
     const fn required_features(self) -> &'static [AndroidKernelFeature] {
         match self {
             Self::NativeNftablesTproxy => NFTABLES_REQUIRED_FEATURES,
-            Self::LegacyXtablesTproxy => XTABLES_REQUIRED_FEATURES,
+            Self::XtablesTproxy => XTABLES_REQUIRED_FEATURES,
             Self::ManagedTun => TUN_REQUIRED_FEATURES,
         }
     }
@@ -623,7 +623,7 @@ impl AndroidCapturePathQualifications {
     const fn for_path(self, path: AndroidCapturePath) -> AndroidCapturePathProbeState {
         match path {
             AndroidCapturePath::NativeNftablesTproxy => self.nftables,
-            AndroidCapturePath::LegacyXtablesTproxy => self.xtables,
+            AndroidCapturePath::XtablesTproxy => self.xtables,
             AndroidCapturePath::ManagedTun => self.tun,
         }
     }
@@ -1324,7 +1324,7 @@ mod tests {
         );
         assert_eq!(
             decision
-                .candidate(AndroidCapturePath::LegacyXtablesTproxy)
+                .candidate(AndroidCapturePath::XtablesTproxy)
                 .state(),
             AndroidCapturePathState::Conflicting
         );
@@ -1390,7 +1390,7 @@ mod tests {
         assert_eq!(decision.selected(), None);
         assert_eq!(
             decision.next_to_qualify(),
-            Some(AndroidCapturePath::LegacyXtablesTproxy)
+            Some(AndroidCapturePath::XtablesTproxy)
         );
         let nftables = decision.candidate(AndroidCapturePath::NativeNftablesTproxy);
         assert_eq!(nftables.state(), AndroidCapturePathState::Missing);
@@ -1446,7 +1446,7 @@ mod tests {
         assert_eq!(decision.selected(), None);
         assert_eq!(
             decision.next_to_qualify(),
-            Some(AndroidCapturePath::LegacyXtablesTproxy)
+            Some(AndroidCapturePath::XtablesTproxy)
         );
     }
 

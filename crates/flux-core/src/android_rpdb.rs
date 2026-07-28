@@ -347,7 +347,7 @@ pub enum AndroidRpdbPlacementPlanError {
     StaticPriorityWindowViolation {
         family: NetworkAddressFamily,
         last_reserved_must_precede: RulePriority,
-        bypass: RulePriority,
+        address_bypass: Option<RulePriority>,
         proxy: RulePriority,
         first_default_network: RulePriority,
     },
@@ -360,14 +360,27 @@ impl fmt::Display for AndroidRpdbPlacementPlanError {
             Self::StaticPriorityWindowViolation {
                 family,
                 last_reserved_must_precede,
-                bypass,
+                address_bypass: Some(address_bypass),
                 proxy,
                 first_default_network,
             } => write!(
                 formatter,
                 "Android RPDB placement for {family:?} does not satisfy reserved profile window {} < {} < {} < {}",
                 last_reserved_must_precede.get(),
-                bypass.get(),
+                address_bypass.get(),
+                proxy.get(),
+                first_default_network.get()
+            ),
+            Self::StaticPriorityWindowViolation {
+                family,
+                last_reserved_must_precede,
+                address_bypass: None,
+                proxy,
+                first_default_network,
+            } => write!(
+                formatter,
+                "Android RPDB placement for {family:?} does not satisfy reserved profile window {} < {} < {}",
+                last_reserved_must_precede.get(),
                 proxy.get(),
                 first_default_network.get()
             ),
@@ -482,7 +495,7 @@ pub fn plan_android_rpdb_placement(
         Err(RpdbPlacementPlanError::PriorityWindowViolation {
             family,
             last_must_precede,
-            bypass,
+            address_bypass,
             proxy,
             first_terminal_barrier,
         }) if last_must_precede == contract.uid_default_unreachable_maximum()
@@ -492,7 +505,7 @@ pub fn plan_android_rpdb_placement(
                 AndroidRpdbPlacementPlanError::StaticPriorityWindowViolation {
                     family,
                     last_reserved_must_precede: last_must_precede,
-                    bypass,
+                    address_bypass,
                     proxy,
                     first_default_network: first_terminal_barrier,
                 },
@@ -505,23 +518,15 @@ pub fn plan_android_rpdb_placement(
         let Some(placement) = request.family(family) else {
             continue;
         };
-        let priorities_fit = match placement.dedicated_bypass_priority() {
-            Some(bypass) => {
-                contract.uid_default_unreachable_maximum() < bypass
-                    && bypass < placement.proxy_priority()
-                    && placement.proxy_priority() < contract.default_network()
-            }
-            None => {
-                contract.uid_default_unreachable_maximum() < placement.proxy_priority()
-                    && placement.proxy_priority() < contract.default_network()
-            }
-        };
-        if !priorities_fit {
+        if !placement.fits_priority_window(
+            contract.uid_default_unreachable_maximum(),
+            contract.default_network(),
+        ) {
             return Err(
                 AndroidRpdbPlacementPlanError::StaticPriorityWindowViolation {
                     family,
                     last_reserved_must_precede: contract.uid_default_unreachable_maximum(),
-                    bypass: placement.bypass_priority(),
+                    address_bypass: placement.address_bypass_priority(),
                     proxy: placement.proxy_priority(),
                     first_default_network: contract.default_network(),
                 },

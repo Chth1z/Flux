@@ -174,7 +174,7 @@ pub(crate) trait UnqualifiedFunctionalCanaryAttemptContext: Send + 'static {
 }
 
 pub(crate) enum RuntimeFunctionalCanary {
-    StructuralOnlyCompatibility,
+    StructuralVerificationOnly,
     // Kept available for the privileged Linux harness and future qualified
     // Android adapter; daemon composition deliberately selects the other arm.
     #[allow(dead_code)]
@@ -187,8 +187,8 @@ pub(crate) enum RuntimeFunctionalCanary {
 impl RuntimeFunctionalCanary {
     const fn mode(&self) -> FunctionalCanaryGateMode {
         match self {
-            Self::StructuralOnlyCompatibility => {
-                FunctionalCanaryGateMode::StructuralOnlyCompatibility
+            Self::StructuralVerificationOnly => {
+                FunctionalCanaryGateMode::StructuralVerificationOnly
             }
             Self::RequiredUnqualified { .. } => FunctionalCanaryGateMode::RequiredUnqualified,
         }
@@ -272,7 +272,7 @@ enum SubscriptionActivationSettlement {
 impl QualifiedRunningGeneration {
     const fn verification(&self) -> RuntimeVerificationState {
         match &self.disposition {
-            FunctionalCanaryDisposition::StructuralOnlyCompatibility => {
+            FunctionalCanaryDisposition::StructuralVerificationOnly => {
                 RuntimeVerificationState::StructuralOnly
             }
             FunctionalCanaryDisposition::AttemptPassedUnqualified(_) => {
@@ -349,7 +349,7 @@ where
             writer,
             engine,
             maintenance_interval,
-            RuntimeFunctionalCanary::StructuralOnlyCompatibility,
+            RuntimeFunctionalCanary::StructuralVerificationOnly,
         )
     }
 
@@ -876,8 +876,7 @@ where
                     );
                 }
                 Ok(
-                    AddressReconciliationOutcome::AwaitingSource
-                    | AddressReconciliationOutcome::Unchanged(_)
+                    AddressReconciliationOutcome::Unchanged(_)
                     | AddressReconciliationOutcome::Blocked { .. },
                 ) => {}
                 Ok(AddressReconciliationOutcome::AwaitingCompleteSnapshot) => {
@@ -1595,10 +1594,10 @@ where
             runtime_writer_error(structural_operation, source, structural_recovery)
         })?;
 
-        if self.functional_canary.mode() == FunctionalCanaryGateMode::StructuralOnlyCompatibility {
+        if self.functional_canary.mode() == FunctionalCanaryGateMode::StructuralVerificationOnly {
             return Ok(QualifiedRunningGeneration {
                 generation: generation.id,
-                disposition: FunctionalCanaryDisposition::StructuralOnlyCompatibility,
+                disposition: FunctionalCanaryDisposition::StructuralVerificationOnly,
             });
         }
 
@@ -1617,7 +1616,7 @@ where
                     )
                 })?
             }
-            RuntimeFunctionalCanary::StructuralOnlyCompatibility => {
+            RuntimeFunctionalCanary::StructuralVerificationOnly => {
                 unreachable!("functional canary mode was checked before attempt preparation")
             }
         };
@@ -1665,7 +1664,7 @@ where
             RuntimeFunctionalCanary::RequiredUnqualified { executor, .. } => {
                 executor.execute(execution_input)
             }
-            RuntimeFunctionalCanary::StructuralOnlyCompatibility => {
+            RuntimeFunctionalCanary::StructuralVerificationOnly => {
                 unreachable!("functional canary mode was checked before execution")
             }
         };
@@ -1680,7 +1679,7 @@ where
                 let observed_at = context.monotonic_now();
                 (environment, observed_at)
             }
-            RuntimeFunctionalCanary::StructuralOnlyCompatibility => {
+            RuntimeFunctionalCanary::StructuralVerificationOnly => {
                 unreachable!("functional canary mode was checked before post-attempt observation")
             }
         };
@@ -1798,7 +1797,7 @@ where
         recovery: &'static str,
     ) -> Result<(), ControlError> {
         match qualification.disposition {
-            FunctionalCanaryDisposition::StructuralOnlyCompatibility
+            FunctionalCanaryDisposition::StructuralVerificationOnly
             | FunctionalCanaryDisposition::AttemptPassedUnqualified(_) => {}
         }
         self.publish_runtime_state(
@@ -1910,7 +1909,7 @@ where
         if self.writer.address_resync_strategy() == AddressResyncStrategy::CoordinatorSynchronous {
             return self.resync_coordinator_addresses();
         }
-        if self.functional_canary.mode() == FunctionalCanaryGateMode::StructuralOnlyCompatibility {
+        if self.functional_canary.mode() == FunctionalCanaryGateMode::StructuralVerificationOnly {
             return self.writer.resync_addresses().map_err(|source| {
                 runtime_writer_error(
                     "resynchronize addresses",
@@ -1973,7 +1972,6 @@ where
                 self.address_reconciliation_pending = true;
             }
             AddressReconciliationOutcome::Invalidated(_)
-            | AddressReconciliationOutcome::AwaitingSource
             | AddressReconciliationOutcome::AwaitingCompleteSnapshot
             | AddressReconciliationOutcome::Blocked { .. } => {
                 self.address_reconciliation_pending = false;
@@ -2044,7 +2042,7 @@ where
 
     const fn pending_verification(&self) -> RuntimeVerificationState {
         match self.functional_canary.mode() {
-            FunctionalCanaryGateMode::StructuralOnlyCompatibility => {
+            FunctionalCanaryGateMode::StructuralVerificationOnly => {
                 RuntimeVerificationState::StructuralOnly
             }
             FunctionalCanaryGateMode::RequiredUnqualified => {
@@ -2058,7 +2056,7 @@ where
         verification: RuntimeVerificationState,
     ) -> RuntimeVerificationState {
         match self.functional_canary.mode() {
-            FunctionalCanaryGateMode::StructuralOnlyCompatibility => {
+            FunctionalCanaryGateMode::StructuralVerificationOnly => {
                 RuntimeVerificationState::StructuralOnly
             }
             FunctionalCanaryGateMode::RequiredUnqualified => verification,
@@ -3029,7 +3027,7 @@ mod tests {
 
         coordinator
             .execute(&RuntimeIntent::Reload {
-                reason: Reason::Fluxctl,
+                reason: Reason::UserControl,
             })
             .expect_err("candidate preparation fails before active binding changes");
 
@@ -3082,7 +3080,7 @@ mod tests {
 
         coordinator
             .execute(&RuntimeIntent::Reload {
-                reason: Reason::Fluxctl,
+                reason: Reason::UserControl,
             })
             .expect_err("uncertain capture detachment blocks replacement");
 
@@ -3265,7 +3263,7 @@ mod tests {
 
         coordinator
             .execute(&RuntimeIntent::ResyncAddresses {
-                reason: Reason::Fluxctl,
+                reason: Reason::UserControl,
             })
             .expect("address resync completes");
 
@@ -4037,7 +4035,7 @@ mod tests {
 
         coordinator
             .execute(&RuntimeIntent::Reload {
-                reason: Reason::Fluxctl,
+                reason: Reason::UserControl,
             })
             .expect_err("candidate post-attempt identity changed");
 
@@ -4050,7 +4048,7 @@ mod tests {
         assert_eq!(
             reload_events,
             [
-                Event::Prepared(Reason::Fluxctl),
+                Event::Prepared(Reason::UserControl),
                 Event::CaptureStopped,
                 Event::EngineRunning(CaptureObservation::Detached),
                 Event::CaptureStarted,
@@ -4307,14 +4305,14 @@ mod tests {
 
         coordinator
             .execute(&RuntimeIntent::Reload {
-                reason: Reason::Fluxctl,
+                reason: Reason::UserControl,
             })
             .expect_err("candidate state publication fails");
 
         assert_eq!(
             *events.lock().expect("events lock"),
             [
-                Event::Prepared(Reason::Fluxctl),
+                Event::Prepared(Reason::UserControl),
                 Event::CaptureStopped,
                 Event::EngineRunning(CaptureObservation::Detached),
                 Event::CaptureStarted,
@@ -4360,7 +4358,7 @@ mod tests {
 
         coordinator
             .execute(&RuntimeIntent::Stopped {
-                reason: Reason::Fluxctl,
+                reason: Reason::UserControl,
             })
             .expect("stop converges");
 
@@ -4404,7 +4402,7 @@ mod tests {
 
         coordinator
             .execute(&RuntimeIntent::Stopped {
-                reason: Reason::Fluxctl,
+                reason: Reason::UserControl,
             })
             .expect_err("uncertain detachment keeps stop pending");
         coordinator.maintain();
@@ -4458,7 +4456,7 @@ mod tests {
 
         coordinator
             .execute(&RuntimeIntent::Stopped {
-                reason: Reason::Fluxctl,
+                reason: Reason::UserControl,
             })
             .expect_err("first bounded stop remains pending");
         coordinator.maintain();
@@ -4498,7 +4496,7 @@ mod tests {
 
         coordinator
             .execute(&RuntimeIntent::ResyncAddresses {
-                reason: Reason::Fluxctl,
+                reason: Reason::UserControl,
             })
             .expect("stopped address resync is idempotent");
 
@@ -4749,14 +4747,14 @@ mod tests {
 
         coordinator
             .execute(&RuntimeIntent::Reload {
-                reason: Reason::Fluxctl,
+                reason: Reason::UserControl,
             })
             .expect("reload converges");
 
         assert_eq!(
             *events.lock().expect("events lock"),
             [
-                Event::Prepared(Reason::Fluxctl),
+                Event::Prepared(Reason::UserControl),
                 Event::CaptureStopped,
                 Event::EngineRunning(CaptureObservation::Detached),
                 Event::CaptureStarted,
@@ -4810,14 +4808,14 @@ mod tests {
 
         coordinator
             .execute(&RuntimeIntent::Reload {
-                reason: Reason::Fluxctl,
+                reason: Reason::UserControl,
             })
             .expect_err("candidate failure is reported after rollback");
 
         assert_eq!(
             *events.lock().expect("events lock"),
             [
-                Event::Prepared(Reason::Fluxctl),
+                Event::Prepared(Reason::UserControl),
                 Event::CaptureStopped,
                 Event::EngineRunning(CaptureObservation::Detached),
                 Event::EngineRunning(CaptureObservation::Detached),
@@ -4868,14 +4866,14 @@ mod tests {
 
         coordinator
             .execute(&RuntimeIntent::Reload {
-                reason: Reason::Fluxctl,
+                reason: Reason::UserControl,
             })
             .expect_err("failed rollback is reported");
 
         assert_eq!(
             *events.lock().expect("events lock"),
             [
-                Event::Prepared(Reason::Fluxctl),
+                Event::Prepared(Reason::UserControl),
                 Event::CaptureStopped,
                 Event::EngineRunning(CaptureObservation::Detached),
                 Event::EngineRunning(CaptureObservation::Detached),
@@ -4919,7 +4917,7 @@ mod tests {
 
         coordinator
             .execute(&RuntimeIntent::Reload {
-                reason: Reason::Fluxctl,
+                reason: Reason::UserControl,
             })
             .expect_err("uncertain capture detachment blocks replacement");
         coordinator.maintain();
@@ -4927,7 +4925,7 @@ mod tests {
         assert_eq!(
             *events.lock().expect("events lock"),
             [
-                Event::Prepared(Reason::Fluxctl),
+                Event::Prepared(Reason::UserControl),
                 Event::CaptureStopped,
                 Event::CaptureStopped,
                 Event::EngineRunning(CaptureObservation::Detached),
@@ -4975,14 +4973,14 @@ mod tests {
 
         coordinator
             .execute(&RuntimeIntent::Reload {
-                reason: Reason::Fluxctl,
+                reason: Reason::UserControl,
             })
             .expect_err("candidate capture and its compensation both fail");
 
         assert_eq!(
             *events.lock().expect("events lock"),
             [
-                Event::Prepared(Reason::Fluxctl),
+                Event::Prepared(Reason::UserControl),
                 Event::CaptureStopped,
                 Event::EngineRunning(CaptureObservation::Detached),
                 Event::CaptureStarted,
@@ -5054,14 +5052,14 @@ mod tests {
 
         coordinator
             .execute(&RuntimeIntent::Reload {
-                reason: Reason::Fluxctl,
+                reason: Reason::UserControl,
             })
             .expect_err("candidate verification failure is reported");
 
         assert_eq!(
             *events.lock().expect("events lock"),
             [
-                Event::Prepared(Reason::Fluxctl),
+                Event::Prepared(Reason::UserControl),
                 Event::CaptureStopped,
                 Event::EngineRunning(CaptureObservation::Detached),
                 Event::CaptureStarted,

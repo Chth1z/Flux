@@ -13,3 +13,9 @@ bin/
 /target/
 /dist/
 /ebpf/target/
+
+# Local Codex research and planning state
+/archive/
+/docs/
+/notes.md
+/task_plan.md

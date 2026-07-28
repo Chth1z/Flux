@@ -14,7 +14,7 @@ use super::{
 };
 
 const XTABLES_SAVE_PROJECTION_DOMAIN: &[u8] =
-    b"Flux owned xtables-save projection\0structured-sha256-v2\0";
+    b"Flux owned xtables-save projection\0structured-sha256-v3\0";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(transparent)]
@@ -82,23 +82,7 @@ impl XtablesNativeReference {
     }
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) enum XtablesLegacyConflict {
-    ChainDeclaration {
-        chain: Box<str>,
-    },
-    RuleSource {
-        chain: Box<str>,
-        ordinal: NonZeroU32,
-    },
-    RuleTarget {
-        source_chain: Box<str>,
-        ordinal: NonZeroU32,
-        target_chain: Box<str>,
-    },
-}
-
-/// Bounded, counter-normalized projection of native and conflicting legacy mangle state.
+/// Bounded, counter-normalized projection of native mangle state.
 ///
 /// Chain creation order is not semantic. Exact names are therefore canonicalized through the map,
 /// while order and duplicates within each owned chain remain material. Native references from
@@ -109,7 +93,6 @@ pub(crate) struct XtablesSaveProjection {
     family: XtablesRestoreFamily,
     chains: BTreeMap<Box<str>, XtablesOwnedChainState>,
     native_references: Box<[XtablesNativeReference]>,
-    legacy_conflicts: Box<[XtablesLegacyConflict]>,
     digest: XtablesSaveProjectionDigest,
 }
 
@@ -130,15 +113,8 @@ impl XtablesSaveProjection {
     }
 
     #[must_use]
-    pub(crate) const fn legacy_conflicts(&self) -> &[XtablesLegacyConflict] {
-        &self.legacy_conflicts
-    }
-
-    #[must_use]
     pub(crate) fn is_empty(&self) -> bool {
-        self.chains.is_empty()
-            && self.native_references.is_empty()
-            && self.legacy_conflicts.is_empty()
+        self.chains.is_empty() && self.native_references.is_empty()
     }
 
     #[must_use]
@@ -444,7 +420,7 @@ fn opaque_line_mentions_owned_state(line: &str) -> bool {
         !(character.is_ascii_uppercase() || character.is_ascii_digit() || character == '_')
     })
     .filter(|token| !token.is_empty())
-    .any(|token| token.starts_with("FLX") || is_known_legacy_chain(token))
+    .any(|token| token.starts_with("FLX"))
 }
 
 fn validate_input(input: &[u8]) -> Result<(), XtablesSaveProjectionError> {
@@ -500,7 +476,6 @@ struct ProjectionBuilder {
     native_targets: BTreeMap<Box<str>, Option<usize>>,
     source_ordinals: BTreeMap<Box<str>, u32>,
     native_references: Vec<PendingReference>,
-    legacy_conflicts: Vec<XtablesLegacyConflict>,
     declaration_lines: BTreeMap<Box<str>, Option<usize>>,
 }
 
@@ -514,7 +489,6 @@ impl ProjectionBuilder {
             native_targets: BTreeMap::new(),
             source_ordinals: BTreeMap::new(),
             native_references: Vec::new(),
-            legacy_conflicts: Vec::new(),
             declaration_lines: BTreeMap::new(),
         }
     }
@@ -550,17 +524,6 @@ impl ProjectionBuilder {
                 ));
             }
             self.declare_native(chain, Some(line_number))?;
-        } else if is_known_legacy_chain(chain) {
-            if parts[1] != "-" {
-                return Err(XtablesSaveProjectionError::at_line(
-                    XtablesSaveProjectionErrorKind::InvalidChainDeclaration,
-                    line_number,
-                ));
-            }
-            self.legacy_conflicts
-                .push(XtablesLegacyConflict::ChainDeclaration {
-                    chain: chain.into(),
-                });
         }
         Ok(())
     }
@@ -589,7 +552,6 @@ impl ProjectionBuilder {
     ) -> Result<(), XtablesSaveProjectionError> {
         let scan = scan_rule(line, Some(line_number))?;
         let ordinal = self.next_source_ordinal(&scan.source, Some(line_number))?;
-        self.record_legacy_conflicts(&scan, ordinal);
         let native_targets = scan
             .targets
             .iter()
@@ -624,16 +586,6 @@ impl ProjectionBuilder {
     ) -> Result<(), XtablesSaveProjectionError> {
         let line = render_live_append(command);
         let scan = scan_rule(&line, None)?;
-        if is_known_legacy_chain(&scan.source)
-            || scan
-                .targets
-                .iter()
-                .any(|target| is_known_legacy_chain(target))
-        {
-            return Err(XtablesSaveProjectionError::global(
-                XtablesSaveProjectionErrorKind::ExpectedUnownedEntry,
-            ));
-        }
         let native_targets = scan
             .targets
             .iter()
@@ -681,26 +633,6 @@ impl ProjectionBuilder {
             )
         })?;
         Ok(NonZeroU32::new(*value).expect("incremented rule ordinal is nonzero"))
-    }
-
-    fn record_legacy_conflicts(&mut self, scan: &RuleScan, ordinal: NonZeroU32) {
-        if is_known_legacy_chain(&scan.source) {
-            self.legacy_conflicts
-                .push(XtablesLegacyConflict::RuleSource {
-                    chain: scan.source.clone().into_boxed_str(),
-                    ordinal,
-                });
-        }
-        for target in &scan.targets {
-            if is_known_legacy_chain(target) {
-                self.legacy_conflicts
-                    .push(XtablesLegacyConflict::RuleTarget {
-                        source_chain: scan.source.clone().into_boxed_str(),
-                        ordinal,
-                        target_chain: target.clone().into_boxed_str(),
-                    });
-            }
-        }
     }
 
     fn record_native_source_rule(
@@ -804,7 +736,6 @@ impl ProjectionBuilder {
 
         self.native_references
             .sort_by(|left, right| left.reference.cmp(&right.reference));
-        self.legacy_conflicts.sort();
         let chains = self
             .chains
             .into_iter()
@@ -827,13 +758,11 @@ impl ProjectionBuilder {
             .map(|pending| pending.reference)
             .collect::<Vec<_>>()
             .into_boxed_slice();
-        let legacy_conflicts = self.legacy_conflicts.into_boxed_slice();
-        let digest = digest_projection(self.family, &chains, &native_references, &legacy_conflicts);
+        let digest = digest_projection(self.family, &chains, &native_references);
         Ok(XtablesSaveProjection {
             family: self.family,
             chains,
             native_references,
-            legacy_conflicts,
             digest,
         })
     }
@@ -1075,37 +1004,15 @@ fn is_native_chain(chain: &str) -> bool {
     chain.starts_with("FLX")
 }
 
-fn is_known_legacy_chain(chain: &str) -> bool {
-    const BASES: [&str; 9] = [
-        "PROXY_PREROUTING",
-        "PROXY_OUTPUT",
-        "BYPASS_IP",
-        "APP_CHAIN",
-        "ACTION_PROXY_PRE",
-        "ACTION_PROXY_OUT",
-        "ACTION_BYPASS",
-        "DIVERT",
-        "BLOCK_QUIC",
-    ];
-    if BASES
-        .into_iter()
-        .any(|base| chain == base || chain.strip_suffix('6') == Some(base))
-    {
-        return true;
-    }
-    (0..16).any(|index| chain == format!("BYP_Z{index}") || chain == format!("BYP_Z{index}6"))
-}
-
-/// Recognizes every native or bridge-era chain name owned by Flux.
+/// Recognizes the private native chain namespace owned by Flux.
 pub(crate) fn is_flux_owned_chain(chain: &str) -> bool {
-    is_native_chain(chain) || is_known_legacy_chain(chain)
+    is_native_chain(chain)
 }
 
 fn digest_projection(
     family: XtablesRestoreFamily,
     chains: &BTreeMap<Box<str>, XtablesOwnedChainState>,
     references: &[XtablesNativeReference],
-    conflicts: &[XtablesLegacyConflict],
 ) -> XtablesSaveProjectionDigest {
     let mut digest = Sha256::new();
     digest.update(XTABLES_SAVE_PROJECTION_DOMAIN);
@@ -1130,30 +1037,6 @@ fn digest_projection(
             digest_string(&mut digest, target);
         }
         digest_string(&mut digest, reference.rule().as_str());
-    }
-    digest_count(&mut digest, conflicts.len());
-    for conflict in conflicts {
-        match conflict {
-            XtablesLegacyConflict::ChainDeclaration { chain } => {
-                digest.update([1]);
-                digest_string(&mut digest, chain);
-            }
-            XtablesLegacyConflict::RuleSource { chain, ordinal } => {
-                digest.update([2]);
-                digest_string(&mut digest, chain);
-                digest.update(ordinal.get().to_be_bytes());
-            }
-            XtablesLegacyConflict::RuleTarget {
-                source_chain,
-                ordinal,
-                target_chain,
-            } => {
-                digest.update([3]);
-                digest_string(&mut digest, source_chain);
-                digest.update(ordinal.get().to_be_bytes());
-                digest_string(&mut digest, target_chain);
-            }
-        }
     }
     XtablesSaveProjectionDigest(digest.finalize().into())
 }

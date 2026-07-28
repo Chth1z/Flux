@@ -2528,7 +2528,7 @@ fn print_help() {
            test-functional-canary-linux-tproxy  Run the ingress-only Linux TPROXY checkpoint\n\
            test-functional-canary-linux-output-tproxy  Run the local-OUTPUT loopback TPROXY checkpoint\n\
            test-functional-canary-linux-output-preflight  Preflight distinct local-OUTPUT credentials (no traffic)\n\
-           test-native-composition-linux  Run the dispatcher-free native lifecycle and recovery checkpoint\n\
+           test-native-composition-linux  Run the single-owner native lifecycle and recovery checkpoint\n\
            test-parser-fuzz-smoke  Run bounded deterministic parser no-panic smoke tests\n\
            test-functional-canary-android-x86_64-output-tproxy  Cross-build and run the exact checkpoint on one explicit rooted x86_64 Android serial\n\
            preflight-android-arm64-mark-ordering  Read-only ADR-0013 target viability report for one explicit rooted ARM64 Android serial\n\

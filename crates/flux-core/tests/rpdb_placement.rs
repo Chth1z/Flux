@@ -118,8 +118,8 @@ fn safe_dual_family_window_returns_snapshot_and_classifier_bound_evidence() {
         .address_bypass_routing_spec(RuleProtocol::from_raw(99))
         .expect("lease projects structural bypass routing");
     assert_eq!(routing.lookup_table(), RuleTableId::from_raw(254));
-    assert_eq!(routing.ipv4_priority(), Some(ipv4.bypass_priority()));
-    assert_eq!(routing.ipv6_priority(), Some(ipv6.bypass_priority()));
+    assert_eq!(routing.ipv4_priority(), ipv4.address_bypass_priority());
+    assert_eq!(routing.ipv6_priority(), ipv6.address_bypass_priority());
     assert_eq!(routing.protocol(), RuleProtocol::from_raw(99));
     assert_eq!(
         lease.deferred_prerequisites(),
@@ -152,8 +152,7 @@ fn proxy_only_placement_consumes_one_priority_without_a_bypass_rule() {
 
     let lease = plan_rpdb_placement(&inventory, &audit, request).expect("one open priority");
 
-    assert_eq!(placement.bypass_priority(), placement.proxy_priority());
-    assert_eq!(placement.dedicated_bypass_priority(), None);
+    assert_eq!(placement.address_bypass_priority(), None);
     assert!(
         lease
             .address_bypass_routing_spec(RuleProtocol::from_raw(99))
@@ -208,7 +207,7 @@ fn structural_constructors_reject_implicit_priorities_and_reserved_tables() {
     assert!(RpdbClassifierRevision::new(0).is_none());
     assert_eq!(revision(9).get(), 9);
     assert_eq!(
-        RpdbFamilyPlacement::new(
+        RpdbFamilyPlacement::with_address_bypass(
             RulePriority::from_raw(0),
             RulePriority::from_raw(PROXY_PRIORITY),
             RuleTableId::from_raw(PRIVATE_TABLE),
@@ -219,7 +218,7 @@ fn structural_constructors_reject_implicit_priorities_and_reserved_tables() {
         }
     );
     assert_eq!(
-        RpdbFamilyPlacement::new(
+        RpdbFamilyPlacement::with_address_bypass(
             RulePriority::from_raw(BYPASS_PRIORITY),
             RulePriority::from_raw(0),
             RuleTableId::from_raw(PRIVATE_TABLE),
@@ -231,7 +230,7 @@ fn structural_constructors_reject_implicit_priorities_and_reserved_tables() {
     );
     for (bypass, proxy) in [(PROXY_PRIORITY, PROXY_PRIORITY), (17_000, 16_000)] {
         assert!(matches!(
-            RpdbFamilyPlacement::new(
+            RpdbFamilyPlacement::with_address_bypass(
                 RulePriority::from_raw(bypass),
                 RulePriority::from_raw(proxy),
                 RuleTableId::from_raw(PRIVATE_TABLE),
@@ -241,7 +240,7 @@ fn structural_constructors_reject_implicit_priorities_and_reserved_tables() {
     }
     for table in [0, 253, 254, 255] {
         assert_eq!(
-            RpdbFamilyPlacement::new(
+            RpdbFamilyPlacement::with_address_bypass(
                 RulePriority::from_raw(BYPASS_PRIORITY),
                 RulePriority::from_raw(PROXY_PRIORITY),
                 RuleTableId::from_raw(table),
@@ -605,7 +604,7 @@ fn goto_edges_crossing_starting_or_landing_in_the_candidate_window_are_rejected(
                 dump_index: 1,
                 source: RulePriority::from_raw(source),
                 target: RulePriority::from_raw(target),
-                bypass: RulePriority::from_raw(BYPASS_PRIORITY),
+                first_candidate: RulePriority::from_raw(BYPASS_PRIORITY),
                 proxy: RulePriority::from_raw(PROXY_PRIORITY),
             }
         );
@@ -694,7 +693,7 @@ fn candidate_priorities_must_be_strictly_inside_the_classified_window() {
         RpdbPlacementPlanError::PriorityWindowViolation {
             family: NetworkAddressFamily::Ipv4,
             last_must_precede: RulePriority::from_raw(15_500),
-            bypass: RulePriority::from_raw(BYPASS_PRIORITY),
+            address_bypass: Some(RulePriority::from_raw(BYPASS_PRIORITY)),
             proxy: RulePriority::from_raw(PROXY_PRIORITY),
             first_terminal_barrier: RulePriority::from_raw(BARRIER_PRIORITY),
         }
@@ -998,9 +997,9 @@ fn revision(value: u64) -> RpdbClassifierRevision {
     RpdbClassifierRevision::new(value).expect("nonzero classifier revision")
 }
 
-fn placement(bypass: u32, proxy: u32, private_table: u32) -> RpdbFamilyPlacement {
-    RpdbFamilyPlacement::new(
-        RulePriority::from_raw(bypass),
+fn placement(address_bypass: u32, proxy: u32, private_table: u32) -> RpdbFamilyPlacement {
+    RpdbFamilyPlacement::with_address_bypass(
+        RulePriority::from_raw(address_bypass),
         RulePriority::from_raw(proxy),
         RuleTableId::from_raw(private_table),
     )

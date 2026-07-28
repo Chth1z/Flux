@@ -5,19 +5,19 @@ use std::num::{NonZeroU16, NonZeroU32};
 use flux_core::{
     AddressBypassRuleBudget, AddressHostFamilySelection, AddressHostSetPlan, AddressHostSetPolicy,
     CaptureApplicationMode, CaptureApplicationPolicy, CaptureBypassPolicy, CaptureGroupId,
-    CaptureInterfacePolicy, CaptureInterfaceSelector, CaptureIpPrefix, CaptureProtocolSet,
-    CaptureTrafficDomain, CaptureTrafficScope, CaptureUserId, CompatibilityEngineCredentials,
-    FwmarkCandidate, InterfaceAddressFlags, InterfaceAddressRecord, InterfaceIndex, InterfaceName,
-    NetworkAddressFamily, NetworkInventoryTracker, RouteProtocol, RouteTableId, RuleFwMark,
-    RulePriority, RuleProtocol, ShadowCaptureArtifact, ShadowCaptureProgramRequest,
-    ShadowCompilationReport, compile_shadow_capture_program, plan_address_host_set,
+    CaptureInterfacePolicy, CaptureInterfaceSelector, CaptureIpPrefix, CaptureProgram,
+    CaptureProgramCompilation, CaptureProgramRequest, CaptureProtocolSet, CaptureTrafficDomain,
+    CaptureTrafficScope, CaptureUserId, EngineCredentials, FwmarkCandidate, InterfaceAddressFlags,
+    InterfaceAddressRecord, InterfaceIndex, InterfaceName, NetworkAddressFamily,
+    NetworkInventoryTracker, RouteProtocol, RouteTableId, RuleFwMark, RulePriority, RuleProtocol,
+    compile_capture_program, plan_address_host_set,
 };
 use flux_platform::{
-    MAX_XTABLES_RESTORE_BYTES, XtablesCaptureArtifactSet, XtablesCaptureEntryPointRole,
-    XtablesCaptureEntrySelector, XtablesCaptureExtension, XtablesCaptureExtensions,
-    XtablesCaptureHook, XtablesCaptureLoweringBudget, XtablesCaptureLoweringError,
-    XtablesCaptureLoweringRequest, XtablesCaptureNamespace, XtablesCaptureTransactionStep,
-    XtablesInterfaceRenderErrorKind, XtablesLocalOutputRoutingSpec,
+    MAX_XTABLES_RESTORE_BYTES, XTABLES_CAPTURE_LOWERING_SCHEMA_VERSION, XtablesCaptureArtifactSet,
+    XtablesCaptureEntryPointRole, XtablesCaptureEntrySelector, XtablesCaptureExtension,
+    XtablesCaptureExtensions, XtablesCaptureHook, XtablesCaptureLoweringBudget,
+    XtablesCaptureLoweringError, XtablesCaptureLoweringRequest, XtablesCaptureNamespace,
+    XtablesCaptureTransactionStep, XtablesInterfaceRenderErrorKind, XtablesLocalOutputRoutingSpec,
     XtablesLocalOutputRoutingSpecError, XtablesLocalOutputRoutingTarget,
     XtablesLocalOutputRoutingTargetError, XtablesRestoreAction, XtablesRestoreContext,
     XtablesRestoreFamily, XtablesTproxyTarget, lower_xtables_capture,
@@ -50,7 +50,7 @@ fn dual_stack_forwarded_lowering_is_deterministic_and_unattached() {
     let first = lower(&report, DEFAULT_GENERATION, default_target()).unwrap();
     let second = lower(&report, DEFAULT_GENERATION, default_target()).unwrap();
     assert_eq!(first, second);
-    assert_eq!(first.source_program_digest(), report.artifact().digest());
+    assert_eq!(first.source_program_digest(), report.program().digest());
     assert_eq!(first.usage().domain_programs(), 2);
     assert_eq!(first.usage().implementation_chains(), 2);
     assert_eq!(first.usage().maximum_jump_depth(), 1);
@@ -95,7 +95,7 @@ fn dual_stack_forwarded_lowering_is_deterministic_and_unattached() {
 }
 
 #[test]
-fn forwarded_schema_v1_fixture_pins_exact_bytes_and_identities() {
+fn forwarded_fixture_pins_exact_bytes_and_identities() {
     let report = compile_program(
         scope(AddressHostFamilySelection::Ipv4, false, true),
         interfaces(&[], &[exact("wlan0")], &[]),
@@ -104,7 +104,10 @@ fn forwarded_schema_v1_fixture_pins_exact_bytes_and_identities() {
     );
     let lowered = lower(&report, 1, default_target()).unwrap();
     let pair = lowered.ipv4().unwrap();
-    assert_eq!(lowered.schema_version(), 1);
+    assert_eq!(
+        lowered.schema_version(),
+        XTABLES_CAPTURE_LOWERING_SCHEMA_VERSION
+    );
 
     assert_eq!(
         restore_text(pair.prepare()),
@@ -131,19 +134,19 @@ fn forwarded_schema_v1_fixture_pins_exact_bytes_and_identities() {
     );
     assert_eq!(
         digest_hex(lowered.source_program_digest().as_bytes()),
-        "f1147e59670fe9ff11ae1811ff1b2a3259fbdf1ac0a76200a375f560f1409994"
+        "8b78445f63c20ebd5610a41c73f6706ed23dda799a5dc9113c7f30c9e5ed7034"
     );
     assert_eq!(
         digest_hex(lowered.lowering_digest().as_bytes()),
-        "0bc1a9be6f62023f78ef59f760e0d45d200e65c817fcc17d1e9237216aa0e518"
+        "b32cd5db848476089647f38bd03000b3f36f34af4f48f745d48a9eb8f1041207"
     );
     assert_eq!(
         digest_hex(pair.digest().as_bytes()),
-        "7262387157f77600877e4ec44e5211f1d2f8f52276bdfc687c7a81b1efaaa92a"
+        "b869f8c4ab6f6e7a2d6c1cbcad98dc5e77ba413d901b10d1926a5b763f07a8f0"
     );
     assert_eq!(
         digest_hex(lowered.digest().as_bytes()),
-        "348fa46a9c283a2dfdda69a8ad12634dc838b0d99a27d08f3414159bd3864e1c"
+        "9c85eeb3fd1cbc719dcca3bb682a7c0a257d8423721f7c82bcd266ab342acbe8"
     );
 }
 
@@ -292,7 +295,7 @@ fn proxying_local_output_requires_exact_family_routing() {
 }
 
 #[test]
-fn ipv4_local_output_schema_v2_pins_complete_non_authorizing_transaction() {
+fn ipv4_local_output_pins_complete_non_authorizing_transaction() {
     let report = compile_program(
         scope(AddressHostFamilySelection::Ipv4, true, false),
         interfaces(&[], &[], &[]),
@@ -399,14 +402,14 @@ fn ipv4_local_output_schema_v2_pins_complete_non_authorizing_transaction() {
     assert!(listener.requires_transparent_socket());
     assert!(listener.requires_original_destination());
     let escape = requirements.loop_escape();
-    assert_eq!(escape.compatibility_credentials().uid(), uid(1000));
-    assert_eq!(escape.compatibility_credentials().gid(), gid(1000));
+    assert_eq!(escape.engine_credentials().uid(), uid(1000));
+    assert_eq!(escape.engine_credentials().gid(), gid(1000));
     assert_eq!(
         escape.socket_mark(),
         RuleFwMark::new(DEFAULT_BYPASS_MARK, DEFAULT_MARK_MASK).unwrap()
     );
 
-    let order = pair.transaction_order().unwrap();
+    let order = pair.transaction_order();
     assert_eq!(
         order.prepare(),
         [
@@ -457,19 +460,19 @@ fn ipv4_local_output_schema_v2_pins_complete_non_authorizing_transaction() {
     );
     assert_eq!(
         digest_hex(lowered.source_program_digest().as_bytes()),
-        "fdee3e01e9f90c898a2147e3d288303b2a3593e24dfce878224c59fab8e8bc8d"
+        "6e12d9b1205a952552bb7723821f032827cdffcf30999d48c3b1215644f5982b"
     );
     assert_eq!(
         digest_hex(lowered.lowering_digest().as_bytes()),
-        "15364f79d458d77bf60b017942e7ea0e19cbe844a19d5ce8dc74641723bd7f43"
+        "fa54eaf9774d90ed5925e2548d661069515d3f202d1d231151fc8f4c2b81e6c7"
     );
     assert_eq!(
         digest_hex(pair.digest().as_bytes()),
-        "bc334397bffd2dee2e951cf99acb8845dfe8741a1e5d13c5f55fe2d39aed506f"
+        "ffdd643b5ec8278c20f1123f16c8c029b2b87688fc32dd96766b93936ebc9f86"
     );
     assert_eq!(
         digest_hex(lowered.digest().as_bytes()),
-        "50133a64041de6034832691f31f2efed3027f45155fbc44a935147906b746f31"
+        "22eab3e33c2c920a77e1f6b831660e72e9eef7a2d90683ea8e7e6a0878dda617"
     );
 }
 
@@ -546,7 +549,7 @@ fn dual_stack_mixed_programs_use_distinct_local_and_forwarded_roles() {
                 ),
             ]
         );
-        let order = pair.transaction_order().unwrap();
+        let order = pair.transaction_order();
         let attach = order
             .prepare()
             .iter()
@@ -762,7 +765,7 @@ fn local_routing_target_rejects_non_actionable_identities() {
 }
 
 #[test]
-fn every_schema_v1_extension_is_rejected_explicitly() {
+fn every_unsupported_extension_is_rejected_explicitly() {
     let report = compile_program(
         scope(AddressHostFamilySelection::Ipv4, false, true),
         interfaces(&[], &[exact("wlan0")], &[]),
@@ -795,7 +798,7 @@ fn every_schema_v1_extension_is_rejected_explicitly() {
     for (extensions, extension) in cases {
         assert_eq!(
             lower_xtables_capture(
-                lowering_request(report.artifact(), DEFAULT_GENERATION, default_target())
+                lowering_request(report.program(), DEFAULT_GENERATION, default_target())
                     .with_extensions(extensions)
             ),
             Err(XtablesCaptureLoweringError::UnsupportedExtension { extension })
@@ -877,7 +880,7 @@ fn forwarded_expansion_honors_the_exact_command_budget() {
 
     let exact_budget = XtablesCaptureLoweringBudget::new(required).unwrap();
     let exact = lower_xtables_capture(
-        lowering_request(report.artifact(), DEFAULT_GENERATION, default_target())
+        lowering_request(report.program(), DEFAULT_GENERATION, default_target())
             .with_budget(exact_budget),
     )
     .expect("exact command budget");
@@ -886,7 +889,7 @@ fn forwarded_expansion_honors_the_exact_command_budget() {
     let smaller_budget = XtablesCaptureLoweringBudget::new(required - 1).unwrap();
     assert_eq!(
         lower_xtables_capture(
-            lowering_request(report.artifact(), DEFAULT_GENERATION, default_target())
+            lowering_request(report.program(), DEFAULT_GENERATION, default_target())
                 .with_budget(smaller_budget)
         ),
         Err(XtablesCaptureLoweringError::CommandBudgetExceeded {
@@ -915,7 +918,7 @@ fn local_output_preflights_the_combined_classifier_and_companion_budget() {
     let baseline = lower_with_routing(&report, 31, default_target(), routing).unwrap();
     let required = baseline.ipv4().unwrap().usage().prepare_commands();
     let exact = lower_xtables_capture(
-        lowering_request(report.artifact(), 31, default_target())
+        lowering_request(report.program(), 31, default_target())
             .with_local_output_routing(routing)
             .with_budget(XtablesCaptureLoweringBudget::new(required).unwrap()),
     )
@@ -924,7 +927,7 @@ fn local_output_preflights_the_combined_classifier_and_companion_budget() {
 
     assert_eq!(
         lower_xtables_capture(
-            lowering_request(report.artifact(), 31, default_target())
+            lowering_request(report.program(), 31, default_target())
                 .with_local_output_routing(routing)
                 .with_budget(XtablesCaptureLoweringBudget::new(required - 1).unwrap()),
         ),
@@ -948,9 +951,9 @@ fn forwarded_expansion_preflights_the_immutable_restore_byte_limit() {
         )
         .unwrap()
     });
-    let report = compile_shadow_capture_program(ShadowCaptureProgramRequest::new(
+    let report = compile_capture_program(CaptureProgramRequest::new(
         scope(AddressHostFamilySelection::Ipv6, false, true),
-        CompatibilityEngineCredentials::new(uid(1000), gid(1000)),
+        EngineCredentials::new(uid(1000), gid(1000)),
         CaptureBypassPolicy::new(configured).unwrap(),
         None,
         interfaces(&[], &[], &[]),
@@ -981,9 +984,9 @@ fn local_output_expansion_preflights_the_immutable_restore_byte_limit() {
         )
         .unwrap()
     });
-    let report = compile_shadow_capture_program(ShadowCaptureProgramRequest::new(
+    let report = compile_capture_program(CaptureProgramRequest::new(
         scope(AddressHostFamilySelection::Ipv6, true, false),
-        CompatibilityEngineCredentials::new(uid(1000), gid(1000)),
+        EngineCredentials::new(uid(1000), gid(1000)),
         CaptureBypassPolicy::new(configured).unwrap(),
         None,
         interfaces(&[], &[], &[]),
@@ -1024,7 +1027,7 @@ fn forwarded_artifact_identity_binds_program_namespace_port_and_marks_but_not_bu
     let baseline = lower(&report, 1, default_target()).unwrap();
     let required = baseline.ipv4().unwrap().usage().prepare_commands();
     let bounded = lower_xtables_capture(
-        lowering_request(report.artifact(), 1, default_target())
+        lowering_request(report.program(), 1, default_target())
             .with_budget(XtablesCaptureLoweringBudget::new(required).unwrap()),
     )
     .unwrap();
@@ -1078,7 +1081,7 @@ fn forwarded_artifact_identity_binds_program_namespace_port_and_marks_but_not_bu
 }
 
 #[test]
-fn local_schema_v2_identity_binds_routing_and_derived_transaction_requirements() {
+fn local_identity_binds_routing_and_derived_transaction_requirements() {
     let report = compile_program(
         scope(AddressHostFamilySelection::Ipv4, true, false),
         interfaces(&[], &[], &[]),
@@ -1089,7 +1092,7 @@ fn local_schema_v2_identity_binds_routing_and_derived_transaction_requirements()
     let baseline = lower_with_routing(&report, 41, default_target(), baseline_routing).unwrap();
     let required = baseline.ipv4().unwrap().usage().prepare_commands();
     let bounded = lower_xtables_capture(
-        lowering_request(report.artifact(), 41, default_target())
+        lowering_request(report.program(), 41, default_target())
             .with_local_output_routing(baseline_routing)
             .with_budget(XtablesCaptureLoweringBudget::new(required).unwrap()),
     )
@@ -1155,7 +1158,7 @@ fn compile_program(
     interfaces: CaptureInterfacePolicy,
     protocols: CaptureProtocolSet,
     bypasses: &[&str],
-) -> ShadowCompilationReport {
+) -> CaptureProgramCompilation {
     compile_program_with_host(scope, interfaces, protocols, bypasses, None)
 }
 
@@ -1165,7 +1168,7 @@ fn compile_program_with_host(
     protocols: CaptureProtocolSet,
     bypasses: &[&str],
     host_bypass: Option<AddressHostSetPlan>,
-) -> ShadowCompilationReport {
+) -> CaptureProgramCompilation {
     compile_program_with_application_and_host(
         scope,
         interfaces,
@@ -1182,7 +1185,7 @@ fn compile_program_with_application(
     applications: CaptureApplicationPolicy,
     protocols: CaptureProtocolSet,
     bypasses: &[&str],
-) -> ShadowCompilationReport {
+) -> CaptureProgramCompilation {
     compile_program_with_application_and_host(
         scope,
         interfaces,
@@ -1200,10 +1203,10 @@ fn compile_program_with_application_and_host(
     protocols: CaptureProtocolSet,
     bypasses: &[&str],
     host_bypass: Option<AddressHostSetPlan>,
-) -> ShadowCompilationReport {
-    compile_shadow_capture_program(ShadowCaptureProgramRequest::new(
+) -> CaptureProgramCompilation {
+    compile_capture_program(CaptureProgramRequest::new(
         scope,
-        CompatibilityEngineCredentials::new(uid(1000), gid(1000)),
+        EngineCredentials::new(uid(1000), gid(1000)),
         CaptureBypassPolicy::new(bypasses.iter().copied().map(capture_prefix)).unwrap(),
         host_bypass,
         interfaces,
@@ -1244,26 +1247,26 @@ fn host_plan(address: &str) -> AddressHostSetPlan {
 }
 
 fn lower(
-    report: &ShadowCompilationReport,
+    report: &CaptureProgramCompilation,
     generation: u32,
     target: XtablesTproxyTarget,
 ) -> Result<XtablesCaptureArtifactSet, XtablesCaptureLoweringError> {
-    lower_xtables_capture(lowering_request(report.artifact(), generation, target))
+    lower_xtables_capture(lowering_request(report.program(), generation, target))
 }
 
 fn lower_with_routing(
-    report: &ShadowCompilationReport,
+    report: &CaptureProgramCompilation,
     generation: u32,
     target: XtablesTproxyTarget,
     routing: XtablesLocalOutputRoutingSpec,
 ) -> Result<XtablesCaptureArtifactSet, XtablesCaptureLoweringError> {
     lower_xtables_capture(
-        lowering_request(report.artifact(), generation, target).with_local_output_routing(routing),
+        lowering_request(report.program(), generation, target).with_local_output_routing(routing),
     )
 }
 
 fn lowering_request(
-    artifact: &ShadowCaptureArtifact,
+    artifact: &CaptureProgram,
     generation: u32,
     target: XtablesTproxyTarget,
 ) -> XtablesCaptureLoweringRequest<'_> {

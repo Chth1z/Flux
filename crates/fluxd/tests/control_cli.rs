@@ -10,31 +10,31 @@ fn control_commands_map_to_runtime_intents_and_wait_for_completion() {
         (
             "start",
             RuntimeIntent::Running {
-                reason: Reason::Fluxctl,
+                reason: Reason::UserControl,
             },
         ),
         (
             "stop",
             RuntimeIntent::Stopped {
-                reason: Reason::Fluxctl,
+                reason: Reason::UserControl,
             },
         ),
         (
             "restart",
             RuntimeIntent::Reload {
-                reason: Reason::Fluxctl,
+                reason: Reason::UserControl,
             },
         ),
         (
             "reload",
             RuntimeIntent::Reload {
-                reason: Reason::Fluxctl,
+                reason: Reason::UserControl,
             },
         ),
         (
             "resync",
             RuntimeIntent::ResyncAddresses {
-                reason: Reason::Fluxctl,
+                reason: Reason::UserControl,
             },
         ),
     ];

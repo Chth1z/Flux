@@ -10,12 +10,12 @@ use std::thread::{self, JoinHandle, ThreadId};
 use std::time::{Duration, Instant};
 
 use flux_platform::{
-    DaemonReactor, FileObservationBatch, FileObservationPaths, ReactorError, ReactorStopHandle,
-    SeqpacketConnection, ShutdownSignal, StopDisposition,
+    DaemonReactor, FileObservationBatch, FileObservationPaths, PlatformError, ReactorError,
+    ReactorStopHandle, SeqpacketConnection, ShutdownSignal, StopDisposition,
 };
 use tempfile::tempdir;
 
-const PARTIAL_BIND_HELPER_ENV: &str = "FLUX_REACTOR_PARTIAL_BIND_HELPER";
+const OPEN_FAILURE_HELPER_ENV: &str = "FLUX_REACTOR_OPEN_FAILURE_HELPER";
 
 extern "C" fn test_signal_handler(_signal: libc::c_int) {}
 
@@ -146,16 +146,16 @@ fn inventory_enabled_reactor_publishes_without_displacing_control_work() {
     let reactor_path = socket_path.clone();
     let thread = thread::spawn(move || {
         let shutdown = ShutdownSignal::install().expect("install shutdown signal source");
-        let (reactor, stop, source) = DaemonReactor::bind_with_network_inventory(
-            reactor_path,
-            shutdown,
-            move |connection| {
+        let (mut reactor, stop) = DaemonReactor::open(shutdown).expect("open daemon reactor");
+        let source = reactor
+            .attach_network_inventory(drop)
+            .expect("attach network inventory");
+        reactor
+            .bind_control(reactor_path, move |connection| {
                 let packet = connection.recv_packet(64).expect("receive request");
                 handled_tx.send(packet).expect("publish handled packet");
-            },
-            drop,
-        )
-        .expect("bind inventory-enabled reactor");
+            })
+            .expect("bind inventory-enabled reactor");
         ready_tx
             .send((stop, source))
             .expect("publish inventory-enabled reactor");
@@ -196,9 +196,9 @@ fn inventory_enabled_reactor_publishes_without_displacing_control_work() {
 }
 
 #[test]
-fn partial_bind_failure_unlinks_listener_and_restores_signal_mask() {
-    if let Some(socket_path) = std::env::var_os(PARTIAL_BIND_HELPER_ENV) {
-        exercise_partial_bind_failure(Path::new(&socket_path));
+fn staged_open_failure_restores_signal_mask_without_creating_a_listener() {
+    if let Some(socket_path) = std::env::var_os(OPEN_FAILURE_HELPER_ENV) {
+        exercise_staged_open_failure(Path::new(&socket_path));
         return;
     }
 
@@ -206,12 +206,12 @@ fn partial_bind_failure_unlinks_listener_and_restores_signal_mask() {
     let socket_path = directory.path().join("fluxd.sock");
     let status = Command::new(std::env::current_exe().expect("current test executable"))
         .arg("--exact")
-        .arg("partial_bind_failure_unlinks_listener_and_restores_signal_mask")
-        .env(PARTIAL_BIND_HELPER_ENV, &socket_path)
+        .arg("staged_open_failure_restores_signal_mask_without_creating_a_listener")
+        .env(OPEN_FAILURE_HELPER_ENV, &socket_path)
         .status()
-        .expect("run partial-bind helper");
+        .expect("run staged-open helper");
 
-    assert!(status.success(), "partial-bind helper failed: {status}");
+    assert!(status.success(), "staged-open helper failed: {status}");
     assert_socket_absent(&socket_path);
 }
 
@@ -316,20 +316,20 @@ fn inventory_is_invalidated_before_running_workers_are_drained() {
     let reactor_path = socket_path.clone();
     let thread = thread::spawn(move || {
         let shutdown = ShutdownSignal::install().expect("install shutdown signal source");
-        let (reactor, stop, source) = DaemonReactor::bind_with_network_inventory(
-            reactor_path,
-            shutdown,
-            move |_connection| {
+        let (mut reactor, stop) = DaemonReactor::open(shutdown).expect("open daemon reactor");
+        let source = reactor
+            .attach_network_inventory(drop)
+            .expect("attach network inventory");
+        reactor
+            .bind_control(reactor_path, move |_connection| {
                 entered_tx.send(()).expect("publish worker entry");
                 let (lock, changed) = &*handler_release;
                 let mut released = lock.lock().expect("worker release lock");
                 while !*released {
                     released = changed.wait(released).expect("wait for worker release");
                 }
-            },
-            drop,
-        )
-        .expect("bind inventory-enabled reactor");
+            })
+            .expect("bind inventory-enabled reactor");
         ready_tx
             .send((stop, source))
             .expect("publish inventory-enabled reactor");
@@ -837,7 +837,7 @@ fn assert_socket_absent(path: &Path) {
     assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
 }
 
-fn exercise_partial_bind_failure(socket_path: &Path) {
+fn exercise_staged_open_failure(socket_path: &Path) {
     let sigint_was_blocked = signal_is_blocked(libc::SIGINT);
     let sigterm_was_blocked = signal_is_blocked(libc::SIGTERM);
     let maximum_observed_fd = std::fs::read_dir("/proc/self/fd")
@@ -879,9 +879,9 @@ fn exercise_partial_bind_failure(socket_path: &Path) {
     };
     assert_eq!(saturation_error.raw_os_error(), Some(libc::EMFILE));
     // Saturating first accounts for arbitrary gaps in the test harness's FD
-    // table. Three released slots permit signalfd, the listener, and eventfd;
-    // epoll creation then fails after the socket pathname has been bound.
-    for _ in 0..3 {
+    // table. Two released slots permit signalfd and eventfd; epoll creation is
+    // then the first failing staged-open operation, before listener binding.
+    for _ in 0..2 {
         drop(fillers.pop().expect("descriptor saturation filler"));
     }
 
@@ -895,9 +895,13 @@ fn exercise_partial_bind_failure(socket_path: &Path) {
     match result {
         Ok((reactor, _stop)) => {
             drop(reactor);
-            panic!("constrained descriptor limit must fail reactor bind");
+            panic!("constrained descriptor limit must fail reactor open");
         }
-        Err(error) => assert!(error.to_string().contains("reactor")),
+        Err(ReactorError::Platform(PlatformError::SystemCall { operation, source })) => {
+            assert_eq!(operation, "create reactor epoll");
+            assert_eq!(source.raw_os_error(), Some(libc::EMFILE));
+        }
+        Err(error) => panic!("unexpected staged-open error: {error}"),
     }
     assert_socket_absent(socket_path);
     assert_eq!(signal_is_blocked(libc::SIGINT), sigint_was_blocked);

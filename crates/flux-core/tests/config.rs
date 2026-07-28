@@ -78,8 +78,8 @@ fn parses_the_complete_desired_state_schema() {
     assert_eq!(config.subscription().max_download_bytes(), 16_777_216);
     assert_eq!(config.subscription().max_decoded_bytes(), 16_777_216);
     assert_eq!(config.subscription().max_nodes(), 10_000);
-    assert!(!config.safety().respect_android_vpn());
-    assert!(!config.safety().require_functional_canary());
+    assert!(config.safety().respect_android_vpn());
+    assert!(config.safety().require_functional_canary());
 }
 
 #[test]

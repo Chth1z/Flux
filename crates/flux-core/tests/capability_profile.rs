@@ -2,11 +2,9 @@ use flux_core::{
     AndroidBuildIdentity, AndroidProductIdentity, ArtifactIdentity, BootIdentity,
     CAPABILITY_PROFILE_SCHEMA_VERSION, CapabilityProfile, CapabilityProfileRevision,
     DeviceIdentity, DeviceIdentityError, IdentityTextErrorKind, KernelBuildIdentity, KernelFacts,
-    KernelRelease, KernelVersion, LegacyAddressSynchronization, LegacyArtifactReadiness,
-    LegacyArtifactResolution, LegacyBridgeFacts, LegacyMutationWriter, LegacyRuleBackend,
-    MutationGate, NetworkNamespaceIdentity, Observation, ReviewedPolicySelector,
-    SecurityPatchLevel, SelinuxMode, SelinuxPolicyIdentity, Sha256Digest, ToolId,
-    VendorBuildIdentity, VerifiedBootIdentity, VerifiedBootState,
+    KernelRelease, KernelVersion, MutationGate, NetworkNamespaceIdentity, Observation,
+    ReviewedPolicySelector, SecurityPatchLevel, SelinuxMode, SelinuxPolicyIdentity, Sha256Digest,
+    ToolId, VendorBuildIdentity, VerifiedBootIdentity, VerifiedBootState,
 };
 
 #[test]
@@ -21,7 +19,6 @@ fn verified_boot_and_supported_kernel_allow_runtime_mutation() {
             KernelRelease::new("5.10.198-android12-9-gki").expect("bounded kernel release"),
         )),
         Observation::Verified(SelinuxMode::Enforcing),
-        ready_legacy_bridge(),
     );
 
     assert_eq!(profile.schema_version(), CAPABILITY_PROFILE_SCHEMA_VERSION);
@@ -44,7 +41,6 @@ fn malformed_kernel_keeps_the_raw_release_and_makes_the_profile_read_only() {
         Observation::Unavailable,
         KernelFacts::from_release(Observation::Verified(release.clone())),
         Observation::Absent,
-        ready_legacy_bridge(),
     );
 
     assert_eq!(profile.kernel().release(), &Observation::Verified(release));
@@ -56,19 +52,6 @@ fn malformed_kernel_keeps_the_raw_release_and_makes_the_profile_read_only() {
             boot_identity: flux_core::BootIdentityMutationStatus::Verified,
         }
     );
-}
-
-#[test]
-fn legacy_bridge_reports_contract_without_claiming_an_active_capture_mode() {
-    let bridge = ready_legacy_bridge();
-
-    assert_eq!(bridge.mutation_writer(), LegacyMutationWriter::Dispatcher);
-    assert_eq!(bridge.rule_backend(), LegacyRuleBackend::IptablesRestore);
-    assert_eq!(
-        bridge.address_synchronization(),
-        LegacyAddressSynchronization::StandaloneAddrsyncdViaScript
-    );
-    assert!(bridge.shell().verified().expect("shell fact").is_ready());
 }
 
 #[test]
@@ -86,7 +69,6 @@ fn nonzero_same_schema_revisions_can_be_preserved_by_adapters() {
             KernelRelease::new("5.10.0").expect("bounded kernel release"),
         )),
         Observation::Verified(SelinuxMode::Permissive),
-        ready_legacy_bridge(),
     );
 
     assert_eq!(profile.revision(), revision);
@@ -106,7 +88,6 @@ fn complete_profile_digest_distinguishes_equal_revisions() {
             KernelRelease::new("5.10.0").expect("bounded kernel release"),
         )),
         Observation::Verified(SelinuxMode::Enforcing),
-        ready_legacy_bridge(),
     );
     let permissive = CapabilityProfile::new(
         revision,
@@ -114,7 +95,6 @@ fn complete_profile_digest_distinguishes_equal_revisions() {
         enforcing.device_identity().clone(),
         enforcing.kernel().clone(),
         Observation::Verified(SelinuxMode::Permissive),
-        enforcing.legacy_bridge().clone(),
     );
 
     assert_eq!(enforcing.revision(), permissive.revision());
@@ -212,14 +192,6 @@ fn device_identity_rejects_ambiguous_tools_and_noncanonical_security_dates() {
     );
     assert!(Sha256Digest::new([0; 32]).is_err());
     assert!(ArtifactIdentity::new(Sha256Digest::new([1; 32]).expect("digest"), 0).is_err());
-}
-
-fn ready_legacy_bridge() -> LegacyBridgeFacts {
-    let ready = Observation::Verified(LegacyArtifactReadiness::new(
-        LegacyArtifactResolution::Direct,
-        true,
-    ));
-    LegacyBridgeFacts::new(ready.clone(), ready.clone(), ready)
 }
 
 fn device_identity(

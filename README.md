@@ -170,9 +170,14 @@ It intentionally cannot pass from the placeholder manifest alone. A release cand
 needs a clean source tree, complete binary provenance/version/hash/license fields, trusted
 payload-bound device evidence, SPDX, pinned build metadata, and complete checksums.
 
-See [the development guide](docs/development.md) for focused tests, capability collectors, package
-staging, and the physical-device safety procedure. Architecture decisions and implementation status
-are indexed under [`docs/`](docs/README.md).
+The bounded, read-only Android fwmark census requires an explicit ADB device and command path:
+
+```text
+cargo --quiet xtask collect-android-arm64-fwmark-census --serial SERIAL --adb PROGRAM
+```
+
+Run device probes only against a recoverable test device after reviewing the command's mutation and
+cleanup boundaries.
 
 ## Disclaimer
 

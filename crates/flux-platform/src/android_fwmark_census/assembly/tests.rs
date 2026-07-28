@@ -8,13 +8,12 @@ use flux_core::{
     DeviceIdentity, FwmarkNetfilterChainName, FwmarkPacketSelectorDigest, InterfaceAddressFlags,
     InterfaceAddressRecord, InterfaceHardwareType, InterfaceIndex, InterfaceLinkFlags,
     InterfaceLinkRecord, InterfaceName, KernelBuildIdentity, KernelFacts, KernelRelease,
-    LegacyArtifactReadiness, LegacyArtifactResolution, LegacyBridgeFacts, NetworkInventoryTracker,
-    NetworkRuleRecord, Observation, RuleAction, RuleFlags, RuleFwMark, RulePrefix, RulePriority,
-    RuleProperties, RuleProtocol, RuleTableId, SecurityPatchLevel, SelinuxMode,
-    SelinuxPolicyIdentity, Sha256Digest, ToolId, VendorBuildIdentity, VerifiedBootIdentity,
-    VerifiedBootState, assess_android_tproxy_topology_scope, classify_android_rpdb,
-    project_android_net_id_fwmark_census_fragment, project_rpdb_fwmark_census_fragment,
-    select_reviewed_android_mark_policy,
+    NetworkInventoryTracker, NetworkRuleRecord, Observation, RuleAction, RuleFlags, RuleFwMark,
+    RulePrefix, RulePriority, RuleProperties, RuleProtocol, RuleTableId, SecurityPatchLevel,
+    SelinuxMode, SelinuxPolicyIdentity, Sha256Digest, ToolId, VendorBuildIdentity,
+    VerifiedBootIdentity, VerifiedBootState, assess_android_tproxy_topology_scope,
+    classify_android_rpdb, project_android_net_id_fwmark_census_fragment,
+    project_rpdb_fwmark_census_fragment, select_reviewed_android_mark_policy,
 };
 
 use super::super::{existing_flux, nftables, traffic_control_bpf, xfrm};
@@ -75,7 +74,7 @@ fn projection_has_exact_core_source_and_plane_order() {
         FwmarkEvidenceSource::AndroidNetId,
         FwmarkEvidenceSource::Rpdb,
         FwmarkEvidenceSource::DeviceMarkPolicy,
-        FwmarkEvidenceSource::LegacyXtables,
+        FwmarkEvidenceSource::Xtables,
         FwmarkEvidenceSource::Nftables,
         FwmarkEvidenceSource::TrafficControlAndBpf,
         FwmarkEvidenceSource::Xfrm,
@@ -287,7 +286,7 @@ fn global_raw_mark_use_budget_rejects_the_513th_duplicate() {
 #[test]
 fn ordered_write_budget_membership_and_uniqueness_are_enforced() {
     let use_record = mark_use(
-        FwmarkEvidenceSource::LegacyXtables,
+        FwmarkEvidenceSource::Xtables,
         FwmarkPlane::Packet,
         FwmarkUseOperation::MaskedWrite,
         CANDIDATE_MASK,
@@ -382,7 +381,6 @@ fn cross_inventory_profile_capability_namespace_xtables_and_candidate_drift_reje
         fixture.capability_profile.device_identity().clone(),
         fixture.capability_profile.kernel().clone(),
         fixture.capability_profile.selinux().clone(),
-        fixture.capability_profile.legacy_bridge().clone(),
     );
     let changed_capability_existing = test_existing(
         &fixture.inventory,
@@ -810,7 +808,6 @@ fn samsung_capability_profile(network_namespace: NetworkNamespaceIdentity) -> Ca
             KernelRelease::new("5.15.207-Qkernel-ga2c4e0b796").expect("kernel release"),
         )),
         Observation::Verified(SelinuxMode::Enforcing),
-        ready_legacy_bridge(),
     )
 }
 
@@ -820,14 +817,6 @@ fn artifact(digest: [u8; 32], size: u64) -> ArtifactIdentity {
         size,
     )
     .expect("nonempty artifact")
-}
-
-fn ready_legacy_bridge() -> LegacyBridgeFacts {
-    let ready = Observation::Verified(LegacyArtifactReadiness::new(
-        LegacyArtifactResolution::Direct,
-        true,
-    ));
-    LegacyBridgeFacts::new(ready.clone(), ready.clone(), ready)
 }
 
 fn coverage(source: FwmarkEvidenceSource, plane: FwmarkPlane) -> FwmarkCensusCoverageRecord {

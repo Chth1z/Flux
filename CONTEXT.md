@@ -1,195 +1,187 @@
-# Flux Transparent Networking
+# Flux Architecture Context
 
-Flux manages transparent proxy behavior on a rooted Android device while preserving the device's direct-connect behavior outside the configured traffic scope.
+Flux is a pre-release Rust transparent-proxy runtime for rooted Android. Magisk and KernelSU are
+installation and launch envelopes only. One `fluxd` process owns runtime admission, Capture Path
+selection, network mutation, rollback, observation, statistics, and manager-facing control.
 
-## Release model
+## Release Boundary
 
-**Pre-release Rewrite**:
-The current development line may break obsolete internal bridge formats and adapters. Bridge,
-shadow, parity, and migration checkpoints are not releases. Publication begins only after the
-intended runtime is fully Rust-owned, superseded runtime components are absent from the package,
-and the final qualification/provenance gates pass.
-_Avoid_: Bridge release, compatibility release
+**Fresh-install development line**
 
-**Rust-only Release Gate**:
-The release boundary requiring `fluxd` to own every intended runtime responsibility, with only
-platform-required installation, boot, disable, and uninstall glue outside Rust and no shell
-networking policy or cleanup implementation.
-_Avoid_: Packaging pass, staged module
+Flux has no supported pre-release upgrade contract. Internal schemas may change together, and a
+fresh package refuses an existing `/data/adb/flux` tree instead of interpreting unknown state.
+Compatibility aliases, dual readers, transition renderers, and fallback writers are prohibited.
 
-## State and lifecycle
+**Rust runtime boundary**
 
-**Desired State**:
-The complete user-requested Flux behavior, including whether Flux is enabled, which traffic is in scope, and which proxy behavior should apply.
-_Avoid_: Settings, target configuration
+Shell is limited to package installation, boot launch/restart, and uninstall delegation required by
+the root framework. Shell must not classify traffic, write routes or firewall state, retrieve
+subscriptions, compile configuration, observe runtime networks, or clean up owned kernel state.
 
-**Observed State**:
-The facts Flux can verify about the proxy engine, Android networks, and Flux-owned networking state at a point in time.
-_Avoid_: Current config, runtime cache
+**Release qualification boundary**
 
-**Reconciliation**:
-The act of moving Observed State toward Desired State while repairing partial or externally disturbed changes.
-_Avoid_: Restart, apply script
+Host tests prove architecture and mechanism behavior, not Android release readiness. Release
+requires the exact ARM64 payloads on rooted Android 5.10 or newer, across the supported Magisk and
+KernelSU lifecycle matrix, with reviewed rollback and cleanup evidence.
 
-**Generation**:
-An immutable, uniquely identified compilation of Desired State that Flux can prepare, activate, verify, and retire as one logical revision.
-_Avoid_: Cache version, rules file
+## Ownership Model
 
-**Degraded State**:
-A running state in which Flux intentionally provides a documented subset of Desired State because the device lacks an optional capability.
-_Avoid_: Partial success, fallback mode
+**Root framework**
 
-## Traffic model
+Packages files and launches one singleton `fluxd` from minimal idempotent glue. It is not a runtime
+supervisor, capability authority, networking writer, or status source.
 
-**Traffic Scope**:
-The set of device, application, user, interface, address-family, and tethering traffic that Flux is allowed to classify.
-_Avoid_: Match list, app list
+**Flux daemon**
 
-**Traffic Domain**:
-A bounded, explicitly anchored and selector-disjoint portion of Traffic Scope, such as residual local OUTPUT for one family or forwarded traffic from one exact tether ingress. Backend planning may differ by domain only after exhaustive coverage and non-overlap are proven.
-_Avoid_: Rule bucket, interface case
+Owns Desired State, staged native admission, the reactor, Generation compilation, Sing-Box
+supervision, the native network writer, durable recovery, control IPC, and observation publication.
 
-**Capture Policy**:
-The ordered decisions that determine whether in-scope traffic is sent to the Proxy Engine or continues directly.
-_Avoid_: Firewall rules, routing script
+**Proxy engine**
 
-**Capture Program**:
-A deterministic backend-neutral compilation of Capture Policy into separate ordered local-OUTPUT and forwarded-ingress programs, with a canonical mandatory safety baseline, optional inventory-host provenance, bounded resources, and a semantic digest. A Capture Program describes decisions; a backend renderer and an authorized Generation are still required before it can become device state.
-_Avoid_: Restore file, active rules
+Sing-Box remains a descriptor-pinned external process. Flux supplies its accepted configuration and
+supervises its exact identity. Sing-Box route, RPDB, nftables, iptables, and autonomous TUN ownership
+must remain disabled; an eventual managed TUN path passes an externally owned descriptor.
 
-**Shadow Capture Artifact**:
-An observation-only Phase 2 Capture Program used to explain and compare compatibility semantics. A separate Phase 4 lowerer may consume a supported artifact, but does not mutate or promote it. Forwarded-ingress-only lowering preserves the frozen schema-v1 contract; any artifact containing local OUTPUT selects schema v2. The shadow artifact remains distinct from both the canonical xtables artifact and the legacy source-shape renderer and has no Generation ID, Planning Authority, writer token, ownership lease, prepared/active conversion, or functional-canary authority.
-_Avoid_: Dry-run Generation, staged rules
+**Manager**
 
-**Xtables Capture Artifact Set**:
-A deterministic, non-authorizing Phase 4 lowering of an extension-free Capture Program. Forwarded-ingress-only input retains the exact schema-v1 bytes and digests in private `F` chains. Input containing local OUTPUT selects schema v2 and adds private `O` classifier and, when proxying, mark-qualified loopback `P` TPROXY chains plus typed stable-hook selectors, listener, loop-escape, lifecycle-order, identity, and resource metadata. Its policy-routing identity requires nonzero route and rule protocols, an explicit nonzero route metric, IPv4 HOST scope, and IPv6 UNIVERSE scope. Prepare/retire syntax never mutates a built-in hook; the metadata is descriptive only. Established-flow caching, transparent-socket DIVERT, FakeIP ICMP, QUIC rejection, and MSS clamping remain rejected, and the artifact carries no restore execution, readback, rollback, writer, ownership, prepared/active, coordinator, or activation authority.
-_Avoid_: Active rules, native cutover, production local-OUTPUT driver
+The future manager is an unprivileged client of versioned, credential-checked, least-authority IPC.
+It must not execute root shell, read kernel journals directly, or become a second state writer.
 
-**Native Restore Process Adapter**:
-An internal Phase 4 platform primitive used only by the native owner. It admits one coherent trusted
-IPv4/optional-IPv6 command/restore/save multicall set before version execution, pins descriptor and
-byte identity, dispatches the exact logical applet through `argv[0]`, and runs bounded direct-child
-restore or complete save operations. A zero child exit is process evidence only; every restore
-failure after spawn is explicitly `MayHaveMutated` and requires fresh owner readback.
-_Avoid_: Public restore CLI, production activation authority
+## State Model
 
-**Native Xtables Owner**:
-A private deep Module exposing only `converge(target)` and `recover()`. It owns stable
-`FLX{4|6}SP` PREROUTING and `FLX{4|6}SO` OUTPUT roots, generation chains, exact save projection,
-journaled policy-routing netlink, rollback, crash recovery, cleanup, and the component transition
-lease. Its exact routing identity requires nonzero route and rule protocols, an explicit nonzero
-route metric, IPv4 HOST scope, and IPv6 UNIVERSE scope. Durable owner-payload schema 2 also binds a
-domain-separated digest of the complete IPv4/IPv6 route/rule audit and exact loopback name/index
-identity. The owner validates that live identity in both name-to-index and index-to-name directions
-before every policy observation or mutation and audits both xtables families plus both routing
-identities before publishing `Active` or `CleanAbsent`. Internally consistent previous-boot durable
-state is retired only under the writer fence after fresh dual-family absence. A current terminal journal retains that
-fence, the native guard, and any surviving lease until fresh global absence retires the terminal
-artifacts. The exact previous-boot revision-1 `Activating` journal-before-lease boundary is recoverable
-when its native-owner scope is coherent; same-boot or mismatched missing-lease state remains blocking.
-Its real Adapter passes deterministic and rooted disposable-WSA mechanism tests, but positive
-production target admission remains uninhabited until the Android 5.10/ARM64 cutover authorities are
-bound; WSA is not release authority.
-_Avoid_: Raw prepare/activate API, production writer today
+**Desired State**
 
-**Xtables Writer Fence**:
-The shared `xtables-writer.lock/` single-writer boundary used by the private native owner and the
-production shell bridge. A native claim carries a durable scope marker. A canonical shell-owner-v2
-claim carries parent plus optional child PID/`/proc` start-tick identities and one boot ID. Either
-live participant remains busy. One parent-bound mutating `scripts/addrsync` or `scripts/tproxy` phase
-command at a time adds and clears only the child slot; the parent identity is never replaced, a
-surviving phase child remains blocking after parent death, and a live parent may reclaim a dead
-child. Both-dead, PID-reused, or previous-boot ownership may retire only after exact revalidation.
-Bare, mixed, malformed, or otherwise unverifiable state is deliberately not guessed stale. Legacy
-start, stop, restart, and failure cleanup claim this fence before `addrsync` or `tproxy` mutation.
-The long-lived standalone `addrsyncd` daemon remains legacy runtime ownership until its cutover.
-_Avoid_: Advisory mkdir only, best-effort stale-lock deletion
+The complete requested runtime behavior: administrative state, traffic scope, proxy engine input,
+Capture Policy, and safety requirements.
 
-**Legacy Rules Plan**:
-A validated, source-shape-preserving Rust representation of the admitted `scripts/rules` compatibility inputs. It can deterministically emit the same bounded apply/cleanup restore bytes for bridge preparation, including legacy ordering and duplicates, but it is not a lowering of `ShadowCaptureArtifact`, a Generation Capture Program, or mutation authority.
-_Avoid_: Native Capture Program, active backend
+**Observed State**
 
-**Legacy Rules Artifact Receipt**:
-A strict Generation-bound preparation manifest emitted only after one rebuilt `LegacyRulesPlan` exactly matches every staged apply/cleanup artifact for the enabled family set. It binds renderer-owned plan, pair, set, artifact digest, context, and resource identities, but is not a signature, freshness proof, live readback, rollback proof, writer token, activation lease, or kernel acceptance evidence.
-_Avoid_: Qualified Generation, restore verification
+Fresh facts about the boot, namespace, Android device, kernel, network inventory, engine, and
+Flux-owned kernel objects. Missing or lossy evidence cannot authorize mutation.
 
-**Rule Cache Producer**:
-The mutually exclusive compiler identity recorded with shared bridge caches. Rust-owned preparation records `rust` and invokes only `fluxd render-legacy-rules`; explicit legacy ownership records `shell` and alone sources `scripts/rules`. A failed Rust render never silently falls back to the shell producer.
-_Avoid_: Preferred renderer, automatic fallback
+**Capability Profile**
 
-**Package Inventory Snapshot**:
-A bounded immutable byte snapshot produced by `fluxd snapshot-legacy-packages` from one no-follow, regular, descriptor-stable Android package source when application UID resolution is required. All renders in one preparation consume the same snapshot; inactive application selection uses an empty snapshot without reading package state.
-_Avoid_: Live packages.list view, package cache
+Schema 3 identity-bound facts collected for the current boot and network namespace. Kernel version,
+configuration, static installation probes, and root-framework identity establish eligibility only;
+runtime observations establish authority.
 
-**Restore Executor**:
-The component that submits prepared restore bytes to the kernel. During the current bridge, `scripts/tproxy` remains the sole production restore executor and networking writer even when Rust produced the cache bytes. The Native Restore Process Adapter is wired only inside the private `NativeXtablesOwner`; because positive production target admission remains uninhabited, it does not change current production writer ownership.
-_Avoid_: Rule compiler, cache producer
+**Network Inventory**
 
-**Bypass Policy**:
-The portion of Capture Policy that identifies traffic which remains direct. It distinguishes mandatory loop/device-local safety exclusions from configurable private, CGNAT, and other special-use direct defaults.
-_Avoid_: Exclusion list, direct rules
+One reactor-owned, loss-aware stream of links, addresses, routes, and rules. Generation planning and
+address reconciliation consume the same immutable snapshot ID and epoch. Descriptor failure, loss,
+or reset invalidates the source instead of publishing an incomplete view.
 
-**Capture Path**:
-The selected device mechanism that realizes Capture Policy for a Generation.
-_Avoid_: Proxy mode, rule backend
+**Native Admission**
 
-**Proxy Engine**:
-The data-plane program that accepts captured traffic and executes proxy, DNS, and outbound-routing behavior.
-_Avoid_: Core, daemon
+A staged type-state decision. Capability and boot rejection occurs before Desired State or mutation
+inputs are loaded. Configured safety policy is evaluated next. A complete reactor inventory is the
+final prerequisite. The result is the sole authority projected into composition, mutation control,
+status, and recovery.
 
-**Compatibility Oracle**:
-The frozen shell networking behavior and pinned fixtures used to review Rust replacement behavior
-during pre-release development. `scripts/rules` is executed only under explicit legacy ownership as
-the rollback producer; under Rust ownership it is retained but not sourced. The shell restore path
-remains the sole production networking writer until ownership transfers through a component-
-specific cutover gate, then the replaced component is removed promptly. The oracle is never a
-release architecture.
-_Avoid_: Second backend, permanent shell path
+**Generation**
 
-## Device model
+An immutable Desired State realization bound to exact engine input, Capture Program, Android mark
+and RPDB planning authority, native target identity, inventory evidence, and a unique generation ID.
+Only the Runtime Coordinator may prepare, publish, verify, replace, or retire it.
 
-**Network Epoch**:
-A period during which the Android network topology relevant to Flux is stable; a material topology change begins a new epoch.
-_Avoid_: Interface event, resync window
+RPDB placement represents the address-bypass priority as optional state. Proxy-only placement has
+no fabricated bypass value or parallel boolean, and Generation identity tags presence explicitly.
 
-**Capability Profile**:
-Freshness-bound facts about what the current device permits Flux to use, distinct from what its
-kernel version or configuration merely claims to support. Schema 2 can retain exact Android
-product/build/vendor/security-patch, verified-boot/vbmeta, kernel-build, SELinux-policy,
-netd/Connectivity, tool-artifact, boot, and network-namespace identity; an unavailable observation
-cannot authorize a device-qualified mark policy.
-_Avoid_: Kernel flags, device preset
+## Traffic Model
 
-**Engine Capability Profile**:
-Verified, version-qualified facts about what the exact Proxy Engine binary and configuration dialect permit Flux to stage, supervise, and hand off.
-_Avoid_: Sing-Box version check, engine feature flags
+**Traffic Scope**
 
-**Kernel Extension Profile**:
-Freshness-bound identity, protocol, semantics, and canary evidence for an already-loaded reviewed OEM/custom-kernel extension. It never authorizes Flux to load or unload a module and never replaces a conventional correctness path.
-_Avoid_: Module detected, kernel plugin available
+The selected address families and disjoint traffic domains. Current production planning requires
+residual local OUTPUT and rejects forwarded ingress; the backend-neutral model and lowerer retain
+forwarded-ingress semantics for later qualified ownership.
 
-**Backend Plan**:
-The explainable selection of a Capture Path and supporting mechanisms for one Capability Profile, Engine Capability Profile, and Desired State.
-_Avoid_: Auto mode, fallback chain
+**Capture Policy**
 
-**Managed Object**:
-A device networking object that Flux can identify as its own, reconstruct from a Generation, and safely remove without disturbing Android-owned state.
-_Avoid_: Flux rule, temporary state
+Ordered direct/proxy decisions: loop prevention, mandatory safety exclusions, configured bypasses,
+inventory-derived host bypasses, interface roles, application UIDs, protocol safety, proxy action,
+and direct default.
 
-**Planning Authority**:
-Freshness-bound positive evidence that permits a later pure planning step while exposing every remaining prerequisite; it is never an activation lease or mutation capability.
-_Avoid_: Approval, safe-to-apply flag
+**Capture Program**
 
-**Device-qualified Mark Grant**:
-An externally established cooperative device-policy assertion binding one exact mark candidate to its topology, Capability Profile, boot, network namespace, policy artifact, revision, and storage planes.
-_Avoid_: Free bits, expert override
+The current backend-neutral compilation Interface. `CaptureProgramRequest` compiles into one
+`CaptureProgramCompilation`, whose `CaptureProgram` contains canonical domain programs, bounded
+resource usage, schema 1, and a semantic digest. Inventory provenance is retained beside the program
+and deliberately excluded from the semantic digest.
 
-**Mark Census**:
-A bounded, consumed point-in-time assertion covering every required mark source and packet, socket, and conntrack plane, including explicit complete absence.
-_Avoid_: Mark cache, available-bit scan
+**Xtables lowering**
 
-## Configuration sources
+One schema-2 lowering converts a Capture Program into immutable IPv4/IPv6 private-chain artifacts,
+typed entry points, exact local-listener and routing requirements, mandatory transaction ordering,
+resource usage, and domain-separated identities. There is no forwarded-only compatibility schema.
 
-**Subscription Snapshot**:
-An immutable, validated set of proxy endpoints produced from one subscription retrieval before it is merged into Desired State.
-_Avoid_: Downloaded config, node file
+**Native xtables owner**
+
+A private deep Module with convergence and recovery as its external Interface. It owns stable
+`FLX{4|6}SP` and `FLX{4|6}SO` roots, generation chains, exact save projections, policy-routing
+netlink mutation, durable target material, writer lease, rollback, crash recovery, and verified
+cleanup. Unknown, mixed, corrupt, or unjournaled Flux state fails closed.
+
+**Capture Path**
+
+The selected mechanism that realizes Capture Policy. Xtables TPROXY is the only composed native
+writer today. Nftables, managed TUN, and eBPF remain future adapters and must not be selected until
+their exact implementation and device evidence qualify them.
+
+## Lifecycle
+
+Startup is ordered as follows:
+
+1. Collect the Capability Profile and evaluate capability admission.
+2. Load Desired State only for a capability-admissible candidate and evaluate safety policy.
+3. Open the reactor, attach and prime its network inventory driver, and obtain a complete snapshot.
+4. Finalize `AdmittedNativeRuntime`.
+5. Run native startup recovery only after final admission.
+6. Compose planning, native ownership, engine supervision, and Runtime Control.
+7. Bind control IPC after composition is complete.
+
+A rejected daemon remains queryable and read-only. Mutation commands return the typed admission
+reason. Process-directed `SIGTERM` is consumed through `signalfd`, runtime cleanup completes, and the
+control socket is removed.
+
+Runtime replacement follows prepare, exact engine readiness, capture convergence, readback,
+optional functional verification, publication, and old-generation retirement. Every failure after a
+possibly mutating boundary requires fresh readback and rollback or durable recovery state.
+
+## Safety Policy
+
+Packaged defaults set both `respect_android_vpn` and `require_functional_canary` to `true`. No
+qualified Android VPN-policy or production functional-canary adapter is currently packaged, so the
+default configuration intentionally rejects mutation while retaining read-only control. Setting a
+requirement to `false` selects structural verification only; it is an explicit policy decision, not
+a silent fallback.
+
+The production functional-canary adapter must prove exact local-OUTPUT TPROXY delivery to the
+transparent listener and supervised engine, bind pre/post identity and counter bounds, and prove
+cleanup. Route lookups, counters alone, REDIRECT, DNAT, or unrelated ingress traffic are not
+substitutes.
+
+## Observation Model
+
+The reactor uses bounded readiness work, bounded worker concurrency, immutable replacement
+snapshots, explicit degradation, and loss/reset semantics. Statistics should default to aggregate,
+privacy-reduced counters with explicit CPU, memory, wakeup, retention, and disk budgets. Per-flow or
+PII-rich observation requires an explicit product and privacy contract.
+
+## Peer-Derived Decisions
+
+- Adopt dae's prepare/ready/commit/retire and bounded pending-reload ideas, not its global BPF or
+  namespace ownership.
+- Use Sing-Box TPROXY listener behavior and external-descriptor TUN only; reject autonomous host
+  mutation.
+- Use Vector's typed IPC and replacement publication as references, but keep the manager strictly
+  less privileged.
+- Treat Magisk and KernelSU as launch envelopes, not supervisors.
+- Treat Re-Kernel as bounded-observation evidence only, never as a dependency or Capture Path.
+- Borrow bindhosts workflows and atomic publication lessons, not its shell/file writer model.
+
+## Current External Gate
+
+The shell networking and standalone `addrsyncd` migration is complete in executable production
+source. The remaining release gate is not migration cleanup: it is implementation and physical
+qualification of the Android VPN-policy and functional-canary adapters, followed by exact ARM64
+native activation, rollback, power, and cleanup evidence.

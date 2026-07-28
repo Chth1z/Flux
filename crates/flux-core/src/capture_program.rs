@@ -9,8 +9,8 @@ use crate::address_bypass::{AddressHostFamilySelection, AddressHostSetPlan};
 use crate::network_inventory::{InterfaceName, NetworkEpoch, NetworkInventorySnapshotId};
 use crate::network_route::NetworkAddressFamily;
 
-/// Schema version for the pure, non-authorizing shadow Capture Program.
-pub const SHADOW_CAPTURE_PROGRAM_SCHEMA_VERSION: u16 = 1;
+/// Schema version for the backend-neutral Capture Program.
+pub const CAPTURE_PROGRAM_SCHEMA_VERSION: u16 = 1;
 /// Compiled maximum for normalized destination prefixes in each address family.
 pub const MAX_CAPTURE_POLICY_PREFIXES_PER_FAMILY: usize = 65_536;
 /// Absolute raw-input ceiling for configurable destination prefixes across both families.
@@ -22,7 +22,7 @@ pub const MAX_CAPTURE_INTERFACE_SELECTORS: usize = 128;
 /// Compiled maximum for inventory-derived host bypasses in each address family.
 pub const MAX_CAPTURE_HOST_ADDRESSES_PER_FAMILY: usize = 4_096;
 
-const CAPTURE_PROGRAM_DIGEST_DOMAIN: &[u8] = b"Flux shadow Capture Program\0canonical-schema-v1\0";
+const CAPTURE_PROGRAM_DIGEST_DOMAIN: &[u8] = b"Flux Capture Program\0canonical-schema-v1\0";
 
 const MANDATORY_IPV4_PREFIX_SPECS: &[(u32, u8)] = &[
     (0x0000_0000, 8),
@@ -85,16 +85,14 @@ impl CaptureGroupId {
     }
 }
 
-/// Exact compatibility credentials used by the shipped owner-match loop bypass.
-///
-/// This is an explicit legacy assumption, not native socket/process loop-prevention authority.
+/// Exact engine credentials used by the owner-match loop-prevention predicate.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct CompatibilityEngineCredentials {
+pub struct EngineCredentials {
     uid: CaptureUserId,
     gid: CaptureGroupId,
 }
 
-impl CompatibilityEngineCredentials {
+impl EngineCredentials {
     #[must_use]
     pub const fn new(uid: CaptureUserId, gid: CaptureGroupId) -> Self {
         Self { uid, gid }
@@ -117,7 +115,7 @@ pub enum CaptureTrafficDomain {
     ForwardedIngress,
 }
 
-/// Nonempty family/domain selection for shadow compilation.
+/// Nonempty family/domain selection for Capture Program compilation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CaptureTrafficScope {
     families: AddressHostFamilySelection,
@@ -180,7 +178,7 @@ impl Error for CaptureTrafficScopeError {}
 /// Family-preserving IP prefix used by packet-classification policy.
 ///
 /// Unlike routing-address normalization, an IPv4-mapped IPv6 prefix remains IPv6 because the
-/// legacy IPv6 classifier intentionally carries `::ffff:0:0/96`.
+/// Capture Program intentionally carries `::ffff:0:0/96`.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct CaptureIpPrefix {
     network: IpAddr,
@@ -387,7 +385,7 @@ impl CaptureInterfaceSelector {
     }
 }
 
-/// Canonical interface roles mirrored from the shipped compatibility settings.
+/// Canonical interface roles used by Capture Program policy.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CaptureInterfacePolicy {
     excluded: Box<[CaptureInterfaceSelector]>,
@@ -776,11 +774,11 @@ impl fmt::Display for CaptureProgramBudgetError {
 
 impl Error for CaptureProgramBudgetError {}
 
-/// Pure inputs to the shadow compiler.
+/// Pure inputs to Capture Program compilation.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ShadowCaptureProgramRequest {
+pub struct CaptureProgramRequest {
     scope: CaptureTrafficScope,
-    engine_credentials: CompatibilityEngineCredentials,
+    engine_credentials: EngineCredentials,
     configured_bypass: CaptureBypassPolicy,
     host_bypass: Option<AddressHostSetPlan>,
     interfaces: CaptureInterfacePolicy,
@@ -789,11 +787,11 @@ pub struct ShadowCaptureProgramRequest {
     budget: CaptureProgramBudget,
 }
 
-impl ShadowCaptureProgramRequest {
+impl CaptureProgramRequest {
     #[must_use]
     pub const fn new(
         scope: CaptureTrafficScope,
-        engine_credentials: CompatibilityEngineCredentials,
+        engine_credentials: EngineCredentials,
         configured_bypass: CaptureBypassPolicy,
         host_bypass: Option<AddressHostSetPlan>,
         interfaces: CaptureInterfacePolicy,
@@ -854,7 +852,7 @@ pub enum CaptureInterfaceDirection {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CapturePredicate {
     Any,
-    EngineCredentials(CompatibilityEngineCredentials),
+    EngineCredentials(EngineCredentials),
     DestinationPrefixes(Box<[CaptureIpPrefix]>),
     DestinationHosts(Box<[IpAddr]>),
     InterfaceMatches {
@@ -1002,16 +1000,16 @@ impl CaptureProgramResourceUsage {
     }
 }
 
-/// Pure shadow artifact. There is intentionally no conversion into a Generation or writer token.
+/// Backend-neutral policy compiled for one Desired State.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ShadowCaptureArtifact {
+pub struct CaptureProgram {
     schema_version: u16,
     programs: Box<[CaptureDomainProgram]>,
     digest: CaptureProgramDigest,
     usage: CaptureProgramResourceUsage,
 }
 
-impl ShadowCaptureArtifact {
+impl CaptureProgram {
     #[must_use]
     pub const fn schema_version(&self) -> u16 {
         self.schema_version
@@ -1034,13 +1032,13 @@ impl ShadowCaptureArtifact {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ShadowAddressHostSetProvenance {
+pub struct AddressHostSetProvenance {
     snapshot_id: NetworkInventorySnapshotId,
     epoch: NetworkEpoch,
     families: AddressHostFamilySelection,
 }
 
-impl ShadowAddressHostSetProvenance {
+impl AddressHostSetProvenance {
     #[must_use]
     pub const fn snapshot_id(self) -> NetworkInventorySnapshotId {
         self.snapshot_id
@@ -1057,74 +1055,27 @@ impl ShadowAddressHostSetProvenance {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub enum ShadowCompatibilityAssumption {
-    CompatibilityEngineUidGidBypass,
-    InventoryHostBypassProjection,
-    LegacyInterfacePrefixMatching,
-    LegacyLoopbackInterfaceName,
-    ResolvedApplicationUidInventory,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub enum ShadowDeferredPrerequisite {
-    AndroidMarkAndRpdbAuthority,
-    BackendRenderingAndReadback,
-    EstablishedFlowDecisionCache,
-    ExactControlAndEngineLoopPrevention,
-    GenerationActivation,
-    HostSetFreshnessAtGenerationFinalization,
-    InventoryHostBypassObservation,
-    KernelWriterOwnership,
-    LegacyOracleParity,
-    ProtocolSpecificCompatibilityRules,
-}
-
-/// Diagnostic-only result of shadow compilation.
+/// Compiled policy plus the inventory provenance excluded from its semantic digest.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ShadowCompilationReport {
-    artifact: ShadowCaptureArtifact,
-    budget: CaptureProgramBudget,
-    host_set_provenance: Option<ShadowAddressHostSetProvenance>,
-    missing_host_observation_families: Box<[NetworkAddressFamily]>,
-    compatibility_assumptions: Box<[ShadowCompatibilityAssumption]>,
-    deferred_prerequisites: Box<[ShadowDeferredPrerequisite]>,
+pub struct CaptureProgramCompilation {
+    program: CaptureProgram,
+    address_host_set_provenance: Option<AddressHostSetProvenance>,
 }
 
-impl ShadowCompilationReport {
+impl CaptureProgramCompilation {
     #[must_use]
-    pub const fn artifact(&self) -> &ShadowCaptureArtifact {
-        &self.artifact
+    pub const fn program(&self) -> &CaptureProgram {
+        &self.program
     }
 
     #[must_use]
-    pub const fn budget(&self) -> CaptureProgramBudget {
-        self.budget
-    }
-
-    #[must_use]
-    pub const fn host_set_provenance(&self) -> Option<ShadowAddressHostSetProvenance> {
-        self.host_set_provenance
-    }
-
-    #[must_use]
-    pub fn missing_host_observation_families(&self) -> &[NetworkAddressFamily] {
-        &self.missing_host_observation_families
-    }
-
-    #[must_use]
-    pub fn compatibility_assumptions(&self) -> &[ShadowCompatibilityAssumption] {
-        &self.compatibility_assumptions
-    }
-
-    #[must_use]
-    pub fn deferred_prerequisites(&self) -> &[ShadowDeferredPrerequisite] {
-        &self.deferred_prerequisites
+    pub const fn address_host_set_provenance(&self) -> Option<AddressHostSetProvenance> {
+        self.address_host_set_provenance
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ShadowCaptureCompileError {
+pub enum CaptureProgramCompileError {
     ResourceBudgetExceeded {
         resource: CaptureProgramResourceKind,
         family: Option<NetworkAddressFamily>,
@@ -1133,7 +1084,7 @@ pub enum ShadowCaptureCompileError {
     },
 }
 
-impl fmt::Display for ShadowCaptureCompileError {
+impl fmt::Display for CaptureProgramCompileError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ResourceBudgetExceeded {
@@ -1145,12 +1096,12 @@ impl fmt::Display for ShadowCaptureCompileError {
                 if let Some(family) = family {
                     write!(
                         formatter,
-                        "shadow Capture Program requires {required_at_least} {resource:?} for {family:?} but its budget is {maximum}"
+                        "Capture Program requires {required_at_least} {resource:?} for {family:?} but its budget is {maximum}"
                     )
                 } else {
                     write!(
                         formatter,
-                        "shadow Capture Program requires {required_at_least} {resource:?} but its budget is {maximum}"
+                        "Capture Program requires {required_at_least} {resource:?} but its budget is {maximum}"
                     )
                 }
             }
@@ -1158,13 +1109,13 @@ impl fmt::Display for ShadowCaptureCompileError {
     }
 }
 
-impl Error for ShadowCaptureCompileError {}
+impl Error for CaptureProgramCompileError {}
 
 /// Compile deterministic, ordered, non-authorizing target policy without performing I/O.
-pub fn compile_shadow_capture_program(
-    request: ShadowCaptureProgramRequest,
-) -> Result<ShadowCompilationReport, ShadowCaptureCompileError> {
-    let ShadowCaptureProgramRequest {
+pub fn compile_capture_program(
+    request: CaptureProgramRequest,
+) -> Result<CaptureProgramCompilation, CaptureProgramCompileError> {
+    let CaptureProgramRequest {
         scope,
         engine_credentials,
         configured_bypass,
@@ -1272,72 +1223,20 @@ pub fn compile_shadow_capture_program(
     };
 
     let digest = digest_programs(&programs);
-    let host_set_provenance = host_bypass
-        .as_ref()
-        .map(|plan| ShadowAddressHostSetProvenance {
-            snapshot_id: plan.snapshot_id(),
-            epoch: plan.epoch(),
-            families: plan.families(),
-        });
-    let missing_host_observation_families =
-        [NetworkAddressFamily::Ipv4, NetworkAddressFamily::Ipv6]
-            .into_iter()
-            .filter(|family| scope.includes_family(*family))
-            .filter(|family| {
-                host_bypass
-                    .as_ref()
-                    .is_none_or(|plan| !plan.families().includes(*family))
-            })
-            .collect::<Vec<_>>();
+    let address_host_set_provenance = host_bypass.as_ref().map(|plan| AddressHostSetProvenance {
+        snapshot_id: plan.snapshot_id(),
+        epoch: plan.epoch(),
+        families: plan.families(),
+    });
 
-    let mut assumptions = Vec::new();
-    if scope.includes_domain(CaptureTrafficDomain::LocalOutput) {
-        assumptions.push(ShadowCompatibilityAssumption::CompatibilityEngineUidGidBypass);
-    }
-    if scope.includes_domain(CaptureTrafficDomain::ForwardedIngress) {
-        assumptions.push(ShadowCompatibilityAssumption::LegacyLoopbackInterfaceName);
-    }
-    if application_uids != 0 {
-        assumptions.push(ShadowCompatibilityAssumption::ResolvedApplicationUidInventory);
-    }
-    if emitted_interface_prefix_matching(&programs) {
-        assumptions.push(ShadowCompatibilityAssumption::LegacyInterfacePrefixMatching);
-    }
-    if family_inputs.iter().any(|input| !input.hosts.is_empty()) {
-        assumptions.push(ShadowCompatibilityAssumption::InventoryHostBypassProjection);
-    }
-    assumptions.sort_unstable();
-
-    let mut deferred = vec![
-        ShadowDeferredPrerequisite::AndroidMarkAndRpdbAuthority,
-        ShadowDeferredPrerequisite::BackendRenderingAndReadback,
-        ShadowDeferredPrerequisite::EstablishedFlowDecisionCache,
-        ShadowDeferredPrerequisite::ExactControlAndEngineLoopPrevention,
-        ShadowDeferredPrerequisite::GenerationActivation,
-        ShadowDeferredPrerequisite::KernelWriterOwnership,
-        ShadowDeferredPrerequisite::LegacyOracleParity,
-        ShadowDeferredPrerequisite::ProtocolSpecificCompatibilityRules,
-    ];
-    if host_set_provenance.is_some() {
-        deferred.push(ShadowDeferredPrerequisite::HostSetFreshnessAtGenerationFinalization);
-    }
-    if !missing_host_observation_families.is_empty() {
-        deferred.push(ShadowDeferredPrerequisite::InventoryHostBypassObservation);
-    }
-    deferred.sort_unstable();
-
-    Ok(ShadowCompilationReport {
-        artifact: ShadowCaptureArtifact {
-            schema_version: SHADOW_CAPTURE_PROGRAM_SCHEMA_VERSION,
+    Ok(CaptureProgramCompilation {
+        program: CaptureProgram {
+            schema_version: CAPTURE_PROGRAM_SCHEMA_VERSION,
             programs: programs.into_boxed_slice(),
             digest,
             usage,
         },
-        budget,
-        host_set_provenance,
-        missing_host_observation_families: missing_host_observation_families.into_boxed_slice(),
-        compatibility_assumptions: assumptions.into_boxed_slice(),
-        deferred_prerequisites: deferred.into_boxed_slice(),
+        address_host_set_provenance,
     })
 }
 
@@ -1363,7 +1262,7 @@ impl FamilyProgramInput {
 
 fn build_local_program(
     input: &FamilyProgramInput,
-    engine_credentials: CompatibilityEngineCredentials,
+    engine_credentials: EngineCredentials,
     interfaces: &CaptureInterfacePolicy,
     applications: &CaptureApplicationPolicy,
     proxy_protocols: CaptureProtocolSet,
@@ -1604,28 +1503,14 @@ fn emitted_interface_selectors(programs: &[CaptureDomainProgram]) -> usize {
         .len()
 }
 
-fn emitted_interface_prefix_matching(programs: &[CaptureDomainProgram]) -> bool {
-    programs
-        .iter()
-        .flat_map(|program| program.clauses.iter())
-        .filter(|clause| clause.stage == CaptureDecisionStage::InterfaceRole)
-        .any(|clause| match &clause.predicate {
-            CapturePredicate::InterfaceMatches { selectors, .. }
-            | CapturePredicate::InterfaceDoesNotMatch { selectors, .. } => selectors
-                .iter()
-                .any(|selector| selector.kind() == CaptureInterfaceSelectorKind::Prefix),
-            _ => false,
-        })
-}
-
 fn ensure_family_budget(
     resource: CaptureProgramResourceKind,
     family: NetworkAddressFamily,
     maximum: usize,
     required: usize,
-) -> Result<(), ShadowCaptureCompileError> {
+) -> Result<(), CaptureProgramCompileError> {
     if required > maximum {
-        Err(ShadowCaptureCompileError::ResourceBudgetExceeded {
+        Err(CaptureProgramCompileError::ResourceBudgetExceeded {
             resource,
             family: Some(family),
             maximum,
@@ -1640,9 +1525,9 @@ fn ensure_budget(
     resource: CaptureProgramResourceKind,
     maximum: usize,
     required: usize,
-) -> Result<(), ShadowCaptureCompileError> {
+) -> Result<(), CaptureProgramCompileError> {
     if required > maximum {
-        Err(ShadowCaptureCompileError::ResourceBudgetExceeded {
+        Err(CaptureProgramCompileError::ResourceBudgetExceeded {
             resource,
             family: None,
             maximum,
@@ -1731,7 +1616,7 @@ fn canonical_hosts(
 fn digest_programs(programs: &[CaptureDomainProgram]) -> CaptureProgramDigest {
     let mut digest = Sha256::new();
     digest.update(CAPTURE_PROGRAM_DIGEST_DOMAIN);
-    digest.update(SHADOW_CAPTURE_PROGRAM_SCHEMA_VERSION.to_be_bytes());
+    digest.update(CAPTURE_PROGRAM_SCHEMA_VERSION.to_be_bytes());
     digest.update(length_bytes(programs.len()));
     for program in programs {
         digest.update([family_tag(program.family)]);

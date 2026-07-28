@@ -14,7 +14,7 @@ use serde::Deserialize;
 
 use crate::capture_program::{
     CaptureApplicationMode, CaptureBypassPolicy, CaptureInterfacePolicy, CaptureInterfaceSelector,
-    CaptureIpPrefix, CaptureProtocolSet, CaptureTrafficScope, CompatibilityEngineCredentials,
+    CaptureIpPrefix, CaptureProtocolSet, CaptureTrafficScope, EngineCredentials,
     MAX_CAPTURE_INTERFACE_SELECTORS, MAX_CAPTURE_POLICY_PREFIX_INPUTS,
 };
 use crate::network_inventory::InterfaceName;
@@ -378,7 +378,7 @@ impl DaemonConfig {
 pub struct EngineConfig {
     binary: PathBuf,
     template: PathBuf,
-    credentials: CompatibilityEngineCredentials,
+    credentials: EngineCredentials,
     startup_timeout: Duration,
     stop_timeout: Duration,
     restart: EngineRestartConfig,
@@ -400,7 +400,7 @@ impl EngineConfig {
         Ok(Self {
             binary: absolute_path("engine.binary", raw.binary)?,
             template: absolute_path("engine.template", raw.template)?,
-            credentials: CompatibilityEngineCredentials::new(uid, gid),
+            credentials: EngineCredentials::new(uid, gid),
             startup_timeout: bounded_duration_ms(
                 "engine.startup_timeout_ms",
                 raw.startup_timeout_ms,
@@ -426,7 +426,7 @@ impl EngineConfig {
     }
 
     #[must_use]
-    pub const fn credentials(&self) -> CompatibilityEngineCredentials {
+    pub const fn credentials(&self) -> EngineCredentials {
         self.credentials
     }
 

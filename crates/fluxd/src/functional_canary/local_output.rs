@@ -1,15 +1,15 @@
 //! Fail-closed local-OUTPUT functional-canary executor boundary.
 //!
-//! The selected request backend is always TPROXY. The current xtables capture
-//! program can mark local OUTPUT, but it does not implement or authorize the
-//! complete route-recomputed local path through loopback into a mark-qualified
-//! PREROUTING TPROXY rule and the exact transparent listener. Consequently the
-//! xtables driver below has no prepared-attempt value and reports `Unsupported`
-//! before it can acquire a networking writer or mutate capture state.
+//! The selected request backend is always TPROXY. Native composition owns the
+//! complete local-OUTPUT transaction, but the packaged Android adapter has no
+//! device-qualified direct observer capable of proving that transaction reached
+//! the exact transparent listener and supervised engine. Consequently the
+//! adapter below has no prepared-attempt value and reports `Unsupported` before
+//! it opens request-scoped process authority.
 //!
 //! Future device-specific drivers return unverified capture proof, process
 //! proof, and raw observations. Separate sealed verifiers must bind both proof
-//! domains to the immutable request before promotion into schema-v2 gate
+//! domains to the immutable request before promotion into gate
 //! evidence, so a driver cannot self-label REDIRECT, DNAT, ingress traffic,
 //! counters, a route lookup, or copied process identities as authoritative
 //! local-OUTPUT TPROXY evidence.
@@ -33,15 +33,14 @@ use super::{
     UnqualifiedFunctionalCanaryExecutor, bounded_prefix,
 };
 
-const XTABLES_LOCAL_OUTPUT_UNSUPPORTED: &str = "the current xtables driver has no authorized complete local-OUTPUT transaction: MARK-only OUTPUT lacks the reviewed RPDB local route, loopback-reachable mark-qualified PREROUTING TPROXY rule, exact transparent-listener delivery, loop escape, and cleanup proof; REDIRECT, DNAT, unrelated ingress traffic, counters, and route lookups are prohibited substitutes";
+const XTABLES_LOCAL_OUTPUT_UNSUPPORTED: &str = "the packaged xtables functional-canary adapter has no device-qualified direct observer for the active local-OUTPUT transaction: exact transparent-listener delivery, supervised-engine receipt, counter bounds, identity stability, and cleanup proof remain required; REDIRECT, DNAT, unrelated ingress traffic, counters alone, and route lookups are prohibited substitutes";
 const NON_TPROXY_REQUEST: &str =
     "the local-OUTPUT functional-canary executor accepts only the request-selected TPROXY backend";
 
 /// Build the deliberately unsupported xtables local-OUTPUT executor.
 ///
-/// This function is production-compiled so runtime composition has one
-/// explicit fail-closed seam when required mode is wired later. The current
-/// daemon deliberately continues to select structural-only compatibility.
+/// This function is production-compiled so native admission has one explicit fail-closed seam.
+/// Admission does not construct it until an Android adapter has been device-qualified.
 #[allow(dead_code)]
 pub(crate) fn xtables_tproxy_local_output_executor() -> Box<dyn UnqualifiedFunctionalCanaryExecutor>
 {
@@ -74,7 +73,7 @@ impl<D, C, P, F> TproxyLocalOutputExecutor<D, C, P, F> {
 trait TproxyLocalOutputDriver: Send + 'static {
     type Prepared: PreparedTproxyLocalOutputAttempt;
 
-    /// Complete read-only backend availability and compatibility checks before
+    /// Complete read-only backend availability and prerequisite checks before
     /// opening any request-scoped process authority.
     fn check_tproxy_local_output(
         &self,
@@ -1947,9 +1946,8 @@ fn contract_failure(
     FunctionalCanaryError::new(kind, cleanup, &diagnostic)
 }
 
-/// The current xtables driver has not implemented or device-qualified the
-/// complete local-OUTPUT TPROXY transaction. This zero-state driver
-/// intentionally owns no mutation handle.
+/// The packaged adapter has no device-qualified direct-observation implementation. This
+/// zero-state driver intentionally owns no mutation handle.
 #[derive(Clone, Copy, Debug, Default)]
 struct XtablesTproxyLocalOutputDriver;
 
@@ -2301,8 +2299,17 @@ mod tests {
             CanaryErrorKind::Availability(CanaryAvailability::Unsupported)
         );
         assert_eq!(error.cleanup(), CanaryCleanupStatus::NotRequired);
-        assert!(error.diagnostic().contains("no authorized complete"));
-        assert!(error.diagnostic().contains("loopback-reachable"));
+        assert!(
+            error
+                .diagnostic()
+                .contains("no device-qualified direct observer")
+        );
+        assert!(
+            error
+                .diagnostic()
+                .contains("exact transparent-listener delivery")
+        );
+        assert!(error.diagnostic().contains("supervised-engine receipt"));
         assert!(error.diagnostic().contains("prohibited substitutes"));
     }
 

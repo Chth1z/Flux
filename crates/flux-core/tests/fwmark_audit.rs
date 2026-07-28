@@ -119,7 +119,7 @@ fn conflict_free_rpdb_evidence_remains_explicitly_incomplete() {
                 FwmarkEvidenceState::Unavailable,
             ),
             (
-                FwmarkEvidenceSource::LegacyXtables,
+                FwmarkEvidenceSource::Xtables,
                 FwmarkEvidenceState::Unavailable,
             ),
             (

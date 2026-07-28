@@ -6,10 +6,9 @@ use std::time::Duration;
 use flux_core::{
     AddressHostFamilySelection, CaptureApplicationMode, CaptureApplicationPolicy,
     CaptureBypassPolicy, CaptureGroupId, CaptureInterfacePolicy, CaptureInterfaceSelector,
-    CaptureIpPrefix, CaptureProtocolSet, CaptureTrafficScope, CaptureUserId,
-    CompatibilityEngineCredentials, FwmarkCandidate, InterfaceIndex, InterfaceName, RouteProtocol,
-    RouteTableId, RulePriority, RuleProtocol, ShadowCaptureProgramRequest,
-    compile_shadow_capture_program,
+    CaptureIpPrefix, CaptureProgramRequest, CaptureProtocolSet, CaptureTrafficScope, CaptureUserId,
+    EngineCredentials, FwmarkCandidate, InterfaceIndex, InterfaceName, RouteProtocol, RouteTableId,
+    RulePriority, RuleProtocol, compile_capture_program,
 };
 use tempfile::TempDir;
 
@@ -1661,9 +1660,9 @@ fn lowered_artifacts(
 ) -> XtablesCaptureArtifactSet {
     let scope = CaptureTrafficScope::new(families, true, forwarded_ingress).unwrap();
     let forwarded = forwarded_ingress.then_some(exact("wlan0"));
-    let program = compile_shadow_capture_program(ShadowCaptureProgramRequest::new(
+    let program = compile_capture_program(CaptureProgramRequest::new(
         scope,
-        CompatibilityEngineCredentials::new(uid(1000), gid(1000)),
+        EngineCredentials::new(uid(1000), gid(1000)),
         CaptureBypassPolicy::new(std::iter::empty::<CaptureIpPrefix>()).unwrap(),
         None,
         CaptureInterfacePolicy::new([], forwarded, []).unwrap(),
@@ -1673,7 +1672,7 @@ fn lowered_artifacts(
     .unwrap();
     lower_xtables_capture(
         XtablesCaptureLoweringRequest::new(
-            program.artifact(),
+            program.program(),
             XtablesCaptureNamespace::new(NonZeroU32::new(generation).unwrap()),
             XtablesTproxyTarget::new(
                 NonZeroU16::new(1536).unwrap(),

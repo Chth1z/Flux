@@ -18,17 +18,15 @@ use crate::{
     FwmarkPacketSelectorDigest, FwmarkPartialAuditOutcome, FwmarkPlane, FwmarkPlaneSet,
     FwmarkUseOperation, FwmarkUseRecord, FwmarkUseRecordError, InterfaceHardwareType,
     InterfaceIndex, InterfaceLinkFlags, InterfaceLinkRecord, InterfaceName, KernelBuildIdentity,
-    KernelFacts, KernelRelease, LegacyAddressSynchronization, LegacyArtifactReadiness,
-    LegacyArtifactResolution, LegacyBridgeFacts, LegacyMutationWriter, LegacyRuleBackend,
-    MAX_ANDROID_MARK_DEVICE_POLICY_NAME_BYTES, MAX_COMPLETE_FWMARK_CENSUS_MARK_USES,
-    NetworkAddressFamily, NetworkInventory, NetworkInventoryTracker, NetworkNamespaceIdentity,
-    NetworkRuleRecord, Observation, OpaqueRuleAttribute, OwnershipJournalIdentity,
-    OwnershipJournalIdentityError, OwnershipJournalRevision, RuleAction, RuleAttributeOpacity,
-    RuleFlags, RuleFwMark, RuleOpaqueAttributeFingerprint, RulePrefix, RulePriority,
-    RuleProperties, RuleProtocol, RuleTableId, SecurityPatchLevel, SelinuxMode,
-    SelinuxPolicyIdentity, Sha256Digest, ToolId, VendorBuildIdentity, VerifiedBootIdentity,
-    VerifiedBootState, assess_android_tproxy_topology_scope, authorize_android_mark_planning,
-    classify_android_rpdb,
+    KernelFacts, KernelRelease, MAX_ANDROID_MARK_DEVICE_POLICY_NAME_BYTES,
+    MAX_COMPLETE_FWMARK_CENSUS_MARK_USES, NetworkAddressFamily, NetworkInventory,
+    NetworkInventoryTracker, NetworkNamespaceIdentity, NetworkRuleRecord, Observation,
+    OpaqueRuleAttribute, OwnershipJournalIdentity, OwnershipJournalIdentityError,
+    OwnershipJournalRevision, RuleAction, RuleAttributeOpacity, RuleFlags, RuleFwMark,
+    RuleOpaqueAttributeFingerprint, RulePrefix, RulePriority, RuleProperties, RuleProtocol,
+    RuleTableId, SecurityPatchLevel, SelinuxMode, SelinuxPolicyIdentity, Sha256Digest, ToolId,
+    VendorBuildIdentity, VerifiedBootIdentity, VerifiedBootState,
+    assess_android_tproxy_topology_scope, authorize_android_mark_planning, classify_android_rpdb,
 };
 
 use super::{
@@ -50,7 +48,7 @@ const SOURCES: [FwmarkEvidenceSource; 9] = [
     FwmarkEvidenceSource::AndroidNetId,
     FwmarkEvidenceSource::Rpdb,
     FwmarkEvidenceSource::DeviceMarkPolicy,
-    FwmarkEvidenceSource::LegacyXtables,
+    FwmarkEvidenceSource::Xtables,
     FwmarkEvidenceSource::Nftables,
     FwmarkEvidenceSource::TrafficControlAndBpf,
     FwmarkEvidenceSource::Xfrm,
@@ -126,7 +124,6 @@ fn positive_policy_and_census_require_exact_namespace_consistent_device_identity
         Observation::Unavailable,
         context.capability_profile.kernel().clone(),
         context.capability_profile.selinux().clone(),
-        context.capability_profile.legacy_bridge().clone(),
     );
     assert!(matches!(
         cooperative_policy(
@@ -320,7 +317,7 @@ fn trust_boundary_values_reject_empty_or_unbounded_identities_and_masks() {
 #[test]
 fn ordered_late_write_constructor_rejects_every_unsafe_lifetime_or_placement() {
     let packet_write = FwmarkUseRecord::new(
-        FwmarkEvidenceSource::LegacyXtables,
+        FwmarkEvidenceSource::Xtables,
         FwmarkPlane::Packet,
         FwmarkUseOperation::MaskedWrite,
         u32::MAX,
@@ -355,7 +352,7 @@ fn ordered_late_write_constructor_rejects_every_unsafe_lifetime_or_placement() {
         .is_ok()
     );
     let predicate = FwmarkUseRecord::new(
-        FwmarkEvidenceSource::LegacyXtables,
+        FwmarkEvidenceSource::Xtables,
         FwmarkPlane::Packet,
         FwmarkUseOperation::PredicateRead,
         u32::MAX,
@@ -712,7 +709,7 @@ fn exact_ordered_late_write_set_survives_policy_census_and_planning_evidence() {
         FwmarkOrderedLateWritePlacement::InputAfterRouting,
     );
     let postrouting = ordered_write(
-        FwmarkEvidenceSource::LegacyXtables,
+        FwmarkEvidenceSource::Xtables,
         NetworkAddressFamily::Ipv6,
         FwmarkNetfilterBuiltinHook::Postrouting,
         "vendor_mangle_POSTROUTING",
@@ -855,7 +852,7 @@ fn known_android_writers_readers_xfrm_and_transfers_are_regression_covered() {
         .expect("StrictResolver flags"),
         // Current and Android 12/13 incoming-packet writers.
         FwmarkUseRecord::new(
-            FwmarkEvidenceSource::LegacyXtables,
+            FwmarkEvidenceSource::Xtables,
             FwmarkPlane::Packet,
             FwmarkUseOperation::MaskedWrite,
             0x7fef_ffff,
@@ -870,14 +867,14 @@ fn known_android_writers_readers_xfrm_and_transfers_are_regression_covered() {
         .expect("Android 12/13 incoming writer"),
         // CLAT effectively reads and writes the complete packet mark.
         FwmarkUseRecord::new(
-            FwmarkEvidenceSource::LegacyXtables,
+            FwmarkEvidenceSource::Xtables,
             FwmarkPlane::Packet,
             FwmarkUseOperation::PredicateRead,
             u32::MAX,
         )
         .expect("CLAT full-mark read"),
         FwmarkUseRecord::new(
-            FwmarkEvidenceSource::LegacyXtables,
+            FwmarkEvidenceSource::Xtables,
             FwmarkPlane::Packet,
             FwmarkUseOperation::MaskedWrite,
             u32::MAX,
@@ -1820,7 +1817,7 @@ fn planning_evidence_digest_binds_census_observation_and_canonical_contents() {
     assert_ne!(repeated_digest, fresh.evidence_digest());
 
     let observed_use = FwmarkUseRecord::new(
-        FwmarkEvidenceSource::LegacyXtables,
+        FwmarkEvidenceSource::Xtables,
         FwmarkPlane::Packet,
         FwmarkUseOperation::PredicateRead,
         0x0000_0001,
@@ -1918,7 +1915,6 @@ fn census_rejects_unverified_boot_identity_at_its_trust_boundary() {
             KernelRelease::new("5.10.198-android13-gki").expect("kernel release"),
         )),
         Observation::Verified(SelinuxMode::Enforcing),
-        ready_legacy_bridge(),
     );
     assert!(matches!(
         census_with(
@@ -2303,23 +2299,7 @@ fn verified_capability_profile(
             KernelRelease::new("5.10.198-android13-gki").expect("bounded kernel release"),
         )),
         Observation::Verified(selinux),
-        ready_legacy_bridge(),
     )
-}
-
-fn ready_legacy_bridge() -> LegacyBridgeFacts {
-    let ready = Observation::Verified(LegacyArtifactReadiness::new(
-        LegacyArtifactResolution::Direct,
-        true,
-    ));
-    let bridge = LegacyBridgeFacts::new(ready.clone(), ready.clone(), ready);
-    assert_eq!(bridge.mutation_writer(), LegacyMutationWriter::Dispatcher);
-    assert_eq!(bridge.rule_backend(), LegacyRuleBackend::IptablesRestore);
-    assert_eq!(
-        bridge.address_synchronization(),
-        LegacyAddressSynchronization::StandaloneAddrsyncdViaScript
-    );
-    bridge
 }
 
 fn namespace(device: u64, inode: u64) -> NetworkNamespaceIdentity {

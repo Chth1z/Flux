@@ -5,7 +5,7 @@ use std::num::NonZeroU64;
 
 use crate::canonical_evidence::CanonicalEvidenceDigest;
 
-pub const CAPABILITY_PROFILE_SCHEMA_VERSION: u16 = 2;
+pub const CAPABILITY_PROFILE_SCHEMA_VERSION: u16 = 3;
 pub const CAPABILITY_PROFILE_DIGEST_BYTES: usize = 32;
 pub const MIN_SUPPORTED_KERNEL: KernelVersion = KernelVersion::new(5, 10, 0);
 pub const MAX_BOOT_IDENTITY_BYTES: usize = 128;
@@ -16,7 +16,7 @@ pub const MAX_DEVICE_TOOL_IDENTITIES: usize = 32;
 pub const SHA256_DIGEST_BYTES: usize = 32;
 
 const CAPABILITY_PROFILE_DIGEST_DOMAIN: &[u8] =
-    b"Flux complete Capability Profile\0canonical-schema-v2\0sha256-v1\0";
+    b"Flux complete Capability Profile\0canonical-schema-v3\0sha256-v1\0";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ObservationKind {
@@ -123,7 +123,6 @@ pub struct CapabilityProfile {
     device_identity: Observation<DeviceIdentity>,
     kernel: KernelFacts,
     selinux: Observation<SelinuxMode>,
-    legacy_bridge: LegacyBridgeFacts,
 }
 
 impl CapabilityProfile {
@@ -133,7 +132,6 @@ impl CapabilityProfile {
         device_identity: Observation<DeviceIdentity>,
         kernel: KernelFacts,
         selinux: Observation<SelinuxMode>,
-        legacy_bridge: LegacyBridgeFacts,
     ) -> Self {
         Self::new(
             CapabilityProfileRevision::INITIAL,
@@ -141,7 +139,6 @@ impl CapabilityProfile {
             device_identity,
             kernel,
             selinux,
-            legacy_bridge,
         )
     }
 
@@ -152,7 +149,6 @@ impl CapabilityProfile {
         device_identity: Observation<DeviceIdentity>,
         kernel: KernelFacts,
         selinux: Observation<SelinuxMode>,
-        legacy_bridge: LegacyBridgeFacts,
     ) -> Self {
         Self {
             schema_version: CAPABILITY_PROFILE_SCHEMA_VERSION,
@@ -161,7 +157,6 @@ impl CapabilityProfile {
             device_identity,
             kernel,
             selinux,
-            legacy_bridge,
         }
     }
 
@@ -197,7 +192,6 @@ impl CapabilityProfile {
                 SelinuxMode::Permissive => 1,
             });
         });
-        digest_legacy_bridge(&mut digest, &self.legacy_bridge);
         CapabilityProfileDigest(digest.finish())
     }
 
@@ -219,11 +213,6 @@ impl CapabilityProfile {
     #[must_use]
     pub const fn selinux(&self) -> &Observation<SelinuxMode> {
         &self.selinux
-    }
-
-    #[must_use]
-    pub const fn legacy_bridge(&self) -> &LegacyBridgeFacts {
-        &self.legacy_bridge
     }
 
     #[must_use]
@@ -323,18 +312,6 @@ fn digest_kernel_version(digest: &mut CanonicalEvidenceDigest, version: KernelVe
     digest.u16(version.major());
     digest.u16(version.minor());
     digest.u16(version.patch());
-}
-
-fn digest_legacy_bridge(digest: &mut CanonicalEvidenceDigest, bridge: &LegacyBridgeFacts) {
-    for observation in [&bridge.shell, &bridge.dispatcher, &bridge.addrsync] {
-        digest_observation(digest, observation, |digest, readiness| {
-            digest.tag(match readiness.resolution() {
-                LegacyArtifactResolution::Direct => 0,
-                LegacyArtifactResolution::SymbolicLink => 1,
-            });
-            digest.boolean(readiness.is_ready());
-        });
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1318,103 +1295,4 @@ fn parse_required_component(
 pub enum SelinuxMode {
     Enforcing,
     Permissive,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum LegacyMutationWriter {
-    Dispatcher,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum LegacyRuleBackend {
-    IptablesRestore,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum LegacyAddressSynchronization {
-    StandaloneAddrsyncdViaScript,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum LegacyArtifactResolution {
-    Direct,
-    SymbolicLink,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct LegacyArtifactReadiness {
-    resolution: LegacyArtifactResolution,
-    executable: bool,
-}
-
-impl LegacyArtifactReadiness {
-    #[must_use]
-    pub const fn new(resolution: LegacyArtifactResolution, executable: bool) -> Self {
-        Self {
-            resolution,
-            executable,
-        }
-    }
-
-    #[must_use]
-    pub const fn resolution(self) -> LegacyArtifactResolution {
-        self.resolution
-    }
-
-    #[must_use]
-    pub const fn is_ready(self) -> bool {
-        self.executable
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LegacyBridgeFacts {
-    shell: Observation<LegacyArtifactReadiness>,
-    dispatcher: Observation<LegacyArtifactReadiness>,
-    addrsync: Observation<LegacyArtifactReadiness>,
-}
-
-impl LegacyBridgeFacts {
-    #[must_use]
-    pub const fn new(
-        shell: Observation<LegacyArtifactReadiness>,
-        dispatcher: Observation<LegacyArtifactReadiness>,
-        addrsync: Observation<LegacyArtifactReadiness>,
-    ) -> Self {
-        Self {
-            shell,
-            dispatcher,
-            addrsync,
-        }
-    }
-
-    #[must_use]
-    pub const fn mutation_writer(&self) -> LegacyMutationWriter {
-        LegacyMutationWriter::Dispatcher
-    }
-
-    #[must_use]
-    pub const fn rule_backend(&self) -> LegacyRuleBackend {
-        LegacyRuleBackend::IptablesRestore
-    }
-
-    #[must_use]
-    pub const fn address_synchronization(&self) -> LegacyAddressSynchronization {
-        LegacyAddressSynchronization::StandaloneAddrsyncdViaScript
-    }
-
-    #[must_use]
-    pub const fn shell(&self) -> &Observation<LegacyArtifactReadiness> {
-        &self.shell
-    }
-
-    #[must_use]
-    pub const fn dispatcher(&self) -> &Observation<LegacyArtifactReadiness> {
-        &self.dispatcher
-    }
-
-    #[must_use]
-    pub const fn addrsync(&self) -> &Observation<LegacyArtifactReadiness> {
-        &self.addrsync
-    }
 }

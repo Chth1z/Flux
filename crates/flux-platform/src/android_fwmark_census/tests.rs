@@ -53,14 +53,14 @@ fn complete_dual_stack_projection_separates_sources_and_qualifies_exact_writes()
         observation.legacy_mark_uses(),
         [
             FwmarkUseRecord::new(
-                FwmarkEvidenceSource::LegacyXtables,
+                FwmarkEvidenceSource::Xtables,
                 FwmarkPlane::Packet,
                 FwmarkUseOperation::PredicateRead,
                 0xffff,
             )
             .unwrap(),
             FwmarkUseRecord::new(
-                FwmarkEvidenceSource::LegacyXtables,
+                FwmarkEvidenceSource::Xtables,
                 FwmarkPlane::Packet,
                 FwmarkUseOperation::MaskedWrite,
                 u32::MAX,
@@ -304,7 +304,7 @@ fn mutation_forms_project_the_bits_they_can_change() {
         assert!(
             observation.legacy_mark_uses().contains(
                 &FwmarkUseRecord::new(
-                    FwmarkEvidenceSource::LegacyXtables,
+                    FwmarkEvidenceSource::Xtables,
                     FwmarkPlane::Packet,
                     FwmarkUseOperation::MaskedWrite,
                     mask,

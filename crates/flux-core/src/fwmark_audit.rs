@@ -26,7 +26,7 @@ const FWMARK_SOURCE_STATUSES: [FwmarkSourceStatus; 9] = [
         FwmarkEvidenceState::Unavailable,
     ),
     FwmarkSourceStatus::new(
-        FwmarkEvidenceSource::LegacyXtables,
+        FwmarkEvidenceSource::Xtables,
         FwmarkEvidenceState::Unavailable,
     ),
     FwmarkSourceStatus::new(
@@ -192,7 +192,7 @@ pub enum FwmarkEvidenceSource {
     AndroidNetId,
     Rpdb,
     DeviceMarkPolicy,
-    LegacyXtables,
+    Xtables,
     Nftables,
     TrafficControlAndBpf,
     Xfrm,
@@ -412,7 +412,7 @@ pub(crate) const fn fwmark_evidence_source_tag(source: FwmarkEvidenceSource) -> 
         FwmarkEvidenceSource::AndroidNetId => 0,
         FwmarkEvidenceSource::Rpdb => 1,
         FwmarkEvidenceSource::DeviceMarkPolicy => 2,
-        FwmarkEvidenceSource::LegacyXtables => 3,
+        FwmarkEvidenceSource::Xtables => 3,
         FwmarkEvidenceSource::Nftables => 4,
         FwmarkEvidenceSource::TrafficControlAndBpf => 5,
         FwmarkEvidenceSource::Xfrm => 6,

@@ -699,7 +699,7 @@ const fn source_label(source: FwmarkEvidenceSource) -> &'static str {
         FwmarkEvidenceSource::AndroidNetId => "android-net-id",
         FwmarkEvidenceSource::Rpdb => "rpdb",
         FwmarkEvidenceSource::DeviceMarkPolicy => "device-mark-policy",
-        FwmarkEvidenceSource::LegacyXtables => "legacy-xtables",
+        FwmarkEvidenceSource::Xtables => "xtables",
         FwmarkEvidenceSource::Nftables => "nftables",
         FwmarkEvidenceSource::TrafficControlAndBpf => "traffic-control-and-bpf",
         FwmarkEvidenceSource::Xfrm => "xfrm",
@@ -802,7 +802,7 @@ mod tests {
 
     fn projection(chain_bytes: usize, digest_byte: u8) -> AndroidFwmarkCensusProjection {
         let mark_use = FwmarkUseRecord::new(
-            FwmarkEvidenceSource::LegacyXtables,
+            FwmarkEvidenceSource::Xtables,
             FwmarkPlane::Packet,
             FwmarkUseOperation::MaskedWrite,
             u32::MAX,
@@ -825,12 +825,11 @@ mod tests {
         let cells = std::array::from_fn(|index| {
             let source = ALL_SOURCES[index / ALL_PLANES.len()];
             let plane = ALL_PLANES[index % ALL_PLANES.len()];
-            let state =
-                if source == FwmarkEvidenceSource::LegacyXtables && plane == FwmarkPlane::Packet {
-                    FwmarkCensusCoverageState::CompletePresent
-                } else {
-                    FwmarkCensusCoverageState::CompleteAbsent
-                };
+            let state = if source == FwmarkEvidenceSource::Xtables && plane == FwmarkPlane::Packet {
+                FwmarkCensusCoverageState::CompletePresent
+            } else {
+                FwmarkCensusCoverageState::CompleteAbsent
+            };
             FwmarkCensusCoverageRecord::new(source, plane, state)
         });
         let metrics =

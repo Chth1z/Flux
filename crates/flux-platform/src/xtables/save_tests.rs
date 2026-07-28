@@ -31,7 +31,6 @@ COMMIT
 
     assert_eq!(projection.family(), XtablesRestoreFamily::Ipv4);
     assert!(!projection.is_empty());
-    assert!(projection.legacy_conflicts().is_empty());
     assert_eq!(
         rules(&projection, "FLX4SP"),
         ["-A FLX4SP -i lo -m mark --mark 0x200000/0x600000 -j FLX4P0000000007"]
@@ -74,18 +73,13 @@ fn missing_or_duplicate_mangle_tables_are_typed() {
 
 #[test]
 fn owned_state_outside_mangle_is_rejected() {
-    for input in [
-        b"*filter\n:FLX4O0000000007 - [0:0]\nCOMMIT\n*mangle\nCOMMIT\n".as_slice(),
-        b"*nat\n:OUTPUT ACCEPT [0:0]\n-A OUTPUT -j PROXY_OUTPUT\nCOMMIT\n*mangle\nCOMMIT\n"
-            .as_slice(),
-    ] {
-        let error = project_xtables_save(input, XtablesRestoreFamily::Ipv4)
-            .expect_err("Flux-owned state outside mangle must fail closed");
-        assert_eq!(
-            error.kind(),
-            XtablesSaveProjectionErrorKind::OwnedStateOutsideMangle
-        );
-    }
+    let input = b"*filter\n:FLX4O0000000007 - [0:0]\nCOMMIT\n*mangle\nCOMMIT\n";
+    let error = project_xtables_save(input, XtablesRestoreFamily::Ipv4)
+        .expect_err("Flux-owned state outside mangle must fail closed");
+    assert_eq!(
+        error.kind(),
+        XtablesSaveProjectionErrorKind::OwnedStateOutsideMangle
+    );
 }
 
 #[test]
@@ -222,56 +216,6 @@ COMMIT
 }
 
 #[test]
-fn legacy_chains_and_references_prevent_clean_absence() {
-    let projection = project_xtables_save(
-        br#"*mangle
-:PREROUTING ACCEPT [0:0]
-:PROXY_PREROUTING - [0:0]
--A PROXY_PREROUTING -j ACCEPT
--A PREROUTING -j PROXY_PREROUTING
-COMMIT
-"#,
-        XtablesRestoreFamily::Ipv4,
-    )
-    .unwrap();
-
-    assert!(!projection.is_empty());
-    assert!(projection.chain("PROXY_PREROUTING").is_none());
-    assert!(
-        projection
-            .legacy_conflicts()
-            .iter()
-            .any(|conflict| matches!(
-                conflict,
-                XtablesLegacyConflict::ChainDeclaration { chain }
-                    if chain.as_ref() == "PROXY_PREROUTING"
-            ))
-    );
-    assert!(
-        projection
-            .legacy_conflicts()
-            .iter()
-            .any(|conflict| matches!(
-                conflict,
-                XtablesLegacyConflict::RuleSource { chain, ordinal }
-                    if chain.as_ref() == "PROXY_PREROUTING" && ordinal.get() == 1
-            ))
-    );
-    assert!(
-        projection
-            .legacy_conflicts()
-            .iter()
-            .any(|conflict| matches!(
-                conflict,
-                XtablesLegacyConflict::RuleTarget { source_chain, ordinal, target_chain }
-                    if source_chain.as_ref() == "PREROUTING"
-                        && ordinal.get() == 1
-                        && target_chain.as_ref() == "PROXY_PREROUTING"
-            ))
-    );
-}
-
-#[test]
 fn unrelated_state_projects_exact_clean_absence() {
     let projection = project_xtables_save(
         br#"*raw
@@ -291,7 +235,6 @@ COMMIT
     .unwrap();
     assert!(projection.is_empty());
     assert!(projection.native_references().is_empty());
-    assert!(projection.legacy_conflicts().is_empty());
 }
 
 #[test]

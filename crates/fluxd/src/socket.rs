@@ -11,16 +11,17 @@ use flux_platform::{PlatformError, ReactorError, SeqpacketConnection};
 
 use crate::inspection::InspectionSource;
 use crate::protocol::{
-    decode_control_response, decode_diagnose_response, decode_event_response,
-    decode_explain_response, decode_logs_response, decode_ping_response, decode_status_response,
+    decode_control_response, decode_diagnose_response, decode_explain_response,
+    decode_logs_response, decode_ping_response, decode_status_response,
     decode_subscription_update_response, encode_control_request, encode_diagnose_request,
-    encode_event_request, encode_explain_request, encode_logs_request, encode_ping_request,
-    encode_status_request, encode_subscription_update_request,
+    encode_explain_request, encode_logs_request, encode_ping_request, encode_status_request,
+    encode_subscription_update_request,
 };
 use crate::subscription::{SubscriptionRefreshClient, SubscriptionRefreshReport};
 use crate::{
-    DaemonSnapshot, DiagnosticReport, EventReport, ExplainReport, LogReport, LogStream,
-    MAX_CONTROL_PACKET_BYTES, ProtocolHandler, RequestPeerId, RuntimeSnapshotSource,
+    DaemonSnapshot, DiagnosticReport, ExplainReport, LogReport, LogStream,
+    MAX_CONTROL_PACKET_BYTES, NativeAdmissionState, ProtocolHandler, RequestPeerId,
+    RuntimeSnapshotSource,
 };
 
 static NEXT_CONTROL_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
@@ -50,18 +51,6 @@ impl SocketControlClient {
         let request = encode_status_request(request_id)?;
         let response = self.exchange(&request)?;
         decode_status_response(&response, request_id)
-    }
-
-    pub fn send_event(
-        &self,
-        event_type: &str,
-        watched_path: &str,
-        event_name: &str,
-    ) -> Result<EventReport, ControlError> {
-        let request_id = self.next_request_id();
-        let request = encode_event_request(request_id, event_type, watched_path, event_name)?;
-        let response = self.exchange(&request)?;
-        decode_event_response(&response, request_id)
     }
 
     pub fn update_subscription(&self) -> Result<SubscriptionRefreshReport, ControlError> {
@@ -131,21 +120,27 @@ where
     C: ControlService,
 {
     #[must_use]
-    pub fn new(capability_profile: Arc<CapabilityProfile>, control: C) -> Self {
+    pub fn new(
+        capability_profile: Arc<CapabilityProfile>,
+        native_admission: NativeAdmissionState,
+        control: C,
+    ) -> Self {
         Self {
-            handler: ProtocolHandler::new(capability_profile, control),
+            handler: ProtocolHandler::new(capability_profile, native_admission, control),
         }
     }
 
     #[must_use]
     pub fn with_runtime_snapshot_source(
         capability_profile: Arc<CapabilityProfile>,
+        native_admission: NativeAdmissionState,
         control: C,
         runtime: RuntimeSnapshotSource,
     ) -> Self {
         Self {
             handler: ProtocolHandler::with_runtime_snapshot_source(
                 capability_profile,
+                native_admission,
                 control,
                 runtime,
             ),
@@ -156,6 +151,7 @@ where
     #[must_use]
     pub(crate) fn with_runtime_snapshot_and_subscription(
         capability_profile: Arc<CapabilityProfile>,
+        native_admission: NativeAdmissionState,
         control: C,
         runtime: RuntimeSnapshotSource,
         subscription: Option<SubscriptionRefreshClient>,
@@ -163,6 +159,7 @@ where
         Self {
             handler: ProtocolHandler::with_runtime_snapshot_and_subscription(
                 capability_profile,
+                native_admission,
                 control,
                 runtime,
                 subscription,
@@ -173,6 +170,7 @@ where
     #[must_use]
     pub(crate) fn with_runtime_subscription_and_inspection(
         capability_profile: Arc<CapabilityProfile>,
+        native_admission: NativeAdmissionState,
         control: C,
         runtime: RuntimeSnapshotSource,
         subscription: Option<SubscriptionRefreshClient>,
@@ -181,6 +179,7 @@ where
         Self {
             handler: ProtocolHandler::with_runtime_subscription_and_inspection(
                 capability_profile,
+                native_admission,
                 control,
                 runtime,
                 subscription,
@@ -275,6 +274,7 @@ mod tests {
         let runtime = RuntimeControl::start(NoopDispatcher, 2).expect("start runtime");
         let handler = ControlConnectionHandler::with_runtime_snapshot_and_subscription(
             Arc::new(CapabilityProfileFixture::supported()),
+            NativeAdmissionState::Admitted,
             runtime,
             RuntimeSnapshotSource::default(),
             Some(subscription),

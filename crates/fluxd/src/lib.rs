@@ -2,9 +2,8 @@ use std::io::Write;
 
 use flux_core::{
     AdministrativeState, ControlClient, ControlError, ControlSnapshot, KernelMutationStatus,
-    KernelSupport, LegacyAddressSynchronization, LegacyArtifactReadiness, LegacyArtifactResolution,
-    LegacyMutationWriter, LegacyRuleBackend, MIN_SUPPORTED_KERNEL, MutationGate, Observation,
-    OperationReport, Reason, RuntimeIntent, SelinuxMode,
+    KernelSupport, MIN_SUPPORTED_KERNEL, MutationGate, Observation, OperationReport, Reason,
+    RuntimeIntent, SelinuxMode,
 };
 use flux_platform::KernelReleaseSource;
 use serde::Serialize;
@@ -18,6 +17,7 @@ mod generation_engine_config;
 mod functional_canary;
 mod inspection;
 mod intent_store;
+mod native_admission;
 mod native_generation_source;
 mod native_runtime_writer;
 mod offline_cleanup;
@@ -45,15 +45,13 @@ pub use inspection::{
     ExplainApplicationMode, ExplainReport, LogReport, LogStream, MAX_LOG_LINES, MAX_LOG_TAIL_BYTES,
 };
 pub use intent_store::{AdministrativeIntentStore, IntentStoreError};
+pub use native_admission::{NativeAdmissionRejection, NativeAdmissionState};
 pub use offline_cleanup::{
     DaemonLeaseError, DaemonLeaseErrorKind, OFFLINE_CLEANUP_BUSY_EXIT, OfflineCleanupDisposition,
     OfflineCleanupError, OfflineCleanupErrorKind, OfflineCleanupReport, run_offline_cleanup,
     run_offline_cleanup_cli,
 };
-pub use protocol::{
-    DaemonSnapshot, EventDisposition, EventReport, MAX_CONTROL_PACKET_BYTES, ProtocolHandler,
-    RequestPeerId,
-};
+pub use protocol::{DaemonSnapshot, MAX_CONTROL_PACKET_BYTES, ProtocolHandler, RequestPeerId};
 pub use runtime_layout::{RuntimeLayoutError, RuntimeLayoutErrorKind};
 pub use runtime_logging::{
     MAX_RUNTIME_LOG_FILE_BYTES, MAX_RUNTIME_LOG_RECORD_BYTES, RuntimeLogError, RuntimeLogErrorKind,
@@ -78,12 +76,6 @@ pub trait DaemonClient: ControlClient {
     fn explain(&self) -> Result<ExplainReport, ControlError> {
         Err(inspection_unavailable())
     }
-    fn send_event(
-        &self,
-        event_type: &str,
-        watched_path: &str,
-        event_name: &str,
-    ) -> Result<EventReport, ControlError>;
 }
 
 fn inspection_unavailable() -> ControlError {
@@ -116,15 +108,6 @@ impl DaemonClient for SocketControlClient {
 
     fn explain(&self) -> Result<ExplainReport, ControlError> {
         SocketControlClient::explain(self)
-    }
-
-    fn send_event(
-        &self,
-        event_type: &str,
-        watched_path: &str,
-        event_name: &str,
-    ) -> Result<EventReport, ControlError> {
-        SocketControlClient::send_event(self, event_type, watched_path, event_name)
     }
 }
 
@@ -226,10 +209,6 @@ where
             Some(daemon) => run_ping(args, daemon, stdout, stderr),
             None => unavailable_online_command("ping", stderr),
         },
-        "event" => match daemon {
-            Some(daemon) => run_event(args, daemon, stdout, stderr),
-            None => unavailable_online_command("event", stderr),
-        },
         "subscription" => match daemon {
             Some(daemon) => run_subscription(args, daemon, stdout, stderr),
             None => unavailable_online_command("subscription", stderr),
@@ -319,16 +298,16 @@ where
 
     let intent = match action {
         "start" => RuntimeIntent::Running {
-            reason: Reason::Fluxctl,
+            reason: Reason::UserControl,
         },
         "stop" => RuntimeIntent::Stopped {
-            reason: Reason::Fluxctl,
+            reason: Reason::UserControl,
         },
         "restart" | "reload" => RuntimeIntent::Reload {
-            reason: Reason::Fluxctl,
+            reason: Reason::UserControl,
         },
         "resync" => RuntimeIntent::ResyncAddresses {
-            reason: Reason::Fluxctl,
+            reason: Reason::UserControl,
         },
         unknown => {
             let _ = writeln!(stderr, "fluxd: unknown control action '{unknown}'");
@@ -400,45 +379,6 @@ where
         Err(error) => {
             let _ = writeln!(stderr, "fluxd: {error}");
             EXIT_RUNTIME_ERROR
-        }
-    }
-}
-
-fn run_event<I, T, O, E>(args: I, daemon: &dyn DaemonClient, stdout: &mut O, stderr: &mut E) -> i32
-where
-    I: IntoIterator<Item = T>,
-    T: AsRef<str>,
-    O: Write,
-    E: Write,
-{
-    let arguments = args.into_iter().collect::<Vec<_>>();
-    if arguments.len() != 3 {
-        let _ = writeln!(
-            stderr,
-            "fluxd: event requires EVENT_TYPE WATCHED_PATH EVENT_NAME"
-        );
-        return EXIT_USAGE;
-    }
-    match daemon.send_event(
-        arguments[0].as_ref(),
-        arguments[1].as_ref(),
-        arguments[2].as_ref(),
-    ) {
-        Ok(report) => {
-            let disposition = match report.disposition {
-                EventDisposition::Applied => "applied",
-                EventDisposition::Deferred => "deferred",
-                EventDisposition::Ignored => "ignored",
-            };
-            if writeln!(stdout, "event {disposition} revision {}", report.revision).is_ok() {
-                EXIT_SUCCESS
-            } else {
-                EXIT_RUNTIME_ERROR
-            }
-        }
-        Err(error) => {
-            let _ = writeln!(stderr, "fluxd: {error}");
-            mutating_error_exit(&error)
         }
     }
 }
@@ -567,7 +507,7 @@ where
         return EXIT_SUCCESS;
     }
 
-    let daemon_state = daemon_state_label(&snapshot.capability_profile);
+    let daemon_state = daemon_state_label(snapshot.native_admission);
     let generation = snapshot
         .runtime
         .generation
@@ -912,19 +852,12 @@ where
         }
     };
     let capability_profile = &snapshot.capability_profile;
-    let daemon_state = match capability_profile.mutation_gate() {
-        MutationGate::Allowed => "running",
-        MutationGate::ReadOnly {
-            kernel: KernelMutationStatus::Unsupported { .. },
-            ..
-        } => "unsupported_kernel",
-        MutationGate::ReadOnly { .. } => "read_only_profile",
-    };
+    let daemon_state = daemon_state_label(snapshot.native_admission);
 
     if json {
         let document = OnlineStatusDocument {
             daemon: daemon_state,
-            kernel: online_kernel_document(capability_profile),
+            native_admission: snapshot.native_admission.into(),
             capability_profile: capability_profile.into(),
             control: OnlineControlDocument::from(snapshot.control),
             runtime: OnlineRuntimeDocument::from(snapshot.runtime),
@@ -935,7 +868,6 @@ where
         return EXIT_SUCCESS;
     }
 
-    let bridge = capability_profile.legacy_bridge();
     let administrative_state = administrative_state_label(snapshot.control.administrative_state);
     let runtime_generation = snapshot
         .runtime
@@ -987,6 +919,12 @@ where
         .is_err()
         || writeln!(
             stdout,
+            "native admission: {}",
+            snapshot.native_admission.as_token()
+        )
+        .is_err()
+        || writeln!(
+            stdout,
             "boot identity: {}",
             format_observation(capability_profile.boot_identity(), |identity| {
                 identity.as_str().to_owned()
@@ -1017,42 +955,6 @@ where
             format_observation(capability_profile.selinux(), |mode| {
                 selinux_mode_label(*mode).to_owned()
             })
-        )
-        .is_err()
-        || writeln!(
-            stdout,
-            "legacy mutation writer: {}",
-            legacy_mutation_writer_label(bridge.mutation_writer())
-        )
-        .is_err()
-        || writeln!(
-            stdout,
-            "legacy rule backend: {}",
-            legacy_rule_backend_label(bridge.rule_backend())
-        )
-        .is_err()
-        || writeln!(
-            stdout,
-            "legacy address synchronization: {}",
-            legacy_address_synchronization_label(bridge.address_synchronization())
-        )
-        .is_err()
-        || writeln!(
-            stdout,
-            "legacy shell: {}",
-            format_legacy_artifact(bridge.shell())
-        )
-        .is_err()
-        || writeln!(
-            stdout,
-            "legacy dispatcher: {}",
-            format_legacy_artifact(bridge.dispatcher())
-        )
-        .is_err()
-        || writeln!(
-            stdout,
-            "legacy addrsync: {}",
-            format_legacy_artifact(bridge.addrsync())
         )
         .is_err()
         || writeln!(stdout, "administrative state: {administrative_state}").is_err()
@@ -1188,7 +1090,7 @@ where
 fn write_help(output: &mut impl Write) -> i32 {
     let result = writeln!(
         output,
-        "Usage: fluxd <COMMAND>\n\nCommands:\n  status [--json]\n  start|stop|restart|reload|resync\n  control <start|stop|restart|reload|resync>\n  diagnose [--json]\n  logs [runtime|daemon|engine] [--lines N] [--json]\n  backend explain [--json]\n  plan [--dry-run] [--json]\n  rules-preview [--json]\n  ping\n  event <EVENT_TYPE> <WATCHED_PATH> <EVENT_NAME>\n  subscription update\n  cleanup --offline\n  help\n  version"
+        "Usage: fluxd <COMMAND>\n\nCommands:\n  status [--json]\n  start|stop|restart|reload|resync\n  control <start|stop|restart|reload|resync>\n  diagnose [--json]\n  logs [runtime|daemon|engine] [--lines N] [--json]\n  backend explain [--json]\n  plan [--dry-run] [--json]\n  rules-preview [--json]\n  ping\n  subscription update\n  cleanup --offline\n  help\n  version"
     );
     if result.is_ok() {
         EXIT_SUCCESS
@@ -1214,8 +1116,7 @@ struct KernelDocument<'a> {
 #[derive(Serialize)]
 struct OnlineStatusDocument {
     daemon: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    kernel: Option<OnlineKernelDocument>,
+    native_admission: OnlineNativeAdmissionDocument,
     capability_profile: WireCapabilityProfile,
     control: OnlineControlDocument,
     runtime: OnlineRuntimeDocument,
@@ -1229,30 +1130,41 @@ struct DiagnosticCliDocument {
 
 fn online_status_document(snapshot: DaemonSnapshot) -> OnlineStatusDocument {
     OnlineStatusDocument {
-        daemon: daemon_state_label(&snapshot.capability_profile),
-        kernel: online_kernel_document(&snapshot.capability_profile),
+        daemon: daemon_state_label(snapshot.native_admission),
+        native_admission: snapshot.native_admission.into(),
         capability_profile: (&snapshot.capability_profile).into(),
         control: OnlineControlDocument::from(snapshot.control),
         runtime: OnlineRuntimeDocument::from(snapshot.runtime),
     }
 }
 
-fn daemon_state_label(capability_profile: &flux_core::CapabilityProfile) -> &'static str {
-    match capability_profile.mutation_gate() {
-        MutationGate::Allowed => "running",
-        MutationGate::ReadOnly {
-            kernel: KernelMutationStatus::Unsupported { .. },
-            ..
-        } => "unsupported_kernel",
-        MutationGate::ReadOnly { .. } => "read_only_profile",
+fn daemon_state_label(admission: NativeAdmissionState) -> &'static str {
+    match admission {
+        NativeAdmissionState::Admitted => "running",
+        NativeAdmissionState::Rejected(reason) => reason.as_token(),
     }
 }
 
 #[derive(Serialize)]
-struct OnlineKernelDocument {
-    version: String,
-    minimum: String,
-    supported: bool,
+struct OnlineNativeAdmissionDocument {
+    state: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'static str>,
+}
+
+impl From<NativeAdmissionState> for OnlineNativeAdmissionDocument {
+    fn from(admission: NativeAdmissionState) -> Self {
+        match admission {
+            NativeAdmissionState::Admitted => Self {
+                state: "admitted",
+                reason: None,
+            },
+            NativeAdmissionState::Rejected(reason) => Self {
+                state: "rejected",
+                reason: Some(reason.as_token()),
+            },
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -1359,42 +1271,9 @@ impl From<OperationReport> for OnlineOperationDocument {
     }
 }
 
-fn online_kernel_document(profile: &flux_core::CapabilityProfile) -> Option<OnlineKernelDocument> {
-    match profile.kernel_support()? {
-        KernelSupport::Supported(version) => Some(OnlineKernelDocument {
-            version: version.to_string(),
-            minimum: MIN_SUPPORTED_KERNEL.to_string(),
-            supported: true,
-        }),
-        KernelSupport::Unsupported { found, minimum } => Some(OnlineKernelDocument {
-            version: found.to_string(),
-            minimum: minimum.to_string(),
-            supported: false,
-        }),
-    }
-}
-
 fn format_observation<T>(observation: &Observation<T>, map: impl FnOnce(&T) -> String) -> String {
     match observation {
         Observation::Verified(value) => format!("{} (verified)", map(value)),
-        Observation::Absent => "absent".to_owned(),
-        Observation::Denied => "denied".to_owned(),
-        Observation::Malformed => "malformed".to_owned(),
-        Observation::Unavailable => "unavailable".to_owned(),
-    }
-}
-
-fn format_legacy_artifact(observation: &Observation<LegacyArtifactReadiness>) -> String {
-    match observation {
-        Observation::Verified(artifact) => format!(
-            "{} ({}, verified)",
-            if artifact.is_ready() {
-                "ready"
-            } else {
-                "not ready"
-            },
-            legacy_artifact_resolution_label(artifact.resolution())
-        ),
         Observation::Absent => "absent".to_owned(),
         Observation::Denied => "denied".to_owned(),
         Observation::Malformed => "malformed".to_owned(),
@@ -1470,35 +1349,6 @@ const fn selinux_mode_label(mode: SelinuxMode) -> &'static str {
     match mode {
         SelinuxMode::Enforcing => "enforcing",
         SelinuxMode::Permissive => "permissive",
-    }
-}
-
-const fn legacy_mutation_writer_label(writer: LegacyMutationWriter) -> &'static str {
-    match writer {
-        LegacyMutationWriter::Dispatcher => "dispatcher",
-    }
-}
-
-const fn legacy_rule_backend_label(backend: LegacyRuleBackend) -> &'static str {
-    match backend {
-        LegacyRuleBackend::IptablesRestore => "iptables_restore",
-    }
-}
-
-const fn legacy_address_synchronization_label(
-    synchronization: LegacyAddressSynchronization,
-) -> &'static str {
-    match synchronization {
-        LegacyAddressSynchronization::StandaloneAddrsyncdViaScript => {
-            "standalone_addrsyncd_via_script"
-        }
-    }
-}
-
-const fn legacy_artifact_resolution_label(resolution: LegacyArtifactResolution) -> &'static str {
-    match resolution {
-        LegacyArtifactResolution::Direct => "direct",
-        LegacyArtifactResolution::SymbolicLink => "symbolic_link",
     }
 }
 

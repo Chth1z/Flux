@@ -410,7 +410,6 @@ fn revised_profile(profile: &CapabilityProfile) -> CapabilityProfile {
         profile.device_identity().clone(),
         profile.kernel().clone(),
         profile.selinux().clone(),
-        profile.legacy_bridge().clone(),
     )
 }
 

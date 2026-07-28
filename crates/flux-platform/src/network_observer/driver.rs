@@ -147,6 +147,21 @@ impl RouteNetworkInventoryDriver {
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub(crate) fn open_primed(
+        policy: AddressEventPolicy,
+        timeout: Duration,
+    ) -> Result<(Self, NetworkInventorySource, Arc<NetworkInventory>), PlatformError> {
+        validate_inventory_timeout(timeout)?;
+        let started = Instant::now();
+        let deadline = started
+            .checked_add(timeout)
+            .ok_or_else(invalid_inventory_timeout)?;
+        let (mut driver, source) = Self::open(policy, started)?;
+        let snapshot = driver.prime_until_complete(&source, deadline)?;
+        Ok((driver, source, snapshot))
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     pub(crate) fn readiness_fd(&self) -> BorrowedFd<'_> {
         self.inner.transport.readiness_fd()
     }
@@ -182,6 +197,44 @@ impl RouteNetworkInventoryDriver {
     pub(crate) fn disable(&mut self) {
         self.inner.disable();
     }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn prime_until_complete(
+        &mut self,
+        source: &NetworkInventorySource,
+        deadline: Instant,
+    ) -> Result<Arc<NetworkInventory>, PlatformError> {
+        loop {
+            if let Some(snapshot) = source.snapshot() {
+                return Ok(snapshot);
+            }
+
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(inventory_timeout());
+            }
+            self.drive_due(now)?;
+            if let Some(snapshot) = source.snapshot() {
+                return Ok(snapshot);
+            }
+
+            wait_for_inventory_readiness(
+                self.readiness_fd(),
+                self.next_deadline()
+                    .map_or(deadline, |next| next.min(deadline)),
+            )?;
+            loop {
+                if Instant::now() >= deadline {
+                    return Err(inventory_timeout());
+                }
+                let report =
+                    self.drive_ready(RouteNetworkInventoryWorkBudget::default(), Instant::now())?;
+                if report.disposition() != RouteNetworkInventoryDriveDisposition::BudgetExhausted {
+                    break;
+                }
+            }
+        }
+    }
 }
 
 /// Collects one complete subscribed route-netlink inventory within an explicit bound.
@@ -193,49 +246,9 @@ impl RouteNetworkInventoryDriver {
 pub fn collect_network_inventory_once(
     timeout: Duration,
 ) -> Result<Arc<NetworkInventory>, PlatformError> {
-    if timeout.is_zero() || timeout > MAX_ONE_SHOT_INVENTORY_TIMEOUT {
-        return Err(invalid_one_shot_timeout());
-    }
-    let started = Instant::now();
-    let deadline = started
-        .checked_add(timeout)
-        .ok_or_else(invalid_one_shot_timeout)?;
-    let (mut driver, source) =
-        RouteNetworkInventoryDriver::open(AddressEventPolicy::new(true), started)?;
-
-    loop {
-        if let Some(snapshot) = source.snapshot() {
-            return Ok(snapshot);
-        }
-
-        let now = Instant::now();
-        if now >= deadline {
-            driver.disable();
-            return Err(one_shot_timeout());
-        }
-        driver.drive_due(now)?;
-        if let Some(snapshot) = source.snapshot() {
-            return Ok(snapshot);
-        }
-
-        wait_for_inventory_readiness(
-            driver.readiness_fd(),
-            driver
-                .next_deadline()
-                .map_or(deadline, |next| next.min(deadline)),
-        )?;
-        loop {
-            let now = Instant::now();
-            if now >= deadline {
-                driver.disable();
-                return Err(one_shot_timeout());
-            }
-            let report = driver.drive_ready(RouteNetworkInventoryWorkBudget::default(), now)?;
-            if report.disposition() != RouteNetworkInventoryDriveDisposition::BudgetExhausted {
-                break;
-            }
-        }
-    }
+    let (_driver, _source, snapshot) =
+        RouteNetworkInventoryDriver::open_primed(AddressEventPolicy::new(true), timeout)?;
+    Ok(snapshot)
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -258,7 +271,7 @@ fn wait_for_inventory_readiness(
         if result >= 0 {
             if poll_fd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
                 return Err(PlatformError::SystemCall {
-                    operation: "wait for one-shot route-netlink inventory",
+                    operation: "wait for initial route-netlink inventory",
                     source: io::Error::other(format!(
                         "route-netlink descriptor reported events {:#x}",
                         poll_fd.revents
@@ -270,7 +283,7 @@ fn wait_for_inventory_readiness(
         let source = io::Error::last_os_error();
         if source.raw_os_error() != Some(libc::EINTR) {
             return Err(PlatformError::SystemCall {
-                operation: "wait for one-shot route-netlink inventory",
+                operation: "wait for initial route-netlink inventory",
                 source,
             });
         }
@@ -278,9 +291,18 @@ fn wait_for_inventory_readiness(
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn invalid_one_shot_timeout() -> PlatformError {
+fn validate_inventory_timeout(timeout: Duration) -> Result<(), PlatformError> {
+    if timeout.is_zero() || timeout > MAX_ONE_SHOT_INVENTORY_TIMEOUT {
+        Err(invalid_inventory_timeout())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn invalid_inventory_timeout() -> PlatformError {
     PlatformError::SystemCall {
-        operation: "validate one-shot route-netlink inventory timeout",
+        operation: "validate initial route-netlink inventory timeout",
         source: io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("timeout must be nonzero and at most {MAX_ONE_SHOT_INVENTORY_TIMEOUT:?}"),
@@ -289,9 +311,9 @@ fn invalid_one_shot_timeout() -> PlatformError {
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn one_shot_timeout() -> PlatformError {
+fn inventory_timeout() -> PlatformError {
     PlatformError::SystemCall {
-        operation: "collect one-shot route-netlink inventory",
+        operation: "collect initial route-netlink inventory",
         source: io::Error::new(
             io::ErrorKind::TimedOut,
             "complete LINK/ADDRESS/ROUTE/RULE inventory was not published before the deadline",
@@ -911,7 +933,7 @@ mod tests {
             assert!(matches!(
                 error,
                 PlatformError::SystemCall {
-                    operation: "validate one-shot route-netlink inventory timeout",
+                    operation: "validate initial route-netlink inventory timeout",
                     source,
                 } if source.kind() == io::ErrorKind::InvalidInput
             ));

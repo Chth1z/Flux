@@ -333,7 +333,7 @@ mod implementation {
     use crate::android_fwmark_census::AndroidXtablesFwmarkObservation;
 
     const ABSENCE_DIGEST_DOMAIN: &[u8] =
-        b"Flux existing ownership absence\0canonical-schema-v1\0sha256-v1\0";
+        b"Flux existing ownership absence\0canonical-schema-v2\0sha256-v1\0";
     const CLEAN_JOURNAL_IDENTITY_DOMAIN: &[u8] =
         b"Flux observed missing ownership journal\0canonical-schema-v1\0sha256-v1\0";
     const ABSENCE_COUNT_SIGNATURE: &[u8] = b"durable-artifact-count\0archived-target-count\0\
@@ -343,8 +343,6 @@ flux-process-count\0flux-chain-count\0flux-route-count\0flux-rule-count\0";
     const MAX_SYSTEM_PROCESS_ENTRIES: usize = 65_536;
     const MAX_PROC_COMM_BYTES: usize = 256;
     const MAX_PROC_STAT_BYTES: usize = 4 * 1024;
-    const LEGACY_ROUTE_TABLE: u32 = 2_025;
-    const LEGACY_RULE_PRIORITY: u32 = 2_025;
     const NATIVE_ROUTE_PROTOCOL: u8 = 4;
     const NATIVE_RULE_PROTOCOL: u8 = 99;
     const NATIVE_ROUTE_METRIC: u32 = 1_024;
@@ -353,7 +351,7 @@ flux-process-count\0flux-chain-count\0flux-route-count\0flux-rule-count\0";
     const RTN_LOCAL: u8 = 2;
     const IPV6_ROUTE_PREFERENCE_MEDIUM: u8 = 0;
 
-    /// Collects a read-only proof that no native or bridge-era Flux owner remains.
+    /// Collects a read-only proof that no native Flux owner remains.
     ///
     /// `durable_root` is the native xtables ownership directory, not the package root. Missing
     /// directories stay missing. The collector never creates a directory, acquires a lock, reads a
@@ -574,19 +572,17 @@ flux-process-count\0flux-chain-count\0flux-route-count\0flux-rule-count\0";
 
     #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
     struct PolicyRoutingOwnership {
-        legacy_routes: usize,
-        native_routes: usize,
-        legacy_rules: usize,
-        native_rules: usize,
+        routes: usize,
+        rules: usize,
     }
 
     impl PolicyRoutingOwnership {
         fn route_total(self) -> usize {
-            self.legacy_routes.saturating_add(self.native_routes)
+            self.routes
         }
 
         fn rule_total(self) -> usize {
-            self.legacy_rules.saturating_add(self.native_rules)
+            self.rules
         }
     }
 
@@ -603,21 +599,13 @@ flux-process-count\0flux-chain-count\0flux-route-count\0flux-rule-count\0";
     fn observe_policy_routing(inventory: &NetworkInventory) -> PolicyRoutingOwnership {
         let mut observation = PolicyRoutingOwnership::default();
         for route in inventory.routes() {
-            if route.properties().table().get() == LEGACY_ROUTE_TABLE {
-                observation.legacy_routes = observation.legacy_routes.saturating_add(1);
-            }
             if is_native_flux_route(inventory, route) {
-                observation.native_routes = observation.native_routes.saturating_add(1);
+                observation.routes = observation.routes.saturating_add(1);
             }
         }
         for rule in inventory.rules() {
-            if rule.priority().get() == LEGACY_RULE_PRIORITY
-                || rule.properties().table().get() == LEGACY_ROUTE_TABLE
-            {
-                observation.legacy_rules = observation.legacy_rules.saturating_add(1);
-            }
             if rule.properties().protocol().raw() == NATIVE_RULE_PROTOCOL {
-                observation.native_rules = observation.native_rules.saturating_add(1);
+                observation.rules = observation.rules.saturating_add(1);
             }
         }
         observation
@@ -664,7 +652,6 @@ flux-process-count\0flux-chain-count\0flux-route-count\0flux-rule-count\0";
     #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
     enum FluxProcessKind {
         Daemon,
-        AddressSynchronizer,
         Engine,
     }
 
@@ -880,7 +867,6 @@ flux-process-count\0flux-chain-count\0flux-route-count\0flux-rule-count\0";
     fn flux_process_kind(command: &[u8]) -> Option<FluxProcessKind> {
         match command {
             b"fluxd" => Some(FluxProcessKind::Daemon),
-            b"addrsyncd" => Some(FluxProcessKind::AddressSynchronizer),
             b"sing-box" => Some(FluxProcessKind::Engine),
             _ => None,
         }

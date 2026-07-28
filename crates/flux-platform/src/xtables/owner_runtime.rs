@@ -2296,7 +2296,7 @@ where
         for family in ALL_XTABLES_FAMILIES {
             if !self.adapter.observe_xtables(family)?.is_empty() {
                 return Err(NativeXtablesOwnerError::LiveStateConflict(
-                    "native or legacy xtables state exists before ownership acquisition",
+                    "Flux xtables state exists before ownership acquisition",
                 ));
             }
         }
@@ -2314,7 +2314,7 @@ where
         for family in ALL_XTABLES_FAMILIES {
             if !self.adapter.observe_xtables(family)?.is_empty() {
                 return Err(NativeXtablesOwnerError::LiveStateConflict(
-                    "native or legacy xtables state exists without a durable owner journal",
+                    "Flux xtables state exists without a durable owner journal",
                 ));
             }
         }

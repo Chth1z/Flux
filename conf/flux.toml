@@ -55,5 +55,5 @@ max_decoded_bytes = 16777216
 max_nodes = 10000
 
 [safety]
-respect_android_vpn = false
-require_functional_canary = false
+respect_android_vpn = true
+require_functional_canary = true

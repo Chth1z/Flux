@@ -8,9 +8,7 @@ use crate::android_tproxy_topology::{
 };
 use crate::capability::{
     BootIdentity, CapabilityProfileRevision, DeviceIdentity, KernelFacts, KernelRelease,
-    LegacyAddressSynchronization, LegacyArtifactReadiness, LegacyArtifactResolution,
-    LegacyBridgeFacts, LegacyMutationWriter, LegacyRuleBackend, Observation, SelinuxMode, ToolId,
-    VerifiedBootIdentity, VerifiedBootState,
+    Observation, SelinuxMode, ToolId, VerifiedBootIdentity, VerifiedBootState,
 };
 use crate::network_inventory::{
     InterfaceHardwareType, InterfaceIndex, InterfaceLinkFlags, InterfaceLinkRecord, InterfaceName,
@@ -163,7 +161,7 @@ fn exact_production_samsung_selector_is_observed_behavior_not_source_authenticat
 fn policy_artifact_digest_is_compiled_from_the_exact_reviewed_document() {
     let bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../docs/policy/samsung-sm-s9180-fzdp-observed-behavior-v1.md"
+        "/tests/fixtures/samsung-sm-s9180-fzdp-observed-behavior-v1.md"
     ));
     let digest = Sha256::digest(bytes);
     assert_eq!(
@@ -412,7 +410,6 @@ fn selection_rejects_unverified_boot_identity_and_namespace_drift() {
         verified.device_identity().clone(),
         verified.kernel().clone(),
         verified.selinux().clone(),
-        verified.legacy_bridge().clone(),
     );
     assert_eq!(
         select_from_catalog(&[ENTRY], &unavailable_boot, profile_namespace,),
@@ -432,7 +429,6 @@ fn selection_rejects_unverified_boot_identity_and_namespace_drift() {
             KernelRelease::new("5.10.198-android13-gki").expect("kernel release"),
         )),
         Observation::Verified(SelinuxMode::Enforcing),
-        ready_legacy_bridge(),
     );
     assert_eq!(
         select_from_catalog(&[ENTRY], &unavailable, profile_namespace),
@@ -521,7 +517,6 @@ fn capability_profile_for_selector(
             .expect("kernel release"),
         )),
         Observation::Verified(SelinuxMode::Enforcing),
-        ready_legacy_bridge(),
     )
 }
 
@@ -539,21 +534,6 @@ fn artifact(byte: u8, size: u64) -> ArtifactIdentity {
         size,
     )
     .expect("nonempty artifact")
-}
-
-fn ready_legacy_bridge() -> LegacyBridgeFacts {
-    let ready = Observation::Verified(LegacyArtifactReadiness::new(
-        LegacyArtifactResolution::Direct,
-        true,
-    ));
-    let bridge = LegacyBridgeFacts::new(ready.clone(), ready.clone(), ready);
-    assert_eq!(bridge.mutation_writer(), LegacyMutationWriter::Dispatcher);
-    assert_eq!(bridge.rule_backend(), LegacyRuleBackend::IptablesRestore);
-    assert_eq!(
-        bridge.address_synchronization(),
-        LegacyAddressSynchronization::StandaloneAddrsyncdViaScript
-    );
-    bridge
 }
 
 fn topology_scope() -> AndroidTproxyTopologyScopeReport {

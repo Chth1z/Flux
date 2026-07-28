@@ -56,6 +56,9 @@ pub enum ReactorError {
     Platform(PlatformError),
     FileObservation(FileObservationError),
     FileObservationAlreadyAttached,
+    NetworkInventoryAlreadyAttached,
+    ControlAlreadyBound,
+    ControlNotBound,
     WorkerSpawn {
         source: std::io::Error,
     },
@@ -80,6 +83,15 @@ impl fmt::Display for ReactorError {
             Self::FileObservation(error) => write!(formatter, "file observation: {error}"),
             Self::FileObservationAlreadyAttached => {
                 formatter.write_str("file observation is already attached to the daemon reactor")
+            }
+            Self::NetworkInventoryAlreadyAttached => formatter.write_str(
+                "network inventory observation is already attached to the daemon reactor",
+            ),
+            Self::ControlAlreadyBound => {
+                formatter.write_str("control listener is already bound to the daemon reactor")
+            }
+            Self::ControlNotBound => {
+                formatter.write_str("control listener is not bound to the daemon reactor")
             }
             Self::WorkerSpawn { source } => {
                 write!(formatter, "spawn reactor worker failed: {source}")
@@ -114,7 +126,10 @@ impl Error for ReactorError {
         match self {
             Self::Platform(error) => Some(error),
             Self::FileObservation(error) => Some(error),
-            Self::FileObservationAlreadyAttached => None,
+            Self::FileObservationAlreadyAttached
+            | Self::NetworkInventoryAlreadyAttached
+            | Self::ControlAlreadyBound
+            | Self::ControlNotBound => None,
             Self::WorkerSpawn { source } => Some(source),
             Self::WorkerPanicked { .. }
             | Self::WorkerIdentifierExhausted
@@ -145,7 +160,7 @@ mod implementation {
     use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
     use std::sync::{Arc, Mutex, MutexGuard};
     use std::thread::{self, JoinHandle};
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     use super::{
         MAX_ACCEPTS_PER_TURN, MAX_WORKERS, NetworkInventoryDegradation, ReactorError,
@@ -168,6 +183,7 @@ mod implementation {
     const NETWORK_INVENTORY_TOKEN: u64 = 4;
     const FILE_OBSERVATION_TOKEN: u64 = 5;
     const EPOLL_EVENT_CAPACITY: usize = 5;
+    const INITIAL_NETWORK_INVENTORY_TIMEOUT: Duration = Duration::from_secs(30);
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum StopPhase {
@@ -428,7 +444,7 @@ mod implementation {
         listener: Option<SeqpacketListener>,
         listener_registered: bool,
         wake: Arc<ReactorWake>,
-        handler: Arc<dyn Fn(SeqpacketConnection) + Send + Sync>,
+        handler: Option<Arc<dyn Fn(SeqpacketConnection) + Send + Sync>>,
         completion_sender: SyncSender<WorkerCompletion>,
         completion_receiver: Receiver<WorkerCompletion>,
         workers: HashMap<u64, JoinHandle<()>>,
@@ -441,19 +457,10 @@ mod implementation {
     }
 
     impl DaemonReactor {
-        pub fn bind<H>(
-            path: impl AsRef<Path>,
-            shutdown: ShutdownSignal,
-            handler: H,
-        ) -> Result<(Self, ReactorStopHandle), ReactorError>
-        where
-            H: Fn(SeqpacketConnection) + Send + Sync + 'static,
-        {
-            let listener = SeqpacketListener::bind_nonblocking(path)?;
+        pub fn open(shutdown: ShutdownSignal) -> Result<(Self, ReactorStopHandle), ReactorError> {
             let wake = Arc::new(ReactorWake::create()?);
             let epoll = create_epoll()?;
 
-            add_epoll_interest(epoll.as_raw_fd(), listener.readiness_fd(), LISTENER_TOKEN)?;
             add_epoll_interest(epoll.as_raw_fd(), shutdown.readiness_fd(), SHUTDOWN_TOKEN)?;
             add_epoll_interest(epoll.as_raw_fd(), wake.readiness_fd(), WAKE_TOKEN)?;
 
@@ -464,10 +471,10 @@ mod implementation {
             Ok((
                 Self {
                     epoll,
-                    listener: Some(listener),
-                    listener_registered: true,
+                    listener: None,
+                    listener_registered: false,
                     wake,
-                    handler: Arc::new(handler),
+                    handler: None,
                     completion_sender,
                     completion_receiver,
                     workers: HashMap::with_capacity(MAX_WORKERS),
@@ -480,41 +487,77 @@ mod implementation {
             ))
         }
 
-        pub fn bind_with_network_inventory<H, D>(
+        pub fn bind<H>(
             path: impl AsRef<Path>,
             shutdown: ShutdownSignal,
             handler: H,
-            on_degradation: D,
-        ) -> Result<(Self, ReactorStopHandle, Option<NetworkInventorySource>), ReactorError>
+        ) -> Result<(Self, ReactorStopHandle), ReactorError>
         where
             H: Fn(SeqpacketConnection) + Send + Sync + 'static,
+        {
+            let (mut reactor, stop) = Self::open(shutdown)?;
+            reactor.bind_control(path, handler)?;
+            Ok((reactor, stop))
+        }
+
+        pub fn bind_control<H>(
+            &mut self,
+            path: impl AsRef<Path>,
+            handler: H,
+        ) -> Result<(), ReactorError>
+        where
+            H: Fn(SeqpacketConnection) + Send + Sync + 'static,
+        {
+            if self.listener.is_some() || self.handler.is_some() {
+                return Err(ReactorError::ControlAlreadyBound);
+            }
+            let listener = SeqpacketListener::bind_nonblocking(path)?;
+            add_epoll_interest(
+                self.epoll.as_raw_fd(),
+                listener.readiness_fd(),
+                LISTENER_TOKEN,
+            )?;
+            self.listener = Some(listener);
+            self.listener_registered = true;
+            self.handler = Some(Arc::new(handler));
+            Ok(())
+        }
+
+        pub fn attach_network_inventory<D>(
+            &mut self,
+            on_degradation: D,
+        ) -> Result<Option<NetworkInventorySource>, ReactorError>
+        where
             D: FnOnce(NetworkInventoryDegradation) + Send + 'static,
         {
-            let (mut reactor, stop) = Self::bind(path, shutdown, handler)?;
-            let (mut driver, source) = match RouteNetworkInventoryDriver::open(
-                AddressEventPolicy::new(true),
-                Instant::now(),
-            ) {
-                Ok(opened) => opened,
-                Err(error) => {
-                    on_degradation(NetworkInventoryDegradation::Initialization(error));
-                    return Ok((reactor, stop, None));
-                }
-            };
+            if self.network_inventory.is_some() {
+                return Err(ReactorError::NetworkInventoryAlreadyAttached);
+            }
+            let (mut driver, source, _initial_snapshot) =
+                match RouteNetworkInventoryDriver::open_primed(
+                    AddressEventPolicy::new(true),
+                    INITIAL_NETWORK_INVENTORY_TIMEOUT,
+                ) {
+                    Ok(opened) => opened,
+                    Err(error) => {
+                        on_degradation(NetworkInventoryDegradation::Initialization(error));
+                        return Ok(None);
+                    }
+                };
             if let Err(error) = add_epoll_interest(
-                reactor.epoll.as_raw_fd(),
+                self.epoll.as_raw_fd(),
                 driver.readiness_fd(),
                 NETWORK_INVENTORY_TOKEN,
             ) {
                 driver.disable();
                 on_degradation(NetworkInventoryDegradation::Initialization(error));
-                return Ok((reactor, stop, None));
+                return Ok(None);
             }
-            reactor.network_inventory = Some(NetworkInventoryRegistration {
+            self.network_inventory = Some(NetworkInventoryRegistration {
                 driver,
                 on_degradation: Box::new(on_degradation),
             });
-            Ok((reactor, stop, Some(source)))
+            Ok(Some(source))
         }
 
         pub fn attach_file_observation<O, I>(
@@ -551,6 +594,9 @@ mod implementation {
         }
 
         pub fn run(mut self) -> Result<(), ReactorError> {
+            if self.listener.is_none() || self.handler.is_none() {
+                return Err(ReactorError::ControlNotBound);
+            }
             let terminal_error = self.drive().err();
             self.close_listener_and_drain(terminal_error)
         }
@@ -766,7 +812,11 @@ mod implementation {
                 .next_worker_id
                 .checked_add(1)
                 .ok_or(ReactorError::WorkerIdentifierExhausted)?;
-            let handler = Arc::clone(&self.handler);
+            let handler = Arc::clone(
+                self.handler
+                    .as_ref()
+                    .expect("control handler exists while listener is registered"),
+            );
             let sender = self.completion_sender.clone();
             let wake = Arc::clone(&self.wake);
             let worker = thread::Builder::new()
@@ -1067,6 +1117,10 @@ mod implementation {
     pub struct DaemonReactor;
 
     impl DaemonReactor {
+        pub fn open(_shutdown: ShutdownSignal) -> Result<(Self, ReactorStopHandle), ReactorError> {
+            Err(PlatformError::UnsupportedPlatform(std::env::consts::OS).into())
+        }
+
         pub fn bind<H>(
             _path: impl AsRef<Path>,
             _shutdown: ShutdownSignal,
@@ -1078,14 +1132,22 @@ mod implementation {
             Err(PlatformError::UnsupportedPlatform(std::env::consts::OS).into())
         }
 
-        pub fn bind_with_network_inventory<H, D>(
+        pub fn bind_control<H>(
+            &mut self,
             _path: impl AsRef<Path>,
-            _shutdown: ShutdownSignal,
             _handler: H,
-            _on_degradation: D,
-        ) -> Result<(Self, ReactorStopHandle, Option<NetworkInventorySource>), ReactorError>
+        ) -> Result<(), ReactorError>
         where
             H: Fn(SeqpacketConnection) + Send + Sync + 'static,
+        {
+            Err(PlatformError::UnsupportedPlatform(std::env::consts::OS).into())
+        }
+
+        pub fn attach_network_inventory<D>(
+            &mut self,
+            _on_degradation: D,
+        ) -> Result<Option<NetworkInventorySource>, ReactorError>
+        where
             D: FnOnce(NetworkInventoryDegradation) + Send + 'static,
         {
             Err(PlatformError::UnsupportedPlatform(std::env::consts::OS).into())

@@ -15,7 +15,7 @@ use super::{
 const STABLE_PREROUTING_SUFFIX: &str = "SP";
 const STABLE_OUTPUT_SUFFIX: &str = "SO";
 
-/// Canonical stable-root artifacts derived from one complete schema-v2 target.
+/// Canonical stable-root artifacts derived from one complete lowering target.
 ///
 /// This is still a private implementation value. It has no writer lease,
 /// runtime admission, live-state evidence, journal, or mutation authority.
@@ -433,9 +433,6 @@ pub(crate) enum XtablesStableTopologyError {
     MissingLocalOutput,
     DuplicateRecoveryFamily,
     InvalidRecoveryMaterial(&'static str),
-    MissingTransactionOrder {
-        family: XtablesRestoreFamily,
-    },
     TransactionOrderMismatch {
         family: XtablesRestoreFamily,
     },
@@ -493,12 +490,6 @@ impl fmt::Display for XtablesStableTopologyError {
                 write!(
                     formatter,
                     "invalid native stable topology recovery material: {reason}"
-                )
-            }
-            Self::MissingTransactionOrder { family } => {
-                write!(
-                    formatter,
-                    "{family:?} artifact has no schema-v2 transaction order"
                 )
             }
             Self::TransactionOrderMismatch { family } => write!(
@@ -631,11 +622,7 @@ impl Error for XtablesStableTopologyError {
 fn validate_transaction_order(
     pair: &XtablesCaptureArtifactPair,
 ) -> Result<(), XtablesStableTopologyError> {
-    let Some(order) = pair.transaction_order() else {
-        return Err(XtablesStableTopologyError::MissingTransactionOrder {
-            family: pair.family(),
-        });
-    };
+    let order = pair.transaction_order();
     let mut prepare = pair
         .entries()
         .iter()

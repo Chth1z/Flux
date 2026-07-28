@@ -13,9 +13,9 @@ use flux_core::{
 use flux_platform::{DaemonReactor, SeqpacketConnection, ShutdownSignal};
 use flux_testkit::CapabilityProfileFixture;
 use fluxd::{
-    ControlConnectionHandler, RuntimeCaptureState, RuntimeEngineState, RuntimeFailure,
-    RuntimePhase, RuntimeSnapshot, RuntimeSnapshotSource, RuntimeVerificationState,
-    SocketControlClient,
+    ControlConnectionHandler, NativeAdmissionRejection, NativeAdmissionState, RuntimeCaptureState,
+    RuntimeEngineState, RuntimeFailure, RuntimePhase, RuntimeSnapshot, RuntimeSnapshotSource,
+    RuntimeVerificationState, SocketControlClient,
 };
 use tempfile::tempdir;
 
@@ -32,15 +32,18 @@ fn seqpacket_client_and_reactor_complete_a_control_operation() {
         4,
     )
     .expect("start runtime");
-    let handler =
-        ControlConnectionHandler::new(Arc::new(CapabilityProfileFixture::supported()), runtime);
+    let handler = ControlConnectionHandler::new(
+        Arc::new(CapabilityProfileFixture::supported()),
+        NativeAdmissionState::Admitted,
+        runtime,
+    );
     let (reactor, stop) = DaemonReactor::bind(&socket_path, shutdown, move |connection| {
         handler.serve(connection).expect("serve control connection");
     })
     .expect("bind reactor");
 
     let intent = RuntimeIntent::Running {
-        reason: Reason::Fluxctl,
+        reason: Reason::UserControl,
     };
     let client_path = socket_path.clone();
     let client_thread = thread::spawn(move || {
@@ -71,7 +74,6 @@ fn seqpacket_status_preserves_the_capability_profile_revision() {
         initial.device_identity().clone(),
         initial.kernel().clone(),
         initial.selinux().clone(),
-        initial.legacy_bridge().clone(),
     );
     let expected_profile = profile.clone();
     let runtime = RuntimeControl::start(
@@ -81,7 +83,11 @@ fn seqpacket_status_preserves_the_capability_profile_revision() {
         4,
     )
     .expect("start runtime");
-    let handler = ControlConnectionHandler::new(Arc::new(profile), runtime);
+    let handler = ControlConnectionHandler::new(
+        Arc::new(profile),
+        NativeAdmissionState::Rejected(NativeAdmissionRejection::UnsupportedKernel),
+        runtime,
+    );
     let (reactor, stop) = DaemonReactor::bind(&socket_path, shutdown, move |connection| {
         handler.serve(connection).expect("serve control connection");
     })
@@ -131,6 +137,7 @@ fn seqpacket_status_preserves_the_observed_runtime_snapshot() {
     .expect("start runtime");
     let handler = ControlConnectionHandler::with_runtime_snapshot_source(
         Arc::new(CapabilityProfileFixture::supported()),
+        NativeAdmissionState::Admitted,
         runtime_control,
         runtime_source,
     );
@@ -166,8 +173,11 @@ fn daemon_keeps_serving_after_a_client_disconnects_before_sending() {
         4,
     )
     .expect("start runtime");
-    let handler =
-        ControlConnectionHandler::new(Arc::new(CapabilityProfileFixture::supported()), runtime);
+    let handler = ControlConnectionHandler::new(
+        Arc::new(CapabilityProfileFixture::supported()),
+        NativeAdmissionState::Admitted,
+        runtime,
+    );
     let (reactor, stop) = DaemonReactor::bind(&socket_path, shutdown, move |connection| {
         if let Err(error) = handler.serve(connection) {
             eprintln!("rejected test connection: {error}");
@@ -206,8 +216,11 @@ fn ping_remains_responsive_while_a_control_operation_is_in_flight() {
         4,
     )
     .expect("start runtime");
-    let handler =
-        ControlConnectionHandler::new(Arc::new(CapabilityProfileFixture::supported()), runtime);
+    let handler = ControlConnectionHandler::new(
+        Arc::new(CapabilityProfileFixture::supported()),
+        NativeAdmissionState::Admitted,
+        runtime,
+    );
     let (reactor, stop) = DaemonReactor::bind(&socket_path, shutdown, move |connection| {
         handler.serve(connection).expect("serve control connection");
     })
@@ -217,7 +230,7 @@ fn ping_remains_responsive_while_a_control_operation_is_in_flight() {
         let control_path = client_path.clone();
         let control = thread::spawn(move || {
             SocketControlClient::new(control_path).submit_and_wait(RuntimeIntent::Running {
-                reason: Reason::Fluxctl,
+                reason: Reason::UserControl,
             })
         });
         let result = (|| {
@@ -254,8 +267,11 @@ fn stop_requested_before_run_closes_the_listener_without_dispatching_queued_clie
         4,
     )
     .expect("start runtime");
-    let handler =
-        ControlConnectionHandler::new(Arc::new(CapabilityProfileFixture::supported()), runtime);
+    let handler = ControlConnectionHandler::new(
+        Arc::new(CapabilityProfileFixture::supported()),
+        NativeAdmissionState::Admitted,
+        runtime,
+    );
     let served = Arc::new(AtomicBool::new(false));
     let handler_served = Arc::clone(&served);
     let (reactor, stop) = DaemonReactor::bind(&socket_path, shutdown, move |connection| {
@@ -265,7 +281,7 @@ fn stop_requested_before_run_closes_the_listener_without_dispatching_queued_clie
     .expect("bind reactor");
     let queued = SeqpacketConnection::connect(&socket_path).expect("queue client");
     queued
-        .send_packet(br#"{"protocol_version":4,"request_id":7,"command":{"kind":"ping"}}"#)
+        .send_packet(br#"{"protocol_version":5,"request_id":7,"command":{"kind":"ping"}}"#)
         .expect("send queued request");
 
     stop.request_stop().expect("request reactor stop");
@@ -290,8 +306,11 @@ fn stop_closes_control_admission_before_a_running_mutation_drains() {
         4,
     )
     .expect("start runtime");
-    let handler =
-        ControlConnectionHandler::new(Arc::new(CapabilityProfileFixture::supported()), runtime);
+    let handler = ControlConnectionHandler::new(
+        Arc::new(CapabilityProfileFixture::supported()),
+        NativeAdmissionState::Admitted,
+        runtime,
+    );
     let (reactor, stop) = DaemonReactor::bind(&socket_path, shutdown, move |connection| {
         handler.serve(connection).expect("serve control connection");
     })
@@ -301,7 +320,7 @@ fn stop_closes_control_admission_before_a_running_mutation_drains() {
         let control_path = client_path.clone();
         let control = thread::spawn(move || {
             SocketControlClient::new(control_path).submit_and_wait(RuntimeIntent::Running {
-                reason: Reason::Fluxctl,
+                reason: Reason::UserControl,
             })
         });
         started_rx

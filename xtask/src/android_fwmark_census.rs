@@ -1718,11 +1718,11 @@ mod tests {
 
     #[test]
     fn documented_census_invocation_suppresses_cargo_argument_echo() {
-        let development = include_str!("../../docs/development.md");
-        assert!(development.contains(
+        let readme = include_str!("../../README.md");
+        assert!(readme.contains(
             "cargo --quiet xtask collect-android-arm64-fwmark-census --serial SERIAL --adb PROGRAM"
         ));
-        assert!(!development.contains(
+        assert!(!readme.contains(
             "cargo xtask collect-android-arm64-fwmark-census --serial SERIAL --adb PROGRAM"
         ));
     }

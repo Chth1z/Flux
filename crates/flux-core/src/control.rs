@@ -7,7 +7,7 @@ use std::time::Duration;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Reason {
     Boot,
-    Fluxctl,
+    UserControl,
     ConfigChanged,
     DisableCreated,
     DisableRemoved,
@@ -20,7 +20,7 @@ impl Reason {
     pub const fn as_token(self) -> &'static str {
         match self {
             Self::Boot => "boot",
-            Self::Fluxctl => "fluxctl",
+            Self::UserControl => "user_control",
             Self::ConfigChanged => "config_changed",
             Self::DisableCreated => "disable_created",
             Self::DisableRemoved => "disable_removed",

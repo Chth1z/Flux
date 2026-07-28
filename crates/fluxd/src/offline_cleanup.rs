@@ -9,9 +9,11 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 
+use flux_core::{CapabilityProfileSource, ObservationKind};
 use flux_platform::{
     DispatcherPhaseCommand, NativeCaptureConvergedState, NativeCaptureConvergence,
-    NativeCaptureDesired, ProcessPhaseDispatcher,
+    NativeCaptureDesired, NativeXtablesAndroidRuntime, ProcessPhaseDispatcher,
+    SystemCapabilityProfileSource,
 };
 
 use crate::daemon::DaemonOptions;
@@ -202,10 +204,6 @@ impl OfflineRecovery for BridgeOfflineRecovery {
 /// already clean, then one final recovery proof retires the terminal cleanup journal. Only the
 /// convergence implementation can interpret and remove stale/foreign durable state, and only exact
 /// clean absence produces the cleanup proof.
-#[allow(
-    dead_code,
-    reason = "the Rust-only cleanup composition is selected only after physical Gate 1"
-)]
 pub(crate) struct NativeOfflineRecovery<C>
 where
     C: NativeCaptureConvergence,
@@ -213,10 +211,6 @@ where
     convergence: C,
 }
 
-#[allow(
-    dead_code,
-    reason = "the Rust-only cleanup composition is selected only after physical Gate 1"
-)]
 impl<C> NativeOfflineRecovery<C>
 where
     C: NativeCaptureConvergence,
@@ -367,8 +361,78 @@ pub fn run_offline_cleanup(
     layout
         .require_run_child("daemon lease", &options.daemon_lease_path)
         .map_err(OfflineCleanupError::RuntimeLayout)?;
+    let profile = SystemCapabilityProfileSource::new(options.capability_profile_paths())
+        .collect_capability_profile();
+    if profile.device_identity().verified().is_some() {
+        return run_native_offline_cleanup(options, &layout, &profile);
+    }
     let mut recovery = BridgeOfflineRecovery::from_options(options);
     run_offline_cleanup_with_recovery(&options.daemon_lease_path, &mut recovery)
+}
+
+fn run_native_offline_cleanup(
+    options: &DaemonOptions,
+    layout: &RuntimeLayout,
+    profile: &flux_core::CapabilityProfile,
+) -> Result<OfflineCleanupReport, OfflineCleanupError> {
+    let boot_identity = profile.boot_identity().verified().cloned().ok_or_else(|| {
+        OfflineCleanupError::Recovery(Box::new(NativeOfflineBootstrapError::MissingBootIdentity {
+            observation: profile.boot_identity().kind(),
+        }))
+    })?;
+    let network_namespace = profile
+        .device_identity()
+        .verified()
+        .expect("native cleanup selection checked the verified device identity")
+        .network_namespace();
+    let config = options.native_xtables_runtime_config(layout);
+    let recovery = while_holding_daemon_lease(&options.daemon_lease_path, || {
+        let convergence =
+            NativeXtablesAndroidRuntime::compose_recovery(config, boot_identity, network_namespace)
+                .map_err(|source| NativeOfflineBootstrapError::Composition(Box::new(source)))?;
+        match convergence {
+            Some(convergence) => NativeOfflineRecovery::new(convergence)
+                .recover_stopped()
+                .map_err(NativeOfflineBootstrapError::Recovery),
+            None => Ok(VerifiedCleanAbsence(())),
+        }
+    })
+    .map_err(OfflineCleanupError::Lease)?;
+    let _clean_absence =
+        recovery.map_err(|source| OfflineCleanupError::Recovery(Box::new(source)))?;
+    Ok(OfflineCleanupReport {
+        disposition: OfflineCleanupDisposition::Complete,
+    })
+}
+
+#[derive(Debug)]
+enum NativeOfflineBootstrapError {
+    MissingBootIdentity { observation: ObservationKind },
+    Composition(Box<dyn Error + Send + Sync>),
+    Recovery(NativeOfflineRecoveryError),
+}
+
+impl fmt::Display for NativeOfflineBootstrapError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingBootIdentity { observation } => write!(
+                formatter,
+                "native offline cleanup requires a verified boot identity, found {observation:?}"
+            ),
+            Self::Composition(source) => write!(formatter, "compose native recovery: {source}"),
+            Self::Recovery(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for NativeOfflineBootstrapError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Composition(source) => Some(source.as_ref()),
+            Self::Recovery(source) => Some(source),
+            Self::MissingBootIdentity { .. } => None,
+        }
+    }
 }
 
 fn run_offline_cleanup_with_recovery<R>(

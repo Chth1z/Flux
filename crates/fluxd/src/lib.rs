@@ -12,9 +12,6 @@ use serde::Serialize;
 mod daemon;
 mod engine_manifest;
 mod engine_supervisor;
-// Pure Generation configuration groundwork. It remains disconnected from the bridge and native
-// writer until the complete planning/evidence authority exists.
-#[allow(dead_code)]
 mod generation_engine_config;
 // The required Stage 1 gate is wired behind an explicit coordinator seam, but
 // production remains structural-only until a platform adapter is qualified.
@@ -24,15 +21,7 @@ mod inspection;
 mod intent_store;
 mod legacy_rules_cli;
 mod legacy_rules_manifest;
-#[allow(
-    dead_code,
-    reason = "H4 composes the native Generation source before the physical writer cutover"
-)]
 mod native_generation_source;
-#[allow(
-    dead_code,
-    reason = "A4 host-verifies native composition before the Gate 1 cutover"
-)]
 mod native_runtime_writer;
 mod offline_cleanup;
 mod protocol;

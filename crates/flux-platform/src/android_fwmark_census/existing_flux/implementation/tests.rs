@@ -59,6 +59,7 @@ impl Fixture {
             &self.capability_profile,
             self.network_namespace,
             &self.xtables,
+            None,
         )
     }
 }
@@ -137,6 +138,7 @@ fn clean_journal_identity_binds_profile_inventory_root_and_xtables_facts() {
         &fixture.capability_profile,
         fixture.network_namespace,
         &fixture.xtables,
+        None,
     )
     .expect("alternate-root absence")
     .ownership_journal_identity();
@@ -150,6 +152,7 @@ fn clean_journal_identity_binds_profile_inventory_root_and_xtables_facts() {
         &fixture.capability_profile,
         fixture.network_namespace,
         &unrelated_xtables,
+        None,
     )
     .expect("changed-xtables absence")
     .ownership_journal_identity();
@@ -258,6 +261,59 @@ fn exact_flux_process_names_block_without_reading_command_lines() {
     unrelated
         .collect()
         .expect("nonexact process identity is unrelated");
+}
+
+#[test]
+fn startup_exclusion_applies_only_to_the_named_daemon_pid() {
+    let current = Fixture::new();
+    write_process(&current.proc_root, 50, "fluxd", 500);
+    collect_from_roots(
+        &current.durable_root,
+        &current.proc_root,
+        &current.inventory,
+        &current.capability_profile,
+        current.network_namespace,
+        &current.xtables,
+        Some(50),
+    )
+    .expect("the lease-owning daemon is excluded");
+
+    let other_daemon = Fixture::new();
+    write_process(&other_daemon.proc_root, 50, "fluxd", 500);
+    write_process(&other_daemon.proc_root, 51, "fluxd", 501);
+    let error = collect_from_roots(
+        &other_daemon.durable_root,
+        &other_daemon.proc_root,
+        &other_daemon.inventory,
+        &other_daemon.capability_profile,
+        other_daemon.network_namespace,
+        &other_daemon.xtables,
+        Some(50),
+    )
+    .expect_err("another daemon remains an ownership conflict");
+    assert_eq!(
+        error.kind(),
+        AndroidExistingFluxOwnershipErrorKind::ProcessOwnershipPresent
+    );
+    assert_eq!(error.observed_count(), Some(1));
+
+    let helper = Fixture::new();
+    write_process(&helper.proc_root, 50, "addrsyncd", 500);
+    let error = collect_from_roots(
+        &helper.durable_root,
+        &helper.proc_root,
+        &helper.inventory,
+        &helper.capability_profile,
+        helper.network_namespace,
+        &helper.xtables,
+        Some(50),
+    )
+    .expect_err("the PID exclusion cannot hide a different Flux process kind");
+    assert_eq!(
+        error.kind(),
+        AndroidExistingFluxOwnershipErrorKind::ProcessOwnershipPresent
+    );
+    assert_eq!(error.observed_count(), Some(1));
 }
 
 #[test]
@@ -374,7 +430,7 @@ fn process_scan_budget_counts_nonnumeric_entries() {
     fs::create_dir(temp.path().join("self")).expect("create second non-PID entry");
 
     assert_eq!(
-        scan_flux_processes_bounded(temp.path(), 1),
+        scan_flux_processes_bounded(temp.path(), 1, None),
         Err(AndroidExistingFluxProcessObservationErrorClass::LimitExceeded)
     );
 }
@@ -449,6 +505,7 @@ fn relative_durable_root_is_rejected_before_observation() {
         &fixture.capability_profile,
         fixture.network_namespace,
         &fixture.xtables,
+        None,
     )
     .expect_err("relative root must fail");
     assert_eq!(

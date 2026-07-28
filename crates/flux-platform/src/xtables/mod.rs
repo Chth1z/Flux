@@ -49,9 +49,10 @@ pub use native_capture::{
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use owner::{
-    NativeXtablesCaptureAdmission, NativeXtablesCaptureAdmissionError,
-    NativeXtablesCaptureConvergenceError, NativeXtablesCaptureConverger,
-    NativeXtablesCaptureTarget, NativeXtablesRoutingPlanError,
+    NativeXtablesAndroidRuntime, NativeXtablesAndroidRuntimeConfig,
+    NativeXtablesAndroidRuntimeError, NativeXtablesCaptureAdmission,
+    NativeXtablesCaptureAdmissionError, NativeXtablesCaptureConvergenceError,
+    NativeXtablesCaptureConverger, NativeXtablesCaptureTarget, NativeXtablesRoutingPlanError,
     plan_native_xtables_local_output_routing,
 };
 

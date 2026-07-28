@@ -372,6 +372,29 @@ flux-process-count\0flux-chain-count\0flux-route-count\0flux-rule-count\0";
             capability_profile,
             network_namespace,
             xtables,
+            None,
+        )
+    }
+
+    /// Production startup variant that excludes only the calling daemon from process ownership.
+    ///
+    /// The caller must already hold the daemon lease. Every other exact Flux process remains a
+    /// fail-closed ownership conflict, including another `fluxd` with a different PID.
+    pub fn collect_android_existing_flux_ownership_for_current_daemon(
+        durable_root: impl AsRef<Path>,
+        inventory: &NetworkInventory,
+        capability_profile: &CapabilityProfile,
+        network_namespace: flux_core::NetworkNamespaceIdentity,
+        xtables: &AndroidXtablesFwmarkObservation,
+    ) -> Result<AndroidExistingFluxOwnershipObservation, AndroidExistingFluxOwnershipError> {
+        collect_from_roots(
+            durable_root.as_ref(),
+            Path::new("/proc"),
+            inventory,
+            capability_profile,
+            network_namespace,
+            xtables,
+            Some(std::process::id()),
         )
     }
 
@@ -382,6 +405,7 @@ flux-process-count\0flux-chain-count\0flux-route-count\0flux-rule-count\0";
         capability_profile: &CapabilityProfile,
         network_namespace: flux_core::NetworkNamespaceIdentity,
         xtables: &AndroidXtablesFwmarkObservation,
+        excluded_daemon_pid: Option<u32>,
     ) -> Result<AndroidExistingFluxOwnershipObservation, AndroidExistingFluxOwnershipError> {
         if !durable_root.is_absolute() {
             return Err(AndroidExistingFluxOwnershipError::new(
@@ -400,9 +424,9 @@ flux-process-count\0flux-chain-count\0flux-route-count\0flux-rule-count\0";
 
         let store = NativeXtablesDurableStore::new(durable_root);
         let durable_before = observe_durable(&store)?;
-        let processes_before = observe_flux_processes(proc_root)?;
+        let processes_before = observe_flux_processes(proc_root, excluded_daemon_pid)?;
         let policy_routing = observe_policy_routing(inventory);
-        let processes_after = observe_flux_processes(proc_root)?;
+        let processes_after = observe_flux_processes(proc_root, excluded_daemon_pid)?;
         let durable_after = observe_durable(&store)?;
 
         if durable_before != durable_after {
@@ -658,20 +682,23 @@ flux-process-count\0flux-chain-count\0flux-route-count\0flux-rule-count\0";
 
     fn observe_flux_processes(
         proc_root: &Path,
+        excluded_daemon_pid: Option<u32>,
     ) -> Result<FluxProcessSnapshot, AndroidExistingFluxOwnershipError> {
-        scan_flux_processes(proc_root)
+        scan_flux_processes(proc_root, excluded_daemon_pid)
             .map_err(AndroidExistingFluxOwnershipError::process_observation)
     }
 
     fn scan_flux_processes(
         proc_root: &Path,
+        excluded_daemon_pid: Option<u32>,
     ) -> Result<FluxProcessSnapshot, AndroidExistingFluxProcessObservationErrorClass> {
-        scan_flux_processes_bounded(proc_root, MAX_SYSTEM_PROCESS_ENTRIES)
+        scan_flux_processes_bounded(proc_root, MAX_SYSTEM_PROCESS_ENTRIES, excluded_daemon_pid)
     }
 
     fn scan_flux_processes_bounded(
         proc_root: &Path,
         max_entries: usize,
+        excluded_daemon_pid: Option<u32>,
     ) -> Result<FluxProcessSnapshot, AndroidExistingFluxProcessObservationErrorClass> {
         let root = open_directory(proc_root)
             .map_err(|_| AndroidExistingFluxProcessObservationErrorClass::ProcRootOpen)?;
@@ -712,6 +739,9 @@ flux-process-count\0flux-chain-count\0flux-route-count\0flux-rule-count\0";
                 .ok_or(AndroidExistingFluxProcessObservationErrorClass::StatMalformed)?;
             if flux_process_kind(parsed.command) != Some(kind) {
                 return Err(AndroidExistingFluxProcessObservationErrorClass::StatMalformed);
+            }
+            if kind == FluxProcessKind::Daemon && excluded_daemon_pid == Some(pid) {
+                continue;
             }
             flux_processes.insert(FluxProcessIdentity {
                 kind,
@@ -927,4 +957,7 @@ flux-process-count\0flux-chain-count\0flux-route-count\0flux-rule-count\0";
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-pub use implementation::collect_android_existing_flux_ownership;
+pub use implementation::{
+    collect_android_existing_flux_ownership,
+    collect_android_existing_flux_ownership_for_current_daemon,
+};

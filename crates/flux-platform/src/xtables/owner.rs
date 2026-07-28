@@ -918,9 +918,10 @@ pub use runtime::{
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[allow(unused_imports)]
 pub use runtime::{
-    NativeXtablesCaptureAdmission, NativeXtablesCaptureAdmissionError,
-    NativeXtablesCaptureConvergenceError, NativeXtablesCaptureConverger,
-    NativeXtablesCaptureTarget, NativeXtablesRoutingPlanError,
+    NativeXtablesAndroidRuntime, NativeXtablesAndroidRuntimeConfig,
+    NativeXtablesAndroidRuntimeError, NativeXtablesCaptureAdmission,
+    NativeXtablesCaptureAdmissionError, NativeXtablesCaptureConvergenceError,
+    NativeXtablesCaptureConverger, NativeXtablesCaptureTarget, NativeXtablesRoutingPlanError,
     plan_native_xtables_local_output_routing,
 };
 

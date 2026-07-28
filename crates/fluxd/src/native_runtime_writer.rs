@@ -338,10 +338,6 @@ where
 /// source. Recovery reaches verified clean absence before the source factory can observe any
 /// configuration. Production daemon selection remains separately fenced in `daemon`.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-#[allow(
-    dead_code,
-    reason = "the privileged Linux gate exercises this before physical Android writer cutover"
-)]
 pub(crate) fn compose_native_runtime<S, F>(
     convergence: NativeXtablesCaptureConverger,
     source_factory: F,

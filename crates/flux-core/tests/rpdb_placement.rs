@@ -134,6 +134,35 @@ fn safe_dual_family_window_returns_snapshot_and_classifier_bound_evidence() {
 }
 
 #[test]
+fn proxy_only_placement_consumes_one_priority_without_a_bypass_rule() {
+    let inventory = inventory([], baseline_rules(NetworkAddressFamily::Ipv4));
+    let audit = audit(
+        &inventory,
+        [
+            RpdbRuleClassification::MustPrecedeFlux,
+            RpdbRuleClassification::TerminalBarrier,
+        ],
+    );
+    let placement = RpdbFamilyPlacement::proxy_only(
+        RulePriority::from_raw(PROXY_PRIORITY),
+        RuleTableId::from_raw(PRIVATE_TABLE),
+    )
+    .expect("one-rule placement");
+    let request = RpdbPlacementRequest::new(Some(placement), None).expect("IPv4 request");
+
+    let lease = plan_rpdb_placement(&inventory, &audit, request).expect("one open priority");
+
+    assert_eq!(placement.bypass_priority(), placement.proxy_priority());
+    assert_eq!(placement.dedicated_bypass_priority(), None);
+    assert!(
+        lease
+            .address_bypass_routing_spec(RuleProtocol::from_raw(99))
+            .is_err(),
+        "a proxy-only lease must not manufacture an empty bypass-routing spec"
+    );
+}
+
+#[test]
 fn audit_requires_exactly_one_classification_per_ordered_rule() {
     let duplicate = rule(
         NetworkAddressFamily::Ipv4,
@@ -222,7 +251,27 @@ fn structural_constructors_reject_implicit_priorities_and_reserved_tables() {
                 table: RuleTableId::from_raw(table),
             }
         );
+        assert_eq!(
+            RpdbFamilyPlacement::proxy_only(
+                RulePriority::from_raw(PROXY_PRIORITY),
+                RuleTableId::from_raw(table),
+            )
+            .expect_err("reserved proxy-only table"),
+            RpdbFamilyPlacementError::ReservedPrivateTable {
+                table: RuleTableId::from_raw(table),
+            }
+        );
     }
+    assert_eq!(
+        RpdbFamilyPlacement::proxy_only(
+            RulePriority::from_raw(0),
+            RuleTableId::from_raw(PRIVATE_TABLE),
+        )
+        .expect_err("zero proxy-only priority"),
+        RpdbFamilyPlacementError::UnspecifiedPriority {
+            role: RpdbPriorityRole::Proxy,
+        }
+    );
     assert_eq!(
         RpdbPlacementRequest::new(None, None).expect_err("no family enabled"),
         RpdbPlacementRequestError::NoEnabledFamilies

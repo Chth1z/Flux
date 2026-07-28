@@ -258,6 +258,64 @@ pub trait AndroidFwmarkCensusCoordinatorSource {
     ) -> Result<AndroidExistingFluxOwnershipObservation, Self::Error>;
 }
 
+struct BoundInventoryCoordinatorSource<'a, S> {
+    source: &'a mut S,
+    inventory: Arc<NetworkInventory>,
+}
+
+impl<S> AndroidFwmarkCensusCoordinatorSource for BoundInventoryCoordinatorSource<'_, S>
+where
+    S: AndroidFwmarkCensusCoordinatorSource,
+{
+    type Error = S::Error;
+
+    fn collect_capability_profile(
+        &mut self,
+        stage: AndroidFwmarkCensusCollectionStage,
+    ) -> Result<CapabilityProfile, Self::Error> {
+        self.source.collect_capability_profile(stage)
+    }
+
+    fn collect_external_snapshot(
+        &mut self,
+        phase: AndroidFwmarkCensusExternalPhase,
+        netd_source_profile: AndroidNetdSourceProfile,
+        candidate: FwmarkCandidate,
+        reviewed_policy: Option<&ReviewedPolicyCatalogEntryId>,
+        bound: Duration,
+    ) -> Result<AndroidFwmarkCensusExternalSnapshot, Self::Error> {
+        self.source.collect_external_snapshot(
+            phase,
+            netd_source_profile,
+            candidate,
+            reviewed_policy,
+            bound,
+        )
+    }
+
+    fn collect_network_inventory(
+        &mut self,
+        _bound: Duration,
+    ) -> Result<Arc<NetworkInventory>, Self::Error> {
+        Ok(Arc::clone(&self.inventory))
+    }
+
+    fn collect_existing_flux_ownership(
+        &mut self,
+        inventory: &NetworkInventory,
+        capability_profile: &CapabilityProfile,
+        network_namespace: NetworkNamespaceIdentity,
+        xtables: &AndroidXtablesFwmarkObservation,
+    ) -> Result<AndroidExistingFluxOwnershipObservation, Self::Error> {
+        self.source.collect_existing_flux_ownership(
+            inventory,
+            capability_profile,
+            network_namespace,
+            xtables,
+        )
+    }
+}
+
 /// Successful output from exactly one coherent collection.
 ///
 /// Both variants are boxed to keep the enum small. The enum intentionally does not implement
@@ -599,6 +657,24 @@ pub fn coordinate_android_fwmark_census<S: AndroidFwmarkCensusCoordinatorSource>
     Ok(AndroidFwmarkCensusCoordinatorOutcome::PlanningAuthority(
         Box::new(authority),
     ))
+}
+
+/// Runs the coherent census around the exact immutable inventory supplied by its caller.
+///
+/// This is the production Generation path: the coordinator still brackets the inventory stage
+/// with complete external and capability observations, but cannot substitute a second route
+/// snapshot whose process-local identity would differ from the Generation being assembled.
+pub fn coordinate_android_fwmark_census_for_inventory<S: AndroidFwmarkCensusCoordinatorSource>(
+    source: &mut S,
+    request: &AndroidFwmarkCensusCoordinatorRequest,
+    purpose: AndroidFwmarkCensusCoordinatorPurpose,
+    inventory: Arc<NetworkInventory>,
+) -> Result<AndroidFwmarkCensusCoordinatorOutcome, AndroidFwmarkCensusCoordinatorError<S::Error>> {
+    coordinate_android_fwmark_census(
+        &mut BoundInventoryCoordinatorSource { source, inventory },
+        request,
+        purpose,
+    )
 }
 
 fn validate_external_context<E>(

@@ -1,6 +1,6 @@
 use std::error::Error;
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -20,7 +20,8 @@ use super::{
     AndroidTrafficControlBpfFwmarkObservationError, AndroidXfrmFwmarkObservationError,
     AndroidXtablesFwmarkObservation, AndroidXtablesFwmarkObservationError,
     MAX_ANDROID_FWMARK_CENSUS_STAGE_BOUND, collect_android_existing_flux_ownership,
-    collect_android_xfrm_fwmarks, observe_android_xtables_fwmarks,
+    collect_android_existing_flux_ownership_for_current_daemon, collect_android_xfrm_fwmarks,
+    observe_android_xtables_fwmarks,
 };
 use crate::xtables::collect_android_xtables_save_snapshots;
 use crate::{
@@ -212,16 +213,39 @@ impl Error for SystemAndroidFwmarkCensusSourceError {
 }
 
 /// Fixed-path, read-only production source for the Android fwmark census coordinator.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SystemAndroidFwmarkCensusSource {
     capability_profile: SystemCapabilityProfileSource,
     kernel_config: SystemAndroidKernelConfigSource,
+    durable_root: PathBuf,
+    exclude_current_daemon: bool,
+}
+
+impl Default for SystemAndroidFwmarkCensusSource {
+    fn default() -> Self {
+        Self {
+            capability_profile: SystemCapabilityProfileSource::default(),
+            kernel_config: SystemAndroidKernelConfigSource::default(),
+            durable_root: PathBuf::from(SYSTEM_FLUX_DURABLE_ROOT),
+            exclude_current_daemon: false,
+        }
+    }
 }
 
 impl SystemAndroidFwmarkCensusSource {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Creates the in-daemon source used only after the caller holds Flux's daemon lease.
+    #[must_use]
+    pub fn for_current_daemon(durable_root: impl AsRef<Path>) -> Self {
+        Self {
+            durable_root: durable_root.as_ref().to_owned(),
+            exclude_current_daemon: true,
+            ..Self::default()
+        }
     }
 }
 
@@ -322,8 +346,13 @@ impl AndroidFwmarkCensusCoordinatorSource for SystemAndroidFwmarkCensusSource {
         network_namespace: NetworkNamespaceIdentity,
         xtables: &AndroidXtablesFwmarkObservation,
     ) -> Result<AndroidExistingFluxOwnershipObservation, Self::Error> {
-        collect_android_existing_flux_ownership(
-            SYSTEM_FLUX_DURABLE_ROOT,
+        let collect = if self.exclude_current_daemon {
+            collect_android_existing_flux_ownership_for_current_daemon
+        } else {
+            collect_android_existing_flux_ownership
+        };
+        collect(
+            &self.durable_root,
             inventory,
             capability_profile,
             network_namespace,

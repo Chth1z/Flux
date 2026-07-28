@@ -49,9 +49,9 @@ pub use android_fwmark_census::{
     AndroidXtablesFwmarkObservation, AndroidXtablesFwmarkObservationError,
     AndroidXtablesFwmarkObservationErrorKind, AndroidXtablesSnapshotDigest,
     MAX_ANDROID_FWMARK_CENSUS_STAGE_BOUND, assemble_android_fwmark_census_projection,
-    coordinate_android_fwmark_census, observe_android_xtables_fwmarks,
-    parse_android_fwmark_census_probe_reports, validate_android_fwmark_census_probe_reports,
-    validate_android_fwmark_census_projection_report,
+    coordinate_android_fwmark_census, coordinate_android_fwmark_census_for_inventory,
+    observe_android_xtables_fwmarks, parse_android_fwmark_census_probe_reports,
+    validate_android_fwmark_census_probe_reports, validate_android_fwmark_census_projection_report,
     write_android_fwmark_census_projection_report,
 };
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -136,9 +136,10 @@ pub use xtables::{
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use xtables::{
-    NativeXtablesCaptureAdmission, NativeXtablesCaptureAdmissionError,
-    NativeXtablesCaptureConvergenceError, NativeXtablesCaptureConverger,
-    NativeXtablesCaptureTarget, NativeXtablesRoutingPlanError,
+    NativeXtablesAndroidRuntime, NativeXtablesAndroidRuntimeConfig,
+    NativeXtablesAndroidRuntimeError, NativeXtablesCaptureAdmission,
+    NativeXtablesCaptureAdmissionError, NativeXtablesCaptureConvergenceError,
+    NativeXtablesCaptureConverger, NativeXtablesCaptureTarget, NativeXtablesRoutingPlanError,
     plan_native_xtables_local_output_routing,
 };
 

@@ -10,20 +10,16 @@ use std::ffi::{CStr, CString};
 use std::fs::File;
 #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
 use std::os::fd::{AsRawFd, FromRawFd};
-#[cfg(all(feature = "native-composition-test", target_os = "linux"))]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
 use std::os::unix::fs::MetadataExt;
 
 use flux_core::{
-    AddressHostFamilySelection, AndroidMarkPlanningAuthority, AndroidTproxyTrafficDomainRequest,
-    DeferredAndroidMarkActivationPrerequisite, DeferredAndroidTproxyPrerequisite, FwmarkCandidate,
-    InterfaceIndex, NetworkAddressFamily, RouteProtocol, RouteTableId, RpdbFamilyPlacement,
-    RpdbPlacementLease, RuleProtocol,
+    AddressHostFamilySelection, AndroidMarkDevicePolicyIdentity, AndroidMarkDevicePolicyRevision,
+    AndroidMarkPlanningAuthority, AndroidTproxyTrafficDomainRequest, BootIdentity, FwmarkCandidate,
+    InterfaceIndex, NetworkAddressFamily, NetworkNamespaceIdentity, OwnershipJournalIdentity,
+    RouteProtocol, RouteTableId, RpdbFamilyPlacement, RpdbPlacementLease, RuleProtocol,
 };
-#[cfg(all(feature = "native-composition-test", target_os = "linux"))]
-use flux_core::{BootIdentity, NetworkNamespaceIdentity, OwnershipJournalIdentity};
-#[cfg(all(feature = "native-composition-test", target_os = "linux"))]
 use sha2::{Digest, Sha256};
 
 use super::{
@@ -49,6 +45,8 @@ use crate::xtables::{
 const NATIVE_ROUTE_METRIC: u32 = 1_024;
 const NATIVE_ROUTE_PROTOCOL: u8 = 4;
 const NATIVE_RULE_PROTOCOL: u8 = 99;
+const ANDROID_RECOVERY_JOURNAL_IDENTITY_DOMAIN: &[u8] =
+    b"Flux native Android recovery journal identity\0sha256-v1\0";
 
 #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
 const NS_GET_USERNS: libc::c_ulong = 0xb701;
@@ -65,10 +63,13 @@ pub fn plan_native_xtables_local_output_routing(
         .enumerate()
     {
         let family_placement = placement.family(family);
-        if family_placement.is_some() != families.includes(family) {
+        if families.includes(family) && family_placement.is_none() {
             return Err(NativeXtablesRoutingPlanError::FamilyMismatch { family });
         }
-        targets[index] = family_placement.map(canonical_routing_target);
+        targets[index] = families
+            .includes(family)
+            .then(|| family_placement.map(canonical_routing_target))
+            .flatten();
     }
     XtablesLocalOutputRoutingSpec::new(targets[0], targets[1])
         .map_err(|_| NativeXtablesRoutingPlanError::NoEnabledFamilies)
@@ -107,6 +108,269 @@ impl fmt::Display for NativeXtablesRoutingPlanError {
 
 impl Error for NativeXtablesRoutingPlanError {}
 
+/// Fixed process and durable-state paths for the production Android xtables owner.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeXtablesAndroidRuntimeConfig {
+    tool_root: PathBuf,
+    durable_root: PathBuf,
+    require_ipv6: bool,
+    wait_seconds: u16,
+    timeout: Duration,
+}
+
+impl NativeXtablesAndroidRuntimeConfig {
+    #[must_use]
+    pub fn new(
+        tool_root: impl AsRef<Path>,
+        durable_root: impl AsRef<Path>,
+        require_ipv6: bool,
+        wait_seconds: u16,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            tool_root: tool_root.as_ref().to_owned(),
+            durable_root: durable_root.as_ref().to_owned(),
+            require_ipv6,
+            wait_seconds,
+            timeout,
+        }
+    }
+}
+
+/// Matched Android admission and convergence capabilities created from one reviewed authority.
+pub struct NativeXtablesAndroidRuntime {
+    admission: NativeXtablesCaptureAdmission,
+    convergence: NativeXtablesCaptureConverger,
+}
+
+impl NativeXtablesAndroidRuntime {
+    pub fn compose(
+        config: NativeXtablesAndroidRuntimeConfig,
+        authority: &AndroidMarkPlanningAuthority,
+        placement: RpdbPlacementLease,
+    ) -> Result<Self, NativeXtablesAndroidRuntimeError> {
+        let routing_audit = android_routing_audit(authority, placement).map_err(|source| {
+            NativeXtablesAndroidRuntimeError::new("bind Android routing", source)
+        })?;
+        let process = XtablesRestoreProcessConfig::new(config.wait_seconds, config.timeout)
+            .map_err(|source| {
+                NativeXtablesAndroidRuntimeError::new("configure xtables restore", source)
+            })?;
+        let tools = XtablesToolSetProcessAdapter::discover_standard(
+            &config.tool_root,
+            config.require_ipv6,
+            process,
+        )
+        .map_err(|source| {
+            NativeXtablesAndroidRuntimeError::new("discover xtables tools", source)
+        })?;
+        let tool_digest = *tools.identity().digest().as_bytes();
+        let binding = NativeXtablesAndroidRuntimeBinding::new(authority, routing_audit);
+        let environment = NativeXtablesEnvironment::new(
+            binding.boot_identity.clone(),
+            binding.network_namespace,
+            binding.journal_identity,
+            routing_audit,
+        );
+        let writer = NativeXtablesRuntimeWriter::new(
+            NativeXtablesProcessOwnerAdapter::new(tools),
+            NativeXtablesDurableStore::new(config.durable_root),
+            environment,
+        )
+        .map_err(|source| {
+            NativeXtablesAndroidRuntimeError::new("open native xtables owner", source)
+        })?;
+        Ok(Self {
+            admission: NativeXtablesCaptureAdmission::new(tool_digest, binding),
+            convergence: NativeXtablesCaptureConverger::from_runtime_writer(writer),
+        })
+    }
+
+    /// Reconstructs a recovery-only converger from exact durable target material.
+    ///
+    /// This constructor grants no target admission. It is intended for startup and offline cleanup
+    /// before a fresh clean-state census can mint a new planning authority.
+    pub fn compose_recovery(
+        config: NativeXtablesAndroidRuntimeConfig,
+        current_boot_identity: BootIdentity,
+        current_network_namespace: NetworkNamespaceIdentity,
+    ) -> Result<Option<NativeXtablesCaptureConverger>, NativeXtablesAndroidRuntimeError> {
+        let process = XtablesRestoreProcessConfig::new(config.wait_seconds, config.timeout)
+            .map_err(|source| {
+                NativeXtablesAndroidRuntimeError::new("configure recovery xtables restore", source)
+            })?;
+        let tools = XtablesToolSetProcessAdapter::discover_standard(
+            &config.tool_root,
+            config.require_ipv6,
+            process,
+        )
+        .map_err(|source| {
+            NativeXtablesAndroidRuntimeError::new("discover recovery xtables tools", source)
+        })?;
+        let tool_digest = *tools.identity().digest().as_bytes();
+        let durable = NativeXtablesDurableStore::new(&config.durable_root);
+        let resolver =
+            DurableNativeXtablesTargetResolver::open(durable.clone()).map_err(|source| {
+                NativeXtablesAndroidRuntimeError::new("open native recovery target archive", source)
+            })?;
+        let Some(routing_audit) = resolver.recovery_routing_audit().map_err(|source| {
+            NativeXtablesAndroidRuntimeError::new("bind native recovery routing", source)
+        })?
+        else {
+            let observed = durable.observe_read_only().map_err(|source| {
+                NativeXtablesAndroidRuntimeError::new("inspect native recovery state", source)
+            })?;
+            if observed.journal_present()
+                || observed.lease_present()
+                || observed.writer_lock_present()
+            {
+                return Err(NativeXtablesAndroidRuntimeError::new(
+                    "bind native recovery target",
+                    NativeXtablesAndroidRecoveryBindingError::MissingTargetMaterial,
+                ));
+            }
+            return Ok(None);
+        };
+        let journal_identity = recovery_journal_identity(
+            &durable,
+            &current_boot_identity,
+            current_network_namespace,
+            &config.durable_root,
+            tool_digest,
+        )
+        .map_err(|source| {
+            NativeXtablesAndroidRuntimeError::new("bind native recovery owner", source)
+        })?;
+        let environment = NativeXtablesEnvironment::new(
+            current_boot_identity,
+            current_network_namespace,
+            journal_identity,
+            routing_audit,
+        );
+        let writer = NativeXtablesRuntimeWriter::new(
+            NativeXtablesProcessOwnerAdapter::new(tools),
+            durable,
+            environment,
+        )
+        .map_err(|source| {
+            NativeXtablesAndroidRuntimeError::new("open native recovery owner", source)
+        })?;
+        Ok(Some(NativeXtablesCaptureConverger::from_runtime_writer(
+            writer,
+        )))
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (NativeXtablesCaptureAdmission, NativeXtablesCaptureConverger) {
+        (self.admission, self.convergence)
+    }
+}
+
+fn recovery_journal_identity(
+    durable: &NativeXtablesDurableStore,
+    current_boot_identity: &BootIdentity,
+    current_network_namespace: NetworkNamespaceIdentity,
+    durable_root: &Path,
+    tool_digest: [u8; 32],
+) -> Result<OwnershipJournalIdentity, NativeXtablesAndroidRecoveryBindingError> {
+    if let Some(journal) = durable
+        .load_journal()
+        .map_err(NativeXtablesAndroidRecoveryBindingError::Durable)?
+    {
+        let binding = journal.binding();
+        if binding.boot_identity() == current_boot_identity
+            && binding.network_namespace() != current_network_namespace
+        {
+            return Err(NativeXtablesAndroidRecoveryBindingError::CurrentNamespaceMismatch);
+        }
+        return Ok(binding.journal_identity());
+    }
+    if let Some(lease) = durable
+        .load_lease()
+        .map_err(NativeXtablesAndroidRecoveryBindingError::Durable)?
+    {
+        if lease.boot_identity() == current_boot_identity
+            && lease.network_namespace() != current_network_namespace
+        {
+            return Err(NativeXtablesAndroidRecoveryBindingError::CurrentNamespaceMismatch);
+        }
+        return Ok(lease.journal_identity());
+    }
+
+    let mut digest = Sha256::new();
+    digest.update(ANDROID_RECOVERY_JOURNAL_IDENTITY_DOMAIN);
+    digest.update(current_boot_identity.as_str().as_bytes());
+    digest.update(current_network_namespace.device().to_be_bytes());
+    digest.update(current_network_namespace.inode().to_be_bytes());
+    digest.update(tool_digest);
+    digest.update(durable_root.as_os_str().as_bytes());
+    OwnershipJournalIdentity::new(digest.finalize().into())
+        .map_err(|_| NativeXtablesAndroidRecoveryBindingError::ZeroIdentity)
+}
+
+#[derive(Debug)]
+enum NativeXtablesAndroidRecoveryBindingError {
+    Durable(NativeXtablesDurableError),
+    MissingTargetMaterial,
+    CurrentNamespaceMismatch,
+    ZeroIdentity,
+}
+
+impl fmt::Display for NativeXtablesAndroidRecoveryBindingError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Durable(source) => source.fmt(formatter),
+            Self::MissingTargetMaterial => formatter.write_str(
+                "native ownership artifacts exist without exact archived target material",
+            ),
+            Self::CurrentNamespaceMismatch => formatter.write_str(
+                "current-boot native recovery state belongs to another network namespace",
+            ),
+            Self::ZeroIdentity => {
+                formatter.write_str("derived native recovery owner identity is zero")
+            }
+        }
+    }
+}
+
+impl Error for NativeXtablesAndroidRecoveryBindingError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Durable(source) => Some(source),
+            Self::MissingTargetMaterial | Self::CurrentNamespaceMismatch | Self::ZeroIdentity => {
+                None
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct NativeXtablesAndroidRuntimeError {
+    operation: &'static str,
+    source: Box<dyn Error + Send + Sync>,
+}
+
+impl NativeXtablesAndroidRuntimeError {
+    fn new(operation: &'static str, source: impl Error + Send + Sync + 'static) -> Self {
+        Self {
+            operation,
+            source: Box::new(source),
+        }
+    }
+}
+
+impl fmt::Display for NativeXtablesAndroidRuntimeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}: {}", self.operation, self.source)
+    }
+}
+
+impl Error for NativeXtablesAndroidRuntimeError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
 /// Opaque platform admission bound to the exact discovered xtables tool identity.
 ///
 /// There is no public constructor. Platform composition creates this value together with the
@@ -115,11 +379,15 @@ impl Error for NativeXtablesRoutingPlanError {}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeXtablesCaptureAdmission {
     tool_digest: [u8; 32],
+    binding: NativeXtablesAndroidRuntimeBinding,
 }
 
 impl NativeXtablesCaptureAdmission {
-    pub(crate) const fn from_tool_digest(tool_digest: [u8; 32]) -> Self {
-        Self { tool_digest }
+    fn new(tool_digest: [u8; 32], binding: NativeXtablesAndroidRuntimeBinding) -> Self {
+        Self {
+            tool_digest,
+            binding,
+        }
     }
 
     pub fn admit_android(
@@ -128,59 +396,9 @@ impl NativeXtablesCaptureAdmission {
         placement: RpdbPlacementLease,
         artifacts: XtablesCaptureArtifactSet,
     ) -> Result<NativeXtablesCaptureTarget, NativeXtablesCaptureAdmissionError> {
-        let mark_prerequisites = authority.deferred_mark_activation_prerequisites();
-        if let Some(first) = mark_prerequisites.first().copied() {
-            return Err(
-                NativeXtablesCaptureAdmissionError::MarkActivationPrerequisitesRemain {
-                    first,
-                    count: mark_prerequisites.len(),
-                },
-            );
-        }
-        let topology_prerequisites = authority.topology_deferred_prerequisites();
-        if let Some(first) = topology_prerequisites.first().copied() {
-            return Err(
-                NativeXtablesCaptureAdmissionError::TopologyActivationPrerequisitesRemain {
-                    first,
-                    count: topology_prerequisites.len(),
-                },
-            );
-        }
-
-        let topology = authority.topology_scope();
-        if placement.snapshot_id() != topology.snapshot_id() {
-            return Err(NativeXtablesCaptureAdmissionError::PlacementSnapshotMismatch);
-        }
-        if placement.epoch() != topology.epoch() {
-            return Err(NativeXtablesCaptureAdmissionError::PlacementEpochMismatch);
-        }
-        if placement.classifier_revision() != topology.classifier_revision() {
-            return Err(NativeXtablesCaptureAdmissionError::PlacementClassifierMismatch);
-        }
-
-        let loopback = [
-            local_output_loopback_index(&authority, NetworkAddressFamily::Ipv4)?,
-            local_output_loopback_index(&authority, NetworkAddressFamily::Ipv6)?,
-        ];
-        if loopback[0] != loopback[1] {
-            return Err(NativeXtablesCaptureAdmissionError::LoopbackIdentityMismatch);
-        }
-        let routing = [
-            admitted_routing_identity(
-                NetworkAddressFamily::Ipv4,
-                placement,
-                authority.candidate(),
-                loopback[0],
-            )?,
-            admitted_routing_identity(
-                NetworkAddressFamily::Ipv6,
-                placement,
-                authority.candidate(),
-                loopback[1],
-            )?,
-        ];
-        let routing_audit = NativePolicyRoutingAudit::new(routing)
-            .expect("one canonical routing identity was derived for each address family");
+        let routing_audit = android_routing_audit(&authority, placement)?;
+        self.binding.ensure_current(&authority, routing_audit)?;
+        let routing = *routing_audit.identities();
         let active_routing = [
             artifacts
                 .pair(XtablesRestoreFamily::Ipv4)
@@ -242,40 +460,118 @@ fn admitted_routing_identity(
     ))
 }
 
+fn android_routing_audit(
+    authority: &AndroidMarkPlanningAuthority,
+    placement: RpdbPlacementLease,
+) -> Result<NativePolicyRoutingAudit, NativeXtablesCaptureAdmissionError> {
+    let topology = authority.topology_scope();
+    if placement.snapshot_id() != topology.snapshot_id() {
+        return Err(NativeXtablesCaptureAdmissionError::PlacementSnapshotMismatch);
+    }
+    if placement.epoch() != topology.epoch() {
+        return Err(NativeXtablesCaptureAdmissionError::PlacementEpochMismatch);
+    }
+    if placement.classifier_revision() != topology.classifier_revision() {
+        return Err(NativeXtablesCaptureAdmissionError::PlacementClassifierMismatch);
+    }
+
+    let loopback = [
+        local_output_loopback_index(authority, NetworkAddressFamily::Ipv4)?,
+        local_output_loopback_index(authority, NetworkAddressFamily::Ipv6)?,
+    ];
+    if loopback[0] != loopback[1] {
+        return Err(NativeXtablesCaptureAdmissionError::LoopbackIdentityMismatch);
+    }
+    let routing = [
+        admitted_routing_identity(
+            NetworkAddressFamily::Ipv4,
+            placement,
+            authority.candidate(),
+            loopback[0],
+        )?,
+        admitted_routing_identity(
+            NetworkAddressFamily::Ipv6,
+            placement,
+            authority.candidate(),
+            loopback[1],
+        )?,
+    ];
+    NativePolicyRoutingAudit::new(routing)
+        .map_err(|_| NativeXtablesCaptureAdmissionError::LoopbackIdentityMismatch)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NativeXtablesAndroidRuntimeBinding {
+    boot_identity: BootIdentity,
+    network_namespace: NetworkNamespaceIdentity,
+    journal_identity: OwnershipJournalIdentity,
+    candidate: FwmarkCandidate,
+    policy_identity: AndroidMarkDevicePolicyIdentity,
+    policy_revision: AndroidMarkDevicePolicyRevision,
+    routing_audit: NativePolicyRoutingAudit,
+}
+
+impl NativeXtablesAndroidRuntimeBinding {
+    fn new(
+        authority: &AndroidMarkPlanningAuthority,
+        routing_audit: NativePolicyRoutingAudit,
+    ) -> Self {
+        Self {
+            boot_identity: authority.boot_identity().clone(),
+            network_namespace: authority.network_namespace(),
+            journal_identity: authority.ownership_journal_identity(),
+            candidate: authority.candidate(),
+            policy_identity: authority.policy_identity().clone(),
+            policy_revision: authority.policy_revision(),
+            routing_audit,
+        }
+    }
+
+    fn ensure_current(
+        &self,
+        authority: &AndroidMarkPlanningAuthority,
+        routing_audit: NativePolicyRoutingAudit,
+    ) -> Result<(), NativeXtablesCaptureAdmissionError> {
+        let mismatch = if authority.boot_identity() != &self.boot_identity {
+            Some("boot identity")
+        } else if authority.network_namespace() != self.network_namespace {
+            Some("network namespace")
+        } else if authority.ownership_journal_identity() != self.journal_identity {
+            Some("ownership journal")
+        } else if authority.candidate() != self.candidate {
+            Some("fwmark candidate")
+        } else if authority.policy_identity() != &self.policy_identity
+            || authority.policy_revision() != self.policy_revision
+        {
+            Some("device policy")
+        } else if routing_audit != self.routing_audit {
+            Some("policy routing")
+        } else {
+            None
+        };
+        mismatch.map_or(Ok(()), |field| {
+            Err(NativeXtablesCaptureAdmissionError::RuntimeBindingMismatch(
+                field,
+            ))
+        })
+    }
+}
+
 #[derive(Debug)]
 pub enum NativeXtablesCaptureAdmissionError {
-    MarkActivationPrerequisitesRemain {
-        first: DeferredAndroidMarkActivationPrerequisite,
-        count: usize,
-    },
-    TopologyActivationPrerequisitesRemain {
-        first: DeferredAndroidTproxyPrerequisite,
-        count: usize,
-    },
     PlacementSnapshotMismatch,
     PlacementEpochMismatch,
     PlacementClassifierMismatch,
-    MissingLocalOutputEvidence {
-        family: NetworkAddressFamily,
-    },
+    MissingLocalOutputEvidence { family: NetworkAddressFamily },
     LoopbackIdentityMismatch,
-    MissingPlacementFamily {
-        family: NetworkAddressFamily,
-    },
+    MissingPlacementFamily { family: NetworkAddressFamily },
+    RuntimeBindingMismatch(&'static str),
     Target(Box<str>),
 }
 
 impl fmt::Display for NativeXtablesCaptureAdmissionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::MarkActivationPrerequisitesRemain { first, count } => write!(
-                formatter,
-                "Android mark activation retains {count} unresolved prerequisites (first: {first:?})"
-            ),
-            Self::TopologyActivationPrerequisitesRemain { first, count } => write!(
-                formatter,
-                "Android TPROXY topology retains {count} unresolved prerequisites (first: {first:?})"
-            ),
             Self::PlacementSnapshotMismatch => formatter
                 .write_str("RPDB placement snapshot differs from Android planning evidence"),
             Self::PlacementEpochMismatch => formatter
@@ -293,6 +589,10 @@ impl fmt::Display for NativeXtablesCaptureAdmissionError {
             Self::MissingPlacementFamily { family } => write!(
                 formatter,
                 "RPDB placement has no complete {family:?} routing identity"
+            ),
+            Self::RuntimeBindingMismatch(field) => write!(
+                formatter,
+                "Android planning evidence differs from the native runtime {field} binding"
             ),
             Self::Target(detail) => write!(formatter, "native target admission rejected: {detail}"),
         }
@@ -793,7 +1093,6 @@ pub struct NativeXtablesCaptureTarget {
 }
 
 impl NativeXtablesCaptureTarget {
-    #[allow(dead_code, reason = "C2 will consume qualified Android admission")]
     pub(crate) fn from_admitted(inner: NativeXtablesAdmittedTarget) -> Self {
         let identity = public_identity(inner.identity());
         Self { inner, identity }
@@ -805,7 +1104,7 @@ impl NativeXtablesCaptureTarget {
     }
 }
 
-/// Opaque production process converger. Construction remains platform-private until C2.
+/// Opaque production process converger. Construction remains platform-private.
 pub struct NativeXtablesCaptureConverger {
     inner: NativeXtablesRuntimeWriter<NativeXtablesProcessOwnerAdapter>,
 }

@@ -178,6 +178,7 @@ pub struct RpdbFamilyPlacement {
     bypass_priority: RulePriority,
     proxy_priority: RulePriority,
     private_table: RuleTableId,
+    dedicated_address_bypass: bool,
 }
 
 impl RpdbFamilyPlacement {
@@ -212,12 +213,50 @@ impl RpdbFamilyPlacement {
             bypass_priority,
             proxy_priority,
             private_table,
+            dedicated_address_bypass: true,
+        })
+    }
+
+    /// Builds a one-rule placement for Capture Programs that bypass addresses before marking.
+    ///
+    /// The stored bypass priority aliases the proxy priority so existing identity and diagnostic
+    /// formats remain stable. `dedicated_bypass_priority` is the authoritative indication that no
+    /// address-bypass RPDB rule is part of this placement.
+    pub fn proxy_only(
+        proxy_priority: RulePriority,
+        private_table: RuleTableId,
+    ) -> Result<Self, RpdbFamilyPlacementError> {
+        if proxy_priority.get() == 0 {
+            return Err(RpdbFamilyPlacementError::UnspecifiedPriority {
+                role: RpdbPriorityRole::Proxy,
+            });
+        }
+        if RESERVED_PRIVATE_TABLES.contains(&private_table.get()) {
+            return Err(RpdbFamilyPlacementError::ReservedPrivateTable {
+                table: private_table,
+            });
+        }
+
+        Ok(Self {
+            bypass_priority: proxy_priority,
+            proxy_priority,
+            private_table,
+            dedicated_address_bypass: false,
         })
     }
 
     #[must_use]
     pub const fn bypass_priority(self) -> RulePriority {
         self.bypass_priority
+    }
+
+    #[must_use]
+    pub const fn dedicated_bypass_priority(self) -> Option<RulePriority> {
+        if self.dedicated_address_bypass {
+            Some(self.bypass_priority)
+        } else {
+            None
+        }
     }
 
     #[must_use]
@@ -428,8 +467,12 @@ impl RpdbPlacementLease {
         AddressBypassRoutingSpec::new(
             RuleTableId::from_raw(ADDRESS_BYPASS_LOOKUP_TABLE),
             protocol,
-            self.request.ipv4.map(RpdbFamilyPlacement::bypass_priority),
-            self.request.ipv6.map(RpdbFamilyPlacement::bypass_priority),
+            self.request
+                .ipv4
+                .and_then(RpdbFamilyPlacement::dedicated_bypass_priority),
+            self.request
+                .ipv6
+                .and_then(RpdbFamilyPlacement::dedicated_bypass_priority),
         )
     }
 
@@ -740,10 +783,13 @@ fn plan_family(
         if rule.destination().family() != family {
             continue;
         }
-        let role = if rule.priority() == placement.bypass_priority {
-            Some(RpdbPriorityRole::AddressBypass)
-        } else if rule.priority() == placement.proxy_priority {
+        let role = if rule.priority() == placement.proxy_priority {
             Some(RpdbPriorityRole::Proxy)
+        } else if placement
+            .dedicated_bypass_priority()
+            .is_some_and(|priority| rule.priority() == priority)
+        {
+            Some(RpdbPriorityRole::AddressBypass)
         } else {
             None
         };
@@ -775,10 +821,18 @@ fn plan_family(
         }
     }
 
-    if !(last_must_precede < placement.bypass_priority
-        && placement.bypass_priority < placement.proxy_priority
-        && placement.proxy_priority < first_terminal_barrier)
-    {
+    let priorities_fit = match placement.dedicated_bypass_priority() {
+        Some(bypass) => {
+            last_must_precede < bypass
+                && bypass < placement.proxy_priority
+                && placement.proxy_priority < first_terminal_barrier
+        }
+        None => {
+            last_must_precede < placement.proxy_priority
+                && placement.proxy_priority < first_terminal_barrier
+        }
+    };
+    if !priorities_fit {
         return Err(RpdbPlacementPlanError::PriorityWindowViolation {
             family,
             last_must_precede,

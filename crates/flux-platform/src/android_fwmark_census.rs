@@ -31,17 +31,20 @@ pub use assembly::{
     AndroidFwmarkCensusProjection, AndroidFwmarkCensusProjectionDigest,
     AndroidFwmarkCensusReportPhase, MAX_ANDROID_FWMARK_CENSUS_STAGE_BOUND,
     assemble_android_fwmark_census_projection, coordinate_android_fwmark_census,
-    parse_android_fwmark_census_probe_reports, validate_android_fwmark_census_probe_reports,
-    validate_android_fwmark_census_projection_report,
+    coordinate_android_fwmark_census_for_inventory, parse_android_fwmark_census_probe_reports,
+    validate_android_fwmark_census_probe_reports, validate_android_fwmark_census_projection_report,
     write_android_fwmark_census_projection_report,
 };
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
-pub use existing_flux::collect_android_existing_flux_ownership;
 pub use existing_flux::{
     AndroidExistingFluxOwnershipDigest, AndroidExistingFluxOwnershipError,
     AndroidExistingFluxOwnershipErrorKind, AndroidExistingFluxOwnershipObservation,
     AndroidExistingFluxProcessObservationErrorClass,
+};
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use existing_flux::{
+    collect_android_existing_flux_ownership,
+    collect_android_existing_flux_ownership_for_current_daemon,
 };
 
 pub use nftables::{

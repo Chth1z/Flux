@@ -4,14 +4,23 @@ use std::marker::PhantomData;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
-use flux_core::{FluxConfig, NetworkInventory, Reason};
+use flux_core::{
+    AndroidNetdSourceProfile, AndroidTproxyRoutingShape, AndroidTproxyTopologyScopeRequest,
+    AndroidTproxyTrafficDomainRequest, CaptureTrafficDomain, FluxConfig, FwmarkCandidate,
+    NetworkAddressFamily, NetworkInventory, Reason, RpdbFamilyPlacement, RpdbPlacementRequest,
+    RulePriority, RuleTableId, classify_android_rpdb, plan_android_rpdb_placement,
+};
+use flux_platform::{
+    AndroidFwmarkCensusCoordinatorOutcome, AndroidFwmarkCensusCoordinatorPurpose,
+    AndroidFwmarkCensusCoordinatorRequest, NativeXtablesCaptureAdmission,
+    NativeXtablesCaptureAdmissionError, NativeXtablesCaptureTarget, NetworkInventorySource,
+    SingBoxLaunchSpec, SingBoxLauncher, SingBoxReadiness, SystemAndroidFwmarkCensusSource,
+    collect_network_inventory_once, coordinate_android_fwmark_census_for_inventory,
+};
 #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
 use flux_platform::{NativeLinuxCompositionTestAdmission, NativeLinuxCompositionTestError};
-use flux_platform::{
-    NativeXtablesCaptureAdmission, NativeXtablesCaptureAdmissionError, NativeXtablesCaptureTarget,
-    NetworkInventorySource, SingBoxLaunchSpec, SingBoxLauncher, SingBoxReadiness,
-};
 
 use crate::generation_engine_config::{
     AddressReconciledGenerationInputs, AddressReconciliationError, AddressReconciliationInspection,
@@ -47,6 +56,216 @@ pub(crate) trait NativeGenerationPlanningSource: Send + 'static {
         inventory: &NetworkInventory,
     ) -> Result<GenerationPlanningAuthority, Self::Error>;
 }
+
+const SYSTEM_ANDROID_INVENTORY_BOUND: Duration = Duration::from_secs(30);
+const SYSTEM_ANDROID_CANDIDATE_MASK: u32 = 0x0300_0000;
+const SYSTEM_ANDROID_PROXY_VALUE: u32 = 0x0100_0000;
+const SYSTEM_ANDROID_BYPASS_VALUE: u32 = 0x0200_0000;
+const SYSTEM_ANDROID_PROXY_PRIORITY: u32 = 30_999;
+const SYSTEM_ANDROID_PRIVATE_TABLE: u32 = 20_253;
+
+/// Startup inventory followed by bounded one-shot refreshes for production Generation assembly.
+pub(crate) struct SystemNativeInventorySource {
+    initial: Option<Arc<NetworkInventory>>,
+}
+
+impl SystemNativeInventorySource {
+    #[must_use]
+    pub(crate) fn new(initial: Arc<NetworkInventory>) -> Self {
+        Self {
+            initial: Some(initial),
+        }
+    }
+
+    pub(crate) fn collect_initial() -> Result<Arc<NetworkInventory>, flux_platform::PlatformError> {
+        collect_network_inventory_once(SYSTEM_ANDROID_INVENTORY_BOUND)
+    }
+}
+
+impl CompleteNativeInventorySource for SystemNativeInventorySource {
+    fn snapshot(&mut self) -> Option<Arc<NetworkInventory>> {
+        self.initial
+            .take()
+            .or_else(|| collect_network_inventory_once(SYSTEM_ANDROID_INVENTORY_BOUND).ok())
+    }
+}
+
+/// Production Android planning adapter backed by the complete system census coordinator.
+pub(crate) struct SystemAndroidGenerationPlanningSource {
+    census: SystemAndroidFwmarkCensusSource,
+    initial: Option<(FluxConfig, GenerationPlanningAuthority)>,
+}
+
+impl SystemAndroidGenerationPlanningSource {
+    #[must_use]
+    pub(crate) fn for_current_daemon(durable_root: impl AsRef<Path>) -> Self {
+        Self {
+            census: SystemAndroidFwmarkCensusSource::for_current_daemon(durable_root),
+            initial: None,
+        }
+    }
+
+    pub(crate) fn plan_initial(
+        &mut self,
+        desired_state: &FluxConfig,
+        inventory: &Arc<NetworkInventory>,
+    ) -> Result<GenerationPlanningAuthority, SystemAndroidGenerationPlanningError> {
+        self.plan_fresh(desired_state, Arc::clone(inventory))
+    }
+
+    pub(crate) fn accept_initial(
+        &mut self,
+        desired_state: &FluxConfig,
+        planning: GenerationPlanningAuthority,
+    ) -> Result<(), SystemAndroidGenerationPlanningError> {
+        if self
+            .initial
+            .replace((desired_state.clone(), planning))
+            .is_some()
+        {
+            return Err(SystemAndroidGenerationPlanningError::InitialAlreadyAccepted);
+        }
+        Ok(())
+    }
+
+    fn plan_fresh(
+        &mut self,
+        desired_state: &FluxConfig,
+        inventory: Arc<NetworkInventory>,
+    ) -> Result<GenerationPlanningAuthority, SystemAndroidGenerationPlanningError> {
+        if !desired_state
+            .capture()
+            .scope()
+            .includes_domain(CaptureTrafficDomain::LocalOutput)
+        {
+            return Err(SystemAndroidGenerationPlanningError::LocalOutputRequired);
+        }
+        if desired_state
+            .capture()
+            .scope()
+            .includes_domain(CaptureTrafficDomain::ForwardedIngress)
+        {
+            return Err(SystemAndroidGenerationPlanningError::ForwardedIngressUnsupported);
+        }
+        let candidate = FwmarkCandidate::new(
+            SYSTEM_ANDROID_CANDIDATE_MASK,
+            SYSTEM_ANDROID_PROXY_VALUE,
+            SYSTEM_ANDROID_BYPASS_VALUE,
+        )
+        .expect("compiled Android mark candidate is structurally valid");
+        let topology = AndroidTproxyTopologyScopeRequest::new(
+            AndroidTproxyRoutingShape::PreMarkAddressHostSet,
+            [
+                AndroidTproxyTrafficDomainRequest::residual_local_output(
+                    NetworkAddressFamily::Ipv4,
+                ),
+                AndroidTproxyTrafficDomainRequest::residual_local_output(
+                    NetworkAddressFamily::Ipv6,
+                ),
+            ],
+        )
+        .expect("compiled Android topology request is structurally valid");
+        let request = AndroidFwmarkCensusCoordinatorRequest::new(
+            AndroidNetdSourceProfile::AospNetd20250324,
+            candidate,
+            topology,
+            SYSTEM_ANDROID_INVENTORY_BOUND,
+        )
+        .expect("compiled Android census request is structurally valid");
+        let outcome = coordinate_android_fwmark_census_for_inventory(
+            &mut self.census,
+            &request,
+            AndroidFwmarkCensusCoordinatorPurpose::PlanningAuthority,
+            Arc::clone(&inventory),
+        )
+        .map_err(|source| {
+            SystemAndroidGenerationPlanningError::Census(source.to_string().into_boxed_str())
+        })?;
+        let authority = match outcome {
+            AndroidFwmarkCensusCoordinatorOutcome::PlanningAuthority(authority) => *authority,
+            AndroidFwmarkCensusCoordinatorOutcome::Diagnostic(_) => {
+                return Err(SystemAndroidGenerationPlanningError::UnexpectedDiagnostic);
+            }
+        };
+
+        let family = RpdbFamilyPlacement::proxy_only(
+            RulePriority::from_raw(SYSTEM_ANDROID_PROXY_PRIORITY),
+            RuleTableId::from_raw(SYSTEM_ANDROID_PRIVATE_TABLE),
+        )
+        .expect("compiled Android one-rule placement is structurally valid");
+        let placement_request = RpdbPlacementRequest::new(Some(family), Some(family))
+            .expect("compiled Android placement enables both families");
+        let classification =
+            classify_android_rpdb(&inventory, AndroidNetdSourceProfile::AospNetd20250324);
+        let placement = plan_android_rpdb_placement(&inventory, &classification, placement_request)
+            .map_err(|source| {
+                SystemAndroidGenerationPlanningError::Placement(source.to_string().into_boxed_str())
+            })?;
+        Ok(GenerationPlanningAuthority::android(
+            authority,
+            Some(placement),
+        ))
+    }
+}
+
+impl NativeGenerationPlanningSource for SystemAndroidGenerationPlanningSource {
+    type Error = SystemAndroidGenerationPlanningError;
+
+    fn plan(
+        &mut self,
+        desired_state: &FluxConfig,
+        inventory: &NetworkInventory,
+    ) -> Result<GenerationPlanningAuthority, Self::Error> {
+        if let Some((planned_desired_state, initial)) = self.initial.take() {
+            if &planned_desired_state != desired_state {
+                return Err(SystemAndroidGenerationPlanningError::InitialDesiredStateChanged);
+            }
+            return Ok(initial);
+        }
+        self.plan_fresh(desired_state, Arc::new(inventory.clone()))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum SystemAndroidGenerationPlanningError {
+    LocalOutputRequired,
+    ForwardedIngressUnsupported,
+    InitialAlreadyAccepted,
+    InitialDesiredStateChanged,
+    UnexpectedDiagnostic,
+    Census(Box<str>),
+    Placement(Box<str>),
+}
+
+impl fmt::Display for SystemAndroidGenerationPlanningError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LocalOutputRequired => formatter
+                .write_str("native Android production planning requires local-OUTPUT capture"),
+            Self::ForwardedIngressUnsupported => formatter.write_str(
+                "native Android production planning does not yet admit forwarded-ingress capture",
+            ),
+            Self::InitialAlreadyAccepted => {
+                formatter.write_str("initial Android planning authority was already accepted")
+            }
+            Self::InitialDesiredStateChanged => formatter.write_str(
+                "Desired State changed between initial Android planning and Generation assembly",
+            ),
+            Self::UnexpectedDiagnostic => {
+                formatter.write_str("Android planning census returned a diagnostic-only projection")
+            }
+            Self::Census(detail) => write!(formatter, "Android planning census failed: {detail}"),
+            Self::Placement(detail) => {
+                write!(
+                    formatter,
+                    "Android proxy-only RPDB placement failed: {detail}"
+                )
+            }
+        }
+    }
+}
+
+impl Error for SystemAndroidGenerationPlanningError {}
 
 pub(crate) trait NativeGenerationTargetAdmission: Send + 'static {
     type Target: Clone + Send + 'static;
@@ -850,7 +1069,6 @@ esac
         desired_state_path: PathBuf,
         state_root: PathBuf,
         desired_state: FluxConfig,
-        accepted_subscription: Option<ValidatedSubscriptionEngineConfig>,
     }
 
     impl SourceFixture {
@@ -912,7 +1130,7 @@ esac
                     capability_profile: CapabilityProfileFixture::device_qualified(),
                 },
                 RecordingAdmission::default(),
-                accepted_subscription.clone(),
+                accepted_subscription,
             );
 
             Self {
@@ -922,7 +1140,6 @@ esac
                 desired_state_path,
                 state_root,
                 desired_state,
-                accepted_subscription,
             }
         }
 
@@ -967,6 +1184,68 @@ esac
                     .clone(),
             )
         }
+    }
+
+    #[test]
+    fn initial_desired_state_drift_rejects_the_cached_android_authority() {
+        let mut fixture = SourceFixture::new(false);
+        let inventory = fixture
+            .inventory
+            .snapshot()
+            .expect("fixture publishes a complete inventory");
+        let mut host_planning = HostPlanning {
+            capability_profile: CapabilityProfileFixture::device_qualified(),
+        };
+        let initial = host_planning
+            .plan(&fixture.desired_state, &inventory)
+            .expect("construct test planning authority");
+        let mut planning =
+            SystemAndroidGenerationPlanningSource::for_current_daemon(&fixture.state_root);
+        planning
+            .accept_initial(&fixture.desired_state, initial)
+            .expect("accept initial planning authority");
+
+        let source = fs::read_to_string(&fixture.desired_state_path)
+            .expect("read fixture Desired State")
+            .replacen(
+                "event_queue_capacity = 256",
+                "event_queue_capacity = 257",
+                1,
+            );
+        let changed = FluxConfig::parse(&source).expect("parse changed Desired State");
+        let error = planning
+            .plan(&changed, &inventory)
+            .expect_err("Desired State drift must consume no cached authority");
+
+        assert_eq!(
+            error,
+            SystemAndroidGenerationPlanningError::InitialDesiredStateChanged
+        );
+    }
+
+    #[test]
+    fn forwarded_ingress_is_rejected_before_android_census() {
+        let mut fixture = SourceFixture::new(false);
+        let inventory = fixture
+            .inventory
+            .snapshot()
+            .expect("fixture publishes a complete inventory");
+        let source = fs::read_to_string(&fixture.desired_state_path)
+            .expect("read fixture Desired State")
+            .replacen("forwarded_ingress = false", "forwarded_ingress = true", 1);
+        let forwarded = FluxConfig::parse(&source).expect("parse forwarded-ingress Desired State");
+        let missing_durable_root = fixture.state_root.join("not-created");
+        let mut planning =
+            SystemAndroidGenerationPlanningSource::for_current_daemon(missing_durable_root);
+
+        let error = planning
+            .plan_initial(&forwarded, &inventory)
+            .expect_err("forwarded ingress must be rejected before census collection");
+
+        assert_eq!(
+            error,
+            SystemAndroidGenerationPlanningError::ForwardedIngressUnsupported
+        );
     }
 
     #[test]

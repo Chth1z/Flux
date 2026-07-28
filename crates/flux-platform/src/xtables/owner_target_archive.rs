@@ -158,6 +158,21 @@ impl DurableNativeXtablesTargetResolver {
             .collect())
     }
 
+    pub(crate) fn recovery_routing_audit(
+        &self,
+    ) -> Result<Option<NativePolicyRoutingAudit>, NativeXtablesTargetArchiveError> {
+        let guard = self.lock()?;
+        let Some(first) = guard.first().map(|target| *target.routing_audit()) else {
+            return Ok(None);
+        };
+        if guard.iter().any(|target| target.routing_audit() != &first) {
+            return Err(NativeXtablesTargetArchiveError::Invalid(
+                "retained targets disagree on the recovery routing audit",
+            ));
+        }
+        Ok(Some(first))
+    }
+
     fn persist(
         &self,
         targets: &[NativeXtablesAdmittedTarget],

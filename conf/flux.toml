@@ -22,7 +22,7 @@ restart_stable_reset_ms = 30000
 [capture]
 backend = "xtables"
 local_output = true
-forwarded_ingress = true
+forwarded_ingress = false
 ipv4 = true
 ipv6 = false
 tcp = true

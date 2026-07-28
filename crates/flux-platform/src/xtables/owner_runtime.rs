@@ -2526,9 +2526,10 @@ pub use runtime_writer::{
 };
 #[allow(unused_imports)]
 pub use runtime_writer::{
-    NativeXtablesCaptureAdmission, NativeXtablesCaptureAdmissionError,
-    NativeXtablesCaptureConvergenceError, NativeXtablesCaptureConverger,
-    NativeXtablesCaptureTarget, NativeXtablesRoutingPlanError,
+    NativeXtablesAndroidRuntime, NativeXtablesAndroidRuntimeConfig,
+    NativeXtablesAndroidRuntimeError, NativeXtablesCaptureAdmission,
+    NativeXtablesCaptureAdmissionError, NativeXtablesCaptureConvergenceError,
+    NativeXtablesCaptureConverger, NativeXtablesCaptureTarget, NativeXtablesRoutingPlanError,
     plan_native_xtables_local_output_routing,
 };
 #[allow(unused_imports)]

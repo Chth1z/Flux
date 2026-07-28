@@ -505,10 +505,18 @@ pub fn plan_android_rpdb_placement(
         let Some(placement) = request.family(family) else {
             continue;
         };
-        if !(contract.uid_default_unreachable_maximum() < placement.bypass_priority()
-            && placement.bypass_priority() < placement.proxy_priority()
-            && placement.proxy_priority() < contract.default_network())
-        {
+        let priorities_fit = match placement.dedicated_bypass_priority() {
+            Some(bypass) => {
+                contract.uid_default_unreachable_maximum() < bypass
+                    && bypass < placement.proxy_priority()
+                    && placement.proxy_priority() < contract.default_network()
+            }
+            None => {
+                contract.uid_default_unreachable_maximum() < placement.proxy_priority()
+                    && placement.proxy_priority() < contract.default_network()
+            }
+        };
+        if !priorities_fit {
             return Err(
                 AndroidRpdbPlacementPlanError::StaticPriorityWindowViolation {
                     family,

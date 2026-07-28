@@ -174,6 +174,22 @@ impl GenerationPlanningAuthority {
             Self::Android { mark, .. } => mark.capability_profile(),
         }
     }
+
+    #[must_use]
+    pub(crate) const fn android_runtime_binding(
+        &self,
+    ) -> Option<(&AndroidMarkPlanningAuthority, RpdbPlacementLease)> {
+        match self {
+            Self::Android {
+                mark,
+                placement: Some(placement),
+            } => Some((mark, *placement)),
+            Self::HostInspection(_)
+            | Self::Android {
+                placement: None, ..
+            } => None,
+        }
+    }
 }
 
 pub(crate) struct GenerationAssemblyRequest<'a> {

@@ -301,7 +301,7 @@ fn valid_config_symbol(symbol: &[u8]) -> bool {
         && symbol.len() <= MAX_ANDROID_KERNEL_CONFIG_SYMBOL_BYTES
         && name
             .iter()
-            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || *byte == b'_')
+            .all(|byte| byte.is_ascii_alphabetic() || byte.is_ascii_digit() || *byte == b'_')
 }
 
 const fn config_state_tag(state: AndroidKernelConfigOptionState) -> u8 {
@@ -1137,14 +1137,14 @@ mod tests {
     #[test]
     fn parser_retains_every_option_state_and_canonicalizes_order() {
         let first = parse_android_kernel_config(
-            b"# generated\nCONFIG_ZETA=\"value\"\nCONFIG_ALPHA=y\nCONFIG_BETA=m\n# CONFIG_GAMMA is not set\n",
+            b"# generated\nCONFIG_ZETA=\"value\"\nCONFIG_ALPHA=y\nCONFIG_BETA=m\n# CONFIG_GAMMA is not set\nCONFIG_vendor_feature=y\n",
         )
         .unwrap();
         let reordered = parse_android_kernel_config(
-            b"CONFIG_BETA=m\n# CONFIG_GAMMA is not set\nCONFIG_ALPHA=y\nCONFIG_ZETA=\"value\"\n",
+            b"CONFIG_BETA=m\n# CONFIG_GAMMA is not set\nCONFIG_vendor_feature=y\nCONFIG_ALPHA=y\nCONFIG_ZETA=\"value\"\n",
         )
         .unwrap();
-        assert_eq!(first.option_count(), 4);
+        assert_eq!(first.option_count(), 5);
         assert_eq!(first.digest(), reordered.digest());
         assert_eq!(
             first.option("CONFIG_ALPHA"),
@@ -1162,6 +1162,10 @@ mod tests {
             first.option("CONFIG_ZETA"),
             Some(AndroidKernelConfigOptionState::Configured)
         );
+        assert_eq!(
+            first.option("CONFIG_vendor_feature"),
+            Some(AndroidKernelConfigOptionState::BuiltIn)
+        );
     }
 
     #[test]
@@ -1176,7 +1180,7 @@ mod tests {
                 AndroidKernelConfigParseErrorKind::MissingFinalLineFeed,
             ),
             (
-                b"CONFIG_bad=y\n".as_slice(),
+                b"CONFIG_BAD-NAME=y\n".as_slice(),
                 AndroidKernelConfigParseErrorKind::InvalidSymbol,
             ),
             (
@@ -1223,7 +1227,7 @@ mod tests {
                 SystemAndroidKernelConfigErrorClass::ParserInvalidLine,
             ),
             (
-                b"CONFIG_bad=y\n".as_slice(),
+                b"CONFIG_BAD-NAME=y\n".as_slice(),
                 SystemAndroidKernelConfigErrorClass::ParserInvalidSymbol,
             ),
             (

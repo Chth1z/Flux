@@ -4,7 +4,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 use std::time::Duration;
 
 use flux_platform::{
@@ -427,12 +427,12 @@ fn verify_device(options: &Options) -> Result<DeviceProfile, String> {
 }
 
 fn collect_root_identity(options: &Options) -> Result<NetworkNamespaceIdentity, String> {
-    let output = adb_root_shell_output(
+    let output = normalize_adb_shell_output(adb_root_shell_output(
         options,
         root_identity_script().as_bytes(),
         ADB_QUERY_TIMEOUT,
         "collect bounded root and network-namespace identity",
-    )?;
+    )?)?;
     if !output.status.success() {
         return Err(
             "the explicit Android target did not provide root identity evidence".to_owned(),
@@ -633,12 +633,12 @@ impl ArtifactIdentity {
 }
 
 fn prove_process_absent(options: &Options, boundary: &str) -> Result<(), String> {
-    let output = adb_root_shell_output(
+    let output = normalize_adb_shell_output(adb_root_shell_output(
         options,
         process_absence_script().as_bytes(),
         ADB_QUERY_TIMEOUT,
         "prove exact fwmark census process absence",
-    )?;
+    )?)?;
     if output.status.success() && output.stdout.is_empty() && output.stderr.is_empty() {
         Ok(())
     } else {
@@ -682,12 +682,12 @@ fn preflight_remote_directory(
         return Err("refusing to preflight an invalid fwmark census directory".to_owned());
     }
     revalidate_device(options, expected_device, "before remote-path preflight")?;
-    let output = adb_root_shell_output(
+    let output = normalize_adb_shell_output(adb_root_shell_output(
         options,
         preflight_remote_directory_script(remote, expected_device).as_bytes(),
         ADB_QUERY_TIMEOUT,
         "prove the generated fwmark census path absent",
-    )?;
+    )?)?;
     if !output.status.success() || !output.stdout.is_empty() || !output.stderr.is_empty() {
         return Err("generated fwmark census path is not cleanly absent".to_owned());
     }
@@ -734,12 +734,12 @@ fn create_remote_directory(
     expected_device: &DeviceProfile,
     remote: &RemoteDirectory,
 ) -> Result<FilesystemIdentity, String> {
-    let output = adb_root_shell_output(
+    let output = normalize_adb_shell_output(adb_root_shell_output(
         options,
         create_remote_directory_script(remote, expected_device).as_bytes(),
         ADB_QUERY_TIMEOUT,
         "create exact owner-marked fwmark census directory",
-    )?;
+    )?)?;
     if !output.status.success() || !output.stderr.is_empty() {
         return Err("owner-marked fwmark census directory creation failed".to_owned());
     }
@@ -811,12 +811,12 @@ fn push_execute_and_validate(
     revalidate_device(options, expected_device, "after the remote push")?;
 
     let script = remote_script(remote, artifact_identity, expected_device)?;
-    let output = adb_root_shell_output(
+    let output = normalize_adb_shell_output(adb_root_shell_output(
         options,
         script.as_bytes(),
         ADB_EXEC_TIMEOUT,
         "run bounded read-only ARM64 fwmark census",
-    )?;
+    )?)?;
     let reports = parse_probe_reports_or_sanitized_failure(
         output.status.success(),
         &output.stdout,
@@ -1018,13 +1018,15 @@ fn cleanup_remote_directory(
         cleanup_script(remote, expected_device).as_bytes(),
         ADB_CLEANUP_TIMEOUT,
         "remove exact owner-marked fwmark census directory",
-    );
+    )
+    .and_then(normalize_adb_shell_output);
     let absence = adb_root_shell_output(
         options,
         remote_absence_script(remote, expected_device).as_bytes(),
         ADB_CLEANUP_TIMEOUT,
         "independently prove fwmark census process and path absence",
-    );
+    )
+    .and_then(normalize_adb_shell_output);
     let identity_after = verify_device(options);
 
     let after = identity_after
@@ -1173,6 +1175,42 @@ fn encode_lower_hex(bytes: &[u8]) -> String {
         encoded.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
     }
     encoded
+}
+
+fn normalize_adb_shell_output(mut output: Output) -> Result<Output, String> {
+    output.stdout = normalize_adb_shell_newlines(output.stdout, "stdout")?;
+    output.stderr = normalize_adb_shell_newlines(output.stderr, "stderr")?;
+    Ok(output)
+}
+
+fn normalize_adb_shell_newlines(bytes: Vec<u8>, stream: &str) -> Result<Vec<u8>, String> {
+    if !bytes.contains(&b'\r') {
+        return Ok(bytes);
+    }
+
+    let mut normalized = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\r' if bytes.get(index + 1) == Some(&b'\n') => {
+                normalized.push(b'\n');
+                index += 2;
+            }
+            b'\r' => {
+                return Err(format!(
+                    "ADB shell {stream} contains a bare carriage return"
+                ));
+            }
+            b'\n' => {
+                return Err(format!("ADB shell {stream} mixes LF and CRLF line endings"));
+            }
+            byte => {
+                normalized.push(byte);
+                index += 1;
+            }
+        }
+    }
+    Ok(normalized)
 }
 
 fn parse_canonical_u64(value: &str, field: &str) -> Result<u64, String> {
@@ -1490,6 +1528,39 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn adb_shell_text_accepts_uniform_lf_or_crlf_and_rejects_ambiguous_framing() {
+        let lf = format!(
+            "{ROOT_IDENTITY_BEGIN}\nuid=0\nself_namespace=4:4026531840\npid1_namespace=4:4026531840\n{ROOT_IDENTITY_END}\n"
+        );
+        assert_eq!(
+            normalize_adb_shell_newlines(lf.as_bytes().to_vec(), "stdout").expect("canonical LF"),
+            lf.as_bytes()
+        );
+
+        let crlf = lf.replace('\n', "\r\n");
+        let normalized = normalize_adb_shell_newlines(crlf.into_bytes(), "stdout")
+            .expect("uniform Windows ADB CRLF");
+        assert_eq!(normalized, lf.as_bytes());
+        parse_root_identity(&normalized).expect("normalized root identity");
+
+        let probe_error =
+            b"Android fwmark census probe: collection-external-before-kernel-config\r\n".to_vec();
+        let normalized =
+            normalize_adb_shell_newlines(probe_error, "stderr").expect("uniform probe-error CRLF");
+        assert_eq!(
+            sanitized_probe_error_label(&normalized),
+            Some("collection-external-before-kernel-config")
+        );
+
+        for ambiguous in [b"one\rbare".as_slice(), b"one\r\ntwo\n".as_slice()] {
+            assert!(
+                normalize_adb_shell_newlines(ambiguous.to_vec(), "stdout").is_err(),
+                "ambiguous framing must fail closed: {ambiguous:?}"
+            );
+        }
     }
 
     #[test]

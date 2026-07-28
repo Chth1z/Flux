@@ -2087,3 +2087,19 @@ It does not yet validate the production Rust composition because that compositio
   payload-free stage. It preserves only a validated lowercase/hyphen probe class and makes cleanup
   failure take precedence. Fifteen focused tests cover this runner module, including three new
   hostile serial/path regressions; strict Clippy, rustfmt, and diff hygiene pass.
+
+## Windows ADB Root-Shell Framing (2026-07-28)
+
+- Commit `b0ea661` reduced the next quiet run to `runner-stage-device-profile`. Its mandatory and
+  independent cleanup checks found zero census paths and processes, while model, build, boot,
+  architecture, and fingerprint remained stable.
+- A separate read-only execution of the runner's exact root-identity script retained no serial or
+  namespace value and classified the transport framing as uniform CRLF. Windows `adb.exe` converts
+  the script's canonical LF output before the host parser sees it.
+- The runner now normalizes either uniform LF or uniform CRLF to canonical LF at all seven
+  root-shell response sites: identity, process absence, path preflight, directory creation, probe
+  stdout/stderr, cleanup removal, and independent cleanup absence. Mixed line endings and bare
+  carriage returns remain hard errors.
+- Sixteen focused runner tests pass. The new regression covers normalized root identity and probe
+  failure labels plus fail-closed mixed/bare-CR inputs. No networking, module, policy, or package
+  mutation occurred.

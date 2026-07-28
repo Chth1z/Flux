@@ -2790,13 +2790,11 @@ the highest-priority unqualified path as the next qualification task.
   a separate device-evidence checkpoint before U2.5.
 
 ### Status
-**S6 fixed-stage diagnostic checkpoint ready** - one attempt stopped before rebuilding the new
-probe, and a second attempt with the new artifact stopped before reports; the outer sanitizer made
-both failures generic. Both independent root proofs found zero generated census paths and zero
-probe processes with stable model/build/boot/architecture/fingerprint identity. The runner now
-discards every detailed host/ADB failure behind a fixed stage label, preserves only an already
-validated probe class, and gives cleanup failure precedence. Commit this host boundary before one
-stage-classified diagnostic.
+**S6 Windows-ADB framing fix ready** - committed fixed-stage diagnostics localized the next run to
+`device-profile`, with clean independent residue and identity proofs. A separate use of the exact
+root script proved Windows `adb.exe` converts its LF records to uniform CRLF. Normalize uniform LF
+or CRLF at every root-shell output boundary and reject mixed/bare carriage returns. Commit the
+focused regression before the next diagnostic.
 
 ### Errors Encountered
 - The first focused test/all-target check compile found that the new byte parser used the
@@ -2845,3 +2843,11 @@ stage-classified diagnostic.
   Git-metadata approval service returned HTTP 503. Leave all four reviewed files unstaged, do not
   bypass the repository boundary, and do not run an uncommitted probe. Retry only after explicit
   user approval following this recorded failure.
+- Commit `b0ea661` made the next quiet diagnostic payload-safe and localized its failure to
+  `runner-stage-device-profile`. Mandatory cleanup and a separate root read again proved zero
+  generated paths/processes and stable build, boot, architecture, model, and fingerprint. A
+  bounded invocation of the runner's exact root-identity script then proved the Windows ADB
+  transport emits uniform CRLF. The structured parser previously accepted only LF, so it rejected
+  before the probe build or remote transaction. Normalize uniform CRLF to LF for all seven
+  root-shell call sites, while rejecting mixed endings and bare carriage returns. Sixteen focused
+  runner tests pass, including root identity and sanitized probe-error CRLF regressions.

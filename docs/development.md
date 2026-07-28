@@ -160,6 +160,9 @@ fingerprint, endpoints, credentials, raw rulesets, BPF instructions, and interfa
 Runner-side failures expose only `fwmark census runner stopped at STAGE`, where `STAGE` is one
 fixed lowercase/hyphen label. A probe failure may additionally preserve its already-validated
 lowercase/hyphen collector class; arbitrary ADB, path, kernel, and tool diagnostics are discarded.
+Structured root-shell text accepts canonical LF or uniform Windows-ADB CRLF at the transport
+boundary and normalizes it to LF before parsing. Mixed endings and bare carriage returns fail
+closed.
 The `--quiet` Cargo flag is required because Cargo otherwise echoes the full child argument list,
 including the explicit serial, before `xtask` starts.
 

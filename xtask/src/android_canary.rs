@@ -12,17 +12,28 @@ use std::os::unix::process::CommandExt;
 
 use serde_json::Value;
 
+use super::android_artifact::AndroidArtifactIdentity;
+use super::android_remote::{
+    FilesystemIdentity, OwnedRemoteDirectory, OwnedRemoteDirectorySpec, normalize_adb_shell_output,
+    owned_root_functions, parse_directory_identity, path_absence_function,
+    process_absence_function, run_owned_remote_transaction, shell_single_quote,
+};
 use super::{
-    ANDROID_NDK_REVISION, ANDROID_RUSTFLAGS, LINUX_ANDROID_HOST_BUILD_TMPDIR,
-    LINUX_CANARY_INTERNAL_ENVS, LINUX_OUTPUT_TPROXY_CANARY_TEST, android_linker,
-    verify_ndk_revision,
+    ANDROID_RUSTFLAGS, ANDROID_TARGET, ANDROID_TARGET_RUSTFLAGS_ENV,
+    LINUX_ANDROID_HOST_BUILD_TMPDIR, LINUX_CANARY_INTERNAL_ENVS, LINUX_OUTPUT_TPROXY_CANARY_TEST,
+    android_kernel, android_linker, validate_aarch64_elf, verify_ndk_revision,
 };
 
-pub(super) const TARGET: &str = "x86_64-linux-android";
-const CLANG_TARGET: &str = "x86_64-linux-android";
+pub(super) const COMMAND: &str = "test-functional-canary-android-output-tproxy";
 const MINIMUM_ANDROID_SDK: u32 = 31;
-const REMOTE_DIRECTORY_TEMPLATE: &str = "/data/local/tmp/flux-output-tproxy.XXXXXX";
-const REMOTE_DIRECTORY_PREFIX: &str = "/data/local/tmp/flux-output-tproxy.";
+const REMOTE_DIRECTORY_SPEC: OwnedRemoteDirectorySpec = OwnedRemoteDirectorySpec::new(
+    "/data/local/tmp/flux-output-tproxy.",
+    32,
+    ".flux-output-tproxy-owner",
+    "flux-android-output-tproxy-owner-v1",
+);
+const REMOTE_DIRECTORY_IDENTITY_BEGIN: &str = "FLUX_ANDROID_CANARY_DIRECTORY_BEGIN";
+const REMOTE_DIRECTORY_IDENTITY_END: &str = "FLUX_ANDROID_CANARY_DIRECTORY_END";
 const REMOTE_BINARY_NAME: &str = "fluxd-test";
 const TRUSTED_ANDROID_PATH: &str = concat!(
     "/product/bin:",
@@ -47,6 +58,7 @@ const ADB_CLEANUP_TIMEOUT: Duration = Duration::from_secs(20);
 const CARGO_BUILD_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const HOST_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const HOST_OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(2);
+const RUNNER_STAGE_FAILURE_PREFIX: &str = "Android canary runner stopped at ";
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(super) struct Options {
@@ -55,10 +67,7 @@ pub(super) struct Options {
 }
 
 pub(super) fn parse_options(arguments: &[OsString]) -> Result<Options, String> {
-    Options::parse(
-        arguments,
-        "test-functional-canary-android-x86_64-output-tproxy",
-    )
+    Options::parse(arguments, COMMAND)
 }
 
 impl Options {
@@ -81,7 +90,7 @@ impl Options {
                 }
                 "--adb" if adb.is_none() => adb = Some(value.clone()),
                 "--serial" | "--adb" => return Err(format!("{flag} may only be supplied once")),
-                unknown => return Err(format!("unknown Android checkpoint option '{unknown}'")),
+                unknown => return Err(format!("unknown Android target option '{unknown}'")),
             }
             index = index.saturating_add(2);
         }
@@ -102,56 +111,202 @@ impl Options {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RunnerStage {
+    DeviceProfile,
+    NdkEnvironment,
+    NdkRevision,
+    AndroidLinker,
+    CanaryBuild,
+    ArtifactIdentity,
+    ArtifactElfValidation,
+    PrecreateDeviceIdentity,
+    RemoteToken,
+    RemotePathPreflight,
+    RemoteDirectoryCreate,
+    RemoteExecution,
+    RemoteCleanup,
+    RemoteTransaction,
+}
+
+impl RunnerStage {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::DeviceProfile => "device-profile",
+            Self::NdkEnvironment => "ndk-environment",
+            Self::NdkRevision => "ndk-revision",
+            Self::AndroidLinker => "android-linker",
+            Self::CanaryBuild => "canary-build",
+            Self::ArtifactIdentity => "artifact-identity",
+            Self::ArtifactElfValidation => "artifact-elf-validation",
+            Self::PrecreateDeviceIdentity => "precreate-device-identity",
+            Self::RemoteToken => "remote-token",
+            Self::RemotePathPreflight => "remote-path-preflight",
+            Self::RemoteDirectoryCreate => "remote-directory-create",
+            Self::RemoteExecution => "remote-execution",
+            Self::RemoteCleanup => "remote-cleanup",
+            Self::RemoteTransaction => "remote-transaction",
+        }
+    }
+}
+
 pub(super) fn run(options: Options) -> Result<(), String> {
     if env::consts::OS != "linux" {
-        return Err(
-            "the x86_64 Android canary runner currently requires a Linux/WSL host".to_owned(),
-        );
+        return Err("the Android canary runner currently requires a Linux/WSL host".to_owned());
     }
-    let device = verify_device(&options)?;
+    let device = at_runner_stage(RunnerStage::DeviceProfile, verify_device(&options))?;
     let ndk_root = env::var_os("ANDROID_NDK_HOME")
         .or_else(|| env::var_os("ANDROID_NDK_ROOT"))
         .map(PathBuf::from)
-        .ok_or_else(|| {
-            format!("ANDROID_NDK_HOME must point to Android NDK revision {ANDROID_NDK_REVISION}")
-        })?;
-    verify_ndk_revision(&ndk_root)?;
-    let linker = android_linker(&ndk_root, TARGET, CLANG_TARGET)?;
-    let artifact = build_test_artifact(&linker)?;
-    revalidate_device(&options, &device, "before remote mutation")?;
-
-    println!(
-        "validated development target serial={} model={} sdk={} abi={} kernel_arch={} kernel_release={} fingerprint={} boot_id={}",
-        options.serial,
-        device.model,
-        device.sdk,
-        device.abi,
-        device.kernel_arch,
-        device.kernel_release,
-        device.build_fingerprint,
-        device.boot_id,
-    );
-    println!(
-        "cross-built exact Android test ELF at {}",
-        artifact.display()
-    );
-
-    let remote = create_remote_directory(&options)?;
-    let execution = push_and_execute(&options, &artifact, &device, &remote);
-    let cleanup = cleanup_remote_directory(&options, &device, &remote);
-    match (execution, cleanup) {
-        (Ok(()), Ok(())) => {
-            println!(
-                "rooted x86_64 Android local-OUTPUT TPROXY checkpoint passed and removed {remote}"
-            );
-            Ok(())
-        }
-        (Err(error), Ok(())) => Err(error),
-        (Ok(()), Err(cleanup_error)) => Err(cleanup_error),
-        (Err(error), Err(cleanup_error)) => Err(format!(
-            "{error}; remote cleanup also failed: {cleanup_error}"
-        )),
+        .ok_or_else(|| runner_stage_error(RunnerStage::NdkEnvironment))?;
+    at_runner_stage(RunnerStage::NdkRevision, verify_ndk_revision(&ndk_root))?;
+    let target = device.target;
+    let linker = at_runner_stage(
+        RunnerStage::AndroidLinker,
+        android_linker(&ndk_root, target.rust_target, target.clang_target),
+    )?;
+    let artifact = at_runner_stage(
+        RunnerStage::CanaryBuild,
+        build_test_artifact(&linker, target),
+    )?;
+    let artifact_identity = at_runner_stage(
+        RunnerStage::ArtifactIdentity,
+        AndroidArtifactIdentity::from_file(&artifact, "exact Android canary ELF"),
+    )?;
+    if target.validate_aarch64_elf {
+        at_runner_stage(
+            RunnerStage::ArtifactElfValidation,
+            validate_aarch64_elf("fluxd Android canary", &artifact),
+        )?;
     }
+    at_runner_stage(
+        RunnerStage::PrecreateDeviceIdentity,
+        revalidate_device(&options, &device, "before remote mutation"),
+    )?;
+
+    println!(
+        "validated rooted {} Android target meeting SDK and kernel floors",
+        target.label
+    );
+    println!(
+        "validated exact Android canary ELF sha256={} size={}",
+        artifact_identity.sha256(),
+        artifact_identity.size(),
+    );
+
+    let mut remote = at_runner_stage(
+        RunnerStage::RemoteToken,
+        REMOTE_DIRECTORY_SPEC.generate("Android canary directory"),
+    )?;
+    at_runner_stage(
+        RunnerStage::RemotePathPreflight,
+        preflight_remote_directory(&options, &device, &remote),
+    )?;
+    let result = run_owned_remote_transaction(
+        &mut remote,
+        |remote| {
+            at_runner_stage(
+                RunnerStage::RemoteDirectoryCreate,
+                create_remote_directory(&options, &device, remote),
+            )
+        },
+        |remote| {
+            at_runner_stage(
+                RunnerStage::RemoteExecution,
+                push_and_execute(&options, &artifact, &artifact_identity, &device, remote),
+            )
+        },
+        |remote| {
+            at_runner_stage(
+                RunnerStage::RemoteCleanup,
+                cleanup_remote_directory(&options, &device, remote),
+            )
+        },
+    )
+    .map_err(sanitize_remote_transaction_error);
+    result?;
+    println!(
+        "rooted {} Android local-OUTPUT TPROXY checkpoint passed with independently proved process and path absence",
+        target.label
+    );
+    Ok(())
+}
+
+fn at_runner_stage<T>(stage: RunnerStage, result: Result<T, String>) -> Result<T, String> {
+    result.map_err(|_| runner_stage_error(stage))
+}
+
+fn runner_stage_error(stage: RunnerStage) -> String {
+    format!("{RUNNER_STAGE_FAILURE_PREFIX}{}", stage.as_str())
+}
+
+fn sanitize_remote_transaction_error(error: String) -> String {
+    if error.contains("; mandatory remote cleanup also failed: ") {
+        runner_stage_error(RunnerStage::RemoteCleanup)
+    } else if error.starts_with(RUNNER_STAGE_FAILURE_PREFIX) {
+        error
+    } else {
+        runner_stage_error(RunnerStage::RemoteTransaction)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AndroidTargetSpec {
+    label: &'static str,
+    required_abi: &'static str,
+    rust_target: &'static str,
+    clang_target: &'static str,
+    cargo_linker_env: &'static str,
+    cc_env: &'static str,
+    rustflags_env: &'static str,
+    validate_aarch64_elf: bool,
+}
+
+const ARM64_TARGET: AndroidTargetSpec = AndroidTargetSpec {
+    label: "ARM64",
+    required_abi: "arm64-v8a",
+    rust_target: ANDROID_TARGET,
+    clang_target: ANDROID_TARGET,
+    cargo_linker_env: "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER",
+    cc_env: "CC_aarch64_linux_android",
+    rustflags_env: ANDROID_TARGET_RUSTFLAGS_ENV,
+    validate_aarch64_elf: true,
+};
+
+const X86_64_TARGET: AndroidTargetSpec = AndroidTargetSpec {
+    label: "x86_64",
+    required_abi: "x86_64",
+    rust_target: "x86_64-linux-android",
+    clang_target: "x86_64-linux-android",
+    cargo_linker_env: "CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER",
+    cc_env: "CC_x86_64_linux_android",
+    rustflags_env: "CARGO_TARGET_X86_64_LINUX_ANDROID_RUSTFLAGS",
+    validate_aarch64_elf: false,
+};
+
+fn target_from_device(
+    abi_list: &str,
+    kernel_arch: &str,
+) -> Result<&'static AndroidTargetSpec, String> {
+    let target = match kernel_arch {
+        "aarch64" => &ARM64_TARGET,
+        "x86_64" => &X86_64_TARGET,
+        _ => {
+            return Err(format!(
+                "Android kernel architecture {kernel_arch:?} is unsupported; expected aarch64 or x86_64"
+            ));
+        }
+    };
+    if !abi_list
+        .split(',')
+        .any(|candidate| candidate.trim() == target.required_abi)
+    {
+        return Err(format!(
+            "Android kernel architecture {kernel_arch:?} requires ABI {} in ro.product.cpu.abilist={abi_list:?}",
+            target.required_abi,
+        ));
+    }
+    Ok(target)
 }
 
 fn validate_serial(serial: &str) -> Result<(), String> {
@@ -170,13 +325,16 @@ fn validate_serial(serial: &str) -> Result<(), String> {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct DeviceProfile {
+    target: &'static AndroidTargetSpec,
     model: String,
     sdk: u32,
-    abi: String,
+    abi_list: String,
     kernel_arch: String,
     kernel_release: String,
     build_fingerprint: String,
     boot_id: String,
+    shell_uid: u32,
+    shell_gid: u32,
 }
 
 fn verify_device(options: &Options) -> Result<DeviceProfile, String> {
@@ -187,7 +345,7 @@ fn verify_device(options: &Options) -> Result<DeviceProfile, String> {
             options.serial
         ));
     }
-    let abi = adb_text(
+    let abi_list = adb_text(
         options,
         &[
             "-s",
@@ -197,22 +355,13 @@ fn verify_device(options: &Options) -> Result<DeviceProfile, String> {
             "ro.product.cpu.abilist",
         ],
     )?;
-    if !abi.split(',').any(|candidate| candidate.trim() == "x86_64") {
-        return Err(format!(
-            "ADB serial {} does not advertise x86_64 in ro.product.cpu.abilist={abi:?}",
-            options.serial
-        ));
-    }
-    validate_profile_text("ABI list", &abi, 1024)?;
+    validate_profile_text("ABI list", &abi_list, 1024)?;
     let kernel_arch = adb_text(options, &["-s", &options.serial, "shell", "uname", "-m"])?;
-    if kernel_arch != "x86_64" {
-        return Err(format!(
-            "ADB serial {} runs kernel architecture {kernel_arch:?}, expected x86_64",
-            options.serial
-        ));
-    }
+    validate_profile_text("kernel architecture", &kernel_arch, 64)?;
+    let target = target_from_device(&abi_list, &kernel_arch)?;
     let kernel_release = adb_text(options, &["-s", &options.serial, "shell", "uname", "-r"])?;
     validate_profile_text("kernel release", &kernel_release, 256)?;
+    android_kernel::validate_supported_release(&kernel_release)?;
     let sdk_text = adb_text(
         options,
         &[
@@ -280,15 +429,44 @@ fn verify_device(options: &Options) -> Result<DeviceProfile, String> {
             options.serial
         ));
     }
+    let shell_uid = parse_canonical_u32(
+        &adb_text(
+            options,
+            &["-s", &options.serial, "shell", "/system/bin/id", "-u"],
+        )?,
+        "ADB shell UID",
+    )?;
+    let shell_gid = parse_canonical_u32(
+        &adb_text(
+            options,
+            &["-s", &options.serial, "shell", "/system/bin/id", "-g"],
+        )?,
+        "ADB shell GID",
+    )?;
     Ok(DeviceProfile {
+        target,
         model,
         sdk,
-        abi,
+        abi_list,
         kernel_arch,
         kernel_release,
         build_fingerprint,
         boot_id,
+        shell_uid,
+        shell_gid,
     })
+}
+
+fn parse_canonical_u32(value: &str, field: &str) -> Result<u32, String> {
+    if value.is_empty()
+        || (value.len() > 1 && value.starts_with('0'))
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(format!("{field} is not a canonical unsigned decimal"));
+    }
+    value
+        .parse::<u32>()
+        .map_err(|_| format!("{field} exceeds the u32 domain"))
 }
 
 fn validate_profile_text(label: &str, value: &str, maximum_bytes: usize) -> Result<(), String> {
@@ -324,14 +502,11 @@ fn revalidate_device(
     if actual == *expected {
         Ok(())
     } else {
-        Err(format!(
-            "ADB serial {} changed identity {boundary}; expected {expected:?}, got {actual:?}",
-            options.serial
-        ))
+        Err(format!("exact Android target identity changed {boundary}"))
     }
 }
 
-fn android_test_build_command(linker: &Path) -> Command {
+fn android_test_build_command(linker: &Path, target: &AndroidTargetSpec) -> Command {
     let mut command = Command::new("cargo");
     command.args([
         "test",
@@ -339,31 +514,26 @@ fn android_test_build_command(linker: &Path) -> Command {
         "fluxd",
         "--lib",
         "--target",
-        TARGET,
+        target.rust_target,
         "--no-run",
         "--message-format=json-render-diagnostics",
     ]);
-    command.env(
-        "CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER",
-        linker.as_os_str(),
-    );
-    command.env("CC_x86_64_linux_android", linker.as_os_str());
-    command.env(
-        "CARGO_TARGET_X86_64_LINUX_ANDROID_RUSTFLAGS",
-        ANDROID_RUSTFLAGS,
-    );
+    command.env(target.cargo_linker_env, linker.as_os_str());
+    command.env(target.cc_env, linker.as_os_str());
+    command.env(target.rustflags_env, ANDROID_RUSTFLAGS);
     command.env("TMPDIR", LINUX_ANDROID_HOST_BUILD_TMPDIR);
     command
 }
 
-fn build_test_artifact(linker: &Path) -> Result<PathBuf, String> {
-    let mut command = android_test_build_command(linker);
+fn build_test_artifact(linker: &Path, target: &AndroidTargetSpec) -> Result<PathBuf, String> {
+    let rust_target = target.rust_target;
+    let mut command = android_test_build_command(linker, target);
     let output = command_output_bounded(
         &mut command,
         None,
         CARGO_BUILD_TIMEOUT,
         MAX_CARGO_CAPTURE_BYTES,
-        &format!("cross-build {TARGET} test ELF"),
+        &format!("cross-build {rust_target} test ELF"),
     )?;
     if !output.stderr.is_empty() {
         std::io::stderr()
@@ -372,7 +542,7 @@ fn build_test_artifact(linker: &Path) -> Result<PathBuf, String> {
     }
     if !output.status.success() {
         return Err(format!(
-            "cross-build of {TARGET} test ELF exited with {}: {}",
+            "cross-build of {rust_target} test ELF exited with {}: {}",
             output.status,
             bounded_diagnostic(&output.stdout)
         ));
@@ -422,40 +592,74 @@ fn test_artifact_from_cargo_messages(messages: &[u8]) -> Result<PathBuf, String>
     Ok(artifact.clone())
 }
 
-fn create_remote_directory(options: &Options) -> Result<String, String> {
-    let remote = adb_text(
-        options,
-        &[
-            "-s",
-            &options.serial,
-            "shell",
-            "/system/bin/mktemp",
-            "-d",
-            REMOTE_DIRECTORY_TEMPLATE,
-        ],
-    )?;
-    if !valid_remote_directory(&remote) {
-        return Err(format!(
-            "ADB returned an invalid remote temporary directory {remote:?}"
-        ));
+fn preflight_remote_directory(
+    options: &Options,
+    expected_device: &DeviceProfile,
+    remote: &OwnedRemoteDirectory,
+) -> Result<(), String> {
+    if !remote.matches_spec() {
+        return Err("refusing to preflight an invalid Android canary directory".to_owned());
     }
-    Ok(remote)
+    revalidate_device(options, expected_device, "before remote-path preflight")?;
+    let output = normalize_adb_shell_output(adb_root_shell_output(
+        options,
+        preflight_remote_directory_script(remote, expected_device).as_bytes(),
+        ADB_QUERY_TIMEOUT,
+        "prove generated Android canary path absent",
+    )?)?;
+    if !output.status.success() || !output.stdout.is_empty() || !output.stderr.is_empty() {
+        return Err("generated Android canary path is not cleanly absent".to_owned());
+    }
+    revalidate_device(options, expected_device, "after remote-path preflight")
 }
 
-fn valid_remote_directory(path: &str) -> bool {
-    path.strip_prefix(REMOTE_DIRECTORY_PREFIX)
-        .is_some_and(|suffix| {
-            suffix.len() == 6 && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
-        })
+fn create_remote_directory(
+    options: &Options,
+    expected_device: &DeviceProfile,
+    remote: &OwnedRemoteDirectory,
+) -> Result<FilesystemIdentity, String> {
+    let output = normalize_adb_shell_output(adb_root_shell_output(
+        options,
+        create_remote_directory_script(remote, expected_device).as_bytes(),
+        ADB_QUERY_TIMEOUT,
+        "create exact owner-marked Android canary directory",
+    )?)?;
+    if !output.status.success() || !output.stderr.is_empty() {
+        return Err("owner-marked Android canary directory creation failed".to_owned());
+    }
+    parse_directory_identity(
+        &output.stdout,
+        REMOTE_DIRECTORY_IDENTITY_BEGIN,
+        REMOTE_DIRECTORY_IDENTITY_END,
+        "directory_identity",
+        "Android canary directory",
+    )
 }
 
 fn push_and_execute(
     options: &Options,
     artifact: &Path,
+    artifact_identity: &AndroidArtifactIdentity,
     expected_device: &DeviceProfile,
-    remote: &str,
+    remote: &OwnedRemoteDirectory,
 ) -> Result<(), String> {
-    let remote_binary = format!("{remote}/{REMOTE_BINARY_NAME}");
+    if remote.identity().is_none() {
+        return Err("Android canary directory identity is unavailable before execution".to_owned());
+    }
+    artifact_identity.verify_file(artifact, "exact Android canary ELF before ADB push")?;
+    revalidate_device(options, expected_device, "before remote push")?;
+    let preflight = normalize_adb_shell_output(adb_root_shell_output(
+        options,
+        execution_preflight_script(remote, expected_device).as_bytes(),
+        ADB_QUERY_TIMEOUT,
+        "validate exact owner-marked Android canary directory before push",
+    )?)?;
+    if !preflight.status.success() || !preflight.stdout.is_empty() || !preflight.stderr.is_empty() {
+        return Err("owner-marked Android canary directory changed before push".to_owned());
+    }
+    revalidate_device(options, expected_device, "immediately before remote push")?;
+
+    let remote_binary = format!("{}/{REMOTE_BINARY_NAME}", remote.path());
     let adb_artifact = artifact_path_for_adb(options, artifact)?;
     let mut push = Command::new(&options.adb);
     push.args(["-s", &options.serial, "push"])
@@ -468,35 +672,21 @@ fn push_and_execute(
         MAX_ADB_CAPTURE_BYTES,
         "push Android test ELF",
     )?;
-    forward_output(&output)?;
     if !output.status.success() {
-        return Err(format!(
-            "ADB push to {remote_binary} exited with {}",
-            output.status
-        ));
+        return Err("ADB push of the exact Android canary ELF failed".to_owned());
     }
     revalidate_device(options, expected_device, "after remote push")?;
 
-    let script = remote_script(remote, expected_device);
-    let mut command = Command::new(&options.adb);
-    command
-        .args(["-s", &options.serial, "shell", "su", "-c", "/system/bin/sh"])
-        .stdin(Stdio::piped());
-    let output = command_output_bounded(
-        &mut command,
-        Some(script.as_bytes()),
+    let output = normalize_adb_shell_output(adb_root_shell_output(
+        options,
+        remote_script(remote, artifact_identity, expected_device)?.as_bytes(),
         ADB_EXEC_TIMEOUT,
-        MAX_ADB_CAPTURE_BYTES,
         "run rooted Android checkpoint shell",
-    )?;
-    forward_output(&output)?;
-    if output.status.success() {
+    )?)?;
+    if output.status.success() && output.stderr.is_empty() {
         Ok(())
     } else {
-        Err(format!(
-            "rooted Android exact checkpoint exited with {}",
-            output.status
-        ))
+        Err("rooted Android exact checkpoint failed".to_owned())
     }
 }
 
@@ -538,78 +728,265 @@ fn uses_windows_adb(adb: &OsString) -> bool {
     adb.to_string_lossy().to_ascii_lowercase().ends_with(".exe")
 }
 
-fn remote_script(remote: &str, expected_device: &DeviceProfile) -> String {
-    let root = shell_single_quote(remote);
+fn remote_script(
+    remote: &OwnedRemoteDirectory,
+    artifact: &AndroidArtifactIdentity,
+    expected_device: &DeviceProfile,
+) -> Result<String, String> {
+    if remote.identity().is_none() {
+        return Err("Android canary directory identity is unavailable before execution".to_owned());
+    }
     let test = shell_single_quote(LINUX_OUTPUT_TPROXY_CANARY_TEST);
-    let expected_boot_id = shell_single_quote(&expected_device.boot_id);
-    let expected_fingerprint = shell_single_quote(&expected_device.build_fingerprint);
+    let expected_sha256 = shell_single_quote(artifact.sha256());
+    let expected_size = artifact.size();
     let internal_envs = LINUX_CANARY_INTERNAL_ENVS.join(" ");
-    format!(
+    Ok(format!(
         "set -eu\n\
          umask 077\n\
-         ROOT={root}\n\
+         {}\
          BIN=\"$ROOT/{REMOTE_BINARY_NAME}\"\n\
          TMPDIR=\"$ROOT/tmp\"\n\
+         EXPECTED_SHA256={expected_sha256}\n\
+         EXPECTED_SIZE='{expected_size}'\n\
          export PATH='{TRUSTED_ANDROID_PATH}'\n\
-         EXPECTED_BOOT_ID={expected_boot_id}\n\
-         EXPECTED_FINGERPRINT={expected_fingerprint}\n\
-         if [ \"$(/system/bin/cat /proc/sys/kernel/random/boot_id)\" != \"$EXPECTED_BOOT_ID\" ] || \
-            [ \"$(/system/bin/getprop ro.build.fingerprint)\" != \"$EXPECTED_FINGERPRINT\" ]; then\n\
-           echo \"exact Android device identity changed before rooted execution\" >&2\n\
-           exit 70\n\
-         fi\n\
-         cleanup() {{ rm -rf \"$ROOT\"; }}\n\
-         trap cleanup EXIT HUP INT TERM\n\
-         chown -R 0:0 \"$ROOT\"\n\
-         chmod 700 \"$ROOT\" \"$BIN\"\n\
-         mkdir \"$TMPDIR\"\n\
-         chmod 700 \"$TMPDIR\"\n\
+         {}\
+         {}\
+         {}\
+         trap remove_owned_root EXIT\n\
+         trap 'exit 70' HUP INT TERM\n\
+         identity_matches\n\
+         probe_process_absent\n\
+         owned_root_matches\n\
+         [ -f \"$BIN\" ] && [ ! -L \"$BIN\" ]\n\
+         /system/bin/chown -R 0:0 \"$ROOT\"\n\
+         /system/bin/chmod 700 \"$ROOT\" \"$BIN\"\n\
+         owned_root_matches\n\
+         [ \"$(/system/bin/stat -c '%a:%u:%g' \"$BIN\")\" = '700:0:0' ]\n\
+         ACTUAL_SHA256=$(/system/bin/sha256sum \"$BIN\" | /system/bin/cut -d ' ' -f 1)\n\
+         [ \"$ACTUAL_SHA256\" = \"$EXPECTED_SHA256\" ]\n\
+         [ \"$(/system/bin/stat -c '%s' \"$BIN\")\" = \"$EXPECTED_SIZE\" ]\n\
+         /system/bin/mkdir \"$TMPDIR\"\n\
+         /system/bin/chmod 700 \"$TMPDIR\"\n\
          export TMPDIR\n\
          unset {internal_envs}\n\
          export FLUX_LINUX_CANARY_REQUIRED=1\n\
          TEST={test}\n\
          LIST_FILE=\"$TMPDIR/list\"\n\
          if ! \"$BIN\" --ignored --exact \"$TEST\" --list >\"$LIST_FILE\"; then\n\
-           echo \"exact Android checkpoint list command failed\" >&2\n\
            exit 70\n\
          fi\n\
-         LIST_OUTPUT=$(tr -d '\\r' <\"$LIST_FILE\")\n\
-         printf '%s\\n' \"$LIST_OUTPUT\"\n\
+         LIST_OUTPUT=$(/system/bin/tr -d '\\r' <\"$LIST_FILE\")\n\
          EXPECTED_LIST=$(printf '%s: test\\n\\n1 test, 0 benchmarks' \"$TEST\")\n\
          if [ \"$LIST_OUTPUT\" != \"$EXPECTED_LIST\" ]; then\n\
-           echo \"exact Android checkpoint list contract mismatch\" >&2\n\
            exit 70\n\
          fi\n\
-         timeout -k {REMOTE_TEST_KILL_GRACE_SECONDS} {REMOTE_TEST_TIMEOUT_SECONDS} \"$BIN\" --ignored --exact \"$TEST\" --nocapture --test-threads=1\n"
-    )
+         set +e\n\
+         /system/bin/timeout -k {REMOTE_TEST_KILL_GRACE_SECONDS} {REMOTE_TEST_TIMEOUT_SECONDS} \"$BIN\" --ignored --exact \"$TEST\" --nocapture --test-threads=1\n\
+         STATUS=$?\n\
+         set -e\n\
+         probe_process_absent\n\
+         remove_owned_root\n\
+         path_absent \"$BIN\"\n\
+         path_absent \"$ROOT\"\n\
+         identity_matches\n\
+         trap - EXIT HUP INT TERM\n\
+         exit \"$STATUS\"\n",
+        remote.shell_variables(expected_device.shell_uid, expected_device.shell_gid),
+        device_identity_function(expected_device),
+        process_absence_function(REMOTE_BINARY_NAME),
+        owned_root_functions(),
+    ))
 }
 
 fn cleanup_remote_directory(
     options: &Options,
     expected_device: &DeviceProfile,
-    remote: &str,
+    remote: &OwnedRemoteDirectory,
 ) -> Result<(), String> {
+    if !remote.matches_spec() {
+        return Err("refusing cleanup for an invalid Android canary directory".to_owned());
+    }
     revalidate_device(options, expected_device, "before remote cleanup")?;
-    let expected_boot_id = shell_single_quote(&expected_device.boot_id);
-    let remove = format!(
-        "test \"$(/system/bin/cat /proc/sys/kernel/random/boot_id)\" = {expected_boot_id} && /system/bin/rm -rf {remote}"
-    );
-    adb_success_with_timeout(
+    let removal = adb_root_shell_output(
         options,
-        &["-s", &options.serial, "shell", "su", "-c", &remove],
+        cleanup_script(remote, expected_device).as_bytes(),
         ADB_CLEANUP_TIMEOUT,
-    )?;
-    revalidate_device(options, expected_device, "after remote cleanup mutation")?;
-    let absent = format!("test ! -e {remote}");
-    adb_success_with_timeout(
-        options,
-        &["-s", &options.serial, "shell", "su", "-c", &absent],
-        ADB_CLEANUP_TIMEOUT,
+        "remove exact owner-marked Android canary directory",
     )
-    .map_err(|error| {
-        format!("remote cleanup could not prove {remote} absent; inspect it manually: {error}")
-    })?;
-    revalidate_device(options, expected_device, "after remote cleanup proof")
+    .and_then(normalize_adb_shell_output);
+    let absence = adb_root_shell_output(
+        options,
+        remote_absence_script(remote, expected_device).as_bytes(),
+        ADB_CLEANUP_TIMEOUT,
+        "independently prove Android canary process and path absence",
+    )
+    .and_then(normalize_adb_shell_output);
+    revalidate_device(options, expected_device, "after remote cleanup proof")?;
+
+    let removal = removal.map_err(|error| format!("remove owned canary directory: {error}"))?;
+    if !removal.status.success() || !removal.stdout.is_empty() || !removal.stderr.is_empty() {
+        return Err("owner-marked Android canary directory removal failed".to_owned());
+    }
+    let absence = absence.map_err(|error| format!("prove Android canary absence: {error}"))?;
+    if !absence.status.success() || !absence.stdout.is_empty() || !absence.stderr.is_empty() {
+        return Err("independent Android canary process and path absence proof failed".to_owned());
+    }
+    Ok(())
+}
+
+fn preflight_remote_directory_script(
+    remote: &OwnedRemoteDirectory,
+    expected_device: &DeviceProfile,
+) -> String {
+    let root = shell_single_quote(remote.path());
+    format!(
+        "set -eu\n\
+         ROOT={root}\n\
+         export PATH='{TRUSTED_ANDROID_PATH}'\n\
+         {}\
+         {}\
+         {}\
+         identity_matches\n\
+         probe_process_absent\n\
+         path_absent \"$ROOT\"\n",
+        path_absence_function(),
+        device_identity_function(expected_device),
+        process_absence_function(REMOTE_BINARY_NAME),
+    )
+}
+
+fn create_remote_directory_script(
+    remote: &OwnedRemoteDirectory,
+    expected_device: &DeviceProfile,
+) -> String {
+    let remote_variables =
+        remote.shell_variables(expected_device.shell_uid, expected_device.shell_gid);
+    let shell_uid = expected_device.shell_uid;
+    let shell_gid = expected_device.shell_gid;
+    format!(
+        "set -eu\n\
+         umask 077\n\
+         {remote_variables}\
+         OWNER_TMP=\"$OWNER.tmp\"\n\
+         EXPECTED_SHELL_UID='{shell_uid}'\n\
+         EXPECTED_SHELL_GID='{shell_gid}'\n\
+         export PATH='{TRUSTED_ANDROID_PATH}'\n\
+         {}\
+         {}\
+         {}\
+         CREATED='0'\n\
+         CREATED_ID=''\n\
+         cleanup_partial() {{\n\
+           [ \"$CREATED\" = '1' ] || return 0\n\
+           identity_matches || return 70\n\
+           probe_process_absent\n\
+           [ -d \"$ROOT\" ] && [ ! -L \"$ROOT\" ]\n\
+           [ \"$(/system/bin/stat -Lc '%d:%i' \"$ROOT\")\" = \"$CREATED_ID\" ]\n\
+           /system/bin/rm -rf \"$ROOT\"\n\
+         }}\n\
+         trap cleanup_partial EXIT\n\
+         trap 'exit 70' HUP INT TERM\n\
+         identity_matches\n\
+         probe_process_absent\n\
+         path_absent \"$ROOT\"\n\
+         /system/bin/mkdir -m 700 \"$ROOT\"\n\
+         CREATED='1'\n\
+         CREATED_ID=$(/system/bin/stat -Lc '%d:%i' \"$ROOT\")\n\
+         printf '%s\\n' \"$EXPECTED_OWNER_RECORD\" >\"$OWNER_TMP\"\n\
+         /system/bin/chown 0:0 \"$OWNER_TMP\"\n\
+         /system/bin/chmod 600 \"$OWNER_TMP\"\n\
+         /system/bin/mv \"$OWNER_TMP\" \"$OWNER\"\n\
+         /system/bin/chown \"$EXPECTED_SHELL_UID:$EXPECTED_SHELL_GID\" \"$ROOT\"\n\
+         [ \"$(/system/bin/stat -c '%a:%u:%g' \"$ROOT\")\" = \"700:$EXPECTED_SHELL_UID:$EXPECTED_SHELL_GID\" ]\n\
+         [ -f \"$OWNER\" ] && [ ! -L \"$OWNER\" ]\n\
+         [ \"$(/system/bin/stat -c '%a:%u:%g' \"$OWNER\")\" = '600:0:0' ]\n\
+         [ \"$(/system/bin/cat \"$OWNER\")\" = \"$EXPECTED_OWNER_RECORD\" ]\n\
+         echo '{REMOTE_DIRECTORY_IDENTITY_BEGIN}'\n\
+         echo \"directory_identity=$CREATED_ID\"\n\
+         echo '{REMOTE_DIRECTORY_IDENTITY_END}'\n\
+         CREATED='0'\n\
+         trap - EXIT HUP INT TERM\n",
+        path_absence_function(),
+        device_identity_function(expected_device),
+        process_absence_function(REMOTE_BINARY_NAME),
+    )
+}
+
+fn execution_preflight_script(
+    remote: &OwnedRemoteDirectory,
+    expected_device: &DeviceProfile,
+) -> String {
+    format!(
+        "set -eu\n\
+         {}\
+         export PATH='{TRUSTED_ANDROID_PATH}'\n\
+         {}\
+         {}\
+         {}\
+         identity_matches\n\
+         probe_process_absent\n\
+         owned_root_matches\n",
+        remote.shell_variables(expected_device.shell_uid, expected_device.shell_gid),
+        device_identity_function(expected_device),
+        process_absence_function(REMOTE_BINARY_NAME),
+        owned_root_functions(),
+    )
+}
+
+fn cleanup_script(remote: &OwnedRemoteDirectory, expected_device: &DeviceProfile) -> String {
+    format!(
+        "set -eu\n\
+         {}\
+         export PATH='{TRUSTED_ANDROID_PATH}'\n\
+         {}\
+         {}\
+         {}\
+         identity_matches\n\
+         remove_owned_root\n",
+        remote.shell_variables(expected_device.shell_uid, expected_device.shell_gid),
+        device_identity_function(expected_device),
+        process_absence_function(REMOTE_BINARY_NAME),
+        owned_root_functions(),
+    )
+}
+
+fn remote_absence_script(remote: &OwnedRemoteDirectory, expected_device: &DeviceProfile) -> String {
+    format!(
+        "set -eu\n\
+         ROOT={}\n\
+         BIN=\"$ROOT/{REMOTE_BINARY_NAME}\"\n\
+         export PATH='{TRUSTED_ANDROID_PATH}'\n\
+         {}\
+         {}\
+         {}\
+         identity_matches\n\
+         path_absent \"$BIN\"\n\
+         path_absent \"$ROOT\"\n\
+         probe_process_absent\n",
+        shell_single_quote(remote.path()),
+        path_absence_function(),
+        device_identity_function(expected_device),
+        process_absence_function(REMOTE_BINARY_NAME),
+    )
+}
+
+fn device_identity_function(expected_device: &DeviceProfile) -> String {
+    let expected_boot_id = shell_single_quote(&expected_device.boot_id);
+    let expected_fingerprint = shell_single_quote(&expected_device.build_fingerprint);
+    let expected_arch = shell_single_quote(&expected_device.kernel_arch);
+    let expected_kernel_release = shell_single_quote(&expected_device.kernel_release);
+    format!(
+        "EXPECTED_BOOT_ID={expected_boot_id}\n\
+         EXPECTED_FINGERPRINT={expected_fingerprint}\n\
+         EXPECTED_ARCH={expected_arch}\n\
+         EXPECTED_KERNEL_RELEASE={expected_kernel_release}\n\
+         identity_matches() {{\n\
+           [ \"$(/system/bin/cat /proc/sys/kernel/random/boot_id)\" = \"$EXPECTED_BOOT_ID\" ] &&\n\
+           [ \"$(/system/bin/getprop ro.build.fingerprint)\" = \"$EXPECTED_FINGERPRINT\" ] &&\n\
+           [ \"$(/system/bin/uname -m)\" = \"$EXPECTED_ARCH\" ] &&\n\
+           [ \"$(/system/bin/uname -r)\" = \"$EXPECTED_KERNEL_RELEASE\" ]\n\
+         }}\n"
+    )
 }
 
 pub(super) fn adb_text(options: &Options, arguments: &[&str]) -> Result<String, String> {
@@ -1017,7 +1394,21 @@ fn reader_summary(stream_name: &str, output: &Result<Vec<u8>, String>) -> String
 }
 
 fn render_adb_command(options: &Options, arguments: &[&str]) -> String {
-    format!("{} {}", options.adb.to_string_lossy(), arguments.join(" "))
+    let mut rendered = Vec::with_capacity(arguments.len());
+    let mut redact_next = None;
+    for argument in arguments {
+        if let Some(label) = redact_next.take() {
+            rendered.push(label);
+            continue;
+        }
+        rendered.push(*argument);
+        redact_next = match *argument {
+            "-s" => Some("<redacted-serial>"),
+            "-c" => Some("<redacted-shell-command>"),
+            _ => None,
+        };
+    }
+    format!("{} {}", options.adb.to_string_lossy(), rendered.join(" "))
 }
 
 pub(super) fn forward_output(output: &Output) -> Result<(), String> {
@@ -1025,10 +1416,6 @@ pub(super) fn forward_output(output: &Output) -> Result<(), String> {
         .write_all(&output.stdout)
         .and_then(|()| std::io::stderr().write_all(&output.stderr))
         .map_err(|error| format!("forward ADB output: {error}"))
-}
-
-pub(super) fn shell_single_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 pub(super) fn bounded_diagnostic(bytes: &[u8]) -> String {
@@ -1042,14 +1429,41 @@ mod tests {
 
     fn expected_device_profile() -> DeviceProfile {
         DeviceProfile {
+            target: &X86_64_TARGET,
             model: "Windows Subsystem for Android".to_owned(),
             sdk: 33,
-            abi: "x86_64,arm64-v8a".to_owned(),
+            abi_list: "x86_64,arm64-v8a".to_owned(),
             kernel_arch: "x86_64".to_owned(),
             kernel_release: "5.15.104-wsa".to_owned(),
             build_fingerprint: "flux/wsa/device:13/test-keys".to_owned(),
             boot_id: "01234567-89ab-cdef-0123-456789abcdef".to_owned(),
+            shell_uid: 2000,
+            shell_gid: 2000,
         }
+    }
+
+    fn expected_remote_directory() -> OwnedRemoteDirectory {
+        let mut remote = REMOTE_DIRECTORY_SPEC
+            .directory_for_token(&"a1".repeat(32), "Android canary directory")
+            .expect("remote token");
+        remote
+            .bind_identity(FilesystemIdentity::new(253, 91_337).expect("filesystem identity"))
+            .expect("bind filesystem identity");
+        remote
+    }
+
+    #[test]
+    fn architecture_requires_kernel_and_abi_agreement() {
+        assert_eq!(
+            target_from_device("arm64-v8a,armeabi-v7a", "aarch64").expect("ARM64 target"),
+            &ARM64_TARGET
+        );
+        assert_eq!(
+            target_from_device("x86_64,arm64-v8a", "x86_64").expect("x86_64 target"),
+            &X86_64_TARGET
+        );
+        assert!(target_from_device("x86_64", "aarch64").is_err());
+        assert!(target_from_device("arm64-v8a", "riscv64").is_err());
     }
 
     #[test]
@@ -1082,33 +1496,41 @@ mod tests {
     }
 
     #[test]
-    fn android_test_build_uses_pinned_compiler_for_rust_and_native_code() {
-        let linker = Path::new("/ndk/toolchains/llvm/bin/x86_64-linux-android31-clang");
-        let command = android_test_build_command(linker);
-        let environment = command
-            .get_envs()
-            .collect::<std::collections::BTreeMap<_, _>>();
+    fn android_test_build_uses_the_matching_pinned_compiler_for_each_architecture() {
+        for target in [&ARM64_TARGET, &X86_64_TARGET] {
+            let linker_path = format!("/ndk/toolchains/llvm/bin/{}31-clang", target.clang_target);
+            let linker = Path::new(&linker_path);
+            let command = android_test_build_command(linker, target);
+            let environment = command
+                .get_envs()
+                .collect::<std::collections::BTreeMap<_, _>>();
+            let arguments = command
+                .get_args()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
 
-        assert_eq!(
-            environment.get(std::ffi::OsStr::new(
-                "CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER"
-            )),
-            Some(&Some(linker.as_os_str()))
-        );
-        assert_eq!(
-            environment.get(std::ffi::OsStr::new("CC_x86_64_linux_android")),
-            Some(&Some(linker.as_os_str()))
-        );
-        assert_eq!(
-            environment.get(std::ffi::OsStr::new(
-                "CARGO_TARGET_X86_64_LINUX_ANDROID_RUSTFLAGS"
-            )),
-            Some(&Some(std::ffi::OsStr::new(ANDROID_RUSTFLAGS)))
-        );
-        assert_eq!(
-            environment.get(std::ffi::OsStr::new("TMPDIR")),
-            Some(&Some(std::ffi::OsStr::new(LINUX_ANDROID_HOST_BUILD_TMPDIR)))
-        );
+            assert!(
+                arguments
+                    .windows(2)
+                    .any(|pair| { pair == ["--target", target.rust_target] })
+            );
+            assert_eq!(
+                environment.get(std::ffi::OsStr::new(target.cargo_linker_env)),
+                Some(&Some(linker.as_os_str()))
+            );
+            assert_eq!(
+                environment.get(std::ffi::OsStr::new(target.cc_env)),
+                Some(&Some(linker.as_os_str()))
+            );
+            assert_eq!(
+                environment.get(std::ffi::OsStr::new(target.rustflags_env)),
+                Some(&Some(std::ffi::OsStr::new(ANDROID_RUSTFLAGS)))
+            );
+            assert_eq!(
+                environment.get(std::ffi::OsStr::new("TMPDIR")),
+                Some(&Some(std::ffi::OsStr::new(LINUX_ANDROID_HOST_BUILD_TMPDIR)))
+            );
+        }
         assert!(ANDROID_RUSTFLAGS.contains("max-page-size=16384"));
         assert!(ANDROID_RUSTFLAGS.contains("common-page-size=16384"));
     }
@@ -1143,55 +1565,52 @@ mod tests {
     }
 
     #[test]
-    fn remote_contract_is_exact_and_fixed_to_private_data_local_tmp() {
-        assert!(valid_remote_directory(
-            "/data/local/tmp/flux-output-tproxy.a1B2c3"
-        ));
-        assert!(!valid_remote_directory(
-            "/data/local/tmp/flux-output-tproxy.a1B2c3/extra"
-        ));
+    fn remote_contract_is_owner_marked_inode_bound_and_process_clean() {
+        let remote = expected_remote_directory();
+        assert!(remote.matches_spec());
+        assert!(!REMOTE_DIRECTORY_SPEC.matches_path(&format!("{}/extra", remote.path())));
         let device = expected_device_profile();
-        let script = remote_script("/data/local/tmp/flux-output-tproxy.a1B2c3", &device);
+        let artifact = AndroidArtifactIdentity::for_test("11".repeat(32), 4096);
+        let script = remote_script(&remote, &artifact, &device).expect("remote script");
         let internal_envs = LINUX_CANARY_INTERNAL_ENVS.join(" ");
-        let expected = format!(
-            "set -eu\n\
-             umask 077\n\
-             ROOT='/data/local/tmp/flux-output-tproxy.a1B2c3'\n\
-             BIN=\"$ROOT/{REMOTE_BINARY_NAME}\"\n\
-             TMPDIR=\"$ROOT/tmp\"\n\
-             export PATH='{TRUSTED_ANDROID_PATH}'\n\
-             EXPECTED_BOOT_ID='01234567-89ab-cdef-0123-456789abcdef'\n\
-             EXPECTED_FINGERPRINT='flux/wsa/device:13/test-keys'\n\
-             if [ \"$(/system/bin/cat /proc/sys/kernel/random/boot_id)\" != \"$EXPECTED_BOOT_ID\" ] || \
-                [ \"$(/system/bin/getprop ro.build.fingerprint)\" != \"$EXPECTED_FINGERPRINT\" ]; then\n\
-               echo \"exact Android device identity changed before rooted execution\" >&2\n\
-               exit 70\n\
-             fi\n\
-             cleanup() {{ rm -rf \"$ROOT\"; }}\n\
-             trap cleanup EXIT HUP INT TERM\n\
-             chown -R 0:0 \"$ROOT\"\n\
-             chmod 700 \"$ROOT\" \"$BIN\"\n\
-             mkdir \"$TMPDIR\"\n\
-             chmod 700 \"$TMPDIR\"\n\
-             export TMPDIR\n\
-             unset {internal_envs}\n\
-             export FLUX_LINUX_CANARY_REQUIRED=1\n\
-             TEST='{LINUX_OUTPUT_TPROXY_CANARY_TEST}'\n\
-             LIST_FILE=\"$TMPDIR/list\"\n\
-             if ! \"$BIN\" --ignored --exact \"$TEST\" --list >\"$LIST_FILE\"; then\n\
-               echo \"exact Android checkpoint list command failed\" >&2\n\
-               exit 70\n\
-             fi\n\
-             LIST_OUTPUT=$(tr -d '\\r' <\"$LIST_FILE\")\n\
-             printf '%s\\n' \"$LIST_OUTPUT\"\n\
-             EXPECTED_LIST=$(printf '%s: test\\n\\n1 test, 0 benchmarks' \"$TEST\")\n\
-             if [ \"$LIST_OUTPUT\" != \"$EXPECTED_LIST\" ]; then\n\
-               echo \"exact Android checkpoint list contract mismatch\" >&2\n\
-               exit 70\n\
-             fi\n\
-             timeout -k {REMOTE_TEST_KILL_GRACE_SECONDS} {REMOTE_TEST_TIMEOUT_SECONDS} \"$BIN\" --ignored --exact \"$TEST\" --nocapture --test-threads=1\n"
-        );
-        assert_eq!(script, expected);
+        for required in [
+            "EXPECTED_OWNER_RECORD=",
+            "EXPECTED_DIRECTORY_ID='253:91337'",
+            "owned_root_matches",
+            "trap remove_owned_root EXIT",
+            "probe_process_absent",
+            "identity_matches",
+            "sha256sum \"$BIN\"",
+            "FLUX_LINUX_CANARY_REQUIRED=1",
+            &format!("unset {internal_envs}"),
+            &format!("TEST='{LINUX_OUTPUT_TPROXY_CANARY_TEST}'"),
+            "--ignored --exact \"$TEST\" --nocapture --test-threads=1",
+            "path_absent \"$BIN\"",
+            "path_absent \"$ROOT\"",
+        ] {
+            assert!(script.contains(required), "missing {required:?}");
+        }
+        assert!(script.find("owned_root_matches").unwrap() < script.find("chown -R").unwrap());
+        assert!(script.contains("for COMM in /proc/[0-9]*/comm"));
+        assert!(!script.contains("pidof"));
+        let cleanup = cleanup_script(&remote, &device);
+        assert!(cleanup.find("owned_root_matches").unwrap() < cleanup.find("rm -rf").unwrap());
+        for (boundary, proof) in [
+            (
+                "preflight",
+                preflight_remote_directory_script(&remote, &device),
+            ),
+            ("final", remote_absence_script(&remote, &device)),
+        ] {
+            assert!(
+                proof.contains(path_absence_function()),
+                "{boundary} proof lacks the shared shell predicate"
+            );
+            assert!(
+                proof.contains("path_absent \"$ROOT\""),
+                "{boundary} proof does not reject root path entries"
+            );
+        }
         assert!(!script.contains("sudo"));
         assert!(uses_windows_adb(&OsString::from("adb.exe")));
         assert!(uses_windows_adb(&OsString::from(
@@ -1200,6 +1619,85 @@ mod tests {
         assert!(!uses_windows_adb(&OsString::from("custom-adb")));
         assert!(!uses_windows_adb(&OsString::from("adb")));
         assert_eq!(shell_single_quote("flux/o'hare"), "'flux/o'\\''hare'");
+    }
+
+    #[test]
+    fn diagnostics_redact_device_identity_and_runner_stages_discard_details() {
+        let options = Options {
+            serial: "secret-serial".to_owned(),
+            adb: OsString::from("adb"),
+        };
+        let rendered = render_adb_command(
+            &options,
+            &[
+                "-s",
+                options.serial(),
+                "shell",
+                "su",
+                "-c",
+                "fingerprint=secret-fingerprint boot=secret-boot",
+            ],
+        );
+        assert_eq!(
+            rendered,
+            "adb -s <redacted-serial> shell su -c <redacted-shell-command>"
+        );
+        for stage in [
+            RunnerStage::DeviceProfile,
+            RunnerStage::RemoteDirectoryCreate,
+            RunnerStage::RemoteExecution,
+            RunnerStage::RemoteCleanup,
+        ] {
+            let error = at_runner_stage::<()>(
+                stage,
+                Err("secret-serial secret-fingerprint secret-boot /data/private".to_owned()),
+            )
+            .expect_err("stage must sanitize details");
+            assert_eq!(error, runner_stage_error(stage));
+            assert!(!error.contains("secret"));
+            assert!(!error.contains("/data/"));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn every_generated_root_script_has_valid_posix_shell_syntax() {
+        let remote = expected_remote_directory();
+        let device = expected_device_profile();
+        let scripts = [
+            preflight_remote_directory_script(&remote, &device),
+            create_remote_directory_script(&remote, &device),
+            execution_preflight_script(&remote, &device),
+            remote_script(
+                &remote,
+                &AndroidArtifactIdentity::for_test("11".repeat(32), 4096),
+                &device,
+            )
+            .expect("remote script"),
+            cleanup_script(&remote, &device),
+            remote_absence_script(&remote, &device),
+        ];
+        for script in scripts {
+            let mut child = Command::new("/bin/sh")
+                .arg("-n")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn shell syntax checker");
+            child
+                .stdin
+                .take()
+                .expect("piped shell stdin")
+                .write_all(script.as_bytes())
+                .expect("write generated shell script");
+            let output = child.wait_with_output().expect("wait for shell checker");
+            assert!(
+                output.status.success(),
+                "generated script failed shell syntax: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]

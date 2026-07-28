@@ -118,12 +118,34 @@ manager IPC.
 | Shell writer takeover and bridge ownership were recognized | Only exact native owner state is recoverable |
 | Proxy-only placement fabricated a bypass priority for identity stability | Optional bypass state is explicit and identity-tagged |
 
+## Qualification Harness Progress
+
+The current Android local-OUTPUT checkpoint now uses one command,
+`test-functional-canary-android-output-tproxy`, for both ARM64 and x86_64. It derives the Cargo/NDK
+target from verified kernel architecture plus the matching Android ABI, rejects kernels below 5.10
+or malformed complete release identities, and applies the package verifier's strict AArch64 ELF/
+interpreter/16 KiB alignment checks before an ARM64 upload. One shared artifact-identity module now
+gives the profile, census, and canary runners the same non-symlink regular-file SHA-256/size
+contract; the canary revalidates it immediately before push and on-device before execution.
+
+The canary and census also share one owner-marked remote-directory transaction: a 256-bit
+host-generated token, root-owned owner record, creation-time device/inode identity, fail-closed
+`/proc` process scan, mandatory cleanup after ambiguous creation, and independent absence proof.
+The canary checks device identity and directory ownership immediately before push, suppresses raw
+ADB/test output, and exposes only sanitized pass/fail stages. The retired x86_64-specific command
+has no dispatcher or help alias.
+
+This is host-side qualification infrastructure, not a production adapter or device result. No ADB
+target was attached in this pass, so native admission remains intentionally read-only under the
+packaged VPN and functional-canary requirements.
+
 ## Remaining Work
 
 ### P0: release correctness
 
-1. Attach a rooted ARM64 Android 5.10+ target and run the read-only capability, namespace, netd,
-   VPN, mark-census, RPDB, listener, and payload-identity probes.
+1. Attach a rooted ARM64 Android 5.10+ target and run the profile, mark-ordering, fwmark-census, and
+   architecture-neutral local-OUTPUT commands, followed by the reviewed VPN, RPDB, listener, and
+   payload-identity matrix.
 2. Implement and qualify the Android VPN-policy adapter against observed netd/Connectivity behavior.
 3. Implement and qualify the production local-OUTPUT functional-canary observer, binding exact
    transparent-listener delivery, supervised-engine receipt, pre/post identity, bounded counters,
@@ -165,6 +187,10 @@ aliases, or speculative backend selection to bypass the P0 physical evidence gat
 - `cargo test -p fluxd --test startup_reconciliation_admission`: 5 passed.
 - `cargo test -p flux-platform --test reactor`: 16 passed.
 - `cargo test -p fluxd --test control_protocol`: 16 passed.
+- `cargo test -p xtask`: 73 passed, 3 ignored; covers ARM64/x86_64 target selection, complete kernel
+  grammar, shared artifact drift detection, owner/inode-bound remote transactions, sanitized
+  diagnostics, strict dangling-symlink-aware path absence, current-command uniqueness, pinned
+  toolchain construction, bounded command cleanup, and existing collectors.
 - `cargo xtask ci`: passed with exit code 0 after replacing retired `fluxctl` tokens in raw
   protocol-v5 test fixtures, boxing the startup-only configured admission state, simplifying the
   remaining current xtables save case, documenting each signal-set unsafe contract, and replacing

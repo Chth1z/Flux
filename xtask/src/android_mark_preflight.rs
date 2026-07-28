@@ -13,6 +13,7 @@ use flux_platform::internal::{
 };
 
 use super::android_canary::{self, Options};
+use super::android_kernel::meets_supported_floor as kernel_meets_floor;
 
 const COMMAND: &str = "preflight-android-arm64-mark-ordering";
 const MINIMUM_ANDROID_SDK: u32 = 31;
@@ -648,36 +649,6 @@ fn preflight_identity_property<'a>(
     properties
         .get(name)
         .map(|value| (!value.is_empty()).then_some(value.as_bytes()))
-}
-
-fn kernel_meets_floor(release: &str) -> bool {
-    let mut components = release.split('.');
-    let Some(major) = components.next().and_then(decimal_component) else {
-        return false;
-    };
-    let Some(minor) = components.next().and_then(decimal_component) else {
-        return false;
-    };
-    if components.next().and_then(decimal_prefix).is_none() {
-        return false;
-    }
-    (major, minor) >= (5, 10)
-}
-
-fn decimal_component(component: &str) -> Option<u32> {
-    (!component.is_empty() && component.bytes().all(|byte| byte.is_ascii_digit()))
-        .then(|| component.parse::<u32>().ok())
-        .flatten()
-}
-
-fn decimal_prefix(component: &str) -> Option<u32> {
-    let digits = component
-        .bytes()
-        .take_while(u8::is_ascii_digit)
-        .collect::<Vec<_>>();
-    (!digits.is_empty())
-        .then(|| std::str::from_utf8(&digits).ok()?.parse::<u32>().ok())
-        .flatten()
 }
 
 fn build_family_report(

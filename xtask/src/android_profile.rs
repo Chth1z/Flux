@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::OsString;
-use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -9,13 +8,15 @@ use std::time::Duration;
 
 use serde_json::Value;
 
+use super::android_artifact::AndroidArtifactIdentity as ArtifactIdentity;
 use super::android_canary::{
     Options, adb_root_shell_output, adb_success_with_timeout, adb_text, artifact_path_for_adb,
-    bounded_diagnostic, command_output_bounded, forward_output, shell_single_quote,
+    bounded_diagnostic, command_output_bounded, forward_output,
 };
+use super::android_remote::shell_single_quote;
 use super::{
     ANDROID_NDK_REVISION, ANDROID_RUSTFLAGS, ANDROID_TARGET, ANDROID_TARGET_RUSTFLAGS_ENV,
-    LINUX_ANDROID_HOST_BUILD_TMPDIR, android_linker, sha256_file, verify_ndk_revision,
+    LINUX_ANDROID_HOST_BUILD_TMPDIR, android_linker, verify_ndk_revision,
 };
 
 const COMMAND: &str = "collect-android-arm64-profile";
@@ -68,7 +69,7 @@ pub(super) fn run(options: Options) -> Result<(), String> {
     verify_ndk_revision(&ndk_root)?;
     let linker = android_linker(&ndk_root, ANDROID_TARGET, CLANG_TARGET)?;
     let artifact = build_probe_artifact(&linker)?;
-    let artifact_identity = ArtifactIdentity::from_file(&artifact)?;
+    let artifact_identity = ArtifactIdentity::from_file(&artifact, "exact profile probe")?;
     revalidate_device(&options, &device, "before remote mutation")?;
 
     println!(
@@ -77,7 +78,8 @@ pub(super) fn run(options: Options) -> Result<(), String> {
     );
     println!(
         "cross-built exact profile probe ELF sha256={} size={}",
-        artifact_identity.sha256, artifact_identity.size,
+        artifact_identity.sha256(),
+        artifact_identity.size(),
     );
 
     let remote = create_remote_directory(&options)?;
@@ -351,32 +353,6 @@ fn test_artifact_from_cargo_messages(messages: &[u8]) -> Result<PathBuf, String>
     Ok(artifact.clone())
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct ArtifactIdentity {
-    sha256: String,
-    size: u64,
-}
-
-impl ArtifactIdentity {
-    fn from_file(path: &Path) -> Result<Self, String> {
-        let metadata = fs::symlink_metadata(path)
-            .map_err(|error| format!("inspect exact profile probe {}: {error}", path.display()))?;
-        if metadata.file_type().is_symlink()
-            || !metadata.file_type().is_file()
-            || metadata.len() == 0
-        {
-            return Err(format!(
-                "exact profile probe {} must be one non-empty regular file",
-                path.display()
-            ));
-        }
-        Ok(Self {
-            sha256: sha256_file(path)?,
-            size: metadata.len(),
-        })
-    }
-}
-
 fn create_remote_directory(options: &Options) -> Result<String, String> {
     let remote = adb_text(
         options,
@@ -556,8 +532,8 @@ fn validate_profile_report(
     }
     require_u64(&fields, "network_namespace_device")?;
     require_field(&fields, "tool_id", "fluxd")?;
-    require_field(&fields, "tool_sha256", &expected_artifact.sha256)?;
-    require_field(&fields, "tool_size", &expected_artifact.size.to_string())
+    require_field(&fields, "tool_sha256", expected_artifact.sha256())?;
+    require_field(&fields, "tool_size", &expected_artifact.size().to_string())
 }
 
 const EXPECTED_PROFILE_FIELDS: [&str; 27] = [
@@ -782,10 +758,7 @@ mod tests {
     #[test]
     fn profile_report_binds_boot_build_kernel_and_exact_probe_elf() {
         let expected = expected_device();
-        let artifact = ArtifactIdentity {
-            sha256: "11".repeat(32),
-            size: 4096,
-        };
+        let artifact = ArtifactIdentity::for_test("11".repeat(32), 4096);
         let report = [
             "authority=read_only_profile_evidence_no_mutation_authority".to_owned(),
             "schema_version=1".to_owned(),
@@ -810,8 +783,8 @@ mod tests {
             format!("connectivity_sha256={}", "66".repeat(32)),
             "connectivity_size=3".to_owned(),
             "tool_id=fluxd".to_owned(),
-            format!("tool_sha256={}", artifact.sha256),
-            format!("tool_size={}", artifact.size),
+            format!("tool_sha256={}", artifact.sha256()),
+            format!("tool_size={}", artifact.size()),
             "network_namespace_device=4".to_owned(),
             "network_namespace_inode=40".to_owned(),
         ]
@@ -830,10 +803,7 @@ mod tests {
         let error = validate_profile_report(
             malformed.as_bytes(),
             &expected_device(),
-            &ArtifactIdentity {
-                sha256: "22".repeat(32),
-                size: 1,
-            },
+            &ArtifactIdentity::for_test("22".repeat(32), 1),
         )
         .expect_err("hyphenated field must be rejected");
         assert!(error.contains("invalid field"));

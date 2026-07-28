@@ -8,10 +8,13 @@ use std::process::{Command, ExitStatus};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+mod android_artifact;
 mod android_canary;
 mod android_fwmark_census;
+mod android_kernel;
 mod android_mark_preflight;
 mod android_profile;
+mod android_remote;
 mod platform_glue;
 
 const ANDROID_TARGET: &str = "aarch64-linux-android";
@@ -221,9 +224,7 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
             require_no_arguments(&arguments)?;
             test_parser_fuzz_smoke()
         }
-        "test-functional-canary-android-x86_64-output-tproxy" => {
-            android_canary::run(android_canary::parse_options(&arguments)?)
-        }
+        android_canary::COMMAND => android_canary::run(android_canary::parse_options(&arguments)?),
         "preflight-android-arm64-mark-ordering" => {
             android_mark_preflight::run(android_mark_preflight::parse_options(&arguments)?)
         }
@@ -1224,7 +1225,7 @@ fn validate_release_manifest(
             "device_test_evidence.kernel_release",
             &evidence.kernel_release,
         )?;
-        validate_kernel_release_floor(&evidence.kernel_release)?;
+        android_kernel::validate_supported_release(&evidence.kernel_release)?;
         validate_boot_id(&evidence.boot_id)?;
         if !matches!(
             evidence.verified_boot_state.as_str(),
@@ -1733,31 +1734,6 @@ fn require_android_build_fingerprint(value: &str) -> Result<(), String> {
     } else {
         Err("device-test evidence must contain a normalized Android build fingerprint".to_owned())
     }
-}
-
-fn validate_kernel_release_floor(value: &str) -> Result<(), String> {
-    let mut components = value.split('.');
-    let major = components
-        .next()
-        .and_then(|part| part.parse::<u32>().ok())
-        .ok_or_else(|| "device-test kernel release has no numeric major version".to_owned())?;
-    let minor_text = components
-        .next()
-        .ok_or_else(|| "device-test kernel release has no minor version".to_owned())?;
-    let minor_digits = minor_text
-        .bytes()
-        .take_while(u8::is_ascii_digit)
-        .collect::<Vec<_>>();
-    let minor = std::str::from_utf8(&minor_digits)
-        .ok()
-        .and_then(|part| part.parse::<u32>().ok())
-        .ok_or_else(|| "device-test kernel release has no numeric minor version".to_owned())?;
-    if (major, minor) < (5, 10) {
-        return Err(format!(
-            "device-test kernel release {value} is below the supported 5.10 floor"
-        ));
-    }
-    Ok(())
 }
 
 fn validate_boot_id(value: &str) -> Result<(), String> {
@@ -2514,7 +2490,12 @@ fn require_success(command: &str, status: ExitStatus) -> Result<(), String> {
 }
 
 fn print_help() {
-    println!(
+    println!("{}", help_text());
+}
+
+fn help_text() -> String {
+    let android_canary_command = android_canary::COMMAND;
+    format!(
         "Flux build tasks\n\n\
          Usage: cargo xtask <COMMAND>\n\n\
          Commands:\n\
@@ -2530,14 +2511,14 @@ fn print_help() {
            test-functional-canary-linux-output-preflight  Preflight distinct local-OUTPUT credentials (no traffic)\n\
            test-native-composition-linux  Run the single-owner native lifecycle and recovery checkpoint\n\
            test-parser-fuzz-smoke  Run bounded deterministic parser no-panic smoke tests\n\
-           test-functional-canary-android-x86_64-output-tproxy  Cross-build and run the exact checkpoint on one explicit rooted x86_64 Android serial\n\
+           {android_canary_command}  Cross-build and run the exact checkpoint on one explicit rooted ARM64 or x86_64 Android serial\n\
            preflight-android-arm64-mark-ordering  Read-only ADR-0013 target viability report for one explicit rooted ARM64 Android serial\n\
            collect-android-arm64-profile  Run the production profile collector in one cleaned explicit-serial ARM64 test directory\n\
            collect-android-arm64-fwmark-census  Run the coherent read-only fwmark census in one cleaned explicit-serial ARM64 test directory\n\
            stage-module   Build and stage the native Magisk tree; requires --stage DIR --runtime-binaries DIR\n\
            verify-package Verify the native package contract; requires --stage DIR\n\
            ci             Run host gates plus the pinned-NDK Android cross-check"
-    );
+    )
 }
 
 #[cfg(test)]
@@ -2723,6 +2704,23 @@ mod tests {
         assert_eq!(parse_native_composition_required(Some("0")), Ok(false));
         assert_eq!(parse_native_composition_required(Some("1")), Ok(true));
         assert!(parse_native_composition_required(Some("true")).is_err());
+    }
+
+    #[test]
+    fn android_canary_exposes_one_current_command_without_a_compatibility_alias() {
+        let help = help_text();
+        assert_eq!(help.matches(android_canary::COMMAND).count(), 1);
+        assert!(!help.contains("test-functional-canary-android-x86_64-output-tproxy"));
+
+        let current = run([OsString::from(android_canary::COMMAND)])
+            .expect_err("the current command still requires an explicit serial");
+        assert!(current.contains("requires --serial SERIAL"), "{current}");
+
+        let retired = run([OsString::from(
+            "test-functional-canary-android-x86_64-output-tproxy",
+        )])
+        .expect_err("the retired command must not dispatch");
+        assert!(retired.starts_with("unknown command"), "{retired}");
     }
 
     #[test]

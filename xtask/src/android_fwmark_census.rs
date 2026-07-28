@@ -1,10 +1,9 @@
 use std::collections::BTreeSet;
 use std::env;
 use std::ffi::OsString;
-use std::fs;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Output};
+use std::process::{Command, ExitStatus};
 use std::time::Duration;
 
 use flux_platform::{
@@ -13,14 +12,20 @@ use flux_platform::{
 };
 use serde_json::Value;
 
+use super::android_artifact::AndroidArtifactIdentity as ArtifactIdentity;
 use super::android_canary::{
     Options, adb_root_shell_output, adb_text, artifact_path_for_adb, bounded_diagnostic,
-    command_output_bounded, shell_single_quote,
+    command_output_bounded,
+};
+use super::android_remote::{
+    FilesystemIdentity, OwnedRemoteDirectory as RemoteDirectory, OwnedRemoteDirectorySpec,
+    normalize_adb_shell_output, owned_root_functions, parse_directory_identity,
+    path_absence_function, process_absence_function, run_owned_remote_transaction,
+    shell_single_quote,
 };
 use super::{
     ANDROID_MIN_LOAD_ALIGNMENT, ANDROID_RUSTFLAGS, ANDROID_TARGET, ANDROID_TARGET_RUSTFLAGS_ENV,
-    LINUX_ANDROID_HOST_BUILD_TMPDIR, android_linker, sha256_file, validate_aarch64_elf,
-    verify_ndk_revision,
+    LINUX_ANDROID_HOST_BUILD_TMPDIR, android_linker, validate_aarch64_elf, verify_ndk_revision,
 };
 
 const COMMAND: &str = "collect-android-arm64-fwmark-census";
@@ -30,10 +35,12 @@ const CC_ENV: &str = "CC_aarch64_linux_android";
 const REQUIRED_ENV: &str = "FLUX_ANDROID_FWMARK_CENSUS_REQUIRED";
 const PROBE_BINARY_TARGET: &str = "android-fwmark-census-probe";
 const PROCESS_AND_REMOTE_BINARY_NAME: &str = "flx-census";
-const REMOTE_DIRECTORY_PREFIX: &str = "/data/local/tmp/flux-census.";
-const REMOTE_DIRECTORY_TOKEN_BYTES: usize = 32;
-const REMOTE_OWNER_FILE: &str = ".flux-census-owner";
-const REMOTE_OWNER_DOMAIN: &str = "flux-android-fwmark-census-owner-v1";
+const REMOTE_DIRECTORY_SPEC: OwnedRemoteDirectorySpec = OwnedRemoteDirectorySpec::new(
+    "/data/local/tmp/flux-census.",
+    32,
+    ".flux-census-owner",
+    "flux-android-fwmark-census-owner-v1",
+);
 const REMOTE_DIRECTORY_IDENTITY_BEGIN: &str = "FLUX_ANDROID_FWMARK_CENSUS_DIRECTORY_BEGIN";
 const REMOTE_DIRECTORY_IDENTITY_END: &str = "FLUX_ANDROID_FWMARK_CENSUS_DIRECTORY_END";
 const ROOT_IDENTITY_BEGIN: &str = "FLUX_ANDROID_ROOT_IDENTITY_BEGIN";
@@ -180,7 +187,7 @@ pub(super) fn run(options: Options) -> Result<(), String> {
     let artifact = at_runner_stage(RunnerStage::ProbeBuild, build_probe_artifact(&linker))?;
     let artifact_identity = at_runner_stage(
         RunnerStage::ArtifactIdentity,
-        ArtifactIdentity::from_file(&artifact),
+        ArtifactIdentity::from_file(&artifact, "exact census probe"),
     )?;
     at_runner_stage(
         RunnerStage::ArtifactElfValidation,
@@ -197,15 +204,19 @@ pub(super) fn run(options: Options) -> Result<(), String> {
     );
     println!(
         "validated stripped release census ELF sha256={} size={} minimum_load_alignment={ANDROID_MIN_LOAD_ALIGNMENT}",
-        artifact_identity.sha256, artifact_identity.size,
+        artifact_identity.sha256(),
+        artifact_identity.size(),
     );
 
-    let mut remote = at_runner_stage(RunnerStage::RemoteToken, RemoteDirectory::generate())?;
+    let mut remote = at_runner_stage(
+        RunnerStage::RemoteToken,
+        REMOTE_DIRECTORY_SPEC.generate("fwmark census directory"),
+    )?;
     at_runner_stage(
         RunnerStage::RemotePathPreflight,
         preflight_remote_directory(&options, &device, &remote),
     )?;
-    let result = run_remote_transaction(
+    let result = run_owned_remote_transaction(
         &mut remote,
         |remote| {
             at_runner_stage(
@@ -313,48 +324,6 @@ fn canonical_probe_error_label(label: &str) -> bool {
 struct NetworkNamespaceIdentity {
     device: u64,
     inode: u64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct FilesystemIdentity {
-    device: u64,
-    inode: u64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct RemoteDirectory {
-    path: String,
-    token: String,
-    identity: Option<FilesystemIdentity>,
-}
-
-impl RemoteDirectory {
-    fn generate() -> Result<Self, String> {
-        let mut bytes = [0_u8; REMOTE_DIRECTORY_TOKEN_BYTES];
-        fs::File::open("/dev/urandom")
-            .and_then(|mut source| source.read_exact(&mut bytes))
-            .map_err(|error| format!("generate fwmark census directory token: {error}"))?;
-        Self::from_token(&encode_lower_hex(&bytes))
-    }
-
-    fn from_token(token: &str) -> Result<Self, String> {
-        if token.len() != REMOTE_DIRECTORY_TOKEN_BYTES * 2
-            || !token
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
-            return Err("fwmark census directory token is not canonical 256-bit hex".to_owned());
-        }
-        Ok(Self {
-            path: format!("{REMOTE_DIRECTORY_PREFIX}{token}"),
-            token: token.to_owned(),
-            identity: None,
-        })
-    }
-
-    fn owner_record(&self) -> String {
-        format!("{REMOTE_OWNER_DOMAIN}:{}", self.token)
-    }
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -664,29 +633,6 @@ fn artifact_from_cargo_messages(messages: &[u8]) -> Result<PathBuf, String> {
     Ok(artifact.clone())
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct ArtifactIdentity {
-    sha256: String,
-    size: u64,
-}
-
-impl ArtifactIdentity {
-    fn from_file(path: &Path) -> Result<Self, String> {
-        let metadata = fs::symlink_metadata(path)
-            .map_err(|error| format!("inspect exact census probe {}: {error}", path.display()))?;
-        if metadata.file_type().is_symlink()
-            || !metadata.file_type().is_file()
-            || metadata.len() == 0
-        {
-            return Err("the exact census probe must be one non-empty regular file".to_owned());
-        }
-        Ok(Self {
-            sha256: sha256_file(path)?,
-            size: metadata.len(),
-        })
-    }
-}
-
 fn prove_process_absent(options: &Options, boundary: &str) -> Result<(), String> {
     let output = normalize_adb_shell_output(adb_root_shell_output(
         options,
@@ -703,28 +649,13 @@ fn prove_process_absent(options: &Options, boundary: &str) -> Result<(), String>
     }
 }
 
-fn process_absence_function() -> String {
-    format!(
-        "probe_process_absent() {{\n\
-           for COMM in /proc/[0-9]*/comm; do\n\
-             [ -e \"$COMM\" ] || continue\n\
-             if ! NAME=$(/system/bin/cat \"$COMM\"); then\n\
-               [ ! -e \"$COMM\" ] && continue\n\
-               return 71\n\
-             fi\n\
-             [ \"$NAME\" != '{PROCESS_AND_REMOTE_BINARY_NAME}' ] || return 72\n\
-           done\n\
-         }}\n"
-    )
-}
-
 fn process_absence_script() -> String {
     format!(
         "set -eu\n\
          export PATH='{TRUSTED_ANDROID_PATH}'\n\
          {}\
          probe_process_absent\n",
-        process_absence_function()
+        process_absence_function(PROCESS_AND_REMOTE_BINARY_NAME)
     )
 }
 
@@ -733,7 +664,7 @@ fn preflight_remote_directory(
     expected_device: &DeviceProfile,
     remote: &RemoteDirectory,
 ) -> Result<(), String> {
-    if !valid_remote_directory(&remote.path) {
+    if !remote.matches_spec() {
         return Err("refusing to preflight an invalid fwmark census directory".to_owned());
     }
     revalidate_device(options, expected_device, "before remote-path preflight")?;
@@ -747,41 +678,6 @@ fn preflight_remote_directory(
         return Err("generated fwmark census path is not cleanly absent".to_owned());
     }
     revalidate_device(options, expected_device, "after remote-path preflight")
-}
-
-fn run_remote_transaction<Create, Execute, Cleanup>(
-    remote: &mut RemoteDirectory,
-    create: Create,
-    execute: Execute,
-    cleanup: Cleanup,
-) -> Result<(), String>
-where
-    Create: FnOnce(&RemoteDirectory) -> Result<FilesystemIdentity, String>,
-    Execute: FnOnce(&RemoteDirectory) -> Result<(), String>,
-    Cleanup: FnOnce(&RemoteDirectory) -> Result<(), String>,
-{
-    let execution = match create(remote) {
-        Ok(identity) => {
-            remote.identity = Some(identity);
-            execute(remote)
-        }
-        Err(error) => Err(error),
-    };
-    combine_execution_and_cleanup(execution, cleanup(remote))
-}
-
-fn combine_execution_and_cleanup(
-    execution: Result<(), String>,
-    cleanup: Result<(), String>,
-) -> Result<(), String> {
-    match (execution, cleanup) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(()), Err(cleanup_error)) => Err(cleanup_error),
-        (Err(error), Err(cleanup_error)) => Err(format!(
-            "{error}; mandatory remote cleanup also failed: {cleanup_error}"
-        )),
-    }
 }
 
 fn create_remote_directory(
@@ -802,42 +698,13 @@ fn create_remote_directory(
 }
 
 fn parse_remote_directory_identity(bytes: &[u8]) -> Result<FilesystemIdentity, String> {
-    let text = std::str::from_utf8(bytes)
-        .map_err(|_| "fwmark census directory identity is not UTF-8".to_owned())?;
-    let lines = text.trim_end_matches('\n').split('\n').collect::<Vec<_>>();
-    let [begin, identity, end] = lines.as_slice() else {
-        return Err("fwmark census directory identity has an invalid line count".to_owned());
-    };
-    if *begin != REMOTE_DIRECTORY_IDENTITY_BEGIN || *end != REMOTE_DIRECTORY_IDENTITY_END {
-        return Err("fwmark census directory identity has an invalid schema".to_owned());
-    }
-    parse_filesystem_identity_field(identity, "directory_identity")
-}
-
-fn parse_filesystem_identity_field(line: &str, key: &str) -> Result<FilesystemIdentity, String> {
-    let value = line
-        .strip_prefix(key)
-        .and_then(|suffix| suffix.strip_prefix('='))
-        .ok_or_else(|| format!("{key} is missing"))?;
-    let (device, inode) = value
-        .split_once(':')
-        .ok_or_else(|| format!("{key} is malformed"))?;
-    let device = parse_canonical_u64(device, key)?;
-    let inode = parse_canonical_u64(inode, key)?;
-    if inode == 0 {
-        return Err(format!("{key} has a zero inode"));
-    }
-    Ok(FilesystemIdentity { device, inode })
-}
-
-fn valid_remote_directory(path: &str) -> bool {
-    path.strip_prefix(REMOTE_DIRECTORY_PREFIX)
-        .is_some_and(|suffix| {
-            suffix.len() == REMOTE_DIRECTORY_TOKEN_BYTES * 2
-                && suffix
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        })
+    parse_directory_identity(
+        bytes,
+        REMOTE_DIRECTORY_IDENTITY_BEGIN,
+        REMOTE_DIRECTORY_IDENTITY_END,
+        "directory_identity",
+        "fwmark census directory",
+    )
 }
 
 fn push_execute_and_validate(
@@ -847,7 +714,7 @@ fn push_execute_and_validate(
     expected_device: &DeviceProfile,
     remote: &RemoteDirectory,
 ) -> Result<(), String> {
-    let remote_binary = format!("{}/{}", remote.path, PROCESS_AND_REMOTE_BINARY_NAME);
+    let remote_binary = format!("{}/{}", remote.path(), PROCESS_AND_REMOTE_BINARY_NAME);
     let adb_artifact = artifact_path_for_adb(options, artifact)
         .map_err(|_| sanitized_probe_failure("remote-artifact-path"))?;
     let mut push = Command::new(options.adb());
@@ -962,18 +829,20 @@ fn preflight_remote_directory_script(
     remote: &RemoteDirectory,
     expected_device: &DeviceProfile,
 ) -> String {
-    let root = shell_single_quote(&remote.path);
+    let root = shell_single_quote(remote.path());
     format!(
         "set -eu\n\
          ROOT={root}\n\
          export PATH='{TRUSTED_ANDROID_PATH}'\n\
          {}\
          {}\
+         {}\
          identity_matches\n\
          probe_process_absent\n\
-         [ ! -e \"$ROOT\" ]\n",
+         path_absent \"$ROOT\"\n",
+        path_absence_function(),
         device_identity_function(expected_device),
-        process_absence_function(),
+        process_absence_function(PROCESS_AND_REMOTE_BINARY_NAME),
     )
 }
 
@@ -981,20 +850,19 @@ fn create_remote_directory_script(
     remote: &RemoteDirectory,
     expected_device: &DeviceProfile,
 ) -> String {
-    let root = shell_single_quote(&remote.path);
-    let owner_record = shell_single_quote(&remote.owner_record());
+    let remote_variables =
+        remote.shell_variables(expected_device.shell_uid, expected_device.shell_gid);
     let shell_uid = expected_device.shell_uid;
     let shell_gid = expected_device.shell_gid;
     format!(
         "set -eu\n\
          umask 077\n\
-         ROOT={root}\n\
-         OWNER=\"$ROOT/{REMOTE_OWNER_FILE}\"\n\
+         {remote_variables}\
          OWNER_TMP=\"$OWNER.tmp\"\n\
-         EXPECTED_OWNER_RECORD={owner_record}\n\
          EXPECTED_SHELL_UID='{shell_uid}'\n\
          EXPECTED_SHELL_GID='{shell_gid}'\n\
          export PATH='{TRUSTED_ANDROID_PATH}'\n\
+         {}\
          {}\
          {}\
          CREATED='0'\n\
@@ -1011,7 +879,7 @@ fn create_remote_directory_script(
          trap 'exit 70' HUP INT TERM\n\
          identity_matches\n\
          probe_process_absent\n\
-         [ ! -e \"$ROOT\" ]\n\
+         path_absent \"$ROOT\"\n\
          /system/bin/mkdir -m 700 \"$ROOT\"\n\
          CREATED='1'\n\
          CREATED_ID=$(/system/bin/stat -Lc '%d:%i' \"$ROOT\")\n\
@@ -1029,8 +897,9 @@ fn create_remote_directory_script(
          echo '{REMOTE_DIRECTORY_IDENTITY_END}'\n\
          CREATED='0'\n\
          trap - EXIT HUP INT TERM\n",
+        path_absence_function(),
         device_identity_function(expected_device),
-        process_absence_function(),
+        process_absence_function(PROCESS_AND_REMOTE_BINARY_NAME),
     )
 }
 
@@ -1039,11 +908,11 @@ fn remote_script(
     artifact: &ArtifactIdentity,
     expected_device: &DeviceProfile,
 ) -> Result<String, String> {
-    if remote.identity.is_none() {
+    if remote.identity().is_none() {
         return Err("fwmark census directory identity is unavailable before execution".to_owned());
     }
-    let expected_sha256 = shell_single_quote(&artifact.sha256);
-    let expected_size = artifact.size;
+    let expected_sha256 = shell_single_quote(artifact.sha256());
+    let expected_size = artifact.size();
     Ok(format!(
         "set -eu\n\
          umask 077\n\
@@ -1078,15 +947,15 @@ fn remote_script(
          set -e\n\
          probe_process_absent\n\
          remove_owned_root\n\
-         [ ! -e \"$BIN\" ]\n\
-         [ ! -e \"$ROOT\" ]\n\
+         path_absent \"$BIN\"\n\
+         path_absent \"$ROOT\"\n\
          probe_process_absent\n\
          identity_matches\n\
          trap - EXIT HUP INT TERM\n\
          exit \"$STATUS\"\n",
         remote_directory_variables(remote, expected_device),
         device_identity_function(expected_device),
-        process_absence_function(),
+        process_absence_function(PROCESS_AND_REMOTE_BINARY_NAME),
         owned_root_functions(),
     ))
 }
@@ -1096,7 +965,7 @@ fn cleanup_remote_directory(
     expected_device: &DeviceProfile,
     remote: &RemoteDirectory,
 ) -> Result<(), String> {
-    if !valid_remote_directory(&remote.path) {
+    if !remote.matches_spec() {
         return Err("refusing cleanup for an invalid fwmark census directory".to_owned());
     }
 
@@ -1174,7 +1043,7 @@ fn cleanup_script(remote: &RemoteDirectory, expected_device: &DeviceProfile) -> 
          remove_owned_root\n",
         remote_directory_variables(remote, expected_device),
         device_identity_function(expected_device),
-        process_absence_function(),
+        process_absence_function(PROCESS_AND_REMOTE_BINARY_NAME),
         owned_root_functions(),
     )
 }
@@ -1187,35 +1056,21 @@ fn remote_absence_script(remote: &RemoteDirectory, expected_device: &DeviceProfi
          export PATH='{TRUSTED_ANDROID_PATH}'\n\
          {}\
          {}\
+         {}\
          identity_matches\n\
-         [ ! -e \"$BIN\" ]\n\
-         [ ! -e \"$ROOT\" ]\n\
+         path_absent \"$BIN\"\n\
+         path_absent \"$ROOT\"\n\
          probe_process_absent\n\
          echo '{REMOTE_ABSENCE_PROVED}'\n",
         remote_directory_variables(remote, expected_device),
+        path_absence_function(),
         device_identity_function(expected_device),
-        process_absence_function(),
+        process_absence_function(PROCESS_AND_REMOTE_BINARY_NAME),
     )
 }
 
 fn remote_directory_variables(remote: &RemoteDirectory, expected_device: &DeviceProfile) -> String {
-    let root = shell_single_quote(&remote.path);
-    let owner_record = shell_single_quote(&remote.owner_record());
-    let expected_identity = remote
-        .identity
-        .as_ref()
-        .map(|identity| format!("{}:{}", identity.device, identity.inode))
-        .unwrap_or_default();
-    let expected_identity = shell_single_quote(&expected_identity);
-    let shell_uid = expected_device.shell_uid;
-    let shell_gid = expected_device.shell_gid;
-    format!(
-        "ROOT={root}\n\
-         OWNER=\"$ROOT/{REMOTE_OWNER_FILE}\"\n\
-         EXPECTED_OWNER_RECORD={owner_record}\n\
-         EXPECTED_DIRECTORY_ID={expected_identity}\n\
-         EXPECTED_SHELL_OWNER='700:{shell_uid}:{shell_gid}'\n"
-    )
+    remote.shell_variables(expected_device.shell_uid, expected_device.shell_gid)
 }
 
 fn device_identity_function(expected_device: &DeviceProfile) -> String {
@@ -1240,74 +1095,6 @@ fn device_identity_function(expected_device: &DeviceProfile) -> String {
     )
 }
 
-fn owned_root_functions() -> String {
-    "owned_root_matches() {\n\
-       [ -d \"$ROOT\" ] && [ ! -L \"$ROOT\" ] || return 1\n\
-       CURRENT_DIRECTORY_ID=$(/system/bin/stat -Lc '%d:%i' \"$ROOT\") || return 1\n\
-       [ -z \"$EXPECTED_DIRECTORY_ID\" ] || [ \"$CURRENT_DIRECTORY_ID\" = \"$EXPECTED_DIRECTORY_ID\" ] || return 1\n\
-       ROOT_OWNER=$(/system/bin/stat -c '%a:%u:%g' \"$ROOT\") || return 1\n\
-       [ \"$ROOT_OWNER\" = '700:0:0' ] || [ \"$ROOT_OWNER\" = \"$EXPECTED_SHELL_OWNER\" ] || return 1\n\
-       [ -f \"$OWNER\" ] && [ ! -L \"$OWNER\" ] || return 1\n\
-       [ \"$(/system/bin/stat -c '%a:%u:%g' \"$OWNER\")\" = '600:0:0' ] || return 1\n\
-       [ \"$(/system/bin/cat \"$OWNER\")\" = \"$EXPECTED_OWNER_RECORD\" ]\n\
-     }\n\
-     remove_owned_root() {\n\
-       identity_matches || return 70\n\
-       probe_process_absent\n\
-       [ -e \"$ROOT\" ] || return 0\n\
-       owned_root_matches || return 73\n\
-       /system/bin/rm -rf \"$ROOT\"\n\
-       [ ! -e \"$ROOT\" ]\n\
-     }\n"
-        .to_owned()
-}
-
-fn encode_lower_hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut encoded = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        encoded.push(char::from(DIGITS[usize::from(byte >> 4)]));
-        encoded.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
-    }
-    encoded
-}
-
-fn normalize_adb_shell_output(mut output: Output) -> Result<Output, String> {
-    output.stdout = normalize_adb_shell_newlines(output.stdout, "stdout")?;
-    output.stderr = normalize_adb_shell_newlines(output.stderr, "stderr")?;
-    Ok(output)
-}
-
-fn normalize_adb_shell_newlines(bytes: Vec<u8>, stream: &str) -> Result<Vec<u8>, String> {
-    if !bytes.contains(&b'\r') {
-        return Ok(bytes);
-    }
-
-    let mut normalized = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'\r' if bytes.get(index + 1) == Some(&b'\n') => {
-                normalized.push(b'\n');
-                index += 2;
-            }
-            b'\r' => {
-                return Err(format!(
-                    "ADB shell {stream} contains a bare carriage return"
-                ));
-            }
-            b'\n' => {
-                return Err(format!("ADB shell {stream} mixes LF and CRLF line endings"));
-            }
-            byte => {
-                normalized.push(byte);
-                index += 1;
-            }
-        }
-    }
-    Ok(normalized)
-}
-
 fn parse_canonical_u64(value: &str, field: &str) -> Result<u64, String> {
     if value.is_empty()
         || (value.len() > 1 && value.starts_with('0'))
@@ -1329,6 +1116,9 @@ fn parse_canonical_u32(value: &str, field: &str) -> Result<u32, String> {
 mod tests {
     use super::*;
     use std::ffi::OsStr;
+    use std::fs;
+
+    use crate::android_remote::normalize_adb_shell_newlines;
 
     fn expected_device() -> DeviceProfile {
         DeviceProfile {
@@ -1349,11 +1139,12 @@ mod tests {
     }
 
     fn remote_directory() -> RemoteDirectory {
-        let mut remote = RemoteDirectory::from_token(&"a1".repeat(32)).expect("remote token");
-        remote.identity = Some(FilesystemIdentity {
-            device: 253,
-            inode: 91_337,
-        });
+        let mut remote = REMOTE_DIRECTORY_SPEC
+            .directory_for_token(&"a1".repeat(32), "fwmark census directory")
+            .expect("remote token");
+        remote
+            .bind_identity(FilesystemIdentity::new(253, 91_337).expect("filesystem identity"))
+            .expect("bind filesystem identity");
         remote
     }
 
@@ -1786,19 +1577,16 @@ mod tests {
     #[test]
     fn remote_path_scripts_pin_owner_only_execution_and_independent_cleanup() {
         let remote = remote_directory();
-        assert!(valid_remote_directory(&remote.path));
-        assert!(!valid_remote_directory(&format!("{}/child", remote.path)));
-        assert!(!valid_remote_directory(&format!(
-            "/data/local/tmp/other.{}",
-            remote.token
-        )));
+        assert!(REMOTE_DIRECTORY_SPEC.matches_path(remote.path()));
+        assert!(!REMOTE_DIRECTORY_SPEC.matches_path(&format!("{}/child", remote.path())));
+        assert!(
+            !REMOTE_DIRECTORY_SPEC
+                .matches_path(&format!("/data/local/tmp/other.{}", remote.token()))
+        );
         assert!(PROCESS_AND_REMOTE_BINARY_NAME.len() <= 15);
         let script = remote_script(
             &remote,
-            &ArtifactIdentity {
-                sha256: "11".repeat(32),
-                size: 4096,
-            },
+            &ArtifactIdentity::for_test("11".repeat(32), 4096),
             &expected_device(),
         )
         .expect("remote script");
@@ -1812,8 +1600,8 @@ mod tests {
             "sha256sum \"$BIN\"",
             "FLUX_ANDROID_FWMARK_CENSUS_REQUIRED=1",
             "probe_process_absent",
-            "[ ! -e \"$BIN\" ]",
-            "[ ! -e \"$ROOT\" ]",
+            "path_absent \"$BIN\"",
+            "path_absent \"$ROOT\"",
             "stat -Lc '%d:%i' /proc/self/ns/net",
         ] {
             assert!(script.contains(required), "missing {required:?}");
@@ -1826,8 +1614,9 @@ mod tests {
         assert!(cleanup.find("probe_process_absent").unwrap() < cleanup.find("rm -rf").unwrap());
         let absence = remote_absence_script(&remote, &expected_device());
         assert!(absence.contains("probe_process_absent"));
-        assert!(absence.contains("[ ! -e \"$BIN\" ]"));
-        assert!(absence.contains("[ ! -e \"$ROOT\" ]"));
+        assert!(absence.contains(path_absence_function()));
+        assert!(absence.contains("path_absent \"$BIN\""));
+        assert!(absence.contains("path_absent \"$ROOT\""));
         assert!(!absence.contains("kill"));
     }
 
@@ -1845,10 +1634,7 @@ mod tests {
             create_remote_directory_script(&remote, &device),
             remote_script(
                 &remote,
-                &ArtifactIdentity {
-                    sha256: "11".repeat(32),
-                    size: 4096,
-                },
+                &ArtifactIdentity::for_test("11".repeat(32), 4096),
                 &device,
             )
             .expect("remote script"),
@@ -1883,8 +1669,10 @@ mod tests {
         use std::cell::RefCell;
 
         let events = RefCell::new(Vec::new());
-        let mut remote = RemoteDirectory::from_token(&"b2".repeat(32)).expect("remote token");
-        let error = run_remote_transaction(
+        let mut remote = REMOTE_DIRECTORY_SPEC
+            .directory_for_token(&"b2".repeat(32), "fwmark census directory")
+            .expect("remote token");
+        let error = run_owned_remote_transaction(
             &mut remote,
             |_| {
                 events.borrow_mut().push("create");
@@ -1893,7 +1681,7 @@ mod tests {
             |_| panic!("execution must not follow uncertain creation"),
             |remote| {
                 events.borrow_mut().push("cleanup");
-                assert!(remote.identity.is_none());
+                assert!(remote.identity().is_none());
                 Ok(())
             },
         )
@@ -1907,24 +1695,23 @@ mod tests {
         use std::cell::RefCell;
 
         let events = RefCell::new(Vec::new());
-        let mut remote = RemoteDirectory::from_token(&"c3".repeat(32)).expect("remote token");
-        let error = run_remote_transaction(
+        let mut remote = REMOTE_DIRECTORY_SPEC
+            .directory_for_token(&"c3".repeat(32), "fwmark census directory")
+            .expect("remote token");
+        let error = run_owned_remote_transaction(
             &mut remote,
             |_| {
                 events.borrow_mut().push("create");
-                Ok(FilesystemIdentity {
-                    device: 7,
-                    inode: 11,
-                })
+                FilesystemIdentity::new(7, 11)
             },
             |remote| {
                 events.borrow_mut().push("execute");
-                assert!(remote.identity.is_some());
+                assert!(remote.identity().is_some());
                 Err("probe execution timed out".to_owned())
             },
             |remote| {
                 events.borrow_mut().push("cleanup");
-                assert!(remote.identity.is_some());
+                assert!(remote.identity().is_some());
                 Err("process residue survived".to_owned())
             },
         )
@@ -1957,9 +1744,10 @@ mod tests {
         let fake = FakeAdb::new("01234567-89ab-cdef-0123-456789abcdef");
         let options = fake.options();
         let device = expected_device();
-        let mut remote =
-            RemoteDirectory::from_token(&"d4".repeat(32)).expect("remote directory token");
-        let error = run_remote_transaction(
+        let mut remote = REMOTE_DIRECTORY_SPEC
+            .directory_for_token(&"d4".repeat(32), "fwmark census directory")
+            .expect("remote directory token");
+        let error = run_owned_remote_transaction(
             &mut remote,
             |remote| create_remote_directory(&options, &device, remote),
             |_| panic!("execution must not follow malformed creation output"),

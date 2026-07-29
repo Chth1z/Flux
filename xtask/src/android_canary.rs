@@ -19,8 +19,8 @@ use super::android_remote::{
     process_absence_function, run_owned_remote_transaction, shell_single_quote,
 };
 use super::{
-    ANDROID_RUSTFLAGS, ANDROID_TARGET, ANDROID_TARGET_RUSTFLAGS_ENV,
-    LINUX_ANDROID_HOST_BUILD_TMPDIR, LINUX_CANARY_INTERNAL_ENVS, LINUX_OUTPUT_TPROXY_CANARY_TEST,
+    ANDROID_OUTPUT_TPROXY_ENGINE_CREDENTIAL_CANARY_TEST, ANDROID_RUSTFLAGS, ANDROID_TARGET,
+    ANDROID_TARGET_RUSTFLAGS_ENV, LINUX_ANDROID_HOST_BUILD_TMPDIR, LINUX_CANARY_INTERNAL_ENVS,
     android_kernel, android_linker, validate_aarch64_elf, verify_ndk_revision,
 };
 
@@ -34,7 +34,14 @@ const REMOTE_DIRECTORY_SPEC: OwnedRemoteDirectorySpec = OwnedRemoteDirectorySpec
 );
 const REMOTE_DIRECTORY_IDENTITY_BEGIN: &str = "FLUX_ANDROID_CANARY_DIRECTORY_BEGIN";
 const REMOTE_DIRECTORY_IDENTITY_END: &str = "FLUX_ANDROID_CANARY_DIRECTORY_END";
-const REMOTE_BINARY_NAME: &str = "fluxd-test";
+const REMOTE_TEST_BINARY_NAME: &str = "fluxd-test";
+const CREDENTIAL_PROBE_TARGET_NAME: &str = "flux-engine-credential-probe";
+const REMOTE_CREDENTIAL_PROBE_BINARY_NAME: &str = CREDENTIAL_PROBE_TARGET_NAME;
+const REMOTE_CREDENTIAL_PROBE_PROCESS_NAME: &str = "flux-cred-probe";
+const REMOTE_PROCESS_NAMES: [&str; 2] = [
+    REMOTE_TEST_BINARY_NAME,
+    REMOTE_CREDENTIAL_PROBE_PROCESS_NAME,
+];
 const TRUSTED_ANDROID_PATH: &str = concat!(
     "/product/bin:",
     "/apex/com.android.runtime/bin:",
@@ -117,7 +124,7 @@ enum RunnerStage {
     NdkEnvironment,
     NdkRevision,
     AndroidLinker,
-    CanaryBuild,
+    ArtifactBuild,
     ArtifactIdentity,
     ArtifactElfValidation,
     PrecreateDeviceIdentity,
@@ -136,7 +143,7 @@ impl RunnerStage {
             Self::NdkEnvironment => "ndk-environment",
             Self::NdkRevision => "ndk-revision",
             Self::AndroidLinker => "android-linker",
-            Self::CanaryBuild => "canary-build",
+            Self::ArtifactBuild => "artifact-build",
             Self::ArtifactIdentity => "artifact-identity",
             Self::ArtifactElfValidation => "artifact-elf-validation",
             Self::PrecreateDeviceIdentity => "precreate-device-identity",
@@ -146,6 +153,47 @@ impl RunnerStage {
             Self::RemoteExecution => "remote-execution",
             Self::RemoteCleanup => "remote-cleanup",
             Self::RemoteTransaction => "remote-transaction",
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct AndroidCanaryArtifactPaths {
+    test: PathBuf,
+    credential_probe: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AndroidCanaryArtifactIdentities {
+    test: AndroidArtifactIdentity,
+    credential_probe: AndroidArtifactIdentity,
+}
+
+impl AndroidCanaryArtifactIdentities {
+    fn from_paths(paths: &AndroidCanaryArtifactPaths) -> Result<Self, String> {
+        Ok(Self {
+            test: AndroidArtifactIdentity::from_file(&paths.test, "exact Android canary test ELF")?,
+            credential_probe: AndroidArtifactIdentity::from_file(
+                &paths.credential_probe,
+                "exact Android credential-probe ELF",
+            )?,
+        })
+    }
+
+    fn verify_paths(&self, paths: &AndroidCanaryArtifactPaths) -> Result<(), String> {
+        self.test
+            .verify_file(&paths.test, "exact Android canary test ELF")?;
+        self.credential_probe.verify_file(
+            &paths.credential_probe,
+            "exact Android credential-probe ELF",
+        )
+    }
+
+    #[cfg(test)]
+    fn for_test() -> Self {
+        Self {
+            test: AndroidArtifactIdentity::for_test("11".repeat(32), 4096),
+            credential_probe: AndroidArtifactIdentity::for_test("22".repeat(32), 2048),
         }
     }
 }
@@ -165,18 +213,22 @@ pub(super) fn run(options: Options) -> Result<(), String> {
         RunnerStage::AndroidLinker,
         android_linker(&ndk_root, target.rust_target, target.clang_target),
     )?;
-    let artifact = at_runner_stage(
-        RunnerStage::CanaryBuild,
-        build_test_artifact(&linker, target),
-    )?;
-    let artifact_identity = at_runner_stage(
+    let artifacts = at_runner_stage(RunnerStage::ArtifactBuild, build_artifacts(&linker, target))?;
+    let artifact_identities = at_runner_stage(
         RunnerStage::ArtifactIdentity,
-        AndroidArtifactIdentity::from_file(&artifact, "exact Android canary ELF"),
+        AndroidCanaryArtifactIdentities::from_paths(&artifacts),
     )?;
     if target.validate_aarch64_elf {
         at_runner_stage(
             RunnerStage::ArtifactElfValidation,
-            validate_aarch64_elf("fluxd Android canary", &artifact),
+            validate_aarch64_elf("fluxd Android canary test", &artifacts.test),
+        )?;
+        at_runner_stage(
+            RunnerStage::ArtifactElfValidation,
+            validate_aarch64_elf(
+                "Android engine credential probe",
+                &artifacts.credential_probe,
+            ),
         )?;
     }
     at_runner_stage(
@@ -189,9 +241,14 @@ pub(super) fn run(options: Options) -> Result<(), String> {
         target.label
     );
     println!(
-        "validated exact Android canary ELF sha256={} size={}",
-        artifact_identity.sha256(),
-        artifact_identity.size(),
+        "validated exact Android canary test ELF sha256={} size={}",
+        artifact_identities.test.sha256(),
+        artifact_identities.test.size(),
+    );
+    println!(
+        "validated exact Android credential-probe ELF sha256={} size={}",
+        artifact_identities.credential_probe.sha256(),
+        artifact_identities.credential_probe.size(),
     );
 
     let mut remote = at_runner_stage(
@@ -213,7 +270,7 @@ pub(super) fn run(options: Options) -> Result<(), String> {
         |remote| {
             at_runner_stage(
                 RunnerStage::RemoteExecution,
-                push_and_execute(&options, &artifact, &artifact_identity, &device, remote),
+                push_and_execute(&options, &artifacts, &artifact_identities, &device, remote),
             )
         },
         |remote| {
@@ -226,7 +283,7 @@ pub(super) fn run(options: Options) -> Result<(), String> {
     .map_err(sanitize_remote_transaction_error);
     result?;
     println!(
-        "rooted {} Android local-OUTPUT TPROXY checkpoint passed with independently proved process and path absence",
+        "rooted {} Android local-OUTPUT TPROXY and engine-credential checkpoints passed with independently proved process and path absence",
         target.label
     );
     Ok(())
@@ -443,6 +500,11 @@ fn verify_device(options: &Options) -> Result<DeviceProfile, String> {
         )?,
         "ADB shell GID",
     )?;
+    if shell_gid == 0 {
+        return Err(
+            "ADB shell primary GID must be nonzero for credential qualification".to_owned(),
+        );
+    }
     Ok(DeviceProfile {
         target,
         model,
@@ -518,22 +580,72 @@ fn android_test_build_command(linker: &Path, target: &AndroidTargetSpec) -> Comm
         "--no-run",
         "--message-format=json-render-diagnostics",
     ]);
+    configure_android_build_environment(&mut command, linker, target);
+    command
+}
+
+fn android_credential_probe_build_command(linker: &Path, target: &AndroidTargetSpec) -> Command {
+    let mut command = Command::new("cargo");
+    command.args([
+        "build",
+        "-p",
+        "flux-platform",
+        "--bin",
+        CREDENTIAL_PROBE_TARGET_NAME,
+        "--target",
+        target.rust_target,
+        "--message-format=json-render-diagnostics",
+    ]);
+    configure_android_build_environment(&mut command, linker, target);
+    command
+}
+
+fn configure_android_build_environment(
+    command: &mut Command,
+    linker: &Path,
+    target: &AndroidTargetSpec,
+) {
     command.env(target.cargo_linker_env, linker.as_os_str());
     command.env(target.cc_env, linker.as_os_str());
     command.env(target.rustflags_env, ANDROID_RUSTFLAGS);
     command.env("TMPDIR", LINUX_ANDROID_HOST_BUILD_TMPDIR);
-    command
 }
 
-fn build_test_artifact(linker: &Path, target: &AndroidTargetSpec) -> Result<PathBuf, String> {
+fn build_artifacts(
+    linker: &Path,
+    target: &AndroidTargetSpec,
+) -> Result<AndroidCanaryArtifactPaths, String> {
+    let test = build_cargo_artifact(
+        android_test_build_command(linker, target),
+        target,
+        "test ELF",
+        test_artifact_from_cargo_messages,
+    )?;
+    let credential_probe = build_cargo_artifact(
+        android_credential_probe_build_command(linker, target),
+        target,
+        "credential-probe ELF",
+        credential_probe_artifact_from_cargo_messages,
+    )?;
+    Ok(AndroidCanaryArtifactPaths {
+        test,
+        credential_probe,
+    })
+}
+
+fn build_cargo_artifact(
+    mut command: Command,
+    target: &AndroidTargetSpec,
+    description: &str,
+    select: fn(&[u8]) -> Result<PathBuf, String>,
+) -> Result<PathBuf, String> {
     let rust_target = target.rust_target;
-    let mut command = android_test_build_command(linker, target);
     let output = command_output_bounded(
         &mut command,
         None,
         CARGO_BUILD_TIMEOUT,
         MAX_CARGO_CAPTURE_BYTES,
-        &format!("cross-build {rust_target} test ELF"),
+        &format!("cross-build {rust_target} {description}"),
     )?;
     if !output.stderr.is_empty() {
         std::io::stderr()
@@ -542,15 +654,15 @@ fn build_test_artifact(linker: &Path, target: &AndroidTargetSpec) -> Result<Path
     }
     if !output.status.success() {
         return Err(format!(
-            "cross-build of {rust_target} test ELF exited with {}: {}",
+            "cross-build of {rust_target} {description} exited with {}: {}",
             output.status,
             bounded_diagnostic(&output.stdout)
         ));
     }
-    let artifact = test_artifact_from_cargo_messages(&output.stdout)?;
+    let artifact = select(&output.stdout)?;
     if !artifact.is_file() {
         return Err(format!(
-            "Cargo reported Android test executable {}, but it is missing",
+            "Cargo reported Android {description} {}, but it is missing",
             artifact.display()
         ));
     }
@@ -558,6 +670,26 @@ fn build_test_artifact(linker: &Path, target: &AndroidTargetSpec) -> Result<Path
 }
 
 fn test_artifact_from_cargo_messages(messages: &[u8]) -> Result<PathBuf, String> {
+    exact_artifact_from_cargo_messages(messages, "fluxd", "lib", true, "fluxd library-test")
+}
+
+fn credential_probe_artifact_from_cargo_messages(messages: &[u8]) -> Result<PathBuf, String> {
+    exact_artifact_from_cargo_messages(
+        messages,
+        CREDENTIAL_PROBE_TARGET_NAME,
+        "bin",
+        false,
+        "credential-probe binary",
+    )
+}
+
+fn exact_artifact_from_cargo_messages(
+    messages: &[u8],
+    target_name: &str,
+    target_kind: &str,
+    test_profile: bool,
+    description: &str,
+) -> Result<PathBuf, String> {
     let mut artifacts = BTreeSet::new();
     for line in messages.split(|byte| *byte == b'\n') {
         if line.iter().all(u8::is_ascii_whitespace) {
@@ -570,12 +702,12 @@ fn test_artifact_from_cargo_messages(messages: &[u8]) -> Result<PathBuf, String>
             )
         })?;
         if message.get("reason").and_then(Value::as_str) != Some("compiler-artifact")
-            || message.pointer("/target/name").and_then(Value::as_str) != Some("fluxd")
-            || !message
+            || message.pointer("/target/name").and_then(Value::as_str) != Some(target_name)
+            || message
                 .pointer("/target/kind")
                 .and_then(Value::as_array)
-                .is_some_and(|kinds| kinds.iter().any(|kind| kind.as_str() == Some("lib")))
-            || message.pointer("/profile/test").and_then(Value::as_bool) != Some(true)
+                .is_none_or(|kinds| kinds.len() != 1 || kinds[0].as_str() != Some(target_kind))
+            || message.pointer("/profile/test").and_then(Value::as_bool) != Some(test_profile)
         {
             continue;
         }
@@ -585,9 +717,9 @@ fn test_artifact_from_cargo_messages(messages: &[u8]) -> Result<PathBuf, String>
     }
     let artifacts = artifacts.into_iter().collect::<Vec<_>>();
     let [artifact] = artifacts.as_slice() else {
-        return Err(
-            "Cargo JSON did not report exactly one fluxd library-test executable".to_owned(),
-        );
+        return Err(format!(
+            "Cargo JSON did not report exactly one {description} executable"
+        ));
     };
     Ok(artifact.clone())
 }
@@ -638,15 +770,15 @@ fn create_remote_directory(
 
 fn push_and_execute(
     options: &Options,
-    artifact: &Path,
-    artifact_identity: &AndroidArtifactIdentity,
+    artifacts: &AndroidCanaryArtifactPaths,
+    artifact_identities: &AndroidCanaryArtifactIdentities,
     expected_device: &DeviceProfile,
     remote: &OwnedRemoteDirectory,
 ) -> Result<(), String> {
     if remote.identity().is_none() {
         return Err("Android canary directory identity is unavailable before execution".to_owned());
     }
-    artifact_identity.verify_file(artifact, "exact Android canary ELF before ADB push")?;
+    artifact_identities.verify_paths(artifacts)?;
     revalidate_device(options, expected_device, "before remote push")?;
     let preflight = normalize_adb_shell_output(adb_root_shell_output(
         options,
@@ -657,29 +789,39 @@ fn push_and_execute(
     if !preflight.status.success() || !preflight.stdout.is_empty() || !preflight.stderr.is_empty() {
         return Err("owner-marked Android canary directory changed before push".to_owned());
     }
-    revalidate_device(options, expected_device, "immediately before remote push")?;
-
-    let remote_binary = format!("{}/{REMOTE_BINARY_NAME}", remote.path());
-    let adb_artifact = artifact_path_for_adb(options, artifact)?;
-    let mut push = Command::new(&options.adb);
-    push.args(["-s", &options.serial, "push"])
-        .arg(adb_artifact)
-        .arg(&remote_binary);
-    let output = command_output_bounded(
-        &mut push,
-        None,
-        ADB_PUSH_TIMEOUT,
-        MAX_ADB_CAPTURE_BYTES,
-        "push Android test ELF",
+    let remote_test = format!("{}/{REMOTE_TEST_BINARY_NAME}", remote.path());
+    revalidate_device(
+        options,
+        expected_device,
+        "immediately before canary-test push",
     )?;
-    if !output.status.success() {
-        return Err("ADB push of the exact Android canary ELF failed".to_owned());
-    }
-    revalidate_device(options, expected_device, "after remote push")?;
+    push_artifact(
+        options,
+        &artifacts.test,
+        &artifact_identities.test,
+        &remote_test,
+        "Android canary test ELF",
+    )?;
+    revalidate_device(options, expected_device, "after canary-test push")?;
+
+    let remote_probe = format!("{}/{REMOTE_CREDENTIAL_PROBE_BINARY_NAME}", remote.path());
+    revalidate_device(
+        options,
+        expected_device,
+        "immediately before credential-probe push",
+    )?;
+    push_artifact(
+        options,
+        &artifacts.credential_probe,
+        &artifact_identities.credential_probe,
+        &remote_probe,
+        "Android credential-probe ELF",
+    )?;
+    revalidate_device(options, expected_device, "after credential-probe push")?;
 
     let output = normalize_adb_shell_output(adb_root_shell_output(
         options,
-        remote_script(remote, artifact_identity, expected_device)?.as_bytes(),
+        remote_script(remote, artifact_identities, expected_device)?.as_bytes(),
         ADB_EXEC_TIMEOUT,
         "run rooted Android checkpoint shell",
     )?)?;
@@ -688,6 +830,32 @@ fn push_and_execute(
     } else {
         Err("rooted Android exact checkpoint failed".to_owned())
     }
+}
+
+fn push_artifact(
+    options: &Options,
+    artifact: &Path,
+    identity: &AndroidArtifactIdentity,
+    remote_path: &str,
+    description: &str,
+) -> Result<(), String> {
+    identity.verify_file(artifact, &format!("exact {description} before ADB push"))?;
+    let adb_artifact = artifact_path_for_adb(options, artifact)?;
+    let mut push = Command::new(&options.adb);
+    push.args(["-s", &options.serial, "push"])
+        .arg(adb_artifact)
+        .arg(remote_path);
+    let output = command_output_bounded(
+        &mut push,
+        None,
+        ADB_PUSH_TIMEOUT,
+        MAX_ADB_CAPTURE_BYTES,
+        &format!("push {description}"),
+    )?;
+    if !output.status.success() {
+        return Err(format!("ADB push of the exact {description} failed"));
+    }
+    Ok(())
 }
 
 pub(super) fn artifact_path_for_adb(
@@ -730,24 +898,34 @@ fn uses_windows_adb(adb: &OsString) -> bool {
 
 fn remote_script(
     remote: &OwnedRemoteDirectory,
-    artifact: &AndroidArtifactIdentity,
+    artifacts: &AndroidCanaryArtifactIdentities,
     expected_device: &DeviceProfile,
 ) -> Result<String, String> {
     if remote.identity().is_none() {
         return Err("Android canary directory identity is unavailable before execution".to_owned());
     }
-    let test = shell_single_quote(LINUX_OUTPUT_TPROXY_CANARY_TEST);
-    let expected_sha256 = shell_single_quote(artifact.sha256());
-    let expected_size = artifact.size();
+    if expected_device.shell_gid == 0 {
+        return Err("Android credential probe requires a nonzero device shell GID".to_owned());
+    }
+    let test = shell_single_quote(ANDROID_OUTPUT_TPROXY_ENGINE_CREDENTIAL_CANARY_TEST);
+    let expected_test_sha256 = shell_single_quote(artifacts.test.sha256());
+    let expected_test_size = artifacts.test.size();
+    let expected_probe_sha256 = shell_single_quote(artifacts.credential_probe.sha256());
+    let expected_probe_size = artifacts.credential_probe.size();
+    let expected_probe_gid = expected_device.shell_gid;
     let internal_envs = LINUX_CANARY_INTERNAL_ENVS.join(" ");
     Ok(format!(
         "set -eu\n\
          umask 077\n\
          {}\
-         BIN=\"$ROOT/{REMOTE_BINARY_NAME}\"\n\
+         TEST_BIN=\"$ROOT/{REMOTE_TEST_BINARY_NAME}\"\n\
+         CREDENTIAL_PROBE=\"$ROOT/{REMOTE_CREDENTIAL_PROBE_BINARY_NAME}\"\n\
          TMPDIR=\"$ROOT/tmp\"\n\
-         EXPECTED_SHA256={expected_sha256}\n\
-         EXPECTED_SIZE='{expected_size}'\n\
+         EXPECTED_TEST_SHA256={expected_test_sha256}\n\
+         EXPECTED_TEST_SIZE='{expected_test_size}'\n\
+         EXPECTED_PROBE_SHA256={expected_probe_sha256}\n\
+         EXPECTED_PROBE_SIZE='{expected_probe_size}'\n\
+         EXPECTED_PROBE_GID='{expected_probe_gid}'\n\
          export PATH='{TRUSTED_ANDROID_PATH}'\n\
          {}\
          {}\
@@ -757,22 +935,30 @@ fn remote_script(
          identity_matches\n\
          probe_process_absent\n\
          owned_root_matches\n\
-         [ -f \"$BIN\" ] && [ ! -L \"$BIN\" ]\n\
+         [ -f \"$TEST_BIN\" ] && [ ! -L \"$TEST_BIN\" ]\n\
+         [ -f \"$CREDENTIAL_PROBE\" ] && [ ! -L \"$CREDENTIAL_PROBE\" ]\n\
          /system/bin/chown -R 0:0 \"$ROOT\"\n\
-         /system/bin/chmod 700 \"$ROOT\" \"$BIN\"\n\
+         /system/bin/chmod 700 \"$ROOT\" \"$TEST_BIN\" \"$CREDENTIAL_PROBE\"\n\
          owned_root_matches\n\
-         [ \"$(/system/bin/stat -c '%a:%u:%g' \"$BIN\")\" = '700:0:0' ]\n\
-         ACTUAL_SHA256=$(/system/bin/sha256sum \"$BIN\" | /system/bin/cut -d ' ' -f 1)\n\
-         [ \"$ACTUAL_SHA256\" = \"$EXPECTED_SHA256\" ]\n\
-         [ \"$(/system/bin/stat -c '%s' \"$BIN\")\" = \"$EXPECTED_SIZE\" ]\n\
+         [ \"$(/system/bin/stat -c '%a:%u:%g' \"$TEST_BIN\")\" = '700:0:0' ]\n\
+         [ \"$(/system/bin/stat -c '%a:%u:%g' \"$CREDENTIAL_PROBE\")\" = '700:0:0' ]\n\
+         ACTUAL_TEST_SHA256=$(/system/bin/sha256sum \"$TEST_BIN\" | /system/bin/cut -d ' ' -f 1)\n\
+         [ \"$ACTUAL_TEST_SHA256\" = \"$EXPECTED_TEST_SHA256\" ]\n\
+         [ \"$(/system/bin/stat -c '%s' \"$TEST_BIN\")\" = \"$EXPECTED_TEST_SIZE\" ]\n\
+         ACTUAL_PROBE_SHA256=$(/system/bin/sha256sum \"$CREDENTIAL_PROBE\" | /system/bin/cut -d ' ' -f 1)\n\
+         [ \"$ACTUAL_PROBE_SHA256\" = \"$EXPECTED_PROBE_SHA256\" ]\n\
+         [ \"$(/system/bin/stat -c '%s' \"$CREDENTIAL_PROBE\")\" = \"$EXPECTED_PROBE_SIZE\" ]\n\
          /system/bin/mkdir \"$TMPDIR\"\n\
          /system/bin/chmod 700 \"$TMPDIR\"\n\
          export TMPDIR\n\
          unset {internal_envs}\n\
          export FLUX_LINUX_CANARY_REQUIRED=1\n\
+         export FLUX_ENGINE_CREDENTIAL_PROBE_REQUIRED=1\n\
+         export FLUX_ENGINE_CREDENTIAL_PROBE_PATH=\"$CREDENTIAL_PROBE\"\n\
+         export FLUX_ENGINE_CREDENTIAL_PROBE_GID=\"$EXPECTED_PROBE_GID\"\n\
          TEST={test}\n\
          LIST_FILE=\"$TMPDIR/list\"\n\
-         if ! \"$BIN\" --ignored --exact \"$TEST\" --list >\"$LIST_FILE\"; then\n\
+         if ! \"$TEST_BIN\" --ignored --exact \"$TEST\" --list >\"$LIST_FILE\"; then\n\
            exit 70\n\
          fi\n\
          LIST_OUTPUT=$(/system/bin/tr -d '\\r' <\"$LIST_FILE\")\n\
@@ -781,19 +967,20 @@ fn remote_script(
            exit 70\n\
          fi\n\
          set +e\n\
-         /system/bin/timeout -k {REMOTE_TEST_KILL_GRACE_SECONDS} {REMOTE_TEST_TIMEOUT_SECONDS} \"$BIN\" --ignored --exact \"$TEST\" --nocapture --test-threads=1\n\
+         /system/bin/timeout -k {REMOTE_TEST_KILL_GRACE_SECONDS} {REMOTE_TEST_TIMEOUT_SECONDS} \"$TEST_BIN\" --ignored --exact \"$TEST\" --nocapture --test-threads=1\n\
          STATUS=$?\n\
          set -e\n\
          probe_process_absent\n\
          remove_owned_root\n\
-         path_absent \"$BIN\"\n\
+         path_absent \"$TEST_BIN\"\n\
+         path_absent \"$CREDENTIAL_PROBE\"\n\
          path_absent \"$ROOT\"\n\
          identity_matches\n\
          trap - EXIT HUP INT TERM\n\
          exit \"$STATUS\"\n",
         remote.shell_variables(expected_device.shell_uid, expected_device.shell_gid),
         device_identity_function(expected_device),
-        process_absence_function(REMOTE_BINARY_NAME),
+        process_absence_function(&REMOTE_PROCESS_NAMES),
         owned_root_functions(),
     ))
 }
@@ -851,7 +1038,7 @@ fn preflight_remote_directory_script(
          path_absent \"$ROOT\"\n",
         path_absence_function(),
         device_identity_function(expected_device),
-        process_absence_function(REMOTE_BINARY_NAME),
+        process_absence_function(&REMOTE_PROCESS_NAMES),
     )
 }
 
@@ -908,7 +1095,7 @@ fn create_remote_directory_script(
          trap - EXIT HUP INT TERM\n",
         path_absence_function(),
         device_identity_function(expected_device),
-        process_absence_function(REMOTE_BINARY_NAME),
+        process_absence_function(&REMOTE_PROCESS_NAMES),
     )
 }
 
@@ -928,7 +1115,7 @@ fn execution_preflight_script(
          owned_root_matches\n",
         remote.shell_variables(expected_device.shell_uid, expected_device.shell_gid),
         device_identity_function(expected_device),
-        process_absence_function(REMOTE_BINARY_NAME),
+        process_absence_function(&REMOTE_PROCESS_NAMES),
         owned_root_functions(),
     )
 }
@@ -945,7 +1132,7 @@ fn cleanup_script(remote: &OwnedRemoteDirectory, expected_device: &DeviceProfile
          remove_owned_root\n",
         remote.shell_variables(expected_device.shell_uid, expected_device.shell_gid),
         device_identity_function(expected_device),
-        process_absence_function(REMOTE_BINARY_NAME),
+        process_absence_function(&REMOTE_PROCESS_NAMES),
         owned_root_functions(),
     )
 }
@@ -954,19 +1141,21 @@ fn remote_absence_script(remote: &OwnedRemoteDirectory, expected_device: &Device
     format!(
         "set -eu\n\
          ROOT={}\n\
-         BIN=\"$ROOT/{REMOTE_BINARY_NAME}\"\n\
+         TEST_BIN=\"$ROOT/{REMOTE_TEST_BINARY_NAME}\"\n\
+         CREDENTIAL_PROBE=\"$ROOT/{REMOTE_CREDENTIAL_PROBE_BINARY_NAME}\"\n\
          export PATH='{TRUSTED_ANDROID_PATH}'\n\
          {}\
          {}\
          {}\
          identity_matches\n\
-         path_absent \"$BIN\"\n\
+         path_absent \"$TEST_BIN\"\n\
+         path_absent \"$CREDENTIAL_PROBE\"\n\
          path_absent \"$ROOT\"\n\
          probe_process_absent\n",
         shell_single_quote(remote.path()),
         path_absence_function(),
         device_identity_function(expected_device),
-        process_absence_function(REMOTE_BINARY_NAME),
+        process_absence_function(&REMOTE_PROCESS_NAMES),
     )
 }
 
@@ -1484,52 +1673,87 @@ mod tests {
     }
 
     #[test]
-    fn cargo_json_selects_one_exact_library_test_executable() {
-        let messages = br#"{"reason":"compiler-artifact","target":{"name":"fluxd","kind":["lib"]},"profile":{"test":true},"executable":"/tmp/fluxd-test"}
+    fn cargo_json_selects_both_exact_artifacts() {
+        let test_messages = br#"{"reason":"compiler-artifact","target":{"name":"fluxd","kind":["lib"]},"profile":{"test":true},"executable":"/tmp/fluxd-test"}
 {"reason":"build-finished","success":true}
 "#;
         assert_eq!(
-            test_artifact_from_cargo_messages(messages).expect("one artifact"),
+            test_artifact_from_cargo_messages(test_messages).expect("one test artifact"),
             PathBuf::from("/tmp/fluxd-test")
         );
+        let probe_messages = br#"{"reason":"compiler-artifact","target":{"name":"flux-engine-credential-probe","kind":["bin"]},"profile":{"test":false},"executable":"/tmp/flux-engine-credential-probe"}
+{"reason":"build-finished","success":true}
+"#;
+        assert_eq!(
+            credential_probe_artifact_from_cargo_messages(probe_messages)
+                .expect("one credential-probe artifact"),
+            PathBuf::from("/tmp/flux-engine-credential-probe")
+        );
         assert!(test_artifact_from_cargo_messages(b"{}").is_err());
+        assert!(credential_probe_artifact_from_cargo_messages(test_messages).is_err());
+        assert!(test_artifact_from_cargo_messages(probe_messages).is_err());
     }
 
     #[test]
-    fn android_test_build_uses_the_matching_pinned_compiler_for_each_architecture() {
+    fn both_android_builds_use_exact_targets_and_matching_pinned_compilers() {
         for target in [&ARM64_TARGET, &X86_64_TARGET] {
             let linker_path = format!("/ndk/toolchains/llvm/bin/{}31-clang", target.clang_target);
             let linker = Path::new(&linker_path);
-            let command = android_test_build_command(linker, target);
-            let environment = command
-                .get_envs()
-                .collect::<std::collections::BTreeMap<_, _>>();
-            let arguments = command
-                .get_args()
-                .map(|argument| argument.to_string_lossy().into_owned())
-                .collect::<Vec<_>>();
+            let commands = [
+                (
+                    android_test_build_command(linker, target),
+                    vec![
+                        "test",
+                        "-p",
+                        "fluxd",
+                        "--lib",
+                        "--target",
+                        target.rust_target,
+                        "--no-run",
+                        "--message-format=json-render-diagnostics",
+                    ],
+                ),
+                (
+                    android_credential_probe_build_command(linker, target),
+                    vec![
+                        "build",
+                        "-p",
+                        "flux-platform",
+                        "--bin",
+                        CREDENTIAL_PROBE_TARGET_NAME,
+                        "--target",
+                        target.rust_target,
+                        "--message-format=json-render-diagnostics",
+                    ],
+                ),
+            ];
+            for (command, expected_arguments) in commands {
+                let environment = command
+                    .get_envs()
+                    .collect::<std::collections::BTreeMap<_, _>>();
+                let arguments = command
+                    .get_args()
+                    .map(|argument| argument.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>();
 
-            assert!(
-                arguments
-                    .windows(2)
-                    .any(|pair| { pair == ["--target", target.rust_target] })
-            );
-            assert_eq!(
-                environment.get(std::ffi::OsStr::new(target.cargo_linker_env)),
-                Some(&Some(linker.as_os_str()))
-            );
-            assert_eq!(
-                environment.get(std::ffi::OsStr::new(target.cc_env)),
-                Some(&Some(linker.as_os_str()))
-            );
-            assert_eq!(
-                environment.get(std::ffi::OsStr::new(target.rustflags_env)),
-                Some(&Some(std::ffi::OsStr::new(ANDROID_RUSTFLAGS)))
-            );
-            assert_eq!(
-                environment.get(std::ffi::OsStr::new("TMPDIR")),
-                Some(&Some(std::ffi::OsStr::new(LINUX_ANDROID_HOST_BUILD_TMPDIR)))
-            );
+                assert_eq!(arguments, expected_arguments);
+                assert_eq!(
+                    environment.get(std::ffi::OsStr::new(target.cargo_linker_env)),
+                    Some(&Some(linker.as_os_str()))
+                );
+                assert_eq!(
+                    environment.get(std::ffi::OsStr::new(target.cc_env)),
+                    Some(&Some(linker.as_os_str()))
+                );
+                assert_eq!(
+                    environment.get(std::ffi::OsStr::new(target.rustflags_env)),
+                    Some(&Some(std::ffi::OsStr::new(ANDROID_RUSTFLAGS)))
+                );
+                assert_eq!(
+                    environment.get(std::ffi::OsStr::new("TMPDIR")),
+                    Some(&Some(std::ffi::OsStr::new(LINUX_ANDROID_HOST_BUILD_TMPDIR)))
+                );
+            }
         }
         assert!(ANDROID_RUSTFLAGS.contains("max-page-size=16384"));
         assert!(ANDROID_RUSTFLAGS.contains("common-page-size=16384"));
@@ -1570,8 +1794,8 @@ mod tests {
         assert!(remote.matches_spec());
         assert!(!REMOTE_DIRECTORY_SPEC.matches_path(&format!("{}/extra", remote.path())));
         let device = expected_device_profile();
-        let artifact = AndroidArtifactIdentity::for_test("11".repeat(32), 4096);
-        let script = remote_script(&remote, &artifact, &device).expect("remote script");
+        let artifacts = AndroidCanaryArtifactIdentities::for_test();
+        let script = remote_script(&remote, &artifacts, &device).expect("remote script");
         let internal_envs = LINUX_CANARY_INTERNAL_ENVS.join(" ");
         for required in [
             "EXPECTED_OWNER_RECORD=",
@@ -1580,21 +1804,30 @@ mod tests {
             "trap remove_owned_root EXIT",
             "probe_process_absent",
             "identity_matches",
-            "sha256sum \"$BIN\"",
+            "sha256sum \"$TEST_BIN\"",
+            "sha256sum \"$CREDENTIAL_PROBE\"",
+            "stat -c '%a:%u:%g' \"$TEST_BIN\"",
+            "stat -c '%a:%u:%g' \"$CREDENTIAL_PROBE\"",
             "FLUX_LINUX_CANARY_REQUIRED=1",
+            "FLUX_ENGINE_CREDENTIAL_PROBE_REQUIRED=1",
+            "FLUX_ENGINE_CREDENTIAL_PROBE_PATH=\"$CREDENTIAL_PROBE\"",
+            "FLUX_ENGINE_CREDENTIAL_PROBE_GID=\"$EXPECTED_PROBE_GID\"",
             &format!("unset {internal_envs}"),
-            &format!("TEST='{LINUX_OUTPUT_TPROXY_CANARY_TEST}'"),
+            &format!("TEST='{ANDROID_OUTPUT_TPROXY_ENGINE_CREDENTIAL_CANARY_TEST}'"),
             "--ignored --exact \"$TEST\" --nocapture --test-threads=1",
-            "path_absent \"$BIN\"",
+            "path_absent \"$TEST_BIN\"",
+            "path_absent \"$CREDENTIAL_PROBE\"",
             "path_absent \"$ROOT\"",
         ] {
             assert!(script.contains(required), "missing {required:?}");
         }
         assert!(script.find("owned_root_matches").unwrap() < script.find("chown -R").unwrap());
         assert!(script.contains("for COMM in /proc/[0-9]*/comm"));
+        assert!(script.contains("'fluxd-test' 'flux-cred-probe'"));
         assert!(!script.contains("pidof"));
         let cleanup = cleanup_script(&remote, &device);
         assert!(cleanup.find("owned_root_matches").unwrap() < cleanup.find("rm -rf").unwrap());
+        assert!(cleanup.contains("'fluxd-test' 'flux-cred-probe'"));
         for (boundary, proof) in [
             (
                 "preflight",
@@ -1610,7 +1843,17 @@ mod tests {
                 proof.contains("path_absent \"$ROOT\""),
                 "{boundary} proof does not reject root path entries"
             );
+            assert!(
+                proof.contains("'fluxd-test' 'flux-cred-probe'"),
+                "{boundary} proof does not reject both process names"
+            );
         }
+        let final_proof = remote_absence_script(&remote, &device);
+        assert!(final_proof.contains("path_absent \"$TEST_BIN\""));
+        assert!(final_proof.contains("path_absent \"$CREDENTIAL_PROBE\""));
+        let mut root_gid = device.clone();
+        root_gid.shell_gid = 0;
+        assert!(remote_script(&remote, &artifacts, &root_gid).is_err());
         assert!(!script.contains("sudo"));
         assert!(uses_windows_adb(&OsString::from("adb.exe")));
         assert!(uses_windows_adb(&OsString::from(
@@ -1670,7 +1913,7 @@ mod tests {
             execution_preflight_script(&remote, &device),
             remote_script(
                 &remote,
-                &AndroidArtifactIdentity::for_test("11".repeat(32), 4096),
+                &AndroidCanaryArtifactIdentities::for_test(),
                 &device,
             )
             .expect("remote script"),

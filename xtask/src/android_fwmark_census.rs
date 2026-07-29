@@ -655,7 +655,7 @@ fn process_absence_script() -> String {
          export PATH='{TRUSTED_ANDROID_PATH}'\n\
          {}\
          probe_process_absent\n",
-        process_absence_function(PROCESS_AND_REMOTE_BINARY_NAME)
+        process_absence_function(&[PROCESS_AND_REMOTE_BINARY_NAME])
     )
 }
 
@@ -842,7 +842,7 @@ fn preflight_remote_directory_script(
          path_absent \"$ROOT\"\n",
         path_absence_function(),
         device_identity_function(expected_device),
-        process_absence_function(PROCESS_AND_REMOTE_BINARY_NAME),
+        process_absence_function(&[PROCESS_AND_REMOTE_BINARY_NAME]),
     )
 }
 
@@ -899,7 +899,7 @@ fn create_remote_directory_script(
          trap - EXIT HUP INT TERM\n",
         path_absence_function(),
         device_identity_function(expected_device),
-        process_absence_function(PROCESS_AND_REMOTE_BINARY_NAME),
+        process_absence_function(&[PROCESS_AND_REMOTE_BINARY_NAME]),
     )
 }
 
@@ -955,7 +955,7 @@ fn remote_script(
          exit \"$STATUS\"\n",
         remote_directory_variables(remote, expected_device),
         device_identity_function(expected_device),
-        process_absence_function(PROCESS_AND_REMOTE_BINARY_NAME),
+        process_absence_function(&[PROCESS_AND_REMOTE_BINARY_NAME]),
         owned_root_functions(),
     ))
 }
@@ -1043,7 +1043,7 @@ fn cleanup_script(remote: &RemoteDirectory, expected_device: &DeviceProfile) -> 
          remove_owned_root\n",
         remote_directory_variables(remote, expected_device),
         device_identity_function(expected_device),
-        process_absence_function(PROCESS_AND_REMOTE_BINARY_NAME),
+        process_absence_function(&[PROCESS_AND_REMOTE_BINARY_NAME]),
         owned_root_functions(),
     )
 }
@@ -1065,7 +1065,7 @@ fn remote_absence_script(remote: &RemoteDirectory, expected_device: &DeviceProfi
         remote_directory_variables(remote, expected_device),
         path_absence_function(),
         device_identity_function(expected_device),
-        process_absence_function(PROCESS_AND_REMOTE_BINARY_NAME),
+        process_absence_function(&[PROCESS_AND_REMOTE_BINARY_NAME]),
     )
 }
 

@@ -103,6 +103,7 @@ const LINUX_CANARY_REQUIRED_ENV: &str = "FLUX_LINUX_CANARY_REQUIRED";
 const LINUX_CANARY_TEST: &str = "functional_canary::linux_namespace_harness::privileged_dual_stack_canary_exercises_real_topology_and_cleanup";
 const LINUX_TPROXY_CANARY_TEST: &str = "functional_canary::linux_namespace_harness::privileged_ingress_tproxy_checkpoint_exercises_real_capture_counters_and_cleanup";
 const LINUX_OUTPUT_TPROXY_CANARY_TEST: &str = "functional_canary::linux_namespace_harness::privileged_local_output_tproxy_checkpoint_exercises_loopback_reinjection_and_cleanup";
+const ANDROID_OUTPUT_TPROXY_ENGINE_CREDENTIAL_CANARY_TEST: &str = "functional_canary::linux_namespace_harness::privileged_android_output_tproxy_and_engine_credentials_exercise_exact_cleanup";
 const LINUX_OUTPUT_UID_PREFLIGHT_TEST: &str = "functional_canary::linux_namespace_harness::privileged_local_output_distinct_uid_capability_preflight";
 const NATIVE_COMPOSITION_REQUIRED_ENV: &str = "FLUX_NATIVE_COMPOSITION_REQUIRED";
 const NATIVE_COMPOSITION_TEST: &str = "functional_canary::linux_namespace_harness::privileged_native_composition_exercises_lifecycle_recovery_and_exact_cleanup";
@@ -117,7 +118,7 @@ const PARSER_FUZZ_SMOKE_TESTS: [&str; 7] = [
     "netlink::rule::tests::complex_rule_prefixes_and_structured_mutations_are_atomic_and_panic_free",
     "socket_diagnostics::tests::deterministic_arbitrary_datagrams_never_panic",
 ];
-const LINUX_CANARY_INTERNAL_ENVS: [&str; 17] = [
+const LINUX_CANARY_INTERNAL_ENVS: [&str; 27] = [
     "FLUX_LINUX_CANARY_HARNESS_MODE",
     "FLUX_LINUX_CANARY_HARNESS_CONFIG",
     "FLUX_LINUX_CANARY_REENTRY_TOKEN",
@@ -135,6 +136,16 @@ const LINUX_CANARY_INTERNAL_ENVS: [&str; 17] = [
     "FLUX_LINUX_CANARY_INNER_NETNS",
     "FLUX_LINUX_CANARY_INNER_USERNS",
     "FLUX_LINUX_CANARY_INNER_MOUNTNS",
+    "FLUX_ENGINE_CREDENTIAL_PROBE_REQUIRED",
+    "FLUX_ENGINE_CREDENTIAL_PROBE_PATH",
+    "FLUX_ENGINE_CREDENTIAL_PROBE_GID",
+    "FLUX_ENGINE_CREDENTIAL_PARENT_DEATH_HELPER",
+    "FLUX_ENGINE_CREDENTIAL_CONFIG",
+    "FLUX_ENGINE_CREDENTIAL_REPORT",
+    "FLUX_ENGINE_CREDENTIAL_LOG",
+    "FLUX_ENGINE_CREDENTIAL_IDENTITY",
+    "FLUX_ENGINE_CREDENTIAL_IDENTITY_TMP",
+    "FLUX_ENGINE_CREDENTIAL_PORT",
 ];
 const NATIVE_COMPOSITION_INTERNAL_ENVS: [&str; 9] = [
     "FLUX_NATIVE_COMPOSITION_HARNESS_MODE",

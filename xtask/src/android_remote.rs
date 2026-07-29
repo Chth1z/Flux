@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::Read;
 use std::process::Output;
@@ -290,18 +291,38 @@ pub(super) fn owned_root_functions() -> String {
     functions
 }
 
-pub(super) fn process_absence_function(process_name: &str) -> String {
-    let expected_process_name = shell_single_quote(process_name);
+pub(super) fn process_absence_function(process_names: &[&str]) -> String {
+    assert!(
+        !process_names.is_empty(),
+        "process-name set must not be empty"
+    );
+    let mut unique = BTreeSet::new();
+    for process_name in process_names {
+        assert!(
+            (1..=15).contains(&process_name.len()) && safe_literal(process_name.as_bytes(), b"._-"),
+            "process name must fit Linux comm and use canonical ASCII"
+        );
+        assert!(
+            unique.insert(*process_name),
+            "process-name set must not contain duplicates"
+        );
+    }
+    let expected_process_names = process_names
+        .iter()
+        .map(|name| shell_single_quote(name))
+        .collect::<Vec<_>>()
+        .join(" ");
     format!(
-        "EXPECTED_PROCESS_NAME={expected_process_name}\n\
-         probe_process_absent() {{\n\
+        "probe_process_absent() {{\n\
            for COMM in /proc/[0-9]*/comm; do\n\
              [ -e \"$COMM\" ] || continue\n\
              if ! NAME=$(/system/bin/cat \"$COMM\"); then\n\
                [ ! -e \"$COMM\" ] && continue\n\
                return 71\n\
              fi\n\
-             [ \"$NAME\" != \"$EXPECTED_PROCESS_NAME\" ] || return 72\n\
+             for EXPECTED_PROCESS_NAME in {expected_process_names}; do\n\
+               [ \"$NAME\" != \"$EXPECTED_PROCESS_NAME\" ] || return 72\n\
+             done\n\
            done\n\
          }}\n"
     )
@@ -446,8 +467,9 @@ mod tests {
 
     #[test]
     fn process_absence_scan_distinguishes_read_failure_from_process_residue() {
-        let function = process_absence_function("fluxd-test");
+        let function = process_absence_function(&["fluxd-test", "flux-cred-probe"]);
         assert!(function.contains("for COMM in /proc/[0-9]*/comm"));
+        assert!(function.contains("for EXPECTED_PROCESS_NAME in 'fluxd-test' 'flux-cred-probe'"));
         assert!(function.contains("return 71"));
         assert!(function.contains("return 72"));
         assert!(function.contains("[ ! -e \"$COMM\" ] && continue"));

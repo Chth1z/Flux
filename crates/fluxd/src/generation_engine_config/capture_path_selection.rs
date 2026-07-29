@@ -43,8 +43,8 @@ enum CapturePathQualificationSource {
 }
 
 impl CapturePathQualificationEvidence {
-    pub(crate) fn new(
-        evidence: CapturePathBehavioralEvidence,
+    fn from_source(
+        source: CapturePathQualificationSource,
         observed_at: Instant,
         valid_until: Instant,
     ) -> Result<Self, CapturePathQualificationEvidenceError> {
@@ -56,7 +56,7 @@ impl CapturePathQualificationEvidence {
             return Err(CapturePathQualificationEvidenceError::LifetimeExceedsMaximum { lifetime });
         }
         Ok(Self {
-            source: CapturePathQualificationSource::Android(evidence),
+            source,
             observed_at,
             valid_until,
         })
@@ -66,10 +66,20 @@ impl CapturePathQualificationEvidence {
         evidence: CapturePathBehavioralEvidence,
         observed_at: Instant,
     ) -> Result<Self, CapturePathQualificationEvidenceError> {
+        Self::from_source_with_maximum_lifetime(
+            CapturePathQualificationSource::Android(evidence),
+            observed_at,
+        )
+    }
+
+    fn from_source_with_maximum_lifetime(
+        source: CapturePathQualificationSource,
+        observed_at: Instant,
+    ) -> Result<Self, CapturePathQualificationEvidenceError> {
         let valid_until = observed_at
             .checked_add(CAPTURE_PATH_QUALIFICATION_EVIDENCE_MAX_AGE)
             .ok_or(CapturePathQualificationEvidenceError::DeadlineOverflow)?;
-        Self::new(evidence, observed_at, valid_until)
+        Self::from_source(source, observed_at, valid_until)
     }
 
     #[cfg(test)]
@@ -78,18 +88,11 @@ impl CapturePathQualificationEvidence {
         observed_at: Instant,
         valid_until: Instant,
     ) -> Result<Self, CapturePathQualificationEvidenceError> {
-        let lifetime = valid_until
-            .checked_duration_since(observed_at)
-            .filter(|lifetime| !lifetime.is_zero())
-            .ok_or(CapturePathQualificationEvidenceError::NonPositiveLifetime)?;
-        if lifetime > CAPTURE_PATH_QUALIFICATION_EVIDENCE_MAX_AGE {
-            return Err(CapturePathQualificationEvidenceError::LifetimeExceedsMaximum { lifetime });
-        }
-        Ok(Self {
-            source: CapturePathQualificationSource::HostInspection(qualifications),
+        Self::from_source(
+            CapturePathQualificationSource::HostInspection(qualifications),
             observed_at,
             valid_until,
-        })
+        )
     }
 
     #[cfg(test)]
@@ -97,10 +100,10 @@ impl CapturePathQualificationEvidence {
         qualifications: CapturePathQualifications,
         observed_at: Instant,
     ) -> Result<Self, CapturePathQualificationEvidenceError> {
-        let valid_until = observed_at
-            .checked_add(CAPTURE_PATH_QUALIFICATION_EVIDENCE_MAX_AGE)
-            .ok_or(CapturePathQualificationEvidenceError::DeadlineOverflow)?;
-        Self::host_inspection(qualifications, observed_at, valid_until)
+        Self::from_source_with_maximum_lifetime(
+            CapturePathQualificationSource::HostInspection(qualifications),
+            observed_at,
+        )
     }
 
     pub(crate) const fn qualifications(&self) -> CapturePathQualifications {
@@ -1361,7 +1364,8 @@ fn digest_capture_path_decision(
 }
 
 fn update_field(digest: &mut Sha256, bytes: &[u8]) {
-    digest.update(bytes.len().to_be_bytes());
+    let length = u64::try_from(bytes.len()).expect("canonical evidence field length fits u64");
+    digest.update(length.to_be_bytes());
     digest.update(bytes);
 }
 

@@ -1174,13 +1174,13 @@ fn digest_product_desired_state(config: &FluxConfig) -> [u8; GENERATION_ASSEMBLY
         AndroidUserSelection::All => digest.update([1]),
         AndroidUserSelection::List(user_ids) => {
             digest.update([2]);
-            update_field(&mut digest, &user_ids.len().to_be_bytes());
+            update_count(&mut digest, user_ids.len());
             for user_id in user_ids {
                 update_field(&mut digest, &user_id.to_be_bytes());
             }
         }
     }
-    update_field(&mut digest, &applications.packages().len().to_be_bytes());
+    update_count(&mut digest, applications.packages().len());
     for package in applications.packages() {
         update_field(&mut digest, package.as_str().as_bytes());
     }
@@ -1191,7 +1191,7 @@ fn digest_product_desired_state(config: &FluxConfig) -> [u8; GENERATION_ASSEMBLY
         interfaces.forwarded_proxy(),
         interfaces.local_bypass(),
     ] {
-        update_field(&mut digest, &selectors.len().to_be_bytes());
+        update_count(&mut digest, selectors.len());
         for selector in selectors {
             digest.update([match selector.kind() {
                 CaptureInterfaceSelectorKind::Exact => 0,
@@ -1202,7 +1202,7 @@ fn digest_product_desired_state(config: &FluxConfig) -> [u8; GENERATION_ASSEMBLY
     }
 
     let prefixes = config.bypass().policy().prefixes();
-    update_field(&mut digest, &prefixes.len().to_be_bytes());
+    update_count(&mut digest, prefixes.len());
     for prefix in prefixes {
         update_ip(&mut digest, prefix.network());
         digest.update([prefix.prefix_length()]);
@@ -1353,6 +1353,12 @@ fn update_os_str(digest: &mut Sha256, value: &OsStr) {
 }
 
 fn update_field(digest: &mut Sha256, bytes: &[u8]) {
-    digest.update(bytes.len().to_be_bytes());
+    let length = u64::try_from(bytes.len()).expect("canonical evidence field length fits u64");
+    digest.update(length.to_be_bytes());
     digest.update(bytes);
+}
+
+fn update_count(digest: &mut Sha256, count: usize) {
+    let count = u64::try_from(count).expect("canonical collection length fits u64");
+    update_field(digest, &count.to_be_bytes());
 }

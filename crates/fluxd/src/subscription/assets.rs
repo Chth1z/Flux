@@ -937,13 +937,13 @@ fn prepared_digest(
     digest.update(subscription_content_sha256);
     digest.update(compiled_digest);
     digest.update(node_count.to_be_bytes());
-    digest.update(assets.len().to_be_bytes());
+    update_count(&mut digest, assets.len());
     for asset in assets {
         digest.update(asset.content_sha256);
         update_field(&mut digest, asset.path.as_os_str().as_encoded_bytes());
         update_field(&mut digest, &asset.bytes);
     }
-    digest.update(bindings.len().to_be_bytes());
+    update_count(&mut digest, bindings.len());
     for binding in bindings {
         update_field(&mut digest, binding.tag.as_bytes());
         digest.update(binding.source.as_bytes());
@@ -953,8 +953,13 @@ fn prepared_digest(
 }
 
 fn update_field(digest: &mut Sha256, bytes: &[u8]) {
-    digest.update(bytes.len().to_be_bytes());
+    update_count(digest, bytes.len());
     digest.update(bytes);
+}
+
+fn update_count(digest: &mut Sha256, count: usize) {
+    let count = u64::try_from(count).expect("canonical collection length fits u64");
+    digest.update(count.to_be_bytes());
 }
 
 fn hex_digest(digest: &[u8; 32]) -> String {

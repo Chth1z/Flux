@@ -1,6 +1,8 @@
 use flux_core::EngineCredentials;
 
 pub const TRANSPARENT_PROXY_ENGINE_CAPABILITY_MASK: u64 = (1_u64 << 12) | (1_u64 << 13);
+pub(crate) const TRANSPARENT_PROXY_ENGINE_SECUREBITS: u64 =
+    (1_u64 << 0) | (1_u64 << 1) | (1_u64 << 2) | (1_u64 << 3) | (1_u64 << 6) | (1_u64 << 7);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ProcessSignal {
@@ -42,7 +44,7 @@ mod implementation {
 
     use super::{
         ChildProcessConfig, ChildProcessPrivilege, ProcessSignal,
-        TRANSPARENT_PROXY_ENGINE_CAPABILITY_MASK,
+        TRANSPARENT_PROXY_ENGINE_CAPABILITY_MASK, TRANSPARENT_PROXY_ENGINE_SECUREBITS,
     };
 
     const DESIRED_NOFILE_LIMIT: libc::rlim_t = 1_048_576;
@@ -55,14 +57,11 @@ mod implementation {
     const SECBIT_NOROOT_LOCKED: libc::c_ulong = 1 << 1;
     const SECBIT_NO_SETUID_FIXUP: libc::c_ulong = 1 << 2;
     const SECBIT_NO_SETUID_FIXUP_LOCKED: libc::c_ulong = 1 << 3;
-    const SECBIT_NO_CAP_AMBIENT_RAISE: libc::c_ulong = 1 << 6;
-    const SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED: libc::c_ulong = 1 << 7;
     const BASE_SECUREBITS: libc::c_ulong = SECBIT_NOROOT
         | SECBIT_NOROOT_LOCKED
         | SECBIT_NO_SETUID_FIXUP
         | SECBIT_NO_SETUID_FIXUP_LOCKED;
-    const FINAL_SECUREBITS: libc::c_ulong =
-        BASE_SECUREBITS | SECBIT_NO_CAP_AMBIENT_RAISE | SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED;
+    const FINAL_SECUREBITS: libc::c_ulong = TRANSPARENT_PROXY_ENGINE_SECUREBITS as libc::c_ulong;
 
     #[repr(C)]
     #[derive(Clone, Copy)]

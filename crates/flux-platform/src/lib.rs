@@ -13,6 +13,8 @@ mod android_identity_properties;
 mod android_kernel_capabilities;
 mod capability;
 mod child_process;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod engine_credential_probe;
 mod file_observer;
 mod netlink;
 #[allow(dead_code)]
@@ -145,6 +147,12 @@ pub mod internal {
         ANDROID_IDENTITY_PROPERTY_NAMES, AndroidIdentityPropertyError,
         MAX_ANDROID_IDENTITY_PROPERTY_BYTES, validate_android_identity_properties,
         validate_android_verified_boot_properties,
+    };
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub use crate::engine_credential_probe::{
+        EngineCredentialProbeCapabilities, EngineCredentialProbeCommand,
+        EngineCredentialProbeConfig, EngineCredentialProbePrivilege, EngineCredentialProbeReport,
+        validate_engine_process_credentials,
     };
     pub use crate::sing_box::{
         PinnedSingBoxLaunch, ProcessDiagnostics, SingBoxChild, SingBoxChildIdentity,

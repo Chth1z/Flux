@@ -14,6 +14,7 @@ use std::ffi::{CString, OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
@@ -51,6 +52,8 @@ const MAX_JOURNAL_BYTES: u64 = 192 * 1024;
 const MAX_JOURNAL_RECORDS: usize = 96;
 static JSON_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(target_os = "android")]
+mod android_engine_credential;
 #[cfg(target_os = "linux")]
 mod distinct_uid;
 #[cfg(target_os = "linux")]
@@ -95,6 +98,21 @@ fn privileged_local_output_tproxy_checkpoint_exercises_loopback_reinjection_and_
 }
 
 #[test]
+#[cfg(target_os = "android")]
+#[ignore = "requires rooted Android local-OUTPUT and engine credential authority"]
+fn privileged_android_output_tproxy_and_engine_credentials_exercise_exact_cleanup() {
+    local_output_tproxy::run();
+    android_engine_credential::run();
+}
+
+#[test]
+#[cfg(target_os = "android")]
+#[ignore = "helper invoked by the Android engine parent-death checkpoint"]
+fn privileged_android_engine_credential_parent_death_helper() {
+    android_engine_credential::run_parent_death_helper();
+}
+
+#[test]
 #[cfg(target_os = "linux")]
 #[ignore = "requires Linux user-namespace authority for distinct subordinate credentials"]
 fn privileged_local_output_distinct_uid_capability_preflight() {
@@ -106,6 +124,39 @@ fn privileged_local_output_distinct_uid_capability_preflight() {
 #[ignore = "requires Linux user/mount/network namespace and native xtables authority"]
 fn privileged_native_composition_exercises_lifecycle_recovery_and_exact_cleanup() {
     native_composition::run();
+}
+
+#[test]
+fn published_process_identity_requires_exact_nonzero_framing() {
+    assert_eq!(
+        parse_published_process_identity("123:456\n"),
+        Ok(ProcessIdentity {
+            pid: 123,
+            start_ticks: 456,
+        })
+    );
+    for rejected in ["123:456", "0123:456\n", "123:0\n", "123:456:789\n"] {
+        assert!(parse_published_process_identity(rejected).is_err());
+    }
+}
+
+#[test]
+fn checkpoint_and_cleanup_failures_remain_independent() {
+    assert_eq!(
+        combine_checkpoint_and_cleanup::<()>(Err("checkpoint".to_owned()), Ok(())),
+        Err("checkpoint".to_owned())
+    );
+    assert_eq!(
+        combine_checkpoint_and_cleanup(Ok(()), Err("cleanup".to_owned())),
+        Err("cleanup failed: cleanup".to_owned())
+    );
+    assert_eq!(
+        combine_checkpoint_and_cleanup::<()>(
+            Err("checkpoint".to_owned()),
+            Err("cleanup".to_owned()),
+        ),
+        Err("checkpoint; cleanup also failed: cleanup".to_owned())
+    );
 }
 
 fn run_outer() -> Result<(), String> {
@@ -271,6 +322,48 @@ struct JournalRecord<'a> {
 struct ProcessIdentity {
     pid: u32,
     start_ticks: u64,
+}
+
+fn parse_published_process_identity(record: &str) -> Result<ProcessIdentity, String> {
+    let record = record
+        .strip_suffix('\n')
+        .ok_or_else(|| "published process identity lacks canonical LF framing".to_owned())?;
+    let (pid, start_ticks) = record
+        .split_once(':')
+        .ok_or_else(|| "published process identity lacks delimiter".to_owned())?;
+    if pid.is_empty()
+        || start_ticks.is_empty()
+        || (pid.len() > 1 && pid.starts_with('0'))
+        || (start_ticks.len() > 1 && start_ticks.starts_with('0'))
+        || !pid.bytes().all(|byte| byte.is_ascii_digit())
+        || !start_ticks.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err("published process identity is not canonical decimal".to_owned());
+    }
+    let pid = pid
+        .parse::<u32>()
+        .map_err(|_| "published process PID exceeds u32".to_owned())?;
+    let start_ticks = start_ticks
+        .parse::<u64>()
+        .map_err(|_| "published process start ticks exceed u64".to_owned())?;
+    if pid == 0 || start_ticks == 0 {
+        return Err("published process identity values must be nonzero".to_owned());
+    }
+    Ok(ProcessIdentity { pid, start_ticks })
+}
+
+fn combine_checkpoint_and_cleanup<T>(
+    checkpoint: Result<T, String>,
+    cleanup: Result<(), String>,
+) -> Result<T, String> {
+    match (checkpoint, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(cleanup_error)) => Err(format!("cleanup failed: {cleanup_error}")),
+        (Err(error), Err(cleanup_error)) => {
+            Err(format!("{error}; cleanup also failed: {cleanup_error}"))
+        }
+    }
 }
 
 struct Journal {
@@ -2798,6 +2891,57 @@ fn verify_process_identity(expected: ProcessIdentity) -> Result<(), String> {
             expected.pid, expected.start_ticks, observed.start_ticks
         ))
     }
+}
+
+fn kill_owned_process(identity: ProcessIdentity) -> Result<(), String> {
+    let pid = i32::try_from(identity.pid)
+        .map_err(|_| format!("PID {} does not fit Linux pid_t", identity.pid))?;
+    // SAFETY: pid is a positive scalar PID and flags zero is the only supported
+    // `pidfd_open` mode. A successful descriptor is uniquely owned below.
+    let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0_u32) };
+    if descriptor < 0 {
+        let error = std::io::Error::last_os_error();
+        return if error.raw_os_error() == Some(libc::ESRCH) && !owned_process_remains(identity)? {
+            Ok(())
+        } else {
+            Err(format!(
+                "open owned process pidfd {}: {error}",
+                identity.pid
+            ))
+        };
+    }
+    let descriptor = i32::try_from(descriptor)
+        .map_err(|_| "pidfd_open returned a descriptor outside i32".to_owned())?;
+    // SAFETY: the successful pidfd_open result is transferred into one OwnedFd.
+    let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor) };
+    if let Err(error) = verify_process_identity(identity) {
+        return if !owned_process_remains(identity)? {
+            Ok(())
+        } else {
+            Err(error)
+        };
+    }
+    // SAFETY: the pidfd was opened before the exact start-tick revalidation, so
+    // PID reuse cannot redirect this signal; null siginfo and flags zero are valid.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            descriptor.as_raw_fd(),
+            libc::SIGKILL,
+            std::ptr::null::<libc::siginfo_t>(),
+            0_u32,
+        )
+    };
+    if result != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(format!(
+                "signal owned process through pidfd {}: {error}",
+                identity.pid
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn terminate_and_reap_owned(

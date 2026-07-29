@@ -36,7 +36,8 @@ pub use android_fwmark_census::{
     AndroidFwmarkCensusCoordinatorRequestError, AndroidFwmarkCensusCoordinatorSource,
     AndroidFwmarkCensusExternalPhase, AndroidFwmarkCensusExternalSnapshot,
     AndroidFwmarkCensusExternalSnapshotDigest, AndroidFwmarkCensusMetric,
-    AndroidFwmarkCensusMetricKind, AndroidFwmarkCensusProbeReports, AndroidFwmarkCensusProjection,
+    AndroidFwmarkCensusMetricKind, AndroidFwmarkCensusPlanningEvidence,
+    AndroidFwmarkCensusProbeReports, AndroidFwmarkCensusProjection,
     AndroidFwmarkCensusProjectionDigest, AndroidFwmarkCensusReportPhase,
     AndroidNftablesFwmarkObservation, AndroidNftablesFwmarkObservationError,
     AndroidNftablesFwmarkObservationErrorKind, AndroidNftablesSnapshotDigest,
@@ -61,9 +62,9 @@ pub use android_fwmark_census::{
 };
 pub use android_kernel_capabilities::{
     ALL_ANDROID_KERNEL_FEATURES, ANDROID_CAPTURE_PATH_COUNT, ANDROID_KERNEL_CONFIG_DIGEST_BYTES,
-    AndroidCapturePathCandidate, AndroidCapturePathDecision, AndroidCapturePathPreference,
-    AndroidCapturePathProbeState, AndroidCapturePathQualifications, AndroidCapturePathState,
-    AndroidKernelConfigDigest, AndroidKernelConfigOptionState, AndroidKernelConfigParseError,
+    AndroidCapturePathCandidate, AndroidCapturePathDecision, AndroidCapturePathProbeState,
+    AndroidCapturePathQualifications, AndroidCapturePathState, AndroidKernelConfigDigest,
+    AndroidKernelConfigOptionState, AndroidKernelConfigParseError,
     AndroidKernelConfigParseErrorKind, AndroidKernelConfigSnapshot, AndroidKernelFeature,
     AndroidKernelFeatureState, AndroidNftablesObservationGate, AndroidNftablesObservationGateError,
     MAX_ANDROID_KERNEL_CONFIG_COMPRESSED_BYTES, MAX_ANDROID_KERNEL_CONFIG_DECOMPRESSED_BYTES,

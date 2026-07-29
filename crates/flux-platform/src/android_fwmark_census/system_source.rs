@@ -319,7 +319,7 @@ impl AndroidFwmarkCensusCoordinatorSource for SystemAndroidFwmarkCensusSource {
             collect_android_xfrm_fwmarks(remaining(deadline)?).map_err(map_xfrm_observation)?;
         ensure_before(deadline)?;
         Ok(AndroidFwmarkCensusExternalSnapshot::new(
-            kernel_config.digest(),
+            Arc::new(kernel_config),
             xtables,
             nftables,
             traffic_control_bpf,

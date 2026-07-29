@@ -58,8 +58,22 @@ fn diagnostic_brackets_the_only_inventory_in_fixed_order() {
 
     let projection = outcome.diagnostic().expect("diagnostic outcome");
     assert!(projection.is_complete());
-    assert!(outcome.planning_authority().is_none());
+    assert!(outcome.planning_evidence().is_none());
     assert_eq!(source.events, complete_sequence());
+}
+
+#[test]
+fn external_snapshot_clones_retain_one_kernel_config_allocation() {
+    let (source, _) = source_and_request();
+
+    assert!(Arc::ptr_eq(
+        &source.external_before.kernel_config,
+        &source.external_after.kernel_config,
+    ));
+    assert_eq!(
+        source.external_before.kernel_config_digest(),
+        source.external_before.kernel_config().digest(),
+    );
 }
 
 #[test]
@@ -91,7 +105,7 @@ fn capability_drift_rejects_after_both_brackets_without_assembly() {
 fn external_drift_rejects_after_capability_revalidation() {
     let (mut source, request) = source_and_request();
     source.external_after = AndroidFwmarkCensusExternalSnapshot::new(
-        source.external_after.kernel_config_digest(),
+        Arc::new(source.external_after.kernel_config().clone()),
         source.external_after.xtables.clone(),
         nftables::test_absent_observation(false),
         source.external_after.traffic_control_bpf.clone(),
@@ -115,7 +129,7 @@ fn external_drift_rejects_after_capability_revalidation() {
 fn kernel_config_drift_is_external_snapshot_drift() {
     let (mut source, request) = source_and_request();
     source.external_after = AndroidFwmarkCensusExternalSnapshot::new(
-        test_kernel_config_digest(true),
+        test_kernel_config(true),
         source.external_after.xtables.clone(),
         source.external_after.nftables.clone(),
         source.external_after.traffic_control_bpf.clone(),
@@ -140,7 +154,7 @@ fn capability_drift_precedes_simultaneous_external_drift() {
     let (mut source, request) = source_and_request();
     source.capability_after = revised_profile(&source.capability_before);
     source.external_after = AndroidFwmarkCensusExternalSnapshot::new(
-        source.external_after.kernel_config_digest(),
+        Arc::new(source.external_after.kernel_config().clone()),
         source.external_after.xtables.clone(),
         nftables::test_absent_observation(false),
         source.external_after.traffic_control_bpf.clone(),
@@ -173,7 +187,7 @@ fn wrong_before_snapshot_context_stops_before_native_collection() {
     )
     .expect("complete alternate-context snapshot");
     source.external_before = AndroidFwmarkCensusExternalSnapshot::new(
-        source.external_before.kernel_config_digest(),
+        Arc::new(source.external_before.kernel_config().clone()),
         xtables,
         source.external_before.nftables.clone(),
         source.external_before.traffic_control_bpf.clone(),
@@ -364,7 +378,7 @@ fn source_and_request() -> (FakeSource, AndroidFwmarkCensusCoordinatorRequest) {
     )
     .expect("bounded coordinator request");
     let external = AndroidFwmarkCensusExternalSnapshot::new(
-        test_kernel_config_digest(false),
+        test_kernel_config(false),
         fixture.xtables,
         fixture.nftables,
         fixture.traffic_control_bpf,
@@ -382,15 +396,13 @@ fn source_and_request() -> (FakeSource, AndroidFwmarkCensusCoordinatorRequest) {
     (source, request)
 }
 
-fn test_kernel_config_digest(nftables_built_in: bool) -> AndroidKernelConfigDigest {
+fn test_kernel_config(nftables_built_in: bool) -> Arc<AndroidKernelConfigSnapshot> {
     let bytes = if nftables_built_in {
         b"CONFIG_NF_TABLES=y\n".as_slice()
     } else {
         b"# CONFIG_NF_TABLES is not set\n".as_slice()
     };
-    crate::parse_android_kernel_config(bytes)
-        .expect("canonical test kernel config")
-        .digest()
+    Arc::new(crate::parse_android_kernel_config(bytes).expect("canonical test kernel config"))
 }
 
 fn topology_request() -> AndroidTproxyTopologyScopeRequest {

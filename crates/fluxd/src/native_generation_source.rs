@@ -155,8 +155,8 @@ impl SystemAndroidGenerationPlanningSource {
         .map_err(|source| {
             SystemAndroidGenerationPlanningError::Census(source.to_string().into_boxed_str())
         })?;
-        let authority = match outcome {
-            AndroidFwmarkCensusCoordinatorOutcome::PlanningAuthority(authority) => *authority,
+        let evidence = match outcome {
+            AndroidFwmarkCensusCoordinatorOutcome::PlanningAuthority(evidence) => *evidence,
             AndroidFwmarkCensusCoordinatorOutcome::Diagnostic(_) => {
                 return Err(SystemAndroidGenerationPlanningError::UnexpectedDiagnostic);
             }
@@ -176,7 +176,7 @@ impl SystemAndroidGenerationPlanningSource {
                 SystemAndroidGenerationPlanningError::Placement(source.to_string().into_boxed_str())
             })?;
         Ok(GenerationPlanningAuthority::android(
-            authority,
+            evidence,
             Some(placement),
         ))
     }

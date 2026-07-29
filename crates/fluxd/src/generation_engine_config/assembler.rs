@@ -13,9 +13,10 @@ use flux_core::{
     StaleRpdbPlacementLease,
 };
 use flux_platform::{
-    SingBoxLauncher, SingBoxReadiness, XtablesCaptureArtifactSet, XtablesCaptureLoweringError,
-    XtablesCaptureLoweringRequest, XtablesCaptureNamespace, XtablesLocalOutputRoutingSpec,
-    XtablesTproxyTarget, lower_xtables_capture, plan_native_xtables_local_output_routing,
+    AndroidFwmarkCensusPlanningEvidence, SingBoxLauncher, SingBoxReadiness,
+    XtablesCaptureArtifactSet, XtablesCaptureLoweringError, XtablesCaptureLoweringRequest,
+    XtablesCaptureNamespace, XtablesLocalOutputRoutingSpec, XtablesTproxyTarget,
+    lower_xtables_capture, plan_native_xtables_local_output_routing,
 };
 use sha2::{Digest, Sha256};
 
@@ -31,7 +32,7 @@ const GENERATION_ASSEMBLY_DIGEST_BYTES: usize = 32;
 const GENERATION_ASSEMBLY_DIGEST_DOMAIN: &[u8] =
     b"Flux coordinator-facing admitted Generation\0sha256-v1\0";
 const GENERATION_PLANNING_DIGEST_DOMAIN: &[u8] =
-    b"Flux complete Generation planning authority\0canonical-schema-v1\0sha256-v1\0";
+    b"Flux complete Generation planning authority\0canonical-schema-v2\0sha256-v1\0";
 const PRODUCT_DESIRED_STATE_DIGEST_DOMAIN: &[u8] =
     b"Flux product Desired State\0schema-v3\0sha256-v1\0";
 
@@ -144,7 +145,7 @@ pub(crate) enum GenerationPlanningAuthority {
     #[cfg(test)]
     HostInspection(Box<HostInspectionPlanningAuthority>),
     Android {
-        mark: Box<AndroidMarkPlanningAuthority>,
+        census: Box<AndroidFwmarkCensusPlanningEvidence>,
         placement: Option<RpdbPlacementLease>,
     },
 }
@@ -158,11 +159,11 @@ impl GenerationPlanningAuthority {
 
     #[must_use]
     pub(crate) fn android(
-        mark: AndroidMarkPlanningAuthority,
+        census: AndroidFwmarkCensusPlanningEvidence,
         placement: Option<RpdbPlacementLease>,
     ) -> Self {
         Self::Android {
-            mark: Box::new(mark),
+            census: Box::new(census),
             placement,
         }
     }
@@ -180,7 +181,7 @@ impl GenerationPlanningAuthority {
         match self {
             #[cfg(test)]
             Self::HostInspection(authority) => &authority.capability_profile,
-            Self::Android { mark, .. } => mark.capability_profile(),
+            Self::Android { census, .. } => census.mark_authority().capability_profile(),
         }
     }
 
@@ -190,9 +191,9 @@ impl GenerationPlanningAuthority {
     ) -> Option<(&AndroidMarkPlanningAuthority, RpdbPlacementLease)> {
         match self {
             Self::Android {
-                mark,
+                census,
                 placement: Some(placement),
-            } => Some((mark, *placement)),
+            } => Some((census.mark_authority(), *placement)),
             #[cfg(test)]
             Self::HostInspection(_) => None,
             Self::Android {
@@ -340,11 +341,12 @@ impl AdmittedGeneration {
             GenerationPlanningAuthority::HostInspection(_) => {
                 Err(NativeGenerationPromotionError::HostInspectionNonPromotable)
             }
-            GenerationPlanningAuthority::Android { mark, placement } => {
+            GenerationPlanningAuthority::Android { census, placement } => {
                 let placement =
                     placement.ok_or(NativeGenerationPromotionError::MissingAndroidPlacement)?;
+                let (mark, _) = census.into_parts();
                 Ok(NativeGenerationTargetRequest {
-                    mark: *mark,
+                    mark,
                     placement,
                     xtables: self.xtables,
                 })
@@ -653,7 +655,8 @@ fn validate_planning(
                 digest,
             })
         }
-        GenerationPlanningAuthority::Android { mark, placement } => {
+        GenerationPlanningAuthority::Android { census, placement } => {
+            let mark = census.mark_authority();
             ensure_common_planning_binding(
                 mark.capability_profile(),
                 mark.topology_scope().snapshot_id(),
@@ -716,9 +719,13 @@ fn digest_generation_planning_authority(
             update_mark(&mut digest, authority.mark);
             update_routing(&mut digest, authority.routing);
         }
-        GenerationPlanningAuthority::Android { mark, placement } => {
+        GenerationPlanningAuthority::Android { census, placement } => {
             digest.update([1]);
-            update_field(&mut digest, mark.evidence_digest().as_bytes());
+            update_field(
+                &mut digest,
+                census.mark_authority().evidence_digest().as_bytes(),
+            );
+            update_field(&mut digest, census.kernel_config().digest().as_bytes());
             update_placement(&mut digest, *placement);
         }
     }

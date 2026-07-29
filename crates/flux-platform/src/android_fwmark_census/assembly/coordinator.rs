@@ -26,7 +26,7 @@ use crate::android_fwmark_census::{
     AndroidTrafficControlBpfFwmarkObservation, AndroidXfrmFwmarkObservation,
     AndroidXtablesFwmarkObservation,
 };
-use crate::android_kernel_capabilities::AndroidKernelConfigDigest;
+use crate::android_kernel_capabilities::{AndroidKernelConfigDigest, AndroidKernelConfigSnapshot};
 
 pub const ANDROID_FWMARK_CENSUS_COLLECTOR_REVISION: FwmarkCensusCollectorRevision =
     FwmarkCensusCollectorRevision::new(2).expect("collector revision two is nonzero");
@@ -102,11 +102,12 @@ impl AndroidFwmarkCensusExternalSnapshotDigest {
 /// Complete external mark observations collected on one side of the native inventory transaction.
 ///
 /// This value is cloneable because it is non-authorizing. The coordinator compares the complete
-/// typed values, not only their aggregate digest. It exposes only the aggregate identity publicly;
-/// raw xtables text, BPF instructions, XFRM selectors, endpoints, and device identities are absent.
+/// typed values, not only their aggregate digest. It retains the typed kernel configuration for
+/// later path selection; raw network observations, endpoints, and device identities remain absent
+/// from its public interface.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AndroidFwmarkCensusExternalSnapshot {
-    kernel_config_digest: AndroidKernelConfigDigest,
+    kernel_config: Arc<AndroidKernelConfigSnapshot>,
     xtables: AndroidXtablesFwmarkObservation,
     nftables: AndroidNftablesFwmarkObservation,
     traffic_control_bpf: AndroidTrafficControlBpfFwmarkObservation,
@@ -117,12 +118,13 @@ pub struct AndroidFwmarkCensusExternalSnapshot {
 impl AndroidFwmarkCensusExternalSnapshot {
     #[must_use]
     pub fn new(
-        kernel_config_digest: AndroidKernelConfigDigest,
+        kernel_config: Arc<AndroidKernelConfigSnapshot>,
         xtables: AndroidXtablesFwmarkObservation,
         nftables: AndroidNftablesFwmarkObservation,
         traffic_control_bpf: AndroidTrafficControlBpfFwmarkObservation,
         xfrm: AndroidXfrmFwmarkObservation,
     ) -> Self {
+        let kernel_config_digest = kernel_config.digest();
         let digest = digest_external_snapshot(
             kernel_config_digest,
             &xtables,
@@ -131,7 +133,7 @@ impl AndroidFwmarkCensusExternalSnapshot {
             &xfrm,
         );
         Self {
-            kernel_config_digest,
+            kernel_config,
             xtables,
             nftables,
             traffic_control_bpf,
@@ -146,8 +148,13 @@ impl AndroidFwmarkCensusExternalSnapshot {
     }
 
     #[must_use]
-    pub const fn kernel_config_digest(&self) -> AndroidKernelConfigDigest {
-        self.kernel_config_digest
+    pub fn kernel_config_digest(&self) -> AndroidKernelConfigDigest {
+        self.kernel_config.digest()
+    }
+
+    #[must_use]
+    pub fn kernel_config(&self) -> &AndroidKernelConfigSnapshot {
+        &self.kernel_config
     }
 }
 
@@ -316,6 +323,45 @@ where
     }
 }
 
+/// Single-use planning evidence from one coherent, freshness-bracketed census.
+#[derive(Debug, Eq, PartialEq)]
+pub struct AndroidFwmarkCensusPlanningEvidence {
+    mark_authority: AndroidMarkPlanningAuthority,
+    kernel_config: Arc<AndroidKernelConfigSnapshot>,
+}
+
+impl AndroidFwmarkCensusPlanningEvidence {
+    fn new(
+        mark_authority: AndroidMarkPlanningAuthority,
+        kernel_config: Arc<AndroidKernelConfigSnapshot>,
+    ) -> Self {
+        Self {
+            mark_authority,
+            kernel_config,
+        }
+    }
+
+    #[must_use]
+    pub const fn mark_authority(&self) -> &AndroidMarkPlanningAuthority {
+        &self.mark_authority
+    }
+
+    #[must_use]
+    pub fn kernel_config(&self) -> &AndroidKernelConfigSnapshot {
+        &self.kernel_config
+    }
+
+    #[must_use]
+    pub fn into_parts(
+        self,
+    ) -> (
+        AndroidMarkPlanningAuthority,
+        Arc<AndroidKernelConfigSnapshot>,
+    ) {
+        (self.mark_authority, self.kernel_config)
+    }
+}
+
 /// Successful output from exactly one coherent collection.
 ///
 /// Both variants are boxed to keep the enum small. The enum intentionally does not implement
@@ -323,7 +369,7 @@ where
 #[derive(Debug, Eq, PartialEq)]
 pub enum AndroidFwmarkCensusCoordinatorOutcome {
     Diagnostic(Box<AndroidFwmarkCensusProjection>),
-    PlanningAuthority(Box<AndroidMarkPlanningAuthority>),
+    PlanningAuthority(Box<AndroidFwmarkCensusPlanningEvidence>),
 }
 
 impl AndroidFwmarkCensusCoordinatorOutcome {
@@ -336,10 +382,10 @@ impl AndroidFwmarkCensusCoordinatorOutcome {
     }
 
     #[must_use]
-    pub fn planning_authority(&self) -> Option<&AndroidMarkPlanningAuthority> {
+    pub fn planning_evidence(&self) -> Option<&AndroidFwmarkCensusPlanningEvidence> {
         match self {
             Self::Diagnostic(_) => None,
-            Self::PlanningAuthority(authority) => Some(authority),
+            Self::PlanningAuthority(evidence) => Some(evidence),
         }
     }
 }
@@ -610,7 +656,7 @@ pub fn coordinate_android_fwmark_census<S: AndroidFwmarkCensusCoordinatorSource>
         &inventory,
         &capability_before,
         network_namespace,
-        external_before.kernel_config_digest,
+        external_before.kernel_config_digest(),
         &device_policy,
         &android_net_id,
         &rpdb,
@@ -655,7 +701,10 @@ pub fn coordinate_android_fwmark_census<S: AndroidFwmarkCensusCoordinatorSource>
     )
     .map_err(|error| AndroidFwmarkCensusCoordinatorError::Authorization(Box::new(error)))?;
     Ok(AndroidFwmarkCensusCoordinatorOutcome::PlanningAuthority(
-        Box::new(authority),
+        Box::new(AndroidFwmarkCensusPlanningEvidence::new(
+            authority,
+            Arc::clone(&external_before.kernel_config),
+        )),
     ))
 }
 

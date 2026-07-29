@@ -28,6 +28,7 @@ mod runtime_logging;
 mod runtime_status;
 mod socket;
 mod subscription;
+mod traffic_observation;
 
 use protocol::WireCapabilityProfile;
 
@@ -62,6 +63,15 @@ pub use runtime_status::{
 };
 pub use socket::{ControlConnectionHandler, ControlSocketError, SocketControlClient};
 pub use subscription::{SubscriptionRefreshDisposition, SubscriptionRefreshReport};
+pub use traffic_observation::{
+    AutomationAction, AutomationActionRequest, AutomationDecisionDisposition,
+    AutomationDecisionJournalSnapshot, AutomationDecisionRecord, AutomationDecisionSequence,
+    AutomationEvaluation, AutomationEvaluationContext, AutomationLimits, AutomationPolicy,
+    AutomationPolicyDecision, AutomationPolicyRevision, AutomationProposal, AutomationRejection,
+    AutomationRuleId, MAX_AUTOMATION_ACCEPTED_ACTION_ENTRIES,
+    MAX_AUTOMATION_DECISION_JOURNAL_ENTRIES, TrafficObservationError, TrafficObservationModule,
+    TrafficObservationPublication, TrafficObservationUpdate, TrafficStatisticsSnapshotSource,
+};
 
 pub trait DaemonClient: ControlClient {
     fn ping(&self) -> Result<(), ControlError>;

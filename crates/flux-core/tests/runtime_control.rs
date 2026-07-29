@@ -136,6 +136,79 @@ fn configuration_change_queued_after_stop_is_deferred_in_writer_order() {
 }
 
 #[test]
+fn automation_maintenance_queued_after_stop_cannot_reactivate_the_runtime() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(0);
+    let runtime = RuntimeControl::start(
+        BlockingRecordingDispatcher {
+            calls: Arc::clone(&calls),
+            entered_tx: Some(entered_tx),
+            release_rx,
+        },
+        3,
+    )
+    .expect("start runtime");
+    let running = runtime
+        .submit(RuntimeIntent::Running {
+            reason: Reason::Boot,
+        })
+        .expect("accept blocking start");
+    entered_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("start enters the serialized dispatcher");
+    let stop = runtime
+        .submit(RuntimeIntent::Stopped {
+            reason: Reason::UserControl,
+        })
+        .expect("queue stop");
+    let automation_reload = runtime
+        .submit(RuntimeIntent::Reload {
+            reason: Reason::Automation,
+        })
+        .expect("queue automation reload behind stop");
+    let automation_resync = runtime
+        .submit(RuntimeIntent::ResyncAddresses {
+            reason: Reason::Automation,
+        })
+        .expect("queue automation resync behind stop");
+
+    release_tx.send(()).expect("release start");
+    running.wait().expect("start succeeds");
+    stop.wait().expect("stop succeeds");
+    let reload_error = automation_reload
+        .wait()
+        .expect_err("serialized stop must reject later automation reload");
+    let resync_error = automation_resync
+        .wait()
+        .expect_err("serialized stop must reject later automation resync");
+
+    assert_eq!(
+        reload_error.rejection_code(),
+        Some("automation_runtime_not_running")
+    );
+    assert_eq!(
+        resync_error.rejection_code(),
+        Some("automation_runtime_not_running")
+    );
+    assert_eq!(
+        calls.lock().expect("calls lock").as_slice(),
+        &[
+            RuntimeIntent::Running {
+                reason: Reason::Boot,
+            },
+            RuntimeIntent::Stopped {
+                reason: Reason::UserControl,
+            },
+        ]
+    );
+    assert_eq!(
+        runtime.snapshot().administrative_state,
+        AdministrativeState::Stopped
+    );
+}
+
+#[test]
 fn accepted_administrative_intent_remains_desired_after_dispatcher_failure() {
     let runtime = RuntimeControl::start(FailingDispatcher, 4).expect("start runtime");
 

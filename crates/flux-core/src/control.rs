@@ -13,6 +13,7 @@ pub enum Reason {
     DisableRemoved,
     EngineExited,
     DaemonRecovery,
+    Automation,
 }
 
 impl Reason {
@@ -26,6 +27,7 @@ impl Reason {
             Self::DisableRemoved => "disable_removed",
             Self::EngineExited => "engine_exited",
             Self::DaemonRecovery => "daemon_recovery",
+            Self::Automation => "automation",
         }
     }
 }
@@ -671,6 +673,20 @@ fn execute_intent<D>(
 where
     D: RuntimeDispatcher,
 {
+    if matches!(
+        intent,
+        RuntimeIntent::Reload {
+            reason: Reason::Automation
+        } | RuntimeIntent::ResyncAddresses {
+            reason: Reason::Automation
+        }
+    ) && read_snapshot(snapshot).administrative_state != AdministrativeState::Running
+    {
+        return Err(ControlError::request_rejected(
+            "automation_runtime_not_running",
+            "automation maintenance requires running administrative intent",
+        ));
+    }
     let started = replace_snapshot(snapshot, |current| ControlSnapshot {
         revision: current.revision.saturating_add(1),
         administrative_state: next_administrative_state(current.administrative_state, intent),

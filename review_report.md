@@ -14,7 +14,9 @@ standalone address synchronizer, bridge renderer, takeover parser, or fallback p
 The product is not release-complete. Packaged safety defaults intentionally reject native mutation
 because Android VPN-policy observation and the production functional-canary adapter are not yet
 qualified. Exact rooted Android 5.10+/ARM64 activation, rollback, cleanup, and power evidence also
-remains unavailable in this workspace.
+remains unavailable in this workspace. The bounded statistics core and daemon automation seam are
+implemented, but no production counter collector, manager serialization, or qualified automated
+policy is connected yet.
 
 ## Migration Answer
 
@@ -51,6 +53,24 @@ control. Generation planning and address reconciliation clone the same `NetworkI
 Loss or descriptor failure invalidates the inventory instead of allowing a one-shot or partial view
 to authorize a Generation.
 
+Traffic observation now has a separate backend-neutral seam. A Generation/Capture Path-bound
+`TrafficCounterPlan` maps opaque cells to reviewed privacy-reduced dimensions under an exact
+240-row ceiling. Complete cumulative samples are validated under row, decoded-byte, and work
+limits; sequence gaps, source replacement/reset, reported loss, regression, saturation, and total
+exhaustion create explicit epochs without joining uncertain deltas. Conflicting replay and invalid
+coverage are rejected without changing the accepted snapshot.
+
+`TrafficObservationModule` publishes whole immutable `Arc` replacements and optionally evaluates
+one replaceable in-process policy synchronously. Policies receive only a snapshot and may request
+only reload or address resync. The daemon binds policy/statistics/Generation/Capture Path/epoch
+provenance, freshness, and rule identity; decision-journal and accepted-action capacities are
+configured independently under separate 128-entry ceilings. Plan replacement publishes a typed
+sequenced discontinuity record. Policy evaluation requires Running administrative intent, and the
+serialized writer repeats that gate after earlier queued intents. Accepted actions enter only
+`RuntimeControl`; protocol-v6 socket clients cannot forge the reserved automation reason. No
+collector, timer, worker, persistence, manager transport, or concrete product policy is introduced
+by this checkpoint.
+
 ### Capture and native ownership
 
 The public migration vocabulary is gone. The current flow is:
@@ -73,9 +93,10 @@ the old bypass-equals-proxy sentinel, parallel boolean, and compatibility-stable
 
 ### Control contract
 
-Protocol v5 reports native admission and current runtime state only. It no longer carries bridge
+Protocol v6 reports native admission and current runtime state only. It no longer carries bridge
 facts, a redundant kernel summary, public events, or shell/address-synchronizer status. Direct user
-actions use `user_control`; current xtables evidence uses `xtables`.
+actions use `user_control`; current xtables evidence uses `xtables`; daemon-originated automation
+uses the reserved `automation` reason, which inbound clients cannot claim.
 
 ### Safety posture
 
@@ -117,6 +138,9 @@ manager IPC.
 | Forwarded lowering retained schema-v1 compatibility | One current lowering schema with mandatory transaction order |
 | Shell writer takeover and bridge ownership were recognized | Only exact native owner state is recoverable |
 | Proxy-only placement fabricated a bypass priority for identity stability | Optional bypass state is explicit and identity-tagged |
+| Generation and Capture Path identities were duplicated or projected through primitives | One canonical `GenerationId` and `CapturePathId` cross core, daemon, platform, status, and qualification evidence |
+| Traffic counters had no product Interface | One bounded backend-neutral accumulator publishes immutable privacy-reduced snapshots |
+| Automation was only a target sketch | One least-authority typed policy seam submits bounded maintenance proposals through `RuntimeControl` |
 
 ## Qualification Harness Progress
 
@@ -157,11 +181,14 @@ packaged VPN and functional-canary requirements.
 
 ### P1: required product surface
 
-1. Build the manager as an unprivileged Android client of typed, credential-checked IPC, following
-   Vector's replacement-state UX without inheriting its broad root interface.
-2. Expose bounded aggregate traffic, health, loss/reset, generation, and power statistics. Keep
-   per-flow and PII-rich data disabled by default.
-3. Complete subscription and configuration workflows through daemon-owned atomic replacement only;
+1. Build the digest-bound xtables counter plan, counter-aware parser, and production collector;
+   qualify its schedule, CPU, RSS, wakeup, queue, and optional persistence budgets.
+2. Build the manager as an unprivileged Android client of typed, credential-checked IPC, following
+   Vector's replacement-state UX without inheriting its broad root interface. Serialize bounded
+   statistics and automation state without exposing kernel or mutation authority.
+3. Add concrete automated policies only after production inputs exist and each policy has a reviewed
+   deterministic work bound, freshness rule, and failure behavior.
+4. Complete subscription and configuration workflows through daemon-owned atomic replacement only;
    the manager must never write runtime state directly.
 
 ### P2: backend expansion after xtables qualification
@@ -181,20 +208,24 @@ aliases, or speculative backend selection to bypass the P0 physical evidence gat
 - `cargo fmt --all -- --check`: passed.
 - `cargo check --workspace --all-targets`: passed.
 - `cargo clippy --workspace --all-targets -- -D warnings`: passed.
-- `cargo test -p flux-core --test capture_program`: 17 passed.
-- `cargo test -p flux-platform --test xtables_capture_lowering`: 23 passed.
-- `cargo test -p fluxd --lib`: 312 passed, 4 ignored.
+- `cargo test -p flux-core`: 53 unit tests plus every integration and doc test passed; the runtime
+  control suite includes the serialized Stop-before-automation ordering case.
+- Exact formerly failing platform archive fixture: 1 passed, 463 unit tests filtered.
+- Canonical platform unit suite: 457 passed, 7 environment-gated tests ignored.
+- `cargo test -p fluxd --lib`: 325 passed, 4 privileged namespace tests ignored; 13 tests cover the
+  bounded traffic-observation and automation Module.
 - `cargo test -p fluxd --test startup_reconciliation_admission`: 5 passed.
 - `cargo test -p flux-platform --test reactor`: 16 passed.
-- `cargo test -p fluxd --test control_protocol`: 16 passed.
+- `cargo test -p fluxd --test control_protocol`: 17 passed, including protocol-v6 outbound
+  automation serialization and inbound reserved-reason rejection.
+- `cargo test -p fluxd --test socket_round_trip`: 7 passed.
 - `cargo test -p xtask`: 73 passed, 3 ignored; covers ARM64/x86_64 target selection, complete kernel
   grammar, shared artifact drift detection, owner/inode-bound remote transactions, sanitized
   diagnostics, strict dangling-symlink-aware path absence, current-command uniqueness, pinned
   toolchain construction, bounded command cleanup, and existing collectors.
-- `cargo xtask ci`: passed with exit code 0 after replacing retired `fluxctl` tokens in raw
-  protocol-v5 test fixtures, boxing the startup-only configured admission state, simplifying the
-  remaining current xtables save case, documenting each signal-set unsafe contract, and replacing
-  the proxy-only RPDB sentinel with explicit optional state.
+- `cargo xtask ci`: passed with exit code 0, including the complete workspace test suite, strict
+  linting, doc tests, and Android target checks.
+- `git diff --check`: passed.
 - Final active-source vocabulary audit found no Capture Program compatibility names, shell-writer
   recovery, bridge owner, standalone address-synchronizer owner, or obsolete lowering branch.
 

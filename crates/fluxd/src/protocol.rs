@@ -24,7 +24,7 @@ use crate::{
     RuntimeSnapshot, RuntimeSnapshotSource, RuntimeVerificationState,
 };
 
-const PROTOCOL_VERSION: u16 = 5;
+const PROTOCOL_VERSION: u16 = 6;
 const RECENT_RESULT_CAPACITY: usize = 128;
 const RECENT_RESULT_FINGERPRINT_BYTES: usize = MAX_CONTROL_PACKET_BYTES;
 const RECENT_RESULT_RESPONSE_BYTES: usize = MAX_CONTROL_PACKET_BYTES;
@@ -326,6 +326,13 @@ where
     }
 
     fn handle_control(&self, request_id: u64, action: WireAction, reason: WireReason) -> Vec<u8> {
+        if reason == WireReason::Automation {
+            return encode_response(ResponseEnvelope::error(
+                request_id,
+                "reserved_reason",
+                "the automation reason is reserved for daemon-originated proposals".to_owned(),
+            ));
+        }
         if let Some(response) = self.mutation_gate_response(request_id) {
             return response;
         }
@@ -609,7 +616,7 @@ enum WireAction {
     Resync,
 }
 
-#[derive(Clone, Copy, Deserialize, Serialize)]
+#[derive(Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum WireReason {
     Boot,
@@ -619,6 +626,7 @@ enum WireReason {
     DisableRemoved,
     EngineExited,
     DaemonRecovery,
+    Automation,
 }
 
 impl From<WireReason> for Reason {
@@ -631,6 +639,7 @@ impl From<WireReason> for Reason {
             WireReason::DisableRemoved => Self::DisableRemoved,
             WireReason::EngineExited => Self::EngineExited,
             WireReason::DaemonRecovery => Self::DaemonRecovery,
+            WireReason::Automation => Self::Automation,
         }
     }
 }
@@ -645,6 +654,7 @@ impl From<Reason> for WireReason {
             Reason::DisableRemoved => Self::DisableRemoved,
             Reason::EngineExited => Self::EngineExited,
             Reason::DaemonRecovery => Self::DaemonRecovery,
+            Reason::Automation => Self::Automation,
         }
     }
 }
@@ -2134,7 +2144,7 @@ mod tests {
         let request = encode_logs_request(91, LogStream::Runtime, 2).expect("log request");
         assert_eq!(
             String::from_utf8(request.clone()).expect("UTF-8 request"),
-            "{\"protocol_version\":5,\"request_id\":91,\"command\":{\"kind\":\"logs\",\"stream\":\"runtime\",\"lines\":2}}"
+            "{\"protocol_version\":6,\"request_id\":91,\"command\":{\"kind\":\"logs\",\"stream\":\"runtime\",\"lines\":2}}"
         );
         let first = handler.handle_for_peer(&request, RequestPeerId::new(Uid::ROOT, 72));
         let report = decode_logs_response(&first, 91, LogStream::Runtime, 2).expect("log report");
@@ -2227,7 +2237,7 @@ mod tests {
         assert_eq!(
             String::from_utf8(response).expect("UTF-8 response"),
             concat!(
-                "{\"protocol_version\":5,\"request_id\":101,",
+                "{\"protocol_version\":6,\"request_id\":101,",
                 "\"result\":{\"status\":\"ok\",\"body\":{",
                 "\"kind\":\"subscription_update\",\"disposition\":\"updated\",",
                 "\"generation\":71,\"node_count\":23,\"cleanup_pending\":true}}}\n"
@@ -2266,7 +2276,7 @@ mod tests {
         assert_eq!(
             String::from_utf8(response).expect("UTF-8 response"),
             concat!(
-                "{\"protocol_version\":5,\"request_id\":102,",
+                "{\"protocol_version\":6,\"request_id\":102,",
                 "\"result\":{\"status\":\"error\",\"code\":\"unsupported_kernel\",",
                 "\"message\":\"kernel 5.4.280 is below minimum 5.10.0\"}}\n"
             )

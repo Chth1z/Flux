@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+use flux_core::CAPABILITY_PROFILE_SCHEMA_VERSION;
 use serde_json::Value;
 
 use super::android_artifact::AndroidArtifactIdentity as ArtifactIdentity;
@@ -485,7 +486,12 @@ fn validate_profile_report(
         "read_only_profile_evidence_no_mutation_authority",
     )?;
     require_field(&fields, "schema_version", "1")?;
-    require_field(&fields, "capability_schema_version", "2")?;
+    let capability_schema_version = CAPABILITY_PROFILE_SCHEMA_VERSION.to_string();
+    require_field(
+        &fields,
+        "capability_schema_version",
+        &capability_schema_version,
+    )?;
     require_positive_u64(&fields, "capability_revision")?;
     require_lower_sha256(&fields, "capability_profile_sha256")?;
     require_field(&fields, "boot_id", &expected_device.boot_id)?;
@@ -762,7 +768,7 @@ mod tests {
         let report = [
             "authority=read_only_profile_evidence_no_mutation_authority".to_owned(),
             "schema_version=1".to_owned(),
-            "capability_schema_version=2".to_owned(),
+            format!("capability_schema_version={CAPABILITY_PROFILE_SCHEMA_VERSION}"),
             "capability_revision=7".to_owned(),
             format!("capability_profile_sha256={}", "22".repeat(32)),
             format!("boot_id={}", expected.boot_id),

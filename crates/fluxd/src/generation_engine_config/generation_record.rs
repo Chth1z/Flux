@@ -7,12 +7,12 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     ADMITTED_GENERATION_SCHEMA_VERSION, AdmittedGeneration, AdmittedGenerationIdentity,
-    GenerationAdmissionKind, GenerationAssemblyDigest,
+    CapturePathSelection, GenerationAdmissionKind, GenerationAssemblyDigest,
 };
 use crate::IntentStoreError;
 use crate::intent_store::record_io;
 
-pub(crate) const PREPARED_GENERATION_RECORD_SCHEMA_VERSION: u16 = 1;
+pub(crate) const PREPARED_GENERATION_RECORD_SCHEMA_VERSION: u16 = 2;
 pub(crate) const MAX_PREPARED_GENERATION_RECORD_BYTES: usize = 16 * 1_024;
 const DIGEST_BYTES: usize = 32;
 
@@ -21,6 +21,7 @@ pub(crate) struct PreparedGenerationRecord {
     identity: AdmittedGenerationIdentity,
     previous: Option<AdmittedGenerationIdentity>,
     admission: GenerationAdmissionKind,
+    capture_path_selection: CapturePathSelection,
     capability_profile_revision: u64,
     capability_profile_digest: [u8; DIGEST_BYTES],
     inventory_snapshot: u64,
@@ -39,6 +40,7 @@ impl PreparedGenerationRecord {
             identity: generation.identity(),
             previous: generation.prior_owned(),
             admission: generation.admission_kind(),
+            capture_path_selection: generation.capture_path_selection(),
             capability_profile_revision: generation.candidate().device_profile().revision().get(),
             capability_profile_digest: *generation.candidate().device_profile().digest().as_bytes(),
             inventory_snapshot: generation.candidate().inventory_snapshot().get(),
@@ -73,6 +75,11 @@ impl PreparedGenerationRecord {
     #[must_use]
     pub(crate) const fn admission(&self) -> GenerationAdmissionKind {
         self.admission
+    }
+
+    #[must_use]
+    pub(crate) const fn capture_path_selection(&self) -> CapturePathSelection {
+        self.capture_path_selection
     }
 
     #[must_use]
@@ -176,6 +183,7 @@ struct StoredPreparedGenerationRecord {
     identity: StoredGenerationIdentity,
     previous: Option<StoredGenerationIdentity>,
     admission: StoredGenerationAdmission,
+    capture_path_selection: CapturePathSelection,
     capability_profile_revision: u64,
     capability_profile_digest: String,
     inventory_snapshot: u64,
@@ -203,6 +211,7 @@ impl From<&PreparedGenerationRecord> for StoredPreparedGenerationRecord {
                     StoredGenerationAdmission::AndroidPlanningEvidence
                 }
             },
+            capture_path_selection: record.capture_path_selection,
             capability_profile_revision: record.capability_profile_revision,
             capability_profile_digest: hex(&record.capability_profile_digest),
             inventory_snapshot: record.inventory_snapshot,
@@ -259,6 +268,7 @@ impl TryFrom<StoredPreparedGenerationRecord> for PreparedGenerationRecord {
                     GenerationAdmissionKind::AndroidPlanningEvidence
                 }
             },
+            capture_path_selection: stored.capture_path_selection,
             capability_profile_revision: nonzero_record_value(
                 stored.capability_profile_revision,
                 "capability_profile_revision",

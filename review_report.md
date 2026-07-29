@@ -3,12 +3,15 @@
 Date: 2026-07-29
 Branch: `codex/fluxd-rust-rewrite`
 Baseline: `c3d153b679346dce9d0c7422ba1536b5ff65637e`
+Reviewed state: R8 qualified Capture Path selection checkpoint based on `19f2f16`
 
 ## Conclusion
 
 The host-implementable shell networking and standalone `addrsyncd` migration is complete. The
 package has one Rust runtime owner, one staged native-admission decision, one reactor-owned network
-inventory, and one current Capture Program/lowering path. No executable shell networking writer,
+inventory, and one current Capture Program/lowering path. Schema-4 `auto`/exact Capture Path
+selection is now bound to the Generation, runtime status, diagnostics, and explain output. No
+executable shell networking writer,
 standalone address synchronizer, bridge renderer, takeover parser, or fallback path remains.
 
 The product is not release-complete. Packaged safety defaults intentionally reject native mutation
@@ -16,7 +19,8 @@ because Android VPN-policy observation and the production functional-canary adap
 qualified. Exact rooted Android 5.10+/ARM64 activation, rollback, cleanup, and power evidence also
 remains unavailable in this workspace. The bounded statistics core and daemon automation seam are
 implemented, but no production counter collector, manager serialization, or qualified automated
-policy is connected yet.
+policy is connected yet. The selector's production Android behavioral evidence deliberately remains
+unqualified, so the packaged daemon stays queryable but read-only.
 
 ## Migration Answer
 
@@ -67,9 +71,37 @@ provenance, freshness, and rule identity; decision-journal and accepted-action c
 configured independently under separate 128-entry ceilings. Plan replacement publishes a typed
 sequenced discontinuity record. Policy evaluation requires Running administrative intent, and the
 serialized writer repeats that gate after earlier queued intents. Accepted actions enter only
-`RuntimeControl`; protocol-v6 socket clients cannot forge the reserved automation reason. No
+`RuntimeControl`; protocol-v8 socket clients cannot forge the reserved automation reason. No
 collector, timer, worker, persistence, manager transport, or concrete product policy is introduced
 by this checkpoint.
+
+### Capture Path selection
+
+Desired State schema 4 accepts `auto` and exact nftables TPROXY, xtables TPROXY, or managed-TUN
+requests. One daemon selector combines the implemented Adapter inventory with the same fresh Android
+planning evidence used to assemble the Generation. The current production inventory contains only
+xtables TPROXY; nftables and TUN remain `Unimplemented`, and an exact unavailable request never
+falls back.
+
+Selected and rejected outcomes both retain the exact request, every bounded candidate state, first
+kernel gaps, and one canonical evidence digest. Selected outcomes are bound to Generation identity,
+prepared records, runtime publication, protocol v8, diagnostics, and explain output. Rejections
+remain inspectable while mutation stays disabled. Production probe state defaults to `Unqualified`,
+so Kconfig or structural eligibility cannot grant behavioral authority.
+
+Qualification evidence records one observation time and an at-most-five-minute deadline. That
+original deadline survives admission, preparation, and runtime ownership; no later layer refreshes
+the lease. Decoding rejects a claimed `Qualified` candidate unless its behavioral probe is qualified
+and no disabled kernel prerequisite remains. Expiry or inventory loss clears the public decision
+and detaches fail-open. Normal Stop clears a latest selected decision immediately while retaining
+the active Generation binding until detachment is proven. Once
+detachment is proven, the coordinator requests one explicit full reactor redump through a
+capacity-one eventfd-woken command. Every complete observation transaction receives a distinct
+snapshot ID while `NetworkEpoch` changes only for topology changes. The prior transaction is
+rejected behind a freshness barrier. Revision mismatch schedules exactly one complete transaction;
+an unsent, active, or already-published transaction bound to the requested revision satisfies a
+later dequeued command without a parallel follow-up flag. Manual restart is blocked, and exactly one
+fresh-evidence `DaemonRecovery` attempt is allowed.
 
 ### Capture and native ownership
 
@@ -93,10 +125,14 @@ the old bypass-equals-proxy sentinel, parallel boolean, and compatibility-stable
 
 ### Control contract
 
-Protocol v6 reports native admission and current runtime state only. It no longer carries bridge
-facts, a redundant kernel summary, public events, or shell/address-synchronizer status. Direct user
-actions use `user_control`; current xtables evidence uses `xtables`; daemon-originated automation
-uses the reserved `automation` reason, which inbound clients cannot claim.
+Protocol v8 reports native admission and current runtime state. `active_generation` structurally
+pairs one Generation with the selection it actually owns; `latest_capture_path_decision` separately
+reports the latest completed selection attempt, including a rejected successor. Explain snapshots
+runtime once and labels whether each request matches current Desired State; decoding rejects forged
+relation labels. The protocol no longer carries bridge facts, a redundant kernel summary, public
+events, or shell/address-synchronizer status. Direct user actions use `user_control`; current
+xtables evidence uses `xtables`; daemon-originated automation uses the reserved `automation` reason,
+which inbound clients cannot claim.
 
 ### Safety posture
 
@@ -141,6 +177,9 @@ manager IPC.
 | Generation and Capture Path identities were duplicated or projected through primitives | One canonical `GenerationId` and `CapturePathId` cross core, daemon, platform, status, and qualification evidence |
 | Traffic counters had no product Interface | One bounded backend-neutral accumulator publishes immutable privacy-reduced snapshots |
 | Automation was only a target sketch | One least-authority typed policy seam submits bounded maintenance proposals through `RuntimeControl` |
+| Capture Path selector was disconnected and configuration was xtables-only | Schema-4 `auto`/exact selection is Generation/status/explain-bound with complete decisions and no-fallback behavior |
+| Selection could outlive quiet, stopped, or lost inventory evidence | The original at-most-five-minute qualification deadline, Stop entry, and inventory loss invalidate the public selection; loss detaches fail-open, forces one current transaction, and allows one recovery attempt |
+| Runtime status used parallel optional Generation, selection, and decision fields | Protocol v8 uses one active Generation/selection binding plus an independent latest-attempt decision and validated Desired State request relations |
 
 ## Qualification Harness Progress
 
@@ -167,16 +206,18 @@ packaged VPN and functional-canary requirements.
 
 ### P0: release correctness
 
-1. Attach a rooted ARM64 Android 5.10+ target and run the profile, mark-ordering, fwmark-census, and
+1. Implement and qualify the production Android Capture Path behavioral-evidence producer; retain
+   `Unqualified` as the packaged default until device evidence exists.
+2. Attach a rooted ARM64 Android 5.10+ target and run the profile, mark-ordering, fwmark-census, and
    architecture-neutral local-OUTPUT commands, followed by the reviewed VPN, RPDB, listener, and
    payload-identity matrix.
-2. Implement and qualify the Android VPN-policy adapter against observed netd/Connectivity behavior.
-3. Implement and qualify the production local-OUTPUT functional-canary observer, binding exact
+3. Implement and qualify the Android VPN-policy adapter against observed netd/Connectivity behavior.
+4. Implement and qualify the production local-OUTPUT functional-canary observer, binding exact
    transparent-listener delivery, supervised-engine receipt, pre/post identity, bounded counters,
    and cleanup.
-4. Exercise fresh install, duplicate service triggers, reboot, safe mode, disable/re-enable,
+5. Exercise fresh install, duplicate service triggers, reboot, safe mode, disable/re-enable,
    replacement, forced death, partial mutation, rollback, and uninstall on both Magisk and KernelSU.
-5. Record exact ARM64 tool/payload digests, power and wakeup budgets, SELinux behavior, and verified
+6. Record exact ARM64 tool/payload digests, power and wakeup budgets, SELinux behavior, and verified
    clean absence before changing the manifest from development-only.
 
 ### P1: required product surface
@@ -208,16 +249,19 @@ aliases, or speculative backend selection to bypass the P0 physical evidence gat
 - `cargo fmt --all -- --check`: passed.
 - `cargo check --workspace --all-targets`: passed.
 - `cargo clippy --workspace --all-targets -- -D warnings`: passed.
-- `cargo test -p flux-core`: 53 unit tests plus every integration and doc test passed; the runtime
+- `cargo test -p flux-core`: 56 unit tests plus every integration and doc test passed; the runtime
   control suite includes the serialized Stop-before-automation ordering case.
-- Exact formerly failing platform archive fixture: 1 passed, 463 unit tests filtered.
-- Canonical platform unit suite: 457 passed, 7 environment-gated tests ignored.
-- `cargo test -p fluxd --lib`: 325 passed, 4 privileged namespace tests ignored; 13 tests cover the
-  bounded traffic-observation and automation Module.
+- Canonical platform unit suite: 466 passed, 7 environment-gated tests ignored. Six focused refresh
+  tests cover command-before-retry, retry-before-command, publish-before-command, active
+  supersession, ordinary refresh, and debounced-event supersession.
+- `cargo test -p fluxd --lib`: 368 passed, 4 privileged namespace tests ignored, including prepared
+  candidate settlement, cleanup retry, every Running-publication deadline boundary, and Stop-entry
+  decision invalidation through uncertain detachment.
 - `cargo test -p fluxd --test startup_reconciliation_admission`: 5 passed.
 - `cargo test -p flux-platform --test reactor`: 16 passed.
-- `cargo test -p fluxd --test control_protocol`: 17 passed, including protocol-v6 outbound
+- `cargo test -p fluxd --test control_protocol`: 17 passed, including protocol-v8 outbound
   automation serialization and inbound reserved-reason rejection.
+- `cargo test -p fluxd --test daemon_cli`: 10 passed.
 - `cargo test -p fluxd --test socket_round_trip`: 7 passed.
 - `cargo test -p xtask`: 73 passed, 3 ignored; covers ARM64/x86_64 target selection, complete kernel
   grammar, shared artifact drift detection, owner/inode-bound remote transactions, sanitized

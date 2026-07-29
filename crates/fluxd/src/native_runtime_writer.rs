@@ -1,6 +1,6 @@
 use std::error::Error;
 use std::fmt;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use flux_core::{AddressResyncDisposition, GenerationId, Reason};
 use flux_platform::{
@@ -10,7 +10,9 @@ use flux_platform::{
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use flux_platform::{NativeXtablesCaptureConverger, NativeXtablesCaptureTarget};
 
-use crate::generation_engine_config::AddressReconciledGenerationInputs;
+use crate::generation_engine_config::{
+    AddressReconciledGenerationInputs, CapturePathDecision, CapturePathSelection,
+};
 use crate::runtime_coordinator::{
     AddressResyncStrategy, PreparedGeneration, PublishedRuntimeState, RuntimeCoordinator,
     RuntimeFunctionalCanary, RuntimeWriter,
@@ -35,9 +37,20 @@ pub(crate) struct PreparedNativeGeneration<T> {
 
 impl<T> PreparedNativeGeneration<T> {
     #[must_use]
-    pub(crate) fn new(id: GenerationId, spec: EngineSpec, target: T) -> Self {
+    pub(crate) fn new(
+        id: GenerationId,
+        spec: EngineSpec,
+        capture_path_selection: CapturePathSelection,
+        capture_path_evidence_deadline: Instant,
+        target: T,
+    ) -> Self {
         Self {
-            runtime: PreparedGeneration::new(id, spec),
+            runtime: PreparedGeneration::new(
+                id,
+                spec,
+                capture_path_selection,
+                capture_path_evidence_deadline,
+            ),
             target,
         }
     }
@@ -81,6 +94,21 @@ pub(crate) trait NativeGenerationSource<T, I>: Send + 'static {
 
     fn accept_deferred_subscription(&mut self, _config: ValidatedSubscriptionEngineConfig) -> bool {
         false
+    }
+
+    fn latest_capture_path_decision(&self) -> Option<CapturePathDecision> {
+        None
+    }
+
+    fn invalidate_latest_capture_path_decision(&mut self) {}
+
+    fn reject_prepared(
+        &mut self,
+        generation: GenerationId,
+        prior: Option<I>,
+    ) -> Result<(), Self::Error> {
+        let _ = generation;
+        self.settle(PublishedRuntimeState::Failed, prior)
     }
 
     fn settle(
@@ -367,6 +395,49 @@ where
 {
     type Error = NativeCoordinatorWriterError;
 
+    fn latest_capture_path_decision(&self) -> Option<CapturePathDecision> {
+        self.source.latest_capture_path_decision()
+    }
+
+    fn invalidate_latest_capture_path_decision(&mut self) {
+        self.source.invalidate_latest_capture_path_decision();
+    }
+
+    fn reject_prepared(&mut self, generation: &PreparedGeneration) -> Result<(), Self::Error> {
+        let generation_id = generation.id();
+        if self.committed_generation == Some(generation_id) {
+            return Err(NativeCoordinatorWriterError::Invariant(
+                "coordinator attempted to reject the committed native Generation",
+            ));
+        }
+        let retained = self
+            .retained
+            .iter()
+            .find(|retained| retained.runtime.id() == generation_id)
+            .ok_or(NativeCoordinatorWriterError::Invariant(
+                "coordinator attempted to reject a native Generation that is not retained",
+            ))?;
+        let candidate_identity = C::target_identity(&retained.target);
+        if self.converged_identity == Some(candidate_identity) {
+            return Err(NativeCoordinatorWriterError::Invariant(
+                "coordinator attempted to reject an active native Generation",
+            ));
+        }
+
+        let prior = self.prior_identity();
+        self.source
+            .reject_prepared(generation_id, prior)
+            .map_err(|source| {
+                NativeCoordinatorWriterError::preparation(
+                    "reject prepared native Generation source transaction",
+                    source,
+                )
+            })?;
+        self.retained
+            .retain(|retained| retained.runtime.id() != generation_id);
+        Ok(())
+    }
+
     fn prepare(&mut self, reason: Reason) -> Result<PreparedGeneration, Self::Error> {
         let prior = self.prior_identity();
         let prepared = self.source.prepare(reason, prior).map_err(|source| {
@@ -543,7 +614,10 @@ mod tests {
 
     use super::*;
     use crate::engine_supervisor::{EngineChildAuthority, EngineChildAuthorityError};
-    use crate::generation_engine_config::AddressReconciler;
+    use crate::generation_engine_config::{
+        AddressReconciler, qualified_xtables_capture_path_evidence,
+        test_xtables_capture_path_selection,
+    };
     use crate::runtime_coordinator::{EngineRuntime, RuntimeCoordinator, RuntimeFunctionalCanary};
     use crate::{
         CaptureObservation, DesiredEngine, EngineReport, EngineSnapshot, EngineSupervisorError,
@@ -811,6 +885,8 @@ mod tests {
         PreparedNativeGeneration::new(
             GenerationId::new(id).expect("nonzero native Generation"),
             fixture.spec.clone(),
+            test_xtables_capture_path_selection(),
+            qualified_xtables_capture_path_evidence().valid_until(),
             ScriptedTarget(u64::from(id)),
         )
     }
@@ -884,6 +960,8 @@ mod tests {
         let mismatched = PreparedNativeGeneration::new(
             GenerationId::INITIAL,
             fixture.spec.clone(),
+            test_xtables_capture_path_selection(),
+            qualified_xtables_capture_path_evidence().valid_until(),
             ScriptedTarget(2),
         );
         let mut writer = writer(&events, None, None, [mismatched], []);
@@ -934,7 +1012,92 @@ mod tests {
             snapshot.verification,
             RuntimeVerificationState::StructuralOnly
         );
-        assert_eq!(snapshot.generation, GenerationId::new(1));
+        assert_eq!(snapshot.generation(), GenerationId::new(1));
+    }
+
+    #[test]
+    fn rejected_native_candidate_releases_the_retained_slot_for_the_same_generation_retry() {
+        let rejected = EngineFixture::new();
+        let retry = EngineFixture::new();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut writer = writer(
+            &events,
+            None,
+            None,
+            [generation(1, &rejected), generation(1, &retry)],
+            [],
+        );
+
+        let candidate =
+            RuntimeWriter::prepare(&mut writer, Reason::Boot).expect("prepare native candidate");
+        assert_eq!(writer.retained.len(), 1);
+        RuntimeWriter::reject_prepared(&mut writer, &candidate)
+            .expect("reject native candidate transaction");
+        assert!(writer.retained.is_empty());
+
+        let retried = RuntimeWriter::prepare(&mut writer, Reason::DaemonRecovery)
+            .expect("same Generation identifier is reusable after rejection");
+        assert_eq!(retried.id(), GenerationId::INITIAL);
+        RuntimeWriter::reject_prepared(&mut writer, &retried).expect("clean retry fixture");
+        assert!(writer.retained.is_empty());
+    }
+
+    #[test]
+    fn native_candidate_rejection_requires_the_exact_retained_generation() {
+        let retained = EngineFixture::new();
+        let mismatched = EngineFixture::new();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut writer = writer(&events, None, None, [generation(1, &retained)], []);
+        let candidate = RuntimeWriter::prepare(&mut writer, Reason::Boot)
+            .expect("prepare retained native candidate");
+        let other = PreparedGeneration::new(
+            GenerationId::new(2).expect("nonzero mismatched Generation"),
+            mismatched.spec,
+            test_xtables_capture_path_selection(),
+            qualified_xtables_capture_path_evidence().valid_until(),
+        );
+
+        let error = RuntimeWriter::reject_prepared(&mut writer, &other)
+            .expect_err("mismatched Generation cannot reject the retained candidate");
+
+        assert_eq!(
+            error.to_string(),
+            "coordinator attempted to reject a native Generation that is not retained"
+        );
+        assert_eq!(writer.retained.len(), 1);
+        assert_eq!(writer.retained[0].runtime.id(), candidate.id());
+        RuntimeWriter::reject_prepared(&mut writer, &candidate)
+            .expect("exact retained candidate remains rejectable");
+    }
+
+    #[test]
+    fn native_candidate_rejection_cannot_discard_the_committed_generation() {
+        let committed = EngineFixture::new();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut writer = writer(&events, None, None, [generation(1, &committed)], []);
+        let generation =
+            RuntimeWriter::prepare(&mut writer, Reason::Boot).expect("prepare native Generation");
+        RuntimeWriter::capture_start(&mut writer, &generation).expect("activate native Generation");
+        RuntimeWriter::publish(
+            &mut writer,
+            PublishedRuntimeState::Running {
+                generation: generation.id(),
+            },
+        )
+        .expect("commit native Generation");
+
+        let error = RuntimeWriter::reject_prepared(&mut writer, &generation)
+            .expect_err("committed Generation cannot be rejected as a candidate");
+
+        assert_eq!(
+            error.to_string(),
+            "coordinator attempted to reject the committed native Generation"
+        );
+        assert_eq!(writer.committed_generation, Some(generation.id()));
+        assert_eq!(writer.retained.len(), 1);
+        RuntimeWriter::capture_stop(&mut writer).expect("stop committed native Generation");
+        RuntimeWriter::publish(&mut writer, PublishedRuntimeState::Stopped)
+            .expect("clean committed writer fixture");
     }
 
     #[test]
@@ -986,7 +1149,7 @@ mod tests {
         assert_eq!(snapshot.phase, RuntimePhase::Degraded);
         assert_eq!(snapshot.capture, RuntimeCaptureState::Published);
         assert_eq!(snapshot.engine, RuntimeEngineState::Ready);
-        assert_eq!(snapshot.generation, GenerationId::new(1));
+        assert_eq!(snapshot.generation(), GenerationId::new(1));
         assert!(snapshot.last_error.is_some());
 
         events.lock().expect("native events lock").clear();
@@ -997,7 +1160,7 @@ mod tests {
         );
         let settled = coordinator.runtime_snapshot_source().snapshot();
         assert_eq!(settled.phase, RuntimePhase::Running);
-        assert_eq!(settled.generation, GenerationId::new(1));
+        assert_eq!(settled.generation(), GenerationId::new(1));
         assert_eq!(settled.last_error, None);
     }
 
@@ -1042,7 +1205,7 @@ mod tests {
         );
         let snapshot = coordinator.runtime_snapshot_source().snapshot();
         assert_eq!(snapshot.phase, RuntimePhase::Running);
-        assert_eq!(snapshot.generation, GenerationId::new(2));
+        assert_eq!(snapshot.generation(), GenerationId::new(2));
     }
 
     #[test]
@@ -1157,7 +1320,10 @@ mod tests {
             ]
         );
         assert_eq!(
-            coordinator.runtime_snapshot_source().snapshot().generation,
+            coordinator
+                .runtime_snapshot_source()
+                .snapshot()
+                .generation(),
             GenerationId::new(2)
         );
     }
@@ -1212,7 +1378,10 @@ mod tests {
 
         coordinator.maintain();
         assert_eq!(
-            coordinator.runtime_snapshot_source().snapshot().generation,
+            coordinator
+                .runtime_snapshot_source()
+                .snapshot()
+                .generation(),
             GenerationId::new(2)
         );
     }
@@ -1248,7 +1417,7 @@ mod tests {
         assert_eq!(snapshot.phase, RuntimePhase::Stopped);
         assert_eq!(snapshot.capture, RuntimeCaptureState::Detached);
         assert_eq!(snapshot.engine, RuntimeEngineState::Stopped);
-        assert_eq!(snapshot.generation, None);
+        assert_eq!(snapshot.generation(), None);
     }
 
     fn desired_state_fixture() -> (tempfile::TempDir, PathBuf) {

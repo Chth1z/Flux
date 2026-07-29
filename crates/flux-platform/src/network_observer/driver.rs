@@ -189,6 +189,10 @@ impl RouteNetworkInventoryDriver {
         self.inner.drive_due(now)
     }
 
+    pub(crate) fn request_refresh(&mut self, now: Instant) -> Result<(), PlatformError> {
+        self.inner.request_refresh(now)
+    }
+
     /// Immediately invalidates all cloned public sources.
     ///
     /// This operation is idempotent. It is used before removing the socket
@@ -522,6 +526,10 @@ enum PendingDumpRequest {
 }
 
 impl PendingDumpRequest {
+    const fn starts_complete_transaction(self) -> bool {
+        matches!(self, Self::Link { .. })
+    }
+
     const fn retry_at(self) -> Instant {
         match self {
             Self::Link { retry_at, .. }
@@ -661,6 +669,31 @@ impl<T: RouteNetworkInventoryTransport> RouteNetworkInventoryDriverInner<T> {
         Ok(progress.finish(false))
     }
 
+    fn request_refresh(&mut self, now: Instant) -> Result<(), PlatformError> {
+        if self.disabled {
+            return Ok(());
+        }
+        if self.observer.current_refresh_revision_is_satisfied() {
+            return Ok(());
+        }
+        if self
+            .pending_dump
+            .is_some_and(PendingDumpRequest::starts_complete_transaction)
+            && !self.observer.refresh_in_progress()
+        {
+            self.observer.begin_refresh();
+            return Ok(());
+        }
+        if self.observer.refresh_in_progress() {
+            return Ok(());
+        }
+
+        self.observer.begin_refresh();
+        self.schedule_resync(now);
+        let mut progress = DriveProgress::default();
+        self.try_send_dump(now, &mut progress)
+    }
+
     fn apply_observer_outcome(
         &mut self,
         outcome: ObserverDriveOutcome,
@@ -669,6 +702,12 @@ impl<T: RouteNetworkInventoryTransport> RouteNetworkInventoryDriverInner<T> {
     ) -> Result<bool, PlatformError> {
         Ok(match outcome {
             ObserverDriveOutcome::Idle => false,
+            ObserverDriveOutcome::Superseded => {
+                progress.made_progress = true;
+                self.observer.begin_refresh();
+                self.schedule_resync(now);
+                true
+            }
             ObserverDriveOutcome::Published(epoch) => {
                 progress.made_progress = true;
                 progress.published_epoch = Some(epoch);
@@ -1009,6 +1048,327 @@ mod tests {
         assert_eq!(snapshot.addresses().len(), 1);
         assert!(snapshot.routes().is_empty());
         assert!(snapshot.rules().is_empty());
+    }
+
+    #[test]
+    fn explicit_refresh_invalidates_the_source_and_publishes_a_new_transaction() {
+        let now = Instant::now();
+        let mut fake = FakeTransport::default();
+        fake.receives.push_back(Ok(batch([link(1), done(1)])));
+        fake.receives.push_back(Ok(batch([address(2), done(2)])));
+        fake.receives.push_back(Ok(batch([done(3)])));
+        fake.receives.push_back(Ok(batch([done(4)])));
+        fake.receives
+            .push_back(Ok(RouteNetworkInventoryReceiveOutcome::WouldBlock));
+        let (mut driver, source) = start(fake, now);
+        driver
+            .drive_ready(RouteNetworkInventoryWorkBudget::default(), now)
+            .expect("publish initial transaction");
+        let initial = source.snapshot().expect("initial complete inventory");
+
+        let refresh_at = now + Duration::from_millis(1);
+        source
+            .begin_explicit_refresh()
+            .expect("advance explicit refresh revision");
+        driver
+            .request_refresh(refresh_at)
+            .expect("request explicit refresh");
+
+        assert!(source.snapshot().is_none());
+        assert_eq!(
+            driver.transport.sent_requests.last(),
+            Some(&TestDumpRequest::Link(5))
+        );
+
+        driver
+            .transport
+            .receives
+            .push_back(Ok(batch([link(5), done(5)])));
+        driver
+            .transport
+            .receives
+            .push_back(Ok(batch([address(6), done(6)])));
+        driver.transport.receives.push_back(Ok(batch([done(7)])));
+        driver.transport.receives.push_back(Ok(batch([done(8)])));
+        driver
+            .transport
+            .receives
+            .push_back(Ok(RouteNetworkInventoryReceiveOutcome::WouldBlock));
+        driver
+            .drive_ready(RouteNetworkInventoryWorkBudget::default(), refresh_at)
+            .expect("publish refreshed transaction");
+
+        let refreshed = source.snapshot().expect("refreshed complete inventory");
+        assert_ne!(refreshed.snapshot_id(), initial.snapshot_id());
+        assert_eq!(refreshed.epoch(), initial.epoch());
+    }
+
+    #[test]
+    fn refresh_during_a_dump_requires_a_followup_transaction() {
+        let now = Instant::now();
+        let mut fake = FakeTransport::default();
+        fake.receives.push_back(Ok(batch([link(1), done(1)])));
+        fake.receives.push_back(Ok(batch([address(2), done(2)])));
+        fake.receives.push_back(Ok(batch([done(3)])));
+        fake.receives.push_back(Ok(batch([done(4)])));
+        fake.receives
+            .push_back(Ok(RouteNetworkInventoryReceiveOutcome::WouldBlock));
+        let (mut driver, source) = start(fake, now);
+
+        source
+            .begin_explicit_refresh()
+            .expect("advance explicit refresh revision");
+        driver
+            .request_refresh(now)
+            .expect("queue refresh behind active transaction");
+        let report = driver
+            .drive_ready(RouteNetworkInventoryWorkBudget::default(), now)
+            .expect("finish superseded transaction");
+
+        assert_eq!(report.published_epoch(), None);
+        assert!(source.snapshot().is_none());
+        assert_eq!(
+            driver.transport.sent_requests.last(),
+            Some(&TestDumpRequest::Link(5))
+        );
+        driver
+            .drive_ready(RouteNetworkInventoryWorkBudget::default(), now)
+            .expect("drain readiness boundary after superseded transaction");
+
+        driver
+            .transport
+            .receives
+            .push_back(Ok(batch([link(5), done(5)])));
+        driver
+            .transport
+            .receives
+            .push_back(Ok(batch([address(6), done(6)])));
+        driver.transport.receives.push_back(Ok(batch([done(7)])));
+        driver.transport.receives.push_back(Ok(batch([done(8)])));
+        driver
+            .transport
+            .receives
+            .push_back(Ok(RouteNetworkInventoryReceiveOutcome::WouldBlock));
+        let report = driver
+            .drive_ready(RouteNetworkInventoryWorkBudget::default(), now)
+            .expect("finish requested followup transaction");
+
+        assert_eq!(report.published_epoch(), Some(NetworkEpoch::INITIAL));
+        assert!(source.snapshot().is_some());
+    }
+
+    #[test]
+    fn explicit_refresh_reuses_an_unsent_link_dump_as_the_fresh_transaction() {
+        let now = Instant::now();
+        let retry_at = now + DEFAULT_DUMP_SEND_RETRY;
+        let mut fake = FakeTransport::default();
+        fake.sends.push_back(Ok(NetlinkSendOutcome::WouldBlock));
+        fake.sends.push_back(Ok(NetlinkSendOutcome::Sent));
+        let (mut driver, source) = start(fake, now);
+        assert_eq!(driver.next_deadline(), Some(retry_at));
+
+        source
+            .begin_explicit_refresh()
+            .expect("advance explicit refresh revision");
+        driver
+            .request_refresh(now + Duration::from_millis(1))
+            .expect("bind refresh to the queued complete transaction");
+
+        assert!(source.snapshot().is_none());
+        assert_eq!(driver.transport.sent_requests, [TestDumpRequest::Link(1)]);
+
+        driver
+            .drive_due(retry_at)
+            .expect("send the queued Link request when writable");
+        driver
+            .transport
+            .receives
+            .push_back(Ok(batch([link(1), done(1)])));
+        driver
+            .transport
+            .receives
+            .push_back(Ok(batch([address(2), done(2)])));
+        driver.transport.receives.push_back(Ok(batch([done(3)])));
+        driver.transport.receives.push_back(Ok(batch([done(4)])));
+        driver
+            .transport
+            .receives
+            .push_back(Ok(RouteNetworkInventoryReceiveOutcome::WouldBlock));
+
+        let report = driver
+            .drive_ready(RouteNetworkInventoryWorkBudget::default(), retry_at)
+            .expect("publish the refresh-bound queued transaction");
+
+        assert_eq!(report.published_epoch(), Some(NetworkEpoch::INITIAL));
+        assert!(source.snapshot().is_some());
+        assert_eq!(
+            driver.transport.sent_requests,
+            [
+                TestDumpRequest::Link(1),
+                TestDumpRequest::Link(1),
+                TestDumpRequest::Address(2),
+                TestDumpRequest::Route(3),
+                TestDumpRequest::Rule(4),
+            ]
+        );
+    }
+
+    #[test]
+    fn refresh_command_consumes_a_link_dump_that_already_adopted_its_revision() {
+        let now = Instant::now();
+        let retry_at = now + DEFAULT_DUMP_SEND_RETRY;
+        let mut fake = FakeTransport::default();
+        fake.sends.push_back(Ok(NetlinkSendOutcome::WouldBlock));
+        fake.sends.push_back(Ok(NetlinkSendOutcome::Sent));
+        let (mut driver, source) = start(fake, now);
+
+        source
+            .begin_explicit_refresh()
+            .expect("advance explicit refresh revision before command delivery");
+        driver
+            .drive_due(retry_at)
+            .expect("send the queued Link request before dequeuing refresh");
+        driver
+            .request_refresh(retry_at)
+            .expect("consume the refresh already adopted by the active transaction");
+
+        driver
+            .transport
+            .receives
+            .push_back(Ok(batch([link(1), done(1)])));
+        driver
+            .transport
+            .receives
+            .push_back(Ok(batch([address(2), done(2)])));
+        driver.transport.receives.push_back(Ok(batch([done(3)])));
+        driver.transport.receives.push_back(Ok(batch([done(4)])));
+        driver
+            .transport
+            .receives
+            .push_back(Ok(RouteNetworkInventoryReceiveOutcome::WouldBlock));
+
+        let report = driver
+            .drive_ready(RouteNetworkInventoryWorkBudget::default(), retry_at)
+            .expect("publish the one refresh-bound transaction");
+
+        assert_eq!(report.published_epoch(), Some(NetworkEpoch::INITIAL));
+        assert!(source.snapshot().is_some());
+        assert_eq!(
+            driver.transport.sent_requests,
+            [
+                TestDumpRequest::Link(1),
+                TestDumpRequest::Link(1),
+                TestDumpRequest::Address(2),
+                TestDumpRequest::Route(3),
+                TestDumpRequest::Rule(4),
+            ]
+        );
+    }
+
+    #[test]
+    fn refresh_command_accepts_a_current_transaction_published_before_dequeue() {
+        let now = Instant::now();
+        let retry_at = now + DEFAULT_DUMP_SEND_RETRY;
+        let mut fake = FakeTransport::default();
+        fake.sends.push_back(Ok(NetlinkSendOutcome::WouldBlock));
+        fake.sends.push_back(Ok(NetlinkSendOutcome::Sent));
+        let (mut driver, source) = start(fake, now);
+
+        source
+            .begin_explicit_refresh()
+            .expect("advance explicit refresh revision before command delivery");
+        driver
+            .drive_due(retry_at)
+            .expect("send the queued Link request before command delivery");
+        driver
+            .transport
+            .receives
+            .push_back(Ok(batch([link(1), done(1)])));
+        driver
+            .transport
+            .receives
+            .push_back(Ok(batch([address(2), done(2)])));
+        driver.transport.receives.push_back(Ok(batch([done(3)])));
+        driver.transport.receives.push_back(Ok(batch([done(4)])));
+        driver
+            .transport
+            .receives
+            .push_back(Ok(RouteNetworkInventoryReceiveOutcome::WouldBlock));
+        driver
+            .drive_ready(RouteNetworkInventoryWorkBudget::default(), retry_at)
+            .expect("publish the revision-bound transaction before command delivery");
+        let published = source.snapshot().expect("current transaction is public");
+
+        driver
+            .request_refresh(retry_at)
+            .expect("consume the already-satisfied refresh command");
+
+        assert_eq!(
+            source
+                .snapshot()
+                .expect("command preserves the current transaction")
+                .snapshot_id(),
+            published.snapshot_id()
+        );
+        assert_eq!(
+            driver.transport.sent_requests,
+            [
+                TestDumpRequest::Link(1),
+                TestDumpRequest::Link(1),
+                TestDumpRequest::Address(2),
+                TestDumpRequest::Route(3),
+                TestDumpRequest::Rule(4),
+            ]
+        );
+    }
+
+    #[test]
+    fn superseded_dump_is_hidden_at_the_concurrent_reader_boundary() {
+        let now = Instant::now();
+        let mut fake = FakeTransport::default();
+        fake.receives.push_back(Ok(batch([link(1), done(1)])));
+        fake.receives.push_back(Ok(batch([address(2), done(2)])));
+        fake.receives.push_back(Ok(batch([done(3)])));
+        fake.receives
+            .push_back(Ok(RouteNetworkInventoryReceiveOutcome::WouldBlock));
+        let (mut driver, source) = start(fake, now);
+        driver
+            .drive_ready(RouteNetworkInventoryWorkBudget::default(), now)
+            .expect("drive superseded transaction through the rule phase");
+        assert_eq!(
+            driver.transport.sent_requests.last(),
+            Some(&TestDumpRequest::Rule(4))
+        );
+
+        source
+            .begin_explicit_refresh()
+            .expect("advance explicit refresh revision");
+        driver
+            .request_refresh(now)
+            .expect("queue refresh behind active transaction");
+        let RouteNetworkInventoryReceiveOutcome::Batch(completion) = batch([done(4)]) else {
+            unreachable!("test completion is a decoded batch");
+        };
+        let outcome = driver.observer.consume_batch(completion.datagrams, now);
+
+        assert_eq!(outcome, ObserverDriveOutcome::Superseded);
+        assert!(
+            source.snapshot().is_none(),
+            "a concurrent reader must not observe the pre-request transaction before driver handling"
+        );
+        let mut progress = DriveProgress::default();
+        assert!(
+            driver
+                .apply_observer_outcome(outcome, now, &mut progress)
+                .expect("schedule the mandatory followup")
+        );
+        driver
+            .try_send_dump(now, &mut progress)
+            .expect("send the mandatory followup");
+        assert_eq!(
+            driver.transport.sent_requests.last(),
+            Some(&TestDumpRequest::Link(5))
+        );
     }
 
     #[test]

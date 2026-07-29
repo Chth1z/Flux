@@ -41,9 +41,16 @@ pub use engine_supervisor::{
     MAX_ENGINE_DIAGNOSTIC_BYTES, OwnedEngineIdentity, RestartPolicy, RestartPolicyError,
     SHA256_DIGEST_BYTES,
 };
+pub use generation_engine_config::{
+    CAPTURE_PATH_SELECTION_EVIDENCE_DIGEST_BYTES, CapturePathCandidateStatus, CapturePathDecision,
+    CapturePathKernelGap, CapturePathRejection, CapturePathRejectionReason, CapturePathSelection,
+    CapturePathSelectionDecodeError, CapturePathSelectionEvidenceDigest,
+    CapturePathSelectionReason,
+};
 pub use inspection::{
     DEFAULT_LOG_LINES, DiagnosticItem, DiagnosticReport, DiagnosticState, ExplainAddressFamilies,
-    ExplainApplicationMode, ExplainReport, LogReport, LogStream, MAX_LOG_LINES, MAX_LOG_TAIL_BYTES,
+    ExplainApplicationMode, ExplainCapturePathRequestRelation, ExplainReport, LogReport, LogStream,
+    MAX_LOG_LINES, MAX_LOG_TAIL_BYTES,
 };
 pub use intent_store::{AdministrativeIntentStore, IntentStoreError};
 pub use native_admission::{NativeAdmissionRejection, NativeAdmissionState};
@@ -58,8 +65,8 @@ pub use runtime_logging::{
     MAX_RUNTIME_LOG_FILE_BYTES, MAX_RUNTIME_LOG_RECORD_BYTES, RuntimeLogError, RuntimeLogErrorKind,
 };
 pub use runtime_status::{
-    RuntimeCaptureState, RuntimeEngineState, RuntimeFailure, RuntimePhase, RuntimeSnapshot,
-    RuntimeSnapshotSource, RuntimeVerificationState,
+    RuntimeCaptureState, RuntimeEngineState, RuntimeFailure, RuntimeGenerationBinding,
+    RuntimePhase, RuntimeSnapshot, RuntimeSnapshotSource, RuntimeVerificationState,
 };
 pub use socket::{ControlConnectionHandler, ControlSocketError, SocketControlClient};
 pub use subscription::{SubscriptionRefreshDisposition, SubscriptionRefreshReport};
@@ -520,7 +527,7 @@ where
     let daemon_state = daemon_state_label(snapshot.native_admission);
     let generation = snapshot
         .runtime
-        .generation
+        .generation()
         .map_or_else(|| "none".to_owned(), |value| value.to_string());
     if writeln!(stdout, "[status]").is_err()
         || writeln!(stdout, "daemon: {daemon_state}").is_err()
@@ -692,7 +699,52 @@ where
             report.desired_state_schema()
         )
         .is_err()
-        || writeln!(stdout, "backend: {}", report.backend()).is_err()
+        || writeln!(
+            stdout,
+            "capture path request: {}",
+            report.capture_path_request()
+        )
+        .is_err()
+        || writeln!(stdout, "runtime revision: {}", report.runtime_revision()).is_err()
+        || writeln!(
+            stdout,
+            "active generation: {}",
+            report.active_generation().map_or_else(
+                || "none".to_owned(),
+                |binding| binding.generation().to_string()
+            )
+        )
+        .is_err()
+        || writeln!(
+            stdout,
+            "active capture path selected: {}",
+            report
+                .active_capture_path_selection()
+                .map_or("unavailable", |selection| selection.selected().as_token())
+        )
+        .is_err()
+        || writeln!(
+            stdout,
+            "active capture path request relation: {}",
+            explain_capture_path_request_relation_label(
+                report.active_capture_path_request_relation()
+            )
+        )
+        .is_err()
+        || writeln!(
+            stdout,
+            "latest capture path decision: {}",
+            explain_capture_path_decision_label(report.latest_capture_path_decision())
+        )
+        .is_err()
+        || writeln!(
+            stdout,
+            "latest capture path request relation: {}",
+            explain_capture_path_request_relation_label(
+                report.latest_capture_path_request_relation()
+            )
+        )
+        .is_err()
         || writeln!(stdout, "listener port: {}", report.listener_port()).is_err()
         || writeln!(
             stdout,
@@ -831,6 +883,28 @@ const fn explain_application_mode_label(mode: ExplainApplicationMode) -> &'stati
     }
 }
 
+const fn explain_capture_path_request_relation_label(
+    relation: ExplainCapturePathRequestRelation,
+) -> &'static str {
+    match relation {
+        ExplainCapturePathRequestRelation::Unavailable => "unavailable",
+        ExplainCapturePathRequestRelation::MatchesDesiredState => "matches_desired_state",
+        ExplainCapturePathRequestRelation::DiffersFromDesiredState => "differs_from_desired_state",
+    }
+}
+
+fn explain_capture_path_decision_label(decision: Option<CapturePathDecision>) -> String {
+    match decision {
+        Some(CapturePathDecision::Selected { selection }) => {
+            format!("selected:{}", selection.selected().as_token())
+        }
+        Some(CapturePathDecision::Rejected { rejection }) => {
+            format!("rejected:{:?}", rejection.reason())
+        }
+        None => "unavailable".to_owned(),
+    }
+}
+
 fn mutating_error_exit(error: &ControlError) -> i32 {
     if error.rejection_code() == Some("unsupported_kernel") {
         EXIT_UNSUPPORTED
@@ -881,8 +955,14 @@ where
     let administrative_state = administrative_state_label(snapshot.control.administrative_state);
     let runtime_generation = snapshot
         .runtime
-        .generation
+        .generation()
         .map_or_else(|| "none".to_owned(), |generation| generation.to_string());
+    let runtime_capture_path = snapshot
+        .runtime
+        .active_capture_path_selection()
+        .map_or("unavailable", |selection| selection.selected().as_token());
+    let latest_capture_path_decision =
+        explain_capture_path_decision_label(snapshot.runtime.latest_capture_path_decision);
     let runtime_error = snapshot
         .runtime
         .last_error
@@ -1006,6 +1086,16 @@ where
         )
         .is_err()
         || writeln!(stdout, "runtime generation: {runtime_generation}").is_err()
+        || writeln!(
+            stdout,
+            "runtime active capture path: {runtime_capture_path}"
+        )
+        .is_err()
+        || writeln!(
+            stdout,
+            "runtime latest capture path decision: {latest_capture_path_decision}"
+        )
+        .is_err()
         || writeln!(stdout, "runtime last error: {runtime_error}").is_err()
     {
         return EXIT_RUNTIME_ERROR;
@@ -1205,7 +1295,8 @@ struct OnlineRuntimeDocument {
     capture: &'static str,
     engine: &'static str,
     verification: &'static str,
-    generation: Option<u32>,
+    active_generation: Option<RuntimeGenerationBinding>,
+    latest_capture_path_decision: Option<CapturePathDecision>,
     last_error: Option<OnlineRuntimeFailureDocument>,
 }
 
@@ -1217,7 +1308,8 @@ impl From<RuntimeSnapshot> for OnlineRuntimeDocument {
             capture: runtime_capture_label(snapshot.capture),
             engine: runtime_engine_label(snapshot.engine),
             verification: runtime_verification_label(snapshot.verification),
-            generation: snapshot.generation.map(flux_core::GenerationId::get),
+            active_generation: snapshot.active_generation,
+            latest_capture_path_decision: snapshot.latest_capture_path_decision,
             last_error: snapshot.last_error.map(Into::into),
         }
     }

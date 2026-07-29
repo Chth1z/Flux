@@ -2,26 +2,30 @@ use std::error::Error as _;
 use std::fs;
 use std::num::{NonZeroU16, NonZeroU32};
 use std::os::unix::fs::PermissionsExt;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use flux_core::{
     CapabilityProfile, CaptureApplicationMode, CaptureApplicationPolicy, CaptureDecisionStage,
-    CaptureInterfaceDirection, CapturePredicate, CaptureTrafficDomain, CaptureUserId, FluxConfig,
-    FwmarkCandidate, InterfaceAddressRecord, InterfaceLinkRecord, KernelSupport,
-    NetworkAddressFamily, NetworkInventory, NetworkInventoryTracker, NetworkNamespaceIdentity,
-    Observation, ObservationKind, RouteProtocol, RouteTableId, RulePriority, RuleProtocol,
-    SelinuxMode,
+    CaptureInterfaceDirection, CapturePathId, CapturePathRequest, CapturePredicate,
+    CaptureTrafficDomain, CaptureUserId, FluxConfig, FwmarkCandidate, InterfaceAddressRecord,
+    InterfaceLinkRecord, KernelSupport, NetworkAddressFamily, NetworkInventory,
+    NetworkInventoryTracker, NetworkNamespaceIdentity, Observation, ObservationKind, RouteProtocol,
+    RouteTableId, RulePriority, RuleProtocol, SelinuxMode,
 };
 use flux_platform::internal::SingBoxProcessError;
 use flux_platform::{
+    AndroidCapturePathProbeState, AndroidCapturePathQualifications, AndroidCapturePathState,
     SingBoxLaunchSpec, SingBoxLauncher, SingBoxReadiness, XtablesLocalOutputRoutingSpec,
     XtablesLocalOutputRoutingTarget,
 };
 use flux_testkit::CapabilityProfileFixture;
 
+use super::capture_path_selection::CapturePathSelectionErrorKind;
 use super::{
     ADMITTED_GENERATION_SCHEMA_VERSION, AdmittedGeneration, AdmittedGenerationIdentity,
-    DesiredStateArtifacts, DesiredStateCompileErrorKind, DesiredStateCompileRequest,
+    CapturePathDecision, CapturePathQualificationEvidence, CapturePathRejection,
+    CapturePathRejectionReason, CapturePathSelectionReason, DesiredStateArtifacts,
+    DesiredStateCompileErrorKind, DesiredStateCompileRequest,
     ENGINE_CAPABILITY_PROFILE_SCHEMA_VERSION, ENGINE_CONFIG_LAUNCH_BINDING_SCHEMA_VERSION,
     EngineCapabilityProfile, EngineCapabilityProfileErrorKind, EngineConfigBindingErrorKind,
     EngineConfigCompileErrorKind, EngineVersionOutputErrorKind,
@@ -35,7 +39,8 @@ use super::{
     TproxyEngineConfigRequest, TproxyGenerationCandidateErrorKind, bind_engine_config_to_spec,
     collect_tproxy_engine_capability_profile, compile_desired_state, compile_desired_state_capture,
     compile_tproxy_engine_config, compile_tproxy_generation_candidate,
-    parse_sing_box_version_output, reconstruct_canonical_tproxy_engine_config,
+    parse_sing_box_version_output, qualified_xtables_capture_path_evidence,
+    qualified_xtables_kernel_config, reconstruct_canonical_tproxy_engine_config,
 };
 use crate::engine_supervisor::EngineCapabilityProbeError;
 use crate::{EngineSpec, MAX_ENGINE_CONFIG_BYTES, RestartPolicy};
@@ -796,6 +801,233 @@ fn assembler_is_deterministic_and_advances_from_prior_owned_identity() {
 }
 
 #[test]
+fn automatic_capture_path_selection_chooses_the_only_implemented_qualified_adapter() {
+    let admitted = HostAssemblyFixture::new()
+        .assemble(None, None)
+        .expect("automatic Capture Path Generation");
+    let selection = admitted.capture_path_selection();
+
+    assert_eq!(selection.request(), CapturePathRequest::Auto);
+    assert_eq!(selection.selected(), CapturePathId::XtablesTproxy);
+    assert_eq!(
+        selection.reason(),
+        CapturePathSelectionReason::AutomaticHighestRankedQualified
+    );
+    assert_eq!(
+        selection.candidates().map(|candidate| candidate.state()),
+        [
+            AndroidCapturePathState::Unimplemented,
+            AndroidCapturePathState::Qualified,
+            AndroidCapturePathState::Unimplemented,
+        ]
+    );
+}
+
+#[test]
+fn kernel_eligibility_without_behavioral_qualification_rejects_every_production_adapter() {
+    let fixture = HostAssemblyFixture::new();
+    let rejection = unqualified_capture_path_rejection(&fixture);
+
+    assert_eq!(rejection.request(), CapturePathRequest::Auto);
+    assert_eq!(
+        rejection.reason(),
+        CapturePathRejectionReason::NoQualifiedPath
+    );
+    assert_eq!(
+        rejection.candidates().map(|candidate| candidate.state()),
+        [
+            AndroidCapturePathState::Unimplemented,
+            AndroidCapturePathState::Unqualified,
+            AndroidCapturePathState::Unimplemented,
+        ]
+    );
+    assert_eq!(
+        rejection
+            .candidates()
+            .map(|candidate| candidate.probe_state()),
+        [AndroidCapturePathProbeState::Unqualified; 3]
+    );
+    assert_eq!(rejection.candidates()[1].first_kernel_gap(), None);
+}
+
+#[test]
+fn rejected_capture_path_decision_round_trips_complete_candidate_evidence() {
+    let fixture = HostAssemblyFixture::new();
+    let decision = CapturePathDecision::Rejected {
+        rejection: unqualified_capture_path_rejection(&fixture),
+    };
+
+    let encoded = serde_json::to_vec(&decision).expect("encode rejected Capture Path decision");
+    let decoded = serde_json::from_slice::<CapturePathDecision>(&encoded)
+        .expect("decode rejected Capture Path decision");
+
+    assert_eq!(decoded, decision);
+    assert!(
+        encoded
+            .windows(b"\"probe_state\":\"unqualified\"".len())
+            .any(|window| { window == b"\"probe_state\":\"unqualified\"" })
+    );
+}
+
+#[test]
+fn selected_capture_path_decode_rejects_qualified_state_without_a_qualified_probe() {
+    let selection = HostAssemblyFixture::new()
+        .assemble(None, None)
+        .expect("qualified Capture Path Generation")
+        .capture_path_selection();
+    let mut encoded = serde_json::to_value(CapturePathDecision::Selected { selection })
+        .expect("encode selected Capture Path decision");
+    encoded["selection"]["candidates"][1]["probe_state"] =
+        serde_json::Value::String("unqualified".to_owned());
+
+    serde_json::from_value::<CapturePathDecision>(encoded)
+        .expect_err("qualified aggregate state without qualified probe evidence must fail closed");
+}
+
+#[test]
+fn selected_capture_path_decode_rejects_qualified_state_with_a_disabled_kernel_gap() {
+    let selection = HostAssemblyFixture::new()
+        .assemble(None, None)
+        .expect("qualified Capture Path Generation")
+        .capture_path_selection();
+    let mut encoded = serde_json::to_value(CapturePathDecision::Selected { selection })
+        .expect("encode selected Capture Path decision");
+    encoded["selection"]["candidates"][1]["first_kernel_gap"] = serde_json::json!({
+        "config_symbol": "CONFIG_NETFILTER",
+        "state": "disabled"
+    });
+
+    serde_json::from_value::<CapturePathDecision>(encoded).expect_err(
+        "qualified aggregate state with a disabled kernel prerequisite must fail closed",
+    );
+}
+
+#[test]
+fn exact_unimplemented_capture_paths_fail_without_xtables_fallback() {
+    let fixture = HostAssemblyFixture::new();
+    for (token, path) in [
+        ("nftables_tproxy", CapturePathId::NftablesTproxy),
+        ("managed_tun", CapturePathId::ManagedTun),
+    ] {
+        let source = fixture.base_desired_state.replacen(
+            "path = \"auto\"",
+            &format!("path = \"{token}\""),
+            1,
+        );
+        let desired_state = fixture.compile_desired_state(&source);
+        let error = fixture
+            .assemble(None, Some(desired_state))
+            .expect_err("an unimplemented exact Capture Path must be rejected");
+        let GenerationAssemblyError::CapturePath(error) = error else {
+            panic!("unexpected exact Capture Path error: {error}");
+        };
+
+        assert_eq!(
+            error.kind(),
+            CapturePathSelectionErrorKind::ExactPathUnavailable {
+                path,
+                state: AndroidCapturePathState::Unimplemented,
+            }
+        );
+        assert_eq!(
+            error.candidates()[1].state(),
+            AndroidCapturePathState::Qualified,
+            "qualified xtables must remain diagnostic evidence, not an exact-request fallback"
+        );
+    }
+}
+
+#[test]
+fn exact_xtables_selection_succeeds_and_changes_generation_identity() {
+    let fixture = HostAssemblyFixture::new();
+    let automatic = fixture
+        .assemble(None, None)
+        .expect("automatic Capture Path Generation");
+    let exact_source =
+        fixture
+            .base_desired_state
+            .replacen("path = \"auto\"", "path = \"xtables_tproxy\"", 1);
+    let exact = fixture
+        .assemble(None, Some(fixture.compile_desired_state(&exact_source)))
+        .expect("exact xtables Capture Path Generation");
+
+    assert_eq!(
+        exact.capture_path_selection().request(),
+        CapturePathRequest::Exact(CapturePathId::XtablesTproxy)
+    );
+    assert_eq!(
+        exact.capture_path_selection().reason(),
+        CapturePathSelectionReason::ExactRequestQualified
+    );
+    assert_ne!(
+        automatic.capture_path_selection().evidence_digest(),
+        exact.capture_path_selection().evidence_digest()
+    );
+    assert_ne!(automatic.identity(), exact.identity());
+}
+
+#[test]
+fn admitted_generation_preserves_the_original_capture_path_evidence_deadline() {
+    let fixture = HostAssemblyFixture::new();
+    let observed_at = Instant::now();
+    let valid_until = observed_at
+        .checked_add(Duration::from_secs(42))
+        .expect("test deadline remains representable");
+    let qualified = qualified_xtables_capture_path_evidence();
+    let evidence =
+        CapturePathQualificationEvidence::new(qualified.qualifications(), observed_at, valid_until)
+            .expect("test evidence lifetime is bounded");
+    let planning = HostInspectionPlanningAuthority::new(
+        &fixture.capability_profile,
+        qualified_xtables_kernel_config(),
+        evidence,
+        &fixture.inventory,
+        test_network_namespace(),
+        test_mark(),
+        Some(test_routing()),
+    );
+
+    let admitted = fixture
+        .assemble_with(
+            None,
+            fixture.desired_state.clone(),
+            &fixture.inventory,
+            GenerationPlanningAuthority::host_inspection(planning),
+        )
+        .expect("Generation with bounded Capture Path evidence");
+
+    assert_eq!(admitted.capture_path_evidence_deadline(), valid_until);
+}
+
+fn unqualified_capture_path_rejection(fixture: &HostAssemblyFixture) -> CapturePathRejection {
+    let planning = HostInspectionPlanningAuthority::new(
+        &fixture.capability_profile,
+        qualified_xtables_kernel_config(),
+        CapturePathQualificationEvidence::with_maximum_lifetime(
+            AndroidCapturePathQualifications::default(),
+            Instant::now(),
+        )
+        .expect("unqualified test evidence has a bounded lifetime"),
+        &fixture.inventory,
+        test_network_namespace(),
+        test_mark(),
+        Some(test_routing()),
+    );
+    let error = fixture
+        .assemble_with(
+            None,
+            fixture.desired_state.clone(),
+            &fixture.inventory,
+            GenerationPlanningAuthority::host_inspection(planning),
+        )
+        .expect_err("kernel eligibility alone must not qualify a Capture Path");
+    let GenerationAssemblyError::CapturePath(error) = error else {
+        panic!("unexpected unqualified Capture Path error: {error}");
+    };
+    error.rejection()
+}
+
+#[test]
 fn assembler_successor_identity_binds_the_complete_prior_identity() {
     let fixture = HostAssemblyFixture::new();
     let first = fixture.assemble(None, None).expect("first Generation");
@@ -881,6 +1113,8 @@ fn assembler_requires_local_output_routing_evidence() {
     let fixture = HostAssemblyFixture::new();
     let authority = HostInspectionPlanningAuthority::new(
         &fixture.capability_profile,
+        qualified_xtables_kernel_config(),
+        qualified_xtables_capture_path_evidence(),
         &fixture.inventory,
         test_network_namespace(),
         test_mark(),
@@ -938,6 +1172,8 @@ fn assembler_identity_binds_complete_capability_profile_not_only_revision() {
     );
     let planning = HostInspectionPlanningAuthority::new(
         &changed_profile,
+        qualified_xtables_kernel_config(),
+        qualified_xtables_capture_path_evidence(),
         &fixture.inventory,
         test_network_namespace(),
         test_mark(),
@@ -1002,6 +1238,10 @@ fn prepared_generation_record_round_trips_and_replaces_atomically() {
     assert_eq!(
         successor_record.planning_evidence_digest(),
         successor.planning_digest().as_bytes()
+    );
+    assert_eq!(
+        successor_record.capture_path_selection(),
+        successor.capture_path_selection()
     );
 
     let encoded = fs::read(&record_path).expect("encoded Generation record");
@@ -1252,6 +1492,8 @@ impl HostAssemblyFixture {
         let inventory = empty_inventory(&mut tracker).clone();
         let planning = HostInspectionPlanningAuthority::new(
             &capability_profile,
+            qualified_xtables_kernel_config(),
+            qualified_xtables_capture_path_evidence(),
             &inventory,
             test_network_namespace(),
             test_mark(),

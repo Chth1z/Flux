@@ -8,14 +8,17 @@ use std::path::{Path, PathBuf};
 use std::os::unix::fs::OpenOptionsExt;
 
 use flux_core::{
-    AddressHostFamilySelection, CaptureApplicationMode, CaptureTrafficDomain,
-    CaptureTransportProtocol, FluxConfig,
+    AddressHostFamilySelection, CaptureApplicationMode, CapturePathId, CapturePathRequest,
+    CaptureTrafficDomain, CaptureTransportProtocol, FluxConfig,
 };
 use serde::{Deserialize, Serialize};
 
-use crate::MAX_ENGINE_CONFIG_BYTES;
 use crate::generation_engine_config::{
     TproxyEngineConfigRequest, compile_tproxy_engine_config, read_bounded_regular_file,
+};
+use crate::{
+    CapturePathDecision, CapturePathSelection, MAX_ENGINE_CONFIG_BYTES, RuntimeGenerationBinding,
+    RuntimeSnapshotSource,
 };
 
 pub const DEFAULT_LOG_LINES: u16 = 120;
@@ -164,10 +167,23 @@ pub enum ExplainApplicationMode {
     Denylist,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExplainCapturePathRequestRelation {
+    Unavailable,
+    MatchesDesiredState,
+    DiffersFromDesiredState,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ExplainReport {
     desired_state_schema: u16,
-    backend: String,
+    capture_path_request: String,
+    runtime_revision: u64,
+    active_generation: Option<RuntimeGenerationBinding>,
+    active_capture_path_request_relation: ExplainCapturePathRequestRelation,
+    latest_capture_path_decision: Option<CapturePathDecision>,
+    latest_capture_path_request_relation: ExplainCapturePathRequestRelation,
     listener_port: u16,
     address_families: ExplainAddressFamilies,
     local_output: bool,
@@ -196,8 +212,41 @@ impl ExplainReport {
     }
 
     #[must_use]
-    pub fn backend(&self) -> &str {
-        &self.backend
+    pub fn capture_path_request(&self) -> &str {
+        &self.capture_path_request
+    }
+
+    #[must_use]
+    pub const fn runtime_revision(&self) -> u64 {
+        self.runtime_revision
+    }
+
+    #[must_use]
+    pub const fn active_generation(&self) -> Option<RuntimeGenerationBinding> {
+        self.active_generation
+    }
+
+    #[must_use]
+    pub const fn active_capture_path_selection(&self) -> Option<CapturePathSelection> {
+        match self.active_generation {
+            Some(binding) => Some(binding.capture_path_selection()),
+            None => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn active_capture_path_request_relation(&self) -> ExplainCapturePathRequestRelation {
+        self.active_capture_path_request_relation
+    }
+
+    #[must_use]
+    pub const fn latest_capture_path_decision(&self) -> Option<CapturePathDecision> {
+        self.latest_capture_path_decision
+    }
+
+    #[must_use]
+    pub const fn latest_capture_path_request_relation(&self) -> ExplainCapturePathRequestRelation {
+        self.latest_capture_path_request_relation
     }
 
     #[must_use]
@@ -297,7 +346,20 @@ impl ExplainReport {
 
     pub(crate) fn validate(&self) -> bool {
         self.desired_state_schema != 0
-            && self.backend == "xtables"
+            && is_capture_path_request(&self.capture_path_request)
+            && self.active_capture_path_request_relation
+                == capture_path_request_relation(
+                    &self.capture_path_request,
+                    self.active_generation
+                        .map(RuntimeGenerationBinding::capture_path_selection)
+                        .map(CapturePathSelection::request),
+                )
+            && self.latest_capture_path_request_relation
+                == capture_path_request_relation(
+                    &self.capture_path_request,
+                    self.latest_capture_path_decision
+                        .map(CapturePathDecision::request),
+                )
             && self.listener_port != 0
             && self.engine_config_schema != 0
             && self.engine_config_digest.len() == 64
@@ -323,6 +385,7 @@ pub(crate) struct ProcessInspectionSource {
     runtime_log_path: PathBuf,
     daemon_log_path: PathBuf,
     engine_log_path: PathBuf,
+    runtime: RuntimeSnapshotSource,
 }
 
 impl ProcessInspectionSource {
@@ -332,12 +395,14 @@ impl ProcessInspectionSource {
         runtime_log_path: impl AsRef<Path>,
         daemon_log_path: impl AsRef<Path>,
         engine_log_path: impl AsRef<Path>,
+        runtime: RuntimeSnapshotSource,
     ) -> Self {
         Self {
             desired_state_path: desired_state_path.as_ref().to_path_buf(),
             runtime_log_path: runtime_log_path.as_ref().to_path_buf(),
             daemon_log_path: daemon_log_path.as_ref().to_path_buf(),
             engine_log_path: engine_log_path.as_ref().to_path_buf(),
+            runtime,
         }
     }
 }
@@ -394,9 +459,26 @@ impl InspectionSource for ProcessInspectionSource {
         let scope = config.capture().scope();
         let protocols = config.capture().protocols();
         let interfaces = config.interfaces().policy();
+        let runtime = self.runtime.snapshot();
+        let capture_path_request = config.capture().path_request();
         Ok(ExplainReport {
             desired_state_schema: config.schema(),
-            backend: "xtables".to_owned(),
+            capture_path_request: capture_path_request.as_token().to_owned(),
+            runtime_revision: runtime.revision,
+            active_generation: runtime.active_generation,
+            active_capture_path_request_relation: capture_path_request_relation(
+                capture_path_request.as_token(),
+                runtime
+                    .active_capture_path_selection()
+                    .map(CapturePathSelection::request),
+            ),
+            latest_capture_path_decision: runtime.latest_capture_path_decision,
+            latest_capture_path_request_relation: capture_path_request_relation(
+                capture_path_request.as_token(),
+                runtime
+                    .latest_capture_path_decision
+                    .map(CapturePathDecision::request),
+            ),
             listener_port: config.listener().port().get(),
             address_families: match scope.families() {
                 AddressHostFamilySelection::Ipv4 => ExplainAddressFamilies::Ipv4,
@@ -425,6 +507,26 @@ impl InspectionSource for ProcessInspectionSource {
             engine_config_bytes: engine.usage().output_bytes(),
             non_authorizing: true,
         })
+    }
+}
+
+fn is_capture_path_request(value: &str) -> bool {
+    value == CapturePathRequest::Auto.as_token()
+        || CapturePathId::ALL
+            .into_iter()
+            .any(|path| value == path.as_token())
+}
+
+fn capture_path_request_relation(
+    desired_state_request: &str,
+    runtime_request: Option<CapturePathRequest>,
+) -> ExplainCapturePathRequestRelation {
+    match runtime_request {
+        None => ExplainCapturePathRequestRelation::Unavailable,
+        Some(request) if request.as_token() == desired_state_request => {
+            ExplainCapturePathRequestRelation::MatchesDesiredState
+        }
+        Some(_) => ExplainCapturePathRequestRelation::DiffersFromDesiredState,
     }
 }
 
@@ -696,6 +798,14 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+    use crate::generation_engine_config::{
+        test_unqualified_capture_path_decision, test_xtables_capture_path_decision,
+        test_xtables_capture_path_selection,
+    };
+    use crate::{
+        RuntimeCaptureState, RuntimeEngineState, RuntimePhase, RuntimeSnapshot,
+        RuntimeVerificationState,
+    };
 
     #[test]
     fn log_tail_is_line_and_byte_bounded() {
@@ -746,20 +856,98 @@ mod tests {
         );
         fs::write(&config_path, config).expect("write config");
         let engine_log_path = directory.path().join("sing-box.log");
+        let capture_path_selection = test_xtables_capture_path_selection();
+        let runtime = RuntimeSnapshotSource::default();
+        runtime.publish(RuntimeSnapshot {
+            revision: 0,
+            phase: RuntimePhase::Running,
+            capture: RuntimeCaptureState::Published,
+            engine: RuntimeEngineState::Ready,
+            verification: RuntimeVerificationState::StructuralOnly,
+            active_generation: Some(RuntimeGenerationBinding::new(
+                flux_core::GenerationId::new(1).expect("nonzero Generation"),
+                capture_path_selection,
+            )),
+            latest_capture_path_decision: Some(test_xtables_capture_path_decision()),
+            last_error: None,
+        });
         let source = ProcessInspectionSource::new(
             &config_path,
             directory.path().join("flux.log"),
             directory.path().join("fluxd.log"),
             &engine_log_path,
+            runtime.clone(),
         );
 
         let report = source.explain().expect("compile explanation");
 
-        assert_eq!(report.backend(), "xtables");
+        assert_eq!(report.capture_path_request(), "auto");
+        assert_eq!(
+            report.active_capture_path_selection(),
+            Some(capture_path_selection)
+        );
+        assert_eq!(
+            report.active_capture_path_request_relation(),
+            ExplainCapturePathRequestRelation::MatchesDesiredState
+        );
+        assert_eq!(
+            report.latest_capture_path_request_relation(),
+            ExplainCapturePathRequestRelation::MatchesDesiredState
+        );
         assert!(report.non_authorizing());
         assert!(report.validate());
         assert!(!engine_log_path.exists());
         assert_eq!(fs::read_dir(&directory).expect("list fixture").count(), 2);
+
+        let drifted_config = fs::read_to_string(&config_path)
+            .expect("read Desired State")
+            .replace("path = \"auto\"", "path = \"managed_tun\"");
+        fs::write(&config_path, drifted_config).expect("write drifted Desired State");
+        let drifted = source.explain().expect("compile drifted explanation");
+        assert_eq!(drifted.capture_path_request(), "managed_tun");
+        assert_eq!(
+            drifted.active_capture_path_selection(),
+            Some(capture_path_selection)
+        );
+        assert_eq!(
+            drifted.active_capture_path_request_relation(),
+            ExplainCapturePathRequestRelation::DiffersFromDesiredState
+        );
+        assert_eq!(
+            drifted.latest_capture_path_request_relation(),
+            ExplainCapturePathRequestRelation::DiffersFromDesiredState
+        );
+        assert!(drifted.validate());
+
+        let rejected_decision = test_unqualified_capture_path_decision();
+        runtime.publish(RuntimeSnapshot {
+            revision: 0,
+            phase: RuntimePhase::Failed,
+            capture: RuntimeCaptureState::Detached,
+            engine: RuntimeEngineState::Stopped,
+            verification: RuntimeVerificationState::StructuralOnly,
+            active_generation: None,
+            latest_capture_path_decision: Some(rejected_decision),
+            last_error: None,
+        });
+        let rejected = source.explain().expect("compile rejected explanation");
+        let rejection = rejected
+            .latest_capture_path_decision()
+            .and_then(CapturePathDecision::rejection)
+            .expect("rejected Capture Path evidence");
+        assert_eq!(rejected.active_capture_path_selection(), None);
+        assert_eq!(
+            rejection.reason(),
+            crate::CapturePathRejectionReason::NoQualifiedPath
+        );
+        assert_eq!(
+            rejection.candidates()[1].state(),
+            flux_platform::AndroidCapturePathState::Unqualified
+        );
+        assert_eq!(
+            rejection.candidates()[1].probe_state(),
+            flux_platform::AndroidCapturePathProbeState::Unqualified
+        );
     }
 
     #[cfg(unix)]
@@ -789,6 +977,7 @@ mod tests {
             directory.path().join("flux.log"),
             directory.path().join("fluxd.log"),
             directory.path().join("sing-box.log"),
+            RuntimeSnapshotSource::default(),
         );
 
         let error = source
@@ -808,6 +997,7 @@ mod tests {
             directory.path().join("flux.log"),
             directory.path().join("fluxd.log"),
             &log_path,
+            RuntimeSnapshotSource::default(),
         );
 
         let diagnostics = source.diagnose();

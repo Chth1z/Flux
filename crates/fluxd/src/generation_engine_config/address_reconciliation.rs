@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[cfg(test)]
-use std::sync::RwLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(test)]
+use std::sync::{Mutex, RwLock};
 
 use flux_core::{
     AddressBypassRuleBudget, AddressHostSetPlan, AddressHostSetPlanError, AddressHostSetPolicy,
@@ -12,7 +14,10 @@ use flux_core::{
     FluxConfig, MAX_ADDRESS_BYPASS_RULES, NetworkEpoch, NetworkInventory,
     NetworkInventorySnapshotId, plan_address_host_set,
 };
-use flux_platform::NetworkInventorySource;
+use flux_platform::{
+    NetworkInventoryRefreshDisposition, NetworkInventoryRefreshHandle, NetworkInventorySource,
+    PlatformError,
+};
 
 #[cfg(test)]
 use super::DesiredStateCompileErrorKind;
@@ -23,11 +28,16 @@ use super::{
 
 trait CompleteNetworkInventorySource: Send + 'static {
     fn snapshot(&self) -> Option<Arc<NetworkInventory>>;
+    fn request_refresh(&self) -> Result<NetworkInventoryRefreshDisposition, PlatformError>;
 }
 
-impl CompleteNetworkInventorySource for NetworkInventorySource {
+impl CompleteNetworkInventorySource for (NetworkInventorySource, NetworkInventoryRefreshHandle) {
     fn snapshot(&self) -> Option<Arc<NetworkInventory>> {
-        NetworkInventorySource::snapshot(self)
+        self.0.snapshot()
+    }
+
+    fn request_refresh(&self) -> Result<NetworkInventoryRefreshDisposition, PlatformError> {
+        self.1.request_refresh()
     }
 }
 
@@ -35,12 +45,25 @@ impl CompleteNetworkInventorySource for NetworkInventorySource {
 #[derive(Clone, Default)]
 pub(crate) struct ReplayNetworkInventorySource {
     current: Arc<RwLock<Option<Arc<NetworkInventory>>>>,
+    refresh_requests: Arc<AtomicUsize>,
+    refresh_disposition: Arc<Mutex<Option<NetworkInventoryRefreshDisposition>>>,
 }
 
 #[cfg(test)]
 impl ReplayNetworkInventorySource {
     pub(crate) fn publish(&self, inventory: Option<Arc<NetworkInventory>>) {
         *self.current.write().expect("replay source write lock") = inventory;
+    }
+
+    pub(crate) fn refresh_requests(&self) -> usize {
+        self.refresh_requests.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_refresh_disposition(&self, disposition: NetworkInventoryRefreshDisposition) {
+        *self
+            .refresh_disposition
+            .lock()
+            .expect("replay refresh disposition lock") = Some(disposition);
     }
 }
 
@@ -51,6 +74,15 @@ impl CompleteNetworkInventorySource for ReplayNetworkInventorySource {
             .read()
             .expect("replay source read lock")
             .clone()
+    }
+
+    fn request_refresh(&self) -> Result<NetworkInventoryRefreshDisposition, PlatformError> {
+        self.refresh_requests.fetch_add(1, Ordering::Relaxed);
+        Ok(self
+            .refresh_disposition
+            .lock()
+            .expect("replay refresh disposition lock")
+            .unwrap_or(NetworkInventoryRefreshDisposition::Requested))
     }
 }
 
@@ -225,6 +257,8 @@ pub(crate) struct AddressReconciler {
     desired_state_path: PathBuf,
     current: Option<AddressReconciledGenerationInputs>,
     last_attempted: Option<(NetworkInventorySnapshotId, NetworkEpoch)>,
+    last_reconciled: Option<(NetworkInventorySnapshotId, NetworkEpoch)>,
+    freshness_barrier: Option<(NetworkInventorySnapshotId, NetworkEpoch)>,
     reconciliation_requested: bool,
 }
 
@@ -233,8 +267,9 @@ impl AddressReconciler {
     pub(crate) fn for_network_inventory(
         desired_state_path: impl AsRef<Path>,
         source: NetworkInventorySource,
+        refresh: NetworkInventoryRefreshHandle,
     ) -> Self {
-        Self::new(desired_state_path, Box::new(source))
+        Self::new(desired_state_path, Box::new((source, refresh)))
     }
 
     #[cfg(test)]
@@ -255,12 +290,35 @@ impl AddressReconciler {
             desired_state_path: desired_state_path.as_ref().to_path_buf(),
             current: None,
             last_attempted: None,
+            last_reconciled: None,
+            freshness_barrier: None,
             reconciliation_requested: true,
         }
     }
 
     pub(crate) const fn request_reconciliation(&mut self) {
         self.reconciliation_requested = true;
+    }
+
+    pub(crate) fn request_fresh_snapshot(
+        &mut self,
+    ) -> Result<NetworkInventoryRefreshDisposition, PlatformError> {
+        let barrier = self
+            .source
+            .snapshot()
+            .map(|inventory| (inventory.snapshot_id(), inventory.epoch()))
+            .or_else(|| {
+                self.current
+                    .as_ref()
+                    .map(AddressReconciledGenerationInputs::inspection)
+                    .map(|inspection| (inspection.snapshot_id(), inspection.epoch()))
+            })
+            .or(self.last_reconciled);
+        self.current = None;
+        self.last_attempted = barrier;
+        self.freshness_barrier = barrier;
+        self.reconciliation_requested = false;
+        self.source.request_refresh()
     }
 
     #[must_use]
@@ -285,6 +343,16 @@ impl AddressReconciler {
             Some(inventory) => inventory,
         };
         let identity = (inventory.snapshot_id(), inventory.epoch());
+        if self.freshness_barrier == Some(identity) {
+            self.current = None;
+            self.last_attempted = Some(identity);
+            self.reconciliation_requested = false;
+            return Ok(AddressReconciliationOutcome::Blocked {
+                snapshot_id: identity.0,
+                epoch: identity.1,
+            });
+        }
+        self.freshness_barrier = None;
         if !self.reconciliation_requested && self.last_attempted == Some(identity) {
             return Ok(match self.current.as_ref() {
                 Some(current) => AddressReconciliationOutcome::Unchanged(current.inspection()),
@@ -300,6 +368,7 @@ impl AddressReconciler {
         self.reconciliation_requested = false;
         let current = compile_address_reconciliation(&self.desired_state_path, inventory)?;
         let inspection = current.inspection();
+        self.last_reconciled = Some((inspection.snapshot_id(), inspection.epoch()));
         self.current = Some(current);
         Ok(AddressReconciliationOutcome::Reconciled(inspection))
     }
@@ -506,6 +575,56 @@ mod tests {
         assert!(matches!(
             fixture.reconciler.reconcile(),
             Ok(AddressReconciliationOutcome::Reconciled(_))
+        ));
+    }
+
+    #[test]
+    fn explicit_refresh_blocks_the_previous_inventory_identity() {
+        let mut fixture = ReconcilerFixture::new();
+        let mut tracker = NetworkInventoryTracker::new();
+        let initial = publish_inventory(&mut tracker, ["8.8.4.4"]);
+        fixture.source.publish(Some(Arc::clone(&initial)));
+        fixture
+            .reconciler
+            .reconcile()
+            .expect("reconcile initial inventory");
+
+        assert_eq!(
+            fixture
+                .reconciler
+                .request_fresh_snapshot()
+                .expect("request fresh inventory"),
+            NetworkInventoryRefreshDisposition::Requested
+        );
+        assert_eq!(fixture.source.refresh_requests(), 1);
+        assert!(fixture.reconciler.current().is_none());
+        assert!(matches!(
+            fixture.reconciler.reconcile(),
+            Ok(AddressReconciliationOutcome::Blocked { snapshot_id, epoch })
+                if snapshot_id == initial.snapshot_id() && epoch == initial.epoch()
+        ));
+
+        fixture.source.publish(None);
+        assert_eq!(
+            fixture
+                .reconciler
+                .reconcile()
+                .expect("await refresh transaction"),
+            AddressReconciliationOutcome::AwaitingCompleteSnapshot
+        );
+        fixture.source.publish(Some(Arc::clone(&initial)));
+        assert!(matches!(
+            fixture.reconciler.reconcile(),
+            Ok(AddressReconciliationOutcome::Blocked { snapshot_id, .. })
+                if snapshot_id == initial.snapshot_id()
+        ));
+
+        let refreshed = publish_inventory(&mut tracker, ["8.8.4.4"]);
+        fixture.source.publish(Some(Arc::clone(&refreshed)));
+        assert!(matches!(
+            fixture.reconciler.reconcile(),
+            Ok(AddressReconciliationOutcome::Reconciled(inspection))
+                if inspection.snapshot_id() == refreshed.snapshot_id()
         ));
     }
 

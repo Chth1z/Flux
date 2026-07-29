@@ -14,13 +14,16 @@ Flux 是面向 Magisk、KernelSU 和 APatch 的 Android 透明代理模块，目
 
 - 一个 Rust 守护进程，负责配置、订阅、Generation 生命周期、Sing-Box 监管、原生
   xtables/rtnetlink 修改、精确回读、回滚和恢复；
+- 一个确定性的 `auto`/精确 Capture Path 选择器；完整的选中或拒绝决策会绑定到 Generation
+  身份、运行时状态和 explain 输出；
 - 一个名为 `native` 的开发 package profile，其清单固定为 13 个文件；
 - 仅用于安装、开机启动/有限重启以及委托卸载的必要 shell 胶水；
 - 不再包含运行时 `scripts/` 目录，也不存在 shell 网络写入者或隐式回退；
 - 不打包内核模块，生产代码也不会加载或卸载 `.ko`/KPM 载荷。
 
-剩余发布工作不是再造兼容桥。下一步是有边界的真机资格验证、完整来源与许可证元数据、
-绑定实际 payload 的设备证据、SBOM/构建元数据/校验和，以及从 `development-only` 明确晋级。
+剩余发布工作不是再造兼容桥。下一步包括为选择器实现生产 Android 行为资格证据生产者、验证
+VPN/canary Adapter、执行有边界的真机测试、补齐来源与许可证元数据、绑定实际 payload 的设备
+证据、SBOM/构建元数据/校验和，以及从 `development-only` 明确晋级。
 
 ## 架构
 
@@ -44,12 +47,12 @@ ipset 和可选 eBPF 事实，但这不等于它们都已可在生产环境修�
 
 | 路径 | 当前边界 |
 |---|---|
-| 原生 xtables TPROXY | Rust owner 已实现，也是当前配置后端；执行修改仍需精确的设备准入 |
+| 原生 xtables TPROXY | Rust owner 已实现，也是唯一的生产 Adapter；当前 Android 行为证据刻意保持未验证，因此打包后的启动保持只读 |
 | nftables | 已有 capability/probe 模型；生产 mutation adapter 尚未实现 |
 | Managed TUN | 已建模为候选回退；生产 ownership 与 route adapter 尚未实现 |
 | eBPF | 仅作为可选观察/资格输入；不属于正确性必需路径 |
 
-显式指定的后端不会静默回退。当完整且新鲜的 authority 不存在时，`fluxd` 保持可查询，
+精确指定的路径不会静默回退。当完整且新鲜的 authority 不存在时，`fluxd` 保持可查询，
 但不会修改网络状态。
 
 ## 安全模型
@@ -93,7 +96,7 @@ native owner journal 和恢复记录。这些生成文件都不属于模块压�
 
 ## 配置
 
-[`conf/flux.toml`](conf/flux.toml) 是唯一的 Flux 产品策略来源。Schema 3 拒绝未知、重复或缺失字段。
+[`conf/flux.toml`](conf/flux.toml) 是唯一的 Flux 产品策略来源。Schema 4 拒绝未知、重复或缺失字段。
 [`conf/template.json`](conf/template.json) 保存 Sing-Box 的 DNS、路由、出站与 API 策略，不能授予
 内核 capture 权限。
 
@@ -101,14 +104,15 @@ native owner journal 和恢复记录。这些生成文件都不属于模块压�
 |---|---|
 | `[daemon]` | Fail-open 策略、reconcile debounce、队列容量和 Generation 保留量 |
 | `[engine]` / `[listener]` | Sing-Box 身份、生命周期/重启上限和 TPROXY listener |
-| `[capture]` | 后端请求、流量域、地址族和协议 |
+| `[capture]` | Capture Path 请求、流量域、地址族和协议 |
 | `[applications]` | 应用包与 Android 用户选择策略 |
 | `[interfaces]` / `[bypass]` | 接口角色与规范化 CIDR 绕过项 |
 | `[subscription]` | HTTPS 刷新来源和资源上限 |
 | `[safety]` | Android VPN 与功能 canary 要求 |
 
-开发默认配置请求通过原生 xtables 代理本机输出的 IPv4 TCP/UDP。转发流量、IPv6、Android VPN
-共存和强制功能 canary 只能在目标设备取得相应 reviewed authority 后启用。
+开发默认配置使用 `auto` 请求本机输出的 IPv4 TCP/UDP。当前生产 Adapter 清单只有 xtables
+TPROXY，但尚无生产行为探针可以把它标记为 qualified；启动会保留类型化拒绝并保持只读。转发
+流量、IPv6、Android VPN 共存和强制功能 canary 都需要相应的目标设备 reviewed authority。
 
 ## CLI
 
@@ -124,9 +128,11 @@ native owner journal 和恢复记录。这些生成文件都不属于模块压�
 /data/adb/flux/bin/fluxd cleanup --offline
 ```
 
-在线命令只使用同一有效 UID 可访问的私有 Unix socket。只读诊断和 preview 有固定输入/输出上限，
-不会生成 mutation authority。`cleanup --offline` 会先取得 daemon lease；已有守护进程正在运行或
-启动时，该命令会拒绝执行。
+在线命令通过同一有效 UID 可访问的私有 Unix socket 使用 protocol v8。状态将活动 Generation 与
+其精确 Capture Path 选择绑定，并单独报告最近一次已完成的选择尝试；explain 会标明两者的请求
+是否仍与 Desired State 一致。只读诊断和 preview 有固定输入/输出上限，不会生成 mutation
+authority。`cleanup --offline` 会先取得 daemon lease；已有守护进程正在运行或启动时，该命令会
+拒绝执行。
 
 ## 构建与验证
 

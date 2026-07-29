@@ -1,9 +1,12 @@
 use std::fmt;
 use std::num::NonZeroU32;
 
+use serde::{Deserialize, Serialize};
+
 /// Canonical identity of one immutable Desired State realization.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[repr(transparent)]
+#[serde(transparent)]
 pub struct GenerationId(NonZeroU32);
 
 impl GenerationId {
@@ -53,5 +56,19 @@ mod tests {
             GenerationId::new(u32::MAX).and_then(GenerationId::checked_next),
             None
         );
+    }
+
+    #[test]
+    fn serialized_generation_identity_is_nonzero() {
+        assert_eq!(
+            serde_json::to_string(&GenerationId::INITIAL).expect("serialize Generation"),
+            "1"
+        );
+        assert_eq!(
+            serde_json::from_str::<GenerationId>("7").expect("deserialize Generation"),
+            GenerationId::new(7).expect("nonzero Generation")
+        );
+        serde_json::from_str::<GenerationId>("0")
+            .expect_err("zero must not deserialize as a Generation");
     }
 }

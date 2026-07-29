@@ -39,10 +39,11 @@ impl NetworkEpoch {
     }
 }
 
-/// Opaque process-local identity for one materially distinct inventory snapshot.
+/// Opaque process-local identity for one complete inventory observation transaction.
 ///
 /// Unlike `NetworkEpoch`, this value does not restart at one for each independent tracker. It lets
-/// in-process plans reject an unrelated snapshot that happens to carry the same epoch counter.
+/// in-process plans reject an unrelated or later observation that happens to carry the same
+/// material-topology epoch.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(transparent)]
 pub struct NetworkInventorySnapshotId(NonZeroU64);
@@ -688,16 +689,15 @@ impl NetworkInventoryTracker {
         let addresses = canonicalize_complete_addresses(addresses)?;
         let routes = routes.into_iter().collect::<Vec<_>>().into_boxed_slice();
         let rules = rules.into_iter().collect::<Vec<_>>().into_boxed_slice();
-        if self.current.as_ref().is_some_and(|current| {
-            current.links == links
-                && current.addresses == addresses
-                && current.routes == routes
-                && current.rules == rules
-        }) {
-            return Ok(self.current.as_ref().expect("current inventory is present"));
-        }
-
         let epoch = match self.current.as_ref() {
+            Some(current)
+                if current.links == links
+                    && current.addresses == addresses
+                    && current.routes == routes
+                    && current.rules == rules =>
+            {
+                current.epoch
+            }
             Some(current) => current
                 .epoch
                 .checked_next()

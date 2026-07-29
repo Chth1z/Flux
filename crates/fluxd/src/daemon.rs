@@ -18,7 +18,7 @@ use flux_core::{
 use flux_platform::{
     CapabilityProfilePaths, DaemonReactor, FileObservationBatch, FileObservationPaths,
     NativeCaptureTargetIdentity, NativeXtablesAndroidRuntime, NativeXtablesAndroidRuntimeConfig,
-    ShutdownSignal,
+    NetworkInventoryRefreshHandle, ShutdownSignal,
 };
 
 use crate::generation_engine_config::AddressReconciler;
@@ -41,8 +41,8 @@ use crate::subscription::{
     SubscriptionRefreshClient, SubscriptionRefreshRuntime, SubscriptionRuntimePaths,
 };
 use crate::{
-    AdministrativeIntentStore, ControlConnectionHandler, ControlSocketError, IntentStoreError,
-    RuntimeSnapshotSource,
+    AdministrativeIntentStore, CapturePathDecision, ControlConnectionHandler, ControlSocketError,
+    IntentStoreError, RuntimeSnapshotSource,
 };
 
 const DEFAULT_ROOT: &str = "/data/adb/flux";
@@ -184,6 +184,11 @@ where
             } else {
                 None
             };
+        let (network_inventory, network_inventory_refresh) =
+            network_inventory.map_or((None, None), |attachment| {
+                let (source, refresh) = attachment.into_parts();
+                (Some(source), Some(refresh))
+            });
         let (native_admission, composition) = match pending_admission {
             PendingNativeAdmission::Rejected(reason) => (
                 NativeAdmissionState::Rejected(reason),
@@ -192,10 +197,19 @@ where
             PendingNativeAdmission::Configured(configured) => {
                 match configured.admit(network_inventory) {
                     Ok(admitted) => {
+                        let network_inventory_refresh =
+                            network_inventory_refresh.ok_or(DaemonError::Invariant(
+                                "admitted native runtime omitted its inventory refresh authority",
+                            ))?;
                         recover_native_startup(&admitted, &options, &runtime_layout)?;
                         (
                             NativeAdmissionState::Admitted,
-                            compose_native_daemon(admitted, &options, &runtime_layout)?,
+                            compose_native_daemon(
+                                admitted,
+                                network_inventory_refresh,
+                                &options,
+                                &runtime_layout,
+                            )?,
                         )
                     }
                     Err(reason) => (
@@ -206,17 +220,19 @@ where
             }
         };
 
+        let runtime = composition.runtime.clone();
         let inspection = Arc::new(ProcessInspectionSource::new(
             &options.config_path,
             runtime_layout.runtime_log_path(),
             runtime_layout.daemon_log_path(),
             runtime_layout.run_path().join("sing-box.log"),
+            runtime.clone(),
         ));
         let handler = ControlConnectionHandler::with_runtime_subscription_and_inspection(
             Arc::clone(&profile),
             native_admission,
             composition.control,
-            composition.runtime,
+            runtime,
             composition.subscription_client,
             inspection,
         );
@@ -314,6 +330,7 @@ fn recover_native_startup(
 
 fn compose_native_daemon(
     admitted: AdmittedNativeRuntime,
+    network_inventory_refresh: NetworkInventoryRefreshHandle,
     options: &DaemonOptions,
     runtime_layout: &RuntimeLayout,
 ) -> Result<DaemonComposition, DaemonError> {
@@ -395,8 +412,11 @@ fn compose_native_daemon(
     );
     let maintenance_interval =
         engine_maintenance_interval(config.daemon().reconcile_debounce().get());
-    let address_reconciler =
-        AddressReconciler::for_network_inventory(&options.config_path, inventory);
+    let address_reconciler = AddressReconciler::for_network_inventory(
+        &options.config_path,
+        inventory,
+        network_inventory_refresh,
+    );
     let dispatcher = compose_native_runtime(
         convergence,
         move || source,
@@ -414,14 +434,24 @@ fn compose_native_daemon(
         .submit(initial_intent)
         .and_then(flux_core::OperationHandle::wait);
     if let Err(admission_error) = admission {
-        if let Some(digest) = bootstrap_digest
-            && let Err(rollback_error) = subscription_client.reject_bootstrap(digest)
-        {
-            return Err(DaemonError::Configuration(format!(
-                "initial runtime admission failed ({admission_error}); cannot restore the unadmitted subscription snapshot ({rollback_error})"
-            )));
+        if initial_admission_can_remain_read_only(&runtime) {
+            daemon_log(
+                LogSeverity::Warn,
+                "capture_path",
+                format_args!(
+                    "initial runtime remains read-only because no Capture Path qualified: {admission_error}"
+                ),
+            );
+        } else {
+            if let Some(digest) = bootstrap_digest
+                && let Err(rollback_error) = subscription_client.reject_bootstrap(digest)
+            {
+                return Err(DaemonError::Configuration(format!(
+                    "initial runtime admission failed ({admission_error}); cannot restore the unadmitted subscription snapshot ({rollback_error})"
+                )));
+            }
+            return Err(DaemonError::Control(admission_error));
         }
-        return Err(DaemonError::Control(admission_error));
     }
     if let Some(digest) = bootstrap_digest {
         subscription_client
@@ -449,6 +479,13 @@ fn compose_native_daemon(
         subscription_client: Some(subscription_client),
         file_observation: Some((observation_paths, observation_controller)),
     })
+}
+
+fn initial_admission_can_remain_read_only(runtime: &RuntimeSnapshotSource) -> bool {
+    matches!(
+        runtime.snapshot().latest_capture_path_decision,
+        Some(CapturePathDecision::Rejected { .. })
+    )
 }
 
 enum DaemonControl {
@@ -880,6 +917,10 @@ fn engine_maintenance_interval(configured: Duration) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::RuntimeSnapshot;
+    use crate::generation_engine_config::{
+        test_unqualified_capture_path_decision, test_xtables_capture_path_decision,
+    };
 
     #[test]
     fn engine_maintenance_interval_is_bounded_independently_of_config_debounce() {
@@ -891,5 +932,24 @@ mod tests {
             engine_maintenance_interval(Duration::from_secs(u64::from(u32::MAX))),
             MAX_ENGINE_MAINTENANCE_INTERVAL
         );
+    }
+
+    #[test]
+    fn only_a_typed_no_safe_capture_path_decision_allows_read_only_startup() {
+        let runtime = RuntimeSnapshotSource::default();
+        runtime.publish(RuntimeSnapshot {
+            latest_capture_path_decision: Some(test_unqualified_capture_path_decision()),
+            ..RuntimeSnapshot::unknown()
+        });
+        assert!(initial_admission_can_remain_read_only(&runtime));
+
+        runtime.publish(RuntimeSnapshot {
+            latest_capture_path_decision: Some(test_xtables_capture_path_decision()),
+            ..RuntimeSnapshot::unknown()
+        });
+        assert!(!initial_admission_can_remain_read_only(&runtime));
+
+        runtime.publish(RuntimeSnapshot::unknown());
+        assert!(!initial_admission_can_remain_read_only(&runtime));
     }
 }

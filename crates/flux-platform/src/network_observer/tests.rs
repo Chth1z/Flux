@@ -872,6 +872,43 @@ fn continuous_churn_publishes_at_maximum_debounce() {
 }
 
 #[test]
+fn explicit_refresh_suppresses_a_pre_refresh_debounced_transaction() {
+    let mut observer = observer();
+    let source = observer.source();
+    let now = Instant::now();
+    complete_single_address_dump(&mut observer, 86, now, 7, [192, 0, 2, 9], 24, 0);
+
+    assert_eq!(
+        observer.consume(
+            decode(address_datagram(
+                0,
+                RTM_NEWADDR,
+                7,
+                [198, 51, 100, 4],
+                24,
+                0,
+            )),
+            now + Duration::from_millis(10),
+        ),
+        ObserverDriveOutcome::Idle
+    );
+    let pending_deadline = observer
+        .next_deadline()
+        .expect("live event starts one debounced transaction");
+
+    source
+        .begin_explicit_refresh()
+        .expect("advance explicit refresh revision");
+    assert!(source.snapshot().is_none());
+    assert_eq!(
+        observer.poll(pending_deadline),
+        ObserverDriveOutcome::Superseded
+    );
+    assert!(source.snapshot().is_none());
+    assert_eq!(observer.next_deadline(), None);
+}
+
+#[test]
 fn empty_datagram_requests_resync_without_panicking() {
     let mut response_observer = observer();
     let source = response_observer.source();

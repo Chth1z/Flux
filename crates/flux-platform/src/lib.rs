@@ -87,7 +87,9 @@ pub use process::{
     ProcessHandleErrorKind, ProcessIdentity, ProcessNamespaceIdentity, ProcessObservation,
 };
 pub use reactor::{
-    DaemonReactor, NetworkInventoryDegradation, ReactorError, ReactorStopHandle, StopDisposition,
+    DaemonReactor, NetworkInventoryAttachment, NetworkInventoryDegradation,
+    NetworkInventoryRefreshDisposition, NetworkInventoryRefreshHandle, ReactorError,
+    ReactorStopHandle, StopDisposition,
 };
 pub use seqpacket::{PeerCredentials, SeqpacketConnection, SeqpacketListener, Uid};
 pub use shutdown::ShutdownSignal;

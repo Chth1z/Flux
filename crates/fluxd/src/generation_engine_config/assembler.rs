@@ -3,6 +3,7 @@ use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::net::IpAddr;
 use std::path::Path;
+use std::time::Instant;
 
 use flux_core::{
     AddressHostFamilySelection, AndroidMarkPlanningAuthority, AndroidUserSelection,
@@ -13,13 +14,17 @@ use flux_core::{
     StaleRpdbPlacementLease,
 };
 use flux_platform::{
-    AndroidFwmarkCensusPlanningEvidence, SingBoxLauncher, SingBoxReadiness,
-    XtablesCaptureArtifactSet, XtablesCaptureLoweringError, XtablesCaptureLoweringRequest,
-    XtablesCaptureNamespace, XtablesLocalOutputRoutingSpec, XtablesTproxyTarget,
-    lower_xtables_capture, plan_native_xtables_local_output_routing,
+    AndroidFwmarkCensusPlanningEvidence, AndroidKernelConfigSnapshot, SingBoxLauncher,
+    SingBoxReadiness, XtablesCaptureArtifactSet, XtablesCaptureLoweringError,
+    XtablesCaptureLoweringRequest, XtablesCaptureNamespace, XtablesLocalOutputRoutingSpec,
+    XtablesTproxyTarget, lower_xtables_capture, plan_native_xtables_local_output_routing,
 };
 use sha2::{Digest, Sha256};
 
+use super::capture_path_selection::{
+    CapturePathQualificationEvidence, CapturePathSelection, CapturePathSelectionError,
+    CapturePathSelectionInput, PRODUCTION_CAPTURE_PATH_SELECTOR,
+};
 use super::{
     DesiredStateArtifacts, EngineCapabilityProfile, EngineConfigBindingError,
     SelectedEngineSourceIdentity, TproxyGenerationCandidate, TproxyGenerationCandidateError,
@@ -27,14 +32,14 @@ use super::{
 };
 use crate::{EngineSpec, RestartPolicy, RestartPolicyError};
 
-pub(crate) const ADMITTED_GENERATION_SCHEMA_VERSION: u16 = 2;
+pub(crate) const ADMITTED_GENERATION_SCHEMA_VERSION: u16 = 3;
 const GENERATION_ASSEMBLY_DIGEST_BYTES: usize = 32;
 const GENERATION_ASSEMBLY_DIGEST_DOMAIN: &[u8] =
     b"Flux coordinator-facing admitted Generation\0sha256-v1\0";
 const GENERATION_PLANNING_DIGEST_DOMAIN: &[u8] =
     b"Flux complete Generation planning authority\0canonical-schema-v2\0sha256-v1\0";
 const PRODUCT_DESIRED_STATE_DIGEST_DOMAIN: &[u8] =
-    b"Flux product Desired State\0schema-v3\0sha256-v1\0";
+    b"Flux product Desired State\0schema-v4\0sha256-v1\0";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(transparent)]
@@ -112,6 +117,8 @@ pub(crate) enum GenerationAdmissionKind {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct HostInspectionPlanningAuthority {
     capability_profile: CapabilityProfile,
+    kernel_config: AndroidKernelConfigSnapshot,
+    capture_path_evidence: CapturePathQualificationEvidence,
     inventory_snapshot: NetworkInventorySnapshotId,
     inventory_epoch: NetworkEpoch,
     network_namespace: NetworkNamespaceIdentity,
@@ -124,6 +131,8 @@ impl HostInspectionPlanningAuthority {
     #[must_use]
     pub(crate) fn new(
         capability_profile: &CapabilityProfile,
+        kernel_config: AndroidKernelConfigSnapshot,
+        capture_path_evidence: CapturePathQualificationEvidence,
         inventory: &NetworkInventory,
         network_namespace: NetworkNamespaceIdentity,
         mark: FwmarkCandidate,
@@ -131,6 +140,8 @@ impl HostInspectionPlanningAuthority {
     ) -> Self {
         Self {
             capability_profile: capability_profile.clone(),
+            kernel_config,
+            capture_path_evidence,
             inventory_snapshot: inventory.snapshot_id(),
             inventory_epoch: inventory.epoch(),
             network_namespace,
@@ -146,6 +157,7 @@ pub(crate) enum GenerationPlanningAuthority {
     HostInspection(Box<HostInspectionPlanningAuthority>),
     Android {
         census: Box<AndroidFwmarkCensusPlanningEvidence>,
+        capture_path_evidence: CapturePathQualificationEvidence,
         placement: Option<RpdbPlacementLease>,
     },
 }
@@ -160,10 +172,12 @@ impl GenerationPlanningAuthority {
     #[must_use]
     pub(crate) fn android(
         census: AndroidFwmarkCensusPlanningEvidence,
+        capture_path_evidence: CapturePathQualificationEvidence,
         placement: Option<RpdbPlacementLease>,
     ) -> Self {
         Self::Android {
             census: Box::new(census),
+            capture_path_evidence,
             placement,
         }
     }
@@ -186,6 +200,27 @@ impl GenerationPlanningAuthority {
     }
 
     #[must_use]
+    pub(crate) fn kernel_config(&self) -> &AndroidKernelConfigSnapshot {
+        match self {
+            #[cfg(test)]
+            Self::HostInspection(authority) => &authority.kernel_config,
+            Self::Android { census, .. } => census.kernel_config(),
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn capture_path_evidence(&self) -> CapturePathQualificationEvidence {
+        match self {
+            #[cfg(test)]
+            Self::HostInspection(authority) => authority.capture_path_evidence,
+            Self::Android {
+                capture_path_evidence,
+                ..
+            } => *capture_path_evidence,
+        }
+    }
+
+    #[must_use]
     pub(crate) const fn android_runtime_binding(
         &self,
     ) -> Option<(&AndroidMarkPlanningAuthority, RpdbPlacementLease)> {
@@ -193,6 +228,7 @@ impl GenerationPlanningAuthority {
             Self::Android {
                 census,
                 placement: Some(placement),
+                ..
             } => Some((census.mark_authority(), *placement)),
             #[cfg(test)]
             Self::HostInspection(_) => None,
@@ -259,6 +295,8 @@ pub(crate) struct AdmittedGeneration {
     engine_source: SelectedEngineSourceIdentity,
     xtables: XtablesCaptureArtifactSet,
     planning_digest: GenerationPlanningDigest,
+    capture_path_selection: CapturePathSelection,
+    capture_path_evidence_deadline: Instant,
     planning: GenerationPlanningAuthority,
 }
 
@@ -333,6 +371,16 @@ impl AdmittedGeneration {
         self.planning_digest
     }
 
+    #[must_use]
+    pub(crate) const fn capture_path_selection(&self) -> CapturePathSelection {
+        self.capture_path_selection
+    }
+
+    #[must_use]
+    pub(crate) const fn capture_path_evidence_deadline(&self) -> Instant {
+        self.capture_path_evidence_deadline
+    }
+
     pub(crate) fn into_native_target_request(
         self,
     ) -> Result<NativeGenerationTargetRequest, NativeGenerationPromotionError> {
@@ -341,7 +389,9 @@ impl AdmittedGeneration {
             GenerationPlanningAuthority::HostInspection(_) => {
                 Err(NativeGenerationPromotionError::HostInspectionNonPromotable)
             }
-            GenerationPlanningAuthority::Android { census, placement } => {
+            GenerationPlanningAuthority::Android {
+                census, placement, ..
+            } => {
                 let placement =
                     placement.ok_or(NativeGenerationPromotionError::MissingAndroidPlacement)?;
                 let (mark, _) = census.into_parts();
@@ -513,6 +563,8 @@ pub(crate) enum GenerationAssemblyError {
     EngineConfig(EngineConfigBindingError),
     Candidate(TproxyGenerationCandidateError),
     Planning(GenerationPlanningError),
+    CapturePath(CapturePathSelectionError),
+    CapturePathAdapterMismatch { selected: CapturePathId },
     GenerationSequenceExhausted,
     Xtables(XtablesCaptureLoweringError),
 }
@@ -524,6 +576,12 @@ impl fmt::Display for GenerationAssemblyError {
             Self::EngineConfig(source) => source.fmt(formatter),
             Self::Candidate(source) => source.fmt(formatter),
             Self::Planning(source) => source.fmt(formatter),
+            Self::CapturePath(source) => source.fmt(formatter),
+            Self::CapturePathAdapterMismatch { selected } => write!(
+                formatter,
+                "Capture Path selector chose {} without a matching Generation assembler",
+                selected.as_token(),
+            ),
             Self::GenerationSequenceExhausted => {
                 formatter.write_str("Generation sequence is exhausted")
             }
@@ -539,8 +597,9 @@ impl Error for GenerationAssemblyError {
             Self::EngineConfig(source) => Some(source),
             Self::Candidate(source) => Some(source),
             Self::Planning(source) => Some(source),
+            Self::CapturePath(source) => Some(source),
             Self::Xtables(source) => Some(source),
-            Self::GenerationSequenceExhausted => None,
+            Self::GenerationSequenceExhausted | Self::CapturePathAdapterMismatch { .. } => None,
         }
     }
 }
@@ -577,6 +636,21 @@ impl GenerationAssembler {
         .map_err(GenerationAssemblyError::Candidate)?;
         let planning_context = validate_planning(&planning, &candidate, inventory, &desired_state)
             .map_err(GenerationAssemblyError::Planning)?;
+        let capture_path_evidence = planning.capture_path_evidence();
+        let capture_path_selection = PRODUCTION_CAPTURE_PATH_SELECTOR
+            .select(CapturePathSelectionInput::new(
+                *desired_state.capture(),
+                &candidate,
+                planning.kernel_config(),
+                capture_path_evidence,
+                planning_context.digest.as_bytes(),
+            ))
+            .map_err(GenerationAssemblyError::CapturePath)?;
+        if capture_path_selection.selected() != CapturePathId::XtablesTproxy {
+            return Err(GenerationAssemblyError::CapturePathAdapterMismatch {
+                selected: capture_path_selection.selected(),
+            });
+        }
         let generation = next_generation(prior_owned)?;
         let mut lowering = XtablesCaptureLoweringRequest::new(
             capture.program(),
@@ -596,6 +670,7 @@ impl GenerationAssembler {
             engine_source_identity,
             xtables: &xtables,
             planning_context,
+            capture_path_selection,
         });
 
         Ok(AdmittedGeneration {
@@ -608,6 +683,8 @@ impl GenerationAssembler {
             engine_source: engine_source_identity,
             xtables,
             planning_digest: planning_context.digest,
+            capture_path_selection,
+            capture_path_evidence_deadline: capture_path_evidence.valid_until(),
             planning,
         })
     }
@@ -655,7 +732,9 @@ fn validate_planning(
                 digest,
             })
         }
-        GenerationPlanningAuthority::Android { census, placement } => {
+        GenerationPlanningAuthority::Android {
+            census, placement, ..
+        } => {
             let mark = census.mark_authority();
             ensure_common_planning_binding(
                 mark.capability_profile(),
@@ -703,6 +782,7 @@ fn digest_generation_planning_authority(
                 &mut digest,
                 authority.capability_profile.digest().as_bytes(),
             );
+            update_field(&mut digest, authority.kernel_config.digest().as_bytes());
             update_field(
                 &mut digest,
                 &authority.inventory_snapshot.get().to_be_bytes(),
@@ -719,7 +799,9 @@ fn digest_generation_planning_authority(
             update_mark(&mut digest, authority.mark);
             update_routing(&mut digest, authority.routing);
         }
-        GenerationPlanningAuthority::Android { census, placement } => {
+        GenerationPlanningAuthority::Android {
+            census, placement, ..
+        } => {
             digest.update([1]);
             update_field(
                 &mut digest,
@@ -929,6 +1011,7 @@ struct GenerationDigestInput<'a> {
     engine_source_identity: SelectedEngineSourceIdentity,
     xtables: &'a XtablesCaptureArtifactSet,
     planning_context: PlanningContext,
+    capture_path_selection: CapturePathSelection,
 }
 
 fn digest_generation(input: GenerationDigestInput<'_>) -> GenerationAssemblyDigest {
@@ -941,6 +1024,7 @@ fn digest_generation(input: GenerationDigestInput<'_>) -> GenerationAssemblyDige
         engine_source_identity,
         xtables,
         planning_context,
+        capture_path_selection,
     } = input;
     let mut digest = Sha256::new();
     digest.update(GENERATION_ASSEMBLY_DIGEST_DOMAIN);
@@ -993,6 +1077,10 @@ fn digest_generation(input: GenerationDigestInput<'_>) -> GenerationAssemblyDige
     update_field(&mut digest, xtables.digest().as_bytes());
     update_engine_spec(&mut digest, engine_spec);
     update_field(&mut digest, planning_context.digest.as_bytes());
+    update_field(
+        &mut digest,
+        capture_path_selection.evidence_digest().as_bytes(),
+    );
     digest.update([match planning_context.kind {
         #[cfg(test)]
         GenerationAdmissionKind::HostInspectionOnly => 0,

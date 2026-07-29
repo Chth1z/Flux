@@ -9,6 +9,7 @@ use flux_core::{
     AddressResyncDisposition, ControlError, DispatcherCompletion, GenerationId, Reason,
     RuntimeDispatcher, RuntimeIntent,
 };
+use flux_platform::NetworkInventoryRefreshDisposition;
 
 use crate::engine_supervisor::{
     EngineChildAuthority, EngineChildAuthorityError, EngineChildAuthorityErrorKind,
@@ -20,7 +21,9 @@ use crate::functional_canary::{
     FunctionalCanaryError, FunctionalCanaryGateMode, UnqualifiedFunctionalCanaryExecution,
     UnqualifiedFunctionalCanaryExecutor,
 };
-use crate::generation_engine_config::{AddressReconciler, AddressReconciliationOutcome};
+use crate::generation_engine_config::{
+    AddressReconciler, AddressReconciliationOutcome, CapturePathDecision, CapturePathSelection,
+};
 #[cfg(test)]
 use crate::generation_engine_config::{AdmittedGeneration, PreparedGenerationRecord};
 use crate::runtime_logging::{LogSeverity, runtime_log};
@@ -32,7 +35,8 @@ use crate::subscription::{SubscriptionRefreshRuntime, ValidatedSubscriptionEngin
 use crate::{
     CaptureObservation, DesiredEngine, EnginePhase, EngineReport, EngineSnapshot, EngineSpec,
     EngineSupervisor, EngineSupervisorError, RuntimeCaptureState, RuntimeEngineState,
-    RuntimeFailure, RuntimePhase, RuntimeSnapshot, RuntimeSnapshotSource, RuntimeVerificationState,
+    RuntimeFailure, RuntimeGenerationBinding, RuntimePhase, RuntimeSnapshot, RuntimeSnapshotSource,
+    RuntimeVerificationState,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -46,17 +50,123 @@ pub(crate) enum PublishedRuntimeState {
 pub(crate) struct PreparedGeneration {
     id: GenerationId,
     spec: EngineSpec,
+    capture_path_selection: CapturePathSelection,
+    capture_path_evidence_deadline: Instant,
 }
 
 impl PreparedGeneration {
     #[must_use]
-    pub(crate) const fn new(id: GenerationId, spec: EngineSpec) -> Self {
-        Self { id, spec }
+    pub(crate) fn new(
+        id: GenerationId,
+        spec: EngineSpec,
+        capture_path_selection: CapturePathSelection,
+        capture_path_evidence_deadline: Instant,
+    ) -> Self {
+        Self {
+            id,
+            spec,
+            capture_path_selection,
+            capture_path_evidence_deadline,
+        }
     }
 
     #[must_use]
     pub(crate) const fn id(&self) -> GenerationId {
         self.id
+    }
+
+    const fn runtime_binding(&self) -> RuntimeGenerationBinding {
+        RuntimeGenerationBinding::new(self.id, self.capture_path_selection)
+    }
+
+    fn capture_path_evidence_expired(&self, now: Instant) -> bool {
+        now >= self.capture_path_evidence_deadline
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn capture_path_evidence_deadline(&self) -> Instant {
+        self.capture_path_evidence_deadline
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CapturePathRefreshRequestState {
+    Pending,
+    Accepted,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CapturePathRecoveryIntent {
+    AutomaticRestart,
+    RemainStopped,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CapturePathRefreshState {
+    Current,
+    Required {
+        request: CapturePathRefreshRequestState,
+        recovery: CapturePathRecoveryIntent,
+    },
+}
+
+impl CapturePathRefreshState {
+    const fn required(recovery: CapturePathRecoveryIntent) -> Self {
+        Self::Required {
+            request: CapturePathRefreshRequestState::Pending,
+            recovery,
+        }
+    }
+
+    const fn require_automatic_recovery() -> Self {
+        Self::required(CapturePathRecoveryIntent::AutomaticRestart)
+    }
+
+    const fn requires_fresh_evidence(self) -> bool {
+        matches!(self, Self::Required { .. })
+    }
+
+    const fn request_pending(self) -> bool {
+        matches!(
+            self,
+            Self::Required {
+                request: CapturePathRefreshRequestState::Pending,
+                ..
+            }
+        )
+    }
+
+    const fn awaiting_fresh_evidence(self) -> bool {
+        matches!(
+            self,
+            Self::Required {
+                request: CapturePathRefreshRequestState::Accepted,
+                ..
+            }
+        )
+    }
+
+    fn accept_request(&mut self) {
+        if let Self::Required { request, .. } = self {
+            *request = CapturePathRefreshRequestState::Accepted;
+        }
+    }
+
+    fn cancel_automatic_recovery(&mut self) {
+        if let Self::Required { recovery, .. } = self {
+            *recovery = CapturePathRecoveryIntent::RemainStopped;
+        }
+    }
+
+    fn accept_fresh_evidence(&mut self) -> bool {
+        let previous = std::mem::replace(self, Self::Current);
+        matches!(
+            previous,
+            Self::Required {
+                recovery: CapturePathRecoveryIntent::AutomaticRestart,
+                ..
+            }
+        )
     }
 }
 
@@ -87,6 +197,11 @@ pub(crate) trait RuntimeWriter: Send + 'static {
     fn accept_deferred_subscription(&mut self, _config: ValidatedSubscriptionEngineConfig) -> bool {
         false
     }
+    fn latest_capture_path_decision(&self) -> Option<CapturePathDecision> {
+        None
+    }
+    fn invalidate_latest_capture_path_decision(&mut self) {}
+    fn reject_prepared(&mut self, generation: &PreparedGeneration) -> Result<(), Self::Error>;
     fn capture_start(&mut self, generation: &PreparedGeneration) -> Result<(), Self::Error>;
     fn capture_stop(&mut self) -> Result<(), Self::Error>;
     fn verify_capture(&mut self, generation: &PreparedGeneration) -> Result<(), Self::Error>;
@@ -101,6 +216,18 @@ pub(crate) trait RuntimeWriter: Send + 'static {
 pub(crate) enum AddressResyncStrategy {
     WriterManaged,
     CoordinatorSynchronous,
+}
+
+trait CapturePathEvidenceClock: Send + Sync {
+    fn now(&self) -> Instant;
+}
+
+struct SystemCapturePathEvidenceClock;
+
+impl CapturePathEvidenceClock for SystemCapturePathEvidenceClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
 }
 
 pub(crate) trait EngineRuntime: Send + 'static {
@@ -234,14 +361,113 @@ enum RuntimeOwnership {
     },
     DetachPending {
         generation: Box<PreparedGeneration>,
-        terminal: PublishedRuntimeState,
+        settlement: RetirementSettlement,
         rollback: Option<Box<PreparedGeneration>>,
     },
     Retiring {
         generation: Box<PreparedGeneration>,
-        terminal: PublishedRuntimeState,
+        settlement: RetirementSettlement,
         rollback: Option<Box<PreparedGeneration>>,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RejectedPreparedContinuation {
+    AwaitRollback,
+    PublishFailed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RetirementSettlement {
+    Publish(PublishedRuntimeState),
+    RejectPrepared(RejectedPreparedContinuation),
+}
+
+impl RuntimeOwnership {
+    fn active_capture_path_authority(&self) -> Option<&PreparedGeneration> {
+        match self {
+            Self::Engine { generation, .. }
+            | Self::CaptureRepairPending { generation }
+            | Self::DetachPending { generation, .. } => Some(generation),
+            Self::Stopped | Self::Retiring { .. } => None,
+        }
+    }
+
+    fn capture_path_expiry_recovery(&self) -> Option<CapturePathRecoveryIntent> {
+        match self {
+            Self::Engine { .. } | Self::CaptureRepairPending { .. } => {
+                Some(CapturePathRecoveryIntent::AutomaticRestart)
+            }
+            Self::DetachPending { settlement, .. } => Some(match settlement {
+                RetirementSettlement::Publish(PublishedRuntimeState::Stopped) => {
+                    CapturePathRecoveryIntent::RemainStopped
+                }
+                RetirementSettlement::Publish(
+                    PublishedRuntimeState::Running { .. } | PublishedRuntimeState::Failed,
+                )
+                | RetirementSettlement::RejectPrepared(_) => {
+                    CapturePathRecoveryIntent::AutomaticRestart
+                }
+            }),
+            Self::Stopped | Self::Retiring { .. } => None,
+        }
+    }
+}
+
+enum CaptureAuthorityFailure {
+    EvidenceExpired,
+    EvidenceExpiredAfterRunningCommit,
+    Writer(ControlError),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActivationRole {
+    Candidate { predecessor_available: bool },
+    Rollback,
+}
+
+struct ActivationFailure {
+    error: ControlError,
+    rollback_eligible: bool,
+}
+
+impl ActivationFailure {
+    const fn before_running_commit(role: ActivationRole, error: ControlError) -> Self {
+        Self {
+            error,
+            rollback_eligible: matches!(
+                role,
+                ActivationRole::Candidate {
+                    predecessor_available: true
+                }
+            ),
+        }
+    }
+
+    const fn committed(error: ControlError) -> Self {
+        Self {
+            error,
+            rollback_eligible: false,
+        }
+    }
+
+    fn into_error(self) -> ControlError {
+        self.error
+    }
+}
+
+impl ActivationRole {
+    const fn failed_activation_settlement(self) -> RetirementSettlement {
+        match self {
+            Self::Candidate {
+                predecessor_available: true,
+            } => RetirementSettlement::RejectPrepared(RejectedPreparedContinuation::AwaitRollback),
+            Self::Candidate {
+                predecessor_available: false,
+            } => RetirementSettlement::RejectPrepared(RejectedPreparedContinuation::PublishFailed),
+            Self::Rollback => RetirementSettlement::Publish(PublishedRuntimeState::Failed),
+        }
+    }
 }
 
 enum RetirementProgress {
@@ -250,7 +476,8 @@ enum RetirementProgress {
 }
 
 struct QualifiedRunningGeneration {
-    generation: GenerationId,
+    generation: RuntimeGenerationBinding,
+    capture_path_evidence_deadline: Instant,
     disposition: FunctionalCanaryDisposition,
 }
 
@@ -270,6 +497,10 @@ enum SubscriptionActivationSettlement {
 }
 
 impl QualifiedRunningGeneration {
+    fn capture_path_evidence_expired(&self, now: Instant) -> bool {
+        now >= self.capture_path_evidence_deadline
+    }
+
     const fn verification(&self) -> RuntimeVerificationState {
         match &self.disposition {
             FunctionalCanaryDisposition::StructuralVerificationOnly => {
@@ -290,8 +521,11 @@ pub(crate) struct RuntimeCoordinator<W, E = EngineSupervisor> {
     maintenance_interval: Duration,
     address_reconciler: Option<AddressReconciler>,
     address_reconciliation_pending: bool,
+    capture_path_refresh: CapturePathRefreshState,
+    capture_path_evidence_clock: Box<dyn CapturePathEvidenceClock>,
     runtime: RuntimeSnapshotSource,
     pending_publication: Option<PublishedRuntimeState>,
+    pending_prepared_rejection: Option<Box<PreparedGeneration>>,
     subscription_refresh: Option<SubscriptionRefreshRuntime>,
     pending_subscription_activation: Option<PendingSubscriptionActivation>,
 }
@@ -313,7 +547,8 @@ where
             capture: RuntimeCaptureState::Detached,
             engine: RuntimeEngineState::Stopped,
             verification: RuntimeVerificationState::StructuralOnly,
-            generation: None,
+            active_generation: None,
+            latest_capture_path_decision: None,
             last_error: None,
         });
         Self {
@@ -324,8 +559,11 @@ where
             maintenance_interval,
             address_reconciler: None,
             address_reconciliation_pending: false,
+            capture_path_refresh: CapturePathRefreshState::Current,
+            capture_path_evidence_clock: Box::new(SystemCapturePathEvidenceClock),
             runtime,
             pending_publication: None,
+            pending_prepared_rejection: None,
             subscription_refresh: None,
             pending_subscription_activation: None,
         }
@@ -353,11 +591,25 @@ where
         )
     }
 
+    #[cfg(test)]
+    fn with_capture_path_evidence_clock(
+        mut self,
+        clock: impl CapturePathEvidenceClock + 'static,
+    ) -> Self {
+        self.capture_path_evidence_clock = Box::new(clock);
+        self
+    }
+
     pub(crate) fn runtime_snapshot_source(&self) -> RuntimeSnapshotSource {
         self.runtime.clone()
     }
 
     fn start(&mut self, reason: Reason) -> Result<(), ControlError> {
+        self.expire_active_capture_path_if_needed(
+            "active Capture Path evidence expired before start",
+        )?;
+        self.settle_pending_prepared_rejection()?;
+        self.require_current_capture_path_evidence("start runtime generation")?;
         if matches!(self.ownership, RuntimeOwnership::Engine { .. }) {
             return self.reload(reason);
         }
@@ -383,11 +635,25 @@ where
                 "leave the current generation untouched and repair preparation inputs",
             )
         })?;
+        let generation =
+            self.accept_prepared_capture_path_evidence(generation, "start runtime generation")?;
         self.request_address_reconciliation();
-        self.activate_prepared(generation)
+        self.activate_prepared(
+            generation,
+            ActivationRole::Candidate {
+                predecessor_available: false,
+            },
+        )
+        .map_err(ActivationFailure::into_error)?;
+        Ok(())
     }
 
     fn reload(&mut self, reason: Reason) -> Result<(), ControlError> {
+        self.expire_active_capture_path_if_needed(
+            "active Capture Path evidence expired before reload",
+        )?;
+        self.settle_pending_prepared_rejection()?;
+        self.require_current_capture_path_evidence("reload runtime generation")?;
         if matches!(
             self.ownership,
             RuntimeOwnership::CaptureRepairPending { .. }
@@ -416,13 +682,27 @@ where
     }
 
     fn reload_prepared(&mut self, candidate: PreparedGeneration) -> Result<(), ControlError> {
+        if let Err(error) = self.expire_active_capture_path_if_needed(
+            "active Capture Path evidence expired while preparing a replacement",
+        ) {
+            return Err(self.reject_prepared_after_failure(candidate, error));
+        }
+        if let Err(error) =
+            self.require_current_capture_path_evidence("reload prepared runtime generation")
+        {
+            self.invalidate_latest_capture_path_decision();
+            return Err(self.reject_prepared_after_failure(candidate, error));
+        }
+        let candidate =
+            self.accept_prepared_capture_path_evidence(candidate, "reload runtime generation")?;
         if matches!(
             self.ownership,
             RuntimeOwnership::CaptureRepairPending { .. }
                 | RuntimeOwnership::DetachPending { .. }
                 | RuntimeOwnership::Retiring { .. }
         ) {
-            return Err(retirement_pending_error("reload prepared runtime"));
+            let error = retirement_pending_error("reload prepared runtime");
+            return Err(self.reject_prepared_after_failure(candidate, error));
         }
         let candidate_id = candidate.id;
         self.mark_functional_gate_pending();
@@ -432,34 +712,46 @@ where
                 generation,
                 capture,
             } => (generation, capture),
-            RuntimeOwnership::Stopped => return self.activate_prepared(candidate),
+            RuntimeOwnership::Stopped => {
+                return self
+                    .activate_prepared(
+                        candidate,
+                        ActivationRole::Candidate {
+                            predecessor_available: false,
+                        },
+                    )
+                    .map_err(ActivationFailure::into_error);
+            }
             RuntimeOwnership::Retiring {
                 generation,
-                terminal,
+                settlement,
                 rollback,
             } => {
                 self.ownership = RuntimeOwnership::Retiring {
                     generation,
-                    terminal,
+                    settlement,
                     rollback,
                 };
-                return Err(retirement_pending_error("reload runtime"));
+                let error = retirement_pending_error("reload runtime");
+                return Err(self.reject_prepared_after_failure(candidate, error));
             }
             RuntimeOwnership::DetachPending {
                 generation,
-                terminal,
+                settlement,
                 rollback,
             } => {
                 self.ownership = RuntimeOwnership::DetachPending {
                     generation,
-                    terminal,
+                    settlement,
                     rollback,
                 };
-                return Err(retirement_pending_error("reload runtime"));
+                let error = retirement_pending_error("reload runtime");
+                return Err(self.reject_prepared_after_failure(candidate, error));
             }
             RuntimeOwnership::CaptureRepairPending { generation } => {
                 self.ownership = RuntimeOwnership::CaptureRepairPending { generation };
-                return Err(retirement_pending_error("reload runtime"));
+                let error = retirement_pending_error("reload runtime");
+                return Err(self.reject_prepared_after_failure(candidate, error));
             }
         };
 
@@ -469,97 +761,194 @@ where
             self.ownership = RuntimeOwnership::CaptureRepairPending {
                 generation: previous,
             };
-            return Err(runtime_writer_error(
+            let failure = runtime_writer_error(
                 "detach active capture before replacement",
                 source,
                 "retain the active proxy engine and retry capture detachment",
-            ));
+            );
+            return Err(self.reject_prepared_after_failure(candidate, failure));
         }
         self.ownership = RuntimeOwnership::Engine {
             generation: previous.clone(),
             capture: CaptureObservation::Detached,
         };
-        match self.activate_prepared(candidate) {
-            Ok(()) => Ok(()),
-            Err(candidate_failure) => match &mut self.ownership {
-                RuntimeOwnership::Engine {
-                    generation,
-                    capture: CaptureObservation::Published,
-                } if generation.id == candidate_id => Err(candidate_failure),
-                RuntimeOwnership::DetachPending {
-                    generation,
-                    rollback,
-                    ..
-                } if generation.id == candidate_id => {
-                    *rollback = Some(previous);
-                    Err(candidate_failure)
-                }
-                RuntimeOwnership::Retiring {
-                    generation,
-                    rollback,
-                    ..
-                } if generation.id == candidate_id => {
-                    *rollback = Some(previous);
-                    Err(candidate_failure)
-                }
-                _ => match self.activate_prepared(*previous) {
-                    Ok(()) => Err(candidate_failure),
-                    Err(rollback_failure) => Err(self.settle_failed_rollback(rollback_failure)),
-                },
+        match self.activate_prepared(
+            candidate,
+            ActivationRole::Candidate {
+                predecessor_available: true,
             },
+        ) {
+            Ok(()) => Ok(()),
+            Err(candidate_failure) if !candidate_failure.rollback_eligible => {
+                Err(candidate_failure.into_error())
+            }
+            Err(candidate_failure) => {
+                let candidate_failure = candidate_failure.into_error();
+                match &mut self.ownership {
+                    RuntimeOwnership::Engine {
+                        generation,
+                        capture: CaptureObservation::Published,
+                    } if generation.id == candidate_id => Err(candidate_failure),
+                    RuntimeOwnership::DetachPending {
+                        generation,
+                        rollback,
+                        ..
+                    } if generation.id == candidate_id => {
+                        *rollback = Some(previous);
+                        Err(candidate_failure)
+                    }
+                    RuntimeOwnership::Retiring {
+                        generation,
+                        rollback,
+                        ..
+                    } if generation.id == candidate_id => {
+                        *rollback = Some(previous);
+                        Err(candidate_failure)
+                    }
+                    RuntimeOwnership::Engine {
+                        generation,
+                        capture: CaptureObservation::Detached,
+                    } if generation.id == previous.id
+                        && self.pending_prepared_rejection.is_some() =>
+                    {
+                        Err(candidate_failure)
+                    }
+                    _ => {
+                        self.ownership = RuntimeOwnership::Stopped;
+                        match self.activate_prepared(*previous, ActivationRole::Rollback) {
+                            Ok(()) => Err(candidate_failure),
+                            Err(rollback_failure) => {
+                                Err(rollback_failure_error(rollback_failure.into_error()))
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
-    fn activate_prepared(&mut self, generation: PreparedGeneration) -> Result<(), ControlError> {
+    fn activate_prepared(
+        &mut self,
+        generation: PreparedGeneration,
+        role: ActivationRole,
+    ) -> Result<(), ActivationFailure> {
+        let generation = match role {
+            ActivationRole::Candidate { .. } => self
+                .accept_prepared_capture_path_evidence(generation, "activate runtime generation")
+                .map_err(|error| ActivationFailure::before_running_commit(role, error))?,
+            ActivationRole::Rollback
+                if generation
+                    .capture_path_evidence_expired(self.capture_path_evidence_clock.now()) =>
+            {
+                let error = self.expire_cleanup_only_rollback(
+                    generation,
+                    "rollback Capture Path evidence expired before activation",
+                );
+                return Err(ActivationFailure::committed(error));
+            }
+            ActivationRole::Rollback => generation,
+        };
         self.publish_runtime_with_verification(
             RuntimePhase::Activating,
             RuntimeCaptureState::Detached,
             RuntimeEngineState::Starting,
             self.pending_verification(),
-            Some(generation.id),
+            Some(generation.runtime_binding()),
             None,
         );
         self.ownership = RuntimeOwnership::Engine {
             generation: Box::new(generation.clone()),
             capture: CaptureObservation::Detached,
         };
-        let report = self
-            .engine
-            .reconcile(
-                DesiredEngine::Running(&generation.spec),
-                CaptureObservation::Detached,
-            )
-            .map_err(|source| {
-                ControlError::runtime(
+        let report = match self.engine.reconcile(
+            DesiredEngine::Running(&generation.spec),
+            CaptureObservation::Detached,
+        ) {
+            Ok(report) => report,
+            Err(source) => {
+                let failure = ControlError::runtime(
                     "start proxy engine",
                     source,
                     "keep capture detached and retry engine reconciliation",
-                )
-            })?;
+                );
+                return Err(ActivationFailure::before_running_commit(
+                    role,
+                    self.compensate_failed_activation(
+                        generation,
+                        role,
+                        CaptureObservation::Detached,
+                        failure,
+                    ),
+                ));
+            }
+        };
         if !matches!(
             report,
             EngineReport::Started { .. } | EngineReport::NoChange { .. }
         ) {
-            return Err(ControlError::runtime(
+            let failure = ControlError::runtime(
                 "start proxy engine",
                 io::Error::other(format!("engine did not become ready: {report:?}")),
                 "keep capture detached and retry after the supervisor settles",
+            );
+            return Err(ActivationFailure::before_running_commit(
+                role,
+                self.compensate_failed_activation(
+                    generation,
+                    role,
+                    CaptureObservation::Detached,
+                    failure,
+                ),
             ));
         }
-        if let Err(source) = self.writer.capture_start(&generation) {
-            let failure = runtime_writer_error(
-                "publish capture",
-                source,
-                "detach partial capture before retrying activation",
-            );
-            return Err(self.compensate_failed_activation(generation, failure));
+        match self.capture_start_with_current_evidence(
+            &generation,
+            "publish capture",
+            "detach partial capture before retrying activation",
+        ) {
+            Ok(()) => {}
+            Err(CaptureAuthorityFailure::EvidenceExpired) => {
+                let error = match role {
+                    ActivationRole::Candidate {
+                        predecessor_available,
+                    } => self.expire_candidate_activation(
+                        generation,
+                        predecessor_available,
+                        CaptureObservation::Detached,
+                        "publish capture",
+                    ),
+                    ActivationRole::Rollback => {
+                        return Err(ActivationFailure::committed(
+                            self.expire_cleanup_only_rollback(
+                                generation,
+                                "rollback Capture Path evidence expired before capture publication",
+                            ),
+                        ));
+                    }
+                };
+                return Err(ActivationFailure::before_running_commit(role, error));
+            }
+            Err(CaptureAuthorityFailure::EvidenceExpiredAfterRunningCommit) => {
+                unreachable!("capture start cannot commit Running state")
+            }
+            Err(CaptureAuthorityFailure::Writer(failure)) => {
+                return Err(ActivationFailure::before_running_commit(
+                    role,
+                    self.compensate_failed_activation(
+                        generation,
+                        role,
+                        CaptureObservation::Published,
+                        failure,
+                    ),
+                ));
+            }
         }
         self.publish_runtime_with_verification(
             RuntimePhase::Verifying,
             RuntimeCaptureState::Published,
             RuntimeEngineState::Ready,
             self.pending_verification(),
-            Some(generation.id),
+            Some(generation.runtime_binding()),
             None,
         );
         let qualification = match self.verify_running_gate(
@@ -570,39 +959,77 @@ where
             Ok(qualification) => qualification,
             Err(failure) => {
                 self.mark_functional_gate_failed();
-                return Err(self.compensate_failed_activation(generation, failure));
+                return Err(ActivationFailure::before_running_commit(
+                    role,
+                    self.compensate_failed_activation(
+                        generation,
+                        role,
+                        CaptureObservation::Published,
+                        failure,
+                    ),
+                ));
             }
         };
         self.ownership = RuntimeOwnership::Engine {
             generation: Box::new(generation.clone()),
             capture: CaptureObservation::Published,
         };
-        let verification = qualification.verification();
-        self.publish_qualified_running(
+        match self.publish_qualified_running(
             qualification,
             "publish running state",
             "retain the verified data path and retry state publication",
-        )?;
-        self.publish_runtime_with_verification(
-            RuntimePhase::Running,
-            RuntimeCaptureState::Published,
-            RuntimeEngineState::Ready,
-            verification,
-            Some(generation.id),
-            None,
-        );
+        ) {
+            Ok(()) => {}
+            Err(CaptureAuthorityFailure::EvidenceExpired) => {
+                let error = match role {
+                    ActivationRole::Candidate {
+                        predecessor_available,
+                    } => self.expire_candidate_activation(
+                        generation,
+                        predecessor_available,
+                        CaptureObservation::Published,
+                        "publish running state",
+                    ),
+                    ActivationRole::Rollback => {
+                        return Err(ActivationFailure::committed(
+                            self.expire_cleanup_only_rollback(
+                                generation,
+                                "rollback Capture Path evidence expired before Running publication",
+                            ),
+                        ));
+                    }
+                };
+                return Err(ActivationFailure::before_running_commit(role, error));
+            }
+            Err(CaptureAuthorityFailure::EvidenceExpiredAfterRunningCommit) => {
+                let error = match self.expire_capture_path_selection(
+                    "Capture Path evidence expired while publishing Running state",
+                ) {
+                    Err(error) => error,
+                    Ok(()) => expired_capture_path_evidence_error("publish running state"),
+                };
+                return Err(ActivationFailure::committed(error));
+            }
+            Err(CaptureAuthorityFailure::Writer(failure)) => {
+                return Err(ActivationFailure::committed(failure));
+            }
+        }
         Ok(())
     }
 
     fn compensate_failed_activation(
         &mut self,
         generation: PreparedGeneration,
+        role: ActivationRole,
+        capture: CaptureObservation,
         activation_failure: ControlError,
     ) -> ControlError {
-        if let Err(source) = self.writer.capture_stop() {
+        if capture == CaptureObservation::Published
+            && let Err(source) = self.writer.capture_stop()
+        {
             self.ownership = RuntimeOwnership::DetachPending {
                 generation: Box::new(generation),
-                terminal: PublishedRuntimeState::Failed,
+                settlement: role.failed_activation_settlement(),
                 rollback: None,
             };
             return runtime_writer_error(
@@ -616,7 +1043,7 @@ where
         }
         match self.reconcile_retirement(
             Box::new(generation),
-            PublishedRuntimeState::Failed,
+            role.failed_activation_settlement(),
             None,
             "stop engine after failed activation",
             "keep capture detached and retry engine cleanup",
@@ -632,6 +1059,10 @@ where
     }
 
     fn maintain_runtime(&mut self) -> Result<(), ControlError> {
+        self.expire_active_capture_path_if_needed(
+            "Capture Path behavioral evidence deadline expired",
+        )?;
+        self.settle_pending_prepared_rejection()?;
         let ownership = std::mem::replace(&mut self.ownership, RuntimeOwnership::Stopped);
         let (generation, capture) = match ownership {
             RuntimeOwnership::Stopped => {
@@ -644,12 +1075,12 @@ where
             } => (generation, capture),
             RuntimeOwnership::Retiring {
                 generation,
-                terminal,
+                settlement,
                 rollback,
             } => {
                 return match self.reconcile_retirement(
                     generation,
-                    terminal,
+                    settlement,
                     rollback,
                     "complete proxy engine retirement",
                     "keep capture detached and retry bounded engine cleanup",
@@ -659,12 +1090,12 @@ where
             }
             RuntimeOwnership::DetachPending {
                 generation,
-                terminal,
+                settlement,
                 rollback,
             } => {
                 return match self.reconcile_pending_detachment(
                     generation,
-                    terminal,
+                    settlement,
                     rollback,
                     "complete capture detachment",
                     "retain the proxy engine and retry capture detachment",
@@ -705,7 +1136,7 @@ where
                 runtime_capture_state(capture),
                 RuntimeEngineState::Exited,
                 self.pending_verification(),
-                Some(generation.id),
+                Some(generation.runtime_binding()),
                 None,
             );
             if capture == CaptureObservation::Published
@@ -738,7 +1169,7 @@ where
                     ));
                 }
             };
-            let generation_id = generation.id;
+            let generation_binding = generation.runtime_binding();
             self.ownership = RuntimeOwnership::Engine {
                 generation,
                 capture: CaptureObservation::Detached,
@@ -753,13 +1184,14 @@ where
                 runtime_phase_for_report(&report),
                 RuntimeCaptureState::Detached,
                 runtime_engine_for_report(&report),
-                Some(generation_id),
+                Some(generation_binding),
                 None,
             );
             return Ok(());
         }
 
-        let generation_id = generation.id;
+        let generation_binding = generation.runtime_binding();
+        let generation_id = generation_binding.generation;
         let engine_ready = matches!(
             report,
             EngineReport::Started { .. } | EngineReport::NoChange { .. }
@@ -780,18 +1212,33 @@ where
                 RuntimeCaptureState::Published,
                 RuntimeEngineState::Ready,
                 self.pending_verification(),
-                Some(generation_id),
+                Some(generation_binding),
                 None,
             );
-            if self.functional_canary.mode() == FunctionalCanaryGateMode::RequiredUnqualified
-                && let Err(source) = self.writer.capture_start(&generation)
-            {
-                self.ownership = RuntimeOwnership::CaptureRepairPending { generation };
-                return Err(runtime_writer_error(
+            if self.functional_canary.mode() == FunctionalCanaryGateMode::RequiredUnqualified {
+                match self.capture_start_with_current_evidence(
+                    &generation,
                     "reassert capture before functional running retry",
-                    source,
                     "detach and restore the active generation before retrying publication",
-                ));
+                ) {
+                    Ok(()) => {}
+                    Err(CaptureAuthorityFailure::EvidenceExpired) => {
+                        self.ownership = RuntimeOwnership::Engine {
+                            generation,
+                            capture,
+                        };
+                        return self.expire_capture_path_selection(
+                            "Capture Path evidence expired before capture reassertion",
+                        );
+                    }
+                    Err(CaptureAuthorityFailure::EvidenceExpiredAfterRunningCommit) => {
+                        unreachable!("capture reassertion cannot commit Running state")
+                    }
+                    Err(CaptureAuthorityFailure::Writer(failure)) => {
+                        self.ownership = RuntimeOwnership::CaptureRepairPending { generation };
+                        return Err(failure);
+                    }
+                }
             }
             let qualification = match self.verify_running_gate(
                 &generation,
@@ -809,20 +1256,24 @@ where
                 generation,
                 capture,
             };
-            let verification = qualification.verification();
-            self.publish_qualified_running(
+            match self.publish_qualified_running(
                 qualification,
                 "retry running state publication",
                 "retain the verified data path and retry publication",
-            )?;
-            self.publish_runtime_with_verification(
-                RuntimePhase::Running,
-                RuntimeCaptureState::Published,
-                RuntimeEngineState::Ready,
-                verification,
-                Some(generation_id),
-                None,
-            );
+            ) {
+                Ok(()) => {}
+                Err(CaptureAuthorityFailure::EvidenceExpired) => {
+                    return self.expire_capture_path_selection(
+                        "Capture Path evidence expired before running republication",
+                    );
+                }
+                Err(CaptureAuthorityFailure::EvidenceExpiredAfterRunningCommit) => {
+                    return self.expire_capture_path_selection(
+                        "Capture Path evidence expired while republishing Running state",
+                    );
+                }
+                Err(CaptureAuthorityFailure::Writer(failure)) => return Err(failure),
+            }
             return Ok(());
         }
         self.ownership = RuntimeOwnership::Engine {
@@ -832,14 +1283,11 @@ where
         if capture == CaptureObservation::Detached && engine_ready {
             self.restore_capture_after_maintenance()?;
         } else {
-            if capture == CaptureObservation::Published && engine_ready {
-                self.retry_pending_running_publication(generation_id)?;
-            }
             self.publish_runtime(
                 runtime_phase_for_report(&report),
                 runtime_capture_state(capture),
                 runtime_engine_for_report(&report),
-                Some(generation_id),
+                Some(generation_binding),
                 None,
             );
         }
@@ -852,8 +1300,159 @@ where
         }
     }
 
+    fn require_current_capture_path_evidence(
+        &self,
+        operation: &'static str,
+    ) -> Result<(), ControlError> {
+        if !self.capture_path_refresh.requires_fresh_evidence() {
+            return Ok(());
+        }
+        Err(ControlError::runtime(
+            operation,
+            io::Error::other("Capture Path evidence refresh is still pending"),
+            "wait for a fresh complete Network Inventory transaction",
+        ))
+    }
+
+    fn accept_prepared_capture_path_evidence(
+        &mut self,
+        generation: PreparedGeneration,
+        operation: &'static str,
+    ) -> Result<PreparedGeneration, ControlError> {
+        if !generation.capture_path_evidence_expired(self.capture_path_evidence_clock.now()) {
+            return Ok(generation);
+        }
+
+        if self.ownership.active_capture_path_authority().is_none()
+            && matches!(self.capture_path_refresh, CapturePathRefreshState::Current)
+        {
+            self.capture_path_refresh = CapturePathRefreshState::require_automatic_recovery();
+        }
+        self.invalidate_latest_capture_path_decision();
+        let failure = expired_capture_path_evidence_error(operation);
+        Err(self.reject_prepared_after_failure(generation, failure))
+    }
+
+    fn reject_prepared_after_failure(
+        &mut self,
+        generation: PreparedGeneration,
+        failure: ControlError,
+    ) -> ControlError {
+        if let Err(source) = self.writer.reject_prepared(&generation) {
+            self.pending_prepared_rejection = Some(Box::new(generation));
+            return runtime_writer_error(
+                "reject unactivated prepared runtime Generation",
+                FailedPreparedRejection {
+                    initiating_failure: failure,
+                    rejection: source,
+                },
+                "retry prepared-candidate settlement before accepting another Generation",
+            );
+        }
+        failure
+    }
+
+    fn settle_pending_prepared_rejection(&mut self) -> Result<(), ControlError> {
+        if self.pending_prepared_rejection.is_some()
+            && matches!(self.ownership, RuntimeOwnership::Stopped)
+            && matches!(
+                self.pending_publication,
+                Some(PublishedRuntimeState::Stopped | PublishedRuntimeState::Failed)
+            )
+        {
+            self.retry_pending_terminal_publication()?;
+        }
+        let Some(generation) = self.pending_prepared_rejection.take() else {
+            return Ok(());
+        };
+        if let Err(source) = self.writer.reject_prepared(&generation) {
+            self.pending_prepared_rejection = Some(generation);
+            return Err(runtime_writer_error(
+                "retry prepared runtime Generation rejection",
+                source,
+                "keep the candidate cleanup-only and retry settlement",
+            ));
+        }
+        Ok(())
+    }
+
+    fn expire_active_capture_path_if_needed(
+        &mut self,
+        cause: &'static str,
+    ) -> Result<(), ControlError> {
+        if self
+            .ownership
+            .active_capture_path_authority()
+            .is_some_and(|generation| {
+                generation.capture_path_evidence_expired(self.capture_path_evidence_clock.now())
+            })
+        {
+            return self.expire_capture_path_selection(cause);
+        }
+        Ok(())
+    }
+
+    fn capture_start_with_current_evidence(
+        &mut self,
+        generation: &PreparedGeneration,
+        operation: &'static str,
+        recovery: &'static str,
+    ) -> Result<(), CaptureAuthorityFailure> {
+        if generation.capture_path_evidence_expired(self.capture_path_evidence_clock.now()) {
+            return Err(CaptureAuthorityFailure::EvidenceExpired);
+        }
+        self.writer.capture_start(generation).map_err(|source| {
+            CaptureAuthorityFailure::Writer(runtime_writer_error(operation, source, recovery))
+        })
+    }
+
+    fn expire_candidate_activation(
+        &mut self,
+        generation: PreparedGeneration,
+        predecessor_available: bool,
+        capture: CaptureObservation,
+        operation: &'static str,
+    ) -> ControlError {
+        self.invalidate_latest_capture_path_decision();
+        if !predecessor_available
+            && matches!(self.capture_path_refresh, CapturePathRefreshState::Current)
+        {
+            self.capture_path_refresh = CapturePathRefreshState::require_automatic_recovery();
+        }
+        let failure = expired_capture_path_evidence_error(operation);
+        self.compensate_failed_activation(
+            generation,
+            ActivationRole::Candidate {
+                predecessor_available,
+            },
+            capture,
+            failure,
+        )
+    }
+
+    fn expire_cleanup_only_rollback(
+        &mut self,
+        generation: PreparedGeneration,
+        cause: &'static str,
+    ) -> ControlError {
+        self.ownership = RuntimeOwnership::Engine {
+            generation: Box::new(generation),
+            capture: CaptureObservation::Detached,
+        };
+        match self.expire_capture_path_selection(cause) {
+            Err(error) => error,
+            Ok(()) => ControlError::runtime(
+                "expire rollback Capture Path selection",
+                io::Error::other("expired rollback lost its cleanup ownership"),
+                "keep capture detached and repair runtime ownership",
+            ),
+        }
+    }
+
     fn maintain_address_reconciliation(&mut self) -> Result<(), ControlError> {
         let active_generation = self.ownership_summary().1;
+        let mut complete_inventory_recovered = false;
+        let mut selection_evidence_lost = false;
         {
             let Some(reconciler) = self.address_reconciler.as_mut() else {
                 return Ok(());
@@ -861,13 +1460,15 @@ where
             match reconciler.reconcile() {
                 Ok(AddressReconciliationOutcome::Reconciled(_)) => {
                     self.address_reconciliation_pending = true;
+                    complete_inventory_recovered = true;
                 }
                 Ok(AddressReconciliationOutcome::Invalidated(previous)) => {
                     self.address_reconciliation_pending = false;
+                    selection_evidence_lost = true;
                     runtime_log(
                         LogSeverity::Warn,
                         "address_reconciliation",
-                        active_generation,
+                        active_generation.map(|binding| binding.generation),
                         format_args!(
                             "network inventory snapshot {} at epoch {} invalidated; awaiting full resynchronization",
                             previous.snapshot_id().get(),
@@ -881,16 +1482,33 @@ where
                 ) => {}
                 Ok(AddressReconciliationOutcome::AwaitingCompleteSnapshot) => {
                     self.address_reconciliation_pending = false;
+                    selection_evidence_lost = true;
                 }
                 Err(error) => {
                     self.address_reconciliation_pending = false;
                     runtime_log(
                         LogSeverity::Warn,
                         "address_reconciliation",
-                        active_generation,
+                        active_generation.map(|binding| binding.generation),
                         format_args!("non-mutating reconciliation blocked: {error}"),
                     );
                 }
+            }
+        }
+        if selection_evidence_lost {
+            self.invalidate_latest_capture_path_decision();
+            if active_generation.is_some() {
+                return self
+                    .expire_capture_path_selection("complete Network Inventory evidence was lost");
+            }
+        }
+        if complete_inventory_recovered
+            && self.capture_path_refresh.awaiting_fresh_evidence()
+            && matches!(self.ownership, RuntimeOwnership::Stopped)
+        {
+            let recover = self.capture_path_refresh.accept_fresh_evidence();
+            if recover {
+                return self.start(Reason::DaemonRecovery);
             }
         }
         let runtime = self.runtime.snapshot();
@@ -943,6 +1561,43 @@ where
             None,
         );
         self.reload_prepared(candidate)
+    }
+
+    fn maintain_capture_path_refresh(&mut self) -> Result<(), ControlError> {
+        if !self.capture_path_refresh.request_pending()
+            || !matches!(self.ownership, RuntimeOwnership::Stopped)
+        {
+            return Ok(());
+        }
+        let reconciler = self.address_reconciler.as_mut().ok_or_else(|| {
+            ControlError::runtime(
+                "request fresh Capture Path evidence",
+                io::Error::other("runtime has no Network Inventory refresh authority"),
+                "keep capture detached and restore the inventory reactor attachment",
+            )
+        })?;
+        let disposition = reconciler.request_fresh_snapshot().map_err(|source| {
+            ControlError::runtime(
+                "request fresh Capture Path evidence",
+                source,
+                "keep capture detached until a fresh complete inventory is available",
+            )
+        })?;
+        match disposition {
+            NetworkInventoryRefreshDisposition::Requested
+            | NetworkInventoryRefreshDisposition::AlreadyPending => {
+                self.capture_path_refresh.accept_request();
+                Ok(())
+            }
+            NetworkInventoryRefreshDisposition::Unavailable => Err(ControlError::runtime(
+                "request fresh Capture Path evidence",
+                io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "Network Inventory reactor is unavailable",
+                ),
+                "keep capture detached and restore the inventory reactor attachment",
+            )),
+        }
     }
 
     fn maintain_subscription_refresh(&mut self) {
@@ -1123,7 +1778,9 @@ where
         ) && runtime.phase == RuntimePhase::Running
             && runtime.capture == RuntimeCaptureState::Published
             && runtime.engine == RuntimeEngineState::Ready
-            && runtime.generation == Some(candidate)
+            && runtime
+                .active_generation
+                .is_some_and(|binding| binding.generation() == candidate)
         {
             return SubscriptionActivationSettlement::Accepted;
         }
@@ -1171,7 +1828,7 @@ where
                 ));
             }
         };
-        let generation_id = generation.id;
+        let generation_binding = generation.runtime_binding();
         self.ownership = RuntimeOwnership::Engine {
             generation,
             capture: CaptureObservation::Detached,
@@ -1186,7 +1843,7 @@ where
             runtime_phase_for_report(&report),
             RuntimeCaptureState::Detached,
             runtime_engine_for_report(&report),
-            Some(generation_id),
+            Some(generation_binding),
             None,
         );
         Ok(())
@@ -1213,23 +1870,38 @@ where
             return Ok(());
         }
         self.mark_functional_gate_pending();
-        if let Err(source) = self.writer.capture_start(&generation) {
-            self.ownership = RuntimeOwnership::Engine {
-                generation,
-                capture,
-            };
-            return Err(runtime_writer_error(
-                "restore capture after engine restart",
-                source,
-                "keep capture detached and retry publication",
-            ));
+        match self.capture_start_with_current_evidence(
+            &generation,
+            "restore capture after engine restart",
+            "keep capture detached and retry publication",
+        ) {
+            Ok(()) => {}
+            Err(CaptureAuthorityFailure::EvidenceExpired) => {
+                self.ownership = RuntimeOwnership::Engine {
+                    generation,
+                    capture,
+                };
+                return self.expire_capture_path_selection(
+                    "Capture Path evidence expired before capture restoration",
+                );
+            }
+            Err(CaptureAuthorityFailure::EvidenceExpiredAfterRunningCommit) => {
+                unreachable!("capture restoration cannot commit Running state")
+            }
+            Err(CaptureAuthorityFailure::Writer(failure)) => {
+                self.ownership = RuntimeOwnership::Engine {
+                    generation,
+                    capture,
+                };
+                return Err(failure);
+            }
         }
         self.publish_runtime_with_verification(
             RuntimePhase::Verifying,
             RuntimeCaptureState::Published,
             RuntimeEngineState::Ready,
             self.pending_verification(),
-            Some(generation.id),
+            Some(generation.runtime_binding()),
             None,
         );
         let qualification = match self.verify_running_gate(
@@ -1240,32 +1912,42 @@ where
             Ok(qualification) => qualification,
             Err(failure) => {
                 self.mark_functional_gate_failed();
-                return Err(self.compensate_failed_activation(*generation, failure));
+                return Err(self.compensate_failed_activation(
+                    *generation,
+                    ActivationRole::Rollback,
+                    CaptureObservation::Published,
+                    failure,
+                ));
             }
         };
-        let generation_id = generation.id;
         self.ownership = RuntimeOwnership::Engine {
             generation,
             capture: CaptureObservation::Published,
         };
-        let verification = qualification.verification();
-        self.publish_qualified_running(
+        match self.publish_qualified_running(
             qualification,
             "republish running state",
             "retain the verified path and retry state publication",
-        )?;
-        self.publish_runtime_with_verification(
-            RuntimePhase::Running,
-            RuntimeCaptureState::Published,
-            RuntimeEngineState::Ready,
-            verification,
-            Some(generation_id),
-            None,
-        );
+        ) {
+            Ok(()) => {}
+            Err(CaptureAuthorityFailure::EvidenceExpired) => {
+                return self.expire_capture_path_selection(
+                    "Capture Path evidence expired before restored running publication",
+                );
+            }
+            Err(CaptureAuthorityFailure::EvidenceExpiredAfterRunningCommit) => {
+                return self.expire_capture_path_selection(
+                    "Capture Path evidence expired while publishing restored Running state",
+                );
+            }
+            Err(CaptureAuthorityFailure::Writer(failure)) => return Err(failure),
+        }
         Ok(())
     }
 
     fn stop(&mut self) -> Result<(), ControlError> {
+        self.invalidate_latest_selected_capture_path_decision();
+        self.capture_path_refresh.cancel_automatic_recovery();
         self.reset_verification();
         let ownership = std::mem::replace(&mut self.ownership, RuntimeOwnership::Stopped);
         let (generation, capture) = match ownership {
@@ -1292,7 +1974,7 @@ where
             RuntimeOwnership::Retiring { generation, .. } => {
                 return match self.reconcile_retirement(
                     generation,
-                    PublishedRuntimeState::Stopped,
+                    RetirementSettlement::Publish(PublishedRuntimeState::Stopped),
                     None,
                     "stop proxy engine",
                     "keep capture detached and retry engine reconciliation",
@@ -1308,7 +1990,7 @@ where
             RuntimeOwnership::DetachPending { generation, .. } => {
                 return match self.reconcile_pending_detachment(
                     generation,
-                    PublishedRuntimeState::Stopped,
+                    RetirementSettlement::Publish(PublishedRuntimeState::Stopped),
                     None,
                     "detach capture",
                     "retain the proxy engine and retry capture detachment",
@@ -1324,7 +2006,7 @@ where
             RuntimeOwnership::CaptureRepairPending { generation } => {
                 return match self.reconcile_pending_detachment(
                     generation,
-                    PublishedRuntimeState::Stopped,
+                    RetirementSettlement::Publish(PublishedRuntimeState::Stopped),
                     None,
                     "detach capture",
                     "retain the proxy engine and retry capture detachment",
@@ -1344,7 +2026,7 @@ where
             runtime_capture_state(capture),
             RuntimeEngineState::Stopping,
             RuntimeVerificationState::StructuralOnly,
-            Some(generation.id),
+            Some(generation.runtime_binding()),
             None,
         );
         if capture == CaptureObservation::Published
@@ -1352,7 +2034,7 @@ where
         {
             self.ownership = RuntimeOwnership::DetachPending {
                 generation,
-                terminal: PublishedRuntimeState::Stopped,
+                settlement: RetirementSettlement::Publish(PublishedRuntimeState::Stopped),
                 rollback: None,
             };
             return Err(runtime_writer_error(
@@ -1363,7 +2045,7 @@ where
         }
         match self.reconcile_retirement(
             generation,
-            PublishedRuntimeState::Stopped,
+            RetirementSettlement::Publish(PublishedRuntimeState::Stopped),
             None,
             "stop proxy engine",
             "keep capture detached and retry engine reconciliation",
@@ -1380,7 +2062,7 @@ where
     fn reconcile_pending_detachment(
         &mut self,
         generation: Box<PreparedGeneration>,
-        terminal: PublishedRuntimeState,
+        settlement: RetirementSettlement,
         rollback: Option<Box<PreparedGeneration>>,
         operation: &'static str,
         recovery: &'static str,
@@ -1388,14 +2070,14 @@ where
         if let Err(source) = self.writer.capture_stop() {
             self.ownership = RuntimeOwnership::DetachPending {
                 generation,
-                terminal,
+                settlement,
                 rollback,
             };
             return Err(runtime_writer_error(operation, source, recovery));
         }
         self.reconcile_retirement(
             generation,
-            terminal,
+            settlement,
             rollback,
             "retire proxy engine after capture detachment",
             "keep capture detached and retry bounded engine cleanup",
@@ -1405,12 +2087,12 @@ where
     fn reconcile_retirement(
         &mut self,
         generation: Box<PreparedGeneration>,
-        terminal: PublishedRuntimeState,
+        settlement: RetirementSettlement,
         rollback: Option<Box<PreparedGeneration>>,
         operation: &'static str,
         recovery: &'static str,
     ) -> Result<RetirementProgress, ControlError> {
-        let generation_id = generation.id;
+        let generation_binding = generation.runtime_binding();
         let report = match self
             .engine
             .reconcile(DesiredEngine::Stopped, CaptureObservation::Detached)
@@ -1419,7 +2101,7 @@ where
             Err(source) => {
                 self.ownership = RuntimeOwnership::Retiring {
                     generation,
-                    terminal,
+                    settlement,
                     rollback,
                 };
                 return Err(ControlError::runtime(operation, source, recovery));
@@ -1431,26 +2113,66 @@ where
         ) {
             self.ownership = RuntimeOwnership::Retiring {
                 generation,
-                terminal,
+                settlement,
                 rollback,
             };
             self.publish_runtime(
                 RuntimePhase::Stopping,
                 RuntimeCaptureState::Detached,
                 runtime_engine_for_report(&report),
-                Some(generation_id),
+                Some(generation_binding),
                 None,
             );
             return Ok(RetirementProgress::Pending(report));
         }
 
-        if let Some(previous) = rollback {
-            self.ownership = RuntimeOwnership::Stopped;
-            return match self.activate_prepared(*previous) {
-                Ok(()) => Ok(RetirementProgress::Settled),
-                Err(rollback_failure) => Err(self.settle_failed_rollback(rollback_failure)),
-            };
-        }
+        let terminal = match settlement {
+            RetirementSettlement::RejectPrepared(continuation) => {
+                if let Err(source) = self.writer.reject_prepared(&generation) {
+                    self.ownership = RuntimeOwnership::Retiring {
+                        generation,
+                        settlement,
+                        rollback,
+                    };
+                    return Err(runtime_writer_error(
+                        "reject cleaned-up runtime Generation candidate",
+                        source,
+                        "keep the candidate cleanup-only and retry exact source settlement",
+                    ));
+                }
+                if let Some(previous) = rollback {
+                    self.ownership = RuntimeOwnership::Stopped;
+                    return match self.activate_prepared(*previous, ActivationRole::Rollback) {
+                        Ok(()) => Ok(RetirementProgress::Settled),
+                        Err(rollback_failure) => {
+                            Err(rollback_failure_error(rollback_failure.into_error()))
+                        }
+                    };
+                }
+                match continuation {
+                    RejectedPreparedContinuation::AwaitRollback => {
+                        self.ownership = RuntimeOwnership::Stopped;
+                        return Ok(RetirementProgress::Settled);
+                    }
+                    RejectedPreparedContinuation::PublishFailed => PublishedRuntimeState::Failed,
+                }
+            }
+            RetirementSettlement::Publish(terminal) => {
+                if rollback.is_some() {
+                    self.ownership = RuntimeOwnership::Retiring {
+                        generation,
+                        settlement,
+                        rollback,
+                    };
+                    return Err(ControlError::runtime(
+                        "settle retired runtime Generation",
+                        io::Error::other("terminal retirement cannot retain a rollback Generation"),
+                        "repair the retirement settlement before retrying cleanup",
+                    ));
+                }
+                terminal
+            }
+        };
 
         let (phase, publish_operation, publish_recovery) = match terminal {
             PublishedRuntimeState::Stopped => (
@@ -1466,7 +2188,7 @@ where
             PublishedRuntimeState::Running { .. } => {
                 self.ownership = RuntimeOwnership::Retiring {
                     generation,
-                    terminal,
+                    settlement,
                     rollback: None,
                 };
                 return Err(ControlError::runtime(
@@ -1495,82 +2217,28 @@ where
         Ok(RetirementProgress::Settled)
     }
 
-    fn settle_failed_rollback(&mut self, rollback_failure: ControlError) -> ControlError {
-        let ownership = std::mem::replace(&mut self.ownership, RuntimeOwnership::Stopped);
-        let settlement = match ownership {
-            RuntimeOwnership::Stopped => self
-                .publish_runtime_state(
-                    PublishedRuntimeState::Failed,
-                    "publish failed state after rollback failure",
-                    "retry failed-state publication while capture remains detached",
-                )
-                .map(|()| RetirementProgress::Settled),
-            RuntimeOwnership::Engine {
-                generation,
-                capture: CaptureObservation::Published,
-            } => {
-                self.ownership = RuntimeOwnership::Engine {
-                    generation,
-                    capture: CaptureObservation::Published,
-                };
-                return rollback_failure_error(rollback_failure);
-            }
-            RuntimeOwnership::Engine {
-                generation,
-                capture: CaptureObservation::Detached,
-            }
-            | RuntimeOwnership::Retiring {
-                generation,
-                terminal: _,
-                rollback: _,
-            } => self.reconcile_retirement(
-                generation,
-                PublishedRuntimeState::Failed,
-                None,
-                "settle failed rollback",
-                "keep capture detached and retry bounded engine cleanup",
-            ),
-            RuntimeOwnership::DetachPending { generation, .. } => {
-                self.ownership = RuntimeOwnership::DetachPending {
-                    generation,
-                    terminal: PublishedRuntimeState::Failed,
-                    rollback: None,
-                };
-                return rollback_failure_error(rollback_failure);
-            }
-            RuntimeOwnership::CaptureRepairPending { generation } => {
-                self.ownership = RuntimeOwnership::DetachPending {
-                    generation,
-                    terminal: PublishedRuntimeState::Failed,
-                    rollback: None,
-                };
-                return rollback_failure_error(rollback_failure);
-            }
-        };
-        match settlement {
-            Ok(RetirementProgress::Settled | RetirementProgress::Pending(_)) => {
-                rollback_failure_error(rollback_failure)
-            }
-            Err(error) => error,
-        }
-    }
-
-    fn ownership_summary(&self) -> (RuntimeCaptureState, Option<GenerationId>) {
+    fn ownership_summary(&self) -> (RuntimeCaptureState, Option<RuntimeGenerationBinding>) {
         match &self.ownership {
             RuntimeOwnership::Stopped => (RuntimeCaptureState::Detached, None),
             RuntimeOwnership::Engine {
                 generation,
                 capture,
-            } => (runtime_capture_state(*capture), Some(generation.id)),
-            RuntimeOwnership::DetachPending { generation, .. } => {
-                (RuntimeCaptureState::Published, Some(generation.id))
-            }
-            RuntimeOwnership::CaptureRepairPending { generation } => {
-                (RuntimeCaptureState::Published, Some(generation.id))
-            }
-            RuntimeOwnership::Retiring { generation, .. } => {
-                (RuntimeCaptureState::Detached, Some(generation.id))
-            }
+            } => (
+                runtime_capture_state(*capture),
+                Some(generation.runtime_binding()),
+            ),
+            RuntimeOwnership::DetachPending { generation, .. } => (
+                RuntimeCaptureState::Published,
+                Some(generation.runtime_binding()),
+            ),
+            RuntimeOwnership::CaptureRepairPending { generation } => (
+                RuntimeCaptureState::Published,
+                Some(generation.runtime_binding()),
+            ),
+            RuntimeOwnership::Retiring { generation, .. } => (
+                RuntimeCaptureState::Detached,
+                Some(generation.runtime_binding()),
+            ),
         }
     }
 
@@ -1586,7 +2254,8 @@ where
 
         if self.functional_canary.mode() == FunctionalCanaryGateMode::StructuralVerificationOnly {
             return Ok(QualifiedRunningGeneration {
-                generation: generation.id,
+                generation: generation.runtime_binding(),
+                capture_path_evidence_deadline: generation.capture_path_evidence_deadline,
                 disposition: FunctionalCanaryDisposition::StructuralVerificationOnly,
             });
         }
@@ -1708,7 +2377,8 @@ where
                 )
             })?;
         Ok(QualifiedRunningGeneration {
-            generation: generation.id,
+            generation: generation.runtime_binding(),
+            capture_path_evidence_deadline: generation.capture_path_evidence_deadline,
             disposition: FunctionalCanaryDisposition::AttemptPassedUnqualified(Box::new(validated)),
         })
     }
@@ -1785,18 +2455,39 @@ where
         qualification: QualifiedRunningGeneration,
         operation: &'static str,
         recovery: &'static str,
-    ) -> Result<(), ControlError> {
-        match qualification.disposition {
+    ) -> Result<(), CaptureAuthorityFailure> {
+        if qualification.capture_path_evidence_expired(self.capture_path_evidence_clock.now()) {
+            return Err(CaptureAuthorityFailure::EvidenceExpired);
+        }
+        let generation = qualification.generation;
+        let verification = qualification.verification();
+        match &qualification.disposition {
             FunctionalCanaryDisposition::StructuralVerificationOnly
             | FunctionalCanaryDisposition::AttemptPassedUnqualified(_) => {}
         }
         self.publish_runtime_state(
             PublishedRuntimeState::Running {
-                generation: qualification.generation,
+                generation: generation.generation,
             },
             operation,
             recovery,
         )
+        .map_err(CaptureAuthorityFailure::Writer)?;
+        if qualification.capture_path_evidence_expired(self.capture_path_evidence_clock.now()) {
+            return Err(CaptureAuthorityFailure::EvidenceExpiredAfterRunningCommit);
+        }
+        self.publish_runtime_with_verification(
+            RuntimePhase::Running,
+            RuntimeCaptureState::Published,
+            RuntimeEngineState::Ready,
+            verification,
+            Some(generation),
+            None,
+        );
+        if qualification.capture_path_evidence_expired(self.capture_path_evidence_clock.now()) {
+            return Err(CaptureAuthorityFailure::EvidenceExpiredAfterRunningCommit);
+        }
+        Ok(())
     }
 
     fn publish_runtime_state(
@@ -1810,41 +2501,34 @@ where
             .publish(state)
             .map_err(|source| runtime_writer_error(operation, source, recovery))?;
         self.pending_publication = None;
+        if matches!(
+            state,
+            PublishedRuntimeState::Stopped | PublishedRuntimeState::Failed
+        ) {
+            self.pending_prepared_rejection = None;
+        }
         Ok(())
     }
 
-    fn retry_pending_running_publication(
-        &mut self,
-        generation: GenerationId,
-    ) -> Result<(), ControlError> {
-        let Some(state) = self.pending_publication else {
+    fn expire_capture_path_selection(&mut self, cause: &'static str) -> Result<(), ControlError> {
+        let Some(recovery) = self.ownership.capture_path_expiry_recovery() else {
             return Ok(());
         };
-        match state {
-            PublishedRuntimeState::Running {
-                generation: pending_generation,
-            } if pending_generation == generation => self.publish_runtime_state(
-                state,
-                "retry running state publication",
-                "retain the verified data path and retry publication",
-            ),
-            PublishedRuntimeState::Running {
-                generation: pending_generation,
-            } => Err(ControlError::runtime(
-                "retry running state publication",
-                io::Error::other(format!(
-                    "pending generation {pending_generation} does not match active generation {generation}"
-                )),
-                "retain the verified data path and reconcile the active generation",
-            )),
-            PublishedRuntimeState::Stopped | PublishedRuntimeState::Failed => {
-                Err(ControlError::runtime(
-                    "retry running state publication",
-                    io::Error::other("terminal state publication is pending for an active runtime"),
-                    "reconcile the active generation before retrying state publication",
-                ))
+        let refresh = match self.capture_path_refresh {
+            CapturePathRefreshState::Current => {
+                self.invalidate_latest_capture_path_decision();
+                CapturePathRefreshState::required(recovery)
             }
-        }
+            required @ CapturePathRefreshState::Required { .. } => required,
+        };
+        let stop_result = self.stop();
+        self.capture_path_refresh = refresh;
+        stop_result?;
+        Err(ControlError::runtime(
+            "expire Capture Path selection",
+            io::Error::other(cause),
+            "remain fail-open until fresh complete evidence qualifies a successor",
+        ))
     }
 
     fn retry_pending_terminal_publication(&mut self) -> Result<(), ControlError> {
@@ -2082,7 +2766,7 @@ where
         phase: RuntimePhase,
         capture: RuntimeCaptureState,
         engine: RuntimeEngineState,
-        generation: Option<GenerationId>,
+        generation: Option<RuntimeGenerationBinding>,
         last_error: Option<RuntimeFailure>,
     ) {
         self.publish_runtime_with_verification(
@@ -2101,7 +2785,7 @@ where
         capture: RuntimeCaptureState,
         engine: RuntimeEngineState,
         verification: RuntimeVerificationState,
-        generation: Option<GenerationId>,
+        generation: Option<RuntimeGenerationBinding>,
         last_error: Option<RuntimeFailure>,
     ) {
         self.runtime.publish(RuntimeSnapshot {
@@ -2110,7 +2794,8 @@ where
             capture,
             engine,
             verification: self.normalize_verification(verification),
-            generation,
+            active_generation: generation,
+            latest_capture_path_decision: self.writer.latest_capture_path_decision(),
             last_error,
         });
     }
@@ -2129,6 +2814,37 @@ where
             generation,
             Some(runtime_failure(error)),
         );
+    }
+
+    fn invalidate_latest_capture_path_decision(&mut self) {
+        if self.writer.latest_capture_path_decision().is_none()
+            && self
+                .runtime
+                .snapshot()
+                .latest_capture_path_decision
+                .is_none()
+        {
+            return;
+        }
+        self.writer.invalidate_latest_capture_path_decision();
+        let mut snapshot = self.runtime.snapshot().as_ref().clone();
+        snapshot.latest_capture_path_decision = None;
+        self.runtime.publish(snapshot);
+    }
+
+    fn invalidate_latest_selected_capture_path_decision(&mut self) {
+        let writer_selected = self
+            .writer
+            .latest_capture_path_decision()
+            .is_some_and(|decision| decision.selection().is_some());
+        let runtime_selected = self
+            .runtime
+            .snapshot()
+            .latest_capture_path_decision
+            .is_some_and(|decision| decision.selection().is_some());
+        if writer_selected || runtime_selected {
+            self.invalidate_latest_capture_path_decision();
+        }
     }
 }
 
@@ -2186,8 +2902,18 @@ where
             runtime_log(
                 LogSeverity::Error,
                 "runtime_coordinator",
-                self.ownership_summary().1,
+                self.ownership_summary().1.map(|binding| binding.generation),
                 format_args!("runtime maintenance failed: {error}"),
+            );
+            return;
+        }
+        if let Err(error) = self.maintain_capture_path_refresh() {
+            self.publish_runtime_error(&error);
+            runtime_log(
+                LogSeverity::Error,
+                "capture_path",
+                self.ownership_summary().1.map(|binding| binding.generation),
+                format_args!("Capture Path evidence refresh failed: {error}"),
             );
             return;
         }
@@ -2196,7 +2922,7 @@ where
             runtime_log(
                 LogSeverity::Error,
                 "runtime_coordinator",
-                self.ownership_summary().1,
+                self.ownership_summary().1.map(|binding| binding.generation),
                 format_args!("address-driven Generation reconciliation failed: {error}"),
             );
         }
@@ -2219,7 +2945,8 @@ where
                     | RuntimeOwnership::CaptureRepairPending { .. }
                     | RuntimeOwnership::DetachPending { .. }
                     | RuntimeOwnership::Retiring { .. }
-            ) || self.pending_publication.is_some();
+            ) || self.pending_publication.is_some()
+                || self.pending_prepared_rejection.is_some();
             if !cleanup_remains || attempt + 1 == MAX_SHUTDOWN_DRAIN_ATTEMPTS {
                 break;
             }
@@ -2230,7 +2957,7 @@ where
             runtime_log(
                 LogSeverity::Error,
                 "runtime_coordinator",
-                self.ownership_summary().1,
+                self.ownership_summary().1.map(|binding| binding.generation),
                 format_args!("runtime shutdown failed: {error}"),
             );
         }
@@ -2379,10 +3106,46 @@ where
     ControlError::runtime(operation, source, recovery)
 }
 
+fn expired_capture_path_evidence_error(operation: &'static str) -> ControlError {
+    ControlError::runtime(
+        operation,
+        io::Error::other("prepared Capture Path evidence expired before authorization"),
+        "keep the Generation cleanup-only and collect fresh behavioral qualification evidence",
+    )
+}
+
 #[derive(Debug)]
 struct FailedActivationCompensation<E> {
     activation: ControlError,
     compensation: E,
+}
+
+#[derive(Debug)]
+struct FailedPreparedRejection<E> {
+    initiating_failure: ControlError,
+    rejection: E,
+}
+
+impl<E> fmt::Display for FailedPreparedRejection<E>
+where
+    E: Error,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "initiating operation failed: {}; prepared candidate rejection failed: {}",
+            self.initiating_failure, self.rejection
+        )
+    }
+}
+
+impl<E> Error for FailedPreparedRejection<E>
+where
+    E: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.rejection)
+    }
 }
 
 impl<E> fmt::Display for FailedActivationCompensation<E>
@@ -2448,11 +3211,1218 @@ mod tests {
     };
     use crate::generation_engine_config::{
         TproxyEngineConfigRequest, compile_tproxy_engine_config,
+        qualified_xtables_capture_path_evidence, test_xtables_capture_path_decision,
+        test_xtables_capture_path_selection,
     };
     use crate::{EngineReport, OwnedEngineIdentity, RestartPolicy};
 
     const PACKAGED_DESIRED_STATE: &str = include_str!("../../../conf/flux.toml");
     const PACKAGED_ENGINE_TEMPLATE: &[u8] = include_bytes!("../../../conf/template.json");
+
+    #[derive(Clone)]
+    struct ReplayCapturePathEvidenceClock {
+        state: Arc<Mutex<ReplayCapturePathEvidenceClockState>>,
+    }
+
+    struct ReplayCapturePathEvidenceClockState {
+        now: Instant,
+        queued: VecDeque<Instant>,
+    }
+
+    impl ReplayCapturePathEvidenceClock {
+        fn new(now: Instant) -> Self {
+            Self {
+                state: Arc::new(Mutex::new(ReplayCapturePathEvidenceClockState {
+                    now,
+                    queued: VecDeque::new(),
+                })),
+            }
+        }
+
+        fn queue(&self, readings: impl IntoIterator<Item = Instant>) {
+            self.state
+                .lock()
+                .expect("Capture Path evidence clock lock")
+                .queued
+                .extend(readings);
+        }
+    }
+
+    impl CapturePathEvidenceClock for ReplayCapturePathEvidenceClock {
+        fn now(&self) -> Instant {
+            let mut state = self.state.lock().expect("Capture Path evidence clock lock");
+            if let Some(now) = state.queued.pop_front() {
+                state.now = now;
+            }
+            state.now
+        }
+    }
+
+    #[test]
+    fn runtime_snapshots_preserve_the_generation_capture_path_pair() {
+        let fixture = EngineFixture::new();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let writer = ScriptedWriter {
+            events: Arc::clone(&events),
+            prepared: VecDeque::from([fixture.spec]),
+            next_generation_id: 1,
+            capture_start_failure: false,
+            capture_stop_failures: 0,
+            verify_failure: false,
+        };
+        let engine = ScriptedEngine {
+            events,
+            reports: Arc::new(Mutex::new(VecDeque::new())),
+        };
+        let mut coordinator = RuntimeCoordinator::with_structural_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+        );
+
+        coordinator
+            .execute(&RuntimeIntent::Running {
+                reason: Reason::UserControl,
+            })
+            .expect("start Generation");
+        let running = coordinator.runtime_snapshot_source().snapshot();
+        assert_eq!(running.generation(), GenerationId::new(1));
+        assert_eq!(
+            running.active_capture_path_selection(),
+            Some(test_xtables_capture_path_selection())
+        );
+
+        coordinator
+            .execute(&RuntimeIntent::Stopped {
+                reason: Reason::UserControl,
+            })
+            .expect("stop Generation");
+        let stopped = coordinator.runtime_snapshot_source().snapshot();
+        assert_eq!(stopped.generation(), None);
+        assert_eq!(stopped.active_capture_path_selection(), None);
+    }
+
+    #[test]
+    fn expired_prepared_start_is_rejected_and_a_fresh_retry_succeeds() {
+        let first = EngineFixture::new();
+        let retry = EngineFixture::new();
+        let now = Instant::now();
+        let fresh_deadline = now
+            .checked_add(Duration::from_secs(60))
+            .expect("fresh test deadline");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let writer = CapturePathDecisionWriter::new(ScriptedWriter {
+            events: Arc::clone(&events),
+            prepared: VecDeque::from([first.spec, retry.spec]),
+            next_generation_id: 1,
+            capture_start_failure: false,
+            capture_stop_failures: 0,
+            verify_failure: false,
+        })
+        .with_deadlines([now, fresh_deadline]);
+        let engine = ScriptedEngine {
+            events: Arc::clone(&events),
+            reports: Arc::new(Mutex::new(VecDeque::new())),
+        };
+        let mut coordinator = RuntimeCoordinator::with_structural_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+        )
+        .with_capture_path_evidence_clock(ReplayCapturePathEvidenceClock::new(now));
+
+        coordinator
+            .execute(&RuntimeIntent::Running {
+                reason: Reason::UserControl,
+            })
+            .expect_err("deadline is exclusive at initial start");
+
+        assert_eq!(
+            *events.lock().expect("events lock"),
+            [
+                Event::Prepared(Reason::UserControl),
+                Event::PreparedRejected(generation(1)),
+            ]
+        );
+        assert!(coordinator.pending_prepared_rejection.is_none());
+        assert_eq!(coordinator.writer.invalidations, 1);
+        assert!(coordinator.capture_path_refresh.requires_fresh_evidence());
+
+        coordinator.capture_path_refresh = CapturePathRefreshState::Current;
+        events.lock().expect("events lock").clear();
+        coordinator
+            .execute(&RuntimeIntent::Running {
+                reason: Reason::DaemonRecovery,
+            })
+            .expect("fresh retry converges");
+
+        let snapshot = coordinator.runtime_snapshot_source().snapshot();
+        assert_eq!(snapshot.phase, RuntimePhase::Running);
+        assert_eq!(snapshot.generation(), GenerationId::new(2));
+    }
+
+    #[test]
+    fn expired_prepared_reload_preserves_the_predecessor_and_a_fresh_retry_succeeds() {
+        let active = EngineFixture::new();
+        let expired = EngineFixture::new();
+        let retry = EngineFixture::new();
+        let now = Instant::now();
+        let fresh_deadline = now
+            .checked_add(Duration::from_secs(60))
+            .expect("fresh test deadline");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let writer = CapturePathDecisionWriter::new(ScriptedWriter {
+            events: Arc::clone(&events),
+            prepared: VecDeque::from([active.spec, expired.spec, retry.spec]),
+            next_generation_id: 1,
+            capture_start_failure: false,
+            capture_stop_failures: 0,
+            verify_failure: false,
+        })
+        .with_deadlines([fresh_deadline, now, fresh_deadline]);
+        let engine = ScriptedEngine {
+            events: Arc::clone(&events),
+            reports: Arc::new(Mutex::new(VecDeque::new())),
+        };
+        let mut coordinator = RuntimeCoordinator::with_structural_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+        )
+        .with_capture_path_evidence_clock(ReplayCapturePathEvidenceClock::new(now));
+        coordinator
+            .execute(&RuntimeIntent::Running {
+                reason: Reason::Boot,
+            })
+            .expect("initial Generation converges");
+        events.lock().expect("events lock").clear();
+
+        coordinator
+            .execute(&RuntimeIntent::Reload {
+                reason: Reason::UserControl,
+            })
+            .expect_err("expired replacement is rejected before detachment");
+
+        assert_eq!(
+            *events.lock().expect("events lock"),
+            [
+                Event::Prepared(Reason::UserControl),
+                Event::PreparedRejected(generation(2)),
+            ]
+        );
+        assert!(coordinator.pending_prepared_rejection.is_none());
+        assert_eq!(coordinator.writer.invalidations, 1);
+        let active_snapshot = coordinator.runtime_snapshot_source().snapshot();
+        assert_eq!(active_snapshot.capture, RuntimeCaptureState::Published);
+        assert_eq!(active_snapshot.generation(), GenerationId::new(1));
+
+        events.lock().expect("events lock").clear();
+        coordinator
+            .execute(&RuntimeIntent::Reload {
+                reason: Reason::UserControl,
+            })
+            .expect("fresh replacement converges");
+
+        let snapshot = coordinator.runtime_snapshot_source().snapshot();
+        assert_eq!(snapshot.phase, RuntimePhase::Running);
+        assert_eq!(snapshot.generation(), GenerationId::new(3));
+    }
+
+    #[test]
+    fn evidence_expiring_at_capture_start_seam_never_mutates_capture() {
+        let fixture = EngineFixture::new();
+        let now = Instant::now();
+        let deadline = now
+            .checked_add(Duration::from_secs(60))
+            .expect("test deadline");
+        let clock = ReplayCapturePathEvidenceClock::new(now);
+        clock.queue([now, now, deadline]);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let writer = CapturePathDecisionWriter::new(ScriptedWriter {
+            events: Arc::clone(&events),
+            prepared: VecDeque::from([fixture.spec]),
+            next_generation_id: 1,
+            capture_start_failure: false,
+            capture_stop_failures: 0,
+            verify_failure: false,
+        })
+        .with_deadlines([deadline]);
+        let engine = ScriptedEngine {
+            events: Arc::clone(&events),
+            reports: Arc::new(Mutex::new(VecDeque::new())),
+        };
+        let mut coordinator = RuntimeCoordinator::with_structural_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+        )
+        .with_capture_path_evidence_clock(clock);
+
+        coordinator
+            .execute(&RuntimeIntent::Running {
+                reason: Reason::Boot,
+            })
+            .expect_err("capture authorization expires at the mutation seam");
+
+        let events = events.lock().expect("events lock");
+        assert!(!events.contains(&Event::CaptureStarted));
+        assert_eq!(
+            *events,
+            [
+                Event::Prepared(Reason::Boot),
+                Event::EngineRunning(CaptureObservation::Detached),
+                Event::EngineStopped(CaptureObservation::Detached),
+                Event::PreparedRejected(generation(1)),
+                Event::Published(PublishedRuntimeState::Failed),
+            ]
+        );
+    }
+
+    #[test]
+    fn evidence_expiring_before_running_commit_rejects_the_candidate() {
+        let fixture = EngineFixture::new();
+        let now = Instant::now();
+        let deadline = now
+            .checked_add(Duration::from_secs(60))
+            .expect("test deadline");
+        let clock = ReplayCapturePathEvidenceClock::new(now);
+        clock.queue([now, now, now, deadline]);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let writer = CapturePathDecisionWriter::new(ScriptedWriter {
+            events: Arc::clone(&events),
+            prepared: VecDeque::from([fixture.spec]),
+            next_generation_id: 1,
+            capture_start_failure: false,
+            capture_stop_failures: 0,
+            verify_failure: false,
+        })
+        .with_deadlines([deadline]);
+        let engine = ScriptedEngine {
+            events: Arc::clone(&events),
+            reports: Arc::new(Mutex::new(VecDeque::new())),
+        };
+        let mut coordinator = RuntimeCoordinator::with_structural_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+        )
+        .with_capture_path_evidence_clock(clock);
+
+        coordinator
+            .execute(&RuntimeIntent::Running {
+                reason: Reason::Boot,
+            })
+            .expect_err("final qualification expires before Running commit");
+
+        let events = events.lock().expect("events lock");
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            Event::Published(PublishedRuntimeState::Running { .. })
+        )));
+        assert!(events.contains(&Event::PreparedRejected(generation(1))));
+        assert!(events.contains(&Event::CaptureStopped));
+    }
+
+    #[test]
+    fn evidence_expiring_after_writer_running_commit_cleans_up_without_rollback() {
+        let fixture = EngineFixture::new();
+        let now = Instant::now();
+        let deadline = now
+            .checked_add(Duration::from_secs(60))
+            .expect("test deadline");
+        let clock = ReplayCapturePathEvidenceClock::new(now);
+        clock.queue([now, now, now, now, deadline]);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let writer = CapturePathDecisionWriter::new(ScriptedWriter {
+            events: Arc::clone(&events),
+            prepared: VecDeque::from([fixture.spec]),
+            next_generation_id: 1,
+            capture_start_failure: false,
+            capture_stop_failures: 0,
+            verify_failure: false,
+        })
+        .with_deadlines([deadline]);
+        let engine = ScriptedEngine {
+            events: Arc::clone(&events),
+            reports: Arc::new(Mutex::new(VecDeque::new())),
+        };
+        let mut coordinator = RuntimeCoordinator::with_structural_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+        )
+        .with_capture_path_evidence_clock(clock);
+
+        coordinator
+            .execute(&RuntimeIntent::Running {
+                reason: Reason::Boot,
+            })
+            .expect_err("evidence expires after persistent Running commit");
+
+        let events = events.lock().expect("events lock");
+        assert!(
+            events.contains(&Event::Published(PublishedRuntimeState::Running {
+                generation: generation(1),
+            }))
+        );
+        assert!(!events.contains(&Event::PreparedRejected(generation(1))));
+        assert_eq!(
+            events.last(),
+            Some(&Event::Published(PublishedRuntimeState::Stopped))
+        );
+        assert!(matches!(coordinator.ownership, RuntimeOwnership::Stopped));
+        assert!(coordinator.capture_path_refresh.requires_fresh_evidence());
+    }
+
+    #[test]
+    fn evidence_expiring_after_runtime_running_snapshot_is_immediately_removed() {
+        let fixture = EngineFixture::new();
+        let now = Instant::now();
+        let deadline = now
+            .checked_add(Duration::from_secs(60))
+            .expect("test deadline");
+        let clock = ReplayCapturePathEvidenceClock::new(now);
+        clock.queue([now, now, now, now, now, deadline]);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let writer = CapturePathDecisionWriter::new(ScriptedWriter {
+            events: Arc::clone(&events),
+            prepared: VecDeque::from([fixture.spec]),
+            next_generation_id: 1,
+            capture_start_failure: false,
+            capture_stop_failures: 0,
+            verify_failure: false,
+        })
+        .with_deadlines([deadline]);
+        let engine = ScriptedEngine {
+            events: Arc::clone(&events),
+            reports: Arc::new(Mutex::new(VecDeque::new())),
+        };
+        let mut coordinator = RuntimeCoordinator::with_structural_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+        )
+        .with_capture_path_evidence_clock(clock);
+        let runtime = coordinator.runtime_snapshot_source();
+
+        coordinator
+            .execute(&RuntimeIntent::Running {
+                reason: Reason::Boot,
+            })
+            .expect_err("evidence expires after internal Running publication");
+
+        let snapshot = runtime.snapshot();
+        assert_eq!(snapshot.revision, 8);
+        assert_eq!(snapshot.phase, RuntimePhase::Failed);
+        assert_eq!(snapshot.capture, RuntimeCaptureState::Detached);
+        assert_eq!(snapshot.generation(), None);
+        assert_eq!(snapshot.latest_capture_path_decision, None);
+        assert!(matches!(coordinator.ownership, RuntimeOwnership::Stopped));
+        assert!(
+            !events
+                .lock()
+                .expect("events lock")
+                .contains(&Event::PreparedRejected(generation(1)))
+        );
+    }
+
+    #[test]
+    fn active_evidence_expiring_during_reload_rejects_the_prepared_successor() {
+        let active = EngineFixture::new();
+        let successor = EngineFixture::new();
+        let now = Instant::now();
+        let deadline = now
+            .checked_add(Duration::from_secs(60))
+            .expect("test deadline");
+        let clock = ReplayCapturePathEvidenceClock::new(now);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let writer = CapturePathDecisionWriter::new(ScriptedWriter {
+            events: Arc::clone(&events),
+            prepared: VecDeque::from([active.spec, successor.spec]),
+            next_generation_id: 1,
+            capture_start_failure: false,
+            capture_stop_failures: 0,
+            verify_failure: false,
+        })
+        .with_deadlines([deadline, deadline]);
+        let engine = ScriptedEngine {
+            events: Arc::clone(&events),
+            reports: Arc::new(Mutex::new(VecDeque::new())),
+        };
+        let mut coordinator = RuntimeCoordinator::with_structural_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+        )
+        .with_capture_path_evidence_clock(clock.clone());
+        coordinator
+            .execute(&RuntimeIntent::Running {
+                reason: Reason::Boot,
+            })
+            .expect("initial Generation converges");
+        events.lock().expect("events lock").clear();
+        clock.queue([now, deadline]);
+
+        coordinator
+            .execute(&RuntimeIntent::Reload {
+                reason: Reason::UserControl,
+            })
+            .expect_err("active evidence expires after successor preparation");
+
+        assert_eq!(
+            *events.lock().expect("events lock"),
+            [
+                Event::Prepared(Reason::UserControl),
+                Event::CaptureStopped,
+                Event::EngineStopped(CaptureObservation::Detached),
+                Event::Published(PublishedRuntimeState::Stopped),
+                Event::PreparedRejected(generation(2)),
+            ]
+        );
+        assert!(coordinator.pending_prepared_rejection.is_none());
+        assert!(matches!(coordinator.ownership, RuntimeOwnership::Stopped));
+        assert_eq!(coordinator.writer.invalidations, 1);
+    }
+
+    #[test]
+    fn failed_expired_candidate_rejection_retains_both_failures_and_retries_first() {
+        let rejected = EngineFixture::new();
+        let retry = EngineFixture::new();
+        let now = Instant::now();
+        let fresh_deadline = now
+            .checked_add(Duration::from_secs(60))
+            .expect("fresh test deadline");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let writer = CapturePathDecisionWriter::new(ScriptedWriter {
+            events: Arc::clone(&events),
+            prepared: VecDeque::from([rejected.spec, retry.spec]),
+            next_generation_id: 1,
+            capture_start_failure: false,
+            capture_stop_failures: 0,
+            verify_failure: false,
+        })
+        .with_deadlines([now, fresh_deadline])
+        .with_rejection_failures(1);
+        let engine = ScriptedEngine {
+            events: Arc::clone(&events),
+            reports: Arc::new(Mutex::new(VecDeque::new())),
+        };
+        let mut coordinator = RuntimeCoordinator::with_structural_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+        )
+        .with_capture_path_evidence_clock(ReplayCapturePathEvidenceClock::new(now));
+
+        let error = coordinator
+            .execute(&RuntimeIntent::Running {
+                reason: Reason::UserControl,
+            })
+            .expect_err("expired candidate rejection fails once");
+        let message = error.to_string();
+        assert!(message.contains("prepared Capture Path evidence expired before authorization"));
+        assert!(message.contains("injected prepared candidate rejection failure"));
+        assert!(coordinator.pending_prepared_rejection.is_some());
+        assert_eq!(
+            *events.lock().expect("events lock"),
+            [Event::Prepared(Reason::UserControl)]
+        );
+
+        coordinator
+            .execute(&RuntimeIntent::Running {
+                reason: Reason::DaemonRecovery,
+            })
+            .expect_err("fresh evidence is still required after rejection retry");
+        assert!(coordinator.pending_prepared_rejection.is_none());
+        assert_eq!(
+            *events.lock().expect("events lock"),
+            [
+                Event::Prepared(Reason::UserControl),
+                Event::PreparedRejected(generation(1)),
+            ]
+        );
+
+        coordinator.capture_path_refresh = CapturePathRefreshState::Current;
+        coordinator
+            .execute(&RuntimeIntent::Running {
+                reason: Reason::DaemonRecovery,
+            })
+            .expect("fresh candidate converges after exact rejection retry");
+        assert_eq!(
+            coordinator
+                .runtime_snapshot_source()
+                .snapshot()
+                .generation(),
+            GenerationId::new(2)
+        );
+    }
+
+    #[test]
+    fn expired_capture_path_evidence_stops_fail_open_and_clears_the_decision() {
+        let fixture = EngineFixture::new();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let writer = CapturePathDecisionWriter::new(ScriptedWriter {
+            events: Arc::clone(&events),
+            prepared: VecDeque::from([fixture.spec]),
+            next_generation_id: 1,
+            capture_start_failure: false,
+            capture_stop_failures: 0,
+            verify_failure: false,
+        });
+        let engine = ScriptedEngine {
+            events: Arc::clone(&events),
+            reports: Arc::new(Mutex::new(VecDeque::new())),
+        };
+        let mut coordinator = RuntimeCoordinator::with_structural_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+        );
+        let runtime = coordinator.runtime_snapshot_source();
+        coordinator
+            .execute(&RuntimeIntent::Running {
+                reason: Reason::Boot,
+            })
+            .expect("initial runtime converges");
+        let RuntimeOwnership::Engine { generation, .. } = &mut coordinator.ownership else {
+            panic!("running runtime must own its Generation");
+        };
+        generation.capture_path_evidence_deadline = Instant::now();
+        events.lock().expect("events lock").clear();
+
+        coordinator.maintain();
+
+        assert_eq!(
+            *events.lock().expect("events lock"),
+            [
+                Event::CaptureStopped,
+                Event::EngineStopped(CaptureObservation::Detached),
+                Event::Published(PublishedRuntimeState::Stopped),
+            ]
+        );
+        assert_eq!(coordinator.writer.invalidations, 1);
+        assert!(matches!(
+            coordinator.capture_path_refresh,
+            CapturePathRefreshState::Required {
+                recovery: CapturePathRecoveryIntent::AutomaticRestart,
+                ..
+            }
+        ));
+        let snapshot = runtime.snapshot();
+        assert_eq!(snapshot.phase, RuntimePhase::Failed);
+        assert_eq!(snapshot.capture, RuntimeCaptureState::Detached);
+        assert_eq!(snapshot.generation(), None);
+        assert_eq!(snapshot.active_capture_path_selection(), None);
+        assert_eq!(snapshot.latest_capture_path_decision, None);
+
+        events.lock().expect("events lock").clear();
+        coordinator.maintain();
+        assert!(events.lock().expect("events lock").is_empty());
+        assert_eq!(coordinator.writer.invalidations, 1);
+    }
+
+    #[test]
+    fn expired_selection_retains_only_the_active_binding_until_detachment_is_proven() {
+        let fixture = EngineFixture::new();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let writer = CapturePathDecisionWriter::new(ScriptedWriter {
+            events: Arc::clone(&events),
+            prepared: VecDeque::from([fixture.spec]),
+            next_generation_id: 1,
+            capture_start_failure: false,
+            capture_stop_failures: 1,
+            verify_failure: false,
+        });
+        let engine = ScriptedEngine {
+            events,
+            reports: Arc::new(Mutex::new(VecDeque::new())),
+        };
+        let mut coordinator = RuntimeCoordinator::with_structural_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+        );
+        let runtime = coordinator.runtime_snapshot_source();
+        coordinator
+            .execute(&RuntimeIntent::Running {
+                reason: Reason::Boot,
+            })
+            .expect("initial runtime converges");
+        let RuntimeOwnership::Engine { generation, .. } = &mut coordinator.ownership else {
+            panic!("running runtime must own its Generation");
+        };
+        generation.capture_path_evidence_deadline = Instant::now();
+
+        coordinator.maintain();
+
+        assert!(matches!(
+            coordinator.ownership,
+            RuntimeOwnership::DetachPending { .. }
+        ));
+        let pending = runtime.snapshot();
+        assert_eq!(pending.phase, RuntimePhase::Degraded);
+        assert_eq!(pending.capture, RuntimeCaptureState::Published);
+        assert_eq!(pending.generation(), GenerationId::new(1));
+        assert_eq!(
+            pending.active_capture_path_selection(),
+            Some(test_xtables_capture_path_selection())
+        );
+        assert_eq!(pending.latest_capture_path_decision, None);
+        assert!(coordinator.capture_path_refresh.requires_fresh_evidence());
+
+        coordinator.maintain();
+
+        assert!(matches!(coordinator.ownership, RuntimeOwnership::Stopped));
+        let stopped = runtime.snapshot();
+        assert_eq!(stopped.generation(), None);
+        assert_eq!(stopped.active_capture_path_selection(), None);
+        assert_eq!(stopped.latest_capture_path_decision, None);
+    }
+
+    #[test]
+    fn expired_selection_cannot_be_restored_from_capture_repair() {
+        let fixture = EngineFixture::new();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let writer = CapturePathDecisionWriter::new(ScriptedWriter {
+            events: Arc::clone(&events),
+            prepared: VecDeque::from([fixture.spec]),
+            next_generation_id: 1,
+            capture_start_failure: false,
+            capture_stop_failures: 0,
+            verify_failure: false,
+        });
+        let engine = ScriptedEngine {
+            events: Arc::clone(&events),
+            reports: Arc::new(Mutex::new(VecDeque::new())),
+        };
+        let mut coordinator = RuntimeCoordinator::with_structural_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+        );
+        let runtime = coordinator.runtime_snapshot_source();
+        coordinator
+            .execute(&RuntimeIntent::Running {
+                reason: Reason::Boot,
+            })
+            .expect("initial runtime converges");
+        let RuntimeOwnership::Engine { mut generation, .. } =
+            std::mem::replace(&mut coordinator.ownership, RuntimeOwnership::Stopped)
+        else {
+            panic!("running runtime must own its Generation");
+        };
+        generation.capture_path_evidence_deadline = Instant::now();
+        coordinator.ownership = RuntimeOwnership::CaptureRepairPending { generation };
+        events.lock().expect("events lock").clear();
+
+        coordinator.maintain();
+
+        assert_eq!(
+            *events.lock().expect("events lock"),
+            [
+                Event::CaptureStopped,
+                Event::EngineStopped(CaptureObservation::Detached),
+                Event::Published(PublishedRuntimeState::Stopped),
+            ]
+        );
+        assert_eq!(coordinator.writer.invalidations, 1);
+        assert!(coordinator.capture_path_refresh.requires_fresh_evidence());
+        assert!(matches!(coordinator.ownership, RuntimeOwnership::Stopped));
+        let snapshot = runtime.snapshot();
+        assert_eq!(snapshot.capture, RuntimeCaptureState::Detached);
+        assert_eq!(snapshot.generation(), None);
+        assert_eq!(snapshot.latest_capture_path_decision, None);
+    }
+
+    #[test]
+    fn expired_selection_blocks_reload_and_stop_start_until_fresh_evidence_arrives() {
+        let first = EngineFixture::new();
+        let second = EngineFixture::new();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let writer = CapturePathDecisionWriter::new(ScriptedWriter {
+            events: Arc::clone(&events),
+            prepared: VecDeque::from([first.spec, second.spec]),
+            next_generation_id: 1,
+            capture_start_failure: false,
+            capture_stop_failures: 0,
+            verify_failure: false,
+        });
+        let engine = ScriptedEngine {
+            events: Arc::clone(&events),
+            reports: Arc::new(Mutex::new(VecDeque::new())),
+        };
+        let mut coordinator = RuntimeCoordinator::with_structural_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+        );
+        coordinator
+            .execute(&RuntimeIntent::Running {
+                reason: Reason::Boot,
+            })
+            .expect("initial runtime converges");
+        let RuntimeOwnership::Engine { generation, .. } = &mut coordinator.ownership else {
+            panic!("running runtime must own its Generation");
+        };
+        generation.capture_path_evidence_deadline = Instant::now();
+        coordinator.maintain();
+        events.lock().expect("events lock").clear();
+
+        assert!(
+            coordinator
+                .execute(&RuntimeIntent::Reload {
+                    reason: Reason::UserControl,
+                })
+                .is_err(),
+            "Reload must not prepare from pre-refresh evidence"
+        );
+        assert!(events.lock().expect("events lock").is_empty());
+
+        coordinator
+            .execute(&RuntimeIntent::Stopped {
+                reason: Reason::UserControl,
+            })
+            .expect("manual Stop remains idempotent while freshness is required");
+        events.lock().expect("events lock").clear();
+        assert!(
+            coordinator
+                .execute(&RuntimeIntent::Running {
+                    reason: Reason::UserControl,
+                })
+                .is_err(),
+            "Stop followed by Start must not restore stale authority"
+        );
+        assert!(events.lock().expect("events lock").is_empty());
+    }
+
+    #[test]
+    fn expired_explicit_stop_detach_pending_invalidates_once_and_remains_stopped() {
+        let fixture = EngineFixture::new();
+        let now = Instant::now();
+        let deadline = now
+            .checked_add(Duration::from_secs(60))
+            .expect("test deadline");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let writer = CapturePathDecisionWriter::new(ScriptedWriter {
+            events: Arc::clone(&events),
+            prepared: VecDeque::from([fixture.spec]),
+            next_generation_id: 1,
+            capture_start_failure: false,
+            capture_stop_failures: 1,
+            verify_failure: false,
+        })
+        .with_deadlines([deadline]);
+        let engine = ScriptedEngine {
+            events: Arc::clone(&events),
+            reports: Arc::new(Mutex::new(VecDeque::new())),
+        };
+        let mut coordinator = RuntimeCoordinator::with_structural_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+        )
+        .with_capture_path_evidence_clock(ReplayCapturePathEvidenceClock::new(now));
+        coordinator
+            .execute(&RuntimeIntent::Running {
+                reason: Reason::Boot,
+            })
+            .expect("initial Generation converges");
+        coordinator
+            .execute(&RuntimeIntent::Stopped {
+                reason: Reason::UserControl,
+            })
+            .expect_err("first explicit detachment remains uncertain");
+        let RuntimeOwnership::DetachPending { generation, .. } = &mut coordinator.ownership else {
+            panic!("failed explicit Stop must retain detachment ownership");
+        };
+        generation.capture_path_evidence_deadline = now;
+        events.lock().expect("events lock").clear();
+
+        coordinator
+            .maintain_runtime()
+            .expect_err("expired uncertain detachment is reported after cleanup");
+
+        assert_eq!(
+            *events.lock().expect("events lock"),
+            [
+                Event::CaptureStopped,
+                Event::EngineStopped(CaptureObservation::Detached),
+                Event::Published(PublishedRuntimeState::Stopped),
+            ]
+        );
+        assert_eq!(coordinator.writer.invalidations, 1);
+        assert!(matches!(
+            coordinator.capture_path_refresh,
+            CapturePathRefreshState::Required {
+                recovery: CapturePathRecoveryIntent::RemainStopped,
+                ..
+            }
+        ));
+        assert!(matches!(coordinator.ownership, RuntimeOwnership::Stopped));
+
+        events.lock().expect("events lock").clear();
+        coordinator
+            .maintain_runtime()
+            .expect("repeated cleanup remains settled");
+        assert!(events.lock().expect("events lock").is_empty());
+        assert_eq!(coordinator.writer.invalidations, 1);
+    }
+
+    #[test]
+    fn expired_rollback_is_cleanup_only_and_never_restarts_capture() {
+        let active = EngineFixture::new();
+        let candidate = EngineFixture::new();
+        let now = Instant::now();
+        let deadline = now
+            .checked_add(Duration::from_secs(60))
+            .expect("test deadline");
+        let clock = ReplayCapturePathEvidenceClock::new(now);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let reports = Arc::new(Mutex::new(VecDeque::new()));
+        let writer = CapturePathDecisionWriter::new(ScriptedWriter {
+            events: Arc::clone(&events),
+            prepared: VecDeque::from([active.spec, candidate.spec]),
+            next_generation_id: 1,
+            capture_start_failure: false,
+            capture_stop_failures: 0,
+            verify_failure: false,
+        })
+        .with_deadlines([deadline, deadline]);
+        let engine = ScriptedEngine {
+            events: Arc::clone(&events),
+            reports: Arc::clone(&reports),
+        };
+        let mut coordinator = RuntimeCoordinator::with_structural_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+        )
+        .with_capture_path_evidence_clock(clock.clone());
+        coordinator
+            .execute(&RuntimeIntent::Running {
+                reason: Reason::Boot,
+            })
+            .expect("initial Generation converges");
+        events.lock().expect("events lock").clear();
+        reports.lock().expect("reports lock").extend([
+            EngineReport::Failed { revision: 2 },
+            EngineReport::Stopped { revision: 3 },
+        ]);
+        clock.queue([now, now, now, now, deadline]);
+
+        coordinator
+            .execute(&RuntimeIntent::Reload {
+                reason: Reason::UserControl,
+            })
+            .expect_err("expired rollback cannot reactivate");
+
+        let events = events.lock().expect("events lock");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, Event::EngineRunning(_)))
+                .count(),
+            1,
+            "only the failed candidate reaches engine activation"
+        );
+        assert!(!events.contains(&Event::CaptureStarted));
+        assert!(events.contains(&Event::PreparedRejected(generation(2))));
+        assert_eq!(
+            events.last(),
+            Some(&Event::Published(PublishedRuntimeState::Stopped))
+        );
+        assert!(matches!(coordinator.ownership, RuntimeOwnership::Stopped));
+        assert!(coordinator.capture_path_refresh.requires_fresh_evidence());
+        assert_eq!(coordinator.writer.invalidations, 1);
+    }
+
+    #[test]
+    fn user_stop_cancels_automatic_recovery_without_clearing_the_freshness_barrier() {
+        let fixture = EngineFixture::new();
+        let (_directory, desired_state_path) = desired_state_fixture();
+        let (source, mut reconciler) = AddressReconciler::replay(desired_state_path);
+        let mut tracker = NetworkInventoryTracker::new();
+        let initial = Arc::new(
+            tracker
+                .publish_complete([], [])
+                .expect("publish initial complete inventory")
+                .clone(),
+        );
+        source.publish(Some(initial));
+        assert!(matches!(
+            reconciler.reconcile(),
+            Ok(AddressReconciliationOutcome::Reconciled(_))
+        ));
+        assert_eq!(
+            reconciler
+                .request_fresh_snapshot()
+                .expect("request a freshness transaction"),
+            NetworkInventoryRefreshDisposition::Requested
+        );
+        let refreshed = Arc::new(
+            tracker
+                .publish_complete([], [])
+                .expect("publish fresh complete inventory")
+                .clone(),
+        );
+        source.publish(Some(refreshed));
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let writer = CapturePathDecisionWriter::new(ScriptedWriter {
+            events: Arc::clone(&events),
+            prepared: VecDeque::from([fixture.spec]),
+            next_generation_id: 1,
+            capture_start_failure: false,
+            capture_stop_failures: 0,
+            verify_failure: false,
+        });
+        let engine = ScriptedEngine {
+            events: Arc::clone(&events),
+            reports: Arc::new(Mutex::new(VecDeque::new())),
+        };
+        let mut coordinator = RuntimeCoordinator::with_structural_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+        )
+        .with_address_reconciler(reconciler);
+        coordinator.capture_path_refresh = CapturePathRefreshState::require_automatic_recovery();
+        coordinator.capture_path_refresh.accept_request();
+
+        coordinator
+            .execute(&RuntimeIntent::Stopped {
+                reason: Reason::UserControl,
+            })
+            .expect("user Stop remains idempotent while evidence is refreshing");
+        assert!(matches!(
+            coordinator.capture_path_refresh,
+            CapturePathRefreshState::Required {
+                request: CapturePathRefreshRequestState::Accepted,
+                recovery: CapturePathRecoveryIntent::RemainStopped,
+            }
+        ));
+        events.lock().expect("events lock").clear();
+
+        assert!(
+            coordinator
+                .execute(&RuntimeIntent::Running {
+                    reason: Reason::UserControl,
+                })
+                .is_err()
+        );
+        assert!(
+            coordinator
+                .execute(&RuntimeIntent::Reload {
+                    reason: Reason::UserControl,
+                })
+                .is_err()
+        );
+        assert!(events.lock().expect("events lock").is_empty());
+
+        coordinator.maintain();
+
+        assert_eq!(
+            coordinator.capture_path_refresh,
+            CapturePathRefreshState::Current
+        );
+        assert!(matches!(coordinator.ownership, RuntimeOwnership::Stopped));
+        assert!(events.lock().expect("events lock").is_empty());
+
+        coordinator
+            .execute(&RuntimeIntent::Running {
+                reason: Reason::UserControl,
+            })
+            .expect("fresh evidence permits a later explicit Start");
+        assert!(
+            events
+                .lock()
+                .expect("events lock")
+                .contains(&Event::Prepared(Reason::UserControl))
+        );
+    }
+
+    #[test]
+    fn inventory_loss_expires_the_path_and_fresh_inventory_attempts_recovery_once() {
+        let first = EngineFixture::new();
+        let second = EngineFixture::new();
+        let (_directory, desired_state_path) = desired_state_fixture();
+        let (source, reconciler) = AddressReconciler::replay(desired_state_path);
+        let mut tracker = NetworkInventoryTracker::new();
+        let inventory = Arc::new(
+            tracker
+                .publish_complete([], [])
+                .expect("publish initial complete inventory")
+                .clone(),
+        );
+        source.publish(Some(Arc::clone(&inventory)));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let writer = CapturePathDecisionWriter::new(ScriptedWriter {
+            events: Arc::clone(&events),
+            prepared: VecDeque::from([first.spec, second.spec]),
+            next_generation_id: 1,
+            capture_start_failure: false,
+            capture_stop_failures: 0,
+            verify_failure: false,
+        });
+        let engine = ScriptedEngine {
+            events: Arc::clone(&events),
+            reports: Arc::new(Mutex::new(VecDeque::new())),
+        };
+        let mut coordinator = RuntimeCoordinator::with_structural_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+        )
+        .with_address_reconciler(reconciler);
+        let runtime = coordinator.runtime_snapshot_source();
+        coordinator.maintain();
+        coordinator
+            .execute(&RuntimeIntent::Running {
+                reason: Reason::Boot,
+            })
+            .expect("initial runtime converges");
+        events.lock().expect("events lock").clear();
+
+        source.publish(None);
+        coordinator.maintain();
+
+        assert!(coordinator.capture_path_refresh.requires_fresh_evidence());
+        assert_eq!(coordinator.writer.invalidations, 1);
+        assert_eq!(runtime.snapshot().latest_capture_path_decision, None);
+        assert_eq!(runtime.snapshot().generation(), None);
+        assert_eq!(source.refresh_requests(), 0);
+
+        source.set_refresh_disposition(NetworkInventoryRefreshDisposition::Unavailable);
+        coordinator.maintain();
+        assert_eq!(source.refresh_requests(), 1);
+        assert!(coordinator.capture_path_refresh.request_pending());
+        source.set_refresh_disposition(NetworkInventoryRefreshDisposition::Requested);
+        coordinator.maintain();
+        assert_eq!(
+            source.refresh_requests(),
+            2,
+            "an unavailable refresh request must remain pending for retry"
+        );
+        assert!(
+            coordinator
+                .execute(&RuntimeIntent::Running {
+                    reason: Reason::UserControl,
+                })
+                .is_err(),
+            "manual start must not reuse pre-refresh evidence"
+        );
+        assert!(
+            coordinator
+                .execute(&RuntimeIntent::Reload {
+                    reason: Reason::UserControl,
+                })
+                .is_err(),
+            "manual Reload must not reuse pre-refresh evidence"
+        );
+
+        source.publish(Some(inventory));
+        coordinator.maintain();
+        assert!(coordinator.capture_path_refresh.requires_fresh_evidence());
+        assert_eq!(runtime.snapshot().generation(), None);
+
+        let refreshed_inventory = Arc::new(
+            tracker
+                .publish_complete([], [])
+                .expect("publish refreshed complete inventory")
+                .clone(),
+        );
+        source.publish(Some(refreshed_inventory));
+        coordinator.maintain();
+
+        assert_eq!(
+            coordinator.capture_path_refresh,
+            CapturePathRefreshState::Current
+        );
+        assert_eq!(
+            runtime.snapshot().latest_capture_path_decision,
+            Some(test_xtables_capture_path_decision())
+        );
+        assert_eq!(runtime.snapshot().generation(), GenerationId::new(2));
+        coordinator.maintain();
+        assert_eq!(
+            events
+                .lock()
+                .expect("events lock")
+                .iter()
+                .filter(|event| **event == Event::Prepared(Reason::DaemonRecovery))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn normal_stop_invalidates_latest_selection_while_retaining_detachment_ownership() {
+        let fixture = EngineFixture::new();
+        let (_directory, desired_state_path) = desired_state_fixture();
+        let (source, reconciler) = AddressReconciler::replay(desired_state_path);
+        let mut tracker = NetworkInventoryTracker::new();
+        source.publish(Some(Arc::new(
+            tracker
+                .publish_complete([], [])
+                .expect("publish initial complete inventory")
+                .clone(),
+        )));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let writer = CapturePathDecisionWriter::new(ScriptedWriter {
+            events: Arc::clone(&events),
+            prepared: VecDeque::from([fixture.spec]),
+            next_generation_id: 1,
+            capture_start_failure: false,
+            capture_stop_failures: 1,
+            verify_failure: false,
+        });
+        let engine = ScriptedEngine {
+            events,
+            reports: Arc::new(Mutex::new(VecDeque::new())),
+        };
+        let mut coordinator = RuntimeCoordinator::with_structural_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+        )
+        .with_address_reconciler(reconciler);
+        let runtime = coordinator.runtime_snapshot_source();
+        coordinator.maintain();
+        coordinator
+            .execute(&RuntimeIntent::Running {
+                reason: Reason::Boot,
+            })
+            .expect("initial runtime converges");
+        coordinator
+            .execute(&RuntimeIntent::Stopped {
+                reason: Reason::UserControl,
+            })
+            .expect_err("uncertain detachment keeps exact Generation ownership");
+        let pending = runtime.snapshot();
+        assert!(matches!(
+            coordinator.ownership,
+            RuntimeOwnership::DetachPending { .. }
+        ));
+        assert_eq!(
+            pending.active_capture_path_selection(),
+            Some(test_xtables_capture_path_selection())
+        );
+        assert_eq!(pending.latest_capture_path_decision, None);
+        assert_eq!(coordinator.writer.invalidations, 1);
+
+        coordinator.maintain();
+
+        assert!(matches!(coordinator.ownership, RuntimeOwnership::Stopped));
+        assert_eq!(runtime.snapshot().active_capture_path_selection(), None);
+        assert_eq!(runtime.snapshot().latest_capture_path_decision, None);
+
+        source.publish(None);
+        coordinator.maintain();
+
+        assert!(matches!(coordinator.ownership, RuntimeOwnership::Stopped));
+        assert_eq!(coordinator.writer.invalidations, 1);
+        assert_eq!(runtime.snapshot().latest_capture_path_decision, None);
+    }
 
     #[test]
     fn maintenance_reconciles_inventory_without_invoking_writer_managed_resync() {
@@ -2516,15 +4486,24 @@ mod tests {
         );
 
         let fixture = EngineFixture::new();
+        let capture_path_selection = test_xtables_capture_path_selection();
         coordinator.ownership = RuntimeOwnership::Engine {
-            generation: Box::new(PreparedGeneration::new(generation(1), fixture.spec.clone())),
+            generation: Box::new(PreparedGeneration::new(
+                generation(1),
+                fixture.spec.clone(),
+                capture_path_selection,
+                qualified_xtables_capture_path_evidence().valid_until(),
+            )),
             capture: CaptureObservation::Published,
         };
         coordinator.publish_runtime(
             RuntimePhase::Running,
             RuntimeCaptureState::Published,
             RuntimeEngineState::Ready,
-            Some(generation(1)),
+            Some(RuntimeGenerationBinding {
+                generation: generation(1),
+                capture_path_selection,
+            }),
             None,
         );
         events.lock().expect("events lock").clear();
@@ -2696,15 +4675,24 @@ mod tests {
             engine,
             Duration::from_millis(100),
         );
+        let capture_path_selection = test_xtables_capture_path_selection();
         coordinator.ownership = RuntimeOwnership::Engine {
-            generation: Box::new(PreparedGeneration::new(generation(1), active.spec.clone())),
+            generation: Box::new(PreparedGeneration::new(
+                generation(1),
+                active.spec.clone(),
+                capture_path_selection,
+                qualified_xtables_capture_path_evidence().valid_until(),
+            )),
             capture: CaptureObservation::Published,
         };
         coordinator.publish_runtime(
             RuntimePhase::Running,
             RuntimeCaptureState::Published,
             RuntimeEngineState::Ready,
-            Some(generation(1)),
+            Some(RuntimeGenerationBinding {
+                generation: generation(1),
+                capture_path_selection,
+            }),
             None,
         );
         let source = validated_subscription_config([44; 32], 9);
@@ -2899,7 +4887,7 @@ mod tests {
             snapshot.verification,
             RuntimeVerificationState::StructuralOnly
         );
-        assert_eq!(snapshot.generation, Some(generation(1)));
+        assert_eq!(snapshot.generation(), Some(generation(1)));
         assert_eq!(snapshot.last_error, None);
     }
 
@@ -3022,7 +5010,7 @@ mod tests {
             .expect_err("candidate preparation fails before active binding changes");
 
         let snapshot = runtime.snapshot();
-        assert_eq!(snapshot.generation, Some(generation(17)));
+        assert_eq!(snapshot.generation(), Some(generation(17)));
         assert_eq!(
             snapshot.verification,
             RuntimeVerificationState::FunctionalPassed
@@ -3075,7 +5063,7 @@ mod tests {
             .expect_err("uncertain capture detachment blocks replacement");
 
         let snapshot = runtime.snapshot();
-        assert_eq!(snapshot.generation, Some(generation(17)));
+        assert_eq!(snapshot.generation(), Some(generation(17)));
         assert_eq!(
             snapshot.verification,
             RuntimeVerificationState::FunctionalPending
@@ -3322,6 +5310,7 @@ mod tests {
                 Event::CanaryReobserved(generation(17)),
                 Event::CaptureStopped,
                 Event::EngineStopped(CaptureObservation::Detached),
+                Event::PreparedRejected(generation(17)),
                 Event::Published(PublishedRuntimeState::Failed),
             ]
         );
@@ -3388,6 +5377,7 @@ mod tests {
                 Event::CanaryReobserved(generation(17)),
                 Event::CaptureStopped,
                 Event::EngineStopped(CaptureObservation::Detached),
+                Event::PreparedRejected(generation(17)),
                 Event::Published(PublishedRuntimeState::Failed),
             ]
         );
@@ -3457,6 +5447,7 @@ mod tests {
                 Event::CanaryReobserved(generation(17)),
                 Event::CaptureStopped,
                 Event::EngineStopped(CaptureObservation::Detached),
+                Event::PreparedRejected(generation(17)),
                 Event::Published(PublishedRuntimeState::Failed),
             ]
         );
@@ -3525,6 +5516,7 @@ mod tests {
                 Event::CanaryReobserved(generation(17)),
                 Event::CaptureStopped,
                 Event::EngineStopped(CaptureObservation::Detached),
+                Event::PreparedRejected(generation(17)),
                 Event::Published(PublishedRuntimeState::Failed),
             ]
         );
@@ -4060,6 +6052,7 @@ mod tests {
             *events.lock().expect("events lock"),
             [
                 Event::EngineStopped(CaptureObservation::Detached),
+                Event::PreparedRejected(generation(18)),
                 Event::EngineRunning(CaptureObservation::Detached),
                 Event::CaptureStarted,
                 Event::CaptureVerified,
@@ -4315,7 +6308,7 @@ mod tests {
         let degraded = runtime.snapshot();
         assert_eq!(degraded.phase, RuntimePhase::Degraded);
         assert_eq!(degraded.capture, RuntimeCaptureState::Published);
-        assert_eq!(degraded.generation, Some(generation(2)));
+        assert_eq!(degraded.generation(), Some(generation(2)));
     }
 
     #[test]
@@ -4619,6 +6612,7 @@ mod tests {
                 Event::CaptureVerified,
                 Event::CaptureStopped,
                 Event::EngineStopped(CaptureObservation::Detached),
+                Event::PreparedRejected(generation(1)),
                 Event::Published(PublishedRuntimeState::Failed),
             ]
         );
@@ -4660,6 +6654,7 @@ mod tests {
             [
                 Event::CaptureStopped,
                 Event::EngineStopped(CaptureObservation::Detached),
+                Event::PreparedRejected(generation(1)),
                 Event::Published(PublishedRuntimeState::Failed),
             ]
         );
@@ -4701,6 +6696,7 @@ mod tests {
                 Event::CaptureStarted,
                 Event::CaptureStopped,
                 Event::EngineStopped(CaptureObservation::Detached),
+                Event::PreparedRejected(generation(1)),
                 Event::Published(PublishedRuntimeState::Failed),
             ]
         );
@@ -4757,7 +6753,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_reload_restores_the_previous_generation_before_returning() {
+    fn failed_reload_settles_candidate_then_fresh_rollback_restores_previous_generation() {
         let active = EngineFixture::new();
         let candidate = EngineFixture::new();
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -4787,8 +6783,9 @@ mod tests {
         events.lock().expect("events lock").clear();
         reports.lock().expect("reports lock").extend([
             EngineReport::Failed { revision: 2 },
+            EngineReport::Stopped { revision: 3 },
             EngineReport::Started {
-                revision: 3,
+                revision: 4,
                 owned_resource_readiness: ReadinessEvidence::Listener {
                     port: NonZeroU16::new(1536).expect("nonzero port"),
                     table: PathBuf::from("/proc/1/net/tcp"),
@@ -4808,6 +6805,8 @@ mod tests {
                 Event::Prepared(Reason::UserControl),
                 Event::CaptureStopped,
                 Event::EngineRunning(CaptureObservation::Detached),
+                Event::EngineStopped(CaptureObservation::Detached),
+                Event::PreparedRejected(generation(2)),
                 Event::EngineRunning(CaptureObservation::Detached),
                 Event::CaptureStarted,
                 Event::CaptureVerified,
@@ -4850,8 +6849,9 @@ mod tests {
         events.lock().expect("events lock").clear();
         reports.lock().expect("reports lock").extend([
             EngineReport::Failed { revision: 2 },
-            EngineReport::Failed { revision: 3 },
-            EngineReport::Stopped { revision: 4 },
+            EngineReport::Stopped { revision: 3 },
+            EngineReport::Failed { revision: 4 },
+            EngineReport::Stopped { revision: 5 },
         ]);
 
         coordinator
@@ -4866,6 +6866,8 @@ mod tests {
                 Event::Prepared(Reason::UserControl),
                 Event::CaptureStopped,
                 Event::EngineRunning(CaptureObservation::Detached),
+                Event::EngineStopped(CaptureObservation::Detached),
+                Event::PreparedRejected(generation(2)),
                 Event::EngineRunning(CaptureObservation::Detached),
                 Event::EngineStopped(CaptureObservation::Detached),
                 Event::Published(PublishedRuntimeState::Failed),
@@ -4917,6 +6919,7 @@ mod tests {
             [
                 Event::Prepared(Reason::UserControl),
                 Event::CaptureStopped,
+                Event::PreparedRejected(generation(2)),
                 Event::CaptureStopped,
                 Event::EngineRunning(CaptureObservation::Detached),
                 Event::CaptureStarted,
@@ -4986,6 +6989,7 @@ mod tests {
             [
                 Event::CaptureStopped,
                 Event::EngineStopped(CaptureObservation::Detached),
+                Event::PreparedRejected(generation(2)),
                 Event::EngineRunning(CaptureObservation::Detached),
                 Event::CaptureStarted,
                 Event::CaptureVerified,
@@ -5067,6 +7071,7 @@ mod tests {
             *events.lock().expect("events lock"),
             [
                 Event::EngineStopped(CaptureObservation::Detached),
+                Event::PreparedRejected(generation(2)),
                 Event::EngineRunning(CaptureObservation::Detached),
                 Event::CaptureStarted,
                 Event::CaptureVerified,
@@ -5140,6 +7145,7 @@ mod tests {
         AddressSuccessorPrepared,
         SubscriptionPrepared,
         SubscriptionDeferred,
+        PreparedRejected(GenerationId),
         Published(PublishedRuntimeState),
     }
 
@@ -5180,6 +7186,36 @@ mod tests {
         capture_start_failure: bool,
         capture_stop_failures: usize,
         verify_failure: bool,
+    }
+
+    struct CapturePathDecisionWriter {
+        inner: ScriptedWriter,
+        decision: Option<CapturePathDecision>,
+        invalidations: usize,
+        deadlines: VecDeque<Instant>,
+        rejection_failures: usize,
+    }
+
+    impl CapturePathDecisionWriter {
+        fn new(inner: ScriptedWriter) -> Self {
+            Self {
+                inner,
+                decision: None,
+                invalidations: 0,
+                deadlines: VecDeque::new(),
+                rejection_failures: 0,
+            }
+        }
+
+        fn with_deadlines(mut self, deadlines: impl IntoIterator<Item = Instant>) -> Self {
+            self.deadlines = deadlines.into_iter().collect();
+            self
+        }
+
+        fn with_rejection_failures(mut self, failures: usize) -> Self {
+            self.rejection_failures = failures;
+            self
+        }
     }
 
     struct PublicationFailingWriter {
@@ -5248,6 +7284,12 @@ mod tests {
             true
         }
 
+        fn reject_prepared(&mut self, generation: &PreparedGeneration) -> Result<(), Self::Error> {
+            self.inner.reject_prepared(generation)?;
+            self.pending = None;
+            Ok(())
+        }
+
         fn capture_start(&mut self, generation: &PreparedGeneration) -> Result<(), Self::Error> {
             self.inner.capture_start(generation)?;
             self.capture_start_calls += 1;
@@ -5295,6 +7337,10 @@ mod tests {
             self.inner.prepare(reason)
         }
 
+        fn reject_prepared(&mut self, generation: &PreparedGeneration) -> Result<(), Self::Error> {
+            self.inner.reject_prepared(generation)
+        }
+
         fn capture_start(&mut self, generation: &PreparedGeneration) -> Result<(), Self::Error> {
             self.inner.capture_start(generation)?;
             self.capture_start_calls += 1;
@@ -5339,6 +7385,10 @@ mod tests {
             self.inner.prepare(reason)
         }
 
+        fn reject_prepared(&mut self, generation: &PreparedGeneration) -> Result<(), Self::Error> {
+            self.inner.reject_prepared(generation)
+        }
+
         fn capture_start(&mut self, generation: &PreparedGeneration) -> Result<(), Self::Error> {
             self.inner.capture_start(generation)
         }
@@ -5366,6 +7416,65 @@ mod tests {
         }
     }
 
+    impl RuntimeWriter for CapturePathDecisionWriter {
+        type Error = io::Error;
+
+        fn prepare(&mut self, reason: Reason) -> Result<PreparedGeneration, Self::Error> {
+            let mut prepared = self.inner.prepare(reason)?;
+            if let Some(deadline) = self.deadlines.pop_front() {
+                prepared.capture_path_evidence_deadline = deadline;
+            }
+            self.decision = Some(test_xtables_capture_path_decision());
+            Ok(prepared)
+        }
+
+        fn prepare_address_successor(
+            &mut self,
+            inputs: &crate::generation_engine_config::AddressReconciledGenerationInputs,
+        ) -> Result<Option<PreparedGeneration>, Self::Error> {
+            self.inner.prepare_address_successor(inputs)
+        }
+
+        fn latest_capture_path_decision(&self) -> Option<CapturePathDecision> {
+            self.decision
+        }
+
+        fn invalidate_latest_capture_path_decision(&mut self) {
+            self.decision = None;
+            self.invalidations = self.invalidations.saturating_add(1);
+        }
+
+        fn reject_prepared(&mut self, generation: &PreparedGeneration) -> Result<(), Self::Error> {
+            if self.rejection_failures > 0 {
+                self.rejection_failures -= 1;
+                return Err(io::Error::other(
+                    "injected prepared candidate rejection failure",
+                ));
+            }
+            self.inner.reject_prepared(generation)
+        }
+
+        fn capture_start(&mut self, generation: &PreparedGeneration) -> Result<(), Self::Error> {
+            self.inner.capture_start(generation)
+        }
+
+        fn capture_stop(&mut self) -> Result<(), Self::Error> {
+            self.inner.capture_stop()
+        }
+
+        fn verify_capture(&mut self, generation: &PreparedGeneration) -> Result<(), Self::Error> {
+            self.inner.verify_capture(generation)
+        }
+
+        fn publish(&mut self, phase: PublishedRuntimeState) -> Result<(), Self::Error> {
+            self.inner.publish(phase)
+        }
+
+        fn resync_addresses(&mut self) -> Result<AddressResyncDisposition, Self::Error> {
+            self.inner.resync_addresses()
+        }
+    }
+
     impl RuntimeWriter for ScriptedWriter {
         type Error = io::Error;
 
@@ -5384,7 +7493,12 @@ mod tests {
                 .prepared
                 .pop_front()
                 .ok_or_else(|| io::Error::other("no scripted generation remains"))?;
-            Ok(PreparedGeneration { id, spec })
+            Ok(PreparedGeneration::new(
+                id,
+                spec,
+                test_xtables_capture_path_selection(),
+                qualified_xtables_capture_path_evidence().valid_until(),
+            ))
         }
 
         fn prepare_address_successor(
@@ -5396,6 +7510,14 @@ mod tests {
                 .expect("events lock")
                 .push(Event::AddressSuccessorPrepared);
             Ok(None)
+        }
+
+        fn reject_prepared(&mut self, generation: &PreparedGeneration) -> Result<(), Self::Error> {
+            self.events
+                .lock()
+                .expect("events lock")
+                .push(Event::PreparedRejected(generation.id()));
+            Ok(())
         }
 
         fn capture_start(&mut self, _generation: &PreparedGeneration) -> Result<(), Self::Error> {

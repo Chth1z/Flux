@@ -14,17 +14,19 @@ use flux_core::{
 use flux_platform::Uid;
 use serde::{Deserialize, Serialize};
 
+use crate::generation_engine_config::CapturePathDecision;
 use crate::inspection::InspectionSource;
 use crate::subscription::{
     SubscriptionRefreshClient, SubscriptionRefreshDisposition, SubscriptionRefreshReport,
 };
 use crate::{
     DiagnosticReport, ExplainReport, LogReport, LogStream, NativeAdmissionRejection,
-    NativeAdmissionState, RuntimeCaptureState, RuntimeEngineState, RuntimeFailure, RuntimePhase,
-    RuntimeSnapshot, RuntimeSnapshotSource, RuntimeVerificationState,
+    NativeAdmissionState, RuntimeCaptureState, RuntimeEngineState, RuntimeFailure,
+    RuntimeGenerationBinding, RuntimePhase, RuntimeSnapshot, RuntimeSnapshotSource,
+    RuntimeVerificationState,
 };
 
-const PROTOCOL_VERSION: u16 = 6;
+const PROTOCOL_VERSION: u16 = 8;
 const RECENT_RESULT_CAPACITY: usize = 128;
 const RECENT_RESULT_FINGERPRINT_BYTES: usize = MAX_CONTROL_PACKET_BYTES;
 const RECENT_RESULT_RESPONSE_BYTES: usize = MAX_CONTROL_PACKET_BYTES;
@@ -1392,7 +1394,8 @@ struct WireRuntimeSnapshot {
     capture: WireRuntimeCaptureState,
     engine: WireRuntimeEngineState,
     verification: WireRuntimeVerificationState,
-    generation: Option<u32>,
+    active_generation: Option<RuntimeGenerationBinding>,
+    latest_capture_path_decision: Option<CapturePathDecision>,
     last_error: Option<WireRuntimeFailure>,
 }
 
@@ -1404,7 +1407,8 @@ impl From<&RuntimeSnapshot> for WireRuntimeSnapshot {
             capture: snapshot.capture.into(),
             engine: snapshot.engine.into(),
             verification: snapshot.verification.into(),
-            generation: snapshot.generation.map(GenerationId::get),
+            active_generation: snapshot.active_generation,
+            latest_capture_path_decision: snapshot.latest_capture_path_decision,
             last_error: snapshot.last_error.as_ref().map(Into::into),
         }
     }
@@ -1414,21 +1418,14 @@ impl TryFrom<WireRuntimeSnapshot> for RuntimeSnapshot {
     type Error = ControlError;
 
     fn try_from(snapshot: WireRuntimeSnapshot) -> Result<Self, Self::Error> {
-        let generation = match snapshot.generation {
-            Some(value) => Some(GenerationId::new(value).ok_or_else(|| {
-                ControlError::protocol(
-                    "daemon returned a zero runtime Generation identifier".to_owned(),
-                )
-            })?),
-            None => None,
-        };
         Ok(Self {
             revision: snapshot.revision,
             phase: snapshot.phase.into(),
             capture: snapshot.capture.into(),
             engine: snapshot.engine.into(),
             verification: snapshot.verification.into(),
-            generation,
+            active_generation: snapshot.active_generation,
+            latest_capture_path_decision: snapshot.latest_capture_path_decision,
             last_error: snapshot.last_error.map(Into::into),
         })
     }
@@ -2088,6 +2085,9 @@ mod tests {
 
     use super::*;
     use crate::DiagnosticState;
+    use crate::generation_engine_config::{
+        test_unqualified_capture_path_decision, test_xtables_capture_path_selection,
+    };
     use crate::inspection::ProcessInspectionSource;
     use crate::subscription::{SubscriptionRefreshError, SubscriptionRefreshErrorKind};
 
@@ -2126,17 +2126,19 @@ mod tests {
         let run = directory.path().join("run");
         fs::create_dir(&run).expect("create run directory");
         fs::write(run.join("flux.log"), "one\ntwo\nthree\n").expect("write runtime log");
+        let runtime = RuntimeSnapshotSource::default();
         let inspection = Arc::new(ProcessInspectionSource::new(
             directory.path().join("flux.toml"),
             run.join("flux.log"),
             run.join("fluxd.log"),
             run.join("sing-box.log"),
+            runtime.clone(),
         ));
         let handler = ProtocolHandler::with_runtime_subscription_and_inspection(
             Arc::new(CapabilityProfileFixture::supported()),
             NativeAdmissionState::Admitted,
             TestControl,
-            RuntimeSnapshotSource::default(),
+            runtime,
             None,
             Some(inspection.clone()),
         );
@@ -2144,7 +2146,7 @@ mod tests {
         let request = encode_logs_request(91, LogStream::Runtime, 2).expect("log request");
         assert_eq!(
             String::from_utf8(request.clone()).expect("UTF-8 request"),
-            "{\"protocol_version\":6,\"request_id\":91,\"command\":{\"kind\":\"logs\",\"stream\":\"runtime\",\"lines\":2}}"
+            "{\"protocol_version\":8,\"request_id\":91,\"command\":{\"kind\":\"logs\",\"stream\":\"runtime\",\"lines\":2}}"
         );
         let first = handler.handle_for_peer(&request, RequestPeerId::new(Uid::ROOT, 72));
         let report = decode_logs_response(&first, 91, LogStream::Runtime, 2).expect("log report");
@@ -2191,7 +2193,26 @@ mod tests {
         let response = handler.handle(&request);
         let explanation = decode_explain_response(&response, 94).expect("explain report");
         assert!(explanation.non_authorizing());
-        assert_eq!(explanation.backend(), "xtables");
+        assert_eq!(explanation.capture_path_request(), "auto");
+        assert_eq!(explanation.active_capture_path_selection(), None);
+
+        let valid_document: serde_json::Value =
+            serde_json::from_slice(&response).expect("valid explanation JSON");
+        for relation in [
+            "active_capture_path_request_relation",
+            "latest_capture_path_request_relation",
+        ] {
+            let mut forged = valid_document.clone();
+            forged["result"]["body"]["report"][relation] =
+                serde_json::json!("matches_desired_state");
+            let forged = serde_json::to_vec(&forged).expect("forged explanation JSON");
+            let error = decode_explain_response(&forged, 94)
+                .expect_err("forged request relation must fail closed");
+            assert_eq!(
+                error.to_string(),
+                "control protocol: daemon returned an invalid Desired State explanation"
+            );
+        }
 
         let read_only_handler = ProtocolHandler::with_runtime_subscription_and_inspection(
             Arc::new(CapabilityProfileFixture::unsupported_kernel()),
@@ -2237,7 +2258,7 @@ mod tests {
         assert_eq!(
             String::from_utf8(response).expect("UTF-8 response"),
             concat!(
-                "{\"protocol_version\":6,\"request_id\":101,",
+                "{\"protocol_version\":8,\"request_id\":101,",
                 "\"result\":{\"status\":\"ok\",\"body\":{",
                 "\"kind\":\"subscription_update\",\"disposition\":\"updated\",",
                 "\"generation\":71,\"node_count\":23,\"cleanup_pending\":true}}}\n"
@@ -2276,7 +2297,7 @@ mod tests {
         assert_eq!(
             String::from_utf8(response).expect("UTF-8 response"),
             concat!(
-                "{\"protocol_version\":6,\"request_id\":102,",
+                "{\"protocol_version\":8,\"request_id\":102,",
                 "\"result\":{\"status\":\"error\",\"code\":\"unsupported_kernel\",",
                 "\"message\":\"kernel 5.4.280 is below minimum 5.10.0\"}}\n"
             )
@@ -2516,15 +2537,20 @@ mod tests {
     }
 
     #[test]
-    fn status_decoder_preserves_the_observed_runtime_snapshot() {
+    fn status_decoder_preserves_active_generation_and_latest_attempt_independently() {
         let profile = CapabilityProfileFixture::supported();
+        let latest_decision = test_unqualified_capture_path_decision();
         let runtime = RuntimeSnapshot {
             revision: 14,
             phase: RuntimePhase::Repairing,
             capture: RuntimeCaptureState::Detached,
             engine: RuntimeEngineState::BackingOff,
             verification: RuntimeVerificationState::FunctionalFailed,
-            generation: GenerationId::new(48),
+            active_generation: Some(RuntimeGenerationBinding::new(
+                GenerationId::new(48).expect("nonzero Generation"),
+                test_xtables_capture_path_selection(),
+            )),
+            latest_capture_path_decision: Some(latest_decision),
             last_error: Some(RuntimeFailure {
                 operation: "maintain proxy engine".to_owned(),
                 message: "owned child exited unexpectedly".to_owned(),
@@ -2544,6 +2570,64 @@ mod tests {
         let snapshot = decode_status_response(&response, 93).expect("coherent status");
 
         assert_eq!(snapshot.runtime, runtime);
+        let selection = snapshot
+            .runtime
+            .active_capture_path_selection()
+            .expect("runtime Capture Path selection");
+        assert_eq!(selection.request(), flux_core::CapturePathRequest::Auto);
+        assert_eq!(
+            selection.selected(),
+            flux_core::CapturePathId::XtablesTproxy
+        );
+        assert_eq!(selection.evidence_digest().as_bytes(), &[0x5a; 32]);
+        assert_eq!(
+            selection.candidates().map(|candidate| candidate.state()),
+            [
+                flux_platform::AndroidCapturePathState::Unimplemented,
+                flux_platform::AndroidCapturePathState::Qualified,
+                flux_platform::AndroidCapturePathState::Unimplemented,
+            ]
+        );
+        assert!(
+            snapshot
+                .runtime
+                .latest_capture_path_decision
+                .and_then(CapturePathDecision::rejection)
+                .is_some(),
+            "the latest rejected successor attempt must not overwrite the active selection"
+        );
+    }
+
+    #[test]
+    fn status_decoder_preserves_a_rejected_capture_path_decision_without_a_generation() {
+        let profile = CapabilityProfileFixture::supported();
+        let decision = test_unqualified_capture_path_decision();
+        let runtime = RuntimeSnapshot {
+            phase: RuntimePhase::Failed,
+            capture: RuntimeCaptureState::Detached,
+            engine: RuntimeEngineState::Stopped,
+            latest_capture_path_decision: Some(decision),
+            ..RuntimeSnapshot::unknown()
+        };
+        let response = encode_response(ResponseEnvelope::ok(
+            99,
+            ResponseBody::Snapshot {
+                capability_profile: Box::new((&profile).into()),
+                native_admission: NativeAdmissionState::Admitted.into(),
+                control: (&ControlSnapshot::default()).into(),
+                runtime: (&runtime).into(),
+            },
+        ));
+
+        let snapshot = decode_status_response(&response, 99).expect("coherent rejected status");
+
+        assert_eq!(snapshot.runtime, runtime);
+        assert_eq!(snapshot.runtime.generation(), None);
+        assert_eq!(snapshot.runtime.active_capture_path_selection(), None);
+        assert_eq!(
+            snapshot.runtime.latest_capture_path_decision,
+            Some(decision)
+        );
     }
 
     #[test]
@@ -2555,20 +2639,56 @@ mod tests {
                 capability_profile: Box::new((&profile).into()),
                 native_admission: NativeAdmissionState::Admitted.into(),
                 control: (&ControlSnapshot::default()).into(),
-                runtime: WireRuntimeSnapshot {
-                    generation: Some(0),
-                    ..WireRuntimeSnapshot::default()
-                },
+                runtime: WireRuntimeSnapshot::default(),
             },
         ));
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&response).expect("encoded status JSON");
+        document["result"]["body"]["runtime"]["active_generation"] = serde_json::json!({
+            "generation": 0,
+            "capture_path_selection": test_xtables_capture_path_selection(),
+        });
+        let response = serde_json::to_vec(&document).expect("zero-Generation status JSON");
 
         let error = decode_status_response(&response, 97)
             .expect_err("zero runtime Generation must fail closed");
 
-        assert_eq!(
-            error.to_string(),
-            "control protocol: daemon returned a zero runtime Generation identifier"
+        assert!(
+            error.to_string().contains("expected a nonzero u32"),
+            "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn status_decoder_rejects_an_incomplete_runtime_generation_binding() {
+        let profile = CapabilityProfileFixture::supported();
+        for incomplete in [
+            serde_json::json!({"generation": 7}),
+            serde_json::json!({
+                "capture_path_selection": test_xtables_capture_path_selection()
+            }),
+        ] {
+            let response = encode_response(ResponseEnvelope::ok(
+                98,
+                ResponseBody::Snapshot {
+                    capability_profile: Box::new((&profile).into()),
+                    native_admission: NativeAdmissionState::Admitted.into(),
+                    control: (&ControlSnapshot::default()).into(),
+                    runtime: WireRuntimeSnapshot::default(),
+                },
+            ));
+            let mut document: serde_json::Value =
+                serde_json::from_slice(&response).expect("encoded status JSON");
+            document["result"]["body"]["runtime"]["active_generation"] = incomplete;
+            let response = serde_json::to_vec(&document).expect("incomplete status JSON");
+
+            let error = decode_status_response(&response, 98)
+                .expect_err("an unpaired runtime Capture Path binding must fail closed");
+            assert!(
+                error.to_string().contains("missing field"),
+                "unexpected error: {error}"
+            );
+        }
     }
 
     #[test]

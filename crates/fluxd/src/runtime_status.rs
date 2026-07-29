@@ -1,6 +1,9 @@
 use std::sync::{Arc, RwLock};
 
 use flux_core::GenerationId;
+use serde::{Deserialize, Serialize};
+
+use crate::generation_engine_config::{CapturePathDecision, CapturePathSelection};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimePhase {
@@ -56,6 +59,39 @@ pub struct RuntimeFailure {
     pub recovery: String,
 }
 
+/// One immutable runtime Generation and the Capture Path decision that authorized it.
+///
+/// Keeping these facts in one value makes an unpaired Generation or selection unrepresentable.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeGenerationBinding {
+    pub(crate) generation: GenerationId,
+    pub(crate) capture_path_selection: CapturePathSelection,
+}
+
+impl RuntimeGenerationBinding {
+    #[must_use]
+    pub const fn new(
+        generation: GenerationId,
+        capture_path_selection: CapturePathSelection,
+    ) -> Self {
+        Self {
+            generation,
+            capture_path_selection,
+        }
+    }
+
+    #[must_use]
+    pub const fn generation(self) -> GenerationId {
+        self.generation
+    }
+
+    #[must_use]
+    pub const fn capture_path_selection(self) -> CapturePathSelection {
+        self.capture_path_selection
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeSnapshot {
     pub revision: u64,
@@ -63,7 +99,9 @@ pub struct RuntimeSnapshot {
     pub capture: RuntimeCaptureState,
     pub engine: RuntimeEngineState,
     pub verification: RuntimeVerificationState,
-    pub generation: Option<GenerationId>,
+    pub active_generation: Option<RuntimeGenerationBinding>,
+    /// Latest completed selection evaluation, which may describe an attempted successor.
+    pub latest_capture_path_decision: Option<CapturePathDecision>,
     pub last_error: Option<RuntimeFailure>,
 }
 
@@ -76,8 +114,25 @@ impl RuntimeSnapshot {
             capture: RuntimeCaptureState::Unknown,
             engine: RuntimeEngineState::Unknown,
             verification: RuntimeVerificationState::StructuralOnly,
-            generation: None,
+            active_generation: None,
+            latest_capture_path_decision: None,
             last_error: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn generation(&self) -> Option<GenerationId> {
+        match self.active_generation {
+            Some(binding) => Some(binding.generation()),
+            None => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn active_capture_path_selection(&self) -> Option<CapturePathSelection> {
+        match self.active_generation {
+            Some(binding) => Some(binding.capture_path_selection()),
+            None => None,
         }
     }
 }
@@ -138,6 +193,9 @@ impl Default for RuntimeSnapshotSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::generation_engine_config::{
+        test_xtables_capture_path_decision, test_xtables_capture_path_selection,
+    };
 
     #[test]
     fn cloned_sources_publish_whole_immutable_snapshots() {
@@ -150,7 +208,11 @@ mod tests {
             capture: RuntimeCaptureState::Published,
             engine: RuntimeEngineState::Ready,
             verification: RuntimeVerificationState::StructuralOnly,
-            generation: GenerationId::new(7),
+            active_generation: Some(RuntimeGenerationBinding::new(
+                GenerationId::new(7).expect("nonzero Generation"),
+                test_xtables_capture_path_selection(),
+            )),
+            latest_capture_path_decision: Some(test_xtables_capture_path_decision()),
             last_error: None,
         };
 
@@ -194,7 +256,8 @@ mod tests {
             capture: RuntimeCaptureState::Detached,
             engine: RuntimeEngineState::Stopped,
             verification: RuntimeVerificationState::StructuralOnly,
-            generation: None,
+            active_generation: None,
+            latest_capture_path_decision: None,
             last_error: None,
         };
 
@@ -212,7 +275,11 @@ mod tests {
             capture: RuntimeCaptureState::Published,
             engine: RuntimeEngineState::Ready,
             verification: RuntimeVerificationState::FunctionalPending,
-            generation: GenerationId::new(7),
+            active_generation: Some(RuntimeGenerationBinding::new(
+                GenerationId::new(7).expect("nonzero Generation"),
+                test_xtables_capture_path_selection(),
+            )),
+            latest_capture_path_decision: Some(test_xtables_capture_path_decision()),
             last_error: None,
         });
 
@@ -222,7 +289,11 @@ mod tests {
             capture: RuntimeCaptureState::Published,
             engine: RuntimeEngineState::Ready,
             verification: RuntimeVerificationState::FunctionalPassed,
-            generation: GenerationId::new(7),
+            active_generation: Some(RuntimeGenerationBinding::new(
+                GenerationId::new(7).expect("nonzero Generation"),
+                test_xtables_capture_path_selection(),
+            )),
+            latest_capture_path_decision: Some(test_xtables_capture_path_decision()),
             last_error: None,
         });
 
@@ -231,6 +302,12 @@ mod tests {
         assert_eq!(
             snapshot.verification,
             RuntimeVerificationState::FunctionalPassed
+        );
+        assert_eq!(
+            snapshot
+                .active_generation
+                .map(RuntimeGenerationBinding::generation),
+            GenerationId::new(7)
         );
     }
 }

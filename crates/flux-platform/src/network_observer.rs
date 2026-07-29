@@ -35,13 +35,30 @@ pub struct NetworkInventorySource {
 impl NetworkInventorySource {
     #[must_use]
     pub fn snapshot(&self) -> Option<Arc<NetworkInventory>> {
-        read_unpoisoned(&self.shared.current).clone()
+        read_unpoisoned(&self.shared.state).current.clone()
+    }
+
+    pub(crate) fn begin_explicit_refresh(&self) -> Option<u64> {
+        let mut state = write_unpoisoned(&self.shared.state);
+        state.refresh_revision = state.refresh_revision.checked_add(1)?;
+        state.current = None;
+        Some(state.refresh_revision)
+    }
+
+    fn refresh_revision(&self) -> u64 {
+        read_unpoisoned(&self.shared.state).refresh_revision
     }
 }
 
 #[derive(Debug, Default)]
 struct SharedInventory {
-    current: RwLock<Option<Arc<NetworkInventory>>>,
+    state: RwLock<SharedInventoryState>,
+}
+
+#[derive(Debug, Default)]
+struct SharedInventoryState {
+    current: Option<Arc<NetworkInventory>>,
+    refresh_revision: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -322,6 +339,7 @@ pub(crate) enum InventoryFactClass {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ObserverDriveOutcome {
     Idle,
+    Superseded,
     Published(NetworkEpoch),
     RequestAddressDump,
     RequestRouteDump,
@@ -346,6 +364,8 @@ pub(crate) struct NetworkInventoryObserver {
     dump: Option<DumpState>,
     pending: Option<PendingState>,
     synchronized: bool,
+    active_refresh_revision: Option<u64>,
+    synchronized_refresh_revision: Option<u64>,
 }
 
 impl NetworkInventoryObserver {
@@ -359,6 +379,8 @@ impl NetworkInventoryObserver {
             dump: None,
             pending: None,
             synchronized: false,
+            active_refresh_revision: None,
+            synchronized_refresh_revision: None,
         }
     }
 
@@ -366,8 +388,28 @@ impl NetworkInventoryObserver {
         self.source.clone()
     }
 
+    pub(crate) const fn refresh_in_progress(&self) -> bool {
+        self.dump.is_some()
+    }
+
+    pub(crate) fn current_refresh_revision_is_satisfied(&self) -> bool {
+        let current_revision = self.source.refresh_revision();
+        self.synchronized_refresh_revision == Some(current_revision)
+            || (self
+                .dump
+                .as_ref()
+                .is_some_and(|dump| !matches!(dump, DumpState::Draining(_)))
+                && self.active_refresh_revision == Some(current_revision))
+    }
+
+    pub(crate) fn begin_refresh(&mut self) {
+        debug_assert!(self.dump.is_none());
+        self.mark_unsynchronized();
+    }
+
     pub(crate) fn begin_link_dump(&mut self, expected_sequence: NonZeroU32, now: Instant) {
         self.mark_unsynchronized();
+        self.active_refresh_revision = Some(self.source.refresh_revision());
         self.dump = Some(DumpState::Link(LinkDumpState {
             expected_sequence,
             deadline: deadline_after(now, self.config.dump_timeout),
@@ -424,6 +466,7 @@ impl NetworkInventoryObserver {
     #[cfg(test)]
     pub(crate) fn begin_dump(&mut self, expected_sequence: NonZeroU32, now: Instant) {
         self.mark_unsynchronized();
+        self.active_refresh_revision = Some(self.source.refresh_revision());
         self.dump = Some(DumpState::Address(AddressDumpState {
             expected_sequence,
             deadline: deadline_after(now, self.config.dump_timeout),
@@ -708,12 +751,19 @@ impl NetworkInventoryObserver {
                 for event in address.raced.addresses {
                     apply_address_event(&mut address.addresses, event);
                 }
-                self.publish(CompleteFacts {
-                    links: address.links,
-                    addresses: address.addresses,
-                    routes: Vec::new(),
-                    rules: Vec::new(),
-                })
+                let refresh_revision = self
+                    .active_refresh_revision
+                    .take()
+                    .expect("active address dump has one refresh revision");
+                self.publish(
+                    CompleteFacts {
+                        links: address.links,
+                        addresses: address.addresses,
+                        routes: Vec::new(),
+                        rules: Vec::new(),
+                    },
+                    refresh_revision,
+                )
             }
             DumpState::Route(route) => {
                 self.dump = Some(DumpState::AwaitingRule(RuleWaitState {
@@ -732,12 +782,19 @@ impl NetworkInventoryObserver {
                 for event in rule.raced.addresses {
                     apply_address_event(&mut rule.addresses, event);
                 }
-                self.publish(CompleteFacts {
-                    links: rule.links,
-                    addresses: rule.addresses,
-                    routes: rule.routes,
-                    rules: rule.rules,
-                })
+                let refresh_revision = self
+                    .active_refresh_revision
+                    .take()
+                    .expect("active rule dump has one refresh revision");
+                self.publish(
+                    CompleteFacts {
+                        links: rule.links,
+                        addresses: rule.addresses,
+                        routes: rule.routes,
+                        rules: rule.rules,
+                    },
+                    refresh_revision,
+                )
             }
             DumpState::Draining(draining) => {
                 self.mark_unsynchronized();
@@ -768,7 +825,7 @@ impl NetworkInventoryObserver {
         }
 
         let pending = self.pending.take().expect("due pending state is present");
-        self.publish(pending.facts)
+        self.publish(pending.facts, pending.refresh_revision)
     }
 
     pub(crate) fn note_loss(
@@ -801,7 +858,13 @@ impl NetworkInventoryObserver {
         self.dump.as_ref().map(DumpState::deadline)
     }
 
-    fn publish(&mut self, facts: CompleteFacts) -> ObserverDriveOutcome {
+    fn publish(&mut self, facts: CompleteFacts, refresh_revision: u64) -> ObserverDriveOutcome {
+        let mut state = write_unpoisoned(&self.source.shared.state);
+        if state.refresh_revision != refresh_revision {
+            self.synchronized = false;
+            self.synchronized_refresh_revision = None;
+            return ObserverDriveOutcome::Superseded;
+        }
         let previous_epoch = self.tracker.current().map(NetworkInventory::epoch);
         let was_synchronized = self.synchronized;
         let inventory = match self.tracker.publish_complete_with_routing(
@@ -811,11 +874,15 @@ impl NetworkInventoryObserver {
             facts.rules,
         ) {
             Ok(inventory) => Arc::new(inventory.clone()),
-            Err(error) => return self.invalidate_without_active(ObserverFault::Inventory(error)),
+            Err(error) => {
+                drop(state);
+                return self.invalidate_without_active(ObserverFault::Inventory(error));
+            }
         };
         let epoch = inventory.epoch();
-        *write_unpoisoned(&self.source.shared.current) = Some(inventory);
+        state.current = Some(inventory);
         self.synchronized = true;
+        self.synchronized_refresh_revision = Some(refresh_revision);
         if !was_synchronized || previous_epoch != Some(epoch) {
             ObserverDriveOutcome::Published(epoch)
         } else {
@@ -838,6 +905,13 @@ impl NetworkInventoryObserver {
             .as_ref()
             .map(|pending| pending.maximum_deadline)
             .unwrap_or_else(|| deadline_after(now, self.config.maximum_debounce));
+        let refresh_revision = previous_pending.as_ref().map_or_else(
+            || {
+                self.synchronized_refresh_revision
+                    .expect("synchronized observer has a publication revision")
+            },
+            |pending| pending.refresh_revision,
+        );
         let mut facts = previous_pending
             .map(|pending| pending.facts)
             .unwrap_or_else(|| facts_from_inventory(self.tracker.current()));
@@ -856,6 +930,7 @@ impl NetworkInventoryObserver {
             facts,
             quiet_deadline: deadline_after(now, self.config.quiet_debounce),
             maximum_deadline,
+            refresh_revision,
         });
     }
 
@@ -911,13 +986,15 @@ impl NetworkInventoryObserver {
 
     fn mark_unsynchronized(&mut self) {
         self.dump = None;
+        self.active_refresh_revision = None;
         self.mark_stale();
     }
 
     fn mark_stale(&mut self) {
         self.pending = None;
         self.synchronized = false;
-        *write_unpoisoned(&self.source.shared.current) = None;
+        self.synchronized_refresh_revision = None;
+        write_unpoisoned(&self.source.shared.state).current = None;
     }
 }
 
@@ -1121,6 +1198,7 @@ struct PendingState {
     facts: CompleteFacts,
     quiet_deadline: Instant,
     maximum_deadline: Instant,
+    refresh_revision: u64,
 }
 
 impl PendingState {

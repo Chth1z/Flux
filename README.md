@@ -16,14 +16,17 @@ profiles. Current source has:
 
 - one Rust-owned daemon for configuration, subscriptions, Generation lifecycle, Sing-Box
   supervision, native xtables/rtnetlink mutation, exact readback, rollback, and recovery;
+- one deterministic `auto`/exact Capture Path selector whose complete selected or rejected decision
+  is bound to Generation identity, runtime status, and explain output;
 - one `native` development package profile with an exact 13-file inventory;
 - only platform-required shell glue for install, boot launch/restart, and uninstall delegation;
 - no runtime `scripts/` tree and no shell networking writer or fallback;
 - no packaged kernel module and no production code that loads or unloads `.ko` or KPM payloads.
 
-The remaining release work is not another compatibility bridge. It is bounded physical-device
-qualification, complete provenance and licensing metadata, payload-bound evidence, SBOM/build
-metadata/checksums, and explicit promotion from `development-only`.
+The remaining release work is not another compatibility bridge. It includes a production Android
+behavioral-qualification producer for the selector, VPN/canary Adapter qualification, bounded
+physical-device testing, complete provenance and licensing metadata, payload-bound evidence,
+SBOM/build metadata/checksums, and explicit promotion from `development-only`.
 
 ## Architecture
 
@@ -48,12 +51,12 @@ with production support:
 
 | Path | Current boundary |
 |---|---|
-| Native xtables TPROXY | Implemented Rust owner and current configured backend; mutation still requires exact device admission |
+| Native xtables TPROXY | Implemented Rust owner and the only production Adapter; current Android behavioral evidence is deliberately unqualified, so packaged startup remains read-only |
 | nftables | Capability/probe model exists; production mutation adapter is deferred |
 | Managed TUN | Modeled fallback; production ownership and route adapter are deferred |
 | eBPF | Optional observation/qualification input only; never required for correctness |
 
-An explicit backend request never silently falls back. If no complete, fresh authority exists,
+An exact path request never silently falls back. If no complete, fresh authority exists,
 `fluxd` stays queryable but does not mutate networking state.
 
 ## Safety Model
@@ -104,7 +107,7 @@ records. None of those generated files belongs in a module archive.
 
 ## Configuration
 
-[`conf/flux.toml`](conf/flux.toml) is the sole Flux product-policy source. Schema 3 rejects unknown,
+[`conf/flux.toml`](conf/flux.toml) is the sole Flux product-policy source. Schema 4 rejects unknown,
 duplicate, or missing fields. [`conf/template.json`](conf/template.json) contains Sing-Box-specific
 DNS, routing, outbound, and API policy; it does not authorize kernel capture.
 
@@ -112,15 +115,17 @@ DNS, routing, outbound, and API policy; it does not authorize kernel capture.
 |---|---|
 | `[daemon]` | Fail-open policy, reconciliation debounce, queue capacity, and Generation retention |
 | `[engine]` / `[listener]` | Sing-Box identity, lifecycle/restart limits, and TPROXY listener |
-| `[capture]` | Backend request, traffic domains, address families, and protocols |
+| `[capture]` | Capture Path request, traffic domains, address families, and protocols |
 | `[applications]` | Package/user selection policy |
 | `[interfaces]` / `[bypass]` | Interface roles and canonical CIDR bypasses |
 | `[subscription]` | HTTPS refresh source and bounded resource limits |
 | `[safety]` | Android VPN and functional-canary requirements |
 
-The packaged development default requests local-output IPv4 TCP/UDP through native xtables.
-Forwarded ingress, IPv6, Android VPN coexistence, and a required functional canary must be enabled
-only after the target device has the corresponding reviewed authority.
+The packaged development default requests `auto` for local-output IPv4 TCP/UDP. The current
+production Adapter inventory contains only xtables TPROXY, but no production behavioral probe may
+mark it qualified yet; startup therefore retains a typed rejection and stays read-only. Forwarded
+ingress, IPv6, Android VPN coexistence, and a required functional canary need corresponding reviewed
+device authority before release use.
 
 ## CLI
 
@@ -136,9 +141,11 @@ only after the target device has the corresponding reviewed authority.
 /data/adb/flux/bin/fluxd cleanup --offline
 ```
 
-Online commands use the private same-effective-UID Unix socket. Read-only diagnostics and previews
-are bounded and grant no mutation authority. `cleanup --offline` acquires the daemon lease and
-refuses while a daemon is active or starting.
+Online commands use protocol v8 over the private same-effective-UID Unix socket. Status binds each
+active Generation to its exact Capture Path selection and reports the latest completed selection
+attempt separately; explain labels whether either request still matches Desired State. Read-only
+diagnostics and previews are bounded and grant no mutation authority. `cleanup --offline` acquires
+the daemon lease and refuses while a daemon is active or starting.
 
 ## Build And Verify
 

@@ -10,8 +10,9 @@ use std::thread::{self, JoinHandle, ThreadId};
 use std::time::{Duration, Instant};
 
 use flux_platform::{
-    DaemonReactor, FileObservationBatch, FileObservationPaths, PlatformError, ReactorError,
-    ReactorStopHandle, SeqpacketConnection, ShutdownSignal, StopDisposition,
+    DaemonReactor, FileObservationBatch, FileObservationPaths, NetworkInventoryRefreshDisposition,
+    PlatformError, ReactorError, ReactorStopHandle, SeqpacketConnection, ShutdownSignal,
+    StopDisposition,
 };
 use tempfile::tempdir;
 
@@ -147,7 +148,7 @@ fn inventory_enabled_reactor_publishes_without_displacing_control_work() {
     let thread = thread::spawn(move || {
         let shutdown = ShutdownSignal::install().expect("install shutdown signal source");
         let (mut reactor, stop) = DaemonReactor::open(shutdown).expect("open daemon reactor");
-        let source = reactor
+        let inventory = reactor
             .attach_network_inventory(drop)
             .expect("attach network inventory");
         reactor
@@ -157,12 +158,12 @@ fn inventory_enabled_reactor_publishes_without_displacing_control_work() {
             })
             .expect("bind inventory-enabled reactor");
         ready_tx
-            .send((stop, source))
+            .send((stop, inventory.map(|attachment| attachment.into_parts())))
             .expect("publish inventory-enabled reactor");
         reactor.run()
     });
     let (stop, source) = ready_rx.recv().expect("reactor setup result");
-    let Some(source) = source else {
+    let Some((source, refresh)) = source else {
         assert_eq!(
             stop.request_stop().expect("request degraded reactor stop"),
             StopDisposition::Requested
@@ -183,6 +184,21 @@ fn inventory_enabled_reactor_publishes_without_displacing_control_work() {
         b"request"
     );
     wait_until(Duration::from_secs(2), || source.snapshot().is_some());
+    let initial_snapshot_id = source
+        .snapshot()
+        .expect("initial reactor inventory")
+        .snapshot_id();
+    assert_eq!(
+        refresh
+            .request_refresh()
+            .expect("request network inventory refresh"),
+        NetworkInventoryRefreshDisposition::Requested
+    );
+    wait_until(Duration::from_secs(2), || {
+        source
+            .snapshot()
+            .is_some_and(|snapshot| snapshot.snapshot_id() != initial_snapshot_id)
+    });
 
     assert_eq!(
         stop.request_stop().expect("request reactor stop"),
@@ -319,7 +335,8 @@ fn inventory_is_invalidated_before_running_workers_are_drained() {
         let (mut reactor, stop) = DaemonReactor::open(shutdown).expect("open daemon reactor");
         let source = reactor
             .attach_network_inventory(drop)
-            .expect("attach network inventory");
+            .expect("attach network inventory")
+            .map(|attachment| attachment.into_parts().0);
         reactor
             .bind_control(reactor_path, move |_connection| {
                 entered_tx.send(()).expect("publish worker entry");

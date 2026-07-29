@@ -14,10 +14,12 @@ use flux_platform::{DaemonReactor, SeqpacketConnection, ShutdownSignal};
 use flux_testkit::CapabilityProfileFixture;
 use fluxd::{
     ControlConnectionHandler, NativeAdmissionRejection, NativeAdmissionState, RuntimeCaptureState,
-    RuntimeEngineState, RuntimeFailure, RuntimePhase, RuntimeSnapshot, RuntimeSnapshotSource,
-    RuntimeVerificationState, SocketControlClient,
+    RuntimeEngineState, RuntimeFailure, RuntimeGenerationBinding, RuntimePhase, RuntimeSnapshot,
+    RuntimeSnapshotSource, RuntimeVerificationState, SocketControlClient,
 };
 use tempfile::tempdir;
+
+mod support;
 
 #[test]
 fn seqpacket_client_and_reactor_complete_a_control_operation() {
@@ -120,7 +122,11 @@ fn seqpacket_status_preserves_the_observed_runtime_snapshot() {
         capture: RuntimeCaptureState::Published,
         engine: RuntimeEngineState::Ready,
         verification: RuntimeVerificationState::FunctionalPending,
-        generation: flux_core::GenerationId::new(91),
+        active_generation: Some(RuntimeGenerationBinding::new(
+            flux_core::GenerationId::new(91).expect("nonzero Generation"),
+            support::xtables_capture_path_selection(),
+        )),
+        latest_capture_path_decision: Some(support::xtables_capture_path_decision()),
         last_error: Some(RuntimeFailure {
             operation: "verify published capture".to_owned(),
             message: "functional probe timed out".to_owned(),
@@ -281,7 +287,7 @@ fn stop_requested_before_run_closes_the_listener_without_dispatching_queued_clie
     .expect("bind reactor");
     let queued = SeqpacketConnection::connect(&socket_path).expect("queue client");
     queued
-        .send_packet(br#"{"protocol_version":6,"request_id":7,"command":{"kind":"ping"}}"#)
+        .send_packet(br#"{"protocol_version":8,"request_id":7,"command":{"kind":"ping"}}"#)
         .expect("send queued request");
 
     stop.request_stop().expect("request reactor stop");

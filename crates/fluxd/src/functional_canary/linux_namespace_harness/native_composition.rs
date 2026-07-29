@@ -26,6 +26,7 @@ use super::{checked_command, network_namespace_identity, random_nonce, user_name
 use crate::generation_engine_config::{
     AddressReconciler, GenerationPlanningAuthority, HostInspectionPlanningAuthority,
     ReplayNetworkInventorySource, TproxyEngineConfigRequest, compile_tproxy_engine_config,
+    qualified_xtables_capture_path_evidence, qualified_xtables_kernel_config,
 };
 use crate::native_generation_source::{
     AssembledNativeGenerationSource, CompleteNativeInventorySource, NativeGenerationPlanningSource,
@@ -654,6 +655,8 @@ impl NativeGenerationPlanningSource for HostPlanning {
         Ok(GenerationPlanningAuthority::host_inspection(
             HostInspectionPlanningAuthority::new(
                 &self.capability_profile,
+                qualified_xtables_kernel_config(),
+                qualified_xtables_capture_path_evidence(),
                 inventory,
                 self.network_namespace,
                 self.mark,

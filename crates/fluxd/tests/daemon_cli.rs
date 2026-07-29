@@ -8,9 +8,11 @@ use flux_testkit::{CapabilityProfileFixture, StaticKernelReleaseSource};
 use fluxd::{
     DaemonClient, DaemonSnapshot, DiagnosticReport, ExplainReport, LogReport, LogStream,
     NativeAdmissionRejection, NativeAdmissionState, RuntimeCaptureState, RuntimeEngineState,
-    RuntimeFailure, RuntimePhase, RuntimeSnapshot, RuntimeVerificationState,
-    SubscriptionRefreshReport, run_cli_with_daemon,
+    RuntimeFailure, RuntimeGenerationBinding, RuntimePhase, RuntimeSnapshot,
+    RuntimeVerificationState, SubscriptionRefreshReport, run_cli_with_daemon,
 };
+
+mod support;
 
 #[test]
 fn ping_uses_the_daemon_transport() {
@@ -185,7 +187,33 @@ fn json_status_comes_from_the_live_daemon_snapshot() {
             "\"runtime\":{\"revision\":7,\"phase\":\"repairing\",",
             "\"capture\":\"detached\",",
             "\"engine\":\"backing_off\",",
-            "\"verification\":\"functional_failed\",\"generation\":19,",
+            "\"verification\":\"functional_failed\",\"active_generation\":{",
+            "\"generation\":19,",
+            "\"capture_path_selection\":{\"request\":\"auto\",",
+            "\"selected\":\"xtables_tproxy\",",
+            "\"reason\":\"automatic_highest_ranked_qualified\",",
+            "\"candidates\":[{\"path\":\"nftables_tproxy\",",
+            "\"state\":\"unimplemented\",\"probe_state\":\"unqualified\",",
+            "\"first_kernel_gap\":null},",
+            "{\"path\":\"xtables_tproxy\",\"state\":\"qualified\",",
+            "\"probe_state\":\"qualified\",\"first_kernel_gap\":null},",
+            "{\"path\":\"managed_tun\",\"state\":\"unimplemented\",",
+            "\"probe_state\":\"unqualified\",\"first_kernel_gap\":null}],",
+            "\"evidence_digest\":",
+            "\"5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a\"}},",
+            "\"latest_capture_path_decision\":{\"outcome\":\"selected\",",
+            "\"selection\":{\"request\":\"auto\",",
+            "\"selected\":\"xtables_tproxy\",",
+            "\"reason\":\"automatic_highest_ranked_qualified\",",
+            "\"candidates\":[{\"path\":\"nftables_tproxy\",",
+            "\"state\":\"unimplemented\",\"probe_state\":\"unqualified\",",
+            "\"first_kernel_gap\":null},",
+            "{\"path\":\"xtables_tproxy\",\"state\":\"qualified\",",
+            "\"probe_state\":\"qualified\",\"first_kernel_gap\":null},",
+            "{\"path\":\"managed_tun\",\"state\":\"unimplemented\",",
+            "\"probe_state\":\"unqualified\",\"first_kernel_gap\":null}],",
+            "\"evidence_digest\":",
+            "\"5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a\"}},",
             "\"last_error\":{\"operation\":\"maintain proxy engine\",",
             "\"message\":\"owned child exited unexpectedly\",",
             "\"recovery\":\"retry after bounded backoff\"}}}\n"
@@ -309,6 +337,8 @@ fn text_status_reports_the_capability_profile_evidence() {
             "runtime engine: backing_off\n",
             "runtime verification: functional_failed\n",
             "runtime generation: 19\n",
+            "runtime active capture path: xtables_tproxy\n",
+            "runtime latest capture path decision: selected:xtables_tproxy\n",
             "runtime last error: maintain proxy engine: owned child exited unexpectedly; ",
             "recovery: retry after bounded backoff\n"
         )
@@ -376,7 +406,10 @@ fn diagnostics_combine_authoritative_status_with_bounded_checks() {
     assert!(stderr.is_empty());
     let document: serde_json::Value = serde_json::from_slice(&stdout).expect("diagnostic JSON");
     assert_eq!(document["status"]["daemon"], "running");
-    assert_eq!(document["status"]["runtime"]["generation"], 19);
+    assert_eq!(
+        document["status"]["runtime"]["active_generation"]["generation"],
+        19
+    );
     assert_eq!(document["diagnostics"]["desired_state"]["state"], "ready");
     assert_eq!(client.diagnoses(), 1);
     assert_eq!(source.calls(), 0);
@@ -401,7 +434,13 @@ fn explain_aliases_return_the_same_non_authorizing_rust_plan() {
         assert!(stderr.is_empty());
         let output = String::from_utf8(stdout).expect("UTF-8 explanation");
         assert!(output.starts_with("authorization: non_authorizing\n"));
-        assert!(output.contains("backend: xtables\n"));
+        assert!(output.contains("capture path request: auto\n"));
+        assert!(output.contains("runtime revision: 7\n"));
+        assert!(output.contains("active generation: 19\n"));
+        assert!(output.contains("active capture path selected: xtables_tproxy\n"));
+        assert!(output.contains("active capture path request relation: matches_desired_state\n"));
+        assert!(output.contains("latest capture path decision: selected:xtables_tproxy\n"));
+        assert!(output.contains("latest capture path request relation: matches_desired_state\n"));
         assert!(output.contains("engine config: schema=1 bytes=4096 digest="));
         assert_eq!(client.explanations(), 1);
     }
@@ -568,8 +607,16 @@ fn diagnostic_report() -> DiagnosticReport {
 
 fn explain_value() -> serde_json::Value {
     serde_json::json!({
-        "desired_state_schema": 3,
-        "backend": "xtables",
+        "desired_state_schema": 4,
+        "capture_path_request": "auto",
+        "runtime_revision": 7,
+        "active_generation": RuntimeGenerationBinding::new(
+            flux_core::GenerationId::new(19).expect("nonzero Generation"),
+            support::xtables_capture_path_selection(),
+        ),
+        "active_capture_path_request_relation": "matches_desired_state",
+        "latest_capture_path_decision": support::xtables_capture_path_decision(),
+        "latest_capture_path_request_relation": "matches_desired_state",
         "listener_port": 9898,
         "address_families": "dual_stack",
         "local_output": true,
@@ -599,7 +646,11 @@ fn observed_runtime() -> RuntimeSnapshot {
         capture: RuntimeCaptureState::Detached,
         engine: RuntimeEngineState::BackingOff,
         verification: RuntimeVerificationState::FunctionalFailed,
-        generation: flux_core::GenerationId::new(19),
+        active_generation: Some(RuntimeGenerationBinding::new(
+            flux_core::GenerationId::new(19).expect("nonzero Generation"),
+            support::xtables_capture_path_selection(),
+        )),
+        latest_capture_path_decision: Some(support::xtables_capture_path_decision()),
         last_error: Some(RuntimeFailure {
             operation: "maintain proxy engine".to_owned(),
             message: "owned child exited unexpectedly".to_owned(),

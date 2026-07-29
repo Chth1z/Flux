@@ -3,7 +3,7 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use flux_core::{
     AndroidNetdSourceProfile, AndroidTproxyRoutingShape, AndroidTproxyTopologyScopeRequest,
@@ -13,23 +13,24 @@ use flux_core::{
     plan_android_rpdb_placement,
 };
 use flux_platform::{
-    AndroidFwmarkCensusCoordinatorOutcome, AndroidFwmarkCensusCoordinatorPurpose,
-    AndroidFwmarkCensusCoordinatorRequest, NativeXtablesCaptureAdmission,
-    NativeXtablesCaptureAdmissionError, NativeXtablesCaptureTarget, NetworkInventorySource,
-    SingBoxLaunchSpec, SingBoxLauncher, SingBoxReadiness, SystemAndroidFwmarkCensusSource,
-    coordinate_android_fwmark_census_for_inventory,
+    AndroidCapturePathQualifications, AndroidFwmarkCensusCoordinatorOutcome,
+    AndroidFwmarkCensusCoordinatorPurpose, AndroidFwmarkCensusCoordinatorRequest,
+    NativeXtablesCaptureAdmission, NativeXtablesCaptureAdmissionError, NativeXtablesCaptureTarget,
+    NetworkInventorySource, SingBoxLaunchSpec, SingBoxLauncher, SingBoxReadiness,
+    SystemAndroidFwmarkCensusSource, coordinate_android_fwmark_census_for_inventory,
 };
 #[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
 use flux_platform::{NativeLinuxCompositionTestAdmission, NativeLinuxCompositionTestError};
 
 use crate::generation_engine_config::{
     AddressReconciledGenerationInputs, AddressReconciliationError, AddressReconciliationInspection,
-    AdmittedGeneration, AdmittedGenerationIdentity, DesiredStateCompileError,
-    EngineCapabilityProfileError, EngineConfigCompileError, GenerationAssembler,
-    GenerationAssemblyError, GenerationAssemblyRequest, GenerationPlanningAuthority,
-    SelectedEngineSource, TproxyEngineConfigRequest, bind_engine_config_to_spec,
-    collect_tproxy_engine_capability_profile, compile_address_reconciliation,
-    compile_tproxy_engine_config, read_bounded_regular_file,
+    AdmittedGeneration, AdmittedGenerationIdentity, CapturePathDecision,
+    CapturePathQualificationEvidence, CapturePathQualificationEvidenceError,
+    DesiredStateCompileError, EngineCapabilityProfileError, EngineConfigCompileError,
+    GenerationAssembler, GenerationAssemblyError, GenerationAssemblyRequest,
+    GenerationPlanningAuthority, SelectedEngineSource, TproxyEngineConfigRequest,
+    bind_engine_config_to_spec, collect_tproxy_engine_capability_profile,
+    compile_address_reconciliation, compile_tproxy_engine_config, read_bounded_regular_file,
 };
 use crate::intent_store::record_io;
 use crate::native_runtime_writer::{NativeGenerationSource, PreparedNativeGeneration};
@@ -175,8 +176,14 @@ impl SystemAndroidGenerationPlanningSource {
             .map_err(|source| {
                 SystemAndroidGenerationPlanningError::Placement(source.to_string().into_boxed_str())
             })?;
+        let capture_path_evidence = CapturePathQualificationEvidence::with_maximum_lifetime(
+            AndroidCapturePathQualifications::default(),
+            Instant::now(),
+        )
+        .map_err(SystemAndroidGenerationPlanningError::CapturePathEvidence)?;
         Ok(GenerationPlanningAuthority::android(
             evidence,
+            capture_path_evidence,
             Some(placement),
         ))
     }
@@ -207,6 +214,7 @@ pub(crate) enum SystemAndroidGenerationPlanningError {
     InitialAlreadyAccepted,
     InitialDesiredStateChanged,
     UnexpectedDiagnostic,
+    CapturePathEvidence(CapturePathQualificationEvidenceError),
     Census(Box<str>),
     Placement(Box<str>),
 }
@@ -228,6 +236,7 @@ impl fmt::Display for SystemAndroidGenerationPlanningError {
             Self::UnexpectedDiagnostic => {
                 formatter.write_str("Android planning census returned a diagnostic-only projection")
             }
+            Self::CapturePathEvidence(source) => source.fmt(formatter),
             Self::Census(detail) => write!(formatter, "Android planning census failed: {detail}"),
             Self::Placement(detail) => {
                 write!(
@@ -239,7 +248,14 @@ impl fmt::Display for SystemAndroidGenerationPlanningError {
     }
 }
 
-impl Error for SystemAndroidGenerationPlanningError {}
+impl Error for SystemAndroidGenerationPlanningError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::CapturePathEvidence(source) => Some(source),
+            _ => None,
+        }
+    }
+}
 
 pub(crate) trait NativeGenerationTargetAdmission: Send + 'static {
     type Target: Clone + Send + 'static;
@@ -432,8 +448,10 @@ where
     planning: P,
     admission: A,
     accepted_subscription: Option<ValidatedSubscriptionEngineConfig>,
+    latest_capture_path_decision: Option<CapturePathDecision>,
     pending: Option<PendingGeneration>,
     committed: Option<CommittedGeneration<I>>,
+    retired_config_path: Option<PathBuf>,
     identity: PhantomData<fn() -> I>,
 }
 
@@ -458,8 +476,10 @@ where
             planning,
             admission,
             accepted_subscription,
+            latest_capture_path_decision: None,
             pending: None,
             committed: None,
+            retired_config_path: None,
             identity: PhantomData,
         }
     }
@@ -544,6 +564,11 @@ where
                 "a native Generation candidate is already pending settlement",
             ));
         }
+        if self.retired_config_path.is_some() {
+            return Err(NativeGenerationSourceError::Invariant(
+                "retired native Generation file cleanup is still pending",
+            ));
+        }
         let prior_owned = self.committed.as_ref().map(|current| current.identity);
         let next = prior_owned
             .map_or(Some(GenerationId::INITIAL), |prior| {
@@ -605,15 +630,30 @@ where
             Some(prior) => request.with_prior_owned(prior),
             None => request,
         };
-        let admitted = GenerationAssembler
-            .assemble(request)
-            .map_err(NativeGenerationSourceError::Assembly)?;
+        let admitted = match GenerationAssembler.assemble(request) {
+            Ok(admitted) => {
+                self.latest_capture_path_decision = Some(CapturePathDecision::Selected {
+                    selection: admitted.capture_path_selection(),
+                });
+                admitted
+            }
+            Err(error) => {
+                if let GenerationAssemblyError::CapturePath(source) = &error {
+                    self.latest_capture_path_decision = Some(CapturePathDecision::Rejected {
+                        rejection: source.rejection(),
+                    });
+                }
+                return Err(NativeGenerationSourceError::Assembly(error));
+            }
+        };
         if admitted.generation() != expected_generation {
             return Err(NativeGenerationSourceError::Invariant(
                 "Generation assembler returned an unexpected successor identifier",
             ));
         }
         let identity = admitted.identity();
+        let capture_path_selection = admitted.capture_path_selection();
+        let capture_path_evidence_deadline = admitted.capture_path_evidence_deadline();
         let target = self
             .admission
             .admit(admitted)
@@ -629,6 +669,8 @@ where
         Ok(PreparedNativeGeneration::new(
             expected_generation,
             spec,
+            capture_path_selection,
+            capture_path_evidence_deadline,
             target,
         ))
     }
@@ -651,13 +693,21 @@ where
         let target = target.ok_or(NativeGenerationSourceError::Invariant(
             "running source settlement omitted the active target identity",
         ))?;
-        if let Some(pending) = self.pending.take() {
+        if let Some(pending) = self.pending.as_ref() {
             if pending.identity.generation() != generation {
-                self.pending = Some(pending);
                 return Err(NativeGenerationSourceError::Invariant(
                     "running source settlement identified a different candidate",
                 ));
             }
+            if self.retired_config_path.is_some() {
+                return Err(NativeGenerationSourceError::Invariant(
+                    "running source settlement overlapped retired file cleanup",
+                ));
+            }
+            let pending = self
+                .pending
+                .take()
+                .expect("validated pending native Generation remains present");
             let previous = self.committed.replace(CommittedGeneration {
                 identity: pending.identity,
                 target,
@@ -667,16 +717,13 @@ where
                 config_path: pending.config_path,
             });
             self.accepted_subscription = pending.subscription;
-            if let Some(previous) = previous {
-                remove_generation_file(&previous.config_path)?;
-            }
-            return Ok(());
+            self.retired_config_path = previous.map(|generation| generation.config_path);
         }
-        match self.committed.as_mut() {
+        match self.committed.as_ref() {
             Some(committed)
                 if committed.identity.generation() == generation && committed.target == target =>
             {
-                Ok(())
+                self.discard_retired_config()
             }
             _ => Err(NativeGenerationSourceError::Invariant(
                 "running source settlement has no matching committed or pending Generation",
@@ -685,9 +732,40 @@ where
     }
 
     fn discard_pending(&mut self) -> Result<(), NativeGenerationSourceError> {
-        if let Some(pending) = self.pending.take() {
+        if let Some(pending) = self.pending.as_ref() {
             remove_generation_file(&pending.config_path)?;
         }
+        self.pending = None;
+        Ok(())
+    }
+
+    fn discard_retired_config(&mut self) -> Result<(), NativeGenerationSourceError> {
+        if let Some(path) = self.retired_config_path.as_ref() {
+            remove_generation_file(path)?;
+        }
+        self.retired_config_path = None;
+        Ok(())
+    }
+
+    fn reject_pending(
+        &mut self,
+        generation: GenerationId,
+        prior: Option<I>,
+    ) -> Result<(), NativeGenerationSourceError> {
+        self.require_prior(prior)?;
+        let pending = self
+            .pending
+            .as_ref()
+            .ok_or(NativeGenerationSourceError::Invariant(
+                "prepared rejection has no pending native Generation",
+            ))?;
+        if pending.identity.generation() != generation {
+            return Err(NativeGenerationSourceError::Invariant(
+                "prepared rejection identified a different native Generation",
+            ));
+        }
+        remove_generation_file(&pending.config_path)?;
+        self.pending = None;
         Ok(())
     }
 
@@ -784,6 +862,22 @@ where
         true
     }
 
+    fn latest_capture_path_decision(&self) -> Option<CapturePathDecision> {
+        self.latest_capture_path_decision
+    }
+
+    fn invalidate_latest_capture_path_decision(&mut self) {
+        self.latest_capture_path_decision = None;
+    }
+
+    fn reject_prepared(
+        &mut self,
+        generation: GenerationId,
+        prior: Option<I>,
+    ) -> Result<(), Self::Error> {
+        self.reject_pending(generation, prior)
+    }
+
     fn settle(
         &mut self,
         phase: PublishedRuntimeState,
@@ -796,9 +890,11 @@ where
             PublishedRuntimeState::Failed => self.discard_pending(),
             PublishedRuntimeState::Stopped => {
                 self.discard_pending()?;
-                if let Some(committed) = self.committed.take() {
+                self.discard_retired_config()?;
+                if let Some(committed) = self.committed.as_ref() {
                     remove_generation_file(&committed.config_path)?;
                 }
+                self.committed = None;
                 Ok(())
             }
         }
@@ -954,6 +1050,7 @@ mod tests {
     use super::*;
     use crate::generation_engine_config::{
         HostInspectionPlanningAuthority, SelectedEngineSourceIdentity,
+        qualified_xtables_capture_path_evidence, qualified_xtables_kernel_config,
     };
 
     const PACKAGED_DESIRED_STATE: &str = include_str!("../../../conf/flux.toml");
@@ -997,6 +1094,7 @@ esac
 
     struct HostPlanning {
         capability_profile: CapabilityProfile,
+        capture_path_evidence: CapturePathQualificationEvidence,
     }
 
     impl NativeGenerationPlanningSource for HostPlanning {
@@ -1010,6 +1108,8 @@ esac
             Ok(GenerationPlanningAuthority::host_inspection(
                 HostInspectionPlanningAuthority::new(
                     &self.capability_profile,
+                    qualified_xtables_kernel_config(),
+                    self.capture_path_evidence,
                     inventory,
                     NetworkNamespaceIdentity::new(10, 20).expect("network namespace identity"),
                     FwmarkCandidate::new(0x00ff_0000, 0x0080_0000, 0x0040_0000).expect("test mark"),
@@ -1044,6 +1144,7 @@ esac
         desired_state_path: PathBuf,
         state_root: PathBuf,
         desired_state: FluxConfig,
+        capture_path_evidence_deadline: Instant,
     }
 
     impl SourceFixture {
@@ -1098,11 +1199,14 @@ esac
                 directory.path(),
                 directory.path().join("sing-box.log"),
             );
+            let capture_path_evidence = qualified_xtables_capture_path_evidence();
+            let capture_path_evidence_deadline = capture_path_evidence.valid_until();
             let assembled = AssembledNativeGenerationSource::new(
                 paths,
                 inventory.clone(),
                 HostPlanning {
                     capability_profile: CapabilityProfileFixture::device_qualified(),
+                    capture_path_evidence,
                 },
                 RecordingAdmission::default(),
                 accepted_subscription,
@@ -1115,6 +1219,7 @@ esac
                 desired_state_path,
                 state_root,
                 desired_state,
+                capture_path_evidence_deadline,
             }
         }
 
@@ -1170,6 +1275,7 @@ esac
             .expect("fixture publishes a complete inventory");
         let mut host_planning = HostPlanning {
             capability_profile: CapabilityProfileFixture::device_qualified(),
+            capture_path_evidence: qualified_xtables_capture_path_evidence(),
         };
         let initial = host_planning
             .plan(&fixture.desired_state, &inventory)
@@ -1220,6 +1326,18 @@ esac
         assert_eq!(
             error,
             SystemAndroidGenerationPlanningError::ForwardedIngressUnsupported
+        );
+    }
+
+    #[test]
+    fn prepared_runtime_preserves_the_planning_evidence_deadline() {
+        let mut fixture = SourceFixture::new(false);
+
+        let prepared = fixture.commit_initial();
+
+        assert_eq!(
+            prepared.runtime().capture_path_evidence_deadline(),
+            fixture.capture_path_evidence_deadline
         );
     }
 
@@ -1287,6 +1405,68 @@ esac
     }
 
     #[test]
+    fn running_settlement_retains_predecessor_file_ownership_until_deletion_succeeds() {
+        let mut fixture = SourceFixture::new(true);
+        fixture.commit_initial();
+        let first_path = fixture.generation_path(1);
+        let displaced = fixture.state_root.join("displaced-engine-1.json");
+        fs::rename(&first_path, &displaced).expect("displace predecessor source");
+        fs::create_dir(&first_path).expect("replace predecessor source with a directory");
+        let changed = fixture.changed_inventory();
+        fixture.inventory.publish(Some(Arc::clone(&changed)));
+        let inputs = compile_address_reconciliation(&fixture.desired_state_path, changed)
+            .expect("compile changed address inputs");
+        let successor = fixture
+            .source
+            .prepare_address_successor(&inputs, 1)
+            .expect("prepare address successor")
+            .expect("changed address input needs a successor");
+
+        fixture
+            .source
+            .settle(
+                PublishedRuntimeState::Running {
+                    generation: successor.runtime().id(),
+                },
+                Some(*successor.target()),
+            )
+            .expect_err("directory cannot be removed as an immutable source file");
+
+        assert_eq!(
+            fixture.source.retired_config_path.as_deref(),
+            Some(first_path.as_path())
+        );
+        assert_eq!(
+            fixture
+                .source
+                .committed
+                .as_ref()
+                .map(|generation| generation.identity.generation()),
+            GenerationId::new(2)
+        );
+        assert!(matches!(
+            fixture.source.prepare(Reason::UserControl, Some(2)),
+            Err(NativeGenerationSourceError::Invariant(_))
+        ));
+
+        fs::remove_dir(&first_path).expect("remove injected predecessor directory");
+        fs::rename(&displaced, &first_path).expect("restore predecessor source");
+        fixture
+            .source
+            .settle(
+                PublishedRuntimeState::Running {
+                    generation: successor.runtime().id(),
+                },
+                Some(*successor.target()),
+            )
+            .expect("retry predecessor cleanup");
+
+        assert!(fixture.source.retired_config_path.is_none());
+        assert!(!first_path.exists());
+        assert!(fixture.generation_path(2).exists());
+    }
+
+    #[test]
     fn failed_subscription_candidate_keeps_the_prior_selected_source_active() {
         let mut fixture = SourceFixture::new(true);
         fixture.commit_initial();
@@ -1324,6 +1504,121 @@ esac
             .source
             .settle(PublishedRuntimeState::Failed, Some(*retry.target()))
             .expect("discard retry fixture");
+    }
+
+    #[test]
+    fn rejected_initial_candidate_removes_its_file_and_releases_the_pending_slot() {
+        let mut fixture = SourceFixture::new(false);
+
+        let rejected = fixture
+            .source
+            .prepare(Reason::Boot, None)
+            .expect("prepare initial candidate");
+        let candidate_path = fixture.generation_path(1);
+        assert_eq!(rejected.runtime().id(), GenerationId::INITIAL);
+        assert!(candidate_path.exists(), "prepared source file must exist");
+
+        fixture
+            .source
+            .settle(PublishedRuntimeState::Failed, None)
+            .expect("reject initial candidate");
+        assert!(!candidate_path.exists(), "rejected source file is removed");
+
+        let retry = fixture
+            .source
+            .prepare(Reason::DaemonRecovery, None)
+            .expect("pending slot is reusable after rejection");
+        assert_eq!(retry.runtime().id(), GenerationId::INITIAL);
+        assert!(
+            candidate_path.exists(),
+            "retry recreates the candidate file"
+        );
+        fixture
+            .source
+            .settle(PublishedRuntimeState::Failed, None)
+            .expect("clean retry fixture");
+        assert!(!candidate_path.exists());
+    }
+
+    #[test]
+    fn prepared_rejection_requires_the_exact_generation_and_prior_lineage() {
+        let mut fixture = SourceFixture::new(false);
+        let rejected = fixture
+            .source
+            .prepare(Reason::Boot, None)
+            .expect("prepare initial candidate");
+        let candidate_path = fixture.generation_path(1);
+
+        assert!(matches!(
+            fixture.source.reject_prepared(
+                GenerationId::new(2).expect("nonzero mismatched Generation"),
+                None,
+            ),
+            Err(NativeGenerationSourceError::Invariant(_))
+        ));
+        assert!(candidate_path.exists());
+        assert!(fixture.source.pending.is_some());
+        assert!(matches!(
+            fixture
+                .source
+                .reject_prepared(rejected.runtime().id(), Some(99)),
+            Err(NativeGenerationSourceError::Invariant(_))
+        ));
+        assert!(candidate_path.exists());
+        assert!(fixture.source.pending.is_some());
+
+        fixture
+            .source
+            .reject_prepared(rejected.runtime().id(), None)
+            .expect("exact candidate rejection succeeds");
+        assert!(!candidate_path.exists());
+        assert!(fixture.source.pending.is_none());
+    }
+
+    #[test]
+    fn prepared_rejection_cannot_discard_a_committed_generation() {
+        let mut fixture = SourceFixture::new(false);
+        let committed = fixture.commit_initial();
+        let committed_path = fixture.generation_path(1);
+
+        assert!(matches!(
+            fixture
+                .source
+                .reject_prepared(committed.runtime().id(), Some(*committed.target())),
+            Err(NativeGenerationSourceError::Invariant(_))
+        ));
+
+        assert!(committed_path.exists());
+        assert!(fixture.source.pending.is_none());
+        assert_eq!(
+            fixture
+                .source
+                .committed
+                .as_ref()
+                .map(|generation| generation.identity.generation()),
+            Some(committed.runtime().id())
+        );
+    }
+
+    #[test]
+    fn failure_before_selection_preserves_the_latest_capture_path_decision() {
+        let mut fixture = SourceFixture::new(false);
+        fixture.commit_initial();
+        let selected = fixture
+            .source
+            .latest_capture_path_decision()
+            .expect("initial selected Capture Path decision");
+
+        let error = match fixture.source.prepare(Reason::UserControl, None) {
+            Ok(_) => panic!("incorrect prior target passed before Capture Path selection"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, NativeGenerationSourceError::Invariant(_)));
+        assert_eq!(
+            fixture.source.latest_capture_path_decision(),
+            Some(selected)
+        );
     }
 
     #[test]
@@ -1395,6 +1690,32 @@ esac
         assert!(!fixture.generation_path(1).exists());
         assert_eq!(fixture.source.committed_engine_source(), None);
         assert_eq!(fixture.source.committed_desired_state(), None);
+    }
+
+    #[test]
+    fn stopped_settlement_retains_committed_file_ownership_until_deletion_succeeds() {
+        let mut fixture = SourceFixture::new(false);
+        fixture.commit_initial();
+        let committed_path = fixture.generation_path(1);
+        let displaced = fixture.state_root.join("displaced-stopped-engine-1.json");
+        fs::rename(&committed_path, &displaced).expect("displace committed source");
+        fs::create_dir(&committed_path).expect("replace committed source with a directory");
+
+        fixture
+            .source
+            .settle(PublishedRuntimeState::Stopped, None)
+            .expect_err("directory cannot be removed as an immutable source file");
+
+        assert!(fixture.source.committed.is_some());
+        fs::remove_dir(&committed_path).expect("remove injected committed directory");
+        fs::rename(&displaced, &committed_path).expect("restore committed source");
+        fixture
+            .source
+            .settle(PublishedRuntimeState::Stopped, None)
+            .expect("retry committed source cleanup");
+
+        assert!(!committed_path.exists());
+        assert!(fixture.source.committed.is_none());
     }
 
     fn subscription_config(

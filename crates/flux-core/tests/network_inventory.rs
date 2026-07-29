@@ -192,7 +192,6 @@ fn routing_publications_preserve_order_multiplicity_and_epoch_semantics() {
     let initial = tracker
         .publish_complete_with_routing([link.clone()], [address], routes.clone(), rules.clone())
         .expect("complete routed inventory");
-    let initial_pointer = std::ptr::from_ref(initial);
     let initial_snapshot_id = initial.snapshot_id();
     let initial_epoch = initial.epoch();
     assert_eq!(initial.routes(), &routes);
@@ -201,8 +200,7 @@ fn routing_publications_preserve_order_multiplicity_and_epoch_semantics() {
     let unchanged = tracker
         .publish_complete_with_routing([link.clone()], [address], routes.clone(), rules.clone())
         .expect("unchanged routed inventory");
-    assert_eq!(std::ptr::from_ref(unchanged), initial_pointer);
-    assert_eq!(unchanged.snapshot_id(), initial_snapshot_id);
+    assert_ne!(unchanged.snapshot_id(), initial_snapshot_id);
     assert_eq!(unchanged.epoch(), initial_epoch);
 
     let reordered = tracker
@@ -264,7 +262,7 @@ fn opaque_rule_fingerprint_changes_advance_inventory_identity() {
         .publish_complete_with_routing([], [], [], [first_opaque])
         .expect("identical opaque rule inventory");
     assert_eq!(unchanged.epoch(), opaque_epoch);
-    assert_eq!(unchanged.snapshot_id(), opaque_snapshot);
+    assert_ne!(unchanged.snapshot_id(), opaque_snapshot);
 
     let changed = tracker
         .publish_complete_with_routing([], [], [], [changed_opaque])
@@ -409,7 +407,7 @@ fn link_only_and_address_only_changes_advance_separate_epochs() {
 }
 
 #[test]
-fn unchanged_combined_snapshot_retains_the_published_inventory() {
+fn unchanged_combined_facts_retain_epoch_but_advance_observation_identity() {
     let first_address = address_record(7, IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)), 24, 0);
     let second_address = address_record(9, IpAddr::V6(Ipv6Addr::LOCALHOST), 128, 0x80);
     let first_link = link_record(7, b"eth0");
@@ -422,7 +420,7 @@ fn unchanged_combined_snapshot_retains_the_published_inventory() {
             [first_address, second_address],
         )
         .expect("initial combined snapshot");
-    let initial_pointer = std::ptr::from_ref(initial);
+    let initial_snapshot_id = initial.snapshot_id();
     let initial_epoch = initial.epoch();
     let unchanged = tracker
         .publish_complete(
@@ -431,7 +429,7 @@ fn unchanged_combined_snapshot_retains_the_published_inventory() {
         )
         .expect("unchanged combined snapshot");
 
-    assert_eq!(std::ptr::from_ref(unchanged), initial_pointer);
+    assert_ne!(unchanged.snapshot_id(), initial_snapshot_id);
     assert_eq!(unchanged.epoch(), initial_epoch);
     assert_eq!(unchanged.links(), &[first_link, link_record(9, b"tun0")]);
     assert_eq!(unchanged.addresses(), &[first_address, second_address]);

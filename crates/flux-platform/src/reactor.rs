@@ -15,6 +15,13 @@ pub enum StopDisposition {
     Exited,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NetworkInventoryRefreshDisposition {
+    Requested,
+    AlreadyPending,
+    Unavailable,
+}
+
 #[derive(Debug)]
 pub enum NetworkInventoryDegradation {
     Initialization(PlatformError),
@@ -157,14 +164,14 @@ mod implementation {
     use std::collections::HashMap;
     use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
     use std::path::Path;
-    use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
+    use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
     use std::sync::{Arc, Mutex, MutexGuard};
     use std::thread::{self, JoinHandle};
     use std::time::{Duration, Instant};
 
     use super::{
-        MAX_ACCEPTS_PER_TURN, MAX_WORKERS, NetworkInventoryDegradation, ReactorError,
-        StopDisposition,
+        MAX_ACCEPTS_PER_TURN, MAX_WORKERS, NetworkInventoryDegradation,
+        NetworkInventoryRefreshDisposition, ReactorError, StopDisposition,
     };
     use crate::address_sync::AddressEventPolicy;
     use crate::file_observer::{FileObservationDriveReport, FileObserverDriver};
@@ -326,6 +333,52 @@ mod implementation {
         }
     }
 
+    #[derive(Clone)]
+    pub struct NetworkInventoryRefreshHandle {
+        requests: SyncSender<()>,
+        wake: Arc<ReactorWake>,
+        source: NetworkInventorySource,
+    }
+
+    impl NetworkInventoryRefreshHandle {
+        pub fn request_refresh(&self) -> Result<NetworkInventoryRefreshDisposition, PlatformError> {
+            if self.wake.is_stopping() {
+                return Ok(NetworkInventoryRefreshDisposition::Unavailable);
+            }
+            self.source.begin_explicit_refresh().ok_or_else(|| {
+                system_call_error(
+                    "advance Network Inventory refresh revision",
+                    std::io::Error::from_raw_os_error(libc::EOVERFLOW),
+                )
+            })?;
+            match self.requests.try_send(()) {
+                Ok(()) => {
+                    self.wake.notify()?;
+                    Ok(NetworkInventoryRefreshDisposition::Requested)
+                }
+                Err(TrySendError::Full(())) => {
+                    self.wake.notify()?;
+                    Ok(NetworkInventoryRefreshDisposition::AlreadyPending)
+                }
+                Err(TrySendError::Disconnected(())) => {
+                    Ok(NetworkInventoryRefreshDisposition::Unavailable)
+                }
+            }
+        }
+    }
+
+    pub struct NetworkInventoryAttachment {
+        source: NetworkInventorySource,
+        refresh: NetworkInventoryRefreshHandle,
+    }
+
+    impl NetworkInventoryAttachment {
+        #[must_use]
+        pub fn into_parts(self) -> (NetworkInventorySource, NetworkInventoryRefreshHandle) {
+            (self.source, self.refresh)
+        }
+    }
+
     struct WorkerCompletion {
         worker_id: u64,
         panicked: bool,
@@ -360,6 +413,7 @@ mod implementation {
 
     struct NetworkInventoryRegistration {
         driver: RouteNetworkInventoryDriver,
+        refresh_requests: Receiver<()>,
         on_degradation: Box<dyn FnOnce(NetworkInventoryDegradation) + Send>,
     }
 
@@ -376,6 +430,13 @@ mod implementation {
 
         fn drive_due(&mut self, now: Instant) -> Result<(), PlatformError> {
             self.driver.drive_due(now).map(|_| ())
+        }
+
+        fn drive_refresh_request(&mut self, now: Instant) -> Result<(), PlatformError> {
+            match self.refresh_requests.try_recv() {
+                Ok(()) => self.driver.request_refresh(now),
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => Ok(()),
+            }
         }
 
         fn degrade(mut self, degradation: NetworkInventoryDegradation) {
@@ -526,7 +587,7 @@ mod implementation {
         pub fn attach_network_inventory<D>(
             &mut self,
             on_degradation: D,
-        ) -> Result<Option<NetworkInventorySource>, ReactorError>
+        ) -> Result<Option<NetworkInventoryAttachment>, ReactorError>
         where
             D: FnOnce(NetworkInventoryDegradation) + Send + 'static,
         {
@@ -553,11 +614,18 @@ mod implementation {
                 on_degradation(NetworkInventoryDegradation::Initialization(error));
                 return Ok(None);
             }
+            let (refresh_sender, refresh_requests) = mpsc::sync_channel(1);
+            let refresh = NetworkInventoryRefreshHandle {
+                requests: refresh_sender,
+                wake: Arc::clone(&self.wake),
+                source: source.clone(),
+            };
             self.network_inventory = Some(NetworkInventoryRegistration {
                 driver,
+                refresh_requests,
                 on_degradation: Box::new(on_degradation),
             });
-            Ok(Some(source))
+            Ok(Some(NetworkInventoryAttachment { source, refresh }))
         }
 
         pub fn attach_file_observation<O, I>(
@@ -623,6 +691,12 @@ mod implementation {
 
                 if ready.wake {
                     self.reap_completed_workers()?;
+                    let error = self.network_inventory.as_mut().and_then(|registration| {
+                        registration.drive_refresh_request(Instant::now()).err()
+                    });
+                    if let Some(error) = error {
+                        self.degrade_network_inventory(NetworkInventoryDegradation::Runtime(error));
+                    }
                 }
                 if self.wake.is_stopping() {
                     return Ok(());
@@ -1108,7 +1182,10 @@ mod implementation {
 mod implementation {
     use std::path::Path;
 
-    use super::{NetworkInventoryDegradation, ReactorError, StopDisposition};
+    use super::{
+        NetworkInventoryDegradation, NetworkInventoryRefreshDisposition, ReactorError,
+        StopDisposition,
+    };
     use crate::{
         FileObservationBatch, FileObservationError, FileObservationPaths, NetworkInventorySource,
         PlatformError, SeqpacketConnection, ShutdownSignal,
@@ -1146,7 +1223,7 @@ mod implementation {
         pub fn attach_network_inventory<D>(
             &mut self,
             _on_degradation: D,
-        ) -> Result<Option<NetworkInventorySource>, ReactorError>
+        ) -> Result<Option<NetworkInventoryAttachment>, ReactorError>
         where
             D: FnOnce(NetworkInventoryDegradation) + Send + 'static,
         {
@@ -1179,6 +1256,26 @@ mod implementation {
             Err(PlatformError::UnsupportedPlatform(std::env::consts::OS))
         }
     }
+
+    pub enum NetworkInventoryAttachment {}
+
+    impl NetworkInventoryAttachment {
+        #[must_use]
+        pub fn into_parts(self) -> (NetworkInventorySource, NetworkInventoryRefreshHandle) {
+            match self {}
+        }
+    }
+
+    #[derive(Clone)]
+    pub struct NetworkInventoryRefreshHandle;
+
+    impl NetworkInventoryRefreshHandle {
+        pub fn request_refresh(&self) -> Result<NetworkInventoryRefreshDisposition, PlatformError> {
+            Err(PlatformError::UnsupportedPlatform(std::env::consts::OS))
+        }
+    }
 }
 
-pub use implementation::{DaemonReactor, ReactorStopHandle};
+pub use implementation::{
+    DaemonReactor, NetworkInventoryAttachment, NetworkInventoryRefreshHandle, ReactorStopHandle,
+};

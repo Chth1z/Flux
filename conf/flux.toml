@@ -1,4 +1,4 @@
-schema = 3
+schema = 4
 
 [daemon]
 fail_policy = "open"
@@ -20,7 +20,7 @@ restart_maximum_backoff_ms = 30000
 restart_stable_reset_ms = 30000
 
 [capture]
-backend = "xtables"
+path = "auto"
 local_output = true
 forwarded_ingress = false
 ipv4 = true

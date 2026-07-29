@@ -4,8 +4,9 @@ use std::io;
 use std::time::Duration;
 
 use flux_core::{
-    AndroidUserSelection, CaptureApplicationMode, CaptureBackend, CaptureTrafficDomain,
-    CaptureTransportProtocol, ConfigErrorKind, FailurePolicy, FluxConfig, NetworkAddressFamily,
+    AndroidUserSelection, CaptureApplicationMode, CapturePathId, CapturePathRequest,
+    CaptureTrafficDomain, CaptureTransportProtocol, ConfigErrorKind, FailurePolicy, FluxConfig,
+    NetworkAddressFamily,
 };
 
 const COMPLETE_CONFIG: &str = include_str!("../../../conf/flux.toml");
@@ -14,7 +15,7 @@ const COMPLETE_CONFIG: &str = include_str!("../../../conf/flux.toml");
 fn parses_the_complete_desired_state_schema() {
     let config = FluxConfig::parse(COMPLETE_CONFIG).expect("complete schema should parse");
 
-    assert_eq!(config.schema(), 3);
+    assert_eq!(config.schema(), 4);
     assert_eq!(config.daemon().fail_policy(), FailurePolicy::Open);
     assert_eq!(
         config.daemon().reconcile_debounce().get(),
@@ -28,7 +29,7 @@ fn parses_the_complete_desired_state_schema() {
     );
     assert_eq!(config.engine().credentials().uid().get(), 0);
     assert_eq!(config.engine().credentials().gid().get(), 0);
-    assert_eq!(config.capture().backend(), CaptureBackend::Xtables);
+    assert_eq!(config.capture().path_request(), CapturePathRequest::Auto);
     assert!(
         config
             .capture()
@@ -105,7 +106,7 @@ fn rejects_an_undocumented_failure_policy() {
 
 #[test]
 fn requires_the_schema_field() {
-    let input = COMPLETE_CONFIG.replacen("schema = 3\n\n", "", 1);
+    let input = COMPLETE_CONFIG.replacen("schema = 4\n\n", "", 1);
 
     let error = FluxConfig::parse(&input).expect_err("schema is mandatory");
 
@@ -131,7 +132,7 @@ fn requires_every_daemon_field() {
 
 #[test]
 fn rejects_duplicate_fields() {
-    let input = COMPLETE_CONFIG.replacen("schema = 3", "schema = 3\nschema = 3", 1);
+    let input = COMPLETE_CONFIG.replacen("schema = 4", "schema = 4\nschema = 4", 1);
 
     let error = FluxConfig::parse(&input).expect_err("duplicate fields are ambiguous");
 
@@ -140,15 +141,15 @@ fn rejects_duplicate_fields() {
 
 #[test]
 fn rejects_an_unsupported_schema_version() {
-    let input = COMPLETE_CONFIG.replacen("schema = 3", "schema = 4", 1);
+    let input = COMPLETE_CONFIG.replacen("schema = 4", "schema = 5", 1);
 
-    let error = FluxConfig::parse(&input).expect_err("schema 4 is not supported");
+    let error = FluxConfig::parse(&input).expect_err("schema 5 is not supported");
 
     assert!(matches!(
         error.kind(),
         ConfigErrorKind::UnsupportedSchema {
-            found: 4,
-            supported: 3
+            found: 5,
+            supported: 4
         }
     ));
 }
@@ -199,14 +200,31 @@ fn requires_every_complete_desired_state_section() {
 }
 
 #[test]
-fn admits_only_the_explicit_xtables_backend() {
-    for backend in ["auto", "nftables", "tun", "iptables_restore"] {
-        let input = COMPLETE_CONFIG.replacen(
-            "backend = \"xtables\"",
-            &format!("backend = \"{backend}\""),
-            1,
-        );
-        let error = FluxConfig::parse(&input).expect_err("deferred backend must fail closed");
+fn admits_only_the_current_capture_path_request_grammar() {
+    for (path, expected) in [
+        ("auto", CapturePathRequest::Auto),
+        (
+            "nftables_tproxy",
+            CapturePathRequest::Exact(CapturePathId::NftablesTproxy),
+        ),
+        (
+            "xtables_tproxy",
+            CapturePathRequest::Exact(CapturePathId::XtablesTproxy),
+        ),
+        (
+            "managed_tun",
+            CapturePathRequest::Exact(CapturePathId::ManagedTun),
+        ),
+    ] {
+        let input = COMPLETE_CONFIG.replacen("path = \"auto\"", &format!("path = \"{path}\""), 1);
+        let config = FluxConfig::parse(&input).expect("current path request must parse");
+        assert_eq!(config.capture().path_request(), expected);
+    }
+
+    for retired in ["xtables", "nftables", "tun", "iptables_restore"] {
+        let input =
+            COMPLETE_CONFIG.replacen("path = \"auto\"", &format!("path = \"{retired}\""), 1);
+        let error = FluxConfig::parse(&input).expect_err("retired path token must fail closed");
         assert_eq!(error.kind(), ConfigErrorKind::InvalidToml);
     }
 }

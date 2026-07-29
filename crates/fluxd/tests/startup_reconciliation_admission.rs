@@ -28,7 +28,7 @@ const SAFETY_REJECTION_HELPER_ROOT: &str = "FLUXD_TEST_SAFETY_REJECTION_HELPER_R
 fn packaged_default_config_matches_the_strict_product_schema() {
     let config = FluxConfig::parse(PACKAGED_CONFIG).expect("packaged flux.toml must be valid");
 
-    assert_eq!(config.schema(), 3);
+    assert_eq!(config.schema(), 4);
     assert_eq!(config.daemon().fail_policy(), FailurePolicy::Open);
     assert_eq!(
         config.daemon().reconcile_debounce().get(),

@@ -101,7 +101,7 @@ pub use capability::{
     SHA256_DIGEST_BYTES, SecurityPatchLevel, SelinuxMode, SelinuxPolicyIdentity, Sha256Digest,
     Sha256DigestError, ToolId, VendorBuildIdentity, VerifiedBootIdentity, VerifiedBootState,
 };
-pub use capture_path::CapturePathId;
+pub use capture_path::{CapturePathId, CapturePathRequest, ImplementedCaptureAdapters};
 pub use capture_program::{
     AddressHostSetProvenance, CAPTURE_PROGRAM_SCHEMA_VERSION, CaptureApplicationMode,
     CaptureApplicationPolicy, CaptureApplicationPolicyError, CaptureBypassPolicy,
@@ -118,8 +118,8 @@ pub use capture_program::{
     MAX_CAPTURE_POLICY_UIDS, compile_capture_program,
 };
 pub use config::{
-    AndroidPackageName, AndroidUserSelection, ApplicationConfig, BypassConfig, CaptureBackend,
-    CaptureConfig, ConfigError, ConfigErrorKind, DaemonConfig, EngineConfig, EngineRestartConfig,
+    AndroidPackageName, AndroidUserSelection, ApplicationConfig, BypassConfig, CaptureConfig,
+    ConfigError, ConfigErrorKind, DaemonConfig, EngineConfig, EngineRestartConfig,
     EventQueueCapacity, FailurePolicy, FluxConfig, GenerationHistory, InterfaceConfig,
     ListenerConfig, MAX_CONFIG_DOCUMENT_BYTES, ReconcileDebounce, SafetyConfig, SubscriptionConfig,
 };

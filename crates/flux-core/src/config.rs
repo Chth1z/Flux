@@ -18,9 +18,11 @@ use crate::capture_program::{
     MAX_CAPTURE_INTERFACE_SELECTORS, MAX_CAPTURE_POLICY_PREFIX_INPUTS,
 };
 use crate::network_inventory::InterfaceName;
-use crate::{AddressHostFamilySelection, CaptureGroupId, CaptureUserId};
+use crate::{
+    AddressHostFamilySelection, CaptureGroupId, CapturePathId, CapturePathRequest, CaptureUserId,
+};
 
-const SUPPORTED_SCHEMA: u16 = 3;
+const SUPPORTED_SCHEMA: u16 = 4;
 /// Maximum UTF-8 byte length accepted by the Phase-1 configuration seam.
 pub const MAX_CONFIG_DOCUMENT_BYTES: usize = 64 * 1_024;
 const LOAD_READ_LIMIT: u64 = MAX_CONFIG_DOCUMENT_BYTES as u64 + 1;
@@ -525,13 +527,8 @@ impl EngineRestartConfig {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CaptureBackend {
-    Xtables,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CaptureConfig {
-    backend: CaptureBackend,
+    path_request: CapturePathRequest,
     scope: CaptureTrafficScope,
     protocols: CaptureProtocolSet,
 }
@@ -563,8 +560,17 @@ impl CaptureConfig {
             )
         })?;
         Ok(Self {
-            backend: match raw.backend {
-                RawCaptureBackend::Xtables => CaptureBackend::Xtables,
+            path_request: match raw.path {
+                RawCapturePathRequest::Auto => CapturePathRequest::Auto,
+                RawCapturePathRequest::NftablesTproxy => {
+                    CapturePathRequest::Exact(CapturePathId::NftablesTproxy)
+                }
+                RawCapturePathRequest::XtablesTproxy => {
+                    CapturePathRequest::Exact(CapturePathId::XtablesTproxy)
+                }
+                RawCapturePathRequest::ManagedTun => {
+                    CapturePathRequest::Exact(CapturePathId::ManagedTun)
+                }
             },
             scope,
             protocols,
@@ -572,8 +578,8 @@ impl CaptureConfig {
     }
 
     #[must_use]
-    pub const fn backend(self) -> CaptureBackend {
-        self.backend
+    pub const fn path_request(self) -> CapturePathRequest {
+        self.path_request
     }
 
     #[must_use]
@@ -1204,7 +1210,7 @@ struct RawEngineConfig {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawCaptureConfig {
-    backend: RawCaptureBackend,
+    path: RawCapturePathRequest,
     local_output: bool,
     forwarded_ingress: bool,
     ipv4: bool,
@@ -1214,9 +1220,12 @@ struct RawCaptureConfig {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum RawCaptureBackend {
-    Xtables,
+#[serde(rename_all = "snake_case")]
+enum RawCapturePathRequest {
+    Auto,
+    NftablesTproxy,
+    XtablesTproxy,
+    ManagedTun,
 }
 
 #[derive(Deserialize)]

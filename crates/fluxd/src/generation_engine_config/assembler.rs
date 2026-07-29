@@ -6,10 +6,11 @@ use std::path::Path;
 
 use flux_core::{
     AddressHostFamilySelection, AndroidMarkPlanningAuthority, AndroidUserSelection,
-    CapabilityProfile, CaptureApplicationMode, CaptureBackend, CaptureInterfaceSelectorKind,
-    CaptureTrafficDomain, CaptureTransportProtocol, FluxConfig, FwmarkCandidate, GenerationId,
-    NetworkAddressFamily, NetworkEpoch, NetworkInventory, NetworkInventorySnapshotId,
-    NetworkNamespaceIdentity, RpdbPlacementLease, StaleRpdbPlacementLease,
+    CapabilityProfile, CaptureApplicationMode, CaptureInterfaceSelectorKind, CapturePathId,
+    CapturePathRequest, CaptureTrafficDomain, CaptureTransportProtocol, FluxConfig,
+    FwmarkCandidate, GenerationId, NetworkAddressFamily, NetworkEpoch, NetworkInventory,
+    NetworkInventorySnapshotId, NetworkNamespaceIdentity, RpdbPlacementLease,
+    StaleRpdbPlacementLease,
 };
 use flux_platform::{
     SingBoxLauncher, SingBoxReadiness, XtablesCaptureArtifactSet, XtablesCaptureLoweringError,
@@ -1048,9 +1049,10 @@ fn digest_product_desired_state(config: &FluxConfig) -> [u8; GENERATION_ASSEMBLY
     }
 
     let capture = *config.capture();
-    digest.update([match capture.backend() {
-        CaptureBackend::Xtables => 0,
-    }]);
+    match capture.path_request() {
+        CapturePathRequest::Auto => digest.update([0]),
+        CapturePathRequest::Exact(path) => digest.update([1, capture_path_tag(path)]),
+    }
     let scope = capture.scope();
     digest.update([family_tag(scope.families())]);
     digest.update([
@@ -1216,6 +1218,14 @@ fn application_mode_tag(mode: CaptureApplicationMode) -> u8 {
         CaptureApplicationMode::All => 0,
         CaptureApplicationMode::Allowlist => 1,
         CaptureApplicationMode::Denylist => 2,
+    }
+}
+
+const fn capture_path_tag(path: CapturePathId) -> u8 {
+    match path {
+        CapturePathId::NftablesTproxy => 0,
+        CapturePathId::XtablesTproxy => 1,
+        CapturePathId::ManagedTun => 2,
     }
 }
 

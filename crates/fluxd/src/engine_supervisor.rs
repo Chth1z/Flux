@@ -7,7 +7,6 @@ use std::io;
 use std::num::{NonZeroU32, NonZeroU64};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -24,6 +23,8 @@ use flux_platform::{
     ProcessObservation, ReadinessEvidence, SingBoxExit, SingBoxLaunchSpec,
 };
 use sha2::{Digest, Sha256};
+
+use crate::process_authority::ProcessAuthorityOpeningId;
 
 pub const MAX_ENGINE_DIAGNOSTIC_BYTES: usize = 4 * 1024;
 pub const MAX_ENGINE_BINARY_BYTES: u64 = 256 * 1024 * 1024;
@@ -475,12 +476,10 @@ impl OwnedEngineIdentity {
 pub(crate) struct EngineChildAuthority {
     identity: OwnedEngineIdentity,
     engine_snapshot_revision: NonZeroU64,
-    opening_id: NonZeroU64,
+    opening_id: ProcessAuthorityOpeningId,
     opened_at: Instant,
     transport: EngineChildAuthorityTransport,
 }
-
-static NEXT_ENGINE_CHILD_AUTHORITY_OPENING_ID: AtomicU64 = AtomicU64::new(1);
 
 enum EngineChildAuthorityTransport {
     Production(Box<ProcessHandle>),
@@ -497,7 +496,8 @@ impl EngineChildAuthority {
         Ok(Self {
             identity: OwnedEngineIdentity::new(identity.pid(), identity.start_time_ticks()),
             engine_snapshot_revision,
-            opening_id: next_engine_child_authority_opening_id()?,
+            opening_id: ProcessAuthorityOpeningId::allocate()
+                .map_err(|_| EngineChildAuthorityError::OpeningIdentityExhausted)?,
             opened_at: Instant::now(),
             transport: EngineChildAuthorityTransport::Production(Box::new(handle)),
         })
@@ -521,7 +521,7 @@ impl EngineChildAuthority {
         Self {
             identity,
             engine_snapshot_revision,
-            opening_id: next_engine_child_authority_opening_id()
+            opening_id: ProcessAuthorityOpeningId::allocate()
                 .expect("scripted engine authority opening IDs are not exhausted"),
             opened_at,
             transport: EngineChildAuthorityTransport::Scripted,
@@ -539,7 +539,7 @@ impl EngineChildAuthority {
     }
 
     #[must_use]
-    pub(crate) const fn opening_id(&self) -> NonZeroU64 {
+    pub(crate) const fn opening_id(&self) -> ProcessAuthorityOpeningId {
         self.opening_id
     }
 
@@ -669,7 +669,7 @@ impl EngineChildProcessObservation {
 pub(crate) struct EngineChildObservationPair {
     identity: OwnedEngineIdentity,
     engine_snapshot_revision: NonZeroU64,
-    opening_id: NonZeroU64,
+    opening_id: ProcessAuthorityOpeningId,
     before: EngineChildProcessObservation,
     after: EngineChildProcessObservation,
     _handle: ProcessHandle,
@@ -687,7 +687,7 @@ impl EngineChildObservationPair {
     }
 
     #[must_use]
-    pub(crate) const fn opening_id(&self) -> NonZeroU64 {
+    pub(crate) const fn opening_id(&self) -> ProcessAuthorityOpeningId {
         self.opening_id
     }
 
@@ -925,15 +925,6 @@ impl Error for EngineChildAuthorityError {
             | Self::OpeningIdentityExhausted => None,
         }
     }
-}
-
-fn next_engine_child_authority_opening_id() -> Result<NonZeroU64, EngineChildAuthorityError> {
-    let raw = NEXT_ENGINE_CHILD_AUTHORITY_OPENING_ID
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-            current.checked_add(1)
-        })
-        .map_err(|_| EngineChildAuthorityError::OpeningIdentityExhausted)?;
-    NonZeroU64::new(raw).ok_or(EngineChildAuthorityError::OpeningIdentityExhausted)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

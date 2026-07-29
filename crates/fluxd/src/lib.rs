@@ -21,6 +21,7 @@ mod native_admission;
 mod native_generation_source;
 mod native_runtime_writer;
 mod offline_cleanup;
+mod process_authority;
 mod protocol;
 mod runtime_coordinator;
 mod runtime_layout;

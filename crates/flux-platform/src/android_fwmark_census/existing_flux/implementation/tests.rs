@@ -652,7 +652,7 @@ fn proc_stat(pid: u32, command: &str, start_time_ticks: u64) -> Vec<u8> {
 
 fn empty_target_archive() -> Vec<u8> {
     let mut encoded = b"flux-native-xtables-target-archive\0".to_vec();
-    encoded.extend_from_slice(&1_u16.to_be_bytes());
+    encoded.extend_from_slice(&2_u16.to_be_bytes());
     encoded.push(0);
     let checksum = Sha256::digest(&encoded);
     encoded.extend_from_slice(&checksum);

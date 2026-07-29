@@ -316,7 +316,7 @@ fn execute_isolated(root: &Path) -> Result<(), String> {
         .coordinator
         .runtime_snapshot_source()
         .snapshot()
-        .generation
+        .generation()
         .ok_or_else(|| "recovered reload has no Generation".to_owned())?;
     if recovered_generation <= generation(4) {
         return Err(format!(
@@ -685,7 +685,7 @@ fn assert_running(coordinator: &TestCoordinator, generation: GenerationId) -> Re
     if snapshot.phase != RuntimePhase::Running
         || snapshot.capture != RuntimeCaptureState::Published
         || snapshot.engine != RuntimeEngineState::Ready
-        || snapshot.generation != Some(generation)
+        || snapshot.generation() != Some(generation)
     {
         return Err(format!(
             "native runtime is not exact running Generation {generation}: {snapshot:?}"
@@ -699,7 +699,7 @@ fn assert_stopped(coordinator: &TestCoordinator) -> Result<(), String> {
     if snapshot.phase != RuntimePhase::Stopped
         || snapshot.capture != RuntimeCaptureState::Detached
         || snapshot.engine != RuntimeEngineState::Stopped
-        || snapshot.generation.is_some()
+        || snapshot.generation().is_some()
     {
         return Err(format!("native runtime is not exact stopped: {snapshot:?}"));
     }

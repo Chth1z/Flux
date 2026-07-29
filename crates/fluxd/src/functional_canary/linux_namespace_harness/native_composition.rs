@@ -1,36 +1,42 @@
 use std::env;
 use std::fs;
 use std::io;
+use std::mem::MaybeUninit;
 use std::net::{IpAddr, TcpListener};
 use std::num::NonZeroU32;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use flux_core::{
-    AddressResyncDisposition, CapabilityProfile, DispatcherCompletion, FluxConfig, FwmarkCandidate,
-    GenerationId, InterfaceAddressFlags, InterfaceAddressRecord, InterfaceIndex, NetworkInventory,
-    NetworkInventoryTracker, NetworkNamespaceIdentity, Reason, RouteProtocol, RouteTableId,
-    RulePriority, RuleProtocol, RuntimeDispatcher, RuntimeIntent,
+    AddressResyncDisposition, AdministrativeState, CapabilityProfile, ControlClient,
+    DispatcherCompletion, FluxConfig, FwmarkCandidate, GenerationId, InterfaceAddressFlags,
+    InterfaceAddressRecord, InterfaceIndex, NetworkInventory, NetworkInventoryTracker,
+    NetworkNamespaceIdentity, Reason, RouteProtocol, RouteTableId, RulePriority, RuleProtocol,
+    RuntimeDispatcher, RuntimeIntent,
 };
 use flux_platform::{
     NativeCaptureTargetIdentity, NativeLinuxCompositionTestAdmission,
     NativeLinuxCompositionTestAuthority, NativeLinuxCompositionTestConfig,
     NativeXtablesCaptureConverger, XtablesLocalOutputRoutingSpec, XtablesLocalOutputRoutingTarget,
 };
-use flux_testkit::CapabilityProfileFixture;
+use flux_testkit::{CapabilityProfileFixture, StaticCapabilityProfileSource};
 
 use super::{checked_command, network_namespace_identity, random_nonce, user_namespace_identity};
+use crate::daemon::{
+    DaemonOptions, LinuxNativeCompositionDaemonPlatform, run_linux_native_composition_test_daemon,
+};
 use crate::generation_engine_config::{
-    AddressReconciler, GenerationPlanningAuthority, HostInspectionPlanningAuthority,
-    ReplayNetworkInventorySource, TproxyEngineConfigRequest, compile_tproxy_engine_config,
-    qualified_xtables_capture_path_evidence, qualified_xtables_kernel_config,
+    AddressReconciler, ReplayNetworkInventorySource, TproxyEngineConfigRequest,
+    compile_tproxy_engine_config,
 };
 use crate::native_generation_source::{
-    AssembledNativeGenerationSource, CompleteNativeInventorySource, NativeGenerationPlanningSource,
-    NativeGenerationSourcePaths, PlatformNativeLinuxCompositionTestAdmission,
+    AssembledNativeGenerationSource, CompleteNativeInventorySource,
+    LinuxNativeCompositionPlanningSource, NativeGenerationSourcePaths,
+    PlatformNativeLinuxCompositionTestAdmission,
 };
 use crate::native_runtime_writer::{NativeCoordinatorWriter, compose_native_runtime};
 use crate::offline_cleanup::{NativeOfflineRecovery, OfflineRecovery};
@@ -38,7 +44,10 @@ use crate::runtime_coordinator::{RuntimeCoordinator, RuntimeFunctionalCanary};
 use crate::subscription::{
     SubscriptionRefreshDecision, SubscriptionRefreshDisposition, ValidatedSubscriptionEngineConfig,
 };
-use crate::{EngineSupervisor, RuntimeCaptureState, RuntimeEngineState, RuntimePhase};
+use crate::{
+    EngineSupervisor, NativeAdmissionState, RuntimeCaptureState, RuntimeEngineState, RuntimePhase,
+    SocketControlClient,
+};
 
 const TEST_NAME: &str = "functional_canary::linux_namespace_harness::privileged_native_composition_exercises_lifecycle_recovery_and_exact_cleanup";
 const REQUIRED_ENV: &str = "FLUX_NATIVE_COMPOSITION_REQUIRED";
@@ -74,7 +83,7 @@ const PACKAGED_ENGINE_TEMPLATE: &[u8] = include_bytes!("../../../../../conf/temp
 
 type TestSource = AssembledNativeGenerationSource<
     ReplayInventory,
-    HostPlanning,
+    LinuxNativeCompositionPlanningSource,
     PlatformNativeLinuxCompositionTestAdmission,
     NativeCaptureTargetIdentity,
 >;
@@ -167,6 +176,12 @@ fn run_outer() -> Result<(), String> {
         .env(EXEC_AUDIT_ENV, &audit)
         .env(ENGINE_PID_LOG_ENV, &pid_log)
         .env(FAIL_CHECK_ENV, &fail_check);
+    // SAFETY: the callback invokes only signal-set syscalls after fork and before exec. The
+    // isolated libtest process and every daemon/controller worker inherit the blocked mask, so
+    // signalfd is the sole SIGINT/SIGTERM consumer during the daemon lifecycle checkpoint.
+    unsafe {
+        command.pre_exec(block_shutdown_signals_before_exec);
+    }
     checked_command(command, PROCESS_TIMEOUT).map(|_| ())
 }
 
@@ -385,7 +400,174 @@ fn execute_isolated(root: &Path) -> Result<(), String> {
     run_offline_recovery(&fixture)?;
     assert_clean_state()?;
     assert_offline_durable_state(&fixture.durable_root)?;
+    exercise_daemon_lifecycle(&root.join("daemon"))?;
+    assert_clean_state()?;
     assert_subprocess_audit(&fixture.audit)?;
+    Ok(())
+}
+
+fn exercise_daemon_lifecycle(root: &Path) -> Result<(), String> {
+    let fixture = Fixture::new(root)?;
+    assert_clean_state()?;
+
+    let socket_path = root.join("run/fluxd.sock");
+    let daemon_options = daemon_options(root);
+    let profile = fixture.capability_profile.clone();
+    let profile_source = StaticCapabilityProfileSource::new(profile.clone());
+    let platform = LinuxNativeCompositionDaemonPlatform::new(
+        profile,
+        &fixture.tool_root,
+        &fixture.durable_root,
+        fixture.routing,
+        fixture.mark,
+        2,
+        COMMAND_TIMEOUT,
+    );
+    let controller_socket = socket_path.clone();
+    let controller_pid_log = fixture.pid_log.clone();
+    let controller = std::thread::Builder::new()
+        .name("flux-native-daemon-controller".to_owned())
+        .spawn(move || daemon_controller(&controller_socket, &controller_pid_log))
+        .map_err(|error| format!("spawn native daemon controller: {error}"))?;
+
+    let daemon =
+        run_linux_native_composition_test_daemon(&profile_source, daemon_options, platform)
+            .map_err(|error| format!("run admitted native daemon: {error}"));
+    let controller = controller.join().map_err(|payload| {
+        format!(
+            "native daemon controller panicked: {}",
+            panic_message(payload)
+        )
+    })?;
+    daemon?;
+    let final_engine_pid = controller?;
+
+    wait_for_process_absence(final_engine_pid)?;
+    if socket_path.exists() {
+        return Err(format!(
+            "control socket remains after daemon shutdown: {}",
+            socket_path.display()
+        ));
+    }
+    assert_clean_state()?;
+    assert_no_durable_writer_fence(&fixture.durable_root)
+}
+
+fn daemon_options(root: &Path) -> DaemonOptions {
+    let run = root.join("run");
+    let state = root.join("state");
+    DaemonOptions {
+        runtime_root: root.to_owned(),
+        socket_path: run.join("fluxd.sock"),
+        daemon_lease_path: run.join("fluxd.lease"),
+        config_path: root.join("conf/flux.toml"),
+        subscription_store_path: state.join("subscription"),
+        intent_path: state.join("administrative-intent.json"),
+        boot_id_path: root.join("boot-id"),
+        selinux_enforce_path: root.join("selinux-enforce"),
+        disable_path: root.join("disable"),
+    }
+}
+
+fn daemon_controller(socket_path: &Path, pid_log: &Path) -> Result<u32, String> {
+    let result = daemon_controller_inner(socket_path, pid_log);
+    if result.is_err() {
+        let _ = signal_daemon_shutdown();
+    }
+    result
+}
+
+fn daemon_controller_inner(socket_path: &Path, pid_log: &Path) -> Result<u32, String> {
+    let client = SocketControlClient::new(socket_path);
+    let deadline = Instant::now() + RECOVERY_TIMEOUT;
+    let initial_generation = loop {
+        if socket_path.exists()
+            && let Ok(snapshot) = client.status()
+            && snapshot.native_admission == NativeAdmissionState::Admitted
+            && snapshot.control.administrative_state == AdministrativeState::Running
+            && snapshot.runtime.phase == RuntimePhase::Running
+            && snapshot.runtime.capture == RuntimeCaptureState::Published
+            && snapshot.runtime.engine == RuntimeEngineState::Ready
+            && let Some(generation) = snapshot.runtime.generation()
+        {
+            break generation;
+        }
+        if Instant::now() >= deadline {
+            return Err("admitted daemon did not become queryable and Running".to_owned());
+        }
+        std::thread::sleep(MAINTENANCE_INTERVAL);
+    };
+    assert_active_kernel_state()?;
+
+    let mut address = Command::new("ip");
+    address.args(["address", "add", "8.8.8.8/32", "dev", "lo"]);
+    checked_command(address, COMMAND_TIMEOUT)?;
+    let deadline = Instant::now() + RECOVERY_TIMEOUT;
+    loop {
+        let _ = client.submit_and_wait(RuntimeIntent::ResyncAddresses {
+            reason: Reason::UserControl,
+        });
+        if let Ok(snapshot) = client.status()
+            && snapshot.native_admission == NativeAdmissionState::Admitted
+            && snapshot.control.administrative_state == AdministrativeState::Running
+            && snapshot.runtime.phase == RuntimePhase::Running
+            && snapshot.runtime.capture == RuntimeCaptureState::Published
+            && snapshot.runtime.engine == RuntimeEngineState::Ready
+            && snapshot
+                .runtime
+                .generation()
+                .is_some_and(|generation| generation > initial_generation)
+        {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err(
+                "reactor inventory change did not converge an address successor".to_owned(),
+            );
+        }
+        std::thread::sleep(MAINTENANCE_INTERVAL);
+    }
+    assert_active_kernel_state()?;
+    let final_engine_pid = latest_engine_pid(pid_log)?;
+    signal_daemon_shutdown()?;
+    Ok(final_engine_pid)
+}
+
+fn signal_daemon_shutdown() -> Result<(), String> {
+    // SAFETY: `getpid` has no arguments and returns this isolated test process identifier.
+    let process_id = unsafe { libc::getpid() };
+    if process_id <= 1 {
+        return Err(format!(
+            "refusing to signal invalid daemon PID {process_id}"
+        ));
+    }
+    // SAFETY: `process_id` names this live isolated process and SIGTERM has no pointer arguments.
+    if unsafe { libc::kill(process_id, libc::SIGTERM) } == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "signal admitted daemon shutdown: {}",
+            io::Error::last_os_error()
+        ))
+    }
+}
+
+fn block_shutdown_signals_before_exec() -> io::Result<()> {
+    let mut mask = MaybeUninit::<libc::sigset_t>::zeroed();
+    // SAFETY: `mask` points to writable storage for one signal set.
+    if unsafe { libc::sigemptyset(mask.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    for signal in [libc::SIGINT, libc::SIGTERM] {
+        // SAFETY: `sigemptyset` initialized the set and both values are valid signal numbers.
+        if unsafe { libc::sigaddset(mask.as_mut_ptr(), signal) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    // SAFETY: `mask` is initialized and SIG_BLOCK accepts a null output pointer.
+    if unsafe { libc::sigprocmask(libc::SIG_BLOCK, mask.as_ptr(), std::ptr::null_mut()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
     Ok(())
 }
 
@@ -459,6 +641,16 @@ impl Fixture {
                 "restart_stable_reset_ms = 30000",
                 "restart_stable_reset_ms = 100",
                 1,
+            )
+            .replacen(
+                "respect_android_vpn = true",
+                "respect_android_vpn = false",
+                1,
+            )
+            .replacen(
+                "require_functional_canary = true",
+                "require_functional_canary = false",
+                1,
             );
         FluxConfig::parse(&source)
             .map_err(|error| format!("parse native fixture config: {error}"))?;
@@ -467,6 +659,7 @@ impl Fixture {
 
         let authority = NativeLinuxCompositionTestAuthority::acquire()
             .map_err(|error| format!("acquire sealed Linux authority: {error}"))?;
+        let boot_identity = authority.boot_identity().clone();
         let network_namespace = authority.network_namespace();
         drop(authority);
         let (initial_inventory, changed_inventory) = inventory_pair()?;
@@ -477,10 +670,13 @@ impl Fixture {
             durable_root,
             working_directory: working_directory.clone(),
             engine_log: working_directory.join("engine.log"),
-            tool_root: root.join("tools"),
+            tool_root: required_absolute_path(ROOT_ENV)?.join("tools"),
             inventory,
             changed_inventory,
-            capability_profile: CapabilityProfileFixture::device_qualified(),
+            capability_profile: CapabilityProfileFixture::device_qualified_for(
+                boot_identity,
+                network_namespace,
+            ),
             network_namespace,
             routing: test_routing()?,
             mark: FwmarkCandidate::new(MARK_MASK, PROXY_MARK, BYPASS_MARK)
@@ -583,12 +779,12 @@ impl Fixture {
                 &self.engine_log,
             ),
             self.inventory.clone(),
-            HostPlanning {
-                capability_profile: self.capability_profile.clone(),
-                network_namespace: self.network_namespace,
-                routing: self.routing,
-                mark: self.mark,
-            },
+            LinuxNativeCompositionPlanningSource::new(
+                self.capability_profile.clone(),
+                self.network_namespace,
+                self.routing,
+                self.mark,
+            ),
             PlatformNativeLinuxCompositionTestAdmission::new(admission),
             self.accepted_subscription
                 .lock()
@@ -634,35 +830,6 @@ impl ReplayInventory {
 impl CompleteNativeInventorySource for ReplayInventory {
     fn snapshot(&mut self) -> Option<Arc<NetworkInventory>> {
         ReplayInventory::snapshot(self)
-    }
-}
-
-struct HostPlanning {
-    capability_profile: CapabilityProfile,
-    network_namespace: NetworkNamespaceIdentity,
-    routing: XtablesLocalOutputRoutingSpec,
-    mark: FwmarkCandidate,
-}
-
-impl NativeGenerationPlanningSource for HostPlanning {
-    type Error = io::Error;
-
-    fn plan(
-        &mut self,
-        _desired_state: &FluxConfig,
-        inventory: &NetworkInventory,
-    ) -> Result<GenerationPlanningAuthority, Self::Error> {
-        Ok(GenerationPlanningAuthority::host_inspection(
-            HostInspectionPlanningAuthority::new(
-                &self.capability_profile,
-                qualified_xtables_kernel_config(),
-                qualified_xtables_capture_path_evidence(),
-                inventory,
-                self.network_namespace,
-                self.mark,
-                Some(self.routing),
-            ),
-        ))
     }
 }
 

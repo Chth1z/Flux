@@ -66,9 +66,20 @@ impl CapabilityProfileFixture {
 
     #[must_use]
     pub fn device_qualified() -> CapabilityProfile {
+        Self::device_qualified_for(
+            test_boot_identity(),
+            NetworkNamespaceIdentity::new(10, 20).expect("namespace identity"),
+        )
+    }
+
+    #[must_use]
+    pub fn device_qualified_for(
+        boot_identity: BootIdentity,
+        network_namespace: NetworkNamespaceIdentity,
+    ) -> CapabilityProfile {
         fixture_with_device(
-            Observation::Verified(test_boot_identity()),
-            Observation::Verified(test_device_identity()),
+            Observation::Verified(boot_identity),
+            Observation::Verified(test_device_identity(network_namespace)),
             "5.10.198-android13-gki",
         )
     }
@@ -93,7 +104,7 @@ fn fixture_with_device(
     )
 }
 
-fn test_device_identity() -> DeviceIdentity {
+fn test_device_identity(network_namespace: NetworkNamespaceIdentity) -> DeviceIdentity {
     DeviceIdentity::new(
         AndroidProductIdentity::new("google/redfin/redfin").expect("product identity"),
         AndroidBuildIdentity::new("google/redfin/redfin:13/TQ3A.230805.001/1:user/release-keys")
@@ -115,7 +126,7 @@ fn test_device_identity() -> DeviceIdentity {
             ToolId::new("fluxd").expect("tool identity"),
             artifact(0x24, 32_768),
         )],
-        NetworkNamespaceIdentity::new(10, 20).expect("namespace identity"),
+        network_namespace,
     )
     .expect("complete device identity")
 }

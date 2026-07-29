@@ -12,6 +12,8 @@ use flux_core::{
     RpdbPlacementRequest, RulePriority, RuleTableId, classify_android_rpdb,
     plan_android_rpdb_placement,
 };
+#[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
+use flux_core::{CapabilityProfile, NetworkNamespaceIdentity};
 use flux_platform::{
     AndroidFwmarkCensusCoordinatorOutcome, AndroidFwmarkCensusCoordinatorPurpose,
     AndroidFwmarkCensusCoordinatorRequest, NativeXtablesCaptureAdmission,
@@ -20,7 +22,10 @@ use flux_platform::{
     coordinate_android_fwmark_census_for_inventory,
 };
 #[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
-use flux_platform::{NativeLinuxCompositionTestAdmission, NativeLinuxCompositionTestError};
+use flux_platform::{
+    NativeLinuxCompositionTestAdmission, NativeLinuxCompositionTestError,
+    XtablesLocalOutputRoutingSpec,
+};
 
 use crate::generation_engine_config::{
     AddressReconciledGenerationInputs, AddressReconciliationError, AddressReconciliationInspection,
@@ -31,6 +36,11 @@ use crate::generation_engine_config::{
     TproxyEngineConfigRequest, bind_engine_config_to_spec,
     collect_tproxy_engine_capability_profile, compile_address_reconciliation,
     compile_tproxy_engine_config, read_bounded_regular_file,
+};
+#[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
+use crate::generation_engine_config::{
+    HostInspectionPlanningAuthority, qualified_xtables_capture_path_evidence,
+    qualified_xtables_kernel_config,
 };
 use crate::intent_store::record_io;
 use crate::native_runtime_writer::{NativeGenerationSource, PreparedNativeGeneration};
@@ -56,6 +66,55 @@ pub(crate) trait NativeGenerationPlanningSource: Send + 'static {
         desired_state: &FluxConfig,
         inventory: &NetworkInventory,
     ) -> Result<GenerationPlanningAuthority, Self::Error>;
+}
+
+#[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
+pub(crate) struct LinuxNativeCompositionPlanningSource {
+    capability_profile: CapabilityProfile,
+    network_namespace: NetworkNamespaceIdentity,
+    routing: XtablesLocalOutputRoutingSpec,
+    mark: FwmarkCandidate,
+}
+
+#[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
+impl LinuxNativeCompositionPlanningSource {
+    #[must_use]
+    pub(crate) const fn new(
+        capability_profile: CapabilityProfile,
+        network_namespace: NetworkNamespaceIdentity,
+        routing: XtablesLocalOutputRoutingSpec,
+        mark: FwmarkCandidate,
+    ) -> Self {
+        Self {
+            capability_profile,
+            network_namespace,
+            routing,
+            mark,
+        }
+    }
+}
+
+#[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
+impl NativeGenerationPlanningSource for LinuxNativeCompositionPlanningSource {
+    type Error = std::convert::Infallible;
+
+    fn plan(
+        &mut self,
+        _desired_state: &FluxConfig,
+        inventory: &NetworkInventory,
+    ) -> Result<GenerationPlanningAuthority, Self::Error> {
+        Ok(GenerationPlanningAuthority::host_inspection(
+            HostInspectionPlanningAuthority::new(
+                &self.capability_profile,
+                qualified_xtables_kernel_config(),
+                qualified_xtables_capture_path_evidence(),
+                inventory,
+                self.network_namespace,
+                self.mark,
+                Some(self.routing),
+            ),
+        ))
+    }
 }
 
 const SYSTEM_ANDROID_CANDIDATE_MASK: u32 = 0x0300_0000;

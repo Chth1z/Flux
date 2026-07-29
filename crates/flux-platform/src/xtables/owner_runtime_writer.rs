@@ -699,6 +699,11 @@ impl NativeLinuxCompositionTestAuthority {
     }
 
     #[must_use]
+    pub const fn boot_identity(&self) -> &BootIdentity {
+        &self.boot_identity
+    }
+
+    #[must_use]
     pub const fn network_namespace(&self) -> NetworkNamespaceIdentity {
         self.network_namespace
     }

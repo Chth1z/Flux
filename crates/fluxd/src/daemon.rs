@@ -15,10 +15,18 @@ use flux_core::{
     ControlObservationIngress, ControlSnapshot, ControlSnapshotSource, FluxConfig, OperationReport,
     Reason, RuntimeControl, RuntimeDispatcher, RuntimeIntent,
 };
+#[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
+use flux_core::{CapabilityProfile, FwmarkCandidate};
 use flux_platform::{
     CapabilityProfilePaths, DaemonReactor, FileObservationBatch, FileObservationPaths,
     NativeCaptureTargetIdentity, NativeXtablesAndroidRuntime, NativeXtablesAndroidRuntimeConfig,
-    NetworkInventoryRefreshHandle, ShutdownSignal,
+    NativeXtablesCaptureConverger, NativeXtablesCaptureTarget, NetworkInventoryRefreshHandle,
+    ShutdownSignal,
+};
+#[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
+use flux_platform::{
+    NativeLinuxCompositionTestAdmission, NativeLinuxCompositionTestAuthority,
+    NativeLinuxCompositionTestConfig, XtablesLocalOutputRoutingSpec,
 };
 
 use crate::generation_engine_config::AddressReconciler;
@@ -28,8 +36,13 @@ use crate::native_admission::{
     NativeAdmissionRejection, NativeAdmissionState,
 };
 use crate::native_generation_source::{
-    AssembledNativeGenerationSource, NativeGenerationSourcePaths,
-    PlatformNativeGenerationTargetAdmission, SystemAndroidGenerationPlanningSource,
+    AssembledNativeGenerationSource, NativeGenerationPlanningSource, NativeGenerationSourcePaths,
+    NativeGenerationTargetAdmission, PlatformNativeGenerationTargetAdmission,
+    SystemAndroidGenerationPlanningSource,
+};
+#[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
+use crate::native_generation_source::{
+    LinuxNativeCompositionPlanningSource, PlatformNativeLinuxCompositionTestAdmission,
 };
 use crate::native_runtime_writer::compose_native_runtime;
 use crate::offline_cleanup::{
@@ -131,6 +144,30 @@ pub fn run_daemon<S>(profile_source: &S, options: DaemonOptions) -> Result<(), D
 where
     S: CapabilityProfileSource,
 {
+    run_daemon_with_platform(profile_source, options, AndroidNativeDaemonPlatform)
+}
+
+#[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
+pub(crate) fn run_linux_native_composition_test_daemon<S>(
+    profile_source: &S,
+    options: DaemonOptions,
+    platform: LinuxNativeCompositionDaemonPlatform,
+) -> Result<(), DaemonError>
+where
+    S: CapabilityProfileSource,
+{
+    run_daemon_with_platform(profile_source, options, platform)
+}
+
+fn run_daemon_with_platform<S, P>(
+    profile_source: &S,
+    options: DaemonOptions,
+    mut platform: P,
+) -> Result<(), DaemonError>
+where
+    S: CapabilityProfileSource,
+    P: NativeDaemonPlatform,
+{
     let runtime_layout =
         RuntimeLayout::bootstrap(&options.runtime_root).map_err(DaemonError::RuntimeLayout)?;
     validate_runtime_layout_paths(&runtime_layout, &options)?;
@@ -201,7 +238,8 @@ where
                             network_inventory_refresh.ok_or(DaemonError::Invariant(
                                 "admitted native runtime omitted its inventory refresh authority",
                             ))?;
-                        recover_native_startup(&admitted, &options, &runtime_layout)?;
+                        platform.recover(&admitted, &options, &runtime_layout)?;
+                        let platform = platform.compose(&admitted, &options, &runtime_layout)?;
                         (
                             NativeAdmissionState::Admitted,
                             compose_native_daemon(
@@ -209,6 +247,7 @@ where
                                 network_inventory_refresh,
                                 &options,
                                 &runtime_layout,
+                                platform,
                             )?,
                         )
                     }
@@ -290,6 +329,43 @@ enum PendingNativeAdmission {
     Configured(Box<ConfiguredNativeAdmission>),
 }
 
+trait NativeDaemonPlatform {
+    type Planning: NativeGenerationPlanningSource;
+    type Admission: NativeGenerationTargetAdmission<Target = NativeXtablesCaptureTarget>;
+
+    fn recover(
+        &mut self,
+        admitted: &AdmittedNativeRuntime,
+        options: &DaemonOptions,
+        runtime_layout: &RuntimeLayout,
+    ) -> Result<(), DaemonError>;
+
+    fn compose(
+        &mut self,
+        admitted: &AdmittedNativeRuntime,
+        options: &DaemonOptions,
+        runtime_layout: &RuntimeLayout,
+    ) -> Result<NativeDaemonPlatformParts<Self::Planning, Self::Admission>, DaemonError>;
+}
+
+struct NativeDaemonPlatformParts<P, A> {
+    planning: P,
+    admission: A,
+    convergence: NativeXtablesCaptureConverger,
+}
+
+impl<P, A> NativeDaemonPlatformParts<P, A> {
+    const fn new(planning: P, admission: A, convergence: NativeXtablesCaptureConverger) -> Self {
+        Self {
+            planning,
+            admission,
+            convergence,
+        }
+    }
+}
+
+struct AndroidNativeDaemonPlatform;
+
 struct DaemonComposition {
     control: DaemonControl,
     runtime: RuntimeSnapshotSource,
@@ -328,21 +404,196 @@ fn recover_native_startup(
     Ok(())
 }
 
-fn compose_native_daemon(
+impl NativeDaemonPlatform for AndroidNativeDaemonPlatform {
+    type Planning = SystemAndroidGenerationPlanningSource;
+    type Admission = PlatformNativeGenerationTargetAdmission;
+
+    fn recover(
+        &mut self,
+        admitted: &AdmittedNativeRuntime,
+        options: &DaemonOptions,
+        runtime_layout: &RuntimeLayout,
+    ) -> Result<(), DaemonError> {
+        recover_native_startup(admitted, options, runtime_layout)
+    }
+
+    fn compose(
+        &mut self,
+        admitted: &AdmittedNativeRuntime,
+        options: &DaemonOptions,
+        runtime_layout: &RuntimeLayout,
+    ) -> Result<NativeDaemonPlatformParts<Self::Planning, Self::Admission>, DaemonError> {
+        let mut planning =
+            SystemAndroidGenerationPlanningSource::for_current_daemon(runtime_layout.run_path());
+        let initial_planning = planning
+            .plan_initial(&admitted.config, &admitted.initial_inventory)
+            .map_err(|source| {
+                DaemonError::native("mint initial Android planning authority", source)
+            })?;
+        let (mark_authority, placement) =
+            initial_planning
+                .android_runtime_binding()
+                .ok_or(DaemonError::Invariant(
+                    "initial Android planning omitted the native runtime binding",
+                ))?;
+        if mark_authority.boot_identity() != &admitted.boot_identity
+            || mark_authority.network_namespace() != admitted.network_namespace
+        {
+            return Err(DaemonError::Invariant(
+                "native planning identity changed after startup recovery",
+            ));
+        }
+        let platform = NativeXtablesAndroidRuntime::compose(
+            options.native_xtables_runtime_config(runtime_layout),
+            mark_authority,
+            placement,
+        )
+        .map_err(|source| DaemonError::native("compose native Android runtime", source))?;
+        planning
+            .accept_initial(&admitted.config, initial_planning)
+            .map_err(|source| {
+                DaemonError::native("retain initial Android planning authority", source)
+            })?;
+        let (admission, convergence) = platform.into_parts();
+        Ok(NativeDaemonPlatformParts::new(
+            planning,
+            PlatformNativeGenerationTargetAdmission::new(admission),
+            convergence,
+        ))
+    }
+}
+
+#[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
+pub(crate) struct LinuxNativeCompositionDaemonPlatform {
+    capability_profile: CapabilityProfile,
+    tool_root: PathBuf,
+    durable_root: PathBuf,
+    routing: XtablesLocalOutputRoutingSpec,
+    mark: FwmarkCandidate,
+    wait_seconds: u16,
+    timeout: Duration,
+}
+
+#[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
+impl LinuxNativeCompositionDaemonPlatform {
+    #[must_use]
+    pub(crate) fn new(
+        capability_profile: CapabilityProfile,
+        tool_root: impl AsRef<Path>,
+        durable_root: impl AsRef<Path>,
+        routing: XtablesLocalOutputRoutingSpec,
+        mark: FwmarkCandidate,
+        wait_seconds: u16,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            capability_profile,
+            tool_root: tool_root.as_ref().to_owned(),
+            durable_root: durable_root.as_ref().to_owned(),
+            routing,
+            mark,
+            wait_seconds,
+            timeout,
+        }
+    }
+
+    fn platform_parts(
+        &self,
+        admitted: &AdmittedNativeRuntime,
+    ) -> Result<
+        (
+            NativeLinuxCompositionTestAdmission,
+            NativeXtablesCaptureConverger,
+        ),
+        DaemonError,
+    > {
+        let authority = NativeLinuxCompositionTestAuthority::acquire()
+            .map_err(|source| DaemonError::native("acquire Linux composition authority", source))?;
+        if authority.boot_identity() != &admitted.boot_identity
+            || authority.network_namespace() != admitted.network_namespace
+        {
+            return Err(DaemonError::Invariant(
+                "Linux composition authority differs from admitted daemon identity",
+            ));
+        }
+        authority
+            .compose(
+                NativeLinuxCompositionTestConfig::new(
+                    &self.tool_root,
+                    &self.durable_root,
+                    self.wait_seconds,
+                    self.timeout,
+                ),
+                self.routing,
+                self.mark,
+            )
+            .map(|runtime| runtime.into_parts())
+            .map_err(|source| DaemonError::native("compose Linux test runtime", source))
+    }
+}
+
+#[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
+impl NativeDaemonPlatform for LinuxNativeCompositionDaemonPlatform {
+    type Planning = LinuxNativeCompositionPlanningSource;
+    type Admission = PlatformNativeLinuxCompositionTestAdmission;
+
+    fn recover(
+        &mut self,
+        admitted: &AdmittedNativeRuntime,
+        _options: &DaemonOptions,
+        _runtime_layout: &RuntimeLayout,
+    ) -> Result<(), DaemonError> {
+        let (_admission, convergence) = self.platform_parts(admitted)?;
+        NativeOfflineRecovery::new(convergence)
+            .recover_stopped()
+            .map(|_| ())
+            .map_err(|source| DaemonError::native("recover Linux test startup state", source))
+    }
+
+    fn compose(
+        &mut self,
+        admitted: &AdmittedNativeRuntime,
+        _options: &DaemonOptions,
+        _runtime_layout: &RuntimeLayout,
+    ) -> Result<NativeDaemonPlatformParts<Self::Planning, Self::Admission>, DaemonError> {
+        let (admission, convergence) = self.platform_parts(admitted)?;
+        let planning = LinuxNativeCompositionPlanningSource::new(
+            self.capability_profile.clone(),
+            admitted.network_namespace,
+            self.routing,
+            self.mark,
+        );
+        Ok(NativeDaemonPlatformParts::new(
+            planning,
+            PlatformNativeLinuxCompositionTestAdmission::new(admission),
+            convergence,
+        ))
+    }
+}
+
+fn compose_native_daemon<P, A>(
     admitted: AdmittedNativeRuntime,
     network_inventory_refresh: NetworkInventoryRefreshHandle,
     options: &DaemonOptions,
     runtime_layout: &RuntimeLayout,
-) -> Result<DaemonComposition, DaemonError> {
+    platform: NativeDaemonPlatformParts<P, A>,
+) -> Result<DaemonComposition, DaemonError>
+where
+    P: NativeGenerationPlanningSource,
+    A: NativeGenerationTargetAdmission<Target = NativeXtablesCaptureTarget>,
+{
     let AdmittedNativeRuntime {
         boot_identity,
-        network_namespace,
         config,
-        initial_inventory,
         inventory,
         functional_canary,
+        ..
     } = admitted;
-    let platform_config = options.native_xtables_runtime_config(runtime_layout);
+    let NativeDaemonPlatformParts {
+        planning,
+        admission,
+        convergence,
+    } = platform;
     let observation_paths =
         file_observation_paths(&options.config_path, &options.disable_path, &config);
     let observation_baseline = ObservedInputsFingerprint::capture(&observation_paths)
@@ -357,33 +608,6 @@ fn compose_native_daemon(
     let disable_present =
         inspect_disable_path(&options.disable_path).map_err(DaemonError::Configuration)?;
     let initial_intent = initial_intent(&store, disable_present)?;
-
-    let mut planning =
-        SystemAndroidGenerationPlanningSource::for_current_daemon(runtime_layout.run_path());
-    let initial_planning = planning
-        .plan_initial(&config, &initial_inventory)
-        .map_err(|source| DaemonError::native("mint initial Android planning authority", source))?;
-    let (mark_authority, placement) =
-        initial_planning
-            .android_runtime_binding()
-            .ok_or(DaemonError::Invariant(
-                "initial Android planning omitted the native runtime binding",
-            ))?;
-    if mark_authority.boot_identity() != &boot_identity
-        || mark_authority.network_namespace() != network_namespace
-    {
-        return Err(DaemonError::Invariant(
-            "native planning identity changed after startup recovery",
-        ));
-    }
-    let platform = NativeXtablesAndroidRuntime::compose(platform_config, mark_authority, placement)
-        .map_err(|source| DaemonError::native("compose native Android runtime", source))?;
-    planning
-        .accept_initial(&config, initial_planning)
-        .map_err(|source| {
-            DaemonError::native("retain initial Android planning authority", source)
-        })?;
-    let (admission, convergence) = platform.into_parts();
 
     let subscription = SubscriptionRefreshRuntime::start(SubscriptionRuntimePaths::new(
         &options.config_path,
@@ -407,7 +631,7 @@ fn compose_native_daemon(
         source_paths,
         inventory.clone(),
         planning,
-        PlatformNativeGenerationTargetAdmission::new(admission),
+        admission,
         accepted_subscription,
     );
     let maintenance_interval =

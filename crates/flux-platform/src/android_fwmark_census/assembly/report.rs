@@ -60,6 +60,16 @@ const ALL_METRIC_KINDS: [AndroidFwmarkCensusMetricKind; ANDROID_FWMARK_CENSUS_PR
     AndroidFwmarkCensusMetricKind::OrderedLateWrites,
 ];
 
+// Container presence is diagnostic evidence; exact artifacts and live state carry ownership.
+const EXISTING_FLUX_OWNERSHIP_METRIC_KINDS: [AndroidFwmarkCensusMetricKind; 6] = [
+    AndroidFwmarkCensusMetricKind::ExistingFluxDurableArtifacts,
+    AndroidFwmarkCensusMetricKind::ExistingFluxArchivedTargets,
+    AndroidFwmarkCensusMetricKind::ExistingFluxProcesses,
+    AndroidFwmarkCensusMetricKind::ExistingFluxChains,
+    AndroidFwmarkCensusMetricKind::ExistingFluxRoutes,
+    AndroidFwmarkCensusMetricKind::ExistingFluxRules,
+];
+
 /// Identifies one of the two ordered reports emitted by the diagnostic probe.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AndroidFwmarkCensusReportPhase {
@@ -187,11 +197,9 @@ pub fn validate_android_fwmark_census_projection_report(
                 coverage_label(cell.state())
             ));
         }
-        if let Some(metric) = projection
-            .metrics()
-            .iter()
-            .find(|metric| is_existing_flux_metric(metric.kind()) && metric.value() != 0)
-        {
+        if let Some(metric) = projection.metrics().iter().find(|metric| {
+            EXISTING_FLUX_OWNERSHIP_METRIC_KINDS.contains(&metric.kind()) && metric.value() != 0
+        }) {
             return Err(format!(
                 "cleanup-existing-flux-metric-{}-{}",
                 metric.kind().as_str(),
@@ -258,16 +266,7 @@ pub fn validate_android_fwmark_census_probe_reports(
             ));
         }
     }
-    for kind in [
-        AndroidFwmarkCensusMetricKind::ExistingFluxDurableRootPresent,
-        AndroidFwmarkCensusMetricKind::ExistingFluxEmptyTargetArchivePresent,
-        AndroidFwmarkCensusMetricKind::ExistingFluxDurableArtifacts,
-        AndroidFwmarkCensusMetricKind::ExistingFluxArchivedTargets,
-        AndroidFwmarkCensusMetricKind::ExistingFluxProcesses,
-        AndroidFwmarkCensusMetricKind::ExistingFluxChains,
-        AndroidFwmarkCensusMetricKind::ExistingFluxRoutes,
-        AndroidFwmarkCensusMetricKind::ExistingFluxRules,
-    ] {
+    for kind in EXISTING_FLUX_OWNERSHIP_METRIC_KINDS {
         let index = kind as usize;
         let value = reports.cleanup.metrics[index];
         if value != 0 {
@@ -680,20 +679,6 @@ fn require_complete_report(
     }
 }
 
-const fn is_existing_flux_metric(kind: AndroidFwmarkCensusMetricKind) -> bool {
-    matches!(
-        kind,
-        AndroidFwmarkCensusMetricKind::ExistingFluxDurableRootPresent
-            | AndroidFwmarkCensusMetricKind::ExistingFluxEmptyTargetArchivePresent
-            | AndroidFwmarkCensusMetricKind::ExistingFluxDurableArtifacts
-            | AndroidFwmarkCensusMetricKind::ExistingFluxArchivedTargets
-            | AndroidFwmarkCensusMetricKind::ExistingFluxProcesses
-            | AndroidFwmarkCensusMetricKind::ExistingFluxChains
-            | AndroidFwmarkCensusMetricKind::ExistingFluxRoutes
-            | AndroidFwmarkCensusMetricKind::ExistingFluxRules
-    )
-}
-
 const fn source_label(source: FwmarkEvidenceSource) -> &'static str {
     match source {
         FwmarkEvidenceSource::AndroidNetId => "android-net-id",
@@ -871,6 +856,40 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_allows_non_owning_durable_container_presence() {
+        let mut cleanup = projection(16, 0x33);
+        for kind in [
+            AndroidFwmarkCensusMetricKind::ExistingFluxDurableRootPresent,
+            AndroidFwmarkCensusMetricKind::ExistingFluxEmptyTargetArchivePresent,
+        ] {
+            cleanup.metrics[kind as usize] = AndroidFwmarkCensusMetric::new(kind, 1);
+        }
+
+        validate_android_fwmark_census_projection_report(
+            AndroidFwmarkCensusReportPhase::Cleanup,
+            &cleanup,
+        )
+        .expect("container presence alone carries no Flux ownership");
+
+        let mut output = Vec::new();
+        write_android_fwmark_census_projection_report(
+            &mut output,
+            AndroidFwmarkCensusReportPhase::Primary,
+            &projection(16, 0x22),
+        )
+        .expect("primary report");
+        write_android_fwmark_census_projection_report(
+            &mut output,
+            AndroidFwmarkCensusReportPhase::Cleanup,
+            &cleanup,
+        )
+        .expect("cleanup report");
+        let reports = parse_android_fwmark_census_probe_reports(&output).expect("rendered reports");
+        validate_android_fwmark_census_probe_reports(&reports)
+            .expect("host accepts non-owning durable containers");
+    }
+
+    #[test]
     fn parser_accepts_the_canonical_chain_limit_and_rejects_one_byte_more() {
         let valid = probe_output(MAX_FWMARK_NETFILTER_CHAIN_NAME_BYTES);
         parse_android_fwmark_census_probe_reports(&valid).expect("128-byte chain");
@@ -919,6 +938,18 @@ mod tests {
             validate_android_fwmark_census_probe_reports(&reports)
                 .expect_err("noncomplete primary cell must stop"),
             "primary-noncomplete-cell-android-net-id-packet-opaque"
+        );
+
+        let mut cleanup = projection(16, 0x33);
+        let process_kind = AndroidFwmarkCensusMetricKind::ExistingFluxProcesses;
+        cleanup.metrics[process_kind as usize] = AndroidFwmarkCensusMetric::new(process_kind, 1);
+        assert_eq!(
+            validate_android_fwmark_census_projection_report(
+                AndroidFwmarkCensusReportPhase::Cleanup,
+                &cleanup,
+            )
+            .expect_err("typed cleanup ownership residue must stop"),
+            "cleanup-existing-flux-metric-existing-flux-processes-1"
         );
 
         let residue = String::from_utf8(probe_output(16))

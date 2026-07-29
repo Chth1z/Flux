@@ -1,5 +1,5 @@
 use std::error::Error;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
 use std::fmt;
 use std::net::IpAddr;
 use std::path::Path;
@@ -15,7 +15,7 @@ use flux_core::{
     StaleRpdbPlacementLease,
 };
 use flux_platform::{
-    AndroidFwmarkCensusPlanningEvidence, AndroidKernelConfigSnapshot, SingBoxLauncher,
+    AndroidFwmarkCensusPlanningEvidence, AndroidKernelConfigSnapshot, SingBoxPrivilege,
     SingBoxReadiness, XtablesCaptureArtifactSet, XtablesCaptureLoweringError,
     XtablesCaptureLoweringRequest, XtablesCaptureNamespace, XtablesLocalOutputRoutingSpec,
     XtablesTproxyTarget, lower_xtables_capture, plan_native_xtables_local_output_routing,
@@ -33,14 +33,14 @@ use super::{
 };
 use crate::{EngineSpec, RestartPolicy, RestartPolicyError};
 
-pub(crate) const ADMITTED_GENERATION_SCHEMA_VERSION: u16 = 3;
+pub(crate) const ADMITTED_GENERATION_SCHEMA_VERSION: u16 = 4;
 const GENERATION_ASSEMBLY_DIGEST_BYTES: usize = 32;
 const GENERATION_ASSEMBLY_DIGEST_DOMAIN: &[u8] =
-    b"Flux coordinator-facing admitted Generation\0sha256-v1\0";
+    b"Flux coordinator-facing admitted Generation\0sha256-v2\0";
 const GENERATION_PLANNING_DIGEST_DOMAIN: &[u8] =
     b"Flux complete Generation planning authority\0canonical-schema-v2\0sha256-v1\0";
 const PRODUCT_DESIRED_STATE_DIGEST_DOMAIN: &[u8] =
-    b"Flux product Desired State\0schema-v4\0sha256-v1\0";
+    b"Flux product Desired State\0schema-v5\0sha256-v1\0";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(transparent)]
@@ -934,7 +934,7 @@ pub(crate) enum DesiredStateEngineBindingError {
     Binary,
     StartupTimeout,
     StopTimeout,
-    Launcher,
+    Privilege,
     RestartPolicy(RestartPolicyError),
 }
 
@@ -948,8 +948,8 @@ impl fmt::Display for DesiredStateEngineBindingError {
             Self::StopTimeout => {
                 "prepared Proxy Engine stop timeout does not match the current Desired State"
             }
-            Self::Launcher => {
-                "prepared Proxy Engine launcher identity does not match the current Desired State"
+            Self::Privilege => {
+                "prepared Proxy Engine privilege identity does not match the current Desired State"
             }
             Self::RestartPolicy(_) => {
                 "current Desired State cannot construct a Proxy Engine restart policy"
@@ -962,7 +962,7 @@ impl Error for DesiredStateEngineBindingError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::RestartPolicy(source) => Some(source),
-            Self::Binary | Self::StartupTimeout | Self::StopTimeout | Self::Launcher => None,
+            Self::Binary | Self::StartupTimeout | Self::StopTimeout | Self::Privilege => None,
         }
     }
 }
@@ -983,20 +983,8 @@ pub(crate) fn bind_engine_spec_to_desired_state(
         return Err(DesiredStateEngineBindingError::StopTimeout);
     }
     let credentials = configured.credentials();
-    let expected_identity = OsString::from(format!(
-        "{}:{}",
-        credentials.uid().get(),
-        credentials.gid().get()
-    ));
-    let launcher_matches = match &process.launcher {
-        SingBoxLauncher::Direct => credentials.uid().get() == 0 && credentials.gid().get() == 0,
-        SingBoxLauncher::BusyBoxSetuidgid { identity, .. } => {
-            (credentials.uid().get() != 0 || credentials.gid().get() != 0)
-                && identity == &expected_identity
-        }
-    };
-    if !launcher_matches {
-        return Err(DesiredStateEngineBindingError::Launcher);
+    if process.privilege != SingBoxPrivilege::TransparentProxy(credentials) {
+        return Err(DesiredStateEngineBindingError::Privilege);
     }
 
     let configured_restart = configured.restart();
@@ -1240,12 +1228,12 @@ fn update_engine_spec(digest: &mut Sha256, spec: &EngineSpec) {
     update_path(digest, &process.config);
     update_path(digest, &process.working_directory);
     update_path(digest, &process.log);
-    match &process.launcher {
-        SingBoxLauncher::Direct => digest.update([0]),
-        SingBoxLauncher::BusyBoxSetuidgid { busybox, identity } => {
+    match process.privilege {
+        SingBoxPrivilege::Inherit => digest.update([0]),
+        SingBoxPrivilege::TransparentProxy(credentials) => {
             digest.update([1]);
-            update_path(digest, busybox);
-            update_os_str(digest, identity);
+            update_field(digest, &credentials.uid().get().to_be_bytes());
+            update_field(digest, &credentials.gid().get().to_be_bytes());
         }
     }
     match &process.readiness {

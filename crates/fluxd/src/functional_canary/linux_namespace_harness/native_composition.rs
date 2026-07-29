@@ -38,7 +38,9 @@ use crate::native_generation_source::{
     LinuxNativeCompositionPlanningSource, NativeGenerationSourcePaths,
     PlatformNativeLinuxCompositionTestAdmission,
 };
-use crate::native_runtime_writer::{NativeCoordinatorWriter, compose_native_runtime};
+use crate::native_runtime_writer::{
+    NativeCoordinatorWriter, compose_linux_native_composition_test_runtime,
+};
 use crate::offline_cleanup::{NativeOfflineRecovery, OfflineRecovery};
 use crate::runtime_coordinator::{RuntimeCoordinator, RuntimeFunctionalCanary};
 use crate::subscription::{
@@ -693,7 +695,7 @@ impl Fixture {
         let source = self.source(admission);
         let (address_inventory, reconciler) = AddressReconciler::replay(&self.desired_state);
         address_inventory.publish(self.inventory.snapshot());
-        let coordinator = compose_native_runtime(
+        let coordinator = compose_linux_native_composition_test_runtime(
             convergence,
             || source,
             MAINTENANCE_INTERVAL,
@@ -771,7 +773,7 @@ impl Fixture {
     }
 
     fn source(&self, admission: NativeLinuxCompositionTestAdmission) -> TestSource {
-        AssembledNativeGenerationSource::new(
+        AssembledNativeGenerationSource::for_linux_native_composition_test(
             NativeGenerationSourcePaths::new(
                 &self.desired_state,
                 &self.state_root,

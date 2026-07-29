@@ -59,6 +59,7 @@ pub struct ProcessCredentials {
     capability_inheritable: u64,
     capability_permitted: u64,
     capability_effective: u64,
+    capability_bounding: u64,
     capability_ambient: u64,
     no_new_privileges: bool,
 }
@@ -94,6 +95,11 @@ impl ProcessCredentials {
     #[must_use]
     pub const fn capability_effective(&self) -> u64 {
         self.capability_effective
+    }
+
+    #[must_use]
+    pub const fn capability_bounding(&self) -> u64 {
+        self.capability_bounding
     }
 
     #[must_use]
@@ -1481,6 +1487,7 @@ mod implementation {
         let capability_inheritable = parse_single_hex(field(contents, b"CapInh:")?)?;
         let capability_permitted = parse_single_hex(field(contents, b"CapPrm:")?)?;
         let capability_effective = parse_single_hex(field(contents, b"CapEff:")?)?;
+        let capability_bounding = parse_single_hex(field(contents, b"CapBnd:")?)?;
         let capability_ambient = parse_single_hex(field(contents, b"CapAmb:")?)?;
         let no_new_privileges = match parse_single_decimal(field(contents, b"NoNewPrivs:")?)? {
             0 => false,
@@ -1497,6 +1504,7 @@ mod implementation {
                 capability_inheritable,
                 capability_permitted,
                 capability_effective,
+                capability_bounding,
                 capability_ambient,
                 no_new_privileges,
             },

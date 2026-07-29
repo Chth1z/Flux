@@ -378,10 +378,57 @@ where
     S: NativeGenerationSource<NativeXtablesCaptureTarget, NativeCaptureTargetIdentity>,
     F: FnOnce() -> S,
 {
+    compose_native_runtime_with_engine(
+        convergence,
+        source_factory,
+        maintenance_interval,
+        functional_canary,
+        EngineSupervisor::new(),
+    )
+}
+
+#[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
+pub(crate) fn compose_linux_native_composition_test_runtime<S, F>(
+    convergence: NativeXtablesCaptureConverger,
+    source_factory: F,
+    maintenance_interval: Duration,
+    functional_canary: RuntimeFunctionalCanary,
+) -> Result<
+    RuntimeCoordinator<NativeCoordinatorWriter<NativeXtablesCaptureConverger, S>, EngineSupervisor>,
+    NativeCoordinatorWriterError,
+>
+where
+    S: NativeGenerationSource<NativeXtablesCaptureTarget, NativeCaptureTargetIdentity>,
+    F: FnOnce() -> S,
+{
+    compose_native_runtime_with_engine(
+        convergence,
+        source_factory,
+        maintenance_interval,
+        functional_canary,
+        EngineSupervisor::for_linux_native_composition_test(),
+    )
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn compose_native_runtime_with_engine<S, F>(
+    convergence: NativeXtablesCaptureConverger,
+    source_factory: F,
+    maintenance_interval: Duration,
+    functional_canary: RuntimeFunctionalCanary,
+    engine: EngineSupervisor,
+) -> Result<
+    RuntimeCoordinator<NativeCoordinatorWriter<NativeXtablesCaptureConverger, S>, EngineSupervisor>,
+    NativeCoordinatorWriterError,
+>
+where
+    S: NativeGenerationSource<NativeXtablesCaptureTarget, NativeCaptureTargetIdentity>,
+    F: FnOnce() -> S,
+{
     let writer = NativeCoordinatorWriter::recover_then_accept_source(convergence, source_factory)?;
     Ok(RuntimeCoordinator::with_dependencies(
         writer,
-        EngineSupervisor::new(),
+        engine,
         maintenance_interval,
         functional_canary,
     ))
@@ -608,7 +655,7 @@ mod tests {
         RuntimeDispatcher, RuntimeIntent,
     };
     use flux_platform::{
-        NativeCaptureConvergenceReport, ReadinessEvidence, SingBoxLaunchSpec, SingBoxLauncher,
+        NativeCaptureConvergenceReport, ReadinessEvidence, SingBoxLaunchSpec, SingBoxPrivilege,
         SingBoxReadiness,
     };
 
@@ -864,7 +911,7 @@ mod tests {
                     config,
                     working_directory: directory.path().to_path_buf(),
                     log: directory.path().join("sing-box.log"),
-                    launcher: SingBoxLauncher::Direct,
+                    privilege: SingBoxPrivilege::Inherit,
                     readiness: SingBoxReadiness::Listener {
                         port: NonZeroU16::new(1536).expect("nonzero test port"),
                     },

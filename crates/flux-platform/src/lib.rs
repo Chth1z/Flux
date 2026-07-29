@@ -76,6 +76,7 @@ pub use android_kernel_capabilities::{
     SystemAndroidKernelConfigErrorKind, SystemAndroidKernelConfigSource,
 };
 pub use capability::{CapabilityProfilePaths, SystemCapabilityProfileSource};
+pub use child_process::TRANSPARENT_PROXY_ENGINE_CAPABILITY_MASK;
 pub use file_observer::{FileObservationBatch, FileObservationError, FileObservationPaths};
 pub use network_observer::NetworkInventorySource;
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -93,7 +94,7 @@ pub use reactor::{
 pub use seqpacket::{PeerCredentials, SeqpacketConnection, SeqpacketListener, Uid};
 pub use shutdown::ShutdownSignal;
 pub use sing_box::{
-    ReadinessEvidence, SingBoxExit, SingBoxLaunchSpec, SingBoxLauncher, SingBoxReadiness,
+    ReadinessEvidence, SingBoxExit, SingBoxLaunchSpec, SingBoxPrivilege, SingBoxReadiness,
 };
 pub use xtables::{
     MAX_XTABLES_CAPTURE_COMMANDS_PER_ARTIFACT, MAX_XTABLES_RESTORE_BYTES,
@@ -147,8 +148,8 @@ pub mod internal {
     };
     pub use crate::sing_box::{
         PinnedSingBoxLaunch, ProcessDiagnostics, SingBoxChild, SingBoxChildIdentity,
-        SingBoxProcessAdapter, SingBoxProcessError, SingBoxVersionReport, TerminationOutcome,
-        ValidationReport,
+        SingBoxExecutablePrivilegeAttribute, SingBoxProcessAdapter, SingBoxProcessError,
+        SingBoxVersionReport, TerminationOutcome, ValidationReport,
     };
 }
 

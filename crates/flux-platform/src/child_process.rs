@@ -1,3 +1,7 @@
+use flux_core::EngineCredentials;
+
+pub const TRANSPARENT_PROXY_ENGINE_CAPABILITY_MASK: u64 = (1_u64 << 12) | (1_u64 << 13);
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ProcessSignal {
     Terminate,
@@ -11,6 +15,13 @@ impl ProcessSignal {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum ChildProcessPrivilege {
+    #[default]
+    Inherit,
+    TransparentProxy(EngineCredentials),
+}
+
 #[derive(Debug, Default)]
 #[cfg_attr(not(any(target_os = "linux", target_os = "android")), allow(dead_code))]
 pub(crate) struct ChildProcessConfig {
@@ -19,6 +30,7 @@ pub(crate) struct ChildProcessConfig {
     pub(crate) kill_on_parent_death: bool,
     pub(crate) close_unlisted_fds: bool,
     pub(crate) inherited_fds: Vec<i32>,
+    pub(crate) privilege: ChildProcessPrivilege,
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -28,9 +40,44 @@ mod implementation {
     use std::os::unix::process::CommandExt;
     use std::process::Command;
 
-    use super::{ChildProcessConfig, ProcessSignal};
+    use super::{
+        ChildProcessConfig, ChildProcessPrivilege, ProcessSignal,
+        TRANSPARENT_PROXY_ENGINE_CAPABILITY_MASK,
+    };
 
     const DESIRED_NOFILE_LIMIT: libc::rlim_t = 1_048_576;
+    const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+    const CAP_SETPCAP: u32 = 8;
+    const CAP_NET_ADMIN: u32 = 12;
+    const CAP_NET_RAW: u32 = 13;
+    const MAX_CAPABILITY_NUMBER: u32 = 63;
+    const SECBIT_NOROOT: libc::c_ulong = 1 << 0;
+    const SECBIT_NOROOT_LOCKED: libc::c_ulong = 1 << 1;
+    const SECBIT_NO_SETUID_FIXUP: libc::c_ulong = 1 << 2;
+    const SECBIT_NO_SETUID_FIXUP_LOCKED: libc::c_ulong = 1 << 3;
+    const SECBIT_NO_CAP_AMBIENT_RAISE: libc::c_ulong = 1 << 6;
+    const SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED: libc::c_ulong = 1 << 7;
+    const BASE_SECUREBITS: libc::c_ulong = SECBIT_NOROOT
+        | SECBIT_NOROOT_LOCKED
+        | SECBIT_NO_SETUID_FIXUP
+        | SECBIT_NO_SETUID_FIXUP_LOCKED;
+    const FINAL_SECUREBITS: libc::c_ulong =
+        BASE_SECUREBITS | SECBIT_NO_CAP_AMBIENT_RAISE | SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CapabilityHeader {
+        version: u32,
+        pid: libc::c_int,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CapabilityData {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
 
     pub(crate) fn configure_child_process(
         command: &mut Command,
@@ -46,6 +93,7 @@ mod implementation {
         let nofile_limit = preferred_nofile_limit(config.raise_nofile_limit);
         let new_process_group = config.new_process_group;
         let close_unlisted_fds = config.close_unlisted_fds;
+        let privilege = config.privilege;
         // Capture the creating process before fork. `PR_SET_PDEATHSIG` is not
         // retroactive, so the child compares this identity after arming the
         // signal to close the parent-exit-before-prctl race.
@@ -57,11 +105,12 @@ mod implementation {
         let inherited_fds = config.inherited_fds;
 
         // SAFETY: the closure runs after fork and before exec. `sigprocmask`,
-        // `setpgid`, `close_range`, `fcntl`, `prctl`, `getpid`, `getppid`, `kill`,
-        // Linux/Bionic's errno accessor, and Linux/Bionic's `setrlimit`
-        // wrapper are allocation-free syscall/TLS operations. The closure
-        // touches only copied or preallocated values and constructs an
-        // `io::Error` from a captured errno integer or constant.
+        // `setpgid`, `close_range`, `fcntl`, `prctl`, the raw credential and
+        // capability syscalls, `getpid`, `getppid`, `kill`, Linux/Bionic's
+        // errno accessor, and Linux/Bionic's `setrlimit` wrapper are
+        // allocation-free syscall/TLS operations. The closure touches only
+        // copied or preallocated values and constructs an `io::Error` from a
+        // captured errno integer or constant.
         unsafe {
             command.pre_exec(move || {
                 if libc::sigprocmask(
@@ -92,23 +141,327 @@ mod implementation {
                     // intentionally ignored so a sandbox cannot prevent exec.
                     let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit);
                 }
+                apply_privilege(privilege)?;
                 if let Some(expected_parent) = expected_parent {
-                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
-                        return Err(last_fork_error());
-                    }
-                    if libc::getppid() != expected_parent {
-                        if libc::kill(libc::getpid(), libc::SIGKILL) != 0 {
-                            return Err(last_fork_error());
-                        }
-                        // SIGKILL cannot return control, but keep the exec
-                        // contract fail-closed if the kernel ever does.
-                        return Err(io::Error::from_raw_os_error(libc::ECHILD));
-                    }
+                    arm_parent_death_signal(expected_parent)?;
                 }
                 Ok(())
             });
         }
         Ok(())
+    }
+
+    fn apply_privilege(privilege: ChildProcessPrivilege) -> Result<(), io::Error> {
+        let ChildProcessPrivilege::TransparentProxy(credentials) = privilege else {
+            return Ok(());
+        };
+
+        // Clear any inherited ambient authority before locking the root and
+        // set-ID capability fixups into their least-privilege behavior.
+        // SAFETY: PR_CAP_AMBIENT_CLEAR_ALL accepts only scalar arguments and
+        // applies to the calling child without dereferencing user memory.
+        if unsafe {
+            libc::prctl(
+                libc::PR_CAP_AMBIENT,
+                libc::PR_CAP_AMBIENT_CLEAR_ALL,
+                0,
+                0,
+                0,
+            )
+        } != 0
+        {
+            return Err(last_fork_error());
+        }
+        set_securebits(BASE_SECUREBITS)?;
+        drop_unrequired_bounding_capabilities()?;
+
+        // SAFETY: the raw Linux setgroups syscall receives a zero element count,
+        // so the null group-array pointer is not dereferenced.
+        if unsafe {
+            libc::syscall(
+                libc::SYS_setgroups,
+                0_usize,
+                std::ptr::null::<libc::gid_t>(),
+            )
+        } != 0
+        {
+            return Err(last_fork_error());
+        }
+        let gid = credentials.gid().get();
+        // SAFETY: the raw Linux setresgid syscall receives three scalar IDs
+        // accepted by Flux's credential value type and mutates only this child.
+        if unsafe { libc::syscall(libc::SYS_setresgid, gid, gid, gid) } != 0 {
+            return Err(last_fork_error());
+        }
+        let uid = credentials.uid().get();
+        // SAFETY: the raw Linux setresuid syscall receives three scalar IDs
+        // accepted by Flux's credential value type and mutates only this child.
+        if unsafe { libc::syscall(libc::SYS_setresuid, uid, uid, uid) } != 0 {
+            return Err(last_fork_error());
+        }
+
+        let setup_capabilities = TRANSPARENT_PROXY_ENGINE_CAPABILITY_MASK | (1_u64 << CAP_SETPCAP);
+        set_capabilities(
+            setup_capabilities,
+            setup_capabilities,
+            TRANSPARENT_PROXY_ENGINE_CAPABILITY_MASK,
+        )?;
+        for capability in [CAP_NET_ADMIN, CAP_NET_RAW] {
+            // SAFETY: PR_CAP_AMBIENT_RAISE accepts a validated capability
+            // number and scalar zero arguments; it accesses no user pointer.
+            if unsafe {
+                libc::prctl(
+                    libc::PR_CAP_AMBIENT,
+                    libc::PR_CAP_AMBIENT_RAISE,
+                    capability,
+                    0,
+                    0,
+                )
+            } != 0
+            {
+                return Err(last_fork_error());
+            }
+        }
+        set_securebits(FINAL_SECUREBITS)?;
+        set_capabilities(
+            TRANSPARENT_PROXY_ENGINE_CAPABILITY_MASK,
+            TRANSPARENT_PROXY_ENGINE_CAPABILITY_MASK,
+            TRANSPARENT_PROXY_ENGINE_CAPABILITY_MASK,
+        )?;
+        // SAFETY: PR_SET_NO_NEW_PRIVS accepts scalar arguments and irreversibly
+        // constrains only the calling child.
+        if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+            return Err(last_fork_error());
+        }
+        verify_privilege(credentials.uid().get(), credentials.gid().get())
+    }
+
+    fn set_securebits(bits: libc::c_ulong) -> Result<(), io::Error> {
+        // SAFETY: PR_SET_SECUREBITS accepts one scalar bit mask and accesses no
+        // user pointer; the caller supplies only the masks defined above.
+        if unsafe { libc::prctl(libc::PR_SET_SECUREBITS, bits, 0, 0, 0) } == 0 {
+            Ok(())
+        } else {
+            Err(last_fork_error())
+        }
+    }
+
+    fn drop_unrequired_bounding_capabilities() -> Result<(), io::Error> {
+        for capability in 0..=MAX_CAPABILITY_NUMBER {
+            if TRANSPARENT_PROXY_ENGINE_CAPABILITY_MASK & (1_u64 << capability) != 0 {
+                continue;
+            }
+            // SAFETY: PR_CAPBSET_DROP accepts one capability number from the
+            // bounded 0..=63 scan and scalar zero arguments.
+            if unsafe { libc::prctl(libc::PR_CAPBSET_DROP, capability, 0, 0, 0) } == 0 {
+                continue;
+            }
+            let error = last_fork_error();
+            if error.raw_os_error() != Some(libc::EINVAL) {
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    fn set_capabilities(effective: u64, permitted: u64, inheritable: u64) -> Result<(), io::Error> {
+        let mut header = CapabilityHeader {
+            version: LINUX_CAPABILITY_VERSION_3,
+            pid: 0,
+        };
+        let data = capability_data(effective, permitted, inheritable);
+        // SAFETY: the version-3 header names the calling process and `data`
+        // contains the required two initialized capability words for capset.
+        if unsafe {
+            libc::syscall(
+                libc::SYS_capset,
+                &raw mut header,
+                (&raw const data).cast::<CapabilityData>(),
+            )
+        } == 0
+        {
+            Ok(())
+        } else {
+            Err(last_fork_error())
+        }
+    }
+
+    fn read_capabilities() -> Result<[CapabilityData; 2], io::Error> {
+        let mut header = CapabilityHeader {
+            version: LINUX_CAPABILITY_VERSION_3,
+            pid: 0,
+        };
+        let mut data = [CapabilityData {
+            effective: 0,
+            permitted: 0,
+            inheritable: 0,
+        }; 2];
+        // SAFETY: the version-3 header names the calling process and `data`
+        // provides writable storage for both capability words filled by capget.
+        if unsafe {
+            libc::syscall(
+                libc::SYS_capget,
+                &raw mut header,
+                (&raw mut data).cast::<CapabilityData>(),
+            )
+        } == 0
+        {
+            Ok(data)
+        } else {
+            Err(last_fork_error())
+        }
+    }
+
+    const fn capability_data(
+        effective: u64,
+        permitted: u64,
+        inheritable: u64,
+    ) -> [CapabilityData; 2] {
+        [
+            CapabilityData {
+                effective: effective as u32,
+                permitted: permitted as u32,
+                inheritable: inheritable as u32,
+            },
+            CapabilityData {
+                effective: (effective >> u32::BITS) as u32,
+                permitted: (permitted >> u32::BITS) as u32,
+                inheritable: (inheritable >> u32::BITS) as u32,
+            },
+        ]
+    }
+
+    fn verify_privilege(uid: u32, gid: u32) -> Result<(), io::Error> {
+        let mut real_uid = u32::MAX;
+        let mut effective_uid = u32::MAX;
+        let mut saved_uid = u32::MAX;
+        // SAFETY: the raw Linux getresuid syscall receives three pointers to
+        // distinct initialized u32 storage valid for its writes.
+        if unsafe {
+            libc::syscall(
+                libc::SYS_getresuid,
+                &raw mut real_uid,
+                &raw mut effective_uid,
+                &raw mut saved_uid,
+            )
+        } != 0
+            || [real_uid, effective_uid, saved_uid] != [uid; 3]
+        {
+            return Err(fork_contract_error());
+        }
+        let mut real_gid = u32::MAX;
+        let mut effective_gid = u32::MAX;
+        let mut saved_gid = u32::MAX;
+        // SAFETY: the raw Linux getresgid syscall receives three pointers to
+        // distinct initialized u32 storage valid for its writes.
+        if unsafe {
+            libc::syscall(
+                libc::SYS_getresgid,
+                &raw mut real_gid,
+                &raw mut effective_gid,
+                &raw mut saved_gid,
+            )
+        } != 0
+            || [real_gid, effective_gid, saved_gid] != [gid; 3]
+        {
+            return Err(fork_contract_error());
+        }
+        // SAFETY: the raw Linux getgroups syscall receives a zero element
+        // count, so the null output pointer is not dereferenced.
+        if unsafe {
+            libc::syscall(
+                libc::SYS_getgroups,
+                0_usize,
+                std::ptr::null_mut::<libc::gid_t>(),
+            )
+        } != 0
+        {
+            return Err(fork_contract_error());
+        }
+        let capabilities = read_capabilities()?;
+        let expected = capability_data(
+            TRANSPARENT_PROXY_ENGINE_CAPABILITY_MASK,
+            TRANSPARENT_PROXY_ENGINE_CAPABILITY_MASK,
+            TRANSPARENT_PROXY_ENGINE_CAPABILITY_MASK,
+        );
+        // SAFETY: both getter operations accept only scalar zero arguments and
+        // return state for the calling child without dereferencing user memory.
+        let securebits = unsafe { libc::prctl(libc::PR_GET_SECUREBITS, 0, 0, 0, 0) };
+        // SAFETY: PR_GET_NO_NEW_PRIVS likewise accepts scalar zero arguments
+        // and reads only state associated with the calling child.
+        let no_new_privileges = unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) };
+        if capabilities
+            .iter()
+            .zip(expected)
+            .any(|(observed, expected)| {
+                observed.effective != expected.effective
+                    || observed.permitted != expected.permitted
+                    || observed.inheritable != expected.inheritable
+            })
+            || securebits != FINAL_SECUREBITS as libc::c_int
+            || no_new_privileges != 1
+            || read_capability_bounding()? != TRANSPARENT_PROXY_ENGINE_CAPABILITY_MASK
+        {
+            return Err(fork_contract_error());
+        }
+        for capability in [CAP_NET_ADMIN, CAP_NET_RAW] {
+            // SAFETY: PR_CAP_AMBIENT_IS_SET accepts a validated capability
+            // number and scalar zero arguments, with no user pointer.
+            if unsafe {
+                libc::prctl(
+                    libc::PR_CAP_AMBIENT,
+                    libc::PR_CAP_AMBIENT_IS_SET,
+                    capability,
+                    0,
+                    0,
+                )
+            } != 1
+            {
+                return Err(fork_contract_error());
+            }
+        }
+        Ok(())
+    }
+
+    fn read_capability_bounding() -> Result<u64, io::Error> {
+        let mut bounding = 0_u64;
+        for capability in 0..=MAX_CAPABILITY_NUMBER {
+            // SAFETY: PR_CAPBSET_READ accepts one capability number from the
+            // bounded 0..=63 scan and scalar zero arguments.
+            match unsafe { libc::prctl(libc::PR_CAPBSET_READ, capability, 0, 0, 0) } {
+                0 => {}
+                1 => bounding |= 1_u64 << capability,
+                _ => {
+                    let error = last_fork_error();
+                    if error.raw_os_error() != Some(libc::EINVAL) {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        Ok(bounding)
+    }
+
+    fn arm_parent_death_signal(expected_parent: libc::pid_t) -> Result<(), io::Error> {
+        // SAFETY: PR_SET_PDEATHSIG accepts a valid signal number and scalar
+        // zero arguments, changing only the calling child's process state.
+        if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } != 0 {
+            return Err(last_fork_error());
+        }
+        // SAFETY: getppid has no arguments, pointers, or failure mode.
+        if unsafe { libc::getppid() } == expected_parent {
+            return Ok(());
+        }
+        // SAFETY: getpid returns the calling child's valid PID; kill targets
+        // exactly that PID with the valid SIGKILL constant.
+        if unsafe { libc::kill(libc::getpid(), libc::SIGKILL) } != 0 {
+            return Err(last_fork_error());
+        }
+        Err(io::Error::from_raw_os_error(libc::ECHILD))
+    }
+
+    fn fork_contract_error() -> io::Error {
+        io::Error::from_raw_os_error(libc::EPERM)
     }
 
     pub(crate) fn set_nonblocking(descriptor: i32) -> Result<(), io::Error> {
@@ -311,6 +664,7 @@ mod implementation {
             kill_on_parent_death: _,
             close_unlisted_fds: _,
             inherited_fds: _,
+            privilege: _,
         } = config;
         Ok(())
     }

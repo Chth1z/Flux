@@ -1,5 +1,4 @@
 use std::error::Error;
-use std::ffi::OsString;
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
@@ -11,7 +10,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::child_process::{self, ChildProcessConfig, ProcessSignal};
+use flux_core::EngineCredentials;
+
+use crate::child_process::{self, ChildProcessConfig, ChildProcessPrivilege, ProcessSignal};
 use crate::process::{ProcessHandle, ProcessHandleError, ProcessIdentity};
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -19,7 +20,7 @@ use std::collections::HashSet;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use std::os::fd::AsRawFd;
 #[cfg(any(target_os = "linux", target_os = "android"))]
-use std::os::unix::fs::{FileExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use std::os::unix::process::ExitStatusExt;
 
@@ -36,25 +37,13 @@ pub struct SingBoxProcessAdapter;
 pub struct PinnedSingBoxLaunch {
     binary: File,
     config: File,
-    busybox: Option<File>,
 }
 
 impl PinnedSingBoxLaunch {
-    pub fn new(
-        binary: File,
-        config: File,
-        busybox: Option<File>,
-    ) -> Result<Self, SingBoxProcessError> {
-        validate_pinned_descriptor("binary", &binary)?;
-        validate_pinned_descriptor("config", &config)?;
-        if let Some(busybox) = &busybox {
-            validate_pinned_descriptor("busybox", busybox)?;
-        }
-        Ok(Self {
-            binary,
-            config,
-            busybox,
-        })
+    pub fn new(binary: File, config: File) -> Result<Self, SingBoxProcessError> {
+        let pinned = Self { binary, config };
+        pinned.revalidate()?;
+        Ok(pinned)
     }
 
     #[must_use]
@@ -67,9 +56,10 @@ impl PinnedSingBoxLaunch {
         &self.config
     }
 
-    #[must_use]
-    pub const fn busybox(&self) -> Option<&File> {
-        self.busybox.as_ref()
+    fn revalidate(&self) -> Result<(), SingBoxProcessError> {
+        validate_pinned_descriptor("binary", &self.binary)?;
+        validate_pinned_executable_privilege(&self.binary)?;
+        validate_pinned_descriptor("config", &self.config)
     }
 }
 
@@ -79,7 +69,6 @@ impl fmt::Debug for PinnedSingBoxLaunch {
             .debug_struct("PinnedSingBoxLaunch")
             .field("binary", &self.binary)
             .field("config", &self.config)
-            .field("busybox", &self.busybox)
             .finish()
     }
 }
@@ -90,19 +79,31 @@ pub struct SingBoxLaunchSpec {
     pub config: PathBuf,
     pub working_directory: PathBuf,
     pub log: PathBuf,
-    pub launcher: SingBoxLauncher,
+    pub privilege: SingBoxPrivilege,
     pub readiness: SingBoxReadiness,
     pub startup_timeout: Duration,
     pub stop_timeout: Duration,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum SingBoxLauncher {
-    Direct,
-    BusyBoxSetuidgid {
-        busybox: PathBuf,
-        identity: OsString,
-    },
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SingBoxPrivilege {
+    Inherit,
+    TransparentProxy(EngineCredentials),
+}
+
+impl SingBoxPrivilege {
+    #[must_use]
+    pub const fn transparent_proxy(credentials: EngineCredentials) -> Self {
+        Self::TransparentProxy(credentials)
+    }
+
+    #[must_use]
+    pub const fn credentials(self) -> Option<EngineCredentials> {
+        match self {
+            Self::Inherit => None,
+            Self::TransparentProxy(credentials) => Some(credentials),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -285,6 +286,13 @@ pub enum TerminationOutcome {
     Killed { exit: SingBoxExit },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SingBoxExecutablePrivilegeAttribute {
+    SetUserId,
+    SetGroupId,
+    FileCapabilities,
+}
+
 #[derive(Debug)]
 pub enum SingBoxProcessError {
     UnsupportedPlatform {
@@ -309,6 +317,9 @@ pub enum SingBoxProcessError {
     PinnedDescriptor {
         role: &'static str,
         source: io::Error,
+    },
+    UnsafeExecutablePrivilege {
+        attribute: SingBoxExecutablePrivilegeAttribute,
     },
     Wait {
         pid: u32,
@@ -406,6 +417,7 @@ impl SingBoxProcessError {
             | Self::Spawn { .. }
             | Self::ReadChildIdentity { .. }
             | Self::PinnedDescriptor { .. }
+            | Self::UnsafeExecutablePrivilege { .. }
             | Self::Wait { .. }
             | Self::Signal { .. }
             | Self::Capture { .. }
@@ -454,6 +466,10 @@ impl fmt::Display for SingBoxProcessError {
                     "invalid pinned Sing-Box {role} descriptor: {source}"
                 )
             }
+            Self::UnsafeExecutablePrivilege { attribute } => write!(
+                formatter,
+                "pinned Sing-Box binary has exec-sensitive privilege attribute {attribute:?}"
+            ),
             Self::Wait { pid, source } => write!(formatter, "cannot poll child {pid}: {source}"),
             Self::Signal {
                 pid,
@@ -567,6 +583,7 @@ impl Error for SingBoxProcessError {
             | Self::ReadinessProbe { source, .. } => Some(source),
             Self::UnsupportedPlatform { .. }
             | Self::InvalidSpec { .. }
+            | Self::UnsafeExecutablePrivilege { .. }
             | Self::CaptureThreadPanicked { .. }
             | Self::CheckFailed { .. }
             | Self::CheckTimedOut { .. }
@@ -590,7 +607,8 @@ impl SingBoxProcessAdapter {
     ) -> Result<SingBoxVersionReport, SingBoxProcessError> {
         ensure_supported()?;
         validate_spec(spec)?;
-        let prepared = pinned_version_command(pinned, spec)?;
+        pinned.revalidate()?;
+        let prepared = pinned_version_command(pinned)?;
         let completed = self.run_pinned_probe(prepared, spec, PinnedProbe::Version)?;
         exact_version_report(completed.output)
     }
@@ -602,6 +620,7 @@ impl SingBoxProcessAdapter {
     ) -> Result<ValidationReport, SingBoxProcessError> {
         ensure_supported()?;
         validate_spec(spec)?;
+        pinned.revalidate()?;
         let prepared = pinned_command(pinned, spec, "check")?;
         let completed = self.run_pinned_probe(prepared, spec, PinnedProbe::Check)?;
         let exit = classify_exit(completed.status);
@@ -624,7 +643,12 @@ impl SingBoxProcessAdapter {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        configure_child(&mut prepared.command, true, prepared.inherited_fds)?;
+        configure_child(
+            &mut prepared.command,
+            true,
+            prepared.inherited_fds,
+            spec.privilege,
+        )?;
 
         let mut child = prepared
             .command
@@ -728,6 +752,7 @@ impl SingBoxProcessAdapter {
     ) -> Result<SingBoxChild, SingBoxProcessError> {
         ensure_supported()?;
         validate_spec(spec)?;
+        pinned.revalidate()?;
         let prepared = pinned_command(pinned, spec, "run")?;
         self.run_spawn(prepared, spec)
     }
@@ -744,7 +769,12 @@ impl SingBoxProcessAdapter {
             .stdin(Stdio::null())
             .stdout(Stdio::from(log.stdout))
             .stderr(Stdio::from(log.stderr));
-        configure_child(&mut prepared.command, false, prepared.inherited_fds)?;
+        configure_child(
+            &mut prepared.command,
+            false,
+            prepared.inherited_fds,
+            spec.privilege,
+        )?;
 
         let child = prepared
             .command
@@ -898,10 +928,6 @@ fn validate_spec(spec: &SingBoxLaunchSpec) -> Result<(), SingBoxProcessError> {
     validate_absolute_path("config", &spec.config)?;
     validate_absolute_path("working_directory", &spec.working_directory)?;
     validate_absolute_path("log", &spec.log)?;
-    if let SingBoxLauncher::BusyBoxSetuidgid { busybox, identity } = &spec.launcher {
-        validate_absolute_path("launcher.busybox", busybox)?;
-        validate_setuidgid_identity(identity)?;
-    }
     if let SingBoxReadiness::TunInterface { name } = &spec.readiness {
         if name.is_empty() {
             return Err(invalid_spec("readiness.name", "interface name is empty"));
@@ -942,42 +968,6 @@ fn validate_absolute_path(field: &'static str, path: &Path) -> Result<(), SingBo
     } else {
         Ok(())
     }
-}
-
-fn validate_setuidgid_identity(identity: &OsString) -> Result<(), SingBoxProcessError> {
-    let Some(identity) = identity.to_str() else {
-        return Err(invalid_spec(
-            "launcher.identity",
-            "identity must be valid UTF-8",
-        ));
-    };
-    let components = identity.split(':').collect::<Vec<_>>();
-    if !(components.len() == 1 || components.len() == 2)
-        || components
-            .iter()
-            .any(|component| !valid_identity(component))
-    {
-        return Err(invalid_spec(
-            "launcher.identity",
-            "expected USER or USER:GROUP using decimal IDs or safe names",
-        ));
-    }
-    Ok(())
-}
-
-fn valid_identity(identity: &str) -> bool {
-    if identity.is_empty() || identity.len() > 255 {
-        return false;
-    }
-    if identity.bytes().all(|byte| byte.is_ascii_digit()) {
-        return identity.parse::<u32>().is_ok();
-    }
-    let mut bytes = identity.bytes();
-    let Some(first) = bytes.next() else {
-        return false;
-    };
-    (first.is_ascii_alphabetic() || first == b'_')
-        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
 fn invalid_spec(field: &'static str, detail: impl Into<String>) -> SingBoxProcessError {
@@ -1049,7 +1039,7 @@ fn pinned_command(
     spec: &SingBoxLaunchSpec,
     subcommand: &'static str,
 ) -> Result<PreparedCommand, SingBoxProcessError> {
-    let mut prepared = pinned_base_command(pinned, spec)?;
+    let mut prepared = pinned_base_command(pinned)?;
     let config = descriptor_path(&pinned.config);
     prepared.inherited_fds.push(pinned.config.as_raw_fd());
     prepared.inherited_fds.sort_unstable();
@@ -1067,9 +1057,8 @@ fn pinned_command(
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn pinned_version_command(
     pinned: &PinnedSingBoxLaunch,
-    spec: &SingBoxLaunchSpec,
 ) -> Result<PreparedCommand, SingBoxProcessError> {
-    let mut prepared = pinned_base_command(pinned, spec)?;
+    let mut prepared = pinned_base_command(pinned)?;
     prepared.command.arg("version");
     Ok(prepared)
 }
@@ -1077,41 +1066,19 @@ fn pinned_version_command(
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn pinned_base_command(
     pinned: &PinnedSingBoxLaunch,
-    spec: &SingBoxLaunchSpec,
 ) -> Result<PreparedCommand, SingBoxProcessError> {
     let binary = descriptor_path(&pinned.binary);
     let binary_fd = pinned.binary.as_raw_fd();
-    let (command, program, mut inherited_fds) = match &spec.launcher {
-        SingBoxLauncher::Direct => {
-            let inherited = if descriptor_is_script("binary", &pinned.binary)? {
-                vec![binary_fd]
-            } else {
-                Vec::new()
-            };
-            (Command::new(&binary), binary.clone(), inherited)
-        }
-        SingBoxLauncher::BusyBoxSetuidgid { identity, .. } => {
-            let busybox = pinned.busybox.as_ref().ok_or_else(|| {
-                invalid_spec(
-                    "launcher.busybox_file",
-                    "pinned BusyBox descriptor is required for setuidgid",
-                )
-            })?;
-            let busybox_path = descriptor_path(busybox);
-            let mut command = Command::new(&busybox_path);
-            command.arg("setuidgid").arg(identity).arg(&binary);
-            let mut inherited = vec![binary_fd];
-            if descriptor_is_script("busybox", busybox)? {
-                inherited.push(busybox.as_raw_fd());
-            }
-            (command, busybox_path, inherited)
-        }
+    let mut inherited_fds = if descriptor_is_script("binary", &pinned.binary)? {
+        vec![binary_fd]
+    } else {
+        Vec::new()
     };
     inherited_fds.sort_unstable();
     inherited_fds.dedup();
     Ok(PreparedCommand {
-        command,
-        program,
+        command: Command::new(&binary),
+        program: binary,
         inherited_fds,
     })
 }
@@ -1156,6 +1123,72 @@ fn validate_pinned_descriptor(role: &'static str, file: &File) -> Result<(), Sin
         });
     }
     set_descriptor_close_on_exec(role, file)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn validate_pinned_executable_privilege(file: &File) -> Result<(), SingBoxProcessError> {
+    const SECURITY_CAPABILITY_XATTR: &[u8] = b"security.capability\0";
+
+    let metadata = file
+        .metadata()
+        .map_err(|source| SingBoxProcessError::PinnedDescriptor {
+            role: "binary privilege",
+            source,
+        })?;
+    let mode = metadata.mode();
+    validate_executable_privilege_state(mode, false)?;
+
+    // SAFETY: the descriptor is live, the attribute name is NUL-terminated,
+    // and a zero-sized query does not dereference the null value pointer.
+    let size = unsafe {
+        libc::fgetxattr(
+            file.as_raw_fd(),
+            SECURITY_CAPABILITY_XATTR.as_ptr().cast(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if size >= 0 {
+        return validate_executable_privilege_state(mode, true);
+    }
+    let source = io::Error::last_os_error();
+    if matches!(source.raw_os_error(), Some(code) if code == libc::ENODATA || code == libc::ENOTSUP)
+    {
+        Ok(())
+    } else {
+        Err(SingBoxProcessError::PinnedDescriptor {
+            role: "binary privilege",
+            source,
+        })
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn validate_executable_privilege_state(
+    mode: u32,
+    file_capabilities: bool,
+) -> Result<(), SingBoxProcessError> {
+    if mode & libc::S_ISUID != 0 {
+        return Err(SingBoxProcessError::UnsafeExecutablePrivilege {
+            attribute: SingBoxExecutablePrivilegeAttribute::SetUserId,
+        });
+    }
+    if mode & libc::S_ISGID != 0 {
+        return Err(SingBoxProcessError::UnsafeExecutablePrivilege {
+            attribute: SingBoxExecutablePrivilegeAttribute::SetGroupId,
+        });
+    }
+    if file_capabilities {
+        return Err(SingBoxProcessError::UnsafeExecutablePrivilege {
+            attribute: SingBoxExecutablePrivilegeAttribute::FileCapabilities,
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn validate_pinned_executable_privilege(_file: &File) -> Result<(), SingBoxProcessError> {
+    Ok(())
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -1480,19 +1513,22 @@ fn configure_child(
     command: &mut Command,
     new_process_group: bool,
     inherited_fds: Vec<i32>,
+    privilege: SingBoxPrivilege,
 ) -> Result<(), SingBoxProcessError> {
     child_process::configure_child_process(
         command,
         ChildProcessConfig {
             raise_nofile_limit: true,
             new_process_group,
-            // This contains direct launches. A later BusyBox setuidgid
-            // credential transition can clear PDEATHSIG, so non-root launch
-            // needs the deferred post-credential Rust launcher before it can
-            // claim the same crash-time guarantee.
             kill_on_parent_death: true,
             close_unlisted_fds: false,
             inherited_fds,
+            privilege: match privilege {
+                SingBoxPrivilege::Inherit => ChildProcessPrivilege::Inherit,
+                SingBoxPrivilege::TransparentProxy(credentials) => {
+                    ChildProcessPrivilege::TransparentProxy(credentials)
+                }
+            },
         },
     )
     .map_err(|source| SingBoxProcessError::Spawn {
@@ -1854,10 +1890,11 @@ fn defer_reap(mut child: Child, pid: u32) {
 mod tests {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     use super::{
-        ProcessHandleError, ReadinessEvidence, SingBoxChild, SingBoxProcessAdapter,
-        SingBoxProcessError, listener_evidence, proc_net_contains_port, read_child_identity,
+        ProcessHandleError, ReadinessEvidence, SingBoxChild, SingBoxExecutablePrivilegeAttribute,
+        SingBoxProcessAdapter, SingBoxProcessError, listener_evidence, proc_net_contains_port,
+        read_child_identity, validate_executable_privilege_state,
     };
-    use super::{bounded_lossy_tail, retain_tail, valid_identity};
+    use super::{bounded_lossy_tail, retain_tail};
     #[cfg(any(target_os = "linux", target_os = "android"))]
     use std::fs::File;
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -1985,27 +2022,6 @@ mod tests {
         assert!(text.len() <= 16);
     }
 
-    #[test]
-    fn setuidgid_identity_accepts_only_safe_numeric_or_named_components() {
-        for valid in ["0", "1000", "root", "_service", "user_123", "4294967295"] {
-            assert!(valid_identity(valid), "expected valid identity {valid:?}");
-        }
-        for invalid in [
-            "",
-            "-root",
-            "+1",
-            "user-name",
-            "user.name",
-            "4294967296",
-            "é",
-        ] {
-            assert!(
-                !valid_identity(invalid),
-                "expected invalid identity {invalid:?}"
-            );
-        }
-    }
-
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn proc_net_parser_requires_tcp_listen_state() {
@@ -2014,5 +2030,37 @@ mod tests {
         let connected = "sl local_address rem_address st\n0: 0100007F:2A25 0100007F:1234 01 0:0 00:0 0 1000 0 4242\n";
         assert!(proc_net_contains_port(listening, port, true));
         assert!(!proc_net_contains_port(connected, port, true));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn executable_privilege_state_rejects_every_exec_sensitive_attribute() {
+        for (mode, file_capabilities, expected) in [
+            (
+                libc::S_ISUID,
+                false,
+                SingBoxExecutablePrivilegeAttribute::SetUserId,
+            ),
+            (
+                libc::S_ISGID,
+                false,
+                SingBoxExecutablePrivilegeAttribute::SetGroupId,
+            ),
+            (
+                0,
+                true,
+                SingBoxExecutablePrivilegeAttribute::FileCapabilities,
+            ),
+        ] {
+            let error = validate_executable_privilege_state(mode, file_capabilities)
+                .expect_err("exec-sensitive privilege must be rejected");
+            assert!(matches!(
+                error,
+                SingBoxProcessError::UnsafeExecutablePrivilege { attribute }
+                    if attribute == expected
+            ));
+        }
+        validate_executable_privilege_state(0o700, false)
+            .expect("plain owner-executable mode has no exec-sensitive privilege");
     }
 }

@@ -18,7 +18,7 @@ use flux_platform::{
     AndroidFwmarkCensusCoordinatorOutcome, AndroidFwmarkCensusCoordinatorPurpose,
     AndroidFwmarkCensusCoordinatorRequest, NativeXtablesCaptureAdmission,
     NativeXtablesCaptureAdmissionError, NativeXtablesCaptureTarget, NetworkInventorySource,
-    SingBoxLaunchSpec, SingBoxLauncher, SingBoxReadiness, SystemAndroidFwmarkCensusSource,
+    SingBoxLaunchSpec, SingBoxPrivilege, SingBoxReadiness, SystemAndroidFwmarkCensusSource,
     coordinate_android_fwmark_census_for_inventory,
 };
 #[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
@@ -27,15 +27,17 @@ use flux_platform::{
     XtablesLocalOutputRoutingSpec,
 };
 
+#[cfg(test)]
+use crate::generation_engine_config::rebind_engine_capability_profile_fixture;
 use crate::generation_engine_config::{
     AddressReconciledGenerationInputs, AddressReconciliationError, AddressReconciliationInspection,
     AdmittedGeneration, AdmittedGenerationIdentity, CapturePathDecision,
-    CapturePathQualificationEvidenceError, DesiredStateCompileError, EngineCapabilityProfileError,
-    EngineConfigCompileError, GenerationAssembler, GenerationAssemblyError,
-    GenerationAssemblyRequest, GenerationPlanningAuthority, SelectedEngineSource,
-    TproxyEngineConfigRequest, bind_engine_config_to_spec,
-    collect_tproxy_engine_capability_profile, compile_address_reconciliation,
-    compile_tproxy_engine_config, read_bounded_regular_file,
+    CapturePathQualificationEvidenceError, DesiredStateCompileError, EngineCapabilityProfile,
+    EngineCapabilityProfileError, EngineConfigCompileError, EngineConfigLaunchBinding,
+    GenerationAssembler, GenerationAssemblyError, GenerationAssemblyRequest,
+    GenerationPlanningAuthority, SelectedEngineSource, TproxyEngineConfigRequest,
+    bind_engine_config_to_spec, collect_tproxy_engine_capability_profile,
+    compile_address_reconciliation, compile_tproxy_engine_config, read_bounded_regular_file,
 };
 #[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
 use crate::generation_engine_config::{
@@ -66,6 +68,49 @@ pub(crate) trait NativeGenerationPlanningSource: Send + 'static {
         desired_state: &FluxConfig,
         inventory: &NetworkInventory,
     ) -> Result<GenerationPlanningAuthority, Self::Error>;
+}
+
+trait EngineCapabilityProfileSource: Send + 'static {
+    fn collect(
+        &mut self,
+        binding: &EngineConfigLaunchBinding,
+        spec: &EngineSpec,
+    ) -> Result<EngineCapabilityProfile, EngineCapabilityProfileError>;
+}
+
+#[derive(Default)]
+struct ProcessEngineCapabilityProfileSource;
+
+impl EngineCapabilityProfileSource for ProcessEngineCapabilityProfileSource {
+    fn collect(
+        &mut self,
+        binding: &EngineConfigLaunchBinding,
+        spec: &EngineSpec,
+    ) -> Result<EngineCapabilityProfile, EngineCapabilityProfileError> {
+        collect_tproxy_engine_capability_profile(binding, spec)
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct InheritedEngineProfileSource;
+
+#[cfg(test)]
+impl EngineCapabilityProfileSource for InheritedEngineProfileSource {
+    fn collect(
+        &mut self,
+        binding: &EngineConfigLaunchBinding,
+        spec: &EngineSpec,
+    ) -> Result<EngineCapabilityProfile, EngineCapabilityProfileError> {
+        let mut process = spec.process().clone();
+        process.privilege = SingBoxPrivilege::Inherit;
+        let probe_spec = EngineSpec::new(process, spec.restart_policy())
+            .expect("inspect inherited engine-profile fixture");
+        let probe_binding = bind_engine_config_to_spec(binding.artifact().clone(), &probe_spec)
+            .expect("bind inherited engine-profile fixture");
+        let profile = collect_tproxy_engine_capability_profile(&probe_binding, &probe_spec)?;
+        Ok(rebind_engine_capability_profile_fixture(profile, binding))
+    }
 }
 
 #[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
@@ -498,6 +543,7 @@ where
     inventory: V,
     planning: P,
     admission: A,
+    engine_profiles: Box<dyn EngineCapabilityProfileSource>,
     accepted_subscription: Option<ValidatedSubscriptionEngineConfig>,
     latest_capture_path_decision: Option<CapturePathDecision>,
     pending: Option<PendingGeneration>,
@@ -521,11 +567,49 @@ where
         admission: A,
         accepted_subscription: Option<ValidatedSubscriptionEngineConfig>,
     ) -> Self {
+        Self::with_engine_profile_source(
+            paths,
+            inventory,
+            planning,
+            admission,
+            accepted_subscription,
+            Box::new(ProcessEngineCapabilityProfileSource),
+        )
+    }
+
+    #[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
+    #[must_use]
+    pub(crate) fn for_linux_native_composition_test(
+        paths: NativeGenerationSourcePaths,
+        inventory: V,
+        planning: P,
+        admission: A,
+        accepted_subscription: Option<ValidatedSubscriptionEngineConfig>,
+    ) -> Self {
+        Self::with_engine_profile_source(
+            paths,
+            inventory,
+            planning,
+            admission,
+            accepted_subscription,
+            Box::new(InheritedEngineProfileSource),
+        )
+    }
+
+    fn with_engine_profile_source(
+        paths: NativeGenerationSourcePaths,
+        inventory: V,
+        planning: P,
+        admission: A,
+        accepted_subscription: Option<ValidatedSubscriptionEngineConfig>,
+        engine_profiles: Box<dyn EngineCapabilityProfileSource>,
+    ) -> Self {
         Self {
             paths,
             inventory,
             planning,
             admission,
+            engine_profiles,
             accepted_subscription,
             latest_capture_path_decision: None,
             pending: None,
@@ -657,7 +741,9 @@ where
         let spec = build_engine_spec(&desired_state, &config_path, &self.paths)?;
         let binding = bind_engine_config_to_spec(engine_source.artifact().clone(), &spec)
             .map_err(NativeGenerationSourceError::EngineBinding)?;
-        let engine_profile = collect_tproxy_engine_capability_profile(&binding, &spec)
+        let engine_profile = self
+            .engine_profiles
+            .collect(&binding, &spec)
             .map_err(NativeGenerationSourceError::EngineProfile)?;
         let planning = self
             .planning
@@ -976,7 +1062,7 @@ fn build_engine_spec(
             config: config_path.to_owned(),
             working_directory: paths.working_directory.clone(),
             log: paths.engine_log.clone(),
-            launcher: SingBoxLauncher::Direct,
+            privilege: SingBoxPrivilege::transparent_proxy(desired_state.engine().credentials()),
             readiness: SingBoxReadiness::Listener {
                 port: desired_state.listener().port(),
             },
@@ -1263,7 +1349,7 @@ esac
             let capture_path_observed_at = capture_path_evidence_deadline
                 .checked_sub(Duration::from_secs(5 * 60))
                 .expect("test Capture Path observation is representable");
-            let assembled = AssembledNativeGenerationSource::new(
+            let assembled = AssembledNativeGenerationSource::with_engine_profile_source(
                 paths,
                 inventory.clone(),
                 HostPlanning {
@@ -1274,6 +1360,7 @@ esac
                 },
                 RecordingAdmission::default(),
                 accepted_subscription,
+                Box::new(InheritedEngineProfileSource),
             );
 
             Self {

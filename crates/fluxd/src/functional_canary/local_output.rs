@@ -24,7 +24,7 @@ use std::convert::Infallible;
 #[cfg(test)]
 use crate::engine_supervisor::OwnedEngineIdentity;
 use crate::engine_supervisor::{EngineChildAuthority, EngineChildObservationPair};
-use flux_platform::ProcessObservation;
+use flux_platform::{ProcessObservation, TRANSPARENT_PROXY_ENGINE_CAPABILITY_MASK};
 
 use super::{
     CANARY_CREDENTIAL_MAP_DIGEST_BYTES, CanaryAttemptRequest, CanaryAttemptSocketObserverSession,
@@ -800,6 +800,7 @@ mod process_ownership_receipt {
         UnqualifiedCanaryCleanupEvidence, UnqualifiedCanaryFlowEvidenceSlots,
     };
     use flux_core::NetworkNamespaceIdentity;
+    use flux_platform::TRANSPARENT_PROXY_ENGINE_CAPABILITY_MASK;
 
     #[derive(Debug, Eq, PartialEq)]
     struct TproxyLocalOutputProcessOwnershipAuthority {
@@ -817,6 +818,7 @@ mod process_ownership_receipt {
         cap_inheritable: u64,
         cap_permitted: u64,
         cap_effective: u64,
+        cap_bounding: u64,
         cap_ambient: u64,
         no_new_privileges: bool,
         credential_domain: CanaryCredentialDomainBinding,
@@ -926,6 +928,7 @@ mod process_ownership_receipt {
             validate_credentials(
                 &self.engine_before.credentials,
                 Some(environment.engine_credentials()),
+                TRANSPARENT_PROXY_ENGINE_CAPABILITY_MASK,
                 credential_domain,
                 network.daemon_network_namespace(),
             )
@@ -933,6 +936,7 @@ mod process_ownership_receipt {
                 validate_credentials(
                     &self.engine_after.credentials,
                     Some(environment.engine_credentials()),
+                    TRANSPARENT_PROXY_ENGINE_CAPABILITY_MASK,
                     credential_domain,
                     network.daemon_network_namespace(),
                 )
@@ -962,6 +966,7 @@ mod process_ownership_receipt {
             validate_credentials(
                 &self.client.observation.credentials,
                 Some(environment.probe_credentials()),
+                0,
                 credential_domain,
                 network.daemon_network_namespace(),
             )
@@ -1008,6 +1013,7 @@ mod process_ownership_receipt {
                 validate_credentials(
                     &peer.observation.credentials,
                     None,
+                    0,
                     credential_domain,
                     network.peer_network_namespace(),
                 )
@@ -1054,6 +1060,7 @@ mod process_ownership_receipt {
                 engine_identity,
                 1,
                 environment.engine_credentials(),
+                TRANSPARENT_PROXY_ENGINE_CAPABILITY_MASK,
                 credential_domain,
                 network.daemon_network_namespace(),
                 earliest_flow_started_at,
@@ -1062,6 +1069,7 @@ mod process_ownership_receipt {
                 engine_identity,
                 1,
                 environment.engine_credentials(),
+                TRANSPARENT_PROXY_ENGINE_CAPABILITY_MASK,
                 credential_domain,
                 network.daemon_network_namespace(),
                 std::cmp::min(latest_flow_completed_at, attempt_completed_at),
@@ -1071,6 +1079,7 @@ mod process_ownership_receipt {
                     cleanup.client.process,
                     2,
                     environment.probe_credentials(),
+                    0,
                     credential_domain,
                     network.daemon_network_namespace(),
                     earliest_flow_started_at,
@@ -1087,6 +1096,7 @@ mod process_ownership_receipt {
                             NonZeroU32::new(raw).expect("peer UID is nonzero"),
                             NonZeroU32::new(raw).expect("peer GID is nonzero"),
                         ),
+                        0,
                         credential_domain,
                         network.peer_network_namespace(),
                         earliest_flow_started_at,
@@ -1134,6 +1144,7 @@ mod process_ownership_receipt {
     fn validate_credentials(
         observed: &TproxyLocalOutputProcessCredentialObservation,
         expected: Option<CanaryProcessCredentialIdentity>,
+        expected_capabilities: u64,
         credential_domain: CanaryCredentialDomainBinding,
         network_namespace: NetworkNamespaceIdentity,
     ) -> Result<(), ()> {
@@ -1142,10 +1153,11 @@ mod process_ownership_receipt {
         if observed.uids != [uid.get(); 4]
             || observed.gids != [gid.get(); 4]
             || observed.supplementary_group_count != 0
-            || observed.cap_inheritable != 0
-            || observed.cap_permitted != 0
-            || observed.cap_effective != 0
-            || observed.cap_ambient != 0
+            || observed.cap_inheritable != expected_capabilities
+            || observed.cap_permitted != expected_capabilities
+            || observed.cap_effective != expected_capabilities
+            || observed.cap_bounding != expected_capabilities
+            || observed.cap_ambient != expected_capabilities
             || !observed.no_new_privileges
             || observed.credential_domain != credential_domain
             || observed.network_namespace != network_namespace
@@ -1183,6 +1195,7 @@ mod process_ownership_receipt {
         identity: CanaryProcessIdentity,
         handle_id: u64,
         credentials: CanaryProcessCredentialIdentity,
+        capabilities: u64,
         credential_domain: CanaryCredentialDomainBinding,
         network_namespace: NetworkNamespaceIdentity,
         observed_at: Instant,
@@ -1194,10 +1207,11 @@ mod process_ownership_receipt {
                 uids: [credentials.uid().get(); 4],
                 gids: [credentials.gid().get(); 4],
                 supplementary_group_count: 0,
-                cap_inheritable: 0,
-                cap_permitted: 0,
-                cap_effective: 0,
-                cap_ambient: 0,
+                cap_inheritable: capabilities,
+                cap_permitted: capabilities,
+                cap_effective: capabilities,
+                cap_bounding: capabilities,
+                cap_ambient: capabilities,
                 no_new_privileges: true,
                 credential_domain,
                 network_namespace,
@@ -1411,6 +1425,7 @@ mod process_ownership_receipt {
             assert_engine_credentials_rejected(|credentials| credentials.cap_inheritable = 1);
             assert_engine_credentials_rejected(|credentials| credentials.cap_permitted = 1);
             assert_engine_credentials_rejected(|credentials| credentials.cap_effective = 1);
+            assert_engine_credentials_rejected(|credentials| credentials.cap_bounding = 1);
             assert_engine_credentials_rejected(|credentials| credentials.cap_ambient = 1);
             assert_engine_credentials_rejected(|credentials| credentials.no_new_privileges = false);
             assert_engine_after_credentials_rejected(|credentials| credentials.uids[2] += 1);
@@ -1804,6 +1819,7 @@ trait EngineProcessPolicyObservationView {
     fn capability_inheritable(&self) -> u64;
     fn capability_permitted(&self) -> u64;
     fn capability_effective(&self) -> u64;
+    fn capability_bounding(&self) -> u64;
     fn capability_ambient(&self) -> u64;
     fn no_new_privileges(&self) -> bool;
     fn user_namespace(&self) -> (u64, u64);
@@ -1836,6 +1852,10 @@ impl EngineProcessPolicyObservationView for ProcessObservation {
 
     fn capability_effective(&self) -> u64 {
         self.credentials().capability_effective()
+    }
+
+    fn capability_bounding(&self) -> u64 {
+        self.credentials().capability_bounding()
     }
 
     fn capability_ambient(&self) -> u64 {
@@ -1886,10 +1906,11 @@ where
     observed.uids() == [expected_credentials.uid().get(); 4]
         && observed.gids() == [expected_credentials.gid().get(); 4]
         && observed.supplementary_groups().is_empty()
-        && observed.capability_inheritable() == 0
-        && observed.capability_permitted() == 0
-        && observed.capability_effective() == 0
-        && observed.capability_ambient() == 0
+        && observed.capability_inheritable() == TRANSPARENT_PROXY_ENGINE_CAPABILITY_MASK
+        && observed.capability_permitted() == TRANSPARENT_PROXY_ENGINE_CAPABILITY_MASK
+        && observed.capability_effective() == TRANSPARENT_PROXY_ENGINE_CAPABILITY_MASK
+        && observed.capability_bounding() == TRANSPARENT_PROXY_ENGINE_CAPABILITY_MASK
+        && observed.capability_ambient() == TRANSPARENT_PROXY_ENGINE_CAPABILITY_MASK
         && observed.no_new_privileges()
         && observed.user_namespace() == (expected_user.device(), expected_user.inode().get())
         && observed.mount_namespace() == (expected_mount.device(), expected_mount.inode().get())
@@ -2088,6 +2109,7 @@ mod tests {
         capability_inheritable: u64,
         capability_permitted: u64,
         capability_effective: u64,
+        capability_bounding: u64,
         capability_ambient: u64,
         no_new_privileges: bool,
         user_namespace: (u64, u64),
@@ -2109,10 +2131,11 @@ mod tests {
                 uids: [credentials.uid().get(); 4],
                 gids: [credentials.gid().get(); 4],
                 supplementary_groups: Vec::new(),
-                capability_inheritable: 0,
-                capability_permitted: 0,
-                capability_effective: 0,
-                capability_ambient: 0,
+                capability_inheritable: TRANSPARENT_PROXY_ENGINE_CAPABILITY_MASK,
+                capability_permitted: TRANSPARENT_PROXY_ENGINE_CAPABILITY_MASK,
+                capability_effective: TRANSPARENT_PROXY_ENGINE_CAPABILITY_MASK,
+                capability_bounding: TRANSPARENT_PROXY_ENGINE_CAPABILITY_MASK,
+                capability_ambient: TRANSPARENT_PROXY_ENGINE_CAPABILITY_MASK,
                 no_new_privileges: true,
                 user_namespace: (user.device(), user.inode().get()),
                 mount_namespace: (mount.device(), mount.inode().get()),
@@ -2146,6 +2169,10 @@ mod tests {
 
         fn capability_effective(&self) -> u64 {
             self.capability_effective
+        }
+
+        fn capability_bounding(&self) -> u64 {
+            self.capability_bounding
         }
 
         fn capability_ambient(&self) -> u64 {
@@ -2205,6 +2232,7 @@ mod tests {
         assert_engine_policy_rejected(request, |observed| observed.capability_inheritable = 1);
         assert_engine_policy_rejected(request, |observed| observed.capability_permitted = 1);
         assert_engine_policy_rejected(request, |observed| observed.capability_effective = 1);
+        assert_engine_policy_rejected(request, |observed| observed.capability_bounding = 1);
         assert_engine_policy_rejected(request, |observed| observed.capability_ambient = 1);
         assert_engine_policy_rejected(request, |observed| observed.no_new_privileges = false);
         assert_engine_policy_rejected(request, |observed| observed.user_namespace.0 ^= 1);
@@ -2243,6 +2271,10 @@ mod tests {
         assert_eq!(
             observed.capability_effective(),
             credentials.capability_effective()
+        );
+        assert_eq!(
+            observed.capability_bounding(),
+            credentials.capability_bounding()
         );
         assert_eq!(
             observed.capability_ambient(),

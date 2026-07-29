@@ -10,13 +10,13 @@ use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Number, Value};
 use sha2::{Digest, Sha256};
 
-use flux_platform::SingBoxReadiness;
+use flux_platform::{SingBoxPrivilege, SingBoxReadiness};
 
 use crate::intent_store::{IntentStoreError, record_io};
 use crate::{EngineArtifactDigest, EngineArtifactSetIdentity, EngineSpec, MAX_ENGINE_CONFIG_BYTES};
 
 pub(crate) const GENERATION_ENGINE_CONFIG_SCHEMA_VERSION: u16 = 1;
-pub(crate) const ENGINE_CONFIG_LAUNCH_BINDING_SCHEMA_VERSION: u16 = 1;
+pub(crate) const ENGINE_CONFIG_LAUNCH_BINDING_SCHEMA_VERSION: u16 = 2;
 pub(crate) const MAX_GENERATION_ENGINE_CONFIG_INBOUNDS: usize = 256;
 
 pub(super) const ENGINE_CONFIG_DIGEST_BYTES: usize = 32;
@@ -25,7 +25,7 @@ const TEMPLATE_DIGEST_DOMAIN: &[u8] =
 const ARTIFACT_DIGEST_DOMAIN: &[u8] =
     b"Flux Generation Sing-Box engine config artifact\0sha256-v1\0";
 const LAUNCH_BINDING_DIGEST_DOMAIN: &[u8] =
-    b"Flux Generation Sing-Box engine config launch binding\0sha256-v1\0";
+    b"Flux Generation Sing-Box engine config launch binding\0sha256-v2\0";
 
 pub(crate) fn read_bounded_regular_file(path: &Path) -> io::Result<Vec<u8>> {
     let maximum = usize::try_from(MAX_ENGINE_CONFIG_BYTES).unwrap_or(usize::MAX);
@@ -189,15 +189,16 @@ impl fmt::Display for EngineConfigLaunchBindingDigest {
     }
 }
 
-/// Canonical configuration bound to one exact inspected launch-artifact set.
+/// Canonical configuration bound to one exact inspected launch request.
 ///
 /// This is not an Engine Capability Profile, runtime readiness observation, process identity,
-/// Generation, or activation token. It records only immutable artifact identities and the
-/// pre-launch listener shape already declared by `EngineSpec`.
+/// Generation, or activation token. It records immutable artifact identities, privilege policy,
+/// and the pre-launch listener shape already declared by `EngineSpec`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct EngineConfigLaunchBinding {
     artifact: EngineConfigArtifact,
     artifacts: EngineArtifactSetIdentity,
+    privilege: SingBoxPrivilege,
     digest: EngineConfigLaunchBindingDigest,
 }
 
@@ -231,10 +232,9 @@ impl EngineConfigLaunchBinding {
         self.artifacts.config()
     }
 
-    #[cfg(test)]
     #[must_use]
-    pub(crate) const fn launcher_digest(&self) -> Option<EngineArtifactDigest> {
-        self.artifacts.launcher()
+    pub(crate) const fn privilege(&self) -> SingBoxPrivilege {
+        self.privilege
     }
 
     #[must_use]
@@ -323,13 +323,16 @@ pub(crate) fn bind_engine_config_to_spec(
     }
 
     let artifacts = spec.artifacts();
+    let privilege = spec.process().privilege;
     let digest = EngineConfigLaunchBindingDigest(digest_engine_config_launch_binding(
         artifact.digest(),
         artifacts,
+        privilege,
     ));
     Ok(EngineConfigLaunchBinding {
         artifact,
         artifacts,
+        privilege,
         digest,
     })
 }
@@ -627,6 +630,7 @@ fn digest_engine_config_artifact(
 fn digest_engine_config_launch_binding(
     artifact_digest: EngineConfigArtifactDigest,
     artifacts: EngineArtifactSetIdentity,
+    privilege: SingBoxPrivilege,
 ) -> [u8; ENGINE_CONFIG_DIGEST_BYTES] {
     let mut digest = Sha256::new();
     digest.update(LAUNCH_BINDING_DIGEST_DOMAIN);
@@ -634,12 +638,13 @@ fn digest_engine_config_launch_binding(
     digest.update(artifact_digest.as_bytes());
     digest.update(artifacts.binary().as_bytes());
     digest.update(artifacts.config().as_bytes());
-    match artifacts.launcher() {
-        Some(launcher_digest) => {
+    match privilege {
+        SingBoxPrivilege::Inherit => digest.update([0]),
+        SingBoxPrivilege::TransparentProxy(credentials) => {
             digest.update([1]);
-            digest.update(launcher_digest.as_bytes());
+            digest.update(credentials.uid().get().to_be_bytes());
+            digest.update(credentials.gid().get().to_be_bytes());
         }
-        None => digest.update([0]),
     }
     digest.finalize().into()
 }

@@ -6,16 +6,17 @@ use std::time::{Duration, Instant};
 
 use flux_core::{
     CapabilityProfile, CapabilityProfileRevision, CaptureApplicationMode, CaptureApplicationPolicy,
-    CaptureDecisionStage, CaptureInterfaceDirection, CapturePathId, CapturePathQualificationState,
-    CapturePathQualifications, CapturePathRequest, CapturePredicate, CaptureTrafficDomain,
-    CaptureUserId, FluxConfig, FwmarkCandidate, InterfaceAddressRecord, InterfaceLinkRecord,
-    KernelSupport, NetworkAddressFamily, NetworkInventory, NetworkInventoryTracker,
-    NetworkNamespaceIdentity, Observation, ObservationKind, RouteProtocol, RouteTableId,
-    RulePriority, RuleProtocol, SelinuxMode, select_reviewed_android_platform_profile,
+    CaptureDecisionStage, CaptureGroupId, CaptureInterfaceDirection, CapturePathId,
+    CapturePathQualificationState, CapturePathQualifications, CapturePathRequest, CapturePredicate,
+    CaptureTrafficDomain, CaptureUserId, EngineCredentials, FluxConfig, FwmarkCandidate,
+    InterfaceAddressRecord, InterfaceLinkRecord, KernelSupport, NetworkAddressFamily,
+    NetworkInventory, NetworkInventoryTracker, NetworkNamespaceIdentity, Observation,
+    ObservationKind, RouteProtocol, RouteTableId, RulePriority, RuleProtocol, SelinuxMode,
+    select_reviewed_android_platform_profile,
 };
 use flux_platform::internal::SingBoxProcessError;
 use flux_platform::{
-    AndroidCapturePathState, SingBoxLaunchSpec, SingBoxLauncher, SingBoxReadiness,
+    AndroidCapturePathState, SingBoxLaunchSpec, SingBoxPrivilege, SingBoxReadiness,
     XtablesLocalOutputRoutingSpec, XtablesLocalOutputRoutingTarget,
 };
 use flux_testkit::CapabilityProfileFixture;
@@ -25,7 +26,7 @@ use super::{
     ADMITTED_GENERATION_SCHEMA_VERSION, AdmittedGeneration, AdmittedGenerationIdentity,
     CapturePathDecision, CapturePathQualificationEvidence, CapturePathRejection,
     CapturePathRejectionReason, CapturePathSelectionReason, DesiredStateArtifacts,
-    DesiredStateCompileErrorKind, DesiredStateCompileRequest,
+    DesiredStateCompileErrorKind, DesiredStateCompileRequest, DesiredStateEngineBindingError,
     ENGINE_CAPABILITY_PROFILE_SCHEMA_VERSION, ENGINE_CONFIG_LAUNCH_BINDING_SCHEMA_VERSION,
     EngineCapabilityProfile, EngineCapabilityProfileErrorKind, EngineConfigBindingErrorKind,
     EngineConfigCompileErrorKind, EngineVersionOutputErrorKind,
@@ -37,10 +38,11 @@ use super::{
     PreparedGenerationRecord, PreparedGenerationRecordError, PreparedGenerationRecordStore,
     SelectedEngineSource, SelectedEngineSourceIdentity, TPROXY_GENERATION_CANDIDATE_SCHEMA_VERSION,
     TproxyEngineConfigRequest, TproxyGenerationCandidateErrorKind, bind_engine_config_to_spec,
-    collect_tproxy_engine_capability_profile, compile_desired_state, compile_desired_state_capture,
-    compile_tproxy_engine_config, compile_tproxy_generation_candidate,
-    parse_sing_box_version_output, qualified_xtables_capture_path_evidence,
-    qualified_xtables_kernel_config, reconstruct_canonical_tproxy_engine_config,
+    bind_engine_spec_to_desired_state, collect_tproxy_engine_capability_profile,
+    compile_desired_state, compile_desired_state_capture, compile_tproxy_engine_config,
+    compile_tproxy_generation_candidate, parse_sing_box_version_output,
+    qualified_xtables_capture_path_evidence, qualified_xtables_kernel_config,
+    rebind_engine_capability_profile_fixture, reconstruct_canonical_tproxy_engine_config,
 };
 use crate::engine_supervisor::EngineCapabilityProbeError;
 use crate::{EngineSpec, MAX_ENGINE_CONFIG_BYTES, RestartPolicy};
@@ -316,11 +318,11 @@ fn binds_exact_config_listener_and_launch_artifact_identities() {
     assert_eq!(binding.artifact().digest(), artifact_digest);
     assert_eq!(binding.binary_digest(), fixture.spec.binary_digest());
     assert_eq!(binding.config_digest(), fixture.spec.config_digest());
-    assert_eq!(binding.launcher_digest(), None);
+    assert_eq!(binding.privilege(), SingBoxPrivilege::Inherit);
     assert_eq!(binding.digest().as_bytes().len(), 32);
     assert_eq!(
         binding.digest().to_string(),
-        "fdacd3c8d087371e5c7f51c879298a3aa42e4369c559dde4fe9337ba97630f5f"
+        "ec673a244afebccf4d9cc6a7e8efc31211b845d37dc3168b09a69cff96468a78"
     );
 }
 
@@ -378,7 +380,7 @@ fn rejects_config_content_or_listener_shape_drift() {
 }
 
 #[test]
-fn binding_identity_retains_binary_and_removed_template_provenance() {
+fn binding_identity_retains_binary_privilege_and_removed_template_provenance() {
     let empty = compile(br#"{"inbounds":[]}"#, PORT).unwrap();
     let old_tun = compile(br#"{"inbounds":[{"type":"tun","tag":"old-tun"}]}"#, PORT).unwrap();
     assert_eq!(empty.bytes(), old_tun.bytes());
@@ -397,10 +399,10 @@ fn binding_identity_retains_binary_and_removed_template_provenance() {
             port: NonZeroU16::new(PORT).unwrap(),
         },
     );
-    let launcher_engine = EngineSpecFixture::new_with_busybox(
+    let privilege_engine = EngineSpecFixture::new_with_privilege(
         empty.bytes(),
         b"sing-box-v1",
-        b"busybox-v1",
+        SingBoxPrivilege::transparent_proxy(engine_credentials(1000, 1000)),
         SingBoxReadiness::Listener {
             port: NonZeroU16::new(PORT).unwrap(),
         },
@@ -408,16 +410,39 @@ fn binding_identity_retains_binary_and_removed_template_provenance() {
 
     let first = bind_engine_config_to_spec(empty.clone(), &first_engine.spec).unwrap();
     let binary_drift = bind_engine_config_to_spec(empty.clone(), &second_engine.spec).unwrap();
-    let launcher_drift = bind_engine_config_to_spec(empty, &launcher_engine.spec).unwrap();
+    let privilege_drift = bind_engine_config_to_spec(empty, &privilege_engine.spec).unwrap();
     let source_drift = bind_engine_config_to_spec(old_tun, &first_engine.spec).unwrap();
 
     assert_ne!(first.digest(), binary_drift.digest());
-    assert_ne!(first.digest(), launcher_drift.digest());
+    assert_ne!(first.digest(), privilege_drift.digest());
     assert_eq!(
-        launcher_drift.launcher_digest(),
-        launcher_engine.spec.launcher_digest()
+        privilege_drift.privilege(),
+        SingBoxPrivilege::transparent_proxy(engine_credentials(1000, 1000))
     );
     assert_ne!(first.digest(), source_drift.digest());
+}
+
+#[test]
+fn desired_state_binding_requires_exact_transparent_proxy_privilege() {
+    let fixture = HostAssemblyFixture::new();
+    let desired_state = fixture.desired_state.desired_state();
+
+    bind_engine_spec_to_desired_state(desired_state, fixture.engine.spec.clone())
+        .expect("exact configured privilege binds");
+
+    for privilege in [
+        SingBoxPrivilege::Inherit,
+        SingBoxPrivilege::transparent_proxy(engine_credentials(1000, 1000)),
+    ] {
+        let mut process = fixture.engine.spec.process().clone();
+        process.privilege = privilege;
+        let spec = EngineSpec::new(process, fixture.engine.spec.restart_policy())
+            .expect("inspect privilege-drift fixture");
+        assert!(matches!(
+            bind_engine_spec_to_desired_state(desired_state, spec),
+            Err(DesiredStateEngineBindingError::Privilege)
+        ));
+    }
 }
 
 #[test]
@@ -447,7 +472,7 @@ fn collects_exact_binary_profile_and_pins_its_revision() {
     assert_eq!(profile.build().stderr(), "Tags: with_quic,with_wireguard\n");
     assert_eq!(
         profile.revision().to_string(),
-        "d129642ba9e1ac385d42a36a7d125b240514d477268a63fdcda448b42edc02ec"
+        "101e9beb5376b8e48f0d5f09f41515ab2e2305e7914f64fac75f05617962a918"
     );
     assert_eq!(profile.revision().as_bytes().len(), 32);
 }
@@ -479,6 +504,39 @@ fn profile_collection_rejects_artifact_mismatch_before_execution() {
     assert!(matches!(
         error.kind(),
         EngineCapabilityProfileErrorKind::ArtifactSetMismatch
+    ));
+    assert!(!marker.exists());
+}
+
+#[test]
+fn profile_collection_rejects_privilege_mismatch_before_execution() {
+    let artifact = compile(br#"{"inbounds":[]}"#, PORT).unwrap();
+    let marker_directory = tempfile::tempdir().expect("create probe marker directory");
+    let marker = marker_directory.path().join("probe-invoked");
+    let script = format!(
+        "#!/bin/sh\nprintf invoked > \"{}\"\n{}",
+        marker.display(),
+        std::str::from_utf8(PROFILE_SCRIPT)
+            .unwrap()
+            .trim_start_matches("#!/bin/sh\n")
+    );
+    let fixture = EngineSpecFixture::new_executable(
+        artifact.bytes(),
+        script.as_bytes(),
+        listener_readiness(),
+    );
+    let binding = bind_engine_config_to_spec(artifact, &fixture.spec).unwrap();
+    let mut process = fixture.spec.process().clone();
+    process.privilege = SingBoxPrivilege::transparent_proxy(engine_credentials(1000, 1000));
+    let mismatched = EngineSpec::new(process, fixture.spec.restart_policy())
+        .expect("inspect privilege-drift fixture");
+
+    let error = collect_tproxy_engine_capability_profile(&binding, &mismatched)
+        .expect_err("privilege mismatch must fail before probing");
+
+    assert!(matches!(
+        error.kind(),
+        EngineCapabilityProfileErrorKind::PrivilegeMismatch
     ));
     assert!(!marker.exists());
 }
@@ -1525,7 +1583,7 @@ struct HostAssemblyFixture {
 impl HostAssemblyFixture {
     fn new() -> Self {
         let canonical = compile(PACKAGED_ENGINE_TEMPLATE, PORT).expect("canonical engine config");
-        let engine = EngineSpecFixture::new_executable(
+        let mut engine = EngineSpecFixture::new_executable(
             canonical.bytes(),
             PROFILE_SCRIPT,
             listener_readiness(),
@@ -1541,11 +1599,18 @@ impl HostAssemblyFixture {
             .replacen("startup_timeout_ms = 5000", "startup_timeout_ms = 1000", 1)
             .replacen("stop_timeout_ms = 5000", "stop_timeout_ms = 1000", 1);
         let desired_state = compile_fixture_desired_state(&base_desired_state);
+        let probe_binding =
+            bind_engine_config_to_spec(desired_state.engine_config().clone(), &engine.spec)
+                .expect("fixture probe binding");
+        let engine_profile = collect_tproxy_engine_capability_profile(&probe_binding, &engine.spec)
+            .expect("fixture Engine Capability Profile");
+        engine.set_privilege(SingBoxPrivilege::transparent_proxy(
+            desired_state.desired_state().engine().credentials(),
+        ));
         let binding =
             bind_engine_config_to_spec(desired_state.engine_config().clone(), &engine.spec)
-                .expect("fixture engine binding");
-        let engine_profile = collect_tproxy_engine_capability_profile(&binding, &engine.spec)
-            .expect("fixture Engine Capability Profile");
+                .expect("fixture production binding");
+        let engine_profile = rebind_engine_capability_profile_fixture(engine_profile, &binding);
         let capability_profile = CapabilityProfileFixture::device_qualified();
         let mut tracker = NetworkInventoryTracker::new();
         let inventory = empty_inventory(&mut tracker).clone();
@@ -1733,16 +1798,16 @@ struct EngineSpecFixture {
 
 impl EngineSpecFixture {
     fn new(config: &[u8], binary: &[u8], readiness: SingBoxReadiness) -> Self {
-        Self::build(config, binary, None, readiness)
+        Self::build(config, binary, SingBoxPrivilege::Inherit, readiness)
     }
 
-    fn new_with_busybox(
+    fn new_with_privilege(
         config: &[u8],
         binary: &[u8],
-        busybox: &[u8],
+        privilege: SingBoxPrivilege,
         readiness: SingBoxReadiness,
     ) -> Self {
-        Self::build(config, binary, Some(busybox), readiness)
+        Self::build(config, binary, privilege, readiness)
     }
 
     fn new_executable(config: &[u8], binary: &[u8], readiness: SingBoxReadiness) -> Self {
@@ -1754,10 +1819,17 @@ impl EngineSpecFixture {
         fixture
     }
 
+    fn set_privilege(&mut self, privilege: SingBoxPrivilege) {
+        let mut process = self.spec.process().clone();
+        process.privilege = privilege;
+        self.spec =
+            EngineSpec::new(process, self.spec.restart_policy()).expect("rebind fixture privilege");
+    }
+
     fn build(
         config: &[u8],
         binary: &[u8],
-        busybox: Option<&[u8]>,
+        privilege: SingBoxPrivilege,
         readiness: SingBoxReadiness,
     ) -> Self {
         let directory = tempfile::tempdir().expect("create engine config binding fixture");
@@ -1765,17 +1837,6 @@ impl EngineSpecFixture {
         let config_path = directory.path().join("config.json");
         fs::write(&binary_path, binary).expect("write engine binary fixture");
         fs::write(&config_path, config).expect("write engine config fixture");
-        let launcher = match busybox {
-            Some(bytes) => {
-                let path = directory.path().join("busybox");
-                fs::write(&path, bytes).expect("write engine launcher fixture");
-                SingBoxLauncher::BusyBoxSetuidgid {
-                    busybox: path,
-                    identity: "1000:1000".into(),
-                }
-            }
-            None => SingBoxLauncher::Direct,
-        };
         let restart = RestartPolicy::new(
             3,
             Duration::from_secs(60),
@@ -1790,7 +1851,7 @@ impl EngineSpecFixture {
                 config: config_path,
                 working_directory: directory.path().to_path_buf(),
                 log: directory.path().join("sing-box.log"),
-                launcher,
+                privilege,
                 readiness,
                 startup_timeout: Duration::from_secs(1),
                 stop_timeout: Duration::from_secs(1),
@@ -1803,4 +1864,11 @@ impl EngineSpecFixture {
             _directory: directory,
         }
     }
+}
+
+fn engine_credentials(uid: u32, gid: u32) -> EngineCredentials {
+    EngineCredentials::new(
+        CaptureUserId::new(uid).expect("valid fixture UID"),
+        CaptureGroupId::new(gid).expect("valid fixture GID"),
+    )
 }

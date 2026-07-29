@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt;
@@ -12,13 +13,15 @@ use std::time::{Duration, Instant};
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
+#[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
+use flux_platform::SingBoxPrivilege;
 use flux_platform::internal::{
     PinnedSingBoxLaunch, SingBoxChild, SingBoxProcessAdapter, SingBoxProcessError,
     SingBoxVersionReport, TerminationOutcome,
 };
 use flux_platform::{
     ProcessHandle, ProcessHandleError, ProcessHandleErrorKind, ProcessObservation,
-    ReadinessEvidence, SingBoxExit, SingBoxLaunchSpec, SingBoxLauncher,
+    ReadinessEvidence, SingBoxExit, SingBoxLaunchSpec,
 };
 use sha2::{Digest, Sha256};
 
@@ -51,7 +54,6 @@ impl fmt::Display for EngineArtifactDigest {
 pub struct EngineArtifactSetIdentity {
     binary: EngineArtifactDigest,
     config: EngineArtifactDigest,
-    launcher: Option<EngineArtifactDigest>,
 }
 
 impl EngineArtifactSetIdentity {
@@ -64,18 +66,12 @@ impl EngineArtifactSetIdentity {
     pub const fn config(self) -> EngineArtifactDigest {
         self.config
     }
-
-    #[must_use]
-    pub const fn launcher(self) -> Option<EngineArtifactDigest> {
-        self.launcher
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EngineArtifact {
     Binary,
     Config,
-    Launcher,
 }
 
 impl fmt::Display for EngineArtifact {
@@ -83,7 +79,6 @@ impl fmt::Display for EngineArtifact {
         formatter.write_str(match self {
             Self::Binary => "binary",
             Self::Config => "configuration",
-            Self::Launcher => "launcher",
         })
     }
 }
@@ -286,8 +281,8 @@ impl EngineCapabilityProbeReport {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-/// An inspected launch request whose identity includes SHA-256 digests of every
-/// executable and configuration artifact involved in the launch.
+/// An inspected launch request whose identity includes SHA-256 digests of the
+/// executable and configuration artifacts involved in the launch.
 ///
 /// At launch time the Supervisor reopens, verifies, and pins these exact file
 /// descriptors through configuration validation and process creation. The
@@ -314,21 +309,12 @@ impl EngineSpec {
             EngineArtifact::Config,
             MAX_ENGINE_CONFIG_BYTES,
         )?;
-        let launcher_digest = match &process.launcher {
-            SingBoxLauncher::Direct => None,
-            SingBoxLauncher::BusyBoxSetuidgid { busybox, .. } => Some(inspect_artifact(
-                busybox,
-                EngineArtifact::Launcher,
-                MAX_ENGINE_BINARY_BYTES,
-            )?),
-        };
         Ok(Self {
             process,
             restart,
             artifacts: EngineArtifactSetIdentity {
                 binary: binary_digest,
                 config: config_digest,
-                launcher: launcher_digest,
             },
         })
     }
@@ -364,11 +350,6 @@ impl EngineSpec {
         self.artifacts.config()
     }
 
-    #[must_use]
-    pub const fn launcher_digest(&self) -> Option<EngineArtifactDigest> {
-        self.artifacts.launcher()
-    }
-
     /// Query and validate the exact pinned artifacts without launching a long-lived process.
     pub(crate) fn probe_capabilities(
         &self,
@@ -395,7 +376,7 @@ impl EngineSpec {
         Ok(engine_capability_probe_report(self.artifacts, version))
     }
 
-    /// Validate this exact configuration through pinned binary, config, and launcher descriptors.
+    /// Validate this exact configuration through pinned binary and config descriptors.
     pub(crate) fn validate_configuration(&self) -> Result<(), EngineCapabilityProbeError> {
         let opened = self
             .open_verified_artifacts()
@@ -424,26 +405,7 @@ impl EngineSpec {
             MAX_ENGINE_CONFIG_BYTES,
             self.artifacts.config(),
         )?;
-        let launcher = match (&self.process.launcher, self.artifacts.launcher()) {
-            (SingBoxLauncher::Direct, None) => None,
-            (SingBoxLauncher::BusyBoxSetuidgid { busybox, .. }, Some(launcher_digest)) => {
-                Some(open_verified_artifact(
-                    busybox,
-                    EngineArtifact::Launcher,
-                    MAX_ENGINE_BINARY_BYTES,
-                    launcher_digest,
-                )?)
-            }
-            (SingBoxLauncher::Direct, Some(_))
-            | (SingBoxLauncher::BusyBoxSetuidgid { .. }, None) => {
-                unreachable!("EngineSpec constructor binds launcher shape and digest together")
-            }
-        };
-        Ok(OpenedEngineArtifacts {
-            binary,
-            config,
-            launcher,
-        })
+        Ok(OpenedEngineArtifacts { binary, config })
     }
 }
 
@@ -1336,6 +1298,15 @@ impl EngineSupervisor {
     pub fn new() -> Self {
         Self::with_dependencies(
             Box::new(ProductionEngineHost::default()),
+            Box::new(SystemClock::new()),
+        )
+    }
+
+    #[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
+    #[must_use]
+    pub(crate) fn for_linux_native_composition_test() -> Self {
+        Self::with_dependencies(
+            Box::new(ProductionEngineHost::inherited_privilege_fixture()),
             Box::new(SystemClock::new()),
         )
     }
@@ -2239,9 +2210,39 @@ struct ScriptedChild {
     identity: OwnedEngineIdentity,
 }
 
+#[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum EnginePrivilegeExecution {
+    #[default]
+    Exact,
+    InheritedFixture,
+}
+
 #[derive(Default)]
 struct ProductionEngineHost {
     adapter: SingBoxProcessAdapter,
+    #[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
+    privilege: EnginePrivilegeExecution,
+}
+
+impl ProductionEngineHost {
+    #[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
+    fn inherited_privilege_fixture() -> Self {
+        Self {
+            adapter: SingBoxProcessAdapter,
+            privilege: EnginePrivilegeExecution::InheritedFixture,
+        }
+    }
+
+    fn execution_spec<'a>(&self, spec: &'a SingBoxLaunchSpec) -> Cow<'a, SingBoxLaunchSpec> {
+        #[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
+        if self.privilege == EnginePrivilegeExecution::InheritedFixture {
+            let mut fixture = spec.clone();
+            fixture.privilege = SingBoxPrivilege::Inherit;
+            return Cow::Owned(fixture);
+        }
+        Cow::Borrowed(spec)
+    }
 }
 
 impl EngineHost for ProductionEngineHost {
@@ -2276,11 +2277,13 @@ impl EngineHost for ProductionEngineHost {
         prepared: &HostPrepared,
     ) -> Result<(), HostFailure> {
         match prepared {
-            HostPrepared::Production(prepared) => self
-                .adapter
-                .validate_pinned(&prepared.pinned, spec)
-                .map(|_| ())
-                .map_err(classify_validation_error),
+            HostPrepared::Production(prepared) => {
+                let spec = self.execution_spec(spec);
+                self.adapter
+                    .validate_pinned(&prepared.pinned, &spec)
+                    .map(|_| ())
+                    .map_err(classify_validation_error)
+            }
             #[cfg(test)]
             HostPrepared::Scripted => Err(HostFailure::Invariant(
                 "production host received scripted prepared artifacts".to_owned(),
@@ -2294,11 +2297,13 @@ impl EngineHost for ProductionEngineHost {
         prepared: &HostPrepared,
     ) -> Result<HostChild, HostFailure> {
         match prepared {
-            HostPrepared::Production(prepared) => self
-                .adapter
-                .spawn_pinned(&prepared.pinned, spec)
-                .map(HostChild::Production)
-                .map_err(classify_spawn_error),
+            HostPrepared::Production(prepared) => {
+                let spec = self.execution_spec(spec);
+                self.adapter
+                    .spawn_pinned(&prepared.pinned, &spec)
+                    .map(HostChild::Production)
+                    .map_err(classify_spawn_error)
+            }
             #[cfg(test)]
             HostPrepared::Scripted => Err(HostFailure::Invariant(
                 "production host received scripted prepared artifacts".to_owned(),
@@ -2486,23 +2491,17 @@ struct OpenedArtifact {
 struct OpenedEngineArtifacts {
     binary: OpenedArtifact,
     config: OpenedArtifact,
-    launcher: Option<OpenedArtifact>,
 }
 
 struct PreparedEngineArtifacts {
     pinned: PinnedSingBoxLaunch,
     binary: ArtifactIdentity,
     config: ArtifactIdentity,
-    launcher: Option<ArtifactIdentity>,
 }
 
 impl OpenedEngineArtifacts {
     fn pin(self) -> Result<PreparedEngineArtifacts, SingBoxProcessError> {
-        let Self {
-            binary,
-            config,
-            launcher,
-        } = self;
+        let Self { binary, config } = self;
         let OpenedArtifact {
             file: binary_file,
             identity: binary,
@@ -2513,16 +2512,11 @@ impl OpenedEngineArtifacts {
             identity: config,
             ..
         } = config;
-        let (busybox_file, launcher) = match launcher {
-            Some(OpenedArtifact { file, identity, .. }) => (Some(file), Some(identity)),
-            None => (None, None),
-        };
-        let pinned = PinnedSingBoxLaunch::new(binary_file, config_file, busybox_file)?;
+        let pinned = PinnedSingBoxLaunch::new(binary_file, config_file)?;
         Ok(PreparedEngineArtifacts {
             pinned,
             binary,
             config,
-            launcher,
         })
     }
 }
@@ -2530,14 +2524,7 @@ impl OpenedEngineArtifacts {
 impl PreparedEngineArtifacts {
     fn reverify(&self) -> Result<(), EngineSpecError> {
         reverify_opened_artifact(self.pinned.binary(), &self.binary)?;
-        reverify_opened_artifact(self.pinned.config(), &self.config)?;
-        match (self.pinned.busybox(), &self.launcher) {
-            (None, None) => Ok(()),
-            (Some(file), Some(identity)) => reverify_opened_artifact(file, identity),
-            (None, Some(_)) | (Some(_), None) => {
-                unreachable!("pinned launcher descriptor and identity are constructed together")
-            }
-        }
+        reverify_opened_artifact(self.pinned.config(), &self.config)
     }
 }
 
@@ -2875,9 +2862,49 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex, MutexGuard};
 
-    use flux_platform::{SingBoxLauncher, SingBoxReadiness};
+    use flux_platform::{SingBoxPrivilege, SingBoxReadiness};
 
     use super::*;
+
+    #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+    #[test]
+    fn linux_composition_privilege_override_is_fixture_only_and_non_mutating() {
+        let credentials = flux_core::EngineCredentials::new(
+            flux_core::CaptureUserId::new(0).expect("root UID"),
+            flux_core::CaptureGroupId::new(0).expect("root GID"),
+        );
+        let process = SingBoxLaunchSpec {
+            binary: PathBuf::from("/fixture/sing-box"),
+            config: PathBuf::from("/fixture/config.json"),
+            working_directory: PathBuf::from("/fixture"),
+            log: PathBuf::from("/fixture/sing-box.log"),
+            privilege: SingBoxPrivilege::TransparentProxy(credentials),
+            readiness: SingBoxReadiness::Listener {
+                port: NonZeroU16::new(1536).expect("nonzero fixture port"),
+            },
+            startup_timeout: Duration::from_secs(1),
+            stop_timeout: Duration::from_secs(1),
+        };
+
+        let production = ProductionEngineHost::default();
+        assert!(matches!(
+            production.execution_spec(&process),
+            Cow::Borrowed(observed) if observed.privilege == process.privilege
+        ));
+
+        let fixture = ProductionEngineHost::inherited_privilege_fixture();
+        assert!(matches!(
+            fixture.execution_spec(&process),
+            Cow::Owned(SingBoxLaunchSpec {
+                privilege: SingBoxPrivilege::Inherit,
+                ..
+            })
+        ));
+        assert_eq!(
+            process.privilege,
+            SingBoxPrivilege::TransparentProxy(credentials)
+        );
+    }
 
     #[test]
     fn running_reconciliation_reaches_ready_with_identity_and_evidence() {
@@ -2958,7 +2985,7 @@ mod tests {
                 config,
                 working_directory: directory.path().to_path_buf(),
                 log: directory.path().join("sing-box.log"),
-                launcher: SingBoxLauncher::Direct,
+                privilege: SingBoxPrivilege::Inherit,
                 readiness: SingBoxReadiness::Listener {
                     port: NonZeroU16::new(port).expect("reserved listener port is nonzero"),
                 },
@@ -3722,41 +3749,6 @@ mod tests {
     }
 
     #[test]
-    fn same_path_busybox_change_produces_a_distinct_inspected_spec() {
-        let directory = tempfile::tempdir().expect("create BusyBox identity fixture");
-        let binary = directory.path().join("sing-box");
-        let config = directory.path().join("config.json");
-        let busybox = directory.path().join("busybox");
-        fs::write(&binary, b"sing-box").expect("write binary");
-        fs::write(&config, b"{}").expect("write config");
-        fs::write(&busybox, b"busybox-v1").expect("write BusyBox");
-        let process = SingBoxLaunchSpec {
-            binary,
-            config,
-            working_directory: directory.path().to_path_buf(),
-            log: directory.path().join("sing-box.log"),
-            launcher: SingBoxLauncher::BusyBoxSetuidgid {
-                busybox: busybox.clone(),
-                identity: "1000:1000".into(),
-            },
-            readiness: SingBoxReadiness::Listener {
-                port: NonZeroU16::new(1536).expect("nonzero port"),
-            },
-            startup_timeout: Duration::from_secs(1),
-            stop_timeout: Duration::from_secs(1),
-        };
-        let original = EngineSpec::new(process.clone(), restart_policy(1))
-            .expect("inspect original BusyBox launch");
-
-        fs::write(&busybox, b"busybox-v2").expect("replace BusyBox contents");
-        let refreshed =
-            EngineSpec::new(process, restart_policy(1)).expect("inspect refreshed BusyBox launch");
-
-        assert_ne!(original.launcher_digest(), refreshed.launcher_digest());
-        assert_ne!(original, refreshed);
-    }
-
-    #[test]
     fn post_spawn_artifact_change_cleans_up_before_returning_error() {
         let (mut supervisor, host, _clock) = test_supervisor();
         let spec = test_spec(1536, restart_policy(2));
@@ -3802,7 +3794,7 @@ mod tests {
             config,
             working_directory: directory.path().to_path_buf(),
             log: directory.path().join("sing-box.log"),
-            launcher: SingBoxLauncher::Direct,
+            privilege: SingBoxPrivilege::Inherit,
             readiness: SingBoxReadiness::Listener {
                 port: NonZeroU16::new(1536).expect("nonzero port"),
             },
@@ -3856,52 +3848,6 @@ mod tests {
         let missing = directory.path().join("missing.json");
         let error = EngineSpec::new(process(missing), restart_policy(1))
             .expect_err("missing config is rejected");
-        assert!(std::error::Error::source(&error).is_some());
-
-        let config = directory.path().join("valid.json");
-        fs::write(&config, b"{}").expect("write valid config");
-        let busybox_process = |busybox: PathBuf| {
-            let mut process = process(config.clone());
-            process.launcher = SingBoxLauncher::BusyBoxSetuidgid {
-                busybox,
-                identity: "1000:1000".into(),
-            };
-            process
-        };
-        assert!(matches!(
-            EngineSpec::new(
-                busybox_process(directory.path().to_path_buf()),
-                restart_policy(1)
-            ),
-            Err(EngineSpecError::UnsafeFileType {
-                artifact: EngineArtifact::Launcher,
-                ..
-            })
-        ));
-
-        let oversized_busybox = directory.path().join("oversized-busybox");
-        File::create(&oversized_busybox)
-            .expect("create oversized BusyBox")
-            .set_len(MAX_ENGINE_BINARY_BYTES + 1)
-            .expect("size oversized BusyBox");
-        assert!(matches!(
-            EngineSpec::new(busybox_process(oversized_busybox), restart_policy(1)),
-            Err(EngineSpecError::TooLarge {
-                artifact: EngineArtifact::Launcher,
-                ..
-            })
-        ));
-
-        let missing_busybox = directory.path().join("missing-busybox");
-        let error = EngineSpec::new(busybox_process(missing_busybox), restart_policy(1))
-            .expect_err("missing BusyBox is rejected");
-        assert!(matches!(
-            &error,
-            EngineSpecError::Io {
-                artifact: EngineArtifact::Launcher,
-                ..
-            }
-        ));
         assert!(std::error::Error::source(&error).is_some());
     }
 
@@ -4001,7 +3947,7 @@ mod tests {
                 config,
                 working_directory: directory.path().to_path_buf(),
                 log: directory.path().join("sing-box.log"),
-                launcher: SingBoxLauncher::Direct,
+                privilege: SingBoxPrivilege::Inherit,
                 readiness: SingBoxReadiness::Listener {
                     port: NonZeroU16::new(port).expect("test port is nonzero"),
                 },
@@ -4055,18 +4001,6 @@ mod tests {
         let (path, expected) = match artifact {
             EngineArtifact::Binary => (&spec.process.binary, spec.artifacts.binary()),
             EngineArtifact::Config => (&spec.process.config, spec.artifacts.config()),
-            EngineArtifact::Launcher => match (&spec.process.launcher, spec.artifacts.launcher()) {
-                (SingBoxLauncher::BusyBoxSetuidgid { busybox, .. }, Some(launcher_digest)) => {
-                    (busybox, launcher_digest)
-                }
-                (SingBoxLauncher::Direct, None) => {
-                    return Err(EngineSpecError::ChangedDuringInspection {
-                        artifact,
-                        path: spec.process.binary.clone(),
-                    });
-                }
-                _ => unreachable!("EngineSpec launcher identity is internally consistent"),
-            },
         };
         let mut observed = *expected.as_bytes();
         observed[0] ^= 0xff;

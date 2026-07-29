@@ -17,6 +17,8 @@ use crate::generation_engine_config::{
 };
 #[cfg(target_os = "linux")]
 use crate::subscription::fetch::{FetchError, FetchPurpose, FetchRequest, FetchedResource};
+#[cfg(target_os = "linux")]
+use flux_platform::SingBoxPrivilege;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -147,6 +149,24 @@ impl FetchAdapter for RuntimeFixtureFetch {
 }
 
 #[cfg(target_os = "linux")]
+struct InheritedRefreshEngineValidator;
+
+#[cfg(target_os = "linux")]
+impl RefreshEngineValidator for InheritedRefreshEngineValidator {
+    fn validate(
+        &self,
+        engine: &EngineSpec,
+        config_path: &Path,
+    ) -> Result<(), SnapshotValidationErrorKind> {
+        let mut process = engine.process().clone();
+        process.privilege = SingBoxPrivilege::Inherit;
+        let engine = EngineSpec::new(process, engine.restart_policy())
+            .map_err(|_| SnapshotValidationErrorKind::Artifact)?;
+        SingBoxSnapshotValidator::from_engine(&engine).validate(config_path)
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn production_operation_fixture() -> (
     tempfile::TempDir,
     SubscriptionRuntimePaths,
@@ -255,12 +275,13 @@ fn canonical_reconstruction_reports_an_explicit_content_digest_mismatch() {
 #[test]
 fn recovery_does_not_reuse_a_snapshot_from_a_different_url_file_source() {
     let (_directory, paths, config, url_file) = production_operation_fixture();
-    let mut publisher = ProductionRefreshOperation::new(
+    let mut publisher = ProductionRefreshOperation::with_engine_validator(
         paths.clone(),
         RuntimeFixtureFetch {
             subscription: fixture_subscription("first"),
             rewrite_url_file: None,
         },
+        Arc::new(InheritedRefreshEngineValidator),
     )
     .expect("subscription publisher");
     assert!(matches!(
@@ -270,12 +291,13 @@ fn recovery_does_not_reuse_a_snapshot_from_a_different_url_file_source() {
 
     fs::write(&url_file, "https://provider-b.example/subscription\n")
         .expect("replace subscription URL while stopped");
-    let mut recovery = ProductionRefreshOperation::new(
+    let mut recovery = ProductionRefreshOperation::with_engine_validator(
         paths,
         RuntimeFixtureFetch {
             subscription: fixture_subscription("second"),
             rewrite_url_file: None,
         },
+        Arc::new(InheritedRefreshEngineValidator),
     )
     .expect("subscription recovery");
 
@@ -290,7 +312,7 @@ fn recovery_does_not_reuse_a_snapshot_from_a_different_url_file_source() {
 #[test]
 fn url_file_mutation_during_fetch_rolls_back_the_candidate() {
     let (_directory, paths, config, url_file) = production_operation_fixture();
-    let mut operation = ProductionRefreshOperation::new(
+    let mut operation = ProductionRefreshOperation::with_engine_validator(
         paths,
         RuntimeFixtureFetch {
             subscription: fixture_subscription("candidate"),
@@ -299,6 +321,7 @@ fn url_file_mutation_during_fetch_rolls_back_the_candidate() {
                 "https://provider-b.example/subscription\n".to_owned(),
             )),
         },
+        Arc::new(InheritedRefreshEngineValidator),
     )
     .expect("subscription operation");
 

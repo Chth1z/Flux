@@ -8,7 +8,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use flux_core::{FluxConfig, GenerationId};
-use flux_platform::{SingBoxLaunchSpec, SingBoxLauncher, SingBoxReadiness};
+use flux_platform::{SingBoxLaunchSpec, SingBoxPrivilege, SingBoxReadiness};
 use url::Url;
 
 use crate::generation_engine_config::{
@@ -311,12 +311,50 @@ trait RefreshOperation: Send + 'static {
     fn reject(&mut self, digest: [u8; 32]) -> Result<(), SubscriptionRefreshError>;
 }
 
-#[derive(Clone, Default)]
+trait RefreshEngineValidator: Send + Sync + 'static {
+    fn validate(
+        &self,
+        engine: &EngineSpec,
+        config_path: &Path,
+    ) -> Result<(), SnapshotValidationErrorKind>;
+}
+
+#[derive(Default)]
+struct ProcessRefreshEngineValidator;
+
+impl RefreshEngineValidator for ProcessRefreshEngineValidator {
+    fn validate(
+        &self,
+        engine: &EngineSpec,
+        config_path: &Path,
+    ) -> Result<(), SnapshotValidationErrorKind> {
+        SingBoxSnapshotValidator::from_engine(engine).validate(config_path)
+    }
+}
+
+#[derive(Clone)]
 struct RefreshSnapshotValidator {
     engine: Arc<Mutex<Option<EngineSpec>>>,
+    validator: Arc<dyn RefreshEngineValidator>,
+}
+
+impl Default for RefreshSnapshotValidator {
+    fn default() -> Self {
+        Self {
+            engine: Arc::default(),
+            validator: Arc::new(ProcessRefreshEngineValidator),
+        }
+    }
 }
 
 impl RefreshSnapshotValidator {
+    fn new(validator: Arc<dyn RefreshEngineValidator>) -> Self {
+        Self {
+            engine: Arc::default(),
+            validator,
+        }
+    }
+
     fn install(&self, engine: EngineSpec) {
         match self.engine.lock() {
             Ok(mut slot) => *slot = Some(engine),
@@ -332,7 +370,7 @@ impl SubscriptionSnapshotValidator for RefreshSnapshotValidator {
             Err(poisoned) => poisoned.into_inner().clone(),
         }
         .ok_or(SnapshotValidationErrorKind::Artifact)?;
-        SingBoxSnapshotValidator::from_engine(&engine).validate(config_path)
+        self.validator.validate(&engine, config_path)
     }
 }
 
@@ -345,7 +383,15 @@ struct ProductionRefreshOperation<A> {
 
 impl<A: FetchAdapter + Send + 'static> ProductionRefreshOperation<A> {
     fn new(paths: SubscriptionRuntimePaths, adapter: A) -> Result<Self, SubscriptionRefreshError> {
-        let validator = RefreshSnapshotValidator::default();
+        Self::with_engine_validator(paths, adapter, Arc::new(ProcessRefreshEngineValidator))
+    }
+
+    fn with_engine_validator(
+        paths: SubscriptionRuntimePaths,
+        adapter: A,
+        engine_validator: Arc<dyn RefreshEngineValidator>,
+    ) -> Result<Self, SubscriptionRefreshError> {
+        let validator = RefreshSnapshotValidator::new(engine_validator);
         let store = SubscriptionSnapshotStore::new(&paths.store_root, validator.clone())
             .map_err(store_error)?;
         Ok(Self {
@@ -535,7 +581,7 @@ fn validation_engine(
             config: config.engine().template().to_owned(),
             working_directory: paths.working_directory.clone(),
             log: paths.validation_log.clone(),
-            launcher: SingBoxLauncher::Direct,
+            privilege: SingBoxPrivilege::transparent_proxy(config.engine().credentials()),
             readiness: SingBoxReadiness::Listener {
                 port: config.listener().port(),
             },

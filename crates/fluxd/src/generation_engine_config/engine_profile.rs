@@ -10,10 +10,10 @@ use super::compiler::{
 use crate::engine_supervisor::{EngineCapabilityProbeError, EngineCapabilityProbeErrorKind};
 use crate::{EngineArtifactSetIdentity, EngineSpec};
 
-pub(crate) const ENGINE_CAPABILITY_PROFILE_SCHEMA_VERSION: u16 = 1;
+pub(crate) const ENGINE_CAPABILITY_PROFILE_SCHEMA_VERSION: u16 = 2;
 
 const ENGINE_CAPABILITY_PROFILE_DIGEST_DOMAIN: &[u8] =
-    b"Flux Sing-Box Engine Capability Profile\0sha256-v1\0";
+    b"Flux Sing-Box Engine Capability Profile\0sha256-v2\0";
 const SING_BOX_VERSION_PREFIX: &str = "sing-box version ";
 const MAX_SING_BOX_RELEASE_BYTES: usize = 128;
 
@@ -87,7 +87,7 @@ impl SingBoxBuildIdentity {
 
 /// Minimal immutable profile for the first canonical TPROXY Generation candidate.
 ///
-/// Schema 1 proves only parsed exact-build identity and descriptor-pinned acceptance of the exact
+/// Schema 2 proves only parsed exact-build identity and descriptor-pinned acceptance of the exact
 /// config binding. Every other engine feature remains unclaimed.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct EngineCapabilityProfile {
@@ -145,6 +145,7 @@ pub(crate) enum EngineVersionOutputErrorKind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum EngineCapabilityProfileErrorKind {
     ArtifactSetMismatch,
+    PrivilegeMismatch,
     Probe(EngineCapabilityProbeErrorKind),
     VersionOutput(EngineVersionOutputErrorKind),
 }
@@ -172,6 +173,9 @@ impl fmt::Display for EngineCapabilityProfileError {
         match self.kind {
             EngineCapabilityProfileErrorKind::ArtifactSetMismatch => formatter.write_str(
                 "engine config binding and EngineSpec identify different launch artifacts",
+            ),
+            EngineCapabilityProfileErrorKind::PrivilegeMismatch => formatter.write_str(
+                "engine config binding and EngineSpec identify different privilege policies",
             ),
             EngineCapabilityProfileErrorKind::Probe(_) => {
                 formatter.write_str("exact Proxy Engine capability probe failed")
@@ -203,6 +207,11 @@ pub(crate) fn collect_tproxy_engine_capability_profile(
             EngineCapabilityProfileErrorKind::ArtifactSetMismatch,
         ));
     }
+    if binding.privilege() != spec.process().privilege {
+        return Err(EngineCapabilityProfileError::without_source(
+            EngineCapabilityProfileErrorKind::PrivilegeMismatch,
+        ));
+    }
 
     let probe = spec.probe_capabilities().map_err(|source| {
         let kind = EngineCapabilityProfileErrorKind::Probe(source.kind());
@@ -225,6 +234,27 @@ pub(crate) fn collect_tproxy_engine_capability_profile(
         revision,
     })
 }
+
+#[cfg(test)]
+pub(crate) fn rebind_engine_capability_profile_fixture(
+    profile: EngineCapabilityProfile,
+    binding: &EngineConfigLaunchBinding,
+) -> EngineCapabilityProfile {
+    assert_eq!(profile.artifacts, binding.artifacts());
+    let revision = EngineCapabilityProfileRevision(digest_engine_capability_profile(
+        binding,
+        &profile.version,
+        &profile.build,
+    ));
+    EngineCapabilityProfile {
+        artifacts: profile.artifacts,
+        validated_binding: binding.digest(),
+        version: profile.version,
+        build: profile.build,
+        revision,
+    }
+}
+
 pub(super) fn parse_sing_box_version_output(
     stdout: &[u8],
     stderr: &[u8],
@@ -359,13 +389,6 @@ fn digest_engine_capability_profile(
     let artifacts = binding.artifacts();
     update_length_prefixed(&mut digest, artifacts.binary().as_bytes());
     update_length_prefixed(&mut digest, artifacts.config().as_bytes());
-    match artifacts.launcher() {
-        Some(launcher) => {
-            update_length_prefixed(&mut digest, &[1]);
-            update_length_prefixed(&mut digest, launcher.as_bytes());
-        }
-        None => update_length_prefixed(&mut digest, &[0]),
-    }
     update_length_prefixed(&mut digest, version.release().as_bytes());
     update_length_prefixed(&mut digest, &version.major().to_be_bytes());
     update_length_prefixed(&mut digest, &version.minor().to_be_bytes());

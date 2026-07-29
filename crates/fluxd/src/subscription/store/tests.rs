@@ -10,7 +10,7 @@ use tempfile::tempdir;
 use url::Url;
 
 #[cfg(target_os = "linux")]
-use flux_platform::{SingBoxLaunchSpec, SingBoxLauncher, SingBoxReadiness};
+use flux_platform::{SingBoxLaunchSpec, SingBoxPrivilege, SingBoxReadiness};
 
 use super::*;
 #[cfg(target_os = "linux")]
@@ -195,7 +195,7 @@ fn production_validator_runs_pinned_check_and_rejects_engine_identity_drift() {
             config: base_config,
             working_directory: directory.path().to_path_buf(),
             log: directory.path().join("sing-box.log"),
-            launcher: SingBoxLauncher::Direct,
+            privilege: SingBoxPrivilege::Inherit,
             readiness: SingBoxReadiness::Listener {
                 port: NonZeroU16::new(1536).expect("nonzero fixture port"),
             },

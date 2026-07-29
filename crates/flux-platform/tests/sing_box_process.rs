@@ -1,6 +1,5 @@
 #![cfg(any(target_os = "linux", target_os = "android"))]
 
-use std::ffi::OsString;
 use std::fs::{self, File};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
@@ -11,11 +10,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use flux_platform::internal::{
-    PinnedSingBoxLaunch, SingBoxChild, SingBoxProcessAdapter, SingBoxProcessError,
-    TerminationOutcome,
+    PinnedSingBoxLaunch, SingBoxChild, SingBoxExecutablePrivilegeAttribute, SingBoxProcessAdapter,
+    SingBoxProcessError, TerminationOutcome,
 };
 use flux_platform::{
-    ProcessHandleErrorKind, ShutdownSignal, SingBoxExit, SingBoxLaunchSpec, SingBoxLauncher,
+    ProcessHandleErrorKind, ShutdownSignal, SingBoxExit, SingBoxLaunchSpec, SingBoxPrivilege,
     SingBoxReadiness,
 };
 use tempfile::{TempDir, tempdir};
@@ -64,6 +63,67 @@ fn version_query_uses_only_the_pinned_binary_and_returns_exact_bounded_output() 
         b"sing-box version 1.13.14\n\nEnvironment: go1.24.5 linux/amd64\n"
     );
     assert!(report.stderr().is_empty());
+}
+
+#[test]
+fn pinned_launch_rejects_set_id_binary_descriptors() {
+    for (mode, expected) in [
+        (0o4700, SingBoxExecutablePrivilegeAttribute::SetUserId),
+        (0o2700, SingBoxExecutablePrivilegeAttribute::SetGroupId),
+    ] {
+        let fixture = Fixture::new("success");
+        fs::set_permissions(&fixture.spec.binary, fs::Permissions::from_mode(mode))
+            .expect("set exec-sensitive fixture mode");
+
+        let error = PinnedSingBoxLaunch::new(
+            File::open(&fixture.spec.binary).expect("open pinned binary"),
+            File::open(&fixture.spec.config).expect("open pinned config"),
+        )
+        .expect_err("set-ID binary must be rejected while pinning");
+
+        assert!(matches!(
+            error,
+            SingBoxProcessError::UnsafeExecutablePrivilege { attribute }
+                if attribute == expected
+        ));
+    }
+}
+
+#[test]
+fn every_execution_revalidates_pinned_binary_privilege() {
+    #[derive(Clone, Copy)]
+    enum Operation {
+        Version,
+        Check,
+        Run,
+    }
+
+    for operation in [Operation::Version, Operation::Check, Operation::Run] {
+        let fixture = Fixture::new("success");
+        let pinned = pin_launch(&fixture.spec);
+        fs::set_permissions(&fixture.spec.binary, fs::Permissions::from_mode(0o4700))
+            .expect("add set-user-ID after descriptor pinning");
+
+        let result = match operation {
+            Operation::Version => SingBoxProcessAdapter
+                .query_version_pinned(&pinned, &fixture.spec)
+                .map(drop),
+            Operation::Check => SingBoxProcessAdapter
+                .validate_pinned(&pinned, &fixture.spec)
+                .map(drop),
+            Operation::Run => SingBoxProcessAdapter
+                .spawn_pinned(&pinned, &fixture.spec)
+                .map(drop),
+        };
+        let error = result.expect_err("execution must revalidate the pinned binary mode");
+        assert!(matches!(
+            error,
+            SingBoxProcessError::UnsafeExecutablePrivilege {
+                attribute: SingBoxExecutablePrivilegeAttribute::SetUserId,
+            }
+        ));
+        assert!(!fixture.invocation.exists());
+    }
 }
 
 #[test]
@@ -341,65 +401,6 @@ fn dropping_a_running_child_defers_reaping_without_blocking_the_caller() {
 }
 
 #[test]
-fn pinned_busybox_check_uses_fd_paths_and_is_reusable_for_run() {
-    let mut fixture = Fixture::new("success");
-    let busybox_record = fixture.root.path().join("pinned-busybox-argv");
-    let busybox_path = fake_busybox(fixture.root.path(), &busybox_record);
-    fixture.spec.launcher = SingBoxLauncher::BusyBoxSetuidgid {
-        busybox: busybox_path.clone(),
-        identity: OsString::from("1000:3003"),
-    };
-    let pinned = PinnedSingBoxLaunch::new(
-        File::open(&fixture.spec.binary).expect("open pinned binary"),
-        File::open(&fixture.spec.config).expect("open pinned config"),
-        Some(File::open(busybox_path).expect("open pinned BusyBox")),
-    )
-    .expect("validate pinned descriptors");
-    let adapter = SingBoxProcessAdapter;
-
-    adapter
-        .query_version_pinned(&pinned, &fixture.spec)
-        .expect("query version through pinned BusyBox");
-    let version_arguments = read_arguments(&busybox_record);
-    assert_eq!(version_arguments[0], "setuidgid");
-    assert_eq!(version_arguments[1], "1000:3003");
-    assert_eq!(
-        version_arguments[2],
-        format!("/proc/self/fd/{}", pinned.binary().as_raw_fd())
-    );
-    assert_eq!(version_arguments[3..], ["version"]);
-
-    adapter
-        .validate_pinned(&pinned, &fixture.spec)
-        .expect("validate through pinned BusyBox");
-    let check_arguments = read_arguments(&busybox_record);
-    assert_eq!(check_arguments[0], "setuidgid");
-    assert_eq!(check_arguments[1], "1000:3003");
-    assert_eq!(
-        check_arguments[2],
-        format!("/proc/self/fd/{}", pinned.binary().as_raw_fd())
-    );
-    assert_eq!(check_arguments[3], "check");
-    assert_eq!(check_arguments[4], "-c");
-    assert_eq!(
-        check_arguments[5],
-        format!("/proc/self/fd/{}", pinned.config().as_raw_fd())
-    );
-    assert_eq!(check_arguments[6], "-D");
-    assert_eq!(
-        check_arguments[7],
-        fixture.spec.working_directory.display().to_string()
-    );
-
-    let mut child = adapter
-        .spawn_pinned(&pinned, &fixture.spec)
-        .expect("reuse pinned descriptors for run");
-    assert_eq!(wait_for_exit(&adapter, &mut child), SingBoxExit::Code(23));
-    let run_arguments = read_arguments(&busybox_record);
-    assert_eq!(run_arguments[3], "run");
-}
-
-#[test]
 fn spawn_rejects_symlink_and_nonregular_log_targets() {
     use std::os::unix::fs::symlink;
 
@@ -484,16 +485,6 @@ fn every_launch_path_must_be_absolute() {
             relative_spec(&fixture.spec, "working_directory"),
         ),
         ("log", relative_spec(&fixture.spec, "log")),
-        (
-            "launcher.busybox",
-            SingBoxLaunchSpec {
-                launcher: SingBoxLauncher::BusyBoxSetuidgid {
-                    busybox: PathBuf::from("busybox"),
-                    identity: OsString::from("1000:3003"),
-                },
-                ..fixture.spec.clone()
-            },
-        ),
     ];
 
     for (expected_field, spec) in cases {
@@ -503,40 +494,6 @@ fn every_launch_path_must_be_absolute() {
         assert!(matches!(
             error,
             SingBoxProcessError::InvalidSpec { field, .. } if field == expected_field
-        ));
-    }
-}
-
-#[test]
-fn busybox_identity_rejects_option_like_and_malformed_values() {
-    let fixture = Fixture::new("success");
-    let pinned = pin_launch(&fixture.spec);
-    for identity in [
-        "-root",
-        "+1000",
-        "root-wheel",
-        "root::wheel",
-        "root:",
-        ":wheel",
-        "root:wheel:extra",
-        "4294967296",
-    ] {
-        let spec = SingBoxLaunchSpec {
-            launcher: SingBoxLauncher::BusyBoxSetuidgid {
-                busybox: fixture.root.path().join("busybox"),
-                identity: OsString::from(identity),
-            },
-            ..fixture.spec.clone()
-        };
-        let error = SingBoxProcessAdapter
-            .validate_pinned(&pinned, &spec)
-            .expect_err("unsafe setuidgid identity must be rejected");
-        assert!(matches!(
-            error,
-            SingBoxProcessError::InvalidSpec {
-                field: "launcher.identity",
-                ..
-            }
         ));
     }
 }
@@ -641,7 +598,7 @@ impl Fixture {
             config,
             working_directory,
             log: root.path().join("sing-box.log"),
-            launcher: SingBoxLauncher::Direct,
+            privilege: SingBoxPrivilege::Inherit,
             readiness: SingBoxReadiness::TunInterface {
                 name: "lo".to_owned(),
             },
@@ -723,18 +680,6 @@ exit 64
     script
 }
 
-fn fake_busybox(directory: &Path, record: &Path) -> PathBuf {
-    let script = directory.join("busybox");
-    write_executable(
-        &script,
-        &format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n[ \"$1\" = setuidgid ] || exit 65\nshift 2\nexec \"$@\"\n",
-            record.display()
-        ),
-    );
-    script
-}
-
 fn relative_spec(spec: &SingBoxLaunchSpec, field: &str) -> SingBoxLaunchSpec {
     let mut spec = spec.clone();
     match field {
@@ -755,16 +700,9 @@ fn write_executable(path: &Path, contents: &str) {
 }
 
 fn pin_launch(spec: &SingBoxLaunchSpec) -> PinnedSingBoxLaunch {
-    let busybox = match &spec.launcher {
-        SingBoxLauncher::Direct => None,
-        SingBoxLauncher::BusyBoxSetuidgid { busybox, .. } => {
-            Some(File::open(busybox).expect("open pinned BusyBox"))
-        }
-    };
     PinnedSingBoxLaunch::new(
         File::open(&spec.binary).expect("open pinned binary"),
         File::open(&spec.config).expect("open pinned config"),
-        busybox,
     )
     .expect("validate pinned launch descriptors")
 }
@@ -780,7 +718,7 @@ fn run_parent_death_helper(root: &Path) {
         config,
         working_directory,
         log: root.join("supervised.log"),
-        launcher: SingBoxLauncher::Direct,
+        privilege: SingBoxPrivilege::Inherit,
         readiness: SingBoxReadiness::TunInterface {
             name: "lo".to_owned(),
         },
@@ -813,14 +751,6 @@ fn assert_exact_invocation(fixture: &Fixture, pinned: &PinnedSingBoxLaunch, mode
     ]
     .join("\n");
     assert_eq!(arguments.trim_end(), expected);
-}
-
-fn read_arguments(path: &Path) -> Vec<String> {
-    fs::read_to_string(path)
-        .expect("read argument record")
-        .lines()
-        .map(str::to_owned)
-        .collect()
 }
 
 fn read_recorded_pid(path: &Path) -> u32 {

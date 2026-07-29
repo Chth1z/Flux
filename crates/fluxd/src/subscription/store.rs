@@ -56,9 +56,7 @@ impl SubscriptionSnapshotValidator for SingBoxSnapshotValidator {
         process.config = config_path.to_owned();
         let candidate = EngineSpec::new(process, self.engine.restart_policy())
             .map_err(|_| SnapshotValidationErrorKind::Artifact)?;
-        if candidate.binary_digest() != self.engine.binary_digest()
-            || candidate.launcher_digest() != self.engine.launcher_digest()
-        {
+        if candidate.binary_digest() != self.engine.binary_digest() {
             return Err(SnapshotValidationErrorKind::Artifact);
         }
         candidate

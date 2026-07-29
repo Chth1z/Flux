@@ -44,6 +44,8 @@ use crate::native_generation_source::{
 use crate::native_generation_source::{
     LinuxNativeCompositionPlanningSource, PlatformNativeLinuxCompositionTestAdmission,
 };
+#[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
+use crate::native_runtime_writer::compose_linux_native_composition_test_runtime;
 use crate::native_runtime_writer::compose_native_runtime;
 use crate::offline_cleanup::{
     DaemonLease, DaemonLeaseError, NativeOfflineRecovery, OfflineRecovery,
@@ -144,7 +146,19 @@ pub fn run_daemon<S>(profile_source: &S, options: DaemonOptions) -> Result<(), D
 where
     S: CapabilityProfileSource,
 {
-    run_daemon_with_platform(profile_source, options, AndroidNativeDaemonPlatform)
+    run_daemon_with_platform(
+        profile_source,
+        options,
+        AndroidNativeDaemonPlatform,
+        NativeEngineExecution::Production,
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeEngineExecution {
+    Production,
+    #[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
+    LinuxCompositionFixture,
 }
 
 #[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
@@ -156,13 +170,19 @@ pub(crate) fn run_linux_native_composition_test_daemon<S>(
 where
     S: CapabilityProfileSource,
 {
-    run_daemon_with_platform(profile_source, options, platform)
+    run_daemon_with_platform(
+        profile_source,
+        options,
+        platform,
+        NativeEngineExecution::LinuxCompositionFixture,
+    )
 }
 
 fn run_daemon_with_platform<S, P>(
     profile_source: &S,
     options: DaemonOptions,
     mut platform: P,
+    engine_execution: NativeEngineExecution,
 ) -> Result<(), DaemonError>
 where
     S: CapabilityProfileSource,
@@ -248,6 +268,7 @@ where
                                 &options,
                                 &runtime_layout,
                                 platform,
+                                engine_execution,
                             )?,
                         )
                     }
@@ -577,6 +598,7 @@ fn compose_native_daemon<P, A>(
     options: &DaemonOptions,
     runtime_layout: &RuntimeLayout,
     platform: NativeDaemonPlatformParts<P, A>,
+    engine_execution: NativeEngineExecution,
 ) -> Result<DaemonComposition, DaemonError>
 where
     P: NativeGenerationPlanningSource,
@@ -627,13 +649,30 @@ where
         &options.runtime_root,
         runtime_layout.run_path().join("sing-box.log"),
     );
-    let source = AssembledNativeGenerationSource::<_, _, _, NativeCaptureTargetIdentity>::new(
-        source_paths,
-        inventory.clone(),
-        planning,
-        admission,
-        accepted_subscription,
-    );
+    let source = match engine_execution {
+        NativeEngineExecution::Production => {
+            AssembledNativeGenerationSource::<_, _, _, NativeCaptureTargetIdentity>::new(
+                source_paths,
+                inventory.clone(),
+                planning,
+                admission,
+                accepted_subscription,
+            )
+        }
+        #[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
+        NativeEngineExecution::LinuxCompositionFixture => AssembledNativeGenerationSource::<
+            _,
+            _,
+            _,
+            NativeCaptureTargetIdentity,
+        >::for_linux_native_composition_test(
+            source_paths,
+            inventory.clone(),
+            planning,
+            admission,
+            accepted_subscription,
+        ),
+    };
     let maintenance_interval =
         engine_maintenance_interval(config.daemon().reconcile_debounce().get());
     let address_reconciler = AddressReconciler::for_network_inventory(
@@ -641,12 +680,23 @@ where
         inventory,
         network_inventory_refresh,
     );
-    let dispatcher = compose_native_runtime(
-        convergence,
-        move || source,
-        maintenance_interval,
-        functional_canary,
-    )
+    let dispatcher = match engine_execution {
+        NativeEngineExecution::Production => compose_native_runtime(
+            convergence,
+            move || source,
+            maintenance_interval,
+            functional_canary,
+        ),
+        #[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
+        NativeEngineExecution::LinuxCompositionFixture => {
+            compose_linux_native_composition_test_runtime(
+                convergence,
+                move || source,
+                maintenance_interval,
+                functional_canary,
+            )
+        }
+    }
     .map_err(|source| DaemonError::native("compose native runtime coordinator", source))?
     .with_address_reconciler(address_reconciler)
     .with_subscription_runtime(subscription_runtime);

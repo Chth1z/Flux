@@ -4673,7 +4673,7 @@ pub(crate) mod tests {
     use std::num::{NonZeroU8, NonZeroU16, NonZeroU32, NonZeroU64};
 
     use flux_core::{NetworkInventoryTracker, OWNERSHIP_JOURNAL_IDENTITY_BYTES};
-    use flux_platform::{SingBoxLaunchSpec, SingBoxLauncher, SingBoxReadiness};
+    use flux_platform::{SingBoxLaunchSpec, SingBoxPrivilege, SingBoxReadiness};
 
     use super::linux_tproxy_checkpoint_boundary::{
         LinuxTproxyCheckpointAction, LinuxTproxyCheckpointEvidence, LinuxTproxyCheckpointHook,
@@ -7298,7 +7298,7 @@ pub(crate) mod tests {
                     config,
                     working_directory: directory.path().to_path_buf(),
                     log: directory.path().join("sing-box.log"),
-                    launcher: SingBoxLauncher::Direct,
+                    privilege: SingBoxPrivilege::Inherit,
                     readiness: SingBoxReadiness::Listener {
                         port: NonZeroU16::new(1536).expect("nonzero port"),
                     },

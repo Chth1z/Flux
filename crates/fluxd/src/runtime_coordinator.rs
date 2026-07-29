@@ -3196,7 +3196,7 @@ mod tests {
         FluxConfig, InterfaceAddressFlags, InterfaceAddressRecord, InterfaceIndex,
         NetworkInventoryTracker, Reason, RuntimeDispatcher, RuntimeIntent,
     };
-    use flux_platform::{ReadinessEvidence, SingBoxLaunchSpec, SingBoxLauncher, SingBoxReadiness};
+    use flux_platform::{ReadinessEvidence, SingBoxLaunchSpec, SingBoxPrivilege, SingBoxReadiness};
 
     use super::*;
     use crate::functional_canary::local_output::xtables_tproxy_local_output_executor;
@@ -8040,7 +8040,7 @@ mod tests {
                     config,
                     working_directory: directory.path().to_path_buf(),
                     log: directory.path().join("sing-box.log"),
-                    launcher: SingBoxLauncher::Direct,
+                    privilege: SingBoxPrivilege::Inherit,
                     readiness: SingBoxReadiness::Listener {
                         port: NonZeroU16::new(1536).expect("nonzero port"),
                     },

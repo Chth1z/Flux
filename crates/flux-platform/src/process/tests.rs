@@ -175,6 +175,7 @@ Groups:\t10 20 30\n\
 CapInh:\t0000000000000001\n\
 CapPrm:\t0000000000000002\n\
 CapEff:\t0000000000000004\n\
+CapBnd:\t0000000000000010\n\
 CapAmb:\t0000000000000008\n\
 NoNewPrivs:\t1\n";
     let (tgid, pid, credentials) = parse_proc_status(status).expect("parse exact proc status");
@@ -186,6 +187,7 @@ NoNewPrivs:\t1\n";
     assert_eq!(credentials.capability_inheritable(), 1);
     assert_eq!(credentials.capability_permitted(), 2);
     assert_eq!(credentials.capability_effective(), 4);
+    assert_eq!(credentials.capability_bounding(), 16);
     assert_eq!(credentials.capability_ambient(), 8);
     assert!(credentials.no_new_privileges());
 
@@ -224,11 +226,11 @@ fn credential_census_validation_rejects_changed_or_heterogeneous_tasks() {
     let leader_id = NonZeroU32::new(4242).unwrap();
     let worker_id = NonZeroU32::new(4243).unwrap();
     let (_, _, leader) = parse_proc_status(
-        b"Tgid:\t4242\nPid:\t4242\nUid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\nGroups:\t1000\nCapInh:\t0\nCapPrm:\t0\nCapEff:\t0\nCapAmb:\t0\nNoNewPrivs:\t0\n",
+        b"Tgid:\t4242\nPid:\t4242\nUid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\nGroups:\t1000\nCapInh:\t0\nCapPrm:\t0\nCapEff:\t0\nCapBnd:\t0\nCapAmb:\t0\nNoNewPrivs:\t0\n",
     )
     .expect("parse leader credentials");
     let (_, _, restricted_worker) = parse_proc_status(
-        b"Tgid:\t4242\nPid:\t4243\nUid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\nGroups:\t1000\nCapInh:\t0\nCapPrm:\t0\nCapEff:\t0\nCapAmb:\t0\nNoNewPrivs:\t1\n",
+        b"Tgid:\t4242\nPid:\t4243\nUid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\nGroups:\t1000\nCapInh:\t0\nCapPrm:\t0\nCapEff:\t0\nCapBnd:\t0\nCapAmb:\t0\nNoNewPrivs:\t1\n",
     )
     .expect("parse worker credentials");
     let task_ids = [leader_id, worker_id];
@@ -303,7 +305,7 @@ fn namespace_and_map_census_rejects_drift_or_heterogeneous_tasks() {
     let leader_id = NonZeroU32::new(4242).unwrap();
     let worker_id = NonZeroU32::new(4243).unwrap();
     let (_, _, credentials) = parse_proc_status(
-        b"Tgid:\t4242\nPid:\t4242\nUid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\nGroups:\t\nCapInh:\t0\nCapPrm:\t0\nCapEff:\t0\nCapAmb:\t0\nNoNewPrivs:\t1\n",
+        b"Tgid:\t4242\nPid:\t4242\nUid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\nGroups:\t\nCapInh:\t0\nCapPrm:\t0\nCapEff:\t0\nCapBnd:\t0\nCapAmb:\t0\nNoNewPrivs:\t1\n",
     )
     .expect("parse stable credentials");
     let task_ids = [leader_id, worker_id];

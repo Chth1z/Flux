@@ -15,8 +15,10 @@ bin/
 /ebpf/target/
 
 # Local Codex research and planning state
+/audit/
 /archive/
 /docs/
 /notes.md
 /task_plan.md
 /review_report.md
+/CONTEXT.md

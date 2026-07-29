@@ -13,11 +13,11 @@ use flux_core::{
     plan_android_rpdb_placement,
 };
 use flux_platform::{
-    AndroidCapturePathQualifications, AndroidFwmarkCensusCoordinatorOutcome,
-    AndroidFwmarkCensusCoordinatorPurpose, AndroidFwmarkCensusCoordinatorRequest,
-    NativeXtablesCaptureAdmission, NativeXtablesCaptureAdmissionError, NativeXtablesCaptureTarget,
-    NetworkInventorySource, SingBoxLaunchSpec, SingBoxLauncher, SingBoxReadiness,
-    SystemAndroidFwmarkCensusSource, coordinate_android_fwmark_census_for_inventory,
+    AndroidFwmarkCensusCoordinatorOutcome, AndroidFwmarkCensusCoordinatorPurpose,
+    AndroidFwmarkCensusCoordinatorRequest, NativeXtablesCaptureAdmission,
+    NativeXtablesCaptureAdmissionError, NativeXtablesCaptureTarget, NetworkInventorySource,
+    SingBoxLaunchSpec, SingBoxLauncher, SingBoxReadiness, SystemAndroidFwmarkCensusSource,
+    coordinate_android_fwmark_census_for_inventory,
 };
 #[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
 use flux_platform::{NativeLinuxCompositionTestAdmission, NativeLinuxCompositionTestError};
@@ -25,12 +25,12 @@ use flux_platform::{NativeLinuxCompositionTestAdmission, NativeLinuxCompositionT
 use crate::generation_engine_config::{
     AddressReconciledGenerationInputs, AddressReconciliationError, AddressReconciliationInspection,
     AdmittedGeneration, AdmittedGenerationIdentity, CapturePathDecision,
-    CapturePathQualificationEvidence, CapturePathQualificationEvidenceError,
-    DesiredStateCompileError, EngineCapabilityProfileError, EngineConfigCompileError,
-    GenerationAssembler, GenerationAssemblyError, GenerationAssemblyRequest,
-    GenerationPlanningAuthority, SelectedEngineSource, TproxyEngineConfigRequest,
-    bind_engine_config_to_spec, collect_tproxy_engine_capability_profile,
-    compile_address_reconciliation, compile_tproxy_engine_config, read_bounded_regular_file,
+    CapturePathQualificationEvidenceError, DesiredStateCompileError, EngineCapabilityProfileError,
+    EngineConfigCompileError, GenerationAssembler, GenerationAssemblyError,
+    GenerationAssemblyRequest, GenerationPlanningAuthority, SelectedEngineSource,
+    TproxyEngineConfigRequest, bind_engine_config_to_spec,
+    collect_tproxy_engine_capability_profile, compile_address_reconciliation,
+    compile_tproxy_engine_config, read_bounded_regular_file,
 };
 use crate::intent_store::record_io;
 use crate::native_runtime_writer::{NativeGenerationSource, PreparedNativeGeneration};
@@ -176,16 +176,8 @@ impl SystemAndroidGenerationPlanningSource {
             .map_err(|source| {
                 SystemAndroidGenerationPlanningError::Placement(source.to_string().into_boxed_str())
             })?;
-        let capture_path_evidence = CapturePathQualificationEvidence::with_maximum_lifetime(
-            AndroidCapturePathQualifications::default(),
-            Instant::now(),
-        )
-        .map_err(SystemAndroidGenerationPlanningError::CapturePathEvidence)?;
-        Ok(GenerationPlanningAuthority::android(
-            evidence,
-            capture_path_evidence,
-            Some(placement),
-        ))
+        GenerationPlanningAuthority::android(evidence, Instant::now(), Some(placement))
+            .map_err(SystemAndroidGenerationPlanningError::CapturePathEvidence)
     }
 }
 
@@ -1040,17 +1032,18 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use flux_core::{
-        CapabilityProfile, FwmarkCandidate, InterfaceAddressFlags, InterfaceAddressRecord,
-        InterfaceIndex, NetworkInventoryTracker, NetworkNamespaceIdentity, RouteProtocol,
-        RouteTableId, RulePriority, RuleProtocol,
+        CapabilityProfile, CapturePathQualifications, FwmarkCandidate, InterfaceAddressFlags,
+        InterfaceAddressRecord, InterfaceIndex, NetworkInventoryTracker, NetworkNamespaceIdentity,
+        RouteProtocol, RouteTableId, RulePriority, RuleProtocol,
     };
     use flux_platform::{XtablesLocalOutputRoutingSpec, XtablesLocalOutputRoutingTarget};
     use flux_testkit::CapabilityProfileFixture;
 
     use super::*;
     use crate::generation_engine_config::{
-        HostInspectionPlanningAuthority, SelectedEngineSourceIdentity,
-        qualified_xtables_capture_path_evidence, qualified_xtables_kernel_config,
+        CapturePathQualificationEvidence, HostInspectionPlanningAuthority,
+        SelectedEngineSourceIdentity, qualified_xtables_capture_path_evidence,
+        qualified_xtables_kernel_config,
     };
 
     const PACKAGED_DESIRED_STATE: &str = include_str!("../../../conf/flux.toml");
@@ -1094,7 +1087,9 @@ esac
 
     struct HostPlanning {
         capability_profile: CapabilityProfile,
-        capture_path_evidence: CapturePathQualificationEvidence,
+        capture_path_qualifications: CapturePathQualifications,
+        capture_path_observed_at: Instant,
+        capture_path_valid_until: Instant,
     }
 
     impl NativeGenerationPlanningSource for HostPlanning {
@@ -1109,7 +1104,12 @@ esac
                 HostInspectionPlanningAuthority::new(
                     &self.capability_profile,
                     qualified_xtables_kernel_config(),
-                    self.capture_path_evidence,
+                    CapturePathQualificationEvidence::host_inspection(
+                        self.capture_path_qualifications,
+                        self.capture_path_observed_at,
+                        self.capture_path_valid_until,
+                    )
+                    .expect("host Capture Path evidence has a bounded lifetime"),
                     inventory,
                     NetworkNamespaceIdentity::new(10, 20).expect("network namespace identity"),
                     FwmarkCandidate::new(0x00ff_0000, 0x0080_0000, 0x0040_0000).expect("test mark"),
@@ -1201,12 +1201,17 @@ esac
             );
             let capture_path_evidence = qualified_xtables_capture_path_evidence();
             let capture_path_evidence_deadline = capture_path_evidence.valid_until();
+            let capture_path_observed_at = capture_path_evidence_deadline
+                .checked_sub(Duration::from_secs(5 * 60))
+                .expect("test Capture Path observation is representable");
             let assembled = AssembledNativeGenerationSource::new(
                 paths,
                 inventory.clone(),
                 HostPlanning {
                     capability_profile: CapabilityProfileFixture::device_qualified(),
-                    capture_path_evidence,
+                    capture_path_qualifications: capture_path_evidence.qualifications(),
+                    capture_path_observed_at,
+                    capture_path_valid_until: capture_path_evidence_deadline,
                 },
                 RecordingAdmission::default(),
                 accepted_subscription,
@@ -1273,9 +1278,14 @@ esac
             .inventory
             .snapshot()
             .expect("fixture publishes a complete inventory");
+        let capture_path_observed_at = Instant::now();
         let mut host_planning = HostPlanning {
             capability_profile: CapabilityProfileFixture::device_qualified(),
-            capture_path_evidence: qualified_xtables_capture_path_evidence(),
+            capture_path_qualifications: qualified_xtables_capture_path_evidence().qualifications(),
+            capture_path_observed_at,
+            capture_path_valid_until: capture_path_observed_at
+                .checked_add(Duration::from_secs(5 * 60))
+                .expect("test Capture Path deadline is representable"),
         };
         let initial = host_planning
             .plan(&fixture.desired_state, &inventory)

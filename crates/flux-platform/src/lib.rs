@@ -61,9 +61,8 @@ pub use android_fwmark_census::{
     collect_android_xfrm_fwmarks,
 };
 pub use android_kernel_capabilities::{
-    ALL_ANDROID_KERNEL_FEATURES, ANDROID_CAPTURE_PATH_COUNT, ANDROID_KERNEL_CONFIG_DIGEST_BYTES,
-    AndroidCapturePathCandidate, AndroidCapturePathDecision, AndroidCapturePathProbeState,
-    AndroidCapturePathQualifications, AndroidCapturePathState, AndroidKernelConfigDigest,
+    ALL_ANDROID_KERNEL_FEATURES, ANDROID_KERNEL_CONFIG_DIGEST_BYTES, AndroidCapturePathCandidate,
+    AndroidCapturePathDecision, AndroidCapturePathState, AndroidKernelConfigDigest,
     AndroidKernelConfigOptionState, AndroidKernelConfigParseError,
     AndroidKernelConfigParseErrorKind, AndroidKernelConfigSnapshot, AndroidKernelFeature,
     AndroidKernelFeatureState, AndroidNftablesObservationGate, AndroidNftablesObservationGateError,

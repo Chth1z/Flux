@@ -149,7 +149,9 @@ fn coordinator_error_label(
         AndroidFwmarkCensusCoordinatorError::ExternalSnapshotDrift { .. } => {
             "external-snapshot-drift".to_owned()
         }
-        AndroidFwmarkCensusCoordinatorError::Policy(_) => "policy-binding".to_owned(),
+        AndroidFwmarkCensusCoordinatorError::PlatformProfile(_) => {
+            "platform-profile-binding".to_owned()
+        }
         AndroidFwmarkCensusCoordinatorError::SelectedNetdSourceProfileMismatch { .. } => {
             "selected-netd-source-profile-mismatch".to_owned()
         }

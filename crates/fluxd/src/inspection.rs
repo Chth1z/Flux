@@ -945,8 +945,8 @@ mod tests {
             flux_platform::AndroidCapturePathState::Unqualified
         );
         assert_eq!(
-            rejection.candidates()[1].probe_state(),
-            flux_platform::AndroidCapturePathProbeState::Unqualified
+            rejection.candidates()[1].qualification_state(),
+            flux_core::CapturePathQualificationState::Unqualified
         );
     }
 

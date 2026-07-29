@@ -10,6 +10,7 @@ use crate::capability::{
     BootIdentity, CapabilityProfileRevision, DeviceIdentity, KernelFacts, KernelRelease,
     Observation, SelinuxMode, ToolId, VerifiedBootIdentity, VerifiedBootState,
 };
+use crate::capture_path::{CapturePathId, CapturePathQualificationState};
 use crate::network_inventory::{
     InterfaceHardwareType, InterfaceIndex, InterfaceLinkFlags, InterfaceLinkRecord, InterfaceName,
     NetworkInventoryTracker,
@@ -39,13 +40,11 @@ const SELECTOR: ReviewedPolicySelectorLiteral = ReviewedPolicySelectorLiteral {
     netd: artifact_literal(0x22, 8_192),
     connectivity: artifact_literal(0x23, 16_384),
 };
-const ENTRY: ReviewedAndroidMarkPolicyCatalogEntry = ReviewedAndroidMarkPolicyCatalogEntry {
-    id: "google-redfin-tq3a-20230805-v1",
-    selector: SELECTOR,
+const MARK_POLICY: ReviewedAndroidMarkPolicyLiteral = ReviewedAndroidMarkPolicyLiteral {
     assurance_class: AndroidMarkPolicyAssuranceClass::AuthenticatedSource,
-    policy_name: "synthetic cooperative policy",
-    policy_revision: 1,
-    policy_artifact_digest: [0x31; 32],
+    name: "synthetic cooperative policy",
+    revision: 1,
+    artifact_digest: [0x31; 32],
     netd_source_profile: AndroidNetdSourceProfile::AospAndroid13R1,
     candidate_mask: CANDIDATE_MASK,
     proxy_value: PROXY_VALUE,
@@ -53,23 +52,49 @@ const ENTRY: ReviewedAndroidMarkPolicyCatalogEntry = ReviewedAndroidMarkPolicyCa
     planes: FwmarkPlaneSet::ALL.bits(),
     ordered_late_writes: &[],
 };
+const CAPTURE_PATH_EVIDENCE: ReviewedCapturePathEvidenceLiteral =
+    ReviewedCapturePathEvidenceLiteral {
+        revision: 7,
+        artifact_digest: [0x41; 32],
+        qualifications: CapturePathQualifications::new(
+            CapturePathQualificationState::Unqualified,
+            CapturePathQualificationState::Qualified,
+            CapturePathQualificationState::Unqualified,
+        ),
+    };
+const ENTRY: ReviewedAndroidPlatformProfileCatalogEntry =
+    ReviewedAndroidPlatformProfileCatalogEntry {
+        id: "google-redfin-tq3a-20230805-v1",
+        selector: SELECTOR,
+        mark_policy: Some(MARK_POLICY),
+        capture_path: Some(CAPTURE_PATH_EVIDENCE),
+    };
 
 #[test]
-fn unmatched_production_selector_returns_explicit_zero_grant() {
+fn unmatched_production_selector_returns_explicit_zero_grants() {
     let namespace = namespace(4, 40);
     let profile = capability_profile(namespace);
     let topology = topology_scope();
 
-    let selection = select_reviewed_android_mark_policy(&profile, namespace)
-        .expect("empty compiled catalog is valid");
+    let selection = select_reviewed_android_platform_profile(&profile, namespace)
+        .expect("compiled platform catalog is valid");
 
     assert!(!selection.is_match());
     assert!(selection.catalog_entry().is_none());
     assert!(selection.netd_source_profile().is_none());
-    let policy = selection
+    assert!(!selection.has_reviewed_capture_path_evidence());
+    let bound = selection
         .bind_topology(&topology)
         .expect("zero grant binds without positive topology authority");
+    let (policy, capture_path) = bound.into_parts();
     assert_eq!(policy.grant_kind(), AndroidMarkDeviceGrantKind::NoGrant);
+    assert_eq!(
+        capture_path.qualifications(),
+        CapturePathQualifications::default()
+    );
+    assert!(capture_path.reviewed_identity().is_none());
+    assert_eq!(capture_path.capability_profile_digest(), profile.digest());
+    assert_eq!(capture_path.network_namespace(), namespace);
 }
 
 #[test]
@@ -81,6 +106,7 @@ fn exact_entry_selects_positive_policy_and_retains_catalog_provenance() {
     let selection = select_from_catalog(&[ENTRY], &profile, namespace).expect("exact match");
 
     assert!(selection.is_match());
+    assert!(selection.has_reviewed_capture_path_evidence());
     assert_eq!(
         selection.netd_source_profile(),
         Some(AndroidNetdSourceProfile::AospAndroid13R1)
@@ -91,9 +117,11 @@ fn exact_entry_selects_positive_policy_and_retains_catalog_provenance() {
             .map(ReviewedPolicyCatalogEntryId::as_str),
         Some("google-redfin-tq3a-20230805-v1")
     );
-    let policy = selection
+    let projected_capture_path = selection.capture_path_evidence();
+    let bound = selection
         .bind_topology(&topology)
         .expect("selected profile binds matching topology");
+    let (policy, capture_path) = bound.into_parts();
     let grant = policy.positive_grant().expect("matched positive policy");
 
     assert_eq!(policy.grant_kind(), AndroidMarkDeviceGrantKind::Positive);
@@ -118,14 +146,30 @@ fn exact_entry_selects_positive_policy_and_retains_catalog_provenance() {
             .as_bytes(),
         &[0x31; 32]
     );
+    assert_eq!(
+        capture_path
+            .qualifications()
+            .state(CapturePathId::XtablesTproxy),
+        CapturePathQualificationState::Qualified
+    );
+    let reviewed = capture_path
+        .reviewed_identity()
+        .expect("synthetic profile includes reviewed Capture Path evidence");
+    assert_eq!(
+        reviewed.catalog_entry().as_str(),
+        "google-redfin-tq3a-20230805-v1"
+    );
+    assert_eq!(reviewed.revision().get(), 7);
+    assert_eq!(reviewed.artifact_digest().as_bytes(), &[0x41; 32]);
+    assert_eq!(projected_capture_path, capture_path);
 }
 
 #[test]
-fn exact_production_samsung_selector_is_observed_behavior_not_source_authenticated() {
+fn exact_production_samsung_selector_grants_marks_but_not_capture_path_behavior() {
     let namespace = namespace(20, 234_673);
-    let selector = SAMSUNG_SM_S9180_FZDP_OBSERVED_BEHAVIOR_V1.selector;
+    let selector = SAMSUNG_SM_S9180_FZDP_PLATFORM_PROFILE_V1.selector;
     let profile = capability_profile_for_selector(namespace, 0x71, selector);
-    let selection = select_reviewed_android_mark_policy(&profile, namespace)
+    let selection = select_reviewed_android_platform_profile(&profile, namespace)
         .expect("exact reviewed Samsung platform selector");
 
     assert_eq!(
@@ -143,18 +187,25 @@ fn exact_production_samsung_selector_is_observed_behavior_not_source_authenticat
         Some(AndroidNetdSourceProfile::AospNetd20250324),
         "the source-named profile is a semantic grammar under observed-behavior assurance"
     );
+    assert!(!selection.has_reviewed_capture_path_evidence());
 
-    let policy = selection
+    let bound = selection
         .bind_topology(&topology_scope_for(
             AndroidNetdSourceProfile::AospNetd20250324,
         ))
         .expect("matching reviewed semantic topology");
+    let (policy, capture_path) = bound.into_parts();
     let grant = policy.positive_grant().expect("exact positive assertion");
     assert_eq!(
         grant.assurance_class(),
         AndroidMarkPolicyAssuranceClass::ExactArtifactObservedBehavior
     );
     assert!(grant.ordered_late_writes().is_empty());
+    assert_eq!(
+        capture_path.qualifications(),
+        CapturePathQualifications::default()
+    );
+    assert!(capture_path.reviewed_identity().is_none());
 }
 
 #[test]
@@ -166,7 +217,10 @@ fn policy_artifact_digest_is_compiled_from_the_exact_reviewed_document() {
     let digest = Sha256::digest(bytes);
     assert_eq!(
         digest.as_slice(),
-        SAMSUNG_SM_S9180_FZDP_OBSERVED_BEHAVIOR_V1.policy_artifact_digest
+        SAMSUNG_SM_S9180_FZDP_PLATFORM_PROFILE_V1
+            .mark_policy
+            .expect("Samsung profile has a mark-policy aspect")
+            .artifact_digest
     );
 }
 
@@ -177,15 +231,22 @@ fn assurance_classes_remain_distinct_for_otherwise_identical_entries() {
     let authenticated = select_from_catalog(&[ENTRY], &profile, namespace)
         .expect("authenticated synthetic policy")
         .bind_topology(&topology_scope())
-        .expect("matching authenticated topology");
-    let observed_entry = ReviewedAndroidMarkPolicyCatalogEntry {
-        assurance_class: AndroidMarkPolicyAssuranceClass::ExactArtifactObservedBehavior,
+        .expect("matching authenticated topology")
+        .into_parts()
+        .0;
+    let observed_entry = ReviewedAndroidPlatformProfileCatalogEntry {
+        mark_policy: Some(ReviewedAndroidMarkPolicyLiteral {
+            assurance_class: AndroidMarkPolicyAssuranceClass::ExactArtifactObservedBehavior,
+            ..MARK_POLICY
+        }),
         ..ENTRY
     };
     let observed = select_from_catalog(&[observed_entry], &profile, namespace)
         .expect("observed-behavior synthetic policy")
         .bind_topology(&topology_scope())
-        .expect("matching observed topology");
+        .expect("matching observed topology")
+        .into_parts()
+        .0;
 
     assert_ne!(authenticated.identity(), observed.identity());
     assert_eq!(
@@ -219,7 +280,9 @@ fn runtime_tool_identity_binds_the_grant_without_becoming_a_self_hash_selector()
     let selection = select_from_catalog(&[ENTRY], &changed, namespace).expect("platform match");
     let policy = selection
         .bind_topology(&topology_scope())
-        .expect("matching topology");
+        .expect("matching topology")
+        .into_parts()
+        .0;
     assert_eq!(
         policy
             .positive_grant()
@@ -239,12 +302,14 @@ fn selected_netd_profile_must_build_the_bound_topology() {
 
     assert_eq!(
         selection.bind_topology(&topology),
-        Err(ReviewedAndroidMarkPolicyCatalogError::PolicyConstruction(
-            AndroidMarkDevicePolicyError::NetdSourceProfileMismatch {
-                selected: AndroidNetdSourceProfile::AospAndroid13R1,
-                topology: AndroidNetdSourceProfile::AospNetd20250324,
-            }
-        ))
+        Err(
+            ReviewedAndroidPlatformProfileCatalogError::MarkPolicyConstruction(
+                AndroidMarkDevicePolicyError::NetdSourceProfileMismatch {
+                    selected: AndroidNetdSourceProfile::AospAndroid13R1,
+                    topology: AndroidNetdSourceProfile::AospNetd20250324,
+                }
+            )
+        )
     );
 }
 
@@ -288,16 +353,116 @@ fn every_stable_selector_fact_drift_returns_zero_grant() {
     ];
 
     for selector in changed_selectors {
-        let changed = ReviewedAndroidMarkPolicyCatalogEntry { selector, ..ENTRY };
+        let changed = ReviewedAndroidPlatformProfileCatalogEntry { selector, ..ENTRY };
         let selection = select_from_catalog(&[changed], &profile, namespace)
             .expect("valid nonmatching catalog");
 
         assert!(!selection.is_match());
-        let policy = selection
+        let bound = selection
             .bind_topology(&topology_scope())
             .expect("nonmatch remains a zero grant");
+        let (policy, capture_path) = bound.into_parts();
         assert_eq!(policy.grant_kind(), AndroidMarkDeviceGrantKind::NoGrant);
+        assert_eq!(
+            capture_path.qualifications(),
+            CapturePathQualifications::default()
+        );
+        assert!(capture_path.reviewed_identity().is_none());
     }
+}
+
+#[test]
+fn optional_aspects_are_independent_and_share_one_exact_selector() {
+    let namespace = namespace(4, 40);
+    let profile = capability_profile(namespace);
+    let mark_only = ReviewedAndroidPlatformProfileCatalogEntry {
+        capture_path: None,
+        ..ENTRY
+    };
+    let capture_only = ReviewedAndroidPlatformProfileCatalogEntry {
+        mark_policy: None,
+        ..ENTRY
+    };
+
+    let mark_bound = select_from_catalog(&[mark_only], &profile, namespace)
+        .expect("mark-only profile")
+        .bind_topology(&topology_scope())
+        .expect("mark-only topology");
+    assert_eq!(
+        mark_bound.mark_policy().grant_kind(),
+        AndroidMarkDeviceGrantKind::Positive
+    );
+    assert_eq!(
+        mark_bound.capture_path_evidence().qualifications(),
+        CapturePathQualifications::default()
+    );
+    assert!(
+        mark_bound
+            .capture_path_evidence()
+            .reviewed_identity()
+            .is_none()
+    );
+
+    let capture_bound = select_from_catalog(&[capture_only], &profile, namespace)
+        .expect("capture-only profile")
+        .bind_topology(&topology_scope())
+        .expect("capture-only topology");
+    assert_eq!(
+        capture_bound.mark_policy().grant_kind(),
+        AndroidMarkDeviceGrantKind::NoGrant
+    );
+    assert_eq!(
+        capture_bound
+            .capture_path_evidence()
+            .qualifications()
+            .state(CapturePathId::XtablesTproxy),
+        CapturePathQualificationState::Qualified
+    );
+    assert!(
+        capture_bound
+            .capture_path_evidence()
+            .reviewed_identity()
+            .is_some()
+    );
+}
+
+#[test]
+fn behavioral_evidence_digest_binds_fresh_capability_and_reviewed_provenance() {
+    let namespace = namespace(4, 40);
+    let first = capability_profile_with_tool(namespace, 0x24);
+    let changed_tool = capability_profile_with_tool(namespace, 0x25);
+    let first_evidence = select_from_catalog(&[ENTRY], &first, namespace)
+        .expect("first exact profile")
+        .bind_topology(&topology_scope())
+        .expect("first bound profile")
+        .into_parts()
+        .1;
+    let changed_evidence = select_from_catalog(&[ENTRY], &changed_tool, namespace)
+        .expect("same stable selector with changed running tool")
+        .bind_topology(&topology_scope())
+        .expect("changed bound profile")
+        .into_parts()
+        .1;
+    let revised_capture = ReviewedAndroidPlatformProfileCatalogEntry {
+        capture_path: Some(ReviewedCapturePathEvidenceLiteral {
+            revision: 8,
+            ..CAPTURE_PATH_EVIDENCE
+        }),
+        ..ENTRY
+    };
+    let revised_evidence = select_from_catalog(&[revised_capture], &first, namespace)
+        .expect("revised reviewed evidence")
+        .bind_topology(&topology_scope())
+        .expect("revised bound profile")
+        .into_parts()
+        .1;
+
+    assert_ne!(first_evidence.digest(), changed_evidence.digest());
+    assert_ne!(first_evidence.digest(), revised_evidence.digest());
+    assert_ne!(
+        first_evidence.capability_profile_digest(),
+        changed_evidence.capability_profile_digest()
+    );
 }
 
 #[test]
@@ -306,97 +471,165 @@ fn duplicate_ids_selectors_and_oversized_catalogs_fail_closed() {
         android_build: "google/redfin/redfin:13/TQ3A.230805.001/2:user/release-keys",
         ..SELECTOR
     };
-    let repeated_id = ReviewedAndroidMarkPolicyCatalogEntry {
+    let repeated_id = ReviewedAndroidPlatformProfileCatalogEntry {
         selector: different_selector,
         ..ENTRY
     };
     assert_eq!(
         validate_catalog(&[ENTRY, repeated_id]),
-        Err(ReviewedAndroidMarkPolicyCatalogError::DuplicateEntryId {
-            first: 0,
-            second: 1,
-        })
+        Err(
+            ReviewedAndroidPlatformProfileCatalogError::DuplicateEntryId {
+                first: 0,
+                second: 1,
+            }
+        )
     );
 
-    let repeated_selector = ReviewedAndroidMarkPolicyCatalogEntry {
+    let repeated_selector = ReviewedAndroidPlatformProfileCatalogEntry {
         id: "google-redfin-tq3a-20230805-v2",
         ..ENTRY
     };
     assert_eq!(
         validate_catalog(&[ENTRY, repeated_selector]),
-        Err(ReviewedAndroidMarkPolicyCatalogError::DuplicateSelector {
-            first: 0,
-            second: 1,
-        })
+        Err(
+            ReviewedAndroidPlatformProfileCatalogError::DuplicateSelector {
+                first: 0,
+                second: 1,
+            }
+        )
     );
 
-    let oversized = [ENTRY; MAX_REVIEWED_ANDROID_MARK_POLICY_CATALOG_ENTRIES + 1];
+    let oversized = [ENTRY; MAX_REVIEWED_ANDROID_PLATFORM_PROFILE_CATALOG_ENTRIES + 1];
     assert_eq!(
         validate_catalog(&oversized),
-        Err(ReviewedAndroidMarkPolicyCatalogError::TooManyEntries {
-            maximum: MAX_REVIEWED_ANDROID_MARK_POLICY_CATALOG_ENTRIES,
-            required_at_least: MAX_REVIEWED_ANDROID_MARK_POLICY_CATALOG_ENTRIES + 1,
+        Err(ReviewedAndroidPlatformProfileCatalogError::TooManyEntries {
+            maximum: MAX_REVIEWED_ANDROID_PLATFORM_PROFILE_CATALOG_ENTRIES,
+            required_at_least: MAX_REVIEWED_ANDROID_PLATFORM_PROFILE_CATALOG_ENTRIES + 1,
         })
     );
 }
 
 #[test]
 fn malformed_candidate_and_planes_fail_closed() {
-    let ineligible_candidate = ReviewedAndroidMarkPolicyCatalogEntry {
-        candidate_mask: 0xc000_0000,
-        proxy_value: 0x8000_0000,
-        bypass_value: 0x4000_0000,
+    let ineligible_candidate = ReviewedAndroidPlatformProfileCatalogEntry {
+        mark_policy: Some(ReviewedAndroidMarkPolicyLiteral {
+            candidate_mask: 0xc000_0000,
+            proxy_value: 0x8000_0000,
+            bypass_value: 0x4000_0000,
+            ..MARK_POLICY
+        }),
         ..ENTRY
     };
     assert_eq!(
         validate_catalog(&[ineligible_candidate]),
-        Err(ReviewedAndroidMarkPolicyCatalogError::InvalidEntry {
+        Err(ReviewedAndroidPlatformProfileCatalogError::InvalidEntry {
             index: 0,
-            field: ReviewedAndroidMarkPolicyCatalogField::Candidate,
+            field: ReviewedAndroidPlatformProfileCatalogField::MarkCandidate,
         })
     );
 
-    let unknown_planes = ReviewedAndroidMarkPolicyCatalogEntry {
-        planes: 0x80,
+    let unknown_planes = ReviewedAndroidPlatformProfileCatalogEntry {
+        mark_policy: Some(ReviewedAndroidMarkPolicyLiteral {
+            planes: 0x80,
+            ..MARK_POLICY
+        }),
         ..ENTRY
     };
     assert_eq!(
         validate_catalog(&[unknown_planes]),
-        Err(ReviewedAndroidMarkPolicyCatalogError::InvalidEntry {
+        Err(ReviewedAndroidPlatformProfileCatalogError::InvalidEntry {
             index: 0,
-            field: ReviewedAndroidMarkPolicyCatalogField::Planes,
+            field: ReviewedAndroidPlatformProfileCatalogField::MarkPlanes,
         })
     );
 
-    let empty_planes = ReviewedAndroidMarkPolicyCatalogEntry { planes: 0, ..ENTRY };
+    let empty_planes = ReviewedAndroidPlatformProfileCatalogEntry {
+        mark_policy: Some(ReviewedAndroidMarkPolicyLiteral {
+            planes: 0,
+            ..MARK_POLICY
+        }),
+        ..ENTRY
+    };
     assert_eq!(
         validate_catalog(&[empty_planes]),
-        Err(ReviewedAndroidMarkPolicyCatalogError::InvalidEntry {
+        Err(ReviewedAndroidPlatformProfileCatalogError::InvalidEntry {
             index: 0,
-            field: ReviewedAndroidMarkPolicyCatalogField::Planes,
+            field: ReviewedAndroidPlatformProfileCatalogField::MarkPlanes,
         })
     );
+}
+
+#[test]
+fn empty_or_malformed_capture_aspects_fail_closed() {
+    let empty = ReviewedAndroidPlatformProfileCatalogEntry {
+        mark_policy: None,
+        capture_path: None,
+        ..ENTRY
+    };
+    assert_eq!(
+        validate_catalog(&[empty]),
+        Err(ReviewedAndroidPlatformProfileCatalogError::InvalidEntry {
+            index: 0,
+            field: ReviewedAndroidPlatformProfileCatalogField::ProfileAspects,
+        })
+    );
+
+    for (capture_path, field) in [
+        (
+            ReviewedCapturePathEvidenceLiteral {
+                revision: 0,
+                ..CAPTURE_PATH_EVIDENCE
+            },
+            ReviewedAndroidPlatformProfileCatalogField::CapturePathEvidenceRevision,
+        ),
+        (
+            ReviewedCapturePathEvidenceLiteral {
+                artifact_digest: [0; 32],
+                ..CAPTURE_PATH_EVIDENCE
+            },
+            ReviewedAndroidPlatformProfileCatalogField::CapturePathEvidenceArtifactDigest,
+        ),
+        (
+            ReviewedCapturePathEvidenceLiteral {
+                qualifications: CapturePathQualifications::default(),
+                ..CAPTURE_PATH_EVIDENCE
+            },
+            ReviewedAndroidPlatformProfileCatalogField::CapturePathQualifications,
+        ),
+    ] {
+        let malformed = ReviewedAndroidPlatformProfileCatalogEntry {
+            capture_path: Some(capture_path),
+            ..ENTRY
+        };
+        assert_eq!(
+            validate_catalog(&[malformed]),
+            Err(ReviewedAndroidPlatformProfileCatalogError::InvalidEntry { index: 0, field })
+        );
+    }
 }
 
 #[test]
 fn malformed_unrelated_entry_poisoning_is_rejected_before_exact_selection() {
     let namespace = namespace(4, 40);
     let profile = capability_profile(namespace);
-    let malformed_unrelated = ReviewedAndroidMarkPolicyCatalogEntry {
+    let malformed_unrelated = ReviewedAndroidPlatformProfileCatalogEntry {
         id: "unrelated-invalid-entry",
         selector: ReviewedPolicySelectorLiteral {
             android_product: "other/product/device",
             ..SELECTOR
         },
-        policy_revision: 0,
+        mark_policy: Some(ReviewedAndroidMarkPolicyLiteral {
+            revision: 0,
+            ..MARK_POLICY
+        }),
         ..ENTRY
     };
 
     assert_eq!(
         select_from_catalog(&[ENTRY, malformed_unrelated], &profile, namespace),
-        Err(ReviewedAndroidMarkPolicyCatalogError::InvalidEntry {
+        Err(ReviewedAndroidPlatformProfileCatalogError::InvalidEntry {
             index: 1,
-            field: ReviewedAndroidMarkPolicyCatalogField::PolicyRevision,
+            field: ReviewedAndroidPlatformProfileCatalogField::MarkPolicyRevision,
         })
     );
 }
@@ -414,7 +647,7 @@ fn selection_rejects_unverified_boot_identity_and_namespace_drift() {
     assert_eq!(
         select_from_catalog(&[ENTRY], &unavailable_boot, profile_namespace,),
         Err(
-            ReviewedAndroidMarkPolicyCatalogError::UnverifiedBootIdentity {
+            ReviewedAndroidPlatformProfileCatalogError::UnverifiedBootIdentity {
                 observation: ObservationKind::Unavailable,
             }
         )
@@ -433,7 +666,7 @@ fn selection_rejects_unverified_boot_identity_and_namespace_drift() {
     assert_eq!(
         select_from_catalog(&[ENTRY], &unavailable, profile_namespace),
         Err(
-            ReviewedAndroidMarkPolicyCatalogError::UnverifiedDeviceIdentity {
+            ReviewedAndroidPlatformProfileCatalogError::UnverifiedDeviceIdentity {
                 observation: ObservationKind::Unavailable,
             }
         )
@@ -444,7 +677,7 @@ fn selection_rejects_unverified_boot_identity_and_namespace_drift() {
     assert_eq!(
         select_from_catalog(&[ENTRY], &profile, other_namespace),
         Err(
-            ReviewedAndroidMarkPolicyCatalogError::NetworkNamespaceMismatch {
+            ReviewedAndroidPlatformProfileCatalogError::NetworkNamespaceMismatch {
                 profile: profile_namespace,
                 observed: other_namespace,
             }

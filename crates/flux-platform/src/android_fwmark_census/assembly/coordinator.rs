@@ -6,14 +6,14 @@ use std::time::Duration;
 use flux_core::{
     AndroidMarkPlanningAuthority, AndroidMarkPlanningAuthorizationError, AndroidNetdSourceProfile,
     AndroidTproxyTopologyScopeError, AndroidTproxyTopologyScopeRequest, CapabilityProfile,
-    CapabilityProfileDigest, CapabilityProfileRevision, CompleteFwmarkCensus,
-    CompleteFwmarkCensusError, FwmarkCandidate, FwmarkCensusCollectorEvidenceDigest,
-    FwmarkCensusCollectorRevision, NetworkInventory, NetworkNamespaceIdentity, ObservationKind,
-    ReviewedAndroidMarkPolicyCatalogError, ReviewedPolicyCatalogEntryId,
-    RpdbFwmarkCensusFragmentError, assess_android_tproxy_topology_scope,
-    authorize_android_mark_planning, classify_android_rpdb,
+    CapabilityProfileDigest, CapabilityProfileRevision, CapturePathBehavioralEvidence,
+    CompleteFwmarkCensus, CompleteFwmarkCensusError, FwmarkCandidate,
+    FwmarkCensusCollectorEvidenceDigest, FwmarkCensusCollectorRevision, NetworkInventory,
+    NetworkNamespaceIdentity, ObservationKind, ReviewedAndroidPlatformProfileCatalogError,
+    ReviewedPolicyCatalogEntryId, RpdbFwmarkCensusFragmentError,
+    assess_android_tproxy_topology_scope, authorize_android_mark_planning, classify_android_rpdb,
     project_android_net_id_fwmark_census_fragment, project_rpdb_fwmark_census_fragment,
-    select_reviewed_android_mark_policy,
+    select_reviewed_android_platform_profile,
 };
 use sha2::{Digest, Sha256};
 
@@ -328,16 +328,19 @@ where
 pub struct AndroidFwmarkCensusPlanningEvidence {
     mark_authority: AndroidMarkPlanningAuthority,
     kernel_config: Arc<AndroidKernelConfigSnapshot>,
+    capture_path_evidence: CapturePathBehavioralEvidence,
 }
 
 impl AndroidFwmarkCensusPlanningEvidence {
     fn new(
         mark_authority: AndroidMarkPlanningAuthority,
         kernel_config: Arc<AndroidKernelConfigSnapshot>,
+        capture_path_evidence: CapturePathBehavioralEvidence,
     ) -> Self {
         Self {
             mark_authority,
             kernel_config,
+            capture_path_evidence,
         }
     }
 
@@ -352,13 +355,23 @@ impl AndroidFwmarkCensusPlanningEvidence {
     }
 
     #[must_use]
+    pub const fn capture_path_evidence(&self) -> &CapturePathBehavioralEvidence {
+        &self.capture_path_evidence
+    }
+
+    #[must_use]
     pub fn into_parts(
         self,
     ) -> (
         AndroidMarkPlanningAuthority,
         Arc<AndroidKernelConfigSnapshot>,
+        CapturePathBehavioralEvidence,
     ) {
-        (self.mark_authority, self.kernel_config)
+        (
+            self.mark_authority,
+            self.kernel_config,
+            self.capture_path_evidence,
+        )
     }
 }
 
@@ -416,7 +429,7 @@ pub enum AndroidFwmarkCensusCoordinatorError<E> {
         before: AndroidFwmarkCensusExternalSnapshotDigest,
         after: AndroidFwmarkCensusExternalSnapshotDigest,
     },
-    Policy(ReviewedAndroidMarkPolicyCatalogError),
+    PlatformProfile(ReviewedAndroidPlatformProfileCatalogError),
     SelectedNetdSourceProfileMismatch {
         selected: AndroidNetdSourceProfile,
         requested: AndroidNetdSourceProfile,
@@ -437,7 +450,7 @@ impl<E> AndroidFwmarkCensusCoordinatorError<E> {
             | Self::CapabilityDrift { .. }
             | Self::ExternalSnapshotContextMismatch { .. }
             | Self::ExternalSnapshotDrift { .. }
-            | Self::Policy(_)
+            | Self::PlatformProfile(_)
             | Self::SelectedNetdSourceProfileMismatch { .. }
             | Self::Topology(_)
             | Self::Rpdb(_)
@@ -489,7 +502,9 @@ impl<E: fmt::Display> fmt::Display for AndroidFwmarkCensusCoordinatorError<E> {
             Self::ExternalSnapshotDrift { .. } => formatter.write_str(
                 "Android fwmark census external snapshots differ across the native inventory transaction",
             ),
-            Self::Policy(error) => write!(formatter, "Android mark policy binding failed: {error}"),
+            Self::PlatformProfile(error) => {
+                write!(formatter, "Android platform-profile binding failed: {error}")
+            }
             Self::SelectedNetdSourceProfileMismatch {
                 selected,
                 requested,
@@ -514,7 +529,7 @@ impl<E: Error + 'static> Error for AndroidFwmarkCensusCoordinatorError<E> {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Collection { source, .. } => Some(source),
-            Self::Policy(error) => Some(error),
+            Self::PlatformProfile(error) => Some(error),
             Self::Topology(error) => Some(error.as_ref()),
             Self::Rpdb(error) => Some(error),
             Self::Assembly(error) => Some(error),
@@ -554,10 +569,10 @@ pub fn coordinate_android_fwmark_census<S: AndroidFwmarkCensusCoordinatorSource>
                 observation: capability_before.device_identity().kind(),
             }
         })?;
-    let policy_selection =
-        select_reviewed_android_mark_policy(&capability_before, network_namespace)
-            .map_err(AndroidFwmarkCensusCoordinatorError::Policy)?;
-    if let Some(selected) = policy_selection.netd_source_profile()
+    let platform_profile_selection =
+        select_reviewed_android_platform_profile(&capability_before, network_namespace)
+            .map_err(AndroidFwmarkCensusCoordinatorError::PlatformProfile)?;
+    if let Some(selected) = platform_profile_selection.netd_source_profile()
         && selected != request.netd_source_profile
     {
         return Err(
@@ -573,7 +588,7 @@ pub fn coordinate_android_fwmark_census<S: AndroidFwmarkCensusCoordinatorSource>
             AndroidFwmarkCensusExternalPhase::Before,
             request.netd_source_profile,
             request.candidate,
-            policy_selection.catalog_entry(),
+            platform_profile_selection.mark_policy_catalog_entry(),
             request.stage_bound,
         )
         .map_err(|source| AndroidFwmarkCensusCoordinatorError::Collection {
@@ -608,7 +623,7 @@ pub fn coordinate_android_fwmark_census<S: AndroidFwmarkCensusCoordinatorSource>
             AndroidFwmarkCensusExternalPhase::After,
             request.netd_source_profile,
             request.candidate,
-            policy_selection.catalog_entry(),
+            platform_profile_selection.mark_policy_catalog_entry(),
             request.stage_bound,
         )
         .map_err(|source| AndroidFwmarkCensusCoordinatorError::Collection {
@@ -646,9 +661,10 @@ pub fn coordinate_android_fwmark_census<S: AndroidFwmarkCensusCoordinatorSource>
     let topology_scope =
         assess_android_tproxy_topology_scope(&inventory, &classification, &request.topology_scope)
             .map_err(|error| AndroidFwmarkCensusCoordinatorError::Topology(Box::new(error)))?;
-    let device_policy = policy_selection
+    let bound_platform_profile = platform_profile_selection
         .bind_topology(&topology_scope)
-        .map_err(AndroidFwmarkCensusCoordinatorError::Policy)?;
+        .map_err(AndroidFwmarkCensusCoordinatorError::PlatformProfile)?;
+    let (device_policy, capture_path_evidence) = bound_platform_profile.into_parts();
     let android_net_id = project_android_net_id_fwmark_census_fragment(request.netd_source_profile);
     let rpdb = project_rpdb_fwmark_census_fragment(&inventory)
         .map_err(AndroidFwmarkCensusCoordinatorError::Rpdb)?;
@@ -704,6 +720,7 @@ pub fn coordinate_android_fwmark_census<S: AndroidFwmarkCensusCoordinatorSource>
         Box::new(AndroidFwmarkCensusPlanningEvidence::new(
             authority,
             Arc::clone(&external_before.kernel_config),
+            capture_path_evidence,
         )),
     ))
 }

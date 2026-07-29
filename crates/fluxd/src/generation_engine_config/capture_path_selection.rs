@@ -3,11 +3,11 @@ use std::fmt;
 use std::time::{Duration, Instant};
 
 use flux_core::{
-    AddressHostFamilySelection, CaptureConfig, CapturePathId, CapturePathRequest,
+    AddressHostFamilySelection, CAPTURE_PATH_COUNT, CaptureConfig, CapturePathBehavioralEvidence,
+    CapturePathId, CapturePathQualificationState, CapturePathQualifications, CapturePathRequest,
     CaptureTrafficDomain, CaptureTransportProtocol, ImplementedCaptureAdapters,
 };
 use flux_platform::{
-    ANDROID_CAPTURE_PATH_COUNT, AndroidCapturePathProbeState, AndroidCapturePathQualifications,
     AndroidCapturePathState, AndroidKernelConfigSnapshot, AndroidKernelFeature,
     AndroidKernelFeatureState, select_android_capture_path,
 };
@@ -28,16 +28,23 @@ pub(crate) const PRODUCTION_IMPLEMENTED_CAPTURE_ADAPTERS: ImplementedCaptureAdap
 pub(crate) const PRODUCTION_CAPTURE_PATH_SELECTOR: CapturePathSelector =
     CapturePathSelector::new(PRODUCTION_IMPLEMENTED_CAPTURE_ADAPTERS);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CapturePathQualificationEvidence {
-    qualifications: AndroidCapturePathQualifications,
+    source: CapturePathQualificationSource,
     observed_at: Instant,
     valid_until: Instant,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CapturePathQualificationSource {
+    Android(CapturePathBehavioralEvidence),
+    #[cfg(test)]
+    HostInspection(CapturePathQualifications),
+}
+
 impl CapturePathQualificationEvidence {
     pub(crate) fn new(
-        qualifications: AndroidCapturePathQualifications,
+        evidence: CapturePathBehavioralEvidence,
         observed_at: Instant,
         valid_until: Instant,
     ) -> Result<Self, CapturePathQualificationEvidenceError> {
@@ -49,28 +56,90 @@ impl CapturePathQualificationEvidence {
             return Err(CapturePathQualificationEvidenceError::LifetimeExceedsMaximum { lifetime });
         }
         Ok(Self {
-            qualifications,
+            source: CapturePathQualificationSource::Android(evidence),
             observed_at,
             valid_until,
         })
     }
 
     pub(crate) fn with_maximum_lifetime(
-        qualifications: AndroidCapturePathQualifications,
+        evidence: CapturePathBehavioralEvidence,
         observed_at: Instant,
     ) -> Result<Self, CapturePathQualificationEvidenceError> {
         let valid_until = observed_at
             .checked_add(CAPTURE_PATH_QUALIFICATION_EVIDENCE_MAX_AGE)
             .ok_or(CapturePathQualificationEvidenceError::DeadlineOverflow)?;
-        Self::new(qualifications, observed_at, valid_until)
+        Self::new(evidence, observed_at, valid_until)
     }
 
-    pub(crate) const fn qualifications(self) -> AndroidCapturePathQualifications {
-        self.qualifications
+    #[cfg(test)]
+    pub(crate) fn host_inspection(
+        qualifications: CapturePathQualifications,
+        observed_at: Instant,
+        valid_until: Instant,
+    ) -> Result<Self, CapturePathQualificationEvidenceError> {
+        let lifetime = valid_until
+            .checked_duration_since(observed_at)
+            .filter(|lifetime| !lifetime.is_zero())
+            .ok_or(CapturePathQualificationEvidenceError::NonPositiveLifetime)?;
+        if lifetime > CAPTURE_PATH_QUALIFICATION_EVIDENCE_MAX_AGE {
+            return Err(CapturePathQualificationEvidenceError::LifetimeExceedsMaximum { lifetime });
+        }
+        Ok(Self {
+            source: CapturePathQualificationSource::HostInspection(qualifications),
+            observed_at,
+            valid_until,
+        })
     }
 
-    pub(crate) const fn valid_until(self) -> Instant {
+    #[cfg(test)]
+    pub(crate) fn host_inspection_with_maximum_lifetime(
+        qualifications: CapturePathQualifications,
+        observed_at: Instant,
+    ) -> Result<Self, CapturePathQualificationEvidenceError> {
+        let valid_until = observed_at
+            .checked_add(CAPTURE_PATH_QUALIFICATION_EVIDENCE_MAX_AGE)
+            .ok_or(CapturePathQualificationEvidenceError::DeadlineOverflow)?;
+        Self::host_inspection(qualifications, observed_at, valid_until)
+    }
+
+    pub(crate) const fn qualifications(&self) -> CapturePathQualifications {
+        match &self.source {
+            CapturePathQualificationSource::Android(evidence) => evidence.qualifications(),
+            #[cfg(test)]
+            CapturePathQualificationSource::HostInspection(qualifications) => *qualifications,
+        }
+    }
+
+    pub(crate) const fn valid_until(&self) -> Instant {
         self.valid_until
+    }
+
+    fn matches_candidate(&self, candidate: &TproxyGenerationCandidate) -> bool {
+        match &self.source {
+            CapturePathQualificationSource::Android(evidence) => {
+                let profile = candidate.device_profile();
+                evidence.capability_profile_digest() == profile.digest()
+                    && profile
+                        .device_identity()
+                        .verified()
+                        .is_some_and(|identity| {
+                            evidence.network_namespace() == identity.network_namespace()
+                        })
+            }
+            #[cfg(test)]
+            CapturePathQualificationSource::HostInspection(_) => true,
+        }
+    }
+
+    pub(crate) fn behavioral_digest(&self) -> Option<[u8; 32]> {
+        match &self.source {
+            CapturePathQualificationSource::Android(evidence) => {
+                Some(*evidence.digest().as_bytes())
+            }
+            #[cfg(test)]
+            CapturePathQualificationSource::HostInspection(_) => None,
+        }
     }
 }
 
@@ -158,7 +227,7 @@ impl CapturePathKernelGap {
 pub struct CapturePathCandidateStatus {
     path: CapturePathId,
     state: AndroidCapturePathState,
-    probe_state: AndroidCapturePathProbeState,
+    qualification_state: CapturePathQualificationState,
     first_kernel_gap: Option<CapturePathKernelGap>,
 }
 
@@ -174,8 +243,8 @@ impl CapturePathCandidateStatus {
     }
 
     #[must_use]
-    pub const fn probe_state(self) -> AndroidCapturePathProbeState {
-        self.probe_state
+    pub const fn qualification_state(self) -> CapturePathQualificationState {
+        self.qualification_state
     }
 
     #[must_use]
@@ -187,20 +256,20 @@ impl CapturePathCandidateStatus {
     pub(crate) const fn from_status_parts(
         path: CapturePathId,
         state: AndroidCapturePathState,
-        probe_state: AndroidCapturePathProbeState,
+        qualification_state: CapturePathQualificationState,
         first_kernel_gap: Option<CapturePathKernelGap>,
     ) -> Self {
         Self {
             path,
             state,
-            probe_state,
+            qualification_state,
             first_kernel_gap,
         }
     }
 
     fn has_coherent_authorizing_evidence(self) -> bool {
         self.state != AndroidCapturePathState::Qualified
-            || (self.probe_state == AndroidCapturePathProbeState::Qualified
+            || (self.qualification_state == CapturePathQualificationState::Qualified
                 && !matches!(
                     self.first_kernel_gap,
                     Some(CapturePathKernelGap {
@@ -220,7 +289,7 @@ pub struct CapturePathSelection {
     request: CapturePathRequest,
     selected: CapturePathId,
     reason: CapturePathSelectionReason,
-    candidates: [CapturePathCandidateStatus; ANDROID_CAPTURE_PATH_COUNT],
+    candidates: [CapturePathCandidateStatus; CAPTURE_PATH_COUNT],
     evidence_digest: CapturePathSelectionEvidenceDigest,
 }
 
@@ -232,7 +301,7 @@ pub struct CapturePathSelection {
 pub struct CapturePathRejection {
     request: CapturePathRequest,
     reason: CapturePathRejectionReason,
-    candidates: [CapturePathCandidateStatus; ANDROID_CAPTURE_PATH_COUNT],
+    candidates: [CapturePathCandidateStatus; CAPTURE_PATH_COUNT],
     evidence_digest: CapturePathSelectionEvidenceDigest,
 }
 
@@ -245,11 +314,12 @@ pub enum CapturePathRejectionReason {
     },
     QualificationEvidenceNotYetObserved,
     QualificationEvidenceExpired,
+    QualificationEvidenceContextMismatch,
     InvalidDecision,
 }
 
 impl CapturePathQualificationEvidence {
-    fn rejection_at(self, evaluated_at: Instant) -> Option<CapturePathRejectionReason> {
+    fn rejection_at(&self, evaluated_at: Instant) -> Option<CapturePathRejectionReason> {
         if evaluated_at < self.observed_at {
             Some(CapturePathRejectionReason::QualificationEvidenceNotYetObserved)
         } else if evaluated_at >= self.valid_until {
@@ -286,7 +356,7 @@ struct SerializedCapturePathSelection {
     request: String,
     selected: String,
     reason: SerializedCapturePathSelectionReason,
-    candidates: [SerializedCapturePathCandidate; ANDROID_CAPTURE_PATH_COUNT],
+    candidates: [SerializedCapturePathCandidate; CAPTURE_PATH_COUNT],
     evidence_digest: String,
 }
 
@@ -295,7 +365,7 @@ struct SerializedCapturePathSelection {
 struct SerializedCapturePathRejection {
     request: String,
     reason: SerializedCapturePathRejectionReason,
-    candidates: [SerializedCapturePathCandidate; ANDROID_CAPTURE_PATH_COUNT],
+    candidates: [SerializedCapturePathCandidate; CAPTURE_PATH_COUNT],
     evidence_digest: String,
 }
 
@@ -309,6 +379,7 @@ enum SerializedCapturePathRejectionReason {
     },
     QualificationEvidenceNotYetObserved,
     QualificationEvidenceExpired,
+    QualificationEvidenceContextMismatch,
     InvalidDecision,
 }
 
@@ -324,13 +395,13 @@ enum SerializedCapturePathSelectionReason {
 struct SerializedCapturePathCandidate {
     path: String,
     state: SerializedCapturePathState,
-    probe_state: SerializedCapturePathProbeState,
+    qualification_state: SerializedCapturePathQualificationState,
     first_kernel_gap: Option<SerializedCapturePathKernelGap>,
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum SerializedCapturePathProbeState {
+enum SerializedCapturePathQualificationState {
     Qualified,
     Unsupported,
     Denied,
@@ -457,6 +528,9 @@ impl From<CapturePathRejectionReason> for SerializedCapturePathRejectionReason {
             CapturePathRejectionReason::QualificationEvidenceExpired => {
                 Self::QualificationEvidenceExpired
             }
+            CapturePathRejectionReason::QualificationEvidenceContextMismatch => {
+                Self::QualificationEvidenceContextMismatch
+            }
             CapturePathRejectionReason::InvalidDecision => Self::InvalidDecision,
         }
     }
@@ -480,6 +554,9 @@ impl TryFrom<SerializedCapturePathRejectionReason> for CapturePathRejectionReaso
             SerializedCapturePathRejectionReason::QualificationEvidenceExpired => {
                 Self::QualificationEvidenceExpired
             }
+            SerializedCapturePathRejectionReason::QualificationEvidenceContextMismatch => {
+                Self::QualificationEvidenceContextMismatch
+            }
             SerializedCapturePathRejectionReason::InvalidDecision => Self::InvalidDecision,
         })
     }
@@ -490,7 +567,7 @@ impl From<CapturePathCandidateStatus> for SerializedCapturePathCandidate {
         Self {
             path: candidate.path.as_token().to_owned(),
             state: candidate.state.into(),
-            probe_state: candidate.probe_state.into(),
+            qualification_state: candidate.qualification_state.into(),
             first_kernel_gap: candidate.first_kernel_gap.map(|gap| {
                 SerializedCapturePathKernelGap {
                     config_symbol: gap.feature.config_symbol().to_owned(),
@@ -508,7 +585,7 @@ impl TryFrom<SerializedCapturePathCandidate> for CapturePathCandidateStatus {
         let candidate = Self::from_status_parts(
             parse_capture_path(&candidate.path)?,
             candidate.state.into(),
-            candidate.probe_state.into(),
+            candidate.qualification_state.into(),
             candidate
                 .first_kernel_gap
                 .map(|gap| {
@@ -533,28 +610,28 @@ impl TryFrom<SerializedCapturePathCandidate> for CapturePathCandidateStatus {
     }
 }
 
-impl From<AndroidCapturePathProbeState> for SerializedCapturePathProbeState {
-    fn from(state: AndroidCapturePathProbeState) -> Self {
+impl From<CapturePathQualificationState> for SerializedCapturePathQualificationState {
+    fn from(state: CapturePathQualificationState) -> Self {
         match state {
-            AndroidCapturePathProbeState::Qualified => Self::Qualified,
-            AndroidCapturePathProbeState::Unsupported => Self::Unsupported,
-            AndroidCapturePathProbeState::Denied => Self::Denied,
-            AndroidCapturePathProbeState::Conflicting => Self::Conflicting,
-            AndroidCapturePathProbeState::Broken => Self::Broken,
-            AndroidCapturePathProbeState::Unqualified => Self::Unqualified,
+            CapturePathQualificationState::Qualified => Self::Qualified,
+            CapturePathQualificationState::Unsupported => Self::Unsupported,
+            CapturePathQualificationState::Denied => Self::Denied,
+            CapturePathQualificationState::Conflicting => Self::Conflicting,
+            CapturePathQualificationState::Broken => Self::Broken,
+            CapturePathQualificationState::Unqualified => Self::Unqualified,
         }
     }
 }
 
-impl From<SerializedCapturePathProbeState> for AndroidCapturePathProbeState {
-    fn from(state: SerializedCapturePathProbeState) -> Self {
+impl From<SerializedCapturePathQualificationState> for CapturePathQualificationState {
+    fn from(state: SerializedCapturePathQualificationState) -> Self {
         match state {
-            SerializedCapturePathProbeState::Qualified => Self::Qualified,
-            SerializedCapturePathProbeState::Unsupported => Self::Unsupported,
-            SerializedCapturePathProbeState::Denied => Self::Denied,
-            SerializedCapturePathProbeState::Conflicting => Self::Conflicting,
-            SerializedCapturePathProbeState::Broken => Self::Broken,
-            SerializedCapturePathProbeState::Unqualified => Self::Unqualified,
+            SerializedCapturePathQualificationState::Qualified => Self::Qualified,
+            SerializedCapturePathQualificationState::Unsupported => Self::Unsupported,
+            SerializedCapturePathQualificationState::Denied => Self::Denied,
+            SerializedCapturePathQualificationState::Conflicting => Self::Conflicting,
+            SerializedCapturePathQualificationState::Broken => Self::Broken,
+            SerializedCapturePathQualificationState::Unqualified => Self::Unqualified,
         }
     }
 }
@@ -677,7 +754,7 @@ impl CapturePathSelection {
     }
 
     #[must_use]
-    pub const fn candidates(&self) -> &[CapturePathCandidateStatus; ANDROID_CAPTURE_PATH_COUNT] {
+    pub const fn candidates(&self) -> &[CapturePathCandidateStatus; CAPTURE_PATH_COUNT] {
         &self.candidates
     }
 
@@ -690,7 +767,7 @@ impl CapturePathSelection {
         request: CapturePathRequest,
         selected: CapturePathId,
         reason: CapturePathSelectionReason,
-        candidates: [CapturePathCandidateStatus; ANDROID_CAPTURE_PATH_COUNT],
+        candidates: [CapturePathCandidateStatus; CAPTURE_PATH_COUNT],
         evidence_digest: CapturePathSelectionEvidenceDigest,
     ) -> Result<Self, CapturePathSelectionStatusError> {
         if candidates.map(CapturePathCandidateStatus::path) != CapturePathId::ALL {
@@ -750,7 +827,7 @@ impl CapturePathRejection {
     }
 
     #[must_use]
-    pub const fn candidates(&self) -> &[CapturePathCandidateStatus; ANDROID_CAPTURE_PATH_COUNT] {
+    pub const fn candidates(&self) -> &[CapturePathCandidateStatus; CAPTURE_PATH_COUNT] {
         &self.candidates
     }
 
@@ -762,7 +839,7 @@ impl CapturePathRejection {
     fn try_from_status_parts(
         request: CapturePathRequest,
         reason: CapturePathRejectionReason,
-        candidates: [CapturePathCandidateStatus; ANDROID_CAPTURE_PATH_COUNT],
+        candidates: [CapturePathCandidateStatus; CAPTURE_PATH_COUNT],
         evidence_digest: CapturePathSelectionEvidenceDigest,
     ) -> Result<Self, CapturePathSelectionStatusError> {
         if candidates.map(CapturePathCandidateStatus::path) != CapturePathId::ALL {
@@ -790,7 +867,8 @@ impl CapturePathRejection {
             (
                 _,
                 CapturePathRejectionReason::QualificationEvidenceNotYetObserved
-                | CapturePathRejectionReason::QualificationEvidenceExpired,
+                | CapturePathRejectionReason::QualificationEvidenceExpired
+                | CapturePathRejectionReason::QualificationEvidenceContextMismatch,
             ) => {}
             (_, CapturePathRejectionReason::InvalidDecision) => {}
             _ => return Err(CapturePathSelectionStatusError::RejectionMismatch),
@@ -830,7 +908,7 @@ impl CapturePathDecision {
     }
 
     #[must_use]
-    pub const fn candidates(&self) -> &[CapturePathCandidateStatus; ANDROID_CAPTURE_PATH_COUNT] {
+    pub const fn candidates(&self) -> &[CapturePathCandidateStatus; CAPTURE_PATH_COUNT] {
         match self {
             Self::Selected { selection } => selection.candidates(),
             Self::Rejected { rejection } => rejection.candidates(),
@@ -861,7 +939,7 @@ pub(crate) struct CapturePathSelectionInput<'a> {
     capture: CaptureConfig,
     candidate: &'a TproxyGenerationCandidate,
     kernel_config: &'a AndroidKernelConfigSnapshot,
-    qualification_evidence: CapturePathQualificationEvidence,
+    qualification_evidence: &'a CapturePathQualificationEvidence,
     planning_evidence_digest: &'a [u8; CAPTURE_PATH_SELECTION_EVIDENCE_DIGEST_BYTES],
 }
 
@@ -871,7 +949,7 @@ impl<'a> CapturePathSelectionInput<'a> {
         capture: CaptureConfig,
         candidate: &'a TproxyGenerationCandidate,
         kernel_config: &'a AndroidKernelConfigSnapshot,
-        qualification_evidence: CapturePathQualificationEvidence,
+        qualification_evidence: &'a CapturePathQualificationEvidence,
         planning_evidence_digest: &'a [u8; CAPTURE_PATH_SELECTION_EVIDENCE_DIGEST_BYTES],
     ) -> Self {
         Self {
@@ -912,11 +990,22 @@ impl CapturePathSelector {
             .map(|candidate| CapturePathCandidateStatus {
                 path: candidate.path(),
                 state: candidate.state(),
-                probe_state: candidate.probe_state(),
+                qualification_state: candidate.qualification_state(),
                 first_kernel_gap: candidate
                     .first_kernel_gap()
                     .map(|(feature, state)| CapturePathKernelGap { feature, state }),
             });
+        if !input
+            .qualification_evidence
+            .matches_candidate(input.candidate)
+        {
+            return Err(selection_error(
+                input,
+                self.implemented_adapters,
+                CapturePathRejectionReason::QualificationEvidenceContextMismatch,
+                candidates,
+            ));
+        }
         if let Some(reason) = input.qualification_evidence.rejection_at(Instant::now()) {
             return Err(selection_error(
                 input,
@@ -974,7 +1063,7 @@ fn selection_error(
     input: CapturePathSelectionInput<'_>,
     implemented_adapters: ImplementedCaptureAdapters,
     reason: CapturePathRejectionReason,
-    candidates: [CapturePathCandidateStatus; ANDROID_CAPTURE_PATH_COUNT],
+    candidates: [CapturePathCandidateStatus; CAPTURE_PATH_COUNT],
 ) -> CapturePathSelectionError {
     let evidence_digest = digest_capture_path_decision(
         input,
@@ -1014,9 +1103,7 @@ impl CapturePathSelectionError {
 
     #[cfg(test)]
     #[must_use]
-    pub(crate) const fn candidates(
-        &self,
-    ) -> &[CapturePathCandidateStatus; ANDROID_CAPTURE_PATH_COUNT] {
+    pub(crate) const fn candidates(&self) -> &[CapturePathCandidateStatus; CAPTURE_PATH_COUNT] {
         self.rejection.candidates()
     }
 
@@ -1037,6 +1124,10 @@ impl fmt::Display for CapturePathSelectionError {
             CapturePathRejectionReason::QualificationEvidenceExpired => {
                 formatter.write_str("Capture Path qualification evidence expired")
             }
+            CapturePathRejectionReason::QualificationEvidenceContextMismatch => formatter
+                .write_str(
+                    "Capture Path qualification evidence identifies a different runtime context",
+                ),
             CapturePathRejectionReason::ExactPathUnavailable { path, state } => write!(
                 formatter,
                 "exact Capture Path {} is unavailable ({state:?}); no fallback is permitted",
@@ -1076,11 +1167,11 @@ CONFIG_NF_TPROXY_IPV6=y\n",
 
 #[cfg(test)]
 pub(crate) fn qualified_xtables_capture_path_evidence() -> CapturePathQualificationEvidence {
-    CapturePathQualificationEvidence::with_maximum_lifetime(
-        AndroidCapturePathQualifications::new(
-            AndroidCapturePathProbeState::Unqualified,
-            AndroidCapturePathProbeState::Qualified,
-            AndroidCapturePathProbeState::Unqualified,
+    CapturePathQualificationEvidence::host_inspection_with_maximum_lifetime(
+        CapturePathQualifications::new(
+            CapturePathQualificationState::Unqualified,
+            CapturePathQualificationState::Qualified,
+            CapturePathQualificationState::Unqualified,
         ),
         Instant::now(),
     )
@@ -1097,19 +1188,19 @@ pub(crate) fn test_xtables_capture_path_selection() -> CapturePathSelection {
             CapturePathCandidateStatus::from_status_parts(
                 CapturePathId::NftablesTproxy,
                 AndroidCapturePathState::Unimplemented,
-                AndroidCapturePathProbeState::Unqualified,
+                CapturePathQualificationState::Unqualified,
                 None,
             ),
             CapturePathCandidateStatus::from_status_parts(
                 CapturePathId::XtablesTproxy,
                 AndroidCapturePathState::Qualified,
-                AndroidCapturePathProbeState::Qualified,
+                CapturePathQualificationState::Qualified,
                 None,
             ),
             CapturePathCandidateStatus::from_status_parts(
                 CapturePathId::ManagedTun,
                 AndroidCapturePathState::Unimplemented,
-                AndroidCapturePathProbeState::Unqualified,
+                CapturePathQualificationState::Unqualified,
                 None,
             ),
         ],
@@ -1135,19 +1226,19 @@ pub(crate) fn test_unqualified_capture_path_decision() -> CapturePathDecision {
                 CapturePathCandidateStatus::from_status_parts(
                     CapturePathId::NftablesTproxy,
                     AndroidCapturePathState::Unimplemented,
-                    AndroidCapturePathProbeState::Unqualified,
+                    CapturePathQualificationState::Unqualified,
                     None,
                 ),
                 CapturePathCandidateStatus::from_status_parts(
                     CapturePathId::XtablesTproxy,
                     AndroidCapturePathState::Unqualified,
-                    AndroidCapturePathProbeState::Unqualified,
+                    CapturePathQualificationState::Unqualified,
                     None,
                 ),
                 CapturePathCandidateStatus::from_status_parts(
                     CapturePathId::ManagedTun,
                     AndroidCapturePathState::Unimplemented,
-                    AndroidCapturePathProbeState::Unqualified,
+                    CapturePathQualificationState::Unqualified,
                     None,
                 ),
             ],
@@ -1170,7 +1261,7 @@ fn digest_capture_path_decision(
     input: CapturePathSelectionInput<'_>,
     implemented_adapters: ImplementedCaptureAdapters,
     outcome: CapturePathDecisionDigestOutcome,
-    candidates: &[CapturePathCandidateStatus; ANDROID_CAPTURE_PATH_COUNT],
+    candidates: &[CapturePathCandidateStatus; CAPTURE_PATH_COUNT],
 ) -> CapturePathSelectionEvidenceDigest {
     let mut digest = Sha256::new();
     digest.update(CAPTURE_PATH_SELECTION_EVIDENCE_DIGEST_DOMAIN);
@@ -1234,6 +1325,13 @@ fn digest_capture_path_decision(
         input.candidate.engine_config().digest().as_bytes(),
     );
     update_field(&mut digest, input.planning_evidence_digest);
+    match input.qualification_evidence.behavioral_digest() {
+        Some(evidence_digest) => {
+            digest.update([1]);
+            update_field(&mut digest, &evidence_digest);
+        }
+        None => digest.update([0]),
+    }
     match outcome {
         CapturePathDecisionDigestOutcome::Selected { selected, reason } => {
             digest.update([0, capture_path_tag(selected), selection_reason_tag(reason)]);
@@ -1249,7 +1347,7 @@ fn digest_capture_path_decision(
         digest.update([
             capture_path_tag(candidate.path),
             capture_path_state_tag(candidate.state),
-            capture_path_probe_state_tag(candidate.probe_state),
+            capture_path_qualification_state_tag(candidate.qualification_state),
         ]);
         match candidate.first_kernel_gap {
             Some(gap) => {
@@ -1295,18 +1393,19 @@ const fn rejection_reason_tag(reason: CapturePathRejectionReason) -> u8 {
         CapturePathRejectionReason::ExactPathUnavailable { .. } => 1,
         CapturePathRejectionReason::QualificationEvidenceNotYetObserved => 2,
         CapturePathRejectionReason::QualificationEvidenceExpired => 3,
-        CapturePathRejectionReason::InvalidDecision => 4,
+        CapturePathRejectionReason::QualificationEvidenceContextMismatch => 4,
+        CapturePathRejectionReason::InvalidDecision => 5,
     }
 }
 
-const fn capture_path_probe_state_tag(state: AndroidCapturePathProbeState) -> u8 {
+const fn capture_path_qualification_state_tag(state: CapturePathQualificationState) -> u8 {
     match state {
-        AndroidCapturePathProbeState::Qualified => 0,
-        AndroidCapturePathProbeState::Unsupported => 1,
-        AndroidCapturePathProbeState::Denied => 2,
-        AndroidCapturePathProbeState::Conflicting => 3,
-        AndroidCapturePathProbeState::Broken => 4,
-        AndroidCapturePathProbeState::Unqualified => 5,
+        CapturePathQualificationState::Qualified => 0,
+        CapturePathQualificationState::Unsupported => 1,
+        CapturePathQualificationState::Denied => 2,
+        CapturePathQualificationState::Conflicting => 3,
+        CapturePathQualificationState::Broken => 4,
+        CapturePathQualificationState::Unqualified => 5,
     }
 }
 
@@ -1336,11 +1435,11 @@ const fn kernel_feature_state_tag(state: AndroidKernelFeatureState) -> u8 {
 mod qualification_evidence_tests {
     use super::*;
 
-    fn qualifications() -> AndroidCapturePathQualifications {
-        AndroidCapturePathQualifications::new(
-            AndroidCapturePathProbeState::Unqualified,
-            AndroidCapturePathProbeState::Qualified,
-            AndroidCapturePathProbeState::Unqualified,
+    fn qualifications() -> CapturePathQualifications {
+        CapturePathQualifications::new(
+            CapturePathQualificationState::Unqualified,
+            CapturePathQualificationState::Qualified,
+            CapturePathQualificationState::Unqualified,
         )
     }
 
@@ -1349,7 +1448,11 @@ mod qualification_evidence_tests {
         let observed_at = Instant::now();
 
         assert_eq!(
-            CapturePathQualificationEvidence::new(qualifications(), observed_at, observed_at,),
+            CapturePathQualificationEvidence::host_inspection(
+                qualifications(),
+                observed_at,
+                observed_at,
+            ),
             Err(CapturePathQualificationEvidenceError::NonPositiveLifetime)
         );
     }
@@ -1365,7 +1468,11 @@ mod qualification_evidence_tests {
             .expect("test deadline remains representable");
 
         assert_eq!(
-            CapturePathQualificationEvidence::new(qualifications(), observed_at, valid_until,),
+            CapturePathQualificationEvidence::host_inspection(
+                qualifications(),
+                observed_at,
+                valid_until,
+            ),
             Err(CapturePathQualificationEvidenceError::LifetimeExceedsMaximum { lifetime })
         );
     }
@@ -1378,9 +1485,12 @@ mod qualification_evidence_tests {
         let valid_until = observed_at
             .checked_add(Duration::from_secs(30))
             .expect("test deadline remains representable");
-        let evidence =
-            CapturePathQualificationEvidence::new(qualifications(), observed_at, valid_until)
-                .expect("test evidence lifetime is valid");
+        let evidence = CapturePathQualificationEvidence::host_inspection(
+            qualifications(),
+            observed_at,
+            valid_until,
+        )
+        .expect("test evidence lifetime is valid");
 
         assert_eq!(
             evidence.rejection_at(

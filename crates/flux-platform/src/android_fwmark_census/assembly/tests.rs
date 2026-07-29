@@ -13,7 +13,7 @@ use flux_core::{
     SelinuxMode, SelinuxPolicyIdentity, Sha256Digest, ToolId, VendorBuildIdentity,
     VerifiedBootIdentity, VerifiedBootState, assess_android_tproxy_topology_scope,
     classify_android_rpdb, project_android_net_id_fwmark_census_fragment,
-    project_rpdb_fwmark_census_fragment, select_reviewed_android_mark_policy,
+    project_rpdb_fwmark_census_fragment, select_reviewed_android_platform_profile,
 };
 
 use super::super::{existing_flux, nftables, traffic_control_bpf, xfrm};
@@ -611,7 +611,7 @@ fn positive_policy_for(
     capability_profile: &CapabilityProfile,
     network_namespace: NetworkNamespaceIdentity,
 ) -> AndroidMarkDevicePolicy {
-    let selection = select_reviewed_android_mark_policy(capability_profile, network_namespace)
+    let selection = select_reviewed_android_platform_profile(capability_profile, network_namespace)
         .expect("exact Samsung selector is valid");
     assert!(selection.is_match());
     let classification = classify_android_rpdb(inventory, PROFILE);
@@ -627,6 +627,8 @@ fn positive_policy_for(
     selection
         .bind_topology(&topology)
         .expect("selected semantic profile matches topology")
+        .into_parts()
+        .0
 }
 
 fn inventory(endpoint: Ipv4Addr) -> NetworkInventory {

@@ -5,18 +5,18 @@ use std::os::unix::fs::PermissionsExt;
 use std::time::{Duration, Instant};
 
 use flux_core::{
-    CapabilityProfile, CaptureApplicationMode, CaptureApplicationPolicy, CaptureDecisionStage,
-    CaptureInterfaceDirection, CapturePathId, CapturePathRequest, CapturePredicate,
-    CaptureTrafficDomain, CaptureUserId, FluxConfig, FwmarkCandidate, InterfaceAddressRecord,
-    InterfaceLinkRecord, KernelSupport, NetworkAddressFamily, NetworkInventory,
-    NetworkInventoryTracker, NetworkNamespaceIdentity, Observation, ObservationKind, RouteProtocol,
-    RouteTableId, RulePriority, RuleProtocol, SelinuxMode,
+    CapabilityProfile, CapabilityProfileRevision, CaptureApplicationMode, CaptureApplicationPolicy,
+    CaptureDecisionStage, CaptureInterfaceDirection, CapturePathId, CapturePathQualificationState,
+    CapturePathQualifications, CapturePathRequest, CapturePredicate, CaptureTrafficDomain,
+    CaptureUserId, FluxConfig, FwmarkCandidate, InterfaceAddressRecord, InterfaceLinkRecord,
+    KernelSupport, NetworkAddressFamily, NetworkInventory, NetworkInventoryTracker,
+    NetworkNamespaceIdentity, Observation, ObservationKind, RouteProtocol, RouteTableId,
+    RulePriority, RuleProtocol, SelinuxMode, select_reviewed_android_platform_profile,
 };
 use flux_platform::internal::SingBoxProcessError;
 use flux_platform::{
-    AndroidCapturePathProbeState, AndroidCapturePathQualifications, AndroidCapturePathState,
-    SingBoxLaunchSpec, SingBoxLauncher, SingBoxReadiness, XtablesLocalOutputRoutingSpec,
-    XtablesLocalOutputRoutingTarget,
+    AndroidCapturePathState, SingBoxLaunchSpec, SingBoxLauncher, SingBoxReadiness,
+    XtablesLocalOutputRoutingSpec, XtablesLocalOutputRoutingTarget,
 };
 use flux_testkit::CapabilityProfileFixture;
 
@@ -844,10 +844,66 @@ fn kernel_eligibility_without_behavioral_qualification_rejects_every_production_
     assert_eq!(
         rejection
             .candidates()
-            .map(|candidate| candidate.probe_state()),
-        [AndroidCapturePathProbeState::Unqualified; 3]
+            .map(|candidate| candidate.qualification_state()),
+        [CapturePathQualificationState::Unqualified; 3]
     );
     assert_eq!(rejection.candidates()[1].first_kernel_gap(), None);
+}
+
+#[test]
+fn capture_path_behavior_from_a_different_capability_profile_is_rejected() {
+    let fixture = HostAssemblyFixture::new();
+    let current = &fixture.capability_profile;
+    let drifted = CapabilityProfile::new(
+        CapabilityProfileRevision::new(current.revision().get() + 1)
+            .expect("next Capability Profile revision"),
+        current.boot_identity().clone(),
+        current.device_identity().clone(),
+        current.kernel().clone(),
+        current.selinux().clone(),
+    );
+    let platform_profile =
+        select_reviewed_android_platform_profile(&drifted, test_network_namespace())
+            .expect("unmatched exact platform produces zero-grant evidence");
+    let evidence = CapturePathQualificationEvidence::with_maximum_lifetime(
+        platform_profile.capture_path_evidence(),
+        Instant::now(),
+    )
+    .expect("reviewed Capture Path evidence has a bounded daemon lease");
+    let planning = HostInspectionPlanningAuthority::new(
+        current,
+        qualified_xtables_kernel_config(),
+        evidence,
+        &fixture.inventory,
+        test_network_namespace(),
+        test_mark(),
+        Some(test_routing()),
+    );
+
+    let error = fixture
+        .assemble_with(
+            None,
+            fixture.desired_state.clone(),
+            &fixture.inventory,
+            GenerationPlanningAuthority::host_inspection(planning),
+        )
+        .expect_err("stale Capture Path context cannot authorize selection");
+    let GenerationAssemblyError::CapturePath(error) = error else {
+        panic!("unexpected stale Capture Path context error: {error}");
+    };
+    assert_eq!(
+        error.kind(),
+        CapturePathRejectionReason::QualificationEvidenceContextMismatch
+    );
+    let decision = CapturePathDecision::Rejected {
+        rejection: error.rejection(),
+    };
+    let encoded = serde_json::to_vec(&decision).expect("encode context-mismatch decision");
+    assert_eq!(
+        serde_json::from_slice::<CapturePathDecision>(&encoded)
+            .expect("decode context-mismatch decision"),
+        decision
+    );
 }
 
 #[test]
@@ -864,24 +920,24 @@ fn rejected_capture_path_decision_round_trips_complete_candidate_evidence() {
     assert_eq!(decoded, decision);
     assert!(
         encoded
-            .windows(b"\"probe_state\":\"unqualified\"".len())
-            .any(|window| { window == b"\"probe_state\":\"unqualified\"" })
+            .windows(b"\"qualification_state\":\"unqualified\"".len())
+            .any(|window| { window == b"\"qualification_state\":\"unqualified\"" })
     );
 }
 
 #[test]
-fn selected_capture_path_decode_rejects_qualified_state_without_a_qualified_probe() {
+fn selected_capture_path_decode_rejects_qualified_state_without_qualified_behavior() {
     let selection = HostAssemblyFixture::new()
         .assemble(None, None)
         .expect("qualified Capture Path Generation")
         .capture_path_selection();
     let mut encoded = serde_json::to_value(CapturePathDecision::Selected { selection })
         .expect("encode selected Capture Path decision");
-    encoded["selection"]["candidates"][1]["probe_state"] =
+    encoded["selection"]["candidates"][1]["qualification_state"] =
         serde_json::Value::String("unqualified".to_owned());
 
     serde_json::from_value::<CapturePathDecision>(encoded)
-        .expect_err("qualified aggregate state without qualified probe evidence must fail closed");
+        .expect_err("qualified aggregate state without qualified behavior must fail closed");
 }
 
 #[test]
@@ -974,9 +1030,12 @@ fn admitted_generation_preserves_the_original_capture_path_evidence_deadline() {
         .checked_add(Duration::from_secs(42))
         .expect("test deadline remains representable");
     let qualified = qualified_xtables_capture_path_evidence();
-    let evidence =
-        CapturePathQualificationEvidence::new(qualified.qualifications(), observed_at, valid_until)
-            .expect("test evidence lifetime is bounded");
+    let evidence = CapturePathQualificationEvidence::host_inspection(
+        qualified.qualifications(),
+        observed_at,
+        valid_until,
+    )
+    .expect("test evidence lifetime is bounded");
     let planning = HostInspectionPlanningAuthority::new(
         &fixture.capability_profile,
         qualified_xtables_kernel_config(),
@@ -1003,8 +1062,8 @@ fn unqualified_capture_path_rejection(fixture: &HostAssemblyFixture) -> CaptureP
     let planning = HostInspectionPlanningAuthority::new(
         &fixture.capability_profile,
         qualified_xtables_kernel_config(),
-        CapturePathQualificationEvidence::with_maximum_lifetime(
-            AndroidCapturePathQualifications::default(),
+        CapturePathQualificationEvidence::host_inspection_with_maximum_lifetime(
+            CapturePathQualifications::default(),
             Instant::now(),
         )
         .expect("unqualified test evidence has a bounded lifetime"),

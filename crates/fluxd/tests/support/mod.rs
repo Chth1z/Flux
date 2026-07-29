@@ -9,19 +9,19 @@ pub(crate) fn xtables_capture_path_selection() -> CapturePathSelection {
             {
                 "path": "nftables_tproxy",
                 "state": "unimplemented",
-                "probe_state": "unqualified",
+                "qualification_state": "unqualified",
                 "first_kernel_gap": null
             },
             {
                 "path": "xtables_tproxy",
                 "state": "qualified",
-                "probe_state": "qualified",
+                "qualification_state": "qualified",
                 "first_kernel_gap": null
             },
             {
                 "path": "managed_tun",
                 "state": "unimplemented",
-                "probe_state": "unqualified",
+                "qualification_state": "unqualified",
                 "first_kernel_gap": null
             }
         ],
@@ -52,19 +52,19 @@ pub(crate) fn unqualified_capture_path_decision() -> CapturePathDecision {
                 {
                     "path": "nftables_tproxy",
                     "state": "unimplemented",
-                    "probe_state": "unqualified",
+                    "qualification_state": "unqualified",
                     "first_kernel_gap": null
                 },
                 {
                     "path": "xtables_tproxy",
                     "state": "unqualified",
-                    "probe_state": "unqualified",
+                    "qualification_state": "unqualified",
                     "first_kernel_gap": null
                 },
                 {
                     "path": "managed_tun",
                     "state": "unimplemented",
-                    "probe_state": "unqualified",
+                    "qualification_state": "unqualified",
                     "first_kernel_gap": null
                 }
             ],

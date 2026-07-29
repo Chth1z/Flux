@@ -2,7 +2,10 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 
-use flux_core::{CapturePathId, CapturePathRequest, ImplementedCaptureAdapters};
+use flux_core::{
+    CAPTURE_PATH_COUNT, CapturePathId, CapturePathQualificationState, CapturePathQualifications,
+    CapturePathRequest, ImplementedCaptureAdapters,
+};
 use sha2::{Digest, Sha256};
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -20,7 +23,6 @@ pub const MAX_ANDROID_KERNEL_CONFIG_COMPRESSED_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_ANDROID_KERNEL_CONFIG_DECOMPRESSED_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_ANDROID_KERNEL_CONFIG_LINE_BYTES: usize = 4 * 1024;
 pub const MAX_ANDROID_KERNEL_CONFIG_OPTIONS: usize = 65_536;
-pub const ANDROID_CAPTURE_PATH_COUNT: usize = 3;
 
 const MAX_ANDROID_KERNEL_CONFIG_SYMBOL_BYTES: usize = 192;
 const DEFAULT_ANDROID_KERNEL_CONFIG_PATH: &str = "/proc/config.gz";
@@ -566,16 +568,6 @@ fn required_features(path: CapturePathId) -> &'static [AndroidKernelFeature] {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AndroidCapturePathProbeState {
-    Qualified,
-    Unsupported,
-    Denied,
-    Conflicting,
-    Broken,
-    Unqualified,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AndroidCapturePathState {
     Qualified,
     Unimplemented,
@@ -587,50 +579,10 @@ pub enum AndroidCapturePathState {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct AndroidCapturePathQualifications {
-    nftables: AndroidCapturePathProbeState,
-    xtables: AndroidCapturePathProbeState,
-    tun: AndroidCapturePathProbeState,
-}
-
-impl AndroidCapturePathQualifications {
-    #[must_use]
-    pub const fn new(
-        nftables: AndroidCapturePathProbeState,
-        xtables: AndroidCapturePathProbeState,
-        tun: AndroidCapturePathProbeState,
-    ) -> Self {
-        Self {
-            nftables,
-            xtables,
-            tun,
-        }
-    }
-
-    const fn for_path(self, path: CapturePathId) -> AndroidCapturePathProbeState {
-        match path {
-            CapturePathId::NftablesTproxy => self.nftables,
-            CapturePathId::XtablesTproxy => self.xtables,
-            CapturePathId::ManagedTun => self.tun,
-        }
-    }
-}
-
-impl Default for AndroidCapturePathQualifications {
-    fn default() -> Self {
-        Self::new(
-            AndroidCapturePathProbeState::Unqualified,
-            AndroidCapturePathProbeState::Unqualified,
-            AndroidCapturePathProbeState::Unqualified,
-        )
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AndroidCapturePathCandidate {
     path: CapturePathId,
     state: AndroidCapturePathState,
-    probe_state: AndroidCapturePathProbeState,
+    qualification_state: CapturePathQualificationState,
     first_kernel_gap: Option<(AndroidKernelFeature, AndroidKernelFeatureState)>,
 }
 
@@ -646,8 +598,8 @@ impl AndroidCapturePathCandidate {
     }
 
     #[must_use]
-    pub const fn probe_state(self) -> AndroidCapturePathProbeState {
-        self.probe_state
+    pub const fn qualification_state(self) -> CapturePathQualificationState {
+        self.qualification_state
     }
 
     #[must_use]
@@ -661,7 +613,7 @@ impl AndroidCapturePathCandidate {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AndroidCapturePathDecision {
     request: CapturePathRequest,
-    candidates: [AndroidCapturePathCandidate; ANDROID_CAPTURE_PATH_COUNT],
+    candidates: [AndroidCapturePathCandidate; CAPTURE_PATH_COUNT],
     selected: Option<CapturePathId>,
     next_to_qualify: Option<CapturePathId>,
 }
@@ -673,7 +625,7 @@ impl AndroidCapturePathDecision {
     }
 
     #[must_use]
-    pub const fn candidates(&self) -> &[AndroidCapturePathCandidate; ANDROID_CAPTURE_PATH_COUNT] {
+    pub const fn candidates(&self) -> &[AndroidCapturePathCandidate; CAPTURE_PATH_COUNT] {
         &self.candidates
     }
 
@@ -701,7 +653,7 @@ impl AndroidCapturePathDecision {
 pub fn select_android_capture_path(
     config: &AndroidKernelConfigSnapshot,
     implemented_adapters: ImplementedCaptureAdapters,
-    qualifications: AndroidCapturePathQualifications,
+    qualifications: CapturePathQualifications,
     request: CapturePathRequest,
 ) -> AndroidCapturePathDecision {
     let candidates = CapturePathId::ALL.map(|path| {
@@ -709,7 +661,7 @@ pub fn select_android_capture_path(
             config,
             path,
             implemented_adapters.contains(path),
-            qualifications.for_path(path),
+            qualifications.state(path),
         )
     });
     let selected = match request {
@@ -743,7 +695,7 @@ pub fn select_android_capture_path(
 }
 
 fn candidate_has_state(
-    candidates: &[AndroidCapturePathCandidate; ANDROID_CAPTURE_PATH_COUNT],
+    candidates: &[AndroidCapturePathCandidate; CAPTURE_PATH_COUNT],
     path: CapturePathId,
     state: AndroidCapturePathState,
 ) -> bool {
@@ -756,7 +708,7 @@ fn capture_path_candidate(
     config: &AndroidKernelConfigSnapshot,
     path: CapturePathId,
     implemented: bool,
-    probe_state: AndroidCapturePathProbeState,
+    qualification_state: CapturePathQualificationState,
 ) -> AndroidCapturePathCandidate {
     let first_kernel_gap = required_features(path).iter().copied().find_map(|feature| {
         let state = config.feature_state(feature);
@@ -768,30 +720,32 @@ fn capture_path_candidate(
         .find(|feature| config.feature_state(*feature) == AndroidKernelFeatureState::Disabled);
     let state = if !implemented {
         AndroidCapturePathState::Unimplemented
-    } else if probe_state == AndroidCapturePathProbeState::Qualified {
+    } else if qualification_state == CapturePathQualificationState::Qualified {
         if disabled.is_some() {
             AndroidCapturePathState::Broken
         } else {
             AndroidCapturePathState::Qualified
         }
-    } else if disabled.is_some() || probe_state == AndroidCapturePathProbeState::Unsupported {
+    } else if disabled.is_some()
+        || qualification_state == CapturePathQualificationState::Unsupported
+    {
         AndroidCapturePathState::Missing
     } else if first_kernel_gap.is_some() {
         AndroidCapturePathState::Unqualified
     } else {
-        match probe_state {
-            AndroidCapturePathProbeState::Qualified => AndroidCapturePathState::Qualified,
-            AndroidCapturePathProbeState::Unsupported => AndroidCapturePathState::Missing,
-            AndroidCapturePathProbeState::Denied => AndroidCapturePathState::Denied,
-            AndroidCapturePathProbeState::Conflicting => AndroidCapturePathState::Conflicting,
-            AndroidCapturePathProbeState::Broken => AndroidCapturePathState::Broken,
-            AndroidCapturePathProbeState::Unqualified => AndroidCapturePathState::Unqualified,
+        match qualification_state {
+            CapturePathQualificationState::Qualified => AndroidCapturePathState::Qualified,
+            CapturePathQualificationState::Unsupported => AndroidCapturePathState::Missing,
+            CapturePathQualificationState::Denied => AndroidCapturePathState::Denied,
+            CapturePathQualificationState::Conflicting => AndroidCapturePathState::Conflicting,
+            CapturePathQualificationState::Broken => AndroidCapturePathState::Broken,
+            CapturePathQualificationState::Unqualified => AndroidCapturePathState::Unqualified,
         }
     };
     AndroidCapturePathCandidate {
         path,
         state,
-        probe_state,
+        qualification_state,
         first_kernel_gap,
     }
 }
@@ -1275,10 +1229,10 @@ mod tests {
         let decision = select_android_capture_path(
             &config,
             ALL_CAPTURE_ADAPTERS,
-            AndroidCapturePathQualifications::new(
-                AndroidCapturePathProbeState::Qualified,
-                AndroidCapturePathProbeState::Qualified,
-                AndroidCapturePathProbeState::Qualified,
+            CapturePathQualifications::new(
+                CapturePathQualificationState::Qualified,
+                CapturePathQualificationState::Qualified,
+                CapturePathQualificationState::Qualified,
             ),
             CapturePathRequest::Auto,
         );
@@ -1292,10 +1246,10 @@ mod tests {
         let decision = select_android_capture_path(
             &config,
             ALL_CAPTURE_ADAPTERS,
-            AndroidCapturePathQualifications::new(
-                AndroidCapturePathProbeState::Denied,
-                AndroidCapturePathProbeState::Conflicting,
-                AndroidCapturePathProbeState::Qualified,
+            CapturePathQualifications::new(
+                CapturePathQualificationState::Denied,
+                CapturePathQualificationState::Conflicting,
+                CapturePathQualificationState::Qualified,
             ),
             CapturePathRequest::Auto,
         );
@@ -1314,43 +1268,47 @@ mod tests {
     fn automatic_selection_matrix_is_deterministic() {
         let config = complete_feature_config(&[]);
         let states = [
-            AndroidCapturePathProbeState::Qualified,
-            AndroidCapturePathProbeState::Unsupported,
-            AndroidCapturePathProbeState::Denied,
-            AndroidCapturePathProbeState::Conflicting,
-            AndroidCapturePathProbeState::Broken,
-            AndroidCapturePathProbeState::Unqualified,
+            CapturePathQualificationState::Qualified,
+            CapturePathQualificationState::Unsupported,
+            CapturePathQualificationState::Denied,
+            CapturePathQualificationState::Conflicting,
+            CapturePathQualificationState::Broken,
+            CapturePathQualificationState::Unqualified,
         ];
         for nftables in states {
             for xtables in states {
                 for tun in states {
-                    let probes = [nftables, xtables, tun];
+                    let qualifications = [nftables, xtables, tun];
                     let decision = select_android_capture_path(
                         &config,
                         ALL_CAPTURE_ADAPTERS,
-                        AndroidCapturePathQualifications::new(nftables, xtables, tun),
+                        CapturePathQualifications::new(nftables, xtables, tun),
                         CapturePathRequest::Auto,
                     );
-                    let expected_selected = probes
+                    let expected_selected = qualifications
                         .iter()
-                        .position(|state| *state == AndroidCapturePathProbeState::Qualified)
+                        .position(|state| *state == CapturePathQualificationState::Qualified)
                         .map(|index| CapturePathId::ALL[index]);
                     let expected_next = expected_selected
                         .is_none()
                         .then(|| {
-                            probes
+                            qualifications
                                 .iter()
                                 .position(|state| {
-                                    *state == AndroidCapturePathProbeState::Unqualified
+                                    *state == CapturePathQualificationState::Unqualified
                                 })
                                 .map(|index| CapturePathId::ALL[index])
                         })
                         .flatten();
-                    assert_eq!(decision.selected(), expected_selected, "probes={probes:?}");
+                    assert_eq!(
+                        decision.selected(),
+                        expected_selected,
+                        "qualifications={qualifications:?}"
+                    );
                     assert_eq!(
                         decision.next_to_qualify(),
                         expected_next,
-                        "probes={probes:?}"
+                        "qualifications={qualifications:?}"
                     );
                 }
             }
@@ -1366,7 +1324,7 @@ mod tests {
         let decision = select_android_capture_path(
             &config,
             ALL_CAPTURE_ADAPTERS,
-            AndroidCapturePathQualifications::default(),
+            CapturePathQualifications::default(),
             CapturePathRequest::Auto,
         );
         assert_eq!(decision.selected(), None);
@@ -1394,10 +1352,10 @@ mod tests {
         let decision = select_android_capture_path(
             &config,
             ALL_CAPTURE_ADAPTERS,
-            AndroidCapturePathQualifications::new(
-                AndroidCapturePathProbeState::Unqualified,
-                AndroidCapturePathProbeState::Qualified,
-                AndroidCapturePathProbeState::Qualified,
+            CapturePathQualifications::new(
+                CapturePathQualificationState::Unqualified,
+                CapturePathQualificationState::Qualified,
+                CapturePathQualificationState::Qualified,
             ),
             CapturePathRequest::Exact(CapturePathId::NftablesTproxy),
         );
@@ -1406,13 +1364,13 @@ mod tests {
     }
 
     #[test]
-    fn unimplemented_adapters_never_qualify_or_become_probe_work() {
+    fn unimplemented_adapters_never_qualify_or_become_qualification_work() {
         let config = complete_feature_config(&[]);
         let xtables_only = ImplementedCaptureAdapters::new(false, true, false);
-        let qualifications = AndroidCapturePathQualifications::new(
-            AndroidCapturePathProbeState::Qualified,
-            AndroidCapturePathProbeState::Qualified,
-            AndroidCapturePathProbeState::Qualified,
+        let qualifications = CapturePathQualifications::new(
+            CapturePathQualificationState::Qualified,
+            CapturePathQualificationState::Qualified,
+            CapturePathQualificationState::Qualified,
         );
 
         let automatic = select_android_capture_path(
@@ -1443,7 +1401,7 @@ mod tests {
     }
 
     #[test]
-    fn contradictory_qualified_probe_is_broken_not_authoritative() {
+    fn contradictory_qualified_behavior_is_broken_not_authoritative() {
         let config = complete_feature_config(&[(
             AndroidKernelFeature::NfTables,
             AndroidKernelConfigOptionState::Disabled,
@@ -1451,10 +1409,10 @@ mod tests {
         let decision = select_android_capture_path(
             &config,
             ALL_CAPTURE_ADAPTERS,
-            AndroidCapturePathQualifications::new(
-                AndroidCapturePathProbeState::Qualified,
-                AndroidCapturePathProbeState::Unqualified,
-                AndroidCapturePathProbeState::Unqualified,
+            CapturePathQualifications::new(
+                CapturePathQualificationState::Qualified,
+                CapturePathQualificationState::Unqualified,
+                CapturePathQualificationState::Unqualified,
             ),
             CapturePathRequest::Auto,
         );

@@ -3,6 +3,7 @@ use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::net::IpAddr;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Instant;
 
 use flux_core::{
@@ -22,8 +23,8 @@ use flux_platform::{
 use sha2::{Digest, Sha256};
 
 use super::capture_path_selection::{
-    CapturePathQualificationEvidence, CapturePathSelection, CapturePathSelectionError,
-    CapturePathSelectionInput, PRODUCTION_CAPTURE_PATH_SELECTOR,
+    CapturePathQualificationEvidence, CapturePathQualificationEvidenceError, CapturePathSelection,
+    CapturePathSelectionError, CapturePathSelectionInput, PRODUCTION_CAPTURE_PATH_SELECTOR,
 };
 use super::{
     DesiredStateArtifacts, EngineCapabilityProfile, EngineConfigBindingError,
@@ -156,8 +157,9 @@ pub(crate) enum GenerationPlanningAuthority {
     #[cfg(test)]
     HostInspection(Box<HostInspectionPlanningAuthority>),
     Android {
-        census: Box<AndroidFwmarkCensusPlanningEvidence>,
-        capture_path_evidence: CapturePathQualificationEvidence,
+        mark: Box<AndroidMarkPlanningAuthority>,
+        kernel_config: Arc<AndroidKernelConfigSnapshot>,
+        capture_path_evidence: Box<CapturePathQualificationEvidence>,
         placement: Option<RpdbPlacementLease>,
     },
 }
@@ -169,17 +171,22 @@ impl GenerationPlanningAuthority {
         Self::HostInspection(Box::new(authority))
     }
 
-    #[must_use]
     pub(crate) fn android(
         census: AndroidFwmarkCensusPlanningEvidence,
-        capture_path_evidence: CapturePathQualificationEvidence,
+        observed_at: Instant,
         placement: Option<RpdbPlacementLease>,
-    ) -> Self {
-        Self::Android {
-            census: Box::new(census),
-            capture_path_evidence,
+    ) -> Result<Self, CapturePathQualificationEvidenceError> {
+        let (mark, kernel_config, behavioral_evidence) = census.into_parts();
+        let capture_path_evidence = CapturePathQualificationEvidence::with_maximum_lifetime(
+            behavioral_evidence,
+            observed_at,
+        )?;
+        Ok(Self::Android {
+            mark: Box::new(mark),
+            kernel_config,
+            capture_path_evidence: Box::new(capture_path_evidence),
             placement,
-        }
+        })
     }
 
     #[cfg(test)]
@@ -195,7 +202,7 @@ impl GenerationPlanningAuthority {
         match self {
             #[cfg(test)]
             Self::HostInspection(authority) => &authority.capability_profile,
-            Self::Android { census, .. } => census.mark_authority().capability_profile(),
+            Self::Android { mark, .. } => mark.capability_profile(),
         }
     }
 
@@ -204,19 +211,19 @@ impl GenerationPlanningAuthority {
         match self {
             #[cfg(test)]
             Self::HostInspection(authority) => &authority.kernel_config,
-            Self::Android { census, .. } => census.kernel_config(),
+            Self::Android { kernel_config, .. } => kernel_config,
         }
     }
 
     #[must_use]
-    pub(crate) const fn capture_path_evidence(&self) -> CapturePathQualificationEvidence {
+    pub(crate) const fn capture_path_evidence(&self) -> &CapturePathQualificationEvidence {
         match self {
             #[cfg(test)]
-            Self::HostInspection(authority) => authority.capture_path_evidence,
+            Self::HostInspection(authority) => &authority.capture_path_evidence,
             Self::Android {
                 capture_path_evidence,
                 ..
-            } => *capture_path_evidence,
+            } => capture_path_evidence,
         }
     }
 
@@ -226,10 +233,10 @@ impl GenerationPlanningAuthority {
     ) -> Option<(&AndroidMarkPlanningAuthority, RpdbPlacementLease)> {
         match self {
             Self::Android {
-                census,
+                mark,
                 placement: Some(placement),
                 ..
-            } => Some((census.mark_authority(), *placement)),
+            } => Some((mark, *placement)),
             #[cfg(test)]
             Self::HostInspection(_) => None,
             Self::Android {
@@ -390,13 +397,12 @@ impl AdmittedGeneration {
                 Err(NativeGenerationPromotionError::HostInspectionNonPromotable)
             }
             GenerationPlanningAuthority::Android {
-                census, placement, ..
+                mark, placement, ..
             } => {
                 let placement =
                     placement.ok_or(NativeGenerationPromotionError::MissingAndroidPlacement)?;
-                let (mark, _) = census.into_parts();
                 Ok(NativeGenerationTargetRequest {
-                    mark,
+                    mark: *mark,
                     placement,
                     xtables: self.xtables,
                 })
@@ -733,9 +739,8 @@ fn validate_planning(
             })
         }
         GenerationPlanningAuthority::Android {
-            census, placement, ..
+            mark, placement, ..
         } => {
-            let mark = census.mark_authority();
             ensure_common_planning_binding(
                 mark.capability_profile(),
                 mark.topology_scope().snapshot_id(),
@@ -800,14 +805,18 @@ fn digest_generation_planning_authority(
             update_routing(&mut digest, authority.routing);
         }
         GenerationPlanningAuthority::Android {
-            census, placement, ..
+            mark,
+            kernel_config,
+            capture_path_evidence,
+            placement,
         } => {
             digest.update([1]);
-            update_field(
-                &mut digest,
-                census.mark_authority().evidence_digest().as_bytes(),
-            );
-            update_field(&mut digest, census.kernel_config().digest().as_bytes());
+            update_field(&mut digest, mark.evidence_digest().as_bytes());
+            update_field(&mut digest, kernel_config.digest().as_bytes());
+            let behavioral_digest = capture_path_evidence
+                .behavioral_digest()
+                .expect("Android planning retains reviewed Capture Path evidence identity");
+            update_field(&mut digest, &behavioral_digest);
             update_placement(&mut digest, *placement);
         }
     }

@@ -686,9 +686,9 @@ impl AndroidMarkDevicePolicy {
     ///
     /// This crate-private factory does not independently inspect the reviewed artifact. The catalog
     /// module must validate the source-coded entry before calling it. External adapters can obtain a
-    /// positive policy only through `select_reviewed_android_mark_policy`; live authorization still
-    /// rechecks topology, inventory, policy, profile, namespace, ownership-journal, and complete
-    /// census evidence.
+    /// positive policy only through `select_reviewed_android_platform_profile`; live authorization
+    /// still rechecks topology, inventory, policy, profile, namespace, ownership-journal, and
+    /// complete census evidence.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn device_qualified_cooperative(
         assurance_class: AndroidMarkPolicyAssuranceClass,

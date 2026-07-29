@@ -8,8 +8,8 @@
 
 mod address_bypass;
 mod android_mark_authority;
-mod android_mark_policy_catalog;
 mod android_netd;
+mod android_platform_profile_catalog;
 mod android_rpdb;
 mod android_tproxy_topology;
 mod canonical_evidence;
@@ -61,12 +61,12 @@ pub use android_mark_authority::{
     OWNERSHIP_JOURNAL_IDENTITY_BYTES, OwnershipJournalIdentity, OwnershipJournalIdentityError,
     OwnershipJournalRevision, ReviewedPolicyCatalogEntryId, authorize_android_mark_planning,
 };
-pub use android_mark_policy_catalog::{
-    MAX_REVIEWED_ANDROID_MARK_POLICY_CATALOG_ENTRIES, ReviewedAndroidMarkPolicyCatalogError,
-    ReviewedAndroidMarkPolicyCatalogField, ReviewedAndroidMarkPolicySelection,
-    select_reviewed_android_mark_policy,
-};
 pub use android_netd::AndroidNetdSourceProfile;
+pub use android_platform_profile_catalog::{
+    BoundReviewedAndroidPlatformProfile, MAX_REVIEWED_ANDROID_PLATFORM_PROFILE_CATALOG_ENTRIES,
+    ReviewedAndroidPlatformProfileCatalogError, ReviewedAndroidPlatformProfileCatalogField,
+    ReviewedAndroidPlatformProfileSelection, select_reviewed_android_platform_profile,
+};
 pub use android_rpdb::{
     AndroidRpdbClassificationReport, AndroidRpdbPlacementPlanError, AndroidRpdbPriorityBand,
     AndroidRpdbPriorityContract, AndroidRpdbProfileIssue, AndroidRpdbRuleRole,
@@ -101,7 +101,14 @@ pub use capability::{
     SHA256_DIGEST_BYTES, SecurityPatchLevel, SelinuxMode, SelinuxPolicyIdentity, Sha256Digest,
     Sha256DigestError, ToolId, VendorBuildIdentity, VerifiedBootIdentity, VerifiedBootState,
 };
-pub use capture_path::{CapturePathId, CapturePathRequest, ImplementedCaptureAdapters};
+pub use capture_path::{
+    CAPTURE_PATH_BEHAVIORAL_EVIDENCE_DIGEST_BYTES, CAPTURE_PATH_COUNT,
+    CapturePathBehavioralEvidence, CapturePathBehavioralEvidenceDigest, CapturePathId,
+    CapturePathQualificationState, CapturePathQualifications, CapturePathRequest,
+    ImplementedCaptureAdapters, REVIEWED_CAPTURE_PATH_EVIDENCE_ARTIFACT_DIGEST_BYTES,
+    ReviewedCapturePathEvidenceArtifactDigest, ReviewedCapturePathEvidenceIdentity,
+    ReviewedCapturePathEvidenceRevision,
+};
 pub use capture_program::{
     AddressHostSetProvenance, CAPTURE_PROGRAM_SCHEMA_VERSION, CaptureApplicationMode,
     CaptureApplicationPolicy, CaptureApplicationPolicyError, CaptureBypassPolicy,

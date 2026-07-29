@@ -427,7 +427,7 @@ fn optional_aspects_are_independent_and_share_one_exact_selector() {
 }
 
 #[test]
-fn behavioral_evidence_digest_binds_fresh_capability_and_reviewed_provenance() {
+fn behavioral_evidence_digest_is_canonical_and_binds_fresh_context() {
     let namespace = namespace(4, 40);
     let first = capability_profile_with_tool(namespace, 0x24);
     let changed_tool = capability_profile_with_tool(namespace, 0x25);
@@ -459,6 +459,15 @@ fn behavioral_evidence_digest_binds_fresh_capability_and_reviewed_provenance() {
 
     assert_ne!(first_evidence.digest(), changed_evidence.digest());
     assert_ne!(first_evidence.digest(), revised_evidence.digest());
+    assert_eq!(
+        first_evidence.digest().as_bytes(),
+        &[
+            0xde, 0xa3, 0xd7, 0xc4, 0xab, 0x25, 0x2a, 0x11, 0x20, 0x5b, 0x0f, 0x7c, 0x7a, 0xc6,
+            0x84, 0xa1, 0x09, 0xeb, 0xa0, 0x29, 0xdd, 0xa1, 0x00, 0x38, 0x54, 0x50, 0xed, 0x03,
+            0x7d, 0x5f, 0x36, 0x5c,
+        ],
+        "schema-v1 evidence bytes must be independent of target pointer width"
+    );
     assert_ne!(
         first_evidence.capability_profile_digest(),
         changed_evidence.capability_profile_digest()

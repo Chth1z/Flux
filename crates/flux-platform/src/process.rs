@@ -151,19 +151,32 @@ impl ProcessCredentialMapDigest {
     }
 }
 
+/// Stable user-namespace and credential-map evidence for one process.
+///
+/// `Unsupported` is returned only when the observer and every observed task
+/// coherently omit the user-namespace descriptor and both credential maps.
+/// Permission failures and mixed presence remain observation errors.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProcessUserNamespaceObservation {
+    Unsupported,
+    Observed {
+        namespace: ProcessNamespaceIdentity,
+        uid_map_digest: ProcessCredentialMapDigest,
+        gid_map_digest: ProcessCredentialMapDigest,
+    },
+}
+
 /// Stable process-wide namespace and credential-map domain.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProcessDomainObservation {
-    user_namespace: ProcessNamespaceIdentity,
+    user_namespace: ProcessUserNamespaceObservation,
     mount_namespace: ProcessNamespaceIdentity,
     network_namespace: ProcessNamespaceIdentity,
-    uid_map_digest: ProcessCredentialMapDigest,
-    gid_map_digest: ProcessCredentialMapDigest,
 }
 
 impl ProcessDomainObservation {
     #[must_use]
-    pub const fn user_namespace(self) -> ProcessNamespaceIdentity {
+    pub const fn user_namespace(self) -> ProcessUserNamespaceObservation {
         self.user_namespace
     }
 
@@ -175,16 +188,6 @@ impl ProcessDomainObservation {
     #[must_use]
     pub const fn network_namespace(self) -> ProcessNamespaceIdentity {
         self.network_namespace
-    }
-
-    #[must_use]
-    pub const fn uid_map_digest(self) -> ProcessCredentialMapDigest {
-        self.uid_map_digest
-    }
-
-    #[must_use]
-    pub const fn gid_map_digest(self) -> ProcessCredentialMapDigest {
-        self.gid_map_digest
     }
 }
 
@@ -236,6 +239,181 @@ pub enum ProcessHandleErrorKind {
     IdentityChanged,
     Parse,
     SystemCall,
+}
+
+/// Stable stage reached while opening exact child-origin process authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProcessHandleOpenStage {
+    Start,
+    ChildDispositionBeforeOpen,
+    ProcfsPidNamespace,
+    ChildIdentity,
+    ChildOwnershipBeforePidFd,
+    PidFdOpen,
+    PidFdChildOwnership,
+    InitialObservation(ProcessHandleObservationStage),
+    ChildDispositionAfterObservation,
+    ChildOwnershipAfterObservation,
+    RecordedChildIdentity,
+}
+
+impl ProcessHandleOpenStage {
+    const BEFORE_INITIAL_OBSERVATION: [Self; 7] = [
+        Self::Start,
+        Self::ChildDispositionBeforeOpen,
+        Self::ProcfsPidNamespace,
+        Self::ChildIdentity,
+        Self::ChildOwnershipBeforePidFd,
+        Self::PidFdOpen,
+        Self::PidFdChildOwnership,
+    ];
+    const AFTER_INITIAL_OBSERVATION: [Self; 3] = [
+        Self::ChildDispositionAfterObservation,
+        Self::ChildOwnershipAfterObservation,
+        Self::RecordedChildIdentity,
+    ];
+    #[cfg(test)]
+    pub(crate) const COUNT: usize = Self::BEFORE_INITIAL_OBSERVATION.len()
+        + ProcessHandleObservationStage::ALL.len()
+        + Self::AFTER_INITIAL_OBSERVATION.len();
+
+    pub(crate) fn all() -> impl Iterator<Item = Self> {
+        Self::BEFORE_INITIAL_OBSERVATION
+            .into_iter()
+            .chain(
+                ProcessHandleObservationStage::ALL
+                    .into_iter()
+                    .map(Self::InitialObservation),
+            )
+            .chain(Self::AFTER_INITIAL_OBSERVATION)
+    }
+
+    #[must_use]
+    pub fn as_str(self) -> String {
+        match self {
+            Self::Start => "start".to_owned(),
+            Self::ChildDispositionBeforeOpen => "child-disposition-before-open".to_owned(),
+            Self::ProcfsPidNamespace => "procfs-pid-namespace".to_owned(),
+            Self::ChildIdentity => "child-identity".to_owned(),
+            Self::ChildOwnershipBeforePidFd => "child-ownership-before-pidfd".to_owned(),
+            Self::PidFdOpen => "pidfd-open".to_owned(),
+            Self::PidFdChildOwnership => "pidfd-child-ownership".to_owned(),
+            Self::InitialObservation(stage) => {
+                format!("initial-observation-{}", stage.as_str())
+            }
+            Self::ChildDispositionAfterObservation => {
+                "child-disposition-after-observation".to_owned()
+            }
+            Self::ChildOwnershipAfterObservation => "child-ownership-after-observation".to_owned(),
+            Self::RecordedChildIdentity => "recorded-child-identity".to_owned(),
+        }
+    }
+}
+
+/// Stable stage reached while observing one exact pidfd-bound process.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProcessHandleObservationStage {
+    ChildDispositionBeforeObservation,
+    ProcfsPidNamespace,
+    PidFdLivenessBeforeObservation,
+    PidFdChildOwnershipBeforeObservation,
+    PidFdIdentityBeforeObservation,
+    ProcessIdentity,
+    UserNamespaceSupportBeforeObservation,
+    FirstTaskIds,
+    FirstTaskStatus,
+    FirstTaskUserNamespace,
+    FirstTaskMountNamespace,
+    FirstTaskNetworkNamespace,
+    FirstUidMap,
+    FirstGidMap,
+    SecondTaskIds,
+    SecondTaskStatus,
+    SecondTaskUserNamespace,
+    SecondTaskMountNamespace,
+    SecondTaskNetworkNamespace,
+    SecondUidMap,
+    SecondGidMap,
+    FinalTaskIds,
+    UserNamespaceSupportAfterObservation,
+    CensusValidation,
+    PidFdIdentityAfterObservation,
+    PidFdChildOwnershipAfterObservation,
+    PidFdLivenessAfterObservation,
+    ChildDispositionAfterObservation,
+}
+
+impl ProcessHandleObservationStage {
+    pub const ALL: [Self; 28] = [
+        Self::ChildDispositionBeforeObservation,
+        Self::ProcfsPidNamespace,
+        Self::PidFdLivenessBeforeObservation,
+        Self::PidFdChildOwnershipBeforeObservation,
+        Self::PidFdIdentityBeforeObservation,
+        Self::ProcessIdentity,
+        Self::UserNamespaceSupportBeforeObservation,
+        Self::FirstTaskIds,
+        Self::FirstTaskStatus,
+        Self::FirstTaskUserNamespace,
+        Self::FirstTaskMountNamespace,
+        Self::FirstTaskNetworkNamespace,
+        Self::FirstUidMap,
+        Self::FirstGidMap,
+        Self::SecondTaskIds,
+        Self::SecondTaskStatus,
+        Self::SecondTaskUserNamespace,
+        Self::SecondTaskMountNamespace,
+        Self::SecondTaskNetworkNamespace,
+        Self::SecondUidMap,
+        Self::SecondGidMap,
+        Self::FinalTaskIds,
+        Self::UserNamespaceSupportAfterObservation,
+        Self::CensusValidation,
+        Self::PidFdIdentityAfterObservation,
+        Self::PidFdChildOwnershipAfterObservation,
+        Self::PidFdLivenessAfterObservation,
+        Self::ChildDispositionAfterObservation,
+    ];
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ChildDispositionBeforeObservation => "child-disposition-before-observation",
+            Self::ProcfsPidNamespace => "procfs-pid-namespace",
+            Self::PidFdLivenessBeforeObservation => "pidfd-liveness-before-observation",
+            Self::PidFdChildOwnershipBeforeObservation => {
+                "pidfd-child-ownership-before-observation"
+            }
+            Self::PidFdIdentityBeforeObservation => "pidfd-identity-before-observation",
+            Self::ProcessIdentity => "process-identity",
+            Self::UserNamespaceSupportBeforeObservation => {
+                "user-namespace-support-before-observation"
+            }
+            Self::FirstTaskIds => "first-task-ids",
+            Self::FirstTaskStatus => "first-task-status",
+            Self::FirstTaskUserNamespace => "first-task-user-namespace",
+            Self::FirstTaskMountNamespace => "first-task-mount-namespace",
+            Self::FirstTaskNetworkNamespace => "first-task-network-namespace",
+            Self::FirstUidMap => "first-uid-map",
+            Self::FirstGidMap => "first-gid-map",
+            Self::SecondTaskIds => "second-task-ids",
+            Self::SecondTaskStatus => "second-task-status",
+            Self::SecondTaskUserNamespace => "second-task-user-namespace",
+            Self::SecondTaskMountNamespace => "second-task-mount-namespace",
+            Self::SecondTaskNetworkNamespace => "second-task-network-namespace",
+            Self::SecondUidMap => "second-uid-map",
+            Self::SecondGidMap => "second-gid-map",
+            Self::FinalTaskIds => "final-task-ids",
+            Self::UserNamespaceSupportAfterObservation => {
+                "user-namespace-support-after-observation"
+            }
+            Self::CensusValidation => "census-validation",
+            Self::PidFdIdentityAfterObservation => "pidfd-identity-after-observation",
+            Self::PidFdChildOwnershipAfterObservation => "pidfd-child-ownership-after-observation",
+            Self::PidFdLivenessAfterObservation => "pidfd-liveness-after-observation",
+            Self::ChildDispositionAfterObservation => "child-disposition-after-observation",
+        }
+    }
 }
 
 /// Failure to open or reobserve an exact child-origin process handle.
@@ -301,8 +479,12 @@ pub enum ProcessHandleError {
         caller_pid: NonZeroU32,
         procfs_pid: NonZeroU32,
     },
-    ProcessDomainUnsupported {
-        path: PathBuf,
+    ProcessUserNamespaceSupportIncoherent,
+    ProcessUserNamespaceSupportChanged {
+        pid: NonZeroU32,
+    },
+    ProcessUserNamespaceObservationMismatch {
+        pid: NonZeroU32,
     },
     MalformedProcStat {
         path: PathBuf,
@@ -345,9 +527,9 @@ impl ProcessHandleError {
     #[must_use]
     pub const fn kind(&self) -> ProcessHandleErrorKind {
         match self {
-            Self::UnsupportedPlatform(_)
-            | Self::PidFdUnsupported { .. }
-            | Self::ProcessDomainUnsupported { .. } => ProcessHandleErrorKind::Unsupported,
+            Self::UnsupportedPlatform(_) | Self::PidFdUnsupported { .. } => {
+                ProcessHandleErrorKind::Unsupported
+            }
             Self::Exited { .. } => ProcessHandleErrorKind::Exited,
             Self::InvalidChildPid { .. }
             | Self::PidFdIdentityMismatch { .. }
@@ -363,7 +545,12 @@ impl ProcessHandleError {
             | Self::ProcessCredentialMapChanged { .. }
             | Self::ChildReapContractUnavailable
             | Self::ChildOwnershipLost { .. }
-            | Self::ProcfsPidNamespaceMismatch { .. } => ProcessHandleErrorKind::IdentityChanged,
+            | Self::ProcfsPidNamespaceMismatch { .. }
+            | Self::ProcessUserNamespaceSupportIncoherent
+            | Self::ProcessUserNamespaceSupportChanged { .. }
+            | Self::ProcessUserNamespaceObservationMismatch { .. } => {
+                ProcessHandleErrorKind::IdentityChanged
+            }
             Self::MalformedProcStat { .. }
             | Self::MalformedProcStatus { .. }
             | Self::MalformedPidFdInfo { .. }
@@ -453,10 +640,16 @@ impl fmt::Display for ProcessHandleError {
                 formatter,
                 "procfs PID namespace mismatch: caller sees PID {caller_pid}, /proc/self/stat reports {procfs_pid}"
             ),
-            Self::ProcessDomainUnsupported { path } => write!(
+            Self::ProcessUserNamespaceSupportIncoherent => {
+                formatter.write_str("observer user-namespace procfs facilities have mixed presence")
+            }
+            Self::ProcessUserNamespaceSupportChanged { pid } => write!(
                 formatter,
-                "required process-domain procfs entry {} is unavailable",
-                path.display()
+                "process {pid} user-namespace procfs support changed during observation"
+            ),
+            Self::ProcessUserNamespaceObservationMismatch { pid } => write!(
+                formatter,
+                "process {pid} user-namespace procfs facilities do not match observer support"
             ),
             Self::MalformedProcStat { path } => {
                 write!(formatter, "malformed proc stat {}", path.display())
@@ -526,7 +719,9 @@ impl Error for ProcessHandleError {
             | Self::ChildReapContractUnavailable
             | Self::ChildOwnershipLost { .. }
             | Self::ProcfsPidNamespaceMismatch { .. }
-            | Self::ProcessDomainUnsupported { .. }
+            | Self::ProcessUserNamespaceSupportIncoherent
+            | Self::ProcessUserNamespaceSupportChanged { .. }
+            | Self::ProcessUserNamespaceObservationMismatch { .. }
             | Self::MalformedProcStat { .. }
             | Self::MalformedProcStatus { .. }
             | Self::MalformedPidFdInfo { .. }
@@ -537,6 +732,108 @@ impl Error for ProcessHandleError {
             | Self::ProcessThreadLimitExceeded { .. }
             | Self::ProcessIdMapEntryLimitExceeded { .. } => None,
         }
+    }
+}
+
+/// Failure to open exact child-origin process authority at a stable stage.
+#[derive(Debug)]
+pub struct ProcessHandleOpenError {
+    stage: ProcessHandleOpenStage,
+    source: ProcessHandleError,
+}
+
+impl ProcessHandleOpenError {
+    #[must_use]
+    pub const fn new(stage: ProcessHandleOpenStage, source: ProcessHandleError) -> Self {
+        Self { stage, source }
+    }
+
+    #[must_use]
+    pub const fn stage(&self) -> ProcessHandleOpenStage {
+        self.stage
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> ProcessHandleErrorKind {
+        self.source.kind()
+    }
+
+    #[must_use]
+    pub const fn source_error(&self) -> &ProcessHandleError {
+        &self.source
+    }
+
+    #[must_use]
+    pub fn into_source(self) -> ProcessHandleError {
+        self.source
+    }
+}
+
+impl fmt::Display for ProcessHandleOpenError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "cannot open exact child process handle during {}: {}",
+            self.stage.as_str(),
+            self.source
+        )
+    }
+}
+
+impl Error for ProcessHandleOpenError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// Failure to observe exact pidfd-bound process authority at a stable stage.
+#[derive(Debug)]
+pub struct ProcessHandleObservationError {
+    stage: ProcessHandleObservationStage,
+    source: ProcessHandleError,
+}
+
+impl ProcessHandleObservationError {
+    #[must_use]
+    pub const fn new(stage: ProcessHandleObservationStage, source: ProcessHandleError) -> Self {
+        Self { stage, source }
+    }
+
+    #[must_use]
+    pub const fn stage(&self) -> ProcessHandleObservationStage {
+        self.stage
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> ProcessHandleErrorKind {
+        self.source.kind()
+    }
+
+    #[must_use]
+    pub const fn source_error(&self) -> &ProcessHandleError {
+        &self.source
+    }
+
+    #[must_use]
+    pub fn into_source(self) -> ProcessHandleError {
+        self.source
+    }
+}
+
+impl fmt::Display for ProcessHandleObservationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "cannot observe exact child process handle during {}: {}",
+            self.stage.as_str(),
+            self.source
+        )
+    }
+}
+
+impl Error for ProcessHandleObservationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.source)
     }
 }
 
@@ -571,7 +868,7 @@ impl ProcessHandle {
     /// `SA_NOCLDWAIT`, and no external reaper may wait on this child while the
     /// handle is opened. These preconditions ensure an unreaped child PID cannot
     /// be recycled between `spawn` and `pidfd_open`.
-    pub fn open_child(child: &Child) -> Result<Self, ProcessHandleError> {
+    pub fn open_child(child: &Child) -> Result<Self, ProcessHandleOpenError> {
         implementation::open_child(child)
     }
 
@@ -612,7 +909,7 @@ impl ProcessHandle {
     /// identity plus point-in-time credential and process-domain observations;
     /// it does not prove that a later exit was reaped by the parent. Callers
     /// must not use the complete procfs census as an exit-wait primitive.
-    pub fn reobserve(&self) -> Result<ProcessObservation, ProcessHandleError> {
+    pub fn reobserve(&self) -> Result<ProcessObservation, ProcessHandleObservationError> {
         implementation::reobserve(self)
     }
 }
@@ -643,8 +940,10 @@ mod implementation {
 
     use super::{
         ProcessCredentialMapDigest, ProcessCredentialMapKind, ProcessCredentials,
-        ProcessDomainObservation, ProcessHandle, ProcessHandleError, ProcessHandleTransport,
-        ProcessIdentity, ProcessNamespaceIdentity, ProcessObservation,
+        ProcessDomainObservation, ProcessHandle, ProcessHandleError, ProcessHandleObservationError,
+        ProcessHandleObservationStage, ProcessHandleOpenError, ProcessHandleOpenStage,
+        ProcessHandleTransport, ProcessIdentity, ProcessNamespaceIdentity, ProcessObservation,
+        ProcessUserNamespaceObservation,
     };
     use std::num::{NonZeroU32, NonZeroU64};
 
@@ -661,8 +960,14 @@ mod implementation {
     const GID_MAP_DIGEST_DOMAIN: &[u8] = b"flux.process.gid-map.v1\0";
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(super) enum ProcessTaskUserNamespaceObservation {
+        Unsupported,
+        Observed(ProcessNamespaceIdentity),
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub(super) struct ProcessTaskNamespaces {
-        pub(super) user: ProcessNamespaceIdentity,
+        pub(super) user: ProcessTaskUserNamespaceObservation,
         pub(super) mount: ProcessNamespaceIdentity,
         pub(super) network: ProcessNamespaceIdentity,
     }
@@ -674,10 +979,59 @@ mod implementation {
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub(super) struct ProcessCredentialMapObservation {
-        pub(super) uid: ProcessCredentialMapDigest,
-        pub(super) gid: ProcessCredentialMapDigest,
+    pub(super) enum ProcessCredentialMapObservation {
+        Unsupported,
+        Observed {
+            uid: ProcessCredentialMapDigest,
+            gid: ProcessCredentialMapDigest,
+        },
     }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(super) enum UserNamespaceSupport {
+        Unsupported,
+        Supported,
+    }
+
+    #[derive(Clone, Copy)]
+    struct ProcessTaskObservationStages {
+        status: ProcessHandleObservationStage,
+        user_namespace: ProcessHandleObservationStage,
+        mount_namespace: ProcessHandleObservationStage,
+        network_namespace: ProcessHandleObservationStage,
+    }
+
+    const FIRST_TASK_OBSERVATION_STAGES: ProcessTaskObservationStages =
+        ProcessTaskObservationStages {
+            status: ProcessHandleObservationStage::FirstTaskStatus,
+            user_namespace: ProcessHandleObservationStage::FirstTaskUserNamespace,
+            mount_namespace: ProcessHandleObservationStage::FirstTaskMountNamespace,
+            network_namespace: ProcessHandleObservationStage::FirstTaskNetworkNamespace,
+        };
+    const SECOND_TASK_OBSERVATION_STAGES: ProcessTaskObservationStages =
+        ProcessTaskObservationStages {
+            status: ProcessHandleObservationStage::SecondTaskStatus,
+            user_namespace: ProcessHandleObservationStage::SecondTaskUserNamespace,
+            mount_namespace: ProcessHandleObservationStage::SecondTaskMountNamespace,
+            network_namespace: ProcessHandleObservationStage::SecondTaskNetworkNamespace,
+        };
+
+    #[derive(Clone, Copy)]
+    struct ProcessCredentialMapObservationStages {
+        uid: ProcessHandleObservationStage,
+        gid: ProcessHandleObservationStage,
+    }
+
+    const FIRST_CREDENTIAL_MAP_STAGES: ProcessCredentialMapObservationStages =
+        ProcessCredentialMapObservationStages {
+            uid: ProcessHandleObservationStage::FirstUidMap,
+            gid: ProcessHandleObservationStage::FirstGidMap,
+        };
+    const SECOND_CREDENTIAL_MAP_STAGES: ProcessCredentialMapObservationStages =
+        ProcessCredentialMapObservationStages {
+            uid: ProcessHandleObservationStage::SecondUidMap,
+            gid: ProcessHandleObservationStage::SecondGidMap,
+        };
 
     #[derive(Clone, Copy, Debug)]
     pub(super) struct ProcessObservationCensusPass<'a> {
@@ -693,19 +1047,49 @@ mod implementation {
         length: u32,
     }
 
-    pub(super) fn open_child(child: &Child) -> Result<ProcessHandle, ProcessHandleError> {
-        require_waitable_child_disposition()?;
-        require_procfs_pid_namespace()?;
+    pub(super) fn open_child(child: &Child) -> Result<ProcessHandle, ProcessHandleOpenError> {
+        require_waitable_child_disposition().map_err(|source| {
+            ProcessHandleOpenError::new(ProcessHandleOpenStage::ChildDispositionBeforeOpen, source)
+        })?;
+        require_procfs_pid_namespace().map_err(|source| {
+            ProcessHandleOpenError::new(ProcessHandleOpenStage::ProcfsPidNamespace, source)
+        })?;
         let raw_pid = child.id();
         let pid = NonZeroU32::new(raw_pid)
             .filter(|pid| i32::try_from(pid.get()).is_ok())
-            .ok_or(ProcessHandleError::InvalidChildPid { pid: raw_pid })?;
-        require_waitable_child_pid(pid)?;
-        let pidfd = open_pidfd(pid)?;
-        require_waitable_child(&pidfd, pid)?;
-        let observation = observe(&pidfd, pid, None)?;
-        require_waitable_child_disposition()?;
-        require_waitable_child(&pidfd, pid)?;
+            .ok_or_else(|| {
+                ProcessHandleOpenError::new(
+                    ProcessHandleOpenStage::ChildIdentity,
+                    ProcessHandleError::InvalidChildPid { pid: raw_pid },
+                )
+            })?;
+        require_waitable_child_pid(pid).map_err(|source| {
+            ProcessHandleOpenError::new(ProcessHandleOpenStage::ChildOwnershipBeforePidFd, source)
+        })?;
+        let pidfd = open_pidfd(pid).map_err(|source| {
+            ProcessHandleOpenError::new(ProcessHandleOpenStage::PidFdOpen, source)
+        })?;
+        require_waitable_child(&pidfd, pid).map_err(|source| {
+            ProcessHandleOpenError::new(ProcessHandleOpenStage::PidFdChildOwnership, source)
+        })?;
+        let observation = observe(&pidfd, pid, None).map_err(|error| {
+            ProcessHandleOpenError::new(
+                ProcessHandleOpenStage::InitialObservation(error.stage()),
+                error.into_source(),
+            )
+        })?;
+        require_waitable_child_disposition().map_err(|source| {
+            ProcessHandleOpenError::new(
+                ProcessHandleOpenStage::ChildDispositionAfterObservation,
+                source,
+            )
+        })?;
+        require_waitable_child(&pidfd, pid).map_err(|source| {
+            ProcessHandleOpenError::new(
+                ProcessHandleOpenStage::ChildOwnershipAfterObservation,
+                source,
+            )
+        })?;
         Ok(ProcessHandle {
             identity: observation.identity,
             credentials: observation.credentials,
@@ -716,7 +1100,7 @@ mod implementation {
 
     pub(super) fn reobserve(
         handle: &ProcessHandle,
-    ) -> Result<ProcessObservation, ProcessHandleError> {
+    ) -> Result<ProcessObservation, ProcessHandleObservationError> {
         observe(
             &handle.transport.pidfd,
             handle.identity.pid(),
@@ -757,50 +1141,113 @@ mod implementation {
         pidfd: &OwnedFd,
         expected_pid: NonZeroU32,
         expected_identity: Option<ProcessIdentity>,
-    ) -> Result<ProcessObservation, ProcessHandleError> {
-        require_waitable_child_disposition()?;
-        require_procfs_pid_namespace()?;
-        require_live(pidfd, expected_pid)?;
-        require_waitable_child(pidfd, expected_pid)?;
-        require_pidfd_pid(pidfd, expected_pid)?;
+    ) -> Result<ProcessObservation, ProcessHandleObservationError> {
+        require_waitable_child_disposition().map_err(|source| {
+            ProcessHandleObservationError::new(
+                ProcessHandleObservationStage::ChildDispositionBeforeObservation,
+                source,
+            )
+        })?;
+        require_procfs_pid_namespace().map_err(|source| {
+            ProcessHandleObservationError::new(
+                ProcessHandleObservationStage::ProcfsPidNamespace,
+                source,
+            )
+        })?;
+        require_live(pidfd, expected_pid).map_err(|source| {
+            ProcessHandleObservationError::new(
+                ProcessHandleObservationStage::PidFdLivenessBeforeObservation,
+                source,
+            )
+        })?;
+        require_waitable_child(pidfd, expected_pid).map_err(|source| {
+            ProcessHandleObservationError::new(
+                ProcessHandleObservationStage::PidFdChildOwnershipBeforeObservation,
+                source,
+            )
+        })?;
+        require_pidfd_pid(pidfd, expected_pid).map_err(|source| {
+            ProcessHandleObservationError::new(
+                ProcessHandleObservationStage::PidFdIdentityBeforeObservation,
+                source,
+            )
+        })?;
 
         let stat_path = proc_process_path(expected_pid, "stat");
         let stat = read_bounded(&stat_path, PROC_STAT_LIMIT, "read process stat")
-            .map_err(|error| prefer_exit(pidfd, expected_pid, error))?;
+            .map_err(|error| prefer_exit(pidfd, expected_pid, error))
+            .map_err(|source| {
+                ProcessHandleObservationError::new(
+                    ProcessHandleObservationStage::ProcessIdentity,
+                    source,
+                )
+            })?;
         let identity = parse_proc_stat(&stat)
             .ok_or_else(|| ProcessHandleError::MalformedProcStat {
                 path: stat_path.clone(),
             })
-            .map_err(|error| prefer_exit(pidfd, expected_pid, error))?;
+            .map_err(|error| prefer_exit(pidfd, expected_pid, error))
+            .map_err(|source| {
+                ProcessHandleObservationError::new(
+                    ProcessHandleObservationStage::ProcessIdentity,
+                    source,
+                )
+            })?;
         if identity.pid() != expected_pid {
-            return Err(prefer_exit(
-                pidfd,
-                expected_pid,
-                ProcessHandleError::PidFdIdentityMismatch {
-                    expected: expected_pid,
-                    observed: identity.pid(),
-                },
+            return Err(ProcessHandleObservationError::new(
+                ProcessHandleObservationStage::ProcessIdentity,
+                prefer_exit(
+                    pidfd,
+                    expected_pid,
+                    ProcessHandleError::PidFdIdentityMismatch {
+                        expected: expected_pid,
+                        observed: identity.pid(),
+                    },
+                ),
             ));
         }
         if let Some(expected) = expected_identity
             && identity != expected
         {
-            return Err(prefer_exit(
-                pidfd,
-                expected_pid,
-                ProcessHandleError::ProcessIdentityMismatch {
-                    expected,
-                    observed: identity,
-                },
+            return Err(ProcessHandleObservationError::new(
+                ProcessHandleObservationStage::ProcessIdentity,
+                prefer_exit(
+                    pidfd,
+                    expected_pid,
+                    ProcessHandleError::ProcessIdentityMismatch {
+                        expected,
+                        observed: identity,
+                    },
+                ),
             ));
         }
 
         let (credentials, domain) = observe_process_state(pidfd, expected_pid)?;
 
-        require_pidfd_pid(pidfd, expected_pid)?;
-        require_waitable_child(pidfd, expected_pid)?;
-        require_live(pidfd, expected_pid)?;
-        require_waitable_child_disposition()?;
+        require_pidfd_pid(pidfd, expected_pid).map_err(|source| {
+            ProcessHandleObservationError::new(
+                ProcessHandleObservationStage::PidFdIdentityAfterObservation,
+                source,
+            )
+        })?;
+        require_waitable_child(pidfd, expected_pid).map_err(|source| {
+            ProcessHandleObservationError::new(
+                ProcessHandleObservationStage::PidFdChildOwnershipAfterObservation,
+                source,
+            )
+        })?;
+        require_live(pidfd, expected_pid).map_err(|source| {
+            ProcessHandleObservationError::new(
+                ProcessHandleObservationStage::PidFdLivenessAfterObservation,
+                source,
+            )
+        })?;
+        require_waitable_child_disposition().map_err(|source| {
+            ProcessHandleObservationError::new(
+                ProcessHandleObservationStage::ChildDispositionAfterObservation,
+                source,
+            )
+        })?;
         Ok(ProcessObservation {
             identity,
             credentials,
@@ -822,14 +1269,54 @@ mod implementation {
     fn observe_process_state(
         pidfd: &OwnedFd,
         pid: NonZeroU32,
-    ) -> Result<(ProcessCredentials, ProcessDomainObservation), ProcessHandleError> {
-        let first_ids = scan_process_task_ids(pidfd, pid)?;
-        let first = read_process_task_observations(pidfd, pid, &first_ids)?;
-        let first_maps = read_process_credential_maps(pidfd, pid)?;
-        let middle_ids = scan_process_task_ids(pidfd, pid)?;
-        let second = read_process_task_observations(pidfd, pid, &middle_ids)?;
-        let second_maps = read_process_credential_maps(pidfd, pid)?;
-        let final_ids = scan_process_task_ids(pidfd, pid)?;
+    ) -> Result<(ProcessCredentials, ProcessDomainObservation), ProcessHandleObservationError> {
+        let user_namespace_support = observe_user_namespace_support().map_err(|source| {
+            ProcessHandleObservationError::new(
+                ProcessHandleObservationStage::UserNamespaceSupportBeforeObservation,
+                source,
+            )
+        })?;
+        let first_ids = scan_process_task_ids(pidfd, pid).map_err(|source| {
+            ProcessHandleObservationError::new(ProcessHandleObservationStage::FirstTaskIds, source)
+        })?;
+        let first = read_process_task_observations(
+            pidfd,
+            pid,
+            &first_ids,
+            user_namespace_support,
+            FIRST_TASK_OBSERVATION_STAGES,
+        )?;
+        let first_maps = read_process_credential_maps(
+            pidfd,
+            pid,
+            user_namespace_support,
+            FIRST_CREDENTIAL_MAP_STAGES,
+        )?;
+        let middle_ids = scan_process_task_ids(pidfd, pid).map_err(|source| {
+            ProcessHandleObservationError::new(ProcessHandleObservationStage::SecondTaskIds, source)
+        })?;
+        let second = read_process_task_observations(
+            pidfd,
+            pid,
+            &middle_ids,
+            user_namespace_support,
+            SECOND_TASK_OBSERVATION_STAGES,
+        )?;
+        let second_maps = read_process_credential_maps(
+            pidfd,
+            pid,
+            user_namespace_support,
+            SECOND_CREDENTIAL_MAP_STAGES,
+        )?;
+        let final_ids = scan_process_task_ids(pidfd, pid).map_err(|source| {
+            ProcessHandleObservationError::new(ProcessHandleObservationStage::FinalTaskIds, source)
+        })?;
+        let final_user_namespace_support = observe_user_namespace_support().map_err(|source| {
+            ProcessHandleObservationError::new(
+                ProcessHandleObservationStage::UserNamespaceSupportAfterObservation,
+                source,
+            )
+        })?;
         validate_process_observation_census(
             pid,
             ProcessObservationCensusPass {
@@ -843,7 +1330,15 @@ mod implementation {
                 credential_maps: second_maps,
             },
             &final_ids,
+            user_namespace_support,
+            final_user_namespace_support,
         )
+        .map_err(|source| {
+            ProcessHandleObservationError::new(
+                ProcessHandleObservationStage::CensusValidation,
+                source,
+            )
+        })
     }
 
     pub(super) fn validate_process_observation_census(
@@ -851,7 +1346,12 @@ mod implementation {
         first: ProcessObservationCensusPass<'_>,
         second: ProcessObservationCensusPass<'_>,
         final_ids: &[NonZeroU32],
+        user_namespace_support: UserNamespaceSupport,
+        final_user_namespace_support: UserNamespaceSupport,
     ) -> Result<(ProcessCredentials, ProcessDomainObservation), ProcessHandleError> {
+        if user_namespace_support != final_user_namespace_support {
+            return Err(ProcessHandleError::ProcessUserNamespaceSupportChanged { pid });
+        }
         let first_aligned = first.task_observations.len() == first.task_ids.len()
             && first
                 .task_observations
@@ -907,26 +1407,76 @@ mod implementation {
                 });
             }
         }
-        if first.credential_maps.uid != second.credential_maps.uid {
-            return Err(ProcessHandleError::ProcessCredentialMapChanged {
-                pid,
-                map: ProcessCredentialMapKind::Uid,
-            });
-        }
-        if first.credential_maps.gid != second.credential_maps.gid {
-            return Err(ProcessHandleError::ProcessCredentialMapChanged {
-                pid,
-                map: ProcessCredentialMapKind::Gid,
-            });
-        }
+        let user_namespace = match (
+            user_namespace_support,
+            leader.namespaces.user,
+            first.credential_maps,
+            second.credential_maps,
+        ) {
+            (
+                UserNamespaceSupport::Unsupported,
+                ProcessTaskUserNamespaceObservation::Unsupported,
+                ProcessCredentialMapObservation::Unsupported,
+                ProcessCredentialMapObservation::Unsupported,
+            ) if first.task_observations.iter().all(|(_, observation)| {
+                observation.namespaces.user == ProcessTaskUserNamespaceObservation::Unsupported
+            }) && second.task_observations.iter().all(|(_, observation)| {
+                observation.namespaces.user == ProcessTaskUserNamespaceObservation::Unsupported
+            }) =>
+            {
+                ProcessUserNamespaceObservation::Unsupported
+            }
+            (
+                UserNamespaceSupport::Supported,
+                ProcessTaskUserNamespaceObservation::Observed(namespace),
+                ProcessCredentialMapObservation::Observed {
+                    uid: first_uid,
+                    gid: first_gid,
+                },
+                ProcessCredentialMapObservation::Observed {
+                    uid: second_uid,
+                    gid: second_gid,
+                },
+            ) if first.task_observations.iter().all(|(_, observation)| {
+                matches!(
+                    observation.namespaces.user,
+                    ProcessTaskUserNamespaceObservation::Observed(_)
+                )
+            }) && second.task_observations.iter().all(|(_, observation)| {
+                matches!(
+                    observation.namespaces.user,
+                    ProcessTaskUserNamespaceObservation::Observed(_)
+                )
+            }) =>
+            {
+                if first_uid != second_uid {
+                    return Err(ProcessHandleError::ProcessCredentialMapChanged {
+                        pid,
+                        map: ProcessCredentialMapKind::Uid,
+                    });
+                }
+                if first_gid != second_gid {
+                    return Err(ProcessHandleError::ProcessCredentialMapChanged {
+                        pid,
+                        map: ProcessCredentialMapKind::Gid,
+                    });
+                }
+                ProcessUserNamespaceObservation::Observed {
+                    namespace,
+                    uid_map_digest: second_uid,
+                    gid_map_digest: second_gid,
+                }
+            }
+            _ => {
+                return Err(ProcessHandleError::ProcessUserNamespaceObservationMismatch { pid });
+            }
+        };
         Ok((
             leader.credentials.clone(),
             ProcessDomainObservation {
-                user_namespace: leader.namespaces.user,
+                user_namespace,
                 mount_namespace: leader.namespaces.mount,
                 network_namespace: leader.namespaces.network,
-                uid_map_digest: second.credential_maps.uid,
-                gid_map_digest: second.credential_maps.gid,
             },
         ))
     }
@@ -981,31 +1531,54 @@ mod implementation {
         pidfd: &OwnedFd,
         pid: NonZeroU32,
         threads: &[NonZeroU32],
-    ) -> Result<Vec<(NonZeroU32, ProcessTaskObservation)>, ProcessHandleError> {
+        user_namespace_support: UserNamespaceSupport,
+        stages: ProcessTaskObservationStages,
+    ) -> Result<Vec<(NonZeroU32, ProcessTaskObservation)>, ProcessHandleObservationError> {
         let mut observations = Vec::with_capacity(threads.len());
         for thread in threads {
             let path = PathBuf::from(format!("/proc/{pid}/task/{thread}/status"));
             let status = read_bounded(&path, PROC_STATUS_LIMIT, "read process task status")
-                .map_err(|error| prefer_task_change_or_exit(pidfd, pid, threads, error))?;
+                .map_err(|error| prefer_task_change_or_exit(pidfd, pid, threads, error))
+                .map_err(|source| ProcessHandleObservationError::new(stages.status, source))?;
             let (status_tgid, status_pid, credentials) = parse_proc_status(&status)
                 .ok_or_else(|| ProcessHandleError::MalformedProcStatus { path: path.clone() })
-                .map_err(|error| prefer_task_change_or_exit(pidfd, pid, threads, error))?;
+                .map_err(|error| prefer_task_change_or_exit(pidfd, pid, threads, error))
+                .map_err(|source| ProcessHandleObservationError::new(stages.status, source))?;
             if status_tgid != pid {
-                return Err(ProcessHandleError::ProcessStatusTgidMismatch {
-                    expected: pid,
-                    observed: status_tgid,
-                });
+                return Err(ProcessHandleObservationError::new(
+                    stages.status,
+                    ProcessHandleError::ProcessStatusTgidMismatch {
+                        expected: pid,
+                        observed: status_tgid,
+                    },
+                ));
             }
             if status_pid != *thread {
-                return Err(ProcessHandleError::ProcessStatusPidMismatch {
-                    expected: *thread,
-                    observed: status_pid,
-                });
+                return Err(ProcessHandleObservationError::new(
+                    stages.status,
+                    ProcessHandleError::ProcessStatusPidMismatch {
+                        expected: *thread,
+                        observed: status_pid,
+                    },
+                ));
             }
             let namespaces = ProcessTaskNamespaces {
-                user: read_process_task_namespace(pidfd, pid, threads, *thread, "user")?,
-                mount: read_process_task_namespace(pidfd, pid, threads, *thread, "mnt")?,
-                network: read_process_task_namespace(pidfd, pid, threads, *thread, "net")?,
+                user: read_process_task_user_namespace(
+                    pidfd,
+                    pid,
+                    threads,
+                    *thread,
+                    user_namespace_support,
+                )
+                .map_err(|source| {
+                    ProcessHandleObservationError::new(stages.user_namespace, source)
+                })?,
+                mount: read_process_task_namespace(pidfd, pid, threads, *thread, "mnt").map_err(
+                    |source| ProcessHandleObservationError::new(stages.mount_namespace, source),
+                )?,
+                network: read_process_task_namespace(pidfd, pid, threads, *thread, "net").map_err(
+                    |source| ProcessHandleObservationError::new(stages.network_namespace, source),
+                )?,
             };
             observations.push((
                 *thread,
@@ -1018,6 +1591,35 @@ mod implementation {
         Ok(observations)
     }
 
+    fn read_process_task_user_namespace(
+        pidfd: &OwnedFd,
+        pid: NonZeroU32,
+        threads: &[NonZeroU32],
+        thread: NonZeroU32,
+        support: UserNamespaceSupport,
+    ) -> Result<ProcessTaskUserNamespaceObservation, ProcessHandleError> {
+        let path = PathBuf::from(format!("/proc/{pid}/task/{thread}/ns/user"));
+        let file = open_optional_process_domain_file(&path, "open process user namespace")
+            .map_err(|error| prefer_task_change_or_exit(pidfd, pid, threads, error))?;
+        match (support, file) {
+            (UserNamespaceSupport::Unsupported, None) => {
+                Ok(ProcessTaskUserNamespaceObservation::Unsupported)
+            }
+            (UserNamespaceSupport::Supported, Some(file)) => {
+                read_process_namespace_identity(file, &path, "inspect process user namespace")
+                    .map(ProcessTaskUserNamespaceObservation::Observed)
+                    .map_err(|error| prefer_task_change_or_exit(pidfd, pid, threads, error))
+            }
+            (UserNamespaceSupport::Unsupported, Some(_))
+            | (UserNamespaceSupport::Supported, None) => Err(prefer_task_change_or_exit(
+                pidfd,
+                pid,
+                threads,
+                ProcessHandleError::ProcessUserNamespaceObservationMismatch { pid },
+            )),
+        }
+    }
+
     fn read_process_task_namespace(
         pidfd: &OwnedFd,
         pid: NonZeroU32,
@@ -1027,75 +1629,127 @@ mod implementation {
     ) -> Result<ProcessNamespaceIdentity, ProcessHandleError> {
         let path = PathBuf::from(format!("/proc/{pid}/task/{thread}/ns/{namespace}"));
         let file = File::open(&path)
-            .map_err(|source| process_domain_system_error("open process namespace", &path, source))
-            .map_err(|error| prefer_task_change_or_exit(pidfd, pid, threads, error))?;
-        let metadata = file
-            .metadata()
-            .map_err(|source| {
-                process_domain_system_error("inspect process namespace", &path, source)
+            .map_err(|source| ProcessHandleError::SystemCall {
+                operation: "open process namespace",
+                path: Some(path.clone()),
+                source,
             })
             .map_err(|error| prefer_task_change_or_exit(pidfd, pid, threads, error))?;
-        let inode = NonZeroU64::new(metadata.ino())
-            .ok_or_else(|| ProcessHandleError::MalformedProcessNamespace { path: path.clone() })
-            .map_err(|error| prefer_task_change_or_exit(pidfd, pid, threads, error))?;
+        read_process_namespace_identity(file, &path, "inspect process namespace")
+            .map_err(|error| prefer_task_change_or_exit(pidfd, pid, threads, error))
+    }
+
+    fn read_process_namespace_identity(
+        file: File,
+        path: &Path,
+        operation: &'static str,
+    ) -> Result<ProcessNamespaceIdentity, ProcessHandleError> {
+        let metadata = file
+            .metadata()
+            .map_err(|source| ProcessHandleError::SystemCall {
+                operation,
+                path: Some(path.to_path_buf()),
+                source,
+            })?;
+        let inode = NonZeroU64::new(metadata.ino()).ok_or_else(|| {
+            ProcessHandleError::MalformedProcessNamespace {
+                path: path.to_path_buf(),
+            }
+        })?;
         Ok(ProcessNamespaceIdentity::new(metadata.dev(), inode))
     }
 
     fn read_process_credential_maps(
         pidfd: &OwnedFd,
         pid: NonZeroU32,
-    ) -> Result<ProcessCredentialMapObservation, ProcessHandleError> {
-        Ok(ProcessCredentialMapObservation {
-            uid: read_process_credential_map(pidfd, pid, ProcessCredentialMapKind::Uid)?,
-            gid: read_process_credential_map(pidfd, pid, ProcessCredentialMapKind::Gid)?,
-        })
+        support: UserNamespaceSupport,
+        stages: ProcessCredentialMapObservationStages,
+    ) -> Result<ProcessCredentialMapObservation, ProcessHandleObservationError> {
+        let uid = read_process_credential_map(pidfd, pid, ProcessCredentialMapKind::Uid, support)
+            .map_err(|source| ProcessHandleObservationError::new(stages.uid, source))?;
+        let gid = read_process_credential_map(pidfd, pid, ProcessCredentialMapKind::Gid, support)
+            .map_err(|source| ProcessHandleObservationError::new(stages.gid, source))?;
+        match (uid, gid) {
+            (None, None) => Ok(ProcessCredentialMapObservation::Unsupported),
+            (Some(uid), Some(gid)) => Ok(ProcessCredentialMapObservation::Observed { uid, gid }),
+            (None, Some(_)) | (Some(_), None) => Err(ProcessHandleObservationError::new(
+                stages.gid,
+                ProcessHandleError::ProcessUserNamespaceObservationMismatch { pid },
+            )),
+        }
     }
 
     fn read_process_credential_map(
         pidfd: &OwnedFd,
         pid: NonZeroU32,
         kind: ProcessCredentialMapKind,
-    ) -> Result<ProcessCredentialMapDigest, ProcessHandleError> {
+        support: UserNamespaceSupport,
+    ) -> Result<Option<ProcessCredentialMapDigest>, ProcessHandleError> {
         let leaf = match kind {
             ProcessCredentialMapKind::Uid => "uid_map",
             ProcessCredentialMapKind::Gid => "gid_map",
         };
         let path = proc_process_path(pid, leaf);
-        let contents = read_bounded(&path, PROC_ID_MAP_LIMIT, "read process credential map")
-            .map_err(|error| process_domain_read_error(&path, error))
+        let file = open_optional_process_domain_file(&path, "open process credential map")
             .map_err(|error| prefer_exit(pidfd, pid, error))?;
-        digest_process_id_map(&contents, &path, kind)
-            .map_err(|error| prefer_exit(pidfd, pid, error))
-    }
-
-    fn process_domain_read_error(path: &Path, error: ProcessHandleError) -> ProcessHandleError {
-        match error {
-            ProcessHandleError::SystemCall { source, .. }
-                if source.kind() == io::ErrorKind::NotFound =>
-            {
-                ProcessHandleError::ProcessDomainUnsupported {
-                    path: path.to_path_buf(),
-                }
+        match (support, file) {
+            (UserNamespaceSupport::Unsupported, None) => Ok(None),
+            (UserNamespaceSupport::Supported, Some(file)) => {
+                let contents = read_file_bounded(
+                    file,
+                    &path,
+                    PROC_ID_MAP_LIMIT,
+                    "read process credential map",
+                )
+                .map_err(|error| prefer_exit(pidfd, pid, error))?;
+                digest_process_id_map(&contents, &path, kind)
+                    .map(Some)
+                    .map_err(|error| prefer_exit(pidfd, pid, error))
             }
-            error => error,
+            (UserNamespaceSupport::Unsupported, Some(_))
+            | (UserNamespaceSupport::Supported, None) => Err(prefer_exit(
+                pidfd,
+                pid,
+                ProcessHandleError::ProcessUserNamespaceObservationMismatch { pid },
+            )),
         }
     }
 
-    fn process_domain_system_error(
-        operation: &'static str,
+    fn open_optional_process_domain_file(
         path: &Path,
-        source: io::Error,
-    ) -> ProcessHandleError {
-        if source.kind() == io::ErrorKind::NotFound {
-            ProcessHandleError::ProcessDomainUnsupported {
-                path: path.to_path_buf(),
-            }
-        } else {
-            ProcessHandleError::SystemCall {
+        operation: &'static str,
+    ) -> Result<Option<File>, ProcessHandleError> {
+        match File::open(path) {
+            Ok(file) => Ok(Some(file)),
+            Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(source) => Err(ProcessHandleError::SystemCall {
                 operation,
                 path: Some(path.to_path_buf()),
                 source,
-            }
+            }),
+        }
+    }
+
+    fn observe_user_namespace_support() -> Result<UserNamespaceSupport, ProcessHandleError> {
+        let present = [
+            (
+                Path::new("/proc/self/ns/user"),
+                "probe observer user namespace",
+            ),
+            (Path::new("/proc/self/uid_map"), "probe observer UID map"),
+            (Path::new("/proc/self/gid_map"), "probe observer GID map"),
+        ]
+        .map(|(path, operation)| {
+            open_optional_process_domain_file(path, operation).map(|file| file.is_some())
+        });
+        let [user_namespace, uid_map, gid_map] = present;
+        let user_namespace = user_namespace?;
+        let uid_map = uid_map?;
+        let gid_map = gid_map?;
+        match (user_namespace, uid_map, gid_map) {
+            (true, true, true) => Ok(UserNamespaceSupport::Supported),
+            (false, false, false) => Ok(UserNamespaceSupport::Unsupported),
+            _ => Err(ProcessHandleError::ProcessUserNamespaceSupportIncoherent),
         }
     }
 
@@ -1433,6 +2087,15 @@ mod implementation {
             path: Some(path.to_path_buf()),
             source,
         })?;
+        read_file_bounded(file, path, limit, operation)
+    }
+
+    fn read_file_bounded(
+        file: File,
+        path: &Path,
+        limit: usize,
+        operation: &'static str,
+    ) -> Result<Vec<u8>, ProcessHandleError> {
         let read_limit = u64::try_from(limit)
             .expect("proc observation limits fit u64")
             .saturating_add(1);
@@ -1600,17 +2263,21 @@ mod implementation {
 mod implementation {
     use std::process::Child;
 
-    use super::{ProcessHandle, ProcessHandleError, ProcessObservation};
+    use super::{
+        ProcessHandle, ProcessHandleError, ProcessHandleObservationError, ProcessHandleOpenError,
+        ProcessHandleOpenStage, ProcessObservation,
+    };
 
-    pub(super) fn open_child(_child: &Child) -> Result<ProcessHandle, ProcessHandleError> {
-        Err(ProcessHandleError::UnsupportedPlatform(
-            std::env::consts::OS,
+    pub(super) fn open_child(_child: &Child) -> Result<ProcessHandle, ProcessHandleOpenError> {
+        Err(ProcessHandleOpenError::new(
+            ProcessHandleOpenStage::Start,
+            ProcessHandleError::UnsupportedPlatform(std::env::consts::OS),
         ))
     }
 
     pub(super) fn reobserve(
         handle: &ProcessHandle,
-    ) -> Result<ProcessObservation, ProcessHandleError> {
+    ) -> Result<ProcessObservation, ProcessHandleObservationError> {
         match handle.transport._never {}
     }
 }

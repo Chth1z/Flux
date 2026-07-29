@@ -13,11 +13,14 @@ use std::time::{Duration, Instant};
 
 use flux_core::{CaptureGroupId, CaptureUserId, EngineCredentials};
 use flux_platform::internal::{
-    EngineCredentialProbeConfig, EngineCredentialProbeReport, PinnedSingBoxLaunch,
-    SingBoxProcessAdapter, TerminationOutcome, validate_engine_process_credentials,
+    ENGINE_CREDENTIAL_PROBE_STAGE_RECEIPT_NAME, ENGINE_CREDENTIAL_PROBE_STAGE_TEMPORARY_NAME,
+    EngineCredentialProbeConfig, EngineCredentialProbeReport, EngineCredentialProbeStage,
+    PinnedSingBoxLaunch, SingBoxProcessAdapter, TerminationOutcome,
+    validate_engine_process_credentials,
 };
 use flux_platform::{
-    ProcessHandleErrorKind, SingBoxExit, SingBoxLaunchSpec, SingBoxPrivilege, SingBoxReadiness,
+    ProcessHandleErrorKind, ProcessHandleOpenStage, SingBoxExit, SingBoxLaunchSpec,
+    SingBoxPrivilege, SingBoxReadiness,
 };
 
 use super::{
@@ -35,6 +38,43 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const STOP_TIMEOUT: Duration = Duration::from_secs(3);
 const PARENT_DEATH_TIMEOUT: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+#[derive(Clone, Copy)]
+struct CredentialLifecycleStages {
+    validation: EngineCredentialProbeStage,
+    spawn: EngineCredentialProbeStage,
+    readiness: EngineCredentialProbeStage,
+    process_handle: fn(ProcessHandleOpenStage) -> EngineCredentialProbeStage,
+    initial_credentials: EngineCredentialProbeStage,
+    reobservation: EngineCredentialProbeStage,
+    report: EngineCredentialProbeStage,
+    termination: EngineCredentialProbeStage,
+    post_reap: EngineCredentialProbeStage,
+}
+
+const ROOT_LIFECYCLE_STAGES: CredentialLifecycleStages = CredentialLifecycleStages {
+    validation: EngineCredentialProbeStage::RootValidation,
+    spawn: EngineCredentialProbeStage::RootSpawn,
+    readiness: EngineCredentialProbeStage::RootReadiness,
+    process_handle: EngineCredentialProbeStage::RootProcessHandle,
+    initial_credentials: EngineCredentialProbeStage::RootInitialCredentials,
+    reobservation: EngineCredentialProbeStage::RootReobservation,
+    report: EngineCredentialProbeStage::RootReport,
+    termination: EngineCredentialProbeStage::RootTermination,
+    post_reap: EngineCredentialProbeStage::RootPostReap,
+};
+
+const DEVICE_GID_LIFECYCLE_STAGES: CredentialLifecycleStages = CredentialLifecycleStages {
+    validation: EngineCredentialProbeStage::DeviceGidValidation,
+    spawn: EngineCredentialProbeStage::DeviceGidSpawn,
+    readiness: EngineCredentialProbeStage::DeviceGidReadiness,
+    process_handle: EngineCredentialProbeStage::DeviceGidProcessHandle,
+    initial_credentials: EngineCredentialProbeStage::DeviceGidInitialCredentials,
+    reobservation: EngineCredentialProbeStage::DeviceGidReobservation,
+    report: EngineCredentialProbeStage::DeviceGidReport,
+    termination: EngineCredentialProbeStage::DeviceGidTermination,
+    post_reap: EngineCredentialProbeStage::DeviceGidPostReap,
+};
 
 pub(super) fn run() {
     if let Err(error) = run_checkpoint() {
@@ -60,8 +100,20 @@ fn run_checkpoint() -> Result<(), String> {
     }
     let root_credentials = credentials(0, 0)?;
     let device_gid_credentials = credentials(0, candidate_gid)?;
-    exercise_lifecycle(root, &probe, "root", root_credentials)?;
-    exercise_lifecycle(root, &probe, "device-gid", device_gid_credentials)?;
+    exercise_lifecycle(
+        root,
+        &probe,
+        "root",
+        root_credentials,
+        ROOT_LIFECYCLE_STAGES,
+    )?;
+    exercise_lifecycle(
+        root,
+        &probe,
+        "device-gid",
+        device_gid_credentials,
+        DEVICE_GID_LIFECYCLE_STAGES,
+    )?;
     exercise_parent_death(root, &probe, root_credentials)?;
     println!(
         "Android engine credential checkpoint passed for two credential profiles and parent-death containment"
@@ -79,6 +131,20 @@ fn require_authority() -> Result<(), String> {
 
 fn required_env(name: &str) -> Result<String, String> {
     env::var(name).map_err(|_| format!("{name} must be present and valid UTF-8"))
+}
+
+fn publish_credential_stage(root: &Path, stage: EngineCredentialProbeStage) -> Result<(), String> {
+    let receipt = root
+        .join("tmp")
+        .join(ENGINE_CREDENTIAL_PROBE_STAGE_RECEIPT_NAME);
+    let temporary = root
+        .join("tmp")
+        .join(ENGINE_CREDENTIAL_PROBE_STAGE_TEMPORARY_NAME);
+    remove_files(&[receipt.clone(), temporary.clone()])?;
+    let _temporary_cleanup = FileCleanup::new(vec![temporary.clone()]);
+    write_new_file(&temporary, format!("{}\n", stage.as_str()).as_bytes())?;
+    fs::rename(&temporary, &receipt)
+        .map_err(|error| format!("publish credential stage atomically: {error}"))
 }
 
 fn probe_path() -> Result<PathBuf, String> {
@@ -102,11 +168,12 @@ fn exercise_lifecycle(
     probe: &Path,
     label: &str,
     expected: EngineCredentials,
+    stages: CredentialLifecycleStages,
 ) -> Result<(), String> {
     let paths = ProbeCasePaths::new(root, label);
     let owned_paths = paths.all();
     let _cleanup = FileCleanup::new(owned_paths.clone());
-    let checkpoint = exercise_lifecycle_inner(root, probe, &paths, expected);
+    let checkpoint = exercise_lifecycle_inner(root, probe, &paths, expected, stages);
     combine_checkpoint_and_cleanup(checkpoint, remove_files(&owned_paths))
 }
 
@@ -115,8 +182,10 @@ fn exercise_lifecycle_inner(
     probe: &Path,
     paths: &ProbeCasePaths,
     expected: EngineCredentials,
+    stages: CredentialLifecycleStages,
 ) -> Result<(), String> {
     remove_files(&paths.all())?;
+    publish_credential_stage(root, stages.validation)?;
     let listener_port = reserve_listener_port()?;
     write_config(&paths.config, expected, listener_port, &paths.report)?;
     let pinned = pin_probe(probe, &paths.config)?;
@@ -131,18 +200,29 @@ fn exercise_lifecycle_inner(
         );
     }
 
+    publish_credential_stage(root, stages.spawn)?;
     let mut child = adapter
         .spawn_pinned(&pinned, &spec)
         .map_err(|error| format!("spawn credential probe through production adapter: {error}"))?;
     let exercise = (|| {
+        publish_credential_stage(root, stages.readiness)?;
         adapter
             .wait_ready(&mut child, &spec)
             .map_err(|error| format!("wait for credential probe listener: {error}"))?;
-        let handle = child
-            .open_process_handle()
-            .map_err(|error| format!("open exact credential-probe process handle: {error}"))?;
+        publish_credential_stage(root, (stages.process_handle)(ProcessHandleOpenStage::Start))?;
+        let handle = child.open_process_handle().map_err(|error| {
+            let failure = format!("open exact credential-probe process handle: {error}");
+            match publish_credential_stage(root, (stages.process_handle)(error.stage())) {
+                Ok(()) => failure,
+                Err(publication) => {
+                    format!("{failure}; publish process-handle failure stage: {publication}")
+                }
+            }
+        })?;
+        publish_credential_stage(root, stages.initial_credentials)?;
         let initial = handle.initial_observation();
         validate_engine_process_credentials(initial.credentials(), expected)?;
+        publish_credential_stage(root, stages.reobservation)?;
         thread::sleep(POLL_INTERVAL);
         let reobserved = handle
             .reobserve()
@@ -153,10 +233,15 @@ fn exercise_lifecycle_inner(
                 "pidfd-bound process identity or domain changed during reobservation".to_owned(),
             );
         }
+        publish_credential_stage(root, stages.report)?;
         let report = read_report(&paths.report)?;
         report.validate_for(expected)?;
         Ok(handle)
     })();
+    let exercise = exercise.and_then(|handle| {
+        publish_credential_stage(root, stages.termination)?;
+        Ok(handle)
+    });
     let termination = adapter
         .terminate(&mut child, STOP_TIMEOUT)
         .map_err(|error| format!("terminate and reap credential probe: {error}"));
@@ -175,6 +260,7 @@ fn exercise_lifecycle_inner(
             ));
         }
     };
+    publish_credential_stage(root, stages.post_reap)?;
     let exited = match handle.reobserve() {
         Ok(_) => return Err("reaped credential probe remains observable".to_owned()),
         Err(error) => error,
@@ -201,6 +287,7 @@ fn exercise_parent_death(
     owned_paths.push(identity_temporary_path.clone());
     let _cleanup = FileCleanup::new(owned_paths.clone());
     let checkpoint = exercise_parent_death_inner(
+        root,
         probe,
         expected,
         &paths,
@@ -212,6 +299,7 @@ fn exercise_parent_death(
 }
 
 fn exercise_parent_death_inner(
+    root: &Path,
     probe: &Path,
     expected: EngineCredentials,
     paths: &ProbeCasePaths,
@@ -220,6 +308,7 @@ fn exercise_parent_death_inner(
     owned_paths: &[PathBuf],
 ) -> Result<(), String> {
     remove_files(owned_paths)?;
+    publish_credential_stage(root, EngineCredentialProbeStage::ParentDeathSupervisor)?;
     let listener_port = reserve_listener_port()?;
     write_config(&paths.config, expected, listener_port, &paths.report)?;
 
@@ -255,6 +344,8 @@ fn exercise_parent_death_inner(
     let mut supervisor = supervisor
         .spawn()
         .map_err(|error| format!("spawn parent-death supervisor: {error}"))?;
+    let identity_stage =
+        publish_credential_stage(root, EngineCredentialProbeStage::ParentDeathIdentity);
     let identity =
         wait_for_parent_death_identity(&mut supervisor, identity_path).and_then(|identity| {
             verify_process_identity(identity).map_err(|error| {
@@ -264,13 +355,21 @@ fn exercise_parent_death_inner(
             })?;
             Ok(identity)
         });
-    let supervisor_cleanup = kill_and_reap_supervisor(&mut supervisor);
     match identity {
-        Ok(identity) => combine_checkpoint_and_cleanup(
-            require_parent_death_or_cleanup(identity),
-            supervisor_cleanup,
-        ),
-        Err(error) => combine_checkpoint_and_cleanup::<()>(Err(error), supervisor_cleanup),
+        Ok(identity) => {
+            let containment_stage =
+                publish_credential_stage(root, EngineCredentialProbeStage::ParentDeathContainment);
+            let supervisor_cleanup = kill_and_reap_supervisor(&mut supervisor);
+            let parent_death = require_parent_death_or_cleanup(identity);
+            let result = combine_checkpoint_and_cleanup(identity_stage, containment_stage);
+            let result = combine_checkpoint_and_cleanup(result, supervisor_cleanup);
+            combine_checkpoint_and_cleanup(result, parent_death)
+        }
+        Err(error) => {
+            let supervisor_cleanup = kill_and_reap_supervisor(&mut supervisor);
+            let result = combine_checkpoint_and_cleanup::<()>(Err(error), identity_stage);
+            combine_checkpoint_and_cleanup(result, supervisor_cleanup)
+        }
     }
 }
 

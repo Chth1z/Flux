@@ -448,18 +448,27 @@ impl CanaryCredentialMapDigest {
     }
 }
 
-/// Identity of the user/mount-namespace and ID-map domain in which process
-/// credentials are interpreted for one immutable attempt.
+/// User-namespace and credential-map domain bound to one immutable attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CanaryUserNamespaceBinding {
+    Unsupported,
+    Observed {
+        namespace: CanaryFileIdentity,
+        uid_map_digest: CanaryCredentialMapDigest,
+        gid_map_digest: CanaryCredentialMapDigest,
+    },
+}
+
+/// Namespace domain in which process credentials are interpreted for one
+/// immutable attempt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct CanaryCredentialDomainBinding {
-    user_namespace: CanaryFileIdentity,
+    user_namespace: CanaryUserNamespaceBinding,
     mount_namespace: CanaryFileIdentity,
-    uid_map_digest: CanaryCredentialMapDigest,
-    gid_map_digest: CanaryCredentialMapDigest,
 }
 
 impl CanaryCredentialDomainBinding {
-    pub(crate) fn new(
+    pub(crate) fn observed(
         user_namespace: CanaryFileIdentity,
         mount_namespace: CanaryFileIdentity,
         uid_map_digest: CanaryCredentialMapDigest,
@@ -469,31 +478,31 @@ impl CanaryCredentialDomainBinding {
             return Err(CanaryBindingError::CredentialNamespaceCollision);
         }
         Ok(Self {
-            user_namespace,
+            user_namespace: CanaryUserNamespaceBinding::Observed {
+                namespace: user_namespace,
+                uid_map_digest,
+                gid_map_digest,
+            },
             mount_namespace,
-            uid_map_digest,
-            gid_map_digest,
         })
     }
 
     #[must_use]
-    pub(crate) const fn user_namespace(self) -> CanaryFileIdentity {
+    pub(crate) const fn unsupported(mount_namespace: CanaryFileIdentity) -> Self {
+        Self {
+            user_namespace: CanaryUserNamespaceBinding::Unsupported,
+            mount_namespace,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn user_namespace(self) -> CanaryUserNamespaceBinding {
         self.user_namespace
     }
 
     #[must_use]
     pub(crate) const fn mount_namespace(self) -> CanaryFileIdentity {
         self.mount_namespace
-    }
-
-    #[must_use]
-    pub(crate) const fn uid_map_digest(self) -> CanaryCredentialMapDigest {
-        self.uid_map_digest
-    }
-
-    #[must_use]
-    pub(crate) const fn gid_map_digest(self) -> CanaryCredentialMapDigest {
-        self.gid_map_digest
     }
 }
 
@@ -4749,7 +4758,7 @@ pub(crate) mod tests {
         );
         let namespace = CanaryFileIdentity::new(60, NonZeroU64::new(70).expect("namespace inode"));
         assert_eq!(
-            CanaryCredentialDomainBinding::new(
+            CanaryCredentialDomainBinding::observed(
                 namespace,
                 namespace,
                 CanaryCredentialMapDigest::new([1; CANARY_CREDENTIAL_MAP_DIGEST_BYTES])
@@ -4759,6 +4768,14 @@ pub(crate) mod tests {
             ),
             Err(CanaryBindingError::CredentialNamespaceCollision)
         );
+        let mount_namespace =
+            CanaryFileIdentity::new(60, NonZeroU64::new(71).expect("mount namespace inode"));
+        let unsupported_domain = CanaryCredentialDomainBinding::unsupported(mount_namespace);
+        assert_eq!(
+            unsupported_domain.user_namespace(),
+            CanaryUserNamespaceBinding::Unsupported
+        );
+        assert_eq!(unsupported_domain.mount_namespace(), mount_namespace);
         let fixture = Fixture::new(CanaryAddressFamilies::Ipv4AndIpv6);
         let environment = &fixture.request.pre_binding.environment;
         let probe = environment.probe_credentials();
@@ -6991,7 +7008,7 @@ pub(crate) mod tests {
                     rpdb.engine_uid,
                     NonZeroU32::new(20_001).expect("engine GID"),
                 ),
-                CanaryCredentialDomainBinding::new(
+                CanaryCredentialDomainBinding::observed(
                     CanaryFileIdentity::new(60, NonZeroU64::new(61).expect("user namespace inode")),
                     CanaryFileIdentity::new(
                         60,

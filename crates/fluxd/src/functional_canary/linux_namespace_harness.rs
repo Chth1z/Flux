@@ -99,9 +99,8 @@ fn privileged_local_output_tproxy_checkpoint_exercises_loopback_reinjection_and_
 
 #[test]
 #[cfg(target_os = "android")]
-#[ignore = "requires rooted Android local-OUTPUT and engine credential authority"]
-fn privileged_android_output_tproxy_and_engine_credentials_exercise_exact_cleanup() {
-    local_output_tproxy::run();
+#[ignore = "requires rooted Android engine credential authority"]
+fn privileged_android_engine_credentials_exercise_exact_cleanup() {
     android_engine_credential::run();
 }
 

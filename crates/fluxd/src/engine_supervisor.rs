@@ -20,8 +20,8 @@ use flux_platform::internal::{
     SingBoxVersionReport, TerminationOutcome,
 };
 use flux_platform::{
-    ProcessHandle, ProcessHandleError, ProcessHandleErrorKind, ProcessObservation,
-    ReadinessEvidence, SingBoxExit, SingBoxLaunchSpec,
+    ProcessHandle, ProcessHandleErrorKind, ProcessHandleObservationError, ProcessHandleOpenError,
+    ProcessObservation, ReadinessEvidence, SingBoxExit, SingBoxLaunchSpec,
 };
 use sha2::{Digest, Sha256};
 
@@ -746,7 +746,7 @@ pub(crate) enum EngineChildObservationError {
         observed: OwnedEngineIdentity,
     },
     ProcessHandle {
-        source: ProcessHandleError,
+        source: ProcessHandleObservationError,
     },
     #[cfg(test)]
     ScriptedAuthority,
@@ -865,7 +865,7 @@ pub(crate) enum EngineChildAuthorityError {
         observed: OwnedEngineIdentity,
     },
     ProcessHandle {
-        source: ProcessHandleError,
+        source: ProcessHandleOpenError,
     },
     OpeningIdentityExhausted,
 }

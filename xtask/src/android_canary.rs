@@ -12,6 +12,10 @@ use std::os::unix::process::CommandExt;
 
 use serde_json::Value;
 
+use flux_platform::internal::{
+    ENGINE_CREDENTIAL_PROBE_STAGE_RECEIPT_NAME, EngineCredentialProbeStage,
+};
+
 use super::android_artifact::AndroidArtifactIdentity;
 use super::android_remote::{
     FilesystemIdentity, OwnedRemoteDirectory, OwnedRemoteDirectorySpec, normalize_adb_shell_output,
@@ -19,9 +23,10 @@ use super::android_remote::{
     process_absence_function, run_owned_remote_transaction, shell_single_quote,
 };
 use super::{
-    ANDROID_OUTPUT_TPROXY_ENGINE_CREDENTIAL_CANARY_TEST, ANDROID_RUSTFLAGS, ANDROID_TARGET,
+    ANDROID_ENGINE_CREDENTIAL_CANARY_TEST, ANDROID_RUSTFLAGS, ANDROID_TARGET,
     ANDROID_TARGET_RUSTFLAGS_ENV, LINUX_ANDROID_HOST_BUILD_TMPDIR, LINUX_CANARY_INTERNAL_ENVS,
-    android_kernel, android_linker, validate_aarch64_elf, verify_ndk_revision,
+    LINUX_OUTPUT_TPROXY_CANARY_TEST, android_kernel, android_linker, validate_aarch64_elf,
+    verify_ndk_revision,
 };
 
 pub(super) const COMMAND: &str = "test-functional-canary-android-output-tproxy";
@@ -58,8 +63,16 @@ const MAX_ADB_CAPTURE_BYTES: usize = 256 * 1024;
 const MAX_CARGO_CAPTURE_BYTES: usize = 16 * 1024 * 1024;
 const ADB_QUERY_TIMEOUT: Duration = Duration::from_secs(15);
 const ADB_PUSH_TIMEOUT: Duration = Duration::from_secs(120);
-const REMOTE_TEST_TIMEOUT_SECONDS: u64 = 90;
+const REMOTE_OUTPUT_TEST_TIMEOUT_SECONDS: u64 = 60;
+const REMOTE_CREDENTIAL_TEST_TIMEOUT_SECONDS: u64 = 25;
 const REMOTE_TEST_KILL_GRACE_SECONDS: u64 = 5;
+const REMOTE_PREFLIGHT_IDENTITY_FAILURE_STATUS: i32 = 70;
+const REMOTE_PREFLIGHT_PROCESS_FAILURE_STATUS: i32 = 71;
+const REMOTE_PREFLIGHT_PATH_FAILURE_STATUS: i32 = 72;
+const REMOTE_CONTRACT_FAILURE_STATUS: i32 = 70;
+const REMOTE_OUTPUT_TEST_FAILURE_STATUS: i32 = 74;
+const REMOTE_CREDENTIAL_TEST_FAILURE_STATUS: i32 = 75;
+const REMOTE_CREDENTIAL_STAGE_OUTPUT_PREFIX: &str = "flux-engine-credential-stage:";
 const ADB_EXEC_TIMEOUT: Duration = Duration::from_secs(115);
 const ADB_CLEANUP_TIMEOUT: Duration = Duration::from_secs(20);
 const CARGO_BUILD_TIMEOUT: Duration = Duration::from_secs(15 * 60);
@@ -129,30 +142,82 @@ enum RunnerStage {
     ArtifactElfValidation,
     PrecreateDeviceIdentity,
     RemoteToken,
-    RemotePathPreflight,
+    RemotePathPreflightIdentityBefore,
+    RemotePathPreflightRootIdentity,
+    RemotePathPreflightProcessAbsence,
+    RemotePathPreflightPathAbsence,
+    RemotePathPreflightContract,
+    RemotePathPreflightTransport,
+    RemotePathPreflightNormalization,
+    RemotePathPreflightUnexpectedStatus,
+    RemotePathPreflightUnexpectedOutput,
+    RemotePathPreflightIdentityAfter,
     RemoteDirectoryCreate,
     RemoteExecution,
+    RemoteExecutionPreflight,
+    RemoteTestArtifactPush,
+    RemoteCredentialArtifactPush,
+    RemoteCheckpointTransport,
+    RemoteContract,
+    RemoteShell,
+    RemoteTimeout,
+    LocalOutputCheckpoint,
+    EngineCredentialCheckpoint,
+    EngineCredential(EngineCredentialProbeStage),
     RemoteCleanup,
     RemoteTransaction,
 }
 
 impl RunnerStage {
-    const fn as_str(self) -> &'static str {
+    fn as_str(self) -> String {
         match self {
-            Self::DeviceProfile => "device-profile",
-            Self::NdkEnvironment => "ndk-environment",
-            Self::NdkRevision => "ndk-revision",
-            Self::AndroidLinker => "android-linker",
-            Self::ArtifactBuild => "artifact-build",
-            Self::ArtifactIdentity => "artifact-identity",
-            Self::ArtifactElfValidation => "artifact-elf-validation",
-            Self::PrecreateDeviceIdentity => "precreate-device-identity",
-            Self::RemoteToken => "remote-token",
-            Self::RemotePathPreflight => "remote-path-preflight",
-            Self::RemoteDirectoryCreate => "remote-directory-create",
-            Self::RemoteExecution => "remote-execution",
-            Self::RemoteCleanup => "remote-cleanup",
-            Self::RemoteTransaction => "remote-transaction",
+            Self::DeviceProfile => "device-profile".to_owned(),
+            Self::NdkEnvironment => "ndk-environment".to_owned(),
+            Self::NdkRevision => "ndk-revision".to_owned(),
+            Self::AndroidLinker => "android-linker".to_owned(),
+            Self::ArtifactBuild => "artifact-build".to_owned(),
+            Self::ArtifactIdentity => "artifact-identity".to_owned(),
+            Self::ArtifactElfValidation => "artifact-elf-validation".to_owned(),
+            Self::PrecreateDeviceIdentity => "precreate-device-identity".to_owned(),
+            Self::RemoteToken => "remote-token".to_owned(),
+            Self::RemotePathPreflightIdentityBefore => {
+                "remote-path-preflight-identity-before".to_owned()
+            }
+            Self::RemotePathPreflightRootIdentity => {
+                "remote-path-preflight-root-identity".to_owned()
+            }
+            Self::RemotePathPreflightProcessAbsence => {
+                "remote-path-preflight-process-absence".to_owned()
+            }
+            Self::RemotePathPreflightPathAbsence => "remote-path-preflight-path-absence".to_owned(),
+            Self::RemotePathPreflightContract => "remote-path-preflight-contract".to_owned(),
+            Self::RemotePathPreflightTransport => "remote-path-preflight-transport".to_owned(),
+            Self::RemotePathPreflightNormalization => {
+                "remote-path-preflight-normalization".to_owned()
+            }
+            Self::RemotePathPreflightUnexpectedStatus => {
+                "remote-path-preflight-unexpected-status".to_owned()
+            }
+            Self::RemotePathPreflightUnexpectedOutput => {
+                "remote-path-preflight-unexpected-output".to_owned()
+            }
+            Self::RemotePathPreflightIdentityAfter => {
+                "remote-path-preflight-identity-after".to_owned()
+            }
+            Self::RemoteDirectoryCreate => "remote-directory-create".to_owned(),
+            Self::RemoteExecution => "remote-execution".to_owned(),
+            Self::RemoteExecutionPreflight => "remote-execution-preflight".to_owned(),
+            Self::RemoteTestArtifactPush => "remote-test-artifact-push".to_owned(),
+            Self::RemoteCredentialArtifactPush => "remote-credential-artifact-push".to_owned(),
+            Self::RemoteCheckpointTransport => "remote-checkpoint-transport".to_owned(),
+            Self::RemoteContract => "remote-contract".to_owned(),
+            Self::RemoteShell => "remote-shell".to_owned(),
+            Self::RemoteTimeout => "remote-timeout".to_owned(),
+            Self::LocalOutputCheckpoint => "local-output-checkpoint".to_owned(),
+            Self::EngineCredentialCheckpoint => "engine-credential-checkpoint".to_owned(),
+            Self::EngineCredential(stage) => format!("engine-credential-{}", stage.as_str()),
+            Self::RemoteCleanup => "remote-cleanup".to_owned(),
+            Self::RemoteTransaction => "remote-transaction".to_owned(),
         }
     }
 }
@@ -255,10 +320,7 @@ pub(super) fn run(options: Options) -> Result<(), String> {
         RunnerStage::RemoteToken,
         REMOTE_DIRECTORY_SPEC.generate("Android canary directory"),
     )?;
-    at_runner_stage(
-        RunnerStage::RemotePathPreflight,
-        preflight_remote_directory(&options, &device, &remote),
-    )?;
+    preflight_remote_directory(&options, &device, &remote)?;
     let result = run_owned_remote_transaction(
         &mut remote,
         |remote| {
@@ -268,10 +330,8 @@ pub(super) fn run(options: Options) -> Result<(), String> {
             )
         },
         |remote| {
-            at_runner_stage(
-                RunnerStage::RemoteExecution,
-                push_and_execute(&options, &artifacts, &artifact_identities, &device, remote),
-            )
+            push_and_execute(&options, &artifacts, &artifact_identities, &device, remote)
+                .map_err(classify_remote_execution_error)
         },
         |remote| {
             at_runner_stage(
@@ -304,6 +364,80 @@ fn sanitize_remote_transaction_error(error: String) -> String {
         error
     } else {
         runner_stage_error(RunnerStage::RemoteTransaction)
+    }
+}
+
+fn classify_remote_execution_error(error: String) -> String {
+    for stage in [
+        RunnerStage::RemoteExecutionPreflight,
+        RunnerStage::RemoteTestArtifactPush,
+        RunnerStage::RemoteCredentialArtifactPush,
+        RunnerStage::RemoteCheckpointTransport,
+        RunnerStage::RemoteContract,
+        RunnerStage::RemoteShell,
+        RunnerStage::RemoteTimeout,
+        RunnerStage::LocalOutputCheckpoint,
+        RunnerStage::EngineCredentialCheckpoint,
+    ] {
+        if error == runner_stage_error(stage) {
+            return error;
+        }
+    }
+    for stage in EngineCredentialProbeStage::all() {
+        if error == runner_stage_error(RunnerStage::EngineCredential(stage)) {
+            return error;
+        }
+    }
+    runner_stage_error(RunnerStage::RemoteExecution)
+}
+
+fn credential_stage_from_remote_output(output: &[u8]) -> Option<EngineCredentialProbeStage> {
+    let output = std::str::from_utf8(output).ok()?;
+    let token = output
+        .strip_prefix(REMOTE_CREDENTIAL_STAGE_OUTPUT_PREFIX)?
+        .strip_suffix('\n')?;
+    if token.is_empty() || token.contains(['\r', '\n']) {
+        return None;
+    }
+    EngineCredentialProbeStage::all().find(|stage| stage.as_str() == token)
+}
+
+fn checkpoint_stage_for_remote_output(
+    code: Option<i32>,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> RunnerStage {
+    if !stderr.is_empty() {
+        return RunnerStage::RemoteExecution;
+    }
+    if code == Some(REMOTE_CREDENTIAL_TEST_FAILURE_STATUS) {
+        return credential_stage_from_remote_output(stdout).map_or(
+            RunnerStage::EngineCredentialCheckpoint,
+            RunnerStage::EngineCredential,
+        );
+    }
+    if !stdout.is_empty() {
+        return RunnerStage::RemoteExecution;
+    }
+    match code {
+        Some(REMOTE_CONTRACT_FAILURE_STATUS) => RunnerStage::RemoteContract,
+        Some(1 | 2) => RunnerStage::RemoteShell,
+        Some(124 | 137) => RunnerStage::RemoteTimeout,
+        Some(REMOTE_OUTPUT_TEST_FAILURE_STATUS) => RunnerStage::LocalOutputCheckpoint,
+        _ => RunnerStage::RemoteExecution,
+    }
+}
+
+fn preflight_stage_for_remote_status(code: Option<i32>) -> RunnerStage {
+    match code {
+        Some(REMOTE_PREFLIGHT_IDENTITY_FAILURE_STATUS) => {
+            RunnerStage::RemotePathPreflightRootIdentity
+        }
+        Some(REMOTE_PREFLIGHT_PROCESS_FAILURE_STATUS) => {
+            RunnerStage::RemotePathPreflightProcessAbsence
+        }
+        Some(REMOTE_PREFLIGHT_PATH_FAILURE_STATUS) => RunnerStage::RemotePathPreflightPathAbsence,
+        _ => RunnerStage::RemotePathPreflightUnexpectedStatus,
     }
 }
 
@@ -730,19 +864,39 @@ fn preflight_remote_directory(
     remote: &OwnedRemoteDirectory,
 ) -> Result<(), String> {
     if !remote.matches_spec() {
-        return Err("refusing to preflight an invalid Android canary directory".to_owned());
+        return Err(runner_stage_error(RunnerStage::RemotePathPreflightContract));
     }
-    revalidate_device(options, expected_device, "before remote-path preflight")?;
-    let output = normalize_adb_shell_output(adb_root_shell_output(
-        options,
-        preflight_remote_directory_script(remote, expected_device).as_bytes(),
-        ADB_QUERY_TIMEOUT,
-        "prove generated Android canary path absent",
-    )?)?;
-    if !output.status.success() || !output.stdout.is_empty() || !output.stderr.is_empty() {
-        return Err("generated Android canary path is not cleanly absent".to_owned());
+    at_runner_stage(
+        RunnerStage::RemotePathPreflightIdentityBefore,
+        revalidate_device(options, expected_device, "before remote-path preflight"),
+    )?;
+    let output = at_runner_stage(
+        RunnerStage::RemotePathPreflightTransport,
+        adb_root_shell_output(
+            options,
+            preflight_remote_directory_script(remote, expected_device).as_bytes(),
+            ADB_QUERY_TIMEOUT,
+            "prove generated Android canary path absent",
+        ),
+    )?;
+    let output = at_runner_stage(
+        RunnerStage::RemotePathPreflightNormalization,
+        normalize_adb_shell_output(output),
+    )?;
+    if !output.status.success() {
+        return Err(runner_stage_error(preflight_stage_for_remote_status(
+            output.status.code(),
+        )));
     }
-    revalidate_device(options, expected_device, "after remote-path preflight")
+    if !output.stdout.is_empty() || !output.stderr.is_empty() {
+        return Err(runner_stage_error(
+            RunnerStage::RemotePathPreflightUnexpectedOutput,
+        ));
+    }
+    at_runner_stage(
+        RunnerStage::RemotePathPreflightIdentityAfter,
+        revalidate_device(options, expected_device, "after remote-path preflight"),
+    )
 }
 
 fn create_remote_directory(
@@ -778,57 +932,97 @@ fn push_and_execute(
     if remote.identity().is_none() {
         return Err("Android canary directory identity is unavailable before execution".to_owned());
     }
-    artifact_identities.verify_paths(artifacts)?;
-    revalidate_device(options, expected_device, "before remote push")?;
-    let preflight = normalize_adb_shell_output(adb_root_shell_output(
-        options,
-        execution_preflight_script(remote, expected_device).as_bytes(),
-        ADB_QUERY_TIMEOUT,
-        "validate exact owner-marked Android canary directory before push",
-    )?)?;
+    at_runner_stage(
+        RunnerStage::RemoteExecutionPreflight,
+        artifact_identities.verify_paths(artifacts),
+    )?;
+    at_runner_stage(
+        RunnerStage::RemoteExecutionPreflight,
+        revalidate_device(options, expected_device, "before remote push"),
+    )?;
+    let preflight = at_runner_stage(
+        RunnerStage::RemoteExecutionPreflight,
+        adb_root_shell_output(
+            options,
+            execution_preflight_script(remote, expected_device).as_bytes(),
+            ADB_QUERY_TIMEOUT,
+            "validate exact owner-marked Android canary directory before push",
+        )
+        .and_then(normalize_adb_shell_output),
+    )?;
     if !preflight.status.success() || !preflight.stdout.is_empty() || !preflight.stderr.is_empty() {
-        return Err("owner-marked Android canary directory changed before push".to_owned());
+        return Err(runner_stage_error(RunnerStage::RemoteExecutionPreflight));
     }
     let remote_test = format!("{}/{REMOTE_TEST_BINARY_NAME}", remote.path());
-    revalidate_device(
-        options,
-        expected_device,
-        "immediately before canary-test push",
+    at_runner_stage(
+        RunnerStage::RemoteTestArtifactPush,
+        revalidate_device(
+            options,
+            expected_device,
+            "immediately before canary-test push",
+        ),
     )?;
-    push_artifact(
-        options,
-        &artifacts.test,
-        &artifact_identities.test,
-        &remote_test,
-        "Android canary test ELF",
+    at_runner_stage(
+        RunnerStage::RemoteTestArtifactPush,
+        push_artifact(
+            options,
+            &artifacts.test,
+            &artifact_identities.test,
+            &remote_test,
+            "Android canary test ELF",
+        ),
     )?;
-    revalidate_device(options, expected_device, "after canary-test push")?;
+    at_runner_stage(
+        RunnerStage::RemoteTestArtifactPush,
+        revalidate_device(options, expected_device, "after canary-test push"),
+    )?;
 
     let remote_probe = format!("{}/{REMOTE_CREDENTIAL_PROBE_BINARY_NAME}", remote.path());
-    revalidate_device(
-        options,
-        expected_device,
-        "immediately before credential-probe push",
+    at_runner_stage(
+        RunnerStage::RemoteCredentialArtifactPush,
+        revalidate_device(
+            options,
+            expected_device,
+            "immediately before credential-probe push",
+        ),
     )?;
-    push_artifact(
-        options,
-        &artifacts.credential_probe,
-        &artifact_identities.credential_probe,
-        &remote_probe,
-        "Android credential-probe ELF",
+    at_runner_stage(
+        RunnerStage::RemoteCredentialArtifactPush,
+        push_artifact(
+            options,
+            &artifacts.credential_probe,
+            &artifact_identities.credential_probe,
+            &remote_probe,
+            "Android credential-probe ELF",
+        ),
     )?;
-    revalidate_device(options, expected_device, "after credential-probe push")?;
+    at_runner_stage(
+        RunnerStage::RemoteCredentialArtifactPush,
+        revalidate_device(options, expected_device, "after credential-probe push"),
+    )?;
 
-    let output = normalize_adb_shell_output(adb_root_shell_output(
-        options,
-        remote_script(remote, artifact_identities, expected_device)?.as_bytes(),
-        ADB_EXEC_TIMEOUT,
-        "run rooted Android checkpoint shell",
-    )?)?;
-    if output.status.success() && output.stderr.is_empty() {
+    let script = at_runner_stage(
+        RunnerStage::RemoteCheckpointTransport,
+        remote_script(remote, artifact_identities, expected_device),
+    )?;
+    let output = at_runner_stage(
+        RunnerStage::RemoteCheckpointTransport,
+        adb_root_shell_output(
+            options,
+            script.as_bytes(),
+            ADB_EXEC_TIMEOUT,
+            "run rooted Android checkpoint shell",
+        )
+        .and_then(normalize_adb_shell_output),
+    )?;
+    if output.status.success() && output.stdout.is_empty() && output.stderr.is_empty() {
         Ok(())
     } else {
-        Err("rooted Android exact checkpoint failed".to_owned())
+        Err(runner_stage_error(checkpoint_stage_for_remote_output(
+            output.status.code(),
+            &output.stdout,
+            &output.stderr,
+        )))
     }
 }
 
@@ -896,6 +1090,41 @@ fn uses_windows_adb(adb: &OsString) -> bool {
     adb.to_string_lossy().to_ascii_lowercase().ends_with(".exe")
 }
 
+fn credential_stage_shell_functions() -> String {
+    let stages = EngineCredentialProbeStage::all()
+        .map(|stage| stage.as_str())
+        .collect::<Vec<_>>();
+    let accepted_pattern = stages
+        .iter()
+        .map(|stage| shell_single_quote(stage))
+        .collect::<Vec<_>>()
+        .join("|");
+    let maximum_frame_bytes = stages
+        .iter()
+        .map(|stage| stage.len().saturating_add(1))
+        .max()
+        .expect("credential probe stage catalog is nonempty");
+    format!(
+        "read_credential_stage() {{\n\
+           CREDENTIAL_STAGE=\n\
+           if [ -f \"$CREDENTIAL_STAGE_RECEIPT\" ] && [ ! -L \"$CREDENTIAL_STAGE_RECEIPT\" ]; then\n\
+             CREDENTIAL_STAGE_SIZE=$(wc -c <\"$CREDENTIAL_STAGE_RECEIPT\") || return 1\n\
+             CREDENTIAL_STAGE_LINES=$(wc -l <\"$CREDENTIAL_STAGE_RECEIPT\") || return 1\n\
+             [ \"$CREDENTIAL_STAGE_SIZE\" -ge 2 ] &&\n\
+             [ \"$CREDENTIAL_STAGE_SIZE\" -le {maximum_frame_bytes} ] &&\n\
+             [ \"$CREDENTIAL_STAGE_LINES\" -eq 1 ] || return 1\n\
+             CREDENTIAL_STAGE=$(cat \"$CREDENTIAL_STAGE_RECEIPT\") || return 1\n\
+           else\n\
+             return 1\n\
+           fi\n\
+           case \"$CREDENTIAL_STAGE\" in\n\
+             {accepted_pattern}) printf '%s\\n' \"$CREDENTIAL_STAGE\" ;;\n\
+             *) return 1 ;;\n\
+           esac\n\
+         }}\n"
+    )
+}
+
 fn remote_script(
     remote: &OwnedRemoteDirectory,
     artifacts: &AndroidCanaryArtifactIdentities,
@@ -907,7 +1136,14 @@ fn remote_script(
     if expected_device.shell_gid == 0 {
         return Err("Android credential probe requires a nonzero device shell GID".to_owned());
     }
-    let test = shell_single_quote(ANDROID_OUTPUT_TPROXY_ENGINE_CREDENTIAL_CANARY_TEST);
+    let output_test = shell_single_quote(LINUX_OUTPUT_TPROXY_CANARY_TEST);
+    let credential_test = shell_single_quote(ANDROID_ENGINE_CREDENTIAL_CANARY_TEST);
+    let credential_stage_receipt_name =
+        shell_single_quote(ENGINE_CREDENTIAL_PROBE_STAGE_RECEIPT_NAME);
+    let credential_stage_shell_functions = credential_stage_shell_functions();
+    let final_credential_stage =
+        shell_single_quote(&EngineCredentialProbeStage::ParentDeathContainment.as_str());
+    let credential_stage_output_prefix = shell_single_quote(REMOTE_CREDENTIAL_STAGE_OUTPUT_PREFIX);
     let expected_test_sha256 = shell_single_quote(artifacts.test.sha256());
     let expected_test_size = artifacts.test.size();
     let expected_probe_sha256 = shell_single_quote(artifacts.credential_probe.sha256());
@@ -921,6 +1157,9 @@ fn remote_script(
          TEST_BIN=\"$ROOT/{REMOTE_TEST_BINARY_NAME}\"\n\
          CREDENTIAL_PROBE=\"$ROOT/{REMOTE_CREDENTIAL_PROBE_BINARY_NAME}\"\n\
          TMPDIR=\"$ROOT/tmp\"\n\
+         CREDENTIAL_STAGE_RECEIPT=\"$TMPDIR\"/{credential_stage_receipt_name}\n\
+         CREDENTIAL_FINAL_STAGE={final_credential_stage}\n\
+         CREDENTIAL_STAGE_OUTPUT_PREFIX={credential_stage_output_prefix}\n\
          EXPECTED_TEST_SHA256={expected_test_sha256}\n\
          EXPECTED_TEST_SIZE='{expected_test_size}'\n\
          EXPECTED_PROBE_SHA256={expected_probe_sha256}\n\
@@ -931,7 +1170,7 @@ fn remote_script(
          {}\
          {}\
          trap remove_owned_root EXIT\n\
-         trap 'exit 70' HUP INT TERM\n\
+         trap 'exit {REMOTE_CONTRACT_FAILURE_STATUS}' HUP INT TERM\n\
          identity_matches\n\
          probe_process_absent\n\
          owned_root_matches\n\
@@ -956,20 +1195,37 @@ fn remote_script(
          export FLUX_ENGINE_CREDENTIAL_PROBE_REQUIRED=1\n\
          export FLUX_ENGINE_CREDENTIAL_PROBE_PATH=\"$CREDENTIAL_PROBE\"\n\
          export FLUX_ENGINE_CREDENTIAL_PROBE_GID=\"$EXPECTED_PROBE_GID\"\n\
-         TEST={test}\n\
-         LIST_FILE=\"$TMPDIR/list\"\n\
-         if ! \"$TEST_BIN\" --ignored --exact \"$TEST\" --list >\"$LIST_FILE\"; then\n\
-           exit 70\n\
+         OUTPUT_TEST={output_test}\n\
+         CREDENTIAL_TEST={credential_test}\n\
+         require_exact_test() {{\n\
+           REQUIRED_TEST=$1\n\
+           REQUIRED_LIST_FILE=$2\n\
+           if ! \"$TEST_BIN\" --ignored --exact \"$REQUIRED_TEST\" --list >\"$REQUIRED_LIST_FILE\"; then\n\
+             return 1\n\
+           fi\n\
+           LIST_OUTPUT=$(/system/bin/tr -d '\\r' <\"$REQUIRED_LIST_FILE\")\n\
+           EXPECTED_LIST=$(printf '%s: test\\n\\n1 test, 0 benchmarks' \"$REQUIRED_TEST\")\n\
+           [ \"$LIST_OUTPUT\" = \"$EXPECTED_LIST\" ]\n\
+         }}\n\
+         run_exact_test() {{\n\
+           TEST_TIMEOUT=$1\n\
+           REQUIRED_TEST=$2\n\
+           /system/bin/timeout -k {REMOTE_TEST_KILL_GRACE_SECONDS} \"$TEST_TIMEOUT\" \"$TEST_BIN\" --ignored --exact \"$REQUIRED_TEST\" --nocapture --test-threads=1\n\
+         }}\n\
+         {credential_stage_shell_functions}\
+         require_exact_test \"$OUTPUT_TEST\" \"$TMPDIR/output-list\" || exit {REMOTE_CONTRACT_FAILURE_STATUS}\n\
+         require_exact_test \"$CREDENTIAL_TEST\" \"$TMPDIR/credential-list\" || exit {REMOTE_CONTRACT_FAILURE_STATUS}\n\
+         if ! run_exact_test {REMOTE_CREDENTIAL_TEST_TIMEOUT_SECONDS} \"$CREDENTIAL_TEST\" >/dev/null 2>&1; then\n\
+           CREDENTIAL_STAGE=$(read_credential_stage) || CREDENTIAL_STAGE=\n\
+           printf '%s%s\\n' \"$CREDENTIAL_STAGE_OUTPUT_PREFIX\" \"$CREDENTIAL_STAGE\"\n\
+           exit {REMOTE_CREDENTIAL_TEST_FAILURE_STATUS}\n\
          fi\n\
-         LIST_OUTPUT=$(/system/bin/tr -d '\\r' <\"$LIST_FILE\")\n\
-         EXPECTED_LIST=$(printf '%s: test\\n\\n1 test, 0 benchmarks' \"$TEST\")\n\
-         if [ \"$LIST_OUTPUT\" != \"$EXPECTED_LIST\" ]; then\n\
-           exit 70\n\
+         CREDENTIAL_STAGE=$(read_credential_stage) || exit {REMOTE_CREDENTIAL_TEST_FAILURE_STATUS}\n\
+         [ \"$CREDENTIAL_STAGE\" = \"$CREDENTIAL_FINAL_STAGE\" ] || exit {REMOTE_CREDENTIAL_TEST_FAILURE_STATUS}\n\
+         probe_process_absent\n\
+         if ! run_exact_test {REMOTE_OUTPUT_TEST_TIMEOUT_SECONDS} \"$OUTPUT_TEST\" >/dev/null 2>&1; then\n\
+           exit {REMOTE_OUTPUT_TEST_FAILURE_STATUS}\n\
          fi\n\
-         set +e\n\
-         /system/bin/timeout -k {REMOTE_TEST_KILL_GRACE_SECONDS} {REMOTE_TEST_TIMEOUT_SECONDS} \"$TEST_BIN\" --ignored --exact \"$TEST\" --nocapture --test-threads=1\n\
-         STATUS=$?\n\
-         set -e\n\
          probe_process_absent\n\
          remove_owned_root\n\
          path_absent \"$TEST_BIN\"\n\
@@ -977,7 +1233,7 @@ fn remote_script(
          path_absent \"$ROOT\"\n\
          identity_matches\n\
          trap - EXIT HUP INT TERM\n\
-         exit \"$STATUS\"\n",
+         exit 0\n",
         remote.shell_variables(expected_device.shell_uid, expected_device.shell_gid),
         device_identity_function(expected_device),
         process_absence_function(&REMOTE_PROCESS_NAMES),
@@ -1033,9 +1289,9 @@ fn preflight_remote_directory_script(
          {}\
          {}\
          {}\
-         identity_matches\n\
-         probe_process_absent\n\
-         path_absent \"$ROOT\"\n",
+         identity_matches || exit {REMOTE_PREFLIGHT_IDENTITY_FAILURE_STATUS}\n\
+         probe_process_absent || exit {REMOTE_PREFLIGHT_PROCESS_FAILURE_STATUS}\n\
+         path_absent \"$ROOT\" || exit {REMOTE_PREFLIGHT_PATH_FAILURE_STATUS}\n",
         path_absence_function(),
         device_identity_function(expected_device),
         process_absence_function(&REMOTE_PROCESS_NAMES),
@@ -1065,14 +1321,14 @@ fn create_remote_directory_script(
          CREATED_ID=''\n\
          cleanup_partial() {{\n\
            [ \"$CREATED\" = '1' ] || return 0\n\
-           identity_matches || return 70\n\
+           identity_matches || return {REMOTE_CONTRACT_FAILURE_STATUS}\n\
            probe_process_absent\n\
            [ -d \"$ROOT\" ] && [ ! -L \"$ROOT\" ]\n\
            [ \"$(/system/bin/stat -Lc '%d:%i' \"$ROOT\")\" = \"$CREATED_ID\" ]\n\
            /system/bin/rm -rf \"$ROOT\"\n\
          }}\n\
          trap cleanup_partial EXIT\n\
-         trap 'exit 70' HUP INT TERM\n\
+         trap 'exit {REMOTE_CONTRACT_FAILURE_STATUS}' HUP INT TERM\n\
          identity_matches\n\
          probe_process_absent\n\
          path_absent \"$ROOT\"\n\
@@ -1774,14 +2030,18 @@ mod tests {
         assert_eq!(ADB_CLEANUP_TIMEOUT, Duration::from_secs(20));
         assert_eq!(ADB_EXEC_TIMEOUT, Duration::from_secs(115));
         assert_eq!(ADB_PUSH_TIMEOUT, Duration::from_secs(120));
-        assert_eq!(REMOTE_TEST_TIMEOUT_SECONDS, 90);
+        assert_eq!(REMOTE_OUTPUT_TEST_TIMEOUT_SECONDS, 60);
+        assert_eq!(REMOTE_CREDENTIAL_TEST_TIMEOUT_SECONDS, 25);
         assert_eq!(REMOTE_TEST_KILL_GRACE_SECONDS, 5);
         assert_eq!(HOST_POLL_INTERVAL, Duration::from_millis(25));
         assert_eq!(HOST_OUTPUT_DRAIN_GRACE, Duration::from_secs(2));
         assert!(ADB_QUERY_TIMEOUT < ADB_CLEANUP_TIMEOUT);
         assert!(
-            Duration::from_secs(REMOTE_TEST_TIMEOUT_SECONDS + REMOTE_TEST_KILL_GRACE_SECONDS)
-                < ADB_EXEC_TIMEOUT
+            Duration::from_secs(
+                REMOTE_OUTPUT_TEST_TIMEOUT_SECONDS
+                    + REMOTE_CREDENTIAL_TEST_TIMEOUT_SECONDS
+                    + (2 * REMOTE_TEST_KILL_GRACE_SECONDS)
+            ) < ADB_EXEC_TIMEOUT
         );
         assert!(ADB_EXEC_TIMEOUT < ADB_PUSH_TIMEOUT);
         assert!(ADB_PUSH_TIMEOUT < CARGO_BUILD_TIMEOUT);
@@ -1813,15 +2073,43 @@ mod tests {
             "FLUX_ENGINE_CREDENTIAL_PROBE_PATH=\"$CREDENTIAL_PROBE\"",
             "FLUX_ENGINE_CREDENTIAL_PROBE_GID=\"$EXPECTED_PROBE_GID\"",
             &format!("unset {internal_envs}"),
-            &format!("TEST='{ANDROID_OUTPUT_TPROXY_ENGINE_CREDENTIAL_CANARY_TEST}'"),
-            "--ignored --exact \"$TEST\" --nocapture --test-threads=1",
+            &format!("OUTPUT_TEST='{LINUX_OUTPUT_TPROXY_CANARY_TEST}'"),
+            &format!("CREDENTIAL_TEST='{ANDROID_ENGINE_CREDENTIAL_CANARY_TEST}'"),
+            "CREDENTIAL_STAGE_RECEIPT=\"$TMPDIR\"/'credential-stage'",
+            "CREDENTIAL_FINAL_STAGE='parent-death-containment'",
+            "CREDENTIAL_STAGE_OUTPUT_PREFIX='flux-engine-credential-stage:'",
+            "read_credential_stage",
+            "require_exact_test \"$OUTPUT_TEST\" \"$TMPDIR/output-list\"",
+            "require_exact_test \"$CREDENTIAL_TEST\" \"$TMPDIR/credential-list\"",
+            &format!("run_exact_test {REMOTE_OUTPUT_TEST_TIMEOUT_SECONDS} \"$OUTPUT_TEST\""),
+            &format!(
+                "run_exact_test {REMOTE_CREDENTIAL_TEST_TIMEOUT_SECONDS} \"$CREDENTIAL_TEST\""
+            ),
+            "CREDENTIAL_STAGE=$(read_credential_stage) || CREDENTIAL_STAGE=",
+            "printf '%s%s\\n' \"$CREDENTIAL_STAGE_OUTPUT_PREFIX\" \"$CREDENTIAL_STAGE\"",
+            "[ \"$CREDENTIAL_STAGE\" = \"$CREDENTIAL_FINAL_STAGE\" ]",
             "path_absent \"$TEST_BIN\"",
             "path_absent \"$CREDENTIAL_PROBE\"",
             "path_absent \"$ROOT\"",
         ] {
             assert!(script.contains(required), "missing {required:?}");
         }
+        let credential_functions = credential_stage_shell_functions();
+        assert!(script.contains(&credential_functions));
+        for stage in EngineCredentialProbeStage::all() {
+            let stage_case = shell_single_quote(&stage.as_str());
+            assert!(
+                credential_functions.contains(&stage_case),
+                "missing credential stage case {stage_case:?}"
+            );
+        }
         assert!(script.find("owned_root_matches").unwrap() < script.find("chown -R").unwrap());
+        assert!(
+            script
+                .find("run_exact_test 25 \"$CREDENTIAL_TEST\"")
+                .unwrap()
+                < script.find("run_exact_test 60 \"$OUTPUT_TEST\"").unwrap()
+        );
         assert!(script.contains("for COMM in /proc/[0-9]*/comm"));
         assert!(script.contains("'fluxd-test' 'flux-cred-probe'"));
         assert!(!script.contains("pidof"));
@@ -1864,6 +2152,178 @@ mod tests {
         assert_eq!(shell_single_quote("flux/o'hare"), "'flux/o'\\''hare'");
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn credential_stage_shell_contract_accepts_exact_receipts_only() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time after Unix epoch")
+            .as_nanos();
+        let receipt = env::temp_dir().join(format!(
+            "flux-credential-stage-{}-{nonce}",
+            std::process::id()
+        ));
+        let receipt_argument =
+            shell_single_quote(receipt.to_str().expect("temporary receipt path is UTF-8"));
+        let functions = credential_stage_shell_functions();
+        let run_reader = || {
+            Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    &format!(
+                        "set -eu\nCREDENTIAL_STAGE_RECEIPT={receipt_argument}\n{functions}read_credential_stage\n"
+                    ),
+                ])
+                .output()
+                .expect("execute credential stage shell contract")
+        };
+        for stage in EngineCredentialProbeStage::all() {
+            std::fs::write(&receipt, format!("{}\n", stage.as_str()))
+                .expect("write canonical credential stage");
+            let output = run_reader();
+            assert!(output.status.success());
+            assert!(output.stderr.is_empty());
+            assert_eq!(output.stdout, format!("{}\n", stage.as_str()).as_bytes());
+        }
+
+        std::fs::remove_file(&receipt)
+            .expect("remove credential stage fixture before absence test");
+        let missing = run_reader();
+        assert!(!missing.status.success());
+        assert!(missing.stdout.is_empty());
+        assert!(missing.stderr.is_empty());
+
+        for malformed in [
+            b"".as_slice(),
+            b"unknown-stage\n".as_slice(),
+            b"root-validation".as_slice(),
+            b"root-validation\r\n".as_slice(),
+            b"root-validation\n\n".as_slice(),
+            b"root-validation\ntrailing".as_slice(),
+        ] {
+            std::fs::write(&receipt, malformed).expect("write malformed credential stage");
+            let output = run_reader();
+            assert!(!output.status.success(), "accepted frame {malformed:?}");
+            assert!(output.stdout.is_empty());
+            assert!(output.stderr.is_empty());
+        }
+        std::fs::remove_file(&receipt).expect("remove credential stage fixture");
+    }
+
+    #[test]
+    fn remote_checkpoint_outputs_are_canonical_and_detail_free() {
+        assert_eq!(
+            preflight_stage_for_remote_status(Some(REMOTE_PREFLIGHT_IDENTITY_FAILURE_STATUS)),
+            RunnerStage::RemotePathPreflightRootIdentity
+        );
+        assert_eq!(
+            preflight_stage_for_remote_status(Some(REMOTE_PREFLIGHT_PROCESS_FAILURE_STATUS)),
+            RunnerStage::RemotePathPreflightProcessAbsence
+        );
+        assert_eq!(
+            preflight_stage_for_remote_status(Some(REMOTE_PREFLIGHT_PATH_FAILURE_STATUS)),
+            RunnerStage::RemotePathPreflightPathAbsence
+        );
+        assert_eq!(
+            preflight_stage_for_remote_status(Some(1)),
+            RunnerStage::RemotePathPreflightUnexpectedStatus
+        );
+        assert_eq!(
+            checkpoint_stage_for_remote_output(Some(REMOTE_CONTRACT_FAILURE_STATUS), b"", b""),
+            RunnerStage::RemoteContract
+        );
+        assert_eq!(
+            checkpoint_stage_for_remote_output(Some(1), b"", b""),
+            RunnerStage::RemoteShell
+        );
+        assert_eq!(
+            checkpoint_stage_for_remote_output(Some(124), b"", b""),
+            RunnerStage::RemoteTimeout
+        );
+        assert_eq!(
+            checkpoint_stage_for_remote_output(Some(REMOTE_OUTPUT_TEST_FAILURE_STATUS), b"", b""),
+            RunnerStage::LocalOutputCheckpoint
+        );
+        assert_eq!(
+            checkpoint_stage_for_remote_output(
+                Some(REMOTE_CREDENTIAL_TEST_FAILURE_STATUS),
+                b"",
+                b""
+            ),
+            RunnerStage::EngineCredentialCheckpoint
+        );
+        for stage in EngineCredentialProbeStage::all() {
+            let output = format!(
+                "{REMOTE_CREDENTIAL_STAGE_OUTPUT_PREFIX}{}\n",
+                stage.as_str()
+            );
+            assert_eq!(
+                checkpoint_stage_for_remote_output(
+                    Some(REMOTE_CREDENTIAL_TEST_FAILURE_STATUS),
+                    output.as_bytes(),
+                    b""
+                ),
+                RunnerStage::EngineCredential(stage)
+            );
+        }
+        for malformed in [
+            b"flux-engine-credential-stage:unknown-stage\n".as_slice(),
+            b"flux-engine-credential-stage:root-validation".as_slice(),
+            b"flux-engine-credential-stage:root-validation\r\n".as_slice(),
+            b"flux-engine-credential-stage:root-validation\n\n".as_slice(),
+            b"root-validation\n".as_slice(),
+            b"\xff".as_slice(),
+        ] {
+            assert_eq!(
+                checkpoint_stage_for_remote_output(
+                    Some(REMOTE_CREDENTIAL_TEST_FAILURE_STATUS),
+                    malformed,
+                    b""
+                ),
+                RunnerStage::EngineCredentialCheckpoint,
+                "accepted output {malformed:?}"
+            );
+        }
+        assert_eq!(
+            checkpoint_stage_for_remote_output(
+                Some(REMOTE_CREDENTIAL_TEST_FAILURE_STATUS),
+                b"flux-engine-credential-stage:root-validation\n",
+                b"unexpected stderr"
+            ),
+            RunnerStage::RemoteExecution
+        );
+        assert_eq!(
+            checkpoint_stage_for_remote_output(Some(71), b"", b""),
+            RunnerStage::RemoteExecution
+        );
+        assert_eq!(
+            checkpoint_stage_for_remote_output(
+                Some(REMOTE_OUTPUT_TEST_FAILURE_STATUS),
+                b"unexpected stdout",
+                b""
+            ),
+            RunnerStage::RemoteExecution
+        );
+        assert_eq!(
+            classify_remote_execution_error(runner_stage_error(
+                RunnerStage::EngineCredentialCheckpoint
+            )),
+            runner_stage_error(RunnerStage::EngineCredentialCheckpoint)
+        );
+        assert_eq!(
+            classify_remote_execution_error(runner_stage_error(RunnerStage::EngineCredential(
+                EngineCredentialProbeStage::DeviceGidReport
+            ))),
+            runner_stage_error(RunnerStage::EngineCredential(
+                EngineCredentialProbeStage::DeviceGidReport
+            ))
+        );
+        assert_eq!(
+            classify_remote_execution_error("raw device failure".to_owned()),
+            runner_stage_error(RunnerStage::RemoteExecution)
+        );
+    }
+
     #[test]
     fn diagnostics_redact_device_identity_and_runner_stages_discard_details() {
         let options = Options {
@@ -1887,8 +2347,25 @@ mod tests {
         );
         for stage in [
             RunnerStage::DeviceProfile,
+            RunnerStage::RemotePathPreflightIdentityBefore,
+            RunnerStage::RemotePathPreflightRootIdentity,
+            RunnerStage::RemotePathPreflightProcessAbsence,
+            RunnerStage::RemotePathPreflightPathAbsence,
+            RunnerStage::RemotePathPreflightContract,
+            RunnerStage::RemotePathPreflightTransport,
+            RunnerStage::RemotePathPreflightNormalization,
+            RunnerStage::RemotePathPreflightUnexpectedStatus,
+            RunnerStage::RemotePathPreflightUnexpectedOutput,
+            RunnerStage::RemotePathPreflightIdentityAfter,
             RunnerStage::RemoteDirectoryCreate,
             RunnerStage::RemoteExecution,
+            RunnerStage::RemoteExecutionPreflight,
+            RunnerStage::RemoteTestArtifactPush,
+            RunnerStage::RemoteCredentialArtifactPush,
+            RunnerStage::RemoteCheckpointTransport,
+            RunnerStage::EngineCredential(EngineCredentialProbeStage::RootValidation),
+            RunnerStage::EngineCredential(EngineCredentialProbeStage::DeviceGidReport),
+            RunnerStage::EngineCredential(EngineCredentialProbeStage::ParentDeathContainment),
             RunnerStage::RemoteCleanup,
         ] {
             let error = at_runner_stage::<()>(

@@ -3051,12 +3051,14 @@ fn rollback_failure_error(rollback_failure: ControlError) -> ControlError {
 }
 
 fn engine_child_authority_error(source: EngineChildAuthorityError) -> FunctionalCanaryError {
-    let permission_denied = matches!(
-        &source,
-        EngineChildAuthorityError::ProcessHandle {
-            source: flux_platform::ProcessHandleError::SystemCall { source, .. },
-        } if source.kind() == io::ErrorKind::PermissionDenied
-    );
+    let permission_denied = match &source {
+        EngineChildAuthorityError::ProcessHandle { source } => matches!(
+            source.source_error(),
+            flux_platform::ProcessHandleError::SystemCall { source, .. }
+                if source.kind() == io::ErrorKind::PermissionDenied
+        ),
+        _ => false,
+    };
     let kind = if permission_denied {
         crate::functional_canary::CanaryErrorKind::Availability(
             crate::functional_canary::CanaryAvailability::Denied,
@@ -5578,11 +5580,14 @@ mod tests {
     fn engine_child_authority_errors_preserve_canary_availability_classes() {
         let mapped = |source| engine_child_authority_error(source);
         let denied = mapped(EngineChildAuthorityError::ProcessHandle {
-            source: flux_platform::ProcessHandleError::SystemCall {
-                operation: "test denied process observation",
-                path: None,
-                source: io::Error::from(io::ErrorKind::PermissionDenied),
-            },
+            source: flux_platform::ProcessHandleOpenError::new(
+                flux_platform::ProcessHandleOpenStage::Start,
+                flux_platform::ProcessHandleError::SystemCall {
+                    operation: "test denied process observation",
+                    path: None,
+                    source: io::Error::from(io::ErrorKind::PermissionDenied),
+                },
+            ),
         });
         assert_eq!(
             denied.kind(),
@@ -5590,7 +5595,10 @@ mod tests {
         );
 
         let unsupported = mapped(EngineChildAuthorityError::ProcessHandle {
-            source: flux_platform::ProcessHandleError::UnsupportedPlatform("test"),
+            source: flux_platform::ProcessHandleOpenError::new(
+                flux_platform::ProcessHandleOpenStage::Start,
+                flux_platform::ProcessHandleError::UnsupportedPlatform("test"),
+            ),
         });
         assert_eq!(
             unsupported.kind(),
@@ -5600,16 +5608,26 @@ mod tests {
         );
 
         let exited = mapped(EngineChildAuthorityError::ProcessHandle {
-            source: flux_platform::ProcessHandleError::Exited {
-                pid: NonZeroU32::new(4242).expect("nonzero PID"),
-            },
+            source: flux_platform::ProcessHandleOpenError::new(
+                flux_platform::ProcessHandleOpenStage::InitialObservation(
+                    flux_platform::ProcessHandleObservationStage::PidFdLivenessBeforeObservation,
+                ),
+                flux_platform::ProcessHandleError::Exited {
+                    pid: NonZeroU32::new(4242).expect("nonzero PID"),
+                },
+            ),
         });
         assert_eq!(exited.kind(), CanaryErrorKind::IdentityChanged);
 
         let malformed = mapped(EngineChildAuthorityError::ProcessHandle {
-            source: flux_platform::ProcessHandleError::MalformedProcStat {
-                path: PathBuf::from("/proc/4242/stat"),
-            },
+            source: flux_platform::ProcessHandleOpenError::new(
+                flux_platform::ProcessHandleOpenStage::InitialObservation(
+                    flux_platform::ProcessHandleObservationStage::ProcessIdentity,
+                ),
+                flux_platform::ProcessHandleError::MalformedProcStat {
+                    path: PathBuf::from("/proc/4242/stat"),
+                },
+            ),
         });
         assert_eq!(
             malformed.kind(),
@@ -5617,11 +5635,16 @@ mod tests {
         );
 
         let system = mapped(EngineChildAuthorityError::ProcessHandle {
-            source: flux_platform::ProcessHandleError::SystemCall {
-                operation: "test process observation",
-                path: None,
-                source: io::Error::other("injected non-permission failure"),
-            },
+            source: flux_platform::ProcessHandleOpenError::new(
+                flux_platform::ProcessHandleOpenStage::InitialObservation(
+                    flux_platform::ProcessHandleObservationStage::ProcessIdentity,
+                ),
+                flux_platform::ProcessHandleError::SystemCall {
+                    operation: "test process observation",
+                    path: None,
+                    source: io::Error::other("injected non-permission failure"),
+                },
+            ),
         });
         assert_eq!(system.kind(), CanaryErrorKind::AdapterFailure);
         assert_eq!(system.cleanup(), CanaryCleanupStatus::NotRequired);
@@ -7964,11 +7987,14 @@ mod tests {
                 .take()
             {
                 return Err(EngineChildAuthorityError::ProcessHandle {
-                    source: flux_platform::ProcessHandleError::SystemCall {
-                        operation: "open scripted engine child authority",
-                        path: None,
-                        source: io::Error::from(kind),
-                    },
+                    source: flux_platform::ProcessHandleOpenError::new(
+                        flux_platform::ProcessHandleOpenStage::Start,
+                        flux_platform::ProcessHandleError::SystemCall {
+                            operation: "open scripted engine child authority",
+                            path: None,
+                            source: io::Error::from(kind),
+                        },
+                    ),
                 });
             }
             let snapshot = self.current_snapshot.lock().expect("current snapshot lock");

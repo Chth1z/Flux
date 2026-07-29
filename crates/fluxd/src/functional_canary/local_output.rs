@@ -24,13 +24,15 @@ use std::convert::Infallible;
 #[cfg(test)]
 use crate::engine_supervisor::OwnedEngineIdentity;
 use crate::engine_supervisor::{EngineChildAuthority, EngineChildObservationPair};
-use flux_platform::{ProcessObservation, TRANSPARENT_PROXY_ENGINE_CAPABILITY_MASK};
+use flux_platform::{
+    ProcessObservation, ProcessUserNamespaceObservation, TRANSPARENT_PROXY_ENGINE_CAPABILITY_MASK,
+};
 
 use super::{
     CANARY_CREDENTIAL_MAP_DIGEST_BYTES, CanaryAttemptRequest, CanaryAttemptSocketObserverSession,
     CanaryAvailability, CanaryCaptureBackend, CanaryCleanupStatus, CanaryErrorKind,
-    FunctionalCanaryError, UnqualifiedCanaryGateEvidence, UnqualifiedFunctionalCanaryExecution,
-    UnqualifiedFunctionalCanaryExecutor, bounded_prefix,
+    CanaryUserNamespaceBinding, FunctionalCanaryError, UnqualifiedCanaryGateEvidence,
+    UnqualifiedFunctionalCanaryExecution, UnqualifiedFunctionalCanaryExecutor, bounded_prefix,
 };
 
 const XTABLES_LOCAL_OUTPUT_UNSUPPORTED: &str = "the packaged xtables functional-canary adapter has no device-qualified direct observer for the active local-OUTPUT transaction: exact transparent-listener delivery, supervised-engine receipt, counter bounds, identity stability, and cleanup proof remain required; REDIRECT, DNAT, unrelated ingress traffic, counters alone, and route lookups are prohibited substitutes";
@@ -1231,8 +1233,8 @@ mod process_ownership_receipt {
         use super::super::super::{
             CANARY_CREDENTIAL_MAP_DIGEST_BYTES, CanaryAddressFamilies, CanaryAttemptRequest,
             CanaryCredentialDomainBinding, CanaryCredentialMapDigest, CanaryFileIdentity,
-            CanaryNonce, CanaryProcessIdentity, FUNCTIONAL_CANARY_NONCE_BYTES,
-            UnqualifiedCanaryGateEvidence,
+            CanaryNonce, CanaryProcessIdentity, CanaryUserNamespaceBinding,
+            FUNCTIONAL_CANARY_NONCE_BYTES, UnqualifiedCanaryGateEvidence,
         };
         use super::*;
 
@@ -1280,7 +1282,7 @@ mod process_ownership_receipt {
         }
 
         fn alternate_credential_domain() -> CanaryCredentialDomainBinding {
-            CanaryCredentialDomainBinding::new(
+            CanaryCredentialDomainBinding::observed(
                 CanaryFileIdentity::new(
                     90,
                     NonZeroU64::new(91).expect("alternate user namespace inode"),
@@ -1483,10 +1485,15 @@ mod process_ownership_receipt {
                 TproxyLocalOutputProcessOwnershipReceiptError::PeerCredentialsInvalid { slot: 0 },
             );
             assert_engine_credentials_rejected(|credentials| {
-                credentials.credential_domain.user_namespace = CanaryFileIdentity::new(
+                let CanaryUserNamespaceBinding::Observed { namespace, .. } =
+                    &mut credentials.credential_domain.user_namespace
+                else {
+                    panic!("fixture user namespace is observed")
+                };
+                *namespace = CanaryFileIdentity::new(
                     90,
                     NonZeroU64::new(94).expect("different user namespace inode"),
-                )
+                );
             });
             assert_engine_credentials_rejected(|credentials| {
                 credentials.credential_domain.mount_namespace = CanaryFileIdentity::new(
@@ -1495,14 +1502,28 @@ mod process_ownership_receipt {
                 )
             });
             assert_engine_credentials_rejected(|credentials| {
-                credentials.credential_domain.uid_map_digest =
+                let CanaryUserNamespaceBinding::Observed { uid_map_digest, .. } =
+                    &mut credentials.credential_domain.user_namespace
+                else {
+                    panic!("fixture user namespace is observed")
+                };
+                *uid_map_digest =
                     CanaryCredentialMapDigest::new([23; CANARY_CREDENTIAL_MAP_DIGEST_BYTES])
-                        .expect("different UID map digest")
+                        .expect("different UID map digest");
             });
             assert_engine_credentials_rejected(|credentials| {
-                credentials.credential_domain.gid_map_digest =
+                let CanaryUserNamespaceBinding::Observed { gid_map_digest, .. } =
+                    &mut credentials.credential_domain.user_namespace
+                else {
+                    panic!("fixture user namespace is observed")
+                };
+                *gid_map_digest =
                     CanaryCredentialMapDigest::new([24; CANARY_CREDENTIAL_MAP_DIGEST_BYTES])
-                        .expect("different GID map digest")
+                        .expect("different GID map digest");
+            });
+            assert_engine_credentials_rejected(|credentials| {
+                credentials.credential_domain.user_namespace =
+                    CanaryUserNamespaceBinding::Unsupported;
             });
         }
 
@@ -1812,6 +1833,50 @@ fn bind_engine_child_observations<P, R>(
     })
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EngineProcessUserNamespaceObservation {
+    Unsupported,
+    Observed {
+        namespace: (u64, u64),
+        uid_map_digest: [u8; CANARY_CREDENTIAL_MAP_DIGEST_BYTES],
+        gid_map_digest: [u8; CANARY_CREDENTIAL_MAP_DIGEST_BYTES],
+    },
+}
+
+impl From<ProcessUserNamespaceObservation> for EngineProcessUserNamespaceObservation {
+    fn from(observation: ProcessUserNamespaceObservation) -> Self {
+        match observation {
+            ProcessUserNamespaceObservation::Unsupported => Self::Unsupported,
+            ProcessUserNamespaceObservation::Observed {
+                namespace,
+                uid_map_digest,
+                gid_map_digest,
+            } => Self::Observed {
+                namespace: (namespace.device(), namespace.inode().get()),
+                uid_map_digest: *uid_map_digest.as_bytes(),
+                gid_map_digest: *gid_map_digest.as_bytes(),
+            },
+        }
+    }
+}
+
+impl From<CanaryUserNamespaceBinding> for EngineProcessUserNamespaceObservation {
+    fn from(binding: CanaryUserNamespaceBinding) -> Self {
+        match binding {
+            CanaryUserNamespaceBinding::Unsupported => Self::Unsupported,
+            CanaryUserNamespaceBinding::Observed {
+                namespace,
+                uid_map_digest,
+                gid_map_digest,
+            } => Self::Observed {
+                namespace: (namespace.device(), namespace.inode().get()),
+                uid_map_digest: uid_map_digest.as_bytes(),
+                gid_map_digest: gid_map_digest.as_bytes(),
+            },
+        }
+    }
+}
+
 trait EngineProcessPolicyObservationView {
     fn uids(&self) -> [u32; 4];
     fn gids(&self) -> [u32; 4];
@@ -1822,11 +1887,9 @@ trait EngineProcessPolicyObservationView {
     fn capability_bounding(&self) -> u64;
     fn capability_ambient(&self) -> u64;
     fn no_new_privileges(&self) -> bool;
-    fn user_namespace(&self) -> (u64, u64);
+    fn user_namespace(&self) -> EngineProcessUserNamespaceObservation;
     fn mount_namespace(&self) -> (u64, u64);
     fn network_namespace(&self) -> (u64, u64);
-    fn uid_map_digest(&self) -> [u8; CANARY_CREDENTIAL_MAP_DIGEST_BYTES];
-    fn gid_map_digest(&self) -> [u8; CANARY_CREDENTIAL_MAP_DIGEST_BYTES];
 }
 
 impl EngineProcessPolicyObservationView for ProcessObservation {
@@ -1866,9 +1929,8 @@ impl EngineProcessPolicyObservationView for ProcessObservation {
         self.credentials().no_new_privileges()
     }
 
-    fn user_namespace(&self) -> (u64, u64) {
-        let identity = self.domain().user_namespace();
-        (identity.device(), identity.inode().get())
+    fn user_namespace(&self) -> EngineProcessUserNamespaceObservation {
+        self.domain().user_namespace().into()
     }
 
     fn mount_namespace(&self) -> (u64, u64) {
@@ -1879,14 +1941,6 @@ impl EngineProcessPolicyObservationView for ProcessObservation {
     fn network_namespace(&self) -> (u64, u64) {
         let identity = self.domain().network_namespace();
         (identity.device(), identity.inode().get())
-    }
-
-    fn uid_map_digest(&self) -> [u8; CANARY_CREDENTIAL_MAP_DIGEST_BYTES] {
-        *self.domain().uid_map_digest().as_bytes()
-    }
-
-    fn gid_map_digest(&self) -> [u8; CANARY_CREDENTIAL_MAP_DIGEST_BYTES] {
-        *self.domain().gid_map_digest().as_bytes()
     }
 }
 
@@ -1901,7 +1955,7 @@ where
     let expected_credentials = environment.engine_credentials();
     let expected_domain = environment.credential_domain();
     let expected_network = environment.authority().network().daemon_network_namespace();
-    let expected_user = expected_domain.user_namespace();
+    let expected_user = expected_domain.user_namespace().into();
     let expected_mount = expected_domain.mount_namespace();
     observed.uids() == [expected_credentials.uid().get(); 4]
         && observed.gids() == [expected_credentials.gid().get(); 4]
@@ -1912,11 +1966,9 @@ where
         && observed.capability_bounding() == TRANSPARENT_PROXY_ENGINE_CAPABILITY_MASK
         && observed.capability_ambient() == TRANSPARENT_PROXY_ENGINE_CAPABILITY_MASK
         && observed.no_new_privileges()
-        && observed.user_namespace() == (expected_user.device(), expected_user.inode().get())
+        && observed.user_namespace() == expected_user
         && observed.mount_namespace() == (expected_mount.device(), expected_mount.inode().get())
         && observed.network_namespace() == (expected_network.device(), expected_network.inode())
-        && observed.uid_map_digest() == expected_domain.uid_map_digest().as_bytes()
-        && observed.gid_map_digest() == expected_domain.gid_map_digest().as_bytes()
 }
 
 fn validate_engine_process_policy_pair<B, A>(
@@ -2095,8 +2147,8 @@ mod tests {
     use super::super::{CanarySocketObserverAuthority, CanarySocketObserverBinding};
     use super::*;
     use crate::functional_canary::{
-        CanaryAddressFamilies, CanaryDeadline, UnqualifiedCanaryCleanupEvidence,
-        UnqualifiedCanaryFlowEvidenceSlots,
+        CanaryAddressFamilies, CanaryCredentialDomainBinding, CanaryDeadline,
+        UnqualifiedCanaryCleanupEvidence, UnqualifiedCanaryFlowEvidenceSlots,
     };
     #[cfg(target_os = "linux")]
     use flux_platform::ProcessHandle;
@@ -2112,11 +2164,9 @@ mod tests {
         capability_bounding: u64,
         capability_ambient: u64,
         no_new_privileges: bool,
-        user_namespace: (u64, u64),
+        user_namespace: EngineProcessUserNamespaceObservation,
         mount_namespace: (u64, u64),
         network_namespace: (u64, u64),
-        uid_map_digest: [u8; CANARY_CREDENTIAL_MAP_DIGEST_BYTES],
-        gid_map_digest: [u8; CANARY_CREDENTIAL_MAP_DIGEST_BYTES],
     }
 
     impl ScriptedEngineProcessPolicyObservation {
@@ -2124,7 +2174,7 @@ mod tests {
             let environment = request.pre_binding().environment();
             let credentials = environment.engine_credentials();
             let domain = environment.credential_domain();
-            let user = domain.user_namespace();
+            let user_namespace = domain.user_namespace().into();
             let mount = domain.mount_namespace();
             let network = environment.authority().network().daemon_network_namespace();
             Self {
@@ -2137,11 +2187,9 @@ mod tests {
                 capability_bounding: TRANSPARENT_PROXY_ENGINE_CAPABILITY_MASK,
                 capability_ambient: TRANSPARENT_PROXY_ENGINE_CAPABILITY_MASK,
                 no_new_privileges: true,
-                user_namespace: (user.device(), user.inode().get()),
+                user_namespace,
                 mount_namespace: (mount.device(), mount.inode().get()),
                 network_namespace: (network.device(), network.inode()),
-                uid_map_digest: domain.uid_map_digest().as_bytes(),
-                gid_map_digest: domain.gid_map_digest().as_bytes(),
             }
         }
     }
@@ -2183,7 +2231,7 @@ mod tests {
             self.no_new_privileges
         }
 
-        fn user_namespace(&self) -> (u64, u64) {
+        fn user_namespace(&self) -> EngineProcessUserNamespaceObservation {
             self.user_namespace
         }
 
@@ -2193,14 +2241,6 @@ mod tests {
 
         fn network_namespace(&self) -> (u64, u64) {
             self.network_namespace
-        }
-
-        fn uid_map_digest(&self) -> [u8; CANARY_CREDENTIAL_MAP_DIGEST_BYTES] {
-            self.uid_map_digest
-        }
-
-        fn gid_map_digest(&self) -> [u8; CANARY_CREDENTIAL_MAP_DIGEST_BYTES] {
-            self.gid_map_digest
         }
     }
 
@@ -2235,14 +2275,75 @@ mod tests {
         assert_engine_policy_rejected(request, |observed| observed.capability_bounding = 1);
         assert_engine_policy_rejected(request, |observed| observed.capability_ambient = 1);
         assert_engine_policy_rejected(request, |observed| observed.no_new_privileges = false);
-        assert_engine_policy_rejected(request, |observed| observed.user_namespace.0 ^= 1);
-        assert_engine_policy_rejected(request, |observed| observed.user_namespace.1 ^= 1);
+        assert_engine_policy_rejected(request, |observed| {
+            let EngineProcessUserNamespaceObservation::Observed { namespace, .. } =
+                &mut observed.user_namespace
+            else {
+                panic!("fixture user namespace is observed")
+            };
+            namespace.0 ^= 1;
+        });
+        assert_engine_policy_rejected(request, |observed| {
+            let EngineProcessUserNamespaceObservation::Observed { namespace, .. } =
+                &mut observed.user_namespace
+            else {
+                panic!("fixture user namespace is observed")
+            };
+            namespace.1 ^= 1;
+        });
         assert_engine_policy_rejected(request, |observed| observed.mount_namespace.0 ^= 1);
         assert_engine_policy_rejected(request, |observed| observed.mount_namespace.1 ^= 1);
         assert_engine_policy_rejected(request, |observed| observed.network_namespace.0 ^= 1);
         assert_engine_policy_rejected(request, |observed| observed.network_namespace.1 ^= 1);
-        assert_engine_policy_rejected(request, |observed| observed.uid_map_digest[0] ^= 1);
-        assert_engine_policy_rejected(request, |observed| observed.gid_map_digest[0] ^= 1);
+        assert_engine_policy_rejected(request, |observed| {
+            let EngineProcessUserNamespaceObservation::Observed { uid_map_digest, .. } =
+                &mut observed.user_namespace
+            else {
+                panic!("fixture user namespace is observed")
+            };
+            uid_map_digest[0] ^= 1;
+        });
+        assert_engine_policy_rejected(request, |observed| {
+            let EngineProcessUserNamespaceObservation::Observed { gid_map_digest, .. } =
+                &mut observed.user_namespace
+            else {
+                panic!("fixture user namespace is observed")
+            };
+            gid_map_digest[0] ^= 1;
+        });
+        assert_engine_policy_rejected(request, |observed| {
+            observed.user_namespace = EngineProcessUserNamespaceObservation::Unsupported
+        });
+    }
+
+    #[test]
+    fn engine_policy_accepts_only_matching_unsupported_user_namespace_domain() {
+        let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+        let mut request = fixture.request().clone();
+        let mount_namespace = request
+            .pre_binding
+            .environment
+            .credentials
+            .domain
+            .mount_namespace();
+        request.pre_binding.environment.credentials.domain =
+            CanaryCredentialDomainBinding::unsupported(mount_namespace);
+
+        let exact = ScriptedEngineProcessPolicyObservation::exact(&request);
+        assert_eq!(
+            exact.user_namespace,
+            EngineProcessUserNamespaceObservation::Unsupported
+        );
+        validate_engine_process_policy_pair(&request, &exact, &exact)
+            .expect("an unsupported request accepts coherent unsupported live evidence");
+
+        assert_engine_policy_rejected(&request, |observed| {
+            observed.user_namespace = EngineProcessUserNamespaceObservation::Observed {
+                namespace: (7, 8),
+                uid_map_digest: [9; CANARY_CREDENTIAL_MAP_DIGEST_BYTES],
+                gid_map_digest: [10; CANARY_CREDENTIAL_MAP_DIGEST_BYTES],
+            };
+        });
     }
 
     #[cfg(target_os = "linux")]
@@ -2284,13 +2385,8 @@ mod tests {
             observed.no_new_privileges(),
             credentials.no_new_privileges()
         );
-        assert_eq!(
-            observed.user_namespace(),
-            (
-                domain.user_namespace().device(),
-                domain.user_namespace().inode().get()
-            )
-        );
+        let expected_user_namespace = domain.user_namespace().into();
+        assert_eq!(observed.user_namespace(), expected_user_namespace);
         assert_eq!(
             observed.mount_namespace(),
             (
@@ -2305,15 +2401,6 @@ mod tests {
                 domain.network_namespace().inode().get()
             )
         );
-        assert_eq!(
-            observed.uid_map_digest(),
-            *domain.uid_map_digest().as_bytes()
-        );
-        assert_eq!(
-            observed.gid_map_digest(),
-            *domain.gid_map_digest().as_bytes()
-        );
-
         child.terminate_and_reap();
     }
 

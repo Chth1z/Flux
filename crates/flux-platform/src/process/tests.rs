@@ -8,12 +8,13 @@ use std::time::{Duration, Instant};
 
 use super::implementation::{
     ProcessCredentialMapObservation, ProcessObservationCensusPass, ProcessTaskNamespaces,
-    ProcessTaskObservation, digest_process_id_map, parse_pidfd_info, parse_proc_stat,
-    parse_proc_status, require_live, require_waitable_child, validate_process_observation_census,
+    ProcessTaskObservation, ProcessTaskUserNamespaceObservation, UserNamespaceSupport,
+    digest_process_id_map, parse_pidfd_info, parse_proc_stat, parse_proc_status, require_live,
+    require_waitable_child, validate_process_observation_census,
 };
 use super::{
     ProcessCredentialMapKind, ProcessHandle, ProcessHandleError, ProcessHandleErrorKind,
-    ProcessIdentity, ProcessNamespaceIdentity,
+    ProcessIdentity, ProcessNamespaceIdentity, ProcessUserNamespaceObservation,
 };
 
 const THREAD_HELPER_MODE: &str = "FLUX_PROCESS_HANDLE_THREAD_HELPER";
@@ -101,14 +102,25 @@ impl Drop for ChildGuard {
 
 fn task_namespaces(seed: u64) -> ProcessTaskNamespaces {
     ProcessTaskNamespaces {
-        user: ProcessNamespaceIdentity::new(4, NonZeroU64::new(seed).unwrap()),
+        user: ProcessTaskUserNamespaceObservation::Observed(ProcessNamespaceIdentity::new(
+            4,
+            NonZeroU64::new(seed).unwrap(),
+        )),
         mount: ProcessNamespaceIdentity::new(4, NonZeroU64::new(seed + 1).unwrap()),
         network: ProcessNamespaceIdentity::new(4, NonZeroU64::new(seed + 2).unwrap()),
     }
 }
 
+fn unsupported_task_namespaces(seed: u64) -> ProcessTaskNamespaces {
+    ProcessTaskNamespaces {
+        user: ProcessTaskUserNamespaceObservation::Unsupported,
+        mount: ProcessNamespaceIdentity::new(4, NonZeroU64::new(seed).unwrap()),
+        network: ProcessNamespaceIdentity::new(4, NonZeroU64::new(seed + 1).unwrap()),
+    }
+}
+
 fn credential_maps(uid: &[u8], gid: &[u8]) -> ProcessCredentialMapObservation {
-    ProcessCredentialMapObservation {
+    ProcessCredentialMapObservation::Observed {
         uid: digest_process_id_map(
             uid,
             Path::new("/test/uid_map"),
@@ -274,6 +286,8 @@ fn credential_census_validation_rejects_changed_or_heterogeneous_tasks() {
         observation_pass(&task_ids, &heterogeneous, maps),
         observation_pass(&task_ids, &heterogeneous, maps),
         &task_ids,
+        UserNamespaceSupport::Supported,
+        UserNamespaceSupport::Supported,
     )
     .expect_err("a stable worker/leader credential mismatch must be rejected");
     assert!(matches!(
@@ -289,6 +303,8 @@ fn credential_census_validation_rejects_changed_or_heterogeneous_tasks() {
         observation_pass(&task_ids, &homogeneous, maps),
         observation_pass(&task_ids, &heterogeneous, maps),
         &task_ids,
+        UserNamespaceSupport::Supported,
+        UserNamespaceSupport::Supported,
     )
     .expect_err("credentials changing between scans must be rejected");
     assert!(matches!(
@@ -350,6 +366,8 @@ fn namespace_and_map_census_rejects_drift_or_heterogeneous_tasks() {
         observation_pass(&task_ids, &homogeneous, maps),
         observation_pass(&task_ids, &heterogeneous, maps),
         &task_ids,
+        UserNamespaceSupport::Supported,
+        UserNamespaceSupport::Supported,
     )
     .expect_err("a namespace transition between scans must be rejected");
     assert!(matches!(
@@ -363,6 +381,8 @@ fn namespace_and_map_census_rejects_drift_or_heterogeneous_tasks() {
         observation_pass(&task_ids, &heterogeneous, maps),
         observation_pass(&task_ids, &heterogeneous, maps),
         &task_ids,
+        UserNamespaceSupport::Supported,
+        UserNamespaceSupport::Supported,
     )
     .expect_err("a stable worker/leader namespace mismatch must be rejected");
     assert!(matches!(
@@ -377,6 +397,8 @@ fn namespace_and_map_census_rejects_drift_or_heterogeneous_tasks() {
         observation_pass(&task_ids, &homogeneous, maps),
         observation_pass(&task_ids, &homogeneous, changed_uid_maps),
         &task_ids,
+        UserNamespaceSupport::Supported,
+        UserNamespaceSupport::Supported,
     )
     .expect_err("a UID map transition between scans must be rejected");
     assert!(matches!(
@@ -385,6 +407,70 @@ fn namespace_and_map_census_rejects_drift_or_heterogeneous_tasks() {
             pid,
             map: ProcessCredentialMapKind::Uid
         } if pid == leader_id
+    ));
+}
+
+#[test]
+fn user_namespace_census_accepts_only_coherent_stable_support() {
+    let leader_id = NonZeroU32::new(4242).unwrap();
+    let (_, _, credentials) = parse_proc_status(
+        b"Tgid:\t4242\nPid:\t4242\nUid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\nGroups:\t\nCapInh:\t0\nCapPrm:\t0\nCapEff:\t0\nCapBnd:\t0\nCapAmb:\t0\nNoNewPrivs:\t1\n",
+    )
+    .expect("parse stable credentials");
+    let task_ids = [leader_id];
+    let observations = [(
+        leader_id,
+        ProcessTaskObservation {
+            credentials,
+            namespaces: unsupported_task_namespaces(400),
+        },
+    )];
+    let unsupported = observation_pass(
+        &task_ids,
+        &observations,
+        ProcessCredentialMapObservation::Unsupported,
+    );
+
+    let (_, domain) = validate_process_observation_census(
+        leader_id,
+        unsupported,
+        unsupported,
+        &task_ids,
+        UserNamespaceSupport::Unsupported,
+        UserNamespaceSupport::Unsupported,
+    )
+    .expect("coherently absent user-namespace facilities are authoritative");
+    assert_eq!(
+        domain.user_namespace(),
+        ProcessUserNamespaceObservation::Unsupported
+    );
+
+    let error = validate_process_observation_census(
+        leader_id,
+        unsupported,
+        unsupported,
+        &task_ids,
+        UserNamespaceSupport::Unsupported,
+        UserNamespaceSupport::Supported,
+    )
+    .expect_err("observer support changing across the census must be rejected");
+    assert!(matches!(
+        error,
+        ProcessHandleError::ProcessUserNamespaceSupportChanged { pid } if pid == leader_id
+    ));
+
+    let error = validate_process_observation_census(
+        leader_id,
+        unsupported,
+        unsupported,
+        &task_ids,
+        UserNamespaceSupport::Supported,
+        UserNamespaceSupport::Supported,
+    )
+    .expect_err("target facilities must match supported observer facilities");
+    assert!(matches!(
+        error,
+        ProcessHandleError::ProcessUserNamespaceObservationMismatch { pid } if pid == leader_id
     ));
 }
 
@@ -505,7 +591,6 @@ fn child_origin_handle_reobserves_the_same_live_identity_and_credentials() {
     let pid = initial.identity().pid();
     let domain = initial.domain();
     for (leaf, observed) in [
-        ("user", domain.user_namespace()),
         ("mnt", domain.mount_namespace()),
         ("net", domain.network_namespace()),
     ] {
@@ -517,20 +602,41 @@ fn child_origin_handle_reobserves_the_same_live_identity_and_credentials() {
     }
     let uid_map_path = format!("/proc/{pid}/uid_map");
     let gid_map_path = format!("/proc/{pid}/gid_map");
-    let expected_uid_map = digest_process_id_map(
-        &std::fs::read(&uid_map_path).expect("read live child UID map"),
-        Path::new(&uid_map_path),
-        ProcessCredentialMapKind::Uid,
-    )
-    .expect("digest live child UID map");
-    let expected_gid_map = digest_process_id_map(
-        &std::fs::read(&gid_map_path).expect("read live child GID map"),
-        Path::new(&gid_map_path),
-        ProcessCredentialMapKind::Gid,
-    )
-    .expect("digest live child GID map");
-    assert_eq!(domain.uid_map_digest(), expected_uid_map);
-    assert_eq!(domain.gid_map_digest(), expected_gid_map);
+    let user_namespace_path = format!("/proc/{pid}/ns/user");
+    match domain.user_namespace() {
+        ProcessUserNamespaceObservation::Unsupported => {
+            for path in [&user_namespace_path, &uid_map_path, &gid_map_path] {
+                let error = std::fs::File::open(path)
+                    .expect_err("unsupported user-namespace facility must remain absent");
+                assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+            }
+        }
+        ProcessUserNamespaceObservation::Observed {
+            namespace,
+            uid_map_digest,
+            gid_map_digest,
+        } => {
+            let file =
+                std::fs::File::open(&user_namespace_path).expect("open live child user namespace");
+            let metadata = file.metadata().expect("inspect live child user namespace");
+            assert_eq!(namespace.device(), metadata.dev());
+            assert_eq!(namespace.inode().get(), metadata.ino());
+            let expected_uid_map = digest_process_id_map(
+                &std::fs::read(&uid_map_path).expect("read live child UID map"),
+                Path::new(&uid_map_path),
+                ProcessCredentialMapKind::Uid,
+            )
+            .expect("digest live child UID map");
+            let expected_gid_map = digest_process_id_map(
+                &std::fs::read(&gid_map_path).expect("read live child GID map"),
+                Path::new(&gid_map_path),
+                ProcessCredentialMapKind::Gid,
+            )
+            .expect("digest live child GID map");
+            assert_eq!(uid_map_digest, expected_uid_map);
+            assert_eq!(gid_map_digest, expected_gid_map);
+        }
+    }
 
     let observation = handle.reobserve().expect("reobserve live child");
     assert_eq!(observation.identity(), initial.identity());

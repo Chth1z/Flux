@@ -15,6 +15,7 @@ mod capability;
 mod child_process;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod engine_credential_probe;
+mod engine_credential_probe_stage;
 mod file_observer;
 mod netlink;
 #[allow(dead_code)]
@@ -86,7 +87,9 @@ pub use network_observer::collect_network_inventory_once;
 pub use process::{
     PROCESS_CREDENTIAL_MAP_DIGEST_BYTES, ProcessCredentialMapDigest, ProcessCredentialMapKind,
     ProcessCredentials, ProcessDomainObservation, ProcessHandle, ProcessHandleError,
-    ProcessHandleErrorKind, ProcessIdentity, ProcessNamespaceIdentity, ProcessObservation,
+    ProcessHandleErrorKind, ProcessHandleObservationError, ProcessHandleObservationStage,
+    ProcessHandleOpenError, ProcessHandleOpenStage, ProcessIdentity, ProcessNamespaceIdentity,
+    ProcessObservation, ProcessUserNamespaceObservation,
 };
 pub use reactor::{
     DaemonReactor, NetworkInventoryAttachment, NetworkInventoryDegradation,
@@ -153,6 +156,10 @@ pub mod internal {
         EngineCredentialProbeCapabilities, EngineCredentialProbeCommand,
         EngineCredentialProbeConfig, EngineCredentialProbePrivilege, EngineCredentialProbeReport,
         validate_engine_process_credentials,
+    };
+    pub use crate::engine_credential_probe_stage::{
+        ENGINE_CREDENTIAL_PROBE_STAGE_RECEIPT_NAME, ENGINE_CREDENTIAL_PROBE_STAGE_TEMPORARY_NAME,
+        EngineCredentialProbeStage,
     };
     pub use crate::sing_box::{
         PinnedSingBoxLaunch, ProcessDiagnostics, SingBoxChild, SingBoxChildIdentity,

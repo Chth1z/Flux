@@ -13,7 +13,10 @@ use std::time::{Duration, Instant};
 use flux_core::EngineCredentials;
 
 use crate::child_process::{self, ChildProcessConfig, ChildProcessPrivilege, ProcessSignal};
-use crate::process::{ProcessHandle, ProcessHandleError, ProcessIdentity};
+use crate::process::{
+    ProcessHandle, ProcessHandleError, ProcessHandleOpenError, ProcessHandleOpenStage,
+    ProcessIdentity,
+};
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use std::collections::HashSet;
@@ -151,26 +154,38 @@ impl SingBoxChild {
     /// pidfd/procfs identity is rechecked against the identity recorded when
     /// Sing-Box was spawned, so a copied PID or changed start time cannot be
     /// promoted into child authority.
-    pub fn open_process_handle(&self) -> Result<ProcessHandle, ProcessHandleError> {
-        let pid =
-            NonZeroU32::new(self.identity.pid).ok_or(ProcessHandleError::InvalidChildPid {
-                pid: self.identity.pid,
-            })?;
-        let child = self
-            .child
-            .as_ref()
-            .ok_or(ProcessHandleError::Exited { pid })?;
+    pub fn open_process_handle(&self) -> Result<ProcessHandle, ProcessHandleOpenError> {
+        let pid = NonZeroU32::new(self.identity.pid).ok_or_else(|| {
+            ProcessHandleOpenError::new(
+                ProcessHandleOpenStage::RecordedChildIdentity,
+                ProcessHandleError::InvalidChildPid {
+                    pid: self.identity.pid,
+                },
+            )
+        })?;
+        let child = self.child.as_ref().ok_or_else(|| {
+            ProcessHandleOpenError::new(
+                ProcessHandleOpenStage::RecordedChildIdentity,
+                ProcessHandleError::Exited { pid },
+            )
+        })?;
         let handle = ProcessHandle::open_child(child)?;
         let start_time_ticks =
             NonZeroU64::new(self.identity.start_time_ticks).ok_or_else(|| {
-                ProcessHandleError::MalformedProcStat {
-                    path: PathBuf::from(format!("/proc/{pid}/stat")),
-                }
+                ProcessHandleOpenError::new(
+                    ProcessHandleOpenStage::RecordedChildIdentity,
+                    ProcessHandleError::MalformedProcStat {
+                        path: PathBuf::from(format!("/proc/{pid}/stat")),
+                    },
+                )
             })?;
         let expected = ProcessIdentity::new(pid, start_time_ticks);
         let observed = handle.identity();
         if observed != expected {
-            return Err(ProcessHandleError::ProcessIdentityMismatch { expected, observed });
+            return Err(ProcessHandleOpenError::new(
+                ProcessHandleOpenStage::RecordedChildIdentity,
+                ProcessHandleError::ProcessIdentityMismatch { expected, observed },
+            ));
         }
         Ok(handle)
     }
@@ -1890,9 +1905,10 @@ fn defer_reap(mut child: Child, pid: u32) {
 mod tests {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     use super::{
-        ProcessHandleError, ReadinessEvidence, SingBoxChild, SingBoxExecutablePrivilegeAttribute,
-        SingBoxProcessAdapter, SingBoxProcessError, listener_evidence, proc_net_contains_port,
-        read_child_identity, validate_executable_privilege_state,
+        ProcessHandleError, ProcessHandleOpenStage, ReadinessEvidence, SingBoxChild,
+        SingBoxExecutablePrivilegeAttribute, SingBoxProcessAdapter, SingBoxProcessError,
+        listener_evidence, proc_net_contains_port, read_child_identity,
+        validate_executable_privilege_state,
     };
     use super::{bounded_lossy_tail, retain_tail};
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -1985,8 +2001,10 @@ mod tests {
         let error = child
             .open_process_handle()
             .expect_err("changed recorded identity must not become child authority");
-        let ProcessHandleError::ProcessIdentityMismatch { expected, observed } = error else {
-            panic!("unexpected process-handle error: {error:?}");
+        assert_eq!(error.stage(), ProcessHandleOpenStage::RecordedChildIdentity);
+        let source = error.into_source();
+        let ProcessHandleError::ProcessIdentityMismatch { expected, observed } = source else {
+            panic!("unexpected process-handle error: {source:?}");
         };
         assert_eq!(expected.pid().get(), changed_identity.pid);
         assert_eq!(

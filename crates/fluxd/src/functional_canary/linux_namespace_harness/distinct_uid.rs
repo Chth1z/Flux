@@ -6,7 +6,10 @@
 //! exact child-origin process handles through live reobservation and parent-confirmed reap.
 
 use super::*;
-use flux_platform::{ProcessHandle, ProcessHandleError, ProcessHandleErrorKind};
+use flux_platform::{
+    ProcessHandle, ProcessHandleError, ProcessHandleErrorKind, ProcessHandleObservationStage,
+    ProcessHandleOpenError, ProcessHandleOpenStage,
+};
 use std::fmt;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -369,8 +372,8 @@ fn run_process_handle_availability_probe() -> Result<(), ProcessHandleProbeFailu
     Ok(())
 }
 
-fn classify_process_handle_open_error(error: ProcessHandleError) -> ProcessHandleProbeFailure {
-    match error {
+fn classify_process_handle_open_error(error: ProcessHandleOpenError) -> ProcessHandleProbeFailure {
+    match error.into_source() {
         ProcessHandleError::UnsupportedPlatform(platform) => {
             ProcessHandleProbeFailure::Unavailable(
                 PreflightUnavailable::new(
@@ -1945,7 +1948,7 @@ mod tests {
 
     #[test]
     fn process_handle_probe_softens_only_unsupported_or_permission_denied_opening() {
-        for error in [
+        for source in [
             ProcessHandleError::UnsupportedPlatform("test"),
             ProcessHandleError::PidFdUnsupported {
                 source: std::io::Error::from_raw_os_error(libc::ENOSYS),
@@ -1957,7 +1960,10 @@ mod tests {
             },
         ] {
             assert!(matches!(
-                classify_process_handle_open_error(error),
+                classify_process_handle_open_error(ProcessHandleOpenError::new(
+                    ProcessHandleOpenStage::Start,
+                    source,
+                )),
                 ProcessHandleProbeFailure::Unavailable(_)
             ));
         }
@@ -1966,17 +1972,28 @@ mod tests {
             pid: std::num::NonZeroU32::new(1).expect("nonzero test PID"),
         };
         assert!(matches!(
-            classify_process_handle_open_error(exited),
+            classify_process_handle_open_error(ProcessHandleOpenError::new(
+                ProcessHandleOpenStage::Start,
+                exited,
+            )),
             ProcessHandleProbeFailure::Hard(_)
         ));
         assert!(matches!(
-            classify_process_handle_open_error(ProcessHandleError::MalformedProcStat {
-                path: PathBuf::from("/proc/1/stat"),
-            }),
+            classify_process_handle_open_error(ProcessHandleOpenError::new(
+                ProcessHandleOpenStage::InitialObservation(
+                    ProcessHandleObservationStage::ProcessIdentity,
+                ),
+                ProcessHandleError::MalformedProcStat {
+                    path: PathBuf::from("/proc/1/stat"),
+                },
+            )),
             ProcessHandleProbeFailure::Hard(_)
         ));
         assert!(matches!(
-            classify_process_handle_open_error(ProcessHandleError::ChildReapContractUnavailable),
+            classify_process_handle_open_error(ProcessHandleOpenError::new(
+                ProcessHandleOpenStage::ChildDispositionBeforeOpen,
+                ProcessHandleError::ChildReapContractUnavailable,
+            )),
             ProcessHandleProbeFailure::Hard(_)
         ));
     }

@@ -3,15 +3,16 @@
 use std::ffi::OsStr;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
-use std::num::{NonZeroU32, NonZeroU64};
+use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 use std::os::fd::AsRawFd;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
 use super::implementation::{
-    DumpDecoder, DumpSequenceState, DumpSpec, RawNetlinkSocketAddress, bounded_session_deadline,
-    encode_dump_request, parse_fd_name, parse_proc_stat, parse_socket_symlink_target,
-    require_stable_socket_fds, validate_kernel_sender,
+    DumpDecoder, DumpSequenceState, DumpSpec, ListenerDumpSpec, RawNetlinkSocketAddress,
+    bounded_session_deadline, encode_dump_request, encode_listener_dump_request, parse_fd_name,
+    parse_proc_stat, parse_socket_symlink_target, require_stable_socket_fds,
+    validate_kernel_sender,
 };
 use super::*;
 
@@ -63,6 +64,356 @@ fn dump_requests_are_exact_and_connected_udp_is_state_filtered() {
         2
     );
     assert!(tcp_request[24..].iter().all(|byte| *byte == 0));
+}
+
+#[test]
+fn listener_dump_request_filters_udp_close_by_source_port() {
+    let spec = ListenerDumpSpec {
+        address_family: InetSocketAddressFamily::Ipv6,
+        source_port: NonZeroU16::new(15_361).unwrap(),
+    };
+    let sequence = NonZeroU32::new(19).unwrap();
+    let request = encode_listener_dump_request(spec, sequence);
+
+    assert_eq!(request[16], libc::AF_INET6 as u8);
+    assert_eq!(request[17], libc::IPPROTO_UDP as u8);
+    assert_eq!(
+        u32::from_ne_bytes(request[20..24].try_into().unwrap()),
+        1_u32 << 7
+    );
+    assert_eq!(
+        u16::from_be_bytes(request[24..26].try_into().unwrap()),
+        15_361
+    );
+    assert!(request[26..].iter().all(|byte| *byte == 0));
+}
+
+#[test]
+fn listener_decoder_exposes_transparency_and_ipv6_only_state() {
+    let spec = ListenerDumpSpec {
+        address_family: InetSocketAddressFamily::Ipv6,
+        source_port: NonZeroU16::new(15_361).unwrap(),
+    };
+    let mut attributes = attribute(11, &[1]);
+    attributes.extend(attribute(22, &[0x20, 0]));
+    let payload = diagnostic_payload(
+        DumpSpec {
+            address_family: spec.address_family,
+            protocol: InetSocketProtocol::Udp,
+        },
+        7,
+        "[::]:15361".parse().unwrap(),
+        "[::]:0".parse().unwrap(),
+        0,
+        [11, 22],
+        1000,
+        4567,
+        &attributes,
+    );
+    let mut decoder = DumpDecoder::new_listener(
+        spec,
+        NonZeroU32::new(3).unwrap(),
+        NonZeroU32::new(44).unwrap(),
+    );
+    decoder
+        .decode_datagram(&netlink_message(
+            SOCK_DIAG_BY_FAMILY,
+            NLM_F_MULTI,
+            3,
+            44,
+            &payload,
+        ))
+        .unwrap();
+    decoder
+        .decode_datagram(&netlink_message(NLMSG_DONE, NLM_F_MULTI, 3, 44, &[]))
+        .unwrap();
+    let now = Instant::now();
+    let record = decoder.finish(now, now).unwrap().sockets[0];
+    assert_eq!(record.state(), 7);
+    assert_eq!(record.transparent(), Some(true));
+    assert_eq!(record.ipv6_only(), Some(true));
+}
+
+#[test]
+fn transparent_listener_correlation_requires_one_row_and_one_fd_inode_join() {
+    let local: SocketAddr = "0.0.0.0:15361".parse().unwrap();
+    let remote: SocketAddr = "0.0.0.0:0".parse().unwrap();
+    let diagnostic = InetSocketDiagnostic {
+        dump_sequence: NonZeroU32::new(1).unwrap(),
+        address_family: InetSocketAddressFamily::Ipv4,
+        protocol: InetSocketProtocol::Tcp,
+        state: 10,
+        local_address: local,
+        remote_address: remote,
+        interface_index: 0,
+        uid: 1000,
+        inode: 55,
+        cookie: InetDiagCookie { words: [1, 2] },
+        mark: None,
+        transparent: Some(true),
+        ipv6_only: None,
+    };
+    let snapshot = snapshot_with(vec![diagnostic]);
+    let correlated = snapshot
+        .correlate_transparent_listener(
+            InetSocketAddressFamily::Ipv4,
+            InetSocketProtocol::Tcp,
+            NonZeroU16::new(15361).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(correlated.process_fd().fd(), 0);
+    assert_eq!(correlated.diagnostic(), diagnostic);
+
+    let ambiguous_fd = ProcessSocketDiagnostics {
+        socket_fds: vec![
+            ProcessSocketFd {
+                fd: 0,
+                inode: NonZeroU64::new(55).unwrap(),
+            },
+            ProcessSocketFd {
+                fd: 1,
+                inode: NonZeroU64::new(55).unwrap(),
+            },
+        ]
+        .into_boxed_slice(),
+        ..snapshot_with(vec![diagnostic])
+    };
+    assert!(
+        ambiguous_fd
+            .correlate_transparent_listener(
+                InetSocketAddressFamily::Ipv4,
+                InetSocketProtocol::Tcp,
+                NonZeroU16::new(15361).unwrap(),
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn transparent_listener_correlation_rejects_wrong_role_state_tuple_and_attributes() {
+    let base = InetSocketDiagnostic {
+        dump_sequence: NonZeroU32::new(1).unwrap(),
+        address_family: InetSocketAddressFamily::Ipv4,
+        protocol: InetSocketProtocol::Tcp,
+        state: 10,
+        local_address: "0.0.0.0:15361".parse().unwrap(),
+        remote_address: "0.0.0.0:0".parse().unwrap(),
+        interface_index: 0,
+        uid: 1000,
+        inode: 55,
+        cookie: InetDiagCookie { words: [1, 2] },
+        mark: None,
+        transparent: Some(true),
+        ipv6_only: None,
+    };
+    let port = NonZeroU16::new(15361).unwrap();
+    let assert_missing = |diagnostic: InetSocketDiagnostic| {
+        assert_eq!(
+            snapshot_with(vec![diagnostic])
+                .correlate_transparent_listener(
+                    InetSocketAddressFamily::Ipv4,
+                    InetSocketProtocol::Tcp,
+                    port,
+                )
+                .unwrap_err(),
+            ListenerSocketCorrelationError::MissingDiagnostic {
+                address_family: InetSocketAddressFamily::Ipv4,
+                protocol: InetSocketProtocol::Tcp,
+                port,
+            }
+        );
+    };
+    assert_missing(InetSocketDiagnostic { state: 7, ..base });
+    assert_missing(InetSocketDiagnostic {
+        local_address: "127.0.0.1:15361".parse().unwrap(),
+        ..base
+    });
+    assert_missing(InetSocketDiagnostic {
+        remote_address: "0.0.0.0:9".parse().unwrap(),
+        ..base
+    });
+    assert_missing(InetSocketDiagnostic {
+        transparent: Some(false),
+        ..base
+    });
+    assert_missing(InetSocketDiagnostic {
+        ipv6_only: Some(false),
+        ..base
+    });
+
+    let ipv6 = InetSocketDiagnostic {
+        dump_sequence: NonZeroU32::new(3).unwrap(),
+        address_family: InetSocketAddressFamily::Ipv6,
+        protocol: InetSocketProtocol::Tcp,
+        state: 10,
+        local_address: "[::]:15361".parse().unwrap(),
+        remote_address: "[::]:0".parse().unwrap(),
+        interface_index: 0,
+        uid: 1000,
+        inode: 56,
+        cookie: InetDiagCookie { words: [2, 3] },
+        mark: None,
+        transparent: Some(true),
+        ipv6_only: Some(true),
+    };
+    assert!(
+        snapshot_with(vec![ipv6])
+            .correlate_transparent_listener(
+                InetSocketAddressFamily::Ipv6,
+                InetSocketProtocol::Tcp,
+                port,
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn complete_four_role_listener_snapshot_correlates_distinct_socket_identities() {
+    let observed_at = Instant::now();
+    let port = NonZeroU16::new(15_361).unwrap();
+    let roles = [
+        (
+            InetSocketAddressFamily::Ipv4,
+            InetSocketProtocol::Tcp,
+            10,
+            "0.0.0.0:15361".parse().unwrap(),
+            "0.0.0.0:0".parse().unwrap(),
+            None,
+            1,
+        ),
+        (
+            InetSocketAddressFamily::Ipv4,
+            InetSocketProtocol::Udp,
+            7,
+            "0.0.0.0:15361".parse().unwrap(),
+            "0.0.0.0:0".parse().unwrap(),
+            None,
+            5,
+        ),
+        (
+            InetSocketAddressFamily::Ipv6,
+            InetSocketProtocol::Tcp,
+            10,
+            "[::]:15361".parse().unwrap(),
+            "[::]:0".parse().unwrap(),
+            Some(true),
+            3,
+        ),
+        (
+            InetSocketAddressFamily::Ipv6,
+            InetSocketProtocol::Udp,
+            7,
+            "[::]:15361".parse().unwrap(),
+            "[::]:0".parse().unwrap(),
+            Some(true),
+            6,
+        ),
+    ];
+    let sockets = roles
+        .into_iter()
+        .enumerate()
+        .map(
+            |(index, (address_family, protocol, state, local, remote, ipv6_only, sequence))| {
+                InetSocketDiagnostic {
+                    dump_sequence: NonZeroU32::new(sequence).unwrap(),
+                    address_family,
+                    protocol,
+                    state,
+                    local_address: local,
+                    remote_address: remote,
+                    interface_index: 0,
+                    uid: 1000,
+                    inode: 55 + u64::try_from(index).unwrap(),
+                    cookie: InetDiagCookie {
+                        words: [1 + u32::try_from(index).unwrap(), 11],
+                    },
+                    mark: None,
+                    transparent: Some(true),
+                    ipv6_only,
+                }
+            },
+        )
+        .collect::<Vec<_>>();
+    let socket_fds = sockets
+        .iter()
+        .enumerate()
+        .map(|(index, diagnostic)| ProcessSocketFd {
+            fd: 10 + u32::try_from(index).unwrap(),
+            inode: NonZeroU64::new(diagnostic.inode()).unwrap(),
+        })
+        .collect::<Vec<_>>();
+    let snapshot = ProcessSocketDiagnostics {
+        process: SocketDiagnosticsProcessIdentity::new(
+            NonZeroU32::new(1).unwrap(),
+            NonZeroU64::new(1).unwrap(),
+        ),
+        netlink_port_id: NonZeroU32::new(1).unwrap(),
+        started_at: observed_at,
+        completed_at: observed_at,
+        socket_fds: socket_fds.into_boxed_slice(),
+        dumps: broad_dumps(observed_at),
+        listener_port: Some(port),
+        listener_dumps: [
+            InetSocketDump {
+                sequence: NonZeroU32::new(5).unwrap(),
+                address_family: InetSocketAddressFamily::Ipv4,
+                protocol: InetSocketProtocol::Udp,
+                started_at: observed_at,
+                completed_at: observed_at,
+            },
+            InetSocketDump {
+                sequence: NonZeroU32::new(6).unwrap(),
+                address_family: InetSocketAddressFamily::Ipv6,
+                protocol: InetSocketProtocol::Udp,
+                started_at: observed_at,
+                completed_at: observed_at,
+            },
+        ]
+        .into(),
+        sockets: sockets.into_boxed_slice(),
+    };
+
+    assert!(snapshot.diag_dumps_complete());
+    assert!(snapshot.listener_diag_dumps_complete());
+    assert_eq!(
+        roles.map(|(family, protocol, ..)| snapshot.listener_role_sequence(family, protocol)),
+        [1, 5, 3, 6].map(NonZeroU32::new)
+    );
+    let correlated = roles.map(|(family, protocol, ..)| {
+        snapshot
+            .correlate_transparent_listener(family, protocol, port)
+            .unwrap()
+    });
+    assert_eq!(
+        correlated.map(|socket| socket.process_fd().fd()),
+        [10, 11, 12, 13]
+    );
+    assert_eq!(
+        correlated.map(|socket| socket.diagnostic().inode()),
+        [55, 56, 57, 58]
+    );
+    assert_eq!(
+        correlated.map(|socket| socket.diagnostic().cookie().words()),
+        [[1, 11], [2, 11], [3, 11], [4, 11]]
+    );
+
+    let mut gapped = snapshot.clone();
+    gapped.listener_dumps[0].sequence = NonZeroU32::new(7).unwrap();
+    gapped.listener_dumps[1].sequence = NonZeroU32::new(8).unwrap();
+    assert!(!gapped.listener_diag_dumps_complete());
+    assert_eq!(
+        gapped.listener_role_sequence(InetSocketAddressFamily::Ipv4, InetSocketProtocol::Tcp,),
+        None
+    );
+    assert!(
+        gapped
+            .correlate_transparent_listener(
+                InetSocketAddressFamily::Ipv4,
+                InetSocketProtocol::Udp,
+                port,
+            )
+            .is_err()
+    );
 }
 
 #[test]
@@ -319,6 +670,39 @@ fn decoder_rejects_unconnected_udp_missing_cookie_and_malformed_attributes() {
             ))
             .is_err()
     );
+
+    for attributes in [
+        attribute(22, &[0x20]),
+        {
+            let mut duplicate = attribute(22, &[0x20, 0]);
+            duplicate.extend(attribute(22, &[0, 0]));
+            duplicate
+        },
+        attribute(11, &[2]),
+    ] {
+        let payload = diagnostic_payload(
+            ipv4_tcp(),
+            10,
+            "0.0.0.0:15361".parse().unwrap(),
+            "0.0.0.0:0".parse().unwrap(),
+            0,
+            [1, 2],
+            1,
+            2,
+            &attributes,
+        );
+        assert!(
+            decoder(ipv4_tcp())
+                .decode_datagram(&netlink_message(
+                    SOCK_DIAG_BY_FAMILY,
+                    NLM_F_MULTI,
+                    7,
+                    8,
+                    &payload,
+                ))
+                .is_err()
+        );
+    }
 }
 
 #[test]
@@ -367,6 +751,8 @@ fn correlation_requires_one_exact_fd_inode_protocol_and_directional_tuple() {
         inode: 55,
         cookie: InetDiagCookie { words: [1, 2] },
         mark: None,
+        transparent: None,
+        ipv6_only: None,
     };
     let snapshot = snapshot_with(vec![diagnostic]);
     assert_eq!(
@@ -424,10 +810,13 @@ fn collection_deadline_is_exclusive_and_checked_before_procfs_access() {
         NonZeroU32::new(u32::MAX).unwrap(),
         NonZeroU64::new(1).unwrap(),
     );
-    let deadline = Instant::now();
-    let error = SystemSocketDiagnosticsSource
-        .collect_until(identity, deadline)
-        .unwrap_err();
+    let session = SystemSocketDiagnosticsSource
+        .open_until(Instant::now() + Duration::from_secs(1))
+        .unwrap();
+    let error = match session.collect_process_until(identity, Instant::now()) {
+        Ok(_) => panic!("an expired deadline cannot collect a diagnostic snapshot"),
+        Err(error) => error,
+    };
     assert_eq!(error.kind(), SocketDiagnosticsErrorKind::DeadlineExpired);
 }
 
@@ -564,6 +953,8 @@ fn live_same_process_tcp_and_connected_udp_are_exactly_correlated() {
     assert!(snapshot.started_at() >= after_open_lower_bound);
     assert!(snapshot.fd_scan_complete());
     assert!(snapshot.diag_dumps_complete());
+    assert!(!snapshot.listener_diag_dumps_complete());
+    assert_eq!(snapshot.listener_port(), None);
     assert_eq!(snapshot.dumps().len(), 4);
     assert!(snapshot.started_at() <= snapshot.completed_at());
     assert!(snapshot.completed_at() < deadline);
@@ -593,6 +984,34 @@ fn live_same_process_tcp_and_connected_udp_are_exactly_correlated() {
             (InetSocketAddressFamily::Ipv6, InetSocketProtocol::Udp),
         ]
     );
+
+    // A second transaction through the retained session proves that the
+    // targeted listener path observes unconnected UDP without widening the
+    // ordinary four-dump contract.
+    let udp_listener = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let listener_port = NonZeroU16::new(udp_listener.local_addr().unwrap().port()).unwrap();
+    let (session, listener_snapshot) = session
+        .collect_process_and_listeners_until(identity, listener_port, deadline)
+        .unwrap();
+    assert_eq!(listener_snapshot.dumps().len(), 4);
+    assert_eq!(listener_snapshot.listener_dumps().len(), 2);
+    assert!(listener_snapshot.listener_diag_dumps_complete());
+    assert_eq!(listener_snapshot.listener_port(), Some(listener_port));
+    assert_eq!(
+        listener_snapshot
+            .listener_dumps()
+            .iter()
+            .map(|dump| dump.sequence().get())
+            .collect::<Vec<_>>(),
+        [9, 10]
+    );
+    assert!(listener_snapshot.sockets().iter().any(|diagnostic| {
+        diagnostic.address_family() == InetSocketAddressFamily::Ipv4
+            && diagnostic.protocol() == InetSocketProtocol::Udp
+            && diagnostic.state() == 7
+            && diagnostic.local_address().port() == listener_port.get()
+            && diagnostic.transparent() == Some(false)
+    }));
 
     let tcp = snapshot
         .correlate(
@@ -624,11 +1043,12 @@ fn live_same_process_tcp_and_connected_udp_are_exactly_correlated() {
             .iter()
             .map(|dump| dump.sequence().get())
             .collect::<Vec<_>>(),
-        [5, 6, 7, 8]
+        [11, 12, 13, 14]
     );
 
-    let temporary = SystemSocketDiagnosticsSource
-        .collect_until(identity, deadline)
+    let temporary_session = SystemSocketDiagnosticsSource.open_until(deadline).unwrap();
+    let (temporary_session, temporary) = temporary_session
+        .collect_process_until(identity, deadline)
         .unwrap();
     assert_ne!(temporary.netlink_port_id(), prebound_port_id);
     assert_eq!(
@@ -639,8 +1059,10 @@ fn live_same_process_tcp_and_connected_udp_are_exactly_correlated() {
             .collect::<Vec<_>>(),
         [1, 2, 3, 4]
     );
-    assert_eq!(proc_fd_count(), fd_count_before_session + 1);
+    assert_eq!(proc_fd_count(), fd_count_before_session + 3);
+    drop(temporary_session);
     drop(session);
+    drop(udp_listener);
     assert_eq!(proc_fd_count(), fd_count_before_session);
 
     drop((tcp_server, tcp_client, tcp_listener, udp_left, udp_right));
@@ -741,20 +1163,43 @@ fn next_random(state: &mut u64) -> u64 {
 }
 
 fn snapshot_with(sockets: Vec<InetSocketDiagnostic>) -> ProcessSocketDiagnostics {
+    let observed_at = Instant::now();
     ProcessSocketDiagnostics {
         process: SocketDiagnosticsProcessIdentity::new(
             NonZeroU32::new(1).unwrap(),
             NonZeroU64::new(1).unwrap(),
         ),
         netlink_port_id: NonZeroU32::new(1).unwrap(),
-        started_at: Instant::now(),
-        completed_at: Instant::now(),
+        started_at: observed_at,
+        completed_at: observed_at,
         socket_fds: vec![ProcessSocketFd {
             fd: 0,
             inode: NonZeroU64::new(55).unwrap(),
         }]
         .into_boxed_slice(),
-        dumps: Box::default(),
+        dumps: broad_dumps(observed_at),
+        listener_port: None,
+        listener_dumps: Box::default(),
         sockets: sockets.into_boxed_slice(),
     }
+}
+
+fn broad_dumps(observed_at: Instant) -> Box<[InetSocketDump]> {
+    [
+        (InetSocketAddressFamily::Ipv4, InetSocketProtocol::Tcp),
+        (InetSocketAddressFamily::Ipv4, InetSocketProtocol::Udp),
+        (InetSocketAddressFamily::Ipv6, InetSocketProtocol::Tcp),
+        (InetSocketAddressFamily::Ipv6, InetSocketProtocol::Udp),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, (address_family, protocol))| InetSocketDump {
+        sequence: NonZeroU32::new(u32::try_from(index + 1).unwrap()).unwrap(),
+        address_family,
+        protocol,
+        started_at: observed_at,
+        completed_at: observed_at,
+    })
+    .collect::<Vec<_>>()
+    .into_boxed_slice()
 }

@@ -4,7 +4,7 @@ use std::fs;
 use std::io;
 use std::mem;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::num::{NonZeroU32, NonZeroU64};
+use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
@@ -18,7 +18,7 @@ use crate::netlink::{
 use super::{
     InetDiagCookie, InetSocketAddressFamily, InetSocketDiagnostic, InetSocketDump,
     InetSocketProtocol, ProcessSocketDiagnostics, ProcessSocketFd, SocketDiagnosticsError,
-    SocketDiagnosticsProcessIdentity,
+    SocketDiagnosticsProcessIdentity, TARGETED_LISTENER_DUMP_COUNT, TCP_CLOSE,
 };
 
 const SOCK_DIAG_BY_FAMILY: u16 = 20;
@@ -28,7 +28,9 @@ const NLM_F_DUMP: u16 = 0x300;
 const INET_DIAG_MESSAGE_LENGTH: usize = 72;
 const INET_DIAG_REQUEST_LENGTH: usize = NETLINK_HEADER_LENGTH + 56;
 const INET_DIAG_PROTOCOL: u16 = 10;
+const INET_DIAG_SKV6ONLY: u16 = 11;
 const INET_DIAG_MARK: u16 = 15;
+const INET_DIAG_SOCKOPT: u16 = 22;
 const TCP_ESTABLISHED: u8 = 1;
 const SOCKET_DIAG_RECEIVE_BUFFER_BYTES: i32 = 4 * 1024 * 1024;
 const MAX_SOCKET_DIAG_DATAGRAM_BYTES: usize = 1024 * 1024;
@@ -96,7 +98,37 @@ impl DumpSpec {
     }
 }
 
+/// One targeted UDP listener transaction. The kernel's `inet_diag_req_v2`
+/// source-port selector keeps unconnected UDP collection bounded to the
+/// configured listener rather than collecting every `TCP_CLOSE` socket.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ListenerDumpSpec {
+    pub(super) address_family: InetSocketAddressFamily,
+    pub(super) source_port: NonZeroU16,
+}
+
+impl ListenerDumpSpec {
+    const ALL_FAMILIES: [InetSocketAddressFamily; TARGETED_LISTENER_DUMP_COUNT] =
+        [InetSocketAddressFamily::Ipv4, InetSocketAddressFamily::Ipv6];
+
+    const fn states(self) -> u32 {
+        1_u32 << TCP_CLOSE
+    }
+
+    const fn family_number(self) -> u8 {
+        match self.address_family {
+            InetSocketAddressFamily::Ipv4 => libc::AF_INET as u8,
+            InetSocketAddressFamily::Ipv6 => libc::AF_INET6 as u8,
+        }
+    }
+
+    const fn protocol_number(self) -> u8 {
+        libc::IPPROTO_UDP as u8
+    }
+}
+
 const _: () = assert!(DumpSpec::ALL.len() == SOCKET_DIAG_DUMP_COUNT);
+const _: () = assert!(ListenerDumpSpec::ALL_FAMILIES.len() == TARGETED_LISTENER_DUMP_COUNT);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[repr(C)]
@@ -137,8 +169,26 @@ impl SystemSocketDiagnosticsSession {
     }
 
     pub(super) fn collect_process_until(
+        self,
+        expected: SocketDiagnosticsProcessIdentity,
+        deadline: Instant,
+    ) -> Result<(Self, ProcessSocketDiagnostics), SocketDiagnosticsError> {
+        self.collect_process_internal(expected, None, deadline)
+    }
+
+    pub(super) fn collect_process_and_listeners_until(
+        self,
+        expected: SocketDiagnosticsProcessIdentity,
+        listener_port: NonZeroU16,
+        deadline: Instant,
+    ) -> Result<(Self, ProcessSocketDiagnostics), SocketDiagnosticsError> {
+        self.collect_process_internal(expected, Some(listener_port), deadline)
+    }
+
+    fn collect_process_internal(
         mut self,
         expected: SocketDiagnosticsProcessIdentity,
+        listener_port: Option<NonZeroU16>,
         deadline: Instant,
     ) -> Result<(Self, ProcessSocketDiagnostics), SocketDiagnosticsError> {
         let deadline = bounded_session_deadline(self.deadline, deadline);
@@ -151,32 +201,40 @@ impl SystemSocketDiagnosticsSession {
         let mut snapshot_bytes = 0_usize;
 
         for (spec, sequence) in DumpSpec::ALL.into_iter().zip(sequences) {
-            let mut decoded = self.socket.dump(spec, sequence, deadline)?;
-            snapshot_bytes = snapshot_bytes
-                .checked_add(decoded.received_bytes)
-                .filter(|bytes| *bytes <= MAX_SOCKET_DIAG_SNAPSHOT_BYTES)
-                .ok_or_else(|| {
-                    protocol_error(
-                        "collect socket-diagnostic snapshot",
-                        "snapshot byte bound exceeded",
-                        None,
-                    )
-                })?;
-            if sockets.len().saturating_add(decoded.sockets.len()) > MAX_SOCKET_DIAG_SNAPSHOT_ROWS {
-                return Err(protocol_error(
-                    "collect socket-diagnostic snapshot",
-                    "snapshot socket-row bound exceeded",
-                    None,
-                ));
-            }
-            sockets.append(&mut decoded.sockets);
-            dumps.push(InetSocketDump {
+            let decoded = self.socket.dump(spec, sequence, deadline)?;
+            dumps.push(append_completed_dump(
+                decoded,
                 sequence,
-                address_family: spec.address_family,
-                protocol: spec.protocol,
-                started_at: decoded.started_at,
-                completed_at: decoded.completed_at,
-            });
+                spec.address_family,
+                spec.protocol,
+                "collect socket-diagnostic snapshot",
+                &mut snapshot_bytes,
+                &mut sockets,
+            )?);
+        }
+
+        let mut listener_dumps = Vec::with_capacity(TARGETED_LISTENER_DUMP_COUNT);
+        if let Some(listener_port) = listener_port {
+            let listener_sequences = self.sequences.reserve_listener_snapshot()?;
+            for (address_family, sequence) in ListenerDumpSpec::ALL_FAMILIES
+                .into_iter()
+                .zip(listener_sequences)
+            {
+                let spec = ListenerDumpSpec {
+                    address_family,
+                    source_port: listener_port,
+                };
+                let decoded = self.socket.dump_listener(spec, sequence, deadline)?;
+                listener_dumps.push(append_completed_dump(
+                    decoded,
+                    sequence,
+                    spec.address_family,
+                    InetSocketProtocol::Udp,
+                    "collect socket-diagnostic listener snapshot",
+                    &mut snapshot_bytes,
+                    &mut sockets,
+                )?);
+            }
         }
 
         verify_process_identity(expected, deadline)?;
@@ -191,10 +249,42 @@ impl SystemSocketDiagnosticsSession {
             completed_at,
             socket_fds: socket_fds.into_boxed_slice(),
             dumps: dumps.into_boxed_slice(),
+            listener_port,
+            listener_dumps: listener_dumps.into_boxed_slice(),
             sockets: sockets.into_boxed_slice(),
         };
         Ok((self, snapshot))
     }
+}
+
+fn append_completed_dump(
+    mut decoded: CompletedDump,
+    sequence: NonZeroU32,
+    address_family: InetSocketAddressFamily,
+    protocol: InetSocketProtocol,
+    operation: &'static str,
+    snapshot_bytes: &mut usize,
+    sockets: &mut Vec<InetSocketDiagnostic>,
+) -> Result<InetSocketDump, SocketDiagnosticsError> {
+    *snapshot_bytes = snapshot_bytes
+        .checked_add(decoded.received_bytes)
+        .filter(|bytes| *bytes <= MAX_SOCKET_DIAG_SNAPSHOT_BYTES)
+        .ok_or_else(|| protocol_error(operation, "snapshot byte bound exceeded", None))?;
+    if sockets.len().saturating_add(decoded.sockets.len()) > MAX_SOCKET_DIAG_SNAPSHOT_ROWS {
+        return Err(protocol_error(
+            operation,
+            "snapshot socket-row bound exceeded",
+            None,
+        ));
+    }
+    sockets.append(&mut decoded.sockets);
+    Ok(InetSocketDump {
+        sequence,
+        address_family,
+        protocol,
+        started_at: decoded.started_at,
+        completed_at: decoded.completed_at,
+    })
 }
 
 pub(super) fn bounded_session_deadline(hard: Instant, requested: Instant) -> Instant {
@@ -221,17 +311,28 @@ impl DumpSequenceState {
     pub(super) fn reserve_snapshot(
         &mut self,
     ) -> Result<[NonZeroU32; SOCKET_DIAG_DUMP_COUNT], SocketDiagnosticsError> {
+        self.reserve::<SOCKET_DIAG_DUMP_COUNT>()
+    }
+
+    pub(super) fn reserve_listener_snapshot(
+        &mut self,
+    ) -> Result<[NonZeroU32; TARGETED_LISTENER_DUMP_COUNT], SocketDiagnosticsError> {
+        self.reserve::<TARGETED_LISTENER_DUMP_COUNT>()
+    }
+
+    fn reserve<const COUNT: usize>(
+        &mut self,
+    ) -> Result<[NonZeroU32; COUNT], SocketDiagnosticsError> {
         let Some(first) = self.next else {
             return Err(sequence_limit_error());
         };
         let first = first.get();
-        let Some(last) = first.checked_add(
-            u32::try_from(SOCKET_DIAG_DUMP_COUNT - 1)
-                .expect("socket diagnostic dump count fits u32"),
-        ) else {
-            self.next = None;
-            return Err(sequence_limit_error());
-        };
+        let last = first
+            .checked_add(u32::try_from(COUNT.saturating_sub(1)).expect("dump count fits u32"))
+            .ok_or_else(|| {
+                self.next = None;
+                sequence_limit_error()
+            })?;
         self.next = last.checked_add(1).and_then(NonZeroU32::new);
         Ok(std::array::from_fn(|index| {
             let offset = u32::try_from(index).expect("dump sequence index fits u32");
@@ -508,10 +609,30 @@ impl SocketDiagSocket {
         sequence: NonZeroU32,
         deadline: Instant,
     ) -> Result<CompletedDump, SocketDiagnosticsError> {
-        let started_at = deadline_checkpoint(deadline)?;
         let request = encode_dump_request(spec, sequence);
+        let decoder = DumpDecoder::new(spec, sequence, self.port_id);
+        self.complete_dump(request, decoder, deadline)
+    }
+
+    fn dump_listener(
+        &self,
+        spec: ListenerDumpSpec,
+        sequence: NonZeroU32,
+        deadline: Instant,
+    ) -> Result<CompletedDump, SocketDiagnosticsError> {
+        let request = encode_listener_dump_request(spec, sequence);
+        let decoder = DumpDecoder::new_listener(spec, sequence, self.port_id);
+        self.complete_dump(request, decoder, deadline)
+    }
+
+    fn complete_dump(
+        &self,
+        request: [u8; INET_DIAG_REQUEST_LENGTH],
+        mut decoder: DumpDecoder,
+        deadline: Instant,
+    ) -> Result<CompletedDump, SocketDiagnosticsError> {
+        let started_at = deadline_checkpoint(deadline)?;
         self.send_request(&request, deadline)?;
-        let mut decoder = DumpDecoder::new(spec, sequence, self.port_id);
         while !decoder.is_complete() {
             let datagram = receive_datagram(self.fd.as_raw_fd(), deadline)?;
             decoder.decode_datagram(&datagram)?;
@@ -772,15 +893,48 @@ pub(super) fn validate_kernel_sender(
 }
 
 pub(super) fn encode_dump_request(spec: DumpSpec, sequence: NonZeroU32) -> [u8; 72] {
+    encode_dump_request_parts(
+        spec.family_number(),
+        spec.protocol_number(),
+        spec.states(),
+        None,
+        sequence,
+    )
+}
+
+pub(super) fn encode_listener_dump_request(
+    spec: ListenerDumpSpec,
+    sequence: NonZeroU32,
+) -> [u8; 72] {
+    encode_dump_request_parts(
+        spec.family_number(),
+        spec.protocol_number(),
+        spec.states(),
+        Some(spec.source_port),
+        sequence,
+    )
+}
+
+fn encode_dump_request_parts(
+    family: u8,
+    protocol: u8,
+    states: u32,
+    source_port: Option<NonZeroU16>,
+    sequence: NonZeroU32,
+) -> [u8; 72] {
     let mut request = [0_u8; INET_DIAG_REQUEST_LENGTH];
     request[..4].copy_from_slice(&(INET_DIAG_REQUEST_LENGTH as u32).to_ne_bytes());
     request[4..6].copy_from_slice(&SOCK_DIAG_BY_FAMILY.to_ne_bytes());
     request[6..8].copy_from_slice(&(NLM_F_REQUEST | NLM_F_DUMP).to_ne_bytes());
     request[8..12].copy_from_slice(&sequence.get().to_ne_bytes());
-    request[NETLINK_HEADER_LENGTH] = spec.family_number();
-    request[NETLINK_HEADER_LENGTH + 1] = spec.protocol_number();
+    request[NETLINK_HEADER_LENGTH] = family;
+    request[NETLINK_HEADER_LENGTH + 1] = protocol;
     request[NETLINK_HEADER_LENGTH + 4..NETLINK_HEADER_LENGTH + 8]
-        .copy_from_slice(&spec.states().to_ne_bytes());
+        .copy_from_slice(&states.to_ne_bytes());
+    if let Some(source_port) = source_port {
+        request[NETLINK_HEADER_LENGTH + 8..NETLINK_HEADER_LENGTH + 10]
+            .copy_from_slice(&source_port.get().to_be_bytes());
+    }
     request
 }
 
@@ -788,6 +942,8 @@ pub(super) struct DumpDecoder {
     spec: DumpSpec,
     sequence: NonZeroU32,
     port_id: NonZeroU32,
+    allowed_states: u32,
+    source_port: Option<NonZeroU16>,
     complete: bool,
     received_bytes: usize,
     message_count: usize,
@@ -796,10 +952,39 @@ pub(super) struct DumpDecoder {
 
 impl DumpDecoder {
     pub(super) const fn new(spec: DumpSpec, sequence: NonZeroU32, port_id: NonZeroU32) -> Self {
+        Self::new_with_filter(spec, sequence, port_id, spec.states(), None)
+    }
+
+    pub(super) const fn new_listener(
+        spec: ListenerDumpSpec,
+        sequence: NonZeroU32,
+        port_id: NonZeroU32,
+    ) -> Self {
+        Self::new_with_filter(
+            DumpSpec {
+                address_family: spec.address_family,
+                protocol: InetSocketProtocol::Udp,
+            },
+            sequence,
+            port_id,
+            spec.states(),
+            Some(spec.source_port),
+        )
+    }
+
+    const fn new_with_filter(
+        spec: DumpSpec,
+        sequence: NonZeroU32,
+        port_id: NonZeroU32,
+        allowed_states: u32,
+        source_port: Option<NonZeroU16>,
+    ) -> Self {
         Self {
             spec,
             sequence,
             port_id,
+            allowed_states,
+            source_port,
             complete: false,
             received_bytes: 0,
             message_count: 0,
@@ -895,6 +1080,8 @@ impl DumpDecoder {
                     self.sockets.push(decode_diagnostic(
                         self.spec,
                         self.sequence,
+                        self.allowed_states,
+                        self.source_port,
                         message.payload(),
                         message.offset() + NETLINK_HEADER_LENGTH,
                     )?);
@@ -985,6 +1172,8 @@ pub(super) struct CompletedDump {
 fn decode_diagnostic(
     spec: DumpSpec,
     sequence: NonZeroU32,
+    allowed_states: u32,
+    source_port: Option<NonZeroU16>,
     payload: &[u8],
     payload_offset: usize,
 ) -> Result<InetSocketDiagnostic, SocketDiagnosticsError> {
@@ -1003,16 +1192,23 @@ fn decode_diagnostic(
         ));
     }
     let state = payload[1];
-    if spec.protocol == InetSocketProtocol::Udp && state != TCP_ESTABLISHED {
+    if state >= u32::BITS as u8 || allowed_states & (1_u32 << state) == 0 {
         return Err(protocol_error(
             "decode INET_DIAG message",
-            "unconnected UDP record in connected-UDP dump",
+            "socket state is not selected by the diagnostic request",
             Some(payload_offset + 1),
         ));
     }
 
     let local_port = read_u16_be(&payload[4..]);
     let remote_port = read_u16_be(&payload[6..]);
+    if source_port.is_some_and(|expected| expected.get() != local_port) {
+        return Err(protocol_error(
+            "decode INET_DIAG message",
+            "socket source port does not match the listener request",
+            Some(payload_offset + 4),
+        ));
+    }
     let local_ip = decode_ip(spec.address_family, &payload[8..24], payload_offset + 8)?;
     let remote_ip = decode_ip(spec.address_family, &payload[24..40], payload_offset + 24)?;
     let interface_index = read_u32_ne(&payload[40..]);
@@ -1027,6 +1223,8 @@ fn decode_diagnostic(
     let uid = read_u32_ne(&payload[64..]);
     let inode = u64::from(read_u32_ne(&payload[68..]));
     let mut mark = None;
+    let mut transparent = None;
+    let mut ipv6_only = None;
     let mut protocol_attribute = None;
     for attribute in NetlinkAttributeIter::new(
         &payload[INET_DIAG_MESSAGE_LENGTH..],
@@ -1064,6 +1262,32 @@ fn decode_diagnostic(
                 }
                 protocol_attribute = Some(attribute.value()[0]);
             }
+            INET_DIAG_SKV6ONLY => {
+                if attribute.flags() != 0
+                    || attribute.value().len() != 1
+                    || ipv6_only.is_some()
+                    || attribute.value()[0] > 1
+                {
+                    return Err(protocol_error(
+                        "decode INET_DIAG attributes",
+                        "malformed or duplicate INET_DIAG_SKV6ONLY",
+                        Some(attribute.offset()),
+                    ));
+                }
+                ipv6_only = Some(attribute.value()[0] != 0);
+            }
+            INET_DIAG_SOCKOPT => {
+                if attribute.flags() != 0 || attribute.value().len() != 2 || transparent.is_some() {
+                    return Err(protocol_error(
+                        "decode INET_DIAG attributes",
+                        "malformed or duplicate INET_DIAG_SOCKOPT",
+                        Some(attribute.offset()),
+                    ));
+                }
+                // `struct inet_diag_sockopt.transparent` is bit five of the
+                // first byte in Linux v5.10's UAPI layout.
+                transparent = Some(attribute.value()[0] & (1 << 5) != 0);
+            }
             _ => {}
         }
     }
@@ -1082,6 +1306,8 @@ fn decode_diagnostic(
             words: cookie_words,
         },
         mark,
+        transparent,
+        ipv6_only,
     })
 }
 

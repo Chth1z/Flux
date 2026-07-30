@@ -14,7 +14,8 @@ use flux_core::{
 use flux_platform::ReadinessEvidence;
 use flux_platform::socket_diagnostics::{
     CorrelatedProcessSocket, InetSocketProtocol, ProcessSocketDiagnostics, SocketCorrelationError,
-    SocketDiagnosticsError, SystemSocketDiagnosticsSession, SystemSocketDiagnosticsSource,
+    SocketDiagnosticsError, SocketDiagnosticsErrorKind, SystemSocketDiagnosticsSession,
+    SystemSocketDiagnosticsSource,
 };
 use sha2::{Digest, Sha256};
 
@@ -34,6 +35,7 @@ pub(crate) const FUNCTIONAL_CANARY_FLOW_SLOTS: usize = 8;
 pub(crate) const CANARY_ATTEMPT_OBJECT_IDENTITY_BYTES: usize = 32;
 pub(crate) const CANARY_PEER_SERVER_SLOTS: usize = 3;
 pub(crate) const CANARY_NEGATIVE_CONTROL_SLOTS: usize = 2;
+pub(crate) const CANARY_LISTENER_ROLE_SLOTS: usize = 4;
 pub(crate) const CANARY_FACILITY_AUDIT_DIGEST_BYTES: usize = 32;
 pub(crate) const CAPTURE_OWNER_RECORD_DIGEST_BYTES: usize = 32;
 pub(crate) const CANARY_CREDENTIAL_MAP_DIGEST_BYTES: usize = 32;
@@ -714,18 +716,66 @@ impl CanaryAttemptSocketObserverSession {
         self.deadline
     }
 
-    /// Recover the exact platform session after request-authority validation.
-    #[allow(dead_code)]
-    pub(crate) fn into_proc_fd_inet_diag(
+    /// Collect one identity-bound process snapshot plus the two targeted UDP
+    /// listener dumps while retaining the exact prebound diagnostic session.
+    ///
+    /// The session is consumed on entry and returned only after a complete,
+    /// all-or-nothing collection. Any platform error consumes the session so
+    /// unread netlink datagrams cannot satisfy a later attempt.
+    pub(crate) fn collect_process_and_listeners_until(
         self,
-    ) -> Result<SystemSocketDiagnosticsSession, FunctionalCanaryError> {
+        process: OwnedEngineIdentity,
+        listener_port: NonZeroU16,
+    ) -> Result<(Self, ProcessSocketDiagnostics), FunctionalCanaryError> {
         match self.transport {
-            CanaryAttemptSocketObserverTransport::ProcFdInetDiag(session) => Ok(session),
+            CanaryAttemptSocketObserverTransport::ProcFdInetDiag(session) => {
+                let expected =
+                    flux_platform::socket_diagnostics::SocketDiagnosticsProcessIdentity::new(
+                        NonZeroU32::new(process.pid()).expect("engine PID is nonzero"),
+                        NonZeroU64::new(process.start_time_ticks())
+                            .expect("engine start ticks are nonzero"),
+                    );
+                let (session, snapshot) = session
+                    .collect_process_and_listeners_until(
+                        expected,
+                        listener_port,
+                        self.deadline.expires_at(),
+                    )
+                    .map_err(|error| {
+                        let kind = match error.kind() {
+                            SocketDiagnosticsErrorKind::DeadlineExpired => {
+                                CanaryErrorKind::TimedOut
+                            }
+                            SocketDiagnosticsErrorKind::ProcessIdentityMismatch
+                            | SocketDiagnosticsErrorKind::ProcessSocketFdsChanged => {
+                                CanaryErrorKind::IdentityChanged
+                            }
+                            _ => CanaryErrorKind::InvalidEvidence,
+                        };
+                        let diagnostic = format!(
+                            "authoritative process/listener socket observation failed ({:?}): {error}",
+                            error.kind(),
+                        );
+                        FunctionalCanaryError::new(
+                            kind,
+                            CanaryCleanupStatus::Uncertain,
+                            &diagnostic,
+                        )
+                    })?;
+                Ok((
+                    Self {
+                        binding: self.binding,
+                        deadline: self.deadline,
+                        transport: CanaryAttemptSocketObserverTransport::ProcFdInetDiag(session),
+                    },
+                    snapshot,
+                ))
+            }
             #[cfg(test)]
             CanaryAttemptSocketObserverTransport::Scripted => Err(FunctionalCanaryError::new(
                 CanaryErrorKind::InvalidEvidence,
                 CanaryCleanupStatus::NotRequired,
-                "the attempt-owned socket observer is not a prebound /proc FD plus INET_DIAG session",
+                "the attempt-owned socket observer cannot collect a production listener snapshot",
             )),
         }
     }
@@ -1951,6 +2001,38 @@ pub(crate) enum CanaryFlowAddressFamily {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
+pub(crate) enum CanaryListenerRole {
+    Ipv4Tcp = 0,
+    Ipv4Udp = 1,
+    Ipv6Tcp = 2,
+    Ipv6Udp = 3,
+}
+
+impl CanaryListenerRole {
+    pub(crate) const ALL: [Self; CANARY_LISTENER_ROLE_SLOTS] =
+        [Self::Ipv4Tcp, Self::Ipv4Udp, Self::Ipv6Tcp, Self::Ipv6Udp];
+
+    pub(crate) const fn index(self) -> usize {
+        self as usize
+    }
+
+    pub(crate) const fn address_family(self) -> CanaryFlowAddressFamily {
+        match self {
+            Self::Ipv4Tcp | Self::Ipv4Udp => CanaryFlowAddressFamily::Ipv4,
+            Self::Ipv6Tcp | Self::Ipv6Udp => CanaryFlowAddressFamily::Ipv6,
+        }
+    }
+
+    pub(crate) const fn protocol(self) -> CanaryFlowProtocol {
+        match self {
+            Self::Ipv4Tcp | Self::Ipv6Tcp => CanaryFlowProtocol::Tcp,
+            Self::Ipv4Udp | Self::Ipv6Udp => CanaryFlowProtocol::Udp,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
 pub(crate) enum CanaryFlow {
     Ipv4TcpEcho = 0,
     Ipv4UdpEcho = 1,
@@ -2006,13 +2088,17 @@ impl CanaryFlow {
         }
     }
 
-    const fn inbound_listener_slot(self) -> usize {
+    pub(crate) const fn listener_role(self) -> CanaryListenerRole {
         match (self.address_family(), self.protocol()) {
-            (CanaryFlowAddressFamily::Ipv4, CanaryFlowProtocol::Tcp) => 0,
-            (CanaryFlowAddressFamily::Ipv4, CanaryFlowProtocol::Udp) => 1,
-            (CanaryFlowAddressFamily::Ipv6, CanaryFlowProtocol::Tcp) => 2,
-            (CanaryFlowAddressFamily::Ipv6, CanaryFlowProtocol::Udp) => 3,
+            (CanaryFlowAddressFamily::Ipv4, CanaryFlowProtocol::Tcp) => CanaryListenerRole::Ipv4Tcp,
+            (CanaryFlowAddressFamily::Ipv4, CanaryFlowProtocol::Udp) => CanaryListenerRole::Ipv4Udp,
+            (CanaryFlowAddressFamily::Ipv6, CanaryFlowProtocol::Tcp) => CanaryListenerRole::Ipv6Tcp,
+            (CanaryFlowAddressFamily::Ipv6, CanaryFlowProtocol::Udp) => CanaryListenerRole::Ipv6Udp,
         }
+    }
+
+    const fn inbound_listener_slot(self) -> usize {
+        self.listener_role().index()
     }
 
     const fn is_dns(self) -> bool {
@@ -2317,18 +2403,87 @@ fn expected_inbound_payload_identity(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CanaryInetDiagListenerSnapshot {
+    observer: CanarySocketObserverBinding,
+    process: OwnedEngineIdentity,
+    listener_port: NonZeroU16,
+    started_at: Instant,
+    completed_at: Instant,
+    first_sequence: NonZeroU64,
+    last_sequence: NonZeroU64,
+    role_sequences: [NonZeroU64; CANARY_LISTENER_ROLE_SLOTS],
+}
+
+impl CanaryInetDiagListenerSnapshot {
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    const fn new(
+        observer: CanarySocketObserverBinding,
+        process: OwnedEngineIdentity,
+        listener_port: NonZeroU16,
+        started_at: Instant,
+        completed_at: Instant,
+        first_sequence: NonZeroU64,
+        last_sequence: NonZeroU64,
+        role_sequences: [NonZeroU64; CANARY_LISTENER_ROLE_SLOTS],
+    ) -> Self {
+        Self {
+            observer,
+            process,
+            listener_port,
+            started_at,
+            completed_at,
+            first_sequence,
+            last_sequence,
+            role_sequences,
+        }
+    }
+
+    #[must_use]
+    fn role_sequence(self, flow: CanaryFlow) -> NonZeroU64 {
+        self.role_sequence_for(flow.listener_role())
+    }
+
+    #[must_use]
+    fn role_sequence_for(self, role: CanaryListenerRole) -> NonZeroU64 {
+        self.role_sequences[role.index()]
+    }
+
+    fn has_exact_sequence_map(self) -> bool {
+        let first = self.first_sequence.get();
+        let Some(last) = first.checked_add(5) else {
+            return false;
+        };
+        self.last_sequence.get() == last
+            && self.role_sequences.map(NonZeroU64::get) == [first, first + 4, first + 2, first + 5]
+    }
+}
+
+/// Loss contract for one listener observation.
+///
+/// Event observers retain their exact before/after counter. The INET_DIAG
+/// path instead binds one all-or-nothing snapshot: interrupted or incomplete
+/// dumps never construct the snapshot value, so it does not fabricate an
+/// event-counter baseline.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CanaryListenerObservationLoss {
+    Counter { before: u64, after: u64 },
+    CompleteInetDiagSnapshot(CanaryInetDiagListenerSnapshot),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct CanaryListenerSocketObservation {
     authority: CanarySocketObserverAuthority,
     sequence: NonZeroU64,
-    lost_events_before: u64,
-    lost_events_after: u64,
+    loss: CanaryListenerObservationLoss,
     observed_at: Instant,
 }
 
 impl CanaryListenerSocketObservation {
     #[cfg(test)]
     #[must_use]
-    const fn new(
+    const fn from_event_counter(
         authority: CanarySocketObserverAuthority,
         sequence: NonZeroU64,
         lost_events_before: u64,
@@ -2338,9 +2493,26 @@ impl CanaryListenerSocketObservation {
         Self {
             authority,
             sequence,
-            lost_events_before,
-            lost_events_after,
+            loss: CanaryListenerObservationLoss::Counter {
+                before: lost_events_before,
+                after: lost_events_after,
+            },
             observed_at,
+        }
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    const fn from_complete_inet_diag_snapshot(
+        authority: CanarySocketObserverAuthority,
+        sequence: NonZeroU64,
+        snapshot: CanaryInetDiagListenerSnapshot,
+    ) -> Self {
+        Self {
+            authority,
+            sequence,
+            loss: CanaryListenerObservationLoss::CompleteInetDiagSnapshot(snapshot),
+            observed_at: snapshot.completed_at,
         }
     }
 }
@@ -3206,6 +3378,12 @@ pub(crate) enum CanaryEvidenceError {
     InboundListenerObservationLoss {
         flow: CanaryFlow,
     },
+    InboundListenerObservationAuthorityMismatch {
+        flow: CanaryFlow,
+    },
+    InboundListenerSnapshotAuthorityMismatch {
+        flow: CanaryFlow,
+    },
     InboundListenerObservationLossBaselineChanged {
         first: CanaryFlow,
         second: CanaryFlow,
@@ -3428,7 +3606,10 @@ fn validate_flow_evidence(
     let mut delivery_sequences: [Option<(CanaryFlow, NonZeroU64)>; FUNCTIONAL_CANARY_FLOW_SLOTS] =
         [None; FUNCTIONAL_CANARY_FLOW_SLOTS];
     let mut delivery_loss_baseline: Option<(CanaryFlow, u64)> = None;
-    let mut listener_observation_loss_baseline: Option<(CanaryFlow, u64)> = None;
+    let mut listener_observation_loss_baseline: Option<(
+        CanaryFlow,
+        CanaryListenerObservationLoss,
+    )> = None;
     let mut delivery_authority: Option<(CanaryFlow, CanaryInboundDeliveryAuthority)> = None;
     let mut accepted_socket_identities: [Option<(
         CanaryFlow,
@@ -3531,7 +3712,7 @@ fn validate_flow_evidence(
             }
             listener_sockets[listener_slot] = Some((expected_flow, validated_delivery.listener));
         }
-        let listener_loss_baseline = validated_delivery.listener.observation.lost_events_before;
+        let listener_loss_baseline = validated_delivery.listener.observation.loss;
         if let Some((first_flow, first_loss_baseline)) = listener_observation_loss_baseline {
             if first_loss_baseline != listener_loss_baseline {
                 return Err(
@@ -3841,8 +4022,35 @@ fn validate_tproxy_listener_socket(
         (CanaryFlowAddressFamily::Ipv4, None) | (CanaryFlowAddressFamily::Ipv6, Some(true)) => {}
         _ => return Err(CanaryEvidenceError::InboundListenerIpv6OnlyStateInvalid { flow }),
     }
-    if listener.observation.lost_events_before != listener.observation.lost_events_after {
-        return Err(CanaryEvidenceError::InboundListenerObservationLoss { flow });
+    match (expected_observer, listener.observation.loss) {
+        (
+            CanarySocketObserverAuthority::ProcFdInetDiag { .. },
+            CanaryListenerObservationLoss::CompleteInetDiagSnapshot(snapshot),
+        ) => {
+            if snapshot.observer != authority.socket_observer_binding()
+                || snapshot.process != engine.engine()
+                || snapshot.listener_port != engine.listener().port()
+                || snapshot.started_at < request.deadline().started_at()
+                || snapshot.completed_at != listener.observation.observed_at
+                || snapshot.completed_at < snapshot.started_at
+                || snapshot.completed_at >= request.deadline().expires_at()
+                || !snapshot.has_exact_sequence_map()
+                || snapshot.role_sequence(flow) != listener.observation.sequence
+            {
+                return Err(CanaryEvidenceError::InboundListenerSnapshotAuthorityMismatch { flow });
+            }
+        }
+        (
+            CanarySocketObserverAuthority::QualifiedCgroupBpf { .. },
+            CanaryListenerObservationLoss::Counter { before, after },
+        ) => {
+            if before != after {
+                return Err(CanaryEvidenceError::InboundListenerObservationLoss { flow });
+            }
+        }
+        _ => {
+            return Err(CanaryEvidenceError::InboundListenerObservationAuthorityMismatch { flow });
+        }
     }
     if delivery_event.lost_events_before != delivery_event.lost_events_after {
         return Err(CanaryEvidenceError::InboundListenerEventLoss { flow });
@@ -5213,19 +5421,48 @@ pub(crate) mod tests {
         let mut observation_loss = fixture.successful_evidence();
         tproxy_listener_mut(&mut observation_loss, flow)
             .observation
-            .lost_events_after = 5;
+            .loss = CanaryListenerObservationLoss::Counter {
+            before: 4,
+            after: 4,
+        };
         assert_eq!(
             validate(&fixture, observation_loss)
-                .expect_err("an incomplete listener observation cannot pass"),
+                .expect_err("an event counter cannot replace the INET_DIAG snapshot"),
+            CanaryEvidenceError::InboundListenerObservationAuthorityMismatch { flow }
+        );
+
+        let mut bpf_fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+        bpf_fixture
+            .request
+            .pre_binding
+            .environment
+            .authority
+            .socket_observer = qualified_cgroup_bpf_observer();
+        let mut bpf_loss = bpf_fixture.successful_evidence();
+        let CanaryListenerObservationLoss::Counter { after, .. } =
+            &mut tproxy_listener_mut(&mut bpf_loss, flow).observation.loss
+        else {
+            panic!("BPF fixture uses event-counter loss authority")
+        };
+        *after = 5;
+        assert_eq!(
+            validate(&bpf_fixture, bpf_loss)
+                .expect_err("a lossy BPF listener observation cannot pass"),
             CanaryEvidenceError::InboundListenerObservationLoss { flow }
         );
 
         let mut observation_timing = fixture.successful_evidence();
         let delivery_observed_at =
             tproxy_delivery_event_mut(&mut observation_timing, flow).observed_at;
-        tproxy_listener_mut(&mut observation_timing, flow)
-            .observation
-            .observed_at = delivery_observed_at + Duration::from_nanos(1);
+        let late_observation = delivery_observed_at + Duration::from_nanos(1);
+        let observation = &mut tproxy_listener_mut(&mut observation_timing, flow).observation;
+        observation.observed_at = late_observation;
+        let CanaryListenerObservationLoss::CompleteInetDiagSnapshot(snapshot) =
+            &mut observation.loss
+        else {
+            panic!("INET_DIAG fixture uses snapshot loss authority")
+        };
+        snapshot.completed_at = late_observation;
         assert_eq!(
             validate(&fixture, observation_timing)
                 .expect_err("a listener observed after delivery cannot pass"),
@@ -5239,6 +5476,122 @@ pub(crate) mod tests {
         assert_eq!(
             validate(&dual, ipv6_v6only).expect_err("the separate IPv6 listener must be v6-only"),
             CanaryEvidenceError::InboundListenerIpv6OnlyStateInvalid { flow: ipv6_flow }
+        );
+    }
+
+    #[test]
+    fn complete_inet_diag_listener_snapshot_is_lossless_and_authority_bound() {
+        let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+        let observer_binding = fixture
+            .request
+            .pre_binding
+            .environment
+            .authority
+            .socket_observer_binding();
+        let observer = observer_binding.authority();
+        let role_sequences = [1, 5, 3, 6]
+            .map(|sequence| NonZeroU64::new(sequence).expect("listener role dump sequence"));
+        let snapshot = CanaryInetDiagListenerSnapshot::new(
+            observer_binding,
+            fixture.request.pre_binding.engine.engine(),
+            fixture.request.pre_binding.engine.listener.port,
+            fixture.request.deadline().started_at(),
+            fixture.request.deadline().started_at() + Duration::from_millis(5),
+            NonZeroU64::new(1).expect("first listener dump sequence"),
+            NonZeroU64::new(6).expect("last listener dump sequence"),
+            role_sequences,
+        );
+        let bind_snapshot = |evidence: &mut UnqualifiedCanaryGateEvidence,
+                             snapshot: CanaryInetDiagListenerSnapshot| {
+            for flow in CanaryFlow::ALL {
+                if fixture.request.requires_flow(flow) {
+                    tproxy_listener_mut(evidence, flow).observation =
+                        CanaryListenerSocketObservation::from_complete_inet_diag_snapshot(
+                            observer,
+                            snapshot.role_sequence(flow),
+                            snapshot,
+                        );
+                }
+            }
+        };
+        let mut evidence = fixture.successful_evidence();
+        bind_snapshot(&mut evidence, snapshot);
+        assert!(validate(&fixture, evidence).is_ok());
+
+        let mut wrong_role = fixture.successful_evidence();
+        bind_snapshot(&mut wrong_role, snapshot);
+        tproxy_listener_mut(&mut wrong_role, CanaryFlow::Ipv4TcpEcho)
+            .observation
+            .sequence = snapshot.role_sequence(CanaryFlow::Ipv4UdpEcho);
+        assert_eq!(
+            validate(&fixture, wrong_role).expect_err("another role's dump cannot pass"),
+            CanaryEvidenceError::InboundListenerSnapshotAuthorityMismatch {
+                flow: CanaryFlow::Ipv4TcpEcho
+            }
+        );
+
+        let mut bpf_fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+        let bpf_observer = qualified_cgroup_bpf_observer();
+        bpf_fixture
+            .request
+            .pre_binding
+            .environment
+            .authority
+            .socket_observer = bpf_observer;
+        let mut bpf_snapshot = bpf_fixture.successful_evidence();
+        for flow in CanaryFlow::ALL {
+            if bpf_fixture.request.requires_flow(flow) {
+                tproxy_listener_mut(&mut bpf_snapshot, flow).observation =
+                    CanaryListenerSocketObservation::from_complete_inet_diag_snapshot(
+                        bpf_observer,
+                        snapshot.role_sequence(flow),
+                        snapshot,
+                    );
+            }
+        }
+        assert_eq!(
+            validate(&bpf_fixture, bpf_snapshot)
+                .expect_err("an INET_DIAG snapshot cannot replace the BPF loss counter"),
+            CanaryEvidenceError::InboundListenerObservationAuthorityMismatch {
+                flow: CanaryFlow::Ipv4TcpEcho
+            }
+        );
+
+        let wrong_authority = match observer {
+            CanarySocketObserverAuthority::ProcFdInetDiag {
+                collector_identity,
+                collector_revision,
+                netlink_port_id,
+            } => CanarySocketObserverAuthority::ProcFdInetDiag {
+                collector_identity,
+                collector_revision,
+                netlink_port_id: NonZeroU32::new(netlink_port_id.get() + 1)
+                    .expect("mismatched netlink port"),
+            },
+            CanarySocketObserverAuthority::QualifiedCgroupBpf { .. } => {
+                panic!("fixture uses the INET_DIAG observer")
+            }
+        };
+        let wrong_snapshot = CanaryInetDiagListenerSnapshot::new(
+            CanarySocketObserverBinding::scripted(
+                wrong_authority,
+                NonZeroU64::new(999).expect("mismatched opening"),
+            ),
+            fixture.request.pre_binding.engine.engine(),
+            fixture.request.pre_binding.engine.listener.port,
+            fixture.request.deadline().started_at(),
+            fixture.request.deadline().started_at() + Duration::from_millis(5),
+            NonZeroU64::new(1).expect("first listener dump sequence"),
+            NonZeroU64::new(6).expect("last listener dump sequence"),
+            role_sequences,
+        );
+        let mut mismatched = fixture.successful_evidence();
+        bind_snapshot(&mut mismatched, wrong_snapshot);
+        assert_eq!(
+            validate(&fixture, mismatched).expect_err("replaced snapshot authority cannot pass"),
+            CanaryEvidenceError::InboundListenerSnapshotAuthorityMismatch {
+                flow: CanaryFlow::Ipv4TcpEcho
+            }
         );
     }
 
@@ -5398,14 +5751,18 @@ pub(crate) mod tests {
         validate(&fixture, independent_sequences)
             .expect("listener-observer and delivery-authority sequence domains are independent");
 
-        let mut shared_listener_sequence = fixture.successful_evidence();
-        let listener_sequence = tproxy_listener_mut(&mut shared_listener_sequence, first)
+        let same_listener_role = CanaryFlow::Ipv4DnsTcp;
+        let mut shared_listener_snapshot = fixture.successful_evidence();
+        let listener_sequence = tproxy_listener_mut(&mut shared_listener_snapshot, first)
             .observation
             .sequence;
-        tproxy_listener_mut(&mut shared_listener_sequence, second)
-            .observation
-            .sequence = listener_sequence;
-        validate(&fixture, shared_listener_sequence)
+        assert_eq!(
+            tproxy_listener_mut(&mut shared_listener_snapshot, same_listener_role)
+                .observation
+                .sequence,
+            listener_sequence
+        );
+        validate(&fixture, shared_listener_snapshot)
             .expect("one complete listener snapshot may cover multiple sockets and flows");
 
         let mut reused_sequence = fixture.successful_evidence();
@@ -5433,12 +5790,21 @@ pub(crate) mod tests {
             CanaryEvidenceError::InboundListenerEventLossBaselineChanged { first, second }
         );
 
-        let mut listener_baseline = fixture.successful_evidence();
+        let mut listener_fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+        listener_fixture
+            .request
+            .pre_binding
+            .environment
+            .authority
+            .socket_observer = qualified_cgroup_bpf_observer();
+        let mut listener_baseline = listener_fixture.successful_evidence();
         let observation = &mut tproxy_listener_mut(&mut listener_baseline, second).observation;
-        observation.lost_events_before = 5;
-        observation.lost_events_after = 5;
+        observation.loss = CanaryListenerObservationLoss::Counter {
+            before: 5,
+            after: 5,
+        };
         assert_eq!(
-            validate(&fixture, listener_baseline)
+            validate(&listener_fixture, listener_baseline)
                 .expect_err("listener-observer loss baseline drift cannot pass"),
             CanaryEvidenceError::InboundListenerObservationLossBaselineChanged { first, second }
         );
@@ -7185,6 +7551,42 @@ pub(crate) mod tests {
             SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), listener_port)
         };
         let observer = request.pre_binding.environment.authority.socket_observer;
+        let observation = match observer {
+            CanarySocketObserverAuthority::ProcFdInetDiag { .. } => {
+                let role_sequences = [1, 5, 3, 6].map(|sequence| {
+                    NonZeroU64::new(sequence).expect("listener role dump sequence")
+                });
+                let snapshot = CanaryInetDiagListenerSnapshot::new(
+                    request
+                        .pre_binding
+                        .environment
+                        .authority
+                        .socket_observer_binding(),
+                    request.pre_binding.engine.engine(),
+                    request.pre_binding.engine.listener.port,
+                    request.deadline().started_at(),
+                    request.deadline().started_at() + Duration::from_millis(1),
+                    NonZeroU64::new(1).expect("first listener dump sequence"),
+                    NonZeroU64::new(6).expect("last listener dump sequence"),
+                    role_sequences,
+                );
+                CanaryListenerSocketObservation::from_complete_inet_diag_snapshot(
+                    observer,
+                    snapshot.role_sequence(flow),
+                    snapshot,
+                )
+            }
+            CanarySocketObserverAuthority::QualifiedCgroupBpf { .. } => {
+                CanaryListenerSocketObservation::from_event_counter(
+                    observer,
+                    NonZeroU64::new(100 + listener_slot_u64)
+                        .expect("listener observation sequence"),
+                    4,
+                    4,
+                    request.deadline().started_at() + Duration::from_millis(1),
+                )
+            }
+        };
         let listener = CanaryTproxyListenerSocketIdentity::new(
             request.pre_binding.engine.generation(),
             request.pre_binding.engine.engine(),
@@ -7209,13 +7611,7 @@ pub(crate) mod tests {
             bind,
             true,
             (!flow.is_ipv4()).then_some(true),
-            CanaryListenerSocketObservation::new(
-                observer,
-                NonZeroU64::new(100 + listener_slot_u64).expect("listener observation sequence"),
-                4,
-                4,
-                request.deadline().started_at() + Duration::from_millis(1),
-            ),
+            observation,
         );
         let delivery_event = CanaryInboundDeliveryEvent::new(
             CanaryInboundDeliveryAuthority::SupervisedEngineReport {

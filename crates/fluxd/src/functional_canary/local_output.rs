@@ -39,6 +39,9 @@ use super::{
 mod driver_process;
 use driver_process::DriverProcessProof;
 
+#[cfg(test)]
+mod listener_observer;
+
 const XTABLES_LOCAL_OUTPUT_UNSUPPORTED: &str = "the packaged xtables functional-canary adapter has no device-qualified direct observer for the active local-OUTPUT transaction: exact transparent-listener delivery, supervised-engine receipt, counter bounds, identity stability, and cleanup proof remain required; REDIRECT, DNAT, unrelated ingress traffic, counters alone, and route lookups are prohibited substitutes";
 const NON_TPROXY_REQUEST: &str =
     "the local-OUTPUT functional-canary executor accepts only the request-selected TPROXY backend";
@@ -4364,17 +4367,7 @@ mod tests {
                 self.binding
             );
             assert_eq!(socket_observer.binding(), self.binding);
-            let session = socket_observer
-                .into_proc_fd_inet_diag()
-                .expect("driver received the real prebound session");
-            let CanarySocketObserverAuthority::ProcFdInetDiag {
-                netlink_port_id, ..
-            } = self.binding.authority()
-            else {
-                panic!("test authority is INET_DIAG")
-            };
-            assert_eq!(session.netlink_port_id(), netlink_port_id);
-            drop(session);
+            assert_eq!(socket_observer.authority(), self.binding.authority());
             self.reached_driver.store(true, Ordering::SeqCst);
             Err(FunctionalCanaryError::new(
                 CanaryErrorKind::ResponseMismatch,

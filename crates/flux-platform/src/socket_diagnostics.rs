@@ -8,10 +8,14 @@
 use std::error::Error;
 use std::ffi::OsString;
 use std::fmt;
-use std::net::SocketAddr;
-use std::num::{NonZeroU32, NonZeroU64};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 use std::path::PathBuf;
 use std::time::Instant;
+
+const TARGETED_LISTENER_DUMP_COUNT: usize = 2;
+const TCP_CLOSE: u8 = 7;
+const TCP_LISTEN: u8 = 10;
 
 /// PID and procfs start-time identity of the process whose sockets are read.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -100,6 +104,8 @@ pub struct InetSocketDiagnostic {
     inode: u64,
     cookie: InetDiagCookie,
     mark: Option<u32>,
+    transparent: Option<bool>,
+    ipv6_only: Option<bool>,
 }
 
 impl InetSocketDiagnostic {
@@ -160,6 +166,21 @@ impl InetSocketDiagnostic {
     pub const fn mark(self) -> Option<u32> {
         self.mark
     }
+
+    /// Whether the kernel reported `IP_TRANSPARENT` for this socket.
+    ///
+    /// The value is optional because older or restricted diagnostic providers
+    /// may omit `INET_DIAG_SOCKOPT`; listener correlation rejects omission.
+    #[must_use]
+    pub const fn transparent(self) -> Option<bool> {
+        self.transparent
+    }
+
+    /// IPv6-only state when the kernel reported `INET_DIAG_SKV6ONLY`.
+    #[must_use]
+    pub const fn ipv6_only(self) -> Option<bool> {
+        self.ipv6_only
+    }
 }
 
 /// One completed diagnostic transaction.
@@ -208,6 +229,8 @@ pub struct ProcessSocketDiagnostics {
     completed_at: Instant,
     socket_fds: Box<[ProcessSocketFd]>,
     dumps: Box<[InetSocketDump]>,
+    listener_port: Option<NonZeroU16>,
+    listener_dumps: Box<[InetSocketDump]>,
     sockets: Box<[InetSocketDiagnostic]>,
 }
 
@@ -243,6 +266,19 @@ impl ProcessSocketDiagnostics {
         &self.dumps
     }
 
+    /// Targeted listener transactions, when this snapshot was collected with
+    /// an explicit listener port. There is one IPv4 and one IPv6 UDP dump.
+    #[must_use]
+    pub fn listener_dumps(&self) -> &[InetSocketDump] {
+        &self.listener_dumps
+    }
+
+    /// Source port selected by the targeted listener transactions.
+    #[must_use]
+    pub const fn listener_port(&self) -> Option<NonZeroU16> {
+        self.listener_port
+    }
+
     #[must_use]
     pub fn sockets(&self) -> &[InetSocketDiagnostic] {
         &self.sockets
@@ -254,10 +290,95 @@ impl ProcessSocketDiagnostics {
         true
     }
 
-    /// Success itself is the completeness proof; all four dumps reached `NLMSG_DONE`.
+    /// Whether this snapshot contains the exact completed broad transaction set.
     #[must_use]
-    pub const fn diag_dumps_complete(&self) -> bool {
-        true
+    pub fn diag_dumps_complete(&self) -> bool {
+        let [ipv4_tcp, ipv4_udp, ipv6_tcp, ipv6_udp] = self.dumps.as_ref() else {
+            return false;
+        };
+        [
+            (
+                ipv4_tcp,
+                InetSocketAddressFamily::Ipv4,
+                InetSocketProtocol::Tcp,
+            ),
+            (
+                ipv4_udp,
+                InetSocketAddressFamily::Ipv4,
+                InetSocketProtocol::Udp,
+            ),
+            (
+                ipv6_tcp,
+                InetSocketAddressFamily::Ipv6,
+                InetSocketProtocol::Tcp,
+            ),
+            (
+                ipv6_udp,
+                InetSocketAddressFamily::Ipv6,
+                InetSocketProtocol::Udp,
+            ),
+        ]
+        .into_iter()
+        .all(|(dump, family, protocol)| {
+            dump.address_family == family
+                && dump.protocol == protocol
+                && dump.started_at >= self.started_at
+                && dump.completed_at >= dump.started_at
+                && dump.completed_at <= self.completed_at
+        }) && dump_sequences_are_contiguous(&self.dumps)
+    }
+
+    /// Whether this snapshot contains the exact completed targeted-listener
+    /// transaction set.
+    ///
+    /// Ordinary process snapshots return `false`: they never requested these
+    /// dumps and cannot be promoted into listener evidence.
+    #[must_use]
+    pub fn listener_diag_dumps_complete(&self) -> bool {
+        let [ipv4, ipv6] = self.listener_dumps.as_ref() else {
+            return false;
+        };
+        self.diag_dumps_complete()
+            && self.listener_port.is_some()
+            && self.listener_dumps.len() == TARGETED_LISTENER_DUMP_COUNT
+            && ipv4.address_family == InetSocketAddressFamily::Ipv4
+            && ipv4.protocol == InetSocketProtocol::Udp
+            && ipv6.address_family == InetSocketAddressFamily::Ipv6
+            && ipv6.protocol == InetSocketProtocol::Udp
+            && dump_sequences_are_contiguous(&self.dumps)
+            && dump_sequences_are_contiguous(&self.listener_dumps)
+            && dump_sequence_sets_are_disjoint(&self.dumps, &self.listener_dumps)
+            && dump_sequence_sets_are_contiguous(&self.dumps, &self.listener_dumps)
+            && [ipv4, ipv6].into_iter().all(|dump| {
+                dump.started_at >= self.started_at
+                    && dump.completed_at >= dump.started_at
+                    && dump.completed_at <= self.completed_at
+            })
+    }
+
+    /// Sequence carrying one listener role in the exact complete transaction.
+    ///
+    /// TCP listener rows come from the broad family dump; UDP listener rows
+    /// come from the source-port-targeted dump. Incomplete or ambiguous dump
+    /// provenance is never projected as a role sequence.
+    #[must_use]
+    pub fn listener_role_sequence(
+        &self,
+        address_family: InetSocketAddressFamily,
+        protocol: InetSocketProtocol,
+    ) -> Option<NonZeroU32> {
+        if !self.listener_diag_dumps_complete() {
+            return None;
+        }
+        let dumps = match protocol {
+            InetSocketProtocol::Tcp => self.dumps.as_ref(),
+            InetSocketProtocol::Udp => self.listener_dumps.as_ref(),
+        };
+        let mut matches = dumps
+            .iter()
+            .filter(|dump| dump.address_family == address_family && dump.protocol == protocol);
+        let sequence = matches.next()?.sequence;
+        matches.next().is_none().then_some(sequence)
     }
 
     /// Join one exact process FD to one exact INET_DIAG row.
@@ -283,6 +404,8 @@ impl ProcessSocketDiagnostics {
                 && diagnostic.protocol == protocol
                 && diagnostic.local_address == local_address
                 && diagnostic.remote_address == remote_address
+                && self.diag_dumps_complete()
+                && has_exact_dump(&self.dumps, *diagnostic)
         });
         let diagnostic = matches
             .next()
@@ -295,6 +418,131 @@ impl ProcessSocketDiagnostics {
             diagnostic,
         })
     }
+
+    /// Join one exact transparent wildcard listener to one exact process FD.
+    ///
+    /// TCP listeners come from the all-state TCP dumps. UDP listeners come
+    /// only from the targeted `TCP_CLOSE` listener dumps. The method is
+    /// intentionally strict: the role tuple, state, transparency, IPv6-only
+    /// contract, diagnostic row, and process FD/inode join must each be
+    /// unique.
+    pub fn correlate_transparent_listener(
+        &self,
+        address_family: InetSocketAddressFamily,
+        protocol: InetSocketProtocol,
+        port: NonZeroU16,
+    ) -> Result<CorrelatedProcessSocket, ListenerSocketCorrelationError> {
+        let wildcard = match address_family {
+            InetSocketAddressFamily::Ipv4 => {
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port.get())
+            }
+            InetSocketAddressFamily::Ipv6 => {
+                SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port.get())
+            }
+        };
+        let zero_remote = match address_family {
+            InetSocketAddressFamily::Ipv4 => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+            InetSocketAddressFamily::Ipv6 => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
+        };
+        let expected_state = match protocol {
+            InetSocketProtocol::Tcp => TCP_LISTEN,
+            InetSocketProtocol::Udp => TCP_CLOSE,
+        };
+        let mut diagnostics = self.sockets.iter().copied().filter(|diagnostic| {
+            diagnostic.address_family == address_family
+                && diagnostic.protocol == protocol
+                && diagnostic.state == expected_state
+                && diagnostic.local_address == wildcard
+                && diagnostic.remote_address == zero_remote
+                && diagnostic.transparent == Some(true)
+                && match address_family {
+                    InetSocketAddressFamily::Ipv4 => diagnostic.ipv6_only.is_none(),
+                    InetSocketAddressFamily::Ipv6 => diagnostic.ipv6_only == Some(true),
+                }
+                && diagnostic.inode != 0
+                && diagnostic.cookie.words() != [u32::MAX; 2]
+                && match protocol {
+                    InetSocketProtocol::Tcp => {
+                        self.diag_dumps_complete() && has_exact_dump(&self.dumps, *diagnostic)
+                    }
+                    InetSocketProtocol::Udp => {
+                        self.listener_port == Some(port)
+                            && self.listener_diag_dumps_complete()
+                            && has_exact_dump(&self.listener_dumps, *diagnostic)
+                    }
+                }
+        });
+        let diagnostic =
+            diagnostics
+                .next()
+                .ok_or(ListenerSocketCorrelationError::MissingDiagnostic {
+                    address_family,
+                    protocol,
+                    port,
+                })?;
+        if diagnostics.next().is_some() {
+            return Err(ListenerSocketCorrelationError::AmbiguousDiagnostic {
+                address_family,
+                protocol,
+                port,
+            });
+        }
+
+        let inode = NonZeroU64::new(diagnostic.inode).ok_or(
+            ListenerSocketCorrelationError::MissingDiagnostic {
+                address_family,
+                protocol,
+                port,
+            },
+        )?;
+        let mut process_fds = self
+            .socket_fds
+            .iter()
+            .copied()
+            .filter(|process_fd| process_fd.inode == inode);
+        let process_fd = process_fds
+            .next()
+            .ok_or(ListenerSocketCorrelationError::MissingProcessSocketFd { inode: inode.get() })?;
+        if process_fds.next().is_some() {
+            return Err(ListenerSocketCorrelationError::AmbiguousProcessSocketFd {
+                inode: inode.get(),
+            });
+        }
+        Ok(CorrelatedProcessSocket {
+            process_fd,
+            diagnostic,
+        })
+    }
+}
+
+fn dump_sequences_are_contiguous(dumps: &[InetSocketDump]) -> bool {
+    !dumps.is_empty()
+        && dumps
+            .windows(2)
+            .all(|pair| pair[0].sequence.get().checked_add(1) == Some(pair[1].sequence.get()))
+}
+
+fn dump_sequence_sets_are_disjoint(left: &[InetSocketDump], right: &[InetSocketDump]) -> bool {
+    left.iter().all(|left_dump| {
+        right
+            .iter()
+            .all(|right_dump| left_dump.sequence != right_dump.sequence)
+    })
+}
+
+fn dump_sequence_sets_are_contiguous(left: &[InetSocketDump], right: &[InetSocketDump]) -> bool {
+    left.last()
+        .and_then(|dump| dump.sequence.get().checked_add(1))
+        == right.first().map(|dump| dump.sequence.get())
+}
+
+fn has_exact_dump(dumps: &[InetSocketDump], diagnostic: InetSocketDiagnostic) -> bool {
+    let mut matching = dumps.iter().filter(|dump| {
+        dump.sequence == diagnostic.dump_sequence
+            && dump.address_family == diagnostic.address_family
+            && dump.protocol == diagnostic.protocol
+    });
+    matching.next().is_some() && matching.next().is_none()
 }
 
 /// Exact procfs-FD to INET_DIAG join selected from one complete snapshot.
@@ -348,6 +596,62 @@ impl fmt::Display for SocketCorrelationError {
 }
 
 impl Error for SocketCorrelationError {}
+
+/// Failure to select one exact transparent listener and one process-FD join.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ListenerSocketCorrelationError {
+    MissingDiagnostic {
+        address_family: InetSocketAddressFamily,
+        protocol: InetSocketProtocol,
+        port: NonZeroU16,
+    },
+    AmbiguousDiagnostic {
+        address_family: InetSocketAddressFamily,
+        protocol: InetSocketProtocol,
+        port: NonZeroU16,
+    },
+    MissingProcessSocketFd {
+        inode: u64,
+    },
+    AmbiguousProcessSocketFd {
+        inode: u64,
+    },
+}
+
+impl fmt::Display for ListenerSocketCorrelationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingDiagnostic {
+                address_family,
+                protocol,
+                port,
+            } => write!(
+                formatter,
+                "no exact transparent {address_family:?}/{protocol:?} listener on port {port}"
+            ),
+            Self::AmbiguousDiagnostic {
+                address_family,
+                protocol,
+                port,
+            } => write!(
+                formatter,
+                "multiple transparent {address_family:?}/{protocol:?} listeners on port {port}"
+            ),
+            Self::MissingProcessSocketFd { inode } => {
+                write!(
+                    formatter,
+                    "listener inode {inode} is absent from process FDs"
+                )
+            }
+            Self::AmbiguousProcessSocketFd { inode } => write!(
+                formatter,
+                "listener inode {inode} is referenced by multiple process FDs"
+            ),
+        }
+    }
+}
+
+impl Error for ListenerSocketCorrelationError {}
 
 /// Stable high-level classification for collection failures.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -518,19 +822,6 @@ impl SystemSocketDiagnosticsSource {
     ) -> Result<SystemSocketDiagnosticsSession, SocketDiagnosticsError> {
         open_until(deadline)
     }
-
-    /// Collect a complete identity-bound snapshot before an exclusive deadline.
-    ///
-    /// This convenience method opens a temporary prebound session internally.
-    pub fn collect_until(
-        self,
-        expected: SocketDiagnosticsProcessIdentity,
-        deadline: Instant,
-    ) -> Result<ProcessSocketDiagnostics, SocketDiagnosticsError> {
-        let session = self.open_until(deadline)?;
-        let (_, snapshot) = session.collect_process_until(expected, deadline)?;
-        Ok(snapshot)
-    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -586,6 +877,30 @@ impl SystemSocketDiagnosticsSession {
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
         {
             let _ = (expected, deadline);
+            match self._unsupported {}
+        }
+    }
+
+    /// Collect a complete process snapshot plus targeted UDP listener dumps,
+    /// retaining this exact prebound session on success.
+    pub fn collect_process_and_listeners_until(
+        self,
+        expected: SocketDiagnosticsProcessIdentity,
+        listener_port: NonZeroU16,
+        deadline: Instant,
+    ) -> Result<(Self, ProcessSocketDiagnostics), SocketDiagnosticsError> {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            let (inner, snapshot) = self.inner.collect_process_and_listeners_until(
+                expected,
+                listener_port,
+                deadline,
+            )?;
+            Ok((Self { inner }, snapshot))
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            let _ = (expected, listener_port, deadline);
             match self._unsupported {}
         }
     }

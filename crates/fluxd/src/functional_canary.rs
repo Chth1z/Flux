@@ -3041,33 +3041,6 @@ impl CanaryAttemptObjectRetirementEvidence {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CanaryListenerDeliveryReportCleanupEvidence {
-    Retired(CanaryAttemptObjectRetirementEvidence),
-    VerifiedNeverCreated {
-        object: CanaryAttemptObjectIdentity,
-        absent_observed_at: Instant,
-    },
-}
-
-impl CanaryListenerDeliveryReportCleanupEvidence {
-    #[must_use]
-    pub(crate) const fn retired(evidence: CanaryAttemptObjectRetirementEvidence) -> Self {
-        Self::Retired(evidence)
-    }
-
-    #[must_use]
-    pub(crate) const fn verified_never_created(
-        object: CanaryAttemptObjectIdentity,
-        absent_observed_at: Instant,
-    ) -> Self {
-        Self::VerifiedNeverCreated {
-            object,
-            absent_observed_at,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct CanaryAttemptRecordRetirementEvidence {
     generation: GenerationId,
     nonce: CanaryNonce,
@@ -4519,10 +4492,13 @@ fn validate_cleanup_evidence(
         delivery_authority.ok_or(CanaryEvidenceError::MissingInboundListenerDelivery {
             flow: CanaryFlow::Ipv4TcpEcho,
         })?;
-    match (delivery_authority, cleanup.listener_delivery_report) {
+    match (
+        delivery_authority,
+        cleanup.listener_delivery_report.disposition(),
+    ) {
         (
             CanaryInboundDeliveryAuthority::SupervisedEngineReport { .. },
-            CanaryListenerDeliveryReportCleanupEvidence::Retired(retirement),
+            CanaryListenerDeliveryReportCleanupDisposition::Retired(retirement),
         ) => {
             let object = CanaryCleanupObjectRole::ListenerDeliveryReport;
             if retirement.object != expected_objects.listener_delivery_report() {
@@ -4552,7 +4528,7 @@ fn validate_cleanup_evidence(
         }
         (
             CanaryInboundDeliveryAuthority::QualifiedCgroupBpf { .. },
-            CanaryListenerDeliveryReportCleanupEvidence::VerifiedNeverCreated {
+            CanaryListenerDeliveryReportCleanupDisposition::VerifiedNeverCreated {
                 object,
                 absent_observed_at,
             },
@@ -4822,6 +4798,8 @@ fn bounded_prefix(diagnostic: &str) -> String {
 
 pub(crate) mod local_output;
 mod supervised_delivery_report;
+use supervised_delivery_report::CanaryListenerDeliveryReportCleanupDisposition;
+pub(crate) use supervised_delivery_report::CanaryListenerDeliveryReportCleanupEvidence;
 
 #[cfg(all(test, any(target_os = "linux", target_os = "android")))]
 mod linux_namespace_harness;
@@ -5994,15 +5972,11 @@ pub(crate) mod tests {
                     .listener_delivery_report(),
                 mixed_fixture.request.deadline().started_at() + Duration::from_millis(123),
             );
-        let CanaryListenerDeliveryReportCleanupEvidence::VerifiedNeverCreated {
-            absent_observed_at,
-            ..
-        } = &mut premature_never_created_readback
+        let absent_observed_at = premature_never_created_readback
             .cleanup
             .listener_delivery_report
-        else {
-            panic!("qualified BPF fixture verifies the report object was never created");
-        };
+            .never_created_absence_mut()
+            .expect("qualified BPF fixture verifies the report object was never created");
         *absent_observed_at = mixed_fixture.request.deadline().started_at();
         assert_eq!(
             validate(&mixed_fixture, premature_never_created_readback)
@@ -6988,12 +6962,11 @@ pub(crate) mod tests {
     fn supervised_report_retirement_mut(
         evidence: &mut UnqualifiedCanaryGateEvidence,
     ) -> &mut CanaryAttemptObjectRetirementEvidence {
-        match &mut evidence.cleanup.listener_delivery_report {
-            CanaryListenerDeliveryReportCleanupEvidence::Retired(retirement) => retirement,
-            CanaryListenerDeliveryReportCleanupEvidence::VerifiedNeverCreated { .. } => {
-                panic!("fixture uses supervised delivery-report cleanup")
-            }
-        }
+        evidence
+            .cleanup
+            .listener_delivery_report
+            .retired_mut()
+            .expect("fixture uses supervised delivery-report cleanup")
     }
 
     fn qualified_cgroup_bpf_observer() -> CanarySocketObserverAuthority {

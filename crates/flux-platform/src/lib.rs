@@ -96,7 +96,9 @@ pub use reactor::{
     NetworkInventoryRefreshDisposition, NetworkInventoryRefreshHandle, ReactorError,
     ReactorStopHandle, StopDisposition,
 };
-pub use seqpacket::{PeerCredentials, SeqpacketConnection, SeqpacketListener, Uid};
+pub use seqpacket::{
+    PeerCredentials, SeqpacketConnection, SeqpacketListener, SeqpacketReceive, Uid,
+};
 pub use shutdown::ShutdownSignal;
 pub use sing_box::{
     ReadinessEvidence, SingBoxExit, SingBoxLaunchSpec, SingBoxPrivilege, SingBoxReadiness,

@@ -83,6 +83,10 @@ use crate::generation_engine_config::{
     EngineSupervisedDeliveryReportWireField as WireField,
 };
 
+mod collector;
+pub(super) use collector::CanaryListenerDeliveryReportCleanupDisposition;
+pub(crate) use collector::CanaryListenerDeliveryReportCleanupEvidence;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SupervisedDeliveryReportBindError {
     CapabilityUnavailable,
@@ -112,6 +116,10 @@ pub(super) struct SupervisedDeliveryReportParserAuthority {
 }
 
 impl SupervisedDeliveryReportParserAuthority {
+    const fn collector() -> Self {
+        Self { _sealed: () }
+    }
+
     #[cfg(test)]
     const fn fixture() -> Self {
         Self { _sealed: () }
@@ -991,6 +999,7 @@ mod tests {
     use std::fs;
     use std::num::{NonZeroU32, NonZeroU64};
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::Arc;
     use std::time::Duration;
 
     use flux_core::GenerationId;
@@ -999,7 +1008,8 @@ mod tests {
     use super::*;
     use crate::functional_canary::tests::{Fixture, request_with_engine_profile_revision};
     use crate::functional_canary::{
-        CanaryAddressFamilies, CanaryNonce, FUNCTIONAL_CANARY_NONCE_BYTES,
+        CanaryAddressFamilies, CanaryAttemptObjectRetirementEvidence,
+        CanaryListenerDeliveryReportCleanupEvidence, CanaryNonce, FUNCTIONAL_CANARY_NONCE_BYTES,
     };
     use crate::generation_engine_config::{
         TproxyEngineConfigRequest, bind_engine_config_to_spec,
@@ -1183,60 +1193,498 @@ esac
     }
 
     #[test]
-    fn parsed_frames_reach_schema_v2_only_through_test_authority() {
+    fn prebound_collector_drains_actual_seqpacket_records_through_real_eof() {
         let context = Context::new(CanaryAddressFamilies::Ipv4AndIpv6);
-        let mut evidence = context.evidence();
-        let frames = encode_report_frames(&context.request, &evidence);
-        let mut report = parse_complete_report(&context, &frames);
-        let authority = SupervisedDeliveryReportSchemaV2FixtureAuthority::fixture();
+        let frames = encode_report_frames(&context.request, &context.evidence());
+        let started_at = context.request.deadline().started_at();
+        let mut observation = 0_u64;
+        let (producer, collector) = prebind_report_collector(&context, move || {
+            observation += 1;
+            started_at + Duration::from_millis(observation * 10)
+        });
 
-        for flow in CanaryFlow::ALL {
-            let existing = evidence.flows.slots[flow.index()]
-                .as_mut()
-                .expect("required flow")
-                .inbound_listener_delivery
-                .take()
-                .expect("listener delivery");
-            let listener = match existing {
-                UnqualifiedCanaryInboundListenerDeliveryEvidence::TproxyTcp {
-                    listener, ..
-                }
-                | UnqualifiedCanaryInboundListenerDeliveryEvidence::TproxyUdp {
-                    listener, ..
-                } => listener,
-                _ => panic!("fixture uses TPROXY evidence"),
-            };
-            evidence.flows.slots[flow.index()]
-                .as_mut()
-                .expect("required flow")
-                .inbound_listener_delivery = Some(
-                report
-                    .take_event(flow)
-                    .expect("parsed flow")
-                    .into_schema_v2_fixture(authority, listener)
-                    .expect("listener role matches parsed flow"),
-            );
+        for frame in frames {
+            producer.send_frame(&frame).expect("send report frame");
         }
-        evidence.local_output_capture_receipt =
-            super::super::local_output::TproxyLocalOutputCaptureReceipt::scripted(
-                &context.request,
-                &evidence.flows,
-            );
-        evidence.local_output_process_ownership_receipt =
-            super::super::local_output::TproxyLocalOutputProcessOwnershipReceipt::scripted(
-                &context.request,
-                &evidence.flows,
-                &evidence.cleanup,
-                evidence.completed_at,
-            );
+        drop(producer);
 
-        evidence
-            .validate_for(
-                &context.request,
-                context.request.pre_binding(),
+        let drained = collector.drain().expect("drain report collector");
+        assert_eq!(
+            drained.report_object(),
+            context
+                .request
+                .pre_binding()
+                .environment()
+                .attempt_objects()
+                .listener_delivery_report()
+        );
+        assert_eq!(drained.profile_revision(), context.profile.revision());
+        assert!(drained.terminal_observed_at() < drained.eof_observed_at());
+    }
+
+    #[test]
+    fn drained_collector_owns_receiver_retirement_after_exact_client_reap() {
+        let context = Context::new(CanaryAddressFamilies::Ipv4AndIpv6);
+        let evidence = context.evidence();
+        let started_at = context.request.deadline().started_at();
+        let drained = drain_report_collector(
+            &context,
+            &evidence,
+            started_at + Duration::from_millis(120),
+            started_at + Duration::from_millis(123),
+        );
+        let authority = client_retirement_authority(drained.binding(), evidence.cleanup.client);
+        let retired = drained
+            .retire_after_client(authority)
+            .expect("retire receiver after client reap");
+
+        assert_eq!(retired.client_retirement(), evidence.cleanup.client);
+        assert_eq!(
+            retired.report_cleanup(),
+            CanaryListenerDeliveryReportCleanupEvidence::retired(
+                CanaryAttemptObjectRetirementEvidence::new(
+                    context
+                        .request
+                        .pre_binding()
+                        .environment()
+                        .attempt_objects()
+                        .listener_delivery_report(),
+                    started_at + Duration::from_millis(120),
+                    started_at + Duration::from_millis(123),
+                ),
+            )
+        );
+    }
+
+    #[test]
+    fn whole_retired_report_reaches_schema_v2_only_through_test_factory() {
+        let context = Context::new(CanaryAddressFamilies::Ipv4AndIpv6);
+        let evidence = context.evidence();
+        let started_at = context.request.deadline().started_at();
+        let drained = drain_report_collector(
+            &context,
+            &evidence,
+            started_at + Duration::from_millis(120),
+            started_at + Duration::from_millis(123),
+        );
+        let authority = client_retirement_authority(drained.binding(), evidence.cleanup.client);
+        let retired = drained
+            .retire_after_client(authority)
+            .expect("retire receiver after client reap");
+
+        collector::validate_schema_v2_fixture(retired, evidence, context.fixture.observed_at())
+            .expect("whole retired report satisfies the existing schema-v2 model");
+    }
+
+    #[test]
+    fn whole_report_factory_rejects_request_and_client_retirement_drift() {
+        let context = Context::new(CanaryAddressFamilies::Ipv4AndIpv6);
+        let evidence = context.evidence();
+        let started_at = context.request.deadline().started_at();
+        let drained = drain_report_collector(
+            &context,
+            &evidence,
+            started_at + Duration::from_millis(120),
+            started_at + Duration::from_millis(123),
+        );
+        let authority = client_retirement_authority(drained.binding(), evidence.cleanup.client);
+        let retired = drained
+            .retire_after_client(authority)
+            .expect("retire receiver after client reap");
+        let alternate = Context::new(CanaryAddressFamilies::Ipv4AndIpv6);
+        assert_eq!(
+            collector::validate_schema_v2_fixture(
+                retired,
+                alternate.evidence(),
+                alternate.fixture.observed_at(),
+            )
+            .expect_err("another request cannot consume the retired report"),
+            collector::SupervisedDeliveryReportFixtureError::RequestMismatch
+        );
+
+        let evidence = context.evidence();
+        let drained = drain_report_collector(
+            &context,
+            &evidence,
+            started_at + Duration::from_millis(120),
+            started_at + Duration::from_millis(123),
+        );
+        let authority = client_retirement_authority(drained.binding(), evidence.cleanup.client);
+        let retired = drained
+            .retire_after_client(authority)
+            .expect("retire receiver after client reap");
+        let mut client_drift = context.evidence();
+        client_drift.cleanup.client.reaped_at += Duration::from_nanos(1);
+        assert_eq!(
+            collector::validate_schema_v2_fixture(
+                retired,
+                client_drift,
                 context.fixture.observed_at(),
             )
-            .expect("parsed report satisfies the existing schema-v2 model");
+            .expect_err("copied client identity cannot replace exact retirement"),
+            collector::SupervisedDeliveryReportFixtureError::ClientRetirementMismatch
+        );
+    }
+
+    #[test]
+    fn receiver_retirement_rejects_invalid_client_and_clock_chronology() {
+        let context = Context::new(CanaryAddressFamilies::Ipv4AndIpv6);
+        let started_at = context.request.deadline().started_at();
+
+        let exact = context.evidence();
+        let alternate = Context::new(CanaryAddressFamilies::Ipv4AndIpv6);
+        let drained = drain_report_collector(
+            &context,
+            &exact,
+            started_at + Duration::from_millis(120),
+            started_at + Duration::from_millis(123),
+        );
+        let alternate_evidence = alternate.evidence();
+        let alternate_started_at = alternate.request.deadline().started_at();
+        let alternate_drained = drain_report_collector(
+            &alternate,
+            &alternate_evidence,
+            alternate_started_at + Duration::from_millis(120),
+            alternate_started_at + Duration::from_millis(123),
+        );
+        assert_ne!(context.request, alternate.request);
+        assert_eq!(drained.report_object(), alternate_drained.report_object());
+        assert_eq!(
+            drained.profile_revision(),
+            alternate_drained.profile_revision()
+        );
+        let wrong_authority = client_retirement_authority(
+            alternate_drained.binding(),
+            alternate_evidence.cleanup.client,
+        );
+        let failure = match drained.retire_after_client(wrong_authority) {
+            Ok(_) => panic!("another request cannot authorize receiver retirement"),
+            Err(failure) => failure,
+        };
+        assert!(matches!(
+            failure.error(),
+            collector::SupervisedDeliveryReportCollectorError::ClientRetirementAuthorityMismatch
+        ));
+        let (drained, alternate_authority) = retained_retirement(failure);
+        alternate_drained
+            .retire_after_client(alternate_authority)
+            .expect("rejected authority still retires its exact alternate receiver");
+        let exact_authority = client_retirement_authority(drained.binding(), exact.cleanup.client);
+        drained
+            .retire_after_client(exact_authority)
+            .expect("exact request authority retires the preserved receiver");
+
+        let mut unordered = context.evidence();
+        unordered.cleanup.client.quiesced_at =
+            unordered.cleanup.client.terminated_at + Duration::from_nanos(1);
+        let drained = drain_report_collector(
+            &context,
+            &unordered,
+            started_at + Duration::from_millis(120),
+            started_at + Duration::from_millis(123),
+        );
+        let unordered_authority =
+            client_retirement_authority(drained.binding(), unordered.cleanup.client);
+        let failure = match drained.retire_after_client(unordered_authority) {
+            Ok(_) => panic!("unordered client retirement cannot retire the receiver"),
+            Err(failure) => failure,
+        };
+        assert!(matches!(
+            failure.error(),
+            collector::SupervisedDeliveryReportCollectorError::InvalidClientRetirement
+        ));
+        let (drained, _invalid_authority) = retained_retirement(failure);
+        let valid = context.evidence();
+        let valid_authority = client_retirement_authority(drained.binding(), valid.cleanup.client);
+        drained
+            .retire_after_client(valid_authority)
+            .expect("retained receiver can retire with exact client authority");
+
+        let mut client_not_reaped = context.evidence();
+        client_not_reaped.cleanup.client.reaped_at = started_at + Duration::from_millis(121);
+        let drained = drain_report_collector(
+            &context,
+            &client_not_reaped,
+            started_at + Duration::from_millis(120),
+            started_at + Duration::from_millis(123),
+        );
+        let premature_authority =
+            client_retirement_authority(drained.binding(), client_not_reaped.cleanup.client);
+        let failure = match drained.retire_after_client(premature_authority) {
+            Ok(_) => panic!("receiver cannot retire before exact client reap"),
+            Err(failure) => failure,
+        };
+        assert!(matches!(
+            failure.error(),
+            collector::SupervisedDeliveryReportCollectorError::InvalidReceiverRetirement
+        ));
+        let (drained, _premature_authority) = retained_retirement(failure);
+        let valid = context.evidence();
+        let valid_authority = client_retirement_authority(drained.binding(), valid.cleanup.client);
+        drained
+            .retire_after_client(valid_authority)
+            .expect("preserved receiver can retire on a later valid clock sample");
+
+        let absence_before_drop = context.evidence();
+        let drained = drain_report_collector(
+            &context,
+            &absence_before_drop,
+            started_at + Duration::from_millis(120),
+            started_at + Duration::from_millis(119),
+        );
+        let absence_authority =
+            client_retirement_authority(drained.binding(), absence_before_drop.cleanup.client);
+        let failure = match drained.retire_after_client(absence_authority) {
+            Ok(_) => panic!("absence cannot precede receiver destruction"),
+            Err(failure) => failure,
+        };
+        assert!(matches!(
+            failure.error(),
+            collector::SupervisedDeliveryReportCollectorError::InvalidReceiverRetirement
+        ));
+        let unverified = match failure.into_disposition() {
+            collector::SupervisedDeliveryReportRetirementFailureDisposition::ReceiverRetained {
+                ..
+            } => panic!("post-drop clock failure cannot retain a destroyed receiver"),
+            collector::SupervisedDeliveryReportRetirementFailureDisposition::ReceiverRetiredWithoutCleanupEvidence(
+                retirement,
+            ) => retirement,
+        };
+        assert!(matches!(
+            unverified.error(),
+            collector::SupervisedDeliveryReportCollectorError::InvalidReceiverRetirement
+        ));
+        assert_eq!(
+            unverified.report_object(),
+            context
+                .request
+                .pre_binding()
+                .environment()
+                .attempt_objects()
+                .listener_delivery_report()
+        );
+        assert_eq!(unverified.profile_revision(), context.profile.revision());
+        assert_eq!(
+            unverified.client_retirement(),
+            absence_before_drop.cleanup.client
+        );
+        assert_eq!(
+            unverified.retired_at(),
+            started_at + Duration::from_millis(120)
+        );
+        assert_eq!(
+            unverified.absent_observed_at(),
+            started_at + Duration::from_millis(119)
+        );
+        assert_eq!(
+            unverified
+                .completed_report()
+                .expect("completed report remains available for diagnostics")
+                .report_object(),
+            unverified.report_object()
+        );
+        assert!(unverified.collection_error().is_none());
+    }
+
+    #[test]
+    fn collector_rejects_transport_truncation_from_a_real_oversized_record() {
+        let context = Context::new(CanaryAddressFamilies::Ipv4Only);
+        let evidence = context.evidence();
+        let started_at = context.request.deadline().started_at();
+        let clock = scripted_collector_clock(
+            &context,
+            1,
+            10,
+            started_at + Duration::from_millis(120),
+            started_at + Duration::from_millis(123),
+        );
+        let (producer, collector) = prebind_report_collector(&context, clock);
+        producer
+            .send_frame(&vec![
+                0;
+                usize::from(
+                    ENGINE_SUPERVISED_DELIVERY_REPORT_MAX_FRAME_BYTES
+                ) + 1
+            ])
+            .expect("send oversized record");
+        drop(producer);
+
+        let failed = match collector.drain() {
+            Ok(_) => panic!("transport truncation must fail"),
+            Err(failed) => *failed,
+        };
+        assert!(matches!(
+            failed.collection_error(),
+            collector::SupervisedDeliveryReportCollectorError::InvalidReport(
+                SupervisedDeliveryReportError::TransportTruncated
+            )
+        ));
+        let authority = client_retirement_authority(failed.binding(), evidence.cleanup.client);
+        let retired = failed
+            .retire_after_client(authority)
+            .expect("failed collector retires only after exact client reap");
+        assert!(matches!(
+            retired.collection_error(),
+            collector::SupervisedDeliveryReportCollectorError::InvalidReport(
+                SupervisedDeliveryReportError::TransportTruncated
+            )
+        ));
+        assert_eq!(retired.client_retirement(), evidence.cleanup.client);
+    }
+
+    #[test]
+    fn failed_collection_retains_diagnostics_without_minting_cleanup_after_bad_post_drop_clock() {
+        let context = Context::new(CanaryAddressFamilies::Ipv4Only);
+        let evidence = context.evidence();
+        let started_at = context.request.deadline().started_at();
+        let clock = scripted_collector_clock(
+            &context,
+            1,
+            10,
+            started_at + Duration::from_millis(120),
+            started_at + Duration::from_millis(119),
+        );
+        let (producer, collector) = prebind_report_collector(&context, clock);
+        producer
+            .send_frame(&vec![
+                0;
+                usize::from(
+                    ENGINE_SUPERVISED_DELIVERY_REPORT_MAX_FRAME_BYTES
+                ) + 1
+            ])
+            .expect("send oversized record");
+        drop(producer);
+
+        let failed = match collector.drain() {
+            Ok(_) => panic!("transport truncation must fail"),
+            Err(failed) => *failed,
+        };
+        let authority = client_retirement_authority(failed.binding(), evidence.cleanup.client);
+        let retirement_failure = match failed.retire_after_client(authority) {
+            Ok(_) => panic!("invalid post-drop chronology cannot mint cleanup evidence"),
+            Err(failure) => failure,
+        };
+        let unverified = match retirement_failure.into_disposition() {
+            collector::SupervisedDeliveryReportRetirementFailureDisposition::ReceiverRetained {
+                ..
+            } => panic!("post-drop clock failure cannot retain a destroyed receiver"),
+            collector::SupervisedDeliveryReportRetirementFailureDisposition::ReceiverRetiredWithoutCleanupEvidence(
+                retirement,
+            ) => retirement,
+        };
+        assert!(unverified.completed_report().is_none());
+        assert!(matches!(
+            unverified
+                .collection_error()
+                .expect("collection failure remains available for diagnostics"),
+            collector::SupervisedDeliveryReportCollectorError::InvalidReport(
+                SupervisedDeliveryReportError::TransportTruncated
+            )
+        ));
+        assert_eq!(unverified.client_retirement(), evidence.cleanup.client);
+        assert_eq!(
+            unverified.absent_observed_at(),
+            started_at + Duration::from_millis(119)
+        );
+    }
+
+    #[test]
+    fn collector_rejects_an_empty_record_after_terminal_instead_of_completing() {
+        let context = Context::new(CanaryAddressFamilies::Ipv4Only);
+        let evidence = context.evidence();
+        let frames = encode_report_frames(&context.request, &evidence);
+        let record_count = frames.len() + 1;
+        let started_at = context.request.deadline().started_at();
+        let clock = scripted_collector_clock(
+            &context,
+            record_count,
+            10,
+            started_at + Duration::from_millis(120),
+            started_at + Duration::from_millis(123),
+        );
+        let (producer, collector) = prebind_report_collector(&context, clock);
+        for frame in frames {
+            producer.send_frame(&frame).expect("send report frame");
+        }
+        producer
+            .send_frame(b"")
+            .expect("send empty trailing record");
+        drop(producer);
+
+        let failed = match collector.drain() {
+            Ok(_) => panic!("an empty post-terminal record cannot complete the report"),
+            Err(failed) => *failed,
+        };
+        assert!(matches!(
+            failed.collection_error(),
+            collector::SupervisedDeliveryReportCollectorError::InvalidReport(
+                SupervisedDeliveryReportError::PostTerminalFrame
+            )
+        ));
+        let authority = client_retirement_authority(failed.binding(), evidence.cleanup.client);
+        failed
+            .retire_after_client(authority)
+            .expect("post-terminal failure retains cleanup ownership");
+    }
+
+    #[test]
+    fn collector_times_out_while_the_post_terminal_producer_is_retained() {
+        let mut context = Context::new(CanaryAddressFamilies::Ipv4Only);
+        let started_at = context.request.deadline().started_at();
+        let short_duration =
+            Instant::now().saturating_duration_since(started_at) + Duration::from_millis(40);
+        context.request.deadline = super::super::CanaryDeadline::new(started_at, short_duration)
+            .expect("short collector deadline");
+        let evidence = context.evidence();
+        let frames = encode_report_frames(&context.request, &evidence);
+        let record_count = frames.len();
+        let clock = scripted_collector_clock(
+            &context,
+            record_count,
+            1,
+            started_at + Duration::from_millis(120),
+            started_at + Duration::from_millis(123),
+        );
+        let (producer, collector) = prebind_report_collector(&context, clock);
+        for frame in frames {
+            producer.send_frame(&frame).expect("send report frame");
+        }
+
+        let wait_started_at = Instant::now();
+        let failed = match collector.drain() {
+            Ok(_) => panic!("retained producer cannot synthesize drained EOF"),
+            Err(failed) => *failed,
+        };
+        assert!(matches!(
+            failed.collection_error(),
+            collector::SupervisedDeliveryReportCollectorError::DeadlineExpired
+        ));
+        assert!(wait_started_at.elapsed() >= Duration::from_millis(20));
+        assert!(wait_started_at.elapsed() < Duration::from_secs(1));
+        drop(producer);
+        let authority = client_retirement_authority(failed.binding(), evidence.cleanup.client);
+        let retired = failed
+            .retire_after_client(authority)
+            .expect("timeout retains receiver ownership until exact client reap");
+        assert!(matches!(
+            retired.collection_error(),
+            collector::SupervisedDeliveryReportCollectorError::DeadlineExpired
+        ));
+        assert_eq!(
+            retired.report_cleanup(),
+            CanaryListenerDeliveryReportCleanupEvidence::retired(
+                CanaryAttemptObjectRetirementEvidence::new(
+                    context
+                        .request
+                        .pre_binding()
+                        .environment()
+                        .attempt_objects()
+                        .listener_delivery_report(),
+                    started_at + Duration::from_millis(120),
+                    started_at + Duration::from_millis(123),
+                ),
+            )
+        );
     }
 
     #[test]
@@ -1715,6 +2163,128 @@ esac
                     ),
             )
             .expect("terminal followed by drained EOF")
+    }
+
+    fn prebind_report_collector<C>(
+        context: &Context,
+        clock: C,
+    ) -> (
+        collector::SupervisedDeliveryReportEngineHandoff,
+        collector::SupervisedDeliveryReportCollector<C>,
+    )
+    where
+        C: FnMut() -> Instant,
+    {
+        let authority = collector::SupervisedDeliveryReportPrebindAuthority::fixture(
+            &context.profile,
+            &context.request,
+        );
+        let (producer, collector) =
+            collector::prebind(authority, clock).expect("prebind report collector");
+        let handoff = producer.into_engine_handoff();
+        assert_eq!(
+            handoff.report_object(),
+            context
+                .request
+                .pre_binding()
+                .environment()
+                .attempt_objects()
+                .listener_delivery_report()
+        );
+        assert_eq!(handoff.profile_revision(), context.profile.revision());
+        assert_eq!(handoff.request(), &context.request);
+        (handoff, collector)
+    }
+
+    fn client_retirement_authority(
+        binding: Arc<collector::SupervisedDeliveryReportTransportBinding>,
+        retirement: super::super::CanaryProcessRetirementEvidence,
+    ) -> collector::SupervisedDeliveryReportClientRetirementAuthority {
+        collector::SupervisedDeliveryReportClientRetirementAuthority::fixture(binding, retirement)
+    }
+
+    fn retained_retirement<T>(
+        failure: collector::SupervisedDeliveryReportRetirementFailure<T>,
+    ) -> (
+        T,
+        collector::SupervisedDeliveryReportClientRetirementAuthority,
+    ) {
+        match failure.into_disposition() {
+            collector::SupervisedDeliveryReportRetirementFailureDisposition::ReceiverRetained {
+                owner,
+                authority,
+            } => (*owner, authority),
+            collector::SupervisedDeliveryReportRetirementFailureDisposition::ReceiverRetiredWithoutCleanupEvidence(
+                ..
+            ) => panic!("pre-drop failure must preserve receiver ownership"),
+        }
+    }
+
+    fn scripted_collector_clock(
+        context: &Context,
+        record_observations: usize,
+        record_step_millis: u64,
+        retired_at: Instant,
+        absent_observed_at: Instant,
+    ) -> Box<dyn FnMut() -> Instant> {
+        let started_at = context.request.deadline().started_at();
+        let mut observations = (1..=record_observations)
+            .map(|index| {
+                started_at
+                    + Duration::from_millis(
+                        record_step_millis * u64::try_from(index).expect("record index fits u64"),
+                    )
+            })
+            .chain([retired_at, absent_observed_at])
+            .collect::<Vec<_>>()
+            .into_iter();
+        Box::new(move || observations.next().expect("scripted collector timestamp"))
+    }
+
+    fn drain_report_collector(
+        context: &Context,
+        evidence: &super::super::UnqualifiedCanaryGateEvidence,
+        retired_at: Instant,
+        absent_observed_at: Instant,
+    ) -> collector::DrainedSupervisedDeliveryReportCollector<Box<dyn FnMut() -> Instant>> {
+        let frames = encode_report_frames(&context.request, evidence);
+        let start = context.request.deadline().started_at();
+        let delivery_count = frames.len() - 1;
+        let mut observations = frames
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                if index < delivery_count {
+                    start
+                        + Duration::from_millis(
+                            10 * u64::try_from(index + 1).expect("flow index fits u64") + 1,
+                        )
+                } else {
+                    start
+                        + Duration::from_millis(
+                            10 * u64::try_from(delivery_count).expect("flow count fits u64") + 2,
+                        )
+                }
+            })
+            .chain([
+                start
+                    + Duration::from_millis(
+                        10 * u64::try_from(delivery_count).expect("flow count fits u64") + 3,
+                    ),
+                retired_at,
+                absent_observed_at,
+                absent_observed_at + Duration::from_nanos(1),
+            ])
+            .collect::<Vec<_>>()
+            .into_iter();
+        let clock: Box<dyn FnMut() -> Instant> =
+            Box::new(move || observations.next().expect("scripted collector timestamp"));
+        let (producer, collector) = prebind_report_collector(context, clock);
+        for frame in frames {
+            producer.send_frame(&frame).expect("send report frame");
+        }
+        drop(producer);
+        collector.drain().expect("drain report collector")
     }
 
     fn assert_first_error(

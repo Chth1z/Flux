@@ -7,11 +7,109 @@ use std::sync::{Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use flux_platform::{PlatformError, SeqpacketConnection, SeqpacketListener, Uid};
+use flux_platform::{PlatformError, SeqpacketConnection, SeqpacketListener, SeqpacketReceive, Uid};
 use tempfile::tempdir;
 
 const STALE_SOCKET_HELPER_ENV: &str = "FLUX_SEQPACKET_STALE_SOCKET_HELPER";
 static SIGNAL_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+#[test]
+fn anonymous_pair_preserves_record_truncation_empty_records_and_eof() {
+    let (producer, collector) = SeqpacketConnection::pair().expect("create anonymous pair");
+    let deadline = Instant::now() + Duration::from_secs(1);
+
+    producer
+        .send_packet(b"12345678")
+        .expect("send oversized record");
+    assert_eq!(
+        collector
+            .recv_record_until(4, deadline)
+            .expect("receive oversized record"),
+        Some(SeqpacketReceive::Record {
+            bytes: b"1234".to_vec(),
+            truncated: true,
+        })
+    );
+
+    producer.send_packet(b"").expect("send empty record");
+    assert_eq!(
+        collector
+            .recv_record_until(4, deadline)
+            .expect("receive empty record"),
+        Some(SeqpacketReceive::Record {
+            bytes: Vec::new(),
+            truncated: false,
+        })
+    );
+
+    drop(producer);
+    assert_eq!(
+        collector
+            .recv_record_until(4, deadline)
+            .expect("observe producer close"),
+        Some(SeqpacketReceive::Eof)
+    );
+}
+
+#[test]
+fn record_receive_returns_none_at_the_exclusive_deadline() {
+    let (_producer, collector) = SeqpacketConnection::pair().expect("create anonymous pair");
+    let started = Instant::now();
+
+    let received = collector
+        .recv_record_until(64, started + Duration::from_millis(40))
+        .expect("wait for absent record");
+
+    assert_eq!(received, None);
+    assert!(started.elapsed() >= Duration::from_millis(20));
+    assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[test]
+fn queued_empty_record_precedes_eof_after_the_producer_closes() {
+    let (producer, collector) = SeqpacketConnection::pair().expect("create anonymous pair");
+    producer.send_packet(b"").expect("send empty record");
+    drop(producer);
+    let deadline = Instant::now() + Duration::from_secs(1);
+
+    assert_eq!(
+        collector
+            .recv_record_until(64, deadline)
+            .expect("receive queued empty record"),
+        Some(SeqpacketReceive::Record {
+            bytes: Vec::new(),
+            truncated: false,
+        })
+    );
+    assert_eq!(
+        collector
+            .recv_record_until(64, deadline)
+            .expect("receive drained EOF"),
+        Some(SeqpacketReceive::Eof)
+    );
+}
+
+#[test]
+fn expired_deadline_does_not_consume_a_queued_record() {
+    let (producer, collector) = SeqpacketConnection::pair().expect("create anonymous pair");
+    producer.send_packet(b"queued").expect("send queued record");
+
+    assert_eq!(
+        collector
+            .recv_record_until(64, Instant::now())
+            .expect("observe expired deadline"),
+        None
+    );
+    assert_eq!(
+        collector
+            .recv_record_until(64, Instant::now() + Duration::from_secs(1))
+            .expect("receive preserved record"),
+        Some(SeqpacketReceive::Record {
+            bytes: b"queued".to_vec(),
+            truncated: false,
+        })
+    );
+}
 
 extern "C" fn test_signal_handler(_signal: libc::c_int) {}
 
@@ -220,6 +318,39 @@ fn accept_timeout_keeps_waiting_after_signal_interruption() {
 }
 
 #[test]
+fn record_receive_keeps_the_same_deadline_after_signal_interruption() {
+    let _serial = SIGNAL_TEST_LOCK.lock().expect("signal test lock");
+    let _handler = SignalHandlerGuard::install();
+    let (_producer, collector) = SeqpacketConnection::pair().expect("create anonymous pair");
+    let (thread_tx, thread_rx) = mpsc::channel();
+
+    let receiver = thread::spawn(move || {
+        // SAFETY: pthread_self has no pointer arguments or preconditions.
+        thread_tx
+            .send(unsafe { libc::pthread_self() } as usize)
+            .expect("publish receiver thread");
+        let started = Instant::now();
+        let received = collector
+            .recv_record_until(64, started + Duration::from_millis(80))
+            .expect("wait after signal");
+        (received, started.elapsed())
+    });
+
+    let receiver_thread = thread_rx.recv().expect("receiver thread identity");
+    thread::sleep(Duration::from_millis(20));
+    // SAFETY: `receiver_thread` names the live receiver thread and SIGUSR1 has
+    // a process-wide non-restarting handler installed for this test.
+    let kill_result =
+        unsafe { libc::pthread_kill(receiver_thread as libc::pthread_t, libc::SIGUSR1) };
+    assert_eq!(kill_result, 0);
+
+    let (received, elapsed) = receiver.join().expect("receiver thread");
+    assert_eq!(received, None);
+    assert!(elapsed >= Duration::from_millis(60));
+    assert!(elapsed < Duration::from_secs(1));
+}
+
+#[test]
 fn seqpacket_transport_preserves_request_and_response_boundaries() {
     let directory = tempdir().expect("temporary directory");
     let socket_path = directory.path().join("fluxd.sock");
@@ -240,6 +371,39 @@ fn seqpacket_transport_preserves_request_and_response_boundaries() {
         connection.recv_packet(1024).expect("receive response"),
         b"response"
     );
+
+    server.join().expect("server thread");
+}
+
+#[test]
+fn accepted_connection_preserves_an_empty_record_before_eof() {
+    let directory = tempdir().expect("temporary directory");
+    let socket_path = directory.path().join("fluxd.sock");
+    let listener = SeqpacketListener::bind(&socket_path).expect("bind listener");
+
+    let server = thread::spawn(move || {
+        let connection = listener.accept().expect("accept client");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        assert_eq!(
+            connection
+                .recv_record_until(64, deadline)
+                .expect("receive empty record"),
+            Some(SeqpacketReceive::Record {
+                bytes: Vec::new(),
+                truncated: false,
+            })
+        );
+        assert_eq!(
+            connection
+                .recv_record_until(64, deadline)
+                .expect("receive drained EOF"),
+            Some(SeqpacketReceive::Eof)
+        );
+    });
+
+    let connection = SeqpacketConnection::connect(&socket_path).expect("connect client");
+    connection.send_packet(b"").expect("send empty record");
+    drop(connection);
 
     server.join().expect("server thread");
 }
@@ -333,7 +497,12 @@ fn oversized_packet_is_reported_without_losing_message_boundaries() {
     let server = thread::spawn(move || {
         let connection = listener.accept().expect("accept client");
         let error = connection.recv_packet(4).expect_err("packet is too large");
-        assert!(error.to_string().contains("exceeds 4 bytes"));
+        match error {
+            PlatformError::PacketTooLarge { actual, limit } => {
+                assert_eq!((actual, limit), (8, 4));
+            }
+            error => panic!("unexpected receive error: {error}"),
+        }
     });
 
     let connection = SeqpacketConnection::connect(&socket_path).expect("connect client");

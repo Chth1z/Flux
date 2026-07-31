@@ -7,13 +7,14 @@ use super::compiler::{
     ENGINE_CONFIG_DIGEST_BYTES, EngineConfigLaunchBinding, EngineConfigLaunchBindingDigest,
     length_bytes,
 };
+use super::supervised_delivery_report_contract::EngineSupervisedDeliveryReportContract;
 use crate::engine_supervisor::{EngineCapabilityProbeError, EngineCapabilityProbeErrorKind};
 use crate::{EngineArtifactSetIdentity, EngineSpec};
 
-pub(crate) const ENGINE_CAPABILITY_PROFILE_SCHEMA_VERSION: u16 = 2;
+pub(crate) const ENGINE_CAPABILITY_PROFILE_SCHEMA_VERSION: u16 = 3;
 
 const ENGINE_CAPABILITY_PROFILE_DIGEST_DOMAIN: &[u8] =
-    b"Flux Sing-Box Engine Capability Profile\0sha256-v2\0";
+    b"Flux Sing-Box Engine Capability Profile\0sha256-v3\0";
 const SING_BOX_VERSION_PREFIX: &str = "sing-box version ";
 const MAX_SING_BOX_RELEASE_BYTES: usize = 128;
 
@@ -87,18 +88,44 @@ impl SingBoxBuildIdentity {
 
 /// Minimal immutable profile for the first canonical TPROXY Generation candidate.
 ///
-/// Schema 2 proves only parsed exact-build identity and descriptor-pinned acceptance of the exact
-/// config binding. Every other engine feature remains unclaimed.
+/// Schema 3 proves parsed exact-build identity and descriptor-pinned acceptance of the exact config
+/// binding, and explicitly records whether the artifact claims the sealed supervised-report
+/// contract. Production collection currently leaves that capability absent.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct EngineCapabilityProfile {
     artifacts: EngineArtifactSetIdentity,
     validated_binding: EngineConfigLaunchBindingDigest,
     version: SingBoxVersionIdentity,
     build: SingBoxBuildIdentity,
+    supervised_delivery_report: Option<EngineSupervisedDeliveryReportContract>,
     revision: EngineCapabilityProfileRevision,
 }
 
 impl EngineCapabilityProfile {
+    fn from_parts(
+        artifacts: EngineArtifactSetIdentity,
+        validated_binding: EngineConfigLaunchBindingDigest,
+        version: SingBoxVersionIdentity,
+        build: SingBoxBuildIdentity,
+        supervised_delivery_report: Option<EngineSupervisedDeliveryReportContract>,
+    ) -> Self {
+        let revision = EngineCapabilityProfileRevision(digest_engine_capability_profile(
+            validated_binding,
+            artifacts,
+            &version,
+            &build,
+            supervised_delivery_report,
+        ));
+        Self {
+            artifacts,
+            validated_binding,
+            version,
+            build,
+            supervised_delivery_report,
+            revision,
+        }
+    }
+
     #[cfg(test)]
     #[must_use]
     pub(crate) const fn schema_version(&self) -> u16 {
@@ -130,6 +157,13 @@ impl EngineCapabilityProfile {
     #[must_use]
     pub(crate) const fn revision(&self) -> EngineCapabilityProfileRevision {
         self.revision
+    }
+
+    #[must_use]
+    pub(crate) const fn supervised_delivery_report(
+        &self,
+    ) -> Option<EngineSupervisedDeliveryReportContract> {
+        self.supervised_delivery_report
     }
 }
 
@@ -223,16 +257,13 @@ pub(crate) fn collect_tproxy_engine_capability_profile(
     debug_assert_eq!(probe.artifacts(), binding.artifacts());
     let (version, build) =
         parse_sing_box_version_output(probe.version_stdout(), probe.version_stderr())?;
-    let revision = EngineCapabilityProfileRevision(digest_engine_capability_profile(
-        binding, &version, &build,
-    ));
-    Ok(EngineCapabilityProfile {
-        artifacts: probe.artifacts(),
-        validated_binding: binding.digest(),
+    Ok(EngineCapabilityProfile::from_parts(
+        probe.artifacts(),
+        binding.digest(),
         version,
         build,
-        revision,
-    })
+        None,
+    ))
 }
 
 #[cfg(test)]
@@ -241,17 +272,33 @@ pub(crate) fn rebind_engine_capability_profile_fixture(
     binding: &EngineConfigLaunchBinding,
 ) -> EngineCapabilityProfile {
     assert_eq!(profile.artifacts, binding.artifacts());
-    let revision = EngineCapabilityProfileRevision(digest_engine_capability_profile(
-        binding,
-        &profile.version,
-        &profile.build,
-    ));
-    EngineCapabilityProfile {
-        artifacts: profile.artifacts,
-        validated_binding: binding.digest(),
-        version: profile.version,
-        build: profile.build,
-        revision,
+    EngineCapabilityProfile::from_parts(
+        profile.artifacts,
+        binding.digest(),
+        profile.version,
+        profile.build,
+        profile.supervised_delivery_report,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn declare_supervised_delivery_report_profile_fixture(
+    profile: EngineCapabilityProfile,
+) -> EngineCapabilityProfile {
+    EngineCapabilityProfile::from_parts(
+        profile.artifacts,
+        profile.validated_binding,
+        profile.version,
+        profile.build,
+        Some(EngineSupervisedDeliveryReportContract::schema_v1_fixture()),
+    )
+}
+
+#[cfg(test)]
+impl EngineCapabilityProfileRevision {
+    #[must_use]
+    pub(crate) const fn from_fixture_bytes(bytes: [u8; ENGINE_CONFIG_DIGEST_BYTES]) -> Self {
+        Self(bytes)
     }
 }
 
@@ -375,9 +422,11 @@ fn engine_version_output_error(kind: EngineVersionOutputErrorKind) -> EngineCapa
 }
 
 fn digest_engine_capability_profile(
-    binding: &EngineConfigLaunchBinding,
+    validated_binding: EngineConfigLaunchBindingDigest,
+    artifacts: EngineArtifactSetIdentity,
     version: &SingBoxVersionIdentity,
     build: &SingBoxBuildIdentity,
+    supervised_delivery_report: Option<EngineSupervisedDeliveryReportContract>,
 ) -> [u8; ENGINE_CONFIG_DIGEST_BYTES] {
     let mut digest = Sha256::new();
     digest.update(ENGINE_CAPABILITY_PROFILE_DIGEST_DOMAIN);
@@ -385,8 +434,7 @@ fn digest_engine_capability_profile(
         &mut digest,
         &ENGINE_CAPABILITY_PROFILE_SCHEMA_VERSION.to_be_bytes(),
     );
-    update_length_prefixed(&mut digest, binding.digest().as_bytes());
-    let artifacts = binding.artifacts();
+    update_length_prefixed(&mut digest, validated_binding.as_bytes());
     update_length_prefixed(&mut digest, artifacts.binary().as_bytes());
     update_length_prefixed(&mut digest, artifacts.config().as_bytes());
     update_length_prefixed(&mut digest, version.release().as_bytes());
@@ -395,6 +443,13 @@ fn digest_engine_capability_profile(
     update_length_prefixed(&mut digest, &version.patch().to_be_bytes());
     update_length_prefixed(&mut digest, build.stdout().as_bytes());
     update_length_prefixed(&mut digest, build.stderr().as_bytes());
+    match supervised_delivery_report {
+        None => update_length_prefixed(&mut digest, &[0]),
+        Some(contract) => {
+            update_length_prefixed(&mut digest, &[1]);
+            contract.update_revision_digest(&mut digest);
+        }
+    }
     digest.finalize().into()
 }
 

@@ -7,6 +7,7 @@ mod desired_state;
 mod engine_profile;
 #[cfg(test)]
 mod generation_record;
+mod supervised_delivery_report_contract;
 
 #[allow(
     unused_imports,
@@ -55,6 +56,7 @@ use engine_profile::parse_sing_box_version_output;
 pub(crate) use engine_profile::*;
 #[cfg(test)]
 pub(crate) use generation_record::*;
+pub(crate) use supervised_delivery_report_contract::*;
 
 #[cfg(test)]
 mod tests;

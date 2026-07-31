@@ -27,9 +27,10 @@ use super::capture_path_selection::{
     CapturePathSelectionError, CapturePathSelectionInput, PRODUCTION_CAPTURE_PATH_SELECTOR,
 };
 use super::{
-    DesiredStateArtifacts, EngineCapabilityProfile, EngineConfigBindingError,
-    SelectedEngineSourceIdentity, TproxyGenerationCandidate, TproxyGenerationCandidateError,
-    bind_engine_config_to_spec, compile_tproxy_generation_candidate,
+    DesiredStateArtifacts, EngineCapabilityProfile, EngineCapabilityProfileRevision,
+    EngineConfigBindingError, SelectedEngineSourceIdentity, TproxyGenerationCandidate,
+    TproxyGenerationCandidateError, bind_engine_config_to_spec,
+    compile_tproxy_generation_candidate,
 };
 use crate::{EngineSpec, RestartPolicy, RestartPolicyError};
 
@@ -322,6 +323,11 @@ impl AdmittedGeneration {
     #[must_use]
     pub(crate) const fn generation(&self) -> GenerationId {
         self.identity.generation
+    }
+
+    #[must_use]
+    pub(crate) const fn engine_profile_revision(&self) -> EngineCapabilityProfileRevision {
+        self.candidate.engine_profile().revision()
     }
 
     #[cfg(test)]

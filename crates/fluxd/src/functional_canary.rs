@@ -20,6 +20,9 @@ use flux_platform::socket_diagnostics::{
 use sha2::{Digest, Sha256};
 
 use crate::engine_supervisor::EngineChildAuthority;
+use crate::generation_engine_config::{
+    ENGINE_SUPERVISED_DELIVERY_REPORT_SCHEMA_VERSION, EngineCapabilityProfileRevision,
+};
 use crate::{EngineArtifactSetIdentity, EngineSpec, OwnedEngineIdentity};
 
 pub(crate) const FUNCTIONAL_CANARY_SCHEMA_VERSION: u16 = 2;
@@ -39,7 +42,6 @@ pub(crate) const CANARY_LISTENER_ROLE_SLOTS: usize = 4;
 pub(crate) const CANARY_FACILITY_AUDIT_DIGEST_BYTES: usize = 32;
 pub(crate) const CAPTURE_OWNER_RECORD_DIGEST_BYTES: usize = 32;
 pub(crate) const CANARY_CREDENTIAL_MAP_DIGEST_BYTES: usize = 32;
-pub(crate) const CANARY_INBOUND_DELIVERY_REPORT_SCHEMA_VERSION: u16 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FunctionalCanaryGateMode {
@@ -1028,6 +1030,7 @@ pub(crate) struct CanaryEngineBinding {
     generation: GenerationId,
     engine: OwnedEngineIdentity,
     engine_snapshot_revision: NonZeroU64,
+    engine_profile_revision: EngineCapabilityProfileRevision,
     artifacts: EngineArtifactSetIdentity,
     listener: CanaryListenerIdentity,
 }
@@ -1038,6 +1041,7 @@ impl CanaryEngineBinding {
         pid: NonZeroU32,
         start_time_ticks: NonZeroU64,
         engine_snapshot_revision: NonZeroU64,
+        engine_profile_revision: EngineCapabilityProfileRevision,
         spec: &EngineSpec,
         readiness: &ReadinessEvidence,
     ) -> Result<Self, CanaryBindingError> {
@@ -1045,6 +1049,7 @@ impl CanaryEngineBinding {
             generation,
             OwnedEngineIdentity::new(pid, start_time_ticks),
             engine_snapshot_revision,
+            engine_profile_revision,
             spec,
             readiness,
         )
@@ -1054,6 +1059,7 @@ impl CanaryEngineBinding {
         generation: GenerationId,
         engine: OwnedEngineIdentity,
         engine_snapshot_revision: NonZeroU64,
+        engine_profile_revision: EngineCapabilityProfileRevision,
         spec: &EngineSpec,
         readiness: &ReadinessEvidence,
     ) -> Result<Self, CanaryBindingError> {
@@ -1070,6 +1076,7 @@ impl CanaryEngineBinding {
             generation,
             engine,
             engine_snapshot_revision,
+            engine_profile_revision,
             artifacts: spec.artifacts(),
             listener,
         })
@@ -1088,6 +1095,11 @@ impl CanaryEngineBinding {
     #[must_use]
     pub(crate) const fn engine_snapshot_revision(&self) -> NonZeroU64 {
         self.engine_snapshot_revision
+    }
+
+    #[must_use]
+    pub(crate) const fn engine_profile_revision(&self) -> EngineCapabilityProfileRevision {
+        self.engine_profile_revision
     }
 
     #[must_use]
@@ -2521,6 +2533,7 @@ impl CanaryListenerSocketObservation {
 pub(crate) enum CanaryInboundDeliveryAuthority {
     SupervisedEngineReport {
         engine: OwnedEngineIdentity,
+        engine_profile_revision: EngineCapabilityProfileRevision,
         report_object: CanaryAttemptObjectIdentity,
         schema_version: NonZeroU16,
     },
@@ -3971,17 +3984,19 @@ fn validate_tproxy_listener_socket(
     let delivery_authority_valid = match delivery_event.authority {
         CanaryInboundDeliveryAuthority::SupervisedEngineReport {
             engine: observed_engine,
+            engine_profile_revision,
             report_object,
             schema_version,
         } => {
             observed_engine == engine.engine()
+                && engine_profile_revision == engine.engine_profile_revision()
                 && report_object
                     == request
                         .pre_binding
                         .environment
                         .attempt_objects
                         .listener_delivery_report
-                && schema_version.get() == CANARY_INBOUND_DELIVERY_REPORT_SCHEMA_VERSION
+                && schema_version.get() == ENGINE_SUPERVISED_DELIVERY_REPORT_SCHEMA_VERSION
         }
         CanaryInboundDeliveryAuthority::QualifiedCgroupBpf { observer } => {
             observer == expected_observer
@@ -4806,6 +4821,7 @@ fn bounded_prefix(diagnostic: &str) -> String {
 }
 
 pub(crate) mod local_output;
+mod supervised_delivery_report;
 
 #[cfg(all(test, any(target_os = "linux", target_os = "android")))]
 mod linux_namespace_harness;
@@ -6071,6 +6087,21 @@ pub(crate) mod tests {
             CanaryEvidenceError::InboundListenerDeliveryAuthorityMismatch { flow }
         );
 
+        let mut profile_revision = fixture.successful_evidence();
+        let CanaryInboundDeliveryAuthority::SupervisedEngineReport {
+            engine_profile_revision,
+            ..
+        } = &mut tproxy_delivery_event_mut(&mut profile_revision, flow).authority
+        else {
+            panic!("fixture uses supervised engine reports");
+        };
+        *engine_profile_revision = EngineCapabilityProfileRevision::from_fixture_bytes([0x52; 32]);
+        assert_eq!(
+            validate(&fixture, profile_revision)
+                .expect_err("another engine profile cannot own the delivery report"),
+            CanaryEvidenceError::InboundListenerDeliveryAuthorityMismatch { flow }
+        );
+
         let mut report_object = fixture.successful_evidence();
         let CanaryInboundDeliveryAuthority::SupervisedEngineReport {
             report_object: observed_object,
@@ -7203,6 +7234,31 @@ pub(crate) mod tests {
         start_time_ticks: NonZeroU64,
         engine_snapshot_revision: NonZeroU64,
     ) -> CanaryAttemptRequest {
+        request_with_engine_profile_revision(
+            spec,
+            families,
+            started_at,
+            nonce,
+            generation,
+            pid,
+            start_time_ticks,
+            engine_snapshot_revision,
+            EngineCapabilityProfileRevision::from_fixture_bytes([0x51; 32]),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn request_with_engine_profile_revision(
+        spec: &EngineSpec,
+        families: CanaryAddressFamilies,
+        started_at: Instant,
+        nonce: CanaryNonce,
+        generation: GenerationId,
+        pid: NonZeroU32,
+        start_time_ticks: NonZeroU64,
+        engine_snapshot_revision: NonZeroU64,
+        engine_profile_revision: EngineCapabilityProfileRevision,
+    ) -> CanaryAttemptRequest {
         let readiness = ReadinessEvidence::Listener {
             port: NonZeroU16::new(1536).expect("nonzero listener port"),
             table: PathBuf::from(format!("/proc/{}/net/tcp", pid.get())),
@@ -7212,6 +7268,7 @@ pub(crate) mod tests {
             pid,
             start_time_ticks,
             engine_snapshot_revision,
+            engine_profile_revision,
             spec,
             &readiness,
         )
@@ -7616,12 +7673,13 @@ pub(crate) mod tests {
         let delivery_event = CanaryInboundDeliveryEvent::new(
             CanaryInboundDeliveryAuthority::SupervisedEngineReport {
                 engine: request.pre_binding.engine.engine(),
+                engine_profile_revision: request.pre_binding.engine.engine_profile_revision(),
                 report_object: request
                     .pre_binding
                     .environment
                     .attempt_objects
                     .listener_delivery_report,
-                schema_version: NonZeroU16::new(CANARY_INBOUND_DELIVERY_REPORT_SCHEMA_VERSION)
+                schema_version: NonZeroU16::new(ENGINE_SUPERVISED_DELIVERY_REPORT_SCHEMA_VERSION)
                     .expect("listener delivery report schema is nonzero"),
             },
             NonZeroU64::new(1_000 + flow_index_u64).expect("delivery event sequence"),

@@ -40,9 +40,10 @@ use super::{
     TproxyEngineConfigRequest, TproxyGenerationCandidateErrorKind, bind_engine_config_to_spec,
     bind_engine_spec_to_desired_state, collect_tproxy_engine_capability_profile,
     compile_desired_state, compile_desired_state_capture, compile_tproxy_engine_config,
-    compile_tproxy_generation_candidate, parse_sing_box_version_output,
-    qualified_xtables_capture_path_evidence, qualified_xtables_kernel_config,
-    rebind_engine_capability_profile_fixture, reconstruct_canonical_tproxy_engine_config,
+    compile_tproxy_generation_candidate, declare_supervised_delivery_report_profile_fixture,
+    parse_sing_box_version_output, qualified_xtables_capture_path_evidence,
+    qualified_xtables_kernel_config, rebind_engine_capability_profile_fixture,
+    reconstruct_canonical_tproxy_engine_config,
 };
 use crate::engine_supervisor::EngineCapabilityProbeError;
 use crate::{EngineSpec, MAX_ENGINE_CONFIG_BYTES, RestartPolicy};
@@ -472,9 +473,38 @@ fn collects_exact_binary_profile_and_pins_its_revision() {
     assert_eq!(profile.build().stderr(), "Tags: with_quic,with_wireguard\n");
     assert_eq!(
         profile.revision().to_string(),
-        "101e9beb5376b8e48f0d5f09f41515ab2e2305e7914f64fac75f05617962a918"
+        "9c7e6eabd63dab8a8b052dfa2fa242685759578e1351419706ca5a14dbe558a3"
     );
     assert_eq!(profile.revision().as_bytes().len(), 32);
+    assert_eq!(profile.supervised_delivery_report(), None);
+}
+
+#[test]
+fn supervised_report_fixture_changes_and_pins_the_complete_profile_revision() {
+    let (binding, profile, _fixture) = collected_profile();
+    let baseline_revision = profile.revision();
+    let declared = declare_supervised_delivery_report_profile_fixture(profile);
+    let contract = declared
+        .supervised_delivery_report()
+        .expect("test fixture declares the sealed report producer");
+
+    assert!(contract.is_canonical_schema_v1());
+    assert_eq!(
+        contract.schema_version().get(),
+        super::ENGINE_SUPERVISED_DELIVERY_REPORT_SCHEMA_VERSION
+    );
+    assert_ne!(declared.revision(), baseline_revision);
+    assert_eq!(
+        declared.revision().to_string(),
+        "9e558abe4c595cdba51f4c05e0987cd9115011be2da5dde1cdbb48475517e472"
+    );
+    assert_eq!(declared.artifacts(), binding.artifacts());
+    assert_eq!(declared.validated_binding(), binding.digest());
+    assert_eq!(
+        declare_supervised_delivery_report_profile_fixture(declared.clone()).revision(),
+        declared.revision(),
+        "redeclaring the same sealed contract is revision-stable"
+    );
 }
 
 #[test]

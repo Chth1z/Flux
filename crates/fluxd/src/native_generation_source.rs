@@ -27,8 +27,6 @@ use flux_platform::{
     XtablesLocalOutputRoutingSpec,
 };
 
-#[cfg(test)]
-use crate::generation_engine_config::rebind_engine_capability_profile_fixture;
 use crate::generation_engine_config::{
     AddressReconciledGenerationInputs, AddressReconciliationError, AddressReconciliationInspection,
     AdmittedGeneration, AdmittedGenerationIdentity, CapturePathDecision,
@@ -38,6 +36,10 @@ use crate::generation_engine_config::{
     GenerationPlanningAuthority, SelectedEngineSource, TproxyEngineConfigRequest,
     bind_engine_config_to_spec, collect_tproxy_engine_capability_profile,
     compile_address_reconciliation, compile_tproxy_engine_config, read_bounded_regular_file,
+};
+#[cfg(test)]
+use crate::generation_engine_config::{
+    EngineCapabilityProfileRevision, rebind_engine_capability_profile_fixture,
 };
 #[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
 use crate::generation_engine_config::{
@@ -789,6 +791,7 @@ where
             ));
         }
         let identity = admitted.identity();
+        let engine_profile_revision = admitted.engine_profile_revision();
         let capture_path_selection = admitted.capture_path_selection();
         let capture_path_evidence_deadline = admitted.capture_path_evidence_deadline();
         let target = self
@@ -806,6 +809,7 @@ where
         Ok(PreparedNativeGeneration::new(
             expected_generation,
             spec,
+            engine_profile_revision,
             capture_path_selection,
             capture_path_evidence_deadline,
             target,
@@ -1267,6 +1271,7 @@ esac
     #[derive(Default)]
     struct RecordingAdmission {
         admitted_sources: Vec<SelectedEngineSourceIdentity>,
+        admitted_engine_profile_revisions: Vec<EngineCapabilityProfileRevision>,
     }
 
     impl NativeGenerationTargetAdmission for RecordingAdmission {
@@ -1275,6 +1280,8 @@ esac
 
         fn admit(&mut self, generation: AdmittedGeneration) -> Result<Self::Target, Self::Error> {
             self.admitted_sources.push(generation.engine_source());
+            self.admitted_engine_profile_revisions
+                .push(generation.engine_profile_revision());
             Ok(u64::from(generation.generation().get()))
         }
     }
@@ -1494,6 +1501,11 @@ esac
         assert_eq!(
             prepared.runtime().capture_path_evidence_deadline(),
             fixture.capture_path_evidence_deadline
+        );
+        assert_eq!(
+            prepared.runtime().engine_profile_revision(),
+            fixture.source.admission.admitted_engine_profile_revisions[0],
+            "the exact admitted engine profile revision reaches runtime canary binding"
         );
     }
 

@@ -23,6 +23,7 @@ use crate::functional_canary::{
 };
 use crate::generation_engine_config::{
     AddressReconciler, AddressReconciliationOutcome, CapturePathDecision, CapturePathSelection,
+    EngineCapabilityProfileRevision,
 };
 #[cfg(test)]
 use crate::generation_engine_config::{AdmittedGeneration, PreparedGenerationRecord};
@@ -50,6 +51,7 @@ pub(crate) enum PublishedRuntimeState {
 pub(crate) struct PreparedGeneration {
     id: GenerationId,
     spec: EngineSpec,
+    engine_profile_revision: EngineCapabilityProfileRevision,
     capture_path_selection: CapturePathSelection,
     capture_path_evidence_deadline: Instant,
 }
@@ -59,12 +61,14 @@ impl PreparedGeneration {
     pub(crate) fn new(
         id: GenerationId,
         spec: EngineSpec,
+        engine_profile_revision: EngineCapabilityProfileRevision,
         capture_path_selection: CapturePathSelection,
         capture_path_evidence_deadline: Instant,
     ) -> Self {
         Self {
             id,
             spec,
+            engine_profile_revision,
             capture_path_selection,
             capture_path_evidence_deadline,
         }
@@ -73,6 +77,11 @@ impl PreparedGeneration {
     #[must_use]
     pub(crate) const fn id(&self) -> GenerationId {
         self.id
+    }
+
+    #[must_use]
+    pub(crate) const fn engine_profile_revision(&self) -> EngineCapabilityProfileRevision {
+        self.engine_profile_revision
     }
 
     const fn runtime_binding(&self) -> RuntimeGenerationBinding {
@@ -2444,6 +2453,7 @@ where
             generation.id,
             identity,
             revision,
+            generation.engine_profile_revision(),
             &generation.spec,
             readiness,
         )
@@ -4493,6 +4503,7 @@ mod tests {
             generation: Box::new(PreparedGeneration::new(
                 generation(1),
                 fixture.spec.clone(),
+                test_engine_profile_revision(),
                 capture_path_selection,
                 qualified_xtables_capture_path_evidence().valid_until(),
             )),
@@ -4682,6 +4693,7 @@ mod tests {
             generation: Box::new(PreparedGeneration::new(
                 generation(1),
                 active.spec.clone(),
+                test_engine_profile_revision(),
                 capture_path_selection,
                 qualified_xtables_capture_path_evidence().valid_until(),
             )),
@@ -7202,6 +7214,10 @@ mod tests {
         GenerationId::new(value).expect("test generation must be nonzero")
     }
 
+    fn test_engine_profile_revision() -> EngineCapabilityProfileRevision {
+        EngineCapabilityProfileRevision::from_fixture_bytes([0x51; 32])
+    }
+
     struct ScriptedWriter {
         events: Arc<Mutex<Vec<Event>>>,
         prepared: VecDeque<EngineSpec>,
@@ -7519,6 +7535,7 @@ mod tests {
             Ok(PreparedGeneration::new(
                 id,
                 spec,
+                test_engine_profile_revision(),
                 test_xtables_capture_path_selection(),
                 qualified_xtables_capture_path_evidence().valid_until(),
             ))

@@ -12,6 +12,7 @@ use flux_platform::{NativeXtablesCaptureConverger, NativeXtablesCaptureTarget};
 
 use crate::generation_engine_config::{
     AddressReconciledGenerationInputs, CapturePathDecision, CapturePathSelection,
+    EngineCapabilityProfileRevision,
 };
 use crate::runtime_coordinator::{
     AddressResyncStrategy, PreparedGeneration, PublishedRuntimeState, RuntimeCoordinator,
@@ -40,6 +41,7 @@ impl<T> PreparedNativeGeneration<T> {
     pub(crate) fn new(
         id: GenerationId,
         spec: EngineSpec,
+        engine_profile_revision: EngineCapabilityProfileRevision,
         capture_path_selection: CapturePathSelection,
         capture_path_evidence_deadline: Instant,
         target: T,
@@ -48,6 +50,7 @@ impl<T> PreparedNativeGeneration<T> {
             runtime: PreparedGeneration::new(
                 id,
                 spec,
+                engine_profile_revision,
                 capture_path_selection,
                 capture_path_evidence_deadline,
             ),
@@ -932,10 +935,15 @@ mod tests {
         PreparedNativeGeneration::new(
             GenerationId::new(id).expect("nonzero native Generation"),
             fixture.spec.clone(),
+            test_engine_profile_revision(),
             test_xtables_capture_path_selection(),
             qualified_xtables_capture_path_evidence().valid_until(),
             ScriptedTarget(u64::from(id)),
         )
+    }
+
+    fn test_engine_profile_revision() -> EngineCapabilityProfileRevision {
+        EngineCapabilityProfileRevision::from_fixture_bytes([0x31; 32])
     }
 
     fn writer(
@@ -1007,6 +1015,7 @@ mod tests {
         let mismatched = PreparedNativeGeneration::new(
             GenerationId::INITIAL,
             fixture.spec.clone(),
+            test_engine_profile_revision(),
             test_xtables_capture_path_selection(),
             qualified_xtables_capture_path_evidence().valid_until(),
             ScriptedTarget(2),
@@ -1100,6 +1109,7 @@ mod tests {
         let other = PreparedGeneration::new(
             GenerationId::new(2).expect("nonzero mismatched Generation"),
             mismatched.spec,
+            test_engine_profile_revision(),
             test_xtables_capture_path_selection(),
             qualified_xtables_capture_path_evidence().valid_until(),
         );

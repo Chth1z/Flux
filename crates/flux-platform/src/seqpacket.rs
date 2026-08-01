@@ -48,7 +48,11 @@ pub struct PeerCredentials {
 #[derive(Debug, Eq, PartialEq)]
 pub enum SeqpacketReceive {
     /// One complete or prefix-truncated record.
-    Record { bytes: Vec<u8>, truncated: bool },
+    Record {
+        bytes: Vec<u8>,
+        truncated: bool,
+        credentials: PeerCredentials,
+    },
     /// Every peer descriptor has been closed and all queued records are drained.
     Eof,
 }
@@ -242,10 +246,43 @@ mod implementation {
             bytes: Vec<u8>,
             actual: usize,
             truncated: bool,
-            #[cfg(test)]
-            control_truncated: bool,
+            control: ReceivedRecordControl,
         },
         Eof,
+    }
+
+    #[derive(Debug, Default)]
+    struct ReceivedRecordControl {
+        credentials: Option<PeerCredentials>,
+        credential_messages: usize,
+        invalid_credentials: bool,
+        unexpected_messages: usize,
+        truncated: bool,
+    }
+
+    impl ReceivedRecordControl {
+        fn require_canonical_credentials(self) -> Result<PeerCredentials, PlatformError> {
+            if self.truncated {
+                return Err(protocol_error("truncated Unix seqpacket control data"));
+            }
+            if self.invalid_credentials {
+                return Err(protocol_error(
+                    "invalid Unix seqpacket SCM_CREDENTIALS payload",
+                ));
+            }
+            if self.unexpected_messages != 0 {
+                return Err(protocol_error("unexpected Unix seqpacket ancillary data"));
+            }
+            if self.credential_messages != 1 {
+                return Err(protocol_error(if self.credential_messages == 0 {
+                    "missing Unix seqpacket SCM_CREDENTIALS"
+                } else {
+                    "duplicate Unix seqpacket SCM_CREDENTIALS"
+                }));
+            }
+            self.credentials
+                .ok_or_else(|| protocol_error("invalid Unix seqpacket SCM_CREDENTIALS payload"))
+        }
     }
 
     impl SeqpacketConnection {
@@ -319,8 +356,9 @@ mod implementation {
                     bytes,
                     actual,
                     truncated,
-                    ..
+                    control,
                 } => {
+                    control.require_canonical_credentials()?;
                     if truncated {
                         return Err(PlatformError::PacketTooLarge { actual, limit });
                     }
@@ -374,9 +412,17 @@ mod implementation {
 
                 match self.recv_record(limit, libc::MSG_DONTWAIT) {
                     Ok(RawSeqpacketReceive::Record {
-                        bytes, truncated, ..
+                        bytes,
+                        truncated,
+                        control,
+                        ..
                     }) => {
-                        return Ok(Some(SeqpacketReceive::Record { bytes, truncated }));
+                        let credentials = control.require_canonical_credentials()?;
+                        return Ok(Some(SeqpacketReceive::Record {
+                            bytes,
+                            truncated,
+                            credentials,
+                        }));
                     }
                     Ok(RawSeqpacketReceive::Eof) => return Ok(Some(SeqpacketReceive::Eof)),
                     Err(PlatformError::SystemCall { source, .. })
@@ -424,10 +470,9 @@ mod implementation {
                 // The kernel must never report more control data than the supplied buffer. Close
                 // every descriptor that can be parsed from the complete buffer before rejecting
                 // an impossible length so even this defensive path cannot leak installed rights.
-                close_received_file_descriptors(control_bytes, true)?;
+                inspect_received_record_control(control_bytes, true)?;
                 return Err(protocol_error("invalid Unix seqpacket control length"));
             };
-            close_received_file_descriptors(received_control, control_truncated)?;
             let actual = usize::try_from(received).map_err(|_| {
                 system_call_error(
                     "receive Unix seqpacket message",
@@ -437,9 +482,10 @@ mod implementation {
             // Linux does not set MSG_EOR on an empty AF_UNIX seqpacket record.
             // SO_PASSCRED supplies a control message for every real record,
             // including an empty one, while drained EOF has no control data.
-            if actual == 0 && message.msg_controllen == 0 {
+            if actual == 0 && message.msg_controllen == 0 && !control_truncated {
                 return Ok(RawSeqpacketReceive::Eof);
             }
+            let control = inspect_received_record_control(received_control, control_truncated)?;
 
             let stored = actual.min(limit);
             bytes.truncate(stored);
@@ -447,8 +493,7 @@ mod implementation {
                 bytes,
                 actual,
                 truncated: actual > limit || message.msg_flags & libc::MSG_TRUNC != 0,
-                #[cfg(test)]
-                control_truncated,
+                control,
             })
         }
 
@@ -598,11 +643,15 @@ mod implementation {
         }
     }
 
-    fn close_received_file_descriptors(
+    fn inspect_received_record_control(
         control: &[u8],
         control_truncated: bool,
-    ) -> Result<(), PlatformError> {
+    ) -> Result<ReceivedRecordControl, PlatformError> {
         let header_length = control_message_header_length()?;
+        let mut inspection = ReceivedRecordControl {
+            truncated: control_truncated,
+            ..ReceivedRecordControl::default()
+        };
         let mut header_offset = 0_usize;
 
         while control.len().saturating_sub(header_offset) >= header_length {
@@ -634,28 +683,72 @@ mod implementation {
             let payload_offset = header_offset
                 .checked_add(header_length)
                 .ok_or_else(|| protocol_error("Unix seqpacket control offset overflow"))?;
-            if level == libc::SOL_SOCKET && kind == libc::SCM_RIGHTS {
-                close_descriptor_payload(&control[payload_offset..available_end])?;
+            let payload = &control[payload_offset..available_end];
+            match (level, kind) {
+                (libc::SOL_SOCKET, libc::SCM_RIGHTS) => {
+                    close_descriptor_payload(payload)?;
+                    inspection.unexpected_messages = inspection
+                        .unexpected_messages
+                        .checked_add(1)
+                        .ok_or_else(|| protocol_error("Unix seqpacket control count overflow"))?;
+                }
+                (libc::SOL_SOCKET, libc::SCM_CREDENTIALS) => {
+                    inspection.credential_messages = inspection
+                        .credential_messages
+                        .checked_add(1)
+                        .ok_or_else(|| protocol_error("Unix seqpacket control count overflow"))?;
+                    if reported_end > control.len() {
+                        inspection.invalid_credentials = true;
+                    } else {
+                        match parse_record_credentials(payload) {
+                            Some(credentials) => {
+                                inspection.credentials.get_or_insert(credentials);
+                            }
+                            None => inspection.invalid_credentials = true,
+                        }
+                    }
+                }
+                _ => {
+                    inspection.unexpected_messages = inspection
+                        .unexpected_messages
+                        .checked_add(1)
+                        .ok_or_else(|| protocol_error("Unix seqpacket control count overflow"))?;
+                }
             }
+
             if reported_end > control.len() {
                 return if control_truncated {
-                    Ok(())
+                    Ok(inspection)
                 } else {
                     Err(protocol_error("truncated Unix seqpacket control message"))
                 };
             }
-
             let aligned_length = checked_control_message_align(cmsg_len)
                 .ok_or_else(|| protocol_error("Unix seqpacket control alignment overflow"))?;
             let next_offset = header_offset
                 .checked_add(aligned_length)
                 .ok_or_else(|| protocol_error("Unix seqpacket control offset overflow"))?;
             if control.len().saturating_sub(next_offset) < header_length {
-                return Ok(());
+                break;
             }
             header_offset = next_offset;
         }
-        Ok(())
+        Ok(inspection)
+    }
+
+    fn parse_record_credentials(payload: &[u8]) -> Option<PeerCredentials> {
+        if payload.len() != std::mem::size_of::<libc::ucred>() {
+            return None;
+        }
+        let raw_pid = read_control_c_int(payload, offset_of!(libc::ucred, pid))?;
+        let pid = u32::try_from(raw_pid).ok().filter(|pid| *pid != 0)?;
+        let uid = read_control_u32(payload, offset_of!(libc::ucred, uid))?;
+        let uid = Uid::from_raw(uid)?;
+        let gid = read_control_u32(payload, offset_of!(libc::ucred, gid))?;
+        if gid == u32::MAX {
+            return None;
+        }
+        Some(PeerCredentials { pid, uid, gid })
     }
 
     fn close_descriptor_payload(payload: &[u8]) -> Result<(), PlatformError> {
@@ -691,6 +784,13 @@ mod implementation {
     fn read_control_c_int(control: &[u8], offset: usize) -> Option<libc::c_int> {
         let end = offset.checked_add(std::mem::size_of::<libc::c_int>())?;
         Some(libc::c_int::from_ne_bytes(
+            control.get(offset..end)?.try_into().ok()?,
+        ))
+    }
+
+    fn read_control_u32(control: &[u8], offset: usize) -> Option<u32> {
+        let end = offset.checked_add(std::mem::size_of::<u32>())?;
+        Some(u32::from_ne_bytes(
             control.get(offset..end)?.try_into().ok()?,
         ))
     }
@@ -803,6 +903,7 @@ mod implementation {
             if accepted >= 0 {
                 // SAFETY: a successful `accept4` returns a new owned descriptor.
                 let accepted_fd = unsafe { OwnedFd::from_raw_fd(accepted) };
+                enable_record_credentials(accepted_fd.as_raw_fd())?;
                 return Ok(SeqpacketConnection { fd: accepted_fd });
             }
             let source = std::io::Error::last_os_error();
@@ -984,10 +1085,95 @@ mod implementation {
         use std::time::{Duration, Instant};
 
         use super::{
-            RECEIVE_CONTROL_WORDS, RawSeqpacketReceive, SeqpacketConnection,
+            RECEIVE_CONTROL_WORDS, RawSeqpacketReceive, SeqpacketConnection, control_buffer_bytes,
             control_message_header_length, control_message_length, control_message_space,
+            inspect_received_record_control,
         };
-        use crate::seqpacket::SeqpacketReceive;
+        use crate::seqpacket::{PeerCredentials, Uid};
+
+        #[test]
+        fn record_control_requires_one_canonical_kernel_credential() {
+            let credentials = current_credentials();
+            let canonical = credential_control(credentials);
+            assert_eq!(
+                inspect_received_record_control(control_buffer_bytes(&canonical), false)
+                    .expect("inspect canonical credentials")
+                    .require_canonical_credentials()
+                    .expect("canonical credentials are required"),
+                credentials
+            );
+
+            let missing = inspect_received_record_control(&[], false)
+                .expect("inspect absent credentials")
+                .require_canonical_credentials()
+                .expect_err("credentials are mandatory");
+            assert!(
+                missing
+                    .to_string()
+                    .contains("missing Unix seqpacket SCM_CREDENTIALS")
+            );
+
+            let mut duplicate = canonical.clone();
+            duplicate.extend_from_slice(&canonical);
+            let duplicate =
+                inspect_received_record_control(control_buffer_bytes(&duplicate), false)
+                    .expect("inspect duplicate credentials")
+                    .require_canonical_credentials()
+                    .expect_err("duplicate credentials are not canonical");
+            assert!(
+                duplicate
+                    .to_string()
+                    .contains("duplicate Unix seqpacket SCM_CREDENTIALS")
+            );
+
+            let truncated = inspect_received_record_control(control_buffer_bytes(&canonical), true)
+                .expect("inspect truncated credentials")
+                .require_canonical_credentials()
+                .expect_err("truncated control is not evidence");
+            assert!(
+                truncated
+                    .to_string()
+                    .contains("truncated Unix seqpacket control data")
+            );
+        }
+
+        #[test]
+        fn record_control_rejects_malformed_or_unknown_ancillary_data() {
+            let credentials = current_credentials();
+            let mut malformed = credential_control(credentials);
+            write_control_usize(
+                control_buffer_bytes_mut(&mut malformed),
+                std::mem::offset_of!(libc::cmsghdr, cmsg_len),
+                control_message_length(std::mem::size_of::<libc::ucred>() - 1)
+                    .expect("malformed credential length"),
+            );
+            let malformed =
+                inspect_received_record_control(control_buffer_bytes(&malformed), false)
+                    .expect("inspect malformed credentials")
+                    .require_canonical_credentials()
+                    .expect_err("malformed credentials are not evidence");
+            assert!(
+                malformed
+                    .to_string()
+                    .contains("invalid Unix seqpacket SCM_CREDENTIALS payload")
+            );
+
+            let mut unknown = credential_control(credentials);
+            write_control_c_int(
+                control_buffer_bytes_mut(&mut unknown),
+                std::mem::offset_of!(libc::cmsghdr, cmsg_type),
+                libc::SCM_CREDENTIALS + 1,
+            );
+            let unknown = inspect_received_record_control(control_buffer_bytes(&unknown), false)
+                .expect("inspect unknown ancillary data")
+                .require_canonical_credentials()
+                .expect_err("unknown ancillary data is not evidence");
+            assert!(
+                unknown
+                    .to_string()
+                    .contains("unexpected Unix seqpacket ancillary data")
+            );
+        }
 
         #[test]
         fn closes_received_file_descriptors_after_record_classification() {
@@ -996,14 +1182,13 @@ mod implementation {
 
             send_file_descriptors(&producer, read_end.as_raw_fd(), 1);
             drop(read_end);
-            assert_eq!(
-                collector
-                    .recv_record_until(1, Instant::now() + Duration::from_secs(1))
-                    .expect("receive record"),
-                Some(SeqpacketReceive::Record {
-                    bytes: b"x".to_vec(),
-                    truncated: false,
-                })
+            let error = collector
+                .recv_record_until(1, Instant::now() + Duration::from_secs(1))
+                .expect_err("SCM_RIGHTS is not valid record evidence");
+            assert!(
+                error
+                    .to_string()
+                    .contains("unexpected Unix seqpacket ancillary data")
             );
 
             assert_writer_has_no_readers(&write_end);
@@ -1023,7 +1208,7 @@ mod implementation {
             let RawSeqpacketReceive::Record {
                 bytes,
                 truncated,
-                control_truncated,
+                control,
                 ..
             } = received
             else {
@@ -1032,9 +1217,11 @@ mod implementation {
             assert_eq!(bytes, b"x");
             assert!(!truncated);
             assert!(
-                !control_truncated,
+                !control.truncated,
                 "credentials plus rights must exactly fill the receive control buffer"
             );
+            assert_eq!(control.credential_messages, 1);
+            assert_eq!(control.unexpected_messages, 1);
             assert_writer_has_no_readers(&write_end);
         }
 
@@ -1062,7 +1249,7 @@ mod implementation {
             let RawSeqpacketReceive::Record {
                 bytes,
                 truncated,
-                control_truncated,
+                control,
                 ..
             } = received
             else {
@@ -1070,7 +1257,7 @@ mod implementation {
             };
             assert_eq!(bytes, b"x");
             assert!(!truncated);
-            assert!(control_truncated, "receive must exercise MSG_CTRUNC");
+            assert!(control.truncated, "receive must exercise MSG_CTRUNC");
             assert_writer_has_no_readers(&write_end);
         }
 
@@ -1088,6 +1275,60 @@ mod implementation {
             assert_eq!(control_message_space(rights_payload), Some(rights_space));
             assert_eq!(rights_payload % std::mem::size_of::<libc::c_int>(), 0);
             rights_payload / std::mem::size_of::<libc::c_int>()
+        }
+
+        fn current_credentials() -> PeerCredentials {
+            // SAFETY: these process identity getters have no pointer arguments or preconditions.
+            let raw_pid = unsafe { libc::getpid() };
+            // SAFETY: see the process-ID call above.
+            let raw_uid = unsafe { libc::geteuid() };
+            // SAFETY: see the process-ID call above.
+            let raw_gid = unsafe { libc::getegid() };
+            PeerCredentials {
+                pid: u32::try_from(raw_pid).expect("positive process ID"),
+                uid: Uid::from_raw(raw_uid).expect("valid effective UID"),
+                gid: raw_gid,
+            }
+        }
+
+        fn credential_control(credentials: PeerCredentials) -> Vec<usize> {
+            let payload_length = std::mem::size_of::<libc::ucred>();
+            let control_space = control_message_space(payload_length).expect("credential space");
+            let control_length = control_message_length(payload_length).expect("credential length");
+            let mut control = vec![0_usize; control_space / std::mem::size_of::<usize>()];
+            let control_bytes = control_buffer_bytes_mut(&mut control);
+            write_control_usize(
+                control_bytes,
+                std::mem::offset_of!(libc::cmsghdr, cmsg_len),
+                control_length,
+            );
+            write_control_c_int(
+                control_bytes,
+                std::mem::offset_of!(libc::cmsghdr, cmsg_level),
+                libc::SOL_SOCKET,
+            );
+            write_control_c_int(
+                control_bytes,
+                std::mem::offset_of!(libc::cmsghdr, cmsg_type),
+                libc::SCM_CREDENTIALS,
+            );
+            let payload_offset = control_message_header_length().expect("control header length");
+            write_control_c_int(
+                control_bytes,
+                payload_offset + std::mem::offset_of!(libc::ucred, pid),
+                libc::pid_t::try_from(credentials.pid()).expect("credential PID fits pid_t"),
+            );
+            write_control_u32(
+                control_bytes,
+                payload_offset + std::mem::offset_of!(libc::ucred, uid),
+                credentials.uid().as_raw(),
+            );
+            write_control_u32(
+                control_bytes,
+                payload_offset + std::mem::offset_of!(libc::ucred, gid),
+                credentials.gid(),
+            );
+            control
         }
 
         fn nonblocking_pipe() -> (OwnedFd, OwnedFd) {
@@ -1210,6 +1451,10 @@ mod implementation {
         }
 
         fn write_control_c_int(control: &mut [u8], offset: usize, value: libc::c_int) {
+            write_control_bytes(control, offset, &value.to_ne_bytes());
+        }
+
+        fn write_control_u32(control: &mut [u8], offset: usize, value: u32) {
             write_control_bytes(control, offset, &value.to_ne_bytes());
         }
 

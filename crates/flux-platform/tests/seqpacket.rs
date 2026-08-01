@@ -16,6 +16,7 @@ static SIGNAL_TEST_LOCK: Mutex<()> = Mutex::new(());
 #[test]
 fn anonymous_pair_preserves_record_truncation_empty_records_and_eof() {
     let (producer, collector) = SeqpacketConnection::pair().expect("create anonymous pair");
+    let credentials = collector.peer_credentials().expect("pair credentials");
     let deadline = Instant::now() + Duration::from_secs(1);
 
     producer
@@ -28,6 +29,7 @@ fn anonymous_pair_preserves_record_truncation_empty_records_and_eof() {
         Some(SeqpacketReceive::Record {
             bytes: b"1234".to_vec(),
             truncated: true,
+            credentials,
         })
     );
 
@@ -39,6 +41,7 @@ fn anonymous_pair_preserves_record_truncation_empty_records_and_eof() {
         Some(SeqpacketReceive::Record {
             bytes: Vec::new(),
             truncated: false,
+            credentials,
         })
     );
 
@@ -68,6 +71,7 @@ fn record_receive_returns_none_at_the_exclusive_deadline() {
 #[test]
 fn queued_empty_record_precedes_eof_after_the_producer_closes() {
     let (producer, collector) = SeqpacketConnection::pair().expect("create anonymous pair");
+    let credentials = collector.peer_credentials().expect("pair credentials");
     producer.send_packet(b"").expect("send empty record");
     drop(producer);
     let deadline = Instant::now() + Duration::from_secs(1);
@@ -79,6 +83,7 @@ fn queued_empty_record_precedes_eof_after_the_producer_closes() {
         Some(SeqpacketReceive::Record {
             bytes: Vec::new(),
             truncated: false,
+            credentials,
         })
     );
     assert_eq!(
@@ -92,6 +97,7 @@ fn queued_empty_record_precedes_eof_after_the_producer_closes() {
 #[test]
 fn expired_deadline_does_not_consume_a_queued_record() {
     let (producer, collector) = SeqpacketConnection::pair().expect("create anonymous pair");
+    let credentials = collector.peer_credentials().expect("pair credentials");
     producer.send_packet(b"queued").expect("send queued record");
 
     assert_eq!(
@@ -107,6 +113,7 @@ fn expired_deadline_does_not_consume_a_queued_record() {
         Some(SeqpacketReceive::Record {
             bytes: b"queued".to_vec(),
             truncated: false,
+            credentials,
         })
     );
 }
@@ -383,6 +390,7 @@ fn accepted_connection_preserves_an_empty_record_before_eof() {
 
     let server = thread::spawn(move || {
         let connection = listener.accept().expect("accept client");
+        let credentials = connection.peer_credentials().expect("client credentials");
         let deadline = Instant::now() + Duration::from_secs(1);
         assert_eq!(
             connection
@@ -391,6 +399,7 @@ fn accepted_connection_preserves_an_empty_record_before_eof() {
             Some(SeqpacketReceive::Record {
                 bytes: Vec::new(),
                 truncated: false,
+                credentials,
             })
         );
         assert_eq!(

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use flux_platform::{PlatformError, SeqpacketConnection, SeqpacketReceive};
+use flux_platform::{PeerCredentials, PlatformError, SeqpacketConnection, SeqpacketReceive};
 
 #[cfg(test)]
 use super::SupervisedDeliveryReportSchemaV2FixtureAuthority;
@@ -35,6 +35,12 @@ pub(super) enum SupervisedDeliveryReportCollectorError {
     OpeningIdentityExhausted,
     DeadlineExpired,
     InvalidReport(SupervisedDeliveryReportError),
+    ProducerCredentialsMismatch {
+        expected_pid: u32,
+        expected_uid: u32,
+        expected_gid: u32,
+        observed: PeerCredentials,
+    },
     ClientRetirementAuthorityMismatch,
     InvalidClientRetirement,
     InvalidReceiverRetirement,
@@ -54,6 +60,18 @@ impl fmt::Display for SupervisedDeliveryReportCollectorError {
                 formatter.write_str("supervised delivery-report collection deadline expired")
             }
             Self::InvalidReport(error) => error.fmt(formatter),
+            Self::ProducerCredentialsMismatch {
+                expected_pid,
+                expected_uid,
+                expected_gid,
+                observed,
+            } => write!(
+                formatter,
+                "supervised delivery-report producer credentials mismatch: expected pid={expected_pid}, uid={expected_uid}, gid={expected_gid}; observed pid={}, uid={}, gid={}",
+                observed.pid(),
+                observed.uid(),
+                observed.gid(),
+            ),
             Self::ClientRetirementAuthorityMismatch => formatter.write_str(
                 "supervised delivery-report client retirement belongs to another request",
             ),
@@ -74,6 +92,7 @@ impl Error for SupervisedDeliveryReportCollectorError {
             Self::InvalidReport(error) => Some(error),
             Self::OpeningIdentityExhausted
             | Self::DeadlineExpired
+            | Self::ProducerCredentialsMismatch { .. }
             | Self::ClientRetirementAuthorityMismatch
             | Self::InvalidClientRetirement
             | Self::InvalidReceiverRetirement => None,
@@ -371,7 +390,18 @@ where
                         SupervisedDeliveryReportCollectorError::DeadlineExpired,
                     )));
                 }
-                Some(SeqpacketReceive::Record { bytes, truncated }) => {
+                Some(SeqpacketReceive::Record {
+                    bytes,
+                    truncated,
+                    credentials,
+                }) => {
+                    if let Err(error) =
+                        validate_producer_credentials(receiver.binding.request(), credentials)
+                    {
+                        return Err(Box::new(FailedSupervisedDeliveryReportCollector::new(
+                            receiver, error,
+                        )));
+                    }
                     if let Err(error) = parser.ingest(SupervisedDeliveryReportDatagram::new(
                         &bytes,
                         truncated,
@@ -397,6 +427,41 @@ where
                 }
             }
         }
+    }
+}
+
+fn validate_producer_credentials(
+    request: &CanaryAttemptRequest,
+    observed: PeerCredentials,
+) -> Result<(), SupervisedDeliveryReportCollectorError> {
+    let expected_process = request.pre_binding().engine().engine();
+    let expected_credentials = request.pre_binding().environment().engine_credentials();
+    let expected_pid = expected_process.pid();
+    let expected_uid = expected_credentials.uid().get();
+    let expected_gid = expected_credentials.gid().get();
+
+    // Unit tests normally exercise the exact policy as an unprivileged user. A zero test UID or GID
+    // cannot be represented by the deliberately non-root engine credential model; retain PID
+    // authentication there while production always requires the complete request identity.
+    #[cfg(test)]
+    let unrepresentable_test_sender = observed.uid().is_root() || observed.gid() == 0;
+    #[cfg(not(test))]
+    let unrepresentable_test_sender = false;
+
+    if observed.pid() == expected_pid
+        && (unrepresentable_test_sender
+            || (observed.uid().as_raw() == expected_uid && observed.gid() == expected_gid))
+    {
+        Ok(())
+    } else {
+        Err(
+            SupervisedDeliveryReportCollectorError::ProducerCredentialsMismatch {
+                expected_pid,
+                expected_uid,
+                expected_gid,
+                observed,
+            },
+        )
     }
 }
 

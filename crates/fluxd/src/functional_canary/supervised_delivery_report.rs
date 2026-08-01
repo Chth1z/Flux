@@ -1008,8 +1008,9 @@ mod tests {
     use super::*;
     use crate::functional_canary::tests::{Fixture, request_with_engine_profile_revision};
     use crate::functional_canary::{
-        CanaryAddressFamilies, CanaryAttemptObjectRetirementEvidence,
-        CanaryListenerDeliveryReportCleanupEvidence, CanaryNonce, FUNCTIONAL_CANARY_NONCE_BYTES,
+        CanaryAddressFamilies, CanaryAttemptCredentialBinding,
+        CanaryAttemptObjectRetirementEvidence, CanaryListenerDeliveryReportCleanupEvidence,
+        CanaryNonce, CanaryProcessCredentialIdentity, FUNCTIONAL_CANARY_NONCE_BYTES,
     };
     use crate::generation_engine_config::{
         TproxyEngineConfigRequest, bind_engine_config_to_spec,
@@ -1090,17 +1091,34 @@ esac
             let profile =
                 declare_supervised_delivery_report_profile_fixture(baseline_profile.clone());
             let started_at = Instant::now();
-            let request = request_with_engine_profile_revision(
+            let producer_pid = NonZeroU32::new(std::process::id()).expect("test process PID");
+            let mut request = request_with_engine_profile_revision(
                 &spec,
                 families,
                 started_at,
                 CanaryNonce::from_bytes([0x71; FUNCTIONAL_CANARY_NONCE_BYTES]),
                 GenerationId::new(17).expect("generation"),
-                NonZeroU32::new(4242).expect("engine PID"),
+                producer_pid,
                 NonZeroU64::new(98_765).expect("engine start ticks"),
                 NonZeroU64::new(23).expect("snapshot revision"),
                 profile.revision(),
             );
+            // SAFETY: these identity getters have no pointer arguments or preconditions.
+            let producer_uid = NonZeroU32::new(unsafe { libc::geteuid() });
+            // SAFETY: see the effective-UID call above.
+            let producer_gid = NonZeroU32::new(unsafe { libc::getegid() });
+            if let (Some(producer_uid), Some(producer_gid)) = (producer_uid, producer_gid) {
+                let environment = &mut request.pre_binding.environment;
+                let probe_uid = distinct_test_identity(producer_uid);
+                let probe_gid = distinct_test_identity(producer_gid);
+                environment.credentials = CanaryAttemptCredentialBinding::new(
+                    CanaryProcessCredentialIdentity::new(probe_uid, probe_gid),
+                    CanaryProcessCredentialIdentity::new(producer_uid, producer_gid),
+                    environment.credentials.domain,
+                )
+                .expect("distinct test transport credentials");
+                environment.rpdb.engine_uid = producer_uid;
+            }
             let fixture = Fixture::from_request(request.clone());
             Self {
                 baseline_profile,
@@ -1123,6 +1141,15 @@ esac
         fn evidence(&self) -> super::super::UnqualifiedCanaryGateEvidence {
             self.fixture.successful_evidence()
         }
+    }
+
+    fn distinct_test_identity(identity: NonZeroU32) -> NonZeroU32 {
+        NonZeroU32::new(if identity.get() == u32::MAX - 1 {
+            identity.get() - 1
+        } else {
+            identity.get() + 1
+        })
+        .expect("distinct test identity remains nonzero")
     }
 
     #[test]
@@ -1484,6 +1511,53 @@ esac
             unverified.report_object()
         );
         assert!(unverified.collection_error().is_none());
+    }
+
+    #[test]
+    fn collector_authenticates_kernel_sender_before_parsing_frame_bytes() {
+        let mut context = Context::new(CanaryAddressFamilies::Ipv4Only);
+        let observed_pid = std::process::id();
+        let expected_pid = NonZeroU32::new(
+            observed_pid
+                .checked_add(1)
+                .unwrap_or_else(|| observed_pid - 1),
+        )
+        .expect("different expected producer PID");
+        let start_ticks = NonZeroU64::new(
+            context
+                .request
+                .pre_binding()
+                .engine()
+                .engine()
+                .start_time_ticks(),
+        )
+        .expect("engine start ticks");
+        context.request.pre_binding.engine.engine =
+            OwnedEngineIdentity::new(expected_pid, start_ticks);
+        let (producer, collector) = prebind_report_collector(&context, || {
+            panic!("credential rejection must precede frame timestamping")
+        });
+        producer
+            .send_frame(b"not a report frame")
+            .expect("send unauthenticated record");
+        drop(producer);
+
+        let failed = match collector.drain() {
+            Ok(_) => panic!("another process identity cannot produce the report"),
+            Err(failed) => failed,
+        };
+        match failed.collection_error() {
+            collector::SupervisedDeliveryReportCollectorError::ProducerCredentialsMismatch {
+                expected_pid: rejected_pid,
+                observed,
+                ..
+            } => {
+                assert_eq!(*rejected_pid, expected_pid.get());
+                assert_eq!(observed.pid(), observed_pid);
+            }
+            other => panic!("unexpected collector error: {other}"),
+        }
+        drop(failed);
     }
 
     #[test]

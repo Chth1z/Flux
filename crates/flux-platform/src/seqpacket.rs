@@ -57,6 +57,19 @@ pub enum SeqpacketReceive {
     Eof,
 }
 
+/// One resource-bearing receive outcome from a Unix seqpacket control connection.
+#[derive(Debug)]
+pub enum SeqpacketConnectionHandoffReceive {
+    /// One complete record carrying exactly one validated Unix seqpacket connection.
+    Record {
+        bytes: Vec<u8>,
+        credentials: PeerCredentials,
+        connection: SeqpacketConnection,
+    },
+    /// Every peer descriptor has been closed and all queued records are drained.
+    Eof,
+}
+
 impl PeerCredentials {
     #[must_use]
     pub const fn pid(self) -> u32 {
@@ -89,7 +102,7 @@ mod implementation {
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
-    use super::{PeerCredentials, SeqpacketReceive, Uid};
+    use super::{PeerCredentials, SeqpacketConnectionHandoffReceive, SeqpacketReceive, Uid};
     use crate::PlatformError;
 
     const RECEIVE_CONTROL_WORDS: usize = 16;
@@ -256,12 +269,137 @@ mod implementation {
         credentials: Option<PeerCredentials>,
         credential_messages: usize,
         invalid_credentials: bool,
+        rights_messages: usize,
+        descriptors: Vec<OwnedFd>,
+        invalid_descriptors: bool,
         unexpected_messages: usize,
         truncated: bool,
     }
 
+    /// The exact ancillary byte range returned by one successful `recvmsg` call.
+    ///
+    /// This token is deliberately non-cloneable: parsing it transfers ownership of every distinct
+    /// descriptor installed by `SCM_RIGHTS` into one `ReceivedRecordControl`.
+    struct InstalledControl<'a> {
+        bytes: &'a [u8],
+    }
+
+    impl<'a> InstalledControl<'a> {
+        /// # Safety
+        ///
+        /// Every distinct nonnegative descriptor encoded in an `SCM_RIGHTS` message must have been
+        /// installed for this process by the represented `recvmsg` call and must not already have a
+        /// Rust owner. The caller must create at most one token for that receive result.
+        unsafe fn from_recvmsg(bytes: &'a [u8]) -> Self {
+            Self { bytes }
+        }
+    }
+
+    struct ControlMessage<'a> {
+        level: libc::c_int,
+        kind: libc::c_int,
+        payload: &'a [u8],
+        complete: bool,
+    }
+
+    struct ControlMessageCursor<'a> {
+        control: &'a [u8],
+        header_length: usize,
+        header_offset: usize,
+        finished: bool,
+    }
+
+    impl<'a> ControlMessageCursor<'a> {
+        fn new(control: &'a [u8]) -> Result<Self, PlatformError> {
+            Ok(Self {
+                control,
+                header_length: control_message_header_length()?,
+                header_offset: 0,
+                finished: false,
+            })
+        }
+    }
+
+    impl<'a> Iterator for ControlMessageCursor<'a> {
+        type Item = Result<ControlMessage<'a>, PlatformError>;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            if self.finished
+                || self.control.len().saturating_sub(self.header_offset) < self.header_length
+            {
+                self.finished = true;
+                return None;
+            }
+
+            let result = self.next_message();
+            if result.is_err() {
+                self.finished = true;
+            }
+            Some(result)
+        }
+    }
+
+    impl<'a> ControlMessageCursor<'a> {
+        fn next_message(&mut self) -> Result<ControlMessage<'a>, PlatformError> {
+            let cmsg_len = read_control_usize(
+                self.control,
+                checked_field_offset(self.header_offset, offset_of!(libc::cmsghdr, cmsg_len))?,
+            )
+            .ok_or_else(|| protocol_error("truncated Unix seqpacket control header"))?;
+            let level = read_control_c_int(
+                self.control,
+                checked_field_offset(self.header_offset, offset_of!(libc::cmsghdr, cmsg_level))?,
+            )
+            .ok_or_else(|| protocol_error("truncated Unix seqpacket control header"))?;
+            let kind = read_control_c_int(
+                self.control,
+                checked_field_offset(self.header_offset, offset_of!(libc::cmsghdr, cmsg_type))?,
+            )
+            .ok_or_else(|| protocol_error("truncated Unix seqpacket control header"))?;
+            if cmsg_len < self.header_length {
+                return Err(protocol_error(
+                    "invalid Unix seqpacket control header length",
+                ));
+            }
+
+            let reported_end = self
+                .header_offset
+                .checked_add(cmsg_len)
+                .ok_or_else(|| protocol_error("Unix seqpacket control length overflow"))?;
+            let available_end = reported_end.min(self.control.len());
+            let payload_offset = self
+                .header_offset
+                .checked_add(self.header_length)
+                .ok_or_else(|| protocol_error("Unix seqpacket control offset overflow"))?;
+            let complete = reported_end <= self.control.len();
+            let message = ControlMessage {
+                level,
+                kind,
+                payload: &self.control[payload_offset..available_end],
+                complete,
+            };
+            if !complete {
+                self.finished = true;
+                return Ok(message);
+            }
+
+            let aligned_length = checked_control_message_align(cmsg_len)
+                .ok_or_else(|| protocol_error("Unix seqpacket control alignment overflow"))?;
+            let next_offset = self
+                .header_offset
+                .checked_add(aligned_length)
+                .ok_or_else(|| protocol_error("Unix seqpacket control offset overflow"))?;
+            if self.control.len().saturating_sub(next_offset) < self.header_length {
+                self.finished = true;
+            } else {
+                self.header_offset = next_offset;
+            }
+            Ok(message)
+        }
+    }
+
     impl ReceivedRecordControl {
-        fn require_canonical_credentials(self) -> Result<PeerCredentials, PlatformError> {
+        fn canonical_credentials(&self) -> Result<PeerCredentials, PlatformError> {
             if self.truncated {
                 return Err(protocol_error("truncated Unix seqpacket control data"));
             }
@@ -282,6 +420,40 @@ mod implementation {
             }
             self.credentials
                 .ok_or_else(|| protocol_error("invalid Unix seqpacket SCM_CREDENTIALS payload"))
+        }
+
+        fn require_canonical_credentials(self) -> Result<PeerCredentials, PlatformError> {
+            let credentials = self.canonical_credentials()?;
+            if self.rights_messages != 0 {
+                return Err(protocol_error("unexpected Unix seqpacket ancillary data"));
+            }
+            Ok(credentials)
+        }
+
+        fn require_canonical_connection_handoff(
+            mut self,
+        ) -> Result<(PeerCredentials, OwnedFd), PlatformError> {
+            let credentials = self.canonical_credentials()?;
+            if self.rights_messages != 1 {
+                return Err(protocol_error(if self.rights_messages == 0 {
+                    "missing Unix seqpacket SCM_RIGHTS"
+                } else {
+                    "duplicate Unix seqpacket SCM_RIGHTS"
+                }));
+            }
+            if self.invalid_descriptors {
+                return Err(protocol_error("invalid Unix seqpacket SCM_RIGHTS payload"));
+            }
+            if self.descriptors.len() != 1 {
+                return Err(protocol_error(
+                    "Unix seqpacket SCM_RIGHTS must contain exactly one descriptor",
+                ));
+            }
+            let descriptor = self
+                .descriptors
+                .pop()
+                .expect("one validated descriptor remains owned");
+            Ok((credentials, descriptor))
         }
     }
 
@@ -373,6 +545,59 @@ mod implementation {
             limit: usize,
             exclusive_deadline: Instant,
         ) -> Result<Option<SeqpacketReceive>, PlatformError> {
+            match self.recv_record_until_raw(limit, exclusive_deadline)? {
+                Some(RawSeqpacketReceive::Record {
+                    bytes,
+                    truncated,
+                    control,
+                    ..
+                }) => {
+                    let credentials = control.require_canonical_credentials()?;
+                    Ok(Some(SeqpacketReceive::Record {
+                        bytes,
+                        truncated,
+                        credentials,
+                    }))
+                }
+                Some(RawSeqpacketReceive::Eof) => Ok(Some(SeqpacketReceive::Eof)),
+                None => Ok(None),
+            }
+        }
+
+        pub fn recv_connection_until(
+            &self,
+            limit: usize,
+            exclusive_deadline: Instant,
+        ) -> Result<Option<SeqpacketConnectionHandoffReceive>, PlatformError> {
+            match self.recv_record_until_raw(limit, exclusive_deadline)? {
+                Some(RawSeqpacketReceive::Record {
+                    bytes,
+                    actual,
+                    truncated,
+                    control,
+                }) => {
+                    let (credentials, descriptor) =
+                        control.require_canonical_connection_handoff()?;
+                    if truncated {
+                        return Err(PlatformError::PacketTooLarge { actual, limit });
+                    }
+                    let connection = validate_transferred_connection(descriptor)?;
+                    Ok(Some(SeqpacketConnectionHandoffReceive::Record {
+                        bytes,
+                        credentials,
+                        connection,
+                    }))
+                }
+                Some(RawSeqpacketReceive::Eof) => Ok(Some(SeqpacketConnectionHandoffReceive::Eof)),
+                None => Ok(None),
+            }
+        }
+
+        fn recv_record_until_raw(
+            &self,
+            limit: usize,
+            exclusive_deadline: Instant,
+        ) -> Result<Option<RawSeqpacketReceive>, PlatformError> {
             checked_packet_capacity(limit)?;
             loop {
                 let now = Instant::now();
@@ -411,20 +636,7 @@ mod implementation {
                 }
 
                 match self.recv_record(limit, libc::MSG_DONTWAIT) {
-                    Ok(RawSeqpacketReceive::Record {
-                        bytes,
-                        truncated,
-                        control,
-                        ..
-                    }) => {
-                        let credentials = control.require_canonical_credentials()?;
-                        return Ok(Some(SeqpacketReceive::Record {
-                            bytes,
-                            truncated,
-                            credentials,
-                        }));
-                    }
-                    Ok(RawSeqpacketReceive::Eof) => return Ok(Some(SeqpacketReceive::Eof)),
+                    Ok(received) => return Ok(Some(received)),
                     Err(PlatformError::SystemCall { source, .. })
                         if source.kind() == std::io::ErrorKind::WouldBlock
                             || source.raw_os_error() == Some(libc::EINTR) => {}
@@ -470,7 +682,10 @@ mod implementation {
                 // The kernel must never report more control data than the supplied buffer. Close
                 // every descriptor that can be parsed from the complete buffer before rejecting
                 // an impossible length so even this defensive path cannot leak installed rights.
-                inspect_received_record_control(control_bytes, true)?;
+                // SAFETY: this is the sole ownership token created for the completed recvmsg. The
+                // full zero-initialized buffer contains every descriptor the kernel could install.
+                let installed = unsafe { InstalledControl::from_recvmsg(control_bytes) };
+                inspect_received_record_control(installed, true)?;
                 return Err(protocol_error("invalid Unix seqpacket control length"));
             };
             let actual = usize::try_from(received).map_err(|_| {
@@ -485,7 +700,10 @@ mod implementation {
             if actual == 0 && message.msg_controllen == 0 && !control_truncated {
                 return Ok(RawSeqpacketReceive::Eof);
             }
-            let control = inspect_received_record_control(received_control, control_truncated)?;
+            // SAFETY: this is the sole ownership token created for the successful recvmsg result.
+            // SCM_RIGHTS entries in its returned control range are newly installed descriptors.
+            let installed = unsafe { InstalledControl::from_recvmsg(received_control) };
+            let control = inspect_received_record_control(installed, control_truncated)?;
 
             let stored = actual.min(limit);
             bytes.truncate(stored);
@@ -585,17 +803,46 @@ mod implementation {
         }
 
         pub fn send_packet(&self, packet: &[u8]) -> Result<(), PlatformError> {
+            self.send_record(packet, None)
+        }
+
+        pub fn send_connection(
+            &self,
+            payload: &[u8],
+            connection: &SeqpacketConnection,
+        ) -> Result<(), PlatformError> {
+            self.send_record(payload, Some(connection))
+        }
+
+        fn send_record(
+            &self,
+            packet: &[u8],
+            connection: Option<&SeqpacketConnection>,
+        ) -> Result<(), PlatformError> {
+            let mut iovec = libc::iovec {
+                iov_base: packet.as_ptr().cast_mut().cast::<libc::c_void>(),
+                iov_len: packet.len(),
+            };
+            // SAFETY: zero initializes every optional msghdr field before the payload and
+            // optional aligned control buffer are attached below.
+            let mut message = unsafe { std::mem::zeroed::<libc::msghdr>() };
+            message.msg_iov = &raw mut iovec;
+            message.msg_iovlen = 1;
+
+            let mut control = connection
+                .map(|connection| single_descriptor_control(connection.fd.as_raw_fd()))
+                .transpose()?;
+            if let Some(control) = control.as_mut() {
+                message.msg_control = control.as_mut_ptr().cast::<libc::c_void>();
+                message.msg_controllen = std::mem::size_of_val(control.as_slice());
+            }
+
             let sent = loop {
-                // SAFETY: `packet` is readable for its length and the connection
-                // FD remains valid. MSG_NOSIGNAL prevents a peer close from
-                // signalling the daemon process.
+                // SAFETY: `message` references the immutable payload through one iovec and, when
+                // present, one initialized SCM_RIGHTS record. All borrowed connection descriptors
+                // remain live for the call. MSG_NOSIGNAL suppresses process-directed SIGPIPE.
                 let sent = unsafe {
-                    libc::send(
-                        self.fd.as_raw_fd(),
-                        packet.as_ptr().cast::<libc::c_void>(),
-                        packet.len(),
-                        libc::MSG_NOSIGNAL,
-                    )
+                    libc::sendmsg(self.fd.as_raw_fd(), &raw const message, libc::MSG_NOSIGNAL)
                 };
                 if sent >= 0 {
                     break sent;
@@ -617,6 +864,34 @@ mod implementation {
             }
             Ok(())
         }
+    }
+
+    fn single_descriptor_control(descriptor: libc::c_int) -> Result<Vec<usize>, PlatformError> {
+        let payload_length = std::mem::size_of::<libc::c_int>();
+        let control_space = control_message_space(payload_length)
+            .ok_or_else(|| protocol_error("Unix seqpacket control space overflow"))?;
+        let control_length = control_message_length(payload_length)
+            .ok_or_else(|| protocol_error("Unix seqpacket control length overflow"))?;
+        if !control_space.is_multiple_of(std::mem::size_of::<usize>()) {
+            return Err(protocol_error("unaligned Unix seqpacket control space"));
+        }
+        let mut control = vec![0_usize; control_space / std::mem::size_of::<usize>()];
+        let header = control.as_mut_ptr().cast::<libc::cmsghdr>();
+        let payload_offset = control_message_header_length()?;
+        // SAFETY: the word-backed vector is aligned for cmsghdr and contains CMSG_SPACE(c_int)
+        // zeroed bytes. The payload offset is CMSG_LEN(0), so both writes stay within that buffer.
+        unsafe {
+            (*header).cmsg_len = control_length;
+            (*header).cmsg_level = libc::SOL_SOCKET;
+            (*header).cmsg_type = libc::SCM_RIGHTS;
+            control
+                .as_mut_ptr()
+                .cast::<u8>()
+                .add(payload_offset)
+                .cast::<libc::c_int>()
+                .write(descriptor);
+        }
+        Ok(control)
     }
 
     fn checked_packet_capacity(limit: usize) -> Result<usize, PlatformError> {
@@ -644,60 +919,40 @@ mod implementation {
     }
 
     fn inspect_received_record_control(
-        control: &[u8],
+        control: InstalledControl<'_>,
         control_truncated: bool,
     ) -> Result<ReceivedRecordControl, PlatformError> {
-        let header_length = control_message_header_length()?;
         let mut inspection = ReceivedRecordControl {
             truncated: control_truncated,
             ..ReceivedRecordControl::default()
         };
-        let mut header_offset = 0_usize;
+        let messages = ControlMessageCursor::new(control.bytes)?;
 
-        while control.len().saturating_sub(header_offset) >= header_length {
-            let cmsg_len = read_control_usize(
-                control,
-                checked_field_offset(header_offset, offset_of!(libc::cmsghdr, cmsg_len))?,
-            )
-            .ok_or_else(|| protocol_error("truncated Unix seqpacket control header"))?;
-            let level = read_control_c_int(
-                control,
-                checked_field_offset(header_offset, offset_of!(libc::cmsghdr, cmsg_level))?,
-            )
-            .ok_or_else(|| protocol_error("truncated Unix seqpacket control header"))?;
-            let kind = read_control_c_int(
-                control,
-                checked_field_offset(header_offset, offset_of!(libc::cmsghdr, cmsg_type))?,
-            )
-            .ok_or_else(|| protocol_error("truncated Unix seqpacket control header"))?;
-            if cmsg_len < header_length {
-                return Err(protocol_error(
-                    "invalid Unix seqpacket control header length",
-                ));
-            }
-
-            let reported_end = header_offset
-                .checked_add(cmsg_len)
-                .ok_or_else(|| protocol_error("Unix seqpacket control length overflow"))?;
-            let available_end = reported_end.min(control.len());
-            let payload_offset = header_offset
-                .checked_add(header_length)
-                .ok_or_else(|| protocol_error("Unix seqpacket control offset overflow"))?;
-            let payload = &control[payload_offset..available_end];
+        for message in messages {
+            let ControlMessage {
+                level,
+                kind,
+                payload,
+                complete,
+            } = message?;
             match (level, kind) {
                 (libc::SOL_SOCKET, libc::SCM_RIGHTS) => {
-                    close_descriptor_payload(payload)?;
-                    inspection.unexpected_messages = inspection
-                        .unexpected_messages
+                    inspection.rights_messages = inspection
+                        .rights_messages
                         .checked_add(1)
                         .ok_or_else(|| protocol_error("Unix seqpacket control count overflow"))?;
+                    // SAFETY: `InstalledControl` proves every distinct nonnegative descriptor in
+                    // this SCM_RIGHTS payload is newly installed and currently unowned.
+                    if !unsafe { own_descriptor_payload(payload, &mut inspection.descriptors) } {
+                        inspection.invalid_descriptors = true;
+                    }
                 }
                 (libc::SOL_SOCKET, libc::SCM_CREDENTIALS) => {
                     inspection.credential_messages = inspection
                         .credential_messages
                         .checked_add(1)
                         .ok_or_else(|| protocol_error("Unix seqpacket control count overflow"))?;
-                    if reported_end > control.len() {
+                    if !complete {
                         inspection.invalid_credentials = true;
                     } else {
                         match parse_record_credentials(payload) {
@@ -716,22 +971,13 @@ mod implementation {
                 }
             }
 
-            if reported_end > control.len() {
+            if !complete {
                 return if control_truncated {
                     Ok(inspection)
                 } else {
                     Err(protocol_error("truncated Unix seqpacket control message"))
                 };
             }
-            let aligned_length = checked_control_message_align(cmsg_len)
-                .ok_or_else(|| protocol_error("Unix seqpacket control alignment overflow"))?;
-            let next_offset = header_offset
-                .checked_add(aligned_length)
-                .ok_or_else(|| protocol_error("Unix seqpacket control offset overflow"))?;
-            if control.len().saturating_sub(next_offset) < header_length {
-                break;
-            }
-            header_offset = next_offset;
         }
         Ok(inspection)
     }
@@ -751,7 +997,13 @@ mod implementation {
         Some(PeerCredentials { pid, uid, gid })
     }
 
-    fn close_descriptor_payload(payload: &[u8]) -> Result<(), PlatformError> {
+    /// # Safety
+    ///
+    /// Every distinct nonnegative descriptor encoded by `payload` must be newly installed in this
+    /// process and must not have another Rust owner. Duplicate raw numbers are permitted and are
+    /// deliberately claimed only once.
+    unsafe fn own_descriptor_payload(payload: &[u8], owned: &mut Vec<OwnedFd>) -> bool {
+        let mut valid = true;
         let mut descriptors = payload.chunks_exact(std::mem::size_of::<libc::c_int>());
         for descriptor in &mut descriptors {
             let descriptor = libc::c_int::from_ne_bytes(
@@ -759,19 +1011,19 @@ mod implementation {
                     .try_into()
                     .expect("chunks_exact yields one native c_int"),
             );
-            if descriptor >= 0 {
-                // SAFETY: SCM_RIGHTS installed a new owned descriptor in this process. Dropping
-                // the OwnedFd consumes exactly that kernel-transferred ownership.
-                drop(unsafe { OwnedFd::from_raw_fd(descriptor) });
+            if descriptor < 0
+                || owned
+                    .iter()
+                    .any(|owned_descriptor| owned_descriptor.as_raw_fd() == descriptor)
+            {
+                valid = false;
+                continue;
             }
+            // SAFETY: SCM_RIGHTS installed a new descriptor in this process. No earlier payload
+            // entry claimed this raw number, so this creates its single Rust owner.
+            owned.push(unsafe { OwnedFd::from_raw_fd(descriptor) });
         }
-        if descriptors.remainder().is_empty() {
-            Ok(())
-        } else {
-            Err(protocol_error(
-                "misaligned Unix seqpacket descriptor payload",
-            ))
-        }
+        valid && descriptors.remainder().is_empty()
     }
 
     fn read_control_usize(control: &[u8], offset: usize) -> Option<usize> {
@@ -814,14 +1066,12 @@ mod implementation {
             .ok_or_else(|| protocol_error("Unix seqpacket control header alignment overflow"))
     }
 
-    #[cfg(test)]
     fn control_message_space(payload_length: usize) -> Option<usize> {
         control_message_header_length()
             .ok()?
             .checked_add(checked_control_message_align(payload_length)?)
     }
 
-    #[cfg(test)]
     fn control_message_length(payload_length: usize) -> Option<usize> {
         control_message_header_length()
             .ok()?
@@ -831,6 +1081,13 @@ mod implementation {
     fn protocol_error(message: &'static str) -> PlatformError {
         system_call_error(
             "parse Unix seqpacket control data",
+            std::io::Error::new(std::io::ErrorKind::InvalidData, message),
+        )
+    }
+
+    fn handoff_error(message: &'static str) -> PlatformError {
+        system_call_error(
+            "validate Unix seqpacket connection handoff",
             std::io::Error::new(std::io::ErrorKind::InvalidData, message),
         )
     }
@@ -856,6 +1113,144 @@ mod implementation {
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
         enable_record_credentials(fd.as_raw_fd())?;
         Ok(fd)
+    }
+
+    fn validate_transferred_connection(fd: OwnedFd) -> Result<SeqpacketConnection, PlatformError> {
+        let descriptor_flags = descriptor_flags(fd.as_raw_fd())?;
+        if descriptor_flags & libc::FD_CLOEXEC == 0 {
+            return Err(handoff_error(
+                "transferred Unix seqpacket descriptor is not close-on-exec",
+            ));
+        }
+        let domain = socket_integer_option(
+            fd.as_raw_fd(),
+            libc::SO_DOMAIN,
+            "read transferred socket domain",
+        )?;
+        if domain != libc::AF_UNIX {
+            return Err(handoff_error(
+                "transferred connection is not an AF_UNIX socket",
+            ));
+        }
+        let socket_type = socket_integer_option(
+            fd.as_raw_fd(),
+            libc::SO_TYPE,
+            "read transferred socket type",
+        )?;
+        if socket_type != libc::SOCK_SEQPACKET {
+            return Err(handoff_error(
+                "transferred connection is not a SOCK_SEQPACKET socket",
+            ));
+        }
+        let accepting = socket_integer_option(
+            fd.as_raw_fd(),
+            libc::SO_ACCEPTCONN,
+            "read transferred socket listener state",
+        )?;
+        if accepting != 0 {
+            return Err(handoff_error(
+                "transferred Unix seqpacket socket is a listener",
+            ));
+        }
+        require_connected_peer(fd.as_raw_fd())?;
+        enable_record_credentials(fd.as_raw_fd())?;
+        Ok(SeqpacketConnection { fd })
+    }
+
+    fn require_connected_peer(fd: libc::c_int) -> Result<(), PlatformError> {
+        // SAFETY: all-zero is a valid initialized sockaddr_storage value. getpeername may overwrite
+        // at most the exact storage length supplied below.
+        let mut peer = unsafe { std::mem::zeroed::<libc::sockaddr_storage>() };
+        let mut length = libc::socklen_t::try_from(std::mem::size_of_val(&peer))
+            .expect("sockaddr_storage length fits socklen_t");
+        loop {
+            // SAFETY: peer is writable sockaddr storage, length names its capacity, and fd remains
+            // owned and live for the duration of the call.
+            let result = unsafe {
+                libc::getpeername(
+                    fd,
+                    (&raw mut peer).cast::<libc::sockaddr>(),
+                    &raw mut length,
+                )
+            };
+            if result == 0 {
+                let length = usize::try_from(length).map_err(|_| {
+                    handoff_error("transferred Unix seqpacket peer address length is invalid")
+                })?;
+                if length < std::mem::size_of::<libc::sa_family_t>()
+                    || length > std::mem::size_of_val(&peer)
+                {
+                    return Err(handoff_error(
+                        "transferred Unix seqpacket peer address length is invalid",
+                    ));
+                }
+                return Ok(());
+            }
+            let source = std::io::Error::last_os_error();
+            match source.raw_os_error() {
+                Some(libc::EINTR) => {}
+                Some(libc::ENOTCONN) => {
+                    return Err(handoff_error(
+                        "transferred Unix seqpacket socket is not connected",
+                    ));
+                }
+                _ => return Err(system_call_error("read transferred socket peer", source)),
+            }
+        }
+    }
+
+    fn descriptor_flags(fd: libc::c_int) -> Result<libc::c_int, PlatformError> {
+        loop {
+            // SAFETY: fd names an owned live descriptor and F_GETFD has no pointer argument.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            if flags >= 0 {
+                return Ok(flags);
+            }
+            let source = std::io::Error::last_os_error();
+            if source.raw_os_error() != Some(libc::EINTR) {
+                return Err(system_call_error(
+                    "read transferred descriptor flags",
+                    source,
+                ));
+            }
+        }
+    }
+
+    fn socket_integer_option(
+        fd: libc::c_int,
+        option: libc::c_int,
+        operation: &'static str,
+    ) -> Result<libc::c_int, PlatformError> {
+        let mut value = 0 as libc::c_int;
+        let mut length = libc::socklen_t::try_from(std::mem::size_of_val(&value))
+            .expect("integer socket option length fits socklen_t");
+        loop {
+            // SAFETY: value is writable storage for one integer, length describes that storage,
+            // and fd remains owned for the duration of the getsockopt call.
+            let result = unsafe {
+                libc::getsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    option,
+                    (&raw mut value).cast::<libc::c_void>(),
+                    &raw mut length,
+                )
+            };
+            if result == 0 {
+                break;
+            }
+            let source = std::io::Error::last_os_error();
+            if source.raw_os_error() != Some(libc::EINTR) {
+                return Err(system_call_error(operation, source));
+            }
+        }
+        if usize::try_from(length).ok() != Some(std::mem::size_of_val(&value)) {
+            return Err(system_call_error(
+                operation,
+                std::io::Error::from_raw_os_error(libc::EPROTO),
+            ));
+        }
+        Ok(value)
     }
 
     fn enable_record_credentials(fd: libc::c_int) -> Result<(), PlatformError> {
@@ -1081,29 +1476,32 @@ mod implementation {
 
     #[cfg(test)]
     mod record_control_tests {
-        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::net::TcpListener;
+        use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
         use std::time::{Duration, Instant};
 
         use super::{
-            RECEIVE_CONTROL_WORDS, RawSeqpacketReceive, SeqpacketConnection, control_buffer_bytes,
+            ControlMessageCursor, InstalledControl, RECEIVE_CONTROL_WORDS, RawSeqpacketReceive,
+            ReceivedRecordControl, SeqpacketConnection, SeqpacketListener, control_buffer_bytes,
             control_message_header_length, control_message_length, control_message_space,
-            inspect_received_record_control,
+            create_socket, inspect_received_record_control, validate_transferred_connection,
         };
-        use crate::seqpacket::{PeerCredentials, Uid};
+        use crate::PlatformError;
+        use crate::seqpacket::{PeerCredentials, SeqpacketConnectionHandoffReceive, Uid};
 
         #[test]
         fn record_control_requires_one_canonical_kernel_credential() {
             let credentials = current_credentials();
             let canonical = credential_control(credentials);
             assert_eq!(
-                inspect_received_record_control(control_buffer_bytes(&canonical), false)
+                inspect_synthetic_record_control(control_buffer_bytes(&canonical), false)
                     .expect("inspect canonical credentials")
                     .require_canonical_credentials()
                     .expect("canonical credentials are required"),
                 credentials
             );
 
-            let missing = inspect_received_record_control(&[], false)
+            let missing = inspect_synthetic_record_control(&[], false)
                 .expect("inspect absent credentials")
                 .require_canonical_credentials()
                 .expect_err("credentials are mandatory");
@@ -1116,7 +1514,7 @@ mod implementation {
             let mut duplicate = canonical.clone();
             duplicate.extend_from_slice(&canonical);
             let duplicate =
-                inspect_received_record_control(control_buffer_bytes(&duplicate), false)
+                inspect_synthetic_record_control(control_buffer_bytes(&duplicate), false)
                     .expect("inspect duplicate credentials")
                     .require_canonical_credentials()
                     .expect_err("duplicate credentials are not canonical");
@@ -1126,10 +1524,11 @@ mod implementation {
                     .contains("duplicate Unix seqpacket SCM_CREDENTIALS")
             );
 
-            let truncated = inspect_received_record_control(control_buffer_bytes(&canonical), true)
-                .expect("inspect truncated credentials")
-                .require_canonical_credentials()
-                .expect_err("truncated control is not evidence");
+            let truncated =
+                inspect_synthetic_record_control(control_buffer_bytes(&canonical), true)
+                    .expect("inspect truncated credentials")
+                    .require_canonical_credentials()
+                    .expect_err("truncated control is not evidence");
             assert!(
                 truncated
                     .to_string()
@@ -1148,7 +1547,7 @@ mod implementation {
                     .expect("malformed credential length"),
             );
             let malformed =
-                inspect_received_record_control(control_buffer_bytes(&malformed), false)
+                inspect_synthetic_record_control(control_buffer_bytes(&malformed), false)
                     .expect("inspect malformed credentials")
                     .require_canonical_credentials()
                     .expect_err("malformed credentials are not evidence");
@@ -1164,7 +1563,7 @@ mod implementation {
                 std::mem::offset_of!(libc::cmsghdr, cmsg_type),
                 libc::SCM_CREDENTIALS + 1,
             );
-            let unknown = inspect_received_record_control(control_buffer_bytes(&unknown), false)
+            let unknown = inspect_synthetic_record_control(control_buffer_bytes(&unknown), false)
                 .expect("inspect unknown ancillary data")
                 .require_canonical_credentials()
                 .expect_err("unknown ancillary data is not evidence");
@@ -1195,6 +1594,303 @@ mod implementation {
         }
 
         #[test]
+        fn credential_and_ancillary_rejection_closes_every_handoff_descriptor() {
+            let credentials = current_credentials();
+            let (malformed_read_end, malformed_write_end) = nonblocking_pipe();
+            let mut malformed = credential_control(credentials);
+            write_control_usize(
+                control_buffer_bytes_mut(&mut malformed),
+                std::mem::offset_of!(libc::cmsghdr, cmsg_len),
+                control_message_length(std::mem::size_of::<libc::ucred>() - 1)
+                    .expect("malformed credential length"),
+            );
+            malformed.extend(rights_control(&[malformed_read_end.into_raw_fd()]));
+
+            let malformed_error =
+                inspect_synthetic_record_control(control_buffer_bytes(&malformed), false)
+                    .expect("inspect malformed credentials with rights")
+                    .require_canonical_connection_handoff()
+                    .expect_err("malformed credentials reject the handoff");
+            assert!(
+                malformed_error
+                    .to_string()
+                    .contains("invalid Unix seqpacket SCM_CREDENTIALS payload")
+            );
+            assert_writer_has_no_readers(&malformed_write_end);
+
+            let (unexpected_read_end, unexpected_write_end) = nonblocking_pipe();
+            let mut unexpected = credential_control(credentials);
+            let mut unknown = credential_control(credentials);
+            write_control_c_int(
+                control_buffer_bytes_mut(&mut unknown),
+                std::mem::offset_of!(libc::cmsghdr, cmsg_type),
+                libc::SCM_CREDENTIALS + 1,
+            );
+            unexpected.extend(unknown);
+            unexpected.extend(rights_control(&[unexpected_read_end.into_raw_fd()]));
+
+            let unexpected_error =
+                inspect_synthetic_record_control(control_buffer_bytes(&unexpected), false)
+                    .expect("inspect unrelated ancillary data with rights")
+                    .require_canonical_connection_handoff()
+                    .expect_err("unrelated ancillary data rejects the handoff");
+            assert!(
+                unexpected_error
+                    .to_string()
+                    .contains("unexpected Unix seqpacket ancillary data")
+            );
+            assert_writer_has_no_readers(&unexpected_write_end);
+        }
+
+        #[test]
+        fn connection_handoff_rejects_a_non_socket_and_closes_it() {
+            let (producer, collector) = SeqpacketConnection::pair().expect("create pair");
+            let (read_end, write_end) = nonblocking_pipe();
+
+            send_file_descriptors(&producer, read_end.as_raw_fd(), 1);
+            drop(read_end);
+            let error = collector
+                .recv_connection_until(1, Instant::now() + Duration::from_secs(1))
+                .expect_err("a pipe is not a typed seqpacket connection");
+            assert!(error.to_string().contains("read transferred socket domain"));
+            assert_writer_has_no_readers(&write_end);
+        }
+
+        #[test]
+        fn connection_handoff_rejects_multiple_descriptors_and_closes_all_of_them() {
+            let (producer, collector) = SeqpacketConnection::pair().expect("create pair");
+            let (read_end, write_end) = nonblocking_pipe();
+
+            send_file_descriptors(&producer, read_end.as_raw_fd(), 2);
+            drop(read_end);
+            let error = collector
+                .recv_connection_until(1, Instant::now() + Duration::from_secs(1))
+                .expect_err("a handoff record must contain one descriptor");
+            assert!(
+                error
+                    .to_string()
+                    .contains("SCM_RIGHTS must contain exactly one descriptor")
+            );
+            assert_writer_has_no_readers(&write_end);
+        }
+
+        #[test]
+        fn connection_handoff_requires_one_rights_message() {
+            let (producer, collector) = SeqpacketConnection::pair().expect("create pair");
+            producer
+                .send_packet(b"x")
+                .expect("send descriptor-free record");
+
+            let error = collector
+                .recv_connection_until(1, Instant::now() + Duration::from_secs(1))
+                .expect_err("a handoff record requires SCM_RIGHTS");
+            assert!(
+                error
+                    .to_string()
+                    .contains("missing Unix seqpacket SCM_RIGHTS")
+            );
+        }
+
+        #[test]
+        fn connection_handoff_rejects_duplicate_rights_messages_and_closes_every_descriptor() {
+            let credentials = current_credentials();
+            let (first_read_end, first_write_end) = nonblocking_pipe();
+            let (second_read_end, second_write_end) = nonblocking_pipe();
+            let mut control = credential_control(credentials);
+            control.extend(rights_control(&[first_read_end.into_raw_fd()]));
+            control.extend(rights_control(&[second_read_end.into_raw_fd()]));
+
+            let error = inspect_synthetic_record_control(control_buffer_bytes(&control), false)
+                .expect("inspect duplicate rights messages")
+                .require_canonical_connection_handoff()
+                .expect_err("duplicate rights messages are not canonical");
+            assert!(
+                error
+                    .to_string()
+                    .contains("duplicate Unix seqpacket SCM_RIGHTS")
+            );
+            assert_writer_has_no_readers(&first_write_end);
+            assert_writer_has_no_readers(&second_write_end);
+        }
+
+        #[test]
+        fn duplicate_descriptor_numbers_are_owned_and_closed_exactly_once() {
+            let credentials = current_credentials();
+            let (read_end, write_end) = nonblocking_pipe();
+            let raw_read_end = read_end.into_raw_fd();
+            let mut control = credential_control(credentials);
+            control.extend(rights_control(&[raw_read_end, raw_read_end]));
+
+            let error = inspect_synthetic_record_control(control_buffer_bytes(&control), false)
+                .expect("inspect duplicate descriptor numbers")
+                .require_canonical_connection_handoff()
+                .expect_err("duplicate raw descriptor ownership is invalid");
+            assert!(
+                error
+                    .to_string()
+                    .contains("invalid Unix seqpacket SCM_RIGHTS payload")
+            );
+            assert_writer_has_no_readers(&write_end);
+        }
+
+        #[test]
+        fn transferred_connection_requires_close_on_exec() {
+            let (candidate, peer) = SeqpacketConnection::pair().expect("create pair");
+            // SAFETY: candidate owns a live descriptor and these fcntl commands have no pointer
+            // arguments. Clearing FD_CLOEXEC deliberately constructs the rejected boundary case.
+            let flags = unsafe { libc::fcntl(candidate.fd.as_raw_fd(), libc::F_GETFD) };
+            assert!(flags >= 0, "read descriptor flags");
+            // SAFETY: see the descriptor-ownership argument above.
+            let clear_result = unsafe {
+                libc::fcntl(
+                    candidate.fd.as_raw_fd(),
+                    libc::F_SETFD,
+                    flags & !libc::FD_CLOEXEC,
+                )
+            };
+            assert_eq!(
+                clear_result,
+                0,
+                "clear close-on-exec: {}",
+                std::io::Error::last_os_error()
+            );
+            let SeqpacketConnection { fd } = candidate;
+
+            let error = validate_transferred_connection(fd)
+                .expect_err("a transferred endpoint must be close-on-exec");
+            assert!(error.to_string().contains("is not close-on-exec"));
+            assert_eq!(
+                peer.recv_record_until(1, Instant::now() + Duration::from_secs(1))
+                    .expect("observe rejected endpoint close"),
+                Some(crate::seqpacket::SeqpacketReceive::Eof)
+            );
+        }
+
+        #[test]
+        fn transferred_connection_requires_unix_seqpacket_socket_identity() {
+            let inet_listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .expect("bind Internet listener");
+            let inet_address = inet_listener.local_addr().expect("listener address");
+            // SAFETY: into_raw_fd relinquishes the listener's exact descriptor to this OwnedFd.
+            let inet_socket = unsafe { OwnedFd::from_raw_fd(inet_listener.into_raw_fd()) };
+            let domain_error = validate_transferred_connection(inet_socket)
+                .expect_err("a transferred endpoint must be AF_UNIX");
+            assert!(
+                domain_error
+                    .to_string()
+                    .contains("is not an AF_UNIX socket")
+            );
+            let rebound_listener =
+                TcpListener::bind(inet_address).expect("rebind released Internet listener address");
+            drop(rebound_listener);
+
+            let (stream_socket, stream_peer) = unix_socket_pair(libc::SOCK_STREAM);
+            let type_error = validate_transferred_connection(stream_socket)
+                .expect_err("a transferred endpoint must be SOCK_SEQPACKET");
+            assert!(
+                type_error
+                    .to_string()
+                    .contains("is not a SOCK_SEQPACKET socket")
+            );
+            let mut byte = 0_u8;
+            // SAFETY: byte is writable for one byte and stream_peer owns a live connected socket.
+            let received = unsafe {
+                libc::recv(
+                    stream_peer.as_raw_fd(),
+                    (&raw mut byte).cast::<libc::c_void>(),
+                    1,
+                    0,
+                )
+            };
+            assert_eq!(received, 0, "rejected stream endpoint must be closed");
+        }
+
+        #[test]
+        fn transferred_connection_requires_a_connected_non_listener_socket() {
+            let unconnected = create_socket().expect("create unconnected Unix seqpacket socket");
+            let unconnected_error = validate_transferred_connection(unconnected)
+                .expect_err("an unconnected socket is not a connection");
+            assert!(unconnected_error.to_string().contains("is not connected"));
+
+            let directory = tempfile::tempdir().expect("temporary directory");
+            let listener = SeqpacketListener::bind(directory.path().join("listener.sock"))
+                .expect("bind Unix seqpacket listener");
+            let listener_copy = duplicate_owned_fd(listener.fd.as_raw_fd());
+            let listener_error = validate_transferred_connection(listener_copy)
+                .expect_err("a listener is not a connection");
+            assert!(listener_error.to_string().contains("is a listener"));
+        }
+
+        #[test]
+        fn deterministic_arbitrary_control_layouts_never_panic() {
+            let maximum_length = std::mem::size_of::<[usize; RECEIVE_CONTROL_WORDS]>() * 2;
+            for seed in 0_u64..64 {
+                let mut state = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+                for length in 0..=maximum_length {
+                    let mut control = vec![0_u8; length];
+                    for byte in &mut control {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        *byte = state as u8;
+                    }
+                    let messages =
+                        ControlMessageCursor::new(&control).expect("control header layout");
+                    for message in messages {
+                        if message.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            let header_length = control_message_header_length().expect("control header length");
+            for cmsg_len in [0, header_length - 1, header_length, usize::MAX] {
+                let mut control = vec![0_u8; header_length * 3];
+                write_control_usize(
+                    &mut control,
+                    std::mem::offset_of!(libc::cmsghdr, cmsg_len),
+                    cmsg_len,
+                );
+                let messages = ControlMessageCursor::new(&control).expect("control header layout");
+                for message in messages {
+                    if message.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn connection_handoff_reenables_record_credentials() {
+            let (control_sender, control_receiver) =
+                SeqpacketConnection::pair().expect("create control pair");
+            let (candidate, peer) = SeqpacketConnection::pair().expect("create endpoint pair");
+            set_record_credentials(candidate.fd.as_raw_fd(), false);
+
+            control_sender
+                .send_connection(b"x", &candidate)
+                .expect("transfer endpoint");
+            drop(candidate);
+            let received = control_receiver
+                .recv_connection_until(1, Instant::now() + Duration::from_secs(1))
+                .expect("receive endpoint")
+                .expect("handoff must arrive");
+            let SeqpacketConnectionHandoffReceive::Record { connection, .. } = received else {
+                panic!("queued handoff cannot be EOF");
+            };
+
+            peer.send_packet(b"proof")
+                .expect("send credentialled record");
+            assert_eq!(
+                connection
+                    .recv_packet(5)
+                    .expect("promoted endpoint receives kernel credentials"),
+                b"proof"
+            );
+        }
+
+        #[test]
         fn exact_control_buffer_fill_closes_every_received_descriptor() {
             let (producer, collector) = SeqpacketConnection::pair().expect("create pair");
             let (read_end, write_end) = nonblocking_pipe();
@@ -1221,7 +1917,11 @@ mod implementation {
                 "credentials plus rights must exactly fill the receive control buffer"
             );
             assert_eq!(control.credential_messages, 1);
-            assert_eq!(control.unexpected_messages, 1);
+            assert_eq!(control.rights_messages, 1);
+            assert_eq!(control.descriptors.len(), descriptor_count);
+            control
+                .require_canonical_credentials()
+                .expect_err("ordinary records reject rights");
             assert_writer_has_no_readers(&write_end);
         }
 
@@ -1258,6 +1958,9 @@ mod implementation {
             assert_eq!(bytes, b"x");
             assert!(!truncated);
             assert!(control.truncated, "receive must exercise MSG_CTRUNC");
+            control
+                .require_canonical_credentials()
+                .expect_err("truncated control is rejected");
             assert_writer_has_no_readers(&write_end);
         }
 
@@ -1275,6 +1978,33 @@ mod implementation {
             assert_eq!(control_message_space(rights_payload), Some(rights_space));
             assert_eq!(rights_payload % std::mem::size_of::<libc::c_int>(), 0);
             rights_payload / std::mem::size_of::<libc::c_int>()
+        }
+
+        fn inspect_synthetic_record_control(
+            control: &[u8],
+            control_truncated: bool,
+        ) -> Result<ReceivedRecordControl, PlatformError> {
+            // SAFETY: test callers surrender every distinct descriptor encoded in SCM_RIGHTS with
+            // into_raw_fd before this call. Descriptor-free controls satisfy the same contract
+            // vacuously, and this helper creates exactly one ownership token per test buffer.
+            let installed = unsafe { InstalledControl::from_recvmsg(control) };
+            inspect_received_record_control(installed, control_truncated)
+        }
+
+        fn duplicate_owned_fd(fd: libc::c_int) -> OwnedFd {
+            loop {
+                // SAFETY: fd names a live descriptor and F_DUPFD_CLOEXEC returns a distinct owned
+                // descriptor at or above the scalar lower bound.
+                let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+                if duplicate >= 0 {
+                    // SAFETY: successful F_DUPFD_CLOEXEC returned one new owned descriptor.
+                    return unsafe { OwnedFd::from_raw_fd(duplicate) };
+                }
+                let source = std::io::Error::last_os_error();
+                if source.raw_os_error() != Some(libc::EINTR) {
+                    panic!("duplicate descriptor: {source}");
+                }
+            }
         }
 
         fn current_credentials() -> PeerCredentials {
@@ -1331,6 +2061,41 @@ mod implementation {
             control
         }
 
+        fn rights_control(descriptors: &[libc::c_int]) -> Vec<usize> {
+            let payload_length = descriptors
+                .len()
+                .checked_mul(std::mem::size_of::<libc::c_int>())
+                .expect("rights payload length");
+            let control_space = control_message_space(payload_length).expect("rights space");
+            let control_length = control_message_length(payload_length).expect("rights length");
+            let mut control = vec![0_usize; control_space / std::mem::size_of::<usize>()];
+            let control_bytes = control_buffer_bytes_mut(&mut control);
+            write_control_usize(
+                control_bytes,
+                std::mem::offset_of!(libc::cmsghdr, cmsg_len),
+                control_length,
+            );
+            write_control_c_int(
+                control_bytes,
+                std::mem::offset_of!(libc::cmsghdr, cmsg_level),
+                libc::SOL_SOCKET,
+            );
+            write_control_c_int(
+                control_bytes,
+                std::mem::offset_of!(libc::cmsghdr, cmsg_type),
+                libc::SCM_RIGHTS,
+            );
+            let payload_offset = control_message_header_length().expect("control header length");
+            for (index, descriptor) in descriptors.iter().copied().enumerate() {
+                write_control_c_int(
+                    control_bytes,
+                    payload_offset + index * std::mem::size_of::<libc::c_int>(),
+                    descriptor,
+                );
+            }
+            control
+        }
+
         fn nonblocking_pipe() -> (OwnedFd, OwnedFd) {
             let mut pipe_descriptors = [-1; 2];
             // SAFETY: `pipe_descriptors` is writable storage for two new FDs.
@@ -1351,6 +2116,53 @@ mod implementation {
             // SAFETY: see the ownership argument above for the second entry.
             let write_end = unsafe { OwnedFd::from_raw_fd(pipe_descriptors[1]) };
             (read_end, write_end)
+        }
+
+        fn unix_socket_pair(socket_type: libc::c_int) -> (OwnedFd, OwnedFd) {
+            let mut descriptors = [-1; 2];
+            // SAFETY: descriptors is writable storage for two new descriptors and the remaining
+            // socketpair arguments are scalar constants.
+            let result = unsafe {
+                libc::socketpair(
+                    libc::AF_UNIX,
+                    socket_type | libc::SOCK_CLOEXEC,
+                    0,
+                    descriptors.as_mut_ptr(),
+                )
+            };
+            assert_eq!(
+                result,
+                0,
+                "create Unix socket pair: {}",
+                std::io::Error::last_os_error()
+            );
+            // SAFETY: the successful socketpair call initialized two distinct owned descriptors.
+            let first = unsafe { OwnedFd::from_raw_fd(descriptors[0]) };
+            // SAFETY: see the ownership argument above for the second descriptor.
+            let second = unsafe { OwnedFd::from_raw_fd(descriptors[1]) };
+            (first, second)
+        }
+
+        fn set_record_credentials(fd: libc::c_int, enabled: bool) {
+            let enabled = libc::c_int::from(enabled);
+            // SAFETY: enabled is an initialized integer option value, its length is exact, and fd
+            // names a live Unix-domain socket owned by the test.
+            let result = unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_PASSCRED,
+                    (&raw const enabled).cast::<libc::c_void>(),
+                    libc::socklen_t::try_from(std::mem::size_of_val(&enabled))
+                        .expect("option length fits socklen_t"),
+                )
+            };
+            assert_eq!(
+                result,
+                0,
+                "set record credentials: {}",
+                std::io::Error::last_os_error()
+            );
         }
 
         fn assert_writer_has_no_readers(write_end: &OwnedFd) {
@@ -1475,7 +2287,7 @@ mod implementation {
     use std::path::Path;
     use std::time::{Duration, Instant};
 
-    use super::{PeerCredentials, SeqpacketReceive, Uid};
+    use super::{PeerCredentials, SeqpacketConnectionHandoffReceive, SeqpacketReceive, Uid};
     use crate::PlatformError;
 
     #[derive(Debug)]
@@ -1522,6 +2334,14 @@ mod implementation {
             Err(PlatformError::UnsupportedPlatform(std::env::consts::OS))
         }
 
+        pub fn recv_connection_until(
+            &self,
+            _limit: usize,
+            _exclusive_deadline: Instant,
+        ) -> Result<Option<SeqpacketConnectionHandoffReceive>, PlatformError> {
+            Err(PlatformError::UnsupportedPlatform(std::env::consts::OS))
+        }
+
         pub fn peer_credentials(&self) -> Result<PeerCredentials, PlatformError> {
             Err(PlatformError::UnsupportedPlatform(std::env::consts::OS))
         }
@@ -1542,6 +2362,14 @@ mod implementation {
         }
 
         pub fn send_packet(&self, _packet: &[u8]) -> Result<(), PlatformError> {
+            Err(PlatformError::UnsupportedPlatform(std::env::consts::OS))
+        }
+
+        pub fn send_connection(
+            &self,
+            _payload: &[u8],
+            _connection: &SeqpacketConnection,
+        ) -> Result<(), PlatformError> {
             Err(PlatformError::UnsupportedPlatform(std::env::consts::OS))
         }
     }

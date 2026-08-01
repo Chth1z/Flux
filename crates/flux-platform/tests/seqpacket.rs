@@ -7,7 +7,10 @@ use std::sync::{Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use flux_platform::{PlatformError, SeqpacketConnection, SeqpacketListener, SeqpacketReceive, Uid};
+use flux_platform::{
+    PlatformError, SeqpacketConnection, SeqpacketConnectionHandoffReceive, SeqpacketListener,
+    SeqpacketReceive, Uid,
+};
 use tempfile::tempdir;
 
 const STALE_SOCKET_HELPER_ENV: &str = "FLUX_SEQPACKET_STALE_SOCKET_HELPER";
@@ -52,6 +55,117 @@ fn anonymous_pair_preserves_record_truncation_empty_records_and_eof() {
             .expect("observe producer close"),
         Some(SeqpacketReceive::Eof)
     );
+}
+
+#[test]
+fn typed_connection_handoff_preserves_payload_credentials_transport_and_eof() {
+    let (control_sender, control_receiver) =
+        SeqpacketConnection::pair().expect("create control pair");
+    let expected_credentials = control_receiver
+        .peer_credentials()
+        .expect("control sender credentials");
+    let (producer_endpoint, collector_endpoint) =
+        SeqpacketConnection::pair().expect("create report pair");
+
+    control_sender
+        .send_connection(b"attempt-7", &producer_endpoint)
+        .expect("transfer producer endpoint");
+    assert!(
+        control_receiver
+            .recv_connection_until(64, Instant::now())
+            .expect("observe expired handoff deadline")
+            .is_none(),
+        "an expired deadline must not consume a queued handoff"
+    );
+    drop(producer_endpoint);
+    let received = control_receiver
+        .recv_connection_until(64, fresh_deadline())
+        .expect("receive producer endpoint")
+        .expect("handoff must arrive");
+    let SeqpacketConnectionHandoffReceive::Record {
+        bytes,
+        credentials,
+        connection,
+    } = received
+    else {
+        panic!("queued handoff cannot be EOF");
+    };
+    assert_eq!(bytes, b"attempt-7");
+    assert_eq!(credentials, expected_credentials);
+
+    collector_endpoint
+        .send_packet(b"challenge")
+        .expect("send collector challenge");
+    assert_eq!(receive_complete_record(&connection, 64), b"challenge");
+    connection
+        .send_packet(b"report")
+        .expect("send report through transferred endpoint");
+    assert_eq!(receive_complete_record(&collector_endpoint, 64), b"report");
+
+    drop(connection);
+    assert_eq!(
+        collector_endpoint
+            .recv_record_until(64, fresh_deadline())
+            .expect("observe transferred endpoint close"),
+        Some(SeqpacketReceive::Eof)
+    );
+    drop(control_sender);
+    assert!(matches!(
+        control_receiver
+            .recv_connection_until(64, fresh_deadline())
+            .expect("observe control sender close"),
+        Some(SeqpacketConnectionHandoffReceive::Eof)
+    ));
+}
+
+#[test]
+fn truncated_connection_handoff_closes_the_transferred_endpoint() {
+    let (control_sender, control_receiver) =
+        SeqpacketConnection::pair().expect("create control pair");
+    let (producer_endpoint, collector_endpoint) =
+        SeqpacketConnection::pair().expect("create report pair");
+
+    control_sender
+        .send_connection(b"oversized", &producer_endpoint)
+        .expect("transfer producer endpoint");
+    drop(producer_endpoint);
+    let error = control_receiver
+        .recv_connection_until(4, fresh_deadline())
+        .expect_err("a handoff payload must not be truncated");
+    match error {
+        PlatformError::PacketTooLarge { actual, limit } => {
+            assert_eq!((actual, limit), (9, 4));
+        }
+        other => panic!("unexpected handoff truncation error: {other}"),
+    }
+    assert_eq!(
+        collector_endpoint
+            .recv_record_until(64, fresh_deadline())
+            .expect("observe rejected endpoint close"),
+        Some(SeqpacketReceive::Eof)
+    );
+}
+
+fn fresh_deadline() -> Instant {
+    Instant::now() + Duration::from_secs(1)
+}
+
+fn receive_complete_record(connection: &SeqpacketConnection, limit: usize) -> Vec<u8> {
+    match connection
+        .recv_record_until(limit, fresh_deadline())
+        .expect("receive deadline-bound authenticated record")
+        .expect("record must arrive before the deadline")
+    {
+        SeqpacketReceive::Record {
+            bytes,
+            truncated: false,
+            ..
+        } => bytes,
+        SeqpacketReceive::Record {
+            truncated: true, ..
+        } => panic!("record must not be truncated"),
+        SeqpacketReceive::Eof => panic!("record must precede EOF"),
+    }
 }
 
 #[test]

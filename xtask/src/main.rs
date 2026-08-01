@@ -109,13 +109,14 @@ const NATIVE_COMPOSITION_REQUIRED_ENV: &str = "FLUX_NATIVE_COMPOSITION_REQUIRED"
 const NATIVE_COMPOSITION_TEST: &str = "functional_canary::linux_namespace_harness::privileged_native_composition_exercises_lifecycle_recovery_and_exact_cleanup";
 const NATIVE_COMPOSITION_FEATURE: &str = "native-composition-test";
 const NATIVE_COMPOSITION_ENGINE_BIN: &str = "flux-native-composition-engine";
-const PARSER_FUZZ_SMOKE_TESTS: [&str; 7] = [
+const PARSER_FUZZ_SMOKE_TESTS: [&str; 8] = [
     "address_sync::tests::deterministic_arbitrary_datagrams_never_panic",
     "netlink::link::tests::deterministic_arbitrary_datagrams_never_panic",
     "netlink::route::tests::deterministic_arbitrary_datagrams_never_panic",
     "netlink::rule::tests::deterministic_arbitrary_datagrams_never_panic",
     "netlink::route::tests::complex_route_prefixes_and_structured_mutations_are_atomic_and_panic_free",
     "netlink::rule::tests::complex_rule_prefixes_and_structured_mutations_are_atomic_and_panic_free",
+    "seqpacket::implementation::record_control_tests::deterministic_arbitrary_control_layouts_never_panic",
     "socket_diagnostics::tests::deterministic_arbitrary_datagrams_never_panic",
 ];
 const LINUX_CANARY_INTERNAL_ENVS: [&str; 27] = [

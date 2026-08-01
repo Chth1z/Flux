@@ -97,7 +97,8 @@ pub use reactor::{
     ReactorStopHandle, StopDisposition,
 };
 pub use seqpacket::{
-    PeerCredentials, SeqpacketConnection, SeqpacketListener, SeqpacketReceive, Uid,
+    PeerCredentials, SeqpacketConnection, SeqpacketConnectionHandoffReceive, SeqpacketListener,
+    SeqpacketReceive, Uid,
 };
 pub use shutdown::ShutdownSignal;
 pub use sing_box::{

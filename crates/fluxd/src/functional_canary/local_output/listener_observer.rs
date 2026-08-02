@@ -333,12 +333,19 @@ fn invalid(diagnostic: &str) -> FunctionalCanaryError {
 #[cfg(test)]
 mod tests {
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    use std::fs;
-    #[cfg(any(target_os = "linux", target_os = "android"))]
     use std::net::{Ipv4Addr, TcpListener, UdpSocket};
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
+    use std::num::{NonZeroU16, NonZeroU64};
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    use std::os::fd::AsRawFd;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    use std::os::unix::process::CommandExt;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    use std::process::{Child, Command};
     use std::time::Duration;
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    use flux_platform::ProcessHandle;
 
     use super::super::super::CanaryAddressFamilies;
     use super::super::super::tests::Fixture;
@@ -475,16 +482,14 @@ mod tests {
         let tcp_listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
         let port = NonZeroU16::new(tcp_listener.local_addr().unwrap().port()).unwrap();
         let udp_listener = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, port.get())).unwrap();
-
-        let stat = fs::read("/proc/self/stat").unwrap();
-        let command_end = stat.iter().rposition(|byte| *byte == b')').unwrap();
-        let fields = stat[command_end + 2..]
-            .split(|byte| byte.is_ascii_whitespace())
-            .filter(|field| !field.is_empty())
-            .collect::<Vec<_>>();
+        let listener_owner = ListenerOwnerChild::spawn(&tcp_listener, &udp_listener);
+        let process_handle = ProcessHandle::open_child(listener_owner.child())
+            .expect("open listener-owner process handle");
+        let identity = process_handle.identity();
+        drop((tcp_listener, udp_listener));
         let process = crate::engine_supervisor::OwnedEngineIdentity::new(
-            NonZeroU32::new(std::process::id()).unwrap(),
-            NonZeroU64::new(std::str::from_utf8(fields[19]).unwrap().parse().unwrap()).unwrap(),
+            identity.pid(),
+            identity.start_time_ticks(),
         );
         request.pre_binding.engine.engine = process;
         request.pre_binding.engine.listener.port = port;
@@ -524,6 +529,50 @@ mod tests {
         };
         assert_eq!(error.kind(), CanaryErrorKind::InvalidEvidence);
         assert_eq!(error.cleanup(), CanaryCleanupStatus::Uncertain);
-        drop((tcp_listener, udp_listener));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    struct ListenerOwnerChild(Option<Child>);
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    impl ListenerOwnerChild {
+        fn spawn(tcp_listener: &TcpListener, udp_listener: &UdpSocket) -> Self {
+            let descriptors = [tcp_listener.as_raw_fd(), udp_listener.as_raw_fd()];
+            let flags = descriptors.map(|descriptor| {
+                // SAFETY: each descriptor is borrowed from a live socket for this call.
+                let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+                assert!(flags >= 0, "read listener descriptor flags");
+                flags
+            });
+            let mut command = Command::new("sleep");
+            command.arg("30");
+            // SAFETY: the closure calls only async-signal-safe `fcntl` with borrowed descriptors
+            // that remain live through spawn. It clears close-on-exec only in the child process.
+            unsafe {
+                command.pre_exec(move || {
+                    for (descriptor, flags) in descriptors.into_iter().zip(flags) {
+                        if libc::fcntl(descriptor, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    }
+                    Ok(())
+                });
+            }
+            Self(Some(command.spawn().expect("spawn listener-owner child")))
+        }
+
+        fn child(&self) -> &Child {
+            self.0.as_ref().expect("listener-owner child is retained")
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    impl Drop for ListenerOwnerChild {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
     }
 }

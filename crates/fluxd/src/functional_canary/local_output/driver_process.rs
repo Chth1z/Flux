@@ -630,7 +630,7 @@ mod tests {
     use crate::functional_canary::{
         CANARY_PEER_SERVER_SLOTS, CanaryProcessIdentity, CanaryProcessRetirementEvidence,
     };
-    use flux_platform::{ProcessHandle, ProcessHandleErrorKind};
+    use flux_platform::ProcessHandle;
 
     fn sleeping_child(role: DriverProcessRole) -> RetainedDriverChild {
         let child = Command::new("sleep")
@@ -729,18 +729,20 @@ mod tests {
             .expect("kill retained child before quiescence");
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
-            match child
-                .handle
-                .as_ref()
-                .expect("retained authority owns its process handle")
-                .reobserve()
-            {
-                Err(error) if error.kind() == ProcessHandleErrorKind::Exited => break,
-                Ok(_) if Instant::now() < deadline => std::thread::yield_now(),
-                observation => {
-                    panic!("unexpected pre-quiescence exit observation: {observation:?}")
-                }
+            let status = child
+                .child
+                .as_mut()
+                .expect("retained authority owns its child until retirement")
+                .try_wait()
+                .expect("observe retained child exit");
+            if status.is_some() {
+                break;
             }
+            assert!(
+                Instant::now() < deadline,
+                "retained child did not exit before the test deadline"
+            );
+            std::thread::yield_now();
         }
         let quiesced_at = Instant::now();
 

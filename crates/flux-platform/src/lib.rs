@@ -165,8 +165,9 @@ pub mod internal {
         EngineCredentialProbeStage,
     };
     pub use crate::sing_box::{
-        PinnedSingBoxLaunch, ProcessDiagnostics, SingBoxChild, SingBoxChildIdentity,
-        SingBoxExecutablePrivilegeAttribute, SingBoxProcessAdapter, SingBoxProcessError,
+        PinnedSingBoxLaunch, ProcessDiagnostics, SING_BOX_LAUNCH_CONTROL_FD_ENV, SingBoxChild,
+        SingBoxChildIdentity, SingBoxExecutablePrivilegeAttribute, SingBoxLaunchControl,
+        SingBoxLaunchControlClaimError, SingBoxProcessAdapter, SingBoxProcessError,
         SingBoxVersionReport, TerminationOutcome, ValidationReport,
     };
 }

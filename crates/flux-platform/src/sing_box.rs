@@ -17,6 +17,9 @@ use crate::process::{
     ProcessHandle, ProcessHandleError, ProcessHandleOpenError, ProcessHandleOpenStage,
     ProcessIdentity,
 };
+use crate::{
+    PlatformError, SeqpacketConnection, SeqpacketConnectionHandoffReceive, SeqpacketReceive,
+};
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use std::collections::HashSet;
@@ -33,6 +36,8 @@ const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const CLEANUP_GRACE: Duration = Duration::from_millis(250);
 const CAPTURE_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 const INTERFACE_NAME_MAX_BYTES: usize = 15;
+pub const SING_BOX_LAUNCH_CONTROL_FD_ENV: &str = "FLUX_SING_BOX_LAUNCH_CONTROL_FD";
+static INHERITED_SING_BOX_LAUNCH_CONTROL_CLAIMED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SingBoxProcessAdapter;
@@ -136,6 +141,7 @@ impl SingBoxChildIdentity {
 pub struct SingBoxChild {
     child: Option<Child>,
     identity: SingBoxChildIdentity,
+    launch_control: SingBoxLaunchControl,
     reaped_exit: Option<SingBoxExit>,
     log: File,
     log_path: PathBuf,
@@ -145,6 +151,11 @@ impl SingBoxChild {
     #[must_use]
     pub const fn identity(&self) -> &SingBoxChildIdentity {
         &self.identity
+    }
+
+    #[must_use]
+    pub const fn launch_control(&self) -> &SingBoxLaunchControl {
+        &self.launch_control
     }
 
     /// Open an exact child-origin process handle without transferring the
@@ -188,6 +199,115 @@ impl SingBoxChild {
             ));
         }
         Ok(handle)
+    }
+}
+
+/// Private record transport retained with one exact pinned Sing-Box child.
+///
+/// The interface transfers typed seqpacket connections without exposing the inherited descriptor.
+pub struct SingBoxLaunchControl {
+    connection: SeqpacketConnection,
+}
+
+impl SingBoxLaunchControl {
+    /// Claims the one launch endpoint admitted by the parent before `exec`.
+    ///
+    /// The process-wide guard makes this a consuming operation even though the descriptor number
+    /// remains present in the environment for non-Rust engine implementations.
+    ///
+    /// # Safety
+    ///
+    /// When the environment key is present, its descriptor must be the caller's sole unowned
+    /// inherited endpoint. No Rust value may own it, and no concurrent code may close or replace
+    /// it while this function claims it.
+    pub unsafe fn claim_inherited() -> Result<Option<Self>, SingBoxLaunchControlClaimError> {
+        let Some(encoded) = std::env::var_os(SING_BOX_LAUNCH_CONTROL_FD_ENV) else {
+            return Ok(None);
+        };
+        if INHERITED_SING_BOX_LAUNCH_CONTROL_CLAIMED
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(SingBoxLaunchControlClaimError::AlreadyClaimed);
+        }
+        let encoded = encoded
+            .to_str()
+            .ok_or(SingBoxLaunchControlClaimError::InvalidDescriptorEnvironment)?;
+        let descriptor = encoded
+            .parse::<i32>()
+            .ok()
+            .filter(|descriptor| descriptor.to_string() == encoded)
+            .ok_or(SingBoxLaunchControlClaimError::InvalidDescriptorEnvironment)?;
+        // SAFETY: upheld by this function's caller for the canonical descriptor parsed above.
+        let connection = unsafe { SeqpacketConnection::claim_inherited(descriptor) }
+            .map_err(SingBoxLaunchControlClaimError::Transport)?;
+        Ok(Some(Self { connection }))
+    }
+
+    pub fn send_connection(
+        &self,
+        frame: &[u8],
+        connection: &SeqpacketConnection,
+    ) -> Result<(), PlatformError> {
+        self.connection.send_connection(frame, connection)
+    }
+
+    pub fn recv_record_until(
+        &self,
+        limit: usize,
+        exclusive_deadline: Instant,
+    ) -> Result<Option<SeqpacketReceive>, PlatformError> {
+        self.connection.recv_record_until(limit, exclusive_deadline)
+    }
+
+    pub fn recv_connection_until(
+        &self,
+        limit: usize,
+        exclusive_deadline: Instant,
+    ) -> Result<Option<SeqpacketConnectionHandoffReceive>, PlatformError> {
+        self.connection
+            .recv_connection_until(limit, exclusive_deadline)
+    }
+}
+
+impl fmt::Debug for SingBoxLaunchControl {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SingBoxLaunchControl")
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug)]
+pub enum SingBoxLaunchControlClaimError {
+    AlreadyClaimed,
+    InvalidDescriptorEnvironment,
+    Transport(PlatformError),
+}
+
+impl fmt::Display for SingBoxLaunchControlClaimError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AlreadyClaimed => {
+                formatter.write_str("Sing-Box launch control was already claimed")
+            }
+            Self::InvalidDescriptorEnvironment => write!(
+                formatter,
+                "{SING_BOX_LAUNCH_CONTROL_FD_ENV} is not one canonical descriptor number"
+            ),
+            Self::Transport(source) => {
+                write!(formatter, "cannot claim Sing-Box launch control: {source}")
+            }
+        }
+    }
+}
+
+impl Error for SingBoxLaunchControlClaimError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Transport(source) => Some(source),
+            Self::AlreadyClaimed | Self::InvalidDescriptorEnvironment => None,
+        }
     }
 }
 
@@ -321,6 +441,9 @@ pub enum SingBoxProcessError {
         path: PathBuf,
         source: io::Error,
     },
+    LaunchControl {
+        source: PlatformError,
+    },
     Spawn {
         program: PathBuf,
         source: io::Error,
@@ -429,6 +552,7 @@ impl SingBoxProcessError {
             Self::UnsupportedPlatform { .. }
             | Self::InvalidSpec { .. }
             | Self::OpenLog { .. }
+            | Self::LaunchControl { .. }
             | Self::Spawn { .. }
             | Self::ReadChildIdentity { .. }
             | Self::PinnedDescriptor { .. }
@@ -464,6 +588,12 @@ impl fmt::Display for SingBoxProcessError {
                     formatter,
                     "cannot open Sing-Box log {}: {source}",
                     path.display()
+                )
+            }
+            Self::LaunchControl { source } => {
+                write!(
+                    formatter,
+                    "cannot establish Sing-Box launch control: {source}"
                 )
             }
             Self::Spawn { program, source } => {
@@ -596,6 +726,7 @@ impl Error for SingBoxProcessError {
             | Self::CaptureWorkerSpawn { source, .. }
             | Self::ValidationGroupSignal { source, .. }
             | Self::ReadinessProbe { source, .. } => Some(source),
+            Self::LaunchControl { source } => Some(source),
             Self::UnsupportedPlatform { .. }
             | Self::InvalidSpec { .. }
             | Self::UnsafeExecutablePrivilege { .. }
@@ -778,9 +909,19 @@ impl SingBoxProcessAdapter {
         spec: &SingBoxLaunchSpec,
     ) -> Result<SingBoxChild, SingBoxProcessError> {
         let log = open_log_streams(&spec.log)?;
+        let (launch_control, inherited_control) = SeqpacketConnection::pair()
+            .map_err(|source| SingBoxProcessError::LaunchControl { source })?;
+        let inherited_descriptor = inherited_control.inherited_descriptor();
+        prepared.inherited_fds.push(inherited_descriptor);
+        prepared.inherited_fds.sort_unstable();
+        prepared.inherited_fds.dedup();
         prepared
             .command
             .current_dir(&spec.working_directory)
+            .env(
+                SING_BOX_LAUNCH_CONTROL_FD_ENV,
+                inherited_descriptor.to_string(),
+            )
             .stdin(Stdio::null())
             .stdout(Stdio::from(log.stdout))
             .stderr(Stdio::from(log.stderr));
@@ -798,6 +939,7 @@ impl SingBoxProcessAdapter {
                 program: prepared.program,
                 source,
             })?;
+        drop(inherited_control);
         let pid = child.id();
         let identity = match read_child_identity(pid) {
             Ok(identity) => identity,
@@ -809,6 +951,9 @@ impl SingBoxProcessAdapter {
         Ok(SingBoxChild {
             child: Some(child),
             identity,
+            launch_control: SingBoxLaunchControl {
+                connection: launch_control,
+            },
             reaped_exit: None,
             log: log.diagnostic,
             log_path: spec.log.clone(),
@@ -1092,7 +1237,11 @@ fn pinned_base_command(
     inherited_fds.sort_unstable();
     inherited_fds.dedup();
     Ok(PreparedCommand {
-        command: Command::new(&binary),
+        command: {
+            let mut command = Command::new(&binary);
+            command.env_remove(SING_BOX_LAUNCH_CONTROL_FD_ENV);
+            command
+        },
         program: binary,
         inherited_fds,
     })
@@ -1906,8 +2055,8 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     use super::{
         ProcessHandleError, ProcessHandleOpenStage, ReadinessEvidence, SingBoxChild,
-        SingBoxExecutablePrivilegeAttribute, SingBoxProcessAdapter, SingBoxProcessError,
-        listener_evidence, proc_net_contains_port, read_child_identity,
+        SingBoxExecutablePrivilegeAttribute, SingBoxLaunchControl, SingBoxProcessAdapter,
+        SingBoxProcessError, listener_evidence, proc_net_contains_port, read_child_identity,
         validate_executable_privilege_state,
     };
     use super::{bounded_lossy_tail, retain_tail};
@@ -1919,6 +2068,14 @@ mod tests {
     use std::process::Command;
     #[cfg(any(target_os = "linux", target_os = "android"))]
     use std::time::Duration;
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn launch_control_fixture() -> SingBoxLaunchControl {
+        let (connection, peer) =
+            crate::SeqpacketConnection::pair().expect("create control fixture");
+        drop(peer);
+        SingBoxLaunchControl { connection }
+    }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
@@ -1958,6 +2115,7 @@ mod tests {
         let mut child = SingBoxChild {
             child: Some(process),
             identity,
+            launch_control: launch_control_fixture(),
             reaped_exit: None,
             log: File::create(&log_path).expect("create child log"),
             log_path,
@@ -1993,6 +2151,7 @@ mod tests {
         let mut child = SingBoxChild {
             child: Some(process),
             identity: changed_identity,
+            launch_control: launch_control_fixture(),
             reaped_exit: None,
             log: File::create(&log_path).expect("create child log"),
             log_path,

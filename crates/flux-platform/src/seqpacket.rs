@@ -496,6 +496,40 @@ mod implementation {
             Ok((Self { fd: first }, Self { fd: second }))
         }
 
+        pub(crate) fn inherited_descriptor(&self) -> libc::c_int {
+            self.fd.as_raw_fd()
+        }
+
+        /// Claims one descriptor that crossed an exact child `exec` with close-on-exec cleared.
+        ///
+        /// # Safety
+        ///
+        /// `descriptor` must name the caller's sole unowned copy of the inherited endpoint. No
+        /// other Rust value may own it, and no concurrent code may close or replace it while this
+        /// function validates and claims it.
+        pub(crate) unsafe fn claim_inherited(
+            descriptor: libc::c_int,
+        ) -> Result<Self, PlatformError> {
+            if descriptor < 3 {
+                return Err(handoff_error(
+                    "inherited Unix seqpacket descriptor overlaps standard streams",
+                ));
+            }
+            // SAFETY: the caller guarantees this is the sole unowned inherited descriptor. Taking
+            // ownership before validation makes every subsequent rejection close it fail-closed.
+            let fd = unsafe { OwnedFd::from_raw_fd(descriptor) };
+            let flags = descriptor_flags(fd.as_raw_fd())?;
+            if flags & libc::FD_CLOEXEC != 0 {
+                return Err(handoff_error(
+                    "inherited Unix seqpacket descriptor did not cross exec",
+                ));
+            }
+            validate_connection_object(fd.as_raw_fd())?;
+            set_descriptor_close_on_exec(fd.as_raw_fd(), flags)?;
+            enable_record_credentials(fd.as_raw_fd())?;
+            Ok(Self { fd })
+        }
+
         pub fn connect(path: impl AsRef<Path>) -> Result<Self, PlatformError> {
             let fd = create_socket()?;
             let (address, length) = socket_address(path.as_ref())?;
@@ -1122,28 +1156,26 @@ mod implementation {
                 "transferred Unix seqpacket descriptor is not close-on-exec",
             ));
         }
-        let domain = socket_integer_option(
-            fd.as_raw_fd(),
-            libc::SO_DOMAIN,
-            "read transferred socket domain",
-        )?;
+        validate_connection_object(fd.as_raw_fd())?;
+        enable_record_credentials(fd.as_raw_fd())?;
+        Ok(SeqpacketConnection { fd })
+    }
+
+    fn validate_connection_object(fd: libc::c_int) -> Result<(), PlatformError> {
+        let domain = socket_integer_option(fd, libc::SO_DOMAIN, "read transferred socket domain")?;
         if domain != libc::AF_UNIX {
             return Err(handoff_error(
                 "transferred connection is not an AF_UNIX socket",
             ));
         }
-        let socket_type = socket_integer_option(
-            fd.as_raw_fd(),
-            libc::SO_TYPE,
-            "read transferred socket type",
-        )?;
+        let socket_type = socket_integer_option(fd, libc::SO_TYPE, "read transferred socket type")?;
         if socket_type != libc::SOCK_SEQPACKET {
             return Err(handoff_error(
                 "transferred connection is not a SOCK_SEQPACKET socket",
             ));
         }
         let accepting = socket_integer_option(
-            fd.as_raw_fd(),
+            fd,
             libc::SO_ACCEPTCONN,
             "read transferred socket listener state",
         )?;
@@ -1152,9 +1184,7 @@ mod implementation {
                 "transferred Unix seqpacket socket is a listener",
             ));
         }
-        require_connected_peer(fd.as_raw_fd())?;
-        enable_record_credentials(fd.as_raw_fd())?;
-        Ok(SeqpacketConnection { fd })
+        require_connected_peer(fd)
     }
 
     fn require_connected_peer(fd: libc::c_int) -> Result<(), PlatformError> {
@@ -1210,6 +1240,27 @@ mod implementation {
             if source.raw_os_error() != Some(libc::EINTR) {
                 return Err(system_call_error(
                     "read transferred descriptor flags",
+                    source,
+                ));
+            }
+        }
+    }
+
+    fn set_descriptor_close_on_exec(
+        fd: libc::c_int,
+        flags: libc::c_int,
+    ) -> Result<(), PlatformError> {
+        loop {
+            // SAFETY: fd names the inherited live descriptor and F_SETFD consumes one scalar flag
+            // value. The caller immediately establishes its sole Rust owner after success.
+            let result = unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
+            if result == 0 {
+                return Ok(());
+            }
+            let source = std::io::Error::last_os_error();
+            if source.raw_os_error() != Some(libc::EINTR) {
+                return Err(system_call_error(
+                    "restore close-on-exec on inherited Unix seqpacket descriptor",
                     source,
                 ));
             }
@@ -2315,6 +2366,17 @@ mod implementation {
 
     impl SeqpacketConnection {
         pub fn pair() -> Result<(Self, Self), PlatformError> {
+            Err(PlatformError::UnsupportedPlatform(std::env::consts::OS))
+        }
+
+        pub(crate) const fn inherited_descriptor(&self) -> i32 {
+            -1
+        }
+
+        /// # Safety
+        ///
+        /// The descriptor must be the caller's sole unowned inherited endpoint.
+        pub(crate) unsafe fn claim_inherited(_descriptor: i32) -> Result<Self, PlatformError> {
             Err(PlatformError::UnsupportedPlatform(std::env::consts::OS))
         }
 

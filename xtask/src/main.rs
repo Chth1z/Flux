@@ -106,6 +106,7 @@ const LINUX_OUTPUT_TPROXY_CANARY_TEST: &str = "functional_canary::linux_namespac
 const ANDROID_ENGINE_CREDENTIAL_CANARY_TEST: &str = "functional_canary::linux_namespace_harness::privileged_android_engine_credentials_exercise_exact_cleanup";
 const LINUX_OUTPUT_UID_PREFLIGHT_TEST: &str = "functional_canary::linux_namespace_harness::privileged_local_output_distinct_uid_capability_preflight";
 const NATIVE_COMPOSITION_REQUIRED_ENV: &str = "FLUX_NATIVE_COMPOSITION_REQUIRED";
+const NATIVE_COMPOSITION_ENGINE_BIN_ENV: &str = "FLUX_NATIVE_COMPOSITION_ENGINE_BIN";
 const NATIVE_COMPOSITION_TEST: &str = "functional_canary::linux_namespace_harness::privileged_native_composition_exercises_lifecycle_recovery_and_exact_cleanup";
 const NATIVE_COMPOSITION_FEATURE: &str = "native-composition-test";
 const NATIVE_COMPOSITION_ENGINE_BIN: &str = "flux-native-composition-engine";
@@ -301,6 +302,7 @@ fn test_native_composition_linux() -> Result<(), String> {
         "build",
         "-p",
         "fluxd",
+        "--release",
         "--features",
         NATIVE_COMPOSITION_FEATURE,
         "--bin",
@@ -326,20 +328,43 @@ fn test_native_composition_linux() -> Result<(), String> {
         );
     }
 
-    cargo_scrubbed([
-        "test",
-        "-p",
-        "fluxd",
-        "--features",
-        NATIVE_COMPOSITION_FEATURE,
-        "--lib",
-        NATIVE_COMPOSITION_TEST,
-        "--",
-        "--ignored",
-        "--exact",
-        "--nocapture",
-        "--test-threads=1",
-    ])
+    let engine = workspace_root()?
+        .join("target")
+        .join("release")
+        .join(format!(
+            "{NATIVE_COMPOSITION_ENGINE_BIN}{}",
+            env::consts::EXE_SUFFIX
+        ));
+    let metadata = fs::symlink_metadata(&engine).map_err(|error| {
+        format!(
+            "release native-composition engine fixture {} is unavailable: {error}",
+            engine.display()
+        )
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "release native-composition engine fixture {} is not a regular file",
+            engine.display()
+        ));
+    }
+
+    cargo_scrubbed_with_env(
+        [
+            "test",
+            "-p",
+            "fluxd",
+            "--features",
+            NATIVE_COMPOSITION_FEATURE,
+            "--lib",
+            NATIVE_COMPOSITION_TEST,
+            "--",
+            "--ignored",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+        ],
+        &[(NATIVE_COMPOSITION_ENGINE_BIN_ENV, engine.as_os_str())],
+    )
 }
 
 fn test_parser_fuzz_smoke() -> Result<(), String> {
@@ -2474,10 +2499,20 @@ fn cargo_stdout<const N: usize>(args: [&str; N]) -> Result<String, String> {
 }
 
 fn cargo_scrubbed<const N: usize>(args: [&str; N]) -> Result<(), String> {
+    cargo_scrubbed_with_env(args, &[])
+}
+
+fn cargo_scrubbed_with_env<const N: usize>(
+    args: [&str; N],
+    envs: &[(&str, &std::ffi::OsStr)],
+) -> Result<(), String> {
     let rendered = format!("cargo {}", args.join(" "));
     let mut command = Command::new("cargo");
     command.args(args);
     scrub_linux_canary_internal_environment(&mut command);
+    for (key, value) in envs {
+        command.env(key, value);
+    }
     let status = command
         .status()
         .map_err(|error| format!("failed to execute `{rendered}`: {error}"))?;

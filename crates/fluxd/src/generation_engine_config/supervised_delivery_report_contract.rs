@@ -14,6 +14,16 @@ pub(crate) const ENGINE_SUPERVISED_DELIVERY_REPORT_MAX_FRAME_BYTES: u16 =
     ENGINE_SUPERVISED_DELIVERY_REPORT_TCP_FRAME_BYTES;
 pub(crate) const ENGINE_SUPERVISED_DELIVERY_REPORT_MAX_EVENTS: u8 = 8;
 
+pub(crate) const ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_SCHEMA_VERSION: u16 = 1;
+pub(crate) const ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_MAGIC: [u8; 8] = *b"FLXHND1\0";
+pub(crate) const ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_FRAME_BYTES: u16 = 160;
+pub(crate) const ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_ATTEMPT_KIND: u8 = 1;
+pub(crate) const ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_IPV4_FLAG: u8 = 1 << 0;
+pub(crate) const ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_IPV6_FLAG: u8 = 1 << 1;
+pub(crate) const ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_TPROXY_BACKEND: u8 = 1;
+pub(crate) const ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_IPV4_FLOW_MASK: u8 = 0x0f;
+pub(crate) const ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_DUAL_STACK_FLOW_MASK: u8 = 0xff;
+
 pub(crate) const ENGINE_SUPERVISED_DELIVERY_REPORT_OFFSET_MAGIC: usize = 0;
 pub(crate) const ENGINE_SUPERVISED_DELIVERY_REPORT_OFFSET_SCHEMA_VERSION: usize = 8;
 pub(crate) const ENGINE_SUPERVISED_DELIVERY_REPORT_OFFSET_KIND: usize = 10;
@@ -219,6 +229,82 @@ pub(crate) const ENGINE_SUPERVISED_DELIVERY_REPORT_PAYLOAD_TCP_LENGTH_FIELD:
     EngineSupervisedDeliveryReportWireField = EngineSupervisedDeliveryReportWireField::new(38, 2);
 pub(crate) const ENGINE_SUPERVISED_DELIVERY_REPORT_PAYLOAD_QUESTION_DIGEST_FIELD:
     EngineSupervisedDeliveryReportWireField = EngineSupervisedDeliveryReportWireField::new(40, 32);
+
+pub(crate) const ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_MAGIC_FIELD:
+    EngineSupervisedDeliveryReportWireField = EngineSupervisedDeliveryReportWireField::new(0, 8);
+pub(crate) const ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_SCHEMA_VERSION_FIELD:
+    EngineSupervisedDeliveryReportWireField = EngineSupervisedDeliveryReportWireField::new(8, 2);
+pub(crate) const ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_KIND_FIELD:
+    EngineSupervisedDeliveryReportWireField = EngineSupervisedDeliveryReportWireField::new(10, 1);
+pub(crate) const ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_FLAGS_FIELD:
+    EngineSupervisedDeliveryReportWireField = EngineSupervisedDeliveryReportWireField::new(11, 1);
+pub(crate) const ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_FRAME_LENGTH_FIELD:
+    EngineSupervisedDeliveryReportWireField = EngineSupervisedDeliveryReportWireField::new(12, 2);
+pub(crate) const ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_HEADER_LENGTH_FIELD:
+    EngineSupervisedDeliveryReportWireField = EngineSupervisedDeliveryReportWireField::new(14, 2);
+pub(crate) const ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_REQUEST_SCHEMA_FIELD:
+    EngineSupervisedDeliveryReportWireField = EngineSupervisedDeliveryReportWireField::new(16, 2);
+pub(crate) const ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_REPORT_SCHEMA_FIELD:
+    EngineSupervisedDeliveryReportWireField = EngineSupervisedDeliveryReportWireField::new(18, 2);
+pub(crate) const ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_FAMILIES_FIELD:
+    EngineSupervisedDeliveryReportWireField = EngineSupervisedDeliveryReportWireField::new(20, 1);
+pub(crate) const ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_REQUIRED_FLOWS_FIELD:
+    EngineSupervisedDeliveryReportWireField = EngineSupervisedDeliveryReportWireField::new(21, 1);
+pub(crate) const ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_BACKEND_FIELD:
+    EngineSupervisedDeliveryReportWireField = EngineSupervisedDeliveryReportWireField::new(22, 1);
+pub(crate) const ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_PREFIX_RESERVED_FIELD:
+    EngineSupervisedDeliveryReportWireField = EngineSupervisedDeliveryReportWireField::new(23, 1);
+pub(crate) const ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_GENERATION_FIELD:
+    EngineSupervisedDeliveryReportWireField = EngineSupervisedDeliveryReportWireField::new(24, 4);
+pub(crate) const ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_ENGINE_PID_FIELD:
+    EngineSupervisedDeliveryReportWireField = EngineSupervisedDeliveryReportWireField::new(28, 4);
+pub(crate) const ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_ENGINE_START_TICKS_FIELD:
+    EngineSupervisedDeliveryReportWireField = EngineSupervisedDeliveryReportWireField::new(32, 8);
+pub(crate) const ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_ENGINE_SNAPSHOT_REVISION_FIELD:
+    EngineSupervisedDeliveryReportWireField = EngineSupervisedDeliveryReportWireField::new(40, 8);
+pub(crate) const ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_REPORT_OBJECT_FIELD:
+    EngineSupervisedDeliveryReportWireField = EngineSupervisedDeliveryReportWireField::new(48, 32);
+pub(crate) const ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_PROFILE_REVISION_FIELD:
+    EngineSupervisedDeliveryReportWireField = EngineSupervisedDeliveryReportWireField::new(80, 32);
+pub(crate) const ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_ATTEMPT_NONCE_FIELD:
+    EngineSupervisedDeliveryReportWireField = EngineSupervisedDeliveryReportWireField::new(112, 32);
+pub(crate) const ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_RESERVED_FIELD:
+    EngineSupervisedDeliveryReportWireField = EngineSupervisedDeliveryReportWireField::new(144, 16);
+
+const _: () = {
+    let fields = [
+        ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_MAGIC_FIELD,
+        ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_SCHEMA_VERSION_FIELD,
+        ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_KIND_FIELD,
+        ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_FLAGS_FIELD,
+        ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_FRAME_LENGTH_FIELD,
+        ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_HEADER_LENGTH_FIELD,
+        ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_REQUEST_SCHEMA_FIELD,
+        ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_REPORT_SCHEMA_FIELD,
+        ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_FAMILIES_FIELD,
+        ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_REQUIRED_FLOWS_FIELD,
+        ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_BACKEND_FIELD,
+        ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_PREFIX_RESERVED_FIELD,
+        ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_GENERATION_FIELD,
+        ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_ENGINE_PID_FIELD,
+        ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_ENGINE_START_TICKS_FIELD,
+        ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_ENGINE_SNAPSHOT_REVISION_FIELD,
+        ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_REPORT_OBJECT_FIELD,
+        ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_PROFILE_REVISION_FIELD,
+        ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_ATTEMPT_NONCE_FIELD,
+        ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_RESERVED_FIELD,
+    ];
+    let mut index = 1;
+    while index < fields.len() {
+        assert!(fields[index - 1].end() == fields[index].offset());
+        index += 1;
+    }
+    assert!(fields[0].offset() == 0);
+    assert!(
+        fields[fields.len() - 1].end()
+            == ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_FRAME_BYTES as usize
+    );
+};
 
 const ENGINE_SUPERVISED_DELIVERY_REPORT_REVISION_DOMAIN: &[u8] =
     b"Flux Engine Supervised Delivery Report Contract\0schema-v1\0";
@@ -470,19 +556,16 @@ impl EngineSupervisedDeliveryReportWireCodec {
         u64::from_be_bytes(bytes)
     }
 
-    #[cfg(test)]
     #[must_use]
     pub(crate) const fn encode_u16(value: u16) -> [u8; 2] {
         value.to_be_bytes()
     }
 
-    #[cfg(test)]
     #[must_use]
     pub(crate) const fn encode_u32(value: u32) -> [u8; 4] {
         value.to_be_bytes()
     }
 
-    #[cfg(test)]
     #[must_use]
     pub(crate) const fn encode_u64(value: u64) -> [u8; 8] {
         value.to_be_bytes()
@@ -618,6 +701,12 @@ enum EngineSupervisedDeliveryReportTransport {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
+enum EngineSupervisedDeliveryReportHandoff {
+    ExactPinnedChildLaunchControlScmRights = 1,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
 enum EngineSupervisedDeliveryReportFraming {
     OneCanonicalFramePerDatagram = 1,
 }
@@ -653,8 +742,10 @@ enum EngineSupervisedDeliveryReportShutdown {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct EngineSupervisedDeliveryReportContract {
     schema_version: NonZeroU16,
+    handoff_schema_version: NonZeroU16,
     source: EngineSupervisedDeliveryReportSource,
     transport: EngineSupervisedDeliveryReportTransport,
+    handoff: EngineSupervisedDeliveryReportHandoff,
     framing: EngineSupervisedDeliveryReportFraming,
     sequence: EngineSupervisedDeliveryReportSequence,
     loss: EngineSupervisedDeliveryReportLoss,
@@ -662,14 +753,17 @@ pub(crate) struct EngineSupervisedDeliveryReportContract {
     shutdown: EngineSupervisedDeliveryReportShutdown,
     max_delivery_events: NonZeroU8,
     max_frame_bytes: NonZeroU16,
+    max_handoff_frame_bytes: NonZeroU16,
 }
 
 impl EngineSupervisedDeliveryReportContract {
     const fn canonical_schema_v1() -> Self {
         Self {
             schema_version: NonZeroU16::MIN,
+            handoff_schema_version: NonZeroU16::MIN,
             source: EngineSupervisedDeliveryReportSource::SupervisedEngineInboundHandler,
             transport: EngineSupervisedDeliveryReportTransport::AttemptOwnedUnixSeqpacket,
+            handoff: EngineSupervisedDeliveryReportHandoff::ExactPinnedChildLaunchControlScmRights,
             framing: EngineSupervisedDeliveryReportFraming::OneCanonicalFramePerDatagram,
             sequence: EngineSupervisedDeliveryReportSequence::ContiguousFromOneInCanonicalFlowOrder,
             loss: EngineSupervisedDeliveryReportLoss::CumulativeZeroForPositiveEvidence,
@@ -687,6 +781,12 @@ impl EngineSupervisedDeliveryReportContract {
                 Some(value) => value,
                 None => panic!("supervised delivery-report frame bound must be nonzero"),
             },
+            max_handoff_frame_bytes: match NonZeroU16::new(
+                ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_FRAME_BYTES,
+            ) {
+                Some(value) => value,
+                None => panic!("supervised delivery-report handoff frame bound must be nonzero"),
+            },
         }
     }
 
@@ -700,6 +800,12 @@ impl EngineSupervisedDeliveryReportContract {
         self.schema_version
     }
 
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn handoff_schema_version(self) -> NonZeroU16 {
+        self.handoff_schema_version
+    }
+
     #[must_use]
     pub(crate) fn is_canonical_schema_v1(self) -> bool {
         self == Self::canonical_schema_v1()
@@ -708,8 +814,10 @@ impl EngineSupervisedDeliveryReportContract {
     pub(super) fn update_revision_digest(self, digest: &mut Sha256) {
         update_length_prefixed(digest, ENGINE_SUPERVISED_DELIVERY_REPORT_REVISION_DOMAIN);
         update_length_prefixed(digest, &self.schema_version.get().to_be_bytes());
+        update_length_prefixed(digest, &self.handoff_schema_version.get().to_be_bytes());
         update_length_prefixed(digest, &[self.source as u8]);
         update_length_prefixed(digest, &[self.transport as u8]);
+        update_length_prefixed(digest, &[self.handoff as u8]);
         update_length_prefixed(digest, &[self.framing as u8]);
         update_length_prefixed(digest, &[self.sequence as u8]);
         update_length_prefixed(digest, &[self.loss as u8]);
@@ -717,6 +825,7 @@ impl EngineSupervisedDeliveryReportContract {
         update_length_prefixed(digest, &[self.shutdown as u8]);
         update_length_prefixed(digest, &[self.max_delivery_events.get()]);
         update_length_prefixed(digest, &self.max_frame_bytes.get().to_be_bytes());
+        update_length_prefixed(digest, &self.max_handoff_frame_bytes.get().to_be_bytes());
         update_length_prefixed(digest, &ENGINE_SUPERVISED_DELIVERY_REPORT_MAGIC);
         update_length_prefixed(
             digest,
@@ -734,6 +843,25 @@ impl EngineSupervisedDeliveryReportContract {
             digest,
             &ENGINE_SUPERVISED_DELIVERY_REPORT_TERMINAL_FRAME_BYTES.to_be_bytes(),
         );
+        update_length_prefixed(
+            digest,
+            &ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_SCHEMA_VERSION.to_be_bytes(),
+        );
+        update_length_prefixed(digest, &ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_MAGIC);
+        update_length_prefixed(
+            digest,
+            &ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_FRAME_BYTES.to_be_bytes(),
+        );
+        for value in [
+            ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_ATTEMPT_KIND,
+            ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_IPV4_FLAG,
+            ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_IPV6_FLAG,
+            ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_TPROXY_BACKEND,
+            ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_IPV4_FLOW_MASK,
+            ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_DUAL_STACK_FLOW_MASK,
+        ] {
+            update_length_prefixed(digest, &[value]);
+        }
         for kind in [
             EngineSupervisedDeliveryReportFrameKind::TcpDelivery,
             EngineSupervisedDeliveryReportFrameKind::UdpDelivery,
@@ -798,6 +926,30 @@ impl EngineSupervisedDeliveryReportContract {
             ENGINE_SUPERVISED_DELIVERY_REPORT_PROFILE_REVISION_FIELD,
             ENGINE_SUPERVISED_DELIVERY_REPORT_ATTEMPT_NONCE_FIELD,
             ENGINE_SUPERVISED_DELIVERY_REPORT_HEADER_RESERVED_FIELD,
+        ] {
+            update_wire_field_digest(digest, field);
+        }
+        for field in [
+            ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_MAGIC_FIELD,
+            ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_SCHEMA_VERSION_FIELD,
+            ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_KIND_FIELD,
+            ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_FLAGS_FIELD,
+            ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_FRAME_LENGTH_FIELD,
+            ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_HEADER_LENGTH_FIELD,
+            ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_REQUEST_SCHEMA_FIELD,
+            ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_REPORT_SCHEMA_FIELD,
+            ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_FAMILIES_FIELD,
+            ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_REQUIRED_FLOWS_FIELD,
+            ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_BACKEND_FIELD,
+            ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_PREFIX_RESERVED_FIELD,
+            ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_GENERATION_FIELD,
+            ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_ENGINE_PID_FIELD,
+            ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_ENGINE_START_TICKS_FIELD,
+            ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_ENGINE_SNAPSHOT_REVISION_FIELD,
+            ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_REPORT_OBJECT_FIELD,
+            ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_PROFILE_REVISION_FIELD,
+            ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_ATTEMPT_NONCE_FIELD,
+            ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_RESERVED_FIELD,
         ] {
             update_wire_field_digest(digest, field);
         }

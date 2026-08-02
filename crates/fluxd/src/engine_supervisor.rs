@@ -1507,8 +1507,9 @@ impl EngineSupervisor {
         capture: CaptureObservation,
         now: Duration,
     ) -> Result<EngineReport, EngineSupervisorError> {
+        let mut prepared = None;
         if let Some(active_spec) = self.active_spec.clone() {
-            self.verify_spec(spec, "Desired State reconciliation")?;
+            prepared = Some(self.prepare_spec(spec, "Desired State reconciliation")?);
             if active_spec == *spec {
                 self.target_spec = Some(spec.clone());
                 self.retry_at = None;
@@ -1554,7 +1555,10 @@ impl EngineSupervisor {
             return Ok(EngineReport::AwaitingCaptureRemoval { revision });
         }
 
-        self.verify_spec(spec, "Desired State reconciliation")?;
+        let prepared = match prepared {
+            Some(prepared) => prepared,
+            None => self.prepare_spec(spec, "Desired State reconciliation")?,
+        };
 
         self.restart.prune(now, spec.restart.window);
         if self.restart.exhausted {
@@ -1574,10 +1578,14 @@ impl EngineSupervisor {
             });
         }
 
-        self.launch(spec)
+        self.launch(spec, prepared)
     }
 
-    fn launch(&mut self, spec: &EngineSpec) -> Result<EngineReport, EngineSupervisorError> {
+    fn launch(
+        &mut self,
+        spec: &EngineSpec,
+        prepared: HostPrepared,
+    ) -> Result<EngineReport, EngineSupervisorError> {
         if self.child.is_some() || self.owned_identity.is_some() || self.active_spec.is_some() {
             return Err(self.host_error(
                 "launch child",
@@ -1586,7 +1594,6 @@ impl EngineSupervisor {
                 ),
             ));
         }
-        let prepared = self.prepare_spec(spec, "before Sing-Box configuration check")?;
         self.publish(EnginePhase::Checking, None);
         match self.host.validate(&spec.process, &prepared) {
             Ok(()) => {}
@@ -1814,14 +1821,6 @@ impl EngineSupervisor {
     fn require_identity(&self) -> Result<OwnedEngineIdentity, EngineSupervisorError> {
         self.owned_identity
             .ok_or_else(|| self.invariant("owned child has no established identity"))
-    }
-
-    fn verify_spec(
-        &mut self,
-        spec: &EngineSpec,
-        operation: &'static str,
-    ) -> Result<(), EngineSupervisorError> {
-        self.prepare_spec(spec, operation).map(drop)
     }
 
     fn prepare_spec(
@@ -3743,7 +3742,7 @@ mod tests {
     fn post_spawn_artifact_change_cleans_up_before_returning_error() {
         let (mut supervisor, host, _clock) = test_supervisor();
         let spec = test_spec(1536, restart_policy(2));
-        host.fail_artifact_verification_after(3, EngineArtifact::Binary);
+        host.fail_artifact_verification_after(2, EngineArtifact::Binary);
 
         let error = supervisor
             .reconcile(DesiredEngine::Running(&spec), CaptureObservation::Detached)
@@ -3761,7 +3760,7 @@ mod tests {
     fn post_check_artifact_change_prevents_spawn() {
         let (mut supervisor, host, _clock) = test_supervisor();
         let spec = test_spec(1536, restart_policy(2));
-        host.fail_artifact_verification_after(2, EngineArtifact::Config);
+        host.fail_artifact_verification_after(1, EngineArtifact::Config);
 
         let error = supervisor
             .reconcile(DesiredEngine::Running(&spec), CaptureObservation::Detached)

@@ -997,12 +997,22 @@ fn parse_payload_identity(
 #[cfg(test)]
 mod tests {
     use std::fs;
+    #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+    use std::fs::File;
+    #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+    use std::net::TcpListener;
     use std::num::{NonZeroU32, NonZeroU64};
     use std::os::unix::fs::PermissionsExt;
+    #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::time::Duration;
 
     use flux_core::GenerationId;
+    #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+    use flux_platform::SeqpacketReceive;
+    #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+    use flux_platform::internal::{PinnedSingBoxLaunch, SingBoxChild, SingBoxProcessAdapter};
     use flux_platform::{SingBoxLaunchSpec, SingBoxPrivilege, SingBoxReadiness};
 
     use super::*;
@@ -1012,6 +1022,7 @@ mod tests {
         CanaryAttemptObjectRetirementEvidence, CanaryListenerDeliveryReportCleanupEvidence,
         CanaryNonce, CanaryProcessCredentialIdentity, FUNCTIONAL_CANARY_NONCE_BYTES,
     };
+    use crate::generation_engine_config as report_contract;
     use crate::generation_engine_config::{
         TproxyEngineConfigRequest, bind_engine_config_to_spec,
         collect_tproxy_engine_capability_profile, compile_tproxy_engine_config,
@@ -1103,21 +1114,8 @@ esac
                 NonZeroU64::new(23).expect("snapshot revision"),
                 profile.revision(),
             );
-            // SAFETY: these identity getters have no pointer arguments or preconditions.
-            let producer_uid = NonZeroU32::new(unsafe { libc::geteuid() });
-            // SAFETY: see the effective-UID call above.
-            let producer_gid = NonZeroU32::new(unsafe { libc::getegid() });
-            if let (Some(producer_uid), Some(producer_gid)) = (producer_uid, producer_gid) {
-                let environment = &mut request.pre_binding.environment;
-                let probe_uid = distinct_test_identity(producer_uid);
-                let probe_gid = distinct_test_identity(producer_gid);
-                environment.credentials = CanaryAttemptCredentialBinding::new(
-                    CanaryProcessCredentialIdentity::new(probe_uid, probe_gid),
-                    CanaryProcessCredentialIdentity::new(producer_uid, producer_gid),
-                    environment.credentials.domain,
-                )
-                .expect("distinct test transport credentials");
-                environment.rpdb.engine_uid = producer_uid;
+            if let Some((producer_uid, producer_gid)) = non_root_process_credentials() {
+                bind_request_engine_credentials(&mut request, producer_uid, producer_gid);
             }
             let fixture = Fixture::from_request(request.clone());
             Self {
@@ -1150,6 +1148,162 @@ esac
             identity.get() + 1
         })
         .expect("distinct test identity remains nonzero")
+    }
+
+    fn non_root_process_credentials() -> Option<(NonZeroU32, NonZeroU32)> {
+        // SAFETY: these identity getters have no pointer arguments or preconditions.
+        let uid = NonZeroU32::new(unsafe { libc::geteuid() })?;
+        // SAFETY: see the effective-UID call above.
+        let gid = NonZeroU32::new(unsafe { libc::getegid() })?;
+        Some((uid, gid))
+    }
+
+    fn bind_request_engine_credentials(
+        request: &mut CanaryAttemptRequest,
+        engine_uid: NonZeroU32,
+        engine_gid: NonZeroU32,
+    ) {
+        let environment = &mut request.pre_binding.environment;
+        environment.credentials = CanaryAttemptCredentialBinding::new(
+            CanaryProcessCredentialIdentity::new(
+                distinct_test_identity(engine_uid),
+                distinct_test_identity(engine_gid),
+            ),
+            CanaryProcessCredentialIdentity::new(engine_uid, engine_gid),
+            environment.credentials.domain,
+        )
+        .expect("distinct test transport credentials");
+        environment.rpdb.engine_uid = engine_uid;
+    }
+
+    #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+    struct NativeLaunchControlFixture {
+        _directory: tempfile::TempDir,
+        evidence: PathBuf,
+        spec: EngineSpec,
+        profile: EngineCapabilityProfile,
+        pinned: PinnedSingBoxLaunch,
+        adapter: SingBoxProcessAdapter,
+    }
+
+    #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+    impl NativeLaunchControlFixture {
+        fn new() -> Self {
+            let binary = native_composition_engine_binary();
+            let directory = tempfile::tempdir().expect("launch-control fixture directory");
+            let evidence = directory.path().join("control-evidence");
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .expect("reserve launch-control listener port");
+            let port = NonZeroU16::new(
+                listener
+                    .local_addr()
+                    .expect("reserved launch-control listener address")
+                    .port(),
+            )
+            .expect("reserved launch-control listener port is nonzero");
+            drop(listener);
+            let template = serde_json::to_vec(&serde_json::json!({
+                "flux_test_launch_control_evidence": evidence
+                    .to_str()
+                    .expect("launch-control evidence path is UTF-8"),
+                "inbounds": [],
+            }))
+            .expect("encode launch-control template");
+            let artifact =
+                compile_tproxy_engine_config(TproxyEngineConfigRequest::new(&template, port))
+                    .expect("compile launch-control engine config");
+            let config = directory.path().join("config.json");
+            fs::write(&config, artifact.bytes()).expect("write launch-control engine config");
+            let spec = EngineSpec::new(
+                SingBoxLaunchSpec {
+                    binary: binary.clone(),
+                    config: config.clone(),
+                    working_directory: directory.path().to_path_buf(),
+                    log: directory.path().join("engine.log"),
+                    privilege: SingBoxPrivilege::Inherit,
+                    readiness: SingBoxReadiness::Listener { port },
+                    startup_timeout: Duration::from_secs(2),
+                    stop_timeout: Duration::from_secs(1),
+                },
+                RestartPolicy::new(
+                    1,
+                    Duration::from_secs(1),
+                    Duration::from_millis(10),
+                    Duration::from_millis(10),
+                    Duration::from_secs(1),
+                )
+                .expect("launch-control restart policy"),
+            )
+            .expect("inspect launch-control EngineSpec");
+            let binding =
+                bind_engine_config_to_spec(artifact, &spec).expect("bind launch-control config");
+            let profile = declare_supervised_delivery_report_profile_fixture(
+                collect_tproxy_engine_capability_profile(&binding, &spec)
+                    .expect("collect launch-control fixture profile"),
+            );
+            let pinned = PinnedSingBoxLaunch::new(
+                File::open(&binary).expect("open launch-control fixture binary"),
+                File::open(&config).expect("open launch-control fixture config"),
+            )
+            .expect("pin launch-control fixture artifacts");
+            Self {
+                _directory: directory,
+                evidence,
+                spec,
+                profile,
+                pinned,
+                adapter: SingBoxProcessAdapter,
+            }
+        }
+
+        fn spawn(&self) -> SingBoxChild {
+            self.adapter
+                .spawn_pinned(&self.pinned, self.spec.process())
+                .expect("spawn exact launch-control child")
+        }
+
+        fn request_for_child(
+            &self,
+            child: &SingBoxChild,
+            engine_uid: NonZeroU32,
+            engine_gid: NonZeroU32,
+        ) -> CanaryAttemptRequest {
+            let identity = child.identity();
+            let mut request = request_with_engine_profile_revision(
+                &self.spec,
+                CanaryAddressFamilies::Ipv4AndIpv6,
+                Instant::now(),
+                CanaryNonce::from_bytes([0x91; FUNCTIONAL_CANARY_NONCE_BYTES]),
+                GenerationId::new(29).expect("launch-control generation"),
+                NonZeroU32::new(identity.pid()).expect("launch-control child PID"),
+                NonZeroU64::new(identity.start_time_ticks())
+                    .expect("launch-control child start ticks"),
+                NonZeroU64::new(31).expect("launch-control engine snapshot revision"),
+                self.profile.revision(),
+            );
+            bind_request_engine_credentials(&mut request, engine_uid, engine_gid);
+            request
+        }
+
+        fn prebind<C>(
+            &self,
+            request: &CanaryAttemptRequest,
+            clock: C,
+        ) -> (
+            collector::SupervisedDeliveryReportEngineHandoff,
+            collector::SupervisedDeliveryReportCollector<C>,
+        )
+        where
+            C: FnMut() -> Instant,
+        {
+            let authority = collector::SupervisedDeliveryReportPrebindAuthority::fixture(
+                &self.profile,
+                request,
+            );
+            let (producer, collector) =
+                collector::prebind(authority, clock).expect("prebind launch-control report");
+            (producer.into_engine_handoff(), collector)
+        }
     }
 
     #[test]
@@ -1191,6 +1345,314 @@ esac
             .expect_err("another artifact cannot supply the report"),
             SupervisedDeliveryReportBindError::ArtifactSetMismatch
         );
+    }
+
+    #[test]
+    fn engine_handoff_frame_is_the_exact_canonical_dual_stack_attempt() {
+        let context = Context::new(CanaryAddressFamilies::Ipv4AndIpv6);
+        let (handoff, _collector) = prebind_report_collector(&context, Instant::now);
+
+        let frame = handoff.encoded_frame().expect("encode engine handoff");
+        let engine = context.request.pre_binding().engine();
+        let engine_identity = engine.engine();
+
+        assert_eq!(
+            frame.len(),
+            usize::from(report_contract::ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_FRAME_BYTES)
+        );
+        assert_eq!(
+            handoff_field(
+                &frame,
+                report_contract::ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_MAGIC_FIELD,
+            ),
+            report_contract::ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_MAGIC
+        );
+        assert_eq!(
+            handoff_field(
+                &frame,
+                report_contract::ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_SCHEMA_VERSION_FIELD,
+            ),
+            report_contract::ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_SCHEMA_VERSION.to_be_bytes()
+        );
+        assert_eq!(
+            handoff_field(
+                &frame,
+                report_contract::ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_KIND_FIELD,
+            ),
+            [report_contract::ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_ATTEMPT_KIND]
+        );
+        assert_eq!(
+            handoff_field(
+                &frame,
+                report_contract::ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_FLAGS_FIELD,
+            ),
+            [0]
+        );
+        for field in [
+            report_contract::ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_FRAME_LENGTH_FIELD,
+            report_contract::ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_HEADER_LENGTH_FIELD,
+        ] {
+            assert_eq!(
+                handoff_field(&frame, field),
+                report_contract::ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_FRAME_BYTES
+                    .to_be_bytes()
+            );
+        }
+        assert_eq!(
+            handoff_field(
+                &frame,
+                report_contract::ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_REQUEST_SCHEMA_FIELD,
+            ),
+            context.request.schema_version().to_be_bytes()
+        );
+        assert_eq!(
+            handoff_field(
+                &frame,
+                report_contract::ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_REPORT_SCHEMA_FIELD,
+            ),
+            report_contract::ENGINE_SUPERVISED_DELIVERY_REPORT_SCHEMA_VERSION.to_be_bytes()
+        );
+        assert_eq!(
+            handoff_field(
+                &frame,
+                report_contract::ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_FAMILIES_FIELD,
+            ),
+            [
+                report_contract::ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_IPV4_FLAG
+                    | report_contract::ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_IPV6_FLAG
+            ]
+        );
+        assert_eq!(
+            handoff_field(
+                &frame,
+                report_contract::ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_REQUIRED_FLOWS_FIELD,
+            ),
+            [report_contract::ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_DUAL_STACK_FLOW_MASK]
+        );
+        assert_eq!(
+            handoff_field(
+                &frame,
+                report_contract::ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_BACKEND_FIELD,
+            ),
+            [report_contract::ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_TPROXY_BACKEND]
+        );
+        assert_eq!(
+            handoff_field(
+                &frame,
+                report_contract::ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_PREFIX_RESERVED_FIELD,
+            ),
+            [0]
+        );
+        assert_eq!(
+            handoff_field(
+                &frame,
+                report_contract::ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_GENERATION_FIELD,
+            ),
+            engine.generation().get().to_be_bytes()
+        );
+        assert_eq!(
+            handoff_field(
+                &frame,
+                report_contract::ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_ENGINE_PID_FIELD,
+            ),
+            engine_identity.pid().to_be_bytes()
+        );
+        assert_eq!(
+            handoff_field(
+                &frame,
+                report_contract::ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_ENGINE_START_TICKS_FIELD,
+            ),
+            engine_identity.start_time_ticks().to_be_bytes()
+        );
+        assert_eq!(
+            handoff_field(
+                &frame,
+                report_contract::ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_ENGINE_SNAPSHOT_REVISION_FIELD,
+            ),
+            engine.engine_snapshot_revision().get().to_be_bytes()
+        );
+        assert_eq!(
+            handoff_field(
+                &frame,
+                report_contract::ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_REPORT_OBJECT_FIELD,
+            ),
+            [15; 32]
+        );
+        assert_eq!(
+            handoff_field(
+                &frame,
+                report_contract::ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_PROFILE_REVISION_FIELD,
+            ),
+            context.profile.revision().as_bytes()
+        );
+        assert_eq!(
+            handoff_field(
+                &frame,
+                report_contract::ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_ATTEMPT_NONCE_FIELD,
+            ),
+            context.request.nonce().as_bytes()
+        );
+        assert_eq!(
+            handoff_field(
+                &frame,
+                report_contract::ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_RESERVED_FIELD,
+            ),
+            [0; 16]
+        );
+    }
+
+    #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+    #[test]
+    fn exact_pinned_exec_receives_the_canonical_handoff_and_sole_producer() {
+        let Some((engine_uid, engine_gid)) = non_root_process_credentials() else {
+            return;
+        };
+        let fixture = NativeLaunchControlFixture::new();
+        let mut child = fixture.spawn();
+        fixture
+            .adapter
+            .wait_ready(&mut child, fixture.spec.process())
+            .expect("launch-control child becomes ready");
+        let request = fixture.request_for_child(&child, engine_uid, engine_gid);
+        let (handoff, collector) = fixture.prebind(&request, Instant::now);
+        let expected_frame = handoff.encoded_frame().expect("canonical handoff frame");
+        let expected_child = request.pre_binding().engine().engine();
+        let expected_report_object = request
+            .pre_binding()
+            .environment()
+            .attempt_objects()
+            .listener_delivery_report();
+
+        let installed = handoff
+            .install_into(&child)
+            .expect("install producer into exact pinned child");
+
+        assert_eq!(installed.child(), expected_child);
+        assert_eq!(installed.report_object(), expected_report_object);
+        assert_eq!(installed.profile_revision(), fixture.profile.revision());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        match collector
+            .recv_fixture_record_until(64, deadline)
+            .expect("receive transferred producer proof")
+        {
+            Some(SeqpacketReceive::Record {
+                bytes,
+                truncated,
+                credentials,
+            }) => {
+                assert_eq!(bytes, b"flux-native-control-producer");
+                assert!(!truncated);
+                assert_eq!(credentials.pid(), child.identity().pid());
+                assert_eq!(credentials.uid().as_raw(), engine_uid.get());
+                assert_eq!(credentials.gid(), engine_gid.get());
+            }
+            Some(SeqpacketReceive::Eof) => {
+                panic!("transferred producer closed before sending its proof")
+            }
+            None => panic!("transferred producer proof deadline expired"),
+        }
+        assert!(matches!(
+            collector
+                .recv_fixture_record_until(1, deadline)
+                .expect("observe sole producer closure"),
+            Some(SeqpacketReceive::Eof)
+        ));
+        assert!(matches!(
+            child
+                .launch_control()
+                .recv_record_until(1, deadline)
+                .expect("observe child launch-control closure"),
+            Some(SeqpacketReceive::Eof)
+        ));
+        wait_for_fixture_path(&fixture.evidence.join("complete"));
+        assert_eq!(
+            fs::read(fixture.evidence.join("frame.bin")).expect("read child handoff frame"),
+            expected_frame
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.evidence.join("sender.txt"))
+                .expect("read handoff sender credentials"),
+            format!("{}\t{}\t{}\n", std::process::id(), engine_uid, engine_gid)
+        );
+        assert_eq!(
+            fixture
+                .adapter
+                .try_wait(&mut child)
+                .expect("poll launch-control child"),
+            None,
+            "fixture child must remain alive after closing both producer endpoints"
+        );
+        fixture
+            .adapter
+            .terminate(&mut child, Duration::from_secs(1))
+            .expect("terminate and reap launch-control child");
+    }
+
+    #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+    #[test]
+    fn wrong_child_handoff_sends_nothing_and_closes_the_producer() {
+        let Some((engine_uid, engine_gid)) = non_root_process_credentials() else {
+            return;
+        };
+        let fixture = NativeLaunchControlFixture::new();
+        let mut child = fixture.spawn();
+        fixture
+            .adapter
+            .wait_ready(&mut child, fixture.spec.process())
+            .expect("launch-control child becomes ready");
+        let mut request = fixture.request_for_child(&child, engine_uid, engine_gid);
+        let actual = request.pre_binding().engine().engine();
+        let wrong_pid = distinct_test_identity(
+            NonZeroU32::new(actual.pid()).expect("actual launch-control child PID"),
+        );
+        request.pre_binding.engine.engine = OwnedEngineIdentity::new(
+            wrong_pid,
+            NonZeroU64::new(actual.start_time_ticks()).expect("actual child start ticks"),
+        );
+        let expected = request.pre_binding().engine().engine();
+        let (handoff, collector) = fixture.prebind(&request, Instant::now);
+
+        let error = match handoff.install_into(&child) {
+            Err(error) => error,
+            Ok(_) => panic!("another child identity must not receive the producer"),
+        };
+
+        assert!(matches!(
+            error,
+            collector::SupervisedDeliveryReportHandoffError::ChildIdentityMismatch {
+                expected: observed_expected,
+                observed_pid,
+                observed_start_time_ticks,
+            } if observed_expected == expected
+                && observed_pid == child.identity().pid()
+                && observed_start_time_ticks == child.identity().start_time_ticks()
+        ));
+        assert!(matches!(
+            collector
+                .recv_fixture_record_until(1, Instant::now() + Duration::from_secs(1))
+                .expect("observe failed-handoff producer closure"),
+            Some(SeqpacketReceive::Eof)
+        ));
+        assert_eq!(
+            child
+                .launch_control()
+                .recv_record_until(1, Instant::now() + Duration::from_millis(100))
+                .expect("inspect wrong-child launch control"),
+            None,
+            "identity mismatch must occur before any launch-control record"
+        );
+        assert!(!fixture.evidence.exists());
+        assert_eq!(
+            fixture
+                .adapter
+                .try_wait(&mut child)
+                .expect("poll wrong-child fixture"),
+            None
+        );
+        fixture
+            .adapter
+            .terminate(&mut child, Duration::from_secs(1))
+            .expect("terminate and reap wrong-child fixture");
     }
 
     #[test]
@@ -2268,6 +2730,42 @@ esac
         assert_eq!(handoff.profile_revision(), context.profile.revision());
         assert_eq!(handoff.request(), &context.request);
         (handoff, collector)
+    }
+
+    fn handoff_field(frame: &[u8], field: WireField) -> &[u8] {
+        &frame[field.offset()..field.end()]
+    }
+
+    #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+    fn native_composition_engine_binary() -> PathBuf {
+        let test = std::env::current_exe().expect("resolve current fluxd test executable");
+        let debug_root = test
+            .parent()
+            .and_then(Path::parent)
+            .expect("derive target directory from fluxd test executable");
+        let binary = debug_root.join(format!(
+            "flux-native-composition-engine{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        assert!(
+            fs::metadata(&binary)
+                .expect("feature-gated native composition engine is built")
+                .is_file(),
+            "native composition engine fixture must be a regular file"
+        );
+        fs::canonicalize(binary).expect("canonicalize native composition engine fixture")
+    }
+
+    #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+    fn wait_for_fixture_path(path: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline {
+            if path.is_file() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("fixture evidence {} was not published", path.display());
     }
 
     fn client_retirement_authority(

@@ -9,7 +9,11 @@ run/
 lrqibazk/
 bin/
 !crates/flux-platform/src/bin/
+crates/flux-platform/src/bin/*
 !crates/flux-platform/src/bin/android-profile-probe.rs
+!crates/fluxd/src/bin/
+crates/fluxd/src/bin/*
+!crates/fluxd/src/bin/native_composition_engine.rs
 /target/
 /dist/
 /ebpf/target/

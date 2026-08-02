@@ -493,10 +493,14 @@ fn supervised_report_fixture_changes_and_pins_the_complete_profile_revision() {
         contract.schema_version().get(),
         super::ENGINE_SUPERVISED_DELIVERY_REPORT_SCHEMA_VERSION
     );
+    assert_eq!(
+        contract.handoff_schema_version().get(),
+        super::ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_SCHEMA_VERSION
+    );
     assert_ne!(declared.revision(), baseline_revision);
     assert_eq!(
         declared.revision().to_string(),
-        "9e558abe4c595cdba51f4c05e0987cd9115011be2da5dde1cdbb48475517e472"
+        "dfb8a48db8fec360158bdf1aa66dd2fa529a536dfe0c8e70c32e11114efd1096"
     );
     assert_eq!(declared.artifacts(), binding.artifacts());
     assert_eq!(declared.validated_binding(), binding.digest());

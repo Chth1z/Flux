@@ -7232,8 +7232,14 @@ pub(crate) mod tests {
         engine_snapshot_revision: NonZeroU64,
         engine_profile_revision: EngineCapabilityProfileRevision,
     ) -> CanaryAttemptRequest {
+        let listener_port = match spec.process().readiness {
+            SingBoxReadiness::Listener { port } => port,
+            SingBoxReadiness::TunInterface { .. } => {
+                panic!("functional canary fixture requires listener readiness")
+            }
+        };
         let readiness = ReadinessEvidence::Listener {
-            port: NonZeroU16::new(1536).expect("nonzero listener port"),
+            port: listener_port,
             table: PathBuf::from(format!("/proc/{}/net/tcp", pid.get())),
         };
         let engine = CanaryEngineBinding::from_identity_parts(

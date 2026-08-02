@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+use flux_platform::internal::SingBoxChild;
 use flux_platform::{PeerCredentials, PlatformError, SeqpacketConnection, SeqpacketReceive};
 
 #[cfg(test)]
@@ -14,9 +15,10 @@ use super::{
     SupervisedDeliveryReportDatagram, SupervisedDeliveryReportError,
     SupervisedDeliveryReportParser, SupervisedDeliveryReportParserAuthority,
 };
+use crate::OwnedEngineIdentity;
 use crate::functional_canary::{
-    CanaryAttemptObjectIdentity, CanaryAttemptObjectRetirementEvidence, CanaryAttemptRequest,
-    CanaryProcessRetirementEvidence,
+    CanaryAddressFamilies, CanaryAttemptObjectIdentity, CanaryAttemptObjectRetirementEvidence,
+    CanaryAttemptRequest, CanaryCaptureBackend, CanaryProcessRetirementEvidence,
 };
 #[cfg(test)]
 use crate::functional_canary::{
@@ -24,8 +26,37 @@ use crate::functional_canary::{
     UnqualifiedCanaryInboundListenerDeliveryEvidence, ValidatedUnqualifiedCanaryGateEvidence,
 };
 use crate::generation_engine_config::{
-    ENGINE_SUPERVISED_DELIVERY_REPORT_MAX_FRAME_BYTES, EngineCapabilityProfile,
-    EngineCapabilityProfileRevision,
+    ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_ATTEMPT_KIND,
+    ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_ATTEMPT_NONCE_FIELD,
+    ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_BACKEND_FIELD,
+    ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_DUAL_STACK_FLOW_MASK,
+    ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_ENGINE_PID_FIELD,
+    ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_ENGINE_SNAPSHOT_REVISION_FIELD,
+    ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_ENGINE_START_TICKS_FIELD,
+    ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_FAMILIES_FIELD,
+    ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_FLAGS_FIELD,
+    ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_FRAME_BYTES,
+    ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_FRAME_LENGTH_FIELD,
+    ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_GENERATION_FIELD,
+    ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_HEADER_LENGTH_FIELD,
+    ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_IPV4_FLAG,
+    ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_IPV4_FLOW_MASK,
+    ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_IPV6_FLAG,
+    ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_KIND_FIELD,
+    ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_MAGIC,
+    ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_MAGIC_FIELD,
+    ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_PROFILE_REVISION_FIELD,
+    ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_REPORT_OBJECT_FIELD,
+    ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_REPORT_SCHEMA_FIELD,
+    ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_REQUEST_SCHEMA_FIELD,
+    ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_REQUIRED_FLOWS_FIELD,
+    ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_SCHEMA_VERSION,
+    ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_SCHEMA_VERSION_FIELD,
+    ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_TPROXY_BACKEND,
+    ENGINE_SUPERVISED_DELIVERY_REPORT_MAX_FRAME_BYTES,
+    ENGINE_SUPERVISED_DELIVERY_REPORT_SCHEMA_VERSION, EngineCapabilityProfile,
+    EngineCapabilityProfileRevision, EngineSupervisedDeliveryReportWireCodec,
+    EngineSupervisedDeliveryReportWireField,
 };
 
 #[derive(Debug)]
@@ -245,6 +276,53 @@ impl SupervisedDeliveryReportProducer {
     }
 }
 
+#[derive(Debug)]
+pub(super) enum SupervisedDeliveryReportHandoffError {
+    ChildIdentityMismatch {
+        expected: OwnedEngineIdentity,
+        observed_pid: u32,
+        observed_start_time_ticks: u64,
+    },
+    UnsupportedCaptureBackend(CanaryCaptureBackend),
+    Transport(PlatformError),
+}
+
+impl fmt::Display for SupervisedDeliveryReportHandoffError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ChildIdentityMismatch {
+                expected,
+                observed_pid,
+                observed_start_time_ticks,
+            } => write!(
+                formatter,
+                "supervised delivery-report handoff child mismatch: expected pid={}, start_ticks={}; observed pid={observed_pid}, start_ticks={observed_start_time_ticks}",
+                expected.pid(),
+                expected.start_time_ticks(),
+            ),
+            Self::UnsupportedCaptureBackend(backend) => write!(
+                formatter,
+                "supervised delivery-report handoff does not support {backend:?} capture"
+            ),
+            Self::Transport(source) => {
+                write!(
+                    formatter,
+                    "supervised delivery-report handoff failed: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl Error for SupervisedDeliveryReportHandoffError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Transport(source) => Some(source),
+            Self::ChildIdentityMismatch { .. } | Self::UnsupportedCaptureBackend(_) => None,
+        }
+    }
+}
+
 /// Identity-bearing writer endpoint consumed by the supervised report producer.
 ///
 /// This interface intentionally exposes record send rather than a raw descriptor. A future
@@ -274,6 +352,50 @@ impl SupervisedDeliveryReportEngineHandoff {
     pub(super) fn send_frame(&self, frame: &[u8]) -> Result<(), PlatformError> {
         self.connection.send_packet(frame)
     }
+
+    #[cfg(test)]
+    pub(super) fn encoded_frame(
+        &self,
+    ) -> Result<
+        [u8; ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_FRAME_BYTES as usize],
+        SupervisedDeliveryReportHandoffError,
+    > {
+        encode_engine_handoff_frame(&self.binding)
+    }
+
+    pub(super) fn install_into(
+        self,
+        child: &SingBoxChild,
+    ) -> Result<InstalledSupervisedDeliveryReportProducer, SupervisedDeliveryReportHandoffError>
+    {
+        let expected = self.binding.request().pre_binding().engine().engine();
+        let observed = child.identity();
+        if expected.pid() != observed.pid()
+            || expected.start_time_ticks() != observed.start_time_ticks()
+        {
+            return Err(
+                SupervisedDeliveryReportHandoffError::ChildIdentityMismatch {
+                    expected,
+                    observed_pid: observed.pid(),
+                    observed_start_time_ticks: observed.start_time_ticks(),
+                },
+            );
+        }
+        let frame = encode_engine_handoff_frame(&self.binding)?;
+        child
+            .launch_control()
+            .send_connection(&frame, &self.connection)
+            .map_err(SupervisedDeliveryReportHandoffError::Transport)?;
+        let Self {
+            connection,
+            binding,
+        } = self;
+        drop(connection);
+        Ok(InstalledSupervisedDeliveryReportProducer {
+            binding,
+            child: expected,
+        })
+    }
 }
 
 impl fmt::Debug for SupervisedDeliveryReportEngineHandoff {
@@ -283,6 +405,195 @@ impl fmt::Debug for SupervisedDeliveryReportEngineHandoff {
             .field("binding", &self.binding)
             .finish_non_exhaustive()
     }
+}
+
+/// Proof that the exact child received the sole supervisor-owned producer endpoint.
+#[must_use = "the installed report producer must remain bound to child retirement"]
+pub(super) struct InstalledSupervisedDeliveryReportProducer {
+    binding: Arc<SupervisedDeliveryReportTransportBinding>,
+    child: OwnedEngineIdentity,
+}
+
+impl InstalledSupervisedDeliveryReportProducer {
+    #[must_use]
+    pub(super) const fn child(&self) -> OwnedEngineIdentity {
+        self.child
+    }
+
+    #[must_use]
+    pub(super) fn report_object(&self) -> CanaryAttemptObjectIdentity {
+        self.binding.report_object()
+    }
+
+    #[must_use]
+    pub(super) fn profile_revision(&self) -> EngineCapabilityProfileRevision {
+        self.binding.profile_revision()
+    }
+}
+
+impl fmt::Debug for InstalledSupervisedDeliveryReportProducer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InstalledSupervisedDeliveryReportProducer")
+            .field("binding", &self.binding)
+            .field("child", &self.child)
+            .finish_non_exhaustive()
+    }
+}
+
+fn encode_engine_handoff_frame(
+    binding: &SupervisedDeliveryReportTransportBinding,
+) -> Result<
+    [u8; ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_FRAME_BYTES as usize],
+    SupervisedDeliveryReportHandoffError,
+> {
+    let request = binding.request();
+    let (families, required_flows) = match request.families() {
+        CanaryAddressFamilies::Ipv4Only => (
+            ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_IPV4_FLAG,
+            ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_IPV4_FLOW_MASK,
+        ),
+        CanaryAddressFamilies::Ipv4AndIpv6 => (
+            ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_IPV4_FLAG
+                | ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_IPV6_FLAG,
+            ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_DUAL_STACK_FLOW_MASK,
+        ),
+    };
+    let backend = match request.capture_backend() {
+        CanaryCaptureBackend::Tproxy => ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_TPROXY_BACKEND,
+        unsupported @ (CanaryCaptureBackend::Redirect | CanaryCaptureBackend::Dnat) => {
+            return Err(
+                SupervisedDeliveryReportHandoffError::UnsupportedCaptureBackend(unsupported),
+            );
+        }
+    };
+    let engine = request.pre_binding().engine();
+    let engine_identity = engine.engine();
+    let mut frame = [0_u8; ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_FRAME_BYTES as usize];
+    write_handoff_field(
+        &mut frame,
+        ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_MAGIC_FIELD,
+        &ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_MAGIC,
+    );
+    write_handoff_u16(
+        &mut frame,
+        ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_SCHEMA_VERSION_FIELD,
+        ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_SCHEMA_VERSION,
+    );
+    write_handoff_field(
+        &mut frame,
+        ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_KIND_FIELD,
+        &[ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_ATTEMPT_KIND],
+    );
+    write_handoff_field(
+        &mut frame,
+        ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_FLAGS_FIELD,
+        &[0],
+    );
+    write_handoff_u16(
+        &mut frame,
+        ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_FRAME_LENGTH_FIELD,
+        ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_FRAME_BYTES,
+    );
+    write_handoff_u16(
+        &mut frame,
+        ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_HEADER_LENGTH_FIELD,
+        ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_FRAME_BYTES,
+    );
+    write_handoff_u16(
+        &mut frame,
+        ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_REQUEST_SCHEMA_FIELD,
+        request.schema_version(),
+    );
+    write_handoff_u16(
+        &mut frame,
+        ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_REPORT_SCHEMA_FIELD,
+        ENGINE_SUPERVISED_DELIVERY_REPORT_SCHEMA_VERSION,
+    );
+    write_handoff_field(
+        &mut frame,
+        ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_FAMILIES_FIELD,
+        &[families],
+    );
+    write_handoff_field(
+        &mut frame,
+        ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_REQUIRED_FLOWS_FIELD,
+        &[required_flows],
+    );
+    write_handoff_field(
+        &mut frame,
+        ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_BACKEND_FIELD,
+        &[backend],
+    );
+    write_handoff_u32(
+        &mut frame,
+        ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_GENERATION_FIELD,
+        engine.generation().get(),
+    );
+    write_handoff_u32(
+        &mut frame,
+        ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_ENGINE_PID_FIELD,
+        engine_identity.pid(),
+    );
+    write_handoff_u64(
+        &mut frame,
+        ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_ENGINE_START_TICKS_FIELD,
+        engine_identity.start_time_ticks(),
+    );
+    write_handoff_u64(
+        &mut frame,
+        ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_ENGINE_SNAPSHOT_REVISION_FIELD,
+        engine.engine_snapshot_revision().get(),
+    );
+    write_handoff_field(
+        &mut frame,
+        ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_REPORT_OBJECT_FIELD,
+        &binding.report_object().0,
+    );
+    write_handoff_field(
+        &mut frame,
+        ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_PROFILE_REVISION_FIELD,
+        binding.profile_revision().as_bytes(),
+    );
+    write_handoff_field(
+        &mut frame,
+        ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_ATTEMPT_NONCE_FIELD,
+        request.nonce().as_bytes(),
+    );
+    Ok(frame)
+}
+
+fn write_handoff_u16(frame: &mut [u8], field: EngineSupervisedDeliveryReportWireField, value: u16) {
+    write_handoff_field(
+        frame,
+        field,
+        &EngineSupervisedDeliveryReportWireCodec::encode_u16(value),
+    );
+}
+
+fn write_handoff_u32(frame: &mut [u8], field: EngineSupervisedDeliveryReportWireField, value: u32) {
+    write_handoff_field(
+        frame,
+        field,
+        &EngineSupervisedDeliveryReportWireCodec::encode_u32(value),
+    );
+}
+
+fn write_handoff_u64(frame: &mut [u8], field: EngineSupervisedDeliveryReportWireField, value: u64) {
+    write_handoff_field(
+        frame,
+        field,
+        &EngineSupervisedDeliveryReportWireCodec::encode_u64(value),
+    );
+}
+
+fn write_handoff_field(
+    frame: &mut [u8],
+    field: EngineSupervisedDeliveryReportWireField,
+    value: &[u8],
+) {
+    assert_eq!(field.bytes(), value.len(), "canonical handoff field size");
+    frame[field.offset()..field.end()].copy_from_slice(value);
 }
 
 struct PendingSupervisedDeliveryReportReceiver<C> {
@@ -359,6 +670,17 @@ impl<C> SupervisedDeliveryReportCollector<C>
 where
     C: FnMut() -> Instant,
 {
+    #[cfg(test)]
+    pub(super) fn recv_fixture_record_until(
+        &self,
+        limit: usize,
+        exclusive_deadline: Instant,
+    ) -> Result<Option<SeqpacketReceive>, PlatformError> {
+        self.receiver
+            .connection
+            .recv_record_until(limit, exclusive_deadline)
+    }
+
     pub(super) fn drain(
         self,
     ) -> Result<

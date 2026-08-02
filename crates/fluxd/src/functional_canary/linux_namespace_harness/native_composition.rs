@@ -1183,24 +1183,39 @@ fn reserve_listener_port() -> Result<u16, String> {
 }
 
 fn fixture_engine_binary() -> Result<PathBuf, String> {
-    let test = env::current_exe().map_err(|error| format!("resolve test executable: {error}"))?;
-    let debug_root = test
-        .parent()
-        .and_then(Path::parent)
-        .ok_or_else(|| format!("cannot derive target directory from {}", test.display()))?;
-    let binary = debug_root.join(format!(
-        "flux-native-composition-engine{}",
-        env::consts::EXE_SUFFIX
-    ));
-    let metadata = fs::metadata(&binary).map_err(|error| {
+    let binary = match env::var_os(ENGINE_BIN_ENV) {
+        Some(value) => {
+            let path = PathBuf::from(value);
+            if !path.is_absolute() {
+                return Err(format!(
+                    "{ENGINE_BIN_ENV} must be absolute, found {}",
+                    path.display()
+                ));
+            }
+            path
+        }
+        None => {
+            let test =
+                env::current_exe().map_err(|error| format!("resolve test executable: {error}"))?;
+            let debug_root = test
+                .parent()
+                .and_then(Path::parent)
+                .ok_or_else(|| format!("cannot derive target directory from {}", test.display()))?;
+            debug_root.join(format!(
+                "flux-native-composition-engine{}",
+                env::consts::EXE_SUFFIX
+            ))
+        }
+    };
+    let metadata = fs::symlink_metadata(&binary).map_err(|error| {
         format!(
             "native engine fixture {} is not built: {error}",
             binary.display()
         )
     })?;
-    if !metadata.is_file() {
+    if !metadata.file_type().is_file() {
         return Err(format!(
-            "native engine fixture {} is not a file",
+            "native engine fixture {} is not a regular file",
             binary.display()
         ));
     }

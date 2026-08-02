@@ -119,6 +119,107 @@ fn typed_connection_handoff_preserves_payload_credentials_transport_and_eof() {
 }
 
 #[test]
+fn expired_connection_handoff_sends_nothing_and_keeps_the_borrowed_endpoint_live() {
+    let (control_sender, control_receiver) =
+        SeqpacketConnection::pair().expect("create control pair");
+    let (producer_endpoint, collector_endpoint) =
+        SeqpacketConnection::pair().expect("create report pair");
+
+    assert!(
+        !control_sender
+            .send_connection_until(b"expired", &producer_endpoint, Instant::now())
+            .expect("reject expired handoff")
+    );
+    assert!(
+        control_receiver
+            .recv_connection_until(64, Instant::now() + Duration::from_millis(20))
+            .expect("inspect control receiver")
+            .is_none()
+    );
+    producer_endpoint
+        .send_packet(b"still-owned")
+        .expect("use endpoint after expired borrowed handoff");
+    assert_eq!(
+        receive_complete_record(&collector_endpoint, 64),
+        b"still-owned"
+    );
+}
+
+#[test]
+fn connection_handoff_returns_at_deadline_when_the_control_queue_is_full() {
+    let _serial = SIGNAL_TEST_LOCK.lock().expect("signal test lock");
+    let _handler = SignalHandlerGuard::install();
+    let (control_sender, control_receiver) =
+        SeqpacketConnection::pair().expect("create control pair");
+    let (producer_endpoint, collector_endpoint) =
+        SeqpacketConnection::pair().expect("create report pair");
+    let mut queued = 0_usize;
+    while control_sender
+        .send_connection_until(
+            b"queued",
+            &producer_endpoint,
+            Instant::now() + Duration::from_millis(10),
+        )
+        .expect("fill control queue")
+    {
+        queued += 1;
+        assert!(queued < 4096, "control queue must become full");
+    }
+    assert!(queued > 0, "at least one handoff must be queued");
+
+    let started = Instant::now();
+    // SAFETY: `pthread_self` has no pointer arguments or preconditions.
+    let sending_thread = unsafe { libc::pthread_self() } as usize;
+    let interrupter = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(10));
+        // SAFETY: `sending_thread` names the live test thread and SIGUSR1 has a process-wide
+        // non-restarting handler installed for this test.
+        let result =
+            unsafe { libc::pthread_kill(sending_thread as libc::pthread_t, libc::SIGUSR1) };
+        assert_eq!(result, 0);
+    });
+    assert!(
+        !control_sender
+            .send_connection_until(
+                b"deadline",
+                &producer_endpoint,
+                started + Duration::from_millis(40),
+            )
+            .expect("bound a full-queue handoff")
+    );
+    interrupter.join().expect("signal interrupter");
+    assert!(started.elapsed() >= Duration::from_millis(20));
+    assert!(started.elapsed() < Duration::from_secs(1));
+    producer_endpoint
+        .send_packet(b"still-owned")
+        .expect("use endpoint after full-queue timeout");
+    assert_eq!(
+        receive_complete_record(&collector_endpoint, 64),
+        b"still-owned"
+    );
+
+    for _ in 0..queued {
+        let received = control_receiver
+            .recv_connection_until(64, fresh_deadline())
+            .expect("drain queued handoff")
+            .expect("queued handoff must remain");
+        let SeqpacketConnectionHandoffReceive::Record {
+            bytes, connection, ..
+        } = received
+        else {
+            panic!("queued handoff cannot be EOF");
+        };
+        assert_eq!(bytes, b"queued");
+        drop(connection);
+    }
+    assert!(
+        control_sender
+            .send_connection_until(b"after-drain", &producer_endpoint, fresh_deadline())
+            .expect("send after draining control queue")
+    );
+}
+
+#[test]
 fn truncated_connection_handoff_closes_the_transferred_endpoint() {
     let (control_sender, control_receiver) =
         SeqpacketConnection::pair().expect("create control pair");

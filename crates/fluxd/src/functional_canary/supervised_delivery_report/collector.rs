@@ -284,6 +284,7 @@ pub(super) enum SupervisedDeliveryReportHandoffError {
         observed_start_time_ticks: u64,
     },
     UnsupportedCaptureBackend(CanaryCaptureBackend),
+    DeadlineExpired,
     Transport(PlatformError),
 }
 
@@ -304,6 +305,9 @@ impl fmt::Display for SupervisedDeliveryReportHandoffError {
                 formatter,
                 "supervised delivery-report handoff does not support {backend:?} capture"
             ),
+            Self::DeadlineExpired => {
+                formatter.write_str("supervised delivery-report handoff deadline expired")
+            }
             Self::Transport(source) => {
                 write!(
                     formatter,
@@ -318,7 +322,9 @@ impl Error for SupervisedDeliveryReportHandoffError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Transport(source) => Some(source),
-            Self::ChildIdentityMismatch { .. } | Self::UnsupportedCaptureBackend(_) => None,
+            Self::ChildIdentityMismatch { .. }
+            | Self::UnsupportedCaptureBackend(_)
+            | Self::DeadlineExpired => None,
         }
     }
 }
@@ -382,10 +388,17 @@ impl SupervisedDeliveryReportEngineHandoff {
             );
         }
         let frame = encode_engine_handoff_frame(&self.binding)?;
-        child
+        let sent = child
             .launch_control()
-            .send_connection(&frame, &self.connection)
+            .send_connection_until(
+                &frame,
+                &self.connection,
+                self.binding.request().deadline().expires_at(),
+            )
             .map_err(SupervisedDeliveryReportHandoffError::Transport)?;
+        if !sent {
+            return Err(SupervisedDeliveryReportHandoffError::DeadlineExpired);
+        }
         let Self {
             connection,
             binding,

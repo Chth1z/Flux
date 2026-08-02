@@ -1655,6 +1655,47 @@ esac
             .expect("terminate and reap wrong-child fixture");
     }
 
+    #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+    #[test]
+    fn expired_exact_child_handoff_sends_nothing_and_closes_the_producer() {
+        let Some((engine_uid, engine_gid)) = non_root_process_credentials() else {
+            return;
+        };
+        let fixture = NativeLaunchControlFixture::new();
+        let mut child = fixture.spawn();
+        fixture
+            .adapter
+            .wait_ready(&mut child, fixture.spec.process())
+            .expect("launch-control child becomes ready");
+        let mut request = fixture.request_for_child(&child, engine_uid, engine_gid);
+        request.deadline.expires_at = Instant::now();
+        let (handoff, collector) = fixture.prebind(&request, Instant::now);
+
+        assert!(matches!(
+            handoff.install_into(&child),
+            Err(collector::SupervisedDeliveryReportHandoffError::DeadlineExpired)
+        ));
+        assert!(matches!(
+            collector
+                .recv_fixture_record_until(1, Instant::now() + Duration::from_secs(1))
+                .expect("observe expired-handoff producer closure"),
+            Some(SeqpacketReceive::Eof)
+        ));
+        assert_eq!(
+            child
+                .launch_control()
+                .recv_record_until(1, Instant::now() + Duration::from_millis(100))
+                .expect("inspect expired child launch control"),
+            None,
+            "deadline expiry must occur before any launch-control record"
+        );
+        assert!(!fixture.evidence.exists());
+        fixture
+            .adapter
+            .terminate(&mut child, Duration::from_secs(1))
+            .expect("terminate and reap expired-handoff fixture");
+    }
+
     #[test]
     fn canonical_dual_stack_report_completes_only_after_terminal_and_eof() {
         let context = Context::new(CanaryAddressFamilies::Ipv4AndIpv6);

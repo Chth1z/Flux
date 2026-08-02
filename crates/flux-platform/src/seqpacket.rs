@@ -848,10 +848,91 @@ mod implementation {
             self.send_record(payload, Some(connection))
         }
 
+        /// Transfers a borrowed endpoint only if the complete record can be queued before the
+        /// exclusive deadline.
+        ///
+        /// A `false` result sends no record and leaves `connection` owned by the caller.
+        pub fn send_connection_until(
+            &self,
+            payload: &[u8],
+            connection: &SeqpacketConnection,
+            exclusive_deadline: Instant,
+        ) -> Result<bool, PlatformError> {
+            self.send_record_until(payload, Some(connection), exclusive_deadline)
+        }
+
         fn send_record(
             &self,
             packet: &[u8],
             connection: Option<&SeqpacketConnection>,
+        ) -> Result<(), PlatformError> {
+            loop {
+                match self.send_record_once(packet, connection, 0) {
+                    Ok(()) => return Ok(()),
+                    Err(PlatformError::SystemCall { source, .. })
+                        if source.raw_os_error() == Some(libc::EINTR) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+
+        fn send_record_until(
+            &self,
+            packet: &[u8],
+            connection: Option<&SeqpacketConnection>,
+            exclusive_deadline: Instant,
+        ) -> Result<bool, PlatformError> {
+            loop {
+                let now = Instant::now();
+                if now >= exclusive_deadline {
+                    return Ok(false);
+                }
+                let remaining = exclusive_deadline.saturating_duration_since(now);
+                let mut descriptor = libc::pollfd {
+                    fd: self.fd.as_raw_fd(),
+                    events: libc::POLLOUT,
+                    revents: 0,
+                };
+                // SAFETY: `descriptor` points to one initialized pollfd and remains writable for
+                // the duration of the call.
+                let result = unsafe {
+                    libc::poll(&raw mut descriptor, 1, duration_to_poll_timeout(remaining))
+                };
+                if result == 0 {
+                    continue;
+                }
+                if result < 0 {
+                    let source = std::io::Error::last_os_error();
+                    if source.raw_os_error() == Some(libc::EINTR) {
+                        continue;
+                    }
+                    return Err(system_call_error("poll Unix seqpacket connection", source));
+                }
+                if Instant::now() >= exclusive_deadline {
+                    return Ok(false);
+                }
+                if descriptor.revents & libc::POLLNVAL != 0 {
+                    return Err(system_call_error(
+                        "poll Unix seqpacket connection",
+                        std::io::Error::from_raw_os_error(libc::EBADF),
+                    ));
+                }
+
+                match self.send_record_once(packet, connection, libc::MSG_DONTWAIT) {
+                    Ok(()) => return Ok(true),
+                    Err(PlatformError::SystemCall { source, .. })
+                        if source.kind() == std::io::ErrorKind::WouldBlock
+                            || source.raw_os_error() == Some(libc::EINTR) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+
+        fn send_record_once(
+            &self,
+            packet: &[u8],
+            connection: Option<&SeqpacketConnection>,
+            additional_flags: libc::c_int,
         ) -> Result<(), PlatformError> {
             let mut iovec = libc::iovec {
                 iov_base: packet.as_ptr().cast_mut().cast::<libc::c_void>(),
@@ -871,21 +952,19 @@ mod implementation {
                 message.msg_controllen = std::mem::size_of_val(control.as_slice());
             }
 
-            let sent = loop {
-                // SAFETY: `message` references the immutable payload through one iovec and, when
-                // present, one initialized SCM_RIGHTS record. All borrowed connection descriptors
-                // remain live for the call. MSG_NOSIGNAL suppresses process-directed SIGPIPE.
-                let sent = unsafe {
-                    libc::sendmsg(self.fd.as_raw_fd(), &raw const message, libc::MSG_NOSIGNAL)
-                };
-                if sent >= 0 {
-                    break sent;
-                }
-                let source = std::io::Error::last_os_error();
-                if source.raw_os_error() != Some(libc::EINTR) {
-                    return Err(system_call_error("send Unix seqpacket message", source));
-                }
+            // SAFETY: `message` references the immutable payload through one iovec and, when
+            // present, one initialized SCM_RIGHTS record. All borrowed connection descriptors
+            // remain live for the call. MSG_NOSIGNAL suppresses process-directed SIGPIPE.
+            let sent = unsafe {
+                libc::sendmsg(
+                    self.fd.as_raw_fd(),
+                    &raw const message,
+                    libc::MSG_NOSIGNAL | additional_flags,
+                )
             };
+            if sent < 0 {
+                return Err(last_error("send Unix seqpacket message"));
+            }
             let actual = usize::try_from(sent).map_err(|_| PlatformError::ShortWrite {
                 expected: packet.len(),
                 actual: 0,
@@ -2432,6 +2511,19 @@ mod implementation {
             _payload: &[u8],
             _connection: &SeqpacketConnection,
         ) -> Result<(), PlatformError> {
+            Err(PlatformError::UnsupportedPlatform(std::env::consts::OS))
+        }
+
+        /// Transfers a borrowed endpoint only if the complete record can be queued before the
+        /// exclusive deadline.
+        ///
+        /// A `false` result sends no record and leaves `connection` owned by the caller.
+        pub fn send_connection_until(
+            &self,
+            _payload: &[u8],
+            _connection: &SeqpacketConnection,
+            _exclusive_deadline: Instant,
+        ) -> Result<bool, PlatformError> {
             Err(PlatformError::UnsupportedPlatform(std::env::consts::OS))
         }
     }

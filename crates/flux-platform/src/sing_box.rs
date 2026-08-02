@@ -244,12 +244,16 @@ impl SingBoxLaunchControl {
         Ok(Some(Self { connection }))
     }
 
-    pub fn send_connection(
+    /// Installs one attempt endpoint without allowing a stalled child to outlive the attempt
+    /// deadline. A `false` result transfers nothing.
+    pub fn send_connection_until(
         &self,
         frame: &[u8],
         connection: &SeqpacketConnection,
-    ) -> Result<(), PlatformError> {
-        self.connection.send_connection(frame, connection)
+        exclusive_deadline: Instant,
+    ) -> Result<bool, PlatformError> {
+        self.connection
+            .send_connection_until(frame, connection, exclusive_deadline)
     }
 
     pub fn recv_record_until(

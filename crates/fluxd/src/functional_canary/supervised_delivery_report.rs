@@ -996,6 +996,8 @@ fn parse_payload_identity(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+    use std::env;
     use std::fs;
     #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
     use std::fs::File;
@@ -1043,6 +1045,9 @@ case "$1" in
         ;;
 esac
 "#;
+
+    #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+    const REAL_PRODUCER_BINARY_ENV: &str = "FLUX_TEST_SING_BOX_PRODUCER_BINARY";
 
     struct Context {
         baseline_profile: EngineCapabilityProfile,
@@ -1192,6 +1197,41 @@ esac
             let binary = native_composition_engine_binary();
             let directory = tempfile::tempdir().expect("launch-control fixture directory");
             let evidence = directory.path().join("control-evidence");
+            let template = serde_json::to_vec(&serde_json::json!({
+                "flux_test_launch_control_evidence": evidence
+                    .to_str()
+                    .expect("launch-control evidence path is UTF-8"),
+                "inbounds": [],
+            }))
+            .expect("encode launch-control template");
+            Self::with_binary_template(binary, directory, evidence, &template)
+        }
+
+        fn real_producer(binary: PathBuf) -> Self {
+            assert!(binary.is_absolute(), "real producer path must be absolute");
+            let binary = fs::canonicalize(&binary).expect("canonicalize real producer path");
+            assert!(
+                fs::metadata(&binary)
+                    .expect("inspect real producer binary")
+                    .is_file(),
+                "real producer must be a regular file"
+            );
+            let directory = tempfile::tempdir().expect("real producer fixture directory");
+            let evidence = directory.path().join("unused-control-evidence");
+            let template = serde_json::to_vec(&serde_json::json!({
+                "log": { "disabled": true },
+                "inbounds": [],
+            }))
+            .expect("encode real producer template");
+            Self::with_binary_template(binary, directory, evidence, &template)
+        }
+
+        fn with_binary_template(
+            binary: PathBuf,
+            directory: tempfile::TempDir,
+            evidence: PathBuf,
+            template: &[u8],
+        ) -> Self {
             let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
                 .expect("reserve launch-control listener port");
             let port = NonZeroU16::new(
@@ -1202,15 +1242,8 @@ esac
             )
             .expect("reserved launch-control listener port is nonzero");
             drop(listener);
-            let template = serde_json::to_vec(&serde_json::json!({
-                "flux_test_launch_control_evidence": evidence
-                    .to_str()
-                    .expect("launch-control evidence path is UTF-8"),
-                "inbounds": [],
-            }))
-            .expect("encode launch-control template");
             let artifact =
-                compile_tproxy_engine_config(TproxyEngineConfigRequest::new(&template, port))
+                compile_tproxy_engine_config(TproxyEngineConfigRequest::new(template, port))
                     .expect("compile launch-control engine config");
             let config = directory.path().join("config.json");
             fs::write(&config, artifact.bytes()).expect("write launch-control engine config");
@@ -1268,12 +1301,25 @@ esac
             engine_uid: NonZeroU32,
             engine_gid: NonZeroU32,
         ) -> CanaryAttemptRequest {
+            self.request_for_child_with_nonce(
+                child,
+                Some((engine_uid, engine_gid)),
+                [0x91; FUNCTIONAL_CANARY_NONCE_BYTES],
+            )
+        }
+
+        fn request_for_child_with_nonce(
+            &self,
+            child: &SingBoxChild,
+            engine_credentials: Option<(NonZeroU32, NonZeroU32)>,
+            nonce: [u8; FUNCTIONAL_CANARY_NONCE_BYTES],
+        ) -> CanaryAttemptRequest {
             let identity = child.identity();
             let mut request = request_with_engine_profile_revision(
                 &self.spec,
                 CanaryAddressFamilies::Ipv4AndIpv6,
                 Instant::now(),
-                CanaryNonce::from_bytes([0x91; FUNCTIONAL_CANARY_NONCE_BYTES]),
+                CanaryNonce::from_bytes(nonce),
                 GenerationId::new(29).expect("launch-control generation"),
                 NonZeroU32::new(identity.pid()).expect("launch-control child PID"),
                 NonZeroU64::new(identity.start_time_ticks())
@@ -1281,7 +1327,9 @@ esac
                 NonZeroU64::new(31).expect("launch-control engine snapshot revision"),
                 self.profile.revision(),
             );
-            bind_request_engine_credentials(&mut request, engine_uid, engine_gid);
+            if let Some((engine_uid, engine_gid)) = engine_credentials {
+                bind_request_engine_credentials(&mut request, engine_uid, engine_gid);
+            }
             request
         }
 
@@ -1586,6 +1634,105 @@ esac
             .adapter
             .terminate(&mut child, Duration::from_secs(1))
             .expect("terminate and reap launch-control child");
+    }
+
+    #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+    #[test]
+    #[ignore = "requires the exact manifest-built Sing-Box producer binary"]
+    fn real_sing_box_producer_obeys_exact_attempt_ownership() {
+        let binary = env::var_os(REAL_PRODUCER_BINARY_ENV)
+            .map(PathBuf::from)
+            .expect("real producer composition requires its exact binary path");
+        let fixture = NativeLaunchControlFixture::real_producer(binary);
+        let mut child = fixture.spawn();
+        fixture
+            .adapter
+            .wait_ready(&mut child, fixture.spec.process())
+            .expect("real producer child becomes ready");
+        let credentials = non_root_process_credentials();
+
+        let first_request = fixture.request_for_child_with_nonce(
+            &child,
+            credentials,
+            [0xa1; FUNCTIONAL_CANARY_NONCE_BYTES],
+        );
+        let first_child = first_request.pre_binding().engine().engine();
+        let (first_handoff, first_collector) = fixture.prebind(&first_request, Instant::now);
+        let first_installed = first_handoff
+            .install_into(&child)
+            .expect("install first real producer attempt");
+        assert_eq!(first_installed.child(), first_child);
+
+        let overlap_request = fixture.request_for_child_with_nonce(
+            &child,
+            credentials,
+            [0xa2; FUNCTIONAL_CANARY_NONCE_BYTES],
+        );
+        let (overlap_handoff, overlap_collector) = fixture.prebind(&overlap_request, Instant::now);
+        let overlap_installed = overlap_handoff
+            .install_into(&child)
+            .expect("transfer overlapping attempt to real producer");
+        assert_eq!(overlap_installed.child(), first_child);
+        assert!(matches!(
+            overlap_collector
+                .recv_fixture_record_until(1, Instant::now() + Duration::from_secs(1))
+                .expect("observe overlapping producer rejection"),
+            Some(SeqpacketReceive::Eof)
+        ));
+        assert_eq!(
+            first_collector
+                .recv_fixture_record_until(1, Instant::now() + Duration::from_millis(100))
+                .expect("inspect admitted first producer"),
+            None,
+            "the first producer must remain active while overlap is rejected"
+        );
+        drop(first_collector);
+
+        let successor_request = fixture.request_for_child_with_nonce(
+            &child,
+            credentials,
+            [0xa3; FUNCTIONAL_CANARY_NONCE_BYTES],
+        );
+        let successor_child = successor_request.pre_binding().engine().engine();
+        let (successor_handoff, successor_collector) =
+            fixture.prebind(&successor_request, Instant::now);
+        let successor_installed = successor_handoff
+            .install_into(&child)
+            .expect("install successor after first receiver retirement");
+        assert_eq!(successor_installed.child(), successor_child);
+        assert_eq!(
+            successor_collector
+                .recv_fixture_record_until(1, Instant::now() + Duration::from_millis(100))
+                .expect("inspect admitted successor producer"),
+            None,
+            "the retired first attempt must admit one live successor"
+        );
+        assert_eq!(
+            fixture
+                .adapter
+                .try_wait(&mut child)
+                .expect("poll real producer child before termination"),
+            None
+        );
+
+        fixture
+            .adapter
+            .terminate(&mut child, Duration::from_secs(1))
+            .expect("terminate and reap real producer child");
+        let eof_deadline = Instant::now() + Duration::from_secs(1);
+        assert!(matches!(
+            successor_collector
+                .recv_fixture_record_until(1, eof_deadline)
+                .expect("observe successor closure after real child exit"),
+            Some(SeqpacketReceive::Eof)
+        ));
+        assert!(matches!(
+            child
+                .launch_control()
+                .recv_record_until(1, eof_deadline)
+                .expect("observe launch-control closure after real child exit"),
+            Some(SeqpacketReceive::Eof)
+        ));
     }
 
     #[cfg(all(feature = "native-composition-test", target_os = "linux"))]

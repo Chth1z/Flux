@@ -5999,6 +5999,44 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn dns_wire_identity_matches_the_producer_golden_vector() {
+        let mut nonce = [0_u8; FUNCTIONAL_CANARY_NONCE_BYTES];
+        nonce[0] = 0x5a;
+        let expected =
+            derive_dns_expectation(CanaryFlow::Ipv4DnsUdp, CanaryNonce::from_bytes(nonce));
+        assert_eq!(expected.transaction_id, 0xc897);
+        assert_eq!(expected.question.wire_name.len(), 83);
+        assert_eq!(expected.question.wire_name[82], 0);
+        assert_eq!(
+            expected.question_digest,
+            CanaryDnsQuestionDigest::from_bytes([
+                0xc8, 0x97, 0xbf, 0x07, 0xaa, 0xdf, 0xc9, 0x63, 0xfe, 0x73, 0xea, 0xd8, 0x78, 0xb0,
+                0xd4, 0x9f, 0x78, 0x29, 0x01, 0xf0, 0x14, 0x8e, 0x33, 0x0f, 0xb1, 0xc6, 0x82, 0xe5,
+                0x19, 0x03, 0xad, 0xaf,
+            ])
+        );
+
+        let mut query = Vec::with_capacity(99);
+        query.extend_from_slice(&expected.transaction_id.to_be_bytes());
+        query.extend_from_slice(&0x0100_u16.to_be_bytes());
+        query.extend_from_slice(&1_u16.to_be_bytes());
+        query.extend_from_slice(&[0; 6]);
+        query.extend_from_slice(&expected.question.wire_name);
+        query.extend_from_slice(&expected.question.record_type.to_be_bytes());
+        query.extend_from_slice(&1_u16.to_be_bytes());
+        assert_eq!(query.len(), 99);
+        let wire_digest: [u8; 32] = Sha256::digest(&query).into();
+        assert_eq!(
+            wire_digest,
+            [
+                0x58, 0xfb, 0xbb, 0x24, 0x21, 0xf3, 0xf3, 0x6b, 0xab, 0x46, 0x2b, 0xce, 0x83, 0xeb,
+                0xb4, 0xcf, 0xa1, 0x67, 0x8f, 0xa8, 0x98, 0x48, 0xf3, 0xda, 0x43, 0x17, 0x29, 0x00,
+                0xa3, 0x8f, 0x43, 0x2e,
+            ]
+        );
+    }
+
+    #[test]
     fn supervised_delivery_report_and_exact_wire_identity_are_attempt_bound() {
         let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
         let flow = CanaryFlow::Ipv4TcpEcho;

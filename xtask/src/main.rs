@@ -8,6 +8,8 @@ use std::process::{Command, ExitStatus};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+use crate::hash::sha256_file;
+
 mod android_artifact;
 mod android_canary;
 mod android_fwmark_census;
@@ -15,7 +17,9 @@ mod android_kernel;
 mod android_mark_preflight;
 mod android_profile;
 mod android_remote;
+mod hash;
 mod platform_glue;
+mod sing_box_producer;
 
 const ANDROID_TARGET: &str = "aarch64-linux-android";
 const ANDROID_API_LEVEL: &str = "31";
@@ -237,6 +241,7 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
             require_no_arguments(&arguments)?;
             test_parser_fuzz_smoke()
         }
+        sing_box_producer::COMMAND => sing_box_producer::run(&arguments),
         android_canary::COMMAND => android_canary::run(android_canary::parse_options(&arguments)?),
         "preflight-android-arm64-mark-ordering" => {
             android_mark_preflight::run(android_mark_preflight::parse_options(&arguments)?)
@@ -1706,7 +1711,8 @@ fn validate_spdx_license(name: &str, value: &str) -> Result<(), String> {
         "MPL-2.0",
         "Unlicense",
     ];
-    const REVIEWED_LICENSE_REFS: &[&str] = &[];
+    const REVIEWED_LICENSE_REFS: &[&str] =
+        &["LicenseRef-Sing-Box-GPL-3.0-or-later-with-Additional-Terms"];
     let custom = REVIEWED_LICENSE_REFS.contains(&value);
     if KNOWN_IDS.contains(&value) || custom {
         Ok(())
@@ -1825,23 +1831,6 @@ fn validate_sha256(name: &str, value: &str) -> Result<(), String> {
             "manifest sha256 for '{name}' must contain exactly 64 hexadecimal characters"
         ))
     }
-}
-
-fn sha256_file(path: &Path) -> Result<String, String> {
-    let mut file = fs::File::open(path)
-        .map_err(|error| format!("cannot open {} for hashing: {error}", path.display()))?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .map_err(|error| format!("cannot hash {}: {error}", path.display()))?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn operational_payload_sha256(stage: &Path, profile: &PackageProfile) -> Result<String, String> {
@@ -2558,6 +2547,7 @@ fn help_text() -> String {
            test-functional-canary-linux-output-preflight  Preflight distinct local-OUTPUT credentials (no traffic)\n\
            test-native-composition-linux  Run the single-owner native lifecycle and recovery checkpoint\n\
            test-parser-fuzz-smoke  Run bounded deterministic parser no-panic smoke tests\n\
+           build-sing-box-producer  Validate, patch, test, and reproducibly build pinned Sing-Box; requires --source DIR --go-sdk FILE --output FILE\n\
            {android_canary_command}  Cross-build and run the exact checkpoint on one explicit rooted ARM64 or x86_64 Android serial\n\
            preflight-android-arm64-mark-ordering  Read-only ADR-0013 target viability report for one explicit rooted ARM64 Android serial\n\
            collect-android-arm64-profile  Run the production profile collector in one cleaned explicit-serial ARM64 test directory\n\

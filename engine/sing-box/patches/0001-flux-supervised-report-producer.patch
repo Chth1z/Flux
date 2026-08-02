@@ -1,0 +1,1572 @@
+diff --git a/cmd/sing-box/cmd_run.go b/cmd/sing-box/cmd_run.go
+index f31db9dc82192cde47dff82807cb391c9e00e6c4..8873c6f0b1057b4a913dcc1e00d9f7df6d569a46 100644
+--- a/cmd/sing-box/cmd_run.go
++++ b/cmd/sing-box/cmd_run.go
+@@ -14,6 +14,7 @@ import (
+ 
+ 	"github.com/sagernet/sing-box"
+ 	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing-box/internal/fluxreport"
+ 	"github.com/sagernet/sing-box/log"
+ 	"github.com/sagernet/sing-box/option"
+ 	E "github.com/sagernet/sing/common/exceptions"
+@@ -167,6 +168,9 @@ func create() (*box.Box, context.CancelFunc, error) {
+ }
+ 
+ func run() error {
++	if err := fluxreport.Start(); err != nil {
++		return E.Cause(err, "initialize Flux launch control")
++	}
+ 	osSignals := make(chan os.Signal, 1)
+ 	signal.Notify(osSignals, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+ 	defer signal.Stop(osSignals)
+diff --git a/common/listener/flux_report.go b/common/listener/flux_report.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..4a320cf1656aea8090bd7b78e608ed2633e1587d
+--- /dev/null
++++ b/common/listener/flux_report.go
+@@ -0,0 +1,14 @@
++package listener
++
++import (
++	"net"
++
++	"github.com/sagernet/sing-box/internal/fluxreport"
++)
++
++func (l *Listener) WrapTProxyTCP(connection net.Conn) net.Conn {
++	if !l.tproxy {
++		return connection
++	}
++	return fluxreport.WrapTProxyTCP(l.tcpListener, connection)
++}
+diff --git a/common/listener/listener_udp.go b/common/listener/listener_udp.go
+index e689c8bb67b84b3fc7901f99840d5194237f45e4..c5e7c9a838f8939c9a481d5aa5321f5140069d7d 100644
+--- a/common/listener/listener_udp.go
++++ b/common/listener/listener_udp.go
+@@ -10,6 +10,7 @@ import (
+ 
+ 	"github.com/sagernet/sing-box/adapter"
+ 	"github.com/sagernet/sing-box/common/redir"
++	"github.com/sagernet/sing-box/internal/fluxreport"
+ 	"github.com/sagernet/sing/common/buf"
+ 	"github.com/sagernet/sing/common/control"
+ 	E "github.com/sagernet/sing/common/exceptions"
+@@ -113,7 +114,7 @@ func (l *Listener) loopUDPIn() {
+ 			} else {
+ 				buffer.Reset()
+ 			}
+-			n, oobN, _, addr, err := l.udpConn.ReadMsgUDPAddrPort(buffer.FreeBytes(), oob)
++			n, oobN, messageFlags, addr, err := l.udpConn.ReadMsgUDPAddrPort(buffer.FreeBytes(), oob)
+ 			if err != nil {
+ 				if l.threadUnsafePacketWriter {
+ 					buffer.Release()
+@@ -126,6 +127,9 @@ func (l *Listener) loopUDPIn() {
+ 				return
+ 			}
+ 			buffer.Truncate(n)
++			if l.tproxy {
++				fluxreport.ObserveTProxyUDP(l.udpConn, buffer.Bytes(), oob[:oobN], messageFlags, addr)
++			}
+ 			l.oobPacketHandler.NewPacketEx(buffer, oob[:oobN], M.SocksaddrFromNetIP(addr).Unwrap())
+ 		}
+ 	} else {
+diff --git a/internal/fluxreport/report_linux_test.go b/internal/fluxreport/report_linux_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..0eaa44f55bb1b1e6b550ba0070fe0a32f4226080
+--- /dev/null
++++ b/internal/fluxreport/report_linux_test.go
+@@ -0,0 +1,438 @@
++//go:build with_flux_report && (linux || android)
++
++package fluxreport
++
++import (
++	"bytes"
++	"crypto/sha256"
++	"encoding/binary"
++	"encoding/hex"
++	"errors"
++	"io"
++	"net"
++	"net/netip"
++	"os"
++	"strconv"
++	"testing"
++	"time"
++	"unsafe"
++
++	"golang.org/x/sys/unix"
++)
++
++func TestParseHandoffAcceptsOnlyCanonicalExactEngineFrame(t *testing.T) {
++	frame := canonicalHandoffFrame(41, 73)
++	parsed, err := parseHandoff(frame, 41, 73)
++	if err != nil {
++		t.Fatalf("parse canonical handoff: %v", err)
++	}
++	if parsed.generation != 9 || parsed.requiredFlows != dualStackFlowMask || !bytes.Equal(parsed.nonce[:], bytes.Repeat([]byte{0x33}, 32)) {
++		t.Fatalf("unexpected parsed handoff: %+v", parsed)
++	}
++
++	mutations := map[string]func([]byte){
++		"magic":              func(value []byte) { value[0] ^= 1 },
++		"schema":             func(value []byte) { value[9]++ },
++		"flags":              func(value []byte) { value[11] = 1 },
++		"frame length":       func(value []byte) { value[13]-- },
++		"request schema":     func(value []byte) { value[17]++ },
++		"families":           func(value []byte) { value[20] = ipv6FamilyFlag },
++		"flow mask":          func(value []byte) { value[21] &^= 1 },
++		"backend":            func(value []byte) { value[22]++ },
++		"prefix reserved":    func(value []byte) { value[23] = 1 },
++		"generation":         func(value []byte) { clear(value[24:28]) },
++		"engine pid":         func(value []byte) { value[31]++ },
++		"engine start ticks": func(value []byte) { value[39]++ },
++		"snapshot revision":  func(value []byte) { clear(value[40:48]) },
++		"suffix reserved":    func(value []byte) { value[159] = 1 },
++	}
++	for name, mutate := range mutations {
++		t.Run(name, func(t *testing.T) {
++			candidate := append([]byte(nil), frame...)
++			mutate(candidate)
++			if _, err := parseHandoff(candidate, 41, 73); err == nil {
++				t.Fatal("mutated handoff was accepted")
++			}
++		})
++	}
++}
++
++func TestReceiveHandoffRequiresCredentialsAndOneCloseOnExecSeqpacket(t *testing.T) {
++	control := socketPair(t)
++	report := socketPair(t)
++	defer closePair(control)
++	defer closePair(report)
++	if err := unix.SetsockoptInt(control[1], unix.SOL_SOCKET, unix.SO_PASSCRED, 1); err != nil {
++		t.Fatalf("enable credentials: %v", err)
++	}
++	frame := canonicalHandoffFrame(uint32(os.Getpid()), 73)
++	if _, err := unix.SendmsgN(control[0], frame, unix.UnixRights(report[0]), nil, 0); err != nil {
++		t.Fatalf("send handoff: %v", err)
++	}
++	received, descriptor, err := receiveHandoff(control[1])
++	if err != nil {
++		t.Fatalf("receive handoff: %v", err)
++	}
++	defer unix.Close(descriptor)
++	if !bytes.Equal(received, frame) {
++		t.Fatal("received handoff bytes changed")
++	}
++	flags, err := unix.FcntlInt(uintptr(descriptor), unix.F_GETFD, 0)
++	if err != nil || flags&unix.FD_CLOEXEC == 0 {
++		t.Fatalf("received endpoint lacks FD_CLOEXEC: flags=%d err=%v", flags, err)
++	}
++	if err := unix.Send(descriptor, []byte("proof"), 0); err != nil {
++		t.Fatalf("use received endpoint: %v", err)
++	}
++	buffer := make([]byte, 8)
++	length, err := unix.Read(report[1], buffer)
++	if err != nil || string(buffer[:length]) != "proof" {
++		t.Fatalf("read transferred endpoint: length=%d bytes=%q err=%v", length, buffer[:length], err)
++	}
++}
++
++func TestExpectedPayloadDerivesCanonicalEchoAndDNSIdentities(t *testing.T) {
++	nonce := [32]byte{0x5a}
++	echo, echoIdentity := expectedPayload(0, nonce)
++	if !bytes.Equal(echo, nonce[:]) || echoIdentity.kind != payloadKindEcho || echoIdentity.wireLength != 32 {
++		t.Fatalf("unexpected echo identity: bytes=%x identity=%+v", echo, echoIdentity)
++	}
++
++	dnsUDP, udpIdentity := expectedPayload(2, nonce)
++	if len(dnsUDP) != 99 || udpIdentity.kind != payloadKindDNS || udpIdentity.wireLength != 99 || udpIdentity.tcpLength != 0 {
++		t.Fatalf("unexpected UDP DNS identity: length=%d identity=%+v", len(dnsUDP), udpIdentity)
++	}
++	if hex.EncodeToString(dnsUDP) != "c8970100000100000000000002663220356130303030303030303030303030303030303030303030303030303030303020303030303030303030303030303030303030303030303030303030303030303004666c757807696e76616c69640000010001" ||
++		hex.EncodeToString(udpIdentity.wireDigest[:]) != "58fbbb2421f3f36bab462bce83ebb4cfa1678fa89848f3da43172900a38f432e" ||
++		hex.EncodeToString(udpIdentity.questionDigest[:]) != "c897bf07aadfc963fe73ead878b0d49f782901f0148e330fb1c682e51903adaf" ||
++		udpIdentity.transactionID != 0xc897 {
++		t.Fatal("UDP DNS identity differs from the Rust cross-language golden vector")
++	}
++	if binary.BigEndian.Uint16(dnsUDP[:2]) != udpIdentity.transactionID || binary.BigEndian.Uint16(dnsUDP[4:6]) != 1 {
++		t.Fatal("UDP DNS query header is not canonical")
++	}
++
++	dnsTCP, tcpIdentity := expectedPayload(3, nonce)
++	if len(dnsTCP) != 101 || binary.BigEndian.Uint16(dnsTCP[:2]) != 99 || sha256.Sum256(dnsTCP[2:]) != tcpIdentity.wireDigest || tcpIdentity.tcpLength != 99 {
++		t.Fatalf("unexpected TCP DNS identity: length=%d identity=%+v", len(dnsTCP), tcpIdentity)
++	}
++}
++
++func TestOriginalDestinationPreservesCountFamilyLengthAndAddress(t *testing.T) {
++	ipv4 := make([]byte, 16)
++	binary.BigEndian.PutUint16(ipv4[2:4], 5353)
++	copy(ipv4[4:8], []byte{192, 0, 2, 9})
++	oob := controlMessage(t, unix.SOL_IP, unix.IP_RECVORIGDSTADDR, ipv4)
++	destination, count, family, length, found := originalDestination(oob, false)
++	if !found || destination.String() != "192.0.2.9:5353" || count != 1 || family != addressFamilyIPv4 || length != 16 {
++		t.Fatalf("unexpected IPv4 original destination: destination=%s count=%d family=%d length=%d found=%t", destination, count, family, length, found)
++	}
++
++	ipv6 := make([]byte, 28)
++	binary.BigEndian.PutUint16(ipv6[2:4], 8053)
++	copy(ipv6[8:24], []byte{0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7})
++	combined := append(oob, controlMessage(t, unix.SOL_IPV6, unix.IPV6_RECVORIGDSTADDR, ipv6)...)
++	destination, count, family, length, found = originalDestination(combined, false)
++	if !found || destination.String() != "192.0.2.9:5353" || count != 2 || family != addressFamilyIPv4 || length != 16 {
++		t.Fatalf("duplicate evidence was not preserved: destination=%s count=%d family=%d length=%d found=%t", destination, count, family, length, found)
++	}
++}
++
++func TestOriginalDestinationRetainsValidPrefixWhenKernelMarksControlTruncated(t *testing.T) {
++	ipv4 := make([]byte, 16)
++	binary.BigEndian.PutUint16(ipv4[2:4], 5353)
++	copy(ipv4[4:8], []byte{192, 0, 2, 19})
++	truncated := make([]byte, unix.CmsgLen(4))
++	header := (*unix.Cmsghdr)(unsafe.Pointer(&truncated[0]))
++	header.Level = unix.SOL_SOCKET
++	header.Type = unix.SCM_RIGHTS
++	header.SetLen(unix.CmsgLen(16))
++	oob := append(controlMessage(t, unix.SOL_IP, unix.IP_RECVORIGDSTADDR, ipv4), truncated...)
++	if _, _, _, _, found := originalDestination(oob, false); found {
++		t.Fatal("malformed control bytes without MSG_CTRUNC were accepted")
++	}
++	destination, count, family, length, found := originalDestination(oob, true)
++	if !found || destination.String() != "192.0.2.19:5353" || count != 1 || family != addressFamilyIPv4 || length != 16 {
++		t.Fatalf("truncated valid prefix was not preserved: destination=%s count=%d family=%d length=%d found=%t", destination, count, family, length, found)
++	}
++}
++
++func TestUDPObservationEmitsTruncationIdentityTerminalAndEOF(t *testing.T) {
++	listener, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
++	if err != nil {
++		t.Fatalf("listen UDP: %v", err)
++	}
++	defer listener.Close()
++	report := socketPair(t)
++	defer closePair(report)
++	binding := testBinding()
++	binding.requiredFlows = 1 << 1
++	attempt := &reportAttempt{binding: binding, reportFD: report[0], nextFlow: 1, sequence: 1}
++	service := &reportService{active: attempt}
++	activeService.Store(service)
++	defer activeService.Store(nil)
++
++	original := make([]byte, 16)
++	binary.BigEndian.PutUint16(original[2:4], 5353)
++	copy(original[4:8], []byte{192, 0, 2, 29})
++	ObserveTProxyUDP(
++		listener,
++		binding.nonce[:],
++		controlMessage(t, unix.SOL_IP, unix.IP_RECVORIGDSTADDR, original),
++		unix.MSG_TRUNC|unix.MSG_CTRUNC,
++		netip.MustParseAddrPort("198.51.100.7:42000"),
++	)
++
++	delivery := receiveRecord(t, report[1], udpReportBytes)
++	payloadOffset := reportHeaderBytes
++	if delivery[10] != reportKindUDP || delivery[payloadOffset] != 1 || delivery[payloadOffset+1] != 1 ||
++		delivery[payloadOffset+2] != addressFamilyIPv4 ||
++		delivery[payloadOffset+3] != udpPayloadTruncated|udpControlTruncated ||
++		binary.BigEndian.Uint16(delivery[payloadOffset+4:payloadOffset+6]) != 16 {
++		t.Fatalf("unexpected UDP report identity: %x", delivery[payloadOffset:payloadOffset+8])
++	}
++	terminal := receiveRecord(t, report[1], terminalReportBytes)
++	if terminal[10] != reportKindTerminal || terminal[reportHeaderBytes] != 1 {
++		t.Fatalf("unexpected UDP terminal: %x", terminal)
++	}
++	requireEOF(t, report[1])
++}
++
++func TestStartOwnsOneAttemptRejectsOverlapAndAcceptsRetiredSuccessor(t *testing.T) {
++	if activeService.Load() != nil {
++		t.Fatal("report service was already active")
++	}
++	control := socketPair(t)
++	flags, err := unix.FcntlInt(uintptr(control[1]), unix.F_GETFD, 0)
++	if err != nil {
++		t.Fatalf("inspect inherited control descriptor: %v", err)
++	}
++	if _, err := unix.FcntlInt(uintptr(control[1]), unix.F_SETFD, flags&^unix.FD_CLOEXEC); err != nil {
++		t.Fatalf("admit inherited control descriptor: %v", err)
++	}
++	t.Setenv(launchControlFDEnvironment, strconv.Itoa(control[1]))
++	if err := Start(); err != nil {
++		t.Fatalf("start report service: %v", err)
++	}
++	if _, exists := os.LookupEnv(launchControlFDEnvironment); exists {
++		t.Fatal("Start retained the descriptor environment")
++	}
++
++	first := socketPair(t)
++	sendHandoff(t, control[0], first[0])
++	_ = unix.Close(first[0])
++	requireEndpointRetained(t, first[1])
++
++	overlap := socketPair(t)
++	sendHandoff(t, control[0], overlap[0])
++	_ = unix.Close(overlap[0])
++	requireEOF(t, overlap[1])
++	_ = unix.Close(overlap[1])
++
++	_ = unix.Close(first[1])
++	successor := socketPair(t)
++	sendHandoff(t, control[0], successor[0])
++	_ = unix.Close(successor[0])
++	requireEndpointRetained(t, successor[1])
++
++	_ = unix.Close(control[0])
++	requireEOF(t, successor[1])
++	_ = unix.Close(successor[1])
++	activeService.Store(nil)
++}
++
++func TestTCPWrapperObservesSegmentedPayloadThenEmitsTerminalAndEOF(t *testing.T) {
++	listener, err := net.Listen("tcp4", "127.0.0.1:0")
++	if err != nil {
++		t.Fatalf("listen: %v", err)
++	}
++	defer listener.Close()
++	client, err := net.Dial("tcp4", listener.Addr().String())
++	if err != nil {
++		t.Fatalf("dial: %v", err)
++	}
++	defer client.Close()
++	server, err := listener.Accept()
++	if err != nil {
++		t.Fatalf("accept: %v", err)
++	}
++	defer server.Close()
++
++	report := socketPair(t)
++	defer closePair(report)
++	binding := testBinding()
++	binding.requiredFlows = 1 << 0
++	attempt := &reportAttempt{binding: binding, reportFD: report[0], nextFlow: 0, sequence: 1}
++	service := &reportService{active: attempt}
++	activeService.Store(service)
++	defer activeService.Store(nil)
++	wrapped := WrapTProxyTCP(listener, server)
++	if wrapped == server {
++		t.Fatal("active expected TCP flow was not wrapped")
++	}
++	if replaceable, ok := wrapped.(interface{ ReaderReplaceable() bool }); !ok || replaceable.ReaderReplaceable() {
++		t.Fatal("observer read hook may be bypassed")
++	}
++
++	nonce := binding.nonce[:]
++	go func() {
++		_, _ = client.Write(nonce[:7])
++		time.Sleep(10 * time.Millisecond)
++		_, _ = client.Write(nonce[7:])
++	}()
++	received := make([]byte, len(nonce))
++	if _, err := io.ReadFull(wrapped, received); err != nil {
++		t.Fatalf("read transparent payload: %v", err)
++	}
++	if !bytes.Equal(received, nonce) {
++		t.Fatal("TCP wrapper changed payload bytes")
++	}
++
++	delivery := receiveRecord(t, report[1], tcpReportBytes)
++	if delivery[10] != reportKindTCP || delivery[reportHeaderBytes] != 0 || binary.BigEndian.Uint64(delivery[16:24]) != 1 {
++		t.Fatalf("unexpected TCP report header: %x", delivery[:reportHeaderBytes+1])
++	}
++	terminal := receiveRecord(t, report[1], terminalReportBytes)
++	if terminal[10] != reportKindTerminal || terminal[reportHeaderBytes] != 1 || binary.BigEndian.Uint64(terminal[16:24]) != 2 {
++		t.Fatalf("unexpected terminal report: %x", terminal)
++	}
++	buffer := make([]byte, 1)
++	length, err := unix.Read(report[1], buffer)
++	if err != nil || length != 0 {
++		t.Fatalf("report producer did not close after terminal: length=%d err=%v", length, err)
++	}
++}
++
++func TestNonblockingFullQueueAccountsLossWithoutWaiting(t *testing.T) {
++	report := socketPair(t)
++	defer closePair(report)
++	if err := unix.SetsockoptInt(report[0], unix.SOL_SOCKET, unix.SO_SNDBUF, 1024); err != nil {
++		t.Fatalf("shrink send buffer: %v", err)
++	}
++	fill := make([]byte, tcpReportBytes)
++	for {
++		_, err := unix.SendmsgN(report[0], fill, nil, nil, unix.MSG_DONTWAIT|unix.MSG_NOSIGNAL)
++		if errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EWOULDBLOCK) {
++			break
++		}
++		if err != nil {
++			t.Fatalf("fill report queue: %v", err)
++		}
++	}
++	attempt := &reportAttempt{binding: testBinding(), reportFD: report[0], nextFlow: 0, sequence: 1}
++	service := &reportService{active: attempt}
++	started := time.Now()
++	service.mu.Lock()
++	service.sendLocked(attempt, fill)
++	service.mu.Unlock()
++	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
++		t.Fatalf("nonblocking report send took %s", elapsed)
++	}
++	if attempt.cumulativeLoss != 1 || service.active != attempt {
++		t.Fatalf("queue loss was not retained: loss=%d active=%p", attempt.cumulativeLoss, service.active)
++	}
++}
++
++func canonicalHandoffFrame(pid uint32, startTicks uint64) []byte {
++	frame := make([]byte, handoffBytes)
++	copy(frame[0:8], handoffMagic[:])
++	binary.BigEndian.PutUint16(frame[8:10], handoffSchema)
++	frame[10] = handoffAttemptKind
++	binary.BigEndian.PutUint16(frame[12:14], handoffBytes)
++	binary.BigEndian.PutUint16(frame[14:16], handoffBytes)
++	binary.BigEndian.PutUint16(frame[16:18], requestSchema)
++	binary.BigEndian.PutUint16(frame[18:20], reportSchema)
++	frame[20] = ipv4FamilyFlag | ipv6FamilyFlag
++	frame[21] = dualStackFlowMask
++	frame[22] = tproxyBackend
++	binary.BigEndian.PutUint32(frame[24:28], 9)
++	binary.BigEndian.PutUint32(frame[28:32], pid)
++	binary.BigEndian.PutUint64(frame[32:40], startTicks)
++	binary.BigEndian.PutUint64(frame[40:48], 11)
++	copy(frame[48:80], bytes.Repeat([]byte{0x11}, 32))
++	copy(frame[80:112], bytes.Repeat([]byte{0x22}, 32))
++	copy(frame[112:144], bytes.Repeat([]byte{0x33}, 32))
++	return frame
++}
++
++func testBinding() handoff {
++	frame := canonicalHandoffFrame(uint32(os.Getpid()), 73)
++	parsed, err := parseHandoff(frame, uint32(os.Getpid()), 73)
++	if err != nil {
++		panic(err)
++	}
++	return parsed
++}
++
++func socketPair(t *testing.T) [2]int {
++	t.Helper()
++	pair, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_SEQPACKET|unix.SOCK_CLOEXEC, 0)
++	if err != nil {
++		t.Fatalf("create seqpacket pair: %v", err)
++	}
++	return pair
++}
++
++func closePair(pair [2]int) {
++	_ = unix.Close(pair[0])
++	_ = unix.Close(pair[1])
++}
++
++func sendHandoff(t *testing.T, controlFD int, reportFD int) {
++	t.Helper()
++	service := activeService.Load()
++	if service == nil {
++		t.Fatal("report service is not active")
++	}
++	frame := canonicalHandoffFrame(service.ownPID, service.ownStartTicks)
++	if _, err := unix.SendmsgN(controlFD, frame, unix.UnixRights(reportFD), nil, 0); err != nil {
++		t.Fatalf("send service handoff: %v", err)
++	}
++}
++
++func requireEndpointRetained(t *testing.T, fd int) {
++	t.Helper()
++	poll := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN | unix.POLLHUP | unix.POLLERR}}
++	ready, err := unix.Poll(poll, 100)
++	if err != nil || ready != 0 {
++		t.Fatalf("report endpoint was not retained: ready=%d events=%#x err=%v", ready, poll[0].Revents, err)
++	}
++}
++
++func requireEOF(t *testing.T, fd int) {
++	t.Helper()
++	poll := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN | unix.POLLHUP | unix.POLLERR}}
++	ready, err := unix.Poll(poll, 1000)
++	if err != nil || ready != 1 {
++		t.Fatalf("report EOF was not observable: ready=%d events=%#x err=%v", ready, poll[0].Revents, err)
++	}
++	buffer := make([]byte, 1)
++	length, err := unix.Read(fd, buffer)
++	if err != nil || length != 0 {
++		t.Fatalf("report endpoint did not reach EOF: length=%d err=%v", length, err)
++	}
++}
++
++func controlMessage(t *testing.T, level int32, kind int32, payload []byte) []byte {
++	t.Helper()
++	message := make([]byte, unix.CmsgSpace(len(payload)))
++	header := (*unix.Cmsghdr)(unsafe.Pointer(&message[0]))
++	header.Level = level
++	header.Type = kind
++	header.SetLen(unix.CmsgLen(len(payload)))
++	copy(message[unix.CmsgLen(0):], payload)
++	return message
++}
++
++func receiveRecord(t *testing.T, fd int, expected int) []byte {
++	t.Helper()
++	buffer := make([]byte, expected+1)
++	length, err := unix.Read(fd, buffer)
++	if err != nil {
++		t.Fatalf("receive report record: %v", err)
++	}
++	if length != expected {
++		t.Fatalf("report length=%d, want %d", length, expected)
++	}
++	return buffer[:length]
++}
+diff --git a/internal/fluxreport/report_stub.go b/internal/fluxreport/report_stub.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..328319360a7daab8c6218f1b8ac2dcf04c91aa65
+--- /dev/null
++++ b/internal/fluxreport/report_stub.go
+@@ -0,0 +1,19 @@
++//go:build !with_flux_report || (!linux && !android)
++
++package fluxreport
++
++import (
++	"net"
++	"net/netip"
++)
++
++func Start() error {
++	return nil
++}
++
++func WrapTProxyTCP(_ net.Listener, connection net.Conn) net.Conn {
++	return connection
++}
++
++func ObserveTProxyUDP(_ *net.UDPConn, _ []byte, _ []byte, _ int, _ netip.AddrPort) {
++}
+diff --git a/internal/fluxreport/service_linux.go b/internal/fluxreport/service_linux.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..c913ac2c7c4d1f188edd8deb6aa713c16c1e7c9a
+--- /dev/null
++++ b/internal/fluxreport/service_linux.go
+@@ -0,0 +1,434 @@
++//go:build with_flux_report && (linux || android)
++
++package fluxreport
++
++import (
++	"errors"
++	"fmt"
++	"net"
++	"net/netip"
++	"os"
++	"strconv"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"syscall"
++
++	"golang.org/x/sys/unix"
++)
++
++const launchControlFDEnvironment = "FLUX_SING_BOX_LAUNCH_CONTROL_FD"
++
++var activeService atomic.Pointer[reportService]
++
++type reportService struct {
++	controlFD     int
++	ownPID        uint32
++	ownStartTicks uint64
++	mu            sync.Mutex
++	active        *reportAttempt
++}
++
++type reportAttempt struct {
++	binding        handoff
++	reportFD       int
++	nextFlow       uint8
++	sequence       uint64
++	cumulativeLoss uint64
++	eventCount     uint8
++}
++
++func Start() error {
++	encoded, exists := os.LookupEnv(launchControlFDEnvironment)
++	if !exists {
++		return nil
++	}
++	if err := os.Unsetenv(launchControlFDEnvironment); err != nil {
++		return fmt.Errorf("remove launch-control descriptor environment: %w", err)
++	}
++	fd, err := parseDescriptor(encoded)
++	if err != nil {
++		return err
++	}
++	service, err := claimControl(fd)
++	if err != nil {
++		_ = unix.Close(fd)
++		return err
++	}
++	if !activeService.CompareAndSwap(nil, service) {
++		_ = unix.Close(fd)
++		return errors.New("Flux launch control was already claimed")
++	}
++	go service.run()
++	return nil
++}
++
++func parseDescriptor(encoded string) (int, error) {
++	if encoded == "" || encoded[0] == '+' || (len(encoded) > 1 && encoded[0] == '0') {
++		return -1, errors.New("launch-control descriptor is not canonical")
++	}
++	for _, character := range encoded {
++		if character < '0' || character > '9' {
++			return -1, errors.New("launch-control descriptor is not canonical")
++		}
++	}
++	value, err := strconv.ParseUint(encoded, 10, 31)
++	if err != nil || value <= 2 {
++		return -1, errors.New("launch-control descriptor is invalid")
++	}
++	return int(value), nil
++}
++
++func claimControl(fd int) (*reportService, error) {
++	flags, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0)
++	if err != nil {
++		return nil, fmt.Errorf("inspect launch-control descriptor: %w", err)
++	}
++	if flags&unix.FD_CLOEXEC != 0 {
++		return nil, errors.New("launch-control descriptor was not admitted across exec")
++	}
++	if err := validateConnectedSeqpacket(fd); err != nil {
++		return nil, fmt.Errorf("validate launch-control descriptor: %w", err)
++	}
++	unix.CloseOnExec(fd)
++	if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_PASSCRED, 1); err != nil {
++		return nil, fmt.Errorf("enable launch-control credentials: %w", err)
++	}
++	startTicks, err := processStartTicks()
++	if err != nil {
++		return nil, err
++	}
++	return &reportService{
++		controlFD:     fd,
++		ownPID:        uint32(os.Getpid()),
++		ownStartTicks: startTicks,
++	}, nil
++}
++
++func validateConnectedSeqpacket(fd int) error {
++	socketType, err := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_TYPE)
++	if err != nil {
++		return err
++	}
++	if socketType != unix.SOCK_SEQPACKET {
++		return errors.New("descriptor is not SOCK_SEQPACKET")
++	}
++	accepting, err := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_ACCEPTCONN)
++	if err != nil {
++		return err
++	}
++	if accepting != 0 {
++		return errors.New("descriptor is a listener")
++	}
++	local, err := unix.Getsockname(fd)
++	if err != nil {
++		return err
++	}
++	peer, err := unix.Getpeername(fd)
++	if err != nil {
++		return err
++	}
++	if _, ok := local.(*unix.SockaddrUnix); !ok {
++		return errors.New("descriptor is not AF_UNIX")
++	}
++	if _, ok := peer.(*unix.SockaddrUnix); !ok {
++		return errors.New("descriptor has no Unix peer")
++	}
++	return nil
++}
++
++func processStartTicks() (uint64, error) {
++	contents, err := os.ReadFile("/proc/self/stat")
++	if err != nil {
++		return 0, fmt.Errorf("read engine process identity: %w", err)
++	}
++	closing := strings.LastIndexByte(string(contents), ')')
++	if closing < 0 || closing+2 >= len(contents) {
++		return 0, errors.New("engine process stat is malformed")
++	}
++	fields := strings.Fields(string(contents[closing+2:]))
++	if len(fields) <= 19 {
++		return 0, errors.New("engine process stat omits start ticks")
++	}
++	startTicks, err := strconv.ParseUint(fields[19], 10, 64)
++	if err != nil || startTicks == 0 {
++		return 0, errors.New("engine process start ticks are invalid")
++	}
++	return startTicks, nil
++}
++
++func (service *reportService) run() {
++	defer unix.Close(service.controlFD)
++	for {
++		frame, reportFD, err := receiveHandoff(service.controlFD)
++		if err != nil {
++			service.closeActive()
++			return
++		}
++		binding, err := parseHandoff(frame, service.ownPID, service.ownStartTicks)
++		if err != nil {
++			_ = unix.Close(reportFD)
++			continue
++		}
++		service.install(binding, reportFD)
++	}
++}
++
++func receiveHandoff(controlFD int) ([]byte, int, error) {
++	payload := make([]byte, handoffBytes+1)
++	oob := make([]byte, unix.CmsgSpace(4)+unix.CmsgSpace(unix.SizeofUcred))
++	n, oobN, flags, _, err := unix.Recvmsg(controlFD, payload, oob, unix.MSG_CMSG_CLOEXEC)
++	if err != nil {
++		return nil, -1, err
++	}
++	if n == 0 {
++		return nil, -1, errors.New("launch control reached EOF")
++	}
++	messages, parseErr := unix.ParseSocketControlMessage(oob[:oobN])
++	var (
++		receivedFD  = -1
++		rightsCount int
++		credCount   int
++		unexpected  bool
++	)
++	for _, message := range messages {
++		switch {
++		case message.Header.Level == unix.SOL_SOCKET && message.Header.Type == unix.SCM_RIGHTS:
++			rights, rightsErr := unix.ParseUnixRights(&message)
++			if rightsErr != nil {
++				parseErr = rightsErr
++				continue
++			}
++			rightsCount++
++			for _, descriptor := range rights {
++				if receivedFD == -1 {
++					receivedFD = descriptor
++				} else {
++					_ = unix.Close(descriptor)
++					unexpected = true
++				}
++			}
++		case message.Header.Level == unix.SOL_SOCKET && message.Header.Type == unix.SCM_CREDENTIALS:
++			credentials, credentialsErr := unix.ParseUnixCredentials(&message)
++			if credentialsErr != nil || credentials.Pid <= 0 {
++				parseErr = errors.New("launch-control credentials are malformed")
++				continue
++			}
++			credCount++
++		default:
++			unexpected = true
++		}
++	}
++	invalid := parseErr != nil || flags&(unix.MSG_TRUNC|unix.MSG_CTRUNC) != 0 || n != handoffBytes || rightsCount != 1 || credCount != 1 || receivedFD < 0 || unexpected
++	if !invalid {
++		fdFlags, flagErr := unix.FcntlInt(uintptr(receivedFD), unix.F_GETFD, 0)
++		invalid = flagErr != nil || fdFlags&unix.FD_CLOEXEC == 0 || validateConnectedSeqpacket(receivedFD) != nil
++	}
++	if invalid {
++		if receivedFD >= 0 {
++			_ = unix.Close(receivedFD)
++		}
++		return nil, -1, errors.New("launch-control record is not canonical")
++	}
++	return payload[:n], receivedFD, nil
++}
++
++func (service *reportService) install(binding handoff, reportFD int) {
++	service.mu.Lock()
++	defer service.mu.Unlock()
++	if service.active != nil {
++		if !endpointRetired(service.active.reportFD) {
++			_ = unix.Close(reportFD)
++			return
++		}
++		_ = unix.Close(service.active.reportFD)
++		service.active = nil
++	}
++	firstFlow, exists := nextRequiredFlow(binding.requiredFlows, -1)
++	if !exists {
++		_ = unix.Close(reportFD)
++		return
++	}
++	service.active = &reportAttempt{
++		binding:  binding,
++		reportFD: reportFD,
++		nextFlow: firstFlow,
++		sequence: 1,
++	}
++}
++
++func endpointRetired(fd int) bool {
++	descriptors := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLERR | unix.POLLHUP}}
++	_, err := unix.Poll(descriptors, 0)
++	return err != nil || descriptors[0].Revents&(unix.POLLERR|unix.POLLHUP|unix.POLLNVAL) != 0
++}
++
++func (service *reportService) closeActive() {
++	service.mu.Lock()
++	defer service.mu.Unlock()
++	service.closeActiveLocked()
++}
++
++func (service *reportService) closeActiveLocked() {
++	if service.active != nil {
++		_ = unix.Close(service.active.reportFD)
++		service.active = nil
++	}
++}
++
++func (service *reportService) expectedTCP(familyIPv4 bool) (*reportAttempt, uint8, []byte, payloadIdentity, bool) {
++	service.mu.Lock()
++	defer service.mu.Unlock()
++	attempt := service.active
++	if attempt == nil || !flowIsTCP(attempt.nextFlow) || flowIsIPv4(attempt.nextFlow) != familyIPv4 {
++		return nil, 0, nil, payloadIdentity{}, false
++	}
++	expected, identity := expectedPayload(attempt.nextFlow, attempt.binding.nonce)
++	return attempt, attempt.nextFlow, expected, identity, true
++}
++
++func (service *reportService) emitTCP(attempt *reportAttempt, flow uint8, listenerCookie [2]uint32, socket socketIdentity, payload payloadIdentity) {
++	service.mu.Lock()
++	defer service.mu.Unlock()
++	if service.active != attempt || attempt.nextFlow != flow {
++		return
++	}
++	frame := encodeTCPReport(attempt.binding, attempt.sequence, attempt.cumulativeLoss, flow, listenerCookie, socket, payload)
++	service.emitDeliveryLocked(attempt, frame)
++}
++
++func (service *reportService) emitUDP(attempt *reportAttempt, flow uint8, datagram udpIdentity, payload payloadIdentity) {
++	service.mu.Lock()
++	defer service.mu.Unlock()
++	if service.active != attempt || attempt.nextFlow != flow {
++		return
++	}
++	frame := encodeUDPReport(attempt.binding, attempt.sequence, attempt.cumulativeLoss, flow, datagram, payload)
++	service.emitDeliveryLocked(attempt, frame)
++}
++
++func (service *reportService) emitDeliveryLocked(attempt *reportAttempt, frame []byte) {
++	service.sendLocked(attempt, frame)
++	if service.active != attempt {
++		return
++	}
++	attempt.sequence++
++	attempt.eventCount++
++	next, exists := nextRequiredFlow(attempt.binding.requiredFlows, int(attempt.nextFlow))
++	if exists {
++		attempt.nextFlow = next
++		return
++	}
++	terminal := encodeTerminalReport(attempt.binding, attempt.sequence, attempt.cumulativeLoss, attempt.eventCount)
++	service.sendLocked(attempt, terminal)
++	if service.active == attempt {
++		service.closeActiveLocked()
++	}
++}
++
++func (service *reportService) sendLocked(attempt *reportAttempt, frame []byte) {
++	written, err := unix.SendmsgN(attempt.reportFD, frame, nil, nil, unix.MSG_DONTWAIT|unix.MSG_NOSIGNAL)
++	if err == nil && written == len(frame) {
++		return
++	}
++	if errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EWOULDBLOCK) {
++		attempt.cumulativeLoss++
++		return
++	}
++	service.closeActiveLocked()
++}
++
++type syscallConnection interface {
++	SyscallConn() (syscall.RawConn, error)
++}
++
++func withSocketFD(value any, operation func(int) error) error {
++	connection, ok := value.(syscallConnection)
++	if !ok {
++		return errors.New("socket does not expose SyscallConn")
++	}
++	raw, err := connection.SyscallConn()
++	if err != nil {
++		return err
++	}
++	var operationErr error
++	if err := raw.Control(func(rawFD uintptr) {
++		if rawFD > uintptr(^uint32(0)>>1) {
++			operationErr = errors.New("socket descriptor is out of range")
++			return
++		}
++		operationErr = operation(int(rawFD))
++	}); err != nil {
++		return err
++	}
++	return operationErr
++}
++
++func socketCookie(value any) ([2]uint32, error) {
++	var words [2]uint32
++	err := withSocketFD(value, func(fd int) error {
++		cookie, err := unix.GetsockoptUint64(fd, unix.SOL_SOCKET, unix.SO_COOKIE)
++		if err != nil {
++			return err
++		}
++		words[0] = uint32(cookie)
++		words[1] = uint32(cookie >> 32)
++		return nil
++	})
++	if err != nil {
++		return words, err
++	}
++	if words == [2]uint32{^uint32(0), ^uint32(0)} {
++		return [2]uint32{}, errors.New("kernel returned the invalid inet_diag cookie")
++	}
++	return words, nil
++}
++
++func socketIdentityFor(connection net.Conn) (socketIdentity, error) {
++	var identity socketIdentity
++	err := withSocketFD(connection, func(fd int) error {
++		var stat unix.Stat_t
++		if err := unix.Fstat(fd, &stat); err != nil {
++			return err
++		}
++		if stat.Ino == 0 {
++			return errors.New("accepted socket inode is zero")
++		}
++		cookie, err := unix.GetsockoptUint64(fd, unix.SOL_SOCKET, unix.SO_COOKIE)
++		if err != nil {
++			return err
++		}
++		identity.fd = uint32(fd)
++		identity.inode = stat.Ino
++		identity.cookie = [2]uint32{uint32(cookie), uint32(cookie >> 32)}
++		if identity.cookie == [2]uint32{^uint32(0), ^uint32(0)} {
++			return errors.New("kernel returned the invalid inet_diag cookie")
++		}
++		return nil
++	})
++	if err != nil {
++		return socketIdentity{}, err
++	}
++	local, err := addressPort(connection.LocalAddr())
++	if err != nil {
++		return socketIdentity{}, err
++	}
++	peer, err := addressPort(connection.RemoteAddr())
++	if err != nil {
++		return socketIdentity{}, err
++	}
++	identity.local = local
++	identity.peer = peer
++	return identity, nil
++}
++
++func addressPort(address net.Addr) (netip.AddrPort, error) {
++	switch typed := address.(type) {
++	case *net.TCPAddr:
++		return typed.AddrPort(), nil
++	case *net.UDPAddr:
++		return typed.AddrPort(), nil
++	default:
++		return netip.AddrPort{}, errors.New("socket address is not IP")
++	}
++}
+diff --git a/internal/fluxreport/tcp_linux.go b/internal/fluxreport/tcp_linux.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..7328f6bf172141d071aa92073879764a6d15d090
+--- /dev/null
++++ b/internal/fluxreport/tcp_linux.go
+@@ -0,0 +1,128 @@
++//go:build with_flux_report && (linux || android)
++
++package fluxreport
++
++import (
++	"bytes"
++	"net"
++	"sync"
++
++	"github.com/sagernet/sing/common/buf"
++	"github.com/sagernet/sing/common/bufio"
++	N "github.com/sagernet/sing/common/network"
++)
++
++type observedTCPConn struct {
++	N.ExtendedConn
++	observer *tcpPayloadObserver
++}
++
++type tcpPayloadObserver struct {
++	mu             sync.Mutex
++	service        *reportService
++	attempt        *reportAttempt
++	flow           uint8
++	expected       []byte
++	payload        payloadIdentity
++	listenerCookie [2]uint32
++	socket         socketIdentity
++	buffer         []byte
++	done           bool
++}
++
++func WrapTProxyTCP(listener net.Listener, connection net.Conn) net.Conn {
++	service := activeService.Load()
++	if service == nil {
++		return connection
++	}
++	local, err := addressPort(connection.LocalAddr())
++	if err != nil || !local.IsValid() {
++		return connection
++	}
++	attempt, flow, expected, payload, ready := service.expectedTCP(local.Addr().Unmap().Is4())
++	if !ready {
++		return connection
++	}
++	listenerCookie, err := socketCookie(listener)
++	if err != nil {
++		return connection
++	}
++	socket, err := socketIdentityFor(connection)
++	if err != nil {
++		return connection
++	}
++	return &observedTCPConn{
++		ExtendedConn: bufio.NewExtendedConn(connection),
++		observer: &tcpPayloadObserver{
++			service:        service,
++			attempt:        attempt,
++			flow:           flow,
++			expected:       append([]byte(nil), expected...),
++			payload:        payload,
++			listenerCookie: listenerCookie,
++			socket:         socket,
++			buffer:         make([]byte, 0, len(expected)),
++		},
++	}
++}
++
++func (connection *observedTCPConn) Read(output []byte) (int, error) {
++	length, err := connection.ExtendedConn.Read(output)
++	if length > 0 {
++		connection.observer.observe(output[:length])
++	}
++	return length, err
++}
++
++func (connection *observedTCPConn) ReadBuffer(buffer *buf.Buffer) error {
++	before := buffer.Len()
++	err := connection.ExtendedConn.ReadBuffer(buffer)
++	if buffer.Len() > before {
++		connection.observer.observe(buffer.Bytes()[before:])
++	}
++	return err
++}
++
++func (connection *observedTCPConn) ReaderReplaceable() bool {
++	return false
++}
++
++func (connection *observedTCPConn) WriterReplaceable() bool {
++	return true
++}
++
++func (connection *observedTCPConn) Upstream() any {
++	return connection.ExtendedConn
++}
++
++func (observer *tcpPayloadObserver) observe(input []byte) {
++	observer.mu.Lock()
++	defer observer.mu.Unlock()
++	if observer.done {
++		return
++	}
++	remaining := len(observer.expected) - len(observer.buffer)
++	if remaining <= 0 {
++		observer.done = true
++		return
++	}
++	if len(input) > remaining {
++		input = input[:remaining]
++	}
++	observer.buffer = append(observer.buffer, input...)
++	if !bytes.Equal(observer.buffer, observer.expected[:len(observer.buffer)]) {
++		observer.done = true
++		return
++	}
++	if len(observer.buffer) != len(observer.expected) {
++		return
++	}
++	observer.done = true
++	observer.service.emitTCP(
++		observer.attempt,
++		observer.flow,
++		observer.listenerCookie,
++		observer.socket,
++		observer.payload,
++	)
++}
+diff --git a/internal/fluxreport/udp_linux.go b/internal/fluxreport/udp_linux.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..c96b2cc09ba6c8228cb2a94e4742947943c57b80
+--- /dev/null
++++ b/internal/fluxreport/udp_linux.go
+@@ -0,0 +1,119 @@
++//go:build with_flux_report && (linux || android)
++
++package fluxreport
++
++import (
++	"bytes"
++	"encoding/binary"
++	"net"
++	"net/netip"
++
++	"golang.org/x/sys/unix"
++)
++
++func ObserveTProxyUDP(listener *net.UDPConn, payload []byte, oob []byte, messageFlags int, client netip.AddrPort) {
++	service := activeService.Load()
++	if service == nil {
++		return
++	}
++	client = netip.AddrPortFrom(client.Addr().Unmap(), client.Port())
++	service.mu.Lock()
++	attempt := service.active
++	if attempt == nil || flowIsTCP(attempt.nextFlow) || flowIsIPv4(attempt.nextFlow) != client.Addr().Is4() {
++		service.mu.Unlock()
++		return
++	}
++	flow := attempt.nextFlow
++	expected, payloadIdentity := expectedPayload(flow, attempt.binding.nonce)
++	service.mu.Unlock()
++	if !bytes.Equal(payload, expected) {
++		return
++	}
++
++	controlTruncated := messageFlags&unix.MSG_CTRUNC != 0
++	destination, cmsgCount, cmsgFamily, cmsgLength, found := originalDestination(oob, controlTruncated)
++	if !found {
++		return
++	}
++	listenerCookie, err := socketCookie(listener)
++	if err != nil {
++		return
++	}
++	var truncationFlags uint8
++	if messageFlags&unix.MSG_TRUNC != 0 {
++		truncationFlags |= udpPayloadTruncated
++	}
++	if messageFlags&unix.MSG_CTRUNC != 0 {
++		truncationFlags |= udpControlTruncated
++	}
++	service.emitUDP(attempt, flow, udpIdentity{
++		cmsgCount:           cmsgCount,
++		cmsgFamily:          cmsgFamily,
++		truncationFlags:     truncationFlags,
++		cmsgPayloadLength:   cmsgLength,
++		listenerCookie:      listenerCookie,
++		client:              client,
++		originalDestination: destination,
++	}, payloadIdentity)
++}
++
++func originalDestination(oob []byte, controlTruncated bool) (netip.AddrPort, uint8, uint8, uint16, bool) {
++	messages, foundPrefix := parseControlMessages(oob, controlTruncated)
++	if !foundPrefix {
++		return netip.AddrPort{}, 0, 0, 0, false
++	}
++	var (
++		destination netip.AddrPort
++		family      uint8
++		length      uint16
++		count       uint16
++	)
++	for _, message := range messages {
++		var candidate netip.AddrPort
++		var candidateFamily uint8
++		switch {
++		case message.Header.Level == unix.SOL_IP && message.Header.Type == unix.IP_RECVORIGDSTADDR && len(message.Data) >= 16:
++			var address [4]byte
++			copy(address[:], message.Data[4:8])
++			candidate = netip.AddrPortFrom(netip.AddrFrom4(address), binary.BigEndian.Uint16(message.Data[2:4]))
++			candidateFamily = addressFamilyIPv4
++		case message.Header.Level == unix.SOL_IPV6 && message.Header.Type == unix.IPV6_RECVORIGDSTADDR && len(message.Data) >= 28:
++			var address [16]byte
++			copy(address[:], message.Data[8:24])
++			candidate = netip.AddrPortFrom(netip.AddrFrom16(address), binary.BigEndian.Uint16(message.Data[2:4]))
++			candidateFamily = addressFamilyIPv6
++		default:
++			continue
++		}
++		count++
++		if count == 1 {
++			destination = candidate
++			family = candidateFamily
++			length = uint16(len(message.Data))
++		}
++	}
++	if count == 0 || !destination.IsValid() || destination.Port() == 0 {
++		return netip.AddrPort{}, 0, 0, 0, false
++	}
++	if count > 255 {
++		count = 255
++	}
++	return destination, uint8(count), family, length, true
++}
++
++func parseControlMessages(oob []byte, allowTruncatedPrefix bool) ([]unix.SocketControlMessage, bool) {
++	messages, err := unix.ParseSocketControlMessage(oob)
++	if err == nil {
++		return messages, true
++	}
++	if !allowTruncatedPrefix {
++		return nil, false
++	}
++	for length := len(oob) - 1; length >= unix.CmsgLen(0); length-- {
++		messages, err = unix.ParseSocketControlMessage(oob[:length])
++		if err == nil && len(messages) > 0 {
++			return messages, true
++		}
++	}
++	return nil, false
++}
+diff --git a/internal/fluxreport/wire.go b/internal/fluxreport/wire.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..5610f3fbbd394e3810ac527acd1531f45e4e4498
+--- /dev/null
++++ b/internal/fluxreport/wire.go
+@@ -0,0 +1,313 @@
++//go:build with_flux_report && (linux || android)
++
++package fluxreport
++
++import (
++	"bytes"
++	"crypto/sha256"
++	"encoding/binary"
++	"errors"
++	"net/netip"
++)
++
++const (
++	handoffBytes        = 160
++	reportHeaderBytes   = 152
++	tcpReportBytes      = 300
++	udpReportBytes      = 280
++	terminalReportBytes = 160
++	requestSchema       = 2
++	reportSchema        = 1
++	handoffSchema       = 1
++	handoffAttemptKind  = 1
++	tproxyBackend       = 1
++	ipv4FamilyFlag      = 1 << 0
++	ipv6FamilyFlag      = 1 << 1
++	ipv4FlowMask        = 0x0f
++	dualStackFlowMask   = 0xff
++	udpPayloadTruncated = 1 << 0
++	udpControlTruncated = 1 << 1
++	payloadKindEcho     = 1
++	payloadKindDNS      = 2
++	reportKindTCP       = 1
++	reportKindUDP       = 2
++	reportKindTerminal  = 3
++	addressFamilyIPv4   = 4
++	addressFamilyIPv6   = 6
++	functionalFlowCount = 8
++)
++
++var (
++	handoffMagic = [8]byte{'F', 'L', 'X', 'H', 'N', 'D', '1', 0}
++	reportMagic  = [8]byte{'F', 'L', 'X', 'D', 'L', 'V', '1', 0}
++)
++
++type handoff struct {
++	families               uint8
++	requiredFlows          uint8
++	generation             uint32
++	enginePID              uint32
++	engineStartTicks       uint64
++	engineSnapshotRevision uint64
++	reportObject           [32]byte
++	profileRevision        [32]byte
++	nonce                  [32]byte
++}
++
++func parseHandoff(frame []byte, ownPID uint32, ownStartTicks uint64) (handoff, error) {
++	var parsed handoff
++	if len(frame) != handoffBytes {
++		return parsed, errors.New("handoff frame length is not canonical")
++	}
++	if !bytes.Equal(frame[0:8], handoffMagic[:]) || binary.BigEndian.Uint16(frame[8:10]) != handoffSchema {
++		return parsed, errors.New("handoff magic or schema is invalid")
++	}
++	if frame[10] != handoffAttemptKind || frame[11] != 0 {
++		return parsed, errors.New("handoff kind or flags are invalid")
++	}
++	if binary.BigEndian.Uint16(frame[12:14]) != handoffBytes || binary.BigEndian.Uint16(frame[14:16]) != handoffBytes {
++		return parsed, errors.New("handoff declared lengths are invalid")
++	}
++	if binary.BigEndian.Uint16(frame[16:18]) != requestSchema || binary.BigEndian.Uint16(frame[18:20]) != reportSchema {
++		return parsed, errors.New("handoff request or report schema is unsupported")
++	}
++	parsed.families = frame[20]
++	parsed.requiredFlows = frame[21]
++	if !((parsed.families == ipv4FamilyFlag && parsed.requiredFlows == ipv4FlowMask) ||
++		(parsed.families == ipv4FamilyFlag|ipv6FamilyFlag && parsed.requiredFlows == dualStackFlowMask)) {
++		return handoff{}, errors.New("handoff family and required-flow set is not canonical")
++	}
++	if frame[22] != tproxyBackend || frame[23] != 0 || !allZero(frame[144:160]) {
++		return handoff{}, errors.New("handoff backend or reserved bytes are invalid")
++	}
++	parsed.generation = binary.BigEndian.Uint32(frame[24:28])
++	parsed.enginePID = binary.BigEndian.Uint32(frame[28:32])
++	parsed.engineStartTicks = binary.BigEndian.Uint64(frame[32:40])
++	parsed.engineSnapshotRevision = binary.BigEndian.Uint64(frame[40:48])
++	if parsed.generation == 0 || parsed.enginePID != ownPID || parsed.engineStartTicks != ownStartTicks || parsed.engineSnapshotRevision == 0 {
++		return handoff{}, errors.New("handoff engine identity is invalid")
++	}
++	copy(parsed.reportObject[:], frame[48:80])
++	copy(parsed.profileRevision[:], frame[80:112])
++	copy(parsed.nonce[:], frame[112:144])
++	return parsed, nil
++}
++
++func allZero(value []byte) bool {
++	for _, octet := range value {
++		if octet != 0 {
++			return false
++		}
++	}
++	return true
++}
++
++func nextRequiredFlow(mask uint8, after int) (uint8, bool) {
++	for flow := after + 1; flow < functionalFlowCount; flow++ {
++		if mask&(1<<flow) != 0 {
++			return uint8(flow), true
++		}
++	}
++	return 0, false
++}
++
++func flowIsIPv4(flow uint8) bool {
++	return flow < 4
++}
++
++func flowIsTCP(flow uint8) bool {
++	return flow == 0 || flow == 3 || flow == 4 || flow == 7
++}
++
++func flowIsDNS(flow uint8) bool {
++	return flow == 2 || flow == 3 || flow == 6 || flow == 7
++}
++
++type payloadIdentity struct {
++	kind           uint8
++	wireLength     uint16
++	wireDigest     [32]byte
++	transactionID  uint16
++	tcpLength      uint16
++	questionDigest [32]byte
++}
++
++func expectedPayload(flow uint8, nonce [32]byte) ([]byte, payloadIdentity) {
++	if !flowIsDNS(flow) {
++		return nonce[:], payloadIdentity{
++			kind:       payloadKindEcho,
++			wireLength: uint16(len(nonce)),
++			wireDigest: sha256.Sum256(nonce[:]),
++		}
++	}
++
++	questionName := make([]byte, 83)
++	questionName[0] = 2
++	questionName[1] = 'f'
++	questionName[2] = hexNibble(flow)
++	questionName[3] = 32
++	encodeHex(nonce[:16], questionName[4:36])
++	questionName[36] = 32
++	encodeHex(nonce[16:], questionName[37:69])
++	copy(questionName[69:74], []byte{4, 'f', 'l', 'u', 'x'})
++	copy(questionName[74:82], []byte{7, 'i', 'n', 'v', 'a', 'l', 'i', 'd'})
++	recordType := uint16(1)
++	if !flowIsIPv4(flow) {
++		recordType = 28
++	}
++	questionHasher := sha256.New()
++	questionHasher.Write([]byte("flux-functional-canary-dns-question-v1"))
++	questionHasher.Write(questionName)
++	writeHashUint16(questionHasher, recordType)
++	writeHashUint16(questionHasher, 1)
++	var questionDigest [32]byte
++	copy(questionDigest[:], questionHasher.Sum(nil))
++	transactionID := binary.BigEndian.Uint16(questionDigest[:2])
++
++	query := make([]byte, 12+len(questionName)+4)
++	binary.BigEndian.PutUint16(query[0:2], transactionID)
++	binary.BigEndian.PutUint16(query[2:4], 0x0100)
++	binary.BigEndian.PutUint16(query[4:6], 1)
++	copy(query[12:], questionName)
++	binary.BigEndian.PutUint16(query[12+len(questionName):], recordType)
++	binary.BigEndian.PutUint16(query[14+len(questionName):], 1)
++	identity := payloadIdentity{
++		kind:           payloadKindDNS,
++		wireLength:     uint16(len(query)),
++		wireDigest:     sha256.Sum256(query),
++		transactionID:  transactionID,
++		questionDigest: questionDigest,
++	}
++	if flowIsTCP(flow) {
++		identity.tcpLength = uint16(len(query))
++		framed := make([]byte, 2+len(query))
++		binary.BigEndian.PutUint16(framed[:2], uint16(len(query)))
++		copy(framed[2:], query)
++		return framed, identity
++	}
++	return query, identity
++}
++
++type hashWriter interface {
++	Write([]byte) (int, error)
++}
++
++func writeHashUint16(writer hashWriter, value uint16) {
++	var encoded [2]byte
++	binary.BigEndian.PutUint16(encoded[:], value)
++	_, _ = writer.Write(encoded[:])
++}
++
++func encodeHex(input []byte, output []byte) {
++	for index, octet := range input {
++		output[index*2] = hexNibble(octet >> 4)
++		output[index*2+1] = hexNibble(octet)
++	}
++}
++
++func hexNibble(value uint8) byte {
++	value &= 0x0f
++	if value < 10 {
++		return '0' + value
++	}
++	return 'a' + value - 10
++}
++
++func commonReportFrame(binding handoff, kind uint8, length int, sequence uint64, cumulativeLoss uint64) []byte {
++	frame := make([]byte, length)
++	copy(frame[0:8], reportMagic[:])
++	binary.BigEndian.PutUint16(frame[8:10], reportSchema)
++	frame[10] = kind
++	binary.BigEndian.PutUint16(frame[12:14], uint16(length))
++	binary.BigEndian.PutUint16(frame[14:16], reportHeaderBytes)
++	binary.BigEndian.PutUint64(frame[16:24], sequence)
++	binary.BigEndian.PutUint64(frame[24:32], cumulativeLoss)
++	binary.BigEndian.PutUint32(frame[32:36], binding.generation)
++	binary.BigEndian.PutUint32(frame[36:40], binding.enginePID)
++	binary.BigEndian.PutUint64(frame[40:48], binding.engineStartTicks)
++	copy(frame[48:80], binding.reportObject[:])
++	copy(frame[80:112], binding.profileRevision[:])
++	copy(frame[112:144], binding.nonce[:])
++	return frame
++}
++
++type socketIdentity struct {
++	fd     uint32
++	inode  uint64
++	cookie [2]uint32
++	local  netip.AddrPort
++	peer   netip.AddrPort
++}
++
++func encodeTCPReport(binding handoff, sequence uint64, cumulativeLoss uint64, flow uint8, listenerCookie [2]uint32, socket socketIdentity, payload payloadIdentity) []byte {
++	frame := commonReportFrame(binding, reportKindTCP, tcpReportBytes, sequence, cumulativeLoss)
++	payloadOffset := reportHeaderBytes
++	frame[payloadOffset] = flow
++	encodeCookie(frame[payloadOffset+4:payloadOffset+12], listenerCookie)
++	binary.BigEndian.PutUint32(frame[payloadOffset+12:payloadOffset+16], socket.fd)
++	binary.BigEndian.PutUint64(frame[payloadOffset+20:payloadOffset+28], socket.inode)
++	encodeCookie(frame[payloadOffset+28:payloadOffset+36], socket.cookie)
++	encodeAddress(frame[payloadOffset+36:payloadOffset+56], socket.local)
++	encodeAddress(frame[payloadOffset+56:payloadOffset+76], socket.peer)
++	encodePayload(frame[payloadOffset+76:payloadOffset+148], payload)
++	return frame
++}
++
++type udpIdentity struct {
++	cmsgCount           uint8
++	cmsgFamily          uint8
++	truncationFlags     uint8
++	cmsgPayloadLength   uint16
++	listenerCookie      [2]uint32
++	client              netip.AddrPort
++	originalDestination netip.AddrPort
++}
++
++func encodeUDPReport(binding handoff, sequence uint64, cumulativeLoss uint64, flow uint8, datagram udpIdentity, payload payloadIdentity) []byte {
++	frame := commonReportFrame(binding, reportKindUDP, udpReportBytes, sequence, cumulativeLoss)
++	payloadOffset := reportHeaderBytes
++	frame[payloadOffset] = flow
++	frame[payloadOffset+1] = datagram.cmsgCount
++	frame[payloadOffset+2] = datagram.cmsgFamily
++	frame[payloadOffset+3] = datagram.truncationFlags
++	binary.BigEndian.PutUint16(frame[payloadOffset+4:payloadOffset+6], datagram.cmsgPayloadLength)
++	encodeCookie(frame[payloadOffset+8:payloadOffset+16], datagram.listenerCookie)
++	encodeAddress(frame[payloadOffset+16:payloadOffset+36], datagram.client)
++	encodeAddress(frame[payloadOffset+36:payloadOffset+56], datagram.originalDestination)
++	encodePayload(frame[payloadOffset+56:payloadOffset+128], payload)
++	return frame
++}
++
++func encodeTerminalReport(binding handoff, sequence uint64, cumulativeLoss uint64, eventCount uint8) []byte {
++	frame := commonReportFrame(binding, reportKindTerminal, terminalReportBytes, sequence, cumulativeLoss)
++	frame[reportHeaderBytes] = eventCount
++	return frame
++}
++
++func encodeCookie(output []byte, cookie [2]uint32) {
++	binary.BigEndian.PutUint32(output[0:4], cookie[0])
++	binary.BigEndian.PutUint32(output[4:8], cookie[1])
++}
++
++func encodeAddress(output []byte, address netip.AddrPort) {
++	address = netip.AddrPortFrom(address.Addr().Unmap(), address.Port())
++	binary.BigEndian.PutUint16(output[2:4], address.Port())
++	if address.Addr().Is4() {
++		output[0] = addressFamilyIPv4
++		octets := address.Addr().As4()
++		copy(output[16:20], octets[:])
++		return
++	}
++	output[0] = addressFamilyIPv6
++	octets := address.Addr().As16()
++	copy(output[4:20], octets[:])
++}
++
++func encodePayload(output []byte, payload payloadIdentity) {
++	output[0] = payload.kind
++	binary.BigEndian.PutUint16(output[2:4], payload.wireLength)
++	copy(output[4:36], payload.wireDigest[:])
++	binary.BigEndian.PutUint16(output[36:38], payload.transactionID)
++	binary.BigEndian.PutUint16(output[38:40], payload.tcpLength)
++	copy(output[40:72], payload.questionDigest[:])
++}
+diff --git a/protocol/redirect/tproxy.go b/protocol/redirect/tproxy.go
+index f0b82bb1328552e9881b4741491b5a75c02d0ba2..e7c0cd5534ee45c5c9335be29f847465bbb5b19d 100644
+--- a/protocol/redirect/tproxy.go
++++ b/protocol/redirect/tproxy.go
+@@ -72,6 +72,7 @@ func (t *TProxy) Close() error {
+ }
+ 
+ func (t *TProxy) NewConnectionEx(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
++	conn = t.listener.WrapTProxyTCP(conn)
+ 	metadata.Inbound = t.Tag()
+ 	metadata.InboundType = t.Type()
+ 	metadata.Destination = M.SocksaddrFromNet(conn.LocalAddr()).Unwrap()

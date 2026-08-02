@@ -1,0 +1,50 @@
+schema_version = 1
+producer_protocol = "flux-supervised-delivery-report-schema-v1-handoff-v1"
+
+[upstream]
+repository = "https://github.com/SagerNet/sing-box"
+tag = "v1.13.14"
+commit = "25a600db24f7680ad9806ce5427bd0ab8afe1114"
+tree = "ebe928ddfdf2273bc2ab7e0cba818db315cd6151"
+go_directive = "1.24.7"
+go_mod_sha256 = "d0b353be0205774084936bae4114a2efa52381cd0860c704ff6172e4b8b50d2d"
+default_build_tags_sha256 = "b1ad56e7129899b107ece8b4deea97d7c29bb0c10412aaa54f16eab683f5cf91"
+upstream_ldflags_sha256 = "b2380b51f636edb80147897e7b9ccc426b7f5ced47e7c641bbac55052de806fa"
+
+[[patches]]
+path = "patches/0001-flux-supervised-report-producer.patch"
+sha256 = "79d1d5b0acd3c4fca0be5eb1c04dfdd3138fb4ec53f9e090db50858dd71a4482"
+
+[patched_source]
+tree = "d2d03f36c8a7ea18dcb04a5d57c51b04d51c2c45"
+
+[toolchain]
+version = "go1.24.7"
+download_url = "https://go.dev/dl/go1.24.7.linux-amd64.tar.gz"
+archive_sha256 = "da18191ddb7db8a9339816f3e2b54bdded8047cdc2a5d67059478f8d1595c43f"
+archive_bytes = 78584952
+executable_sha256 = "5e997f6088bfb2ae7e7025f32900977755cae16484dd346e6f3fc2d1007b9ffc"
+executable_bytes = 14323704
+
+[build]
+target_os = "linux"
+target_arch = "amd64"
+target_variant = "v1"
+cgo_enabled = false
+tags = "with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_ocm,badlinkname,tfogo_checklinkname0,with_flux_report"
+version = "1.13.14-flux.1"
+trimpath = true
+build_vcs = false
+module_mode = "readonly"
+ldflags = "-X github.com/sagernet/sing-box/constant.Version=1.13.14-flux.1 -X internal/godebug.defaultGODEBUG=multipathtcp=0 -checklinkname=0 -s -w -buildid="
+
+[artifact]
+sha256 = "dcdae10ab17cac8dca312507748203208e94df83a67c6d480f10a03f6cb01f05"
+bytes = 57360532
+
+[license]
+spdx = "LicenseRef-Sing-Box-GPL-3.0-or-later-with-Additional-Terms"
+base_spdx = "GPL-3.0-or-later"
+file = "LICENSE"
+sha256 = "650d5e3b99a446fb38e820fa87a49562e0c79eab868fff58618ac487a58e554c"
+notice = "Derivative works may not use the sing-box name or imply association without prior consent."

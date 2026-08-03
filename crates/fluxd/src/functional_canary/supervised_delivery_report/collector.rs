@@ -22,7 +22,7 @@ use crate::functional_canary::{
 };
 #[cfg(test)]
 use crate::functional_canary::{
-    CanaryEvidenceError, CanaryFlow, UnqualifiedCanaryGateEvidence,
+    CanaryEvidenceError, CanaryFlow, CanaryFlowTuple, UnqualifiedCanaryGateEvidence,
     UnqualifiedCanaryInboundListenerDeliveryEvidence, ValidatedUnqualifiedCanaryGateEvidence,
 };
 use crate::generation_engine_config::{
@@ -60,7 +60,7 @@ use crate::generation_engine_config::{
 };
 
 #[derive(Debug)]
-pub(super) enum SupervisedDeliveryReportCollectorError {
+pub(in crate::functional_canary) enum SupervisedDeliveryReportCollectorError {
     Bind(SupervisedDeliveryReportBindError),
     Transport(PlatformError),
     OpeningIdentityExhausted,
@@ -242,14 +242,14 @@ static NEXT_SUPERVISED_DELIVERY_REPORT_OPENING_ID: AtomicU64 = AtomicU64::new(1)
 /// Production construction remains deliberately unavailable until the prepared driver owns an
 /// authoritative report producer. The test constructor models that future consumed authority.
 #[must_use = "the report-object prebind authority must be consumed exactly once"]
-pub(super) struct SupervisedDeliveryReportPrebindAuthority {
+pub(in crate::functional_canary) struct SupervisedDeliveryReportPrebindAuthority {
     profile: EngineCapabilityProfile,
     request: CanaryAttemptRequest,
 }
 
 impl SupervisedDeliveryReportPrebindAuthority {
     #[cfg(test)]
-    pub(super) fn fixture(
+    pub(in crate::functional_canary) fn fixture(
         profile: &EngineCapabilityProfile,
         request: &CanaryAttemptRequest,
     ) -> Self {
@@ -262,13 +262,15 @@ impl SupervisedDeliveryReportPrebindAuthority {
 
 /// Prebound producer endpoint that can be handed to the supervised engine only once.
 #[must_use = "the prebound producer must be consumed into its engine handoff"]
-pub(super) struct SupervisedDeliveryReportProducer {
+pub(in crate::functional_canary) struct SupervisedDeliveryReportProducer {
     connection: SeqpacketConnection,
     binding: Arc<SupervisedDeliveryReportTransportBinding>,
 }
 
 impl SupervisedDeliveryReportProducer {
-    pub(super) fn into_engine_handoff(self) -> SupervisedDeliveryReportEngineHandoff {
+    pub(in crate::functional_canary) fn into_engine_handoff(
+        self,
+    ) -> SupervisedDeliveryReportEngineHandoff {
         SupervisedDeliveryReportEngineHandoff {
             connection: self.connection,
             binding: self.binding,
@@ -277,7 +279,7 @@ impl SupervisedDeliveryReportProducer {
 }
 
 #[derive(Debug)]
-pub(super) enum SupervisedDeliveryReportHandoffError {
+pub(in crate::functional_canary) enum SupervisedDeliveryReportHandoffError {
     ChildIdentityMismatch {
         expected: OwnedEngineIdentity,
         observed_pid: u32,
@@ -334,7 +336,7 @@ impl Error for SupervisedDeliveryReportHandoffError {
 /// This interface intentionally exposes record send rather than a raw descriptor. A future
 /// prepared-child adapter may consume this type without reopening socket ownership in `fluxd`.
 #[must_use = "the engine report handoff must remain owned until the producer has stopped"]
-pub(super) struct SupervisedDeliveryReportEngineHandoff {
+pub(in crate::functional_canary) struct SupervisedDeliveryReportEngineHandoff {
     connection: SeqpacketConnection,
     binding: Arc<SupervisedDeliveryReportTransportBinding>,
 }
@@ -369,7 +371,7 @@ impl SupervisedDeliveryReportEngineHandoff {
         encode_engine_handoff_frame(&self.binding)
     }
 
-    pub(super) fn install_into(
+    pub(in crate::functional_canary) fn install_into(
         self,
         child: &SingBoxChild,
     ) -> Result<InstalledSupervisedDeliveryReportProducer, SupervisedDeliveryReportHandoffError>
@@ -422,14 +424,14 @@ impl fmt::Debug for SupervisedDeliveryReportEngineHandoff {
 
 /// Proof that the exact child received the sole supervisor-owned producer endpoint.
 #[must_use = "the installed report producer must remain bound to child retirement"]
-pub(super) struct InstalledSupervisedDeliveryReportProducer {
+pub(in crate::functional_canary) struct InstalledSupervisedDeliveryReportProducer {
     binding: Arc<SupervisedDeliveryReportTransportBinding>,
     child: OwnedEngineIdentity,
 }
 
 impl InstalledSupervisedDeliveryReportProducer {
     #[must_use]
-    pub(super) const fn child(&self) -> OwnedEngineIdentity {
+    pub(in crate::functional_canary) const fn child(&self) -> OwnedEngineIdentity {
         self.child
     }
 
@@ -616,13 +618,13 @@ struct PendingSupervisedDeliveryReportReceiver<C> {
 }
 
 /// Request/profile-bound owner of the sole report receiver and parser.
-pub(super) struct SupervisedDeliveryReportCollector<C> {
+pub(in crate::functional_canary) struct SupervisedDeliveryReportCollector<C> {
     receiver: PendingSupervisedDeliveryReportReceiver<C>,
     parser: SupervisedDeliveryReportParser,
 }
 
 /// Prebinds one parser and one anonymous record transport from consumed attempt authority.
-pub(super) fn prebind<C>(
+pub(in crate::functional_canary) fn prebind<C>(
     authority: SupervisedDeliveryReportPrebindAuthority,
     clock: C,
 ) -> Result<
@@ -684,7 +686,7 @@ where
     C: FnMut() -> Instant,
 {
     #[cfg(test)]
-    pub(super) fn recv_fixture_record_until(
+    pub(in crate::functional_canary) fn recv_fixture_record_until(
         &self,
         limit: usize,
         exclusive_deadline: Instant,
@@ -694,7 +696,44 @@ where
             .recv_record_until(limit, exclusive_deadline)
     }
 
-    pub(super) fn drain(
+    #[cfg(test)]
+    pub(in crate::functional_canary) fn ingest_fixture_record_until(
+        &mut self,
+        exclusive_deadline: Instant,
+    ) -> Result<(), SupervisedDeliveryReportCollectorError> {
+        match self
+            .receiver
+            .connection
+            .recv_record_until(
+                usize::from(ENGINE_SUPERVISED_DELIVERY_REPORT_MAX_FRAME_BYTES),
+                exclusive_deadline,
+            )
+            .map_err(SupervisedDeliveryReportCollectorError::Transport)?
+        {
+            Some(SeqpacketReceive::Record {
+                bytes,
+                truncated,
+                credentials,
+            }) => {
+                validate_producer_credentials(self.receiver.binding.request(), credentials)?;
+                self.parser
+                    .ingest(SupervisedDeliveryReportDatagram::new(
+                        &bytes,
+                        truncated,
+                        (self.receiver.clock)(),
+                    ))
+                    .map_err(SupervisedDeliveryReportCollectorError::InvalidReport)
+            }
+            Some(SeqpacketReceive::Eof) => {
+                Err(SupervisedDeliveryReportCollectorError::InvalidReport(
+                    SupervisedDeliveryReportError::PrematureEof,
+                ))
+            }
+            None => Err(SupervisedDeliveryReportCollectorError::DeadlineExpired),
+        }
+    }
+
+    pub(in crate::functional_canary) fn drain(
         self,
     ) -> Result<
         DrainedSupervisedDeliveryReportCollector<C>,
@@ -802,7 +841,7 @@ fn validate_producer_credentials(
 
 /// Failed collection that still owns the receiver required for ordered cleanup.
 #[must_use = "failed report collection still owns a receiver that must be retired"]
-pub(super) struct FailedSupervisedDeliveryReportCollector<C> {
+pub(in crate::functional_canary) struct FailedSupervisedDeliveryReportCollector<C> {
     receiver: PendingSupervisedDeliveryReportReceiver<C>,
     collection_error: SupervisedDeliveryReportCollectorError,
 }
@@ -852,7 +891,7 @@ impl<C> Error for FailedSupervisedDeliveryReportCollector<C> {
 }
 
 /// Completed report that deliberately retains the sole receiver until cleanup retirement.
-pub(super) struct DrainedSupervisedDeliveryReportCollector<C> {
+pub(in crate::functional_canary) struct DrainedSupervisedDeliveryReportCollector<C> {
     receiver: PendingSupervisedDeliveryReportReceiver<C>,
     report: CompletedSupervisedDeliveryReport,
 }
@@ -864,23 +903,33 @@ impl<C> DrainedSupervisedDeliveryReportCollector<C> {
     }
 
     #[must_use]
-    pub(super) const fn report_object(&self) -> CanaryAttemptObjectIdentity {
+    pub(in crate::functional_canary) const fn report_object(&self) -> CanaryAttemptObjectIdentity {
         self.report.report_object()
     }
 
     #[must_use]
-    pub(super) const fn profile_revision(&self) -> EngineCapabilityProfileRevision {
+    pub(in crate::functional_canary) const fn profile_revision(
+        &self,
+    ) -> EngineCapabilityProfileRevision {
         self.report.profile_revision()
     }
 
     #[must_use]
-    pub(super) const fn terminal_observed_at(&self) -> Instant {
+    pub(in crate::functional_canary) const fn terminal_observed_at(&self) -> Instant {
         self.report.terminal_observed_at()
     }
 
     #[must_use]
-    pub(super) const fn eof_observed_at(&self) -> Instant {
+    pub(in crate::functional_canary) const fn eof_observed_at(&self) -> Instant {
         self.report.eof_observed_at()
+    }
+
+    #[cfg(test)]
+    pub(in crate::functional_canary) fn delivery_tuple(
+        &self,
+        flow: CanaryFlow,
+    ) -> Option<CanaryFlowTuple> {
+        self.report.delivery_tuple(flow)
     }
 }
 

@@ -12,7 +12,10 @@ use super::{
     CanaryTproxyUdpRecvmsgDelivery, FUNCTIONAL_CANARY_FLOW_SLOTS,
 };
 #[cfg(test)]
-use super::{CanaryTproxyListenerSocketIdentity, UnqualifiedCanaryInboundListenerDeliveryEvidence};
+use super::{
+    CanaryFlowTuple, CanaryTproxyListenerSocketIdentity,
+    UnqualifiedCanaryInboundListenerDeliveryEvidence,
+};
 use crate::OwnedEngineIdentity;
 #[cfg(test)]
 use crate::generation_engine_config::ENGINE_SUPERVISED_DELIVERY_REPORT_TCP_FRAME_BYTES;
@@ -83,7 +86,7 @@ use crate::generation_engine_config::{
     EngineSupervisedDeliveryReportWireField as WireField,
 };
 
-mod collector;
+pub(super) mod collector;
 pub(super) use collector::CanaryListenerDeliveryReportCleanupDisposition;
 pub(crate) use collector::CanaryListenerDeliveryReportCleanupEvidence;
 
@@ -726,6 +729,19 @@ impl CompletedSupervisedDeliveryReport {
     fn take_event(&mut self, flow: CanaryFlow) -> Option<ParsedSupervisedDeliveryEvent> {
         self.events[flow.index()].take()
     }
+
+    #[cfg(test)]
+    fn delivery_tuple(&self, flow: CanaryFlow) -> Option<CanaryFlowTuple> {
+        let event = self.events[flow.index()].as_ref()?;
+        Some(match &event.transport {
+            ParsedSupervisedDeliveryTransport::Tcp(accepted) => {
+                CanaryFlowTuple::new(accepted.peer, accepted.local)
+            }
+            ParsedSupervisedDeliveryTransport::Udp(datagram) => {
+                CanaryFlowTuple::new(datagram.client_source, datagram.original_destination)
+            }
+        })
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1002,12 +1018,18 @@ mod tests {
     #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
     use std::fs::File;
     #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
-    use std::net::TcpListener;
+    use std::io::{Read, Write};
+    #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+    use std::net::{Shutdown, TcpListener, TcpStream, UdpSocket};
     use std::num::{NonZeroU32, NonZeroU64};
     use std::os::unix::fs::PermissionsExt;
     #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
     use std::path::{Path, PathBuf};
+    #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+    use std::process::Command;
     use std::sync::Arc;
+    #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+    use std::thread::{self, JoinHandle};
     use std::time::Duration;
 
     use flux_core::GenerationId;
@@ -1018,6 +1040,8 @@ mod tests {
     use flux_platform::{SingBoxLaunchSpec, SingBoxPrivilege, SingBoxReadiness};
 
     use super::*;
+    #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+    use crate::functional_canary::CanaryFlow;
     use crate::functional_canary::tests::{Fixture, request_with_engine_profile_revision};
     use crate::functional_canary::{
         CanaryAddressFamilies, CanaryAttemptCredentialBinding,
@@ -1207,7 +1231,7 @@ esac
             Self::with_binary_template(binary, directory, evidence, &template)
         }
 
-        fn real_producer(binary: PathBuf) -> Self {
+        fn real_producer(binary: PathBuf, sink_port: NonZeroU16) -> Self {
             assert!(binary.is_absolute(), "real producer path must be absolute");
             let binary = fs::canonicalize(&binary).expect("canonicalize real producer path");
             assert!(
@@ -1221,6 +1245,15 @@ esac
             let template = serde_json::to_vec(&serde_json::json!({
                 "log": { "disabled": true },
                 "inbounds": [],
+                "outbounds": [{ "type": "direct", "tag": "direct" }],
+                "route": {
+                    "rules": [{
+                        "action": "route",
+                        "outbound": "direct",
+                        "override_address": "127.0.0.1",
+                        "override_port": sink_port.get(),
+                    }],
+                },
             }))
             .expect("encode real producer template");
             Self::with_binary_template(binary, directory, evidence, &template)
@@ -1352,6 +1385,111 @@ esac
                 collector::prebind(authority, clock).expect("prebind launch-control report");
             (producer.into_engine_handoff(), collector)
         }
+    }
+
+    #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+    fn enable_isolated_loopback() {
+        let status = Command::new("ip")
+            .args(["link", "set", "lo", "up"])
+            .status()
+            .expect("run isolated loopback setup");
+        assert!(status.success(), "isolated loopback setup failed: {status}");
+    }
+
+    #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+    fn start_real_producer_sinks() -> (NonZeroU16, JoinHandle<()>, JoinHandle<()>) {
+        let tcp = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind TCP producer sink");
+        let port = NonZeroU16::new(tcp.local_addr().expect("inspect TCP producer sink").port())
+            .expect("TCP producer sink port is nonzero");
+        let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, port.get()))
+            .expect("bind UDP producer sink on the same port");
+        udp.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("bound UDP producer sink timeout");
+
+        let tcp_thread = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut connection, _) = tcp.accept().expect("accept producer sink connection");
+                connection
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .expect("bound producer sink connection timeout");
+                let mut payload = Vec::new();
+                connection
+                    .read_to_end(&mut payload)
+                    .expect("read producer sink request");
+                assert!(
+                    !payload.is_empty(),
+                    "producer sink request must not be empty"
+                );
+            }
+        });
+        let udp_thread = thread::spawn(move || {
+            let mut payload = [0_u8; 512];
+            for _ in 0..2 {
+                let (length, _) = udp
+                    .recv_from(&mut payload)
+                    .expect("receive producer sink datagram");
+                assert!(length > 0, "producer sink datagram must not be empty");
+            }
+        });
+        (port, tcp_thread, udp_thread)
+    }
+
+    #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+    fn send_real_producer_tcp(port: NonZeroU16, payload: &[u8]) -> TcpStream {
+        let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port.get()))
+            .expect("connect real producer TCP flow");
+        stream
+            .write_all(payload)
+            .expect("write real producer TCP payload");
+        stream
+            .shutdown(Shutdown::Write)
+            .expect("half-close real producer TCP payload");
+        stream
+    }
+
+    #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+    fn send_real_producer_udp(port: NonZeroU16, payload: &[u8]) {
+        let socket =
+            UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind real producer UDP client");
+        assert_eq!(
+            socket
+                .send_to(payload, (Ipv4Addr::LOCALHOST, port.get()))
+                .expect("send real producer UDP payload"),
+            payload.len()
+        );
+    }
+
+    #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+    fn real_producer_dns_query(
+        request: &CanaryAttemptRequest,
+        flow: CanaryFlow,
+        tcp: bool,
+    ) -> Vec<u8> {
+        let expected = request
+            .expected_dns(flow)
+            .expect("DNS flow has a canonical expectation");
+        let question = expected.question();
+        let mut message = Vec::with_capacity(101);
+        message.extend_from_slice(&expected.transaction_id().to_be_bytes());
+        message.extend_from_slice(&0x0100_u16.to_be_bytes());
+        message.extend_from_slice(&1_u16.to_be_bytes());
+        message.extend_from_slice(&0_u16.to_be_bytes());
+        message.extend_from_slice(&0_u16.to_be_bytes());
+        message.extend_from_slice(&0_u16.to_be_bytes());
+        message.extend_from_slice(question.wire_name());
+        message.extend_from_slice(&question.record_type().to_be_bytes());
+        message.extend_from_slice(&1_u16.to_be_bytes());
+        if !tcp {
+            return message;
+        }
+        let mut framed = Vec::with_capacity(message.len() + 2);
+        framed.extend_from_slice(
+            &u16::try_from(message.len())
+                .expect("canonical DNS query length fits u16")
+                .to_be_bytes(),
+        );
+        framed.extend_from_slice(&message);
+        framed
     }
 
     #[test]
@@ -1643,7 +1781,9 @@ esac
         let binary = env::var_os(REAL_PRODUCER_BINARY_ENV)
             .map(PathBuf::from)
             .expect("real producer composition requires its exact binary path");
-        let fixture = NativeLaunchControlFixture::real_producer(binary);
+        enable_isolated_loopback();
+        let (sink_port, tcp_sink, udp_sink) = start_real_producer_sinks();
+        let fixture = NativeLaunchControlFixture::real_producer(binary, sink_port);
         let mut child = fixture.spawn();
         fixture
             .adapter
@@ -1688,25 +1828,62 @@ esac
         );
         drop(first_collector);
 
-        let successor_request = fixture.request_for_child_with_nonce(
+        let mut successor_request = fixture.request_for_child_with_nonce(
             &child,
             credentials,
             [0xa3; FUNCTIONAL_CANARY_NONCE_BYTES],
         );
+        successor_request.families = CanaryAddressFamilies::Ipv4Only;
         let successor_child = successor_request.pre_binding().engine().engine();
-        let (successor_handoff, successor_collector) =
+        let expected_report_object = successor_request
+            .pre_binding()
+            .environment()
+            .attempt_objects()
+            .listener_delivery_report();
+        let (successor_handoff, mut successor_collector) =
             fixture.prebind(&successor_request, Instant::now);
         let successor_installed = successor_handoff
             .install_into(&child)
             .expect("install successor after first receiver retirement");
         assert_eq!(successor_installed.child(), successor_child);
-        assert_eq!(
-            successor_collector
-                .recv_fixture_record_until(1, Instant::now() + Duration::from_millis(100))
-                .expect("inspect admitted successor producer"),
-            None,
-            "the retired first attempt must admit one live successor"
-        );
+        let listener_port = match &fixture.spec.process().readiness {
+            SingBoxReadiness::Listener { port } => *port,
+            SingBoxReadiness::TunInterface { .. } => {
+                panic!("real producer composition requires listener readiness")
+            }
+        };
+        let tcp_echo = send_real_producer_tcp(listener_port, successor_request.nonce().as_bytes());
+        successor_collector
+            .ingest_fixture_record_until(Instant::now() + Duration::from_secs(1))
+            .expect("parse real producer IPv4 TCP echo report");
+        drop(tcp_echo);
+
+        send_real_producer_udp(listener_port, successor_request.nonce().as_bytes());
+        successor_collector
+            .ingest_fixture_record_until(Instant::now() + Duration::from_secs(1))
+            .expect("parse real producer IPv4 UDP echo report");
+
+        let dns_udp = real_producer_dns_query(&successor_request, CanaryFlow::Ipv4DnsUdp, false);
+        send_real_producer_udp(listener_port, &dns_udp);
+        successor_collector
+            .ingest_fixture_record_until(Instant::now() + Duration::from_secs(1))
+            .expect("parse real producer IPv4 DNS-over-UDP report");
+
+        let dns_tcp = real_producer_dns_query(&successor_request, CanaryFlow::Ipv4DnsTcp, true);
+        let dns_tcp_client = send_real_producer_tcp(listener_port, &dns_tcp);
+        successor_collector
+            .ingest_fixture_record_until(Instant::now() + Duration::from_secs(1))
+            .expect("parse real producer IPv4 DNS-over-TCP report");
+        drop(dns_tcp_client);
+
+        let drained = successor_collector
+            .drain()
+            .unwrap_or_else(|failed| panic!("complete real producer report: {failed}"));
+        assert_eq!(drained.report_object(), expected_report_object);
+        assert_eq!(drained.profile_revision(), fixture.profile.revision());
+        assert!(drained.terminal_observed_at() <= drained.eof_observed_at());
+        tcp_sink.join().expect("join TCP producer sink");
+        udp_sink.join().expect("join UDP producer sink");
         assert_eq!(
             fixture
                 .adapter
@@ -1720,12 +1897,6 @@ esac
             .terminate(&mut child, Duration::from_secs(1))
             .expect("terminate and reap real producer child");
         let eof_deadline = Instant::now() + Duration::from_secs(1);
-        assert!(matches!(
-            successor_collector
-                .recv_fixture_record_until(1, eof_deadline)
-                .expect("observe successor closure after real child exit"),
-            Some(SeqpacketReceive::Eof)
-        ));
         assert!(matches!(
             child
                 .launch_control()

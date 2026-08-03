@@ -23,10 +23,10 @@ use super::android_remote::{
     process_absence_function, run_owned_remote_transaction, shell_single_quote,
 };
 use super::{
-    ANDROID_ENGINE_CREDENTIAL_CANARY_TEST, ANDROID_RUSTFLAGS, ANDROID_TARGET,
-    ANDROID_TARGET_RUSTFLAGS_ENV, LINUX_ANDROID_HOST_BUILD_TMPDIR, LINUX_CANARY_INTERNAL_ENVS,
-    LINUX_OUTPUT_TPROXY_CANARY_TEST, android_kernel, android_linker, validate_aarch64_elf,
-    verify_ndk_revision,
+    ANDROID_ENGINE_CREDENTIAL_CANARY_TEST, ANDROID_RUSTFLAGS,
+    ANDROID_SUPERVISED_PRODUCER_CANARY_TEST, ANDROID_TARGET, ANDROID_TARGET_RUSTFLAGS_ENV,
+    LINUX_ANDROID_HOST_BUILD_TMPDIR, LINUX_CANARY_INTERNAL_ENVS, LINUX_OUTPUT_TPROXY_CANARY_TEST,
+    android_kernel, android_linker, sing_box_producer, validate_aarch64_elf, verify_ndk_revision,
 };
 
 pub(super) const COMMAND: &str = "test-functional-canary-android-output-tproxy";
@@ -43,9 +43,12 @@ const REMOTE_TEST_BINARY_NAME: &str = "fluxd-test";
 const CREDENTIAL_PROBE_TARGET_NAME: &str = "flux-engine-credential-probe";
 const REMOTE_CREDENTIAL_PROBE_BINARY_NAME: &str = CREDENTIAL_PROBE_TARGET_NAME;
 const REMOTE_CREDENTIAL_PROBE_PROCESS_NAME: &str = "flux-cred-probe";
-const REMOTE_PROCESS_NAMES: [&str; 2] = [
+const REMOTE_PRODUCER_BINARY_NAME: &str = "flux-sbox-p01";
+const REAL_PRODUCER_BINARY_ENV: &str = "FLUX_TEST_SING_BOX_PRODUCER_BINARY";
+const REMOTE_PROCESS_NAMES: [&str; 3] = [
     REMOTE_TEST_BINARY_NAME,
     REMOTE_CREDENTIAL_PROBE_PROCESS_NAME,
+    REMOTE_PRODUCER_BINARY_NAME,
 ];
 const TRUSTED_ANDROID_PATH: &str = concat!(
     "/product/bin:",
@@ -65,6 +68,7 @@ const ADB_QUERY_TIMEOUT: Duration = Duration::from_secs(15);
 const ADB_PUSH_TIMEOUT: Duration = Duration::from_secs(120);
 const REMOTE_OUTPUT_TEST_TIMEOUT_SECONDS: u64 = 60;
 const REMOTE_CREDENTIAL_TEST_TIMEOUT_SECONDS: u64 = 25;
+const REMOTE_SUPERVISED_TEST_TIMEOUT_SECONDS: u64 = 60;
 const REMOTE_TEST_KILL_GRACE_SECONDS: u64 = 5;
 const REMOTE_PREFLIGHT_IDENTITY_FAILURE_STATUS: i32 = 70;
 const REMOTE_PREFLIGHT_PROCESS_FAILURE_STATUS: i32 = 71;
@@ -72,8 +76,10 @@ const REMOTE_PREFLIGHT_PATH_FAILURE_STATUS: i32 = 72;
 const REMOTE_CONTRACT_FAILURE_STATUS: i32 = 70;
 const REMOTE_OUTPUT_TEST_FAILURE_STATUS: i32 = 74;
 const REMOTE_CREDENTIAL_TEST_FAILURE_STATUS: i32 = 75;
+const REMOTE_SUPERVISED_TEST_FAILURE_STATUS: i32 = 76;
 const REMOTE_CREDENTIAL_STAGE_OUTPUT_PREFIX: &str = "flux-engine-credential-stage:";
 const ADB_EXEC_TIMEOUT: Duration = Duration::from_secs(115);
+const ADB_SUPERVISED_EXEC_TIMEOUT: Duration = Duration::from_secs(180);
 const ADB_CLEANUP_TIMEOUT: Duration = Duration::from_secs(20);
 const CARGO_BUILD_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const HOST_POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -84,6 +90,7 @@ const RUNNER_STAGE_FAILURE_PREFIX: &str = "Android canary runner stopped at ";
 pub(super) struct Options {
     serial: String,
     adb: OsString,
+    producer: Option<PathBuf>,
 }
 
 pub(super) fn parse_options(arguments: &[OsString]) -> Result<Options, String> {
@@ -94,6 +101,7 @@ impl Options {
     pub(super) fn parse(arguments: &[OsString], command: &str) -> Result<Self, String> {
         let mut serial = None;
         let mut adb = None;
+        let mut producer = None;
         let mut index = 0;
         while index < arguments.len() {
             let flag = arguments[index].to_string_lossy();
@@ -109,7 +117,19 @@ impl Options {
                     serial = Some(value.to_owned());
                 }
                 "--adb" if adb.is_none() => adb = Some(value.clone()),
-                "--serial" | "--adb" => return Err(format!("{flag} may only be supplied once")),
+                "--producer" if command == COMMAND && producer.is_none() => {
+                    let path = PathBuf::from(value);
+                    if !path.is_absolute() {
+                        return Err("--producer must be an absolute file path".to_owned());
+                    }
+                    producer = Some(path);
+                }
+                "--serial" | "--adb" => {
+                    return Err(format!("{flag} may only be supplied once"));
+                }
+                "--producer" if command == COMMAND => {
+                    return Err(format!("{flag} may only be supplied once"));
+                }
                 unknown => return Err(format!("unknown Android target option '{unknown}'")),
             }
             index = index.saturating_add(2);
@@ -119,6 +139,7 @@ impl Options {
             adb: adb
                 .or_else(|| env::var_os("ADB"))
                 .unwrap_or_else(|| OsString::from("adb")),
+            producer,
         })
     }
 
@@ -157,11 +178,13 @@ enum RunnerStage {
     RemoteExecutionPreflight,
     RemoteTestArtifactPush,
     RemoteCredentialArtifactPush,
+    RemoteProducerArtifactPush,
     RemoteCheckpointTransport,
     RemoteContract,
     RemoteShell,
     RemoteTimeout,
     LocalOutputCheckpoint,
+    SupervisedProducerCheckpoint,
     EngineCredentialCheckpoint,
     EngineCredential(EngineCredentialProbeStage),
     RemoteCleanup,
@@ -209,11 +232,13 @@ impl RunnerStage {
             Self::RemoteExecutionPreflight => "remote-execution-preflight".to_owned(),
             Self::RemoteTestArtifactPush => "remote-test-artifact-push".to_owned(),
             Self::RemoteCredentialArtifactPush => "remote-credential-artifact-push".to_owned(),
+            Self::RemoteProducerArtifactPush => "remote-producer-artifact-push".to_owned(),
             Self::RemoteCheckpointTransport => "remote-checkpoint-transport".to_owned(),
             Self::RemoteContract => "remote-contract".to_owned(),
             Self::RemoteShell => "remote-shell".to_owned(),
             Self::RemoteTimeout => "remote-timeout".to_owned(),
             Self::LocalOutputCheckpoint => "local-output-checkpoint".to_owned(),
+            Self::SupervisedProducerCheckpoint => "supervised-producer-checkpoint".to_owned(),
             Self::EngineCredentialCheckpoint => "engine-credential-checkpoint".to_owned(),
             Self::EngineCredential(stage) => format!("engine-credential-{}", stage.as_str()),
             Self::RemoteCleanup => "remote-cleanup".to_owned(),
@@ -226,12 +251,14 @@ impl RunnerStage {
 struct AndroidCanaryArtifactPaths {
     test: PathBuf,
     credential_probe: PathBuf,
+    producer: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct AndroidCanaryArtifactIdentities {
     test: AndroidArtifactIdentity,
     credential_probe: AndroidArtifactIdentity,
+    producer: Option<AndroidArtifactIdentity>,
 }
 
 impl AndroidCanaryArtifactIdentities {
@@ -242,6 +269,16 @@ impl AndroidCanaryArtifactIdentities {
                 &paths.credential_probe,
                 "exact Android credential-probe ELF",
             )?,
+            producer: paths
+                .producer
+                .as_deref()
+                .map(|path| {
+                    AndroidArtifactIdentity::from_file(
+                        path,
+                        "exact manifest-bound Android Sing-Box producer",
+                    )
+                })
+                .transpose()?,
         })
     }
 
@@ -251,7 +288,16 @@ impl AndroidCanaryArtifactIdentities {
         self.credential_probe.verify_file(
             &paths.credential_probe,
             "exact Android credential-probe ELF",
-        )
+        )?;
+        match (&self.producer, &paths.producer) {
+            (Some(identity), Some(path)) => {
+                identity.verify_file(path, "exact manifest-bound Android Sing-Box producer")
+            }
+            (None, None) => Ok(()),
+            _ => {
+                Err("Android producer artifact presence changed after identity capture".to_owned())
+            }
+        }
     }
 
     #[cfg(test)]
@@ -259,6 +305,15 @@ impl AndroidCanaryArtifactIdentities {
         Self {
             test: AndroidArtifactIdentity::for_test("11".repeat(32), 4096),
             credential_probe: AndroidArtifactIdentity::for_test("22".repeat(32), 2048),
+            producer: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_producer_for_test() -> Self {
+        Self {
+            producer: Some(AndroidArtifactIdentity::for_test("33".repeat(32), 8192)),
+            ..Self::for_test()
         }
     }
 }
@@ -278,7 +333,18 @@ pub(super) fn run(options: Options) -> Result<(), String> {
         RunnerStage::AndroidLinker,
         android_linker(&ndk_root, target.rust_target, target.clang_target),
     )?;
-    let artifacts = at_runner_stage(RunnerStage::ArtifactBuild, build_artifacts(&linker, target))?;
+    let mut artifacts =
+        at_runner_stage(RunnerStage::ArtifactBuild, build_artifacts(&linker, target))?;
+    if let Some(producer) = options.producer.clone() {
+        if target != &ARM64_TARGET {
+            return Err(runner_stage_error(RunnerStage::ArtifactElfValidation));
+        }
+        at_runner_stage(
+            RunnerStage::ArtifactElfValidation,
+            sing_box_producer::validate_android_artifact(&producer),
+        )?;
+        artifacts.producer = Some(producer);
+    }
     let artifact_identities = at_runner_stage(
         RunnerStage::ArtifactIdentity,
         AndroidCanaryArtifactIdentities::from_paths(&artifacts),
@@ -315,6 +381,13 @@ pub(super) fn run(options: Options) -> Result<(), String> {
         artifact_identities.credential_probe.sha256(),
         artifact_identities.credential_probe.size(),
     );
+    if let Some(producer) = &artifact_identities.producer {
+        println!(
+            "validated exact manifest-bound Android Sing-Box producer sha256={} size={}",
+            producer.sha256(),
+            producer.size(),
+        );
+    }
 
     let mut remote = at_runner_stage(
         RunnerStage::RemoteToken,
@@ -342,10 +415,17 @@ pub(super) fn run(options: Options) -> Result<(), String> {
     )
     .map_err(sanitize_remote_transaction_error);
     result?;
-    println!(
-        "rooted {} Android local-OUTPUT TPROXY and engine-credential checkpoints passed with independently proved process and path absence",
-        target.label
-    );
+    if artifact_identities.producer.is_some() {
+        println!(
+            "rooted {} Android local-OUTPUT TPROXY, engine-credential, and supervised-producer checkpoints passed with independently proved process and path absence",
+            target.label
+        );
+    } else {
+        println!(
+            "rooted {} Android local-OUTPUT TPROXY and engine-credential checkpoints passed with independently proved process and path absence",
+            target.label
+        );
+    }
     Ok(())
 }
 
@@ -372,11 +452,13 @@ fn classify_remote_execution_error(error: String) -> String {
         RunnerStage::RemoteExecutionPreflight,
         RunnerStage::RemoteTestArtifactPush,
         RunnerStage::RemoteCredentialArtifactPush,
+        RunnerStage::RemoteProducerArtifactPush,
         RunnerStage::RemoteCheckpointTransport,
         RunnerStage::RemoteContract,
         RunnerStage::RemoteShell,
         RunnerStage::RemoteTimeout,
         RunnerStage::LocalOutputCheckpoint,
+        RunnerStage::SupervisedProducerCheckpoint,
         RunnerStage::EngineCredentialCheckpoint,
     ] {
         if error == runner_stage_error(stage) {
@@ -424,6 +506,7 @@ fn checkpoint_stage_for_remote_output(
         Some(1 | 2) => RunnerStage::RemoteShell,
         Some(124 | 137) => RunnerStage::RemoteTimeout,
         Some(REMOTE_OUTPUT_TEST_FAILURE_STATUS) => RunnerStage::LocalOutputCheckpoint,
+        Some(REMOTE_SUPERVISED_TEST_FAILURE_STATUS) => RunnerStage::SupervisedProducerCheckpoint,
         _ => RunnerStage::RemoteExecution,
     }
 }
@@ -764,6 +847,7 @@ fn build_artifacts(
     Ok(AndroidCanaryArtifactPaths {
         test,
         credential_probe,
+        producer: None,
     })
 }
 
@@ -1001,6 +1085,31 @@ fn push_and_execute(
         revalidate_device(options, expected_device, "after credential-probe push"),
     )?;
 
+    if let (Some(producer), Some(identity)) = (
+        artifacts.producer.as_deref(),
+        artifact_identities.producer.as_ref(),
+    ) {
+        let remote_producer = format!("{}/{REMOTE_PRODUCER_BINARY_NAME}", remote.path());
+        at_runner_stage(
+            RunnerStage::RemoteProducerArtifactPush,
+            revalidate_device(options, expected_device, "immediately before producer push"),
+        )?;
+        at_runner_stage(
+            RunnerStage::RemoteProducerArtifactPush,
+            push_artifact(
+                options,
+                producer,
+                identity,
+                &remote_producer,
+                "manifest-bound Android Sing-Box producer",
+            ),
+        )?;
+        at_runner_stage(
+            RunnerStage::RemoteProducerArtifactPush,
+            revalidate_device(options, expected_device, "after producer push"),
+        )?;
+    }
+
     let script = at_runner_stage(
         RunnerStage::RemoteCheckpointTransport,
         remote_script(remote, artifact_identities, expected_device),
@@ -1010,7 +1119,11 @@ fn push_and_execute(
         adb_root_shell_output(
             options,
             script.as_bytes(),
-            ADB_EXEC_TIMEOUT,
+            if artifact_identities.producer.is_some() {
+                ADB_SUPERVISED_EXEC_TIMEOUT
+            } else {
+                ADB_EXEC_TIMEOUT
+            },
             "run rooted Android checkpoint shell",
         )
         .and_then(normalize_adb_shell_output),
@@ -1150,12 +1263,41 @@ fn remote_script(
     let expected_probe_size = artifacts.credential_probe.size();
     let expected_probe_gid = expected_device.shell_gid;
     let internal_envs = LINUX_CANARY_INTERNAL_ENVS.join(" ");
+    let (producer_contract, producer_checkpoint) = match &artifacts.producer {
+        Some(producer) => {
+            let expected_sha256 = shell_single_quote(producer.sha256());
+            let expected_size = producer.size();
+            let test = shell_single_quote(ANDROID_SUPERVISED_PRODUCER_CANARY_TEST);
+            (
+                format!(
+                    "[ -f \"$PRODUCER_BIN\" ] && [ ! -L \"$PRODUCER_BIN\" ]\n\
+                     /system/bin/chmod 700 \"$PRODUCER_BIN\"\n\
+                     [ \"$(/system/bin/stat -c '%a:%u:%g' \"$PRODUCER_BIN\")\" = '700:0:0' ]\n\
+                     ACTUAL_PRODUCER_SHA256=$(/system/bin/sha256sum \"$PRODUCER_BIN\" | /system/bin/cut -d ' ' -f 1)\n\
+                     [ \"$ACTUAL_PRODUCER_SHA256\" = {expected_sha256} ]\n\
+                     [ \"$(/system/bin/stat -c '%s' \"$PRODUCER_BIN\")\" = '{expected_size}' ]\n"
+                ),
+                format!(
+                    "PRODUCER_TEST={test}\n\
+                     require_exact_test \"$PRODUCER_TEST\" \"$TMPDIR/producer-list\" || exit {REMOTE_CONTRACT_FAILURE_STATUS}\n\
+                     export {REAL_PRODUCER_BINARY_ENV}=\"$PRODUCER_BIN\"\n\
+                     if ! run_exact_test {REMOTE_SUPERVISED_TEST_TIMEOUT_SECONDS} \"$PRODUCER_TEST\" >/dev/null 2>&1; then\n\
+                       exit {REMOTE_SUPERVISED_TEST_FAILURE_STATUS}\n\
+                     fi\n\
+                     unset {REAL_PRODUCER_BINARY_ENV}\n\
+                     probe_process_absent\n"
+                ),
+            )
+        }
+        None => ("path_absent \"$PRODUCER_BIN\"\n".to_owned(), String::new()),
+    };
     Ok(format!(
         "set -eu\n\
          umask 077\n\
          {}\
          TEST_BIN=\"$ROOT/{REMOTE_TEST_BINARY_NAME}\"\n\
          CREDENTIAL_PROBE=\"$ROOT/{REMOTE_CREDENTIAL_PROBE_BINARY_NAME}\"\n\
+         PRODUCER_BIN=\"$ROOT/{REMOTE_PRODUCER_BINARY_NAME}\"\n\
          TMPDIR=\"$ROOT/tmp\"\n\
          CREDENTIAL_STAGE_RECEIPT=\"$TMPDIR\"/{credential_stage_receipt_name}\n\
          CREDENTIAL_FINAL_STAGE={final_credential_stage}\n\
@@ -1178,6 +1320,7 @@ fn remote_script(
          [ -f \"$CREDENTIAL_PROBE\" ] && [ ! -L \"$CREDENTIAL_PROBE\" ]\n\
          /system/bin/chown -R 0:0 \"$ROOT\"\n\
          /system/bin/chmod 700 \"$ROOT\" \"$TEST_BIN\" \"$CREDENTIAL_PROBE\"\n\
+         {producer_contract}\
          owned_root_matches\n\
          [ \"$(/system/bin/stat -c '%a:%u:%g' \"$TEST_BIN\")\" = '700:0:0' ]\n\
          [ \"$(/system/bin/stat -c '%a:%u:%g' \"$CREDENTIAL_PROBE\")\" = '700:0:0' ]\n\
@@ -1227,9 +1370,11 @@ fn remote_script(
            exit {REMOTE_OUTPUT_TEST_FAILURE_STATUS}\n\
          fi\n\
          probe_process_absent\n\
+         {producer_checkpoint}\
          remove_owned_root\n\
          path_absent \"$TEST_BIN\"\n\
          path_absent \"$CREDENTIAL_PROBE\"\n\
+         path_absent \"$PRODUCER_BIN\"\n\
          path_absent \"$ROOT\"\n\
          identity_matches\n\
          trap - EXIT HUP INT TERM\n\
@@ -1399,6 +1544,7 @@ fn remote_absence_script(remote: &OwnedRemoteDirectory, expected_device: &Device
          ROOT={}\n\
          TEST_BIN=\"$ROOT/{REMOTE_TEST_BINARY_NAME}\"\n\
          CREDENTIAL_PROBE=\"$ROOT/{REMOTE_CREDENTIAL_PROBE_BINARY_NAME}\"\n\
+         PRODUCER_BIN=\"$ROOT/{REMOTE_PRODUCER_BINARY_NAME}\"\n\
          export PATH='{TRUSTED_ANDROID_PATH}'\n\
          {}\
          {}\
@@ -1406,6 +1552,7 @@ fn remote_absence_script(remote: &OwnedRemoteDirectory, expected_device: &Device
          identity_matches\n\
          path_absent \"$TEST_BIN\"\n\
          path_absent \"$CREDENTIAL_PROBE\"\n\
+         path_absent \"$PRODUCER_BIN\"\n\
          path_absent \"$ROOT\"\n\
          probe_process_absent\n",
         shell_single_quote(remote.path()),
@@ -1922,9 +2069,27 @@ mod tests {
         .expect("valid options");
         assert_eq!(options.serial, "127.0.0.1:58526");
         assert_eq!(options.adb, OsString::from("custom-adb"));
+        assert_eq!(options.producer, None);
+        let with_producer = parse_options(&[
+            OsString::from("--serial"),
+            OsString::from("device"),
+            OsString::from("--producer"),
+            OsString::from("/tmp/sing-box"),
+        ])
+        .expect("producer qualification options");
+        assert_eq!(with_producer.producer, Some(PathBuf::from("/tmp/sing-box")));
         assert!(parse_options(&[]).is_err());
         assert!(
             parse_options(&[OsString::from("--serial"), OsString::from("unsafe serial"),]).is_err()
+        );
+        assert!(
+            parse_options(&[
+                OsString::from("--serial"),
+                OsString::from("device"),
+                OsString::from("--producer"),
+                OsString::from("relative/sing-box"),
+            ])
+            .is_err()
         );
     }
 
@@ -2029,9 +2194,11 @@ mod tests {
         assert_eq!(ADB_QUERY_TIMEOUT, Duration::from_secs(15));
         assert_eq!(ADB_CLEANUP_TIMEOUT, Duration::from_secs(20));
         assert_eq!(ADB_EXEC_TIMEOUT, Duration::from_secs(115));
+        assert_eq!(ADB_SUPERVISED_EXEC_TIMEOUT, Duration::from_secs(180));
         assert_eq!(ADB_PUSH_TIMEOUT, Duration::from_secs(120));
         assert_eq!(REMOTE_OUTPUT_TEST_TIMEOUT_SECONDS, 60);
         assert_eq!(REMOTE_CREDENTIAL_TEST_TIMEOUT_SECONDS, 25);
+        assert_eq!(REMOTE_SUPERVISED_TEST_TIMEOUT_SECONDS, 60);
         assert_eq!(REMOTE_TEST_KILL_GRACE_SECONDS, 5);
         assert_eq!(HOST_POLL_INTERVAL, Duration::from_millis(25));
         assert_eq!(HOST_OUTPUT_DRAIN_GRACE, Duration::from_secs(2));
@@ -2044,6 +2211,14 @@ mod tests {
             ) < ADB_EXEC_TIMEOUT
         );
         assert!(ADB_EXEC_TIMEOUT < ADB_PUSH_TIMEOUT);
+        assert!(
+            Duration::from_secs(
+                REMOTE_OUTPUT_TEST_TIMEOUT_SECONDS
+                    + REMOTE_CREDENTIAL_TEST_TIMEOUT_SECONDS
+                    + REMOTE_SUPERVISED_TEST_TIMEOUT_SECONDS
+                    + (3 * REMOTE_TEST_KILL_GRACE_SECONDS)
+            ) < ADB_SUPERVISED_EXEC_TIMEOUT
+        );
         assert!(ADB_PUSH_TIMEOUT < CARGO_BUILD_TIMEOUT);
         assert!(HOST_POLL_INTERVAL < ADB_QUERY_TIMEOUT);
     }
@@ -2090,6 +2265,7 @@ mod tests {
             "[ \"$CREDENTIAL_STAGE\" = \"$CREDENTIAL_FINAL_STAGE\" ]",
             "path_absent \"$TEST_BIN\"",
             "path_absent \"$CREDENTIAL_PROBE\"",
+            "path_absent \"$PRODUCER_BIN\"",
             "path_absent \"$ROOT\"",
         ] {
             assert!(script.contains(required), "missing {required:?}");
@@ -2111,11 +2287,11 @@ mod tests {
                 < script.find("run_exact_test 60 \"$OUTPUT_TEST\"").unwrap()
         );
         assert!(script.contains("for COMM in /proc/[0-9]*/comm"));
-        assert!(script.contains("'fluxd-test' 'flux-cred-probe'"));
+        assert!(script.contains("'fluxd-test' 'flux-cred-probe' 'flux-sbox-p01'"));
         assert!(!script.contains("pidof"));
         let cleanup = cleanup_script(&remote, &device);
         assert!(cleanup.find("owned_root_matches").unwrap() < cleanup.find("rm -rf").unwrap());
-        assert!(cleanup.contains("'fluxd-test' 'flux-cred-probe'"));
+        assert!(cleanup.contains("'fluxd-test' 'flux-cred-probe' 'flux-sbox-p01'"));
         for (boundary, proof) in [
             (
                 "preflight",
@@ -2132,17 +2308,20 @@ mod tests {
                 "{boundary} proof does not reject root path entries"
             );
             assert!(
-                proof.contains("'fluxd-test' 'flux-cred-probe'"),
-                "{boundary} proof does not reject both process names"
+                proof.contains("'fluxd-test' 'flux-cred-probe' 'flux-sbox-p01'"),
+                "{boundary} proof does not reject every process name"
             );
         }
         let final_proof = remote_absence_script(&remote, &device);
         assert!(final_proof.contains("path_absent \"$TEST_BIN\""));
         assert!(final_proof.contains("path_absent \"$CREDENTIAL_PROBE\""));
+        assert!(final_proof.contains("path_absent \"$PRODUCER_BIN\""));
         let mut root_gid = device.clone();
         root_gid.shell_gid = 0;
         assert!(remote_script(&remote, &artifacts, &root_gid).is_err());
         assert!(!script.contains("sudo"));
+        assert!(!script.contains("PRODUCER_TEST="));
+        assert!(!script.contains(&format!("export {REAL_PRODUCER_BINARY_ENV}=")));
         assert!(uses_windows_adb(&OsString::from("adb.exe")));
         assert!(uses_windows_adb(&OsString::from(
             "/mnt/c/Android/platform-tools/ADB.EXE"
@@ -2150,6 +2329,39 @@ mod tests {
         assert!(!uses_windows_adb(&OsString::from("custom-adb")));
         assert!(!uses_windows_adb(&OsString::from("adb")));
         assert_eq!(shell_single_quote("flux/o'hare"), "'flux/o'\\''hare'");
+    }
+
+    #[test]
+    fn supervised_producer_uses_the_same_owned_remote_contract() {
+        let remote = expected_remote_directory();
+        let device = expected_device_profile();
+        let artifacts = AndroidCanaryArtifactIdentities::with_producer_for_test();
+        let script =
+            remote_script(&remote, &artifacts, &device).expect("supervised producer remote script");
+        for required in [
+            "[ -f \"$PRODUCER_BIN\" ] && [ ! -L \"$PRODUCER_BIN\" ]",
+            "/system/bin/chmod 700 \"$PRODUCER_BIN\"",
+            "stat -c '%a:%u:%g' \"$PRODUCER_BIN\"",
+            "sha256sum \"$PRODUCER_BIN\"",
+            &format!("PRODUCER_TEST='{ANDROID_SUPERVISED_PRODUCER_CANARY_TEST}'"),
+            "require_exact_test \"$PRODUCER_TEST\" \"$TMPDIR/producer-list\"",
+            &format!("export {REAL_PRODUCER_BINARY_ENV}=\"$PRODUCER_BIN\""),
+            &format!("run_exact_test {REMOTE_SUPERVISED_TEST_TIMEOUT_SECONDS} \"$PRODUCER_TEST\""),
+            &format!("unset {REAL_PRODUCER_BINARY_ENV}"),
+            "path_absent \"$PRODUCER_BIN\"",
+        ] {
+            assert!(script.contains(required), "missing {required:?}");
+        }
+        assert!(
+            script
+                .find("run_exact_test 60 \"$OUTPUT_TEST\"")
+                .expect("mechanism test")
+                < script
+                    .find("run_exact_test 60 \"$PRODUCER_TEST\"")
+                    .expect("producer test")
+        );
+        assert!(script.contains("probe_process_absent"));
+        assert!(script.contains("trap remove_owned_root EXIT"));
     }
 
     #[cfg(target_os = "linux")]
@@ -2246,6 +2458,14 @@ mod tests {
         );
         assert_eq!(
             checkpoint_stage_for_remote_output(
+                Some(REMOTE_SUPERVISED_TEST_FAILURE_STATUS),
+                b"",
+                b""
+            ),
+            RunnerStage::SupervisedProducerCheckpoint
+        );
+        assert_eq!(
+            checkpoint_stage_for_remote_output(
                 Some(REMOTE_CREDENTIAL_TEST_FAILURE_STATUS),
                 b"",
                 b""
@@ -2329,6 +2549,7 @@ mod tests {
         let options = Options {
             serial: "secret-serial".to_owned(),
             adb: OsString::from("adb"),
+            producer: None,
         };
         let rendered = render_adb_command(
             &options,
@@ -2362,10 +2583,12 @@ mod tests {
             RunnerStage::RemoteExecutionPreflight,
             RunnerStage::RemoteTestArtifactPush,
             RunnerStage::RemoteCredentialArtifactPush,
+            RunnerStage::RemoteProducerArtifactPush,
             RunnerStage::RemoteCheckpointTransport,
             RunnerStage::EngineCredential(EngineCredentialProbeStage::RootValidation),
             RunnerStage::EngineCredential(EngineCredentialProbeStage::DeviceGidReport),
             RunnerStage::EngineCredential(EngineCredentialProbeStage::ParentDeathContainment),
+            RunnerStage::SupervisedProducerCheckpoint,
             RunnerStage::RemoteCleanup,
         ] {
             let error = at_runner_stage::<()>(
@@ -2394,6 +2617,12 @@ mod tests {
                 &device,
             )
             .expect("remote script"),
+            remote_script(
+                &remote,
+                &AndroidCanaryArtifactIdentities::with_producer_for_test(),
+                &device,
+            )
+            .expect("supervised producer remote script"),
             cleanup_script(&remote, &device),
             remote_absence_script(&remote, &device),
         ];

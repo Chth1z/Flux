@@ -112,6 +112,13 @@ fn privileged_android_engine_credential_parent_death_helper() {
 }
 
 #[test]
+#[cfg(target_os = "android")]
+#[ignore = "requires the exact manifest-built Android producer and rooted local-OUTPUT authority"]
+fn privileged_android_supervised_producer_exercises_local_output_reports_and_cleanup() {
+    local_output_tproxy::run_supervised_producer();
+}
+
+#[test]
 #[cfg(target_os = "linux")]
 #[ignore = "requires Linux user-namespace authority for distinct subordinate credentials"]
 fn privileged_local_output_distinct_uid_capability_preflight() {

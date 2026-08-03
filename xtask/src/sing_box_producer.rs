@@ -12,6 +12,7 @@ use std::os::unix::fs::PermissionsExt;
 use serde::Deserialize;
 
 use crate::hash::sha256_file;
+use crate::{validate_aarch64_elf, validate_https_url};
 
 pub(super) const COMMAND: &str = "build-sing-box-producer";
 const MANIFEST_RELATIVE: &str = "engine/sing-box/manifest.toml";
@@ -27,6 +28,32 @@ struct Options {
     source: PathBuf,
     go_sdk: PathBuf,
     output: PathBuf,
+    target: ProducerTarget,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProducerTarget {
+    LinuxAmd64,
+    AndroidArm64,
+}
+
+impl ProducerTarget {
+    const ALL: [Self; 2] = [Self::LinuxAmd64, Self::AndroidArm64];
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::LinuxAmd64 => "linux-amd64",
+            Self::AndroidArm64 => "android-arm64",
+        }
+    }
+
+    fn parse(value: &OsStr) -> Result<Self, String> {
+        match value.to_str() {
+            Some("linux-amd64") => Ok(Self::LinuxAmd64),
+            Some("android-arm64") => Ok(Self::AndroidArm64),
+            _ => Err("--target must be linux-amd64 or android-arm64".to_owned()),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -38,8 +65,9 @@ struct Manifest {
     patches: Vec<Patch>,
     patched_source: PatchedSource,
     toolchain: Toolchain,
+    validation: ValidationTarget,
     build: Build,
-    artifact: Artifact,
+    artifacts: Vec<Artifact>,
     license: License,
 }
 
@@ -83,9 +111,6 @@ struct Toolchain {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Build {
-    target_os: String,
-    target_arch: String,
-    target_variant: String,
     cgo_enabled: bool,
     tags: String,
     version: String,
@@ -97,7 +122,19 @@ struct Build {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ValidationTarget {
+    target_os: String,
+    target_arch: String,
+    target_variant: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Artifact {
+    target: String,
+    target_os: String,
+    target_arch: String,
+    target_variant: Option<String>,
     sha256: String,
     bytes: u64,
 }
@@ -121,6 +158,7 @@ pub(super) fn run(arguments: &[OsString]) -> Result<(), String> {
         .expect("the checked manifest has a parent");
     let manifest = read_manifest(&manifest_path)?;
     validate_manifest(&manifest, manifest_directory)?;
+    let artifact = manifest_artifact(&manifest, options.target)?;
 
     let source = canonical_directory(&options.source, "Sing-Box source")?;
     let go_sdk = canonical_file(&options.go_sdk, "Go SDK archive")?;
@@ -155,7 +193,14 @@ pub(super) fn run(arguments: &[OsString]) -> Result<(), String> {
 
     let module_cache = temporary.path().join("go-module-cache");
     let test_cache = temporary.path().join("go-test-cache");
-    run_go_tests(&go, &patched, &manifest.build, &test_cache, &module_cache)?;
+    run_go_tests(
+        &go,
+        &patched,
+        &manifest.build,
+        &manifest.validation,
+        &test_cache,
+        &module_cache,
+    )?;
     remove_task_directory(&test_cache, "producer test build cache")?;
     let first = temporary.path().join("build-a/sing-box");
     let second = temporary.path().join("build-b/sing-box");
@@ -168,6 +213,7 @@ pub(super) fn run(arguments: &[OsString]) -> Result<(), String> {
         &go,
         &patched,
         &manifest.build,
+        artifact,
         &first,
         &first_cache,
         &module_cache,
@@ -178,6 +224,7 @@ pub(super) fn run(arguments: &[OsString]) -> Result<(), String> {
         &go,
         &patched,
         &manifest.build,
+        artifact,
         &second,
         &second_cache,
         &module_cache,
@@ -185,31 +232,56 @@ pub(super) fn run(arguments: &[OsString]) -> Result<(), String> {
     remove_task_directory(&second_cache, "second producer build cache")?;
     require_identical_files(&first, &second)?;
     let expected_artifact = ArtifactEvidence {
-        sha256: manifest.artifact.sha256.clone(),
-        bytes: manifest.artifact.bytes,
+        sha256: artifact.sha256.clone(),
+        bytes: artifact.bytes,
     };
     require_artifact_evidence(&artifact_evidence(&first)?, &expected_artifact)?;
-    verify_probe_isolation(
+    verify_target_artifact(
+        options.target,
+        &workspace,
         &first,
         temporary.path(),
         &manifest.build,
+        artifact,
         &manifest.toolchain.version,
     )?;
-    verify_rust_composition(&workspace, &first)?;
 
     let artifact = publish_artifact_atomically(&first, &output, &expected_artifact)?;
     println!("sing_box_upstream_commit={}", manifest.upstream.commit);
     println!("sing_box_patched_tree={}", manifest.patched_source.tree);
+    println!("sing_box_producer_target={}", options.target.as_str());
     println!("sing_box_producer_sha256={}", artifact.sha256);
     println!("sing_box_producer_bytes={}", artifact.bytes);
     println!("sing_box_producer_output={}", output.display());
     Ok(())
 }
 
+pub(super) fn validate_android_artifact(path: &Path) -> Result<(), String> {
+    let workspace = workspace_root()?;
+    let manifest_path = workspace.join(MANIFEST_RELATIVE);
+    let manifest = read_manifest(&manifest_path)?;
+    validate_manifest(
+        &manifest,
+        manifest_path
+            .parent()
+            .expect("the checked manifest has a parent"),
+    )?;
+    let artifact = manifest_artifact(&manifest, ProducerTarget::AndroidArm64)?;
+    require_artifact_evidence(
+        &artifact_evidence(path)?,
+        &ArtifactEvidence {
+            sha256: artifact.sha256.clone(),
+            bytes: artifact.bytes,
+        },
+    )?;
+    validate_aarch64_elf("manifest-bound Android Sing-Box producer", path)
+}
+
 fn parse_options(arguments: &[OsString]) -> Result<Options, String> {
     let mut source = None;
     let mut go_sdk = None;
     let mut output = None;
+    let mut target = None;
     let mut index = 0;
     while index < arguments.len() {
         let flag = arguments[index]
@@ -224,7 +296,8 @@ fn parse_options(arguments: &[OsString]) -> Result<Options, String> {
             "--source" if source.replace(PathBuf::from(value)).is_none() => {}
             "--go-sdk" if go_sdk.replace(PathBuf::from(value)).is_none() => {}
             "--output" if output.replace(PathBuf::from(value)).is_none() => {}
-            "--source" | "--go-sdk" | "--output" => {
+            "--target" if target.is_none() => target = Some(ProducerTarget::parse(value)?),
+            "--source" | "--go-sdk" | "--output" | "--target" => {
                 return Err(format!("duplicate option {flag}"));
             }
             _ => return Err(format!("unknown option {flag}")),
@@ -234,6 +307,7 @@ fn parse_options(arguments: &[OsString]) -> Result<Options, String> {
         source: source.ok_or_else(|| "missing required --source DIR".to_owned())?,
         go_sdk: go_sdk.ok_or_else(|| "missing required --go-sdk FILE".to_owned())?,
         output: output.ok_or_else(|| "missing required --output FILE".to_owned())?,
+        target: target.ok_or_else(|| "missing required --target TARGET".to_owned())?,
     })
 }
 
@@ -253,7 +327,10 @@ fn validate_manifest(manifest: &Manifest, directory: &Path) -> Result<(), String
             "producer manifest schema, protocol, or patch cardinality is invalid".to_owned(),
         );
     }
-    require_https_repository(&manifest.upstream.repository)?;
+    validate_https_url(
+        "producer upstream repository",
+        &manifest.upstream.repository,
+    )?;
     require_lower_hex("upstream commit", &manifest.upstream.commit, 40)?;
     require_lower_hex("upstream tree", &manifest.upstream.tree, 40)?;
     require_lower_hex("patched tree", &manifest.patched_source.tree, 40)?;
@@ -268,7 +345,6 @@ fn validate_manifest(manifest: &Manifest, directory: &Path) -> Result<(), String
             &manifest.upstream.upstream_ldflags_sha256,
         ),
         ("license digest", &manifest.license.sha256),
-        ("artifact digest", &manifest.artifact.sha256),
         ("Go SDK archive digest", &manifest.toolchain.archive_sha256),
         (
             "Go SDK executable digest",
@@ -283,9 +359,9 @@ fn validate_manifest(manifest: &Manifest, directory: &Path) -> Result<(), String
         || manifest.toolchain.download_url != "https://go.dev/dl/go1.24.7.linux-amd64.tar.gz"
         || manifest.toolchain.archive_bytes == 0
         || manifest.toolchain.executable_bytes == 0
-        || manifest.build.target_os != "linux"
-        || manifest.build.target_arch != "amd64"
-        || manifest.build.target_variant != "v1"
+        || manifest.validation.target_os != "linux"
+        || manifest.validation.target_arch != "amd64"
+        || manifest.validation.target_variant.as_deref() != Some("v1")
         || manifest.build.cgo_enabled
         || !manifest.build.trimpath
         || manifest.build.build_vcs
@@ -294,7 +370,6 @@ fn validate_manifest(manifest: &Manifest, directory: &Path) -> Result<(), String
         || manifest.license.spdx != "LicenseRef-Sing-Box-GPL-3.0-or-later-with-Additional-Terms"
         || manifest.license.base_spdx != "GPL-3.0-or-later"
         || manifest.license.file != "LICENSE"
-        || manifest.artifact.bytes == 0
     {
         return Err(
             "producer manifest weakens a pinned source, build, or license invariant".to_owned(),
@@ -320,6 +395,34 @@ fn validate_manifest(manifest: &Manifest, directory: &Path) -> Result<(), String
     {
         return Err("producer linker flags are not canonical".to_owned());
     }
+    if manifest.artifacts.len() != ProducerTarget::ALL.len() {
+        return Err("producer manifest must contain the exact reviewed artifact set".to_owned());
+    }
+    for target in ProducerTarget::ALL {
+        let artifact = manifest_artifact(manifest, target)?;
+        require_lower_hex("artifact digest", &artifact.sha256, 64)?;
+        if artifact.bytes == 0 {
+            return Err("producer artifact length must be nonzero".to_owned());
+        }
+        let target_is_exact = match target {
+            ProducerTarget::LinuxAmd64 => {
+                artifact.target_os == "linux"
+                    && artifact.target_arch == "amd64"
+                    && artifact.target_variant.as_deref() == Some("v1")
+            }
+            ProducerTarget::AndroidArm64 => {
+                artifact.target_os == "android"
+                    && artifact.target_arch == "arm64"
+                    && artifact.target_variant.is_none()
+            }
+        };
+        if !target_is_exact {
+            return Err(format!(
+                "producer artifact target {} is not canonical",
+                target.as_str()
+            ));
+        }
+    }
     for patch in &manifest.patches {
         validate_relative_path("patch", &patch.path)?;
         require_lower_hex("patch digest", &patch.sha256, 64)?;
@@ -327,6 +430,26 @@ fn validate_manifest(manifest: &Manifest, directory: &Path) -> Result<(), String
         require_equal("patch digest", &sha256_file(&path)?, &patch.sha256)?;
     }
     Ok(())
+}
+
+fn manifest_artifact(manifest: &Manifest, target: ProducerTarget) -> Result<&Artifact, String> {
+    let mut matches = manifest
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.target == target.as_str());
+    let artifact = matches.next().ok_or_else(|| {
+        format!(
+            "producer manifest omits required artifact {}",
+            target.as_str()
+        )
+    })?;
+    if matches.next().is_some() {
+        return Err(format!(
+            "producer manifest duplicates artifact {}",
+            target.as_str()
+        ));
+    }
+    Ok(artifact)
 }
 
 fn validate_upstream(source: &Path, manifest: &Manifest) -> Result<(), String> {
@@ -431,12 +554,21 @@ fn run_go_tests(
     go: &GoToolchain,
     source: &Path,
     build: &Build,
+    target: &ValidationTarget,
     build_cache: &Path,
     module_cache: &Path,
 ) -> Result<(), String> {
     create_go_cache(build_cache, "test build")?;
     create_go_cache(module_cache, "module")?;
-    let mut command = go_command(go, source, build, module_cache);
+    let mut command = go_command(
+        go,
+        source,
+        build,
+        &target.target_os,
+        &target.target_arch,
+        target.target_variant.as_deref(),
+        module_cache,
+    );
     command.env("GOCACHE", build_cache);
     command.args([
         "test",
@@ -455,12 +587,21 @@ fn build_once(
     go: &GoToolchain,
     source: &Path,
     build: &Build,
+    artifact: &Artifact,
     output: &Path,
     cache: &Path,
     module_cache: &Path,
 ) -> Result<(), String> {
     create_go_cache(cache, "build")?;
-    let mut command = go_command(go, source, build, module_cache);
+    let mut command = go_command(
+        go,
+        source,
+        build,
+        &artifact.target_os,
+        &artifact.target_arch,
+        artifact.target_variant.as_deref(),
+        module_cache,
+    );
     command.env("GOCACHE", cache).args([
         "build",
         "-mod=readonly",
@@ -485,7 +626,15 @@ fn create_go_cache(path: &Path, kind: &str) -> Result<(), String> {
     })
 }
 
-fn go_command(go: &GoToolchain, source: &Path, build: &Build, module_cache: &Path) -> Command {
+fn go_command(
+    go: &GoToolchain,
+    source: &Path,
+    build: &Build,
+    target_os: &str,
+    target_arch: &str,
+    target_variant: Option<&str>,
+    module_cache: &Path,
+) -> Command {
     let mut command = Command::new(&go.executable);
     command
         .current_dir(source)
@@ -495,13 +644,16 @@ fn go_command(go: &GoToolchain, source: &Path, build: &Build, module_cache: &Pat
         .env("GOWORK", "off")
         .env("GOTELEMETRY", "off")
         .env("GOMODCACHE", module_cache)
-        .env("GOOS", &build.target_os)
-        .env("GOARCH", &build.target_arch)
-        .env("GOAMD64", &build.target_variant)
+        .env("GOOS", target_os)
+        .env("GOARCH", target_arch)
+        .env_remove("GOAMD64")
         .env_remove("GOFLAGS")
         .env_remove("GOEXPERIMENT")
         .env_remove("GOFIPS140")
         .env("CGO_ENABLED", if build.cgo_enabled { "1" } else { "0" });
+    if let Some(target_variant) = target_variant {
+        command.env("GOAMD64", target_variant);
+    }
     command
 }
 
@@ -509,6 +661,7 @@ fn verify_probe_isolation(
     binary: &Path,
     directory: &Path,
     build: &Build,
+    artifact: &Artifact,
     go_version: &str,
 ) -> Result<(), String> {
     let version = run_output(
@@ -523,7 +676,7 @@ fn verify_probe_isolation(
         format!("sing-box version {}", build.version),
         format!(
             "Environment: {} {}/{}",
-            go_version, build.target_os, build.target_arch
+            go_version, artifact.target_os, artifact.target_arch
         ),
         format!("Tags: {}", build.tags),
         "CGO: disabled".to_owned(),
@@ -542,6 +695,26 @@ fn verify_probe_isolation(
             .env(LAUNCH_CONTROL_ENV, "not-a-descriptor"),
         "probe producer configuration",
     )
+}
+
+fn verify_target_artifact(
+    target: ProducerTarget,
+    workspace: &Path,
+    binary: &Path,
+    directory: &Path,
+    build: &Build,
+    artifact: &Artifact,
+    go_version: &str,
+) -> Result<(), String> {
+    match target {
+        ProducerTarget::LinuxAmd64 => {
+            verify_probe_isolation(binary, directory, build, artifact, go_version)?;
+            verify_rust_composition(workspace, binary)
+        }
+        ProducerTarget::AndroidArm64 => {
+            validate_aarch64_elf("manifest-built Android Sing-Box producer", binary)
+        }
+    }
 }
 
 fn verify_rust_composition(workspace: &Path, binary: &Path) -> Result<(), String> {
@@ -816,18 +989,6 @@ fn validate_relative_path(field: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn require_https_repository(value: &str) -> Result<(), String> {
-    if !value.starts_with("https://")
-        || value
-            .bytes()
-            .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
-        || !value[8..].contains('/')
-    {
-        return Err("upstream repository must be one canonical HTTPS URL".to_owned());
-    }
-    Ok(())
-}
-
 fn require_lower_hex(field: &str, value: &str, length: usize) -> Result<(), String> {
     if value.len() != length
         || !value
@@ -1041,6 +1202,12 @@ mod tests {
     }
 
     #[test]
+    fn android_qualification_rejects_an_unbound_artifact() {
+        let root = workspace_root().expect("workspace root");
+        assert!(validate_android_artifact(&root.join("Cargo.toml")).is_err());
+    }
+
+    #[test]
     fn options_require_each_distinct_named_path() {
         let parsed = parse_options(&[
             OsString::from("--source"),
@@ -1049,9 +1216,12 @@ mod tests {
             OsString::from("/go-sdk.tar.gz"),
             OsString::from("--output"),
             OsString::from("/output"),
+            OsString::from("--target"),
+            OsString::from("android-arm64"),
         ])
         .expect("parse producer options");
         assert_eq!(parsed.source, PathBuf::from("/source"));
+        assert_eq!(parsed.target, ProducerTarget::AndroidArm64);
         assert!(parse_options(&[]).is_err());
         assert!(
             parse_options(&[
@@ -1059,6 +1229,19 @@ mod tests {
                 OsString::from("a"),
                 OsString::from("--source"),
                 OsString::from("b"),
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_options(&[
+                OsString::from("--source"),
+                OsString::from("/source"),
+                OsString::from("--go-sdk"),
+                OsString::from("/go-sdk.tar.gz"),
+                OsString::from("--output"),
+                OsString::from("/output"),
+                OsString::from("--target"),
+                OsString::from("linux-arm64"),
             ])
             .is_err()
         );

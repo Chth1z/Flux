@@ -73,10 +73,10 @@ index e689c8bb67b84b3fc7901f99840d5194237f45e4..c5e7c9a838f8939c9a481d5aa5321f51
  	} else {
 diff --git a/internal/fluxreport/report_linux_test.go b/internal/fluxreport/report_linux_test.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..0eaa44f55bb1b1e6b550ba0070fe0a32f4226080
+index 0000000000000000000000000000000000000000..df17afe54a00c8ee0ca70cd8975a351903316ce4
 --- /dev/null
 +++ b/internal/fluxreport/report_linux_test.go
-@@ -0,0 +1,438 @@
+@@ -0,0 +1,620 @@
 +//go:build with_flux_report && (linux || android)
 +
 +package fluxreport
@@ -358,6 +358,7 @@ index 0000000000000000000000000000000000000000..0eaa44f55bb1b1e6b550ba0070fe0a32
 +		_, _ = client.Write(nonce[:7])
 +		time.Sleep(10 * time.Millisecond)
 +		_, _ = client.Write(nonce[7:])
++		_ = client.(*net.TCPConn).CloseWrite()
 +	}()
 +	received := make([]byte, len(nonce))
 +	if _, err := io.ReadFull(wrapped, received); err != nil {
@@ -365,6 +366,10 @@ index 0000000000000000000000000000000000000000..0eaa44f55bb1b1e6b550ba0070fe0a32
 +	}
 +	if !bytes.Equal(received, nonce) {
 +		t.Fatal("TCP wrapper changed payload bytes")
++	}
++	boundary := make([]byte, 1)
++	if length, err := wrapped.Read(boundary); length != 0 || !errors.Is(err, io.EOF) {
++		t.Fatalf("read transparent payload boundary: length=%d err=%v", length, err)
 +	}
 +
 +	delivery := receiveRecord(t, report[1], tcpReportBytes)
@@ -379,6 +384,138 @@ index 0000000000000000000000000000000000000000..0eaa44f55bb1b1e6b550ba0070fe0a32
 +	length, err := unix.Read(report[1], buffer)
 +	if err != nil || length != 0 {
 +		t.Fatalf("report producer did not close after terminal: length=%d err=%v", length, err)
++	}
++}
++
++func TestTCPPayloadObserverRequiresExactPayloadBoundary(t *testing.T) {
++	type observation struct {
++		input []byte
++		err   error
++	}
++	nonce := bytes.Repeat([]byte{0x33}, 32)
++	var nonceArray [32]byte
++	copy(nonceArray[:], nonce)
++	dns, _ := expectedPayload(3, nonceArray)
++	invalidDNSLength := append([]byte(nil), dns...)
++	invalidDNSLength[1]--
++	for _, test := range []struct {
++		name       string
++		flow       uint8
++		observe    []observation
++		wantReport bool
++	}{
++		{name: "echo exact single read and EOF", observe: []observation{{input: nonce, err: io.EOF}}, wantReport: true},
++		{name: "echo fragmented then EOF", observe: []observation{{input: nonce[:7]}, {input: nonce[7:]}, {err: io.EOF}}, wantReport: true},
++		{name: "echo same-read suffix", observe: []observation{{input: append(append([]byte(nil), nonce...), 0xff), err: io.EOF}}},
++		{name: "echo later suffix before EOF", observe: []observation{{input: nonce}, {input: []byte{0xff}}, {err: io.EOF}}},
++		{name: "echo truncated EOF", observe: []observation{{input: nonce[:31], err: io.EOF}}},
++		{name: "DNS exact single read", flow: 3, observe: []observation{{input: dns}}, wantReport: true},
++		{name: "DNS fragmented", flow: 3, observe: []observation{{input: dns[:1]}, {input: dns[1:19]}, {input: dns[19:]}}, wantReport: true},
++		{name: "DNS same-read suffix", flow: 3, observe: []observation{{input: append(append([]byte(nil), dns...), 0xff)}}},
++		{name: "DNS invalid length", flow: 3, observe: []observation{{input: invalidDNSLength}}},
++		{name: "DNS truncated EOF", flow: 3, observe: []observation{{input: dns[:len(dns)-1], err: io.EOF}}},
++	} {
++		t.Run(test.name, func(t *testing.T) {
++			observer, reportFD := testTCPPayloadObserver(t, test.flow)
++			for _, observation := range test.observe {
++				observer.observe(observation.input, observation.err)
++			}
++			if test.wantReport {
++				requireTCPReportAndTerminal(t, reportFD, test.flow)
++			} else {
++				requireNoRecord(t, reportFD)
++			}
++		})
++	}
++}
++
++func TestTCPPayloadObserverRejectsMismatchAtEveryByte(t *testing.T) {
++	expected := bytes.Repeat([]byte{0x33}, 32)
++	for index := range expected {
++		t.Run(strconv.Itoa(index), func(t *testing.T) {
++			observer, reportFD := testTCPPayloadObserver(t, 0)
++			mismatch := append([]byte(nil), expected...)
++			mismatch[index] ^= 0xff
++			observer.observe(mismatch, io.EOF)
++			requireNoRecord(t, reportFD)
++		})
++	}
++}
++
++func TestTCPPayloadObserverEmitsOnlyOnceAfterTerminal(t *testing.T) {
++	observer, reportFD := testTCPPayloadObserver(t, 0)
++	observer.observe(bytes.Repeat([]byte{0x33}, 32), io.EOF)
++	observer.observe(nil, io.EOF)
++	observer.observe([]byte{0xff}, nil)
++	requireTCPReportAndTerminal(t, reportFD, 0)
++}
++
++func TestEndpointRetirementObservationIsTypedAndFailsClosed(t *testing.T) {
++	pair := socketPair(t)
++	defer closePair(pair)
++	state, err := observeEndpointRetirement(pair[0])
++	if err != nil || state != endpointActive {
++		t.Fatalf("live endpoint observation: state=%d err=%v", state, err)
++	}
++	_ = unix.Close(pair[1])
++	pair[1] = -1
++	state, err = observeEndpointRetirement(pair[0])
++	if err != nil || state != endpointRetired {
++		t.Fatalf("retired endpoint observation: state=%d err=%v", state, err)
++	}
++	for name, events := range map[string]int16{
++		"poll error event":   unix.POLLERR,
++		"invalid descriptor": unix.POLLNVAL,
++	} {
++		t.Run(name, func(t *testing.T) {
++			if _, err := classifyEndpointRetirement(1, events, nil); err == nil {
++				t.Fatal("endpoint observation error authorized retirement")
++			}
++		})
++	}
++	if _, err := classifyEndpointRetirement(0, 0, unix.EINTR); err == nil {
++		t.Fatal("poll failure authorized endpoint retirement")
++	}
++}
++
++func TestInstallRejectsSuccessorWhenRetirementObservationFails(t *testing.T) {
++	binding := testBinding()
++	active := &reportAttempt{binding: binding, reportFD: 1 << 30, nextFlow: 0, sequence: 1}
++	service := &reportService{active: active}
++	successor := socketPair(t)
++	defer closePair(successor)
++
++	service.install(binding, successor[0])
++	successor[0] = -1
++
++	if service.active != active {
++		t.Fatal("failed retirement observation replaced the active attempt")
++	}
++	requireEOF(t, successor[1])
++}
++
++func TestRestoreCloseOnExecIsCheckedAndReadBack(t *testing.T) {
++	pair := socketPair(t)
++	defer closePair(pair)
++	flags, err := unix.FcntlInt(uintptr(pair[0]), unix.F_GETFD, 0)
++	if err != nil {
++		t.Fatalf("inspect descriptor flags: %v", err)
++	}
++	if _, err := unix.FcntlInt(uintptr(pair[0]), unix.F_SETFD, flags&^unix.FD_CLOEXEC); err != nil {
++		t.Fatalf("clear close-on-exec: %v", err)
++	}
++	if err := restoreCloseOnExec(pair[0]); err != nil {
++		t.Fatalf("restore close-on-exec: %v", err)
++	}
++	readback, err := unix.FcntlInt(uintptr(pair[0]), unix.F_GETFD, 0)
++	if err != nil || readback&unix.FD_CLOEXEC == 0 {
++		t.Fatalf("close-on-exec readback: flags=%d err=%v", readback, err)
++	}
++	closed := pair[1]
++	_ = unix.Close(closed)
++	pair[1] = -1
++	if err := restoreCloseOnExec(closed); err == nil {
++		t.Fatal("closed descriptor passed close-on-exec restoration")
 +	}
 +}
 +
@@ -505,6 +642,11 @@ index 0000000000000000000000000000000000000000..0eaa44f55bb1b1e6b550ba0070fe0a32
 +
 +func receiveRecord(t *testing.T, fd int, expected int) []byte {
 +	t.Helper()
++	poll := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN | unix.POLLHUP | unix.POLLERR}}
++	ready, pollErr := unix.Poll(poll, 1000)
++	if pollErr != nil || ready != 1 || poll[0].Revents&unix.POLLIN == 0 {
++		t.Fatalf("report record was not readable: ready=%d events=%#x err=%v", ready, poll[0].Revents, pollErr)
++	}
 +	buffer := make([]byte, expected+1)
 +	length, err := unix.Read(fd, buffer)
 +	if err != nil {
@@ -514,6 +656,46 @@ index 0000000000000000000000000000000000000000..0eaa44f55bb1b1e6b550ba0070fe0a32
 +		t.Fatalf("report length=%d, want %d", length, expected)
 +	}
 +	return buffer[:length]
++}
++
++func testTCPPayloadObserver(t *testing.T, flow uint8) (*tcpPayloadObserver, int) {
++	t.Helper()
++	report := socketPair(t)
++	t.Cleanup(func() { closePair(report) })
++	binding := testBinding()
++	binding.requiredFlows = 1 << flow
++	expected, payload := expectedPayload(flow, binding.nonce)
++	attempt := &reportAttempt{binding: binding, reportFD: report[0], nextFlow: flow, sequence: 1}
++	return &tcpPayloadObserver{
++		service:  &reportService{active: attempt},
++		attempt:  attempt,
++		flow:     flow,
++		expected: expected,
++		payload:  payload,
++		buffer:   make([]byte, 0, len(expected)),
++	}, report[1]
++}
++
++func requireNoRecord(t *testing.T, fd int) {
++	t.Helper()
++	poll := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN | unix.POLLHUP | unix.POLLERR}}
++	ready, err := unix.Poll(poll, 0)
++	if err != nil || ready != 0 {
++		t.Fatalf("unexpected report record: ready=%d events=%#x err=%v", ready, poll[0].Revents, err)
++	}
++}
++
++func requireTCPReportAndTerminal(t *testing.T, fd int, flow uint8) {
++	t.Helper()
++	delivery := receiveRecord(t, fd, tcpReportBytes)
++	if delivery[10] != reportKindTCP || delivery[reportHeaderBytes] != flow {
++		t.Fatalf("unexpected TCP report: %x", delivery)
++	}
++	terminal := receiveRecord(t, fd, terminalReportBytes)
++	if terminal[10] != reportKindTerminal || terminal[reportHeaderBytes] != 1 {
++		t.Fatalf("unexpected terminal report: %x", terminal)
++	}
++	requireEOF(t, fd)
 +}
 diff --git a/internal/fluxreport/report_stub.go b/internal/fluxreport/report_stub.go
 new file mode 100644
@@ -542,10 +724,10 @@ index 0000000000000000000000000000000000000000..328319360a7daab8c6218f1b8ac2dcf0
 +}
 diff --git a/internal/fluxreport/service_linux.go b/internal/fluxreport/service_linux.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..c913ac2c7c4d1f188edd8deb6aa713c16c1e7c9a
+index 0000000000000000000000000000000000000000..3052b9f1760ef817f0026bc9c41a808e7db5a5cd
 --- /dev/null
 +++ b/internal/fluxreport/service_linux.go
-@@ -0,0 +1,434 @@
+@@ -0,0 +1,481 @@
 +//go:build with_flux_report && (linux || android)
 +
 +package fluxreport
@@ -585,6 +767,13 @@ index 0000000000000000000000000000000000000000..c913ac2c7c4d1f188edd8deb6aa713c1
 +	cumulativeLoss uint64
 +	eventCount     uint8
 +}
++
++type endpointRetirementState uint8
++
++const (
++	endpointActive endpointRetirementState = iota + 1
++	endpointRetired
++)
 +
 +func Start() error {
 +	encoded, exists := os.LookupEnv(launchControlFDEnvironment)
@@ -638,7 +827,9 @@ index 0000000000000000000000000000000000000000..c913ac2c7c4d1f188edd8deb6aa713c1
 +	if err := validateConnectedSeqpacket(fd); err != nil {
 +		return nil, fmt.Errorf("validate launch-control descriptor: %w", err)
 +	}
-+	unix.CloseOnExec(fd)
++	if err := restoreCloseOnExec(fd); err != nil {
++		return nil, err
++	}
 +	if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_PASSCRED, 1); err != nil {
 +		return nil, fmt.Errorf("enable launch-control credentials: %w", err)
 +	}
@@ -651,6 +842,24 @@ index 0000000000000000000000000000000000000000..c913ac2c7c4d1f188edd8deb6aa713c1
 +		ownPID:        uint32(os.Getpid()),
 +		ownStartTicks: startTicks,
 +	}, nil
++}
++
++func restoreCloseOnExec(fd int) error {
++	flags, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0)
++	if err != nil {
++		return fmt.Errorf("inspect launch-control descriptor flags: %w", err)
++	}
++	if _, err := unix.FcntlInt(uintptr(fd), unix.F_SETFD, flags|unix.FD_CLOEXEC); err != nil {
++		return fmt.Errorf("restore launch-control FD_CLOEXEC: %w", err)
++	}
++	readback, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0)
++	if err != nil {
++		return fmt.Errorf("read back launch-control descriptor flags: %w", err)
++	}
++	if readback&unix.FD_CLOEXEC == 0 {
++		return errors.New("launch-control FD_CLOEXEC restoration was not retained")
++	}
++	return nil
 +}
 +
 +func validateConnectedSeqpacket(fd int) error {
@@ -785,7 +994,8 @@ index 0000000000000000000000000000000000000000..c913ac2c7c4d1f188edd8deb6aa713c1
 +	service.mu.Lock()
 +	defer service.mu.Unlock()
 +	if service.active != nil {
-+		if !endpointRetired(service.active.reportFD) {
++		state, err := observeEndpointRetirement(service.active.reportFD)
++		if err != nil || state != endpointRetired {
 +			_ = unix.Close(reportFD)
 +			return
 +		}
@@ -805,10 +1015,29 @@ index 0000000000000000000000000000000000000000..c913ac2c7c4d1f188edd8deb6aa713c1
 +	}
 +}
 +
-+func endpointRetired(fd int) bool {
++func observeEndpointRetirement(fd int) (endpointRetirementState, error) {
 +	descriptors := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLERR | unix.POLLHUP}}
-+	_, err := unix.Poll(descriptors, 0)
-+	return err != nil || descriptors[0].Revents&(unix.POLLERR|unix.POLLHUP|unix.POLLNVAL) != 0
++	ready, err := unix.Poll(descriptors, 0)
++	return classifyEndpointRetirement(ready, descriptors[0].Revents, err)
++}
++
++func classifyEndpointRetirement(ready int, events int16, pollErr error) (endpointRetirementState, error) {
++	if pollErr != nil {
++		return 0, fmt.Errorf("observe report endpoint retirement: %w", pollErr)
++	}
++	if ready < 0 || ready > 1 || events&(unix.POLLERR|unix.POLLNVAL) != 0 || events & ^int16(unix.POLLHUP) != 0 {
++		return 0, errors.New("report endpoint retirement observation is invalid")
++	}
++	if events&unix.POLLHUP != 0 {
++		if ready != 1 {
++			return 0, errors.New("report endpoint retirement readiness is inconsistent")
++		}
++		return endpointRetired, nil
++	}
++	if ready != 0 {
++		return 0, errors.New("active report endpoint has unexplained readiness")
++	}
++	return endpointActive, nil
 +}
 +
 +func (service *reportService) closeActive() {
@@ -982,16 +1211,19 @@ index 0000000000000000000000000000000000000000..c913ac2c7c4d1f188edd8deb6aa713c1
 +}
 diff --git a/internal/fluxreport/tcp_linux.go b/internal/fluxreport/tcp_linux.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..7328f6bf172141d071aa92073879764a6d15d090
+index 0000000000000000000000000000000000000000..3569fa6f404190c0f9cc142080cebb584bfce87c
 --- /dev/null
 +++ b/internal/fluxreport/tcp_linux.go
-@@ -0,0 +1,128 @@
+@@ -0,0 +1,156 @@
 +//go:build with_flux_report && (linux || android)
 +
 +package fluxreport
 +
 +import (
 +	"bytes"
++	"encoding/binary"
++	"errors"
++	"io"
 +	"net"
 +	"sync"
 +
@@ -1056,8 +1288,8 @@ index 0000000000000000000000000000000000000000..7328f6bf172141d071aa92073879764a
 +
 +func (connection *observedTCPConn) Read(output []byte) (int, error) {
 +	length, err := connection.ExtendedConn.Read(output)
-+	if length > 0 {
-+		connection.observer.observe(output[:length])
++	if length > 0 || err != nil {
++		connection.observer.observe(output[:length], err)
 +	}
 +	return length, err
 +}
@@ -1065,8 +1297,8 @@ index 0000000000000000000000000000000000000000..7328f6bf172141d071aa92073879764a
 +func (connection *observedTCPConn) ReadBuffer(buffer *buf.Buffer) error {
 +	before := buffer.Len()
 +	err := connection.ExtendedConn.ReadBuffer(buffer)
-+	if buffer.Len() > before {
-+		connection.observer.observe(buffer.Bytes()[before:])
++	if buffer.Len() > before || err != nil {
++		connection.observer.observe(buffer.Bytes()[before:], err)
 +	}
 +	return err
 +}
@@ -1083,26 +1315,51 @@ index 0000000000000000000000000000000000000000..7328f6bf172141d071aa92073879764a
 +	return connection.ExtendedConn
 +}
 +
-+func (observer *tcpPayloadObserver) observe(input []byte) {
++func (observer *tcpPayloadObserver) observe(input []byte, readErr error) {
 +	observer.mu.Lock()
 +	defer observer.mu.Unlock()
 +	if observer.done {
 +		return
 +	}
-+	remaining := len(observer.expected) - len(observer.buffer)
-+	if remaining <= 0 {
++	if len(input) > len(observer.expected)-len(observer.buffer) {
 +		observer.done = true
 +		return
-+	}
-+	if len(input) > remaining {
-+		input = input[:remaining]
 +	}
 +	observer.buffer = append(observer.buffer, input...)
 +	if !bytes.Equal(observer.buffer, observer.expected[:len(observer.buffer)]) {
 +		observer.done = true
 +		return
 +	}
-+	if len(observer.buffer) != len(observer.expected) {
++	if readErr != nil && !errors.Is(readErr, io.EOF) {
++		observer.done = true
++		return
++	}
++	complete := false
++	switch observer.payload.kind {
++	case payloadKindEcho:
++		if errors.Is(readErr, io.EOF) {
++			complete = len(observer.buffer) == len(observer.expected)
++			observer.done = true
++		}
++	case payloadKindDNS:
++		if len(observer.buffer) >= 2 {
++			declared := binary.BigEndian.Uint16(observer.buffer[:2])
++			if declared != observer.payload.tcpLength || int(declared)+2 != len(observer.expected) {
++				observer.done = true
++				return
++			}
++		}
++		if len(observer.buffer) == len(observer.expected) {
++			complete = true
++			observer.done = true
++		} else if errors.Is(readErr, io.EOF) {
++			observer.done = true
++		}
++	default:
++		observer.done = true
++		return
++	}
++	if !complete {
 +		return
 +	}
 +	observer.done = true

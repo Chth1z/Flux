@@ -13,10 +13,10 @@ upstream_ldflags_sha256 = "b2380b51f636edb80147897e7b9ccc426b7f5ced47e7c641bbac5
 
 [[patches]]
 path = "patches/0001-flux-supervised-report-producer.patch"
-sha256 = "79d1d5b0acd3c4fca0be5eb1c04dfdd3138fb4ec53f9e090db50858dd71a4482"
+sha256 = "56feb792b35c50d8bdae8ed107b85703e53ab63f3ea50185a688d1edb97dcda8"
 
 [patched_source]
-tree = "d2d03f36c8a7ea18dcb04a5d57c51b04d51c2c45"
+tree = "f3c1d50d66831bbdda05377f4d5eb5d57b0db481"
 
 [toolchain]
 version = "go1.24.7"
@@ -26,10 +26,12 @@ archive_bytes = 78584952
 executable_sha256 = "5e997f6088bfb2ae7e7025f32900977755cae16484dd346e6f3fc2d1007b9ffc"
 executable_bytes = 14323704
 
-[build]
+[validation]
 target_os = "linux"
 target_arch = "amd64"
 target_variant = "v1"
+
+[build]
 cgo_enabled = false
 tags = "with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_ocm,badlinkname,tfogo_checklinkname0,with_flux_report"
 version = "1.13.14-flux.1"
@@ -38,9 +40,20 @@ build_vcs = false
 module_mode = "readonly"
 ldflags = "-X github.com/sagernet/sing-box/constant.Version=1.13.14-flux.1 -X internal/godebug.defaultGODEBUG=multipathtcp=0 -checklinkname=0 -s -w -buildid="
 
-[artifact]
-sha256 = "dcdae10ab17cac8dca312507748203208e94df83a67c6d480f10a03f6cb01f05"
-bytes = 57360532
+[[artifacts]]
+target = "linux-amd64"
+target_os = "linux"
+target_arch = "amd64"
+target_variant = "v1"
+sha256 = "7ea1e7e4ee63ca8bbe6f2f0e6d1a7ec1fa241605d7322af778a7f0a26770359b"
+bytes = 57368724
+
+[[artifacts]]
+target = "android-arm64"
+target_os = "android"
+target_arch = "arm64"
+sha256 = "5f455701bff0da57f939d367a4a547683a145cca4e58ea636f794ee24d8563bf"
+bytes = 59244861
 
 [license]
 spdx = "LicenseRef-Sing-Box-GPL-3.0-or-later-with-Additional-Terms"

@@ -22,6 +22,25 @@ mod platform_glue;
 mod sing_box_producer;
 
 const ANDROID_TARGET: &str = "aarch64-linux-android";
+const REVIEWED_SING_BOX_LICENSE_REF: &str =
+    "LicenseRef-Sing-Box-GPL-3.0-or-later-with-Additional-Terms";
+const REVIEWED_SING_BOX_LICENSE_TEXT: &str = "Copyright (C) 2022 by nekohasekai <contact-sagernet@sekai.icu>\n\
+\n\
+This program is free software: you can redistribute it and/or modify\n\
+it under the terms of the GNU General Public License as published by\n\
+the Free Software Foundation, either version 3 of the License, or\n\
+(at your option) any later version.\n\
+\n\
+This program is distributed in the hope that it will be useful,\n\
+but WITHOUT ANY WARRANTY; without even the implied warranty of\n\
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the\n\
+GNU General Public License for more details.\n\
+\n\
+You should have received a copy of the GNU General Public License\n\
+along with this program. If not, see <http://www.gnu.org/licenses/>.\n\
+\n\
+In addition, no derivative work may use the name or imply association\n\
+with this application without prior consent.\n";
 const ANDROID_API_LEVEL: &str = "31";
 const ANDROID_NDK_REVISION: &str = "27.3.13750724";
 const LINUX_ANDROID_HOST_BUILD_TMPDIR: &str = "/tmp";
@@ -108,6 +127,7 @@ const LINUX_CANARY_TEST: &str = "functional_canary::linux_namespace_harness::pri
 const LINUX_TPROXY_CANARY_TEST: &str = "functional_canary::linux_namespace_harness::privileged_ingress_tproxy_checkpoint_exercises_real_capture_counters_and_cleanup";
 const LINUX_OUTPUT_TPROXY_CANARY_TEST: &str = "functional_canary::linux_namespace_harness::privileged_local_output_tproxy_checkpoint_exercises_loopback_reinjection_and_cleanup";
 const ANDROID_ENGINE_CREDENTIAL_CANARY_TEST: &str = "functional_canary::linux_namespace_harness::privileged_android_engine_credentials_exercise_exact_cleanup";
+const ANDROID_SUPERVISED_PRODUCER_CANARY_TEST: &str = "functional_canary::linux_namespace_harness::privileged_android_supervised_producer_exercises_local_output_reports_and_cleanup";
 const LINUX_OUTPUT_UID_PREFLIGHT_TEST: &str = "functional_canary::linux_namespace_harness::privileged_local_output_distinct_uid_capability_preflight";
 const NATIVE_COMPOSITION_REQUIRED_ENV: &str = "FLUX_NATIVE_COMPOSITION_REQUIRED";
 const NATIVE_COMPOSITION_ENGINE_BIN_ENV: &str = "FLUX_NATIVE_COMPOSITION_ENGINE_BIN";
@@ -124,7 +144,7 @@ const PARSER_FUZZ_SMOKE_TESTS: [&str; 8] = [
     "seqpacket::implementation::record_control_tests::deterministic_arbitrary_control_layouts_never_panic",
     "socket_diagnostics::tests::deterministic_arbitrary_datagrams_never_panic",
 ];
-const LINUX_CANARY_INTERNAL_ENVS: [&str; 27] = [
+const LINUX_CANARY_INTERNAL_ENVS: [&str; 28] = [
     "FLUX_LINUX_CANARY_HARNESS_MODE",
     "FLUX_LINUX_CANARY_HARNESS_CONFIG",
     "FLUX_LINUX_CANARY_REENTRY_TOKEN",
@@ -152,6 +172,7 @@ const LINUX_CANARY_INTERNAL_ENVS: [&str; 27] = [
     "FLUX_ENGINE_CREDENTIAL_IDENTITY",
     "FLUX_ENGINE_CREDENTIAL_IDENTITY_TMP",
     "FLUX_ENGINE_CREDENTIAL_PORT",
+    "FLUX_TEST_SING_BOX_PRODUCER_BINARY",
 ];
 const NATIVE_COMPOSITION_INTERNAL_ENVS: [&str; 9] = [
     "FLUX_NATIVE_COMPOSITION_HARNESS_MODE",
@@ -1711,9 +1732,7 @@ fn validate_spdx_license(name: &str, value: &str) -> Result<(), String> {
         "MPL-2.0",
         "Unlicense",
     ];
-    const REVIEWED_LICENSE_REFS: &[&str] =
-        &["LicenseRef-Sing-Box-GPL-3.0-or-later-with-Additional-Terms"];
-    let custom = REVIEWED_LICENSE_REFS.contains(&value);
+    let custom = reviewed_license_ref_text(value).is_some();
     if KNOWN_IDS.contains(&value) || custom {
         Ok(())
     } else {
@@ -1721,6 +1740,27 @@ fn validate_spdx_license(name: &str, value: &str) -> Result<(), String> {
             "manifest license for '{name}' must be a recognized SPDX identifier or explicitly reviewed LicenseRef"
         ))
     }
+}
+
+fn reviewed_license_ref_text(value: &str) -> Option<&'static str> {
+    (value == REVIEWED_SING_BOX_LICENSE_REF).then_some(REVIEWED_SING_BOX_LICENSE_TEXT)
+}
+
+fn has_exact_reviewed_extracted_license(
+    license_id: &str,
+    licenses: &[SpdxExtractedLicense],
+) -> bool {
+    let Some(reviewed_text) = reviewed_license_ref_text(license_id) else {
+        return false;
+    };
+    let mut extracted = licenses
+        .iter()
+        .filter(|license| license.license_id == license_id);
+    extracted
+        .next()
+        .map(|license| license.extracted_text.as_str())
+        == Some(reviewed_text)
+        && extracted.next().is_none()
 }
 
 fn validate_utc_timestamp(field: &str, value: &str) -> Result<(), String> {
@@ -2154,12 +2194,13 @@ fn validate_spdx_document(path: &Path, manifest: &ReleaseManifest) -> Result<(),
             ));
         }
         if binary.license.starts_with("LicenseRef-")
-            && !document.extracted_licensing_infos.iter().any(|license| {
-                license.license_id == binary.license && !license.extracted_text.trim().is_empty()
-            })
+            && !has_exact_reviewed_extracted_license(
+                &binary.license,
+                &document.extracted_licensing_infos,
+            )
         {
             return Err(format!(
-                "SPDX document is missing extracted text for {}",
+                "SPDX document must contain exactly the reviewed extracted text for {}",
                 binary.license
             ));
         }
@@ -2547,8 +2588,8 @@ fn help_text() -> String {
            test-functional-canary-linux-output-preflight  Preflight distinct local-OUTPUT credentials (no traffic)\n\
            test-native-composition-linux  Run the single-owner native lifecycle and recovery checkpoint\n\
            test-parser-fuzz-smoke  Run bounded deterministic parser no-panic smoke tests\n\
-           build-sing-box-producer  Validate, patch, test, and reproducibly build pinned Sing-Box; requires --source DIR --go-sdk FILE --output FILE\n\
-           {android_canary_command}  Cross-build and run the exact checkpoint on one explicit rooted ARM64 or x86_64 Android serial\n\
+           build-sing-box-producer  Validate, patch, test, and reproducibly build pinned Sing-Box; requires --source DIR --go-sdk FILE --target linux-amd64|android-arm64 --output FILE\n\
+           {android_canary_command}  Cross-build and run the exact checkpoint on one explicit rooted ARM64 or x86_64 Android serial; --producer FILE adds the manifest-bound ARM64 report attempt\n\
            preflight-android-arm64-mark-ordering  Read-only ADR-0013 target viability report for one explicit rooted ARM64 Android serial\n\
            collect-android-arm64-profile  Run the production profile collector in one cleaned explicit-serial ARM64 test directory\n\
            collect-android-arm64-fwmark-census  Run the coherent read-only fwmark census in one cleaned explicit-serial ARM64 test directory\n\
@@ -3398,6 +3439,24 @@ mod tests {
         let unlicensed_error = validate_spdx_license("fixture", "LicenseRef-UNLICENSED")
             .expect_err("unlicensed placeholder must not become a reviewed custom license");
         assert!(unlicensed_error.contains("explicitly reviewed LicenseRef"));
+        assert_eq!(
+            reviewed_license_ref_text(REVIEWED_SING_BOX_LICENSE_REF),
+            Some(REVIEWED_SING_BOX_LICENSE_TEXT)
+        );
+        assert!(has_exact_reviewed_extracted_license(
+            REVIEWED_SING_BOX_LICENSE_REF,
+            &[SpdxExtractedLicense {
+                license_id: REVIEWED_SING_BOX_LICENSE_REF.to_owned(),
+                extracted_text: REVIEWED_SING_BOX_LICENSE_TEXT.to_owned(),
+            }]
+        ));
+        assert!(!has_exact_reviewed_extracted_license(
+            REVIEWED_SING_BOX_LICENSE_REF,
+            &[SpdxExtractedLicense {
+                license_id: REVIEWED_SING_BOX_LICENSE_REF.to_owned(),
+                extracted_text: "arbitrary nonempty extracted text".to_owned(),
+            }]
+        ));
 
         let revision_error =
             validate_source_revision("fluxd", "0000000000000000000000000000000000000000")

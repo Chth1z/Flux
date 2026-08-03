@@ -20,9 +20,18 @@ use super::*;
 use serde_json::Value;
 use std::sync::mpsc::{self, Receiver, Sender};
 
+#[cfg(target_os = "android")]
+mod supervised_producer;
+
 const TEST_NAME: &str = "functional_canary::linux_namespace_harness::privileged_local_output_tproxy_checkpoint_exercises_loopback_reinjection_and_cleanup";
+#[cfg(target_os = "android")]
+const SUPERVISED_PRODUCER_TEST_NAME: &str = "functional_canary::linux_namespace_harness::privileged_android_supervised_producer_exercises_local_output_reports_and_cleanup";
 const MODE_PREFLIGHT: &str = "local-output-tproxy-preflight";
 const MODE_ISOLATED: &str = "local-output-tproxy-isolated";
+#[cfg(target_os = "android")]
+const MODE_SUPERVISED_PREFLIGHT: &str = "local-output-supervised-producer-preflight";
+#[cfg(target_os = "android")]
+const MODE_SUPERVISED_ISOLATED: &str = "local-output-supervised-producer-isolated";
 
 // Disposable test-only field inside the currently modeled Android device-policy candidate range.
 // This does not allocate or authorize a production mark lease.
@@ -50,7 +59,29 @@ pub(super) fn run() {
     }
 }
 
+#[cfg(target_os = "android")]
+pub(super) fn run_supervised_producer() {
+    let result = match env::var(MODE_ENV).as_deref() {
+        Err(env::VarError::NotPresent) => run_outer_for(
+            SUPERVISED_PRODUCER_TEST_NAME,
+            MODE_SUPERVISED_PREFLIGHT,
+            MODE_SUPERVISED_ISOLATED,
+        ),
+        Ok(MODE_SUPERVISED_PREFLIGHT) => run_preflight(),
+        Ok(MODE_SUPERVISED_ISOLATED) => run_supervised_isolated(),
+        Ok(other) => Err(format!("unsupported {MODE_ENV} value {other:?}")),
+        Err(env::VarError::NotUnicode(_)) => Err(format!("{MODE_ENV} must contain valid UTF-8")),
+    };
+    if let Err(error) = result {
+        panic!("Android supervised-producer checkpoint failed: {error}");
+    }
+}
+
 fn run_outer() -> Result<(), String> {
+    run_outer_for(TEST_NAME, MODE_PREFLIGHT, MODE_ISOLATED)
+}
+
+fn run_outer_for(test_name: &str, preflight_mode: &str, isolated_mode: &str) -> Result<(), String> {
     let required = required_mode()?;
     for (program, arguments) in [
         ("unshare", unshare_probe_arguments()),
@@ -70,16 +101,16 @@ fn run_outer() -> Result<(), String> {
         }
     }
 
-    if let Err(reason) = run_outer_reentry(MODE_PREFLIGHT, COMMAND_TIMEOUT) {
+    if let Err(reason) = run_outer_reentry(test_name, preflight_mode, COMMAND_TIMEOUT) {
         return skip_or_fail(
             required,
             format!("disposable local-OUTPUT TPROXY preflight is unavailable: {reason}"),
         );
     }
-    run_outer_reentry(MODE_ISOLATED, PROCESS_TIMEOUT)
+    run_outer_reentry(test_name, isolated_mode, PROCESS_TIMEOUT)
 }
 
-fn run_outer_reentry(mode: &str, timeout: Duration) -> Result<(), String> {
+fn run_outer_reentry(test_name: &str, mode: &str, timeout: Duration) -> Result<(), String> {
     let executable =
         env::current_exe().map_err(|error| format!("resolve test executable: {error}"))?;
     let reentry_token = random_nonce()?;
@@ -92,7 +123,7 @@ fn run_outer_reentry(mode: &str, timeout: Duration) -> Result<(), String> {
         .args([
             "--ignored",
             "--exact",
-            TEST_NAME,
+            test_name,
             "--nocapture",
             "--test-threads=1",
         ])
@@ -1127,13 +1158,33 @@ struct LocalOutputResources {
 }
 
 fn run_isolated() -> Result<(), String> {
-    ensure_local_output_isolated_authority_with_boundary(
+    let config = LocalOutputConfig::new(random_nonce()?)?;
+    run_isolated_with(
         "conventional local OUTPUT mark, RPDB local route, loopback PREROUTING TPROXY, and cleanup evidence only; no Android release or production qualification",
-    )?;
+        config,
+        execute_isolated,
+    )
+}
+
+#[cfg(target_os = "android")]
+fn run_supervised_isolated() -> Result<(), String> {
+    let config = supervised_producer::config(random_nonce()?)?;
+    run_isolated_with(
+        "manifest-bound Android producer, Rust-owned report handoff, local OUTPUT TPROXY, and exact cleanup qualification only; no package or production admission",
+        config,
+        supervised_producer::execute,
+    )
+}
+
+fn run_isolated_with(
+    boundary: &str,
+    config: LocalOutputConfig,
+    execute: fn(&mut LocalOutputResources) -> Result<(), String>,
+) -> Result<(), String> {
+    ensure_local_output_isolated_authority_with_boundary(boundary)?;
     let modules = ModuleInventory::capture()?;
     let directory = tempfile::tempdir()
         .map_err(|error| format!("create local-OUTPUT TPROXY harness directory: {error}"))?;
-    let config = LocalOutputConfig::new(random_nonce()?)?;
     let journal_path = directory.path().join("mutations.jsonl");
     let journal = Journal::create(journal_path, config.nonce.clone())?;
     let baselines = Baselines::capture(&config)?;
@@ -1147,7 +1198,7 @@ fn run_isolated() -> Result<(), String> {
         listeners: None,
     };
 
-    let execution = panic::catch_unwind(AssertUnwindSafe(|| execute_isolated(&mut resources)))
+    let execution = panic::catch_unwind(AssertUnwindSafe(|| execute(&mut resources)))
         .unwrap_or_else(|payload| {
             Err(format!(
                 "local-OUTPUT TPROXY isolated execution panicked: {}",
@@ -1673,6 +1724,7 @@ fn mutation(
 #[derive(Debug, Clone)]
 struct RulePlan {
     family: AddressFamily,
+    expected_selectors: BTreeSet<(String, u16)>,
     program: String,
     output_chain: String,
     prerouting_chain: String,
@@ -1725,7 +1777,7 @@ impl RulePlan {
             }
         }
 
-        let expected = BTreeSet::from([("tcp".to_owned(), TCP_PORT), ("udp".to_owned(), UDP_PORT)]);
+        let expected = &self.expected_selectors;
         let mark_selectors = selector_set(
             self.output_rules
                 .iter()
@@ -1738,10 +1790,10 @@ impl RulePlan {
         )?;
         let prerouting_selectors = selector_set(self.prerouting_hooks.iter())?;
         let activation_selectors = selector_set(self.activation_hooks.iter())?;
-        if mark_selectors != expected
-            || tproxy_selectors != expected
-            || prerouting_selectors != expected
-            || activation_selectors != expected
+        if &mark_selectors != expected
+            || &tproxy_selectors != expected
+            || &prerouting_selectors != expected
+            || &activation_selectors != expected
         {
             return Err(format!(
                 "local-OUTPUT selector coverage differs: expected={expected:?} mark={mark_selectors:?} tproxy={tproxy_selectors:?} prerouting={prerouting_selectors:?} activation={activation_selectors:?}"
@@ -1752,14 +1804,15 @@ impl RulePlan {
             .iter()
             .rposition(|rule| rule_action(rule) == Some("DROP"))
             .ok_or_else(|| "local-OUTPUT chain has no terminal unexpected DROP".to_owned())?;
-        for (protocol, port) in [("tcp", TCP_PORT), ("udp", UDP_PORT)] {
+        for (protocol, port) in expected {
             let matching = |action: &str| {
                 self.output_rules
                     .iter()
                     .enumerate()
                     .filter(|(_, rule)| {
                         rule_action(rule) == Some(action)
-                            && rule_value_after(rule, &["-p", "--protocol"]) == Some(protocol)
+                            && rule_value_after(rule, &["-p", "--protocol"])
+                                == Some(protocol.as_str())
                             && rule_value_after(rule, &["--dport"])
                                 == Some(port.to_string().as_str())
                     })
@@ -2127,6 +2180,10 @@ fn rule_plan(config: &LocalOutputConfig, family: AddressFamily) -> RulePlan {
     };
     RulePlan {
         family,
+        expected_selectors: BTreeSet::from([
+            ("tcp".to_owned(), TCP_PORT),
+            ("udp".to_owned(), UDP_PORT),
+        ]),
         program: program.to_owned(),
         output_chain: output_chain.clone(),
         prerouting_chain: prerouting_chain.clone(),

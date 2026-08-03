@@ -7270,6 +7270,33 @@ pub(crate) mod tests {
         engine_snapshot_revision: NonZeroU64,
         engine_profile_revision: EngineCapabilityProfileRevision,
     ) -> CanaryAttemptRequest {
+        request_with_engine_profile_revision_and_duration(
+            spec,
+            families,
+            started_at,
+            nonce,
+            generation,
+            pid,
+            start_time_ticks,
+            engine_snapshot_revision,
+            engine_profile_revision,
+            Duration::from_secs(2),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn request_with_engine_profile_revision_and_duration(
+        spec: &EngineSpec,
+        families: CanaryAddressFamilies,
+        started_at: Instant,
+        nonce: CanaryNonce,
+        generation: GenerationId,
+        pid: NonZeroU32,
+        start_time_ticks: NonZeroU64,
+        engine_snapshot_revision: NonZeroU64,
+        engine_profile_revision: EngineCapabilityProfileRevision,
+        duration: Duration,
+    ) -> CanaryAttemptRequest {
         let listener_port = match spec.process().readiness {
             SingBoxReadiness::Listener { port } => port,
             SingBoxReadiness::TunInterface { .. } => {
@@ -7294,7 +7321,7 @@ pub(crate) mod tests {
         CanaryAttemptRequest::new(
             CanaryAttemptBinding::new(engine, environment),
             nonce,
-            CanaryDeadline::new(started_at, Duration::from_secs(2)).expect("valid deadline"),
+            CanaryDeadline::new(started_at, duration).expect("valid deadline"),
             families,
             counter_bounds(families),
         )

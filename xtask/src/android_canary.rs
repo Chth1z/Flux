@@ -792,6 +792,7 @@ fn android_test_build_command(linker: &Path, target: &AndroidTargetSpec) -> Comm
         "-p",
         "fluxd",
         "--lib",
+        "--release",
         "--target",
         target.rust_target,
         "--no-run",
@@ -809,6 +810,7 @@ fn android_credential_probe_build_command(linker: &Path, target: &AndroidTargetS
         "flux-platform",
         "--bin",
         CREDENTIAL_PROBE_TARGET_NAME,
+        "--release",
         "--target",
         target.rust_target,
         "--message-format=json-render-diagnostics",
@@ -2116,7 +2118,7 @@ mod tests {
     }
 
     #[test]
-    fn both_android_builds_use_exact_targets_and_matching_pinned_compilers() {
+    fn both_android_builds_use_exact_release_targets_and_matching_pinned_compilers() {
         for target in [&ARM64_TARGET, &X86_64_TARGET] {
             let linker_path = format!("/ndk/toolchains/llvm/bin/{}31-clang", target.clang_target);
             let linker = Path::new(&linker_path);
@@ -2128,6 +2130,7 @@ mod tests {
                         "-p",
                         "fluxd",
                         "--lib",
+                        "--release",
                         "--target",
                         target.rust_target,
                         "--no-run",
@@ -2142,6 +2145,7 @@ mod tests {
                         "flux-platform",
                         "--bin",
                         CREDENTIAL_PROBE_TARGET_NAME,
+                        "--release",
                         "--target",
                         target.rust_target,
                         "--message-format=json-render-diagnostics",

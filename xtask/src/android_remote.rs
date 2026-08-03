@@ -316,7 +316,7 @@ pub(super) fn process_absence_function(process_names: &[&str]) -> String {
         "probe_process_absent() {{\n\
            for COMM in /proc/[0-9]*/comm; do\n\
              [ -e \"$COMM\" ] || continue\n\
-             if ! NAME=$(/system/bin/cat \"$COMM\"); then\n\
+             if ! IFS= read -r NAME <\"$COMM\"; then\n\
                [ ! -e \"$COMM\" ] && continue\n\
                return 71\n\
              fi\n\
@@ -466,9 +466,11 @@ mod tests {
     }
 
     #[test]
-    fn process_absence_scan_distinguishes_read_failure_from_process_residue() {
+    fn process_absence_scan_avoids_per_process_forks_and_distinguishes_failures() {
         let function = process_absence_function(&["fluxd-test", "flux-cred-probe"]);
         assert!(function.contains("for COMM in /proc/[0-9]*/comm"));
+        assert!(function.contains("if ! IFS= read -r NAME <\"$COMM\"; then"));
+        assert!(!function.contains("/system/bin/cat \"$COMM\""));
         assert!(function.contains("for EXPECTED_PROCESS_NAME in 'fluxd-test' 'flux-cred-probe'"));
         assert!(function.contains("return 71"));
         assert!(function.contains("return 72"));

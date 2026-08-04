@@ -6,10 +6,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use flux_core::{
-    AndroidNetdSourceProfile, AndroidTproxyRoutingShape, AndroidTproxyTopologyScopeRequest,
-    AndroidTproxyTrafficDomainRequest, CaptureTrafficDomain, FluxConfig, FwmarkCandidate,
-    GenerationId, NetworkAddressFamily, NetworkInventory, Reason, RpdbFamilyPlacement,
-    RpdbPlacementRequest, RulePriority, RuleTableId, classify_android_rpdb,
+    AddressHostFamilySelection, AndroidNetdSourceProfile, AndroidTproxyRoutingShape,
+    AndroidTproxyTopologyScopeRequest, AndroidTproxyTrafficDomainRequest, CaptureTrafficDomain,
+    FluxConfig, FwmarkCandidate, GenerationId, NetworkAddressFamily, NetworkInventory, Reason,
+    RpdbFamilyPlacement, RpdbPlacementRequest, RulePriority, RuleTableId, classify_android_rpdb,
     plan_android_rpdb_placement,
 };
 #[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
@@ -27,16 +27,17 @@ use flux_platform::{
     XtablesLocalOutputRoutingSpec,
 };
 
-use crate::functional_canary::CanaryBindingError;
+use crate::functional_canary::{CanaryBindingError, CanaryFacilityIdentity};
 use crate::generation_engine_config::{
     AddressReconciledGenerationInputs, AddressReconciliationError, AddressReconciliationInspection,
     AdmittedGeneration, AdmittedGenerationIdentity, CapturePathDecision,
     CapturePathQualificationEvidenceError, DesiredStateCompileError, EngineCapabilityProfile,
     EngineCapabilityProfileError, EngineConfigCompileError, EngineConfigLaunchBinding,
     GenerationAssembler, GenerationAssemblyError, GenerationAssemblyRequest,
-    GenerationPlanningAuthority, SelectedEngineSource, TproxyEngineConfigRequest,
-    bind_engine_config_to_spec, collect_tproxy_engine_capability_profile,
-    compile_address_reconciliation, compile_tproxy_engine_config, read_bounded_regular_file,
+    GenerationPlanningAuthority, SelectedEngineSource, TproxyCanaryEngineRoute,
+    TproxyEngineConfigRequest, bind_engine_config_to_spec,
+    collect_tproxy_engine_capability_profile, compile_address_reconciliation,
+    compile_tproxy_engine_config, read_bounded_regular_file,
 };
 #[cfg(test)]
 use crate::generation_engine_config::{
@@ -550,6 +551,7 @@ where
     planning: P,
     admission: A,
     engine_profiles: Box<dyn EngineCapabilityProfileSource>,
+    canary_facility: Option<CanaryFacilityIdentity>,
     accepted_subscription: Option<ValidatedSubscriptionEngineConfig>,
     latest_capture_path_decision: Option<CapturePathDecision>,
     pending: Option<PendingGeneration>,
@@ -616,6 +618,7 @@ where
             planning,
             admission,
             engine_profiles,
+            canary_facility: None,
             accepted_subscription,
             latest_capture_path_decision: None,
             pending: None,
@@ -623,6 +626,20 @@ where
             retired_config_path: None,
             identity: PhantomData,
         }
+    }
+
+    /// Bind an already-validated facility without granting this source network mutation authority.
+    #[allow(
+        dead_code,
+        reason = "the serialized native facility owner supplies this value in the next checkpoint"
+    )]
+    #[must_use]
+    pub(crate) fn with_retained_canary_facility(
+        mut self,
+        facility: CanaryFacilityIdentity,
+    ) -> Self {
+        self.canary_facility = Some(facility);
+        self
     }
 
     fn prepare_current(
@@ -656,6 +673,7 @@ where
         NativeGenerationSourceError,
     > {
         let desired_state = inputs.desired_state();
+        let canary_route = self.required_canary_route(desired_state)?;
         if desired_state.subscription().enabled() {
             let subscription = self
                 .accepted_subscription
@@ -664,9 +682,20 @@ where
             if subscription.desired_state() != desired_state {
                 return Err(NativeGenerationSourceError::SelectedSourceDrift);
             }
-            let artifact = subscription
+            let stored_artifact = subscription
                 .reconstruct_artifact(desired_state.listener().port())
                 .map_err(NativeGenerationSourceError::EngineConfig)?;
+            let artifact = match canary_route {
+                Some(route) => compile_tproxy_engine_config(
+                    TproxyEngineConfigRequest::new(
+                        stored_artifact.bytes(),
+                        desired_state.listener().port(),
+                    )
+                    .with_canary_route(route),
+                )
+                .map_err(NativeGenerationSourceError::EngineConfig)?,
+                None => stored_artifact,
+            };
             return Ok((
                 SelectedEngineSource::subscription(
                     artifact,
@@ -684,12 +713,48 @@ where
                 source,
             }
         })?;
-        let artifact = compile_tproxy_engine_config(TproxyEngineConfigRequest::new(
-            &template,
-            desired_state.listener().port(),
-        ))
-        .map_err(NativeGenerationSourceError::EngineConfig)?;
+        let request = TproxyEngineConfigRequest::new(&template, desired_state.listener().port());
+        let request = match canary_route {
+            Some(route) => request.with_canary_route(route),
+            None => request,
+        };
+        let artifact = compile_tproxy_engine_config(request)
+            .map_err(NativeGenerationSourceError::EngineConfig)?;
         Ok((SelectedEngineSource::template(artifact), None))
+    }
+
+    fn required_canary_route(
+        &self,
+        desired_state: &FluxConfig,
+    ) -> Result<Option<TproxyCanaryEngineRoute>, NativeGenerationSourceError> {
+        if !desired_state.safety().require_functional_canary() {
+            return Ok(None);
+        }
+        let facility = self
+            .canary_facility
+            .ok_or(NativeGenerationSourceError::CanaryFacilityUnavailable)?;
+        let ipv6_peer = match desired_state.capture().scope().families() {
+            AddressHostFamilySelection::Ipv4 => None,
+            AddressHostFamilySelection::DualStack => Some(
+                facility
+                    .ipv6()
+                    .ok_or(NativeGenerationSourceError::CanaryBinding(
+                        CanaryBindingError::MissingIpv6Facility,
+                    ))?
+                    .peer(),
+            ),
+            AddressHostFamilySelection::Ipv6 => {
+                return Err(NativeGenerationSourceError::UnsupportedCanaryAddressFamilies);
+            }
+        };
+        let ports = facility.ports();
+        Ok(Some(TproxyCanaryEngineRoute::new(
+            facility.ipv4().peer(),
+            ipv6_peer,
+            ports.tcp_echo(),
+            ports.udp_echo(),
+            ports.dns(),
+        )))
     }
 
     fn prepare_candidate(
@@ -997,9 +1062,20 @@ where
         if config.desired_state() != inputs.desired_state() {
             return Err(NativeGenerationSourceError::SelectedSourceDrift);
         }
-        let artifact = config
+        let stored_artifact = config
             .reconstruct_artifact(inputs.desired_state().listener().port())
             .map_err(NativeGenerationSourceError::EngineConfig)?;
+        let artifact = match self.required_canary_route(inputs.desired_state())? {
+            Some(route) => compile_tproxy_engine_config(
+                TproxyEngineConfigRequest::new(
+                    stored_artifact.bytes(),
+                    inputs.desired_state().listener().port(),
+                )
+                .with_canary_route(route),
+            )
+            .map_err(NativeGenerationSourceError::EngineConfig)?,
+            None => stored_artifact,
+        };
         let selected = SelectedEngineSource::subscription(
             artifact,
             config.snapshot_digest(),
@@ -1103,6 +1179,8 @@ pub(crate) enum NativeGenerationSourceError {
     InventoryUnavailable,
     Address(AddressReconciliationError),
     SubscriptionUnavailable,
+    CanaryFacilityUnavailable,
+    UnsupportedCanaryAddressFamilies,
     SelectedSourceDrift,
     Template {
         path: PathBuf,
@@ -1133,6 +1211,11 @@ impl fmt::Display for NativeGenerationSourceError {
             Self::Address(source) => source.fmt(formatter),
             Self::SubscriptionUnavailable => formatter
                 .write_str("subscription-enabled Desired State has no accepted engine source"),
+            Self::CanaryFacilityUnavailable => formatter
+                .write_str("required functional-canary Generation has no retained native facility"),
+            Self::UnsupportedCanaryAddressFamilies => formatter.write_str(
+                "required functional-canary Generation supports IPv4 or dual-stack capture",
+            ),
             Self::SelectedSourceDrift => formatter.write_str(
                 "current Desired State differs from the selected engine-source transaction",
             ),
@@ -1180,6 +1263,8 @@ impl Error for NativeGenerationSourceError {
             Self::CanaryBinding(source) => Some(source),
             Self::InventoryUnavailable
             | Self::SubscriptionUnavailable
+            | Self::CanaryFacilityUnavailable
+            | Self::UnsupportedCanaryAddressFamilies
             | Self::SelectedSourceDrift
             | Self::UnsupportedEngineIdentity
             | Self::GenerationSequenceExhausted
@@ -1192,20 +1277,23 @@ impl Error for NativeGenerationSourceError {
 mod tests {
     use std::fs;
     use std::io;
-    use std::net::IpAddr;
-    use std::num::NonZeroU32;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use std::num::{NonZeroU16, NonZeroU32};
     use std::os::unix::fs::PermissionsExt;
     use std::sync::{Arc, Mutex};
 
     use flux_core::{
         CapabilityProfile, CapturePathQualifications, FwmarkCandidate, InterfaceAddressFlags,
-        InterfaceAddressRecord, InterfaceIndex, NetworkInventoryTracker, NetworkNamespaceIdentity,
-        RouteProtocol, RouteTableId, RulePriority, RuleProtocol,
+        InterfaceAddressRecord, InterfaceIndex, InterfaceName, NetworkInventoryTracker,
+        NetworkNamespaceIdentity, RouteProtocol, RouteTableId, RulePriority, RuleProtocol,
     };
     use flux_platform::{XtablesLocalOutputRoutingSpec, XtablesLocalOutputRoutingTarget};
     use flux_testkit::CapabilityProfileFixture;
 
     use super::*;
+    use crate::functional_canary::{
+        CanaryIpv4AddressPair, CanaryIpv6AddressPair, CanaryResponderPorts, CanaryVethIdentity,
+    };
     use crate::generation_engine_config::{
         CapturePathQualificationEvidence, HostInspectionPlanningAuthority,
         SelectedEngineSourceIdentity, qualified_xtables_capture_path_evidence,
@@ -1385,7 +1473,8 @@ esac
                 RecordingAdmission::default(),
                 accepted_subscription,
                 Box::new(InheritedEngineProfileSource),
-            );
+            )
+            .with_retained_canary_facility(test_canary_facility());
 
             Self {
                 _directory: directory,
@@ -1534,6 +1623,137 @@ esac
                 .supervised_delivery_report()
                 .expect("required native Generation retains the sealed report contract")
                 .is_canonical_schema_v1()
+        );
+    }
+
+    #[test]
+    fn required_template_and_subscription_sources_bind_the_retained_facility_route() {
+        for subscription_enabled in [false, true] {
+            let mut fixture = SourceFixture::new(subscription_enabled);
+            fixture.commit_initial();
+            let document: serde_json::Value = serde_json::from_slice(
+                &fs::read(fixture.generation_path(1)).expect("read routed Generation source"),
+            )
+            .expect("parse routed Generation source");
+
+            assert_eq!(
+                document["outbounds"][0],
+                serde_json::json!({"tag":"flux-canary-direct-v1","type":"direct"})
+            );
+            assert_eq!(
+                document["route"]["rules"][0],
+                serde_json::json!({
+                    "action":"route",
+                    "ip_cidr":["11.0.0.2/32"],
+                    "network":"tcp",
+                    "outbound":"flux-canary-direct-v1",
+                    "port":[41001,41003]
+                })
+            );
+            assert_eq!(
+                document["route"]["rules"][1],
+                serde_json::json!({
+                    "action":"route",
+                    "ip_cidr":["11.0.0.2/32"],
+                    "network":"udp",
+                    "outbound":"flux-canary-direct-v1",
+                    "port":[41002,41003]
+                })
+            );
+
+            if subscription_enabled {
+                let stored = fixture
+                    .source
+                    .accepted_subscription
+                    .as_ref()
+                    .expect("fixture retains its subscription source")
+                    .reconstruct_artifact(fixture.desired_state.listener().port())
+                    .expect("stored subscription identity remains valid");
+                assert!(
+                    !stored
+                        .bytes()
+                        .windows(b"flux-canary-direct-v1".len())
+                        .any(|window| window == b"flux-canary-direct-v1"),
+                    "the persisted subscription source remains route-disabled"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn required_source_without_a_retained_facility_fails_before_artifact_creation() {
+        let mut fixture = SourceFixture::new(false);
+        fixture.source.canary_facility = None;
+
+        let error = match fixture.source.prepare(Reason::Boot, None) {
+            Ok(_) => panic!("required source cannot prepare without a retained facility"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            NativeGenerationSourceError::CanaryFacilityUnavailable
+        ));
+        assert!(!fixture.generation_path(1).exists());
+        assert!(fixture.source.pending.is_none());
+    }
+
+    #[test]
+    fn required_route_matches_the_generation_address_families() {
+        let fixture = SourceFixture::new(false);
+        let dual_state = FluxConfig::parse(
+            &fs::read_to_string(&fixture.desired_state_path)
+                .expect("read fixture Desired State")
+                .replacen("ipv6 = false", "ipv6 = true", 1),
+        )
+        .expect("parse dual-stack Desired State");
+        let route = fixture
+            .source
+            .required_canary_route(&dual_state)
+            .expect("dual-stack facility satisfies dual-stack Generation")
+            .expect("required Generation has a route");
+        let artifact = compile_tproxy_engine_config(
+            TproxyEngineConfigRequest::new(b"{}", dual_state.listener().port())
+                .with_canary_route(route),
+        )
+        .expect("compile dual-stack Generation route");
+        let document: serde_json::Value =
+            serde_json::from_slice(artifact.bytes()).expect("parse dual-stack Generation route");
+
+        assert_eq!(
+            document["route"]["rules"][0]["ip_cidr"],
+            serde_json::json!(["11.0.0.2/32", "2001:4860::2/128"])
+        );
+    }
+
+    #[test]
+    fn structural_source_without_a_facility_preserves_route_disabled_output() {
+        let mut fixture = SourceFixture::new(false);
+        fixture.source.canary_facility = None;
+        let source = fs::read_to_string(&fixture.desired_state_path)
+            .expect("read fixture Desired State")
+            .replacen(
+                "require_functional_canary = true",
+                "require_functional_canary = false",
+                1,
+            );
+        fs::write(&fixture.desired_state_path, source).expect("disable the fixture canary gate");
+
+        let prepared = fixture
+            .source
+            .prepare(Reason::Boot, None)
+            .expect("structural source does not require a facility");
+        let bytes =
+            fs::read(fixture.generation_path(1)).expect("read structural Generation source");
+
+        assert_eq!(
+            prepared.runtime().functional_canary_mode(),
+            crate::functional_canary::FunctionalCanaryGateMode::StructuralVerificationOnly
+        );
+        assert!(
+            !bytes
+                .windows(b"flux-canary-direct-v1".len())
+                .any(|window| window == b"flux-canary-direct-v1")
         );
     }
 
@@ -1925,6 +2145,35 @@ esac
         ))
         .expect("compile subscription engine source");
         ValidatedSubscriptionEngineConfig::for_test(desired_state, artifact, digest, 1)
+    }
+
+    fn test_canary_facility() -> CanaryFacilityIdentity {
+        CanaryFacilityIdentity::new(
+            CanaryVethIdentity::new(
+                InterfaceIndex::new(101).expect("daemon veth index"),
+                InterfaceName::new(b"fluxc0").expect("daemon veth name"),
+            ),
+            CanaryVethIdentity::new(
+                InterfaceIndex::new(102).expect("peer veth index"),
+                InterfaceName::new(b"fluxp0").expect("peer veth name"),
+            ),
+            CanaryIpv4AddressPair::new(Ipv4Addr::new(11, 0, 0, 1), Ipv4Addr::new(11, 0, 0, 2))
+                .expect("test canary IPv4 pair"),
+            Some(
+                CanaryIpv6AddressPair::new(
+                    Ipv6Addr::new(0x2001, 0x4860, 0, 0, 0, 0, 0, 1),
+                    Ipv6Addr::new(0x2001, 0x4860, 0, 0, 0, 0, 0, 2),
+                )
+                .expect("test canary IPv6 pair"),
+            ),
+            CanaryResponderPorts::new(
+                NonZeroU16::new(41_001).expect("TCP responder port"),
+                NonZeroU16::new(41_002).expect("UDP responder port"),
+                NonZeroU16::new(41_003).expect("DNS responder port"),
+            )
+            .expect("test responder ports"),
+        )
+        .expect("test canary facility")
     }
 
     fn test_routing() -> XtablesLocalOutputRoutingSpec {

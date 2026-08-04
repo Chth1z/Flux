@@ -571,6 +571,11 @@ where
         let Some(prepared) = retained.runtime.prepared_canary_generation().cloned() else {
             return Ok(None);
         };
+        let facility = retained.runtime.retained_canary_facility().ok_or(
+            NativeCoordinatorWriterError::Invariant(
+                "native canary Generation has no route-bound retained facility",
+            ),
+        )?;
         let expected = expected.native_capture_target_identity().ok_or(
             NativeCoordinatorWriterError::Invariant(
                 "native canary facts were retained for a non-native capture identity",
@@ -587,7 +592,7 @@ where
             }
         };
         observation
-            .map(|observation| prepared.bind_active_ownership(expected, &observation))
+            .map(|observation| prepared.bind_active_ownership(expected, &observation, facility))
             .transpose()
             .map_err(|source| {
                 NativeCoordinatorWriterError::convergence(

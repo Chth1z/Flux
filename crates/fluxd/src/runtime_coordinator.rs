@@ -19,10 +19,11 @@ use crate::functional_canary::{
     ActiveCanaryGenerationBinding, AdmittedSupervisedDeliveryReportBinding, CanaryAddressFamilies,
     CanaryAttemptBinding, CanaryAttemptRequest, CanaryAttemptSocketObserverSession,
     CanaryCounterDeltaBounds, CanaryDeadline, CanaryEngineBinding, CanaryEnvironmentBinding,
-    CanaryNonce, FunctionalCanaryDisposition, FunctionalCanaryError, FunctionalCanaryGateMode,
-    InstalledSupervisedDeliveryReportProducer, PreparedCanaryGenerationBinding,
-    SupervisedDeliveryReportEngineHandoff, SupervisedDeliveryReportHandoffError,
-    UnqualifiedFunctionalCanaryExecution, UnqualifiedFunctionalCanaryExecutor,
+    CanaryFacilityIdentity, CanaryNonce, FunctionalCanaryDisposition, FunctionalCanaryError,
+    FunctionalCanaryGateMode, InstalledSupervisedDeliveryReportProducer,
+    PreparedCanaryGenerationBinding, SupervisedDeliveryReportEngineHandoff,
+    SupervisedDeliveryReportHandoffError, UnqualifiedFunctionalCanaryExecution,
+    UnqualifiedFunctionalCanaryExecutor,
 };
 use crate::generation_engine_config::{
     AddressReconciler, AddressReconciliationOutcome, CapturePathDecision, CapturePathSelection,
@@ -60,6 +61,7 @@ pub(crate) struct PreparedGeneration {
     capture_path_selection: CapturePathSelection,
     capture_path_evidence_deadline: Instant,
     prepared_canary_generation: Option<PreparedCanaryGenerationBinding>,
+    retained_canary_facility: Option<CanaryFacilityIdentity>,
 }
 
 impl PreparedGeneration {
@@ -82,6 +84,7 @@ impl PreparedGeneration {
             capture_path_selection,
             capture_path_evidence_deadline,
             prepared_canary_generation: None,
+            retained_canary_facility: None,
         };
         assert!(
             generation.functional_canary_mode() != FunctionalCanaryGateMode::RequiredUnqualified
@@ -133,6 +136,29 @@ impl PreparedGeneration {
         &self,
     ) -> Option<&PreparedCanaryGenerationBinding> {
         self.prepared_canary_generation.as_ref()
+    }
+
+    #[must_use]
+    pub(crate) fn with_retained_canary_facility(
+        mut self,
+        facility: CanaryFacilityIdentity,
+    ) -> Self {
+        assert_eq!(
+            self.functional_canary_mode,
+            FunctionalCanaryGateMode::RequiredUnqualified,
+            "only a required functional-canary Generation may retain a facility"
+        );
+        assert!(
+            self.retained_canary_facility.is_none(),
+            "a required functional-canary Generation may retain only one facility"
+        );
+        self.retained_canary_facility = Some(facility);
+        self
+    }
+
+    #[must_use]
+    pub(crate) const fn retained_canary_facility(&self) -> Option<CanaryFacilityIdentity> {
+        self.retained_canary_facility
     }
 
     const fn runtime_binding(&self) -> RuntimeGenerationBinding {

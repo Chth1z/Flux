@@ -1713,6 +1713,7 @@ impl PreparedCanaryGenerationBinding {
         &self,
         expected_target: NativeCaptureTargetIdentity,
         observation: &NativeCaptureOwnershipObservation,
+        retained_facility: CanaryFacilityIdentity,
     ) -> Result<ActiveCanaryGenerationBinding, CanaryBindingError> {
         if expected_target.generation() != self.generation
             || observation.target() != expected_target
@@ -1746,6 +1747,7 @@ impl PreparedCanaryGenerationBinding {
             network_epoch: self.network_epoch,
             network_inventory_snapshot_id: self.network_inventory_snapshot_id,
             capture_program_digest: self.capture_program_digest,
+            retained_facility,
             ownership: CanaryOwnershipBinding::new(
                 observation.journal_identity(),
                 observation.journal_revision(),
@@ -1765,6 +1767,7 @@ pub(crate) struct ActiveCanaryGenerationBinding {
     network_epoch: NetworkEpoch,
     network_inventory_snapshot_id: NetworkInventorySnapshotId,
     capture_program_digest: CaptureProgramDigest,
+    retained_facility: CanaryFacilityIdentity,
     ownership: CanaryOwnershipBinding,
 }
 
@@ -1783,6 +1786,7 @@ impl ActiveCanaryGenerationBinding {
             && self.network_epoch == authority.network.network_epoch
             && self.network_inventory_snapshot_id == authority.network.network_inventory_snapshot_id
             && self.capture_program_digest == authority.capture_program_digest
+            && self.retained_facility == environment.facility
             && self.ownership == authority.ownership
             && self.generation == authority.ownership.capture_owner.generation
     }
@@ -1799,6 +1803,7 @@ impl ActiveCanaryGenerationBinding {
             network_epoch: authority.network.network_epoch,
             network_inventory_snapshot_id: authority.network.network_inventory_snapshot_id,
             capture_program_digest: authority.capture_program_digest,
+            retained_facility: environment.facility,
             ownership: authority.ownership.clone(),
         }
     }
@@ -5452,6 +5457,9 @@ pub(crate) mod tests {
         revision.ownership.journal_revision =
             OwnershipJournalRevision::new(2).expect("alternate journal revision");
 
+        let mut facility = binding.clone();
+        facility.retained_facility.ipv4.peer = Ipv4Addr::new(11, 0, 0, 3);
+
         let mut capture_owner = binding;
         capture_owner.ownership.capture_owner.digest =
             CaptureOwnerRecordDigest::new([15; CAPTURE_OWNER_RECORD_DIGEST_BYTES])
@@ -5467,6 +5475,7 @@ pub(crate) mod tests {
             ("Capture Program", capture_program),
             ("ownership journal", journal),
             ("ownership journal revision", revision),
+            ("retained canary facility", facility),
             ("capture owner record", capture_owner),
         ] {
             assert!(

@@ -868,6 +868,13 @@ where
         let prepared_canary_generation = admitted
             .prepared_canary_generation_binding()
             .map_err(NativeGenerationSourceError::CanaryBinding)?;
+        let retained_canary_facility = match functional_canary_mode {
+            crate::functional_canary::FunctionalCanaryGateMode::RequiredUnqualified => Some(
+                self.canary_facility
+                    .ok_or(NativeGenerationSourceError::CanaryFacilityUnavailable)?,
+            ),
+            crate::functional_canary::FunctionalCanaryGateMode::StructuralVerificationOnly => None,
+        };
         let target = self
             .admission
             .admit(admitted)
@@ -880,19 +887,21 @@ where
             config_path,
             subscription,
         });
-        Ok(PreparedNativeGeneration::new(
-            PreparedGeneration::new(
-                expected_generation,
-                spec,
-                engine_profile_revision,
-                functional_canary_mode,
-                supervised_delivery_report,
-                capture_path_selection,
-                capture_path_evidence_deadline,
-            )
-            .with_prepared_canary_generation(prepared_canary_generation),
-            target,
-        ))
+        let runtime = PreparedGeneration::new(
+            expected_generation,
+            spec,
+            engine_profile_revision,
+            functional_canary_mode,
+            supervised_delivery_report,
+            capture_path_selection,
+            capture_path_evidence_deadline,
+        )
+        .with_prepared_canary_generation(prepared_canary_generation);
+        let runtime = match retained_canary_facility {
+            Some(facility) => runtime.with_retained_canary_facility(facility),
+            None => runtime,
+        };
+        Ok(PreparedNativeGeneration::new(runtime, target))
     }
 
     fn require_prior(&self, prior: Option<I>) -> Result<(), NativeGenerationSourceError> {
@@ -1630,11 +1639,16 @@ esac
     fn required_template_and_subscription_sources_bind_the_retained_facility_route() {
         for subscription_enabled in [false, true] {
             let mut fixture = SourceFixture::new(subscription_enabled);
-            fixture.commit_initial();
+            let prepared = fixture.commit_initial();
             let document: serde_json::Value = serde_json::from_slice(
                 &fs::read(fixture.generation_path(1)).expect("read routed Generation source"),
             )
             .expect("parse routed Generation source");
+
+            assert_eq!(
+                prepared.runtime().retained_canary_facility(),
+                Some(test_canary_facility())
+            );
 
             assert_eq!(
                 document["outbounds"][0],
@@ -1750,6 +1764,7 @@ esac
             prepared.runtime().functional_canary_mode(),
             crate::functional_canary::FunctionalCanaryGateMode::StructuralVerificationOnly
         );
+        assert_eq!(prepared.runtime().retained_canary_facility(), None);
         assert!(
             !bytes
                 .windows(b"flux-canary-direct-v1".len())

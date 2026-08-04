@@ -20,7 +20,7 @@ use super::*;
 use serde_json::Value;
 use std::sync::mpsc::{self, Receiver, Sender};
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", test))]
 mod supervised_producer;
 
 const TEST_NAME: &str = "functional_canary::linux_namespace_harness::privileged_local_output_tproxy_checkpoint_exercises_loopback_reinjection_and_cleanup";

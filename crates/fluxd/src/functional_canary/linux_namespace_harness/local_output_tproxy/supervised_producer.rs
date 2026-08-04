@@ -12,7 +12,9 @@ use flux_platform::internal::{PinnedSingBoxLaunch, SingBoxChild, SingBoxProcessA
 use flux_platform::{SeqpacketReceive, SingBoxLaunchSpec, SingBoxPrivilege, SingBoxReadiness};
 
 use crate::functional_canary::supervised_delivery_report::collector;
-use crate::functional_canary::tests::request_with_engine_profile_revision_and_duration;
+use crate::functional_canary::tests::{
+    fixture_responder_ports, request_with_engine_profile_revision_and_duration,
+};
 use crate::functional_canary::{
     CanaryAddressFamilies, CanaryAttemptRequest, CanaryFlow, CanaryFlowKind, CanaryFlowProtocol,
     CanaryFlowTuple, CanaryNonce, FUNCTIONAL_CANARY_FLOW_SLOTS, FUNCTIONAL_CANARY_NONCE_BYTES,
@@ -26,7 +28,6 @@ use crate::generation_engine_config::{
 use crate::{EngineSpec, RestartPolicy};
 
 const PRODUCER_BINARY_ENV: &str = "FLUX_TEST_SING_BOX_PRODUCER_BINARY";
-const DNS_PORT: u16 = 41_003;
 const EXPECTED_TCP_SINK_FLOWS: usize = 4;
 const EXPECTED_UDP_SINK_FLOWS: usize = 4;
 const SINK_TIMEOUT: Duration = Duration::from_secs(10);
@@ -74,7 +75,7 @@ pub(super) fn execute(resources: &mut LocalOutputResources) -> Result<(), String
     let sinks = prepared.start_sinks()?;
     let mut producer = prepared.spawn()?;
     producer.wait_ready()?;
-    exercise_attempt_lifecycle(&resources.config, &producer.fixture, producer.child())?;
+    exercise_attempt_lifecycle(&resources.config, producer.fixture, producer.child())?;
 
     validate_supervised_counters(&comments, CounterExpectation::Positive)?;
     sinks.join()?;
@@ -647,11 +648,12 @@ struct SupervisedFamilyComments {
 impl SupervisedFamilyComments {
     fn new(family: &str, suffix: &str) -> Self {
         let prefix = format!("sp{family}{suffix}");
+        let ports = fixture_responder_ports();
         let selectors = [
-            ("tcp", TCP_PORT, "te"),
-            ("udp", UDP_PORT, "ue"),
-            ("udp", DNS_PORT, "du"),
-            ("tcp", DNS_PORT, "dt"),
+            ("tcp", ports.tcp_echo().get(), "te"),
+            ("udp", ports.udp_echo().get(), "ue"),
+            ("udp", ports.dns().get(), "du"),
+            ("tcp", ports.dns().get(), "dt"),
         ]
         .into_iter()
         .map(|(protocol, port, tag)| SelectorCounterComments {
@@ -972,4 +974,29 @@ fn validate_supervised_counters(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn supervised_selectors_match_fixture_responder_ports() {
+        let ports = fixture_responder_ports();
+        let comments = SupervisedFamilyComments::new("4", "12345678");
+        let observed = comments
+            .selectors
+            .iter()
+            .map(|selector| (selector.protocol, selector.port))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            observed,
+            vec![
+                ("tcp", ports.tcp_echo().get()),
+                ("udp", ports.udp_echo().get()),
+                ("udp", ports.dns().get()),
+                ("tcp", ports.dns().get()),
+            ]
+        );
+    }
 }

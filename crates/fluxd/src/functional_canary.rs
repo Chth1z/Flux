@@ -7343,6 +7343,15 @@ pub(crate) mod tests {
         .expect("ordered canary counter bounds")
     }
 
+    pub(crate) fn fixture_responder_ports() -> CanaryResponderPorts {
+        CanaryResponderPorts::new(
+            NonZeroU16::new(41_001).expect("TCP responder port"),
+            NonZeroU16::new(41_002).expect("UDP responder port"),
+            NonZeroU16::new(41_003).expect("DNS responder port"),
+        )
+        .expect("same-protocol responder ports are distinct")
+    }
+
     fn environment(
         generation: GenerationId,
         nonce: CanaryNonce,
@@ -7372,12 +7381,7 @@ pub(crate) mod tests {
                 )
                 .expect("distinct IPv6 addresses"),
             ),
-            CanaryResponderPorts::new(
-                NonZeroU16::new(41_001).expect("TCP responder port"),
-                NonZeroU16::new(41_002).expect("UDP responder port"),
-                NonZeroU16::new(41_003).expect("DNS responder port"),
-            )
-            .expect("same-protocol responder ports are distinct"),
+            fixture_responder_ports(),
         )
         .expect("valid facility");
         let admission = CanaryFacilityAdmissionToken::new(

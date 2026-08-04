@@ -757,7 +757,7 @@ pub(crate) struct EngineSupervisedDeliveryReportContract {
 }
 
 impl EngineSupervisedDeliveryReportContract {
-    const fn canonical_schema_v1() -> Self {
+    pub(super) const fn canonical_schema_v1() -> Self {
         Self {
             schema_version: NonZeroU16::MIN,
             handoff_schema_version: NonZeroU16::MIN,

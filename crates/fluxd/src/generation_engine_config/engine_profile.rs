@@ -15,6 +15,10 @@ pub(crate) const ENGINE_CAPABILITY_PROFILE_SCHEMA_VERSION: u16 = 3;
 
 const ENGINE_CAPABILITY_PROFILE_DIGEST_DOMAIN: &[u8] =
     b"Flux Sing-Box Engine Capability Profile\0sha256-v3\0";
+const MANIFEST_BOUND_ANDROID_SUPERVISED_PRODUCER_SHA256: [u8; ENGINE_CONFIG_DIGEST_BYTES] = [
+    0x5f, 0x45, 0x57, 0x01, 0xbf, 0xf0, 0xda, 0x57, 0xf9, 0x39, 0xd3, 0x67, 0xa4, 0xa5, 0x47, 0x68,
+    0x3a, 0x14, 0x5c, 0xca, 0x4e, 0x58, 0xea, 0x63, 0x6f, 0x79, 0x4e, 0xe2, 0x4d, 0x85, 0x63, 0xbf,
+];
 const SING_BOX_VERSION_PREFIX: &str = "sing-box version ";
 const MAX_SING_BOX_RELEASE_BYTES: usize = 128;
 
@@ -90,7 +94,8 @@ impl SingBoxBuildIdentity {
 ///
 /// Schema 3 proves parsed exact-build identity and descriptor-pinned acceptance of the exact config
 /// binding, and explicitly records whether the artifact claims the sealed supervised-report
-/// contract. Production collection currently leaves that capability absent.
+/// contract. Production collection declares that contract only for the manifest-bound Android
+/// producer artifact; version output alone cannot qualify it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct EngineCapabilityProfile {
     artifacts: EngineArtifactSetIdentity,
@@ -257,13 +262,22 @@ pub(crate) fn collect_tproxy_engine_capability_profile(
     debug_assert_eq!(probe.artifacts(), binding.artifacts());
     let (version, build) =
         parse_sing_box_version_output(probe.version_stdout(), probe.version_stderr())?;
+    let supervised_delivery_report =
+        supervised_delivery_report_contract_for_binary(probe.artifacts().binary().as_bytes());
     Ok(EngineCapabilityProfile::from_parts(
         probe.artifacts(),
         binding.digest(),
         version,
         build,
-        None,
+        supervised_delivery_report,
     ))
+}
+
+fn supervised_delivery_report_contract_for_binary(
+    binary_sha256: &[u8; ENGINE_CONFIG_DIGEST_BYTES],
+) -> Option<EngineSupervisedDeliveryReportContract> {
+    (*binary_sha256 == MANIFEST_BOUND_ANDROID_SUPERVISED_PRODUCER_SHA256)
+        .then(EngineSupervisedDeliveryReportContract::canonical_schema_v1)
 }
 
 #[cfg(test)]
@@ -456,4 +470,78 @@ fn digest_engine_capability_profile(
 fn update_length_prefixed(digest: &mut Sha256, bytes: &[u8]) {
     digest.update(length_bytes(bytes.len()));
     digest.update(bytes);
+}
+
+#[cfg(test)]
+mod qualified_artifact_tests {
+    use super::*;
+
+    const PRODUCER_MANIFEST: &str = include_str!("../../../../engine/sing-box/manifest.toml");
+
+    #[test]
+    fn production_report_contract_requires_the_manifest_bound_android_artifact() {
+        let manifest: toml::Value =
+            toml::from_str(PRODUCER_MANIFEST).expect("parse producer manifest");
+        let artifacts = manifest
+            .get("artifacts")
+            .and_then(toml::Value::as_array)
+            .expect("producer manifest artifact array");
+        let android = artifacts
+            .iter()
+            .find(|artifact| {
+                artifact.get("target").and_then(toml::Value::as_str) == Some("android-arm64")
+            })
+            .expect("manifest-bound Android artifact");
+        let linux = artifacts
+            .iter()
+            .find(|artifact| {
+                artifact.get("target").and_then(toml::Value::as_str) == Some("linux-amd64")
+            })
+            .expect("manifest-bound Linux artifact");
+        let compiled_digest = MANIFEST_BOUND_ANDROID_SUPERVISED_PRODUCER_SHA256
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+
+        assert_eq!(
+            android.get("sha256").and_then(toml::Value::as_str),
+            Some(compiled_digest.as_str())
+        );
+        assert!(
+            supervised_delivery_report_contract_for_binary(
+                &MANIFEST_BOUND_ANDROID_SUPERVISED_PRODUCER_SHA256
+            )
+            .is_some_and(EngineSupervisedDeliveryReportContract::is_canonical_schema_v1)
+        );
+
+        let linux_digest = decode_sha256(
+            linux
+                .get("sha256")
+                .and_then(toml::Value::as_str)
+                .expect("Linux artifact SHA-256"),
+        );
+        assert_eq!(
+            supervised_delivery_report_contract_for_binary(&linux_digest),
+            None
+        );
+        for index in 0..ENGINE_CONFIG_DIGEST_BYTES {
+            let mut changed = MANIFEST_BOUND_ANDROID_SUPERVISED_PRODUCER_SHA256;
+            changed[index] ^= 1;
+            assert_eq!(
+                supervised_delivery_report_contract_for_binary(&changed),
+                None,
+                "digest mismatch at byte {index} must not declare the report contract"
+            );
+        }
+    }
+
+    fn decode_sha256(encoded: &str) -> [u8; ENGINE_CONFIG_DIGEST_BYTES] {
+        assert_eq!(encoded.len(), ENGINE_CONFIG_DIGEST_BYTES * 2);
+        let mut decoded = [0; ENGINE_CONFIG_DIGEST_BYTES];
+        for (index, byte) in decoded.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&encoded[index * 2..index * 2 + 2], 16)
+                .expect("lowercase hexadecimal SHA-256");
+        }
+        decoded
+    }
 }

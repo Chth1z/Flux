@@ -26,6 +26,7 @@ libc.workspace = true
 [dev-dependencies]
 flux-testkit = { path = "../flux-testkit" }
 tempfile = "3"
+toml.workspace = true
 
 [[bin]]
 name = "flux-native-composition-engine"

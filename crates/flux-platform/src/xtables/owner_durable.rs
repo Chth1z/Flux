@@ -4,6 +4,7 @@ use std::fmt;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::mem::MaybeUninit;
+use std::num::NonZeroU64;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
@@ -29,6 +30,7 @@ pub(crate) const MAX_NATIVE_XTABLES_DURABLE_RECORD_BYTES: usize = 16 * 1024;
 pub(crate) const MAX_NATIVE_XTABLES_TARGET_ARCHIVE_BYTES: usize = 12 * 1024 * 1024;
 
 const JOURNAL_MAGIC: &str = "flux-native-xtables-journal-v1";
+pub(crate) const NATIVE_XTABLES_JOURNAL_SCHEMA_VERSION: u16 = 1;
 const LEASE_MAGIC: &str = "flux-native-xtables-lease-v1";
 const WRITER_OWNER_MAGIC: &str = "flux-native-xtables-writer-owner-v1";
 const COMPONENT_NAME: &str = "native_xtables";
@@ -197,6 +199,37 @@ pub(crate) struct NativeXtablesJournalRecord {
     revision: OwnershipJournalRevision,
     phase: NativeXtablesJournalPhase,
     owner_payload: NativeXtablesOwnerPayload,
+}
+
+/// Exact bytes and descriptor identity used to parse one durable journal record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NativeXtablesJournalObservation {
+    record: NativeXtablesJournalRecord,
+    file_device: u64,
+    file_inode: NonZeroU64,
+    digest: [u8; CHECKSUM_BYTES],
+}
+
+impl NativeXtablesJournalObservation {
+    #[must_use]
+    pub(crate) const fn record(&self) -> &NativeXtablesJournalRecord {
+        &self.record
+    }
+
+    #[must_use]
+    pub(crate) const fn file_device(&self) -> u64 {
+        self.file_device
+    }
+
+    #[must_use]
+    pub(crate) const fn file_inode(&self) -> NonZeroU64 {
+        self.file_inode
+    }
+
+    #[must_use]
+    pub(crate) const fn digest(&self) -> [u8; CHECKSUM_BYTES] {
+        self.digest
+    }
 }
 
 impl NativeXtablesJournalRecord {
@@ -673,6 +706,15 @@ impl NativeXtablesDurableStore {
             return Ok(None);
         };
         read_journal(&root)
+    }
+
+    pub(crate) fn observe_journal(
+        &self,
+    ) -> Result<Option<NativeXtablesJournalObservation>, NativeXtablesDurableError> {
+        let Some(root) = open_root(&self.root, false)? else {
+            return Ok(None);
+        };
+        read_journal_observation(&root)
     }
 
     pub(crate) fn load_lease(
@@ -1647,6 +1689,27 @@ fn read_journal(
     .transpose()
 }
 
+fn read_journal_observation(
+    root: &File,
+) -> Result<Option<NativeXtablesJournalObservation>, NativeXtablesDurableError> {
+    let Some(observation) = read_record_bounded_observation(
+        root,
+        NATIVE_XTABLES_JOURNAL_FILE_NAME,
+        DurableArtifact::Journal,
+        MAX_NATIVE_XTABLES_DURABLE_RECORD_BYTES,
+    )?
+    else {
+        return Ok(None);
+    };
+    let record = parse_journal(&observation.encoded)?;
+    Ok(Some(NativeXtablesJournalObservation {
+        record,
+        file_device: observation.file_device,
+        file_inode: observation.file_inode,
+        digest: Sha256::digest(&observation.encoded).into(),
+    }))
+}
+
 fn read_lease(root: &File) -> Result<Option<NativeXtablesLeaseScope>, NativeXtablesDurableError> {
     read_record(root, NATIVE_XTABLES_LEASE_FILE_NAME, DurableArtifact::Lease)?
         .map(|encoded| parse_lease(&encoded))
@@ -1672,6 +1735,22 @@ fn read_record_bounded(
     artifact: DurableArtifact,
     maximum_bytes: usize,
 ) -> Result<Option<Vec<u8>>, NativeXtablesDurableError> {
+    read_record_bounded_observation(root, name, artifact, maximum_bytes)
+        .map(|observation| observation.map(|observation| observation.encoded))
+}
+
+struct DurableRecordObservation {
+    encoded: Vec<u8>,
+    file_device: u64,
+    file_inode: NonZeroU64,
+}
+
+fn read_record_bounded_observation(
+    root: &File,
+    name: &str,
+    artifact: DurableArtifact,
+    maximum_bytes: usize,
+) -> Result<Option<DurableRecordObservation>, NativeXtablesDurableError> {
     let name = static_c_string(name);
     let path = durable_child_path(root, name.as_c_str());
     match entry_kind(root.as_raw_fd(), &name).map_err(|source| {
@@ -1699,6 +1778,8 @@ fn read_record_bounded(
     let metadata = file.metadata().map_err(|source| {
         NativeXtablesDurableError::io("inspect native xtables durable record", source)
     })?;
+    let file_inode = NonZeroU64::new(metadata.ino())
+        .ok_or_else(|| invalid_record(artifact, "record inode is zero"))?;
     let actual = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
     if actual > maximum_bytes {
         return Err(NativeXtablesDurableError::RecordTooLarge {
@@ -1718,7 +1799,11 @@ fn read_record_bounded(
         NativeXtablesDurableError::io("read native xtables durable record", source)
     })?;
     ensure_record_bound_with_limit(&encoded, artifact, maximum_bytes)?;
-    Ok(Some(encoded))
+    Ok(Some(DurableRecordObservation {
+        encoded,
+        file_device: metadata.dev(),
+        file_inode,
+    }))
 }
 
 fn atomic_write(

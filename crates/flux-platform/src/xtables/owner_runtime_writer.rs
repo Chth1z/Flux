@@ -38,8 +38,9 @@ use crate::xtables::owner_durable::{
 };
 use crate::xtables::{
     NativeCaptureConvergedState, NativeCaptureConvergence, NativeCaptureConvergenceReport,
-    NativeCaptureDesired, NativeCaptureTargetIdentity, XtablesCaptureArtifactSet,
-    XtablesLocalOutputRoutingSpec, XtablesLocalOutputRoutingTarget, XtablesRestoreFamily,
+    NativeCaptureDesired, NativeCaptureOwnershipObservation, NativeCaptureTargetIdentity,
+    XtablesCaptureArtifactSet, XtablesLocalOutputRoutingSpec, XtablesLocalOutputRoutingTarget,
+    XtablesRestoreFamily,
 };
 
 const NATIVE_ROUTE_METRIC: u32 = 1_024;
@@ -1159,6 +1160,14 @@ impl NativeCaptureConvergence for NativeXtablesCaptureConverger {
             .map_err(|source| NativeXtablesCaptureConvergenceError { source })
     }
 
+    fn observe_active_ownership(
+        &mut self,
+    ) -> Result<Option<NativeCaptureOwnershipObservation>, Self::Error> {
+        self.inner
+            .observe_active_ownership()
+            .map_err(|source| NativeXtablesCaptureConvergenceError { source })
+    }
+
     fn converge(
         &mut self,
         desired: NativeCaptureDesired<Self::Target>,
@@ -1260,6 +1269,22 @@ where
             return Err(source);
         }
         Ok(report)
+    }
+
+    pub(crate) fn observe_active_ownership(
+        &mut self,
+    ) -> Result<Option<NativeCaptureOwnershipObservation>, NativeXtablesRuntimeWriterError> {
+        if !self.recovered {
+            return Err(NativeXtablesRuntimeWriterError::RecoveryRequired);
+        }
+        let _transaction = self.begin_transaction()?;
+        match self.owner.observe_active_ownership() {
+            Ok(observation) => Ok(observation),
+            Err(source) => {
+                self.recovered = false;
+                Err(NativeXtablesRuntimeWriterError::Owner(Box::new(source)))
+            }
+        }
     }
 
     fn begin_transaction(

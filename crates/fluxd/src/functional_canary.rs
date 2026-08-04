@@ -11,11 +11,13 @@ use flux_core::{
     NetworkEpoch, NetworkInventorySnapshotId, NetworkNamespaceIdentity, OwnershipJournalIdentity,
     OwnershipJournalRevision, RouteTableId, RulePriority,
 };
-use flux_platform::ReadinessEvidence;
 use flux_platform::socket_diagnostics::{
     CorrelatedProcessSocket, InetSocketProtocol, ProcessSocketDiagnostics, SocketCorrelationError,
     SocketDiagnosticsError, SocketDiagnosticsErrorKind, SystemSocketDiagnosticsSession,
     SystemSocketDiagnosticsSource,
+};
+use flux_platform::{
+    NativeCaptureOwnershipObservation, NativeCaptureTargetIdentity, ReadinessEvidence,
 };
 use sha2::{Digest, Sha256};
 
@@ -195,6 +197,11 @@ pub(crate) enum CanaryBindingError {
     AllZeroCaptureOwnerRecordDigest,
     CaptureOwnerGenerationMismatch,
     CaptureOwnerBootMismatch,
+    ActiveCaptureTargetMismatch,
+    ActiveCaptureBootMismatch,
+    ActiveCaptureNetworkNamespaceMismatch,
+    ActiveCaptureJournalIdentityMismatch,
+    ActiveCaptureJournalRevisionNotAdvanced,
     AllZeroAttemptObjectIdentity,
     AttemptObjectIdentityCollision,
     AttemptObjectGenerationMismatch,
@@ -1651,6 +1658,149 @@ impl CanaryEnvironmentAuthorityBinding {
     #[must_use]
     pub(crate) const fn ownership(&self) -> &CanaryOwnershipBinding {
         &self.ownership
+    }
+}
+
+/// Immutable native facts retained when a Generation is admitted.
+///
+/// This value is planning evidence only. It cannot become canary authority until the native writer
+/// combines it with a fresh exact active-ownership observation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PreparedCanaryGenerationBinding {
+    generation: GenerationId,
+    boot_identity: BootIdentity,
+    capability_profile_revision: CapabilityProfileRevision,
+    daemon_network_namespace: NetworkNamespaceIdentity,
+    network_epoch: NetworkEpoch,
+    network_inventory_snapshot_id: NetworkInventorySnapshotId,
+    capture_program_digest: CaptureProgramDigest,
+    journal_identity: OwnershipJournalIdentity,
+    planning_journal_revision: OwnershipJournalRevision,
+}
+
+impl PreparedCanaryGenerationBinding {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        generation: GenerationId,
+        boot_identity: BootIdentity,
+        capability_profile_revision: CapabilityProfileRevision,
+        daemon_network_namespace: NetworkNamespaceIdentity,
+        network_epoch: NetworkEpoch,
+        network_inventory_snapshot_id: NetworkInventorySnapshotId,
+        capture_program_digest: [u8; CAPTURE_PROGRAM_DIGEST_BYTES],
+        journal_identity: OwnershipJournalIdentity,
+        planning_journal_revision: OwnershipJournalRevision,
+    ) -> Result<Self, CanaryBindingError> {
+        Ok(Self {
+            generation,
+            boot_identity,
+            capability_profile_revision,
+            daemon_network_namespace,
+            network_epoch,
+            network_inventory_snapshot_id,
+            capture_program_digest: CaptureProgramDigest::new(capture_program_digest)?,
+            journal_identity,
+            planning_journal_revision,
+        })
+    }
+
+    #[must_use]
+    pub(crate) const fn generation(&self) -> GenerationId {
+        self.generation
+    }
+
+    pub(crate) fn bind_active_ownership(
+        &self,
+        expected_target: NativeCaptureTargetIdentity,
+        observation: &NativeCaptureOwnershipObservation,
+    ) -> Result<ActiveCanaryGenerationBinding, CanaryBindingError> {
+        if expected_target.generation() != self.generation
+            || observation.target() != expected_target
+        {
+            return Err(CanaryBindingError::ActiveCaptureTargetMismatch);
+        }
+        if observation.boot_identity() != &self.boot_identity {
+            return Err(CanaryBindingError::ActiveCaptureBootMismatch);
+        }
+        if observation.network_namespace() != self.daemon_network_namespace {
+            return Err(CanaryBindingError::ActiveCaptureNetworkNamespaceMismatch);
+        }
+        if observation.journal_identity() != self.journal_identity {
+            return Err(CanaryBindingError::ActiveCaptureJournalIdentityMismatch);
+        }
+        if observation.journal_revision() <= self.planning_journal_revision {
+            return Err(CanaryBindingError::ActiveCaptureJournalRevisionNotAdvanced);
+        }
+        let capture_owner = CaptureOwnerRecordBinding::new(
+            observation.record_schema_version(),
+            observation.boot_identity().clone(),
+            self.generation,
+            CanaryFileIdentity::new(observation.record_device(), observation.record_inode()),
+            CaptureOwnerRecordDigest::new(observation.record_digest())?,
+        );
+        Ok(ActiveCanaryGenerationBinding {
+            generation: self.generation,
+            boot_identity: self.boot_identity.clone(),
+            capability_profile_revision: self.capability_profile_revision,
+            daemon_network_namespace: self.daemon_network_namespace,
+            network_epoch: self.network_epoch,
+            network_inventory_snapshot_id: self.network_inventory_snapshot_id,
+            capture_program_digest: self.capture_program_digest,
+            ownership: CanaryOwnershipBinding::new(
+                observation.journal_identity(),
+                observation.journal_revision(),
+                capture_owner,
+            ),
+        })
+    }
+}
+
+/// Fresh active native ownership combined with the immutable admitted Generation facts.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ActiveCanaryGenerationBinding {
+    generation: GenerationId,
+    boot_identity: BootIdentity,
+    capability_profile_revision: CapabilityProfileRevision,
+    daemon_network_namespace: NetworkNamespaceIdentity,
+    network_epoch: NetworkEpoch,
+    network_inventory_snapshot_id: NetworkInventorySnapshotId,
+    capture_program_digest: CaptureProgramDigest,
+    ownership: CanaryOwnershipBinding,
+}
+
+impl ActiveCanaryGenerationBinding {
+    #[must_use]
+    pub(crate) const fn generation(&self) -> GenerationId {
+        self.generation
+    }
+
+    #[must_use]
+    pub(crate) fn matches_environment(&self, environment: &CanaryEnvironmentBinding) -> bool {
+        let authority = environment.authority();
+        self.boot_identity == authority.boot_identity
+            && self.capability_profile_revision == authority.capability_profile_revision
+            && self.daemon_network_namespace == authority.network.daemon_network_namespace
+            && self.network_epoch == authority.network.network_epoch
+            && self.network_inventory_snapshot_id == authority.network.network_inventory_snapshot_id
+            && self.capture_program_digest == authority.capture_program_digest
+            && self.ownership == authority.ownership
+            && self.generation == authority.ownership.capture_owner.generation
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn from_environment_fixture(environment: &CanaryEnvironmentBinding) -> Self {
+        let authority = environment.authority();
+        Self {
+            generation: authority.ownership.capture_owner.generation,
+            boot_identity: authority.boot_identity.clone(),
+            capability_profile_revision: authority.capability_profile_revision,
+            daemon_network_namespace: authority.network.daemon_network_namespace,
+            network_epoch: authority.network.network_epoch,
+            network_inventory_snapshot_id: authority.network.network_inventory_snapshot_id,
+            capture_program_digest: authority.capture_program_digest,
+            ownership: authority.ownership.clone(),
+        }
     }
 }
 
@@ -5089,6 +5239,73 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn active_generation_binding_matches_only_exact_environment_authority() {
+        let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+        let environment = fixture.request.pre_binding().environment();
+        let binding = ActiveCanaryGenerationBinding::from_environment_fixture(environment);
+        assert!(binding.matches_environment(environment));
+
+        let mut generation = binding.clone();
+        generation.generation = GenerationId::new(18).expect("alternate Generation");
+
+        let mut boot = binding.clone();
+        boot.boot_identity =
+            BootIdentity::parse("00000000-0000-0000-0000-000000000002").expect("alternate boot");
+
+        let mut profile = binding.clone();
+        profile.capability_profile_revision =
+            CapabilityProfileRevision::new(10).expect("alternate profile revision");
+
+        let mut namespace = binding.clone();
+        namespace.daemon_network_namespace =
+            NetworkNamespaceIdentity::new(2, 101).expect("alternate daemon namespace");
+
+        let mut epoch = binding.clone();
+        epoch.network_epoch = NetworkEpoch::new(2).expect("alternate network epoch");
+
+        let other_binding = active_generation_binding(binding.generation());
+        let mut inventory = binding.clone();
+        inventory.network_inventory_snapshot_id = other_binding.network_inventory_snapshot_id;
+
+        let mut capture_program = binding.clone();
+        capture_program.capture_program_digest =
+            CaptureProgramDigest::new([13; CAPTURE_PROGRAM_DIGEST_BYTES])
+                .expect("alternate capture program");
+
+        let mut journal = binding.clone();
+        journal.ownership.journal_identity =
+            OwnershipJournalIdentity::new([14; OWNERSHIP_JOURNAL_IDENTITY_BYTES])
+                .expect("alternate journal identity");
+
+        let mut revision = binding.clone();
+        revision.ownership.journal_revision =
+            OwnershipJournalRevision::new(2).expect("alternate journal revision");
+
+        let mut capture_owner = binding;
+        capture_owner.ownership.capture_owner.digest =
+            CaptureOwnerRecordDigest::new([15; CAPTURE_OWNER_RECORD_DIGEST_BYTES])
+                .expect("alternate capture owner record");
+
+        for (name, substituted) in [
+            ("Generation", generation),
+            ("boot", boot),
+            ("Capability Profile revision", profile),
+            ("daemon network namespace", namespace),
+            ("Network Epoch", epoch),
+            ("Network Inventory snapshot", inventory),
+            ("Capture Program", capture_program),
+            ("ownership journal", journal),
+            ("ownership journal revision", revision),
+            ("capture owner record", capture_owner),
+        ] {
+            assert!(
+                !substituted.matches_environment(environment),
+                "{name} substitution must not match the attempt environment"
+            );
+        }
+    }
+
+    #[test]
     fn post_environment_must_equal_the_request_pre_binding() {
         let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
         let evidence = fixture.successful_evidence();
@@ -7350,6 +7567,17 @@ pub(crate) mod tests {
             NonZeroU16::new(41_003).expect("DNS responder port"),
         )
         .expect("same-protocol responder ports are distinct")
+    }
+
+    pub(crate) fn active_generation_binding(
+        generation: GenerationId,
+    ) -> ActiveCanaryGenerationBinding {
+        let environment = environment(
+            generation,
+            CanaryNonce::from_bytes([7; FUNCTIONAL_CANARY_NONCE_BYTES]),
+            Instant::now(),
+        );
+        ActiveCanaryGenerationBinding::from_environment_fixture(&environment)
     }
 
     fn environment(

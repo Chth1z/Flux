@@ -26,11 +26,22 @@ use crate::subscription::ValidatedSubscriptionEngineConfig;
 
 pub(crate) trait NativeCoordinatorGenerationIdentity {
     fn coordinator_generation(self) -> Option<GenerationId>;
+
+    fn native_capture_target_identity(self) -> Option<NativeCaptureTargetIdentity>
+    where
+        Self: Sized,
+    {
+        None
+    }
 }
 
 impl NativeCoordinatorGenerationIdentity for NativeCaptureTargetIdentity {
     fn coordinator_generation(self) -> Option<GenerationId> {
         Some(self.generation())
+    }
+
+    fn native_capture_target_identity(self) -> Option<NativeCaptureTargetIdentity> {
+        Some(self)
     }
 }
 
@@ -544,6 +555,46 @@ where
                 "native structural verification has no matching successful convergence report",
             ))
         }
+    }
+
+    fn observe_active_canary_generation(
+        &mut self,
+        generation: &PreparedGeneration,
+    ) -> Result<Option<crate::functional_canary::ActiveCanaryGenerationBinding>, Self::Error> {
+        let retained = self.retained(generation.id())?;
+        let expected = C::target_identity(&retained.target);
+        if self.converged_identity != Some(expected) {
+            return Err(NativeCoordinatorWriterError::Invariant(
+                "native canary observation has no matching successful convergence report",
+            ));
+        }
+        let Some(prepared) = retained.runtime.prepared_canary_generation().cloned() else {
+            return Ok(None);
+        };
+        let expected = expected.native_capture_target_identity().ok_or(
+            NativeCoordinatorWriterError::Invariant(
+                "native canary facts were retained for a non-native capture identity",
+            ),
+        )?;
+        let observation = match self.convergence.observe_active_ownership() {
+            Ok(observation) => observation,
+            Err(source) => {
+                self.recovery_required = true;
+                return Err(NativeCoordinatorWriterError::convergence(
+                    "observe active native ownership for functional canary",
+                    source,
+                ));
+            }
+        };
+        observation
+            .map(|observation| prepared.bind_active_ownership(expected, &observation))
+            .transpose()
+            .map_err(|source| {
+                NativeCoordinatorWriterError::convergence(
+                    "bind active native ownership to functional canary Generation",
+                    source,
+                )
+            })
     }
 
     fn publish(&mut self, phase: PublishedRuntimeState) -> Result<(), Self::Error> {

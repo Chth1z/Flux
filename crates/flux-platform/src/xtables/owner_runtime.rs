@@ -1,6 +1,7 @@
 use std::error::Error;
 use std::fmt;
 use std::net::IpAddr;
+use std::num::NonZeroU16;
 
 use flux_core::{
     BootIdentity, GenerationId, NetworkAddressFamily, NetworkNamespaceIdentity,
@@ -14,10 +15,11 @@ use crate::netlink::policy_routing::{
 
 use super::super::XtablesCaptureArtifactSet;
 use super::super::owner_durable::{
-    NativeXtablesDurableError, NativeXtablesDurableStore, NativeXtablesJournalBinding,
-    NativeXtablesJournalPhase, NativeXtablesJournalRecord, NativeXtablesLeaseScope,
-    NativeXtablesOwnerPayload, NativeXtablesRecovery, NativeXtablesRecoveryFence,
-    NativeXtablesRecoveryInspection, NativeXtablesTransitionLease,
+    NATIVE_XTABLES_JOURNAL_SCHEMA_VERSION, NativeXtablesDurableError, NativeXtablesDurableStore,
+    NativeXtablesJournalBinding, NativeXtablesJournalObservation, NativeXtablesJournalPhase,
+    NativeXtablesJournalRecord, NativeXtablesLeaseScope, NativeXtablesOwnerPayload,
+    NativeXtablesRecovery, NativeXtablesRecoveryFence, NativeXtablesRecoveryInspection,
+    NativeXtablesTransitionLease,
 };
 use super::super::save::{
     XtablesExpectedState, XtablesExpectedStatePhase, XtablesSaveProjection,
@@ -25,6 +27,9 @@ use super::super::save::{
 };
 use super::super::{XtablesRestoreArtifact, XtablesRestoreFamily};
 use super::{XtablesStableFamilyPlan, XtablesStableTopologyError, XtablesStableTopologyPlan};
+use crate::xtables::native_capture::{
+    NativeCaptureOwnershipObservation, NativeCaptureTargetIdentity,
+};
 
 const OWNER_PAYLOAD_SCHEMA: u16 = 3;
 const IDENTITY_DIGEST_BYTES: usize = 32;
@@ -1245,6 +1250,80 @@ where
         }
     }
 
+    /// Returns one stable descriptor-anchored projection of the exact active owner.
+    ///
+    /// The durable journal is observed on both sides of live xtables and policy-routing readback.
+    /// A transition fence, substituted record, missing lease, or live drift fails closed.
+    pub(crate) fn observe_active_ownership(
+        &mut self,
+    ) -> Result<Option<NativeCaptureOwnershipObservation>, NativeXtablesOwnerError> {
+        if self.durable.writer_lock_exists()? {
+            return Err(NativeXtablesOwnerError::LiveStateConflict(
+                "native ownership observation found an active writer lock",
+            ));
+        }
+        let Some(before) = self.durable.observe_journal()? else {
+            return Ok(None);
+        };
+        if before.record().phase() != NativeXtablesJournalPhase::Active {
+            return Ok(None);
+        }
+        let binding = self.expected_binding(before.record().binding())?;
+        let lease =
+            self.durable
+                .load_lease()?
+                .ok_or(NativeXtablesOwnerError::LiveStateConflict(
+                    "active ownership observation found no durable lease",
+                ))?;
+        if lease != binding.lease_scope() {
+            return Err(NativeXtablesOwnerError::LiveStateConflict(
+                "active ownership observation found a substituted durable lease",
+            ));
+        }
+        let intent = NativeOwnerIntent::parse(before.record().owner_payload())?;
+        let identity = intent
+            .target
+            .ok_or(NativeXtablesOwnerError::InvalidPayload(
+                "active ownership observation has no target",
+            ))?;
+        if intent.step != NativeOwnerStep::PublishActive
+            || intent.previous.is_some()
+            || identity.generation() != binding.generation()
+        {
+            return Err(NativeXtablesOwnerError::LiveStateConflict(
+                "active ownership observation found a substituted target or Generation",
+            ));
+        }
+        let target = self.resolve_target(identity)?;
+        if !self.target_is_exact_active(&target)? {
+            return Err(NativeXtablesOwnerError::LiveStateConflict(
+                "active ownership observation did not match exact live state",
+            ));
+        }
+        if self.durable.writer_lock_exists()? {
+            return Err(NativeXtablesOwnerError::LiveStateConflict(
+                "native ownership changed during active readback",
+            ));
+        }
+        let after =
+            self.durable
+                .observe_journal()?
+                .ok_or(NativeXtablesOwnerError::LiveStateConflict(
+                    "native ownership journal disappeared during active readback",
+                ))?;
+        if before != after {
+            return Err(NativeXtablesOwnerError::LiveStateConflict(
+                "native ownership journal changed during active readback",
+            ));
+        }
+        if self.durable.load_lease()?.as_ref() != Some(&lease) {
+            return Err(NativeXtablesOwnerError::LiveStateConflict(
+                "native ownership lease changed during active readback",
+            ));
+        }
+        Ok(Some(public_ownership_observation(before, identity)))
+    }
+
     fn recover_current_journal(
         &mut self,
         record: NativeXtablesJournalRecord,
@@ -2330,6 +2409,30 @@ where
         }
         Ok(())
     }
+}
+
+fn public_ownership_observation(
+    observation: NativeXtablesJournalObservation,
+    target: NativeXtablesTargetIdentity,
+) -> NativeCaptureOwnershipObservation {
+    let binding = observation.record().binding();
+    NativeCaptureOwnershipObservation::new(
+        NativeCaptureTargetIdentity::new(
+            target.generation(),
+            target.target_digest(),
+            target.tool_digest(),
+            target.routing_digest(),
+        ),
+        binding.boot_identity().clone(),
+        binding.network_namespace(),
+        binding.journal_identity(),
+        observation.record().revision(),
+        NonZeroU16::new(NATIVE_XTABLES_JOURNAL_SCHEMA_VERSION)
+            .expect("native xtables journal schema is nonzero"),
+        observation.file_device(),
+        observation.file_inode(),
+        observation.digest(),
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

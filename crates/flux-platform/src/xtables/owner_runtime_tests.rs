@@ -73,6 +73,131 @@ fn zero_to_active_and_idempotent_active_use_one_exact_transaction() {
 }
 
 #[test]
+fn active_ownership_observation_binds_exact_journal_descriptor_and_live_target() {
+    let target = target(7, AddressHostFamilySelection::Ipv4, false);
+    let fixture = Fixture::new([target.clone()]);
+    let mut owner = fixture.owner();
+    owner
+        .converge(NativeXtablesDesiredTarget::Active(target.clone()))
+        .expect("activate target before ownership observation");
+
+    let encoded = std::fs::read(fixture.store.journal_path()).expect("read active journal bytes");
+    let metadata = std::fs::metadata(fixture.store.journal_path())
+        .expect("inspect active journal descriptor identity");
+    let journal = fixture.store.load_journal().unwrap().unwrap();
+    let observation = owner
+        .observe_active_ownership()
+        .expect("observe exact active ownership")
+        .expect("active target has ownership evidence");
+
+    assert_eq!(
+        observation.target().generation(),
+        target.identity().generation()
+    );
+    assert_eq!(
+        observation.target().target_digest(),
+        target.identity().target_digest()
+    );
+    assert_eq!(
+        observation.target().tool_digest(),
+        target.identity().tool_digest()
+    );
+    assert_eq!(
+        observation.target().routing_digest(),
+        target.identity().routing_digest()
+    );
+    assert_eq!(
+        observation.boot_identity(),
+        &fixture.environment.boot_identity
+    );
+    assert_eq!(
+        observation.network_namespace(),
+        fixture.environment.network_namespace
+    );
+    assert_eq!(
+        observation.journal_identity(),
+        fixture.environment.journal_identity
+    );
+    assert_eq!(observation.journal_revision(), journal.revision());
+    assert!(observation.journal_revision() > OwnershipJournalRevision::INITIAL);
+    assert_eq!(
+        observation.record_schema_version().get(),
+        NATIVE_XTABLES_JOURNAL_SCHEMA_VERSION
+    );
+    assert_eq!(observation.record_device(), metadata.dev());
+    assert_eq!(observation.record_inode().get(), metadata.ino());
+    assert_eq!(
+        observation.record_digest(),
+        <[u8; 32]>::from(Sha256::digest(encoded))
+    );
+}
+
+#[test]
+fn active_ownership_observation_rejects_generation_target_substitution() {
+    let target = target(7, AddressHostFamilySelection::Ipv4, false);
+    let fixture = Fixture::new([target.clone()]);
+    let mut owner = fixture.owner();
+    owner
+        .converge(NativeXtablesDesiredTarget::Active(target.clone()))
+        .expect("activate target before journal substitution");
+    let current = fixture.store.load_journal().unwrap().unwrap();
+    let expected = current.binding().clone();
+    let NativeXtablesRecovery::Leased(mut lease) = fixture.store.recover(&expected).unwrap() else {
+        panic!("active journal must retain its durable lease");
+    };
+    lease
+        .rebind(NativeXtablesJournalRecord::new(
+            fixture.environment.binding(GenerationId::new(8).unwrap()),
+            next_revision(current.revision()).unwrap(),
+            NativeXtablesJournalPhase::Active,
+            current.owner_payload().clone(),
+        ))
+        .expect("publish substituted Generation for negative control");
+    drop(lease);
+
+    let error = owner
+        .observe_active_ownership()
+        .expect_err("journal Generation and target substitution must fail");
+    assert!(
+        error
+            .to_string()
+            .contains("substituted target or Generation")
+    );
+}
+
+#[test]
+fn active_ownership_observation_rejects_writer_fence() {
+    let target = target(7, AddressHostFamilySelection::Ipv4, false);
+    let fixture = Fixture::new([target.clone()]);
+    let mut owner = fixture.owner();
+    owner
+        .converge(NativeXtablesDesiredTarget::Active(target))
+        .expect("activate target before writer-fence control");
+    create_same_scope_writer_lock(&fixture.store, &fixture.environment);
+
+    let error = owner
+        .observe_active_ownership()
+        .expect_err("active writer fence must block ownership observation");
+    assert!(error.to_string().contains("active writer lock"));
+}
+
+#[test]
+fn active_ownership_observation_rejects_live_readback_drift() {
+    let target = target(7, AddressHostFamilySelection::Ipv4, false);
+    let fixture = Fixture::new([target.clone()]);
+    let mut owner = fixture.owner();
+    owner
+        .converge(NativeXtablesDesiredTarget::Active(target))
+        .expect("activate target before live-state control");
+    owner.adapter.foreign_xtables[0] = true;
+
+    let error = owner
+        .observe_active_ownership()
+        .expect_err("live xtables substitution must fail ownership observation");
+    assert!(error.to_string().contains("did not match exact live state"));
+}
+
+#[test]
 fn durable_target_archive_round_trips_exact_runtime_material() {
     let temp = TempDir::new().unwrap();
     let store = NativeXtablesDurableStore::new(temp.path().join("run"));

@@ -15,10 +15,11 @@ use crate::engine_supervisor::{
     EngineChildAuthority, EngineChildAuthorityError, EngineChildAuthorityErrorKind,
 };
 use crate::functional_canary::{
-    CanaryAddressFamilies, CanaryAttemptBinding, CanaryAttemptRequest,
-    CanaryAttemptSocketObserverSession, CanaryCounterDeltaBounds, CanaryDeadline,
-    CanaryEngineBinding, CanaryEnvironmentBinding, CanaryNonce, FunctionalCanaryDisposition,
-    FunctionalCanaryError, FunctionalCanaryGateMode, UnqualifiedFunctionalCanaryExecution,
+    ActiveCanaryGenerationBinding, CanaryAddressFamilies, CanaryAttemptBinding,
+    CanaryAttemptRequest, CanaryAttemptSocketObserverSession, CanaryCounterDeltaBounds,
+    CanaryDeadline, CanaryEngineBinding, CanaryEnvironmentBinding, CanaryNonce,
+    FunctionalCanaryDisposition, FunctionalCanaryError, FunctionalCanaryGateMode,
+    PreparedCanaryGenerationBinding, UnqualifiedFunctionalCanaryExecution,
     UnqualifiedFunctionalCanaryExecutor,
 };
 use crate::generation_engine_config::{
@@ -56,6 +57,7 @@ pub(crate) struct PreparedGeneration {
     supervised_delivery_report: Option<EngineSupervisedDeliveryReportContract>,
     capture_path_selection: CapturePathSelection,
     capture_path_evidence_deadline: Instant,
+    prepared_canary_generation: Option<PreparedCanaryGenerationBinding>,
 }
 
 impl PreparedGeneration {
@@ -77,6 +79,7 @@ impl PreparedGeneration {
             supervised_delivery_report,
             capture_path_selection,
             capture_path_evidence_deadline,
+            prepared_canary_generation: None,
         };
         assert!(
             generation.functional_canary_mode() != FunctionalCanaryGateMode::RequiredUnqualified
@@ -106,6 +109,28 @@ impl PreparedGeneration {
         &self,
     ) -> Option<EngineSupervisedDeliveryReportContract> {
         self.supervised_delivery_report
+    }
+
+    #[must_use]
+    pub(crate) fn with_prepared_canary_generation(
+        mut self,
+        binding: Option<PreparedCanaryGenerationBinding>,
+    ) -> Self {
+        assert!(
+            binding
+                .as_ref()
+                .is_none_or(|binding| binding.generation() == self.id),
+            "prepared canary facts must identify the coordinator Generation"
+        );
+        self.prepared_canary_generation = binding;
+        self
+    }
+
+    #[must_use]
+    pub(crate) const fn prepared_canary_generation(
+        &self,
+    ) -> Option<&PreparedCanaryGenerationBinding> {
+        self.prepared_canary_generation.as_ref()
     }
 
     const fn runtime_binding(&self) -> RuntimeGenerationBinding {
@@ -238,6 +263,12 @@ pub(crate) trait RuntimeWriter: Send + 'static {
     fn capture_start(&mut self, generation: &PreparedGeneration) -> Result<(), Self::Error>;
     fn capture_stop(&mut self) -> Result<(), Self::Error>;
     fn verify_capture(&mut self, generation: &PreparedGeneration) -> Result<(), Self::Error>;
+    fn observe_active_canary_generation(
+        &mut self,
+        _generation: &PreparedGeneration,
+    ) -> Result<Option<ActiveCanaryGenerationBinding>, Self::Error> {
+        Ok(None)
+    }
     fn publish(&mut self, phase: PublishedRuntimeState) -> Result<(), Self::Error>;
     fn resync_addresses(&mut self) -> Result<AddressResyncDisposition, Self::Error>;
     fn address_resync_strategy(&self) -> AddressResyncStrategy {
@@ -322,12 +353,13 @@ impl UnqualifiedFunctionalCanaryAttemptInputs {
 pub(crate) trait UnqualifiedFunctionalCanaryAttemptContext: Send + 'static {
     fn prepare_attempt(
         &mut self,
-        generation: GenerationId,
+        generation: ActiveCanaryGenerationBinding,
     ) -> Result<UnqualifiedFunctionalCanaryAttemptInputs, FunctionalCanaryError>;
 
     fn reobserve_environment(
         &mut self,
         request: &CanaryAttemptRequest,
+        generation: ActiveCanaryGenerationBinding,
     ) -> Result<CanaryEnvironmentBinding, FunctionalCanaryError>;
 
     fn monotonic_now(&mut self) -> Instant;
@@ -2320,6 +2352,30 @@ where
         Ok(())
     }
 
+    fn observe_active_canary_generation(
+        &mut self,
+        generation: &PreparedGeneration,
+    ) -> Result<ActiveCanaryGenerationBinding, ControlError> {
+        self.writer
+            .observe_active_canary_generation(generation)
+            .map_err(|source| {
+                runtime_writer_error(
+                    "observe active capture ownership for functional canary",
+                    source,
+                    "detach capture before refreshing native ownership evidence",
+                )
+            })?
+            .ok_or_else(|| {
+                ControlError::runtime(
+                    "observe active capture ownership for functional canary",
+                    io::Error::other(
+                        "required functional-canary Generation has no active native ownership evidence",
+                    ),
+                    "detach capture before refreshing native ownership evidence",
+                )
+            })
+    }
+
     fn verify_running_gate(
         &mut self,
         generation: &PreparedGeneration,
@@ -2345,16 +2401,17 @@ where
             "observe proxy engine before functional canary",
             "detach capture before repairing the proxy engine and canary environment",
         )?;
+        let pre_capture = self.observe_active_canary_generation(generation)?;
         let attempt = match &mut self.functional_canary {
-            RuntimeFunctionalCanary::RequiredUnqualified { context, .. } => {
-                context.prepare_attempt(generation.id).map_err(|source| {
+            RuntimeFunctionalCanary::RequiredUnqualified { context, .. } => context
+                .prepare_attempt(pre_capture.clone())
+                .map_err(|source| {
                     functional_canary_error(
                         "prepare functional canary attempt",
                         source,
                         "detach capture before repairing canary attempt inputs",
                     )
-                })?
-            }
+                })?,
             RuntimeFunctionalCanary::StructuralVerificationOnly => {
                 unreachable!("required adapter availability was validated before engine start")
             }
@@ -2367,6 +2424,15 @@ where
             families,
             counter_bounds,
         } = attempt;
+        if !pre_capture.matches_environment(&environment) {
+            return Err(ControlError::runtime(
+                "validate functional canary prepared environment",
+                io::Error::other(
+                    "functional canary environment does not match active native ownership",
+                ),
+                "detach capture before preparing a fresh canary environment",
+            ));
+        }
         let pre_binding = CanaryAttemptBinding::new(pre_engine, environment);
         let request =
             CanaryAttemptRequest::new(pre_binding, nonce, deadline, families, counter_bounds)
@@ -2407,6 +2473,7 @@ where
                 unreachable!("required adapter availability was validated before engine start")
             }
         };
+        let post_capture = self.observe_active_canary_generation(generation)?;
         let post_engine = self.reconcile_canary_engine(
             generation,
             "observe proxy engine after functional canary",
@@ -2414,7 +2481,7 @@ where
         );
         let (post_environment, observed_at) = match &mut self.functional_canary {
             RuntimeFunctionalCanary::RequiredUnqualified { context, .. } => {
-                let environment = context.reobserve_environment(&request);
+                let environment = context.reobserve_environment(&request, post_capture.clone());
                 let observed_at = context.monotonic_now();
                 (environment, observed_at)
             }
@@ -2430,6 +2497,15 @@ where
                 "detach capture before repairing the canary environment",
             )
         })?;
+        if pre_capture != post_capture || !post_capture.matches_environment(&post_environment) {
+            return Err(ControlError::runtime(
+                "validate functional canary active ownership",
+                io::Error::other(
+                    "active native ownership changed or was substituted during the functional canary",
+                ),
+                "detach capture before starting a fresh functional canary attempt",
+            ));
+        }
         let post_binding = CanaryAttemptBinding::new(post_engine, post_environment);
         if request.pre_binding() != &post_binding {
             return Err(ControlError::runtime(
@@ -3278,7 +3354,7 @@ mod tests {
     use super::*;
     use crate::functional_canary::local_output::xtables_tproxy_local_output_executor;
     use crate::functional_canary::tests::{
-        Fixture as FunctionalCanaryFixture,
+        Fixture as FunctionalCanaryFixture, active_generation_binding,
         request_with_engine_identity as functional_request_with_engine_identity,
         request_with_nonce as functional_request_with_nonce,
     };
@@ -5102,7 +5178,8 @@ mod tests {
     }
 
     #[test]
-    fn required_capable_runtime_executes_structural_generation_without_canary() {
+    fn required_capable_runtime_executes_structural_generation_without_canary_or_ownership_observation()
+     {
         let fixture = EngineFixture::new();
         let events = Arc::new(Mutex::new(Vec::new()));
         let canary_script = Arc::new(Mutex::new(ScriptedCanary::new([
@@ -5207,7 +5284,7 @@ mod tests {
         );
         let authority_openings = engine.authority_openings();
         let mut coordinator = RuntimeCoordinator::with_dependencies(
-            writer.with_required_generations(),
+            writer.with_required_canary_script(Arc::clone(&canary_script)),
             engine,
             Duration::from_millis(100),
             scripted_required_canary(Arc::clone(&canary_script), Arc::clone(&events)),
@@ -5254,6 +5331,201 @@ mod tests {
     }
 
     #[test]
+    fn required_canary_without_active_ownership_never_prepares_attempt() {
+        let fixture = EngineFixture::new();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let request = functional_request_with_nonce(
+            &fixture.spec,
+            CanaryAddressFamilies::Ipv4Only,
+            Instant::now(),
+            CanaryNonce::from_bytes([61; FUNCTIONAL_CANARY_NONCE_BYTES]),
+        );
+        let canary_script = Arc::new(Mutex::new(ScriptedCanary::new([
+            ScriptedCanaryAttempt::passing(request),
+        ])));
+        let mut writer = ScriptedWriter {
+            events: Arc::clone(&events),
+            prepared: VecDeque::from([fixture.spec.clone()]),
+            next_generation_id: 17,
+            capture_start_failure: false,
+            capture_stop_failures: 0,
+            verify_failure: false,
+        }
+        .with_required_canary_script(Arc::clone(&canary_script));
+        writer.active_observations.push_back(None);
+        let observation_calls = Arc::clone(&writer.observation_calls);
+        let engine = RequiredScriptedEngine::new(
+            Arc::clone(&events),
+            [ready_canary_snapshot(98_765), ready_canary_snapshot(98_765)],
+        );
+        let mut coordinator = RuntimeCoordinator::with_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+            scripted_required_canary(Arc::clone(&canary_script), Arc::clone(&events)),
+        );
+        let runtime = coordinator.runtime_snapshot_source();
+
+        let error = coordinator
+            .execute(&RuntimeIntent::Running {
+                reason: Reason::Boot,
+            })
+            .expect_err("missing active ownership must block canary preparation");
+
+        assert!(error.to_string().contains(
+            "required functional-canary Generation has no active native ownership evidence"
+        ));
+        let script = canary_script.lock().expect("canary script");
+        assert_eq!(script.attempts.len(), 1);
+        assert_eq!(script.executions, 0);
+        assert_eq!(
+            *observation_calls
+                .lock()
+                .expect("active ownership observation calls lock"),
+            [generation(17)]
+        );
+        assert!(!events.lock().expect("events lock").iter().any(|event| {
+            matches!(*event, Event::CanaryPrepared(_) | Event::CanaryExecuted(_))
+        }));
+        assert_ne!(runtime.snapshot().phase, RuntimePhase::Running);
+    }
+
+    #[test]
+    fn substituted_pre_attempt_ownership_never_executes_canary() {
+        let fixture = EngineFixture::new();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let request = functional_request_with_nonce(
+            &fixture.spec,
+            CanaryAddressFamilies::Ipv4Only,
+            Instant::now(),
+            CanaryNonce::from_bytes([62; FUNCTIONAL_CANARY_NONCE_BYTES]),
+        );
+        let canary_script = Arc::new(Mutex::new(ScriptedCanary::new([
+            ScriptedCanaryAttempt::passing(request),
+        ])));
+        let mut writer = ScriptedWriter {
+            events: Arc::clone(&events),
+            prepared: VecDeque::from([fixture.spec.clone()]),
+            next_generation_id: 17,
+            capture_start_failure: false,
+            capture_stop_failures: 0,
+            verify_failure: false,
+        }
+        .with_required_canary_script(Arc::clone(&canary_script));
+        writer
+            .active_observations
+            .push_back(Some(active_generation_binding(generation(17))));
+        let observation_calls = Arc::clone(&writer.observation_calls);
+        let engine = RequiredScriptedEngine::new(
+            Arc::clone(&events),
+            [ready_canary_snapshot(98_765), ready_canary_snapshot(98_765)],
+        );
+        let mut coordinator = RuntimeCoordinator::with_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+            scripted_required_canary(Arc::clone(&canary_script), Arc::clone(&events)),
+        );
+        let runtime = coordinator.runtime_snapshot_source();
+
+        let error = coordinator
+            .execute(&RuntimeIntent::Running {
+                reason: Reason::Boot,
+            })
+            .expect_err("substituted pre-attempt ownership must block execution");
+
+        assert!(
+            error
+                .to_string()
+                .contains("scripted canary generation does not match the active generation")
+        );
+        assert_eq!(canary_script.lock().expect("canary script").executions, 0);
+        assert_eq!(
+            *observation_calls
+                .lock()
+                .expect("active ownership observation calls lock"),
+            [generation(17)]
+        );
+        assert!(
+            !events
+                .lock()
+                .expect("events lock")
+                .iter()
+                .any(|event| matches!(*event, Event::CanaryExecuted(_)))
+        );
+        assert_ne!(runtime.snapshot().phase, RuntimePhase::Running);
+    }
+
+    #[test]
+    fn post_execution_ownership_substitution_never_publishes_running() {
+        let fixture = EngineFixture::new();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let request = functional_request_with_nonce(
+            &fixture.spec,
+            CanaryAddressFamilies::Ipv4Only,
+            Instant::now(),
+            CanaryNonce::from_bytes([63; FUNCTIONAL_CANARY_NONCE_BYTES]),
+        );
+        let pre_observation = ActiveCanaryGenerationBinding::from_environment_fixture(
+            request.pre_binding().environment(),
+        );
+        let canary_script = Arc::new(Mutex::new(ScriptedCanary::new([
+            ScriptedCanaryAttempt::passing(request),
+        ])));
+        let mut writer = ScriptedWriter {
+            events: Arc::clone(&events),
+            prepared: VecDeque::from([fixture.spec.clone()]),
+            next_generation_id: 17,
+            capture_start_failure: false,
+            capture_stop_failures: 0,
+            verify_failure: false,
+        }
+        .with_required_canary_script(Arc::clone(&canary_script));
+        writer.active_observations.extend([
+            Some(pre_observation),
+            Some(active_generation_binding(generation(17))),
+        ]);
+        let observation_calls = Arc::clone(&writer.observation_calls);
+        let engine = RequiredScriptedEngine::new(
+            Arc::clone(&events),
+            [ready_canary_snapshot(98_765), ready_canary_snapshot(98_765)],
+        );
+        let mut coordinator = RuntimeCoordinator::with_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+            scripted_required_canary(Arc::clone(&canary_script), Arc::clone(&events)),
+        );
+        let runtime = coordinator.runtime_snapshot_source();
+
+        let error = coordinator
+            .execute(&RuntimeIntent::Running {
+                reason: Reason::Boot,
+            })
+            .expect_err("post-execution ownership substitution must block publication");
+
+        assert!(
+            error
+                .to_string()
+                .contains("post-attempt observation received a different request")
+        );
+        assert_eq!(canary_script.lock().expect("canary script").executions, 1);
+        assert_eq!(
+            *observation_calls
+                .lock()
+                .expect("active ownership observation calls lock"),
+            [generation(17), generation(17)]
+        );
+        assert!(!events.lock().expect("events lock").iter().any(|event| {
+            matches!(
+                *event,
+                Event::Published(PublishedRuntimeState::Running { .. })
+            )
+        }));
+        assert_ne!(runtime.snapshot().phase, RuntimePhase::Running);
+    }
+
+    #[test]
     fn required_reload_prepare_failure_preserves_the_active_functional_pass() {
         let fixture = EngineFixture::new();
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -5279,7 +5551,7 @@ mod tests {
             [ready_canary_snapshot(98_765), ready_canary_snapshot(98_765)],
         );
         let mut coordinator = RuntimeCoordinator::with_dependencies(
-            writer.with_required_generations(),
+            writer.with_required_canary_script(Arc::clone(&canary_script)),
             engine,
             Duration::from_millis(100),
             scripted_required_canary(canary_script, events),
@@ -5332,7 +5604,7 @@ mod tests {
             [ready_canary_snapshot(98_765), ready_canary_snapshot(98_765)],
         );
         let mut coordinator = RuntimeCoordinator::with_dependencies(
-            writer.with_required_generations(),
+            writer.with_required_canary_script(Arc::clone(&canary_script)),
             engine,
             Duration::from_millis(100),
             scripted_required_canary(canary_script, events),
@@ -5390,7 +5662,7 @@ mod tests {
             std::iter::repeat_with(|| ready_canary_snapshot(98_765)).take(5),
         );
         let mut coordinator = RuntimeCoordinator::with_dependencies(
-            writer.with_required_generations(),
+            writer.with_required_canary_script(Arc::clone(&canary_script)),
             engine,
             Duration::from_millis(100),
             scripted_required_canary(Arc::clone(&canary_script), events),
@@ -5455,7 +5727,7 @@ mod tests {
             std::iter::repeat_with(|| ready_canary_snapshot(98_765)).take(4),
         );
         let mut coordinator = RuntimeCoordinator::with_dependencies(
-            writer.with_required_generations(),
+            writer.with_required_canary_script(Arc::clone(&canary_script)),
             engine,
             Duration::from_millis(100),
             scripted_required_canary(Arc::clone(&canary_script), events),
@@ -5515,7 +5787,7 @@ mod tests {
             std::iter::repeat_with(|| ready_canary_snapshot(98_765)).take(4),
         );
         let mut coordinator = RuntimeCoordinator::with_dependencies(
-            writer.with_required_generations(),
+            writer.with_required_canary_script(Arc::clone(&canary_script)),
             engine,
             Duration::from_millis(100),
             scripted_required_canary(Arc::clone(&canary_script), events),
@@ -5571,7 +5843,7 @@ mod tests {
             [ready_canary_snapshot(98_765), ready_canary_snapshot(98_766)],
         );
         let mut coordinator = RuntimeCoordinator::with_dependencies(
-            writer.with_required_generations(),
+            writer.with_required_canary_script(Arc::clone(&canary_script)),
             engine,
             Duration::from_millis(100),
             scripted_required_canary(canary_script, Arc::clone(&events)),
@@ -5638,7 +5910,7 @@ mod tests {
             [ready_canary_snapshot(98_765), ready_canary_snapshot(98_765)],
         );
         let mut coordinator = RuntimeCoordinator::with_dependencies(
-            writer.with_required_generations(),
+            writer.with_required_canary_script(Arc::clone(&canary_script)),
             engine,
             Duration::from_millis(100),
             scripted_required_canary(canary_script, Arc::clone(&events)),
@@ -5709,7 +5981,7 @@ mod tests {
             executor: xtables_tproxy_local_output_executor(),
         };
         let mut coordinator = RuntimeCoordinator::with_dependencies(
-            writer.with_required_generations(),
+            writer.with_required_canary_script(Arc::clone(&canary_script)),
             engine,
             Duration::from_millis(100),
             functional_canary,
@@ -5778,7 +6050,7 @@ mod tests {
         engine.fail_next_authority_opening(io::ErrorKind::PermissionDenied);
         engine.fail_running_on_call = Some(3);
         let mut coordinator = RuntimeCoordinator::with_dependencies(
-            writer.with_required_generations(),
+            writer.with_required_canary_script(Arc::clone(&canary_script)),
             engine,
             Duration::from_millis(100),
             scripted_required_canary(Arc::clone(&canary_script), Arc::clone(&events)),
@@ -5974,7 +6246,7 @@ mod tests {
             std::iter::repeat_with(|| ready_canary_snapshot(98_765)).take(8),
         );
         let mut coordinator = RuntimeCoordinator::with_dependencies(
-            writer.with_required_generations(),
+            writer.with_required_canary_script(Arc::clone(&canary_script)),
             engine,
             Duration::from_millis(100),
             scripted_required_canary(Arc::clone(&canary_script), Arc::clone(&events)),
@@ -6065,7 +6337,7 @@ mod tests {
             std::iter::repeat_with(|| ready_canary_snapshot(98_765)).take(12),
         );
         let mut coordinator = RuntimeCoordinator::with_dependencies(
-            writer.with_required_generations(),
+            writer.with_required_canary_script(Arc::clone(&canary_script)),
             engine,
             Duration::from_millis(100),
             scripted_required_canary(Arc::clone(&canary_script), Arc::clone(&events)),
@@ -6178,7 +6450,7 @@ mod tests {
             ],
         );
         let mut coordinator = RuntimeCoordinator::with_dependencies(
-            writer.with_required_generations(),
+            writer.with_required_canary_script(Arc::clone(&canary_script)),
             engine,
             Duration::from_millis(100),
             scripted_required_canary(Arc::clone(&canary_script), Arc::clone(&events)),
@@ -6295,7 +6567,7 @@ mod tests {
             ],
         );
         let mut coordinator = RuntimeCoordinator::with_dependencies(
-            writer.with_required_generations(),
+            writer.with_required_canary_script(Arc::clone(&canary_script)),
             engine,
             Duration::from_millis(100),
             scripted_required_canary(Arc::clone(&canary_script), Arc::clone(&events)),
@@ -7503,11 +7775,31 @@ mod tests {
 
     struct RequiredGenerationWriter<W> {
         inner: W,
+        canary_script: Option<Arc<Mutex<ScriptedCanary>>>,
+        active_observations: VecDeque<Option<ActiveCanaryGenerationBinding>>,
+        observation_calls: Arc<Mutex<Vec<GenerationId>>>,
     }
 
     trait RequiredGenerationWriterExt: Sized {
         fn with_required_generations(self) -> RequiredGenerationWriter<Self> {
-            RequiredGenerationWriter { inner: self }
+            RequiredGenerationWriter {
+                inner: self,
+                canary_script: None,
+                active_observations: VecDeque::new(),
+                observation_calls: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn with_required_canary_script(
+            self,
+            canary_script: Arc<Mutex<ScriptedCanary>>,
+        ) -> RequiredGenerationWriter<Self> {
+            RequiredGenerationWriter {
+                inner: self,
+                canary_script: Some(canary_script),
+                active_observations: VecDeque::new(),
+                observation_calls: Arc::new(Mutex::new(Vec::new())),
+            }
         }
     }
 
@@ -7581,6 +7873,33 @@ mod tests {
 
         fn verify_capture(&mut self, generation: &PreparedGeneration) -> Result<(), Self::Error> {
             self.inner.verify_capture(generation)
+        }
+
+        fn observe_active_canary_generation(
+            &mut self,
+            generation: &PreparedGeneration,
+        ) -> Result<Option<ActiveCanaryGenerationBinding>, Self::Error> {
+            self.observation_calls
+                .lock()
+                .expect("active ownership observation calls lock")
+                .push(generation.id());
+            if let Some(observation) = self.active_observations.pop_front() {
+                return Ok(observation);
+            }
+            let Some(script) = &self.canary_script else {
+                return Ok(None);
+            };
+            let script = script.lock().expect("canary script");
+            let request = script
+                .active
+                .as_ref()
+                .map(|attempt| &attempt.request)
+                .or_else(|| script.attempts.front().map(|attempt| &attempt.request));
+            Ok(request.map(|request| {
+                ActiveCanaryGenerationBinding::from_environment_fixture(
+                    request.pre_binding().environment(),
+                )
+            }))
         }
 
         fn publish(&mut self, phase: PublishedRuntimeState) -> Result<(), Self::Error> {
@@ -7968,6 +8287,13 @@ mod tests {
             }
         }
 
+        fn observe_active_canary_generation(
+            &mut self,
+            _generation: &PreparedGeneration,
+        ) -> Result<Option<ActiveCanaryGenerationBinding>, Self::Error> {
+            panic!("structural Generations must not request active canary ownership")
+        }
+
         fn publish(&mut self, phase: PublishedRuntimeState) -> Result<(), Self::Error> {
             self.events
                 .lock()
@@ -8107,7 +8433,7 @@ mod tests {
     impl UnqualifiedFunctionalCanaryAttemptContext for ScriptedCanaryContext {
         fn prepare_attempt(
             &mut self,
-            generation: GenerationId,
+            generation: ActiveCanaryGenerationBinding,
         ) -> Result<UnqualifiedFunctionalCanaryAttemptInputs, FunctionalCanaryError> {
             let mut script = self.script.lock().expect("canary script");
             let attempt = script.attempts.pop_front().ok_or_else(|| {
@@ -8117,7 +8443,9 @@ mod tests {
                     "no scripted functional canary attempt remains",
                 )
             })?;
-            if attempt.request.pre_binding().engine().generation() != generation {
+            if attempt.request.pre_binding().engine().generation() != generation.generation()
+                || !generation.matches_environment(attempt.request.pre_binding().environment())
+            {
                 return Err(FunctionalCanaryError::new(
                     CanaryErrorKind::IdentityChanged,
                     CanaryCleanupStatus::NotRequired,
@@ -8127,7 +8455,7 @@ mod tests {
             self.events
                 .lock()
                 .expect("events lock")
-                .push(Event::CanaryPrepared(generation));
+                .push(Event::CanaryPrepared(generation.generation()));
             let environment = attempt.request.pre_binding().environment().clone();
             let socket_observer = CanaryAttemptSocketObserverSession::scripted(
                 environment.authority().socket_observer_binding(),
@@ -8150,6 +8478,7 @@ mod tests {
         fn reobserve_environment(
             &mut self,
             request: &CanaryAttemptRequest,
+            generation: ActiveCanaryGenerationBinding,
         ) -> Result<CanaryEnvironmentBinding, FunctionalCanaryError> {
             let script = self.script.lock().expect("canary script");
             let active = script.active.as_ref().ok_or_else(|| {
@@ -8159,7 +8488,9 @@ mod tests {
                     "functional canary has no active scripted attempt",
                 )
             })?;
-            if &active.request != request {
+            if &active.request != request
+                || !generation.matches_environment(request.pre_binding().environment())
+            {
                 return Err(FunctionalCanaryError::new(
                     CanaryErrorKind::IdentityChanged,
                     CanaryCleanupStatus::NotRequired,

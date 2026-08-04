@@ -27,6 +27,7 @@ use flux_platform::{
     XtablesLocalOutputRoutingSpec,
 };
 
+use crate::functional_canary::CanaryBindingError;
 use crate::generation_engine_config::{
     AddressReconciledGenerationInputs, AddressReconciliationError, AddressReconciliationInspection,
     AdmittedGeneration, AdmittedGenerationIdentity, CapturePathDecision,
@@ -799,6 +800,9 @@ where
         let supervised_delivery_report = admitted.supervised_delivery_report();
         let capture_path_selection = admitted.capture_path_selection();
         let capture_path_evidence_deadline = admitted.capture_path_evidence_deadline();
+        let prepared_canary_generation = admitted
+            .prepared_canary_generation_binding()
+            .map_err(NativeGenerationSourceError::CanaryBinding)?;
         let target = self
             .admission
             .admit(admitted)
@@ -820,7 +824,8 @@ where
                 supervised_delivery_report,
                 capture_path_selection,
                 capture_path_evidence_deadline,
-            ),
+            )
+            .with_prepared_canary_generation(prepared_canary_generation),
             target,
         ))
     }
@@ -1113,6 +1118,7 @@ pub(crate) enum NativeGenerationSourceError {
     DesiredState(DesiredStateCompileError),
     Planning(Box<dyn Error + Send + Sync>),
     Assembly(GenerationAssemblyError),
+    CanaryBinding(CanaryBindingError),
     Admission(Box<dyn Error + Send + Sync>),
     GenerationSequenceExhausted,
     Invariant(&'static str),
@@ -1147,6 +1153,7 @@ impl fmt::Display for NativeGenerationSourceError {
             Self::DesiredState(source) => source.fmt(formatter),
             Self::Planning(source) => write!(formatter, "native Generation planning: {source}"),
             Self::Assembly(source) => source.fmt(formatter),
+            Self::CanaryBinding(source) => source.fmt(formatter),
             Self::Admission(source) => write!(formatter, "native target admission: {source}"),
             Self::GenerationSequenceExhausted => {
                 formatter.write_str("native Generation sequence is exhausted")
@@ -1170,6 +1177,7 @@ impl Error for NativeGenerationSourceError {
             Self::DesiredState(source) => Some(source),
             Self::Planning(source) | Self::Admission(source) => Some(source.as_ref()),
             Self::Assembly(source) => Some(source),
+            Self::CanaryBinding(source) => Some(source),
             Self::InventoryUnavailable
             | Self::SubscriptionUnavailable
             | Self::SelectedSourceDrift

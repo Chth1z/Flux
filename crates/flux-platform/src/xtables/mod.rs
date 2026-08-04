@@ -43,7 +43,7 @@ pub use lowering::{
 
 pub use native_capture::{
     NativeCaptureConvergedState, NativeCaptureConvergence, NativeCaptureConvergenceReport,
-    NativeCaptureDesired, NativeCaptureTargetIdentity,
+    NativeCaptureDesired, NativeCaptureOwnershipObservation, NativeCaptureTargetIdentity,
 };
 
 #[cfg(any(target_os = "linux", target_os = "android"))]

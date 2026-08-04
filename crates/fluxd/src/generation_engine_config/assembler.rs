@@ -32,7 +32,9 @@ use super::{
     TproxyGenerationCandidate, TproxyGenerationCandidateError, bind_engine_config_to_spec,
     compile_tproxy_generation_candidate,
 };
-use crate::functional_canary::FunctionalCanaryGateMode;
+use crate::functional_canary::{
+    CanaryBindingError, FunctionalCanaryGateMode, PreparedCanaryGenerationBinding,
+};
 use crate::{EngineSpec, RestartPolicy, RestartPolicyError};
 
 pub(crate) const ADMITTED_GENERATION_SCHEMA_VERSION: u16 = 4;
@@ -406,6 +408,29 @@ impl AdmittedGeneration {
     #[must_use]
     pub(crate) const fn capture_path_evidence_deadline(&self) -> Instant {
         self.capture_path_evidence_deadline
+    }
+
+    pub(crate) fn prepared_canary_generation_binding(
+        &self,
+    ) -> Result<Option<PreparedCanaryGenerationBinding>, CanaryBindingError> {
+        match &self.planning {
+            GenerationPlanningAuthority::Android { mark, .. } => {
+                PreparedCanaryGenerationBinding::new(
+                    self.generation(),
+                    mark.boot_identity().clone(),
+                    mark.capability_revision(),
+                    mark.network_namespace(),
+                    self.candidate.inventory_epoch(),
+                    self.candidate.inventory_snapshot(),
+                    *self.capture.program().digest().as_bytes(),
+                    mark.ownership_journal_identity(),
+                    mark.ownership_journal_revision(),
+                )
+                .map(Some)
+            }
+            #[cfg(test)]
+            GenerationPlanningAuthority::HostInspection(_) => Ok(None),
+        }
     }
 
     pub(crate) fn into_native_target_request(

@@ -5,10 +5,14 @@ use std::net::Shutdown;
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::thread::JoinHandle;
 
 use flux_core::GenerationId;
-use flux_platform::internal::{PinnedSingBoxLaunch, SingBoxChild, SingBoxProcessAdapter};
+use flux_platform::internal::{
+    PinnedSingBoxLaunch, SingBoxChild, SingBoxProcessAdapter, TerminationOutcome,
+};
 use flux_platform::{SeqpacketReceive, SingBoxLaunchSpec, SingBoxPrivilege, SingBoxReadiness};
 
 use crate::functional_canary::supervised_delivery_report::collector;
@@ -31,8 +35,15 @@ const PRODUCER_BINARY_ENV: &str = "FLUX_TEST_SING_BOX_PRODUCER_BINARY";
 const EXPECTED_TCP_SINK_FLOWS: usize = 4;
 const EXPECTED_UDP_SINK_FLOWS: usize = 4;
 const SINK_TIMEOUT: Duration = Duration::from_secs(10);
+const SINK_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const SINK_PORT: u16 = 41_390;
 const PRODUCER_STOP_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_SELECTOR_PACKETS: u64 = 64;
+const TCP_ECHO_PAYLOAD_BYTES: usize = FUNCTIONAL_CANARY_NONCE_BYTES;
+const EXPECTED_SUPERVISED_CONFIG_SHA256: [u8; 32] = [
+    0xea, 0x16, 0xae, 0xf2, 0x57, 0x78, 0xcc, 0x74, 0xae, 0x44, 0xba, 0xa3, 0x04, 0x63, 0xca, 0xb5,
+    0xb2, 0xef, 0xb9, 0x8c, 0xbc, 0x2c, 0x6c, 0x7c, 0x90, 0x5a, 0xa7, 0x01, 0x32, 0x18, 0xf2, 0x83,
+];
 
 pub(super) fn config(nonce: String) -> Result<LocalOutputConfig, String> {
     let mut config = LocalOutputConfig::new(nonce)?;
@@ -72,16 +83,117 @@ pub(super) fn execute(resources: &mut LocalOutputResources) -> Result<(), String
     validate_route_controls(&resources.config)?;
     resources.modules.verify()?;
 
-    let sinks = prepared.start_sinks()?;
-    let mut producer = prepared.spawn()?;
-    producer.wait_ready()?;
-    exercise_attempt_lifecycle(&resources.config, producer.fixture, producer.child())?;
+    let before_request_nonce = [0xb1; FUNCTIONAL_CANARY_NONCE_BYTES];
+    let before_collector = run_with_producer(&prepared, |producer| {
+        producer.wait_ready()?;
+        let request = request_for_child(prepared.fixture(), producer.child(), before_request_nonce);
+        let authority = collector::SupervisedDeliveryReportPrebindAuthority::fixture(
+            &prepared.fixture().profile,
+            &request,
+        );
+        let (report_producer, report_collector) = collector::prebind(authority, Instant::now)
+            .map_err(|error| format!("prebind pre-emission termination report: {error}"))?;
+        let _installed = report_producer
+            .into_engine_handoff()
+            .install_into(producer.child())
+            .map_err(|error| format!("install pre-emission termination report: {error}"))?;
+        if report_collector
+            .recv_fixture_record_until(1, Instant::now() + Duration::from_millis(100))
+            .map_err(|error| format!("inspect pre-emission termination report: {error}"))?
+            .is_some()
+        {
+            return Err("pre-emission attempt produced a report before traffic".to_owned());
+        }
+        Ok(report_collector)
+    })?;
+    if !matches!(
+        before_collector
+            .recv_fixture_record_until(1, Instant::now() + PRODUCER_STOP_TIMEOUT)
+            .map_err(|error| format!("observe pre-emission producer termination: {error}"))?,
+        Some(SeqpacketReceive::Eof)
+    ) {
+        return Err(
+            "pre-emission producer termination did not close the report endpoint".to_owned(),
+        );
+    }
 
-    validate_supervised_counters(&comments, CounterExpectation::Positive)?;
-    sinks.join()?;
-    producer.ensure_running()?;
-    producer.terminate()?;
-    resources.modules.verify()
+    let mut sinks = None;
+    let execution = panic::catch_unwind(AssertUnwindSafe(|| -> Result<(), String> {
+        let during_collector = run_with_producer(&prepared, |producer| {
+            producer.wait_ready()?;
+            let request = request_for_child(
+                prepared.fixture(),
+                producer.child(),
+                [0xb2; FUNCTIONAL_CANARY_NONCE_BYTES],
+            );
+            let authority = collector::SupervisedDeliveryReportPrebindAuthority::fixture(
+                &prepared.fixture().profile,
+                &request,
+            );
+            let (report_producer, mut report_collector) =
+                collector::prebind(authority, Instant::now)
+                    .map_err(|error| format!("prebind mid-emission termination report: {error}"))?;
+            let _installed = report_producer
+                .into_engine_handoff()
+                .install_into(producer.child())
+                .map_err(|error| format!("install mid-emission termination report: {error}"))?;
+            let flow = CanaryFlow::Ipv4TcpEcho;
+            let payload = flow_payload(&request, flow)?;
+            sinks = Some(prepared.start_sinks(SinkExpectations::one_tcp(payload.clone()))?);
+            let destination = SocketAddr::new(
+                request.peer_address(flow),
+                request.responder_port(flow).get(),
+            );
+            let source = SocketAddr::new(resources.config.source(AddressFamily::Ipv4), 0);
+            let (stream, _) = send_tcp_flow(source, destination, &payload)?;
+            report_collector
+                .ingest_fixture_record_until(request.deadline().expires_at())
+                .map_err(|error| format!("collect mid-emission supervised report: {error}"))?;
+            drop(stream);
+            sinks
+                .take()
+                .ok_or_else(|| "mid-emission sink workers are missing".to_owned())?
+                .join()?;
+            Ok(report_collector)
+        })?;
+        if !matches!(
+            during_collector
+                .recv_fixture_record_until(1, Instant::now() + PRODUCER_STOP_TIMEOUT)
+                .map_err(|error| format!("observe mid-emission producer termination: {error}"))?,
+            Some(SeqpacketReceive::Eof)
+        ) {
+            return Err(
+                "mid-emission producer termination did not close the incomplete report endpoint"
+                    .to_owned(),
+            );
+        }
+
+        run_with_producer(&prepared, |producer| {
+            producer.wait_ready()?;
+            exercise_attempt_lifecycle(&resources.config, &prepared, producer.child(), &mut sinks)?;
+            validate_supervised_counters(&comments, CounterExpectation::Positive)?;
+            sinks
+                .take()
+                .ok_or_else(|| "supervised sink workers are missing".to_owned())?
+                .join()?;
+            producer.ensure_running()
+        })
+    }))
+    .unwrap_or_else(|payload| {
+        Err(format!(
+            "supervised producer execution panicked: {}",
+            panic_message(payload)
+        ))
+    });
+    let sink_cleanup = match sinks.take() {
+        Some(sinks) => sinks.cancel_and_join(),
+        None => Ok(()),
+    };
+    combine_results([
+        ("supervised execution", execution),
+        ("sink cleanup", sink_cleanup),
+        ("module verification", resources.modules.verify()),
+    ])
 }
 
 struct PreparedProducer {
@@ -94,24 +206,14 @@ impl PreparedProducer {
     fn new() -> Result<Self, String> {
         let binary = producer_binary()?;
         let sinks = PreparedSinks::bind()?;
-        let template = serde_json::to_vec(&serde_json::json!({
-            "log": { "disabled": true },
-            "inbounds": [],
-            "outbounds": [{ "type": "direct", "tag": "direct" }],
-            "route": {
-                "rules": [{
-                    "action": "route",
-                    "outbound": "direct",
-                    "override_address": "127.0.0.1",
-                    "override_port": sinks.port.get(),
-                }],
-            },
-        }))
-        .map_err(|error| format!("encode supervised-producer config template: {error}"))?;
+        let template = supervised_config_template(sinks.port)?;
         let listener_port = NonZeroU16::new(TPROXY_PORT).expect("TPROXY port is nonzero");
         let artifact =
             compile_tproxy_engine_config(TproxyEngineConfigRequest::new(&template, listener_port))
                 .map_err(|error| format!("compile supervised-producer config: {error}"))?;
+        if artifact.content_sha256() != &EXPECTED_SUPERVISED_CONFIG_SHA256 {
+            return Err("supervised-producer canonical config digest drifted".to_owned());
+        }
         let directory = tempfile::tempdir()
             .map_err(|error| format!("create supervised-producer fixture directory: {error}"))?;
         let config = directory.path().join("config.json");
@@ -164,8 +266,8 @@ impl PreparedProducer {
         })
     }
 
-    fn start_sinks(&self) -> Result<SinkWorkers, String> {
-        self.sinks.spawn()
+    fn start_sinks(&self, expectations: SinkExpectations) -> Result<SinkWorkers, String> {
+        self.sinks.spawn(expectations)
     }
 
     fn spawn(&self) -> Result<ProducerGuard<'_>, String> {
@@ -179,6 +281,27 @@ impl PreparedProducer {
             child: Some(child),
         })
     }
+
+    const fn fixture(&self) -> &ProducerFixture {
+        &self.fixture
+    }
+}
+
+fn supervised_config_template(sink_port: NonZeroU16) -> Result<Vec<u8>, String> {
+    serde_json::to_vec(&serde_json::json!({
+        "log": { "disabled": true },
+        "inbounds": [],
+        "outbounds": [{ "type": "direct", "tag": "direct" }],
+        "route": {
+            "rules": [{
+                "action": "route",
+                "outbound": "direct",
+                "override_address": "127.0.0.1",
+                "override_port": sink_port.get(),
+            }],
+        },
+    }))
+    .map_err(|error| format!("encode supervised-producer config template: {error}"))
 }
 
 fn producer_binary() -> Result<PathBuf, String> {
@@ -256,11 +379,39 @@ impl ProducerGuard<'_> {
 
     fn terminate(&mut self) -> Result<(), String> {
         let adapter = self.fixture.adapter;
-        adapter
-            .terminate(self.child_mut(), PRODUCER_STOP_TIMEOUT)
-            .map_err(|error| format!("terminate and reap supervised producer: {error}"))?;
-        self.child.take();
+        let mut child = self
+            .child
+            .take()
+            .expect("live producer guard retains its child");
+        let outcome = match adapter.terminate(&mut child, PRODUCER_STOP_TIMEOUT) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.child = Some(child);
+                return Err(format!("terminate and reap supervised producer: {error}"));
+            }
+        };
+        require_explicit_termination(outcome)?;
+        if !matches!(
+            child
+                .launch_control()
+                .recv_record_until(1, Instant::now() + PRODUCER_STOP_TIMEOUT)
+                .map_err(|error| format!("observe supervised producer control EOF: {error}"))?,
+            Some(SeqpacketReceive::Eof)
+        ) {
+            return Err(
+                "terminated supervised producer retained its launch-control endpoint".to_owned(),
+            );
+        }
         Ok(())
+    }
+}
+
+fn require_explicit_termination(outcome: TerminationOutcome) -> Result<(), String> {
+    match outcome {
+        TerminationOutcome::AlreadyExited { exit } => Err(format!(
+            "supervised producer exited before explicit termination: {exit}"
+        )),
+        TerminationOutcome::Terminated { .. } | TerminationOutcome::Killed { .. } => Ok(()),
     }
 }
 
@@ -272,11 +423,64 @@ impl Drop for ProducerGuard<'_> {
     }
 }
 
+fn run_with_producer<T>(
+    prepared: &PreparedProducer,
+    operation: impl FnOnce(&mut ProducerGuard<'_>) -> Result<T, String>,
+) -> Result<T, String> {
+    let mut producer = prepared.spawn()?;
+    let operation = panic::catch_unwind(AssertUnwindSafe(|| operation(&mut producer)))
+        .unwrap_or_else(|payload| {
+            Err(format!(
+                "supervised producer phase panicked: {}",
+                panic_message(payload)
+            ))
+        });
+    finish_with_required_cleanup(operation, || producer.terminate())
+}
+
+fn finish_with_required_cleanup<T>(
+    operation: Result<T, String>,
+    cleanup: impl FnOnce() -> Result<(), String>,
+) -> Result<T, String> {
+    let cleanup = panic::catch_unwind(AssertUnwindSafe(cleanup)).unwrap_or_else(|payload| {
+        Err(format!(
+            "producer cleanup panicked: {}",
+            panic_message(payload)
+        ))
+    });
+    match (operation, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(cleanup_error)) => Err(format!("producer cleanup failed: {cleanup_error}")),
+        (Err(error), Err(cleanup_error)) => Err(format!(
+            "{error}; producer cleanup also failed: {cleanup_error}"
+        )),
+    }
+}
+
+fn combine_results<const N: usize>(
+    results: [(&'static str, Result<(), String>); N],
+) -> Result<(), String> {
+    let mut errors = Vec::new();
+    for (label, result) in results {
+        if let Err(error) = result {
+            errors.push(format!("{label} failed: {error}"));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
 fn exercise_attempt_lifecycle(
     config: &LocalOutputConfig,
-    fixture: &ProducerFixture,
+    prepared: &PreparedProducer,
     child: &SingBoxChild,
+    sinks: &mut Option<SinkWorkers>,
 ) -> Result<(), String> {
+    let fixture = prepared.fixture();
     let first_request = request_for_child(fixture, child, [0xa1; FUNCTIONAL_CANARY_NONCE_BYTES]);
     let first_authority = collector::SupervisedDeliveryReportPrebindAuthority::fixture(
         &fixture.profile,
@@ -338,6 +542,7 @@ fn exercise_attempt_lifecycle(
         .into_engine_handoff()
         .install_into(child)
         .map_err(|error| format!("install successor supervised report: {error}"))?;
+    *sinks = Some(prepared.start_sinks(SinkExpectations::for_request(&successor_request)?)?);
 
     let mut client_tuples = [None; FUNCTIONAL_CANARY_FLOW_SLOTS];
     for flow in CanaryFlow::ALL {
@@ -357,7 +562,8 @@ fn exercise_attempt_lifecycle(
                 tuple
             }
             CanaryFlowProtocol::Udp => {
-                let (socket, tuple) = send_udp_flow(source, destination, &payload)?;
+                let (socket, tuple) =
+                    send_udp_flow(udp_send_mode(flow)?, source, destination, &payload)?;
                 successor_collector
                     .ingest_fixture_record_until(successor_request.deadline().expires_at())
                     .map_err(|error| format!("collect {flow:?} supervised report: {error}"))?;
@@ -484,20 +690,26 @@ fn send_tcp_flow(
 }
 
 fn send_udp_flow(
+    mode: UdpSendMode,
     source: SocketAddr,
     destination: SocketAddr,
     payload: &[u8],
 ) -> Result<(UdpSocket, CanaryFlowTuple), String> {
-    let (socket, initial_mark) = connect_marked_udp(source, destination, 0, IO_TIMEOUT)?;
-    let connected_mark = udp_socket_mark(&socket)?;
-    if initial_mark != 0 || mark_role(connected_mark) != 0 {
+    let (socket, initial_mark) = match mode {
+        UdpSendMode::Connected => connect_marked_udp(source, destination, 0, IO_TIMEOUT)?,
+        UdpSendMode::Unconnected => bind_marked_udp(source, 0, IO_TIMEOUT)?,
+    };
+    let observed_mark = udp_socket_mark(&socket)?;
+    if initial_mark != 0 || mark_role(observed_mark) != 0 {
         return Err(format!(
-            "supervised UDP client entered the owned mark field: initial={initial_mark:#x} connected={connected_mark:#x}"
+            "supervised UDP client entered the owned mark field: initial={initial_mark:#x} observed={observed_mark:#x}"
         ));
     }
-    let sent = socket
-        .send(payload)
-        .map_err(|error| format!("send supervised UDP payload: {error}"))?;
+    let sent = match mode {
+        UdpSendMode::Connected => socket.send(payload),
+        UdpSendMode::Unconnected => socket.send_to(payload, destination),
+    }
+    .map_err(|error| format!("send supervised {mode:?} UDP payload: {error}"))?;
     if sent != payload.len() {
         return Err(format!(
             "supervised UDP payload was partial: sent={sent} expected={}",
@@ -507,15 +719,80 @@ fn send_udp_flow(
     let local = socket
         .local_addr()
         .map_err(|error| format!("read supervised UDP client source: {error}"))?;
-    let remote = socket
-        .peer_addr()
-        .map_err(|error| format!("read supervised UDP client destination: {error}"))?;
+    let remote = match mode {
+        UdpSendMode::Connected => socket
+            .peer_addr()
+            .map_err(|error| format!("read supervised UDP client destination: {error}"))?,
+        UdpSendMode::Unconnected => match socket.peer_addr() {
+            Err(error) if error.kind() == std::io::ErrorKind::NotConnected => destination,
+            Err(error) => {
+                return Err(format!(
+                    "inspect unconnected supervised UDP client peer: {error}"
+                ));
+            }
+            Ok(peer) => {
+                return Err(format!(
+                    "unconnected supervised UDP client acquired peer {peer}"
+                ));
+            }
+        },
+    };
     if local.ip() != source.ip() || remote != destination {
         return Err(format!(
             "supervised UDP client tuple changed: source={local} destination={remote}"
         ));
     }
     Ok((socket, CanaryFlowTuple::new(local, remote)))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UdpSendMode {
+    Connected,
+    Unconnected,
+}
+
+fn udp_send_mode(flow: CanaryFlow) -> Result<UdpSendMode, String> {
+    match flow.kind() {
+        CanaryFlowKind::UdpEcho => Ok(UdpSendMode::Connected),
+        CanaryFlowKind::DnsUdp => Ok(UdpSendMode::Unconnected),
+        CanaryFlowKind::TcpEcho | CanaryFlowKind::DnsTcp => {
+            Err(format!("non-UDP flow {flow:?} requested a UDP send mode"))
+        }
+    }
+}
+
+struct SinkExpectations {
+    tcp: Vec<Vec<u8>>,
+    udp: Vec<Vec<u8>>,
+}
+
+impl SinkExpectations {
+    fn one_tcp(payload: Vec<u8>) -> Self {
+        Self {
+            tcp: vec![payload],
+            udp: Vec::new(),
+        }
+    }
+
+    fn for_request(request: &CanaryAttemptRequest) -> Result<Self, String> {
+        let mut tcp = Vec::with_capacity(EXPECTED_TCP_SINK_FLOWS);
+        let mut udp = Vec::with_capacity(EXPECTED_UDP_SINK_FLOWS);
+        for flow in CanaryFlow::ALL {
+            let payload = flow_payload(request, flow)?;
+            match flow.protocol() {
+                CanaryFlowProtocol::Tcp => tcp.push(payload),
+                CanaryFlowProtocol::Udp => udp.push(payload),
+            }
+        }
+        if tcp.len() != EXPECTED_TCP_SINK_FLOWS || udp.len() != EXPECTED_UDP_SINK_FLOWS {
+            return Err(format!(
+                "supervised sink expectation count drifted: tcp={} udp={}",
+                tcp.len(),
+                udp.len()
+            ));
+        }
+        Ok(Self { tcp, udp })
+    }
 }
 
 struct PreparedSinks {
@@ -526,24 +803,27 @@ struct PreparedSinks {
 
 impl PreparedSinks {
     fn bind() -> Result<Self, String> {
-        let tcp = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        let port = NonZeroU16::new(SINK_PORT).expect("supervised sink port is nonzero");
+        let tcp = TcpListener::bind((Ipv4Addr::LOCALHOST, port.get()))
             .map_err(|error| format!("bind supervised TCP sink: {error}"))?;
         tcp.set_nonblocking(true)
             .map_err(|error| format!("make supervised TCP sink nonblocking: {error}"))?;
-        let port = NonZeroU16::new(
-            tcp.local_addr()
-                .map_err(|error| format!("inspect supervised TCP sink: {error}"))?
-                .port(),
-        )
-        .ok_or_else(|| "supervised TCP sink received port zero".to_owned())?;
+        if tcp
+            .local_addr()
+            .map_err(|error| format!("inspect supervised TCP sink: {error}"))?
+            .port()
+            != port.get()
+        {
+            return Err("supervised TCP sink changed its fixed port".to_owned());
+        }
         let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, port.get()))
             .map_err(|error| format!("bind supervised UDP sink: {error}"))?;
-        udp.set_read_timeout(Some(SINK_TIMEOUT))
+        udp.set_read_timeout(Some(SINK_POLL_INTERVAL))
             .map_err(|error| format!("bound supervised UDP sink timeout: {error}"))?;
         Ok(Self { port, tcp, udp })
     }
 
-    fn spawn(&self) -> Result<SinkWorkers, String> {
+    fn spawn(&self, expectations: SinkExpectations) -> Result<SinkWorkers, String> {
         let tcp = self
             .tcp
             .try_clone()
@@ -552,27 +832,62 @@ impl PreparedSinks {
             .udp
             .try_clone()
             .map_err(|error| format!("clone supervised UDP sink: {error}"))?;
-        let tcp = thread::spawn(move || run_tcp_sink(tcp));
-        let udp = thread::spawn(move || run_udp_sink(udp));
-        Ok(SinkWorkers { tcp, udp })
+        let SinkExpectations {
+            tcp: tcp_expectations,
+            udp: udp_expectations,
+        } = expectations;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let tcp_cancel = Arc::clone(&cancel);
+        let tcp = thread::Builder::new()
+            .name("flux-supervised-tcp-sink".to_owned())
+            .spawn(move || run_tcp_sink(tcp, tcp_expectations, &tcp_cancel))
+            .map_err(|error| format!("spawn supervised TCP sink: {error}"))?;
+        let mut workers = SinkWorkers {
+            cancel,
+            tcp: Some(tcp),
+            udp: None,
+        };
+        let udp_cancel = Arc::clone(&workers.cancel);
+        match thread::Builder::new()
+            .name("flux-supervised-udp-sink".to_owned())
+            .spawn(move || run_udp_sink(udp, udp_expectations, &udp_cancel))
+        {
+            Ok(udp) => {
+                workers.udp = Some(udp);
+                Ok(workers)
+            }
+            Err(error) => {
+                let cleanup = workers.cancel_and_join();
+                match cleanup {
+                    Ok(()) => Err(format!("spawn supervised UDP sink: {error}")),
+                    Err(cleanup_error) => Err(format!(
+                        "spawn supervised UDP sink: {error}; partial sink cleanup also failed: {cleanup_error}"
+                    )),
+                }
+            }
+        }
     }
 }
 
 struct SinkWorkers {
-    tcp: JoinHandle<Result<(), String>>,
-    udp: JoinHandle<Result<(), String>>,
+    cancel: Arc<AtomicBool>,
+    tcp: Option<JoinHandle<Result<(), String>>>,
+    udp: Option<JoinHandle<Result<(), String>>>,
 }
 
 impl SinkWorkers {
-    fn join(self) -> Result<(), String> {
-        let tcp = self
-            .tcp
-            .join()
-            .map_err(|_| "supervised TCP sink panicked".to_owned())?;
-        let udp = self
-            .udp
-            .join()
-            .map_err(|_| "supervised UDP sink panicked".to_owned())?;
+    fn join(mut self) -> Result<(), String> {
+        self.join_all()
+    }
+
+    fn cancel_and_join(mut self) -> Result<(), String> {
+        self.cancel.store(true, Ordering::Release);
+        self.join_all()
+    }
+
+    fn join_all(&mut self) -> Result<(), String> {
+        let tcp = join_sink_worker(self.tcp.take(), "TCP");
+        let udp = join_sink_worker(self.udp.take(), "UDP");
         match (tcp, udp) {
             (Ok(()), Ok(())) => Ok(()),
             (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
@@ -583,10 +898,37 @@ impl SinkWorkers {
     }
 }
 
-fn run_tcp_sink(listener: TcpListener) -> Result<(), String> {
+impl Drop for SinkWorkers {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Release);
+        let _ = self.join_all();
+    }
+}
+
+fn join_sink_worker(
+    worker: Option<JoinHandle<Result<(), String>>>,
+    label: &str,
+) -> Result<(), String> {
+    let Some(worker) = worker else {
+        return Ok(());
+    };
+    worker
+        .join()
+        .map_err(|_| format!("supervised {label} sink panicked"))?
+}
+
+fn run_tcp_sink(
+    listener: TcpListener,
+    mut expectations: Vec<Vec<u8>>,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
     let deadline = Instant::now() + SINK_TIMEOUT;
-    for index in 0..EXPECTED_TCP_SINK_FLOWS {
+    let expected_flows = expectations.len();
+    for index in 0..expected_flows {
         let mut stream = loop {
+            if cancel.load(Ordering::Acquire) {
+                return Ok(());
+            }
             match listener.accept() {
                 Ok((stream, _)) => break stream,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -598,34 +940,154 @@ fn run_tcp_sink(listener: TcpListener) -> Result<(), String> {
                 Err(error) => return Err(format!("accept supervised TCP sink: {error}")),
             }
         };
-        let remaining = deadline
-            .saturating_duration_since(Instant::now())
-            .max(Duration::from_millis(1));
+        let maximum_length = expectations
+            .iter()
+            .map(Vec::len)
+            .max()
+            .ok_or_else(|| "supervised TCP sink exhausted its expectations early".to_owned())?;
+        let Some(payload) =
+            read_bounded_tcp_payload_to_eof(&mut stream, maximum_length, deadline, cancel, index)?
+        else {
+            return Ok(());
+        };
+        take_matching_sink_expectation(&mut expectations, &payload, "TCP", index)?;
+    }
+    Ok(())
+}
+
+fn read_bounded_tcp_payload_to_eof(
+    stream: &mut TcpStream,
+    maximum_length: usize,
+    deadline: Instant,
+    cancel: &AtomicBool,
+    index: usize,
+) -> Result<Option<Vec<u8>>, String> {
+    let mut payload = Vec::with_capacity(maximum_length);
+    let mut buffer = [0_u8; 512];
+    while payload.len() < maximum_length {
+        let remaining = maximum_length - payload.len();
+        let buffer_length = remaining.min(buffer.len());
+        let Some(read) =
+            read_tcp_with_deadline(stream, &mut buffer[..buffer_length], deadline, cancel)?
+        else {
+            return Ok(None);
+        };
+        if read == 0 {
+            return Ok(Some(payload));
+        }
+        payload.extend_from_slice(&buffer[..read]);
+    }
+    let mut suffix = [0_u8; 1];
+    match read_tcp_with_deadline(stream, &mut suffix, deadline, cancel)? {
+        None => Ok(None),
+        Some(0) => Ok(Some(payload)),
+        Some(_) => Err(format!(
+            "supervised TCP sink flow {index} exceeded the bounded {maximum_length}-byte payload cap"
+        )),
+    }
+}
+
+fn read_tcp_with_deadline(
+    stream: &mut TcpStream,
+    buffer: &mut [u8],
+    deadline: Instant,
+    cancel: &AtomicBool,
+) -> Result<Option<usize>, String> {
+    loop {
+        if cancel.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("supervised TCP sink reached its absolute deadline".to_owned());
+        }
         stream
-            .set_read_timeout(Some(remaining))
+            .set_read_timeout(Some(remaining.min(SINK_POLL_INTERVAL)))
             .map_err(|error| format!("bound supervised TCP sink read: {error}"))?;
-        let mut payload = Vec::new();
-        stream
-            .read_to_end(&mut payload)
-            .map_err(|error| format!("read supervised TCP sink flow {index}: {error}"))?;
-        if payload.is_empty() {
-            return Err(format!("supervised TCP sink flow {index} was empty"));
+        match stream.read(buffer) {
+            Ok(read) => return Ok(Some(read)),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(error) => return Err(format!("read supervised TCP sink: {error}")),
+        }
+    }
+}
+
+fn run_udp_sink(
+    socket: UdpSocket,
+    mut expectations: Vec<Vec<u8>>,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    let deadline = Instant::now() + SINK_TIMEOUT;
+    let expected_flows = expectations.len();
+    for index in 0..expected_flows {
+        let maximum_length = expectations
+            .iter()
+            .map(Vec::len)
+            .max()
+            .ok_or_else(|| "supervised UDP sink exhausted its expectations early".to_owned())?;
+        let mut payload = vec![0_u8; maximum_length + 1];
+        loop {
+            if cancel.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            match socket.recv_from(&mut payload) {
+                Ok((length, _)) => {
+                    take_matching_sink_expectation(
+                        &mut expectations,
+                        &payload[..length],
+                        "UDP",
+                        index,
+                    )?;
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    if Instant::now() >= deadline {
+                        return Err(format!("supervised UDP sink timed out before flow {index}"));
+                    }
+                }
+                Err(error) => {
+                    return Err(format!("receive supervised UDP sink flow {index}: {error}"));
+                }
+            }
         }
     }
     Ok(())
 }
 
-fn run_udp_sink(socket: UdpSocket) -> Result<(), String> {
-    let mut payload = [0_u8; 512];
-    for index in 0..EXPECTED_UDP_SINK_FLOWS {
-        let (length, _) = socket
-            .recv_from(&mut payload)
-            .map_err(|error| format!("receive supervised UDP sink flow {index}: {error}"))?;
-        if length == 0 {
-            return Err(format!("supervised UDP sink flow {index} was empty"));
-        }
+fn take_matching_sink_expectation(
+    expectations: &mut Vec<Vec<u8>>,
+    payload: &[u8],
+    protocol: &str,
+    index: usize,
+) -> Result<(), String> {
+    if let Some(position) = expectations
+        .iter()
+        .position(|expected| expected.as_slice() == payload)
+    {
+        expectations.swap_remove(position);
+        return Ok(());
     }
-    Ok(())
+    let remaining_lengths = expectations.iter().map(Vec::len).collect::<Vec<_>>();
+    let detail = if remaining_lengths.contains(&payload.len()) {
+        "payload differed from every remaining canonical value"
+    } else {
+        "payload length differed from every remaining canonical value"
+    };
+    Err(format!(
+        "supervised {protocol} sink flow {index} {detail}: observed={} remaining={remaining_lengths:?}",
+        payload.len()
+    ))
 }
 
 #[derive(Clone)]
@@ -979,6 +1441,29 @@ fn validate_supervised_counters(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    use flux_platform::SingBoxExit;
+
+    #[test]
+    fn explicit_termination_rejects_an_already_exited_producer() {
+        assert_eq!(
+            require_explicit_termination(TerminationOutcome::AlreadyExited {
+                exit: SingBoxExit::Code(7),
+            }),
+            Err("supervised producer exited before explicit termination: exit code 7".to_owned())
+        );
+        for outcome in [
+            TerminationOutcome::Terminated {
+                exit: SingBoxExit::Signal(libc::SIGTERM),
+            },
+            TerminationOutcome::Killed {
+                exit: SingBoxExit::Signal(libc::SIGKILL),
+            },
+        ] {
+            assert!(require_explicit_termination(outcome).is_ok());
+        }
+    }
 
     #[test]
     fn supervised_selectors_match_fixture_responder_ports() {
@@ -997,6 +1482,148 @@ mod tests {
                 ("udp", ports.dns().get()),
                 ("tcp", ports.dns().get()),
             ]
+        );
+    }
+
+    #[test]
+    fn supervised_udp_flows_cover_connected_and_unconnected_clients() {
+        assert_eq!(
+            udp_send_mode(CanaryFlow::Ipv4UdpEcho),
+            Ok(UdpSendMode::Connected)
+        );
+        assert_eq!(
+            udp_send_mode(CanaryFlow::Ipv6UdpEcho),
+            Ok(UdpSendMode::Connected)
+        );
+        assert_eq!(
+            udp_send_mode(CanaryFlow::Ipv4DnsUdp),
+            Ok(UdpSendMode::Unconnected)
+        );
+        assert_eq!(
+            udp_send_mode(CanaryFlow::Ipv6DnsUdp),
+            Ok(UdpSendMode::Unconnected)
+        );
+        assert!(udp_send_mode(CanaryFlow::Ipv4TcpEcho).is_err());
+    }
+
+    #[test]
+    fn required_cleanup_runs_and_preserves_primary_and_cleanup_failures() {
+        let called = Cell::new(false);
+        let result = finish_with_required_cleanup(Err::<(), _>("primary".to_owned()), || {
+            called.set(true);
+            Err("cleanup".to_owned())
+        });
+        assert!(called.get());
+        assert_eq!(
+            result,
+            Err("primary; producer cleanup also failed: cleanup".to_owned())
+        );
+    }
+
+    #[test]
+    fn sink_join_observes_both_workers_after_one_panics() {
+        let udp_joined = Arc::new(AtomicBool::new(false));
+        let udp_joined_by_worker = Arc::clone(&udp_joined);
+        let workers = SinkWorkers {
+            cancel: Arc::new(AtomicBool::new(false)),
+            tcp: Some(thread::spawn(|| -> Result<(), String> {
+                panic!("TCP sink fixture panic")
+            })),
+            udp: Some(thread::spawn(move || {
+                udp_joined_by_worker.store(true, Ordering::Release);
+                Ok(())
+            })),
+        };
+
+        assert_eq!(
+            workers.join(),
+            Err("supervised TCP sink panicked".to_owned())
+        );
+        assert!(udp_joined.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn tcp_sink_read_requires_exact_bytes_and_eof() {
+        assert!(run_tcp_sink_read_case(vec![0x41; TCP_ECHO_PAYLOAD_BYTES]).is_ok());
+        let error = run_tcp_sink_read_case(vec![0x42; TCP_ECHO_PAYLOAD_BYTES])
+            .expect_err("same-length mismatch must fail exact payload identity");
+        assert!(error.contains("payload differed from every remaining canonical value"));
+        let error = run_tcp_sink_read_case(vec![0x41; TCP_ECHO_PAYLOAD_BYTES + 1])
+            .expect_err("suffix must exceed the exact payload boundary");
+        assert!(error.contains("exceeded the bounded 32-byte payload cap"));
+    }
+
+    fn run_tcp_sink_read_case(payload: Vec<u8>) -> Result<(), String> {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind TCP sink fixture");
+        let address = listener.local_addr().expect("inspect TCP sink fixture");
+        let client = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).expect("connect TCP sink fixture");
+            stream.write_all(&payload).expect("write TCP sink fixture");
+            stream
+                .shutdown(Shutdown::Write)
+                .expect("half-close TCP sink fixture");
+        });
+        let (mut stream, _) = listener.accept().expect("accept TCP sink fixture");
+        let cancel = AtomicBool::new(false);
+        let result = read_bounded_tcp_payload_to_eof(
+            &mut stream,
+            TCP_ECHO_PAYLOAD_BYTES,
+            Instant::now() + Duration::from_secs(1),
+            &cancel,
+            0,
+        );
+        client.join().expect("join TCP sink fixture client");
+        let payload =
+            result?.ok_or_else(|| "TCP sink fixture was unexpectedly cancelled".to_owned())?;
+        let mut expectations = vec![vec![0x41; TCP_ECHO_PAYLOAD_BYTES]];
+        take_matching_sink_expectation(&mut expectations, &payload, "TCP", 0)
+    }
+
+    #[test]
+    fn udp_sink_rejects_a_same_length_payload_mismatch() {
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind UDP sink fixture");
+        let address = socket.local_addr().expect("inspect UDP sink fixture");
+        let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind UDP client fixture");
+        client
+            .send_to(&[0x42; TCP_ECHO_PAYLOAD_BYTES], address)
+            .expect("send UDP sink fixture payload");
+        let cancel = AtomicBool::new(false);
+        let error = run_udp_sink(socket, vec![vec![0x41; TCP_ECHO_PAYLOAD_BYTES]], &cancel)
+            .expect_err("same-length UDP mismatch must fail exact payload identity");
+        assert!(error.contains("payload differed from every remaining canonical value"));
+    }
+
+    #[test]
+    fn sink_expectation_matching_allows_reordering_and_preserves_duplicate_counts() {
+        let echo = vec![0x41; TCP_ECHO_PAYLOAD_BYTES];
+        let dns = vec![0x42; TCP_ECHO_PAYLOAD_BYTES + 1];
+        let mut expectations = vec![echo.clone(), echo.clone(), dns.clone()];
+
+        assert!(take_matching_sink_expectation(&mut expectations, &dns, "UDP", 0).is_ok());
+        assert_eq!(expectations, vec![echo.clone(), echo.clone()]);
+        assert!(take_matching_sink_expectation(&mut expectations, &echo, "UDP", 1).is_ok());
+        assert_eq!(expectations, vec![echo.clone()]);
+        assert!(take_matching_sink_expectation(&mut expectations, &echo, "UDP", 2).is_ok());
+        assert!(expectations.is_empty());
+        assert!(take_matching_sink_expectation(&mut expectations, &echo, "UDP", 3).is_err());
+    }
+
+    #[test]
+    fn supervised_config_is_fixed_port_and_content_digest_bound() {
+        let sink_port = NonZeroU16::new(SINK_PORT).expect("fixed sink port is nonzero");
+        let template = supervised_config_template(sink_port).expect("encode config template");
+        let listener_port = NonZeroU16::new(TPROXY_PORT).expect("TPROXY port is nonzero");
+        let artifact =
+            compile_tproxy_engine_config(TproxyEngineConfigRequest::new(&template, listener_port))
+                .expect("compile canonical supervised config");
+        assert_eq!(
+            artifact.content_sha256(),
+            &EXPECTED_SUPERVISED_CONFIG_SHA256
+        );
+        assert!(
+            std::str::from_utf8(artifact.bytes())
+                .expect("canonical config is UTF-8")
+                .contains("\"override_port\":41390")
         );
     }
 }

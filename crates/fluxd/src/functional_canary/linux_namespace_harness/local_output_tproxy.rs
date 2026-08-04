@@ -11,7 +11,7 @@ use super::transparent_tcp::{
     set_socket_mark as set_tcp_socket_mark, socket_mark as tcp_socket_mark,
 };
 use super::transparent_udp::{
-    TransparentUdpListener, connect_marked as connect_marked_udp,
+    TransparentUdpListener, bind_marked as bind_marked_udp, connect_marked as connect_marked_udp,
     connect_transparent_marked as connect_transparent_marked_udp,
     set_socket_mark as set_udp_socket_mark, socket_mark as udp_socket_mark,
 };

@@ -1029,6 +1029,8 @@ mod tests {
     use std::process::Command;
     use std::sync::Arc;
     #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+    use std::sync::atomic::{AtomicBool, Ordering};
+    #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
     use std::thread::{self, JoinHandle};
     use std::time::Duration;
 
@@ -1397,41 +1399,308 @@ esac
     }
 
     #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
-    fn start_real_producer_sinks() -> (NonZeroU16, JoinHandle<()>, JoinHandle<()>) {
+    const REAL_PRODUCER_SINK_TIMEOUT: Duration = Duration::from_secs(10);
+
+    #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+    const REAL_PRODUCER_SINK_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+    #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+    struct PreparedRealProducerSinks {
+        port: NonZeroU16,
+        tcp: TcpListener,
+        udp: UdpSocket,
+    }
+
+    #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+    impl PreparedRealProducerSinks {
+        const fn port(&self) -> NonZeroU16 {
+            self.port
+        }
+
+        fn spawn(
+            self,
+            tcp_expectations: Vec<Vec<u8>>,
+            udp_expectations: Vec<Vec<u8>>,
+        ) -> RealProducerSinkWorkers {
+            let deadline = Instant::now() + REAL_PRODUCER_SINK_TIMEOUT;
+            let cancel = Arc::new(AtomicBool::new(false));
+            let tcp_cancel = Arc::clone(&cancel);
+            let tcp = thread::Builder::new()
+                .name("flux-real-producer-tcp-sink".to_owned())
+                .spawn(move || {
+                    run_real_producer_tcp_sink(self.tcp, tcp_expectations, &tcp_cancel, deadline)
+                })
+                .expect("spawn real producer TCP sink");
+            let mut workers = RealProducerSinkWorkers {
+                cancel,
+                tcp: Some(tcp),
+                udp: None,
+            };
+            let udp_cancel = Arc::clone(&workers.cancel);
+            match thread::Builder::new()
+                .name("flux-real-producer-udp-sink".to_owned())
+                .spawn(move || {
+                    run_real_producer_udp_sink(self.udp, udp_expectations, &udp_cancel, deadline)
+                }) {
+                Ok(udp) => {
+                    workers.udp = Some(udp);
+                    workers
+                }
+                Err(error) => panic!("spawn real producer UDP sink: {error}"),
+            }
+        }
+    }
+
+    #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+    struct RealProducerSinkWorkers {
+        cancel: Arc<AtomicBool>,
+        tcp: Option<JoinHandle<Result<(), String>>>,
+        udp: Option<JoinHandle<Result<(), String>>>,
+    }
+
+    #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+    impl RealProducerSinkWorkers {
+        fn join(mut self) -> Result<(), String> {
+            self.join_all()
+        }
+
+        fn join_all(&mut self) -> Result<(), String> {
+            let tcp = join_real_producer_sink_worker(self.tcp.take(), "TCP");
+            let udp = join_real_producer_sink_worker(self.udp.take(), "UDP");
+            match (tcp, udp) {
+                (Ok(()), Ok(())) => Ok(()),
+                (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+                (Err(tcp_error), Err(udp_error)) => {
+                    Err(format!("{tcp_error}; UDP sink also failed: {udp_error}"))
+                }
+            }
+        }
+    }
+
+    #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+    impl Drop for RealProducerSinkWorkers {
+        fn drop(&mut self) {
+            self.cancel.store(true, Ordering::Release);
+            let _ = self.join_all();
+        }
+    }
+
+    #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+    fn join_real_producer_sink_worker(
+        worker: Option<JoinHandle<Result<(), String>>>,
+        label: &str,
+    ) -> Result<(), String> {
+        let Some(worker) = worker else {
+            return Ok(());
+        };
+        worker
+            .join()
+            .map_err(|_| format!("real producer {label} sink panicked"))?
+    }
+
+    #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+    fn bind_real_producer_sinks() -> PreparedRealProducerSinks {
         let tcp = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind TCP producer sink");
+        tcp.set_nonblocking(true)
+            .expect("make TCP producer sink nonblocking");
         let port = NonZeroU16::new(tcp.local_addr().expect("inspect TCP producer sink").port())
             .expect("TCP producer sink port is nonzero");
         let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, port.get()))
             .expect("bind UDP producer sink on the same port");
-        udp.set_read_timeout(Some(Duration::from_secs(10)))
+        udp.set_read_timeout(Some(REAL_PRODUCER_SINK_POLL_INTERVAL))
             .expect("bound UDP producer sink timeout");
+        PreparedRealProducerSinks { port, tcp, udp }
+    }
 
-        let tcp_thread = thread::spawn(move || {
-            for _ in 0..2 {
-                let (mut connection, _) = tcp.accept().expect("accept producer sink connection");
-                connection
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .expect("bound producer sink connection timeout");
-                let mut payload = Vec::new();
-                connection
-                    .read_to_end(&mut payload)
-                    .expect("read producer sink request");
-                assert!(
-                    !payload.is_empty(),
-                    "producer sink request must not be empty"
-                );
+    #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+    fn run_real_producer_tcp_sink(
+        listener: TcpListener,
+        mut expectations: Vec<Vec<u8>>,
+        cancel: &AtomicBool,
+        deadline: Instant,
+    ) -> Result<(), String> {
+        let expected_flows = expectations.len();
+        for index in 0..expected_flows {
+            let mut connection = loop {
+                if cancel.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "real producer TCP sink timed out before flow {index}"
+                    ));
+                }
+                match listener.accept() {
+                    Ok((connection, _)) => break connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => {
+                        return Err(format!(
+                            "accept real producer TCP sink flow {index}: {error}"
+                        ));
+                    }
+                }
+            };
+            let maximum_length = expectations.iter().map(Vec::len).max().ok_or_else(|| {
+                "real producer TCP sink exhausted its expectations early".to_owned()
+            })?;
+            let Some(payload) = read_bounded_real_producer_payload(
+                &mut connection,
+                maximum_length,
+                deadline,
+                cancel,
+                index,
+            )?
+            else {
+                return Ok(());
+            };
+            take_matching_real_producer_expectation(&mut expectations, &payload, "TCP", index)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+    fn read_bounded_real_producer_payload(
+        connection: &mut TcpStream,
+        maximum_length: usize,
+        deadline: Instant,
+        cancel: &AtomicBool,
+        index: usize,
+    ) -> Result<Option<Vec<u8>>, String> {
+        let mut payload = Vec::with_capacity(maximum_length);
+        let mut buffer = [0_u8; 512];
+        while payload.len() < maximum_length {
+            let remaining = maximum_length - payload.len();
+            let buffer_length = remaining.min(buffer.len());
+            let Some(read) = read_real_producer_sink_chunk(
+                connection,
+                &mut buffer[..buffer_length],
+                deadline,
+                cancel,
+            )?
+            else {
+                return Ok(None);
+            };
+            if read == 0 {
+                return Ok(Some(payload));
             }
-        });
-        let udp_thread = thread::spawn(move || {
-            let mut payload = [0_u8; 512];
-            for _ in 0..2 {
-                let (length, _) = udp
-                    .recv_from(&mut payload)
-                    .expect("receive producer sink datagram");
-                assert!(length > 0, "producer sink datagram must not be empty");
+            payload.extend_from_slice(&buffer[..read]);
+        }
+        let mut suffix = [0_u8; 1];
+        match read_real_producer_sink_chunk(connection, &mut suffix, deadline, cancel)? {
+            None => Ok(None),
+            Some(0) => Ok(Some(payload)),
+            Some(_) => Err(format!(
+                "real producer TCP sink flow {index} exceeded the bounded {maximum_length}-byte payload cap"
+            )),
+        }
+    }
+
+    #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+    fn read_real_producer_sink_chunk(
+        connection: &mut TcpStream,
+        buffer: &mut [u8],
+        deadline: Instant,
+        cancel: &AtomicBool,
+    ) -> Result<Option<usize>, String> {
+        loop {
+            if cancel.load(Ordering::Acquire) {
+                return Ok(None);
             }
-        });
-        (port, tcp_thread, udp_thread)
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err("real producer TCP sink reached its absolute deadline".to_owned());
+            }
+            connection
+                .set_read_timeout(Some(remaining.min(REAL_PRODUCER_SINK_POLL_INTERVAL)))
+                .map_err(|error| format!("bound real producer TCP sink read: {error}"))?;
+            match connection.read(buffer) {
+                Ok(read) => return Ok(Some(read)),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(error) => return Err(format!("read real producer TCP sink: {error}")),
+            }
+        }
+    }
+
+    #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+    fn run_real_producer_udp_sink(
+        socket: UdpSocket,
+        mut expectations: Vec<Vec<u8>>,
+        cancel: &AtomicBool,
+        deadline: Instant,
+    ) -> Result<(), String> {
+        let expected_flows = expectations.len();
+        for index in 0..expected_flows {
+            let maximum_length = expectations.iter().map(Vec::len).max().ok_or_else(|| {
+                "real producer UDP sink exhausted its expectations early".to_owned()
+            })?;
+            let mut payload = vec![0_u8; maximum_length + 1];
+            loop {
+                if cancel.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "real producer UDP sink timed out before flow {index}"
+                    ));
+                }
+                match socket.recv_from(&mut payload) {
+                    Ok((length, _)) => {
+                        take_matching_real_producer_expectation(
+                            &mut expectations,
+                            &payload[..length],
+                            "UDP",
+                            index,
+                        )?;
+                        break;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) => {}
+                    Err(error) => {
+                        return Err(format!(
+                            "receive real producer UDP sink flow {index}: {error}"
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+    fn take_matching_real_producer_expectation(
+        expectations: &mut Vec<Vec<u8>>,
+        payload: &[u8],
+        protocol: &str,
+        index: usize,
+    ) -> Result<(), String> {
+        if let Some(position) = expectations
+            .iter()
+            .position(|expected| expected.as_slice() == payload)
+        {
+            expectations.swap_remove(position);
+            return Ok(());
+        }
+        let remaining_lengths = expectations.iter().map(Vec::len).collect::<Vec<_>>();
+        let detail = if remaining_lengths.contains(&payload.len()) {
+            "payload differed from every remaining canonical value"
+        } else {
+            "payload length differed from every remaining canonical value"
+        };
+        Err(format!(
+            "real producer {protocol} sink flow {index} {detail}: observed={} remaining={remaining_lengths:?}",
+            payload.len()
+        ))
     }
 
     #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
@@ -1782,8 +2051,8 @@ esac
             .map(PathBuf::from)
             .expect("real producer composition requires its exact binary path");
         enable_isolated_loopback();
-        let (sink_port, tcp_sink, udp_sink) = start_real_producer_sinks();
-        let fixture = NativeLaunchControlFixture::real_producer(binary, sink_port);
+        let prepared_sinks = bind_real_producer_sinks();
+        let fixture = NativeLaunchControlFixture::real_producer(binary, prepared_sinks.port());
         let mut child = fixture.spawn();
         fixture
             .adapter
@@ -1852,24 +2121,29 @@ esac
                 panic!("real producer composition requires listener readiness")
             }
         };
-        let tcp_echo = send_real_producer_tcp(listener_port, successor_request.nonce().as_bytes());
+        let echo_payload = successor_request.nonce().as_bytes().to_vec();
+        let dns_udp = real_producer_dns_query(&successor_request, CanaryFlow::Ipv4DnsUdp, false);
+        let dns_tcp = real_producer_dns_query(&successor_request, CanaryFlow::Ipv4DnsTcp, true);
+        let sinks = prepared_sinks.spawn(
+            vec![echo_payload.clone(), dns_tcp.clone()],
+            vec![echo_payload.clone(), dns_udp.clone()],
+        );
+        let tcp_echo = send_real_producer_tcp(listener_port, &echo_payload);
         successor_collector
             .ingest_fixture_record_until(Instant::now() + Duration::from_secs(1))
             .expect("parse real producer IPv4 TCP echo report");
         drop(tcp_echo);
 
-        send_real_producer_udp(listener_port, successor_request.nonce().as_bytes());
+        send_real_producer_udp(listener_port, &echo_payload);
         successor_collector
             .ingest_fixture_record_until(Instant::now() + Duration::from_secs(1))
             .expect("parse real producer IPv4 UDP echo report");
 
-        let dns_udp = real_producer_dns_query(&successor_request, CanaryFlow::Ipv4DnsUdp, false);
         send_real_producer_udp(listener_port, &dns_udp);
         successor_collector
             .ingest_fixture_record_until(Instant::now() + Duration::from_secs(1))
             .expect("parse real producer IPv4 DNS-over-UDP report");
 
-        let dns_tcp = real_producer_dns_query(&successor_request, CanaryFlow::Ipv4DnsTcp, true);
         let dns_tcp_client = send_real_producer_tcp(listener_port, &dns_tcp);
         successor_collector
             .ingest_fixture_record_until(Instant::now() + Duration::from_secs(1))
@@ -1882,8 +2156,7 @@ esac
         assert_eq!(drained.report_object(), expected_report_object);
         assert_eq!(drained.profile_revision(), fixture.profile.revision());
         assert!(drained.terminal_observed_at() <= drained.eof_observed_at());
-        tcp_sink.join().expect("join TCP producer sink");
-        udp_sink.join().expect("join UDP producer sink");
+        sinks.join().expect("join real producer sinks");
         assert_eq!(
             fixture
                 .adapter

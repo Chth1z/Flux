@@ -233,6 +233,21 @@ pub(super) fn connect_marked(
     Ok((socket, observed_mark))
 }
 
+pub(super) fn bind_marked(
+    source: SocketAddr,
+    mark: u32,
+    timeout: Duration,
+) -> Result<(UdpSocket, u32), String> {
+    let (socket, observed_mark, transparent) =
+        configure_socket(source, None, mark, timeout, false)?;
+    if transparent.is_some() {
+        return Err(
+            "non-transparent bound UDP socket unexpectedly reported transparency".to_owned(),
+        );
+    }
+    Ok((socket, observed_mark))
+}
+
 pub(super) fn connect_transparent_marked(
     source: SocketAddr,
     destination: SocketAddr,
@@ -270,11 +285,26 @@ fn connect_configured(
     timeout: Duration,
     transparent: bool,
 ) -> Result<(UdpSocket, u32, Option<i32>), String> {
-    if source.is_ipv4() != destination.is_ipv4() {
+    configure_socket(source, Some(destination), mark, timeout, transparent)
+}
+
+fn configure_socket(
+    source: SocketAddr,
+    destination: Option<SocketAddr>,
+    mark: u32,
+    timeout: Duration,
+    transparent: bool,
+) -> Result<(UdpSocket, u32, Option<i32>), String> {
+    if let Some(destination) = destination
+        && source.is_ipv4() != destination.is_ipv4()
+    {
         return Err(format!(
             "configured UDP source {source} and destination {destination} use different families"
         ));
     }
+    let destination_label = destination
+        .map(|destination| destination.to_string())
+        .unwrap_or_else(|| "unconnected".to_owned());
     let family = UdpFamily::from_ip(source.ip());
     let fd = socket_owned(
         family.domain(),
@@ -290,7 +320,7 @@ fn connect_configured(
         let observed = get_i32_option(fd.as_raw_fd(), level, name)?;
         if observed != 1 {
             return Err(format!(
-                "transparent UDP socket {source} -> {destination} read back option {name}={observed}"
+                "transparent UDP socket {source} -> {destination_label} read back option {name}={observed}"
             ));
         }
         Some(observed)
@@ -305,13 +335,17 @@ fn connect_configured(
         ));
     }
     bind_fd(fd.as_raw_fd(), source)?;
-    connect_fd(fd.as_raw_fd(), destination, timeout)?;
+    if let Some(destination) = destination {
+        connect_fd(fd.as_raw_fd(), destination, timeout)?;
+    }
     let socket = UdpSocket::from(fd);
     socket
         .set_nonblocking(false)
         .and_then(|()| socket.set_read_timeout(Some(timeout)))
         .and_then(|()| socket.set_write_timeout(Some(timeout)))
-        .map_err(|error| format!("configure UDP socket {source} -> {destination}: {error}"))?;
+        .map_err(|error| {
+            format!("configure UDP socket {source} -> {destination_label}: {error}")
+        })?;
     Ok((socket, observed_mark, transparent_readback))
 }
 

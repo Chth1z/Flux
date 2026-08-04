@@ -285,8 +285,8 @@ pub(crate) fn inspect_admitted_generation(
 
 /// Non-cloneable ownership of one logical selector session for an exact canary request.
 ///
-/// This checkpoint reserves serialization only. It does not install kernel selectors; a later
-/// execution handoff must preserve supervised-report setup before any such mutation.
+/// Reservation itself does not install kernel selectors. The local-OUTPUT executor lends this
+/// session to a prepared attempt only after supervised-report prebind and installation.
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct CanarySelectorSession {
     request: CanaryAttemptRequest,
@@ -2626,7 +2626,7 @@ where
                 "detach capture before preparing fresh canary authorities",
             )
         })?;
-        let selector_session = self
+        let mut selector_session = self
             .writer
             .reserve_canary_selector_session(generation, &request)
             .map_err(|source| {
@@ -2647,7 +2647,7 @@ where
             })?;
         let execution = match &mut self.functional_canary {
             RuntimeFunctionalCanary::RequiredUnqualified { executor, .. } => {
-                executor.execute(execution_input)
+                executor.execute(execution_input, &mut selector_session)
             }
             RuntimeFunctionalCanary::StructuralVerificationOnly => {
                 unreachable!("required adapter availability was validated before engine start")
@@ -6253,13 +6253,15 @@ mod tests {
             capture_start_failure: false,
             capture_stop_failures: 0,
             verify_failure: false,
-        };
+        }
+        .with_required_canary_script(Arc::clone(&canary_script));
+        let selector_session_calls = Arc::clone(&writer.selector_session_calls);
         let engine = RequiredScriptedEngine::new(
             Arc::clone(&events),
             [ready_canary_snapshot(98_765), ready_canary_snapshot(98_765)],
         );
         let mut coordinator = RuntimeCoordinator::with_dependencies(
-            writer.with_required_canary_script(Arc::clone(&canary_script)),
+            writer,
             engine,
             Duration::from_millis(100),
             scripted_required_canary(canary_script, Arc::clone(&events)),
@@ -6293,6 +6295,21 @@ mod tests {
         assert_eq!(
             runtime.snapshot().verification,
             RuntimeVerificationState::FunctionalFailed
+        );
+        assert_eq!(
+            *selector_session_calls
+                .lock()
+                .expect("selector session calls lock"),
+            [
+                SelectorSessionCall::Reserved {
+                    generation: generation(17),
+                    nonce: CanaryNonce::from_bytes([23; FUNCTIONAL_CANARY_NONCE_BYTES]),
+                },
+                SelectorSessionCall::Retired {
+                    generation: generation(17),
+                    nonce: CanaryNonce::from_bytes([23; FUNCTIONAL_CANARY_NONCE_BYTES]),
+                },
+            ]
         );
     }
 
@@ -8995,8 +9012,16 @@ mod tests {
         fn execute(
             &mut self,
             execution: UnqualifiedFunctionalCanaryExecution<'_>,
+            selector_session: &mut CanarySelectorSession,
         ) -> Result<UnqualifiedCanaryGateEvidence, FunctionalCanaryError> {
             let request = execution.request();
+            if selector_session.request() != request {
+                return Err(FunctionalCanaryError::new(
+                    CanaryErrorKind::IdentityChanged,
+                    CanaryCleanupStatus::NotRequired,
+                    "scripted executor received a selector session for a different request",
+                ));
+            }
             if execution.socket_observer_authority()
                 != request
                     .pre_binding()

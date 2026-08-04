@@ -17,13 +17,15 @@
 //! session separately from the pure request. Read-only availability sees only
 //! the request. After availability succeeds, preparation may prebind and
 //! install the supervised report; execution then opens the engine observation
-//! authority and passes the observer session to the prepared attempt by value.
+//! authority and passes the observer session by value plus the coordinator-owned
+//! selector session by mutable borrow to the prepared attempt.
 
 use std::convert::Infallible;
 
 #[cfg(test)]
 use crate::engine_supervisor::OwnedEngineIdentity;
 use crate::engine_supervisor::{EngineChildAuthority, EngineChildObservationPair};
+use crate::runtime_coordinator::CanarySelectorSession;
 use flux_platform::{
     ProcessObservation, ProcessUserNamespaceObservation, TRANSPARENT_PROXY_ENGINE_CAPABILITY_MASK,
 };
@@ -153,6 +155,7 @@ trait PreparedTproxyLocalOutputAttempt {
         self,
         request: &CanaryAttemptRequest,
         socket_observer: CanaryAttemptSocketObserverSession,
+        selector_session: &mut CanarySelectorSession,
     ) -> UnverifiedTproxyLocalOutputResult<
         Self::CaptureProof,
         Self::ProcessProof,
@@ -2286,6 +2289,7 @@ where
     fn execute(
         &mut self,
         mut execution: UnqualifiedFunctionalCanaryExecution<'_>,
+        selector_session: &mut CanarySelectorSession,
     ) -> Result<UnqualifiedCanaryGateEvidence, FunctionalCanaryError> {
         let request = execution.request();
         require_tproxy_request(request)?;
@@ -2298,10 +2302,10 @@ where
             .prepare_tproxy_local_output(&mut execution)
             .map_err(TproxyLocalOutputUnavailable::into_functional_error)?;
         let (request, socket_observer, engine_child) = execution
-            .into_parts()
+            .into_selector_ready_parts(selector_session)
             .map_err(normalize_post_preparation_failure)?;
         let raw = prepared
-            .execute_tproxy_local_output(request, socket_observer)
+            .execute_tproxy_local_output(request, socket_observer, selector_session)
             .map_err(normalize_post_preparation_failure)?;
         let capture_bound = self
             .capture_verifier
@@ -2710,6 +2714,7 @@ impl PreparedTproxyLocalOutputAttempt for Infallible {
         self,
         _request: &CanaryAttemptRequest,
         _socket_observer: CanaryAttemptSocketObserverSession,
+        _selector_session: &mut CanarySelectorSession,
     ) -> Result<
         UnverifiedTproxyLocalOutputArtifacts<
             Self::CaptureProof,
@@ -3064,7 +3069,7 @@ mod tests {
         let mut executor = xtables_tproxy_local_output_executor();
 
         let error = executor
-            .execute(execution(fixture.request()))
+            .execute_with_reserved_selector(execution(fixture.request()))
             .expect_err("xtables has no qualifying local-OUTPUT TPROXY mechanism");
 
         assert_eq!(
@@ -3104,7 +3109,7 @@ mod tests {
             );
 
             let error = executor
-                .execute(execution(&request))
+                .execute_with_reserved_selector(execution(&request))
                 .expect_err("substitute request backends cannot enter the driver");
 
             assert_eq!(error.kind(), CanaryErrorKind::InvalidEvidence);
@@ -3131,7 +3136,7 @@ mod tests {
             );
 
             let error = executor
-                .execute(execution(fixture.request()))
+                .execute_with_reserved_selector(execution(fixture.request()))
                 .expect_err("pre-mutation unavailability cannot execute an attempt");
 
             assert_eq!(error.kind(), CanaryErrorKind::Availability(availability));
@@ -3165,7 +3170,7 @@ mod tests {
             request,
             socket_observer,
             admitted_report_binding(request),
-            unused_report_installer(),
+            scripted_report_installer(),
             Box::new(|| {
                 Err(FunctionalCanaryError::new(
                     CanaryErrorKind::Availability(CanaryAvailability::Denied),
@@ -3177,7 +3182,7 @@ mod tests {
         .expect("observer binding is valid");
 
         let error = executor
-            .execute(execution)
+            .execute_with_reserved_selector(execution)
             .expect_err("authority denial prevents prepared-attempt execution");
 
         assert_eq!(error.kind(), CanaryErrorKind::CleanupUncertain);
@@ -3189,6 +3194,82 @@ mod tests {
                 .contains("injected authority opening denial")
         );
         assert_eq!(prepare_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn selector_session_reaches_prepared_attempt_only_after_report_installation() {
+        let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+        let stage = Arc::new(AtomicUsize::new(0));
+        let mut executor = TproxyLocalOutputExecutor::new(
+            SelectorHandoffDriver {
+                stage: Arc::clone(&stage),
+            },
+            NeverCalledCaptureVerifier,
+            NeverCalledProcessOwnershipVerifier,
+            NeverCalledEvidenceFactory,
+        );
+
+        let error = executor
+            .execute_with_reserved_selector(execution(fixture.request()))
+            .expect_err("the prepared fixture stops after observing the selector session");
+
+        assert_eq!(error.kind(), CanaryErrorKind::ResponseMismatch);
+        assert_eq!(error.cleanup(), CanaryCleanupStatus::VerifiedAbsent);
+        assert_eq!(stage.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn missing_report_installation_blocks_selector_handoff() {
+        let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+        let prepared_executions = Arc::new(AtomicUsize::new(0));
+        let mut executor = TproxyLocalOutputExecutor::new(
+            MissingReportInstallDriver {
+                prepared_executions: Arc::clone(&prepared_executions),
+            },
+            NeverCalledCaptureVerifier,
+            NeverCalledProcessOwnershipVerifier,
+            NeverCalledEvidenceFactory,
+        );
+
+        let error = executor
+            .execute_with_reserved_selector(execution(fixture.request()))
+            .expect_err("a prebound but uninstalled report must block selector handoff");
+
+        assert_eq!(error.kind(), CanaryErrorKind::CleanupUncertain);
+        assert_eq!(error.cleanup(), CanaryCleanupStatus::Uncertain);
+        assert!(error.diagnostic().contains("before supervised-report"));
+        assert_eq!(prepared_executions.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn selector_session_must_match_execution_request() {
+        let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+        let request = fixture.request();
+        let stage = Arc::new(AtomicUsize::new(0));
+        let mut executor = TproxyLocalOutputExecutor::new(
+            SelectorHandoffDriver {
+                stage: Arc::clone(&stage),
+            },
+            NeverCalledCaptureVerifier,
+            NeverCalledProcessOwnershipVerifier,
+            NeverCalledEvidenceFactory,
+        );
+        let mut substitute = request.clone();
+        substitute.nonce = super::super::CanaryNonce::from_bytes([0x5a; 32]);
+        let mut selector_session = CanarySelectorSession::reserved_for(&substitute);
+
+        let error = executor
+            .execute(execution(request), &mut selector_session)
+            .expect_err("a selector session for another request cannot reach execution");
+
+        assert_eq!(error.kind(), CanaryErrorKind::CleanupUncertain);
+        assert_eq!(error.cleanup(), CanaryCleanupStatus::Uncertain);
+        assert!(
+            error
+                .diagnostic()
+                .contains("selector session does not match")
+        );
+        assert_eq!(stage.load(Ordering::SeqCst), 2);
     }
 
     #[test]
@@ -3219,7 +3300,7 @@ mod tests {
         );
 
         let error = executor
-            .execute(execution(fixture.request()))
+            .execute_with_reserved_selector(execution(fixture.request()))
             .expect_err("NotRequired is invalid after a prepared attempt exists");
 
         assert_eq!(error.kind(), CanaryErrorKind::CleanupUncertain);
@@ -3236,7 +3317,7 @@ mod tests {
             NeverCalledEvidenceFactory,
         );
         let error = contradictory
-            .execute(execution(fixture.request()))
+            .execute_with_reserved_selector(execution(fixture.request()))
             .expect_err("cleanup-uncertain kind cannot claim verified absence");
         assert_eq!(error.kind(), CanaryErrorKind::CleanupUncertain);
         assert_eq!(error.cleanup(), CanaryCleanupStatus::Uncertain);
@@ -3264,7 +3345,7 @@ mod tests {
             );
 
             let error = executor
-                .execute(execution(fixture.request()))
+                .execute_with_reserved_selector(execution(fixture.request()))
                 .expect_err("prepared attempt injects a failure");
 
             assert_eq!(error.kind(), kind);
@@ -3298,7 +3379,7 @@ mod tests {
             TproxyLocalOutputExecutor::new(driver, capture_verifier, process_verifier, factory);
 
         let error = executor
-            .execute(execution(fixture.request()))
+            .execute_with_reserved_selector(execution(fixture.request()))
             .expect_err("recording factory deliberately stops after observing the receipt");
 
         assert_eq!(error.kind(), CanaryErrorKind::ResponseMismatch);
@@ -3343,7 +3424,7 @@ mod tests {
             TproxyLocalOutputExecutor::new(driver, capture_verifier, process_verifier, factory);
 
         let error = executor
-            .execute(execution(fixture.request()))
+            .execute_with_reserved_selector(execution(fixture.request()))
             .expect_err("a capture proof cannot bless a different raw observation batch");
 
         assert_eq!(error.kind(), CanaryErrorKind::CleanupUncertain);
@@ -3380,7 +3461,7 @@ mod tests {
             TproxyLocalOutputExecutor::new(driver, capture_verifier, process_verifier, factory);
 
         let error = executor
-            .execute(execution(fixture.request()))
+            .execute_with_reserved_selector(execution(fixture.request()))
             .expect_err("a process proof cannot bless a different cleanup observation batch");
 
         assert_eq!(error.kind(), CanaryErrorKind::CleanupUncertain);
@@ -3417,7 +3498,7 @@ mod tests {
             TproxyLocalOutputExecutor::new(driver, capture_verifier, process_verifier, factory);
 
         let error = executor
-            .execute(execution(fixture.request()))
+            .execute_with_reserved_selector(execution(fixture.request()))
             .expect_err("premature completion cannot mint a process receipt");
 
         assert_eq!(error.kind(), CanaryErrorKind::CleanupUncertain);
@@ -3487,14 +3568,16 @@ mod tests {
             &request,
             socket_observer,
             admitted_report_binding(&request),
-            unused_report_installer(),
+            scripted_report_installer(),
             Box::new(move || Ok(authority)),
         )
         .expect("bind real engine authority to the exact request");
 
-        let error = executor.execute(execution).expect_err(
-            "raw engine observation checkpoint deliberately stops before receipt minting",
-        );
+        let error = executor
+            .execute_with_reserved_selector(execution)
+            .expect_err(
+                "raw engine observation checkpoint deliberately stops before receipt minting",
+            );
 
         assert_eq!(error.kind(), CanaryErrorKind::ResponseMismatch);
         assert_eq!(error.cleanup(), CanaryCleanupStatus::VerifiedAbsent);
@@ -3549,13 +3632,13 @@ mod tests {
             &request,
             socket_observer,
             admitted_report_binding(&request),
-            unused_report_installer(),
+            scripted_report_installer(),
             Box::new(move || Ok(authority)),
         )
         .expect("bind real engine authority to the exact request identity");
 
         let error = executor
-            .execute(execution)
+            .execute_with_reserved_selector(execution)
             .expect_err("host child credentials and domain cannot satisfy the scripted request");
 
         assert_eq!(error.kind(), CanaryErrorKind::CleanupUncertain);
@@ -3654,13 +3737,13 @@ mod tests {
             &request,
             socket_observer,
             admitted_report_binding(&request),
-            unused_report_installer(),
+            scripted_report_installer(),
             Box::new(move || Ok(authority)),
         )
         .expect("bind exited engine authority to the exact request");
 
         let error = executor
-            .execute(execution)
+            .execute_with_reserved_selector(execution)
             .expect_err("exited engine cannot produce a final observation pair");
 
         assert_eq!(error.kind(), CanaryErrorKind::CleanupUncertain);
@@ -3764,6 +3847,7 @@ mod tests {
                 )
             })?;
             assert_eq!(&prepared.capture_proof.request, request);
+            install_scripted_report(execution);
             Ok(prepared)
         }
     }
@@ -3777,6 +3861,7 @@ mod tests {
             self,
             _request: &CanaryAttemptRequest,
             _socket_observer: CanaryAttemptSocketObserverSession,
+            selector_session: &mut CanarySelectorSession,
         ) -> Result<
             UnverifiedTproxyLocalOutputArtifacts<
                 Self::CaptureProof,
@@ -3785,6 +3870,7 @@ mod tests {
             >,
             FunctionalCanaryError,
         > {
+            assert_eq!(selector_session.request(), &self.capture_proof.request);
             Ok(UnverifiedTproxyLocalOutputArtifacts {
                 capture_proof: self.capture_proof,
                 process_proof: self.process_proof,
@@ -4199,6 +4285,108 @@ mod tests {
         cleanup: CanaryCleanupStatus,
     }
 
+    struct SelectorHandoffDriver {
+        stage: Arc<AtomicUsize>,
+    }
+
+    struct SelectorHandoffPrepared {
+        stage: Arc<AtomicUsize>,
+    }
+
+    impl TproxyLocalOutputDriver for SelectorHandoffDriver {
+        type Prepared = SelectorHandoffPrepared;
+
+        fn check_tproxy_local_output(
+            &self,
+            _request: &CanaryAttemptRequest,
+        ) -> Result<(), TproxyLocalOutputUnavailable> {
+            assert_eq!(self.stage.fetch_add(1, Ordering::SeqCst), 0);
+            Ok(())
+        }
+
+        fn prepare_tproxy_local_output(
+            &mut self,
+            execution: &mut UnqualifiedFunctionalCanaryExecution<'_>,
+        ) -> Result<Self::Prepared, TproxyLocalOutputUnavailable> {
+            assert_eq!(self.stage.load(Ordering::SeqCst), 1);
+            install_scripted_report(execution);
+            assert_eq!(self.stage.fetch_add(1, Ordering::SeqCst), 1);
+            Ok(SelectorHandoffPrepared {
+                stage: Arc::clone(&self.stage),
+            })
+        }
+    }
+
+    impl PreparedTproxyLocalOutputAttempt for SelectorHandoffPrepared {
+        type CaptureProof = ();
+        type ProcessProof = ();
+        type RawObservations = ();
+
+        fn execute_tproxy_local_output(
+            self,
+            request: &CanaryAttemptRequest,
+            _socket_observer: CanaryAttemptSocketObserverSession,
+            selector_session: &mut CanarySelectorSession,
+        ) -> UnverifiedTproxyLocalOutputResult<(), (), ()> {
+            assert_eq!(self.stage.fetch_add(1, Ordering::SeqCst), 2);
+            assert_eq!(selector_session.request(), request);
+            Err(FunctionalCanaryError::new(
+                CanaryErrorKind::ResponseMismatch,
+                CanaryCleanupStatus::VerifiedAbsent,
+                "scripted prepared attempt observed the selector session",
+            ))
+        }
+    }
+
+    struct MissingReportInstallDriver {
+        prepared_executions: Arc<AtomicUsize>,
+    }
+
+    struct MissingReportInstallPrepared {
+        prepared_executions: Arc<AtomicUsize>,
+    }
+
+    impl TproxyLocalOutputDriver for MissingReportInstallDriver {
+        type Prepared = MissingReportInstallPrepared;
+
+        fn check_tproxy_local_output(
+            &self,
+            _request: &CanaryAttemptRequest,
+        ) -> Result<(), TproxyLocalOutputUnavailable> {
+            Ok(())
+        }
+
+        fn prepare_tproxy_local_output(
+            &mut self,
+            execution: &mut UnqualifiedFunctionalCanaryExecution<'_>,
+        ) -> Result<Self::Prepared, TproxyLocalOutputUnavailable> {
+            let (producer, collector) = execution
+                .prebind_supervised_delivery_report(Instant::now as fn() -> Instant)
+                .expect("prebind the report without installing its producer");
+            drop(producer);
+            drop(collector);
+            Ok(MissingReportInstallPrepared {
+                prepared_executions: Arc::clone(&self.prepared_executions),
+            })
+        }
+    }
+
+    impl PreparedTproxyLocalOutputAttempt for MissingReportInstallPrepared {
+        type CaptureProof = ();
+        type ProcessProof = ();
+        type RawObservations = ();
+
+        fn execute_tproxy_local_output(
+            self,
+            _request: &CanaryAttemptRequest,
+            _socket_observer: CanaryAttemptSocketObserverSession,
+            _selector_session: &mut CanarySelectorSession,
+        ) -> UnverifiedTproxyLocalOutputResult<(), (), ()> {
+            self.prepared_executions.fetch_add(1, Ordering::SeqCst);
+            panic!("selector session reached an attempt without an installed report")
+        }
+    }
+
     struct AuthorityOpeningGuardDriver {
         prepare_calls: Arc<AtomicUsize>,
     }
@@ -4215,9 +4403,10 @@ mod tests {
 
         fn prepare_tproxy_local_output(
             &mut self,
-            _execution: &mut UnqualifiedFunctionalCanaryExecution<'_>,
+            execution: &mut UnqualifiedFunctionalCanaryExecution<'_>,
         ) -> Result<Self::Prepared, TproxyLocalOutputUnavailable> {
             self.prepare_calls.fetch_add(1, Ordering::SeqCst);
+            install_scripted_report(execution);
             Ok(PreparedFailure {
                 kind: CanaryErrorKind::AdapterFailure,
                 cleanup: CanaryCleanupStatus::Uncertain,
@@ -4237,8 +4426,9 @@ mod tests {
 
         fn prepare_tproxy_local_output(
             &mut self,
-            _execution: &mut UnqualifiedFunctionalCanaryExecution<'_>,
+            execution: &mut UnqualifiedFunctionalCanaryExecution<'_>,
         ) -> Result<Self::Prepared, TproxyLocalOutputUnavailable> {
+            install_scripted_report(execution);
             Ok(PreparedFailure {
                 kind: self.kind,
                 cleanup: self.cleanup,
@@ -4258,8 +4448,9 @@ mod tests {
 
         fn execute_tproxy_local_output(
             self,
-            _request: &CanaryAttemptRequest,
+            request: &CanaryAttemptRequest,
             _socket_observer: CanaryAttemptSocketObserverSession,
+            selector_session: &mut CanarySelectorSession,
         ) -> Result<
             UnverifiedTproxyLocalOutputArtifacts<
                 Self::CaptureProof,
@@ -4268,6 +4459,7 @@ mod tests {
             >,
             FunctionalCanaryError,
         > {
+            assert_eq!(selector_session.request(), request);
             Err(FunctionalCanaryError::new(
                 self.kind,
                 self.cleanup,
@@ -4327,7 +4519,7 @@ mod tests {
             request,
             socket_observer,
             admitted_report_binding(request),
-            unused_report_installer(),
+            scripted_report_installer(),
             scripted_engine_opener(request),
         )
         .expect("scripted observer matches request authority")
@@ -4353,6 +4545,47 @@ mod tests {
             + 'a,
     > {
         Box::new(|_| panic!("this test does not install a supervised-report producer"))
+    }
+
+    fn scripted_report_installer<'a>() -> Box<
+        dyn FnOnce(
+                SupervisedDeliveryReportEngineHandoff,
+            )
+                -> Result<InstalledSupervisedDeliveryReportProducer, FunctionalCanaryError>
+            + 'a,
+    > {
+        Box::new(|handoff| Ok(handoff.into_installed_fixture()))
+    }
+
+    fn install_scripted_report(execution: &mut UnqualifiedFunctionalCanaryExecution<'_>) {
+        let (producer, collector) = execution
+            .prebind_supervised_delivery_report(Instant::now as fn() -> Instant)
+            .expect("prebind the scripted supervised report");
+        let installed = execution
+            .install_supervised_delivery_report(producer.into_engine_handoff())
+            .expect("install the scripted supervised-report producer");
+        drop(installed);
+        drop(collector);
+    }
+
+    trait TestCanaryExecutorExt {
+        fn execute_with_reserved_selector(
+            &mut self,
+            execution: UnqualifiedFunctionalCanaryExecution<'_>,
+        ) -> Result<UnqualifiedCanaryGateEvidence, FunctionalCanaryError>;
+    }
+
+    impl<T> TestCanaryExecutorExt for T
+    where
+        T: UnqualifiedFunctionalCanaryExecutor + ?Sized,
+    {
+        fn execute_with_reserved_selector(
+            &mut self,
+            execution: UnqualifiedFunctionalCanaryExecution<'_>,
+        ) -> Result<UnqualifiedCanaryGateEvidence, FunctionalCanaryError> {
+            let mut selector_session = CanarySelectorSession::reserved_for(execution.request());
+            self.execute(execution, &mut selector_session)
+        }
     }
 
     fn scripted_engine_opener(
@@ -4577,12 +4810,12 @@ mod tests {
         );
 
         let error = executor
-            .execute(
+            .execute_with_reserved_selector(
                 UnqualifiedFunctionalCanaryExecution::new(
                     &request,
                     observer,
                     admitted_report_binding(&request),
-                    unused_report_installer(),
+                    scripted_report_installer(),
                     scripted_engine_opener(&request),
                 )
                 .expect("prebound observer matches request authority"),
@@ -4630,6 +4863,7 @@ mod tests {
                     .socket_observer_binding(),
                 self.binding
             );
+            install_scripted_report(execution);
             Ok(PreboundObserverPreparedFailure {
                 binding: self.binding,
                 reached_driver: Arc::clone(&self.reached_driver),
@@ -4651,6 +4885,7 @@ mod tests {
             self,
             request: &CanaryAttemptRequest,
             socket_observer: CanaryAttemptSocketObserverSession,
+            selector_session: &mut CanarySelectorSession,
         ) -> Result<
             UnverifiedTproxyLocalOutputArtifacts<
                 Self::CaptureProof,
@@ -4669,6 +4904,7 @@ mod tests {
             );
             assert_eq!(socket_observer.binding(), self.binding);
             assert_eq!(socket_observer.authority(), self.binding.authority());
+            assert_eq!(selector_session.request(), request);
             self.reached_driver.store(true, Ordering::SeqCst);
             Err(FunctionalCanaryError::new(
                 CanaryErrorKind::ResponseMismatch,

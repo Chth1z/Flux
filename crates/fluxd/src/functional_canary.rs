@@ -25,6 +25,7 @@ use crate::engine_supervisor::EngineChildAuthority;
 use crate::generation_engine_config::{
     ENGINE_SUPERVISED_DELIVERY_REPORT_SCHEMA_VERSION, EngineCapabilityProfileRevision,
 };
+use crate::runtime_coordinator::CanarySelectorSession;
 use crate::{EngineArtifactSetIdentity, EngineSpec, OwnedEngineIdentity};
 
 pub(crate) const FUNCTIONAL_CANARY_SCHEMA_VERSION: u16 = 2;
@@ -4943,7 +4944,6 @@ impl<'a> UnqualifiedFunctionalCanaryExecution<'a> {
             ));
         }
         let installed = installer(handoff)?;
-        self.supervised_report_installed = true;
         let expected_engine = self.request.pre_binding().engine();
         let expected_report = self
             .request
@@ -4961,6 +4961,7 @@ impl<'a> UnqualifiedFunctionalCanaryExecution<'a> {
                 "installed supervised-report producer does not match the immutable canary request",
             ));
         }
+        self.supervised_report_installed = true;
         Ok(installed)
     }
 
@@ -5043,6 +5044,35 @@ impl<'a> UnqualifiedFunctionalCanaryExecution<'a> {
         }
         Ok((self.request, self.socket_observer, engine_child))
     }
+
+    /// Consume the attempt authorities only after the report handoff and selector identity agree.
+    pub(crate) fn into_selector_ready_parts(
+        self,
+        selector_session: &CanarySelectorSession,
+    ) -> Result<
+        (
+            &'a CanaryAttemptRequest,
+            CanaryAttemptSocketObserverSession,
+            EngineChildAuthority,
+        ),
+        FunctionalCanaryError,
+    > {
+        if selector_session.request() != self.request {
+            return Err(FunctionalCanaryError::new(
+                CanaryErrorKind::IdentityChanged,
+                CanaryCleanupStatus::Uncertain,
+                "selector session does not match the immutable canary request",
+            ));
+        }
+        if !self.supervised_report_prebound || !self.supervised_report_installed {
+            return Err(FunctionalCanaryError::new(
+                CanaryErrorKind::CleanupUncertain,
+                CanaryCleanupStatus::Uncertain,
+                "selector session cannot enter execution before supervised-report prebind and installation",
+            ));
+        }
+        self.into_parts()
+    }
 }
 
 fn supervised_delivery_report_bind_error(
@@ -5107,6 +5137,7 @@ pub(crate) trait UnqualifiedFunctionalCanaryExecutor: Send + 'static {
     fn execute(
         &mut self,
         execution: UnqualifiedFunctionalCanaryExecution<'_>,
+        selector_session: &mut CanarySelectorSession,
     ) -> Result<UnqualifiedCanaryGateEvidence, FunctionalCanaryError>;
 }
 

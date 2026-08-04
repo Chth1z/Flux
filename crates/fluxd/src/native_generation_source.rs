@@ -39,7 +39,8 @@ use crate::generation_engine_config::{
 };
 #[cfg(test)]
 use crate::generation_engine_config::{
-    EngineCapabilityProfileRevision, rebind_engine_capability_profile_fixture,
+    EngineCapabilityProfileRevision, declare_supervised_delivery_report_profile_fixture,
+    rebind_engine_capability_profile_fixture,
 };
 #[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
 use crate::generation_engine_config::{
@@ -48,7 +49,7 @@ use crate::generation_engine_config::{
 };
 use crate::intent_store::record_io;
 use crate::native_runtime_writer::{NativeGenerationSource, PreparedNativeGeneration};
-use crate::runtime_coordinator::PublishedRuntimeState;
+use crate::runtime_coordinator::{PreparedGeneration, PublishedRuntimeState};
 use crate::subscription::ValidatedSubscriptionEngineConfig;
 use crate::{EngineSpec, EngineSpecError, IntentStoreError, RestartPolicy, RestartPolicyError};
 
@@ -111,7 +112,9 @@ impl EngineCapabilityProfileSource for InheritedEngineProfileSource {
         let probe_binding = bind_engine_config_to_spec(binding.artifact().clone(), &probe_spec)
             .expect("bind inherited engine-profile fixture");
         let profile = collect_tproxy_engine_capability_profile(&probe_binding, &probe_spec)?;
-        Ok(rebind_engine_capability_profile_fixture(profile, binding))
+        Ok(declare_supervised_delivery_report_profile_fixture(
+            rebind_engine_capability_profile_fixture(profile, binding),
+        ))
     }
 }
 
@@ -792,6 +795,8 @@ where
         }
         let identity = admitted.identity();
         let engine_profile_revision = admitted.engine_profile_revision();
+        let functional_canary_mode = admitted.functional_canary_mode();
+        let supervised_delivery_report = admitted.supervised_delivery_report();
         let capture_path_selection = admitted.capture_path_selection();
         let capture_path_evidence_deadline = admitted.capture_path_evidence_deadline();
         let target = self
@@ -807,11 +812,15 @@ where
             subscription,
         });
         Ok(PreparedNativeGeneration::new(
-            expected_generation,
-            spec,
-            engine_profile_revision,
-            capture_path_selection,
-            capture_path_evidence_deadline,
+            PreparedGeneration::new(
+                expected_generation,
+                spec,
+                engine_profile_revision,
+                functional_canary_mode,
+                supervised_delivery_report,
+                capture_path_selection,
+                capture_path_evidence_deadline,
+            ),
             target,
         ))
     }
@@ -1506,6 +1515,17 @@ esac
             prepared.runtime().engine_profile_revision(),
             fixture.source.admission.admitted_engine_profile_revisions[0],
             "the exact admitted engine profile revision reaches runtime canary binding"
+        );
+        assert_eq!(
+            prepared.runtime().functional_canary_mode(),
+            crate::functional_canary::FunctionalCanaryGateMode::RequiredUnqualified
+        );
+        assert!(
+            prepared
+                .runtime()
+                .supervised_delivery_report()
+                .expect("required native Generation retains the sealed report contract")
+                .is_canonical_schema_v1()
         );
     }
 

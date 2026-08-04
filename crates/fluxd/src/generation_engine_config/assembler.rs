@@ -28,10 +28,11 @@ use super::capture_path_selection::{
 };
 use super::{
     DesiredStateArtifacts, EngineCapabilityProfile, EngineCapabilityProfileRevision,
-    EngineConfigBindingError, SelectedEngineSourceIdentity, TproxyGenerationCandidate,
-    TproxyGenerationCandidateError, bind_engine_config_to_spec,
+    EngineConfigBindingError, EngineSupervisedDeliveryReportContract, SelectedEngineSourceIdentity,
+    TproxyGenerationCandidate, TproxyGenerationCandidateError, bind_engine_config_to_spec,
     compile_tproxy_generation_candidate,
 };
+use crate::functional_canary::FunctionalCanaryGateMode;
 use crate::{EngineSpec, RestartPolicy, RestartPolicyError};
 
 pub(crate) const ADMITTED_GENERATION_SCHEMA_VERSION: u16 = 4;
@@ -305,6 +306,7 @@ pub(crate) struct AdmittedGeneration {
     planning_digest: GenerationPlanningDigest,
     capture_path_selection: CapturePathSelection,
     capture_path_evidence_deadline: Instant,
+    functional_canary_mode: FunctionalCanaryGateMode,
     planning: GenerationPlanningAuthority,
 }
 
@@ -328,6 +330,18 @@ impl AdmittedGeneration {
     #[must_use]
     pub(crate) const fn engine_profile_revision(&self) -> EngineCapabilityProfileRevision {
         self.candidate.engine_profile().revision()
+    }
+
+    #[must_use]
+    pub(crate) const fn supervised_delivery_report(
+        &self,
+    ) -> Option<EngineSupervisedDeliveryReportContract> {
+        self.candidate.engine_profile().supervised_delivery_report()
+    }
+
+    #[must_use]
+    pub(crate) const fn functional_canary_mode(&self) -> FunctionalCanaryGateMode {
+        self.functional_canary_mode
     }
 
     #[cfg(test)]
@@ -576,6 +590,7 @@ pub(crate) enum GenerationAssemblyError {
     Candidate(TproxyGenerationCandidateError),
     Planning(GenerationPlanningError),
     CapturePath(CapturePathSelectionError),
+    RequiredFunctionalCanaryReportUnavailable,
     CapturePathAdapterMismatch { selected: CapturePathId },
     GenerationSequenceExhausted,
     Xtables(XtablesCaptureLoweringError),
@@ -589,6 +604,9 @@ impl fmt::Display for GenerationAssemblyError {
             Self::Candidate(source) => source.fmt(formatter),
             Self::Planning(source) => source.fmt(formatter),
             Self::CapturePath(source) => source.fmt(formatter),
+            Self::RequiredFunctionalCanaryReportUnavailable => formatter.write_str(
+                "require_functional_canary needs an exact engine profile with the canonical supervised-delivery report contract",
+            ),
             Self::CapturePathAdapterMismatch { selected } => write!(
                 formatter,
                 "Capture Path selector chose {} without a matching Generation assembler",
@@ -611,7 +629,9 @@ impl Error for GenerationAssemblyError {
             Self::Planning(source) => Some(source),
             Self::CapturePath(source) => Some(source),
             Self::Xtables(source) => Some(source),
-            Self::GenerationSequenceExhausted | Self::CapturePathAdapterMismatch { .. } => None,
+            Self::RequiredFunctionalCanaryReportUnavailable
+            | Self::GenerationSequenceExhausted
+            | Self::CapturePathAdapterMismatch { .. } => None,
         }
     }
 }
@@ -646,6 +666,18 @@ impl GenerationAssembler {
             binding,
         )
         .map_err(GenerationAssemblyError::Candidate)?;
+        let functional_canary_mode = if desired_state.safety().require_functional_canary() {
+            if candidate
+                .engine_profile()
+                .supervised_delivery_report()
+                .is_none()
+            {
+                return Err(GenerationAssemblyError::RequiredFunctionalCanaryReportUnavailable);
+            }
+            FunctionalCanaryGateMode::RequiredUnqualified
+        } else {
+            FunctionalCanaryGateMode::StructuralVerificationOnly
+        };
         let planning_context = validate_planning(&planning, &candidate, inventory, &desired_state)
             .map_err(GenerationAssemblyError::Planning)?;
         let capture_path_evidence = planning.capture_path_evidence();
@@ -697,6 +729,7 @@ impl GenerationAssembler {
             planning_digest: planning_context.digest,
             capture_path_selection,
             capture_path_evidence_deadline: capture_path_evidence.valid_until(),
+            functional_canary_mode,
             planning,
         })
     }

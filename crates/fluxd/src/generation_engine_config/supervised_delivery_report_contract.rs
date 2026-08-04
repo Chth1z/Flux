@@ -737,8 +737,8 @@ enum EngineSupervisedDeliveryReportShutdown {
 
 /// Exact producer and wire contract claimed by one immutable engine artifact profile.
 ///
-/// Construction is sealed in this module. Production collection currently leaves the capability
-/// absent; only test fixtures can claim the single canonical schema-v1 shape.
+/// Construction is sealed in this module. Production collection declares the single canonical
+/// schema-v1 shape only for the exact manifest-bound Android producer artifact.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct EngineSupervisedDeliveryReportContract {
     schema_version: NonZeroU16,

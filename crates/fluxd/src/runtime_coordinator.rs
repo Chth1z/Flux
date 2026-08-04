@@ -23,7 +23,7 @@ use crate::functional_canary::{
 };
 use crate::generation_engine_config::{
     AddressReconciler, AddressReconciliationOutcome, CapturePathDecision, CapturePathSelection,
-    EngineCapabilityProfileRevision,
+    EngineCapabilityProfileRevision, EngineSupervisedDeliveryReportContract,
 };
 #[cfg(test)]
 use crate::generation_engine_config::{AdmittedGeneration, PreparedGenerationRecord};
@@ -52,6 +52,8 @@ pub(crate) struct PreparedGeneration {
     id: GenerationId,
     spec: EngineSpec,
     engine_profile_revision: EngineCapabilityProfileRevision,
+    functional_canary_mode: FunctionalCanaryGateMode,
+    supervised_delivery_report: Option<EngineSupervisedDeliveryReportContract>,
     capture_path_selection: CapturePathSelection,
     capture_path_evidence_deadline: Instant,
 }
@@ -62,16 +64,26 @@ impl PreparedGeneration {
         id: GenerationId,
         spec: EngineSpec,
         engine_profile_revision: EngineCapabilityProfileRevision,
+        functional_canary_mode: FunctionalCanaryGateMode,
+        supervised_delivery_report: Option<EngineSupervisedDeliveryReportContract>,
         capture_path_selection: CapturePathSelection,
         capture_path_evidence_deadline: Instant,
     ) -> Self {
-        Self {
+        let generation = Self {
             id,
             spec,
             engine_profile_revision,
+            functional_canary_mode,
+            supervised_delivery_report,
             capture_path_selection,
             capture_path_evidence_deadline,
-        }
+        };
+        assert!(
+            generation.functional_canary_mode() != FunctionalCanaryGateMode::RequiredUnqualified
+                || generation.supervised_delivery_report().is_some(),
+            "a required functional-canary Generation must retain its sealed report contract"
+        );
+        generation
     }
 
     #[must_use]
@@ -82,6 +94,18 @@ impl PreparedGeneration {
     #[must_use]
     pub(crate) const fn engine_profile_revision(&self) -> EngineCapabilityProfileRevision {
         self.engine_profile_revision
+    }
+
+    #[must_use]
+    pub(crate) const fn functional_canary_mode(&self) -> FunctionalCanaryGateMode {
+        self.functional_canary_mode
+    }
+
+    #[must_use]
+    pub(crate) const fn supervised_delivery_report(
+        &self,
+    ) -> Option<EngineSupervisedDeliveryReportContract> {
+        self.supervised_delivery_report
     }
 
     const fn runtime_binding(&self) -> RuntimeGenerationBinding {
@@ -4504,6 +4528,8 @@ mod tests {
                 generation(1),
                 fixture.spec.clone(),
                 test_engine_profile_revision(),
+                FunctionalCanaryGateMode::StructuralVerificationOnly,
+                None,
                 capture_path_selection,
                 qualified_xtables_capture_path_evidence().valid_until(),
             )),
@@ -4694,6 +4720,8 @@ mod tests {
                 generation(1),
                 active.spec.clone(),
                 test_engine_profile_revision(),
+                FunctionalCanaryGateMode::StructuralVerificationOnly,
+                None,
                 capture_path_selection,
                 qualified_xtables_capture_path_evidence().valid_until(),
             )),
@@ -7536,6 +7564,8 @@ mod tests {
                 id,
                 spec,
                 test_engine_profile_revision(),
+                FunctionalCanaryGateMode::StructuralVerificationOnly,
+                None,
                 test_xtables_capture_path_selection(),
                 qualified_xtables_capture_path_evidence().valid_until(),
             ))

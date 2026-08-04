@@ -46,6 +46,7 @@ use super::{
     reconstruct_canonical_tproxy_engine_config,
 };
 use crate::engine_supervisor::EngineCapabilityProbeError;
+use crate::functional_canary::FunctionalCanaryGateMode;
 use crate::{EngineSpec, MAX_ENGINE_CONFIG_BYTES, RestartPolicy};
 
 const PORT: u16 = 1536;
@@ -796,6 +797,16 @@ fn assembler_produces_one_complete_host_inspection_generation() {
     );
     assert_eq!(admitted.generation().get(), 1);
     assert_eq!(
+        admitted.functional_canary_mode(),
+        FunctionalCanaryGateMode::RequiredUnqualified
+    );
+    assert!(
+        admitted
+            .supervised_delivery_report()
+            .expect("required Generation retains its sealed report contract")
+            .is_canonical_schema_v1()
+    );
+    assert_eq!(
         admitted.admission_kind(),
         GenerationAdmissionKind::HostInspectionOnly
     );
@@ -849,6 +860,49 @@ fn assembler_produces_one_complete_host_inspection_generation() {
         inspection.inventory_epoch(),
         admitted.candidate().inventory_epoch().get()
     );
+}
+
+#[test]
+fn required_functional_canary_rejects_an_unqualified_engine_profile() {
+    let fixture = HostAssemblyFixture::new();
+    let error = match fixture.assemble_with_engine_profile(
+        fixture.desired_state.clone(),
+        fixture.unqualified_engine_profile.clone(),
+    ) {
+        Ok(_) => panic!("required functional canary admitted an unqualified engine profile"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(
+        error,
+        GenerationAssemblyError::RequiredFunctionalCanaryReportUnavailable
+    ));
+    assert_eq!(
+        error.to_string(),
+        "require_functional_canary needs an exact engine profile with the canonical supervised-delivery report contract"
+    );
+}
+
+#[test]
+fn structural_functional_canary_admits_an_unqualified_engine_profile() {
+    let fixture = HostAssemblyFixture::new();
+    let source = fixture.base_desired_state.replacen(
+        "require_functional_canary = true",
+        "require_functional_canary = false",
+        1,
+    );
+    let admitted = fixture
+        .assemble_with_engine_profile(
+            fixture.compile_desired_state(&source),
+            fixture.unqualified_engine_profile.clone(),
+        )
+        .expect("structural functional-canary policy accepts an unqualified engine profile");
+
+    assert_eq!(
+        admitted.functional_canary_mode(),
+        FunctionalCanaryGateMode::StructuralVerificationOnly
+    );
+    assert_eq!(admitted.supervised_delivery_report(), None);
 }
 
 #[test]
@@ -1611,6 +1665,7 @@ struct HostAssemblyFixture {
     capability_profile: CapabilityProfile,
     inventory: NetworkInventory,
     engine_profile: EngineCapabilityProfile,
+    unqualified_engine_profile: EngineCapabilityProfile,
     planning: HostInspectionPlanningAuthority,
 }
 
@@ -1644,7 +1699,10 @@ impl HostAssemblyFixture {
         let binding =
             bind_engine_config_to_spec(desired_state.engine_config().clone(), &engine.spec)
                 .expect("fixture production binding");
-        let engine_profile = rebind_engine_capability_profile_fixture(engine_profile, &binding);
+        let unqualified_engine_profile =
+            rebind_engine_capability_profile_fixture(engine_profile, &binding);
+        let engine_profile =
+            declare_supervised_delivery_report_profile_fixture(unqualified_engine_profile.clone());
         let capability_profile = CapabilityProfileFixture::device_qualified();
         let mut tracker = NetworkInventoryTracker::new();
         let inventory = empty_inventory(&mut tracker).clone();
@@ -1664,6 +1722,7 @@ impl HostAssemblyFixture {
             capability_profile,
             inventory,
             engine_profile,
+            unqualified_engine_profile,
             planning,
         }
     }
@@ -1692,12 +1751,43 @@ impl HostAssemblyFixture {
         inventory: &NetworkInventory,
         planning: GenerationPlanningAuthority,
     ) -> Result<AdmittedGeneration, GenerationAssemblyError> {
+        self.assemble_with_profile(
+            prior,
+            desired_state,
+            inventory,
+            self.engine_profile.clone(),
+            planning,
+        )
+    }
+
+    fn assemble_with_engine_profile(
+        &self,
+        desired_state: DesiredStateArtifacts,
+        engine_profile: EngineCapabilityProfile,
+    ) -> Result<AdmittedGeneration, GenerationAssemblyError> {
+        self.assemble_with_profile(
+            None,
+            desired_state,
+            &self.inventory,
+            engine_profile,
+            GenerationPlanningAuthority::host_inspection(self.planning.clone()),
+        )
+    }
+
+    fn assemble_with_profile(
+        &self,
+        prior: Option<AdmittedGenerationIdentity>,
+        desired_state: DesiredStateArtifacts,
+        inventory: &NetworkInventory,
+        engine_profile: EngineCapabilityProfile,
+        planning: GenerationPlanningAuthority,
+    ) -> Result<AdmittedGeneration, GenerationAssemblyError> {
         let request = GenerationAssemblyRequest::new(
             desired_state,
             self.engine.spec.clone(),
             self.capability_profile.clone(),
             inventory,
-            self.engine_profile.clone(),
+            engine_profile,
             planning,
         );
         let request = match prior {

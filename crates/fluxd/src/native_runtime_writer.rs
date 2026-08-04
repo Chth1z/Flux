@@ -1,6 +1,6 @@
 use std::error::Error;
 use std::fmt;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use flux_core::{AddressResyncDisposition, GenerationId, Reason};
 use flux_platform::{
@@ -10,16 +10,19 @@ use flux_platform::{
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use flux_platform::{NativeXtablesCaptureConverger, NativeXtablesCaptureTarget};
 
-use crate::generation_engine_config::{
-    AddressReconciledGenerationInputs, CapturePathDecision, CapturePathSelection,
-    EngineCapabilityProfileRevision,
-};
+#[cfg(test)]
+use crate::EngineSpec;
+use crate::EngineSupervisor;
+#[cfg(test)]
+use crate::functional_canary::FunctionalCanaryGateMode;
+#[cfg(test)]
+use crate::generation_engine_config::EngineCapabilityProfileRevision;
+use crate::generation_engine_config::{AddressReconciledGenerationInputs, CapturePathDecision};
 use crate::runtime_coordinator::{
     AddressResyncStrategy, PreparedGeneration, PublishedRuntimeState, RuntimeCoordinator,
     RuntimeFunctionalCanary, RuntimeWriter,
 };
 use crate::subscription::ValidatedSubscriptionEngineConfig;
-use crate::{EngineSpec, EngineSupervisor};
 
 pub(crate) trait NativeCoordinatorGenerationIdentity {
     fn coordinator_generation(self) -> Option<GenerationId>;
@@ -38,24 +41,8 @@ pub(crate) struct PreparedNativeGeneration<T> {
 
 impl<T> PreparedNativeGeneration<T> {
     #[must_use]
-    pub(crate) fn new(
-        id: GenerationId,
-        spec: EngineSpec,
-        engine_profile_revision: EngineCapabilityProfileRevision,
-        capture_path_selection: CapturePathSelection,
-        capture_path_evidence_deadline: Instant,
-        target: T,
-    ) -> Self {
-        Self {
-            runtime: PreparedGeneration::new(
-                id,
-                spec,
-                engine_profile_revision,
-                capture_path_selection,
-                capture_path_evidence_deadline,
-            ),
-            target,
-        }
+    pub(crate) const fn new(runtime: PreparedGeneration, target: T) -> Self {
+        Self { runtime, target }
     }
 
     #[cfg(test)]
@@ -933,11 +920,15 @@ mod tests {
 
     fn generation(id: u32, fixture: &EngineFixture) -> PreparedNativeGeneration<ScriptedTarget> {
         PreparedNativeGeneration::new(
-            GenerationId::new(id).expect("nonzero native Generation"),
-            fixture.spec.clone(),
-            test_engine_profile_revision(),
-            test_xtables_capture_path_selection(),
-            qualified_xtables_capture_path_evidence().valid_until(),
+            PreparedGeneration::new(
+                GenerationId::new(id).expect("nonzero native Generation"),
+                fixture.spec.clone(),
+                test_engine_profile_revision(),
+                FunctionalCanaryGateMode::StructuralVerificationOnly,
+                None,
+                test_xtables_capture_path_selection(),
+                qualified_xtables_capture_path_evidence().valid_until(),
+            ),
             ScriptedTarget(u64::from(id)),
         )
     }
@@ -1013,11 +1004,15 @@ mod tests {
         let fixture = EngineFixture::new();
         let events = Arc::new(Mutex::new(Vec::new()));
         let mismatched = PreparedNativeGeneration::new(
-            GenerationId::INITIAL,
-            fixture.spec.clone(),
-            test_engine_profile_revision(),
-            test_xtables_capture_path_selection(),
-            qualified_xtables_capture_path_evidence().valid_until(),
+            PreparedGeneration::new(
+                GenerationId::INITIAL,
+                fixture.spec.clone(),
+                test_engine_profile_revision(),
+                FunctionalCanaryGateMode::StructuralVerificationOnly,
+                None,
+                test_xtables_capture_path_selection(),
+                qualified_xtables_capture_path_evidence().valid_until(),
+            ),
             ScriptedTarget(2),
         );
         let mut writer = writer(&events, None, None, [mismatched], []);
@@ -1110,6 +1105,8 @@ mod tests {
             GenerationId::new(2).expect("nonzero mismatched Generation"),
             mismatched.spec,
             test_engine_profile_revision(),
+            FunctionalCanaryGateMode::StructuralVerificationOnly,
+            None,
             test_xtables_capture_path_selection(),
             qualified_xtables_capture_path_evidence().valid_until(),
         );

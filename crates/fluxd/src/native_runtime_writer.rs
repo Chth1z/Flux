@@ -13,14 +13,15 @@ use flux_platform::{NativeXtablesCaptureConverger, NativeXtablesCaptureTarget};
 #[cfg(test)]
 use crate::EngineSpec;
 use crate::EngineSupervisor;
+use crate::functional_canary::CanaryAttemptRequest;
 #[cfg(test)]
 use crate::functional_canary::FunctionalCanaryGateMode;
 #[cfg(test)]
 use crate::generation_engine_config::EngineCapabilityProfileRevision;
 use crate::generation_engine_config::{AddressReconciledGenerationInputs, CapturePathDecision};
 use crate::runtime_coordinator::{
-    AddressResyncStrategy, PreparedGeneration, PublishedRuntimeState, RuntimeCoordinator,
-    RuntimeFunctionalCanary, RuntimeWriter,
+    AddressResyncStrategy, CanarySelectorSession, PreparedGeneration, PublishedRuntimeState,
+    RetiredCanarySelectorSession, RuntimeCoordinator, RuntimeFunctionalCanary, RuntimeWriter,
 };
 use crate::subscription::ValidatedSubscriptionEngineConfig;
 
@@ -141,6 +142,7 @@ where
     retained: Vec<RetainedNativeGeneration<C::Target>>,
     committed_generation: Option<GenerationId>,
     converged_identity: Option<C::Identity>,
+    active_canary_selector_session: Option<CanaryAttemptRequest>,
     recovery_required: bool,
 }
 
@@ -186,6 +188,7 @@ where
             retained: Vec::with_capacity(2),
             committed_generation: None,
             converged_identity: None,
+            active_canary_selector_session: None,
             recovery_required: false,
         })
     }
@@ -296,6 +299,11 @@ where
     }
 
     fn converge_stopped(&mut self) -> Result<(), NativeCoordinatorWriterError> {
+        if self.active_canary_selector_session.is_some() {
+            return Err(NativeCoordinatorWriterError::Invariant(
+                "native capture cannot stop before the active canary selector session retires",
+            ));
+        }
         self.recover_if_required()?;
         let report = match self.convergence.converge(NativeCaptureDesired::Stopped) {
             Ok(report) => report,
@@ -561,6 +569,11 @@ where
         &mut self,
         generation: &PreparedGeneration,
     ) -> Result<Option<crate::functional_canary::ActiveCanaryGenerationBinding>, Self::Error> {
+        if self.active_canary_selector_session.is_some() {
+            return Err(NativeCoordinatorWriterError::Invariant(
+                "native canary ownership cannot be observed before the active selector session retires",
+            ));
+        }
         let retained = self.retained(generation.id())?;
         let expected = C::target_identity(&retained.target);
         if self.converged_identity != Some(expected) {
@@ -600,6 +613,55 @@ where
                     source,
                 )
             })
+    }
+
+    fn reserve_canary_selector_session(
+        &mut self,
+        generation: &PreparedGeneration,
+        request: &CanaryAttemptRequest,
+    ) -> Result<Option<CanarySelectorSession>, Self::Error> {
+        if self.active_canary_selector_session.is_some() {
+            return Err(NativeCoordinatorWriterError::Invariant(
+                "native canary selector session overlaps an active attempt",
+            ));
+        }
+        let retained = self.retained(generation.id())?;
+        let expected = C::target_identity(&retained.target);
+        if self.converged_identity != Some(expected) {
+            return Err(NativeCoordinatorWriterError::Invariant(
+                "native canary selector session has no matching successful convergence report",
+            ));
+        }
+        if !retained.runtime.matches_canary_selector_request(request) {
+            return Err(NativeCoordinatorWriterError::Invariant(
+                "native canary selector session does not match the retained Generation and facility",
+            ));
+        }
+
+        self.active_canary_selector_session = Some(request.clone());
+        Ok(Some(CanarySelectorSession::reserved_for(request)))
+    }
+
+    fn retire_canary_selector_session(
+        &mut self,
+        generation: &PreparedGeneration,
+        session: CanarySelectorSession,
+    ) -> Result<Option<RetiredCanarySelectorSession>, Self::Error> {
+        let active = self.active_canary_selector_session.as_ref().ok_or(
+            NativeCoordinatorWriterError::Invariant(
+                "native canary selector session retirement has no active reservation",
+            ),
+        )?;
+        if session.request().pre_binding().engine().generation() != generation.id()
+            || active != session.request()
+        {
+            return Err(NativeCoordinatorWriterError::Invariant(
+                "native canary selector session retirement substituted the active request",
+            ));
+        }
+
+        self.active_canary_selector_session = None;
+        Ok(Some(session.retire()))
     }
 
     fn publish(&mut self, phase: PublishedRuntimeState) -> Result<(), Self::Error> {
@@ -694,11 +756,11 @@ mod tests {
     use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use flux_core::{
         InterfaceAddressFlags, InterfaceAddressRecord, InterfaceIndex, NetworkInventoryTracker,
-        RuntimeDispatcher, RuntimeIntent,
+        OwnershipJournalRevision, RuntimeDispatcher, RuntimeIntent,
     };
     use flux_platform::{
         NativeCaptureConvergenceReport, ReadinessEvidence, SingBoxLaunchSpec, SingBoxPrivilege,
@@ -709,13 +771,15 @@ mod tests {
     use crate::engine_supervisor::{
         EngineCanaryReportHandoffError, EngineChildAuthority, EngineChildAuthorityError,
     };
+    use crate::functional_canary::tests::request_with_engine_identity;
     use crate::functional_canary::{
-        CanaryAttemptRequest, InstalledSupervisedDeliveryReportProducer,
+        CanaryAddressFamilies, CanaryAttemptRequest, CanaryNonce, FUNCTIONAL_CANARY_NONCE_BYTES,
+        InstalledSupervisedDeliveryReportProducer, PreparedCanaryGenerationBinding,
         SupervisedDeliveryReportEngineHandoff,
     };
     use crate::generation_engine_config::{
-        AddressReconciler, qualified_xtables_capture_path_evidence,
-        test_xtables_capture_path_selection,
+        AddressReconciler, EngineSupervisedDeliveryReportContract,
+        qualified_xtables_capture_path_evidence, test_xtables_capture_path_selection,
     };
     use crate::runtime_coordinator::{EngineRuntime, RuntimeCoordinator, RuntimeFunctionalCanary};
     use crate::{
@@ -1009,8 +1073,58 @@ mod tests {
         )
     }
 
+    fn required_canary_generation(
+        id: u32,
+        fixture: &EngineFixture,
+        request: &CanaryAttemptRequest,
+    ) -> PreparedNativeGeneration<ScriptedTarget> {
+        let generation = GenerationId::new(id).expect("nonzero native Generation");
+        let authority = request.pre_binding().environment().authority();
+        let network = authority.network();
+        let ownership = authority.ownership();
+        let prepared = PreparedCanaryGenerationBinding::new(
+            generation,
+            authority.boot_identity().clone(),
+            authority.capability_profile_revision(),
+            network.daemon_network_namespace(),
+            network.network_epoch(),
+            network.network_inventory_snapshot_id(),
+            *authority.capture_program_digest().as_bytes(),
+            ownership.journal_identity(),
+            OwnershipJournalRevision::INITIAL,
+        )
+        .expect("prepared canary Generation binding");
+        PreparedNativeGeneration::new(
+            PreparedGeneration::new(
+                generation,
+                fixture.spec.clone(),
+                request.pre_binding().engine().engine_profile_revision(),
+                FunctionalCanaryGateMode::RequiredUnqualified,
+                Some(EngineSupervisedDeliveryReportContract::schema_v1_fixture()),
+                test_xtables_capture_path_selection(),
+                qualified_xtables_capture_path_evidence().valid_until(),
+            )
+            .with_prepared_canary_generation(Some(prepared))
+            .with_retained_canary_facility(request.pre_binding().environment().facility()),
+            ScriptedTarget(u64::from(id)),
+        )
+    }
+
     fn test_engine_profile_revision() -> EngineCapabilityProfileRevision {
         EngineCapabilityProfileRevision::from_fixture_bytes([0x31; 32])
+    }
+
+    fn selector_request(fixture: &EngineFixture, nonce_byte: u8) -> CanaryAttemptRequest {
+        request_with_engine_identity(
+            &fixture.spec,
+            CanaryAddressFamilies::Ipv4Only,
+            Instant::now(),
+            CanaryNonce::from_bytes([nonce_byte; FUNCTIONAL_CANARY_NONCE_BYTES]),
+            GenerationId::new(17).expect("selector-session Generation"),
+            NonZeroU32::new(4242).expect("engine PID"),
+            NonZeroU64::new(98_765).expect("engine start ticks"),
+            NonZeroU64::new(23).expect("engine snapshot revision"),
+        )
     }
 
     fn writer(
@@ -1073,6 +1187,112 @@ mod tests {
                 Event::SourceAccepted,
             ]
         );
+    }
+
+    #[test]
+    fn native_selector_session_rejects_overlap_missing_retirement_and_substitution() {
+        let fixture = EngineFixture::new();
+        let request = selector_request(&fixture, 71);
+        let alternate = selector_request(&fixture, 72);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut writer = writer(
+            &events,
+            None,
+            None,
+            [required_canary_generation(17, &fixture, &request)],
+            [],
+        );
+        let generation = RuntimeWriter::prepare(&mut writer, Reason::Boot)
+            .expect("prepare required native Generation");
+        RuntimeWriter::capture_start(&mut writer, &generation)
+            .expect("activate required native Generation");
+
+        let missing = RuntimeWriter::retire_canary_selector_session(
+            &mut writer,
+            &generation,
+            CanarySelectorSession::reserved_for(&request),
+        )
+        .expect_err("retirement without a reservation must fail");
+        assert_eq!(
+            missing.to_string(),
+            "native canary selector session retirement has no active reservation"
+        );
+
+        let session =
+            RuntimeWriter::reserve_canary_selector_session(&mut writer, &generation, &request)
+                .expect("reserve exact selector session")
+                .expect("native writer supplies selector-session ownership");
+        let overlap =
+            RuntimeWriter::reserve_canary_selector_session(&mut writer, &generation, &alternate)
+                .expect_err("overlapping selector sessions must fail");
+        assert_eq!(
+            overlap.to_string(),
+            "native canary selector session overlaps an active attempt"
+        );
+
+        let substituted = RuntimeWriter::retire_canary_selector_session(
+            &mut writer,
+            &generation,
+            CanarySelectorSession::reserved_for(&alternate),
+        )
+        .expect_err("a different request cannot retire the active session");
+        assert_eq!(
+            substituted.to_string(),
+            "native canary selector session retirement substituted the active request"
+        );
+        assert_eq!(
+            writer.active_canary_selector_session.as_ref(),
+            Some(&request),
+            "a substituted retirement must leave the exact reservation active"
+        );
+
+        let retired =
+            RuntimeWriter::retire_canary_selector_session(&mut writer, &generation, session)
+                .expect("retire exact selector session")
+                .expect("native writer returns exact retirement");
+        assert!(retired.matches_request(&request));
+        assert!(writer.active_canary_selector_session.is_none());
+    }
+
+    #[test]
+    fn native_selector_session_must_retire_before_ownership_observation_or_capture_stop() {
+        let fixture = EngineFixture::new();
+        let request = selector_request(&fixture, 73);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut writer = writer(
+            &events,
+            None,
+            None,
+            [required_canary_generation(17, &fixture, &request)],
+            [],
+        );
+        let generation = RuntimeWriter::prepare(&mut writer, Reason::Boot)
+            .expect("prepare required native Generation");
+        RuntimeWriter::capture_start(&mut writer, &generation)
+            .expect("activate required native Generation");
+        let session =
+            RuntimeWriter::reserve_canary_selector_session(&mut writer, &generation, &request)
+                .expect("reserve exact selector session")
+                .expect("native writer supplies selector-session ownership");
+
+        let observation = RuntimeWriter::observe_active_canary_generation(&mut writer, &generation)
+            .expect_err("post-attempt observation must wait for exact retirement");
+        assert_eq!(
+            observation.to_string(),
+            "native canary ownership cannot be observed before the active selector session retires"
+        );
+        let stop = RuntimeWriter::capture_stop(&mut writer)
+            .expect_err("capture cannot detach around an active selector session");
+        assert_eq!(
+            stop.to_string(),
+            "native capture cannot stop before the active canary selector session retires"
+        );
+
+        RuntimeWriter::retire_canary_selector_session(&mut writer, &generation, session)
+            .expect("retire exact selector session")
+            .expect("native writer returns exact retirement");
+        RuntimeWriter::capture_stop(&mut writer)
+            .expect("capture can stop after exact selector-session retirement");
     }
 
     #[test]

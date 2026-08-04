@@ -161,6 +161,25 @@ impl PreparedGeneration {
         self.retained_canary_facility
     }
 
+    #[must_use]
+    pub(crate) fn matches_canary_selector_request(&self, request: &CanaryAttemptRequest) -> bool {
+        let engine = request.pre_binding().engine();
+        let environment = request.pre_binding().environment();
+        let attempt_objects = environment.attempt_objects();
+        self.functional_canary_mode == FunctionalCanaryGateMode::RequiredUnqualified
+            && self.supervised_delivery_report.is_some()
+            && self
+                .prepared_canary_generation
+                .as_ref()
+                .is_some_and(|prepared| prepared.generation() == self.id)
+            && self.retained_canary_facility == Some(environment.facility())
+            && self.id == engine.generation()
+            && self.engine_profile_revision == engine.engine_profile_revision()
+            && self.spec.artifacts() == engine.artifacts()
+            && attempt_objects.generation() == self.id
+            && attempt_objects.nonce() == request.nonce()
+    }
+
     const fn runtime_binding(&self) -> RuntimeGenerationBinding {
         RuntimeGenerationBinding::new(self.id, self.capture_path_selection)
     }
@@ -264,6 +283,49 @@ pub(crate) fn inspect_admitted_generation(
     PreparedGenerationRecord::from_admitted(generation)
 }
 
+/// Non-cloneable ownership of one logical selector session for an exact canary request.
+///
+/// This checkpoint reserves serialization only. It does not install kernel selectors; a later
+/// execution handoff must preserve supervised-report setup before any such mutation.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct CanarySelectorSession {
+    request: CanaryAttemptRequest,
+}
+
+impl CanarySelectorSession {
+    #[must_use]
+    pub(crate) fn reserved_for(request: &CanaryAttemptRequest) -> Self {
+        Self {
+            request: request.clone(),
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn request(&self) -> &CanaryAttemptRequest {
+        &self.request
+    }
+
+    #[must_use]
+    pub(crate) fn retire(self) -> RetiredCanarySelectorSession {
+        RetiredCanarySelectorSession {
+            request: self.request,
+        }
+    }
+}
+
+/// Proof returned only after the serialized writer retired the exact logical session.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct RetiredCanarySelectorSession {
+    request: CanaryAttemptRequest,
+}
+
+impl RetiredCanarySelectorSession {
+    #[must_use]
+    pub(crate) fn matches_request(&self, request: &CanaryAttemptRequest) -> bool {
+        self.request == *request
+    }
+}
+
 pub(crate) trait RuntimeWriter: Send + 'static {
     type Error: Error + Send + Sync + 'static;
 
@@ -295,6 +357,22 @@ pub(crate) trait RuntimeWriter: Send + 'static {
         &mut self,
         _generation: &PreparedGeneration,
     ) -> Result<Option<ActiveCanaryGenerationBinding>, Self::Error> {
+        Ok(None)
+    }
+    /// Reserve serialization for this exact request without mutating selector state.
+    fn reserve_canary_selector_session(
+        &mut self,
+        _generation: &PreparedGeneration,
+        _request: &CanaryAttemptRequest,
+    ) -> Result<Option<CanarySelectorSession>, Self::Error> {
+        Ok(None)
+    }
+    /// Consume the exact reservation before any post-attempt ownership observation.
+    fn retire_canary_selector_session(
+        &mut self,
+        _generation: &PreparedGeneration,
+        _session: CanarySelectorSession,
+    ) -> Result<Option<RetiredCanarySelectorSession>, Self::Error> {
         Ok(None)
     }
     fn publish(&mut self, phase: PublishedRuntimeState) -> Result<(), Self::Error>;
@@ -2548,6 +2626,25 @@ where
                 "detach capture before preparing fresh canary authorities",
             )
         })?;
+        let selector_session = self
+            .writer
+            .reserve_canary_selector_session(generation, &request)
+            .map_err(|source| {
+                runtime_writer_error(
+                    "reserve functional-canary selector session",
+                    source,
+                    "detach capture before recovering selector-session ownership",
+                )
+            })?
+            .ok_or_else(|| {
+                ControlError::runtime(
+                    "reserve functional-canary selector session",
+                    io::Error::other(
+                        "required functional-canary Generation has no selector-session reservation",
+                    ),
+                    "detach capture before installing the required selector-session owner",
+                )
+            })?;
         let execution = match &mut self.functional_canary {
             RuntimeFunctionalCanary::RequiredUnqualified { executor, .. } => {
                 executor.execute(execution_input)
@@ -2556,6 +2653,34 @@ where
                 unreachable!("required adapter availability was validated before engine start")
             }
         };
+        let retired_selector_session = self
+            .writer
+            .retire_canary_selector_session(generation, selector_session)
+            .map_err(|source| {
+                runtime_writer_error(
+                    "retire functional-canary selector session",
+                    source,
+                    "detach capture before recovering selector-session ownership",
+                )
+            })?
+            .ok_or_else(|| {
+                ControlError::runtime(
+                    "retire functional-canary selector session",
+                    io::Error::other(
+                        "required functional-canary attempt has no exact selector-session retirement",
+                    ),
+                    "detach capture before recovering selector-session ownership",
+                )
+            })?;
+        if !retired_selector_session.matches_request(&request) {
+            return Err(ControlError::runtime(
+                "retire functional-canary selector session",
+                io::Error::other(
+                    "retired functional-canary selector session does not match the immutable request",
+                ),
+                "detach capture before recovering selector-session ownership",
+            ));
+        }
         let post_capture = self.observe_active_canary_generation(generation)?;
         let post_engine = self.reconcile_canary_engine(
             generation,
@@ -5419,8 +5544,10 @@ mod tests {
             [ready_canary_snapshot(98_765), ready_canary_snapshot(98_765)],
         );
         let authority_openings = engine.authority_openings();
+        let writer = writer.with_required_canary_script(Arc::clone(&canary_script));
+        let selector_session_calls = Arc::clone(&writer.selector_session_calls);
         let mut coordinator = RuntimeCoordinator::with_dependencies(
-            writer.with_required_canary_script(Arc::clone(&canary_script)),
+            writer,
             engine,
             Duration::from_millis(100),
             scripted_required_canary(Arc::clone(&canary_script), Arc::clone(&events)),
@@ -5457,6 +5584,21 @@ mod tests {
                 NonZeroU32::new(4242).expect("nonzero engine PID"),
                 NonZeroU64::new(98_765).expect("nonzero engine start ticks"),
             )]
+        );
+        assert_eq!(
+            *selector_session_calls
+                .lock()
+                .expect("selector session calls lock"),
+            [
+                SelectorSessionCall::Reserved {
+                    generation: generation(17),
+                    nonce: CanaryNonce::from_bytes([21; FUNCTIONAL_CANARY_NONCE_BYTES]),
+                },
+                SelectorSessionCall::Retired {
+                    generation: generation(17),
+                    nonce: CanaryNonce::from_bytes([21; FUNCTIONAL_CANARY_NONCE_BYTES]),
+                },
+            ]
         );
         let snapshot = runtime.snapshot();
         assert_eq!(snapshot.phase, RuntimePhase::Running);
@@ -5523,6 +5665,77 @@ mod tests {
         assert!(!events.lock().expect("events lock").iter().any(|event| {
             matches!(*event, Event::CanaryPrepared(_) | Event::CanaryExecuted(_))
         }));
+        assert_ne!(runtime.snapshot().phase, RuntimePhase::Running);
+    }
+
+    #[test]
+    fn required_canary_without_selector_session_never_executes_attempt() {
+        let fixture = EngineFixture::new();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let request = functional_request_with_nonce(
+            &fixture.spec,
+            CanaryAddressFamilies::Ipv4Only,
+            Instant::now(),
+            CanaryNonce::from_bytes([64; FUNCTIONAL_CANARY_NONCE_BYTES]),
+        );
+        let canary_script = Arc::new(Mutex::new(ScriptedCanary::new([
+            ScriptedCanaryAttempt::passing(request),
+        ])));
+        let mut writer = ScriptedWriter {
+            events: Arc::clone(&events),
+            prepared: VecDeque::from([fixture.spec.clone()]),
+            next_generation_id: 17,
+            capture_start_failure: false,
+            capture_stop_failures: 0,
+            verify_failure: false,
+        }
+        .with_required_canary_script(Arc::clone(&canary_script));
+        writer.selector_session_available = false;
+        let selector_session_calls = Arc::clone(&writer.selector_session_calls);
+        let observation_calls = Arc::clone(&writer.observation_calls);
+        let engine = RequiredScriptedEngine::new(
+            Arc::clone(&events),
+            [ready_canary_snapshot(98_765), ready_canary_snapshot(98_765)],
+        );
+        let mut coordinator = RuntimeCoordinator::with_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+            scripted_required_canary(Arc::clone(&canary_script), Arc::clone(&events)),
+        );
+        let runtime = coordinator.runtime_snapshot_source();
+
+        let error = coordinator
+            .execute(&RuntimeIntent::Running {
+                reason: Reason::Boot,
+            })
+            .expect_err("missing selector-session ownership must block execution");
+
+        assert!(
+            error
+                .to_string()
+                .contains("has no selector-session reservation")
+        );
+        assert_eq!(canary_script.lock().expect("canary script").executions, 0);
+        assert!(
+            selector_session_calls
+                .lock()
+                .expect("selector session calls lock")
+                .is_empty()
+        );
+        assert_eq!(
+            *observation_calls
+                .lock()
+                .expect("active ownership observation calls lock"),
+            [generation(17)]
+        );
+        assert!(
+            !events
+                .lock()
+                .expect("events lock")
+                .iter()
+                .any(|event| matches!(*event, Event::CanaryExecuted(_)))
+        );
         assert_ne!(runtime.snapshot().phase, RuntimePhase::Running);
     }
 
@@ -7957,6 +8170,21 @@ mod tests {
         canary_script: Option<Arc<Mutex<ScriptedCanary>>>,
         active_observations: VecDeque<Option<ActiveCanaryGenerationBinding>>,
         observation_calls: Arc<Mutex<Vec<GenerationId>>>,
+        active_selector_session: Option<CanaryAttemptRequest>,
+        selector_session_available: bool,
+        selector_session_calls: Arc<Mutex<Vec<SelectorSessionCall>>>,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum SelectorSessionCall {
+        Reserved {
+            generation: GenerationId,
+            nonce: CanaryNonce,
+        },
+        Retired {
+            generation: GenerationId,
+            nonce: CanaryNonce,
+        },
     }
 
     trait RequiredGenerationWriterExt: Sized {
@@ -7966,6 +8194,9 @@ mod tests {
                 canary_script: None,
                 active_observations: VecDeque::new(),
                 observation_calls: Arc::new(Mutex::new(Vec::new())),
+                active_selector_session: None,
+                selector_session_available: true,
+                selector_session_calls: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -7978,6 +8209,9 @@ mod tests {
                 canary_script: Some(canary_script),
                 active_observations: VecDeque::new(),
                 observation_calls: Arc::new(Mutex::new(Vec::new())),
+                active_selector_session: None,
+                selector_session_available: true,
+                selector_session_calls: Arc::new(Mutex::new(Vec::new())),
             }
         }
     }
@@ -8062,6 +8296,9 @@ mod tests {
                 .lock()
                 .expect("active ownership observation calls lock")
                 .push(generation.id());
+            if self.active_selector_session.is_some() {
+                return Ok(None);
+            }
             if let Some(observation) = self.active_observations.pop_front() {
                 return Ok(observation);
             }
@@ -8079,6 +8316,47 @@ mod tests {
                     request.pre_binding().environment(),
                 )
             }))
+        }
+
+        fn reserve_canary_selector_session(
+            &mut self,
+            generation: &PreparedGeneration,
+            request: &CanaryAttemptRequest,
+        ) -> Result<Option<CanarySelectorSession>, Self::Error> {
+            if !self.selector_session_available || self.active_selector_session.is_some() {
+                return Ok(None);
+            }
+            self.active_selector_session = Some(request.clone());
+            self.selector_session_calls
+                .lock()
+                .expect("selector session calls lock")
+                .push(SelectorSessionCall::Reserved {
+                    generation: generation.id(),
+                    nonce: request.nonce(),
+                });
+            Ok(Some(CanarySelectorSession::reserved_for(request)))
+        }
+
+        fn retire_canary_selector_session(
+            &mut self,
+            generation: &PreparedGeneration,
+            session: CanarySelectorSession,
+        ) -> Result<Option<RetiredCanarySelectorSession>, Self::Error> {
+            if session.request().pre_binding().engine().generation() != generation.id()
+                || self.active_selector_session.as_ref() != Some(session.request())
+            {
+                return Ok(None);
+            }
+            let nonce = session.request().nonce();
+            self.active_selector_session = None;
+            self.selector_session_calls
+                .lock()
+                .expect("selector session calls lock")
+                .push(SelectorSessionCall::Retired {
+                    generation: generation.id(),
+                    nonce,
+                });
+            Ok(Some(session.retire()))
         }
 
         fn publish(&mut self, phase: PublishedRuntimeState) -> Result<(), Self::Error> {

@@ -1608,6 +1608,7 @@ mod implementation {
     mod record_control_tests {
         use std::net::TcpListener;
         use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+        use std::thread;
         use std::time::{Duration, Instant};
 
         use super::{
@@ -2094,6 +2095,20 @@ mod implementation {
             assert_writer_has_no_readers(&write_end);
         }
 
+        #[test]
+        fn writer_reader_absence_waits_for_a_transient_inherited_reader() {
+            let (read_end, write_end) = nonblocking_pipe();
+            let transient_reader = duplicate_owned_fd(read_end.as_raw_fd());
+            let release = thread::spawn(move || {
+                thread::sleep(Duration::from_millis(50));
+                drop(transient_reader);
+            });
+            drop(read_end);
+
+            assert_writer_has_no_readers(&write_end);
+            release.join().expect("join transient pipe reader");
+        }
+
         fn exact_fill_descriptor_count() -> usize {
             let receive_control_bytes = std::mem::size_of::<[usize; RECEIVE_CONTROL_WORDS]>();
             let credential_space = control_message_space(std::mem::size_of::<libc::ucred>())
@@ -2296,18 +2311,25 @@ mod implementation {
         }
 
         fn assert_writer_has_no_readers(write_end: &OwnedFd) {
+            let deadline = Instant::now() + Duration::from_secs(1);
             let mut descriptor = libc::pollfd {
                 fd: write_end.as_raw_fd(),
                 events: libc::POLLOUT,
                 revents: 0,
             };
-            // SAFETY: `descriptor` points to one initialized writable pollfd.
-            assert_eq!(unsafe { libc::poll(&raw mut descriptor, 1, 0) }, 1);
-            assert_ne!(
-                descriptor.revents & libc::POLLERR,
-                0,
-                "no received duplicate of the pipe read end may remain open"
-            );
+            loop {
+                descriptor.revents = 0;
+                // SAFETY: `descriptor` points to one initialized writable pollfd.
+                assert_eq!(unsafe { libc::poll(&raw mut descriptor, 1, 0) }, 1);
+                if descriptor.revents & libc::POLLERR != 0 {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "received pipe readers remained open after the bounded close wait"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
         }
 
         fn send_file_descriptors(

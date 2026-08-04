@@ -1002,6 +1002,13 @@ fn assembler_produces_one_complete_host_inspection_generation() {
     assert!(admitted.xtables().ipv4().is_some());
     assert!(admitted.xtables().ipv6().is_none());
     assert_eq!(
+        admitted
+            .xtables()
+            .ipv4()
+            .and_then(|pair| pair.local_output_canary_selector()),
+        Some("FLX4C0000000001")
+    );
+    assert_eq!(
         admitted.engine_spec().restart_policy().maximum_backoff(),
         admitted
             .desired_state()
@@ -1076,6 +1083,12 @@ fn structural_functional_canary_admits_an_unqualified_engine_profile() {
         FunctionalCanaryGateMode::StructuralVerificationOnly
     );
     assert_eq!(admitted.supervised_delivery_report(), None);
+    assert!(
+        admitted
+            .xtables()
+            .ipv4()
+            .is_some_and(|pair| pair.local_output_canary_selector().is_none())
+    );
 }
 
 #[test]

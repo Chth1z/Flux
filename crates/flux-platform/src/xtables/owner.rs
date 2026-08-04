@@ -242,6 +242,9 @@ impl XtablesStableFamilyPlan {
             .iter()
             .map(|entry| Box::<str>::from(entry.chain()))
             .collect::<Vec<_>>();
+        if let Some(chain) = pair.local_output_canary_selector() {
+            private_chains.push(chain.into());
+        }
         private_chains.sort_unstable();
         Ok(Self {
             family,

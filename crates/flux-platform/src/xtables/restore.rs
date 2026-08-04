@@ -1137,7 +1137,7 @@ fn capture_stable_chain_family(chain: &str) -> Option<XtablesRestoreFamily> {
 fn capture_generation_chain_family(chain: &str) -> Option<XtablesRestoreFamily> {
     let suffix = chain.strip_prefix("FLX")?;
     let bytes = suffix.as_bytes();
-    if bytes.len() != 12 || !matches!(bytes[1], b'F' | b'O' | b'P') {
+    if bytes.len() != 12 || !matches!(bytes[1], b'C' | b'F' | b'O' | b'P') {
         return None;
     }
     let family = match bytes[0] {

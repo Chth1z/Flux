@@ -477,6 +477,112 @@ fn ipv4_local_output_pins_complete_non_authorizing_transaction() {
 }
 
 #[test]
+fn local_output_canary_slot_is_empty_owned_and_precedes_configurable_policy() {
+    let report = compile_program_with_application_and_host(
+        scope(AddressHostFamilySelection::Ipv4, true, false),
+        interfaces(&[exact("tun0")], &[], &[]),
+        CaptureApplicationPolicy::new(CaptureApplicationMode::Denylist, [uid(1001)]).unwrap(),
+        CaptureProtocolSet::TCP_AND_UDP,
+        &["100.64.0.0/10"],
+        Some(host_plan("203.0.113.7")),
+    );
+    let routing = local_routing_spec(Some(default_routing_target()), None);
+    let baseline = lower_with_routing(&report, 24, default_target(), routing).unwrap();
+    let lowered = lower_xtables_capture(
+        lowering_request(report.program(), 24, default_target())
+            .with_local_output_routing(routing)
+            .with_local_output_canary_selector_slot(),
+    )
+    .unwrap();
+    let baseline_pair = baseline.ipv4().unwrap();
+    let pair = lowered.ipv4().unwrap();
+    let slot = pair
+        .local_output_canary_selector()
+        .expect("required lowering reserves one selector slot");
+    assert_eq!(slot, "FLX4C0000000024");
+    assert!(pair.entries().iter().all(|entry| entry.chain() != slot));
+
+    let prepare = restore_text(pair.prepare());
+    let owner = prepare.find("--uid-owner 1000 --gid-owner 1000").unwrap();
+    let mandatory = prepare.find("-d 0.0.0.0/8 -j RETURN").unwrap();
+    let host = prepare.find("-d 203.0.113.7/32 -j RETURN").unwrap();
+    let selector = prepare
+        .find("-A FLX4O0000000024 -j FLX4C0000000024")
+        .unwrap();
+    let configured = prepare.find("-d 100.64.0.0/10 -j RETURN").unwrap();
+    let application = prepare.find("--uid-owner 1001 -j RETURN").unwrap();
+    let proxy = prepare.find("-p tcp -j MARK --set-xmark").unwrap();
+    assert!(
+        owner < mandatory
+            && mandatory < host
+            && host < selector
+            && selector < configured
+            && configured < application
+            && application < proxy
+    );
+    assert!(prepare.contains(":FLX4C0000000024 - [0:0]\n"));
+    assert!(!prepare.contains("-A FLX4C0000000024 "));
+
+    let retire = restore_text(pair.retire());
+    assert!(retire.contains("-F FLX4C0000000024\n"));
+    assert!(retire.contains("-X FLX4C0000000024\n"));
+    assert_eq!(
+        pair.usage().implementation_chains(),
+        baseline_pair.usage().implementation_chains() + 1
+    );
+    assert_eq!(
+        pair.usage().prepare_commands(),
+        baseline_pair.usage().prepare_commands() + 1
+    );
+    assert_eq!(
+        pair.usage().retire_commands(),
+        baseline_pair.usage().retire_commands() + 2
+    );
+    assert_eq!(pair.usage().maximum_jump_depth(), 2);
+    assert_ne!(lowered.lowering_digest(), baseline.lowering_digest());
+}
+
+#[test]
+fn canary_slot_requires_a_proxy_capable_local_output_program() {
+    let forwarded = compile_program(
+        scope(AddressHostFamilySelection::Ipv4, false, true),
+        interfaces(&[], &[exact("wlan0")], &[]),
+        CaptureProtocolSet::TCP,
+        &[],
+    );
+    assert_eq!(
+        lower_xtables_capture(
+            lowering_request(forwarded.program(), 25, default_target())
+                .with_local_output_canary_selector_slot(),
+        ),
+        Err(
+            XtablesCaptureLoweringError::MissingLocalOutputCanarySelectorAnchor {
+                family: NetworkAddressFamily::Ipv4,
+            }
+        )
+    );
+
+    let all_direct = compile_program_with_application(
+        scope(AddressHostFamilySelection::Ipv4, true, false),
+        interfaces(&[], &[], &[]),
+        CaptureApplicationPolicy::new(CaptureApplicationMode::Allowlist, []).unwrap(),
+        CaptureProtocolSet::TCP_AND_UDP,
+        &[],
+    );
+    assert_eq!(
+        lower_xtables_capture(
+            lowering_request(all_direct.program(), 25, default_target())
+                .with_local_output_canary_selector_slot(),
+        ),
+        Err(
+            XtablesCaptureLoweringError::MissingLocalOutputCanarySelectorAnchor {
+                family: NetworkAddressFamily::Ipv4,
+            }
+        )
+    );
+}
+
+#[test]
 fn ipv6_local_output_uses_kernel_canonical_scope_and_explicit_metric() {
     let report = compile_program(
         scope(AddressHostFamilySelection::Ipv6, true, false),

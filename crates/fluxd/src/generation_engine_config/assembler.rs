@@ -729,6 +729,9 @@ impl GenerationAssembler {
         if let Some(routing) = planning_context.routing {
             lowering = lowering.with_local_output_routing(routing);
         }
+        if functional_canary_mode == FunctionalCanaryGateMode::RequiredUnqualified {
+            lowering = lowering.with_local_output_canary_selector_slot();
+        }
         let xtables = lower_xtables_capture(lowering).map_err(GenerationAssemblyError::Xtables)?;
         let digest = digest_generation(GenerationDigestInput {
             generation,

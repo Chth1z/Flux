@@ -31,6 +31,8 @@ const PAIR_DIGEST_DOMAIN: &[u8] =
     b"Flux canonical xtables Capture Program artifact pair\0schema-v2\0";
 const SET_DIGEST_DOMAIN: &[u8] =
     b"Flux canonical xtables Capture Program artifact set\0schema-v2\0";
+const CANARY_SELECTOR_LOWERING_DIGEST_MARKER: &[u8] =
+    b"\0Flux local-OUTPUT canary selector slot\0v1\0";
 const LINUX_ROUTE_SCOPE_UNIVERSE: u8 = 0;
 const LINUX_ROUTE_SCOPE_HOST: u8 = 254;
 const LINUX_ROUTE_TYPE_LOCAL: u8 = 2;
@@ -352,6 +354,7 @@ pub struct XtablesCaptureLoweringRequest<'a> {
     namespace: XtablesCaptureNamespace,
     target: XtablesTproxyTarget,
     local_output_routing: Option<XtablesLocalOutputRoutingSpec>,
+    reserve_local_output_canary_selector: bool,
     extensions: XtablesCaptureExtensions,
     budget: XtablesCaptureLoweringBudget,
 }
@@ -368,6 +371,7 @@ impl<'a> XtablesCaptureLoweringRequest<'a> {
             namespace,
             target,
             local_output_routing: None,
+            reserve_local_output_canary_selector: false,
             extensions: XtablesCaptureExtensions::new(false, false, false, false, false),
             budget: XtablesCaptureLoweringBudget(MAX_XTABLES_CAPTURE_COMMANDS_PER_ARTIFACT),
         }
@@ -379,6 +383,14 @@ impl<'a> XtablesCaptureLoweringRequest<'a> {
         routing: XtablesLocalOutputRoutingSpec,
     ) -> Self {
         self.local_output_routing = Some(routing);
+        self
+    }
+
+    /// Reserves one empty Generation-scoped chain reached from each proxy-capable local-OUTPUT
+    /// classifier. The slot is descriptive target material only and grants no mutation authority.
+    #[must_use]
+    pub const fn with_local_output_canary_selector_slot(mut self) -> Self {
+        self.reserve_local_output_canary_selector = true;
         self
     }
 
@@ -784,6 +796,7 @@ pub struct XtablesCaptureArtifactPair {
     family: XtablesRestoreFamily,
     entries: Box<[XtablesCaptureEntryPoint]>,
     local_output: Option<XtablesLocalOutputTransactionRequirements>,
+    local_output_canary_selector: Option<Box<str>>,
     transaction_order: XtablesCaptureTransactionOrder,
     prepare: XtablesRestoreArtifact,
     retire: XtablesRestoreArtifact,
@@ -805,6 +818,11 @@ impl XtablesCaptureArtifactPair {
     #[must_use]
     pub const fn local_output(&self) -> Option<XtablesLocalOutputTransactionRequirements> {
         self.local_output
+    }
+
+    #[must_use]
+    pub fn local_output_canary_selector(&self) -> Option<&str> {
+        self.local_output_canary_selector.as_deref()
     }
 
     #[must_use]
@@ -959,6 +977,9 @@ pub enum XtablesCaptureLoweringError {
     UnexpectedLocalOutputRouting {
         family: NetworkAddressFamily,
     },
+    MissingLocalOutputCanarySelectorAnchor {
+        family: NetworkAddressFamily,
+    },
     InvalidProgramShape {
         family: NetworkAddressFamily,
         domain: CaptureTrafficDomain,
@@ -1035,6 +1056,10 @@ impl fmt::Display for XtablesCaptureLoweringError {
             Self::UnexpectedLocalOutputRouting { family } => write!(
                 formatter,
                 "{family:?} local-OUTPUT routing was supplied without a proxy-capable local program"
+            ),
+            Self::MissingLocalOutputCanarySelectorAnchor { family } => write!(
+                formatter,
+                "{family:?} canary selector slot was requested without a proxy-capable local-OUTPUT program"
             ),
             Self::InvalidProgramShape {
                 family,
@@ -1113,6 +1138,7 @@ impl Error for XtablesCaptureLoweringError {
             | Self::UnsupportedTrafficDomain { .. }
             | Self::MissingLocalOutputRouting { .. }
             | Self::UnexpectedLocalOutputRouting { .. }
+            | Self::MissingLocalOutputCanarySelectorAnchor { .. }
             | Self::InvalidProgramShape { .. }
             | Self::MissingForwardedLoopbackSafety { .. }
             | Self::FamilyMismatch { .. }
@@ -1275,6 +1301,19 @@ fn lower_family(
         }
         (None, None) => None,
     };
+    let local_output_canary_selector = if request.reserve_local_output_canary_selector {
+        if local_proxy_protocols.is_none() {
+            return Err(
+                XtablesCaptureLoweringError::MissingLocalOutputCanarySelectorAnchor { family },
+            );
+        }
+        Some(canary_selector_chain_name(
+            family,
+            request.namespace.generation(),
+        ))
+    } else {
+        None
+    };
 
     let implementation_chains = analyses
         .iter()
@@ -1284,7 +1323,8 @@ fn lower_family(
                     && analysis.protocols.is_some(),
             )
         })
-        .sum::<usize>();
+        .sum::<usize>()
+        + usize::from(local_output_canary_selector.is_some());
     let prepare_commands = analyses
         .iter()
         .map(|analysis| {
@@ -1298,7 +1338,11 @@ fn lower_family(
                 } else {
                     0
                 };
-            program_commands + companion_commands
+            let canary_jump = usize::from(
+                analysis.program.domain() == CaptureTrafficDomain::LocalOutput
+                    && local_output_canary_selector.is_some(),
+            );
+            program_commands + companion_commands + canary_jump
         })
         .sum::<usize>();
     let retire_commands = implementation_chains * 2;
@@ -1322,7 +1366,12 @@ fn lower_family(
             CaptureTrafficDomain::LocalOutput => {
                 let role = XtablesCaptureEntryPointRole::LocalOutputClassifier;
                 let chain = capture_chain_name(family, role, request.namespace.generation());
-                let rules = render_program(analysis, &chain, request.target)?;
+                let rules = render_program(
+                    analysis,
+                    &chain,
+                    request.target,
+                    local_output_canary_selector.as_deref(),
+                )?;
                 entries.push(XtablesCaptureEntryPoint {
                     role,
                     domain: CaptureTrafficDomain::LocalOutput,
@@ -1334,6 +1383,12 @@ fn lower_family(
                     ),
                 });
                 chains.push(RenderedChain { name: chain, rules });
+                if let Some(slot) = &local_output_canary_selector {
+                    chains.push(RenderedChain {
+                        name: slot.clone(),
+                        rules: Vec::new(),
+                    });
+                }
 
                 if let Some(protocols) = analysis.protocols {
                     let role = XtablesCaptureEntryPointRole::LocalOutputLoopbackTproxy;
@@ -1355,7 +1410,7 @@ fn lower_family(
             CaptureTrafficDomain::ForwardedIngress => {
                 let role = XtablesCaptureEntryPointRole::ForwardedIngress;
                 let chain = capture_chain_name(family, role, request.namespace.generation());
-                let rules = render_program(analysis, &chain, request.target)?;
+                let rules = render_program(analysis, &chain, request.target, None)?;
                 entries.push(XtablesCaptureEntryPoint {
                     role,
                     domain: CaptureTrafficDomain::ForwardedIngress,
@@ -1430,7 +1485,8 @@ fn lower_family(
                         0
                     }
             })
-            .sum(),
+            .sum::<usize>()
+            + usize::from(local_output_canary_selector.is_some()),
         implementation_chains,
         entry_points: entries.len(),
         listener_requirements: local_output
@@ -1440,7 +1496,7 @@ fn lower_family(
         transaction_steps: transaction_order.prepare().len() + transaction_order.retire().len(),
         prepare_commands,
         retire_commands,
-        maximum_jump_depth: 1,
+        maximum_jump_depth: 1 + usize::from(local_output_canary_selector.is_some()),
     };
     let entries = entries.into_boxed_slice();
     let digest = digest_pair(PairDigestInput {
@@ -1457,6 +1513,7 @@ fn lower_family(
         family: restore_family,
         entries,
         local_output,
+        local_output_canary_selector,
         transaction_order,
         prepare,
         retire,
@@ -1793,12 +1850,27 @@ fn render_program(
     analysis: &ProgramAnalysis<'_>,
     chain: &str,
     target: XtablesTproxyTarget,
+    canary_selector_chain: Option<&str>,
 ) -> Result<Vec<String>, XtablesCaptureLoweringError> {
     let mut rules = Vec::with_capacity(
-        analysis.direct_rules + analysis.proxy_rules + usize::from(analysis.final_return),
+        analysis.direct_rules
+            + analysis.proxy_rules
+            + usize::from(analysis.final_return)
+            + usize::from(canary_selector_chain.is_some()),
     );
+    let mut canary_inserted = false;
     for clause in &analysis.program.clauses()[..analysis.direct_clause_count] {
+        if !canary_inserted
+            && clause.stage() >= CaptureDecisionStage::ConfigurableBypass
+            && let Some(canary_selector_chain) = canary_selector_chain
+        {
+            rules.push(format!("-A {chain} -j {canary_selector_chain}"));
+            canary_inserted = true;
+        }
         render_direct_clause(analysis.program, clause, chain, &mut rules)?;
+    }
+    if !canary_inserted && let Some(canary_selector_chain) = canary_selector_chain {
+        rules.push(format!("-A {chain} -j {canary_selector_chain}"));
     }
     if let (Some(scope), Some(protocols)) = (&analysis.proxy_scope, analysis.protocols) {
         render_proxy_rules(
@@ -1815,7 +1887,10 @@ fn render_program(
     }
     debug_assert_eq!(
         rules.len(),
-        analysis.direct_rules + analysis.proxy_rules + usize::from(analysis.final_return)
+        analysis.direct_rules
+            + analysis.proxy_rules
+            + usize::from(analysis.final_return)
+            + usize::from(canary_selector_chain.is_some())
     );
     Ok(rules)
 }
@@ -2224,6 +2299,10 @@ fn capture_chain_name(
     format!("FLX{}{role}{:010}", family_tag(family), generation.get()).into_boxed_str()
 }
 
+fn canary_selector_chain_name(family: NetworkAddressFamily, generation: GenerationId) -> Box<str> {
+    format!("FLX{}C{:010}", family_tag(family), generation.get()).into_boxed_str()
+}
+
 fn digest_lowering(request: XtablesCaptureLoweringRequest<'_>) -> XtablesCaptureLoweringDigest {
     let mut digest = Sha256::new();
     digest.update(LOWERING_DIGEST_DOMAIN);
@@ -2237,6 +2316,9 @@ fn digest_lowering(request: XtablesCaptureLoweringRequest<'_>) -> XtablesCapture
     digest.update(request.target.mark().bypass_value().to_be_bytes());
     digest.update([request.extensions.bits()]);
     digest_routing_spec(&mut digest, request.local_output_routing);
+    if request.reserve_local_output_canary_selector {
+        digest.update(CANARY_SELECTOR_LOWERING_DIGEST_MARKER);
+    }
     XtablesCaptureLoweringDigest(digest.finalize().into())
 }
 

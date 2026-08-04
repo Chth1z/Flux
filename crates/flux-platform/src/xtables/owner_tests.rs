@@ -21,7 +21,7 @@ const BYPASS_MARK: u32 = 0x0040_0000;
 
 #[test]
 fn local_output_topology_pins_stable_roots_and_output_last_install() {
-    let artifacts = artifacts(AddressHostFamilySelection::Ipv4, true, false);
+    let artifacts = artifacts(AddressHostFamilySelection::Ipv4, true, false, false);
     let plan = XtablesStableTopologyPlan::from_artifacts(&artifacts)
         .expect("derive local-OUTPUT stable topology");
     let family = plan
@@ -107,7 +107,7 @@ fn local_output_topology_pins_stable_roots_and_output_last_install() {
 
 #[test]
 fn prerouting_root_orders_loopback_tproxy_before_forwarded_ingress() {
-    let artifacts = artifacts(AddressHostFamilySelection::Ipv4, true, true);
+    let artifacts = artifacts(AddressHostFamilySelection::Ipv4, true, true, false);
     let plan = XtablesStableTopologyPlan::from_artifacts(&artifacts)
         .expect("derive combined stable topology");
     let install = text(
@@ -127,7 +127,7 @@ fn prerouting_root_orders_loopback_tproxy_before_forwarded_ingress() {
 
 #[test]
 fn dual_stack_topology_uses_family_scoped_stable_roots() {
-    let artifacts = artifacts(AddressHostFamilySelection::DualStack, true, false);
+    let artifacts = artifacts(AddressHostFamilySelection::DualStack, true, false, false);
     let plan = XtablesStableTopologyPlan::from_artifacts(&artifacts)
         .expect("derive dual-stack stable topology");
 
@@ -143,8 +143,36 @@ fn dual_stack_topology_uses_family_scoped_stable_roots() {
 }
 
 #[test]
+fn canary_selector_slots_are_retained_as_private_recovery_chains() {
+    let artifacts = artifacts(AddressHostFamilySelection::DualStack, true, false, true);
+    let plan = XtablesStableTopologyPlan::from_artifacts(&artifacts)
+        .expect("derive canary-enabled stable topology");
+
+    for (family, digit) in [
+        (XtablesRestoreFamily::Ipv4, '4'),
+        (XtablesRestoreFamily::Ipv6, '6'),
+    ] {
+        let private_chains = plan
+            .family(family)
+            .expect("enabled family")
+            .private_chains()
+            .iter()
+            .map(AsRef::as_ref)
+            .collect::<Vec<&str>>();
+        assert_eq!(
+            private_chains,
+            [
+                format!("FLX{digit}C0000000007"),
+                format!("FLX{digit}O0000000007"),
+                format!("FLX{digit}P0000000007"),
+            ]
+        );
+    }
+}
+
+#[test]
 fn forwarded_only_program_cannot_enter_the_native_owner_topology() {
-    let artifacts = artifacts(AddressHostFamilySelection::Ipv4, false, true);
+    let artifacts = artifacts(AddressHostFamilySelection::Ipv4, false, true, false);
     let error = XtablesStableTopologyPlan::from_artifacts(&artifacts)
         .expect_err("native owner requires local OUTPUT capture");
     assert!(matches!(
@@ -157,6 +185,7 @@ fn artifacts(
     families: AddressHostFamilySelection,
     local_output: bool,
     forwarded_ingress: bool,
+    reserve_canary_selector: bool,
 ) -> XtablesCaptureArtifactSet {
     let scope = CaptureTrafficScope::new(families, local_output, forwarded_ingress).unwrap();
     let forwarded = forwarded_ingress.then_some(exact("wlan0"));
@@ -179,6 +208,11 @@ fn artifacts(
             FwmarkCandidate::new(MARK_MASK, PROXY_MARK, BYPASS_MARK).unwrap(),
         ),
     );
+    let request = if reserve_canary_selector {
+        request.with_local_output_canary_selector_slot()
+    } else {
+        request
+    };
     if local_output {
         lower_xtables_capture(request.with_local_output_routing(routing(families))).unwrap()
     } else {

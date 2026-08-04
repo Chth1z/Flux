@@ -204,7 +204,7 @@ fn canonical_capture_chain_names_are_family_scoped_and_sealed() {
         ('4', XtablesRestoreFamily::Ipv4, XtablesRestoreFamily::Ipv6),
         ('6', XtablesRestoreFamily::Ipv6, XtablesRestoreFamily::Ipv4),
     ] {
-        for role in ['F', 'O', 'P'] {
+        for role in ['C', 'F', 'O', 'P'] {
             let chain = format!("FLX{family_digit}{role}0000000001");
             let input = format!("*mangle\n:{chain} - [0:0]\nCOMMIT\n");
             let artifact = parse_xtables_restore(
@@ -235,6 +235,10 @@ fn canonical_capture_chain_names_are_family_scoped_and_sealed() {
         "FLX4F0000000000",
         "FLX4O0000000000",
         "FLX4P0000000000",
+        "FLX4C0000000000",
+        "FLX4C000000001",
+        "FLX4C4294967296",
+        "FLX6C000000000A",
         "FLX4F000000001",
         "FLX4F4294967296",
         "FLX6F000000000A",

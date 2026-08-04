@@ -285,8 +285,9 @@ pub(crate) fn inspect_admitted_generation(
 
 /// Non-cloneable ownership of one logical selector session for an exact canary request.
 ///
-/// Reservation itself does not install kernel selectors. The local-OUTPUT executor lends this
-/// session to a prepared attempt only after supervised-report prebind and installation.
+/// A required native writer returns this only after populating the exact reserved selector. The
+/// local-OUTPUT executor lends it to a prepared attempt only after supervised-report prebind and
+/// installation.
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct CanarySelectorSession {
     request: CanaryAttemptRequest,
@@ -359,7 +360,7 @@ pub(crate) trait RuntimeWriter: Send + 'static {
     ) -> Result<Option<ActiveCanaryGenerationBinding>, Self::Error> {
         Ok(None)
     }
-    /// Reserve serialization for this exact request without mutating selector state.
+    /// Reserve serialization and make this exact request's selector ready for execution.
     fn reserve_canary_selector_session(
         &mut self,
         _generation: &PreparedGeneration,
@@ -367,7 +368,7 @@ pub(crate) trait RuntimeWriter: Send + 'static {
     ) -> Result<Option<CanarySelectorSession>, Self::Error> {
         Ok(None)
     }
-    /// Consume the exact reservation before any post-attempt ownership observation.
+    /// Flush and consume the exact reservation before any post-attempt ownership observation.
     fn retire_canary_selector_session(
         &mut self,
         _generation: &PreparedGeneration,

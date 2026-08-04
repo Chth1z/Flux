@@ -253,7 +253,8 @@ impl<I> NativeCaptureConvergenceReport<I> {
 /// Coordinator-facing native capture interface.
 ///
 /// Implementations own recovery, exact readback, mutation ordering, compensation, and durable
-/// state. Callers can request only startup recovery or convergence to one opaque target/absence.
+/// state. Callers can request startup recovery, convergence to one opaque target/absence, or one
+/// bounded selector population/retirement inside that admitted target.
 pub trait NativeCaptureConvergence: Send + 'static {
     type Target: Clone + Send + 'static;
     type Identity: Copy + Debug + Eq + Send + Sync + 'static;

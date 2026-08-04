@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use flux_core::{AddressResyncDisposition, GenerationId, Reason};
 use flux_platform::{
-    NativeCaptureConvergedState, NativeCaptureConvergence, NativeCaptureDesired,
-    NativeCaptureTargetIdentity,
+    NativeCaptureCanarySelector, NativeCaptureConvergedState, NativeCaptureConvergence,
+    NativeCaptureDesired, NativeCaptureTargetIdentity,
 };
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use flux_platform::{NativeXtablesCaptureConverger, NativeXtablesCaptureTarget};
@@ -13,9 +13,9 @@ use flux_platform::{NativeXtablesCaptureConverger, NativeXtablesCaptureTarget};
 #[cfg(test)]
 use crate::EngineSpec;
 use crate::EngineSupervisor;
-use crate::functional_canary::CanaryAttemptRequest;
 #[cfg(test)]
 use crate::functional_canary::FunctionalCanaryGateMode;
+use crate::functional_canary::{CanaryAddressFamilies, CanaryAttemptRequest};
 #[cfg(test)]
 use crate::generation_engine_config::EngineCapabilityProfileRevision;
 use crate::generation_engine_config::{AddressReconciledGenerationInputs, CapturePathDecision};
@@ -127,10 +127,41 @@ struct RetainedNativeGeneration<T> {
     target: T,
 }
 
+fn native_canary_selector(
+    request: &CanaryAttemptRequest,
+) -> Result<NativeCaptureCanarySelector, NativeCoordinatorWriterError> {
+    let environment = request.pre_binding().environment();
+    let facility = environment.facility();
+    let ipv6_peer = match request.families() {
+        CanaryAddressFamilies::Ipv4Only => None,
+        CanaryAddressFamilies::Ipv4AndIpv6 => Some(
+            facility
+                .ipv6()
+                .ok_or(NativeCoordinatorWriterError::Invariant(
+                    "dual-stack canary selector request has no admitted IPv6 peer",
+                ))?
+                .peer(),
+        ),
+    };
+    let ports = facility.ports();
+    NativeCaptureCanarySelector::new(
+        environment.probe_uid(),
+        facility.ipv4().peer(),
+        ipv6_peer,
+        ports.tcp_echo(),
+        ports.udp_echo(),
+        ports.dns(),
+    )
+    .ok_or(NativeCoordinatorWriterError::Invariant(
+        "canary selector request has colliding responder ports",
+    ))
+}
+
 /// Coordinator adapter for the deep native `recover`/`converge` interface.
 ///
 /// The adapter has no dispatcher or state-file dependency. It retains only the committed target
-/// and one candidate so coordinator rollback can reactivate the prior immutable Generation.
+/// and one candidate so coordinator rollback can reactivate the prior immutable Generation, plus
+/// at most one request-bound selector session while a canary executes.
 pub(crate) struct NativeCoordinatorWriter<C, S>
 where
     C: NativeCaptureConvergence,
@@ -259,6 +290,7 @@ where
             NativeCaptureConvergedState::Active(identity) => Some(identity),
             NativeCaptureConvergedState::CleanAbsent => None,
         };
+        self.active_canary_selector_session = None;
         self.recovery_required = false;
         Ok(())
     }
@@ -299,12 +331,12 @@ where
     }
 
     fn converge_stopped(&mut self) -> Result<(), NativeCoordinatorWriterError> {
+        self.recover_if_required()?;
         if self.active_canary_selector_session.is_some() {
             return Err(NativeCoordinatorWriterError::Invariant(
                 "native capture cannot stop before the active canary selector session retires",
             ));
         }
-        self.recover_if_required()?;
         let report = match self.convergence.converge(NativeCaptureDesired::Stopped) {
             Ok(report) => report,
             Err(source) => {
@@ -637,6 +669,23 @@ where
                 "native canary selector session does not match the retained Generation and facility",
             ));
         }
+        let target = retained.target.clone();
+        let selector = native_canary_selector(request)?;
+        let populated = match self.convergence.populate_canary_selector(&target, selector) {
+            Ok(populated) => populated,
+            Err(source) => {
+                self.recovery_required = true;
+                return Err(NativeCoordinatorWriterError::convergence(
+                    "populate native functional-canary selector",
+                    source,
+                ));
+            }
+        };
+        if !populated {
+            return Err(NativeCoordinatorWriterError::Invariant(
+                "native capture converger has no canary selector population authority",
+            ));
+        }
 
         self.active_canary_selector_session = Some(request.clone());
         Ok(Some(CanarySelectorSession::reserved_for(request)))
@@ -657,6 +706,39 @@ where
         {
             return Err(NativeCoordinatorWriterError::Invariant(
                 "native canary selector session retirement substituted the active request",
+            ));
+        }
+        let retained = self.retained(generation.id())?;
+        let expected = C::target_identity(&retained.target);
+        if self.converged_identity != Some(expected) {
+            return Err(NativeCoordinatorWriterError::Invariant(
+                "native canary selector retirement has no matching successful convergence report",
+            ));
+        }
+        if !retained
+            .runtime
+            .matches_canary_selector_request(session.request())
+        {
+            return Err(NativeCoordinatorWriterError::Invariant(
+                "native canary selector retirement does not match the retained Generation and facility",
+            ));
+        }
+        let target = retained.target.clone();
+        let selector = native_canary_selector(session.request())?;
+        let retired = match self.convergence.retire_canary_selector(&target, selector) {
+            Ok(retired) => retired,
+            Err(source) => {
+                self.recovery_required = true;
+                return Err(NativeCoordinatorWriterError::convergence(
+                    "retire native functional-canary selector",
+                    source,
+                ));
+            }
+        };
+        if !retired {
+            self.recovery_required = true;
+            return Err(NativeCoordinatorWriterError::Invariant(
+                "native capture converger did not retire the populated canary selector",
             ));
         }
 
@@ -814,6 +896,14 @@ mod tests {
             generation: u32,
             prior: u64,
         },
+        SelectorPopulated {
+            target: u64,
+            selector: NativeCaptureCanarySelector,
+        },
+        SelectorRetired {
+            target: u64,
+            selector: NativeCaptureCanarySelector,
+        },
         EngineRunning(CaptureObservation),
         EngineStopped(CaptureObservation),
     }
@@ -822,6 +912,12 @@ mod tests {
         events: Arc<Mutex<Vec<Event>>>,
         active: Option<u64>,
         fail_active_once: Option<u64>,
+        selector: Option<(u64, NativeCaptureCanarySelector)>,
+        fail_recover_once: bool,
+        fail_populate_once: bool,
+        fail_retire_once: bool,
+        unsupported_populate_once: bool,
+        unsupported_retire_once: bool,
     }
 
     impl NativeCaptureConvergence for ScriptedConvergence {
@@ -836,6 +932,15 @@ mod tests {
         fn recover(
             &mut self,
         ) -> Result<NativeCaptureConvergenceReport<Self::Identity>, Self::Error> {
+            if self.fail_recover_once {
+                self.fail_recover_once = false;
+                return Err(io::Error::other(
+                    "injected native selector recovery failure",
+                ));
+            }
+            if self.selector.take().is_some() {
+                self.active = None;
+            }
             self.events
                 .lock()
                 .expect("native events lock")
@@ -850,6 +955,68 @@ mod tests {
                     false,
                 ),
             })
+        }
+
+        fn populate_canary_selector(
+            &mut self,
+            target: &Self::Target,
+            selector: NativeCaptureCanarySelector,
+        ) -> Result<bool, Self::Error> {
+            if self.unsupported_populate_once {
+                self.unsupported_populate_once = false;
+                return Ok(false);
+            }
+            if self.active != Some(target.0) || self.selector.is_some() {
+                return Err(io::Error::other(
+                    "scripted selector population found a different active state",
+                ));
+            }
+            self.selector = Some((target.0, selector));
+            self.events
+                .lock()
+                .expect("native events lock")
+                .push(Event::SelectorPopulated {
+                    target: target.0,
+                    selector,
+                });
+            if self.fail_populate_once {
+                self.fail_populate_once = false;
+                return Err(io::Error::other(
+                    "injected uncertain native selector population failure",
+                ));
+            }
+            Ok(true)
+        }
+
+        fn retire_canary_selector(
+            &mut self,
+            target: &Self::Target,
+            selector: NativeCaptureCanarySelector,
+        ) -> Result<bool, Self::Error> {
+            if self.unsupported_retire_once {
+                self.unsupported_retire_once = false;
+                return Ok(false);
+            }
+            if self.active != Some(target.0) || self.selector != Some((target.0, selector)) {
+                return Err(io::Error::other(
+                    "scripted selector retirement found a different active state",
+                ));
+            }
+            if self.fail_retire_once {
+                self.fail_retire_once = false;
+                return Err(io::Error::other(
+                    "injected uncertain native selector retirement failure",
+                ));
+            }
+            self.selector = None;
+            self.events
+                .lock()
+                .expect("native events lock")
+                .push(Event::SelectorRetired {
+                    target: target.0,
+                    selector,
+                });
+            Ok(true)
         }
 
         fn converge(
@@ -870,6 +1037,7 @@ mod tests {
                     }
                     let changed = self.active != Some(target.0);
                     self.active = Some(target.0);
+                    self.selector = None;
                     Ok(NativeCaptureConvergenceReport::new(
                         NativeCaptureConvergedState::Active(target.0),
                         changed,
@@ -881,6 +1049,7 @@ mod tests {
                         .expect("native events lock")
                         .push(Event::ConvergedStopped);
                     let changed = self.active.take().is_some();
+                    self.selector = None;
                     Ok(NativeCaptureConvergenceReport::new(
                         NativeCaptureConvergedState::CleanAbsent,
                         changed,
@@ -1115,9 +1284,17 @@ mod tests {
     }
 
     fn selector_request(fixture: &EngineFixture, nonce_byte: u8) -> CanaryAttemptRequest {
+        selector_request_with_families(fixture, nonce_byte, CanaryAddressFamilies::Ipv4Only)
+    }
+
+    fn selector_request_with_families(
+        fixture: &EngineFixture,
+        nonce_byte: u8,
+        families: CanaryAddressFamilies,
+    ) -> CanaryAttemptRequest {
         request_with_engine_identity(
             &fixture.spec,
-            CanaryAddressFamilies::Ipv4Only,
+            families,
             Instant::now(),
             CanaryNonce::from_bytes([nonce_byte; FUNCTIONAL_CANARY_NONCE_BYTES]),
             GenerationId::new(17).expect("selector-session Generation"),
@@ -1138,6 +1315,12 @@ mod tests {
             events: Arc::clone(events),
             active,
             fail_active_once,
+            selector: None,
+            fail_recover_once: false,
+            fail_populate_once: false,
+            fail_retire_once: false,
+            unsupported_populate_once: false,
+            unsupported_retire_once: false,
         };
         let source = ScriptedGenerationSource {
             events: Arc::clone(events),
@@ -1222,6 +1405,20 @@ mod tests {
             RuntimeWriter::reserve_canary_selector_session(&mut writer, &generation, &request)
                 .expect("reserve exact selector session")
                 .expect("native writer supplies selector-session ownership");
+        let populated = writer
+            .convergence
+            .selector
+            .expect("reservation populates one exact platform selector");
+        let environment = request.pre_binding().environment();
+        let facility = environment.facility();
+        let ports = facility.ports();
+        assert_eq!(populated.0, 17);
+        assert_eq!(populated.1.probe_uid(), environment.probe_uid());
+        assert_eq!(populated.1.ipv4_peer(), facility.ipv4().peer());
+        assert_eq!(populated.1.ipv6_peer(), None);
+        assert_eq!(populated.1.tcp_echo_port(), ports.tcp_echo());
+        assert_eq!(populated.1.udp_echo_port(), ports.udp_echo());
+        assert_eq!(populated.1.dns_port(), ports.dns());
         let overlap =
             RuntimeWriter::reserve_canary_selector_session(&mut writer, &generation, &alternate)
                 .expect_err("overlapping selector sessions must fail");
@@ -1252,6 +1449,219 @@ mod tests {
                 .expect("native writer returns exact retirement");
         assert!(retired.matches_request(&request));
         assert!(writer.active_canary_selector_session.is_none());
+        assert!(writer.convergence.selector.is_none());
+    }
+
+    #[test]
+    fn native_selector_session_maps_the_exact_dual_stack_request() {
+        let fixture = EngineFixture::new();
+        let request =
+            selector_request_with_families(&fixture, 74, CanaryAddressFamilies::Ipv4AndIpv6);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut writer = writer(
+            &events,
+            None,
+            None,
+            [required_canary_generation(17, &fixture, &request)],
+            [],
+        );
+        let generation = RuntimeWriter::prepare(&mut writer, Reason::Boot)
+            .expect("prepare dual-stack required native Generation");
+        RuntimeWriter::capture_start(&mut writer, &generation)
+            .expect("activate dual-stack required native Generation");
+
+        let session =
+            RuntimeWriter::reserve_canary_selector_session(&mut writer, &generation, &request)
+                .expect("populate dual-stack selector session")
+                .expect("native writer returns dual-stack selector ownership");
+
+        let selector = writer
+            .convergence
+            .selector
+            .expect("dual-stack reservation populates one selector")
+            .1;
+        let environment = request.pre_binding().environment();
+        let facility = environment.facility();
+        assert_eq!(selector.probe_uid(), environment.probe_uid());
+        assert_eq!(selector.ipv4_peer(), facility.ipv4().peer());
+        assert_eq!(
+            selector.ipv6_peer(),
+            Some(facility.ipv6().expect("dual-stack facility").peer())
+        );
+        let ports = facility.ports();
+        assert_eq!(selector.tcp_echo_port(), ports.tcp_echo());
+        assert_eq!(selector.udp_echo_port(), ports.udp_echo());
+        assert_eq!(selector.dns_port(), ports.dns());
+
+        RuntimeWriter::retire_canary_selector_session(&mut writer, &generation, session)
+            .expect("retire dual-stack selector session")
+            .expect("native writer returns dual-stack retirement proof");
+        assert!(writer.convergence.selector.is_none());
+    }
+
+    #[test]
+    fn uncertain_selector_population_recovers_before_capture_stop() {
+        let fixture = EngineFixture::new();
+        let request = selector_request(&fixture, 75);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut writer = writer(
+            &events,
+            None,
+            None,
+            [required_canary_generation(17, &fixture, &request)],
+            [],
+        );
+        let generation = RuntimeWriter::prepare(&mut writer, Reason::Boot)
+            .expect("prepare required native Generation");
+        RuntimeWriter::capture_start(&mut writer, &generation)
+            .expect("activate required native Generation");
+        writer.convergence.fail_populate_once = true;
+
+        let error =
+            RuntimeWriter::reserve_canary_selector_session(&mut writer, &generation, &request)
+                .expect_err("uncertain selector population must not return session ownership");
+
+        assert_eq!(
+            error.to_string(),
+            "populate native functional-canary selector: injected uncertain native selector population failure"
+        );
+        assert!(writer.active_canary_selector_session.is_none());
+        assert!(writer.convergence.selector.is_some());
+        assert!(writer.recovery_required);
+        events.lock().expect("native events lock").clear();
+
+        RuntimeWriter::capture_stop(&mut writer)
+            .expect("capture stop must recover uncertain population before detaching");
+
+        assert_eq!(
+            *events.lock().expect("native events lock"),
+            [Event::Recovered(None), Event::ConvergedStopped]
+        );
+        assert!(writer.active_canary_selector_session.is_none());
+        assert!(writer.convergence.selector.is_none());
+        assert!(!writer.recovery_required);
+        assert_eq!(writer.converged_identity, None);
+    }
+
+    #[test]
+    fn uncertain_selector_retirement_recovers_before_the_session_guard() {
+        let fixture = EngineFixture::new();
+        let request = selector_request(&fixture, 76);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut writer = writer(
+            &events,
+            None,
+            None,
+            [required_canary_generation(17, &fixture, &request)],
+            [],
+        );
+        let generation = RuntimeWriter::prepare(&mut writer, Reason::Boot)
+            .expect("prepare required native Generation");
+        RuntimeWriter::capture_start(&mut writer, &generation)
+            .expect("activate required native Generation");
+        let session =
+            RuntimeWriter::reserve_canary_selector_session(&mut writer, &generation, &request)
+                .expect("populate exact selector session")
+                .expect("native writer returns selector ownership");
+        writer.convergence.fail_retire_once = true;
+
+        let error =
+            RuntimeWriter::retire_canary_selector_session(&mut writer, &generation, session)
+                .expect_err("uncertain selector retirement must not return a retirement proof");
+
+        assert_eq!(
+            error.to_string(),
+            "retire native functional-canary selector: injected uncertain native selector retirement failure"
+        );
+        assert_eq!(
+            writer.active_canary_selector_session.as_ref(),
+            Some(&request)
+        );
+        assert!(writer.convergence.selector.is_some());
+        assert!(writer.recovery_required);
+        writer.convergence.fail_recover_once = true;
+        events.lock().expect("native events lock").clear();
+
+        let recovery = RuntimeWriter::capture_stop(&mut writer)
+            .expect_err("failed recovery must retain the uncertain selector session");
+        assert_eq!(
+            recovery.to_string(),
+            "recover native capture after an uncertain convergence: injected native selector recovery failure"
+        );
+        assert_eq!(
+            writer.active_canary_selector_session.as_ref(),
+            Some(&request)
+        );
+        assert!(writer.convergence.selector.is_some());
+        assert!(writer.recovery_required);
+        assert!(events.lock().expect("native events lock").is_empty());
+
+        RuntimeWriter::capture_stop(&mut writer)
+            .expect("stop recovery must run before rejecting the retained uncertain session");
+
+        assert_eq!(
+            *events.lock().expect("native events lock"),
+            [Event::Recovered(None), Event::ConvergedStopped]
+        );
+        assert!(writer.active_canary_selector_session.is_none());
+        assert!(writer.convergence.selector.is_none());
+        assert!(!writer.recovery_required);
+        assert_eq!(writer.converged_identity, None);
+    }
+
+    #[test]
+    fn native_selector_session_requires_positive_platform_receipts() {
+        let fixture = EngineFixture::new();
+        let request = selector_request(&fixture, 77);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut writer = writer(
+            &events,
+            None,
+            None,
+            [required_canary_generation(17, &fixture, &request)],
+            [],
+        );
+        let generation = RuntimeWriter::prepare(&mut writer, Reason::Boot)
+            .expect("prepare required native Generation");
+        RuntimeWriter::capture_start(&mut writer, &generation)
+            .expect("activate required native Generation");
+        writer.convergence.unsupported_populate_once = true;
+
+        let unsupported =
+            RuntimeWriter::reserve_canary_selector_session(&mut writer, &generation, &request)
+                .expect_err("unsupported population must not become selector ownership");
+
+        assert_eq!(
+            unsupported.to_string(),
+            "native capture converger has no canary selector population authority"
+        );
+        assert!(writer.active_canary_selector_session.is_none());
+        assert!(writer.convergence.selector.is_none());
+        assert!(!writer.recovery_required);
+
+        let session =
+            RuntimeWriter::reserve_canary_selector_session(&mut writer, &generation, &request)
+                .expect("retry exact selector population")
+                .expect("native writer returns selector ownership");
+        writer.convergence.unsupported_retire_once = true;
+        let unsupported =
+            RuntimeWriter::retire_canary_selector_session(&mut writer, &generation, session)
+                .expect_err("unsupported retirement must not become a retirement proof");
+
+        assert_eq!(
+            unsupported.to_string(),
+            "native capture converger did not retire the populated canary selector"
+        );
+        assert_eq!(
+            writer.active_canary_selector_session.as_ref(),
+            Some(&request)
+        );
+        assert!(writer.convergence.selector.is_some());
+        assert!(writer.recovery_required);
+        RuntimeWriter::capture_stop(&mut writer)
+            .expect("unsupported retirement must recover before capture stop");
+        assert!(writer.active_canary_selector_session.is_none());
+        assert!(writer.convergence.selector.is_none());
     }
 
     #[test]

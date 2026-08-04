@@ -24,6 +24,10 @@ use flux_platform::{
 };
 use sha2::{Digest, Sha256};
 
+use crate::functional_canary::{
+    CanaryAttemptRequest, InstalledSupervisedDeliveryReportProducer,
+    SupervisedDeliveryReportEngineHandoff, SupervisedDeliveryReportHandoffError,
+};
 use crate::process_authority::ProcessAuthorityOpeningId;
 
 pub const MAX_ENGINE_DIAGNOSTIC_BYTES: usize = 4 * 1024;
@@ -927,6 +931,48 @@ impl Error for EngineChildAuthorityError {
     }
 }
 
+#[derive(Debug)]
+pub(crate) enum EngineCanaryReportHandoffError {
+    RequestMismatch,
+    RetainedChild {
+        source: EngineChildAuthorityError,
+    },
+    Transfer {
+        source: SupervisedDeliveryReportHandoffError,
+    },
+}
+
+impl fmt::Display for EngineCanaryReportHandoffError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RequestMismatch => formatter
+                .write_str("supervised-report handoff does not match the immutable canary request"),
+            Self::RetainedChild { source } => {
+                write!(
+                    formatter,
+                    "select retained engine child for report handoff: {source}"
+                )
+            }
+            Self::Transfer { source } => {
+                write!(
+                    formatter,
+                    "transfer supervised report to retained child: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl Error for EngineCanaryReportHandoffError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::RequestMismatch => None,
+            Self::RetainedChild { source } => Some(source),
+            Self::Transfer { source } => Some(source),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EngineSnapshot {
     revision: u64,
@@ -1373,32 +1419,30 @@ impl EngineSupervisor {
         Arc::clone(&self.snapshot)
     }
 
-    /// Open a non-cloneable observation authority only from the exact live,
-    /// ready child already retained by this Supervisor.
-    pub(crate) fn open_child_authority(
+    fn retained_ready_canary_child(
         &self,
         expected: OwnedEngineIdentity,
         expected_snapshot_revision: NonZeroU64,
         expected_spec: &EngineSpec,
-    ) -> Result<EngineChildAuthority, EngineChildAuthorityError> {
+    ) -> Result<&HostChild, EngineChildAuthorityError> {
         if self.snapshot.phase != EnginePhase::Ready {
             return Err(EngineChildAuthorityError::state_changed(
-                "engine is not ready while opening its child authority",
+                "engine is not ready while selecting its retained canary child",
             ));
         }
         if self.active_spec.as_ref() != Some(expected_spec) {
             return Err(EngineChildAuthorityError::state_changed(
-                "ready engine active launch specification changed before authority opening",
+                "ready engine active launch specification changed before child selection",
             ));
         }
         if self.snapshot.revision != expected_snapshot_revision.get() {
             return Err(EngineChildAuthorityError::state_changed(
-                "ready engine snapshot revision changed before authority opening",
+                "ready engine snapshot revision changed before child selection",
             ));
         }
         if self.readiness.is_none() || self.snapshot.readiness != self.readiness {
             return Err(EngineChildAuthorityError::state_changed(
-                "ready engine child authority lacks matching readiness evidence",
+                "ready engine retained child lacks matching readiness evidence",
             ));
         }
         let owned = self.owned_identity.ok_or_else(|| {
@@ -1425,10 +1469,56 @@ impl EngineSupervisor {
                 observed: child_identity,
             });
         }
+        Ok(child)
+    }
+
+    /// Consume one exact request-bound report handoff against the live child
+    /// retained by this Supervisor. This does not open process-observation
+    /// authority or expose launch control to the canary driver.
+    pub(crate) fn install_canary_report_handoff(
+        &self,
+        expected_request: &CanaryAttemptRequest,
+        expected_spec: &EngineSpec,
+        handoff: SupervisedDeliveryReportEngineHandoff,
+    ) -> Result<InstalledSupervisedDeliveryReportProducer, EngineCanaryReportHandoffError> {
+        if handoff.request() != expected_request {
+            return Err(EngineCanaryReportHandoffError::RequestMismatch);
+        }
+        let expected_engine = expected_request.pre_binding().engine();
+        let child = self
+            .retained_ready_canary_child(
+                expected_engine.engine(),
+                expected_engine.engine_snapshot_revision(),
+                expected_spec,
+            )
+            .map_err(|source| EngineCanaryReportHandoffError::RetainedChild { source })?;
+        match child {
+            HostChild::Production(child) => handoff
+                .install_into(child)
+                .map_err(|source| EngineCanaryReportHandoffError::Transfer { source }),
+            #[cfg(test)]
+            HostChild::Scripted(_) => Err(EngineCanaryReportHandoffError::RetainedChild {
+                source: EngineChildAuthorityError::state_changed(
+                    "scripted engine child has no launch-control transport",
+                ),
+            }),
+        }
+    }
+
+    /// Open a non-cloneable observation authority only from the exact live,
+    /// ready child already retained by this Supervisor.
+    pub(crate) fn open_child_authority(
+        &self,
+        expected: OwnedEngineIdentity,
+        expected_snapshot_revision: NonZeroU64,
+        expected_spec: &EngineSpec,
+    ) -> Result<EngineChildAuthority, EngineChildAuthorityError> {
+        let child =
+            self.retained_ready_canary_child(expected, expected_snapshot_revision, expected_spec)?;
         let authority = child.open_authority(expected_snapshot_revision)?;
-        if authority.identity() != owned {
+        if authority.identity() != expected {
             return Err(EngineChildAuthorityError::IdentityMismatch {
-                expected: owned,
+                expected,
                 observed: authority.identity(),
             });
         }

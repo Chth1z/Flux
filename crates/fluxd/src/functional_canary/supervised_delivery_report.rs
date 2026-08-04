@@ -88,7 +88,10 @@ use crate::generation_engine_config::{
 
 pub(super) mod collector;
 pub(super) use collector::CanaryListenerDeliveryReportCleanupDisposition;
-pub(crate) use collector::CanaryListenerDeliveryReportCleanupEvidence;
+pub(crate) use collector::{
+    CanaryListenerDeliveryReportCleanupEvidence, InstalledSupervisedDeliveryReportProducer,
+    SupervisedDeliveryReportEngineHandoff, SupervisedDeliveryReportHandoffError,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SupervisedDeliveryReportBindError {
@@ -1019,8 +1022,10 @@ mod tests {
     use std::fs::File;
     #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
     use std::io::{Read, Write};
+    #[cfg(target_os = "linux")]
+    use std::net::TcpListener;
     #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
-    use std::net::{Shutdown, TcpListener, TcpStream, UdpSocket};
+    use std::net::{Shutdown, TcpStream, UdpSocket};
     use std::num::{NonZeroU32, NonZeroU64};
     use std::os::unix::fs::PermissionsExt;
     #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
@@ -1035,13 +1040,19 @@ mod tests {
     use std::time::Duration;
 
     use flux_core::GenerationId;
-    #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
+    #[cfg(target_os = "linux")]
+    use flux_platform::ProcessHandleErrorKind;
+    #[cfg(target_os = "linux")]
     use flux_platform::SeqpacketReceive;
     #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
     use flux_platform::internal::{PinnedSingBoxLaunch, SingBoxChild, SingBoxProcessAdapter};
     use flux_platform::{SingBoxLaunchSpec, SingBoxPrivilege, SingBoxReadiness};
 
     use super::*;
+    #[cfg(target_os = "linux")]
+    use crate::engine_supervisor::{
+        EngineCanaryReportHandoffError, EngineChildAuthorityError, EngineChildObservationErrorKind,
+    };
     #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
     use crate::functional_canary::CanaryFlow;
     use crate::functional_canary::tests::{Fixture, request_with_engine_profile_revision};
@@ -1050,12 +1061,19 @@ mod tests {
         CanaryAttemptObjectRetirementEvidence, CanaryListenerDeliveryReportCleanupEvidence,
         CanaryNonce, CanaryProcessCredentialIdentity, FUNCTIONAL_CANARY_NONCE_BYTES,
     };
+    #[cfg(target_os = "linux")]
+    use crate::functional_canary::{
+        CanaryAttemptSocketObserverSession, CanaryCleanupStatus, CanaryErrorKind,
+        FunctionalCanaryError, UnqualifiedFunctionalCanaryExecution,
+    };
     use crate::generation_engine_config as report_contract;
     use crate::generation_engine_config::{
         TproxyEngineConfigRequest, bind_engine_config_to_spec,
         collect_tproxy_engine_capability_profile, compile_tproxy_engine_config,
         declare_supervised_delivery_report_profile_fixture,
     };
+    #[cfg(target_os = "linux")]
+    use crate::{CaptureObservation, DesiredEngine, EnginePhase, EngineSupervisor};
     use crate::{EngineSpec, RestartPolicy};
 
     const PROFILE_SCRIPT: &[u8] = br#"#!/bin/sh
@@ -1080,6 +1098,7 @@ esac
         profile: EngineCapabilityProfile,
         request: CanaryAttemptRequest,
         fixture: Fixture,
+        spec: EngineSpec,
         _directory: tempfile::TempDir,
     }
 
@@ -1089,9 +1108,21 @@ esac
         }
 
         fn with_script(families: CanaryAddressFamilies, script: &[u8]) -> Self {
+            Self::with_script_and_port(
+                families,
+                script,
+                NonZeroU16::new(1536).expect("listener port"),
+            )
+        }
+
+        fn with_script_and_port(
+            families: CanaryAddressFamilies,
+            script: &[u8],
+            listener_port: NonZeroU16,
+        ) -> Self {
             let artifact = compile_tproxy_engine_config(TproxyEngineConfigRequest::new(
                 br#"{"inbounds":[]}"#,
-                NonZeroU16::new(1536).expect("listener port"),
+                listener_port,
             ))
             .expect("compile parser engine config");
             let directory = tempfile::tempdir().expect("parser engine fixture");
@@ -1112,7 +1143,7 @@ esac
                     log: directory.path().join("sing-box.log"),
                     privilege: SingBoxPrivilege::Inherit,
                     readiness: SingBoxReadiness::Listener {
-                        port: NonZeroU16::new(1536).expect("listener port"),
+                        port: listener_port,
                     },
                     startup_timeout: Duration::from_secs(1),
                     stop_timeout: Duration::from_secs(1),
@@ -1154,6 +1185,7 @@ esac
                 profile,
                 request,
                 fixture,
+                spec,
                 _directory: directory,
             }
         }
@@ -1170,6 +1202,118 @@ esac
         fn evidence(&self) -> super::super::UnqualifiedCanaryGateEvidence {
             self.fixture.successful_evidence()
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    type SupervisorReportCollector = collector::SupervisedDeliveryReportCollector<fn() -> Instant>;
+
+    #[cfg(target_os = "linux")]
+    fn running_supervisor_context() -> (Context, EngineSupervisor) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .expect("reserve retained-child listener port");
+        let port = NonZeroU16::new(
+            listener
+                .local_addr()
+                .expect("retained-child listener address")
+                .port(),
+        )
+        .expect("retained-child listener port is nonzero");
+        drop(listener);
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in\nversion) printf '%s\\n' 'sing-box version 1.13.14' ;;\ncheck) exit 0 ;;\nrun) exec /usr/bin/python3 -c 'import signal,socket; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind((\"127.0.0.1\",{})); s.listen(); signal.pause()' ;;\n*) exit 64 ;;\nesac\n",
+            port.get(),
+        );
+        let context =
+            Context::with_script_and_port(CanaryAddressFamilies::Ipv4Only, script.as_bytes(), port);
+        let mut supervisor = EngineSupervisor::new();
+        let report = supervisor
+            .reconcile(
+                DesiredEngine::Running(&context.spec),
+                CaptureObservation::Detached,
+            )
+            .expect("retained-child supervisor reaches ready");
+        assert!(matches!(report, crate::EngineReport::Started { .. }));
+        assert_eq!(supervisor.snapshot().phase(), EnginePhase::Ready);
+        (context, supervisor)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn request_for_ready_supervisor(
+        context: &Context,
+        supervisor: &EngineSupervisor,
+        generation: u32,
+        nonce: u8,
+    ) -> CanaryAttemptRequest {
+        let snapshot = supervisor.snapshot();
+        let identity = snapshot
+            .owned_identity()
+            .expect("ready supervisor owns its retained child");
+        request_with_engine_profile_revision(
+            &context.spec,
+            CanaryAddressFamilies::Ipv4Only,
+            Instant::now(),
+            CanaryNonce::from_bytes([nonce; FUNCTIONAL_CANARY_NONCE_BYTES]),
+            GenerationId::new(generation).expect("nonzero canary Generation"),
+            NonZeroU32::new(identity.pid()).expect("nonzero retained-child PID"),
+            NonZeroU64::new(identity.start_time_ticks())
+                .expect("nonzero retained-child start ticks"),
+            NonZeroU64::new(snapshot.revision()).expect("nonzero ready snapshot revision"),
+            context.profile.revision(),
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn prebind_supervisor_report(
+        context: &Context,
+        request: &CanaryAttemptRequest,
+    ) -> (
+        collector::SupervisedDeliveryReportEngineHandoff,
+        SupervisorReportCollector,
+    ) {
+        let authority =
+            collector::SupervisedDeliveryReportPrebindAuthority::fixture(&context.profile, request);
+        let (producer, collector) = collector::prebind(authority, Instant::now as fn() -> Instant)
+            .expect("prebind supervisor report fixture");
+        (producer.into_engine_handoff(), collector)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_report_endpoint_closed(collector: &SupervisorReportCollector, context: &str) {
+        assert!(
+            matches!(
+                collector
+                    .recv_fixture_record_until(1, Instant::now() + Duration::from_secs(1))
+                    .unwrap_or_else(|error| panic!("{context}: {error}")),
+                Some(SeqpacketReceive::Eof)
+            ),
+            "{context}: report endpoint did not reach EOF",
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn stop_supervisor(supervisor: &mut EngineSupervisor) {
+        let report = supervisor
+            .reconcile(DesiredEngine::Stopped, CaptureObservation::Detached)
+            .expect("retained-child supervisor stops and reaps");
+        assert!(matches!(report, crate::EngineReport::Stopped { .. }));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn handoff_functional_error(error: EngineCanaryReportHandoffError) -> FunctionalCanaryError {
+        FunctionalCanaryError::new(
+            CanaryErrorKind::AdapterFailure,
+            CanaryCleanupStatus::NotRequired,
+            &error.to_string(),
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn authority_functional_error(error: EngineChildAuthorityError) -> FunctionalCanaryError {
+        FunctionalCanaryError::new(
+            CanaryErrorKind::IdentityChanged,
+            CanaryCleanupStatus::NotRequired,
+            &error.to_string(),
+        )
     }
 
     fn distinct_test_identity(identity: NonZeroU32) -> NonZeroU32 {
@@ -1953,6 +2097,189 @@ esac
                 report_contract::ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_RESERVED_FIELD,
             ),
             [0; 16]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stopped_supervisor_cannot_consume_a_report_handoff() {
+        let context = Context::new(CanaryAddressFamilies::Ipv4Only);
+        let (handoff, collector) = prebind_supervisor_report(&context, &context.request);
+        let supervisor = EngineSupervisor::new();
+
+        let error = supervisor
+            .install_canary_report_handoff(&context.request, &context.spec, handoff)
+            .expect_err("a stopped supervisor has no retained report child");
+
+        assert!(matches!(
+            error,
+            EngineCanaryReportHandoffError::RetainedChild {
+                source: EngineChildAuthorityError::StateChanged { .. }
+            }
+        ));
+        assert_report_endpoint_closed(&collector, "stopped supervisor report handoff");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn supervisor_report_handoff_rejects_request_child_and_snapshot_substitution() {
+        let (context, mut supervisor) = running_supervisor_context();
+        let request = request_for_ready_supervisor(&context, &supervisor, 29, 0x91);
+
+        let generation_substitute = request_for_ready_supervisor(&context, &supervisor, 30, 0x92);
+        let (handoff, collector) = prebind_supervisor_report(&context, &generation_substitute);
+        assert!(matches!(
+            supervisor
+                .install_canary_report_handoff(&request, &context.spec, handoff)
+                .expect_err("another Generation request must not reach launch control"),
+            EngineCanaryReportHandoffError::RequestMismatch
+        ));
+        assert_report_endpoint_closed(&collector, "Generation-substituted report handoff");
+
+        let actual = request.pre_binding().engine().engine();
+        let mut child_substitute = request.clone();
+        child_substitute.pre_binding.engine.engine = OwnedEngineIdentity::new(
+            distinct_test_identity(
+                NonZeroU32::new(actual.pid()).expect("retained-child PID is nonzero"),
+            ),
+            NonZeroU64::new(actual.start_time_ticks())
+                .expect("retained-child start ticks are nonzero"),
+        );
+        let (handoff, collector) = prebind_supervisor_report(&context, &child_substitute);
+        assert!(matches!(
+            supervisor
+                .install_canary_report_handoff(&child_substitute, &context.spec, handoff)
+                .expect_err("another child identity must not reach launch control"),
+            EngineCanaryReportHandoffError::RetainedChild {
+                source: EngineChildAuthorityError::IdentityMismatch { .. }
+            }
+        ));
+        assert_report_endpoint_closed(&collector, "child-substituted report handoff");
+
+        let mut snapshot_substitute = request.clone();
+        let revision = snapshot_substitute
+            .pre_binding()
+            .engine()
+            .engine_snapshot_revision();
+        snapshot_substitute
+            .pre_binding
+            .engine
+            .engine_snapshot_revision =
+            NonZeroU64::new(revision.get() + 1).expect("substituted snapshot revision is nonzero");
+        let (handoff, collector) = prebind_supervisor_report(&context, &snapshot_substitute);
+        assert!(matches!(
+            supervisor
+                .install_canary_report_handoff(&snapshot_substitute, &context.spec, handoff)
+                .expect_err("another snapshot revision must not reach launch control"),
+            EngineCanaryReportHandoffError::RetainedChild {
+                source: EngineChildAuthorityError::StateChanged { .. }
+            }
+        ));
+        assert_report_endpoint_closed(&collector, "snapshot-substituted report handoff");
+
+        stop_supervisor(&mut supervisor);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn supervisor_report_handoff_honors_the_immutable_expired_deadline() {
+        let (context, mut supervisor) = running_supervisor_context();
+        let mut request = request_for_ready_supervisor(&context, &supervisor, 29, 0x91);
+        request.deadline.expires_at = Instant::now();
+        let (handoff, collector) = prebind_supervisor_report(&context, &request);
+
+        assert!(matches!(
+            supervisor
+                .install_canary_report_handoff(&request, &context.spec, handoff)
+                .expect_err("an expired report handoff must not reach launch control"),
+            EngineCanaryReportHandoffError::Transfer {
+                source: SupervisedDeliveryReportHandoffError::DeadlineExpired
+            }
+        ));
+        assert_report_endpoint_closed(&collector, "expired supervisor report handoff");
+
+        stop_supervisor(&mut supervisor);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn execution_consumes_one_report_installer_and_opens_process_authority_independently() {
+        let (context, mut supervisor) = running_supervisor_context();
+        let request = request_for_ready_supervisor(&context, &supervisor, 29, 0x91);
+        let (handoff, collector) = prebind_supervisor_report(&context, &request);
+        let (second_handoff, second_collector) = prebind_supervisor_report(&context, &request);
+        let expected = request.pre_binding().engine();
+        let socket_observer = CanaryAttemptSocketObserverSession::scripted(
+            request
+                .pre_binding()
+                .environment()
+                .authority()
+                .socket_observer_binding(),
+            request.deadline(),
+        );
+        let report_supervisor = &supervisor;
+        let report_request = &request;
+        let report_spec = &context.spec;
+        let process_supervisor = &supervisor;
+        let process_spec = &context.spec;
+        let mut execution = UnqualifiedFunctionalCanaryExecution::new(
+            &request,
+            socket_observer,
+            Box::new(move |handoff| {
+                report_supervisor
+                    .install_canary_report_handoff(report_request, report_spec, handoff)
+                    .map_err(handoff_functional_error)
+            }),
+            Box::new(move || {
+                process_supervisor
+                    .open_child_authority(
+                        expected.engine(),
+                        expected.engine_snapshot_revision(),
+                        process_spec,
+                    )
+                    .map_err(authority_functional_error)
+            }),
+        )
+        .expect("bind exact retained-child execution");
+
+        let installed = execution
+            .install_supervised_delivery_report(handoff)
+            .expect("install one exact supervised-report producer");
+        assert_eq!(installed.child(), expected.engine());
+        assert_eq!(
+            installed.report_object(),
+            request
+                .pre_binding()
+                .environment()
+                .attempt_objects()
+                .listener_delivery_report(),
+        );
+        assert_eq!(installed.profile_revision(), context.profile.revision());
+
+        let second_error = execution
+            .install_supervised_delivery_report(second_handoff)
+            .expect_err("one execution cannot consume a second report installer");
+        assert_eq!(second_error.kind(), CanaryErrorKind::CleanupUncertain);
+        assert_eq!(second_error.cleanup(), CanaryCleanupStatus::Uncertain);
+        assert_report_endpoint_closed(&second_collector, "second report installer");
+
+        let (_, _socket_observer, process_authority) = execution
+            .into_parts()
+            .expect("open the independent child-origin process authority");
+        assert_eq!(process_authority.identity(), expected.engine());
+        assert_eq!(
+            process_authority.engine_snapshot_revision(),
+            expected.engine_snapshot_revision(),
+        );
+
+        stop_supervisor(&mut supervisor);
+        assert_report_endpoint_closed(&collector, "installed report after child retirement");
+        assert_eq!(
+            process_authority
+                .observe_after_until(Instant::now() + Duration::from_secs(1))
+                .expect_err("the independent pidfd observes the reaped child exit")
+                .kind(),
+            EngineChildObservationErrorKind::ProcessHandle(ProcessHandleErrorKind::Exited),
         );
     }
 

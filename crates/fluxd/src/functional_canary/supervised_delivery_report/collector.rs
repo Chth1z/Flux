@@ -279,7 +279,7 @@ impl SupervisedDeliveryReportProducer {
 }
 
 #[derive(Debug)]
-pub(in crate::functional_canary) enum SupervisedDeliveryReportHandoffError {
+pub(crate) enum SupervisedDeliveryReportHandoffError {
     ChildIdentityMismatch {
         expected: OwnedEngineIdentity,
         observed_pid: u32,
@@ -336,14 +336,14 @@ impl Error for SupervisedDeliveryReportHandoffError {
 /// This interface intentionally exposes record send rather than a raw descriptor. A future
 /// prepared-child adapter may consume this type without reopening socket ownership in `fluxd`.
 #[must_use = "the engine report handoff must remain owned until the producer has stopped"]
-pub(in crate::functional_canary) struct SupervisedDeliveryReportEngineHandoff {
+pub(crate) struct SupervisedDeliveryReportEngineHandoff {
     connection: SeqpacketConnection,
     binding: Arc<SupervisedDeliveryReportTransportBinding>,
 }
 
 impl SupervisedDeliveryReportEngineHandoff {
     #[must_use]
-    pub(super) fn request(&self) -> &CanaryAttemptRequest {
+    pub(crate) fn request(&self) -> &CanaryAttemptRequest {
         self.binding.request()
     }
 
@@ -371,7 +371,7 @@ impl SupervisedDeliveryReportEngineHandoff {
         encode_engine_handoff_frame(&self.binding)
     }
 
-    pub(in crate::functional_canary) fn install_into(
+    pub(crate) fn install_into(
         self,
         child: &SingBoxChild,
     ) -> Result<InstalledSupervisedDeliveryReportProducer, SupervisedDeliveryReportHandoffError>
@@ -424,24 +424,24 @@ impl fmt::Debug for SupervisedDeliveryReportEngineHandoff {
 
 /// Proof that the exact child received the sole supervisor-owned producer endpoint.
 #[must_use = "the installed report producer must remain bound to child retirement"]
-pub(in crate::functional_canary) struct InstalledSupervisedDeliveryReportProducer {
+pub(crate) struct InstalledSupervisedDeliveryReportProducer {
     binding: Arc<SupervisedDeliveryReportTransportBinding>,
     child: OwnedEngineIdentity,
 }
 
 impl InstalledSupervisedDeliveryReportProducer {
     #[must_use]
-    pub(in crate::functional_canary) const fn child(&self) -> OwnedEngineIdentity {
+    pub(crate) const fn child(&self) -> OwnedEngineIdentity {
         self.child
     }
 
     #[must_use]
-    pub(super) fn report_object(&self) -> CanaryAttemptObjectIdentity {
+    pub(crate) fn report_object(&self) -> CanaryAttemptObjectIdentity {
         self.binding.report_object()
     }
 
     #[must_use]
-    pub(super) fn profile_revision(&self) -> EngineCapabilityProfileRevision {
+    pub(crate) fn profile_revision(&self) -> EngineCapabilityProfileRevision {
         self.binding.profile_revision()
     }
 }

@@ -12,15 +12,17 @@ use flux_core::{
 use flux_platform::NetworkInventoryRefreshDisposition;
 
 use crate::engine_supervisor::{
-    EngineChildAuthority, EngineChildAuthorityError, EngineChildAuthorityErrorKind,
+    EngineCanaryReportHandoffError, EngineChildAuthority, EngineChildAuthorityError,
+    EngineChildAuthorityErrorKind,
 };
 use crate::functional_canary::{
     ActiveCanaryGenerationBinding, CanaryAddressFamilies, CanaryAttemptBinding,
     CanaryAttemptRequest, CanaryAttemptSocketObserverSession, CanaryCounterDeltaBounds,
     CanaryDeadline, CanaryEngineBinding, CanaryEnvironmentBinding, CanaryNonce,
     FunctionalCanaryDisposition, FunctionalCanaryError, FunctionalCanaryGateMode,
-    PreparedCanaryGenerationBinding, UnqualifiedFunctionalCanaryExecution,
-    UnqualifiedFunctionalCanaryExecutor,
+    InstalledSupervisedDeliveryReportProducer, PreparedCanaryGenerationBinding,
+    SupervisedDeliveryReportEngineHandoff, SupervisedDeliveryReportHandoffError,
+    UnqualifiedFunctionalCanaryExecution, UnqualifiedFunctionalCanaryExecutor,
 };
 use crate::generation_engine_config::{
     AddressReconciler, AddressReconciliationOutcome, CapturePathDecision, CapturePathSelection,
@@ -309,6 +311,13 @@ pub(crate) trait EngineRuntime: Send + 'static {
         expected_snapshot_revision: NonZeroU64,
         expected_spec: &EngineSpec,
     ) -> Result<EngineChildAuthority, EngineChildAuthorityError>;
+
+    fn install_canary_report_handoff(
+        &self,
+        expected_request: &CanaryAttemptRequest,
+        expected_spec: &EngineSpec,
+        handoff: SupervisedDeliveryReportEngineHandoff,
+    ) -> Result<InstalledSupervisedDeliveryReportProducer, EngineCanaryReportHandoffError>;
 }
 
 pub(crate) struct UnqualifiedFunctionalCanaryAttemptInputs {
@@ -410,6 +419,20 @@ impl EngineRuntime for EngineSupervisor {
             expected,
             expected_snapshot_revision,
             expected_spec,
+        )
+    }
+
+    fn install_canary_report_handoff(
+        &self,
+        expected_request: &CanaryAttemptRequest,
+        expected_spec: &EngineSpec,
+        handoff: SupervisedDeliveryReportEngineHandoff,
+    ) -> Result<InstalledSupervisedDeliveryReportProducer, EngineCanaryReportHandoffError> {
+        EngineSupervisor::install_canary_report_handoff(
+            self,
+            expected_request,
+            expected_spec,
+            handoff,
         )
     }
 }
@@ -2445,6 +2468,14 @@ where
                 })?;
         let expected_engine = request.pre_binding().engine().engine();
         let expected_snapshot_revision = request.pre_binding().engine().engine_snapshot_revision();
+        let report_engine = &self.engine;
+        let report_request = &request;
+        let report_spec = &generation.spec;
+        let install_supervised_report = Box::new(move |handoff| {
+            report_engine
+                .install_canary_report_handoff(report_request, report_spec, handoff)
+                .map_err(engine_canary_report_handoff_error)
+        });
         let engine = &self.engine;
         let expected_spec = &generation.spec;
         let open_engine_child = Box::new(move || {
@@ -2456,15 +2487,19 @@ where
                 )
                 .map_err(engine_child_authority_error)
         });
-        let execution_input =
-            UnqualifiedFunctionalCanaryExecution::new(&request, socket_observer, open_engine_child)
-                .map_err(|source| {
-                    functional_canary_error(
-                        "bind functional canary attempt-owned authorities",
-                        source,
-                        "detach capture before preparing fresh canary authorities",
-                    )
-                })?;
+        let execution_input = UnqualifiedFunctionalCanaryExecution::new(
+            &request,
+            socket_observer,
+            install_supervised_report,
+            open_engine_child,
+        )
+        .map_err(|source| {
+            functional_canary_error(
+                "bind functional canary attempt-owned authorities",
+                source,
+                "detach capture before preparing fresh canary authorities",
+            )
+        })?;
         let execution = match &mut self.functional_canary {
             RuntimeFunctionalCanary::RequiredUnqualified { executor, .. } => {
                 executor.execute(execution_input)
@@ -3240,6 +3275,59 @@ fn engine_child_authority_error(source: EngineChildAuthorityError) -> Functional
                 crate::functional_canary::CanaryErrorKind::AdapterFailure
             }
         }
+    };
+    FunctionalCanaryError::new(
+        kind,
+        crate::functional_canary::CanaryCleanupStatus::NotRequired,
+        &source.to_string(),
+    )
+}
+
+fn engine_canary_report_handoff_error(
+    source: EngineCanaryReportHandoffError,
+) -> FunctionalCanaryError {
+    if let EngineCanaryReportHandoffError::RetainedChild { source } = source {
+        return engine_child_authority_error(source);
+    }
+    let kind = match &source {
+        EngineCanaryReportHandoffError::RequestMismatch
+        | EngineCanaryReportHandoffError::Transfer {
+            source: SupervisedDeliveryReportHandoffError::ChildIdentityMismatch { .. },
+        } => crate::functional_canary::CanaryErrorKind::IdentityChanged,
+        EngineCanaryReportHandoffError::Transfer {
+            source: SupervisedDeliveryReportHandoffError::UnsupportedCaptureBackend(_),
+        } => crate::functional_canary::CanaryErrorKind::InvalidEvidence,
+        EngineCanaryReportHandoffError::Transfer {
+            source: SupervisedDeliveryReportHandoffError::DeadlineExpired,
+        } => crate::functional_canary::CanaryErrorKind::TimedOut,
+        EngineCanaryReportHandoffError::Transfer {
+            source:
+                SupervisedDeliveryReportHandoffError::Transport(
+                    flux_platform::PlatformError::UnsupportedPlatform(_),
+                ),
+        } => crate::functional_canary::CanaryErrorKind::Availability(
+            crate::functional_canary::CanaryAvailability::Unsupported,
+        ),
+        EngineCanaryReportHandoffError::Transfer {
+            source:
+                SupervisedDeliveryReportHandoffError::Transport(
+                    flux_platform::PlatformError::SystemCall { source, .. },
+                ),
+        } if source.kind() == io::ErrorKind::PermissionDenied => {
+            crate::functional_canary::CanaryErrorKind::Availability(
+                crate::functional_canary::CanaryAvailability::Denied,
+            )
+        }
+        EngineCanaryReportHandoffError::Transfer {
+            source:
+                SupervisedDeliveryReportHandoffError::Transport(
+                    flux_platform::PlatformError::PeerClosed,
+                ),
+        } => crate::functional_canary::CanaryErrorKind::IdentityChanged,
+        EngineCanaryReportHandoffError::Transfer {
+            source: SupervisedDeliveryReportHandoffError::Transport(_),
+        } => crate::functional_canary::CanaryErrorKind::AdapterFailure,
+        EngineCanaryReportHandoffError::RetainedChild { .. } => unreachable!(),
     };
     FunctionalCanaryError::new(
         kind,
@@ -6209,6 +6297,49 @@ mod tests {
     }
 
     #[test]
+    fn engine_report_handoff_errors_preserve_request_deadline_and_transport_classes() {
+        let request_mismatch =
+            engine_canary_report_handoff_error(EngineCanaryReportHandoffError::RequestMismatch);
+        assert_eq!(request_mismatch.kind(), CanaryErrorKind::IdentityChanged);
+
+        let expired =
+            engine_canary_report_handoff_error(EngineCanaryReportHandoffError::Transfer {
+                source: SupervisedDeliveryReportHandoffError::DeadlineExpired,
+            });
+        assert_eq!(expired.kind(), CanaryErrorKind::TimedOut);
+
+        let unsupported =
+            engine_canary_report_handoff_error(EngineCanaryReportHandoffError::Transfer {
+                source: SupervisedDeliveryReportHandoffError::UnsupportedCaptureBackend(
+                    crate::functional_canary::CanaryCaptureBackend::Redirect,
+                ),
+            });
+        assert_eq!(unsupported.kind(), CanaryErrorKind::InvalidEvidence);
+
+        let denied = engine_canary_report_handoff_error(EngineCanaryReportHandoffError::Transfer {
+            source: SupervisedDeliveryReportHandoffError::Transport(
+                flux_platform::PlatformError::SystemCall {
+                    operation: "test denied handoff",
+                    source: io::Error::from(io::ErrorKind::PermissionDenied),
+                },
+            ),
+        });
+        assert_eq!(
+            denied.kind(),
+            CanaryErrorKind::Availability(crate::functional_canary::CanaryAvailability::Denied),
+        );
+
+        let peer_closed =
+            engine_canary_report_handoff_error(EngineCanaryReportHandoffError::Transfer {
+                source: SupervisedDeliveryReportHandoffError::Transport(
+                    flux_platform::PlatformError::PeerClosed,
+                ),
+            });
+        assert_eq!(peer_closed.kind(), CanaryErrorKind::IdentityChanged);
+        assert_eq!(peer_closed.cleanup(), CanaryCleanupStatus::NotRequired);
+    }
+
+    #[test]
     fn running_publication_retry_reasserts_capture_and_runs_fresh_canary() {
         let fixture = EngineFixture::new();
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -8366,6 +8497,20 @@ mod tests {
                 "structural-only scripted engine has no canary child authority",
             ))
         }
+
+        fn install_canary_report_handoff(
+            &self,
+            _expected_request: &CanaryAttemptRequest,
+            _expected_spec: &EngineSpec,
+            _handoff: SupervisedDeliveryReportEngineHandoff,
+        ) -> Result<InstalledSupervisedDeliveryReportProducer, EngineCanaryReportHandoffError>
+        {
+            Err(EngineCanaryReportHandoffError::RetainedChild {
+                source: EngineChildAuthorityError::state_changed(
+                    "structural-only scripted engine has no report handoff",
+                ),
+            })
+        }
     }
 
     #[derive(Clone, Copy)]
@@ -8734,6 +8879,20 @@ mod tests {
                 expected_snapshot_revision,
                 Instant::now(),
             ))
+        }
+
+        fn install_canary_report_handoff(
+            &self,
+            _expected_request: &CanaryAttemptRequest,
+            _expected_spec: &EngineSpec,
+            _handoff: SupervisedDeliveryReportEngineHandoff,
+        ) -> Result<InstalledSupervisedDeliveryReportProducer, EngineCanaryReportHandoffError>
+        {
+            Err(EngineCanaryReportHandoffError::RetainedChild {
+                source: EngineChildAuthorityError::state_changed(
+                    "scripted required engine has no launch-control transport",
+                ),
+            })
         }
     }
 

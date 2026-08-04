@@ -701,7 +701,13 @@ mod tests {
     };
 
     use super::*;
-    use crate::engine_supervisor::{EngineChildAuthority, EngineChildAuthorityError};
+    use crate::engine_supervisor::{
+        EngineCanaryReportHandoffError, EngineChildAuthority, EngineChildAuthorityError,
+    };
+    use crate::functional_canary::{
+        CanaryAttemptRequest, InstalledSupervisedDeliveryReportProducer,
+        SupervisedDeliveryReportEngineHandoff,
+    };
     use crate::generation_engine_config::{
         AddressReconciler, qualified_xtables_capture_path_evidence,
         test_xtables_capture_path_selection,
@@ -923,6 +929,20 @@ mod tests {
             Err(EngineChildAuthorityError::state_changed(
                 "structural native test engine has no canary authority",
             ))
+        }
+
+        fn install_canary_report_handoff(
+            &self,
+            _expected_request: &CanaryAttemptRequest,
+            _expected_spec: &EngineSpec,
+            _handoff: SupervisedDeliveryReportEngineHandoff,
+        ) -> Result<InstalledSupervisedDeliveryReportProducer, EngineCanaryReportHandoffError>
+        {
+            Err(EngineCanaryReportHandoffError::RetainedChild {
+                source: EngineChildAuthorityError::state_changed(
+                    "structural native test engine has no report handoff",
+                ),
+            })
         }
     }
 

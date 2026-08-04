@@ -4838,9 +4838,18 @@ impl fmt::Display for FunctionalCanaryError {
 
 impl Error for FunctionalCanaryError {}
 
+type SupervisedReportInstaller<'a> = Box<
+    dyn FnOnce(
+            SupervisedDeliveryReportEngineHandoff,
+        ) -> Result<InstalledSupervisedDeliveryReportProducer, FunctionalCanaryError>
+        + 'a,
+>;
+
 pub(crate) struct UnqualifiedFunctionalCanaryExecution<'a> {
     request: &'a CanaryAttemptRequest,
     socket_observer: CanaryAttemptSocketObserverSession,
+    install_supervised_report: Option<SupervisedReportInstaller<'a>>,
+    supervised_report_installed: bool,
     open_engine_child:
         Box<dyn FnOnce() -> Result<EngineChildAuthority, FunctionalCanaryError> + 'a>,
 }
@@ -4849,6 +4858,7 @@ impl<'a> UnqualifiedFunctionalCanaryExecution<'a> {
     pub(crate) fn new(
         request: &'a CanaryAttemptRequest,
         socket_observer: CanaryAttemptSocketObserverSession,
+        install_supervised_report: SupervisedReportInstaller<'a>,
         open_engine_child: Box<
             dyn FnOnce() -> Result<EngineChildAuthority, FunctionalCanaryError> + 'a,
         >,
@@ -4876,6 +4886,8 @@ impl<'a> UnqualifiedFunctionalCanaryExecution<'a> {
         Ok(Self {
             request,
             socket_observer,
+            install_supervised_report: Some(install_supervised_report),
+            supervised_report_installed: false,
             open_engine_child,
         })
     }
@@ -4888,6 +4900,54 @@ impl<'a> UnqualifiedFunctionalCanaryExecution<'a> {
     #[must_use]
     pub(crate) const fn socket_observer_authority(&self) -> CanarySocketObserverAuthority {
         self.socket_observer.authority()
+    }
+
+    pub(crate) fn install_supervised_delivery_report(
+        &mut self,
+        handoff: SupervisedDeliveryReportEngineHandoff,
+    ) -> Result<InstalledSupervisedDeliveryReportProducer, FunctionalCanaryError> {
+        let installer = self.install_supervised_report.take().ok_or_else(|| {
+            if self.supervised_report_installed {
+                FunctionalCanaryError::new(
+                    CanaryErrorKind::CleanupUncertain,
+                    CanaryCleanupStatus::Uncertain,
+                    "functional canary execution already installed its supervised-report producer",
+                )
+            } else {
+                FunctionalCanaryError::new(
+                    CanaryErrorKind::AdapterFailure,
+                    CanaryCleanupStatus::NotRequired,
+                    "functional canary execution has no unused supervised-report installer",
+                )
+            }
+        })?;
+        if handoff.request() != self.request {
+            return Err(FunctionalCanaryError::new(
+                CanaryErrorKind::IdentityChanged,
+                CanaryCleanupStatus::NotRequired,
+                "supervised-report handoff does not match the immutable canary request",
+            ));
+        }
+        let installed = installer(handoff)?;
+        self.supervised_report_installed = true;
+        let expected_engine = self.request.pre_binding().engine();
+        let expected_report = self
+            .request
+            .pre_binding()
+            .environment()
+            .attempt_objects()
+            .listener_delivery_report();
+        if installed.child() != expected_engine.engine()
+            || installed.report_object() != expected_report
+            || installed.profile_revision() != expected_engine.engine_profile_revision()
+        {
+            return Err(FunctionalCanaryError::new(
+                CanaryErrorKind::CleanupUncertain,
+                CanaryCleanupStatus::Uncertain,
+                "installed supervised-report producer does not match the immutable canary request",
+            ));
+        }
+        Ok(installed)
     }
 
     pub(crate) fn into_parts(
@@ -4949,7 +5009,10 @@ fn bounded_prefix(diagnostic: &str) -> String {
 pub(crate) mod local_output;
 mod supervised_delivery_report;
 use supervised_delivery_report::CanaryListenerDeliveryReportCleanupDisposition;
-pub(crate) use supervised_delivery_report::CanaryListenerDeliveryReportCleanupEvidence;
+pub(crate) use supervised_delivery_report::{
+    CanaryListenerDeliveryReportCleanupEvidence, InstalledSupervisedDeliveryReportProducer,
+    SupervisedDeliveryReportEngineHandoff, SupervisedDeliveryReportHandoffError,
+};
 
 #[cfg(all(test, any(target_os = "linux", target_os = "android")))]
 mod linux_namespace_harness;

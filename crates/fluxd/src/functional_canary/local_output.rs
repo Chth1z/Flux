@@ -2551,6 +2551,7 @@ mod tests {
     use super::*;
     use crate::functional_canary::{
         CanaryAddressFamilies, CanaryCredentialDomainBinding, CanaryDeadline,
+        InstalledSupervisedDeliveryReportProducer, SupervisedDeliveryReportEngineHandoff,
         UnqualifiedCanaryCleanupEvidence, UnqualifiedCanaryFlowEvidenceSlots,
     };
     #[cfg(target_os = "linux")]
@@ -2913,6 +2914,7 @@ mod tests {
         let execution = UnqualifiedFunctionalCanaryExecution::new(
             request,
             socket_observer,
+            unused_report_installer(),
             Box::new(|| {
                 Err(FunctionalCanaryError::new(
                     CanaryErrorKind::Availability(CanaryAvailability::Denied),
@@ -3229,6 +3231,7 @@ mod tests {
         let execution = UnqualifiedFunctionalCanaryExecution::new(
             &request,
             socket_observer,
+            unused_report_installer(),
             Box::new(move || Ok(authority)),
         )
         .expect("bind real engine authority to the exact request");
@@ -3289,6 +3292,7 @@ mod tests {
         let execution = UnqualifiedFunctionalCanaryExecution::new(
             &request,
             socket_observer,
+            unused_report_installer(),
             Box::new(move || Ok(authority)),
         )
         .expect("bind real engine authority to the exact request identity");
@@ -3392,6 +3396,7 @@ mod tests {
         let execution = UnqualifiedFunctionalCanaryExecution::new(
             &request,
             socket_observer,
+            unused_report_installer(),
             Box::new(move || Ok(authority)),
         )
         .expect("bind exited engine authority to the exact request");
@@ -4062,9 +4067,20 @@ mod tests {
         UnqualifiedFunctionalCanaryExecution::new(
             request,
             socket_observer,
+            unused_report_installer(),
             scripted_engine_opener(request),
         )
         .expect("scripted observer matches request authority")
+    }
+
+    fn unused_report_installer<'a>() -> Box<
+        dyn FnOnce(
+                SupervisedDeliveryReportEngineHandoff,
+            )
+                -> Result<InstalledSupervisedDeliveryReportProducer, FunctionalCanaryError>
+            + 'a,
+    > {
+        Box::new(|_| panic!("this test does not install a supervised-report producer"))
     }
 
     fn scripted_engine_opener(
@@ -4105,6 +4121,7 @@ mod tests {
         let execution = UnqualifiedFunctionalCanaryExecution::new(
             request,
             socket_observer,
+            unused_report_installer(),
             Box::new(move || Ok(mismatched)),
         )
         .expect("observer binding is valid before the engine authority opens");
@@ -4142,6 +4159,7 @@ mod tests {
         let revision_execution = UnqualifiedFunctionalCanaryExecution::new(
             request,
             observer(),
+            unused_report_installer(),
             Box::new(move || Ok(wrong_revision_authority)),
         )
         .expect("observer binding is valid");
@@ -4161,6 +4179,7 @@ mod tests {
         let stale_execution = UnqualifiedFunctionalCanaryExecution::new(
             request,
             observer(),
+            unused_report_installer(),
             Box::new(move || Ok(stale_authority)),
         )
         .expect("observer binding is valid");
@@ -4192,6 +4211,7 @@ mod tests {
         let error = match UnqualifiedFunctionalCanaryExecution::new(
             request,
             observer,
+            unused_report_installer(),
             scripted_engine_opener(request),
         ) {
             Ok(_) => panic!("copied numeric authority cannot replace the original opening"),
@@ -4221,6 +4241,7 @@ mod tests {
         let error = match UnqualifiedFunctionalCanaryExecution::new(
             request,
             observer,
+            unused_report_installer(),
             scripted_engine_opener(request),
         ) {
             Ok(_) => panic!("observer and request deadlines cannot diverge"),
@@ -4283,6 +4304,7 @@ mod tests {
                 UnqualifiedFunctionalCanaryExecution::new(
                     &request,
                     observer,
+                    unused_report_installer(),
                     scripted_engine_opener(&request),
                 )
                 .expect("prebound observer matches request authority"),

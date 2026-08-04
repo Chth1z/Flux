@@ -1,5 +1,6 @@
 use std::error::Error as _;
 use std::fs;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::num::{NonZeroU16, NonZeroU32};
 use std::os::unix::fs::PermissionsExt;
 use std::time::{Duration, Instant};
@@ -37,13 +38,13 @@ use super::{
     NativeGenerationPromotionError, PREPARED_GENERATION_RECORD_SCHEMA_VERSION,
     PreparedGenerationRecord, PreparedGenerationRecordError, PreparedGenerationRecordStore,
     SelectedEngineSource, SelectedEngineSourceIdentity, TPROXY_GENERATION_CANDIDATE_SCHEMA_VERSION,
-    TproxyEngineConfigRequest, TproxyGenerationCandidateErrorKind, bind_engine_config_to_spec,
-    bind_engine_spec_to_desired_state, collect_tproxy_engine_capability_profile,
-    compile_desired_state, compile_desired_state_capture, compile_tproxy_engine_config,
-    compile_tproxy_generation_candidate, declare_supervised_delivery_report_profile_fixture,
-    parse_sing_box_version_output, qualified_xtables_capture_path_evidence,
-    qualified_xtables_kernel_config, rebind_engine_capability_profile_fixture,
-    reconstruct_canonical_tproxy_engine_config,
+    TproxyCanaryEngineRoute, TproxyEngineConfigRequest, TproxyGenerationCandidateErrorKind,
+    bind_engine_config_to_spec, bind_engine_spec_to_desired_state,
+    collect_tproxy_engine_capability_profile, compile_desired_state, compile_desired_state_capture,
+    compile_tproxy_engine_config, compile_tproxy_generation_candidate,
+    declare_supervised_delivery_report_profile_fixture, parse_sing_box_version_output,
+    qualified_xtables_capture_path_evidence, qualified_xtables_kernel_config,
+    rebind_engine_capability_profile_fixture, reconstruct_canonical_tproxy_engine_config,
 };
 use crate::engine_supervisor::EngineCapabilityProbeError;
 use crate::functional_canary::FunctionalCanaryGateMode;
@@ -297,6 +298,178 @@ fn listener_port_changes_only_the_compiled_identity_not_the_template_identity() 
     assert_eq!(first.template_digest(), second.template_digest());
     assert_ne!(first.content_sha256(), second.content_sha256());
     assert_ne!(first.digest(), second.digest());
+}
+
+#[test]
+fn canary_route_precedes_and_preserves_user_policy() {
+    let template = br#"{
+        "outbounds": [
+            {"type":"direct","tag":"USER-DIRECT"},
+            {"type":"selector","tag":"USER-PROXY","outbounds":["USER-DIRECT"]}
+        ],
+        "route": {
+            "rules": [
+                {"action":"sniff"},
+                {"action":"route","network":"tcp","outbound":"USER-PROXY"}
+            ],
+            "final":"USER-PROXY"
+        }
+    }"#;
+    let artifact = compile_with_canary_route(template, PORT, dual_stack_canary_route())
+        .expect("canonical canary route");
+    let document: serde_json::Value =
+        serde_json::from_slice(artifact.bytes()).expect("compiled configuration JSON");
+
+    assert_eq!(
+        document["outbounds"],
+        serde_json::json!([
+            {"tag":"flux-canary-direct-v1","type":"direct"},
+            {"tag":"USER-DIRECT","type":"direct"},
+            {"outbounds":["USER-DIRECT"],"tag":"USER-PROXY","type":"selector"}
+        ])
+    );
+    assert_eq!(
+        document["route"]["rules"],
+        serde_json::json!([
+            {
+                "action":"route",
+                "ip_cidr":["192.0.2.2/32","2001:db8::2/128"],
+                "network":"tcp",
+                "outbound":"flux-canary-direct-v1",
+                "port":[41001,41053]
+            },
+            {
+                "action":"route",
+                "ip_cidr":["192.0.2.2/32","2001:db8::2/128"],
+                "network":"udp",
+                "outbound":"flux-canary-direct-v1",
+                "port":[41002,41053]
+            },
+            {"action":"sniff"},
+            {"action":"route","network":"tcp","outbound":"USER-PROXY"}
+        ])
+    );
+    assert_eq!(document["route"]["final"], "USER-PROXY");
+}
+
+#[test]
+fn canary_route_is_deterministic_and_bound_to_config_identity() {
+    let template = br#"{"inbounds":[],"route":{"rules":[]}}"#;
+    let reordered = br#" { "route" : { "rules" : [ ] }, "inbounds" : [ ] } "#;
+    let route = dual_stack_canary_route();
+    let first = compile_with_canary_route(template, PORT, route).unwrap();
+    let second = compile_with_canary_route(reordered, PORT, route).unwrap();
+
+    assert_eq!(first.bytes(), second.bytes());
+    assert_eq!(first.template_digest(), second.template_digest());
+    assert_eq!(first.content_sha256(), second.content_sha256());
+    assert_eq!(first.digest(), second.digest());
+
+    let changed_route = TproxyCanaryEngineRoute::new(
+        Ipv4Addr::new(192, 0, 2, 3),
+        Some(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 3)),
+        NonZeroU16::new(41001).unwrap(),
+        NonZeroU16::new(41002).unwrap(),
+        NonZeroU16::new(41053).unwrap(),
+    );
+    let changed = compile_with_canary_route(template, PORT, changed_route).unwrap();
+    assert_eq!(first.template_digest(), changed.template_digest());
+    assert_ne!(first.content_sha256(), changed.content_sha256());
+    assert_ne!(first.digest(), changed.digest());
+}
+
+#[test]
+fn ipv4_only_canary_route_recompiles_idempotently() {
+    let route = ipv4_only_canary_route();
+    let artifact = compile_with_canary_route(br#"{"inbounds":[]}"#, PORT, route).unwrap();
+    let document: serde_json::Value = serde_json::from_slice(artifact.bytes()).unwrap();
+    let rules = document["route"]["rules"].as_array().unwrap();
+    assert_eq!(rules[0]["ip_cidr"], serde_json::json!(["192.0.2.2/32"]));
+    assert_eq!(rules[1]["ip_cidr"], serde_json::json!(["192.0.2.2/32"]));
+
+    let recompiled = compile_with_canary_route(artifact.bytes(), PORT, route)
+        .expect("exact generated canary bundle recompiles");
+    assert_eq!(recompiled.bytes(), artifact.bytes());
+    assert_eq!(recompiled.content_sha256(), artifact.content_sha256());
+
+    let reconstructed = reconstruct_canonical_tproxy_engine_config(
+        artifact.bytes(),
+        NonZeroU16::new(PORT).unwrap(),
+    )
+    .expect("exact routed artifact reconstructs canonically");
+    assert_eq!(reconstructed.bytes(), artifact.bytes());
+}
+
+#[test]
+fn canary_route_rejects_reserved_tag_substitution_and_duplicates() {
+    for template in [
+        br#"{"outbounds":[{"type":"block","tag":"flux-canary-direct-v1"}]}"#.as_slice(),
+        br#"{"route":{"rules":[{"action":"route","outbound":"flux-canary-direct-v1"}]}}"#
+            .as_slice(),
+        br#"{"route":{"final":"flux-canary-direct-v1"}}"#.as_slice(),
+    ] {
+        let error = compile_with_canary_route(template, PORT, dual_stack_canary_route())
+            .expect_err("reserved canary tag must remain compiler-owned");
+        assert_eq!(
+            error.kind(),
+            EngineConfigCompileErrorKind::CanaryRouteReservedTagCollision
+        );
+    }
+
+    let artifact = compile_with_canary_route(br#"{}"#, PORT, dual_stack_canary_route()).unwrap();
+    let mut duplicate: serde_json::Value = serde_json::from_slice(artifact.bytes()).unwrap();
+    let outbound = duplicate["outbounds"][0].clone();
+    duplicate["outbounds"]
+        .as_array_mut()
+        .unwrap()
+        .push(outbound);
+    let duplicate = serde_json::to_vec(&duplicate).unwrap();
+    let error = compile_with_canary_route(&duplicate, PORT, dual_stack_canary_route())
+        .expect_err("duplicate reserved outbound must fail");
+    assert_eq!(
+        error.kind(),
+        EngineConfigCompileErrorKind::CanaryRouteReservedTagCollision
+    );
+}
+
+#[test]
+fn canary_route_rejects_malformed_route_and_outbound_containers() {
+    let cases: &[(&[u8], EngineConfigCompileErrorKind)] = &[
+        (
+            br#"{"outbounds":{}}"#,
+            EngineConfigCompileErrorKind::OutboundsNotArray,
+        ),
+        (
+            br#"{"outbounds":[false]}"#,
+            EngineConfigCompileErrorKind::OutboundNotObject { index: 0 },
+        ),
+        (
+            br#"{"outbounds":[{"tag":7}]}"#,
+            EngineConfigCompileErrorKind::OutboundTagNotString { index: 0 },
+        ),
+        (
+            br#"{"route":[]}"#,
+            EngineConfigCompileErrorKind::RouteNotObject,
+        ),
+        (
+            br#"{"route":{"rules":{}}}"#,
+            EngineConfigCompileErrorKind::RouteRulesNotArray,
+        ),
+        (
+            br#"{"route":{"rules":[false]}}"#,
+            EngineConfigCompileErrorKind::RouteRuleNotObject { index: 0 },
+        ),
+        (
+            br#"{"route":{"rules":[{"outbound":7}]}}"#,
+            EngineConfigCompileErrorKind::RouteRuleOutboundNotString { index: 0 },
+        ),
+    ];
+
+    for (template, expected) in cases {
+        let error = compile_with_canary_route(template, PORT, dual_stack_canary_route())
+            .expect_err("malformed canary route container must fail");
+        assert_eq!(error.kind(), *expected);
+    }
 }
 
 #[test]
@@ -1837,6 +2010,37 @@ fn compile(
         template,
         NonZeroU16::new(port).unwrap(),
     ))
+}
+
+fn compile_with_canary_route(
+    template: &[u8],
+    port: u16,
+    canary_route: TproxyCanaryEngineRoute,
+) -> Result<super::EngineConfigArtifact, super::EngineConfigCompileError> {
+    compile_tproxy_engine_config(
+        TproxyEngineConfigRequest::new(template, NonZeroU16::new(port).unwrap())
+            .with_canary_route(canary_route),
+    )
+}
+
+fn dual_stack_canary_route() -> TproxyCanaryEngineRoute {
+    TproxyCanaryEngineRoute::new(
+        Ipv4Addr::new(192, 0, 2, 2),
+        Some(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2)),
+        NonZeroU16::new(41001).unwrap(),
+        NonZeroU16::new(41002).unwrap(),
+        NonZeroU16::new(41053).unwrap(),
+    )
+}
+
+fn ipv4_only_canary_route() -> TproxyCanaryEngineRoute {
+    TproxyCanaryEngineRoute::new(
+        Ipv4Addr::new(192, 0, 2, 2),
+        None,
+        NonZeroU16::new(41001).unwrap(),
+        NonZeroU16::new(41002).unwrap(),
+        NonZeroU16::new(41053).unwrap(),
+    )
 }
 
 fn hex(bytes: &[u8]) -> String {

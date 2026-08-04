@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::io;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::num::NonZeroU16;
 use std::path::Path;
 
@@ -26,6 +27,7 @@ const ARTIFACT_DIGEST_DOMAIN: &[u8] =
     b"Flux Generation Sing-Box engine config artifact\0sha256-v1\0";
 const LAUNCH_BINDING_DIGEST_DOMAIN: &[u8] =
     b"Flux Generation Sing-Box engine config launch binding\0sha256-v2\0";
+const TPROXY_CANARY_DIRECT_OUTBOUND_TAG: &str = "flux-canary-direct-v1";
 
 pub(crate) fn read_bounded_regular_file(path: &Path) -> io::Result<Vec<u8>> {
     let maximum = usize::try_from(MAX_ENGINE_CONFIG_BYTES).unwrap_or(usize::MAX);
@@ -72,6 +74,7 @@ impl fmt::Display for EngineConfigArtifactDigest {
 pub(crate) struct TproxyEngineConfigRequest<'a> {
     template: &'a [u8],
     listener_port: NonZeroU16,
+    canary_route: Option<TproxyCanaryEngineRoute>,
 }
 
 impl<'a> TproxyEngineConfigRequest<'a> {
@@ -80,6 +83,53 @@ impl<'a> TproxyEngineConfigRequest<'a> {
         Self {
             template,
             listener_port,
+            canary_route: None,
+        }
+    }
+
+    #[allow(
+        dead_code,
+        reason = "the serialized native facility supplies this route in the next canary checkpoint"
+    )]
+    #[must_use]
+    pub(crate) const fn with_canary_route(mut self, canary_route: TproxyCanaryEngineRoute) -> Self {
+        self.canary_route = Some(canary_route);
+        self
+    }
+}
+
+/// Immutable, already-admitted peer endpoints for one Generation's private Sing-Box route.
+///
+/// Address selection and collision checks belong to the serialized native facility owner. This
+/// value grants no facility creation, route mutation, or traffic authority.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct TproxyCanaryEngineRoute {
+    ipv4_peer: Ipv4Addr,
+    ipv6_peer: Option<Ipv6Addr>,
+    tcp_echo_port: NonZeroU16,
+    udp_echo_port: NonZeroU16,
+    dns_port: NonZeroU16,
+}
+
+impl TproxyCanaryEngineRoute {
+    #[allow(
+        dead_code,
+        reason = "the serialized native facility supplies admitted endpoints in the next canary checkpoint"
+    )]
+    #[must_use]
+    pub(crate) const fn new(
+        ipv4_peer: Ipv4Addr,
+        ipv6_peer: Option<Ipv6Addr>,
+        tcp_echo_port: NonZeroU16,
+        udp_echo_port: NonZeroU16,
+        dns_port: NonZeroU16,
+    ) -> Self {
+        Self {
+            ipv4_peer,
+            ipv6_peer,
+            tcp_echo_port,
+            udp_echo_port,
+            dns_port,
         }
     }
 }
@@ -348,6 +398,14 @@ pub(crate) enum EngineConfigCompileErrorKind {
     InboundTypeMissing { index: usize },
     InboundTypeNotString { index: usize },
     MultipleTproxyInbounds,
+    OutboundsNotArray,
+    OutboundNotObject { index: usize },
+    OutboundTagNotString { index: usize },
+    RouteNotObject,
+    RouteRulesNotArray,
+    RouteRuleNotObject { index: usize },
+    RouteRuleOutboundNotString { index: usize },
+    CanaryRouteReservedTagCollision,
     OutputTooLarge { actual: usize, maximum: u64 },
     NonCanonical,
     ContentDigestMismatch,
@@ -418,6 +476,34 @@ impl fmt::Display for EngineConfigCompileError {
             ),
             EngineConfigCompileErrorKind::MultipleTproxyInbounds => formatter.write_str(
                 "Sing-Box template contains multiple TPROXY inbounds; one canonical listener is required",
+            ),
+            EngineConfigCompileErrorKind::OutboundsNotArray => {
+                formatter.write_str("Sing-Box template field 'outbounds' must be a JSON array")
+            }
+            EngineConfigCompileErrorKind::OutboundNotObject { index } => write!(
+                formatter,
+                "Sing-Box template outbound {index} must be a JSON object"
+            ),
+            EngineConfigCompileErrorKind::OutboundTagNotString { index } => write!(
+                formatter,
+                "Sing-Box template outbound {index} field 'tag' must be a string"
+            ),
+            EngineConfigCompileErrorKind::RouteNotObject => {
+                formatter.write_str("Sing-Box template field 'route' must be a JSON object")
+            }
+            EngineConfigCompileErrorKind::RouteRulesNotArray => formatter
+                .write_str("Sing-Box template field 'route.rules' must be a JSON array"),
+            EngineConfigCompileErrorKind::RouteRuleNotObject { index } => write!(
+                formatter,
+                "Sing-Box template route rule {index} must be a JSON object"
+            ),
+            EngineConfigCompileErrorKind::RouteRuleOutboundNotString { index } => write!(
+                formatter,
+                "Sing-Box template route rule {index} field 'outbound' must be a string"
+            ),
+            EngineConfigCompileErrorKind::CanaryRouteReservedTagCollision => write!(
+                formatter,
+                "Sing-Box template substitutes or reuses reserved canary outbound tag '{TPROXY_CANARY_DIRECT_OUTBOUND_TAG}'"
             ),
             EngineConfigCompileErrorKind::OutputTooLarge { actual, maximum } => write!(
                 formatter,
@@ -533,6 +619,9 @@ pub(crate) fn compile_tproxy_engine_config(
     }
     let output_inbound_count = output_inbounds.len();
     document.insert("inbounds".to_owned(), Value::Array(output_inbounds));
+    if let Some(canary_route) = request.canary_route {
+        install_tproxy_canary_route(&mut document, canary_route)?;
+    }
 
     let output = canonicalize_json(Value::Object(document));
     let mut bytes = serde_json::to_vec(&output).map_err(|source| {
@@ -584,6 +673,169 @@ pub(crate) fn reconstruct_canonical_tproxy_engine_config(
         ));
     }
     Ok(artifact)
+}
+
+fn install_tproxy_canary_route(
+    document: &mut Map<String, Value>,
+    route_plan: TproxyCanaryEngineRoute,
+) -> Result<(), EngineConfigCompileError> {
+    validate_canary_route_containers(document)?;
+
+    let direct_outbound = canary_direct_outbound();
+    let tcp_rule = canary_route_rule(route_plan, "tcp", route_plan.tcp_echo_port);
+    let udp_rule = canary_route_rule(route_plan, "udp", route_plan.udp_echo_port);
+    let exact_bundle = document
+        .get("outbounds")
+        .and_then(Value::as_array)
+        .and_then(|outbounds| outbounds.first())
+        == Some(&direct_outbound)
+        && document
+            .get("route")
+            .and_then(Value::as_object)
+            .and_then(|route| route.get("rules"))
+            .and_then(Value::as_array)
+            .is_some_and(|rules| {
+                rules.first() == Some(&tcp_rule) && rules.get(1) == Some(&udp_rule)
+            });
+    let reserved_tag_occurrences = document
+        .values()
+        .map(count_reserved_canary_tag)
+        .sum::<usize>();
+    if reserved_tag_occurrences != 0 {
+        if exact_bundle && reserved_tag_occurrences == 3 {
+            return Ok(());
+        }
+        return Err(EngineConfigCompileError::without_source(
+            EngineConfigCompileErrorKind::CanaryRouteReservedTagCollision,
+        ));
+    }
+
+    let outbounds = document
+        .entry("outbounds".to_owned())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let Value::Array(outbounds) = outbounds else {
+        unreachable!("canary route containers were validated before mutation");
+    };
+    outbounds.insert(0, direct_outbound);
+
+    let route = document
+        .entry("route".to_owned())
+        .or_insert_with(|| Value::Object(Map::new()));
+    let Value::Object(route) = route else {
+        unreachable!("canary route containers were validated before mutation");
+    };
+    let rules = route
+        .entry("rules".to_owned())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let Value::Array(rules) = rules else {
+        unreachable!("canary route containers were validated before mutation");
+    };
+    rules.splice(0..0, [tcp_rule, udp_rule]);
+    Ok(())
+}
+
+fn validate_canary_route_containers(
+    document: &Map<String, Value>,
+) -> Result<(), EngineConfigCompileError> {
+    if let Some(outbounds) = document.get("outbounds") {
+        let Value::Array(outbounds) = outbounds else {
+            return Err(EngineConfigCompileError::without_source(
+                EngineConfigCompileErrorKind::OutboundsNotArray,
+            ));
+        };
+        for (index, outbound) in outbounds.iter().enumerate() {
+            let Value::Object(outbound) = outbound else {
+                return Err(EngineConfigCompileError::without_source(
+                    EngineConfigCompileErrorKind::OutboundNotObject { index },
+                ));
+            };
+            if outbound.get("tag").is_some_and(|tag| !tag.is_string()) {
+                return Err(EngineConfigCompileError::without_source(
+                    EngineConfigCompileErrorKind::OutboundTagNotString { index },
+                ));
+            }
+        }
+    }
+
+    let Some(route) = document.get("route") else {
+        return Ok(());
+    };
+    let Value::Object(route) = route else {
+        return Err(EngineConfigCompileError::without_source(
+            EngineConfigCompileErrorKind::RouteNotObject,
+        ));
+    };
+    let Some(rules) = route.get("rules") else {
+        return Ok(());
+    };
+    let Value::Array(rules) = rules else {
+        return Err(EngineConfigCompileError::without_source(
+            EngineConfigCompileErrorKind::RouteRulesNotArray,
+        ));
+    };
+    for (index, rule) in rules.iter().enumerate() {
+        let Value::Object(rule) = rule else {
+            return Err(EngineConfigCompileError::without_source(
+                EngineConfigCompileErrorKind::RouteRuleNotObject { index },
+            ));
+        };
+        if rule
+            .get("outbound")
+            .is_some_and(|outbound| !outbound.is_string())
+        {
+            return Err(EngineConfigCompileError::without_source(
+                EngineConfigCompileErrorKind::RouteRuleOutboundNotString { index },
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn canary_direct_outbound() -> Value {
+    let mut outbound = Map::new();
+    outbound.insert("type".to_owned(), Value::String("direct".to_owned()));
+    outbound.insert(
+        "tag".to_owned(),
+        Value::String(TPROXY_CANARY_DIRECT_OUTBOUND_TAG.to_owned()),
+    );
+    Value::Object(outbound)
+}
+
+fn canary_route_rule(
+    route_plan: TproxyCanaryEngineRoute,
+    network: &'static str,
+    echo_port: NonZeroU16,
+) -> Value {
+    let mut cidrs = vec![Value::String(format!("{}/32", route_plan.ipv4_peer))];
+    if let Some(ipv6_peer) = route_plan.ipv6_peer {
+        cidrs.push(Value::String(format!("{ipv6_peer}/128")));
+    }
+
+    let mut rule = Map::new();
+    rule.insert("action".to_owned(), Value::String("route".to_owned()));
+    rule.insert("ip_cidr".to_owned(), Value::Array(cidrs));
+    rule.insert("network".to_owned(), Value::String(network.to_owned()));
+    rule.insert(
+        "port".to_owned(),
+        Value::Array(vec![
+            Value::Number(Number::from(echo_port.get())),
+            Value::Number(Number::from(route_plan.dns_port.get())),
+        ]),
+    );
+    rule.insert(
+        "outbound".to_owned(),
+        Value::String(TPROXY_CANARY_DIRECT_OUTBOUND_TAG.to_owned()),
+    );
+    Value::Object(rule)
+}
+
+fn count_reserved_canary_tag(value: &Value) -> usize {
+    match value {
+        Value::String(value) => usize::from(value == TPROXY_CANARY_DIRECT_OUTBOUND_TAG),
+        Value::Array(values) => values.iter().map(count_reserved_canary_tag).sum(),
+        Value::Object(values) => values.values().map(count_reserved_canary_tag).sum(),
+        Value::Null | Value::Bool(_) | Value::Number(_) => 0,
+    }
 }
 
 fn normalize_tproxy_inbound(inbound: &mut Map<String, Value>, port: NonZeroU16) {

@@ -15,9 +15,9 @@
 //! local-OUTPUT TPROXY evidence.
 //! Attempt preparation also carries the exact non-cloneable socket-observer
 //! session separately from the pure request. Read-only availability sees only
-//! the request. Only after availability succeeds does execution open the
-//! engine authority and cross the prepared boundary; the prepared attempt then
-//! receives the bound observer session once by value.
+//! the request. After availability succeeds, preparation may prebind and
+//! install the supervised report; execution then opens the engine observation
+//! authority and passes the observer session to the prepared attempt by value.
 
 use std::convert::Infallible;
 
@@ -39,8 +39,8 @@ use super::{
 mod driver_process;
 use driver_process::DriverProcessProof;
 
-#[cfg(test)]
-mod listener_observer;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(in crate::functional_canary) mod listener_observer;
 
 const XTABLES_LOCAL_OUTPUT_UNSUPPORTED: &str = "the packaged xtables functional-canary adapter has no device-qualified direct observer for the active local-OUTPUT transaction: exact transparent-listener delivery, supervised-engine receipt, counter bounds, identity stability, and cleanup proof remain required; REDIRECT, DNAT, unrelated ingress traffic, counters alone, and route lookups are prohibited substitutes";
 const NON_TPROXY_REQUEST: &str =
@@ -106,7 +106,8 @@ trait TproxyLocalOutputDriver: Send + 'static {
         request: &CanaryAttemptRequest,
     ) -> Result<(), TproxyLocalOutputUnavailable>;
 
-    /// Return the prepared attempt only after request-scoped authorities open.
+    /// Return the prepared attempt after consuming any report prebind/install
+    /// operations required before traffic starts.
     ///
     /// This phase must not mutate networking state. Therefore an error from
     /// this method may claim `NotRequired` cleanup only. Once a prepared value
@@ -114,7 +115,7 @@ trait TproxyLocalOutputDriver: Send + 'static {
     /// potentially post-mutation.
     fn prepare_tproxy_local_output(
         &mut self,
-        request: &CanaryAttemptRequest,
+        execution: &mut UnqualifiedFunctionalCanaryExecution<'_>,
     ) -> Result<Self::Prepared, TproxyLocalOutputUnavailable>;
 }
 
@@ -190,32 +191,48 @@ trait TproxyLocalOutputEvidenceFactory<R>: Send + 'static {
 }
 
 mod capture_receipt {
-    #[cfg(not(test))]
-    use std::convert::Infallible;
     use std::num::{NonZeroU32, NonZeroU64};
     use std::time::Instant;
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    use super::super::supervised_delivery_report::{
+        SupervisedDeliveryReportError,
+        collector::{
+            RetiredSupervisedDeliveryReport, RetiredSupervisedDeliveryReportCaptureAuthority,
+        },
+    };
     use super::super::{
         CanaryAttemptRequest, CanaryCaptureBackend, CanaryFlow, CanaryFlowTuple,
         CanaryInboundDeliveryEvent, CanaryInboundPayloadIdentity, CanaryInetDiagCookie,
         FUNCTIONAL_CANARY_FLOW_SLOTS, UnqualifiedCanaryFlowEvidence,
         UnqualifiedCanaryFlowEvidenceSlots, UnqualifiedCanaryInboundListenerDeliveryEvidence,
     };
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    use super::super::{
+        CanaryListenerDeliveryReportCleanupDisposition,
+        CanaryListenerDeliveryReportCleanupEvidence, CanaryProcessRetirementEvidence,
+        UnqualifiedCanaryCleanupEvidence,
+    };
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    use super::listener_observer::ListenerObservations;
 
     /// Sealed authority proving that a verifier, rather than a capture driver,
     /// minted the receipt from direct local-OUTPUT observations.
     ///
-    /// Production remains deliberately uninhabited. A future concrete
-    /// verifier must replace the `Infallible` field with a reviewed,
-    /// mechanism-specific authority that proves the local-OUTPUT TPROXY
-    /// domain and its loss/readback contract. Unit tests receive a scripted
-    /// authority without opening a production construction path.
+    /// Production construction consumes the retired authenticated report,
+    /// exact listener snapshot, and matching cleanup evidence. Unit tests
+    /// retain a separate scripted variant for the older receipt regressions.
     #[derive(Debug, Eq, PartialEq)]
-    struct TproxyLocalOutputCaptureAuthority {
-        #[cfg(not(test))]
-        _never: Infallible,
+    enum TproxyLocalOutputCaptureAuthority {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        SupervisedReport {
+            terminal_observed_at: Instant,
+            eof_observed_at: Instant,
+            client_retirement: CanaryProcessRetirementEvidence,
+            report_cleanup: CanaryListenerDeliveryReportCleanupEvidence,
+        },
         #[cfg(test)]
-        _scripted: (),
+        Scripted,
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -301,7 +318,152 @@ mod capture_receipt {
         },
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(in super::super) enum TproxyLocalOutputCaptureProjectionError {
+        RequestMismatch,
+        MissingFlow { flow: CanaryFlow },
+        UnexpectedFlow { flow: CanaryFlow },
+        PrefilledListenerDelivery { flow: CanaryFlow },
+        MissingListenerRole { flow: CanaryFlow },
+        MissingReportEvent { flow: CanaryFlow },
+        InvalidReport(SupervisedDeliveryReportError),
+        ClientRetirementMismatch,
+        ReportCleanupMismatch,
+        ReportChronologyInvalid,
+        ReportSequenceMismatch { flow: CanaryFlow },
+        ReportLossObserved { flow: CanaryFlow },
+        ReceiptInvalid(TproxyLocalOutputCaptureReceiptError),
+    }
+
     impl TproxyLocalOutputCaptureReceipt {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        pub(in super::super) fn from_retired_supervised_report(
+            expected: &CanaryAttemptRequest,
+            mut report: RetiredSupervisedDeliveryReport,
+            listeners: ListenerObservations,
+            flows: &mut UnqualifiedCanaryFlowEvidenceSlots,
+            cleanup: &UnqualifiedCanaryCleanupEvidence,
+        ) -> Result<Self, TproxyLocalOutputCaptureProjectionError> {
+            use TproxyLocalOutputCaptureProjectionError as Error;
+
+            if report.request() != expected {
+                return Err(Error::RequestMismatch);
+            }
+
+            for flow in CanaryFlow::ALL {
+                let slot = flows.slots[flow.index()].as_ref();
+                if !expected.requires_flow(flow) {
+                    if slot.is_some() {
+                        return Err(Error::UnexpectedFlow { flow });
+                    }
+                    continue;
+                }
+                let evidence = slot.ok_or(Error::MissingFlow { flow })?;
+                if evidence.inbound_listener_delivery.is_some() {
+                    return Err(Error::PrefilledListenerDelivery { flow });
+                }
+            }
+
+            let mut deliveries: [Option<UnqualifiedCanaryInboundListenerDeliveryEvidence>;
+                FUNCTIONAL_CANARY_FLOW_SLOTS] = std::array::from_fn(|_| None);
+            for flow in CanaryFlow::ALL {
+                if !expected.requires_flow(flow) {
+                    continue;
+                }
+                let listener = listeners
+                    .listener_for(flow)
+                    .cloned()
+                    .ok_or(Error::MissingListenerRole { flow })?;
+                deliveries[flow.index()] = Some(
+                    report
+                        .take_listener_delivery(flow, listener)
+                        .map_err(Error::InvalidReport)?
+                        .ok_or(Error::MissingReportEvent { flow })?,
+                );
+            }
+
+            let report = report
+                .into_capture_authority()
+                .map_err(Error::InvalidReport)?;
+            if report.request() != expected {
+                return Err(Error::RequestMismatch);
+            }
+            if report.client_retirement() != cleanup.client {
+                return Err(Error::ClientRetirementMismatch);
+            }
+            if report.report_cleanup() != cleanup.listener_delivery_report {
+                return Err(Error::ReportCleanupMismatch);
+            }
+            validate_report_chronology(expected, &listeners, &deliveries, &report)?;
+
+            let client_retirement = report.client_retirement();
+            let report_cleanup = report.report_cleanup();
+            let mut events: [Option<TproxyLocalOutputCaptureEvent>; FUNCTIONAL_CANARY_FLOW_SLOTS] =
+                std::array::from_fn(|_| None);
+            for flow in CanaryFlow::ALL {
+                if !expected.requires_flow(flow) {
+                    continue;
+                }
+                let flow_evidence = flows.slots[flow.index()]
+                    .as_ref()
+                    .expect("required flow presence was validated before report projection");
+                let delivery = deliveries[flow.index()]
+                    .as_ref()
+                    .expect("required report delivery was projected before receipt construction");
+                let (listener_cookie, delivery_event, payload) =
+                    tproxy_delivery_evidence_binding(delivery)
+                        .expect("supervised report produces only TPROXY delivery evidence");
+                events[flow.index()] = Some(TproxyLocalOutputCaptureEvent {
+                    flow,
+                    nonce: expected.nonce(),
+                    client_tuple: flow_evidence.client_tuple,
+                    observed_socket_uid: expected.pre_binding().environment().probe_uid(),
+                    payload,
+                    listener_cookie,
+                    delivery_event,
+                    sequence: delivery_event.sequence,
+                    observed_at: delivery_event.observed_at,
+                });
+            }
+
+            let receipt = Self {
+                _authority: TproxyLocalOutputCaptureAuthority::SupervisedReport {
+                    terminal_observed_at: report.terminal_observed_at(),
+                    eof_observed_at: report.eof_observed_at(),
+                    client_retirement,
+                    report_cleanup,
+                },
+                request: expected.clone(),
+                observation_started_at: listeners.started_at(),
+                observation_completed_at: client_retirement.quiesced_at,
+                lost_events_before: 0,
+                lost_events_after: 0,
+                events,
+                unexpected_event_count: 0,
+            };
+            let mut projected_flows = flows.clone();
+            for flow in CanaryFlow::ALL {
+                if !expected.requires_flow(flow) {
+                    continue;
+                }
+                projected_flows.slots[flow.index()]
+                    .as_mut()
+                    .expect("required flow presence was validated before report projection")
+                    .inbound_listener_delivery = deliveries[flow.index()].clone();
+            }
+            receipt
+                .validate_for(
+                    expected,
+                    &projected_flows,
+                    client_retirement.quiesced_at,
+                    client_retirement.quiesced_at,
+                )
+                .map_err(Error::ReceiptInvalid)?;
+            *flows = projected_flows;
+            Ok(receipt)
+        }
+
         pub(in super::super) fn validate_for(
             &self,
             expected: &CanaryAttemptRequest,
@@ -468,7 +630,7 @@ mod capture_receipt {
                 .max()
                 .expect("request validation always requires IPv4 canary flows");
             Self {
-                _authority: TproxyLocalOutputCaptureAuthority { _scripted: () },
+                _authority: TproxyLocalOutputCaptureAuthority::Scripted,
                 request: request.clone(),
                 observation_started_at: request.deadline().started_at(),
                 observation_completed_at,
@@ -487,7 +649,17 @@ mod capture_receipt {
         CanaryInboundDeliveryEvent,
         CanaryInboundPayloadIdentity,
     )> {
-        match flow.inbound_listener_delivery.as_ref()? {
+        tproxy_delivery_evidence_binding(flow.inbound_listener_delivery.as_ref()?)
+    }
+
+    fn tproxy_delivery_evidence_binding(
+        delivery: &UnqualifiedCanaryInboundListenerDeliveryEvidence,
+    ) -> Option<(
+        CanaryInetDiagCookie,
+        CanaryInboundDeliveryEvent,
+        CanaryInboundPayloadIdentity,
+    )> {
+        match delivery {
             UnqualifiedCanaryInboundListenerDeliveryEvidence::TproxyTcp { accepted, .. } => {
                 Some((accepted.listener_cookie, accepted.event, accepted.payload))
             }
@@ -497,6 +669,77 @@ mod capture_receipt {
             UnqualifiedCanaryInboundListenerDeliveryEvidence::Redirect
             | UnqualifiedCanaryInboundListenerDeliveryEvidence::Dnat => None,
         }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn validate_report_chronology(
+        expected: &CanaryAttemptRequest,
+        listeners: &ListenerObservations,
+        deliveries: &[Option<UnqualifiedCanaryInboundListenerDeliveryEvidence>;
+             FUNCTIONAL_CANARY_FLOW_SLOTS],
+        report: &RetiredSupervisedDeliveryReportCaptureAuthority,
+    ) -> Result<(), TproxyLocalOutputCaptureProjectionError> {
+        use TproxyLocalOutputCaptureProjectionError as Error;
+
+        let deadline = expected.deadline();
+        let client = report.client_retirement();
+        let terminal = report.terminal_observed_at();
+        let eof = report.eof_observed_at();
+        if listeners.started_at() < deadline.started_at()
+            || listeners.completed_at() < listeners.started_at()
+            || listeners.completed_at() >= deadline.expires_at()
+            || terminal < listeners.completed_at()
+            || eof < terminal
+            || eof > client.quiesced_at
+            || client.quiesced_at > client.terminated_at
+            || client.terminated_at > client.reaped_at
+            || client.reaped_at >= deadline.expires_at()
+        {
+            return Err(Error::ReportChronologyInvalid);
+        }
+
+        let mut expected_sequence = 1_u64;
+        for flow in CanaryFlow::ALL {
+            if !expected.requires_flow(flow) {
+                continue;
+            }
+            let delivery = deliveries[flow.index()]
+                .as_ref()
+                .expect("required report delivery was projected before chronology validation");
+            let (_, event, _) = tproxy_delivery_evidence_binding(delivery)
+                .expect("supervised report produces only TPROXY delivery evidence");
+            if event.sequence.get() != expected_sequence {
+                return Err(Error::ReportSequenceMismatch { flow });
+            }
+            if event.lost_events_before != 0 || event.lost_events_after != 0 {
+                return Err(Error::ReportLossObserved { flow });
+            }
+            if event.observed_at < listeners.completed_at() || event.observed_at > terminal {
+                return Err(Error::ReportChronologyInvalid);
+            }
+            expected_sequence += 1;
+        }
+
+        let cleanup = match report.report_cleanup().disposition() {
+            CanaryListenerDeliveryReportCleanupDisposition::Retired(cleanup) => cleanup,
+            CanaryListenerDeliveryReportCleanupDisposition::VerifiedNeverCreated { .. } => {
+                return Err(Error::ReportCleanupMismatch);
+            }
+        };
+        if cleanup.object
+            != expected
+                .pre_binding()
+                .environment()
+                .attempt_objects()
+                .listener_delivery_report()
+            || cleanup.retired_at < eof
+            || cleanup.retired_at < client.reaped_at
+            || cleanup.absent_observed_at < cleanup.retired_at
+            || cleanup.absent_observed_at >= deadline.expires_at()
+        {
+            return Err(Error::ReportChronologyInvalid);
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -812,6 +1055,8 @@ mod capture_receipt {
     }
 }
 
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+pub(super) use capture_receipt::TproxyLocalOutputCaptureProjectionError;
 pub(super) use capture_receipt::TproxyLocalOutputCaptureReceipt;
 
 mod process_ownership_receipt {
@@ -2040,7 +2285,7 @@ where
 {
     fn execute(
         &mut self,
-        execution: UnqualifiedFunctionalCanaryExecution<'_>,
+        mut execution: UnqualifiedFunctionalCanaryExecution<'_>,
     ) -> Result<UnqualifiedCanaryGateEvidence, FunctionalCanaryError> {
         let request = execution.request();
         require_tproxy_request(request)?;
@@ -2048,11 +2293,13 @@ where
         self.driver
             .check_tproxy_local_output(request)
             .map_err(TproxyLocalOutputUnavailable::into_functional_error)?;
-        let (request, socket_observer, engine_child) = execution.into_parts()?;
         let prepared = self
             .driver
-            .prepare_tproxy_local_output(request)
+            .prepare_tproxy_local_output(&mut execution)
             .map_err(TproxyLocalOutputUnavailable::into_functional_error)?;
+        let (request, socket_observer, engine_child) = execution
+            .into_parts()
+            .map_err(normalize_post_preparation_failure)?;
         let raw = prepared
             .execute_tproxy_local_output(request, socket_observer)
             .map_err(normalize_post_preparation_failure)?;
@@ -2443,8 +2690,9 @@ impl TproxyLocalOutputDriver for XtablesTproxyLocalOutputDriver {
 
     fn prepare_tproxy_local_output(
         &mut self,
-        request: &CanaryAttemptRequest,
+        execution: &mut UnqualifiedFunctionalCanaryExecution<'_>,
     ) -> Result<Self::Prepared, TproxyLocalOutputUnavailable> {
+        let request = execution.request();
         debug_assert_eq!(request.capture_backend(), CanaryCaptureBackend::Tproxy);
         Err(TproxyLocalOutputUnavailable::new(
             CanaryAvailability::Unsupported,
@@ -2550,10 +2798,12 @@ mod tests {
     use super::super::{CanarySocketObserverAuthority, CanarySocketObserverBinding};
     use super::*;
     use crate::functional_canary::{
-        CanaryAddressFamilies, CanaryCredentialDomainBinding, CanaryDeadline,
-        InstalledSupervisedDeliveryReportProducer, SupervisedDeliveryReportEngineHandoff,
-        UnqualifiedCanaryCleanupEvidence, UnqualifiedCanaryFlowEvidenceSlots,
+        AdmittedSupervisedDeliveryReportBinding, CanaryAddressFamilies,
+        CanaryCredentialDomainBinding, CanaryDeadline, InstalledSupervisedDeliveryReportProducer,
+        SupervisedDeliveryReportEngineHandoff, UnqualifiedCanaryCleanupEvidence,
+        UnqualifiedCanaryFlowEvidenceSlots,
     };
+    use crate::generation_engine_config::EngineSupervisedDeliveryReportContract;
     #[cfg(target_os = "linux")]
     use flux_platform::ProcessHandle;
 
@@ -2891,7 +3141,7 @@ mod tests {
     }
 
     #[test]
-    fn authority_open_failure_stays_before_the_prepared_cleanup_boundary() {
+    fn authority_open_failure_after_preparation_is_cleanup_uncertain() {
         let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
         let request = fixture.request();
         let prepare_calls = Arc::new(AtomicUsize::new(0));
@@ -2914,6 +3164,7 @@ mod tests {
         let execution = UnqualifiedFunctionalCanaryExecution::new(
             request,
             socket_observer,
+            admitted_report_binding(request),
             unused_report_installer(),
             Box::new(|| {
                 Err(FunctionalCanaryError::new(
@@ -2927,14 +3178,17 @@ mod tests {
 
         let error = executor
             .execute(execution)
-            .expect_err("authority denial prevents prepared-attempt construction");
+            .expect_err("authority denial prevents prepared-attempt execution");
 
-        assert_eq!(
-            error.kind(),
-            CanaryErrorKind::Availability(CanaryAvailability::Denied)
+        assert_eq!(error.kind(), CanaryErrorKind::CleanupUncertain);
+        assert_eq!(error.cleanup(), CanaryCleanupStatus::Uncertain);
+        assert!(error.diagnostic().contains("after preparation"));
+        assert!(
+            error
+                .diagnostic()
+                .contains("injected authority opening denial")
         );
-        assert_eq!(error.cleanup(), CanaryCleanupStatus::NotRequired);
-        assert_eq!(prepare_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(prepare_calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -3179,12 +3433,13 @@ mod tests {
         let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
         let seed = fixture.successful_evidence();
         let mut driver = ScriptedProofDriver::new(fixture.request(), &seed);
+        let mut execution = execution(fixture.request());
 
-        let _prepared = match driver.prepare_tproxy_local_output(fixture.request()) {
+        let _prepared = match driver.prepare_tproxy_local_output(&mut execution) {
             Ok(prepared) => prepared,
             Err(_) => panic!("first preparation consumes the exact process authority"),
         };
-        let error = match driver.prepare_tproxy_local_output(fixture.request()) {
+        let error = match driver.prepare_tproxy_local_output(&mut execution) {
             Ok(_) => panic!("prepared process authority cannot be cloned or replayed"),
             Err(error) => error,
         };
@@ -3231,6 +3486,7 @@ mod tests {
         let execution = UnqualifiedFunctionalCanaryExecution::new(
             &request,
             socket_observer,
+            admitted_report_binding(&request),
             unused_report_installer(),
             Box::new(move || Ok(authority)),
         )
@@ -3292,6 +3548,7 @@ mod tests {
         let execution = UnqualifiedFunctionalCanaryExecution::new(
             &request,
             socket_observer,
+            admitted_report_binding(&request),
             unused_report_installer(),
             Box::new(move || Ok(authority)),
         )
@@ -3396,6 +3653,7 @@ mod tests {
         let execution = UnqualifiedFunctionalCanaryExecution::new(
             &request,
             socket_observer,
+            admitted_report_binding(&request),
             unused_report_installer(),
             Box::new(move || Ok(authority)),
         )
@@ -3496,8 +3754,9 @@ mod tests {
 
         fn prepare_tproxy_local_output(
             &mut self,
-            request: &CanaryAttemptRequest,
+            execution: &mut UnqualifiedFunctionalCanaryExecution<'_>,
         ) -> Result<Self::Prepared, TproxyLocalOutputUnavailable> {
+            let request = execution.request();
             let prepared = self.prepared.take().ok_or_else(|| {
                 TproxyLocalOutputUnavailable::new(
                     CanaryAvailability::Broken,
@@ -3898,7 +4157,7 @@ mod tests {
 
         fn prepare_tproxy_local_output(
             &mut self,
-            _request: &CanaryAttemptRequest,
+            _execution: &mut UnqualifiedFunctionalCanaryExecution<'_>,
         ) -> Result<Self::Prepared, TproxyLocalOutputUnavailable> {
             Err(TproxyLocalOutputUnavailable::new(
                 CanaryAvailability::Broken,
@@ -3926,7 +4185,7 @@ mod tests {
 
         fn prepare_tproxy_local_output(
             &mut self,
-            _request: &CanaryAttemptRequest,
+            _execution: &mut UnqualifiedFunctionalCanaryExecution<'_>,
         ) -> Result<Self::Prepared, TproxyLocalOutputUnavailable> {
             Err(TproxyLocalOutputUnavailable::new(
                 self.availability,
@@ -3956,7 +4215,7 @@ mod tests {
 
         fn prepare_tproxy_local_output(
             &mut self,
-            _request: &CanaryAttemptRequest,
+            _execution: &mut UnqualifiedFunctionalCanaryExecution<'_>,
         ) -> Result<Self::Prepared, TproxyLocalOutputUnavailable> {
             self.prepare_calls.fetch_add(1, Ordering::SeqCst);
             Ok(PreparedFailure {
@@ -3978,7 +4237,7 @@ mod tests {
 
         fn prepare_tproxy_local_output(
             &mut self,
-            _request: &CanaryAttemptRequest,
+            _execution: &mut UnqualifiedFunctionalCanaryExecution<'_>,
         ) -> Result<Self::Prepared, TproxyLocalOutputUnavailable> {
             Ok(PreparedFailure {
                 kind: self.kind,
@@ -4067,10 +4326,23 @@ mod tests {
         UnqualifiedFunctionalCanaryExecution::new(
             request,
             socket_observer,
+            admitted_report_binding(request),
             unused_report_installer(),
             scripted_engine_opener(request),
         )
         .expect("scripted observer matches request authority")
+    }
+
+    fn admitted_report_binding(
+        request: &CanaryAttemptRequest,
+    ) -> AdmittedSupervisedDeliveryReportBinding {
+        let engine = request.pre_binding().engine();
+        AdmittedSupervisedDeliveryReportBinding::new(
+            engine.artifacts(),
+            engine.engine_profile_revision(),
+            EngineSupervisedDeliveryReportContract::schema_v1_fixture(),
+        )
+        .expect("fixture report binding is canonical")
     }
 
     fn unused_report_installer<'a>() -> Box<
@@ -4121,6 +4393,7 @@ mod tests {
         let execution = UnqualifiedFunctionalCanaryExecution::new(
             request,
             socket_observer,
+            admitted_report_binding(request),
             unused_report_installer(),
             Box::new(move || Ok(mismatched)),
         )
@@ -4159,6 +4432,7 @@ mod tests {
         let revision_execution = UnqualifiedFunctionalCanaryExecution::new(
             request,
             observer(),
+            admitted_report_binding(request),
             unused_report_installer(),
             Box::new(move || Ok(wrong_revision_authority)),
         )
@@ -4179,6 +4453,7 @@ mod tests {
         let stale_execution = UnqualifiedFunctionalCanaryExecution::new(
             request,
             observer(),
+            admitted_report_binding(request),
             unused_report_installer(),
             Box::new(move || Ok(stale_authority)),
         )
@@ -4211,6 +4486,7 @@ mod tests {
         let error = match UnqualifiedFunctionalCanaryExecution::new(
             request,
             observer,
+            admitted_report_binding(request),
             unused_report_installer(),
             scripted_engine_opener(request),
         ) {
@@ -4241,6 +4517,7 @@ mod tests {
         let error = match UnqualifiedFunctionalCanaryExecution::new(
             request,
             observer,
+            admitted_report_binding(request),
             unused_report_installer(),
             scripted_engine_opener(request),
         ) {
@@ -4304,6 +4581,7 @@ mod tests {
                 UnqualifiedFunctionalCanaryExecution::new(
                     &request,
                     observer,
+                    admitted_report_binding(&request),
                     unused_report_installer(),
                     scripted_engine_opener(&request),
                 )
@@ -4341,8 +4619,9 @@ mod tests {
 
         fn prepare_tproxy_local_output(
             &mut self,
-            request: &CanaryAttemptRequest,
+            execution: &mut UnqualifiedFunctionalCanaryExecution<'_>,
         ) -> Result<Self::Prepared, TproxyLocalOutputUnavailable> {
+            let request = execution.request();
             assert_eq!(
                 request
                     .pre_binding()

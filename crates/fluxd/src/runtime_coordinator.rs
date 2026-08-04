@@ -16,10 +16,10 @@ use crate::engine_supervisor::{
     EngineChildAuthorityErrorKind,
 };
 use crate::functional_canary::{
-    ActiveCanaryGenerationBinding, CanaryAddressFamilies, CanaryAttemptBinding,
-    CanaryAttemptRequest, CanaryAttemptSocketObserverSession, CanaryCounterDeltaBounds,
-    CanaryDeadline, CanaryEngineBinding, CanaryEnvironmentBinding, CanaryNonce,
-    FunctionalCanaryDisposition, FunctionalCanaryError, FunctionalCanaryGateMode,
+    ActiveCanaryGenerationBinding, AdmittedSupervisedDeliveryReportBinding, CanaryAddressFamilies,
+    CanaryAttemptBinding, CanaryAttemptRequest, CanaryAttemptSocketObserverSession,
+    CanaryCounterDeltaBounds, CanaryDeadline, CanaryEngineBinding, CanaryEnvironmentBinding,
+    CanaryNonce, FunctionalCanaryDisposition, FunctionalCanaryError, FunctionalCanaryGateMode,
     InstalledSupervisedDeliveryReportProducer, PreparedCanaryGenerationBinding,
     SupervisedDeliveryReportEngineHandoff, SupervisedDeliveryReportHandoffError,
     UnqualifiedFunctionalCanaryExecution, UnqualifiedFunctionalCanaryExecutor,
@@ -2468,6 +2468,27 @@ where
                 })?;
         let expected_engine = request.pre_binding().engine().engine();
         let expected_snapshot_revision = request.pre_binding().engine().engine_snapshot_revision();
+        let report_contract = generation.supervised_delivery_report().ok_or_else(|| {
+            ControlError::runtime(
+                "bind admitted supervised-report capability",
+                io::Error::other(
+                    "required functional-canary Generation lost its sealed report contract",
+                ),
+                "detach capture before preparing a fresh admitted Generation",
+            )
+        })?;
+        let admitted_supervised_report = AdmittedSupervisedDeliveryReportBinding::new(
+            generation.spec.artifacts(),
+            generation.engine_profile_revision(),
+            report_contract,
+        )
+        .map_err(|source| {
+            ControlError::runtime(
+                "bind admitted supervised-report capability",
+                io::Error::other(source),
+                "detach capture before preparing a fresh admitted Generation",
+            )
+        })?;
         let report_engine = &self.engine;
         let report_request = &request;
         let report_spec = &generation.spec;
@@ -2490,6 +2511,7 @@ where
         let execution_input = UnqualifiedFunctionalCanaryExecution::new(
             &request,
             socket_observer,
+            admitted_supervised_report,
             install_supervised_report,
             open_engine_child,
         )

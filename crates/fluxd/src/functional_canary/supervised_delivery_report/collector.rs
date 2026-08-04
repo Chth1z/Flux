@@ -9,11 +9,12 @@ use flux_platform::internal::SingBoxChild;
 use flux_platform::{PeerCredentials, PlatformError, SeqpacketConnection, SeqpacketReceive};
 
 #[cfg(test)]
-use super::SupervisedDeliveryReportSchemaV2FixtureAuthority;
+use super::EngineCapabilityProfile;
 use super::{
-    CompletedSupervisedDeliveryReport, SupervisedDeliveryReportBindError,
-    SupervisedDeliveryReportDatagram, SupervisedDeliveryReportError,
-    SupervisedDeliveryReportParser, SupervisedDeliveryReportParserAuthority,
+    AdmittedSupervisedDeliveryReportBinding, CompletedSupervisedDeliveryReport,
+    SupervisedDeliveryReportBindError, SupervisedDeliveryReportDatagram,
+    SupervisedDeliveryReportError, SupervisedDeliveryReportParser,
+    SupervisedDeliveryReportParserAuthority,
 };
 use crate::OwnedEngineIdentity;
 use crate::functional_canary::{
@@ -54,9 +55,8 @@ use crate::generation_engine_config::{
     ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_SCHEMA_VERSION_FIELD,
     ENGINE_SUPERVISED_DELIVERY_REPORT_HANDOFF_TPROXY_BACKEND,
     ENGINE_SUPERVISED_DELIVERY_REPORT_MAX_FRAME_BYTES,
-    ENGINE_SUPERVISED_DELIVERY_REPORT_SCHEMA_VERSION, EngineCapabilityProfile,
-    EngineCapabilityProfileRevision, EngineSupervisedDeliveryReportWireCodec,
-    EngineSupervisedDeliveryReportWireField,
+    ENGINE_SUPERVISED_DELIVERY_REPORT_SCHEMA_VERSION, EngineCapabilityProfileRevision,
+    EngineSupervisedDeliveryReportWireCodec, EngineSupervisedDeliveryReportWireField,
 };
 
 #[derive(Debug)]
@@ -239,24 +239,34 @@ static NEXT_SUPERVISED_DELIVERY_REPORT_OPENING_ID: AtomicU64 = AtomicU64::new(1)
 
 /// Single-use authority for opening the report object named by one immutable attempt.
 ///
-/// Production construction remains deliberately unavailable until the prepared driver owns an
-/// authoritative report producer. The test constructor models that future consumed authority.
+/// Production construction accepts only a Generation-admitted artifact/revision/contract binding
+/// that matches the immutable request. Tests build the same binding from their exact profile.
 #[must_use = "the report-object prebind authority must be consumed exactly once"]
 pub(in crate::functional_canary) struct SupervisedDeliveryReportPrebindAuthority {
-    profile: EngineCapabilityProfile,
+    admitted: AdmittedSupervisedDeliveryReportBinding,
     request: CanaryAttemptRequest,
 }
 
 impl SupervisedDeliveryReportPrebindAuthority {
+    pub(in crate::functional_canary) fn admitted(
+        admitted: AdmittedSupervisedDeliveryReportBinding,
+        request: &CanaryAttemptRequest,
+    ) -> Result<Self, SupervisedDeliveryReportBindError> {
+        admitted.validate_for(request)?;
+        Ok(Self {
+            admitted,
+            request: request.clone(),
+        })
+    }
+
     #[cfg(test)]
     pub(in crate::functional_canary) fn fixture(
         profile: &EngineCapabilityProfile,
         request: &CanaryAttemptRequest,
     ) -> Self {
-        Self {
-            profile: profile.clone(),
-            request: request.clone(),
-        }
+        let admitted = AdmittedSupervisedDeliveryReportBinding::from_profile(profile)
+            .expect("fixture profile declares the canonical report contract");
+        Self::admitted(admitted, request).expect("fixture profile matches the immutable request")
     }
 }
 
@@ -371,6 +381,19 @@ impl SupervisedDeliveryReportEngineHandoff {
         encode_engine_handoff_frame(&self.binding)
     }
 
+    #[cfg(test)]
+    pub(in crate::functional_canary) fn into_installed_fixture(
+        self,
+    ) -> InstalledSupervisedDeliveryReportProducer {
+        let child = self.binding.request().pre_binding().engine().engine();
+        let Self {
+            connection,
+            binding,
+        } = self;
+        drop(connection);
+        InstalledSupervisedDeliveryReportProducer { binding, child }
+    }
+
     pub(crate) fn install_into(
         self,
         child: &SingBoxChild,
@@ -443,6 +466,16 @@ impl InstalledSupervisedDeliveryReportProducer {
     #[must_use]
     pub(crate) fn profile_revision(&self) -> EngineCapabilityProfileRevision {
         self.binding.profile_revision()
+    }
+
+    pub(in crate::functional_canary) fn into_client_retirement_authority(
+        self,
+        retirement: CanaryProcessRetirementEvidence,
+    ) -> SupervisedDeliveryReportClientRetirementAuthority {
+        SupervisedDeliveryReportClientRetirementAuthority {
+            binding: self.binding,
+            retirement,
+        }
     }
 }
 
@@ -637,10 +670,10 @@ pub(in crate::functional_canary) fn prebind<C>(
 where
     C: FnMut() -> Instant,
 {
-    let SupervisedDeliveryReportPrebindAuthority { profile, request } = authority;
-    let parser = SupervisedDeliveryReportParser::bind(
+    let SupervisedDeliveryReportPrebindAuthority { admitted, request } = authority;
+    let parser = SupervisedDeliveryReportParser::bind_admitted(
         SupervisedDeliveryReportParserAuthority::collector(),
-        &profile,
+        admitted,
         &request,
     )
     .map_err(SupervisedDeliveryReportCollectorError::Bind)?;
@@ -651,7 +684,7 @@ where
             .environment()
             .attempt_objects()
             .listener_delivery_report(),
-        profile_revision: profile.revision(),
+        profile_revision: admitted.profile_revision,
         request,
     });
     let (producer, receiver) =
@@ -935,10 +968,10 @@ impl<C> DrainedSupervisedDeliveryReportCollector<C> {
 
 /// Non-cloneable request-bound proof that the exact attempt client was parent-reaped.
 ///
-/// Production construction remains unavailable until the prepared driver returns its retained
-/// child-origin proof. Tests can model that future authority without opening production code.
+/// Production construction consumes the installed report proof together with the prepared
+/// driver's exact reaped client. Tests can model the same single-use transition privately.
 #[must_use = "client retirement authority must be consumed by receiver retirement"]
-pub(super) struct SupervisedDeliveryReportClientRetirementAuthority {
+pub(in crate::functional_canary) struct SupervisedDeliveryReportClientRetirementAuthority {
     binding: Arc<SupervisedDeliveryReportTransportBinding>,
     retirement: CanaryProcessRetirementEvidence,
 }
@@ -1391,7 +1424,7 @@ fn validate_client_retirement(
 }
 
 /// Completed report plus cleanup evidence minted by consuming its receiver resource.
-pub(super) struct RetiredSupervisedDeliveryReport {
+pub(in crate::functional_canary) struct RetiredSupervisedDeliveryReport {
     report: CompletedSupervisedDeliveryReport,
     binding: Arc<SupervisedDeliveryReportTransportBinding>,
     client_retirement: CanaryProcessRetirementEvidence,
@@ -1400,12 +1433,89 @@ pub(super) struct RetiredSupervisedDeliveryReport {
 
 impl RetiredSupervisedDeliveryReport {
     #[must_use]
+    pub(in crate::functional_canary) fn request(&self) -> &CanaryAttemptRequest {
+        self.binding.request()
+    }
+
+    pub(in crate::functional_canary) fn take_listener_delivery(
+        &mut self,
+        flow: crate::functional_canary::CanaryFlow,
+        listener: crate::functional_canary::CanaryTproxyListenerSocketIdentity,
+    ) -> Result<
+        Option<crate::functional_canary::UnqualifiedCanaryInboundListenerDeliveryEvidence>,
+        SupervisedDeliveryReportError,
+    > {
+        self.report
+            .take_event(flow)
+            .map(|event| event.into_listener_delivery(listener))
+            .transpose()
+    }
+
+    pub(in crate::functional_canary) fn into_capture_authority(
+        self,
+    ) -> Result<RetiredSupervisedDeliveryReportCaptureAuthority, SupervisedDeliveryReportError>
+    {
+        if self.report.events.iter().any(Option::is_some) {
+            return Err(SupervisedDeliveryReportError::UnconsumedDeliveryEvents);
+        }
+        Ok(RetiredSupervisedDeliveryReportCaptureAuthority {
+            terminal_observed_at: self.report.terminal_observed_at(),
+            eof_observed_at: self.report.eof_observed_at(),
+            binding: self.binding,
+            client_retirement: self.client_retirement,
+            report_cleanup: self.report_cleanup,
+        })
+    }
+
+    #[must_use]
     pub(super) const fn client_retirement(&self) -> CanaryProcessRetirementEvidence {
         self.client_retirement
     }
 
     #[must_use]
     pub(super) const fn report_cleanup(&self) -> CanaryListenerDeliveryReportCleanupEvidence {
+        self.report_cleanup
+    }
+}
+
+/// Single-use proof that every authenticated delivery event was projected and the report receiver
+/// retired after the exact client. This type is the only production input that can inhabit the
+/// supervised-report capture receipt.
+pub(in crate::functional_canary) struct RetiredSupervisedDeliveryReportCaptureAuthority {
+    binding: Arc<SupervisedDeliveryReportTransportBinding>,
+    terminal_observed_at: Instant,
+    eof_observed_at: Instant,
+    client_retirement: CanaryProcessRetirementEvidence,
+    report_cleanup: CanaryListenerDeliveryReportCleanupEvidence,
+}
+
+impl RetiredSupervisedDeliveryReportCaptureAuthority {
+    #[must_use]
+    pub(in crate::functional_canary) fn request(&self) -> &CanaryAttemptRequest {
+        self.binding.request()
+    }
+
+    #[must_use]
+    pub(in crate::functional_canary) const fn terminal_observed_at(&self) -> Instant {
+        self.terminal_observed_at
+    }
+
+    #[must_use]
+    pub(in crate::functional_canary) const fn eof_observed_at(&self) -> Instant {
+        self.eof_observed_at
+    }
+
+    #[must_use]
+    pub(in crate::functional_canary) const fn client_retirement(
+        &self,
+    ) -> CanaryProcessRetirementEvidence {
+        self.client_retirement
+    }
+
+    #[must_use]
+    pub(in crate::functional_canary) const fn report_cleanup(
+        &self,
+    ) -> CanaryListenerDeliveryReportCleanupEvidence {
         self.report_cleanup
     }
 }
@@ -1500,7 +1610,6 @@ pub(super) fn validate_schema_v2_fixture(
         return Err(SupervisedDeliveryReportFixtureError::TransportBindingMismatch);
     }
 
-    let authority = SupervisedDeliveryReportSchemaV2FixtureAuthority::fixture();
     for flow in CanaryFlow::ALL {
         let parsed = report.take_event(flow);
         if !request.requires_flow(flow) {
@@ -1531,7 +1640,7 @@ pub(super) fn validate_schema_v2_fixture(
         };
         flow_evidence.inbound_listener_delivery = Some(
             parsed
-                .into_schema_v2_fixture(authority, listener)
+                .into_listener_delivery(listener)
                 .map_err(SupervisedDeliveryReportFixtureError::InvalidReport)?,
         );
     }

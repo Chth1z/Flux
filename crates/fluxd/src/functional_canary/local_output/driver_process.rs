@@ -11,8 +11,10 @@ use flux_platform::{
 
 use super::super::{
     CANARY_PEER_SERVER_SLOTS, CanaryProcessIdentity, CanaryProcessRetirementEvidence,
+    InstalledSupervisedDeliveryReportProducer,
 };
 use super::insert_distinct_role_key;
+use crate::functional_canary::supervised_delivery_report::collector::SupervisedDeliveryReportClientRetirementAuthority;
 use crate::process_authority::{ProcessAuthorityOpeningId, ProcessAuthorityOpeningIdExhausted};
 
 const CHILD_REAP_POLL_INTERVAL: Duration = Duration::from_millis(1);
@@ -196,6 +198,18 @@ pub(super) struct ReapedDriverChild {
 }
 
 impl ReapedDriverChild {
+    pub(super) fn bind_supervised_report_retirement(
+        self,
+        installed: InstalledSupervisedDeliveryReportProducer,
+    ) -> Result<
+        (Self, SupervisedDeliveryReportClientRetirementAuthority),
+        DriverProcessAuthorityError,
+    > {
+        require_role(self.role, DriverProcessRole::Client)?;
+        let authority = installed.into_client_retirement_authority(self.retirement);
+        Ok((self, authority))
+    }
+
     pub(super) fn verify_post_reap_exit(
         self,
         exclusive_deadline: Instant,
@@ -626,10 +640,15 @@ mod tests {
         TproxyLocalOutputProcessOwnershipAuthority, TproxyLocalOutputProcessOwnershipReceipt,
         TproxyLocalOutputProcessOwnershipReceiptError,
     };
+    use crate::functional_canary::supervised_delivery_report::{
+        AdmittedSupervisedDeliveryReportBinding, collector,
+    };
     use crate::functional_canary::tests::Fixture;
     use crate::functional_canary::{
-        CANARY_PEER_SERVER_SLOTS, CanaryProcessIdentity, CanaryProcessRetirementEvidence,
+        CANARY_PEER_SERVER_SLOTS, CanaryAttemptRequest, CanaryProcessIdentity,
+        CanaryProcessRetirementEvidence, InstalledSupervisedDeliveryReportProducer,
     };
+    use crate::generation_engine_config::EngineSupervisedDeliveryReportContract;
     use flux_platform::ProcessHandle;
 
     fn sleeping_child(role: DriverProcessRole) -> RetainedDriverChild {
@@ -653,6 +672,49 @@ mod tests {
                 .expect("terminate and reap peer fixture")
         });
         (client, peers)
+    }
+
+    fn installed_report_fixture(
+        request: &CanaryAttemptRequest,
+    ) -> InstalledSupervisedDeliveryReportProducer {
+        let engine = request.pre_binding().engine();
+        let admitted = AdmittedSupervisedDeliveryReportBinding::new(
+            engine.artifacts(),
+            engine.engine_profile_revision(),
+            EngineSupervisedDeliveryReportContract::schema_v1_fixture(),
+        )
+        .expect("fixture report binding is canonical");
+        let authority =
+            collector::SupervisedDeliveryReportPrebindAuthority::admitted(admitted, request)
+                .expect("fixture report binding matches the request");
+        let (producer, collector) =
+            collector::prebind(authority, Instant::now).expect("prebind installed-report fixture");
+        drop(collector);
+        producer.into_engine_handoff().into_installed_fixture()
+    }
+
+    #[test]
+    fn installed_report_proof_binds_only_a_reaped_client_role() {
+        let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let client = sleeping_child(DriverProcessRole::Client)
+            .terminate_and_reap(Instant::now(), deadline)
+            .expect("terminate and reap exact client fixture");
+        let peer = sleeping_child(DriverProcessRole::PeerServer { slot: 0 })
+            .terminate_and_reap(Instant::now(), deadline)
+            .expect("terminate and reap exact peer fixture");
+
+        let (_client, authority) = client
+            .bind_supervised_report_retirement(installed_report_fixture(fixture.request()))
+            .expect("reaped client consumes the installed report proof");
+        drop(authority);
+        assert!(matches!(
+            peer.bind_supervised_report_retirement(installed_report_fixture(fixture.request())),
+            Err(super::DriverProcessAuthorityError::RoleMismatch {
+                expected: DriverProcessRole::Client,
+                observed: DriverProcessRole::PeerServer { slot: 0 },
+            })
+        ));
     }
 
     #[test]

@@ -2577,7 +2577,6 @@ pub(crate) struct CanaryInetDiagListenerSnapshot {
 }
 
 impl CanaryInetDiagListenerSnapshot {
-    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     #[must_use]
     const fn new(
@@ -2663,7 +2662,6 @@ impl CanaryListenerSocketObservation {
         }
     }
 
-    #[cfg(test)]
     #[must_use]
     const fn from_complete_inet_diag_snapshot(
         authority: CanarySocketObserverAuthority,
@@ -2742,7 +2740,6 @@ pub(crate) struct CanaryTproxyListenerSocketIdentity {
 
 impl CanaryTproxyListenerSocketIdentity {
     #[allow(clippy::too_many_arguments)]
-    #[cfg(test)]
     #[must_use]
     const fn new(
         generation: GenerationId,
@@ -4848,6 +4845,9 @@ type SupervisedReportInstaller<'a> = Box<
 pub(crate) struct UnqualifiedFunctionalCanaryExecution<'a> {
     request: &'a CanaryAttemptRequest,
     socket_observer: CanaryAttemptSocketObserverSession,
+    supervised_report_prebind:
+        Option<supervised_delivery_report::collector::SupervisedDeliveryReportPrebindAuthority>,
+    supervised_report_prebound: bool,
     install_supervised_report: Option<SupervisedReportInstaller<'a>>,
     supervised_report_installed: bool,
     open_engine_child:
@@ -4858,6 +4858,7 @@ impl<'a> UnqualifiedFunctionalCanaryExecution<'a> {
     pub(crate) fn new(
         request: &'a CanaryAttemptRequest,
         socket_observer: CanaryAttemptSocketObserverSession,
+        supervised_report: AdmittedSupervisedDeliveryReportBinding,
         install_supervised_report: SupervisedReportInstaller<'a>,
         open_engine_child: Box<
             dyn FnOnce() -> Result<EngineChildAuthority, FunctionalCanaryError> + 'a,
@@ -4883,9 +4884,17 @@ impl<'a> UnqualifiedFunctionalCanaryExecution<'a> {
                 "attempt-owned socket observer deadline does not match the immutable request deadline",
             ));
         }
+        let supervised_report_prebind =
+            supervised_delivery_report::collector::SupervisedDeliveryReportPrebindAuthority::admitted(
+                supervised_report,
+                request,
+            )
+            .map_err(supervised_delivery_report_bind_error)?;
         Ok(Self {
             request,
             socket_observer,
+            supervised_report_prebind: Some(supervised_report_prebind),
+            supervised_report_prebound: false,
             install_supervised_report: Some(install_supervised_report),
             supervised_report_installed: false,
             open_engine_child,
@@ -4950,6 +4959,39 @@ impl<'a> UnqualifiedFunctionalCanaryExecution<'a> {
         Ok(installed)
     }
 
+    pub(in crate::functional_canary) fn prebind_supervised_delivery_report<C>(
+        &mut self,
+        clock: C,
+    ) -> Result<
+        (
+            supervised_delivery_report::collector::SupervisedDeliveryReportProducer,
+            supervised_delivery_report::collector::SupervisedDeliveryReportCollector<C>,
+        ),
+        FunctionalCanaryError,
+    >
+    where
+        C: FnMut() -> Instant,
+    {
+        let authority = self.supervised_report_prebind.take().ok_or_else(|| {
+            FunctionalCanaryError::new(
+                if self.supervised_report_prebound {
+                    CanaryErrorKind::CleanupUncertain
+                } else {
+                    CanaryErrorKind::AdapterFailure
+                },
+                if self.supervised_report_prebound {
+                    CanaryCleanupStatus::Uncertain
+                } else {
+                    CanaryCleanupStatus::NotRequired
+                },
+                "functional canary execution has no unused supervised-report prebind authority",
+            )
+        })?;
+        self.supervised_report_prebound = true;
+        supervised_delivery_report::collector::prebind(authority, clock)
+            .map_err(supervised_delivery_report_collector_error)
+    }
+
     pub(crate) fn into_parts(
         self,
     ) -> Result<
@@ -4960,6 +5002,13 @@ impl<'a> UnqualifiedFunctionalCanaryExecution<'a> {
         ),
         FunctionalCanaryError,
     > {
+        if self.supervised_report_prebound && !self.supervised_report_installed {
+            return Err(FunctionalCanaryError::new(
+                CanaryErrorKind::CleanupUncertain,
+                CanaryCleanupStatus::Uncertain,
+                "functional canary execution prebound a supervised report but did not install its producer",
+            ));
+        }
         let engine_child = (self.open_engine_child)()?;
         debug_assert_ne!(engine_child.opening_id().get(), 0);
         let expected_engine = self.request.pre_binding().engine();
@@ -4991,6 +5040,64 @@ impl<'a> UnqualifiedFunctionalCanaryExecution<'a> {
     }
 }
 
+fn supervised_delivery_report_bind_error(
+    source: SupervisedDeliveryReportBindError,
+) -> FunctionalCanaryError {
+    let kind = match source {
+        SupervisedDeliveryReportBindError::CapabilityUnavailable
+        | SupervisedDeliveryReportBindError::NonCanonicalContract => {
+            CanaryErrorKind::InvalidEvidence
+        }
+        SupervisedDeliveryReportBindError::ArtifactSetMismatch
+        | SupervisedDeliveryReportBindError::ProfileRevisionMismatch => {
+            CanaryErrorKind::IdentityChanged
+        }
+    };
+    FunctionalCanaryError::new(kind, CanaryCleanupStatus::NotRequired, &source.to_string())
+}
+
+fn supervised_delivery_report_collector_error(
+    source: supervised_delivery_report::collector::SupervisedDeliveryReportCollectorError,
+) -> FunctionalCanaryError {
+    use supervised_delivery_report::collector::SupervisedDeliveryReportCollectorError as Error;
+
+    let (kind, cleanup) = match &source {
+        Error::Bind(error) => return supervised_delivery_report_bind_error(*error),
+        Error::Transport(flux_platform::PlatformError::UnsupportedPlatform(_)) => (
+            CanaryErrorKind::Availability(CanaryAvailability::Unsupported),
+            CanaryCleanupStatus::NotRequired,
+        ),
+        Error::Transport(flux_platform::PlatformError::SystemCall { source, .. })
+            if source.kind() == std::io::ErrorKind::PermissionDenied =>
+        {
+            (
+                CanaryErrorKind::Availability(CanaryAvailability::Denied),
+                CanaryCleanupStatus::NotRequired,
+            )
+        }
+        Error::Transport(_) | Error::OpeningIdentityExhausted => (
+            CanaryErrorKind::AdapterFailure,
+            CanaryCleanupStatus::NotRequired,
+        ),
+        Error::DeadlineExpired => (CanaryErrorKind::TimedOut, CanaryCleanupStatus::Uncertain),
+        Error::InvalidReport(_) => (
+            CanaryErrorKind::InvalidEvidence,
+            CanaryCleanupStatus::Uncertain,
+        ),
+        Error::ProducerCredentialsMismatch { .. } => (
+            CanaryErrorKind::IdentityChanged,
+            CanaryCleanupStatus::Uncertain,
+        ),
+        Error::ClientRetirementAuthorityMismatch
+        | Error::InvalidClientRetirement
+        | Error::InvalidReceiverRetirement => (
+            CanaryErrorKind::CleanupUncertain,
+            CanaryCleanupStatus::Uncertain,
+        ),
+    };
+    FunctionalCanaryError::new(kind, cleanup, &source.to_string())
+}
+
 pub(crate) trait UnqualifiedFunctionalCanaryExecutor: Send + 'static {
     fn execute(
         &mut self,
@@ -5010,7 +5117,8 @@ pub(crate) mod local_output;
 mod supervised_delivery_report;
 use supervised_delivery_report::CanaryListenerDeliveryReportCleanupDisposition;
 pub(crate) use supervised_delivery_report::{
-    CanaryListenerDeliveryReportCleanupEvidence, InstalledSupervisedDeliveryReportProducer,
+    AdmittedSupervisedDeliveryReportBinding, CanaryListenerDeliveryReportCleanupEvidence,
+    InstalledSupervisedDeliveryReportProducer, SupervisedDeliveryReportBindError,
     SupervisedDeliveryReportEngineHandoff, SupervisedDeliveryReportHandoffError,
 };
 

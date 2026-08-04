@@ -4,19 +4,16 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::num::{NonZeroU16, NonZeroU64};
 use std::time::Instant;
 
+#[cfg(test)]
+use super::CanaryFlowTuple;
 use super::{
     CanaryAttemptObjectIdentity, CanaryAttemptRequest, CanaryFlow, CanaryFlowAddressFamily,
     CanaryFlowKind, CanaryFlowProtocol, CanaryInboundDeliveryAuthority, CanaryInboundDeliveryEvent,
     CanaryInboundPayloadDigest, CanaryInboundPayloadIdentity, CanaryInetDiagCookie,
     CanaryOriginalDestinationCmsg, CanaryProcFd, CanaryTproxyAcceptedSocketDelivery,
-    CanaryTproxyUdpRecvmsgDelivery, FUNCTIONAL_CANARY_FLOW_SLOTS,
+    CanaryTproxyListenerSocketIdentity, CanaryTproxyUdpRecvmsgDelivery,
+    FUNCTIONAL_CANARY_FLOW_SLOTS, UnqualifiedCanaryInboundListenerDeliveryEvidence,
 };
-#[cfg(test)]
-use super::{
-    CanaryFlowTuple, CanaryTproxyListenerSocketIdentity,
-    UnqualifiedCanaryInboundListenerDeliveryEvidence,
-};
-use crate::OwnedEngineIdentity;
 #[cfg(test)]
 use crate::generation_engine_config::ENGINE_SUPERVISED_DELIVERY_REPORT_TCP_FRAME_BYTES;
 use crate::generation_engine_config::{
@@ -79,12 +76,13 @@ use crate::generation_engine_config::{
     ENGINE_SUPERVISED_DELIVERY_REPORT_UDP_TRUNCATION_FLAGS_FIELD, EngineCapabilityProfile,
     EngineCapabilityProfileRevision,
     EngineSupervisedDeliveryReportAddressFamilyCode as AddressFamilyCode,
-    EngineSupervisedDeliveryReportFlowCode as FlowCode,
+    EngineSupervisedDeliveryReportContract, EngineSupervisedDeliveryReportFlowCode as FlowCode,
     EngineSupervisedDeliveryReportFrameKind as FrameKind,
     EngineSupervisedDeliveryReportPayloadKind as PayloadKind,
     EngineSupervisedDeliveryReportWireCodec as WireCodec,
     EngineSupervisedDeliveryReportWireField as WireField,
 };
+use crate::{EngineArtifactSetIdentity, OwnedEngineIdentity};
 
 pub(super) mod collector;
 pub(super) use collector::CanaryListenerDeliveryReportCleanupDisposition;
@@ -94,7 +92,7 @@ pub(crate) use collector::{
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum SupervisedDeliveryReportBindError {
+pub(crate) enum SupervisedDeliveryReportBindError {
     CapabilityUnavailable,
     NonCanonicalContract,
     ArtifactSetMismatch,
@@ -112,10 +110,67 @@ impl fmt::Display for SupervisedDeliveryReportBindError {
 
 impl Error for SupervisedDeliveryReportBindError {}
 
+/// Minimal admitted fact required to open one supervised report parser.
+///
+/// Generation assembly retains the full capability profile. Attempt execution carries only the
+/// exact artifact set, its content-derived profile revision, and the sealed canonical report
+/// contract.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AdmittedSupervisedDeliveryReportBinding {
+    artifacts: EngineArtifactSetIdentity,
+    profile_revision: EngineCapabilityProfileRevision,
+    contract: EngineSupervisedDeliveryReportContract,
+}
+
+impl AdmittedSupervisedDeliveryReportBinding {
+    pub(crate) fn new(
+        artifacts: EngineArtifactSetIdentity,
+        profile_revision: EngineCapabilityProfileRevision,
+        contract: EngineSupervisedDeliveryReportContract,
+    ) -> Result<Self, SupervisedDeliveryReportBindError> {
+        if contract.schema_version().get() != ENGINE_SUPERVISED_DELIVERY_REPORT_SCHEMA_VERSION
+            || !contract.is_canonical_schema_v1()
+            || usize::from(ENGINE_SUPERVISED_DELIVERY_REPORT_MAX_EVENTS)
+                != FUNCTIONAL_CANARY_FLOW_SLOTS
+        {
+            return Err(SupervisedDeliveryReportBindError::NonCanonicalContract);
+        }
+        Ok(Self {
+            artifacts,
+            profile_revision,
+            contract,
+        })
+    }
+
+    fn from_profile(
+        profile: &EngineCapabilityProfile,
+    ) -> Result<Self, SupervisedDeliveryReportBindError> {
+        let contract = profile
+            .supervised_delivery_report()
+            .ok_or(SupervisedDeliveryReportBindError::CapabilityUnavailable)?;
+        Self::new(profile.artifacts(), profile.revision(), contract)
+    }
+
+    fn validate_for(
+        self,
+        request: &CanaryAttemptRequest,
+    ) -> Result<(), SupervisedDeliveryReportBindError> {
+        let engine = request.pre_binding().engine();
+        if self.artifacts != engine.artifacts() {
+            return Err(SupervisedDeliveryReportBindError::ArtifactSetMismatch);
+        }
+        if self.profile_revision != engine.engine_profile_revision() {
+            return Err(SupervisedDeliveryReportBindError::ProfileRevisionMismatch);
+        }
+        debug_assert!(self.contract.is_canonical_schema_v1());
+        Ok(())
+    }
+}
+
 /// Sealed authority for opening one parser against an immutable request and engine profile.
 ///
-/// There is deliberately no production constructor in checkpoint 13d. The future collector will
-/// own the real attempt seqpacket and become the only production source of this authority.
+/// The private collector is the sole production constructor and consumes this authority while
+/// opening the attempt's exact seqpacket transport.
 #[derive(Debug)]
 pub(super) struct SupervisedDeliveryReportParserAuthority {
     _sealed: (),
@@ -175,6 +230,7 @@ pub(super) enum SupervisedDeliveryReportError {
     PostTerminalFrame,
     PrematureEof,
     ObservationTimeInvalid,
+    UnconsumedDeliveryEvents,
 }
 
 impl fmt::Display for SupervisedDeliveryReportError {
@@ -222,24 +278,9 @@ pub(super) struct ParsedSupervisedDeliveryEvent {
     transport: ParsedSupervisedDeliveryTransport,
 }
 
-#[cfg(test)]
-#[derive(Clone, Copy, Debug)]
-pub(super) struct SupervisedDeliveryReportSchemaV2FixtureAuthority {
-    _sealed: (),
-}
-
-#[cfg(test)]
-impl SupervisedDeliveryReportSchemaV2FixtureAuthority {
-    const fn fixture() -> Self {
-        Self { _sealed: () }
-    }
-}
-
-#[cfg(test)]
 impl ParsedSupervisedDeliveryEvent {
-    fn into_schema_v2_fixture(
+    fn into_listener_delivery(
         self,
-        _authority: SupervisedDeliveryReportSchemaV2FixtureAuthority,
         listener: CanaryTproxyListenerSocketIdentity,
     ) -> Result<UnqualifiedCanaryInboundListenerDeliveryEvidence, SupervisedDeliveryReportError>
     {
@@ -290,27 +331,24 @@ pub(super) struct SupervisedDeliveryReportParser {
 
 impl SupervisedDeliveryReportParser {
     pub(super) fn bind(
-        _authority: SupervisedDeliveryReportParserAuthority,
+        authority: SupervisedDeliveryReportParserAuthority,
         profile: &EngineCapabilityProfile,
         request: &CanaryAttemptRequest,
     ) -> Result<Self, SupervisedDeliveryReportBindError> {
-        let contract = profile
-            .supervised_delivery_report()
-            .ok_or(SupervisedDeliveryReportBindError::CapabilityUnavailable)?;
-        if contract.schema_version().get() != ENGINE_SUPERVISED_DELIVERY_REPORT_SCHEMA_VERSION
-            || !contract.is_canonical_schema_v1()
-            || usize::from(ENGINE_SUPERVISED_DELIVERY_REPORT_MAX_EVENTS)
-                != FUNCTIONAL_CANARY_FLOW_SLOTS
-        {
-            return Err(SupervisedDeliveryReportBindError::NonCanonicalContract);
-        }
+        Self::bind_admitted(
+            authority,
+            AdmittedSupervisedDeliveryReportBinding::from_profile(profile)?,
+            request,
+        )
+    }
+
+    fn bind_admitted(
+        _authority: SupervisedDeliveryReportParserAuthority,
+        admitted: AdmittedSupervisedDeliveryReportBinding,
+        request: &CanaryAttemptRequest,
+    ) -> Result<Self, SupervisedDeliveryReportBindError> {
+        admitted.validate_for(request)?;
         let engine = request.pre_binding().engine();
-        if profile.artifacts() != engine.artifacts() {
-            return Err(SupervisedDeliveryReportBindError::ArtifactSetMismatch);
-        }
-        if profile.revision() != engine.engine_profile_revision() {
-            return Err(SupervisedDeliveryReportBindError::ProfileRevisionMismatch);
-        }
 
         let mut required_flows = [None; FUNCTIONAL_CANARY_FLOW_SLOTS];
         let mut required_flow_count = 0;
@@ -324,7 +362,7 @@ impl SupervisedDeliveryReportParser {
             binding: ParserBinding {
                 generation: engine.generation().get(),
                 engine: engine.engine(),
-                profile_revision: profile.revision(),
+                profile_revision: admitted.profile_revision,
                 report_object: request
                     .pre_binding()
                     .environment()
@@ -728,7 +766,6 @@ impl CompletedSupervisedDeliveryReport {
         self.eof_observed_at
     }
 
-    #[cfg(test)]
     fn take_event(&mut self, flow: CanaryFlow) -> Option<ParsedSupervisedDeliveryEvent> {
         self.events[flow.index()].take()
     }
@@ -1051,10 +1088,16 @@ mod tests {
     use super::*;
     #[cfg(target_os = "linux")]
     use crate::engine_supervisor::{
-        EngineCanaryReportHandoffError, EngineChildAuthorityError, EngineChildObservationErrorKind,
+        EngineCanaryReportHandoffError, EngineChildAuthority, EngineChildAuthorityError,
+        EngineChildObservationErrorKind,
     };
     #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
     use crate::functional_canary::CanaryFlow;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    use crate::functional_canary::local_output::{
+        TproxyLocalOutputCaptureProjectionError, TproxyLocalOutputCaptureReceipt,
+        listener_observer::ListenerObservations,
+    };
     use crate::functional_canary::tests::{Fixture, request_with_engine_profile_revision};
     use crate::functional_canary::{
         CanaryAddressFamilies, CanaryAttemptCredentialBinding,
@@ -2206,7 +2249,6 @@ esac
     fn execution_consumes_one_report_installer_and_opens_process_authority_independently() {
         let (context, mut supervisor) = running_supervisor_context();
         let request = request_for_ready_supervisor(&context, &supervisor, 29, 0x91);
-        let (handoff, collector) = prebind_supervisor_report(&context, &request);
         let (second_handoff, second_collector) = prebind_supervisor_report(&context, &request);
         let expected = request.pre_binding().engine();
         let socket_observer = CanaryAttemptSocketObserverSession::scripted(
@@ -2225,6 +2267,8 @@ esac
         let mut execution = UnqualifiedFunctionalCanaryExecution::new(
             &request,
             socket_observer,
+            AdmittedSupervisedDeliveryReportBinding::from_profile(&context.profile)
+                .expect("fixture report binding is canonical"),
             Box::new(move |handoff| {
                 report_supervisor
                     .install_canary_report_handoff(report_request, report_spec, handoff)
@@ -2242,8 +2286,19 @@ esac
         )
         .expect("bind exact retained-child execution");
 
+        let (producer, collector) = execution
+            .prebind_supervised_delivery_report(Instant::now as fn() -> Instant)
+            .expect("prebind the admitted report exactly once");
+        let prebind_error =
+            match execution.prebind_supervised_delivery_report(Instant::now as fn() -> Instant) {
+                Ok(_) => panic!("one execution cannot consume a second report prebind authority"),
+                Err(error) => error,
+            };
+        assert_eq!(prebind_error.kind(), CanaryErrorKind::CleanupUncertain);
+        assert_eq!(prebind_error.cleanup(), CanaryCleanupStatus::Uncertain);
+
         let installed = execution
-            .install_supervised_delivery_report(handoff)
+            .install_supervised_delivery_report(producer.into_engine_handoff())
             .expect("install one exact supervised-report producer");
         assert_eq!(installed.child(), expected.engine());
         assert_eq!(
@@ -2281,6 +2336,111 @@ esac
                 .kind(),
             EngineChildObservationErrorKind::ProcessHandle(ProcessHandleErrorKind::Exited),
         );
+    }
+
+    #[test]
+    fn admitted_report_prebind_rejects_artifact_and_profile_substitution() {
+        let context = Context::new(CanaryAddressFamilies::Ipv4Only);
+        let alternate = Context::with_script(
+            CanaryAddressFamilies::Ipv4Only,
+            br#"#!/bin/sh
+case "$1" in
+    version)
+        printf '%s\n' 'sing-box version 1.13.14'
+        ;;
+    check)
+        exit 0
+        ;;
+    *)
+        exit 64
+        ;;
+esac
+# Alternate artifact identity for substitution coverage.
+"#,
+        );
+        assert_ne!(
+            context.request.pre_binding().engine().artifacts(),
+            alternate.request.pre_binding().engine().artifacts(),
+        );
+        assert_ne!(context.profile.revision(), alternate.profile.revision());
+
+        let artifact_substitute = AdmittedSupervisedDeliveryReportBinding::new(
+            alternate.request.pre_binding().engine().artifacts(),
+            context.profile.revision(),
+            EngineSupervisedDeliveryReportContract::schema_v1_fixture(),
+        )
+        .expect("substitute still carries a canonical contract");
+        assert!(matches!(
+            collector::SupervisedDeliveryReportPrebindAuthority::admitted(
+                artifact_substitute,
+                &context.request,
+            ),
+            Err(SupervisedDeliveryReportBindError::ArtifactSetMismatch)
+        ));
+
+        let profile_substitute = AdmittedSupervisedDeliveryReportBinding::new(
+            context.request.pre_binding().engine().artifacts(),
+            alternate.profile.revision(),
+            EngineSupervisedDeliveryReportContract::schema_v1_fixture(),
+        )
+        .expect("substitute still carries a canonical contract");
+        assert!(matches!(
+            collector::SupervisedDeliveryReportPrebindAuthority::admitted(
+                profile_substitute,
+                &context.request,
+            ),
+            Err(SupervisedDeliveryReportBindError::ProfileRevisionMismatch)
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn prebound_report_without_installation_blocks_process_authority_opening() {
+        let (context, mut supervisor) = running_supervisor_context();
+        let request = request_for_ready_supervisor(&context, &supervisor, 29, 0x91);
+        let expected_engine = request.pre_binding().engine().engine();
+        let expected_revision = request.pre_binding().engine().engine_snapshot_revision();
+        let opened_at = request.deadline().started_at() + Duration::from_nanos(1);
+        let socket_observer = CanaryAttemptSocketObserverSession::scripted(
+            request
+                .pre_binding()
+                .environment()
+                .authority()
+                .socket_observer_binding(),
+            request.deadline(),
+        );
+        let process_opened = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let process_opened_by_closure = std::sync::Arc::clone(&process_opened);
+        let mut execution = UnqualifiedFunctionalCanaryExecution::new(
+            &request,
+            socket_observer,
+            AdmittedSupervisedDeliveryReportBinding::from_profile(&context.profile)
+                .expect("fixture report binding is canonical"),
+            Box::new(|_| panic!("this test deliberately omits report installation")),
+            Box::new(move || {
+                process_opened_by_closure.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(EngineChildAuthority::scripted(
+                    expected_engine,
+                    expected_revision,
+                    opened_at,
+                ))
+            }),
+        )
+        .expect("bind exact retained-child execution");
+        let (producer, collector) = execution
+            .prebind_supervised_delivery_report(Instant::now as fn() -> Instant)
+            .expect("prebind the admitted report");
+        drop(producer);
+
+        let error = match execution.into_parts() {
+            Ok(_) => panic!("a prebound report without installation cannot open process authority"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), CanaryErrorKind::CleanupUncertain);
+        assert_eq!(error.cleanup(), CanaryCleanupStatus::Uncertain);
+        assert!(!process_opened.load(std::sync::atomic::Ordering::SeqCst));
+        assert_report_endpoint_closed(&collector, "uninstalled prebound report");
+        stop_supervisor(&mut supervisor);
     }
 
     #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
@@ -2722,6 +2882,207 @@ esac
 
         collector::validate_schema_v2_fixture(retired, evidence, context.fixture.observed_at())
             .expect("whole retired report satisfies the existing schema-v2 model");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn retired_report_and_listener_snapshot_mint_the_exact_capture_receipt() {
+        for families in [
+            CanaryAddressFamilies::Ipv4Only,
+            CanaryAddressFamilies::Ipv4AndIpv6,
+        ] {
+            let (context, mut evidence, listeners, retired) = capture_projection_inputs(families);
+            clear_listener_deliveries(&mut evidence.flows);
+            let cleanup = evidence.cleanup.clone();
+
+            let receipt = TproxyLocalOutputCaptureReceipt::from_retired_supervised_report(
+                &context.request,
+                retired,
+                listeners,
+                &mut evidence.flows,
+                &cleanup,
+            )
+            .expect("retired authenticated report projects through the exact listener snapshot");
+
+            receipt
+                .validate_for(
+                    &context.request,
+                    &evidence.flows,
+                    evidence.completed_at,
+                    cleanup.client.quiesced_at,
+                )
+                .expect("production-shaped capture receipt satisfies its sealed contract");
+            for flow in CanaryFlow::ALL {
+                assert_eq!(
+                    evidence.flows.slots[flow.index()].is_some(),
+                    context.request.requires_flow(flow),
+                );
+                if context.request.requires_flow(flow) {
+                    assert!(
+                        evidence.flows.slots[flow.index()]
+                            .as_ref()
+                            .expect("required flow remains present")
+                            .inbound_listener_delivery
+                            .is_some()
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn capture_projection_rejects_request_prefill_and_cleanup_substitution() {
+        let (context, mut evidence, listeners, retired) =
+            capture_projection_inputs(CanaryAddressFamilies::Ipv4Only);
+        clear_listener_deliveries(&mut evidence.flows);
+        let mut request_substitute = context.request.clone();
+        request_substitute.nonce = CanaryNonce::from_bytes([0x72; FUNCTIONAL_CANARY_NONCE_BYTES]);
+        assert_eq!(
+            TproxyLocalOutputCaptureReceipt::from_retired_supervised_report(
+                &request_substitute,
+                retired,
+                listeners,
+                &mut evidence.flows,
+                &evidence.cleanup,
+            ),
+            Err(TproxyLocalOutputCaptureProjectionError::RequestMismatch)
+        );
+
+        let (context, mut evidence, listeners, retired) =
+            capture_projection_inputs(CanaryAddressFamilies::Ipv4Only);
+        assert_eq!(
+            TproxyLocalOutputCaptureReceipt::from_retired_supervised_report(
+                &context.request,
+                retired,
+                listeners,
+                &mut evidence.flows,
+                &evidence.cleanup,
+            ),
+            Err(
+                TproxyLocalOutputCaptureProjectionError::PrefilledListenerDelivery {
+                    flow: CanaryFlow::Ipv4TcpEcho,
+                }
+            )
+        );
+
+        let (context, mut evidence, listeners, retired) =
+            capture_projection_inputs(CanaryAddressFamilies::Ipv4Only);
+        clear_listener_deliveries(&mut evidence.flows);
+        let mut cleanup = evidence.cleanup.clone();
+        cleanup.client.reaped_at += Duration::from_nanos(1);
+        assert_eq!(
+            TproxyLocalOutputCaptureReceipt::from_retired_supervised_report(
+                &context.request,
+                retired,
+                listeners,
+                &mut evidence.flows,
+                &cleanup,
+            ),
+            Err(TproxyLocalOutputCaptureProjectionError::ClientRetirementMismatch)
+        );
+
+        let (context, mut evidence, listeners, retired) =
+            capture_projection_inputs(CanaryAddressFamilies::Ipv4Only);
+        clear_listener_deliveries(&mut evidence.flows);
+        let mut cleanup = evidence.cleanup.clone();
+        cleanup.listener_delivery_report =
+            CanaryListenerDeliveryReportCleanupEvidence::verified_never_created(
+                context
+                    .request
+                    .pre_binding()
+                    .environment()
+                    .attempt_objects()
+                    .listener_delivery_report(),
+                context.request.deadline().started_at() + Duration::from_millis(123),
+            );
+        assert_eq!(
+            TproxyLocalOutputCaptureReceipt::from_retired_supervised_report(
+                &context.request,
+                retired,
+                listeners,
+                &mut evidence.flows,
+                &cleanup,
+            ),
+            Err(TproxyLocalOutputCaptureProjectionError::ReportCleanupMismatch)
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn capture_projection_rejects_missing_or_substituted_listener_and_report_events() {
+        let (context, mut evidence, mut listeners, retired) =
+            capture_projection_inputs(CanaryAddressFamilies::Ipv4Only);
+        clear_listener_deliveries(&mut evidence.flows);
+        listeners.remove_role_fixture(CanaryFlow::Ipv4TcpEcho);
+        assert_eq!(
+            TproxyLocalOutputCaptureReceipt::from_retired_supervised_report(
+                &context.request,
+                retired,
+                listeners,
+                &mut evidence.flows,
+                &evidence.cleanup,
+            ),
+            Err(
+                TproxyLocalOutputCaptureProjectionError::MissingListenerRole {
+                    flow: CanaryFlow::Ipv4TcpEcho,
+                }
+            )
+        );
+
+        let (context, mut evidence, mut listeners, retired) =
+            capture_projection_inputs(CanaryAddressFamilies::Ipv4Only);
+        clear_listener_deliveries(&mut evidence.flows);
+        listeners.substitute_role_fixture(CanaryFlow::Ipv4TcpEcho, CanaryFlow::Ipv4UdpEcho);
+        assert_eq!(
+            TproxyLocalOutputCaptureReceipt::from_retired_supervised_report(
+                &context.request,
+                retired,
+                listeners,
+                &mut evidence.flows,
+                &evidence.cleanup,
+            ),
+            Err(TproxyLocalOutputCaptureProjectionError::InvalidReport(
+                SupervisedDeliveryReportError::FlowTransportMismatch,
+            ))
+        );
+
+        let (context, mut evidence, listeners, mut retired) =
+            capture_projection_inputs(CanaryAddressFamilies::Ipv4Only);
+        let listener = listener_from_flow(&evidence, CanaryFlow::Ipv4TcpEcho);
+        assert!(
+            retired
+                .take_listener_delivery(CanaryFlow::Ipv4TcpEcho, listener)
+                .expect("consume one valid report event")
+                .is_some()
+        );
+        clear_listener_deliveries(&mut evidence.flows);
+        assert_eq!(
+            TproxyLocalOutputCaptureReceipt::from_retired_supervised_report(
+                &context.request,
+                retired,
+                listeners,
+                &mut evidence.flows,
+                &evidence.cleanup,
+            ),
+            Err(
+                TproxyLocalOutputCaptureProjectionError::MissingReportEvent {
+                    flow: CanaryFlow::Ipv4TcpEcho,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn retired_report_rejects_unconsumed_delivery_events() {
+        let context = Context::new(CanaryAddressFamilies::Ipv4Only);
+        let evidence = context.evidence();
+        let retired = retire_complete_report(&context, &evidence);
+
+        assert!(matches!(
+            retired.into_capture_authority(),
+            Err(SupervisedDeliveryReportError::UnconsumedDeliveryEvents)
+        ));
     }
 
     #[test]
@@ -3816,6 +4177,69 @@ esac
         }
         drop(producer);
         collector.drain().expect("drain report collector")
+    }
+
+    fn retire_complete_report(
+        context: &Context,
+        evidence: &super::super::UnqualifiedCanaryGateEvidence,
+    ) -> collector::RetiredSupervisedDeliveryReport {
+        let started_at = context.request.deadline().started_at();
+        let drained = drain_report_collector(
+            context,
+            evidence,
+            started_at + Duration::from_millis(119),
+            started_at + Duration::from_millis(123),
+        );
+        let authority = client_retirement_authority(drained.binding(), evidence.cleanup.client);
+        drained
+            .retire_after_client(authority)
+            .expect("retire complete report after the exact client")
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn capture_projection_inputs(
+        families: CanaryAddressFamilies,
+    ) -> (
+        Context,
+        super::super::UnqualifiedCanaryGateEvidence,
+        ListenerObservations,
+        collector::RetiredSupervisedDeliveryReport,
+    ) {
+        let context = Context::new(families);
+        let evidence = context.evidence();
+        let listeners = ListenerObservations::fixture_from_flows(&context.request, &evidence.flows);
+        let retired = retire_complete_report(&context, &evidence);
+        (context, evidence, listeners, retired)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn clear_listener_deliveries(flows: &mut super::super::UnqualifiedCanaryFlowEvidenceSlots) {
+        for flow in flows.slots.iter_mut().flatten() {
+            flow.inbound_listener_delivery = None;
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn listener_from_flow(
+        evidence: &super::super::UnqualifiedCanaryGateEvidence,
+        flow: CanaryFlow,
+    ) -> CanaryTproxyListenerSocketIdentity {
+        match evidence.flows.slots[flow.index()]
+            .as_ref()
+            .expect("fixture contains the requested flow")
+            .inbound_listener_delivery
+            .as_ref()
+            .expect("fixture contains listener delivery")
+        {
+            UnqualifiedCanaryInboundListenerDeliveryEvidence::TproxyTcp { listener, .. }
+            | UnqualifiedCanaryInboundListenerDeliveryEvidence::TproxyUdp { listener, .. } => {
+                listener.clone()
+            }
+            UnqualifiedCanaryInboundListenerDeliveryEvidence::Redirect
+            | UnqualifiedCanaryInboundListenerDeliveryEvidence::Dnat => {
+                panic!("fixture listener delivery must use TPROXY")
+            }
+        }
     }
 
     fn assert_first_error(

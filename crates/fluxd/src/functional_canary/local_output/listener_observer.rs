@@ -1,8 +1,8 @@
-//! Test-only authoritative listener observation for the local-OUTPUT canary.
+//! Authoritative listener observation for the local-OUTPUT canary.
 //!
-//! The packaged adapter remains uninhabited. This module exercises the exact
-//! request/session/snapshot seam that a future device-qualified driver must
-//! use, without exposing a production constructor for positive evidence.
+//! This module consumes the exact request-owned INET_DIAG session and returns
+//! only correlated transparent-listener identities. It does not mint capture
+//! evidence or expose a public constructor.
 
 use std::net::SocketAddr;
 use std::num::NonZeroU64;
@@ -13,15 +13,114 @@ use flux_platform::socket_diagnostics::{
 
 use super::super::{
     CANARY_LISTENER_ROLE_SLOTS, CanaryAttemptRequest, CanaryAttemptSocketObserverSession,
-    CanaryCleanupStatus, CanaryErrorKind, CanaryFlowAddressFamily, CanaryFlowProtocol,
-    CanaryInetDiagCookie, CanaryInetDiagListenerSnapshot, CanaryListenerObservationLoss,
-    CanaryListenerRole, CanaryListenerSocketObservation, CanaryProcFd,
-    CanarySocketObserverAuthority, CanaryTproxyListenerSocketIdentity, FunctionalCanaryError,
+    CanaryCleanupStatus, CanaryErrorKind, CanaryFlow, CanaryFlowAddressFamily, CanaryFlowProtocol,
+    CanaryInetDiagCookie, CanaryInetDiagListenerSnapshot, CanaryListenerRole,
+    CanaryListenerSocketObservation, CanaryProcFd, CanarySocketObserverAuthority,
+    CanaryTproxyListenerSocketIdentity, FunctionalCanaryError,
+};
+#[cfg(test)]
+use super::super::{
+    CanaryListenerObservationLoss, UnqualifiedCanaryFlowEvidenceSlots,
+    UnqualifiedCanaryInboundListenerDeliveryEvidence,
 };
 
 /// Fixed listener role order: IPv4 TCP, IPv4 UDP, IPv6 TCP, IPv6 UDP.
 pub(super) type ListenerObservationSlots =
     [Option<CanaryTproxyListenerSocketIdentity>; CANARY_LISTENER_ROLE_SLOTS];
+
+/// One complete listener snapshot with its exact role projection.
+pub(in crate::functional_canary) struct ListenerObservations {
+    snapshot: CanaryInetDiagListenerSnapshot,
+    slots: ListenerObservationSlots,
+}
+
+impl ListenerObservations {
+    #[must_use]
+    pub(super) const fn started_at(&self) -> std::time::Instant {
+        self.snapshot.started_at
+    }
+
+    #[must_use]
+    pub(super) const fn completed_at(&self) -> std::time::Instant {
+        self.snapshot.completed_at
+    }
+
+    #[must_use]
+    pub(super) fn listener_for(
+        &self,
+        flow: CanaryFlow,
+    ) -> Option<&CanaryTproxyListenerSocketIdentity> {
+        self.slots[flow.listener_role().index()].as_ref()
+    }
+
+    #[cfg(test)]
+    pub(in crate::functional_canary) fn fixture_from_flows(
+        request: &CanaryAttemptRequest,
+        flows: &UnqualifiedCanaryFlowEvidenceSlots,
+    ) -> Self {
+        let mut snapshot = None;
+        let mut slots: ListenerObservationSlots = std::array::from_fn(|_| None);
+        for flow in CanaryFlow::ALL {
+            if !request.requires_flow(flow) {
+                continue;
+            }
+            let evidence = flows.slots[flow.index()]
+                .as_ref()
+                .expect("fixture contains every required flow");
+            let listener = match evidence
+                .inbound_listener_delivery
+                .as_ref()
+                .expect("fixture contains exact listener evidence")
+            {
+                UnqualifiedCanaryInboundListenerDeliveryEvidence::TproxyTcp {
+                    listener, ..
+                }
+                | UnqualifiedCanaryInboundListenerDeliveryEvidence::TproxyUdp {
+                    listener, ..
+                } => listener,
+                UnqualifiedCanaryInboundListenerDeliveryEvidence::Redirect
+                | UnqualifiedCanaryInboundListenerDeliveryEvidence::Dnat => {
+                    panic!("listener fixture requires TPROXY evidence")
+                }
+            };
+            let CanaryListenerObservationLoss::CompleteInetDiagSnapshot(observed_snapshot) =
+                listener.observation.loss
+            else {
+                panic!("listener fixture requires complete INET_DIAG evidence")
+            };
+            if let Some(expected) = snapshot {
+                assert_eq!(expected, observed_snapshot);
+            } else {
+                snapshot = Some(observed_snapshot);
+            }
+            let role_slot = &mut slots[flow.listener_role().index()];
+            if let Some(existing) = role_slot {
+                assert!(existing.same_socket_as(listener));
+            } else {
+                *role_slot = Some(listener.clone());
+            }
+        }
+        Self {
+            snapshot: snapshot.expect("fixture request requires IPv4 listener roles"),
+            slots,
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::functional_canary) fn remove_role_fixture(&mut self, flow: CanaryFlow) {
+        self.slots[flow.listener_role().index()] = None;
+    }
+
+    #[cfg(test)]
+    pub(in crate::functional_canary) fn substitute_role_fixture(
+        &mut self,
+        target: CanaryFlow,
+        substitute: CanaryFlow,
+    ) {
+        self.slots[target.listener_role().index()] =
+            self.slots[substitute.listener_role().index()].clone();
+    }
+}
 
 const ROLES: [CanaryListenerRole; CANARY_LISTENER_ROLE_SLOTS] = CanaryListenerRole::ALL;
 
@@ -31,7 +130,7 @@ const ROLES: [CanaryListenerRole; CANARY_LISTENER_ROLE_SLOTS] = CanaryListenerRo
 pub(super) fn collect(
     request: &CanaryAttemptRequest,
     observer: CanaryAttemptSocketObserverSession,
-) -> Result<(CanaryAttemptSocketObserverSession, ListenerObservationSlots), FunctionalCanaryError> {
+) -> Result<(CanaryAttemptSocketObserverSession, ListenerObservations), FunctionalCanaryError> {
     if observer.binding()
         != request
             .pre_binding()
@@ -82,7 +181,13 @@ pub(super) fn collect(
         snapshot_authority,
         correlations,
     )?;
-    Ok((observer, slots))
+    Ok((
+        observer,
+        ListenerObservations {
+            snapshot: snapshot_authority,
+            slots,
+        },
+    ))
 }
 
 fn assemble_listener_slots(

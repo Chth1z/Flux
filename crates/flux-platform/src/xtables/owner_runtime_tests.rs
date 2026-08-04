@@ -1,3 +1,4 @@
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::num::{NonZeroU16, NonZeroU32};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
@@ -20,7 +21,8 @@ use crate::xtables::owner_durable::DurableEvent;
 use crate::xtables::save::project_xtables_save;
 use crate::xtables::{
     XtablesCaptureLoweringRequest, XtablesCaptureNamespace, XtablesLocalOutputRoutingSpec,
-    XtablesLocalOutputRoutingTarget, XtablesTproxyTarget, lower_xtables_capture,
+    XtablesLocalOutputRoutingTarget, XtablesRestoreAction, XtablesRestoreCommandKind,
+    XtablesRestoreEntry, XtablesTproxyTarget, lower_xtables_capture,
 };
 
 use super::*;
@@ -70,6 +72,363 @@ fn zero_to_active_and_idempotent_active_use_one_exact_transaction() {
     );
     assert!(!report.changed());
     assert!(owner.adapter.operations.is_empty());
+}
+
+#[test]
+fn dual_stack_canary_selector_population_and_retirement_are_exact() {
+    const EXPECTED_IPV4: &str = concat!(
+        "*mangle\n",
+        "-F FLX4C0000000007\n",
+        "-A FLX4C0000000007 -d 198.18.0.2/32 -p tcp -m owner --uid-owner 2000 -m tcp --dport 10080 -m mark --mark 0x0/0x600000 -j MARK --set-xmark 0x200000/0x600000\n",
+        "-A FLX4C0000000007 -d 198.18.0.2/32 -p tcp -m owner --uid-owner 2000 -m tcp --dport 10080 -m mark --mark 0x200000/0x600000 -j ACCEPT\n",
+        "-A FLX4C0000000007 -d 198.18.0.2/32 -p tcp -m owner --uid-owner 2000 -m tcp --dport 10053 -m mark --mark 0x0/0x600000 -j MARK --set-xmark 0x200000/0x600000\n",
+        "-A FLX4C0000000007 -d 198.18.0.2/32 -p tcp -m owner --uid-owner 2000 -m tcp --dport 10053 -m mark --mark 0x200000/0x600000 -j ACCEPT\n",
+        "-A FLX4C0000000007 -d 198.18.0.2/32 -p udp -m owner --uid-owner 2000 -m udp --dport 10081 -m mark --mark 0x0/0x600000 -j MARK --set-xmark 0x200000/0x600000\n",
+        "-A FLX4C0000000007 -d 198.18.0.2/32 -p udp -m owner --uid-owner 2000 -m udp --dport 10081 -m mark --mark 0x200000/0x600000 -j ACCEPT\n",
+        "-A FLX4C0000000007 -d 198.18.0.2/32 -p udp -m owner --uid-owner 2000 -m udp --dport 10053 -m mark --mark 0x0/0x600000 -j MARK --set-xmark 0x200000/0x600000\n",
+        "-A FLX4C0000000007 -d 198.18.0.2/32 -p udp -m owner --uid-owner 2000 -m udp --dport 10053 -m mark --mark 0x200000/0x600000 -j ACCEPT\n",
+        "COMMIT\n",
+    );
+    const EXPECTED_IPV6: &str = concat!(
+        "*mangle\n",
+        "-F FLX6C0000000007\n",
+        "-A FLX6C0000000007 -d fd00::2/128 -p tcp -m owner --uid-owner 2000 -m tcp --dport 10080 -m mark --mark 0x0/0x600000 -j MARK --set-xmark 0x200000/0x600000\n",
+        "-A FLX6C0000000007 -d fd00::2/128 -p tcp -m owner --uid-owner 2000 -m tcp --dport 10080 -m mark --mark 0x200000/0x600000 -j ACCEPT\n",
+        "-A FLX6C0000000007 -d fd00::2/128 -p tcp -m owner --uid-owner 2000 -m tcp --dport 10053 -m mark --mark 0x0/0x600000 -j MARK --set-xmark 0x200000/0x600000\n",
+        "-A FLX6C0000000007 -d fd00::2/128 -p tcp -m owner --uid-owner 2000 -m tcp --dport 10053 -m mark --mark 0x200000/0x600000 -j ACCEPT\n",
+        "-A FLX6C0000000007 -d fd00::2/128 -p udp -m owner --uid-owner 2000 -m udp --dport 10081 -m mark --mark 0x0/0x600000 -j MARK --set-xmark 0x200000/0x600000\n",
+        "-A FLX6C0000000007 -d fd00::2/128 -p udp -m owner --uid-owner 2000 -m udp --dport 10081 -m mark --mark 0x200000/0x600000 -j ACCEPT\n",
+        "-A FLX6C0000000007 -d fd00::2/128 -p udp -m owner --uid-owner 2000 -m udp --dport 10053 -m mark --mark 0x0/0x600000 -j MARK --set-xmark 0x200000/0x600000\n",
+        "-A FLX6C0000000007 -d fd00::2/128 -p udp -m owner --uid-owner 2000 -m udp --dport 10053 -m mark --mark 0x200000/0x600000 -j ACCEPT\n",
+        "COMMIT\n",
+    );
+
+    let target = canary_target(7, AddressHostFamilySelection::DualStack);
+    let fixture = Fixture::new([target.clone()]);
+    let mut owner = fixture.owner();
+    owner
+        .converge(NativeXtablesDesiredTarget::Active(target.clone()))
+        .unwrap();
+    owner.adapter.operations.clear();
+
+    owner
+        .populate_canary_selector(&target, canary_selector(true))
+        .expect("populate exact dual-stack canary selector");
+
+    assert_eq!(
+        owner.adapter.operations,
+        [
+            "restore:ipv4:populate_canary:7",
+            "restore:ipv6:populate_canary:7",
+        ]
+    );
+    assert_eq!(
+        owner
+            .adapter
+            .family_state(XtablesRestoreFamily::Ipv4)
+            .canary_selector
+            .as_ref()
+            .unwrap()
+            .render_canonical()
+            .as_ref(),
+        EXPECTED_IPV4.as_bytes()
+    );
+    assert_eq!(
+        owner
+            .adapter
+            .family_state(XtablesRestoreFamily::Ipv6)
+            .canary_selector
+            .as_ref()
+            .unwrap()
+            .render_canonical()
+            .as_ref(),
+        EXPECTED_IPV6.as_bytes()
+    );
+    let active = owner.durable.load_journal().unwrap().unwrap();
+    assert_eq!(
+        NativeOwnerIntent::parse(active.owner_payload())
+            .unwrap()
+            .step,
+        NativeOwnerStep::CanaryActive
+    );
+    assert!(!owner.target_is_exact_active(&target).unwrap());
+
+    owner.adapter.operations.clear();
+    owner
+        .retire_canary_selector(&target, canary_selector(true))
+        .expect("retire exact dual-stack canary selector");
+
+    assert_eq!(
+        owner.adapter.operations,
+        [
+            "restore:ipv4:retire_canary:7",
+            "restore:ipv6:retire_canary:7",
+        ]
+    );
+    assert!(
+        owner
+            .adapter
+            .family_state(XtablesRestoreFamily::Ipv4)
+            .canary_selector
+            .is_none()
+    );
+    assert!(
+        owner
+            .adapter
+            .family_state(XtablesRestoreFamily::Ipv6)
+            .canary_selector
+            .is_none()
+    );
+    assert!(owner.target_is_exact_active(&target).unwrap());
+    let active = owner.durable.load_journal().unwrap().unwrap();
+    assert_eq!(
+        NativeOwnerIntent::parse(active.owner_payload())
+            .unwrap()
+            .step,
+        NativeOwnerStep::PublishActive
+    );
+}
+
+#[test]
+fn canary_selector_family_mismatch_is_rejected_before_any_write() {
+    for (families, selector) in [
+        (AddressHostFamilySelection::Ipv4, canary_selector(true)),
+        (
+            AddressHostFamilySelection::DualStack,
+            canary_selector(false),
+        ),
+    ] {
+        let target = canary_target(7, families);
+        let fixture = Fixture::new([target.clone()]);
+        let mut owner = fixture.owner();
+        owner
+            .converge(NativeXtablesDesiredTarget::Active(target.clone()))
+            .unwrap();
+        owner.adapter.operations.clear();
+        let write_count = owner.adapter.write_count;
+
+        let error = owner
+            .populate_canary_selector(&target, selector)
+            .expect_err("selector/target family mismatch must fail closed");
+
+        assert!(matches!(
+            error,
+            NativeXtablesOwnerError::InvalidCanarySelector(
+                "selector address families differ from the admitted target"
+            )
+        ));
+        assert_eq!(owner.adapter.write_count, write_count);
+        assert!(owner.adapter.operations.is_empty());
+        assert!(owner.target_is_exact_active(&target).unwrap());
+    }
+}
+
+#[test]
+fn interrupted_canary_session_flushes_reserved_chains_before_target_cleanup() {
+    let target = canary_target(7, AddressHostFamilySelection::DualStack);
+    let fixture = Fixture::new([target.clone()]);
+    let mut owner = fixture.owner();
+    owner
+        .converge(NativeXtablesDesiredTarget::Active(target.clone()))
+        .unwrap();
+    owner
+        .populate_canary_selector(&target, canary_selector(true))
+        .unwrap();
+    owner.adapter.operations.clear();
+    let (adapter, resolver, durable) = owner.into_parts();
+    let mut restarted =
+        NativeXtablesOwner::new(adapter, resolver, durable, fixture.environment.clone());
+
+    let report = restarted
+        .recover()
+        .expect("crash recovery must normalize selectors before target cleanup");
+
+    assert_eq!(report.state(), NativeXtablesConvergedState::CleanAbsent);
+    assert_eq!(
+        restarted.adapter.operations,
+        [
+            "restore:ipv4:retire_canary:7",
+            "restore:ipv4:detach_output:7",
+            "restore:ipv6:retire_canary:7",
+            "restore:ipv6:detach_output:7",
+            "policy:ipv4:DeleteRule",
+            "policy:ipv4:DeleteRoute",
+            "policy:ipv6:DeleteRule",
+            "policy:ipv6:DeleteRoute",
+            "restore:ipv4:detach_remaining:7",
+            "restore:ipv4:retire:7",
+            "restore:ipv6:detach_remaining:7",
+            "restore:ipv6:retire:7",
+        ]
+    );
+    restarted
+        .require_clean_absence(std::slice::from_ref(&target))
+        .unwrap();
+}
+
+#[test]
+fn outstanding_canary_journal_with_an_empty_slot_still_cleans_the_target() {
+    let target = canary_target(7, AddressHostFamilySelection::Ipv4);
+    let fixture = Fixture::new([target.clone()]);
+    let mut owner = fixture.owner();
+    owner
+        .converge(NativeXtablesDesiredTarget::Active(target.clone()))
+        .unwrap();
+    owner
+        .populate_canary_selector(&target, canary_selector(false))
+        .unwrap();
+    owner
+        .adapter
+        .family_state_mut(XtablesRestoreFamily::Ipv4)
+        .canary_selector = None;
+    owner.adapter.operations.clear();
+    let (adapter, resolver, durable) = owner.into_parts();
+    let mut restarted =
+        NativeXtablesOwner::new(adapter, resolver, durable, fixture.environment.clone());
+
+    let report = restarted
+        .recover()
+        .expect("an outstanding selector session must not recover as settled active ownership");
+
+    assert_eq!(report.state(), NativeXtablesConvergedState::CleanAbsent);
+    assert_eq!(
+        restarted.adapter.operations,
+        [
+            "restore:ipv4:detach_output:7",
+            "policy:ipv4:DeleteRule",
+            "policy:ipv4:DeleteRoute",
+            "restore:ipv4:detach_remaining:7",
+            "restore:ipv4:retire:7",
+        ]
+    );
+    restarted
+        .require_clean_absence(std::slice::from_ref(&target))
+        .unwrap();
+}
+
+#[test]
+fn canary_selector_write_failures_are_compensated_or_proven_by_readback() {
+    for retiring in [false, true] {
+        for write in 1..=2 {
+            for after_apply in [false, true] {
+                let target = canary_target(7, AddressHostFamilySelection::DualStack);
+                let fixture = Fixture::new([target.clone()]);
+                let mut owner = fixture.owner();
+                owner
+                    .converge(NativeXtablesDesiredTarget::Active(target.clone()))
+                    .unwrap();
+                if retiring {
+                    owner
+                        .populate_canary_selector(&target, canary_selector(true))
+                        .unwrap();
+                }
+                owner.adapter.write_count = 0;
+                owner.adapter.failures = vec![Failure { write, after_apply }];
+
+                let result = if retiring {
+                    owner.retire_canary_selector(&target, canary_selector(true))
+                } else {
+                    owner.populate_canary_selector(&target, canary_selector(true))
+                };
+
+                if after_apply {
+                    result.expect("post-apply error with exact readback must be accepted");
+                    if !retiring {
+                        owner.adapter.failures.clear();
+                        owner
+                            .retire_canary_selector(&target, canary_selector(true))
+                            .unwrap();
+                    }
+                } else {
+                    assert!(matches!(
+                        result,
+                        Err(NativeXtablesOwnerError::RolledBack {
+                            state: NativeXtablesConvergedState::Active(identity),
+                            ..
+                        }) if identity == target.identity()
+                    ));
+                }
+                assert!(owner.target_is_exact_active(&target).unwrap());
+            }
+        }
+    }
+}
+
+#[test]
+fn failed_canary_compensation_remains_recoverable() {
+    let target = canary_target(7, AddressHostFamilySelection::DualStack);
+    let fixture = Fixture::new([target.clone()]);
+    let mut owner = fixture.owner();
+    owner
+        .converge(NativeXtablesDesiredTarget::Active(target.clone()))
+        .unwrap();
+    owner.adapter.write_count = 0;
+    owner.adapter.failures = vec![
+        Failure {
+            write: 2,
+            after_apply: false,
+        },
+        Failure {
+            write: 3,
+            after_apply: false,
+        },
+    ];
+
+    let error = owner
+        .populate_canary_selector(&target, canary_selector(true))
+        .expect_err("failed compensation must retain an uncertain journal");
+
+    assert!(matches!(error, NativeXtablesOwnerError::Uncertain { .. }));
+    assert_eq!(
+        owner.durable.load_journal().unwrap().unwrap().phase(),
+        NativeXtablesJournalPhase::Uncertain
+    );
+    assert!(owner.durable.load_lease().unwrap().is_some());
+    owner.adapter.failures.clear();
+
+    let report = owner
+        .recover()
+        .expect("restart recovery must clean the target");
+
+    assert_eq!(report.state(), NativeXtablesConvergedState::CleanAbsent);
+    owner
+        .require_clean_absence(std::slice::from_ref(&target))
+        .unwrap();
+}
+
+#[test]
+fn recovery_rejects_drift_outside_the_reserved_canary_chain() {
+    let target = canary_target(7, AddressHostFamilySelection::Ipv4);
+    let fixture = Fixture::new([target.clone()]);
+    let mut owner = fixture.owner();
+    owner
+        .converge(NativeXtablesDesiredTarget::Active(target.clone()))
+        .unwrap();
+    owner
+        .populate_canary_selector(&target, canary_selector(false))
+        .unwrap();
+    owner.adapter.operations.clear();
+    owner.adapter.foreign_xtables[family_index(XtablesRestoreFamily::Ipv4)] = true;
+
+    let error = owner
+        .recover()
+        .expect_err("recovery must not normalize unrelated native drift");
+
+    assert!(matches!(error, NativeXtablesOwnerError::Uncertain { .. }));
+    assert!(owner.adapter.operations.is_empty());
+    owner.adapter.foreign_xtables[family_index(XtablesRestoreFamily::Ipv4)] = false;
+
+    let report = owner
+        .recover()
+        .expect("recovery may continue after unrelated drift is removed");
+    assert_eq!(report.state(), NativeXtablesConvergedState::CleanAbsent);
+    assert_eq!(
+        owner.adapter.operations.first(),
+        Some(&"restore:ipv4:retire_canary:7")
+    );
+    owner
+        .require_clean_absence(std::slice::from_ref(&target))
+        .unwrap();
 }
 
 #[test]
@@ -329,6 +688,60 @@ fn runtime_writer_requires_recovery_before_any_convergence() {
     ));
     assert!(writer.test_adapter().operations.is_empty());
     assert!(writer.test_archived_identities().unwrap().is_empty());
+}
+
+#[test]
+fn runtime_writer_forwards_canary_mutation_and_invalidates_after_owner_error() {
+    let target = canary_target(7, AddressHostFamilySelection::Ipv4);
+    let fixture = Fixture::new([target.clone()]);
+    let mut writer = NativeXtablesRuntimeWriter::new(
+        FakeAdapter::new(vec![target.clone()]),
+        fixture.store.clone(),
+        fixture.environment.clone(),
+    )
+    .unwrap();
+    writer.recover().unwrap();
+    writer
+        .converge(NativeXtablesDesiredTarget::Active(target.clone()))
+        .unwrap();
+    writer.test_adapter_mut().operations.clear();
+
+    writer
+        .populate_canary_selector(&target, canary_selector(false))
+        .unwrap();
+    writer
+        .retire_canary_selector(&target, canary_selector(false))
+        .unwrap();
+
+    assert_eq!(
+        writer.test_adapter().operations,
+        [
+            "restore:ipv4:populate_canary:7",
+            "restore:ipv4:retire_canary:7",
+        ]
+    );
+
+    let error = writer
+        .populate_canary_selector(&target, canary_selector(true))
+        .expect_err("owner selector error must invalidate the runtime writer");
+    assert!(matches!(
+        error,
+        NativeXtablesRuntimeWriterError::Owner(source)
+            if matches!(
+                source.as_ref(),
+                NativeXtablesOwnerError::InvalidCanarySelector(
+                    "selector address families differ from the admitted target"
+                )
+            )
+    ));
+    assert!(matches!(
+        writer.observe_active_ownership(),
+        Err(NativeXtablesRuntimeWriterError::RecoveryRequired)
+    ));
+    assert_eq!(
+        writer.recover().unwrap().state(),
+        NativeXtablesConvergedState::Active(target.identity())
+    );
 }
 
 #[test]
@@ -1445,6 +1858,7 @@ struct FakeFamilyState {
     prepared: Vec<NativeXtablesTargetIdentity>,
     stable: Option<NativeXtablesTargetIdentity>,
     output_attached: bool,
+    canary_selector: Option<XtablesRestoreArtifact>,
 }
 
 #[derive(Clone)]
@@ -1504,6 +1918,57 @@ impl FakeAdapter {
         family: XtablesRestoreFamily,
         artifact: &XtablesRestoreArtifact,
     ) -> (&'static str, NativeXtablesTargetIdentity) {
+        if artifact.context().action() == XtablesRestoreAction::Replace {
+            let flush = artifact
+                .transactions()
+                .first()
+                .and_then(|transaction| transaction.entries().first())
+                .and_then(|entry| match entry {
+                    XtablesRestoreEntry::Command(command)
+                        if command.kind() == XtablesRestoreCommandKind::Flush =>
+                    {
+                        Some(command)
+                    }
+                    XtablesRestoreEntry::ChainDeclaration(_) | XtablesRestoreEntry::Command(_) => {
+                        None
+                    }
+                });
+            let target = flush.and_then(|flush| {
+                self.targets
+                    .iter()
+                    .find(|target| {
+                        target
+                            .topology()
+                            .family(family)
+                            .and_then(XtablesStableFamilyPlan::local_output_canary_selector)
+                            == Some(flush.chain())
+                    })
+                    .map(|target| (target, flush))
+            });
+            if let Some((target, flush)) = target {
+                let [transaction] = artifact.transactions() else {
+                    panic!("selector replacement must contain one transaction");
+                };
+                let [XtablesRestoreEntry::Command(_), remaining @ ..] = transaction.entries()
+                else {
+                    unreachable!("the first selector entry was already classified as a flush");
+                };
+                assert!(remaining.iter().all(|entry| {
+                    matches!(
+                        entry,
+                        XtablesRestoreEntry::Command(command)
+                            if command.kind() == XtablesRestoreCommandKind::Append
+                                && command.chain() == flush.chain()
+                    )
+                }));
+                let kind = if remaining.is_empty() {
+                    "retire_canary"
+                } else {
+                    "populate_canary"
+                };
+                return (kind, target.identity());
+            }
+        }
         for target in &self.targets {
             let Some(plan) = target.topology().family(family) else {
                 continue;
@@ -1531,6 +1996,7 @@ impl FakeAdapter {
         family: XtablesRestoreFamily,
         kind: &str,
         identity: NativeXtablesTargetIdentity,
+        artifact: &XtablesRestoreArtifact,
     ) {
         let state = self.family_state_mut(family);
         match kind {
@@ -1550,6 +2016,8 @@ impl FakeAdapter {
                 state.output_attached = false;
             }
             "retire" => state.prepared.retain(|candidate| *candidate != identity),
+            "populate_canary" => state.canary_selector = Some(artifact.clone()),
+            "retire_canary" => state.canary_selector = None,
             _ => unreachable!(),
         }
     }
@@ -1576,14 +2044,25 @@ impl FakeAdapter {
         let stable = state
             .stable
             .map(|identity| self.target_by_identity(identity));
-        expected_state(
+        let projection = expected_state(
             &prepared,
             stable,
             family,
             stable.is_some() && !state.output_attached,
         )
-        .map(|expected| expected.projection().clone())
-        .map_err(|error| {
+        .map(|expected| expected.projection().clone());
+        let projection = match (projection, &state.canary_selector) {
+            (Ok(projection), Some(selector)) => projection.with_owned_chain_replacement(selector),
+            (Ok(projection), None) => Ok(projection),
+            (Err(error), _) => {
+                return Err(NativeXtablesAdapterError::new(
+                    "fake save",
+                    NativeMutationCertainty::NotMutated,
+                    error.to_string(),
+                ));
+            }
+        };
+        projection.map_err(|error| {
             NativeXtablesAdapterError::new(
                 "fake save",
                 NativeMutationCertainty::NotMutated,
@@ -1627,7 +2106,7 @@ impl NativeXtablesOwnerAdapter for FakeAdapter {
                 "injected failure",
             ));
         }
-        self.apply_restore(family, kind, identity);
+        self.apply_restore(family, kind, identity, artifact);
         self.operations.push(operation(kind, family, identity));
         if self.failure(true) {
             return Err(NativeXtablesAdapterError::new(
@@ -1731,6 +2210,18 @@ fn target(
     target_with_tool_digest(generation, families, forwarded_ingress, TOOL_DIGEST)
 }
 
+fn canary_target(
+    generation: u32,
+    families: AddressHostFamilySelection,
+) -> NativeXtablesAdmittedTarget {
+    admit_target(
+        lowered_canary_artifacts(generation, families),
+        false,
+        InterfaceIndex::new(1).unwrap(),
+        TOOL_DIGEST,
+    )
+}
+
 fn target_with_tool_digest(
     generation: u32,
     families: AddressHostFamilySelection,
@@ -1768,10 +2259,23 @@ fn target_with_loopback_index_and_tool_digest(
     loopback_index: InterfaceIndex,
     tool_digest: [u8; 32],
 ) -> NativeXtablesAdmittedTarget {
-    let artifacts = lowered_artifacts(generation, families, forwarded_ingress);
+    admit_target(
+        lowered_artifacts(generation, families, forwarded_ingress),
+        forwarded_ingress,
+        loopback_index,
+        tool_digest,
+    )
+}
+
+fn admit_target(
+    artifacts: XtablesCaptureArtifactSet,
+    forwarded_ingress: bool,
+    loopback_index: InterfaceIndex,
+    tool_digest: [u8; 32],
+) -> NativeXtablesAdmittedTarget {
     let identities = routing_identities(&artifacts, loopback_index);
     let audit_artifacts = lowered_artifacts(
-        generation,
+        artifacts.namespace().generation().get(),
         AddressHostFamilySelection::DualStack,
         forwarded_ingress,
     );
@@ -1789,6 +2293,22 @@ fn lowered_artifacts(
     families: AddressHostFamilySelection,
     forwarded_ingress: bool,
 ) -> XtablesCaptureArtifactSet {
+    lower_artifacts(generation, families, forwarded_ingress, false)
+}
+
+fn lowered_canary_artifacts(
+    generation: u32,
+    families: AddressHostFamilySelection,
+) -> XtablesCaptureArtifactSet {
+    lower_artifacts(generation, families, false, true)
+}
+
+fn lower_artifacts(
+    generation: u32,
+    families: AddressHostFamilySelection,
+    forwarded_ingress: bool,
+    reserve_canary_selector: bool,
+) -> XtablesCaptureArtifactSet {
     let scope = CaptureTrafficScope::new(families, true, forwarded_ingress).unwrap();
     let forwarded = forwarded_ingress.then_some(exact("wlan0"));
     let program = compile_capture_program(CaptureProgramRequest::new(
@@ -1801,18 +2321,19 @@ fn lowered_artifacts(
         CaptureProtocolSet::TCP_AND_UDP,
     ))
     .unwrap();
-    lower_xtables_capture(
-        XtablesCaptureLoweringRequest::new(
-            program.program(),
-            XtablesCaptureNamespace::new(GenerationId::new(generation).unwrap()),
-            XtablesTproxyTarget::new(
-                NonZeroU16::new(1536).unwrap(),
-                FwmarkCandidate::new(MARK_MASK, PROXY_MARK, BYPASS_MARK).unwrap(),
-            ),
-        )
-        .with_local_output_routing(routing(families)),
+    let mut request = XtablesCaptureLoweringRequest::new(
+        program.program(),
+        XtablesCaptureNamespace::new(GenerationId::new(generation).unwrap()),
+        XtablesTproxyTarget::new(
+            NonZeroU16::new(1536).unwrap(),
+            FwmarkCandidate::new(MARK_MASK, PROXY_MARK, BYPASS_MARK).unwrap(),
+        ),
     )
-    .unwrap()
+    .with_local_output_routing(routing(families));
+    if reserve_canary_selector {
+        request = request.with_local_output_canary_selector_slot();
+    }
+    lower_xtables_capture(request).unwrap()
 }
 
 fn routing_identities(
@@ -1878,8 +2399,24 @@ fn operation(
         ("detach_output", XtablesRestoreFamily::Ipv6, 7) => "restore:ipv6:detach_output:7",
         ("detach_remaining", XtablesRestoreFamily::Ipv4, 7) => "restore:ipv4:detach_remaining:7",
         ("detach_remaining", XtablesRestoreFamily::Ipv6, 7) => "restore:ipv6:detach_remaining:7",
+        ("populate_canary", XtablesRestoreFamily::Ipv4, 7) => "restore:ipv4:populate_canary:7",
+        ("populate_canary", XtablesRestoreFamily::Ipv6, 7) => "restore:ipv6:populate_canary:7",
+        ("retire_canary", XtablesRestoreFamily::Ipv4, 7) => "restore:ipv4:retire_canary:7",
+        ("retire_canary", XtablesRestoreFamily::Ipv6, 7) => "restore:ipv6:retire_canary:7",
         _ => "restore:other",
     }
+}
+
+fn canary_selector(ipv6: bool) -> NativeCaptureCanarySelector {
+    NativeCaptureCanarySelector::new(
+        NonZeroU32::new(2_000).unwrap(),
+        Ipv4Addr::new(198, 18, 0, 2),
+        ipv6.then_some(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 2)),
+        NonZeroU16::new(10_080).unwrap(),
+        NonZeroU16::new(10_081).unwrap(),
+        NonZeroU16::new(10_053).unwrap(),
+    )
+    .unwrap()
 }
 
 fn policy_operation(family: NetworkAddressFamily, kind: PolicyRoutingMutationKind) -> &'static str {

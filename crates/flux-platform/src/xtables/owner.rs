@@ -339,6 +339,18 @@ impl XtablesStableFamilyPlan {
     }
 
     #[must_use]
+    pub(crate) fn local_output_canary_selector(&self) -> Option<&str> {
+        let prefix = match self.family {
+            XtablesRestoreFamily::Ipv4 => "FLX4C",
+            XtablesRestoreFamily::Ipv6 => "FLX6C",
+        };
+        self.private_chains
+            .iter()
+            .map(Box::as_ref)
+            .find(|chain| chain.starts_with(prefix))
+    }
+
+    #[must_use]
     pub(crate) const fn prepare(&self) -> &XtablesRestoreArtifact {
         &self.prepare
     }

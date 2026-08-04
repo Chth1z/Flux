@@ -37,10 +37,10 @@ use crate::xtables::owner_durable::{
     NativeXtablesDurableError, NativeXtablesDurableStore, NativeXtablesRuntimeGuard,
 };
 use crate::xtables::{
-    NativeCaptureConvergedState, NativeCaptureConvergence, NativeCaptureConvergenceReport,
-    NativeCaptureDesired, NativeCaptureOwnershipObservation, NativeCaptureTargetIdentity,
-    XtablesCaptureArtifactSet, XtablesLocalOutputRoutingSpec, XtablesLocalOutputRoutingTarget,
-    XtablesRestoreFamily,
+    NativeCaptureCanarySelector, NativeCaptureConvergedState, NativeCaptureConvergence,
+    NativeCaptureConvergenceReport, NativeCaptureDesired, NativeCaptureOwnershipObservation,
+    NativeCaptureTargetIdentity, XtablesCaptureArtifactSet, XtablesLocalOutputRoutingSpec,
+    XtablesLocalOutputRoutingTarget, XtablesRestoreFamily,
 };
 
 const NATIVE_ROUTE_METRIC: u32 = 1_024;
@@ -1168,6 +1168,28 @@ impl NativeCaptureConvergence for NativeXtablesCaptureConverger {
             .map_err(|source| NativeXtablesCaptureConvergenceError { source })
     }
 
+    fn populate_canary_selector(
+        &mut self,
+        target: &Self::Target,
+        selector: NativeCaptureCanarySelector,
+    ) -> Result<bool, Self::Error> {
+        self.inner
+            .populate_canary_selector(&target.inner, selector)
+            .map(|()| true)
+            .map_err(|source| NativeXtablesCaptureConvergenceError { source })
+    }
+
+    fn retire_canary_selector(
+        &mut self,
+        target: &Self::Target,
+        selector: NativeCaptureCanarySelector,
+    ) -> Result<bool, Self::Error> {
+        self.inner
+            .retire_canary_selector(&target.inner, selector)
+            .map(|()| true)
+            .map_err(|source| NativeXtablesCaptureConvergenceError { source })
+    }
+
     fn converge(
         &mut self,
         desired: NativeCaptureDesired<Self::Target>,
@@ -1280,6 +1302,42 @@ where
         let _transaction = self.begin_transaction()?;
         match self.owner.observe_active_ownership() {
             Ok(observation) => Ok(observation),
+            Err(source) => {
+                self.recovered = false;
+                Err(NativeXtablesRuntimeWriterError::Owner(Box::new(source)))
+            }
+        }
+    }
+
+    pub(crate) fn populate_canary_selector(
+        &mut self,
+        target: &NativeXtablesAdmittedTarget,
+        selector: NativeCaptureCanarySelector,
+    ) -> Result<(), NativeXtablesRuntimeWriterError> {
+        if !self.recovered {
+            return Err(NativeXtablesRuntimeWriterError::RecoveryRequired);
+        }
+        let _transaction = self.begin_transaction()?;
+        match self.owner.populate_canary_selector(target, selector) {
+            Ok(()) => Ok(()),
+            Err(source) => {
+                self.recovered = false;
+                Err(NativeXtablesRuntimeWriterError::Owner(Box::new(source)))
+            }
+        }
+    }
+
+    pub(crate) fn retire_canary_selector(
+        &mut self,
+        target: &NativeXtablesAdmittedTarget,
+        selector: NativeCaptureCanarySelector,
+    ) -> Result<(), NativeXtablesRuntimeWriterError> {
+        if !self.recovered {
+            return Err(NativeXtablesRuntimeWriterError::RecoveryRequired);
+        }
+        let _transaction = self.begin_transaction()?;
+        match self.owner.retire_canary_selector(target, selector) {
+            Ok(()) => Ok(()),
             Err(source) => {
                 self.recovered = false;
                 Err(NativeXtablesRuntimeWriterError::Owner(Box::new(source)))

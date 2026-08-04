@@ -25,10 +25,13 @@ use super::super::save::{
     XtablesExpectedState, XtablesExpectedStatePhase, XtablesSaveProjection,
     XtablesSaveProjectionError,
 };
-use super::super::{XtablesRestoreArtifact, XtablesRestoreFamily};
+use super::super::{
+    XtablesRestoreAction, XtablesRestoreArtifact, XtablesRestoreContext, XtablesRestoreFamily,
+    XtablesRestoreParseError, parse_xtables_restore,
+};
 use super::{XtablesStableFamilyPlan, XtablesStableTopologyError, XtablesStableTopologyPlan};
 use crate::xtables::native_capture::{
-    NativeCaptureOwnershipObservation, NativeCaptureTargetIdentity,
+    NativeCaptureCanarySelector, NativeCaptureOwnershipObservation, NativeCaptureTargetIdentity,
 };
 
 const OWNER_PAYLOAD_SCHEMA: u16 = 3;
@@ -561,6 +564,11 @@ enum NativeOwnerStep {
     DetachRemainingIpv6,
     RetireIpv4,
     RetireIpv6,
+    PopulateCanaryIpv4,
+    PopulateCanaryIpv6,
+    CanaryActive,
+    RetireCanaryIpv4,
+    RetireCanaryIpv6,
     PublishActive,
     Rollback,
     Failed,
@@ -590,6 +598,11 @@ impl NativeOwnerStep {
             Self::DetachRemainingIpv6 => "detach_remaining_ipv6",
             Self::RetireIpv4 => "retire_ipv4",
             Self::RetireIpv6 => "retire_ipv6",
+            Self::PopulateCanaryIpv4 => "populate_canary_ipv4",
+            Self::PopulateCanaryIpv6 => "populate_canary_ipv6",
+            Self::CanaryActive => "canary_active",
+            Self::RetireCanaryIpv4 => "retire_canary_ipv4",
+            Self::RetireCanaryIpv6 => "retire_canary_ipv6",
             Self::PublishActive => "publish_active",
             Self::Rollback => "rollback",
             Self::Failed => "failed",
@@ -619,6 +632,11 @@ impl NativeOwnerStep {
             "detach_remaining_ipv6" => Self::DetachRemainingIpv6,
             "retire_ipv4" => Self::RetireIpv4,
             "retire_ipv6" => Self::RetireIpv6,
+            "populate_canary_ipv4" => Self::PopulateCanaryIpv4,
+            "populate_canary_ipv6" => Self::PopulateCanaryIpv6,
+            "canary_active" => Self::CanaryActive,
+            "retire_canary_ipv4" => Self::RetireCanaryIpv4,
+            "retire_canary_ipv6" => Self::RetireCanaryIpv6,
             "publish_active" => Self::PublishActive,
             "rollback" => Self::Rollback,
             "failed" => Self::Failed,
@@ -986,6 +1004,166 @@ const fn retire_step(family: XtablesRestoreFamily) -> NativeOwnerStep {
     }
 }
 
+const fn populate_canary_step(family: XtablesRestoreFamily) -> NativeOwnerStep {
+    match family {
+        XtablesRestoreFamily::Ipv4 => NativeOwnerStep::PopulateCanaryIpv4,
+        XtablesRestoreFamily::Ipv6 => NativeOwnerStep::PopulateCanaryIpv6,
+    }
+}
+
+const fn retire_canary_step(family: XtablesRestoreFamily) -> NativeOwnerStep {
+    match family {
+        XtablesRestoreFamily::Ipv4 => NativeOwnerStep::RetireCanaryIpv4,
+        XtablesRestoreFamily::Ipv6 => NativeOwnerStep::RetireCanaryIpv6,
+    }
+}
+
+struct NativeCanarySelectorFamilyPlan {
+    family: XtablesRestoreFamily,
+    chain: Box<str>,
+    populate: XtablesRestoreArtifact,
+    retire: XtablesRestoreArtifact,
+    populated_state: XtablesExpectedState,
+}
+
+#[derive(Clone, Copy)]
+enum NativeCanarySelectorProgress {
+    Populating(usize),
+    Retiring(usize),
+}
+
+impl NativeCanarySelectorProgress {
+    const fn family_is_populated(self, index: usize) -> bool {
+        match self {
+            Self::Populating(completed) => index < completed,
+            Self::Retiring(completed) => index >= completed,
+        }
+    }
+}
+
+fn canary_selector_plans(
+    target: &NativeXtablesAdmittedTarget,
+    selector: NativeCaptureCanarySelector,
+) -> Result<Vec<NativeCanarySelectorFamilyPlan>, NativeXtablesOwnerError> {
+    if target
+        .topology()
+        .family(XtablesRestoreFamily::Ipv4)
+        .is_none()
+    {
+        return Err(NativeXtablesOwnerError::InvalidCanarySelector(
+            "the admitted target has no IPv4 local-OUTPUT family",
+        ));
+    }
+    let target_has_ipv6 = target
+        .topology()
+        .family(XtablesRestoreFamily::Ipv6)
+        .is_some();
+    if selector.ipv6_peer().is_some() != target_has_ipv6 {
+        return Err(NativeXtablesOwnerError::InvalidCanarySelector(
+            "selector address families differ from the admitted target",
+        ));
+    }
+
+    target
+        .topology()
+        .families()
+        .iter()
+        .map(|family_plan| {
+            let family = family_plan.family();
+            let chain = family_plan.local_output_canary_selector().ok_or(
+                NativeXtablesOwnerError::InvalidCanarySelector(
+                    "the admitted target has no reserved canary selector chain",
+                ),
+            )?;
+            let routing = target
+                .routing()
+                .iter()
+                .copied()
+                .find(|routing| restore_family(routing.family()) == family)
+                .ok_or(NativeXtablesOwnerError::InvalidCanarySelector(
+                    "the selector family has no admitted proxy-mark route",
+                ))?;
+            let (populate, retire) = render_canary_selector_artifacts(
+                family,
+                chain,
+                selector,
+                routing.rule().mark().value(),
+                routing.rule().mark().mask(),
+            )?;
+            let populated_state = family_plan
+                .active_state()
+                .with_owned_chain_replacement(&populate)
+                .map_err(NativeXtablesOwnerError::ExpectedState)?;
+            Ok(NativeCanarySelectorFamilyPlan {
+                family,
+                chain: chain.into(),
+                populate,
+                retire,
+                populated_state,
+            })
+        })
+        .collect()
+}
+
+fn render_canary_selector_artifacts(
+    family: XtablesRestoreFamily,
+    chain: &str,
+    selector: NativeCaptureCanarySelector,
+    proxy_mark: u32,
+    proxy_mask: u32,
+) -> Result<(XtablesRestoreArtifact, XtablesRestoreArtifact), NativeXtablesOwnerError> {
+    let (peer, prefix) = match family {
+        XtablesRestoreFamily::Ipv4 => (selector.ipv4_peer().to_string(), 32),
+        XtablesRestoreFamily::Ipv6 => (
+            selector
+                .ipv6_peer()
+                .ok_or(NativeXtablesOwnerError::InvalidCanarySelector(
+                    "the IPv6 selector peer is absent",
+                ))?
+                .to_string(),
+            128,
+        ),
+    };
+    let mark = format!("0x{proxy_mark:x}/0x{proxy_mask:x}");
+    let unmarked = format!("0x0/0x{proxy_mask:x}");
+    let mut populate = format!("*mangle\n-F {chain}\n");
+    for (protocol, ports) in [
+        ("tcp", [selector.tcp_echo_port(), selector.dns_port()]),
+        ("udp", [selector.udp_echo_port(), selector.dns_port()]),
+    ] {
+        for port in ports {
+            let exact = format!(
+                "-A {chain} -d {peer}/{prefix} -p {protocol} -m owner --uid-owner {} -m {protocol} --dport {}",
+                selector.probe_uid(),
+                port.get(),
+            );
+            populate.push_str(&format!(
+                "{exact} -m mark --mark {unmarked} -j MARK --set-xmark {mark}\n"
+            ));
+            populate.push_str(&format!("{exact} -m mark --mark {mark} -j ACCEPT\n"));
+        }
+    }
+    populate.push_str("COMMIT\n");
+    let context = XtablesRestoreContext::new(XtablesRestoreAction::Replace, family);
+    Ok((
+        parse_xtables_restore(populate.as_bytes(), context)
+            .map_err(NativeXtablesOwnerError::CanarySelectorArtifact)?,
+        render_canary_retire_artifact(family, chain)?,
+    ))
+}
+
+fn render_canary_retire_artifact(
+    family: XtablesRestoreFamily,
+    chain: &str,
+) -> Result<XtablesRestoreArtifact, NativeXtablesOwnerError> {
+    let retire = format!("*mangle\n-F {chain}\nCOMMIT\n");
+    parse_xtables_restore(
+        retire.as_bytes(),
+        XtablesRestoreContext::new(XtablesRestoreAction::Replace, family),
+    )
+    .map_err(NativeXtablesOwnerError::CanarySelectorArtifact)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum NativeXtablesConvergedState {
     Active(NativeXtablesTargetIdentity),
@@ -1024,6 +1202,8 @@ pub(crate) enum NativeXtablesOwnerError {
     LiveStateConflict(&'static str),
     ReplacementIncompatible(&'static str),
     ExpectedState(XtablesSaveProjectionError),
+    InvalidCanarySelector(&'static str),
+    CanarySelectorArtifact(XtablesRestoreParseError),
     RolledBack {
         cause: Box<str>,
         state: NativeXtablesConvergedState,
@@ -1071,6 +1251,15 @@ impl fmt::Display for NativeXtablesOwnerError {
                     "cannot derive native xtables expected state: {source}"
                 )
             }
+            Self::InvalidCanarySelector(reason) => {
+                write!(formatter, "invalid native canary selector: {reason}")
+            }
+            Self::CanarySelectorArtifact(source) => {
+                write!(
+                    formatter,
+                    "cannot build native canary selector artifact: {source}"
+                )
+            }
             Self::RolledBack { cause, state } => write!(
                 formatter,
                 "native xtables convergence failed and rolled back to {state:?}: {cause}"
@@ -1092,6 +1281,7 @@ impl Error for NativeXtablesOwnerError {
             Self::Durable(source) => Some(source),
             Self::Adapter(source) => Some(source),
             Self::ExpectedState(source) => Some(source),
+            Self::CanarySelectorArtifact(source) => Some(source),
             _ => None,
         }
     }
@@ -1324,6 +1514,289 @@ where
         Ok(Some(public_ownership_observation(before, identity)))
     }
 
+    pub(crate) fn populate_canary_selector(
+        &mut self,
+        target: &NativeXtablesAdmittedTarget,
+        selector: NativeCaptureCanarySelector,
+    ) -> Result<(), NativeXtablesOwnerError> {
+        let plans = canary_selector_plans(target, selector)?;
+        let (mut lease, mut cursor) =
+            self.begin_canary_transition(target, NativeOwnerStep::PublishActive)?;
+        self.require_canary_selector_state(
+            target,
+            &plans,
+            NativeCanarySelectorProgress::Populating(0),
+        )?;
+        self.require_policy_exact(target)?;
+
+        if let Err(primary) = self.apply_canary_selector(&mut lease, &mut cursor, target, &plans) {
+            let cause = primary.to_string();
+            return match self.restore_active_canary_base(&mut lease, &mut cursor, target, &plans) {
+                Ok(()) => Err(NativeXtablesOwnerError::RolledBack {
+                    cause: cause.into_boxed_str(),
+                    state: NativeXtablesConvergedState::Active(target.identity()),
+                }),
+                Err(compensation) => {
+                    self.fail_uncertain(&mut lease, &mut cursor, &cause, &compensation.to_string())
+                }
+            };
+        }
+        Ok(())
+    }
+
+    pub(crate) fn retire_canary_selector(
+        &mut self,
+        target: &NativeXtablesAdmittedTarget,
+        selector: NativeCaptureCanarySelector,
+    ) -> Result<(), NativeXtablesOwnerError> {
+        let plans = canary_selector_plans(target, selector)?;
+        let (mut lease, mut cursor) =
+            self.begin_canary_transition(target, NativeOwnerStep::CanaryActive)?;
+        self.require_canary_selector_state(
+            target,
+            &plans,
+            NativeCanarySelectorProgress::Retiring(0),
+        )?;
+        self.require_policy_exact(target)?;
+
+        if let Err(primary) = self.remove_canary_selector(&mut lease, &mut cursor, target, &plans) {
+            let cause = primary.to_string();
+            return match self.restore_active_canary_base(&mut lease, &mut cursor, target, &plans) {
+                Ok(()) => Err(NativeXtablesOwnerError::RolledBack {
+                    cause: cause.into_boxed_str(),
+                    state: NativeXtablesConvergedState::Active(target.identity()),
+                }),
+                Err(compensation) => {
+                    self.fail_uncertain(&mut lease, &mut cursor, &cause, &compensation.to_string())
+                }
+            };
+        }
+        Ok(())
+    }
+
+    fn begin_canary_transition(
+        &mut self,
+        target: &NativeXtablesAdmittedTarget,
+        expected_step: NativeOwnerStep,
+    ) -> Result<(NativeXtablesTransitionLease, JournalCursor), NativeXtablesOwnerError> {
+        if target.routing_audit() != self.environment.routing_audit() {
+            return Err(NativeXtablesOwnerError::LiveStateConflict(
+                "canary target routing audit differs from the recovery environment",
+            ));
+        }
+        self.require_tool_identity(target)?;
+        let record =
+            self.durable
+                .load_journal()?
+                .ok_or(NativeXtablesOwnerError::LiveStateConflict(
+                    "canary selector mutation found no active journal",
+                ))?;
+        let intent = NativeOwnerIntent::parse(record.owner_payload())?;
+        if record.phase() != NativeXtablesJournalPhase::Active
+            || intent.step != expected_step
+            || intent.target != Some(target.identity())
+            || intent.previous.is_some()
+        {
+            return Err(NativeXtablesOwnerError::LiveStateConflict(
+                "canary selector mutation found a different active owner state",
+            ));
+        }
+        let expected = self.expected_binding(record.binding())?;
+        let NativeXtablesRecovery::Leased(lease) = self.durable.recover(&expected)? else {
+            return Err(NativeXtablesOwnerError::LiveStateConflict(
+                "canary selector mutation found no durable transition lease",
+            ));
+        };
+        let guarded = self.guarded_journal(lease.binding())?;
+        let guarded_intent = NativeOwnerIntent::parse(guarded.owner_payload())?;
+        if guarded.phase() != NativeXtablesJournalPhase::Active
+            || guarded_intent.step != expected_step
+            || guarded_intent.target != Some(target.identity())
+            || guarded_intent.previous.is_some()
+        {
+            return Err(NativeXtablesOwnerError::LiveStateConflict(
+                "canary selector owner changed while acquiring the writer fence",
+            ));
+        }
+        let cursor = JournalCursor::from_record(&guarded)?;
+        Ok((lease, cursor))
+    }
+
+    fn apply_canary_selector(
+        &mut self,
+        lease: &mut NativeXtablesTransitionLease,
+        cursor: &mut JournalCursor,
+        target: &NativeXtablesAdmittedTarget,
+        plans: &[NativeCanarySelectorFamilyPlan],
+    ) -> Result<(), NativeXtablesOwnerError> {
+        for (index, plan) in plans.iter().enumerate() {
+            cursor.advance(
+                lease,
+                NativeXtablesJournalPhase::Activating,
+                populate_canary_step(plan.family),
+            )?;
+            if let Err(error) = self.adapter.restore(plan.family, &plan.populate) {
+                if error.certainty() != NativeMutationCertainty::MayHaveMutated {
+                    return Err(error.into());
+                }
+                self.require_canary_selector_state(
+                    target,
+                    plans,
+                    NativeCanarySelectorProgress::Populating(index + 1),
+                )?;
+            } else {
+                self.require_canary_selector_state(
+                    target,
+                    plans,
+                    NativeCanarySelectorProgress::Populating(index + 1),
+                )?;
+            }
+        }
+        self.require_policy_exact(target)?;
+        cursor.advance(
+            lease,
+            NativeXtablesJournalPhase::Active,
+            NativeOwnerStep::CanaryActive,
+        )
+    }
+
+    fn remove_canary_selector(
+        &mut self,
+        lease: &mut NativeXtablesTransitionLease,
+        cursor: &mut JournalCursor,
+        target: &NativeXtablesAdmittedTarget,
+        plans: &[NativeCanarySelectorFamilyPlan],
+    ) -> Result<(), NativeXtablesOwnerError> {
+        for (index, plan) in plans.iter().enumerate() {
+            cursor.advance(
+                lease,
+                NativeXtablesJournalPhase::Retiring,
+                retire_canary_step(plan.family),
+            )?;
+            if let Err(error) = self.adapter.restore(plan.family, &plan.retire) {
+                if error.certainty() != NativeMutationCertainty::MayHaveMutated {
+                    return Err(error.into());
+                }
+                self.require_canary_selector_state(
+                    target,
+                    plans,
+                    NativeCanarySelectorProgress::Retiring(index + 1),
+                )?;
+            } else {
+                self.require_canary_selector_state(
+                    target,
+                    plans,
+                    NativeCanarySelectorProgress::Retiring(index + 1),
+                )?;
+            }
+        }
+        self.require_policy_exact(target)?;
+        cursor.advance(
+            lease,
+            NativeXtablesJournalPhase::Active,
+            NativeOwnerStep::PublishActive,
+        )
+    }
+
+    fn restore_active_canary_base(
+        &mut self,
+        lease: &mut NativeXtablesTransitionLease,
+        cursor: &mut JournalCursor,
+        target: &NativeXtablesAdmittedTarget,
+        plans: &[NativeCanarySelectorFamilyPlan],
+    ) -> Result<(), NativeXtablesOwnerError> {
+        cursor.advance(
+            lease,
+            NativeXtablesJournalPhase::Retiring,
+            NativeOwnerStep::Rollback,
+        )?;
+        for plan in plans {
+            let observed = self.adapter.observe_xtables(plan.family)?;
+            let normalized = observed
+                .with_owned_chain_replacement(&plan.retire)
+                .map_err(NativeXtablesOwnerError::ExpectedState)?;
+            let family = target
+                .topology()
+                .family(plan.family)
+                .expect("selector plan family belongs to its target");
+            if !family.active_state().is_satisfied_by(&normalized) {
+                return Err(NativeXtablesOwnerError::LiveStateConflict(
+                    "canary compensation found drift outside the reserved selector chain",
+                ));
+            }
+            let dirty = !observed
+                .chain(&plan.chain)
+                .ok_or(NativeXtablesOwnerError::LiveStateConflict(
+                    "canary compensation lost the reserved selector chain",
+                ))?
+                .rules()
+                .is_empty();
+            if !dirty {
+                continue;
+            }
+            cursor.advance(
+                lease,
+                NativeXtablesJournalPhase::Retiring,
+                retire_canary_step(plan.family),
+            )?;
+            if let Err(error) = self.adapter.restore(plan.family, &plan.retire) {
+                let observed = self.adapter.observe_xtables(plan.family)?;
+                if error.certainty() != NativeMutationCertainty::MayHaveMutated
+                    || !family.active_state().is_satisfied_by(&observed)
+                {
+                    return Err(error.into());
+                }
+            }
+            let observed = self.adapter.observe_xtables(plan.family)?;
+            if !family.active_state().is_satisfied_by(&observed) {
+                return Err(NativeXtablesOwnerError::LiveStateConflict(
+                    "canary compensation did not prove selector absence",
+                ));
+            }
+        }
+        self.require_active_state(&[target], target)?;
+        self.require_policy_exact(target)?;
+        cursor.advance(
+            lease,
+            NativeXtablesJournalPhase::Active,
+            NativeOwnerStep::PublishActive,
+        )
+    }
+
+    fn require_canary_selector_state(
+        &mut self,
+        target: &NativeXtablesAdmittedTarget,
+        plans: &[NativeCanarySelectorFamilyPlan],
+        progress: NativeCanarySelectorProgress,
+    ) -> Result<(), NativeXtablesOwnerError> {
+        for family in ALL_XTABLES_FAMILIES {
+            let observed = self.adapter.observe_xtables(family)?;
+            let exact = match target.topology().family(family) {
+                Some(target_family) => {
+                    let (index, plan) = plans
+                        .iter()
+                        .enumerate()
+                        .find(|(_, plan)| plan.family == family)
+                        .ok_or(NativeXtablesOwnerError::InvalidCanarySelector(
+                            "an enabled target family has no selector plan",
+                        ))?;
+                    if progress.family_is_populated(index) {
+                        plan.populated_state.is_satisfied_by(&observed)
+                    } else {
+                        target_family.active_state().is_satisfied_by(&observed)
+                    }
+                }
+                None => observed.is_empty(),
+            };
+            if !exact {
+                return Err(NativeXtablesOwnerError::LiveStateConflict(
+                    "canary selector readback did not match the exact transaction state",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn recover_current_journal(
         &mut self,
         record: NativeXtablesJournalRecord,
@@ -1340,6 +1813,7 @@ where
                 let cursor = JournalCursor::from_record(&guarded)?;
                 let targets = self.resolve_intent_targets(&guarded_intent)?;
                 if guarded.phase() == NativeXtablesJournalPhase::Active
+                    && guarded_intent.step == NativeOwnerStep::PublishActive
                     && targets.len() == 1
                     && guarded_intent.target == Some(targets[0].identity())
                     && self.target_is_exact_active(&targets[0])?
@@ -1849,6 +2323,62 @@ where
         self.require_policy_exact(current)
     }
 
+    fn clear_recoverable_canary_slots(
+        &mut self,
+        lease: &mut NativeXtablesTransitionLease,
+        cursor: &mut JournalCursor,
+        targets: &[&NativeXtablesAdmittedTarget],
+        family: XtablesRestoreFamily,
+    ) -> Result<(), NativeXtablesOwnerError> {
+        let observed = self.adapter.observe_xtables(family)?;
+        let present = present_targets_for_family(&observed, targets, family)?;
+        let mut normalized = observed.clone();
+        let mut retirements = Vec::new();
+        for target in &present {
+            let plan = target
+                .topology()
+                .family(family)
+                .expect("present target has a family plan");
+            let Some(chain) = plan.local_output_canary_selector() else {
+                continue;
+            };
+            let retire = render_canary_retire_artifact(family, chain)?;
+            normalized = normalized
+                .with_owned_chain_replacement(&retire)
+                .map_err(NativeXtablesOwnerError::ExpectedState)?;
+            let dirty = !observed
+                .chain(chain)
+                .expect("a present target retains every private chain")
+                .rules()
+                .is_empty();
+            if dirty {
+                retirements.push((Box::<str>::from(chain), retire));
+            }
+        }
+        classify_family_state(&normalized, &present, family)?;
+
+        for (chain, retire) in retirements {
+            cursor.advance(
+                lease,
+                NativeXtablesJournalPhase::Retiring,
+                retire_canary_step(family),
+            )?;
+            if let Err(error) = self.adapter.restore(family, &retire) {
+                let observed = self.adapter.observe_xtables(family)?;
+                let absent = observed
+                    .chain(&chain)
+                    .is_some_and(|state| state.rules().is_empty());
+                if error.certainty() != NativeMutationCertainty::MayHaveMutated || !absent {
+                    return Err(error.into());
+                }
+            }
+        }
+
+        let observed = self.adapter.observe_xtables(family)?;
+        let present = present_targets_for_family(&observed, targets, family)?;
+        classify_family_state(&observed, &present, family).map(|_| ())
+    }
+
     fn cleanup_targets(
         &mut self,
         lease: &mut NativeXtablesTransitionLease,
@@ -1857,6 +2387,7 @@ where
     ) -> Result<(), NativeXtablesOwnerError> {
         let refs = targets.iter().collect::<Vec<_>>();
         for family in ALL_XTABLES_FAMILIES {
+            self.clear_recoverable_canary_slots(lease, cursor, &refs, family)?;
             let observed = self.adapter.observe_xtables(family)?;
             let present = present_targets_for_family(&observed, &refs, family)?;
             let state = classify_family_state(&observed, &present, family)?;

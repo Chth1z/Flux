@@ -121,6 +121,81 @@ impl XtablesSaveProjection {
     pub(crate) const fn digest(&self) -> XtablesSaveProjectionDigest {
         self.digest
     }
+
+    pub(crate) fn with_owned_chain_replacement(
+        &self,
+        artifact: &XtablesRestoreArtifact,
+    ) -> Result<Self, XtablesSaveProjectionError> {
+        if artifact.context().action() != XtablesRestoreAction::Replace {
+            return Err(XtablesSaveProjectionError::global(
+                XtablesSaveProjectionErrorKind::ExpectedActionMismatch,
+            ));
+        }
+        if artifact.context().family() != self.family {
+            return Err(XtablesSaveProjectionError::global(
+                XtablesSaveProjectionErrorKind::ExpectedFamilyMismatch,
+            ));
+        }
+
+        let mut chain = None;
+        let mut rules = Vec::new();
+        for transaction in artifact.transactions() {
+            if transaction.table() != XtablesRestoreTable::Mangle {
+                return Err(XtablesSaveProjectionError::global(
+                    XtablesSaveProjectionErrorKind::ExpectedNonMangleTable,
+                ));
+            }
+            for entry in transaction.entries() {
+                let XtablesRestoreEntry::Command(command) = entry else {
+                    return Err(XtablesSaveProjectionError::global(
+                        XtablesSaveProjectionErrorKind::ExpectedReplacementMismatch,
+                    ));
+                };
+                match command.kind() {
+                    XtablesRestoreCommandKind::Flush if chain.is_none() => {
+                        chain = Some(command.chain());
+                    }
+                    XtablesRestoreCommandKind::Append
+                        if chain.is_some_and(|chain| chain == command.chain()) =>
+                    {
+                        let line = render_live_append(command);
+                        let scan = scan_rule(&line, None)?;
+                        if !is_native_chain(&scan.source)
+                            || scan.targets.iter().any(|target| is_native_chain(target))
+                        {
+                            return Err(XtablesSaveProjectionError::global(
+                                XtablesSaveProjectionErrorKind::ExpectedReplacementMismatch,
+                            ));
+                        }
+                        rules.push(XtablesOwnedRule(line.into_boxed_str()));
+                    }
+                    _ => {
+                        return Err(XtablesSaveProjectionError::global(
+                            XtablesSaveProjectionErrorKind::ExpectedReplacementMismatch,
+                        ));
+                    }
+                }
+            }
+        }
+        let chain = chain.ok_or_else(|| {
+            XtablesSaveProjectionError::global(
+                XtablesSaveProjectionErrorKind::ExpectedReplacementMismatch,
+            )
+        })?;
+        let mut projection = self.clone();
+        let state = projection.chains.get_mut(chain).ok_or_else(|| {
+            XtablesSaveProjectionError::global(
+                XtablesSaveProjectionErrorKind::ExpectedReplacementMismatch,
+            )
+        })?;
+        state.rules = rules.into_boxed_slice();
+        projection.digest = digest_projection(
+            projection.family,
+            &projection.chains,
+            &projection.native_references,
+        );
+        Ok(projection)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -198,6 +273,16 @@ impl XtablesExpectedState {
     pub(crate) fn is_satisfied_by(&self, observed: &XtablesSaveProjection) -> bool {
         &self.projection == observed
     }
+
+    pub(crate) fn with_owned_chain_replacement(
+        &self,
+        artifact: &XtablesRestoreArtifact,
+    ) -> Result<Self, XtablesSaveProjectionError> {
+        Ok(Self {
+            phase: self.phase,
+            projection: self.projection.with_owned_chain_replacement(artifact)?,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -225,6 +310,7 @@ pub(crate) enum XtablesSaveProjectionErrorKind {
     ExpectedNonMangleTable,
     ExpectedUnownedEntry,
     ExpectedExternalAppend,
+    ExpectedReplacementMismatch,
     OwnedStateOutsideMangle,
 }
 

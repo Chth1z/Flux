@@ -335,8 +335,9 @@ pub(crate) trait UnqualifiedFunctionalCanaryAttemptContext: Send + 'static {
 
 pub(crate) enum RuntimeFunctionalCanary {
     StructuralVerificationOnly,
-    // Kept available for the privileged Linux harness and future qualified
-    // Android adapter; daemon composition deliberately selects the other arm.
+    // Installed adapter capability. The prepared Generation decides whether this is executed.
+    // Kept available for the privileged Linux harness and future qualified Android adapter;
+    // daemon composition deliberately selects the other arm.
     #[allow(dead_code)]
     RequiredUnqualified {
         context: Box<dyn UnqualifiedFunctionalCanaryAttemptContext>,
@@ -345,13 +346,11 @@ pub(crate) enum RuntimeFunctionalCanary {
 }
 
 impl RuntimeFunctionalCanary {
-    const fn mode(&self) -> FunctionalCanaryGateMode {
-        match self {
-            Self::StructuralVerificationOnly => {
-                FunctionalCanaryGateMode::StructuralVerificationOnly
-            }
-            Self::RequiredUnqualified { .. } => FunctionalCanaryGateMode::RequiredUnqualified,
-        }
+    const fn supports(&self, requested: FunctionalCanaryGateMode) -> bool {
+        matches!(
+            requested,
+            FunctionalCanaryGateMode::StructuralVerificationOnly
+        ) || matches!(self, Self::RequiredUnqualified { .. })
     }
 }
 
@@ -728,6 +727,9 @@ where
         }
         let candidate =
             self.accept_prepared_capture_path_evidence(candidate, "reload runtime generation")?;
+        if let Err(error) = self.validate_functional_canary_availability(&candidate) {
+            return Err(self.reject_prepared_after_failure(candidate, error));
+        }
         if matches!(
             self.ownership,
             RuntimeOwnership::CaptureRepairPending { .. }
@@ -738,7 +740,6 @@ where
             return Err(self.reject_prepared_after_failure(candidate, error));
         }
         let candidate_id = candidate.id;
-        self.mark_functional_gate_pending();
         let ownership = std::mem::replace(&mut self.ownership, RuntimeOwnership::Stopped);
         let (previous, capture) = match ownership {
             RuntimeOwnership::Engine {
@@ -787,6 +788,7 @@ where
                 return Err(self.reject_prepared_after_failure(candidate, error));
             }
         };
+        self.mark_functional_gate_pending(&previous);
 
         if capture == CaptureObservation::Published
             && let Err(source) = self.writer.capture_stop()
@@ -881,11 +883,20 @@ where
             }
             ActivationRole::Rollback => generation,
         };
+        if let Err(error) = self.validate_functional_canary_availability(&generation) {
+            return Err(match role {
+                ActivationRole::Candidate { .. } => ActivationFailure::before_running_commit(
+                    role,
+                    self.reject_prepared_after_failure(generation, error),
+                ),
+                ActivationRole::Rollback => ActivationFailure::committed(error),
+            });
+        }
         self.publish_runtime_with_verification(
             RuntimePhase::Activating,
             RuntimeCaptureState::Detached,
             RuntimeEngineState::Starting,
-            self.pending_verification(),
+            Self::pending_verification_for(&generation),
             Some(generation.runtime_binding()),
             None,
         );
@@ -980,7 +991,7 @@ where
             RuntimePhase::Verifying,
             RuntimeCaptureState::Published,
             RuntimeEngineState::Ready,
-            self.pending_verification(),
+            Self::pending_verification_for(&generation),
             Some(generation.runtime_binding()),
             None,
         );
@@ -991,7 +1002,7 @@ where
         ) {
             Ok(qualification) => qualification,
             Err(failure) => {
-                self.mark_functional_gate_failed();
+                self.mark_functional_gate_failed(&generation);
                 return Err(ActivationFailure::before_running_commit(
                     role,
                     self.compensate_failed_activation(
@@ -1146,11 +1157,11 @@ where
         {
             Ok(report) => report,
             Err(source) => {
+                self.mark_functional_gate_pending(&generation);
                 self.ownership = RuntimeOwnership::Engine {
                     generation,
                     capture,
                 };
-                self.mark_functional_gate_pending();
                 return Err(ControlError::runtime(
                     "maintain proxy engine",
                     source,
@@ -1160,7 +1171,7 @@ where
         };
 
         if !matches!(report, EngineReport::NoChange { .. }) {
-            self.mark_functional_gate_pending();
+            self.mark_functional_gate_pending(&generation);
         }
 
         if matches!(report, EngineReport::AwaitingCaptureRemoval { .. }) {
@@ -1168,7 +1179,7 @@ where
                 RuntimePhase::Repairing,
                 runtime_capture_state(capture),
                 RuntimeEngineState::Exited,
-                self.pending_verification(),
+                Self::pending_verification_for(&generation),
                 Some(generation.runtime_binding()),
                 None,
             );
@@ -1233,7 +1244,7 @@ where
             self.pending_publication,
             Some(PublishedRuntimeState::Running { generation }) if generation == generation_id
         );
-        let functional_requalification_pending = self.functional_canary.mode()
+        let functional_requalification_pending = generation.functional_canary_mode()
             == FunctionalCanaryGateMode::RequiredUnqualified
             && self.current_verification() == RuntimeVerificationState::FunctionalPending;
         if capture == CaptureObservation::Published
@@ -1244,11 +1255,12 @@ where
                 RuntimePhase::Verifying,
                 RuntimeCaptureState::Published,
                 RuntimeEngineState::Ready,
-                self.pending_verification(),
+                Self::pending_verification_for(&generation),
                 Some(generation_binding),
                 None,
             );
-            if self.functional_canary.mode() == FunctionalCanaryGateMode::RequiredUnqualified {
+            if generation.functional_canary_mode() == FunctionalCanaryGateMode::RequiredUnqualified
+            {
                 match self.capture_start_with_current_evidence(
                     &generation,
                     "reassert capture before functional running retry",
@@ -1280,7 +1292,7 @@ where
             ) {
                 Ok(qualification) => qualification,
                 Err(error) => {
-                    self.mark_functional_gate_failed();
+                    self.mark_functional_gate_failed(&generation);
                     self.ownership = RuntimeOwnership::CaptureRepairPending { generation };
                     return Err(error);
                 }
@@ -1835,7 +1847,7 @@ where
         &mut self,
         generation: Box<PreparedGeneration>,
     ) -> Result<(), ControlError> {
-        self.mark_functional_gate_pending();
+        self.mark_functional_gate_pending(&generation);
         if let Err(source) = self.writer.capture_stop() {
             self.ownership = RuntimeOwnership::CaptureRepairPending { generation };
             return Err(runtime_writer_error(
@@ -1902,7 +1914,7 @@ where
             };
             return Ok(());
         }
-        self.mark_functional_gate_pending();
+        self.mark_functional_gate_pending(&generation);
         match self.capture_start_with_current_evidence(
             &generation,
             "restore capture after engine restart",
@@ -1933,7 +1945,7 @@ where
             RuntimePhase::Verifying,
             RuntimeCaptureState::Published,
             RuntimeEngineState::Ready,
-            self.pending_verification(),
+            Self::pending_verification_for(&generation),
             Some(generation.runtime_binding()),
             None,
         );
@@ -1944,7 +1956,7 @@ where
         ) {
             Ok(qualification) => qualification,
             Err(failure) => {
-                self.mark_functional_gate_failed();
+                self.mark_functional_gate_failed(&generation);
                 return Err(self.compensate_failed_activation(
                     *generation,
                     ActivationRole::Rollback,
@@ -2275,6 +2287,39 @@ where
         }
     }
 
+    fn validate_functional_canary_availability(
+        &self,
+        generation: &PreparedGeneration,
+    ) -> Result<(), ControlError> {
+        if generation.functional_canary_mode()
+            == FunctionalCanaryGateMode::StructuralVerificationOnly
+        {
+            return Ok(());
+        }
+        if generation.supervised_delivery_report().is_none() {
+            return Err(ControlError::runtime(
+                "validate functional-canary runtime admission",
+                io::Error::other(
+                    "required functional-canary Generation lost its sealed report contract",
+                ),
+                "reject the Generation and repair its engine-profile binding before retrying",
+            ));
+        }
+        if !self
+            .functional_canary
+            .supports(generation.functional_canary_mode())
+        {
+            return Err(ControlError::runtime(
+                "validate functional-canary runtime admission",
+                io::Error::other(
+                    "required functional-canary Generation has no installed runtime adapter",
+                ),
+                "reject the Generation and install the required adapter before retrying",
+            ));
+        }
+        Ok(())
+    }
+
     fn verify_running_gate(
         &mut self,
         generation: &PreparedGeneration,
@@ -2285,7 +2330,9 @@ where
             runtime_writer_error(structural_operation, source, structural_recovery)
         })?;
 
-        if self.functional_canary.mode() == FunctionalCanaryGateMode::StructuralVerificationOnly {
+        if generation.functional_canary_mode()
+            == FunctionalCanaryGateMode::StructuralVerificationOnly
+        {
             return Ok(QualifiedRunningGeneration {
                 generation: generation.runtime_binding(),
                 capture_path_evidence_deadline: generation.capture_path_evidence_deadline,
@@ -2309,7 +2356,7 @@ where
                 })?
             }
             RuntimeFunctionalCanary::StructuralVerificationOnly => {
-                unreachable!("functional canary mode was checked before attempt preparation")
+                unreachable!("required adapter availability was validated before engine start")
             }
         };
         let UnqualifiedFunctionalCanaryAttemptInputs {
@@ -2357,7 +2404,7 @@ where
                 executor.execute(execution_input)
             }
             RuntimeFunctionalCanary::StructuralVerificationOnly => {
-                unreachable!("functional canary mode was checked before execution")
+                unreachable!("required adapter availability was validated before engine start")
             }
         };
         let post_engine = self.reconcile_canary_engine(
@@ -2372,7 +2419,7 @@ where
                 (environment, observed_at)
             }
             RuntimeFunctionalCanary::StructuralVerificationOnly => {
-                unreachable!("functional canary mode was checked before post-attempt observation")
+                unreachable!("required adapter availability was validated before engine start")
             }
         };
         let post_engine = post_engine?;
@@ -2617,7 +2664,13 @@ where
         if self.writer.address_resync_strategy() == AddressResyncStrategy::CoordinatorSynchronous {
             return self.resync_coordinator_addresses();
         }
-        if self.functional_canary.mode() == FunctionalCanaryGateMode::StructuralVerificationOnly {
+        let functional_requalification_required = matches!(
+            &self.ownership,
+            RuntimeOwnership::Engine { generation, .. }
+                if generation.functional_canary_mode()
+                    == FunctionalCanaryGateMode::RequiredUnqualified
+        );
+        if !functional_requalification_required {
             return self.writer.resync_addresses().map_err(|source| {
                 runtime_writer_error(
                     "resynchronize addresses",
@@ -2627,7 +2680,6 @@ where
             });
         }
 
-        self.mark_functional_gate_pending();
         let ownership = std::mem::replace(&mut self.ownership, RuntimeOwnership::Stopped);
         let (generation, capture) = match ownership {
             RuntimeOwnership::Engine {
@@ -2639,6 +2691,7 @@ where
                 return Ok(AddressResyncDisposition::CompleteNoChange);
             }
         };
+        self.mark_functional_gate_pending(&generation);
         self.pending_publication = Some(PublishedRuntimeState::Running {
             generation: generation.id,
         });
@@ -2748,8 +2801,8 @@ where
         self.runtime.snapshot().verification
     }
 
-    const fn pending_verification(&self) -> RuntimeVerificationState {
-        match self.functional_canary.mode() {
+    const fn pending_verification_for(generation: &PreparedGeneration) -> RuntimeVerificationState {
+        match generation.functional_canary_mode() {
             FunctionalCanaryGateMode::StructuralVerificationOnly => {
                 RuntimeVerificationState::StructuralOnly
             }
@@ -2759,20 +2812,8 @@ where
         }
     }
 
-    const fn normalize_verification(
-        &self,
-        verification: RuntimeVerificationState,
-    ) -> RuntimeVerificationState {
-        match self.functional_canary.mode() {
-            FunctionalCanaryGateMode::StructuralVerificationOnly => {
-                RuntimeVerificationState::StructuralOnly
-            }
-            FunctionalCanaryGateMode::RequiredUnqualified => verification,
-        }
-    }
-
-    fn mark_functional_gate_failed(&self) {
-        if self.functional_canary.mode() != FunctionalCanaryGateMode::RequiredUnqualified {
+    fn mark_functional_gate_failed(&self, generation: &PreparedGeneration) {
+        if generation.functional_canary_mode() != FunctionalCanaryGateMode::RequiredUnqualified {
             return;
         }
         let mut snapshot = self.runtime.snapshot().as_ref().clone();
@@ -2780,8 +2821,8 @@ where
         self.runtime.publish(snapshot);
     }
 
-    fn mark_functional_gate_pending(&self) {
-        if self.functional_canary.mode() != FunctionalCanaryGateMode::RequiredUnqualified {
+    fn mark_functional_gate_pending(&self, generation: &PreparedGeneration) {
+        if generation.functional_canary_mode() != FunctionalCanaryGateMode::RequiredUnqualified {
             return;
         }
         let mut snapshot = self.runtime.snapshot().as_ref().clone();
@@ -2827,7 +2868,7 @@ where
             phase,
             capture,
             engine,
-            verification: self.normalize_verification(verification),
+            verification,
             active_generation: generation,
             latest_capture_path_decision: self.writer.latest_capture_path_decision(),
             last_error,
@@ -4934,6 +4975,211 @@ mod tests {
     }
 
     #[test]
+    fn required_generation_without_runtime_adapter_is_rejected_before_engine_start() {
+        let fixture = EngineFixture::new();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let writer = ScriptedWriter {
+            events: Arc::clone(&events),
+            prepared: VecDeque::from([fixture.spec.clone()]),
+            next_generation_id: 17,
+            capture_start_failure: false,
+            capture_stop_failures: 0,
+            verify_failure: false,
+        }
+        .with_required_generations();
+        let engine = ScriptedEngine {
+            events: Arc::clone(&events),
+            reports: Arc::new(Mutex::new(VecDeque::new())),
+        };
+        let mut coordinator = RuntimeCoordinator::with_structural_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+        );
+
+        let error = coordinator
+            .execute(&RuntimeIntent::Running {
+                reason: Reason::Boot,
+            })
+            .expect_err("required Generation must not use a structural-only runtime");
+
+        assert!(
+            error
+                .to_string()
+                .contains("required functional-canary Generation has no installed runtime adapter")
+        );
+        assert_eq!(
+            *events.lock().expect("events lock"),
+            [
+                Event::Prepared(Reason::Boot),
+                Event::PreparedRejected(generation(17)),
+            ]
+        );
+    }
+
+    #[test]
+    fn unavailable_required_reload_preserves_the_structural_predecessor() {
+        let active = EngineFixture::new();
+        let candidate = EngineFixture::new();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let writer = ScriptedWriter {
+            events: Arc::clone(&events),
+            prepared: VecDeque::new(),
+            next_generation_id: 3,
+            capture_start_failure: false,
+            capture_stop_failures: 0,
+            verify_failure: false,
+        };
+        let engine = ScriptedEngine {
+            events: Arc::clone(&events),
+            reports: Arc::new(Mutex::new(VecDeque::new())),
+        };
+        let mut coordinator = RuntimeCoordinator::with_structural_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+        );
+        let capture_path_selection = test_xtables_capture_path_selection();
+        let active = PreparedGeneration::new(
+            generation(1),
+            active.spec,
+            test_engine_profile_revision(),
+            FunctionalCanaryGateMode::StructuralVerificationOnly,
+            None,
+            capture_path_selection,
+            qualified_xtables_capture_path_evidence().valid_until(),
+        );
+        let active_binding = active.runtime_binding();
+        coordinator.ownership = RuntimeOwnership::Engine {
+            generation: Box::new(active),
+            capture: CaptureObservation::Published,
+        };
+        coordinator.publish_runtime_with_verification(
+            RuntimePhase::Running,
+            RuntimeCaptureState::Published,
+            RuntimeEngineState::Ready,
+            RuntimeVerificationState::StructuralOnly,
+            Some(active_binding),
+            None,
+        );
+        let candidate = require_functional_canary_generation_fixture(PreparedGeneration::new(
+            generation(2),
+            candidate.spec,
+            test_engine_profile_revision(),
+            FunctionalCanaryGateMode::StructuralVerificationOnly,
+            None,
+            capture_path_selection,
+            qualified_xtables_capture_path_evidence().valid_until(),
+        ));
+
+        let error = coordinator
+            .reload_prepared(candidate)
+            .expect_err("unavailable required successor must be rejected before detachment");
+
+        assert!(
+            error
+                .to_string()
+                .contains("required functional-canary Generation has no installed runtime adapter")
+        );
+        assert_eq!(
+            *events.lock().expect("events lock"),
+            [Event::PreparedRejected(generation(2))]
+        );
+        assert!(matches!(
+            &coordinator.ownership,
+            RuntimeOwnership::Engine {
+                generation: owned,
+                capture: CaptureObservation::Published,
+            } if owned.id() == generation(1)
+        ));
+        let runtime = coordinator.runtime.snapshot();
+        assert_eq!(runtime.phase, RuntimePhase::Running);
+        assert_eq!(runtime.generation(), Some(generation(1)));
+        assert_eq!(
+            runtime.verification,
+            RuntimeVerificationState::StructuralOnly
+        );
+    }
+
+    #[test]
+    fn required_capable_runtime_executes_structural_generation_without_canary() {
+        let fixture = EngineFixture::new();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let canary_script = Arc::new(Mutex::new(ScriptedCanary::new([
+            ScriptedCanaryAttempt::passing(functional_request_with_nonce(
+                &fixture.spec,
+                CanaryAddressFamilies::Ipv4Only,
+                Instant::now(),
+                CanaryNonce::from_bytes([50; FUNCTIONAL_CANARY_NONCE_BYTES]),
+            )),
+        ])));
+        let writer = ScriptedWriter {
+            events: Arc::clone(&events),
+            prepared: VecDeque::from([fixture.spec.clone()]),
+            next_generation_id: 1,
+            capture_start_failure: false,
+            capture_stop_failures: 0,
+            verify_failure: false,
+        };
+        let engine = ScriptedEngine {
+            events: Arc::clone(&events),
+            reports: Arc::new(Mutex::new(VecDeque::new())),
+        };
+        let mut coordinator = RuntimeCoordinator::with_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+            scripted_required_canary(Arc::clone(&canary_script), Arc::clone(&events)),
+        );
+        let runtime = coordinator.runtime_snapshot_source();
+
+        coordinator
+            .execute(&RuntimeIntent::Running {
+                reason: Reason::Boot,
+            })
+            .expect("structural Generation converges without using the installed adapter");
+
+        assert_eq!(
+            *events.lock().expect("events lock"),
+            [
+                Event::Prepared(Reason::Boot),
+                Event::EngineRunning(CaptureObservation::Detached),
+                Event::CaptureStarted,
+                Event::CaptureVerified,
+                Event::Published(PublishedRuntimeState::Running {
+                    generation: generation(1),
+                }),
+            ]
+        );
+        events.lock().expect("events lock").clear();
+        assert_eq!(
+            coordinator
+                .resync_active_addresses()
+                .expect("structural Generation resynchronizes without requalification"),
+            AddressResyncDisposition::AcceptedDeferred
+        );
+        assert_eq!(
+            *events.lock().expect("events lock"),
+            [Event::AddressesResynchronized]
+        );
+        events.lock().expect("events lock").clear();
+        coordinator
+            .maintain_runtime()
+            .expect("structural Generation maintenance skips the installed adapter");
+        assert_eq!(
+            *events.lock().expect("events lock"),
+            [Event::EngineRunning(CaptureObservation::Published)]
+        );
+        let script = canary_script.lock().expect("canary script");
+        assert!(script.requests.is_empty());
+        assert_eq!(script.executions, 0);
+        assert_eq!(
+            runtime.snapshot().verification,
+            RuntimeVerificationState::StructuralOnly
+        );
+    }
+
+    #[test]
     fn required_canary_start_orders_complete_gate_before_running_publication() {
         let fixture = EngineFixture::new();
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -4961,7 +5207,7 @@ mod tests {
         );
         let authority_openings = engine.authority_openings();
         let mut coordinator = RuntimeCoordinator::with_dependencies(
-            writer,
+            writer.with_required_generations(),
             engine,
             Duration::from_millis(100),
             scripted_required_canary(Arc::clone(&canary_script), Arc::clone(&events)),
@@ -5033,7 +5279,7 @@ mod tests {
             [ready_canary_snapshot(98_765), ready_canary_snapshot(98_765)],
         );
         let mut coordinator = RuntimeCoordinator::with_dependencies(
-            writer,
+            writer.with_required_generations(),
             engine,
             Duration::from_millis(100),
             scripted_required_canary(canary_script, events),
@@ -5086,7 +5332,7 @@ mod tests {
             [ready_canary_snapshot(98_765), ready_canary_snapshot(98_765)],
         );
         let mut coordinator = RuntimeCoordinator::with_dependencies(
-            writer,
+            writer.with_required_generations(),
             engine,
             Duration::from_millis(100),
             scripted_required_canary(canary_script, events),
@@ -5144,7 +5390,7 @@ mod tests {
             std::iter::repeat_with(|| ready_canary_snapshot(98_765)).take(5),
         );
         let mut coordinator = RuntimeCoordinator::with_dependencies(
-            writer,
+            writer.with_required_generations(),
             engine,
             Duration::from_millis(100),
             scripted_required_canary(Arc::clone(&canary_script), events),
@@ -5209,7 +5455,7 @@ mod tests {
             std::iter::repeat_with(|| ready_canary_snapshot(98_765)).take(4),
         );
         let mut coordinator = RuntimeCoordinator::with_dependencies(
-            writer,
+            writer.with_required_generations(),
             engine,
             Duration::from_millis(100),
             scripted_required_canary(Arc::clone(&canary_script), events),
@@ -5269,7 +5515,7 @@ mod tests {
             std::iter::repeat_with(|| ready_canary_snapshot(98_765)).take(4),
         );
         let mut coordinator = RuntimeCoordinator::with_dependencies(
-            writer,
+            writer.with_required_generations(),
             engine,
             Duration::from_millis(100),
             scripted_required_canary(Arc::clone(&canary_script), events),
@@ -5325,7 +5571,7 @@ mod tests {
             [ready_canary_snapshot(98_765), ready_canary_snapshot(98_766)],
         );
         let mut coordinator = RuntimeCoordinator::with_dependencies(
-            writer,
+            writer.with_required_generations(),
             engine,
             Duration::from_millis(100),
             scripted_required_canary(canary_script, Arc::clone(&events)),
@@ -5392,7 +5638,7 @@ mod tests {
             [ready_canary_snapshot(98_765), ready_canary_snapshot(98_765)],
         );
         let mut coordinator = RuntimeCoordinator::with_dependencies(
-            writer,
+            writer.with_required_generations(),
             engine,
             Duration::from_millis(100),
             scripted_required_canary(canary_script, Arc::clone(&events)),
@@ -5463,7 +5709,7 @@ mod tests {
             executor: xtables_tproxy_local_output_executor(),
         };
         let mut coordinator = RuntimeCoordinator::with_dependencies(
-            writer,
+            writer.with_required_generations(),
             engine,
             Duration::from_millis(100),
             functional_canary,
@@ -5532,7 +5778,7 @@ mod tests {
         engine.fail_next_authority_opening(io::ErrorKind::PermissionDenied);
         engine.fail_running_on_call = Some(3);
         let mut coordinator = RuntimeCoordinator::with_dependencies(
-            writer,
+            writer.with_required_generations(),
             engine,
             Duration::from_millis(100),
             scripted_required_canary(Arc::clone(&canary_script), Arc::clone(&events)),
@@ -5728,7 +5974,7 @@ mod tests {
             std::iter::repeat_with(|| ready_canary_snapshot(98_765)).take(8),
         );
         let mut coordinator = RuntimeCoordinator::with_dependencies(
-            writer,
+            writer.with_required_generations(),
             engine,
             Duration::from_millis(100),
             scripted_required_canary(Arc::clone(&canary_script), Arc::clone(&events)),
@@ -5819,7 +6065,7 @@ mod tests {
             std::iter::repeat_with(|| ready_canary_snapshot(98_765)).take(12),
         );
         let mut coordinator = RuntimeCoordinator::with_dependencies(
-            writer,
+            writer.with_required_generations(),
             engine,
             Duration::from_millis(100),
             scripted_required_canary(Arc::clone(&canary_script), Arc::clone(&events)),
@@ -5932,7 +6178,7 @@ mod tests {
             ],
         );
         let mut coordinator = RuntimeCoordinator::with_dependencies(
-            writer,
+            writer.with_required_generations(),
             engine,
             Duration::from_millis(100),
             scripted_required_canary(Arc::clone(&canary_script), Arc::clone(&events)),
@@ -6049,7 +6295,7 @@ mod tests {
             ],
         );
         let mut coordinator = RuntimeCoordinator::with_dependencies(
-            writer,
+            writer.with_required_generations(),
             engine,
             Duration::from_millis(100),
             scripted_required_canary(Arc::clone(&canary_script), Arc::clone(&events)),
@@ -7253,6 +7499,101 @@ mod tests {
         capture_start_failure: bool,
         capture_stop_failures: usize,
         verify_failure: bool,
+    }
+
+    struct RequiredGenerationWriter<W> {
+        inner: W,
+    }
+
+    trait RequiredGenerationWriterExt: Sized {
+        fn with_required_generations(self) -> RequiredGenerationWriter<Self> {
+            RequiredGenerationWriter { inner: self }
+        }
+    }
+
+    impl<W> RequiredGenerationWriterExt for W {}
+
+    fn require_functional_canary_generation_fixture(
+        mut generation: PreparedGeneration,
+    ) -> PreparedGeneration {
+        generation.functional_canary_mode = FunctionalCanaryGateMode::RequiredUnqualified;
+        generation.supervised_delivery_report =
+            Some(EngineSupervisedDeliveryReportContract::schema_v1_fixture());
+        generation
+    }
+
+    impl<W> RuntimeWriter for RequiredGenerationWriter<W>
+    where
+        W: RuntimeWriter,
+    {
+        type Error = W::Error;
+
+        fn prepare(&mut self, reason: Reason) -> Result<PreparedGeneration, Self::Error> {
+            self.inner
+                .prepare(reason)
+                .map(require_functional_canary_generation_fixture)
+        }
+
+        fn prepare_address_successor(
+            &mut self,
+            inputs: &crate::generation_engine_config::AddressReconciledGenerationInputs,
+        ) -> Result<Option<PreparedGeneration>, Self::Error> {
+            self.inner
+                .prepare_address_successor(inputs)
+                .map(|generation| generation.map(require_functional_canary_generation_fixture))
+        }
+
+        fn prepare_subscription(
+            &mut self,
+            config: &ValidatedSubscriptionEngineConfig,
+        ) -> Result<Option<PreparedGeneration>, Self::Error> {
+            self.inner
+                .prepare_subscription(config)
+                .map(|generation| generation.map(require_functional_canary_generation_fixture))
+        }
+
+        fn accept_deferred_subscription(
+            &mut self,
+            config: ValidatedSubscriptionEngineConfig,
+        ) -> bool {
+            self.inner.accept_deferred_subscription(config)
+        }
+
+        fn latest_capture_path_decision(&self) -> Option<CapturePathDecision> {
+            self.inner.latest_capture_path_decision()
+        }
+
+        fn invalidate_latest_capture_path_decision(&mut self) {
+            self.inner.invalidate_latest_capture_path_decision();
+        }
+
+        fn reject_prepared(&mut self, generation: &PreparedGeneration) -> Result<(), Self::Error> {
+            self.inner.reject_prepared(generation)
+        }
+
+        fn capture_start(&mut self, generation: &PreparedGeneration) -> Result<(), Self::Error> {
+            self.inner.capture_start(generation)
+        }
+
+        fn capture_stop(&mut self) -> Result<(), Self::Error> {
+            self.inner.capture_stop()
+        }
+
+        fn verify_capture(&mut self, generation: &PreparedGeneration) -> Result<(), Self::Error> {
+            self.inner.verify_capture(generation)
+        }
+
+        fn publish(&mut self, phase: PublishedRuntimeState) -> Result<(), Self::Error> {
+            self.inner.publish(phase)
+        }
+
+        fn resync_addresses(&mut self) -> Result<AddressResyncDisposition, Self::Error> {
+            self.inner.resync_addresses()
+        }
+
+        fn address_resync_strategy(&self) -> AddressResyncStrategy {
+            self.inner.address_resync_strategy()
+        }
     }
 
     struct CapturePathDecisionWriter {

@@ -791,7 +791,7 @@ impl EngineSupervisedDeliveryReportContract {
     }
 
     #[cfg(test)]
-    pub(super) const fn schema_v1_fixture() -> Self {
+    pub(crate) const fn schema_v1_fixture() -> Self {
         Self::canonical_schema_v1()
     }
 

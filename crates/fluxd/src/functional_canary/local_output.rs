@@ -34,15 +34,21 @@ use super::{
     CANARY_CREDENTIAL_MAP_DIGEST_BYTES, CanaryAttemptRequest, CanaryAttemptSocketObserverSession,
     CanaryAvailability, CanaryCaptureBackend, CanaryCleanupStatus, CanaryErrorKind,
     CanaryUserNamespaceBinding, FunctionalCanaryError, UnqualifiedCanaryCleanupEvidence,
-    UnqualifiedCanaryFlowEvidenceSlots, UnqualifiedCanaryGateEvidence,
+    UnqualifiedCanaryCounterEvidence, UnqualifiedCanaryFlowEvidenceSlots,
+    UnqualifiedCanaryGateEvidence, UnqualifiedCanaryLoopEvidence,
     UnqualifiedFunctionalCanaryExecution, UnqualifiedFunctionalCanaryExecutor, bounded_prefix,
 };
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use super::supervised_delivery_report::collector::RetiredSupervisedDeliveryReport;
 
 mod driver_process;
 use driver_process::DriverProcessProof;
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub(in crate::functional_canary) mod listener_observer;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use listener_observer::ListenerObservations;
 
 const XTABLES_LOCAL_OUTPUT_UNSUPPORTED: &str = "the packaged xtables functional-canary adapter has no device-qualified direct observer for the active local-OUTPUT transaction: exact transparent-listener delivery, supervised-engine receipt, counter bounds, identity stability, and cleanup proof remain required; REDIRECT, DNAT, unrelated ingress traffic, counters alone, and route lookups are prohibited substitutes";
 const NON_TPROXY_REQUEST: &str =
@@ -2265,9 +2271,35 @@ struct ReceiptBoundTproxyLocalOutputArtifacts<R> {
     observations: R,
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+struct TproxyCanaryCaptureProof {
+    report: RetiredSupervisedDeliveryReport,
+    listeners: ListenerObservations,
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+struct TproxyCanaryRawObservations {
+    flows: UnqualifiedCanaryFlowEvidenceSlots,
+    unexpected_flow_count: u8,
+    loop_escape: UnqualifiedCanaryLoopEvidence,
+    counters: UnqualifiedCanaryCounterEvidence,
+    cleanup: UnqualifiedCanaryCleanupEvidence,
+}
+
 trait TproxyLocalOutputProcessReceiptObservations {
     fn flows(&self) -> &UnqualifiedCanaryFlowEvidenceSlots;
     fn cleanup(&self) -> &UnqualifiedCanaryCleanupEvidence;
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+impl TproxyLocalOutputProcessReceiptObservations for TproxyCanaryRawObservations {
+    fn flows(&self) -> &UnqualifiedCanaryFlowEvidenceSlots {
+        &self.flows
+    }
+
+    fn cleanup(&self) -> &UnqualifiedCanaryCleanupEvidence {
+        &self.cleanup
+    }
 }
 
 impl<D, C, P, F> UnqualifiedFunctionalCanaryExecutor for TproxyLocalOutputExecutor<D, C, P, F>
@@ -2678,8 +2710,14 @@ fn contract_failure(
 #[derive(Clone, Copy, Debug, Default)]
 struct XtablesTproxyLocalOutputDriver;
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+enum PackagedTproxyLocalOutputAttempt {}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+type PackagedTproxyLocalOutputAttempt = Infallible;
+
 impl TproxyLocalOutputDriver for XtablesTproxyLocalOutputDriver {
-    type Prepared = Infallible;
+    type Prepared = PackagedTproxyLocalOutputAttempt;
 
     fn check_tproxy_local_output(
         &self,
@@ -2705,6 +2743,26 @@ impl TproxyLocalOutputDriver for XtablesTproxyLocalOutputDriver {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+impl PreparedTproxyLocalOutputAttempt for PackagedTproxyLocalOutputAttempt {
+    type CaptureProof = TproxyCanaryCaptureProof;
+    type ProcessProof = DriverProcessProof;
+    type RawObservations = TproxyCanaryRawObservations;
+
+    fn execute_tproxy_local_output(
+        self,
+        _request: &CanaryAttemptRequest,
+        _socket_observer: CanaryAttemptSocketObserverSession,
+        _selector_session: &mut CanarySelectorSession,
+    ) -> UnverifiedTproxyLocalOutputResult<
+        Self::CaptureProof,
+        Self::ProcessProof,
+        Self::RawObservations,
+    > {
+        match self {}
+    }
+}
+
 impl PreparedTproxyLocalOutputAttempt for Infallible {
     type CaptureProof = Infallible;
     type ProcessProof = Infallible;
@@ -2727,12 +2785,63 @@ impl PreparedTproxyLocalOutputAttempt for Infallible {
     }
 }
 
-/// Placeholder verifier for a later, separately qualified direct-observation
-/// mechanism. Both inputs remain uninhabited in production, so it cannot mint
-/// a positive capture receipt.
 #[derive(Clone, Copy, Debug, Default)]
 struct TproxyCanaryCaptureVerifier;
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+impl
+    TproxyLocalOutputCaptureVerifier<
+        TproxyCanaryCaptureProof,
+        DriverProcessProof,
+        TproxyCanaryRawObservations,
+    > for TproxyCanaryCaptureVerifier
+{
+    fn verify(
+        &mut self,
+        request: &CanaryAttemptRequest,
+        raw: UnverifiedTproxyLocalOutputArtifacts<
+            TproxyCanaryCaptureProof,
+            DriverProcessProof,
+            TproxyCanaryRawObservations,
+        >,
+    ) -> Result<
+        CaptureReceiptBoundTproxyLocalOutputArtifacts<
+            DriverProcessProof,
+            TproxyCanaryRawObservations,
+        >,
+        FunctionalCanaryError,
+    > {
+        let UnverifiedTproxyLocalOutputArtifacts {
+            capture_proof,
+            process_proof,
+            mut observations,
+        } = raw;
+        let capture_receipt = TproxyLocalOutputCaptureReceipt::from_retired_supervised_report(
+            request,
+            capture_proof.report,
+            capture_proof.listeners,
+            &mut observations.flows,
+            &observations.cleanup,
+        )
+        .map_err(|error| {
+            let diagnostic = format!(
+                "retired supervised report and listener observations could not mint the local-OUTPUT capture receipt: {error:?}"
+            );
+            FunctionalCanaryError::new(
+                CanaryErrorKind::CleanupUncertain,
+                CanaryCleanupStatus::Uncertain,
+                &diagnostic,
+            )
+        })?;
+        Ok(CaptureReceiptBoundTproxyLocalOutputArtifacts {
+            capture_receipt,
+            process_proof,
+            observations,
+        })
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 impl TproxyLocalOutputCaptureVerifier<Infallible, Infallible, Infallible>
     for TproxyCanaryCaptureVerifier
 {
@@ -2751,6 +2860,30 @@ impl TproxyLocalOutputCaptureVerifier<Infallible, Infallible, Infallible>
 #[derive(Clone, Copy, Debug, Default)]
 struct TproxyCanaryProcessOwnershipVerifier;
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+impl TproxyLocalOutputProcessOwnershipVerifier<DriverProcessProof, TproxyCanaryRawObservations>
+    for TproxyCanaryProcessOwnershipVerifier
+{
+    fn verify_process_ownership(
+        &mut self,
+        request: &CanaryAttemptRequest,
+        engine_child: EngineChildAuthority,
+        capture_bound: CaptureReceiptBoundTproxyLocalOutputArtifacts<
+            DriverProcessProof,
+            TproxyCanaryRawObservations,
+        >,
+    ) -> Result<
+        ReceiptBoundTproxyLocalOutputArtifacts<TproxyCanaryRawObservations>,
+        FunctionalCanaryError,
+    > {
+        RetainedChildProcessOwnershipVerifier::new(
+            std::time::Instant::now as fn() -> std::time::Instant,
+        )
+        .verify_process_ownership(request, engine_child, capture_bound)
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 impl TproxyLocalOutputProcessOwnershipVerifier<Infallible, Infallible>
     for TproxyCanaryProcessOwnershipVerifier
 {
@@ -2771,13 +2904,63 @@ impl TproxyLocalOutputProcessOwnershipVerifier<Infallible, Infallible>
     }
 }
 
-/// Placeholder authority boundary for the later real observer/report factory.
-///
-/// Its current raw type is uninhabited, so production has no positive evidence
-/// construction path through this seam.
 #[derive(Clone, Copy, Debug, Default)]
 struct TproxyCanaryEvidenceFactory;
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+impl TproxyLocalOutputEvidenceFactory<TproxyCanaryRawObservations> for TproxyCanaryEvidenceFactory {
+    fn promote(
+        &mut self,
+        request: &CanaryAttemptRequest,
+        verified: ReceiptBoundTproxyLocalOutputArtifacts<TproxyCanaryRawObservations>,
+    ) -> Result<UnqualifiedCanaryGateEvidence, FunctionalCanaryError> {
+        let ReceiptBoundTproxyLocalOutputArtifacts {
+            capture_receipt,
+            process_ownership_receipt,
+            attempt_completed_at,
+            observations,
+        } = verified;
+        capture_receipt
+            .validate_for(
+                request,
+                &observations.flows,
+                attempt_completed_at,
+                observations.cleanup.client.quiesced_at,
+            )
+            .map_err(|error| receipt_promotion_failure("capture receipt", &error))?;
+        process_ownership_receipt
+            .validate_for(
+                request,
+                &observations.flows,
+                &observations.cleanup,
+                attempt_completed_at,
+            )
+            .map_err(|error| receipt_promotion_failure("process-ownership receipt", &error))?;
+        Ok(UnqualifiedCanaryGateEvidence::new(
+            request.clone(),
+            capture_receipt,
+            process_ownership_receipt,
+            attempt_completed_at,
+            observations.flows,
+            observations.unexpected_flow_count,
+            observations.loop_escape,
+            observations.counters,
+            observations.cleanup,
+        ))
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn receipt_promotion_failure(context: &str, error: &impl std::fmt::Debug) -> FunctionalCanaryError {
+    let diagnostic = format!("packaged local-OUTPUT {context} is invalid: {error:?}");
+    FunctionalCanaryError::new(
+        CanaryErrorKind::CleanupUncertain,
+        CanaryCleanupStatus::Uncertain,
+        &diagnostic,
+    )
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 impl TproxyLocalOutputEvidenceFactory<Infallible> for TproxyCanaryEvidenceFactory {
     fn promote(
         &mut self,
@@ -2804,9 +2987,9 @@ mod tests {
     use super::*;
     use crate::functional_canary::{
         AdmittedSupervisedDeliveryReportBinding, CanaryAddressFamilies,
-        CanaryCredentialDomainBinding, CanaryDeadline, InstalledSupervisedDeliveryReportProducer,
-        SupervisedDeliveryReportEngineHandoff, UnqualifiedCanaryCleanupEvidence,
-        UnqualifiedCanaryFlowEvidenceSlots,
+        CanaryCredentialDomainBinding, CanaryDeadline, CanaryNonce, FUNCTIONAL_CANARY_NONCE_BYTES,
+        InstalledSupervisedDeliveryReportProducer, SupervisedDeliveryReportEngineHandoff,
+        UnqualifiedCanaryCleanupEvidence, UnqualifiedCanaryFlowEvidenceSlots,
     };
     use crate::generation_engine_config::EngineSupervisedDeliveryReportContract;
     #[cfg(target_os = "linux")]
@@ -3003,6 +3186,95 @@ mod tests {
                 gid_map_digest: [10; CANARY_CREDENTIAL_MAP_DIGEST_BYTES],
             };
         });
+    }
+
+    fn packaged_receipt_bound_artifacts(
+        fixture: &Fixture,
+    ) -> ReceiptBoundTproxyLocalOutputArtifacts<TproxyCanaryRawObservations> {
+        let evidence = fixture.successful_evidence_without_selector_retirement();
+        let UnqualifiedCanaryGateEvidence {
+            request: _,
+            local_output_capture_receipt: capture_receipt,
+            local_output_process_ownership_receipt: process_ownership_receipt,
+            completed_at: attempt_completed_at,
+            flows,
+            unexpected_flow_count,
+            loop_escape,
+            counters,
+            cleanup,
+        } = evidence;
+        ReceiptBoundTproxyLocalOutputArtifacts {
+            capture_receipt,
+            process_ownership_receipt,
+            attempt_completed_at,
+            observations: TproxyCanaryRawObservations {
+                flows,
+                unexpected_flow_count,
+                loop_escape,
+                counters,
+                cleanup,
+            },
+        }
+    }
+
+    #[test]
+    fn packaged_evidence_factory_consumes_exact_receipts_and_raw_observations() {
+        for families in [
+            CanaryAddressFamilies::Ipv4Only,
+            CanaryAddressFamilies::Ipv4AndIpv6,
+        ] {
+            let fixture = Fixture::new(families);
+            let expected = fixture.successful_evidence_without_selector_retirement();
+            let verified = packaged_receipt_bound_artifacts(&fixture);
+
+            let promoted = TproxyCanaryEvidenceFactory
+                .promote(fixture.request(), verified)
+                .expect("exact packaged receipt authorities promote raw observations");
+
+            assert_eq!(promoted.request, expected.request);
+            assert_eq!(promoted.completed_at, expected.completed_at);
+            assert_eq!(promoted.flows, expected.flows);
+            assert_eq!(
+                promoted.unexpected_flow_count,
+                expected.unexpected_flow_count
+            );
+            assert_eq!(promoted.loop_escape, expected.loop_escape);
+            assert_eq!(promoted.counters, expected.counters);
+            assert_eq!(promoted.cleanup, expected.cleanup);
+        }
+    }
+
+    #[test]
+    fn packaged_evidence_factory_rejects_request_substitution() {
+        let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+        let verified = packaged_receipt_bound_artifacts(&fixture);
+        let mut substitute = fixture.request().clone();
+        substitute.nonce = CanaryNonce::from_bytes([0x5a; FUNCTIONAL_CANARY_NONCE_BYTES]);
+
+        let error = TproxyCanaryEvidenceFactory
+            .promote(&substitute, verified)
+            .expect_err("receipt authorities from another request cannot be promoted");
+
+        assert_eq!(error.kind(), CanaryErrorKind::CleanupUncertain);
+        assert_eq!(error.cleanup(), CanaryCleanupStatus::Uncertain);
+        assert!(error.diagnostic().contains("capture receipt"));
+    }
+
+    #[test]
+    fn packaged_evidence_factory_rejects_process_receipt_substitution() {
+        let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+        let mut verified = packaged_receipt_bound_artifacts(&fixture);
+        let substitute = Fixture::new(CanaryAddressFamilies::Ipv4AndIpv6)
+            .successful_evidence_without_selector_retirement();
+        verified.process_ownership_receipt = substitute.local_output_process_ownership_receipt;
+
+        let error = TproxyCanaryEvidenceFactory
+            .promote(fixture.request(), verified)
+            .expect_err("a process receipt from another request cannot be promoted");
+
+        assert_eq!(error.kind(), CanaryErrorKind::CleanupUncertain);
+        assert_eq!(error.cleanup(), CanaryCleanupStatus::Uncertain);
+        assert!(error.diagnostic().contains("process-ownership receipt"));
     }
 
     #[cfg(target_os = "linux")]
@@ -4228,7 +4500,7 @@ mod tests {
     }
 
     impl TproxyLocalOutputDriver for CountingUnsupportedDriver {
-        type Prepared = Infallible;
+        type Prepared = PackagedTproxyLocalOutputAttempt;
 
         fn check_tproxy_local_output(
             &self,
@@ -4257,7 +4529,7 @@ mod tests {
     }
 
     impl TproxyLocalOutputDriver for UnavailableDriver {
-        type Prepared = Infallible;
+        type Prepared = PackagedTproxyLocalOutputAttempt;
 
         fn check_tproxy_local_output(
             &self,

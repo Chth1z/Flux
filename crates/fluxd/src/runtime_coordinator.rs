@@ -17,13 +17,13 @@ use crate::engine_supervisor::{
 };
 use crate::functional_canary::{
     ActiveCanaryGenerationBinding, AdmittedSupervisedDeliveryReportBinding, CanaryAddressFamilies,
-    CanaryAttemptBinding, CanaryAttemptRequest, CanaryAttemptSocketObserverSession,
-    CanaryCounterDeltaBounds, CanaryDeadline, CanaryEngineBinding, CanaryEnvironmentBinding,
-    CanaryFacilityIdentity, CanaryNonce, FunctionalCanaryDisposition, FunctionalCanaryError,
-    FunctionalCanaryGateMode, InstalledSupervisedDeliveryReportProducer,
-    PreparedCanaryGenerationBinding, SupervisedDeliveryReportEngineHandoff,
-    SupervisedDeliveryReportHandoffError, UnqualifiedFunctionalCanaryExecution,
-    UnqualifiedFunctionalCanaryExecutor,
+    CanaryAttemptBinding, CanaryAttemptObjectRetirementEvidence, CanaryAttemptRequest,
+    CanaryAttemptSocketObserverSession, CanaryCounterDeltaBounds, CanaryDeadline,
+    CanaryEngineBinding, CanaryEnvironmentBinding, CanaryFacilityIdentity, CanaryNonce,
+    FunctionalCanaryDisposition, FunctionalCanaryError, FunctionalCanaryGateMode,
+    InstalledSupervisedDeliveryReportProducer, PreparedCanaryGenerationBinding,
+    SupervisedDeliveryReportEngineHandoff, SupervisedDeliveryReportHandoffError,
+    UnqualifiedFunctionalCanaryExecution, UnqualifiedFunctionalCanaryExecutor,
 };
 use crate::generation_engine_config::{
     AddressReconciler, AddressReconciliationOutcome, CapturePathDecision, CapturePathSelection,
@@ -307,23 +307,44 @@ impl CanarySelectorSession {
     }
 
     #[must_use]
-    pub(crate) fn retire(self) -> RetiredCanarySelectorSession {
+    pub(crate) fn retire(
+        self,
+        retired_at: Instant,
+        absent_observed_at: Instant,
+    ) -> RetiredCanarySelectorSession {
+        let selector = self
+            .request
+            .pre_binding()
+            .environment()
+            .attempt_objects()
+            .selector();
         RetiredCanarySelectorSession {
             request: self.request,
+            selector_retirement: CanaryAttemptObjectRetirementEvidence::new(
+                selector,
+                retired_at,
+                absent_observed_at,
+            ),
         }
     }
 }
 
-/// Proof returned only after the serialized writer retired the exact logical session.
+/// Request-bound object receipt returned only after the serialized writer proved selector absence.
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct RetiredCanarySelectorSession {
     request: CanaryAttemptRequest,
+    selector_retirement: CanaryAttemptObjectRetirementEvidence,
 }
 
 impl RetiredCanarySelectorSession {
     #[must_use]
     pub(crate) fn matches_request(&self, request: &CanaryAttemptRequest) -> bool {
         self.request == *request
+    }
+
+    #[must_use]
+    pub(crate) const fn selector_retirement(&self) -> CanaryAttemptObjectRetirementEvidence {
+        self.selector_retirement
     }
 }
 
@@ -368,7 +389,7 @@ pub(crate) trait RuntimeWriter: Send + 'static {
     ) -> Result<Option<CanarySelectorSession>, Self::Error> {
         Ok(None)
     }
-    /// Flush and consume the exact reservation before any post-attempt ownership observation.
+    /// Flush, prove absence, and consume the exact reservation before post-attempt observation.
     fn retire_canary_selector_session(
         &mut self,
         _generation: &PreparedGeneration,
@@ -2682,6 +2703,26 @@ where
                 "detach capture before recovering selector-session ownership",
             ));
         }
+        let execution = execution
+            .map_err(|source| {
+                functional_canary_error(
+                    "execute functional capture canary",
+                    source,
+                    "detach capture before repairing the proxy engine and canary environment",
+                )
+            })
+            .and_then(|mut evidence| {
+                evidence
+                    .bind_selector_retirement(retired_selector_session.selector_retirement())
+                    .map_err(|source| {
+                        functional_canary_error(
+                            "bind functional-canary selector retirement evidence",
+                            source,
+                            "detach capture before recovering selector cleanup authority",
+                        )
+                    })?;
+                Ok(evidence)
+            });
         let post_capture = self.observe_active_canary_generation(generation)?;
         let post_engine = self.reconcile_canary_engine(
             generation,
@@ -2725,13 +2766,7 @@ where
                 "detach capture before starting a fresh functional canary attempt",
             ));
         }
-        let evidence = execution.map_err(|source| {
-            functional_canary_error(
-                "execute functional capture canary",
-                source,
-                "detach capture before repairing the proxy engine and canary environment",
-            )
-        })?;
+        let evidence = execution?;
         let validated = evidence
             .validate_for(&request, &post_binding, observed_at)
             .map_err(|source| {
@@ -5610,6 +5645,81 @@ mod tests {
     }
 
     #[test]
+    fn conflicting_executor_selector_retirement_is_rejected_after_writer_retirement() {
+        let fixture = EngineFixture::new();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let request = functional_request_with_nonce(
+            &fixture.spec,
+            CanaryAddressFamilies::Ipv4Only,
+            Instant::now(),
+            CanaryNonce::from_bytes([67; FUNCTIONAL_CANARY_NONCE_BYTES]),
+        );
+        let canary_script = Arc::new(Mutex::new(ScriptedCanary::new([
+            ScriptedCanaryAttempt::passing_with_prefilled_selector_retirement(request),
+        ])));
+        let writer = ScriptedWriter {
+            events: Arc::clone(&events),
+            prepared: VecDeque::from([fixture.spec.clone()]),
+            next_generation_id: 17,
+            capture_start_failure: false,
+            capture_stop_failures: 0,
+            verify_failure: false,
+        }
+        .with_required_canary_script(Arc::clone(&canary_script));
+        let selector_session_calls = Arc::clone(&writer.selector_session_calls);
+        let observation_calls = Arc::clone(&writer.observation_calls);
+        let engine = RequiredScriptedEngine::new(
+            Arc::clone(&events),
+            [ready_canary_snapshot(98_765), ready_canary_snapshot(98_765)],
+        );
+        let mut coordinator = RuntimeCoordinator::with_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+            scripted_required_canary(canary_script, Arc::clone(&events)),
+        );
+
+        let error = coordinator
+            .execute(&RuntimeIntent::Running {
+                reason: Reason::Boot,
+            })
+            .expect_err("driver-prefilled selector retirement must not replace writer authority");
+
+        assert!(
+            error
+                .to_string()
+                .contains("CleanupSelectorRetirementConflict")
+        );
+        assert_eq!(
+            *selector_session_calls
+                .lock()
+                .expect("selector session calls lock"),
+            [
+                SelectorSessionCall::Reserved {
+                    generation: generation(17),
+                    nonce: CanaryNonce::from_bytes([67; FUNCTIONAL_CANARY_NONCE_BYTES]),
+                },
+                SelectorSessionCall::Retired {
+                    generation: generation(17),
+                    nonce: CanaryNonce::from_bytes([67; FUNCTIONAL_CANARY_NONCE_BYTES]),
+                },
+            ]
+        );
+        assert_eq!(
+            *observation_calls
+                .lock()
+                .expect("active ownership observation calls lock"),
+            [generation(17), generation(17)]
+        );
+        assert!(
+            events
+                .lock()
+                .expect("events lock")
+                .contains(&Event::CanaryReobserved(generation(17)))
+        );
+    }
+
+    #[test]
     fn required_canary_without_active_ownership_never_prepares_attempt() {
         let fixture = EngineFixture::new();
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -8374,7 +8484,11 @@ mod tests {
                     generation: generation.id(),
                     nonce,
                 });
-            Ok(Some(session.retire()))
+            let started_at = session.request().deadline().started_at();
+            Ok(Some(session.retire(
+                started_at + Duration::from_millis(206),
+                started_at + Duration::from_millis(207),
+            )))
         }
 
         fn publish(&mut self, phase: PublishedRuntimeState) -> Result<(), Self::Error> {
@@ -8860,6 +8974,7 @@ mod tests {
     #[derive(Clone, Copy)]
     enum ScriptedCanaryOutcome {
         Pass,
+        PassWithPrefilledSelectorRetirement,
         Fail {
             kind: CanaryErrorKind,
             cleanup: CanaryCleanupStatus,
@@ -8876,6 +8991,13 @@ mod tests {
             Self {
                 request,
                 outcome: ScriptedCanaryOutcome::Pass,
+            }
+        }
+
+        fn passing_with_prefilled_selector_retirement(request: CanaryAttemptRequest) -> Self {
+            Self {
+                request,
+                outcome: ScriptedCanaryOutcome::PassWithPrefilledSelectorRetirement,
             }
         }
 
@@ -9066,10 +9188,13 @@ mod tests {
                 .expect("events lock")
                 .push(Event::CanaryExecuted(generation));
             match outcome {
-                ScriptedCanaryOutcome::Pass => Ok(FunctionalCanaryFixture::from_request(
-                    request.clone(),
-                )
-                .successful_evidence()),
+                ScriptedCanaryOutcome::Pass => {
+                    Ok(FunctionalCanaryFixture::from_request(request.clone())
+                        .successful_evidence_without_selector_retirement())
+                }
+                ScriptedCanaryOutcome::PassWithPrefilledSelectorRetirement => Ok(
+                    FunctionalCanaryFixture::from_request(request.clone()).successful_evidence(),
+                ),
                 ScriptedCanaryOutcome::Fail { kind, cleanup } => Err(FunctionalCanaryError::new(
                     kind,
                     cleanup,

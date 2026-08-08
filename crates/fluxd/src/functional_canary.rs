@@ -3191,6 +3191,21 @@ impl CanaryAttemptObjectRetirementEvidence {
             absent_observed_at,
         }
     }
+
+    #[must_use]
+    pub(crate) const fn object(self) -> CanaryAttemptObjectIdentity {
+        self.object
+    }
+
+    #[must_use]
+    pub(crate) const fn retired_at(self) -> Instant {
+        self.retired_at
+    }
+
+    #[must_use]
+    pub(crate) const fn absent_observed_at(self) -> Instant {
+        self.absent_observed_at
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3231,7 +3246,7 @@ pub(crate) struct UnqualifiedCanaryCleanupEvidence {
     nonce: CanaryNonce,
     client: CanaryProcessRetirementEvidence,
     peer_servers: [CanaryProcessRetirementEvidence; CANARY_PEER_SERVER_SLOTS],
-    selector_retirement: CanaryAttemptObjectRetirementEvidence,
+    selector_retirement: Option<CanaryAttemptObjectRetirementEvidence>,
     leak_guard_retirement: CanaryAttemptObjectRetirementEvidence,
     counters_retirement: CanaryAttemptObjectRetirementEvidence,
     listener_delivery_report: CanaryListenerDeliveryReportCleanupEvidence,
@@ -3247,7 +3262,7 @@ impl UnqualifiedCanaryCleanupEvidence {
         nonce: CanaryNonce,
         client: CanaryProcessRetirementEvidence,
         peer_servers: [CanaryProcessRetirementEvidence; CANARY_PEER_SERVER_SLOTS],
-        selector_retirement: CanaryAttemptObjectRetirementEvidence,
+        selector_retirement: Option<CanaryAttemptObjectRetirementEvidence>,
         leak_guard_retirement: CanaryAttemptObjectRetirementEvidence,
         counters_retirement: CanaryAttemptObjectRetirementEvidence,
         listener_delivery_report: CanaryListenerDeliveryReportCleanupEvidence,
@@ -3359,6 +3374,40 @@ impl UnqualifiedCanaryGateEvidence {
             counters,
             cleanup,
         }
+    }
+
+    /// Complete executor-local evidence with the serialized writer's outer selector receipt.
+    pub(crate) fn bind_selector_retirement(
+        &mut self,
+        selector_retirement: CanaryAttemptObjectRetirementEvidence,
+    ) -> Result<(), CanaryEvidenceError> {
+        if self.cleanup.selector_retirement.is_some() {
+            return Err(CanaryEvidenceError::CleanupSelectorRetirementConflict);
+        }
+        if selector_retirement.object
+            != self
+                .request
+                .pre_binding()
+                .environment()
+                .attempt_objects()
+                .selector()
+        {
+            return Err(CanaryEvidenceError::CleanupObjectMismatch {
+                object: CanaryCleanupObjectRole::Selector,
+            });
+        }
+        if selector_retirement.retired_at > selector_retirement.absent_observed_at {
+            return Err(CanaryEvidenceError::CleanupObjectRetirementTimingInvalid {
+                object: CanaryCleanupObjectRole::Selector,
+            });
+        }
+        if selector_retirement.retired_at < self.completed_at {
+            return Err(CanaryEvidenceError::CleanupSelectorRetiredBeforeAttemptSettlement);
+        }
+
+        self.completed_at = selector_retirement.absent_observed_at;
+        self.cleanup.selector_retirement = Some(selector_retirement);
+        Ok(())
     }
 
     pub(crate) fn validate_for(
@@ -3690,6 +3739,9 @@ pub(crate) enum CanaryEvidenceError {
         observed: u64,
     },
     CleanupNonceMismatch,
+    CleanupSelectorRetirementMissing,
+    CleanupSelectorRetirementConflict,
+    CleanupSelectorRetiredBeforeAttemptSettlement,
     CleanupObjectMismatch {
         object: CanaryCleanupObjectRole,
     },
@@ -4595,11 +4647,6 @@ fn validate_cleanup_evidence(
     let expected_objects = environment.attempt_objects;
     let object_retirements = [
         (
-            CanaryCleanupObjectRole::Selector,
-            cleanup.selector_retirement,
-            expected_objects.selector(),
-        ),
-        (
             CanaryCleanupObjectRole::LeakGuard,
             cleanup.leak_guard_retirement,
             expected_objects.leak_guard(),
@@ -4747,6 +4794,33 @@ fn validate_cleanup_evidence(
     )?;
     if cleanup.retained_facility_observed_at < cleanup_settled_at {
         return Err(CanaryEvidenceError::CleanupFacilityObservedBeforeSettlement);
+    }
+
+    let selector_retirement = cleanup
+        .selector_retirement
+        .ok_or(CanaryEvidenceError::CleanupSelectorRetirementMissing)?;
+    let object = CanaryCleanupObjectRole::Selector;
+    if selector_retirement.object != expected_objects.selector() {
+        return Err(CanaryEvidenceError::CleanupObjectMismatch { object });
+    }
+    if selector_retirement.retired_at > selector_retirement.absent_observed_at {
+        return Err(CanaryEvidenceError::CleanupObjectRetirementTimingInvalid { object });
+    }
+    validate_cleanup_timestamp(
+        selector_retirement.retired_at,
+        attempt_completed_at,
+        deadline,
+    )?;
+    validate_cleanup_timestamp(
+        selector_retirement.absent_observed_at,
+        attempt_completed_at,
+        deadline,
+    )?;
+    if selector_retirement.retired_at < client.reaped_at {
+        return Err(CanaryEvidenceError::CleanupObjectRetiredBeforeClientReap { object });
+    }
+    if selector_retirement.retired_at < cleanup.retained_facility_observed_at {
+        return Err(CanaryEvidenceError::CleanupSelectorRetiredBeforeAttemptSettlement);
     }
     Ok(())
 }
@@ -5548,6 +5622,74 @@ pub(crate) mod tests {
                 .expect("complete fixed-slot evidence validates");
             assert_eq!(validated.evidence().request, fixture.request);
         }
+    }
+
+    #[test]
+    fn selector_retirement_requires_the_writer_receipt_before_validation() {
+        let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+        let mut evidence = fixture.successful_evidence_without_selector_retirement();
+        assert_eq!(
+            validate(&fixture, evidence)
+                .expect_err("an executor cannot self-complete writer-owned selector cleanup"),
+            CanaryEvidenceError::CleanupSelectorRetirementMissing
+        );
+
+        evidence = fixture.successful_evidence_without_selector_retirement();
+        let executor_completed_at = evidence.completed_at;
+        assert_eq!(
+            evidence
+                .bind_selector_retirement(CanaryAttemptObjectRetirementEvidence::new(
+                    fixture
+                        .request
+                        .pre_binding()
+                        .environment()
+                        .attempt_objects()
+                        .leak_guard(),
+                    executor_completed_at + Duration::from_nanos(1),
+                    executor_completed_at + Duration::from_nanos(2),
+                ))
+                .expect_err("the writer receipt must carry the exact selector object"),
+            CanaryEvidenceError::CleanupObjectMismatch {
+                object: CanaryCleanupObjectRole::Selector,
+            }
+        );
+
+        evidence = fixture.successful_evidence_without_selector_retirement();
+        let executor_completed_at = evidence.completed_at;
+        assert_eq!(
+            evidence
+                .bind_selector_retirement(CanaryAttemptObjectRetirementEvidence::new(
+                    fixture
+                        .request
+                        .pre_binding()
+                        .environment()
+                        .attempt_objects()
+                        .selector(),
+                    executor_completed_at - Duration::from_nanos(1),
+                    executor_completed_at,
+                ))
+                .expect_err("writer retirement cannot predate executor settlement"),
+            CanaryEvidenceError::CleanupSelectorRetiredBeforeAttemptSettlement
+        );
+
+        evidence = fixture.successful_evidence_without_selector_retirement();
+        let executor_completed_at = evidence.completed_at;
+        let retired_at = executor_completed_at + Duration::from_nanos(1);
+        let absent_observed_at = retired_at + Duration::from_nanos(1);
+        evidence
+            .bind_selector_retirement(CanaryAttemptObjectRetirementEvidence::new(
+                fixture
+                    .request
+                    .pre_binding()
+                    .environment()
+                    .attempt_objects()
+                    .selector(),
+                retired_at,
+                absent_observed_at,
+            ))
+            .expect("the exact writer receipt completes raw evidence");
+        assert_eq!(evidence.completed_at, absent_observed_at);
+        validate(&fixture, evidence).expect("writer-bound selector cleanup validates");
     }
 
     #[test]
@@ -7132,14 +7274,10 @@ pub(crate) mod tests {
         );
 
         let mut absence_before_retirement = fixture.successful_evidence();
-        absence_before_retirement
-            .cleanup
-            .selector_retirement
-            .retired_at = absence_before_retirement
-            .cleanup
-            .selector_retirement
-            .absent_observed_at
-            + Duration::from_nanos(1);
+        let selector_absent_observed_at =
+            selector_retirement_mut(&mut absence_before_retirement).absent_observed_at;
+        selector_retirement_mut(&mut absence_before_retirement).retired_at =
+            selector_absent_observed_at + Duration::from_nanos(1);
         assert_eq!(
             validate(&fixture, absence_before_retirement)
                 .expect_err("absence readback cannot precede object retirement"),
@@ -7183,17 +7321,28 @@ pub(crate) mod tests {
         );
 
         let mut object_removed_before_client_reap = fixture.successful_evidence();
-        object_removed_before_client_reap
-            .cleanup
-            .selector_retirement
-            .retired_at =
-            object_removed_before_client_reap.cleanup.client.reaped_at - Duration::from_nanos(1);
+        let client_reaped_at = object_removed_before_client_reap.cleanup.client.reaped_at;
+        selector_retirement_mut(&mut object_removed_before_client_reap).retired_at =
+            client_reaped_at - Duration::from_nanos(1);
         assert_eq!(
             validate(&fixture, object_removed_before_client_reap)
                 .expect_err("attempt objects remain until the client is reaped"),
             CanaryEvidenceError::CleanupObjectRetiredBeforeClientReap {
                 object: CanaryCleanupObjectRole::Selector,
             }
+        );
+
+        let mut selector_removed_before_attempt_settlement = fixture.successful_evidence();
+        let retained_facility_observed_at = selector_removed_before_attempt_settlement
+            .cleanup
+            .retained_facility_observed_at;
+        let selector = selector_retirement_mut(&mut selector_removed_before_attempt_settlement);
+        selector.retired_at = retained_facility_observed_at - Duration::from_nanos(1);
+        selector.absent_observed_at = retained_facility_observed_at;
+        assert_eq!(
+            validate(&fixture, selector_removed_before_attempt_settlement)
+                .expect_err("the outer selector guard remains through attempt-local cleanup"),
+            CanaryEvidenceError::CleanupSelectorRetiredBeforeAttemptSettlement
         );
 
         let mut peer_stopped_before_object_removal = fixture.successful_evidence();
@@ -7435,6 +7584,16 @@ pub(crate) mod tests {
             .expect("fixture uses supervised delivery-report cleanup")
     }
 
+    fn selector_retirement_mut(
+        evidence: &mut UnqualifiedCanaryGateEvidence,
+    ) -> &mut CanaryAttemptObjectRetirementEvidence {
+        evidence
+            .cleanup
+            .selector_retirement
+            .as_mut()
+            .expect("fixture carries selector retirement evidence")
+    }
+
     fn qualified_cgroup_bpf_observer() -> CanarySocketObserverAuthority {
         CanarySocketObserverAuthority::QualifiedCgroupBpf {
             program_identity: CanaryAttemptObjectIdentity::new(
@@ -7603,7 +7762,7 @@ pub(crate) mod tests {
             );
             let counters = counter_evidence(&self.request);
             let cleanup = cleanup_evidence(&self.request);
-            let completed_at = self.request.deadline().started_at() + Duration::from_millis(200);
+            let completed_at = self.request.deadline().started_at() + Duration::from_millis(205);
             let local_output_capture_receipt =
                 local_output::TproxyLocalOutputCaptureReceipt::scripted(&self.request, &flows);
             let local_output_process_ownership_receipt =
@@ -7624,6 +7783,14 @@ pub(crate) mod tests {
                 counters,
                 cleanup,
             )
+        }
+
+        pub(crate) fn successful_evidence_without_selector_retirement(
+            &self,
+        ) -> UnqualifiedCanaryGateEvidence {
+            let mut evidence = self.successful_evidence();
+            evidence.cleanup.selector_retirement = None;
+            evidence
         }
 
         pub(crate) fn observed_at(&self) -> Instant {
@@ -7976,11 +8143,11 @@ pub(crate) mod tests {
                     started_at + Duration::from_millis(138),
                 ),
             ],
-            CanaryAttemptObjectRetirementEvidence::new(
+            Some(CanaryAttemptObjectRetirementEvidence::new(
                 request.pre_binding.environment.attempt_objects.selector(),
-                started_at + Duration::from_millis(116),
-                started_at + Duration::from_millis(120),
-            ),
+                started_at + Duration::from_millis(201),
+                started_at + Duration::from_millis(202),
+            )),
             CanaryAttemptObjectRetirementEvidence::new(
                 request.pre_binding.environment.attempt_objects.leak_guard(),
                 started_at + Duration::from_millis(117),

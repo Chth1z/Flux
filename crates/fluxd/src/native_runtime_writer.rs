@@ -1,6 +1,6 @@
 use std::error::Error;
 use std::fmt;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use flux_core::{AddressResyncDisposition, GenerationId, Reason};
 use flux_platform::{
@@ -742,8 +742,11 @@ where
             ));
         }
 
+        // A positive converger result already includes exact selector-absence readback.
+        let retired_at = Instant::now();
+        let absent_observed_at = Instant::now();
         self.active_canary_selector_session = None;
-        Ok(Some(session.retire()))
+        Ok(Some(session.retire(retired_at, absent_observed_at)))
     }
 
     fn publish(&mut self, phase: PublishedRuntimeState) -> Result<(), Self::Error> {
@@ -918,6 +921,7 @@ mod tests {
         fail_retire_once: bool,
         unsupported_populate_once: bool,
         unsupported_retire_once: bool,
+        selector_retired_observed_at: Option<Instant>,
     }
 
     impl NativeCaptureConvergence for ScriptedConvergence {
@@ -1016,6 +1020,7 @@ mod tests {
                     target: target.0,
                     selector,
                 });
+            self.selector_retired_observed_at = Some(Instant::now());
             Ok(true)
         }
 
@@ -1321,6 +1326,7 @@ mod tests {
             fail_retire_once: false,
             unsupported_populate_once: false,
             unsupported_retire_once: false,
+            selector_retired_observed_at: None,
         };
         let source = ScriptedGenerationSource {
             events: Arc::clone(events),
@@ -1448,6 +1454,23 @@ mod tests {
                 .expect("retire exact selector session")
                 .expect("native writer returns exact retirement");
         assert!(retired.matches_request(&request));
+        let selector_retirement = retired.selector_retirement();
+        assert_eq!(
+            selector_retirement.object(),
+            request
+                .pre_binding()
+                .environment()
+                .attempt_objects()
+                .selector()
+        );
+        assert!(
+            selector_retirement.retired_at()
+                >= writer
+                    .convergence
+                    .selector_retired_observed_at
+                    .expect("platform retirement/readback observation")
+        );
+        assert!(selector_retirement.absent_observed_at() >= selector_retirement.retired_at());
         assert!(writer.active_canary_selector_session.is_none());
         assert!(writer.convergence.selector.is_none());
     }

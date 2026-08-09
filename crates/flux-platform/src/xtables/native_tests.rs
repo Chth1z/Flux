@@ -994,6 +994,40 @@ fn save_uses_no_arguments_null_stdin_and_complete_bounded_stdout() {
 }
 
 #[test]
+fn counted_save_uses_exact_c_argument_null_stdin_and_complete_bounded_stdout() {
+    let fixture = Fixture::new();
+    let args = fixture.path("counted-save.args");
+    let output_path = fixture.path("counted-save.output");
+    let output = b"*mangle\n[3:144] -A OUTPUT -j ACCEPT\nCOMMIT\n"
+        .repeat(1_024)
+        .into_boxed_slice();
+    assert!(output.len() > MAX_CAPTURE_BYTES);
+    fs::write(&output_path, &output).unwrap();
+    let save_body = format!(
+        ": > {}\nfor argument in \"$@\"; do {PRINTF} '%s\\n' \"$argument\" >> {}; done\nif IFS= read -r unexpected; then exit 42; fi\n{CAT} {}",
+        shell_quote(&args),
+        shell_quote(&args),
+        shell_quote(&output_path),
+    );
+    let paths = fixture.tool_set_paths(false, "1.8.11", "legacy", "exit 0", &save_body);
+    let mut adapter = XtablesToolSetProcessAdapter::open_exact_for_tests(
+        paths,
+        process_config(Duration::from_secs(2)),
+    )
+    .unwrap();
+
+    let observed = adapter
+        .save_with_counters(XtablesRestoreFamily::Ipv4)
+        .unwrap();
+    assert_eq!(observed.family(), XtablesRestoreFamily::Ipv4);
+    assert_eq!(observed.tool_identity().role(), XtablesToolRole::Save);
+    assert_eq!(observed.tool_identity().applet(), "iptables-save");
+    assert_eq!(observed.stdout(), &*output);
+    assert_eq!(observed.stderr(), "");
+    assert_eq!(fs::read(args).unwrap(), b"-c\n");
+}
+
+#[test]
 fn save_stdout_above_the_restore_byte_budget_is_rejected_without_mutation() {
     let fixture = Fixture::new();
     let output_path = fixture.path("oversized-save.output");
@@ -1009,6 +1043,38 @@ fn save_stdout_above_the_restore_byte_budget_is_rejected_without_mutation() {
     let error = adapter
         .save(XtablesRestoreFamily::Ipv4)
         .expect_err("save output above the exact projection budget must fail");
+    assert_eq!(
+        error.mutation_disposition(),
+        XtablesRestoreMutationDisposition::NotStarted
+    );
+    assert!(matches!(
+        error,
+        XtablesRestoreProcessError::OutputLimit {
+            operation: XtablesRestoreProcessOperation::Save,
+            stream: XtablesRestoreProcessStream::Stdout,
+            maximum: MAX_XTABLES_RESTORE_BYTES,
+            actual,
+            ..
+        } if actual > MAX_XTABLES_RESTORE_BYTES
+    ));
+}
+
+#[test]
+fn counted_save_stdout_above_the_restore_byte_budget_is_rejected_without_mutation() {
+    let fixture = Fixture::new();
+    let output_path = fixture.path("oversized-counted-save.output");
+    fs::write(&output_path, vec![b'x'; MAX_XTABLES_RESTORE_BYTES + 1]).unwrap();
+    let save_body = format!("{CAT} {}", shell_quote(&output_path));
+    let paths = fixture.tool_set_paths(false, "1.8.11", "legacy", "exit 0", &save_body);
+    let mut adapter = XtablesToolSetProcessAdapter::open_exact_for_tests(
+        paths,
+        process_config(Duration::from_secs(2)),
+    )
+    .unwrap();
+
+    let error = adapter
+        .save_with_counters(XtablesRestoreFamily::Ipv4)
+        .expect_err("counted-save output above the projection budget must fail");
     assert_eq!(
         error.mutation_disposition(),
         XtablesRestoreMutationDisposition::NotStarted
@@ -1131,6 +1197,32 @@ fn save_tool_mutation_during_execution_invalidates_readback_evidence() {
     let error = adapter
         .save(XtablesRestoreFamily::Ipv4)
         .expect_err("a changed save executable cannot authorize observed bytes");
+    assert_eq!(error.kind(), XtablesRestoreProcessErrorKind::ToolIdentity);
+    assert_eq!(
+        error.mutation_disposition(),
+        XtablesRestoreMutationDisposition::NotStarted
+    );
+}
+
+#[test]
+fn counted_save_tool_mutation_during_execution_invalidates_readback_evidence() {
+    let fixture = Fixture::new();
+    let paths = fixture.tool_set_paths(false, "1.8.11", "legacy", "exit 0", "exit 0");
+    let save_path = paths.ipv4().path(XtablesToolRole::Save).to_path_buf();
+    let body = format!(
+        "{PRINTF} '%s\\n' '*mangle' 'COMMIT'\n{PRINTF} '%s\\n' '# changed' >> {}",
+        shell_quote(&save_path)
+    );
+    write_script(&save_path, "iptables-save v1.8.11 (legacy)", &body, 0o700);
+    let mut adapter = XtablesToolSetProcessAdapter::open_exact_for_tests(
+        paths,
+        process_config(Duration::from_secs(2)),
+    )
+    .unwrap();
+
+    let error = adapter
+        .save_with_counters(XtablesRestoreFamily::Ipv4)
+        .expect_err("a changed counted-save executable cannot authorize observed bytes");
     assert_eq!(error.kind(), XtablesRestoreProcessErrorKind::ToolIdentity);
     assert_eq!(
         error.mutation_disposition(),

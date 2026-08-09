@@ -1505,6 +1505,23 @@ impl XtablesToolSetProcessAdapter {
         &mut self,
         family: XtablesRestoreFamily,
     ) -> Result<XtablesSaveProcessOutput, XtablesRestoreProcessError> {
+        self.save_with_fixed_arguments(family, &[])
+    }
+
+    /// Read one complete rule-and-counter snapshot without exposing arbitrary
+    /// save-tool arguments to callers.
+    pub(crate) fn save_with_counters(
+        &mut self,
+        family: XtablesRestoreFamily,
+    ) -> Result<XtablesSaveProcessOutput, XtablesRestoreProcessError> {
+        self.save_with_fixed_arguments(family, &["-c"])
+    }
+
+    fn save_with_fixed_arguments(
+        &mut self,
+        family: XtablesRestoreFamily,
+        arguments: &[&str],
+    ) -> Result<XtablesSaveProcessOutput, XtablesRestoreProcessError> {
         let config = self.config;
         self.verify_all(XtablesRestoreMutationDisposition::NotStarted)?;
         let tool = self
@@ -1514,7 +1531,7 @@ impl XtablesToolSetProcessAdapter {
         let output = run_pinned_process(
             tool,
             XtablesRestoreProcessOperation::Save,
-            &[],
+            arguments,
             ProcessStdin::Null,
             CapturePolicy::Complete(MAX_XTABLES_RESTORE_BYTES),
             config.timeout,

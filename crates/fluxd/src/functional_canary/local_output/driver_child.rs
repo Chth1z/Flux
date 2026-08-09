@@ -401,6 +401,7 @@ fn peer_for_flow(flow: CanaryFlow) -> (usize, PackagedDriverChildRole) {
     }
 }
 
+#[must_use = "a held packaged flow must be released or explicitly dropped before aborting children"]
 pub(super) struct PackagedDriverFlowHolding<'a> {
     children: &'a mut PackagedDriverChildren,
     peer_index: usize,

@@ -31,7 +31,8 @@ use super::super::{
 };
 use super::{XtablesStableFamilyPlan, XtablesStableTopologyError, XtablesStableTopologyPlan};
 use crate::xtables::native_capture::{
-    NativeCaptureCanarySelector, NativeCaptureOwnershipObservation, NativeCaptureTargetIdentity,
+    NativeCaptureCanaryRouteOutcome, NativeCaptureCanaryRouteQuery, NativeCaptureCanarySelector,
+    NativeCaptureOwnershipObservation, NativeCaptureTargetIdentity,
 };
 
 const OWNER_PAYLOAD_SCHEMA: u16 = 3;
@@ -492,6 +493,11 @@ pub(crate) trait NativeXtablesOwnerAdapter {
         &mut self,
         identity: ManagedPolicyRoutingIdentity,
     ) -> Result<NativePolicyRoutingObservation, NativeXtablesAdapterError>;
+
+    fn observe_canary_route(
+        &mut self,
+        query: NativeCaptureCanaryRouteQuery,
+    ) -> Result<NativeCaptureCanaryRouteOutcome, NativeXtablesAdapterError>;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1105,6 +1111,54 @@ fn canary_selector_plans(
         .collect()
 }
 
+fn validate_canary_route_query(
+    target: &NativeXtablesAdmittedTarget,
+    selector: NativeCaptureCanarySelector,
+    query: NativeCaptureCanaryRouteQuery,
+) -> Result<(), NativeXtablesOwnerError> {
+    let destination = query.destination();
+    let family = match destination.ip() {
+        IpAddr::V4(address) if address == selector.ipv4_peer() => XtablesRestoreFamily::Ipv4,
+        IpAddr::V6(address) if Some(address) == selector.ipv6_peer() => XtablesRestoreFamily::Ipv6,
+        IpAddr::V4(_) | IpAddr::V6(_) => {
+            return Err(NativeXtablesOwnerError::InvalidCanarySelector(
+                "route lookup destination differs from the active canary selector",
+            ));
+        }
+    };
+    if destination.port() != selector.tcp_echo_port().get() {
+        return Err(NativeXtablesOwnerError::InvalidCanarySelector(
+            "route lookup must use the selector's TCP echo responder port",
+        ));
+    }
+    let routing = target
+        .routing()
+        .iter()
+        .copied()
+        .find(|routing| restore_family(routing.family()) == family)
+        .ok_or(NativeXtablesOwnerError::InvalidCanarySelector(
+            "route lookup family has no admitted proxy-mark route",
+        ))?;
+    if query.mark() != routing.rule().mark().value() {
+        return Err(NativeXtablesOwnerError::InvalidCanarySelector(
+            "route lookup mark differs from the admitted proxy mark",
+        ));
+    }
+    let engine_uid = target
+        .topology()
+        .family(family)
+        .and_then(XtablesStableFamilyPlan::local_output_canary_engine_uid)
+        .ok_or(NativeXtablesOwnerError::InvalidCanarySelector(
+            "route lookup family has no admitted canary engine identity",
+        ))?;
+    if query.uid().get() != engine_uid {
+        return Err(NativeXtablesOwnerError::InvalidCanarySelector(
+            "route lookup UID differs from the admitted canary engine",
+        ));
+    }
+    Ok(())
+}
+
 fn render_canary_selector_artifacts(
     family: XtablesRestoreFamily,
     chain: &str,
@@ -1572,6 +1626,44 @@ where
             };
         }
         Ok(())
+    }
+
+    /// Resolve one fixed-purpose TCP route while the exact selector and native target remain
+    /// stable. A definite kernel rejection is returned as data; any ambiguous Adapter or
+    /// surrounding readback failure leaves recovery to the serialized runtime writer.
+    pub(crate) fn observe_canary_route(
+        &mut self,
+        target: &NativeXtablesAdmittedTarget,
+        selector: NativeCaptureCanarySelector,
+        query: NativeCaptureCanaryRouteQuery,
+    ) -> Result<NativeCaptureCanaryRouteOutcome, NativeXtablesOwnerError> {
+        let plans = canary_selector_plans(target, selector)?;
+        validate_canary_route_query(target, selector, query)?;
+        let (lease, _cursor) =
+            self.begin_canary_transition(target, NativeOwnerStep::CanaryActive)?;
+        let before = self.guarded_journal(lease.binding())?;
+        self.require_canary_selector_state(
+            target,
+            &plans,
+            NativeCanarySelectorProgress::Populating(plans.len()),
+        )?;
+        self.require_policy_exact(target)?;
+
+        let outcome = self.adapter.observe_canary_route(query)?;
+
+        self.require_canary_selector_state(
+            target,
+            &plans,
+            NativeCanarySelectorProgress::Populating(plans.len()),
+        )?;
+        self.require_policy_exact(target)?;
+        let after = self.guarded_journal(lease.binding())?;
+        if before != after {
+            return Err(NativeXtablesOwnerError::LiveStateConflict(
+                "native canary route lookup observed a changed owner journal",
+            ));
+        }
+        Ok(outcome)
     }
 
     fn begin_canary_transition(

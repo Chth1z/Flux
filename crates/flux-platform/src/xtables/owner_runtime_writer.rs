@@ -37,10 +37,11 @@ use crate::xtables::owner_durable::{
     NativeXtablesDurableError, NativeXtablesDurableStore, NativeXtablesRuntimeGuard,
 };
 use crate::xtables::{
-    NativeCaptureCanarySelector, NativeCaptureConvergedState, NativeCaptureConvergence,
-    NativeCaptureConvergenceReport, NativeCaptureDesired, NativeCaptureOwnershipObservation,
-    NativeCaptureTargetIdentity, XtablesCaptureArtifactSet, XtablesLocalOutputRoutingSpec,
-    XtablesLocalOutputRoutingTarget, XtablesRestoreFamily,
+    NativeCaptureCanaryRouteOutcome, NativeCaptureCanaryRouteQuery, NativeCaptureCanarySelector,
+    NativeCaptureConvergedState, NativeCaptureConvergence, NativeCaptureConvergenceReport,
+    NativeCaptureDesired, NativeCaptureOwnershipObservation, NativeCaptureTargetIdentity,
+    XtablesCaptureArtifactSet, XtablesLocalOutputRoutingSpec, XtablesLocalOutputRoutingTarget,
+    XtablesRestoreFamily,
 };
 
 const NATIVE_ROUTE_METRIC: u32 = 1_024;
@@ -1190,6 +1191,18 @@ impl NativeCaptureConvergence for NativeXtablesCaptureConverger {
             .map_err(|source| NativeXtablesCaptureConvergenceError { source })
     }
 
+    fn observe_canary_route(
+        &mut self,
+        target: &Self::Target,
+        selector: NativeCaptureCanarySelector,
+        query: NativeCaptureCanaryRouteQuery,
+    ) -> Result<Option<NativeCaptureCanaryRouteOutcome>, Self::Error> {
+        self.inner
+            .observe_canary_route(&target.inner, selector, query)
+            .map(Some)
+            .map_err(|source| NativeXtablesCaptureConvergenceError { source })
+    }
+
     fn converge(
         &mut self,
         desired: NativeCaptureDesired<Self::Target>,
@@ -1338,6 +1351,25 @@ where
         let _transaction = self.begin_transaction()?;
         match self.owner.retire_canary_selector(target, selector) {
             Ok(()) => Ok(()),
+            Err(source) => {
+                self.recovered = false;
+                Err(NativeXtablesRuntimeWriterError::Owner(Box::new(source)))
+            }
+        }
+    }
+
+    pub(crate) fn observe_canary_route(
+        &mut self,
+        target: &NativeXtablesAdmittedTarget,
+        selector: NativeCaptureCanarySelector,
+        query: NativeCaptureCanaryRouteQuery,
+    ) -> Result<NativeCaptureCanaryRouteOutcome, NativeXtablesRuntimeWriterError> {
+        if !self.recovered {
+            return Err(NativeXtablesRuntimeWriterError::RecoveryRequired);
+        }
+        let _transaction = self.begin_transaction()?;
+        match self.owner.observe_canary_route(target, selector, query) {
+            Ok(outcome) => Ok(outcome),
             Err(source) => {
                 self.recovered = false;
                 Err(NativeXtablesRuntimeWriterError::Owner(Box::new(source)))

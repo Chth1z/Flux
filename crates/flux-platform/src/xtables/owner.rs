@@ -8,8 +8,8 @@ use super::{
     XTABLES_CAPTURE_LOWERING_SCHEMA_VERSION, XtablesCaptureArtifactPair, XtablesCaptureArtifactSet,
     XtablesCaptureEntryPoint, XtablesCaptureEntryPointRole, XtablesCaptureEntrySelector,
     XtablesCaptureHook, XtablesCaptureTransactionStep, XtablesRestoreAction,
-    XtablesRestoreArtifact, XtablesRestoreContext, XtablesRestoreEntry, XtablesRestoreFamily,
-    XtablesRestoreParseError, parse_xtables_restore,
+    XtablesRestoreArtifact, XtablesRestoreCommandKind, XtablesRestoreContext, XtablesRestoreEntry,
+    XtablesRestoreFamily, XtablesRestoreParseError, parse_xtables_restore,
 };
 
 const STABLE_PREROUTING_SUFFIX: &str = "SP";
@@ -375,6 +375,33 @@ impl XtablesStableFamilyPlan {
             .iter()
             .map(Box::as_ref)
             .find(|chain| chain.starts_with(prefix))
+    }
+
+    #[must_use]
+    pub(crate) fn local_output_canary_engine_uid(&self) -> Option<u32> {
+        let output_root = self.output_root.as_deref()?;
+        let observation = self.local_output_canary_observation()?;
+        self.install
+            .transactions()
+            .iter()
+            .flat_map(|transaction| transaction.entries())
+            .find_map(|entry| {
+                let XtablesRestoreEntry::Command(command) = entry else {
+                    return None;
+                };
+                let arguments = command.arguments();
+                (command.kind() == XtablesRestoreCommandKind::Append
+                    && command.chain() == output_root
+                    && arguments.len() == 8
+                    && arguments[0].as_str() == "-m"
+                    && arguments[1].as_str() == "owner"
+                    && arguments[2].as_str() == "--uid-owner"
+                    && arguments[4].as_str() == "--gid-owner"
+                    && arguments[6].as_str() == "-j"
+                    && arguments[7].as_str() == observation)
+                    .then(|| arguments[3].as_str().parse::<u32>().ok())
+                    .flatten()
+            })
     }
 
     #[must_use]

@@ -1,9 +1,11 @@
 use std::ffi::{CStr, CString};
+use std::time::Instant;
 
 use flux_core::{InterfaceIndex, InterfaceName};
 
 use crate::netlink::policy_routing::{ManagedInterfaceIdentity, PolicyRoutingMutation};
 use crate::netlink::policy_routing_session::{PolicyRoutingSession, PolicyRoutingStepOutcome};
+use crate::netlink::route_lookup::{CanaryRouteLookupOutcome, CanaryRouteLookupRequest};
 
 use super::super::{XtablesRestoreArtifact, XtablesRestoreFamily};
 use super::{
@@ -13,6 +15,10 @@ use super::{
 use crate::netlink::policy_routing::ManagedPolicyRoutingIdentity;
 use crate::xtables::native::{
     XtablesRestoreMutationDisposition, XtablesRestoreProcessError, XtablesToolSetProcessAdapter,
+};
+use crate::xtables::native_capture::{
+    NativeCaptureCanaryRouteObservation, NativeCaptureCanaryRouteOutcome,
+    NativeCaptureCanaryRouteQuery, NativeCaptureCanaryRouteRejection,
 };
 use crate::xtables::save::{
     XtablesSaveProjection, XtablesSaveProjectionError, project_xtables_save,
@@ -164,6 +170,58 @@ impl NativeXtablesOwnerAdapter for NativeXtablesProcessOwnerAdapter {
             observed.rule().exact_count(),
             observed.rule().conflict_count(),
         ))
+    }
+
+    fn observe_canary_route(
+        &mut self,
+        query: NativeCaptureCanaryRouteQuery,
+    ) -> Result<NativeCaptureCanaryRouteOutcome, NativeXtablesAdapterError> {
+        // Every lookup gets a fresh groups-zero socket. An ambiguous receive therefore cannot
+        // contaminate a later family or attempt, and the subscribed inventory socket is untouched.
+        let mut session = PolicyRoutingSession::open().map_err(|error| {
+            NativeXtablesAdapterError::new(
+                "open canary route-lookup session",
+                NativeMutationCertainty::NotMutated,
+                error.to_string(),
+            )
+        })?;
+        let lookup = CanaryRouteLookupRequest::new(
+            query.destination().ip(),
+            query.responder_port(),
+            query.uid(),
+            query.mark(),
+        );
+        let outcome = session
+            .lookup_canary_route_until(lookup, query.deadline())
+            .map_err(|error| {
+                NativeXtablesAdapterError::new(
+                    "canary route lookup",
+                    NativeMutationCertainty::NotMutated,
+                    error.to_string(),
+                )
+            })?;
+        let observed_at = Instant::now();
+        if observed_at >= query.deadline() {
+            return Err(NativeXtablesAdapterError::new(
+                "canary route lookup completion",
+                NativeMutationCertainty::NotMutated,
+                "route lookup completed at or after the immutable canary deadline",
+            ));
+        }
+        Ok(match outcome {
+            CanaryRouteLookupOutcome::Resolved(result) => {
+                NativeCaptureCanaryRouteOutcome::Resolved(NativeCaptureCanaryRouteObservation::new(
+                    query,
+                    result.table(),
+                    observed_at,
+                ))
+            }
+            CanaryRouteLookupOutcome::Rejected(rejection) => {
+                NativeCaptureCanaryRouteOutcome::Rejected(NativeCaptureCanaryRouteRejection::new(
+                    rejection.errno(),
+                ))
+            }
+        })
     }
 }
 

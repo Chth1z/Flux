@@ -1,8 +1,8 @@
-use std::net::{Ipv4Addr, Ipv6Addr};
-use std::num::{NonZeroU16, NonZeroU32};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::num::{NonZeroI32, NonZeroU16, NonZeroU32};
 use std::os::unix::fs::MetadataExt;
-use std::path::Path;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use flux_core::{
     AddressHostFamilySelection, CaptureApplicationMode, CaptureApplicationPolicy,
@@ -20,6 +20,7 @@ use crate::xtables::native::{XtablesRestoreProcessConfig, XtablesToolSetProcessA
 use crate::xtables::owner_durable::DurableEvent;
 use crate::xtables::save::project_xtables_save;
 use crate::xtables::{
+    NativeCaptureCanaryRouteObservation, NativeCaptureCanaryRouteRejection,
     XtablesCaptureLoweringRequest, XtablesCaptureNamespace, XtablesLocalOutputRoutingSpec,
     XtablesLocalOutputRoutingTarget, XtablesRestoreAction, XtablesRestoreCommandKind,
     XtablesRestoreEntry, XtablesTproxyTarget, lower_xtables_capture,
@@ -221,6 +222,212 @@ fn canary_selector_family_mismatch_is_rejected_before_any_write() {
         assert!(owner.adapter.operations.is_empty());
         assert!(owner.target_is_exact_active(&target).unwrap());
     }
+}
+
+#[test]
+fn canary_route_lookup_requires_the_exact_active_selector_target_and_query() {
+    let target = canary_target(7, AddressHostFamilySelection::DualStack);
+    let substituted_target = canary_target(8, AddressHostFamilySelection::DualStack);
+    let fixture = Fixture::new([target.clone(), substituted_target.clone()]);
+    let mut owner = fixture.owner();
+    let selector = canary_selector(true);
+    let ipv4_destination = SocketAddr::new(
+        IpAddr::V4(selector.ipv4_peer()),
+        selector.tcp_echo_port().get(),
+    );
+    let ipv4_query = canary_route_query(ipv4_destination);
+    owner
+        .converge(NativeXtablesDesiredTarget::Active(target.clone()))
+        .unwrap();
+
+    let error = owner
+        .observe_canary_route(&target, selector, ipv4_query)
+        .expect_err("route lookup outside the active selector session must fail closed");
+    assert!(matches!(
+        error,
+        NativeXtablesOwnerError::LiveStateConflict(
+            "canary selector mutation found a different active owner state"
+        )
+    ));
+    assert!(owner.adapter.canary_route_queries.is_empty());
+
+    owner.populate_canary_selector(&target, selector).unwrap();
+    let invalid_queries = [
+        NativeCaptureCanaryRouteQuery::new(
+            SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(198, 18, 0, 3)),
+                selector.tcp_echo_port().get(),
+            ),
+            ipv4_query.uid(),
+            ipv4_query.mark(),
+            ipv4_query.deadline(),
+        )
+        .unwrap(),
+        NativeCaptureCanaryRouteQuery::new(
+            SocketAddr::new(
+                IpAddr::V4(selector.ipv4_peer()),
+                selector.udp_echo_port().get(),
+            ),
+            ipv4_query.uid(),
+            ipv4_query.mark(),
+            ipv4_query.deadline(),
+        )
+        .unwrap(),
+        NativeCaptureCanaryRouteQuery::new(
+            ipv4_destination,
+            ipv4_query.uid(),
+            BYPASS_MARK,
+            ipv4_query.deadline(),
+        )
+        .unwrap(),
+        NativeCaptureCanaryRouteQuery::new(
+            ipv4_destination,
+            NonZeroU32::new(ipv4_query.uid().get() + 1).unwrap(),
+            ipv4_query.mark(),
+            ipv4_query.deadline(),
+        )
+        .unwrap(),
+        NativeCaptureCanaryRouteQuery::new(
+            SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 3)),
+                selector.tcp_echo_port().get(),
+            ),
+            ipv4_query.uid(),
+            ipv4_query.mark(),
+            ipv4_query.deadline(),
+        )
+        .unwrap(),
+    ];
+    for query in invalid_queries {
+        assert!(matches!(
+            owner.observe_canary_route(&target, selector, query),
+            Err(NativeXtablesOwnerError::InvalidCanarySelector(_))
+        ));
+    }
+    assert!(owner.adapter.canary_route_queries.is_empty());
+
+    let ipv4_observation = match owner
+        .observe_canary_route(&target, selector, ipv4_query)
+        .unwrap()
+    {
+        NativeCaptureCanaryRouteOutcome::Resolved(observation) => observation,
+        NativeCaptureCanaryRouteOutcome::Rejected(_) => panic!("fake route must resolve"),
+    };
+    assert_eq!(ipv4_observation.query(), ipv4_query);
+    assert_eq!(ipv4_observation.selected_table().get(), 20_253);
+    assert!(ipv4_observation.observed_at() < ipv4_query.deadline());
+
+    let ipv6_query = canary_route_query(SocketAddr::new(
+        IpAddr::V6(selector.ipv6_peer().unwrap()),
+        selector.tcp_echo_port().get(),
+    ));
+    assert!(matches!(
+        owner.observe_canary_route(&target, selector, ipv6_query),
+        Ok(NativeCaptureCanaryRouteOutcome::Resolved(observation))
+            if observation.query() == ipv6_query
+    ));
+    assert_eq!(owner.adapter.canary_route_queries, [ipv4_query, ipv6_query]);
+
+    let error = owner
+        .observe_canary_route(&substituted_target, selector, ipv4_query)
+        .expect_err("a substituted admitted target must fail closed");
+    assert!(matches!(
+        error,
+        NativeXtablesOwnerError::LiveStateConflict(
+            "canary selector mutation found a different active owner state"
+        )
+    ));
+    assert_eq!(owner.adapter.canary_route_queries, [ipv4_query, ipv6_query]);
+
+    owner.retire_canary_selector(&target, selector).unwrap();
+}
+
+#[test]
+fn canary_route_lookup_rechecks_selector_policy_target_and_journal_after_observation() {
+    for case in 0..4 {
+        let target = canary_target(7, AddressHostFamilySelection::Ipv4);
+        let substituted_target = canary_target(8, AddressHostFamilySelection::Ipv4);
+        let fixture = Fixture::new([target.clone(), substituted_target.clone()]);
+        let mut owner = fixture.owner();
+        let selector = canary_selector(false);
+        owner
+            .converge(NativeXtablesDesiredTarget::Active(target.clone()))
+            .unwrap();
+        owner.populate_canary_selector(&target, selector).unwrap();
+        owner.adapter.canary_route_post_action = Some(match case {
+            0 => FakeCanaryRoutePostAction::DropSelector(XtablesRestoreFamily::Ipv4),
+            1 => FakeCanaryRoutePostAction::DropPolicyRules,
+            2 => FakeCanaryRoutePostAction::SubstituteTarget {
+                family: XtablesRestoreFamily::Ipv4,
+                identity: substituted_target.identity(),
+            },
+            3 => FakeCanaryRoutePostAction::CorruptJournal(fixture.store.journal_path()),
+            _ => unreachable!(),
+        });
+        let query = canary_route_query(SocketAddr::new(
+            IpAddr::V4(selector.ipv4_peer()),
+            selector.tcp_echo_port().get(),
+        ));
+
+        let error = owner
+            .observe_canary_route(&target, selector, query)
+            .expect_err("post-lookup owner substitution must fail closed");
+
+        if case == 3 {
+            assert!(matches!(error, NativeXtablesOwnerError::Durable(_)));
+        } else {
+            assert!(matches!(
+                error,
+                NativeXtablesOwnerError::LiveStateConflict(_)
+            ));
+        }
+        assert_eq!(owner.adapter.canary_route_queries, [query]);
+    }
+}
+
+#[test]
+fn runtime_writer_keeps_definite_route_rejection_cleanup_but_poisons_ambiguity() {
+    let target = canary_target(7, AddressHostFamilySelection::Ipv4);
+    let fixture = Fixture::new([target.clone()]);
+    let mut writer = NativeXtablesRuntimeWriter::new(
+        FakeAdapter::new(vec![target.clone()]),
+        fixture.store.clone(),
+        fixture.environment.clone(),
+    )
+    .unwrap();
+    let selector = canary_selector(false);
+    let query = canary_route_query(SocketAddr::new(
+        IpAddr::V4(selector.ipv4_peer()),
+        selector.tcp_echo_port().get(),
+    ));
+    writer.recover().unwrap();
+    writer
+        .converge(NativeXtablesDesiredTarget::Active(target.clone()))
+        .unwrap();
+    writer.populate_canary_selector(&target, selector).unwrap();
+    let errno = NonZeroI32::new(libc::EHOSTUNREACH).unwrap();
+    writer.test_adapter_mut().canary_route_result = FakeCanaryRouteResult::Rejected(errno);
+
+    assert!(matches!(
+        writer.observe_canary_route(&target, selector, query),
+        Ok(NativeCaptureCanaryRouteOutcome::Rejected(rejection))
+            if rejection.errno() == errno
+    ));
+    writer
+        .retire_canary_selector(&target, selector)
+        .expect("definite route rejection must retain normal selector cleanup");
+
+    writer.populate_canary_selector(&target, selector).unwrap();
+    writer.test_adapter_mut().canary_route_result = FakeCanaryRouteResult::AmbiguousFailure;
+    assert!(matches!(
+        writer.observe_canary_route(&target, selector, query),
+        Err(NativeXtablesRuntimeWriterError::Owner(source))
+            if matches!(source.as_ref(), NativeXtablesOwnerError::Adapter(_))
+    ));
+    assert!(matches!(
+        writer.retire_canary_selector(&target, selector),
+        Err(NativeXtablesRuntimeWriterError::RecoveryRequired)
+    ));
 }
 
 #[test]
@@ -1861,6 +2068,24 @@ struct FakeFamilyState {
     canary_selector: Option<XtablesRestoreArtifact>,
 }
 
+#[derive(Clone, Copy)]
+enum FakeCanaryRouteResult {
+    Resolved(RouteTableId),
+    Rejected(NonZeroI32),
+    AmbiguousFailure,
+}
+
+#[derive(Clone)]
+enum FakeCanaryRoutePostAction {
+    DropSelector(XtablesRestoreFamily),
+    DropPolicyRules,
+    SubstituteTarget {
+        family: XtablesRestoreFamily,
+        identity: NativeXtablesTargetIdentity,
+    },
+    CorruptJournal(PathBuf),
+}
+
 #[derive(Clone)]
 struct FakeAdapter {
     targets: Vec<NativeXtablesAdmittedTarget>,
@@ -1872,6 +2097,9 @@ struct FakeAdapter {
     write_count: usize,
     interface_identity_valid: bool,
     foreign_xtables: [bool; 2],
+    canary_route_queries: Vec<NativeCaptureCanaryRouteQuery>,
+    canary_route_result: FakeCanaryRouteResult,
+    canary_route_post_action: Option<FakeCanaryRoutePostAction>,
 }
 
 impl FakeAdapter {
@@ -1886,6 +2114,9 @@ impl FakeAdapter {
             write_count: 0,
             interface_identity_valid: true,
             foreign_xtables: [false; 2],
+            canary_route_queries: Vec::new(),
+            canary_route_result: FakeCanaryRouteResult::Resolved(RouteTableId::from_raw(20_253)),
+            canary_route_post_action: None,
         }
     }
 
@@ -2200,6 +2431,49 @@ impl NativeXtablesOwnerAdapter for FakeAdapter {
             0,
         ))
     }
+
+    fn observe_canary_route(
+        &mut self,
+        query: NativeCaptureCanaryRouteQuery,
+    ) -> Result<NativeCaptureCanaryRouteOutcome, NativeXtablesAdapterError> {
+        self.canary_route_queries.push(query);
+        let outcome = match self.canary_route_result {
+            FakeCanaryRouteResult::Resolved(table) => NativeCaptureCanaryRouteOutcome::Resolved(
+                NativeCaptureCanaryRouteObservation::new(query, table, Instant::now()),
+            ),
+            FakeCanaryRouteResult::Rejected(errno) => NativeCaptureCanaryRouteOutcome::Rejected(
+                NativeCaptureCanaryRouteRejection::new(errno),
+            ),
+            FakeCanaryRouteResult::AmbiguousFailure => {
+                return Err(NativeXtablesAdapterError::new(
+                    "fake canary route lookup",
+                    NativeMutationCertainty::NotMutated,
+                    "ambiguous route response",
+                ));
+            }
+        };
+        if let Some(action) = self.canary_route_post_action.take() {
+            match action {
+                FakeCanaryRoutePostAction::DropSelector(family) => {
+                    self.family_state_mut(family).canary_selector = None;
+                }
+                FakeCanaryRoutePostAction::DropPolicyRules => self.rules.clear(),
+                FakeCanaryRoutePostAction::SubstituteTarget { family, identity } => {
+                    let state = self.family_state_mut(family);
+                    state.prepared.clear();
+                    state.prepared.push(identity);
+                    state.stable = Some(identity);
+                    state.canary_selector = None;
+                }
+                FakeCanaryRoutePostAction::CorruptJournal(path) => {
+                    let mut encoded = std::fs::read(&path).unwrap();
+                    encoded[0] ^= 0xff;
+                    std::fs::write(path, encoded).unwrap();
+                }
+            }
+        }
+        Ok(outcome)
+    }
 }
 
 fn target(
@@ -2415,6 +2689,16 @@ fn canary_selector(ipv6: bool) -> NativeCaptureCanarySelector {
         NonZeroU16::new(10_080).unwrap(),
         NonZeroU16::new(10_081).unwrap(),
         NonZeroU16::new(10_053).unwrap(),
+    )
+    .unwrap()
+}
+
+fn canary_route_query(destination: SocketAddr) -> NativeCaptureCanaryRouteQuery {
+    NativeCaptureCanaryRouteQuery::new(
+        destination,
+        NonZeroU32::new(1_000).unwrap(),
+        PROXY_MARK,
+        Instant::now() + Duration::from_secs(30),
     )
     .unwrap()
 }

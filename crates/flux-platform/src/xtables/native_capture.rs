@@ -1,11 +1,12 @@
 use std::error::Error;
 use std::fmt::Debug;
-use std::net::{Ipv4Addr, Ipv6Addr};
-use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::num::{NonZeroI32, NonZeroU16, NonZeroU32, NonZeroU64};
+use std::time::Instant;
 
 use flux_core::{
     BootIdentity, GenerationId, NetworkNamespaceIdentity, OwnershipJournalIdentity,
-    OwnershipJournalRevision,
+    OwnershipJournalRevision, RouteTableId,
 };
 
 /// Opaque identity of one exact native capture target.
@@ -215,6 +216,125 @@ impl NativeCaptureCanarySelector {
     }
 }
 
+/// Exact fixed-purpose TCP route lookup for one active canary selector.
+///
+/// The destination port must be nonzero. Source address and source port are deliberately absent:
+/// this negative control completes before the supervised engine creates its outbound socket.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeCaptureCanaryRouteQuery {
+    destination: SocketAddr,
+    uid: NonZeroU32,
+    mark: u32,
+    deadline: Instant,
+}
+
+impl NativeCaptureCanaryRouteQuery {
+    #[must_use]
+    pub fn new(
+        destination: SocketAddr,
+        uid: NonZeroU32,
+        mark: u32,
+        deadline: Instant,
+    ) -> Option<Self> {
+        NonZeroU16::new(destination.port())?;
+        Some(Self {
+            destination,
+            uid,
+            mark,
+            deadline,
+        })
+    }
+
+    #[must_use]
+    pub const fn destination(self) -> SocketAddr {
+        self.destination
+    }
+
+    #[must_use]
+    pub fn responder_port(self) -> NonZeroU16 {
+        NonZeroU16::new(self.destination.port())
+            .expect("canary route query construction rejects port zero")
+    }
+
+    #[must_use]
+    pub const fn uid(self) -> NonZeroU32 {
+        self.uid
+    }
+
+    #[must_use]
+    pub const fn mark(self) -> u32 {
+        self.mark
+    }
+
+    #[must_use]
+    pub const fn deadline(self) -> Instant {
+        self.deadline
+    }
+}
+
+/// Strict kernel-selected table observation for one exact canary query.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeCaptureCanaryRouteObservation {
+    query: NativeCaptureCanaryRouteQuery,
+    selected_table: RouteTableId,
+    observed_at: Instant,
+}
+
+impl NativeCaptureCanaryRouteObservation {
+    #[must_use]
+    pub(crate) const fn new(
+        query: NativeCaptureCanaryRouteQuery,
+        selected_table: RouteTableId,
+        observed_at: Instant,
+    ) -> Self {
+        Self {
+            query,
+            selected_table,
+            observed_at,
+        }
+    }
+
+    #[must_use]
+    pub const fn query(self) -> NativeCaptureCanaryRouteQuery {
+        self.query
+    }
+
+    #[must_use]
+    pub const fn selected_table(self) -> RouteTableId {
+        self.selected_table
+    }
+
+    #[must_use]
+    pub const fn observed_at(self) -> Instant {
+        self.observed_at
+    }
+}
+
+/// Definite bounded kernel rejection for a read-only canary route lookup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeCaptureCanaryRouteRejection {
+    errno: NonZeroI32,
+}
+
+impl NativeCaptureCanaryRouteRejection {
+    #[must_use]
+    pub(crate) const fn new(errno: NonZeroI32) -> Self {
+        Self { errno }
+    }
+
+    #[must_use]
+    pub const fn errno(self) -> NonZeroI32 {
+        self.errno
+    }
+}
+
+/// One definite response from the fixed-purpose route lookup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeCaptureCanaryRouteOutcome {
+    Resolved(NativeCaptureCanaryRouteObservation),
+    Rejected(NativeCaptureCanaryRouteRejection),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NativeCaptureDesired<T> {
     Active(T),
@@ -295,6 +415,20 @@ pub trait NativeCaptureConvergence: Send + 'static {
         _selector: NativeCaptureCanarySelector,
     ) -> Result<bool, Self::Error> {
         Ok(false)
+    }
+
+    /// Resolves one exact canary TCP route while the matching selector remains active.
+    ///
+    /// `None` means this implementation has no route-observation authority. A definite kernel
+    /// rejection is a typed outcome so callers may perform normal cleanup; ambiguous transport or
+    /// framing failures remain implementation errors and require recovery.
+    fn observe_canary_route(
+        &mut self,
+        _target: &Self::Target,
+        _selector: NativeCaptureCanarySelector,
+        _query: NativeCaptureCanaryRouteQuery,
+    ) -> Result<Option<NativeCaptureCanaryRouteOutcome>, Self::Error> {
+        Ok(None)
     }
 
     fn converge(

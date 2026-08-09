@@ -1,3 +1,5 @@
+use std::num::NonZeroU32;
+
 use flux_core::EngineCredentials;
 
 pub const TRANSPARENT_PROXY_ENGINE_CAPABILITY_MASK: u64 = (1_u64 << 12) | (1_u64 << 13);
@@ -22,6 +24,34 @@ pub(crate) enum ChildProcessPrivilege {
     #[default]
     Inherit,
     TransparentProxy(EngineCredentials),
+    Restricted(RestrictedChildCredentials),
+}
+
+/// Exact credentials for a child that must retain no Linux capabilities.
+///
+/// This is an internal cross-crate boundary for the packaged functional canary.
+/// It deliberately does not carry process, namespace, or lifecycle authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RestrictedChildCredentials {
+    uid: NonZeroU32,
+    gid: NonZeroU32,
+}
+
+impl RestrictedChildCredentials {
+    #[must_use]
+    pub const fn new(uid: NonZeroU32, gid: NonZeroU32) -> Self {
+        Self { uid, gid }
+    }
+
+    #[must_use]
+    pub const fn uid(self) -> NonZeroU32 {
+        self.uid
+    }
+
+    #[must_use]
+    pub const fn gid(self) -> NonZeroU32 {
+        self.gid
+    }
 }
 
 #[derive(Debug, Default)]
@@ -32,6 +62,7 @@ pub(crate) struct ChildProcessConfig {
     pub(crate) kill_on_parent_death: bool,
     pub(crate) close_unlisted_fds: bool,
     pub(crate) inherited_fds: Vec<i32>,
+    pub(crate) network_namespace: Option<std::fs::File>,
     pub(crate) privilege: ChildProcessPrivilege,
 }
 
@@ -39,11 +70,12 @@ pub(crate) struct ChildProcessConfig {
 mod implementation {
     use std::io;
     use std::mem::MaybeUninit;
+    use std::os::fd::AsRawFd;
     use std::os::unix::process::CommandExt;
     use std::process::Command;
 
     use super::{
-        ChildProcessConfig, ChildProcessPrivilege, ProcessSignal,
+        ChildProcessConfig, ChildProcessPrivilege, ProcessSignal, RestrictedChildCredentials,
         TRANSPARENT_PROXY_ENGINE_CAPABILITY_MASK, TRANSPARENT_PROXY_ENGINE_SECUREBITS,
     };
 
@@ -93,6 +125,7 @@ mod implementation {
         let new_process_group = config.new_process_group;
         let close_unlisted_fds = config.close_unlisted_fds;
         let privilege = config.privilege;
+        let network_namespace = config.network_namespace;
         // Capture the creating process before fork. `PR_SET_PDEATHSIG` is not
         // retroactive, so the child compares this identity after arming the
         // signal to close the parent-exit-before-prctl race.
@@ -140,6 +173,15 @@ mod implementation {
                     // intentionally ignored so a sandbox cannot prevent exec.
                     let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit);
                 }
+                if let Some(network_namespace) = &network_namespace
+                    && libc::syscall(
+                        libc::SYS_setns,
+                        network_namespace.as_raw_fd(),
+                        libc::CLONE_NEWNET,
+                    ) != 0
+                {
+                    return Err(last_fork_error());
+                }
                 apply_privilege(privilege)?;
                 if let Some(expected_parent) = expected_parent {
                     arm_parent_death_signal(expected_parent)?;
@@ -151,10 +193,20 @@ mod implementation {
     }
 
     fn apply_privilege(privilege: ChildProcessPrivilege) -> Result<(), io::Error> {
-        let ChildProcessPrivilege::TransparentProxy(credentials) = privilege else {
-            return Ok(());
-        };
+        match privilege {
+            ChildProcessPrivilege::Inherit => Ok(()),
+            ChildProcessPrivilege::TransparentProxy(credentials) => {
+                apply_transparent_proxy_privilege(credentials)
+            }
+            ChildProcessPrivilege::Restricted(credentials) => {
+                apply_restricted_privilege(credentials)
+            }
+        }
+    }
 
+    fn apply_transparent_proxy_privilege(
+        credentials: flux_core::EngineCredentials,
+    ) -> Result<(), io::Error> {
         // Clear any inherited ambient authority before locking the root and
         // set-ID capability fixups into their least-privilege behavior.
         // SAFETY: PR_CAP_AMBIENT_CLEAR_ALL accepts only scalar arguments and
@@ -172,7 +224,7 @@ mod implementation {
             return Err(last_fork_error());
         }
         set_securebits(BASE_SECUREBITS)?;
-        drop_unrequired_bounding_capabilities()?;
+        drop_unrequired_bounding_capabilities(TRANSPARENT_PROXY_ENGINE_CAPABILITY_MASK)?;
 
         // SAFETY: the raw Linux setgroups syscall receives a zero element count,
         // so the null group-array pointer is not dereferenced.
@@ -235,6 +287,81 @@ mod implementation {
         verify_privilege(credentials.uid().get(), credentials.gid().get())
     }
 
+    fn apply_restricted_privilege(
+        credentials: RestrictedChildCredentials,
+    ) -> Result<(), io::Error> {
+        // Optional namespace entry has already completed. From this point the
+        // child cannot regain namespace or networking authority across exec.
+        // SAFETY: the ambient-clear prctl accepts scalar constants only and
+        // affects only the calling pre-exec child.
+        if unsafe {
+            libc::prctl(
+                libc::PR_CAP_AMBIENT,
+                libc::PR_CAP_AMBIENT_CLEAR_ALL,
+                0,
+                0,
+                0,
+            )
+        } != 0
+        {
+            return Err(last_fork_error());
+        }
+        set_securebits(BASE_SECUREBITS)?;
+        drop_unrequired_bounding_capabilities(0)?;
+        clear_supplementary_groups()?;
+
+        let gid = credentials.gid().get();
+        // SAFETY: setresgid receives three validated scalar IDs and mutates
+        // only the calling pre-exec child.
+        if unsafe { libc::syscall(libc::SYS_setresgid, gid, gid, gid) } != 0 {
+            return Err(last_fork_error());
+        }
+        let uid = credentials.uid().get();
+        // SAFETY: setresuid receives three validated scalar IDs and mutates
+        // only the calling pre-exec child.
+        if unsafe { libc::syscall(libc::SYS_setresuid, uid, uid, uid) } != 0 {
+            return Err(last_fork_error());
+        }
+        set_capabilities(0, 0, 0)?;
+        // SAFETY: PR_SET_NO_NEW_PRIVS accepts scalar arguments only and
+        // irreversibly constrains the calling pre-exec child.
+        if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+            return Err(last_fork_error());
+        }
+        verify_restricted_privilege(uid, gid)
+    }
+
+    fn clear_supplementary_groups() -> Result<(), io::Error> {
+        // SAFETY: a zero element count means the null group pointer is not
+        // dereferenced; the syscall affects only the calling child.
+        if unsafe {
+            libc::syscall(
+                libc::SYS_setgroups,
+                0_usize,
+                std::ptr::null::<libc::gid_t>(),
+            )
+        } == 0
+        {
+            return Ok(());
+        }
+        let error = last_fork_error();
+        if error.raw_os_error() == Some(libc::EPERM)
+            // SAFETY: the zero-count query does not dereference its null output
+            // pointer and reads only the calling child's group count.
+            && unsafe {
+                libc::syscall(
+                    libc::SYS_getgroups,
+                    0_usize,
+                    std::ptr::null_mut::<libc::gid_t>(),
+                )
+            } == 0
+        {
+            Ok(())
+        } else {
+            Err(error)
+        }
+    }
+
     fn set_securebits(bits: libc::c_ulong) -> Result<(), io::Error> {
         // SAFETY: PR_SET_SECUREBITS accepts one scalar bit mask and accesses no
         // user pointer; the caller supplies only the masks defined above.
@@ -245,9 +372,9 @@ mod implementation {
         }
     }
 
-    fn drop_unrequired_bounding_capabilities() -> Result<(), io::Error> {
+    fn drop_unrequired_bounding_capabilities(retained: u64) -> Result<(), io::Error> {
         for capability in 0..=MAX_CAPABILITY_NUMBER {
-            if TRANSPARENT_PROXY_ENGINE_CAPABILITY_MASK & (1_u64 << capability) != 0 {
+            if retained & (1_u64 << capability) != 0 {
                 continue;
             }
             // SAFETY: PR_CAPBSET_DROP accepts one capability number from the
@@ -331,52 +458,7 @@ mod implementation {
     }
 
     fn verify_privilege(uid: u32, gid: u32) -> Result<(), io::Error> {
-        let mut real_uid = u32::MAX;
-        let mut effective_uid = u32::MAX;
-        let mut saved_uid = u32::MAX;
-        // SAFETY: the raw Linux getresuid syscall receives three pointers to
-        // distinct initialized u32 storage valid for its writes.
-        if unsafe {
-            libc::syscall(
-                libc::SYS_getresuid,
-                &raw mut real_uid,
-                &raw mut effective_uid,
-                &raw mut saved_uid,
-            )
-        } != 0
-            || [real_uid, effective_uid, saved_uid] != [uid; 3]
-        {
-            return Err(fork_contract_error());
-        }
-        let mut real_gid = u32::MAX;
-        let mut effective_gid = u32::MAX;
-        let mut saved_gid = u32::MAX;
-        // SAFETY: the raw Linux getresgid syscall receives three pointers to
-        // distinct initialized u32 storage valid for its writes.
-        if unsafe {
-            libc::syscall(
-                libc::SYS_getresgid,
-                &raw mut real_gid,
-                &raw mut effective_gid,
-                &raw mut saved_gid,
-            )
-        } != 0
-            || [real_gid, effective_gid, saved_gid] != [gid; 3]
-        {
-            return Err(fork_contract_error());
-        }
-        // SAFETY: the raw Linux getgroups syscall receives a zero element
-        // count, so the null output pointer is not dereferenced.
-        if unsafe {
-            libc::syscall(
-                libc::SYS_getgroups,
-                0_usize,
-                std::ptr::null_mut::<libc::gid_t>(),
-            )
-        } != 0
-        {
-            return Err(fork_contract_error());
-        }
+        verify_ids_and_groups(uid, gid)?;
         let capabilities = read_capabilities()?;
         let expected = capability_data(
             TRANSPARENT_PROXY_ENGINE_CAPABILITY_MASK,
@@ -418,6 +500,91 @@ mod implementation {
             {
                 return Err(fork_contract_error());
             }
+        }
+        Ok(())
+    }
+
+    fn verify_restricted_privilege(uid: u32, gid: u32) -> Result<(), io::Error> {
+        verify_ids_and_groups(uid, gid)?;
+        let capabilities = read_capabilities()?;
+        // SAFETY: both getter operations accept scalar zero arguments and read
+        // only state associated with the calling child.
+        let securebits = unsafe { libc::prctl(libc::PR_GET_SECUREBITS, 0, 0, 0, 0) };
+        // SAFETY: PR_GET_NO_NEW_PRIVS likewise accepts scalar zero arguments.
+        let no_new_privileges = unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) };
+        if capabilities.iter().any(|observed| {
+            observed.effective != 0 || observed.permitted != 0 || observed.inheritable != 0
+        }) || securebits != BASE_SECUREBITS as libc::c_int
+            || no_new_privileges != 1
+            || read_capability_bounding()? != 0
+        {
+            return Err(fork_contract_error());
+        }
+        for capability in 0..=MAX_CAPABILITY_NUMBER {
+            // SAFETY: the bounded capability number and remaining arguments
+            // are scalar values; no user pointer is dereferenced.
+            if unsafe {
+                libc::prctl(
+                    libc::PR_CAP_AMBIENT,
+                    libc::PR_CAP_AMBIENT_IS_SET,
+                    capability,
+                    0,
+                    0,
+                )
+            } > 0
+            {
+                return Err(fork_contract_error());
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_ids_and_groups(uid: u32, gid: u32) -> Result<(), io::Error> {
+        let mut real_uid = u32::MAX;
+        let mut effective_uid = u32::MAX;
+        let mut saved_uid = u32::MAX;
+        // SAFETY: getresuid receives pointers to three distinct writable u32
+        // values owned by this stack frame.
+        if unsafe {
+            libc::syscall(
+                libc::SYS_getresuid,
+                &raw mut real_uid,
+                &raw mut effective_uid,
+                &raw mut saved_uid,
+            )
+        } != 0
+            || [real_uid, effective_uid, saved_uid] != [uid; 3]
+        {
+            return Err(fork_contract_error());
+        }
+        let mut real_gid = u32::MAX;
+        let mut effective_gid = u32::MAX;
+        let mut saved_gid = u32::MAX;
+        // SAFETY: getresgid receives pointers to three distinct writable u32
+        // values owned by this stack frame.
+        if unsafe {
+            libc::syscall(
+                libc::SYS_getresgid,
+                &raw mut real_gid,
+                &raw mut effective_gid,
+                &raw mut saved_gid,
+            )
+        } != 0
+            || [real_gid, effective_gid, saved_gid] != [gid; 3]
+        {
+            return Err(fork_contract_error());
+        }
+        // SAFETY: the zero-count query does not dereference its null output
+        // pointer and reads only the calling child's group count.
+        if unsafe {
+            libc::syscall(
+                libc::SYS_getgroups,
+                0_usize,
+                std::ptr::null_mut::<libc::gid_t>(),
+            )
+        } != 0
+        {
+            return Err(fork_contract_error());
         }
         Ok(())
     }
@@ -663,6 +830,7 @@ mod implementation {
             kill_on_parent_death: _,
             close_unlisted_fds: _,
             inherited_fds: _,
+            network_namespace: _,
             privilege: _,
         } = config;
         Ok(())
@@ -711,6 +879,28 @@ pub(crate) fn configure_child_process(
     #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
     record_native_composition_test_exec(command)?;
     implementation::configure_child_process(command, config)
+}
+
+/// Configure one packaged canary child to enter its final namespace and exact
+/// zero-capability credentials before exec.
+pub fn configure_restricted_child_process(
+    command: &mut std::process::Command,
+    credentials: RestrictedChildCredentials,
+    network_namespace: Option<std::fs::File>,
+    inherited_fds: Vec<i32>,
+) -> Result<(), std::io::Error> {
+    configure_child_process(
+        command,
+        ChildProcessConfig {
+            raise_nofile_limit: false,
+            new_process_group: false,
+            kill_on_parent_death: true,
+            close_unlisted_fds: true,
+            inherited_fds,
+            network_namespace,
+            privilege: ChildProcessPrivilege::Restricted(credentials),
+        },
+    )
 }
 
 #[cfg(all(feature = "native-composition-test", target_os = "linux"))]

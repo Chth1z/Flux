@@ -2,6 +2,9 @@ use flux_platform::{SystemCapabilityProfileSource, SystemKernelReleaseSource};
 
 fn main() {
     let args = std::env::args().collect::<Vec<_>>();
+    if let Some(exit) = fluxd::internal::try_run_packaged_canary_child(&args) {
+        std::process::exit(exit);
+    }
     if args.get(1).is_some_and(|command| command == "cleanup") {
         let options = match fluxd::DaemonOptions::from_environment() {
             Ok(options) => options,

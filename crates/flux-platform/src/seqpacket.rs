@@ -840,6 +840,16 @@ mod implementation {
             self.send_record(packet, None)
         }
 
+        /// Sends one complete record only if it can be queued before the
+        /// exclusive monotonic deadline.
+        pub fn send_packet_until(
+            &self,
+            packet: &[u8],
+            exclusive_deadline: Instant,
+        ) -> Result<bool, PlatformError> {
+            self.send_record_until(packet, None, exclusive_deadline)
+        }
+
         pub fn send_connection(
             &self,
             payload: &[u8],
@@ -2525,6 +2535,14 @@ mod implementation {
         }
 
         pub fn send_packet(&self, _packet: &[u8]) -> Result<(), PlatformError> {
+            Err(PlatformError::UnsupportedPlatform(std::env::consts::OS))
+        }
+
+        pub fn send_packet_until(
+            &self,
+            _packet: &[u8],
+            _exclusive_deadline: Instant,
+        ) -> Result<bool, PlatformError> {
             Err(PlatformError::UnsupportedPlatform(std::env::consts::OS))
         }
 

@@ -177,6 +177,58 @@ impl RetainedDriverChild {
             retirement,
         })
     }
+
+    /// Compensates a failed pre-proof child transaction without minting
+    /// retirement evidence. Success means this parent reaped the exact child.
+    pub(super) fn abort_and_reap(
+        mut self,
+        exclusive_deadline: Instant,
+    ) -> Result<(), DriverProcessAuthorityError> {
+        let child = self
+            .child
+            .as_mut()
+            .expect("live retained authority owns its child");
+        match child
+            .try_wait()
+            .map_err(|source| DriverProcessAuthorityError::ChildOperation {
+                role: self.role,
+                operation: "inspect failed child transaction",
+                source,
+            })? {
+            Some(_) => {
+                drop(self.child.take());
+                return Ok(());
+            }
+            None => child
+                .kill()
+                .map_err(|source| DriverProcessAuthorityError::ChildOperation {
+                    role: self.role,
+                    operation: "abort failed child transaction",
+                    source,
+                })?,
+        }
+        loop {
+            if child
+                .try_wait()
+                .map_err(|source| DriverProcessAuthorityError::ChildOperation {
+                    role: self.role,
+                    operation: "reap failed child transaction",
+                    source,
+                })?
+                .is_some()
+            {
+                drop(self.child.take());
+                return Ok(());
+            }
+            if Instant::now() >= exclusive_deadline {
+                return Err(DriverProcessAuthorityError::DeadlineExpired {
+                    role: self.role,
+                    operation: "failed child transaction reap",
+                });
+            }
+            sleep_until_reap_poll(exclusive_deadline);
+        }
+    }
 }
 
 impl Drop for RetainedDriverChild {
@@ -606,7 +658,7 @@ impl Drop for ChildReapGuard {
     }
 }
 
-fn retire_child_without_blocking(mut child: Child) {
+pub(super) fn retire_child_without_blocking(mut child: Child) {
     if matches!(child.try_wait(), Ok(Some(_))) {
         return;
     }

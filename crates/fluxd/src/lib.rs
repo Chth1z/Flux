@@ -81,6 +81,16 @@ pub use traffic_observation::{
     TrafficObservationPublication, TrafficObservationUpdate, TrafficStatisticsSnapshotSource,
 };
 
+#[doc(hidden)]
+pub mod internal {
+    /// Dispatches the packaged canary's private self-exec child mode before
+    /// ordinary user-facing CLI parsing.
+    #[must_use]
+    pub fn try_run_packaged_canary_child(args: &[String]) -> Option<i32> {
+        crate::functional_canary::try_run_internal_driver_child(args)
+    }
+}
+
 pub trait DaemonClient: ControlClient {
     fn ping(&self) -> Result<(), ControlError>;
     fn status(&self) -> Result<DaemonSnapshot, ControlError>;

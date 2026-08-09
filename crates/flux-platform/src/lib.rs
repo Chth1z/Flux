@@ -155,6 +155,9 @@ pub mod internal {
         MAX_ANDROID_IDENTITY_PROPERTY_BYTES, validate_android_identity_properties,
         validate_android_verified_boot_properties,
     };
+    pub use crate::child_process::{
+        RestrictedChildCredentials, configure_restricted_child_process,
+    };
     #[cfg(any(target_os = "linux", target_os = "android"))]
     pub use crate::engine_credential_probe::{
         EngineCredentialProbeCapabilities, EngineCredentialProbeCommand,
@@ -171,6 +174,25 @@ pub mod internal {
         SingBoxLaunchControlClaimError, SingBoxProcessAdapter, SingBoxProcessError,
         SingBoxVersionReport, TerminationOutcome, ValidationReport,
     };
+
+    #[must_use]
+    pub fn seqpacket_inherited_descriptor(connection: &crate::SeqpacketConnection) -> i32 {
+        connection.inherited_descriptor()
+    }
+
+    /// Claims the sole inherited endpoint after an exact child exec.
+    ///
+    /// # Safety
+    ///
+    /// The descriptor must be the caller's sole unowned inherited seqpacket
+    /// endpoint and must not be concurrently closed or replaced.
+    pub unsafe fn claim_inherited_seqpacket_connection(
+        descriptor: i32,
+    ) -> Result<crate::SeqpacketConnection, crate::PlatformError> {
+        // SAFETY: this wrapper preserves the caller's sole-owner precondition
+        // documented above and transfers it unchanged to the implementation.
+        unsafe { crate::SeqpacketConnection::claim_inherited(descriptor) }
+    }
 }
 
 pub trait KernelReleaseSource {

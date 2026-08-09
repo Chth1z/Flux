@@ -1691,6 +1691,7 @@ fn configure_child(
             kill_on_parent_death: true,
             close_unlisted_fds: false,
             inherited_fds,
+            network_namespace: None,
             privilege: match privilege {
                 SingBoxPrivilege::Inherit => ChildProcessPrivilege::Inherit,
                 SingBoxPrivilege::TransparentProxy(credentials) => {

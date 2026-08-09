@@ -5225,6 +5225,10 @@ fn bounded_prefix(diagnostic: &str) -> String {
 
 pub(crate) mod local_output;
 mod supervised_delivery_report;
+
+pub(crate) fn try_run_internal_driver_child(args: &[String]) -> Option<i32> {
+    local_output::try_run_internal_child(args)
+}
 use supervised_delivery_report::CanaryListenerDeliveryReportCleanupDisposition;
 pub(crate) use supervised_delivery_report::{
     AdmittedSupervisedDeliveryReportBinding, CanaryListenerDeliveryReportCleanupEvidence,

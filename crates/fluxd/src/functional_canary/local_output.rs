@@ -42,8 +42,20 @@ use super::{
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use super::supervised_delivery_report::collector::RetiredSupervisedDeliveryReport;
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod driver_child;
 mod driver_process;
 use driver_process::DriverProcessProof;
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(in crate::functional_canary) fn try_run_internal_child(args: &[String]) -> Option<i32> {
+    driver_child::try_run_internal_child(args)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub(in crate::functional_canary) fn try_run_internal_child(_args: &[String]) -> Option<i32> {
+    None
+}
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub(in crate::functional_canary) mod listener_observer;

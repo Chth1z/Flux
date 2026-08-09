@@ -170,7 +170,13 @@ impl ChildBindPlan {
 pub(super) struct PackagedDriverChildren {
     client: PackagedDriverChild,
     peer_servers: [PackagedDriverChild; CANARY_PEER_SERVER_SLOTS],
-    next_flow_index: usize,
+    traffic_state: PackagedDriverTrafficState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PackagedDriverTrafficState {
+    Ready { next_flow_index: usize },
+    InFlight,
 }
 
 impl PackagedDriverChildren {
@@ -247,14 +253,15 @@ impl PackagedDriverChildren {
         Ok(Self {
             client,
             peer_servers: [peer_0, peer_1, peer_2],
-            next_flow_index: 0,
+            traffic_state: PackagedDriverTrafficState::Ready { next_flow_index: 0 },
         })
     }
 
     /// Start one exact flow in canonical request order and return only after
     /// both live endpoints have authenticated their held socket tuples. The
     /// borrow prevents another child command until the caller explicitly
-    /// releases the peer response or drops the hold and aborts all children.
+    /// releases the peer response. Dropping the hold poisons orderly
+    /// continuation and leaves only the retained all-child abort/reap path.
     pub(super) fn begin_flow(
         &mut self,
         request: &CanaryAttemptRequest,
@@ -270,11 +277,17 @@ impl PackagedDriverChildren {
         exclusive_deadline: Instant,
     ) -> Result<PackagedDriverFlowHolding<'_>, PackagedDriverChildError> {
         let flow = plan.flow();
-        if CanaryFlow::ALL.get(self.next_flow_index).copied() != Some(flow) {
+        let PackagedDriverTrafficState::Ready { next_flow_index } = self.traffic_state else {
+            return Err(PackagedDriverChildError::Protocol(
+                "packaged driver traffic cannot continue after an abandoned or failed flow",
+            ));
+        };
+        if CanaryFlow::ALL.get(next_flow_index).copied() != Some(flow) {
             return Err(PackagedDriverChildError::Protocol(
                 "packaged driver traffic must follow canonical canary flow order",
             ));
         }
+        self.traffic_state = PackagedDriverTrafficState::InFlight;
         let (peer_index, peer_role) = peer_for_flow(flow);
         let peer = &self.peer_servers[peer_index];
         parent_send_plan(
@@ -319,11 +332,11 @@ impl PackagedDriverChildren {
             exclusive_deadline,
         )?;
         super::driver_traffic::TrafficFlowResult::new(plan.clone(), client_tuple, peer_tuple)?;
-        self.next_flow_index += 1;
         Ok(PackagedDriverFlowHolding {
             children: self,
             peer_index,
             peer_role,
+            next_flow_index: next_flow_index + 1,
             plan,
             client_tuple,
             peer_tuple,
@@ -356,6 +369,12 @@ impl PackagedDriverChildren {
         self,
         exclusive_deadline: Instant,
     ) -> Result<ReapedPackagedDriverChildren, PackagedDriverChildError> {
+        if self.traffic_state == PackagedDriverTrafficState::InFlight {
+            self.abort_and_reap(exclusive_deadline)?;
+            return Err(PackagedDriverChildError::Protocol(
+                "packaged driver traffic cannot quiesce an abandoned or failed flow",
+            ));
+        }
         let [peer_0, peer_1, peer_2] = self.peer_servers;
         // Evaluate every retirement before propagating the first error. A
         // failed control exchange must not skip orderly cleanup for siblings.
@@ -386,6 +405,7 @@ pub(super) struct PackagedDriverFlowHolding<'a> {
     children: &'a mut PackagedDriverChildren,
     peer_index: usize,
     peer_role: PackagedDriverChildRole,
+    next_flow_index: usize,
     plan: TrafficFlowPlan,
     client_tuple: super::super::CanaryFlowTuple,
     peer_tuple: super::super::CanaryFlowTuple,
@@ -425,6 +445,7 @@ impl PackagedDriverFlowHolding<'_> {
             children,
             peer_index,
             peer_role,
+            next_flow_index,
             plan,
             client_tuple,
             peer_tuple,
@@ -462,7 +483,9 @@ impl PackagedDriverFlowHolding<'_> {
                 "driver traffic result changed a tuple after its held observation",
             ));
         }
-        TrafficFlowResult::new(plan, client_tuple, peer_tuple)
+        let result = TrafficFlowResult::new(plan, client_tuple, peer_tuple)?;
+        children.traffic_state = PackagedDriverTrafficState::Ready { next_flow_index };
+        Ok(result)
     }
 }
 
@@ -1200,7 +1223,7 @@ mod tests {
         let reaped = PackagedDriverChildren {
             client,
             peer_servers: [tcp, udp, dns],
-            next_flow_index: 0,
+            traffic_state: PackagedDriverTrafficState::Ready { next_flow_index: 0 },
         }
         .quiesce_and_reap(deadline)
         .expect("quiesce and parent-reap every exact child");
@@ -1251,7 +1274,7 @@ mod tests {
         let mut children = PackagedDriverChildren {
             client,
             peer_servers: [tcp, udp, dns],
-            next_flow_index: 0,
+            traffic_state: PackagedDriverTrafficState::Ready { next_flow_index: 0 },
         };
 
         for flow in CanaryFlow::ALL {
@@ -1367,7 +1390,7 @@ mod tests {
         let mut children = PackagedDriverChildren {
             client,
             peer_servers: [tcp, udp, dns],
-            next_flow_index: 0,
+            traffic_state: PackagedDriverTrafficState::Ready { next_flow_index: 0 },
         };
         let reordered = TrafficFlowPlan::for_request(request, CanaryFlow::Ipv4UdpEcho)
             .expect("derive reordered test flow")
@@ -1383,6 +1406,63 @@ mod tests {
         children
             .quiesce_and_reap(deadline)
             .expect("reordered pre-emission rejection preserves orderly cleanup");
+    }
+
+    #[test]
+    fn dropped_flow_holding_poisoned_orderly_continuation_and_preserved_abort() {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let tcp_port = available_tcp_port();
+        let udp_port = available_udp_port();
+        let dns_port = available_dns_port();
+        let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+        let request = fixture.request();
+        let client = spawn_test_child(PackagedDriverChildRole::Client, None, deadline);
+        let tcp = spawn_test_child(
+            PackagedDriverChildRole::TcpEcho,
+            Some(loopback_bind_plan(tcp_port, false)),
+            deadline,
+        );
+        let udp = spawn_test_child(
+            PackagedDriverChildRole::UdpEcho,
+            Some(loopback_bind_plan(udp_port, false)),
+            deadline,
+        );
+        let dns = spawn_test_child(
+            PackagedDriverChildRole::Dns,
+            Some(loopback_bind_plan(dns_port, false)),
+            deadline,
+        );
+        let mut children = PackagedDriverChildren {
+            client,
+            peer_servers: [tcp, udp, dns],
+            traffic_state: PackagedDriverTrafficState::Ready { next_flow_index: 0 },
+        };
+        let tcp_plan = TrafficFlowPlan::for_request(request, CanaryFlow::Ipv4TcpEcho)
+            .expect("derive first canonical test flow")
+            .with_test_endpoints(
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, tcp_port)),
+            )
+            .expect("substitute direct-loopback TCP endpoint");
+        let holding = children
+            .begin_flow_plan(tcp_plan, deadline)
+            .expect("hold the first exact flow");
+        drop(holding);
+
+        let udp_plan = TrafficFlowPlan::for_request(request, CanaryFlow::Ipv4UdpEcho)
+            .expect("derive next canonical test flow")
+            .with_test_endpoints(
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, udp_port)),
+            )
+            .expect("substitute direct-loopback UDP endpoint");
+        assert!(matches!(
+            children.begin_flow_plan(udp_plan, deadline),
+            Err(PackagedDriverChildError::Protocol(_))
+        ));
+        children
+            .abort_and_reap(deadline)
+            .expect("abandoned hold retains bounded all-sibling abort authority");
     }
 
     #[test]
@@ -1410,7 +1490,7 @@ mod tests {
         let children = PackagedDriverChildren {
             client,
             peer_servers: [tcp, udp, dns],
-            next_flow_index: 0,
+            traffic_state: PackagedDriverTrafficState::Ready { next_flow_index: 0 },
         };
         parent_send_signal(
             &children.client.control,
@@ -1465,7 +1545,7 @@ mod tests {
         let mut children = PackagedDriverChildren {
             client,
             peer_servers: [tcp, udp, dns],
-            next_flow_index: 0,
+            traffic_state: PackagedDriverTrafficState::Ready { next_flow_index: 0 },
         };
         let plan = TrafficFlowPlan::for_request(request, CanaryFlow::Ipv4TcpEcho)
             .expect("derive first canonical test flow")

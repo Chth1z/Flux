@@ -1009,6 +1009,13 @@ fn assembler_produces_one_complete_host_inspection_generation() {
         Some("FLX4C0000000001")
     );
     assert_eq!(
+        admitted
+            .xtables()
+            .ipv4()
+            .and_then(|pair| pair.local_output_canary_observation()),
+        Some("FLX4A0000000001")
+    );
+    assert_eq!(
         admitted.engine_spec().restart_policy().maximum_backoff(),
         admitted
             .desired_state()

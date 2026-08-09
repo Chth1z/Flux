@@ -477,7 +477,7 @@ fn ipv4_local_output_pins_complete_non_authorizing_transaction() {
 }
 
 #[test]
-fn local_output_canary_slot_is_empty_owned_and_precedes_configurable_policy() {
+fn local_output_canary_slots_are_empty_owned_and_add_no_steady_state_output_jump() {
     let report = compile_program_with_application_and_host(
         scope(AddressHostFamilySelection::Ipv4, true, false),
         interfaces(&[exact("tun0")], &[], &[]),
@@ -499,8 +499,16 @@ fn local_output_canary_slot_is_empty_owned_and_precedes_configurable_policy() {
     let slot = pair
         .local_output_canary_selector()
         .expect("required lowering reserves one selector slot");
+    let observation = pair
+        .local_output_canary_observation()
+        .expect("required lowering reserves one attempt-observation slot");
     assert_eq!(slot, "FLX4C0000000024");
-    assert!(pair.entries().iter().all(|entry| entry.chain() != slot));
+    assert_eq!(observation, "FLX4A0000000024");
+    assert!(
+        pair.entries()
+            .iter()
+            .all(|entry| entry.chain() != slot && entry.chain() != observation)
+    );
 
     let prepare = restore_text(pair.prepare());
     let owner = prepare.find("--uid-owner 1000 --gid-owner 1000").unwrap();
@@ -522,13 +530,18 @@ fn local_output_canary_slot_is_empty_owned_and_precedes_configurable_policy() {
     );
     assert!(prepare.contains(":FLX4C0000000024 - [0:0]\n"));
     assert!(!prepare.contains("-A FLX4C0000000024 "));
+    assert!(prepare.contains(":FLX4A0000000024 - [0:0]\n"));
+    assert!(!prepare.contains("-A FLX4A0000000024 "));
+    assert!(!prepare.contains("-A FLX4SO -j FLX4A0000000024"));
 
     let retire = restore_text(pair.retire());
     assert!(retire.contains("-F FLX4C0000000024\n"));
     assert!(retire.contains("-X FLX4C0000000024\n"));
+    assert!(retire.contains("-F FLX4A0000000024\n"));
+    assert!(retire.contains("-X FLX4A0000000024\n"));
     assert_eq!(
         pair.usage().implementation_chains(),
-        baseline_pair.usage().implementation_chains() + 1
+        baseline_pair.usage().implementation_chains() + 2
     );
     assert_eq!(
         pair.usage().prepare_commands(),
@@ -536,7 +549,7 @@ fn local_output_canary_slot_is_empty_owned_and_precedes_configurable_policy() {
     );
     assert_eq!(
         pair.usage().retire_commands(),
-        baseline_pair.usage().retire_commands() + 2
+        baseline_pair.usage().retire_commands() + 4
     );
     assert_eq!(pair.usage().maximum_jump_depth(), 2);
     assert_ne!(lowered.lowering_digest(), baseline.lowering_digest());

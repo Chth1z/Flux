@@ -143,7 +143,7 @@ fn dual_stack_topology_uses_family_scoped_stable_roots() {
 }
 
 #[test]
-fn canary_selector_slots_are_retained_as_private_recovery_chains() {
+fn canary_attempt_slots_are_retained_as_private_recovery_chains() {
     let artifacts = artifacts(AddressHostFamilySelection::DualStack, true, false, true);
     let plan = XtablesStableTopologyPlan::from_artifacts(&artifacts)
         .expect("derive canary-enabled stable topology");
@@ -162,10 +162,16 @@ fn canary_selector_slots_are_retained_as_private_recovery_chains() {
         assert_eq!(
             private_chains,
             [
+                format!("FLX{digit}A0000000007"),
                 format!("FLX{digit}C0000000007"),
                 format!("FLX{digit}O0000000007"),
                 format!("FLX{digit}P0000000007"),
             ]
+        );
+        let family_plan = plan.family(family).expect("enabled family");
+        assert_eq!(
+            family_plan.local_output_canary_observation(),
+            Some(format!("FLX{digit}A0000000007").as_str())
         );
     }
 }

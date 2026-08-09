@@ -32,7 +32,7 @@ const PAIR_DIGEST_DOMAIN: &[u8] =
 const SET_DIGEST_DOMAIN: &[u8] =
     b"Flux canonical xtables Capture Program artifact set\0schema-v2\0";
 const CANARY_SELECTOR_LOWERING_DIGEST_MARKER: &[u8] =
-    b"\0Flux local-OUTPUT canary selector slot\0v1\0";
+    b"\0Flux local-OUTPUT canary selector and observation slots\0v2\0";
 const LINUX_ROUTE_SCOPE_UNIVERSE: u8 = 0;
 const LINUX_ROUTE_SCOPE_HOST: u8 = 254;
 const LINUX_ROUTE_TYPE_LOCAL: u8 = 2;
@@ -386,8 +386,10 @@ impl<'a> XtablesCaptureLoweringRequest<'a> {
         self
     }
 
-    /// Reserves one empty Generation-scoped chain reached from each proxy-capable local-OUTPUT
-    /// classifier. The slot is descriptive target material only and grants no mutation authority.
+    /// Reserves the empty Generation-scoped selector and attempt-observation chains needed by one
+    /// local-OUTPUT canary. Only the selector is reached in steady state; the observation chain
+    /// remains detached until the serialized owner starts an attempt. These slots are descriptive
+    /// target material only and grant no mutation authority.
     #[must_use]
     pub const fn with_local_output_canary_selector_slot(mut self) -> Self {
         self.reserve_local_output_canary_selector = true;
@@ -797,6 +799,7 @@ pub struct XtablesCaptureArtifactPair {
     entries: Box<[XtablesCaptureEntryPoint]>,
     local_output: Option<XtablesLocalOutputTransactionRequirements>,
     local_output_canary_selector: Option<Box<str>>,
+    local_output_canary_observation: Option<Box<str>>,
     transaction_order: XtablesCaptureTransactionOrder,
     prepare: XtablesRestoreArtifact,
     retire: XtablesRestoreArtifact,
@@ -823,6 +826,11 @@ impl XtablesCaptureArtifactPair {
     #[must_use]
     pub fn local_output_canary_selector(&self) -> Option<&str> {
         self.local_output_canary_selector.as_deref()
+    }
+
+    #[must_use]
+    pub fn local_output_canary_observation(&self) -> Option<&str> {
+        self.local_output_canary_observation.as_deref()
     }
 
     #[must_use]
@@ -1301,19 +1309,26 @@ fn lower_family(
         }
         (None, None) => None,
     };
-    let local_output_canary_selector = if request.reserve_local_output_canary_selector {
-        if local_proxy_protocols.is_none() {
-            return Err(
-                XtablesCaptureLoweringError::MissingLocalOutputCanarySelectorAnchor { family },
-            );
-        }
-        Some(canary_selector_chain_name(
-            family,
-            request.namespace.generation(),
-        ))
-    } else {
-        None
-    };
+    let (local_output_canary_selector, local_output_canary_observation) =
+        if request.reserve_local_output_canary_selector {
+            if local_proxy_protocols.is_none() {
+                return Err(
+                    XtablesCaptureLoweringError::MissingLocalOutputCanarySelectorAnchor { family },
+                );
+            }
+            (
+                Some(canary_selector_chain_name(
+                    family,
+                    request.namespace.generation(),
+                )),
+                Some(canary_observation_chain_name(
+                    family,
+                    request.namespace.generation(),
+                )),
+            )
+        } else {
+            (None, None)
+        };
 
     let implementation_chains = analyses
         .iter()
@@ -1324,7 +1339,8 @@ fn lower_family(
             )
         })
         .sum::<usize>()
-        + usize::from(local_output_canary_selector.is_some());
+        + usize::from(local_output_canary_selector.is_some())
+        + usize::from(local_output_canary_observation.is_some());
     let prepare_commands = analyses
         .iter()
         .map(|analysis| {
@@ -1384,6 +1400,12 @@ fn lower_family(
                 });
                 chains.push(RenderedChain { name: chain, rules });
                 if let Some(slot) = &local_output_canary_selector {
+                    chains.push(RenderedChain {
+                        name: slot.clone(),
+                        rules: Vec::new(),
+                    });
+                }
+                if let Some(slot) = &local_output_canary_observation {
                     chains.push(RenderedChain {
                         name: slot.clone(),
                         rules: Vec::new(),
@@ -1514,6 +1536,7 @@ fn lower_family(
         entries,
         local_output,
         local_output_canary_selector,
+        local_output_canary_observation,
         transaction_order,
         prepare,
         retire,
@@ -2301,6 +2324,13 @@ fn capture_chain_name(
 
 fn canary_selector_chain_name(family: NetworkAddressFamily, generation: GenerationId) -> Box<str> {
     format!("FLX{}C{:010}", family_tag(family), generation.get()).into_boxed_str()
+}
+
+fn canary_observation_chain_name(
+    family: NetworkAddressFamily,
+    generation: GenerationId,
+) -> Box<str> {
+    format!("FLX{}A{:010}", family_tag(family), generation.get()).into_boxed_str()
 }
 
 fn digest_lowering(request: XtablesCaptureLoweringRequest<'_>) -> XtablesCaptureLoweringDigest {

@@ -245,6 +245,9 @@ impl XtablesStableFamilyPlan {
         if let Some(chain) = pair.local_output_canary_selector() {
             private_chains.push(chain.into());
         }
+        if let Some(chain) = pair.local_output_canary_observation() {
+            private_chains.push(chain.into());
+        }
         private_chains.sort_unstable();
         Ok(Self {
             family,
@@ -343,6 +346,18 @@ impl XtablesStableFamilyPlan {
         let prefix = match self.family {
             XtablesRestoreFamily::Ipv4 => "FLX4C",
             XtablesRestoreFamily::Ipv6 => "FLX6C",
+        };
+        self.private_chains
+            .iter()
+            .map(Box::as_ref)
+            .find(|chain| chain.starts_with(prefix))
+    }
+
+    #[must_use]
+    pub(crate) fn local_output_canary_observation(&self) -> Option<&str> {
+        let prefix = match self.family {
+            XtablesRestoreFamily::Ipv4 => "FLX4A",
+            XtablesRestoreFamily::Ipv6 => "FLX6A",
         };
         self.private_chains
             .iter()

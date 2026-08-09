@@ -3049,33 +3049,33 @@ impl UnqualifiedCanaryOutboundEvidenceSlots {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct UnqualifiedCanaryNegativeRouteControl {
     flow: CanaryFlow,
-    tuple: CanaryFlowTuple,
+    destination: SocketAddr,
     observed_at: Instant,
     queried_uid: NonZeroU32,
     mark: u32,
     selected_table: RouteTableId,
-    peer_observation_count: u8,
+    injected_peer_observation_count: Option<u8>,
 }
 
 impl UnqualifiedCanaryNegativeRouteControl {
     #[must_use]
     pub(crate) const fn new(
         flow: CanaryFlow,
-        tuple: CanaryFlowTuple,
+        destination: SocketAddr,
         observed_at: Instant,
         queried_uid: NonZeroU32,
         mark: u32,
         selected_table: RouteTableId,
-        peer_observation_count: u8,
+        injected_peer_observation_count: Option<u8>,
     ) -> Self {
         Self {
             flow,
-            tuple,
+            destination,
             observed_at,
             queried_uid,
             mark,
             selected_table,
-            peer_observation_count,
+            injected_peer_observation_count,
         }
     }
 }
@@ -3717,7 +3717,7 @@ pub(crate) enum CanaryEvidenceError {
         observed: CanaryFlow,
     },
     NegativeControlFlowNotRequired,
-    NegativeControlTupleMismatch,
+    NegativeControlDestinationMismatch,
     NegativeControlUidMismatch,
     NegativeControlTimingInvalid,
     NegativeControlMarkMismatch,
@@ -4353,11 +4353,12 @@ fn validate_loop_evidence(
                 observed: negative.flow,
             });
         }
-        let flow = flows.slots[expected_flow.index()]
-            .as_ref()
-            .expect("required flow evidence is validated before loop evidence");
-        if negative.tuple != flow.peer_tuple {
-            return Err(CanaryEvidenceError::NegativeControlTupleMismatch);
+        let expected_destination = SocketAddr::new(
+            request.peer_address(expected_flow),
+            request.responder_port(expected_flow).get(),
+        );
+        if negative.destination != expected_destination {
+            return Err(CanaryEvidenceError::NegativeControlDestinationMismatch);
         }
         if negative.queried_uid != rpdb.engine_uid {
             return Err(CanaryEvidenceError::NegativeControlUidMismatch);
@@ -4383,10 +4384,10 @@ fn validate_loop_evidence(
         if negative.selected_table.get() != rpdb.proxy_capture_table.get() {
             return Err(CanaryEvidenceError::NegativeControlSelectedWrongTable);
         }
-        if negative.peer_observation_count != 0 {
-            return Err(CanaryEvidenceError::NegativeControlReachedPeer {
-                count: negative.peer_observation_count,
-            });
+        if let Some(count) = negative.injected_peer_observation_count
+            && count != 0
+        {
+            return Err(CanaryEvidenceError::NegativeControlReachedPeer { count });
         }
     }
     Ok(())
@@ -6945,11 +6946,72 @@ pub(crate) mod tests {
             CanaryEvidenceError::NegativeControlSelectedPeerTable
         );
 
+        let mut wrong_destination = fixture.successful_evidence();
+        let negative = wrong_destination.loop_escape.negative_route_controls.slots[0]
+            .as_mut()
+            .expect("IPv4 negative control");
+        negative.destination =
+            SocketAddr::new(negative.destination.ip(), negative.destination.port() + 1);
+        assert_eq!(
+            validate(&fixture, wrong_destination)
+                .expect_err("negative route lookup destination cannot change"),
+            CanaryEvidenceError::NegativeControlDestinationMismatch
+        );
+
+        let mut wrong_uid = fixture.successful_evidence();
+        wrong_uid.loop_escape.negative_route_controls.slots[0]
+            .as_mut()
+            .expect("IPv4 negative control")
+            .queried_uid = NonZeroU32::new(20_002).expect("alternate UID");
+        assert_eq!(
+            validate(&fixture, wrong_uid).expect_err("negative route lookup UID cannot change"),
+            CanaryEvidenceError::NegativeControlUidMismatch
+        );
+
+        let mut wrong_mark = fixture.successful_evidence();
+        wrong_mark.loop_escape.negative_route_controls.slots[0]
+            .as_mut()
+            .expect("IPv4 negative control")
+            .mark ^= 1;
+        assert_eq!(
+            validate(&fixture, wrong_mark).expect_err("negative route lookup mark cannot change"),
+            CanaryEvidenceError::NegativeControlMarkMismatch
+        );
+
+        let mut wrong_table = fixture.successful_evidence();
+        wrong_table.loop_escape.negative_route_controls.slots[0]
+            .as_mut()
+            .expect("IPv4 negative control")
+            .selected_table = RouteTableId::from_raw(10_103);
+        assert_eq!(
+            validate(&fixture, wrong_table)
+                .expect_err("negative route lookup must select the capture table"),
+            CanaryEvidenceError::NegativeControlSelectedWrongTable
+        );
+
+        let mut late = fixture.successful_evidence();
+        late.loop_escape.negative_route_controls.slots[0]
+            .as_mut()
+            .expect("IPv4 negative control")
+            .observed_at = fixture.request.deadline().started_at() + Duration::from_millis(10);
+        assert_eq!(
+            validate(&fixture, late).expect_err("negative route lookup must precede traffic"),
+            CanaryEvidenceError::NegativeControlTimingInvalid
+        );
+
+        let mut injected_zero = fixture.successful_evidence();
+        injected_zero.loop_escape.negative_route_controls.slots[0]
+            .as_mut()
+            .expect("IPv4 negative control")
+            .injected_peer_observation_count = Some(0);
+        validate(&fixture, injected_zero)
+            .expect("an armed injection window with zero peer packets remains isolated");
+
         let mut observed = fixture.successful_evidence();
         observed.loop_escape.negative_route_controls.slots[0]
             .as_mut()
             .expect("IPv4 negative control")
-            .peer_observation_count = 1;
+            .injected_peer_observation_count = Some(1);
         assert_eq!(
             validate(&fixture, observed).expect_err("negative packet reached peer"),
             CanaryEvidenceError::NegativeControlReachedPeer { count: 1 }
@@ -7741,13 +7803,12 @@ pub(crate) mod tests {
                     CanaryFlow::Ipv6TcpEcho
                 };
                 self.request.requires_flow(flow).then(|| {
-                    let tuple = flows.slots[flow.index()]
-                        .as_ref()
-                        .expect("required TCP flow evidence")
-                        .peer_tuple;
                     UnqualifiedCanaryNegativeRouteControl::new(
                         flow,
-                        tuple,
+                        SocketAddr::new(
+                            self.request.peer_address(flow),
+                            self.request.responder_port(flow).get(),
+                        ),
                         self.request.deadline().started_at() + Duration::from_millis(1),
                         self.request.pre_binding.environment.rpdb.engine_uid,
                         self.request.pre_binding.environment.rpdb.proxy_mark_value,
@@ -7756,7 +7817,7 @@ pub(crate) mod tests {
                             .environment
                             .rpdb
                             .proxy_capture_table,
-                        0,
+                        None,
                     )
                 })
             });

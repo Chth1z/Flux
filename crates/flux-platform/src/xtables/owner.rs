@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::fmt;
 
-use flux_core::RuleFwMark;
+use flux_core::{EngineCredentials, RuleFwMark};
 
 use super::save::{XtablesExpectedState, XtablesExpectedStatePhase, XtablesSaveProjectionError};
 use super::{
@@ -137,7 +137,8 @@ impl XtablesStableFamilyPlan {
             }
         }
 
-        match pair.local_output() {
+        let local_output_requirements = pair.local_output();
+        match local_output_requirements {
             Some(requirements) => {
                 let output = local_output.ok_or(XtablesStableTopologyError::MissingRole {
                     family,
@@ -172,6 +173,17 @@ impl XtablesStableFamilyPlan {
             prerouting_rules.push(render_stable_rule(root, entry)?);
         }
         let mut output_rules = Vec::new();
+        if let (Some(root), Some(observation), Some(requirements)) = (
+            &output_root,
+            pair.local_output_canary_observation(),
+            local_output_requirements,
+        ) {
+            output_rules.push(render_canary_observation_rule(
+                root,
+                observation,
+                requirements.loop_escape().engine_credentials(),
+            ));
+        }
         if let (Some(root), Some(entry)) = (&output_root, local_output) {
             output_rules.push(render_stable_rule(root, entry)?);
         }
@@ -809,6 +821,18 @@ fn render_stable_rule(
     rule.push_str(" -j ");
     rule.push_str(entry.chain());
     Ok(rule)
+}
+
+fn render_canary_observation_rule(
+    stable_root: &str,
+    observation_chain: &str,
+    engine_credentials: EngineCredentials,
+) -> String {
+    format!(
+        "-A {stable_root} -m owner --uid-owner {} --gid-owner {} -j {observation_chain}",
+        engine_credentials.uid().get(),
+        engine_credentials.gid().get()
+    )
 }
 
 fn mark_token(mark: RuleFwMark) -> String {

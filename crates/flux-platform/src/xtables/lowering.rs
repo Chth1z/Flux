@@ -387,9 +387,10 @@ impl<'a> XtablesCaptureLoweringRequest<'a> {
     }
 
     /// Reserves the empty Generation-scoped selector and attempt-observation chains needed by one
-    /// local-OUTPUT canary. Only the selector is reached in steady state; the observation chain
-    /// remains detached until the serialized owner starts an attempt. These slots are descriptive
-    /// target material only and grant no mutation authority.
+    /// local-OUTPUT canary. The selector is reached from the classifier; the serialized owner
+    /// reaches the observation slot from the existing stable OUTPUT root using the exact engine
+    /// credentials. These slots are descriptive target material only and grant no mutation
+    /// authority.
     #[must_use]
     pub const fn with_local_output_canary_selector_slot(mut self) -> Self {
         self.reserve_local_output_canary_selector = true;

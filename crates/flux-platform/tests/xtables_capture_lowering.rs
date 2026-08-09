@@ -477,7 +477,7 @@ fn ipv4_local_output_pins_complete_non_authorizing_transaction() {
 }
 
 #[test]
-fn local_output_canary_slots_are_empty_owned_and_add_no_steady_state_output_jump() {
+fn local_output_canary_slots_are_empty_owned_and_selector_precedes_configurable_policy() {
     let report = compile_program_with_application_and_host(
         scope(AddressHostFamilySelection::Ipv4, true, false),
         interfaces(&[exact("tun0")], &[], &[]),
@@ -532,7 +532,6 @@ fn local_output_canary_slots_are_empty_owned_and_add_no_steady_state_output_jump
     assert!(!prepare.contains("-A FLX4C0000000024 "));
     assert!(prepare.contains(":FLX4A0000000024 - [0:0]\n"));
     assert!(!prepare.contains("-A FLX4A0000000024 "));
-    assert!(!prepare.contains("-A FLX4SO -j FLX4A0000000024"));
 
     let retire = restore_text(pair.retire());
     assert!(retire.contains("-F FLX4C0000000024\n"));

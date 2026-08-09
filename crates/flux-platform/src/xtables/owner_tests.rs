@@ -169,10 +169,27 @@ fn canary_attempt_slots_are_retained_as_private_recovery_chains() {
             ]
         );
         let family_plan = plan.family(family).expect("enabled family");
+        let observation_chain = format!("FLX{digit}A0000000007");
         assert_eq!(
             family_plan.local_output_canary_observation(),
-            Some(format!("FLX{digit}A0000000007").as_str())
+            Some(observation_chain.as_str())
         );
+        let observation_rule = format!(
+            "-A FLX{digit}SO -m owner --uid-owner 1000 --gid-owner 1000 -j {observation_chain}"
+        );
+        let classifier_rule =
+            format!("-A FLX{digit}SO -m mark --mark 0x0/0x600000 -j FLX{digit}O0000000007");
+        for artifact in [family_plan.install(), family_plan.switch()] {
+            let rendered = text(artifact);
+            let stable_output_rules = rendered
+                .lines()
+                .filter(|line| line.starts_with(&format!("-A FLX{digit}SO ")))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                stable_output_rules,
+                [observation_rule.as_str(), classifier_rule.as_str()]
+            );
+        }
     }
 }
 

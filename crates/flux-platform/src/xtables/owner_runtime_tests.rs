@@ -17,7 +17,10 @@ use crate::netlink::policy_routing::{
     ManagedFwmarkRuleIdentity, ManagedLocalRouteIdentity, PolicyRoutingMutationKind,
 };
 use crate::xtables::native::{XtablesRestoreProcessConfig, XtablesToolSetProcessAdapter};
-use crate::xtables::owner_durable::DurableEvent;
+use crate::xtables::owner_durable::{
+    DurableEvent, NativeXtablesAttemptPayload, NativeXtablesAttemptPhase,
+    NativeXtablesAttemptRecord,
+};
 use crate::xtables::save::project_xtables_save;
 use crate::xtables::{
     NativeCaptureCanaryRouteObservation, NativeCaptureCanaryRouteRejection,
@@ -745,6 +748,44 @@ fn active_ownership_observation_rejects_writer_fence() {
         .observe_active_ownership()
         .expect_err("active writer fence must block ownership observation");
     assert!(error.to_string().contains("active writer lock"));
+}
+
+#[test]
+fn outstanding_attempt_blocks_recovery_and_active_ownership_observation() {
+    let target = target(7, AddressHostFamilySelection::Ipv4, false);
+    let fixture = Fixture::new([target.clone()]);
+    let mut owner = fixture.owner();
+    owner
+        .converge(NativeXtablesDesiredTarget::Active(target))
+        .expect("activate target before attempt control");
+    let journal = fixture.store.load_journal().unwrap().unwrap();
+    let expected = journal.binding().clone();
+    let primary = std::fs::read(fixture.store.journal_path()).unwrap();
+    let NativeXtablesRecovery::Leased(mut lease) = fixture.store.recover(&expected).unwrap() else {
+        panic!("active journal must retain its durable lease");
+    };
+    lease
+        .publish_attempt(NativeXtablesAttemptRecord::new(
+            expected,
+            NativeXtablesAttemptPhase::Reserved,
+            NativeXtablesAttemptPayload::new(b"nonce=runtime-control".to_vec()).unwrap(),
+        ))
+        .unwrap();
+    drop(lease);
+
+    assert!(matches!(
+        owner.observe_active_ownership().unwrap_err(),
+        NativeXtablesOwnerError::AttemptRecoveryRequired
+    ));
+    assert!(matches!(
+        owner.recover().unwrap_err(),
+        NativeXtablesOwnerError::AttemptRecoveryRequired
+    ));
+    assert_eq!(
+        std::fs::read(fixture.store.journal_path()).unwrap(),
+        primary
+    );
+    assert!(fixture.store.load_attempt().unwrap().is_some());
 }
 
 #[test]

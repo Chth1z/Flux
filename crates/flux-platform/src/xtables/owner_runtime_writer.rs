@@ -34,7 +34,8 @@ use crate::xtables::native::{
     XtablesRestoreProcessConfig, XtablesRestoreProcessError, XtablesToolSetProcessAdapter,
 };
 use crate::xtables::owner_durable::{
-    NativeXtablesDurableError, NativeXtablesDurableStore, NativeXtablesRuntimeGuard,
+    NativeXtablesDurableError, NativeXtablesDurableReadOnlyObservation, NativeXtablesDurableStore,
+    NativeXtablesRuntimeGuard,
 };
 use crate::xtables::{
     NativeCaptureCanaryRouteOutcome, NativeCaptureCanaryRouteQuery, NativeCaptureCanarySelector,
@@ -222,10 +223,7 @@ impl NativeXtablesAndroidRuntime {
             let observed = durable.observe_read_only().map_err(|source| {
                 NativeXtablesAndroidRuntimeError::new("inspect native recovery state", source)
             })?;
-            if observed.journal_present()
-                || observed.lease_present()
-                || observed.writer_lock_present()
-            {
+            if requires_archived_recovery_target(&observed) {
                 return Err(NativeXtablesAndroidRuntimeError::new(
                     "bind native recovery target",
                     NativeXtablesAndroidRecoveryBindingError::MissingTargetMaterial,
@@ -266,6 +264,13 @@ impl NativeXtablesAndroidRuntime {
     pub fn into_parts(self) -> (NativeXtablesCaptureAdmission, NativeXtablesCaptureConverger) {
         (self.admission, self.convergence)
     }
+}
+
+fn requires_archived_recovery_target(observed: &NativeXtablesDurableReadOnlyObservation) -> bool {
+    observed.journal_present()
+        || observed.lease_present()
+        || observed.attempt_present()
+        || observed.writer_lock_present()
 }
 
 fn recovery_journal_identity(
@@ -1693,7 +1698,10 @@ impl Error for NativeXtablesRuntimeWriterError {
 
 #[cfg(test)]
 mod admission_tests {
+    use std::fs;
+
     use flux_core::{RpdbFamilyPlacement, RulePriority, RuleTableId};
+    use tempfile::TempDir;
 
     use super::*;
 
@@ -1713,5 +1721,16 @@ mod admission_tests {
         assert_eq!(routing.route_metric().get(), 1_024);
         assert_eq!(routing.route_protocol().raw(), 4);
         assert_eq!(routing.rule_protocol().raw(), 99);
+    }
+
+    #[test]
+    fn orphaned_attempt_requires_archived_recovery_target_material() {
+        let directory = TempDir::new().expect("temporary durable root");
+        let store = NativeXtablesDurableStore::new(directory.path());
+        fs::write(store.attempt_path(), b"opaque attempt residue").expect("write attempt residue");
+
+        let observed = store.observe_read_only().expect("observe durable root");
+
+        assert!(requires_archived_recovery_target(&observed));
     }
 }

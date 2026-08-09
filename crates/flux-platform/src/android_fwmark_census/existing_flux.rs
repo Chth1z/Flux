@@ -333,7 +333,7 @@ mod implementation {
     use crate::android_fwmark_census::AndroidXtablesFwmarkObservation;
 
     const ABSENCE_DIGEST_DOMAIN: &[u8] =
-        b"Flux existing ownership absence\0canonical-schema-v2\0sha256-v1\0";
+        b"Flux existing ownership absence\0canonical-schema-v3\0sha256-v1\0";
     const CLEAN_JOURNAL_IDENTITY_DOMAIN: &[u8] =
         b"Flux observed missing ownership journal\0canonical-schema-v1\0sha256-v1\0";
     const ABSENCE_COUNT_SIGNATURE: &[u8] = b"durable-artifact-count\0archived-target-count\0\
@@ -528,6 +528,7 @@ flux-process-count\0flux-chain-count\0flux-route-count\0flux-rule-count\0";
         root_identity: Option<NativeXtablesDurableRootIdentity>,
         journal_present: bool,
         lease_present: bool,
+        attempt_present: bool,
         writer_lock_present: bool,
         archive: NativeXtablesTargetArchiveObservation,
     }
@@ -536,6 +537,7 @@ flux-process-count\0flux-chain-count\0flux-route-count\0flux-rule-count\0";
         fn ownership_artifact_count(self) -> usize {
             usize::from(self.journal_present)
                 + usize::from(self.lease_present)
+                + usize::from(self.attempt_present)
                 + usize::from(self.writer_lock_present)
                 + self.archive.target_count()
         }
@@ -565,6 +567,7 @@ flux-process-count\0flux-chain-count\0flux-route-count\0flux-rule-count\0";
             root_identity: observed.root_identity(),
             journal_present: observed.journal_present(),
             lease_present: observed.lease_present(),
+            attempt_present: observed.attempt_present(),
             writer_lock_present: observed.writer_lock_present(),
             archive,
         })
@@ -905,6 +908,7 @@ flux-process-count\0flux-chain-count\0flux-route-count\0flux-rule-count\0";
         digest.update([
             u8::from(durable.journal_present),
             u8::from(durable.lease_present),
+            u8::from(durable.attempt_present),
             u8::from(durable.writer_lock_present),
             u8::from(durable.archive.present()),
         ]);

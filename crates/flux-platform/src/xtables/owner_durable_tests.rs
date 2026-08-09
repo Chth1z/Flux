@@ -148,6 +148,369 @@ fn acquisition_conflicts_and_updates_require_exact_lease_and_next_revision() {
 }
 
 #[test]
+fn attempt_sidecar_advances_without_changing_primary_journal_and_requires_exact_retirement() {
+    let fixture = Fixture::new();
+    let binding = test_binding(20);
+    let mut lease = fixture
+        .store
+        .acquire(record(
+            binding.clone(),
+            1,
+            NativeXtablesJournalPhase::Activating,
+            b"target=active",
+        ))
+        .unwrap();
+    lease
+        .update(record(
+            binding.clone(),
+            2,
+            NativeXtablesJournalPhase::Active,
+            b"target=active",
+        ))
+        .unwrap();
+    let primary = fs::read(fixture.store.journal_path()).unwrap();
+    let reserved = attempt(
+        binding.clone(),
+        NativeXtablesAttemptPhase::Reserved,
+        b"nonce=20;selector=v4",
+    );
+    lease.publish_attempt(reserved.clone()).unwrap();
+    assert_eq!(fs::read(fixture.store.journal_path()).unwrap(), primary);
+    assert_eq!(
+        fixture.store.load_attempt().unwrap(),
+        Some(reserved.clone())
+    );
+    assert!(fixture.store.observe_read_only().unwrap().attempt_present());
+
+    let populated = attempt(
+        binding.clone(),
+        NativeXtablesAttemptPhase::PopulateSelectorIpv4,
+        b"nonce=20;selector=v4",
+    );
+    lease.update_attempt(&reserved, populated.clone()).unwrap();
+    assert_eq!(fs::read(fixture.store.journal_path()).unwrap(), primary);
+
+    drop(lease);
+    let mut lease = match fixture.store.recover(&binding).unwrap() {
+        NativeXtablesRecovery::OutstandingAttempt { lease, record } => {
+            assert_eq!(record, populated);
+            lease
+        }
+        other => {
+            panic!("outstanding attempt must remain explicit during recovery, found {other:?}")
+        }
+    };
+
+    let blocked = lease
+        .update(record(
+            binding.clone(),
+            3,
+            NativeXtablesJournalPhase::Retiring,
+            b"must not advance primary",
+        ))
+        .expect_err("primary journal cannot advance while an attempt is present");
+    assert!(matches!(
+        blocked,
+        NativeXtablesDurableError::AttemptConflict
+    ));
+
+    for invalid in [populated.clone(), reserved.clone()] {
+        assert!(matches!(
+            lease.update_attempt(&populated, invalid),
+            Err(NativeXtablesDurableError::InvalidRecord {
+                artifact: DurableArtifact::Attempt,
+                ..
+            })
+        ));
+    }
+
+    let changed_payload = attempt(
+        binding.clone(),
+        NativeXtablesAttemptPhase::Active,
+        b"nonce=20;selector=v6",
+    );
+    assert!(matches!(
+        lease.update_attempt(&populated, changed_payload),
+        Err(NativeXtablesDurableError::InvalidRecord {
+            artifact: DurableArtifact::Attempt,
+            ..
+        })
+    ));
+
+    let replacement_binding = NativeXtablesJournalBinding::new(
+        binding.boot_identity().clone(),
+        binding.network_namespace(),
+        GenerationId::new(binding.generation().get() + 1).unwrap(),
+        binding.journal_identity(),
+    );
+    assert!(matches!(
+        lease.rebind(record(
+            replacement_binding,
+            1,
+            NativeXtablesJournalPhase::Active,
+            b"replacement must remain blocked",
+        )),
+        Err(NativeXtablesDurableError::AttemptConflict)
+    ));
+
+    let substituted = attempt(
+        binding.clone(),
+        NativeXtablesAttemptPhase::Active,
+        b"nonce=21;selector=v4",
+    );
+    let error = lease
+        .remove_attempt(&substituted)
+        .expect_err("retirement must reject a substituted sidecar");
+    assert!(matches!(
+        error,
+        NativeXtablesDurableError::BindingMismatch {
+            artifact: DurableArtifact::Attempt
+        }
+    ));
+
+    let error = lease
+        .complete(record(
+            binding.clone(),
+            3,
+            NativeXtablesJournalPhase::CleanAbsent,
+            b"completion must remain blocked",
+        ))
+        .expect_err("completion cannot retire the primary owner with an attempt present");
+    assert!(matches!(error, NativeXtablesDurableError::AttemptConflict));
+    let mut lease = match fixture.store.recover(&binding).unwrap() {
+        NativeXtablesRecovery::OutstandingAttempt { lease, record } => {
+            assert_eq!(record, populated);
+            lease
+        }
+        other => panic!("failed completion must retain the attempt, found {other:?}"),
+    };
+    lease.remove_attempt(&populated).unwrap();
+    assert!(fixture.store.load_attempt().unwrap().is_none());
+    assert!(!fixture.store.observe_read_only().unwrap().attempt_present());
+    assert_eq!(fs::read(fixture.store.journal_path()).unwrap(), primary);
+}
+
+#[test]
+fn current_boot_attempt_requires_an_active_primary_journal() {
+    let fixture = Fixture::new();
+    let binding = test_binding(22);
+    let lease = fixture
+        .store
+        .acquire(record(
+            binding.clone(),
+            1,
+            NativeXtablesJournalPhase::Activating,
+            b"not active",
+        ))
+        .unwrap();
+    fs::write(
+        fixture.store.attempt_path(),
+        encode_attempt(&attempt(
+            binding.clone(),
+            NativeXtablesAttemptPhase::Reserved,
+            b"nonce=22",
+        )),
+    )
+    .unwrap();
+    drop(lease);
+
+    assert!(matches!(
+        fixture.store.recover(&binding).unwrap_err(),
+        NativeXtablesDurableError::OrphanedAttempt
+    ));
+    assert!(fixture.store.writer_lock_exists().unwrap());
+    assert!(matches!(
+        fixture
+            .store
+            .inspect_for_recovery(&binding.lease_scope())
+            .unwrap_err(),
+        NativeXtablesDurableError::OrphanedAttempt
+    ));
+
+    let terminal = Fixture::new();
+    let binding = test_binding(26);
+    let lease = terminal
+        .store
+        .acquire(record(
+            binding.clone(),
+            1,
+            NativeXtablesJournalPhase::Activating,
+            b"terminal control",
+        ))
+        .unwrap();
+    lease
+        .complete(record(
+            binding.clone(),
+            2,
+            NativeXtablesJournalPhase::CleanAbsent,
+            b"terminal control",
+        ))
+        .unwrap();
+    fs::write(
+        terminal.store.attempt_path(),
+        encode_attempt(&attempt(
+            binding.clone(),
+            NativeXtablesAttemptPhase::Reserved,
+            b"nonce=terminal",
+        )),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        terminal.store.recover(&binding).unwrap_err(),
+        NativeXtablesDurableError::OrphanedAttempt
+    ));
+}
+
+#[test]
+fn attempt_crash_boundaries_preserve_exact_recoverable_state() {
+    for event in [
+        DurableEvent::AttemptTempDurable,
+        DurableEvent::AttemptDurable,
+    ] {
+        let fixture = Fixture::new();
+        let binding = test_binding(23 + u8::from(event == DurableEvent::AttemptDurable));
+        let mut lease = fixture
+            .store
+            .acquire(record(
+                binding.clone(),
+                1,
+                NativeXtablesJournalPhase::Activating,
+                b"active target",
+            ))
+            .unwrap();
+        lease
+            .update(record(
+                binding.clone(),
+                2,
+                NativeXtablesJournalPhase::Active,
+                b"active target",
+            ))
+            .unwrap();
+        let primary = fs::read(fixture.store.journal_path()).unwrap();
+        let reserved = attempt(
+            binding.clone(),
+            NativeXtablesAttemptPhase::Reserved,
+            b"nonce=crash",
+        );
+        let next = attempt(
+            binding.clone(),
+            NativeXtablesAttemptPhase::PopulateSelectorIpv4,
+            b"nonce=crash",
+        );
+        lease.publish_attempt(reserved.clone()).unwrap();
+        fixture.store.set_failpoint(Some(event));
+
+        assert!(matches!(
+            lease.update_attempt(&reserved, next.clone()),
+            Err(NativeXtablesDurableError::InterruptedAt(actual)) if actual == event
+        ));
+        drop(lease);
+        assert!(fixture.store.writer_lock_exists().unwrap());
+        assert_eq!(fs::read(fixture.store.journal_path()).unwrap(), primary);
+        let expected = if event == DurableEvent::AttemptTempDurable {
+            reserved
+        } else {
+            next.clone()
+        };
+        let (mut lease, recovered) = match fixture.store.recover(&binding).unwrap() {
+            NativeXtablesRecovery::OutstandingAttempt { lease, record } => (lease, record),
+            other => {
+                panic!("attempt publication boundary must recover explicitly, found {other:?}")
+            }
+        };
+        assert_eq!(recovered, expected);
+        if recovered != next {
+            lease.update_attempt(&recovered, next.clone()).unwrap();
+        }
+        lease.remove_attempt(&next).unwrap();
+    }
+
+    let fixture = Fixture::new();
+    let binding = test_binding(25);
+    let mut lease = fixture
+        .store
+        .acquire(record(
+            binding.clone(),
+            1,
+            NativeXtablesJournalPhase::Activating,
+            b"active target",
+        ))
+        .unwrap();
+    lease
+        .update(record(
+            binding.clone(),
+            2,
+            NativeXtablesJournalPhase::Active,
+            b"active target",
+        ))
+        .unwrap();
+    let primary = fs::read(fixture.store.journal_path()).unwrap();
+    let reserved = attempt(
+        binding.clone(),
+        NativeXtablesAttemptPhase::Reserved,
+        b"nonce=remove",
+    );
+    lease.publish_attempt(reserved.clone()).unwrap();
+    fixture
+        .store
+        .set_failpoint(Some(DurableEvent::AttemptRemovedDurable));
+
+    assert!(matches!(
+        lease.remove_attempt(&reserved),
+        Err(NativeXtablesDurableError::InterruptedAt(
+            DurableEvent::AttemptRemovedDurable
+        ))
+    ));
+    drop(lease);
+    assert!(fixture.store.writer_lock_exists().unwrap());
+    assert!(fixture.store.load_attempt().unwrap().is_none());
+    assert_eq!(fs::read(fixture.store.journal_path()).unwrap(), primary);
+    match fixture.store.recover(&binding).unwrap() {
+        NativeXtablesRecovery::Leased(_) => {}
+        other => panic!("durable attempt removal must recover the primary lease, found {other:?}"),
+    }
+}
+
+#[test]
+fn malformed_or_orphaned_attempt_sidecar_blocks_recovery_and_new_acquisition() {
+    let fixture = Fixture::new();
+    assert!(matches!(
+        NativeXtablesAttemptPayload::new(vec![0; MAX_NATIVE_XTABLES_ATTEMPT_PAYLOAD_BYTES + 1]),
+        Err(NativeXtablesDurableError::AttemptPayloadTooLarge { .. })
+    ));
+    fs::write(fixture.store.attempt_path(), b"not-a-canonical-attempt\n").unwrap();
+    let error = fixture
+        .store
+        .load_attempt()
+        .expect_err("malformed attempt sidecar must not be accepted");
+    assert!(matches!(
+        error,
+        NativeXtablesDurableError::InvalidRecord {
+            artifact: DurableArtifact::Attempt,
+            ..
+        }
+    ));
+    let error = fixture
+        .store
+        .acquire(record(
+            test_binding(21),
+            1,
+            NativeXtablesJournalPhase::Activating,
+            b"new owner",
+        ))
+        .expect_err("an orphaned attempt must block a fresh owner");
+    assert!(matches!(
+        error,
+        NativeXtablesDurableError::InvalidRecord {
+            artifact: DurableArtifact::Attempt,
+            ..
+        }
+    ));
+    assert!(fixture.store.writer_lock_exists().unwrap());
+}
+
+#[test]
 fn recovery_rejects_each_stale_binding_dimension() {
     let fixture = Fixture::new();
     let actual = test_binding(5);
@@ -531,17 +894,41 @@ fn recovery_inspection_adopts_a_prejournal_native_lock_only_boundary() {
 fn recovery_inspection_retires_an_internally_consistent_previous_boot_pair_on_finish() {
     let fixture = Fixture::new();
     let previous = test_binding(69);
-    drop(
-        fixture
-            .store
-            .acquire(record(
-                previous.clone(),
-                1,
-                NativeXtablesJournalPhase::Activating,
-                b"previous boot",
-            ))
-            .unwrap(),
+    let mut lease = fixture
+        .store
+        .acquire(record(
+            previous.clone(),
+            1,
+            NativeXtablesJournalPhase::Activating,
+            b"previous boot",
+        ))
+        .unwrap();
+    lease
+        .update(record(
+            previous.clone(),
+            2,
+            NativeXtablesJournalPhase::Active,
+            b"previous boot",
+        ))
+        .unwrap();
+    let reserved = attempt(
+        previous.clone(),
+        NativeXtablesAttemptPhase::Reserved,
+        b"nonce=69;selector=v4",
     );
+    lease.publish_attempt(reserved.clone()).unwrap();
+    lease
+        .update_attempt(
+            &reserved,
+            attempt(
+                previous.clone(),
+                NativeXtablesAttemptPhase::Active,
+                b"nonce=69;selector=v4",
+            ),
+        )
+        .unwrap();
+    drop(lease);
+    let _ = fixture.store.take_events();
     let current = NativeXtablesLeaseScope::new(
         BootIdentity::parse("11111111-aaaa-bbbb-cccc-222222222222").unwrap(),
         previous.network_namespace(),
@@ -554,11 +941,23 @@ fn recovery_inspection_retires_an_internally_consistent_previous_boot_pair_on_fi
     };
     assert!(fixture.store.load_journal().unwrap().is_some());
     assert!(fixture.store.load_lease().unwrap().is_some());
+    assert!(fixture.store.load_attempt().unwrap().is_some());
     assert!(fixture.store.writer_lock_exists().unwrap());
 
     fence.finish_clean().unwrap();
+    assert_event_order(
+        &fixture.store.take_events(),
+        &[
+            DurableEvent::TerminalJournalDurable,
+            DurableEvent::AttemptRemovedDurable,
+            DurableEvent::LeaseRemovedDurable,
+            DurableEvent::JournalRemovedDurable,
+            DurableEvent::WriterLockReleased,
+        ],
+    );
     assert!(fixture.store.load_journal().unwrap().is_none());
     assert!(fixture.store.load_lease().unwrap().is_none());
+    assert!(fixture.store.load_attempt().unwrap().is_none());
     assert!(!fixture.store.writer_lock_exists().unwrap());
 }
 
@@ -792,22 +1191,37 @@ fn recovery_inspection_retires_terminal_previous_boot_release_boundaries() {
 fn previous_boot_retirement_resumes_after_each_durable_cleanup_boundary() {
     for event in [
         DurableEvent::TerminalJournalDurable,
+        DurableEvent::AttemptRemovedDurable,
         DurableEvent::LeaseRemovedDurable,
         DurableEvent::JournalRemovedDurable,
     ] {
         let fixture = Fixture::new();
         let previous = test_binding(76);
-        drop(
-            fixture
-                .store
-                .acquire(record(
-                    previous.clone(),
-                    1,
-                    NativeXtablesJournalPhase::Activating,
-                    b"retirement retry",
-                ))
-                .unwrap(),
-        );
+        let mut lease = fixture
+            .store
+            .acquire(record(
+                previous.clone(),
+                1,
+                NativeXtablesJournalPhase::Activating,
+                b"retirement retry",
+            ))
+            .unwrap();
+        lease
+            .update(record(
+                previous.clone(),
+                2,
+                NativeXtablesJournalPhase::Active,
+                b"retirement retry",
+            ))
+            .unwrap();
+        lease
+            .publish_attempt(attempt(
+                previous.clone(),
+                NativeXtablesAttemptPhase::Reserved,
+                b"nonce=previous-boot",
+            ))
+            .unwrap();
+        drop(lease);
         let current = current_scope_for_binding(&previous);
         let fence = match fixture.store.inspect_for_recovery(&current).unwrap() {
             NativeXtablesRecoveryInspection::Vacant(fence) => fence,
@@ -827,6 +1241,7 @@ fn previous_boot_retirement_resumes_after_each_durable_cleanup_boundary() {
         retry.finish_clean().unwrap();
         assert!(fixture.store.load_journal().unwrap().is_none());
         assert!(fixture.store.load_lease().unwrap().is_none());
+        assert!(fixture.store.load_attempt().unwrap().is_none());
         assert!(!fixture.store.writer_lock_exists().unwrap());
     }
 }
@@ -1348,6 +1763,18 @@ fn record(
         OwnershipJournalRevision::new(revision).unwrap(),
         phase,
         NativeXtablesOwnerPayload::new(payload.to_vec()).unwrap(),
+    )
+}
+
+fn attempt(
+    binding: NativeXtablesJournalBinding,
+    phase: NativeXtablesAttemptPhase,
+    payload: &[u8],
+) -> NativeXtablesAttemptRecord {
+    NativeXtablesAttemptRecord::new(
+        binding,
+        phase,
+        NativeXtablesAttemptPayload::new(payload.to_vec()).unwrap(),
     )
 }
 

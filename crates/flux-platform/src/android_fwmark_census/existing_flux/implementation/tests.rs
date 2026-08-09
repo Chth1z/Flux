@@ -211,10 +211,11 @@ fn malformed_archive_and_no_follow_paths_fail_closed() {
 }
 
 #[test]
-fn journal_lease_and_writer_lock_each_block_clean_absence() {
+fn journal_lease_attempt_and_writer_lock_each_block_clean_absence() {
     for artifact in [
         "native_xtables.journal",
         "native_xtables.lease",
+        "native_xtables.attempt",
         "xtables-writer.lock",
     ] {
         let fixture = Fixture::new();

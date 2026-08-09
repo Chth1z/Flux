@@ -1258,6 +1258,7 @@ pub(crate) enum NativeXtablesOwnerError {
     ExpectedState(XtablesSaveProjectionError),
     InvalidCanarySelector(&'static str),
     CanarySelectorArtifact(XtablesRestoreParseError),
+    AttemptRecoveryRequired,
     RolledBack {
         cause: Box<str>,
         state: NativeXtablesConvergedState,
@@ -1314,6 +1315,9 @@ impl fmt::Display for NativeXtablesOwnerError {
                     "cannot build native canary selector artifact: {source}"
                 )
             }
+            Self::AttemptRecoveryRequired => formatter.write_str(
+                "native xtables attempt recovery must complete before active ownership is available",
+            ),
             Self::RolledBack { cause, state } => write!(
                 formatter,
                 "native xtables convergence failed and rolled back to {state:?}: {cause}"
@@ -1491,6 +1495,9 @@ where
             NativeXtablesRecoveryInspection::CurrentJournal(record) => {
                 self.recover_current_journal(record)
             }
+            NativeXtablesRecoveryInspection::CurrentAttempt { .. } => {
+                Err(NativeXtablesOwnerError::AttemptRecoveryRequired)
+            }
         }
     }
 
@@ -1505,6 +1512,9 @@ where
             return Err(NativeXtablesOwnerError::LiveStateConflict(
                 "native ownership observation found an active writer lock",
             ));
+        }
+        if self.durable.load_attempt()?.is_some() {
+            return Err(NativeXtablesOwnerError::AttemptRecoveryRequired);
         }
         let Some(before) = self.durable.observe_journal()? else {
             return Ok(None);
@@ -1564,6 +1574,9 @@ where
             return Err(NativeXtablesOwnerError::LiveStateConflict(
                 "native ownership lease changed during active readback",
             ));
+        }
+        if self.durable.load_attempt()?.is_some() {
+            return Err(NativeXtablesOwnerError::AttemptRecoveryRequired);
         }
         Ok(Some(public_ownership_observation(before, identity)))
     }
@@ -1916,6 +1929,9 @@ where
                     });
                 }
                 self.recover_to_clean_absence(lease, cursor, &targets)
+            }
+            NativeXtablesRecovery::OutstandingAttempt { .. } => {
+                Err(NativeXtablesOwnerError::AttemptRecoveryRequired)
             }
         }
     }

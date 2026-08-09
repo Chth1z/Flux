@@ -20,18 +20,21 @@ use sha2::{Digest, Sha256};
 
 pub(crate) const NATIVE_XTABLES_JOURNAL_FILE_NAME: &str = "native_xtables.journal";
 pub(crate) const NATIVE_XTABLES_LEASE_FILE_NAME: &str = "native_xtables.lease";
+pub(crate) const NATIVE_XTABLES_ATTEMPT_FILE_NAME: &str = "native_xtables.attempt";
 pub(crate) const NATIVE_XTABLES_TARGET_ARCHIVE_FILE_NAME: &str = "native_xtables.targets";
 pub(crate) const XTABLES_WRITER_LOCK_DIRECTORY_NAME: &str = "xtables-writer.lock";
 const NATIVE_XTABLES_OWNER_GUARD_FILE_NAME: &str = ".native_xtables.owner.lock";
 const NATIVE_XTABLES_RUNTIME_GUARD_FILE_NAME: &str = ".native_xtables.runtime.lock";
 const NATIVE_XTABLES_WRITER_OWNER_FILE_NAME: &str = "native-owner";
 pub(crate) const MAX_NATIVE_XTABLES_OWNER_PAYLOAD_BYTES: usize = 4096;
+pub(crate) const MAX_NATIVE_XTABLES_ATTEMPT_PAYLOAD_BYTES: usize = 512;
 pub(crate) const MAX_NATIVE_XTABLES_DURABLE_RECORD_BYTES: usize = 16 * 1024;
 pub(crate) const MAX_NATIVE_XTABLES_TARGET_ARCHIVE_BYTES: usize = 12 * 1024 * 1024;
 
 const JOURNAL_MAGIC: &str = "flux-native-xtables-journal-v1";
 pub(crate) const NATIVE_XTABLES_JOURNAL_SCHEMA_VERSION: u16 = 1;
 const LEASE_MAGIC: &str = "flux-native-xtables-lease-v1";
+const ATTEMPT_MAGIC: &str = "flux-native-xtables-attempt-v1";
 const WRITER_OWNER_MAGIC: &str = "flux-native-xtables-writer-owner-v1";
 const COMPONENT_NAME: &str = "native_xtables";
 const CHECKSUM_BYTES: usize = 32;
@@ -133,6 +136,130 @@ impl NativeXtablesJournalBinding {
     #[must_use]
     pub(crate) fn lease_scope(&self) -> NativeXtablesLeaseScope {
         NativeXtablesLeaseScope::from_journal(self)
+    }
+}
+
+/// Exact phase durably published before one attempt-object mutation boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NativeXtablesAttemptPhase {
+    Reserved,
+    PopulateSelectorIpv4,
+    PopulateSelectorIpv6,
+    PopulateObservationIpv4,
+    PopulateObservationIpv6,
+    Active,
+    RetireObservationIpv4,
+    RetireObservationIpv6,
+    RetireSelectorIpv4,
+    RetireSelectorIpv6,
+}
+
+impl NativeXtablesAttemptPhase {
+    const fn token(self) -> &'static str {
+        match self {
+            Self::Reserved => "reserved",
+            Self::PopulateSelectorIpv4 => "populate_selector_ipv4",
+            Self::PopulateSelectorIpv6 => "populate_selector_ipv6",
+            Self::PopulateObservationIpv4 => "populate_observation_ipv4",
+            Self::PopulateObservationIpv6 => "populate_observation_ipv6",
+            Self::Active => "active",
+            Self::RetireObservationIpv4 => "retire_observation_ipv4",
+            Self::RetireObservationIpv6 => "retire_observation_ipv6",
+            Self::RetireSelectorIpv4 => "retire_selector_ipv4",
+            Self::RetireSelectorIpv6 => "retire_selector_ipv6",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "reserved" => Some(Self::Reserved),
+            "populate_selector_ipv4" => Some(Self::PopulateSelectorIpv4),
+            "populate_selector_ipv6" => Some(Self::PopulateSelectorIpv6),
+            "populate_observation_ipv4" => Some(Self::PopulateObservationIpv4),
+            "populate_observation_ipv6" => Some(Self::PopulateObservationIpv6),
+            "active" => Some(Self::Active),
+            "retire_observation_ipv4" => Some(Self::RetireObservationIpv4),
+            "retire_observation_ipv6" => Some(Self::RetireObservationIpv6),
+            "retire_selector_ipv4" => Some(Self::RetireSelectorIpv4),
+            "retire_selector_ipv6" => Some(Self::RetireSelectorIpv6),
+            _ => None,
+        }
+    }
+
+    const fn rank(self) -> u8 {
+        match self {
+            Self::Reserved => 0,
+            Self::PopulateSelectorIpv4 => 1,
+            Self::PopulateSelectorIpv6 => 2,
+            Self::PopulateObservationIpv4 => 3,
+            Self::PopulateObservationIpv6 => 4,
+            Self::Active => 5,
+            Self::RetireObservationIpv4 => 6,
+            Self::RetireObservationIpv6 => 7,
+            Self::RetireSelectorIpv4 => 8,
+            Self::RetireSelectorIpv6 => 9,
+        }
+    }
+}
+
+/// Bounded canonical attempt identity encoded by the owner layer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NativeXtablesAttemptPayload(Box<[u8]>);
+
+impl NativeXtablesAttemptPayload {
+    pub(crate) fn new(bytes: impl Into<Box<[u8]>>) -> Result<Self, NativeXtablesDurableError> {
+        let bytes = bytes.into();
+        if bytes.len() > MAX_NATIVE_XTABLES_ATTEMPT_PAYLOAD_BYTES {
+            return Err(NativeXtablesDurableError::AttemptPayloadTooLarge {
+                actual: bytes.len(),
+                limit: MAX_NATIVE_XTABLES_ATTEMPT_PAYLOAD_BYTES,
+            });
+        }
+        Ok(Self(bytes))
+    }
+
+    #[must_use]
+    pub(crate) const fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// One Generation-bound attempt sidecar. The primary owner journal remains unchanged while this
+/// record advances independently under the same component lease and process-liveness guard.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NativeXtablesAttemptRecord {
+    binding: NativeXtablesJournalBinding,
+    phase: NativeXtablesAttemptPhase,
+    payload: NativeXtablesAttemptPayload,
+}
+
+impl NativeXtablesAttemptRecord {
+    #[must_use]
+    pub(crate) const fn new(
+        binding: NativeXtablesJournalBinding,
+        phase: NativeXtablesAttemptPhase,
+        payload: NativeXtablesAttemptPayload,
+    ) -> Self {
+        Self {
+            binding,
+            phase,
+            payload,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn binding(&self) -> &NativeXtablesJournalBinding {
+        &self.binding
+    }
+
+    #[must_use]
+    pub(crate) const fn phase(&self) -> NativeXtablesAttemptPhase {
+        self.phase
+    }
+
+    #[must_use]
+    pub(crate) const fn payload(&self) -> &NativeXtablesAttemptPayload {
+        &self.payload
     }
 }
 
@@ -301,6 +428,7 @@ pub(crate) struct NativeXtablesDurableReadOnlyObservation {
     root_identity: Option<NativeXtablesDurableRootIdentity>,
     journal_present: bool,
     lease_present: bool,
+    attempt_present: bool,
     writer_lock_present: bool,
     target_archive: Option<Box<[u8]>>,
 }
@@ -319,6 +447,11 @@ impl NativeXtablesDurableReadOnlyObservation {
     #[must_use]
     pub(crate) const fn lease_present(&self) -> bool {
         self.lease_present
+    }
+
+    #[must_use]
+    pub(crate) const fn attempt_present(&self) -> bool {
+        self.attempt_present
     }
 
     #[must_use]
@@ -353,6 +486,11 @@ impl NativeXtablesDurableStore {
     }
 
     #[must_use]
+    pub(crate) fn attempt_path(&self) -> PathBuf {
+        self.root.join(NATIVE_XTABLES_ATTEMPT_FILE_NAME)
+    }
+
+    #[must_use]
     pub(crate) fn writer_lock_path(&self) -> PathBuf {
         self.root.join(XTABLES_WRITER_LOCK_DIRECTORY_NAME)
     }
@@ -372,6 +510,7 @@ impl NativeXtablesDurableStore {
                 root_identity: None,
                 journal_present: false,
                 lease_present: false,
+                attempt_present: false,
                 writer_lock_present: false,
                 target_archive: None,
             });
@@ -385,6 +524,7 @@ impl NativeXtablesDurableStore {
         });
         let journal_present = named_entry_exists(&root, NATIVE_XTABLES_JOURNAL_FILE_NAME)?;
         let lease_present = named_entry_exists(&root, NATIVE_XTABLES_LEASE_FILE_NAME)?;
+        let attempt_present = named_entry_exists(&root, NATIVE_XTABLES_ATTEMPT_FILE_NAME)?;
         let writer_lock_present = named_entry_exists(&root, XTABLES_WRITER_LOCK_DIRECTORY_NAME)?;
         let target_archive = read_record_bounded(
             &root,
@@ -397,6 +537,7 @@ impl NativeXtablesDurableStore {
             root_identity,
             journal_present,
             lease_present,
+            attempt_present,
             writer_lock_present,
             target_archive,
         })
@@ -491,6 +632,9 @@ impl NativeXtablesDurableStore {
         {
             return Err(NativeXtablesDurableError::UnresolvedJournal);
         }
+        if read_attempt(&root)?.is_some() {
+            return Err(NativeXtablesDurableError::OrphanedAttempt);
+        }
 
         let encoded_journal = encode_journal(&initial);
         atomic_write(
@@ -537,16 +681,23 @@ impl NativeXtablesDurableStore {
 
         let journal = read_journal(&root)?;
         let lease = read_lease(&root)?;
+        let attempt = read_attempt(&root)?;
         match (journal, lease) {
             (None, None) if inherited_lock => {
                 Err(NativeXtablesDurableError::InterruptedPublication)
             }
             (None, None) => {
+                if attempt.is_some() {
+                    return Err(NativeXtablesDurableError::OrphanedAttempt);
+                }
                 remove_writer_lock(&root, writer_lock, self)?;
                 Ok(NativeXtablesRecovery::Empty)
             }
             (Some(journal), None) => {
                 require_binding(expected, &journal.binding, DurableArtifact::Journal)?;
+                if attempt.is_some() {
+                    return Err(NativeXtablesDurableError::OrphanedAttempt);
+                }
                 if journal.phase.is_terminal() {
                     Ok(NativeXtablesRecovery::CleanAbsent {
                         record: journal.clone(),
@@ -556,6 +707,7 @@ impl NativeXtablesDurableStore {
                             retirement: Some(PreviousBootRetirement {
                                 journal,
                                 lease: None,
+                                attempt: None,
                             }),
                             _native_guard: native_guard,
                         }),
@@ -567,6 +719,9 @@ impl NativeXtablesDurableStore {
                 }
             }
             (None, Some(lease)) => {
+                if attempt.is_some() {
+                    return Err(NativeXtablesDurableError::OrphanedAttempt);
+                }
                 let result = require_lease_scope(&lease_scope, &lease)
                     .and(Err(NativeXtablesDurableError::MissingJournal));
                 if !inherited_lock {
@@ -585,6 +740,16 @@ impl NativeXtablesDurableStore {
                     }
                     return Err(error);
                 }
+                if let Some(attempt_record) = &attempt {
+                    require_binding(
+                        &journal.binding,
+                        attempt_record.binding(),
+                        DurableArtifact::Attempt,
+                    )?;
+                }
+                if attempt.is_some() && journal.phase != NativeXtablesJournalPhase::Active {
+                    return Err(NativeXtablesDurableError::OrphanedAttempt);
+                }
                 if journal.phase.is_terminal() {
                     Ok(NativeXtablesRecovery::CleanAbsent {
                         record: journal.clone(),
@@ -594,20 +759,25 @@ impl NativeXtablesDurableStore {
                             retirement: Some(PreviousBootRetirement {
                                 journal,
                                 lease: Some(lease),
+                                attempt,
                             }),
                             _native_guard: native_guard,
                         }),
                     })
                 } else {
                     remove_writer_lock(&root, writer_lock, self)?;
-                    Ok(NativeXtablesRecovery::Leased(
-                        NativeXtablesTransitionLease {
-                            store: self.clone(),
-                            binding: expected.clone(),
-                            lease_scope,
-                            _native_guard: native_guard,
-                        },
-                    ))
+                    let lease = NativeXtablesTransitionLease {
+                        store: self.clone(),
+                        binding: expected.clone(),
+                        lease_scope,
+                        _native_guard: native_guard,
+                    };
+                    match attempt {
+                        Some(record) => {
+                            Ok(NativeXtablesRecovery::OutstandingAttempt { lease, record })
+                        }
+                        None => Ok(NativeXtablesRecovery::Leased(lease)),
+                    }
                 }
             }
         }
@@ -634,19 +804,37 @@ impl NativeXtablesDurableStore {
             recover_or_create_writer_lock(&root, current_scope, self)?;
         let journal = read_journal(&root)?;
         let lease = read_lease(&root)?;
+        let attempt = read_attempt(&root)?;
 
         match (journal, lease) {
-            (None, None) => Ok(NativeXtablesRecoveryInspection::Vacant(
-                NativeXtablesRecoveryFence {
-                    store: self.clone(),
-                    writer_lock,
-                    retirement: None,
-                    _native_guard: native_guard,
-                },
-            )),
-            (None, Some(_)) => Err(NativeXtablesDurableError::MissingJournal),
+            (None, None) => {
+                if attempt.is_some() {
+                    return Err(NativeXtablesDurableError::OrphanedAttempt);
+                }
+                Ok(NativeXtablesRecoveryInspection::Vacant(
+                    NativeXtablesRecoveryFence {
+                        store: self.clone(),
+                        writer_lock,
+                        retirement: None,
+                        _native_guard: native_guard,
+                    },
+                ))
+            }
+            (None, Some(_)) => {
+                if attempt.is_some() {
+                    return Err(NativeXtablesDurableError::OrphanedAttempt);
+                }
+                Err(NativeXtablesDurableError::MissingJournal)
+            }
             (Some(journal), lease) => {
                 let recorded_scope = journal.binding.lease_scope();
+                if let Some(attempt_record) = &attempt {
+                    require_binding(
+                        &journal.binding,
+                        attempt_record.binding(),
+                        DurableArtifact::Attempt,
+                    )?;
+                }
                 if journal.binding.boot_identity == current_scope.boot_identity {
                     require_lease_scope(current_scope, &recorded_scope)?;
                     match &lease {
@@ -656,13 +844,27 @@ impl NativeXtablesDurableStore {
                         }
                         None => {}
                     }
+                    if let Some(attempt) = attempt {
+                        if journal.phase != NativeXtablesJournalPhase::Active {
+                            return Err(NativeXtablesDurableError::OrphanedAttempt);
+                        }
+                        remove_writer_lock(&root, writer_lock, self)?;
+                        return Ok(NativeXtablesRecoveryInspection::CurrentAttempt {
+                            record: journal,
+                            attempt,
+                        });
+                    }
                     if journal.phase.is_terminal() {
                         return Ok(NativeXtablesRecoveryInspection::CurrentTerminal {
                             record: journal.clone(),
                             fence: NativeXtablesRecoveryFence {
                                 store: self.clone(),
                                 writer_lock,
-                                retirement: Some(PreviousBootRetirement { journal, lease }),
+                                retirement: Some(PreviousBootRetirement {
+                                    journal,
+                                    lease,
+                                    attempt: None,
+                                }),
                                 _native_guard: native_guard,
                             },
                         });
@@ -690,7 +892,11 @@ impl NativeXtablesDurableStore {
                         NativeXtablesRecoveryFence {
                             store: self.clone(),
                             writer_lock,
-                            retirement: Some(PreviousBootRetirement { journal, lease }),
+                            retirement: Some(PreviousBootRetirement {
+                                journal,
+                                lease,
+                                attempt,
+                            }),
                             _native_guard: native_guard,
                         },
                     ))
@@ -724,6 +930,15 @@ impl NativeXtablesDurableStore {
             return Ok(None);
         };
         read_lease(&root)
+    }
+
+    pub(crate) fn load_attempt(
+        &self,
+    ) -> Result<Option<NativeXtablesAttemptRecord>, NativeXtablesDurableError> {
+        let Some(root) = open_root(&self.root, false)? else {
+            return Ok(None);
+        };
+        read_attempt(&root)
     }
 
     pub(crate) fn writer_lock_exists(&self) -> Result<bool, NativeXtablesDurableError> {
@@ -763,6 +978,10 @@ impl NativeXtablesDurableStore {
 pub(crate) enum NativeXtablesRecovery {
     Empty,
     Leased(NativeXtablesTransitionLease),
+    OutstandingAttempt {
+        lease: NativeXtablesTransitionLease,
+        record: NativeXtablesAttemptRecord,
+    },
     CleanAbsent {
         record: NativeXtablesJournalRecord,
         fence: Box<NativeXtablesRecoveryFence>,
@@ -781,6 +1000,12 @@ pub(crate) enum NativeXtablesRecoveryInspection {
     },
     /// A current durable journal exists and the caller must continue through exact journal recovery.
     CurrentJournal(NativeXtablesJournalRecord),
+    /// A current active journal has an exact attempt that must be normalized before active state can
+    /// be reported or another mutation can begin.
+    CurrentAttempt {
+        record: NativeXtablesJournalRecord,
+        attempt: NativeXtablesAttemptRecord,
+    },
 }
 
 #[derive(Debug)]
@@ -795,6 +1020,7 @@ pub(crate) struct NativeXtablesRecoveryFence {
 struct PreviousBootRetirement {
     journal: NativeXtablesJournalRecord,
     lease: Option<NativeXtablesLeaseScope>,
+    attempt: Option<NativeXtablesAttemptRecord>,
 }
 
 impl NativeXtablesRecoveryFence {
@@ -828,6 +1054,9 @@ impl NativeXtablesRecoveryFence {
                 )?;
                 terminal
             };
+            if let Some(attempt) = retirement.attempt {
+                remove_attempt(&root, &attempt, &self.store)?;
+            }
             if let Some(lease) = retirement.lease {
                 remove_lease(&root, &lease, &self.store)?;
             }
@@ -856,6 +1085,94 @@ impl NativeXtablesTransitionLease {
         &self.binding
     }
 
+    /// Publishes one exact attempt sidecar without changing the primary owner journal.
+    pub(crate) fn publish_attempt(
+        &mut self,
+        initial: NativeXtablesAttemptRecord,
+    ) -> Result<(), NativeXtablesDurableError> {
+        if initial.phase != NativeXtablesAttemptPhase::Reserved {
+            return Err(NativeXtablesDurableError::InvalidRecord {
+                artifact: DurableArtifact::Attempt,
+                reason: "initial attempt phase is not reserved",
+            });
+        }
+        require_binding(&self.binding, &initial.binding, DurableArtifact::Attempt)?;
+        let root = open_existing_root(&self.store.root)?;
+        let writer_lock = create_writer_lock(&root, &self.lease_scope, &self.store)?;
+        if let Err(error) = validate_primary_pair(&root, &self.binding, &self.lease_scope) {
+            remove_writer_lock(&root, writer_lock, &self.store)?;
+            return Err(error);
+        }
+        if read_attempt(&root)?.is_some() {
+            remove_writer_lock(&root, writer_lock, &self.store)?;
+            return Err(NativeXtablesDurableError::AttemptConflict);
+        }
+        atomic_write_bounded(
+            &root,
+            NATIVE_XTABLES_ATTEMPT_FILE_NAME,
+            &encode_attempt(&initial),
+            DurableArtifact::Attempt,
+            MAX_NATIVE_XTABLES_DURABLE_RECORD_BYTES,
+            DurableEvent::AttemptTempDurable,
+            DurableEvent::AttemptDurable,
+            &self.store,
+        )?;
+        remove_writer_lock(&root, writer_lock, &self.store)
+    }
+
+    /// Advances the exact sidecar before the matching attempt-object mutation boundary.
+    pub(crate) fn update_attempt(
+        &mut self,
+        current: &NativeXtablesAttemptRecord,
+        next: NativeXtablesAttemptRecord,
+    ) -> Result<(), NativeXtablesDurableError> {
+        require_binding(&self.binding, &current.binding, DurableArtifact::Attempt)?;
+        require_binding(&self.binding, &next.binding, DurableArtifact::Attempt)?;
+        if current.payload != next.payload || next.phase.rank() <= current.phase.rank() {
+            return Err(NativeXtablesDurableError::InvalidRecord {
+                artifact: DurableArtifact::Attempt,
+                reason: "attempt update changed identity or did not advance its phase",
+            });
+        }
+        let root = open_existing_root(&self.store.root)?;
+        let writer_lock = create_writer_lock(&root, &self.lease_scope, &self.store)?;
+        if let Err(error) = validate_primary_pair(&root, &self.binding, &self.lease_scope)
+            .and_then(|()| require_exact_attempt(&root, current))
+        {
+            remove_writer_lock(&root, writer_lock, &self.store)?;
+            return Err(error);
+        }
+        atomic_write_bounded(
+            &root,
+            NATIVE_XTABLES_ATTEMPT_FILE_NAME,
+            &encode_attempt(&next),
+            DurableArtifact::Attempt,
+            MAX_NATIVE_XTABLES_DURABLE_RECORD_BYTES,
+            DurableEvent::AttemptTempDurable,
+            DurableEvent::AttemptDurable,
+            &self.store,
+        )?;
+        remove_writer_lock(&root, writer_lock, &self.store)
+    }
+
+    /// Removes only the exact sidecar after the owner has proved all attempt objects absent.
+    pub(crate) fn remove_attempt(
+        &mut self,
+        expected: &NativeXtablesAttemptRecord,
+    ) -> Result<(), NativeXtablesDurableError> {
+        require_binding(&self.binding, &expected.binding, DurableArtifact::Attempt)?;
+        let root = open_existing_root(&self.store.root)?;
+        let writer_lock = create_writer_lock(&root, &self.lease_scope, &self.store)?;
+        if let Err(error) = validate_primary_pair(&root, &self.binding, &self.lease_scope)
+            .and_then(|()| require_exact_attempt(&root, expected))
+        {
+            remove_writer_lock(&root, writer_lock, &self.store)?;
+            return Err(error);
+        }
+        remove_attempt(&root, expected, &self.store)?;
+        remove_writer_lock(&root, writer_lock, &self.store)
+    }
+
     /// Atomically advances a nonterminal journal record while holding and revalidating the exact
     /// durable lease. Terminal publication must use `complete` so lease-release ordering cannot be
     /// bypassed.
@@ -868,7 +1185,8 @@ impl NativeXtablesTransitionLease {
         }
         let root = open_existing_root(&self.store.root)?;
         let writer_lock = create_writer_lock(&root, &self.lease_scope, &self.store)?;
-        let result = validate_update(&root, &self.binding, &self.lease_scope, &next);
+        let result = require_attempt_absence(&root)
+            .and_then(|()| validate_update(&root, &self.binding, &self.lease_scope, &next));
         if let Err(error) = result {
             remove_writer_lock(&root, writer_lock, &self.store)?;
             return Err(error);
@@ -895,7 +1213,8 @@ impl NativeXtablesTransitionLease {
         validate_replacement_shape(&self.binding, &self.lease_scope, &replacement)?;
         let root = open_existing_root(&self.store.root)?;
         let writer_lock = create_writer_lock(&root, &self.lease_scope, &self.store)?;
-        let result = validate_rebind(&root, &self.binding, &self.lease_scope, &replacement);
+        let result = require_attempt_absence(&root)
+            .and_then(|()| validate_rebind(&root, &self.binding, &self.lease_scope, &replacement));
         if let Err(error) = result {
             remove_writer_lock(&root, writer_lock, &self.store)?;
             return Err(error);
@@ -926,7 +1245,8 @@ impl NativeXtablesTransitionLease {
         }
         let root = open_existing_root(&self.store.root)?;
         let writer_lock = create_writer_lock(&root, &self.lease_scope, &self.store)?;
-        let result = validate_update(&root, &self.binding, &self.lease_scope, &terminal);
+        let result = require_attempt_absence(&root)
+            .and_then(|()| validate_update(&root, &self.binding, &self.lease_scope, &terminal));
         if let Err(error) = result {
             remove_writer_lock(&root, writer_lock, &self.store)?;
             return Err(error);
@@ -970,6 +1290,46 @@ fn validate_update(
         });
     }
     Ok(())
+}
+
+fn validate_primary_pair(
+    root: &File,
+    expected: &NativeXtablesJournalBinding,
+    expected_scope: &NativeXtablesLeaseScope,
+) -> Result<(), NativeXtablesDurableError> {
+    let lease = read_lease(root)?.ok_or(NativeXtablesDurableError::MissingLease)?;
+    require_lease_scope(expected_scope, &lease)?;
+    let journal = read_journal(root)?.ok_or(NativeXtablesDurableError::MissingJournal)?;
+    require_binding(expected, &journal.binding, DurableArtifact::Journal)?;
+    if journal.phase != NativeXtablesJournalPhase::Active {
+        return Err(NativeXtablesDurableError::InvalidRecord {
+            artifact: DurableArtifact::Journal,
+            reason: "attempt sidecar requires an active primary journal",
+        });
+    }
+    Ok(())
+}
+
+fn require_exact_attempt(
+    root: &File,
+    expected: &NativeXtablesAttemptRecord,
+) -> Result<(), NativeXtablesDurableError> {
+    let actual = read_attempt(root)?.ok_or(NativeXtablesDurableError::OrphanedAttempt)?;
+    if actual == *expected {
+        Ok(())
+    } else {
+        Err(NativeXtablesDurableError::BindingMismatch {
+            artifact: DurableArtifact::Attempt,
+        })
+    }
+}
+
+fn require_attempt_absence(root: &File) -> Result<(), NativeXtablesDurableError> {
+    if read_attempt(root)?.is_none() {
+        Ok(())
+    } else {
+        Err(NativeXtablesDurableError::AttemptConflict)
+    }
 }
 
 fn validate_replacement_shape(
@@ -1042,6 +1402,7 @@ fn require_lease_scope(
 pub(crate) enum DurableArtifact {
     Journal,
     Lease,
+    Attempt,
     TargetArchive,
     WriterOwner,
 }
@@ -1051,6 +1412,7 @@ impl fmt::Display for DurableArtifact {
         match self {
             Self::Journal => formatter.write_str("journal"),
             Self::Lease => formatter.write_str("lease"),
+            Self::Attempt => formatter.write_str("attempt sidecar"),
             Self::TargetArchive => formatter.write_str("target archive"),
             Self::WriterOwner => formatter.write_str("writer owner"),
         }
@@ -1075,6 +1437,10 @@ pub(crate) enum NativeXtablesDurableError {
         actual: usize,
         limit: usize,
     },
+    AttemptPayloadTooLarge {
+        actual: usize,
+        limit: usize,
+    },
     InvalidRecord {
         artifact: DurableArtifact,
         reason: &'static str,
@@ -1086,6 +1452,8 @@ pub(crate) enum NativeXtablesDurableError {
     InterruptedPublication,
     MissingJournal,
     MissingLease,
+    AttemptConflict,
+    OrphanedAttempt,
     BindingMismatch {
         artifact: DurableArtifact,
     },
@@ -1140,6 +1508,10 @@ impl fmt::Display for NativeXtablesDurableError {
                 formatter,
                 "native xtables owner payload is {actual} bytes, exceeding {limit}-byte limit"
             ),
+            Self::AttemptPayloadTooLarge { actual, limit } => write!(
+                formatter,
+                "native xtables attempt payload is {actual} bytes, exceeding {limit}-byte limit"
+            ),
             Self::InvalidRecord { artifact, reason } => {
                 write!(formatter, "invalid native xtables {artifact}: {reason}")
             }
@@ -1161,6 +1533,12 @@ impl fmt::Display for NativeXtablesDurableError {
             Self::MissingLease => {
                 formatter.write_str("nonterminal native xtables journal has no matching lease")
             }
+            Self::AttemptConflict => {
+                formatter.write_str("a native xtables attempt sidecar already exists")
+            }
+            Self::OrphanedAttempt => formatter.write_str(
+                "native xtables attempt sidecar has no matching active journal and lease",
+            ),
             Self::BindingMismatch { artifact } => write!(
                 formatter,
                 "native xtables {artifact} scope or exact journal binding is stale"
@@ -1232,6 +1610,24 @@ fn encode_lease(scope: &NativeXtablesLeaseScope) -> Vec<u8> {
     push_line(&mut encoded, LEASE_MAGIC);
     push_line(&mut encoded, &format!("component={COMPONENT_NAME}"));
     encode_scope_lines(&mut encoded, scope);
+    append_checksum(&mut encoded);
+    encoded
+}
+
+fn encode_attempt(record: &NativeXtablesAttemptRecord) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(512 + record.payload.as_bytes().len() * 2);
+    push_line(&mut encoded, ATTEMPT_MAGIC);
+    push_line(&mut encoded, &format!("component={COMPONENT_NAME}"));
+    encode_binding_lines(&mut encoded, &record.binding);
+    push_line(&mut encoded, &format!("phase={}", record.phase.token()));
+    push_line(
+        &mut encoded,
+        &format!("payload_bytes={}", record.payload.as_bytes().len()),
+    );
+    push_line(
+        &mut encoded,
+        &format!("payload_hex={}", encode_hex(record.payload.as_bytes())),
+    );
     append_checksum(&mut encoded);
     encoded
 }
@@ -1334,6 +1730,48 @@ fn parse_journal(encoded: &[u8]) -> Result<NativeXtablesJournalRecord, NativeXta
     if encode_journal(&record) != encoded {
         return Err(invalid_record(
             DurableArtifact::Journal,
+            "record is not canonical",
+        ));
+    }
+    Ok(record)
+}
+
+fn parse_attempt(encoded: &[u8]) -> Result<NativeXtablesAttemptRecord, NativeXtablesDurableError> {
+    ensure_record_bound(encoded, DurableArtifact::Attempt)?;
+    let lines = canonical_lines(encoded, DurableArtifact::Attempt, 11)?;
+    if lines[0] != ATTEMPT_MAGIC || lines[1] != format!("component={COMPONENT_NAME}") {
+        return Err(invalid_record(
+            DurableArtifact::Attempt,
+            "wrong schema or component",
+        ));
+    }
+    validate_checksum(encoded, &lines, DurableArtifact::Attempt)?;
+    let binding = parse_binding(&lines[2..7], DurableArtifact::Attempt)?;
+    let phase =
+        NativeXtablesAttemptPhase::parse(field(lines[7], "phase", DurableArtifact::Attempt)?)
+            .ok_or_else(|| invalid_record(DurableArtifact::Attempt, "invalid phase"))?;
+    let payload_len =
+        parse_canonical_usize(field(lines[8], "payload_bytes", DurableArtifact::Attempt)?)
+            .ok_or_else(|| invalid_record(DurableArtifact::Attempt, "invalid payload length"))?;
+    if payload_len > MAX_NATIVE_XTABLES_ATTEMPT_PAYLOAD_BYTES {
+        return Err(NativeXtablesDurableError::AttemptPayloadTooLarge {
+            actual: payload_len,
+            limit: MAX_NATIVE_XTABLES_ATTEMPT_PAYLOAD_BYTES,
+        });
+    }
+    let payload = decode_hex(field(lines[9], "payload_hex", DurableArtifact::Attempt)?)
+        .ok_or_else(|| invalid_record(DurableArtifact::Attempt, "invalid payload encoding"))?;
+    if payload.len() != payload_len {
+        return Err(invalid_record(
+            DurableArtifact::Attempt,
+            "payload length does not match encoding",
+        ));
+    }
+    let record =
+        NativeXtablesAttemptRecord::new(binding, phase, NativeXtablesAttemptPayload::new(payload)?);
+    if encode_attempt(&record) != encoded {
+        return Err(invalid_record(
+            DurableArtifact::Attempt,
             "record is not canonical",
         ));
     }
@@ -1714,6 +2152,18 @@ fn read_lease(root: &File) -> Result<Option<NativeXtablesLeaseScope>, NativeXtab
     read_record(root, NATIVE_XTABLES_LEASE_FILE_NAME, DurableArtifact::Lease)?
         .map(|encoded| parse_lease(&encoded))
         .transpose()
+}
+
+fn read_attempt(
+    root: &File,
+) -> Result<Option<NativeXtablesAttemptRecord>, NativeXtablesDurableError> {
+    read_record(
+        root,
+        NATIVE_XTABLES_ATTEMPT_FILE_NAME,
+        DurableArtifact::Attempt,
+    )?
+    .map(|encoded| parse_attempt(&encoded))
+    .transpose()
 }
 
 fn read_record(
@@ -2328,6 +2778,22 @@ fn remove_lease(
     checkpoint(store, DurableEvent::LeaseRemovedDurable)
 }
 
+fn remove_attempt(
+    root: &File,
+    expected: &NativeXtablesAttemptRecord,
+    store: &NativeXtablesDurableStore,
+) -> Result<(), NativeXtablesDurableError> {
+    require_exact_attempt(root, expected)?;
+    let name = static_c_string(NATIVE_XTABLES_ATTEMPT_FILE_NAME);
+    unlink_at(root.as_raw_fd(), &name, 0).map_err(|source| {
+        NativeXtablesDurableError::io("remove native xtables attempt sidecar", source)
+    })?;
+    root.sync_all().map_err(|source| {
+        NativeXtablesDurableError::io("sync native xtables attempt sidecar removal", source)
+    })?;
+    checkpoint(store, DurableEvent::AttemptRemovedDurable)
+}
+
 fn remove_journal(
     root: &File,
     expected: &NativeXtablesJournalRecord,
@@ -2481,6 +2947,9 @@ pub(crate) enum DurableEvent {
     WriterLockDurable,
     TargetArchiveTempDurable,
     TargetArchiveDurable,
+    AttemptTempDurable,
+    AttemptDurable,
+    AttemptRemovedDurable,
     JournalTempDurable,
     JournalDurable,
     JournalBeforeLease,

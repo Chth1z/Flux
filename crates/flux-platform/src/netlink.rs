@@ -28,6 +28,10 @@ pub(crate) mod policy_routing_session;
 #[allow(dead_code)]
 pub(crate) mod route;
 
+// Fixed-purpose canary FIB lookup stays private behind the serialized routing session.
+#[allow(dead_code)]
+pub(crate) mod route_lookup;
+
 // Raw rule framing stays private behind the combined inventory observer.
 #[allow(dead_code)]
 pub(crate) mod rule;

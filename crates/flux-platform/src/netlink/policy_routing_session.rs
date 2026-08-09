@@ -11,6 +11,10 @@ use super::policy_routing::{
     PolicyRoutingMutation, PolicyRoutingMutationKind, PolicyRoutingReadbackErrorKind,
     decode_policy_routing_ack, encode_policy_routing_mutation, observe_managed_policy_routing,
 };
+use super::route_lookup::{
+    CanaryRouteLookupOutcome, CanaryRouteLookupRequest, MAX_ROUTE_LOOKUP_RESPONSE_BYTES,
+    RouteLookupDecodeErrorKind, decode_canary_route_lookup, encode_canary_route_lookup,
+};
 use super::socket::{NetlinkSequenceAllocator, RouteDumpRequest, RuleDumpRequest};
 use super::{NLMSG_DONE, NLMSG_ERROR, NLMSG_OVERRUN, NetlinkMessageIter};
 
@@ -67,6 +71,7 @@ pub(crate) enum PolicyRoutingSessionFailureKind {
     Encode(PolicyRoutingEncodeError),
     AckDecode(PolicyRoutingAckDecodeErrorKind),
     Readback(PolicyRoutingReadbackErrorKind),
+    RouteLookupDecode(RouteLookupDecodeErrorKind),
     FreshSessionRequired,
 }
 
@@ -323,6 +328,58 @@ impl PolicyRoutingSession {
                 error.offset(),
             )
         })
+    }
+
+    pub(crate) fn lookup_canary_route_until(
+        &mut self,
+        lookup: CanaryRouteLookupRequest,
+        caller_deadline: Instant,
+    ) -> Result<CanaryRouteLookupOutcome, PolicyRoutingSessionFailure> {
+        const OPERATION: &str = "lookup canary route";
+
+        self.require_usable(OPERATION)?;
+        let deadline = caller_deadline.min(self.deadline());
+        if Instant::now() >= deadline {
+            return Err(PolicyRoutingSessionFailure::new(
+                OPERATION,
+                PolicyRoutingSessionFailureKind::TimedOut,
+                0,
+            ));
+        }
+
+        let sequence = self.sequences.allocate();
+        let request = encode_canary_route_lookup(lookup, sequence);
+        if let Err(error) = self.transport.send_datagram(request.bytes(), deadline) {
+            self.requires_fresh_session = true;
+            return Err(error);
+        }
+        let datagram = match self
+            .transport
+            .receive_datagram(MAX_ROUTE_LOOKUP_RESPONSE_BYTES, deadline)
+        {
+            Ok(datagram) => datagram,
+            Err(error) => {
+                self.requires_fresh_session = true;
+                return Err(error);
+            }
+        };
+
+        match decode_canary_route_lookup(
+            &datagram.bytes,
+            datagram.sender,
+            self.evidence().local_port_id(),
+            &request,
+        ) {
+            Ok(outcome) => Ok(outcome),
+            Err(error) => {
+                self.requires_fresh_session = true;
+                Err(PolicyRoutingSessionFailure::new(
+                    OPERATION,
+                    PolicyRoutingSessionFailureKind::RouteLookupDecode(error.kind()),
+                    error.offset(),
+                ))
+            }
+        }
     }
 
     fn execute_transaction(

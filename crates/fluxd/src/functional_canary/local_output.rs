@@ -45,6 +45,8 @@ use super::supervised_delivery_report::collector::RetiredSupervisedDeliveryRepor
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod driver_child;
 mod driver_process;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod driver_traffic;
 use driver_process::DriverProcessProof;
 
 #[cfg(any(target_os = "linux", target_os = "android"))]

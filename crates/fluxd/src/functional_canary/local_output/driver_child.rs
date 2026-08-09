@@ -10,16 +10,21 @@ use flux_platform::internal::{
     RestrictedChildCredentials, claim_inherited_seqpacket_connection,
     configure_restricted_child_process, seqpacket_inherited_descriptor,
 };
-use flux_platform::{PeerCredentials, PlatformError, SeqpacketConnection, SeqpacketReceive};
+use flux_platform::{
+    PeerCredentials, PlatformError, ProcessIdentity, SeqpacketConnection, SeqpacketReceive,
+};
 
 use super::super::{
     CANARY_PEER_SERVER_SLOTS, CanaryAttemptRequest, CanaryFlow, CanaryProcessCredentialIdentity,
 };
-#[cfg(test)]
 use super::driver_process::DriverProcessProof;
 use super::driver_process::{
     DriverProcessAuthorityError, DriverProcessRole, ReapedDriverChild, RetainedDriverChild,
     abort_unready_driver_child, retire_child_without_blocking,
+};
+use super::driver_traffic::{
+    TrafficFlowPlan, TrafficFlowResult, TrafficMessage, parent_receive_signal,
+    parent_receive_tuple, parent_send_plan, parent_send_signal, run_child_session,
 };
 
 const PROC_SELF_EXE: &str = "/proc/self/exe";
@@ -30,7 +35,7 @@ const MAX_CHILD_LIFETIME: Duration = Duration::from_secs(120);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
-enum PackagedDriverChildRole {
+pub(super) enum PackagedDriverChildRole {
     Client = 0,
     TcpEcho = 1,
     UdpEcho = 2,
@@ -64,6 +69,16 @@ impl PackagedDriverChildRole {
             "tcp-echo" => Some(Self::TcpEcho),
             "udp-echo" => Some(Self::UdpEcho),
             "dns" => Some(Self::Dns),
+            _ => None,
+        }
+    }
+
+    pub(super) const fn from_tag(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Client),
+            1 => Some(Self::TcpEcho),
+            2 => Some(Self::UdpEcho),
+            3 => Some(Self::Dns),
             _ => None,
         }
     }
@@ -155,6 +170,7 @@ impl ChildBindPlan {
 pub(super) struct PackagedDriverChildren {
     client: PackagedDriverChild,
     peer_servers: [PackagedDriverChild; CANARY_PEER_SERVER_SLOTS],
+    next_flow_index: usize,
 }
 
 impl PackagedDriverChildren {
@@ -231,7 +247,109 @@ impl PackagedDriverChildren {
         Ok(Self {
             client,
             peer_servers: [peer_0, peer_1, peer_2],
+            next_flow_index: 0,
         })
+    }
+
+    /// Start one exact flow in canonical request order and return only after
+    /// both live endpoints have authenticated their held socket tuples. The
+    /// borrow prevents another child command until the caller explicitly
+    /// releases the peer response or drops the hold and aborts all children.
+    pub(super) fn begin_flow(
+        &mut self,
+        request: &CanaryAttemptRequest,
+        flow: CanaryFlow,
+    ) -> Result<PackagedDriverFlowHolding<'_>, PackagedDriverChildError> {
+        let plan = TrafficFlowPlan::for_request(request, flow)?;
+        self.begin_flow_plan(plan, request.deadline().expires_at())
+    }
+
+    fn begin_flow_plan(
+        &mut self,
+        plan: TrafficFlowPlan,
+        exclusive_deadline: Instant,
+    ) -> Result<PackagedDriverFlowHolding<'_>, PackagedDriverChildError> {
+        let flow = plan.flow();
+        if CanaryFlow::ALL.get(self.next_flow_index).copied() != Some(flow) {
+            return Err(PackagedDriverChildError::Protocol(
+                "packaged driver traffic must follow canonical canary flow order",
+            ));
+        }
+        let (peer_index, peer_role) = peer_for_flow(flow);
+        let peer = &self.peer_servers[peer_index];
+        parent_send_plan(
+            &peer.control,
+            peer_role,
+            TrafficMessage::ArmFlow,
+            &plan,
+            exclusive_deadline,
+        )?;
+        parent_receive_signal(
+            &peer.control,
+            peer.retained.identity().pid().get(),
+            peer.credentials,
+            peer_role,
+            TrafficMessage::Armed,
+            flow,
+            exclusive_deadline,
+        )?;
+        parent_send_plan(
+            &self.client.control,
+            PackagedDriverChildRole::Client,
+            TrafficMessage::RunFlow,
+            &plan,
+            exclusive_deadline,
+        )?;
+        let peer_tuple = parent_receive_tuple(
+            &peer.control,
+            peer.retained.identity().pid().get(),
+            peer.credentials,
+            peer_role,
+            TrafficMessage::PeerObserved,
+            flow,
+            exclusive_deadline,
+        )?;
+        let client_tuple = parent_receive_tuple(
+            &self.client.control,
+            self.client.retained.identity().pid().get(),
+            self.client.credentials,
+            PackagedDriverChildRole::Client,
+            TrafficMessage::ClientHolding,
+            flow,
+            exclusive_deadline,
+        )?;
+        super::driver_traffic::TrafficFlowResult::new(plan.clone(), client_tuple, peer_tuple)?;
+        self.next_flow_index += 1;
+        Ok(PackagedDriverFlowHolding {
+            children: self,
+            peer_index,
+            peer_role,
+            plan,
+            client_tuple,
+            peer_tuple,
+            exclusive_deadline,
+        })
+    }
+
+    /// Compensate any failed or abandoned traffic transaction. Every child is
+    /// evaluated before the first failure is returned, so siblings never
+    /// detach merely because one reap failed.
+    pub(super) fn abort_and_reap(
+        self,
+        exclusive_deadline: Instant,
+    ) -> Result<(), PackagedDriverChildError> {
+        let [peer_0, peer_1, peer_2] = self.peer_servers;
+        let [client, peer_0, peer_1, peer_2] = [
+            self.client.abort_and_reap(exclusive_deadline),
+            peer_0.abort_and_reap(exclusive_deadline),
+            peer_1.abort_and_reap(exclusive_deadline),
+            peer_2.abort_and_reap(exclusive_deadline),
+        ];
+        client?;
+        peer_0?;
+        peer_1?;
+        peer_2?;
+        Ok(())
     }
 
     pub(super) fn quiesce_and_reap(
@@ -254,14 +372,107 @@ impl PackagedDriverChildren {
     }
 }
 
+fn peer_for_flow(flow: CanaryFlow) -> (usize, PackagedDriverChildRole) {
+    match flow.kind() {
+        super::super::CanaryFlowKind::TcpEcho => (0, PackagedDriverChildRole::TcpEcho),
+        super::super::CanaryFlowKind::UdpEcho => (1, PackagedDriverChildRole::UdpEcho),
+        super::super::CanaryFlowKind::DnsUdp | super::super::CanaryFlowKind::DnsTcp => {
+            (2, PackagedDriverChildRole::Dns)
+        }
+    }
+}
+
+pub(super) struct PackagedDriverFlowHolding<'a> {
+    children: &'a mut PackagedDriverChildren,
+    peer_index: usize,
+    peer_role: PackagedDriverChildRole,
+    plan: TrafficFlowPlan,
+    client_tuple: super::super::CanaryFlowTuple,
+    peer_tuple: super::super::CanaryFlowTuple,
+    exclusive_deadline: Instant,
+}
+
+impl PackagedDriverFlowHolding<'_> {
+    #[must_use]
+    pub(super) const fn flow(&self) -> CanaryFlow {
+        self.plan.flow()
+    }
+
+    #[must_use]
+    pub(super) const fn client_tuple(&self) -> super::super::CanaryFlowTuple {
+        self.client_tuple
+    }
+
+    #[must_use]
+    pub(super) const fn peer_tuple(&self) -> super::super::CanaryFlowTuple {
+        self.peer_tuple
+    }
+
+    #[must_use]
+    pub(super) fn client_process_identity(&self) -> ProcessIdentity {
+        self.children.client.retained.identity()
+    }
+
+    #[must_use]
+    pub(super) fn peer_process_identity(&self) -> ProcessIdentity {
+        self.children.peer_servers[self.peer_index]
+            .retained
+            .identity()
+    }
+
+    pub(super) fn release(self) -> Result<TrafficFlowResult, PackagedDriverChildError> {
+        let Self {
+            children,
+            peer_index,
+            peer_role,
+            plan,
+            client_tuple,
+            peer_tuple,
+            exclusive_deadline,
+        } = self;
+        let flow = plan.flow();
+        let peer = &children.peer_servers[peer_index];
+        parent_send_signal(
+            &peer.control,
+            peer_role,
+            TrafficMessage::ReleaseResponse,
+            flow,
+            exclusive_deadline,
+        )?;
+        let completed_peer_tuple = parent_receive_tuple(
+            &peer.control,
+            peer.retained.identity().pid().get(),
+            peer.credentials,
+            peer_role,
+            TrafficMessage::PeerResult,
+            flow,
+            exclusive_deadline,
+        )?;
+        let completed_client_tuple = parent_receive_tuple(
+            &children.client.control,
+            children.client.retained.identity().pid().get(),
+            children.client.credentials,
+            PackagedDriverChildRole::Client,
+            TrafficMessage::ClientResult,
+            flow,
+            exclusive_deadline,
+        )?;
+        if completed_client_tuple != client_tuple || completed_peer_tuple != peer_tuple {
+            return Err(PackagedDriverChildError::Protocol(
+                "driver traffic result changed a tuple after its held observation",
+            ));
+        }
+        TrafficFlowResult::new(plan, client_tuple, peer_tuple)
+    }
+}
+
 pub(super) struct ReapedPackagedDriverChildren {
     pub(super) client: ReapedDriverChild,
     pub(super) peer_servers: [ReapedDriverChild; CANARY_PEER_SERVER_SLOTS],
 }
 
 impl ReapedPackagedDriverChildren {
-    #[cfg(test)]
-    fn into_process_proof(self) -> Result<DriverProcessProof, PackagedDriverChildError> {
+    pub(super) fn into_process_proof(self) -> Result<DriverProcessProof, PackagedDriverChildError> {
         DriverProcessProof::new(self.client, self.peer_servers).map_err(Into::into)
     }
 }
@@ -694,9 +905,15 @@ fn run_internal_child(args: &[String]) -> Result<(), PackagedDriverChildError> {
                 source,
             }
         })?;
-    let resources = BoundChildResources::bind(role, binding)?;
+    let mut resources = BoundChildResources::bind(role, binding)?;
     send_frame(&control, role, ControlMessage::Ready, deadline)?;
-    receive_parent_quiesce(&control, role, deadline)?;
+    run_child_session(
+        &control,
+        role,
+        &mut resources,
+        control_frame(role, ControlMessage::Quiesce),
+        deadline,
+    )?;
     drop(resources);
     send_frame(&control, role, ControlMessage::Quiesced, deadline)?;
 
@@ -707,46 +924,7 @@ fn run_internal_child(args: &[String]) -> Result<(), PackagedDriverChildError> {
     }
 }
 
-fn receive_parent_quiesce(
-    control: &SeqpacketConnection,
-    role: PackagedDriverChildRole,
-    exclusive_deadline: Instant,
-) -> Result<(), PackagedDriverChildError> {
-    let received = control
-        .recv_record_until(CONTROL_FRAME_BYTES, exclusive_deadline)
-        .map_err(|source| PackagedDriverChildError::Platform {
-            operation: "receive driver-child quiescence command",
-            source,
-        })?
-        .ok_or(PackagedDriverChildError::DeadlineExpired(
-            "receive driver-child quiescence command",
-        ))?;
-    let SeqpacketReceive::Record {
-        bytes,
-        truncated,
-        credentials,
-    } = received
-    else {
-        return Err(PackagedDriverChildError::Protocol(
-            "driver-child parent closed before quiescence",
-        ));
-    };
-    // SAFETY: getppid has no arguments, pointers, or failure mode.
-    let parent_pid = u32::try_from(unsafe { libc::getppid() }).map_err(|_| {
-        PackagedDriverChildError::Protocol("driver child observed an invalid parent PID")
-    })?;
-    if truncated
-        || bytes != control_frame(role, ControlMessage::Quiesce)
-        || credentials.pid() != parent_pid
-    {
-        return Err(PackagedDriverChildError::Protocol(
-            "driver child received a malformed command or substituted parent identity",
-        ));
-    }
-    Ok(())
-}
-
-enum BoundChildResources {
+pub(super) enum BoundChildResources {
     Client,
     Tcp(Vec<TcpListener>),
     Udp(Vec<UdpSocket>),
@@ -872,11 +1050,15 @@ impl Error for PackagedDriverChildError {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use std::env;
-    use std::net::{Ipv4Addr, SocketAddrV4};
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
     use std::num::NonZeroU32;
     use std::os::unix::process::CommandExt;
     use std::process::Command;
 
+    use crate::functional_canary::tests::Fixture;
+    use crate::functional_canary::{CanaryAddressFamilies, CanaryFlowKind};
+
+    use super::super::driver_traffic::MAX_TRAFFIC_FRAME_BYTES;
     use super::*;
 
     const TEST_REENTRY: &str =
@@ -1018,6 +1200,7 @@ mod tests {
         let reaped = PackagedDriverChildren {
             client,
             peer_servers: [tcp, udp, dns],
+            next_flow_index: 0,
         }
         .quiesce_and_reap(deadline)
         .expect("quiesce and parent-reap every exact child");
@@ -1032,6 +1215,272 @@ mod tests {
         UdpSocket::bind(udp_address).expect("UDP echo binding retired before acknowledgement");
         TcpListener::bind(dns_address).expect("DNS/TCP binding retired before acknowledgement");
         UdpSocket::bind(dns_address).expect("DNS/UDP binding retired before acknowledgement");
+    }
+
+    #[test]
+    fn packaged_self_exec_children_run_held_echo_and_dns_transaction() {
+        let ipv6 = ipv6_loopback_available();
+        let families = if ipv6 {
+            CanaryAddressFamilies::Ipv4AndIpv6
+        } else {
+            CanaryAddressFamilies::Ipv4Only
+        };
+        let fixture = Fixture::new(families);
+        let request = fixture.request();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let tcp_port = available_tcp_port_for_families(ipv6);
+        let udp_port = available_udp_port_for_families(ipv6);
+        let dns_port = available_dns_port_for_families(ipv6);
+
+        let client = spawn_test_child(PackagedDriverChildRole::Client, None, deadline);
+        let tcp = spawn_test_child(
+            PackagedDriverChildRole::TcpEcho,
+            Some(loopback_bind_plan(tcp_port, ipv6)),
+            deadline,
+        );
+        let udp = spawn_test_child(
+            PackagedDriverChildRole::UdpEcho,
+            Some(loopback_bind_plan(udp_port, ipv6)),
+            deadline,
+        );
+        let dns = spawn_test_child(
+            PackagedDriverChildRole::Dns,
+            Some(loopback_bind_plan(dns_port, ipv6)),
+            deadline,
+        );
+        let mut children = PackagedDriverChildren {
+            client,
+            peer_servers: [tcp, udp, dns],
+            next_flow_index: 0,
+        };
+
+        for flow in CanaryFlow::ALL {
+            if !request.requires_flow(flow) {
+                continue;
+            }
+            let port = match flow.kind() {
+                CanaryFlowKind::TcpEcho => tcp_port,
+                CanaryFlowKind::UdpEcho => udp_port,
+                CanaryFlowKind::DnsUdp | CanaryFlowKind::DnsTcp => dns_port,
+            };
+            let source = if flow.is_ipv4() {
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            } else {
+                SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 0, 0, 0))
+            };
+            let destination = if flow.is_ipv4() {
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
+            } else {
+                SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, port, 0, 0))
+            };
+            let plan = TrafficFlowPlan::for_request(request, flow)
+                .expect("derive exact request traffic")
+                .with_test_endpoints(source, destination)
+                .expect("substitute only direct-loopback test endpoints");
+            let expected_request = plan.request_payload().to_vec();
+            let expected_response = plan.response_payload().to_vec();
+            let expected_dns = plan.dns();
+            let holding = children
+                .begin_flow_plan(plan, deadline)
+                .expect("arm peers and hold both exact live flow endpoints");
+
+            assert_eq!(holding.flow(), flow);
+            assert_eq!(holding.client_tuple().destination(), destination);
+            assert_eq!(holding.peer_tuple().destination(), destination);
+            assert_eq!(
+                holding.client_tuple().source(),
+                holding.peer_tuple().source()
+            );
+            assert_ne!(
+                holding.client_process_identity(),
+                holding.peer_process_identity()
+            );
+            assert!(
+                holding
+                    .children
+                    .client
+                    .control
+                    .recv_record_until(
+                        MAX_TRAFFIC_FRAME_BYTES,
+                        Instant::now() + Duration::from_millis(5),
+                    )
+                    .expect("probe held client control channel")
+                    .is_none(),
+                "client result must remain blocked until explicit peer release"
+            );
+
+            let result = holding
+                .release()
+                .expect("release peer response and authenticate both typed results");
+            assert_eq!(result.flow(), flow);
+            assert_eq!(result.client_tuple().destination(), destination);
+            assert_eq!(result.peer_tuple().destination(), destination);
+            assert_eq!(result.request_payload(), expected_request);
+            assert_eq!(result.response_payload(), expected_response);
+            assert_eq!(result.dns(), expected_dns);
+            if matches!(
+                flow.kind(),
+                CanaryFlowKind::TcpEcho | CanaryFlowKind::UdpEcho
+            ) {
+                assert_eq!(result.request_payload(), request.nonce().as_bytes());
+                assert_eq!(result.response_payload(), request.nonce().as_bytes());
+            } else {
+                assert_eq!(result.dns(), request.expected_dns(flow));
+            }
+        }
+
+        let reaped = children
+            .quiesce_and_reap(deadline)
+            .expect("quiesce and parent-reap completed traffic children");
+        let proof = reaped
+            .into_process_proof()
+            .expect("assemble completed traffic child proof");
+        let _verified = proof
+            .verify_post_reap_exit(deadline)
+            .expect("observe every completed traffic child exited after parent reap");
+    }
+
+    #[test]
+    fn packaged_parent_rejects_reordered_flow_without_losing_cleanup_authority() {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let tcp_port = available_tcp_port();
+        let udp_port = available_udp_port();
+        let dns_port = available_dns_port();
+        let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+        let request = fixture.request();
+        let client = spawn_test_child(PackagedDriverChildRole::Client, None, deadline);
+        let tcp = spawn_test_child(
+            PackagedDriverChildRole::TcpEcho,
+            Some(loopback_bind_plan(tcp_port, false)),
+            deadline,
+        );
+        let udp = spawn_test_child(
+            PackagedDriverChildRole::UdpEcho,
+            Some(loopback_bind_plan(udp_port, false)),
+            deadline,
+        );
+        let dns = spawn_test_child(
+            PackagedDriverChildRole::Dns,
+            Some(loopback_bind_plan(dns_port, false)),
+            deadline,
+        );
+        let mut children = PackagedDriverChildren {
+            client,
+            peer_servers: [tcp, udp, dns],
+            next_flow_index: 0,
+        };
+        let reordered = TrafficFlowPlan::for_request(request, CanaryFlow::Ipv4UdpEcho)
+            .expect("derive reordered test flow")
+            .with_test_endpoints(
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, udp_port)),
+            )
+            .expect("substitute direct-loopback UDP endpoint");
+        assert!(matches!(
+            children.begin_flow_plan(reordered, deadline),
+            Err(PackagedDriverChildError::Protocol(_))
+        ));
+        children
+            .quiesce_and_reap(deadline)
+            .expect("reordered pre-emission rejection preserves orderly cleanup");
+    }
+
+    #[test]
+    fn packaged_self_exec_child_rejects_reordered_frame_and_group_aborts() {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let tcp_port = available_tcp_port();
+        let udp_port = available_udp_port();
+        let dns_port = available_dns_port();
+        let client = spawn_test_child(PackagedDriverChildRole::Client, None, deadline);
+        let tcp = spawn_test_child(
+            PackagedDriverChildRole::TcpEcho,
+            Some(loopback_bind_plan(tcp_port, false)),
+            deadline,
+        );
+        let udp = spawn_test_child(
+            PackagedDriverChildRole::UdpEcho,
+            Some(loopback_bind_plan(udp_port, false)),
+            deadline,
+        );
+        let dns = spawn_test_child(
+            PackagedDriverChildRole::Dns,
+            Some(loopback_bind_plan(dns_port, false)),
+            deadline,
+        );
+        let children = PackagedDriverChildren {
+            client,
+            peer_servers: [tcp, udp, dns],
+            next_flow_index: 0,
+        };
+        parent_send_signal(
+            &children.client.control,
+            PackagedDriverChildRole::Client,
+            TrafficMessage::ReleaseResponse,
+            CanaryFlow::Ipv4TcpEcho,
+            deadline,
+        )
+        .expect("inject authenticated but reordered client frame");
+        assert!(matches!(
+            parent_receive_tuple(
+                &children.client.control,
+                children.client.retained.identity().pid().get(),
+                children.client.credentials,
+                PackagedDriverChildRole::Client,
+                TrafficMessage::ClientHolding,
+                CanaryFlow::Ipv4TcpEcho,
+                Instant::now() + Duration::from_secs(1),
+            ),
+            Err(PackagedDriverChildError::Protocol(_))
+                | Err(PackagedDriverChildError::Platform { .. })
+        ));
+        children
+            .abort_and_reap(deadline)
+            .expect("abort and reap every sibling after child protocol rejection");
+    }
+
+    #[test]
+    fn expired_parent_transaction_keeps_all_children_abortable() {
+        let cleanup_deadline = Instant::now() + Duration::from_secs(20);
+        let tcp_port = available_tcp_port();
+        let udp_port = available_udp_port();
+        let dns_port = available_dns_port();
+        let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+        let request = fixture.request();
+        let client = spawn_test_child(PackagedDriverChildRole::Client, None, cleanup_deadline);
+        let tcp = spawn_test_child(
+            PackagedDriverChildRole::TcpEcho,
+            Some(loopback_bind_plan(tcp_port, false)),
+            cleanup_deadline,
+        );
+        let udp = spawn_test_child(
+            PackagedDriverChildRole::UdpEcho,
+            Some(loopback_bind_plan(udp_port, false)),
+            cleanup_deadline,
+        );
+        let dns = spawn_test_child(
+            PackagedDriverChildRole::Dns,
+            Some(loopback_bind_plan(dns_port, false)),
+            cleanup_deadline,
+        );
+        let mut children = PackagedDriverChildren {
+            client,
+            peer_servers: [tcp, udp, dns],
+            next_flow_index: 0,
+        };
+        let plan = TrafficFlowPlan::for_request(request, CanaryFlow::Ipv4TcpEcho)
+            .expect("derive first canonical test flow")
+            .with_test_endpoints(
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, tcp_port)),
+            )
+            .expect("substitute direct-loopback TCP endpoint");
+        assert!(matches!(
+            children.begin_flow_plan(plan, Instant::now()),
+            Err(PackagedDriverChildError::DeadlineExpired(_))
+        ));
+        children
+            .abort_and_reap(cleanup_deadline)
+            .expect("expired transaction retains bounded sibling abort authority");
     }
 
     #[test]
@@ -1168,5 +1617,71 @@ mod tests {
             }
         }
         panic!("could not reserve one shared DNS UDP/TCP test port")
+    }
+
+    fn loopback_bind_plan(port: u16, ipv6: bool) -> ChildBindPlan {
+        ChildBindPlan {
+            ipv4: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)),
+            ipv6: ipv6.then(|| SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, port, 0, 0))),
+        }
+    }
+
+    fn ipv6_loopback_available() -> bool {
+        TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).is_ok()
+            && UdpSocket::bind((Ipv6Addr::LOCALHOST, 0)).is_ok()
+    }
+
+    fn available_tcp_port_for_families(ipv6: bool) -> u16 {
+        if !ipv6 {
+            return available_tcp_port();
+        }
+        for _ in 0..32 {
+            let ipv4 = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .expect("reserve candidate IPv4 TCP port");
+            let port = ipv4.local_addr().expect("read candidate TCP port").port();
+            if TcpListener::bind((Ipv6Addr::LOCALHOST, port)).is_ok() {
+                return port;
+            }
+        }
+        panic!("could not reserve one dual-family TCP test port")
+    }
+
+    fn available_udp_port_for_families(ipv6: bool) -> u16 {
+        if !ipv6 {
+            return available_udp_port();
+        }
+        for _ in 0..32 {
+            let ipv4 =
+                UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("reserve candidate IPv4 UDP port");
+            let port = ipv4.local_addr().expect("read candidate UDP port").port();
+            if UdpSocket::bind((Ipv6Addr::LOCALHOST, port)).is_ok() {
+                return port;
+            }
+        }
+        panic!("could not reserve one dual-family UDP test port")
+    }
+
+    fn available_dns_port_for_families(ipv6: bool) -> u16 {
+        if !ipv6 {
+            return available_dns_port();
+        }
+        for _ in 0..32 {
+            let tcp4 = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .expect("reserve candidate IPv4 DNS/TCP port");
+            let port = tcp4.local_addr().expect("read DNS/TCP port").port();
+            let Ok(udp4) = UdpSocket::bind((Ipv4Addr::LOCALHOST, port)) else {
+                continue;
+            };
+            let Ok(tcp6) = TcpListener::bind((Ipv6Addr::LOCALHOST, port)) else {
+                continue;
+            };
+            if UdpSocket::bind((Ipv6Addr::LOCALHOST, port)).is_ok() {
+                drop(tcp6);
+                drop(udp4);
+                drop(tcp4);
+                return port;
+            }
+        }
+        panic!("could not reserve one dual-family DNS UDP/TCP test port")
     }
 }

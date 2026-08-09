@@ -13,6 +13,8 @@ use super::{
     XtablesRestoreTable, parse_xtables_restore,
 };
 
+pub(in crate::xtables) mod counted;
+
 const XTABLES_SAVE_PROJECTION_DOMAIN: &[u8] =
     b"Flux owned xtables-save projection\0structured-sha256-v3\0";
 

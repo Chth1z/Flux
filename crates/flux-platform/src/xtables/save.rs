@@ -163,7 +163,10 @@ impl XtablesSaveProjection {
                         let line = render_live_append(command);
                         let scan = scan_rule(&line, None)?;
                         if !is_native_chain(&scan.source)
-                            || scan.targets.iter().any(|target| is_native_chain(target))
+                            || scan.targets.iter().any(|target| {
+                                is_native_chain(target)
+                                    && !self.chains.contains_key(target.as_str())
+                            })
                         {
                             return Err(XtablesSaveProjectionError::global(
                                 XtablesSaveProjectionErrorKind::ExpectedReplacementMismatch,

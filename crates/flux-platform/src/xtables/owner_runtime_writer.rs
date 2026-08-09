@@ -24,10 +24,10 @@ use sha2::{Digest, Sha256};
 
 use super::{
     DurableNativeXtablesTargetResolver, NativePolicyRoutingAudit, NativeXtablesAdmittedTarget,
-    NativeXtablesConvergedState, NativeXtablesConvergenceReport, NativeXtablesDesiredTarget,
-    NativeXtablesEnvironment, NativeXtablesOwner, NativeXtablesOwnerAdapter,
-    NativeXtablesOwnerError, NativeXtablesProcessOwnerAdapter, NativeXtablesTargetArchiveError,
-    NativeXtablesTargetIdentity,
+    NativeXtablesAttemptSession, NativeXtablesConvergedState, NativeXtablesConvergenceReport,
+    NativeXtablesDesiredTarget, NativeXtablesEnvironment, NativeXtablesOwner,
+    NativeXtablesOwnerAdapter, NativeXtablesOwnerError, NativeXtablesProcessOwnerAdapter,
+    NativeXtablesTargetArchiveError, NativeXtablesTargetIdentity,
 };
 use crate::netlink::policy_routing::ManagedPolicyRoutingIdentity;
 use crate::xtables::native::{
@@ -38,7 +38,7 @@ use crate::xtables::owner_durable::{
     NativeXtablesRuntimeGuard,
 };
 use crate::xtables::{
-    NativeCaptureCanaryRouteOutcome, NativeCaptureCanaryRouteQuery, NativeCaptureCanarySelector,
+    NativeCaptureCanaryAttempt, NativeCaptureCanaryRouteOutcome, NativeCaptureCanaryRouteQuery,
     NativeCaptureConvergedState, NativeCaptureConvergence, NativeCaptureConvergenceReport,
     NativeCaptureDesired, NativeCaptureOwnershipObservation, NativeCaptureTargetIdentity,
     XtablesCaptureArtifactSet, XtablesLocalOutputRoutingSpec, XtablesLocalOutputRoutingTarget,
@@ -1092,6 +1092,12 @@ where
     owner: NativeXtablesOwner<A, DurableNativeXtablesTargetResolver>,
     resolver: DurableNativeXtablesTargetResolver,
     recovered: bool,
+    active_attempt: Option<NativeXtablesRuntimeAttempt>,
+}
+
+struct NativeXtablesRuntimeAttempt {
+    session: NativeXtablesAttemptSession,
+    _runtime_guard: NativeXtablesRuntimeGuard,
 }
 
 /// Opaque native target admitted inside `flux-platform`.
@@ -1177,10 +1183,10 @@ impl NativeCaptureConvergence for NativeXtablesCaptureConverger {
     fn populate_canary_selector(
         &mut self,
         target: &Self::Target,
-        selector: NativeCaptureCanarySelector,
+        attempt: NativeCaptureCanaryAttempt,
     ) -> Result<bool, Self::Error> {
         self.inner
-            .populate_canary_selector(&target.inner, selector)
+            .populate_canary_selector(&target.inner, attempt)
             .map(|()| true)
             .map_err(|source| NativeXtablesCaptureConvergenceError { source })
     }
@@ -1188,10 +1194,10 @@ impl NativeCaptureConvergence for NativeXtablesCaptureConverger {
     fn retire_canary_selector(
         &mut self,
         target: &Self::Target,
-        selector: NativeCaptureCanarySelector,
+        attempt: NativeCaptureCanaryAttempt,
     ) -> Result<bool, Self::Error> {
         self.inner
-            .retire_canary_selector(&target.inner, selector)
+            .retire_canary_selector(&target.inner, attempt)
             .map(|()| true)
             .map_err(|source| NativeXtablesCaptureConvergenceError { source })
     }
@@ -1199,11 +1205,11 @@ impl NativeCaptureConvergence for NativeXtablesCaptureConverger {
     fn observe_canary_route(
         &mut self,
         target: &Self::Target,
-        selector: NativeCaptureCanarySelector,
+        attempt: NativeCaptureCanaryAttempt,
         query: NativeCaptureCanaryRouteQuery,
     ) -> Result<Option<NativeCaptureCanaryRouteOutcome>, Self::Error> {
         self.inner
-            .observe_canary_route(&target.inner, selector, query)
+            .observe_canary_route(&target.inner, attempt, query)
             .map(Some)
             .map_err(|source| NativeXtablesCaptureConvergenceError { source })
     }
@@ -1262,12 +1268,14 @@ where
             owner,
             resolver,
             recovered: false,
+            active_attempt: None,
         })
     }
 
     pub(crate) fn recover(
         &mut self,
     ) -> Result<NativeXtablesConvergenceReport, NativeXtablesRuntimeWriterError> {
+        drop(self.active_attempt.take());
         let _transaction = self.begin_transaction()?;
         let report = match self.owner.recover() {
             Ok(report) => report,
@@ -1288,6 +1296,9 @@ where
         &mut self,
         target: NativeXtablesDesiredTarget,
     ) -> Result<NativeXtablesConvergenceReport, NativeXtablesRuntimeWriterError> {
+        if self.active_attempt.is_some() {
+            return Err(NativeXtablesRuntimeWriterError::AttemptInProgress);
+        }
         if !self.recovered {
             return Err(NativeXtablesRuntimeWriterError::RecoveryRequired);
         }
@@ -1314,6 +1325,9 @@ where
     pub(crate) fn observe_active_ownership(
         &mut self,
     ) -> Result<Option<NativeCaptureOwnershipObservation>, NativeXtablesRuntimeWriterError> {
+        if self.active_attempt.is_some() {
+            return Err(NativeXtablesRuntimeWriterError::AttemptInProgress);
+        }
         if !self.recovered {
             return Err(NativeXtablesRuntimeWriterError::RecoveryRequired);
         }
@@ -1330,14 +1344,23 @@ where
     pub(crate) fn populate_canary_selector(
         &mut self,
         target: &NativeXtablesAdmittedTarget,
-        selector: NativeCaptureCanarySelector,
+        attempt: NativeCaptureCanaryAttempt,
     ) -> Result<(), NativeXtablesRuntimeWriterError> {
+        if self.active_attempt.is_some() {
+            return Err(NativeXtablesRuntimeWriterError::AttemptInProgress);
+        }
         if !self.recovered {
             return Err(NativeXtablesRuntimeWriterError::RecoveryRequired);
         }
-        let _transaction = self.begin_transaction()?;
-        match self.owner.populate_canary_selector(target, selector) {
-            Ok(()) => Ok(()),
+        let transaction = self.begin_transaction()?;
+        match self.owner.populate_canary_selector(target, attempt) {
+            Ok(session) => {
+                self.active_attempt = Some(NativeXtablesRuntimeAttempt {
+                    session,
+                    _runtime_guard: transaction,
+                });
+                Ok(())
+            }
             Err(source) => {
                 self.recovered = false;
                 Err(NativeXtablesRuntimeWriterError::Owner(Box::new(source)))
@@ -1348,13 +1371,31 @@ where
     pub(crate) fn retire_canary_selector(
         &mut self,
         target: &NativeXtablesAdmittedTarget,
-        selector: NativeCaptureCanarySelector,
+        attempt: NativeCaptureCanaryAttempt,
     ) -> Result<(), NativeXtablesRuntimeWriterError> {
         if !self.recovered {
             return Err(NativeXtablesRuntimeWriterError::RecoveryRequired);
         }
-        let _transaction = self.begin_transaction()?;
-        match self.owner.retire_canary_selector(target, selector) {
+        let active = self
+            .active_attempt
+            .as_ref()
+            .ok_or(NativeXtablesRuntimeWriterError::RecoveryRequired)?;
+        if !active.session.matches(target.identity(), attempt) {
+            self.recovered = false;
+            return Err(NativeXtablesRuntimeWriterError::Owner(Box::new(
+                NativeXtablesOwnerError::LiveStateConflict(
+                    "native canary retirement substituted the retained attempt session",
+                ),
+            )));
+        }
+        let active = self
+            .active_attempt
+            .take()
+            .expect("the retained attempt was checked above");
+        match self
+            .owner
+            .retire_canary_selector(target, attempt, active.session)
+        {
             Ok(()) => Ok(()),
             Err(source) => {
                 self.recovered = false;
@@ -1366,14 +1407,20 @@ where
     pub(crate) fn observe_canary_route(
         &mut self,
         target: &NativeXtablesAdmittedTarget,
-        selector: NativeCaptureCanarySelector,
+        attempt: NativeCaptureCanaryAttempt,
         query: NativeCaptureCanaryRouteQuery,
     ) -> Result<NativeCaptureCanaryRouteOutcome, NativeXtablesRuntimeWriterError> {
         if !self.recovered {
             return Err(NativeXtablesRuntimeWriterError::RecoveryRequired);
         }
-        let _transaction = self.begin_transaction()?;
-        match self.owner.observe_canary_route(target, selector, query) {
+        let active = self
+            .active_attempt
+            .as_ref()
+            .ok_or(NativeXtablesRuntimeWriterError::RecoveryRequired)?;
+        match self
+            .owner
+            .observe_canary_route(target, attempt, query, &active.session)
+        {
             Ok(outcome) => Ok(outcome),
             Err(source) => {
                 self.recovered = false;
@@ -1430,6 +1477,9 @@ where
         &mut self,
         desired: NativeXtablesDryRunTarget<'_>,
     ) -> Result<NativeXtablesDryRunReport, NativeXtablesRuntimeWriterError> {
+        if self.active_attempt.is_some() {
+            return Err(NativeXtablesRuntimeWriterError::AttemptInProgress);
+        }
         self.resolver
             .refresh()
             .map_err(|source| NativeXtablesRuntimeWriterError::TargetArchive(Box::new(source)))?;
@@ -1647,6 +1697,7 @@ impl NativeXtablesDryRunReport {
 #[derive(Debug)]
 pub(crate) enum NativeXtablesRuntimeWriterError {
     RecoveryRequired,
+    AttemptInProgress,
     TargetArchive(Box<NativeXtablesTargetArchiveError>),
     Durable(Box<NativeXtablesDurableError>),
     ProcessAdapter(Box<XtablesRestoreProcessError>),
@@ -1666,6 +1717,8 @@ impl fmt::Display for NativeXtablesRuntimeWriterError {
         match self {
             Self::RecoveryRequired => formatter
                 .write_str("native runtime recovery must complete before convergence is allowed"),
+            Self::AttemptInProgress => formatter
+                .write_str("native canary attempt must retire before another runtime operation"),
             Self::TargetArchive(source) => source.fmt(formatter),
             Self::Durable(source) => source.fmt(formatter),
             Self::ProcessAdapter(source) => source.fmt(formatter),
@@ -1691,7 +1744,7 @@ impl Error for NativeXtablesRuntimeWriterError {
             Self::Owner(source) => Some(source.as_ref()),
             Self::SettledArchive { source, .. } => Some(source.as_ref()),
             Self::SettledDurable { source, .. } => Some(source.as_ref()),
-            Self::RecoveryRequired => None,
+            Self::RecoveryRequired | Self::AttemptInProgress => None,
         }
     }
 }

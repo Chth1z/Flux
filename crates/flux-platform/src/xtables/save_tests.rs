@@ -260,6 +260,49 @@ fn duplicate_and_non_closed_native_state_fails_closed() {
 }
 
 #[test]
+fn owned_chain_replacement_accepts_only_declared_native_jump_targets() {
+    let projection = project_xtables_save(
+        br#"*mangle
+:FLX4A0000000007 - [0:0]
+:FLX4C0000000007 - [0:0]
+COMMIT
+"#,
+        XtablesRestoreFamily::Ipv4,
+    )
+    .unwrap();
+    let declared = replacement_artifact(
+        br#"*mangle
+-F FLX4C0000000007
+-A FLX4C0000000007 -m mark --mark 0x200000/0x600000 -j FLX4A0000000007
+COMMIT
+"#,
+    );
+
+    let replaced = projection
+        .with_owned_chain_replacement(&declared)
+        .expect("replacement may jump to an already-declared owned chain");
+    assert_eq!(
+        rules(&replaced, "FLX4C0000000007"),
+        ["-A FLX4C0000000007 -m mark --mark 0x200000/0x600000 -j FLX4A0000000007"]
+    );
+
+    let dangling = replacement_artifact(
+        br#"*mangle
+-F FLX4C0000000007
+-A FLX4C0000000007 -j FLX4A0000000008
+COMMIT
+"#,
+    );
+    assert_eq!(
+        projection
+            .with_owned_chain_replacement(&dangling)
+            .expect_err("replacement must reject an undeclared owned target")
+            .kind(),
+        XtablesSaveProjectionErrorKind::ExpectedReplacementMismatch
+    );
+}
+
+#[test]
 fn cross_family_or_malformed_native_state_fails_closed() {
     for input in [
         b"*mangle\n:FLX6SP - [0:0]\nCOMMIT\n".as_slice(),
@@ -450,6 +493,14 @@ fn apply_artifact(bytes: &[u8]) -> XtablesRestoreArtifact {
     parse_xtables_restore(
         bytes,
         XtablesRestoreContext::new(XtablesRestoreAction::Apply, XtablesRestoreFamily::Ipv4),
+    )
+    .unwrap()
+}
+
+fn replacement_artifact(bytes: &[u8]) -> XtablesRestoreArtifact {
+    parse_xtables_restore(
+        bytes,
+        XtablesRestoreContext::new(XtablesRestoreAction::Replace, XtablesRestoreFamily::Ipv4),
     )
     .unwrap()
 }

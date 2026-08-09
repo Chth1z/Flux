@@ -155,7 +155,7 @@ pub(crate) enum NativeXtablesAttemptPhase {
 }
 
 impl NativeXtablesAttemptPhase {
-    const fn token(self) -> &'static str {
+    pub(crate) const fn token(self) -> &'static str {
         match self {
             Self::Reserved => "reserved",
             Self::PopulateSelectorIpv4 => "populate_selector_ipv4",
@@ -170,7 +170,7 @@ impl NativeXtablesAttemptPhase {
         }
     }
 
-    fn parse(value: &str) -> Option<Self> {
+    pub(crate) fn parse(value: &str) -> Option<Self> {
         match value {
             "reserved" => Some(Self::Reserved),
             "populate_selector_ipv4" => Some(Self::PopulateSelectorIpv4),
@@ -186,7 +186,7 @@ impl NativeXtablesAttemptPhase {
         }
     }
 
-    const fn rank(self) -> u8 {
+    pub(crate) const fn rank(self) -> u8 {
         match self {
             Self::Reserved => 0,
             Self::PopulateSelectorIpv4 => 1,
@@ -200,11 +200,53 @@ impl NativeXtablesAttemptPhase {
             Self::RetireSelectorIpv6 => 9,
         }
     }
+
+    const fn can_advance_to(self, next: Self) -> bool {
+        matches!(
+            (self, next),
+            (Self::Reserved, Self::PopulateSelectorIpv4)
+                | (
+                    Self::PopulateSelectorIpv4,
+                    Self::PopulateSelectorIpv6 | Self::PopulateObservationIpv4
+                )
+                | (Self::PopulateSelectorIpv6, Self::PopulateObservationIpv4)
+                | (
+                    Self::PopulateObservationIpv4,
+                    Self::PopulateObservationIpv6 | Self::Active
+                )
+                | (Self::PopulateObservationIpv6, Self::Active)
+                | (Self::Active, Self::RetireObservationIpv4)
+                | (
+                    Self::RetireObservationIpv4,
+                    Self::RetireObservationIpv6 | Self::RetireSelectorIpv4
+                )
+                | (Self::RetireObservationIpv6, Self::RetireSelectorIpv4)
+                | (Self::RetireSelectorIpv4, Self::RetireSelectorIpv6)
+        )
+    }
+
+    const fn can_recover_to(self, next: Self) -> bool {
+        matches!(next, Self::RetireObservationIpv4)
+            && self.rank() < Self::RetireObservationIpv4.rank()
+    }
+
+    const fn permits_removal(self) -> bool {
+        matches!(self, Self::RetireSelectorIpv4 | Self::RetireSelectorIpv6)
+    }
 }
 
 /// Bounded canonical attempt identity encoded by the owner layer.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub(crate) struct NativeXtablesAttemptPayload(Box<[u8]>);
+
+impl fmt::Debug for NativeXtablesAttemptPayload {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NativeXtablesAttemptPayload")
+            .field("len", &self.0.len())
+            .finish()
+    }
+}
 
 impl NativeXtablesAttemptPayload {
     pub(crate) fn new(bytes: impl Into<Box<[u8]>>) -> Result<Self, NativeXtablesDurableError> {
@@ -1128,12 +1170,37 @@ impl NativeXtablesTransitionLease {
     ) -> Result<(), NativeXtablesDurableError> {
         require_binding(&self.binding, &current.binding, DurableArtifact::Attempt)?;
         require_binding(&self.binding, &next.binding, DurableArtifact::Attempt)?;
-        if current.payload != next.payload || next.phase.rank() <= current.phase.rank() {
+        if current.payload != next.payload || !current.phase.can_advance_to(next.phase) {
             return Err(NativeXtablesDurableError::InvalidRecord {
                 artifact: DurableArtifact::Attempt,
-                reason: "attempt update changed identity or did not advance its phase",
+                reason: "attempt update changed identity or is not an adjacent family-aware phase",
             });
         }
+        self.replace_attempt(current, next)
+    }
+
+    /// Publishes the single permitted recovery jump before normalizing any attempt-owned chain.
+    pub(crate) fn start_attempt_recovery(
+        &mut self,
+        current: &NativeXtablesAttemptRecord,
+        next: NativeXtablesAttemptRecord,
+    ) -> Result<(), NativeXtablesDurableError> {
+        require_binding(&self.binding, &current.binding, DurableArtifact::Attempt)?;
+        require_binding(&self.binding, &next.binding, DurableArtifact::Attempt)?;
+        if current.payload != next.payload || !current.phase.can_recover_to(next.phase) {
+            return Err(NativeXtablesDurableError::InvalidRecord {
+                artifact: DurableArtifact::Attempt,
+                reason: "attempt recovery must preserve identity and enter retire_observation_ipv4",
+            });
+        }
+        self.replace_attempt(current, next)
+    }
+
+    fn replace_attempt(
+        &mut self,
+        current: &NativeXtablesAttemptRecord,
+        next: NativeXtablesAttemptRecord,
+    ) -> Result<(), NativeXtablesDurableError> {
         let root = open_existing_root(&self.store.root)?;
         let writer_lock = create_writer_lock(&root, &self.lease_scope, &self.store)?;
         if let Err(error) = validate_primary_pair(&root, &self.binding, &self.lease_scope)
@@ -1161,6 +1228,12 @@ impl NativeXtablesTransitionLease {
         expected: &NativeXtablesAttemptRecord,
     ) -> Result<(), NativeXtablesDurableError> {
         require_binding(&self.binding, &expected.binding, DurableArtifact::Attempt)?;
+        if !expected.phase.permits_removal() {
+            return Err(NativeXtablesDurableError::InvalidRecord {
+                artifact: DurableArtifact::Attempt,
+                reason: "attempt removal requires a completed selector-retirement phase",
+            });
+        }
         let root = open_existing_root(&self.store.root)?;
         let writer_lock = create_writer_lock(&root, &self.lease_scope, &self.store)?;
         if let Err(error) = validate_primary_pair(&root, &self.binding, &self.lease_scope)
@@ -1314,7 +1387,7 @@ fn require_exact_attempt(
     root: &File,
     expected: &NativeXtablesAttemptRecord,
 ) -> Result<(), NativeXtablesDurableError> {
-    let actual = read_attempt(root)?.ok_or(NativeXtablesDurableError::OrphanedAttempt)?;
+    let actual = read_attempt(root)?.ok_or(NativeXtablesDurableError::MissingAttempt)?;
     if actual == *expected {
         Ok(())
     } else {
@@ -1454,6 +1527,7 @@ pub(crate) enum NativeXtablesDurableError {
     MissingLease,
     AttemptConflict,
     OrphanedAttempt,
+    MissingAttempt,
     BindingMismatch {
         artifact: DurableArtifact,
     },
@@ -1539,6 +1613,9 @@ impl fmt::Display for NativeXtablesDurableError {
             Self::OrphanedAttempt => formatter.write_str(
                 "native xtables attempt sidecar has no matching active journal and lease",
             ),
+            Self::MissingAttempt => {
+                formatter.write_str("the expected native xtables attempt sidecar is missing")
+            }
             Self::BindingMismatch { artifact } => write!(
                 formatter,
                 "native xtables {artifact} scope or exact journal binding is stale"

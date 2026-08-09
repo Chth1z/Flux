@@ -255,7 +255,7 @@ fn attempt_sidecar_advances_without_changing_primary_journal_and_requires_exact_
 
     let substituted = attempt(
         binding.clone(),
-        NativeXtablesAttemptPhase::Active,
+        NativeXtablesAttemptPhase::RetireSelectorIpv4,
         b"nonce=21;selector=v4",
     );
     let error = lease
@@ -284,10 +284,300 @@ fn attempt_sidecar_advances_without_changing_primary_journal_and_requires_exact_
         }
         other => panic!("failed completion must retain the attempt, found {other:?}"),
     };
-    lease.remove_attempt(&populated).unwrap();
+    let retired = advance_attempt_phases(
+        &mut lease,
+        populated,
+        &[
+            NativeXtablesAttemptPhase::PopulateObservationIpv4,
+            NativeXtablesAttemptPhase::Active,
+            NativeXtablesAttemptPhase::RetireObservationIpv4,
+            NativeXtablesAttemptPhase::RetireSelectorIpv4,
+        ],
+    );
+    lease.remove_attempt(&retired).unwrap();
     assert!(fixture.store.load_attempt().unwrap().is_none());
     assert!(!fixture.store.observe_read_only().unwrap().attempt_present());
     assert_eq!(fs::read(fixture.store.journal_path()).unwrap(), primary);
+}
+
+#[test]
+fn attempt_phase_tokens_order_and_transition_graph_are_exhaustive() {
+    let phases = [
+        (NativeXtablesAttemptPhase::Reserved, "reserved", 0),
+        (
+            NativeXtablesAttemptPhase::PopulateSelectorIpv4,
+            "populate_selector_ipv4",
+            1,
+        ),
+        (
+            NativeXtablesAttemptPhase::PopulateSelectorIpv6,
+            "populate_selector_ipv6",
+            2,
+        ),
+        (
+            NativeXtablesAttemptPhase::PopulateObservationIpv4,
+            "populate_observation_ipv4",
+            3,
+        ),
+        (
+            NativeXtablesAttemptPhase::PopulateObservationIpv6,
+            "populate_observation_ipv6",
+            4,
+        ),
+        (NativeXtablesAttemptPhase::Active, "active", 5),
+        (
+            NativeXtablesAttemptPhase::RetireObservationIpv4,
+            "retire_observation_ipv4",
+            6,
+        ),
+        (
+            NativeXtablesAttemptPhase::RetireObservationIpv6,
+            "retire_observation_ipv6",
+            7,
+        ),
+        (
+            NativeXtablesAttemptPhase::RetireSelectorIpv4,
+            "retire_selector_ipv4",
+            8,
+        ),
+        (
+            NativeXtablesAttemptPhase::RetireSelectorIpv6,
+            "retire_selector_ipv6",
+            9,
+        ),
+    ];
+    let normal_edges = [
+        (
+            NativeXtablesAttemptPhase::Reserved,
+            NativeXtablesAttemptPhase::PopulateSelectorIpv4,
+        ),
+        (
+            NativeXtablesAttemptPhase::PopulateSelectorIpv4,
+            NativeXtablesAttemptPhase::PopulateSelectorIpv6,
+        ),
+        (
+            NativeXtablesAttemptPhase::PopulateSelectorIpv4,
+            NativeXtablesAttemptPhase::PopulateObservationIpv4,
+        ),
+        (
+            NativeXtablesAttemptPhase::PopulateSelectorIpv6,
+            NativeXtablesAttemptPhase::PopulateObservationIpv4,
+        ),
+        (
+            NativeXtablesAttemptPhase::PopulateObservationIpv4,
+            NativeXtablesAttemptPhase::PopulateObservationIpv6,
+        ),
+        (
+            NativeXtablesAttemptPhase::PopulateObservationIpv4,
+            NativeXtablesAttemptPhase::Active,
+        ),
+        (
+            NativeXtablesAttemptPhase::PopulateObservationIpv6,
+            NativeXtablesAttemptPhase::Active,
+        ),
+        (
+            NativeXtablesAttemptPhase::Active,
+            NativeXtablesAttemptPhase::RetireObservationIpv4,
+        ),
+        (
+            NativeXtablesAttemptPhase::RetireObservationIpv4,
+            NativeXtablesAttemptPhase::RetireObservationIpv6,
+        ),
+        (
+            NativeXtablesAttemptPhase::RetireObservationIpv4,
+            NativeXtablesAttemptPhase::RetireSelectorIpv4,
+        ),
+        (
+            NativeXtablesAttemptPhase::RetireObservationIpv6,
+            NativeXtablesAttemptPhase::RetireSelectorIpv4,
+        ),
+        (
+            NativeXtablesAttemptPhase::RetireSelectorIpv4,
+            NativeXtablesAttemptPhase::RetireSelectorIpv6,
+        ),
+    ];
+
+    for (phase, token, rank) in phases {
+        assert_eq!(phase.token(), token);
+        assert_eq!(NativeXtablesAttemptPhase::parse(token), Some(phase));
+        assert_eq!(phase.rank(), rank);
+        assert_eq!(
+            phase.permits_removal(),
+            matches!(
+                phase,
+                NativeXtablesAttemptPhase::RetireSelectorIpv4
+                    | NativeXtablesAttemptPhase::RetireSelectorIpv6
+            )
+        );
+        for (next, _, _) in phases {
+            assert_eq!(
+                phase.can_advance_to(next),
+                normal_edges.contains(&(phase, next)),
+                "unexpected normal attempt transition {phase:?} -> {next:?}"
+            );
+            assert_eq!(
+                phase.can_recover_to(next),
+                next == NativeXtablesAttemptPhase::RetireObservationIpv4
+                    && phase.rank() < NativeXtablesAttemptPhase::RetireObservationIpv4.rank(),
+                "unexpected recovery attempt transition {phase:?} -> {next:?}"
+            );
+        }
+    }
+    assert_eq!(
+        NativeXtablesAttemptPhase::parse("retire_selector_ipvx"),
+        None
+    );
+}
+
+#[test]
+fn attempt_payload_debug_exposes_only_its_length() {
+    let payload =
+        NativeXtablesAttemptPayload::new(b"nonce=11223344556677889900aabbccddeeff".to_vec())
+            .unwrap();
+    let raw_debug = format!("{:?}", payload.as_bytes());
+
+    let payload_debug = format!("{payload:?}");
+    assert_eq!(
+        payload_debug,
+        format!(
+            "NativeXtablesAttemptPayload {{ len: {} }}",
+            payload.as_bytes().len()
+        )
+    );
+    assert!(!payload_debug.contains(&raw_debug));
+
+    let record = NativeXtablesAttemptRecord::new(
+        test_binding(31),
+        NativeXtablesAttemptPhase::Reserved,
+        payload,
+    );
+    assert!(!format!("{record:?}").contains(&raw_debug));
+}
+
+#[test]
+fn initial_attempt_publication_boundaries_recover_and_retry_exactly() {
+    for event in [
+        DurableEvent::AttemptTempDurable,
+        DurableEvent::AttemptDurable,
+    ] {
+        let fixture = Fixture::new();
+        let binding = test_binding(28 + u8::from(event == DurableEvent::AttemptDurable));
+        let mut lease = fixture
+            .store
+            .acquire(record(
+                binding.clone(),
+                1,
+                NativeXtablesJournalPhase::Activating,
+                b"active target",
+            ))
+            .unwrap();
+        lease
+            .update(record(
+                binding.clone(),
+                2,
+                NativeXtablesJournalPhase::Active,
+                b"active target",
+            ))
+            .unwrap();
+        let primary = fs::read(fixture.store.journal_path()).unwrap();
+        let reserved = attempt(
+            binding.clone(),
+            NativeXtablesAttemptPhase::Reserved,
+            b"nonce=initial-publication",
+        );
+        fixture.store.set_failpoint(Some(event));
+
+        assert!(matches!(
+            lease.publish_attempt(reserved.clone()),
+            Err(NativeXtablesDurableError::InterruptedAt(actual)) if actual == event
+        ));
+        drop(lease);
+        assert_eq!(fs::read(fixture.store.journal_path()).unwrap(), primary);
+        let (mut lease, recovered) = match (event, fixture.store.recover(&binding).unwrap()) {
+            (DurableEvent::AttemptTempDurable, NativeXtablesRecovery::Leased(mut lease)) => {
+                lease.publish_attempt(reserved.clone()).unwrap();
+                (lease, reserved)
+            }
+            (
+                DurableEvent::AttemptDurable,
+                NativeXtablesRecovery::OutstandingAttempt { lease, record },
+            ) => {
+                assert_eq!(record, reserved);
+                (lease, record)
+            }
+            (_, other) => panic!("initial attempt boundary recovered as {other:?}"),
+        };
+        let recovering = attempt(
+            binding.clone(),
+            NativeXtablesAttemptPhase::RetireObservationIpv4,
+            b"nonce=initial-publication",
+        );
+        lease
+            .start_attempt_recovery(&recovered, recovering.clone())
+            .unwrap();
+        let retired = advance_attempt_phases(
+            &mut lease,
+            recovering,
+            &[NativeXtablesAttemptPhase::RetireSelectorIpv4],
+        );
+        lease.remove_attempt(&retired).unwrap();
+        assert!(fixture.store.load_attempt().unwrap().is_none());
+        assert_eq!(fs::read(fixture.store.journal_path()).unwrap(), primary);
+    }
+}
+
+#[test]
+fn attempt_removal_requires_a_terminal_phase_and_reports_missing_sidecar() {
+    let fixture = Fixture::new();
+    let binding = test_binding(30);
+    let mut lease = fixture
+        .store
+        .acquire(record(
+            binding.clone(),
+            1,
+            NativeXtablesJournalPhase::Activating,
+            b"active target",
+        ))
+        .unwrap();
+    lease
+        .update(record(
+            binding.clone(),
+            2,
+            NativeXtablesJournalPhase::Active,
+            b"active target",
+        ))
+        .unwrap();
+    let reserved = attempt(
+        binding,
+        NativeXtablesAttemptPhase::Reserved,
+        b"nonce=terminal-removal",
+    );
+    lease.publish_attempt(reserved.clone()).unwrap();
+    assert!(matches!(
+        lease.remove_attempt(&reserved),
+        Err(NativeXtablesDurableError::InvalidRecord {
+            artifact: DurableArtifact::Attempt,
+            ..
+        })
+    ));
+    let recovering = attempt(
+        reserved.binding().clone(),
+        NativeXtablesAttemptPhase::RetireObservationIpv4,
+        reserved.payload().as_bytes(),
+    );
+    lease
+        .start_attempt_recovery(&reserved, recovering.clone())
+        .unwrap();
+    let retired = advance_attempt_phases(
+        &mut lease,
+        recovering,
+        &[NativeXtablesAttemptPhase::RetireSelectorIpv4],
+    );
+    lease.remove_attempt(&retired).unwrap();
+    assert!(matches!(
+        lease.remove_attempt(&retired),
+        Err(NativeXtablesDurableError::MissingAttempt)
+    ));
 }
 
 #[test]
@@ -420,10 +710,26 @@ fn attempt_crash_boundaries_preserve_exact_recoverable_state() {
             }
         };
         assert_eq!(recovered, expected);
-        if recovered != next {
-            lease.update_attempt(&recovered, next.clone()).unwrap();
-        }
-        lease.remove_attempt(&next).unwrap();
+        let populated = if recovered == next {
+            next
+        } else {
+            advance_attempt_phases(
+                &mut lease,
+                recovered,
+                &[NativeXtablesAttemptPhase::PopulateSelectorIpv4],
+            )
+        };
+        let retired = advance_attempt_phases(
+            &mut lease,
+            populated,
+            &[
+                NativeXtablesAttemptPhase::PopulateObservationIpv4,
+                NativeXtablesAttemptPhase::Active,
+                NativeXtablesAttemptPhase::RetireObservationIpv4,
+                NativeXtablesAttemptPhase::RetireSelectorIpv4,
+            ],
+        );
+        lease.remove_attempt(&retired).unwrap();
     }
 
     let fixture = Fixture::new();
@@ -452,12 +758,23 @@ fn attempt_crash_boundaries_preserve_exact_recoverable_state() {
         b"nonce=remove",
     );
     lease.publish_attempt(reserved.clone()).unwrap();
+    let retired = advance_attempt_phases(
+        &mut lease,
+        reserved,
+        &[
+            NativeXtablesAttemptPhase::PopulateSelectorIpv4,
+            NativeXtablesAttemptPhase::PopulateObservationIpv4,
+            NativeXtablesAttemptPhase::Active,
+            NativeXtablesAttemptPhase::RetireObservationIpv4,
+            NativeXtablesAttemptPhase::RetireSelectorIpv4,
+        ],
+    );
     fixture
         .store
         .set_failpoint(Some(DurableEvent::AttemptRemovedDurable));
 
     assert!(matches!(
-        lease.remove_attempt(&reserved),
+        lease.remove_attempt(&retired),
         Err(NativeXtablesDurableError::InterruptedAt(
             DurableEvent::AttemptRemovedDurable
         ))
@@ -916,17 +1233,7 @@ fn recovery_inspection_retires_an_internally_consistent_previous_boot_pair_on_fi
         NativeXtablesAttemptPhase::Reserved,
         b"nonce=69;selector=v4",
     );
-    lease.publish_attempt(reserved.clone()).unwrap();
-    lease
-        .update_attempt(
-            &reserved,
-            attempt(
-                previous.clone(),
-                NativeXtablesAttemptPhase::Active,
-                b"nonce=69;selector=v4",
-            ),
-        )
-        .unwrap();
+    lease.publish_attempt(reserved).unwrap();
     drop(lease);
     let _ = fixture.store.take_events();
     let current = NativeXtablesLeaseScope::new(
@@ -1776,6 +2083,23 @@ fn attempt(
         phase,
         NativeXtablesAttemptPayload::new(payload.to_vec()).unwrap(),
     )
+}
+
+fn advance_attempt_phases(
+    lease: &mut NativeXtablesTransitionLease,
+    mut current: NativeXtablesAttemptRecord,
+    phases: &[NativeXtablesAttemptPhase],
+) -> NativeXtablesAttemptRecord {
+    for phase in phases {
+        let next = attempt(
+            current.binding().clone(),
+            *phase,
+            current.payload().as_bytes(),
+        );
+        lease.update_attempt(&current, next.clone()).unwrap();
+        current = next;
+    }
+    current
 }
 
 struct Fixture {

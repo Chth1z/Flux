@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 
 use flux_core::{AddressResyncDisposition, GenerationId, Reason};
 use flux_platform::{
-    NativeCaptureCanarySelector, NativeCaptureConvergedState, NativeCaptureConvergence,
-    NativeCaptureDesired, NativeCaptureTargetIdentity,
+    NativeCaptureCanaryAttempt, NativeCaptureCanarySelector, NativeCaptureConvergedState,
+    NativeCaptureConvergence, NativeCaptureDesired, NativeCaptureTargetIdentity,
 };
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use flux_platform::{NativeXtablesCaptureConverger, NativeXtablesCaptureTarget};
@@ -127,9 +127,9 @@ struct RetainedNativeGeneration<T> {
     target: T,
 }
 
-fn native_canary_selector(
+fn native_canary_attempt(
     request: &CanaryAttemptRequest,
-) -> Result<NativeCaptureCanarySelector, NativeCoordinatorWriterError> {
+) -> Result<NativeCaptureCanaryAttempt, NativeCoordinatorWriterError> {
     let environment = request.pre_binding().environment();
     let facility = environment.facility();
     let ipv6_peer = match request.families() {
@@ -144,7 +144,7 @@ fn native_canary_selector(
         ),
     };
     let ports = facility.ports();
-    NativeCaptureCanarySelector::new(
+    let selector = NativeCaptureCanarySelector::new(
         environment.probe_uid(),
         facility.ipv4().peer(),
         ipv6_peer,
@@ -154,6 +154,17 @@ fn native_canary_selector(
     )
     .ok_or(NativeCoordinatorWriterError::Invariant(
         "canary selector request has colliding responder ports",
+    ))?;
+    let attempt_objects = environment.attempt_objects();
+    let facility_digest = environment.facility_admission().scope().facility_digest();
+    NativeCaptureCanaryAttempt::new(
+        selector,
+        *request.nonce().as_bytes(),
+        *attempt_objects.selector().as_bytes(),
+        *facility_digest.as_bytes(),
+    )
+    .ok_or(NativeCoordinatorWriterError::Invariant(
+        "native canary attempt has an invalid selector identity or facility digest",
     ))
 }
 
@@ -670,8 +681,8 @@ where
             ));
         }
         let target = retained.target.clone();
-        let selector = native_canary_selector(request)?;
-        let populated = match self.convergence.populate_canary_selector(&target, selector) {
+        let attempt = native_canary_attempt(request)?;
+        let populated = match self.convergence.populate_canary_selector(&target, attempt) {
             Ok(populated) => populated,
             Err(source) => {
                 self.recovery_required = true;
@@ -724,8 +735,8 @@ where
             ));
         }
         let target = retained.target.clone();
-        let selector = native_canary_selector(session.request())?;
-        let retired = match self.convergence.retire_canary_selector(&target, selector) {
+        let attempt = native_canary_attempt(session.request())?;
+        let retired = match self.convergence.retire_canary_selector(&target, attempt) {
             Ok(retired) => retired,
             Err(source) => {
                 self.recovery_required = true;
@@ -901,11 +912,11 @@ mod tests {
         },
         SelectorPopulated {
             target: u64,
-            selector: NativeCaptureCanarySelector,
+            attempt: NativeCaptureCanaryAttempt,
         },
         SelectorRetired {
             target: u64,
-            selector: NativeCaptureCanarySelector,
+            attempt: NativeCaptureCanaryAttempt,
         },
         EngineRunning(CaptureObservation),
         EngineStopped(CaptureObservation),
@@ -915,7 +926,7 @@ mod tests {
         events: Arc<Mutex<Vec<Event>>>,
         active: Option<u64>,
         fail_active_once: Option<u64>,
-        selector: Option<(u64, NativeCaptureCanarySelector)>,
+        selector: Option<(u64, NativeCaptureCanaryAttempt)>,
         fail_recover_once: bool,
         fail_populate_once: bool,
         fail_retire_once: bool,
@@ -964,7 +975,7 @@ mod tests {
         fn populate_canary_selector(
             &mut self,
             target: &Self::Target,
-            selector: NativeCaptureCanarySelector,
+            attempt: NativeCaptureCanaryAttempt,
         ) -> Result<bool, Self::Error> {
             if self.unsupported_populate_once {
                 self.unsupported_populate_once = false;
@@ -975,13 +986,13 @@ mod tests {
                     "scripted selector population found a different active state",
                 ));
             }
-            self.selector = Some((target.0, selector));
+            self.selector = Some((target.0, attempt));
             self.events
                 .lock()
                 .expect("native events lock")
                 .push(Event::SelectorPopulated {
                     target: target.0,
-                    selector,
+                    attempt,
                 });
             if self.fail_populate_once {
                 self.fail_populate_once = false;
@@ -995,13 +1006,13 @@ mod tests {
         fn retire_canary_selector(
             &mut self,
             target: &Self::Target,
-            selector: NativeCaptureCanarySelector,
+            attempt: NativeCaptureCanaryAttempt,
         ) -> Result<bool, Self::Error> {
             if self.unsupported_retire_once {
                 self.unsupported_retire_once = false;
                 return Ok(false);
             }
-            if self.active != Some(target.0) || self.selector != Some((target.0, selector)) {
+            if self.active != Some(target.0) || self.selector != Some((target.0, attempt)) {
                 return Err(io::Error::other(
                     "scripted selector retirement found a different active state",
                 ));
@@ -1018,7 +1029,7 @@ mod tests {
                 .expect("native events lock")
                 .push(Event::SelectorRetired {
                     target: target.0,
-                    selector,
+                    attempt,
                 });
             self.selector_retired_observed_at = Some(Instant::now());
             Ok(true)
@@ -1419,12 +1430,14 @@ mod tests {
         let facility = environment.facility();
         let ports = facility.ports();
         assert_eq!(populated.0, 17);
-        assert_eq!(populated.1.probe_uid(), environment.probe_uid());
-        assert_eq!(populated.1.ipv4_peer(), facility.ipv4().peer());
-        assert_eq!(populated.1.ipv6_peer(), None);
-        assert_eq!(populated.1.tcp_echo_port(), ports.tcp_echo());
-        assert_eq!(populated.1.udp_echo_port(), ports.udp_echo());
-        assert_eq!(populated.1.dns_port(), ports.dns());
+        let selector = populated.1.selector();
+        assert_eq!(selector.probe_uid(), environment.probe_uid());
+        assert_eq!(selector.ipv4_peer(), facility.ipv4().peer());
+        assert_eq!(selector.ipv6_peer(), None);
+        assert_eq!(selector.tcp_echo_port(), ports.tcp_echo());
+        assert_eq!(selector.udp_echo_port(), ports.udp_echo());
+        assert_eq!(selector.dns_port(), ports.dns());
+        assert_eq!(populated.1.nonce(), request.nonce().as_bytes());
         let overlap =
             RuntimeWriter::reserve_canary_selector_session(&mut writer, &generation, &alternate)
                 .expect_err("overlapping selector sessions must fail");
@@ -1498,11 +1511,12 @@ mod tests {
                 .expect("populate dual-stack selector session")
                 .expect("native writer returns dual-stack selector ownership");
 
-        let selector = writer
+        let attempt = writer
             .convergence
             .selector
             .expect("dual-stack reservation populates one selector")
             .1;
+        let selector = attempt.selector();
         let environment = request.pre_binding().environment();
         let facility = environment.facility();
         assert_eq!(selector.probe_uid(), environment.probe_uid());
@@ -1515,6 +1529,19 @@ mod tests {
         assert_eq!(selector.tcp_echo_port(), ports.tcp_echo());
         assert_eq!(selector.udp_echo_port(), ports.udp_echo());
         assert_eq!(selector.dns_port(), ports.dns());
+        assert_eq!(attempt.nonce(), request.nonce().as_bytes());
+        assert_eq!(
+            attempt.selector_identity(),
+            environment.attempt_objects().selector().as_bytes()
+        );
+        assert_eq!(
+            attempt.facility_digest(),
+            environment
+                .facility_admission()
+                .scope()
+                .facility_digest()
+                .as_bytes()
+        );
 
         RuntimeWriter::retire_canary_selector_session(&mut writer, &generation, session)
             .expect("retire dual-stack selector session")

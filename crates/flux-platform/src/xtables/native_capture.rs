@@ -1,5 +1,5 @@
 use std::error::Error;
-use std::fmt::Debug;
+use std::fmt::{self, Debug};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::num::{NonZeroI32, NonZeroU16, NonZeroU32, NonZeroU64};
 use std::time::Instant;
@@ -216,6 +216,82 @@ impl NativeCaptureCanarySelector {
     }
 }
 
+/// Exact request identity for one serialized native canary mutation session.
+///
+/// The owner derives Generation-scoped chain and mark identities from the admitted target. This
+/// value supplies only request-owned facts that cannot be reconstructed after a restart. Nonce
+/// bytes are intentionally redacted from `Debug` output.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct NativeCaptureCanaryAttempt {
+    selector: NativeCaptureCanarySelector,
+    nonce: [u8; 32],
+    selector_identity: [u8; 32],
+    facility_digest: [u8; 32],
+}
+
+impl NativeCaptureCanaryAttempt {
+    #[must_use]
+    pub const fn new(
+        selector: NativeCaptureCanarySelector,
+        nonce: [u8; 32],
+        selector_identity: [u8; 32],
+        facility_digest: [u8; 32],
+    ) -> Option<Self> {
+        if bytes_are_zero(&selector_identity) || bytes_are_zero(&facility_digest) {
+            return None;
+        }
+        Some(Self {
+            selector,
+            nonce,
+            selector_identity,
+            facility_digest,
+        })
+    }
+
+    #[must_use]
+    pub const fn selector(self) -> NativeCaptureCanarySelector {
+        self.selector
+    }
+
+    #[must_use]
+    pub const fn nonce(&self) -> &[u8; 32] {
+        &self.nonce
+    }
+
+    #[must_use]
+    pub const fn selector_identity(&self) -> &[u8; 32] {
+        &self.selector_identity
+    }
+
+    #[must_use]
+    pub const fn facility_digest(&self) -> &[u8; 32] {
+        &self.facility_digest
+    }
+}
+
+impl fmt::Debug for NativeCaptureCanaryAttempt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NativeCaptureCanaryAttempt")
+            .field("selector", &self.selector)
+            .field("nonce", &"<redacted>")
+            .field("selector_identity", &self.selector_identity)
+            .field("facility_digest", &self.facility_digest)
+            .finish()
+    }
+}
+
+const fn bytes_are_zero(bytes: &[u8; 32]) -> bool {
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != 0 {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
 /// Exact fixed-purpose TCP route lookup for one active canary selector.
 ///
 /// The destination port must be nonzero. Source address and source port are deliberately absent:
@@ -401,7 +477,7 @@ pub trait NativeCaptureConvergence: Send + 'static {
     fn populate_canary_selector(
         &mut self,
         _target: &Self::Target,
-        _selector: NativeCaptureCanarySelector,
+        _attempt: NativeCaptureCanaryAttempt,
     ) -> Result<bool, Self::Error> {
         Ok(false)
     }
@@ -412,7 +488,7 @@ pub trait NativeCaptureConvergence: Send + 'static {
     fn retire_canary_selector(
         &mut self,
         _target: &Self::Target,
-        _selector: NativeCaptureCanarySelector,
+        _attempt: NativeCaptureCanaryAttempt,
     ) -> Result<bool, Self::Error> {
         Ok(false)
     }
@@ -425,7 +501,7 @@ pub trait NativeCaptureConvergence: Send + 'static {
     fn observe_canary_route(
         &mut self,
         _target: &Self::Target,
-        _selector: NativeCaptureCanarySelector,
+        _attempt: NativeCaptureCanaryAttempt,
         _query: NativeCaptureCanaryRouteQuery,
     ) -> Result<Option<NativeCaptureCanaryRouteOutcome>, Self::Error> {
         Ok(None)

@@ -257,6 +257,11 @@ impl CanaryAttemptObjectIdentity {
         }
         Err(CanaryBindingError::AllZeroAttemptObjectIdentity)
     }
+
+    #[must_use]
+    pub(crate) const fn as_bytes(&self) -> &[u8; CANARY_ATTEMPT_OBJECT_IDENTITY_BYTES] {
+        &self.0
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -340,6 +345,11 @@ impl CanaryFacilityAuditDigest {
             index += 1;
         }
         Err(CanaryBindingError::AllZeroFacilityAuditDigest)
+    }
+
+    #[must_use]
+    pub(crate) const fn as_bytes(&self) -> &[u8; CANARY_FACILITY_AUDIT_DIGEST_BYTES] {
+        &self.0
     }
 }
 
@@ -1297,6 +1307,11 @@ impl CanaryFacilityAdmissionScope {
             facility_digest,
             reviewed_pool_identity,
         }
+    }
+
+    #[must_use]
+    pub(crate) const fn facility_digest(self) -> CanaryFacilityAuditDigest {
+        self.facility_digest
     }
 }
 

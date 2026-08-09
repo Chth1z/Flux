@@ -188,46 +188,81 @@ impl RetainedDriverChild {
             .child
             .as_mut()
             .expect("live retained authority owns its child");
-        match child
+        abort_child_and_reap(
+            child,
+            self.role,
+            "inspect failed child transaction",
+            "abort failed child transaction",
+            "reap failed child transaction",
+            exclusive_deadline,
+        )?;
+        drop(self.child.take());
+        Ok(())
+    }
+}
+
+/// Compensate a child that failed before retained process authority could be
+/// opened. This deliberately shares the exact bounded kill/reap primitive used
+/// after authority construction instead of growing a second raw-child loop in
+/// the packaged protocol.
+pub(super) fn abort_unready_driver_child(
+    role: DriverProcessRole,
+    child: &mut Child,
+    exclusive_deadline: Instant,
+) -> Result<(), DriverProcessAuthorityError> {
+    abort_child_and_reap(
+        child,
+        role,
+        "inspect unready driver child",
+        "abort unready driver child",
+        "reap unready driver child",
+        exclusive_deadline,
+    )
+}
+
+fn abort_child_and_reap(
+    child: &mut Child,
+    role: DriverProcessRole,
+    inspect_operation: &'static str,
+    abort_operation: &'static str,
+    reap_operation: &'static str,
+    exclusive_deadline: Instant,
+) -> Result<(), DriverProcessAuthorityError> {
+    match child
+        .try_wait()
+        .map_err(|source| DriverProcessAuthorityError::ChildOperation {
+            role,
+            operation: inspect_operation,
+            source,
+        })? {
+        Some(_) => return Ok(()),
+        None => child
+            .kill()
+            .map_err(|source| DriverProcessAuthorityError::ChildOperation {
+                role,
+                operation: abort_operation,
+                source,
+            })?,
+    }
+    loop {
+        if child
             .try_wait()
             .map_err(|source| DriverProcessAuthorityError::ChildOperation {
-                role: self.role,
-                operation: "inspect failed child transaction",
+                role,
+                operation: reap_operation,
                 source,
-            })? {
-            Some(_) => {
-                drop(self.child.take());
-                return Ok(());
-            }
-            None => child
-                .kill()
-                .map_err(|source| DriverProcessAuthorityError::ChildOperation {
-                    role: self.role,
-                    operation: "abort failed child transaction",
-                    source,
-                })?,
+            })?
+            .is_some()
+        {
+            return Ok(());
         }
-        loop {
-            if child
-                .try_wait()
-                .map_err(|source| DriverProcessAuthorityError::ChildOperation {
-                    role: self.role,
-                    operation: "reap failed child transaction",
-                    source,
-                })?
-                .is_some()
-            {
-                drop(self.child.take());
-                return Ok(());
-            }
-            if Instant::now() >= exclusive_deadline {
-                return Err(DriverProcessAuthorityError::DeadlineExpired {
-                    role: self.role,
-                    operation: "failed child transaction reap",
-                });
-            }
-            sleep_until_reap_poll(exclusive_deadline);
+        if Instant::now() >= exclusive_deadline {
+            return Err(DriverProcessAuthorityError::DeadlineExpired {
+                role,
+                operation: reap_operation,
+            });
         }
+        sleep_until_reap_poll(exclusive_deadline);
     }
 }
 

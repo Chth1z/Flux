@@ -19,7 +19,7 @@ use super::super::{
 use super::driver_process::DriverProcessProof;
 use super::driver_process::{
     DriverProcessAuthorityError, DriverProcessRole, ReapedDriverChild, RetainedDriverChild,
-    retire_child_without_blocking,
+    abort_unready_driver_child, retire_child_without_blocking,
 };
 
 const PROC_SELF_EXE: &str = "/proc/self/exe";
@@ -294,7 +294,7 @@ impl PackagedDriverChild {
                 source,
             })?;
         let inherited_descriptor = seqpacket_inherited_descriptor(&inherited);
-        let lifetime = child_lifetime(exclusive_deadline)?;
+        let deadline_nanos = child_monotonic_deadline(exclusive_deadline)?;
         let (ipv4, ipv6) = binding.map_or_else(
             || ("-".to_owned(), "-".to_owned()),
             ChildBindPlan::arguments,
@@ -305,7 +305,7 @@ impl PackagedDriverChild {
                 INTERNAL_CHILD_COMMAND,
                 role.label(),
                 &inherited_descriptor.to_string(),
-                &lifetime.as_millis().to_string(),
+                &deadline_nanos.to_string(),
                 &ipv4,
                 &ipv6,
             ])
@@ -357,9 +357,11 @@ impl PackagedDriverChild {
             ControlMessage::Ready,
             exclusive_deadline,
         ) {
-            if let Err(cleanup) = abort_spawned_child(&mut child, exclusive_deadline) {
+            if let Err(cleanup) =
+                abort_unready_driver_child(role.process_role(), &mut child, exclusive_deadline)
+            {
                 retire_child_without_blocking(child);
-                return Err(cleanup);
+                return Err(cleanup.into());
             }
             return Err(error);
         }
@@ -402,46 +404,6 @@ impl PackagedDriverChild {
         retained
             .terminate_and_reap(quiesced_at, exclusive_deadline)
             .map_err(Into::into)
-    }
-}
-
-fn abort_spawned_child(
-    child: &mut std::process::Child,
-    exclusive_deadline: Instant,
-) -> Result<(), PackagedDriverChildError> {
-    match child.try_wait() {
-        Ok(Some(_)) => return Ok(()),
-        Ok(None) => child
-            .kill()
-            .map_err(|source| PackagedDriverChildError::Io {
-                operation: "abort unready driver child",
-                source,
-            })?,
-        Err(source) => {
-            return Err(PackagedDriverChildError::Io {
-                operation: "inspect unready driver child",
-                source,
-            });
-        }
-    }
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return Ok(()),
-            Ok(None) if Instant::now() < exclusive_deadline => {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            Ok(None) => {
-                return Err(PackagedDriverChildError::DeadlineExpired(
-                    "reap unready driver child",
-                ));
-            }
-            Err(source) => {
-                return Err(PackagedDriverChildError::Io {
-                    operation: "reap unready driver child",
-                    source,
-                });
-            }
-        }
     }
 }
 
@@ -538,14 +500,73 @@ fn validate_child_credentials(
     Ok(())
 }
 
-fn child_lifetime(exclusive_deadline: Instant) -> Result<Duration, PackagedDriverChildError> {
+fn child_monotonic_deadline(exclusive_deadline: Instant) -> Result<u64, PackagedDriverChildError> {
+    // Sample the shared clock first and `Instant` second. Any time between the
+    // samples shortens, rather than extends, the absolute child deadline.
+    let raw_now = monotonic_now_nanos()?;
     let remaining = exclusive_deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() || remaining > MAX_CHILD_LIFETIME {
         return Err(PackagedDriverChildError::InvalidArguments(
             "driver-child lifetime is zero or exceeds the bounded maximum",
         ));
     }
-    Ok(remaining)
+    let remaining_nanos = u64::try_from(remaining.as_nanos()).map_err(|_| {
+        PackagedDriverChildError::InvalidArguments(
+            "driver-child remaining lifetime does not fit the monotonic clock",
+        )
+    })?;
+    raw_now
+        .checked_add(remaining_nanos)
+        .ok_or(PackagedDriverChildError::InvalidArguments(
+            "driver-child monotonic deadline cannot be represented",
+        ))
+}
+
+fn child_instant_deadline(deadline_nanos: u64) -> Result<Instant, PackagedDriverChildError> {
+    // Sample `Instant` first and the shared process monotonic clock second. Any
+    // time between the samples shortens, rather than extends, the child budget.
+    let now = Instant::now();
+    let raw_now = monotonic_now_nanos()?;
+    let remaining = deadline_nanos
+        .checked_sub(raw_now)
+        .map(Duration::from_nanos)
+        .filter(|remaining| !remaining.is_zero() && *remaining <= MAX_CHILD_LIFETIME)
+        .ok_or(PackagedDriverChildError::InvalidArguments(
+            "driver-child monotonic deadline is expired or exceeds the bounded maximum",
+        ))?;
+    now.checked_add(remaining)
+        .ok_or(PackagedDriverChildError::InvalidArguments(
+            "driver-child deadline cannot be represented",
+        ))
+}
+
+fn monotonic_now_nanos() -> Result<u64, PackagedDriverChildError> {
+    let mut time = std::mem::MaybeUninit::<libc::timespec>::zeroed();
+    // SAFETY: `time` points to writable storage for one `timespec`, and
+    // `CLOCK_MONOTONIC` has no caller-owned lifetime or aliasing requirements.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, time.as_mut_ptr()) } != 0 {
+        return Err(PackagedDriverChildError::Io {
+            operation: "read monotonic driver-child clock",
+            source: std::io::Error::last_os_error(),
+        });
+    }
+    // SAFETY: a successful `clock_gettime` initialized the complete value.
+    let time = unsafe { time.assume_init() };
+    let seconds = u64::try_from(time.tv_sec).map_err(|_| {
+        PackagedDriverChildError::InvalidArguments("driver-child monotonic clock is negative")
+    })?;
+    let nanos = u64::try_from(time.tv_nsec)
+        .ok()
+        .filter(|nanos| *nanos < 1_000_000_000)
+        .ok_or(PackagedDriverChildError::InvalidArguments(
+            "driver-child monotonic clock nanoseconds are invalid",
+        ))?;
+    seconds
+        .checked_mul(1_000_000_000)
+        .and_then(|value| value.checked_add(nanos))
+        .ok_or(PackagedDriverChildError::InvalidArguments(
+            "driver-child monotonic clock cannot be represented",
+        ))
 }
 
 fn clone_namespace(namespace: &File) -> Result<File, PackagedDriverChildError> {
@@ -650,31 +671,20 @@ fn run_internal_child(args: &[String]) -> Result<(), PackagedDriverChildError> {
         .ok_or(PackagedDriverChildError::InvalidArguments(
             "invalid inherited driver-child control descriptor",
         ))?;
-    let lifetime_millis = args[4]
+    let deadline_nanos = args[4]
         .parse::<u64>()
         .ok()
-        .filter(|millis| *millis > 0)
+        .filter(|deadline| *deadline > 0)
         .ok_or(PackagedDriverChildError::InvalidArguments(
-            "invalid driver-child lifetime",
+            "invalid driver-child monotonic deadline",
         ))?;
-    let lifetime = Duration::from_millis(lifetime_millis);
-    if lifetime > MAX_CHILD_LIFETIME {
-        return Err(PackagedDriverChildError::InvalidArguments(
-            "driver-child lifetime exceeds the bounded maximum",
-        ));
-    }
     let binding = ChildBindPlan::parse(&args[5], &args[6])?;
     if role.binding_flows().is_some() != binding.is_some() {
         return Err(PackagedDriverChildError::InvalidArguments(
             "driver-child role and bind plan disagree",
         ));
     }
-    let deadline =
-        Instant::now()
-            .checked_add(lifetime)
-            .ok_or(PackagedDriverChildError::InvalidArguments(
-                "driver-child deadline cannot be represented",
-            ))?;
+    let deadline = child_instant_deadline(deadline_nanos)?;
     // SAFETY: argument validation requires a non-standard descriptor and this
     // child has no Rust owner for the sole endpoint inherited across exec.
     let control =
@@ -874,7 +884,7 @@ mod tests {
     const TEST_CHILD_ENV: &str = "FLUX_TEST_PACKAGED_DRIVER_CHILD";
     const TEST_ROLE_ENV: &str = "FLUX_TEST_PACKAGED_DRIVER_ROLE";
     const TEST_DESCRIPTOR_ENV: &str = "FLUX_TEST_PACKAGED_DRIVER_FD";
-    const TEST_LIFETIME_ENV: &str = "FLUX_TEST_PACKAGED_DRIVER_LIFETIME_MS";
+    const TEST_DEADLINE_ENV: &str = "FLUX_TEST_PACKAGED_DRIVER_DEADLINE_NS";
     const TEST_IPV4_ENV: &str = "FLUX_TEST_PACKAGED_DRIVER_IPV4";
     const TEST_IPV6_ENV: &str = "FLUX_TEST_PACKAGED_DRIVER_IPV6";
 
@@ -894,20 +904,31 @@ mod tests {
 
     #[test]
     fn hidden_dispatch_rejects_substituted_roles_descriptors_deadlines_and_bindings() {
+        let deadline = child_monotonic_deadline(Instant::now() + Duration::from_secs(1))
+            .expect("bounded test child deadline")
+            .to_string();
         let valid = [
             "fluxd",
             INTERNAL_CHILD_COMMAND,
             "client",
             "3",
-            "1000",
+            &deadline,
             "-",
             "-",
         ];
+        let overlong_deadline = monotonic_now_nanos()
+            .expect("read test monotonic clock")
+            .checked_add(
+                u64::try_from((MAX_CHILD_LIFETIME + Duration::from_secs(5)).as_nanos())
+                    .expect("bounded maximum fits u64"),
+            )
+            .expect("overlong test deadline fits u64")
+            .to_string();
         for (index, value) in [
             (2, "unknown"),
             (3, "2"),
             (4, "0"),
-            (4, "120001"),
+            (4, overlong_deadline.as_str()),
             (5, "[::1]:5300"),
             (6, "127.0.0.1:5300"),
         ] {
@@ -930,6 +951,25 @@ mod tests {
         server_without_binding[2] = "tcp-echo".to_owned();
         assert!(matches!(
             run_internal_child(&server_without_binding),
+            Err(PackagedDriverChildError::InvalidArguments(_))
+        ));
+    }
+
+    #[test]
+    fn absolute_child_deadline_never_extends_the_parent_instant() {
+        let parent_deadline = Instant::now() + Duration::from_millis(250);
+        let encoded = child_monotonic_deadline(parent_deadline)
+            .expect("encode one bounded absolute monotonic deadline");
+        std::thread::sleep(Duration::from_millis(2));
+        let decoded = child_instant_deadline(encoded)
+            .expect("decode the still-live absolute monotonic deadline");
+        assert!(decoded <= parent_deadline);
+
+        let expired = monotonic_now_nanos()
+            .expect("read monotonic clock")
+            .saturating_sub(1);
+        assert!(matches!(
+            child_instant_deadline(expired),
             Err(PackagedDriverChildError::InvalidArguments(_))
         ));
     }
@@ -1005,7 +1045,7 @@ mod tests {
             INTERNAL_CHILD_COMMAND.to_owned(),
             required_test_env(TEST_ROLE_ENV),
             required_test_env(TEST_DESCRIPTOR_ENV),
-            required_test_env(TEST_LIFETIME_ENV),
+            required_test_env(TEST_DEADLINE_ENV),
             required_test_env(TEST_IPV4_ENV),
             required_test_env(TEST_IPV6_ENV),
         ];
@@ -1032,7 +1072,8 @@ mod tests {
         );
         let (control, inherited) = SeqpacketConnection::pair().expect("create test control pair");
         let inherited_descriptor = seqpacket_inherited_descriptor(&inherited);
-        let lifetime = child_lifetime(exclusive_deadline).expect("bounded test child lifetime");
+        let deadline_nanos =
+            child_monotonic_deadline(exclusive_deadline).expect("bounded test child deadline");
         let (ipv4, ipv6) = binding.map_or_else(
             || ("-".to_owned(), "-".to_owned()),
             ChildBindPlan::arguments,
@@ -1052,7 +1093,7 @@ mod tests {
             .env(TEST_CHILD_ENV, "1")
             .env(TEST_ROLE_ENV, role.label())
             .env(TEST_DESCRIPTOR_ENV, inherited_descriptor.to_string())
-            .env(TEST_LIFETIME_ENV, lifetime.as_millis().to_string())
+            .env(TEST_DEADLINE_ENV, deadline_nanos.to_string())
             .env(TEST_IPV4_ENV, ipv4)
             .env(TEST_IPV6_ENV, ipv6)
             .current_dir("/")

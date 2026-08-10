@@ -736,6 +736,65 @@ impl CanaryAttemptSocketObserverSession {
         self.deadline
     }
 
+    /// Collect one identity-bound process snapshot while retaining the exact
+    /// prebound diagnostic session.
+    ///
+    /// The session is consumed on entry and returned only after a complete,
+    /// all-or-nothing collection. Any platform error consumes the session so
+    /// unread netlink datagrams cannot satisfy a later attempt.
+    pub(crate) fn collect_process_until(
+        self,
+        process: OwnedEngineIdentity,
+    ) -> Result<(Self, ProcessSocketDiagnostics), FunctionalCanaryError> {
+        match self.transport {
+            CanaryAttemptSocketObserverTransport::ProcFdInetDiag(session) => {
+                let expected =
+                    flux_platform::socket_diagnostics::SocketDiagnosticsProcessIdentity::new(
+                        NonZeroU32::new(process.pid()).expect("engine PID is nonzero"),
+                        NonZeroU64::new(process.start_time_ticks())
+                            .expect("engine start ticks are nonzero"),
+                    );
+                let (session, snapshot) = session
+                    .collect_process_until(expected, self.deadline.expires_at())
+                    .map_err(|error| {
+                        let kind = match error.kind() {
+                            SocketDiagnosticsErrorKind::DeadlineExpired => {
+                                CanaryErrorKind::TimedOut
+                            }
+                            SocketDiagnosticsErrorKind::ProcessIdentityMismatch
+                            | SocketDiagnosticsErrorKind::ProcessSocketFdsChanged => {
+                                CanaryErrorKind::IdentityChanged
+                            }
+                            _ => CanaryErrorKind::InvalidEvidence,
+                        };
+                        let diagnostic = format!(
+                            "authoritative process socket observation failed ({:?}): {error}",
+                            error.kind(),
+                        );
+                        FunctionalCanaryError::new(
+                            kind,
+                            CanaryCleanupStatus::Uncertain,
+                            &diagnostic,
+                        )
+                    })?;
+                Ok((
+                    Self {
+                        binding: self.binding,
+                        deadline: self.deadline,
+                        transport: CanaryAttemptSocketObserverTransport::ProcFdInetDiag(session),
+                    },
+                    snapshot,
+                ))
+            }
+            #[cfg(test)]
+            CanaryAttemptSocketObserverTransport::Scripted => Err(FunctionalCanaryError::new(
+                CanaryErrorKind::InvalidEvidence,
+                CanaryCleanupStatus::NotRequired,
+                "the attempt-owned socket observer cannot collect a production process snapshot",
+            )),
+        }
+    }
+
     /// Collect one identity-bound process snapshot plus the two targeted UDP
     /// listener dumps while retaining the exact prebound diagnostic session.
     ///
@@ -6177,6 +6236,27 @@ pub(crate) mod tests {
                 flow: CanaryFlow::Ipv4TcpEcho
             }
         );
+    }
+
+    #[test]
+    fn scripted_attempt_socket_observer_cannot_collect_a_process_snapshot() {
+        let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+        let observer = CanaryAttemptSocketObserverSession::scripted(
+            fixture
+                .request
+                .pre_binding
+                .environment
+                .authority
+                .socket_observer_binding(),
+            fixture.request.deadline(),
+        );
+        let result = observer.collect_process_until(fixture.request.pre_binding.engine.engine());
+        let error = match result {
+            Ok(_) => panic!("scripted observer must not collect production socket state"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), CanaryErrorKind::InvalidEvidence);
+        assert_eq!(error.cleanup(), CanaryCleanupStatus::NotRequired);
     }
 
     #[test]

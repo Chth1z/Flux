@@ -365,10 +365,10 @@ impl PackagedDriverChildren {
         Ok(())
     }
 
-    pub(super) fn quiesce_and_reap(
+    pub(super) fn quiesce_client_and_reap(
         self,
         exclusive_deadline: Instant,
-    ) -> Result<ReapedPackagedDriverChildren, PackagedDriverChildError> {
+    ) -> Result<ClientReapedPackagedDriverChildren, PackagedDriverChildError> {
         if self.traffic_state == PackagedDriverTrafficState::InFlight {
             self.abort_and_reap(exclusive_deadline)?;
             return Err(PackagedDriverChildError::Protocol(
@@ -376,18 +376,29 @@ impl PackagedDriverChildren {
             ));
         }
         let [peer_0, peer_1, peer_2] = self.peer_servers;
-        // Evaluate every retirement before propagating the first error. A
-        // failed control exchange must not skip orderly cleanup for siblings.
-        let [client, peer_0, peer_1, peer_2] = [
-            self.client.quiesce_and_reap(exclusive_deadline),
-            peer_0.quiesce_and_reap(exclusive_deadline),
-            peer_1.quiesce_and_reap(exclusive_deadline),
-            peer_2.quiesce_and_reap(exclusive_deadline),
-        ];
-        Ok(ReapedPackagedDriverChildren {
-            client: client?,
-            peer_servers: [peer_0?, peer_1?, peer_2?],
+        let client = match self.client.quiesce_and_reap(exclusive_deadline) {
+            Ok(client) => client,
+            Err(error) => {
+                let _peer_cleanup = [
+                    peer_0.abort_and_reap(exclusive_deadline),
+                    peer_1.abort_and_reap(exclusive_deadline),
+                    peer_2.abort_and_reap(exclusive_deadline),
+                ];
+                return Err(error);
+            }
+        };
+        Ok(ClientReapedPackagedDriverChildren {
+            client,
+            peer_servers: [peer_0, peer_1, peer_2],
         })
+    }
+
+    pub(super) fn quiesce_and_reap(
+        self,
+        exclusive_deadline: Instant,
+    ) -> Result<ReapedPackagedDriverChildren, PackagedDriverChildError> {
+        self.quiesce_client_and_reap(exclusive_deadline)?
+            .quiesce_and_reap_peers(exclusive_deadline)
     }
 }
 
@@ -493,6 +504,50 @@ impl PackagedDriverFlowHolding<'_> {
 pub(super) struct ReapedPackagedDriverChildren {
     pub(super) client: ReapedDriverChild,
     pub(super) peer_servers: [ReapedDriverChild; CANARY_PEER_SERVER_SLOTS],
+}
+
+/// Fixed cleanup boundary after the request-driving client is parent-reaped
+/// while all peer listeners remain live.
+pub(super) struct ClientReapedPackagedDriverChildren {
+    pub(super) client: ReapedDriverChild,
+    peer_servers: [PackagedDriverChild; CANARY_PEER_SERVER_SLOTS],
+}
+
+impl ClientReapedPackagedDriverChildren {
+    /// Compensate a failed evidence-retirement transaction without detaching
+    /// any still-live peer child.
+    pub(super) fn abort_and_reap_peers(
+        self,
+        exclusive_deadline: Instant,
+    ) -> Result<(), PackagedDriverChildError> {
+        let [peer_0, peer_1, peer_2] = self.peer_servers;
+        let [peer_0, peer_1, peer_2] = [
+            peer_0.abort_and_reap(exclusive_deadline),
+            peer_1.abort_and_reap(exclusive_deadline),
+            peer_2.abort_and_reap(exclusive_deadline),
+        ];
+        peer_0?;
+        peer_1?;
+        peer_2?;
+        Ok(())
+    }
+
+    pub(super) fn quiesce_and_reap_peers(
+        self,
+        exclusive_deadline: Instant,
+    ) -> Result<ReapedPackagedDriverChildren, PackagedDriverChildError> {
+        let [peer_0, peer_1, peer_2] = self.peer_servers;
+        // Evaluate every peer retirement before propagating the first error.
+        let [peer_0, peer_1, peer_2] = [
+            peer_0.quiesce_and_reap(exclusive_deadline),
+            peer_1.quiesce_and_reap(exclusive_deadline),
+            peer_2.quiesce_and_reap(exclusive_deadline),
+        ];
+        Ok(ReapedPackagedDriverChildren {
+            client: self.client,
+            peer_servers: [peer_0?, peer_1?, peer_2?],
+        })
+    }
 }
 
 impl ReapedPackagedDriverChildren {
@@ -1221,13 +1276,22 @@ mod tests {
         assert!(TcpListener::bind(dns_address).is_err());
         assert!(UdpSocket::bind(dns_address).is_err());
 
-        let reaped = PackagedDriverChildren {
+        let client_reaped = PackagedDriverChildren {
             client,
             peer_servers: [tcp, udp, dns],
             traffic_state: PackagedDriverTrafficState::Ready { next_flow_index: 0 },
         }
-        .quiesce_and_reap(deadline)
-        .expect("quiesce and parent-reap every exact child");
+        .quiesce_client_and_reap(deadline)
+        .expect("quiesce and parent-reap the exact client first");
+
+        assert!(TcpListener::bind(tcp_address).is_err());
+        assert!(UdpSocket::bind(udp_address).is_err());
+        assert!(TcpListener::bind(dns_address).is_err());
+        assert!(UdpSocket::bind(dns_address).is_err());
+
+        let reaped = client_reaped
+            .quiesce_and_reap_peers(deadline)
+            .expect("quiesce and parent-reap every retained peer");
         let proof = reaped
             .into_process_proof()
             .expect("assemble distinct retained-child proof");

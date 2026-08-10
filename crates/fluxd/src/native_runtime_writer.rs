@@ -1980,6 +1980,7 @@ mod tests {
             facility.peer_veth(),
             facility.ipv4(),
             facility.ipv6(),
+            facility.peer_veth_topology(),
             CanaryResponderPorts::new(
                 NonZeroU16::new(42_001).expect("substituted TCP port"),
                 NonZeroU16::new(42_002).expect("substituted UDP port"),

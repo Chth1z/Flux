@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use flux_core::{
     BootIdentity, CapabilityProfileRevision, GenerationId, InterfaceIndex, InterfaceName,
     NetworkEpoch, NetworkInventorySnapshotId, NetworkNamespaceIdentity, OwnershipJournalIdentity,
-    OwnershipJournalRevision, RouteTableId, RulePriority,
+    OwnershipJournalRevision, RouteProtocol, RouteScope, RouteTableId, RouteType, RulePriority,
 };
 use flux_platform::socket_diagnostics::{
     CorrelatedProcessSocket, InetSocketProtocol, ProcessSocketDiagnostics, SocketCorrelationError,
@@ -178,9 +178,16 @@ pub(crate) enum CanaryBindingError {
     DuplicateIpv6Address,
     ForbiddenIpv4Address,
     ForbiddenIpv6Address,
+    InvalidIpv4VethPrefixLength,
+    InvalidIpv6VethPrefixLength,
+    MismatchedVethTopologyFamily,
+    FacilityIpv6TopologyMismatch,
+    ZeroCanaryRouteTable,
+    ZeroCanaryRouteProtocol,
     SameNetworkNamespace,
     ZeroRpdbTable,
     SameRpdbTable,
+    CanaryPeerRouteTableMismatch,
     InvalidRpdbPriorityOrder,
     ProxyMarkEmpty,
     ProxyMarkBitsOutsideMask,
@@ -192,6 +199,7 @@ pub(crate) enum CanaryBindingError {
     MissingIpv6Facility,
     SameProtocolResponderPortCollision,
     FacilityAdmissionInventoryMismatch,
+    FacilityAdmissionScopeMismatch,
     FacilityAdmissionAttemptMismatch,
     FacilityAdmissionExpired,
     AllZeroFacilityAuditDigest,
@@ -1267,6 +1275,193 @@ impl CanaryIpv6AddressPair {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CanaryRouteShape {
+    table: RouteTableId,
+    protocol: RouteProtocol,
+    scope: RouteScope,
+    route_type: RouteType,
+    metric: NonZeroU32,
+}
+
+impl CanaryRouteShape {
+    pub(crate) const fn new(
+        table: RouteTableId,
+        protocol: RouteProtocol,
+        scope: RouteScope,
+        metric: NonZeroU32,
+    ) -> Result<Self, CanaryBindingError> {
+        if table.get() == 0 {
+            return Err(CanaryBindingError::ZeroCanaryRouteTable);
+        }
+        if protocol.raw() == 0 {
+            return Err(CanaryBindingError::ZeroCanaryRouteProtocol);
+        }
+        Ok(Self {
+            table,
+            protocol,
+            scope,
+            route_type: RouteType::from_raw(1),
+            metric,
+        })
+    }
+
+    #[must_use]
+    pub(crate) const fn table(self) -> RouteTableId {
+        self.table
+    }
+
+    #[must_use]
+    pub(crate) const fn protocol(self) -> RouteProtocol {
+        self.protocol
+    }
+
+    #[must_use]
+    pub(crate) const fn scope(self) -> RouteScope {
+        self.scope
+    }
+
+    #[must_use]
+    pub(crate) const fn route_type(self) -> RouteType {
+        self.route_type
+    }
+
+    #[must_use]
+    pub(crate) const fn metric(self) -> NonZeroU32 {
+        self.metric
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CanaryVethAddressFamily {
+    Ipv4,
+    Ipv6,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CanaryVethFamilyTopology {
+    family: CanaryVethAddressFamily,
+    daemon_prefix_length: u8,
+    peer_prefix_length: u8,
+    daemon_to_peer_route: CanaryRouteShape,
+    peer_to_daemon_route: CanaryRouteShape,
+}
+
+impl CanaryVethFamilyTopology {
+    pub(crate) const fn ipv4(
+        daemon_prefix_length: u8,
+        peer_prefix_length: u8,
+        daemon_to_peer_route: CanaryRouteShape,
+        peer_to_daemon_route: CanaryRouteShape,
+    ) -> Result<Self, CanaryBindingError> {
+        Self::new(
+            CanaryVethAddressFamily::Ipv4,
+            32,
+            CanaryBindingError::InvalidIpv4VethPrefixLength,
+            daemon_prefix_length,
+            peer_prefix_length,
+            daemon_to_peer_route,
+            peer_to_daemon_route,
+        )
+    }
+
+    pub(crate) const fn ipv6(
+        daemon_prefix_length: u8,
+        peer_prefix_length: u8,
+        daemon_to_peer_route: CanaryRouteShape,
+        peer_to_daemon_route: CanaryRouteShape,
+    ) -> Result<Self, CanaryBindingError> {
+        Self::new(
+            CanaryVethAddressFamily::Ipv6,
+            128,
+            CanaryBindingError::InvalidIpv6VethPrefixLength,
+            daemon_prefix_length,
+            peer_prefix_length,
+            daemon_to_peer_route,
+            peer_to_daemon_route,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    const fn new(
+        family: CanaryVethAddressFamily,
+        maximum_prefix_length: u8,
+        invalid_prefix_error: CanaryBindingError,
+        daemon_prefix_length: u8,
+        peer_prefix_length: u8,
+        daemon_to_peer_route: CanaryRouteShape,
+        peer_to_daemon_route: CanaryRouteShape,
+    ) -> Result<Self, CanaryBindingError> {
+        if daemon_prefix_length == 0
+            || daemon_prefix_length > maximum_prefix_length
+            || peer_prefix_length == 0
+            || peer_prefix_length > maximum_prefix_length
+        {
+            return Err(invalid_prefix_error);
+        }
+        Ok(Self {
+            family,
+            daemon_prefix_length,
+            peer_prefix_length,
+            daemon_to_peer_route,
+            peer_to_daemon_route,
+        })
+    }
+
+    #[must_use]
+    pub(crate) const fn daemon_prefix_length(self) -> u8 {
+        self.daemon_prefix_length
+    }
+
+    #[must_use]
+    pub(crate) const fn peer_prefix_length(self) -> u8 {
+        self.peer_prefix_length
+    }
+
+    #[must_use]
+    pub(crate) const fn daemon_to_peer_route(self) -> CanaryRouteShape {
+        self.daemon_to_peer_route
+    }
+
+    #[must_use]
+    pub(crate) const fn peer_to_daemon_route(self) -> CanaryRouteShape {
+        self.peer_to_daemon_route
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CanaryPeerVethTopology {
+    ipv4: CanaryVethFamilyTopology,
+    ipv6: Option<CanaryVethFamilyTopology>,
+}
+
+impl CanaryPeerVethTopology {
+    pub(crate) const fn new(
+        ipv4: CanaryVethFamilyTopology,
+        ipv6: Option<CanaryVethFamilyTopology>,
+    ) -> Result<Self, CanaryBindingError> {
+        let ipv4_matches = matches!(ipv4.family, CanaryVethAddressFamily::Ipv4);
+        let ipv6_matches = match ipv6 {
+            Some(ipv6) => matches!(ipv6.family, CanaryVethAddressFamily::Ipv6),
+            None => true,
+        };
+        if !ipv4_matches || !ipv6_matches {
+            return Err(CanaryBindingError::MismatchedVethTopologyFamily);
+        }
+        Ok(Self { ipv4, ipv6 })
+    }
+
+    #[must_use]
+    pub(crate) const fn ipv4(self) -> CanaryVethFamilyTopology {
+        self.ipv4
+    }
+
+    #[must_use]
+    pub(crate) const fn ipv6(self) -> Option<CanaryVethFamilyTopology> {
+        self.ipv6
+    }
+}
+
 fn ipv4_forbidden(address: Ipv4Addr) -> bool {
     let [a, b, c, _] = address.octets();
     address.is_unspecified()
@@ -1429,6 +1624,7 @@ pub(crate) struct CanaryFacilityIdentity {
     peer_veth: CanaryVethIdentity,
     ipv4: CanaryIpv4AddressPair,
     ipv6: Option<CanaryIpv6AddressPair>,
+    peer_veth_topology: CanaryPeerVethTopology,
     ports: CanaryResponderPorts,
 }
 
@@ -1438,6 +1634,7 @@ impl CanaryFacilityIdentity {
         peer_veth: CanaryVethIdentity,
         ipv4: CanaryIpv4AddressPair,
         ipv6: Option<CanaryIpv6AddressPair>,
+        peer_veth_topology: CanaryPeerVethTopology,
         ports: CanaryResponderPorts,
     ) -> Result<Self, CanaryBindingError> {
         if daemon_veth.interface_index == peer_veth.interface_index {
@@ -1446,11 +1643,15 @@ impl CanaryFacilityIdentity {
         if daemon_veth.interface_name == peer_veth.interface_name {
             return Err(CanaryBindingError::DuplicateVethName);
         }
+        if ipv6.is_some() != peer_veth_topology.ipv6.is_some() {
+            return Err(CanaryBindingError::FacilityIpv6TopologyMismatch);
+        }
         Ok(Self {
             daemon_veth,
             peer_veth,
             ipv4,
             ipv6,
+            peer_veth_topology,
             ports,
         })
     }
@@ -1473,6 +1674,11 @@ impl CanaryFacilityIdentity {
     #[must_use]
     pub(crate) const fn ipv6(&self) -> Option<CanaryIpv6AddressPair> {
         self.ipv6
+    }
+
+    #[must_use]
+    pub(crate) const fn peer_veth_topology(&self) -> CanaryPeerVethTopology {
+        self.peer_veth_topology
     }
 
     #[must_use]
@@ -1905,7 +2111,15 @@ impl CanaryEnvironmentBinding {
             return Err(CanaryBindingError::FacilityAdmissionInventoryMismatch);
         }
         if facility_admission.scope.facility != facility {
-            return Err(CanaryBindingError::FacilityAdmissionInventoryMismatch);
+            return Err(CanaryBindingError::FacilityAdmissionScopeMismatch);
+        }
+        let topology = facility.peer_veth_topology();
+        if topology.ipv4().daemon_to_peer_route().table() != rpdb.peer_table()
+            || topology
+                .ipv6()
+                .is_some_and(|ipv6| ipv6.daemon_to_peer_route().table() != rpdb.peer_table())
+        {
+            return Err(CanaryBindingError::CanaryPeerRouteTableMismatch);
         }
         Ok(Self {
             authority,
@@ -7584,6 +7798,182 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn route_shape_rejects_zero_identity_fields_but_allows_universe_scope() {
+        let table = RouteTableId::from_raw(10_201);
+        let protocol = RouteProtocol::from_raw(99);
+        let scope = RouteScope::from_raw(0);
+        let metric = NonZeroU32::new(100).expect("nonzero route metric");
+        assert_eq!(
+            CanaryRouteShape::new(RouteTableId::from_raw(0), protocol, scope, metric),
+            Err(CanaryBindingError::ZeroCanaryRouteTable)
+        );
+        assert_eq!(
+            CanaryRouteShape::new(table, RouteProtocol::from_raw(0), scope, metric),
+            Err(CanaryBindingError::ZeroCanaryRouteProtocol)
+        );
+
+        let shape = CanaryRouteShape::new(table, protocol, scope, metric)
+            .expect("zero is the valid universe scope");
+        assert_eq!(shape.table(), table);
+        assert_eq!(shape.protocol(), protocol);
+        assert_eq!(shape.scope(), scope);
+        assert_eq!(shape.route_type(), RouteType::from_raw(1));
+        assert_eq!(shape.metric(), metric);
+    }
+
+    #[test]
+    fn peer_veth_topology_enforces_family_widths_and_preserves_exact_shape() {
+        let daemon_to_peer = fixture_route_shape(10_201, 100);
+        let peer_to_daemon = fixture_route_shape(10_202, 101);
+        assert_eq!(
+            CanaryVethFamilyTopology::ipv4(0, 32, daemon_to_peer, peer_to_daemon),
+            Err(CanaryBindingError::InvalidIpv4VethPrefixLength)
+        );
+        assert_eq!(
+            CanaryVethFamilyTopology::ipv4(33, 32, daemon_to_peer, peer_to_daemon),
+            Err(CanaryBindingError::InvalidIpv4VethPrefixLength)
+        );
+
+        let ipv4 = CanaryVethFamilyTopology::ipv4(32, 31, daemon_to_peer, peer_to_daemon)
+            .expect("nonzero family prefixes");
+        assert_eq!(
+            CanaryVethFamilyTopology::ipv6(
+                128,
+                129,
+                fixture_route_shape(10_203, 102),
+                fixture_route_shape(10_204, 103),
+            ),
+            Err(CanaryBindingError::InvalidIpv6VethPrefixLength)
+        );
+
+        let ipv6 = fixture_ipv6_family_topology(10_201, 10_204);
+        assert_eq!(
+            CanaryPeerVethTopology::new(ipv6, Some(ipv4)),
+            Err(CanaryBindingError::MismatchedVethTopologyFamily)
+        );
+        let topology = CanaryPeerVethTopology::new(ipv4, Some(ipv6))
+            .expect("point-to-point host prefixes remain valid");
+        assert_eq!(topology.ipv4(), ipv4);
+        assert_eq!(topology.ipv6(), Some(ipv6));
+        assert_eq!(ipv4.daemon_prefix_length(), 32);
+        assert_eq!(ipv4.peer_prefix_length(), 31);
+        assert_eq!(ipv4.daemon_to_peer_route(), daemon_to_peer);
+        assert_eq!(ipv4.peer_to_daemon_route(), peer_to_daemon);
+        assert_eq!(
+            topology,
+            CanaryPeerVethTopology::new(ipv4, Some(ipv6)).unwrap()
+        );
+    }
+
+    #[test]
+    fn facility_requires_matching_ipv6_topology_and_admission_rejects_substitution() {
+        let fixture = Fixture::new(CanaryAddressFamilies::Ipv4AndIpv6);
+        let environment = &fixture.request.pre_binding.environment;
+        let facility = environment.facility();
+        let ipv4_only_topology =
+            CanaryPeerVethTopology::new(facility.peer_veth_topology().ipv4(), None)
+                .expect("valid IPv4-only topology");
+        assert_eq!(
+            CanaryFacilityIdentity::new(
+                facility.daemon_veth(),
+                facility.peer_veth(),
+                facility.ipv4(),
+                facility.ipv6(),
+                ipv4_only_topology,
+                facility.ports(),
+            ),
+            Err(CanaryBindingError::FacilityIpv6TopologyMismatch)
+        );
+        assert_eq!(
+            CanaryFacilityIdentity::new(
+                facility.daemon_veth(),
+                facility.peer_veth(),
+                facility.ipv4(),
+                None,
+                facility.peer_veth_topology(),
+                facility.ports(),
+            ),
+            Err(CanaryBindingError::FacilityIpv6TopologyMismatch)
+        );
+
+        let substituted_facility = CanaryFacilityIdentity::new(
+            facility.daemon_veth(),
+            facility.peer_veth(),
+            facility.ipv4(),
+            facility.ipv6(),
+            fixture_peer_veth_topology(10_101, 10_300),
+            facility.ports(),
+        )
+        .expect("valid substituted topology");
+        assert_ne!(substituted_facility, facility);
+        assert_eq!(
+            CanaryEnvironmentBinding::new(
+                environment.authority().clone(),
+                CanaryAttemptCredentialBinding::new(
+                    environment.probe_credentials(),
+                    environment.engine_credentials(),
+                    environment.credential_domain(),
+                )
+                .expect("fixture credential binding"),
+                substituted_facility,
+                environment.facility_admission(),
+                environment.rpdb(),
+                environment.attempt_objects(),
+            ),
+            Err(CanaryBindingError::FacilityAdmissionScopeMismatch)
+        );
+    }
+
+    #[test]
+    fn environment_rejects_ipv4_daemon_to_peer_route_outside_the_peer_table() {
+        let fixture = Fixture::new(CanaryAddressFamilies::Ipv4AndIpv6);
+        let environment = &fixture.request.pre_binding.environment;
+        let facility = environment.facility();
+        let topology = facility.peer_veth_topology();
+        let ipv4 = topology.ipv4();
+        let substituted_ipv4 = CanaryVethFamilyTopology::ipv4(
+            ipv4.daemon_prefix_length(),
+            ipv4.peer_prefix_length(),
+            route_shape_with_table(ipv4.daemon_to_peer_route(), 10_999),
+            ipv4.peer_to_daemon_route(),
+        )
+        .expect("valid substituted IPv4 route shape");
+        let substituted_topology = CanaryPeerVethTopology::new(substituted_ipv4, topology.ipv6())
+            .expect("valid dual-stack topology");
+        let substituted_facility = facility_with_topology(facility, substituted_topology);
+
+        assert_eq!(
+            environment_with_admitted_facility(environment, substituted_facility),
+            Err(CanaryBindingError::CanaryPeerRouteTableMismatch)
+        );
+    }
+
+    #[test]
+    fn environment_rejects_ipv6_daemon_to_peer_route_outside_the_peer_table() {
+        let fixture = Fixture::new(CanaryAddressFamilies::Ipv4AndIpv6);
+        let environment = &fixture.request.pre_binding.environment;
+        let facility = environment.facility();
+        let topology = facility.peer_veth_topology();
+        let ipv6 = topology.ipv6().expect("dual-stack fixture topology");
+        let substituted_ipv6 = CanaryVethFamilyTopology::ipv6(
+            ipv6.daemon_prefix_length(),
+            ipv6.peer_prefix_length(),
+            route_shape_with_table(ipv6.daemon_to_peer_route(), 10_999),
+            ipv6.peer_to_daemon_route(),
+        )
+        .expect("valid substituted IPv6 route shape");
+        let substituted_topology =
+            CanaryPeerVethTopology::new(topology.ipv4(), Some(substituted_ipv6))
+                .expect("valid dual-stack topology");
+        let substituted_facility = facility_with_topology(facility, substituted_topology);
+
+        assert_eq!(
+            environment_with_admitted_facility(environment, substituted_facility),
+            Err(CanaryBindingError::CanaryPeerRouteTableMismatch)
+        );
+    }
+
     fn validate(
         fixture: &Fixture,
         evidence: UnqualifiedCanaryGateEvidence,
@@ -8106,6 +8496,102 @@ pub(crate) mod tests {
         .expect("ordered canary counter bounds")
     }
 
+    fn fixture_route_shape(table: u32, metric: u32) -> CanaryRouteShape {
+        CanaryRouteShape::new(
+            RouteTableId::from_raw(table),
+            RouteProtocol::from_raw(99),
+            RouteScope::from_raw(0),
+            NonZeroU32::new(metric).expect("nonzero fixture route metric"),
+        )
+        .expect("valid fixture route shape")
+    }
+
+    fn route_shape_with_table(shape: CanaryRouteShape, table: u32) -> CanaryRouteShape {
+        CanaryRouteShape::new(
+            RouteTableId::from_raw(table),
+            shape.protocol(),
+            shape.scope(),
+            shape.metric(),
+        )
+        .expect("valid substituted route table")
+    }
+
+    fn facility_with_topology(
+        facility: CanaryFacilityIdentity,
+        topology: CanaryPeerVethTopology,
+    ) -> CanaryFacilityIdentity {
+        CanaryFacilityIdentity::new(
+            facility.daemon_veth(),
+            facility.peer_veth(),
+            facility.ipv4(),
+            facility.ipv6(),
+            topology,
+            facility.ports(),
+        )
+        .expect("valid substituted facility topology")
+    }
+
+    fn environment_with_admitted_facility(
+        environment: &CanaryEnvironmentBinding,
+        facility: CanaryFacilityIdentity,
+    ) -> Result<CanaryEnvironmentBinding, CanaryBindingError> {
+        let mut admission = environment.facility_admission();
+        admission.scope.facility = facility;
+        CanaryEnvironmentBinding::new(
+            environment.authority().clone(),
+            CanaryAttemptCredentialBinding::new(
+                environment.probe_credentials(),
+                environment.engine_credentials(),
+                environment.credential_domain(),
+            )
+            .expect("fixture credential binding"),
+            facility,
+            admission,
+            environment.rpdb(),
+            environment.attempt_objects(),
+        )
+    }
+
+    fn fixture_ipv4_family_topology(
+        peer_table: u32,
+        reverse_table: u32,
+    ) -> CanaryVethFamilyTopology {
+        CanaryVethFamilyTopology::ipv4(
+            32,
+            32,
+            fixture_route_shape(peer_table, 100),
+            fixture_route_shape(reverse_table, 101),
+        )
+        .expect("valid fixture IPv4 topology")
+    }
+
+    fn fixture_ipv6_family_topology(
+        peer_table: u32,
+        reverse_table: u32,
+    ) -> CanaryVethFamilyTopology {
+        CanaryVethFamilyTopology::ipv6(
+            128,
+            128,
+            fixture_route_shape(peer_table, 102),
+            fixture_route_shape(reverse_table, 103),
+        )
+        .expect("valid fixture IPv6 topology")
+    }
+
+    fn fixture_peer_veth_topology(
+        peer_table: u32,
+        first_reverse_table: u32,
+    ) -> CanaryPeerVethTopology {
+        CanaryPeerVethTopology::new(
+            fixture_ipv4_family_topology(peer_table, first_reverse_table),
+            Some(fixture_ipv6_family_topology(
+                peer_table,
+                first_reverse_table + 1,
+            )),
+        )
+        .expect("valid dual-stack fixture topology")
+    }
+
     pub(crate) fn fixture_responder_ports() -> CanaryResponderPorts {
         CanaryResponderPorts::new(
             NonZeroU16::new(41_001).expect("TCP responder port"),
@@ -8171,6 +8657,7 @@ pub(crate) mod tests {
                 )
                 .expect("distinct IPv6 addresses"),
             ),
+            fixture_peer_veth_topology(10_101, 10_200),
             fixture_responder_ports(),
         )
         .expect("valid facility");

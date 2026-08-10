@@ -1294,14 +1294,16 @@ mod tests {
     use flux_core::{
         CapabilityProfile, CapturePathQualifications, FwmarkCandidate, InterfaceAddressFlags,
         InterfaceAddressRecord, InterfaceIndex, InterfaceName, NetworkInventoryTracker,
-        NetworkNamespaceIdentity, RouteProtocol, RouteTableId, RulePriority, RuleProtocol,
+        NetworkNamespaceIdentity, RouteProtocol, RouteScope, RouteTableId, RulePriority,
+        RuleProtocol,
     };
     use flux_platform::{XtablesLocalOutputRoutingSpec, XtablesLocalOutputRoutingTarget};
     use flux_testkit::CapabilityProfileFixture;
 
     use super::*;
     use crate::functional_canary::{
-        CanaryIpv4AddressPair, CanaryIpv6AddressPair, CanaryResponderPorts, CanaryVethIdentity,
+        CanaryIpv4AddressPair, CanaryIpv6AddressPair, CanaryPeerVethTopology, CanaryResponderPorts,
+        CanaryRouteShape, CanaryVethFamilyTopology, CanaryVethIdentity,
     };
     use crate::generation_engine_config::{
         CapturePathQualificationEvidence, HostInspectionPlanningAuthority,
@@ -2181,6 +2183,25 @@ esac
                 )
                 .expect("test canary IPv6 pair"),
             ),
+            CanaryPeerVethTopology::new(
+                CanaryVethFamilyTopology::ipv4(
+                    32,
+                    32,
+                    test_canary_route_shape(20_253, 1_031),
+                    test_canary_route_shape(20_262, 1_032),
+                )
+                .expect("test IPv4 veth topology"),
+                Some(
+                    CanaryVethFamilyTopology::ipv6(
+                        128,
+                        128,
+                        test_canary_route_shape(20_253, 1_033),
+                        test_canary_route_shape(20_264, 1_034),
+                    )
+                    .expect("test IPv6 veth topology"),
+                ),
+            )
+            .expect("test dual-stack peer-veth topology"),
             CanaryResponderPorts::new(
                 NonZeroU16::new(41_001).expect("TCP responder port"),
                 NonZeroU16::new(41_002).expect("UDP responder port"),
@@ -2189,6 +2210,16 @@ esac
             .expect("test responder ports"),
         )
         .expect("test canary facility")
+    }
+
+    fn test_canary_route_shape(table: u32, metric: u32) -> CanaryRouteShape {
+        CanaryRouteShape::new(
+            RouteTableId::from_raw(table),
+            RouteProtocol::from_raw(99),
+            RouteScope::from_raw(0),
+            NonZeroU32::new(metric).expect("nonzero test canary route metric"),
+        )
+        .expect("test canary route shape")
     }
 
     fn test_routing() -> XtablesLocalOutputRoutingSpec {

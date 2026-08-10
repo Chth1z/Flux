@@ -3,7 +3,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::num::NonZeroU32;
 use std::time::Instant;
 
-use flux_core::{InterfaceAddressFlags, InterfaceLinkFlags, NetworkEpoch};
+use flux_core::{InterfaceAddressFlags, InterfaceLinkFlags, InterfaceLinkReference, NetworkEpoch};
 
 use crate::address_sync::{AddressEventPolicy, RtnetlinkAddressEventDecoder};
 use crate::netlink::link::RtnetlinkLinkEventDecoder;
@@ -23,6 +23,7 @@ const AF_INET: u8 = 2;
 const AF_INET6: u8 = 10;
 const IFLA_IFNAME: u16 = 3;
 const IFLA_MTU: u16 = 4;
+const IFLA_LINK: u16 = 5;
 const IFLA_OPERSTATE: u16 = 16;
 const IFLA_LINKINFO: u16 = 18;
 const IFLA_CARRIER: u16 = 33;
@@ -117,7 +118,14 @@ fn coordinated_four_phase_dump_publishes_only_after_rule_done() {
 
     assert_eq!(
         observer.consume(
-            decode(link_datagram(70, 7, b"wlan0", 0x1, Some(1_500))),
+            decode(link_datagram_with_reference(
+                70,
+                7,
+                b"wlan0",
+                0x1,
+                Some(1_500),
+                Some(9),
+            )),
             now + Duration::from_millis(1),
         ),
         ObserverDriveOutcome::Idle
@@ -188,6 +196,10 @@ fn coordinated_four_phase_dump_publishes_only_after_rule_done() {
     assert_eq!(snapshot.links().len(), 1);
     assert_eq!(snapshot.links()[0].interface_index().get(), 7);
     assert_eq!(snapshot.links()[0].name().as_bytes(), b"wlan0");
+    assert_eq!(
+        snapshot.links()[0].link_reference(),
+        InterfaceIndex::new(9).map(InterfaceLinkReference::Interface)
+    );
     assert_eq!(snapshot.links()[0].mtu(), Some(1_500));
     assert_eq!(snapshot.addresses().len(), 1);
     assert_eq!(snapshot.routes().len(), 1);
@@ -208,7 +220,14 @@ fn transaction_races_span_all_phases_and_preserve_partial_link_fields() {
             [
                 decode(fully_populated_link_datagram(72, 7, b"wlan0", 0x1)),
                 decode(netlink_message(NLMSG_DONE, 72, &[])),
-                decode_notification(link_datagram(900, 7, b"wlan0", 0x41, None)),
+                decode_notification(link_datagram_with_reference(
+                    900,
+                    7,
+                    b"wlan0",
+                    0x41,
+                    None,
+                    Some(9),
+                )),
             ],
             now + Duration::from_millis(1),
         ),
@@ -275,6 +294,10 @@ fn transaction_races_span_all_phases_and_preserve_partial_link_fields() {
     );
     assert_eq!(snapshot.links()[0].carrier(), Some(true));
     assert_eq!(
+        snapshot.links()[0].link_reference(),
+        InterfaceIndex::new(9).map(InterfaceLinkReference::Interface)
+    );
+    assert_eq!(
         snapshot.links()[0]
             .kind()
             .expect("preserved link kind")
@@ -283,6 +306,91 @@ fn transaction_races_span_all_phases_and_preserve_partial_link_fields() {
     );
     assert_eq!(snapshot.addresses().len(), 1);
     assert_eq!(snapshot.addresses()[0].interface_index().get(), 9);
+}
+
+#[test]
+fn live_link_reference_changes_preserve_absent_unknown_and_interface_states() {
+    let mut observer = observer();
+    let source = observer.source();
+    let now = Instant::now();
+    complete_single_routed_dump(&mut observer, 76, now);
+
+    let initial = source.snapshot().expect("initial inventory");
+    assert_eq!(initial.links()[0].link_reference(), None);
+
+    assert_eq!(
+        observer.consume(
+            decode_notification(link_datagram_with_reference(
+                904,
+                7,
+                b"wlan0",
+                0x1,
+                None,
+                Some(0),
+            )),
+            now + Duration::from_millis(10),
+        ),
+        ObserverDriveOutcome::Idle
+    );
+    let unknown_epoch = NetworkEpoch::INITIAL
+        .checked_next()
+        .expect("unknown-media epoch");
+    assert_eq!(
+        observer.poll(now + Duration::from_millis(30)),
+        ObserverDriveOutcome::Published(unknown_epoch)
+    );
+    let unknown = source.snapshot().expect("unknown-media inventory");
+    assert_eq!(
+        unknown.links()[0].link_reference(),
+        Some(InterfaceLinkReference::UnknownMedia)
+    );
+    assert_eq!(unknown.links()[0].mtu(), Some(1_500));
+
+    assert_eq!(
+        observer.consume(
+            decode_notification(link_datagram_with_reference(
+                905,
+                7,
+                b"wlan0",
+                0x1,
+                None,
+                Some(9),
+            )),
+            now + Duration::from_millis(40),
+        ),
+        ObserverDriveOutcome::Idle
+    );
+    let referenced_epoch = unknown_epoch
+        .checked_next()
+        .expect("interface-reference epoch");
+    assert_eq!(
+        observer.poll(now + Duration::from_millis(60)),
+        ObserverDriveOutcome::Published(referenced_epoch)
+    );
+    let referenced = source.snapshot().expect("interface-reference inventory");
+    assert_eq!(
+        referenced.links()[0].link_reference(),
+        InterfaceIndex::new(9).map(InterfaceLinkReference::Interface)
+    );
+
+    assert_eq!(
+        observer.consume(
+            decode_notification(link_datagram(906, 7, b"wlan0", 0x1, None)),
+            now + Duration::from_millis(70),
+        ),
+        ObserverDriveOutcome::Idle
+    );
+    let absent_epoch = referenced_epoch
+        .checked_next()
+        .expect("absent-reference epoch");
+    assert_eq!(
+        observer.poll(now + Duration::from_millis(90)),
+        ObserverDriveOutcome::Published(absent_epoch)
+    );
+    let absent = source.snapshot().expect("absent-reference inventory");
+    assert_eq!(absent.epoch(), absent_epoch);
+    assert_eq!(absent.links()[0].link_reference(), None);
+    assert_eq!(absent.links()[0].mtu(), Some(1_500));
 }
 
 #[test]
@@ -1683,6 +1791,17 @@ fn link_datagram(
     flags: u32,
     mtu: Option<u32>,
 ) -> Vec<u8> {
+    link_datagram_with_reference(sequence, interface_index, name, flags, mtu, None)
+}
+
+fn link_datagram_with_reference(
+    sequence: u32,
+    interface_index: u32,
+    name: &[u8],
+    flags: u32,
+    mtu: Option<u32>,
+    link_reference: Option<u32>,
+) -> Vec<u8> {
     let mut payload = vec![AF_UNSPEC, 0];
     payload.extend(1_u16.to_ne_bytes());
     payload.extend((interface_index as i32).to_ne_bytes());
@@ -1691,6 +1810,9 @@ fn link_datagram(
     append_attribute(&mut payload, IFLA_IFNAME, &[name, &[0]].concat());
     if let Some(mtu) = mtu {
         append_attribute(&mut payload, IFLA_MTU, &mtu.to_ne_bytes());
+    }
+    if let Some(link_reference) = link_reference {
+        append_attribute(&mut payload, IFLA_LINK, &link_reference.to_ne_bytes());
     }
     netlink_message(RTM_NEWLINK, sequence, &payload)
 }
@@ -1708,6 +1830,7 @@ fn fully_populated_link_datagram(
     payload.extend(u32::MAX.to_ne_bytes());
     append_attribute(&mut payload, IFLA_IFNAME, &[name, &[0]].concat());
     append_attribute(&mut payload, IFLA_MTU, &1_500_u32.to_ne_bytes());
+    append_attribute(&mut payload, IFLA_LINK, &9_u32.to_ne_bytes());
     append_attribute(&mut payload, IFLA_OPERSTATE, &[6]);
     append_attribute(&mut payload, IFLA_CARRIER, &[1]);
     let mut link_info = Vec::new();

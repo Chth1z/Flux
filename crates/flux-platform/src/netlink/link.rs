@@ -3,7 +3,7 @@ use std::fmt;
 
 use flux_core::{
     InterfaceHardwareType, InterfaceIndex, InterfaceLinkFlags, InterfaceLinkKind,
-    InterfaceLinkRecord, InterfaceName, InterfaceOperationalState,
+    InterfaceLinkRecord, InterfaceLinkReference, InterfaceName, InterfaceOperationalState,
 };
 
 use super::{
@@ -21,6 +21,7 @@ const AF_UNSPEC: u8 = 0;
 
 const IFLA_IFNAME: u16 = 3;
 const IFLA_MTU: u16 = 4;
+const IFLA_LINK: u16 = 5;
 const IFLA_OPERSTATE: u16 = 16;
 const IFLA_LINKINFO: u16 = 18;
 const IFLA_CARRIER: u16 = 33;
@@ -65,6 +66,8 @@ pub(crate) enum LinkEventDecodeErrorKind {
     InvalidInterfaceName,
     InvalidLinkKind,
     InvalidMtuLength,
+    InvalidLinkReferenceLength,
+    InvalidLinkReference,
     InvalidOperationalStateLength,
     InvalidCarrierLength,
     InvalidCarrierValue,
@@ -187,6 +190,12 @@ impl fmt::Display for LinkEventDecodeError {
                 LinkEventDecodeErrorKind::InvalidLinkKind => "link kind is invalid",
                 LinkEventDecodeErrorKind::InvalidMtuLength => {
                     "IFLA_MTU must contain exactly one u32"
+                }
+                LinkEventDecodeErrorKind::InvalidLinkReferenceLength => {
+                    "IFLA_LINK must contain exactly one u32"
+                }
+                LinkEventDecodeErrorKind::InvalidLinkReference => {
+                    "IFLA_LINK has an invalid interface index"
                 }
                 LinkEventDecodeErrorKind::InvalidOperationalStateLength => {
                     "IFLA_OPERSTATE must contain exactly one u8"
@@ -383,6 +392,9 @@ impl RtnetlinkLinkEventDecoder {
             InterfaceHardwareType::from_raw(read_u16(&body[2..])),
             InterfaceLinkFlags::from_bits(read_u32(&body[8..])),
         );
+        if let Some(link_reference) = decoded.link_reference {
+            record = record.with_link_reference(link_reference);
+        }
         if let Some(mtu) = decoded.mtu {
             record = record.with_mtu(mtu);
         }
@@ -403,6 +415,8 @@ impl RtnetlinkLinkEventDecoder {
 #[derive(Default)]
 struct DecodedLinkAttributes {
     name: Option<InterfaceName>,
+    link_reference: Option<InterfaceLinkReference>,
+    saw_link_reference: bool,
     mtu: Option<u32>,
     operational_state: Option<InterfaceOperationalState>,
     carrier: Option<bool>,
@@ -448,6 +462,32 @@ fn decode_link_attributes(
                     attribute.value_offset(),
                 )?;
                 decoded.mtu = Some(read_u32(attribute.value()));
+            }
+            IFLA_LINK => {
+                require_plain_attribute(attribute.flags(), attribute.offset())?;
+                if decoded.saw_link_reference {
+                    return Err(duplicate_attribute(attribute.offset()));
+                }
+                decoded.saw_link_reference = true;
+                require_length(
+                    attribute.value(),
+                    std::mem::size_of::<u32>(),
+                    LinkEventDecodeErrorKind::InvalidLinkReferenceLength,
+                    attribute.value_offset(),
+                )?;
+                let raw_reference = read_u32(attribute.value());
+                decoded.link_reference = Some(if raw_reference == 0 {
+                    InterfaceLinkReference::UnknownMedia
+                } else {
+                    InterfaceLinkReference::Interface(
+                        InterfaceIndex::new(raw_reference).ok_or_else(|| {
+                            LinkEventDecodeError::new(
+                                LinkEventDecodeErrorKind::InvalidLinkReference,
+                                attribute.value_offset(),
+                            )
+                        })?,
+                    )
+                });
             }
             IFLA_OPERSTATE => {
                 require_plain_attribute(attribute.flags(), attribute.offset())?;

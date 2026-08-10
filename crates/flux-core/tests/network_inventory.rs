@@ -3,12 +3,13 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use flux_core::{
     INTERFACE_LINK_KIND_MAX_BYTES, INTERFACE_NAME_MAX_BYTES, InterfaceAddressFlags,
     InterfaceAddressRecord, InterfaceAddressRecordErrorKind, InterfaceHardwareType, InterfaceIndex,
-    InterfaceLinkFlags, InterfaceLinkKind, InterfaceLinkRecord, InterfaceName,
-    InterfaceOperationalState, NetworkAddressFamily, NetworkEpoch, NetworkInventoryError,
-    NetworkInventoryTracker, NetworkRouteRecord, NetworkRuleRecord, OpaqueRuleAttribute,
-    RouteFlags, RoutePath, RoutePrefix, RouteProperties, RouteProtocol, RouteScope, RouteTableId,
-    RouteType, RuleAction, RuleAttributeOpacity, RuleFlags, RuleOpaqueAttributeFingerprint,
-    RulePrefix, RulePriority, RuleProperties, RuleProtocol, RuleTableId,
+    InterfaceLinkFlags, InterfaceLinkKind, InterfaceLinkRecord, InterfaceLinkReference,
+    InterfaceName, InterfaceOperationalState, NetworkAddressFamily, NetworkEpoch,
+    NetworkInventoryError, NetworkInventoryTracker, NetworkRouteRecord, NetworkRuleRecord,
+    OpaqueRuleAttribute, RouteFlags, RoutePath, RoutePrefix, RouteProperties, RouteProtocol,
+    RouteScope, RouteTableId, RouteType, RuleAction, RuleAttributeOpacity, RuleFlags,
+    RuleOpaqueAttributeFingerprint, RulePrefix, RulePriority, RuleProperties, RuleProtocol,
+    RuleTableId,
 };
 
 #[test]
@@ -112,6 +113,7 @@ fn link_facts_preserve_kernel_identity_without_assuming_utf8_or_known_values() {
     .with_kind(non_utf8_kind.clone());
 
     assert_eq!(record.interface_index(), interface_index);
+    assert_eq!(record.link_reference(), None);
     assert_eq!(record.name(), &non_utf8_name);
     assert_eq!(record.hardware_type().raw(), 0xfffe);
     assert_eq!(record.flags().bits(), 0x8001_0001);
@@ -132,6 +134,50 @@ fn link_facts_preserve_kernel_identity_without_assuming_utf8_or_known_values() {
     assert_eq!(minimal.operational_state(), None);
     assert_eq!(minimal.carrier(), None);
     assert_eq!(minimal.kind(), None);
+}
+
+#[test]
+fn link_reference_preserves_all_three_states_as_material_inventory_facts() {
+    let absent = link_record(7, b"lower-media");
+    let referenced_index = InterfaceIndex::new(9).expect("referenced interface index");
+    let unknown = absent
+        .clone()
+        .with_link_reference(InterfaceLinkReference::UnknownMedia);
+    let referenced = absent
+        .clone()
+        .with_link_reference(InterfaceLinkReference::Interface(referenced_index));
+    let mut tracker = NetworkInventoryTracker::new();
+
+    assert_eq!(absent.link_reference(), None);
+    assert_eq!(
+        unknown.link_reference(),
+        Some(InterfaceLinkReference::UnknownMedia)
+    );
+    assert_eq!(
+        referenced.link_reference(),
+        Some(InterfaceLinkReference::Interface(referenced_index))
+    );
+
+    let initial_epoch = tracker
+        .publish_complete([absent], [])
+        .expect("inventory without IFLA_LINK")
+        .epoch();
+    let unknown_epoch = tracker
+        .publish_complete([unknown], [])
+        .expect("inventory with explicit unknown media")
+        .epoch();
+    let referenced_epoch = tracker
+        .publish_complete([referenced.clone()], [])
+        .expect("inventory with interface reference")
+        .epoch();
+    let unchanged_epoch = tracker
+        .publish_complete([referenced], [])
+        .expect("unchanged interface reference inventory")
+        .epoch();
+
+    assert_eq!(unknown_epoch, initial_epoch.checked_next().unwrap());
+    assert_eq!(referenced_epoch, unknown_epoch.checked_next().unwrap());
+    assert_eq!(unchanged_epoch, referenced_epoch);
 }
 
 #[test]

@@ -1250,6 +1250,9 @@ fn merge_link_record(
         update.hardware_type(),
         update.flags(),
     );
+    if let Some(reference) = update.link_reference() {
+        merged = merged.with_link_reference(reference);
+    }
     if let Some(mtu) = update
         .mtu()
         .or_else(|| existing.and_then(InterfaceLinkRecord::mtu))

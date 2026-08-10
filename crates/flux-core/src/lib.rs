@@ -153,9 +153,9 @@ pub use network_inventory::{
     AddressFlagConflict, INTERFACE_LINK_KIND_MAX_BYTES, INTERFACE_NAME_MAX_BYTES,
     InterfaceAddressFlags, InterfaceAddressRecord, InterfaceAddressRecordError,
     InterfaceAddressRecordErrorKind, InterfaceHardwareType, InterfaceIndex, InterfaceLinkConflict,
-    InterfaceLinkFlags, InterfaceLinkKind, InterfaceLinkRecord, InterfaceName,
-    InterfaceNameConflict, InterfaceOperationalState, NetworkEpoch, NetworkInventory,
-    NetworkInventoryError, NetworkInventorySnapshotId, NetworkInventoryTracker,
+    InterfaceLinkFlags, InterfaceLinkKind, InterfaceLinkRecord, InterfaceLinkReference,
+    InterfaceName, InterfaceNameConflict, InterfaceOperationalState, NetworkEpoch,
+    NetworkInventory, NetworkInventoryError, NetworkInventorySnapshotId, NetworkInventoryTracker,
 };
 pub use network_route::{
     NetworkAddressFamily, NetworkRouteRecord, NetworkRouteRecordError, NetworkRouteRecordErrorKind,

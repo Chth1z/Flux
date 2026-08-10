@@ -16,6 +16,7 @@ fn link_decoder_constructs_a_complete_canonical_record() {
         &[
             (IFLA_IFNAME, b"tun0\0"),
             (IFLA_MTU, &9_000_u32.to_ne_bytes()),
+            (IFLA_LINK, &11_u32.to_ne_bytes()),
             (IFLA_OPERSTATE, &[0xfe]),
             (IFLA_CARRIER, &[1]),
             (IFLA_LINKINFO | NLA_F_NESTED, &link_info),
@@ -36,6 +37,10 @@ fn link_decoder_constructs_a_complete_canonical_record() {
     assert_eq!(record.name().as_bytes(), b"tun0");
     assert_eq!(record.hardware_type().raw(), 0xfffe);
     assert_eq!(record.flags().bits(), 0x8001_0001);
+    assert_eq!(
+        record.link_reference(),
+        InterfaceIndex::new(11).map(InterfaceLinkReference::Interface)
+    );
     assert_eq!(record.mtu(), Some(9_000));
     assert_eq!(
         record.operational_state(),
@@ -66,6 +71,7 @@ fn minimal_link_update_leaves_optional_facts_absent() {
     let record = decoded.events()[0].record().expect("upsert record");
 
     assert_eq!(record.mtu(), None);
+    assert_eq!(record.link_reference(), None);
     assert_eq!(record.operational_state(), None);
     assert_eq!(record.carrier(), None);
     assert_eq!(record.kind(), None);
@@ -211,6 +217,16 @@ fn recognized_scalar_attributes_require_exact_native_widths() {
             LinkEventDecodeErrorKind::InvalidMtuLength,
         ),
         (
+            IFLA_LINK,
+            &[0; 3],
+            LinkEventDecodeErrorKind::InvalidLinkReferenceLength,
+        ),
+        (
+            IFLA_LINK,
+            &[0; 5],
+            LinkEventDecodeErrorKind::InvalidLinkReferenceLength,
+        ),
+        (
             IFLA_OPERSTATE,
             &[0; 2],
             LinkEventDecodeErrorKind::InvalidOperationalStateLength,
@@ -236,6 +252,51 @@ fn recognized_scalar_attributes_require_exact_native_widths() {
             .decode_datagram(&datagram)
             .expect_err("wrong scalar width");
         assert_eq!(error.kind(), *expected);
+    }
+}
+
+#[test]
+fn link_reference_preserves_unknown_media_and_rejects_out_of_domain_indices() {
+    let unknown = link_message(
+        RTM_NEWLINK,
+        AF_UNSPEC,
+        0,
+        7,
+        0,
+        0,
+        &[
+            (IFLA_IFNAME, b"lower-media\0"),
+            (IFLA_LINK, &0_u32.to_ne_bytes()),
+        ],
+    );
+    let decoded = decoder()
+        .decode_datagram(&unknown)
+        .expect("explicit unknown media");
+    assert_eq!(
+        decoded.events()[0]
+            .record()
+            .expect("upsert record")
+            .link_reference(),
+        Some(InterfaceLinkReference::UnknownMedia)
+    );
+
+    for invalid in [i32::MAX as u32 + 1, u32::MAX] {
+        let datagram = link_message(
+            RTM_NEWLINK,
+            AF_UNSPEC,
+            0,
+            7,
+            0,
+            0,
+            &[
+                (IFLA_IFNAME, b"veth-flux\0"),
+                (IFLA_LINK, &invalid.to_ne_bytes()),
+            ],
+        );
+        let error = decoder()
+            .decode_datagram(&datagram)
+            .expect_err("invalid link reference");
+        assert_eq!(error.kind(), LinkEventDecodeErrorKind::InvalidLinkReference);
     }
 }
 
@@ -266,6 +327,7 @@ fn duplicate_recognized_attributes_are_ambiguous_even_when_identical() {
     let cases: &[(u16, &[u8])] = &[
         (IFLA_IFNAME, b"eth0\0"),
         (IFLA_MTU, &scalar),
+        (IFLA_LINK, &scalar),
         (IFLA_OPERSTATE, &[1]),
         (IFLA_CARRIER, &[1]),
         (IFLA_LINKINFO | NLA_F_NESTED, &nested),
@@ -285,6 +347,28 @@ fn duplicate_recognized_attributes_are_ambiguous_even_when_identical() {
             LinkEventDecodeErrorKind::DuplicateSemanticAttribute
         );
     }
+
+    let zero = 0_u32.to_ne_bytes();
+    let duplicate_zero = link_message(
+        RTM_NEWLINK,
+        AF_UNSPEC,
+        0,
+        7,
+        0,
+        0,
+        &[
+            (IFLA_IFNAME, b"lower-media\0"),
+            (IFLA_LINK, &zero),
+            (IFLA_LINK, &zero),
+        ],
+    );
+    assert_eq!(
+        decoder()
+            .decode_datagram(&duplicate_zero)
+            .expect_err("duplicate explicit unknown media")
+            .kind(),
+        LinkEventDecodeErrorKind::DuplicateSemanticAttribute
+    );
 }
 
 #[test]
@@ -303,6 +387,26 @@ fn known_plain_attributes_reject_netlink_attribute_flags() {
             decoder()
                 .decode_datagram(&datagram)
                 .expect_err("plain attribute flags are ambiguous")
+                .kind(),
+            LinkEventDecodeErrorKind::InvalidAttributeFlags
+        );
+
+        let datagram = link_message(
+            RTM_NEWLINK,
+            AF_UNSPEC,
+            0,
+            7,
+            0,
+            0,
+            &[
+                (IFLA_IFNAME, b"lower-media\0"),
+                (IFLA_LINK | flags, &9_u32.to_ne_bytes()),
+            ],
+        );
+        assert_eq!(
+            decoder()
+                .decode_datagram(&datagram)
+                .expect_err("flagged IFLA_LINK is ambiguous")
                 .kind(),
             LinkEventDecodeErrorKind::InvalidAttributeFlags
         );

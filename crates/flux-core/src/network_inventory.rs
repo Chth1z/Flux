@@ -252,9 +252,23 @@ impl InterfaceOperationalState {
     }
 }
 
+/// Exact semantic value of Linux `IFLA_LINK` for one interface.
+///
+/// This is a generic lower-layer or media identity, not necessarily a veth peer. The kernel can
+/// report unknown media explicitly, and an interface reference can name the containing interface
+/// itself. Interface indices are namespace-scoped, so downstream code must bind both observations
+/// to their exact network-namespace authorities, validate the `veth` link kind at both endpoints,
+/// and require reciprocal references before interpreting this value as a veth pairing.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum InterfaceLinkReference {
+    UnknownMedia,
+    Interface(InterfaceIndex),
+}
+
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct InterfaceLinkRecord {
     interface_index: InterfaceIndex,
+    link_reference: Option<InterfaceLinkReference>,
     name: InterfaceName,
     hardware_type: InterfaceHardwareType,
     flags: InterfaceLinkFlags,
@@ -274,6 +288,7 @@ impl InterfaceLinkRecord {
     ) -> Self {
         Self {
             interface_index,
+            link_reference: None,
             name,
             hardware_type,
             flags,
@@ -282,6 +297,12 @@ impl InterfaceLinkRecord {
             carrier: None,
             kind: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_link_reference(mut self, reference: InterfaceLinkReference) -> Self {
+        self.link_reference = Some(reference);
+        self
     }
 
     #[must_use]
@@ -311,6 +332,16 @@ impl InterfaceLinkRecord {
     #[must_use]
     pub const fn interface_index(&self) -> InterfaceIndex {
         self.interface_index
+    }
+
+    /// Returns the generic `IFLA_LINK` lower/media identity when the attribute was present.
+    ///
+    /// Explicit unknown media and self-reference are valid observations. Callers must bind both
+    /// namespace-scoped observations to their exact authorities, validate the `veth` link kind at
+    /// both endpoints, and require reciprocal references before treating this value as a veth peer.
+    #[must_use]
+    pub const fn link_reference(&self) -> Option<InterfaceLinkReference> {
+        self.link_reference
     }
 
     #[must_use]

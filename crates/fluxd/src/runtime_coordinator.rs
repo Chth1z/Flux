@@ -9012,6 +9012,52 @@ mod tests {
                 .expect("the coordinator retains final selector-retirement authority");
         assert!(retired.matches_request(&request));
 
+        let mismatch_after =
+            CanaryCounterReadback::new(19, 23, 0, started_at + Duration::from_millis(8));
+        let mut mismatch_writer = ObservationWriter {
+            request: request.clone(),
+            counter_readbacks: VecDeque::from([before, mismatch_after]),
+            counter_retirement: None,
+        };
+        let mut mismatch_session = CanarySelectorSession::reserved_with_peer_network_namespace(
+            &request,
+            tempfile::tempfile().expect("mismatched-authority peer namespace fixture"),
+        );
+        {
+            let mut mismatch = BorrowedCanaryAttempt {
+                writer: &mut mismatch_writer,
+                generation: &generation,
+                session: &mut mismatch_session,
+                phase: CanaryAttemptObservationPhase::RouteControls {
+                    ipv4: false,
+                    ipv6: false,
+                },
+            };
+            mismatch
+                .observe_negative_route_control(CanaryFlowAddressFamily::Ipv4)
+                .expect("observe route before testing client-reap substitution");
+            mismatch
+                .observe_baseline_counters()
+                .expect("observe baseline before testing client-reap substitution");
+            drop(
+                mismatch
+                    .take_peer_network_namespace()
+                    .expect("handoff namespace before testing client-reap substitution"),
+            );
+            let alternate = FunctionalCanaryFixture::new(CanaryAddressFamilies::Ipv4AndIpv6);
+            let error = mismatch
+                .observe_final_counters(ClientReapedCanaryAttemptAuthority::fixture(
+                    alternate.request(),
+                ))
+                .expect_err("another request's client reap cannot authorize final counters");
+            assert!(error.diagnostic().contains("immutable canary request"));
+        }
+        assert_eq!(
+            mismatch_writer.counter_readbacks,
+            VecDeque::from([mismatch_after]),
+            "request substitution must reject before consuming the final writer readback"
+        );
+
         let mut poisoned_writer = ObservationWriter {
             request: request.clone(),
             counter_readbacks: VecDeque::new(),

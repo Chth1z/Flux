@@ -17,8 +17,10 @@ use crate::netlink::{
 
 use super::{
     InetDiagCookie, InetSocketAddressFamily, InetSocketDiagnostic, InetSocketDump,
-    InetSocketProtocol, ProcessSocketDiagnostics, ProcessSocketFd, SocketDiagnosticsError,
-    SocketDiagnosticsProcessIdentity, TARGETED_LISTENER_DUMP_COUNT, TCP_CLOSE,
+    InetSocketProtocol, ListenerConflictDump, ListenerConflictSnapshot, ListenerConflictTarget,
+    MAX_LISTENER_CONFLICT_TARGETS, ProcessSocketDiagnostics, ProcessSocketFd,
+    SocketDiagnosticsError, SocketDiagnosticsProcessIdentity, TARGETED_LISTENER_DUMP_COUNT,
+    TCP_CLOSE, TCP_LISTEN,
 };
 
 const SOCK_DIAG_BY_FAMILY: u16 = 20;
@@ -98,12 +100,13 @@ impl DumpSpec {
     }
 }
 
-/// One targeted UDP listener transaction. The kernel's `inet_diag_req_v2`
-/// source-port selector keeps unconnected UDP collection bounded to the
-/// configured listener rather than collecting every `TCP_CLOSE` socket.
+/// One source-port-targeted listener transaction. The kernel's
+/// `inet_diag_req_v2` selector keeps collection bounded to the requested TCP
+/// `LISTEN` or unconnected UDP `CLOSE` socket set.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct ListenerDumpSpec {
     pub(super) address_family: InetSocketAddressFamily,
+    pub(super) protocol: InetSocketProtocol,
     pub(super) source_port: NonZeroU16,
 }
 
@@ -112,7 +115,10 @@ impl ListenerDumpSpec {
         [InetSocketAddressFamily::Ipv4, InetSocketAddressFamily::Ipv6];
 
     const fn states(self) -> u32 {
-        1_u32 << TCP_CLOSE
+        match self.protocol {
+            InetSocketProtocol::Tcp => 1_u32 << TCP_LISTEN,
+            InetSocketProtocol::Udp => 1_u32 << TCP_CLOSE,
+        }
     }
 
     const fn family_number(self) -> u8 {
@@ -123,7 +129,10 @@ impl ListenerDumpSpec {
     }
 
     const fn protocol_number(self) -> u8 {
-        libc::IPPROTO_UDP as u8
+        match self.protocol {
+            InetSocketProtocol::Tcp => libc::IPPROTO_TCP as u8,
+            InetSocketProtocol::Udp => libc::IPPROTO_UDP as u8,
+        }
     }
 }
 
@@ -222,6 +231,7 @@ impl SystemSocketDiagnosticsSession {
             {
                 let spec = ListenerDumpSpec {
                     address_family,
+                    protocol: InetSocketProtocol::Udp,
                     source_port: listener_port,
                 };
                 let decoded = self.socket.dump_listener(spec, sequence, deadline)?;
@@ -255,6 +265,83 @@ impl SystemSocketDiagnosticsSession {
         };
         Ok((self, snapshot))
     }
+
+    pub(super) fn collect_listener_conflicts_until(
+        mut self,
+        targets: &[ListenerConflictTarget],
+        deadline: Instant,
+    ) -> Result<(Self, ListenerConflictSnapshot), SocketDiagnosticsError> {
+        validate_listener_conflict_targets(targets)?;
+        let deadline = bounded_session_deadline(self.deadline, deadline);
+        let started_at = deadline_checkpoint(deadline)?;
+        let sequences = self.sequences.reserve_listener_conflicts(targets.len())?;
+        let mut conflicts = Vec::new();
+        let mut dumps = Vec::with_capacity(targets.len());
+        let mut snapshot_bytes = 0_usize;
+
+        for (target, sequence) in targets.iter().copied().zip(sequences) {
+            let spec = ListenerDumpSpec {
+                address_family: target.address_family(),
+                protocol: target.protocol(),
+                source_port: target.source_port(),
+            };
+            let decoded = self.socket.dump_listener(spec, sequence, deadline)?;
+            let completed = append_completed_dump(
+                decoded,
+                sequence,
+                target.address_family(),
+                target.protocol(),
+                "collect listener-conflict snapshot",
+                &mut snapshot_bytes,
+                &mut conflicts,
+            )?;
+            dumps.push(ListenerConflictDump {
+                sequence,
+                target,
+                started_at: completed.started_at(),
+                completed_at: completed.completed_at(),
+            });
+        }
+
+        let completed_at = deadline_checkpoint(deadline)?;
+        let snapshot = ListenerConflictSnapshot {
+            netlink_port_id: self.socket.port_id,
+            started_at,
+            completed_at,
+            dumps: dumps.into_boxed_slice(),
+            conflicts: conflicts.into_boxed_slice(),
+        };
+        debug_assert!(snapshot.dumps_complete());
+        Ok((self, snapshot))
+    }
+}
+
+pub(super) fn validate_listener_conflict_targets(
+    targets: &[ListenerConflictTarget],
+) -> Result<(), SocketDiagnosticsError> {
+    if targets.is_empty() {
+        return Err(SocketDiagnosticsError::InvalidRequest {
+            operation: "validate listener-conflict targets",
+            detail: "target set is empty",
+        });
+    }
+    if targets.len() > MAX_LISTENER_CONFLICT_TARGETS {
+        return Err(SocketDiagnosticsError::CollectionLimitExceeded {
+            operation: "validate listener-conflict targets",
+            limit: MAX_LISTENER_CONFLICT_TARGETS,
+        });
+    }
+    if targets
+        .iter()
+        .enumerate()
+        .any(|(index, target)| targets[..index].contains(target))
+    {
+        return Err(SocketDiagnosticsError::InvalidRequest {
+            operation: "validate listener-conflict targets",
+            detail: "target set contains a duplicate tuple",
+        });
+    }
+    Ok(())
 }
 
 fn append_completed_dump(
@@ -318,6 +405,36 @@ impl DumpSequenceState {
         &mut self,
     ) -> Result<[NonZeroU32; TARGETED_LISTENER_DUMP_COUNT], SocketDiagnosticsError> {
         self.reserve::<TARGETED_LISTENER_DUMP_COUNT>()
+    }
+
+    pub(super) fn reserve_listener_conflicts(
+        &mut self,
+        count: usize,
+    ) -> Result<Vec<NonZeroU32>, SocketDiagnosticsError> {
+        if count == 0 {
+            return Err(SocketDiagnosticsError::InvalidRequest {
+                operation: "reserve listener-conflict sequences",
+                detail: "target count is zero",
+            });
+        }
+        if count > MAX_LISTENER_CONFLICT_TARGETS {
+            return Err(SocketDiagnosticsError::CollectionLimitExceeded {
+                operation: "reserve listener-conflict sequences",
+                limit: MAX_LISTENER_CONFLICT_TARGETS,
+            });
+        }
+        let Some(first) = self.next else {
+            return Err(sequence_limit_error());
+        };
+        let offset = u32::try_from(count - 1).expect("listener-conflict target count fits u32");
+        let Some(last) = first.get().checked_add(offset) else {
+            self.next = None;
+            return Err(sequence_limit_error());
+        };
+        self.next = last.checked_add(1).and_then(NonZeroU32::new);
+        Ok((first.get()..=last)
+            .map(|sequence| NonZeroU32::new(sequence).expect("reserved sequence is nonzero"))
+            .collect())
     }
 
     fn reserve<const COUNT: usize>(
@@ -963,7 +1080,7 @@ impl DumpDecoder {
         Self::new_with_filter(
             DumpSpec {
                 address_family: spec.address_family,
-                protocol: InetSocketProtocol::Udp,
+                protocol: spec.protocol,
             },
             sequence,
             port_id,

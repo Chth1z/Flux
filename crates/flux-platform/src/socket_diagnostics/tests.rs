@@ -12,7 +12,7 @@ use super::implementation::{
     DumpDecoder, DumpSequenceState, DumpSpec, ListenerDumpSpec, RawNetlinkSocketAddress,
     bounded_session_deadline, encode_dump_request, encode_listener_dump_request, parse_fd_name,
     parse_proc_stat, parse_socket_symlink_target, require_stable_socket_fds,
-    validate_kernel_sender,
+    validate_kernel_sender, validate_listener_conflict_targets,
 };
 use super::*;
 
@@ -67,31 +67,46 @@ fn dump_requests_are_exact_and_connected_udp_is_state_filtered() {
 }
 
 #[test]
-fn listener_dump_request_filters_udp_close_by_source_port() {
-    let spec = ListenerDumpSpec {
+fn listener_dump_requests_filter_tcp_listen_and_udp_close_by_big_endian_source_port() {
+    let udp = ListenerDumpSpec {
         address_family: InetSocketAddressFamily::Ipv6,
+        protocol: InetSocketProtocol::Udp,
         source_port: NonZeroU16::new(15_361).unwrap(),
     };
+    let tcp = ListenerDumpSpec {
+        address_family: InetSocketAddressFamily::Ipv4,
+        protocol: InetSocketProtocol::Tcp,
+        source_port: NonZeroU16::new(0x1234).unwrap(),
+    };
     let sequence = NonZeroU32::new(19).unwrap();
-    let request = encode_listener_dump_request(spec, sequence);
+    let udp_request = encode_listener_dump_request(udp, sequence);
+    let tcp_request = encode_listener_dump_request(tcp, sequence);
 
-    assert_eq!(request[16], libc::AF_INET6 as u8);
-    assert_eq!(request[17], libc::IPPROTO_UDP as u8);
+    assert_eq!(udp_request[16], libc::AF_INET6 as u8);
+    assert_eq!(udp_request[17], libc::IPPROTO_UDP as u8);
     assert_eq!(
-        u32::from_ne_bytes(request[20..24].try_into().unwrap()),
+        u32::from_ne_bytes(udp_request[20..24].try_into().unwrap()),
         1_u32 << 7
     );
     assert_eq!(
-        u16::from_be_bytes(request[24..26].try_into().unwrap()),
+        u16::from_be_bytes(udp_request[24..26].try_into().unwrap()),
         15_361
     );
-    assert!(request[26..].iter().all(|byte| *byte == 0));
+    assert!(udp_request[26..].iter().all(|byte| *byte == 0));
+    assert_eq!(tcp_request[16], libc::AF_INET as u8);
+    assert_eq!(tcp_request[17], libc::IPPROTO_TCP as u8);
+    assert_eq!(
+        u32::from_ne_bytes(tcp_request[20..24].try_into().unwrap()),
+        1_u32 << 10
+    );
+    assert_eq!(&tcp_request[24..26], &[0x12, 0x34]);
 }
 
 #[test]
 fn listener_decoder_exposes_transparency_and_ipv6_only_state() {
     let spec = ListenerDumpSpec {
         address_family: InetSocketAddressFamily::Ipv6,
+        protocol: InetSocketProtocol::Udp,
         source_port: NonZeroU16::new(15_361).unwrap(),
     };
     let mut attributes = attribute(11, &[1]);
@@ -132,6 +147,153 @@ fn listener_decoder_exposes_transparency_and_ipv6_only_state() {
     assert_eq!(record.state(), 7);
     assert_eq!(record.transparent(), Some(true));
     assert_eq!(record.ipv6_only(), Some(true));
+}
+
+#[test]
+fn listener_conflict_decoder_accepts_zero_row_done_and_synthetic_ipv6() {
+    let spec = ListenerDumpSpec {
+        address_family: InetSocketAddressFamily::Ipv6,
+        protocol: InetSocketProtocol::Tcp,
+        source_port: NonZeroU16::new(15_361).unwrap(),
+    };
+    let sequence = NonZeroU32::new(3).unwrap();
+    let port_id = NonZeroU32::new(44).unwrap();
+    let now = Instant::now();
+    let mut empty = DumpDecoder::new_listener(spec, sequence, port_id);
+    empty
+        .decode_datagram(&netlink_message(NLMSG_DONE, NLM_F_MULTI, 3, 44, &[]))
+        .unwrap();
+    assert!(empty.finish(now, now).unwrap().sockets.is_empty());
+
+    let dump_spec = DumpSpec {
+        address_family: InetSocketAddressFamily::Ipv6,
+        protocol: InetSocketProtocol::Tcp,
+    };
+    let payload = diagnostic_payload(
+        dump_spec,
+        10,
+        "[2001:db8::1]:15361".parse().unwrap(),
+        "[::]:0".parse().unwrap(),
+        0,
+        [4, 5],
+        1000,
+        77,
+        &attribute(10, &[libc::IPPROTO_TCP as u8]),
+    );
+    let mut decoder = DumpDecoder::new_listener(spec, sequence, port_id);
+    decoder
+        .decode_datagram(&netlink_message(
+            SOCK_DIAG_BY_FAMILY,
+            NLM_F_MULTI,
+            3,
+            44,
+            &payload,
+        ))
+        .unwrap();
+    decoder
+        .decode_datagram(&netlink_message(NLMSG_DONE, NLM_F_MULTI, 3, 44, &[]))
+        .unwrap();
+    let record = decoder.finish(now, now).unwrap().sockets[0];
+    assert_eq!(record.address_family(), InetSocketAddressFamily::Ipv6);
+    assert_eq!(record.protocol(), InetSocketProtocol::Tcp);
+    assert_eq!(record.state(), 10);
+    assert_eq!(
+        record.local_address(),
+        "[2001:db8::1]:15361".parse().unwrap()
+    );
+}
+
+#[test]
+fn listener_conflict_decoder_rejects_substituted_transaction_and_row_fields() {
+    let spec = ListenerDumpSpec {
+        address_family: InetSocketAddressFamily::Ipv6,
+        protocol: InetSocketProtocol::Tcp,
+        source_port: NonZeroU16::new(15_361).unwrap(),
+    };
+    let expected = DumpSpec {
+        address_family: InetSocketAddressFamily::Ipv6,
+        protocol: InetSocketProtocol::Tcp,
+    };
+    let payload = |dump_spec, state, local: SocketAddr, attributes: &[u8]| {
+        diagnostic_payload(
+            dump_spec,
+            state,
+            local,
+            "[::]:0".parse().unwrap(),
+            0,
+            [7, 8],
+            1000,
+            88,
+            attributes,
+        )
+    };
+    let wrong_family = payload(
+        DumpSpec {
+            address_family: InetSocketAddressFamily::Ipv4,
+            protocol: InetSocketProtocol::Tcp,
+        },
+        10,
+        "127.0.0.1:15361".parse().unwrap(),
+        &[],
+    );
+    let wrong_state = payload(expected, 1, "[::1]:15361".parse().unwrap(), &[]);
+    let wrong_port = payload(expected, 10, "[::1]:15362".parse().unwrap(), &[]);
+    let wrong_protocol = payload(
+        expected,
+        10,
+        "[::1]:15361".parse().unwrap(),
+        &attribute(10, &[libc::IPPROTO_UDP as u8]),
+    );
+    for datagram in [
+        netlink_message(SOCK_DIAG_BY_FAMILY, NLM_F_MULTI, 3, 44, &wrong_family),
+        netlink_message(SOCK_DIAG_BY_FAMILY, NLM_F_MULTI, 3, 44, &wrong_state),
+        netlink_message(SOCK_DIAG_BY_FAMILY, NLM_F_MULTI, 3, 44, &wrong_port),
+        netlink_message(SOCK_DIAG_BY_FAMILY, NLM_F_MULTI, 3, 44, &wrong_protocol),
+        netlink_message(SOCK_DIAG_BY_FAMILY, NLM_F_MULTI, 4, 44, &wrong_state),
+        netlink_message(SOCK_DIAG_BY_FAMILY, NLM_F_MULTI, 3, 45, &wrong_state),
+    ] {
+        assert_eq!(
+            DumpDecoder::new_listener(
+                spec,
+                NonZeroU32::new(3).unwrap(),
+                NonZeroU32::new(44).unwrap(),
+            )
+            .decode_datagram(&datagram)
+            .unwrap_err()
+            .kind(),
+            SocketDiagnosticsErrorKind::NetlinkProtocol
+        );
+    }
+
+    let now = Instant::now();
+    assert!(
+        DumpDecoder::new_listener(
+            spec,
+            NonZeroU32::new(3).unwrap(),
+            NonZeroU32::new(44).unwrap(),
+        )
+        .finish(now, now)
+        .is_err()
+    );
+    let mut after_done = DumpDecoder::new_listener(
+        spec,
+        NonZeroU32::new(3).unwrap(),
+        NonZeroU32::new(44).unwrap(),
+    );
+    after_done
+        .decode_datagram(&netlink_message(NLMSG_DONE, NLM_F_MULTI, 3, 44, &[]))
+        .unwrap();
+    assert!(
+        after_done
+            .decode_datagram(&netlink_message(
+                SOCK_DIAG_BY_FAMILY,
+                NLM_F_MULTI,
+                3,
+                44,
+                &payload(expected, 10, "[::1]:15361".parse().unwrap(), &[]),
+            ))
+            .is_err()
+    );
 }
 
 #[test]
@@ -866,6 +1028,127 @@ fn session_sequences_are_monotonic_nonzero_and_never_wrap() {
 }
 
 #[test]
+fn listener_conflict_targets_are_bounded_ordered_and_unique() {
+    let target = ListenerConflictTarget::new(
+        InetSocketAddressFamily::Ipv4,
+        InetSocketProtocol::Tcp,
+        NonZeroU16::new(15_361).unwrap(),
+    );
+    assert_eq!(
+        validate_listener_conflict_targets(&[]).unwrap_err().kind(),
+        SocketDiagnosticsErrorKind::InvalidRequest
+    );
+    assert_eq!(
+        validate_listener_conflict_targets(&[target, target])
+            .unwrap_err()
+            .kind(),
+        SocketDiagnosticsErrorKind::InvalidRequest
+    );
+
+    let too_many = (0..=MAX_LISTENER_CONFLICT_TARGETS)
+        .map(|offset| {
+            ListenerConflictTarget::new(
+                InetSocketAddressFamily::Ipv4,
+                InetSocketProtocol::Udp,
+                NonZeroU16::new(20_000 + u16::try_from(offset).unwrap()).unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        validate_listener_conflict_targets(&too_many)
+            .unwrap_err()
+            .kind(),
+        SocketDiagnosticsErrorKind::CollectionLimitExceeded
+    );
+
+    let ordered = [
+        target,
+        ListenerConflictTarget::new(
+            InetSocketAddressFamily::Ipv4,
+            InetSocketProtocol::Udp,
+            target.source_port(),
+        ),
+        ListenerConflictTarget::new(
+            InetSocketAddressFamily::Ipv6,
+            InetSocketProtocol::Tcp,
+            target.source_port(),
+        ),
+    ];
+    validate_listener_conflict_targets(&ordered).unwrap();
+    assert_eq!(
+        ordered.map(ListenerConflictTarget::protocol),
+        [
+            InetSocketProtocol::Tcp,
+            InetSocketProtocol::Udp,
+            InetSocketProtocol::Tcp,
+        ]
+    );
+}
+
+#[test]
+fn listener_conflict_sequence_reservation_is_dynamic_contiguous_and_exhausting() {
+    let mut ordinary = DumpSequenceState::starting_at(NonZeroU32::new(1).unwrap());
+    assert_eq!(
+        ordinary.reserve_listener_conflicts(0).unwrap_err().kind(),
+        SocketDiagnosticsErrorKind::InvalidRequest
+    );
+    assert_eq!(
+        ordinary
+            .reserve_listener_conflicts(MAX_LISTENER_CONFLICT_TARGETS + 1)
+            .unwrap_err()
+            .kind(),
+        SocketDiagnosticsErrorKind::CollectionLimitExceeded
+    );
+    assert_eq!(
+        ordinary
+            .reserve_listener_conflicts(3)
+            .unwrap()
+            .into_iter()
+            .map(NonZeroU32::get)
+            .collect::<Vec<_>>(),
+        [1, 2, 3]
+    );
+    assert_eq!(
+        ordinary.reserve_snapshot().unwrap().map(NonZeroU32::get),
+        [4, 5, 6, 7]
+    );
+
+    let mut final_complete = DumpSequenceState::starting_at(NonZeroU32::new(u32::MAX - 2).unwrap());
+    assert_eq!(
+        final_complete
+            .reserve_listener_conflicts(3)
+            .unwrap()
+            .into_iter()
+            .map(NonZeroU32::get)
+            .collect::<Vec<_>>(),
+        [u32::MAX - 2, u32::MAX - 1, u32::MAX]
+    );
+    assert_eq!(
+        final_complete
+            .reserve_listener_conflicts(1)
+            .unwrap_err()
+            .kind(),
+        SocketDiagnosticsErrorKind::CollectionLimitExceeded
+    );
+
+    let mut insufficient = DumpSequenceState::starting_at(NonZeroU32::new(u32::MAX - 1).unwrap());
+    assert_eq!(
+        insufficient
+            .reserve_listener_conflicts(3)
+            .unwrap_err()
+            .kind(),
+        SocketDiagnosticsErrorKind::CollectionLimitExceeded
+    );
+    assert_eq!(
+        insufficient
+            .reserve_listener_conflicts(1)
+            .unwrap_err()
+            .kind(),
+        SocketDiagnosticsErrorKind::CollectionLimitExceeded
+    );
+}
+
+#[test]
 fn later_collection_deadline_cannot_extend_the_session_ceiling() {
     let opened = Instant::now();
     let hard = opened + Duration::from_secs(3);
@@ -1066,6 +1349,101 @@ fn live_same_process_tcp_and_connected_udp_are_exactly_correlated() {
     assert_eq!(proc_fd_count(), fd_count_before_session);
 
     drop((tcp_server, tcp_client, tcp_listener, udp_left, udp_right));
+}
+
+#[test]
+fn live_listener_conflicts_reobserve_empty_through_retained_session() {
+    const CHILD_MODE: &str = "FLUX_LISTENER_CONFLICT_LIVE_CHILD";
+    const CHILD_TOKEN: &str = "listener-conflict-live-v1";
+    const CHILD_PARENT: &str = "FLUX_LISTENER_CONFLICT_LIVE_PARENT";
+    // SAFETY: `getppid` has no pointer arguments or preconditions.
+    let parent_pid = unsafe { libc::getppid() };
+    let is_isolated_child = std::env::var_os(CHILD_MODE).as_deref()
+        == Some(OsStr::new(CHILD_TOKEN))
+        && std::env::var(CHILD_PARENT)
+            .ok()
+            .and_then(|value| value.parse::<libc::pid_t>().ok())
+            == Some(parent_pid);
+    if !is_isolated_child {
+        // SAFETY: `getpid` has no pointer arguments or preconditions.
+        let process_id = unsafe { libc::getpid() };
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(
+                "socket_diagnostics::tests::live_listener_conflicts_reobserve_empty_through_retained_session",
+            )
+            .arg("--test-threads=1")
+            .env_clear()
+            .env(CHILD_MODE, CHILD_TOKEN)
+            .env(CHILD_PARENT, process_id.to_string())
+            .status()
+            .unwrap();
+        assert!(status.success(), "isolated listener-conflict smoke failed");
+        return;
+    }
+
+    let tcp_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = NonZeroU16::new(tcp_listener.local_addr().unwrap().port()).unwrap();
+    let udp_listener = UdpSocket::bind((Ipv4Addr::LOCALHOST, port.get())).unwrap();
+    let unrelated = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let unrelated_port = unrelated.local_addr().unwrap().port();
+    assert_ne!(unrelated_port, port.get());
+
+    let targets = [
+        ListenerConflictTarget::new(InetSocketAddressFamily::Ipv4, InetSocketProtocol::Tcp, port),
+        ListenerConflictTarget::new(InetSocketAddressFamily::Ipv4, InetSocketProtocol::Udp, port),
+    ];
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let session = SystemSocketDiagnosticsSource.open_until(deadline).unwrap();
+    let port_id = session.netlink_port_id();
+    let (session, conflicts) = session
+        .collect_listener_conflicts_until(&targets, deadline)
+        .unwrap();
+    assert_eq!(conflicts.netlink_port_id(), port_id);
+    assert!(conflicts.dumps_complete());
+    assert_eq!(
+        conflicts
+            .dumps()
+            .iter()
+            .map(|dump| (dump.sequence().get(), dump.target()))
+            .collect::<Vec<_>>(),
+        vec![(1, targets[0]), (2, targets[1])]
+    );
+    assert_eq!(conflicts.conflicts().len(), targets.len());
+    assert!(conflicts.conflicts().iter().all(|diagnostic| {
+        diagnostic.local_address().port() == port.get()
+            && diagnostic.local_address().port() != unrelated_port
+    }));
+    for (target, state) in targets.into_iter().zip([10, 7]) {
+        let matches = conflicts
+            .conflicts()
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.address_family() == target.address_family()
+                    && diagnostic.protocol() == target.protocol()
+                    && diagnostic.state() == state
+                    && diagnostic.local_address().port() == target.source_port().get()
+            })
+            .count();
+        assert_eq!(matches, 1);
+    }
+
+    drop((tcp_listener, udp_listener));
+    let (session, empty) = session
+        .collect_listener_conflicts_until(&targets, deadline)
+        .unwrap();
+    assert_eq!(empty.netlink_port_id(), port_id);
+    assert!(empty.dumps_complete());
+    assert_eq!(
+        empty
+            .dumps()
+            .iter()
+            .map(|dump| dump.sequence().get())
+            .collect::<Vec<_>>(),
+        [3, 4]
+    );
+    assert!(empty.conflicts().is_empty());
+    drop((session, unrelated));
 }
 
 fn proc_fd_count() -> usize {

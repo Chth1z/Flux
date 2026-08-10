@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 const TARGETED_LISTENER_DUMP_COUNT: usize = 2;
+const MAX_LISTENER_CONFLICT_TARGETS: usize = 8;
 const TCP_CLOSE: u8 = 7;
 const TCP_LISTEN: u8 = 10;
 
@@ -56,6 +57,55 @@ pub enum InetSocketAddressFamily {
 pub enum InetSocketProtocol {
     Tcp,
     Udp,
+}
+
+/// One namespace-wide listener tuple selected for conflict observation.
+///
+/// TCP targets select `LISTEN`; UDP targets select the unconnected `CLOSE`
+/// state. The source port remains part of the kernel request, so unrelated
+/// listeners are not returned by a successful dump.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ListenerConflictTarget {
+    address_family: InetSocketAddressFamily,
+    protocol: InetSocketProtocol,
+    source_port: NonZeroU16,
+}
+
+impl ListenerConflictTarget {
+    #[must_use]
+    pub const fn new(
+        address_family: InetSocketAddressFamily,
+        protocol: InetSocketProtocol,
+        source_port: NonZeroU16,
+    ) -> Self {
+        Self {
+            address_family,
+            protocol,
+            source_port,
+        }
+    }
+
+    #[must_use]
+    pub const fn address_family(self) -> InetSocketAddressFamily {
+        self.address_family
+    }
+
+    #[must_use]
+    pub const fn protocol(self) -> InetSocketProtocol {
+        self.protocol
+    }
+
+    #[must_use]
+    pub const fn source_port(self) -> NonZeroU16 {
+        self.source_port
+    }
+
+    const fn expected_state(self) -> u8 {
+        match self.protocol {
+            InetSocketProtocol::Tcp => TCP_LISTEN,
+            InetSocketProtocol::Udp => TCP_CLOSE,
+        }
+    }
 }
 
 /// Kernel-assigned INET_DIAG socket cookie.
@@ -217,6 +267,111 @@ impl InetSocketDump {
     #[must_use]
     pub const fn completed_at(self) -> Instant {
         self.completed_at
+    }
+}
+
+/// One completed namespace listener-conflict transaction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ListenerConflictDump {
+    sequence: NonZeroU32,
+    target: ListenerConflictTarget,
+    started_at: Instant,
+    completed_at: Instant,
+}
+
+impl ListenerConflictDump {
+    #[must_use]
+    pub const fn sequence(self) -> NonZeroU32 {
+        self.sequence
+    }
+
+    #[must_use]
+    pub const fn target(self) -> ListenerConflictTarget {
+        self.target
+    }
+
+    #[must_use]
+    pub const fn started_at(self) -> Instant {
+        self.started_at
+    }
+
+    #[must_use]
+    pub const fn completed_at(self) -> Instant {
+        self.completed_at
+    }
+}
+
+/// Complete bounded listener-conflict observation in the retained session's
+/// network namespace.
+///
+/// Every returned diagnostic row is a conflict. An empty `conflicts()` slice
+/// is successful negative evidence only because construction requires every
+/// ordered dump to terminate with a valid `NLMSG_DONE`. Targets are queried
+/// sequentially across the recorded interval; this is not an atomic or
+/// simultaneous namespace snapshot. Empty results prove absence only for the
+/// exact requested listener states and ports, not total immediate bindability.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ListenerConflictSnapshot {
+    netlink_port_id: NonZeroU32,
+    started_at: Instant,
+    completed_at: Instant,
+    dumps: Box<[ListenerConflictDump]>,
+    conflicts: Box<[InetSocketDiagnostic]>,
+}
+
+impl ListenerConflictSnapshot {
+    #[must_use]
+    pub const fn netlink_port_id(&self) -> NonZeroU32 {
+        self.netlink_port_id
+    }
+
+    #[must_use]
+    pub const fn started_at(&self) -> Instant {
+        self.started_at
+    }
+
+    #[must_use]
+    pub const fn completed_at(&self) -> Instant {
+        self.completed_at
+    }
+
+    #[must_use]
+    pub fn dumps(&self) -> &[ListenerConflictDump] {
+        &self.dumps
+    }
+
+    #[must_use]
+    pub fn conflicts(&self) -> &[InetSocketDiagnostic] {
+        &self.conflicts
+    }
+
+    /// Whether the snapshot retains the exact bounded ordered transaction.
+    #[must_use]
+    pub fn dumps_complete(&self) -> bool {
+        !self.dumps.is_empty()
+            && self.dumps.len() <= MAX_LISTENER_CONFLICT_TARGETS
+            && self
+                .dumps
+                .windows(2)
+                .all(|pair| pair[0].sequence.get().checked_add(1) == Some(pair[1].sequence.get()))
+            && self.dumps.iter().enumerate().all(|(index, dump)| {
+                self.dumps[..index]
+                    .iter()
+                    .all(|prior| prior.target != dump.target)
+                    && dump.started_at >= self.started_at
+                    && dump.completed_at >= dump.started_at
+                    && dump.completed_at <= self.completed_at
+            })
+            && self.conflicts.iter().all(|conflict| {
+                let mut dumps = self.dumps.iter().filter(|dump| {
+                    dump.sequence == conflict.dump_sequence
+                        && dump.target.address_family == conflict.address_family
+                        && dump.target.protocol == conflict.protocol
+                        && dump.target.source_port.get() == conflict.local_address.port()
+                        && dump.target.expected_state() == conflict.state
+                });
+                dumps.next().is_some() && dumps.next().is_none()
+            })
     }
 }
 
@@ -658,6 +813,7 @@ impl Error for ListenerSocketCorrelationError {}
 pub enum SocketDiagnosticsErrorKind {
     UnsupportedPlatform,
     DeadlineExpired,
+    InvalidRequest,
     Io,
     ProcessIdentityMismatch,
     ProcessSocketFdsChanged,
@@ -673,6 +829,10 @@ pub enum SocketDiagnosticsErrorKind {
 pub enum SocketDiagnosticsError {
     UnsupportedPlatform(&'static str),
     DeadlineExpired,
+    InvalidRequest {
+        operation: &'static str,
+        detail: &'static str,
+    },
     Io {
         operation: &'static str,
         path: Option<PathBuf>,
@@ -712,6 +872,7 @@ impl SocketDiagnosticsError {
         match self {
             Self::UnsupportedPlatform(_) => SocketDiagnosticsErrorKind::UnsupportedPlatform,
             Self::DeadlineExpired => SocketDiagnosticsErrorKind::DeadlineExpired,
+            Self::InvalidRequest { .. } => SocketDiagnosticsErrorKind::InvalidRequest,
             Self::Io { .. } => SocketDiagnosticsErrorKind::Io,
             Self::ProcessIdentityMismatch { .. } => {
                 SocketDiagnosticsErrorKind::ProcessIdentityMismatch
@@ -742,6 +903,9 @@ impl fmt::Display for SocketDiagnosticsError {
                 )
             }
             Self::DeadlineExpired => formatter.write_str("socket-diagnostic deadline expired"),
+            Self::InvalidRequest { operation, detail } => {
+                write!(formatter, "{operation}: {detail}")
+            }
             Self::Io {
                 operation,
                 path,
@@ -901,6 +1065,33 @@ impl SystemSocketDiagnosticsSession {
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
         {
             let _ = (expected, listener_port, deadline);
+            match self._unsupported {}
+        }
+    }
+
+    /// Observe a bounded ordered set of namespace-wide listener conflicts.
+    ///
+    /// The target slice must contain one through eight unique tuples. All
+    /// sequences are reserved before the first request; success returns this
+    /// same retained session and a complete result in request order. Any error
+    /// consumes the session so late datagrams cannot satisfy a later dump.
+    /// Per-target dumps are sequential and retain their individual intervals;
+    /// the result does not claim a simultaneous observation.
+    pub fn collect_listener_conflicts_until(
+        self,
+        targets: &[ListenerConflictTarget],
+        deadline: Instant,
+    ) -> Result<(Self, ListenerConflictSnapshot), SocketDiagnosticsError> {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            let (inner, snapshot) = self
+                .inner
+                .collect_listener_conflicts_until(targets, deadline)?;
+            Ok((Self { inner }, snapshot))
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            let _ = (targets, deadline);
             match self._unsupported {}
         }
     }

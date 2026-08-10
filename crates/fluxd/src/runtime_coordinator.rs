@@ -24,7 +24,8 @@ use crate::functional_canary::{
     CanaryErrorKind, CanaryFacilityIdentity, CanaryFlow, CanaryFlowAddressFamily, CanaryNonce,
     ClientReapedCanaryAttemptAuthority, FunctionalCanaryDisposition, FunctionalCanaryError,
     FunctionalCanaryGateMode, InstalledSupervisedDeliveryReportProducer,
-    PreparedCanaryGenerationBinding, SupervisedDeliveryReportEngineHandoff,
+    PeerReapedCanaryAttemptAuthority, PreparedCanaryGenerationBinding,
+    RetainedCanaryFacilityReadback, SupervisedDeliveryReportEngineHandoff,
     SupervisedDeliveryReportHandoffError, UnqualifiedCanaryCounterEvidence,
     UnqualifiedCanaryNegativeRouteControl, UnqualifiedFunctionalCanaryExecution,
     UnqualifiedFunctionalCanaryExecutor,
@@ -401,6 +402,15 @@ pub(crate) trait CanaryAttemptObservationAuthority {
     ) -> Result<CanaryAttemptObjectRetirementEvidence, FunctionalCanaryError> {
         Err(canary_attempt_authority_unavailable("counter retirement"))
     }
+
+    fn reobserve_retained_facility(
+        &mut self,
+        _peer_reaped: &PeerReapedCanaryAttemptAuthority,
+    ) -> Result<RetainedCanaryFacilityReadback, FunctionalCanaryError> {
+        Err(canary_attempt_authority_unavailable(
+            "retained facility reobservation",
+        ))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -487,6 +497,7 @@ enum CanaryAttemptObservationPhase {
     TrafficInProgress(CanaryCounterReadback),
     FinalObserved,
     CountersRetired,
+    FacilityReobserved,
     Poisoned,
 }
 
@@ -679,6 +690,42 @@ where
             retirement.absent_observed_at,
         ))
     }
+
+    fn reobserve_retained_facility(
+        &mut self,
+        peer_reaped: &PeerReapedCanaryAttemptAuthority,
+    ) -> Result<RetainedCanaryFacilityReadback, FunctionalCanaryError> {
+        let phase = std::mem::replace(&mut self.phase, CanaryAttemptObservationPhase::Poisoned);
+        if phase != CanaryAttemptObservationPhase::CountersRetired {
+            return Err(canary_attempt_phase_error(
+                "retained facility reobservation requires counter retirement and exact peer reap",
+            ));
+        }
+        if peer_reaped.request() != self.request() {
+            return Err(canary_attempt_phase_error(
+                "retained facility reobservation requires peer-reap authority for the immutable canary request",
+            ));
+        }
+        let readback = self
+            .writer
+            .reobserve_retained_canary_facility(self.generation, self.session, peer_reaped)
+            .map_err(|source| {
+                canary_attempt_writer_error("reobserve retained canary facility", source)
+            })?
+            .ok_or_else(|| {
+                canary_attempt_authority_unavailable("retained facility reobservation")
+            })?;
+        if readback.facility() != self.request().pre_binding().environment().facility()
+            || readback.observed_at() <= peer_reaped.latest_peer_reaped_at()
+            || readback.observed_at() >= self.request().deadline().expires_at()
+        {
+            return Err(canary_attempt_phase_error(
+                "retained facility readback does not match the immutable facility and post-reap deadline",
+            ));
+        }
+        self.phase = CanaryAttemptObservationPhase::FacilityReobserved;
+        Ok(readback)
+    }
 }
 
 #[allow(
@@ -817,6 +864,19 @@ pub(crate) trait RuntimeWriter: Send + 'static {
         _generation: &PreparedGeneration,
         _session: &CanarySelectorSession,
     ) -> Result<Option<CanaryCounterRetirementReadback>, Self::Error> {
+        Ok(None)
+    }
+    /// Reobserve the retained facility after exact counter retirement and peer reap.
+    #[allow(
+        dead_code,
+        reason = "the packaged attempt remains uninhabited until its evidence transaction lands"
+    )]
+    fn reobserve_retained_canary_facility(
+        &mut self,
+        _generation: &PreparedGeneration,
+        _session: &CanarySelectorSession,
+        _peer_reaped: &PeerReapedCanaryAttemptAuthority,
+    ) -> Result<Option<RetainedCanaryFacilityReadback>, Self::Error> {
         Ok(None)
     }
     /// Flush, prove absence, and consume the exact reservation before post-attempt observation.
@@ -4095,7 +4155,8 @@ mod tests {
         request_with_nonce as functional_request_with_nonce,
     };
     use crate::functional_canary::{
-        CanaryAddressFamilies, CanaryCleanupStatus, CanaryErrorKind, CanaryNonce,
+        CanaryAddressFamilies, CanaryCleanupStatus, CanaryErrorKind, CanaryFacilityIdentity,
+        CanaryNonce, CanaryProcessIdentity, CanaryProcessRetirementEvidence, CanaryResponderPorts,
         CanarySocketObserverBinding, FUNCTIONAL_CANARY_NONCE_BYTES, UnqualifiedCanaryGateEvidence,
     };
     use crate::generation_engine_config::{
@@ -8736,6 +8797,7 @@ mod tests {
         request: CanaryAttemptRequest,
         counter_readbacks: VecDeque<CanaryCounterReadback>,
         counter_retirement: Option<CanaryCounterRetirementReadback>,
+        facility_readback: Option<RetainedCanaryFacilityReadback>,
     }
 
     impl RuntimeWriter for ObservationWriter {
@@ -8813,6 +8875,21 @@ mod tests {
                 self.request.pre_binding().engine().generation()
             );
             Ok(self.counter_retirement.take())
+        }
+
+        fn reobserve_retained_canary_facility(
+            &mut self,
+            generation: &PreparedGeneration,
+            session: &CanarySelectorSession,
+            peer_reaped: &PeerReapedCanaryAttemptAuthority,
+        ) -> Result<Option<RetainedCanaryFacilityReadback>, Self::Error> {
+            assert_eq!(session.request(), &self.request);
+            assert_eq!(peer_reaped.request(), &self.request);
+            assert_eq!(
+                generation.id(),
+                self.request.pre_binding().engine().generation()
+            );
+            Ok(self.facility_readback.take())
         }
 
         fn retire_canary_selector_session(
@@ -8911,10 +8988,35 @@ mod tests {
             started_at + Duration::from_millis(9),
             started_at + Duration::from_millis(10),
         );
+        let peer_reaped_authority = || {
+            let peer_retirement = |slot: u32, offset: u64| {
+                CanaryProcessRetirementEvidence::new(
+                    CanaryProcessIdentity::new(
+                        NonZeroU32::new(70_000 + slot).expect("peer PID"),
+                        NonZeroU64::new(80_000 + u64::from(slot)).expect("peer start ticks"),
+                    ),
+                    started_at + Duration::from_millis(offset),
+                    started_at + Duration::from_millis(offset + 1),
+                    started_at + Duration::from_millis(offset + 2),
+                )
+            };
+            PeerReapedCanaryAttemptAuthority::fixture(
+                &request,
+                [
+                    peer_retirement(1, 100),
+                    peer_retirement(2, 110),
+                    peer_retirement(3, 120),
+                ],
+            )
+        };
         let mut writer = ObservationWriter {
             request: request.clone(),
             counter_readbacks: VecDeque::from([before, after]),
             counter_retirement: Some(counter_retirement),
+            facility_readback: Some(RetainedCanaryFacilityReadback::fixture(
+                request.pre_binding().environment().facility(),
+                started_at + Duration::from_millis(130),
+            )),
         };
         let engine = EngineFixture::new();
         let generation = PreparedGeneration::new(
@@ -9002,6 +9104,20 @@ mod tests {
                     counter_retirement.absent_observed_at,
                 )
             );
+            let peer_reaped = peer_reaped_authority();
+            let facility = attempt
+                .reobserve_retained_facility(&peer_reaped)
+                .expect("reobserve the retained facility exactly once");
+            assert_eq!(
+                facility,
+                RetainedCanaryFacilityReadback::fixture(
+                    request.pre_binding().environment().facility(),
+                    started_at + Duration::from_millis(130),
+                )
+            );
+            attempt
+                .reobserve_retained_facility(&peer_reaped)
+                .expect_err("retained facility reobservation cannot be replayed");
             attempt
                 .retire_counters()
                 .expect_err("counter retirement cannot be replayed");
@@ -9012,12 +9128,79 @@ mod tests {
                 .expect("the coordinator retains final selector-retirement authority");
         assert!(retired.matches_request(&request));
 
+        let reject_facility_readback = |facility_readback: RetainedCanaryFacilityReadback,
+                                        case: &str| {
+            let mut writer = ObservationWriter {
+                request: request.clone(),
+                counter_readbacks: VecDeque::new(),
+                counter_retirement: None,
+                facility_readback: Some(facility_readback),
+            };
+            let mut session = CanarySelectorSession::reserved_with_peer_network_namespace(
+                &request,
+                tempfile::tempfile().expect("invalid facility readback peer namespace fixture"),
+            );
+            let error = BorrowedCanaryAttempt {
+                writer: &mut writer,
+                generation: &generation,
+                session: &mut session,
+                phase: CanaryAttemptObservationPhase::CountersRetired,
+            }
+            .reobserve_retained_facility(&peer_reaped_authority())
+            .expect_err(case);
+            assert_eq!(error.kind(), CanaryErrorKind::InvalidEvidence);
+            assert!(error.diagnostic().contains("post-reap deadline"));
+        };
+        let facility = request.pre_binding().environment().facility();
+        let ports = facility.ports();
+        let substituted_ports = CanaryResponderPorts::new(
+            NonZeroU16::new(
+                ports
+                    .tcp_echo()
+                    .get()
+                    .checked_add(10)
+                    .expect("fixture TCP port has substitution headroom"),
+            )
+            .expect("substituted TCP port is nonzero"),
+            ports.udp_echo(),
+            ports.dns(),
+        )
+        .expect("substituted facility ports remain representable and collision-free");
+        let substituted_facility = CanaryFacilityIdentity::new(
+            facility.daemon_veth(),
+            facility.peer_veth(),
+            facility.ipv4(),
+            facility.ipv6(),
+            facility.peer_veth_topology(),
+            substituted_ports,
+        )
+        .expect("substituted facility remains structurally valid");
+        reject_facility_readback(
+            RetainedCanaryFacilityReadback::fixture(
+                substituted_facility,
+                started_at + Duration::from_millis(130),
+            ),
+            "a substituted facility readback must fail closed",
+        );
+        reject_facility_readback(
+            RetainedCanaryFacilityReadback::fixture(
+                facility,
+                peer_reaped_authority().latest_peer_reaped_at(),
+            ),
+            "a readback at the latest peer reap must fail closed",
+        );
+        reject_facility_readback(
+            RetainedCanaryFacilityReadback::fixture(facility, request.deadline().expires_at()),
+            "a readback at the exclusive deadline must fail closed",
+        );
+
         let mismatch_after =
             CanaryCounterReadback::new(19, 23, 0, started_at + Duration::from_millis(8));
         let mut mismatch_writer = ObservationWriter {
             request: request.clone(),
             counter_readbacks: VecDeque::from([before, mismatch_after]),
             counter_retirement: None,
+            facility_readback: None,
         };
         let mut mismatch_session = CanarySelectorSession::reserved_with_peer_network_namespace(
             &request,
@@ -9062,6 +9245,7 @@ mod tests {
             request: request.clone(),
             counter_readbacks: VecDeque::new(),
             counter_retirement: None,
+            facility_readback: None,
         };
         let mut poisoned_session = CanarySelectorSession::reserved_with_peer_network_namespace(
             &request,

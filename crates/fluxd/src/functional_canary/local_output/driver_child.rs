@@ -23,7 +23,7 @@ use super::super::supervised_delivery_report::collector::{
 use super::super::{
     CANARY_PEER_SERVER_SLOTS, CanaryAttemptObjectRetirementEvidence, CanaryAttemptRequest,
     CanaryFlow, CanaryProcessCredentialIdentity, ClientReapedCanaryAttemptAuthority,
-    InstalledSupervisedDeliveryReportProducer,
+    InstalledSupervisedDeliveryReportProducer, PeerReapedCanaryAttemptAuthority,
 };
 use super::driver_process::DriverProcessProof;
 use super::driver_process::{
@@ -834,6 +834,32 @@ impl ReportRetiredPackagedDriverChildren {
 }
 
 impl PeerReapedPackagedDriverChildren {
+    pub(super) fn into_authority_and_parts(
+        self,
+    ) -> (
+        PeerReapedCanaryAttemptAuthority,
+        ReapedPackagedDriverChildren,
+        RetiredSupervisedDeliveryReport,
+        CanaryAttemptObjectRetirementEvidence,
+    ) {
+        let peer_servers = self
+            .children
+            .peer_servers
+            .each_ref()
+            .map(ReapedDriverChild::retirement);
+        let authority = PeerReapedCanaryAttemptAuthority::from_reaped_peers(
+            self.report.request(),
+            peer_servers,
+        );
+        (
+            authority,
+            self.children,
+            self.report,
+            self.counters_retirement,
+        )
+    }
+
+    #[cfg(test)]
     pub(super) fn into_parts(
         self,
     ) -> (

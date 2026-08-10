@@ -9,13 +9,19 @@ use std::os::unix::fs::MetadataExt;
 use std::time::{Duration, Instant};
 
 use flux_core::{AddressResyncDisposition, GenerationId, NetworkNamespaceIdentity, Reason};
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use flux_platform::socket_diagnostics::{
+    ListenerConflictSnapshot, ListenerConflictTarget, SystemSocketDiagnosticsSource,
+};
 use flux_platform::{
     NativeCaptureCanaryAttempt, NativeCaptureCanaryRouteOutcome, NativeCaptureCanaryRouteQuery,
     NativeCaptureCanarySelector, NativeCaptureConvergedState, NativeCaptureConvergence,
     NativeCaptureDesired, NativeCaptureTargetIdentity,
 };
 #[cfg(any(target_os = "linux", target_os = "android"))]
-use flux_platform::{NativeXtablesCaptureConverger, NativeXtablesCaptureTarget};
+use flux_platform::{
+    NativeXtablesCaptureConverger, NativeXtablesCaptureTarget, collect_network_inventory_once,
+};
 
 #[cfg(test)]
 use crate::EngineSpec;
@@ -24,6 +30,9 @@ use crate::EngineSupervisor;
 use crate::functional_canary::FunctionalCanaryGateMode;
 use crate::functional_canary::{
     CanaryAddressFamilies, CanaryAttemptRequest, CanaryFlow, CanaryFlowAddressFamily,
+    PeerReapedCanaryAttemptAuthority, RetainedCanaryFacilityObservation,
+    RetainedCanaryFacilityReadback, RetainedCanaryFacilityValidationError,
+    canonical_listener_conflict_targets, validate_retained_canary_facility_observation,
 };
 #[cfg(test)]
 use crate::generation_engine_config::EngineCapabilityProfileRevision;
@@ -147,6 +156,10 @@ pub(crate) struct RetainedCanaryFacilityAuthority {
     peer_network_namespace_handle: File,
 }
 
+#[allow(
+    dead_code,
+    reason = "the packaged attempt remains uninhabited until its evidence transaction lands"
+)]
 impl RetainedCanaryFacilityAuthority {
     #[allow(
         dead_code,
@@ -166,6 +179,13 @@ impl RetainedCanaryFacilityAuthority {
             peer_network_namespace,
             peer_network_namespace_handle,
         })
+    }
+
+    fn matches_request(&self, request: &CanaryAttemptRequest) -> bool {
+        let environment = request.pre_binding().environment();
+        self.facility == environment.facility()
+            && self.peer_network_namespace
+                == environment.authority().network().peer_network_namespace()
     }
 
     fn duplicate_for(
@@ -200,6 +220,262 @@ impl RetainedCanaryFacilityAuthority {
         validate_peer_network_namespace_handle(&duplicate, self.peer_network_namespace)?;
         Ok(duplicate)
     }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn reobserve_for(
+        &self,
+        request: &CanaryAttemptRequest,
+        peer_reaped: &PeerReapedCanaryAttemptAuthority,
+    ) -> Result<RetainedCanaryFacilityReadback, NativeCoordinatorWriterError> {
+        if !self.matches_request(request) || peer_reaped.request() != request {
+            return Err(NativeCoordinatorWriterError::Invariant(
+                "retained canary facility reobservation substituted its immutable request",
+            ));
+        }
+        let deadline = request.deadline().expires_at();
+        let peer_namespace_handle = self.duplicate_for(request)?;
+        let expected_network = request.pre_binding().environment().authority().network();
+        let expected_daemon_namespace = expected_network.daemon_network_namespace();
+        let expected_peer_namespace = expected_network.peer_network_namespace();
+
+        let daemon_namespace_before = current_network_namespace_identity()?;
+        if daemon_namespace_before != expected_daemon_namespace {
+            return Err(NativeCoordinatorWriterError::Invariant(
+                "retained facility observer is not in the immutable daemon network namespace",
+            ));
+        }
+        let (daemon_inventory, daemon_started_at, daemon_completed_at) =
+            collect_inventory_until(deadline)?;
+        if current_network_namespace_identity()? != expected_daemon_namespace {
+            return Err(NativeCoordinatorWriterError::Invariant(
+                "daemon network namespace changed during retained facility inventory",
+            ));
+        }
+
+        let targets = canonical_listener_conflict_targets(request);
+        let peer_observer = std::thread::Builder::new()
+            .name("flux-canary-peer-observer".to_owned())
+            .spawn(move || {
+                collect_peer_facility_observation(
+                    peer_namespace_handle,
+                    expected_peer_namespace,
+                    targets,
+                    deadline,
+                )
+            })
+            .map_err(|source| {
+                NativeCoordinatorWriterError::observation(
+                    "spawn retained peer network namespace observer",
+                    source,
+                )
+            })?;
+        let peer = peer_observer.join().map_err(|_| {
+            NativeCoordinatorWriterError::observation(
+                "join retained peer network namespace observer",
+                io::Error::other("retained peer observer panicked"),
+            )
+        })??;
+
+        let daemon_namespace_after = current_network_namespace_identity()?;
+        if daemon_namespace_after != expected_daemon_namespace {
+            return Err(NativeCoordinatorWriterError::Invariant(
+                "daemon network namespace changed across retained facility reobservation",
+            ));
+        }
+        let observation = RetainedCanaryFacilityObservation::new(
+            daemon_namespace_before,
+            daemon_namespace_after,
+            peer.namespace,
+            daemon_inventory,
+            peer.inventory,
+            daemon_started_at,
+            daemon_completed_at,
+            peer.inventory_started_at,
+            peer.inventory_completed_at,
+            &peer.listener_conflicts,
+        );
+        let validated =
+            validate_retained_canary_facility_observation(request, peer_reaped, &observation)
+                .map_err(|source| {
+                    NativeCoordinatorWriterError::observation(
+                        "validate retained canary facility observation",
+                        source,
+                    )
+                })?;
+        let observed_at = Instant::now();
+        if observed_at >= deadline {
+            return Err(NativeCoordinatorWriterError::observation(
+                "finalize retained canary facility observation",
+                RetainedCanaryFacilityValidationError::InvalidObservationChronology,
+            ));
+        }
+        validated.finalize_at(observed_at).map_err(|source| {
+            NativeCoordinatorWriterError::observation(
+                "finalize retained canary facility observation",
+                source,
+            )
+        })
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    fn reobserve_for(
+        &self,
+        _request: &CanaryAttemptRequest,
+        _peer_reaped: &PeerReapedCanaryAttemptAuthority,
+    ) -> Result<RetainedCanaryFacilityReadback, NativeCoordinatorWriterError> {
+        Err(NativeCoordinatorWriterError::Invariant(
+            "retained canary facility reobservation requires Linux or Android",
+        ))
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[allow(
+    dead_code,
+    reason = "the packaged attempt remains uninhabited until its evidence transaction lands"
+)]
+struct PeerFacilityObservation {
+    namespace: NetworkNamespaceIdentity,
+    inventory: std::sync::Arc<flux_core::NetworkInventory>,
+    inventory_started_at: Instant,
+    inventory_completed_at: Instant,
+    listener_conflicts: ListenerConflictSnapshot,
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[allow(
+    dead_code,
+    reason = "the packaged attempt remains uninhabited until its evidence transaction lands"
+)]
+fn collect_inventory_until(
+    deadline: Instant,
+) -> Result<
+    (
+        std::sync::Arc<flux_core::NetworkInventory>,
+        Instant,
+        Instant,
+    ),
+    NativeCoordinatorWriterError,
+> {
+    let started_at = Instant::now();
+    let remaining = deadline.saturating_duration_since(started_at);
+    if remaining.is_zero() {
+        return Err(NativeCoordinatorWriterError::Invariant(
+            "retained facility inventory started at or after the immutable deadline",
+        ));
+    }
+    // The platform one-shot entry point accepts a relative timeout. Bracketing
+    // its result against the immutable deadline prevents admitting late data,
+    // but does not claim that the internal wait itself used the same absolute
+    // instant.
+    let inventory = collect_network_inventory_once(remaining.min(Duration::from_secs(30)))
+        .map_err(|source| {
+            NativeCoordinatorWriterError::observation(
+                "collect retained canary facility inventory",
+                source,
+            )
+        })?;
+    let completed_at = Instant::now();
+    if completed_at >= deadline {
+        return Err(NativeCoordinatorWriterError::Invariant(
+            "retained facility inventory completed at or after the immutable deadline",
+        ));
+    }
+    Ok((inventory, started_at, completed_at))
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[allow(
+    dead_code,
+    reason = "the packaged attempt remains uninhabited until its evidence transaction lands"
+)]
+fn current_network_namespace_identity()
+-> Result<NetworkNamespaceIdentity, NativeCoordinatorWriterError> {
+    let metadata = std::fs::metadata("/proc/thread-self/ns/net").map_err(|source| {
+        NativeCoordinatorWriterError::observation(
+            "inspect current thread network namespace",
+            source,
+        )
+    })?;
+    NetworkNamespaceIdentity::new(metadata.dev(), metadata.ino()).ok_or(
+        NativeCoordinatorWriterError::Invariant(
+            "current thread network namespace has a zero inode",
+        ),
+    )
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[allow(
+    dead_code,
+    reason = "the packaged attempt remains uninhabited until its evidence transaction lands"
+)]
+fn collect_peer_facility_observation(
+    namespace_handle: File,
+    expected_namespace: NetworkNamespaceIdentity,
+    targets: Vec<ListenerConflictTarget>,
+    deadline: Instant,
+) -> Result<PeerFacilityObservation, NativeCoordinatorWriterError> {
+    if Instant::now() >= deadline {
+        return Err(NativeCoordinatorWriterError::Invariant(
+            "peer network namespace observation started at or after the immutable deadline",
+        ));
+    }
+    // SAFETY: this dedicated thread owns the duplicated nsfs descriptor. It
+    // performs no work before `setns`, never lends the thread, and terminates
+    // after returning owned observations, so namespace restoration is neither
+    // required nor attempted.
+    if unsafe { libc::setns(namespace_handle.as_raw_fd(), libc::CLONE_NEWNET) } != 0 {
+        return Err(NativeCoordinatorWriterError::observation(
+            "enter retained peer network namespace",
+            io::Error::last_os_error(),
+        ));
+    }
+    let namespace = current_network_namespace_identity()?;
+    if namespace != expected_namespace {
+        return Err(NativeCoordinatorWriterError::Invariant(
+            "dedicated peer observer entered a substituted network namespace",
+        ));
+    }
+    let (inventory, inventory_started_at, inventory_completed_at) =
+        collect_inventory_until(deadline)?;
+    if current_network_namespace_identity()? != expected_namespace {
+        return Err(NativeCoordinatorWriterError::Invariant(
+            "peer network namespace changed during retained facility inventory",
+        ));
+    }
+    let diagnostics = SystemSocketDiagnosticsSource
+        .open_until(deadline)
+        .map_err(|source| {
+            NativeCoordinatorWriterError::observation(
+                "open retained peer listener-conflict observer",
+                source,
+            )
+        })?;
+    let (_diagnostics, listener_conflicts) = diagnostics
+        .collect_listener_conflicts_until(&targets, deadline)
+        .map_err(|source| {
+            NativeCoordinatorWriterError::observation(
+                "collect retained peer listener conflicts",
+                source,
+            )
+        })?;
+    if current_network_namespace_identity()? != expected_namespace {
+        return Err(NativeCoordinatorWriterError::Invariant(
+            "peer network namespace changed during listener-conflict observation",
+        ));
+    }
+    if Instant::now() >= deadline {
+        return Err(NativeCoordinatorWriterError::Invariant(
+            "peer network namespace observation completed at or after the immutable deadline",
+        ));
+    }
+    Ok(PeerFacilityObservation {
+        namespace,
+        inventory,
+        inventory_started_at,
+        inventory_completed_at,
+        listener_conflicts,
+    })
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -1062,6 +1338,44 @@ where
         }))
     }
 
+    fn reobserve_retained_canary_facility(
+        &mut self,
+        generation: &PreparedGeneration,
+        session: &CanarySelectorSession,
+        peer_reaped: &PeerReapedCanaryAttemptAuthority,
+    ) -> Result<Option<RetainedCanaryFacilityReadback>, Self::Error> {
+        // All substitution checks precede descriptor inspection or live-state
+        // observation. A rejected borrowed authority poisons only the caller's
+        // attempt phase; it does not manufacture a live drift claim here.
+        let _ = self.active_canary_attempt(generation, session)?;
+        if peer_reaped.request() != session.request() {
+            return Err(NativeCoordinatorWriterError::Invariant(
+                "retained facility reobservation substituted peer-reap authority",
+            ));
+        }
+        let authority = self.retained_canary_facility_authority.as_ref().ok_or(
+            NativeCoordinatorWriterError::Invariant(
+                "retained facility reobservation has no writer-owned facility authority",
+            ),
+        )?;
+        if !authority.matches_request(session.request()) {
+            return Err(NativeCoordinatorWriterError::Invariant(
+                "retained facility reobservation substituted the writer-owned facility",
+            ));
+        }
+
+        // Descriptor validation is the first live-observation action. Any
+        // failure from this point requires recovery and deliberately retains
+        // the active selector session.
+        match authority.reobserve_for(session.request(), peer_reaped) {
+            Ok(readback) => Ok(Some(readback)),
+            Err(source) => {
+                self.recovery_required = true;
+                Err(source)
+            }
+        }
+    }
+
     fn retire_canary_selector_session(
         &mut self,
         generation: &PreparedGeneration,
@@ -1172,6 +1486,14 @@ pub(crate) enum NativeCoordinatorWriterError {
         operation: &'static str,
         source: io::Error,
     },
+    #[allow(
+        dead_code,
+        reason = "the packaged attempt remains uninhabited until its evidence transaction lands"
+    )]
+    Observation {
+        operation: &'static str,
+        source: Box<dyn Error + Send + Sync>,
+    },
     Invariant(&'static str),
 }
 
@@ -1193,12 +1515,25 @@ impl NativeCoordinatorWriterError {
     fn authority(operation: &'static str, source: io::Error) -> Self {
         Self::Authority { operation, source }
     }
+
+    #[allow(
+        dead_code,
+        reason = "the packaged attempt remains uninhabited until its evidence transaction lands"
+    )]
+    fn observation(operation: &'static str, source: impl Error + Send + Sync + 'static) -> Self {
+        Self::Observation {
+            operation,
+            source: Box::new(source),
+        }
+    }
 }
 
 impl fmt::Display for NativeCoordinatorWriterError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Convergence { operation, source } | Self::Preparation { operation, source } => {
+            Self::Convergence { operation, source }
+            | Self::Preparation { operation, source }
+            | Self::Observation { operation, source } => {
                 write!(formatter, "{operation}: {source}")
             }
             Self::Authority { operation, source } => write!(formatter, "{operation}: {source}"),
@@ -1210,9 +1545,9 @@ impl fmt::Display for NativeCoordinatorWriterError {
 impl Error for NativeCoordinatorWriterError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Convergence { source, .. } | Self::Preparation { source, .. } => {
-                Some(source.as_ref())
-            }
+            Self::Convergence { source, .. }
+            | Self::Preparation { source, .. }
+            | Self::Observation { source, .. } => Some(source.as_ref()),
             Self::Authority { source, .. } => Some(source),
             Self::Invariant(_) => None,
         }
@@ -1247,8 +1582,9 @@ mod tests {
     use crate::functional_canary::tests::request_with_engine_identity_and_network_namespaces;
     use crate::functional_canary::{
         CanaryAddressFamilies, CanaryAttemptRequest, CanaryFacilityIdentity, CanaryNonce,
-        CanaryResponderPorts, FUNCTIONAL_CANARY_NONCE_BYTES,
-        InstalledSupervisedDeliveryReportProducer, PreparedCanaryGenerationBinding,
+        CanaryProcessIdentity, CanaryProcessRetirementEvidence, CanaryResponderPorts,
+        FUNCTIONAL_CANARY_NONCE_BYTES, InstalledSupervisedDeliveryReportProducer,
+        PeerReapedCanaryAttemptAuthority, PreparedCanaryGenerationBinding,
         SupervisedDeliveryReportEngineHandoff,
     };
     use crate::generation_engine_config::{
@@ -1788,6 +2124,25 @@ mod tests {
         )
     }
 
+    fn peer_reaped_authority(request: &CanaryAttemptRequest) -> PeerReapedCanaryAttemptAuthority {
+        let started_at = request.deadline().started_at();
+        let retirement = |slot: u32, offset: u64| {
+            CanaryProcessRetirementEvidence::new(
+                CanaryProcessIdentity::new(
+                    NonZeroU32::new(70_000 + slot).expect("peer PID"),
+                    NonZeroU64::new(80_000 + u64::from(slot)).expect("peer start ticks"),
+                ),
+                started_at + Duration::from_millis(offset),
+                started_at + Duration::from_millis(offset + 1),
+                started_at + Duration::from_millis(offset + 2),
+            )
+        };
+        PeerReapedCanaryAttemptAuthority::fixture(
+            request,
+            [retirement(1, 100), retirement(2, 110), retirement(3, 120)],
+        )
+    }
+
     fn writer(
         events: &Arc<Mutex<Vec<Event>>>,
         active: Option<u64>,
@@ -2301,6 +2656,159 @@ mod tests {
             .expect("retire dual-stack selector session")
             .expect("native writer returns dual-stack retirement proof");
         assert!(writer.convergence.selector.is_none());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn retained_facility_live_failure_poisons_recovery_and_retains_the_selector() {
+        let fixture = EngineFixture::new();
+        let (request, authority) = selector_request(&fixture, 82);
+        let (alternate, _alternate_authority) = selector_request(&fixture, 83);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut writer = writer(
+            &events,
+            None,
+            None,
+            [required_canary_generation(17, &fixture, &request)],
+            [],
+        )
+        .with_retained_canary_facility_authority(authority)
+        .expect("attach retained canary facility authority");
+        let generation = RuntimeWriter::prepare(&mut writer, Reason::Boot)
+            .expect("prepare required native Generation");
+        RuntimeWriter::capture_start(&mut writer, &generation)
+            .expect("activate required native Generation");
+        let session =
+            RuntimeWriter::reserve_canary_selector_session(&mut writer, &generation, &request)
+                .expect("reserve exact selector session")
+                .expect("native writer supplies selector-session ownership");
+
+        let substituted = RuntimeWriter::reobserve_retained_canary_facility(
+            &mut writer,
+            &generation,
+            &session,
+            &peer_reaped_authority(&alternate),
+        )
+        .expect_err("a substituted peer-reap authority must reject before live observation");
+        assert_eq!(
+            substituted.to_string(),
+            "retained facility reobservation substituted peer-reap authority"
+        );
+        assert!(!writer.recovery_required);
+
+        let failure = RuntimeWriter::reobserve_retained_canary_facility(
+            &mut writer,
+            &generation,
+            &session,
+            &peer_reaped_authority(&request),
+        )
+        .expect_err("the synthetic daemon namespace must fail after descriptor validation");
+        assert_eq!(
+            failure.to_string(),
+            "retained facility observer is not in the immutable daemon network namespace"
+        );
+        assert!(writer.recovery_required);
+        assert_eq!(
+            writer.active_canary_selector_session.as_ref(),
+            Some(&request)
+        );
+        assert!(writer.convergence.selector.is_some());
+
+        let retirement =
+            RuntimeWriter::retire_canary_selector_session(&mut writer, &generation, session)
+                .expect_err("poisoned observation cannot mint selector retirement");
+        assert_eq!(
+            retirement.to_string(),
+            "native canary attempt operation requires capture recovery"
+        );
+        RuntimeWriter::capture_stop(&mut writer)
+            .expect("capture stop recovers the poisoned retained facility observation");
+        assert!(!writer.recovery_required);
+        assert!(writer.active_canary_selector_session.is_none());
+        assert!(writer.convergence.selector.is_none());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    #[ignore = "requires network-namespace creation and setns authority"]
+    fn retained_facility_observer_thread_never_changes_the_caller_namespace() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let caller_namespace = current_network_namespace_identity()
+            .expect("inspect caller network namespace before privileged smoke");
+        let peer_thread = std::thread::Builder::new()
+            .name("flux-canary-peer-fixture".to_owned())
+            .spawn(|| {
+                // SAFETY: this dedicated fixture thread terminates after opening
+                // an owned descriptor for the new namespace; it is never reused.
+                if unsafe { libc::unshare(libc::CLONE_NEWNET) } != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                let handle = fs::File::open("/proc/thread-self/ns/net")?;
+                let metadata = handle.metadata()?;
+                let identity = NetworkNamespaceIdentity::new(metadata.dev(), metadata.ino())
+                    .ok_or_else(|| io::Error::other("peer namespace has a zero inode"))?;
+                Ok((handle, identity))
+            })
+            .expect("spawn privileged peer namespace fixture");
+        let (peer_handle, peer_namespace) = peer_thread
+            .join()
+            .expect("join privileged peer namespace fixture")
+            .expect("create privileged peer network namespace");
+        assert_ne!(peer_namespace, caller_namespace);
+
+        let fixture = EngineFixture::new();
+        let request = selector_request_for_network_namespaces(
+            &fixture,
+            84,
+            CanaryAddressFamilies::Ipv4Only,
+            caller_namespace,
+            peer_namespace,
+        );
+        let authority = RetainedCanaryFacilityAuthority::new(
+            request.pre_binding().environment().facility(),
+            peer_namespace,
+            peer_handle,
+        )
+        .expect("retain privileged peer namespace authority");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut writer = writer(
+            &events,
+            None,
+            None,
+            [required_canary_generation(17, &fixture, &request)],
+            [],
+        )
+        .with_retained_canary_facility_authority(authority)
+        .expect("attach privileged retained facility authority");
+        let generation = RuntimeWriter::prepare(&mut writer, Reason::Boot)
+            .expect("prepare privileged required native Generation");
+        RuntimeWriter::capture_start(&mut writer, &generation)
+            .expect("activate privileged required native Generation");
+        let session =
+            RuntimeWriter::reserve_canary_selector_session(&mut writer, &generation, &request)
+                .expect("reserve privileged selector session")
+                .expect("native writer supplies privileged selector ownership");
+
+        RuntimeWriter::reobserve_retained_canary_facility(
+            &mut writer,
+            &generation,
+            &session,
+            &peer_reaped_authority(&request),
+        )
+        .expect_err("empty fixture namespace has no declared canary veth facility");
+        assert_eq!(
+            current_network_namespace_identity()
+                .expect("inspect caller namespace after observer thread termination"),
+            caller_namespace
+        );
+        assert!(writer.recovery_required);
+        assert_eq!(
+            writer.active_canary_selector_session.as_ref(),
+            Some(&request)
+        );
+        RuntimeWriter::capture_stop(&mut writer)
+            .expect("recover privileged smoke state after namespace-isolation proof");
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]

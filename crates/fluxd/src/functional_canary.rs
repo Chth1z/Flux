@@ -3,16 +3,22 @@ use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::num::{NonZeroU8, NonZeroU16, NonZeroU32, NonZeroU64};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use flux_core::{
-    BootIdentity, CapabilityProfileRevision, GenerationId, InterfaceIndex, InterfaceName,
-    NetworkEpoch, NetworkInventorySnapshotId, NetworkNamespaceIdentity, OwnershipJournalIdentity,
-    OwnershipJournalRevision, RouteProtocol, RouteScope, RouteTableId, RouteType, RulePriority,
+    BootIdentity, CapabilityProfileRevision, GenerationId, InterfaceAddressFlags, InterfaceIndex,
+    InterfaceLinkReference, InterfaceName, NetworkAddressFamily, NetworkEpoch, NetworkInventory,
+    NetworkInventorySnapshotId, NetworkNamespaceIdentity, NetworkRouteRecord, NetworkRuleRecord,
+    OwnershipJournalIdentity, OwnershipJournalRevision, RouteFlags, RoutePath, RoutePreference,
+    RoutePrefix, RouteProperties, RouteProtocol, RouteScope, RouteTableId, RouteType, RuleAction,
+    RuleFlags, RuleFwMark, RuleIpProtocol, RulePortRange, RulePrefix, RulePriority, RuleProperties,
+    RuleProtocol, RuleTableId, RuleUidRange,
 };
 use flux_platform::socket_diagnostics::{
-    CorrelatedProcessSocket, InetSocketProtocol, ProcessSocketDiagnostics, SocketCorrelationError,
+    CorrelatedProcessSocket, InetSocketAddressFamily, InetSocketProtocol, ListenerConflictSnapshot,
+    ListenerConflictTarget, ProcessSocketDiagnostics, SocketCorrelationError,
     SocketDiagnosticsError, SocketDiagnosticsErrorKind, SystemSocketDiagnosticsSession,
     SystemSocketDiagnosticsSource,
 };
@@ -187,6 +193,7 @@ pub(crate) enum CanaryBindingError {
     SameNetworkNamespace,
     ZeroRpdbTable,
     SameRpdbTable,
+    UnrepresentableRpdbEngineUid,
     CanaryPeerRouteTableMismatch,
     InvalidRpdbPriorityOrder,
     ProxyMarkEmpty,
@@ -198,6 +205,7 @@ pub(crate) enum CanaryBindingError {
     CredentialNamespaceCollision,
     MissingIpv6Facility,
     SameProtocolResponderPortCollision,
+    UnrepresentableResponderPort,
     FacilityAdmissionInventoryMismatch,
     FacilityAdmissionScopeMismatch,
     FacilityAdmissionAttemptMismatch,
@@ -1502,6 +1510,9 @@ impl CanaryResponderPorts {
         udp_echo: NonZeroU16,
         dns: NonZeroU16,
     ) -> Result<Self, CanaryBindingError> {
+        if tcp_echo.get() == u16::MAX || udp_echo.get() == u16::MAX || dns.get() == u16::MAX {
+            return Err(CanaryBindingError::UnrepresentableResponderPort);
+        }
         if tcp_echo.get() == dns.get() || udp_echo.get() == dns.get() {
             return Err(CanaryBindingError::SameProtocolResponderPortCollision);
         }
@@ -1711,6 +1722,9 @@ impl CanaryRpdbIdentity {
         proxy_mark_value: u32,
         proxy_mark_mask: NonZeroU32,
     ) -> Result<Self, CanaryBindingError> {
+        if engine_uid.get() == u32::MAX {
+            return Err(CanaryBindingError::UnrepresentableRpdbEngineUid);
+        }
         if peer_table.get() == 0 || proxy_capture_table.get() == 0 {
             return Err(CanaryBindingError::ZeroRpdbTable);
         }
@@ -1777,6 +1791,620 @@ impl CanaryRpdbIdentity {
     pub(crate) const fn proxy_mark_mask(&self) -> NonZeroU32 {
         self.proxy_mark_mask
     }
+}
+
+/// Private provenance supplied to the pure retained-facility validator.
+///
+/// The two inventories come from separate loss-aware one-shot observers. Their
+/// epochs are deliberately not compared: a first publication is `INITIAL` for
+/// both observers and is not a continuity token.
+#[allow(
+    dead_code,
+    reason = "the packaged attempt remains uninhabited until its evidence transaction lands"
+)]
+pub(crate) struct RetainedCanaryFacilityObservation {
+    daemon_namespace_before: NetworkNamespaceIdentity,
+    daemon_namespace_after: NetworkNamespaceIdentity,
+    peer_namespace: NetworkNamespaceIdentity,
+    daemon_inventory: Arc<NetworkInventory>,
+    peer_inventory: Arc<NetworkInventory>,
+    daemon_started_at: Instant,
+    daemon_completed_at: Instant,
+    peer_started_at: Instant,
+    peer_inventory_completed_at: Instant,
+    listener_started_at: Instant,
+    listener_completed_at: Instant,
+    listener_netlink_port_id: NonZeroU32,
+    listener_dumps: Box<[RetainedCanaryListenerDump]>,
+    listener_conflict_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RetainedCanaryListenerDump {
+    sequence: NonZeroU32,
+    target: ListenerConflictTarget,
+    started_at: Instant,
+    completed_at: Instant,
+}
+
+#[allow(
+    dead_code,
+    reason = "the packaged attempt remains uninhabited until its evidence transaction lands"
+)]
+impl RetainedCanaryFacilityObservation {
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub(crate) fn new(
+        daemon_namespace_before: NetworkNamespaceIdentity,
+        daemon_namespace_after: NetworkNamespaceIdentity,
+        peer_namespace: NetworkNamespaceIdentity,
+        daemon_inventory: Arc<NetworkInventory>,
+        peer_inventory: Arc<NetworkInventory>,
+        daemon_started_at: Instant,
+        daemon_completed_at: Instant,
+        peer_started_at: Instant,
+        peer_inventory_completed_at: Instant,
+        listener: &ListenerConflictSnapshot,
+    ) -> Self {
+        Self {
+            daemon_namespace_before,
+            daemon_namespace_after,
+            peer_namespace,
+            daemon_inventory,
+            peer_inventory,
+            daemon_started_at,
+            daemon_completed_at,
+            peer_started_at,
+            peer_inventory_completed_at,
+            listener_started_at: listener.started_at(),
+            listener_completed_at: listener.completed_at(),
+            listener_netlink_port_id: listener.netlink_port_id(),
+            listener_dumps: listener
+                .dumps()
+                .iter()
+                .map(|dump| RetainedCanaryListenerDump {
+                    sequence: dump.sequence(),
+                    target: dump.target(),
+                    started_at: dump.started_at(),
+                    completed_at: dump.completed_at(),
+                })
+                .collect(),
+            listener_conflict_count: listener.conflicts().len(),
+        }
+    }
+
+    fn listener_dumps_complete(&self) -> bool {
+        !self.listener_dumps.is_empty()
+            && self
+                .listener_dumps
+                .windows(2)
+                .all(|pair| pair[0].sequence.get().checked_add(1) == Some(pair[1].sequence.get()))
+            && self.listener_dumps.iter().enumerate().all(|(index, dump)| {
+                self.listener_dumps[..index]
+                    .iter()
+                    .all(|prior| prior.target != dump.target)
+                    && dump.started_at >= self.listener_started_at
+                    && dump.completed_at >= dump.started_at
+                    && dump.completed_at <= self.listener_completed_at
+            })
+    }
+}
+
+/// Minimal successful readback. Observer epochs, snapshot identities, and
+/// sequential intervals remain validation-local and cannot become authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(
+    dead_code,
+    reason = "the packaged attempt remains uninhabited until its evidence transaction lands"
+)]
+pub(crate) struct RetainedCanaryFacilityReadback {
+    facility: CanaryFacilityIdentity,
+    observed_at: Instant,
+}
+
+#[allow(
+    dead_code,
+    reason = "the packaged attempt remains uninhabited until its evidence transaction lands"
+)]
+impl RetainedCanaryFacilityReadback {
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn fixture(facility: CanaryFacilityIdentity, observed_at: Instant) -> Self {
+        Self {
+            facility,
+            observed_at,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn facility(self) -> CanaryFacilityIdentity {
+        self.facility
+    }
+
+    #[must_use]
+    pub(crate) const fn observed_at(self) -> Instant {
+        self.observed_at
+    }
+
+    /// Finalize the validated facility with the completion time sampled by the
+    /// live observer after semantic validation has succeeded.
+    pub(crate) fn finalize_at(
+        self,
+        observed_at: Instant,
+    ) -> Result<Self, RetainedCanaryFacilityValidationError> {
+        if observed_at < self.observed_at {
+            return Err(RetainedCanaryFacilityValidationError::InvalidObservationChronology);
+        }
+        Ok(Self {
+            facility: self.facility,
+            observed_at,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RetainedCanaryFacilityValidationError {
+    RequestMismatch,
+    InvalidPeerRetirementChronology,
+    NetworkNamespaceMismatch,
+    InventoryProvenanceMismatch,
+    InvalidObservationChronology,
+    IncompleteListenerObservation,
+    ListenerTargetMismatch,
+    ListenerConflict,
+    DaemonVethMismatch,
+    PeerVethMismatch,
+    AddressMismatch,
+    RouteMismatch,
+    PeerRuleMismatch,
+}
+
+impl fmt::Display for RetainedCanaryFacilityValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::RequestMismatch => {
+                "peer-reaped authority belongs to another functional-canary request"
+            }
+            Self::InvalidPeerRetirementChronology => "peer-server retirement chronology is invalid",
+            Self::NetworkNamespaceMismatch => {
+                "retained facility was observed under a different network namespace"
+            }
+            Self::InventoryProvenanceMismatch => {
+                "retained facility inventories do not have fresh distinct snapshot provenance"
+            }
+            Self::InvalidObservationChronology => {
+                "retained facility observation falls outside the immutable sequential chronology"
+            }
+            Self::IncompleteListenerObservation => {
+                "retained facility listener-conflict observation is incomplete"
+            }
+            Self::ListenerTargetMismatch => {
+                "retained facility listener-conflict targets are not canonical"
+            }
+            Self::ListenerConflict => {
+                "retained facility responder port has a namespace listener conflict"
+            }
+            Self::DaemonVethMismatch => "daemon retained-facility veth endpoint changed",
+            Self::PeerVethMismatch => "peer retained-facility veth endpoint changed",
+            Self::AddressMismatch => "retained-facility address or prefix changed",
+            Self::RouteMismatch => "retained-facility canonical host route changed",
+            Self::PeerRuleMismatch => "daemon retained-facility peer-selection policy rule changed",
+        })
+    }
+}
+
+impl Error for RetainedCanaryFacilityValidationError {}
+
+/// Validate one sequential post-reap observation without performing I/O.
+///
+/// Listener dumps are complete negative evidence for the exact ordered states
+/// and ports only. They are sequential rather than atomic and do not claim
+/// total immediate bindability.
+pub(crate) fn validate_retained_canary_facility_observation(
+    request: &CanaryAttemptRequest,
+    peer_reaped: &PeerReapedCanaryAttemptAuthority,
+    observation: &RetainedCanaryFacilityObservation,
+) -> Result<RetainedCanaryFacilityReadback, RetainedCanaryFacilityValidationError> {
+    if peer_reaped.request() != request {
+        return Err(RetainedCanaryFacilityValidationError::RequestMismatch);
+    }
+    let deadline = request.deadline();
+    let peer_retirements = peer_reaped.peer_servers();
+    if peer_retirements.iter().any(|retirement| {
+        retirement.quiesced_at > retirement.terminated_at
+            || retirement.terminated_at > retirement.reaped_at
+            || retirement.quiesced_at < deadline.started_at()
+            || retirement.reaped_at >= deadline.expires_at()
+    }) || peer_retirements
+        .iter()
+        .map(|retirement| retirement.reaped_at)
+        .max()
+        != Some(peer_reaped.latest_peer_reaped_at())
+    {
+        return Err(RetainedCanaryFacilityValidationError::InvalidPeerRetirementChronology);
+    }
+
+    let expected_network = request.pre_binding().environment().authority().network();
+    if observation.daemon_namespace_before != expected_network.daemon_network_namespace()
+        || observation.daemon_namespace_after != expected_network.daemon_network_namespace()
+        || observation.peer_namespace != expected_network.peer_network_namespace()
+    {
+        return Err(RetainedCanaryFacilityValidationError::NetworkNamespaceMismatch);
+    }
+    let admission_snapshot = expected_network.network_inventory_snapshot_id();
+    if observation.daemon_inventory.snapshot_id() == admission_snapshot
+        || observation.peer_inventory.snapshot_id() == admission_snapshot
+        || observation.daemon_inventory.snapshot_id() == observation.peer_inventory.snapshot_id()
+    {
+        return Err(RetainedCanaryFacilityValidationError::InventoryProvenanceMismatch);
+    }
+    if peer_reaped.latest_peer_reaped_at() >= observation.daemon_started_at
+        || observation.daemon_started_at > observation.daemon_completed_at
+        || observation.daemon_completed_at > observation.peer_started_at
+        || observation.peer_started_at > observation.peer_inventory_completed_at
+        || observation.peer_inventory_completed_at > observation.listener_started_at
+        || observation.listener_started_at > observation.listener_completed_at
+        || observation.listener_completed_at >= deadline.expires_at()
+    {
+        return Err(RetainedCanaryFacilityValidationError::InvalidObservationChronology);
+    }
+    if !observation.listener_dumps_complete() {
+        return Err(RetainedCanaryFacilityValidationError::IncompleteListenerObservation);
+    }
+    if observation
+        .listener_dumps
+        .iter()
+        .map(|dump| dump.target)
+        .ne(canonical_listener_conflict_targets(request))
+    {
+        return Err(RetainedCanaryFacilityValidationError::ListenerTargetMismatch);
+    }
+    if observation.listener_conflict_count != 0 {
+        return Err(RetainedCanaryFacilityValidationError::ListenerConflict);
+    }
+
+    let environment = request.pre_binding().environment();
+    let facility = environment.facility();
+    validate_veth_endpoint(
+        observation.daemon_inventory.as_ref(),
+        facility.daemon_veth(),
+        facility.peer_veth().interface_index(),
+    )
+    .map_err(|()| RetainedCanaryFacilityValidationError::DaemonVethMismatch)?;
+    validate_veth_endpoint(
+        observation.peer_inventory.as_ref(),
+        facility.peer_veth(),
+        facility.daemon_veth().interface_index(),
+    )
+    .map_err(|()| RetainedCanaryFacilityValidationError::PeerVethMismatch)?;
+
+    let topology = facility.peer_veth_topology();
+    let ipv6 = facility.ipv6().zip(topology.ipv6());
+    validate_exact_endpoint_addresses(
+        observation.daemon_inventory.as_ref(),
+        observation.peer_inventory.as_ref(),
+        facility.daemon_veth().interface_index(),
+        IpAddr::V4(facility.ipv4().daemon()),
+        topology.ipv4().daemon_prefix_length(),
+        ipv6.map(|(addresses, topology)| {
+            (
+                IpAddr::V6(addresses.daemon()),
+                topology.daemon_prefix_length(),
+            )
+        }),
+    )?;
+    validate_exact_endpoint_addresses(
+        observation.peer_inventory.as_ref(),
+        observation.daemon_inventory.as_ref(),
+        facility.peer_veth().interface_index(),
+        IpAddr::V4(facility.ipv4().peer()),
+        topology.ipv4().peer_prefix_length(),
+        ipv6.map(|(addresses, topology)| {
+            (IpAddr::V6(addresses.peer()), topology.peer_prefix_length())
+        }),
+    )?;
+    let mut daemon_routes = vec![
+        expected_host_route(
+            IpAddr::V4(facility.ipv4().peer()),
+            facility.daemon_veth().interface_index(),
+            topology.ipv4().daemon_to_peer_route(),
+        )
+        .ok_or(RetainedCanaryFacilityValidationError::RouteMismatch)?,
+    ];
+    let mut peer_routes = vec![
+        expected_host_route(
+            IpAddr::V4(facility.ipv4().daemon()),
+            facility.peer_veth().interface_index(),
+            topology.ipv4().peer_to_daemon_route(),
+        )
+        .ok_or(RetainedCanaryFacilityValidationError::RouteMismatch)?,
+    ];
+    if let Some((addresses, ipv6_topology)) = ipv6 {
+        daemon_routes.push(
+            expected_host_route(
+                IpAddr::V6(addresses.peer()),
+                facility.daemon_veth().interface_index(),
+                ipv6_topology.daemon_to_peer_route(),
+            )
+            .ok_or(RetainedCanaryFacilityValidationError::RouteMismatch)?,
+        );
+        peer_routes.push(
+            expected_host_route(
+                IpAddr::V6(addresses.daemon()),
+                facility.peer_veth().interface_index(),
+                ipv6_topology.peer_to_daemon_route(),
+            )
+            .ok_or(RetainedCanaryFacilityValidationError::RouteMismatch)?,
+        );
+    }
+    validate_exact_owned_route_cohort(observation.daemon_inventory.as_ref(), &daemon_routes)?;
+    validate_exact_owned_route_cohort(observation.peer_inventory.as_ref(), &peer_routes)?;
+    validate_peer_selection_rules(request, observation.daemon_inventory.as_ref())?;
+
+    // The listener completion is the lower bound for the writer's final live
+    // observation timestamp. The writer samples the clock only after this pure
+    // semantic validation returns successfully.
+    Ok(RetainedCanaryFacilityReadback {
+        facility,
+        observed_at: observation.listener_completed_at,
+    })
+}
+
+fn validate_exact_owned_route_cohort(
+    inventory: &NetworkInventory,
+    expected: &[NetworkRouteRecord],
+) -> Result<(), RetainedCanaryFacilityValidationError> {
+    let actual = inventory
+        .routes()
+        .iter()
+        .filter(|route| {
+            expected.iter().any(|candidate| {
+                route.properties().table() == candidate.properties().table()
+                    && route.properties().protocol() == candidate.properties().protocol()
+            })
+        })
+        .collect::<Vec<_>>();
+    if actual.len() != expected.len()
+        || expected
+            .iter()
+            .any(|candidate| actual.iter().filter(|route| **route == candidate).count() != 1)
+        || actual
+            .iter()
+            .any(|route| !expected.iter().any(|candidate| **route == *candidate))
+    {
+        return Err(RetainedCanaryFacilityValidationError::RouteMismatch);
+    }
+    Ok(())
+}
+
+pub(crate) fn canonical_listener_conflict_targets(
+    request: &CanaryAttemptRequest,
+) -> Vec<ListenerConflictTarget> {
+    CanaryFlow::ALL
+        .iter()
+        .copied()
+        .filter(|flow| request.requires_flow(*flow))
+        .map(|flow| {
+            ListenerConflictTarget::new(
+                match flow.address_family() {
+                    CanaryFlowAddressFamily::Ipv4 => InetSocketAddressFamily::Ipv4,
+                    CanaryFlowAddressFamily::Ipv6 => InetSocketAddressFamily::Ipv6,
+                },
+                match flow.protocol() {
+                    CanaryFlowProtocol::Tcp => InetSocketProtocol::Tcp,
+                    CanaryFlowProtocol::Udp => InetSocketProtocol::Udp,
+                },
+                request.responder_port(flow),
+            )
+        })
+        .collect()
+}
+
+fn validate_veth_endpoint(
+    inventory: &NetworkInventory,
+    expected: CanaryVethIdentity,
+    expected_peer_index: InterfaceIndex,
+) -> Result<(), ()> {
+    let mut endpoints = inventory.links().iter().filter(|link| {
+        link.interface_index() == expected.interface_index()
+            || link.name() == &expected.interface_name()
+    });
+    let endpoint = endpoints.next().ok_or(())?;
+    if endpoints.next().is_some()
+        || endpoint.interface_index() != expected.interface_index()
+        || endpoint.name() != &expected.interface_name()
+        || endpoint.kind().map(|kind| kind.as_bytes()) != Some(b"veth".as_slice())
+        || endpoint.link_reference() != Some(InterfaceLinkReference::Interface(expected_peer_index))
+    {
+        return Err(());
+    }
+    Ok(())
+}
+
+fn validate_exact_endpoint_addresses(
+    inventory: &NetworkInventory,
+    other_inventory: &NetworkInventory,
+    expected_interface: InterfaceIndex,
+    expected_ipv4: IpAddr,
+    expected_ipv4_prefix_length: u8,
+    expected_ipv6: Option<(IpAddr, u8)>,
+) -> Result<(), RetainedCanaryFacilityValidationError> {
+    for (expected_address, expected_prefix_length) in
+        std::iter::once((expected_ipv4, expected_ipv4_prefix_length)).chain(expected_ipv6)
+    {
+        let matching = inventory
+            .addresses()
+            .iter()
+            .filter(|address| address.address() == expected_address)
+            .collect::<Vec<_>>();
+        if matching.len() != 1
+            || matching[0].interface_index() != expected_interface
+            || matching[0].prefix_length() != expected_prefix_length
+            || has_unhealthy_address_flags(matching[0].flags())
+            || other_inventory
+                .addresses()
+                .iter()
+                .any(|address| address.address() == expected_address)
+        {
+            return Err(RetainedCanaryFacilityValidationError::AddressMismatch);
+        }
+    }
+    let extras = inventory.addresses().iter().filter(|address| {
+        address.interface_index() == expected_interface
+            && address.address() != expected_ipv4
+            && expected_ipv6.is_none_or(|(expected, _)| address.address() != expected)
+    });
+    let mut link_local_count = 0_usize;
+    for address in extras {
+        if !is_healthy_ipv6_link_local(address.address(), address.prefix_length(), address.flags())
+        {
+            return Err(RetainedCanaryFacilityValidationError::AddressMismatch);
+        }
+        link_local_count += 1;
+    }
+    // Linux may synthesize one link-local endpoint unless the future facility
+    // creator pins addrgenmode. Its concrete address is not an authority, but
+    // multiple, unhealthy, non-/64, or global extras remain drift.
+    if link_local_count > 1 {
+        return Err(RetainedCanaryFacilityValidationError::AddressMismatch);
+    }
+    Ok(())
+}
+
+fn expected_host_route(
+    destination: IpAddr,
+    output_interface: InterfaceIndex,
+    shape: CanaryRouteShape,
+) -> Option<NetworkRouteRecord> {
+    let family = match destination {
+        IpAddr::V4(_) => NetworkAddressFamily::Ipv4,
+        IpAddr::V6(_) => NetworkAddressFamily::Ipv6,
+    };
+    let prefix_length = match family {
+        NetworkAddressFamily::Ipv4 => 32,
+        NetworkAddressFamily::Ipv6 => 128,
+    };
+    let route = NetworkRouteRecord::new(
+        RoutePrefix::new(destination, prefix_length).ok()?,
+        RoutePrefix::unspecified(family),
+        RouteProperties::new(
+            0,
+            shape.table(),
+            shape.protocol(),
+            shape.scope(),
+            shape.route_type(),
+            RouteFlags::from_raw(0),
+        ),
+        shape.metric().get(),
+        RoutePath::Single {
+            output_interface: Some(output_interface),
+            gateway: None,
+        },
+    )
+    .ok()?;
+    match family {
+        NetworkAddressFamily::Ipv4 => Some(route),
+        NetworkAddressFamily::Ipv6 => route.with_preference(RoutePreference::from_raw(0)).ok(),
+    }
+}
+
+fn has_unhealthy_address_flags(flags: InterfaceAddressFlags) -> bool {
+    flags.intersects(
+        InterfaceAddressFlags::TENTATIVE
+            | InterfaceAddressFlags::DAD_FAILED
+            | InterfaceAddressFlags::DEPRECATED,
+    )
+}
+
+fn is_healthy_ipv6_link_local(
+    address: IpAddr,
+    prefix_length: u8,
+    flags: InterfaceAddressFlags,
+) -> bool {
+    matches!(address, IpAddr::V6(address) if address.segments()[0] & 0xffc0 == 0xfe80)
+        && prefix_length == 64
+        && !has_unhealthy_address_flags(flags)
+}
+
+fn validate_peer_selection_rules(
+    request: &CanaryAttemptRequest,
+    daemon_inventory: &NetworkInventory,
+) -> Result<(), RetainedCanaryFacilityValidationError> {
+    let expected = CanaryFlow::ALL
+        .iter()
+        .copied()
+        .filter(|flow| request.requires_flow(*flow))
+        .map(|flow| {
+            expected_peer_selection_rule(request, flow)
+                .ok_or(RetainedCanaryFacilityValidationError::PeerRuleMismatch)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let rpdb = request.pre_binding().environment().rpdb();
+    let peer_table = RuleTableId::from_raw(rpdb.peer_table().get());
+    let actual = daemon_inventory
+        .rules()
+        .iter()
+        .filter(|rule| {
+            rule.priority() == rpdb.peer_rule_priority() || rule.properties().table() == peer_table
+        })
+        .collect::<Vec<_>>();
+    if actual.len() != expected.len()
+        || expected
+            .iter()
+            .any(|candidate| actual.iter().filter(|rule| **rule == candidate).count() != 1)
+        || actual
+            .iter()
+            .any(|rule| !expected.iter().any(|candidate| **rule == *candidate))
+    {
+        return Err(RetainedCanaryFacilityValidationError::PeerRuleMismatch);
+    }
+    Ok(())
+}
+
+fn expected_peer_selection_rule(
+    request: &CanaryAttemptRequest,
+    flow: CanaryFlow,
+) -> Option<NetworkRuleRecord> {
+    let environment = request.pre_binding().environment();
+    let rpdb = environment.rpdb();
+    let destination = request.peer_address(flow);
+    let family = match destination {
+        IpAddr::V4(_) => NetworkAddressFamily::Ipv4,
+        IpAddr::V6(_) => NetworkAddressFamily::Ipv6,
+    };
+    let prefix_length = match family {
+        NetworkAddressFamily::Ipv4 => 32,
+        NetworkAddressFamily::Ipv6 => 128,
+    };
+    let mut rule = NetworkRuleRecord::new(
+        RulePrefix::new(destination, prefix_length).ok()?,
+        RulePrefix::unspecified(family),
+        RuleProperties::new(
+            0,
+            RuleTableId::from_raw(rpdb.peer_table().get()),
+            RuleAction::TO_TABLE,
+            RuleProtocol::from_raw(rpdb.rule_protocol().get()),
+            RuleFlags::from_raw(0),
+        ),
+        rpdb.peer_rule_priority(),
+        None,
+    )
+    .ok()?;
+    rule = rule
+        .with_fwmark(RuleFwMark::new(0, rpdb.proxy_mark_mask().get())?)
+        .with_uid_range(RuleUidRange::new(rpdb.engine_uid().get(), rpdb.engine_uid().get()).ok()?)
+        .with_ip_protocol(RuleIpProtocol::new(match flow.protocol() {
+            CanaryFlowProtocol::Tcp => 6,
+            CanaryFlowProtocol::Udp => 17,
+        })?)
+        .with_destination_port_range(
+            RulePortRange::new(
+                request.responder_port(flow).get(),
+                request.responder_port(flow).get(),
+            )
+            .ok()?,
+        );
+    rule.has_complete_attribute_coverage().then_some(rule)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2288,6 +2916,70 @@ pub(crate) struct CanaryAttemptRequest {
 )]
 pub(crate) struct ClientReapedCanaryAttemptAuthority {
     request: CanaryAttemptRequest,
+}
+
+/// Linear proof that every exact peer-server role was parent-reaped after the
+/// report and counter objects retired.
+///
+/// Production construction is private to the local-OUTPUT child typestate.
+/// The ordered retirement slots remain available for later process receipt
+/// projection; the latest reap time is only a chronology convenience.
+#[derive(Debug, Eq, PartialEq)]
+#[allow(
+    dead_code,
+    reason = "the packaged attempt remains uninhabited until its evidence transaction lands"
+)]
+pub(crate) struct PeerReapedCanaryAttemptAuthority {
+    request: CanaryAttemptRequest,
+    peer_servers: [CanaryProcessRetirementEvidence; CANARY_PEER_SERVER_SLOTS],
+    latest_peer_reaped_at: Instant,
+}
+
+#[allow(
+    dead_code,
+    reason = "the packaged attempt remains uninhabited until its evidence transaction lands"
+)]
+impl PeerReapedCanaryAttemptAuthority {
+    fn from_reaped_peers(
+        request: &CanaryAttemptRequest,
+        peer_servers: [CanaryProcessRetirementEvidence; CANARY_PEER_SERVER_SLOTS],
+    ) -> Self {
+        let latest_peer_reaped_at = peer_servers
+            .iter()
+            .map(|retirement| retirement.reaped_at)
+            .max()
+            .expect("the fixed peer-server retirement set is nonempty");
+        Self {
+            request: request.clone(),
+            peer_servers,
+            latest_peer_reaped_at,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn request(&self) -> &CanaryAttemptRequest {
+        &self.request
+    }
+
+    #[must_use]
+    pub(crate) const fn peer_servers(
+        &self,
+    ) -> &[CanaryProcessRetirementEvidence; CANARY_PEER_SERVER_SLOTS] {
+        &self.peer_servers
+    }
+
+    #[must_use]
+    pub(crate) const fn latest_peer_reaped_at(&self) -> Instant {
+        self.latest_peer_reaped_at
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture(
+        request: &CanaryAttemptRequest,
+        peer_servers: [CanaryProcessRetirementEvidence; CANARY_PEER_SERVER_SLOTS],
+    ) -> Self {
+        Self::from_reaped_peers(request, peer_servers)
+    }
 }
 
 #[allow(
@@ -5574,7 +6266,11 @@ pub(crate) mod tests {
     use std::fs;
     use std::num::{NonZeroU8, NonZeroU16, NonZeroU32, NonZeroU64};
 
-    use flux_core::{NetworkInventoryTracker, OWNERSHIP_JOURNAL_IDENTITY_BYTES};
+    use flux_core::{
+        InterfaceAddressRecord, InterfaceHardwareType, InterfaceLinkFlags, InterfaceLinkKind,
+        InterfaceLinkRecord, NetworkInventoryTracker, OWNERSHIP_JOURNAL_IDENTITY_BYTES,
+        OpaqueRuleAttribute, RuleAttributeOpacity, RuleOpaqueAttributeFingerprint,
+    };
     use flux_platform::{SingBoxLaunchSpec, SingBoxPrivilege, SingBoxReadiness};
 
     use super::linux_tproxy_checkpoint_boundary::{
@@ -5583,6 +6279,594 @@ pub(crate) mod tests {
     };
     use super::*;
     use crate::RestartPolicy;
+
+    #[derive(Clone, Copy)]
+    enum RetainedFacilityDrift {
+        None,
+        MissingDaemonLinkReference,
+        UnknownDaemonLinkReference,
+        WrongPeerLinkReference,
+        NonVethPeer,
+        TentativeDaemonAddress,
+        ExtraDaemonGlobalIpv6,
+        InvalidDaemonLinkLocal,
+        WrongPeerIpv4Prefix,
+        MissingDaemonRoute,
+        DuplicateDaemonRoute,
+        AlteredDaemonRoute,
+        ResidualDaemonRoute,
+        MissingPeerRule,
+        DuplicatePeerRule,
+        AlteredPeerRule,
+        ResidualPeerRule,
+        DisabledIpv6PeerRule,
+        OpaquePeerRule,
+    }
+
+    fn retained_peer_reaped_authority(
+        request: &CanaryAttemptRequest,
+    ) -> PeerReapedCanaryAttemptAuthority {
+        let started_at = request.deadline().started_at();
+        let retirement = |slot: u32, offset: u64| {
+            CanaryProcessRetirementEvidence::new(
+                CanaryProcessIdentity::new(
+                    NonZeroU32::new(70_000 + slot).expect("peer PID"),
+                    NonZeroU64::new(80_000 + u64::from(slot)).expect("peer start ticks"),
+                ),
+                started_at + Duration::from_millis(offset),
+                started_at + Duration::from_millis(offset + 1),
+                started_at + Duration::from_millis(offset + 2),
+            )
+        };
+        PeerReapedCanaryAttemptAuthority::fixture(
+            request,
+            [retirement(1, 100), retirement(2, 110), retirement(3, 120)],
+        )
+    }
+
+    fn retained_facility_fixture(families: CanaryAddressFamilies) -> Fixture {
+        let engine = EngineFixture::new();
+        Fixture::from_request(request(
+            &engine.spec,
+            families,
+            Instant::now() - Duration::from_millis(500),
+        ))
+    }
+
+    fn retained_facility_observation_fixture(
+        request: &CanaryAttemptRequest,
+        drift: RetainedFacilityDrift,
+    ) -> RetainedCanaryFacilityObservation {
+        let facility = request.pre_binding().environment().facility();
+        let topology = facility.peer_veth_topology();
+        let daemon_veth = facility.daemon_veth();
+        let peer_veth = facility.peer_veth();
+        let veth_kind = InterfaceLinkKind::new(b"veth").expect("veth kind");
+        let daemon_link = InterfaceLinkRecord::new(
+            daemon_veth.interface_index(),
+            daemon_veth.interface_name(),
+            InterfaceHardwareType::from_raw(1),
+            InterfaceLinkFlags::from_bits(0),
+        )
+        .with_kind(veth_kind.clone());
+        let daemon_link = match drift {
+            RetainedFacilityDrift::MissingDaemonLinkReference => daemon_link,
+            RetainedFacilityDrift::UnknownDaemonLinkReference => {
+                daemon_link.with_link_reference(InterfaceLinkReference::UnknownMedia)
+            }
+            _ => daemon_link.with_link_reference(InterfaceLinkReference::Interface(
+                peer_veth.interface_index(),
+            )),
+        };
+        let peer_kind = if matches!(drift, RetainedFacilityDrift::NonVethPeer) {
+            InterfaceLinkKind::new(b"bridge").expect("non-veth kind")
+        } else {
+            veth_kind
+        };
+        let peer_reference = if matches!(drift, RetainedFacilityDrift::WrongPeerLinkReference) {
+            InterfaceLinkReference::Interface(peer_veth.interface_index())
+        } else {
+            InterfaceLinkReference::Interface(daemon_veth.interface_index())
+        };
+        let peer_link = InterfaceLinkRecord::new(
+            peer_veth.interface_index(),
+            peer_veth.interface_name(),
+            InterfaceHardwareType::from_raw(1),
+            InterfaceLinkFlags::from_bits(0),
+        )
+        .with_kind(peer_kind)
+        .with_link_reference(peer_reference);
+
+        let daemon_ipv4_flags = if matches!(drift, RetainedFacilityDrift::TentativeDaemonAddress) {
+            InterfaceAddressFlags::PERMANENT | InterfaceAddressFlags::TENTATIVE
+        } else {
+            InterfaceAddressFlags::PERMANENT
+        };
+        let mut daemon_addresses = vec![
+            InterfaceAddressRecord::new(
+                daemon_veth.interface_index(),
+                IpAddr::V4(facility.ipv4().daemon()),
+                topology.ipv4().daemon_prefix_length(),
+                daemon_ipv4_flags,
+            )
+            .expect("daemon IPv4 address"),
+        ];
+        let peer_ipv4_prefix = if matches!(drift, RetainedFacilityDrift::WrongPeerIpv4Prefix) {
+            topology.ipv4().peer_prefix_length().saturating_sub(1)
+        } else {
+            topology.ipv4().peer_prefix_length()
+        };
+        let mut peer_addresses = vec![
+            InterfaceAddressRecord::new(
+                peer_veth.interface_index(),
+                IpAddr::V4(facility.ipv4().peer()),
+                peer_ipv4_prefix,
+                InterfaceAddressFlags::PERMANENT,
+            )
+            .expect("peer IPv4 address"),
+        ];
+        let mut daemon_routes = Vec::new();
+        let mut peer_routes = Vec::new();
+        if !matches!(drift, RetainedFacilityDrift::MissingDaemonRoute) {
+            daemon_routes.push(
+                expected_host_route(
+                    IpAddr::V4(facility.ipv4().peer()),
+                    daemon_veth.interface_index(),
+                    topology.ipv4().daemon_to_peer_route(),
+                )
+                .expect("daemon IPv4 route"),
+            );
+        }
+        peer_routes.push(
+            expected_host_route(
+                IpAddr::V4(facility.ipv4().daemon()),
+                peer_veth.interface_index(),
+                topology.ipv4().peer_to_daemon_route(),
+            )
+            .expect("peer IPv4 route"),
+        );
+        if matches!(drift, RetainedFacilityDrift::ResidualDaemonRoute) {
+            daemon_routes.push(
+                expected_host_route(
+                    IpAddr::V4(Ipv4Addr::new(11, 0, 0, 99)),
+                    daemon_veth.interface_index(),
+                    topology.ipv4().daemon_to_peer_route(),
+                )
+                .expect("residual daemon route"),
+            );
+        }
+        if matches!(drift, RetainedFacilityDrift::DuplicateDaemonRoute) {
+            daemon_routes.push(daemon_routes[0].clone());
+        }
+        if matches!(drift, RetainedFacilityDrift::AlteredDaemonRoute) {
+            daemon_routes[0] = daemon_routes[0]
+                .clone()
+                .with_preferred_source(IpAddr::V4(facility.ipv4().daemon()))
+                .expect("same-family preferred source");
+        }
+        if matches!(drift, RetainedFacilityDrift::ExtraDaemonGlobalIpv6) {
+            daemon_addresses.push(
+                InterfaceAddressRecord::new(
+                    daemon_veth.interface_index(),
+                    "2001:4860::99".parse().expect("extra global IPv6 address"),
+                    64,
+                    InterfaceAddressFlags::PERMANENT,
+                )
+                .expect("extra daemon global IPv6 address"),
+            );
+        }
+        if let (Some(ipv6), Some(ipv6_topology)) = (facility.ipv6(), topology.ipv6()) {
+            daemon_addresses.extend([
+                InterfaceAddressRecord::new(
+                    daemon_veth.interface_index(),
+                    IpAddr::V6(ipv6.daemon()),
+                    ipv6_topology.daemon_prefix_length(),
+                    InterfaceAddressFlags::PERMANENT,
+                )
+                .expect("daemon IPv6 address"),
+                InterfaceAddressRecord::new(
+                    daemon_veth.interface_index(),
+                    "fe80::1".parse().expect("daemon link-local address"),
+                    if matches!(drift, RetainedFacilityDrift::InvalidDaemonLinkLocal) {
+                        63
+                    } else {
+                        64
+                    },
+                    InterfaceAddressFlags::PERMANENT,
+                )
+                .expect("daemon IPv6 link-local address"),
+            ]);
+            peer_addresses.extend([
+                InterfaceAddressRecord::new(
+                    peer_veth.interface_index(),
+                    IpAddr::V6(ipv6.peer()),
+                    ipv6_topology.peer_prefix_length(),
+                    InterfaceAddressFlags::PERMANENT,
+                )
+                .expect("peer IPv6 address"),
+                InterfaceAddressRecord::new(
+                    peer_veth.interface_index(),
+                    "fe80::2".parse().expect("peer link-local address"),
+                    64,
+                    InterfaceAddressFlags::PERMANENT,
+                )
+                .expect("peer IPv6 link-local address"),
+            ]);
+            if !matches!(drift, RetainedFacilityDrift::MissingDaemonRoute) {
+                daemon_routes.push(
+                    expected_host_route(
+                        IpAddr::V6(ipv6.peer()),
+                        daemon_veth.interface_index(),
+                        ipv6_topology.daemon_to_peer_route(),
+                    )
+                    .expect("daemon IPv6 route"),
+                );
+            }
+            peer_routes.push(
+                expected_host_route(
+                    IpAddr::V6(ipv6.daemon()),
+                    peer_veth.interface_index(),
+                    ipv6_topology.peer_to_daemon_route(),
+                )
+                .expect("peer IPv6 route"),
+            );
+        }
+        let mut daemon_rules = CanaryFlow::ALL
+            .iter()
+            .copied()
+            .filter(|flow| request.requires_flow(*flow))
+            .enumerate()
+            .filter_map(|(index, flow)| {
+                if matches!(drift, RetainedFacilityDrift::MissingPeerRule) && index == 0 {
+                    None
+                } else {
+                    Some(expected_peer_selection_rule(request, flow).expect("canonical peer rule"))
+                }
+            })
+            .collect::<Vec<_>>();
+        if matches!(drift, RetainedFacilityDrift::ResidualPeerRule) {
+            let port = request
+                .responder_port(CanaryFlow::Ipv4TcpEcho)
+                .get()
+                .checked_add(1)
+                .expect("admission rejects maximum responder ports");
+            daemon_rules.push(
+                expected_peer_selection_rule(request, CanaryFlow::Ipv4TcpEcho)
+                    .expect("canonical IPv4 TCP rule")
+                    .with_destination_port_range(
+                        RulePortRange::new(port, port).expect("residual singleton port"),
+                    ),
+            );
+        }
+        if matches!(drift, RetainedFacilityDrift::DuplicatePeerRule) {
+            daemon_rules.push(daemon_rules[0].clone());
+        }
+        if matches!(drift, RetainedFacilityDrift::AlteredPeerRule) {
+            let port = request
+                .responder_port(CanaryFlow::Ipv4TcpEcho)
+                .get()
+                .checked_add(1)
+                .expect("admission rejects maximum responder ports");
+            daemon_rules[0] = daemon_rules[0].clone().with_destination_port_range(
+                RulePortRange::new(port, port).expect("altered singleton port"),
+            );
+        }
+        if matches!(drift, RetainedFacilityDrift::DisabledIpv6PeerRule) {
+            daemon_rules.push(
+                expected_peer_selection_rule(request, CanaryFlow::Ipv6TcpEcho)
+                    .expect("disabled-family rule still has a retained facility endpoint"),
+            );
+        }
+        if matches!(drift, RetainedFacilityDrift::OpaquePeerRule) {
+            let opacity = RuleAttributeOpacity::new(
+                [OpaqueRuleAttribute::new(0x7fff, 0, 4)],
+                0,
+                RuleOpaqueAttributeFingerprint::from_bytes([0x55; 32]),
+            )
+            .expect("opaque rule evidence");
+            daemon_rules[0] = daemon_rules[0].clone().with_attribute_opacity(opacity);
+        }
+
+        let mut daemon_tracker = NetworkInventoryTracker::new();
+        let daemon_inventory = daemon_tracker
+            .publish_complete_with_routing(
+                [daemon_link],
+                daemon_addresses,
+                daemon_routes,
+                daemon_rules,
+            )
+            .expect("daemon retained facility inventory")
+            .clone();
+        let mut peer_tracker = NetworkInventoryTracker::new();
+        let peer_inventory = peer_tracker
+            .publish_complete_with_routing(
+                [peer_link],
+                peer_addresses,
+                peer_routes,
+                std::iter::empty(),
+            )
+            .expect("peer retained facility inventory")
+            .clone();
+        let started_at = request.deadline().started_at();
+        let network = request.pre_binding().environment().authority().network();
+        let listener_started_at = started_at + Duration::from_millis(260);
+        let listener_completed_at = started_at + Duration::from_millis(280);
+        let listener_dumps = canonical_listener_conflict_targets(request)
+            .into_iter()
+            .enumerate()
+            .map(|(index, target)| RetainedCanaryListenerDump {
+                sequence: NonZeroU32::new(u32::try_from(index + 1).expect("bounded dump index"))
+                    .expect("listener sequence is nonzero"),
+                target,
+                started_at: listener_started_at,
+                completed_at: listener_completed_at,
+            })
+            .collect();
+        RetainedCanaryFacilityObservation {
+            daemon_namespace_before: network.daemon_network_namespace(),
+            daemon_namespace_after: network.daemon_network_namespace(),
+            peer_namespace: network.peer_network_namespace(),
+            daemon_inventory: Arc::new(daemon_inventory),
+            peer_inventory: Arc::new(peer_inventory),
+            daemon_started_at: started_at + Duration::from_millis(200),
+            daemon_completed_at: started_at + Duration::from_millis(220),
+            peer_started_at: started_at + Duration::from_millis(230),
+            peer_inventory_completed_at: started_at + Duration::from_millis(250),
+            listener_started_at,
+            listener_completed_at,
+            listener_netlink_port_id: NonZeroU32::new(65_001).expect("netlink port ID"),
+            listener_dumps,
+            listener_conflict_count: 0,
+        }
+    }
+
+    #[test]
+    fn retained_facility_validator_accepts_exact_dual_stack_observation() {
+        let fixture = retained_facility_fixture(CanaryAddressFamilies::Ipv4AndIpv6);
+        let request = fixture.request().clone();
+        let peer_reaped = retained_peer_reaped_authority(&request);
+        let observation =
+            retained_facility_observation_fixture(&request, RetainedFacilityDrift::None);
+
+        let readback =
+            validate_retained_canary_facility_observation(&request, &peer_reaped, &observation)
+                .expect("exact retained facility remains valid");
+
+        assert_eq!(
+            readback.facility(),
+            request.pre_binding().environment().facility()
+        );
+        assert!(readback.observed_at() >= observation.listener_completed_at);
+        assert!(readback.observed_at() < request.deadline().expires_at());
+    }
+
+    #[test]
+    fn retained_facility_validator_accepts_ipv4_and_checks_a_retained_dual_stack_facility() {
+        let ipv4 = retained_facility_fixture(CanaryAddressFamilies::Ipv4Only);
+        let ipv4_request = ipv4.request().clone();
+        let ipv4_peer_reaped = retained_peer_reaped_authority(&ipv4_request);
+        validate_retained_canary_facility_observation(
+            &ipv4_request,
+            &ipv4_peer_reaped,
+            &retained_facility_observation_fixture(&ipv4_request, RetainedFacilityDrift::None),
+        )
+        .expect("exact IPv4 retained facility remains valid");
+
+        let dual = retained_facility_fixture(CanaryAddressFamilies::Ipv4AndIpv6);
+        let mut request = dual.request().clone();
+        request.families = CanaryAddressFamilies::Ipv4Only;
+        let peer_reaped = retained_peer_reaped_authority(&request);
+        validate_retained_canary_facility_observation(
+            &request,
+            &peer_reaped,
+            &retained_facility_observation_fixture(&request, RetainedFacilityDrift::None),
+        )
+        .expect("IPv4 attempt still validates every family retained by its facility");
+        assert_eq!(
+            validate_retained_canary_facility_observation(
+                &request,
+                &peer_reaped,
+                &retained_facility_observation_fixture(
+                    &request,
+                    RetainedFacilityDrift::DisabledIpv6PeerRule,
+                ),
+            ),
+            Err(RetainedCanaryFacilityValidationError::PeerRuleMismatch),
+        );
+    }
+
+    #[test]
+    fn retained_facility_validator_rejects_topology_address_route_and_rule_drift() {
+        let fixture = retained_facility_fixture(CanaryAddressFamilies::Ipv4AndIpv6);
+        let request = fixture.request().clone();
+        let peer_reaped = retained_peer_reaped_authority(&request);
+        for (drift, expected) in [
+            (
+                RetainedFacilityDrift::MissingDaemonLinkReference,
+                RetainedCanaryFacilityValidationError::DaemonVethMismatch,
+            ),
+            (
+                RetainedFacilityDrift::UnknownDaemonLinkReference,
+                RetainedCanaryFacilityValidationError::DaemonVethMismatch,
+            ),
+            (
+                RetainedFacilityDrift::WrongPeerLinkReference,
+                RetainedCanaryFacilityValidationError::PeerVethMismatch,
+            ),
+            (
+                RetainedFacilityDrift::NonVethPeer,
+                RetainedCanaryFacilityValidationError::PeerVethMismatch,
+            ),
+            (
+                RetainedFacilityDrift::TentativeDaemonAddress,
+                RetainedCanaryFacilityValidationError::AddressMismatch,
+            ),
+            (
+                RetainedFacilityDrift::ExtraDaemonGlobalIpv6,
+                RetainedCanaryFacilityValidationError::AddressMismatch,
+            ),
+            (
+                RetainedFacilityDrift::InvalidDaemonLinkLocal,
+                RetainedCanaryFacilityValidationError::AddressMismatch,
+            ),
+            (
+                RetainedFacilityDrift::WrongPeerIpv4Prefix,
+                RetainedCanaryFacilityValidationError::AddressMismatch,
+            ),
+            (
+                RetainedFacilityDrift::MissingDaemonRoute,
+                RetainedCanaryFacilityValidationError::RouteMismatch,
+            ),
+            (
+                RetainedFacilityDrift::DuplicateDaemonRoute,
+                RetainedCanaryFacilityValidationError::RouteMismatch,
+            ),
+            (
+                RetainedFacilityDrift::AlteredDaemonRoute,
+                RetainedCanaryFacilityValidationError::RouteMismatch,
+            ),
+            (
+                RetainedFacilityDrift::ResidualDaemonRoute,
+                RetainedCanaryFacilityValidationError::RouteMismatch,
+            ),
+            (
+                RetainedFacilityDrift::MissingPeerRule,
+                RetainedCanaryFacilityValidationError::PeerRuleMismatch,
+            ),
+            (
+                RetainedFacilityDrift::DuplicatePeerRule,
+                RetainedCanaryFacilityValidationError::PeerRuleMismatch,
+            ),
+            (
+                RetainedFacilityDrift::AlteredPeerRule,
+                RetainedCanaryFacilityValidationError::PeerRuleMismatch,
+            ),
+            (
+                RetainedFacilityDrift::ResidualPeerRule,
+                RetainedCanaryFacilityValidationError::PeerRuleMismatch,
+            ),
+            (
+                RetainedFacilityDrift::OpaquePeerRule,
+                RetainedCanaryFacilityValidationError::PeerRuleMismatch,
+            ),
+        ] {
+            let observation = retained_facility_observation_fixture(&request, drift);
+            assert_eq!(
+                validate_retained_canary_facility_observation(&request, &peer_reaped, &observation,),
+                Err(expected),
+            );
+        }
+    }
+
+    #[test]
+    fn retained_facility_validator_requires_strict_post_reap_complete_empty_listener_interval() {
+        let fixture = retained_facility_fixture(CanaryAddressFamilies::Ipv4Only);
+        let request = fixture.request().clone();
+        let peer_reaped = retained_peer_reaped_authority(&request);
+        let mut observation =
+            retained_facility_observation_fixture(&request, RetainedFacilityDrift::None);
+        observation.daemon_started_at = peer_reaped.latest_peer_reaped_at();
+        assert_eq!(
+            validate_retained_canary_facility_observation(&request, &peer_reaped, &observation),
+            Err(RetainedCanaryFacilityValidationError::InvalidObservationChronology),
+        );
+
+        let mut observation =
+            retained_facility_observation_fixture(&request, RetainedFacilityDrift::None);
+        observation.listener_dumps[1].sequence = observation.listener_dumps[0].sequence;
+        assert_eq!(
+            validate_retained_canary_facility_observation(&request, &peer_reaped, &observation),
+            Err(RetainedCanaryFacilityValidationError::IncompleteListenerObservation),
+        );
+
+        let mut observation =
+            retained_facility_observation_fixture(&request, RetainedFacilityDrift::None);
+        observation.listener_conflict_count = 1;
+        assert_eq!(
+            validate_retained_canary_facility_observation(&request, &peer_reaped, &observation),
+            Err(RetainedCanaryFacilityValidationError::ListenerConflict),
+        );
+
+        let mut observation =
+            retained_facility_observation_fixture(&request, RetainedFacilityDrift::None);
+        let first = observation.listener_dumps[0].target;
+        observation.listener_dumps[0].target = observation.listener_dumps[1].target;
+        observation.listener_dumps[1].target = first;
+        assert_eq!(
+            validate_retained_canary_facility_observation(&request, &peer_reaped, &observation),
+            Err(RetainedCanaryFacilityValidationError::ListenerTargetMismatch),
+        );
+
+        let mut observation =
+            retained_facility_observation_fixture(&request, RetainedFacilityDrift::None);
+        observation.listener_completed_at = request.deadline().expires_at();
+        assert_eq!(
+            validate_retained_canary_facility_observation(&request, &peer_reaped, &observation),
+            Err(RetainedCanaryFacilityValidationError::InvalidObservationChronology),
+        );
+    }
+
+    #[test]
+    fn retained_facility_validator_rejects_namespace_request_and_retirement_substitution() {
+        let fixture = retained_facility_fixture(CanaryAddressFamilies::Ipv4Only);
+        let request = fixture.request().clone();
+        let peer_reaped = retained_peer_reaped_authority(&request);
+        let mut observation =
+            retained_facility_observation_fixture(&request, RetainedFacilityDrift::None);
+        observation.daemon_namespace_after = request
+            .pre_binding()
+            .environment()
+            .authority()
+            .network()
+            .peer_network_namespace();
+        assert_eq!(
+            validate_retained_canary_facility_observation(&request, &peer_reaped, &observation),
+            Err(RetainedCanaryFacilityValidationError::NetworkNamespaceMismatch),
+        );
+
+        let mut substituted_request = request.clone();
+        substituted_request.nonce = CanaryNonce::from_bytes([0x99; FUNCTIONAL_CANARY_NONCE_BYTES]);
+        let substituted = retained_peer_reaped_authority(&substituted_request);
+        let observation =
+            retained_facility_observation_fixture(&request, RetainedFacilityDrift::None);
+        assert_eq!(
+            validate_retained_canary_facility_observation(&request, &substituted, &observation),
+            Err(RetainedCanaryFacilityValidationError::RequestMismatch),
+        );
+
+        let mut invalid_retirement = retained_peer_reaped_authority(&request);
+        invalid_retirement.peer_servers[0].terminated_at =
+            invalid_retirement.peer_servers[0].reaped_at + Duration::from_nanos(1);
+        assert_eq!(
+            validate_retained_canary_facility_observation(
+                &request,
+                &invalid_retirement,
+                &observation,
+            ),
+            Err(RetainedCanaryFacilityValidationError::InvalidPeerRetirementChronology),
+        );
+    }
+
+    #[test]
+    fn retained_facility_bindings_reject_unrepresentable_rule_singletons() {
+        let ports = CanaryResponderPorts::new(
+            NonZeroU16::new(u16::MAX).expect("maximum port is nonzero"),
+            NonZeroU16::new(41_002).expect("UDP responder port"),
+            NonZeroU16::new(41_003).expect("DNS responder port"),
+        );
+        assert_eq!(ports, Err(CanaryBindingError::UnrepresentableResponderPort));
+        let rpdb = CanaryRpdbIdentity::new(
+            NonZeroU32::new(u32::MAX).expect("maximum UID is nonzero"),
+            NonZeroU8::new(99).expect("rule protocol"),
+            RouteTableId::from_raw(10_101),
+            RouteTableId::from_raw(10_102),
+            RulePriority::from_raw(12_100),
+            RulePriority::from_raw(12_000),
+            0x1200,
+            NonZeroU32::new(0xff00).expect("proxy mask"),
+        );
+        assert_eq!(rpdb, Err(CanaryBindingError::UnrepresentableRpdbEngineUid));
+    }
 
     #[test]
     fn linux_tproxy_checkpoint_rejects_output_mark_only_evidence() {

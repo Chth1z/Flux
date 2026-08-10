@@ -33,9 +33,10 @@ use super::super::{
 };
 use super::{XtablesStableFamilyPlan, XtablesStableTopologyError, XtablesStableTopologyPlan};
 use crate::xtables::native_capture::{
-    NativeCaptureCanaryAttempt, NativeCaptureCanaryCounterSnapshot,
-    NativeCaptureCanaryRouteOutcome, NativeCaptureCanaryRouteQuery, NativeCaptureCanarySelector,
-    NativeCaptureOwnershipObservation, NativeCaptureTargetIdentity,
+    NativeCaptureCanaryAttempt, NativeCaptureCanaryCounterRetirement,
+    NativeCaptureCanaryCounterSnapshot, NativeCaptureCanaryRouteOutcome,
+    NativeCaptureCanaryRouteQuery, NativeCaptureCanarySelector, NativeCaptureOwnershipObservation,
+    NativeCaptureTargetIdentity,
 };
 
 const OWNER_PAYLOAD_SCHEMA: u16 = 3;
@@ -2065,16 +2066,44 @@ where
         mut session: NativeXtablesAttemptSession,
     ) -> Result<(), NativeXtablesOwnerError> {
         let plans = canary_attempt_plans(target, attempt.selector())?;
-        self.require_canary_attempt_session(
-            target,
-            attempt,
-            &plans,
-            &session,
-            NativeXtablesAttemptPhase::Active,
-            NativeCanaryAttemptProgress::Active,
-        )?;
+        let terminal_observation_phase = plans
+            .last()
+            .map(|plan| retire_observation_phase(plan.family))
+            .ok_or(NativeXtablesOwnerError::InvalidCanarySelector(
+                "canary attempt has no enabled family",
+            ))?;
+        let observations_retired = if session.record.phase() == NativeXtablesAttemptPhase::Active {
+            self.require_canary_attempt_session(
+                target,
+                attempt,
+                &plans,
+                &session,
+                NativeXtablesAttemptPhase::Active,
+                NativeCanaryAttemptProgress::Active,
+            )?;
+            false
+        } else if session.record.phase() == terminal_observation_phase {
+            self.require_canary_attempt_session(
+                target,
+                attempt,
+                &plans,
+                &session,
+                terminal_observation_phase,
+                NativeCanaryAttemptProgress::RetiringObservations(plans.len()),
+            )?;
+            true
+        } else {
+            return Err(NativeXtablesOwnerError::LiveStateConflict(
+                "native canary retirement found an invalid retained attempt phase",
+            ));
+        };
 
-        if let Err(primary) = self.retire_canary_attempt_objects(target, &plans, &mut session) {
+        let retirement = if observations_retired {
+            self.retire_canary_selector_objects(target, &plans, &mut session)
+        } else {
+            self.retire_canary_attempt_objects(target, &plans, &mut session)
+        };
+        if let Err(primary) = retirement {
             let cause = primary.to_string();
             return match self.normalize_canary_attempt(target, &plans, &mut session) {
                 Ok(()) => Err(NativeXtablesOwnerError::RolledBack {
@@ -2089,6 +2118,75 @@ where
         }
         self.finish_canary_attempt(target, &plans, &mut session)?;
         Ok(())
+    }
+
+    /// Retire only the counted observation chains while retaining selector and recovery authority.
+    fn retire_canary_counters(
+        &mut self,
+        target: &NativeXtablesAdmittedTarget,
+        attempt: NativeCaptureCanaryAttempt,
+        deadline: Instant,
+        session: &mut NativeXtablesAttemptSession,
+    ) -> Result<NativeCaptureCanaryCounterRetirement, NativeXtablesOwnerError> {
+        let plans = canary_attempt_plans(target, attempt.selector())?;
+        if Instant::now() >= deadline {
+            return Err(NativeXtablesOwnerError::InvalidCanaryAttempt(
+                "counter retirement started at or after the immutable canary deadline",
+            ));
+        }
+        self.require_canary_attempt_session(
+            target,
+            attempt,
+            &plans,
+            session,
+            NativeXtablesAttemptPhase::Active,
+            NativeCanaryAttemptProgress::Active,
+        )?;
+
+        let retirement = (|| {
+            self.retire_canary_observation_objects(target, &plans, session, Some(deadline))?;
+            let retired_at = Instant::now();
+            let terminal_phase = plans
+                .last()
+                .map(|plan| retire_observation_phase(plan.family))
+                .ok_or(NativeXtablesOwnerError::InvalidCanarySelector(
+                    "canary attempt has no enabled family",
+                ))?;
+            self.require_canary_attempt_session(
+                target,
+                attempt,
+                &plans,
+                session,
+                terminal_phase,
+                NativeCanaryAttemptProgress::RetiringObservations(plans.len()),
+            )?;
+            let absent_observed_at = Instant::now();
+            if absent_observed_at >= deadline {
+                return Err(NativeXtablesOwnerError::InvalidCanaryAttempt(
+                    "counter retirement completed at or after the immutable canary deadline",
+                ));
+            }
+            Ok(NativeCaptureCanaryCounterRetirement::new(
+                retired_at,
+                absent_observed_at,
+            ))
+        })();
+        match retirement {
+            Ok(retirement) => Ok(retirement),
+            Err(primary) => {
+                let cause = primary.to_string();
+                match self.normalize_canary_attempt(target, &plans, session) {
+                    Ok(()) => Err(NativeXtablesOwnerError::RolledBack {
+                        cause: cause.into_boxed_str(),
+                        state: NativeXtablesConvergedState::Active(target.identity()),
+                    }),
+                    Err(compensation) => Err(NativeXtablesOwnerError::Uncertain {
+                        primary: cause.into_boxed_str(),
+                        compensation: compensation.to_string().into_boxed_str(),
+                    }),
+                }
+            }
+        }
     }
 
     /// Resolve one fixed-purpose TCP route while the exact selector and native target remain
@@ -2293,7 +2391,23 @@ where
         plans: &[NativeCanaryAttemptFamilyPlan],
         session: &mut NativeXtablesAttemptSession,
     ) -> Result<(), NativeXtablesOwnerError> {
+        self.retire_canary_observation_objects(target, plans, session, None)?;
+        self.retire_canary_selector_objects(target, plans, session)
+    }
+
+    fn retire_canary_observation_objects(
+        &mut self,
+        target: &NativeXtablesAdmittedTarget,
+        plans: &[NativeCanaryAttemptFamilyPlan],
+        session: &mut NativeXtablesAttemptSession,
+        deadline: Option<Instant>,
+    ) -> Result<(), NativeXtablesOwnerError> {
         for (index, plan) in plans.iter().enumerate() {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Err(NativeXtablesOwnerError::InvalidCanaryAttempt(
+                    "counter retirement reached the immutable canary deadline",
+                ));
+            }
             self.advance_canary_attempt(plans, session, retire_observation_phase(plan.family))?;
             self.apply_canary_attempt_artifact(
                 target,
@@ -2303,6 +2417,15 @@ where
                 NativeCanaryAttemptProgress::RetiringObservations(index + 1),
             )?;
         }
+        Ok(())
+    }
+
+    fn retire_canary_selector_objects(
+        &mut self,
+        target: &NativeXtablesAdmittedTarget,
+        plans: &[NativeCanaryAttemptFamilyPlan],
+        session: &mut NativeXtablesAttemptSession,
+    ) -> Result<(), NativeXtablesOwnerError> {
         for (index, plan) in plans.iter().enumerate() {
             self.advance_canary_attempt(plans, session, retire_selector_phase(plan.family))?;
             self.apply_canary_attempt_artifact(

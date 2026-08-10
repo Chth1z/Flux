@@ -79,7 +79,7 @@ fn zero_to_active_and_idempotent_active_use_one_exact_transaction() {
 }
 
 #[test]
-fn dual_stack_canary_selector_population_and_retirement_are_exact() {
+fn dual_stack_canary_selector_population_and_two_stage_retirement_are_exact() {
     const EXPECTED_IPV4: &str = concat!(
         "*mangle\n",
         "-F FLX4C0000000007\n",
@@ -210,15 +210,46 @@ fn dual_stack_canary_selector_population_and_retirement_are_exact() {
     assert!(!owner.target_is_exact_active(&target).unwrap());
 
     owner.adapter.operations.clear();
-    owner
-        .retire_canary_selector(&target, canary_attempt(true), session)
-        .expect("retire exact dual-stack canary selector");
+    let mut session = session;
+    let started_at = Instant::now();
+    let deadline = started_at + Duration::from_secs(30);
+    let counter_retirement = owner
+        .retire_canary_counters(&target, canary_attempt(true), deadline, &mut session)
+        .expect("retire the exact dual-stack counter object first");
 
     assert_eq!(
         owner.adapter.operations,
         [
             "restore:ipv4:retire_canary_observation:7",
             "restore:ipv6:retire_canary_observation:7",
+        ]
+    );
+    assert!(counter_retirement.retired_at() >= started_at);
+    assert!(counter_retirement.absent_observed_at() >= counter_retirement.retired_at());
+    assert!(counter_retirement.absent_observed_at() < deadline);
+    for family in ALL_XTABLES_FAMILIES {
+        let state = owner.adapter.family_state(family);
+        assert!(state.canary_selector.is_some());
+        assert!(state.canary_observation.is_none());
+    }
+    assert_eq!(owner.durable.load_journal().unwrap().unwrap(), primary);
+    assert_eq!(
+        std::fs::read(owner.durable.journal_path()).unwrap(),
+        primary_bytes
+    );
+    assert_eq!(
+        owner.durable.load_attempt().unwrap().unwrap().phase(),
+        NativeXtablesAttemptPhase::RetireObservationIpv6
+    );
+
+    owner.adapter.operations.clear();
+    owner
+        .retire_canary_selector(&target, canary_attempt(true), session)
+        .expect("retire the retained dual-stack canary selector");
+
+    assert_eq!(
+        owner.adapter.operations,
+        [
             "restore:ipv4:retire_canary_selector:7",
             "restore:ipv6:retire_canary_selector:7",
         ]
@@ -646,6 +677,38 @@ fn canary_counter_readback_rejects_an_expired_deadline_before_counted_save() {
         )
     ));
     assert!(owner.adapter.canary_counter_reads.is_empty());
+    owner
+        .retire_canary_selector(&target, attempt, session)
+        .unwrap();
+}
+
+#[test]
+fn canary_counter_retirement_rejects_an_expired_deadline_before_mutation() {
+    let target = canary_target(7, AddressHostFamilySelection::Ipv4);
+    let fixture = Fixture::new([target.clone()]);
+    let mut owner = fixture.owner();
+    let attempt = canary_attempt(false);
+    owner
+        .converge(NativeXtablesDesiredTarget::Active(target.clone()))
+        .unwrap();
+    let mut session = owner.populate_canary_selector(&target, attempt).unwrap();
+    owner.adapter.operations.clear();
+
+    let error = owner
+        .retire_canary_counters(&target, attempt, Instant::now(), &mut session)
+        .expect_err("an expired deadline must retain the complete active attempt");
+
+    assert!(matches!(
+        error,
+        NativeXtablesOwnerError::InvalidCanaryAttempt(
+            "counter retirement started at or after the immutable canary deadline"
+        )
+    ));
+    assert!(owner.adapter.operations.is_empty());
+    assert_eq!(
+        owner.durable.load_attempt().unwrap().unwrap().phase(),
+        NativeXtablesAttemptPhase::Active
+    );
     owner
         .retire_canary_selector(&target, attempt, session)
         .unwrap();
@@ -1739,6 +1802,29 @@ fn runtime_writer_holds_the_runtime_guard_for_the_complete_canary_attempt() {
     assert_eq!(counter_snapshot.capture_packets(), 4);
     assert_eq!(counter_snapshot.bypass_packets(), 4);
     assert_eq!(counter_snapshot.recapture_packets(), 0);
+    assert!(matches!(
+        receiver.recv_timeout(Duration::from_millis(50)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    ));
+
+    let counter_retirement = writer
+        .retire_canary_counters(&target, attempt, Instant::now() + Duration::from_secs(30))
+        .expect("counter retirement must retain the attempt guard and selector");
+    assert!(counter_retirement.absent_observed_at() >= counter_retirement.retired_at());
+    assert!(
+        writer
+            .test_adapter()
+            .family_state(XtablesRestoreFamily::Ipv4)
+            .canary_selector
+            .is_some()
+    );
+    assert!(
+        writer
+            .test_adapter()
+            .family_state(XtablesRestoreFamily::Ipv4)
+            .canary_observation
+            .is_none()
+    );
     assert!(matches!(
         receiver.recv_timeout(Duration::from_millis(50)),
         Err(std::sync::mpsc::RecvTimeoutError::Timeout)

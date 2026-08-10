@@ -460,6 +460,33 @@ impl NativeCaptureCanaryCounterSnapshot {
     }
 }
 
+/// Exact retirement of the active canary counter object while its selector remains owned.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeCaptureCanaryCounterRetirement {
+    retired_at: Instant,
+    absent_observed_at: Instant,
+}
+
+impl NativeCaptureCanaryCounterRetirement {
+    #[must_use]
+    pub(crate) const fn new(retired_at: Instant, absent_observed_at: Instant) -> Self {
+        Self {
+            retired_at,
+            absent_observed_at,
+        }
+    }
+
+    #[must_use]
+    pub const fn retired_at(self) -> Instant {
+        self.retired_at
+    }
+
+    #[must_use]
+    pub const fn absent_observed_at(self) -> Instant {
+        self.absent_observed_at
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NativeCaptureDesired<T> {
     Active(T),
@@ -567,6 +594,20 @@ pub trait NativeCaptureConvergence: Send + 'static {
         _attempt: NativeCaptureCanaryAttempt,
         _deadline: Instant,
     ) -> Result<Option<NativeCaptureCanaryCounterSnapshot>, Self::Error> {
+        Ok(None)
+    }
+
+    /// Retires the exact canary counter object while retaining the active selector session.
+    ///
+    /// `None` means this implementation cannot provide the intermediate cleanup boundary. A
+    /// supported implementation must prove counter absence before `deadline`; final selector and
+    /// recovery-record retirement remain owned by [`Self::retire_canary_selector`].
+    fn retire_canary_counters(
+        &mut self,
+        _target: &Self::Target,
+        _attempt: NativeCaptureCanaryAttempt,
+        _deadline: Instant,
+    ) -> Result<Option<NativeCaptureCanaryCounterRetirement>, Self::Error> {
         Ok(None)
     }
 

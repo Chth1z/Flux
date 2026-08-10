@@ -38,11 +38,12 @@ use crate::xtables::owner_durable::{
     NativeXtablesRuntimeGuard,
 };
 use crate::xtables::{
-    NativeCaptureCanaryAttempt, NativeCaptureCanaryCounterSnapshot,
-    NativeCaptureCanaryRouteOutcome, NativeCaptureCanaryRouteQuery, NativeCaptureConvergedState,
-    NativeCaptureConvergence, NativeCaptureConvergenceReport, NativeCaptureDesired,
-    NativeCaptureOwnershipObservation, NativeCaptureTargetIdentity, XtablesCaptureArtifactSet,
-    XtablesLocalOutputRoutingSpec, XtablesLocalOutputRoutingTarget, XtablesRestoreFamily,
+    NativeCaptureCanaryAttempt, NativeCaptureCanaryCounterRetirement,
+    NativeCaptureCanaryCounterSnapshot, NativeCaptureCanaryRouteOutcome,
+    NativeCaptureCanaryRouteQuery, NativeCaptureConvergedState, NativeCaptureConvergence,
+    NativeCaptureConvergenceReport, NativeCaptureDesired, NativeCaptureOwnershipObservation,
+    NativeCaptureTargetIdentity, XtablesCaptureArtifactSet, XtablesLocalOutputRoutingSpec,
+    XtablesLocalOutputRoutingTarget, XtablesRestoreFamily,
 };
 
 const NATIVE_ROUTE_METRIC: u32 = 1_024;
@@ -1226,6 +1227,18 @@ impl NativeCaptureConvergence for NativeXtablesCaptureConverger {
             .map_err(|source| NativeXtablesCaptureConvergenceError { source })
     }
 
+    fn retire_canary_counters(
+        &mut self,
+        target: &Self::Target,
+        attempt: NativeCaptureCanaryAttempt,
+        deadline: Instant,
+    ) -> Result<Option<NativeCaptureCanaryCounterRetirement>, Self::Error> {
+        self.inner
+            .retire_canary_counters(&target.inner, attempt, deadline)
+            .map(Some)
+            .map_err(|source| NativeXtablesCaptureConvergenceError { source })
+    }
+
     fn converge(
         &mut self,
         desired: NativeCaptureDesired<Self::Target>,
@@ -1459,6 +1472,28 @@ where
             .observe_canary_counters(target, attempt, deadline, &active.session)
         {
             Ok(snapshot) => Ok(snapshot),
+            Err(source) => {
+                self.recovered = false;
+                Err(NativeXtablesRuntimeWriterError::Owner(Box::new(source)))
+            }
+        }
+    }
+
+    pub(crate) fn retire_canary_counters(
+        &mut self,
+        target: &NativeXtablesAdmittedTarget,
+        attempt: NativeCaptureCanaryAttempt,
+        deadline: Instant,
+    ) -> Result<NativeCaptureCanaryCounterRetirement, NativeXtablesRuntimeWriterError> {
+        if !self.recovered {
+            return Err(NativeXtablesRuntimeWriterError::RecoveryRequired);
+        }
+        let (owner, active_attempt) = (&mut self.owner, &mut self.active_attempt);
+        let active = active_attempt
+            .as_mut()
+            .ok_or(NativeXtablesRuntimeWriterError::RecoveryRequired)?;
+        match owner.retire_canary_counters(target, attempt, deadline, &mut active.session) {
+            Ok(retirement) => Ok(retirement),
             Err(source) => {
                 self.recovered = false;
                 Err(NativeXtablesRuntimeWriterError::Owner(Box::new(source)))

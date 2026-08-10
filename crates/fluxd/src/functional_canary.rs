@@ -269,7 +269,6 @@ pub(crate) struct CanaryAttemptObjectIdentities {
     generation: GenerationId,
     nonce: CanaryNonce,
     selector: CanaryAttemptObjectIdentity,
-    leak_guard: CanaryAttemptObjectIdentity,
     counters: CanaryAttemptObjectIdentity,
     listener_delivery_report: CanaryAttemptObjectIdentity,
 }
@@ -279,11 +278,10 @@ impl CanaryAttemptObjectIdentities {
         generation: GenerationId,
         nonce: CanaryNonce,
         selector: CanaryAttemptObjectIdentity,
-        leak_guard: CanaryAttemptObjectIdentity,
         counters: CanaryAttemptObjectIdentity,
         listener_delivery_report: CanaryAttemptObjectIdentity,
     ) -> Result<Self, CanaryBindingError> {
-        let identities = [selector, leak_guard, counters, listener_delivery_report];
+        let identities = [selector, counters, listener_delivery_report];
         for (index, identity) in identities.iter().enumerate() {
             if identities[index + 1..].contains(identity) {
                 return Err(CanaryBindingError::AttemptObjectIdentityCollision);
@@ -293,7 +291,6 @@ impl CanaryAttemptObjectIdentities {
             generation,
             nonce,
             selector,
-            leak_guard,
             counters,
             listener_delivery_report,
         })
@@ -312,11 +309,6 @@ impl CanaryAttemptObjectIdentities {
     #[must_use]
     pub(crate) const fn selector(self) -> CanaryAttemptObjectIdentity {
         self.selector
-    }
-
-    #[must_use]
-    pub(crate) const fn leak_guard(self) -> CanaryAttemptObjectIdentity {
-        self.leak_guard
     }
 
     #[must_use]
@@ -3283,34 +3275,8 @@ impl CanaryAttemptObjectRetirementEvidence {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct CanaryAttemptRecordRetirementEvidence {
-    generation: GenerationId,
-    nonce: CanaryNonce,
-    retired_at: Instant,
-    absent_observed_at: Instant,
-}
-
-impl CanaryAttemptRecordRetirementEvidence {
-    #[must_use]
-    pub(crate) const fn new(
-        generation: GenerationId,
-        nonce: CanaryNonce,
-        retired_at: Instant,
-        absent_observed_at: Instant,
-    ) -> Self {
-        Self {
-            generation,
-            nonce,
-            retired_at,
-            absent_observed_at,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CanaryCleanupObjectRole {
     Selector,
-    LeakGuard,
     Counters,
     ListenerDeliveryReport,
 }
@@ -3321,10 +3287,8 @@ pub(crate) struct UnqualifiedCanaryCleanupEvidence {
     client: CanaryProcessRetirementEvidence,
     peer_servers: [CanaryProcessRetirementEvidence; CANARY_PEER_SERVER_SLOTS],
     selector_retirement: Option<CanaryAttemptObjectRetirementEvidence>,
-    leak_guard_retirement: CanaryAttemptObjectRetirementEvidence,
     counters_retirement: CanaryAttemptObjectRetirementEvidence,
     listener_delivery_report: CanaryListenerDeliveryReportCleanupEvidence,
-    attempt_record: CanaryAttemptRecordRetirementEvidence,
     retained_facility: CanaryFacilityIdentity,
     retained_facility_observed_at: Instant,
 }
@@ -3337,10 +3301,8 @@ impl UnqualifiedCanaryCleanupEvidence {
         client: CanaryProcessRetirementEvidence,
         peer_servers: [CanaryProcessRetirementEvidence; CANARY_PEER_SERVER_SLOTS],
         selector_retirement: Option<CanaryAttemptObjectRetirementEvidence>,
-        leak_guard_retirement: CanaryAttemptObjectRetirementEvidence,
         counters_retirement: CanaryAttemptObjectRetirementEvidence,
         listener_delivery_report: CanaryListenerDeliveryReportCleanupEvidence,
-        attempt_record: CanaryAttemptRecordRetirementEvidence,
         retained_facility: CanaryFacilityIdentity,
         retained_facility_observed_at: Instant,
     ) -> Self {
@@ -3349,10 +3311,8 @@ impl UnqualifiedCanaryCleanupEvidence {
             client,
             peer_servers,
             selector_retirement,
-            leak_guard_retirement,
             counters_retirement,
             listener_delivery_report,
-            attempt_record,
             retained_facility,
             retained_facility_observed_at,
         }
@@ -3841,9 +3801,6 @@ pub(crate) enum CanaryEvidenceError {
         slot: usize,
     },
     CleanupProcessIdentityCollision,
-    CleanupAttemptRecordMismatch,
-    CleanupAttemptRecordTimingInvalid,
-    CleanupAttemptRecordRetiredBeforePeerReap,
     CleanupFacilityChanged,
     CleanupFacilityObservedBeforeSettlement,
     CleanupTimingAfterGateCompletion,
@@ -4720,18 +4677,11 @@ fn validate_cleanup_evidence(
     }
 
     let expected_objects = environment.attempt_objects;
-    let object_retirements = [
-        (
-            CanaryCleanupObjectRole::LeakGuard,
-            cleanup.leak_guard_retirement,
-            expected_objects.leak_guard(),
-        ),
-        (
-            CanaryCleanupObjectRole::Counters,
-            cleanup.counters_retirement,
-            expected_objects.counters(),
-        ),
-    ];
+    let object_retirements = [(
+        CanaryCleanupObjectRole::Counters,
+        cleanup.counters_retirement,
+        expected_objects.counters(),
+    )];
     let mut last_object_absence_observed_at = client.reaped_at;
     for (object, retirement, expected_identity) in object_retirements {
         if retirement.object != expected_identity {
@@ -4838,26 +4788,6 @@ fn validate_cleanup_evidence(
         }
         cleanup_settled_at = std::cmp::max(cleanup_settled_at, peer.reaped_at);
     }
-
-    let attempt_record = cleanup.attempt_record;
-    if attempt_record.generation != request.pre_binding.engine.generation()
-        || attempt_record.nonce != request.nonce()
-    {
-        return Err(CanaryEvidenceError::CleanupAttemptRecordMismatch);
-    }
-    if attempt_record.retired_at > attempt_record.absent_observed_at {
-        return Err(CanaryEvidenceError::CleanupAttemptRecordTimingInvalid);
-    }
-    validate_cleanup_timestamp(attempt_record.retired_at, attempt_completed_at, deadline)?;
-    validate_cleanup_timestamp(
-        attempt_record.absent_observed_at,
-        attempt_completed_at,
-        deadline,
-    )?;
-    if attempt_record.retired_at < cleanup_settled_at {
-        return Err(CanaryEvidenceError::CleanupAttemptRecordRetiredBeforePeerReap);
-    }
-    cleanup_settled_at = attempt_record.absent_observed_at;
 
     if cleanup.retained_facility != environment.facility {
         return Err(CanaryEvidenceError::CleanupFacilityChanged);
@@ -5723,7 +5653,7 @@ pub(crate) mod tests {
                         .pre_binding()
                         .environment()
                         .attempt_objects()
-                        .leak_guard(),
+                        .counters(),
                     executor_completed_at + Duration::from_nanos(1),
                     executor_completed_at + Duration::from_nanos(2),
                 ))
@@ -7530,29 +7460,6 @@ pub(crate) mod tests {
             CanaryEvidenceError::CleanupProcessIdentityCollision
         );
 
-        let mut wrong_attempt_record = fixture.successful_evidence();
-        wrong_attempt_record.cleanup.attempt_record.nonce =
-            CanaryNonce::from_bytes([9; FUNCTIONAL_CANARY_NONCE_BYTES]);
-        assert_eq!(
-            validate(&fixture, wrong_attempt_record)
-                .expect_err("cleanup must retire the exact attempt record"),
-            CanaryEvidenceError::CleanupAttemptRecordMismatch
-        );
-
-        let mut attempt_record_retired_before_peer_reap = fixture.successful_evidence();
-        attempt_record_retired_before_peer_reap
-            .cleanup
-            .attempt_record
-            .retired_at = attempt_record_retired_before_peer_reap.cleanup.peer_servers
-            [CANARY_PEER_SERVER_SLOTS - 1]
-            .reaped_at
-            - Duration::from_nanos(1);
-        assert_eq!(
-            validate(&fixture, attempt_record_retired_before_peer_reap)
-                .expect_err("the attempt record outlives all peer servers"),
-            CanaryEvidenceError::CleanupAttemptRecordRetiredBeforePeerReap
-        );
-
         let mut facility_observed_before_settlement = fixture.successful_evidence();
         facility_observed_before_settlement
             .cleanup
@@ -7594,8 +7501,6 @@ pub(crate) mod tests {
                 CanaryNonce::from_bytes([2; FUNCTIONAL_CANARY_NONCE_BYTES]),
                 identity,
                 identity,
-                CanaryAttemptObjectIdentity::new([3; CANARY_ATTEMPT_OBJECT_IDENTITY_BYTES])
-                    .expect("counter identity"),
                 CanaryAttemptObjectIdentity::new([4; CANARY_ATTEMPT_OBJECT_IDENTITY_BYTES])
                     .expect("report identity"),
             ),
@@ -8268,8 +8173,6 @@ pub(crate) mod tests {
             nonce,
             CanaryAttemptObjectIdentity::new([5; CANARY_ATTEMPT_OBJECT_IDENTITY_BYTES])
                 .expect("selector identity"),
-            CanaryAttemptObjectIdentity::new([6; CANARY_ATTEMPT_OBJECT_IDENTITY_BYTES])
-                .expect("guard identity"),
             CanaryAttemptObjectIdentity::new([7; CANARY_ATTEMPT_OBJECT_IDENTITY_BYTES])
                 .expect("counter identity"),
             CanaryAttemptObjectIdentity::new([15; CANARY_ATTEMPT_OBJECT_IDENTITY_BYTES])
@@ -8391,11 +8294,6 @@ pub(crate) mod tests {
                 started_at + Duration::from_millis(202),
             )),
             CanaryAttemptObjectRetirementEvidence::new(
-                request.pre_binding.environment.attempt_objects.leak_guard(),
-                started_at + Duration::from_millis(117),
-                started_at + Duration::from_millis(121),
-            ),
-            CanaryAttemptObjectRetirementEvidence::new(
                 request.pre_binding.environment.attempt_objects.counters(),
                 started_at + Duration::from_millis(118),
                 started_at + Duration::from_millis(122),
@@ -8410,12 +8308,6 @@ pub(crate) mod tests {
                     started_at + Duration::from_millis(119),
                     started_at + Duration::from_millis(123),
                 ),
-            ),
-            CanaryAttemptRecordRetirementEvidence::new(
-                request.pre_binding.engine.generation(),
-                request.nonce(),
-                started_at + Duration::from_millis(140),
-                started_at + Duration::from_millis(141),
             ),
             request.pre_binding.environment.facility,
             started_at + Duration::from_millis(150),

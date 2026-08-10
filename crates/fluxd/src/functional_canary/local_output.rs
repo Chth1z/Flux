@@ -129,16 +129,13 @@ trait TproxyLocalOutputDriver: Send + 'static {
     ) -> Result<(), TproxyLocalOutputUnavailable>;
 
     /// Return the prepared attempt after consuming any report prebind/install
-    /// operations required before traffic starts.
-    ///
-    /// This phase must not mutate networking state. Therefore an error from
-    /// this method may claim `NotRequired` cleanup only. Once a prepared value
-    /// exists, the executor conservatively treats all later failures as
-    /// potentially post-mutation.
+    /// operations required before traffic starts. Failures retain their exact
+    /// cleanup status because installing the report producer can require
+    /// explicit recovery even though networking mutation has not started.
     fn prepare_tproxy_local_output(
         &mut self,
         execution: &mut UnqualifiedFunctionalCanaryExecution<'_>,
-    ) -> Result<Self::Prepared, TproxyLocalOutputUnavailable>;
+    ) -> Result<Self::Prepared, FunctionalCanaryError>;
 }
 
 struct TproxyLocalOutputUnavailable {
@@ -2343,10 +2340,7 @@ where
         self.driver
             .check_tproxy_local_output(request)
             .map_err(TproxyLocalOutputUnavailable::into_functional_error)?;
-        let prepared = self
-            .driver
-            .prepare_tproxy_local_output(&mut execution)
-            .map_err(TproxyLocalOutputUnavailable::into_functional_error)?;
+        let prepared = self.driver.prepare_tproxy_local_output(&mut execution)?;
         let (request, socket_observer, engine_child) = execution
             .into_selector_ready_parts(selector_session)
             .map_err(normalize_post_preparation_failure)?;
@@ -2747,13 +2741,14 @@ impl TproxyLocalOutputDriver for XtablesTproxyLocalOutputDriver {
     fn prepare_tproxy_local_output(
         &mut self,
         execution: &mut UnqualifiedFunctionalCanaryExecution<'_>,
-    ) -> Result<Self::Prepared, TproxyLocalOutputUnavailable> {
+    ) -> Result<Self::Prepared, FunctionalCanaryError> {
         let request = execution.request();
         debug_assert_eq!(request.capture_backend(), CanaryCaptureBackend::Tproxy);
         Err(TproxyLocalOutputUnavailable::new(
             CanaryAvailability::Unsupported,
             XTABLES_LOCAL_OUTPUT_UNSUPPORTED,
-        ))
+        )
+        .into_functional_error())
     }
 }
 
@@ -3432,6 +3427,51 @@ mod tests {
     }
 
     #[test]
+    fn report_install_failure_preserves_cleanup_uncertainty_during_preparation() {
+        let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+        let request = fixture.request();
+        let socket_observer = CanaryAttemptSocketObserverSession::scripted(
+            request
+                .pre_binding()
+                .environment()
+                .authority()
+                .socket_observer_binding(),
+            request.deadline(),
+        );
+        let execution = UnqualifiedFunctionalCanaryExecution::new(
+            request,
+            socket_observer,
+            admitted_report_binding(request),
+            Box::new(|_| {
+                Err(FunctionalCanaryError::new(
+                    CanaryErrorKind::CleanupUncertain,
+                    CanaryCleanupStatus::Uncertain,
+                    "injected report installation uncertainty",
+                ))
+            }),
+            Box::new(|| panic!("engine authority must not open after preparation fails")),
+        )
+        .expect("observer binding is valid");
+        let mut executor = TproxyLocalOutputExecutor::new(
+            ReportInstallFailureDriver,
+            NeverCalledCaptureVerifier,
+            NeverCalledProcessOwnershipVerifier,
+            NeverCalledEvidenceFactory,
+        );
+
+        let error = executor
+            .execute_with_reserved_selector(execution)
+            .expect_err("report installation uncertainty must leave preparation directly");
+
+        assert_eq!(error.kind(), CanaryErrorKind::CleanupUncertain);
+        assert_eq!(error.cleanup(), CanaryCleanupStatus::Uncertain);
+        assert_eq!(
+            error.diagnostic(),
+            "injected report installation uncertainty"
+        );
+    }
+
+    #[test]
     fn authority_open_failure_after_preparation_is_cleanup_uncertain() {
         let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
         let request = fixture.request();
@@ -3811,8 +3851,12 @@ mod tests {
             Err(error) => error,
         };
 
-        assert_eq!(error.availability, CanaryAvailability::Broken);
-        assert!(error.diagnostic.contains("already consumed"));
+        assert_eq!(
+            error.kind(),
+            CanaryErrorKind::Availability(CanaryAvailability::Broken)
+        );
+        assert_eq!(error.cleanup(), CanaryCleanupStatus::NotRequired);
+        assert!(error.diagnostic().contains("already consumed"));
     }
 
     #[cfg(target_os = "linux")]
@@ -4124,13 +4168,14 @@ mod tests {
         fn prepare_tproxy_local_output(
             &mut self,
             execution: &mut UnqualifiedFunctionalCanaryExecution<'_>,
-        ) -> Result<Self::Prepared, TproxyLocalOutputUnavailable> {
+        ) -> Result<Self::Prepared, FunctionalCanaryError> {
             let request = execution.request();
             let prepared = self.prepared.take().ok_or_else(|| {
                 TproxyLocalOutputUnavailable::new(
                     CanaryAvailability::Broken,
                     "scripted prepared process authority was already consumed",
                 )
+                .into_functional_error()
             })?;
             assert_eq!(&prepared.capture_proof.request, request);
             install_scripted_report(execution);
@@ -4530,16 +4575,50 @@ mod tests {
         fn prepare_tproxy_local_output(
             &mut self,
             _execution: &mut UnqualifiedFunctionalCanaryExecution<'_>,
-        ) -> Result<Self::Prepared, TproxyLocalOutputUnavailable> {
+        ) -> Result<Self::Prepared, FunctionalCanaryError> {
             Err(TproxyLocalOutputUnavailable::new(
                 CanaryAvailability::Broken,
                 "counting driver should not be called for a substitute backend",
-            ))
+            )
+            .into_functional_error())
         }
     }
 
     struct UnavailableDriver {
         availability: CanaryAvailability,
+    }
+
+    struct ReportInstallFailureDriver;
+
+    impl TproxyLocalOutputDriver for ReportInstallFailureDriver {
+        type Prepared = PreparedFailure;
+
+        fn check_tproxy_local_output(
+            &self,
+            _request: &CanaryAttemptRequest,
+        ) -> Result<(), TproxyLocalOutputUnavailable> {
+            Ok(())
+        }
+
+        fn prepare_tproxy_local_output(
+            &mut self,
+            execution: &mut UnqualifiedFunctionalCanaryExecution<'_>,
+        ) -> Result<Self::Prepared, FunctionalCanaryError> {
+            let (producer, collector) =
+                execution.prebind_supervised_delivery_report(Instant::now as fn() -> Instant)?;
+            let result = execution
+                .install_supervised_delivery_report(producer.into_engine_handoff())
+                .and_then(|installed| {
+                    drop(installed);
+                    Err(FunctionalCanaryError::new(
+                        CanaryErrorKind::AdapterFailure,
+                        CanaryCleanupStatus::Uncertain,
+                        "report installation unexpectedly succeeded",
+                    ))
+                });
+            drop(collector);
+            result
+        }
     }
 
     impl TproxyLocalOutputDriver for UnavailableDriver {
@@ -4558,11 +4637,12 @@ mod tests {
         fn prepare_tproxy_local_output(
             &mut self,
             _execution: &mut UnqualifiedFunctionalCanaryExecution<'_>,
-        ) -> Result<Self::Prepared, TproxyLocalOutputUnavailable> {
+        ) -> Result<Self::Prepared, FunctionalCanaryError> {
             Err(TproxyLocalOutputUnavailable::new(
                 self.availability,
                 "synthetic pre-mutation unavailability",
-            ))
+            )
+            .into_functional_error())
         }
     }
 
@@ -4593,7 +4673,7 @@ mod tests {
         fn prepare_tproxy_local_output(
             &mut self,
             execution: &mut UnqualifiedFunctionalCanaryExecution<'_>,
-        ) -> Result<Self::Prepared, TproxyLocalOutputUnavailable> {
+        ) -> Result<Self::Prepared, FunctionalCanaryError> {
             assert_eq!(self.stage.load(Ordering::SeqCst), 1);
             install_scripted_report(execution);
             assert_eq!(self.stage.fetch_add(1, Ordering::SeqCst), 1);
@@ -4645,7 +4725,7 @@ mod tests {
         fn prepare_tproxy_local_output(
             &mut self,
             execution: &mut UnqualifiedFunctionalCanaryExecution<'_>,
-        ) -> Result<Self::Prepared, TproxyLocalOutputUnavailable> {
+        ) -> Result<Self::Prepared, FunctionalCanaryError> {
             let (producer, collector) = execution
                 .prebind_supervised_delivery_report(Instant::now as fn() -> Instant)
                 .expect("prebind the report without installing its producer");
@@ -4690,7 +4770,7 @@ mod tests {
         fn prepare_tproxy_local_output(
             &mut self,
             execution: &mut UnqualifiedFunctionalCanaryExecution<'_>,
-        ) -> Result<Self::Prepared, TproxyLocalOutputUnavailable> {
+        ) -> Result<Self::Prepared, FunctionalCanaryError> {
             self.prepare_calls.fetch_add(1, Ordering::SeqCst);
             install_scripted_report(execution);
             Ok(PreparedFailure {
@@ -4713,7 +4793,7 @@ mod tests {
         fn prepare_tproxy_local_output(
             &mut self,
             execution: &mut UnqualifiedFunctionalCanaryExecution<'_>,
-        ) -> Result<Self::Prepared, TproxyLocalOutputUnavailable> {
+        ) -> Result<Self::Prepared, FunctionalCanaryError> {
             install_scripted_report(execution);
             Ok(PreparedFailure {
                 kind: self.kind,
@@ -5139,7 +5219,7 @@ mod tests {
         fn prepare_tproxy_local_output(
             &mut self,
             execution: &mut UnqualifiedFunctionalCanaryExecution<'_>,
-        ) -> Result<Self::Prepared, TproxyLocalOutputUnavailable> {
+        ) -> Result<Self::Prepared, FunctionalCanaryError> {
             let request = execution.request();
             assert_eq!(
                 request

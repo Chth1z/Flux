@@ -10,8 +10,9 @@ use std::time::{Duration, Instant};
 
 use flux_core::{AddressResyncDisposition, GenerationId, NetworkNamespaceIdentity, Reason};
 use flux_platform::{
-    NativeCaptureCanaryAttempt, NativeCaptureCanarySelector, NativeCaptureConvergedState,
-    NativeCaptureConvergence, NativeCaptureDesired, NativeCaptureTargetIdentity,
+    NativeCaptureCanaryAttempt, NativeCaptureCanaryRouteOutcome, NativeCaptureCanaryRouteQuery,
+    NativeCaptureCanarySelector, NativeCaptureConvergedState, NativeCaptureConvergence,
+    NativeCaptureDesired, NativeCaptureTargetIdentity,
 };
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use flux_platform::{NativeXtablesCaptureConverger, NativeXtablesCaptureTarget};
@@ -21,12 +22,15 @@ use crate::EngineSpec;
 use crate::EngineSupervisor;
 #[cfg(test)]
 use crate::functional_canary::FunctionalCanaryGateMode;
-use crate::functional_canary::{CanaryAddressFamilies, CanaryAttemptRequest};
+use crate::functional_canary::{
+    CanaryAddressFamilies, CanaryAttemptRequest, CanaryFlow, CanaryFlowAddressFamily,
+};
 #[cfg(test)]
 use crate::generation_engine_config::EngineCapabilityProfileRevision;
 use crate::generation_engine_config::{AddressReconciledGenerationInputs, CapturePathDecision};
 use crate::runtime_coordinator::{
-    AddressResyncStrategy, CanarySelectorSession, PreparedGeneration, PublishedRuntimeState,
+    AddressResyncStrategy, CanaryCounterReadback, CanaryCounterRetirementReadback,
+    CanaryRouteReadback, CanarySelectorSession, PreparedGeneration, PublishedRuntimeState,
     RetiredCanarySelectorSession, RuntimeCoordinator, RuntimeFunctionalCanary, RuntimeWriter,
 };
 use crate::subscription::ValidatedSubscriptionEngineConfig;
@@ -431,6 +435,54 @@ where
             ))
     }
 
+    #[allow(
+        dead_code,
+        reason = "the packaged attempt remains uninhabited until its evidence transaction lands"
+    )]
+    fn active_canary_attempt(
+        &self,
+        generation: &PreparedGeneration,
+        session: &CanarySelectorSession,
+    ) -> Result<(C::Target, NativeCaptureCanaryAttempt), NativeCoordinatorWriterError> {
+        if self.recovery_required {
+            return Err(NativeCoordinatorWriterError::Invariant(
+                "native canary attempt operation requires capture recovery",
+            ));
+        }
+        let active = self.active_canary_selector_session.as_ref().ok_or(
+            NativeCoordinatorWriterError::Invariant(
+                "native canary attempt operation has no active selector session",
+            ),
+        )?;
+        if session.request().pre_binding().engine().generation() != generation.id()
+            || active != session.request()
+        {
+            return Err(NativeCoordinatorWriterError::Invariant(
+                "native canary attempt operation substituted the active request",
+            ));
+        }
+        let retained = self.retained(generation.id())?;
+        let expected = C::target_identity(&retained.target);
+        if self.converged_identity != Some(expected) {
+            return Err(NativeCoordinatorWriterError::Invariant(
+                "native canary attempt operation has no matching successful convergence report",
+            ));
+        }
+        if !generation.matches_canary_selector_request(session.request())
+            || !retained
+                .runtime
+                .matches_canary_selector_request(session.request())
+        {
+            return Err(NativeCoordinatorWriterError::Invariant(
+                "native canary attempt operation does not match the retained Generation and facility",
+            ));
+        }
+        Ok((
+            retained.target.clone(),
+            native_canary_attempt(session.request())?,
+        ))
+    }
+
     fn recover_if_required(&mut self) -> Result<(), NativeCoordinatorWriterError> {
         if !self.recovery_required {
             return Ok(());
@@ -819,7 +871,9 @@ where
                 "native canary selector session has no matching successful convergence report",
             ));
         }
-        if !retained.runtime.matches_canary_selector_request(request) {
+        if !generation.matches_canary_selector_request(request)
+            || !retained.runtime.matches_canary_selector_request(request)
+        {
             return Err(NativeCoordinatorWriterError::Invariant(
                 "native canary selector session does not match the retained Generation and facility",
             ));
@@ -858,11 +912,166 @@ where
         ))
     }
 
+    fn observe_canary_route(
+        &mut self,
+        generation: &PreparedGeneration,
+        session: &CanarySelectorSession,
+        family: CanaryFlowAddressFamily,
+    ) -> Result<Option<CanaryRouteReadback>, Self::Error> {
+        let (target, attempt) = self.active_canary_attempt(generation, session)?;
+        let request = session.request();
+        let flow = match family {
+            CanaryFlowAddressFamily::Ipv4 => CanaryFlow::Ipv4TcpEcho,
+            CanaryFlowAddressFamily::Ipv6 => CanaryFlow::Ipv6TcpEcho,
+        };
+        if !request.requires_flow(flow) {
+            return Err(NativeCoordinatorWriterError::Invariant(
+                "native canary route observation requested a disabled address family",
+            ));
+        }
+        let rpdb = request.pre_binding().environment().rpdb();
+        let query = NativeCaptureCanaryRouteQuery::new(
+            std::net::SocketAddr::new(
+                request.peer_address(flow),
+                request.responder_port(flow).get(),
+            ),
+            rpdb.engine_uid(),
+            rpdb.proxy_mark_value(),
+            request.deadline().expires_at(),
+        )
+        .ok_or(NativeCoordinatorWriterError::Invariant(
+            "native canary request could not produce its fixed route query",
+        ))?;
+        let outcome = match self
+            .convergence
+            .observe_canary_route(&target, attempt, query)
+        {
+            Ok(outcome) => outcome,
+            Err(source) => {
+                self.recovery_required = true;
+                return Err(NativeCoordinatorWriterError::convergence(
+                    "observe native functional-canary route",
+                    source,
+                ));
+            }
+        };
+        let Some(outcome) = outcome else {
+            return Ok(None);
+        };
+        match outcome {
+            NativeCaptureCanaryRouteOutcome::Resolved(observation) => {
+                if observation.query() != query
+                    || observation.observed_at() < request.deadline().started_at()
+                    || observation.observed_at() >= request.deadline().expires_at()
+                {
+                    self.recovery_required = true;
+                    return Err(NativeCoordinatorWriterError::Invariant(
+                        "native canary route receipt does not match the immutable query and deadline",
+                    ));
+                }
+                Ok(Some(CanaryRouteReadback::Resolved {
+                    destination: query.destination(),
+                    queried_uid: query.uid(),
+                    mark: query.mark(),
+                    selected_table: observation.selected_table(),
+                    observed_at: observation.observed_at(),
+                }))
+            }
+            NativeCaptureCanaryRouteOutcome::Rejected(rejection) => {
+                Ok(Some(CanaryRouteReadback::Rejected(rejection.errno())))
+            }
+        }
+    }
+
+    fn observe_canary_counters(
+        &mut self,
+        generation: &PreparedGeneration,
+        session: &CanarySelectorSession,
+    ) -> Result<Option<CanaryCounterReadback>, Self::Error> {
+        let (target, attempt) = self.active_canary_attempt(generation, session)?;
+        let deadline = session.request().deadline();
+        let snapshot =
+            match self
+                .convergence
+                .observe_canary_counters(&target, attempt, deadline.expires_at())
+            {
+                Ok(snapshot) => snapshot,
+                Err(source) => {
+                    self.recovery_required = true;
+                    return Err(NativeCoordinatorWriterError::convergence(
+                        "observe native functional-canary counters",
+                        source,
+                    ));
+                }
+            };
+        if snapshot.is_some_and(|snapshot| {
+            snapshot.observed_at() < deadline.started_at()
+                || snapshot.observed_at() >= deadline.expires_at()
+        }) {
+            self.recovery_required = true;
+            return Err(NativeCoordinatorWriterError::Invariant(
+                "native canary counter snapshot falls outside the immutable deadline",
+            ));
+        }
+        Ok(snapshot.map(|snapshot| {
+            CanaryCounterReadback::new(
+                snapshot.capture_packets(),
+                snapshot.bypass_packets(),
+                snapshot.recapture_packets(),
+                snapshot.observed_at(),
+            )
+        }))
+    }
+
+    fn retire_canary_counters(
+        &mut self,
+        generation: &PreparedGeneration,
+        session: &CanarySelectorSession,
+    ) -> Result<Option<CanaryCounterRetirementReadback>, Self::Error> {
+        let (target, attempt) = self.active_canary_attempt(generation, session)?;
+        let deadline = session.request().deadline();
+        let retirement =
+            match self
+                .convergence
+                .retire_canary_counters(&target, attempt, deadline.expires_at())
+            {
+                Ok(retirement) => retirement,
+                Err(source) => {
+                    self.recovery_required = true;
+                    return Err(NativeCoordinatorWriterError::convergence(
+                        "retire native functional-canary counters",
+                        source,
+                    ));
+                }
+            };
+        if retirement.is_some_and(|retirement| {
+            retirement.retired_at() < deadline.started_at()
+                || retirement.absent_observed_at() < retirement.retired_at()
+                || retirement.absent_observed_at() >= deadline.expires_at()
+        }) {
+            self.recovery_required = true;
+            return Err(NativeCoordinatorWriterError::Invariant(
+                "native canary counter retirement falls outside the immutable cleanup chronology",
+            ));
+        }
+        Ok(retirement.map(|retirement| {
+            CanaryCounterRetirementReadback::new(
+                retirement.retired_at(),
+                retirement.absent_observed_at(),
+            )
+        }))
+    }
+
     fn retire_canary_selector_session(
         &mut self,
         generation: &PreparedGeneration,
         session: CanarySelectorSession,
     ) -> Result<Option<RetiredCanarySelectorSession>, Self::Error> {
+        if self.recovery_required {
+            return Err(NativeCoordinatorWriterError::Invariant(
+                "native canary attempt operation requires capture recovery",
+            ));
+        }
         let active = self.active_canary_selector_session.as_ref().ok_or(
             NativeCoordinatorWriterError::Invariant(
                 "native canary selector session retirement has no active reservation",
@@ -882,9 +1091,10 @@ where
                 "native canary selector retirement has no matching successful convergence report",
             ));
         }
-        if !retained
-            .runtime
-            .matches_canary_selector_request(session.request())
+        if !generation.matches_canary_selector_request(session.request())
+            || !retained
+                .runtime
+                .matches_canary_selector_request(session.request())
         {
             return Err(NativeCoordinatorWriterError::Invariant(
                 "native canary selector retirement does not match the retained Generation and facility",
@@ -1100,6 +1310,10 @@ mod tests {
         fail_retire_once: bool,
         unsupported_populate_once: bool,
         unsupported_retire_once: bool,
+        fail_counter_observation_once: bool,
+        route_queries: Vec<NativeCaptureCanaryRouteQuery>,
+        counter_observation_deadlines: Vec<Instant>,
+        counter_retirement_deadlines: Vec<Instant>,
         selector_retired_observed_at: Option<Instant>,
     }
 
@@ -1201,6 +1415,44 @@ mod tests {
                 });
             self.selector_retired_observed_at = Some(Instant::now());
             Ok(true)
+        }
+
+        fn observe_canary_counters(
+            &mut self,
+            _target: &Self::Target,
+            _attempt: NativeCaptureCanaryAttempt,
+            deadline: Instant,
+        ) -> Result<Option<flux_platform::NativeCaptureCanaryCounterSnapshot>, Self::Error>
+        {
+            self.counter_observation_deadlines.push(deadline);
+            if self.fail_counter_observation_once {
+                self.fail_counter_observation_once = false;
+                return Err(io::Error::other(
+                    "injected uncertain native counter observation failure",
+                ));
+            }
+            Ok(None)
+        }
+
+        fn observe_canary_route(
+            &mut self,
+            _target: &Self::Target,
+            _attempt: NativeCaptureCanaryAttempt,
+            query: NativeCaptureCanaryRouteQuery,
+        ) -> Result<Option<NativeCaptureCanaryRouteOutcome>, Self::Error> {
+            self.route_queries.push(query);
+            Ok(None)
+        }
+
+        fn retire_canary_counters(
+            &mut self,
+            _target: &Self::Target,
+            _attempt: NativeCaptureCanaryAttempt,
+            deadline: Instant,
+        ) -> Result<Option<flux_platform::NativeCaptureCanaryCounterRetirement>, Self::Error>
+        {
+            self.counter_retirement_deadlines.push(deadline);
+            Ok(None)
         }
 
         fn converge(
@@ -1553,6 +1805,10 @@ mod tests {
             fail_retire_once: false,
             unsupported_populate_once: false,
             unsupported_retire_once: false,
+            fail_counter_observation_once: false,
+            route_queries: Vec::new(),
+            counter_observation_deadlines: Vec::new(),
+            counter_retirement_deadlines: Vec::new(),
             selector_retired_observed_at: None,
         };
         let source = ScriptedGenerationSource {
@@ -2012,6 +2268,34 @@ mod tests {
                 .as_bytes()
         );
 
+        for family in [CanaryFlowAddressFamily::Ipv4, CanaryFlowAddressFamily::Ipv6] {
+            assert_eq!(
+                RuntimeWriter::observe_canary_route(&mut writer, &generation, &session, family,)
+                    .expect("the exact dual-stack route query is a definite operation"),
+                None,
+                "the scripted converger intentionally has no typed route receipt"
+            );
+        }
+        let rpdb = request.pre_binding().environment().rpdb();
+        assert_eq!(writer.convergence.route_queries.len(), 2);
+        for (query, flow) in writer
+            .convergence
+            .route_queries
+            .iter()
+            .zip([CanaryFlow::Ipv4TcpEcho, CanaryFlow::Ipv6TcpEcho])
+        {
+            assert_eq!(
+                query.destination(),
+                std::net::SocketAddr::new(
+                    request.peer_address(flow),
+                    request.responder_port(flow).get(),
+                )
+            );
+            assert_eq!(query.uid(), rpdb.engine_uid());
+            assert_eq!(query.mark(), rpdb.proxy_mark_value());
+            assert_eq!(query.deadline(), request.deadline().expires_at());
+        }
+
         RuntimeWriter::retire_canary_selector_session(&mut writer, &generation, session)
             .expect("retire dual-stack selector session")
             .expect("native writer returns dual-stack retirement proof");
@@ -2188,6 +2472,202 @@ mod tests {
         assert!(writer.recovery_required);
         RuntimeWriter::capture_stop(&mut writer)
             .expect("unsupported retirement must recover before capture stop");
+        assert!(writer.active_canary_selector_session.is_none());
+        assert!(writer.convergence.selector.is_none());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn native_attempt_observations_remain_request_bound_and_explicitly_unsupported() {
+        let fixture = EngineFixture::new();
+        let (request, authority) = selector_request(&fixture, 79);
+        let (alternate, _alternate_authority) = selector_request(&fixture, 80);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut writer = writer(
+            &events,
+            None,
+            None,
+            [required_canary_generation(17, &fixture, &request)],
+            [],
+        )
+        .with_retained_canary_facility_authority(authority)
+        .expect("attach retained canary facility authority");
+        let generation = RuntimeWriter::prepare(&mut writer, Reason::Boot)
+            .expect("prepare required native Generation");
+        RuntimeWriter::capture_start(&mut writer, &generation)
+            .expect("activate required native Generation");
+        let substituted_generation = PreparedGeneration::new(
+            generation.id(),
+            fixture.spec.clone(),
+            EngineCapabilityProfileRevision::from_fixture_bytes([0xA5; 32]),
+            FunctionalCanaryGateMode::RequiredUnqualified,
+            Some(EngineSupervisedDeliveryReportContract::schema_v1_fixture()),
+            test_xtables_capture_path_selection(),
+            qualified_xtables_capture_path_evidence().valid_until(),
+        )
+        .with_prepared_canary_generation(generation.prepared_canary_generation().cloned())
+        .with_retained_canary_facility(
+            generation
+                .retained_canary_facility()
+                .expect("required Generation retains the admitted facility"),
+        );
+        let substituted_reservation = RuntimeWriter::reserve_canary_selector_session(
+            &mut writer,
+            &substituted_generation,
+            &request,
+        )
+        .expect_err("a same-ID substituted Generation cannot reserve the selector");
+        assert_eq!(
+            substituted_reservation.to_string(),
+            "native canary selector session does not match the retained Generation and facility"
+        );
+        assert!(writer.convergence.selector.is_none());
+        let session =
+            RuntimeWriter::reserve_canary_selector_session(&mut writer, &generation, &request)
+                .expect("reserve exact selector session")
+                .expect("native writer supplies selector-session ownership");
+
+        let substituted_observation = RuntimeWriter::observe_canary_route(
+            &mut writer,
+            &substituted_generation,
+            &session,
+            CanaryFlowAddressFamily::Ipv4,
+        )
+        .expect_err("a same-ID substituted Generation cannot observe the active attempt");
+        assert_eq!(
+            substituted_observation.to_string(),
+            "native canary attempt operation does not match the retained Generation and facility"
+        );
+        assert!(writer.convergence.route_queries.is_empty());
+
+        assert_eq!(
+            RuntimeWriter::observe_canary_route(
+                &mut writer,
+                &generation,
+                &session,
+                CanaryFlowAddressFamily::Ipv4,
+            )
+            .expect("unsupported route observation is a definite result"),
+            None
+        );
+        let disabled = RuntimeWriter::observe_canary_route(
+            &mut writer,
+            &generation,
+            &session,
+            CanaryFlowAddressFamily::Ipv6,
+        )
+        .expect_err("IPv6 observation must be rejected for an IPv4-only request");
+        assert_eq!(
+            disabled.to_string(),
+            "native canary route observation requested a disabled address family"
+        );
+        assert_eq!(
+            RuntimeWriter::observe_canary_counters(&mut writer, &generation, &session)
+                .expect("unsupported counter observation is a definite result"),
+            None
+        );
+        assert_eq!(
+            RuntimeWriter::retire_canary_counters(&mut writer, &generation, &session)
+                .expect("unsupported counter retirement is a definite result"),
+            None
+        );
+        let route_query = writer.convergence.route_queries[0];
+        let rpdb = request.pre_binding().environment().rpdb();
+        assert_eq!(
+            route_query.destination(),
+            std::net::SocketAddr::new(
+                request.peer_address(CanaryFlow::Ipv4TcpEcho),
+                request.responder_port(CanaryFlow::Ipv4TcpEcho).get(),
+            )
+        );
+        assert_eq!(route_query.uid(), rpdb.engine_uid());
+        assert_eq!(route_query.mark(), rpdb.proxy_mark_value());
+        assert_eq!(route_query.deadline(), request.deadline().expires_at());
+        assert_eq!(
+            writer.convergence.counter_observation_deadlines,
+            [request.deadline().expires_at()]
+        );
+        assert_eq!(
+            writer.convergence.counter_retirement_deadlines,
+            [request.deadline().expires_at()]
+        );
+
+        let substitute = CanarySelectorSession::reserved_for(&alternate);
+        let substituted =
+            RuntimeWriter::observe_canary_counters(&mut writer, &generation, &substitute)
+                .expect_err("counter observation cannot substitute the active request");
+        assert_eq!(
+            substituted.to_string(),
+            "native canary attempt operation substituted the active request"
+        );
+        assert!(!writer.recovery_required);
+
+        let substituted_retirement = RuntimeWriter::retire_canary_selector_session(
+            &mut writer,
+            &substituted_generation,
+            CanarySelectorSession::reserved_for(&request),
+        )
+        .expect_err("a same-ID substituted Generation cannot retire the active attempt");
+        assert_eq!(
+            substituted_retirement.to_string(),
+            "native canary selector retirement does not match the retained Generation and facility"
+        );
+        assert_eq!(
+            writer.active_canary_selector_session.as_ref(),
+            Some(&request)
+        );
+        assert!(writer.convergence.selector.is_some());
+
+        RuntimeWriter::retire_canary_selector_session(&mut writer, &generation, session)
+            .expect("retire exact selector session")
+            .expect("native writer returns exact retirement");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn uncertain_attempt_observation_requires_recovery_before_selector_cleanup() {
+        let fixture = EngineFixture::new();
+        let (request, authority) = selector_request(&fixture, 81);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut writer = writer(
+            &events,
+            None,
+            None,
+            [required_canary_generation(17, &fixture, &request)],
+            [],
+        )
+        .with_retained_canary_facility_authority(authority)
+        .expect("attach retained canary facility authority");
+        let generation = RuntimeWriter::prepare(&mut writer, Reason::Boot)
+            .expect("prepare required native Generation");
+        RuntimeWriter::capture_start(&mut writer, &generation)
+            .expect("activate required native Generation");
+        let session =
+            RuntimeWriter::reserve_canary_selector_session(&mut writer, &generation, &request)
+                .expect("reserve exact selector session")
+                .expect("native writer supplies selector-session ownership");
+        writer.convergence.fail_counter_observation_once = true;
+
+        let observation =
+            RuntimeWriter::observe_canary_counters(&mut writer, &generation, &session)
+                .expect_err("an uncertain counter observation must fail closed");
+        assert!(
+            observation
+                .to_string()
+                .contains("injected uncertain native counter observation failure")
+        );
+        assert!(writer.recovery_required);
+        let retirement =
+            RuntimeWriter::retire_canary_selector_session(&mut writer, &generation, session)
+                .expect_err("uncertain observation cannot mint selector-retirement evidence");
+        assert_eq!(
+            retirement.to_string(),
+            "native canary attempt operation requires capture recovery"
+        );
+
+        RuntimeWriter::capture_stop(&mut writer)
+            .expect("capture stop recovers the uncertain active attempt");
+        assert!(!writer.recovery_required);
         assert!(writer.active_canary_selector_session.is_none());
         assert!(writer.convergence.selector.is_none());
     }

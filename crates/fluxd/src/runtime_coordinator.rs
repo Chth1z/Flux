@@ -1,13 +1,14 @@
 use std::error::Error;
 use std::fmt;
 use std::io;
-use std::num::NonZeroU64;
+use std::net::SocketAddr;
+use std::num::{NonZeroI32, NonZeroU32, NonZeroU64};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use flux_core::{
     AddressResyncDisposition, ControlError, DispatcherCompletion, GenerationId, Reason,
-    RuntimeDispatcher, RuntimeIntent,
+    RouteTableId, RuntimeDispatcher, RuntimeIntent,
 };
 use flux_platform::NetworkInventoryRefreshDisposition;
 
@@ -18,12 +19,15 @@ use crate::engine_supervisor::{
 use crate::functional_canary::{
     ActiveCanaryGenerationBinding, AdmittedSupervisedDeliveryReportBinding, CanaryAddressFamilies,
     CanaryAttemptBinding, CanaryAttemptObjectRetirementEvidence, CanaryAttemptRequest,
-    CanaryAttemptSocketObserverSession, CanaryCounterDeltaBounds, CanaryDeadline,
-    CanaryEngineBinding, CanaryEnvironmentBinding, CanaryFacilityIdentity, CanaryNonce,
-    FunctionalCanaryDisposition, FunctionalCanaryError, FunctionalCanaryGateMode,
-    InstalledSupervisedDeliveryReportProducer, PreparedCanaryGenerationBinding,
-    SupervisedDeliveryReportEngineHandoff, SupervisedDeliveryReportHandoffError,
-    UnqualifiedFunctionalCanaryExecution, UnqualifiedFunctionalCanaryExecutor,
+    CanaryAttemptSocketObserverSession, CanaryCleanupStatus, CanaryCounterDeltaBounds,
+    CanaryCounterSnapshot, CanaryDeadline, CanaryEngineBinding, CanaryEnvironmentBinding,
+    CanaryErrorKind, CanaryFacilityIdentity, CanaryFlow, CanaryFlowAddressFamily, CanaryNonce,
+    ClientReapedCanaryAttemptAuthority, FunctionalCanaryDisposition, FunctionalCanaryError,
+    FunctionalCanaryGateMode, InstalledSupervisedDeliveryReportProducer,
+    PreparedCanaryGenerationBinding, SupervisedDeliveryReportEngineHandoff,
+    SupervisedDeliveryReportHandoffError, UnqualifiedCanaryCounterEvidence,
+    UnqualifiedCanaryNegativeRouteControl, UnqualifiedFunctionalCanaryExecution,
+    UnqualifiedFunctionalCanaryExecutor,
 };
 use crate::generation_engine_config::{
     AddressReconciler, AddressReconciliationOutcome, CapturePathDecision, CapturePathSelection,
@@ -355,6 +359,369 @@ impl CanarySelectorSession {
     }
 }
 
+/// Execution-scoped access to the exact writer-owned canary attempt.
+///
+/// The executor may borrow observation and intermediate cleanup authority, but the coordinator
+/// retains ownership of the selector session and its final retirement.
+#[allow(
+    dead_code,
+    reason = "the packaged attempt remains uninhabited until its evidence transaction lands"
+)]
+pub(crate) trait CanaryAttemptObservationAuthority {
+    fn request(&self) -> &CanaryAttemptRequest;
+
+    fn observe_negative_route_control(
+        &mut self,
+        _family: CanaryFlowAddressFamily,
+    ) -> Result<UnqualifiedCanaryNegativeRouteControl, FunctionalCanaryError> {
+        Err(canary_attempt_authority_unavailable("route observation"))
+    }
+
+    fn observe_baseline_counters(&mut self) -> Result<(), FunctionalCanaryError> {
+        Err(canary_attempt_authority_unavailable("counter observation"))
+    }
+
+    fn take_peer_network_namespace(&mut self) -> Result<std::fs::File, FunctionalCanaryError> {
+        Err(canary_attempt_authority_unavailable(
+            "peer network namespace",
+        ))
+    }
+
+    fn observe_final_counters(
+        &mut self,
+        _client_reaped: ClientReapedCanaryAttemptAuthority,
+    ) -> Result<UnqualifiedCanaryCounterEvidence, FunctionalCanaryError> {
+        Err(canary_attempt_authority_unavailable(
+            "final counter observation",
+        ))
+    }
+
+    fn retire_counters(
+        &mut self,
+    ) -> Result<CanaryAttemptObjectRetirementEvidence, FunctionalCanaryError> {
+        Err(canary_attempt_authority_unavailable("counter retirement"))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(
+    dead_code,
+    reason = "the packaged attempt remains uninhabited until its evidence transaction lands"
+)]
+pub(crate) enum CanaryRouteReadback {
+    Resolved {
+        destination: SocketAddr,
+        queried_uid: NonZeroU32,
+        mark: u32,
+        selected_table: RouteTableId,
+        observed_at: Instant,
+    },
+    Rejected(NonZeroI32),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(
+    dead_code,
+    reason = "the packaged attempt remains uninhabited until its evidence transaction lands"
+)]
+pub(crate) struct CanaryCounterReadback {
+    capture_packets: u64,
+    bypass_packets: u64,
+    recapture_packets: u64,
+    observed_at: Instant,
+}
+
+#[allow(
+    dead_code,
+    reason = "the packaged attempt remains uninhabited until its evidence transaction lands"
+)]
+impl CanaryCounterReadback {
+    #[must_use]
+    pub(crate) const fn new(
+        capture_packets: u64,
+        bypass_packets: u64,
+        recapture_packets: u64,
+        observed_at: Instant,
+    ) -> Self {
+        Self {
+            capture_packets,
+            bypass_packets,
+            recapture_packets,
+            observed_at,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(
+    dead_code,
+    reason = "the packaged attempt remains uninhabited until its evidence transaction lands"
+)]
+pub(crate) struct CanaryCounterRetirementReadback {
+    retired_at: Instant,
+    absent_observed_at: Instant,
+}
+
+#[allow(
+    dead_code,
+    reason = "the packaged attempt remains uninhabited until its evidence transaction lands"
+)]
+impl CanaryCounterRetirementReadback {
+    #[must_use]
+    pub(crate) const fn new(retired_at: Instant, absent_observed_at: Instant) -> Self {
+        Self {
+            retired_at,
+            absent_observed_at,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(
+    dead_code,
+    reason = "the packaged attempt remains uninhabited until its evidence transaction lands"
+)]
+enum CanaryAttemptObservationPhase {
+    RouteControls { ipv4: bool, ipv6: bool },
+    BaselineObserved(CanaryCounterReadback),
+    TrafficInProgress(CanaryCounterReadback),
+    FinalObserved,
+    CountersRetired,
+    Poisoned,
+}
+
+#[allow(
+    dead_code,
+    reason = "the packaged attempt remains uninhabited until its evidence transaction lands"
+)]
+struct BorrowedCanaryAttempt<'a, W>
+where
+    W: RuntimeWriter,
+{
+    writer: &'a mut W,
+    generation: &'a PreparedGeneration,
+    session: &'a mut CanarySelectorSession,
+    phase: CanaryAttemptObservationPhase,
+}
+
+impl<W> CanaryAttemptObservationAuthority for BorrowedCanaryAttempt<'_, W>
+where
+    W: RuntimeWriter,
+{
+    fn request(&self) -> &CanaryAttemptRequest {
+        self.session.request()
+    }
+
+    fn observe_negative_route_control(
+        &mut self,
+        family: CanaryFlowAddressFamily,
+    ) -> Result<UnqualifiedCanaryNegativeRouteControl, FunctionalCanaryError> {
+        let phase = std::mem::replace(&mut self.phase, CanaryAttemptObservationPhase::Poisoned);
+        let CanaryAttemptObservationPhase::RouteControls { ipv4, ipv6 } = phase else {
+            return Err(canary_attempt_phase_error(
+                "route controls must precede counter and traffic observation",
+            ));
+        };
+        let already_observed = match family {
+            CanaryFlowAddressFamily::Ipv4 => ipv4,
+            CanaryFlowAddressFamily::Ipv6 => ipv6,
+        };
+        if already_observed {
+            return Err(canary_attempt_phase_error(
+                "each required route control may be observed only once",
+            ));
+        }
+        let outcome = self
+            .writer
+            .observe_canary_route(self.generation, self.session, family)
+            .map_err(|source| canary_attempt_writer_error("observe canary route", source))?
+            .ok_or_else(|| canary_attempt_authority_unavailable("route observation"))?;
+        let (destination, queried_uid, mark, selected_table, observed_at) = match outcome {
+            CanaryRouteReadback::Resolved {
+                destination,
+                queried_uid,
+                mark,
+                selected_table,
+                observed_at,
+            } => (destination, queried_uid, mark, selected_table, observed_at),
+            CanaryRouteReadback::Rejected(errno) => {
+                let diagnostic = format!(
+                    "required native canary route control was rejected with errno {}",
+                    errno,
+                );
+                return Err(FunctionalCanaryError::new(
+                    CanaryErrorKind::InvalidEvidence,
+                    CanaryCleanupStatus::Uncertain,
+                    &diagnostic,
+                ));
+            }
+        };
+        self.phase = CanaryAttemptObservationPhase::RouteControls {
+            ipv4: ipv4 || family == CanaryFlowAddressFamily::Ipv4,
+            ipv6: ipv6 || family == CanaryFlowAddressFamily::Ipv6,
+        };
+        let flow = match family {
+            CanaryFlowAddressFamily::Ipv4 => CanaryFlow::Ipv4TcpEcho,
+            CanaryFlowAddressFamily::Ipv6 => CanaryFlow::Ipv6TcpEcho,
+        };
+        Ok(UnqualifiedCanaryNegativeRouteControl::new(
+            flow,
+            destination,
+            observed_at,
+            queried_uid,
+            mark,
+            selected_table,
+            None,
+        ))
+    }
+
+    fn observe_baseline_counters(&mut self) -> Result<(), FunctionalCanaryError> {
+        let phase = std::mem::replace(&mut self.phase, CanaryAttemptObservationPhase::Poisoned);
+        let CanaryAttemptObservationPhase::RouteControls { ipv4, ipv6 } = phase else {
+            return Err(canary_attempt_phase_error(
+                "baseline counters must follow the route controls exactly once",
+            ));
+        };
+        let requires_ipv6 = self.request().families() == CanaryAddressFamilies::Ipv4AndIpv6;
+        if !ipv4 || ipv6 != requires_ipv6 {
+            return Err(canary_attempt_phase_error(
+                "baseline counters require every enabled route control and no disabled-family control",
+            ));
+        }
+        let snapshot = self
+            .writer
+            .observe_canary_counters(self.generation, self.session)
+            .map_err(|source| canary_attempt_writer_error("observe canary counters", source))?
+            .ok_or_else(|| canary_attempt_authority_unavailable("counter observation"))?;
+        self.phase = CanaryAttemptObservationPhase::BaselineObserved(snapshot);
+        Ok(())
+    }
+
+    fn take_peer_network_namespace(&mut self) -> Result<std::fs::File, FunctionalCanaryError> {
+        let phase = std::mem::replace(&mut self.phase, CanaryAttemptObservationPhase::Poisoned);
+        let CanaryAttemptObservationPhase::BaselineObserved(before) = phase else {
+            return Err(canary_attempt_phase_error(
+                "peer namespace handoff requires completed route and baseline observation",
+            ));
+        };
+        let namespace = self
+            .session
+            .take_peer_network_namespace()
+            .ok_or_else(|| canary_attempt_authority_unavailable("peer network namespace"))?;
+        self.phase = CanaryAttemptObservationPhase::TrafficInProgress(before);
+        Ok(namespace)
+    }
+
+    fn observe_final_counters(
+        &mut self,
+        client_reaped: ClientReapedCanaryAttemptAuthority,
+    ) -> Result<UnqualifiedCanaryCounterEvidence, FunctionalCanaryError> {
+        let phase = std::mem::replace(&mut self.phase, CanaryAttemptObservationPhase::Poisoned);
+        let CanaryAttemptObservationPhase::TrafficInProgress(before) = phase else {
+            return Err(canary_attempt_phase_error(
+                "final counters require one completed peer-namespace traffic handoff and client reap",
+            ));
+        };
+        if client_reaped.request() != self.request() {
+            return Err(canary_attempt_phase_error(
+                "final counters require client-reap authority for the immutable canary request",
+            ));
+        }
+        let after = self
+            .writer
+            .observe_canary_counters(self.generation, self.session)
+            .map_err(|source| canary_attempt_writer_error("observe final canary counters", source))?
+            .ok_or_else(|| canary_attempt_authority_unavailable("final counter observation"))?;
+        self.phase = CanaryAttemptObservationPhase::FinalObserved;
+        Ok(UnqualifiedCanaryCounterEvidence::new(
+            self.request()
+                .pre_binding()
+                .environment()
+                .attempt_objects()
+                .counters(),
+            before.observed_at,
+            CanaryCounterSnapshot::new(
+                before.capture_packets,
+                before.bypass_packets,
+                before.recapture_packets,
+            ),
+            after.observed_at,
+            CanaryCounterSnapshot::new(
+                after.capture_packets,
+                after.bypass_packets,
+                after.recapture_packets,
+            ),
+        ))
+    }
+
+    fn retire_counters(
+        &mut self,
+    ) -> Result<CanaryAttemptObjectRetirementEvidence, FunctionalCanaryError> {
+        let phase = std::mem::replace(&mut self.phase, CanaryAttemptObservationPhase::Poisoned);
+        if phase != CanaryAttemptObservationPhase::FinalObserved {
+            return Err(canary_attempt_phase_error(
+                "counter retirement requires one final counter observation",
+            ));
+        }
+        let retirement = self
+            .writer
+            .retire_canary_counters(self.generation, self.session)
+            .map_err(|source| canary_attempt_writer_error("retire canary counters", source))?
+            .ok_or_else(|| canary_attempt_authority_unavailable("counter retirement"))?;
+        self.phase = CanaryAttemptObservationPhase::CountersRetired;
+        Ok(CanaryAttemptObjectRetirementEvidence::new(
+            self.request()
+                .pre_binding()
+                .environment()
+                .attempt_objects()
+                .counters(),
+            retirement.retired_at,
+            retirement.absent_observed_at,
+        ))
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "the packaged attempt remains uninhabited until its evidence transaction lands"
+)]
+fn canary_attempt_writer_error(
+    operation: &'static str,
+    source: impl Error,
+) -> FunctionalCanaryError {
+    let diagnostic = format!("{operation}: {source}");
+    FunctionalCanaryError::new(
+        CanaryErrorKind::AdapterFailure,
+        CanaryCleanupStatus::Uncertain,
+        &diagnostic,
+    )
+}
+
+#[allow(
+    dead_code,
+    reason = "the packaged attempt remains uninhabited until its evidence transaction lands"
+)]
+fn canary_attempt_authority_unavailable(authority: &'static str) -> FunctionalCanaryError {
+    let diagnostic = format!("required native canary {authority} authority is unavailable");
+    FunctionalCanaryError::new(
+        CanaryErrorKind::InvalidEvidence,
+        CanaryCleanupStatus::Uncertain,
+        &diagnostic,
+    )
+}
+
+#[allow(
+    dead_code,
+    reason = "the packaged attempt remains uninhabited until its evidence transaction lands"
+)]
+fn canary_attempt_phase_error(diagnostic: &'static str) -> FunctionalCanaryError {
+    FunctionalCanaryError::new(
+        CanaryErrorKind::InvalidEvidence,
+        CanaryCleanupStatus::Uncertain,
+        diagnostic,
+    )
+}
+
 /// Request-bound object receipt returned only after the serialized writer proved selector absence.
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct RetiredCanarySelectorSession {
@@ -413,6 +780,43 @@ pub(crate) trait RuntimeWriter: Send + 'static {
         _generation: &PreparedGeneration,
         _request: &CanaryAttemptRequest,
     ) -> Result<Option<CanarySelectorSession>, Self::Error> {
+        Ok(None)
+    }
+    /// Observe the exact request-known negative route control while its selector is active.
+    #[allow(
+        dead_code,
+        reason = "the packaged attempt remains uninhabited until its evidence transaction lands"
+    )]
+    fn observe_canary_route(
+        &mut self,
+        _generation: &PreparedGeneration,
+        _session: &CanarySelectorSession,
+        _family: CanaryFlowAddressFamily,
+    ) -> Result<Option<CanaryRouteReadback>, Self::Error> {
+        Ok(None)
+    }
+    /// Read the exact active attempt's counter object before its immutable deadline.
+    #[allow(
+        dead_code,
+        reason = "the packaged attempt remains uninhabited until its evidence transaction lands"
+    )]
+    fn observe_canary_counters(
+        &mut self,
+        _generation: &PreparedGeneration,
+        _session: &CanarySelectorSession,
+    ) -> Result<Option<CanaryCounterReadback>, Self::Error> {
+        Ok(None)
+    }
+    /// Retire only the counter object while retaining final selector cleanup authority.
+    #[allow(
+        dead_code,
+        reason = "the packaged attempt remains uninhabited until its evidence transaction lands"
+    )]
+    fn retire_canary_counters(
+        &mut self,
+        _generation: &PreparedGeneration,
+        _session: &CanarySelectorSession,
+    ) -> Result<Option<CanaryCounterRetirementReadback>, Self::Error> {
         Ok(None)
     }
     /// Flush, prove absence, and consume the exact reservation before post-attempt observation.
@@ -2695,7 +3099,16 @@ where
             })?;
         let execution = match &mut self.functional_canary {
             RuntimeFunctionalCanary::RequiredUnqualified { executor, .. } => {
-                executor.execute(execution_input, &mut selector_session)
+                let mut attempt = BorrowedCanaryAttempt {
+                    writer: &mut self.writer,
+                    generation,
+                    session: &mut selector_session,
+                    phase: CanaryAttemptObservationPhase::RouteControls {
+                        ipv4: false,
+                        ipv6: false,
+                    },
+                };
+                executor.execute(execution_input, &mut attempt)
             }
             RuntimeFunctionalCanary::StructuralVerificationOnly => {
                 unreachable!("required adapter availability was validated before engine start")
@@ -8319,6 +8732,112 @@ mod tests {
         verify_failure: bool,
     }
 
+    struct ObservationWriter {
+        request: CanaryAttemptRequest,
+        counter_readbacks: VecDeque<CanaryCounterReadback>,
+        counter_retirement: Option<CanaryCounterRetirementReadback>,
+    }
+
+    impl RuntimeWriter for ObservationWriter {
+        type Error = io::Error;
+
+        fn prepare(&mut self, _reason: Reason) -> Result<PreparedGeneration, Self::Error> {
+            unreachable!("the observation fixture receives an already prepared Generation")
+        }
+
+        fn reject_prepared(&mut self, _generation: &PreparedGeneration) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn capture_start(&mut self, _generation: &PreparedGeneration) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn capture_stop(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn verify_capture(&mut self, _generation: &PreparedGeneration) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn observe_canary_route(
+            &mut self,
+            generation: &PreparedGeneration,
+            session: &CanarySelectorSession,
+            family: CanaryFlowAddressFamily,
+        ) -> Result<Option<CanaryRouteReadback>, Self::Error> {
+            assert_eq!(session.request(), &self.request);
+            assert_eq!(
+                generation.id(),
+                self.request.pre_binding().engine().generation()
+            );
+            let flow = match family {
+                CanaryFlowAddressFamily::Ipv4 => CanaryFlow::Ipv4TcpEcho,
+                CanaryFlowAddressFamily::Ipv6 => CanaryFlow::Ipv6TcpEcho,
+            };
+            let rpdb = self.request.pre_binding().environment().rpdb();
+            Ok(Some(CanaryRouteReadback::Resolved {
+                destination: std::net::SocketAddr::new(
+                    self.request.peer_address(flow),
+                    self.request.responder_port(flow).get(),
+                ),
+                queried_uid: rpdb.engine_uid(),
+                mark: rpdb.proxy_mark_value(),
+                selected_table: rpdb.proxy_capture_table(),
+                observed_at: self.request.deadline().started_at() + Duration::from_millis(1),
+            }))
+        }
+
+        fn observe_canary_counters(
+            &mut self,
+            generation: &PreparedGeneration,
+            session: &CanarySelectorSession,
+        ) -> Result<Option<CanaryCounterReadback>, Self::Error> {
+            assert_eq!(session.request(), &self.request);
+            assert_eq!(
+                generation.id(),
+                self.request.pre_binding().engine().generation()
+            );
+            Ok(self.counter_readbacks.pop_front())
+        }
+
+        fn retire_canary_counters(
+            &mut self,
+            generation: &PreparedGeneration,
+            session: &CanarySelectorSession,
+        ) -> Result<Option<CanaryCounterRetirementReadback>, Self::Error> {
+            assert_eq!(session.request(), &self.request);
+            assert_eq!(
+                generation.id(),
+                self.request.pre_binding().engine().generation()
+            );
+            Ok(self.counter_retirement.take())
+        }
+
+        fn retire_canary_selector_session(
+            &mut self,
+            generation: &PreparedGeneration,
+            session: CanarySelectorSession,
+        ) -> Result<Option<RetiredCanarySelectorSession>, Self::Error> {
+            assert_eq!(session.request(), &self.request);
+            assert_eq!(
+                generation.id(),
+                self.request.pre_binding().engine().generation()
+            );
+            let retired_at = self.request.deadline().started_at() + Duration::from_millis(11);
+            Ok(Some(session.retire(retired_at, retired_at)))
+        }
+
+        fn publish(&mut self, _phase: PublishedRuntimeState) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn resync_addresses(&mut self) -> Result<AddressResyncDisposition, Self::Error> {
+            Ok(AddressResyncDisposition::CompleteNoChange)
+        }
+    }
+
     struct RequiredGenerationWriter<W> {
         inner: W,
         canary_script: Option<Arc<Mutex<ScriptedCanary>>>,
@@ -8379,6 +8898,145 @@ mod tests {
         generation.supervised_delivery_report =
             Some(EngineSupervisedDeliveryReportContract::schema_v1_fixture());
         generation
+    }
+
+    #[test]
+    fn borrowed_canary_attempt_enforces_observation_and_retirement_order() {
+        let fixture = FunctionalCanaryFixture::new(CanaryAddressFamilies::Ipv4Only);
+        let request = fixture.request().clone();
+        let started_at = request.deadline().started_at();
+        let before = CanaryCounterReadback::new(10, 20, 0, started_at + Duration::from_millis(2));
+        let after = CanaryCounterReadback::new(18, 22, 0, started_at + Duration::from_millis(8));
+        let counter_retirement = CanaryCounterRetirementReadback::new(
+            started_at + Duration::from_millis(9),
+            started_at + Duration::from_millis(10),
+        );
+        let mut writer = ObservationWriter {
+            request: request.clone(),
+            counter_readbacks: VecDeque::from([before, after]),
+            counter_retirement: Some(counter_retirement),
+        };
+        let engine = EngineFixture::new();
+        let generation = PreparedGeneration::new(
+            request.pre_binding().engine().generation(),
+            engine.spec.clone(),
+            request.pre_binding().engine().engine_profile_revision(),
+            FunctionalCanaryGateMode::RequiredUnqualified,
+            Some(EngineSupervisedDeliveryReportContract::schema_v1_fixture()),
+            test_xtables_capture_path_selection(),
+            request.deadline().expires_at(),
+        );
+        let peer_network_namespace = tempfile::tempfile().expect("peer namespace fixture");
+        let mut session = CanarySelectorSession::reserved_with_peer_network_namespace(
+            &request,
+            peer_network_namespace,
+        );
+        {
+            let mut attempt = BorrowedCanaryAttempt {
+                writer: &mut writer,
+                generation: &generation,
+                session: &mut session,
+                phase: CanaryAttemptObservationPhase::RouteControls {
+                    ipv4: false,
+                    ipv6: false,
+                },
+            };
+
+            let route = attempt
+                .observe_negative_route_control(CanaryFlowAddressFamily::Ipv4)
+                .expect("observe the IPv4 negative route control");
+            let rpdb = request.pre_binding().environment().rpdb();
+            assert_eq!(
+                route,
+                UnqualifiedCanaryNegativeRouteControl::new(
+                    CanaryFlow::Ipv4TcpEcho,
+                    std::net::SocketAddr::new(
+                        request.peer_address(CanaryFlow::Ipv4TcpEcho),
+                        request.responder_port(CanaryFlow::Ipv4TcpEcho).get(),
+                    ),
+                    started_at + Duration::from_millis(1),
+                    rpdb.engine_uid(),
+                    rpdb.proxy_mark_value(),
+                    rpdb.proxy_capture_table(),
+                    None,
+                )
+            );
+            attempt
+                .observe_baseline_counters()
+                .expect("observe one baseline snapshot");
+            drop(
+                attempt
+                    .take_peer_network_namespace()
+                    .expect("consume the peer namespace exactly once"),
+            );
+
+            let counters = attempt
+                .observe_final_counters(ClientReapedCanaryAttemptAuthority::fixture(&request))
+                .expect("observe one final counter snapshot");
+            assert_eq!(
+                counters,
+                UnqualifiedCanaryCounterEvidence::new(
+                    request
+                        .pre_binding()
+                        .environment()
+                        .attempt_objects()
+                        .counters(),
+                    before.observed_at,
+                    CanaryCounterSnapshot::new(10, 20, 0),
+                    after.observed_at,
+                    CanaryCounterSnapshot::new(18, 22, 0),
+                )
+            );
+            let retirement = attempt
+                .retire_counters()
+                .expect("retire the counted observation object once");
+            assert_eq!(
+                retirement,
+                CanaryAttemptObjectRetirementEvidence::new(
+                    request
+                        .pre_binding()
+                        .environment()
+                        .attempt_objects()
+                        .counters(),
+                    counter_retirement.retired_at,
+                    counter_retirement.absent_observed_at,
+                )
+            );
+            attempt
+                .retire_counters()
+                .expect_err("counter retirement cannot be replayed");
+        }
+        let retired =
+            RuntimeWriter::retire_canary_selector_session(&mut writer, &generation, session)
+                .expect("retire the selector after intermediate counter cleanup")
+                .expect("the coordinator retains final selector-retirement authority");
+        assert!(retired.matches_request(&request));
+
+        let mut poisoned_writer = ObservationWriter {
+            request: request.clone(),
+            counter_readbacks: VecDeque::new(),
+            counter_retirement: None,
+        };
+        let mut poisoned_session = CanarySelectorSession::reserved_with_peer_network_namespace(
+            &request,
+            tempfile::tempfile().expect("poisoned peer namespace fixture"),
+        );
+        let mut poisoned = BorrowedCanaryAttempt {
+            writer: &mut poisoned_writer,
+            generation: &generation,
+            session: &mut poisoned_session,
+            phase: CanaryAttemptObservationPhase::RouteControls {
+                ipv4: false,
+                ipv6: false,
+            },
+        };
+        poisoned
+            .observe_baseline_counters()
+            .expect_err("out-of-order baseline observation poisons the attempt");
+        let retry = poisoned
+            .observe_negative_route_control(CanaryFlowAddressFamily::Ipv4)
+            .expect_err("a poisoned attempt cannot retry with the missing route control");
+        assert_eq!(retry.kind(), CanaryErrorKind::InvalidEvidence);
     }
 
     impl<W> RuntimeWriter for RequiredGenerationWriter<W>
@@ -9161,10 +9819,10 @@ mod tests {
         fn execute(
             &mut self,
             execution: UnqualifiedFunctionalCanaryExecution<'_>,
-            selector_session: &mut CanarySelectorSession,
+            attempt: &mut dyn CanaryAttemptObservationAuthority,
         ) -> Result<UnqualifiedCanaryGateEvidence, FunctionalCanaryError> {
             let request = execution.request();
-            if selector_session.request() != request {
+            if attempt.request() != request {
                 return Err(FunctionalCanaryError::new(
                     CanaryErrorKind::IdentityChanged,
                     CanaryCleanupStatus::NotRequired,

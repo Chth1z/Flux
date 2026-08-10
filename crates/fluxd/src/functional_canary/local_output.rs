@@ -17,15 +17,16 @@
 //! session separately from the pure request. Read-only availability sees only
 //! the request. After availability succeeds, preparation may prebind and
 //! install the supervised report; execution then opens the engine observation
-//! authority and passes the observer session by value plus the coordinator-owned
-//! selector session by mutable borrow to the prepared attempt.
+//! authority and passes the observer session by value plus one request-bound,
+//! coordinator-owned attempt-observation authority by mutable borrow to the
+//! prepared attempt.
 
 use std::convert::Infallible;
 
 #[cfg(test)]
 use crate::engine_supervisor::OwnedEngineIdentity;
 use crate::engine_supervisor::{EngineChildAuthority, EngineChildObservationPair};
-use crate::runtime_coordinator::CanarySelectorSession;
+use crate::runtime_coordinator::CanaryAttemptObservationAuthority;
 use flux_platform::{
     ProcessObservation, ProcessUserNamespaceObservation, TRANSPARENT_PROXY_ENGINE_CAPABILITY_MASK,
 };
@@ -172,7 +173,7 @@ trait PreparedTproxyLocalOutputAttempt {
         self,
         request: &CanaryAttemptRequest,
         socket_observer: CanaryAttemptSocketObserverSession,
-        selector_session: &mut CanarySelectorSession,
+        attempt: &mut dyn CanaryAttemptObservationAuthority,
     ) -> UnverifiedTproxyLocalOutputResult<
         Self::CaptureProof,
         Self::ProcessProof,
@@ -2332,7 +2333,7 @@ where
     fn execute(
         &mut self,
         mut execution: UnqualifiedFunctionalCanaryExecution<'_>,
-        selector_session: &mut CanarySelectorSession,
+        attempt: &mut dyn CanaryAttemptObservationAuthority,
     ) -> Result<UnqualifiedCanaryGateEvidence, FunctionalCanaryError> {
         let request = execution.request();
         require_tproxy_request(request)?;
@@ -2342,10 +2343,10 @@ where
             .map_err(TproxyLocalOutputUnavailable::into_functional_error)?;
         let prepared = self.driver.prepare_tproxy_local_output(&mut execution)?;
         let (request, socket_observer, engine_child) = execution
-            .into_selector_ready_parts(selector_session)
+            .into_selector_ready_parts(attempt)
             .map_err(normalize_post_preparation_failure)?;
         let raw = prepared
-            .execute_tproxy_local_output(request, socket_observer, selector_session)
+            .execute_tproxy_local_output(request, socket_observer, attempt)
             .map_err(normalize_post_preparation_failure)?;
         let capture_bound = self
             .capture_verifier
@@ -2762,7 +2763,7 @@ impl PreparedTproxyLocalOutputAttempt for PackagedTproxyLocalOutputAttempt {
         self,
         _request: &CanaryAttemptRequest,
         _socket_observer: CanaryAttemptSocketObserverSession,
-        _selector_session: &mut CanarySelectorSession,
+        _attempt: &mut dyn CanaryAttemptObservationAuthority,
     ) -> UnverifiedTproxyLocalOutputResult<
         Self::CaptureProof,
         Self::ProcessProof,
@@ -2781,7 +2782,7 @@ impl PreparedTproxyLocalOutputAttempt for Infallible {
         self,
         _request: &CanaryAttemptRequest,
         _socket_observer: CanaryAttemptSocketObserverSession,
-        _selector_session: &mut CanarySelectorSession,
+        _attempt: &mut dyn CanaryAttemptObservationAuthority,
     ) -> Result<
         UnverifiedTproxyLocalOutputArtifacts<
             Self::CaptureProof,
@@ -3001,8 +3002,27 @@ mod tests {
         UnqualifiedCanaryCleanupEvidence, UnqualifiedCanaryFlowEvidenceSlots,
     };
     use crate::generation_engine_config::EngineSupervisedDeliveryReportContract;
+    use crate::runtime_coordinator::CanarySelectorSession;
     #[cfg(target_os = "linux")]
     use flux_platform::ProcessHandle;
+
+    struct ScriptedAttemptAuthority {
+        session: CanarySelectorSession,
+    }
+
+    impl ScriptedAttemptAuthority {
+        fn reserved_for(request: &CanaryAttemptRequest) -> Self {
+            Self {
+                session: CanarySelectorSession::reserved_for(request),
+            }
+        }
+    }
+
+    impl CanaryAttemptObservationAuthority for ScriptedAttemptAuthority {
+        fn request(&self) -> &CanaryAttemptRequest {
+            self.session.request()
+        }
+    }
 
     #[derive(Clone)]
     struct ScriptedEngineProcessPolicyObservation {
@@ -3582,10 +3602,10 @@ mod tests {
         );
         let mut substitute = request.clone();
         substitute.nonce = super::super::CanaryNonce::from_bytes([0x5a; 32]);
-        let mut selector_session = CanarySelectorSession::reserved_for(&substitute);
+        let mut attempt = ScriptedAttemptAuthority::reserved_for(&substitute);
 
         let error = executor
-            .execute(execution(request), &mut selector_session)
+            .execute(execution(request), &mut attempt)
             .expect_err("a selector session for another request cannot reach execution");
 
         assert_eq!(error.kind(), CanaryErrorKind::CleanupUncertain);
@@ -4192,7 +4212,7 @@ mod tests {
             self,
             _request: &CanaryAttemptRequest,
             _socket_observer: CanaryAttemptSocketObserverSession,
-            selector_session: &mut CanarySelectorSession,
+            attempt: &mut dyn CanaryAttemptObservationAuthority,
         ) -> Result<
             UnverifiedTproxyLocalOutputArtifacts<
                 Self::CaptureProof,
@@ -4201,7 +4221,7 @@ mod tests {
             >,
             FunctionalCanaryError,
         > {
-            assert_eq!(selector_session.request(), &self.capture_proof.request);
+            assert_eq!(attempt.request(), &self.capture_proof.request);
             Ok(UnverifiedTproxyLocalOutputArtifacts {
                 capture_proof: self.capture_proof,
                 process_proof: self.process_proof,
@@ -4692,10 +4712,10 @@ mod tests {
             self,
             request: &CanaryAttemptRequest,
             _socket_observer: CanaryAttemptSocketObserverSession,
-            selector_session: &mut CanarySelectorSession,
+            attempt: &mut dyn CanaryAttemptObservationAuthority,
         ) -> UnverifiedTproxyLocalOutputResult<(), (), ()> {
             assert_eq!(self.stage.fetch_add(1, Ordering::SeqCst), 2);
-            assert_eq!(selector_session.request(), request);
+            assert_eq!(attempt.request(), request);
             Err(FunctionalCanaryError::new(
                 CanaryErrorKind::ResponseMismatch,
                 CanaryCleanupStatus::VerifiedAbsent,
@@ -4746,7 +4766,7 @@ mod tests {
             self,
             _request: &CanaryAttemptRequest,
             _socket_observer: CanaryAttemptSocketObserverSession,
-            _selector_session: &mut CanarySelectorSession,
+            _attempt: &mut dyn CanaryAttemptObservationAuthority,
         ) -> UnverifiedTproxyLocalOutputResult<(), (), ()> {
             self.prepared_executions.fetch_add(1, Ordering::SeqCst);
             panic!("selector session reached an attempt without an installed report")
@@ -4816,7 +4836,7 @@ mod tests {
             self,
             request: &CanaryAttemptRequest,
             _socket_observer: CanaryAttemptSocketObserverSession,
-            selector_session: &mut CanarySelectorSession,
+            attempt: &mut dyn CanaryAttemptObservationAuthority,
         ) -> Result<
             UnverifiedTproxyLocalOutputArtifacts<
                 Self::CaptureProof,
@@ -4825,7 +4845,7 @@ mod tests {
             >,
             FunctionalCanaryError,
         > {
-            assert_eq!(selector_session.request(), request);
+            assert_eq!(attempt.request(), request);
             Err(FunctionalCanaryError::new(
                 self.kind,
                 self.cleanup,
@@ -4949,8 +4969,8 @@ mod tests {
             &mut self,
             execution: UnqualifiedFunctionalCanaryExecution<'_>,
         ) -> Result<UnqualifiedCanaryGateEvidence, FunctionalCanaryError> {
-            let mut selector_session = CanarySelectorSession::reserved_for(execution.request());
-            self.execute(execution, &mut selector_session)
+            let mut attempt = ScriptedAttemptAuthority::reserved_for(execution.request());
+            self.execute(execution, &mut attempt)
         }
     }
 
@@ -5251,7 +5271,7 @@ mod tests {
             self,
             request: &CanaryAttemptRequest,
             socket_observer: CanaryAttemptSocketObserverSession,
-            selector_session: &mut CanarySelectorSession,
+            attempt: &mut dyn CanaryAttemptObservationAuthority,
         ) -> Result<
             UnverifiedTproxyLocalOutputArtifacts<
                 Self::CaptureProof,
@@ -5270,7 +5290,7 @@ mod tests {
             );
             assert_eq!(socket_observer.binding(), self.binding);
             assert_eq!(socket_observer.authority(), self.binding.authority());
-            assert_eq!(selector_session.request(), request);
+            assert_eq!(attempt.request(), request);
             self.reached_driver.store(true, Ordering::SeqCst);
             Err(FunctionalCanaryError::new(
                 CanaryErrorKind::ResponseMismatch,

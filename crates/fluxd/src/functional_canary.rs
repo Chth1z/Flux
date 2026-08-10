@@ -25,7 +25,7 @@ use crate::engine_supervisor::EngineChildAuthority;
 use crate::generation_engine_config::{
     ENGINE_SUPERVISED_DELIVERY_REPORT_SCHEMA_VERSION, EngineCapabilityProfileRevision,
 };
-use crate::runtime_coordinator::CanarySelectorSession;
+use crate::runtime_coordinator::CanaryAttemptObservationAuthority;
 use crate::{EngineArtifactSetIdentity, EngineSpec, OwnedEngineIdentity};
 
 pub(crate) const FUNCTIONAL_CANARY_SCHEMA_VERSION: u16 = 2;
@@ -2059,6 +2059,43 @@ pub(crate) struct CanaryAttemptRequest {
     families: CanaryAddressFamilies,
     dns_expectations: CanaryDnsExpectationSlots,
     counter_bounds: CanaryCounterDeltaBounds,
+}
+
+/// Linear proof that the exact request-driving client was parent-reaped while
+/// its peer servers remained owned and live.
+///
+/// Production construction is private to the local-OUTPUT child typestate. The
+/// writer-bound attempt consumes this proof before its final counter snapshot,
+/// preventing namespace handoff alone from claiming traffic completion.
+#[derive(Debug, Eq, PartialEq)]
+#[allow(
+    dead_code,
+    reason = "the packaged attempt remains uninhabited until its evidence transaction lands"
+)]
+pub(crate) struct ClientReapedCanaryAttemptAuthority {
+    request: CanaryAttemptRequest,
+}
+
+#[allow(
+    dead_code,
+    reason = "the packaged attempt remains uninhabited until its evidence transaction lands"
+)]
+impl ClientReapedCanaryAttemptAuthority {
+    fn from_request(request: &CanaryAttemptRequest) -> Self {
+        Self {
+            request: request.clone(),
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn request(&self) -> &CanaryAttemptRequest {
+        &self.request
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture(request: &CanaryAttemptRequest) -> Self {
+        Self::from_request(request)
+    }
 }
 
 impl CanaryAttemptRequest {
@@ -5127,7 +5164,7 @@ impl<'a> UnqualifiedFunctionalCanaryExecution<'a> {
     /// Consume the attempt authorities only after the report handoff and selector identity agree.
     pub(crate) fn into_selector_ready_parts(
         self,
-        selector_session: &CanarySelectorSession,
+        attempt: &dyn CanaryAttemptObservationAuthority,
     ) -> Result<
         (
             &'a CanaryAttemptRequest,
@@ -5136,7 +5173,7 @@ impl<'a> UnqualifiedFunctionalCanaryExecution<'a> {
         ),
         FunctionalCanaryError,
     > {
-        if selector_session.request() != self.request {
+        if attempt.request() != self.request {
             return Err(FunctionalCanaryError::new(
                 CanaryErrorKind::IdentityChanged,
                 CanaryCleanupStatus::Uncertain,
@@ -5216,7 +5253,7 @@ pub(crate) trait UnqualifiedFunctionalCanaryExecutor: Send + 'static {
     fn execute(
         &mut self,
         execution: UnqualifiedFunctionalCanaryExecution<'_>,
-        selector_session: &mut CanarySelectorSession,
+        attempt: &mut dyn CanaryAttemptObservationAuthority,
     ) -> Result<UnqualifiedCanaryGateEvidence, FunctionalCanaryError>;
 }
 

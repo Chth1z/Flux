@@ -16,6 +16,7 @@ use flux_platform::{
 
 use super::super::{
     CANARY_PEER_SERVER_SLOTS, CanaryAttemptRequest, CanaryFlow, CanaryProcessCredentialIdentity,
+    ClientReapedCanaryAttemptAuthority,
 };
 use super::driver_process::DriverProcessProof;
 use super::driver_process::{
@@ -168,6 +169,7 @@ impl ChildBindPlan {
 /// path exists; every successful spawn is immediately converted into the
 /// existing retained process authority.
 pub(super) struct PackagedDriverChildren {
+    request: CanaryAttemptRequest,
     client: PackagedDriverChild,
     peer_servers: [PackagedDriverChild; CANARY_PEER_SERVER_SLOTS],
     traffic_state: PackagedDriverTrafficState,
@@ -251,6 +253,7 @@ impl PackagedDriverChildren {
             }
         };
         Ok(Self {
+            request: request.clone(),
             client,
             peer_servers: [peer_0, peer_1, peer_2],
             traffic_state: PackagedDriverTrafficState::Ready { next_flow_index: 0 },
@@ -369,12 +372,12 @@ impl PackagedDriverChildren {
         self,
         exclusive_deadline: Instant,
     ) -> Result<ClientReapedPackagedDriverChildren, PackagedDriverChildError> {
-        if self.traffic_state == PackagedDriverTrafficState::InFlight {
+        let PackagedDriverTrafficState::Ready { next_flow_index } = self.traffic_state else {
             self.abort_and_reap(exclusive_deadline)?;
             return Err(PackagedDriverChildError::Protocol(
                 "packaged driver traffic cannot quiesce an abandoned or failed flow",
             ));
-        }
+        };
         let [peer_0, peer_1, peer_2] = self.peer_servers;
         let client = match self.client.quiesce_and_reap(exclusive_deadline) {
             Ok(client) => client,
@@ -388,6 +391,9 @@ impl PackagedDriverChildren {
             }
         };
         Ok(ClientReapedPackagedDriverChildren {
+            request: self.request,
+            completed_flow_count: next_flow_index,
+            final_counter_authority_issued: false,
             client,
             peer_servers: [peer_0, peer_1, peer_2],
         })
@@ -509,11 +515,39 @@ pub(super) struct ReapedPackagedDriverChildren {
 /// Fixed cleanup boundary after the request-driving client is parent-reaped
 /// while all peer listeners remain live.
 pub(super) struct ClientReapedPackagedDriverChildren {
+    request: CanaryAttemptRequest,
+    completed_flow_count: usize,
+    final_counter_authority_issued: bool,
     pub(super) client: ReapedDriverChild,
     peer_servers: [PackagedDriverChild; CANARY_PEER_SERVER_SLOTS],
 }
 
 impl ClientReapedPackagedDriverChildren {
+    /// Bind the one writer-owned final-counter transition to the exact
+    /// parent-reaped client while retaining ownership of every live peer.
+    pub(super) fn bind_final_counter_observation(
+        &mut self,
+    ) -> Result<ClientReapedCanaryAttemptAuthority, PackagedDriverChildError> {
+        let required_flow_count = CanaryFlow::ALL
+            .iter()
+            .filter(|flow| self.request.requires_flow(**flow))
+            .count();
+        if self.completed_flow_count != required_flow_count {
+            return Err(PackagedDriverChildError::Protocol(
+                "final counter observation requires every canonical request flow to complete",
+            ));
+        }
+        if self.final_counter_authority_issued {
+            return Err(PackagedDriverChildError::Protocol(
+                "final counter observation authority was already issued",
+            ));
+        }
+        self.final_counter_authority_issued = true;
+        Ok(ClientReapedCanaryAttemptAuthority::from_request(
+            &self.request,
+        ))
+    }
+
     /// Compensate a failed evidence-retirement transaction without detaching
     /// any still-live peer child.
     pub(super) fn abort_and_reap_peers(
@@ -1237,6 +1271,8 @@ mod tests {
 
     #[test]
     fn packaged_self_exec_children_hold_quiesce_and_reap_exact_roles() {
+        let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+        let request = fixture.request();
         let deadline = Instant::now() + Duration::from_secs(20);
         let tcp_address =
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, available_tcp_port()));
@@ -1276,7 +1312,8 @@ mod tests {
         assert!(TcpListener::bind(dns_address).is_err());
         assert!(UdpSocket::bind(dns_address).is_err());
 
-        let client_reaped = PackagedDriverChildren {
+        let mut client_reaped = PackagedDriverChildren {
+            request: request.clone(),
             client,
             peer_servers: [tcp, udp, dns],
             traffic_state: PackagedDriverTrafficState::Ready { next_flow_index: 0 },
@@ -1288,6 +1325,11 @@ mod tests {
         assert!(UdpSocket::bind(udp_address).is_err());
         assert!(TcpListener::bind(dns_address).is_err());
         assert!(UdpSocket::bind(dns_address).is_err());
+
+        assert!(matches!(
+            client_reaped.bind_final_counter_observation(),
+            Err(PackagedDriverChildError::Protocol(_))
+        ));
 
         let reaped = client_reaped
             .quiesce_and_reap_peers(deadline)
@@ -1337,6 +1379,7 @@ mod tests {
             deadline,
         );
         let mut children = PackagedDriverChildren {
+            request: request.clone(),
             client,
             peer_servers: [tcp, udp, dns],
             traffic_state: PackagedDriverTrafficState::Ready { next_flow_index: 0 },
@@ -1417,9 +1460,20 @@ mod tests {
             }
         }
 
-        let reaped = children
-            .quiesce_and_reap(deadline)
-            .expect("quiesce and parent-reap completed traffic children");
+        let mut client_reaped = children
+            .quiesce_client_and_reap(deadline)
+            .expect("quiesce and parent-reap the completed traffic client");
+        let final_counter_authority = client_reaped
+            .bind_final_counter_observation()
+            .expect("all canonical flows authorize the final counter snapshot");
+        assert_eq!(final_counter_authority.request(), request);
+        assert!(matches!(
+            client_reaped.bind_final_counter_observation(),
+            Err(PackagedDriverChildError::Protocol(_))
+        ));
+        let reaped = client_reaped
+            .quiesce_and_reap_peers(deadline)
+            .expect("quiesce and parent-reap the retained traffic peers");
         let proof = reaped
             .into_process_proof()
             .expect("assemble completed traffic child proof");
@@ -1453,6 +1507,7 @@ mod tests {
             deadline,
         );
         let mut children = PackagedDriverChildren {
+            request: request.clone(),
             client,
             peer_servers: [tcp, udp, dns],
             traffic_state: PackagedDriverTrafficState::Ready { next_flow_index: 0 },
@@ -1498,6 +1553,7 @@ mod tests {
             deadline,
         );
         let mut children = PackagedDriverChildren {
+            request: request.clone(),
             client,
             peer_servers: [tcp, udp, dns],
             traffic_state: PackagedDriverTrafficState::Ready { next_flow_index: 0 },
@@ -1532,6 +1588,8 @@ mod tests {
 
     #[test]
     fn packaged_self_exec_child_rejects_reordered_frame_and_group_aborts() {
+        let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+        let request = fixture.request();
         let deadline = Instant::now() + Duration::from_secs(20);
         let tcp_port = available_tcp_port();
         let udp_port = available_udp_port();
@@ -1553,6 +1611,7 @@ mod tests {
             deadline,
         );
         let children = PackagedDriverChildren {
+            request: request.clone(),
             client,
             peer_servers: [tcp, udp, dns],
             traffic_state: PackagedDriverTrafficState::Ready { next_flow_index: 0 },
@@ -1608,6 +1667,7 @@ mod tests {
             cleanup_deadline,
         );
         let mut children = PackagedDriverChildren {
+            request: request.clone(),
             client,
             peer_servers: [tcp, udp, dns],
             traffic_state: PackagedDriverTrafficState::Ready { next_flow_index: 0 },

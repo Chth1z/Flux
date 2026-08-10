@@ -2,6 +2,7 @@ use std::error::Error;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::num::{NonZeroU16, NonZeroU32};
+use std::time::Instant;
 
 use flux_core::{
     BootIdentity, GenerationId, NetworkAddressFamily, NetworkNamespaceIdentity,
@@ -32,8 +33,9 @@ use super::super::{
 };
 use super::{XtablesStableFamilyPlan, XtablesStableTopologyError, XtablesStableTopologyPlan};
 use crate::xtables::native_capture::{
-    NativeCaptureCanaryAttempt, NativeCaptureCanaryRouteOutcome, NativeCaptureCanaryRouteQuery,
-    NativeCaptureCanarySelector, NativeCaptureOwnershipObservation, NativeCaptureTargetIdentity,
+    NativeCaptureCanaryAttempt, NativeCaptureCanaryCounterSnapshot,
+    NativeCaptureCanaryRouteOutcome, NativeCaptureCanaryRouteQuery, NativeCaptureCanarySelector,
+    NativeCaptureOwnershipObservation, NativeCaptureTargetIdentity,
 };
 
 const OWNER_PAYLOAD_SCHEMA: u16 = 3;
@@ -425,6 +427,44 @@ pub(crate) struct NativePolicyRoutingObservation {
     rule_conflicts: usize,
 }
 
+/// Rule-ordered packet counters from one exact owner-derived canary observation chain.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NativeXtablesCanaryCounterReadback {
+    capture_packets: u64,
+    recapture_packets: u64,
+    bypass_packets: u64,
+}
+
+impl NativeXtablesCanaryCounterReadback {
+    #[must_use]
+    pub(crate) const fn new(
+        capture_packets: u64,
+        recapture_packets: u64,
+        bypass_packets: u64,
+    ) -> Self {
+        Self {
+            capture_packets,
+            recapture_packets,
+            bypass_packets,
+        }
+    }
+
+    #[must_use]
+    const fn capture_packets(self) -> u64 {
+        self.capture_packets
+    }
+
+    #[must_use]
+    const fn recapture_packets(self) -> u64 {
+        self.recapture_packets
+    }
+
+    #[must_use]
+    const fn bypass_packets(self) -> u64 {
+        self.bypass_packets
+    }
+}
+
 impl NativePolicyRoutingObservation {
     #[must_use]
     pub(crate) const fn new(
@@ -485,6 +525,13 @@ pub(crate) trait NativeXtablesOwnerAdapter {
         &mut self,
         family: XtablesRestoreFamily,
     ) -> Result<XtablesSaveProjection, NativeXtablesAdapterError>;
+
+    fn observe_canary_counters(
+        &mut self,
+        family: XtablesRestoreFamily,
+        expected: &XtablesExpectedState,
+        observation_chain: &str,
+    ) -> Result<NativeXtablesCanaryCounterReadback, NativeXtablesAdapterError>;
 
     fn mutate_policy_routing(
         &mut self,
@@ -2076,6 +2123,82 @@ where
             NativeCanaryAttemptProgress::Active,
         )?;
         Ok(outcome)
+    }
+
+    /// Read and aggregate the active attempt's exact per-family observation chains.
+    fn observe_canary_counters(
+        &mut self,
+        target: &NativeXtablesAdmittedTarget,
+        attempt: NativeCaptureCanaryAttempt,
+        deadline: Instant,
+        session: &NativeXtablesAttemptSession,
+    ) -> Result<NativeCaptureCanaryCounterSnapshot, NativeXtablesOwnerError> {
+        let plans = canary_attempt_plans(target, attempt.selector())?;
+        if Instant::now() >= deadline {
+            return Err(NativeXtablesOwnerError::InvalidCanaryAttempt(
+                "counter observation started at or after the immutable canary deadline",
+            ));
+        }
+        self.require_canary_attempt_session(
+            target,
+            attempt,
+            &plans,
+            session,
+            NativeXtablesAttemptPhase::Active,
+            NativeCanaryAttemptProgress::Active,
+        )?;
+
+        let mut capture_packets = 0_u64;
+        let mut bypass_packets = 0_u64;
+        let mut recapture_packets = 0_u64;
+        for plan in &plans {
+            if Instant::now() >= deadline {
+                return Err(NativeXtablesOwnerError::InvalidCanaryAttempt(
+                    "counter observation reached the immutable canary deadline",
+                ));
+            }
+            let counters = self.adapter.observe_canary_counters(
+                plan.family,
+                &plan.active_attempt_state,
+                &plan.observation_chain,
+            )?;
+            capture_packets = capture_packets
+                .checked_add(counters.capture_packets())
+                .ok_or(NativeXtablesOwnerError::InvalidCanaryAttempt(
+                    "canary capture counter aggregation overflowed",
+                ))?;
+            bypass_packets = bypass_packets
+                .checked_add(counters.bypass_packets())
+                .ok_or(NativeXtablesOwnerError::InvalidCanaryAttempt(
+                    "canary bypass counter aggregation overflowed",
+                ))?;
+            recapture_packets = recapture_packets
+                .checked_add(counters.recapture_packets())
+                .ok_or(NativeXtablesOwnerError::InvalidCanaryAttempt(
+                    "canary recapture counter aggregation overflowed",
+                ))?;
+        }
+
+        self.require_canary_attempt_session(
+            target,
+            attempt,
+            &plans,
+            session,
+            NativeXtablesAttemptPhase::Active,
+            NativeCanaryAttemptProgress::Active,
+        )?;
+        let observed_at = Instant::now();
+        if observed_at >= deadline {
+            return Err(NativeXtablesOwnerError::InvalidCanaryAttempt(
+                "counter observation completed at or after the immutable canary deadline",
+            ));
+        }
+        Ok(NativeCaptureCanaryCounterSnapshot::new(
+            capture_packets,
+            bypass_packets,
+            recapture_packets,
+            observed_at,
+        ))
     }
 
     fn begin_canary_transition(

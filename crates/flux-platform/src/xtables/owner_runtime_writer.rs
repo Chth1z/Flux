@@ -2,7 +2,7 @@ use std::error::Error;
 use std::fmt;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
 use std::ffi::{CStr, CString};
@@ -38,11 +38,11 @@ use crate::xtables::owner_durable::{
     NativeXtablesRuntimeGuard,
 };
 use crate::xtables::{
-    NativeCaptureCanaryAttempt, NativeCaptureCanaryRouteOutcome, NativeCaptureCanaryRouteQuery,
-    NativeCaptureConvergedState, NativeCaptureConvergence, NativeCaptureConvergenceReport,
-    NativeCaptureDesired, NativeCaptureOwnershipObservation, NativeCaptureTargetIdentity,
-    XtablesCaptureArtifactSet, XtablesLocalOutputRoutingSpec, XtablesLocalOutputRoutingTarget,
-    XtablesRestoreFamily,
+    NativeCaptureCanaryAttempt, NativeCaptureCanaryCounterSnapshot,
+    NativeCaptureCanaryRouteOutcome, NativeCaptureCanaryRouteQuery, NativeCaptureConvergedState,
+    NativeCaptureConvergence, NativeCaptureConvergenceReport, NativeCaptureDesired,
+    NativeCaptureOwnershipObservation, NativeCaptureTargetIdentity, XtablesCaptureArtifactSet,
+    XtablesLocalOutputRoutingSpec, XtablesLocalOutputRoutingTarget, XtablesRestoreFamily,
 };
 
 const NATIVE_ROUTE_METRIC: u32 = 1_024;
@@ -1214,6 +1214,18 @@ impl NativeCaptureConvergence for NativeXtablesCaptureConverger {
             .map_err(|source| NativeXtablesCaptureConvergenceError { source })
     }
 
+    fn observe_canary_counters(
+        &mut self,
+        target: &Self::Target,
+        attempt: NativeCaptureCanaryAttempt,
+        deadline: Instant,
+    ) -> Result<Option<NativeCaptureCanaryCounterSnapshot>, Self::Error> {
+        self.inner
+            .observe_canary_counters(&target.inner, attempt, deadline)
+            .map(Some)
+            .map_err(|source| NativeXtablesCaptureConvergenceError { source })
+    }
+
     fn converge(
         &mut self,
         desired: NativeCaptureDesired<Self::Target>,
@@ -1422,6 +1434,31 @@ where
             .observe_canary_route(target, attempt, query, &active.session)
         {
             Ok(outcome) => Ok(outcome),
+            Err(source) => {
+                self.recovered = false;
+                Err(NativeXtablesRuntimeWriterError::Owner(Box::new(source)))
+            }
+        }
+    }
+
+    pub(crate) fn observe_canary_counters(
+        &mut self,
+        target: &NativeXtablesAdmittedTarget,
+        attempt: NativeCaptureCanaryAttempt,
+        deadline: Instant,
+    ) -> Result<NativeCaptureCanaryCounterSnapshot, NativeXtablesRuntimeWriterError> {
+        if !self.recovered {
+            return Err(NativeXtablesRuntimeWriterError::RecoveryRequired);
+        }
+        let active = self
+            .active_attempt
+            .as_ref()
+            .ok_or(NativeXtablesRuntimeWriterError::RecoveryRequired)?;
+        match self
+            .owner
+            .observe_canary_counters(target, attempt, deadline, &active.session)
+        {
+            Ok(snapshot) => Ok(snapshot),
             Err(source) => {
                 self.recovered = false;
                 Err(NativeXtablesRuntimeWriterError::Owner(Box::new(source)))

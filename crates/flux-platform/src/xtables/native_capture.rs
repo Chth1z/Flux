@@ -411,6 +411,55 @@ pub enum NativeCaptureCanaryRouteOutcome {
     Rejected(NativeCaptureCanaryRouteRejection),
 }
 
+/// One exact aggregate readback of the active canary observation chains.
+///
+/// Packet counts cover every address family enabled by the admitted target. `observed_at` is
+/// sampled locally only after the complete counted readback and owner-state revalidation finish.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeCaptureCanaryCounterSnapshot {
+    capture_packets: u64,
+    bypass_packets: u64,
+    recapture_packets: u64,
+    observed_at: Instant,
+}
+
+impl NativeCaptureCanaryCounterSnapshot {
+    #[must_use]
+    pub(crate) const fn new(
+        capture_packets: u64,
+        bypass_packets: u64,
+        recapture_packets: u64,
+        observed_at: Instant,
+    ) -> Self {
+        Self {
+            capture_packets,
+            bypass_packets,
+            recapture_packets,
+            observed_at,
+        }
+    }
+
+    #[must_use]
+    pub const fn capture_packets(self) -> u64 {
+        self.capture_packets
+    }
+
+    #[must_use]
+    pub const fn bypass_packets(self) -> u64 {
+        self.bypass_packets
+    }
+
+    #[must_use]
+    pub const fn recapture_packets(self) -> u64 {
+        self.recapture_packets
+    }
+
+    #[must_use]
+    pub const fn observed_at(self) -> Instant {
+        self.observed_at
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NativeCaptureDesired<T> {
     Active(T),
@@ -504,6 +553,20 @@ pub trait NativeCaptureConvergence: Send + 'static {
         _attempt: NativeCaptureCanaryAttempt,
         _query: NativeCaptureCanaryRouteQuery,
     ) -> Result<Option<NativeCaptureCanaryRouteOutcome>, Self::Error> {
+        Ok(None)
+    }
+
+    /// Reads the exact active canary observation chains before one immutable deadline.
+    ///
+    /// `None` means this implementation has no counter-observation authority. A supported
+    /// implementation must bind the readback to the exact active target and attempt and reject a
+    /// snapshot completed at or after `deadline`.
+    fn observe_canary_counters(
+        &mut self,
+        _target: &Self::Target,
+        _attempt: NativeCaptureCanaryAttempt,
+        _deadline: Instant,
+    ) -> Result<Option<NativeCaptureCanaryCounterSnapshot>, Self::Error> {
         Ok(None)
     }
 

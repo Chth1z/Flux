@@ -463,6 +463,195 @@ fn canary_route_lookup_rechecks_selector_policy_target_and_journal_after_observa
 }
 
 #[test]
+fn canary_counter_readback_maps_rule_roles_and_aggregates_only_enabled_families() {
+    for (families, ipv6, expected) in [
+        (
+            AddressHostFamilySelection::Ipv4,
+            false,
+            (11_u64, 7_u64, 2_u64),
+        ),
+        (
+            AddressHostFamilySelection::DualStack,
+            true,
+            (24_u64, 16_u64, 5_u64),
+        ),
+    ] {
+        let target = canary_target(7, families);
+        let fixture = Fixture::new([target.clone()]);
+        let mut owner = fixture.owner();
+        let attempt = canary_attempt(ipv6);
+        owner
+            .converge(NativeXtablesDesiredTarget::Active(target.clone()))
+            .unwrap();
+        let session = owner.populate_canary_selector(&target, attempt).unwrap();
+        owner.adapter.canary_counter_readbacks = [
+            NativeXtablesCanaryCounterReadback::new(11, 2, 7),
+            NativeXtablesCanaryCounterReadback::new(13, 3, 9),
+        ];
+        let started_at = Instant::now();
+        let deadline = started_at + Duration::from_secs(30);
+
+        let snapshot = owner
+            .observe_canary_counters(&target, attempt, deadline, &session)
+            .expect("exact active counted readback");
+
+        assert_eq!(snapshot.capture_packets(), expected.0);
+        assert_eq!(snapshot.bypass_packets(), expected.1);
+        assert_eq!(snapshot.recapture_packets(), expected.2);
+        assert!(snapshot.observed_at() >= started_at);
+        assert!(snapshot.observed_at() < deadline);
+        assert_eq!(
+            owner.adapter.canary_counter_reads,
+            if ipv6 {
+                vec![
+                    (XtablesRestoreFamily::Ipv4, "FLX4A0000000007".into()),
+                    (XtablesRestoreFamily::Ipv6, "FLX6A0000000007".into()),
+                ]
+            } else {
+                vec![(XtablesRestoreFamily::Ipv4, "FLX4A0000000007".into())]
+            }
+        );
+        owner
+            .retire_canary_selector(&target, attempt, session)
+            .unwrap();
+    }
+}
+
+#[test]
+fn canary_counter_readback_rejects_substitution_before_counted_save() {
+    let target = canary_target(7, AddressHostFamilySelection::Ipv4);
+    let substituted_target = canary_target(8, AddressHostFamilySelection::Ipv4);
+    let fixture = Fixture::new([target.clone(), substituted_target.clone()]);
+    let mut owner = fixture.owner();
+    let attempt = canary_attempt(false);
+    owner
+        .converge(NativeXtablesDesiredTarget::Active(target.clone()))
+        .unwrap();
+    let session = owner.populate_canary_selector(&target, attempt).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let substituted_attempt = NativeCaptureCanaryAttempt::new(
+        attempt.selector(),
+        [0x12; 32],
+        *attempt.selector_identity(),
+        *attempt.facility_digest(),
+    )
+    .unwrap();
+
+    for result in [
+        owner.observe_canary_counters(&target, substituted_attempt, deadline, &session),
+        owner.observe_canary_counters(&substituted_target, attempt, deadline, &session),
+    ] {
+        assert!(matches!(
+            result,
+            Err(NativeXtablesOwnerError::LiveStateConflict(
+                "native canary attempt session was substituted"
+            ))
+        ));
+    }
+    assert!(owner.adapter.canary_counter_reads.is_empty());
+    owner
+        .retire_canary_selector(&target, attempt, session)
+        .unwrap();
+}
+
+#[test]
+fn canary_counter_readback_rechecks_active_state_after_counted_save() {
+    let target = canary_target(7, AddressHostFamilySelection::Ipv4);
+    let fixture = Fixture::new([target.clone()]);
+    let mut owner = fixture.owner();
+    let attempt = canary_attempt(false);
+    owner
+        .converge(NativeXtablesDesiredTarget::Active(target.clone()))
+        .unwrap();
+    let session = owner.populate_canary_selector(&target, attempt).unwrap();
+    owner.adapter.canary_counter_post_action = Some(FakeCanaryRoutePostAction::DropObservation(
+        XtablesRestoreFamily::Ipv4,
+    ));
+
+    let error = owner
+        .observe_canary_counters(
+            &target,
+            attempt,
+            Instant::now() + Duration::from_secs(30),
+            &session,
+        )
+        .expect_err("post-readback observation-chain drift must fail closed");
+
+    assert!(matches!(
+        error,
+        NativeXtablesOwnerError::LiveStateConflict(
+            "canary attempt readback did not match the exact transaction state"
+        )
+    ));
+    assert_eq!(
+        owner.adapter.canary_counter_reads,
+        [(XtablesRestoreFamily::Ipv4, "FLX4A0000000007".into())]
+    );
+}
+
+#[test]
+fn dual_stack_canary_counter_aggregation_rejects_overflow() {
+    let target = canary_target(7, AddressHostFamilySelection::DualStack);
+    let fixture = Fixture::new([target.clone()]);
+    let mut owner = fixture.owner();
+    let attempt = canary_attempt(true);
+    owner
+        .converge(NativeXtablesDesiredTarget::Active(target.clone()))
+        .unwrap();
+    let session = owner.populate_canary_selector(&target, attempt).unwrap();
+    owner.adapter.canary_counter_readbacks = [
+        NativeXtablesCanaryCounterReadback::new(u64::MAX, 0, 0),
+        NativeXtablesCanaryCounterReadback::new(1, 0, 0),
+    ];
+
+    let error = owner
+        .observe_canary_counters(
+            &target,
+            attempt,
+            Instant::now() + Duration::from_secs(30),
+            &session,
+        )
+        .expect_err("cross-family packet aggregation must not wrap");
+
+    assert!(matches!(
+        error,
+        NativeXtablesOwnerError::InvalidCanaryAttempt(
+            "canary capture counter aggregation overflowed"
+        )
+    ));
+    owner
+        .retire_canary_selector(&target, attempt, session)
+        .unwrap();
+}
+
+#[test]
+fn canary_counter_readback_rejects_an_expired_deadline_before_counted_save() {
+    let target = canary_target(7, AddressHostFamilySelection::Ipv4);
+    let fixture = Fixture::new([target.clone()]);
+    let mut owner = fixture.owner();
+    let attempt = canary_attempt(false);
+    owner
+        .converge(NativeXtablesDesiredTarget::Active(target.clone()))
+        .unwrap();
+    let session = owner.populate_canary_selector(&target, attempt).unwrap();
+
+    let error = owner
+        .observe_canary_counters(&target, attempt, Instant::now(), &session)
+        .expect_err("an expired immutable deadline must fail before counted save");
+
+    assert!(matches!(
+        error,
+        NativeXtablesOwnerError::InvalidCanaryAttempt(
+            "counter observation started at or after the immutable canary deadline"
+        )
+    ));
+    assert!(owner.adapter.canary_counter_reads.is_empty());
+    owner
+        .retire_canary_selector(&target, attempt, session)
+        .unwrap();
+}
+
+#[test]
 fn runtime_writer_keeps_definite_route_rejection_cleanup_but_poisons_ambiguity() {
     let target = canary_target(7, AddressHostFamilySelection::Ipv4);
     let fixture = Fixture::new([target.clone()]);
@@ -1537,6 +1726,19 @@ fn runtime_writer_holds_the_runtime_guard_for_the_complete_canary_attempt() {
     writer
         .observe_canary_route(&target, attempt, query)
         .expect("route observation must borrow the retained attempt guard");
+    assert!(matches!(
+        receiver.recv_timeout(Duration::from_millis(50)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    ));
+
+    writer.test_adapter_mut().canary_counter_readbacks[0] =
+        NativeXtablesCanaryCounterReadback::new(4, 0, 4);
+    let counter_snapshot = writer
+        .observe_canary_counters(&target, attempt, Instant::now() + Duration::from_secs(30))
+        .expect("counter observation must borrow the retained attempt guard");
+    assert_eq!(counter_snapshot.capture_packets(), 4);
+    assert_eq!(counter_snapshot.bypass_packets(), 4);
+    assert_eq!(counter_snapshot.recapture_packets(), 0);
     assert!(matches!(
         receiver.recv_timeout(Duration::from_millis(50)),
         Err(std::sync::mpsc::RecvTimeoutError::Timeout)
@@ -2770,6 +2972,9 @@ struct FakeAdapter {
     canary_route_queries: Vec<NativeCaptureCanaryRouteQuery>,
     canary_route_result: FakeCanaryRouteResult,
     canary_route_post_action: Option<FakeCanaryRoutePostAction>,
+    canary_counter_readbacks: [NativeXtablesCanaryCounterReadback; 2],
+    canary_counter_reads: Vec<(XtablesRestoreFamily, Box<str>)>,
+    canary_counter_post_action: Option<FakeCanaryRoutePostAction>,
 }
 
 impl FakeAdapter {
@@ -2787,6 +2992,9 @@ impl FakeAdapter {
             canary_route_queries: Vec::new(),
             canary_route_result: FakeCanaryRouteResult::Resolved(RouteTableId::from_raw(20_253)),
             canary_route_post_action: None,
+            canary_counter_readbacks: [NativeXtablesCanaryCounterReadback::new(0, 0, 0); 2],
+            canary_counter_reads: Vec::new(),
+            canary_counter_post_action: None,
         }
     }
 
@@ -2984,6 +3192,31 @@ impl FakeAdapter {
             )
         })
     }
+
+    fn apply_canary_post_action(&mut self, action: FakeCanaryRoutePostAction) {
+        match action {
+            FakeCanaryRoutePostAction::DropSelector(family) => {
+                self.family_state_mut(family).canary_selector = None;
+            }
+            FakeCanaryRoutePostAction::DropObservation(family) => {
+                self.family_state_mut(family).canary_observation = None;
+            }
+            FakeCanaryRoutePostAction::DropPolicyRules => self.rules.clear(),
+            FakeCanaryRoutePostAction::SubstituteTarget { family, identity } => {
+                let state = self.family_state_mut(family);
+                state.prepared.clear();
+                state.prepared.push(identity);
+                state.stable = Some(identity);
+                state.canary_selector = None;
+                state.canary_observation = None;
+            }
+            FakeCanaryRoutePostAction::CorruptJournal(path) => {
+                let mut encoded = std::fs::read(&path).unwrap();
+                encoded[0] ^= 0xff;
+                std::fs::write(path, encoded).unwrap();
+            }
+        }
+    }
 }
 
 impl NativeXtablesOwnerAdapter for FakeAdapter {
@@ -3056,6 +3289,33 @@ impl NativeXtablesOwnerAdapter for FakeAdapter {
             });
         }
         self.projection(family)
+    }
+
+    fn observe_canary_counters(
+        &mut self,
+        family: XtablesRestoreFamily,
+        expected: &XtablesExpectedState,
+        observation_chain: &str,
+    ) -> Result<NativeXtablesCanaryCounterReadback, NativeXtablesAdapterError> {
+        if !expected.is_satisfied_by(&self.projection(family)?)
+            || expected
+                .projection()
+                .chain(observation_chain)
+                .is_none_or(|chain| chain.rules().len() != 3)
+        {
+            return Err(NativeXtablesAdapterError::new(
+                "fake canary counted save",
+                NativeMutationCertainty::NotMutated,
+                "owner supplied a substituted expected state or observation chain",
+            ));
+        }
+        self.canary_counter_reads
+            .push((family, observation_chain.into()));
+        let readback = self.canary_counter_readbacks[family_index(family)];
+        if let Some(action) = self.canary_counter_post_action.take() {
+            self.apply_canary_post_action(action);
+        }
+        Ok(readback)
     }
 
     fn mutate_policy_routing(
@@ -3136,28 +3396,7 @@ impl NativeXtablesOwnerAdapter for FakeAdapter {
             }
         };
         if let Some(action) = self.canary_route_post_action.take() {
-            match action {
-                FakeCanaryRoutePostAction::DropSelector(family) => {
-                    self.family_state_mut(family).canary_selector = None;
-                }
-                FakeCanaryRoutePostAction::DropObservation(family) => {
-                    self.family_state_mut(family).canary_observation = None;
-                }
-                FakeCanaryRoutePostAction::DropPolicyRules => self.rules.clear(),
-                FakeCanaryRoutePostAction::SubstituteTarget { family, identity } => {
-                    let state = self.family_state_mut(family);
-                    state.prepared.clear();
-                    state.prepared.push(identity);
-                    state.stable = Some(identity);
-                    state.canary_selector = None;
-                    state.canary_observation = None;
-                }
-                FakeCanaryRoutePostAction::CorruptJournal(path) => {
-                    let mut encoded = std::fs::read(&path).unwrap();
-                    encoded[0] ^= 0xff;
-                    std::fs::write(path, encoded).unwrap();
-                }
-            }
+            self.apply_canary_post_action(action);
         }
         Ok(outcome)
     }

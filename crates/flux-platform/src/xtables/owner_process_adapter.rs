@@ -10,7 +10,7 @@ use crate::netlink::route_lookup::{CanaryRouteLookupOutcome, CanaryRouteLookupRe
 use super::super::{XtablesRestoreArtifact, XtablesRestoreFamily};
 use super::{
     NativeMutationCertainty, NativePolicyRoutingObservation, NativeXtablesAdapterError,
-    NativeXtablesOwnerAdapter,
+    NativeXtablesCanaryCounterReadback, NativeXtablesOwnerAdapter,
 };
 use crate::netlink::policy_routing::ManagedPolicyRoutingIdentity;
 use crate::xtables::native::{
@@ -20,8 +20,9 @@ use crate::xtables::native_capture::{
     NativeCaptureCanaryRouteObservation, NativeCaptureCanaryRouteOutcome,
     NativeCaptureCanaryRouteQuery, NativeCaptureCanaryRouteRejection,
 };
+use crate::xtables::save::counted::project_expected_counted_chain;
 use crate::xtables::save::{
-    XtablesSaveProjection, XtablesSaveProjectionError, project_xtables_save,
+    XtablesExpectedState, XtablesSaveProjection, XtablesSaveProjectionError, project_xtables_save,
 };
 
 /// Real process/netlink Adapter for the private owner.
@@ -104,6 +105,16 @@ impl NativeXtablesOwnerAdapter for NativeXtablesProcessOwnerAdapter {
                 detail.into_boxed_str(),
             )
         })
+    }
+
+    fn observe_canary_counters(
+        &mut self,
+        family: XtablesRestoreFamily,
+        expected: &XtablesExpectedState,
+        observation_chain: &str,
+    ) -> Result<NativeXtablesCanaryCounterReadback, NativeXtablesAdapterError> {
+        let output = self.tools.save_with_counters(family).map_err(map_restore)?;
+        project_canary_counter_readback(output.stdout(), family, expected, observation_chain)
     }
 
     fn mutate_policy_routing(
@@ -305,6 +316,44 @@ fn project_complete_save(
     }
 }
 
+fn project_canary_counter_readback(
+    stdout: &[u8],
+    family: XtablesRestoreFamily,
+    expected: &XtablesExpectedState,
+    observation_chain: &str,
+) -> Result<NativeXtablesCanaryCounterReadback, NativeXtablesAdapterError> {
+    let packets = project_expected_counted_chain(stdout, family, expected, observation_chain)
+        .map_err(|error| {
+            let mut detail = match std::error::Error::source(&error) {
+                Some(source) => format!("{error}: {source}"),
+                None => error.to_string(),
+            };
+            if let Some(line) = error.line().and_then(|line| save_line(stdout, line))
+                && line.contains("FLX")
+            {
+                detail.push_str("; live native line: ");
+                detail.push_str(line);
+            }
+            NativeXtablesAdapterError::new(
+                "counted xtables-save projection",
+                NativeMutationCertainty::NotMutated,
+                detail.into_boxed_str(),
+            )
+        })?;
+    let [capture_packets, recapture_packets, bypass_packets] = packets.as_slice() else {
+        return Err(NativeXtablesAdapterError::new(
+            "counted xtables-save projection",
+            NativeMutationCertainty::NotMutated,
+            "the exact canary observation chain did not contain three rules",
+        ));
+    };
+    Ok(NativeXtablesCanaryCounterReadback::new(
+        *capture_packets,
+        *recapture_packets,
+        *bypass_packets,
+    ))
+}
+
 fn map_restore(error: XtablesRestoreProcessError) -> NativeXtablesAdapterError {
     let certainty = match error.mutation_disposition() {
         XtablesRestoreMutationDisposition::NotStarted => NativeMutationCertainty::NotMutated,
@@ -318,6 +367,8 @@ fn map_restore(error: XtablesRestoreProcessError) -> NativeXtablesAdapterError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::xtables::save::XtablesExpectedStatePhase;
+    use crate::xtables::{XtablesRestoreAction, XtablesRestoreContext, parse_xtables_restore};
 
     #[test]
     fn exactly_empty_full_save_is_clean_absence_but_nonempty_missing_mangle_stays_invalid() {
@@ -327,6 +378,59 @@ mod tests {
                 .is_empty()
         );
         assert!(project_complete_save(b"*filter\nCOMMIT\n", XtablesRestoreFamily::Ipv4).is_err());
+    }
+
+    #[test]
+    fn counted_canary_projection_maps_exact_rule_order_and_rejects_malformed_readback() {
+        const CHAIN: &str = "FLX4A0000000007";
+        let artifact = parse_xtables_restore(
+            format!(
+                "*mangle\n:{CHAIN} - [0:0]\n\
+                 -A {CHAIN} -m owner --uid-owner 2000 -m mark --mark 0x200000/0x600000 -j RETURN\n\
+                 -A {CHAIN} -m owner --uid-owner 1000 -m mark --mark 0x200000/0x600000 -j RETURN\n\
+                 -A {CHAIN} -m owner --uid-owner 1000 -j RETURN\n\
+                 COMMIT\n"
+            )
+            .as_bytes(),
+            XtablesRestoreContext::new(XtablesRestoreAction::Apply, XtablesRestoreFamily::Ipv4),
+        )
+        .unwrap();
+        let expected = XtablesExpectedState::from_apply_artifacts(
+            XtablesRestoreFamily::Ipv4,
+            XtablesExpectedStatePhase::Active,
+            [&artifact],
+        )
+        .unwrap();
+        let counted = format!(
+            "*mangle\n:{CHAIN} - [0:0]\n\
+             [3:180] -A {CHAIN} -m owner --uid-owner 2000 -m mark --mark 0x200000/0x600000 -j RETURN\n\
+             [5:300] -A {CHAIN} -m owner --uid-owner 1000 -m mark --mark 0x200000/0x600000 -j RETURN\n\
+             [7:420] -A {CHAIN} -m owner --uid-owner 1000 -j RETURN\n\
+             COMMIT\n"
+        );
+
+        assert_eq!(
+            project_canary_counter_readback(
+                counted.as_bytes(),
+                XtablesRestoreFamily::Ipv4,
+                &expected,
+                CHAIN,
+            )
+            .unwrap(),
+            NativeXtablesCanaryCounterReadback::new(3, 5, 7)
+        );
+
+        let malformed = counted.replacen(&format!("[5:300] -A {CHAIN}"), &format!("-A {CHAIN}"), 1);
+        let error = project_canary_counter_readback(
+            malformed.as_bytes(),
+            XtablesRestoreFamily::Ipv4,
+            &expected,
+            CHAIN,
+        )
+        .expect_err("a missing counted prefix must not authorize canary evidence");
+        assert_eq!(error.certainty(), NativeMutationCertainty::NotMutated);
+        assert!(error.to_string().contains("MissingRuleCounter"));
+        assert!(error.to_string().contains("live native line"));
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]

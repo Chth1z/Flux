@@ -1502,6 +1502,56 @@ pub(in crate::functional_canary) struct RetiredSupervisedDeliveryReport {
     report_cleanup: CanaryListenerDeliveryReportCleanupEvidence,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::functional_canary) enum SupervisedDeliveryReportPeerReapValidationError {
+    RequestMismatch,
+    ClientRetirementMismatch,
+    FinalCounterAuthorityMissing,
+    ReportBindingMismatch,
+    ReportCleanupDispositionMismatch,
+    ReportObjectMismatch,
+    CounterObjectMismatch,
+    DeadlineExtension,
+    InvalidClientChronology,
+    InvalidReportChronology,
+    InvalidCounterChronology,
+    InvalidPeerReapChronology,
+}
+
+impl fmt::Display for SupervisedDeliveryReportPeerReapValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let reason = match self {
+            Self::RequestMismatch => "retired report belongs to another canary request",
+            Self::ClientRetirementMismatch => {
+                "retired report belongs to another reaped canary client"
+            }
+            Self::FinalCounterAuthorityMissing => {
+                "final counter observation was not bound to the reaped canary client"
+            }
+            Self::ReportBindingMismatch => {
+                "retired report does not match its installed transport binding"
+            }
+            Self::ReportCleanupDispositionMismatch => {
+                "supervised report receiver was not verifiably retired"
+            }
+            Self::ReportObjectMismatch => {
+                "retired report cleanup belongs to another attempt object"
+            }
+            Self::CounterObjectMismatch => "counter retirement belongs to another attempt object",
+            Self::DeadlineExtension => {
+                "peer reap deadline extends the immutable canary request deadline"
+            }
+            Self::InvalidClientChronology => "reaped client chronology is invalid",
+            Self::InvalidReportChronology => "retired report chronology is invalid",
+            Self::InvalidCounterChronology => "counter retirement chronology is invalid",
+            Self::InvalidPeerReapChronology => "peer reap start chronology is invalid",
+        };
+        formatter.write_str(reason)
+    }
+}
+
+impl Error for SupervisedDeliveryReportPeerReapValidationError {}
+
 impl RetiredSupervisedDeliveryReport {
     #[must_use]
     pub(in crate::functional_canary) fn request(&self) -> &CanaryAttemptRequest {
@@ -1536,6 +1586,112 @@ impl RetiredSupervisedDeliveryReport {
             client_retirement: self.client_retirement,
             report_cleanup: self.report_cleanup,
         })
+    }
+
+    /// Validate the exact report/counter retirement boundary while borrowing
+    /// the report so authenticated delivery events remain available.
+    pub(in crate::functional_canary) fn validate_peer_reap(
+        &self,
+        request: &CanaryAttemptRequest,
+        client_retirement: CanaryProcessRetirementEvidence,
+        final_counter_authority_issued: bool,
+        counters_retirement: CanaryAttemptObjectRetirementEvidence,
+        peer_reap_started_at: Instant,
+        exclusive_deadline: Instant,
+    ) -> Result<(), SupervisedDeliveryReportPeerReapValidationError> {
+        use SupervisedDeliveryReportPeerReapValidationError as ValidationError;
+
+        if self.binding.request() != request {
+            return Err(ValidationError::RequestMismatch);
+        }
+        if self.client_retirement != client_retirement {
+            return Err(ValidationError::ClientRetirementMismatch);
+        }
+        if !final_counter_authority_issued {
+            return Err(ValidationError::FinalCounterAuthorityMissing);
+        }
+
+        let expected_objects = request.pre_binding().environment().attempt_objects();
+        if self.binding.report_object() != self.report.report_object()
+            || self.binding.profile_revision() != self.report.profile_revision()
+        {
+            return Err(ValidationError::ReportBindingMismatch);
+        }
+        let report_cleanup = match self.report_cleanup.disposition() {
+            CanaryListenerDeliveryReportCleanupDisposition::Retired(retirement) => retirement,
+            CanaryListenerDeliveryReportCleanupDisposition::VerifiedNeverCreated { .. } => {
+                return Err(ValidationError::ReportCleanupDispositionMismatch);
+            }
+        };
+        if self.binding.report_object() != expected_objects.listener_delivery_report()
+            || report_cleanup.object() != expected_objects.listener_delivery_report()
+        {
+            return Err(ValidationError::ReportObjectMismatch);
+        }
+        if counters_retirement.object() != expected_objects.counters() {
+            return Err(ValidationError::CounterObjectMismatch);
+        }
+
+        let deadline = request.deadline();
+        if exclusive_deadline > deadline.expires_at() {
+            return Err(ValidationError::DeadlineExtension);
+        }
+        if client_retirement.quiesced_at < deadline.started_at()
+            || client_retirement.quiesced_at > client_retirement.terminated_at
+            || client_retirement.terminated_at > client_retirement.reaped_at
+            || client_retirement.reaped_at >= exclusive_deadline
+            || client_retirement.reaped_at >= peer_reap_started_at
+        {
+            return Err(ValidationError::InvalidClientChronology);
+        }
+
+        let report_terminal_at = self.report.terminal_observed_at();
+        let report_eof_at = self.report.eof_observed_at();
+        if report_terminal_at < deadline.started_at()
+            || report_terminal_at > report_eof_at
+            || report_eof_at > report_cleanup.retired_at()
+            || report_cleanup.retired_at() < client_retirement.reaped_at
+            || report_cleanup.retired_at() > report_cleanup.absent_observed_at()
+            || report_cleanup.absent_observed_at() >= exclusive_deadline
+            || report_cleanup.absent_observed_at() >= peer_reap_started_at
+        {
+            return Err(ValidationError::InvalidReportChronology);
+        }
+
+        if counters_retirement.retired_at() < client_retirement.reaped_at
+            || counters_retirement.retired_at() > counters_retirement.absent_observed_at()
+            || counters_retirement.absent_observed_at() >= exclusive_deadline
+            || counters_retirement.absent_observed_at() >= peer_reap_started_at
+        {
+            return Err(ValidationError::InvalidCounterChronology);
+        }
+        if exclusive_deadline <= deadline.started_at()
+            || peer_reap_started_at >= exclusive_deadline
+            || peer_reap_started_at >= deadline.expires_at()
+        {
+            return Err(ValidationError::InvalidPeerReapChronology);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(in crate::functional_canary) fn substitute_report_cleanup_object(
+        &mut self,
+        object: CanaryAttemptObjectIdentity,
+    ) {
+        let retirement = match self.report_cleanup.disposition() {
+            CanaryListenerDeliveryReportCleanupDisposition::Retired(retirement) => retirement,
+            CanaryListenerDeliveryReportCleanupDisposition::VerifiedNeverCreated { .. } => {
+                panic!("retired-report fixtures always own report retirement evidence")
+            }
+        };
+        self.report_cleanup = CanaryListenerDeliveryReportCleanupEvidence::from_retired_collector(
+            CanaryAttemptObjectRetirementEvidence::new(
+                object,
+                retirement.retired_at(),
+                retirement.absent_observed_at(),
+            ),
+        );
     }
 
     #[must_use]

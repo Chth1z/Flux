@@ -285,6 +285,11 @@ pub(super) struct ReapedDriverChild {
 }
 
 impl ReapedDriverChild {
+    #[must_use]
+    pub(super) const fn retirement(&self) -> CanaryProcessRetirementEvidence {
+        self.retirement
+    }
+
     pub(super) fn bind_supervised_report_retirement(
         &self,
         installed: InstalledSupervisedDeliveryReportProducer,

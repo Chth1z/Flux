@@ -15,11 +15,15 @@ use flux_platform::{
 };
 
 use super::super::supervised_delivery_report::collector::{
-    SupervisedDeliveryReportCollectorRetirement, SupervisedDeliveryReportRetirementFailure,
+    DrainedSupervisedDeliveryReportCollector, FailedSupervisedDeliveryReportCollector,
+    RetiredFailedSupervisedDeliveryReport, RetiredSupervisedDeliveryReport,
+    SupervisedDeliveryReportCollectorRetirement, SupervisedDeliveryReportPeerReapValidationError,
+    SupervisedDeliveryReportRetirementFailure,
 };
 use super::super::{
-    CANARY_PEER_SERVER_SLOTS, CanaryAttemptRequest, CanaryFlow, CanaryProcessCredentialIdentity,
-    ClientReapedCanaryAttemptAuthority, InstalledSupervisedDeliveryReportProducer,
+    CANARY_PEER_SERVER_SLOTS, CanaryAttemptObjectRetirementEvidence, CanaryAttemptRequest,
+    CanaryFlow, CanaryProcessCredentialIdentity, ClientReapedCanaryAttemptAuthority,
+    InstalledSupervisedDeliveryReportProducer,
 };
 use super::driver_process::DriverProcessProof;
 use super::driver_process::{
@@ -402,6 +406,7 @@ impl PackagedDriverChildren {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn quiesce_and_reap(
         self,
         exclusive_deadline: Instant,
@@ -515,6 +520,55 @@ pub(super) struct ReapedPackagedDriverChildren {
     pub(super) peer_servers: [ReapedDriverChild; CANARY_PEER_SERVER_SLOTS],
 }
 
+/// Completed report retirement while the exact peer listeners remain owned
+/// and live. Authenticated report events are deliberately not consumed here.
+pub(super) struct ReportRetiredPackagedDriverChildren {
+    children: ClientReapedPackagedDriverChildren,
+    report: RetiredSupervisedDeliveryReport,
+}
+
+/// Linear handoff after exact report/counter validation and orderly peer reap.
+pub(super) struct PeerReapedPackagedDriverChildren {
+    children: ReapedPackagedDriverChildren,
+    report: RetiredSupervisedDeliveryReport,
+    counters_retirement: CanaryAttemptObjectRetirementEvidence,
+}
+
+#[must_use = "failed peer reap still owns report and counter-retirement authority"]
+pub(super) enum ReportRetiredPeerReapFailure {
+    Rejected {
+        state: Box<ReportRetiredPackagedDriverChildren>,
+        counters_retirement: CanaryAttemptObjectRetirementEvidence,
+        source: SupervisedDeliveryReportPeerReapValidationError,
+    },
+    Cleanup(Box<ReportRetiredPeerCleanupFailure>),
+}
+
+pub(super) struct ReportRetiredPeerCleanupFailure {
+    client: ReapedDriverChild,
+    peer_servers: [Result<ReapedDriverChild, PackagedDriverChildError>; CANARY_PEER_SERVER_SLOTS],
+    report: RetiredSupervisedDeliveryReport,
+    counters_retirement: CanaryAttemptObjectRetirementEvidence,
+}
+
+impl ReportRetiredPeerCleanupFailure {
+    pub(super) fn into_parts(
+        self,
+    ) -> (
+        ReapedDriverChild,
+        [Result<ReapedDriverChild, PackagedDriverChildError>; CANARY_PEER_SERVER_SLOTS],
+        RetiredSupervisedDeliveryReport,
+        CanaryAttemptObjectRetirementEvidence,
+    ) {
+        (
+            self.client,
+            self.peer_servers,
+            self.report,
+            self.counters_retirement,
+        )
+    }
+}
+
 /// Fixed cleanup boundary after the request-driving client is parent-reaped
 /// while all peer listeners remain live.
 pub(super) struct ClientReapedPackagedDriverChildren {
@@ -565,7 +619,45 @@ impl ClientReapedPackagedDriverChildren {
     ///
     /// The installed producer proof is bound through the private reaped-client authority; live
     /// peers remain owned by the returned child group on both success and every failure path.
-    pub(super) fn retire_supervised_delivery_report<T>(
+    pub(super) fn retire_supervised_delivery_report<C>(
+        self,
+        installed: InstalledSupervisedDeliveryReportProducer,
+        collector: DrainedSupervisedDeliveryReportCollector<C>,
+    ) -> Result<
+        ReportRetiredPackagedDriverChildren,
+        Box<
+            ClientReapedSupervisedReportRetirementFailure<
+                DrainedSupervisedDeliveryReportCollector<C>,
+            >,
+        >,
+    >
+    where
+        C: FnMut() -> Instant,
+    {
+        let (children, report) =
+            self.retire_supervised_delivery_report_owner(installed, collector)?;
+        Ok(ReportRetiredPackagedDriverChildren { children, report })
+    }
+
+    pub(super) fn retire_failed_supervised_delivery_report<C>(
+        self,
+        installed: InstalledSupervisedDeliveryReportProducer,
+        collector: FailedSupervisedDeliveryReportCollector<C>,
+    ) -> Result<
+        (Self, RetiredFailedSupervisedDeliveryReport),
+        Box<
+            ClientReapedSupervisedReportRetirementFailure<
+                FailedSupervisedDeliveryReportCollector<C>,
+            >,
+        >,
+    >
+    where
+        C: FnMut() -> Instant,
+    {
+        self.retire_supervised_delivery_report_owner(installed, collector)
+    }
+
+    fn retire_supervised_delivery_report_owner<T>(
         self,
         installed: InstalledSupervisedDeliveryReportProducer,
         collector: T,
@@ -650,12 +742,12 @@ impl ClientReapedPackagedDriverChildren {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn quiesce_and_reap_peers(
         self,
         exclusive_deadline: Instant,
     ) -> Result<ReapedPackagedDriverChildren, PackagedDriverChildError> {
         let [peer_0, peer_1, peer_2] = self.peer_servers;
-        // Evaluate every peer retirement before propagating the first error.
         let [peer_0, peer_1, peer_2] = [
             peer_0.quiesce_and_reap(exclusive_deadline),
             peer_1.quiesce_and_reap(exclusive_deadline),
@@ -665,6 +757,91 @@ impl ClientReapedPackagedDriverChildren {
             client: self.client,
             peer_servers: [peer_0?, peer_1?, peer_2?],
         })
+    }
+}
+
+impl ReportRetiredPackagedDriverChildren {
+    pub(super) fn quiesce_and_reap_peers(
+        self,
+        counters_retirement: CanaryAttemptObjectRetirementEvidence,
+        exclusive_deadline: Instant,
+    ) -> Result<PeerReapedPackagedDriverChildren, Box<ReportRetiredPeerReapFailure>> {
+        let peer_reap_started_at = Instant::now();
+        if let Err(source) = self.report.validate_peer_reap(
+            &self.children.request,
+            self.children.client.retirement(),
+            self.children.final_counter_authority_issued,
+            counters_retirement,
+            peer_reap_started_at,
+            exclusive_deadline,
+        ) {
+            return Err(Box::new(ReportRetiredPeerReapFailure::Rejected {
+                state: Box::new(self),
+                counters_retirement,
+                source,
+            }));
+        }
+        let Self { children, report } = self;
+        let ClientReapedPackagedDriverChildren {
+            client,
+            peer_servers,
+            ..
+        } = children;
+        let [peer_0, peer_1, peer_2] = peer_servers;
+        // Every peer transition is evaluated before the first failure is
+        // returned, preserving the existing cleanup behavior.
+        let peer_servers = [
+            peer_0.quiesce_and_reap(exclusive_deadline),
+            peer_1.quiesce_and_reap(exclusive_deadline),
+            peer_2.quiesce_and_reap(exclusive_deadline),
+        ];
+        if peer_servers.iter().any(Result::is_err) {
+            return Err(Box::new(ReportRetiredPeerReapFailure::Cleanup(Box::new(
+                ReportRetiredPeerCleanupFailure {
+                    client,
+                    peer_servers,
+                    report,
+                    counters_retirement,
+                },
+            ))));
+        }
+        let [Ok(peer_0), Ok(peer_1), Ok(peer_2)] = peer_servers else {
+            unreachable!("peer cleanup failures returned the typed partial disposition")
+        };
+        Ok(PeerReapedPackagedDriverChildren {
+            children: ReapedPackagedDriverChildren {
+                client,
+                peer_servers: [peer_0, peer_1, peer_2],
+            },
+            report,
+            counters_retirement,
+        })
+    }
+
+    pub(super) fn abort_and_reap_peers(
+        self,
+        exclusive_deadline: Instant,
+    ) -> Result<
+        RetiredSupervisedDeliveryReport,
+        Box<(RetiredSupervisedDeliveryReport, PackagedDriverChildError)>,
+    > {
+        let Self { children, report } = self;
+        match children.abort_and_reap_peers(exclusive_deadline) {
+            Ok(()) => Ok(report),
+            Err(source) => Err(Box::new((report, source))),
+        }
+    }
+}
+
+impl PeerReapedPackagedDriverChildren {
+    pub(super) fn into_parts(
+        self,
+    ) -> (
+        ReapedPackagedDriverChildren,
+        RetiredSupervisedDeliveryReport,
+        CanaryAttemptObjectRetirementEvidence,
+    ) {
+        (self.children, self.report, self.counters_retirement)
     }
 }
 
@@ -1251,6 +1428,7 @@ mod tests {
     use std::num::{NonZeroU32, NonZeroU64};
     use std::os::unix::process::CommandExt;
     use std::process::Command;
+    use std::sync::{Mutex, MutexGuard};
 
     use crate::OwnedEngineIdentity;
     use crate::functional_canary::supervised_delivery_report::tests::encode_report_frames;
@@ -1259,8 +1437,8 @@ mod tests {
     };
     use crate::functional_canary::tests::Fixture;
     use crate::functional_canary::{
-        CanaryAddressFamilies, CanaryFlowKind, CanaryProcessCredentialIdentity,
-        UnqualifiedCanaryGateEvidence,
+        CanaryAddressFamilies, CanaryAttemptObjectIdentity, CanaryFlowKind,
+        CanaryProcessCredentialIdentity, UnqualifiedCanaryGateEvidence,
     };
     use crate::generation_engine_config::EngineSupervisedDeliveryReportContract;
 
@@ -1275,6 +1453,7 @@ mod tests {
     const TEST_DEADLINE_ENV: &str = "FLUX_TEST_PACKAGED_DRIVER_DEADLINE_NS";
     const TEST_IPV4_ENV: &str = "FLUX_TEST_PACKAGED_DRIVER_IPV4";
     const TEST_IPV6_ENV: &str = "FLUX_TEST_PACKAGED_DRIVER_IPV6";
+    static SELF_EXEC_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn hidden_dispatch_does_not_intercept_the_public_cli() {
@@ -1364,6 +1543,7 @@ mod tests {
 
     #[test]
     fn packaged_self_exec_children_hold_quiesce_and_reap_exact_roles() {
+        let _self_exec_guard = serialize_self_exec_test();
         let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
         let request = fixture.request();
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -1442,6 +1622,7 @@ mod tests {
 
     #[test]
     fn client_reaped_group_retires_failed_report_while_peers_remain_live() {
+        let _self_exec_guard = serialize_self_exec_test();
         let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
         let request = fixture.request();
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -1449,7 +1630,7 @@ mod tests {
         let (children, bindings) = spawn_client_reaped_fixture(request, deadline);
 
         let (children, retired) =
-            match children.retire_supervised_delivery_report(installed, failed) {
+            match children.retire_failed_supervised_delivery_report(installed, failed) {
                 Ok(retired) => retired,
                 Err(_) => panic!("exact reaped client retires the failed collector"),
             };
@@ -1457,13 +1638,14 @@ mod tests {
         assert_peer_bindings_live(bindings);
 
         children
-            .quiesce_and_reap_peers(deadline)
-            .expect("report retirement retains orderly peer cleanup");
+            .abort_and_reap_peers(deadline)
+            .expect("failed report retirement uses abort compensation");
         assert_peer_bindings_retired(bindings);
     }
 
     #[test]
     fn client_reaped_group_retires_drained_report_after_terminal_eof_with_peers_live() {
+        let _self_exec_guard = serialize_self_exec_test();
         let fixture = report_sender_fixture();
         let request = fixture.request();
         let evidence = fixture.successful_evidence();
@@ -1472,22 +1654,289 @@ mod tests {
             completed_report_fixture(request, &evidence, Instant::now as fn() -> Instant);
         let (children, bindings) = spawn_client_reaped_fixture(request, deadline);
 
-        let (children, retired) =
-            match children.retire_supervised_delivery_report(installed, drained) {
-                Ok(retired) => retired,
-                Err(_) => panic!("exact reaped client retires the terminal-plus-EOF collector"),
-            };
-        drop(retired);
+        let report_retired = match children.retire_supervised_delivery_report(installed, drained) {
+            Ok(report_retired) => report_retired,
+            Err(_) => panic!("exact reaped client retires the terminal-plus-EOF collector"),
+        };
         assert_peer_bindings_live(bindings);
 
+        let counters_retirement = exact_counter_retirement(&report_retired);
+        let (mut report_retired, counters_retirement) = match report_retired
+            .quiesce_and_reap_peers(counters_retirement, request.deadline().expires_at())
+        {
+            Ok(_) => panic!("peer reap requires final counter observation authority"),
+            Err(failure) => match *failure {
+                ReportRetiredPeerReapFailure::Rejected {
+                    state,
+                    counters_retirement,
+                    source,
+                } => {
+                    assert_eq!(
+                            source,
+                            SupervisedDeliveryReportPeerReapValidationError::FinalCounterAuthorityMissing
+                        );
+                    (*state, counters_retirement)
+                }
+                ReportRetiredPeerReapFailure::Cleanup(_) => {
+                    panic!("missing final counter authority must reject before peer cleanup")
+                }
+            },
+        };
+        assert_peer_bindings_live(bindings);
+        bind_final_counter_fixture(&mut report_retired.children);
+        let extended_deadline = request
+            .deadline()
+            .expires_at()
+            .checked_add(Duration::from_nanos(1))
+            .expect("fixture deadline has a successor");
+        let (report_retired, counters_retirement) =
+            match report_retired.quiesce_and_reap_peers(counters_retirement, extended_deadline) {
+                Ok(_) => panic!("peer reap cannot extend the immutable request deadline"),
+                Err(failure) => match *failure {
+                    ReportRetiredPeerReapFailure::Rejected {
+                        state,
+                        counters_retirement,
+                        source,
+                    } => {
+                        assert_eq!(
+                            source,
+                            SupervisedDeliveryReportPeerReapValidationError::DeadlineExtension
+                        );
+                        (*state, counters_retirement)
+                    }
+                    ReportRetiredPeerReapFailure::Cleanup(_) => {
+                        panic!("deadline extension must reject before peer cleanup")
+                    }
+                },
+            };
+        assert_peer_bindings_live(bindings);
+        let peer_reaped = match report_retired
+            .quiesce_and_reap_peers(counters_retirement, request.deadline().expires_at())
+        {
+            Ok(peer_reaped) => peer_reaped,
+            Err(_) => panic!("exact report and counter retirement permit orderly peer reap"),
+        };
+        assert_peer_bindings_retired(bindings);
+        let (children, report, preserved_counters_retirement) = peer_reaped.into_parts();
+        assert_eq!(preserved_counters_retirement, counters_retirement);
+        assert!(matches!(
+            report.into_capture_authority(),
+            Err(crate::functional_canary::supervised_delivery_report::SupervisedDeliveryReportError::UnconsumedDeliveryEvents)
+        ));
         children
-            .quiesce_and_reap_peers(deadline)
-            .expect("drained report retirement retains orderly peer cleanup");
+            .into_process_proof()
+            .expect("assemble peer-reaped process proof");
+    }
+
+    #[test]
+    fn peer_reap_rejects_substituted_report_request_before_cleanup() {
+        let _self_exec_guard = serialize_self_exec_test();
+        let fixture = report_sender_fixture();
+        let alternate = report_sender_fixture();
+        assert_ne!(fixture.request(), alternate.request());
+        let child_deadline = Instant::now() + Duration::from_secs(20);
+        let (mut state, bindings) = spawn_report_retired_fixture(
+            fixture.request(),
+            &fixture.successful_evidence(),
+            child_deadline,
+        );
+        let (mut alternate_state, alternate_bindings) = spawn_report_retired_fixture(
+            alternate.request(),
+            &alternate.successful_evidence(),
+            child_deadline,
+        );
+        std::mem::swap(&mut state.report, &mut alternate_state.report);
+        let counters_retirement = exact_counter_retirement(&state);
+
+        assert_pre_reap_rejection(
+            state.quiesce_and_reap_peers(
+                counters_retirement,
+                fixture.request().deadline().expires_at(),
+            ),
+            SupervisedDeliveryReportPeerReapValidationError::RequestMismatch,
+            counters_retirement,
+            bindings,
+            child_deadline,
+        );
+        let report = alternate_state
+            .abort_and_reap_peers(child_deadline)
+            .unwrap_or_else(|failure| {
+                let (_report, source) = *failure;
+                panic!("abort compensation failed: {source}")
+            });
+        drop(report);
+        assert_peer_bindings_retired(alternate_bindings);
+    }
+
+    #[test]
+    fn peer_reap_rejects_substituted_client_before_cleanup() {
+        let _self_exec_guard = serialize_self_exec_test();
+        let fixture = report_sender_fixture();
+        let request = fixture.request();
+        let evidence = fixture.successful_evidence();
+        let child_deadline = Instant::now() + Duration::from_secs(20);
+        let (mut state, bindings) =
+            spawn_report_retired_fixture(request, &evidence, child_deadline);
+        let (mut alternate_state, alternate_bindings) =
+            spawn_report_retired_fixture(request, &evidence, child_deadline);
+        assert_ne!(
+            state.children.client.retirement(),
+            alternate_state.children.client.retirement()
+        );
+        std::mem::swap(&mut state.report, &mut alternate_state.report);
+        let counters_retirement = exact_counter_retirement(&state);
+
+        assert_pre_reap_rejection(
+            state.quiesce_and_reap_peers(counters_retirement, request.deadline().expires_at()),
+            SupervisedDeliveryReportPeerReapValidationError::ClientRetirementMismatch,
+            counters_retirement,
+            bindings,
+            child_deadline,
+        );
+        let report = alternate_state
+            .abort_and_reap_peers(child_deadline)
+            .unwrap_or_else(|failure| {
+                let (_report, source) = *failure;
+                panic!("abort compensation failed: {source}")
+            });
+        drop(report);
+        assert_peer_bindings_retired(alternate_bindings);
+    }
+
+    #[test]
+    fn peer_reap_rejects_substituted_report_object_before_cleanup() {
+        let _self_exec_guard = serialize_self_exec_test();
+        let fixture = report_sender_fixture();
+        let request = fixture.request();
+        let child_deadline = Instant::now() + Duration::from_secs(20);
+        let (mut state, bindings) =
+            spawn_report_retired_fixture(request, &fixture.successful_evidence(), child_deadline);
+        state
+            .report
+            .substitute_report_cleanup_object(substituted_attempt_object(
+                request
+                    .pre_binding()
+                    .environment()
+                    .attempt_objects()
+                    .listener_delivery_report(),
+            ));
+        let counters_retirement = exact_counter_retirement(&state);
+
+        assert_pre_reap_rejection(
+            state.quiesce_and_reap_peers(counters_retirement, request.deadline().expires_at()),
+            SupervisedDeliveryReportPeerReapValidationError::ReportObjectMismatch,
+            counters_retirement,
+            bindings,
+            child_deadline,
+        );
+    }
+
+    #[test]
+    fn peer_reap_rejects_substituted_counter_object_before_cleanup() {
+        let _self_exec_guard = serialize_self_exec_test();
+        let fixture = report_sender_fixture();
+        let request = fixture.request();
+        let child_deadline = Instant::now() + Duration::from_secs(20);
+        let (state, bindings) =
+            spawn_report_retired_fixture(request, &fixture.successful_evidence(), child_deadline);
+        let exact = exact_counter_retirement(&state);
+        let counters_retirement = CanaryAttemptObjectRetirementEvidence::new(
+            substituted_attempt_object(exact.object()),
+            exact.retired_at(),
+            exact.absent_observed_at(),
+        );
+
+        assert_pre_reap_rejection(
+            state.quiesce_and_reap_peers(counters_retirement, request.deadline().expires_at()),
+            SupervisedDeliveryReportPeerReapValidationError::CounterObjectMismatch,
+            counters_retirement,
+            bindings,
+            child_deadline,
+        );
+    }
+
+    #[test]
+    fn peer_reap_rejects_substituted_counter_chronology_before_cleanup() {
+        let _self_exec_guard = serialize_self_exec_test();
+        let fixture = report_sender_fixture();
+        let request = fixture.request();
+        let child_deadline = Instant::now() + Duration::from_secs(20);
+        let (state, bindings) =
+            spawn_report_retired_fixture(request, &fixture.successful_evidence(), child_deadline);
+        let exact = exact_counter_retirement(&state);
+        let invalid_retired_at = exact
+            .absent_observed_at()
+            .checked_add(Duration::from_nanos(1))
+            .expect("fixture counter absence has a successor");
+        let counters_retirement = CanaryAttemptObjectRetirementEvidence::new(
+            exact.object(),
+            invalid_retired_at,
+            exact.absent_observed_at(),
+        );
+
+        assert_pre_reap_rejection(
+            state.quiesce_and_reap_peers(counters_retirement, request.deadline().expires_at()),
+            SupervisedDeliveryReportPeerReapValidationError::InvalidCounterChronology,
+            counters_retirement,
+            bindings,
+            child_deadline,
+        );
+    }
+
+    #[test]
+    fn peer_reap_failure_after_validation_preserves_report_and_counter_owners() {
+        let _self_exec_guard = serialize_self_exec_test();
+        let fixture = report_sender_fixture();
+        let request = fixture.request();
+        let child_deadline = Instant::now() + Duration::from_secs(20);
+        let (state, bindings) =
+            spawn_report_retired_fixture(request, &fixture.successful_evidence(), child_deadline);
+        let counters_retirement = exact_counter_retirement(&state);
+        let peer_pid = state.children.peer_servers[0]
+            .retained
+            .identity()
+            .pid()
+            .get();
+        // SAFETY: the exact retained child PID is live and owned by this test;
+        // the gate still performs the parent-reap and sibling cleanup.
+        let kill_result = unsafe { libc::kill(peer_pid.cast_signed(), libc::SIGKILL) };
+        assert_eq!(kill_result, 0);
+
+        let failure = match state
+            .quiesce_and_reap_peers(counters_retirement, request.deadline().expires_at())
+        {
+            Ok(_) => panic!("a killed peer cannot produce complete orderly-reap proof"),
+            Err(failure) => failure,
+        };
+        let (client, peer_servers, report, preserved_counters_retirement) = match *failure {
+            ReportRetiredPeerReapFailure::Cleanup(failure) => (*failure).into_parts(),
+            ReportRetiredPeerReapFailure::Rejected { .. } => {
+                panic!("exact pre-reap evidence must reach destructive cleanup")
+            }
+        };
+        assert_eq!(preserved_counters_retirement, counters_retirement);
+        assert_eq!(
+            peer_servers.iter().filter(|result| result.is_err()).count(),
+            1
+        );
+        assert!(
+            peer_servers
+                .iter()
+                .filter_map(|result| result.as_ref().err())
+                .all(|source| !source.to_string().is_empty())
+        );
+        assert!(matches!(
+            report.into_capture_authority(),
+            Err(crate::functional_canary::supervised_delivery_report::SupervisedDeliveryReportError::UnconsumedDeliveryEvents)
+        ));
+        drop(client);
+        drop(peer_servers);
         assert_peer_bindings_retired(bindings);
     }
 
     #[test]
     fn client_reaped_bridge_rejects_another_request_before_consuming_report_owners() {
+        let _self_exec_guard = serialize_self_exec_test();
         let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
         let alternate = Fixture::new(CanaryAddressFamilies::Ipv4Only);
         assert_ne!(fixture.request(), alternate.request());
@@ -1496,7 +1945,7 @@ mod tests {
             failed_report_fixture(alternate.request(), Instant::now as fn() -> Instant);
         let (children, bindings) = spawn_client_reaped_fixture(fixture.request(), deadline);
 
-        let failure = match children.retire_supervised_delivery_report(installed, failed) {
+        let failure = match children.retire_failed_supervised_delivery_report(installed, failed) {
             Ok(_) => panic!("another request cannot consume the reaped-client report bridge"),
             Err(failure) => failure,
         };
@@ -1518,13 +1967,14 @@ mod tests {
         }
         assert_peer_bindings_live(bindings);
         children
-            .quiesce_and_reap_peers(deadline)
-            .expect("request rejection retains orderly peer cleanup");
+            .abort_and_reap_peers(deadline)
+            .expect("request rejection uses abort compensation");
         assert_peer_bindings_retired(bindings);
     }
 
     #[test]
     fn client_reaped_bridge_preserves_receiver_retained_report_failure() {
+        let _self_exec_guard = serialize_self_exec_test();
         let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
         let alternate = Fixture::new(CanaryAddressFamilies::Ipv4Only);
         let request = fixture.request();
@@ -1537,11 +1987,12 @@ mod tests {
         drop(unused_failed);
         let (children, bindings) = spawn_client_reaped_fixture(request, deadline);
 
-        let failure =
-            match children.retire_supervised_delivery_report(substituted_installed, failed) {
-                Ok(_) => panic!("another transport binding cannot retire the retained receiver"),
-                Err(failure) => failure,
-            };
+        let failure = match children
+            .retire_failed_supervised_delivery_report(substituted_installed, failed)
+        {
+            Ok(_) => panic!("another transport binding cannot retire the retained receiver"),
+            Err(failure) => failure,
+        };
         let (children, disposition) = failure.into_disposition();
         let source = match disposition {
             ClientReapedSupervisedReportRetirementFailureDisposition::Collector(source) => source,
@@ -1570,13 +2021,14 @@ mod tests {
         }
         assert_peer_bindings_live(bindings);
         children
-            .quiesce_and_reap_peers(deadline)
-            .expect("retained-receiver failure keeps orderly peer cleanup");
+            .abort_and_reap_peers(deadline)
+            .expect("retained-receiver failure uses abort compensation");
         assert_peer_bindings_retired(bindings);
     }
 
     #[test]
     fn client_reaped_bridge_preserves_receiver_retired_without_evidence_failure() {
+        let _self_exec_guard = serialize_self_exec_test();
         let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
         let request = fixture.request();
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -1601,7 +2053,7 @@ mod tests {
         let (installed, failed) = failed_report_fixture(request, clock);
         let (children, bindings) = spawn_client_reaped_fixture(request, deadline);
 
-        let failure = match children.retire_supervised_delivery_report(installed, failed) {
+        let failure = match children.retire_failed_supervised_delivery_report(installed, failed) {
             Ok(_) => panic!("invalid post-drop chronology cannot mint report cleanup evidence"),
             Err(failure) => failure,
         };
@@ -1630,8 +2082,8 @@ mod tests {
         drop(unverified);
         assert_peer_bindings_live(bindings);
         children
-            .quiesce_and_reap_peers(deadline)
-            .expect("terminal report failure keeps orderly peer cleanup");
+            .abort_and_reap_peers(deadline)
+            .expect("terminal report failure uses abort compensation");
         assert_peer_bindings_retired(bindings);
     }
 
@@ -1649,6 +2101,7 @@ mod tests {
 
     #[test]
     fn packaged_self_exec_children_run_held_echo_and_dns_transaction() {
+        let _self_exec_guard = serialize_self_exec_test();
         let ipv6 = ipv6_loopback_available();
         let families = if ipv6 {
             CanaryAddressFamilies::Ipv4AndIpv6
@@ -1784,6 +2237,7 @@ mod tests {
 
     #[test]
     fn packaged_parent_rejects_reordered_flow_without_losing_cleanup_authority() {
+        let _self_exec_guard = serialize_self_exec_test();
         let deadline = Instant::now() + Duration::from_secs(20);
         let tcp_port = available_tcp_port();
         let udp_port = available_udp_port();
@@ -1830,6 +2284,7 @@ mod tests {
 
     #[test]
     fn dropped_flow_holding_poisoned_orderly_continuation_and_preserved_abort() {
+        let _self_exec_guard = serialize_self_exec_test();
         let deadline = Instant::now() + Duration::from_secs(20);
         let tcp_port = available_tcp_port();
         let udp_port = available_udp_port();
@@ -1888,6 +2343,7 @@ mod tests {
 
     #[test]
     fn packaged_self_exec_child_rejects_reordered_frame_and_group_aborts() {
+        let _self_exec_guard = serialize_self_exec_test();
         let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
         let request = fixture.request();
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -1944,6 +2400,7 @@ mod tests {
 
     #[test]
     fn expired_parent_transaction_keeps_all_children_abortable() {
+        let _self_exec_guard = serialize_self_exec_test();
         let cleanup_deadline = Instant::now() + Duration::from_secs(20);
         let tcp_port = available_tcp_port();
         let udp_port = available_udp_port();
@@ -2004,6 +2461,12 @@ mod tests {
             required_test_env(TEST_IPV6_ENV),
         ];
         run_internal_child(&args).expect("run self-exec child reentry");
+    }
+
+    fn serialize_self_exec_test() -> MutexGuard<'static, ()> {
+        SELF_EXEC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn spawn_test_child(
@@ -2231,6 +2694,95 @@ mod tests {
         .quiesce_client_and_reap(exclusive_deadline)
         .expect("quiesce and parent-reap the exact report-retirement client");
         (children, bindings)
+    }
+
+    fn spawn_report_retired_fixture(
+        request: &CanaryAttemptRequest,
+        evidence: &UnqualifiedCanaryGateEvidence,
+        exclusive_deadline: Instant,
+    ) -> (ReportRetiredPackagedDriverChildren, TestPeerBindings) {
+        let (installed, drained) =
+            completed_report_fixture(request, evidence, Instant::now as fn() -> Instant);
+        let (mut children, bindings) = spawn_client_reaped_fixture(request, exclusive_deadline);
+        bind_final_counter_fixture(&mut children);
+        let report_retired = match children.retire_supervised_delivery_report(installed, drained) {
+            Ok(report_retired) => report_retired,
+            Err(_) => panic!("exact fixture client retires the completed report"),
+        };
+        (report_retired, bindings)
+    }
+
+    fn bind_final_counter_fixture(children: &mut ClientReapedPackagedDriverChildren) {
+        children.completed_flow_count = CanaryFlow::ALL
+            .iter()
+            .filter(|flow| children.request.requires_flow(**flow))
+            .count();
+        let authority = children
+            .bind_final_counter_observation()
+            .expect("completed fixture flows bind final counter observation once");
+        assert_eq!(authority.request(), &children.request);
+    }
+
+    fn exact_counter_retirement(
+        state: &ReportRetiredPackagedDriverChildren,
+    ) -> CanaryAttemptObjectRetirementEvidence {
+        let retired_at = Instant::now();
+        assert!(retired_at >= state.children.client.retirement().reaped_at);
+        CanaryAttemptObjectRetirementEvidence::new(
+            state
+                .children
+                .request
+                .pre_binding()
+                .environment()
+                .attempt_objects()
+                .counters(),
+            retired_at,
+            Instant::now(),
+        )
+    }
+
+    fn substituted_attempt_object(
+        original: CanaryAttemptObjectIdentity,
+    ) -> CanaryAttemptObjectIdentity {
+        let mut bytes = *original.as_bytes();
+        bytes[0] ^= 0xff;
+        CanaryAttemptObjectIdentity::new(bytes)
+            .expect("substituted object identity remains nonzero")
+    }
+
+    fn assert_pre_reap_rejection(
+        result: Result<PeerReapedPackagedDriverChildren, Box<ReportRetiredPeerReapFailure>>,
+        expected_source: SupervisedDeliveryReportPeerReapValidationError,
+        expected_counters_retirement: CanaryAttemptObjectRetirementEvidence,
+        bindings: TestPeerBindings,
+        cleanup_deadline: Instant,
+    ) {
+        let failure = match result {
+            Ok(_) => panic!("substituted retirement evidence cannot reap peers"),
+            Err(failure) => failure,
+        };
+        let (state, counters_retirement, source) = match *failure {
+            ReportRetiredPeerReapFailure::Rejected {
+                state,
+                counters_retirement,
+                source,
+            } => (state, counters_retirement, source),
+            ReportRetiredPeerReapFailure::Cleanup(_) => {
+                panic!("pre-reap validation rejection cannot begin peer cleanup")
+            }
+        };
+        assert_eq!(source, expected_source);
+        assert_eq!(counters_retirement, expected_counters_retirement);
+        assert_peer_bindings_live(bindings);
+        let report = match state.abort_and_reap_peers(cleanup_deadline) {
+            Ok(report) => report,
+            Err(failure) => {
+                let (_report, source) = *failure;
+                panic!("abort compensation failed: {source}")
+            }
+        };
+        drop(report);
+        assert_peer_bindings_retired(bindings);
     }
 
     fn assert_peer_bindings_live(bindings: TestPeerBindings) {

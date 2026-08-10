@@ -367,7 +367,11 @@ impl SupervisedDeliveryReportEngineHandoff {
         self.binding.profile_revision()
     }
 
-    pub(super) fn send_frame(&self, frame: &[u8]) -> Result<(), PlatformError> {
+    #[cfg(test)]
+    pub(in crate::functional_canary) fn send_frame(
+        &self,
+        frame: &[u8],
+    ) -> Result<(), PlatformError> {
         self.connection.send_packet(frame)
     }
 
@@ -989,9 +993,32 @@ impl SupervisedDeliveryReportClientRetirementAuthority {
     }
 }
 
+/// Sibling-visible adapter over the two terminal collector typestates.
+///
+/// The adapter deliberately starts after parsing has either drained or failed. It consumes the
+/// exact collector owner together with one request-bound client-retirement authority, so sibling
+/// protocols cannot bypass the receiver-retirement chronology or erase its failure disposition.
+pub(in crate::functional_canary) trait SupervisedDeliveryReportCollectorRetirement:
+    collector_retirement_seal::Sealed + Sized
+{
+    type Retired;
+
+    #[must_use]
+    fn retirement_request(&self) -> &CanaryAttemptRequest;
+
+    fn retire_after_client(
+        self,
+        authority: SupervisedDeliveryReportClientRetirementAuthority,
+    ) -> Result<Self::Retired, SupervisedDeliveryReportRetirementFailure<Self>>;
+}
+
+mod collector_retirement_seal {
+    pub trait Sealed {}
+}
+
 /// Retirement failure that distinguishes a still-owned receiver from a resource already closed.
 #[must_use = "retirement failure may still own the report receiver"]
-pub(super) struct SupervisedDeliveryReportRetirementFailure<T> {
+pub(in crate::functional_canary) struct SupervisedDeliveryReportRetirementFailure<T> {
     state: SupervisedDeliveryReportRetirementFailureState<T>,
 }
 
@@ -1004,7 +1031,7 @@ enum SupervisedDeliveryReportRetirementFailureState<T> {
     ReceiverRetiredWithoutCleanupEvidence(Box<UnverifiedSupervisedDeliveryReportRetirement>),
 }
 
-pub(super) enum SupervisedDeliveryReportRetirementFailureDisposition<T> {
+pub(in crate::functional_canary) enum SupervisedDeliveryReportRetirementFailureDisposition<T> {
     ReceiverRetained {
         owner: Box<T>,
         authority: SupervisedDeliveryReportClientRetirementAuthority,
@@ -1021,7 +1048,7 @@ enum UnverifiedSupervisedDeliveryReportOutcome {
 ///
 /// This terminal state retains chronology and collection diagnostics, but deliberately exposes no
 /// cleanup evidence and cannot be converted into a promotable report.
-pub(super) struct UnverifiedSupervisedDeliveryReportRetirement {
+pub(in crate::functional_canary) struct UnverifiedSupervisedDeliveryReportRetirement {
     binding: Arc<SupervisedDeliveryReportTransportBinding>,
     client_retirement: CanaryProcessRetirementEvidence,
     retired_at: Instant,
@@ -1032,7 +1059,9 @@ pub(super) struct UnverifiedSupervisedDeliveryReportRetirement {
 
 impl UnverifiedSupervisedDeliveryReportRetirement {
     #[must_use]
-    pub(super) const fn error(&self) -> &SupervisedDeliveryReportCollectorError {
+    pub(in crate::functional_canary) const fn error(
+        &self,
+    ) -> &SupervisedDeliveryReportCollectorError {
         &self.error
     }
 
@@ -1120,7 +1149,9 @@ impl<T> SupervisedDeliveryReportRetirementFailure<T> {
     }
 
     #[must_use]
-    pub(super) const fn error(&self) -> &SupervisedDeliveryReportCollectorError {
+    pub(in crate::functional_canary) const fn error(
+        &self,
+    ) -> &SupervisedDeliveryReportCollectorError {
         match &self.state {
             SupervisedDeliveryReportRetirementFailureState::ReceiverRetained { error, .. } => error,
             SupervisedDeliveryReportRetirementFailureState::ReceiverRetiredWithoutCleanupEvidence(
@@ -1129,7 +1160,7 @@ impl<T> SupervisedDeliveryReportRetirementFailure<T> {
         }
     }
 
-    pub(super) fn into_disposition(
+    pub(in crate::functional_canary) fn into_disposition(
         self,
     ) -> SupervisedDeliveryReportRetirementFailureDisposition<T> {
         match self.state {
@@ -1234,6 +1265,26 @@ where
     }
 }
 
+impl<C> SupervisedDeliveryReportCollectorRetirement for DrainedSupervisedDeliveryReportCollector<C>
+where
+    C: FnMut() -> Instant,
+{
+    type Retired = RetiredSupervisedDeliveryReport;
+
+    fn retirement_request(&self) -> &CanaryAttemptRequest {
+        self.receiver.binding.request()
+    }
+
+    fn retire_after_client(
+        self,
+        authority: SupervisedDeliveryReportClientRetirementAuthority,
+    ) -> Result<Self::Retired, SupervisedDeliveryReportRetirementFailure<Self>> {
+        DrainedSupervisedDeliveryReportCollector::retire_after_client(self, authority)
+    }
+}
+
+impl<C> collector_retirement_seal::Sealed for DrainedSupervisedDeliveryReportCollector<C> {}
+
 impl<C> FailedSupervisedDeliveryReportCollector<C>
 where
     C: FnMut() -> Instant,
@@ -1278,6 +1329,26 @@ where
         }
     }
 }
+
+impl<C> SupervisedDeliveryReportCollectorRetirement for FailedSupervisedDeliveryReportCollector<C>
+where
+    C: FnMut() -> Instant,
+{
+    type Retired = RetiredFailedSupervisedDeliveryReport;
+
+    fn retirement_request(&self) -> &CanaryAttemptRequest {
+        self.receiver.binding.request()
+    }
+
+    fn retire_after_client(
+        self,
+        authority: SupervisedDeliveryReportClientRetirementAuthority,
+    ) -> Result<Self::Retired, SupervisedDeliveryReportRetirementFailure<Self>> {
+        FailedSupervisedDeliveryReportCollector::retire_after_client(self, authority)
+    }
+}
+
+impl<C> collector_retirement_seal::Sealed for FailedSupervisedDeliveryReportCollector<C> {}
 
 #[derive(Clone, Copy)]
 struct ReceiverRetirementRequirements {
@@ -1521,7 +1592,7 @@ impl RetiredSupervisedDeliveryReportCaptureAuthority {
 }
 
 /// Failed report collection after ordered receiver destruction.
-pub(super) struct RetiredFailedSupervisedDeliveryReport {
+pub(in crate::functional_canary) struct RetiredFailedSupervisedDeliveryReport {
     collection_error: SupervisedDeliveryReportCollectorError,
     client_retirement: CanaryProcessRetirementEvidence,
     report_cleanup: CanaryListenerDeliveryReportCleanupEvidence,

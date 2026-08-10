@@ -14,9 +14,12 @@ use flux_platform::{
     PeerCredentials, PlatformError, ProcessIdentity, SeqpacketConnection, SeqpacketReceive,
 };
 
+use super::super::supervised_delivery_report::collector::{
+    SupervisedDeliveryReportCollectorRetirement, SupervisedDeliveryReportRetirementFailure,
+};
 use super::super::{
     CANARY_PEER_SERVER_SLOTS, CanaryAttemptRequest, CanaryFlow, CanaryProcessCredentialIdentity,
-    ClientReapedCanaryAttemptAuthority,
+    ClientReapedCanaryAttemptAuthority, InstalledSupervisedDeliveryReportProducer,
 };
 use super::driver_process::DriverProcessProof;
 use super::driver_process::{
@@ -522,7 +525,88 @@ pub(super) struct ClientReapedPackagedDriverChildren {
     peer_servers: [PackagedDriverChild; CANARY_PEER_SERVER_SLOTS],
 }
 
+/// Failed consuming transition from the client-reaped/peers-live boundary to report retirement.
+///
+/// Every disposition retains the complete child group. Collector retirement failures are stored
+/// unchanged so their receiver-retained versus receiver-retired-without-cleanup-evidence state is
+/// not flattened into a generic driver error.
+#[must_use = "failed report retirement still owns child and collector cleanup authority"]
+pub(super) struct ClientReapedSupervisedReportRetirementFailure<T> {
+    children: ClientReapedPackagedDriverChildren,
+    disposition: ClientReapedSupervisedReportRetirementFailureDisposition<T>,
+}
+
+pub(super) enum ClientReapedSupervisedReportRetirementFailureDisposition<T> {
+    RequestMismatch {
+        installed: InstalledSupervisedDeliveryReportProducer,
+        collector: T,
+    },
+    InvalidClientAuthority {
+        installed: InstalledSupervisedDeliveryReportProducer,
+        collector: T,
+        error: DriverProcessAuthorityError,
+    },
+    Collector(SupervisedDeliveryReportRetirementFailure<T>),
+}
+
+impl<T> ClientReapedSupervisedReportRetirementFailure<T> {
+    pub(super) fn into_disposition(
+        self,
+    ) -> (
+        ClientReapedPackagedDriverChildren,
+        ClientReapedSupervisedReportRetirementFailureDisposition<T>,
+    ) {
+        (self.children, self.disposition)
+    }
+}
+
 impl ClientReapedPackagedDriverChildren {
+    /// Consume one finished collector only after this group's exact client was parent-reaped.
+    ///
+    /// The installed producer proof is bound through the private reaped-client authority; live
+    /// peers remain owned by the returned child group on both success and every failure path.
+    pub(super) fn retire_supervised_delivery_report<T>(
+        self,
+        installed: InstalledSupervisedDeliveryReportProducer,
+        collector: T,
+    ) -> Result<(Self, T::Retired), Box<ClientReapedSupervisedReportRetirementFailure<T>>>
+    where
+        T: SupervisedDeliveryReportCollectorRetirement,
+    {
+        if collector.retirement_request() != &self.request {
+            return Err(Box::new(ClientReapedSupervisedReportRetirementFailure {
+                children: self,
+                disposition:
+                    ClientReapedSupervisedReportRetirementFailureDisposition::RequestMismatch {
+                        installed,
+                        collector,
+                    },
+            }));
+        }
+        let authority = match self.client.bind_supervised_report_retirement(installed) {
+            Ok(authority) => authority,
+            Err((installed, error)) => {
+                return Err(Box::new(ClientReapedSupervisedReportRetirementFailure {
+                    children: self,
+                    disposition: ClientReapedSupervisedReportRetirementFailureDisposition::InvalidClientAuthority {
+                        installed,
+                        collector,
+                        error,
+                    },
+                }));
+            }
+        };
+        match collector.retire_after_client(authority) {
+            Ok(retired) => Ok((self, retired)),
+            Err(failure) => Err(Box::new(ClientReapedSupervisedReportRetirementFailure {
+                children: self,
+                disposition: ClientReapedSupervisedReportRetirementFailureDisposition::Collector(
+                    failure,
+                ),
+            })),
+        }
+    }
+
     /// Bind the one writer-owned final-counter transition to the exact
     /// parent-reaped client while retaining ownership of every live peer.
     pub(super) fn bind_final_counter_observation(
@@ -1164,12 +1248,21 @@ impl Error for PackagedDriverChildError {
 mod tests {
     use std::env;
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
-    use std::num::NonZeroU32;
+    use std::num::{NonZeroU32, NonZeroU64};
     use std::os::unix::process::CommandExt;
     use std::process::Command;
 
+    use crate::OwnedEngineIdentity;
+    use crate::functional_canary::supervised_delivery_report::tests::encode_report_frames;
+    use crate::functional_canary::supervised_delivery_report::{
+        AdmittedSupervisedDeliveryReportBinding, collector,
+    };
     use crate::functional_canary::tests::Fixture;
-    use crate::functional_canary::{CanaryAddressFamilies, CanaryFlowKind};
+    use crate::functional_canary::{
+        CanaryAddressFamilies, CanaryFlowKind, CanaryProcessCredentialIdentity,
+        UnqualifiedCanaryGateEvidence,
+    };
+    use crate::generation_engine_config::EngineSupervisedDeliveryReportContract;
 
     use super::super::driver_traffic::MAX_TRAFFIC_FRAME_BYTES;
     use super::*;
@@ -1345,6 +1438,213 @@ mod tests {
         UdpSocket::bind(udp_address).expect("UDP echo binding retired before acknowledgement");
         TcpListener::bind(dns_address).expect("DNS/TCP binding retired before acknowledgement");
         UdpSocket::bind(dns_address).expect("DNS/UDP binding retired before acknowledgement");
+    }
+
+    #[test]
+    fn client_reaped_group_retires_failed_report_while_peers_remain_live() {
+        let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+        let request = fixture.request();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let (installed, failed) = failed_report_fixture(request, Instant::now as fn() -> Instant);
+        let (children, bindings) = spawn_client_reaped_fixture(request, deadline);
+
+        let (children, retired) =
+            match children.retire_supervised_delivery_report(installed, failed) {
+                Ok(retired) => retired,
+                Err(_) => panic!("exact reaped client retires the failed collector"),
+            };
+        drop(retired);
+        assert_peer_bindings_live(bindings);
+
+        children
+            .quiesce_and_reap_peers(deadline)
+            .expect("report retirement retains orderly peer cleanup");
+        assert_peer_bindings_retired(bindings);
+    }
+
+    #[test]
+    fn client_reaped_group_retires_drained_report_after_terminal_eof_with_peers_live() {
+        let fixture = report_sender_fixture();
+        let request = fixture.request();
+        let evidence = fixture.successful_evidence();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let (installed, drained) =
+            completed_report_fixture(request, &evidence, Instant::now as fn() -> Instant);
+        let (children, bindings) = spawn_client_reaped_fixture(request, deadline);
+
+        let (children, retired) =
+            match children.retire_supervised_delivery_report(installed, drained) {
+                Ok(retired) => retired,
+                Err(_) => panic!("exact reaped client retires the terminal-plus-EOF collector"),
+            };
+        drop(retired);
+        assert_peer_bindings_live(bindings);
+
+        children
+            .quiesce_and_reap_peers(deadline)
+            .expect("drained report retirement retains orderly peer cleanup");
+        assert_peer_bindings_retired(bindings);
+    }
+
+    #[test]
+    fn client_reaped_bridge_rejects_another_request_before_consuming_report_owners() {
+        let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+        let alternate = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+        assert_ne!(fixture.request(), alternate.request());
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let (installed, failed) =
+            failed_report_fixture(alternate.request(), Instant::now as fn() -> Instant);
+        let (children, bindings) = spawn_client_reaped_fixture(fixture.request(), deadline);
+
+        let failure = match children.retire_supervised_delivery_report(installed, failed) {
+            Ok(_) => panic!("another request cannot consume the reaped-client report bridge"),
+            Err(failure) => failure,
+        };
+        let (children, disposition) = failure.into_disposition();
+        match disposition {
+            ClientReapedSupervisedReportRetirementFailureDisposition::RequestMismatch {
+                installed,
+                collector,
+            } => {
+                drop(installed);
+                drop(collector);
+            }
+            ClientReapedSupervisedReportRetirementFailureDisposition::InvalidClientAuthority {
+                ..
+            }
+            | ClientReapedSupervisedReportRetirementFailureDisposition::Collector(_) => {
+                panic!("request substitution must reject before client/report binding")
+            }
+        }
+        assert_peer_bindings_live(bindings);
+        children
+            .quiesce_and_reap_peers(deadline)
+            .expect("request rejection retains orderly peer cleanup");
+        assert_peer_bindings_retired(bindings);
+    }
+
+    #[test]
+    fn client_reaped_bridge_preserves_receiver_retained_report_failure() {
+        let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+        let alternate = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+        let request = fixture.request();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let (unused_installed, failed) =
+            failed_report_fixture(request, Instant::now as fn() -> Instant);
+        let (substituted_installed, unused_failed) =
+            failed_report_fixture(alternate.request(), Instant::now as fn() -> Instant);
+        drop(unused_installed);
+        drop(unused_failed);
+        let (children, bindings) = spawn_client_reaped_fixture(request, deadline);
+
+        let failure =
+            match children.retire_supervised_delivery_report(substituted_installed, failed) {
+                Ok(_) => panic!("another transport binding cannot retire the retained receiver"),
+                Err(failure) => failure,
+            };
+        let (children, disposition) = failure.into_disposition();
+        let source = match disposition {
+            ClientReapedSupervisedReportRetirementFailureDisposition::Collector(source) => source,
+            ClientReapedSupervisedReportRetirementFailureDisposition::RequestMismatch {
+                ..
+            }
+            | ClientReapedSupervisedReportRetirementFailureDisposition::InvalidClientAuthority {
+                ..
+            } => panic!("same-request collector reaches exact transport-binding validation"),
+        };
+        assert!(matches!(
+            source.error(),
+            collector::SupervisedDeliveryReportCollectorError::ClientRetirementAuthorityMismatch
+        ));
+        match source.into_disposition() {
+            collector::SupervisedDeliveryReportRetirementFailureDisposition::ReceiverRetained {
+                owner,
+                authority,
+            } => {
+                drop(owner);
+                drop(authority);
+            }
+            collector::SupervisedDeliveryReportRetirementFailureDisposition::ReceiverRetiredWithoutCleanupEvidence(
+                ..
+            ) => panic!("pre-drop binding rejection must preserve the exact receiver"),
+        }
+        assert_peer_bindings_live(bindings);
+        children
+            .quiesce_and_reap_peers(deadline)
+            .expect("retained-receiver failure keeps orderly peer cleanup");
+        assert_peer_bindings_retired(bindings);
+    }
+
+    #[test]
+    fn client_reaped_bridge_preserves_receiver_retired_without_evidence_failure() {
+        let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+        let request = fixture.request();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut calls = 0_u8;
+        let mut retired_at = None;
+        let clock = move || {
+            calls += 1;
+            match calls {
+                1 => Instant::now(),
+                2 => {
+                    let observed = Instant::now();
+                    retired_at = Some(observed);
+                    observed
+                }
+                3 => retired_at
+                    .expect("receiver-retirement timestamp was recorded")
+                    .checked_sub(Duration::from_nanos(1))
+                    .expect("test retirement instant has a predecessor"),
+                _ => panic!("unexpected report-retirement clock read"),
+            }
+        };
+        let (installed, failed) = failed_report_fixture(request, clock);
+        let (children, bindings) = spawn_client_reaped_fixture(request, deadline);
+
+        let failure = match children.retire_supervised_delivery_report(installed, failed) {
+            Ok(_) => panic!("invalid post-drop chronology cannot mint report cleanup evidence"),
+            Err(failure) => failure,
+        };
+        let (children, disposition) = failure.into_disposition();
+        let source = match disposition {
+            ClientReapedSupervisedReportRetirementFailureDisposition::Collector(source) => source,
+            ClientReapedSupervisedReportRetirementFailureDisposition::RequestMismatch {
+                ..
+            }
+            | ClientReapedSupervisedReportRetirementFailureDisposition::InvalidClientAuthority {
+                ..
+            } => panic!("exact report owners reach receiver-retirement validation"),
+        };
+        let unverified = match source.into_disposition() {
+            collector::SupervisedDeliveryReportRetirementFailureDisposition::ReceiverRetained {
+                ..
+            } => panic!("post-drop failure cannot retain a destroyed receiver"),
+            collector::SupervisedDeliveryReportRetirementFailureDisposition::ReceiverRetiredWithoutCleanupEvidence(
+                retirement,
+            ) => retirement,
+        };
+        assert!(matches!(
+            unverified.error(),
+            collector::SupervisedDeliveryReportCollectorError::InvalidReceiverRetirement
+        ));
+        drop(unverified);
+        assert_peer_bindings_live(bindings);
+        children
+            .quiesce_and_reap_peers(deadline)
+            .expect("terminal report failure keeps orderly peer cleanup");
+        assert_peer_bindings_retired(bindings);
+    }
+
+    #[test]
+    fn report_retirement_adapter_covers_both_linear_terminal_collector_states() {
+        fn assert_retirement_state<T: collector::SupervisedDeliveryReportCollectorRetirement>() {}
+
+        assert_retirement_state::<
+            collector::DrainedSupervisedDeliveryReportCollector<fn() -> Instant>,
+        >();
+        assert_retirement_state::<
+            collector::FailedSupervisedDeliveryReportCollector<fn() -> Instant>,
+        >();
     }
 
     #[test]
@@ -1788,6 +2088,164 @@ mod tests {
             exclusive_deadline,
         )
         .expect("spawn retained self-exec test child")
+    }
+
+    fn failed_report_fixture<C>(
+        request: &CanaryAttemptRequest,
+        clock: C,
+    ) -> (
+        InstalledSupervisedDeliveryReportProducer,
+        collector::FailedSupervisedDeliveryReportCollector<C>,
+    )
+    where
+        C: FnMut() -> Instant,
+    {
+        let engine = request.pre_binding().engine();
+        let admitted = AdmittedSupervisedDeliveryReportBinding::new(
+            engine.artifacts(),
+            engine.engine_profile_revision(),
+            EngineSupervisedDeliveryReportContract::schema_v1_fixture(),
+        )
+        .expect("fixture report binding is canonical");
+        let authority =
+            collector::SupervisedDeliveryReportPrebindAuthority::admitted(admitted, request)
+                .expect("fixture report binding matches the request");
+        let (producer, collector) =
+            collector::prebind(authority, clock).expect("prebind report-retirement fixture");
+        let installed = producer.into_engine_handoff().into_installed_fixture();
+        let failed = match collector.drain() {
+            Ok(_) => panic!("producer retirement before a terminal report must fail collection"),
+            Err(failed) => *failed,
+        };
+        (installed, failed)
+    }
+
+    fn report_sender_fixture() -> Fixture {
+        let original = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+        let mut request = original.request().clone();
+        let engine = request.pre_binding().engine().engine();
+        request.pre_binding.engine.engine = OwnedEngineIdentity::new(
+            NonZeroU32::new(std::process::id()).expect("test process PID is nonzero"),
+            NonZeroU64::new(engine.start_time_ticks())
+                .expect("fixture engine start ticks are nonzero"),
+        );
+        // The collector's test-only root fallback cannot represent UID/GID zero in this model.
+        // Non-root test runs instead bind the request to the actual seqpacket sender credentials.
+        // SAFETY: the effective-identity getters have no pointer arguments or preconditions.
+        let uid = NonZeroU32::new(unsafe { libc::geteuid() });
+        // SAFETY: see the effective-UID getter above.
+        let gid = NonZeroU32::new(unsafe { libc::getegid() });
+        if let (Some(uid), Some(gid)) = (uid, gid) {
+            request.pre_binding.environment.credentials.engine =
+                CanaryProcessCredentialIdentity::new(uid, gid);
+        }
+        Fixture::from_request(request)
+    }
+
+    fn completed_report_fixture<C>(
+        request: &CanaryAttemptRequest,
+        evidence: &UnqualifiedCanaryGateEvidence,
+        clock: C,
+    ) -> (
+        InstalledSupervisedDeliveryReportProducer,
+        collector::DrainedSupervisedDeliveryReportCollector<C>,
+    )
+    where
+        C: FnMut() -> Instant,
+    {
+        let engine = request.pre_binding().engine();
+        let admitted = AdmittedSupervisedDeliveryReportBinding::new(
+            engine.artifacts(),
+            engine.engine_profile_revision(),
+            EngineSupervisedDeliveryReportContract::schema_v1_fixture(),
+        )
+        .expect("fixture report binding is canonical");
+        let authority =
+            collector::SupervisedDeliveryReportPrebindAuthority::admitted(admitted, request)
+                .expect("fixture report binding matches the request");
+        let (producer, collector) =
+            collector::prebind(authority, clock).expect("prebind completed-report fixture");
+        let handoff = producer.into_engine_handoff();
+        for frame in encode_report_frames(request, evidence) {
+            handoff
+                .send_frame(&frame)
+                .expect("send one canonical supervised report record");
+        }
+        let installed = handoff.into_installed_fixture();
+        let drained = match collector.drain() {
+            Ok(drained) => drained,
+            Err(failed) => {
+                panic!("terminal report followed by transport EOF must drain: {failed}")
+            }
+        };
+        (installed, drained)
+    }
+
+    #[derive(Clone, Copy)]
+    struct TestPeerBindings {
+        tcp: SocketAddr,
+        udp: SocketAddr,
+        dns: SocketAddr,
+    }
+
+    fn spawn_client_reaped_fixture(
+        request: &CanaryAttemptRequest,
+        exclusive_deadline: Instant,
+    ) -> (ClientReapedPackagedDriverChildren, TestPeerBindings) {
+        let bindings = TestPeerBindings {
+            tcp: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, available_tcp_port())),
+            udp: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, available_udp_port())),
+            dns: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, available_dns_port())),
+        };
+        let client = spawn_test_child(PackagedDriverChildRole::Client, None, exclusive_deadline);
+        let tcp = spawn_test_child(
+            PackagedDriverChildRole::TcpEcho,
+            Some(ChildBindPlan {
+                ipv4: bindings.tcp,
+                ipv6: None,
+            }),
+            exclusive_deadline,
+        );
+        let udp = spawn_test_child(
+            PackagedDriverChildRole::UdpEcho,
+            Some(ChildBindPlan {
+                ipv4: bindings.udp,
+                ipv6: None,
+            }),
+            exclusive_deadline,
+        );
+        let dns = spawn_test_child(
+            PackagedDriverChildRole::Dns,
+            Some(ChildBindPlan {
+                ipv4: bindings.dns,
+                ipv6: None,
+            }),
+            exclusive_deadline,
+        );
+        let children = PackagedDriverChildren {
+            request: request.clone(),
+            client,
+            peer_servers: [tcp, udp, dns],
+            traffic_state: PackagedDriverTrafficState::Ready { next_flow_index: 0 },
+        }
+        .quiesce_client_and_reap(exclusive_deadline)
+        .expect("quiesce and parent-reap the exact report-retirement client");
+        (children, bindings)
+    }
+
+    fn assert_peer_bindings_live(bindings: TestPeerBindings) {
+        assert!(TcpListener::bind(bindings.tcp).is_err());
+        assert!(UdpSocket::bind(bindings.udp).is_err());
+        assert!(TcpListener::bind(bindings.dns).is_err());
+        assert!(UdpSocket::bind(bindings.dns).is_err());
+    }
+
+    fn assert_peer_bindings_retired(bindings: TestPeerBindings) {
+        TcpListener::bind(bindings.tcp).expect("TCP peer retired only after explicit peer reap");
+        UdpSocket::bind(bindings.udp).expect("UDP peer retired only after explicit peer reap");
+        TcpListener::bind(bindings.dns)
+            .expect("DNS/TCP peer retired only after explicit peer reap");
+        UdpSocket::bind(bindings.dns).expect("DNS/UDP peer retired only after explicit peer reap");
     }
 
     fn required_test_env(name: &str) -> String {

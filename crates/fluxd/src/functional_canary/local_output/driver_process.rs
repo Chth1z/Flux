@@ -286,15 +286,20 @@ pub(super) struct ReapedDriverChild {
 
 impl ReapedDriverChild {
     pub(super) fn bind_supervised_report_retirement(
-        self,
+        &self,
         installed: InstalledSupervisedDeliveryReportProducer,
     ) -> Result<
-        (Self, SupervisedDeliveryReportClientRetirementAuthority),
-        DriverProcessAuthorityError,
+        SupervisedDeliveryReportClientRetirementAuthority,
+        (
+            InstalledSupervisedDeliveryReportProducer,
+            DriverProcessAuthorityError,
+        ),
     > {
-        require_role(self.role, DriverProcessRole::Client)?;
+        if let Err(error) = require_role(self.role, DriverProcessRole::Client) {
+            return Err((installed, error));
+        }
         let authority = installed.into_client_retirement_authority(self.retirement);
-        Ok((self, authority))
+        Ok(authority)
     }
 
     pub(super) fn verify_post_reap_exit(
@@ -791,17 +796,24 @@ mod tests {
             .terminate_and_reap(Instant::now(), deadline)
             .expect("terminate and reap exact peer fixture");
 
-        let (_client, authority) = client
+        let (installed, error) = match peer
             .bind_supervised_report_retirement(installed_report_fixture(fixture.request()))
-            .expect("reaped client consumes the installed report proof");
-        drop(authority);
+        {
+            Ok(_) => panic!("a peer role cannot bind client report retirement"),
+            Err(failure) => failure,
+        };
         assert!(matches!(
-            peer.bind_supervised_report_retirement(installed_report_fixture(fixture.request())),
-            Err(super::DriverProcessAuthorityError::RoleMismatch {
+            error,
+            super::DriverProcessAuthorityError::RoleMismatch {
                 expected: DriverProcessRole::Client,
                 observed: DriverProcessRole::PeerServer { slot: 0 },
-            })
+            }
         ));
+        let authority = match client.bind_supervised_report_retirement(installed) {
+            Ok(authority) => authority,
+            Err(_) => panic!("the exact client consumes the proof preserved by peer rejection"),
+        };
+        drop(authority);
     }
 
     #[test]

@@ -1051,7 +1051,7 @@ fn parse_payload_identity(
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::functional_canary) mod tests {
     #[cfg(all(feature = "native-composition-test", target_os = "linux"))]
     use std::env;
     use std::fs;
@@ -4276,7 +4276,7 @@ esac
         SupervisedDeliveryReportDatagram::new(bytes, false, observed_at)
     }
 
-    fn encode_report_frames(
+    pub(in crate::functional_canary) fn encode_report_frames(
         request: &CanaryAttemptRequest,
         evidence: &super::super::UnqualifiedCanaryGateEvidence,
     ) -> Vec<Vec<u8>> {

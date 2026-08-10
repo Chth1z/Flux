@@ -27,6 +27,10 @@ use std::convert::Infallible;
 use crate::engine_supervisor::OwnedEngineIdentity;
 use crate::engine_supervisor::{EngineChildAuthority, EngineChildObservationPair};
 use crate::runtime_coordinator::CanaryAttemptObservationAuthority;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use flux_platform::socket_diagnostics::{
+    InetSocketProtocol, ProcessSocketDiagnostics, SocketCorrelationError,
+};
 use flux_platform::{
     ProcessObservation, ProcessUserNamespaceObservation, TRANSPARENT_PROXY_ENGINE_CAPABILITY_MASK,
 };
@@ -39,6 +43,12 @@ use super::{
     UnqualifiedCanaryGateEvidence, UnqualifiedCanaryLoopEvidence,
     UnqualifiedFunctionalCanaryExecution, UnqualifiedFunctionalCanaryExecutor, bounded_prefix,
 };
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use super::{
+    CanaryFlow, CanaryFlowProtocol, CanaryFlowTuple, CanarySocketCorrelation,
+    CanarySocketCorrelationBuildError, UnqualifiedCanaryDnsEvidence, UnqualifiedCanaryFlowEvidence,
+    UnqualifiedCanaryOutboundEvidence,
+};
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use super::supervised_delivery_report::collector::RetiredSupervisedDeliveryReport;
@@ -49,6 +59,8 @@ mod driver_process;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod driver_traffic;
 use driver_process::DriverProcessProof;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use driver_traffic::{TrafficFlowPlan, TrafficFlowResult};
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub(in crate::functional_canary) fn try_run_internal_child(args: &[String]) -> Option<i32> {
@@ -2714,6 +2726,198 @@ fn contract_failure(
     FunctionalCanaryError::new(kind, cleanup, &diagnostic)
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(
+    dead_code,
+    reason = "the packaged attempt remains closed until its full cleanup choreography lands"
+)]
+enum PackagedTrafficProjectionError {
+    FlowNotRequired,
+    ResultFlowMismatch,
+    TupleMismatch,
+    PayloadMismatch,
+    DnsMismatch,
+    TimingInvalid,
+}
+
+/// Project one authenticated child traffic result without granting capture authority.
+///
+/// The child substrate already proves the exact bytes crossed both endpoints. This adapter binds
+/// that result back to the immutable request and records only the raw flow/DNS facts consumed by
+/// the existing private capture and gate verifiers.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[allow(
+    dead_code,
+    reason = "the packaged attempt remains closed until its full cleanup choreography lands"
+)]
+fn project_packaged_traffic_flow(
+    request: &CanaryAttemptRequest,
+    expected_flow: CanaryFlow,
+    result: &TrafficFlowResult,
+    started_at: std::time::Instant,
+    completed_at: std::time::Instant,
+) -> Result<UnqualifiedCanaryFlowEvidence, PackagedTrafficProjectionError> {
+    if !request.requires_flow(expected_flow) {
+        return Err(PackagedTrafficProjectionError::FlowNotRequired);
+    }
+    if result.flow() != expected_flow {
+        return Err(PackagedTrafficProjectionError::ResultFlowMismatch);
+    }
+
+    let expected_plan = TrafficFlowPlan::for_request(request, expected_flow)
+        .map_err(|_| PackagedTrafficProjectionError::FlowNotRequired)?;
+    let expected_destination = expected_plan.destination();
+    let client_tuple = result.client_tuple();
+    let peer_tuple = result.peer_tuple();
+    if client_tuple.source().ip() != expected_plan.source().ip()
+        || client_tuple.source().port() == 0
+        || client_tuple.destination() != expected_destination
+        || peer_tuple.source().ip() != expected_plan.source().ip()
+        || peer_tuple.source().port() == 0
+        || peer_tuple.destination() != expected_destination
+    {
+        return Err(PackagedTrafficProjectionError::TupleMismatch);
+    }
+    let expected_dns = request.expected_dns(expected_flow);
+    if result.dns() != expected_dns {
+        return Err(PackagedTrafficProjectionError::DnsMismatch);
+    }
+    if result.request_payload() != expected_plan.request_payload()
+        || result.response_payload() != expected_plan.response_payload()
+    {
+        return Err(PackagedTrafficProjectionError::PayloadMismatch);
+    }
+    let deadline = request.deadline();
+    if started_at < deadline.started_at()
+        || completed_at < started_at
+        || completed_at >= deadline.expires_at()
+    {
+        return Err(PackagedTrafficProjectionError::TimingInvalid);
+    }
+
+    let dns = expected_dns.map(|expected| {
+        UnqualifiedCanaryDnsEvidence::new(
+            expected.transaction_id(),
+            expected.transaction_id(),
+            expected.transaction_id(),
+            expected.question_digest(),
+            expected.question_digest(),
+            expected.question_digest(),
+            expected.answer(),
+            expected.answer(),
+        )
+    });
+    Ok(UnqualifiedCanaryFlowEvidence::new(
+        expected_flow,
+        request.nonce(),
+        request.nonce(),
+        request.nonce(),
+        client_tuple,
+        peer_tuple,
+        started_at,
+        completed_at,
+        None,
+        dns,
+    ))
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(
+    dead_code,
+    reason = "the packaged attempt remains closed until its full cleanup choreography lands"
+)]
+enum PackagedOutboundProjectionError {
+    RequestMismatch,
+    TupleMismatch,
+    MissingSocket,
+    AmbiguousSocket,
+    SocketCorrelation(SocketCorrelationError),
+    CorrelationBuild(CanarySocketCorrelationBuildError),
+    MissingDiagnosticMark,
+    ZeroDiagnosticUid,
+}
+
+/// Select the sole engine FD/INET_DIAG join for a held flow and project it into raw loop evidence.
+///
+/// The caller must invoke this while `PackagedDriverFlowHolding` still owns both live endpoints.
+/// The exact peer-observed tuple is used directionally; unrelated process sockets are ignored, but
+/// a second matching FD or any ambiguous per-FD diagnostic row fails closed.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[allow(
+    dead_code,
+    reason = "the packaged attempt remains closed until its full cleanup choreography lands"
+)]
+fn correlate_held_engine_outbound(
+    request: &CanaryAttemptRequest,
+    flow: CanaryFlow,
+    peer_tuple: CanaryFlowTuple,
+    snapshot: &ProcessSocketDiagnostics,
+) -> Result<UnqualifiedCanaryOutboundEvidence, PackagedOutboundProjectionError> {
+    if request.capture_backend() != CanaryCaptureBackend::Tproxy || !request.requires_flow(flow) {
+        return Err(PackagedOutboundProjectionError::RequestMismatch);
+    }
+    let expected_destination = std::net::SocketAddr::new(
+        request.peer_address(flow),
+        request.responder_port(flow).get(),
+    );
+    if peer_tuple.source().ip() != request.daemon_address(flow)
+        || peer_tuple.source().port() == 0
+        || peer_tuple.destination() != expected_destination
+    {
+        return Err(PackagedOutboundProjectionError::TupleMismatch);
+    }
+    let protocol = match flow.protocol() {
+        CanaryFlowProtocol::Tcp => InetSocketProtocol::Tcp,
+        CanaryFlowProtocol::Udp => InetSocketProtocol::Udp,
+    };
+    let mut selected = None;
+    for process_fd in snapshot.socket_fds() {
+        match snapshot.correlate(
+            process_fd.fd(),
+            protocol,
+            peer_tuple.source(),
+            peer_tuple.destination(),
+        ) {
+            Ok(correlated) => {
+                if selected.replace(correlated).is_some() {
+                    return Err(PackagedOutboundProjectionError::AmbiguousSocket);
+                }
+            }
+            Err(SocketCorrelationError::MissingDiagnostic { .. }) => {}
+            Err(source) => {
+                return Err(PackagedOutboundProjectionError::SocketCorrelation(source));
+            }
+        }
+    }
+    let correlated = selected.ok_or(PackagedOutboundProjectionError::MissingSocket)?;
+    let diagnostic = correlated.diagnostic();
+    let observed_uid = std::num::NonZeroU32::new(diagnostic.uid())
+        .ok_or(PackagedOutboundProjectionError::ZeroDiagnosticUid)?;
+    let observed_socket_mark = diagnostic
+        .mark()
+        .ok_or(PackagedOutboundProjectionError::MissingDiagnosticMark)?;
+    let correlation = CanarySocketCorrelation::from_proc_fd_inet_diag_snapshot(
+        request
+            .pre_binding()
+            .environment()
+            .authority()
+            .socket_observer(),
+        request.pre_binding().engine().engine(),
+        snapshot,
+        correlated,
+    )
+    .map_err(PackagedOutboundProjectionError::CorrelationBuild)?;
+    Ok(UnqualifiedCanaryOutboundEvidence::new(
+        flow,
+        peer_tuple,
+        correlation,
+        observed_uid,
+        observed_socket_mark,
+    ))
+}
+
 /// The packaged adapter has no device-qualified direct-observation implementation. This
 /// zero-state driver intentionally owns no mutation handle.
 #[derive(Clone, Copy, Debug, Default)]
@@ -3112,6 +3316,193 @@ mod tests {
 
         fn network_namespace(&self) -> (u64, u64) {
             self.network_namespace
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn packaged_traffic_result(
+        request: &CanaryAttemptRequest,
+        flow: CanaryFlow,
+    ) -> TrafficFlowResult {
+        let plan = TrafficFlowPlan::for_request(request, flow).expect("required traffic plan");
+        let destination = plan.destination();
+        let source_ip = plan.source().ip();
+        TrafficFlowResult::new(
+            plan,
+            CanaryFlowTuple::new(
+                std::net::SocketAddr::new(source_ip, 51_000 + flow.index() as u16),
+                destination,
+            ),
+            CanaryFlowTuple::new(
+                std::net::SocketAddr::new(source_ip, 52_000 + flow.index() as u16),
+                destination,
+            ),
+        )
+        .expect("exact traffic result")
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn packaged_traffic_projection_preserves_exact_flow_and_dns_facts() {
+        for families in [
+            CanaryAddressFamilies::Ipv4Only,
+            CanaryAddressFamilies::Ipv4AndIpv6,
+        ] {
+            let fixture = Fixture::new(families);
+            let request = fixture.request();
+            for flow in CanaryFlow::ALL {
+                if !request.requires_flow(flow) {
+                    continue;
+                }
+                let result = packaged_traffic_result(request, flow);
+                let started_at = request.deadline().started_at() + Duration::from_millis(10);
+                let completed_at = started_at + Duration::from_millis(10);
+
+                let projected =
+                    project_packaged_traffic_flow(request, flow, &result, started_at, completed_at)
+                        .expect("exact packaged traffic projects into raw evidence");
+
+                assert_eq!(projected.flow, flow);
+                assert_eq!(projected.nonce_sent, request.nonce());
+                assert_eq!(projected.nonce_received, request.nonce());
+                assert_eq!(projected.nonce_peer_observed, request.nonce());
+                assert_eq!(projected.client_tuple, result.client_tuple());
+                assert_eq!(projected.peer_tuple, result.peer_tuple());
+                assert_eq!(projected.started_at, started_at);
+                assert_eq!(projected.completed_at, completed_at);
+                assert!(projected.inbound_listener_delivery.is_none());
+                match (projected.dns, request.expected_dns(flow)) {
+                    (None, None) => {}
+                    (Some(observed), Some(expected)) => {
+                        assert_eq!(observed.sent_transaction_id, expected.transaction_id());
+                        assert_eq!(observed.received_transaction_id, expected.transaction_id());
+                        assert_eq!(observed.peer_transaction_id, expected.transaction_id());
+                        assert_eq!(observed.sent_question, expected.question_digest());
+                        assert_eq!(observed.received_question, expected.question_digest());
+                        assert_eq!(observed.peer_question, expected.question_digest());
+                        assert_eq!(observed.received_answer, expected.answer());
+                        assert_eq!(observed.peer_answer, expected.answer());
+                    }
+                    mismatch => {
+                        panic!("projected DNS presence differs from the request: {mismatch:?}")
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn packaged_traffic_projection_rejects_request_tuple_payload_dns_and_time_substitution() {
+        let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+        let request = fixture.request();
+        let started_at = request.deadline().started_at() + Duration::from_millis(10);
+        let completed_at = started_at + Duration::from_millis(10);
+        let tcp = packaged_traffic_result(request, CanaryFlow::Ipv4TcpEcho);
+        let udp = packaged_traffic_result(request, CanaryFlow::Ipv4UdpEcho);
+
+        assert_eq!(
+            project_packaged_traffic_flow(
+                request,
+                CanaryFlow::Ipv4TcpEcho,
+                &udp,
+                started_at,
+                completed_at,
+            ),
+            Err(PackagedTrafficProjectionError::ResultFlowMismatch)
+        );
+        let dual = Fixture::new(CanaryAddressFamilies::Ipv4AndIpv6);
+        let ipv6 = packaged_traffic_result(dual.request(), CanaryFlow::Ipv6TcpEcho);
+        assert_eq!(
+            project_packaged_traffic_flow(
+                request,
+                CanaryFlow::Ipv6TcpEcho,
+                &ipv6,
+                started_at,
+                completed_at,
+            ),
+            Err(PackagedTrafficProjectionError::FlowNotRequired)
+        );
+
+        let altered_plan = TrafficFlowPlan::for_request(request, CanaryFlow::Ipv4TcpEcho)
+            .expect("required traffic plan")
+            .with_test_endpoints(
+                "192.0.2.10:0".parse().expect("test source"),
+                "192.0.2.11:53001".parse().expect("test destination"),
+            )
+            .expect("valid alternate endpoints");
+        let altered_destination = altered_plan.destination();
+        let altered_source = altered_plan.source().ip();
+        let altered_tuple = TrafficFlowResult::new(
+            altered_plan,
+            CanaryFlowTuple::new(
+                std::net::SocketAddr::new(altered_source, 53_001),
+                altered_destination,
+            ),
+            CanaryFlowTuple::new(
+                std::net::SocketAddr::new(altered_source, 53_002),
+                altered_destination,
+            ),
+        )
+        .expect("alternate traffic result");
+        assert_eq!(
+            project_packaged_traffic_flow(
+                request,
+                CanaryFlow::Ipv4TcpEcho,
+                &altered_tuple,
+                started_at,
+                completed_at,
+            ),
+            Err(PackagedTrafficProjectionError::TupleMismatch)
+        );
+
+        let mut changed_nonce = request.clone();
+        changed_nonce.nonce = CanaryNonce::from_bytes([0xa5; FUNCTIONAL_CANARY_NONCE_BYTES]);
+        let changed_payload = packaged_traffic_result(&changed_nonce, CanaryFlow::Ipv4TcpEcho);
+        assert_eq!(
+            project_packaged_traffic_flow(
+                request,
+                CanaryFlow::Ipv4TcpEcho,
+                &changed_payload,
+                started_at,
+                completed_at,
+            ),
+            Err(PackagedTrafficProjectionError::PayloadMismatch)
+        );
+
+        let mut changed_dns = request.clone();
+        changed_dns.dns_expectations.slots[CanaryFlow::Ipv4DnsUdp.index()] =
+            changed_dns.dns_expectations.slots[CanaryFlow::Ipv4DnsTcp.index()];
+        let changed_dns_result = packaged_traffic_result(&changed_dns, CanaryFlow::Ipv4DnsUdp);
+        assert_eq!(
+            project_packaged_traffic_flow(
+                request,
+                CanaryFlow::Ipv4DnsUdp,
+                &changed_dns_result,
+                started_at,
+                completed_at,
+            ),
+            Err(PackagedTrafficProjectionError::DnsMismatch)
+        );
+
+        for (invalid_start, invalid_complete) in [
+            (
+                request.deadline().started_at() - Duration::from_nanos(1),
+                completed_at,
+            ),
+            (completed_at, started_at),
+            (started_at, request.deadline().expires_at()),
+        ] {
+            assert_eq!(
+                project_packaged_traffic_flow(
+                    request,
+                    CanaryFlow::Ipv4TcpEcho,
+                    &tcp,
+                    invalid_start,
+                    invalid_complete,
+                ),
+                Err(PackagedTrafficProjectionError::TimingInvalid)
+            );
         }
     }
 

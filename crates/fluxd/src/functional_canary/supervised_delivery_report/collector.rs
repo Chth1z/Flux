@@ -1700,7 +1700,9 @@ impl RetiredSupervisedDeliveryReport {
     }
 
     #[must_use]
-    pub(super) const fn report_cleanup(&self) -> CanaryListenerDeliveryReportCleanupEvidence {
+    pub(in crate::functional_canary) const fn report_cleanup(
+        &self,
+    ) -> CanaryListenerDeliveryReportCleanupEvidence {
         self.report_cleanup
     }
 }

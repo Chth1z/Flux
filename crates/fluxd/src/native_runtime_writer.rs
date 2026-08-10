@@ -1,8 +1,14 @@
 use std::error::Error;
 use std::fmt;
+use std::fs::File;
+use std::io;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use std::os::fd::AsRawFd;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use std::os::unix::fs::MetadataExt;
 use std::time::{Duration, Instant};
 
-use flux_core::{AddressResyncDisposition, GenerationId, Reason};
+use flux_core::{AddressResyncDisposition, GenerationId, NetworkNamespaceIdentity, Reason};
 use flux_platform::{
     NativeCaptureCanaryAttempt, NativeCaptureCanarySelector, NativeCaptureConvergedState,
     NativeCaptureConvergence, NativeCaptureDesired, NativeCaptureTargetIdentity,
@@ -127,6 +133,124 @@ struct RetainedNativeGeneration<T> {
     target: T,
 }
 
+/// Linear boot-facility authority retained by the serialized native writer.
+///
+/// The identity values do not authorize reopening a namespace. The original descriptor remains
+/// writer-owned, and an attempt receives only a freshly validated duplicate.
+pub(crate) struct RetainedCanaryFacilityAuthority {
+    facility: crate::functional_canary::CanaryFacilityIdentity,
+    peer_network_namespace: NetworkNamespaceIdentity,
+    peer_network_namespace_handle: File,
+}
+
+impl RetainedCanaryFacilityAuthority {
+    #[allow(
+        dead_code,
+        reason = "the production facility creator is intentionally not connected in this checkpoint"
+    )]
+    pub(crate) fn new(
+        facility: crate::functional_canary::CanaryFacilityIdentity,
+        peer_network_namespace: NetworkNamespaceIdentity,
+        peer_network_namespace_handle: File,
+    ) -> Result<Self, NativeCoordinatorWriterError> {
+        validate_peer_network_namespace_handle(
+            &peer_network_namespace_handle,
+            peer_network_namespace,
+        )?;
+        Ok(Self {
+            facility,
+            peer_network_namespace,
+            peer_network_namespace_handle,
+        })
+    }
+
+    fn duplicate_for(
+        &self,
+        request: &CanaryAttemptRequest,
+    ) -> Result<File, NativeCoordinatorWriterError> {
+        let environment = request.pre_binding().environment();
+        if self.facility != environment.facility() {
+            return Err(NativeCoordinatorWriterError::Invariant(
+                "retained canary facility authority does not match the immutable request",
+            ));
+        }
+        if self.peer_network_namespace != environment.authority().network().peer_network_namespace()
+        {
+            return Err(NativeCoordinatorWriterError::Invariant(
+                "retained peer network namespace authority does not match the immutable request",
+            ));
+        }
+        validate_peer_network_namespace_handle(
+            &self.peer_network_namespace_handle,
+            self.peer_network_namespace,
+        )?;
+        let duplicate = self
+            .peer_network_namespace_handle
+            .try_clone()
+            .map_err(|source| {
+                NativeCoordinatorWriterError::authority(
+                    "duplicate retained peer network namespace",
+                    source,
+                )
+            })?;
+        validate_peer_network_namespace_handle(&duplicate, self.peer_network_namespace)?;
+        Ok(duplicate)
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn validate_peer_network_namespace_handle(
+    handle: &File,
+    expected: NetworkNamespaceIdentity,
+) -> Result<(), NativeCoordinatorWriterError> {
+    const NSFS_MAGIC: u64 = 0x6e73_6673;
+
+    let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::zeroed();
+    // SAFETY: `filesystem` points to writable storage for one `statfs`; `handle` remains borrowed
+    // for the syscall and therefore keeps its descriptor open.
+    if unsafe { libc::fstatfs(handle.as_raw_fd(), filesystem.as_mut_ptr()) } != 0 {
+        return Err(NativeCoordinatorWriterError::authority(
+            "inspect retained peer network namespace filesystem",
+            io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: successful `fstatfs` initialized the complete structure.
+    let filesystem = unsafe { filesystem.assume_init() };
+    if filesystem.f_type as u64 != NSFS_MAGIC {
+        return Err(NativeCoordinatorWriterError::Invariant(
+            "retained peer network namespace descriptor is not an nsfs handle",
+        ));
+    }
+
+    let metadata = handle.metadata().map_err(|source| {
+        NativeCoordinatorWriterError::authority(
+            "inspect retained peer network namespace identity",
+            source,
+        )
+    })?;
+    let observed = NetworkNamespaceIdentity::new(metadata.dev(), metadata.ino()).ok_or(
+        NativeCoordinatorWriterError::Invariant(
+            "retained peer network namespace descriptor has a zero inode",
+        ),
+    )?;
+    if observed != expected {
+        return Err(NativeCoordinatorWriterError::Invariant(
+            "retained peer network namespace descriptor identity changed",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn validate_peer_network_namespace_handle(
+    _handle: &File,
+    _expected: NetworkNamespaceIdentity,
+) -> Result<(), NativeCoordinatorWriterError> {
+    Err(NativeCoordinatorWriterError::Invariant(
+        "retained peer network namespaces require Linux or Android",
+    ))
+}
+
 fn native_canary_attempt(
     request: &CanaryAttemptRequest,
 ) -> Result<NativeCaptureCanaryAttempt, NativeCoordinatorWriterError> {
@@ -172,7 +296,8 @@ fn native_canary_attempt(
 ///
 /// The adapter has no dispatcher or state-file dependency. It retains only the committed target
 /// and one candidate so coordinator rollback can reactivate the prior immutable Generation, plus
-/// at most one request-bound selector session while a canary executes.
+/// at most one request-bound selector session while a canary executes. A separately supplied boot
+/// facility authority remains writer-owned across those attempt sessions.
 pub(crate) struct NativeCoordinatorWriter<C, S>
 where
     C: NativeCaptureConvergence,
@@ -184,6 +309,7 @@ where
     retained: Vec<RetainedNativeGeneration<C::Target>>,
     committed_generation: Option<GenerationId>,
     converged_identity: Option<C::Identity>,
+    retained_canary_facility_authority: Option<RetainedCanaryFacilityAuthority>,
     active_canary_selector_session: Option<CanaryAttemptRequest>,
     recovery_required: bool,
 }
@@ -230,9 +356,27 @@ where
             retained: Vec::with_capacity(2),
             committed_generation: None,
             converged_identity: None,
+            retained_canary_facility_authority: None,
             active_canary_selector_session: None,
             recovery_required: false,
         })
+    }
+
+    #[allow(
+        dead_code,
+        reason = "the production facility creator is intentionally not connected in this checkpoint"
+    )]
+    pub(crate) fn with_retained_canary_facility_authority(
+        mut self,
+        authority: RetainedCanaryFacilityAuthority,
+    ) -> Result<Self, NativeCoordinatorWriterError> {
+        if self.retained_canary_facility_authority.is_some() {
+            return Err(NativeCoordinatorWriterError::Invariant(
+                "native writer already retains a canary facility authority",
+            ));
+        }
+        self.retained_canary_facility_authority = Some(authority);
+        Ok(self)
     }
 
     fn prior_identity(&self) -> Option<C::Identity> {
@@ -680,6 +824,13 @@ where
                 "native canary selector session does not match the retained Generation and facility",
             ));
         }
+        let peer_network_namespace = self
+            .retained_canary_facility_authority
+            .as_ref()
+            .ok_or(NativeCoordinatorWriterError::Invariant(
+                "native canary selector session has no retained facility authority",
+            ))?
+            .duplicate_for(request)?;
         let target = retained.target.clone();
         let attempt = native_canary_attempt(request)?;
         let populated = match self.convergence.populate_canary_selector(&target, attempt) {
@@ -699,7 +850,12 @@ where
         }
 
         self.active_canary_selector_session = Some(request.clone());
-        Ok(Some(CanarySelectorSession::reserved_for(request)))
+        Ok(Some(
+            CanarySelectorSession::reserved_with_peer_network_namespace(
+                request,
+                peer_network_namespace,
+            ),
+        ))
     }
 
     fn retire_canary_selector_session(
@@ -802,6 +958,10 @@ pub(crate) enum NativeCoordinatorWriterError {
         operation: &'static str,
         source: Box<dyn Error + Send + Sync>,
     },
+    Authority {
+        operation: &'static str,
+        source: io::Error,
+    },
     Invariant(&'static str),
 }
 
@@ -819,6 +979,10 @@ impl NativeCoordinatorWriterError {
             source: Box::new(source),
         }
     }
+
+    fn authority(operation: &'static str, source: io::Error) -> Self {
+        Self::Authority { operation, source }
+    }
 }
 
 impl fmt::Display for NativeCoordinatorWriterError {
@@ -827,6 +991,7 @@ impl fmt::Display for NativeCoordinatorWriterError {
             Self::Convergence { operation, source } | Self::Preparation { operation, source } => {
                 write!(formatter, "{operation}: {source}")
             }
+            Self::Authority { operation, source } => write!(formatter, "{operation}: {source}"),
             Self::Invariant(message) => formatter.write_str(message),
         }
     }
@@ -838,6 +1003,7 @@ impl Error for NativeCoordinatorWriterError {
             Self::Convergence { source, .. } | Self::Preparation { source, .. } => {
                 Some(source.as_ref())
             }
+            Self::Authority { source, .. } => Some(source),
             Self::Invariant(_) => None,
         }
     }
@@ -867,9 +1033,11 @@ mod tests {
     use crate::engine_supervisor::{
         EngineCanaryReportHandoffError, EngineChildAuthority, EngineChildAuthorityError,
     };
-    use crate::functional_canary::tests::request_with_engine_identity;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    use crate::functional_canary::tests::request_with_engine_identity_and_network_namespaces;
     use crate::functional_canary::{
-        CanaryAddressFamilies, CanaryAttemptRequest, CanaryNonce, FUNCTIONAL_CANARY_NONCE_BYTES,
+        CanaryAddressFamilies, CanaryAttemptRequest, CanaryFacilityIdentity, CanaryNonce,
+        CanaryResponderPorts, FUNCTIONAL_CANARY_NONCE_BYTES,
         InstalledSupervisedDeliveryReportProducer, PreparedCanaryGenerationBinding,
         SupervisedDeliveryReportEngineHandoff,
     };
@@ -1299,16 +1467,62 @@ mod tests {
         EngineCapabilityProfileRevision::from_fixture_bytes([0x31; 32])
     }
 
-    fn selector_request(fixture: &EngineFixture, nonce_byte: u8) -> CanaryAttemptRequest {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn selector_request(
+        fixture: &EngineFixture,
+        nonce_byte: u8,
+    ) -> (CanaryAttemptRequest, RetainedCanaryFacilityAuthority) {
         selector_request_with_families(fixture, nonce_byte, CanaryAddressFamilies::Ipv4Only)
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn selector_request_with_families(
         fixture: &EngineFixture,
         nonce_byte: u8,
         families: CanaryAddressFamilies,
+    ) -> (CanaryAttemptRequest, RetainedCanaryFacilityAuthority) {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let peer_network_namespace_handle = fs::File::open("/proc/self/ns/net")
+            .expect("open current network namespace for native writer test");
+        let metadata = peer_network_namespace_handle
+            .metadata()
+            .expect("inspect current network namespace for native writer test");
+        let peer_network_namespace = NetworkNamespaceIdentity::new(metadata.dev(), metadata.ino())
+            .expect("current network namespace has nonzero identity");
+        let daemon_inode = if peer_network_namespace.inode() == u64::MAX {
+            peer_network_namespace.inode() - 1
+        } else {
+            peer_network_namespace.inode() + 1
+        };
+        let daemon_network_namespace =
+            NetworkNamespaceIdentity::new(peer_network_namespace.device(), daemon_inode)
+                .expect("synthetic daemon network namespace has nonzero identity");
+        let request = selector_request_for_network_namespaces(
+            fixture,
+            nonce_byte,
+            families,
+            daemon_network_namespace,
+            peer_network_namespace,
+        );
+        let authority = RetainedCanaryFacilityAuthority::new(
+            request.pre_binding().environment().facility(),
+            peer_network_namespace,
+            peer_network_namespace_handle,
+        )
+        .expect("retain current peer network namespace authority");
+        (request, authority)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn selector_request_for_network_namespaces(
+        fixture: &EngineFixture,
+        nonce_byte: u8,
+        families: CanaryAddressFamilies,
+        daemon_network_namespace: NetworkNamespaceIdentity,
+        peer_network_namespace: NetworkNamespaceIdentity,
     ) -> CanaryAttemptRequest {
-        request_with_engine_identity(
+        request_with_engine_identity_and_network_namespaces(
             &fixture.spec,
             families,
             Instant::now(),
@@ -1317,6 +1531,8 @@ mod tests {
             NonZeroU32::new(4242).expect("engine PID"),
             NonZeroU64::new(98_765).expect("engine start ticks"),
             NonZeroU64::new(23).expect("engine snapshot revision"),
+            daemon_network_namespace,
+            peer_network_namespace,
         )
     }
 
@@ -1389,11 +1605,40 @@ mod tests {
         );
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
-    fn native_selector_session_rejects_overlap_missing_retirement_and_substitution() {
+    fn retained_canary_facility_rejects_regular_files() {
+        use std::os::unix::fs::MetadataExt as _;
+
         let fixture = EngineFixture::new();
-        let request = selector_request(&fixture, 71);
-        let alternate = selector_request(&fixture, 72);
+        let (request, _authority) = selector_request(&fixture, 65);
+        let regular_file = tempfile::tempfile().expect("create regular descriptor fixture");
+        let metadata = regular_file
+            .metadata()
+            .expect("inspect regular descriptor fixture");
+        let regular_identity = NetworkNamespaceIdentity::new(metadata.dev(), metadata.ino())
+            .expect("regular descriptor fixture has nonzero identity");
+
+        let error = match RetainedCanaryFacilityAuthority::new(
+            request.pre_binding().environment().facility(),
+            regular_identity,
+            regular_file,
+        ) {
+            Ok(_) => panic!("a regular file must not become network namespace authority"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "retained peer network namespace descriptor is not an nsfs handle"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn native_selector_session_requires_retained_facility_authority_before_population() {
+        let fixture = EngineFixture::new();
+        let (request, _authority) = selector_request(&fixture, 66);
         let events = Arc::new(Mutex::new(Vec::new()));
         let mut writer = writer(
             &events,
@@ -1402,6 +1647,200 @@ mod tests {
             [required_canary_generation(17, &fixture, &request)],
             [],
         );
+        let generation = RuntimeWriter::prepare(&mut writer, Reason::Boot)
+            .expect("prepare required native Generation");
+        RuntimeWriter::capture_start(&mut writer, &generation)
+            .expect("activate required native Generation");
+        events.lock().expect("native events lock").clear();
+
+        let error =
+            RuntimeWriter::reserve_canary_selector_session(&mut writer, &generation, &request)
+                .expect_err("missing retained facility authority must fail closed");
+
+        assert_eq!(
+            error.to_string(),
+            "native canary selector session has no retained facility authority"
+        );
+        assert!(writer.convergence.selector.is_none());
+        assert!(writer.active_canary_selector_session.is_none());
+        assert!(!writer.recovery_required);
+        assert!(events.lock().expect("native events lock").is_empty());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn native_selector_session_revalidates_the_retained_descriptor_before_population() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let fixture = EngineFixture::new();
+        let (request, mut authority) = selector_request(&fixture, 67);
+        let changed_handle =
+            fs::File::open("/proc/self/ns/mnt").expect("open a distinct nsfs descriptor fixture");
+        let changed = changed_handle
+            .metadata()
+            .expect("inspect distinct nsfs descriptor fixture");
+        let changed = NetworkNamespaceIdentity::new(changed.dev(), changed.ino())
+            .expect("distinct nsfs descriptor has nonzero identity");
+        assert_ne!(changed, authority.peer_network_namespace);
+        authority.peer_network_namespace_handle = changed_handle;
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut writer = writer(
+            &events,
+            None,
+            None,
+            [required_canary_generation(17, &fixture, &request)],
+            [],
+        )
+        .with_retained_canary_facility_authority(authority)
+        .expect("attach initially validated facility authority");
+        let generation = RuntimeWriter::prepare(&mut writer, Reason::Boot)
+            .expect("prepare required native Generation");
+        RuntimeWriter::capture_start(&mut writer, &generation)
+            .expect("activate required native Generation");
+        events.lock().expect("native events lock").clear();
+
+        let error =
+            RuntimeWriter::reserve_canary_selector_session(&mut writer, &generation, &request)
+                .expect_err("changed retained descriptor must fail before population");
+
+        assert_eq!(
+            error.to_string(),
+            "retained peer network namespace descriptor identity changed"
+        );
+        assert!(writer.convergence.selector.is_none());
+        assert!(writer.active_canary_selector_session.is_none());
+        assert!(!writer.recovery_required);
+        assert!(events.lock().expect("native events lock").is_empty());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn native_selector_session_rejects_retained_facility_substitution_before_population() {
+        let fixture = EngineFixture::new();
+        let (request, authority) = selector_request(&fixture, 68);
+        let facility = request.pre_binding().environment().facility();
+        let substituted_facility = CanaryFacilityIdentity::new(
+            facility.daemon_veth(),
+            facility.peer_veth(),
+            facility.ipv4(),
+            facility.ipv6(),
+            CanaryResponderPorts::new(
+                NonZeroU16::new(42_001).expect("substituted TCP port"),
+                NonZeroU16::new(42_002).expect("substituted UDP port"),
+                NonZeroU16::new(42_003).expect("substituted DNS port"),
+            )
+            .expect("distinct substituted responder ports"),
+        )
+        .expect("valid substituted facility identity");
+        let authority = RetainedCanaryFacilityAuthority::new(
+            substituted_facility,
+            authority.peer_network_namespace,
+            authority.peer_network_namespace_handle,
+        )
+        .expect("retain substituted facility over the exact namespace descriptor");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut writer = writer(
+            &events,
+            None,
+            None,
+            [required_canary_generation(17, &fixture, &request)],
+            [],
+        )
+        .with_retained_canary_facility_authority(authority)
+        .expect("attach substituted facility authority");
+        let generation = RuntimeWriter::prepare(&mut writer, Reason::Boot)
+            .expect("prepare required native Generation");
+        RuntimeWriter::capture_start(&mut writer, &generation)
+            .expect("activate required native Generation");
+        events.lock().expect("native events lock").clear();
+
+        let error =
+            RuntimeWriter::reserve_canary_selector_session(&mut writer, &generation, &request)
+                .expect_err("facility substitution must fail before selector population");
+
+        assert_eq!(
+            error.to_string(),
+            "retained canary facility authority does not match the immutable request"
+        );
+        assert!(writer.convergence.selector.is_none());
+        assert!(writer.active_canary_selector_session.is_none());
+        assert!(!writer.recovery_required);
+        assert!(events.lock().expect("native events lock").is_empty());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn native_selector_session_rejects_peer_namespace_substitution_before_population() {
+        let fixture = EngineFixture::new();
+        let (original, authority) = selector_request(&fixture, 69);
+        let retained_peer = authority.peer_network_namespace;
+        let substituted_peer = NetworkNamespaceIdentity::new(
+            retained_peer.device().wrapping_add(1),
+            retained_peer.inode(),
+        )
+        .expect("substituted peer network namespace identity");
+        let substituted_daemon = NetworkNamespaceIdentity::new(
+            retained_peer.device().wrapping_add(2),
+            retained_peer.inode(),
+        )
+        .expect("substituted daemon network namespace identity");
+        let request = selector_request_for_network_namespaces(
+            &fixture,
+            69,
+            CanaryAddressFamilies::Ipv4Only,
+            substituted_daemon,
+            substituted_peer,
+        );
+        assert_eq!(
+            original.pre_binding().environment().facility(),
+            request.pre_binding().environment().facility()
+        );
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut writer = writer(
+            &events,
+            None,
+            None,
+            [required_canary_generation(17, &fixture, &request)],
+            [],
+        )
+        .with_retained_canary_facility_authority(authority)
+        .expect("attach exact retained namespace authority");
+        let generation = RuntimeWriter::prepare(&mut writer, Reason::Boot)
+            .expect("prepare required native Generation");
+        RuntimeWriter::capture_start(&mut writer, &generation)
+            .expect("activate required native Generation");
+        events.lock().expect("native events lock").clear();
+
+        let error =
+            RuntimeWriter::reserve_canary_selector_session(&mut writer, &generation, &request)
+                .expect_err("peer namespace substitution must fail before selector population");
+
+        assert_eq!(
+            error.to_string(),
+            "retained peer network namespace authority does not match the immutable request"
+        );
+        assert!(writer.convergence.selector.is_none());
+        assert!(writer.active_canary_selector_session.is_none());
+        assert!(!writer.recovery_required);
+        assert!(events.lock().expect("native events lock").is_empty());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn native_selector_session_rejects_overlap_missing_retirement_and_substitution() {
+        let fixture = EngineFixture::new();
+        let (request, authority) = selector_request(&fixture, 71);
+        let (alternate, _alternate_authority) = selector_request(&fixture, 72);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut writer = writer(
+            &events,
+            None,
+            None,
+            [required_canary_generation(17, &fixture, &request)],
+            [],
+        )
+        .with_retained_canary_facility_authority(authority)
+        .expect("attach retained canary facility authority");
         let generation = RuntimeWriter::prepare(&mut writer, Reason::Boot)
             .expect("prepare required native Generation");
         RuntimeWriter::capture_start(&mut writer, &generation)
@@ -1418,10 +1857,28 @@ mod tests {
             "native canary selector session retirement has no active reservation"
         );
 
-        let session =
+        let mut session =
             RuntimeWriter::reserve_canary_selector_session(&mut writer, &generation, &request)
                 .expect("reserve exact selector session")
                 .expect("native writer supplies selector-session ownership");
+        let peer_network_namespace = session
+            .take_peer_network_namespace()
+            .expect("native writer lends one peer network namespace duplicate");
+        validate_peer_network_namespace_handle(
+            &peer_network_namespace,
+            request
+                .pre_binding()
+                .environment()
+                .authority()
+                .network()
+                .peer_network_namespace(),
+        )
+        .expect("lent peer network namespace remains exact");
+        assert!(
+            session.take_peer_network_namespace().is_none(),
+            "the namespace duplicate is take-once"
+        );
+        drop(peer_network_namespace);
         let populated = writer
             .convergence
             .selector
@@ -1486,12 +1943,22 @@ mod tests {
         assert!(selector_retirement.absent_observed_at() >= selector_retirement.retired_at());
         assert!(writer.active_canary_selector_session.is_none());
         assert!(writer.convergence.selector.is_none());
+
+        let mut next =
+            RuntimeWriter::reserve_canary_selector_session(&mut writer, &generation, &alternate)
+                .expect("reuse original authority for a later attempt")
+                .expect("native writer lends a fresh later-attempt duplicate");
+        assert!(next.take_peer_network_namespace().is_some());
+        RuntimeWriter::retire_canary_selector_session(&mut writer, &generation, next)
+            .expect("retire later selector session")
+            .expect("later selector retirement remains exact");
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn native_selector_session_maps_the_exact_dual_stack_request() {
         let fixture = EngineFixture::new();
-        let request =
+        let (request, authority) =
             selector_request_with_families(&fixture, 74, CanaryAddressFamilies::Ipv4AndIpv6);
         let events = Arc::new(Mutex::new(Vec::new()));
         let mut writer = writer(
@@ -1500,7 +1967,9 @@ mod tests {
             None,
             [required_canary_generation(17, &fixture, &request)],
             [],
-        );
+        )
+        .with_retained_canary_facility_authority(authority)
+        .expect("attach retained dual-stack facility authority");
         let generation = RuntimeWriter::prepare(&mut writer, Reason::Boot)
             .expect("prepare dual-stack required native Generation");
         RuntimeWriter::capture_start(&mut writer, &generation)
@@ -1549,10 +2018,11 @@ mod tests {
         assert!(writer.convergence.selector.is_none());
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn uncertain_selector_population_recovers_before_capture_stop() {
         let fixture = EngineFixture::new();
-        let request = selector_request(&fixture, 75);
+        let (request, authority) = selector_request(&fixture, 75);
         let events = Arc::new(Mutex::new(Vec::new()));
         let mut writer = writer(
             &events,
@@ -1560,7 +2030,9 @@ mod tests {
             None,
             [required_canary_generation(17, &fixture, &request)],
             [],
-        );
+        )
+        .with_retained_canary_facility_authority(authority)
+        .expect("attach retained canary facility authority");
         let generation = RuntimeWriter::prepare(&mut writer, Reason::Boot)
             .expect("prepare required native Generation");
         RuntimeWriter::capture_start(&mut writer, &generation)
@@ -1593,10 +2065,11 @@ mod tests {
         assert_eq!(writer.converged_identity, None);
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn uncertain_selector_retirement_recovers_before_the_session_guard() {
         let fixture = EngineFixture::new();
-        let request = selector_request(&fixture, 76);
+        let (request, authority) = selector_request(&fixture, 76);
         let events = Arc::new(Mutex::new(Vec::new()));
         let mut writer = writer(
             &events,
@@ -1604,7 +2077,9 @@ mod tests {
             None,
             [required_canary_generation(17, &fixture, &request)],
             [],
-        );
+        )
+        .with_retained_canary_facility_authority(authority)
+        .expect("attach retained canary facility authority");
         let generation = RuntimeWriter::prepare(&mut writer, Reason::Boot)
             .expect("prepare required native Generation");
         RuntimeWriter::capture_start(&mut writer, &generation)
@@ -1659,10 +2134,11 @@ mod tests {
         assert_eq!(writer.converged_identity, None);
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn native_selector_session_requires_positive_platform_receipts() {
         let fixture = EngineFixture::new();
-        let request = selector_request(&fixture, 77);
+        let (request, authority) = selector_request(&fixture, 77);
         let events = Arc::new(Mutex::new(Vec::new()));
         let mut writer = writer(
             &events,
@@ -1670,7 +2146,9 @@ mod tests {
             None,
             [required_canary_generation(17, &fixture, &request)],
             [],
-        );
+        )
+        .with_retained_canary_facility_authority(authority)
+        .expect("attach retained canary facility authority");
         let generation = RuntimeWriter::prepare(&mut writer, Reason::Boot)
             .expect("prepare required native Generation");
         RuntimeWriter::capture_start(&mut writer, &generation)
@@ -1714,10 +2192,11 @@ mod tests {
         assert!(writer.convergence.selector.is_none());
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn native_selector_session_must_retire_before_ownership_observation_or_capture_stop() {
         let fixture = EngineFixture::new();
-        let request = selector_request(&fixture, 73);
+        let (request, authority) = selector_request(&fixture, 73);
         let events = Arc::new(Mutex::new(Vec::new()));
         let mut writer = writer(
             &events,
@@ -1725,7 +2204,9 @@ mod tests {
             None,
             [required_canary_generation(17, &fixture, &request)],
             [],
-        );
+        )
+        .with_retained_canary_facility_authority(authority)
+        .expect("attach retained canary facility authority");
         let generation = RuntimeWriter::prepare(&mut writer, Reason::Boot)
             .expect("prepare required native Generation");
         RuntimeWriter::capture_start(&mut writer, &generation)

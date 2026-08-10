@@ -7934,6 +7934,35 @@ pub(crate) mod tests {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub(crate) fn request_with_engine_identity_and_network_namespaces(
+        spec: &EngineSpec,
+        families: CanaryAddressFamilies,
+        started_at: Instant,
+        nonce: CanaryNonce,
+        generation: GenerationId,
+        pid: NonZeroU32,
+        start_time_ticks: NonZeroU64,
+        engine_snapshot_revision: NonZeroU64,
+        daemon_network_namespace: NetworkNamespaceIdentity,
+        peer_network_namespace: NetworkNamespaceIdentity,
+    ) -> CanaryAttemptRequest {
+        request_with_engine_profile_revision_and_duration_and_network_namespaces(
+            spec,
+            families,
+            started_at,
+            nonce,
+            generation,
+            pid,
+            start_time_ticks,
+            engine_snapshot_revision,
+            EngineCapabilityProfileRevision::from_fixture_bytes([0x51; 32]),
+            Duration::from_secs(2),
+            daemon_network_namespace,
+            peer_network_namespace,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn request_with_engine_profile_revision(
         spec: &EngineSpec,
         families: CanaryAddressFamilies,
@@ -7972,6 +8001,37 @@ pub(crate) mod tests {
         engine_profile_revision: EngineCapabilityProfileRevision,
         duration: Duration,
     ) -> CanaryAttemptRequest {
+        request_with_engine_profile_revision_and_duration_and_network_namespaces(
+            spec,
+            families,
+            started_at,
+            nonce,
+            generation,
+            pid,
+            start_time_ticks,
+            engine_snapshot_revision,
+            engine_profile_revision,
+            duration,
+            NetworkNamespaceIdentity::new(1, 101).expect("daemon namespace"),
+            NetworkNamespaceIdentity::new(1, 102).expect("peer namespace"),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn request_with_engine_profile_revision_and_duration_and_network_namespaces(
+        spec: &EngineSpec,
+        families: CanaryAddressFamilies,
+        started_at: Instant,
+        nonce: CanaryNonce,
+        generation: GenerationId,
+        pid: NonZeroU32,
+        start_time_ticks: NonZeroU64,
+        engine_snapshot_revision: NonZeroU64,
+        engine_profile_revision: EngineCapabilityProfileRevision,
+        duration: Duration,
+        daemon_network_namespace: NetworkNamespaceIdentity,
+        peer_network_namespace: NetworkNamespaceIdentity,
+    ) -> CanaryAttemptRequest {
         let listener_port = match spec.process().readiness {
             SingBoxReadiness::Listener { port } => port,
             SingBoxReadiness::TunInterface { .. } => {
@@ -7992,7 +8052,13 @@ pub(crate) mod tests {
             &readiness,
         )
         .expect("exact engine binding");
-        let environment = environment(generation, nonce, started_at);
+        let environment = environment_with_network_namespaces(
+            generation,
+            nonce,
+            started_at,
+            daemon_network_namespace,
+            peer_network_namespace,
+        );
         CanaryAttemptRequest::new(
             CanaryAttemptBinding::new(engine, environment),
             nonce,
@@ -8042,6 +8108,22 @@ pub(crate) mod tests {
         generation: GenerationId,
         nonce: CanaryNonce,
         attempt_started_at: Instant,
+    ) -> CanaryEnvironmentBinding {
+        environment_with_network_namespaces(
+            generation,
+            nonce,
+            attempt_started_at,
+            NetworkNamespaceIdentity::new(1, 101).expect("daemon namespace"),
+            NetworkNamespaceIdentity::new(1, 102).expect("peer namespace"),
+        )
+    }
+
+    fn environment_with_network_namespaces(
+        generation: GenerationId,
+        nonce: CanaryNonce,
+        attempt_started_at: Instant,
+        daemon_network_namespace: NetworkNamespaceIdentity,
+        peer_network_namespace: NetworkNamespaceIdentity,
     ) -> CanaryEnvironmentBinding {
         let mut tracker = NetworkInventoryTracker::new();
         let inventory = tracker
@@ -8115,8 +8197,8 @@ pub(crate) mod tests {
         )
         .expect("distinct attempt object identities");
         let network = CanaryNetworkObservationBinding::new(
-            NetworkNamespaceIdentity::new(1, 101).expect("daemon namespace"),
-            NetworkNamespaceIdentity::new(1, 102).expect("peer namespace"),
+            daemon_network_namespace,
+            peer_network_namespace,
             inventory.epoch(),
             inventory.snapshot_id(),
         )

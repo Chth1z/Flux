@@ -288,22 +288,48 @@ pub(crate) fn inspect_admitted_generation(
 /// A required native writer returns this only after populating the exact reserved selector. The
 /// local-OUTPUT executor lends it to a prepared attempt only after supervised-report prebind and
 /// installation.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub(crate) struct CanarySelectorSession {
     request: CanaryAttemptRequest,
+    peer_network_namespace: Option<std::fs::File>,
 }
 
 impl CanarySelectorSession {
     #[must_use]
+    #[allow(
+        dead_code,
+        reason = "descriptor-free sessions are retained for non-native writers and test adapters"
+    )]
     pub(crate) fn reserved_for(request: &CanaryAttemptRequest) -> Self {
         Self {
             request: request.clone(),
+            peer_network_namespace: None,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn reserved_with_peer_network_namespace(
+        request: &CanaryAttemptRequest,
+        peer_network_namespace: std::fs::File,
+    ) -> Self {
+        Self {
+            request: request.clone(),
+            peer_network_namespace: Some(peer_network_namespace),
         }
     }
 
     #[must_use]
     pub(crate) const fn request(&self) -> &CanaryAttemptRequest {
         &self.request
+    }
+
+    /// Lend the writer-validated duplicate once to the packaged attempt substrate.
+    #[allow(
+        dead_code,
+        reason = "the packaged attempt remains uninhabited until its evidence transaction lands"
+    )]
+    pub(crate) fn take_peer_network_namespace(&mut self) -> Option<std::fs::File> {
+        self.peer_network_namespace.take()
     }
 
     #[must_use]

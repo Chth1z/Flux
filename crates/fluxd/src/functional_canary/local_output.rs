@@ -2839,6 +2839,48 @@ enum PackagedOutboundProjectionError {
     ZeroDiagnosticUid,
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn project_held_engine_outbound<T: Copy>(
+    flow: CanaryFlow,
+    peer_tuple: CanaryFlowTuple,
+    candidates: impl IntoIterator<Item = Result<T, SocketCorrelationError>>,
+    diagnostic_fields: impl Fn(T) -> (u32, Option<u32>),
+    build_correlation: impl FnOnce(
+        T,
+    )
+        -> Result<CanarySocketCorrelation, CanarySocketCorrelationBuildError>,
+) -> Result<UnqualifiedCanaryOutboundEvidence, PackagedOutboundProjectionError> {
+    let mut selected = None;
+    for candidate in candidates {
+        match candidate {
+            Ok(correlated) => {
+                if selected.replace(correlated).is_some() {
+                    return Err(PackagedOutboundProjectionError::AmbiguousSocket);
+                }
+            }
+            Err(SocketCorrelationError::MissingDiagnostic { .. }) => {}
+            Err(source) => {
+                return Err(PackagedOutboundProjectionError::SocketCorrelation(source));
+            }
+        }
+    }
+    let correlated = selected.ok_or(PackagedOutboundProjectionError::MissingSocket)?;
+    let correlation =
+        build_correlation(correlated).map_err(PackagedOutboundProjectionError::CorrelationBuild)?;
+    let (uid, mark) = diagnostic_fields(correlated);
+    let observed_uid =
+        std::num::NonZeroU32::new(uid).ok_or(PackagedOutboundProjectionError::ZeroDiagnosticUid)?;
+    let observed_socket_mark =
+        mark.ok_or(PackagedOutboundProjectionError::MissingDiagnosticMark)?;
+    Ok(UnqualifiedCanaryOutboundEvidence::new(
+        flow,
+        peer_tuple,
+        correlation,
+        observed_uid,
+        observed_socket_mark,
+    ))
+}
+
 /// Select the sole engine FD/INET_DIAG join for a held flow and project it into raw loop evidence.
 ///
 /// The caller must invoke this while `PackagedDriverFlowHolding` still owns both live endpoints.
@@ -2872,50 +2914,34 @@ fn correlate_held_engine_outbound(
         CanaryFlowProtocol::Tcp => InetSocketProtocol::Tcp,
         CanaryFlowProtocol::Udp => InetSocketProtocol::Udp,
     };
-    let mut selected = None;
-    for process_fd in snapshot.socket_fds() {
-        match snapshot.correlate(
-            process_fd.fd(),
-            protocol,
-            peer_tuple.source(),
-            peer_tuple.destination(),
-        ) {
-            Ok(correlated) => {
-                if selected.replace(correlated).is_some() {
-                    return Err(PackagedOutboundProjectionError::AmbiguousSocket);
-                }
-            }
-            Err(SocketCorrelationError::MissingDiagnostic { .. }) => {}
-            Err(source) => {
-                return Err(PackagedOutboundProjectionError::SocketCorrelation(source));
-            }
-        }
-    }
-    let correlated = selected.ok_or(PackagedOutboundProjectionError::MissingSocket)?;
-    let diagnostic = correlated.diagnostic();
-    let observed_uid = std::num::NonZeroU32::new(diagnostic.uid())
-        .ok_or(PackagedOutboundProjectionError::ZeroDiagnosticUid)?;
-    let observed_socket_mark = diagnostic
-        .mark()
-        .ok_or(PackagedOutboundProjectionError::MissingDiagnosticMark)?;
-    let correlation = CanarySocketCorrelation::from_proc_fd_inet_diag_snapshot(
-        request
-            .pre_binding()
-            .environment()
-            .authority()
-            .socket_observer(),
-        request.pre_binding().engine().engine(),
-        snapshot,
-        correlated,
-    )
-    .map_err(PackagedOutboundProjectionError::CorrelationBuild)?;
-    Ok(UnqualifiedCanaryOutboundEvidence::new(
+    project_held_engine_outbound(
         flow,
         peer_tuple,
-        correlation,
-        observed_uid,
-        observed_socket_mark,
-    ))
+        snapshot.socket_fds().iter().map(|process_fd| {
+            snapshot.correlate(
+                process_fd.fd(),
+                protocol,
+                peer_tuple.source(),
+                peer_tuple.destination(),
+            )
+        }),
+        |correlated| {
+            let diagnostic = correlated.diagnostic();
+            (diagnostic.uid(), diagnostic.mark())
+        },
+        |correlated| {
+            CanarySocketCorrelation::from_proc_fd_inet_diag_snapshot(
+                request
+                    .pre_binding()
+                    .environment()
+                    .authority()
+                    .socket_observer(),
+                request.pre_binding().engine().engine(),
+                snapshot,
+                correlated,
+            )
+        },
+    )
 }
 
 /// The packaged adapter has no device-qualified direct-observation implementation. This
@@ -3187,9 +3213,15 @@ impl TproxyLocalOutputEvidenceFactory<Infallible> for TproxyCanaryEvidenceFactor
 
 #[cfg(test)]
 mod tests {
-    use std::num::{NonZeroU32, NonZeroU64};
-    #[cfg(target_os = "linux")]
-    use std::process::Command;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    use std::net::{TcpListener, TcpStream};
+    use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    use std::os::fd::AsRawFd;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    use std::os::unix::process::CommandExt;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    use std::process::{Child, Command};
     use std::sync::Arc;
     #[cfg(any(target_os = "linux", target_os = "android"))]
     use std::sync::atomic::AtomicBool;
@@ -3207,7 +3239,7 @@ mod tests {
     };
     use crate::generation_engine_config::EngineSupervisedDeliveryReportContract;
     use crate::runtime_coordinator::CanarySelectorSession;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     use flux_platform::ProcessHandle;
 
     struct ScriptedAttemptAuthority {
@@ -3339,6 +3371,403 @@ mod tests {
             ),
         )
         .expect("exact traffic result")
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn packaged_outbound_seed(
+        fixture: &Fixture,
+        flow: CanaryFlow,
+    ) -> (CanaryFlowTuple, CanarySocketCorrelation) {
+        let evidence = fixture.successful_evidence();
+        let outbound = evidence.loop_escape.outbound.slots[flow.index()]
+            .as_ref()
+            .expect("required flow has outbound evidence");
+        (outbound.tuple, outbound.socket_correlation)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    struct EngineSocketOwnerChild(Option<Child>);
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    impl EngineSocketOwnerChild {
+        fn spawn(stream: &TcpStream) -> Self {
+            let descriptor = stream.as_raw_fd();
+            // SAFETY: the descriptor is borrowed from a live stream for this call.
+            let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+            assert!(flags >= 0, "read engine socket descriptor flags");
+            let mut command = Command::new("sleep");
+            command.arg("30");
+            // SAFETY: the hook only clears close-on-exec on the borrowed descriptor before exec.
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::fcntl(descriptor, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let mut child = command.spawn().expect("spawn engine socket-owner child");
+            let pid = child.id();
+            let descriptor_path = format!("/proc/{pid}/fd/{descriptor}");
+            let comm_path = format!("/proc/{pid}/comm");
+            let ready_deadline = Instant::now() + Duration::from_secs(1);
+            let ready = loop {
+                let comm_is_sleep = std::fs::read_to_string(&comm_path)
+                    .map(|comm| comm.trim_end() == "sleep")
+                    .unwrap_or(false);
+                if comm_is_sleep && std::fs::read_link(&descriptor_path).is_ok() {
+                    break true;
+                }
+                if Instant::now() >= ready_deadline {
+                    break false;
+                }
+                if child
+                    .try_wait()
+                    .expect("poll engine socket-owner child")
+                    .is_some()
+                {
+                    break false;
+                }
+                std::thread::yield_now();
+            };
+            if !ready {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("engine socket-owner child did not stabilize before collection");
+            }
+            Self(Some(child))
+        }
+
+        fn child(&self) -> &Child {
+            self.0
+                .as_ref()
+                .expect("engine socket-owner child is retained")
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    impl Drop for EngineSocketOwnerChild {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn bind_request_to_ipv4_socket(
+        request: &mut CanaryAttemptRequest,
+        local: std::net::SocketAddr,
+        remote: std::net::SocketAddr,
+    ) -> CanaryFlowTuple {
+        let std::net::SocketAddr::V4(local) = local else {
+            panic!("direct correlation fixture uses IPv4")
+        };
+        let std::net::SocketAddr::V4(remote) = remote else {
+            panic!("direct correlation fixture uses IPv4")
+        };
+        let facility = &mut request.pre_binding.environment.facility;
+        facility.ipv4.daemon = *local.ip();
+        facility.ipv4.peer = *remote.ip();
+        let tcp_echo = NonZeroU16::new(remote.port()).expect("remote port is nonzero");
+        let udp_echo = NonZeroU16::new(
+            remote
+                .port()
+                .checked_add(1)
+                .expect("direct fixture leaves one responder port"),
+        )
+        .expect("UDP responder port is nonzero");
+        let dns = NonZeroU16::new(
+            remote
+                .port()
+                .checked_add(2)
+                .expect("direct fixture leaves two responder ports"),
+        )
+        .expect("DNS responder port is nonzero");
+        facility.ports.tcp_echo = tcp_echo;
+        facility.ports.udp_echo = udp_echo;
+        facility.ports.dns = dns;
+        CanaryFlowTuple::new(
+            std::net::SocketAddr::V4(local),
+            std::net::SocketAddr::V4(remote),
+        )
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn held_outbound_correlation_direct_snapshot_reaches_real_fd_diag_join() {
+        let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+        let mut request = fixture.request().clone();
+        let listener = TcpListener::bind((std::net::Ipv4Addr::new(127, 0, 0, 2), 0))
+            .expect("bind direct-correlation listener");
+        let remote = listener.local_addr().expect("read direct listener address");
+        let client = TcpStream::connect(remote).expect("connect direct-correlation socket");
+        let (_server, _) = listener.accept().expect("accept direct-correlation socket");
+        let child = EngineSocketOwnerChild::spawn(&client);
+        let handle = ProcessHandle::open_child(child.child()).expect("open exact engine child");
+        let identity = handle.identity();
+        let process = OwnedEngineIdentity::new(identity.pid(), identity.start_time_ticks());
+        request.pre_binding.engine.engine = process;
+        let peer_tuple =
+            bind_request_to_ipv4_socket(&mut request, client.local_addr().unwrap(), remote);
+
+        let (collector_identity, collector_revision) = match request
+            .pre_binding()
+            .environment()
+            .authority()
+            .socket_observer()
+        {
+            CanarySocketObserverAuthority::ProcFdInetDiag {
+                collector_identity,
+                collector_revision,
+                ..
+            } => (collector_identity, collector_revision),
+            CanarySocketObserverAuthority::QualifiedCgroupBpf { .. } => {
+                panic!("fixture uses the INET_DIAG observer")
+            }
+        };
+        let observer = CanaryAttemptSocketObserverSession::open_proc_fd_inet_diag(
+            collector_identity,
+            collector_revision,
+            request.deadline(),
+        )
+        .expect("open direct-correlation observer");
+        let binding = observer.binding();
+        request.pre_binding.environment.authority.socket_observer = observer.authority();
+        request
+            .pre_binding
+            .environment
+            .authority
+            .socket_observer_opening = binding.opening_id;
+        let (_observer, snapshot) = observer
+            .collect_process_until(process)
+            .expect("collect the child-owned connected socket");
+
+        match correlate_held_engine_outbound(
+            &request,
+            CanaryFlow::Ipv4TcpEcho,
+            peer_tuple,
+            &snapshot,
+        ) {
+            Ok(evidence) => {
+                assert_eq!(evidence.flow, CanaryFlow::Ipv4TcpEcho);
+                assert_eq!(evidence.tuple, peer_tuple);
+            }
+            Err(PackagedOutboundProjectionError::MissingDiagnosticMark)
+            | Err(PackagedOutboundProjectionError::CorrelationBuild(
+                CanarySocketCorrelationBuildError::MissingDiagnosticMark,
+            )) => {}
+            other => panic!("real FD/INET_DIAG join failed before field disclosure: {other:?}"),
+        }
+
+        let missing_tuple = CanaryFlowTuple::new(
+            std::net::SocketAddr::new(
+                peer_tuple.source().ip(),
+                peer_tuple
+                    .source()
+                    .port()
+                    .checked_add(1)
+                    .expect("direct fixture source port leaves substitution room"),
+            ),
+            peer_tuple.destination(),
+        );
+        assert_eq!(
+            correlate_held_engine_outbound(
+                &request,
+                CanaryFlow::Ipv4TcpEcho,
+                missing_tuple,
+                &snapshot,
+            ),
+            Err(PackagedOutboundProjectionError::MissingSocket)
+        );
+
+        let mut wrong_observer = request.clone();
+        let substituted_observer = match wrong_observer
+            .pre_binding()
+            .environment()
+            .authority()
+            .socket_observer()
+        {
+            CanarySocketObserverAuthority::ProcFdInetDiag {
+                collector_identity,
+                collector_revision,
+                netlink_port_id,
+            } => CanarySocketObserverAuthority::ProcFdInetDiag {
+                collector_identity,
+                collector_revision,
+                netlink_port_id: NonZeroU32::new(
+                    netlink_port_id
+                        .get()
+                        .checked_add(1)
+                        .expect("direct fixture observer port leaves substitution room"),
+                )
+                .expect("substituted observer port is nonzero"),
+            },
+            CanarySocketObserverAuthority::QualifiedCgroupBpf { .. } => {
+                panic!("fixture uses the INET_DIAG observer")
+            }
+        };
+        wrong_observer
+            .pre_binding
+            .environment
+            .authority
+            .socket_observer = substituted_observer;
+        assert_eq!(
+            correlate_held_engine_outbound(
+                &wrong_observer,
+                CanaryFlow::Ipv4TcpEcho,
+                peer_tuple,
+                &snapshot,
+            ),
+            Err(PackagedOutboundProjectionError::CorrelationBuild(
+                CanarySocketCorrelationBuildError::ObserverPortMismatch
+            ))
+        );
+
+        let mut wrong_process = request.clone();
+        wrong_process.pre_binding.engine.engine = OwnedEngineIdentity::new(
+            NonZeroU32::new(
+                process
+                    .pid()
+                    .checked_add(1)
+                    .expect("direct fixture PID leaves substitution room"),
+            )
+            .expect("substituted process PID is nonzero"),
+            NonZeroU64::new(process.start_time_ticks()).expect("engine start ticks are nonzero"),
+        );
+        assert_eq!(
+            correlate_held_engine_outbound(
+                &wrong_process,
+                CanaryFlow::Ipv4TcpEcho,
+                peer_tuple,
+                &snapshot,
+            ),
+            Err(PackagedOutboundProjectionError::CorrelationBuild(
+                CanarySocketCorrelationBuildError::ProcessIdentityMismatch
+            ))
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn held_outbound_correlation_projects_one_exact_process_socket() {
+        let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+        let flow = CanaryFlow::Ipv4TcpEcho;
+        let (tuple, correlation) = packaged_outbound_seed(&fixture, flow);
+        let evidence = project_held_engine_outbound(
+            flow,
+            tuple,
+            [Ok(41_u32)],
+            |_| (20_001, Some(0)),
+            |_| Ok(correlation),
+        )
+        .expect("one exact correlation must project");
+
+        assert_eq!(evidence.flow, flow);
+        assert_eq!(evidence.tuple, tuple);
+        assert_eq!(evidence.observed_uid.get(), 20_001);
+        assert_eq!(evidence.observed_socket_mark, 0);
+        assert_eq!(evidence.socket_correlation, correlation);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn held_outbound_correlation_rejects_missing_and_ambiguous_matches() {
+        let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+        let flow = CanaryFlow::Ipv4TcpEcho;
+        let (tuple, correlation) = packaged_outbound_seed(&fixture, flow);
+        assert_eq!(
+            project_held_engine_outbound(
+                flow,
+                tuple,
+                [Err::<u32, _>(SocketCorrelationError::MissingDiagnostic {
+                    fd: 42
+                })],
+                |_| unreachable!("a missing candidate has no diagnostic"),
+                |_| unreachable!("a missing candidate has no correlation"),
+            ),
+            Err(PackagedOutboundProjectionError::MissingSocket)
+        );
+
+        assert_eq!(
+            project_held_engine_outbound(
+                flow,
+                tuple,
+                [Ok(42_u32), Ok(43_u32)],
+                |_| (20_001, Some(0)),
+                |_| Ok(correlation),
+            ),
+            Err(PackagedOutboundProjectionError::AmbiguousSocket)
+        );
+
+        assert_eq!(
+            project_held_engine_outbound(
+                flow,
+                tuple,
+                [Err::<u32, _>(SocketCorrelationError::AmbiguousDiagnostic {
+                    fd: 42,
+                })],
+                |_| unreachable!("an ambiguous candidate has no diagnostic"),
+                |_| unreachable!("an ambiguous candidate has no correlation"),
+            ),
+            Err(PackagedOutboundProjectionError::SocketCorrelation(
+                SocketCorrelationError::AmbiguousDiagnostic { fd: 42 }
+            ))
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn held_outbound_correlation_rejects_observer_and_process_substitution() {
+        let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+        let flow = CanaryFlow::Ipv4TcpEcho;
+        let (tuple, _) = packaged_outbound_seed(&fixture, flow);
+        for error in [
+            CanarySocketCorrelationBuildError::WrongObserverAuthority,
+            CanarySocketCorrelationBuildError::ObserverPortMismatch,
+            CanarySocketCorrelationBuildError::ProcessIdentityMismatch,
+        ] {
+            assert_eq!(
+                project_held_engine_outbound(
+                    flow,
+                    tuple,
+                    [Ok(44_u32)],
+                    |_| (20_001, Some(0)),
+                    |_| Err(error),
+                ),
+                Err(PackagedOutboundProjectionError::CorrelationBuild(error))
+            );
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn held_outbound_correlation_requires_nonzero_uid_and_disclosed_mark() {
+        let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+        let flow = CanaryFlow::Ipv4TcpEcho;
+        let (tuple, correlation) = packaged_outbound_seed(&fixture, flow);
+        assert_eq!(
+            project_held_engine_outbound(
+                flow,
+                tuple,
+                [Ok(45_u32)],
+                |_| (0, Some(0)),
+                |_| Ok(correlation),
+            ),
+            Err(PackagedOutboundProjectionError::ZeroDiagnosticUid)
+        );
+
+        assert_eq!(
+            project_held_engine_outbound(
+                flow,
+                tuple,
+                [Ok(45_u32)],
+                |_| (20_001, None),
+                |_| Ok(correlation),
+            ),
+            Err(PackagedOutboundProjectionError::MissingDiagnosticMark)
+        );
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]

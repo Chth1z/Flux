@@ -411,7 +411,7 @@ fn read_response(
     if !response.status().is_success() {
         return Err(FetchError::HttpStatus(status));
     }
-    validate_response_headers(response.headers(), request.purpose)?;
+    validate_response_encoding(response.headers())?;
 
     // ureq places its limit around the raw reader before content decoding. Flux independently
     // caps the decoded reader so a compressed body cannot evade either resource budget.
@@ -440,13 +440,30 @@ fn read_response(
             maximum: request.maximum_decoded_bytes,
         });
     }
+    validate_response_content_type(response.headers(), request.purpose, Some(&bytes))?;
     if bytes.is_empty() {
         return Err(FetchError::EmptyBody);
     }
     Ok(FetchedResource::from_bytes(bytes))
 }
 
+#[cfg(test)]
 fn validate_response_headers(headers: &HeaderMap, purpose: FetchPurpose) -> Result<(), FetchError> {
+    validate_response_encoding(headers)?;
+    validate_response_content_type(headers, purpose, None)
+}
+
+#[cfg(test)]
+fn validate_response_headers_with_body(
+    headers: &HeaderMap,
+    purpose: FetchPurpose,
+    body: &[u8],
+) -> Result<(), FetchError> {
+    validate_response_encoding(headers)?;
+    validate_response_content_type(headers, purpose, Some(body))
+}
+
+fn validate_response_encoding(headers: &HeaderMap) -> Result<(), FetchError> {
     for value in headers.get_all(CONTENT_ENCODING) {
         let value = value
             .to_str()
@@ -455,7 +472,14 @@ fn validate_response_headers(headers: &HeaderMap, purpose: FetchPurpose) -> Resu
             return Err(FetchError::InvalidContentEncoding);
         }
     }
+    Ok(())
+}
 
+fn validate_response_content_type(
+    headers: &HeaderMap,
+    purpose: FetchPurpose,
+    body: Option<&[u8]>,
+) -> Result<(), FetchError> {
     let mut values = headers.get_all(CONTENT_TYPE).iter();
     let Some(value) = values.next() else {
         return Ok(());
@@ -469,10 +493,19 @@ fn validate_response_headers(headers: &HeaderMap, purpose: FetchPurpose) -> Resu
         .map_or(value, |(mime, _)| mime)
         .trim()
         .to_ascii_lowercase();
-    if mime.is_empty() || !purpose.accepts_mime(&mime) {
+    let legacy_subscription_body = matches!(purpose, FetchPurpose::Subscription)
+        && mime == "text/html"
+        && body.is_some_and(|value| !looks_like_html_body(value));
+    if mime.is_empty() || (!purpose.accepts_mime(&mime) && !legacy_subscription_body) {
         return Err(FetchError::InvalidContentType);
     }
     Ok(())
+}
+
+fn looks_like_html_body(body: &[u8]) -> bool {
+    std::str::from_utf8(body)
+        .map(str::trim_start)
+        .is_ok_and(|text| text.starts_with('<'))
 }
 
 fn body_limit_error(error: &io::Error) -> bool {
@@ -632,6 +665,32 @@ mod tests {
                 .unwrap_err()
                 .kind(),
             FetchErrorKind::InvalidContentEncoding
+        );
+    }
+
+    #[test]
+    fn legacy_html_mime_is_allowed_only_for_non_html_subscription_payloads() {
+        let url = Url::parse("https://provider.example/sub").unwrap();
+        let base64_uri = b"dmxlc3M6Ly9leGFtcGxl";
+        let mut legacy = response(base64_uri.to_vec(), Some("text/html; charset=UTF-8"));
+        assert_eq!(
+            read_response(&mut legacy, request(&url, 64, 64))
+                .unwrap()
+                .bytes(),
+            base64_uri
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, "text/html; charset=UTF-8".parse().unwrap());
+        assert_eq!(
+            validate_response_headers_with_body(
+                &headers,
+                FetchPurpose::Subscription,
+                b"<!doctype html><html>login</html>"
+            )
+            .unwrap_err()
+            .kind(),
+            FetchErrorKind::InvalidContentType
         );
     }
 

@@ -12,6 +12,10 @@ use ureq::{Agent, Body};
 use url::Url;
 
 const FETCH_USER_AGENT: &str = concat!("Flux/", env!("CARGO_PKG_VERSION"), " (Android; Rust)");
+// XBoard/V2Board-style subscription endpoints use the v2rayNG token to select their
+// base64-URI response. Keep that compatibility identity scoped to subscription requests;
+// binary rule-set downloads retain Flux's own identity.
+const SUBSCRIPTION_USER_AGENT: &str = "v2rayNG/2.3.3";
 const MAX_REDIRECTS: u32 = 5;
 const MAX_FETCH_BYTES: u64 = 64 * 1_024 * 1_024;
 const MAX_FETCH_URL_BYTES: usize = 4_096;
@@ -33,6 +37,13 @@ impl FetchPurpose {
             Self::BinaryRuleSet => {
                 "application/octet-stream, application/vnd.sing-box.ruleset, application/x-binary"
             }
+        }
+    }
+
+    const fn user_agent(self) -> &'static str {
+        match self {
+            Self::Subscription => SUBSCRIPTION_USER_AGENT,
+            Self::BinaryRuleSet => FETCH_USER_AGENT,
         }
     }
 
@@ -162,7 +173,7 @@ pub(super) struct UreqFetchAdapter;
 impl FetchAdapter for UreqFetchAdapter {
     fn fetch(&self, request: FetchRequest<'_>) -> Result<FetchedResource, FetchError> {
         validate_request(request)?;
-        let agent = build_agent(request.timeout);
+        let agent = build_agent(request.timeout, request.purpose);
         let mut response = agent
             .get(request.url.as_str())
             .header("accept", request.purpose.accept())
@@ -370,7 +381,7 @@ pub(super) fn validate_request(request: FetchRequest<'_>) -> Result<(), FetchErr
     Ok(())
 }
 
-fn build_agent(timeout: Duration) -> Agent {
+fn build_agent(timeout: Duration, purpose: FetchPurpose) -> Agent {
     let tls = TlsConfig::builder()
         .provider(TlsProvider::Rustls)
         .root_certs(RootCerts::WebPki)
@@ -383,7 +394,7 @@ fn build_agent(timeout: Duration) -> Agent {
         .max_redirects(MAX_REDIRECTS)
         .max_redirects_will_error(true)
         .redirect_auth_headers(RedirectAuthHeaders::Never)
-        .user_agent(FETCH_USER_AGENT)
+        .user_agent(purpose.user_agent())
         .accept_encoding("gzip, br")
         .timeout_global(Some(timeout))
         .max_response_header_size(MAX_RESPONSE_HEADER_BYTES)
@@ -505,9 +516,20 @@ mod tests {
     }
 
     #[test]
+    fn subscription_agent_uses_v2rayng_compatible_identity() {
+        let agent = build_agent(Duration::from_secs(11), FetchPurpose::Subscription);
+        let user_agent = match agent.config().user_agent() {
+            ureq::config::AutoHeaderValue::Provided(value) => value.as_str(),
+            value => panic!("subscription User-Agent must be explicit, got {value:?}"),
+        };
+        assert_eq!(user_agent, SUBSCRIPTION_USER_AGENT);
+        assert!(!user_agent.contains("Flux/"));
+    }
+
+    #[test]
     fn production_agent_is_https_only_proxy_free_and_globally_bounded() {
         let timeout = Duration::from_secs(11);
-        let agent = build_agent(timeout);
+        let agent = build_agent(timeout, FetchPurpose::BinaryRuleSet);
         let config = agent.config();
 
         assert!(config.https_only());
@@ -523,6 +545,10 @@ mod tests {
             RootCerts::WebPki
         ));
         assert!(!config.tls_config().disable_verification());
+        assert!(matches!(
+            config.user_agent(),
+            ureq::config::AutoHeaderValue::Provided(value) if value.as_str() == FETCH_USER_AGENT
+        ));
     }
 
     #[test]
